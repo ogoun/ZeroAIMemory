@@ -64,9 +64,10 @@ fn append_to_section_goes_after_subsections() {
     let a = apply(SRC, &append_to("A > B", "tail"));
     assert_eq!(
         a.text,
-        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nc\r\ntail\r\n## D\r\nd\r\n# E\r\ne"
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nc\r\n\r\ntail\r\n## D\r\nd\r\n# E\r\ne"
     );
-    assert_eq!(&a.text[a.changed.clone()], "tail\r\n");
+    // пустая строка: иначе «tail» стал бы ленивым продолжением абзаца «c»
+    assert_eq!(&a.text[a.changed.clone()], "\r\ntail\r\n");
 }
 
 #[test]
@@ -74,12 +75,12 @@ fn insert_after_heading_lines() {
     let a = apply(SRC, &after_heading("A > B", "first\r\n"));
     assert_eq!(
         a.text,
-        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nfirst\r\nb\r\n### C\r\nc\r\n## D\r\nd\r\n# E\r\ne"
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nfirst\r\n\r\nb\r\n### C\r\nc\r\n## D\r\nd\r\n# E\r\ne"
     );
     let a = apply(SRC, &after_heading("A > B > C", "x"));
     assert_eq!(
         a.text,
-        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nx\r\nc\r\n## D\r\nd\r\n# E\r\ne"
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nx\r\n\r\nc\r\n## D\r\nd\r\n# E\r\ne"
     );
     assert_eq!(a.touched_section.as_deref(), Some("A > B > C"));
 }
@@ -94,9 +95,9 @@ fn append_adds_missing_newline_before() {
     );
     assert_eq!(
         a.text,
-        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nc\r\n## D\r\nd\r\n# E\r\ne\r\nend\r\n"
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nc\r\n## D\r\nd\r\n# E\r\ne\r\n\r\nend\r\n"
     );
-    assert_eq!(&a.text[a.changed.clone()], "\r\nend\r\n");
+    assert_eq!(&a.text[a.changed.clone()], "\r\n\r\nend\r\n");
     assert_eq!(a.touched_section, None);
 }
 
@@ -181,6 +182,7 @@ c
 a
 ## B
 b
+
 t
    # C
 c
@@ -188,7 +190,8 @@ c
     );
     assert_eq!(
         &a.text[a.changed.clone()],
-        "t
+        "
+t
 "
     );
     // смена отступа C не меняет байты B (нет ложного конфликта)
@@ -479,4 +482,92 @@ proptest! {
             prop_assert_eq!(found, 1, "{:?} -> {:?}", src, a.text);
         }
     }
+}
+
+// ---------- Ленивое продолжение абзаца ----------
+
+/// HTML рендера — для проверки, что вставка стала отдельным блоком.
+fn rendered(src: &str) -> String {
+    zam_markdown::render_html(src, &zam_markdown::NoResolve).html
+}
+
+#[test]
+fn inserted_paragraph_is_not_lazy_continuation() {
+    // абзац, пункт списка, цитата, строка таблицы перед вставкой
+    for (src, expect_text) in [
+        ("# A\nабзац\n", "# A\nабзац\n\nновый\n"),
+        ("# A\n- пункт\n", "# A\n- пункт\n\nновый\n"),
+        ("# A\n> цитата\n", "# A\n> цитата\n\nновый\n"),
+        (
+            "# A\n| a | b |\n|---|---|\n| 1 | 2 |\n",
+            "# A\n| a | b |\n|---|---|\n| 1 | 2 |\n\nновый\n",
+        ),
+    ] {
+        let a = apply(src, &append_to("A", "новый"));
+        assert_eq!(a.text, expect_text, "{src:?}");
+        assert!(
+            rendered(&a.text).contains(">новый</p>"),
+            "{}",
+            rendered(&a.text)
+        );
+        let a = apply(
+            src,
+            &PatchOp::Append {
+                content: "новый".into(),
+            },
+        );
+        assert_eq!(a.text, expect_text, "{src:?}");
+    }
+}
+
+#[test]
+fn no_blank_line_when_not_needed() {
+    // после заголовка, перед заголовком, после пустой строки
+    let a = apply("# A\n", &append_to("A", "текст"));
+    assert_eq!(a.text, "# A\nтекст\n");
+    let a = apply("# A\nабзац\n\n", &append_to("A", "текст"));
+    assert_eq!(a.text, "# A\nабзац\n\nтекст\n");
+    let a = apply("# A\n## B\n", &after_heading("A", "текст"));
+    assert_eq!(a.text, "# A\nтекст\n## B\n");
+    // вставка пункта списка в список продолжает список
+    let a = apply("# A\n- один\n", &append_to("A", "- два"));
+    assert_eq!(a.text, "# A\n- один\n- два\n");
+    // вставка заголовка, цитаты, ограждения — без пустой строки
+    let a = apply("# A\nабзац\n", &append_to("A", "> цитата"));
+    assert_eq!(a.text, "# A\nабзац\n> цитата\n");
+    // ReplaceSection между заголовками пустых строк не добавляет
+    let a = apply("# A\nстарое\n# B\n", &replace("A", "новое"));
+    assert_eq!(a.text, "# A\nновое\n# B\n");
+}
+
+#[test]
+fn blank_line_after_insert_before_plain_text() {
+    // InsertAfterHeading перед абзацем: абзацы не сливаются
+    let a = apply("# A\nстарый\n", &after_heading("A", "новый"));
+    assert_eq!(a.text, "# A\nновый\n\nстарый\n");
+    assert_eq!(&a.text[a.changed.clone()], "новый\n\n");
+    let h = rendered(&a.text);
+    assert!(h.contains(">новый</p>") && h.contains(">старый</p>"), "{h}");
+    // Prepend перед абзацем, CRLF
+    let a = apply(
+        "---\r\nt: 1\r\n---\r\nтекст\r\n",
+        &PatchOp::Prepend {
+            content: "пре".into(),
+        },
+    );
+    assert_eq!(a.text, "---\r\nt: 1\r\n---\r\nпре\r\n\r\nтекст\r\n");
+    // перед заголовком, пунктом списка или пустой строкой — без добавки
+    let a = apply("# A\n- пункт\n", &after_heading("A", "новый"));
+    assert_eq!(a.text, "# A\nновый\n- пункт\n");
+    // вставка, сама кончающаяся пустой строкой, не удваивает её
+    let a = apply("# A\nстарый\n", &after_heading("A", "новый\n\n"));
+    assert_eq!(a.text, "# A\nновый\n\nстарый\n");
+}
+
+#[test]
+fn setext_underline_content_after_paragraph_stays_break() {
+    // `---` сразу после абзаца сделал бы из него заголовок setext
+    let a = apply("# A\nабзац\n", &append_to("A", "---"));
+    assert_eq!(a.text, "# A\nабзац\n\n---\n");
+    assert!(rendered(&a.text).contains("<hr"), "{}", rendered(&a.text));
 }
