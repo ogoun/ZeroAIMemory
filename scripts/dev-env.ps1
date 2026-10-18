@@ -1,4 +1,4 @@
-# Окружение разработки ZeroAIMemory. Запуск: . scripts/dev-env.ps1
+﻿# Окружение разработки ZeroAIMemory. Запуск: . scripts/dev-env.ps1
 $ZamRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $env:RUSTUP_HOME = Join-Path $ZamRoot '.toolchain\rustup'
 $env:CARGO_HOME = Join-Path $ZamRoot '.toolchain\cargo'
