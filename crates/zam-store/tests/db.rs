@@ -274,6 +274,17 @@ fn wal_len(p: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Номер checkpoint в заголовке WAL (смещение 12): растёт при каждом сбросе WAL
+/// на начало файла; 0 — файла нет или WAL ещё не сбрасывался.
+fn wal_seq(p: &std::path::Path) -> u32 {
+    use std::io::Read;
+    let mut h = [0u8; 16];
+    std::fs::File::open(side_file(p, "-wal"))
+        .and_then(|mut f| f.read_exact(&mut h))
+        .map(|()| u32::from_be_bytes([h[12], h[13], h[14], h[15]]))
+        .unwrap_or(0)
+}
+
 static BLOB_MIGS: &[Migration] = &[Migration {
     version: 1,
     sql: "CREATE TABLE b(x BLOB);",
@@ -326,14 +337,6 @@ async fn background_checkpointer_keeps_wal_small() {
     };
     let db = Db::open_with(&p, BLOB_MIGS, opts).unwrap();
     let db_len = || std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-    // номер checkpoint в заголовке WAL (смещение 12) растёт при каждом
-    // перезапуске WAL с начала
-    let wal_seq = || {
-        let h = std::fs::read(side_file(&p, "-wal")).unwrap_or_default();
-        h.get(12..16)
-            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
-            .unwrap_or(0)
-    };
     // пять порций по 1 МБ; после каждой ждём, пока фоновый поток перенесёт кадры
     // в файл базы (без checkpoint файл базы не растёт) и файл перестанет меняться
     for k in 1..=5u64 {
@@ -355,7 +358,7 @@ async fn background_checkpointer_keeps_wal_small() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
-    let (len, seq) = (wal_len(&p), wal_seq());
+    let (len, seq) = (wal_len(&p), wal_seq(&p));
     assert!(seq >= 1, "WAL ни разу не начат сначала");
     // без перезапусков WAL был бы больше 5 МБ (см. without_any_checkpoint_wal_grows)
     assert!(len < 5 * 1024 * 1024, "WAL {len} байт, перезапусков {seq}");
@@ -388,4 +391,27 @@ async fn without_any_checkpoint_wal_grows() {
     write_blobs(&db, 160, 32 * 1024).await;
     let len = wal_len(&p);
     assert!(len >= 5 * 1024 * 1024, "WAL {len} байт");
+}
+
+#[tokio::test]
+async fn background_restart_resets_wal_under_continuous_writes() {
+    // страховка писателя выключена (предел u64::MAX): сбросить WAL может только
+    // фоновый RESTART. Без него при записи без пауз WAL не начинается сначала ни
+    // разу (номер checkpoint в заголовке остаётся 0, файл растёт на весь объём).
+    let p = tmp("bg-restart");
+    let opts = DbOptions {
+        checkpoint_interval: std::time::Duration::from_millis(20),
+        wal_limit_bytes: u64::MAX,
+        wal_restart_bytes: 256 * 1024,
+        ..DbOptions::default()
+    };
+    let db = Db::open_with(&p, BLOB_MIGS, opts).unwrap();
+    // до 64 МБ записей по 32 КБ с паузой 1 мс, пока WAL не начнётся сначала
+    let mut writes = 0;
+    while wal_seq(&p) == 0 && writes < 2048 {
+        write_blobs(&db, 1, 32 * 1024).await;
+        writes += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(wal_seq(&p) >= 1, "WAL не сброшен за {writes} записей");
 }

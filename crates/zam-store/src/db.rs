@@ -3,9 +3,10 @@
 //! **Checkpoint WAL (ТЗ §17).** Автоматический checkpoint писателя выключен
 //! (`wal_autocheckpoint=0`): иначе fsync базы при переносе кадров попадал бы в
 //! задержку записи. Кадры переносит фоновый поток со своим соединением —
-//! `wal_checkpoint(PASSIVE)` раз в [`DbOptions::checkpoint_interval`], если WAL
-//! изменился. Страховка на случай, если фоновый поток не успевает или умер:
-//! писатель после задания делает `wal_checkpoint(RESTART)`, когда WAL больше
+//! `wal_checkpoint(PASSIVE)` раз в [`DbOptions::checkpoint_interval`], а следом
+//! `RESTART`, если в WAL больше [`DbOptions::wal_restart_bytes`].
+//! Страховка на случай, если фоновый поток не успевает или умер: писатель после
+//! задания делает `wal_checkpoint(RESTART)`, когда WAL больше
 //! [`DbOptions::wal_limit_bytes`]. При закрытии — `wal_checkpoint(TRUNCATE)`,
 //! затем закрывается последнее соединение и SQLite удаляет `-wal`/`-shm`.
 
@@ -136,6 +137,9 @@ pub struct DbOptions {
     /// Размер WAL, после которого писатель сам делает `wal_checkpoint(RESTART)`;
     /// он же — `journal_size_limit` (до него WAL усекается после сброса).
     pub wal_limit_bytes: u64,
+    /// Кадров в WAL больше чем на столько байт — фоновый поток после
+    /// PASSIVE делает `RESTART`, чтобы WAL начался сначала и при непрерывной записи.
+    pub wal_restart_bytes: u64,
 }
 
 impl Default for DbOptions {
@@ -144,6 +148,7 @@ impl Default for DbOptions {
             background_checkpoint: true,
             checkpoint_interval: Duration::from_secs(1),
             wal_limit_bytes: 64 * 1024 * 1024,
+            wal_restart_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -165,14 +170,27 @@ fn checkpoint(conn: &Connection, mode: &str) -> Result<(), rusqlite::Error> {
     conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |_| Ok(()))
 }
 
+/// Сколько миллисекунд фоновый RESTART ждёт писателя и читателей, прежде чем
+/// отступить до следующего тика (пока он держит блокировку записи, писатель ждёт).
+const RESTART_BUSY_MS: u64 = 50;
+
 /// Фоновый поток: `wal_checkpoint(PASSIVE)` раз в `interval`. Если новых кадров
 /// нет, PASSIVE лишь читает wal-index и ничего не пишет и не синхронизирует, —
 /// отдельная проверка «WAL вырос» не нужна (размер и mtime файла на Windows
 /// ненадёжны, `data_version` без транзакции чтения запаздывает). PASSIVE не ждёт
 /// читателей и писателя; ошибки не фатальны — сработает страховка писателя.
+///
+/// При непрерывной записи WAL сам не начинается сначала: писатель перезапускает
+/// его, только если к началу транзакции все кадры перенесены. Поэтому, если в WAL
+/// больше кадров, чем на `restart_bytes`, поток делает `RESTART` сразу после
+/// PASSIVE, перенёсшего всё: переносить нечего, блокировка записи держится мгновение.
+/// Если же WAL вчетверо больше порога, а полного переноса не случилось, `RESTART`
+/// делается и с переносом остатка — писатель ждёт его fsync, но WAL не дорастает
+/// до страховочного предела писателя.
 fn spawn_checkpointer(
     path: &Path,
     interval: Duration,
+    restart_bytes: u64,
 ) -> Result<(mpsc::Sender<()>, JoinHandle<()>), StoreError> {
     let conn = Connection::open_with_flags(
         path,
@@ -180,12 +198,31 @@ fn spawn_checkpointer(
     )?;
     set_common_pragmas(&conn)?;
     conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    conn.busy_timeout(Duration::from_millis(RESTART_BUSY_MS))?;
+    let page: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let restart_frames = i64::try_from(restart_bytes / page.max(512) as u64).unwrap_or(i64::MAX);
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let handle = std::thread::Builder::new()
         .name("zam-db-checkpoint".into())
         .spawn(move || {
             while let Err(mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
-                let _ = checkpoint(&conn, "PASSIVE");
+                // (busy, кадров в WAL, перенесено)
+                let Ok((busy, log, done)) =
+                    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })
+                else {
+                    continue;
+                };
+                // всё перенесено — RESTART почти бесплатен; WAL вчетверо больше порога —
+                // RESTART и с переносом остатка (писатель ждёт его fsync)
+                if busy == 0 && log > restart_frames && (log == done || log > 4 * restart_frames) {
+                    let _ = checkpoint(&conn, "RESTART");
+                }
             }
             drop(conn);
         })?;
@@ -245,7 +282,8 @@ impl Db {
         }
 
         let (checkpointer_stop, checkpointer) = if opts.background_checkpoint {
-            let (stop, handle) = spawn_checkpointer(path, opts.checkpoint_interval)?;
+            let (stop, handle) =
+                spawn_checkpointer(path, opts.checkpoint_interval, opts.wal_restart_bytes)?;
             (Some(stop), Some(handle))
         } else {
             (None, None)
