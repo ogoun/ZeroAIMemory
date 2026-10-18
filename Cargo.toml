@@ -21,6 +21,16 @@ toml = "0.8"
 ipnet = { version = "2", features = ["serde"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "compression-br"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+anyhow = "1"
+http-body-util = "0.1"
 argon2 = { version = "0.5", features = ["std"] }
 fs4 = { version = "1", features = ["sync"] }
 jiff = { version = "0.2", features = ["serde"] }

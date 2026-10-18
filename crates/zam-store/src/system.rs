@@ -189,6 +189,16 @@ impl SystemStore {
         })
     }
 
+    /// Проверка доступности `system.db` (для `/ready`).
+    pub async fn ping(&self) -> Result<(), StoreError> {
+        self.db
+            .read(|c| {
+                Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+                    .map(|_| ())?)
+            })
+            .await
+    }
+
     // ---- пользователи ----
 
     pub async fn create_user(&self, name: &str, is_admin: bool) -> Result<User, StoreError> {
