@@ -365,7 +365,12 @@ fn dumpbin_in(vs_root: &Path) -> Result<PathBuf> {
         .collect();
     vers.sort_by_key(|v| version_key(v));
     for v in vers.iter().rev() {
-        let p = msvc.join(v).join(r"bin\Hostx64\x64\dumpbin.exe");
+        let p = msvc
+            .join(v)
+            .join("bin")
+            .join("Hostx64")
+            .join("x64")
+            .join("dumpbin.exe");
         if p.is_file() {
             return Ok(p);
         }
