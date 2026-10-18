@@ -1,0 +1,13 @@
+# pdfium из bblanchon/pdfium-binaries, закреплённый тег chromium/8100.
+name = "pdfium"
+version = "chromium/8100"
+
+[platform.windows-x64]
+url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8100/pdfium-win-x64.tgz"
+sha256 = "51621bcc1d9be9ea448f4b84b0516862b928e3968d3fca899af1a6d6e2848d6d"
+extract = ["bin/pdfium.dll"]
+
+[platform.linux-x64]
+url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8100/pdfium-linux-x64.tgz"
+sha256 = "1c1894a12d4d96ee01400c3874444126254180c5c7d2ab628576b67f8120320a"
+extract = ["lib/libpdfium.so"]

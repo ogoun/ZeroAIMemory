@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
-# xtask добавится в members в Task 12
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
 
 [workspace.package]
 version = "0.0.1"
@@ -40,6 +39,9 @@ cookie = "0.18"
 memory-serve = "2.4"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 assert_cmd = "2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]

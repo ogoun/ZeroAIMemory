@@ -1,3 +1,7 @@
 # Общие настройки cargo для workspace
 [term]
 color = "auto"
+
+# cargo xtask <команда>
+[alias]
+xtask = "run -p xtask --"
