@@ -50,7 +50,7 @@ async function waitHealth(url: string, alive: () => boolean): Promise<void> {
 }
 
 export default async function globalSetup(): Promise<() => Promise<void>> {
-  const exe = process.env.ZAM_E2E_SERVER ??
+  const exe = process.env.E2E_SERVER ??
     `${repo}target/release/zam-server${process.platform === 'win32' ? '.exe' : ''}`;
   if (!existsSync(exe)) {
     throw new Error(`нет ${exe}: соберите npm run build и cargo build --release -p zam-server`);
@@ -65,23 +65,29 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     Object.entries(process.env).filter(([k]) => !k.toUpperCase().startsWith('ZAM_')),
   );
   env.ZAM_ADMIN_PASSWORD = ADMIN_PASSWORD;
+  const base = `http://${lanIp()}:${port}/`;
   const child = spawn(exe, ['serve', '--bind', `0.0.0.0:${port}`, '--data-dir', data], {
     env,
     stdio: ['ignore', 'ignore', 'pipe'],
   });
-  // Журнал сервера без строки с первым токеном.
   const log = createWriteStream(`${tmp}server.log`);
-  let rest = '';
-  child.stderr!.on('data', (chunk: Buffer) => {
-    const lines = (rest + chunk.toString('utf8')).split('\n');
-    rest = lines.pop() ?? '';
-    for (const l of lines) if (!l.startsWith('ZeroAIMemoryToken=')) log.write(`${l}\n`);
-  });
+  try {
+    // Журнал сервера без строки с первым токеном.
+    let rest = '';
+    child.stderr!.on('data', (chunk: Buffer) => {
+      const lines = (rest + chunk.toString('utf8')).split('\n');
+      rest = lines.pop() ?? '';
+      for (const l of lines) if (!l.startsWith('ZeroAIMemoryToken=')) log.write(`${l}\n`);
+    });
 
-  const base = `http://${lanIp()}:${port}/`;
-  await waitHealth(base, () => child.exitCode === null);
-  process.env.E2E_BASE_URL = base;
-  process.env.E2E_ADMIN_PASSWORD = ADMIN_PASSWORD;
+    await waitHealth(base, () => child.exitCode === null);
+    process.env.E2E_BASE_URL = base;
+    process.env.E2E_ADMIN_PASSWORD = ADMIN_PASSWORD;
+  } catch (e) {
+    child.kill();
+    log.end();
+    throw e;
+  }
 
   return async () => {
     if (child.exitCode === null) {
