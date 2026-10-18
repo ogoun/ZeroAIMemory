@@ -5,6 +5,7 @@ pub mod db;
 pub mod migrate;
 pub mod system;
 pub mod time;
+pub mod user_db;
 
 pub use datadir::DataDir;
 pub use db::Db;
@@ -12,6 +13,7 @@ pub use migrate::Migration;
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,
 };
+pub use user_db::{Space, SpaceKind, USER_MIGRATIONS, UserDbs, list_spaces};
 
 /// Ошибки слоя хранения.
 #[derive(Debug, thiserror::Error)]
