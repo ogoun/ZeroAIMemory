@@ -4,6 +4,7 @@ pub mod datadir;
 pub mod db;
 pub mod migrate;
 pub mod system;
+pub mod time;
 
 pub use datadir::DataDir;
 pub use db::Db;
@@ -27,6 +28,8 @@ pub enum StoreError {
     Conflict(String),
     #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
     DataDirLocked(std::path::PathBuf),
+    #[error("повреждённые данные: {0}")]
+    Corrupt(String),
     #[error("не поддерживается: {0}")]
     Unsupported(String),
     #[error("некорректный список миграций: {0}")]

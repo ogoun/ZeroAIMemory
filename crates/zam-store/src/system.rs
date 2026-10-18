@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use zam_core::{Id, generate_token, hash_token};
 
+use crate::time::{fmt_ts, parse_ts};
 use crate::{DataDir, Db, Migration, StoreError};
 
 /// Миграции `system.db`.
@@ -124,12 +125,12 @@ fn conv_err<E: std::error::Error + Send + Sync + 'static>(i: usize, e: E) -> rus
 
 fn ts_at(r: &Row, i: usize) -> rusqlite::Result<Timestamp> {
     let s: String = r.get(i)?;
-    s.parse().map_err(|e| conv_err(i, e))
+    parse_ts(&s).map_err(|e| conv_err(i, e))
 }
 
 fn ts_opt(r: &Row, i: usize) -> rusqlite::Result<Option<Timestamp>> {
     r.get::<_, Option<String>>(i)?
-        .map(|s| s.parse().map_err(|e| conv_err(i, e)))
+        .map(|s| parse_ts(&s).map_err(|e| conv_err(i, e)))
         .transpose()
 }
 
@@ -168,7 +169,7 @@ fn is_unique_violation(e: &rusqlite::Error) -> bool {
 }
 
 fn json_err(e: serde_json::Error) -> StoreError {
-    StoreError::Unsupported(format!("некорректный JSON: {e}"))
+    StoreError::Corrupt(format!("некорректный JSON: {e}"))
 }
 
 /// 32 случайных байта ОС в base64url без заполнения.
@@ -203,7 +204,7 @@ impl SystemStore {
                 };
                 tx.execute(
                     "INSERT INTO users (id, name, is_admin, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![u.id, u.name, u.is_admin, u.created_at.to_string()],
+                    params![u.id, u.name, u.is_admin, fmt_ts(u.created_at)],
                 )
                 .map_err(|e| {
                     if is_unique_violation(&e) {
@@ -243,7 +244,7 @@ impl SystemStore {
     pub async fn set_user_disabled(&self, id: Id, disabled: bool) -> Result<(), StoreError> {
         self.db
             .write(move |tx| {
-                let at = disabled.then(|| Timestamp::now().to_string());
+                let at = disabled.then(|| fmt_ts(Timestamp::now()));
                 let n = tx.execute(
                     "UPDATE users SET disabled_at = ?2 WHERE id = ?1",
                     params![id, at],
@@ -315,7 +316,7 @@ impl SystemStore {
                         info.prefix,
                         nt.secret_hash,
                         info.access,
-                        info.created_at.to_string()
+                        fmt_ts(info.created_at)
                     ],
                 )?;
                 Ok(info)
@@ -341,7 +342,7 @@ impl SystemStore {
             .write(move |tx| {
                 let n = tx.execute(
                     "UPDATE tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
-                    params![token, Timestamp::now().to_string()],
+                    params![token, fmt_ts(Timestamp::now())],
                 )?;
                 if n == 0 {
                     return Err(StoreError::NotFound);
@@ -394,13 +395,18 @@ impl SystemStore {
         if stale {
             let ip = ip.map(str::to_string);
             let id = auth.token_id;
+            let threshold = fmt_ts(
+                now.checked_sub(Span::new().seconds(LAST_USED_THROTTLE_SECS))
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?,
+            );
             // Сбой обновления статистики не должен отклонять валидный токен.
             let _ = self
                 .db
                 .write(move |tx| {
                     tx.execute(
-                        "UPDATE tokens SET last_used_at = ?2, last_ip = ?3 WHERE id = ?1",
-                        params![id, now.to_string(), ip],
+                        "UPDATE tokens SET last_used_at = ?2, last_ip = ?3
+                         WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?4)",
+                        params![id, fmt_ts(now), ip, threshold],
                     )?;
                     Ok(())
                 })
@@ -424,11 +430,15 @@ impl SystemStore {
                 let now = Timestamp::now();
                 let exp = now
                     .checked_add(Span::new().hours(SESSION_TTL_HOURS))
-                    .map_err(|e| StoreError::Unsupported(e.to_string()))?;
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                tx.execute(
+                    "DELETE FROM web_sessions WHERE expires_at <= ?1",
+                    [fmt_ts(now)],
+                )?;
                 tx.execute(
                     "INSERT INTO web_sessions (id, csrf_token, created_at, expires_at, ip)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![key, csrf_db, now.to_string(), exp.to_string(), ip],
+                    params![key, csrf_db, fmt_ts(now), fmt_ts(exp), ip],
                 )?;
                 Ok(())
             })
@@ -504,7 +514,7 @@ impl SystemStore {
                     "INSERT INTO audit (ts, actor, user_id, action, target, ip, details)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
-                        Timestamp::now().to_string(),
+                        fmt_ts(Timestamp::now()),
                         actor,
                         user_id,
                         action,

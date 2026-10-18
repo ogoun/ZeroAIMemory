@@ -223,3 +223,48 @@ async fn settings_roundtrip() {
         Some("v")
     );
 }
+
+#[tokio::test]
+async fn create_session_purges_expired() {
+    let (dd, s) = store("purge").await;
+    let (old, _) = s.create_web_session(None).await.unwrap();
+    raw(&dd)
+        .execute(
+            "UPDATE web_sessions SET expires_at='2000-01-01T00:00:00.000000Z'",
+            [],
+        )
+        .unwrap();
+    let (fresh, _) = s.create_web_session(None).await.unwrap();
+    let n: i64 = raw(&dd)
+        .query_row("SELECT count(*) FROM web_sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(s.get_web_session(&old).await.unwrap().is_none());
+    assert!(s.get_web_session(&fresh).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn times_use_fixed_format() {
+    let (dd, s) = store("timefmt").await;
+    let u = s.create_user("ivan", false).await.unwrap();
+    let stored: String = raw(&dd)
+        .query_row("SELECT created_at FROM users WHERE id=?1", [u.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored.len(), "2026-10-18T12:00:00.000000Z".len());
+    assert!(stored.ends_with('Z'));
+}
+
+#[tokio::test]
+async fn broken_json_is_corrupt() {
+    let (dd, s) = store("corrupt").await;
+    raw(&dd)
+        .execute(
+            "INSERT INTO settings (key, value) VALUES ('k', '{не json')",
+            [],
+        )
+        .unwrap();
+    let err = s.get_setting::<serde_json::Value>("k").await.unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+}

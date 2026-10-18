@@ -1,0 +1,44 @@
+//! Единый текстовый формат времени в БД: UTC, микросекунды, `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
+//! Фиксированная ширина делает лексикографический порядок строк равным хронологическому.
+
+use jiff::Timestamp;
+
+use crate::StoreError;
+
+/// Форматирует момент времени для хранения в TEXT-колонке.
+pub fn fmt_ts(ts: Timestamp) -> String {
+    ts.strftime("%Y-%m-%dT%H:%M:%S.%6fZ").to_string()
+}
+
+/// Разбирает строку времени из БД.
+pub fn parse_ts(s: &str) -> Result<Timestamp, StoreError> {
+    s.parse()
+        .map_err(|e| StoreError::Corrupt(format!("некорректное время «{s}»: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_width_and_roundtrip() {
+        let t: Timestamp = "2026-10-18T12:00:00Z".parse().unwrap();
+        assert_eq!(fmt_ts(t), "2026-10-18T12:00:00.000000Z");
+        let t2: Timestamp = "2026-10-18T12:00:00.123456789Z".parse().unwrap();
+        assert_eq!(fmt_ts(t2), "2026-10-18T12:00:00.123456Z");
+        assert_eq!(
+            parse_ts(&fmt_ts(t2)).unwrap().as_microsecond(),
+            t2.as_microsecond()
+        );
+        assert!(matches!(parse_ts("мусор"), Err(StoreError::Corrupt(_))));
+    }
+
+    #[test]
+    fn lexicographic_order_is_chronological() {
+        let a: Timestamp = "2026-10-18T12:00:00Z".parse().unwrap();
+        let b: Timestamp = "2026-10-18T12:00:00.5Z".parse().unwrap();
+        let c: Timestamp = "2026-10-18T12:00:01Z".parse().unwrap();
+        let (sa, sb, sc) = (fmt_ts(a), fmt_ts(b), fmt_ts(c));
+        assert!(sa < sb && sb < sc);
+    }
+}
