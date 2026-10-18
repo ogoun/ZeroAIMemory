@@ -42,8 +42,7 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
                 now,
             ],
         )?;
-        insert_revision(tx, id, 1, &n.content, &hash, &n.attrib, &now)?;
-        rebuild_chunks(tx, id, 1, &n.content, &meta)?;
+        store_revision(tx, id, 1, &n.content, &hash, &meta, &n.attrib, &now)?;
         load_node(tx, id)
     })
     .await
@@ -122,8 +121,26 @@ fn insert_folder(
     Ok(id)
 }
 
+/// Общая часть создания и правки заметки: дописывает ревизию `rev` и пересобирает
+/// чанки и FTS по её тексту. Строка `nodes` к этому моменту уже указывает на `rev`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn store_revision(
+    c: &Connection,
+    node_id: Id,
+    rev: i64,
+    content: &str,
+    hash: &str,
+    meta: &NoteMeta,
+    a: &Attribution,
+    now: &str,
+) -> Result<(), StoreError> {
+    insert_revision(c, node_id, rev, content, hash, a, now)?;
+    rebuild_chunks(c, node_id, rev, content, meta)?;
+    Ok(())
+}
+
 /// Дописывает ревизию (ревизии только дописываются).
-pub(crate) fn insert_revision(
+fn insert_revision(
     c: &Connection,
     node_id: Id,
     rev: i64,

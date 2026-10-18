@@ -3,11 +3,15 @@
 //! Структура модуля:
 //! - `mod.rs` — типы и отображение строк `nodes`;
 //! - [`write`] — запись: создание папок и заметок в одной транзакции писателя;
+//! - [`revise`] — правка заметки: замена с проверкой ревизии, PATCH секций, откат;
 //! - [`read`] — чтение: узел, содержимое ревизии, дети, поиск по имени;
+//! - [`history`] — список ревизий и унифицированный дифф;
 //! - [`chunks`] — метаданные заметки (frontmatter, L0) и чанки секций с FTS.
 
 mod chunks;
+mod history;
 mod read;
+mod revise;
 mod write;
 
 use std::fmt::Write as _;
@@ -23,7 +27,9 @@ use crate::StoreError;
 use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
+pub use history::{RevisionInfo, list_revisions, unified_diff};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
+pub use revise::{WriteError, patch_note, revert_note, update_note};
 pub use write::{create_folder, create_note};
 
 /// Вид узла.
@@ -204,6 +210,17 @@ pub(crate) fn live_by_path(
         node_row,
     )
     .optional()?)
+}
+
+/// Текст ревизии `rev` узла `node_id`. Нет такой ревизии → `NotFound`.
+pub(crate) fn revision_text(c: &Connection, node_id: Id, rev: i64) -> Result<String, StoreError> {
+    c.query_row(
+        "SELECT content FROM revisions WHERE node_id = ?1 AND rev = ?2",
+        rusqlite::params![node_id, rev],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or(StoreError::NotFound)
 }
 
 /// sha256 hex в нижнем регистре.

@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
 use zam_core::Id;
+use zam_markdown::{PatchError, PatchOp};
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, NewNote, NodeKind, NodePath, SpaceKind, StoreError,
-    USER_MIGRATIONS, UserDbs, create_folder, create_note, find_by_name, get_node, get_node_by_path,
-    list_children, list_spaces, node_content,
+    USER_MIGRATIONS, UserDbs, WriteError, create_folder, create_note, find_by_name, get_node,
+    get_node_by_path, list_children, list_revisions, list_spaces, node_content, patch_note,
+    revert_note, unified_diff, update_note,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -513,4 +515,308 @@ async fn migrate_from_v1() {
         .await
         .unwrap();
     assert_eq!(n.current_rev, 1);
+}
+
+// ---------- правка, патч, история, откат ----------
+
+const TWO: &str = "# Альфа\n\nстарое слово\n\n# Бета\n\nвторая секция\n";
+
+fn human(msg: &str) -> Attribution {
+    Attribution {
+        message: Some(msg.into()),
+        ..Attribution::new(AuthorKind::Human)
+    }
+}
+
+fn replace(section: &str, content: &str) -> PatchOp {
+    PatchOp::ReplaceSection {
+        section: section.into(),
+        content: content.into(),
+    }
+}
+
+/// Число чанков заметки, в тексте которых FTS находит слово.
+async fn fts_hits(db: &Db, node: Id, word: &str) -> i64 {
+    let q = format!("text : {word}");
+    db.read(move |c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM chunks_fts f JOIN chunks c ON c.seq = f.rowid
+             WHERE chunks_fts MATCH ?1 AND c.node_id = ?2",
+            rusqlite::params![q, node],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn update_with_right_rev_rebuilds_chunks() {
+    let (db, space) = setup("update").await;
+    let n = create_note(&db, note(space, "Заметка", TWO)).await.unwrap();
+    assert_eq!(fts_hits(&db, n.id, "старое").await, 1);
+
+    let new = TWO.replace("старое", "новое");
+    let u = update_note(&db, n.id, 1, new.clone(), None, human("правка"))
+        .await
+        .unwrap();
+    assert_eq!(u.current_rev, 2);
+    assert_ne!(u.content_hash, n.content_hash);
+    assert!(u.updated_at >= n.updated_at);
+    assert_eq!(
+        node_content(&db, n.id, None).await.unwrap(),
+        (2, new.clone())
+    );
+    assert_eq!(fts_hits(&db, n.id, "старое").await, 0);
+    assert_eq!(fts_hits(&db, n.id, "новое").await, 1);
+
+    let revs = list_revisions(&db, n.id).await.unwrap();
+    assert_eq!(revs.iter().map(|r| r.rev).collect::<Vec<_>>(), vec![2, 1]);
+    assert_eq!(revs[0].author_kind, "human");
+    assert_eq!(revs[0].message.as_deref(), Some("правка"));
+    assert_eq!(revs[0].content_hash, u.content_hash.unwrap());
+    assert_eq!(revs[0].size, new.len() as i64);
+    assert_eq!(revs[1].author_kind, "agent");
+    assert_eq!(revs[1].machine.as_deref(), Some("box"));
+    assert_eq!(revs[1].session_id.as_deref(), Some("s1"));
+    assert!(revs[1].token_id.is_some());
+    assert!(revs[0].ts >= revs[1].ts);
+    assert!(matches!(
+        list_revisions(&db, Id::new()).await,
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn update_l0_rules() {
+    let (db, space) = setup("update-l0").await;
+    let mut nn = note(space, "Л", "первый абзац\n");
+    nn.l0 = Some("от агента".into());
+    let n = create_note(&db, nn).await.unwrap();
+    assert_eq!(n.l0_source.as_deref(), Some("agent"));
+    // смена текста без нового l0 — сводка агента не сохраняется (§8.3)
+    let u = update_note(&db, n.id, 1, "другой абзац\n".into(), None, human("x"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (u.l0.as_deref(), u.l0_source.as_deref()),
+        (Some("другой абзац"), Some("auto"))
+    );
+    let u = update_note(
+        &db,
+        n.id,
+        2,
+        "третий\n".into(),
+        Some("снова агент".into()),
+        human("x"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (u.l0.as_deref(), u.l0_source.as_deref()),
+        (Some("снова агент"), Some("agent"))
+    );
+}
+
+#[tokio::test]
+async fn update_with_stale_rev_is_mismatch() {
+    let (db, space) = setup("update-stale").await;
+    let n = create_note(&db, note(space, "Заметка", TWO)).await.unwrap();
+    update_note(&db, n.id, 1, "v2".into(), None, human("a"))
+        .await
+        .unwrap();
+    match update_note(&db, n.id, 1, "v3".into(), None, human("b")).await {
+        Err(WriteError::RevMismatch {
+            current_rev,
+            current,
+        }) => assert_eq!((current_rev, current.as_str()), (2, "v2")),
+        other => panic!("ожидался RevMismatch: {other:?}"),
+    }
+    assert!(matches!(
+        update_note(&db, n.id, 3, "v3".into(), None, human("b")).await,
+        Err(WriteError::RevMismatch { current_rev: 2, .. })
+    ));
+    assert_eq!(list_revisions(&db, n.id).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn same_content_creates_no_revision() {
+    let (db, space) = setup("same").await;
+    let n = create_note(&db, note(space, "Заметка", TWO)).await.unwrap();
+    let u = update_note(&db, n.id, 1, TWO.into(), None, human("тот же"))
+        .await
+        .unwrap();
+    assert_eq!(u, n);
+    let u = patch_note(
+        &db,
+        n.id,
+        1,
+        // тело секции начинается сразу после строки заголовка
+        vec![replace("Бета", "\nвторая секция\n")],
+        human("p"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(u, n);
+    assert_eq!(list_revisions(&db, n.id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn patch_other_section_with_old_base_rev() {
+    let (db, space) = setup("patch-other").await;
+    let n = create_note(&db, note(space, "Заметка", TWO)).await.unwrap();
+    // другая сторона меняет «Бету» (rev 2)
+    patch_note(
+        &db,
+        n.id,
+        1,
+        vec![replace("Бета", "бета от машины Б\n")],
+        human("б"),
+    )
+    .await
+    .unwrap();
+    // эта сторона правит «Альфу» на base_rev = 1
+    let u = patch_note(
+        &db,
+        n.id,
+        1,
+        vec![
+            replace("Альфа", "альфа от машины А\n"),
+            PatchOp::Append {
+                content: "хвост\n".into(),
+            },
+        ],
+        human("а"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(u.current_rev, 3);
+    let (_, text) = node_content(&db, n.id, None).await.unwrap();
+    assert!(text.contains("альфа от машины А"), "{text}");
+    assert!(text.contains("бета от машины Б"), "{text}");
+    assert!(text.ends_with("хвост\n"), "{text}");
+    assert!(!text.contains("старое слово"));
+    assert_eq!(fts_hits(&db, n.id, "машины").await, 2);
+}
+
+#[tokio::test]
+async fn patch_changed_section_is_conflict() {
+    let (db, space) = setup("patch-same").await;
+    let n = create_note(&db, note(space, "Заметка", TWO)).await.unwrap();
+    patch_note(&db, n.id, 1, vec![replace("Бета", "Б\n")], human("б"))
+        .await
+        .unwrap();
+    match patch_note(&db, n.id, 1, vec![replace("Бета", "А\n")], human("а")).await {
+        Err(WriteError::SectionChanged {
+            section,
+            current_rev,
+        }) => assert_eq!((section.as_str(), current_rev), ("Бета", 2)),
+        other => panic!("ожидался SectionChanged: {other:?}"),
+    }
+    // неудачная операция в цепочке — ничего не записано
+    let r = patch_note(
+        &db,
+        n.id,
+        2,
+        vec![replace("Альфа", "x\n"), replace("Нет такой", "y\n")],
+        human("а"),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(WriteError::Patch(PatchError::SectionNotFound(_)))),
+        "{r:?}"
+    );
+    // base_rev из будущего и несуществующий base_rev
+    assert!(matches!(
+        patch_note(&db, n.id, 5, vec![replace("Альфа", "x\n")], human("а")).await,
+        Err(WriteError::RevMismatch { current_rev: 2, .. })
+    ));
+    assert!(matches!(
+        patch_note(&db, n.id, 0, vec![replace("Альфа", "x\n")], human("а")).await,
+        Err(WriteError::Store(StoreError::NotFound))
+    ));
+    assert_eq!(get_node(&db, n.id).await.unwrap().current_rev, 2);
+    // папка — BadInput, нет узла — NotFound
+    let f = create_folder(&db, space, p("Папка")).await.unwrap();
+    assert!(matches!(
+        update_note(&db, f.id, 0, "x".into(), None, human("а")).await,
+        Err(WriteError::Store(StoreError::BadInput(_)))
+    ));
+    assert!(matches!(
+        update_note(&db, Id::new(), 1, "x".into(), None, human("а")).await,
+        Err(WriteError::Store(StoreError::NotFound))
+    ));
+}
+
+#[tokio::test]
+async fn deleted_note_is_not_writable() {
+    let (db, space) = setup("deleted").await;
+    let n = create_note(&db, note(space, "Заметка", TWO)).await.unwrap();
+    db.write(move |tx| {
+        tx.execute(
+            "UPDATE nodes SET deleted_at = '2026-10-18T00:00:00.000000Z' WHERE id = ?1",
+            [n.id],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        update_note(&db, n.id, 1, "x".into(), None, human("а")).await,
+        Err(WriteError::Store(StoreError::NotFound))
+    ));
+    assert!(matches!(
+        patch_note(&db, n.id, 1, vec![replace("Альфа", "x\n")], human("а")).await,
+        Err(WriteError::Store(StoreError::NotFound))
+    ));
+    assert!(matches!(
+        revert_note(&db, n.id, 1, human("а")).await,
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn revert_adds_revision_with_old_text() {
+    let (db, space) = setup("revert").await;
+    let n = create_note(&db, note(space, "Заметка", TWO)).await.unwrap();
+    update_note(&db, n.id, 1, "v2 новое\n".into(), None, human("2"))
+        .await
+        .unwrap();
+    update_note(&db, n.id, 2, "v3\n".into(), None, human("3"))
+        .await
+        .unwrap();
+    let r = revert_note(&db, n.id, 1, human("откат к 1")).await.unwrap();
+    assert_eq!(r.current_rev, 4);
+    assert_eq!(r.content_hash, n.content_hash);
+    assert_eq!(r.l0_source.as_deref(), Some("auto"));
+    assert_eq!(
+        node_content(&db, n.id, None).await.unwrap(),
+        (4, TWO.to_string())
+    );
+    let revs = list_revisions(&db, n.id).await.unwrap();
+    assert_eq!(revs.len(), 4);
+    assert_eq!(revs[0].message.as_deref(), Some("откат к 1"));
+    assert_eq!(fts_hits(&db, n.id, "старое").await, 1);
+    // откат к содержимому текущей ревизии — без новой ревизии
+    let same = revert_note(&db, n.id, 1, human("ещё раз")).await.unwrap();
+    assert_eq!(same.current_rev, 4);
+    assert_eq!(list_revisions(&db, n.id).await.unwrap().len(), 4);
+    assert!(matches!(
+        revert_note(&db, n.id, 9, human("x")).await,
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[test]
+fn unified_diff_marks_lines() {
+    let d = unified_diff("a\nстарое\nb\n", "a\nновое\nb\n", "rev 1", "rev 2");
+    assert!(d.starts_with("--- rev 1\n+++ rev 2\n"), "{d}");
+    assert!(d.contains("@@ -1,3 +1,3 @@"), "{d}");
+    assert!(d.contains("\n-старое\n"), "{d}");
+    assert!(d.contains("\n+новое\n"), "{d}");
+    // контекст 3 строки: дальние строки в ханк не попадают
+    let old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+    let d = unified_diff(old, &old.replace("9\n", "девять\n"), "a", "b");
+    assert!(d.contains("@@ -6,4 +6,4 @@") && !d.contains(" 5\n"), "{d}");
+    assert_eq!(unified_diff("x\n", "x\n", "a", "b"), "");
 }

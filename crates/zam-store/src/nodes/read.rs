@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use rusqlite::{OptionalExtension, params};
 use zam_core::Id;
 
-use super::{NODE_COLS, Node, live_by_path, load_node, node_row};
+use super::{NODE_COLS, Node, live_by_path, load_node, node_row, revision_text};
 use crate::paths::NodePath;
 use crate::{Db, StoreError};
 
@@ -34,15 +34,7 @@ pub async fn node_content(db: &Db, id: Id, rev: Option<i64>) -> Result<(i64, Str
                 .optional()?
                 .ok_or(StoreError::NotFound)?,
         };
-        let content: String = c
-            .query_row(
-                "SELECT content FROM revisions WHERE node_id = ?1 AND rev = ?2",
-                params![id, rev],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)?;
-        Ok((rev, content))
+        Ok((rev, revision_text(c, id, rev)?))
     })
     .await
 }

@@ -14,8 +14,9 @@ pub use datadir::DataDir;
 pub use db::Db;
 pub use migrate::Migration;
 pub use nodes::{
-    Attribution, AuthorKind, NewNote, Node, NodeKind, create_folder, create_note, find_by_name,
-    get_node, get_node_by_path, list_children, node_content,
+    Attribution, AuthorKind, NewNote, Node, NodeKind, RevisionInfo, WriteError, create_folder,
+    create_note, find_by_name, get_node, get_node_by_path, list_children, list_revisions,
+    node_content, patch_note, revert_note, unified_diff, update_note,
 };
 pub use paths::NodePath;
 pub use system::{
