@@ -41,8 +41,8 @@ fn html(src: &str) -> String {
 // ---------- Шаг 1: рендер ----------
 
 #[test]
-fn render_version_is_two() {
-    assert_eq!(RENDER_VERSION, 2);
+fn render_version_is_three() {
+    assert_eq!(RENDER_VERSION, 3);
 }
 
 #[test]
@@ -448,4 +448,128 @@ Setext заголовок
     // дубли пронумерованы
     assert!(ours.contains(&"h-установка-1".to_string()), "{ours:?}");
     assert!(ours.contains(&"h-установка-2".to_string()), "{ours:?}");
+}
+
+#[test]
+fn cyrillic_callout_type() {
+    let h = html("> [!Заметка]\n> текст\n");
+    assert!(
+        h.contains(r#"<div class="callout" data-callout="заметка""#),
+        "{h}"
+    );
+    // без заголовка — тип с заглавной буквы
+    assert!(h.contains(">Заметка<"), "{h}");
+    assert!(!h.contains("[!"), "{h}");
+
+    let h = html("> [!важно_2]- Свёрнуто\n> тело\n");
+    assert!(h.contains(r#"data-callout="важно_2""#), "{h}");
+    assert!(h.contains(r#"data-fold="closed""#), "{h}");
+}
+
+#[test]
+fn callout_type_with_punctuation_is_plain_quote() {
+    for src in [
+        "> [!a\"b]\n> x\n",
+        "> [!a b]\n> x\n",
+        "> [!a<b>]\n> x\n",
+        "> [!тип.точка]\n> x\n",
+    ] {
+        let h = html(src);
+        assert!(h.contains("<blockquote"), "{src:?}: {h}");
+        assert!(!h.contains("data-callout"), "{src:?}: {h}");
+    }
+}
+
+// ---------- Бюджет подсветки (ТЗ §17) ----------
+
+/// Блок Rust примерно на `bytes` байт.
+fn rust_block(bytes: usize) -> String {
+    let line = "fn f(x: u32) -> u32 { let y = x * 2; y + 1 } // комментарий\n";
+    let mut s = String::from("```rust\n");
+    while s.len() < bytes {
+        s.push_str(line);
+    }
+    s.push_str("```\n\n");
+    s
+}
+
+#[test]
+fn highlight_budget_per_document() {
+    // два блока по 150 КБ: первый подсвечен, второй уже не помещается в 256 КиБ
+    let src = format!("{}{}", rust_block(150 * 1024), rust_block(150 * 1024));
+    let h = html(&src);
+    assert_eq!(
+        h.matches("<pre class=\"hl-code\"").count(),
+        1,
+        "подсвечен один блок"
+    );
+    assert_eq!(
+        h.matches("<pre class=\"hl-skipped\"").count(),
+        1,
+        "второй — без подсветки"
+    );
+    // пропущенный блок — экранированный текст без span-ов
+    let skipped = &h[h.find("hl-skipped").unwrap()..];
+    assert!(
+        !skipped.contains("<span"),
+        "в пропущенном блоке нет подсветки"
+    );
+    assert!(skipped.contains("-&gt; u32"), "текст экранирован");
+}
+
+#[test]
+fn block_is_highlighted_only_if_it_fits_remaining_budget() {
+    // блок больше бюджета целиком не подсвечивается и бюджет не тратит:
+    // следующий малый блок подсвечен
+    let src = format!("{}```rust\nfn main() {{}}\n```\n", rust_block(260 * 1024));
+    let h = html(&src);
+    assert_eq!(h.matches("<pre class=\"hl-skipped\"").count(), 1);
+    assert_eq!(h.matches("<pre class=\"hl-code\"").count(), 1);
+
+    // 200 КБ + 60 КБ: второй не помещается в остаток, третий (малый) помещается
+    let src = format!(
+        "{}{}```rust\nfn main() {{}}\n```\n",
+        rust_block(200 * 1024),
+        rust_block(60 * 1024)
+    );
+    let h = html(&src);
+    assert_eq!(h.matches("<pre class=\"hl-code\"").count(), 2);
+    assert_eq!(h.matches("<pre class=\"hl-skipped\"").count(), 1);
+
+    // блоки без языка и с неизвестным языком — обычный `<pre>`, не `hl-skipped`
+    let h = html("```\nx\n```\n\n```нет-такого\ny\n```\n");
+    assert!(!h.contains("hl-skipped"), "{h}");
+}
+
+#[test]
+fn megabyte_note_with_large_code_blocks_renders_bounded() {
+    // 1 МБ: четыре блока по ~250 КБ кода Rust; первый — настоящий код (исходник
+    // рендера), остальные — плотный синтетический
+    let mut real = String::from("```rust\n");
+    for line in include_str!("../src/render.rs").lines().cycle() {
+        if real.len() + line.len() + 1 > 250 * 1024 {
+            break;
+        }
+        real.push_str(line);
+        real.push('\n');
+    }
+    real.push_str("```\n\n");
+    let src = format!("{real}{}", rust_block(250 * 1024).repeat(3));
+    assert!(src.len() >= 1_000_000);
+    let started = std::time::Instant::now();
+    let h = html(&src);
+    let took = started.elapsed();
+    eprintln!("рендер 1 МБ: {took:?}, HTML {} байт", h.len());
+    assert_eq!(h.matches("<pre class=\"hl-code\"").count(), 1);
+    assert_eq!(h.matches("<pre class=\"hl-skipped\"").count(), 3);
+    // подсветка раздувает HTML; без бюджета вывод был бы в разы больше
+    assert!(h.len() < 8 * src.len(), "HTML {} байт", h.len());
+    if !cfg!(debug_assertions) {
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    }
+}
+
+#[test]
+fn highlight_css_is_cached() {
+    assert!(std::ptr::eq(highlight_css(), highlight_css()));
 }

@@ -11,6 +11,8 @@ use std::sync::LazyLock;
 
 use ammonia::{Builder, UrlRelative};
 
+use crate::render::is_callout_kind;
+
 /// Разрешённые теги: всё, что порождают comrak (GFM, сноски, задачи) и
 /// собственные проходы (callout, медиа, формулы).
 const TAGS: &[&str] = &[
@@ -170,12 +172,7 @@ fn filter<'u>(element: &str, attribute: &str, value: &'u str) -> Option<Cow<'u, 
         ),
         (_, "data-math-style") => keep(matches!(value, "inline" | "display")),
         (_, "data-fold") => keep(matches!(value, "open" | "closed" | "none")),
-        (_, "data-callout") => keep(
-            !value.is_empty()
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-        ),
+        (_, "data-callout") => keep(is_callout_kind(value)),
         ("h1" | "h2" | "h3" | "h4" | "h5" | "h6", "id") => keep(value.starts_with("h-")),
         ("li", "id") => keep(value.starts_with("fn-")),
         ("a", "id") => keep(value.starts_with("fnref-")),

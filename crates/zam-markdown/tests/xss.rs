@@ -288,3 +288,18 @@ fn sanitizer_input_only_checkbox() {
     assert!(!out.contains("text"), "{out}");
     assert!(!out.contains("value"), "{out}");
 }
+
+#[test]
+fn sanitizer_data_callout_unicode_only_letters_digits() {
+    let out = sanitize_html(r#"<div class="callout" data-callout="заметка_1-x">t</div>"#);
+    assert!(out.contains(r#"data-callout="заметка_1-x""#), "{out}");
+    for bad in [
+        r#"<div data-callout="a b">t</div>"#,
+        r#"<div data-callout="тип:x">t</div>"#,
+        r#"<div data-callout="">t</div>"#,
+        "<div data-callout=\"тип\u{202e}\">t</div>",
+    ] {
+        let out = sanitize_html(bad);
+        assert!(!out.contains("data-callout"), "{bad}: {out}");
+    }
+}

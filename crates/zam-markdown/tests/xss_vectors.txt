@@ -101,6 +101,15 @@ text <script>alert(document.cookie)</script> inline
 ---8<---
 > [!tip]+ `<style>` **<iframe>**
 ---8<---
+> [!заметка" onclick="alert(1)] заголовок
+> тело
+---8<---
+> [!заметка]- <img src=x onerror=alert(1)>
+> [[javascript:alert(1)]]
+---8<---
+> [!тип‮<script>]
+> тело
+---8<---
 <details open ontoggle=alert(1)>x</details>
 ---8<---
 ```"><script>alert(1)</script>

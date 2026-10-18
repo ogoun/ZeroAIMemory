@@ -19,13 +19,13 @@ use comrak::{Arena, parse_document};
 use serde::Serialize;
 
 use crate::doc::{Link, OutlineItem, doc_from_root, outline, split_anchor};
-use crate::highlight::highlight;
+use crate::highlight::{HIGHLIGHT_BUDGET_BYTES, Highlighted, highlight};
 use crate::options::{HEADER_ID_PREFIX, comrak_options};
 use crate::sanitize::{EXTERNAL_REL, sanitize_html};
 
 /// Версия вывода рендера: часть ключа кэша `(content_hash, render_version)`.
 /// Растёт при любом изменении HTML.
-pub const RENDER_VERSION: u32 = 2;
+pub const RENDER_VERSION: u32 = 3;
 
 /// Разрешённая вики-ссылка.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +148,6 @@ enum Plan {
 }
 
 /// Данные проходов для форматтера; узлы — по адресу в арене.
-#[derive(Default)]
 struct State {
     /// Цитата → callout `(тип, сворачивание)`.
     callouts: HashMap<usize, (String, Fold)>,
@@ -156,6 +155,19 @@ struct State {
     titles: HashMap<usize, Fold>,
     /// Ссылки, картинки и вики-ссылки с особым выводом.
     plans: HashMap<usize, Plan>,
+    /// Остаток бюджета подсветки документа, байт исходника.
+    highlight_budget: usize,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            callouts: HashMap::new(),
+            titles: HashMap::new(),
+            plans: HashMap::new(),
+            highlight_budget: HIGHLIGHT_BUDGET_BYTES,
+        }
+    }
 }
 
 fn key(node: &AstNode<'_>) -> usize {
@@ -282,11 +294,7 @@ fn parse_marker(s: &str) -> Option<(String, Fold, usize)> {
     let rest = s.strip_prefix("[!")?;
     let end = rest.find(']')?;
     let kind = &rest[..end];
-    if kind.is_empty()
-        || !kind
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
+    if !is_callout_kind(kind) {
         return None;
     }
     let after = &rest[end + 1..];
@@ -298,7 +306,16 @@ fn parse_marker(s: &str) -> Option<(String, Fold, usize)> {
     if !after[sign..].is_empty() && !after[sign..].starts_with(char::is_whitespace) {
         return None;
     }
-    Some((kind.to_ascii_lowercase(), fold, 2 + end + 1 + sign))
+    Some((kind.to_lowercase(), fold, 2 + end + 1 + sign))
+}
+
+/// Допустимый тип callout: буквы и цифры любого алфавита (`заметка`, `note`), `-`, `_`.
+/// Тот же набор проверяет санитайзер в `data-callout`.
+pub(crate) fn is_callout_kind(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Тип с заглавной первой буквой — заголовок callout по умолчанию.
@@ -513,20 +530,36 @@ fn code_block<'a>(ctx: &mut Ctx<'_, '_>, node: &'a AstNode<'a>, cb: &NodeCodeBlo
         ctx.write_str("><code>")?;
         ctx.escape(&cb.literal)?;
         ctx.write_str("</code></pre>")?;
-    } else if let Some(html) = highlight(lang, &cb.literal) {
-        ctx.write_str("<pre class=\"hl-code\"")?;
-        render_sourcepos(ctx, node)?;
-        ctx.write_str("><code>")?;
-        ctx.write_str(&html)?;
-        ctx.write_str("</code></pre>")?;
     } else {
-        ctx.write_str("<pre")?;
-        render_sourcepos(ctx, node)?;
-        ctx.write_str("><code>")?;
-        ctx.escape(&cb.literal)?;
-        ctx.write_str("</code></pre>")?;
+        match highlight(lang, &cb.literal, &mut ctx.user.highlight_budget) {
+            Highlighted::Html(html) => {
+                ctx.write_str("<pre class=\"hl-code\"")?;
+                render_sourcepos(ctx, node)?;
+                ctx.write_str("><code>")?;
+                ctx.write_str(&html)?;
+                ctx.write_str("</code></pre>")?;
+            }
+            // бюджет подсветки документа исчерпан (ТЗ §17)
+            Highlighted::Skipped => plain_code(ctx, node, &cb.literal, " class=\"hl-skipped\"")?,
+            Highlighted::Plain => plain_code(ctx, node, &cb.literal, "")?,
+        }
     }
     ctx.lf()
+}
+
+/// Блок кода экранированным текстом; `class_attr` — готовый атрибут или пусто.
+fn plain_code<'a>(
+    ctx: &mut Ctx<'_, '_>,
+    node: &'a AstNode<'a>,
+    literal: &str,
+    class_attr: &str,
+) -> fmt::Result {
+    ctx.write_str("<pre")?;
+    ctx.write_str(class_attr)?;
+    render_sourcepos(ctx, node)?;
+    ctx.write_str("><code>")?;
+    ctx.escape(literal)?;
+    ctx.write_str("</code></pre>")
 }
 
 fn callout_open<'a>(
