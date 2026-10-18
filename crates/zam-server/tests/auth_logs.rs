@@ -2,9 +2,11 @@
 mod common;
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
 use tracing_subscriber::fmt::MakeWriter;
@@ -45,11 +47,25 @@ async fn bad_token_not_in_logs() {
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
-    let r = app.oneshot(req).await.unwrap();
+    let r = app.clone().oneshot(req).await.unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     assert!(!log.contains("BBBBBBBB"), "{log}");
     assert!(log.contains("zam_AAAAAAAA…"), "{log}");
     // событие о неудаче есть и содержит ip
     assert!(log.contains("WARN") && log.contains("ip=0.0.0.0"), "{log}");
+    // прокси вне trusted_proxies — одно предупреждение на процесс
+    for _ in 0..2 {
+        let mut req = Request::get("/api/v1/spaces")
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([10, 2, 2, 2], 1))));
+        let r = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    let n = log.matches("server.trusted_proxies").count();
+    assert_eq!(n, 1, "{log}");
 }

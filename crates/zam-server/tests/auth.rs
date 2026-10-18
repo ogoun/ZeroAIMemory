@@ -332,7 +332,7 @@ async fn sixth_login_attempt_in_minute_429() {
 }
 
 #[tokio::test]
-async fn bad_tokens_rate_limited_valid_unaffected_elsewhere() {
+async fn bad_tokens_rate_limited_valid_token_still_passes() {
     let (app, _, token) = app(cfg("ratetoken")).await;
     let with_peer = |t: &str, ip: &str| {
         let mut r = bearer("/api/v1/spaces", t);
@@ -353,20 +353,20 @@ async fn bad_tokens_rate_limited_valid_unaffected_elsewhere() {
         let r = app.clone().oneshot(with_peer(t, "10.0.0.5")).await.unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{t}");
     }
-    let r = app
-        .clone()
-        .oneshot(with_peer(&bad, "10.0.0.5"))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(r.headers().contains_key(header::RETRY_AFTER));
-    // IP заблокирован и для верного токена (иначе перебор продолжался бы)
+    // превышение не блокирует верный токен с того же IP (общий NAT/прокси)
     let r = app
         .clone()
         .oneshot(with_peer(&token, "10.0.0.5"))
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.status(), StatusCode::OK);
+    // неверный в формате и не в формате — 429 с Retry-After
+    for t in [bad.as_str(), "garbage"] {
+        let r = app.clone().oneshot(with_peer(t, "10.0.0.5")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS, "{t}");
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+        assert_eq!(body_json(r).await["type"], "/problems/rate-limited");
+    }
     let r = app.oneshot(with_peer(&token, "10.0.0.6")).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
@@ -443,4 +443,42 @@ async fn admin_selects_user_via_header() {
     let j = body_json(app.oneshot(r).await.unwrap()).await;
     assert_eq!(j["user"]["name"], "bob");
     assert_eq!(j["access"], "ro");
+}
+
+#[tokio::test]
+async fn failed_login_audit_has_no_entered_login() {
+    let (app, st, _) = app(cfg("auditlogin")).await;
+    let r = app
+        .clone()
+        .oneshot(login_req("s3cretpass", "whatever"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let r = app.oneshot(login_req("admin", "wrong")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let rows = audit_actions(&st).await;
+    let all = format!("{rows:?}");
+    assert!(
+        !all.contains("s3cretpass") && !all.contains("whatever"),
+        "{all}"
+    );
+    let failed: Vec<_> = rows
+        .iter()
+        .filter(|r| r.action == "admin_login_failed")
+        .map(|r| r.details["login_matches"].as_bool().unwrap())
+        .collect();
+    // новые первыми
+    assert_eq!(failed, [true, false]);
+}
+
+#[test]
+fn principal_debug_masks_session_id() {
+    let sid = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let p = zam_server::auth::Principal::Admin {
+        session_id: sid.into(),
+    };
+    let a = AdminOnly(sid.into());
+    let dbg = format!("{p:?} {a:?}");
+    assert!(!dbg.contains("efgh"), "{dbg}");
+    assert!(dbg.contains("abcd…"), "{dbg}");
 }

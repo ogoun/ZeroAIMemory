@@ -18,8 +18,6 @@ use crate::error::ApiError;
 
 /// Срок cookie совпадает со сроком веб-сессии в `system.db` (12 ч).
 const SESSION_MAX_AGE_S: i64 = 12 * 3600;
-/// Сколько символов введённого логина попадает в аудит неудачи.
-const AUDIT_LOGIN_MAX: usize = 64;
 
 #[derive(Deserialize)]
 struct LoginReq {
@@ -42,7 +40,7 @@ fn session_cookie(st: &AppState, value: String, max_age_s: i64, secure: bool) ->
 }
 
 /// Хэш случайного пароля с параметрами настоящего: проверка по нему длится столько же.
-fn make_dummy_hash(real: &str) -> Result<String, String> {
+pub(crate) fn make_dummy_hash(real: &str) -> Result<String, String> {
     let parsed = PasswordHash::new(real).map_err(|e| e.to_string())?;
     let alg = Algorithm::try_from(parsed.algorithm).map_err(|e| e.to_string())?;
     let ver = parsed
@@ -82,29 +80,18 @@ pub async fn login(
         .map_err(|_| ApiError::BadRequest("ожидается JSON {login, password}".into()))?;
     let login_ok = ct_eq(req.login.as_bytes(), st.cfg.admin.login.as_bytes());
     // Неверный логин тоже проходит полную проверку argon2 — время ответа одинаково.
-    let st2 = st.clone();
+    let hash = if login_ok {
+        st.admin_hash.to_string()
+    } else {
+        st.auth.dummy_hash.clone()
+    };
     let password = req.password;
-    let verified = tokio::task::spawn_blocking(move || {
-        let hash = if login_ok {
-            st2.admin_hash.as_str().to_string()
-        } else {
-            match st2.auth.dummy_hash.get() {
-                Some(h) => h.clone(),
-                None => {
-                    let h = make_dummy_hash(&st2.admin_hash)?;
-                    st2.auth.dummy_hash.get_or_init(|| h).clone()
-                }
-            }
-        };
-        Ok::<_, String>(verify(&hash, &password))
-    })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?
-    .map_err(ApiError::Internal)?;
+    let verified = tokio::task::spawn_blocking(move || verify(&hash, &password))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if !(login_ok && verified) {
         tracing::warn!(ip = %ip, "неудачный вход администратора");
-        let shown: String = req.login.chars().take(AUDIT_LOGIN_MAX).collect();
         st.system
             .audit(
                 "anonymous",
@@ -112,7 +99,7 @@ pub async fn login(
                 "admin_login_failed",
                 None,
                 Some(&ip),
-                json!({ "login": shown }),
+                json!({ "login_matches": login_ok }),
             )
             .await?;
         return Err(ApiError::Unauthorized);

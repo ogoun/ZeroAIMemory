@@ -97,13 +97,18 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         .await?
         .ok_or_else(|| anyhow::anyhow!("администратор не найден после первого запуска"))?
         .id;
+    // Фиктивный хэш — до приёма запросов: без оракула первого вызова.
+    let real = admin_hash.clone();
+    let auth = tokio::task::spawn_blocking(move || AuthState::new(&real))
+        .await?
+        .map_err(|e| anyhow::anyhow!("не удалось подготовить проверку пароля: {e}"))?;
     let state = AppState {
         users: UserDbs::new(data_dir.users_dir()),
         data_dir,
         system,
         admin_hash: Arc::new(admin_hash),
         admin_id,
-        auth: Arc::default(),
+        auth: Arc::new(auth),
         started_at: Instant::now(),
         version: env!("CARGO_PKG_VERSION"),
         cfg: Arc::new(cfg),

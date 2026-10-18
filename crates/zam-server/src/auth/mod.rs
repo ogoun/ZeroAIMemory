@@ -3,7 +3,7 @@ pub mod admin;
 pub mod rate;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
@@ -25,26 +25,70 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 pub const USER_HEADER: &str = "x-zam-user";
 
 /// Состояние аутентификации процесса (лимиты, фиктивный хэш).
-#[derive(Debug, Default)]
 pub struct AuthState {
     /// Каждая попытка входа администратора.
     pub login: RateLimiter,
     /// Только неудачные проверки токена.
     pub bad_token: RateLimiter,
-    /// Фиктивный argon2id-хэш для неверного логина (вычисляется один раз).
-    pub(crate) dummy_hash: OnceLock<String>,
+    /// Фиктивный хэш для неверного логина: с параметрами настоящего, вычисляется при старте.
+    pub(crate) dummy_hash: String,
+    /// Предупреждение о недоверенном прокси уже выдано.
+    proxy_warned: AtomicBool,
+}
+
+impl AuthState {
+    /// Блокирующий вызов (argon2): выполнять в `spawn_blocking`.
+    pub fn new(admin_hash: &str) -> Result<AuthState, String> {
+        Ok(AuthState {
+            login: RateLimiter::default(),
+            bad_token: RateLimiter::default(),
+            dummy_hash: admin::make_dummy_hash(admin_hash)?,
+            proxy_warned: AtomicBool::new(false),
+        })
+    }
+}
+
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthState").finish_non_exhaustive()
+    }
 }
 
 /// Кто выполняет запрос.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Principal {
     Token(AuthToken),
     Admin { session_id: String },
 }
 
 /// Только администратор по cookie-сессии; токены — 403.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdminOnly(pub String /*session_id*/);
+
+/// Id сессии в отладочном выводе: первые 4 символа.
+fn mask_sid(sid: &str) -> String {
+    format!("{}…", sid.chars().take(4).collect::<String>())
+}
+
+impl std::fmt::Debug for Principal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Principal::Token(t) => f.debug_tuple("Token").field(t).finish(),
+            Principal::Admin { session_id } => f
+                .debug_struct("Admin")
+                .field("session_id", &mask_sid(session_id))
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AdminOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AdminOnly")
+            .field(&mask_sid(&self.0))
+            .finish()
+    }
+}
 
 /// Адрес клиента и схема с учётом доверенных прокси. Извлекается всегда.
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +153,17 @@ impl FromRequestParts<AppState> for Client {
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
+        if let Some(p) = peer
+            && !trusted_peer(p, trusted)
+            && parts.headers.contains_key("x-forwarded-for")
+            && !st.auth.proxy_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                peer = %p.ip(),
+                "запросы идут через прокси, не указанный в server.trusted_proxies —
+                 лимиты и IP в аудите общие для всех клиентов"
+            );
+        }
         Ok(match peer {
             Some(p) => Client {
                 ip: client_ip(p, &parts.headers, trusted),
@@ -151,13 +206,18 @@ async fn authenticate_token(st: &AppState, ip: IpAddr, token: &str) -> Result<Pr
     let limited = |d| ApiError::RateLimited {
         retry_after_s: retry_after_secs(d),
     };
-    // Заблокированный IP не проверяется вовсе — иначе перебор продолжался бы.
-    st.auth.bad_token.peek(ip).map_err(limited)?;
+    // Превышение не блокирует верные токены: за общим NAT/прокси чужой мусор
+    // не должен отключать агентов. Перебор 40 символов base62 и так невозможен.
+    let over = st.auth.bad_token.peek(ip).err();
     if looks_like_token(token) {
         let ip_s = ip.to_string();
         if let Some(t) = st.system.verify_token(token, Some(&ip_s)).await? {
             return Ok(Principal::Token(t));
         }
+    }
+    // При превышении — 429 без записи в лог (защита от наводнения журнала).
+    if let Some(d) = over {
+        return Err(limited(d));
     }
     tracing::warn!(token = %mask_token(token), ip = %ip, "отклонён неверный токен");
     st.auth.bad_token.check(ip).map_err(limited)?;
