@@ -2,6 +2,7 @@
 //! Фиксированная ширина делает лексикографический порядок строк равным хронологическому.
 
 use jiff::Timestamp;
+use rusqlite::Row;
 
 use crate::StoreError;
 
@@ -14,6 +15,27 @@ pub fn fmt_ts(ts: Timestamp) -> String {
 pub fn parse_ts(s: &str) -> Result<Timestamp, StoreError> {
     s.parse()
         .map_err(|e| StoreError::Corrupt(format!("некорректное время «{s}»: {e}")))
+}
+
+/// Ошибка преобразования значения колонки `i` для `query_map`.
+pub(crate) fn conv_err<E: std::error::Error + Send + Sync + 'static>(
+    i: usize,
+    e: E,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e))
+}
+
+/// Обязательное время из колонки `i`.
+pub(crate) fn ts_at(r: &Row, i: usize) -> rusqlite::Result<Timestamp> {
+    let s: String = r.get(i)?;
+    parse_ts(&s).map_err(|e| conv_err(i, e))
+}
+
+/// Необязательное время из колонки `i`.
+pub(crate) fn ts_opt(r: &Row, i: usize) -> rusqlite::Result<Option<Timestamp>> {
+    r.get::<_, Option<String>>(i)?
+        .map(|s| parse_ts(&s).map_err(|e| conv_err(i, e)))
+        .transpose()
 }
 
 #[cfg(test)]

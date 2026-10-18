@@ -1,8 +1,11 @@
-//! Хранилище ZeroAIMemory: открытие SQLite, поток-писатель, пул читателей, миграции.
+//! Хранилище ZeroAIMemory: открытие SQLite, поток-писатель, пул читателей, миграции,
+//! узлы и ревизии заметок с синхронной индексацией (чанки секций, FTS5).
 
 pub mod datadir;
 pub mod db;
 pub mod migrate;
+pub mod nodes;
+pub mod paths;
 pub mod system;
 pub mod time;
 pub mod user_db;
@@ -10,6 +13,11 @@ pub mod user_db;
 pub use datadir::DataDir;
 pub use db::Db;
 pub use migrate::Migration;
+pub use nodes::{
+    Attribution, AuthorKind, NewNote, Node, NodeKind, create_folder, create_note, find_by_name,
+    get_node, get_node_by_path, list_children, node_content,
+};
+pub use paths::NodePath;
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,
 };
@@ -28,6 +36,8 @@ pub enum StoreError {
     NotFound,
     #[error("конфликт: {0}")]
     Conflict(String),
+    #[error("некорректные данные: {0}")]
+    BadInput(String),
     #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
     DataDirLocked(std::path::PathBuf),
     #[error("повреждённые данные: {0}")]

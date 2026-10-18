@@ -55,6 +55,8 @@ mime_guess = "2"
 lru = "0.18"
 proptest = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
+# хеш текста и id чанков (§6.3)
+blake3 = "1"
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]

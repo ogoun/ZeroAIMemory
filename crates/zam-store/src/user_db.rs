@@ -15,10 +15,16 @@ use crate::time::fmt_ts;
 use crate::{Db, Migration, StoreError};
 
 /// Миграции пользовательской БД.
-pub static USER_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/user/0001_init.sql"),
-}];
+pub static USER_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/user/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/user/0002_notes.sql"),
+    },
+];
 
 /// Вид пространства.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

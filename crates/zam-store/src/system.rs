@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use zam_core::{Id, generate_token, hash_token};
 
-use crate::time::{fmt_ts, parse_ts};
+use crate::time::{conv_err, fmt_ts, ts_at, ts_opt};
 use crate::{DataDir, Db, Migration, StoreError};
 
 /// Миграции `system.db`.
@@ -117,21 +117,6 @@ pub struct AuditRow {
 #[derive(Clone, Debug)]
 pub struct SystemStore {
     db: Db,
-}
-
-fn conv_err<E: std::error::Error + Send + Sync + 'static>(i: usize, e: E) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e))
-}
-
-fn ts_at(r: &Row, i: usize) -> rusqlite::Result<Timestamp> {
-    let s: String = r.get(i)?;
-    parse_ts(&s).map_err(|e| conv_err(i, e))
-}
-
-fn ts_opt(r: &Row, i: usize) -> rusqlite::Result<Option<Timestamp>> {
-    r.get::<_, Option<String>>(i)?
-        .map(|s| parse_ts(&s).map_err(|e| conv_err(i, e)))
-        .transpose()
 }
 
 fn user_row(r: &Row) -> rusqlite::Result<User> {
