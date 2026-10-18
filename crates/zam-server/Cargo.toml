@@ -32,6 +32,8 @@ tracing-appender.workspace = true
 clap.workspace = true
 rpassword.workspace = true
 anyhow.workspace = true
+subtle.workspace = true
+cookie.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

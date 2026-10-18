@@ -6,8 +6,10 @@ use axum::Router;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
+use zam_core::Id;
 use zam_store::{DataDir, SystemStore, UserDbs};
 
+use crate::auth::AuthState;
 use crate::config::{AdminSecret, ServerConfig};
 use crate::error::not_found;
 use crate::{api, bootstrap};
@@ -22,6 +24,9 @@ pub struct AppState {
     /// Владелец лока каталога данных: живёт, пока жив любой клон состояния.
     pub data_dir: Arc<DataDir>,
     pub admin_hash: Arc<String>,
+    /// Пользователь администратора (неизменен после первого запуска).
+    pub admin_id: Id,
+    pub auth: Arc<AuthState>,
     pub system: SystemStore,
     pub users: UserDbs,
     pub started_at: Instant,
@@ -87,11 +92,18 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     } = p;
     let system = SystemStore::open(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
+    let admin_id = system
+        .admin_user()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("администратор не найден после первого запуска"))?
+        .id;
     let state = AppState {
         users: UserDbs::new(data_dir.users_dir()),
         data_dir,
         system,
         admin_hash: Arc::new(admin_hash),
+        admin_id,
+        auth: Arc::default(),
         started_at: Instant::now(),
         version: env!("CARGO_PKG_VERSION"),
         cfg: Arc::new(cfg),

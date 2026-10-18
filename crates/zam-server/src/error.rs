@@ -3,9 +3,12 @@ use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
+use zam_store::StoreError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    #[error("{0}")]
+    BadRequest(String),
     #[error("требуется аутентификация")]
     Unauthorized,
     #[error("доступ запрещён")]
@@ -26,6 +29,7 @@ pub enum ApiError {
 impl ApiError {
     fn parts(&self) -> (StatusCode, &'static str, &'static str) {
         match self {
+            ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "about:blank", "Bad Request"),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "about:blank", "Unauthorized"),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "about:blank", "Forbidden"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "about:blank", "Not Found"),
@@ -49,6 +53,16 @@ impl ApiError {
     }
 }
 
+impl From<StoreError> for ApiError {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::NotFound => ApiError::NotFound,
+            StoreError::Conflict(m) => ApiError::Conflict(m),
+            other => ApiError::Internal(other.to_string()),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, kind, title) = self.parts();
@@ -62,13 +76,20 @@ impl IntoResponse for ApiError {
             "detail": self.to_string(),
         });
         let mut resp = (status, Json(body)).into_response();
-        resp.headers_mut().insert(
+        let h = resp.headers_mut();
+        h.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),
         );
-        if let ApiError::RateLimited { retry_after_s } = self {
-            resp.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_s));
+        match self {
+            ApiError::RateLimited { retry_after_s } => {
+                h.insert(header::RETRY_AFTER, HeaderValue::from(retry_after_s));
+            }
+            // RFC 9110 §15.5.2: 401 обязан нести схему.
+            ApiError::Unauthorized => {
+                h.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            }
+            _ => {}
         }
         resp
     }
