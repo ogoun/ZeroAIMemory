@@ -3,6 +3,7 @@
   // справа — документ, стартовый экран пользователя или администрирование.
   import { onMount } from 'svelte';
   import DocView from '../components/DocView.svelte';
+  import Search from '../components/Search.svelte';
   import Tree, { type Reveal, type TreeChange } from '../components/Tree.svelte';
   import Users from './Users.svelte';
   import { ApiError, listUsers, type Me, type NodeInfo, type User } from '../lib/api';
@@ -19,6 +20,9 @@
   let reloadKey = $state(0);
   /** Узкий экран: дерево — выдвижная панель (скрытая недоступна с клавиатуры). */
   let narrow = $state(false);
+  /** Счётчик событий маршрута (повторный переход к тому же якорю тоже прокручивает). */
+  let nav = $state(0);
+  let searchOpen = $state(false);
 
   async function loadUsers() {
     usersError = '';
@@ -49,12 +53,15 @@
     narrow = mq.matches;
     const onmq = (e: MediaQueryListEvent) => (narrow = e.matches);
     mq.addEventListener('change', onmq);
-    if (normalize(route)) route = current();
+    // пустой адрес заменяется адресом своего пользователя; маршрут — всегда по итогу
+    normalize(current());
+    route = current();
     loadUsers();
     const off = listen((r) => {
       if (!normalize(r)) return;
       const wasAdmin = route.name === 'admin';
       route = r;
+      nav++;
       drawer = false;
       // после администрирования список пользователей мог измениться
       if (wasAdmin && r.name !== 'admin') loadUsers();
@@ -86,11 +93,23 @@
     }
   }
 
+  /** Пользователь, в заметках которого ищет Ctrl+K: открытый, иначе свой. */
+  let searchUser = $derived(route.name === 'admin' ? me.user_id : (route.user ?? me.user_id));
+
+  function onkeydown(e: KeyboardEvent) {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      searchOpen = true;
+    }
+  }
+
   let userName = $derived.by(() => {
     const r = route;
     return r.name === 'admin' ? '' : (users.find((u) => u.id === r.user)?.name ?? '');
   });
 </script>
+
+<svelte:window {onkeydown} />
 
 <div class="shell" class:drawer-open={drawer}>
   <header class="topbar">
@@ -109,6 +128,10 @@
       <a href={href({ name: 'home', user: me.user_id })} aria-current={route.name !== 'admin' ? 'page' : undefined}>Заметки</a>
       <a href={href({ name: 'admin' })} aria-current={route.name === 'admin' ? 'page' : undefined}>Администрирование</a>
     </nav>
+    <button type="button" class="search-btn" onclick={() => (searchOpen = true)} title="Поиск (Ctrl+K)" aria-label="Поиск">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8" /><path d="M13 13l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" /></svg>
+      <span class="search-label">Поиск</span><kbd>Ctrl K</kbd>
+    </button>
     <span class="who">
       <span class="muted login">{me.login}</span>
       <button type="button" onclick={onlogout}>Выйти</button>
@@ -136,6 +159,7 @@
         node={route.node}
         anchor={route.anchor}
         {reloadKey}
+        {nav}
         {onloaded}
         {onexpired}
       />
@@ -150,6 +174,8 @@
     {/if}
   </main>
 </div>
+
+<Search bind:open={searchOpen} user={searchUser} {onexpired} />
 
 <style>
   .shell {
@@ -195,8 +221,25 @@
     color: var(--text);
     background: var(--selected);
   }
-  .who {
+  .search-btn {
     margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    color: var(--muted);
+  }
+  .search-btn svg {
+    width: 16px;
+    height: 16px;
+  }
+  .search-btn kbd {
+    font: 11px ui-monospace, Consolas, monospace;
+    padding: 1px 4px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .who {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -258,7 +301,9 @@
       padding: 6px;
       font-size: 14px;
     }
-    .login {
+    .login,
+    .search-btn kbd,
+    .search-label {
       display: none;
     }
     .sidebar {

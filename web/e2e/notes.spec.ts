@@ -1,6 +1,7 @@
 // Сквозные сценарии заметок в WebUI: дерево, просмотр документа с «оживлением»,
 // контекстное меню, корзина, узкий экран. Данные — из seed.ts (global-setup).
 import { expect, test, type Page } from '@playwright/test';
+import { ADMIN_STATE } from './session';
 import { RUST_CODE } from './seed';
 
 const env = (k: string) => {
@@ -9,6 +10,8 @@ const env = (k: string) => {
   return v;
 };
 const base = () => env('E2E_BASE_URL');
+
+test.use({ storageState: ADMIN_STATE });
 
 /** Ошибки JS, CSP и неожиданные HTTP-ответы страницы. */
 function watch(page: Page): string[] {
@@ -27,11 +30,9 @@ function watch(page: Page): string[] {
   return problems;
 }
 
+/** Открывает приложение с общей сессией (вход — один раз в global-setup). */
 async function login(page: Page) {
   await page.goto(base());
-  await page.getByLabel('Логин').fill('admin');
-  await page.getByLabel('Пароль').fill(env('E2E_ADMIN_PASSWORD'));
-  await page.getByRole('button', { name: 'Войти' }).click();
   await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
 }
 

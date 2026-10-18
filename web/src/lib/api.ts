@@ -32,6 +32,8 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    /** Тело problem+json (RFC 9457) с дополнительными полями, если пришло. */
+    public problem: Record<string, unknown> | null = null,
   ) {
     super(message);
   }
@@ -45,27 +47,48 @@ export const hasSession = (): boolean => csrf !== '';
 /** Заголовок выбора пользователя: администратор действует от имени `user`. */
 const USER_HEADER = 'X-Zam-User';
 
-async function call<T>(method: string, path: string, body?: unknown, user?: string): Promise<T> {
-  const headers: Record<string, string> = {};
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
+interface Req {
+  body?: unknown;
+  user?: string;
+  headers?: Record<string, string>;
+}
+
+/** Запрос к API: CSRF для изменяющих методов, выбор пользователя, разбор problem+json. */
+async function request(method: string, path: string, r: Req = {}): Promise<Response> {
+  const headers: Record<string, string> = { ...r.headers };
+  let body: BodyInit | undefined;
+  if (r.body instanceof FormData) {
+    // Content-Type с boundary ставит браузер
+    body = r.body;
+  } else if (r.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(r.body);
+  }
   if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf;
-  if (user) headers[USER_HEADER] = user;
+  if (r.user) headers[USER_HEADER] = r.user;
   const resp = await fetch(`api/v1/${path}`, {
     method,
     headers,
     credentials: 'same-origin',
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body,
   });
   if (!resp.ok) {
     let detail = resp.statusText;
+    let problem: Record<string, unknown> | null = null;
     try {
       const p = await resp.json();
+      if (p && typeof p === 'object') problem = p as Record<string, unknown>;
       if (typeof p.detail === 'string') detail = p.detail;
     } catch {
       /* тело не JSON */
     }
-    throw new ApiError(resp.status, detail);
+    throw new ApiError(resp.status, detail, problem);
   }
+  return resp;
+}
+
+async function call<T>(method: string, path: string, body?: unknown, user?: string): Promise<T> {
+  const resp = await request(method, path, { body, user });
   if (resp.status === 204) return undefined as T;
   return (await resp.json()) as T;
 }
@@ -212,5 +235,111 @@ export const listTrash = (user: string, space?: string) =>
     'GET',
     space ? `trash?space=${q(space)}` : 'trash',
     undefined,
+    user,
+  );
+
+// ---- правка, история, вложения, поиск ----
+
+/** Ответ 409 на замену: текущая ревизия и дифф от моей базовой к ней. */
+export interface Conflict {
+  current_rev: number;
+  diff: string;
+}
+
+/** Конфликт ревизий из ошибки `PUT` (409 с `current_rev`); иначе `null`. */
+export function conflictOf(e: unknown): Conflict | null {
+  if (!(e instanceof ApiError) || e.status !== 409 || !e.problem) return null;
+  const rev = e.problem.current_rev;
+  if (typeof rev !== 'number') return null;
+  const diff = e.problem.diff;
+  return { current_rev: rev, diff: typeof diff === 'string' ? diff : '' };
+}
+
+/** `PUT /nodes/{id}` с `If-Match: <rev>`: замена текста целиком. */
+export const replaceNode = async (user: string, id: string, rev: number, content: string) =>
+  (await (
+    await request('PUT', `nodes/${q(id)}`, {
+      body: { content },
+      user,
+      headers: { 'If-Match': `"${rev}"` },
+    })
+  ).json()) as NodeInfo;
+
+export interface Preview {
+  html: string;
+  toc: OutlineItem[];
+  warnings: string[];
+}
+
+/** Предпросмотр редактора: рендер в контексте заметки (вики-ссылки, вложения). */
+export const renderPreview = (user: string, md: string, baseNode: string) =>
+  call<Preview>('POST', 'render', { md, base_node: baseNode }, user);
+
+export interface UploadedBlob {
+  sha256: string;
+  link: string;
+  mime: string;
+  size: number;
+}
+
+/** `POST /blobs`: поле `node` строго перед `file` (так читает сервер). */
+export function uploadBlob(user: string, node: string, file: File): Promise<UploadedBlob> {
+  const form = new FormData();
+  form.append('node', node);
+  form.append('file', file, file.name);
+  return request('POST', 'blobs', { body: form, user }).then((r) => r.json() as Promise<UploadedBlob>);
+}
+
+export interface RevisionInfo {
+  rev: number;
+  content_hash: string;
+  size: number;
+  /** `human` | `agent` | `system`. */
+  author_kind: string;
+  token_id: string | null;
+  session_id: string | null;
+  machine: string | null;
+  message: string | null;
+  ts: string;
+}
+
+export const listRevisions = (user: string, id: string) =>
+  call<RevisionInfo[]>('GET', `nodes/${q(id)}/revisions`, undefined, user);
+
+/** Унифицированный дифф `from → to` (текст). */
+export const getDiff = async (user: string, id: string, from: number, to: number) =>
+  (await request('GET', `nodes/${q(id)}/diff?from=${from}&to=${to}`, { user })).text();
+
+export const revertNode = (user: string, id: string, rev: number) =>
+  call<NodeInfo>('POST', `nodes/${q(id)}/revert`, { rev }, user);
+
+export const getOutline = (user: string, id: string) =>
+  call<OutlineItem[]>('GET', `nodes/${q(id)}/outline`, undefined, user);
+
+export interface SearchItem {
+  node_id: string;
+  space: Space | null;
+  path: string;
+  heading_path: string;
+  rev: number;
+  /** Совпадения обрамлены U+E000 … U+E001. */
+  snippet: string;
+  score: number;
+}
+
+/** Полнотекстовый поиск по пространствам пользователя (Human — только администратору). */
+export const search = (user: string, query: string, spaces: string[]) =>
+  call<{ items: SearchItem[] }>(
+    'POST',
+    'search',
+    {
+      query,
+      scope: { spaces, include_human: true },
+      mode: 'chunks',
+      top_k: 20,
+      // в chunks бюджет делят и тексты чанков: с запасом, чтобы пришли все top_k
+      budget_tokens: 100_000,
+      format: 'json',
+    },
     user,
   );

@@ -4,6 +4,8 @@
   // формулы (KaTeX) и диаграммы (Mermaid) лениво отдельными чанками.
   import '../doc.css';
   import { tick, untrack } from 'svelte';
+  import Editor from './Editor.svelte';
+  import History from './History.svelte';
   import Lightbox from './Lightbox.svelte';
   import {
     ApiError,
@@ -15,7 +17,8 @@
     type RenderedNode,
   } from '../lib/api';
   import { copyText } from '../lib/clipboard';
-  import { codeOf, flashButton, hydrateDom, rewriteLinks } from '../lib/hydrate/dom';
+  import { codeOf, flashButton } from '../lib/hydrate/dom';
+  import { hydrateRendered } from '../lib/hydrate/render';
   import { anchorId, go, href, parse } from '../lib/router';
 
   interface Props {
@@ -25,11 +28,13 @@
     anchor: string | null;
     /** Смена значения — перечитать документ (переименование, восстановление). */
     reloadKey: number;
+    /** Счётчик событий маршрута: каждое (и с тем же якорем) — прокрутка к якорю. */
+    nav: number;
     onloaded: (n: NodeInfo) => void;
     onexpired: () => void;
   }
 
-  let { user, space, node, anchor, reloadKey, onloaded, onexpired }: Props = $props();
+  let { user, space, node, anchor, reloadKey, nav, onloaded, onexpired }: Props = $props();
 
   type Tab = 'doc' | 'history' | 'links';
   let tab = $state<Tab>('doc');
@@ -41,16 +46,35 @@
   let loading = $state(false);
   let body = $state<HTMLDivElement | null>(null);
   let lightbox = $state<{ src: string; alt: string } | null>(null);
+  /** Открыт редактор (вкладка «Документ»). */
+  let editing = $state(false);
 
   let seq = 0;
+  /** Загруженный документ и ключ перезагрузки: смена одного якоря не перечитывает документ. */
+  let loadedDoc = '';
+  let loadedReload = -1;
 
   $effect(() => {
     const u = user;
     const n = node;
     const s = space;
-    void reloadKey;
-    untrack(() => load(u, s, n));
+    const k = reloadKey;
+    const doc = JSON.stringify([u, s, n]);
+    if (doc === loadedDoc && k === loadedReload) return;
+    untrack(() => {
+      if (doc !== loadedDoc) {
+        // другая заметка — редактор закрывается (уход уже подтверждён проверкой маршрута)
+        editing = false;
+        tab = 'doc';
+      }
+      loadedDoc = doc;
+      loadedReload = k;
+      load(u, s, n);
+    });
   });
+
+  /** Перечитать документ (после сохранения, отката). */
+  const reload = () => load(user, space, node);
 
   async function load(u: string, s: string, n: string) {
     const my = ++seq;
@@ -97,32 +121,23 @@
   async function hydrate(r: RenderedNode, el: HTMLElement) {
     await tick();
     if (rendered !== r) return;
-    hydrateDom(el);
-    rewriteLinks(
-      el,
-      (n, a) => href({ name: 'node', user, space, node: n, anchor: a }),
-      (a) => href({ name: 'node', user, space, node, anchor: a }),
-    );
+    const done = hydrateRendered(el, {
+      wiki: (n, a) => href({ name: 'node', user, space, node: n, anchor: a }),
+      self: (a) => href({ name: 'node', user, space, node, anchor: a }),
+      alive: () => rendered === r,
+    });
     scrollToAnchor(anchor);
-    const jobs: Promise<void>[] = [];
-    if (el.querySelector('.math')) {
-      jobs.push(import('../lib/hydrate/katex').then((m) => (rendered === r ? m.renderMath(el) : undefined)));
-    }
-    if (el.querySelector('pre.mermaid-src')) {
-      jobs.push(import('../lib/hydrate/mermaid').then((m) => (rendered === r ? m.renderMermaid(el) : undefined)));
-    }
-    if (jobs.length === 0) return;
-    const res = await Promise.allSettled(jobs);
+    const ok = await done;
     if (rendered !== r) return;
-    if (res.some((x) => x.status === 'rejected')) {
-      notice = 'Не удалось загрузить модуль формул или диаграмм: обновите страницу.';
-    }
+    if (!ok) notice = 'Не удалось загрузить модуль формул или диаграмм: обновите страницу.';
     // формулы и диаграммы меняют высоту блоков — якорь мог сместиться
     scrollToAnchor(anchor);
   }
 
-  // Смена только якоря (назад/вперёд, ссылка внутри документа).
+  // Любое событие маршрута (назад/вперёд, оглавление, ссылка внутри документа,
+  // повторный клик по тому же якорю) — прокрутка к якорю.
   $effect(() => {
+    void nav;
     const a = anchor;
     untrack(() => scrollToAnchor(a));
   });
@@ -137,6 +152,12 @@
     el.classList.add('flash');
   }
 
+  /** Якорь этого документа: адрес без новой записи истории, прокрутка — по событию маршрута. */
+  function jump(a: string | null) {
+    go({ name: 'node', user, space, node, anchor: a }, { replace: true });
+  }
+
+  // Делегирование кликов документа и оглавления: копирование кода, лайтбокс, ссылки.
   async function onclick(e: MouseEvent) {
     const t = e.target as HTMLElement;
     const btn = t.closest<HTMLButtonElement>('button[data-copy]');
@@ -161,9 +182,8 @@
     e.preventDefault();
     const r = parse(raw);
     if (r.name === 'node' && r.user === user && r.node === node) {
-      // тот же документ: прокрутка и адрес без перезагрузки
-      go(r, { silent: true });
-      scrollToAnchor(r.anchor);
+      // тот же документ: якорь в адресе и прокрутка, без перезагрузки
+      jump(r.anchor);
     } else {
       go(r);
     }
@@ -189,7 +209,7 @@
   <link rel="stylesheet" href="api/v1/render/highlight.css" />
 </svelte:head>
 
-<article class="docview">
+<article class="docview" class:editing={editing && tab === 'doc'}>
   <header class="doc-head">
     <div class="crumbs" aria-label="Расположение">
       <span>{spaceName || space}</span>
@@ -212,6 +232,16 @@
       <button type="button" role="tab" aria-selected={tab === 'doc'} onclick={() => (tab = 'doc')}>Документ</button>
       <button type="button" role="tab" aria-selected={tab === 'history'} onclick={() => (tab = 'history')}>История</button>
       <button type="button" role="tab" aria-selected={tab === 'links'} onclick={() => (tab = 'links')}>Связи</button>
+      {#if info?.kind === 'note' && !editing}
+        <button
+          type="button"
+          class="edit"
+          onclick={() => {
+            tab = 'doc';
+            editing = true;
+          }}>Править</button
+        >
+      {/if}
     </div>
   </header>
 
@@ -223,41 +253,54 @@
   {/if}
 
   <div role="tabpanel" hidden={tab !== 'doc'}>
-    {#if loading && !rendered}
-      <p class="muted">Загрузка…</p>
-    {/if}
-    {#if rendered}
-      {#if rendered.warnings.length}
-        <details class="render-warnings">
-          <summary>Предупреждения рендера: {rendered.warnings.length}</summary>
-          <ul>
-            {#each rendered.warnings as w, i (i)}<li>{w}</li>{/each}
-          </ul>
-        </details>
+    {#if editing && info}
+      <Editor
+        {user}
+        {space}
+        {node}
+        onsaved={() => reload()}
+        onclose={() => (editing = false)}
+        {onexpired}
+      />
+    {:else}
+      {#if loading && !rendered}
+        <p class="muted">Загрузка…</p>
       {/if}
-      {#if rendered.toc.length >= 3}
-        <details class="toc">
-          <summary>Содержание</summary>
-          <ul>
-            {#each rendered.toc as t, i (i)}
-              <li style:--lvl={t.level}>
-                <a href={href({ name: 'node', user, space, node, anchor: encodeURIComponent(`h-${t.anchor}`) })}>{t.title}</a>
-              </li>
-            {/each}
-          </ul>
-        </details>
+      {#if rendered}
+        {#if rendered.warnings.length}
+          <details class="render-warnings">
+            <summary>Предупреждения рендера: {rendered.warnings.length}</summary>
+            <ul>
+              {#each rendered.warnings as w, i (i)}<li>{w}</li>{/each}
+            </ul>
+          </details>
+        {/if}
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+        <div class="doc-click" {onclick}>
+          {#if rendered.toc.length >= 3}
+            <details class="toc">
+              <summary>Содержание</summary>
+              <ul>
+                {#each rendered.toc as t, i (i)}
+                  <li style:--lvl={t.level}>
+                    <a href={href({ name: 'node', user, space, node, anchor: encodeURIComponent(`h-${t.anchor}`) })}>{t.title}</a>
+                  </li>
+                {/each}
+              </ul>
+            </details>
+          {/if}
+          {#key rendered}
+            <!-- HTML ответа сервера: санитизирован ammonia ({@html} — только здесь и в предпросмотре редактора) -->
+            <div class="doc" bind:this={body}>{@html rendered.html}</div>
+          {/key}
+        </div>
       {/if}
-      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-      <div class="doc-click" {onclick}>
-        {#key rendered}
-          <!-- HTML ответа сервера: санитизирован ammonia (единственное место {@html}) -->
-          <div class="doc" bind:this={body}>{@html rendered.html}</div>
-        {/key}
-      </div>
     {/if}
   </div>
   <div role="tabpanel" hidden={tab !== 'history'}>
-    <p class="muted placeholder">История ревизий появится в следующем обновлении.</p>
+    {#if tab === 'history' && info?.kind === 'note'}
+      <History {user} {node} rev={info.current_rev} onreverted={() => reload()} {onexpired} />
+    {/if}
   </div>
   <div role="tabpanel" hidden={tab !== 'links'}>
     <p class="muted placeholder">Связи и обратные ссылки появятся в M3.</p>
@@ -272,6 +315,16 @@
   .docview {
     max-width: 860px;
     margin: 0 auto;
+  }
+  .docview.editing {
+    max-width: 1600px;
+  }
+  .tabs .edit {
+    margin: 0 0 4px auto;
+    padding: 3px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
   }
   .doc-head {
     margin-bottom: 16px;

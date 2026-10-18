@@ -60,27 +60,64 @@ export function href(r: Route): string {
 export const current = (): Route => parse(location.hash);
 
 /**
+ * Проверка ухода с текущего адреса (несохранённая правка): `false` — остаться.
+ * Синхронная: вызывается из `hashchange`, где переход уже случился и откатывается.
+ */
+export type Guard = (next: Route) => boolean;
+
+let guard: Guard | null = null;
+/** Адрес, на котором стоит приложение (для отката запрещённого перехода). */
+let shown = location.hash;
+
+/** Ставит проверку ухода; возвращает снятие. */
+export function setGuard(g: Guard): () => void {
+  guard = g;
+  return () => {
+    if (guard === g) guard = null;
+  };
+}
+
+const allowed = (r: Route): boolean => !guard || guard(r);
+
+/**
  * Переход. `replace` — без новой записи истории; `silent` — только адрес,
- * без события маршрута (прокрутка к якорю в уже открытом документе).
+ * без события маршрута и без проверки ухода.
  */
 export function go(r: Route, opts: { replace?: boolean; silent?: boolean } = {}): void {
   const target = href(r);
+  if (!opts.silent && !allowed(r)) return;
   if (opts.replace || opts.silent) {
     // replaceState не порождает hashchange: событие — вручную
     history.replaceState(null, '', target);
+    shown = location.hash;
     if (!opts.silent) emit();
   } else if (location.hash === target) {
     emit();
   } else {
+    // проверка уже пройдена: hashchange её не повторяет
+    skipGuard = true;
     location.hash = target;
   }
 }
 
 const listeners = new Set<(r: Route) => void>();
+let skipGuard = false;
 
 function emit() {
   const r = current();
   for (const l of listeners) l(r);
+}
+
+function onHashChange() {
+  const skip = skipGuard;
+  skipGuard = false;
+  if (!skip && !allowed(current())) {
+    // остаться: вернуть прежний адрес без нового события
+    history.replaceState(null, '', shown || location.pathname + location.search);
+    return;
+  }
+  shown = location.hash;
+  emit();
 }
 
 let attached = false;
@@ -88,7 +125,7 @@ let attached = false;
 /** Подписка на смену маршрута; возвращает отписку. */
 export function listen(cb: (r: Route) => void): () => void {
   if (!attached) {
-    window.addEventListener('hashchange', emit);
+    window.addEventListener('hashchange', onHashChange);
     attached = true;
   }
   listeners.add(cb);
