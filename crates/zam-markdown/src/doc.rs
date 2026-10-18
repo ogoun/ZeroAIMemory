@@ -281,14 +281,18 @@ pub fn first_paragraph(src: &str, doc: &Doc) -> Option<String> {
 }
 
 /// Секция по пути вида `"Установка > Linux"`; пробелы вокруг `>` не важны.
+/// При нескольких секциях с одним путём — первая.
 pub fn section_by_path<'a>(doc: &'a Doc, path: &str) -> Option<&'a Section> {
+    sections_by_path(doc, path).next()
+}
+
+/// Все секции с путём `path` (без преамбулы), по порядку документа.
+pub(crate) fn sections_by_path<'a>(doc: &'a Doc, path: &str) -> impl Iterator<Item = &'a Section> {
     let parts: Vec<&str> = path.split('>').map(str::trim).collect();
-    if parts.iter().any(|p| p.is_empty()) {
-        return None;
-    }
-    doc.sections
-        .iter()
-        .find(|s| s.level > 0 && s.path.iter().map(String::as_str).eq(parts.iter().copied()))
+    let valid = !parts.iter().any(|p| p.is_empty());
+    doc.sections.iter().filter(move |s| {
+        valid && s.level > 0 && s.path.iter().map(String::as_str).eq(parts.iter().copied())
+    })
 }
 
 /// Якорь заголовка по алгоритму comrak (`header_id`), без префикса и суффикса уникальности.

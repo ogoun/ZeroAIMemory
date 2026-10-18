@@ -1,0 +1,407 @@
+//! PATCH секций байтовым splice: операции, переводы строк, ошибки и инвариант
+//! «байты вне изменённого диапазона совпадают с исходными».
+
+mod common;
+
+use std::ops::Range;
+
+use common::md_line;
+use proptest::prelude::*;
+use zam_markdown::{
+    Applied, PatchError, PatchOp, apply_patch, parse, section_by_path, section_bytes,
+};
+
+/// Документ с BOM, frontmatter, H1/H2/H3 и CRLF; последняя строка без перевода.
+const SRC: &str = "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nc\r\n## D\r\nd\r\n# E\r\ne";
+
+fn replace(path: &str, content: &str) -> PatchOp {
+    PatchOp::ReplaceSection {
+        section: path.into(),
+        content: content.into(),
+    }
+}
+
+fn append_to(path: &str, content: &str) -> PatchOp {
+    PatchOp::AppendToSection {
+        section: path.into(),
+        content: content.into(),
+    }
+}
+
+fn after_heading(path: &str, content: &str) -> PatchOp {
+    PatchOp::InsertAfterHeading {
+        section: path.into(),
+        content: content.into(),
+    }
+}
+
+fn apply(src: &str, op: &PatchOp) -> Applied {
+    apply_patch(src, op).expect("патч применяется")
+}
+
+// ---------- Шаг 1: операции ----------
+
+#[test]
+fn fixture_has_frontmatter_after_bom() {
+    let doc = parse(SRC);
+    assert!(doc.frontmatter.is_some());
+    assert!(SRC[doc.body_start..].starts_with("# A\r\n"));
+}
+
+#[test]
+fn replace_section_keeps_heading_and_converts_newlines() {
+    let a = apply(SRC, &replace("A > B", "new\nlines"));
+    assert_eq!(
+        a.text,
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nnew\r\nlines\r\n## D\r\nd\r\n# E\r\ne"
+    );
+    assert_eq!(&a.text[a.changed.clone()], "new\r\nlines\r\n");
+    assert_eq!(a.touched_section.as_deref(), Some("A > B"));
+}
+
+#[test]
+fn append_to_section_goes_after_subsections() {
+    let a = apply(SRC, &append_to("A > B", "tail"));
+    assert_eq!(
+        a.text,
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nc\r\ntail\r\n## D\r\nd\r\n# E\r\ne"
+    );
+    assert_eq!(&a.text[a.changed.clone()], "tail\r\n");
+}
+
+#[test]
+fn insert_after_heading_lines() {
+    let a = apply(SRC, &after_heading("A > B", "first\r\n"));
+    assert_eq!(
+        a.text,
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nfirst\r\nb\r\n### C\r\nc\r\n## D\r\nd\r\n# E\r\ne"
+    );
+    let a = apply(SRC, &after_heading("A > B > C", "x"));
+    assert_eq!(
+        a.text,
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nx\r\nc\r\n## D\r\nd\r\n# E\r\ne"
+    );
+    assert_eq!(a.touched_section.as_deref(), Some("A > B > C"));
+}
+
+#[test]
+fn append_adds_missing_newline_before() {
+    let a = apply(
+        SRC,
+        &PatchOp::Append {
+            content: "end".into(),
+        },
+    );
+    assert_eq!(
+        a.text,
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nc\r\n## D\r\nd\r\n# E\r\ne\r\nend\r\n"
+    );
+    assert_eq!(&a.text[a.changed.clone()], "\r\nend\r\n");
+    assert_eq!(a.touched_section, None);
+}
+
+#[test]
+fn prepend_goes_after_frontmatter() {
+    let a = apply(
+        SRC,
+        &PatchOp::Prepend {
+            content: "pre".into(),
+        },
+    );
+    assert_eq!(
+        a.text,
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\npre\r\n# A\r\nintro\r\n## B\r\nb\r\n### C\r\nc\r\n## D\r\nd\r\n# E\r\ne"
+    );
+    assert_eq!(a.touched_section, None);
+    // без frontmatter — сразу после BOM, без лишнего перевода строки
+    let a = apply(
+        "\u{FEFF}# A\n",
+        &PatchOp::Prepend {
+            content: "pre".into(),
+        },
+    );
+    assert_eq!(a.text, "\u{FEFF}pre\n# A\n");
+    let a = apply(
+        "",
+        &PatchOp::Prepend {
+            content: "x".into(),
+        },
+    );
+    assert_eq!(a.text, "x\n");
+}
+
+#[test]
+fn lf_document_normalizes_crlf_and_lone_cr() {
+    let src = "# A\ntext\n## B\nb\n";
+    let a = apply(src, &replace("A", "x\r\ny\rz"));
+    // тело H1 включает подсекции — заменяется целиком
+    assert_eq!(a.text, "# A\nx\ny\nz\n");
+    assert_eq!(a.changed, 4..10);
+}
+
+#[test]
+fn heading_at_eof_without_newline() {
+    let a = apply("# A", &after_heading("A", "x"));
+    assert_eq!(a.text, "# A\nx\n");
+    assert_eq!(a.changed, 3..6);
+    let a = apply("Сетекст\n===", &replace("Сетекст", "тело"));
+    assert_eq!(a.text, "Сетекст\n===\nтело\n");
+}
+
+#[test]
+fn indented_next_heading_is_untouched() {
+    let src = "# A\na\n## B\nb\n   # C\nc\n";
+    let a = apply(src, &append_to("A > B", "t"));
+    assert_eq!(a.text, "# A\na\n## B\nb\n   \nt\n# C\nc\n");
+    assert_eq!(
+        section_by_path(&parse(&a.text), "C").map(|s| s.level),
+        Some(1)
+    );
+}
+
+#[test]
+fn empty_content_inserts_nothing() {
+    let a = apply(SRC, &replace("A > B", ""));
+    assert_eq!(
+        a.text,
+        "\u{FEFF}---\r\ntags: [x]\r\n---\r\n# A\r\nintro\r\n## B\r\n## D\r\nd\r\n# E\r\ne"
+    );
+    assert!(a.changed.is_empty());
+    let a = apply(
+        SRC,
+        &PatchOp::Append {
+            content: String::new(),
+        },
+    );
+    assert_eq!(a.text, SRC);
+}
+
+#[test]
+fn path_spacing_is_lenient_touched_is_canonical() {
+    let a = apply(SRC, &append_to(" A >B ", "t"));
+    assert_eq!(a.touched_section.as_deref(), Some("A > B"));
+}
+
+#[test]
+fn section_bytes_returns_whole_range() {
+    assert_eq!(
+        section_bytes(SRC, "A > B"),
+        Some("## B\r\nb\r\n### C\r\nc\r\n")
+    );
+    assert_eq!(section_bytes(SRC, "E"), Some("# E\r\ne"));
+    assert_eq!(section_bytes(SRC, "Нет"), None);
+    // PATCH соседней секции не меняет байты этой
+    let a = apply(SRC, &replace("A > D", "новое"));
+    assert_eq!(section_bytes(&a.text, "A > B"), section_bytes(SRC, "A > B"));
+    assert_ne!(section_bytes(&a.text, "A > D"), section_bytes(SRC, "A > D"));
+}
+
+#[test]
+fn patch_op_json_shape() {
+    let op: PatchOp = serde_json::from_str(
+        r#"{"op":"replace_section","section":"Установка > Linux","content":"x"}"#,
+    )
+    .expect("json");
+    assert!(
+        matches!(op, PatchOp::ReplaceSection { ref section, .. } if section == "Установка > Linux")
+    );
+    for tag in ["append_to_section", "insert_after_heading"] {
+        let json = format!(r#"{{"op":"{tag}","section":"A","content":"x"}}"#);
+        serde_json::from_str::<PatchOp>(&json).expect("json");
+    }
+    let op: PatchOp = serde_json::from_str(r#"{"op":"prepend","content":"x"}"#).expect("json");
+    assert!(matches!(op, PatchOp::Prepend { .. }));
+    let back = serde_json::to_string(&PatchOp::Append {
+        content: "y".into(),
+    })
+    .expect("json");
+    assert_eq!(back, r#"{"op":"append","content":"y"}"#);
+}
+
+// ---------- Шаг 3: ошибки ----------
+
+#[test]
+fn missing_and_ambiguous_sections() {
+    let src = "# H\n## A\nx\n## A\ny\n";
+    assert!(matches!(
+        apply_patch(src, &replace("H > Z", "t")),
+        Err(PatchError::SectionNotFound(p)) if p == "H > Z"
+    ));
+    assert!(matches!(
+        apply_patch(src, &append_to("H > A", "t")),
+        Err(PatchError::Ambiguous(p)) if p == "H > A"
+    ));
+    assert!(matches!(
+        apply_patch(src, &after_heading("", "t")),
+        Err(PatchError::SectionNotFound(_))
+    ));
+    assert_eq!(section_bytes(src, "H > A"), None);
+    assert_eq!(
+        PatchError::SectionNotFound("X".into()).to_string(),
+        "секция не найдена: X"
+    );
+    assert_eq!(
+        PatchError::Ambiguous("X".into()).to_string(),
+        "путь секции неоднозначен: X"
+    );
+}
+
+// ---------- Шаг 2: property-инвариант ----------
+
+/// Строки документа: общие из `md_line` и заголовки с короткими разными названиями,
+/// чтобы пути чаще были уникальными.
+fn patch_line() -> impl Strategy<Value = String> {
+    prop_oneof![
+        3 => md_line(),
+        1 => "(#|##|###) [a-e]{1,2}",
+    ]
+}
+
+/// Документ: необязательные BOM и frontmatter, LF или CRLF, с переводом строки в конце или без.
+fn patch_doc() -> impl Strategy<Value = String> {
+    (
+        prop::collection::vec(patch_line(), 0..24),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(|(lines, crlf, bom, fm, tail)| {
+            let nl = if crlf { "\r\n" } else { "\n" };
+            let mut s = String::new();
+            if bom {
+                s.push('\u{FEFF}');
+            }
+            if fm {
+                s.push_str(&format!("---{nl}tags: [t]{nl}---{nl}"));
+            }
+            s.push_str(&lines.join(nl));
+            if tail {
+                s.push_str(nl);
+            }
+            s
+        })
+}
+
+fn patch_content() -> impl Strategy<Value = String> {
+    prop_oneof![
+        3 => (prop::collection::vec(patch_line(), 0..6), prop_oneof![Just("\n"), Just("\r\n"), Just("\r")], any::<bool>())
+            .prop_map(|(lines, nl, tail)| {
+                let mut s = lines.join(nl);
+                if tail {
+                    s.push_str(nl);
+                }
+                s
+            }),
+        1 => any::<String>(),
+    ]
+}
+
+/// Заменённый диапазон в старом тексте по известному разбору.
+fn old_range(src: &str, op: &PatchOp) -> Range<usize> {
+    let doc = parse(src);
+    let sec = |p: &str| section_by_path(&doc, p).expect("секция").clone();
+    match op {
+        PatchOp::ReplaceSection { section, .. } => sec(section).body,
+        PatchOp::AppendToSection { section, .. } => {
+            let e = sec(section).range.end;
+            e..e
+        }
+        PatchOp::InsertAfterHeading { section, .. } => {
+            let s = sec(section).body.start;
+            s..s
+        }
+        PatchOp::Append { .. } => src.len()..src.len(),
+        PatchOp::Prepend { .. } => doc.body_start..doc.body_start,
+    }
+}
+
+fn doc_newline(src: &str) -> &'static str {
+    match src.find('\n') {
+        Some(i) if i > 0 && src.as_bytes()[i - 1] == b'\r' => "\r\n",
+        _ => "\n",
+    }
+}
+
+/// Документ не начинается с `---` без закрытого frontmatter: иначе вставленная
+/// строка `---` превратила бы начало документа во frontmatter (свойство YAML-блока,
+/// а не PATCH).
+fn no_open_frontmatter(src: &str) -> bool {
+    let body = src.strip_prefix('\u{FEFF}').unwrap_or(src);
+    parse(src).frontmatter.is_some() || !body.starts_with("---")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+    #[test]
+    fn splice_keeps_bytes_outside_changed_range(
+        src in patch_doc(),
+        content in patch_content(),
+        pick in any::<prop::sample::Index>(),
+        kind in 0u8..5,
+    ) {
+        let doc = parse(&src);
+        let paths: Vec<String> = doc
+            .sections
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| s.path.join(" > "))
+            .collect();
+        let op = match (kind, paths.is_empty()) {
+            (0..=2, true) | (3, _) => PatchOp::Append { content: content.clone() },
+            (4.., _) => PatchOp::Prepend { content: content.clone() },
+            (k, false) => {
+                let path = pick.get(&paths).clone();
+                let unique = paths.iter().filter(|p| **p == path).count() == 1;
+                let op = match k {
+                    0 => replace(&path, &content),
+                    1 => append_to(&path, &content),
+                    _ => after_heading(&path, &content),
+                };
+                if !unique {
+                    prop_assert!(
+                        matches!(apply_patch(&src, &op), Err(PatchError::Ambiguous(_))),
+                        "{:?}",
+                        src
+                    );
+                    return Ok(());
+                }
+                op
+            }
+        };
+
+        let a = apply_patch(&src, &op).expect("патч применяется");
+        let old = old_range(&src, &op);
+        prop_assert_eq!(a.changed.start, old.start);
+        prop_assert!(a.changed.end <= a.text.len());
+        prop_assert_eq!(&a.text[..a.changed.start], &src[..old.start]);
+        prop_assert_eq!(&a.text[a.changed.end..], &src[old.end..]);
+
+        // вставка — в переводах строк документа и заканчивается переводом строки
+        let ins = &a.text[a.changed.clone()];
+        let nl = doc_newline(&src);
+        if content.is_empty() {
+            prop_assert!(ins.is_empty());
+        } else {
+            prop_assert!(ins.ends_with(nl), "{:?}", ins);
+            let unix = ins.replace("\r\n", "\n");
+            prop_assert!(!unix.contains('\r'), "{:?}", ins);
+            if nl == "\r\n" {
+                prop_assert_eq!(ins.matches("\r\n").count(), ins.matches('\n').count());
+            } else {
+                prop_assert!(!ins.contains('\r'), "{:?}", ins);
+            }
+        }
+
+        if let Some(path) = &a.touched_section
+            && no_open_frontmatter(&src)
+        {
+            prop_assert!(
+                section_by_path(&parse(&a.text), path).is_some(),
+                "{:?} -> {:?}",
+                src,
+                a.text
+            );
+        }
+    }
+}

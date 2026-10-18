@@ -2542,6 +2542,7 @@ dependencies = [
  "pulldown-cmark",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
