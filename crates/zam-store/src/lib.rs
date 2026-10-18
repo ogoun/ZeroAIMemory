@@ -15,7 +15,7 @@ pub mod user_db;
 
 pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, resolve_attachment};
 pub use datadir::DataDir;
-pub use db::Db;
+pub use db::{Db, DbOptions};
 pub use migrate::Migration;
 pub use nodes::{
     Attribution, AuthorKind, NewNote, Node, NodeKind, RevisionInfo, WriteError, create_folder,

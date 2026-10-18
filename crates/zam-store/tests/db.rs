@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use zam_store::{Db, Migration, StoreError};
+use zam_store::{Db, DbOptions, Migration, StoreError};
 
 static MIGS: &[Migration] = &[
     Migration {
@@ -258,4 +258,134 @@ async fn drop_checkpoints_wal_and_data_survives_rename() {
         .await
         .unwrap();
     assert_eq!(n, 201); // 200 + строка из миграции 2
+}
+
+// ---------- Checkpoint WAL вне потока-писателя (ТЗ §17) ----------
+
+fn side_file(p: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn wal_len(p: &std::path::Path) -> u64 {
+    std::fs::metadata(side_file(p, "-wal"))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+static BLOB_MIGS: &[Migration] = &[Migration {
+    version: 1,
+    sql: "CREATE TABLE b(x BLOB);",
+}];
+
+async fn write_blobs(db: &Db, n: usize, size: usize) {
+    for _ in 0..n {
+        db.write(move |t| {
+            t.execute("INSERT INTO b VALUES(zeroblob(?1))", [size as i64])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn writer_does_not_autocheckpoint() {
+    let db = Db::open(&tmp("noauto"), BLOB_MIGS).unwrap();
+    let n: i64 = db
+        .write(|t| Ok(t.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn wal_bounded_by_writer_safety_net_without_background() {
+    let p = tmp("safety");
+    let limit = 512 * 1024;
+    let opts = DbOptions {
+        background_checkpoint: false,
+        wal_limit_bytes: limit,
+        ..DbOptions::default()
+    };
+    let db = Db::open_with(&p, BLOB_MIGS, opts).unwrap();
+    // 8 МБ записей при пределе WAL 512 КиБ
+    write_blobs(&db, 256, 32 * 1024).await;
+    let len = wal_len(&p);
+    assert!(len <= 2 * limit, "WAL {len} байт при пределе {limit}");
+    drop(db);
+}
+
+#[tokio::test]
+async fn background_checkpointer_keeps_wal_small() {
+    let p = tmp("bg");
+    let opts = DbOptions {
+        checkpoint_interval: std::time::Duration::from_millis(50),
+        ..DbOptions::default()
+    };
+    let db = Db::open_with(&p, BLOB_MIGS, opts).unwrap();
+    let db_len = || std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+    // номер checkpoint в заголовке WAL (смещение 12) растёт при каждом
+    // перезапуске WAL с начала
+    let wal_seq = || {
+        let h = std::fs::read(side_file(&p, "-wal")).unwrap_or_default();
+        h.get(12..16)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+            .unwrap_or(0)
+    };
+    // пять порций по 1 МБ; после каждой ждём, пока фоновый поток перенесёт кадры
+    // в файл базы (без checkpoint файл базы не растёт) и файл перестанет меняться
+    for k in 1..=5u64 {
+        write_blobs(&db, 32, 32 * 1024).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (mut last, mut stable_since) = (0, std::time::Instant::now());
+        loop {
+            let now = db_len();
+            if now != last {
+                (last, stable_since) = (now, std::time::Instant::now());
+            }
+            if now >= k * 1024 * 1024 && stable_since.elapsed().as_millis() >= 500 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "фоновый checkpoint не перенёс порцию {k}: база {now} байт"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let (len, seq) = (wal_len(&p), wal_seq());
+    assert!(seq >= 1, "WAL ни разу не начат сначала");
+    // без перезапусков WAL был бы больше 5 МБ (см. without_any_checkpoint_wal_grows)
+    assert!(len < 5 * 1024 * 1024, "WAL {len} байт, перезапусков {seq}");
+    eprintln!("WAL {len} байт, перезапусков {seq}");
+}
+
+#[tokio::test]
+async fn drop_leaves_no_wal_and_shm() {
+    let p = tmp("close");
+    let db = Db::open(&p, BLOB_MIGS).unwrap();
+    write_blobs(&db, 64, 16 * 1024).await;
+    db.read(|c| Ok(c.query_row("SELECT count(*) FROM b", [], |r| r.get::<_, i64>(0))?))
+        .await
+        .unwrap();
+    drop(db);
+    assert!(!side_file(&p, "-wal").exists(), "-wal остался");
+    assert!(!side_file(&p, "-shm").exists(), "-shm остался");
+}
+
+#[tokio::test]
+async fn without_any_checkpoint_wal_grows() {
+    // контроль к двум тестам выше: без фона и с большим пределом WAL растёт
+    let p = tmp("grow");
+    let opts = DbOptions {
+        background_checkpoint: false,
+        wal_limit_bytes: u64::MAX,
+        ..DbOptions::default()
+    };
+    let db = Db::open_with(&p, BLOB_MIGS, opts).unwrap();
+    write_blobs(&db, 160, 32 * 1024).await;
+    let len = wal_len(&p);
+    assert!(len >= 5 * 1024 * 1024, "WAL {len} байт");
 }
