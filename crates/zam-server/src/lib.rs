@@ -25,11 +25,12 @@ fn print_initial_token(token: &str) {
 pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Result<()> {
     let bind = cfg.server.bind;
     let log_cfg = cfg.log.clone();
-    // Порядок: пароль, лок каталога, логи, базы; токен печатаем только после bind.
+    // Порядок: пароль, лок каталога, логи, базы; bind до выпуска токена, печать после.
     let prepared = app::prepare(cfg, env_password.as_deref())?;
     let _guard = logging::init(&log_cfg, &prepared.data_dir.logs())?;
-    let (app, state, report) = app::finish(prepared).await?;
+    // bind до выпуска токена: при занятом порту в БД ничего не появляется.
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    let (app, state, report) = app::finish(prepared).await?;
     if let Some(t) = &report.initial_token {
         print_initial_token(t);
     }
