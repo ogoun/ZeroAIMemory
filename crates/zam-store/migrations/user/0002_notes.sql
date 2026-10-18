@@ -25,7 +25,8 @@ CREATE TABLE nodes (
 );
 CREATE UNIQUE INDEX nodes_live_path ON nodes (space_id, path) WHERE deleted_at IS NULL;
 CREATE INDEX nodes_parent ON nodes (space_id, parent_id);
-CREATE INDEX nodes_deleted ON nodes (deleted_at);
+-- Частичный: только для корзины; выборки живых узлов идут по nodes_parent/nodes_live_path.
+CREATE INDEX nodes_deleted ON nodes (deleted_at) WHERE deleted_at IS NOT NULL;
 
 -- Ревизии только дописываются.
 CREATE TABLE revisions (
@@ -64,8 +65,9 @@ CREATE TABLE chunks (
 );
 CREATE INDEX chunks_node ON chunks (node_id);
 
+-- context_prefix (пространство, путь, имя, заголовки, теги) участвует в FTS (§8.2 п.6).
 CREATE VIRTUAL TABLE chunks_fts USING fts5 (
-    text, heading_path,
+    text, heading_path, context_prefix,
     content = 'chunks', content_rowid = 'seq',
     tokenize = 'unicode61 remove_diacritics 2'
 );
@@ -76,20 +78,23 @@ CREATE VIRTUAL TABLE chunks_fts_tri USING fts5 (
 );
 
 CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
-    INSERT INTO chunks_fts (rowid, text, heading_path) VALUES (new.seq, new.text, new.heading_path);
+    INSERT INTO chunks_fts (rowid, text, heading_path, context_prefix)
+        VALUES (new.seq, new.text, new.heading_path, new.context_prefix);
     INSERT INTO chunks_fts_tri (rowid, text) VALUES (new.seq, new.text);
 END;
 CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
-    INSERT INTO chunks_fts (chunks_fts, rowid, text, heading_path)
-        VALUES ('delete', old.seq, old.text, old.heading_path);
+    INSERT INTO chunks_fts (chunks_fts, rowid, text, heading_path, context_prefix)
+        VALUES ('delete', old.seq, old.text, old.heading_path, old.context_prefix);
     INSERT INTO chunks_fts_tri (chunks_fts_tri, rowid, text) VALUES ('delete', old.seq, old.text);
 END;
--- Чанки пересоздаются удалением и вставкой; UPDATE — страховка согласованности FTS.
-CREATE TRIGGER chunks_au AFTER UPDATE OF text, heading_path ON chunks BEGIN
-    INSERT INTO chunks_fts (chunks_fts, rowid, text, heading_path)
-        VALUES ('delete', old.seq, old.text, old.heading_path);
+-- Чанки пересоздаются удалением и вставкой; UPDATE (например, context_prefix
+-- после переноса узла) держит FTS согласованным.
+CREATE TRIGGER chunks_au AFTER UPDATE OF text, heading_path, context_prefix ON chunks BEGIN
+    INSERT INTO chunks_fts (chunks_fts, rowid, text, heading_path, context_prefix)
+        VALUES ('delete', old.seq, old.text, old.heading_path, old.context_prefix);
     INSERT INTO chunks_fts_tri (chunks_fts_tri, rowid, text) VALUES ('delete', old.seq, old.text);
-    INSERT INTO chunks_fts (rowid, text, heading_path) VALUES (new.seq, new.text, new.heading_path);
+    INSERT INTO chunks_fts (rowid, text, heading_path, context_prefix)
+        VALUES (new.seq, new.text, new.heading_path, new.context_prefix);
     INSERT INTO chunks_fts_tri (rowid, text) VALUES (new.seq, new.text);
 END;
 

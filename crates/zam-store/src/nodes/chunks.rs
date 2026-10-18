@@ -87,13 +87,25 @@ pub(crate) fn truncate_words(s: &str, max: usize) -> String {
     head.trim_end().to_string()
 }
 
-/// `[<space>/<path>] <имя> > <heading_path>`; без ` > …` при пустом пути заголовков.
-pub(crate) fn context_prefix(space: &str, path: &str, name: &str, heading_path: &str) -> String {
-    if heading_path.is_empty() {
-        format!("[{space}/{path}] {name}")
-    } else {
-        format!("[{space}/{path}] {name} > {heading_path}")
+/// `[<space>/<path>] <имя> > <heading_path> | <тег1>, <тег2>` (§8.2 п.6);
+/// ` > …` опускается при пустом пути заголовков, ` | …` — без тегов.
+pub(crate) fn context_prefix(
+    space: &str,
+    path: &str,
+    name: &str,
+    heading_path: &str,
+    tags: &[String],
+) -> String {
+    let mut s = format!("[{space}/{path}] {name}");
+    if !heading_path.is_empty() {
+        s.push_str(" > ");
+        s.push_str(heading_path);
     }
+    if !tags.is_empty() {
+        s.push_str(" | ");
+        s.push_str(&tags.join(", "));
+    }
+    s
 }
 
 /// Чанк секции до вставки в БД.
@@ -166,6 +178,11 @@ pub(crate) fn rebuild_chunks(
         [node_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    let tags = meta
+        .doc
+        .frontmatter
+        .as_ref()
+        .map_or(&[][..], |f| &f.tags[..]);
     let chunks = section_chunks(content, &meta.doc);
     let mut st = c.prepare_cached(
         "INSERT INTO chunks (id, node_id, rev, level, heading_path, ordinal, text,
@@ -180,7 +197,7 @@ pub(crate) fn rebuild_chunks(
             ch.heading_path,
             ch.ordinal,
             ch.text,
-            context_prefix(&space, &path, &name, &ch.heading_path),
+            context_prefix(&space, &path, &name, &ch.heading_path, tags),
             approx_tokens(&ch.text),
             ch.text_hash,
         ])?;
@@ -231,9 +248,18 @@ mod tests {
 
     #[test]
     fn prefix_format() {
-        assert_eq!(context_prefix("K", "a/b", "b", ""), "[K/a/b] b");
+        let tags = ["x".to_string(), "y z".to_string()];
+        assert_eq!(context_prefix("K", "a/b", "b", "", &[]), "[K/a/b] b");
         assert_eq!(
-            context_prefix("K", "a/b", "b", "X > Y"),
+            context_prefix("K", "a/b", "b", "", &tags),
+            "[K/a/b] b | x, y z"
+        );
+        assert_eq!(
+            context_prefix("K", "a/b", "b", "H", &tags),
+            "[K/a/b] b > H | x, y z"
+        );
+        assert_eq!(
+            context_prefix("K", "a/b", "b", "X > Y", &[]),
             "[K/a/b] b > X > Y"
         );
     }

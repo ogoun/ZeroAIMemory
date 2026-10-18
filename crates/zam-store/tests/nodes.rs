@@ -315,7 +315,15 @@ async fn chunks_per_section_and_fts() {
         "скрипты".into(),
     )
     .await;
-    assert_eq!(hits, 1);
+    // имя заметки «Bash скрипты» входит в context_prefix каждого чанка
+    assert_eq!(hits, 3);
+    let in_text = count(
+        &db,
+        "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+        "text : скрипты".into(),
+    )
+    .await;
+    assert_eq!(in_text, 1);
     let tri = count(
         &db,
         "SELECT count(*) FROM chunks_fts_tri WHERE chunks_fts_tri MATCH ?1",
@@ -352,13 +360,60 @@ async fn preamble_chunk_and_whitespace_sections() {
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(rows[0].0, "");
     assert!(rows[0].1.starts_with("Вступление") && !rows[0].1.contains("tags"));
-    assert_eq!(rows[0].2, "[Knowledge/Пре] Пре");
+    assert_eq!(rows[0].2, "[Knowledge/Пре] Пре | a");
+    assert_eq!(rows[1].2, "[Knowledge/Пре] Пре > Полная | a");
     assert_eq!(rows[1].0, "Полная");
     assert_eq!(
         n.frontmatter,
         Some(serde_json::json!({"tags": ["a"]})),
         "null-поля опускаются"
     );
+}
+
+#[tokio::test]
+async fn fts_finds_by_name_path_and_tag() {
+    let (db, space) = setup("prefix").await;
+    let src = "---
+tags: [девопс, linux]
+---
+# Раздел
+
+просто текст
+";
+    let n = create_note(&db, note(space, "Инструменты/Шпаргалка", src))
+        .await
+        .unwrap();
+    let rows: i64 = chunk_count(&db, n.id).await;
+    assert_eq!(rows, 1);
+    let prefix: String = db
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT context_prefix FROM chunks WHERE node_id = ?1",
+                [n.id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        prefix,
+        "[Knowledge/Инструменты/Шпаргалка] Шпаргалка > Раздел | девопс, linux"
+    );
+    for q in [
+        "шпаргалка",
+        "инструменты",
+        "девопс",
+        "LINUX",
+        "context_prefix : knowledge",
+    ] {
+        let hits = count(
+            &db,
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+            q.into(),
+        )
+        .await;
+        assert_eq!(hits, 1, "запрос {q:?}");
+    }
 }
 
 #[tokio::test]

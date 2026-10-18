@@ -59,16 +59,7 @@ pub async fn list_children(
     let depth = depth.max(1);
     db.read(move |c| {
         // один запрос — один снимок данных для всего поддерева
-        let mut st = c.prepare(&format!(
-            "WITH RECURSIVE t (id, lvl) AS (
-                 SELECT id, 1 FROM nodes
-                 WHERE space_id = ?1 AND parent_id IS ?2 AND deleted_at IS NULL
-                 UNION ALL
-                 SELECT c.id, t.lvl + 1 FROM nodes c JOIN t ON c.parent_id = t.id
-                 WHERE c.deleted_at IS NULL AND t.lvl < ?3
-             )
-             SELECT {NODE_COLS} FROM nodes n JOIN t ON n.id = t.id"
-        ))?;
+        let mut st = c.prepare(&children_sql())?;
         let rows = st.query_map(params![space_id, parent, depth], node_row)?;
         let mut by_parent: HashMap<Option<Id>, Vec<Node>> = HashMap::new();
         for n in rows {
@@ -83,6 +74,21 @@ pub async fn list_children(
         Ok(out)
     })
     .await
+}
+
+/// Запрос поддерева для [`list_children`]: `?1` — пространство, `?2` — родитель,
+/// `?3` — глубина. Шаг рекурсии ограничен `space_id`, чтобы работал индекс `nodes_parent`.
+pub(crate) fn children_sql() -> String {
+    format!(
+        "WITH RECURSIVE t (id, lvl) AS (
+             SELECT id, 1 FROM nodes
+             WHERE space_id = ?1 AND parent_id IS ?2 AND deleted_at IS NULL
+             UNION ALL
+             SELECT c.id, t.lvl + 1 FROM nodes c JOIN t ON c.parent_id = t.id
+             WHERE c.space_id = ?1 AND c.deleted_at IS NULL AND t.lvl < ?3
+         )
+         SELECT {NODE_COLS} FROM nodes n JOIN t ON n.id = t.id"
+    )
 }
 
 fn preorder(

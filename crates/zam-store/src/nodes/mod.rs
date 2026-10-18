@@ -147,10 +147,12 @@ pub struct NewNote {
 }
 
 /// Колонки узла для [`node_row`]; таблица `nodes` под псевдонимом `n`.
+/// `has_children` ограничен `space_id`, чтобы подзапрос шёл по индексу `nodes_parent`.
 pub(crate) const NODE_COLS: &str = "n.id, n.space_id, n.parent_id, n.kind, n.name, n.path,
     n.current_rev, n.content_hash, n.frontmatter, n.l0, n.l0_source,
     n.created_at, n.updated_at, n.deleted_at,
-    EXISTS (SELECT 1 FROM nodes c WHERE c.parent_id = n.id AND c.deleted_at IS NULL)";
+    EXISTS (SELECT 1 FROM nodes c
+            WHERE c.space_id = n.space_id AND c.parent_id = n.id AND c.deleted_at IS NULL)";
 
 pub(crate) fn node_row(r: &Row) -> rusqlite::Result<Node> {
     let frontmatter = r
@@ -216,4 +218,49 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
             write!(s, "{b:02x}").expect("запись в String");
             s
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::NODE_COLS;
+    use super::read::children_sql;
+
+    fn schema() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        c
+    }
+
+    fn plan(c: &Connection, sql: &str, params: usize) -> String {
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args = rusqlite::params_from_iter(vec!["x"; params]);
+        let rows = st.query_map(args, |r| r.get::<_, String>(3)).unwrap();
+        rows.map(Result::unwrap).collect::<Vec<_>>().join(
+            "
+",
+        )
+    }
+
+    #[test]
+    fn has_children_uses_parent_index() {
+        let c = schema();
+        let sql = format!("SELECT {NODE_COLS} FROM nodes n WHERE n.id = ?1");
+        let p = plan(&c, &sql, 1);
+        assert!(p.contains("nodes_parent"), "{p}");
+        assert!(!p.contains("nodes_deleted"), "{p}");
+    }
+
+    #[test]
+    fn children_cte_uses_parent_index() {
+        let c = schema();
+        let p = plan(&c, &children_sql(), 3);
+        let parent_uses = p.matches("nodes_parent").count();
+        // якорь, шаг рекурсии и has_children
+        assert!(parent_uses >= 3, "{p}");
+        assert!(!p.contains("nodes_deleted"), "{p}");
+    }
 }
