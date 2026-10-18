@@ -1,11 +1,12 @@
 //! Хранилище ZeroAIMemory: открытие SQLite, поток-писатель, пул читателей, миграции,
-//! узлы и ревизии заметок с синхронной индексацией (чанки секций, FTS5).
+//! узлы и ревизии заметок с синхронной индексацией (чанки секций, FTS5), полнотекстовый поиск.
 
 pub mod datadir;
 pub mod db;
 pub mod migrate;
 pub mod nodes;
 pub mod paths;
+pub mod search;
 pub mod system;
 pub mod time;
 pub mod user_db;
@@ -20,6 +21,7 @@ pub use nodes::{
     unified_diff, update_note,
 };
 pub use paths::NodePath;
+pub use search::{FtsHit, FtsQuery, MARK_END, MARK_START, sanitize_fts, search_fts};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,
 };
