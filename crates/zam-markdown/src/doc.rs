@@ -104,6 +104,12 @@ pub fn parse(src: &str) -> Doc {
     let arena = Arena::new();
     let options = comrak_options();
     let root = parse_document(&arena, src, &options);
+    doc_from_root(src, root)
+}
+
+/// [`Doc`] по уже разобранному AST (`root` — результат `parse_document`
+/// с [`comrak_options`]). Общий путь для [`parse`] и рендера: один разбор.
+pub(crate) fn doc_from_root<'a>(src: &str, root: &'a AstNode<'a>) -> Doc {
     let li = LineIndex::new(src);
     let bom = if src.starts_with(BOM) { BOM.len() } else { 0 };
 
@@ -196,15 +202,20 @@ fn label_of<'a>(node: &'a AstNode<'a>) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
-fn make_link(kind: LinkKind, url: &str, label: Option<String>, range: Range<usize>) -> Link {
-    let (target, anchor) = match url.split_once('#') {
-        Some((t, a)) => (t, (!a.is_empty()).then(|| a.to_string())),
+/// Цель и якорь ссылки: часть после первого `#`; пустой якорь — `None`.
+pub(crate) fn split_anchor(url: &str) -> (&str, Option<&str>) {
+    match url.split_once('#') {
+        Some((t, a)) => (t, (!a.is_empty()).then_some(a)),
         None => (url, None),
-    };
+    }
+}
+
+fn make_link(kind: LinkKind, url: &str, label: Option<String>, range: Range<usize>) -> Link {
+    let (target, anchor) = split_anchor(url);
     Link {
         kind,
         target: target.to_string(),
-        anchor,
+        anchor: anchor.map(str::to_string),
         label,
         range,
     }

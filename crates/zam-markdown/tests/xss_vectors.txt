@@ -1,0 +1,144 @@
+<script>alert(1)</script>
+---8<---
+<SCRIPT SRC=//evil.example/x.js></SCRIPT>
+---8<---
+text <script>alert(document.cookie)</script> inline
+---8<---
+<img src=x onerror=alert(1)>
+---8<---
+<IMG SRC="x" ONERROR="alert(1)">
+---8<---
+<img src="javascript:alert(1)">
+---8<---
+[клик](javascript:alert(1))
+---8<---
+[клик](JaVaScRiPt:alert(1))
+---8<---
+[клик](  javascript:alert(1)  )
+---8<---
+[клик](<javascript:alert(1)>)
+---8<---
+[клик](java&#x09;script:alert(1))
+---8<---
+[клик](&#106;avascript:alert(1))
+---8<---
+<a href="&#106;avascript:alert(1)">x</a>
+---8<---
+[клик](java\u0000script:alert(1))
+---8<---
+[клик](java%00script:alert(1))
+---8<---
+[клик]: javascript:alert(1)
+[ссылка][клик]
+---8<---
+[клик](vbscript:msgbox(1))
+---8<---
+[клик](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)
+---8<---
+![картинка](data:text/html,<script>alert(1)</script>)
+---8<---
+<javascript:alert(1)>
+---8<---
+автоссылка javascript:alert(1) и www.javascript:alert(1)
+---8<---
+<vbscript:msgbox(1)>
+---8<---
+[[javascript:alert(1)]]
+---8<---
+[[javascript:alert(1)|клик]]
+---8<---
+[[Заметка" onmouseover="alert(1)]]
+---8<---
+[[x<script>alert(1)</script>]]
+---8<---
+[[vbscript:msgbox(1)#якорь]]
+---8<---
+[[data:text/html,<b>x</b>]]
+---8<---
+<svg onload=alert(1)>
+---8<---
+<svg><script>alert(1)</script></svg>
+---8<---
+<iframe src="https://evil.example"></iframe>
+---8<---
+<object data="javascript:alert(1)"></object>
+---8<---
+<embed src="javascript:alert(1)">
+---8<---
+<form action="javascript:alert(1)"><input type=submit></form>
+---8<---
+<style>body{background:url(javascript:alert(1))}</style>
+---8<---
+<div style="width: expression(alert(1))">x</div>
+---8<---
+<p style="background:url(javascript:alert(1))">x</p>
+---8<---
+&lt;script&gt;alert(1)&lt;/script&gt; и &#60;script&#62;
+---8<---
+<math><mtext><table><mglyph><style><img src=x onerror=alert(1)>
+---8<---
+<math xlink:href="javascript:alert(1)">x</math>
+---8<---
+<svg><a xlink:href="javascript:alert(1)"><text>x</text></a></svg>
+---8<---
+<base href="https://evil.example/">
+---8<---
+<meta http-equiv="refresh" content="0;url=javascript:alert(1)">
+---8<---
+<link rel="stylesheet" href="https://evil.example/x.css">
+---8<---
+> [!info]- <script>alert(1)</script>
+> тело
+---8<---
+> [!info" onclick="alert(1)] заголовок
+> тело
+---8<---
+> [!note] <img src=x onerror=alert(1)> [x](javascript:alert(1))
+> тело
+---8<---
+> [!javascript:alert(1)]
+> тело
+---8<---
+> [!tip]+ `<style>` **<iframe>**
+---8<---
+<details open ontoggle=alert(1)>x</details>
+---8<---
+```"><script>alert(1)</script>
+код
+```
+---8<---
+```mermaid
+graph TD; A["<img src=x onerror=alert(1)>"]
+```
+---8<---
+$<script>alert(1)</script>$ и $$<img src=x onerror=alert(1)>$$
+---8<---
+```math
+<iframe src=javascript:alert(1)>
+```
+---8<---
+![x](_attachments/0123456789abcdef/x.png" onerror="alert(1))
+---8<---
+![x](_attachments/0123456789abcdef/%22%20onerror%3D%22alert(1).png)
+---8<---
+![x](_attachments/0123456789abcdef/javascript:alert(1).html)
+---8<---
+[x](https://ok.example "title\" onmouseover=\"alert(1)")
+---8<---
+<a href="https://ok.example" onclick="alert(1)">x</a>
+---8<---
+# Заголовок <script>alert(1)</script>
+---8<---
+| a |
+|---|
+| <script>alert(1)</script> |
+---8<---
+[^1]
+
+[^1]: <iframe src=x></iframe>
+---8<---
+<!-- <script>alert(1)</script> -->
+---8<---
+<noscript><p title="</noscript><img src=x onerror=alert(1)>">
+---8<---
+<xmp><img src=x onerror=alert(1)></xmp>

@@ -1,7 +1,8 @@
-# Фаззинг разбора, позиций и PATCH (ТЗ §5.3). Отдельный пакет вне workspace:
+# Фаззинг разбора, позиций, PATCH и рендера (ТЗ §5.3). Отдельный пакет вне workspace:
 # собирается только nightly-тулчейном, в CI не входит.
 #   cargo +nightly fuzz run parse
 #   cargo +nightly fuzz run patch
+#   cargo +nightly fuzz run render
 [package]
 name = "zam-markdown-fuzz"
 version = "0.0.0"
@@ -25,6 +26,13 @@ bench = false
 [[bin]]
 name = "patch"
 path = "fuzz_targets/patch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render"
+path = "fuzz_targets/render.rs"
 test = false
 doc = false
 bench = false

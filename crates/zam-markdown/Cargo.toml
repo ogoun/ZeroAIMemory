@@ -1,14 +1,17 @@
 [package]
 name = "zam-markdown"
-description = "Разбор Markdown ZeroAIMemory: позиции, секции, ссылки (comrak)"
+description = "Markdown ZeroAIMemory: разбор (позиции, секции, ссылки) и HTML-рендер (comrak, syntect, ammonia)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ammonia.workspace = true
 comrak.workspace = true
+mime_guess.workspace = true
 serde.workspace = true
+syntect.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

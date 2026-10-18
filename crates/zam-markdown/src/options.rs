@@ -28,6 +28,8 @@ pub fn comrak_options() -> Options<'static> {
     ext.front_matter_delimiter = Some(FRONT_MATTER_DELIMITER.to_string());
     ext.header_id_prefix = Some(HEADER_ID_PREFIX.to_string());
     o.render.sourcepos = true;
+    // только вывод: классы `task-list-item` у пунктов задач, на разбор не влияет
+    o.render.tasklist_classes = true;
     o.render.r#unsafe = false;
     o
 }

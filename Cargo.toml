@@ -45,8 +45,10 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 # M1: Markdown, подсветка, санитизация, диффы, вложения, кэш рендера
-comrak = { version = "0.56", default-features = false }
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# тильда: comrak::Anchorizer — #[doc(hidden)], минорный выпуск может его сдвинуть
+comrak = { version = "~0.56", default-features = false }
+# набор default-fancy без загрузчиков plist/yaml (yaml-rust не сопровождается): встроенные дампы и чистый Rust regex
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "html", "regex-fancy"] }
 ammonia = "4"
 similar = "2"
 mime_guess = "2"
