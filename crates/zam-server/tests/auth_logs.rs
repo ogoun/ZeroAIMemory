@@ -1,4 +1,4 @@
-//! Неверный токен не попадает в журнал: только маска (отдельный бинарь — глобальный subscriber).
+//! Неверный и отозванный токены не попадают в журнал: только маска (отдельный бинарь — глобальный subscriber).
 mod common;
 
 use std::io::Write;
@@ -41,7 +41,7 @@ async fn bad_token_not_in_logs() {
         .with_ansi(false)
         .init();
     let cfg = common::cfg_in(common::tmp("auth-logs"));
-    let (app, ..) = zam_server::build(cfg, Some("pw".into())).await.unwrap();
+    let (app, st, _) = zam_server::build(cfg, Some("pw".into())).await.unwrap();
     let token = format!("zam_{}{}", "A".repeat(8), "B".repeat(32));
     let req = Request::get("/api/v1/spaces?x=1")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -54,6 +54,23 @@ async fn bad_token_not_in_logs() {
     assert!(log.contains("zam_AAAAAAAA…"), "{log}");
     // событие о неудаче есть и содержит ip
     assert!(log.contains("WARN") && log.contains("ip=0.0.0.0"), "{log}");
+    // отозванный действующий токен: в журнале маска, хвоста нет
+    let admin = st.system.admin_user().await.unwrap().unwrap();
+    let (info, revoked) = st
+        .system
+        .issue_token(admin.id, "logs", zam_store::Access::Ro)
+        .await
+        .unwrap();
+    st.system.revoke_token(info.id).await.unwrap();
+    let req = Request::get("/api/v1/spaces")
+        .header(header::AUTHORIZATION, format!("Bearer {revoked}"))
+        .body(Body::empty())
+        .unwrap();
+    let r = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(!log.contains(&revoked[12..]), "{log}");
+    assert!(log.contains(&zam_core::mask_token(&revoked)), "{log}");
     // прокси вне trusted_proxies — одно предупреждение на процесс
     for _ in 0..2 {
         let mut req = Request::get("/api/v1/spaces")

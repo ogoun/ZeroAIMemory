@@ -160,7 +160,7 @@ impl FromRequestParts<AppState> for Client {
         {
             tracing::warn!(
                 peer = %p.ip(),
-                "запросы идут через прокси, не указанный в server.trusted_proxies —
+                "запросы идут через прокси, не указанный в server.trusted_proxies — \
                  лимиты и IP в аудите общие для всех клиентов"
             );
         }

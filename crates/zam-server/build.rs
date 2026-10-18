@@ -11,11 +11,9 @@ fn watch(p: &Path) {
 }
 
 const STUB_INDEX: &str = concat!(
-    "<!doctype html>
-<html lang=\"ru\"><head><meta charset=\"UTF-8\" />",
+    "<!doctype html>\n<html lang=\"ru\"><head><meta charset=\"UTF-8\" />",
     "<base href=\"/\" /><title>ZeroAIMemory</title></head>",
-    "<body><p>WebUI не собран: выполните npm run build в web/.</p></body></html>
-"
+    "<body><p>WebUI не собран: выполните npm run build в web/.</p></body></html>\n"
 );
 
 /// Копирует `dir` в `dst` без корневого `index.html` (его отдаёт `web.rs` с подстановкой base href).

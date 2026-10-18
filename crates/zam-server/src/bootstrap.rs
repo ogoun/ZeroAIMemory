@@ -4,8 +4,9 @@ use zam_core::mask_token;
 use zam_store::{Access, StoreError, SystemStore};
 
 /// Если администратора нет, создаёт `login` (is_admin) и токен `initial` (rw).
-/// Если администратор есть, но у него нет действующих токенов (сбой между
-/// созданием и выпуском), выпускает новый `initial`.
+/// Если администратор есть, но у него нет ни одного токена, даже отозванного
+/// (сбой между созданием и выпуском), выпускает новый `initial`. Отозванные
+/// токены — действие администратора, новый токен в этом случае не выпускается.
 /// Возвращает открытый текст токена только при выпуске; в аудит пишется маска.
 pub async fn ensure_admin_user(
     system: &SystemStore,
@@ -14,7 +15,7 @@ pub async fn ensure_admin_user(
     let (user, action) = match system.admin_user().await? {
         Some(u) => {
             let tokens = system.list_tokens(u.id).await?;
-            if tokens.iter().any(|t| t.revoked_at.is_none()) {
+            if !tokens.is_empty() {
                 return Ok(None);
             }
             (u, "bootstrap_recover")

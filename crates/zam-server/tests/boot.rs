@@ -115,25 +115,44 @@ async fn no_password_means_no_side_effects() {
 }
 
 #[tokio::test]
-async fn admin_without_tokens_gets_new_initial_token() {
+async fn admin_without_any_tokens_gets_new_initial_token() {
+    // Сбой между созданием администратора и выпуском токена: токенов нет вовсе.
     let d = common::tmp("b8");
+    {
+        let dd = zam_store::DataDir::open(&d).unwrap();
+        let s = zam_store::SystemStore::open(&dd).unwrap();
+        s.create_user("admin", true).await.unwrap();
+    }
+    let (_, st, rep) = build(cfg_in(d), Some("pw".into())).await.unwrap();
+    let plain = rep.initial_token.expect("токен выпущен");
+    assert!(
+        st.system
+            .verify_token(&plain, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let rows = st.system.list_audit(10, None).await.unwrap();
+    assert!(rows.iter().any(|r| r.action == "bootstrap_recover"));
+}
+
+#[tokio::test]
+async fn revoked_admin_tokens_do_not_issue_new_initial_token() {
+    // Отозванные токены — осознанное действие администратора, не сбой бутстрапа.
+    let d = common::tmp("b8r");
     let (app, st, rep) = build(cfg_in(d.clone()), Some("pw".into())).await.unwrap();
-    let first = rep.initial_token.unwrap();
+    assert!(rep.initial_token.is_some());
     let admin = st.system.admin_user().await.unwrap().unwrap();
     for t in st.system.list_tokens(admin.id).await.unwrap() {
         st.system.revoke_token(t.id).await.unwrap();
     }
     drop((app, st));
     let (_, st, rep) = build(cfg_in(d), Some("pw".into())).await.unwrap();
-    let second = rep.initial_token.expect("токен выпущен заново");
-    assert_ne!(first, second);
-    assert!(
-        st.system
-            .verify_token(&second, None)
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(rep.initial_token.is_none());
+    let admin = st.system.admin_user().await.unwrap().unwrap();
+    let tokens = st.system.list_tokens(admin.id).await.unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert!(tokens[0].revoked_at.is_some());
 }
 
 #[tokio::test]

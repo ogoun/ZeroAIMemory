@@ -34,7 +34,7 @@ CREATE TABLE web_sessions (
 CREATE TABLE audit (
     id      INTEGER PRIMARY KEY,
     ts      TEXT NOT NULL,
-    actor   TEXT NOT NULL,                   -- 'admin' | id токена
+    actor   TEXT NOT NULL,                   -- 'system' (бутстрап) | 'admin' (сессия WebUI) | 'anonymous' (неудачный вход); id токена — с появлением действий по токену
     user_id TEXT,
     action  TEXT NOT NULL,
     target  TEXT,

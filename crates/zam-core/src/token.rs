@@ -11,11 +11,21 @@ const DISPLAY_PREFIX_LEN: usize = 8;
 const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /// Свежесозданный токен: открытый текст показывается один раз, в БД — только хэш.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NewToken {
     pub plaintext: String,
     pub prefix: String,
     pub secret_hash: String,
+}
+
+/// В Debug открытый текст — только маска, хэш не выводится.
+impl std::fmt::Debug for NewToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewToken")
+            .field("plaintext", &mask_token(&self.plaintext))
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Генерирует токен `zam_` + 40 символов base62 из ОС-источника случайности.
@@ -96,6 +106,14 @@ mod tests {
         assert_eq!(m, format!("zam_{}…", t.prefix));
         assert!(!m.contains(&t.plaintext[12..]));
         assert_eq!(mask_token("garbage"), "***");
+    }
+    #[test]
+    fn debug_masks_plaintext() {
+        let t = generate_token();
+        let d = format!("{t:?}");
+        assert!(!d.contains(&t.plaintext), "{d}");
+        assert!(d.contains(&mask_token(&t.plaintext)), "{d}");
+        assert!(d.contains(&t.prefix), "{d}");
     }
     #[test]
     fn looks_like_token_checks_format() {

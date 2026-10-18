@@ -102,7 +102,8 @@ pub fn check_url(url: &str) -> Result<(), String> {
     }
 }
 
-const FILES: [&str; 3] = ["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"];
+/// Порядок внутри одного каталога: локальные настройки важнее общих.
+const FILES: [&str; 3] = ["CLAUDE.local.md", "CLAUDE.md", "AGENTS.md"];
 const BEGIN: &str = "<!-- zeroaimemory:begin";
 const END: &str = "<!-- zeroaimemory:end";
 
@@ -393,8 +394,16 @@ mod tests {
             "ZeroAIMemoryUrl=http://local:3\n",
         )
         .unwrap();
+        std::fs::write(sub.join("CLAUDE.md"), "ZeroAIMemoryUrl=http://claude:4\n").unwrap();
+        // В каталоге: CLAUDE.local.md → CLAUDE.md → AGENTS.md.
         let r = res(&Flags::default(), &[], &sub, &root.join("nohome"));
         assert_eq!(r.url.unwrap().value, "http://local:3");
+        std::fs::remove_file(sub.join("CLAUDE.local.md")).unwrap();
+        let r = res(&Flags::default(), &[], &sub, &root.join("nohome"));
+        assert_eq!(r.url.unwrap().value, "http://claude:4");
+        std::fs::remove_file(sub.join("CLAUDE.md")).unwrap();
+        let r = res(&Flags::default(), &[], &sub, &root.join("nohome"));
+        assert_eq!(r.url.unwrap().value, "http://agents:2");
     }
 
     #[test]
