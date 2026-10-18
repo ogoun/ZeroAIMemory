@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use axum::Router;
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, Predicate};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use zam_core::Id;
@@ -149,5 +150,16 @@ fn router(state: AppState) -> Router {
             .on_request(())
             .on_response(DefaultOnResponse::new().level(Level::INFO)),
     )
-    .layer(CompressionLayer::new())
+    .layer(CompressionLayer::new().compress_when(compress_predicate()))
+}
+
+/// Сжатие по умолчанию, кроме ответов с меткой [`api::blobs::NoCompress`]
+/// (блобы: `Range` и медиа).
+fn compress_predicate() -> impl Predicate {
+    DefaultPredicate::new().and(
+        |_: axum::http::StatusCode,
+         _: axum::http::Version,
+         _: &axum::http::HeaderMap,
+         ext: &axum::http::Extensions| ext.get::<api::blobs::NoCompress>().is_none(),
+    )
 }

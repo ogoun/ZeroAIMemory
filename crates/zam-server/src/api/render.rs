@@ -9,10 +9,16 @@
 //! - href — `#/n/<node_id>`, с якорем `#h-<slug(якорь)>`;
 //! - не найдено → `None` (битая ссылка, предупреждение рендера).
 //!
-//! Вложения в этой задаче не разрешаются (`attachment` → `None`): их подключает задача 9.
+//! Ссылки на вложения `_attachments/<sha16>/<имя>` тоже разрешаются заранее
+//! (`resolve_attachment`): сначала в пространстве заметки, затем в любом доступном
+//! зрителю (по токену — кроме Human). URL — `api/v1/blobs/<sha256>/<имя в
+//! percent-encoding>`; администратору, действующему от имени другого пользователя,
+//! добавляется `?user=<id>` (браузер не передаёт `X-Zam-User` в `<img src>`).
 //!
-//! **Кэш.** LRU на 512 записей; ключ — `(content_hash, RENDER_VERSION, space_id, user_id)`:
-//! href вики-ссылок зависят от узлов пространства и от пользователя (`X-Zam-User`).
+//! **Кэш.** LRU на 512 записей; ключ — `(content_hash, RENDER_VERSION, space_id,
+//! user_id, viewer)`: href вики-ссылок зависят от узлов пространства и от пользователя
+//! (`X-Zam-User`), URL вложений — ещё и от вида зрителя ([`Viewer`]: токен не видит
+//! вложений Human, администратору от имени другого нужен `?user=`).
 //! Ничего больше не инвалидируется: если после рендера появилась или исчезла цель
 //! вики-ссылки, кэшированный HTML покажет её прежнее состояние до изменения самой
 //! заметки (или вытеснения записи) — это допустимо.
@@ -31,10 +37,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_markdown::{
-    HEADER_ID_PREFIX, LinkKind, LinkResolution, RENDER_VERSION, Rendered, Resolver, highlight_css,
-    parse, render_html, slug,
+    HEADER_ID_PREFIX, LinkKind, LinkResolution, RENDER_VERSION, Rendered, Resolver, attachment_ref,
+    highlight_css, parse, render_html, slug,
 };
-use zam_store::{Db, NodeKind, NodePath, find_by_name, get_node_by_path};
+use zam_store::{
+    AttachScope, Db, NodeKind, NodePath, find_by_name, get_node_by_path, resolve_attachment,
+};
 
 use super::json_body;
 use super::scope::{Mode, node_scope};
@@ -48,12 +56,42 @@ pub const RENDER_BODY_MAX: usize = 1024 * 1024;
 pub const RENDER_CACHE_ENTRIES: usize = 512;
 /// HTML крупнее не кэшируется: 512 записей по несколько МБ — слишком много памяти.
 pub const RENDER_CACHE_MAX_HTML: usize = 256 * 1024;
-/// Не больше стольких разных целей вики-ссылок разрешается в одной заметке;
-/// остальные считаются битыми (защита от тысяч запросов к БД на один рендер).
+/// Не больше стольких разных целей вики-ссылок (и отдельно — вложений) разрешается
+/// в одной заметке; остальные считаются битыми (защита от тысяч запросов к БД на
+/// один рендер).
 const WIKI_TARGETS_MAX: usize = 500;
 
-/// `(content_hash, RENDER_VERSION, space_id, user_id)`.
-pub type RenderKey = (String, u32, Id, Id);
+/// Кто смотрит отрендеренный HTML: от этого зависят URL вложений.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Viewer {
+    /// Токен: вложения узлов Human не разрешаются.
+    Token,
+    /// Администратор в своей базе.
+    Admin,
+    /// Администратор от имени другого пользователя: URL блобов с `?user=<id>`.
+    AdminFor(Id),
+}
+
+impl Viewer {
+    /// Вид зрителя для принципала `p`, читающего базу пользователя `user`.
+    pub fn of(st: &AppState, p: &Principal, user: Id) -> Viewer {
+        match p {
+            Principal::Token(_) => Viewer::Token,
+            Principal::Admin { .. } if user == st.admin_id => Viewer::Admin,
+            Principal::Admin { .. } => Viewer::AdminFor(user),
+        }
+    }
+}
+
+/// Контекст разрешения ссылок: пространство заметки и зритель.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderCtx {
+    pub space: Id,
+    pub viewer: Viewer,
+}
+
+/// `(content_hash, RENDER_VERSION, space_id, user_id, viewer)`.
+pub type RenderKey = (String, u32, Id, Id, Viewer);
 /// Кэш HTML заметок.
 pub type RenderCache = Arc<Mutex<LruCache<RenderKey, Arc<Rendered>>>>;
 
@@ -62,9 +100,16 @@ pub fn new_cache() -> RenderCache {
     Arc::new(Mutex::new(LruCache::new(n)))
 }
 
-/// Ключ кэша для текста с хэшем `content_hash` в пространстве `space` пользователя `user`.
-pub fn cache_key(content_hash: &str, space: Id, user: Id) -> RenderKey {
-    (content_hash.to_string(), RENDER_VERSION, space, user)
+/// Ключ кэша для текста с хэшем `content_hash` в пространстве `space` пользователя
+/// `user` для зрителя `viewer`.
+pub fn cache_key(content_hash: &str, space: Id, user: Id, viewer: Viewer) -> RenderKey {
+    (
+        content_hash.to_string(),
+        RENDER_VERSION,
+        space,
+        user,
+        viewer,
+    )
 }
 
 /// Запись из кэша (отравленный мьютекс не мешает: кэш — только ускорение).
@@ -83,13 +128,13 @@ pub async fn render_cached(
     st: &AppState,
     key: RenderKey,
     db: &Db,
-    space: Id,
+    ctx: RenderCtx,
     text: String,
 ) -> Result<Arc<Rendered>, ApiError> {
     if let Some(r) = cache_get(st, &key) {
         return Ok(r);
     }
-    let r = Arc::new(render(db, Some(space), text).await?);
+    let r = Arc::new(render(db, Some(ctx), text).await?);
     if cacheable(&r) {
         cache_put(st, key, Arc::clone(&r));
     }
@@ -101,16 +146,69 @@ fn cacheable(r: &Rendered) -> bool {
     r.html.len() <= RENDER_CACHE_MAX_HTML
 }
 
-/// Рендер текста: вики-ссылки разрешаются в пространстве `space` (`None` — не разрешаются).
+/// Рендер текста: ссылки разрешаются в контексте `ctx` (`None` — не разрешаются).
 /// Сам рендер (CPU) — в `spawn_blocking`.
-pub async fn render(db: &Db, space: Option<Id>, text: String) -> Result<Rendered, ApiError> {
-    let links = match space {
-        Some(s) => resolve_wiki(db, s, &text).await?,
-        None => HashMap::new(),
+pub async fn render(db: &Db, ctx: Option<RenderCtx>, text: String) -> Result<Rendered, ApiError> {
+    let (links, attachments) = match ctx {
+        Some(c) => (
+            resolve_wiki(db, c.space, &text).await?,
+            resolve_attachments(db, c, &text).await?,
+        ),
+        None => (HashMap::new(), HashMap::new()),
     };
-    tokio::task::spawn_blocking(move || render_html(&text, &MapResolver { links }))
+    let resolver = MapResolver { links, attachments };
+    tokio::task::spawn_blocking(move || render_html(&text, &resolver))
         .await
         .map_err(|e| ApiError::Internal(format!("рендер прерван: {e}")))
+}
+
+/// Ссылки на вложения документа → URL блобов (неразрешённые отсутствуют).
+/// Ключ — `(sha16 в нижнем регистре, декодированное имя)`, как их передаёт рендер.
+async fn resolve_attachments(
+    db: &Db,
+    ctx: RenderCtx,
+    text: &str,
+) -> Result<HashMap<(String, String), String>, ApiError> {
+    let mut refs: Vec<(String, String)> = parse(text)
+        .links
+        .into_iter()
+        .filter(|l| l.kind != LinkKind::Wiki)
+        .filter_map(|l| match attachment_ref(&l.target) {
+            Some((sha16, Some(name))) => Some((sha16, name)),
+            _ => None,
+        })
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs.truncate(WIKI_TARGETS_MAX);
+    let scope = AttachScope {
+        prefer_space: Some(ctx.space),
+        allow_human: ctx.viewer != Viewer::Token,
+    };
+    let mut out = HashMap::new();
+    for (sha16, name) in refs {
+        if let Some((sha, _mime)) = resolve_attachment(db, &sha16, &name, scope).await? {
+            let mut url = format!("api/v1/blobs/{sha}/{}", percent_encode(&name));
+            if let Viewer::AdminFor(u) = ctx.viewer {
+                url.push_str(&format!("?user={u}"));
+            }
+            out.insert((sha16, name), url);
+        }
+    }
+    Ok(out)
+}
+
+/// Percent-encoding сегмента пути: всё, кроме `A–Z a–z 0–9 - . _ ~`, — `%XX` байтов UTF-8.
+pub fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Цели вики-ссылок документа → id заметок (неразрешённые отсутствуют).
@@ -183,6 +281,8 @@ fn percent_decode(s: &str) -> String {
 /// Резолвер по заранее разрешённым целям.
 struct MapResolver {
     links: HashMap<String, Id>,
+    /// `(sha16, имя)` → URL блоба.
+    attachments: HashMap<(String, String), String>,
 }
 
 impl Resolver for MapResolver {
@@ -197,8 +297,10 @@ impl Resolver for MapResolver {
         Some(LinkResolution { href, exists: true })
     }
 
-    fn attachment(&self, _sha16: &str, _filename: &str) -> Option<String> {
-        None
+    fn attachment(&self, sha16: &str, filename: &str) -> Option<String> {
+        self.attachments
+            .get(&(sha16.to_ascii_lowercase(), filename.to_string()))
+            .cloned()
     }
 }
 
@@ -217,15 +319,19 @@ pub async fn preview(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let req: Preview = json_body(body)?;
-    let (db, space) = match &req.base_node {
+    let (db, ctx) = match &req.base_node {
         Some(id) => {
             let sc = node_scope(&st, &p, &headers, id, Mode::Read).await?;
-            (Some(sc.db), Some(sc.space.id))
+            let ctx = RenderCtx {
+                space: sc.space.id,
+                viewer: Viewer::of(&st, &p, sc.user.id),
+            };
+            (Some(sc.db), Some(ctx))
         }
         None => (None, None),
     };
     let r = match db {
-        Some(db) => render(&db, space, req.md).await?,
+        Some(db) => render(&db, ctx, req.md).await?,
         None => {
             let md = req.md;
             tokio::task::spawn_blocking(move || render_html(&md, &zam_markdown::NoResolve))
@@ -285,8 +391,13 @@ mod tests {
     #[test]
     fn resolver_href() {
         let id = Id::new();
+        let sha = "0123456789abcdef".to_string();
         let r = MapResolver {
             links: HashMap::from([("Цель".to_string(), id)]),
+            attachments: HashMap::from([(
+                (sha.clone(), "a.png".to_string()),
+                "api/v1/blobs/x/a.png".to_string(),
+            )]),
         };
         assert_eq!(
             r.wiki("Цель", Some("Мой Раздел")).unwrap().href,
@@ -294,6 +405,11 @@ mod tests {
         );
         assert_eq!(r.wiki("Цель", None).unwrap().href, format!("#/n/{id}"));
         assert!(r.wiki("Нет", None).is_none());
-        assert!(r.attachment("0123456789abcdef", "a.png").is_none());
+        assert_eq!(
+            r.attachment("0123456789ABCDEF", "a.png").as_deref(),
+            Some("api/v1/blobs/x/a.png")
+        );
+        assert!(r.attachment(&sha, "b.png").is_none());
+        assert_eq!(percent_encode("кот 1.png"), "%D0%BA%D0%BE%D1%82%201.png");
     }
 }

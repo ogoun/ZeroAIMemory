@@ -41,8 +41,8 @@ fn html(src: &str) -> String {
 // ---------- Шаг 1: рендер ----------
 
 #[test]
-fn render_version_is_one() {
-    assert_eq!(RENDER_VERSION, 1);
+fn render_version_is_two() {
+    assert_eq!(RENDER_VERSION, 2);
 }
 
 #[test]
@@ -249,6 +249,31 @@ fn attachment_filename_percent_decoded() {
         "{}",
         r.html
     );
+}
+
+#[test]
+fn attachment_ref_normalizes_sha_and_strips_query_and_fragment() {
+    let up = SHA.to_ascii_uppercase();
+    let r = render_html(
+        &format!(
+            "![a](_attachments/{up}/cat.png?v=2)\n\n![b](_attachments/{SHA}/clip.mp4#t=10)\n\n\
+             ![c](_attachments/{SHA}/a%20b.png?x#y)\n"
+        ),
+        &TestResolver,
+    );
+    let h = &r.html;
+    assert!(
+        h.contains(&format!(r#"src="api/v1/blobs/{SHA}/cat.png""#)),
+        "{h}"
+    );
+    // MIME — по имени без `#…`: видео, а не файл
+    assert!(h.contains("<video"), "{h}");
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(
+        zam_markdown::attachment_ref(&format!("./_attachments/{up}/a%20b.png?x#y")),
+        Some((SHA.to_string(), Some("a b.png".to_string())))
+    );
+    assert_eq!(zam_markdown::attachment_ref("_attachments/xyz/a.png"), None);
 }
 
 #[test]

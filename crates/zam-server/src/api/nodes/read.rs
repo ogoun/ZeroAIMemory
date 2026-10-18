@@ -21,7 +21,7 @@ use zam_markdown::{OutlineItem, first_paragraph, outline as doc_outline, parse};
 use zam_store::{NodeKind, NodePath, get_node_by_path, node_content};
 
 use crate::api::query;
-use crate::api::render::{cache_get, cache_key, render, render_cached};
+use crate::api::render::{RenderCtx, Viewer, cache_get, cache_key, render, render_cached};
 use crate::api::scope::{Mode, NodeScope, live, node_scope, space_scope};
 use crate::app::AppState;
 use crate::auth::Principal;
@@ -85,7 +85,7 @@ pub async fn by_id(
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
     let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
-    read(&st, sc, q).await
+    read(&st, &p, sc, q).await
 }
 
 pub async fn by_path(
@@ -106,7 +106,7 @@ pub async fn by_path(
         space: sc.space,
         node,
     };
-    read(&st, ns, q).await
+    read(&st, &p, ns, q).await
 }
 
 /// `GET /nodes/{id}/outline` → `[OutlineItem]` текущей ревизии.
@@ -125,12 +125,21 @@ pub async fn outline(
     Ok(Json(doc_outline(&parse(&text))))
 }
 
-async fn read(st: &AppState, sc: NodeScope, q: ReadQuery) -> Result<Response, ApiError> {
+async fn read(
+    st: &AppState,
+    p: &Principal,
+    sc: NodeScope,
+    q: ReadQuery,
+) -> Result<Response, ApiError> {
     // Доступ уже проверен в node_scope / space_scope.
     live(&sc)?;
     let format = parse_format(q.format.as_deref())?;
     let tier = parse_tier(q.tier.as_deref())?;
     let node = &sc.node;
+    let ctx = RenderCtx {
+        space: sc.space.id,
+        viewer: Viewer::of(st, p, sc.user.id),
+    };
     if tier == Tier::L0 {
         return Ok(Json(json!({ "l0": node.l0, "rev": node.current_rev })).into_response());
     }
@@ -150,7 +159,7 @@ async fn read(st: &AppState, sc: NodeScope, q: ReadQuery) -> Result<Response, Ap
         && q.section.is_none()
         && current
         && let Some(hash) = &node.content_hash
-        && let Some(r) = cache_get(st, &cache_key(hash, sc.space.id, sc.user.id))
+        && let Some(r) = cache_get(st, &cache_key(hash, sc.space.id, sc.user.id, ctx.viewer))
     {
         return Ok(html_json(&r, node.current_rev));
     }
@@ -171,12 +180,12 @@ async fn read(st: &AppState, sc: NodeScope, q: ReadQuery) -> Result<Response, Ap
         Format::Json => Json(json!({ "node": node, "content": text, "rev": rev })).into_response(),
         Format::Html if whole => {
             let hash = key_hash(node, rev, &text);
-            let key = cache_key(&hash, sc.space.id, sc.user.id);
-            let r = render_cached(st, key, &sc.db, sc.space.id, text).await?;
+            let key = cache_key(&hash, sc.space.id, sc.user.id, ctx.viewer);
+            let r = render_cached(st, key, &sc.db, ctx, text).await?;
             html_json(&r, rev)
         }
         // Секция рендерится без кэша: ключ по хэшу заметки ей не подходит.
-        Format::Html => html_json(&render(&sc.db, Some(sc.space.id), text).await?, rev),
+        Format::Html => html_json(&render(&sc.db, Some(ctx), text).await?, rev),
     })
 }
 

@@ -129,9 +129,11 @@ async fn node_html_uses_render_cache() {
     let h2 = a.t(Method::GET, &uri, None).await.json();
     assert_eq!(len(), 1);
     assert_eq!(h1, h2);
-    // администратор читает ту же базу (первый токен — его пользователя): та же запись
-    a.adm(Method::GET, &uri, None, None).await;
-    assert_eq!(len(), 1);
+    // администратор читает ту же базу (первый токен — его пользователя), но зритель
+    // другой (ему видны вложения Human): отдельная запись, HTML тот же
+    let h_adm = a.adm(Method::GET, &uri, None, None).await.json();
+    assert_eq!(h_adm, h1);
+    assert_eq!(len(), 2);
     // тот же текст у другого пользователя — другой контекст резолвера, отдельная запись
     let (_, tok) = a.new_user("ivan").await;
     let r = a
@@ -154,7 +156,7 @@ fn main() {}
     );
     let h3 = a.tok(&tok, Method::GET, &other, None).await.json();
     assert_eq!(h3["html"], h1["html"]);
-    assert_eq!(len(), 2);
+    assert_eq!(len(), 3);
     // старая ревизия рендерится по своему хэшу
     let r = a
         .tok_h(

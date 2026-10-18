@@ -1,9 +1,11 @@
 //! Маршруты HTTP API.
 pub mod admin;
+pub mod blobs;
 pub mod health;
 pub mod nodes;
 pub mod render;
 pub mod scope;
+pub mod search;
 pub mod solutions;
 pub mod spaces;
 
@@ -34,6 +36,15 @@ fn note_body_limit(l: &LimitsSection) -> DefaultBodyLimit {
             .saturating_mul(2)
             .saturating_add(JSON_OVERHEAD),
     )
+}
+
+/// Запас на заголовки частей и поле `node` в multipart загрузки вложения, байт.
+const MULTIPART_OVERHEAD: usize = 1024 * 1024;
+
+/// Предел тела `POST /blobs`: само вложение проверяется потоком по
+/// `blob_max_bytes` (413), слой отсекает лишь заведомо большие тела.
+fn blob_body_limit(l: &LimitsSection) -> DefaultBodyLimit {
+    DefaultBodyLimit::max(l.blob_max_bytes.saturating_add(MULTIPART_OVERHEAD))
 }
 
 /// Маршруты под `/api/v1`.
@@ -81,6 +92,12 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
             post(render::preview).layer(DefaultBodyLimit::max(render::RENDER_BODY_MAX)),
         )
         .route("/api/v1/render/highlight.css", get(render::highlight))
+        .route(
+            "/api/v1/blobs",
+            post(blobs::upload).layer(blob_body_limit(limits)),
+        )
+        .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
+        .route("/api/v1/search", post(search::search))
         .route(
             "/api/v1/admin/users",
             get(admin::list_users).post(admin::create_user),

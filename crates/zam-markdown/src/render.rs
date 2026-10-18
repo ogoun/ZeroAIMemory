@@ -25,7 +25,7 @@ use crate::sanitize::{EXTERNAL_REL, sanitize_html};
 
 /// Версия вывода рендера: часть ключа кэша `(content_hash, render_version)`.
 /// Растёт при любом изменении HTML.
-pub const RENDER_VERSION: u32 = 1;
+pub const RENDER_VERSION: u32 = 2;
 
 /// Разрешённая вики-ссылка.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +214,7 @@ fn plan_attachment(url: &str, resolver: &dyn Resolver, warnings: &mut Vec<String
     let (sha16, name) = attachment_ref(url)?;
     let resolved = name.and_then(|name| {
         resolver
-            .attachment(sha16, &name)
+            .attachment(&sha16, &name)
             .map(|url| (media_of(&name), url))
     });
     Some(match resolved {
@@ -227,9 +227,10 @@ fn plan_attachment(url: &str, resolver: &dyn Resolver, warnings: &mut Vec<String
 }
 
 /// Разбирает `_attachments/<16 hex>/<имя>` (допустимы ведущие `./`, `../`, `/`).
-/// Имя декодируется из percent-encoding; `Some((sha, None))` — ссылка на
-/// вложение с недопустимым именем.
-fn attachment_ref(url: &str) -> Option<(&str, Option<String>)> {
+/// Хэш приводится к нижнему регистру; суффиксы `?…` и `#…` отбрасываются;
+/// имя декодируется из percent-encoding. `Some((sha, None))` — ссылка на
+/// вложение с недопустимым именем; `None` — не ссылка на вложение.
+pub fn attachment_ref(url: &str) -> Option<(String, Option<String>)> {
     let mut u = url;
     while let Some(r) = u.strip_prefix("./").or_else(|| u.strip_prefix("../")) {
         u = r;
@@ -239,9 +240,10 @@ fn attachment_ref(url: &str) -> Option<(&str, Option<String>)> {
     if sha16.len() != 16 || !sha16.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
+    let name = name.split(['?', '#']).next().unwrap_or_default();
     let name = percent_decode(name)
         .filter(|n| !n.is_empty() && !n.contains(['/', '\\', '\0']) && n != "." && n != "..");
-    Some((sha16, name))
+    Some((sha16.to_ascii_lowercase(), name))
 }
 
 /// Декодирует `%XX`; `None` — неверная последовательность или не UTF-8.

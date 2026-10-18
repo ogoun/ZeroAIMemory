@@ -22,5 +22,7 @@ pub use highlight::highlight_css;
 pub use options::{HEADER_ID_PREFIX, comrak_options};
 pub use patch::{Applied, PatchError, PatchOp, apply_patch, section_bytes};
 pub use pos::LineIndex;
-pub use render::{LinkResolution, NoResolve, RENDER_VERSION, Rendered, Resolver, render_html};
+pub use render::{
+    LinkResolution, NoResolve, RENDER_VERSION, Rendered, Resolver, attachment_ref, render_html,
+};
 pub use sanitize::sanitize_html;
