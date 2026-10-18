@@ -1,8 +1,10 @@
 //! Хранилище ZeroAIMemory: открытие SQLite, поток-писатель, пул читателей, миграции.
 
+pub mod datadir;
 pub mod db;
 pub mod migrate;
 
+pub use datadir::DataDir;
 pub use db::Db;
 pub use migrate::Migration;
 

@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 rusqlite.workspace = true
 thiserror.workspace = true
+fs4.workspace = true
+zam-core = { path = "../zam-core", features = ["sqlite"] }
 tokio.workspace = true
 
 [dev-dependencies]
