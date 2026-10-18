@@ -1,6 +1,8 @@
 //! Хранилище ZeroAIMemory: открытие SQLite, поток-писатель, пул читателей, миграции,
-//! узлы и ревизии заметок с синхронной индексацией (чанки секций, FTS5), полнотекстовый поиск.
+//! узлы и ревизии заметок с синхронной индексацией (чанки секций, FTS5), полнотекстовый поиск,
+//! блобы вложений.
 
+pub mod blobs;
 pub mod datadir;
 pub mod db;
 pub mod migrate;
@@ -11,6 +13,7 @@ pub mod system;
 pub mod time;
 pub mod user_db;
 
+pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, resolve_attachment};
 pub use datadir::DataDir;
 pub use db::Db;
 pub use migrate::Migration;

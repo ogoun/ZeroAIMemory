@@ -11,7 +11,7 @@ rusqlite.workspace = true
 thiserror.workspace = true
 fs4.workspace = true
 zam-core = { path = "../zam-core", features = ["sqlite"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
