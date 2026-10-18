@@ -1,0 +1,353 @@
+/* Типографика документа (HTML рендера сервера, контейнер .doc). Цвета — из app.css. */
+
+.doc {
+  font-size: 16px;
+  line-height: 1.65;
+  overflow-wrap: break-word;
+  color: var(--text);
+}
+.doc > :first-child {
+  margin-top: 0;
+}
+
+/* ---- заголовки и якоря ---- */
+.doc h1,
+.doc h2,
+.doc h3,
+.doc h4,
+.doc h5,
+.doc h6 {
+  position: relative;
+  margin: 1.6em 0 0.6em;
+  line-height: 1.3;
+  font-weight: 650;
+  scroll-margin-top: calc(var(--header-h) + 12px);
+}
+.doc h1 {
+  font-size: 1.9em;
+  margin-top: 0.4em;
+}
+.doc h2 {
+  font-size: 1.45em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--border);
+}
+.doc h3 {
+  font-size: 1.2em;
+}
+.doc h4 {
+  font-size: 1.05em;
+}
+.doc h5,
+.doc h6 {
+  font-size: 0.95em;
+  color: var(--muted);
+}
+.doc .heading-anchor {
+  margin-left: 0.4em;
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 400;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.doc :is(h1, h2, h3, h4, h5, h6):hover .heading-anchor,
+.doc .heading-anchor:focus-visible {
+  opacity: 1;
+}
+@media (hover: none) {
+  .doc .heading-anchor {
+    opacity: 0.5;
+  }
+}
+.doc .flash {
+  animation: doc-flash 1.6s ease-out;
+}
+@keyframes doc-flash {
+  from {
+    background: var(--flash);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+/* ---- текст ---- */
+.doc p,
+.doc ul,
+.doc ol,
+.doc blockquote,
+.doc table,
+.doc .code-block,
+.doc details {
+  margin: 0 0 1em;
+}
+.doc a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+.doc a.wikilink {
+  text-decoration-style: dotted;
+}
+.doc a.wikilink.broken {
+  color: var(--danger);
+  cursor: not-allowed;
+  text-decoration-style: wavy;
+}
+.doc a.attachment::before {
+  content: '⤓ ';
+}
+.doc hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+.doc ul,
+.doc ol {
+  padding-left: 1.6em;
+}
+.doc li + li {
+  margin-top: 0.25em;
+}
+.doc li > ul,
+.doc li > ol {
+  margin: 0.25em 0 0;
+}
+.doc blockquote {
+  padding: 0.2em 1em;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.doc del {
+  color: var(--muted);
+}
+
+/* ---- задачи ---- */
+.doc li.task-list-item {
+  list-style: none;
+  margin-left: -1.4em;
+}
+.doc li.task-list-item input[type='checkbox'] {
+  margin: 0 0.5em 0 0;
+  vertical-align: -1px;
+}
+
+/* ---- код ---- */
+.doc code {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, 'SFMono-Regular', monospace;
+  font-size: 0.88em;
+}
+.doc :not(pre) > code {
+  padding: 0.12em 0.38em;
+  border-radius: 4px;
+  background: var(--code-bg);
+}
+.doc .code-block {
+  position: relative;
+}
+.doc pre {
+  margin: 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
+  line-height: 1.5;
+  tab-size: 4;
+}
+.doc pre code {
+  font-size: 13.5px;
+}
+.doc .copy-code {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.doc .code-block:hover .copy-code,
+.doc .copy-code:focus-visible {
+  opacity: 1;
+}
+@media (hover: none) {
+  .doc .copy-code {
+    opacity: 0.85;
+  }
+}
+
+/* ---- таблицы ---- */
+.doc table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+.doc th,
+.doc td {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+.doc th {
+  background: var(--code-bg);
+  font-weight: 600;
+}
+.doc th[align='center'],
+.doc td[align='center'] {
+  text-align: center;
+}
+.doc th[align='right'],
+.doc td[align='right'] {
+  text-align: right;
+}
+
+/* ---- медиа ---- */
+.doc img,
+.doc video {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+}
+.doc img.zoomable {
+  cursor: zoom-in;
+}
+.doc audio {
+  width: 100%;
+  max-width: 480px;
+}
+
+/* ---- формулы и диаграммы ---- */
+.doc div.math,
+.doc span.math[data-math-style='display'] {
+  display: block;
+  margin: 0 0 1em;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.doc .math-error {
+  color: var(--danger);
+  font-family: ui-monospace, Consolas, monospace;
+}
+.doc .mermaid-diagram {
+  margin: 0 0 1em;
+  overflow-x: auto;
+  text-align: center;
+}
+.doc .mermaid-diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+.doc pre.mermaid-src {
+  color: var(--muted);
+}
+.doc .mermaid-error {
+  margin: 0 0 4px;
+  color: var(--danger);
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+
+/* ---- callout (GitHub alerts и Obsidian) ---- */
+.doc .callout {
+  --c: var(--callout-note);
+  margin: 0 0 1em;
+  padding: 10px 14px;
+  border-left: 4px solid var(--c);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--c) 9%, transparent);
+}
+.doc .callout-title {
+  font-weight: 600;
+  color: var(--c);
+}
+.doc summary.callout-title {
+  cursor: pointer;
+}
+.doc .callout-content > :first-child {
+  margin-top: 0.4em;
+}
+.doc .callout-content > :last-child {
+  margin-bottom: 0;
+}
+.doc .callout[data-callout='tip'],
+.doc .callout[data-callout='hint'],
+.doc .callout[data-callout='success'],
+.doc .callout[data-callout='check'],
+.doc .callout[data-callout='done'] {
+  --c: var(--callout-tip);
+}
+.doc .callout[data-callout='important'],
+.doc .callout[data-callout='example'],
+.doc .callout[data-callout='abstract'],
+.doc .callout[data-callout='summary'],
+.doc .callout[data-callout='tldr'] {
+  --c: var(--callout-important);
+}
+.doc .callout[data-callout='warning'],
+.doc .callout[data-callout='attention'],
+.doc .callout[data-callout='question'],
+.doc .callout[data-callout='help'],
+.doc .callout[data-callout='faq'] {
+  --c: var(--callout-warning);
+}
+.doc .callout[data-callout='caution'],
+.doc .callout[data-callout='danger'],
+.doc .callout[data-callout='error'],
+.doc .callout[data-callout='failure'],
+.doc .callout[data-callout='fail'],
+.doc .callout[data-callout='missing'],
+.doc .callout[data-callout='bug'] {
+  --c: var(--callout-caution);
+}
+.doc .callout[data-callout='quote'],
+.doc .callout[data-callout='cite'] {
+  --c: var(--muted);
+}
+
+/* обычный details/summary в документе */
+.doc details:not(.callout) {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.doc details:not(.callout) > summary {
+  cursor: pointer;
+  font-weight: 500;
+}
+
+/* ---- сноски ---- */
+.doc .footnotes {
+  margin-top: 2.5em;
+  padding-top: 1em;
+  border-top: 1px solid var(--border);
+  font-size: 0.9em;
+  color: var(--muted);
+}
+.doc .footnotes li:target,
+.doc .footnotes li.flash {
+  color: var(--text);
+}
+.doc sup a {
+  text-decoration: none;
+}
+.doc a.footnote-backref {
+  text-decoration: none;
+}
+
+@media (max-width: 719px) {
+  .doc {
+    font-size: 15.5px;
+  }
+  .doc h1 {
+    font-size: 1.6em;
+  }
+  .doc h2 {
+    font-size: 1.3em;
+  }
+}

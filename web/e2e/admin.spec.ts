@@ -32,6 +32,10 @@ test('администратор: вход, пользователь, токен
   await page.getByLabel('Логин').fill('admin');
   await page.getByLabel('Пароль').fill(process.env.E2E_ADMIN_PASSWORD!);
   await page.getByRole('button', { name: 'Войти' }).click();
+  // После входа — заметки; пользователи и токены — в разделе «Администрирование».
+  await expect(page.getByRole('navigation', { name: 'Дерево заметок' })).toBeVisible();
+  await page.getByRole('link', { name: 'Администрирование' }).click();
+  await expect(page).toHaveURL(/#\/admin$/);
   await expect(page.getByRole('heading', { name: 'Пользователи' })).toBeVisible();
 
   // F5 до выхода восстанавливает сессию по cookie

@@ -10,6 +10,17 @@
   --danger: #c43d3d;
   --warn-bg: #fff4d6;
   --warn-text: #6b4a00;
+  --hover: rgb(15 23 42 / 0.05);
+  --selected: rgb(47 111 237 / 0.12);
+  --chip: rgb(15 23 42 / 0.06);
+  --code-bg: #f3f4f7;
+  --flash: rgb(255 214 10 / 0.35);
+  --callout-note: #2f6fed;
+  --callout-tip: #1a7f37;
+  --callout-important: #8250df;
+  --callout-warning: #9a6700;
+  --callout-caution: #cf222e;
+  --header-h: 52px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -23,6 +34,16 @@
     --danger: #ff7b7b;
     --warn-bg: #3a2f10;
     --warn-text: #ffd978;
+    --hover: rgb(255 255 255 / 0.05);
+    --selected: rgb(108 155 255 / 0.18);
+    --chip: rgb(255 255 255 / 0.08);
+    --code-bg: #171b21;
+    --flash: rgb(255 214 10 / 0.22);
+    --callout-note: #6c9bff;
+    --callout-tip: #3fb950;
+    --callout-important: #a371f7;
+    --callout-warning: #d29922;
+    --callout-caution: #f85149;
   }
 }
 * { box-sizing: border-box; }
@@ -53,14 +74,20 @@ button {
 }
 button.primary { color: var(--accent-text); background: var(--accent); border-color: var(--accent); }
 button.danger { color: var(--danger); }
+button.danger-fill { color: #fff; background: var(--danger); border-color: var(--danger); }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+a { color: var(--accent); }
 button:disabled { opacity: 0.5; cursor: default; }
 .panel { padding: 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
 .error { color: var(--danger); margin: 8px 0 0; }
 .muted { color: var(--muted); }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.overlay { position: fixed; inset: 0; background: rgb(0 0 0 / 0.5); }
+.overlay { position: fixed; inset: 0; z-index: 50; background: rgb(0 0 0 / 0.5); }
 .dialog {
-  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  position: fixed; top: 50%; left: 50%; z-index: 51; transform: translate(-50%, -50%);
   width: min(520px, 92vw);
 }
 .warn { background: var(--warn-bg); color: var(--warn-text); padding: 8px 10px; border-radius: 6px; }

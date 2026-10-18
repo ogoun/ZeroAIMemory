@@ -12,6 +12,7 @@
     type TokenInfo,
     type User,
   } from '../lib/api';
+  import { copyText } from '../lib/clipboard';
 
   let { onExpired }: { onExpired: () => void } = $props();
 
@@ -81,30 +82,18 @@
     shown = t;
   }
 
-  // Clipboard API есть только в secure context (HTTPS, localhost); по HTTP в LAN —
-  // выделение поля и execCommand('copy'), иначе подсказка скопировать вручную.
+  // copyText: Clipboard API в secure context, по HTTP в LAN — execCommand('copy');
+  // не вышло — токен выделяется в поле с подсказкой скопировать вручную.
   async function copy() {
     if (!shown) return;
     copyHint = '';
-    if (window.isSecureContext && navigator.clipboard) {
-      try {
-        await navigator.clipboard.writeText(shown.plaintext);
-        copied = true;
-        return;
-      } catch {
-        // запасной путь ниже
-      }
+    if (await copyText(shown.plaintext)) {
+      copied = true;
+      return;
     }
     tokenField?.focus();
     tokenField?.select();
-    let ok = false;
-    try {
-      ok = document.execCommand('copy');
-    } catch {
-      ok = false;
-    }
-    if (ok) copied = true;
-    else copyHint = 'Не удалось скопировать автоматически: токен выделен, скопируйте его вручную (Ctrl+C).';
+    copyHint = 'Не удалось скопировать автоматически: токен выделен, скопируйте его вручную (Ctrl+C).';
   }
 
   reload();
