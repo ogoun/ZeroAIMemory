@@ -1,0 +1,25 @@
+[Unit]
+Description=ZeroAIMemory server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zam
+Group=zam
+WorkingDirectory=/opt/zeroaimemory
+ExecStart=/opt/zeroaimemory/zam-server serve --config /etc/zeroaimemory/config.toml
+Restart=on-failure
+RestartSec=3
+# Сервер корректно завершается по SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=20
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Каталог данных (data_dir в config.toml)
+ReadWritePaths=/var/lib/zeroaimemory
+
+[Install]
+WantedBy=multi-user.target

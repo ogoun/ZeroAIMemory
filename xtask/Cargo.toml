@@ -16,3 +16,4 @@ ureq.workspace = true
 zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
+serde_json.workspace = true

@@ -2,6 +2,8 @@
 
 mod fetch;
 mod manifest;
+mod package;
+mod smoke;
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +29,30 @@ enum Cmd {
         /// Скачать и напечатать фактические SHA-256 (только при обновлении версий)
         #[arg(long)]
         print_hashes: bool,
+    },
+    /// Собрать архивы поставки в target/dist/ и SHA256SUMS (сначала: fetch-deps и release-сборка)
+    Package {
+        /// windows-x64 | linux-x64
+        #[arg(long)]
+        platform: String,
+        /// cpu (gpu появится на этапе M2)
+        #[arg(long, default_value = "cpu")]
+        flavor: String,
+        /// Версия X.Y.Z[-суффикс]
+        #[arg(long)]
+        version: String,
+        /// Путь к zam-server (по умолчанию target/release/zam-server[.exe])
+        #[arg(long)]
+        server_bin: Option<PathBuf>,
+        /// Путь к zam (по умолчанию target/release/zam[.exe])
+        #[arg(long)]
+        cli_bin: Option<PathBuf>,
+    },
+    /// Smoke-тест комплекта сервера: распаковка, запуск, проверка API, zam и Qdrant
+    Smoke {
+        /// Архив zam-server-…-cpu.(zip|tar.gz)
+        #[arg(long)]
+        archive: PathBuf,
     },
 }
 
@@ -104,11 +130,76 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool) -> Result<()> {
     Ok(())
 }
 
+fn package_cmd(
+    platform: String,
+    flavor: String,
+    version: String,
+    server_bin: Option<PathBuf>,
+    cli_bin: Option<PathBuf>,
+) -> Result<()> {
+    if flavor == "gpu" {
+        bail!("GPU-комплект появится на этапе M2");
+    }
+    if flavor != "cpu" {
+        bail!("неизвестный flavor '{flavor}', допустим cpu");
+    }
+    if !PLATFORMS.contains(&platform.as_str()) {
+        bail!(
+            "неизвестная платформа '{platform}', допустимы: {}",
+            PLATFORMS.join(", ")
+        );
+    }
+    let root = repo_root();
+    let target = root.join("target");
+    let release = target.join("release");
+    let server_bin =
+        server_bin.unwrap_or_else(|| release.join(package::exe(&platform, "zam-server")));
+    let cli_bin = cli_bin.unwrap_or_else(|| release.join(package::exe(&platform, "zam")));
+    let deploy = root.join("deploy");
+    let licenses = target.join("licenses");
+    package::generate_licenses(&root, &licenses)?;
+    let vc = if platform.starts_with("windows") {
+        Some(package::find_vcruntime()?)
+    } else {
+        None
+    };
+    let qv = package::qdrant_version(&deploy)?;
+    let dist = target.join("dist");
+    let license = root.join("LICENSE");
+    let deps = target.join("deps").join(&platform);
+    let (server, cli) = package::package(&package::Inputs {
+        platform: &platform,
+        version: &version,
+        server_bin: &server_bin,
+        cli_bin: &cli_bin,
+        deps_dir: &deps,
+        deploy_dir: &deploy,
+        generated_licenses_dir: &licenses,
+        project_license: &license,
+        vcruntime: vc.as_deref(),
+        qdrant_version: &qv,
+        out_dir: &dist,
+    })?;
+    let sums = package::write_sha256sums(&dist)?;
+    for p in [server, cli, sums] {
+        println!("{}", p.display());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::FetchDeps {
             platform,
             print_hashes,
         } => fetch_deps(platform, print_hashes),
+        Cmd::Package {
+            platform,
+            flavor,
+            version,
+            server_bin,
+            cli_bin,
+        } => package_cmd(platform, flavor, version, server_bin, cli_bin),
+        Cmd::Smoke { archive } => smoke::run(&archive, &repo_root().join("target")),
     }
 }
