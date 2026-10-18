@@ -3,10 +3,14 @@
 pub mod datadir;
 pub mod db;
 pub mod migrate;
+pub mod system;
 
 pub use datadir::DataDir;
 pub use db::Db;
 pub use migrate::Migration;
+pub use system::{
+    Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,
+};
 
 /// Ошибки слоя хранения.
 #[derive(Debug, thiserror::Error)]
