@@ -149,10 +149,57 @@ fn heading_at_eof_without_newline() {
 }
 
 #[test]
-fn indented_next_heading_is_untouched() {
-    let src = "# A\na\n## B\nb\n   # C\nc\n";
+fn indented_next_heading_line_belongs_to_next_section() {
+    let src = "# A
+a
+## B
+b
+   # C
+c
+";
+    // отступ строки заголовка — часть следующей секции, а не предыдущей
+    assert_eq!(
+        section_bytes(src, "A > B"),
+        Some(
+            "## B
+b
+"
+        )
+    );
+    assert_eq!(
+        section_bytes(src, "C"),
+        Some(
+            "   # C
+c
+"
+        )
+    );
     let a = apply(src, &append_to("A > B", "t"));
-    assert_eq!(a.text, "# A\na\n## B\nb\n   \nt\n# C\nc\n");
+    assert_eq!(
+        a.text,
+        "# A
+a
+## B
+b
+t
+   # C
+c
+"
+    );
+    assert_eq!(
+        &a.text[a.changed.clone()],
+        "t
+"
+    );
+    // смена отступа C не меняет байты B (нет ложного конфликта)
+    let moved = "# A
+a
+## B
+b
+ # C
+c
+";
+    assert_eq!(section_bytes(moved, "A > B"), section_bytes(src, "A > B"));
     assert_eq!(
         section_by_path(&parse(&a.text), "C").map(|s| s.level),
         Some(1)
@@ -246,6 +293,38 @@ fn missing_and_ambiguous_sections() {
     );
 }
 
+#[test]
+fn section_lost_after_splice_is_broken() {
+    // `---` в начале без закрытия: вставка `---` делает из начала frontmatter
+    assert_eq!(
+        apply_patch(
+            "---
+# d",
+            &append_to("d", "---")
+        ),
+        Err(PatchError::Broken("d".into()))
+    );
+    // вставка дубля пути делает его неоднозначным
+    let src = "# A
+## B
+x
+";
+    assert_eq!(
+        apply_patch(
+            src,
+            &append_to(
+                "A > B", "## B
+"
+            )
+        ),
+        Err(PatchError::Broken("A > B".into()))
+    );
+    assert_eq!(
+        PatchError::Broken("X".into()).to_string(),
+        "после правки секция не находится однозначно: X"
+    );
+}
+
 // ---------- Шаг 2: property-инвариант ----------
 
 /// Строки документа: общие из `md_line` и заголовки с короткими разными названиями,
@@ -323,14 +402,6 @@ fn doc_newline(src: &str) -> &'static str {
     }
 }
 
-/// Документ не начинается с `---` без закрытого frontmatter: иначе вставленная
-/// строка `---` превратила бы начало документа во frontmatter (свойство YAML-блока,
-/// а не PATCH).
-fn no_open_frontmatter(src: &str) -> bool {
-    let body = src.strip_prefix('\u{FEFF}').unwrap_or(src);
-    parse(src).frontmatter.is_some() || !body.starts_with("---")
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
     #[test]
@@ -370,7 +441,11 @@ proptest! {
             }
         };
 
-        let a = apply_patch(&src, &op).expect("патч применяется");
+        let a = match apply_patch(&src, &op) {
+            Ok(a) => a,
+            Err(PatchError::Broken(_)) => return Ok(()),
+            Err(e) => return Err(TestCaseError::fail(format!("{e}: {src:?}"))),
+        };
         let old = old_range(&src, &op);
         prop_assert_eq!(a.changed.start, old.start);
         prop_assert!(a.changed.end <= a.text.len());
@@ -393,15 +468,15 @@ proptest! {
             }
         }
 
-        if let Some(path) = &a.touched_section
-            && no_open_frontmatter(&src)
-        {
-            prop_assert!(
-                section_by_path(&parse(&a.text), path).is_some(),
-                "{:?} -> {:?}",
-                src,
-                a.text
-            );
+        // Ok — значит, секция по-прежнему находится ровно одна
+        if let Some(path) = &a.touched_section {
+            let new_doc = parse(&a.text);
+            let found = new_doc
+                .sections
+                .iter()
+                .filter(|s| s.level > 0 && s.path.join(" > ") == *path)
+                .count();
+            prop_assert_eq!(found, 1, "{:?} -> {:?}", src, a.text);
         }
     }
 }

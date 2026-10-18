@@ -51,30 +51,41 @@ pub enum PatchError {
     SectionNotFound(String),
     #[error("путь секции неоднозначен: {0}")]
     Ambiguous(String),
+    /// После splice повторный разбор не находит затронутую секцию ровно один раз
+    /// (например, вставка дублирует путь или превращает начало во frontmatter).
+    #[error("после правки секция не находится однозначно: {0}")]
+    Broken(String),
 }
 
 /// Применяет операцию к исходнику заметки.
 ///
 /// Путь секции сравнивается с заголовками точно (пробелы вокруг `>` не важны);
-/// если путь есть у нескольких секций — [`PatchError::Ambiguous`].
+/// если путь есть у нескольких секций — [`PatchError::Ambiguous`]. После splice
+/// новый текст разбирается повторно: если затронутая секция не находится ровно
+/// одна — [`PatchError::Broken`].
 /// Пустой `content` ничего не вставляет (у `ReplaceSection` — удаляет тело).
 pub fn apply_patch(src: &str, op: &PatchOp) -> Result<Applied, PatchError> {
     let doc = parse(src);
-    let (range, content, touched) = match op {
+    let (range, content, touched, path) = match op {
         PatchOp::ReplaceSection { section, content } => {
             let s = unique_section(&doc, section)?;
-            (s.body.clone(), content, Some(s))
+            (s.body.clone(), content, Some(s), section.as_str())
         }
         PatchOp::AppendToSection { section, content } => {
             let s = unique_section(&doc, section)?;
-            (s.range.end..s.range.end, content, Some(s))
+            (s.range.end..s.range.end, content, Some(s), section.as_str())
         }
         PatchOp::InsertAfterHeading { section, content } => {
             let s = unique_section(&doc, section)?;
-            (s.body.start..s.body.start, content, Some(s))
+            (
+                s.body.start..s.body.start,
+                content,
+                Some(s),
+                section.as_str(),
+            )
         }
-        PatchOp::Append { content } => (src.len()..src.len(), content, None),
-        PatchOp::Prepend { content } => (doc.body_start..doc.body_start, content, None),
+        PatchOp::Append { content } => (src.len()..src.len(), content, None, ""),
+        PatchOp::Prepend { content } => (doc.body_start..doc.body_start, content, None, ""),
     };
 
     let insert = prepare(src, range.start, content);
@@ -82,10 +93,17 @@ pub fn apply_patch(src: &str, op: &PatchOp) -> Result<Applied, PatchError> {
     text.push_str(&src[..range.start]);
     text.push_str(&insert);
     text.push_str(&src[range.end..]);
+
+    let touched_section = touched.map(|s| s.path.join(" > "));
+    if let Some(canon) = &touched_section
+        && sections_by_path(&parse(&text), canon).count() != 1
+    {
+        return Err(PatchError::Broken(path.to_string()));
+    }
     Ok(Applied {
         text,
         changed: range.start..range.start + insert.len(),
-        touched_section: touched.map(|s| s.path.join(" > ")),
+        touched_section,
     })
 }
 

@@ -59,7 +59,8 @@ pub struct Section {
     /// Заголовки от корня до этой секции включительно.
     pub path: Vec<String>,
     pub anchor: String,
-    /// От начала заголовка до начала следующей секции того же или высшего уровня.
+    /// От начала строки заголовка (с отступом) до начала строки следующего
+    /// заголовка того же или высшего уровня.
     pub range: Range<usize>,
     /// Содержимое после строк заголовка.
     pub body: Range<usize>,
@@ -213,7 +214,11 @@ fn build_sections(src: &str, body_start: usize, headings: &[Heading]) -> Vec<Sec
     let heads: Vec<&Heading> = headings.iter().filter(|h| h.level <= 3).collect();
     let mut sections = Vec::with_capacity(heads.len() + 1);
 
-    let first = heads.first().map_or(src.len(), |h| h.range.start);
+    // секции состоят из целых строк: отступ строки заголовка (до трёх пробелов)
+    // принадлежит его секции, а не предыдущей
+    let first = heads
+        .first()
+        .map_or(src.len(), |h| line_start(src, body_start, h.range.start));
     if first > body_start && !src[body_start..first].trim().is_empty() {
         sections.push(Section {
             level: 0,
@@ -230,7 +235,8 @@ fn build_sections(src: &str, body_start: usize, headings: &[Heading]) -> Vec<Sec
         let end = heads[i + 1..]
             .iter()
             .find(|n| n.level <= h.level)
-            .map_or(src.len(), |n| n.range.start);
+            .map_or(src.len(), |n| line_start(src, body_start, n.range.start));
+        let start = line_start(src, body_start, h.range.start);
         while stack.last().is_some_and(|&(l, _)| l >= h.level) {
             stack.pop();
         }
@@ -240,11 +246,18 @@ fn build_sections(src: &str, body_start: usize, headings: &[Heading]) -> Vec<Sec
             title: h.text.clone(),
             path: stack.iter().map(|&(_, t)| t.to_string()).collect(),
             anchor: h.anchor.clone(),
-            range: h.range.start..end,
+            range: start..end,
             body: h.range.end.min(end)..end,
         });
     }
     sections
+}
+
+/// Начало строки, содержащей `pos`, но не раньше `floor`.
+fn line_start(src: &str, floor: usize, pos: usize) -> usize {
+    src[floor..pos]
+        .rfind(['\n', '\r'])
+        .map_or(floor, |i| floor + i + 1)
 }
 
 /// Оглавление по секциям H1–H3.
