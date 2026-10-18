@@ -54,17 +54,35 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/nonexistent-home"))
 }
 
-fn agent() -> ureq::Agent {
-    ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(2)))
-            .timeout_recv_response(Some(Duration::from_secs(5)))
-            .timeout_recv_body(Some(Duration::from_secs(5)))
-            .http_status_as_error(false)
-            // сервер в LAN: системный прокси из окружения не используем
-            .proxy(None)
-            .build(),
-    )
+/// Хост из URL без схемы, userinfo и порта (IPv6 без скобок).
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
+    if let Some(v6) = auth.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or("");
+    }
+    auth.split(':').next().unwrap_or("")
+}
+
+/// К loopback системный прокси не применяется; для остальных хостов работают
+/// ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY (по умолчанию ureq).
+fn bypass_proxy(url: &str) -> bool {
+    matches!(host_of(url), "127.0.0.1" | "localhost" | "::1")
+}
+
+fn agent(url: &str) -> ureq::Agent {
+    let mut b = ureq::Agent::config_builder()
+        .timeout_resolve(Some(Duration::from_secs(2)))
+        .timeout_global(Some(Duration::from_secs(10)))
+        .timeout_connect(Some(Duration::from_secs(2)))
+        .timeout_recv_response(Some(Duration::from_secs(5)))
+        .timeout_recv_body(Some(Duration::from_secs(5)))
+        .http_status_as_error(false);
+    if bypass_proxy(url) {
+        b = b.proxy(None);
+    }
+    ureq::Agent::new_with_config(b.build())
 }
 
 /// GET; Ok((код, тело)) или текст сетевой ошибки (токен в нём не встречается).
@@ -88,15 +106,25 @@ fn status(flags: Flags, as_json: bool) -> u8 {
         .iter()
         .filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?)))
         .collect();
-    let r = locate::resolve(&flags, &env, &cwd, &home_dir());
+    let r = match locate::resolve(&flags, &env, &cwd, &home_dir()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return EXIT_CONFIG;
+        }
+    };
     let Some(url) = r.url else {
         eprintln!(
             "не задан адрес сервера: флаг --url, ZAM_URL, блок ZeroAIMemory в CLAUDE.md/AGENTS.md или ~/.zeroaimemory/config.toml"
         );
         return EXIT_CONFIG;
     };
+    if let Err(e) = locate::check_url(&url.value) {
+        eprintln!("{e}");
+        return EXIT_CONFIG;
+    }
     let solution = locate::find_solution(&cwd);
-    let agent = agent();
+    let agent = agent(&url.value);
 
     // 1. сервер: /health без аутентификации
     let health = match get(&agent, &format!("{}/api/v1/health", url.value), None) {
@@ -220,6 +248,32 @@ impl Report {
         }
         if let Some(p) = problem {
             eprintln!("{p}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_hosts_bypass_proxy() {
+        for u in [
+            "http://127.0.0.1:7700",
+            "http://localhost",
+            "https://localhost:1/x",
+            "http://[::1]:7700",
+            "http://user:pw@127.0.0.1/",
+        ] {
+            assert!(bypass_proxy(u), "{u}");
+        }
+        for u in [
+            "http://192.168.1.5:7700",
+            "http://zam.lan",
+            "http://localhost.evil.com",
+            "http://127.0.0.10",
+        ] {
+            assert!(!bypass_proxy(u), "{u}");
         }
     }
 }

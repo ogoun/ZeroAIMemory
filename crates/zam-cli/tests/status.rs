@@ -37,6 +37,18 @@ async fn start(name: &str) -> (String, String) {
 fn zam(name: &str) -> Command {
     let dir = tmp(&format!("{name}-cwd"));
     let mut c = Command::cargo_bin("zam").unwrap();
+    for k in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        c.env_remove(k);
+    }
     c.env_remove("ZAM_URL")
         .env_remove("ZAM_TOKEN")
         .env("HOME", &dir)
@@ -178,4 +190,28 @@ fn no_url_exit_1_with_hint() {
     let o = zam("nourl").arg("status").output().unwrap();
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).contains("не задан адрес сервера"), "{}", err(&o));
+}
+
+#[test]
+fn bad_url_scheme_exit_1() {
+    for u in ["host:7700", "ftp://h"] {
+        let o = zam("badscheme")
+            .args(["status", "--url", u])
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(1), "{u}");
+        assert!(err(&o).contains("http:// или https://"), "{}", err(&o));
+    }
+}
+
+#[test]
+fn broken_home_config_exit_1_with_path() {
+    let mut c = zam("brokenhome");
+    let dir = tmp("brokenhome-cwd-keep");
+    std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
+    std::fs::write(dir.join(".zeroaimemory/config.toml"), "url = [").unwrap();
+    c.env("HOME", &dir).env("USERPROFILE", &dir);
+    let o = c.arg("status").output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("config.toml"), "{}", err(&o));
 }

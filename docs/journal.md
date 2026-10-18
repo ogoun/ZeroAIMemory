@@ -48,5 +48,5 @@
 - Составлен план этапа M0 (каркас и конвейер релиза): `docs/plans/2026-10-18-m0-skeleton.md`, 15 задач. Планы M1–M7 составляются по одному, после завершения предыдущего этапа.
 - Состояние машины: Rust не установлен (будет поставлен в `.toolchain/` внутри проекта), MSVC Build Tools, Node 22 и WSL2 есть, `gh` нет.
 
-- Добавлен CLI `zam` (`crates/zam-cli`): `zam --version`, `zam status [--url] [--token] [--json]` с поиском настроек (флаги, ZAM_*, CLAUDE.md/AGENTS.md вверх от cwd, `~/.zeroaimemory/config.toml`); коды выхода 0/1/2/3. Без tokio, tracing и SQLite. HTTP-клиент ureq 3 без системного прокси.
+- Добавлен CLI `zam` (`crates/zam-cli`): `zam --version`, `zam status [--url] [--token] [--json]` с поиском настроек (флаги, ZAM_*, CLAUDE.md/AGENTS.md вверх от cwd, `~/.zeroaimemory/config.toml`); коды выхода 0/1/2/3. Без tokio, tracing и SQLite. HTTP-клиент ureq 3: прокси из окружения (ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY) учитываются, кроме loopback-хостов; битый `~/.zeroaimemory/config.toml` — ошибка конфигурации (exit 1); файлы настроек > 1 МиБ пропускаются.
 - Замер холодного старта `zam --version` (release, Windows 11, 50 запусков через `.tmp/bench-start.ps1`): среднее 5.8 мс, p95 7.7 мс при цели ≤ 20 мс.
