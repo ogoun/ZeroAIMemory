@@ -155,7 +155,10 @@ async fn read(st: &AppState, sc: NodeScope, q: ReadQuery) -> Result<Response, Ap
         return Ok(html_json(&r, node.current_rev));
     }
 
-    let (rev, text) = node_content(&sc.db, node.id, q.rev).await?;
+    // Ровно та ревизия, что в снимке узла: иначе запись между чтением узла и текста
+    // дала бы текст rev N+1 при `node`/хэше rev N (и отравила бы кэш HTML).
+    let (rev, text) =
+        node_content(&sc.db, node.id, Some(q.rev.unwrap_or(node.current_rev))).await?;
     let (text, whole) = match q.section.as_deref() {
         Some(path) => (section_slice(&text, path)?.to_string(), false),
         None => (text, true),
@@ -167,10 +170,7 @@ async fn read(st: &AppState, sc: NodeScope, q: ReadQuery) -> Result<Response, Ap
         Format::Md => markdown_response(text, rev),
         Format::Json => Json(json!({ "node": node, "content": text, "rev": rev })).into_response(),
         Format::Html if whole => {
-            let hash = match (&node.content_hash, current) {
-                (Some(h), true) => h.clone(),
-                _ => sha256_hex(text.as_bytes()),
-            };
+            let hash = key_hash(node, rev, &text);
             let key = cache_key(&hash, sc.space.id, sc.user.id);
             let r = render_cached(st, key, &sc.db, sc.space.id, text).await?;
             html_json(&r, rev)
@@ -198,6 +198,15 @@ pub(crate) fn markdown_response(text: String, rev: i64) -> Response {
         HeaderValue::from_str(&format!("\"{rev}\"")).expect("число — допустимый заголовок"),
     );
     r
+}
+
+/// Хэш для ключа кэша — по ревизии, текст которой действительно прочитан:
+/// `content_hash` узла годится только для его `current_rev` (ревизии неизменяемы).
+fn key_hash(node: &zam_store::Node, rev_read: i64, text: &str) -> String {
+    match &node.content_hash {
+        Some(h) if rev_read == node.current_rev => h.clone(),
+        _ => sha256_hex(text.as_bytes()),
+    }
 }
 
 fn sha256_hex(b: &[u8]) -> String {
@@ -275,6 +284,35 @@ fn first_sentence(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_hash_follows_revision_read() {
+        let now = jiff::Timestamp::now();
+        let text = "текст rev 1
+";
+        let node = zam_store::Node {
+            id: zam_core::Id::new(),
+            space_id: zam_core::Id::new(),
+            parent_id: None,
+            kind: NodeKind::Note,
+            name: "n".into(),
+            path: "n".into(),
+            current_rev: 2,
+            content_hash: Some("hash-of-rev-2".into()),
+            frontmatter: None,
+            l0: None,
+            l0_source: None,
+            index_state: "pending".into(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            has_children: false,
+        };
+        assert_eq!(key_hash(&node, 2, "что угодно"), "hash-of-rev-2");
+        // прочитана другая ревизия — ключ по её собственному тексту
+        assert_eq!(key_hash(&node, 1, text), sha256_hex(text.as_bytes()));
+        assert_eq!(key_hash(&node, 3, text), sha256_hex(text.as_bytes()));
+    }
 
     #[test]
     fn sentence_cut() {

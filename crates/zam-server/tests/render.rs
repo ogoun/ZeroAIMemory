@@ -173,3 +173,16 @@ fn main() {}
     assert_eq!(new["rev"], 2);
     assert!(new["html"].as_str().unwrap().contains("Новый"));
 }
+
+#[tokio::test]
+async fn large_html_is_not_cached() {
+    let a = api("render-big", |_| {}).await;
+    // ~9000 абзацев → HTML заметно больше 256 КиБ при тексте ~27 КиБ
+    let md = "a\n\n".repeat(9000);
+    let n = a.note("knowledge", "big", &md).await;
+    let uri = format!("/api/v1/nodes/{}?format=html", n["id"].as_str().unwrap());
+    let r = a.t(Method::GET, &uri, None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.json()["html"].as_str().unwrap().len() > 256 * 1024);
+    assert_eq!(a.st.render_cache.lock().unwrap().len(), 0);
+}

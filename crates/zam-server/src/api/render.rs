@@ -46,6 +46,8 @@ use crate::error::ApiError;
 pub const RENDER_BODY_MAX: usize = 1024 * 1024;
 /// Записей в кэше рендера.
 pub const RENDER_CACHE_ENTRIES: usize = 512;
+/// HTML крупнее не кэшируется: 512 записей по несколько МБ — слишком много памяти.
+pub const RENDER_CACHE_MAX_HTML: usize = 256 * 1024;
 /// Не больше стольких разных целей вики-ссылок разрешается в одной заметке;
 /// остальные считаются битыми (защита от тысяч запросов к БД на один рендер).
 const WIKI_TARGETS_MAX: usize = 500;
@@ -88,8 +90,15 @@ pub async fn render_cached(
         return Ok(r);
     }
     let r = Arc::new(render(db, Some(space), text).await?);
-    cache_put(st, key, Arc::clone(&r));
+    if cacheable(&r) {
+        cache_put(st, key, Arc::clone(&r));
+    }
     Ok(r)
+}
+
+/// Кэшируется только HTML не больше [`RENDER_CACHE_MAX_HTML`].
+fn cacheable(r: &Rendered) -> bool {
+    r.html.len() <= RENDER_CACHE_MAX_HTML
 }
 
 /// Рендер текста: вики-ссылки разрешаются в пространстве `space` (`None` — не разрешаются).
@@ -250,6 +259,18 @@ pub async fn highlight(_: Principal) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_html_not_cacheable() {
+        let mk = |n: usize| Rendered {
+            html: "x".repeat(n),
+            toc: Vec::new(),
+            links: Vec::new(),
+            warnings: Vec::new(),
+        };
+        assert!(cacheable(&mk(RENDER_CACHE_MAX_HTML)));
+        assert!(!cacheable(&mk(RENDER_CACHE_MAX_HTML + 1)));
+    }
 
     #[test]
     fn percent_decode_cases() {

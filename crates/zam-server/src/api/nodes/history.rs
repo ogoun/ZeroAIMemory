@@ -9,10 +9,10 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
-use zam_store::{Node, RevisionInfo, list_revisions, node_content, revert_note, unified_diff};
+use zam_store::{Node, RevisionInfo, list_revisions, node_content, revert_note};
 
-use super::audit_node;
 use super::read::markdown_response;
+use super::{audit_node, diff_blocking};
 use crate::api::scope::{Mode, live, node_scope};
 use crate::api::{json_body, query};
 use crate::app::AppState;
@@ -89,8 +89,9 @@ pub async fn diff(
     } else {
         node_content(&sc.db, sc.node.id, Some(from)).await?.1
     };
-    let mut r =
-        unified_diff(&old, &new, &format!("rev {from}"), &format!("rev {to}")).into_response();
+    let mut r = diff_blocking(old, new, format!("rev {from}"), format!("rev {to}"))
+        .await?
+        .into_response();
     r.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),

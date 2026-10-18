@@ -46,3 +46,5 @@ memory-serve.workspace = true
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
+
+jiff.workspace = true

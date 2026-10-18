@@ -61,12 +61,17 @@ async fn write_error(db: &Db, id: Id, base_rev: i64, e: WriteError) -> ApiError 
                 Ok((_, t)) => t,
                 Err(_) => String::new(),
             };
-            let diff = unified_diff(
-                &base,
-                &current,
-                &format!("rev {base_rev}"),
-                &format!("rev {current_rev}"),
-            );
+            let diff = match diff_blocking(
+                base,
+                current,
+                format!("rev {base_rev}"),
+                format!("rev {current_rev}"),
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => return e,
+            };
             let mut extra = Map::new();
             extra.insert("current_rev".into(), json!(current_rev));
             extra.insert("diff".into(), json!(diff));
@@ -92,6 +97,18 @@ async fn write_error(db: &Db, id: Id, base_rev: i64, e: WriteError) -> ApiError 
         WriteError::Patch(p) => patch_error(p),
         e @ WriteError::TooLarge { .. } => ApiError::PayloadTooLarge(e.to_string()),
     }
+}
+
+/// Унифицированный дифф вне async-потока: тексты до 5 МБ (CPU).
+pub(crate) async fn diff_blocking(
+    old: String,
+    new: String,
+    old_label: String,
+    new_label: String,
+) -> Result<String, ApiError> {
+    tokio::task::spawn_blocking(move || unified_diff(&old, &new, &old_label, &new_label))
+        .await
+        .map_err(|e| ApiError::Internal(format!("дифф прерван: {e}")))
 }
 
 fn patch_error(e: PatchError) -> ApiError {

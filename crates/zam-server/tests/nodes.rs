@@ -728,3 +728,30 @@ async fn delete_trash_restore_move_revert_and_audit() {
         assert_ne!(row["actor"], "admin", "по токену актор — id токена");
     }
 }
+
+#[tokio::test]
+async fn admin_cookie_write_without_csrf_is_403() {
+    use axum::body::Body;
+    use axum::http::header;
+    let a = api("csrf", |_| {}).await;
+    let n = a.note("knowledge", "x", "x").await;
+    let body = json!({"space":"knowledge","path":"y","kind":"note","content":"z"});
+    for (m, uri, b) in [
+        (Method::POST, "/api/v1/nodes".to_string(), Some(body)),
+        (Method::DELETE, format!("/api/v1/nodes/{}", id(&n)), None),
+    ] {
+        let r = common::api::req(m.clone(), &uri, b.as_ref())
+            .header(header::COOKIE, &a.cookie)
+            .body(b.map_or_else(Body::empty, |v| Body::from(v.to_string())))
+            .unwrap();
+        let r = a.send(r).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{m} {uri}");
+    }
+    // ничего не изменилось
+    assert_eq!(
+        get(&a, &format!("/api/v1/nodes/{}", id(&n))).await.status,
+        StatusCode::OK
+    );
+    let t = get(&a, "/api/v1/spaces/knowledge/tree").await.json();
+    assert_eq!(t["items"].as_array().unwrap().len(), 1);
+}
