@@ -267,6 +267,31 @@ impl SystemStore {
             .await
     }
 
+    /// Переименовывает пользователя; нет такого — `NotFound`, занятое имя — `Conflict`.
+    pub async fn rename_user(&self, id: Id, name: &str) -> Result<(), StoreError> {
+        let name = name.to_string();
+        self.db
+            .write(move |tx| {
+                let n = tx
+                    .execute(
+                        "UPDATE users SET name = ?2 WHERE id = ?1",
+                        params![id, name],
+                    )
+                    .map_err(|e| {
+                        if is_unique_violation(&e) {
+                            StoreError::Conflict(format!("пользователь «{name}» уже существует"))
+                        } else {
+                            e.into()
+                        }
+                    })?;
+                if n == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// Первый (по времени создания) администратор.
     pub async fn admin_user(&self) -> Result<Option<User>, StoreError> {
         self.db
@@ -333,6 +358,19 @@ impl SystemStore {
             })
             .await?;
         Ok((info, plain))
+    }
+
+    pub async fn get_token(&self, id: Id) -> Result<Option<TokenInfo>, StoreError> {
+        self.db
+            .read(move |c| {
+                Ok(c.query_row(
+                    &format!("SELECT {TOKEN_COLS} FROM tokens WHERE id = ?1"),
+                    [id],
+                    token_row,
+                )
+                .optional()?)
+            })
+            .await
     }
 
     pub async fn list_tokens(&self, user: Id) -> Result<Vec<TokenInfo>, StoreError> {

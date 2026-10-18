@@ -7,7 +7,6 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
-use axum::routing::get;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -373,15 +372,8 @@ async fn bad_tokens_rate_limited_valid_token_still_passes() {
 
 #[tokio::test]
 async fn token_cannot_call_admin_routes() {
-    let (app, st, token) = app(cfg("adminonly")).await;
-    // Маршруты /admin появятся в Task 9; здесь — тот же извлекатель AdminOnly.
-    let admin_app = Router::new()
-        .route(
-            "/api/v1/admin/users",
-            get(|AdminOnly(_): AdminOnly| async { "ok" }),
-        )
-        .with_state(st);
-    let r = admin_app
+    let (app, _st, token) = app(cfg("adminonly")).await;
+    let r = app
         .clone()
         .oneshot(bearer("/api/v1/admin/users", &token))
         .await
@@ -399,10 +391,7 @@ async fn token_cannot_call_admin_routes() {
         .header(header::COOKIE, cookie)
         .body(Body::empty())
         .unwrap();
-    assert_eq!(
-        admin_app.oneshot(req).await.unwrap().status(),
-        StatusCode::OK
-    );
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
 
 #[tokio::test]

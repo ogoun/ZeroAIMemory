@@ -268,3 +268,28 @@ async fn broken_json_is_corrupt() {
     let err = s.get_setting::<serde_json::Value>("k").await.unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
 }
+
+#[tokio::test]
+async fn rename_user_and_get_token() {
+    let (_dd, s) = store("rename").await;
+    let a = s.create_user("ann", false).await.unwrap();
+    let b = s.create_user("bob", false).await.unwrap();
+    s.rename_user(a.id, "anna").await.unwrap();
+    assert_eq!(s.get_user(a.id).await.unwrap().unwrap().name, "anna");
+    assert!(matches!(
+        s.rename_user(a.id, "bob").await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        s.rename_user(Id::new(), "zed").await,
+        Err(StoreError::NotFound)
+    ));
+    let (info, _) = s.issue_token(b.id, "t", Access::Ro).await.unwrap();
+    let got = s.get_token(info.id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.id, got.user_id, got.access),
+        (info.id, b.id, Access::Ro)
+    );
+    assert_eq!(got.prefix, info.prefix);
+    assert!(s.get_token(Id::new()).await.unwrap().is_none());
+}
