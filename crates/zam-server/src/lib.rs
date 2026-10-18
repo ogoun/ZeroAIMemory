@@ -23,14 +23,16 @@ fn print_initial_token(token: &str) {
 
 /// Запускает сервер до Ctrl+C / SIGTERM.
 pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Result<()> {
-    std::fs::create_dir_all(cfg.data_dir.join("logs"))?;
-    let _guard = logging::init(&cfg.log, &cfg.data_dir.join("logs"))?;
     let bind = cfg.server.bind;
-    let (app, state, report) = build(cfg, env_password).await?;
+    let log_cfg = cfg.log.clone();
+    // Порядок: пароль, лок каталога, логи, базы; токен печатаем только после bind.
+    let prepared = app::prepare(cfg, env_password.as_deref())?;
+    let _guard = logging::init(&log_cfg, &prepared.data_dir.logs())?;
+    let (app, state, report) = app::finish(prepared).await?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
     if let Some(t) = &report.initial_token {
         print_initial_token(t);
     }
-    let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(addr = %listener.local_addr()?, version = state.version, "zam-server запущен");
     axum::serve(
         listener,

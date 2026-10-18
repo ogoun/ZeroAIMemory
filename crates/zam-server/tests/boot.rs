@@ -102,3 +102,79 @@ async fn second_instance_on_same_dir_is_refused() {
     assert!(e.contains("уже используется"), "{e}");
     drop(first);
 }
+
+#[tokio::test]
+async fn no_password_means_no_side_effects() {
+    let d = common::tmp("b7").join("nested");
+    let e = build(cfg_in(d.clone()), None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("ZAM_ADMIN_PASSWORD"), "{e}");
+    assert!(!d.exists());
+}
+
+#[tokio::test]
+async fn admin_without_tokens_gets_new_initial_token() {
+    let d = common::tmp("b8");
+    let (app, st, rep) = build(cfg_in(d.clone()), Some("pw".into())).await.unwrap();
+    let first = rep.initial_token.unwrap();
+    let admin = st.system.admin_user().await.unwrap().unwrap();
+    for t in st.system.list_tokens(admin.id).await.unwrap() {
+        st.system.revoke_token(t.id).await.unwrap();
+    }
+    drop((app, st));
+    let (_, st, rep) = build(cfg_in(d), Some("pw".into())).await.unwrap();
+    let second = rep.initial_token.expect("токен выпущен заново");
+    assert_ne!(first, second);
+    assert!(
+        st.system
+            .verify_token(&second, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn non_admin_with_login_name_refuses_start() {
+    let d = common::tmp("b9");
+    {
+        let dd = zam_store::DataDir::open(&d).unwrap();
+        let s = zam_store::SystemStore::open(&dd).unwrap();
+        s.create_user("admin", false).await.unwrap();
+    }
+    let e = build(cfg_in(d), Some("pw".into()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("не является администратором"), "{e}");
+}
+
+#[tokio::test]
+async fn bootstrap_audit_has_mask_and_debug_hides_secrets() {
+    let (app, st, rep) = build(cfg_in(common::tmp("b10")), Some("pw".into()))
+        .await
+        .unwrap();
+    let plain = rep.initial_token.clone().unwrap();
+    let rows = st.system.list_audit(10, None).await.unwrap();
+    let row = rows.iter().find(|r| r.action == "bootstrap").unwrap();
+    let det = row.details.to_string();
+    assert!(!det.contains(&plain[12..]), "{det}");
+    assert!(det.contains(&zam_core::mask_token(&plain)), "{det}");
+    let dbg = format!("{st:?} {rep:?} {app:?}");
+    assert!(!dbg.contains(&plain[12..]));
+    assert!(!dbg.contains("argon2"));
+}
+
+#[tokio::test]
+async fn unavailable_is_503_problem_json() {
+    use axum::response::IntoResponse;
+    let r = zam_server::error::ApiError::Unavailable("system.db недоступна".into()).into_response();
+    assert_eq!(r.status(), 503);
+    assert_eq!(
+        r.headers()[header::CONTENT_TYPE],
+        "application/problem+json"
+    );
+    assert_eq!(json(r).await["status"], 503);
+}

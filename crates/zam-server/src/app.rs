@@ -57,8 +57,34 @@ pub async fn build(
     cfg: ServerConfig,
     env_password: Option<String>,
 ) -> anyhow::Result<(Router, AppState, BootReport)> {
-    let AdminSecret::Hash(admin_hash) = cfg.admin_secret(env_password.as_deref())?;
+    finish(prepare(cfg, env_password.as_deref())?).await
+}
+
+/// Фаза 1 запуска: пароль администратора и лок каталога данных.
+pub(crate) struct Prepared {
+    cfg: ServerConfig,
+    admin_hash: String,
+    pub(crate) data_dir: Arc<DataDir>,
+}
+
+/// Без побочных эффектов до проверки пароля; каталог создаётся только после неё.
+pub(crate) fn prepare(cfg: ServerConfig, env_password: Option<&str>) -> anyhow::Result<Prepared> {
+    let AdminSecret::Hash(admin_hash) = cfg.admin_secret(env_password)?;
     let data_dir = Arc::new(DataDir::open(&cfg.data_dir)?);
+    Ok(Prepared {
+        cfg,
+        admin_hash,
+        data_dir,
+    })
+}
+
+/// Фаза 2: система, администратор, роутер.
+pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, BootReport)> {
+    let Prepared {
+        cfg,
+        admin_hash,
+        data_dir,
+    } = p;
     let system = SystemStore::open(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
     let state = AppState {

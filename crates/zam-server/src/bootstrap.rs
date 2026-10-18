@@ -4,22 +4,38 @@ use zam_core::mask_token;
 use zam_store::{Access, StoreError, SystemStore};
 
 /// Если администратора нет, создаёт `login` (is_admin) и токен `initial` (rw).
-/// Возвращает открытый текст токена только при создании; в аудит пишется маска.
+/// Если администратор есть, но у него нет действующих токенов (сбой между
+/// созданием и выпуском), выпускает новый `initial`.
+/// Возвращает открытый текст токена только при выпуске; в аудит пишется маска.
 pub async fn ensure_admin_user(
     system: &SystemStore,
     login: &str,
 ) -> Result<Option<String>, StoreError> {
-    if system.admin_user().await?.is_some() {
-        return Ok(None);
-    }
-    let user = system.create_user(login, true).await?;
+    let (user, action) = match system.admin_user().await? {
+        Some(u) => {
+            let tokens = system.list_tokens(u.id).await?;
+            if tokens.iter().any(|t| t.revoked_at.is_none()) {
+                return Ok(None);
+            }
+            (u, "bootstrap_recover")
+        }
+        None => {
+            if system.list_users().await?.iter().any(|u| u.name == login) {
+                return Err(StoreError::Conflict(format!(
+                    "пользователь '{login}' уже существует и не является администратором; \
+                     задайте другой [admin].login"
+                )));
+            }
+            (system.create_user(login, true).await?, "bootstrap")
+        }
+    };
     let (_, plain) = system.issue_token(user.id, "initial", Access::Rw).await?;
     system
         .audit(
             "system",
             Some(user.id),
-            "bootstrap",
-            Some(login),
+            action,
+            Some(&user.name),
             None,
             json!({ "token": mask_token(&plain) }),
         )

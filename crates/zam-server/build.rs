@@ -1,9 +1,28 @@
 //! Git-хэш сборки: `ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short HEAD`, иначе "unknown".
+use std::path::Path;
 use std::process::Command;
+
+/// rerun-if-changed только для существующих путей (иначе пересборка при каждом запуске).
+fn watch(p: &Path) {
+    if p.exists() {
+        println!("cargo:rerun-if-changed={}", p.display());
+    }
+}
 
 fn main() {
     println!("cargo:rerun-if-env-changed=ZAM_GIT_SHA");
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    let git = Path::new("../../.git");
+    // В worktree `.git` — файл: отслеживать нечего, остаётся ZAM_GIT_SHA.
+    if git.is_dir() {
+        let head = git.join("HEAD");
+        watch(&head);
+        if let Ok(text) = std::fs::read_to_string(&head)
+            && let Some(r) = text.trim().strip_prefix("ref: ")
+        {
+            watch(&git.join(r));
+        }
+        watch(&git.join("packed-refs"));
+    }
     let sha = std::env::var("ZAM_GIT_SHA")
         .ok()
         .filter(|s| !s.trim().is_empty())

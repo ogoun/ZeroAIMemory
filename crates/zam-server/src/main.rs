@@ -47,7 +47,9 @@ fn load(o: Opts) -> anyhow::Result<ServerConfig> {
 
 fn read_password() -> anyhow::Result<String> {
     if std::io::stdin().is_terminal() {
-        return Ok(rpassword::prompt_password("Пароль: ")?);
+        // Приглашение в stderr: в stdout только хэш.
+        eprint!("Пароль: ");
+        return Ok(rpassword::read_password()?);
     }
     let mut s = String::new();
     std::io::stdin().read_to_string(&mut s)?;
