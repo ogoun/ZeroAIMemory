@@ -1,0 +1,70 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --text: #1c2026;
+  --muted: #667085;
+  --border: #d9dde3;
+  --accent: #2f6fed;
+  --accent-text: #ffffff;
+  --danger: #c43d3d;
+  --warn-bg: #fff4d6;
+  --warn-text: #6b4a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --panel: #1d2128;
+    --text: #e6e9ee;
+    --muted: #98a2b3;
+    --border: #323843;
+    --accent: #6c9bff;
+    --accent-text: #0d1117;
+    --danger: #ff7b7b;
+    --warn-bg: #3a2f10;
+    --warn-text: #ffd978;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1, h2 { margin: 0 0 12px; font-weight: 600; }
+h1 { font-size: 20px; }
+h2 { font-size: 16px; }
+input, select, button { font: inherit; }
+input, select {
+  padding: 6px 10px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+button {
+  padding: 6px 14px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+button.primary { color: var(--accent-text); background: var(--accent); border-color: var(--accent); }
+button.danger { color: var(--danger); }
+button:disabled { opacity: 0.5; cursor: default; }
+.panel { padding: 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+.error { color: var(--danger); margin: 8px 0 0; }
+.muted { color: var(--muted); }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.overlay { position: fixed; inset: 0; background: rgb(0 0 0 / 0.5); }
+.dialog {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: min(520px, 92vw);
+}
+.warn { background: var(--warn-bg); color: var(--warn-text); padding: 8px 10px; border-radius: 6px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+code { font-family: ui-monospace, Consolas, monospace; }
+.token-field { width: 100%; font-family: ui-monospace, Consolas, monospace; }

@@ -1,0 +1,22 @@
+[package]
+name = "zam-store"
+description = "Хранилище ZeroAIMemory: SQLite (писатель, читатели, миграции)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+fs4.workspace = true
+zam-core = { path = "../zam-core", features = ["sqlite"] }
+tokio.workspace = true
+jiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,11 @@
+Microsoft Visual C++ Runtime (vcruntime140.dll)
+
+Файл vcruntime140.dll входит в состав комплекта для Windows как app-local
+(рядом с qdrant.exe) копия распространяемого компонента Microsoft Visual C++
+Redistributable. Он распространяется на условиях, указанных в Microsoft Visual
+Studio License Terms, раздел "Distributable Code" (файлы из списка
+REDIST.TXT установленной Visual Studio):
+  https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution
+  https://visualstudio.microsoft.com/license-terms/
+
+Файл не изменялся. Права на него принадлежат Microsoft Corporation.

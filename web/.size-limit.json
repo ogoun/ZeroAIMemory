@@ -1,0 +1,1 @@
+[{ "path": "dist/assets/*.js", "gzip": true, "limit": "300 KB" }]

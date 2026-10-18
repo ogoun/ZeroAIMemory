@@ -1,0 +1,21 @@
+[package]
+name = "zam-core"
+description = "Ядро ZeroAIMemory: общие типы и логика"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+uuid.workspace = true
+rand.workspace = true
+sha2.workspace = true
+serde.workspace = true
+rusqlite = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+

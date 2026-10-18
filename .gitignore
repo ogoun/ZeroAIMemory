@@ -1,0 +1,22 @@
+# Временные файлы, снимки, логи прогонов
+.tmp/
+
+# Локальный тулчейн Rust (RUSTUP_HOME/CARGO_HOME внутри проекта)
+.toolchain/
+
+# Rust
+target/
+
+# Web
+web/node_modules/
+web/dist/
+
+# Локальные данные ZeroAIMemory-клиента
+.zeroaimemory/cache/
+.zeroaimemory/logs/
+
+# Данные сервера при локальном запуске
+data/
+
+# Рабочие файлы процесса разработки (SDD)
+.superpowers/

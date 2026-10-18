@@ -1,0 +1,14 @@
+# Qdrant: закреплённая версия и SHA-256 архивов. Формат и правила обновления: см. xtask (cargo xtask fetch-deps).
+# vcruntime140.dll для Windows здесь не загружается: при упаковке копируется из установленного VC Redist.
+name = "qdrant"
+version = "1.19.2"
+
+[platform.windows-x64]
+url = "https://github.com/qdrant/qdrant/releases/download/v1.19.2/qdrant-x86_64-pc-windows-msvc.zip"
+sha256 = "7d86596f16c6e85d45a50312f5e16ccb51e059b62e3d7308110cb65b4c799a4d"
+extract = ["qdrant.exe"]
+
+[platform.linux-x64]
+url = "https://github.com/qdrant/qdrant/releases/download/v1.19.2/qdrant-x86_64-unknown-linux-musl.tar.gz"
+sha256 = "50b253243309ed0ae50a19f678f0d0adcc4f0b567b3bd2c5c0c7e02fa8404bb6"
+extract = ["qdrant"]
