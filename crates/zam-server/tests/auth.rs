@@ -131,6 +131,31 @@ async fn no_credentials_401() {
 }
 
 #[tokio::test]
+async fn me_csrf_is_accepted_on_post() {
+    let (app, ..) = app(cfg("mecsrf")).await;
+    let (cookie, _) = login_ok(&app).await;
+    let me = Request::get("/api/v1/auth/me")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let csrf = body_json(app.clone().oneshot(me).await.unwrap()).await["csrf"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = |tok: &str| {
+        Request::post("/api/v1/auth/logout")
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", tok)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let r = app.clone().oneshot(out("wrong")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = app.oneshot(out(&csrf)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn login_sets_strict_httponly_cookie() {
     let (app, st, _) = app(cfg("cookie")).await;
     let r = app.clone().oneshot(login_req("admin", PW)).await.unwrap();
@@ -155,6 +180,7 @@ async fn login_sets_strict_httponly_cookie() {
     let j = body_json(r).await;
     assert_eq!(j["login"], "admin");
     assert_eq!(j["user_id"], admin.id.to_string());
+    assert_eq!(j["csrf"], csrf);
     let sp = Request::get("/api/v1/spaces")
         .header(header::COOKIE, format!("other=1; {}", cookie_pair(&sc)))
         .body(Body::empty())

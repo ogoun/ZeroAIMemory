@@ -153,9 +153,21 @@ pub async fn logout(
     Ok(resp)
 }
 
-/// `GET /auth/me` → `{login, user_id}`.
-pub async fn me(State(st): State<AppState>, _: AdminOnly) -> Json<serde_json::Value> {
-    Json(json!({ "login": st.cfg.admin.login, "user_id": st.admin_id }))
+/// `GET /auth/me` → `{login, user_id, csrf}`: по живой cookie-сессии (восстановление после F5).
+pub async fn me(
+    State(st): State<AppState>,
+    AdminOnly(sid): AdminOnly,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws = st
+        .system
+        .get_web_session(&sid)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(Json(json!({
+        "login": st.cfg.admin.login,
+        "user_id": st.admin_id,
+        "csrf": ws.csrf_token,
+    })))
 }
 
 #[cfg(test)]

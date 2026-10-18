@@ -79,7 +79,19 @@ export async function logout(): Promise<void> {
   }
 }
 
-export const me = () => call<{ login: string; user_id: string }>('GET', 'auth/me');
+export const me = () => call<{ login: string; user_id: string; csrf: string }>('GET', 'auth/me');
+
+/** Восстанавливает вход по живой cookie-сессии (после F5); false — нужен экран входа. */
+export async function restore(): Promise<string | null> {
+  try {
+    const r = await me();
+    csrf = r.csrf;
+    return r.login;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) return null;
+    throw e;
+  }
+}
 export const listUsers = () => call<User[]>('GET', 'admin/users');
 export const listTokens = (userId: string) =>
   call<TokenInfo[]>('GET', `admin/users/${userId}/tokens`);

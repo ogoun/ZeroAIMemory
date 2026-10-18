@@ -37,11 +37,24 @@ fn copy_assets(dir: &Path, dst: &Path, root: bool) {
 /// Готовит ассеты WebUI в `OUT_DIR`: исходное дерево не трогается. Нет `web/dist` — заглушка.
 fn prepare_web() {
     let dist = Path::new("../../web/dist");
-    println!("cargo:rerun-if-changed=../../web/dist");
+    // Нет web/dist: путь в rerun-if-changed заставлял бы перезапускать скрипт на каждой сборке.
+    // После первого `npm run build` выполните `cargo build` с ZAM_WEB_REBUILD=1 (или touch build.rs).
+    println!("cargo:rerun-if-env-changed=ZAM_WEB_REBUILD");
+    if dist.exists() {
+        watch(dist);
+    } else {
+        println!("cargo:rerun-if-changed=build.rs");
+    }
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let assets = out.join("web-assets");
-    let _ = std::fs::remove_dir_all(&assets);
-    let index = if dist.join("index.html").is_file() {
+    // Каталог ассетов отслеживается memory-serve: пересоздавать его без нужды нельзя (иначе
+    // build-скрипт перезапускался бы на каждой сборке).
+    let has_dist = dist.join("index.html").is_file();
+    let stale = std::fs::read_dir(&assets).is_ok_and(|mut d| d.next().is_some());
+    if has_dist || stale {
+        let _ = std::fs::remove_dir_all(&assets);
+    }
+    let index = if has_dist {
         copy_assets(dist, &assets, true);
         std::fs::read_to_string(dist.join("index.html")).expect("прочитать web/dist/index.html")
     } else {
@@ -49,7 +62,9 @@ fn prepare_web() {
         STUB_INDEX.to_string()
     };
     let index_path = out.join("web-index.html");
-    std::fs::write(&index_path, index).expect("записать index.html");
+    if std::fs::read_to_string(&index_path).ok().as_deref() != Some(index.as_str()) {
+        std::fs::write(&index_path, index).expect("записать index.html");
+    }
     println!("cargo:rustc-env=ZAM_WEB_INDEX={}", index_path.display());
     // Без вывода предупреждений memory-serve; ассеты всегда встраиваются в бинарь.
     // SAFETY: build-скрипт однопоточен.

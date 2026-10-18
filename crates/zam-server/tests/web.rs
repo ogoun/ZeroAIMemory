@@ -77,3 +77,17 @@ async fn outside_base_path_is_not_found() {
     assert_eq!(st, StatusCode::NOT_FOUND);
     assert_eq!(ctype(&h), "application/problem+json");
 }
+
+#[tokio::test]
+async fn missing_file_paths_are_not_found() {
+    let app = app("web-files", "/memory").await;
+    for uri in [
+        "/memory/assets/nope.js",
+        "/memory/favicon.ico",
+        "/memory/a.b/c.css",
+    ] {
+        let (st, h, _) = get(&app, uri).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(ctype(&h), "application/problem+json", "{uri}");
+    }
+}

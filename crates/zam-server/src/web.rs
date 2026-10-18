@@ -79,7 +79,9 @@ pub async fn fallback(index: Index, method: Method, uri: Uri) -> Response {
     let reserved = ["/api", "/mcp"]
         .iter()
         .any(|r| p == *r || p.strip_prefix(r).is_some_and(|t| t.starts_with('/')));
-    if reserved || !matches!(method, Method::GET | Method::HEAD) {
+    // Путь к файлу (точка в последнем сегменте) — не SPA-маршрут: нет ассета, значит 404.
+    let file_like = p.rsplit('/').next().is_some_and(|l| l.contains('.'));
+    if reserved || file_like || !matches!(method, Method::GET | Method::HEAD) {
         return not_found().await.into_response();
     }
     html(&index)
