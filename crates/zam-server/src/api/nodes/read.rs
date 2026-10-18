@@ -159,7 +159,10 @@ async fn read(
         && q.section.is_none()
         && current
         && let Some(hash) = &node.content_hash
-        && let Some(r) = cache_get(st, &cache_key(hash, sc.space.id, sc.user.id, ctx.viewer))
+        && let Some(r) = cache_get(
+            st,
+            &cache_key(st, hash, sc.space.id, sc.user.id, ctx.viewer),
+        )
     {
         return Ok(html_json(&r, node.current_rev));
     }
@@ -180,7 +183,7 @@ async fn read(
         Format::Json => Json(json!({ "node": node, "content": text, "rev": rev })).into_response(),
         Format::Html if whole => {
             let hash = key_hash(node, rev, &text);
-            let key = cache_key(&hash, sc.space.id, sc.user.id, ctx.viewer);
+            let key = cache_key(st, &hash, sc.space.id, sc.user.id, ctx.viewer);
             let r = render_cached(st, key, &sc.db, ctx, text).await?;
             html_json(&r, rev)
         }

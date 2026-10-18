@@ -85,6 +85,7 @@ pub async fn create(
             create_note(&sc.db, n).await?
         }
     };
+    st.render_gen.bump_space(sc.user.id, sc.space.id);
     Ok((StatusCode::CREATED, Json(node)))
 }
 
@@ -171,7 +172,9 @@ pub async fn move_to(
     live(&sc)?;
     let req: Move = json_body(body)?;
     let path = NodePath::parse(&req.path)?;
-    Ok(Json(move_node(&sc.db, sc.node.id, path).await?))
+    let node = move_node(&sc.db, sc.node.id, path).await?;
+    st.render_gen.bump_space(sc.user.id, sc.space.id);
+    Ok(Json(node))
 }
 
 /// `DELETE /nodes/{id}` — мягкое удаление поддерева → 204; аудит `node.delete`.
@@ -184,6 +187,7 @@ pub async fn remove(
 ) -> Result<StatusCode, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     let count = delete_node(&sc.db, sc.node.id).await?;
+    st.render_gen.bump_space(sc.user.id, sc.space.id);
     let details = json!({ "space": sc.space.id, "path": sc.node.path, "nodes": count });
     audit_node(
         &st,
@@ -208,6 +212,7 @@ pub async fn restore(
 ) -> Result<Json<Node>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     let node = restore_node(&sc.db, sc.node.id).await?;
+    st.render_gen.bump_space(sc.user.id, sc.space.id);
     let details = json!({ "space": sc.space.id, "path": node.path });
     audit_node(
         &st,

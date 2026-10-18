@@ -16,12 +16,13 @@
 //! добавляется `?user=<id>` (браузер не передаёт `X-Zam-User` в `<img src>`).
 //!
 //! **Кэш.** LRU на 512 записей; ключ — `(content_hash, RENDER_VERSION, space_id,
-//! user_id, viewer)`: href вики-ссылок зависят от узлов пространства и от пользователя
-//! (`X-Zam-User`), URL вложений — ещё и от вида зрителя ([`Viewer`]: токен не видит
-//! вложений Human, администратору от имени другого нужен `?user=`).
-//! Ничего больше не инвалидируется: если после рендера появилась или исчезла цель
-//! вики-ссылки, кэшированный HTML покажет её прежнее состояние до изменения самой
-//! заметки (или вытеснения записи) — это допустимо.
+//! user_id, viewer, поколение)`: href вики-ссылок зависят от узлов пространства и от
+//! пользователя (`X-Zam-User`), URL вложений — ещё и от вида зрителя ([`Viewer`]:
+//! токен не видит вложений Human, администратору от имени другого нужен `?user=`).
+//! Поколение ([`RenderGenerations`]) растёт при создании, переносе, удалении и
+//! восстановлении узлов пространства и при загрузке вложения, поэтому появление или
+//! исчезновение цели ссылки сразу видно в HTML. Поколение читается до разрешения
+//! ссылок: рендер, начатый до изменения, попадает в кэш под старым ключом.
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -90,10 +91,47 @@ pub struct RenderCtx {
     pub viewer: Viewer,
 }
 
-/// `(content_hash, RENDER_VERSION, space_id, user_id, viewer)`.
-pub type RenderKey = (String, u32, Id, Id, Viewer);
+/// `(content_hash, RENDER_VERSION, space_id, user_id, viewer, поколение)`.
+pub type RenderKey = (String, u32, Id, Id, Viewer, u64);
 /// Кэш HTML заметок.
 pub type RenderCache = Arc<Mutex<LruCache<RenderKey, Arc<Rendered>>>>;
+
+/// Поколения разрешения ссылок для ключа кэша рендера.
+///
+/// Вики-ссылки разрешаются в пространстве заметки, поэтому создание, перенос,
+/// удаление и восстановление узлов увеличивают счётчик `(user, space)`. Вложения
+/// разрешаются во всех пространствах пользователя — загрузка увеличивает его общий
+/// счётчик. Поколение пространства — сумма двух счётчиков: она растёт при любом
+/// изменении, и старые записи кэша больше не находятся (их вытеснит LRU).
+#[derive(Debug, Default)]
+pub struct RenderGenerations {
+    /// `(user, Some(space))` — узлы пространства; `(user, None)` — вложения пользователя.
+    counters: Mutex<HashMap<(Id, Option<Id>), u64>>,
+}
+
+impl RenderGenerations {
+    fn bump(&self, key: (Id, Option<Id>)) {
+        let mut m = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        *m.entry(key).or_default() += 1;
+    }
+
+    /// Изменился состав узлов пространства `space` пользователя `user`.
+    pub fn bump_space(&self, user: Id, space: Id) {
+        self.bump((user, Some(space)));
+    }
+
+    /// У пользователя `user` появилось вложение.
+    pub fn bump_user(&self, user: Id) {
+        self.bump((user, None));
+    }
+
+    /// Текущее поколение пространства; читать до разрешения ссылок.
+    pub fn get(&self, user: Id, space: Id) -> u64 {
+        let m = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let n = |k| m.get(&k).copied().unwrap_or(0);
+        n((user, Some(space))) + n((user, None))
+    }
+}
 
 pub fn new_cache() -> RenderCache {
     let n = NonZeroUsize::new(RENDER_CACHE_ENTRIES).expect("ненулевой размер");
@@ -101,14 +139,21 @@ pub fn new_cache() -> RenderCache {
 }
 
 /// Ключ кэша для текста с хэшем `content_hash` в пространстве `space` пользователя
-/// `user` для зрителя `viewer`.
-pub fn cache_key(content_hash: &str, space: Id, user: Id, viewer: Viewer) -> RenderKey {
+/// `user` для зрителя `viewer` при текущем поколении ссылок пространства.
+pub fn cache_key(
+    st: &AppState,
+    content_hash: &str,
+    space: Id,
+    user: Id,
+    viewer: Viewer,
+) -> RenderKey {
     (
         content_hash.to_string(),
         RENDER_VERSION,
         space,
         user,
         viewer,
+        st.render_gen.get(user, space),
     )
 }
 
@@ -376,6 +421,20 @@ mod tests {
         };
         assert!(cacheable(&mk(RENDER_CACHE_MAX_HTML)));
         assert!(!cacheable(&mk(RENDER_CACHE_MAX_HTML + 1)));
+    }
+
+    #[test]
+    fn generations_per_space_and_user() {
+        let g = RenderGenerations::default();
+        let (u, s1, s2) = (Id::new(), Id::new(), Id::new());
+        assert_eq!((g.get(u, s1), g.get(u, s2)), (0, 0));
+        g.bump_space(u, s1);
+        assert_eq!((g.get(u, s1), g.get(u, s2)), (1, 0));
+        // вложение — во всех пространствах пользователя
+        g.bump_user(u);
+        assert_eq!((g.get(u, s1), g.get(u, s2)), (2, 1));
+        // другой пользователь не затронут
+        assert_eq!(g.get(Id::new(), s1), 0);
     }
 
     #[test]

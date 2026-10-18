@@ -89,7 +89,8 @@ async fn bearer_token_lists_spaces() {
         .iter()
         .map(|s| s["kind"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["rules", "human", "knowledge"]);
+    // Human токену не виден ни в каком виде (как и 404 на его узлы)
+    assert_eq!(kinds, ["rules", "knowledge"]);
     let admin = st.system.admin_user().await.unwrap().unwrap();
     assert_eq!(j["user"]["id"], admin.id.to_string());
     assert_eq!(j["user"]["name"], "admin");

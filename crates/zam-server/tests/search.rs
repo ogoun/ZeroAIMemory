@@ -74,7 +74,8 @@ async fn finds_note_and_reports_degraded() {
     let j = r.json();
     assert_eq!(j["degraded"], true);
     assert_eq!(j["degraded_reason"], "vector index not available (M1)");
-    assert_eq!(j["pending_count"], 0);
+    // Knowledge и Rules (решение не задано): по одной заметке, обе ждут векторов
+    assert_eq!(j["pending_count"], 2, "{j}");
     assert!(j["timings"]["fts_ms"].is_number(), "{j}");
     let items = j["items"].as_array().unwrap();
     let it = &items[0];
@@ -294,4 +295,26 @@ async fn fts_syntax_is_plain_words() {
     // слишком длинный запрос → 400
     let r = search(&a, json!({ "query": "а".repeat(513) })).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn pending_count_counts_searched_spaces_only() {
+    let a = api("search-pending", |_| {}).await;
+    corpus(&a).await;
+    a.note("knowledge", "Без векторов", "---\nindex: false\n---\n# Б\n")
+        .await;
+    // явные пространства: решение — одна заметка
+    let r = search(&a, json!({"query": "скрипты", "scope": {"spaces": [GUID]}})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["pending_count"], 1);
+    // Knowledge + Rules + решение; index: false и Human не считаются
+    let r = search(&a, json!({"query": "скрипты", "scope": {"solution": GUID}})).await;
+    assert_eq!(r.json()["pending_count"], 3, "{}", r.text());
+    // префикс пути
+    let r = search(
+        &a,
+        json!({"query": "скрипты", "scope": {"path_prefix": "Инструменты"}}),
+    )
+    .await;
+    assert_eq!(r.json()["pending_count"], 1, "{}", r.text());
 }

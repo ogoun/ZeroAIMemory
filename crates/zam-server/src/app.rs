@@ -34,6 +34,8 @@ pub struct AppState {
     pub version: &'static str,
     /// Кэш HTML заметок (см. [`api::render::RenderCache`]).
     pub render_cache: api::render::RenderCache,
+    /// Поколения ссылок для ключа кэша рендера.
+    pub render_gen: Arc<api::render::RenderGenerations>,
 }
 
 // Вручную: хэш пароля и пути не должны попадать в отладочный вывод.
@@ -115,6 +117,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         started_at: Instant::now(),
         version: env!("CARGO_PKG_VERSION"),
         render_cache: api::render::new_cache(),
+        render_gen: Arc::default(),
         cfg: Arc::new(cfg),
     };
     let router = router(state.clone());

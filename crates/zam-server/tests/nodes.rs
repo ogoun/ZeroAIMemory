@@ -755,3 +755,161 @@ async fn admin_cookie_write_without_csrf_is_403() {
     let t = get(&a, "/api/v1/spaces/knowledge/tree").await.json();
     assert_eq!(t["items"].as_array().unwrap().len(), 1);
 }
+
+// ---------- Матрица доступа HTTP ----------
+
+/// Запрос матрицы: метод, URI, тело, дополнительные заголовки.
+type Case = (
+    Method,
+    String,
+    Option<Value>,
+    &'static [(&'static str, &'static str)],
+);
+
+/// Загрузка вложения токеном: минимальный multipart `node` + `file`.
+async fn upload_by(a: &Api, token: &str, node: &str) -> common::api::Resp {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    let b = "zam-matrix-boundary";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"node\"\r\n\r\n{node}\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\nx\r\n--{b}--\r\n"
+    );
+    let r = Request::post("/api/v1/blobs")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={b}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    a.send(r).await
+}
+
+#[tokio::test]
+async fn access_matrix_ro_rules_human() {
+    let a = api("matrix", |_| {}).await;
+    let ro = a.issue(&a.admin_id(), "ro").await;
+
+    // ro: restore удалённого узла и загрузка вложения — 403
+    let gone = a.note("knowledge", "удалённая", "# У\n").await;
+    let gid = id(&gone);
+    let r = a
+        .t(Method::DELETE, &format!("/api/v1/nodes/{gid}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = a
+        .tok(
+            &ro,
+            Method::POST,
+            &format!("/api/v1/nodes/{gid}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let n = a.note("knowledge", "живая", "# Ж\n").await;
+    assert_eq!(
+        upload_by(&a, &ro, &id(&n)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        upload_by(&a, &a.token, &id(&n)).await.status,
+        StatusCode::CREATED
+    );
+
+    // Rules: rw-токен пишет только при rules.agent_write = true, ro — никогда
+    let body = json!({"space":"rules","path":"правило","kind":"note","content":"# П\n"});
+    let r = a.t(Method::POST, "/api/v1/nodes", Some(body.clone())).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    a.st.system
+        .set_setting("rules.agent_write", &true)
+        .await
+        .unwrap();
+    let r = a
+        .tok(&ro, Method::POST, "/api/v1/nodes", Some(body.clone()))
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = a.t(Method::POST, "/api/v1/nodes", Some(body)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+
+    // Human: любые операции с узлом по токену — 404, текст не утекает
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/nodes",
+            Some(json!({"space":"human","path":"тайна","kind":"note","content":"секрет\n"})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let hid = id(&r.json());
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/nodes/{hid}"),
+            Some(json!({"base_rev":1,"ops":[{"op":"append","content":"ещё"}]})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let cases: Vec<Case> = vec![
+        (
+            Method::GET,
+            format!("/api/v1/nodes/{hid}/diff?from=1&to=2"),
+            None,
+            &[],
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/nodes/{hid}/revisions/1"),
+            None,
+            &[],
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/nodes/{hid}/restore"),
+            None,
+            &[],
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/nodes/{hid}/move"),
+            Some(json!({"path":"наружу"})),
+            &[],
+        ),
+        (
+            Method::PUT,
+            format!("/api/v1/nodes/{hid}"),
+            Some(json!({"content":"подмена"})),
+            &[("if-match", "2")],
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/nodes/{hid}"),
+            Some(json!({"base_rev":2,"ops":[{"op":"append","content":"x"}]})),
+            &[],
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/nodes/{hid}/revert"),
+            Some(json!({"rev":1})),
+            &[],
+        ),
+    ];
+    for token in [&a.token, &ro] {
+        for (m, uri, body, extra) in &cases {
+            let r = a.tok_h(token, m.clone(), uri, body.clone(), extra).await;
+            assert_eq!(r.status, StatusCode::NOT_FOUND, "{m} {uri}: {}", r.text());
+            assert!(!r.text().contains("секрет"), "{m} {uri}");
+        }
+    }
+    assert_eq!(
+        upload_by(&a, &a.token, &hid).await.status,
+        StatusCode::NOT_FOUND
+    );
+    // узел не изменился
+    let r = a
+        .adm(Method::GET, &format!("/api/v1/nodes/{hid}"), None, None)
+        .await;
+    assert_eq!(r.json()["rev"], 2);
+}

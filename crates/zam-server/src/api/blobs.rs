@@ -173,6 +173,7 @@ pub async fn upload(
         .await
         .map_err(|e| put_err(e, limit))?;
     let link = attach(&sc.db, sc.node.id, &sha, size, &filename, &mime).await?;
+    st.render_gen.bump_user(sc.user.id);
     tracing::info!(node = %sc.node.id, sha256 = %sha, size, "вложение загружено");
     Ok((
         StatusCode::CREATED,

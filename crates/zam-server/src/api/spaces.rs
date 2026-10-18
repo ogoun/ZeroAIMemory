@@ -1,4 +1,4 @@
-//! `GET /spaces` — пространства пользователя запроса (§6.3);
+//! `GET /spaces` — пространства пользователя запроса (§6.3; токену — без Human);
 //! `GET /spaces/{space}/tree` — дерево узлов пространства.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
@@ -23,7 +23,12 @@ pub async fn list(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let user = target_user(&st, &p, &headers).await?;
-    let spaces = list_spaces(&st.users.get(user.id).await?).await?;
+    // Human токену не виден ни в каком виде (его узлы по токену — 404)
+    let spaces: Vec<_> = list_spaces(&st.users.get(user.id).await?)
+        .await?
+        .into_iter()
+        .filter(|s| token_can_read(&p, s))
+        .collect();
     let access = match &p {
         Principal::Token(t) => t.access.as_str(),
         Principal::Admin { .. } => "admin",

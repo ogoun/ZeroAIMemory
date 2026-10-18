@@ -154,7 +154,8 @@ async fn new_user_token_sees_own_spaces() {
     assert_eq!(r.status(), StatusCode::OK);
     let s = json_of(r).await;
     assert_eq!(s["user"]["name"], "olga");
-    assert_eq!(s["spaces"].as_array().unwrap().len(), 3);
+    // по токену — без Human
+    assert_eq!(s["spaces"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]

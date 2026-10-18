@@ -1,5 +1,6 @@
 //! `POST /search` (§9.1–9.2) — в M1 только полнотекстовый канал (FTS5), векторного
-//! индекса нет: ответ всегда `degraded: true`.
+//! индекса нет: ответ всегда `degraded: true`, а `pending_count` — число живых заметок
+//! области, ждущих векторной индексации (`index_state = 'pending'`; без `index: false`).
 //!
 //! **Тело** (остальные поля §9.1 принимаются и пока игнорируются):
 //! - `query` — до 512 символов, синтаксис FTS5 в нём не действует;
@@ -41,7 +42,7 @@ use zam_core::Id;
 use zam_store::time::fmt_ts;
 use zam_store::{
     Db, FtsHit, FtsQuery, MARK_END, MARK_START, Space, SpaceKind, get_node, get_solution,
-    list_spaces, search_fts,
+    list_spaces, pending_count, search_fts,
 };
 
 use super::json_body;
@@ -347,6 +348,13 @@ pub async fn search(
         .await?
     };
     let fts_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // заметки области, ещё не прошедшие векторную индексацию (в M1 — все, кроме `index: false`)
+    let pending = pending_count(
+        &db,
+        spaces.iter().map(|s| s.id).collect(),
+        req.scope.path_prefix.clone(),
+    )
+    .await?;
 
     let mut items = match mode {
         SearchMode::Notes => group_by_node(hits, top_k),
@@ -374,7 +382,7 @@ pub async fn search(
                 "items": items,
                 "degraded": true,
                 "degraded_reason": DEGRADED_REASON,
-                "pending_count": 0,
+                "pending_count": pending,
                 "timings": { "fts_ms": (fts_ms * 100.0).round() / 100.0 },
             }))
             .into_response()

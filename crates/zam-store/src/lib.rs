@@ -24,7 +24,7 @@ pub use nodes::{
     restore_node, revert_note, unified_diff, update_note,
 };
 pub use paths::NodePath;
-pub use search::{FtsHit, FtsQuery, MARK_END, MARK_START, sanitize_fts, search_fts};
+pub use search::{FtsHit, FtsQuery, MARK_END, MARK_START, pending_count, sanitize_fts, search_fts};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,
 };

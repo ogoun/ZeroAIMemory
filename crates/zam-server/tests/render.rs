@@ -188,3 +188,45 @@ async fn large_html_is_not_cached() {
     assert!(r.json()["html"].as_str().unwrap().len() > 256 * 1024);
     assert_eq!(a.st.render_cache.lock().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn render_cache_sees_wikilink_target_changes() {
+    let a = api("render-gen", |_| {}).await;
+    let src = a.note("knowledge", "Источник", "см. [[Цель]]\n").await;
+    let uri = format!("/api/v1/nodes/{}?format=html", src["id"].as_str().unwrap());
+    let html = || async { a.t(Method::GET, &uri, None).await.json() };
+
+    let j = html().await;
+    assert_eq!(j["warnings"].as_array().unwrap().len(), 1, "{j}");
+    // цель появилась — ссылка рабочая, хотя текст источника не менялся
+    let target = a.note("knowledge", "Цель", "# Т\n").await;
+    let tid = target["id"].as_str().unwrap().to_string();
+    let href = format!("href=\"#/n/{tid}\"");
+    let j = html().await;
+    assert!(j["html"].as_str().unwrap().contains(&href), "{j}");
+    assert!(j["warnings"].as_array().unwrap().is_empty(), "{j}");
+    // удалена — снова битая
+    let r = a
+        .t(Method::DELETE, &format!("/api/v1/nodes/{tid}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let j = html().await;
+    assert!(!j["html"].as_str().unwrap().contains(&href), "{j}");
+    assert_eq!(j["warnings"].as_array().unwrap().len(), 1, "{j}");
+    // восстановлена — рабочая
+    let r = a
+        .t(Method::POST, &format!("/api/v1/nodes/{tid}/restore"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(html().await["html"].as_str().unwrap().contains(&href));
+    // переименована — битая
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/nodes/{tid}/move"),
+            Some(json!({ "path": "Другое имя" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(html().await["warnings"].as_array().unwrap().len(), 1);
+}

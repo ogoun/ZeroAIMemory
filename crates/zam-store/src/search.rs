@@ -491,6 +491,37 @@ fn text_snippet(text: &str, needles: &[&str]) -> String {
     s
 }
 
+/// Сколько живых заметок в `space_ids` (и под `path_prefix`, если задан) ждут
+/// векторной индексации (`index_state = 'pending'`) — `pending_count` выдачи поиска.
+/// Заметки с `index: false` (`excluded`) не считаются.
+pub async fn pending_count(
+    db: &Db,
+    space_ids: Vec<Id>,
+    path_prefix: Option<String>,
+) -> Result<i64, StoreError> {
+    if space_ids.is_empty() {
+        return Ok(0);
+    }
+    let ids = serde_json::Value::from(space_ids.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .to_string();
+    let prefix = path_prefix
+        .as_deref()
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    db.read(move |c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM nodes n
+             WHERE n.kind = 'note' AND n.index_state = 'pending' AND n.deleted_at IS NULL
+               AND n.space_id IN (SELECT value FROM json_each(?1))
+               AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
+            params![ids, prefix],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

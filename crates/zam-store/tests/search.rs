@@ -606,3 +606,27 @@ async fn bench_fts_1000_notes() {
 async fn bench_fts_10000_notes() {
     bench(10_000).await;
 }
+
+// ---------- pending_count ----------
+
+#[tokio::test]
+async fn pending_count_by_scope() {
+    use zam_store::pending_count;
+    let (db, k, h) = setup("pending").await;
+    add(&db, k, "a", "# A\n").await;
+    add(&db, k, "dir/b", "# B\n").await;
+    add(&db, k, "skip", "---\nindex: false\n---\n# С\n").await;
+    let gone = add(&db, k, "gone", "# Г\n").await;
+    delete_node(&db, gone).await.unwrap();
+    add(&db, h, "личное", "x").await;
+    // папка dir, заметка с index: false и удалённая не считаются
+    assert_eq!(pending_count(&db, vec![k], None).await.unwrap(), 2);
+    assert_eq!(pending_count(&db, vec![k, h], None).await.unwrap(), 3);
+    assert_eq!(
+        pending_count(&db, vec![k], Some("dir/".into()))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(pending_count(&db, vec![], None).await.unwrap(), 0);
+}

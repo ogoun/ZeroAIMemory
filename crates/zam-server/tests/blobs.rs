@@ -419,3 +419,77 @@ async fn render_resolves_attachment_links() {
     let own2 = a.tok(&tok, Method::GET, &puri, None).await.json();
     assert_eq!(own2["html"], own["html"]);
 }
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn render_cache_sees_attachment_upload() {
+    let a = api("blobs-gen", |_| {}).await;
+    let data = png();
+    let sha = sha256_hex(&data);
+    let md = format!("# A\n\n![кот](_attachments/{}/a.png)\n", &sha[..16]);
+    let n = a.note("knowledge", "a", &md).await;
+    let uri = format!("/api/v1/nodes/{}?format=html", id(&n));
+    let img = format!("<img src=\"api/v1/blobs/{sha}/a.png\"");
+
+    let j = a.t(Method::GET, &uri, None).await.json();
+    assert!(!j["html"].as_str().unwrap().contains(&img), "{j}");
+    assert_eq!(j["warnings"].as_array().unwrap().len(), 1, "{j}");
+    // вложение загружено после рендера: кэш его видит
+    let r = upload(&a, &id(&n), "a.png", &data).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["sha256"], sha);
+    let j = a.t(Method::GET, &uri, None).await.json();
+    assert!(j["html"].as_str().unwrap().contains(&img), "{j}");
+    assert!(j["warnings"].as_array().unwrap().is_empty(), "{j}");
+}
+
+#[tokio::test]
+async fn token_render_ignores_attachment_only_in_human() {
+    let a = api("blobs-human-render", |_| {}).await;
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/nodes",
+            Some(json!({"space": "human", "path": "личное", "kind": "note", "content": "x"})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let hid = id(&r.json());
+    let body = multipart(&[
+        ("node", None, None, hid.as_bytes()),
+        ("file", Some("a.png"), None, &png()),
+    ]);
+    let req = Request::post("/api/v1/blobs")
+        .header(header::COOKIE, &a.cookie)
+        .header("x-csrf-token", &a.csrf)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let r = a.send(req).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let sha = r.json()["sha256"].as_str().unwrap().to_string();
+
+    // заметка Knowledge ссылается на вложение, которое есть только в Human
+    let md = format!("![x](_attachments/{}/a.png)\n", &sha[..16]);
+    let k = a.note("knowledge", "ссылка", &md).await;
+    let uri = format!("/api/v1/nodes/{}?format=html", id(&k));
+    let j = a.t(Method::GET, &uri, None).await.json();
+    let html = j["html"].as_str().unwrap();
+    assert!(!html.contains("<img"), "{html}");
+    assert!(!html.contains(&sha), "{html}");
+    assert_eq!(j["warnings"].as_array().unwrap().len(), 1, "{j}");
+    // администратору то же вложение видно
+    let j = a.adm(Method::GET, &uri, None, None).await.json();
+    assert!(j["html"].as_str().unwrap().contains("<img"), "{j}");
+}
