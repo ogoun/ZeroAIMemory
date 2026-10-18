@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// Платформы поставки.
@@ -41,6 +41,26 @@ impl Manifest {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("не удалось прочитать {}", path.display()))?;
         Self::parse(&text).with_context(|| path.display().to_string())
+    }
+
+    /// Проверка манифеста; `allow_empty_hash` — только для режима `--print-hashes`.
+    pub fn validate(&self, allow_empty_hash: bool) -> Result<()> {
+        for (plat, e) in &self.platform {
+            let ctx = || format!("{} [{plat}]", self.name);
+            if !e.url.starts_with("https://") {
+                bail!("{}: url должен начинаться с https://", ctx());
+            }
+            let h = e.sha256.trim();
+            if h.is_empty() {
+                if !allow_empty_hash {
+                    bail!("{}: sha256 не задан; используйте --print-hashes", ctx());
+                }
+            } else if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                bail!("{}: sha256 должен быть 64 hex-символа", ctx());
+            }
+            crate::fetch::dest_names(e).with_context(ctx)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -86,9 +106,24 @@ rename = { "qdrant" = "qdrant-bin" }
         for name in MANIFESTS {
             let m = Manifest::load(&dir.join(format!("{name}.toml"))).unwrap();
             assert_eq!(m.name, name);
+            m.validate(false).unwrap();
             for p in PLATFORMS {
                 assert!(m.platform.contains_key(p), "{name}: нет платформы {p}");
             }
         }
+    }
+
+    #[test]
+    fn validation_rejects_bad_hash_and_url() {
+        let ok = SAMPLE.replace("abc", &"A".repeat(64));
+        let m = Manifest::parse(&ok).unwrap();
+        assert!(m.validate(false).is_err()); // у linux-x64 хэш пуст
+        assert!(m.validate(true).is_ok());
+        assert!(Manifest::parse(SAMPLE).unwrap().validate(true).is_err()); // "abc"
+        let http = ok.replace(
+            "https://example.invalid/q.zip",
+            "http://example.invalid/q.zip",
+        );
+        assert!(Manifest::parse(&http).unwrap().validate(true).is_err());
     }
 }

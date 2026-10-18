@@ -89,7 +89,20 @@ fn dest_name(entry: &PlatformEntry, path: &str) -> Result<String> {
     Ok(name)
 }
 
-/// Извлекает из архива только перечисленные в `entry.extract` файлы в `out`.
+/// Имена назначения для всех `extract`; дубликаты и недопустимые имена — ошибка.
+pub fn dest_names(entry: &PlatformEntry) -> Result<Vec<String>> {
+    let mut names: Vec<String> = Vec::new();
+    for p in &entry.extract {
+        let n = dest_name(entry, &norm(p))?;
+        if names.contains(&n) {
+            bail!("два файла извлекаются под одним именем '{n}'");
+        }
+        names.push(n);
+    }
+    Ok(names)
+}
+
+/// Извлекает из архива только перечисленные в `entry.extract` обычные файлы в `out`.
 pub fn extract_selected(
     archive: &Path,
     url: &str,
@@ -98,10 +111,7 @@ pub fn extract_selected(
 ) -> Result<()> {
     let wanted: Vec<String> = entry.extract.iter().map(|p| norm(p)).collect();
     // Имена назначения проверяем до записи чего-либо.
-    let names: Vec<String> = wanted
-        .iter()
-        .map(|p| dest_name(entry, p))
-        .collect::<Result<_>>()?;
+    let names = dest_names(entry)?;
     fs::create_dir_all(out)?;
     let mut found = vec![false; wanted.len()];
     let lower = url.to_ascii_lowercase();
@@ -110,8 +120,12 @@ pub fn extract_selected(
         for (i, w) in wanted.iter().enumerate() {
             let mut f = match z.by_name(w) {
                 Ok(f) => f,
-                Err(_) => continue,
+                Err(zip::result::ZipError::FileNotFound) => continue,
+                Err(e) => bail!("ошибка чтения '{w}' из zip: {e}"),
             };
+            if !f.is_file() || f.is_symlink() {
+                bail!("'{w}' в архиве не является обычным файлом");
+            }
             let mut o = File::create(out.join(&names[i]))?;
             io::copy(&mut f, &mut o)?;
             found[i] = true;
@@ -123,6 +137,9 @@ pub fn extract_selected(
             let mut e = e?;
             let p = norm(&e.path()?.to_string_lossy());
             if let Some(i) = wanted.iter().position(|w| *w == p) {
+                if !e.header().entry_type().is_file() {
+                    bail!("'{p}' в архиве не является обычным файлом");
+                }
                 let mut o = File::create(out.join(&names[i]))?;
                 io::copy(&mut e, &mut o)?;
                 found[i] = true;
@@ -143,6 +160,28 @@ pub fn extract_selected(
     Ok(())
 }
 
+/// Атомарная замена каталога: распаковка в `<out>.tmp`, затем подмена `out`.
+pub fn extract_atomic(archive: &Path, url: &str, entry: &PlatformEntry, out: &Path) -> Result<()> {
+    let mut tmp_name = out
+        .file_name()
+        .context("пустое имя каталога")?
+        .to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = out.with_file_name(tmp_name);
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp)?;
+    }
+    if let Err(e) = extract_selected(archive, url, entry, &tmp) {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    if out.exists() {
+        fs::remove_dir_all(out)?;
+    }
+    fs::rename(&tmp, out)?;
+    Ok(())
+}
+
 /// Скачивает (если нет в кэше), проверяет хэш и распаковывает. `root` — каталог `target/`.
 /// Возвращает true, если файл взят из кэша.
 pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> Result<bool> {
@@ -156,8 +195,12 @@ pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> 
     let cached = cache.join(&expected);
     let from_cache = cached.is_file();
     if from_cache {
-        // Кэш мог быть повреждён — проверяем и при ошибке не качаем молча.
-        verify_sha256(&cached, &expected)?;
+        verify_sha256(&cached, &expected).with_context(|| {
+            format!(
+                "{name}: файл кэша повреждён; удалите файл кэша {} и повторите",
+                cached.display()
+            )
+        })?;
     } else {
         println!("{name}: загрузка {}", entry.url);
         let (part, actual) = download_part(&entry.url, &cache)?;
@@ -167,7 +210,7 @@ pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> 
         }
         fs::rename(&part, &cached)?;
     }
-    extract_selected(&cached, &entry.url, entry, out).with_context(|| name.to_string())?;
+    extract_atomic(&cached, &entry.url, entry, out).with_context(|| name.to_string())?;
     Ok(from_cache)
 }
 
@@ -313,5 +356,66 @@ mod tests {
         let d = tmp("empty_hash");
         let e = fetch_one("qdrant", &entry(&["x"], &[]), &d, &d.join("out")).unwrap_err();
         assert!(e.to_string().contains("--print-hashes"), "{e}");
+    }
+
+    #[test]
+    fn atomic_extract_replaces_dir_and_keeps_old_on_error() {
+        let d = tmp("atomic");
+        let zip_p = d.join("a.zip");
+        make_zip(&zip_p);
+        let out = d.join("dep");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("stale.txt"), b"old").unwrap();
+        extract_atomic(&zip_p, "u.zip", &entry(&["root/lib/a.dll"], &[]), &out).unwrap();
+        assert!(!out.join("stale.txt").exists());
+        assert!(out.join("a.dll").exists());
+        assert!(!d.join("dep.tmp").exists());
+
+        let e = extract_atomic(
+            &zip_p,
+            "u.zip",
+            &entry(&["root/lib/a.dll", "root/nope"], &[]),
+            &out,
+        );
+        assert!(e.is_err());
+        assert_eq!(std::fs::read(out.join("a.dll")).unwrap(), b"AAA");
+        assert!(!d.join("dep.tmp").exists());
+    }
+
+    #[test]
+    fn untrusted_cache_is_error_and_nothing_extracted() {
+        let d = tmp("bad_cache");
+        let hash = "a".repeat(64);
+        std::fs::create_dir_all(d.join("deps-cache")).unwrap();
+        std::fs::write(d.join("deps-cache").join(&hash), b"not the archive").unwrap();
+        let mut e = entry(&["x"], &[]);
+        e.sha256 = hash;
+        e.url = "https://x/a.zip".into();
+        let out = d.join("out");
+        let err = format!("{:#}", fetch_one("qdrant", &e, &d, &out).unwrap_err());
+        assert!(err.contains("удалите файл кэша"), "{err}");
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn duplicate_destination_and_non_regular_are_errors() {
+        let e = entry(&["a/x.dll", "b/x.dll"], &[]);
+        assert!(dest_names(&e).unwrap_err().to_string().contains("x.dll"));
+
+        let d = tmp("non_regular");
+        let p = d.join("l.tgz");
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&p).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut t = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        t.append_link(&mut h, "root/link", "/etc/passwd").unwrap();
+        t.into_inner().unwrap().finish().unwrap();
+        let err =
+            extract_selected(&p, "u.tgz", &entry(&["root/link"], &[]), &d.join("o")).unwrap_err();
+        assert!(err.to_string().contains("обычным файлом"), "{err}");
     }
 }

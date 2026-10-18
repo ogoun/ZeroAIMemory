@@ -48,6 +48,17 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool) -> Result<()> {
     let root = repo_root();
     let target = root.join("target");
     let manifests = load_manifests(&root)?;
+    for m in &manifests {
+        m.validate(print_hashes)?;
+    }
+    if let Some(p) = platform.as_deref()
+        && !PLATFORMS.contains(&p)
+    {
+        bail!(
+            "неизвестная платформа '{p}', допустимы: {}",
+            PLATFORMS.join(", ")
+        );
+    }
 
     if print_hashes {
         for m in &manifests {
