@@ -25,6 +25,7 @@ pub struct RevisionInfo {
     pub session_id: Option<String>,
     pub machine: Option<String>,
     pub message: Option<String>,
+    #[serde(serialize_with = "crate::time::ser_ts")]
     pub ts: Timestamp,
 }
 

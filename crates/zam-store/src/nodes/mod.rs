@@ -31,7 +31,7 @@ use crate::time::{conv_err, ts_at, ts_opt};
 
 pub use history::{RevisionInfo, list_revisions, unified_diff};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
-pub use revise::{WriteError, patch_note, revert_note, update_note};
+pub use revise::{WriteError, patch_note, patch_note_within, revert_note, update_note};
 pub use tree_ops::{delete_node, list_trash, move_node, restore_node};
 pub use write::{create_folder, create_note};
 
@@ -137,8 +137,13 @@ pub struct Node {
     pub l0: Option<String>,
     /// `auto` | `manual` | `agent`.
     pub l0_source: Option<String>,
+    /// `pending` | `indexed` | `failed` | `excluded` (векторная индексация, §8.1).
+    pub index_state: String,
+    #[serde(serialize_with = "crate::time::ser_ts")]
     pub created_at: Timestamp,
+    #[serde(serialize_with = "crate::time::ser_ts")]
     pub updated_at: Timestamp,
+    #[serde(serialize_with = "crate::time::ser_ts_opt")]
     pub deleted_at: Option<Timestamp>,
     /// Есть живой дочерний узел.
     pub has_children: bool,
@@ -159,7 +164,7 @@ pub struct NewNote {
 /// `has_children` ограничен `space_id`, чтобы подзапрос шёл по индексу `nodes_parent`.
 pub(crate) const NODE_COLS: &str = "n.id, n.space_id, n.parent_id, n.kind, n.name, n.path,
     n.current_rev, n.content_hash, n.frontmatter, n.l0, n.l0_source,
-    n.created_at, n.updated_at, n.deleted_at,
+    n.created_at, n.updated_at, n.deleted_at, n.index_state,
     EXISTS (SELECT 1 FROM nodes c
             WHERE c.space_id = n.space_id AND c.parent_id = n.id AND c.deleted_at IS NULL)";
 
@@ -183,7 +188,8 @@ pub(crate) fn node_row(r: &Row) -> rusqlite::Result<Node> {
         created_at: ts_at(r, 11)?,
         updated_at: ts_at(r, 12)?,
         deleted_at: ts_opt(r, 13)?,
-        has_children: r.get(14)?,
+        index_state: r.get(14)?,
+        has_children: r.get(15)?,
     })
 }
 

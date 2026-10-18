@@ -1054,3 +1054,27 @@ async fn move_rename_and_errors() {
         Err(StoreError::NotFound)
     ));
 }
+
+#[tokio::test]
+async fn index_state_in_node_and_patch_size_limit() {
+    use zam_store::patch_note_within;
+    let (db, space) = setup("limit").await;
+    let n = create_note(&db, note(space, "lim", "# А\nтекст\n"))
+        .await
+        .unwrap();
+    assert_eq!(n.index_state, "pending");
+    let f = create_folder(&db, space, p("dir")).await.unwrap();
+    assert_eq!(f.index_state, "excluded");
+    let op = PatchOp::Append {
+        content: "x".repeat(100),
+    };
+    match patch_note_within(&db, n.id, 1, vec![op.clone()], agent(), 50).await {
+        Err(WriteError::TooLarge { size, max }) => assert!(size > 100 && max == 50),
+        other => panic!("{:?}", other.map(|n| n.current_rev)),
+    }
+    assert_eq!(get_node(&db, n.id).await.unwrap().current_rev, 1);
+    let u = patch_note_within(&db, n.id, 1, vec![op], agent(), 1000)
+        .await
+        .unwrap();
+    assert_eq!(u.current_rev, 2);
+}

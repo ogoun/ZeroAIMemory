@@ -11,6 +11,19 @@ pub fn fmt_ts(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%S.%6fZ").to_string()
 }
 
+/// Сериализация времени в JSON в том же формате, что и в БД (`serialize_with`).
+pub fn ser_ts<S: serde::Serializer>(ts: &Timestamp, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&fmt_ts(*ts))
+}
+
+/// [`ser_ts`] для необязательного времени (`None` → `null`).
+pub fn ser_ts_opt<S: serde::Serializer>(ts: &Option<Timestamp>, s: S) -> Result<S::Ok, S::Error> {
+    match ts {
+        Some(t) => s.serialize_str(&fmt_ts(*t)),
+        None => s.serialize_none(),
+    }
+}
+
 /// Разбирает строку времени из БД.
 pub fn parse_ts(s: &str) -> Result<Timestamp, StoreError> {
     s.parse()

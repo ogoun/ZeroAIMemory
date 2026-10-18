@@ -18,8 +18,9 @@ use crate::time::fmt_ts;
 use crate::{Db, StoreError};
 
 /// Ошибка правки заметки. Сервер отображает `RevMismatch` и `SectionChanged` в 409,
-/// `Patch` — в 422. Сообщения не содержат текста заметки (его нельзя писать в логи).
-#[derive(Debug, thiserror::Error)]
+/// `Patch` — в 422, `TooLarge` — в 413. Сообщения не содержат текста заметки (его нельзя
+/// писать в логи); `Debug` тоже: текст `RevMismatch::current` в нём скрыт.
+#[derive(thiserror::Error)]
 pub enum WriteError {
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -31,6 +32,40 @@ pub enum WriteError {
     /// Затронутая секция изменилась после `base_rev`.
     #[error("секция изменена после базовой ревизии: текущая ревизия {current_rev}")]
     SectionChanged { section: String, current_rev: i64 },
+    /// Итоговый текст PATCH длиннее предела (байт).
+    #[error("заметка после правки — {size} байт, предел {max}")]
+    TooLarge { size: usize, max: usize },
+}
+
+// Вручную: текст заметки (`RevMismatch::current`) не должен попасть в отладочный вывод.
+impl std::fmt::Debug for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Store(e) => f.debug_tuple("Store").field(e).finish(),
+            WriteError::RevMismatch {
+                current_rev,
+                current,
+            } => f
+                .debug_struct("RevMismatch")
+                .field("current_rev", current_rev)
+                .field("current_len", &current.len())
+                .finish_non_exhaustive(),
+            WriteError::Patch(e) => f.debug_tuple("Patch").field(e).finish(),
+            WriteError::SectionChanged {
+                section,
+                current_rev,
+            } => f
+                .debug_struct("SectionChanged")
+                .field("section", section)
+                .field("current_rev", current_rev)
+                .finish(),
+            WriteError::TooLarge { size, max } => f
+                .debug_struct("TooLarge")
+                .field("size", size)
+                .field("max", max)
+                .finish(),
+        }
+    }
 }
 
 /// Заменяет текст заметки. `base_rev` должен совпадать с текущей ревизией, иначе
@@ -69,6 +104,19 @@ pub async fn patch_note(
     ops: Vec<PatchOp>,
     a: Attribution,
 ) -> Result<Node, WriteError> {
+    patch_note_within(db, id, base_rev, ops, a, usize::MAX).await
+}
+
+/// [`patch_note`] с пределом размера итогового текста: длиннее `max_bytes` →
+/// [`WriteError::TooLarge`], ничего не записано.
+pub async fn patch_note_within(
+    db: &Db,
+    id: Id,
+    base_rev: i64,
+    ops: Vec<PatchOp>,
+    a: Attribution,
+    max_bytes: usize,
+) -> Result<Node, WriteError> {
     write_note(db, move |tx| {
         let node = live_note(tx, id)?;
         if ops.is_empty() {
@@ -95,6 +143,12 @@ pub async fn patch_note(
                 });
             }
             text = apply_patch(&text, op)?.text;
+        }
+        if text.len() > max_bytes {
+            return Err(WriteError::TooLarge {
+                size: text.len(),
+                max: max_bytes,
+            });
         }
         Ok(commit_text(tx, node, &text, None, &a)?)
     })
