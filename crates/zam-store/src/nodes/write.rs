@@ -72,7 +72,7 @@ fn ensure_space(c: &Connection, space_id: Id) -> Result<(), StoreError> {
         .ok_or(StoreError::NotFound)
 }
 
-fn ensure_free(c: &Connection, space_id: Id, path: &NodePath) -> Result<(), StoreError> {
+pub(crate) fn ensure_free(c: &Connection, space_id: Id, path: &NodePath) -> Result<(), StoreError> {
     match live_by_path(c, space_id, path.as_str())? {
         Some(_) => Err(StoreError::Conflict(format!("путь «{path}» уже занят"))),
         None => Ok(()),

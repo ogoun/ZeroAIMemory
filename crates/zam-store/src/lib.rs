@@ -15,8 +15,9 @@ pub use db::Db;
 pub use migrate::Migration;
 pub use nodes::{
     Attribution, AuthorKind, NewNote, Node, NodeKind, RevisionInfo, WriteError, create_folder,
-    create_note, find_by_name, get_node, get_node_by_path, list_children, list_revisions,
-    node_content, patch_note, revert_note, unified_diff, update_note,
+    create_note, delete_node, find_by_name, get_node, get_node_by_path, list_children,
+    list_revisions, list_trash, move_node, node_content, patch_note, restore_node, revert_note,
+    unified_diff, update_note,
 };
 pub use paths::NodePath;
 pub use system::{

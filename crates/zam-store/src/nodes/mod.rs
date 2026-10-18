@@ -6,12 +6,14 @@
 //! - [`revise`] — правка заметки: замена с проверкой ревизии, PATCH секций, откат;
 //! - [`read`] — чтение: узел, содержимое ревизии, дети, поиск по имени;
 //! - [`history`] — список ревизий и унифицированный дифф;
+//! - [`tree_ops`] — корзина (мягкое удаление поддерева, восстановление) и перенос узла;
 //! - [`chunks`] — метаданные заметки (frontmatter, L0) и чанки секций с FTS.
 
 mod chunks;
 mod history;
 mod read;
 mod revise;
+mod tree_ops;
 mod write;
 
 use std::fmt::Write as _;
@@ -30,6 +32,7 @@ use crate::time::{conv_err, ts_at, ts_opt};
 pub use history::{RevisionInfo, list_revisions, unified_diff};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
 pub use revise::{WriteError, patch_note, revert_note, update_note};
+pub use tree_ops::{delete_node, list_trash, move_node, restore_node};
 pub use write::{create_folder, create_note};
 
 /// Вид узла.

@@ -4,9 +4,9 @@ use zam_core::Id;
 use zam_markdown::{PatchError, PatchOp};
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, NewNote, NodeKind, NodePath, SpaceKind, StoreError,
-    USER_MIGRATIONS, UserDbs, WriteError, create_folder, create_note, find_by_name, get_node,
-    get_node_by_path, list_children, list_revisions, list_spaces, node_content, patch_note,
-    revert_note, unified_diff, update_note,
+    USER_MIGRATIONS, UserDbs, WriteError, create_folder, create_note, delete_node, find_by_name,
+    get_node, get_node_by_path, list_children, list_revisions, list_spaces, list_trash, move_node,
+    node_content, patch_note, restore_node, revert_note, unified_diff, update_note,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -819,4 +819,238 @@ fn unified_diff_marks_lines() {
     let d = unified_diff(old, &old.replace("9\n", "девять\n"), "a", "b");
     assert!(d.contains("@@ -6,4 +6,4 @@") && !d.contains(" 5\n"), "{d}");
     assert_eq!(unified_diff("x\n", "x\n", "a", "b"), "");
+}
+
+// ---------- корзина и перемещение ----------
+
+const WORDY: &str = "# Раздел\n\nуникальнослово здесь\n";
+
+/// Число чанков заметки, у которых FTS находит слово в `context_prefix`.
+async fn prefix_hits(db: &Db, node: Id, word: &str) -> i64 {
+    let q = format!("context_prefix : {word}");
+    db.read(move |c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM chunks_fts f JOIN chunks c ON c.seq = f.rowid
+             WHERE chunks_fts MATCH ?1 AND c.node_id = ?2",
+            rusqlite::params![q, node],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+    .unwrap()
+}
+
+fn ids(nodes: &[zam_store::Node]) -> Vec<Id> {
+    nodes.iter().map(|n| n.id).collect()
+}
+
+#[tokio::test]
+async fn delete_folder_and_restore_cycle() {
+    let (db, space) = setup("trash").await;
+    let x = create_note(&db, note(space, "a/x", WORDY)).await.unwrap();
+    let y = create_note(&db, note(space, "a/y", WORDY)).await.unwrap();
+    let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
+
+    assert_eq!(delete_node(&db, a.id).await.unwrap(), 3);
+    let mut stamps = Vec::new();
+    for id in [a.id, x.id, y.id] {
+        stamps.push(get_node(&db, id).await.unwrap().deleted_at.expect("удалён"));
+    }
+    assert!(stamps.iter().all(|t| *t == stamps[0]), "одна метка времени");
+    assert_eq!(fts_hits(&db, x.id, "уникальнослово").await, 0);
+    assert_eq!(chunk_count(&db, y.id).await, 0);
+    assert!(matches!(
+        get_node_by_path(&db, space, &p("a")).await,
+        Err(StoreError::NotFound)
+    ));
+    // повторное удаление — NotFound
+    assert!(matches!(
+        delete_node(&db, a.id).await,
+        Err(StoreError::NotFound)
+    ));
+
+    // путь свободен: новая папка с тем же путём
+    let a2 = create_folder(&db, space, p("a")).await.unwrap();
+    assert!(matches!(
+        restore_node(&db, a.id).await,
+        Err(StoreError::Conflict(_))
+    ));
+    // ребёнок тянет за собой предка, путь которого занят
+    assert!(matches!(
+        restore_node(&db, x.id).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(get_node(&db, x.id).await.unwrap().deleted_at.is_some());
+
+    assert_eq!(
+        ids(&list_trash(&db, Some(space)).await.unwrap()),
+        vec![a.id]
+    );
+
+    assert_eq!(delete_node(&db, a2.id).await.unwrap(), 1);
+    assert_eq!(
+        ids(&list_trash(&db, None).await.unwrap()),
+        vec![a2.id, a.id],
+        "новые удаления первыми"
+    );
+
+    let r = restore_node(&db, a.id).await.unwrap();
+    assert_eq!(r.id, a.id);
+    assert!(r.deleted_at.is_none());
+    assert!(r.has_children);
+    for id in [x.id, y.id] {
+        assert!(get_node(&db, id).await.unwrap().deleted_at.is_none());
+        assert_eq!(fts_hits(&db, id, "уникальнослово").await, 1);
+    }
+    assert_eq!(
+        get_node_by_path(&db, space, &p("a/x")).await.unwrap().id,
+        x.id
+    );
+    // живой узел восстанавливать нечего
+    assert!(matches!(
+        restore_node(&db, a.id).await,
+        Err(StoreError::BadInput(_))
+    ));
+    assert!(matches!(
+        restore_node(&db, Id::new()).await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(
+        ids(&list_trash(&db, Some(space)).await.unwrap()),
+        vec![a2.id]
+    );
+    assert!(list_trash(&db, Some(Id::new())).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn restore_child_restores_only_ancestors() {
+    let (db, space) = setup("trash-child").await;
+    let x = create_note(&db, note(space, "a/b/x", WORDY)).await.unwrap();
+    let y = create_note(&db, note(space, "a/y", WORDY)).await.unwrap();
+    let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
+    let b = get_node_by_path(&db, space, &p("a/b")).await.unwrap();
+    assert_eq!(delete_node(&db, a.id).await.unwrap(), 4);
+
+    restore_node(&db, x.id).await.unwrap();
+    for id in [a.id, b.id, x.id] {
+        assert!(get_node(&db, id).await.unwrap().deleted_at.is_none());
+    }
+    assert!(get_node(&db, y.id).await.unwrap().deleted_at.is_some());
+    assert_eq!(fts_hits(&db, x.id, "уникальнослово").await, 1);
+    // y теперь корень удалённого: его родитель жив
+    assert_eq!(
+        ids(&list_trash(&db, Some(space)).await.unwrap()),
+        vec![y.id]
+    );
+}
+
+#[tokio::test]
+async fn earlier_deleted_descendant_stays_deleted() {
+    let (db, space) = setup("trash-earlier").await;
+    let x = create_note(&db, note(space, "a/x", WORDY)).await.unwrap();
+    let y = create_note(&db, note(space, "a/y", WORDY)).await.unwrap();
+    let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
+    assert_eq!(delete_node(&db, y.id).await.unwrap(), 1);
+    assert_eq!(delete_node(&db, a.id).await.unwrap(), 2);
+
+    assert_eq!(
+        ids(&list_trash(&db, Some(space)).await.unwrap()),
+        vec![a.id, y.id]
+    );
+    restore_node(&db, a.id).await.unwrap();
+    assert!(get_node(&db, x.id).await.unwrap().deleted_at.is_none());
+    assert!(get_node(&db, y.id).await.unwrap().deleted_at.is_some());
+    assert_eq!(chunk_count(&db, y.id).await, 0);
+    assert_eq!(
+        ids(&list_trash(&db, Some(space)).await.unwrap()),
+        vec![y.id]
+    );
+}
+
+#[tokio::test]
+async fn move_folder_rewrites_descendants() {
+    let (db, space) = setup("move").await;
+    let x = create_note(&db, note(space, "a/x", WORDY)).await.unwrap();
+    let z = create_note(&db, note(space, "a/sub/z", WORDY))
+        .await
+        .unwrap();
+    let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
+    let sub = get_node_by_path(&db, space, &p("a/sub")).await.unwrap();
+
+    let m = move_node(&db, a.id, p("b/c")).await.unwrap();
+    assert_eq!((m.path.as_str(), m.name.as_str()), ("b/c", "c"));
+    let b = get_node_by_path(&db, space, &p("b")).await.unwrap();
+    assert_eq!(b.kind, NodeKind::Folder);
+    assert_eq!(m.parent_id, Some(b.id));
+    assert!(m.updated_at >= a.updated_at);
+
+    for (id, path) in [(x.id, "b/c/x"), (sub.id, "b/c/sub"), (z.id, "b/c/sub/z")] {
+        assert_eq!(get_node(&db, id).await.unwrap().path, path);
+        assert_eq!(get_node_by_path(&db, space, &p(path)).await.unwrap().id, id);
+    }
+    assert_eq!(get_node(&db, z.id).await.unwrap().parent_id, Some(sub.id));
+    assert!(matches!(
+        get_node_by_path(&db, space, &p("a/x")).await,
+        Err(StoreError::NotFound)
+    ));
+
+    // context_prefix пересчитан и в чанках, и в FTS
+    let prefix: String = db
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT context_prefix FROM chunks WHERE node_id = ?1",
+                [z.id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(prefix, "[Knowledge/b/c/sub/z] z > Раздел");
+    assert_eq!(prefix_hits(&db, z.id, "c").await, 1);
+    assert_eq!(prefix_hits(&db, x.id, "a").await, 0);
+    assert_eq!(fts_hits(&db, x.id, "уникальнослово").await, 1);
+}
+
+#[tokio::test]
+async fn move_rename_and_errors() {
+    let (db, space) = setup("move-errors").await;
+    let x = create_note(&db, note(space, "a/x", WORDY)).await.unwrap();
+    let w = create_note(&db, note(space, "a/w", WORDY)).await.unwrap();
+    let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
+
+    // перенос в собственное поддерево
+    assert!(matches!(
+        move_node(&db, a.id, p("a/z")).await,
+        Err(StoreError::BadInput(_))
+    ));
+    assert!(matches!(
+        move_node(&db, x.id, p("a/w")).await,
+        Err(StoreError::Conflict(_))
+    ));
+    // предок назначения — заметка
+    assert!(matches!(
+        move_node(&db, x.id, p("a/w/q")).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(get_node(&db, x.id).await.unwrap().path, "a/x");
+    assert!(get_node(&db, w.id).await.unwrap().deleted_at.is_none());
+
+    let same = move_node(&db, x.id, p("a/x")).await.unwrap();
+    assert_eq!(same, get_node(&db, x.id).await.unwrap());
+
+    // переименование заметки; «a/xx» — не потомок «a/x»
+    let r = move_node(&db, x.id, p("a/xx")).await.unwrap();
+    assert_eq!((r.path.as_str(), r.name.as_str()), ("a/xx", "xx"));
+    assert_eq!(r.parent_id, Some(a.id));
+    assert_eq!(prefix_hits(&db, x.id, "xx").await, 1);
+
+    delete_node(&db, x.id).await.unwrap();
+    assert!(matches!(
+        move_node(&db, x.id, p("q")).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        move_node(&db, Id::new(), p("q")).await,
+        Err(StoreError::NotFound)
+    ));
 }
