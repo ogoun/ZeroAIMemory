@@ -1,0 +1,3 @@
+# Общие настройки cargo для workspace
+[term]
+color = "auto"

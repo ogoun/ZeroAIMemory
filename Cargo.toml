@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+# xtask добавится в members в Task 12
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+rust-version = "1.92"
+
+# Общие версии зависимостей; крейты подключают через `dep.workspace = true`
+[workspace.dependencies]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
