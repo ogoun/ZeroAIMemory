@@ -1,5 +1,6 @@
 //! Smoke-тест комплекта: распаковка, запуск сервера, проверка API, клиента и Qdrant.
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -91,6 +92,25 @@ fn unpack(archive: &Path, dir: &Path) -> Result<PathBuf> {
     Ok(roots.remove(0).path())
 }
 
+/// Имена переменных `ZAM_*` (без учёта регистра) из `vars`, кроме `keep`.
+fn zam_vars_except<I: IntoIterator<Item = OsString>>(vars: I, keep: &[&str]) -> Vec<OsString> {
+    vars.into_iter()
+        .filter(|k| {
+            let up = k.to_string_lossy().to_ascii_uppercase();
+            up.starts_with("ZAM_") && !keep.contains(&up.as_str())
+        })
+        .collect()
+}
+
+/// Убирает из окружения дочернего процесса все `ZAM_*` текущего, кроме `keep`:
+/// сборочные переменные CI (`ZAM_GIT_SHA` и т. п.) и настройки разработчика не должны влиять на проверку.
+fn scrub_zam_env<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
+    for k in zam_vars_except(std::env::vars_os().map(|(k, _)| k), keep) {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 /// Свободный порт: bind на 127.0.0.1:0 и закрытие.
 fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
@@ -105,18 +125,19 @@ struct Server {
 
 impl Server {
     fn start(root: &Path, data: &Path, addr: SocketAddr) -> Result<Self> {
-        let mut child =
-            Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")))
-                .args(["serve", "--data-dir"])
-                .arg(data)
-                .args(["--bind", &addr.to_string()])
-                .env("ZAM_ADMIN_PASSWORD", "smoke")
-                .current_dir(root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("запуск zam-server")?;
+        let mut cmd =
+            Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")));
+        let mut child = scrub_zam_env(&mut cmd, &["ZAM_ADMIN_PASSWORD"])
+            .args(["serve", "--data-dir"])
+            .arg(data)
+            .args(["--bind", &addr.to_string()])
+            .env("ZAM_ADMIN_PASSWORD", "smoke")
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("запуск zam-server")?;
         let stderr = child.stderr.take().context("stderr сервера")?;
         let log = Arc::new(Mutex::new(Vec::new()));
         let (tx, token_rx) = mpsc::channel();
@@ -289,6 +310,60 @@ fn admin_issue_ro(base: &str) -> Result<String> {
     Ok(plain.to_string())
 }
 
+/// Критерий M0: `zam status` без флагов находит URL и токен в `CLAUDE.md` выше cwd.
+/// Окружение без `ZAM_*`, домашний каталог — пустой временный (без ~/.zeroaimemory). Токен не печатается.
+fn status_from_claude_md(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let proj = dir.join("proj");
+    let sub = proj.join("sub");
+    let home = dir.join("home");
+    fs::create_dir_all(&sub)?;
+    fs::create_dir_all(&home)?;
+    let claude_md = proj.join("CLAUDE.md");
+    fs::write(
+        &claude_md,
+        format!(
+            "# smoke\n<!-- zeroaimemory:begin v1 -->\nZeroAIMemoryUrl={base}\nZeroAIMemoryToken={token}\n<!-- zeroaimemory:end -->\n"
+        ),
+    )?;
+    let mut cmd = Command::new(zam);
+    scrub_zam_env(&mut cmd, &[])
+        .args(["status", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&sub);
+    let out = output_with_timeout(&mut cmd, CMD_TIMEOUT)?;
+    // В выводе только маска токена.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains(token) {
+        bail!("вывод zam status содержит токен целиком");
+    }
+    if out.status.code() != Some(0) {
+        bail!("код {:?}\n{text}", out.status.code());
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).context("разбор JSON zam status")?;
+    let expect = format!("файл {}", claude_md.display());
+    for key in ["url_source", "token_source"] {
+        if v[key].as_str() != Some(expect.as_str()) {
+            bail!("{key} = {}, ожидалось «{expect}»", v[key]);
+        }
+    }
+    Ok(())
+}
+
+/// В комплекте есть тексты лицензий пакетов бандла WebUI (минимум svelte).
+fn check_web_notices(root: &Path) -> Result<()> {
+    let p = root.join("LICENSES").join("THIRD-PARTY-WEB-NOTICES.txt");
+    let text = fs::read_to_string(&p).with_context(|| format!("чтение {}", p.display()))?;
+    if !text.lines().any(|l| l.starts_with("svelte@")) {
+        bail!("в {} нет лицензии svelte", p.display());
+    }
+    Ok(())
+}
+
 fn step<T>(n: u32, what: &str, r: Result<T>) -> Result<T> {
     r.map_err(|e| anyhow!("шаг {n} ({what}): {e:#}"))
 }
@@ -307,8 +382,7 @@ fn check_static_crt(root: &Path) -> Result<()> {
         let text = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
             bail!(
-                "dumpbin /dependents {exe}: код {:?}
-{text}",
+                "dumpbin /dependents {exe}: код {:?}\n{text}",
                 out.status.code()
             );
         }
@@ -325,6 +399,11 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
     let name = archive_stem(archive)?;
     let dir = target.join("smoke").join(&name);
     let root = step(1, "распаковка", unpack(archive, &dir))?;
+    step(
+        11,
+        "тексты лицензий WebUI в LICENSES/",
+        check_web_notices(&root),
+    )?;
     if host_platform(&root) == "windows-x64" {
         step(
             9,
@@ -369,6 +448,12 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+
+    step(
+        10,
+        "zam status из CLAUDE.md без флагов",
+        status_from_claude_md(&zam, &dir, &base, &token),
+    )?;
 
     step(6, "вход администратора и токен ro", admin_issue_ro(&base))?;
 
@@ -434,6 +519,20 @@ mod tests {
         let mut c = Command::new("sleep");
         c.arg("30");
         c
+    }
+
+    #[test]
+    fn zam_vars_except_filters_case_insensitively() {
+        let vars = [
+            "ZAM_GIT_SHA",
+            "zam_web_rebuild",
+            "ZAM_ADMIN_PASSWORD",
+            "PATH",
+            "XZAM_A",
+        ]
+        .map(OsString::from);
+        let got = zam_vars_except(vars, &["ZAM_ADMIN_PASSWORD"]);
+        assert_eq!(got, ["ZAM_GIT_SHA", "zam_web_rebuild"].map(OsString::from));
     }
 
     #[test]

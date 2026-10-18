@@ -438,7 +438,27 @@ fn package_id_from_json(json: &str) -> Result<String> {
     Ok(format!("{name}@{version}"))
 }
 
-/// Генерирует THIRD-PARTY-RUST.html (cargo-about) и THIRD-PARTY-WEB.json (license-checker).
+/// Тексты лицензий пакетов, попавших в бандл WebUI (rollup-plugin-license при `npm run build`).
+const WEB_NOTICES: &str = "THIRD-PARTY-NOTICES.txt";
+/// Имя этого файла в `LICENSES/` комплекта.
+const WEB_NOTICES_OUT: &str = "THIRD-PARTY-WEB-NOTICES.txt";
+
+/// Копирует `web/dist/THIRD-PARTY-NOTICES.txt` в каталог сгенерированных лицензий.
+fn copy_web_notices(web_dist: &Path, out: &Path) -> Result<()> {
+    let src = web_dist.join(WEB_NOTICES);
+    if !src.is_file() {
+        bail!(
+            "нет {}: соберите WebUI (npm run build в web/)",
+            src.display()
+        );
+    }
+    fs::copy(&src, out.join(WEB_NOTICES_OUT))
+        .with_context(|| format!("копирование {}", src.display()))?;
+    Ok(())
+}
+
+/// Генерирует THIRD-PARTY-RUST.html (cargo-about), THIRD-PARTY-WEB.json (license-checker)
+/// и копирует THIRD-PARTY-WEB-NOTICES.txt (тексты лицензий бандла WebUI).
 pub fn generate_licenses(root: &Path, out: &Path) -> Result<()> {
     if out.exists() {
         fs::remove_dir_all(out)?;
@@ -472,7 +492,7 @@ pub fn generate_licenses(root: &Path, out: &Path) -> Result<()> {
         out.join("THIRD-PARTY-WEB.json"),
         strip_local_paths(&String::from_utf8_lossy(&o.stdout))?,
     )?;
-    Ok(())
+    copy_web_notices(&root.join("web").join("dist"), out)
 }
 
 /// Версия Qdrant из `deploy/qdrant.toml`.
@@ -684,20 +704,27 @@ mod tests {
     }
 
     #[test]
+    fn web_notices_copied_or_missing_is_error() {
+        let w = work("web-notices");
+        let (dist, out) = (w.join("dist"), w.join("out"));
+        fs::create_dir_all(&out).unwrap();
+        let e = copy_web_notices(&dist, &out).unwrap_err();
+        assert!(format!("{e:#}").contains("npm run build"), "{e:#}");
+        touch(&dist.join(WEB_NOTICES));
+        copy_web_notices(&dist, &out).unwrap();
+        assert!(out.join(WEB_NOTICES_OUT).is_file());
+    }
+
+    #[test]
     fn forbidden_imports_detects_dynamic_crt() {
-        let ok = "Image has the following dependencies:
-
-    KERNEL32.dll
-    bcrypt.dll
-
-  Summary
-";
+        let ok = "Image has the following dependencies:\n\n    KERNEL32.dll\n    bcrypt.dll\n\n  Summary\n";
         assert!(forbidden_imports(ok).is_empty());
-        let bad = "    KERNEL32.dll
-    VCRUNTIME140.dll
-    api-ms-win-crt-runtime-l1-1-0.dll
-    MSVCP140.dll
-";
+        let bad = concat!(
+            "    KERNEL32.dll\n",
+            "    VCRUNTIME140.dll\n",
+            "    api-ms-win-crt-runtime-l1-1-0.dll\n",
+            "    MSVCP140.dll\n",
+        );
         assert_eq!(forbidden_imports(bad).len(), 3);
     }
 
