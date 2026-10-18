@@ -247,11 +247,17 @@ pub fn resolve(
     Ok(r)
 }
 
-/// Ближайший вверх от `start` файл `solution.toml`.
+/// Ближайший вверх от `start` файл решения: в каждом каталоге сначала
+/// `.zeroaimemory/solution.toml` (§11.1), затем `solution.toml` (совместимость с M0).
 pub fn find_solution(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
-        .map(|d| d.join("solution.toml"))
+        .flat_map(|d| {
+            [
+                d.join(".zeroaimemory").join("solution.toml"),
+                d.join("solution.toml"),
+            ]
+        })
         .find(|p| p.is_file())
 }
 
@@ -422,6 +428,12 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::write(root.join("solution.toml"), "").unwrap();
         assert_eq!(find_solution(&cwd), Some(root.join("solution.toml")));
+        // .zeroaimemory/solution.toml ближе — выигрывает
+        let mid = root.join("x");
+        std::fs::create_dir_all(mid.join(".zeroaimemory")).unwrap();
+        let f = mid.join(".zeroaimemory").join("solution.toml");
+        std::fs::write(&f, "").unwrap();
+        assert_eq!(find_solution(&cwd), Some(f));
     }
 
     #[test]

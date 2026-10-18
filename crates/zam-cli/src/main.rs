@@ -1,21 +1,22 @@
-//! `zam` — клиент ZeroAIMemory. В пути статуса нет tokio и tracing (холодный старт ≤ 20 мс).
+//! `zam` — клиент ZeroAIMemory. Без tokio и tracing (холодный старт ≤ 20 мс).
+//!
+//! Коды выхода: 0 — успех; 1 — конфигурация; 2 — сервер недоступен; 3 — токен;
+//! 4 — конфликт; 5 — не найдено; 6 — неверный ввод (в том числе аргументы).
+mod client;
+mod cmd;
 mod locate;
+mod target;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use serde_json::{Value, json};
 
-use locate::{Flags, Found};
+use client::{CliError, EXIT_INPUT};
+use cmd::Common;
+use locate::Flags;
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ZAM_GIT_SHA"), ")");
-
-/// Коды выхода.
-const EXIT_CONFIG: u8 = 1;
-const EXIT_UNREACHABLE: u8 = 2;
-const EXIT_TOKEN: u8 = 3;
 
 #[derive(Parser)]
 #[command(name = "zam", version = VERSION, about = "Клиент ZeroAIMemory")]
@@ -28,252 +29,184 @@ struct Cli {
 enum Cmd {
     /// Проверить подключение: сервер, токен, пользователь, solution.toml
     Status {
-        /// Адрес сервера (иначе ZAM_URL, CLAUDE.md/AGENTS.md, ~/.zeroaimemory/config.toml)
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Дерево пространства с L0: [space:]path (без префикса — решение или knowledge)
+    Tree {
+        target: Option<String>,
+        /// Глубина (1–5)
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=5))]
+        depth: u32,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Прочитать заметки: [space:]path или id; Markdown в stdout как сохранён
+    Read {
+        #[arg(required = true)]
+        targets: Vec<String>,
+        /// Уровень: L0 (сводка), L1 (оглавление), L2 (полный текст)
+        #[arg(long, value_parser = ["L0", "L1", "L2", "l0", "l1", "l2"])]
+        tier: Option<String>,
+        /// Секция по пути заголовков: "A > B"
         #[arg(long)]
-        url: Option<String>,
-        /// Токен доступа (иначе ZAM_TOKEN и те же источники)
+        section: Option<String>,
+        /// Ревизия
         #[arg(long)]
-        token: Option<String>,
-        /// Вывод в JSON
+        rev: Option<i64>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Записать заметку из --file или stdin (новая — создаётся, есть — заменяется)
+    Write {
+        target: String,
+        /// Файл с текстом (иначе stdin)
         #[arg(long)]
-        json: bool,
+        file: Option<PathBuf>,
+        /// Сообщение ревизии
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// Ревизия, от которой сделана правка (иначе текущая)
+        #[arg(long)]
+        base_rev: Option<i64>,
+        /// Сводка L0
+        #[arg(long)]
+        l0: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Ревизии заметки; --diff A..B — дифф, --revert N — откат
+    History {
+        target: String,
+        /// Диапазон ревизий A..B (A.. — до текущей)
+        #[arg(long, conflicts_with = "revert")]
+        diff: Option<String>,
+        /// Откатить к ревизии N (создаётся новая ревизия)
+        #[arg(long)]
+        revert: Option<i64>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Поиск: Markdown по умолчанию
+    Search {
+        query: String,
+        /// Во всех решениях
+        #[arg(long)]
+        all: bool,
+        /// Режим выдачи
+        #[arg(long, default_value = "brief", value_parser = ["brief", "chunks", "notes"])]
+        mode: String,
+        /// Число результатов (1–100)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
+        top_k: Option<u32>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Прикрепить файл к заметке; печатает ссылку для вставки
+    Attach {
+        target: String,
+        file: PathBuf,
+        #[command(flatten)]
+        common: Common,
     },
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Status { url, token, json } => ExitCode::from(status(Flags { url, token }, json)),
-    }
-}
-
-fn home_dir() -> PathBuf {
-    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(var)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/nonexistent-home"))
-}
-
-/// Хост из URL без схемы, userinfo и порта (IPv6 без скобок).
-fn host_of(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
-    if let Some(v6) = auth.strip_prefix('[') {
-        return v6.split(']').next().unwrap_or("");
-    }
-    auth.split(':').next().unwrap_or("")
-}
-
-/// К loopback системный прокси не применяется; для остальных хостов работают
-/// ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY (по умолчанию ureq).
-fn bypass_proxy(url: &str) -> bool {
-    matches!(host_of(url), "127.0.0.1" | "localhost" | "::1")
-}
-
-fn agent(url: &str) -> ureq::Agent {
-    let mut b = ureq::Agent::config_builder()
-        .timeout_resolve(Some(Duration::from_secs(2)))
-        .timeout_global(Some(Duration::from_secs(10)))
-        .timeout_connect(Some(Duration::from_secs(2)))
-        .timeout_recv_response(Some(Duration::from_secs(5)))
-        .timeout_recv_body(Some(Duration::from_secs(5)))
-        .http_status_as_error(false);
-    if bypass_proxy(url) {
-        b = b.proxy(None);
-    }
-    ureq::Agent::new_with_config(b.build())
-}
-
-/// GET; Ok((код, тело)) или текст сетевой ошибки (токен в нём не встречается).
-fn get(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Result<(u16, String), String> {
-    let mut req = agent.get(url);
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-    let mut resp = req.call().map_err(|e| e.to_string())?;
-    let code = resp.status().as_u16();
-    let body = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
-    Ok((code, body))
-}
-
-fn status(flags: Flags, as_json: bool) -> u8 {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let env: Vec<(String, String)> = ["ZAM_URL", "ZAM_TOKEN"]
-        .iter()
-        .filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?)))
-        .collect();
-    let r = match locate::resolve(&flags, &env, &cwd, &home_dir()) {
-        Ok(r) => r,
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("{e}");
-            return EXIT_CONFIG;
+            // --help и --version — успех; ошибка аргументов — неверный ввод (6), не 2
+            let _ = e.print();
+            return ExitCode::from(if e.use_stderr() { EXIT_INPUT } else { 0 });
         }
     };
-    let Some(url) = r.url else {
-        eprintln!(
-            "не задан адрес сервера: флаг --url, ZAM_URL, блок ZeroAIMemory в CLAUDE.md/AGENTS.md или ~/.zeroaimemory/config.toml"
-        );
-        return EXIT_CONFIG;
-    };
-    if let Err(e) = locate::check_url(&url.value) {
-        eprintln!("{e}");
-        return EXIT_CONFIG;
+    if let Cmd::Status { common } = &cli.cmd {
+        let flags = Flags {
+            url: common.url.clone(),
+            token: common.token.clone(),
+        };
+        return ExitCode::from(cmd::status::run(flags, common.json));
     }
-    let solution = locate::find_solution(&cwd);
-    let agent = agent(&url.value);
-
-    // 1. сервер: /health без аутентификации
-    let health = match get(&agent, &format!("{}/api/v1/health", url.value), None) {
-        Ok((200, body)) => serde_json::from_str::<Value>(&body).ok(),
-        Ok((code, _)) => {
-            eprintln!("сервер {} ответил HTTP {code} на /health", url.value);
-            return EXIT_UNREACHABLE;
-        }
+    match dispatch(cli.cmd) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("сервер {} недоступен: {e}", url.value);
-            return EXIT_UNREACHABLE;
-        }
-    };
-    let field = |k: &str| {
-        health
-            .as_ref()
-            .and_then(|h| h.get(k))
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_string()
-    };
-    let mut rep = Report {
-        url,
-        version: field("version"),
-        git: field("git"),
-        token: r.token.clone(),
-        user: None,
-        access: None,
-        solution,
-    };
-
-    // 2. токен: /spaces
-    let Some(token) = r.token else {
-        rep.print(as_json, Some("токен не задан"));
-        return EXIT_TOKEN;
-    };
-    match get(
-        &agent,
-        &format!("{}/api/v1/spaces", rep.url.value),
-        Some(&token.value),
-    ) {
-        Ok((200, body)) => {
-            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            rep.user = Some((str_of(&v["user"]["name"]), str_of(&v["user"]["id"])));
-            rep.access = Some(str_of(&v["access"]));
-            rep.print(as_json, None);
-            0
-        }
-        Ok((401 | 403, _)) => {
-            rep.print(as_json, Some("токен отклонён сервером"));
-            EXIT_TOKEN
-        }
-        Ok((code, _)) => {
-            eprintln!("сервер ответил HTTP {code} на /spaces");
-            EXIT_UNREACHABLE
-        }
-        Err(e) => {
-            eprintln!("сервер {} недоступен: {e}", rep.url.value);
-            EXIT_UNREACHABLE
-        }
-    }
-}
-
-fn str_of(v: &Value) -> String {
-    v.as_str().unwrap_or("?").to_string()
-}
-
-struct Report {
-    url: Found,
-    version: String,
-    git: String,
-    token: Option<Found>,
-    user: Option<(String, String)>,
-    access: Option<String>,
-    solution: Option<PathBuf>,
-}
-
-impl Report {
-    /// Печать результата; токен — только маска. `problem` идёт в stderr (и в поле `error` JSON).
-    fn print(&self, as_json: bool, problem: Option<&str>) {
-        let mask = self.token.as_ref().map(|t| zam_core::mask_token(&t.value));
-        let sol = self.solution.as_deref().map(Path::display);
-        if as_json {
-            let v = json!({
-                "url": self.url.value,
-                "url_source": self.url.source.describe(),
-                "server": { "version": self.version, "git": self.git },
-                "token": mask,
-                "token_source": self.token.as_ref().map(|t| t.source.describe()),
-                "access": self.access,
-                "user": self.user.as_ref().map(|(n, i)| json!({ "name": n, "id": i })),
-                "solution": sol.map(|d| d.to_string()),
-                "error": problem,
-            });
-            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-            return;
-        }
-        println!(
-            "Сервер:   {}  (версия {}, git {})",
-            self.url.value, self.version, self.git
-        );
-        println!("Источник: {}", self.url.source.describe());
-        match (&self.token, &mask) {
-            (Some(t), Some(m)) => {
-                let access = self
-                    .access
-                    .as_deref()
-                    .map_or(String::new(), |a| format!("  (доступ {a})"));
-                println!("Токен:    {m}{access}");
-                println!("Источник токена: {}", t.source.describe());
+            if !e.msg.is_empty() {
+                eprintln!("{e}");
             }
-            _ => println!("Токен:    не задан"),
-        }
-        match &self.user {
-            Some((n, i)) => println!("Пользователь: {n} ({i})"),
-            None => println!("Пользователь: неизвестен"),
-        }
-        match sol {
-            Some(d) => println!("Решение:  {d}"),
-            None => println!("Решение:  не найдено"),
-        }
-        if let Some(p) = problem {
-            eprintln!("{p}");
+            ExitCode::from(e.code)
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loopback_hosts_bypass_proxy() {
-        for u in [
-            "http://127.0.0.1:7700",
-            "http://localhost",
-            "https://localhost:1/x",
-            "http://[::1]:7700",
-            "http://user:pw@127.0.0.1/",
-        ] {
-            assert!(bypass_proxy(u), "{u}");
+fn dispatch(c: Cmd) -> Result<(), CliError> {
+    match c {
+        Cmd::Status { .. } => unreachable!("обработан в main"),
+        Cmd::Tree {
+            target,
+            depth,
+            common,
+        } => cmd::tree::run(&cmd::connect(&common)?, target.as_deref(), depth),
+        Cmd::Read {
+            targets,
+            tier,
+            section,
+            rev,
+            common,
+        } => {
+            let o = cmd::read::Opts {
+                tier: tier.as_deref(),
+                section: section.as_deref(),
+                rev,
+            };
+            cmd::read::run(&cmd::connect(&common)?, &targets, &o)
         }
-        for u in [
-            "http://192.168.1.5:7700",
-            "http://zam.lan",
-            "http://localhost.evil.com",
-            "http://127.0.0.10",
-        ] {
-            assert!(!bypass_proxy(u), "{u}");
+        Cmd::Write {
+            target,
+            file,
+            message,
+            base_rev,
+            l0,
+            common,
+        } => {
+            let o = cmd::write::Opts {
+                file: file.as_deref(),
+                message: message.as_deref(),
+                base_rev,
+                l0: l0.as_deref(),
+            };
+            cmd::write::run(&cmd::connect(&common)?, &target, &o)
         }
+        Cmd::History {
+            target,
+            diff,
+            revert,
+            common,
+        } => {
+            let action = match (diff, revert) {
+                (Some(d), _) => cmd::history::Action::Diff(d),
+                (None, Some(r)) => cmd::history::Action::Revert(r),
+                (None, None) => cmd::history::Action::List,
+            };
+            cmd::history::run(&cmd::connect(&common)?, &target, &action)
+        }
+        Cmd::Search {
+            query,
+            all,
+            mode,
+            top_k,
+            common,
+        } => {
+            let o = cmd::search::Opts {
+                all,
+                mode: &mode,
+                top_k,
+            };
+            cmd::search::run(&cmd::connect(&common)?, &query, &o)
+        }
+        Cmd::Attach {
+            target,
+            file,
+            common,
+        } => cmd::attach::run(&cmd::connect(&common)?, &target, &file),
     }
 }
