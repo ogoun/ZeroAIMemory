@@ -24,6 +24,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("../migrations/user/0002_notes.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("../migrations/user/0003_revisions_append_only.sql"),
+    },
 ];
 
 /// Вид пространства.

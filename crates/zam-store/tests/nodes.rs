@@ -68,6 +68,18 @@ async fn chunk_count(db: &Db, node: Id) -> i64 {
     .await
 }
 
+/// `(heading_path, text)` чанков заметки по порядку.
+async fn chunk_rows(db: &Db, node: Id) -> Vec<(String, String)> {
+    db.read(move |c| {
+        let mut st =
+            c.prepare("SELECT heading_path, text FROM chunks WHERE node_id = ?1 ORDER BY ordinal")?;
+        let rows = st.query_map([node], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+    .unwrap()
+}
+
 // ---------- NodePath ----------
 
 #[test]
@@ -419,19 +431,83 @@ tags: [девопс, linux]
 }
 
 #[tokio::test]
-async fn index_false_no_chunks() {
+async fn index_false_keeps_fts_and_marks_excluded() {
+    // `index: false` исключает только из векторного индекса (§6.4): FTS остаётся
     let (db, space) = setup("noindex").await;
     let src = "---\nindex: false\n---\n# Секрет\n\nскрипты\n";
     let n = create_note(&db, note(space, "x", src)).await.unwrap();
-    assert_eq!(chunk_count(&db, n.id).await, 0);
+    assert_eq!(chunk_count(&db, n.id).await, 1);
     assert_eq!(n.frontmatter.unwrap()["index"], serde_json::json!(false));
+    assert_eq!(n.index_state, "excluded", "M2 пропустит векторизацию");
     let all = count(
         &db,
         "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
         "скрипты".into(),
     )
     .await;
-    assert_eq!(all, 0);
+    assert_eq!(all, 1);
+}
+
+#[tokio::test]
+async fn note_without_own_text_still_has_chunk() {
+    let (db, space) = setup("emptynote").await;
+    // заметка из WebUI: только заголовок
+    let n = create_note(&db, note(space, "Новая", "# Новая заметка\n"))
+        .await
+        .unwrap();
+    let rows = chunk_rows(&db, n.id).await;
+    assert_eq!(
+        rows,
+        vec![("Новая заметка".to_string(), "Новая заметка".to_string())]
+    );
+    // совсем пустая — чанк с именем узла
+    let n = create_note(&db, note(space, "Пустышка", "")).await.unwrap();
+    assert_eq!(
+        chunk_rows(&db, n.id).await,
+        vec![(String::new(), "Пустышка".to_string())]
+    );
+    // только пустые секции — первый заголовок
+    let n = create_note(&db, note(space, "Пустые", "# Раз\n\n## Два\n   \n"))
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_rows(&db, n.id).await,
+        vec![("Раз".to_string(), "Раз".to_string())]
+    );
+    for q in ["заметка", "пустышка", "раз"] {
+        let hits = count(
+            &db,
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+            q.into(),
+        )
+        .await;
+        assert!(hits >= 1, "запрос {q:?}");
+    }
+}
+
+#[tokio::test]
+async fn revisions_are_append_only_in_schema() {
+    let (db, space) = setup("appendonly").await;
+    let n = create_note(&db, note(space, "a", "# A\n\nтекст\n"))
+        .await
+        .unwrap();
+    for sql in [
+        "UPDATE revisions SET content = 'подмена' WHERE node_id = ?1",
+        "DELETE FROM revisions WHERE node_id = ?1",
+    ] {
+        let err = db
+            .write(move |t| Ok(t.execute(sql, [n.id])?))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("revisions are append-only"),
+            "{sql}: {err}"
+        );
+    }
+    assert_eq!(
+        node_content(&db, n.id, None).await.unwrap(),
+        (1, "# A\n\nтекст\n".to_string())
+    );
 }
 
 // ---------- L0 ----------
@@ -508,7 +584,7 @@ async fn migrate_from_v1() {
         .read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
         .await
         .unwrap();
-    assert_eq!(ver, 2);
+    assert_eq!(ver, 3);
     let spaces = list_spaces(&db).await.unwrap();
     assert!(spaces.iter().any(|s| s.id == sid && s.name == "Проект"));
     let n = create_note(&db, note(sid, "после/миграции", "# H\n\nтекст\n"))

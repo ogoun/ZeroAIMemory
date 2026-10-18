@@ -1,6 +1,7 @@
 //! Метаданные заметки (frontmatter, L0) и чанки секций (§8.2, §8.3 ТЗ).
 //!
-//! M1: один чанк на секцию H1–H3 (`level = 'section'`) и на непустую преамбулу.
+//! M1: один чанк на секцию H1–H3 (`level = 'section'`) и на непустую преамбулу;
+//! у заметки без собственного текста — один чанк с заголовком или именем.
 //! Текст чанка — собственные байты секции без строки заголовка и без вложенных
 //! подсекций H1–H3: чанки не перекрываются, а вместе покрывают всё тело заметки.
 
@@ -143,6 +144,30 @@ pub(crate) fn section_chunks(src: &str, doc: &Doc) -> Vec<SectionChunk> {
     out
 }
 
+/// Чанк заметки без собственного текста (например, только `# Имя` из WebUI):
+/// путь и текст — первый заголовок, а без заголовков — имя узла. Так любая
+/// заметка находится поиском по названию.
+pub(crate) fn title_chunk(doc: &Doc, name: &str) -> SectionChunk {
+    let (heading_path, text) = match doc.sections.iter().find(|s| s.level > 0) {
+        Some(s) => (
+            s.path.join(" > "),
+            s.path.last().cloned().unwrap_or_default(),
+        ),
+        None => (String::new(), name.to_string()),
+    };
+    let text = if text.trim().is_empty() {
+        name.to_string()
+    } else {
+        text
+    };
+    SectionChunk {
+        heading_path,
+        ordinal: 0,
+        text_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
+        text,
+    }
+}
+
 /// Детерминированный id чанка: первые 16 байт blake3(node ‖ ordinal ‖ text_hash), hex.
 pub(crate) fn chunk_id(node: Id, ordinal: i64, text_hash: &str) -> String {
     let mut h = blake3::Hasher::new();
@@ -159,7 +184,7 @@ fn approx_tokens(text: &str) -> i64 {
 }
 
 /// Пересобирает чанки заметки `node_id` по ревизии `rev`: старые удаляются
-/// (триггеры убирают их из FTS), новые вставляются, если `index`.
+/// (триггеры убирают их из FTS), новые вставляются всегда (и при `index: false`).
 /// Вызывается внутри транзакции записи. Возвращает число вставленных чанков.
 pub(crate) fn rebuild_chunks(
     c: &Connection,
@@ -168,10 +193,9 @@ pub(crate) fn rebuild_chunks(
     content: &str,
     meta: &NoteMeta,
 ) -> Result<usize, StoreError> {
+    // `index: false` исключает только из векторного индекса (§6.4): чанки и FTS
+    // остаются, признак — `nodes.index_state = 'excluded'`
     c.execute("DELETE FROM chunks WHERE node_id = ?1", [node_id])?;
-    if !meta.index {
-        return Ok(0);
-    }
     let (space, path, name): (String, String, String) = c.query_row(
         "SELECT s.name, n.path, n.name FROM nodes n JOIN spaces s ON s.id = n.space_id
          WHERE n.id = ?1",
@@ -183,7 +207,10 @@ pub(crate) fn rebuild_chunks(
         .frontmatter
         .as_ref()
         .map_or(&[][..], |f| &f.tags[..]);
-    let chunks = section_chunks(content, &meta.doc);
+    let mut chunks = section_chunks(content, &meta.doc);
+    if chunks.is_empty() {
+        chunks.push(title_chunk(&meta.doc, &name));
+    }
     let mut st = c.prepare_cached(
         "INSERT INTO chunks (id, node_id, rev, level, heading_path, ordinal, text,
                              context_prefix, token_count, text_hash)
