@@ -163,7 +163,7 @@ pub fn load(
 ) -> Result<ServerConfig, ConfigError> {
     let mut merged = Value::try_from(ServerConfig::default()).expect("умолчания сериализуются");
     // (путь ключа, источник, значение) в порядке применения.
-    let mut leaves: Vec<(Vec<String>, String, Value)> = Vec::new();
+    let mut leaves: Vec<(Vec<String>, String, Value, Option<String>)> = Vec::new();
 
     if let Some(path) = file {
         let shown = path.display().to_string();
@@ -171,12 +171,21 @@ pub fn load(
             path: shown.clone(),
             message: e.to_string(),
         })?;
-        let table: Table = toml::from_str(&text).map_err(|e| ConfigError::Syntax {
-            path: shown.clone(),
-            message: e.to_string(),
+        let table: Table = toml::from_str(&text).map_err(|e| {
+            // Без цитаты исходника: в строке может быть секрет.
+            let place = e.span().map_or(String::new(), |sp| {
+                let before = &text.as_bytes()[..sp.start.min(text.len())];
+                let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+                let col = before.iter().rev().take_while(|&&b| b != b'\n').count() + 1;
+                format!(" (строка {line}, столбец {col})")
+            });
+            ConfigError::Syntax {
+                path: shown.clone(),
+                message: format!("{}{place}", e.message()),
+            }
         })?;
         flatten(&mut Vec::new(), &Value::Table(table), &mut |p, v| {
-            leaves.push((p, format!("file {shown}"), v));
+            leaves.push((p, format!("file {shown}"), v, None));
         });
     }
 
@@ -193,7 +202,12 @@ pub fn load(
             .split("__")
             .map(String::from)
             .collect();
-        leaves.push((path, format!("env {name}"), parse_scalar(raw)));
+        leaves.push((
+            path,
+            format!("env {name}"),
+            parse_scalar(raw),
+            Some(raw.clone()),
+        ));
     }
 
     if let Some(bind) = cli.bind {
@@ -201,6 +215,7 @@ pub fn load(
             vec!["server".into(), "bind".into()],
             "cli".into(),
             Value::String(bind.to_string()),
+            None,
         ));
     }
     if let Some(dir) = &cli.data_dir {
@@ -208,20 +223,37 @@ pub fn load(
             vec!["data_dir".into()],
             "cli".into(),
             Value::String(dir.to_string_lossy().into_owned()),
+            None,
         ));
     }
 
     let defaults = merged.clone();
-    for (path, source, value) in leaves {
+    for (path, source, mut value, raw) in leaves {
+        // Пустая таблица известной секции ничего не меняет.
+        if path.is_empty()
+            || (is_empty_table(&value) && get_path(&defaults, &path).is_some_and(Value::is_table))
+        {
+            continue;
+        }
         // Проверка значения в изоляции, чтобы указать ключ и источник.
-        let mut probe = defaults.clone();
-        set_path(&mut probe, &path, value.clone());
-        if let Err(e) = probe.try_into::<ServerConfig>() {
-            return Err(ConfigError::Invalid {
-                key: path.join("."),
-                source_name: source,
-                message: e.message().to_string(),
-            });
+        let probe_with = |v: &Value| {
+            let mut probe = defaults.clone();
+            set_path(&mut probe, &path, v.clone());
+            probe.try_into::<ServerConfig>().map(|_| ())
+        };
+        if let Err(e) = probe_with(&value) {
+            // Значение env может быть строкой, похожей на число/булево/дату.
+            let as_string = raw.map(Value::String).filter(|v| probe_with(v).is_ok());
+            match as_string {
+                Some(v) => value = v,
+                None => {
+                    return Err(ConfigError::Invalid {
+                        key: path.join("."),
+                        source_name: source,
+                        message: e.message().to_string(),
+                    });
+                }
+            }
         }
         set_path(&mut merged, &path, value);
     }
@@ -258,7 +290,7 @@ fn normalize_base_path(raw: &str) -> String {
 /// Обходит листья (всё, кроме таблиц).
 fn flatten(prefix: &mut Vec<String>, v: &Value, f: &mut impl FnMut(Vec<String>, Value)) {
     match v {
-        Value::Table(t) => {
+        Value::Table(t) if !t.is_empty() => {
             for (k, child) in t {
                 prefix.push(k.clone());
                 flatten(prefix, child, f);
@@ -267,6 +299,14 @@ fn flatten(prefix: &mut Vec<String>, v: &Value, f: &mut impl FnMut(Vec<String>, 
         }
         leaf => f(prefix.clone(), leaf.clone()),
     }
+}
+
+fn is_empty_table(v: &Value) -> bool {
+    v.as_table().is_some_and(Table::is_empty)
+}
+
+fn get_path<'a>(root: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(root, |v, k| v.as_table()?.get(k))
 }
 
 fn set_path(root: &mut Value, path: &[String], value: Value) {
@@ -511,5 +551,69 @@ mod tests {
             .join("../../deploy/config.example.toml");
         let c = load(Some(&p), &[], &Default::default()).unwrap();
         assert_eq!(c, load(None, &[], &Default::default()).unwrap());
+    }
+
+    #[test]
+    fn env_string_like_values_for_string_fields() {
+        for (raw, want) in [("123", "123"), ("true", "true"), ("nan", "nan")] {
+            let env = vec![env("ZAM_ADMIN__LOGIN", raw)];
+            let c = load(None, &env, &Default::default()).unwrap();
+            assert_eq!(c.admin.login, want);
+        }
+        let e2 = vec![
+            env("ZAM_DATA_DIR", "2024-01-01"),
+            env("ZAM_SERVER__BASE_PATH", "123"),
+        ];
+        let c = load(None, &e2, &Default::default()).unwrap();
+        assert_eq!(c.data_dir, std::path::PathBuf::from("2024-01-01"));
+        assert_eq!(c.server.base_path, "/123");
+        let e3 = vec![env("ZAM_LOG__MAX_FILES", "7")];
+        assert_eq!(
+            load(None, &e3, &Default::default()).unwrap().log.max_files,
+            7
+        );
+        let e4 = vec![env("ZAM_LOG__MAX_FILES", "abc")];
+        let e = load(None, &e4, &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("log.max_files") && e.contains("ZAM_LOG__MAX_FILES"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn empty_unknown_table_is_error() {
+        let f = write_in_target(
+            "bogus.toml",
+            "[bogus]
+",
+        );
+        let e = load(Some(&f), &[], &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("bogus"), "{e}");
+        let f = write_in_target(
+            "empty_known.toml",
+            "[server]
+[log]
+",
+        );
+        assert!(load(Some(&f), &[], &Default::default()).is_ok());
+    }
+
+    #[test]
+    fn syntax_error_does_not_quote_source() {
+        let f = write_in_target(
+            "broken.toml",
+            "[admin]
+password_hash = \"$argon2id$SECRET
+",
+        );
+        let e = load(Some(&f), &[], &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("SECRET"), "{e}");
+        assert!(e.contains("строка 2"), "{e}");
     }
 }
