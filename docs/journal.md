@@ -48,15 +48,12 @@
 - Составлен план этапа M0 (каркас и конвейер релиза): `docs/plans/2026-10-18-m0-skeleton.md`, 15 задач. Планы M1–M7 составляются по одному, после завершения предыдущего этапа.
 - Состояние машины: Rust не установлен (будет поставлен в `.toolchain/` внутри проекта), MSVC Build Tools, Node 22 и WSL2 есть, `gh` нет.
 
-- Добавлен CLI `zam` (`crates/zam-cli`): `zam --version`, `zam status [--url] [--token] [--json]` с поиском настроек (флаги, ZAM_*, CLAUDE.md/AGENTS.md вверх от cwd, `~/.zeroaimemory/config.toml`); коды выхода 0/1/2/3. Без tokio, tracing и SQLite. HTTP-клиент ureq 3: прокси из окружения (ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY) учитываются, кроме loopback-хостов; битый `~/.zeroaimemory/config.toml` — ошибка конфигурации (exit 1); файлы настроек > 1 МиБ пропускаются.
-- Замер холодного старта `zam --version` (release, Windows 11, 50 запусков через `.tmp/bench-start.ps1`): среднее 5.8 мс, p95 7.7 мс при цели ≤ 20 мс.
-
 ## 2026-10-18 — Этап M0 (каркас и конвейер релиза): итог
 - Выполнены задачи 0–14 плана `docs/plans/2026-10-18-m0-skeleton.md` на ветке `m0-skeleton`:
   - `zam-core`, `zam-store`, `zam-server` (конфигурация, SQLite, каталог данных, аутентификация, admin API), WebUI-заглушка, CLI `zam status`;
   - `cargo xtask fetch-deps|package|smoke|changelog-section`, манифесты зависимостей (Qdrant 1.19.2, ONNX Runtime 1.31.0, pdfium) с проверкой SHA-256;
   - CI (`ci.yml`: web, check, package-smoke), релизный конвейер (`release.yml`) и переиспользуемый `package.yml` (сборка, упаковка и smoke-тест для Windows x64 и Linux x64).
-- Замеры холодного старта `zam --version` (release, Windows 11, 50 запусков): среднее 5.8 мс, p95 7.7 мс при цели ≤ 20 мс.
+- Замеры холодного старта `zam --version` (release, Windows 11, 50 запусков через `.tmp/bench-start.ps1`): среднее 5.8 мс, p95 7.7 мс при цели ≤ 20 мс.
 - Локально на Windows: `cargo xtask package` и `cargo xtask smoke` — `SMOKE OK`.
 - Не проверено локально (проверяется после push):
   - Linux-комплект целиком (сборка `zam-server` под gnu и `zam` под musl на ubuntu-22.04, упаковка tar.gz, smoke);
@@ -64,3 +61,10 @@
 - Релиз: тег `v0.0.1-m0` (создаёт владелец после push ветки и зелёного CI) даст черновик GitHub Release с четырьмя архивами и `SHA256SUMS`; ссылка на релиз будет добавлена после его создания.
 - Review Task 13 исправлен: `SHA256SUMS` строится только по собранным архивам (общий файл релиза пересчитывается в job `publish`), инструкция установки Linux согласована с юнитом systemd, license-checker закреплён (5.0.1), внешние команды smoke выполняются с таймаутом 15 с.
 - Fix round 1 (ревью Task 14): статический CRT для Windows (exe не требуют VC Redistributable; smoke проверяет `dumpbin /dependents`), версия workspace `0.0.1-m0` с проверкой тега в `release.yml`, хэш коммита 12 символов, job `test` перед publish, `concurrency` в `ci.yml`.
+- Финальное ревью ветки, волна исправлений:
+  - C1: `zam-server` падал при `ZAM_GIT_SHA` в окружении CI («unknown field git_sha») — smoke в CI не прошёл бы ни на одной ОС. Сборочные переменные (`ZAM_GIT_SHA`, `ZAM_WEB_REBUILD`, `ZAM_WEB_INDEX`, `ZAM_VCRUNTIME_DLL`) исключены из слоя конфигурации, `ZAM_GIT_SHA` задаётся только на шагах `cargo build`, smoke и e2e запускают сервер без `ZAM_*` родителя (кроме `ZAM_ADMIN_PASSWORD`). Локально: `ZAM_GIT_SHA=abc` + package + smoke — `SMOKE OK`.
+  - Критерий M0 «`zam status` с токеном из CLAUDE.md → код 0» покрыт шагом smoke (без флагов, из подкаталога, чистое окружение и пустой домашний каталог; источник URL и токена — файл).
+  - WebUI проверен в браузере: Playwright + установленный Edge (`npm run e2e`), страница по LAN-IP без secure context; «Копировать» работает через запасной путь `execCommand('copy')` (Clipboard API по HTTP недоступен).
+  - Тексты лицензий пакетов бандла WebUI (rollup-plugin-license 3.7.1) — `LICENSES/THIRD-PARTY-WEB-NOTICES.txt`; тулчейн закреплён на 1.99.1; README-install: интерактивный `hash-password`, раздел про Traefik, порядок поиска настроек `zam` (`CLAUDE.local.md` → `CLAUDE.md` → `AGENTS.md`).
+  - Мелкие: маска в `Debug` у `NewToken`, первый токен восстанавливается только если у администратора нет ни одного токена, комментарий `audit.actor`, тест логов с отозванным токеном, многострочные литералы заменены на `\n`.
+- Итог M0: все критерии этапа проверены локально на Windows (тесты, fmt, clippy, actionlint, check/build/size-limit WebUI, package + smoke, e2e WebUI). Не проверены до push: Linux-комплект и реальный прогон GitHub Actions.

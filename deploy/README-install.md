@@ -19,13 +19,21 @@ Qdrant (`qdrant/<версия>/`), пример конфигурации `config
 
 Администратор задаётся не в базе данных, а в конфигурации. Два варианта:
 
-1. Хэш пароля в `config.toml` (рекомендуется):
+1. Хэш пароля в `config.toml` (рекомендуется). Запустите команду без аргументов и введите
+   пароль в ответ на приглашение (ввод не отображается и не попадает в историю оболочки):
 
    ```
-   echo "мой-пароль" | zam-server hash-password
+   zam-server hash-password
    ```
 
-   Результат (`$argon2id$...`) вставьте в `[admin] password_hash`.
+   Результат (`$argon2id$...`) вставьте в `[admin] password_hash`. Не передавайте пароль
+   через `echo ... |`: в Windows PowerShell 5.1 конвейер меняет кодировку не-ASCII символов,
+   `cmd` добавляет к паролю пробел перед `|`, а сама команда остаётся в истории.
+   Для скриптов в Linux — чтение без отображения:
+
+   ```
+   read -rs -p 'Пароль: ' PW && echo >&2 && printf '%s\n' "$PW" | zam-server hash-password; unset PW
+   ```
 2. Переменная окружения `ZAM_ADMIN_PASSWORD` (пароль хэшируется в памяти; удобно для проверки).
 
 Скопируйте `config.example.toml` в `config.toml`, при необходимости измените значения и запустите:
@@ -59,6 +67,20 @@ zam status --url http://127.0.0.1:7700 --token <токен>
 Коды выхода `zam status`: 0 — всё в порядке, 1 — ошибка конфигурации,
 2 — сервер недоступен, 3 — токен отклонён.
 
+Без флагов `zam` ищет адрес и токен по порядку: `--url`/`--token`, переменные `ZAM_URL`/`ZAM_TOKEN`,
+блок в файлах проекта от текущего каталога вверх (ближайший каталог важнее; внутри каталога —
+`CLAUDE.local.md`, затем `CLAUDE.md`, затем `AGENTS.md`), затем `~/.zeroaimemory/config.toml`.
+Адрес и токен ищутся независимо. Блок в `CLAUDE.md`:
+
+```
+<!-- zeroaimemory:begin v1 -->
+ZeroAIMemoryUrl=http://<хост>:7700
+ZeroAIMemoryToken=<токен>
+<!-- zeroaimemory:end -->
+```
+
+Личный токен удобнее держать в `CLAUDE.local.md` (обычно не коммитится).
+
 ## Windows
 
 1. Распакуйте архив `zam-server-<версия>-windows-x64-cpu.zip`, например в `C:\ZeroAIMemory`.
@@ -91,7 +113,7 @@ zam status --url http://127.0.0.1:7700 --token <токен>
    ```
 
    В `config.toml` укажите `data_dir = "/var/lib/zeroaimemory"` и `[admin] password_hash`
-   (хэш: `echo "пароль" | /opt/zeroaimemory/zam-server hash-password`).
+   (хэш: `/opt/zeroaimemory/zam-server hash-password`, пароль вводится по приглашению).
 3. Установите юнит systemd и запустите службу:
 
    ```
@@ -105,6 +127,57 @@ zam status --url http://127.0.0.1:7700 --token <токен>
    (таймаут 20 с).
 4. `zam-server` собран под `x86_64-unknown-linux-gnu` на Ubuntu 22.04 (glibc 2.35 и новее);
    `zam` — статический (musl).
+
+## За обратным прокси (Traefik)
+
+Сервер можно опубликовать по HTTPS под префиксом пути, например `https://example.com/memory`.
+
+1. В `config.toml` сервера:
+
+   ```
+   [server]
+   bind = "0.0.0.0:7700"
+   public_url = "https://example.com/memory"
+   base_path = "/memory"                 # префикс без завершающего "/"
+   trusted_proxies = ["172.18.0.2"]      # адрес (или подсеть) Traefik, как его видит сервер
+   ```
+
+   `X-Forwarded-For` и `X-Forwarded-Proto` принимаются только от адресов из `trusted_proxies`:
+   по ним определяются IP клиента (лимиты и аудит) и HTTPS. Если последний `X-Forwarded-Proto`
+   от доверенного прокси равен `https`, cookie сессии WebUI получает атрибут `Secure`.
+   Без `trusted_proxies` все клиенты за прокси выглядят как один IP (сервер один раз
+   предупреждает об этом в журнале), а cookie остаётся без `Secure`.
+2. Traefik передаёт путь как есть: префикс **не** срезается (`StripPrefix` не нужен), сервер
+   сам обслуживает маршруты под `base_path`. Пример меток Docker:
+
+   ```
+   labels:
+     - traefik.enable=true
+     - traefik.http.routers.zam.rule=Host(`example.com`) && PathPrefix(`/memory`)
+     - traefik.http.routers.zam.entrypoints=websecure
+     - traefik.http.routers.zam.tls=true
+     - traefik.http.services.zam.loadbalancer.server.port=7700
+   ```
+
+   Тот же маршрут в файловом провайдере (`dynamic.yml`):
+
+   ```
+   http:
+     routers:
+       zam:
+         rule: "Host(`example.com`) && PathPrefix(`/memory`)"
+         entryPoints: [websecure]
+         tls: {}
+         service: zam
+     services:
+       zam:
+         loadBalancer:
+           servers:
+             - url: "http://10.0.0.5:7700"
+   ```
+
+   Traefik по умолчанию добавляет `X-Forwarded-For` и `X-Forwarded-Proto`.
+3. Клиенты указывают полный адрес с префиксом: `ZeroAIMemoryUrl=https://example.com/memory`.
 
 ## Обновление
 
