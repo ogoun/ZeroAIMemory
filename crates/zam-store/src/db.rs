@@ -2,6 +2,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -20,6 +21,18 @@ struct ReaderPool {
     path: PathBuf,
     conns: Mutex<Vec<Connection>>,
     sem: Arc<Semaphore>,
+    // Число живых соединений (в пуле и выданных).
+    live: AtomicUsize,
+}
+
+impl ReaderPool {
+    /// Одно соединение потеряно безвозвратно. Если живых не осталось, закрываем
+    /// семафор: иначе `read()` навсегда завис бы на `acquire_owned`; теперь он вернёт `Closed`.
+    fn shrink(&self) {
+        if self.live.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.sem.close();
+        }
+    }
 }
 
 /// Соединение из пула; возвращается обратно при drop, в том числе при панике.
@@ -53,6 +66,7 @@ impl Drop for PooledConn {
                     if let Some(p) = self.permit.take() {
                         p.forget();
                     }
+                    self.pool.shrink();
                     return;
                 }
             }
@@ -74,6 +88,13 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // Сначала закрываем читателей: писатель должен закрыться последним,
+        // тогда SQLite делает checkpoint и удаляет -wal/-shm.
+        self.readers
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         drop(self.writer.take());
         if let Some(h) = self.thread.take() {
             // Если последний Db уничтожается внутри самого писателя — join невозможен.
@@ -144,6 +165,7 @@ impl Db {
                     path: path.to_path_buf(),
                     conns: Mutex::new(readers),
                     sem: Arc::new(Semaphore::new(READERS)),
+                    live: AtomicUsize::new(READERS),
                 }),
             }),
         })
@@ -211,3 +233,22 @@ const _: fn() = || {
     fn check<T: Send + Sync>() {}
     check::<Db>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_pool_closes_semaphore() {
+        let pool = ReaderPool {
+            path: PathBuf::new(),
+            conns: Mutex::new(Vec::new()),
+            sem: Arc::new(Semaphore::new(2)),
+            live: AtomicUsize::new(2),
+        };
+        pool.shrink();
+        assert!(pool.sem.clone().acquire_owned().await.is_ok());
+        pool.shrink();
+        assert!(pool.sem.clone().acquire_owned().await.is_err());
+    }
+}

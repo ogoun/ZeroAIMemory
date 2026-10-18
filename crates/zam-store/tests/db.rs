@@ -228,3 +228,34 @@ fn invalid_migration_lists_are_rejected() {
         assert!(matches!(r, Err(StoreError::InvalidMigrations(_))), "{n}");
     }
 }
+
+#[tokio::test]
+async fn drop_checkpoints_wal_and_data_survives_rename() {
+    let p = tmp("ckpt");
+    let db = Db::open(&p, MIGS).unwrap();
+    for i in 0..200 {
+        db.write(move |t| {
+            t.execute("INSERT INTO t VALUES(?1)", [i])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    // Читатели должны побывать в работе, иначе тест не проверяет порядок закрытия.
+    db.read(|c| Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))?))
+        .await
+        .unwrap();
+    drop(db);
+    let mut wal = p.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    assert!(!wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0);
+    let moved = p.with_file_name("moved.db");
+    std::fs::rename(&p, &moved).unwrap();
+    let db2 = Db::open(&moved, MIGS).unwrap();
+    let n: i64 = db2
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(n, 201); // 200 + строка из миграции 2
+}
