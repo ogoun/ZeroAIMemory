@@ -17,7 +17,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  ZAM_GIT_SHA: ${{ github.sha }}
 
 jobs:
   package:
@@ -59,8 +58,10 @@ jobs:
       - name: musl-tools
         if: matrix.platform == 'linux-x64'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: dtolnay/rust-toolchain@stable
+      # Версия совпадает с rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -73,11 +74,16 @@ jobs:
           key: deps-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
       - name: fetch-deps
         run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
+      # ZAM_GIT_SHA — только на шагах сборки: это сборочная переменная build.rs.
       - name: build (windows)
         if: matrix.platform == 'windows-x64'
+        env:
+          ZAM_GIT_SHA: ${{ github.sha }}
         run: cargo build --release -p zam-server -p zam-cli
       - name: build (linux)
         if: matrix.platform == 'linux-x64'
+        env:
+          ZAM_GIT_SHA: ${{ github.sha }}
         run: |
           cargo build --release -p zam-server
           cargo build --release -p zam-cli --target x86_64-unknown-linux-musl

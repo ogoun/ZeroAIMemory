@@ -53,8 +53,9 @@ jobs:
         with:
           name: web-dist
           path: web/dist
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: fmt

@@ -9,12 +9,17 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml::{Table, Value};
 
-/// Переменные `ZAM_*`, которые не являются слоем конфигурации.
-const RESERVED_ENV: [&str; 4] = [
+/// Переменные `ZAM_*`, которые не являются слоем конфигурации:
+/// секреты и адрес клиента, а также сборочные (build.rs, xtask), попадающие в окружение CI.
+const RESERVED_ENV: [&str; 8] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
     "ZAM_MASTER_KEY",
+    "ZAM_GIT_SHA",
+    "ZAM_WEB_REBUILD",
+    "ZAM_WEB_INDEX",
+    "ZAM_VCRUNTIME_DLL",
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -429,6 +434,21 @@ mod tests {
     }
 
     #[test]
+    fn build_env_are_skipped() {
+        // Сборочные переменные CI/разработчика не должны ломать запуск сервера.
+        let env = vec![
+            env("ZAM_GIT_SHA", "abc"),
+            env("ZAM_WEB_REBUILD", "1"),
+            env("ZAM_WEB_INDEX", "/x/index.html"),
+            env("ZAM_VCRUNTIME_DLL", "C:/x/vcruntime140.dll"),
+        ];
+        assert_eq!(
+            load(None, &env, &Default::default()).unwrap(),
+            ServerConfig::default()
+        );
+    }
+
+    #[test]
     fn unknown_env_key_is_error() {
         let env = vec![env("ZAM_SERVER__BINDD", "1")];
         let e = load(None, &env, &Default::default())
@@ -584,21 +604,12 @@ mod tests {
 
     #[test]
     fn empty_unknown_table_is_error() {
-        let f = write_in_target(
-            "bogus.toml",
-            "[bogus]
-",
-        );
+        let f = write_in_target("bogus.toml", "[bogus]\n");
         let e = load(Some(&f), &[], &Default::default())
             .unwrap_err()
             .to_string();
         assert!(e.contains("bogus"), "{e}");
-        let f = write_in_target(
-            "empty_known.toml",
-            "[server]
-[log]
-",
-        );
+        let f = write_in_target("empty_known.toml", "[server]\n[log]\n");
         assert!(load(Some(&f), &[], &Default::default()).is_ok());
     }
 
@@ -606,9 +617,7 @@ mod tests {
     fn syntax_error_does_not_quote_source() {
         let f = write_in_target(
             "broken.toml",
-            "[admin]
-password_hash = \"$argon2id$SECRET
-",
+            "[admin]\npassword_hash = \"$argon2id$SECRET\n",
         );
         let e = load(Some(&f), &[], &Default::default())
             .unwrap_err()
