@@ -1,0 +1,358 @@
+//! Чтение узла: `GET /nodes/{id}`, `GET /nodes/by-path`, `GET /nodes/{id}/outline`.
+//!
+//! Параметры `GET /nodes/{id}` (и `by-path`):
+//! - `format=json` (по умолчанию) → `{node, content, rev}`;
+//! - `format=md` → байты ревизии как сохранены (`text/markdown`, `ETag: "<rev>"`);
+//! - `format=html` → `{html, toc, warnings, rev}` из кэша рендера;
+//! - `tier=L0` → `{l0, rev}` (сводка текущей ревизии);
+//! - `tier=L1` → `{l1, rev}`: оглавление и первое предложение каждой секции, ≤ 1200
+//!   символов простого текста **[решение исполнителя до M2]**; `L2` — полный текст;
+//! - `section="A > B"` → только байты секции (нет — 404, неоднозначно — 422);
+//! - `rev=N` → старая ревизия.
+use axum::Json;
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, header};
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use zam_markdown::{OutlineItem, first_paragraph, outline as doc_outline, parse};
+use zam_store::{NodeKind, NodePath, get_node_by_path, node_content};
+
+use crate::api::query;
+use crate::api::render::{RenderCtx, Viewer, cache_get, cache_key, render, render_cached};
+use crate::api::scope::{Mode, NodeScope, live, node_scope, space_scope};
+use crate::app::AppState;
+use crate::auth::Principal;
+use crate::error::ApiError;
+
+/// Предел длины L1, символов.
+const L1_MAX_CHARS: usize = 1200;
+/// Предел длины первого предложения секции в L1, символов.
+const L1_SENTENCE_MAX_CHARS: usize = 200;
+
+#[derive(Deserialize, Default)]
+pub struct ReadQuery {
+    format: Option<String>,
+    tier: Option<String>,
+    section: Option<String>,
+    rev: Option<i64>,
+    /// Только для `by-path`.
+    space: Option<String>,
+    /// Только для `by-path`.
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Json,
+    Md,
+    Html,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    L0,
+    L1,
+    L2,
+}
+
+fn parse_format(s: Option<&str>) -> Result<Format, ApiError> {
+    match s.unwrap_or("json") {
+        "json" => Ok(Format::Json),
+        "md" => Ok(Format::Md),
+        "html" => Ok(Format::Html),
+        _ => Err(ApiError::BadRequest("format: json, md или html".into())),
+    }
+}
+
+fn parse_tier(s: Option<&str>) -> Result<Tier, ApiError> {
+    match s.map(str::to_ascii_uppercase).as_deref() {
+        None | Some("L2") => Ok(Tier::L2),
+        Some("L0") => Ok(Tier::L0),
+        Some("L1") => Ok(Tier::L1),
+        _ => Err(ApiError::BadRequest("tier: L0, L1 или L2".into())),
+    }
+}
+
+pub async fn by_id(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    q: Result<Query<ReadQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let q = query(q)?;
+    let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
+    read(&st, &p, sc, q).await
+}
+
+pub async fn by_path(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    q: Result<Query<ReadQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let q = query(q)?;
+    let (Some(space), Some(path)) = (q.space.as_deref(), q.path.as_deref()) else {
+        return Err(ApiError::BadRequest("нужны параметры space и path".into()));
+    };
+    let sc = space_scope(&st, &p, &headers, space, Mode::Read).await?;
+    let node = get_node_by_path(&sc.db, sc.space.id, &NodePath::parse(path)?).await?;
+    let ns = NodeScope {
+        user: sc.user,
+        db: sc.db,
+        space: sc.space,
+        node,
+    };
+    read(&st, &p, ns, q).await
+}
+
+/// `GET /nodes/{id}/outline` → `[OutlineItem]` текущей ревизии.
+pub async fn outline(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<OutlineItem>>, ApiError> {
+    let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
+    live(&sc)?;
+    if sc.node.kind == NodeKind::Folder {
+        return Ok(Json(Vec::new()));
+    }
+    let (_, text) = node_content(&sc.db, sc.node.id, None).await?;
+    Ok(Json(doc_outline(&parse(&text))))
+}
+
+async fn read(
+    st: &AppState,
+    p: &Principal,
+    sc: NodeScope,
+    q: ReadQuery,
+) -> Result<Response, ApiError> {
+    // Доступ уже проверен в node_scope / space_scope.
+    live(&sc)?;
+    let format = parse_format(q.format.as_deref())?;
+    let tier = parse_tier(q.tier.as_deref())?;
+    let node = &sc.node;
+    let ctx = RenderCtx {
+        space: sc.space.id,
+        viewer: Viewer::of(st, p, sc.user.id),
+    };
+    if tier == Tier::L0 {
+        return Ok(Json(json!({ "l0": node.l0, "rev": node.current_rev })).into_response());
+    }
+    if node.kind == NodeKind::Folder {
+        return match (tier, format) {
+            (Tier::L2, Format::Json) => {
+                Ok(Json(json!({ "node": node, "content": null, "rev": 0 })).into_response())
+            }
+            _ => Err(ApiError::BadRequest("узел — папка: текста нет".into())),
+        };
+    }
+    let current = q.rev.is_none_or(|r| r == node.current_rev);
+
+    // Попадание в кэш HTML текущей ревизии — без чтения текста.
+    if tier == Tier::L2
+        && format == Format::Html
+        && q.section.is_none()
+        && current
+        && let Some(hash) = &node.content_hash
+        && let Some(r) = cache_get(
+            st,
+            &cache_key(st, hash, sc.space.id, sc.user.id, ctx.viewer),
+        )
+    {
+        return Ok(html_json(&r, node.current_rev));
+    }
+
+    // Ровно та ревизия, что в снимке узла: иначе запись между чтением узла и текста
+    // дала бы текст rev N+1 при `node`/хэше rev N (и отравила бы кэш HTML).
+    let (rev, text) =
+        node_content(&sc.db, node.id, Some(q.rev.unwrap_or(node.current_rev))).await?;
+    let (text, whole) = match q.section.as_deref() {
+        Some(path) => (section_slice(&text, path)?.to_string(), false),
+        None => (text, true),
+    };
+    if tier == Tier::L1 {
+        return Ok(Json(json!({ "l1": l1(&text), "rev": rev })).into_response());
+    }
+    Ok(match format {
+        Format::Md => markdown_response(text, rev),
+        Format::Json => Json(json!({ "node": node, "content": text, "rev": rev })).into_response(),
+        Format::Html if whole => {
+            let hash = key_hash(node, rev, &text);
+            let key = cache_key(st, &hash, sc.space.id, sc.user.id, ctx.viewer);
+            let r = render_cached(st, key, &sc.db, ctx, text).await?;
+            html_json(&r, rev)
+        }
+        // Секция рендерится без кэша: ключ по хэшу заметки ей не подходит.
+        Format::Html => html_json(&render(&sc.db, Some(ctx), text).await?, rev),
+    })
+}
+
+fn html_json(r: &zam_markdown::Rendered, rev: i64) -> Response {
+    Json(json!({ "html": r.html, "toc": r.toc, "warnings": r.warnings, "rev": rev }))
+        .into_response()
+}
+
+/// Текст ревизии как есть: `text/markdown; charset=utf-8`, `ETag: "<rev>"`.
+pub(crate) fn markdown_response(text: String, rev: i64) -> Response {
+    let mut r = text.into_response();
+    let h = r.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/markdown; charset=utf-8"),
+    );
+    h.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{rev}\"")).expect("число — допустимый заголовок"),
+    );
+    r
+}
+
+/// Хэш для ключа кэша — по ревизии, текст которой действительно прочитан:
+/// `content_hash` узла годится только для его `current_rev` (ревизии неизменяемы).
+fn key_hash(node: &zam_store::Node, rev_read: i64, text: &str) -> String {
+    match &node.content_hash {
+        Some(h) if rev_read == node.current_rev => h.clone(),
+        _ => sha256_hex(text.as_bytes()),
+    }
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
+}
+
+/// Байты секции `path` (весь её диапазон, с заголовком и подсекциями).
+/// Нет секции → 404, путь у нескольких секций → 422.
+fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
+    let want: Vec<&str> = path.split('>').map(str::trim).collect();
+    if want.iter().any(|p| p.is_empty()) {
+        return Err(ApiError::NotFound);
+    }
+    let doc = parse(text);
+    let mut found = doc
+        .sections
+        .iter()
+        .filter(|s| s.level > 0 && s.path.iter().map(String::as_str).eq(want.iter().copied()));
+    let s = found.next().ok_or(ApiError::NotFound)?;
+    if found.next().is_some() {
+        return Err(ApiError::Unprocessable(format!(
+            "путь секции неоднозначен: {path}"
+        )));
+    }
+    text.get(s.range.clone()).ok_or(ApiError::NotFound)
+}
+
+/// L1: по строке на секцию — `#… Заголовок: первое предложение` собственного текста
+/// секции (до первой подсекции); обрезается до 1200 символов.
+fn l1(text: &str) -> String {
+    let doc = parse(text);
+    let sections: Vec<_> = doc.sections.iter().filter(|s| s.level > 0).collect();
+    let mut lines = Vec::with_capacity(sections.len());
+    for (i, s) in sections.iter().enumerate() {
+        let own_end = sections
+            .get(i + 1)
+            .map_or(s.range.end, |n| n.range.start.min(s.range.end))
+            .max(s.body.start);
+        let own = text.get(s.body.start..own_end).unwrap_or("");
+        let mut line = format!("{} {}", "#".repeat(s.level as usize), s.title);
+        if let Some(p) = first_paragraph(own, &parse(own)) {
+            line.push_str(": ");
+            line.push_str(&first_sentence(&p));
+        }
+        lines.push(line);
+    }
+    let all = lines.join("\n");
+    match all.char_indices().nth(L1_MAX_CHARS) {
+        Some((cut, _)) => all[..cut].to_string(),
+        None => all,
+    }
+}
+
+/// Первое предложение: до `.`, `!`, `?` или `…`, за которыми пробел или конец;
+/// не длиннее 200 символов.
+fn first_sentence(p: &str) -> String {
+    let mut out = String::new();
+    let mut chars = p.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if matches!(c, '.' | '!' | '?' | '…') && chars.peek().is_none_or(|n| n.is_whitespace()) {
+            break;
+        }
+        if out.chars().count() >= L1_SENTENCE_MAX_CHARS {
+            out.push('…');
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_hash_follows_revision_read() {
+        let now = jiff::Timestamp::now();
+        let text = "текст rev 1
+";
+        let node = zam_store::Node {
+            id: zam_core::Id::new(),
+            space_id: zam_core::Id::new(),
+            parent_id: None,
+            kind: NodeKind::Note,
+            name: "n".into(),
+            path: "n".into(),
+            current_rev: 2,
+            content_hash: Some("hash-of-rev-2".into()),
+            frontmatter: None,
+            l0: None,
+            l0_source: None,
+            index_state: "pending".into(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            has_children: false,
+        };
+        assert_eq!(key_hash(&node, 2, "что угодно"), "hash-of-rev-2");
+        // прочитана другая ревизия — ключ по её собственному тексту
+        assert_eq!(key_hash(&node, 1, text), sha256_hex(text.as_bytes()));
+        assert_eq!(key_hash(&node, 3, text), sha256_hex(text.as_bytes()));
+    }
+
+    #[test]
+    fn sentence_cut() {
+        assert_eq!(first_sentence("Раз. Два."), "Раз.");
+        assert_eq!(first_sentence("v1.2 вышла! Да"), "v1.2 вышла!");
+        assert_eq!(first_sentence("без точки"), "без точки");
+        assert_eq!(first_sentence(&"я".repeat(300)).chars().count(), 201);
+    }
+
+    #[test]
+    fn l1_outline_and_limit() {
+        let t = "# A\nПервое. Второе.\n## B\nТекст B.\n# C\n";
+        assert_eq!(l1(t), "# A: Первое.\n## B: Текст B.\n# C");
+        let big: String = (0..200)
+            .map(|i| format!("# Заголовок {i}\nТекст.\n"))
+            .collect();
+        assert_eq!(l1(&big).chars().count(), L1_MAX_CHARS);
+    }
+
+    #[test]
+    fn section_slice_cases() {
+        let t = "# A\nx\n## B\ny\n# A\nz\n";
+        assert_eq!(section_slice(t, "A > B").unwrap(), "## B\ny\n");
+        assert!(matches!(
+            section_slice(t, "A"),
+            Err(ApiError::Unprocessable(_))
+        ));
+        assert!(matches!(section_slice(t, "Q"), Err(ApiError::NotFound)));
+        assert!(matches!(section_slice(t, "A >"), Err(ApiError::NotFound)));
+    }
+}

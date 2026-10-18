@@ -17,3 +17,5 @@
 *.pdf binary
 *.docx binary
 *.xlsx binary
+# Golden-фикстуры Markdown хранятся побайтно: диапазоны зависят от CRLF и BOM
+crates/zam-markdown/tests/golden/*.md -text

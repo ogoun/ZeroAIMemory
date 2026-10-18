@@ -79,3 +79,27 @@ async fn migrate_on_open_backup() {
         .unwrap();
     assert_eq!(marker, 42);
 }
+
+#[tokio::test]
+async fn solutions_idempotent_and_lookup() {
+    use zam_store::{create_solution, get_solution, get_space, space_of_kind};
+    let dd = datadir("solutions");
+    let db = UserDbs::new(dd.users_dir()).get(Id::new()).await.unwrap();
+    let guid = "0b3c2a8e-6f1d-4c5e-9a7b-1d2e3f405162";
+    let (s, created) = create_solution(&db, guid, "Проект").await.unwrap();
+    assert!(created);
+    assert_eq!(s.kind, SpaceKind::Solution);
+    assert_eq!(s.solution_guid.as_deref(), Some(guid));
+    assert_eq!(s.name, "Проект");
+    // повтор: тот же id, имя не меняется
+    let (again, created) = create_solution(&db, guid, "Другое").await.unwrap();
+    assert!(!created);
+    assert_eq!(again, s);
+    assert_eq!(get_solution(&db, guid).await.unwrap(), Some(s.clone()));
+    assert_eq!(get_solution(&db, "nope").await.unwrap(), None);
+    assert_eq!(get_space(&db, s.id).await.unwrap(), Some(s.clone()));
+    assert_eq!(get_space(&db, Id::new()).await.unwrap(), None);
+    let k = space_of_kind(&db, SpaceKind::Knowledge).await.unwrap();
+    assert_eq!(k.kind, SpaceKind::Knowledge);
+    assert_eq!(list_spaces(&db).await.unwrap().len(), 4);
+}

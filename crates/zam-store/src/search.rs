@@ -1,0 +1,604 @@
+//! Полнотекстовый поиск по чанкам (§9.2 ТЗ, канал (b)): FTS5 без моделей.
+//!
+//! - Канал A — `chunks_fts` (unicode61, `bm25` с весами колонок text 1.0,
+//!   heading_path 0.5, context_prefix 0.3), top 50. Сначала строгий запрос
+//!   (все слова), при пустой выдаче — ослабленный (любое слово). Префиксный
+//!   поиск (`"слово"*`) — только для слов от 3 символов: префикс из 1–2 букв
+//!   раскрывается в тысячи термов и стоит секунды.
+//! - Канал B — `chunks_fts_tri` (trigram), top 20: подстроки-идентификаторы
+//!   запроса (токен ≥ 3 символов с `_ . / - :` или цифрами) через OR; если
+//!   идентификаторов нет — вся фраза, и только когда канал A ничего не нашёл.
+//! - Слияние weighted RRF (k = 60, веса 1.0 и 0.7), не больше 3 чанков на узел, top_k.
+//!
+//! Выборка двухшаговая в одной читающей транзакции: каналы отбирают только
+//! `rowid` и узел (глобальный top с запасом из индекса FTS, затем фильтр области;
+//! если в области осталось мало — точный запрос с фильтром), текст, метаданные
+//! и `snippet()` читаются лишь для итоговых top_k. Фильтр области (пространства,
+//! префикс пути, живые узлы) действует до отсечения top-N канала.
+
+use std::collections::HashMap;
+
+use jiff::Timestamp;
+use rusqlite::{Connection, ToSql, params, params_from_iter};
+use zam_core::Id;
+
+use crate::time::ts_at;
+use crate::{Db, StoreError};
+
+/// Маркеры подсветки в `snippet` (Private Use Area: в тексте заметок не встречаются,
+/// клиент заменяет их на свою разметку).
+pub const MARK_START: char = '\u{E000}';
+pub const MARK_END: char = '\u{E001}';
+
+/// Предел длины запроса в символах.
+pub const QUERY_MAX_CHARS: usize = 512;
+
+/// Константа RRF.
+const RRF_K: f64 = 60.0;
+/// Вес канала bm25 (unicode61).
+const W_BM25: f64 = 1.0;
+/// Вес канала trigram.
+const W_TRIGRAM: f64 = 0.7;
+/// Кандидатов из канала bm25.
+const BM25_LIMIT: i64 = 50;
+/// Кандидатов из канала trigram.
+const TRIGRAM_LIMIT: i64 = 20;
+/// Во сколько раз больше кандидатов канала отбирается до фильтра области.
+const OVERSAMPLE: i64 = 8;
+/// Не больше чанков с одного узла (§9.2 п.6).
+const PER_NODE_CAP: usize = 3;
+/// Предел `top_k`.
+const TOP_K_MAX: usize = 100;
+/// Слов в запросе FTS: остальные отбрасываются, чтобы стоимость запроса была ограничена.
+const MAX_TERMS: usize = 32;
+/// Минимальная длина (в символах) слова для префиксного поиска и подстроки trigram.
+const MIN_PREFIX_CHARS: usize = 3;
+/// Токенов в сниппете канала bm25.
+const SNIPPET_TOKENS: i64 = 16;
+/// Длина сниппета trigram-хита в символах (без многоточий).
+const SNIPPET_CHARS: usize = 160;
+
+/// Запрос полнотекстового поиска.
+#[derive(Debug, Clone)]
+pub struct FtsQuery {
+    /// Текст запроса как прислан, до 512 символов: синтаксис FTS5 в нём не действует.
+    pub text: String,
+    /// Разрешённые пространства; пусто → `BadInput`.
+    pub space_ids: Vec<Id>,
+    /// Префикс пути: сам узел `prefix` и всё под `prefix/`. Регистр учитывается.
+    pub path_prefix: Option<String>,
+    /// Размер выдачи, 1..=100.
+    pub top_k: usize,
+}
+
+/// Найденный чанк.
+#[derive(Debug, Clone)]
+pub struct FtsHit {
+    pub chunk_id: String,
+    pub node_id: Id,
+    pub space_id: Id,
+    pub path: String,
+    pub heading_path: String,
+    /// Ревизия, по которой построен чанк.
+    pub rev: i64,
+    /// Слитый RRF-балл (больше — лучше).
+    pub score: f64,
+    pub updated_at: Timestamp,
+    /// Фрагмент с совпадениями между [`MARK_START`] и [`MARK_END`].
+    pub snippet: String,
+    /// Полный текст чанка (обрезку под бюджет делает сервер).
+    pub text: String,
+}
+
+/// Слова запроса: всё, что не буква и не цифра (Unicode), — разделитель.
+fn terms(query: &str) -> Vec<&str> {
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .take(MAX_TERMS)
+        .collect()
+}
+
+/// Строка в кавычках FTS5 (кавычки внутри удваиваются): операторы теряют смысл.
+fn quote(t: &str) -> String {
+    format!("\"{}\"", t.replace('"', "\"\""))
+}
+
+/// Слово как терм FTS5: от [`MIN_PREFIX_CHARS`] символов — префиксный (`"слово"*`),
+/// короче — точный.
+fn quote_term(t: &str) -> String {
+    let q = quote(t);
+    if t.chars().count() >= MIN_PREFIX_CHARS {
+        q + "*"
+    } else {
+        q
+    }
+}
+
+/// Безопасный запрос FTS5: каждое слово в кавычках, от 3 символов — с префиксом
+/// (`"слово"*`), слова через пробел (неявный AND). Синтаксис FTS5 во входе
+/// (`"`, `*`, `AND`, `-`, `:`, `(`, `NEAR`) не действует. `None` — в запросе нет слов.
+pub fn sanitize_fts(query: &str) -> Option<String> {
+    join_terms(query, " ")
+}
+
+/// Ослабленный вариант [`sanitize_fts`]: слова через `OR`.
+fn sanitize_fts_any(query: &str) -> Option<String> {
+    join_terms(query, " OR ")
+}
+
+fn join_terms(query: &str, sep: &str) -> Option<String> {
+    let t = terms(query);
+    if t.is_empty() {
+        return None;
+    }
+    Some(t.into_iter().map(quote_term).collect::<Vec<_>>().join(sep))
+}
+
+/// Идентификаторы и код в запросе: токены через пробелы без обрамляющей
+/// пунктуации, от 3 символов, с `_ . / - :` или цифрами.
+fn identifiers(query: &str) -> Vec<&str> {
+    query
+        .split_whitespace()
+        .map(|t| t.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_'))
+        .filter(|t| {
+            t.chars().count() >= MIN_PREFIX_CHARS
+                && t.chars()
+                    .any(|ch| matches!(ch, '_' | '.' | '/' | '-' | ':') || ch.is_ascii_digit())
+        })
+        .take(MAX_TERMS)
+        .collect()
+}
+
+/// Запрос канала trigram и подстроки для сниппета. Идентификаторы — через OR;
+/// без идентификаторов — вся фраза, если `bm25_empty` и в ней не меньше 3 символов
+/// (короче trigram не ищет). `None` — канал не запускается.
+fn trigram_query(query: &str, bm25_empty: bool) -> Option<(String, Vec<&str>)> {
+    let ids = identifiers(query);
+    if !ids.is_empty() {
+        let fts = ids
+            .iter()
+            .map(|t| quote(t))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        return Some((fts, ids));
+    }
+    let phrase = query.trim();
+    (bm25_empty && phrase.chars().count() >= MIN_PREFIX_CHARS)
+        .then(|| (quote(phrase), vec![phrase]))
+}
+
+/// Канал поиска.
+#[derive(Clone, Copy)]
+enum Channel {
+    Bm25,
+    Trigram,
+}
+
+/// `?start, ?start+1, …` — `n` параметров.
+fn placeholders(start: usize, n: usize) -> String {
+    (start..start + n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Таблица FTS, ранжирование и размер выдачи канала.
+fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
+    match ch {
+        Channel::Bm25 => ("chunks_fts", "bm25(chunks_fts, 1.0, 0.5, 0.3)", BM25_LIMIT),
+        Channel::Trigram => ("chunks_fts_tri", "bm25(chunks_fts_tri)", TRIGRAM_LIMIT),
+    }
+}
+
+/// Условие области для `chunks c JOIN nodes n`: `?2` — префикс пути или NULL,
+/// пространства — с `?3`. Префикс сравнивается через substr, а не LIKE: LIKE
+/// в SQLite нечувствителен к регистру ASCII и требует экранирования `%` и `_`.
+fn scope_sql(n_spaces: usize) -> String {
+    format!(
+        "n.deleted_at IS NULL
+         AND n.space_id IN ({})
+         AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
+        placeholders(3, n_spaces)
+    )
+}
+
+/// JSON-массив чисел для `json_each`: один текст SQL при любом размере списка.
+/// Запросы по такому списку и по MATCH используют `CROSS JOIN` — он фиксирует
+/// порядок соединения в SQLite: при одном пространстве планировщик иначе
+/// обходит все узлы пространства по индексу (`nodes_parent`), что в десятки раз дольше.
+fn json_ids(ids: &[i64]) -> String {
+    let items: Vec<String> = ids.iter().map(i64::to_string).collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Выполняет канал: `(seq, node_id)` по убыванию релевантности канала.
+///
+/// Ранжирование с соединением `chunks`/`nodes` для каждого совпадения дорого
+/// (на 30 тыс. чанков частое слово — ~30 мс), поэтому сначала берётся
+/// глобальный top `limit × OVERSAMPLE` только из индекса FTS, затем к нему
+/// применяется фильтр области. Порядок фильтр сохраняет, поэтому результат
+/// точный, если после фильтра осталось не меньше `limit`; иначе (большая часть
+/// совпадений вне области) выполняется полный запрос с фильтром.
+fn run_channel(
+    c: &Connection,
+    ch: Channel,
+    fts: &str,
+    prefix: Option<&str>,
+    spaces: &[Id],
+) -> Result<Vec<(i64, Id)>, StoreError> {
+    let (table, order, limit) = channel_spec(ch);
+    let over = limit * OVERSAMPLE;
+    let mut st = c.prepare_cached(&format!(
+        "SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY {order}, rowid LIMIT {over}"
+    ))?;
+    let top: Vec<i64> = st
+        .query_map([fts], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if top.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = json_ids(&top);
+    let mut args: Vec<&dyn ToSql> = vec![&ids, &prefix];
+    args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+    let mut st = c.prepare_cached(&format!(
+        "SELECT c.seq, c.node_id
+         FROM json_each(?1) j
+         CROSS JOIN chunks c ON c.seq = j.value
+         CROSS JOIN nodes n ON n.id = c.node_id
+         WHERE {}",
+        scope_sql(spaces.len())
+    ))?;
+    let allowed: HashMap<i64, Id> = st
+        .query_map(params_from_iter(args), |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let out: Vec<(i64, Id)> = top
+        .iter()
+        .filter_map(|seq| allowed.get(seq).map(|node| (*seq, *node)))
+        .take(limit as usize)
+        .collect();
+    if out.len() as i64 == limit || (top.len() as i64) < over {
+        return Ok(out);
+    }
+
+    let mut args: Vec<&dyn ToSql> = vec![&fts, &prefix];
+    args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+    let mut st = c.prepare_cached(&format!(
+        "SELECT f.rowid, c.node_id
+         FROM {table} f
+         CROSS JOIN chunks c ON c.seq = f.rowid
+         CROSS JOIN nodes n ON n.id = c.node_id
+         WHERE {table} MATCH ?1 AND {}
+         ORDER BY {order}, f.rowid
+         LIMIT {limit}",
+        scope_sql(spaces.len())
+    ))?;
+    let rows = st.query_map(params_from_iter(args), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Итоговый кандидат после слияния.
+struct Ranked {
+    seq: i64,
+    score: f64,
+    /// Найден каналом bm25 (сниппет — через FTS5 `snippet()`).
+    in_bm25: bool,
+}
+
+/// Полнотекстовый поиск по чанкам живых узлов в пределах `space_ids` и `path_prefix`.
+/// Запрос без слов (и без фразы для trigram) — пустая выдача.
+/// `top_k` вне 1..=100, пустой `space_ids` или запрос длиннее 512 символов → `BadInput`.
+pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError> {
+    if !(1..=TOP_K_MAX).contains(&q.top_k) {
+        return Err(StoreError::BadInput(format!(
+            "top_k должен быть в 1..={TOP_K_MAX}, получено {}",
+            q.top_k
+        )));
+    }
+    if q.space_ids.is_empty() {
+        return Err(StoreError::BadInput(
+            "не задано ни одного пространства".into(),
+        ));
+    }
+    if q.text.chars().count() > QUERY_MAX_CHARS {
+        return Err(StoreError::BadInput(format!(
+            "запрос длиннее {QUERY_MAX_CHARS} символов"
+        )));
+    }
+    let mut spaces = q.space_ids.clone();
+    spaces.sort();
+    spaces.dedup();
+    let prefix = q
+        .path_prefix
+        .as_deref()
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+
+    db.read(move |c| {
+        // один снимок данных для обоих шагов; транзакция только читает и
+        // откатывается при выходе
+        let tx = c.unchecked_transaction()?;
+        let prefix = prefix.as_deref();
+        // канал A: строгий запрос, при пустой выдаче — ослабленный
+        let mut a_fts = sanitize_fts(&q.text);
+        let mut a = match &a_fts {
+            Some(fts) => run_channel(&tx, Channel::Bm25, fts, prefix, &spaces)?,
+            None => Vec::new(),
+        };
+        if a.is_empty() && terms(&q.text).len() > 1 {
+            a_fts = sanitize_fts_any(&q.text);
+            if let Some(fts) = &a_fts {
+                a = run_channel(&tx, Channel::Bm25, fts, prefix, &spaces)?;
+            }
+        }
+        // канал B
+        let (b, needles) = match trigram_query(&q.text, a.is_empty()) {
+            Some((fts, needles)) => (
+                run_channel(&tx, Channel::Trigram, &fts, prefix, &spaces)?,
+                needles,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        let ranked = merge(a, b, q.top_k);
+        fetch_hits(&tx, &ranked, a_fts.as_deref(), &needles)
+    })
+    .await
+}
+
+/// Weighted RRF по чанкам, лимит на узел, top_k.
+fn merge(a: Vec<(i64, Id)>, b: Vec<(i64, Id)>, top_k: usize) -> Vec<Ranked> {
+    let mut by_seq: HashMap<i64, (Id, f64, bool)> = HashMap::new();
+    for (w, list, is_a) in [(W_BM25, a, true), (W_TRIGRAM, b, false)] {
+        for (i, (seq, node)) in list.into_iter().enumerate() {
+            let e = by_seq.entry(seq).or_insert((node, 0.0, false));
+            e.1 += w / (RRF_K + (i + 1) as f64);
+            e.2 |= is_a;
+        }
+    }
+    let mut all: Vec<(i64, (Id, f64, bool))> = by_seq.into_iter().collect();
+    all.sort_by(|(x, (_, sx, _)), (y, (_, sy, _))| sy.total_cmp(sx).then(x.cmp(y)));
+
+    let mut per_node: HashMap<Id, usize> = HashMap::new();
+    all.into_iter()
+        .filter(|(_, (node, _, _))| {
+            let n = per_node.entry(*node).or_default();
+            *n += 1;
+            *n <= PER_NODE_CAP
+        })
+        .take(top_k)
+        .map(|(seq, (_, score, in_bm25))| Ranked {
+            seq,
+            score,
+            in_bm25,
+        })
+        .collect()
+}
+
+/// Шаг 2: текст, метаданные и сниппеты итоговых чанков в порядке `ranked`.
+/// `bm25_fts` — запрос канала A, по которому строится `snippet()`;
+/// `needles` — подстроки для сниппета trigram-хитов.
+fn fetch_hits(
+    c: &Connection,
+    ranked: &[Ranked],
+    bm25_fts: Option<&str>,
+    needles: &[&str],
+) -> Result<Vec<FtsHit>, StoreError> {
+    if ranked.is_empty() {
+        return Ok(Vec::new());
+    }
+    let seqs: Vec<i64> = ranked.iter().map(|r| r.seq).collect();
+    let mut st = c.prepare_cached(
+        "SELECT c.seq, c.id, c.node_id, n.space_id, n.path, c.heading_path, c.rev,
+                n.updated_at, c.text
+         FROM json_each(?1) j
+         CROSS JOIN chunks c ON c.seq = j.value
+         CROSS JOIN nodes n ON n.id = c.node_id",
+    )?;
+    let rows = st.query_map([json_ids(&seqs)], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            FtsHit {
+                chunk_id: r.get(1)?,
+                node_id: r.get(2)?,
+                space_id: r.get(3)?,
+                path: r.get(4)?,
+                heading_path: r.get(5)?,
+                rev: r.get(6)?,
+                score: 0.0,
+                updated_at: ts_at(r, 7)?,
+                snippet: String::new(),
+                text: r.get(8)?,
+            },
+        ))
+    })?;
+    let mut by_seq: HashMap<i64, FtsHit> = rows.collect::<Result<_, _>>()?;
+
+    let mut snippets: HashMap<i64, String> = HashMap::new();
+    let a_seqs: Vec<i64> = ranked.iter().filter(|r| r.in_bm25).map(|r| r.seq).collect();
+    if let Some(fts) = bm25_fts
+        && !a_seqs.is_empty()
+    {
+        // snippet() требует курсора MATCH, поэтому запрос повторяется одним
+        // проходом по совпадениям; `+rowid` не отдаётся FTS5 как ограничение:
+        // иначе для каждого rowid из списка MATCH (с раскрытием префиксов)
+        // вычисляется заново — на 30 тыс. чанков в 10 раз дольше
+        let (ms, me) = (MARK_START.to_string(), MARK_END.to_string());
+        let mut st = c.prepare_cached(&format!(
+            "SELECT rowid, snippet(chunks_fts, 0, ?1, ?2, '…', {SNIPPET_TOKENS})
+             FROM chunks_fts
+             WHERE chunks_fts MATCH ?3 AND +rowid IN (SELECT value FROM json_each(?4))"
+        ))?;
+        let rows = st.query_map(params![ms, me, fts, json_ids(&a_seqs)], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        snippets = rows.collect::<Result<_, _>>()?;
+    }
+
+    Ok(ranked
+        .iter()
+        .filter_map(|r| {
+            let mut h = by_seq.remove(&r.seq)?;
+            h.score = r.score;
+            h.snippet = snippets
+                .remove(&r.seq)
+                .unwrap_or_else(|| text_snippet(&h.text, needles));
+            Some(h)
+        })
+        .collect())
+}
+
+/// Первое вхождение `pat` в `chars` без учёта регистра: индекс символа.
+fn find_ci(chars: &[char], pat: &str) -> Option<usize> {
+    let pat: Vec<char> = pat.chars().collect();
+    if pat.is_empty() || pat.len() > chars.len() {
+        return None;
+    }
+    let same = |x: char, y: char| x == y || x.to_lowercase().eq(y.to_lowercase());
+    (0..=chars.len() - pat.len()).find(|&i| pat.iter().zip(&chars[i..]).all(|(&p, &t)| same(p, t)))
+}
+
+/// Сниппет из текста: до [`SNIPPET_CHARS`] символов вокруг первого вхождения
+/// первой найденной из `needles` подстроки без учёта регистра, вхождение — между
+/// маркерами. Ничего не нашлось — начало текста. Режется только по границам символов.
+fn text_snippet(text: &str, needles: &[&str]) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let (start, len) = needles
+        .iter()
+        .find_map(|n| find_ci(&chars, n).map(|i| (i, n.chars().count())))
+        .unwrap_or((0, 0));
+    let budget = SNIPPET_CHARS.saturating_sub(len);
+    let mut from = start.saturating_sub(budget / 2);
+    let to = (start + len + (budget - (start - from))).min(chars.len());
+    // остаток бюджета у конца текста отдаётся началу
+    from = from.min(start.saturating_sub(budget.saturating_sub(to - (start + len))));
+
+    let mut s = String::new();
+    if from > 0 {
+        s.push('…');
+    }
+    s.extend(&chars[from..start]);
+    if len > 0 {
+        s.push(MARK_START);
+        s.extend(&chars[start..start + len]);
+        s.push(MARK_END);
+    }
+    s.extend(&chars[start + len..to]);
+    if to < chars.len() {
+        s.push('…');
+    }
+    s
+}
+
+/// Сколько живых заметок в `space_ids` (и под `path_prefix`, если задан) ждут
+/// векторной индексации (`index_state = 'pending'`) — `pending_count` выдачи поиска.
+/// Заметки с `index: false` (`excluded`) не считаются.
+pub async fn pending_count(
+    db: &Db,
+    space_ids: Vec<Id>,
+    path_prefix: Option<String>,
+) -> Result<i64, StoreError> {
+    if space_ids.is_empty() {
+        return Ok(0);
+    }
+    let ids = serde_json::Value::from(space_ids.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .to_string();
+    let prefix = path_prefix
+        .as_deref()
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    db.read(move |c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM nodes n
+             WHERE n.kind = 'note' AND n.index_state = 'pending' AND n.deleted_at IS NULL
+               AND n.space_id IN (SELECT value FROM json_each(?1))
+               AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
+            params![ids, prefix],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifier_detection() {
+        assert_eq!(
+            identifiers("настройка (core.autocrlf), a_b src/main x-y a:b v42 abc 123 ab. 12"),
+            vec![
+                "core.autocrlf",
+                "a_b",
+                "src/main",
+                "x-y",
+                "a:b",
+                "v42",
+                "123"
+            ]
+        );
+        for s in ["скрипт bash", "a.", "12", "просто слова", "...", "«ab.»"] {
+            assert!(identifiers(s).is_empty(), "{s}");
+        }
+    }
+
+    #[test]
+    fn short_terms_are_exact() {
+        assert_eq!(sanitize_fts("в с a").as_deref(), Some(r#""в" "с" "a""#));
+        assert_eq!(
+            sanitize_fts("файл в git").as_deref(),
+            Some(r#""файл"* "в" "git"*"#)
+        );
+        // символы, а не байты: «ёж» — 2 символа (4 байта)
+        assert_eq!(sanitize_fts("ёж").as_deref(), Some(r#""ёж""#));
+        assert_eq!(
+            sanitize_fts_any("ab cde").as_deref(),
+            Some(r#""ab" OR "cde"*"#)
+        );
+    }
+
+    #[test]
+    fn trigram_query_by_identifiers_or_phrase() {
+        assert_eq!(
+            trigram_query("настройка mygit.core и a\"b.c", false),
+            Some((
+                r#""mygit.core" OR "a""b.c""#.to_string(),
+                vec!["mygit.core", "a\"b.c"]
+            ))
+        );
+        // без идентификаторов — фраза, только при пустом bm25
+        assert_eq!(trigram_query(" просто слова ", false), None);
+        assert_eq!(
+            trigram_query(" просто слова ", true),
+            Some((r#""просто слова""#.to_string(), vec!["просто слова"]))
+        );
+        assert_eq!(trigram_query("ab", true), None);
+    }
+
+    #[test]
+    fn snippet_window() {
+        let m = |s: &str| format!("{MARK_START}{s}{MARK_END}");
+        assert_eq!(
+            text_snippet("Hello World", &["WORLD"]),
+            format!("Hello {}", m("World"))
+        );
+        assert_eq!(text_snippet("abc", &["zzz"]), "abc");
+        // первая найденная подстрока из списка
+        assert_eq!(
+            text_snippet("a.b c.d", &["x.y", "C.D"]),
+            format!("a.b {}", m("c.d"))
+        );
+        let long = "я".repeat(500);
+        let s = text_snippet(&format!("{long}КЛЮЧ{long}"), &["ключ"]);
+        assert!(s.starts_with('…') && s.ends_with('…'));
+        assert!(s.contains(&m("КЛЮЧ")));
+        assert_eq!(s.chars().count(), SNIPPET_CHARS + 4);
+        // у конца текста окно сдвигается влево
+        let s = text_snippet(&format!("{long}ключ"), &["ключ"]);
+        assert_eq!(s.chars().count(), 1 + SNIPPET_CHARS + 2);
+        assert!(s.ends_with(MARK_END));
+    }
+}

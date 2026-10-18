@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use jiff::Timestamp;
-use rusqlite::params;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use zam_core::Id;
@@ -15,10 +15,20 @@ use crate::time::fmt_ts;
 use crate::{Db, Migration, StoreError};
 
 /// Миграции пользовательской БД.
-pub static USER_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/user/0001_init.sql"),
-}];
+pub static USER_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/user/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/user/0002_notes.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("../migrations/user/0003_revisions_append_only.sql"),
+    },
+];
 
 /// Вид пространства.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,20 +137,92 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
 /// Пространства: rules, human, knowledge, затем решения по имени.
 pub async fn list_spaces(db: &Db) -> Result<Vec<Space>, StoreError> {
     db.read(|c| {
-        let mut st = c.prepare(
-            "SELECT id, kind, solution_guid, name FROM spaces
+        let mut st = c.prepare(&format!(
+            "SELECT {SPACE_COLS} FROM spaces
              ORDER BY CASE kind WHEN 'rules' THEN 0 WHEN 'human' THEN 1
-                                WHEN 'knowledge' THEN 2 ELSE 3 END, name, id",
-        )?;
-        let rows = st.query_map([], |r| {
-            Ok(Space {
-                id: r.get(0)?,
-                kind: r.get(1)?,
-                solution_guid: r.get(2)?,
-                name: r.get(3)?,
-            })
-        })?;
+                                WHEN 'knowledge' THEN 2 ELSE 3 END, name, id"
+        ))?;
+        let rows = st.query_map([], space_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+const SPACE_COLS: &str = "id, kind, solution_guid, name";
+
+fn space_row(r: &Row) -> rusqlite::Result<Space> {
+    Ok(Space {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        solution_guid: r.get(2)?,
+        name: r.get(3)?,
+    })
+}
+
+fn solution_by_guid(c: &Connection, guid: &str) -> Result<Option<Space>, StoreError> {
+    Ok(c.query_row(
+        &format!("SELECT {SPACE_COLS} FROM spaces WHERE solution_guid = ?1"),
+        [guid],
+        space_row,
+    )
+    .optional()?)
+}
+
+/// Пространство по id; нет — `None`.
+pub async fn get_space(db: &Db, id: Id) -> Result<Option<Space>, StoreError> {
+    db.read(move |c| {
+        Ok(c.query_row(
+            &format!("SELECT {SPACE_COLS} FROM spaces WHERE id = ?1"),
+            [id],
+            space_row,
+        )
+        .optional()?)
+    })
+    .await
+}
+
+/// Фиксированное пространство вида `kind` (`Rules`, `Human`, `Knowledge`).
+/// Для `Solution` и при отсутствии — `NotFound`.
+pub async fn space_of_kind(db: &Db, kind: SpaceKind) -> Result<Space, StoreError> {
+    if kind == SpaceKind::Solution {
+        return Err(StoreError::NotFound);
+    }
+    db.read(move |c| {
+        c.query_row(
+            &format!("SELECT {SPACE_COLS} FROM spaces WHERE kind = ?1"),
+            [kind],
+            space_row,
+        )
+        .optional()?
+        .ok_or(StoreError::NotFound)
+    })
+    .await
+}
+
+/// Пространство решения по GUID (как сохранён: нижний регистр с дефисами).
+pub async fn get_solution(db: &Db, guid: &str) -> Result<Option<Space>, StoreError> {
+    let guid = guid.to_string();
+    db.read(move |c| solution_by_guid(c, &guid)).await
+}
+
+/// Идемпотентно регистрирует решение: создаёт пространство `solution` с `guid`
+/// или возвращает существующее (имя существующего не меняется).
+/// Второе значение — `true`, если пространство создано сейчас.
+/// GUID и имя проверяет вызывающий; GUID хранится как передан.
+pub async fn create_solution(db: &Db, guid: &str, name: &str) -> Result<(Space, bool), StoreError> {
+    let (guid, name) = (guid.to_string(), name.to_string());
+    db.write(move |tx| {
+        if let Some(s) = solution_by_guid(tx, &guid)? {
+            return Ok((s, false));
+        }
+        let id = Id::new();
+        tx.execute(
+            "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
+             VALUES (?1, 'solution', ?2, ?3, ?4)",
+            params![id, guid, name, fmt_ts(Timestamp::now())],
+        )?;
+        let s = solution_by_guid(tx, &guid)?.ok_or(StoreError::NotFound)?;
+        Ok((s, true))
     })
     .await
 }

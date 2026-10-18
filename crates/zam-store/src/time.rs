@@ -2,6 +2,7 @@
 //! Фиксированная ширина делает лексикографический порядок строк равным хронологическому.
 
 use jiff::Timestamp;
+use rusqlite::Row;
 
 use crate::StoreError;
 
@@ -10,10 +11,44 @@ pub fn fmt_ts(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%S.%6fZ").to_string()
 }
 
+/// Сериализация времени в JSON в том же формате, что и в БД (`serialize_with`).
+pub fn ser_ts<S: serde::Serializer>(ts: &Timestamp, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&fmt_ts(*ts))
+}
+
+/// [`ser_ts`] для необязательного времени (`None` → `null`).
+pub fn ser_ts_opt<S: serde::Serializer>(ts: &Option<Timestamp>, s: S) -> Result<S::Ok, S::Error> {
+    match ts {
+        Some(t) => s.serialize_str(&fmt_ts(*t)),
+        None => s.serialize_none(),
+    }
+}
+
 /// Разбирает строку времени из БД.
 pub fn parse_ts(s: &str) -> Result<Timestamp, StoreError> {
     s.parse()
         .map_err(|e| StoreError::Corrupt(format!("некорректное время «{s}»: {e}")))
+}
+
+/// Ошибка преобразования значения колонки `i` для `query_map`.
+pub(crate) fn conv_err<E: std::error::Error + Send + Sync + 'static>(
+    i: usize,
+    e: E,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e))
+}
+
+/// Обязательное время из колонки `i`.
+pub(crate) fn ts_at(r: &Row, i: usize) -> rusqlite::Result<Timestamp> {
+    let s: String = r.get(i)?;
+    parse_ts(&s).map_err(|e| conv_err(i, e))
+}
+
+/// Необязательное время из колонки `i`.
+pub(crate) fn ts_opt(r: &Row, i: usize) -> rusqlite::Result<Option<Timestamp>> {
+    r.get::<_, Option<String>>(i)?
+        .map(|s| parse_ts(&s).map_err(|e| conv_err(i, e)))
+        .transpose()
 }
 
 #[cfg(test)]

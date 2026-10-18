@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 901da2801dcbe14c892974353ca5ec1633f0c32e89521421e230543e0589785b # shrinks to src = "\n# Заголовок"
+cc 9aebb167b0a0474da8399a8667fb97b2039e0a858688fccace0f91adce3226fc # shrinks to src = "# Заголовок\n---\n# Заголовок\n# Заголовок\n---"
+cc 1f60b2e0c36bff26af91269979640c47fd69e7b78a6954826209be1791b6a245 # shrinks to src = "> [в цитате\nсм. [ссылку](путь/файл.md#якорь) и ![кот](img/кот.png)\n[[ссылка#якорь|текст]]\n> через строку](d.md)"

@@ -1,0 +1,102 @@
+{
+  "body_start": 0,
+  "frontmatter": null,
+  "sections": [
+    {
+      "level": 1,
+      "title": "Ссылки",
+      "path": [
+        "Ссылки"
+      ],
+      "anchor": "ссылки",
+      "range": [
+        0,
+        212
+      ],
+      "body": [
+        15,
+        212
+      ],
+      "text": "# Ссылки\n\nСм. [[A]], [[A#B]], [[A#B|текст]] и [[папка/A]].\n\nОбычная [ссылка](docs/x.md \"title\") и ![картинка](img/p.png).\n\nВнешняя <https://example.com/path#frag>.\n"
+    }
+  ],
+  "links": [
+    {
+      "kind": "wiki",
+      "target": "A",
+      "anchor": null,
+      "label": null,
+      "range": [
+        22,
+        27
+      ],
+      "text": "[[A]]"
+    },
+    {
+      "kind": "wiki",
+      "target": "A",
+      "anchor": "B",
+      "label": null,
+      "range": [
+        29,
+        36
+      ],
+      "text": "[[A#B]]"
+    },
+    {
+      "kind": "wiki",
+      "target": "A",
+      "anchor": "B",
+      "label": "текст",
+      "range": [
+        38,
+        56
+      ],
+      "text": "[[A#B|текст]]"
+    },
+    {
+      "kind": "wiki",
+      "target": "папка/A",
+      "anchor": null,
+      "label": null,
+      "range": [
+        60,
+        76
+      ],
+      "text": "[[папка/A]]"
+    },
+    {
+      "kind": "markdown",
+      "target": "docs/x.md",
+      "anchor": null,
+      "label": "ссылка",
+      "range": [
+        94,
+        127
+      ],
+      "text": "[ссылка](docs/x.md \"title\")"
+    },
+    {
+      "kind": "image",
+      "target": "img/p.png",
+      "anchor": null,
+      "label": "картинка",
+      "range": [
+        131,
+        161
+      ],
+      "text": "![картинка](img/p.png)"
+    },
+    {
+      "kind": "markdown",
+      "target": "https://example.com/path",
+      "anchor": "frag",
+      "label": "https://example.com/path#frag",
+      "range": [
+        179,
+        210
+      ],
+      "text": "<https://example.com/path#frag>"
+    }
+  ]
+}

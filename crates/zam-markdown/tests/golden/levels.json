@@ -1,0 +1,114 @@
+{
+  "body_start": 0,
+  "frontmatter": null,
+  "sections": [
+    {
+      "level": 1,
+      "title": "A",
+      "path": [
+        "A"
+      ],
+      "anchor": "a",
+      "range": [
+        0,
+        25
+      ],
+      "body": [
+        4,
+        25
+      ],
+      "text": "# A\n## B\n### C\ntext\n## D\n"
+    },
+    {
+      "level": 2,
+      "title": "B",
+      "path": [
+        "A",
+        "B"
+      ],
+      "anchor": "b",
+      "range": [
+        4,
+        20
+      ],
+      "body": [
+        9,
+        20
+      ],
+      "text": "## B\n### C\ntext\n"
+    },
+    {
+      "level": 3,
+      "title": "C",
+      "path": [
+        "A",
+        "B",
+        "C"
+      ],
+      "anchor": "c",
+      "range": [
+        9,
+        20
+      ],
+      "body": [
+        15,
+        20
+      ],
+      "text": "### C\ntext\n"
+    },
+    {
+      "level": 2,
+      "title": "D",
+      "path": [
+        "A",
+        "D"
+      ],
+      "anchor": "d",
+      "range": [
+        20,
+        25
+      ],
+      "body": [
+        25,
+        25
+      ],
+      "text": "## D\n"
+    },
+    {
+      "level": 1,
+      "title": "E",
+      "path": [
+        "E"
+      ],
+      "anchor": "e",
+      "range": [
+        25,
+        42
+      ],
+      "body": [
+        29,
+        42
+      ],
+      "text": "# E\n### F\n#### G\n"
+    },
+    {
+      "level": 3,
+      "title": "F",
+      "path": [
+        "E",
+        "F"
+      ],
+      "anchor": "f",
+      "range": [
+        29,
+        42
+      ],
+      "body": [
+        35,
+        42
+      ],
+      "text": "### F\n#### G\n"
+    }
+  ],
+  "links": []
+}

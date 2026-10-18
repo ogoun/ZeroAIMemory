@@ -1,4 +1,14 @@
 //! `Db`: один поток-писатель (транзакции IMMEDIATE) и пул read-only соединений.
+//!
+//! **Checkpoint WAL (ТЗ §17).** Автоматический checkpoint писателя выключен
+//! (`wal_autocheckpoint=0`): иначе fsync базы при переносе кадров попадал бы в
+//! задержку записи. Кадры переносит фоновый поток со своим соединением —
+//! `wal_checkpoint(PASSIVE)` раз в [`DbOptions::checkpoint_interval`], а следом
+//! `RESTART`, если в WAL больше [`DbOptions::wal_restart_bytes`].
+//! Страховка на случай, если фоновый поток не успевает или умер: писатель после
+//! задания делает `wal_checkpoint(RESTART)`, когда WAL больше
+//! [`DbOptions::wal_limit_bytes`]. При закрытии — `wal_checkpoint(TRUNCATE)`,
+//! затем закрывается последнее соединение и SQLite удаляет `-wal`/`-shm`.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -6,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -83,26 +94,139 @@ struct Inner {
     // Option: в Drop отправитель закрывается раньше join потока-писателя.
     writer: Option<mpsc::Sender<WriterJob>>,
     thread: Option<JoinHandle<()>>,
+    // Фоновый checkpoint: закрытие канала — сигнал остановки.
+    checkpointer_stop: Option<mpsc::Sender<()>>,
+    checkpointer: Option<JoinHandle<()>>,
     readers: Arc<ReaderPool>,
+}
+
+/// Если последний `Db` уничтожается внутри самого потока — join невозможен.
+fn join_unless_current(h: JoinHandle<()>) {
+    if h.thread().id() != std::thread::current().id() {
+        let _ = h.join();
+    }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Сначала закрываем читателей: писатель должен закрыться последним,
-        // тогда SQLite делает checkpoint и удаляет -wal/-shm.
+        // Сначала закрываем читателей и фоновый checkpoint: писатель должен
+        // закрыться последним, тогда SQLite удаляет -wal/-shm.
         self.readers
             .conns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        drop(self.checkpointer_stop.take());
+        if let Some(h) = self.checkpointer.take() {
+            join_unless_current(h);
+        }
         drop(self.writer.take());
         if let Some(h) = self.thread.take() {
-            // Если последний Db уничтожается внутри самого писателя — join невозможен.
-            if h.thread().id() != std::thread::current().id() {
-                let _ = h.join();
-            }
+            join_unless_current(h);
         }
     }
+}
+
+/// Параметры открытия [`Db`]. Умолчания — для работы; тесты меняют пороги.
+#[derive(Debug, Clone)]
+pub struct DbOptions {
+    /// Запускать ли фоновый поток checkpoint.
+    pub background_checkpoint: bool,
+    /// Период фонового `wal_checkpoint(PASSIVE)`.
+    pub checkpoint_interval: Duration,
+    /// Размер WAL, после которого писатель сам делает `wal_checkpoint(RESTART)`;
+    /// он же — `journal_size_limit` (до него WAL усекается после сброса).
+    pub wal_limit_bytes: u64,
+    /// Кадров в WAL больше чем на столько байт — фоновый поток после
+    /// PASSIVE делает `RESTART`, чтобы WAL начался сначала и при непрерывной записи.
+    pub wal_restart_bytes: u64,
+}
+
+impl Default for DbOptions {
+    fn default() -> Self {
+        Self {
+            background_checkpoint: true,
+            checkpoint_interval: Duration::from_secs(1),
+            wal_limit_bytes: 64 * 1024 * 1024,
+            wal_restart_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// Путь `<база>-wal` (суффикс к имени файла, как у SQLite).
+fn wal_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push("-wal");
+    PathBuf::from(s)
+}
+/// Размер WAL в байтах; 0 — файла нет. `fs::metadata` на Windows читает размер
+/// через дескриптор файла, поэтому он актуален и при открытых соединениях.
+fn wal_len(wal: &Path) -> u64 {
+    std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0)
+}
+
+/// `PRAGMA wal_checkpoint(<mode>)`; результат (busy, кадров, перенесено) не нужен.
+fn checkpoint(conn: &Connection, mode: &str) -> Result<(), rusqlite::Error> {
+    conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |_| Ok(()))
+}
+
+/// Сколько миллисекунд фоновый RESTART ждёт писателя и читателей, прежде чем
+/// отступить до следующего тика (пока он держит блокировку записи, писатель ждёт).
+const RESTART_BUSY_MS: u64 = 50;
+
+/// Фоновый поток: `wal_checkpoint(PASSIVE)` раз в `interval`. Если новых кадров
+/// нет, PASSIVE лишь читает wal-index и ничего не пишет и не синхронизирует, —
+/// отдельная проверка «WAL вырос» не нужна (размер и mtime файла на Windows
+/// ненадёжны, `data_version` без транзакции чтения запаздывает). PASSIVE не ждёт
+/// читателей и писателя; ошибки не фатальны — сработает страховка писателя.
+///
+/// При непрерывной записи WAL сам не начинается сначала: писатель перезапускает
+/// его, только если к началу транзакции все кадры перенесены. Поэтому, если в WAL
+/// больше кадров, чем на `restart_bytes`, поток делает `RESTART` сразу после
+/// PASSIVE, перенёсшего всё: переносить нечего, блокировка записи держится мгновение.
+/// Если же WAL вчетверо больше порога, а полного переноса не случилось, `RESTART`
+/// делается и с переносом остатка — писатель ждёт его fsync, но WAL не дорастает
+/// до страховочного предела писателя.
+fn spawn_checkpointer(
+    path: &Path,
+    interval: Duration,
+    restart_bytes: u64,
+) -> Result<(mpsc::Sender<()>, JoinHandle<()>), StoreError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    set_common_pragmas(&conn)?;
+    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    conn.busy_timeout(Duration::from_millis(RESTART_BUSY_MS))?;
+    let page: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let restart_frames = i64::try_from(restart_bytes / page.max(512) as u64).unwrap_or(i64::MAX);
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let handle = std::thread::Builder::new()
+        .name("zam-db-checkpoint".into())
+        .spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
+                // (busy, кадров в WAL, перенесено)
+                let Ok((busy, log, done)) =
+                    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })
+                else {
+                    continue;
+                };
+                // всё перенесено — RESTART почти бесплатен; WAL вчетверо больше порога —
+                // RESTART и с переносом остатка (писатель ждёт его fsync)
+                if busy == 0 && log > restart_frames && (log == done || log > 4 * restart_frames) {
+                    let _ = checkpoint(&conn, "RESTART");
+                }
+            }
+            drop(conn);
+        })?;
+    Ok((stop_tx, handle))
 }
 
 /// Дескриптор базы; дёшево клонируется.
@@ -124,8 +248,18 @@ fn set_common_pragmas(conn: &Connection) -> Result<(), StoreError> {
 }
 
 impl Db {
-    /// Открывает (создаёт) БД, применяет PRAGMA и миграции, запускает писателя и читателей.
+    /// Открывает (создаёт) БД, применяет PRAGMA и миграции, запускает писателя,
+    /// читателей и фоновый checkpoint с параметрами по умолчанию.
     pub fn open(path: &Path, migrations: &'static [Migration]) -> Result<Db, StoreError> {
+        Self::open_with(path, migrations, DbOptions::default())
+    }
+
+    /// То же, что [`Db::open`], с явными [`DbOptions`].
+    pub fn open_with(
+        path: &Path,
+        migrations: &'static [Migration],
+        opts: DbOptions,
+    ) -> Result<Db, StoreError> {
         let mut conn = Connection::open(path)?;
         set_common_pragmas(&conn)?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
@@ -136,6 +270,10 @@ impl Db {
         }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrate::apply(&mut conn, path, migrations)?;
+        // checkpoint — не в потоке писателя (см. документацию модуля)
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        let size_limit = i64::try_from(opts.wal_limit_bytes).unwrap_or(i64::MAX);
+        conn.pragma_update(None, "journal_size_limit", size_limit)?;
 
         // Читатели открываются после того, как писатель создал файл и применил миграции.
         let mut readers = Vec::with_capacity(READERS);
@@ -143,6 +281,16 @@ impl Db {
             readers.push(open_reader(path)?);
         }
 
+        let (checkpointer_stop, checkpointer) = if opts.background_checkpoint {
+            let (stop, handle) =
+                spawn_checkpointer(path, opts.checkpoint_interval, opts.wal_restart_bytes)?;
+            (Some(stop), Some(handle))
+        } else {
+            (None, None)
+        };
+
+        let wal = wal_path(path);
+        let limit = opts.wal_limit_bytes;
         let (tx, rx) = mpsc::channel::<WriterJob>();
         let thread = std::thread::Builder::new()
             .name("zam-db-writer".into())
@@ -154,13 +302,21 @@ impl Db {
                     if !conn.is_autocommit() {
                         let _ = conn.execute_batch("ROLLBACK");
                     }
+                    // Страховка от неограниченного WAL, если фоновый checkpoint отстал или умер.
+                    if wal_len(&wal) > limit {
+                        let _ = checkpoint(&conn, "RESTART");
+                    }
                 }
+                // Закрытие: читатели и фоновый поток уже закрыты (Inner::drop).
+                let _ = checkpoint(&conn, "TRUNCATE");
             })?;
 
         Ok(Db {
             inner: Arc::new(Inner {
                 writer: Some(tx),
                 thread: Some(thread),
+                checkpointer_stop,
+                checkpointer,
                 readers: Arc::new(ReaderPool {
                     path: path.to_path_buf(),
                     conns: Mutex::new(readers),

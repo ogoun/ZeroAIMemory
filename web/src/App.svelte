@@ -1,31 +1,24 @@
 <script lang="ts">
   import './app.css';
   import Login from './routes/Login.svelte';
-  import Users from './routes/Users.svelte';
-  import { hasSession, logout, me, restore } from './lib/api';
+  import Shell from './routes/Shell.svelte';
+  import { logout, me as fetchMe, restore, type Me } from './lib/api';
 
-  // Два экрана без роутера: выбор по наличию сессии (CSRF-токен в памяти).
-  let authed = $state(false);
+  // Вход или оболочка: выбор по наличию сессии (CSRF-токен в памяти).
+  let session = $state<Me | null>(null);
   let ready = $state(false);
-  let adminLogin = $state('');
 
-  // При старте пробуем восстановить сессию по cookie; до ответа показываем нейтральное состояние.
+  // При старте пробуем восстановить сессию по cookie; до ответа — нейтральное состояние.
   restore()
-    .then((l) => {
-      if (l !== null) {
-        adminLogin = l;
-        authed = true;
-      }
-    })
+    .then((m) => (session = m))
     .catch(() => {})
     .finally(() => (ready = true));
 
   async function onLogin() {
-    authed = hasSession();
     try {
-      adminLogin = (await me()).login;
+      session = await fetchMe();
     } catch {
-      adminLogin = '';
+      session = null;
     }
   }
 
@@ -35,23 +28,26 @@
     } catch {
       /* сессия уже недействительна */
     }
-    authed = false;
+    session = null;
   }
 </script>
 
-<main style="max-width: 880px; margin: 0 auto; padding: 24px 16px;">
-  {#if !ready}
-    <p class="muted">Загрузка…</p>
-  {:else if authed}
-    <header class="row" style="justify-content: space-between; margin-bottom: 16px;">
-      <h1>ZeroAIMemory</h1>
-      <span class="row">
-        <span class="muted">{adminLogin}</span>
-        <button onclick={onLogout}>Выйти</button>
-      </span>
-    </header>
-    <Users onExpired={() => (authed = false)} />
-  {:else}
+{#if !ready}
+  <p class="muted boot">Загрузка…</p>
+{:else if session}
+  <Shell me={session} onlogout={onLogout} onexpired={() => (session = null)} />
+{:else}
+  <main class="login-page">
     <Login {onLogin} />
-  {/if}
-</main>
+  </main>
+{/if}
+
+<style>
+  .boot {
+    text-align: center;
+    margin-top: 20vh;
+  }
+  .login-page {
+    padding: 24px 16px;
+  }
+</style>

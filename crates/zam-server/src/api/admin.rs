@@ -5,7 +5,6 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use zam_core::{Id, mask_token};
 use zam_store::time::fmt_ts;
@@ -14,6 +13,8 @@ use zam_store::{Access, AuditRow, TokenInfo, User};
 use crate::app::AppState;
 use crate::auth::{AdminOnly, Client};
 use crate::error::ApiError;
+
+use super::{parse_body, parse_id};
 
 const NAME_MAX_CHARS: usize = 64;
 const AUDIT_DEFAULT_LIMIT: u32 = 50;
@@ -62,15 +63,6 @@ fn audit_json(r: &AuditRow) -> Value {
 }
 
 // ---- разбор входных данных ----
-
-fn parse_id(s: &str) -> Result<Id, ApiError> {
-    s.parse()
-        .map_err(|_| ApiError::BadRequest("некорректный идентификатор".into()))
-}
-
-fn parse_body<T: DeserializeOwned>(b: &Bytes) -> Result<T, ApiError> {
-    serde_json::from_slice(b).map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))
-}
 
 /// Имя: непустое после trim, ≤ 64 символов, без управляющих. Возвращает обрезанное.
 fn valid_name(raw: &str) -> Result<String, ApiError> {
@@ -167,7 +159,7 @@ pub async fn patch_user(
     }
     let user = require_user(&st, id).await?;
     if req.disabled == Some(true) && is_admin(&st, &user) {
-        return Err(ApiError::Conflict("администратора нельзя отключить".into()));
+        return Err(ApiError::conflict("администратора нельзя отключить"));
     }
     let new_name = req.name.as_deref().map(valid_name).transpose()?;
     let ip = client.ip.to_string();
@@ -213,7 +205,7 @@ pub async fn delete_user(
     let id = parse_id(&id)?;
     let user = require_user(&st, id).await?;
     if is_admin(&st, &user) {
-        return Err(ApiError::Conflict("администратора нельзя удалить".into()));
+        return Err(ApiError::conflict("администратора нельзя удалить"));
     }
     if user.disabled_at.is_none() {
         st.system.set_user_disabled(id, true).await?;
@@ -290,8 +282,8 @@ pub async fn issue_token(
     };
     let user = require_user(&st, id).await?;
     if user.disabled_at.is_some() {
-        return Err(ApiError::Conflict(
-            "пользователь отключён: токен выпустить нельзя".into(),
+        return Err(ApiError::conflict(
+            "пользователь отключён: токен выпустить нельзя",
         ));
     }
     let (info, plain) = st.system.issue_token(id, &name, access).await?;

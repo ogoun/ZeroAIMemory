@@ -68,6 +68,11 @@ impl DataDir {
         self.users_dir().join(format!("{id}.db"))
     }
 
+    /// Блобы вложений: `<data_dir>/blobs/<user_id>/<aa>/<sha256>`.
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.root.join("blobs")
+    }
+
     pub fn logs(&self) -> PathBuf {
         self.root.join("logs")
     }

@@ -2,6 +2,8 @@
 #![allow(dead_code)]
 use std::path::PathBuf;
 
+pub mod api;
+
 use zam_server::config::ServerConfig;
 
 /// Уникальный (по имени) пустой каталог внутри target.

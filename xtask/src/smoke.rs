@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -24,12 +24,29 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(15);
 /// Запускает команду и ждёт не дольше `timeout`; по истечении процесс убивается, это ошибка.
 /// stdout/stderr читаются в потоках, чтобы переполнение канала не вешало дочерний процесс.
 fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output> {
+    output_with_stdin(cmd, None, timeout)
+}
+
+/// То же, со входом: `input` пишется в stdin в отдельном потоке и канал закрывается.
+fn output_with_stdin(cmd: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
+    let stdin = if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("запуск процесса")?;
+    if let Some(input) = input {
+        let mut w = child.stdin.take().context("stdin")?;
+        let data = input.to_vec();
+        thread::spawn(move || {
+            let _ = w.write_all(&data);
+        });
+    }
     let mut out = child.stdout.take().context("stdout")?;
     let mut err = child.stderr.take().context("stderr")?;
     let t_out = thread::spawn(move || {
@@ -354,6 +371,66 @@ fn status_from_claude_md(zam: &Path, dir: &Path, base: &str, token: &str) -> Res
     Ok(())
 }
 
+/// Текст заметки smoke-теста.
+const SMOKE_NOTE: &[u8] = b"# Hello\nsmoke note\n";
+
+/// `zam` из комплекта с чистым окружением: только адрес и токен в `ZAM_URL`/`ZAM_TOKEN`.
+fn zam_cmd(zam: &Path, dir: &Path, base: &str, token: &str) -> Command {
+    let mut cmd = Command::new(zam);
+    scrub_zam_env(&mut cmd, &[])
+        .env("ZAM_URL", base)
+        .env("ZAM_TOKEN", token)
+        .env("HOME", dir)
+        .env("USERPROFILE", dir)
+        .current_dir(dir);
+    cmd
+}
+
+/// Критерий M1: `zam write` из stdin → `zam search` находит путь → `zam read` возвращает текст.
+fn note_roundtrip(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let home = dir.join("notes-home");
+    fs::create_dir_all(&home)?;
+    let run = |args: &[&str], input: Option<&[u8]>| -> Result<Output> {
+        let out = output_with_stdin(
+            zam_cmd(zam, &home, base, token).args(args),
+            input,
+            CMD_TIMEOUT,
+        )?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if text.contains(token) {
+            bail!("вывод zam {} содержит токен целиком", args.join(" "));
+        }
+        if out.status.code() != Some(0) {
+            bail!(
+                "zam {}: код {:?}\n{text}",
+                args.join(" "),
+                out.status.code()
+            );
+        }
+        Ok(out)
+    };
+    run(&["write", "knowledge:smoke/hello"], Some(SMOKE_NOTE))?;
+    let found = run(&["search", "hello"], None)?;
+    if !String::from_utf8_lossy(&found.stdout).contains("smoke/hello") {
+        bail!(
+            "zam search hello не нашёл smoke/hello:\n{}",
+            String::from_utf8_lossy(&found.stdout)
+        );
+    }
+    let read = run(&["read", "knowledge:smoke/hello"], None)?;
+    if read.stdout != SMOKE_NOTE {
+        bail!(
+            "zam read вернул другой текст: {:?}",
+            String::from_utf8_lossy(&read.stdout)
+        );
+    }
+    Ok(())
+}
+
 /// В комплекте есть тексты лицензий пакетов бандла WebUI (минимум svelte).
 fn check_web_notices(root: &Path) -> Result<()> {
     let p = root.join("LICENSES").join("THIRD-PARTY-WEB-NOTICES.txt");
@@ -455,6 +532,12 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
         status_from_claude_md(&zam, &dir, &base, &token),
     )?;
 
+    step(
+        12,
+        "zam write → search → read заметки",
+        note_roundtrip(&zam, &dir, &base, &token),
+    )?;
+
     step(6, "вход администратора и токен ro", admin_issue_ro(&base))?;
 
     let qv = Manifest::load(&root.join("deploy").join("qdrant.toml"))?.version;
@@ -540,6 +623,24 @@ mod tests {
         let o = output_with_timeout(&mut echo(), Duration::from_secs(10)).unwrap();
         assert!(o.status.success());
         assert!(String::from_utf8_lossy(&o.stdout).contains("hi"));
+    }
+
+    #[cfg(windows)]
+    fn cat() -> Command {
+        let mut c = Command::new("findstr");
+        c.arg("^");
+        c
+    }
+    #[cfg(not(windows))]
+    fn cat() -> Command {
+        Command::new("cat")
+    }
+
+    #[test]
+    fn output_with_stdin_passes_input() {
+        let o = output_with_stdin(&mut cat(), Some(b"abc\n"), Duration::from_secs(10)).unwrap();
+        assert!(o.status.success());
+        assert!(String::from_utf8_lossy(&o.stdout).contains("abc"));
     }
 
     #[test]

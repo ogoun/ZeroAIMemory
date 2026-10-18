@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use axum::Router;
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, Predicate};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use zam_core::Id;
@@ -31,6 +32,10 @@ pub struct AppState {
     pub users: UserDbs,
     pub started_at: Instant,
     pub version: &'static str,
+    /// Кэш HTML заметок (см. [`api::render::RenderCache`]).
+    pub render_cache: api::render::RenderCache,
+    /// Поколения ссылок для ключа кэша рендера.
+    pub render_gen: Arc<api::render::RenderGenerations>,
 }
 
 // Вручную: хэш пароля и пути не должны попадать в отладочный вывод.
@@ -111,6 +116,8 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         auth: Arc::new(auth),
         started_at: Instant::now(),
         version: env!("CARGO_PKG_VERSION"),
+        render_cache: api::render::new_cache(),
+        render_gen: Arc::default(),
         cfg: Arc::new(cfg),
     };
     let router = router(state.clone());
@@ -121,7 +128,7 @@ fn router(state: AppState) -> Router {
     let base = state.cfg.server.base_path.clone();
     let index = web::Index::new(&base);
     let root = index.clone();
-    let api = api::router()
+    let api = api::router(&state.cfg.limits)
         .merge(web::assets_router())
         .fallback(move |m, u| web::fallback(index.clone(), m, u))
         .with_state(state);
@@ -146,5 +153,16 @@ fn router(state: AppState) -> Router {
             .on_request(())
             .on_response(DefaultOnResponse::new().level(Level::INFO)),
     )
-    .layer(CompressionLayer::new())
+    .layer(CompressionLayer::new().compress_when(compress_predicate()))
+}
+
+/// Сжатие по умолчанию, кроме ответов с меткой [`api::blobs::NoCompress`]
+/// (блобы: `Range` и медиа).
+fn compress_predicate() -> impl Predicate {
+    DefaultPredicate::new().and(
+        |_: axum::http::StatusCode,
+         _: axum::http::Version,
+         _: &axum::http::HeaderMap,
+         ext: &axum::http::Extensions| ext.get::<api::blobs::NoCompress>().is_none(),
+    )
 }

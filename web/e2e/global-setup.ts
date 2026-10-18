@@ -5,6 +5,9 @@ import { createWriteStream, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { request } from '@playwright/test';
+import { seed } from './seed';
+import { ADMIN_STATE } from './session';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 const tmp = `${repo}.tmp/e2e/`;
@@ -72,17 +75,33 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   });
   const log = createWriteStream(`${tmp}server.log`);
   try {
-    // Журнал сервера без строки с первым токеном.
+    // Журнал сервера без строки с первым токеном; сам токен — для наполнения данными.
     let rest = '';
+    let token = '';
     child.stderr!.on('data', (chunk: Buffer) => {
       const lines = (rest + chunk.toString('utf8')).split('\n');
       rest = lines.pop() ?? '';
-      for (const l of lines) if (!l.startsWith('ZeroAIMemoryToken=')) log.write(`${l}\n`);
+      for (const l of lines) {
+        if (l.startsWith('ZeroAIMemoryToken=')) token = l.slice('ZeroAIMemoryToken='.length).trim();
+        else log.write(`${l}\n`);
+      }
     });
 
     await waitHealth(base, () => child.exitCode === null);
+    if (!token) throw new Error('сервер не напечатал первый токен администратора');
+    const ids = await seed(base, token);
+    // один вход на весь прогон (см. session.ts)
+    const rc = await request.newContext({ baseURL: base });
+    const r = await rc.post('api/v1/auth/login', { data: { login: 'admin', password: ADMIN_PASSWORD } });
+    if (!r.ok()) throw new Error(`вход администратора: HTTP ${r.status()}`);
+    await rc.storageState({ path: ADMIN_STATE });
+    await rc.dispose();
     process.env.E2E_BASE_URL = base;
     process.env.E2E_ADMIN_PASSWORD = ADMIN_PASSWORD;
+    process.env.E2E_NOTE_MEDIA = ids.media;
+    process.env.E2E_NOTE_SECOND = ids.second;
+    // токен администратора — для правок «из другого места» в сценариях конфликта
+    process.env.E2E_ADMIN_TOKEN = token;
   } catch (e) {
     child.kill();
     log.end();
