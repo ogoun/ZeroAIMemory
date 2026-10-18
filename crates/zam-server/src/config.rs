@@ -30,6 +30,7 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     pub log: LogSection,
     pub qdrant: QdrantSection,
+    pub limits: LimitsSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,6 +84,14 @@ pub struct QdrantSection {
     pub grpc_port: u16,
 }
 
+/// Пределы размеров (§16.2): заметка и вложение, байт.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+    pub note_max_bytes: usize,
+    pub blob_max_bytes: usize,
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -107,6 +116,10 @@ impl Default for ServerConfig {
                 url: None,
                 http_port: 6333,
                 grpc_port: 6334,
+            },
+            limits: LimitsSection {
+                note_max_bytes: 5_242_880,
+                blob_max_bytes: 209_715_200,
             },
         }
     }
@@ -381,6 +394,29 @@ mod tests {
         assert_eq!(c.log.max_files, 14);
         assert_eq!(c.qdrant.mode, QdrantMode::Managed);
         assert_eq!((c.qdrant.http_port, c.qdrant.grpc_port), (6333, 6334));
+        assert_eq!(c.limits.note_max_bytes, 5_242_880);
+        assert_eq!(c.limits.blob_max_bytes, 209_715_200);
+    }
+
+    #[test]
+    fn limits_from_file_and_env() {
+        let f = write_in_target(
+            "limits.toml",
+            "[limits]
+note_max_bytes = 1000
+",
+        );
+        let e = vec![env("ZAM_LIMITS__BLOB_MAX_BYTES", "2000")];
+        let c = load(Some(&f), &e, &Default::default()).unwrap();
+        assert_eq!(
+            (c.limits.note_max_bytes, c.limits.blob_max_bytes),
+            (1000, 2000)
+        );
+        let bad = vec![env("ZAM_LIMITS__NOTE_MAX_BYTES", "-1")];
+        let e = load(None, &bad, &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("limits.note_max_bytes"), "{e}");
     }
 
     #[test]

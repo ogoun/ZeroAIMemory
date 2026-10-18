@@ -35,6 +35,10 @@ anyhow.workspace = true
 subtle.workspace = true
 cookie.workspace = true
 memory-serve.workspace = true
+zam-markdown = { path = "../zam-markdown" }
+lru.workspace = true
+uuid.workspace = true
+sha2.workspace = true
 
 [build-dependencies]
 memory-serve.workspace = true

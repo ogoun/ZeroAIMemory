@@ -31,6 +31,8 @@ pub struct AppState {
     pub users: UserDbs,
     pub started_at: Instant,
     pub version: &'static str,
+    /// Кэш HTML заметок (см. [`api::render::RenderCache`]).
+    pub render_cache: api::render::RenderCache,
 }
 
 // Вручную: хэш пароля и пути не должны попадать в отладочный вывод.
@@ -111,6 +113,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         auth: Arc::new(auth),
         started_at: Instant::now(),
         version: env!("CARGO_PKG_VERSION"),
+        render_cache: api::render::new_cache(),
         cfg: Arc::new(cfg),
     };
     let router = router(state.clone());
@@ -121,7 +124,7 @@ fn router(state: AppState) -> Router {
     let base = state.cfg.server.base_path.clone();
     let index = web::Index::new(&base);
     let root = index.clone();
-    let api = api::router()
+    let api = api::router(&state.cfg.limits)
         .merge(web::assets_router())
         .fallback(move |m, u| web::fallback(index.clone(), m, u))
         .with_state(state);

@@ -1,6 +1,7 @@
 //! Сервер ZeroAIMemory.
 pub mod api;
 pub mod app;
+pub mod attrib;
 pub mod auth;
 pub mod bootstrap;
 pub mod config;
