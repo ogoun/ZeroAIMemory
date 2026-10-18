@@ -30,8 +30,13 @@ export interface EditorHandle {
   text(): string;
   /** Заменяет весь текст (новая загрузка); история правок сбрасывается. */
   reset(text: string): void;
-  /** Вставляет строку в позицию курсора (вместо выделения). */
-  insert(s: string): void;
+  /**
+   * Вставляет строку в позицию `pos` (`null` — вместо выделения); курсор — после неё.
+   * Возвращает позицию конца вставки (для следующей вставки подряд).
+   */
+  insertAt(pos: number | null, s: string): number;
+  /** Разделитель строк документа. */
+  lineBreak(): string;
   focus(): void;
   destroy(): void;
 }
@@ -41,6 +46,8 @@ export interface EditorOpts {
   onChange: () => void;
   /** Ctrl+S / Cmd+S. */
   onSave: () => void;
+  /** Файлы из вставки или перетаскивания; `pos` — место сброса (`null` — курсор). */
+  onFiles: (files: File[], pos: number | null) => void;
 }
 
 /** Цвета — из переменных темы приложения (светлая и тёмная). */
@@ -85,6 +92,24 @@ function makeState(doc: string, o: EditorOpts): EditorState {
         ...defaultKeymap,
         ...historyKeymap,
       ]),
+      // файлы из буфера и перетаскивания — во вложения (встроенный drop вставил бы их текстом)
+      EditorView.domEventHandlers({
+        paste(e) {
+          const files = [...(e.clipboardData?.files ?? [])];
+          if (!files.length) return false;
+          e.preventDefault();
+          o.onFiles(files, null);
+          return true;
+        },
+        drop(e, view) {
+          const files = [...(e.dataTransfer?.files ?? [])];
+          if (!files.length) return false;
+          e.preventDefault();
+          // неточный режим: ближайшая позиция и при сбросе на поля или пустую строку
+          o.onFiles(files, view.posAtCoords({ x: e.clientX, y: e.clientY }, false));
+          return true;
+        },
+      }),
       EditorView.updateListener.of((u: ViewUpdate) => {
         if (u.docChanged) o.onChange();
       }),
@@ -97,10 +122,21 @@ export function createEditor(parent: HTMLElement, doc: string, o: EditorOpts): E
   return {
     text: () => view.state.sliceDoc(),
     reset: (t) => view.setState(makeState(t, o)),
-    insert: (s) => {
-      view.dispatch(view.state.replaceSelection(s));
+    insertAt: (pos, s) => {
+      const st = view.state;
+      const len = st.toText(s).length;
+      if (pos === null) {
+        const from = st.selection.main.from;
+        view.dispatch(st.replaceSelection(s));
+        view.focus();
+        return from + len;
+      }
+      const at = Math.max(0, Math.min(pos, st.doc.length));
+      view.dispatch({ changes: { from: at, insert: s }, selection: { anchor: at + len } });
       view.focus();
+      return at + len;
     },
+    lineBreak: () => view.state.lineBreak,
     focus: () => view.focus(),
     destroy: () => view.destroy(),
   };

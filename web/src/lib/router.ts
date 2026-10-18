@@ -95,8 +95,11 @@ export function go(r: Route, opts: { replace?: boolean; silent?: boolean } = {})
     emit();
   } else {
     // проверка уже пройдена: hashchange её не повторяет
+    const before = location.href;
     skipGuard = true;
     location.hash = target;
+    // равнозначный адрес (другая percent-кодировка) не порождает hashchange
+    if (location.href === before) skipGuard = false;
   }
 }
 

@@ -5,8 +5,9 @@
 
   type Kind = 'add' | 'del' | 'hunk' | 'meta' | 'ctx';
 
-  function kindOf(l: string): Kind {
-    if (l.startsWith('+++') || l.startsWith('---')) return 'meta';
+  /** `inHunk` — уже был `@@`: дальше `---`/`+++` — удалённая или добавленная строка текста. */
+  function kindOf(l: string, inHunk: boolean): Kind {
+    if (!inHunk && (l.startsWith('+++') || l.startsWith('---'))) return 'meta';
     if (l.startsWith('+')) return 'add';
     if (l.startsWith('-')) return 'del';
     if (l.startsWith('@@')) return 'hunk';
@@ -14,12 +15,17 @@
     return 'ctx';
   }
 
-  let lines = $derived(
-    diff
+  let lines = $derived.by(() => {
+    let inHunk = false;
+    return diff
       .replace(/\r?\n$/, '')
       .split(/\r?\n/)
-      .map((text) => ({ text, kind: kindOf(text) })),
-  );
+      .map((text) => {
+        const kind = kindOf(text, inHunk);
+        if (kind === 'hunk') inHunk = true;
+        return { text, kind };
+      });
+  });
 </script>
 
 {#if diff.trim() === ''}

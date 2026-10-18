@@ -27,6 +27,10 @@
 
   let seq = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  /** Поиск назначен (debounce ещё идёт). */
+  let pending = false;
+  /** Последний запущенный поиск. */
+  let inflight: Promise<void> = Promise.resolve();
   /** Пространства пользователя (id): читаются при первом поиске для этого пользователя. */
   let spaces: { user: string; ids: string[] } | null = null;
 
@@ -41,7 +45,24 @@
 
   function schedule(delay: number) {
     clearTimeout(timer);
-    timer = setTimeout(run, delay);
+    pending = true;
+    timer = setTimeout(start, delay);
+  }
+
+  function start() {
+    clearTimeout(timer);
+    pending = false;
+    inflight = run();
+  }
+
+  /** Enter: выдача строго по введённому запросу (debounce не дожидается). */
+  async function enter() {
+    if (pending) start();
+    const my = seq;
+    await inflight;
+    // за время ожидания запрос изменили — Enter относится к устаревшему
+    if (my !== seq) return;
+    void choose(items[active]);
   }
 
   async function run() {
@@ -128,7 +149,7 @@
       if (items.length) active = (active - 1 + items.length) % items.length;
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      void choose(items[active]);
+      void enter();
     }
   }
 

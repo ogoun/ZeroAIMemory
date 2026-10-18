@@ -252,6 +252,51 @@ test('вложение: «Прикрепить файл», уход с несо�
   await expect(editorContent(page)).toContainText('[заметки.txt](_attachments/');
   await expect(editorContent(page)).not.toContainText('![заметки.txt]');
 
+  // перетаскивание двух файлов: загрузка по очереди, по ссылке на строку
+  await page.keyboard.press('Enter');
+  const files = (names: { name: string; type: string; text?: string }[]) =>
+    page.evaluateHandle(
+      ({ names, b64 }) => {
+        const dt = new DataTransfer();
+        for (const f of names) {
+          const body = f.text ?? Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+          dt.items.add(new File([body], f.name, { type: f.type }));
+        }
+        return dt;
+      },
+      { names, b64: png.toString('base64') },
+    );
+  const dropped = await files([
+    { name: 'сброс.png', type: 'image/png' },
+    { name: 'сброс.txt', type: 'text/plain', text: 'abc' },
+  ]);
+  // сброс — на последнюю (пустую) строку: вставка по координатам, а не по курсору
+  await editorContent(page).click({ position: { x: 5, y: 5 } });
+  const box = (await page.locator('.editor .cm-line').last().boundingBox())!;
+  await editorContent(page).dispatchEvent('drop', {
+    dataTransfer: dropped,
+    clientX: box.x + 4,
+    clientY: box.y + box.height / 2,
+  });
+  await expect(page.locator('.editor .state')).toHaveText('Файл «сброс.txt» прикреплён');
+  const lines = page.locator('.editor .cm-line');
+  await expect(lines.filter({ hasText: /^!\[сброс\.png\]\(_attachments\/[0-9a-f]{16}\/сброс\.png\)$/ })).toHaveCount(1);
+  await expect(lines.filter({ hasText: /^\[сброс\.txt\]\(_attachments\/[0-9a-f]{16}\/сброс\.txt\)$/ })).toHaveCount(1);
+  const droppedImg = page.locator('.editor .preview img[alt="сброс.png"]');
+  await expect
+    .poll(() => droppedImg.evaluate((i: HTMLImageElement) => (i.complete ? i.naturalWidth : 0)))
+    .toBe(1);
+
+  // вставка файла из буфера — в позицию курсора
+  await page.keyboard.press('Control+End');
+  await page.keyboard.press('Enter');
+  const pasted = await files([{ name: 'вставка.png', type: 'image/png' }]);
+  await editorContent(page).evaluate((el, dt) => {
+    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  }, pasted);
+  await expect(page.locator('.editor .state')).toHaveText('Файл «вставка.png» прикреплён');
+  await expect(lines.last()).toHaveText(/^!\[вставка\.png\]\(_attachments\/[0-9a-f]{16}\/вставка\.png\)$/);
+
   // уход по дереву с несохранёнными правками: «остаться», затем «уйти»
   const t = tree(page);
   const other = t.getByRole('link', { name: 'Вторая заметка' });
@@ -267,6 +312,65 @@ test('вложение: «Прикрепить файл», уход с несо�
   // правки не сохранены: ревизия прежняя
   expect(await rawText(a, n.id)).toBe('# Вложения\n\n');
 
+  await a.dispose();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('ошибка перечитывания после сохранения не закрывает редактор; дифф строки ---', async ({ page }) => {
+  const problems = watch(page);
+  const uid = await login(page);
+  const a = await api();
+  const n = await createNote(a, `E2E/Линия ${Date.now()}`, '# Линия\n\n---\n\nтекст\n');
+  await page.goto(`${base()}#/u/${uid}/s/knowledge/n/${n.id}`);
+  await openEditor(page, 1);
+
+  // перечитывание документа после сохранения обрывается
+  await page.route('**/api/v1/nodes/*?format=html', (r) => r.abort());
+  await editorContent(page).click();
+  await page.keyboard.press('Control+a');
+  await page.keyboard.type('# Линия\n\nтекст\n');
+  await page.keyboard.press('Control+s');
+  await expect(page.locator('.editor .state')).toHaveText('Сохранено: ревизия 2');
+  await expect(page.locator('.docview > .error')).toBeVisible();
+  await typeAtEnd(page, 'несохранённое');
+  await expect(editorContent(page)).toContainText('несохранённое');
+  await expect(page.locator('.editor')).toBeVisible();
+  await page.unroute('**/api/v1/nodes/*?format=html');
+  await page.getByRole('button', { name: 'Сохранить' }).click();
+  await expect(page.locator('.editor .state')).toHaveText('Сохранено: ревизия 3');
+  expect(await rawText(a, n.id)).toBe('# Линия\n\nтекст\nнесохранённое');
+
+  // удалённая строка «---» — строка диффа «----», а не заголовок
+  await page.getByRole('tab', { name: 'История' }).click();
+  const rows = page.locator('table[aria-label="Ревизии"] tbody tr');
+  await expect(rows).toHaveCount(3);
+  await rows.nth(2).getByLabel('А: ревизия 1').check();
+  await rows.nth(1).getByLabel('Б: ревизия 2').check();
+  await expect(page.locator('.diff .del').filter({ hasText: /^----$/ })).toHaveCount(1);
+  await expect(page.locator('.diff .meta').filter({ hasText: /^--- rev 1$/ })).toHaveCount(1);
+
+  await a.dispose();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('поиск: Enter до конца debounce открывает результат нового запроса', async ({ page }) => {
+  const problems = watch(page);
+  const uid = await login(page);
+  const a = await api();
+  const w1 = uniqueWord();
+  const first = await createNote(a, `E2E/Поиск один ${Date.now()}`, `# Один\n\n${w1}\n`);
+  const w2 = uniqueWord() + 'й';
+  const second = await createNote(a, `E2E/Поиск два ${Date.now()}`, `# Два\n\n${w2}\n`);
+  await page.goto(`${base()}#/u/${uid}`);
+  await page.keyboard.press('Control+k');
+  const search = page.getByRole('combobox', { name: 'Поиск по заметкам' });
+  await search.fill(w1);
+  await expect(page.getByRole('option')).toHaveCount(1);
+  // новый запрос и сразу Enter: выдача по нему, а не по прежнему
+  await search.fill(w2);
+  await search.press('Enter');
+  await expect(page).toHaveURL(new RegExp(`/n/${second.id}`));
+  expect(page.url()).not.toContain(first.id);
   await a.dispose();
   expect(problems, problems.join('\n')).toEqual([]);
 });

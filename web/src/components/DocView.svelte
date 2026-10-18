@@ -253,7 +253,8 @@
   {/if}
 
   <div role="tabpanel" hidden={tab !== 'doc'}>
-    {#if editing && info}
+    {#if editing}
+      <!-- редактор живёт до своего onclose: ошибка перечитывания документа не теряет правки -->
       <Editor
         {user}
         {space}

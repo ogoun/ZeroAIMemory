@@ -82,7 +82,11 @@
         const text = j.content ?? '';
         saved = text;
         rev = j.rev;
-        cm = mod.createEditor(host, text, { onChange, onSave: () => void save() });
+        cm = mod.createEditor(host, text, {
+          onChange,
+          onSave: () => void save(),
+          onFiles: (files, pos) => void attach(files, pos),
+        });
         ready = true;
         cm.focus();
         schedulePreview(0);
@@ -245,28 +249,50 @@
     return `${embed ? '!' : ''}[${alt}](${link})`;
   }
 
-  async function onfile(e: Event) {
-    const input = e.currentTarget as HTMLInputElement;
-    const file = input.files?.[0];
-    input.value = '';
-    if (!file || !cm) return;
+  /** Очередь загрузок: вставки и сбросы во время загрузки ждут её конца. */
+  let uploadQueue: Promise<void> = Promise.resolve();
+
+  /** Кнопка, вставка из буфера, перетаскивание: файлы по очереди, по ссылке на строку. */
+  function attach(files: File[], pos: number | null): Promise<void> {
+    uploadQueue = uploadQueue.then(() => uploadAll(files, pos));
+    return uploadQueue;
+  }
+
+  async function uploadAll(files: File[], pos: number | null) {
+    if (!cm || !files.length) return;
     uploading = true;
     error = '';
-    status = `Загрузка «${file.name}»…`;
+    let at = pos;
+    let first = true;
     try {
-      const b = await uploadBlob(user, node, file);
-      cm.insert(attachmentMarkdown(file.name, b.link, b.mime));
-      status = `Файл «${file.name}» прикреплён`;
-    } catch (err) {
-      status = '';
-      if (expired(err)) return;
-      error =
-        err instanceof ApiError && err.status === 413
-          ? `Файл «${file.name}» не загружен: файл больше лимита.`
-          : `Файл «${file.name}» не загружен: ${message(err)}`;
+      for (const file of files) {
+        status = `Загрузка «${file.name}»…`;
+        try {
+          const b = await uploadBlob(user, node, file);
+          if (!cm) return;
+          const md = attachmentMarkdown(file.name, b.link, b.mime);
+          at = cm.insertAt(at, first ? md : cm.lineBreak() + md);
+          first = false;
+          status = `Файл «${file.name}» прикреплён`;
+        } catch (err) {
+          status = '';
+          if (expired(err)) return;
+          error =
+            err instanceof ApiError && err.status === 413
+              ? `Файл «${file.name}» не загружен: файл больше лимита.`
+              : `Файл «${file.name}» не загружен: ${message(err)}`;
+        }
+      }
     } finally {
       uploading = false;
     }
+  }
+
+  function onfile(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const files = [...(input.files ?? [])];
+    input.value = '';
+    void attach(files, null);
   }
 
   // Предпросмотр: копирование кода; якорь этой же заметки — прокрутка внутри панели.
@@ -311,7 +337,7 @@
     <button type="button" onclick={() => fileInput?.click()} disabled={!ready || uploading}>
       Прикрепить файл
     </button>
-    <input class="file" type="file" bind:this={fileInput} onchange={onfile} tabindex="-1" aria-hidden="true" />
+    <input class="file" type="file" multiple bind:this={fileInput} onchange={onfile} tabindex="-1" aria-hidden="true" />
     <span class="state muted" role="status">
       {#if status}{status}{:else if dirty}Есть несохранённые изменения{:else if ready}Ревизия {rev}{/if}
     </span>
