@@ -2998,7 +2998,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.0.1-m0"
+version = "0.0.2-m1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3037,7 +3037,7 @@ dependencies = [
 
 [[package]]
 name = "zam-cli"
-version = "0.0.1-m0"
+version = "0.0.2-m1"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "zam-core"
-version = "0.0.1-m0"
+version = "0.0.2-m1"
 dependencies = [
  "rand 0.9.5",
  "rusqlite",
@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "zam-markdown"
-version = "0.0.1-m0"
+version = "0.0.2-m1"
 dependencies = [
  "ammonia",
  "comrak",
@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "zam-server"
-version = "0.0.1-m0"
+version = "0.0.2-m1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3116,7 +3116,7 @@ dependencies = [
 
 [[package]]
 name = "zam-store"
-version = "0.0.1-m0"
+version = "0.0.2-m1"
 dependencies = [
  "base64 0.22.1",
  "blake3",

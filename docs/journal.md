@@ -70,3 +70,24 @@
 - Первый прогон CI по PR (run 39123068896): `check (ubuntu-22.04)` упал на тесте `xtask package::tests::dumpbin_picks_highest_version` — путь к `dumpbin.exe` собирался строкой с `\`, на Linux это один компонент имени. Исправлено: путь из отдельных компонентов. Linux-комплект (`package-smoke / linux-x64`) прошёл smoke с первого раза.
 - Второй прогон (run 39123653004, `defef20`): web, check (ubuntu-22.04 и windows-latest) и package-smoke linux-x64 — success. Результат package-smoke windows-x64 проверить в следующей сессии. Затем merge в main и тег `v0.0.1-m0`.
 - Итог M0: все критерии этапа проверены локально на Windows (тесты, fmt, clippy, actionlint, check/build/size-limit WebUI, package + smoke, e2e WebUI). Не проверены до push: Linux-комплект и реальный прогон GitHub Actions.
+
+## 2026-10-18 — Этап M1 (заметки): итог
+- Выполнены задачи 1–13 плана `docs/plans/2026-10-18-m1-notes.md` на ветке `m1-notes`; решения и отложенные замечания — `docs/plans/2026-10-18-m1-notes-log.md`:
+  - `zam-markdown`: разбор с байтовыми позициями, секции, frontmatter, PATCH байтовым splice, рендер HTML (ammonia, syntect, callout, вложения);
+  - `zam-store`: узлы, ревизии, история и откат, корзина и перемещение, чанки секций, FTS5 (bm25 + trigram, RRF), блобы вложений;
+  - `zam-server`: REST API заметок, дерева, ревизий, рендера, вложений (Range, `sandbox`) и поиска (`degraded: true` — векторов ещё нет);
+  - CLI `zam`: `tree`, `read`, `write`, `history`, `search`, `attach`; smoke комплекта с заметкой;
+  - WebUI: дерево, просмотр документа с медиа, редактор с предпросмотром, история, поиск Ctrl+K, вложения.
+- Версия workspace и WebUI — `0.0.2-m1`.
+- Критерии M1 (§19 ТЗ) и тесты:
+  - создание, правка, история, поиск через CLI — `crates/zam-cli/tests/notes.rs` (`notes_full_cycle`, `solution_toml_scopes_write_and_search`), шаг smoke `zam write → search → read`;
+  - то же через WebUI — `web/e2e/editor.spec.ts` (правка, Ctrl+S, поиск Ctrl+K, история, дифф, откат; конфликт; CRLF; вложение), `web/e2e/notes.spec.ts` (документ, дерево, корзина);
+  - инвариант PATCH — `crates/zam-markdown/tests/patch.rs` (proptest `splice_keeps_bytes_outside_changed_range`, CRLF и BOM), API — `crates/zam-server/tests/nodes.rs` (`patch_from_two_machines`, `put_requires_if_match_and_reports_conflict_diff`);
+  - XSS-набор — `crates/zam-markdown/tests/xss.rs` (`xss_vectors_are_neutralized`, `xss_vectors_neutralized_inside_containers`), загруженные HTML/SVG — `crates/zam-server/tests/blobs.rs` (`svg_and_html_are_attachment_with_sandbox`);
+  - синтаксис FTS5 в запросе — `crates/zam-server/tests/search.rs` (`fts_syntax_is_plain_words`); Human и токены — `human_hidden_from_token`, `ro_token_reads_but_never_writes`, `rules_write_gated_by_setting`.
+- Прогоны (Windows 11, локально): `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` — чисто; `cargo test --workspace` — 391 passed, 0 failed, 2 ignored (бенчмарки FTS); `npm run check` — 0 ошибок; `npm run build`, `size-limit` — entry 54.95 КБ gzip из 300; `npm run e2e` (Edge) — 12 passed; `cargo xtask package` + `cargo xtask smoke` — `SMOKE OK`.
+- Замеры §17 (release, `.tmp/bench-m1.ps1`, localhost, 1000 заметок по ~2 КБ, 100 повторов; каталог данных на HDD Seagate ST4000NE001; 4 прогона, в первом заметки ~2.9 КБ):
+  - чтение узла по id (`GET /nodes/{id}?format=md`): p50 0.41–0.47 мс, p95 0.58–1.05 мс (цель ≤ 5) — выполнено;
+  - FTS-поиск (`POST /search`, 1–3 слова): p50 4.5–5.3 мс, p95 8.5–11.0 мс (цель ≤ 20) — выполнено;
+  - запись до FTS (`POST /nodes`, 201 после фиксации ревизии, чанков и FTS; заметка сразу находится поиском): p50 1.5 мс, p95 33–66 мс (цель ≤ 30) — **не выполнено на HDD**. 7–10 % записей ждут 370–720 мс при почти нулевом CPU сервера: это fsync автоматического checkpoint WAL на писателе (каждые 1000 страниц). Контрольный прогон с отключённым автоматическим checkpoint (локальная правка, не закоммичена): p95 2.84 мс, max 24.8 мс, загрузка корпуса 2.7 с вместо 21 с. Предложение — вынести checkpoint с пути записи (PASSIVE в фоне) — решение за владельцем / M2.
+- Не проверено локально: Linux-комплект (gnu `zam-server`, musl `zam`) и smoke с заметкой — выполняются в CI (`package.yml`) после push; замер на SSD (правило: данные только в каталоге проекта, а он на HDD).
