@@ -24,6 +24,8 @@
   let error = $state('');
   let shown = $state<IssuedToken | null>(null);
   let copied = $state(false);
+  let copyHint = $state('');
+  let tokenField = $state<HTMLInputElement | null>(null);
 
   // 401/403 означает потерю сессии, остальные ошибки показываем.
   async function guard(fn: () => Promise<void>) {
@@ -75,17 +77,34 @@
 
   function show(t: IssuedToken) {
     copied = false;
+    copyHint = '';
     shown = t;
   }
 
+  // Clipboard API есть только в secure context (HTTPS, localhost); по HTTP в LAN —
+  // выделение поля и execCommand('copy'), иначе подсказка скопировать вручную.
   async function copy() {
     if (!shown) return;
-    try {
-      await navigator.clipboard.writeText(shown.plaintext);
-      copied = true;
-    } catch {
-      error = 'Не удалось скопировать: выделите токен и скопируйте вручную';
+    copyHint = '';
+    if (window.isSecureContext && navigator.clipboard) {
+      try {
+        await navigator.clipboard.writeText(shown.plaintext);
+        copied = true;
+        return;
+      } catch {
+        // запасной путь ниже
+      }
     }
+    tokenField?.focus();
+    tokenField?.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch {
+      ok = false;
+    }
+    if (ok) copied = true;
+    else copyHint = 'Не удалось скопировать автоматически: токен выделен, скопируйте его вручную (Ctrl+C).';
   }
 
   reload();
@@ -163,11 +182,20 @@
       <Dialog.Description class="warn">
         Токен показан один раз и больше не будет показан. Сохраните его сейчас.
       </Dialog.Description>
-      <p><code style="word-break: break-all; user-select: all;">{shown?.plaintext}</code></p>
-      <div class="row">
+      <input
+        class="token-field"
+        readonly
+        aria-label="Токен"
+        value={shown?.plaintext ?? ''}
+        bind:this={tokenField}
+        onfocus={(e) => e.currentTarget.select()}
+      />
+      <div class="row" style="margin-top: 8px;">
         <button class="primary" onclick={copy}>{copied ? 'Скопировано' : 'Копировать'}</button>
         <Dialog.Close>Закрыть</Dialog.Close>
       </div>
+      {#if copied}<p class="muted" role="status">Токен скопирован в буфер обмена.</p>{/if}
+      {#if copyHint}<p class="error" role="alert">{copyHint}</p>{/if}
     </Dialog.Content>
   </Dialog.Portal>
 </Dialog.Root>

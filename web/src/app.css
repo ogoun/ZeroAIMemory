@@ -67,3 +67,4 @@ button:disabled { opacity: 0.5; cursor: default; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
 code { font-family: ui-monospace, Consolas, monospace; }
+.token-field { width: 100%; font-family: ui-monospace, Consolas, monospace; }
