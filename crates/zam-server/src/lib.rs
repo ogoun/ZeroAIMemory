@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod error;
 pub mod logging;
+pub mod web;
 
 #[cfg(test)]
 mod test_util;

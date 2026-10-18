@@ -1,5 +1,6 @@
-//! Git-хэш сборки: `ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short HEAD`, иначе "unknown".
-use std::path::Path;
+//! Сборочные шаги сервера: git-хэш (`ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short HEAD`,
+//! иначе "unknown") и подготовка ассетов WebUI из `web/dist` (см. `prepare_web`).
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// rerun-if-changed только для существующих путей (иначе пересборка при каждом запуске).
@@ -9,7 +10,55 @@ fn watch(p: &Path) {
     }
 }
 
+const STUB_INDEX: &str = concat!(
+    "<!doctype html>
+<html lang=\"ru\"><head><meta charset=\"UTF-8\" />",
+    "<base href=\"/\" /><title>ZeroAIMemory</title></head>",
+    "<body><p>WebUI не собран: выполните npm run build в web/.</p></body></html>
+"
+);
+
+/// Копирует `dir` в `dst` без корневого `index.html` (его отдаёт `web.rs` с подстановкой base href).
+fn copy_assets(dir: &Path, dst: &Path, root: bool) {
+    std::fs::create_dir_all(dst).expect("создать каталог ассетов");
+    for e in std::fs::read_dir(dir)
+        .expect("прочитать web/dist")
+        .flatten()
+    {
+        let (from, to) = (e.path(), dst.join(e.file_name()));
+        if from.is_dir() {
+            copy_assets(&from, &to, false);
+        } else if !(root && e.file_name() == "index.html") {
+            std::fs::copy(&from, &to).expect("скопировать ассет");
+        }
+    }
+}
+
+/// Готовит ассеты WebUI в `OUT_DIR`: исходное дерево не трогается. Нет `web/dist` — заглушка.
+fn prepare_web() {
+    let dist = Path::new("../../web/dist");
+    println!("cargo:rerun-if-changed=../../web/dist");
+    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let assets = out.join("web-assets");
+    let _ = std::fs::remove_dir_all(&assets);
+    let index = if dist.join("index.html").is_file() {
+        copy_assets(dist, &assets, true);
+        std::fs::read_to_string(dist.join("index.html")).expect("прочитать web/dist/index.html")
+    } else {
+        std::fs::create_dir_all(&assets).expect("создать каталог ассетов");
+        STUB_INDEX.to_string()
+    };
+    let index_path = out.join("web-index.html");
+    std::fs::write(&index_path, index).expect("записать index.html");
+    println!("cargo:rustc-env=ZAM_WEB_INDEX={}", index_path.display());
+    // Без вывода предупреждений memory-serve; ассеты всегда встраиваются в бинарь.
+    // SAFETY: build-скрипт однопоточен.
+    unsafe { std::env::set_var("MEMORY_SERVE_QUIET", "1") };
+    memory_serve::load_directory_with_embed(&assets, true);
+}
+
 fn main() {
+    prepare_web();
     println!("cargo:rerun-if-env-changed=ZAM_GIT_SHA");
     let git = Path::new("../../.git");
     // В worktree `.git` — файл: отслеживать нечего, остаётся ZAM_GIT_SHA.

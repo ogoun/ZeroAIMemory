@@ -69,8 +69,8 @@ async fn ready_ok() {
 #[tokio::test]
 async fn unknown_route_is_problem_json() {
     for (i, (base, uri)) in [
-        ("", "/nope"),
-        ("/memory", "/memory/nope"),
+        ("", "/api/nope"),
+        ("/memory", "/memory/api/nope"),
         ("/memory", "/other"),
     ]
     .into_iter()

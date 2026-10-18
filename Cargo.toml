@@ -23,7 +23,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "compression-br", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 tracing-appender = "0.2"
@@ -37,6 +37,7 @@ jiff = { version = "0.2", features = ["serde"] }
 base64 = "0.22"
 subtle = "2.6"
 cookie = "0.18"
+memory-serve = "2.4"
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]

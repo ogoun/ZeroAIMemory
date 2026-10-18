@@ -34,6 +34,10 @@ rpassword.workspace = true
 anyhow.workspace = true
 subtle.workspace = true
 cookie.workspace = true
+memory-serve.workspace = true
+
+[build-dependencies]
+memory-serve.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

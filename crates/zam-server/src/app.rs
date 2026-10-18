@@ -12,7 +12,7 @@ use zam_store::{DataDir, SystemStore, UserDbs};
 use crate::auth::AuthState;
 use crate::config::{AdminSecret, ServerConfig};
 use crate::error::not_found;
-use crate::{api, bootstrap};
+use crate::{api, bootstrap, web};
 
 /// Git-хэш сборки (см. build.rs).
 pub const GIT_SHA: &str = env!("ZAM_GIT_SHA");
@@ -119,11 +119,23 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
 
 fn router(state: AppState) -> Router {
     let base = state.cfg.server.base_path.clone();
-    let api = api::router().fallback(not_found).with_state(state);
+    let index = web::Index::new(&base);
+    let root = index.clone();
+    let api = api::router()
+        .merge(web::assets_router())
+        .fallback(move |m, u| web::fallback(index.clone(), m, u))
+        .with_state(state);
     let app = if base.is_empty() {
         api
     } else {
-        Router::new().nest(&base, api).fallback(not_found)
+        // `nest` не отдаёт «{base}/» вложенному роутеру — корень WebUI добавляем явно.
+        Router::new()
+            .route(
+                &format!("{base}/"),
+                axum::routing::get(move || std::future::ready(root.response())),
+            )
+            .nest(&base, api)
+            .fallback(not_found)
     };
     // Только метод, путь (без query: в ней может быть токен), статус и задержка.
     app.layer(
