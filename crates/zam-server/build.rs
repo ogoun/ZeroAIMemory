@@ -1,4 +1,4 @@
-//! Сборочные шаги сервера: git-хэш (`ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short HEAD`,
+//! Сборочные шаги сервера: git-хэш (`ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short=12 HEAD`,
 //! иначе "unknown") и подготовка ассетов WebUI из `web/dist` (см. `prepare_web`).
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -89,10 +89,11 @@ fn main() {
     }
     let sha = std::env::var("ZAM_GIT_SHA")
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().chars().take(12).collect::<String>())
+        .filter(|s| !s.is_empty())
         .or_else(|| {
             Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
+                .args(["rev-parse", "--short=12", "HEAD"])
                 .output()
                 .ok()
                 .filter(|o| o.status.success())

@@ -2122,7 +2122,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.0.1-m0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "zam-cli"
-version = "0.0.1"
+version = "0.0.1-m0"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "zam-core"
-version = "0.0.1"
+version = "0.0.1-m0"
 dependencies = [
  "rand",
  "rusqlite",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "zam-server"
-version = "0.0.1"
+version = "0.0.1-m0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2194,7 +2194,7 @@ dependencies = [
 
 [[package]]
 name = "zam-store"
-version = "0.0.1"
+version = "0.0.1-m0"
 dependencies = [
  "base64 0.22.1",
  "fs4",

@@ -1,4 +1,4 @@
-//! Git-хэш для `zam --version`: `ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short HEAD`.
+//! Git-хэш для `zam --version`: `ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short=12 HEAD`.
 use std::path::Path;
 use std::process::Command;
 
@@ -23,10 +23,11 @@ fn main() {
     }
     let sha = std::env::var("ZAM_GIT_SHA")
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().chars().take(12).collect::<String>())
+        .filter(|s| !s.is_empty())
         .or_else(|| {
             Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
+                .args(["rev-parse", "--short=12", "HEAD"])
                 .output()
                 .ok()
                 .filter(|o| o.status.success())

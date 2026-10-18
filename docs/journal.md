@@ -63,3 +63,4 @@
   - все workflow GitHub Actions: YAML проверен `actionlint` 1.7.12 (ошибок нет), но реальный прогон не выполнялся.
 - Релиз: тег `v0.0.1-m0` (создаёт владелец после push ветки и зелёного CI) даст черновик GitHub Release с четырьмя архивами и `SHA256SUMS`; ссылка на релиз будет добавлена после его создания.
 - Review Task 13 исправлен: `SHA256SUMS` строится только по собранным архивам (общий файл релиза пересчитывается в job `publish`), инструкция установки Linux согласована с юнитом systemd, license-checker закреплён (5.0.1), внешние команды smoke выполняются с таймаутом 15 с.
+- Fix round 1 (ревью Task 14): статический CRT для Windows (exe не требуют VC Redistributable; smoke проверяет `dumpbin /dependents`), версия workspace `0.0.1-m0` с проверкой тега в `release.yml`, хэш коммита 12 символов, job `test` перед publish, `concurrency` в `ci.yml`.

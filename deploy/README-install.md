@@ -62,7 +62,8 @@ zam status --url http://127.0.0.1:7700 --token <токен>
 ## Windows
 
 1. Распакуйте архив `zam-server-<версия>-windows-x64-cpu.zip`, например в `C:\ZeroAIMemory`.
-2. Рядом с `qdrant.exe` лежит app-local `vcruntime140.dll`, отдельная установка VC Redistributable не нужна.
+2. `zam-server.exe` и `zam.exe` собраны со статическим CRT, а рядом с `qdrant.exe` лежит app-local
+   `vcruntime140.dll`: отдельная установка VC Redistributable не нужна.
 3. Создайте `config.toml` и запустите `zam-server.exe serve --config config.toml`.
 4. Для работы в фоне зарегистрируйте запуск в Планировщике заданий или через менеджер служб (например, NSSM).
 

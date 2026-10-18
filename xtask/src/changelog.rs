@@ -24,13 +24,7 @@ pub fn section(text: &str, version: &str) -> Result<String> {
     if !found {
         bail!("в CHANGELOG.md нет раздела '## [{v}]'");
     }
-    let body = body
-        .join(
-            "
-",
-        )
-        .trim()
-        .to_string();
+    let body = body.join("\n").trim().to_string();
     if body.is_empty() {
         bail!("раздел '## [{v}]' в CHANGELOG.md пуст");
     }

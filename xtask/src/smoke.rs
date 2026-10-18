@@ -293,11 +293,45 @@ fn step<T>(n: u32, what: &str, r: Result<T>) -> Result<T> {
     r.map_err(|e| anyhow!("шаг {n} ({what}): {e:#}"))
 }
 
+/// Windows: exe комплекта не должны импортировать динамический CRT (VCRUNTIME/MSVCP/UCRT),
+/// иначе на чистой системе без VC Redistributable они не запустятся.
+fn check_static_crt(root: &Path) -> Result<()> {
+    let dumpbin = crate::package::find_dumpbin()?;
+    for exe in ["zam-server.exe", "zam.exe"] {
+        let out = output_with_timeout(
+            Command::new(&dumpbin)
+                .arg("/dependents")
+                .arg(root.join(exe)),
+            CMD_TIMEOUT,
+        )?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() {
+            bail!(
+                "dumpbin /dependents {exe}: код {:?}
+{text}",
+                out.status.code()
+            );
+        }
+        let bad = crate::package::forbidden_imports(&text);
+        if !bad.is_empty() {
+            bail!("{exe} импортирует динамический CRT: {}", bad.join(", "));
+        }
+    }
+    Ok(())
+}
+
 /// Выполняет smoke-тест; при успехе печатает `SMOKE OK`.
 pub fn run(archive: &Path, target: &Path) -> Result<()> {
     let name = archive_stem(archive)?;
     let dir = target.join("smoke").join(&name);
     let root = step(1, "распаковка", unpack(archive, &dir))?;
+    if host_platform(&root) == "windows-x64" {
+        step(
+            9,
+            "статический CRT (dumpbin /dependents)",
+            check_static_crt(&root),
+        )?;
+    }
     let data = dir.join("data");
     let port = free_port()?;
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();

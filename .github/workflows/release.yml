@@ -40,9 +40,42 @@ jobs:
           path: web/dist
           if-no-files-found: error
 
+  verify-version:
+    name: verify-version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: тег без v == версия workspace
+        run: |
+          set -euo pipefail
+          ws=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"$/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          echo "тег: ${tag}, workspace: ${ws}"
+          test -n "${ws}"
+          test "${tag}" = "${ws}"
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: web
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test
+        run: cargo test --workspace
+
   package:
     name: package
-    needs: web
+    needs: [web, verify-version]
     uses: ./.github/workflows/package.yml
     with:
       version: ${{ github.ref_name }}
@@ -50,7 +83,7 @@ jobs:
 
   publish:
     name: publish (draft)
-    needs: package
+    needs: [package, test]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

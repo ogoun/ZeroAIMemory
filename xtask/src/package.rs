@@ -268,11 +268,7 @@ pub fn write_sha256sums(dist: &Path, archives: &[PathBuf]) -> Result<PathBuf> {
     names.sort();
     let mut text = String::new();
     for n in &names {
-        text.push_str(&format!(
-            "{}  {n}
-",
-            sha256_file(&dist.join(n))?
-        ));
+        text.push_str(&format!("{}  {n}\n", sha256_file(&dist.join(n))?));
     }
     let out = dist.join("SHA256SUMS");
     fs::write(&out, text)?;
@@ -317,22 +313,12 @@ fn vcruntime_in(vs_root: &Path) -> Result<PathBuf> {
     bail!("vcruntime140.dll не найден в {}", msvc.display())
 }
 
-/// `ZAM_VCRUNTIME_DLL` или Visual Studio через vswhere.
-pub fn find_vcruntime() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("ZAM_VCRUNTIME_DLL") {
-        let p = PathBuf::from(p);
-        if !p.is_file() {
-            bail!(
-                "ZAM_VCRUNTIME_DLL указывает на несуществующий файл: {}",
-                p.display()
-            );
-        }
-        return Ok(p);
-    }
+/// Каталог установки Visual Studio с VC Tools (vswhere).
+fn vs_install_path() -> Result<PathBuf> {
     let vswhere =
         Path::new(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
     if !vswhere.is_file() {
-        bail!("vcruntime140.dll не найден: нет vswhere; задайте ZAM_VCRUNTIME_DLL");
+        bail!("не найден vswhere (Visual Studio не установлена)");
     }
     let out = Command::new(vswhere)
         .args([
@@ -348,9 +334,63 @@ pub fn find_vcruntime() -> Result<PathBuf> {
         .context("запуск vswhere")?;
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if path.is_empty() {
-        bail!("vswhere не нашёл Visual Studio с компонентом VC Tools; задайте ZAM_VCRUNTIME_DLL");
+        bail!("vswhere не нашёл Visual Studio с компонентом VC Tools");
     }
-    vcruntime_in(Path::new(&path))
+    Ok(PathBuf::from(path))
+}
+
+/// `ZAM_VCRUNTIME_DLL` или Visual Studio через vswhere.
+pub fn find_vcruntime() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("ZAM_VCRUNTIME_DLL") {
+        let p = PathBuf::from(p);
+        if !p.is_file() {
+            bail!(
+                "ZAM_VCRUNTIME_DLL указывает на несуществующий файл: {}",
+                p.display()
+            );
+        }
+        return Ok(p);
+    }
+    let vs = vs_install_path().context("vcruntime140.dll не найден; задайте ZAM_VCRUNTIME_DLL")?;
+    vcruntime_in(&vs)
+}
+
+/// `<vs>\VC\Tools\MSVC\<наибольшая версия>\bin\Hostx64\x64\dumpbin.exe`
+fn dumpbin_in(vs_root: &Path) -> Result<PathBuf> {
+    let msvc = vs_root.join("VC").join("Tools").join("MSVC");
+    let mut vers: Vec<String> = fs::read_dir(&msvc)
+        .with_context(|| format!("нет каталога {}", msvc.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    vers.sort_by_key(|v| version_key(v));
+    for v in vers.iter().rev() {
+        let p = msvc.join(v).join(r"bin\Hostx64\x64\dumpbin.exe");
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    bail!("dumpbin.exe не найден в {}", msvc.display())
+}
+
+pub fn find_dumpbin() -> Result<PathBuf> {
+    dumpbin_in(&vs_install_path()?)
+}
+
+/// Имена DLL из вывода `dumpbin /dependents`, которых не должно быть у exe со статическим CRT.
+pub fn forbidden_imports(dumpbin_output: &str) -> Vec<String> {
+    dumpbin_output
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.to_ascii_lowercase().ends_with(".dll") && !l.contains(' '))
+        .filter(|l| {
+            let n = l.to_ascii_lowercase();
+            ["vcruntime", "msvcp", "msvcr", "api-ms-win-crt", "ucrtbase"]
+                .iter()
+                .any(|p| n.starts_with(p))
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 // ---- лицензии ----
@@ -641,6 +681,38 @@ mod tests {
             "zam-web@0.1.0"
         );
         assert!(package_id_from_json(r#"{"name":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn forbidden_imports_detects_dynamic_crt() {
+        let ok = "Image has the following dependencies:
+
+    KERNEL32.dll
+    bcrypt.dll
+
+  Summary
+";
+        assert!(forbidden_imports(ok).is_empty());
+        let bad = "    KERNEL32.dll
+    VCRUNTIME140.dll
+    api-ms-win-crt-runtime-l1-1-0.dll
+    MSVCP140.dll
+";
+        assert_eq!(forbidden_imports(bad).len(), 3);
+    }
+
+    #[test]
+    fn dumpbin_picks_highest_version() {
+        let w = work("dumpbin");
+        for v in ["14.9.1", "14.44.35207"] {
+            touch(&w.join(format!("VC/Tools/MSVC/{v}/bin/Hostx64/x64/dumpbin.exe")));
+        }
+        assert!(
+            dumpbin_in(&w)
+                .unwrap()
+                .to_string_lossy()
+                .contains("14.44.35207")
+        );
     }
 
     #[test]
