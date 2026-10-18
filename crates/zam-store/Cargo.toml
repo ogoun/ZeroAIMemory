@@ -24,3 +24,4 @@ zam-markdown = { path = "../zam-markdown" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+rusqlite.workspace = true

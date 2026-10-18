@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use zam_core::Id;
 use zam_store::search::{FtsQuery, MARK_END, MARK_START, sanitize_fts, search_fts};
+use zam_store::time::fmt_ts;
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, NewNote, NodePath, SpaceKind, StoreError, UserDbs,
     create_note, delete_node, list_spaces,
@@ -77,7 +78,12 @@ fn sanitize_builds_quoted_prefix_terms() {
     assert_eq!(sanitize_fts("AND").as_deref(), Some(r#""AND"*"#));
     assert_eq!(
         sanitize_fts("NEAR(a b)").as_deref(),
-        Some(r#""NEAR"* "a"* "b"*"#)
+        Some(r#""NEAR"* "a" "b""#)
+    );
+    // слова короче 3 символов — точные термы: префикс «с»* раскрывается в тысячи термов
+    assert_eq!(
+        sanitize_fts("сборка с проверкой").as_deref(),
+        Some(r#""сборка"* "с" "проверкой"*"#)
     );
     for s in ["", "   ", "\"", "*", "(", "-:", "'; --"] {
         assert_eq!(sanitize_fts(s), None, "запрос {s:?}");
@@ -125,7 +131,8 @@ async fn uppercase_query_finds_lowercase() {
 #[tokio::test]
 async fn identifier_found_via_trigram() {
     let (db, k, _) = setup("tri").await;
-    // идентификатор внутри слова: unicode61 даёт токен «gitcore», не «core»
+    // unicode61 режет «mygit.core.autocrlf» на «mygit», «core», «autocrlf»:
+    // слово «git» в нём не найти, подстроку — только через trigram
     add(
         &db,
         k,
@@ -315,34 +322,240 @@ async fn top_k_limits_and_validates() {
     assert!(search_fts(&db, q("  ", &[k])).await.unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn mixed_query_uses_identifier_in_trigram() {
+    let (db, k, _) = setup("mixed").await;
+    // слова «настройка» здесь нет: строгий bm25 не находит, ослабленный (OR) —
+    // по «mygit» и «core», trigram — по идентификатору «mygit.core»
+    add(
+        &db,
+        k,
+        "git/attrs",
+        "# Ключи\n\nЗначение mygit.core.autocrlf=input.\n",
+    )
+    .await;
+    for i in 0..3 {
+        add(
+            &db,
+            k,
+            &format!("other{i}"),
+            "# Общее\n\nНастройка окружения и прочее.\n",
+        )
+        .await;
+    }
+    let hits = search_fts(&db, q("настройка mygit.core", &[k]))
+        .await
+        .unwrap();
+    assert_eq!(hits[0].path, "git/attrs", "{hits:?}");
+    assert!(hits.iter().any(|h| h.path.starts_with("other")));
+    // найден обоими каналами: балл выше максимума одного канала bm25 (1/61),
+    // сниппет — от bm25
+    assert!(hits[0].score > 1.0 / 61.0, "{}", hits[0].score);
+    assert!(hits[0].snippet.contains(MARK_START));
+}
+
+#[tokio::test]
+async fn short_words_and_long_query() {
+    let (db, k, _) = setup("short").await;
+    add(&db, k, "n", "# A\n\nсборка с проверкой в git\n").await;
+    // короткие слова ищутся точно и не ломают строгий запрос
+    let hits = search_fts(&db, q("сборка с проверкой", &[k]))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    // ровно 512 символов — можно, 513 — BadInput
+    let ok = "я".repeat(512);
+    assert!(search_fts(&db, q(&ok, &[k])).await.is_ok());
+    let long = "я".repeat(513);
+    assert!(matches!(
+        search_fts(&db, q(&long, &[k])).await,
+        Err(StoreError::BadInput(_))
+    ));
+}
+
 // ---------- нагрузка ----------
 
-/// 1000 заметок по 3 секции.
-async fn seed_1000(name: &str) -> (Db, Id) {
-    let (db, k, _) = setup(name).await;
-    for i in 0..1000 {
-        let body = format!(
-            "# Установка {i}\n\nПакет pkg{i} ставится скриптом install.sh, версия 1.{i}.\n\n\
-             # Настройка\n\nПараметр core.autocrlf и файл config{i}.toml для узла {i}.\n\n\
-             # Заметки\n\nПрочие сведения о сборке номер {i} и проверке.\n"
-        );
-        add(&db, k, &format!("Раздел{}/заметка {i}", i % 10), &body).await;
+/// Генератор псевдослучайных чисел (LCG) для воспроизводимого корпуса.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self, n: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as usize) % n
     }
+}
+
+const WORDS: &[&str] = &[
+    "сборка",
+    "проверка",
+    "установка",
+    "пакет",
+    "скрипт",
+    "файл",
+    "настройка",
+    "сервер",
+    "клиент",
+    "журнал",
+    "ошибка",
+    "запрос",
+    "ответ",
+    "память",
+    "заметка",
+    "каталог",
+    "ключ",
+    "значение",
+    "версия",
+    "сеть",
+    "в",
+    "с",
+    "и",
+    "на",
+    "по",
+    "для",
+    "не",
+    "от",
+    "build",
+    "test",
+    "deploy",
+    "config",
+    "cache",
+    "index",
+    "query",
+    "git",
+    "rust",
+    "cargo",
+    "linux",
+];
+const SYLLABLES: &[&str] = &[
+    "ка", "ро", "с", "ти", "на", "ле", "ми", "со", "пр", "ва", "ст", "ко", "ре", "де", "по", "ло",
+    "та", "ни", "ск", "ры",
+];
+
+/// Текст секции: слова словаря вперемешку с синтетическими (много разных термов,
+/// в том числе на «с», — нагрузка на префиксный поиск).
+fn section_text(rng: &mut Lcg, words: usize) -> String {
+    let mut out = Vec::with_capacity(words);
+    for _ in 0..words {
+        if rng.next(3) == 0 {
+            out.push(WORDS[rng.next(WORDS.len())].to_string());
+        } else {
+            let n = 2 + rng.next(3);
+            out.push(
+                (0..n)
+                    .map(|_| SYLLABLES[rng.next(SYLLABLES.len())])
+                    .collect(),
+            );
+        }
+    }
+    out.join(" ")
+}
+
+/// Вставляет `notes` заметок прямо в таблицы одной транзакцией (FTS заполняют
+/// триггеры `chunks`); `sections(i)` — пары (заголовок, текст) заметки `i`.
+async fn insert_notes(
+    db: &Db,
+    space: Id,
+    dir: &'static str,
+    notes: usize,
+    mut sections: impl FnMut(usize) -> Vec<(String, String)> + Send + 'static,
+) {
+    db.write(move |tx| {
+        let now = fmt_ts(jiff::Timestamp::now());
+        let mut node = tx.prepare(
+            "INSERT INTO nodes (id, space_id, kind, name, path, current_rev, index_state,
+                                created_at, updated_at)
+             VALUES (?1, ?2, 'note', ?3, ?4, 1, 'indexed', ?5, ?5)",
+        )?;
+        let mut chunk = tx.prepare(
+            "INSERT INTO chunks (id, node_id, rev, level, heading_path, ordinal, text,
+                                 context_prefix, token_count, text_hash)
+             VALUES (?1, ?2, 1, 'section', ?3, ?4, ?5, ?6, 40, ?1)",
+        )?;
+        for i in 0..notes {
+            let id = Id::new();
+            let name = format!("заметка {i}");
+            let path = format!("{dir}{}/{name}", i % 10);
+            node.execute(rusqlite::params![id, space, name, path, now])?;
+            for (ord, (head, text)) in sections(i).iter().enumerate() {
+                chunk.execute(rusqlite::params![
+                    format!("{id}-{ord}"),
+                    id,
+                    head,
+                    ord as i64,
+                    text,
+                    format!("[{dir}/{path}] {name} > {head}"),
+                ])?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+/// Корпус `notes` заметок по 3 секции в Knowledge.
+async fn seed(name: &str, notes: usize) -> (Db, Id) {
+    let (db, k, _) = setup(name).await;
+    let mut rng = Lcg(42);
+    insert_notes(&db, k, "Раздел", notes, move |i| {
+        vec![
+            (
+                "Установка".into(),
+                format!(
+                    "Пакет pkg{i} ставится install.sh. {}",
+                    section_text(&mut rng, 40)
+                ),
+            ),
+            (
+                "Настройка".into(),
+                format!(
+                    "Файл config{i}.toml, ключ mygit.core.autocrlf. {}",
+                    section_text(&mut rng, 40)
+                ),
+            ),
+            ("Заметки".into(), section_text(&mut rng, 40)),
+        ]
+    })
+    .await;
     (db, k)
+}
+
+#[tokio::test]
+async fn scope_filter_exact_when_most_matches_are_outside() {
+    // 450 совпадений вне области (больше предвыборки top 50 × 8) и 2 — в ней,
+    // вставлены последними: в глобальном top-400 их нет, нужен полный запрос
+    let (db, k, h) = setup("oversample").await;
+    let one = |text: &'static str| move |_| vec![("A".to_string(), text.to_string())];
+    insert_notes(&db, h, "чужое", 450, one("редкоеслово ab_cd1")).await;
+    insert_notes(&db, k, "своё", 2, one("редкоеслово ab_cd1")).await;
+    for s in ["редкоеслово", "ab_cd1"] {
+        let hits = search_fts(&db, q(s, &[k])).await.unwrap();
+        assert_eq!(hits.len(), 2, "{s}");
+        assert!(hits.iter().all(|x| x.space_id == k));
+    }
+    // а в области из обоих пространств — top_k
+    let hits = search_fts(&db, q("редкоеслово", &[k, h])).await.unwrap();
+    assert_eq!(hits.len(), 20);
 }
 
 const BENCH_QUERIES: &[&str] = &[
     "установка пакет",
     "core.autocrlf",
     "config42.toml",
-    "сборке проверке",
+    "сборка с проверкой",
+    "в файле с ключом",
+    "настройка mygit.core",
     "скрипт install",
     "несуществующее слово",
+    "сто",
 ];
 
 #[tokio::test]
 async fn search_over_1000_notes_completes() {
-    let (db, k) = seed_1000("load").await;
+    let (db, k) = seed("load", 1000).await;
     for s in BENCH_QUERIES {
         let hits = search_fts(&db, q(s, &[k])).await.unwrap();
         assert!(hits.len() <= 20);
@@ -351,26 +564,45 @@ async fn search_over_1000_notes_completes() {
     assert_eq!(hits[0].path, "Раздел2/заметка 42");
 }
 
-/// Замер p95: `cargo test -p zam-store --release --test search -- --ignored bench_fts_1000_notes --nocapture`.
-#[tokio::test]
-#[ignore]
-async fn bench_fts_1000_notes() {
-    let (db, k) = seed_1000("bench").await;
-    let mut times = Vec::new();
-    for _ in 0..50 {
-        for s in BENCH_QUERIES {
+async fn bench(notes: usize) {
+    let (db, k) = seed(&format!("bench-{notes}"), notes).await;
+    let mut all = Vec::new();
+    for s in BENCH_QUERIES {
+        let mut times = Vec::new();
+        for _ in 0..30 {
             let t = Instant::now();
             search_fts(&db, q(s, &[k])).await.unwrap();
             times.push(t.elapsed());
         }
+        times.sort();
+        println!(
+            "  {s:?}: p50={:?} max={:?}",
+            times[times.len() / 2],
+            times[times.len() - 1]
+        );
+        all.extend(times);
     }
-    times.sort();
-    let p = |x: f64| times[((times.len() as f64 * x) as usize).min(times.len() - 1)];
+    all.sort();
+    let p = |x: f64| all[((all.len() as f64 * x) as usize).min(all.len() - 1)];
     println!(
-        "FTS 1000×3: n={} p50={:?} p95={:?} max={:?}",
-        times.len(),
+        "FTS {notes}×3: n={} p50={:?} p95={:?} max={:?}",
+        all.len(),
         p(0.50),
         p(0.95),
-        times[times.len() - 1]
+        all[all.len() - 1]
     );
+}
+
+/// Замер p95: `cargo test -p zam-store --release --test search -- --ignored bench_fts --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn bench_fts_1000_notes() {
+    bench(1000).await;
+}
+
+/// То же на 30 тысячах чанков.
+#[tokio::test]
+#[ignore]
+async fn bench_fts_10000_notes() {
+    bench(10_000).await;
 }
