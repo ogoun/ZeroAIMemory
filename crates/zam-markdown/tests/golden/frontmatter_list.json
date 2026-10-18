@@ -1,0 +1,48 @@
+{
+  "body_start": 79,
+  "frontmatter": {
+    "raw": "tags:\r\n  - один\r\n  - 'два'\r\nindex: false\r\nother: { a: 1 }\r\n",
+    "tags": [
+      "один",
+      "два"
+    ],
+    "description": null,
+    "l0": null,
+    "index": false
+  },
+  "sections": [
+    {
+      "level": 0,
+      "title": "",
+      "path": [],
+      "anchor": "",
+      "range": [
+        79,
+        116
+      ],
+      "body": [
+        79,
+        116
+      ],
+      "text": "Текст сразу после.\r\n\r\n"
+    },
+    {
+      "level": 2,
+      "title": "Раздел",
+      "path": [
+        "Раздел"
+      ],
+      "anchor": "раздел",
+      "range": [
+        116,
+        133
+      ],
+      "body": [
+        133,
+        133
+      ],
+      "text": "## Раздел\r\n"
+    }
+  ],
+  "links": []
+}

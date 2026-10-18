@@ -1,0 +1,94 @@
+{
+  "body_start": 0,
+  "frontmatter": null,
+  "sections": [
+    {
+      "level": 1,
+      "title": "Отступ",
+      "path": [
+        "Отступ"
+      ],
+      "anchor": "отступ",
+      "range": [
+        3,
+        54
+      ],
+      "body": [
+        20,
+        54
+      ],
+      "text": "# Отступ #\n\n#Нет\n\n## Закрытый ##\n\n"
+    },
+    {
+      "level": 2,
+      "title": "Закрытый",
+      "path": [
+        "Отступ",
+        "Закрытый"
+      ],
+      "anchor": "закрытый",
+      "range": [
+        30,
+        54
+      ],
+      "body": [
+        53,
+        54
+      ],
+      "text": "## Закрытый ##\n\n"
+    },
+    {
+      "level": 1,
+      "title": "Дубль",
+      "path": [
+        "Дубль"
+      ],
+      "anchor": "дубль",
+      "range": [
+        54,
+        68
+      ],
+      "body": [
+        67,
+        68
+      ],
+      "text": "# Дубль\n\n"
+    },
+    {
+      "level": 1,
+      "title": "Дубль",
+      "path": [
+        "Дубль"
+      ],
+      "anchor": "дубль-1",
+      "range": [
+        68,
+        108
+      ],
+      "body": [
+        81,
+        108
+      ],
+      "text": "# Дубль\n\n## Hello, World! `код`\n"
+    },
+    {
+      "level": 2,
+      "title": "Hello, World! код",
+      "path": [
+        "Дубль",
+        "Hello, World! код"
+      ],
+      "anchor": "hello-world-код",
+      "range": [
+        82,
+        108
+      ],
+      "body": [
+        108,
+        108
+      ],
+      "text": "## Hello, World! `код`\n"
+    }
+  ],
+  "links": []
+}

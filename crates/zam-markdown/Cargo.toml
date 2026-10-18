@@ -1,0 +1,16 @@
+[package]
+name = "zam-markdown"
+description = "Разбор Markdown ZeroAIMemory: позиции, секции, ссылки (comrak)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+comrak.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+proptest.workspace = true
+pulldown-cmark.workspace = true

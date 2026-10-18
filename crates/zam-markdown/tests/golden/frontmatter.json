@@ -1,0 +1,45 @@
+{
+  "body_start": 147,
+  "frontmatter": {
+    "raw": "tags: [rust, \"markdown\"]\ndescription: \"Описание: с двоеточием\"\nl0: Краткая суть заметки.\nindex: true\n",
+    "tags": [
+      "rust",
+      "markdown"
+    ],
+    "description": "Описание: с двоеточием",
+    "l0": "Краткая суть заметки.",
+    "index": true
+  },
+  "sections": [
+    {
+      "level": 1,
+      "title": "Заголовок",
+      "path": [
+        "Заголовок"
+      ],
+      "anchor": "заголовок",
+      "range": [
+        147,
+        249
+      ],
+      "body": [
+        168,
+        249
+      ],
+      "text": "# Заголовок\n\nПервый абзац с **жирным** и [ссылкой](other.md#part).\n"
+    }
+  ],
+  "links": [
+    {
+      "kind": "markdown",
+      "target": "other.md",
+      "anchor": "part",
+      "label": "ссылкой",
+      "range": [
+        216,
+        247
+      ],
+      "text": "[ссылкой](other.md#part)"
+    }
+  ]
+}
