@@ -38,6 +38,8 @@ base64 = "0.22"
 subtle = "2.6"
 cookie = "0.18"
 memory-serve = "2.4"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+assert_cmd = "2"
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]
