@@ -318,3 +318,26 @@ async fn pending_count_counts_searched_spaces_only() {
     .await;
     assert_eq!(r.json()["pending_count"], 1, "{}", r.text());
 }
+
+#[tokio::test]
+async fn webui_brief_budget_fits_top_k_20() {
+    // параметры поиска WebUI (web/src/lib/api.ts): brief, top_k 20, 4000 токенов
+    let a = api("search-webui", |_| {}).await;
+    let long = "Очень длинное имя папки с пояснением".repeat(3);
+    for i in 0..25 {
+        let body = format!(
+            "# Раздел с длинным заголовком номер {i} про сборку проекта\n\n{}\n",
+            "общий текст про сборку и скрипты ".repeat(30)
+        );
+        a.note("knowledge", &format!("{long}/Заметка {i}"), &body)
+            .await;
+    }
+    let r = search(
+        &a,
+        json!({"query": "сборку", "scope": {"spaces": ["knowledge"]},
+               "mode": "brief", "top_k": 20, "budget_tokens": 4000}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["items"].as_array().unwrap().len(), 20);
+}

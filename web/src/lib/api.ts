@@ -335,10 +335,11 @@ export const search = (user: string, query: string, spaces: string[]) =>
     {
       query,
       scope: { spaces, include_human: true },
-      mode: 'chunks',
+      mode: 'brief',
       top_k: 20,
-      // в chunks бюджет делят и тексты чанков: с запасом, чтобы пришли все top_k
-      budget_tokens: 100_000,
+      // brief: путь, заголовок и сниппет (≤ 160 символов) — до ~600 символов на
+      // элемент; 4000 токенов × 4 символа с запасом вмещают все top_k
+      budget_tokens: 4000,
       format: 'json',
     },
     user,
