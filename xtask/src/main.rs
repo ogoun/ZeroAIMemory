@@ -1,5 +1,6 @@
 //! Вспомогательные задачи сборки: `cargo xtask <команда>`.
 
+mod changelog;
 mod fetch;
 mod manifest;
 mod package;
@@ -47,6 +48,11 @@ enum Cmd {
         /// Путь к zam (по умолчанию target/release/zam[.exe])
         #[arg(long)]
         cli_bin: Option<PathBuf>,
+    },
+    /// Напечатать тело раздела версии из CHANGELOG.md (для текста релиза)
+    ChangelogSection {
+        /// vX.Y.Z[-суффикс] или X.Y.Z[-суффикс]
+        version: String,
     },
     /// Smoke-тест комплекта сервера: распаковка, запуск, проверка API, zam и Qdrant
     Smoke {
@@ -200,6 +206,9 @@ fn main() -> Result<()> {
             server_bin,
             cli_bin,
         } => package_cmd(platform, flavor, version, server_bin, cli_bin),
+        Cmd::ChangelogSection { version } => {
+            changelog::run(&repo_root().join("CHANGELOG.md"), &version)
+        }
         Cmd::Smoke { archive } => smoke::run(&archive, &repo_root().join("target")),
     }
 }

@@ -59,3 +59,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+
+  package-smoke:
+    name: package-smoke
+    needs: web
+    uses: ./.github/workflows/package.yml
+    with:
+      version: 0.0.0-ci

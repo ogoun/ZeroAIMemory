@@ -50,3 +50,16 @@
 
 - Добавлен CLI `zam` (`crates/zam-cli`): `zam --version`, `zam status [--url] [--token] [--json]` с поиском настроек (флаги, ZAM_*, CLAUDE.md/AGENTS.md вверх от cwd, `~/.zeroaimemory/config.toml`); коды выхода 0/1/2/3. Без tokio, tracing и SQLite. HTTP-клиент ureq 3: прокси из окружения (ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY) учитываются, кроме loopback-хостов; битый `~/.zeroaimemory/config.toml` — ошибка конфигурации (exit 1); файлы настроек > 1 МиБ пропускаются.
 - Замер холодного старта `zam --version` (release, Windows 11, 50 запусков через `.tmp/bench-start.ps1`): среднее 5.8 мс, p95 7.7 мс при цели ≤ 20 мс.
+
+## 2026-10-18 — Этап M0 (каркас и конвейер релиза): итог
+- Выполнены задачи 0–14 плана `docs/plans/2026-10-18-m0-skeleton.md` на ветке `m0-skeleton`:
+  - `zam-core`, `zam-store`, `zam-server` (конфигурация, SQLite, каталог данных, аутентификация, admin API), WebUI-заглушка, CLI `zam status`;
+  - `cargo xtask fetch-deps|package|smoke|changelog-section`, манифесты зависимостей (Qdrant 1.19.2, ONNX Runtime 1.31.0, pdfium) с проверкой SHA-256;
+  - CI (`ci.yml`: web, check, package-smoke), релизный конвейер (`release.yml`) и переиспользуемый `package.yml` (сборка, упаковка и smoke-тест для Windows x64 и Linux x64).
+- Замеры холодного старта `zam --version` (release, Windows 11, 50 запусков): среднее 5.8 мс, p95 7.7 мс при цели ≤ 20 мс.
+- Локально на Windows: `cargo xtask package` и `cargo xtask smoke` — `SMOKE OK`.
+- Не проверено локально (проверяется после push):
+  - Linux-комплект целиком (сборка `zam-server` под gnu и `zam` под musl на ubuntu-22.04, упаковка tar.gz, smoke);
+  - все workflow GitHub Actions: YAML проверен `actionlint` 1.7.12 (ошибок нет), но реальный прогон не выполнялся.
+- Релиз: тег `v0.0.1-m0` (создаёт владелец после push ветки и зелёного CI) даст черновик GitHub Release с четырьмя архивами и `SHA256SUMS`; ссылка на релиз будет добавлена после его создания.
+- Review Task 13 исправлен: `SHA256SUMS` строится только по собранным архивам (общий файл релиза пересчитывается в job `publish`), инструкция установки Linux согласована с юнитом systemd, license-checker закреплён (5.0.1), внешние команды smoke выполняются с таймаутом 15 с.

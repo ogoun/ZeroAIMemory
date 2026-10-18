@@ -1,0 +1,85 @@
+# Релиз по тегу v*: web -> комплекты обеих платформ (сборка, упаковка, smoke) -> черновик GitHub Release.
+# Если упала любая платформа или любой smoke-тест, publish не запускается и релиз не создаётся.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ZAM_GIT_SHA: ${{ github.sha }}
+
+jobs:
+  web:
+    name: web
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: svelte-check
+        run: npm run check
+      - name: build
+        run: npm run build
+      - name: size-limit
+        run: npx size-limit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  package:
+    name: package
+    needs: web
+    uses: ./.github/workflows/package.yml
+    with:
+      version: ${{ github.ref_name }}
+      upload: true
+
+  publish:
+    name: publish (draft)
+    needs: package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: SHA256SUMS по всем архивам
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          test "$(ls zam-*.zip zam-*.tar.gz | wc -l)" -eq 4
+          sha256sum zam-*.zip zam-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: текст релиза из CHANGELOG.md
+        run: cargo xtask changelog-section "${GITHUB_REF_NAME}" > release-notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            dist/zam-*.zip
+            dist/zam-*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
