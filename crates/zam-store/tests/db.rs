@@ -158,3 +158,73 @@ async fn path_with_cyrillic_and_quote() {
     Db::open(&p, MIGS).unwrap();
     assert!(dir.join("б д.db.bak-v1").exists());
 }
+
+#[tokio::test]
+async fn writer_thread_is_joined_on_drop() {
+    let p = tmp("join");
+    let db = Db::open(&p, MIGS).unwrap();
+    db.write(|_| Ok(())).await.unwrap();
+    drop(db);
+    // На Windows rename падает, пока писатель держит файл открытым.
+    std::fs::rename(&p, p.with_file_name("moved.db")).unwrap();
+}
+
+#[tokio::test]
+async fn dangling_savepoint_does_not_break_next_write() {
+    let db = Db::open(&tmp("savepoint"), MIGS).unwrap();
+    db.write(|t| {
+        t.execute_batch("SAVEPOINT x")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    db.write(|t| {
+        t.execute("INSERT INTO t VALUES(5)", [])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn dangling_reader_transaction_is_rolled_back() {
+    let db = Db::open(&tmp("rd_tx"), MIGS).unwrap();
+    for _ in 0..8 {
+        db.read(|c| {
+            c.execute_batch("BEGIN")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    let open: bool = db.read(|c| Ok(!c.is_autocommit())).await.unwrap();
+    assert!(!open);
+}
+
+#[test]
+fn invalid_migration_lists_are_rejected() {
+    static DUP: &[Migration] = &[
+        Migration {
+            version: 1,
+            sql: "CREATE TABLE a(x);",
+        },
+        Migration {
+            version: 1,
+            sql: "CREATE TABLE b(x);",
+        },
+    ];
+    static GAP: &[Migration] = &[
+        Migration {
+            version: 1,
+            sql: "CREATE TABLE a(x);",
+        },
+        Migration {
+            version: 3,
+            sql: "CREATE TABLE b(x);",
+        },
+    ];
+    for (n, m) in [("dup", DUP), ("gap", GAP)] {
+        let r = Db::open(&tmp(n), m);
+        assert!(matches!(r, Err(StoreError::InvalidMigrations(_))), "{n}");
+    }
+}

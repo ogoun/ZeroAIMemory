@@ -30,6 +30,17 @@ pub fn apply(
     path: &Path,
     migrations: &[Migration],
 ) -> Result<u32, StoreError> {
+    // Валидация до любых обращений к файлу и транзакций.
+    for (i, m) in migrations.iter().enumerate() {
+        let expected = i as u32 + 1;
+        if m.version != expected {
+            return Err(StoreError::InvalidMigrations(format!(
+                "позиция {}: ожидалась версия {expected}, указана {} (нужны версии 1..N по порядку, без дубликатов и пропусков)",
+                i + 1,
+                m.version
+            )));
+        }
+    }
     let latest = migrations.iter().map(|m| m.version).max().unwrap_or(0);
     let current = user_version(conn)?;
     if current > latest {

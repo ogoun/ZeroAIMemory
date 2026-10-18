@@ -19,6 +19,12 @@ pub enum StoreError {
     NotFound,
     #[error("конфликт: {0}")]
     Conflict(String),
+    #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
+    DataDirLocked(std::path::PathBuf),
+    #[error("не поддерживается: {0}")]
+    Unsupported(String),
+    #[error("некорректный список миграций: {0}")]
+    InvalidMigrations(String),
     #[error("база закрыта или операция аварийно прервана")]
     Closed,
 }

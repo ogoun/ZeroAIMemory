@@ -1,9 +1,10 @@
 //! `Db`: один поток-писатель (транзакции IMMEDIATE) и пул read-only соединений.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -16,6 +17,7 @@ const READERS: usize = 4;
 type WriterJob = Box<dyn FnOnce(&mut Connection) + Send>;
 
 struct ReaderPool {
+    path: PathBuf,
     conns: Mutex<Vec<Connection>>,
     sem: Arc<Semaphore>,
 }
@@ -24,25 +26,62 @@ struct ReaderPool {
 struct PooledConn {
     conn: Option<Connection>,
     pool: Arc<ReaderPool>,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+fn open_reader(path: &Path) -> Result<Connection, StoreError> {
+    let r = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    set_common_pragmas(&r)?;
+    Ok(r)
 }
 
 impl Drop for PooledConn {
     fn drop(&mut self) {
-        if let Some(c) = self.conn.take() {
-            self.pool
-                .conns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(c);
+        let Some(mut c) = self.conn.take() else {
+            return;
+        };
+        // Незакрытая транзакция (в т.ч. при панике) не должна утечь в пул.
+        if !c.is_autocommit() && c.execute_batch("ROLLBACK").is_err() {
+            match open_reader(&self.pool.path) {
+                Ok(fresh) => c = fresh,
+                Err(_) => {
+                    // Заменить нечем: пул сжимается, пермит гасим, чтобы
+                    // инвариант «пермит ⇒ есть соединение» сохранился.
+                    if let Some(p) = self.permit.take() {
+                        p.forget();
+                    }
+                    return;
+                }
+            }
         }
+        self.pool
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(c);
     }
 }
 
 struct Inner {
-    // Закрытие отправителя (drop последнего Db) завершает поток-писатель.
-    writer: mpsc::Sender<WriterJob>,
+    // Option: в Drop отправитель закрывается раньше join потока-писателя.
+    writer: Option<mpsc::Sender<WriterJob>>,
+    thread: Option<JoinHandle<()>>,
     readers: Arc<ReaderPool>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        drop(self.writer.take());
+        if let Some(h) = self.thread.take() {
+            // Если последний Db уничтожается внутри самого писателя — join невозможен.
+            if h.thread().id() != std::thread::current().id() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 /// Дескриптор базы; дёшево клонируется.
@@ -68,35 +107,41 @@ impl Db {
     pub fn open(path: &Path, migrations: &'static [Migration]) -> Result<Db, StoreError> {
         let mut conn = Connection::open(path)?;
         set_common_pragmas(&conn)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(StoreError::Unsupported(format!(
+                "не удалось включить journal_mode=WAL (получено: {mode})"
+            )));
+        }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrate::apply(&mut conn, path, migrations)?;
 
         // Читатели открываются после того, как писатель создал файл и применил миграции.
         let mut readers = Vec::with_capacity(READERS);
         for _ in 0..READERS {
-            let r = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            set_common_pragmas(&r)?;
-            readers.push(r);
+            readers.push(open_reader(path)?);
         }
 
         let (tx, rx) = mpsc::channel::<WriterJob>();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("zam-db-writer".into())
             .spawn(move || {
                 let mut conn = conn;
                 while let Ok(job) = rx.recv() {
                     job(&mut conn);
+                    // Страховка: после любого задания соединение не в транзакции.
+                    if !conn.is_autocommit() {
+                        let _ = conn.execute_batch("ROLLBACK");
+                    }
                 }
             })?;
 
         Ok(Db {
             inner: Arc::new(Inner {
-                writer: tx,
+                writer: Some(tx),
+                thread: Some(thread),
                 readers: Arc::new(ReaderPool {
+                    path: path.to_path_buf(),
                     conns: Mutex::new(readers),
                     sem: Arc::new(Semaphore::new(READERS)),
                 }),
@@ -123,6 +168,8 @@ impl Db {
         });
         self.inner
             .writer
+            .as_ref()
+            .ok_or(StoreError::Closed)?
             .send(job)
             .map_err(|_| StoreError::Closed)?;
         rx.await.map_err(|_| StoreError::Closed)?
@@ -150,7 +197,7 @@ impl Db {
             let guard = PooledConn {
                 conn: Some(conn),
                 pool: pool.clone(),
-                _permit: permit,
+                permit: Some(permit),
             };
             f(guard.conn.as_ref().expect("соединение только что выдано"))
         })
