@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
-use pulldown_cmark::{Event, Options as PdOptions, Parser, Tag};
+use pulldown_cmark::{Event, LinkType, Options as PdOptions, Parser, Tag};
 use serde::Serialize;
 use zam_markdown::{
     Doc, Frontmatter, LineIndex, Link, LinkKind, Section, first_paragraph, outline, parse,
@@ -316,16 +316,10 @@ fn pulldown_headings(src: &str) -> Vec<(usize, usize)> {
     // pulldown-cmark не снимает BOM, а YAML-блоки ищет не только в начале файла:
     // разбираем тело после BOM и frontmatter (их границу проверяют отдельные тесты)
     let bom = parse(src).body_start;
-    let body = &src[bom..];
-    let mut opts = PdOptions::empty();
-    opts.insert(PdOptions::ENABLE_TABLES);
-    opts.insert(PdOptions::ENABLE_STRIKETHROUGH);
-    opts.insert(PdOptions::ENABLE_TASKLISTS);
-    opts.insert(PdOptions::ENABLE_FOOTNOTES);
     let li = LineIndex::new(src);
     let mut depth = 0usize;
     let mut out = Vec::new();
-    for (ev, range) in Parser::new_ext(body, opts).into_offset_iter() {
+    for (ev, range) in Parser::new_ext(&src[bom..], pulldown_options()).into_offset_iter() {
         match ev {
             Event::Start(Tag::Heading { .. }) if depth == 0 => {
                 let end = trim_line_end(src, bom + range.end);
@@ -338,6 +332,45 @@ fn pulldown_headings(src: &str) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+fn pulldown_options() -> PdOptions {
+    let mut opts = PdOptions::empty();
+    opts.insert(PdOptions::ENABLE_TABLES);
+    opts.insert(PdOptions::ENABLE_STRIKETHROUGH);
+    opts.insert(PdOptions::ENABLE_TASKLISTS);
+    opts.insert(PdOptions::ENABLE_FOOTNOTES);
+    opts
+}
+
+/// Диапазоны Markdown-ссылок и картинок по pulldown-cmark (вики-ссылки не включены).
+fn pulldown_links(src: &str) -> Vec<(usize, usize)> {
+    let bom = parse(src).body_start;
+    Parser::new_ext(&src[bom..], pulldown_options())
+        .into_offset_iter()
+        .filter_map(|(ev, r)| match ev {
+            Event::Start(Tag::Link { link_type, .. })
+                if !matches!(link_type, LinkType::WikiLink { .. }) =>
+            {
+                Some((bom + r.start, bom + r.end))
+            }
+            Event::Start(Tag::Image { .. }) => Some((bom + r.start, bom + r.end)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Диапазоны Markdown-ссылок и картинок по `zam_markdown`. Голые автоссылки GFM
+/// (`https://…`, `www.…` без `<>`) исключены намеренно: в pulldown-cmark их нет,
+/// сверять не с чем. Отличаются тем, что не начинаются с `[`, `!` или `<`.
+fn zam_links(src: &str) -> Vec<(usize, usize)> {
+    parse(src)
+        .links
+        .iter()
+        .filter(|l| matches!(l.kind, LinkKind::Markdown | LinkKind::Image))
+        .filter(|l| src[l.range.clone()].starts_with(['[', '!', '<']))
+        .map(|l| (l.range.start, l.range.end))
+        .collect()
 }
 
 fn trim_line_end(src: &str, mut end: usize) -> usize {
@@ -371,6 +404,17 @@ fn headings_match_pulldown_on_golden() {
     }
 }
 
+#[test]
+fn links_match_pulldown_on_golden() {
+    let mut total = 0;
+    for (path, src) in golden_sources() {
+        let zam = zam_links(&src);
+        total += zam.len();
+        assert_eq!(zam, pulldown_links(&src), "{}", path.display());
+    }
+    assert!(total >= 4, "в golden мало Markdown-ссылок: {total}");
+}
+
 fn md_line() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("# Заголовок".to_string()),
@@ -392,6 +436,15 @@ fn md_line() -> impl Strategy<Value = String> {
         Just("```".to_string()),
         Just("~~~".to_string()),
         Just("[[ссылка#якорь|текст]]".to_string()),
+        Just("см. [ссылку](путь/файл.md#якорь) и ![кот](img/кот.png)".to_string()),
+        Just("> цитата со [ссылкой](a.md \"заголовок\")".to_string()),
+        Just("- пункт [в списке](b.md)".to_string()),
+        Just("[разорванная".to_string()),
+        Just("ссылка](c.md)".to_string()),
+        Just("> [в цитате".to_string()),
+        Just("> через строку](d.md)".to_string()),
+        Just("<https://example.com/x> и https://bare.example.com".to_string()),
+        Just("[![вложенная](i.png)](e.md)".to_string()),
         "[a-zа-я ]{0,12}",
     ]
 }
@@ -408,6 +461,7 @@ proptest! {
     #[test]
     fn headings_match_pulldown_generated(src in md_doc()) {
         prop_assert_eq!(zam_headings(&src), pulldown_headings(&src), "{:?}", src);
+        prop_assert_eq!(zam_links(&src), pulldown_links(&src), "{:?}", src);
     }
 }
 
