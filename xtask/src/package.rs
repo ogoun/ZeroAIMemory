@@ -254,17 +254,25 @@ pub fn package(i: &Inputs) -> Result<(PathBuf, PathBuf)> {
     Ok((server, cli))
 }
 
-/// SHA256SUMS в формате `sha256sum` для всех архивов каталога.
-pub fn write_sha256sums(dist: &Path) -> Result<PathBuf> {
-    let mut names: Vec<String> = fs::read_dir(dist)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| (n.ends_with(".zip") || n.ends_with(".tar.gz")) && n.starts_with("zam"))
-        .collect();
+/// SHA256SUMS в формате `sha256sum` строго для перечисленных архивов (лежат в `dist`).
+/// Чужие архивы в каталоге (другая платформа) в файл не попадают.
+pub fn write_sha256sums(dist: &Path, archives: &[PathBuf]) -> Result<PathBuf> {
+    let mut names: Vec<String> = Vec::new();
+    for a in archives {
+        let n = a
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| format!("некорректный путь архива {}", a.display()))?;
+        names.push(n.to_string());
+    }
     names.sort();
     let mut text = String::new();
     for n in &names {
-        text.push_str(&format!("{}  {n}\n", sha256_file(&dist.join(n))?));
+        text.push_str(&format!(
+            "{}  {n}
+",
+            sha256_file(&dist.join(n))?
+        ));
     }
     let out = dist.join("SHA256SUMS");
     fs::write(&out, text)?;
@@ -373,6 +381,23 @@ fn strip_local_paths(json: &str) -> Result<String> {
     Ok(serde_json::to_string_pretty(&v)?)
 }
 
+/// Закреплённая версия license-checker (воспроизводимость сборки лицензий).
+const LICENSE_CHECKER: &str = "license-checker-rseidelsohn@5.0.1";
+
+/// `name@version` самого web-пакета из package.json (исключается из отчёта о лицензиях).
+fn web_package_id(package_json: &Path) -> Result<String> {
+    let text = fs::read_to_string(package_json)
+        .with_context(|| format!("чтение {}", package_json.display()))?;
+    package_id_from_json(&text).with_context(|| format!("разбор {}", package_json.display()))
+}
+
+fn package_id_from_json(json: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(json)?;
+    let name = v["name"].as_str().context("нет поля name")?;
+    let version = v["version"].as_str().context("нет поля version")?;
+    Ok(format!("{name}@{version}"))
+}
+
 /// Генерирует THIRD-PARTY-RUST.html (cargo-about) и THIRD-PARTY-WEB.json (license-checker).
 pub fn generate_licenses(root: &Path, out: &Path) -> Result<()> {
     if out.exists() {
@@ -392,13 +417,14 @@ pub fn generate_licenses(root: &Path, out: &Path) -> Result<()> {
     )?;
     // В бандл WebUI входят пакеты из devDependencies (сборка vite), поэтому проверяем всё дерево.
     let npx = if cfg!(windows) { "npx.cmd" } else { "npx" };
+    let web_pkg = web_package_id(&root.join("web").join("package.json"))?;
     let o = run(
         Command::new(npx).current_dir(root.join("web")).args([
             "--yes",
-            "license-checker-rseidelsohn",
+            LICENSE_CHECKER,
             "--json",
             "--excludePackages",
-            "zam-web@0.1.0",
+            &web_pkg,
         ]),
         "npx license-checker-rseidelsohn",
     )?;
@@ -591,18 +617,30 @@ mod tests {
     #[test]
     fn sha256sums_and_windows_requires_vcruntime() {
         let w = work("sums");
-        run_package(&w, "linux-x64", false).unwrap();
-        let sums = write_sha256sums(&w.join("dist")).unwrap();
+        let (a, b) = run_package(&w, "linux-x64", false).unwrap();
+        // Архив другой платформы в том же dist в SHA256SUMS не попадает.
+        let foreign = w.join("dist").join("zam-9.9.9-windows-x64.zip");
+        fs::write(&foreign, b"x").unwrap();
+        let sums = write_sha256sums(&w.join("dist"), &[a, b]).unwrap();
         let text = fs::read_to_string(sums).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         for l in lines {
             let (h, n) = l.split_once("  ").unwrap();
             assert_eq!(h.len(), 64);
-            assert!(n.starts_with("zam"));
+            assert!(n.starts_with("zam") && !n.contains("9.9.9"), "{n}");
         }
         let w = work("novc");
         assert!(run_package(&w, "windows-x64", false).is_err());
+    }
+
+    #[test]
+    fn web_package_id_reads_name_and_version() {
+        assert_eq!(
+            package_id_from_json(r#"{"name":"zam-web","version":"0.1.0"}"#).unwrap(),
+            "zam-web@0.1.0"
+        );
+        assert!(package_id_from_json(r#"{"name":"x"}"#).is_err());
     }
 
     #[test]

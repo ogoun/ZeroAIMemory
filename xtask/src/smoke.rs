@@ -1,10 +1,10 @@
 //! Smoke-тест комплекта: распаковка, запуск сервера, проверка API, клиента и Qdrant.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,6 +17,48 @@ use crate::manifest::Manifest;
 
 const TOKEN_PREFIX: &str = "ZeroAIMemoryToken=";
 const WAIT: Duration = Duration::from_secs(10);
+/// Предел для коротких вызовов (`zam status`, `qdrant --version`).
+const CMD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Запускает команду и ждёт не дольше `timeout`; по истечении процесс убивается, это ошибка.
+/// stdout/stderr читаются в потоках, чтобы переполнение канала не вешало дочерний процесс.
+fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("запуск процесса")?;
+    let mut out = child.stdout.take().context("stdout")?;
+    let mut err = child.stderr.take().context("stderr")?;
+    let t_out = thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let t_err = thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+    let t0 = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if t0.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("процесс не завершился за {} с, убит", timeout.as_secs_f32());
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Output {
+        status,
+        stdout: t_out.join().unwrap_or_default(),
+        stderr: t_err.join().unwrap_or_default(),
+    })
+}
 
 /// Имя архива без расширения.
 fn archive_stem(archive: &Path) -> Result<String> {
@@ -278,11 +320,12 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
     let out = step(
         5,
         "zam status",
-        Command::new(&zam)
-            .args(["status", "--url", &base, "--token", &token])
-            .current_dir(&dir)
-            .output()
-            .map_err(Into::into),
+        output_with_timeout(
+            Command::new(&zam)
+                .args(["status", "--url", &base, "--token", &token])
+                .current_dir(&dir),
+            CMD_TIMEOUT,
+        ),
     )?;
     if out.status.code() != Some(0) {
         bail!(
@@ -301,11 +344,10 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
     let out = step(
         7,
         "qdrant --version",
-        Command::new(&qbin)
-            .arg("--version")
-            .current_dir(&qdir)
-            .output()
-            .map_err(Into::into),
+        output_with_timeout(
+            Command::new(&qbin).arg("--version").current_dir(&qdir),
+            CMD_TIMEOUT,
+        ),
     )?;
     let text = format!(
         "{}{}",
@@ -328,4 +370,50 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
     }
     println!("SMOKE OK");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    fn echo() -> Command {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "echo", "hi"]);
+        c
+    }
+    #[cfg(not(windows))]
+    fn echo() -> Command {
+        let mut c = Command::new("echo");
+        c.arg("hi");
+        c
+    }
+    // Долгая команда без обёртки-оболочки: kill гарантированно закрывает её каналы.
+    #[cfg(windows)]
+    fn sleeper() -> Command {
+        let mut c = Command::new("ping");
+        c.args(["-n", "30", "127.0.0.1"]);
+        c
+    }
+    #[cfg(not(windows))]
+    fn sleeper() -> Command {
+        let mut c = Command::new("sleep");
+        c.arg("30");
+        c
+    }
+
+    #[test]
+    fn output_with_timeout_returns_output() {
+        let o = output_with_timeout(&mut echo(), Duration::from_secs(10)).unwrap();
+        assert!(o.status.success());
+        assert!(String::from_utf8_lossy(&o.stdout).contains("hi"));
+    }
+
+    #[test]
+    fn output_with_timeout_kills_slow_command() {
+        let t0 = Instant::now();
+        let e = output_with_timeout(&mut sleeper(), Duration::from_millis(300)).unwrap_err();
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        assert!(format!("{e:#}").contains("убит"), "{e:#}");
+    }
 }

@@ -71,21 +71,30 @@ zam status --url http://127.0.0.1:7700 --token <токен>
 ## Linux
 
 1. Распакуйте архив `zam-server-<версия>-linux-x64-cpu.tar.gz` в `/opt/zeroaimemory`
-   (исполняемые файлы: `zam-server`, `zam`, `qdrant/<версия>/qdrant`).
+   (лишний верхний каталог архива отбрасывается):
+
+   ```
+   sudo install -d /opt/zeroaimemory
+   sudo tar -xzf zam-server-<версия>-linux-x64-cpu.tar.gz --strip-components=1 -C /opt/zeroaimemory
+   ```
+
+   Исполняемые файлы: `/opt/zeroaimemory/zam-server`, `/opt/zeroaimemory/zam`,
+   `/opt/zeroaimemory/qdrant/<версия>/qdrant`.
 2. Создайте пользователя и каталоги:
 
    ```
    sudo useradd --system --home /var/lib/zeroaimemory --shell /usr/sbin/nologin zam
    sudo install -d -o zam -g zam /var/lib/zeroaimemory
    sudo install -d /etc/zeroaimemory
-   sudo cp config.example.toml /etc/zeroaimemory/config.toml
+   sudo cp /opt/zeroaimemory/config.example.toml /etc/zeroaimemory/config.toml
    ```
 
-   В `config.toml` укажите `data_dir = "/var/lib/zeroaimemory"` и `[admin] password_hash`.
+   В `config.toml` укажите `data_dir = "/var/lib/zeroaimemory"` и `[admin] password_hash`
+   (хэш: `echo "пароль" | /opt/zeroaimemory/zam-server hash-password`).
 3. Установите юнит systemd и запустите службу:
 
    ```
-   sudo cp systemd/zam-server.service /etc/systemd/system/
+   sudo cp /opt/zeroaimemory/systemd/zam-server.service /etc/systemd/system/
    sudo systemctl daemon-reload
    sudo systemctl enable --now zam-server
    sudo journalctl -u zam-server -n 50      # первый токен в рамке (stderr)

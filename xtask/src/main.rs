@@ -180,7 +180,7 @@ fn package_cmd(
         qdrant_version: &qv,
         out_dir: &dist,
     })?;
-    let sums = package::write_sha256sums(&dist)?;
+    let sums = package::write_sha256sums(&dist, &[server.clone(), cli.clone()])?;
     for p in [server, cli, sums] {
         println!("{}", p.display());
     }
