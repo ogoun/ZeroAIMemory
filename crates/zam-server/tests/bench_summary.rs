@@ -40,6 +40,8 @@ async fn measure(a: &Api, label: &str) {
 /// `notes` больших заметок `big/handbook*`; первым — одна из них.
 async fn measure_n(a: &Api, label: &str, notes: usize) {
     let mut lat = Vec::new();
+    // этапы из `timings` ответа: fts, embed, vector, fuse
+    let mut stages: [Vec<f64>; 4] = Default::default();
     for _ in 0..30 {
         let t = Instant::now();
         let r = a
@@ -52,15 +54,30 @@ async fn measure_n(a: &Api, label: &str, notes: usize) {
         lat.push(t.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(r.status, StatusCode::OK, "{}", r.text());
         let j: Value = r.json();
+        for (k, name) in ["fts_ms", "embed_ms", "vector_ms", "fuse_ms"]
+            .iter()
+            .enumerate()
+        {
+            stages[k].push(j["timings"][name].as_f64().unwrap_or(0.0));
+        }
         let first = j["items"][0]["path"].as_str().unwrap_or_default();
         assert!(first.starts_with("big/handbook"), "{j}");
         assert!(j["items"].as_array().unwrap().len() >= notes.min(10), "{j}");
     }
     lat.sort_by(f64::total_cmp);
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let [fts, embed, vector, fuse] = &mut stages;
     eprintln!(
-        "T8-BENCH {label}: {notes} × {SECTIONS} листов, p50 {:.1} мс, p95 {:.1} мс",
+        "T8-BENCH {label}: {notes} × {SECTIONS} листов, p50 {:.1} мс, p95 {:.1} мс (p50 этапов: fts {:.2}, embed {:.2}, vector {:.2}, fuse {:.2})",
         lat[lat.len() / 2],
-        lat[(lat.len() * 95 / 100).min(lat.len() - 1)]
+        lat[(lat.len() * 95 / 100).min(lat.len() - 1)],
+        med(fts),
+        med(embed),
+        med(vector),
+        med(fuse)
     );
 }
 

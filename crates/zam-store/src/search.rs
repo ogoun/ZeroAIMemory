@@ -606,6 +606,27 @@ pub async fn leaves_of_nodes(
     .await
 }
 
+/// Тексты чанков `ids`: `chunk_id → (text, context_prefix)`; отсутствующие пропускаются.
+/// Одним запросом (дочитать тексты только отобранных листов).
+pub async fn chunk_texts(
+    db: &Db,
+    ids: Vec<String>,
+) -> Result<HashMap<String, (String, String)>, StoreError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let list = serde_json::Value::from(ids).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT c.id, c.text, c.context_prefix
+             FROM json_each(?1) j CROSS JOIN chunks c ON c.id = j.value",
+        )?;
+        let rows = st.query_map([list], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
 /// Лист узла с числом найденных в нём слов запроса ([`leaf_term_hits`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafHit {
@@ -816,14 +837,19 @@ fn fetch_hits(
         .collect())
 }
 
-/// Первое вхождение `pat` в `chars` без учёта регистра: индекс символа.
-fn find_ci(chars: &[char], pat: &str) -> Option<usize> {
-    let pat: Vec<char> = pat.chars().collect();
-    if pat.is_empty() || pat.len() > chars.len() {
+/// Символ в нижнем регистре (первый символ `to_lowercase`): индексы символов сохраняются.
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Первое вхождение `pat` в `folded` (текст после [`fold`]) без учёта регистра: индекс
+/// символа. Текст сворачивается один раз на все подстроки, а не на каждое сравнение.
+fn find_ci(folded: &[char], pat: &str) -> Option<usize> {
+    let pat: Vec<char> = pat.chars().map(fold).collect();
+    if pat.is_empty() || pat.len() > folded.len() {
         return None;
     }
-    let same = |x: char, y: char| x == y || x.to_lowercase().eq(y.to_lowercase());
-    (0..=chars.len() - pat.len()).find(|&i| pat.iter().zip(&chars[i..]).all(|(&p, &t)| same(p, t)))
+    folded.windows(pat.len()).position(|w| w == pat.as_slice())
 }
 
 /// Сниппет из текста: до [`SNIPPET_CHARS`] символов вокруг первого вхождения
@@ -831,9 +857,10 @@ fn find_ci(chars: &[char], pat: &str) -> Option<usize> {
 /// маркерами. Ничего не нашлось — начало текста. Режется только по границам символов.
 pub fn text_snippet(text: &str, needles: &[&str]) -> String {
     let chars: Vec<char> = text.chars().collect();
+    let folded: Vec<char> = chars.iter().copied().map(fold).collect();
     let (start, len) = needles
         .iter()
-        .find_map(|n| find_ci(&chars, n).map(|i| (i, n.chars().count())))
+        .find_map(|n| find_ci(&folded, n).map(|i| (i, n.chars().count())))
         .unwrap_or((0, 0));
     let budget = SNIPPET_CHARS.saturating_sub(len);
     let mut from = start.saturating_sub(budget / 2);

@@ -53,11 +53,28 @@ fn leaf_fits(s: &Ranked, leaf: &Ranked) -> bool {
         && (s.level == Level::Note || in_section(&leaf.heading_path, &s.heading_path))
 }
 
-/// Сводки, для которых в `r` нет подходящего листа: для них вызывающий выбирает лист
-/// сам (`best_leaf` у [`note_to_leaf`]).
-pub fn summaries_without_leaf(r: &[Ranked]) -> Vec<&Ranked> {
+/// Сводки из первых `window` элементов `r`, для которых во **всём** `r` нет подходящего
+/// листа: для них вызывающий выбирает лист сам (`best_leaf` у [`note_to_leaf`]).
+pub fn summaries_without_leaf(r: &[Ranked], window: usize) -> Vec<&Ranked> {
     r.iter()
+        .take(window)
         .filter(|s| s.level.is_summary() && !r.iter().any(|l| leaf_fits(s, l)))
+        .collect()
+}
+
+/// Убирает сводки за окном (`window` первых элементов), у которых в `r` нет подходящего
+/// листа: лист им не выбирался ([`summaries_without_leaf`] берёт только окно), а после
+/// слияний они могли бы подняться в выдачу как сводки. Сводки со своим листом в `r`
+/// остаются — [`note_to_leaf`] сольёт их с ним.
+pub fn drop_unresolved_tail(r: Vec<Ranked>, window: usize) -> Vec<Ranked> {
+    let keep: Vec<bool> = r
+        .iter()
+        .enumerate()
+        .map(|(i, s)| i < window || !s.level.is_summary() || r.iter().any(|l| leaf_fits(s, l)))
+        .collect();
+    r.into_iter()
+        .zip(keep)
+        .filter_map(|(x, k)| k.then_some(x))
         .collect()
 }
 
@@ -171,7 +188,7 @@ mod tests {
             rh("sec-b", n, Level::Section, "B", 0.7, "vector"),
             rh("leaf-b", n, Level::Chunk, "B > C", 0.6, "fts"),
         ];
-        assert!(summaries_without_leaf(&list).is_empty());
+        assert!(summaries_without_leaf(&list, 10).is_empty());
         let out = cap_per_node(note_to_leaf(list, |_| unreachable!()), 3);
         let got: Vec<(&str, f64)> = out.iter().map(|x| (x.chunk_id.as_str(), x.score)).collect();
         assert_eq!(got, vec![("leaf-a", 0.9), ("leaf-b", 0.7)]);
@@ -181,13 +198,51 @@ mod tests {
             rh("leaf-a", n, Level::Chunk, "A", 0.8, "fts"),
             rh("sec-b", n, Level::Section, "B", 0.7, "vector"),
         ];
-        assert_eq!(summaries_without_leaf(&list).len(), 1);
+        assert_eq!(summaries_without_leaf(&list, 10).len(), 1);
         let out = note_to_leaf(list, |x| {
             assert_eq!(x.chunk_id, "sec-b");
             leaf("leaf-b", "B")
         });
         assert_eq!(out[1].chunk_id, "leaf-b");
         assert_eq!(out[1].heading_path, "B");
+    }
+
+    #[test]
+    fn window_summaries_and_tail() {
+        let (n, m, k) = (Id::new(), Id::new(), Id::new());
+        let list = vec![
+            // в окне: сводка n, её лист — за окном; сводка m без листа
+            rh("n-note", n, Level::Note, "", 0.9, "vector"),
+            rh("m-sec", m, Level::Section, "S", 0.8, "vector"),
+            rh("x", k, Level::Chunk, "", 0.7, "fts"),
+            // за окном: лист n и сводка k-секции без листа своей секции
+            rh("n-leaf", n, Level::Chunk, "A", 0.5, "fts"),
+            rh("k-sec", k, Level::Section, "B", 0.4, "fts"),
+        ];
+        // лист ищется по всему списку: сводке n лист не нужен, сводке m — нужен
+        let need: Vec<&str> = summaries_without_leaf(&list, 3)
+            .iter()
+            .map(|r| r.chunk_id.as_str())
+            .collect();
+        assert_eq!(need, vec!["m-sec"]);
+        // сводка за окном без своего листа отбрасывается, сводка в окне и лист — нет
+        let pruned = drop_unresolved_tail(list, 3);
+        let ids: Vec<&str> = pruned.iter().map(|r| r.chunk_id.as_str()).collect();
+        assert_eq!(ids, vec!["n-note", "m-sec", "x", "n-leaf"]);
+        // итог: ни одной сводки, у которой есть подходящий лист
+        let out = note_to_leaf(pruned, |r| {
+            assert_eq!(r.chunk_id, "m-sec");
+            None
+        });
+        let ids: Vec<(&str, Level)> = out.iter().map(|r| (r.chunk_id.as_str(), r.level)).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("n-leaf", Level::Chunk),
+                ("m-sec", Level::Section),
+                ("x", Level::Chunk)
+            ]
+        );
     }
 
     #[test]

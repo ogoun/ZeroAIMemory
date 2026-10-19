@@ -770,6 +770,15 @@ async fn neighbors_of_leaf() {
     assert_eq!(many.len(), 2);
     assert_eq!(many[&n], leaves);
     assert_eq!(many[&other].len(), 1);
+    // тексты отобранных листов — одним запросом
+    let texts = zam_store::chunk_texts(&db, vec![leaves[1].chunk_id.clone(), "нет".into()])
+        .await
+        .unwrap();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(
+        texts[&leaves[1].chunk_id],
+        (leaves[1].text.clone(), leaves[1].context_prefix.clone())
+    );
     // без текста — те же листы, пустые text и context_prefix
     let bare = zam_store::leaves_of_nodes(&db, vec![n], false)
         .await

@@ -86,6 +86,16 @@ opt-level = 3
 # sha256 файла модели (model_id в zam-ml): bge-m3 — 568 МБ
 [profile.dev.package.sha2]
 opt-level = 3
+# токенизатор (счётчик токенов чанкера и бюджета поиска) без оптимизаций в debug
+# медленнее в десятки раз: ~1 мс на карточку выдачи в тестах и замерах
+[profile.dev.package.tokenizers]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.unicode-normalization-alignments]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

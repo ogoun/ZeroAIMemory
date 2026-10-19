@@ -18,8 +18,8 @@ pub mod hybrid;
 pub mod pack;
 
 pub use adjust::{
-    LeafRef, RECENCY_FLOOR, cap_per_node, in_section, note_to_leaf, recency_factor,
-    summaries_without_leaf,
+    LeafRef, RECENCY_FLOOR, cap_per_node, drop_unresolved_tail, in_section, note_to_leaf,
+    recency_factor, summaries_without_leaf,
 };
 pub use hybrid::{Channel, ChunkMeta, Level, Ranked, SearchInputs, Weights, fuse};
 pub use pack::{Cost, Fit, pack, truncate_to_tokens};

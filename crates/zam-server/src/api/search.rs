@@ -76,15 +76,16 @@ use zam_core::Id;
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, embed_key_of};
 use zam_ml::Embedding;
 use zam_search::{
-    ChunkMeta, Cost, Fit, LeafRef, Level, Ranked, SearchInputs, Weights, cap_per_node, fuse,
-    in_section, note_to_leaf, pack, summaries_without_leaf, truncate_to_tokens,
+    ChunkMeta, Cost, Fit, LeafRef, Level, Ranked, SearchInputs, Weights, cap_per_node,
+    drop_unresolved_tail, fuse, in_section, note_to_leaf, pack, summaries_without_leaf,
+    truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
     ChunkScope, Db, FtsChannels, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
-    count_tokens, get_embeddings, get_node, get_solution, leaf_term_hits, leaves_of_nodes,
-    list_spaces, live_chunks, neighbor_leaves, node_content, pending_count, query_needles,
-    search_fts_channels, text_snippet,
+    chunk_texts, count_tokens, get_embeddings, get_node, get_solution, leaf_term_hits,
+    leaves_of_nodes, list_spaces, live_chunks, neighbor_leaves, node_content, pending_count,
+    query_needles, search_fts_channels, text_snippet,
 };
 
 use super::json_body;
@@ -308,8 +309,9 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 ///   (как в M1).
 ///
 /// Всё пакетно, без запроса на каждую сводку: совпадения слов — по индексу FTS без
-/// чтения текстов листов; листы с текстами (из них строится ключ кэша `embeddings`) —
-/// только при векторе, одним чтением на все узлы, эмбеддинги — одним `get_embeddings`.
+/// чтения текстов листов; при векторе — пути листов всех узлов одним чтением, тексты
+/// (из них строится ключ кэша `embeddings`) — только листов-кандидатов одним запросом,
+/// эмбеддинги — одним `get_embeddings`.
 async fn best_leaves(
     db: &Db,
     summaries: &[&Ranked],
@@ -325,16 +327,25 @@ async fn best_leaves(
     let fits = |r: &Ranked, hp: &str| r.level == Level::Note || in_section(hp, &r.heading_path);
     let mut out: HashMap<String, LeafRef> = HashMap::new();
     if let Some((q, model)) = query {
-        let leaves = leaves_of_nodes(db, nodes.clone(), true).await?;
-        let keys: HashMap<&str, String> = leaves
-            .values()
-            .flatten()
-            .map(|l| {
-                (
-                    l.chunk_id.as_str(),
-                    embed_key_of(&l.context_prefix, &l.text),
-                )
+        // пути листов без текстов; тексты (для ключа кэша) — только листов-кандидатов
+        let leaves = leaves_of_nodes(db, nodes.clone(), false).await?;
+        let mut need: Vec<String> = summaries
+            .iter()
+            .flat_map(|r| {
+                leaves
+                    .get(&r.node_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|l| fits(r, &l.heading_path))
+                    .map(|l| l.chunk_id.clone())
             })
+            .collect();
+        need.sort();
+        need.dedup();
+        let texts = chunk_texts(db, need).await?;
+        let keys: HashMap<&str, String> = texts
+            .iter()
+            .map(|(id, (text, prefix))| (id.as_str(), embed_key_of(prefix, text)))
             .collect();
         let all: Vec<String> = keys.values().cloned().collect();
         let embs = get_embeddings(db, model, &all).await?;
@@ -421,8 +432,10 @@ fn group_by_node(items: Vec<Item>, top_k: usize) -> Vec<Item> {
 
 /// Собственный текст секции `heading_path` (заголовок и текст до первой подсекции);
 /// пустой путь — преамбула. Если секций с таким путём несколько, берётся та, где лежит
-/// лист `leaf` (по его последней непустой строке: перекрытие чанкер добавляет в начало
-/// листа), иначе первая. `None` — секции нет.
+/// лист `leaf`: секции, содержащие самую длинную (наиболее специфичную) строку листа, а
+/// среди них — с наибольшей долей строк листа. Короткие однотипные строки (```` ``` ````,
+/// `---`, `</details>`) так секцию не решают. Ни одна не подошла — первая. `None` —
+/// секции нет.
 fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a str> {
     let doc = zam_markdown::parse(src);
     let own = |i: usize| {
@@ -444,12 +457,29 @@ fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a s
             }
         })
         .collect();
-    let last = leaf.lines().rev().map(str::trim).find(|l| !l.is_empty());
-    let by_leaf = last.and_then(|line| {
-        found
-            .iter()
-            .copied()
-            .find(|&i| own(i).is_some_and(|t| t.contains(line)))
+    let lines: Vec<&str> = leaf
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    // первая из самых длинных строк
+    let longest = lines.iter().copied().fold(None::<&str>, |b, l| match b {
+        Some(b) if b.chars().count() >= l.chars().count() => Some(b),
+        _ => Some(l),
+    });
+    let by_leaf = longest.and_then(|key| {
+        let mut best: Option<(usize, usize)> = None;
+        for &i in &found {
+            let Some(t) = own(i) else { continue };
+            if !t.contains(key) {
+                continue;
+            }
+            let n = lines.iter().filter(|l| t.contains(*l)).count();
+            if best.is_none_or(|(_, m)| n > m) {
+                best = Some((i, n));
+            }
+        }
+        best.map(|(i, _)| i)
     });
     own(by_leaf.or(found.first().copied())?)
 }
@@ -788,8 +818,10 @@ pub async fn search(
         .zip(st.index.model_id())
         .filter(|_| vrun.hits.is_some());
     let needles = query_needles(&req.query);
-    // листы — только для сводок окна: дальше окна выдача всё равно не идёт
-    let summaries = summaries_without_leaf(&ranked[..ranked.len().min(window)]);
+    // сводки за окном без своего листа — прочь (лист им не выбирается); листы ищутся
+    // для сводок окна, а наличие листа проверяется по всему списку
+    let ranked = drop_unresolved_tail(ranked, window);
+    let summaries = summaries_without_leaf(&ranked, window);
     let mut best = best_leaves(&db, &summaries, &needles, query_vec).await?;
     // листы-замены — живые чанки области; не нашёлся (узел перезаписан между чтениями) —
     // сводка остаётся как есть
@@ -1076,6 +1108,22 @@ mod tests {
         );
         assert_eq!(own_section(dup, "A", "первая"), Some("# A\n\nпервая"));
         assert_eq!(own_section(dup, "A", "нет такого"), Some("# A\n\nпервая"));
+        // однотипная концовка (```) не решает: по самой длинной строке листа
+        let code = "# A\n\n```sh\necho первый\n```\n\n# A\n\n```sh\necho второй вариант\n```\n";
+        assert_eq!(
+            own_section(code, "A", "```sh\necho второй вариант\n```"),
+            Some("# A\n\n```sh\necho второй вариант\n```")
+        );
+        assert_eq!(
+            own_section(code, "A", "```sh\necho первый\n```"),
+            Some("# A\n\n```sh\necho первый\n```")
+        );
+        // самая длинная строка есть в обеих — решает доля совпавших строк
+        let tie = "# A\n\nобщая длинная строка\nx1\n\n# A\n\nобщая длинная строка\ny2\n";
+        assert_eq!(
+            own_section(tie, "A", "общая длинная строка\ny2"),
+            Some("# A\n\nобщая длинная строка\ny2")
+        );
     }
 
     #[test]
