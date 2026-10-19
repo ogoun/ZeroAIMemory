@@ -62,11 +62,20 @@ pulldown-cmark = { version = "0.13", default-features = false }
 blake3 = "1"
 # M2: границы предложений UAX #29 (L0, перекрытие чанков §8.2)
 unicode-segmentation = "1.13"
+# M2: ONNX Runtime только load-dynamic (dylib рядом с exe), без ndarray (исследование 05 §1.3)
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "load-dynamic", "api-31", "cuda", "half", "tracing"] }
+# без regex-фичи tokenizers не собирается; fancy-regex — чистый Rust (исследование 05 §2.2)
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+# fp16-веса sparse-головы bge-m3 (sparse_linear.pt)
+half = "2"
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]
+opt-level = 3
+# sha256 файла модели (model_id в zam-ml): bge-m3 — 568 МБ
+[profile.dev.package.sha2]
 opt-level = 3
 
 [profile.release]

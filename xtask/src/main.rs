@@ -12,7 +12,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use manifest::{
-    CUDA_MANIFEST, CudaManifest, MANIFESTS, MODELS_MANIFEST, Manifest, ModelsManifest, PLATFORMS,
+    CUDA_MANIFEST, CudaManifest, MANIFESTS, MODEL_SPEC_FILE, MODELS_MANIFEST, Manifest,
+    ModelsManifest, PLATFORMS,
 };
 
 #[derive(Parser)]
@@ -197,6 +198,14 @@ fn fetch_models(ids: Vec<String>, test: bool, accept_nc: bool) -> Result<()> {
                 }
             );
         }
+        // описатель для zam-ml пишется атомарно (через временный файл в том же каталоге)
+        let spec = dir.join(MODEL_SPEC_FILE);
+        let tmp = dir.join(format!("{MODEL_SPEC_FILE}.part"));
+        std::fs::write(&tmp, m.spec_toml()?)
+            .with_context(|| format!("не удалось записать {}", tmp.display()))?;
+        std::fs::rename(&tmp, &spec)
+            .with_context(|| format!("не удалось записать {}", spec.display()))?;
+        println!("  {MODEL_SPEC_FILE}: записан");
     }
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Платформы поставки.
 pub const PLATFORMS: [&str; 2] = ["windows-x64", "linux-x64"];
@@ -135,7 +135,7 @@ pub enum ModelDevice {
 }
 
 /// Пулинг выхода `last_hidden_state`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Pooling {
     Cls,
@@ -180,17 +180,54 @@ pub struct ModelFile {
 }
 
 /// Описатель модели для zam-ml.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSpec {
     /// Размерность dense-вектора (embed, test).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dim: Option<usize>,
     /// Пулинг (embed, test).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pooling: Option<Pooling>,
     /// Файл sparse-головы из `files`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sparse_head: Option<String>,
     pub max_tokens_passage: usize,
     pub max_tokens_query: usize,
+    /// Активации квантуются динамически по всему тензору (`DynamicQuantizeLinear`):
+    /// соседи по батчу меняют вектор, поэтому zam-ml прогоняет такие модели по одному тексту.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dynamic_quant: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Содержимое `<models_dir>/<id>/model.toml`, которое читает `zam_ml::ModelSpec::load`.
+#[derive(Serialize)]
+struct ModelSpecFile<'a> {
+    id: &'a str,
+    #[serde(flatten)]
+    spec: &'a ModelSpec,
+}
+
+/// Имя описателя модели в её каталоге.
+pub const MODEL_SPEC_FILE: &str = "model.toml";
+
+impl ModelEntry {
+    /// `model.toml` для каталога модели: `id` и поля `[model.spec]` верхнего уровня.
+    pub fn spec_toml(&self) -> Result<String> {
+        let body = toml::to_string(&ModelSpecFile {
+            id: &self.id,
+            spec: &self.spec,
+        })
+        .context("не удалось сериализовать описатель модели")?;
+        Ok(format!(
+            "# Описатель модели для zam-ml; создан `cargo xtask fetch-models` из deploy/models.toml
+{body}"
+        ))
+    }
 }
 
 impl ModelsManifest {
@@ -487,6 +524,7 @@ files = [
 dim = 8
 pooling = "cls"
 sparse_head = "head.pt"
+dynamic_quant = true
 max_tokens_passage = 16
 max_tokens_query = 8
 
@@ -700,6 +738,24 @@ max_tokens_query = 8
         assert_eq!(test[0].spec.dim, Some(384));
         assert_eq!(get("bge-m3-int8").spec.dim, Some(1024));
         assert_eq!(get("bge-m3-fp16").device, ModelDevice::Gpu);
+    }
+
+    #[test]
+    fn model_spec_toml_roundtrip() {
+        let m = ModelsManifest::parse(&models_sample()).unwrap();
+        let text = m.model[0].spec_toml().unwrap();
+        let v: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(v["id"].as_str(), Some(m.model[0].id.as_str()));
+        assert_eq!(v["dim"].as_integer(), Some(8));
+        assert_eq!(v["pooling"].as_str(), Some("cls"));
+        assert_eq!(v["sparse_head"].as_str(), Some("head.pt"));
+        assert!(v.contains_key("max_tokens_passage") && v.contains_key("max_tokens_query"));
+        assert_eq!(v["dynamic_quant"].as_bool(), Some(true));
+        // у mean-модели без sparse-головы поля нет
+        let t2: toml::Table = toml::from_str(&m.model[1].spec_toml().unwrap()).unwrap();
+        assert_eq!(t2["pooling"].as_str(), Some("mean"));
+        assert!(!t2.contains_key("sparse_head"));
+        assert!(!t2.contains_key("dynamic_quant"));
     }
 
     // ---- deploy/cuda.toml ----

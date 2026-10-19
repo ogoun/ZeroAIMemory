@@ -13,7 +13,10 @@
 #   [model.spec]          — описатель для zam-ml: dim и pooling (cls | mean) для embed/test,
 #                           sparse_head (имя файла из files), max_tokens_passage и max_tokens_query.
 #                           Для реранкера запрос усекается до max_tokens_query, пара целиком —
-#                           до max_tokens_passage.
+#                           до max_tokens_passage. dynamic_quant = true — граф квантует активации
+#                           динамически по всему тензору (DynamicQuantizeLinear): соседи по батчу
+#                           меняют вектор (косинус ≈ 0,99), поэтому такие модели прогоняются по
+#                           одному тексту. Пишется в <id>/model.toml для zam-ml.
 #
 # Источники и хэши: docs/research/2026-10-19-05-m2-index-ml.md (§3, §4, §9); полные sha256
 # сверены с API Hugging Face (lfs.sha256, X-Linked-ETag), для файлов без LFS — посчитаны при загрузке.
@@ -36,6 +39,7 @@ pooling = "cls"
 sparse_head = "sparse_linear.pt"
 max_tokens_passage = 1024
 max_tokens_query = 512
+dynamic_quant = true
 
 # bge-m3 для GPU: fp16 от Xenova (входы i64, выход f32), токенизатор и sparse-голова те же.
 [[model]]
@@ -72,6 +76,7 @@ dim = 384
 pooling = "mean"
 max_tokens_passage = 256
 max_tokens_query = 128
+dynamic_quant = true
 
 # Реранкер для GPU: fp16-экспорт onnx-community от BAAI/bge-reranker-v2-m3 (Apache-2.0).
 [[model]]

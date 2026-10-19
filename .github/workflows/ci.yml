@@ -82,6 +82,9 @@ jobs:
       - name: fetch-models
         run: cargo xtask fetch-models --test
       - name: test
+        # тесты zam-ml без ORT или MiniLM падают, а не пропускаются
+        env:
+          ZAM_REQUIRE_ML: "1"
         run: cargo test --workspace
 
   package-smoke:
