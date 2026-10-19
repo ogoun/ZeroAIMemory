@@ -124,7 +124,9 @@ struct Inner {
     embedded: AtomicU64,
     jobs_done: AtomicU64,
     /// Папки, свёртку которых нужно пересчитать (старый родитель при переносе).
-    hints: Mutex<Vec<(Id, Id)>>,
+    /// Множество: без воркера (FTS-only) подсказки не забираются, а размер ограничен
+    /// числом папок.
+    hints: Mutex<HashSet<(Id, Id)>>,
     stop: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -209,7 +211,7 @@ impl WorkerHandle {
     /// API вызывает для старого родителя при переносе или переименовании узла — задание
     /// индексации знает только новое положение.
     pub fn rollup_hint(&self, user: Id, folder: Id) {
-        lock(&self.inner.hints).push((user, folder));
+        lock(&self.inner.hints).insert((user, folder));
         self.notify();
     }
 

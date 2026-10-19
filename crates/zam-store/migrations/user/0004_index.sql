@@ -1,10 +1,10 @@
 -- user DB, §6.3, §8.1, §8.2 ТЗ (этап M2): кэш эмбеддингов, outbox индексации,
 -- уровни чанков в FTS. Время — TEXT, формат zam_store::time.
 
--- Кэш эмбеддингов по тексту чанка: Qdrant пересобирается отсюда без инференса.
+-- Кэш эмбеддингов по эмбеддируемой строке чанка: Qdrant пересобирается отсюда без инференса.
 -- dense — f16 LE подряд; sparse — повторяющиеся пары (u32 LE id, f16 LE вес).
 CREATE TABLE embeddings (
-    text_hash  TEXT NOT NULL,          -- blake3 hex текста чанка (chunks.text_hash)
+    text_hash  TEXT NOT NULL,          -- blake3 hex эмбеддируемой строки: префикс + текст (zam_index::embed_key)
     model_id   TEXT NOT NULL,
     dense      BLOB NOT NULL,
     sparse     BLOB NOT NULL,

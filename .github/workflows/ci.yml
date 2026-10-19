@@ -80,7 +80,7 @@ jobs:
           path: |
             target/deps
             target/models
-          key: deps-models-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
+          key: deps-models-v2-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
       - name: fetch-deps
         run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
       - name: fetch-models

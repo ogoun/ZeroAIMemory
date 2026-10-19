@@ -71,12 +71,6 @@ pub fn fetch(manifest: &DepManifest, binary: &Path) -> anyhow::Result<String> {
     if !binary.is_file() {
         bail!("после установки нет {}", binary.display());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("права на {}", binary.display()))?;
-    }
     let mut out = format!(
         "Qdrant {} установлен: {} (SHA-256 архива сверен)",
         manifest.version,

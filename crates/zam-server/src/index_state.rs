@@ -262,6 +262,10 @@ impl IndexRuntime {
         if st.model_mismatch.is_some() {
             return Err(DegradedReason::ModelMismatch);
         }
+        // Воркер завершился (паника): сам не поднимется, «очередь догонит» неверно.
+        if !st.running {
+            return Err(DegradedReason::Broken);
+        }
         if !st.vector_ready {
             return Err(DegradedReason::QdrantDown);
         }

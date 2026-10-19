@@ -124,6 +124,26 @@ fn archive_err(e: impl std::fmt::Display) -> FetchError {
     FetchError::Invalid(format!("ошибка чтения архива: {e}"))
 }
 
+/// Права извлечённого файла на Unix: исполняемый в архиве (любой бит x) → 0o755,
+/// иначе 0o644. Без этого бинарник Qdrant из tar.gz не запускается (EACCES).
+/// На Windows права не применяются.
+fn set_mode(path: &Path, mode: Option<u32>) -> Result<(), FetchError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let m = if mode.is_some_and(|m| m & 0o111 != 0) {
+            0o755
+        } else {
+            0o644
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(m))
+            .map_err(FetchError::io(format!("права на {}", path.display())))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
 /// Извлекает из архива только перечисленные в `entry.extract` обычные файлы в `out`.
 pub fn extract_selected(
     archive: &Path,
@@ -158,8 +178,10 @@ pub fn extract_selected(
                     "'{w}' в архиве не является обычным файлом"
                 )));
             }
-            let mut o = File::create(out.join(&names[i])).map_err(FetchError::io(out_ctx()))?;
+            let to = out.join(&names[i]);
+            let mut o = File::create(&to).map_err(FetchError::io(out_ctx()))?;
             io::copy(&mut f, &mut o).map_err(archive_err)?;
+            set_mode(&to, f.unix_mode())?;
             found[i] = true;
         }
     } else if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
@@ -174,8 +196,11 @@ pub fn extract_selected(
                         "'{p}' в архиве не является обычным файлом"
                     )));
                 }
-                let mut o = File::create(out.join(&names[i])).map_err(FetchError::io(out_ctx()))?;
+                let to = out.join(&names[i]);
+                let mode = e.header().mode().ok();
+                let mut o = File::create(&to).map_err(FetchError::io(out_ctx()))?;
                 io::copy(&mut e, &mut o).map_err(archive_err)?;
+                set_mode(&to, mode)?;
                 found[i] = true;
             }
         }
@@ -386,10 +411,11 @@ mod tests {
             ("./root/lib/a.so", "AAA"),
             ("root/lib/b.so", "BBB"),
             ("root/other.txt", "X"),
+            ("root/bin/tool", "#!"),
         ] {
             let mut h = tar::Header::new_gnu();
             h.set_size(c.len() as u64);
-            h.set_mode(0o644);
+            h.set_mode(if n.ends_with("tool") { 0o755 } else { 0o644 });
             t.append_data(&mut h, n, c.as_bytes()).unwrap();
         }
         t.into_inner().unwrap().finish().unwrap();
@@ -440,6 +466,21 @@ mod tests {
         assert_eq!(std::fs::read(out.join("a.so")).unwrap(), b"AAA");
         assert_eq!(std::fs::read(out.join("libb.so")).unwrap(), b"BBB");
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_bit_survives_extraction() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmp("extract_mode");
+        let tgz_p = d.join("a.tgz");
+        make_tgz(&tgz_p);
+        let out = d.join("out");
+        let e = entry(&["root/bin/tool", "root/lib/b.so"], &[]);
+        extract_selected(&tgz_p, "https://x/a.tgz", &e, &out).unwrap();
+        let mode = |n: &str| std::fs::metadata(out.join(n)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("tool"), 0o755);
+        assert_eq!(mode("b.so"), 0o644);
     }
 
     #[test]
