@@ -9,6 +9,9 @@
 //!   запроса (токен ≥ 3 символов с `_ . / - :` или цифрами) через OR; если
 //!   идентификаторов нет — вся фраза, и только когда канал A ничего не нашёл.
 //! - Слияние weighted RRF (k = 60, веса 1.0 и 0.7), не больше 3 чанков на узел, top_k.
+//! - В FTS лежат листы (`chunk`) и L1 заметки (`note`, §8.2; L1 секций — только для
+//!   векторов). L1 заметки попадает в выдачу, только если ни один лист узла не найден:
+//!   он повторяет предложения листов, но находит заметку по словам из разных листов.
 //!
 //! Выборка двухшаговая в одной читающей транзакции: каналы отбирают только
 //! `rowid` и узел (глобальный top с запасом из индекса FTS, затем фильтр области;
@@ -16,7 +19,7 @@
 //! и `snippet()` читаются лишь для итоговых top_k. Фильтр области (пространства,
 //! префикс пути, живые узлы) действует до отсечения top-N канала.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
 use rusqlite::{Connection, ToSql, params, params_from_iter};
@@ -212,7 +215,10 @@ fn json_ids(ids: &[i64]) -> String {
     format!("[{}]", items.join(","))
 }
 
-/// Выполняет канал: `(seq, node_id)` по убыванию релевантности канала.
+/// Кандидат канала: `(seq, node_id, это L1 заметки)`.
+type Cand = (i64, Id, bool);
+
+/// Выполняет канал: кандидаты по убыванию релевантности канала.
 ///
 /// Ранжирование с соединением `chunks`/`nodes` для каждого совпадения дорого
 /// (на 30 тыс. чанков частое слово — ~30 мс), поэтому сначала берётся
@@ -226,7 +232,7 @@ fn run_channel(
     fts: &str,
     prefix: Option<&str>,
     spaces: &[Id],
-) -> Result<Vec<(i64, Id)>, StoreError> {
+) -> Result<Vec<Cand>, StoreError> {
     let (table, order, limit) = channel_spec(ch);
     let over = limit * OVERSAMPLE;
     let mut st = c.prepare_cached(&format!(
@@ -243,19 +249,21 @@ fn run_channel(
     let mut args: Vec<&dyn ToSql> = vec![&ids, &prefix];
     args.extend(spaces.iter().map(|s| s as &dyn ToSql));
     let mut st = c.prepare_cached(&format!(
-        "SELECT c.seq, c.node_id
+        "SELECT c.seq, c.node_id, c.level = 'note'
          FROM json_each(?1) j
          CROSS JOIN chunks c ON c.seq = j.value
          CROSS JOIN nodes n ON n.id = c.node_id
          WHERE {}",
         scope_sql(spaces.len())
     ))?;
-    let allowed: HashMap<i64, Id> = st
-        .query_map(params_from_iter(args), |r| Ok((r.get(0)?, r.get(1)?)))?
+    let allowed: HashMap<i64, (Id, bool)> = st
+        .query_map(params_from_iter(args), |r| {
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+        })?
         .collect::<Result<_, _>>()?;
-    let out: Vec<(i64, Id)> = top
+    let out: Vec<Cand> = top
         .iter()
-        .filter_map(|seq| allowed.get(seq).map(|node| (*seq, *node)))
+        .filter_map(|seq| allowed.get(seq).map(|(node, note)| (*seq, *node, *note)))
         .take(limit as usize)
         .collect();
     if out.len() as i64 == limit || (top.len() as i64) < over {
@@ -265,7 +273,7 @@ fn run_channel(
     let mut args: Vec<&dyn ToSql> = vec![&fts, &prefix];
     args.extend(spaces.iter().map(|s| s as &dyn ToSql));
     let mut st = c.prepare_cached(&format!(
-        "SELECT f.rowid, c.node_id
+        "SELECT f.rowid, c.node_id, c.level = 'note'
          FROM {table} f
          CROSS JOIN chunks c ON c.seq = f.rowid
          CROSS JOIN nodes n ON n.id = c.node_id
@@ -274,7 +282,9 @@ fn run_channel(
          LIMIT {limit}",
         scope_sql(spaces.len())
     ))?;
-    let rows = st.query_map(params_from_iter(args), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let rows = st.query_map(params_from_iter(args), |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -347,8 +357,27 @@ pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError>
     .await
 }
 
+/// Weighted RRF по чанкам, L1 заметки — только у узлов без найденных листов,
+/// лимит на узел, top_k.
+fn merge(a: Vec<Cand>, b: Vec<Cand>, top_k: usize) -> Vec<Ranked> {
+    let with_leaf: HashSet<Id> = a
+        .iter()
+        .chain(&b)
+        .filter(|(_, _, note)| !note)
+        .map(|(_, node, _)| *node)
+        .collect();
+    let keep = |c: &Cand| !c.2 || !with_leaf.contains(&c.1);
+    let strip = |l: Vec<Cand>| -> Vec<(i64, Id)> {
+        l.into_iter()
+            .filter(keep)
+            .map(|(seq, node, _)| (seq, node))
+            .collect()
+    };
+    rrf(strip(a), strip(b), top_k)
+}
+
 /// Weighted RRF по чанкам, лимит на узел, top_k.
-fn merge(a: Vec<(i64, Id)>, b: Vec<(i64, Id)>, top_k: usize) -> Vec<Ranked> {
+fn rrf(a: Vec<(i64, Id)>, b: Vec<(i64, Id)>, top_k: usize) -> Vec<Ranked> {
     let mut by_seq: HashMap<i64, (Id, f64, bool)> = HashMap::new();
     for (w, list, is_a) in [(W_BM25, a, true), (W_TRIGRAM, b, false)] {
         for (i, (seq, node)) in list.into_iter().enumerate() {

@@ -59,20 +59,23 @@ async fn count(db: &Db, sql: &'static str, arg: String) -> i64 {
         .unwrap()
 }
 
+/// Число листовых чанков (`level = 'chunk'`) заметки.
 async fn chunk_count(db: &Db, node: Id) -> i64 {
     count(
         db,
-        "SELECT count(*) FROM chunks WHERE node_id = ?1",
+        "SELECT count(*) FROM chunks WHERE node_id = ?1 AND level = 'chunk'",
         node.to_string(),
     )
     .await
 }
 
-/// `(heading_path, text)` чанков заметки по порядку.
+/// `(heading_path, text)` листовых чанков заметки по порядку.
 async fn chunk_rows(db: &Db, node: Id) -> Vec<(String, String)> {
     db.read(move |c| {
-        let mut st =
-            c.prepare("SELECT heading_path, text FROM chunks WHERE node_id = ?1 ORDER BY ordinal")?;
+        let mut st = c.prepare(
+            "SELECT heading_path, text FROM chunks
+             WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
+        )?;
         let rows = st.query_map([node], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     })
@@ -281,18 +284,20 @@ async fn list_children_and_find_by_name() {
 
 const THREE: &str = "# Обзор\n\nОбщие сведения.\n\n## Установка\n\nСтавим скрипты в PATH.\n\n#### Детали\n\nвнутри секции\n\n## Использование\n\nЗапуск через core.autocrlf.\n";
 
+/// Чанкер §8.2: короткие секции-соседи склеиваются, за листами (`chunk`) идёт L1
+/// заметки (`note`); в FTS — оба уровня.
 #[tokio::test]
-async fn chunks_per_section_and_fts() {
+async fn chunks_by_section_rules_and_fts() {
     let (db, space) = setup("chunks").await;
     let n = create_note(&db, note(space, "Инструменты/Bash скрипты", THREE))
         .await
         .unwrap();
-    assert_eq!(chunk_count(&db, n.id).await, 3);
+    assert_eq!(chunk_count(&db, n.id).await, 2);
 
-    let rows: Vec<(String, i64, String, String, String, String)> = db
+    let rows: Vec<(String, i64, String, String, String, String, i64)> = db
         .read(move |c| {
             let mut st = c.prepare(
-                "SELECT heading_path, ordinal, text, context_prefix, level, text_hash
+                "SELECT heading_path, ordinal, text, context_prefix, level, text_hash, token_count
                  FROM chunks WHERE node_id = ?1 ORDER BY ordinal",
             )?;
             let rows = st.query_map([n.id], |r| {
@@ -303,25 +308,33 @@ async fn chunks_per_section_and_fts() {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
         .await
         .unwrap();
-    let heads: Vec<_> = rows.iter().map(|r| r.0.as_str()).collect();
+    let heads: Vec<_> = rows.iter().map(|r| (r.0.as_str(), r.4.as_str())).collect();
     assert_eq!(
         heads,
-        vec!["Обзор", "Обзор > Установка", "Обзор > Использование"]
+        vec![
+            ("Обзор", "chunk"),
+            ("Обзор > Установка", "chunk"),
+            ("", "note")
+        ]
     );
     assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![0, 1, 2]);
+    // «Установка» и «Использование» — короткие соседи: один лист, путь первой секции,
+    // строка заголовка присоединённой секции остаётся в тексте
     assert!(!rows[1].2.contains("## Установка"));
     assert!(rows[1].2.contains("Ставим скрипты") && rows[1].2.contains("#### Детали"));
+    assert!(rows[1].2.contains("## Использование"));
     assert_eq!(
         rows[1].3,
         "[Knowledge/Инструменты/Bash скрипты] Bash скрипты > Обзор > Установка"
     );
-    assert!(rows.iter().all(|r| r.4 == "section" && r.5.len() == 64));
+    assert!(rows.iter().all(|r| r.5.len() == 64 && r.6 > 0));
 
     let hits = count(
         &db,
@@ -329,18 +342,13 @@ async fn chunks_per_section_and_fts() {
         "скрипты".into(),
     )
     .await;
-    // имя заметки «Bash скрипты» входит в context_prefix каждого чанка
+    // имя заметки «Bash скрипты» входит в context_prefix каждой строки FTS
     assert_eq!(hits, 3);
-    let in_text = count(
-        &db,
-        "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
-        "text : скрипты".into(),
-    )
-    .await;
-    assert_eq!(in_text, 1);
+    assert_eq!(fts_hits(&db, n.id, "скрипты").await, 1);
     let tri = count(
         &db,
-        "SELECT count(*) FROM chunks_fts_tri WHERE chunks_fts_tri MATCH ?1",
+        "SELECT count(*) FROM chunks_fts_tri f JOIN chunks c ON c.seq = f.rowid
+         WHERE chunks_fts_tri MATCH ?1 AND c.level = 'chunk'",
         "\"core.autocrlf\"".into(),
     )
     .await;
@@ -348,7 +356,7 @@ async fn chunks_per_section_and_fts() {
     let by_heading = count(
         &db,
         "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
-        "heading_path : использование".into(),
+        "heading_path : установка".into(),
     )
     .await;
     assert_eq!(by_heading, 1);
@@ -364,7 +372,7 @@ async fn preamble_chunk_and_whitespace_sections() {
         .read(move |c| {
             let mut st = c.prepare(
                 "SELECT heading_path, text, context_prefix FROM chunks
-                 WHERE node_id = ?1 ORDER BY ordinal",
+                 WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
             )?;
             let rows = st.query_map([n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -402,7 +410,7 @@ tags: [девопс, linux]
     let prefix: String = db
         .read(move |c| {
             Ok(c.query_row(
-                "SELECT context_prefix FROM chunks WHERE node_id = ?1",
+                "SELECT context_prefix FROM chunks WHERE node_id = ?1 AND level = 'chunk'",
                 [n.id],
                 |r| r.get(0),
             )?)
@@ -422,7 +430,8 @@ tags: [девопс, linux]
     ] {
         let hits = count(
             &db,
-            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+            "SELECT count(*) FROM chunks_fts f JOIN chunks c ON c.seq = f.rowid
+             WHERE chunks_fts MATCH ?1 AND c.level = 'chunk'",
             q.into(),
         )
         .await;
@@ -439,13 +448,7 @@ async fn index_false_keeps_fts_and_marks_excluded() {
     assert_eq!(chunk_count(&db, n.id).await, 1);
     assert_eq!(n.frontmatter.unwrap()["index"], serde_json::json!(false));
     assert_eq!(n.index_state, "excluded", "M2 пропустит векторизацию");
-    let all = count(
-        &db,
-        "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
-        "скрипты".into(),
-    )
-    .await;
-    assert_eq!(all, 1);
+    assert_eq!(fts_hits(&db, n.id, "скрипты").await, 1);
 }
 
 #[tokio::test]
@@ -584,7 +587,7 @@ async fn migrate_from_v1() {
         .read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
         .await
         .unwrap();
-    assert_eq!(ver, 3);
+    assert_eq!(ver, 4);
     let spaces = list_spaces(&db).await.unwrap();
     assert!(spaces.iter().any(|s| s.id == sid && s.name == "Проект"));
     let n = create_note(&db, note(sid, "после/миграции", "# H\n\nтекст\n"))
@@ -611,13 +614,13 @@ fn replace(section: &str, content: &str) -> PatchOp {
     }
 }
 
-/// Число чанков заметки, в тексте которых FTS находит слово.
+/// Число листовых чанков заметки, в тексте которых FTS находит слово.
 async fn fts_hits(db: &Db, node: Id, word: &str) -> i64 {
     let q = format!("text : {word}");
     db.read(move |c| {
         Ok(c.query_row(
             "SELECT count(*) FROM chunks_fts f JOIN chunks c ON c.seq = f.rowid
-             WHERE chunks_fts MATCH ?1 AND c.node_id = ?2",
+             WHERE chunks_fts MATCH ?1 AND c.node_id = ?2 AND c.level = 'chunk'",
             rusqlite::params![q, node],
             |r| r.get(0),
         )?)
@@ -772,7 +775,8 @@ async fn patch_other_section_with_old_base_rev() {
     assert!(text.contains("бета от машины Б"), "{text}");
     assert!(text.ends_with("хвост\n"), "{text}");
     assert!(!text.contains("старое слово"));
-    assert_eq!(fts_hits(&db, n.id, "машины").await, 2);
+    // обе короткие секции — один лист (§8.2)
+    assert_eq!(fts_hits(&db, n.id, "машины").await, 1);
 }
 
 #[tokio::test]
@@ -901,13 +905,13 @@ fn unified_diff_marks_lines() {
 
 const WORDY: &str = "# Раздел\n\nуникальнослово здесь\n";
 
-/// Число чанков заметки, у которых FTS находит слово в `context_prefix`.
+/// Число листовых чанков заметки, у которых FTS находит слово в `context_prefix`.
 async fn prefix_hits(db: &Db, node: Id, word: &str) -> i64 {
     let q = format!("context_prefix : {word}");
     db.read(move |c| {
         Ok(c.query_row(
             "SELECT count(*) FROM chunks_fts f JOIN chunks c ON c.seq = f.rowid
-             WHERE chunks_fts MATCH ?1 AND c.node_id = ?2",
+             WHERE chunks_fts MATCH ?1 AND c.node_id = ?2 AND c.level = 'chunk'",
             rusqlite::params![q, node],
             |r| r.get(0),
         )?)
@@ -1074,7 +1078,7 @@ async fn move_folder_rewrites_descendants() {
     let prefix: String = db
         .read(move |c| {
             Ok(c.query_row(
-                "SELECT context_prefix FROM chunks WHERE node_id = ?1",
+                "SELECT context_prefix FROM chunks WHERE node_id = ?1 AND level = 'chunk'",
                 [z.id],
                 |r| r.get(0),
             )?)

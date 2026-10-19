@@ -11,8 +11,8 @@ use rusqlite::{Connection, params};
 use zam_core::Id;
 use zam_markdown::{PatchError, PatchOp, apply_patch, section_bytes};
 
-use super::chunks::note_meta;
-use super::write::{index_state, store_revision};
+use super::chunks::{index_state, note_meta, space_kind};
+use super::write::store_revision;
 use super::{Attribution, Node, NodeKind, load_node, revision_text, sha256_hex};
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
@@ -225,6 +225,7 @@ fn commit_text(
     }
     let now = fmt_ts(Timestamp::now());
     let meta = note_meta(content, agent_l0);
+    let kind = space_kind(tx, node.space_id)?;
     let rev = node.current_rev + 1;
     tx.execute(
         "UPDATE nodes SET current_rev = ?2, content_hash = ?3, frontmatter = ?4, l0 = ?5,
@@ -237,10 +238,20 @@ fn commit_text(
             meta.frontmatter.as_ref().map(|v| v.to_string()),
             meta.l0,
             meta.l0_source,
-            index_state(&meta),
+            index_state(&meta, kind),
             now,
         ],
     )?;
-    store_revision(tx, node.id, rev, content, &hash, &meta, a, &now)?;
+    store_revision(
+        tx,
+        node.id,
+        rev,
+        content,
+        &hash,
+        &meta,
+        a,
+        Some(&node.index_state),
+        &now,
+    )?;
     load_node(tx, node.id)
 }

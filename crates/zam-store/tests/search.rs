@@ -285,7 +285,11 @@ async fn deleted_node_not_found() {
 async fn at_most_three_chunks_per_node() {
     let (db, k, _) = setup("cap").await;
     let body: String = (1..=5)
-        .map(|i| format!("# Раздел {i}\n\nповторяемое слово номер {i}\n\n"))
+        // секции не короче merge_below: чанкер §8.2 их не склеивает
+        .map(|i| {
+            let filler = "текст ".repeat(80);
+            format!("# Раздел {i}\n\nповторяемое слово номер {i}. {filler}\n\n")
+        })
         .collect();
     add(&db, k, "many", &body).await;
     add(&db, k, "single", "# Один\n\nповторяемое слово\n").await;
@@ -472,7 +476,7 @@ async fn insert_notes(
         let mut chunk = tx.prepare(
             "INSERT INTO chunks (id, node_id, rev, level, heading_path, ordinal, text,
                                  context_prefix, token_count, text_hash)
-             VALUES (?1, ?2, 1, 'section', ?3, ?4, ?5, ?6, 40, ?1)",
+             VALUES (?1, ?2, 1, 'chunk', ?3, ?4, ?5, ?6, 40, ?1)",
         )?;
         for i in 0..notes {
             let id = Id::new();
@@ -619,9 +623,10 @@ async fn pending_count_by_scope() {
     let gone = add(&db, k, "gone", "# Г\n").await;
     delete_node(&db, gone).await.unwrap();
     add(&db, h, "личное", "x").await;
-    // папка dir, заметка с index: false и удалённая не считаются
+    // папка dir, заметка с index: false, удалённая и Human (никогда не векторизуется,
+    // `excluded`) не считаются
     assert_eq!(pending_count(&db, vec![k], None).await.unwrap(), 2);
-    assert_eq!(pending_count(&db, vec![k, h], None).await.unwrap(), 3);
+    assert_eq!(pending_count(&db, vec![k, h], None).await.unwrap(), 2);
     assert_eq!(
         pending_count(&db, vec![k], Some("dir/".into()))
             .await
@@ -629,4 +634,26 @@ async fn pending_count_by_scope() {
         1
     );
     assert_eq!(pending_count(&db, vec![], None).await.unwrap(), 0);
+}
+
+// ---------- уровни чанков §8.2 ----------
+
+#[tokio::test]
+async fn note_level_only_when_no_leaf_matches() {
+    let (db, k, _) = setup("levels").await;
+    let filler = "текст ".repeat(80);
+    let body = format!(
+        "# Первая\n\nАльфаслово открывает раздел. {filler}\n\n# Вторая\n\nБетаслово открывает раздел. {filler}\n"
+    );
+    let id = add(&db, k, "две", &body).await;
+    // каждое слово — в своём листе: L1 заметки не дублирует лист
+    let hits = search_fts(&db, q("альфаслово", &[k])).await.unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].heading_path, "Первая");
+    // оба слова — только в L1 заметки (первые предложения разделов)
+    let hits = search_fts(&db, q("альфаслово бетаслово", &[k]))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!((hits[0].node_id, hits[0].heading_path.as_str()), (id, ""));
 }

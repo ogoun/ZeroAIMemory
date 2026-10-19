@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use zam_core::Id;
 
+use crate::jobs::PRIORITY_REINDEX;
 use crate::time::fmt_ts;
 use crate::{Db, Migration, StoreError};
 
@@ -27,6 +28,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: include_str!("../migrations/user/0003_revisions_append_only.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("../migrations/user/0004_index.sql"),
     },
 ];
 
@@ -112,6 +117,7 @@ impl UserDbs {
         }
         let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
         ensure_fixed_spaces(&db).await?;
+        rechunk_after_v4(&db).await?;
         open.insert(user, db.clone());
         Ok(db)
     }
@@ -132,6 +138,46 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
         Ok(())
     })
     .await
+}
+
+/// Ключ `meta`: разовая перечанковка после миграции 0004 ещё не выполнена.
+const RECHUNK_V4: &str = "rechunk_v4";
+
+/// Ruling R1: чанки M1 построены по секциям (`section`) и без векторов, поэтому при
+/// первом открытии базы v4 все живые заметки перечанковываются текущим счётчиком
+/// и получают `upsert`. Флаг снимается только после успеха: прерванная перечанковка
+/// повторится при следующем открытии (она идемпотентна). На большой базе — долго;
+/// в лог идут только счётчики.
+async fn rechunk_after_v4(db: &Db) -> Result<(), StoreError> {
+    let pending = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM meta WHERE key = ?1",
+                [RECHUNK_V4],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+        .await?;
+    if !pending {
+        return Ok(());
+    }
+    tracing::info!("перечанковка заметок после миграции индекса (v4)");
+    let started = std::time::Instant::now();
+    let (notes, upserts) = crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX).await?;
+    db.write(|tx| {
+        tx.execute("DELETE FROM meta WHERE key = ?1", [RECHUNK_V4])?;
+        Ok(())
+    })
+    .await?;
+    tracing::info!(
+        notes,
+        upserts,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "перечанковка после миграции индекса завершена"
+    );
+    Ok(())
 }
 
 /// Пространства: rules, human, knowledge, затем решения по имени.

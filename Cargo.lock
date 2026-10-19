@@ -3599,6 +3599,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "fs4",
+ "half",
  "jiff",
  "rand 0.9.5",
  "rusqlite",
@@ -3608,6 +3609,7 @@ dependencies = [
  "similar",
  "thiserror",
  "tokio",
+ "tracing",
  "zam-core",
  "zam-markdown",
 ]
