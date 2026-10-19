@@ -60,7 +60,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04]
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-22.04
+            platform: linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -71,6 +75,9 @@ jobs:
         with:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@v2
+      # тесты zam-index запускают настоящий Qdrant из target/deps и без него падают
+      - name: fetch-deps
+        run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
       - name: test
         run: cargo test --workspace
 

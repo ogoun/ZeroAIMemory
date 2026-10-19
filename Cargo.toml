@@ -12,7 +12,7 @@ rust-version = "1.92"
 
 # Общие версии зависимостей; крейты подключают через `dep.workspace = true`
 [workspace.dependencies]
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v7", "v5"] }
 rand = "0.9"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -68,6 +68,10 @@ ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
 # fp16-веса sparse-головы bge-m3 (sparse_linear.pt)
 half = "2"
+# M2: gRPC-клиент Qdrant без download_snapshots (reqwest) и serde (исследование 05 §5.2)
+qdrant-client = { version = "=1.19.0", default-features = false }
+# только tonic::Code/Status для разбора ошибок qdrant-client (клиент tonic не реэкспортирует)
+tonic = { version = "0.14", default-features = false }
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]

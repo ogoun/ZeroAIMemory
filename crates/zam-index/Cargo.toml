@@ -1,0 +1,19 @@
+[package]
+name = "zam-index"
+description = "Векторный индекс ZeroAIMemory: трейт VectorIndex и адаптер Qdrant (named dense + sparse, RRF)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+qdrant-client.workspace = true
+tonic.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zam-core = { path = "../zam-core" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+rand.workspace = true
