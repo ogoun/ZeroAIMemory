@@ -5,9 +5,10 @@
   import DocView from '../components/DocView.svelte';
   import Search from '../components/Search.svelte';
   import Tree, { type Reveal, type TreeChange } from '../components/Tree.svelte';
+  import IndexStatus from './IndexStatus.svelte';
   import Users from './Users.svelte';
   import { ApiError, listUsers, type Me, type NodeInfo, type User } from '../lib/api';
-  import { current, go, href, listen, type Route } from '../lib/router';
+  import { current, go, href, listen, routeUser, type Route } from '../lib/router';
 
   let { me, onlogout, onexpired }: { me: Me; onlogout: () => void; onexpired: () => void } = $props();
 
@@ -94,7 +95,7 @@
   }
 
   /** Пользователь, в заметках которого ищет Ctrl+K: открытый, иначе свой. */
-  let searchUser = $derived(route.name === 'admin' ? me.user_id : (route.user ?? me.user_id));
+  let searchUser = $derived(routeUser(route) ?? me.user_id);
 
   function onkeydown(e: KeyboardEvent) {
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
@@ -105,7 +106,8 @@
 
   let userName = $derived.by(() => {
     const r = route;
-    return r.name === 'admin' ? '' : (users.find((u) => u.id === r.user)?.name ?? '');
+    const u = routeUser(r);
+    return u ? (users.find((x) => x.id === u)?.name ?? '') : '';
   });
 </script>
 
@@ -125,8 +127,12 @@
     </button>
     <a class="brand" href={href({ name: 'home', user: me.user_id })}>ZeroAIMemory</a>
     <nav class="topnav" aria-label="Разделы">
-      <a href={href({ name: 'home', user: me.user_id })} aria-current={route.name !== 'admin' ? 'page' : undefined}>Заметки</a>
-      <a href={href({ name: 'admin' })} aria-current={route.name === 'admin' ? 'page' : undefined}>Администрирование</a>
+      <a href={href({ name: 'home', user: me.user_id })} aria-current={routeUser(route) ? 'page' : undefined}>Заметки</a>
+      <a href={href({ name: 'index' })} aria-current={route.name === 'index' ? 'page' : undefined}>Индекс</a>
+      <!-- на узком экране — короткая подпись (имя ссылки для доступности — полное) -->
+      <a href={href({ name: 'admin' })} aria-current={route.name === 'admin' ? 'page' : undefined} aria-label="Администрирование"
+        ><span class="long">Администрирование</span><span class="short" aria-hidden="true">Админ</span></a
+      >
     </nav>
     <button type="button" class="search-btn" onclick={() => (searchOpen = true)} title="Поиск (Ctrl+K)" aria-label="Поиск">
       <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8" /><path d="M13 13l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" /></svg>
@@ -151,6 +157,10 @@
     {#if route.name === 'admin'}
       <div class="admin">
         <Users onExpired={onexpired} />
+      </div>
+    {:else if route.name === 'index'}
+      <div class="admin">
+        <IndexStatus {users} {onexpired} />
       </div>
     {:else if route.name === 'node'}
       <DocView
@@ -216,6 +226,9 @@
   }
   .topnav a:hover {
     background: var(--hover);
+  }
+  .topnav .short {
+    display: none;
   }
   .topnav a[aria-current='page'] {
     color: var(--text);
@@ -300,6 +313,12 @@
     .topnav a {
       padding: 6px;
       font-size: 14px;
+    }
+    .topnav .long {
+      display: none;
+    }
+    .topnav .short {
+      display: inline;
     }
     .login,
     .search-btn kbd,

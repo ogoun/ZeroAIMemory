@@ -325,11 +325,23 @@ export interface SearchItem {
   /** Совпадения обрамлены U+E000 … U+E001. */
   snippet: string;
   score: number;
+  /** Каналы, нашедшие элемент: `vector`, `fts`, `trigram`. */
+  sources: string[];
 }
 
-/** Полнотекстовый поиск по пространствам пользователя (Human — только администратору). */
+export interface SearchResult {
+  items: SearchItem[];
+  /** Векторный канал выключен: выдача только полнотекстовая. */
+  degraded: boolean;
+  /** Причина деградации (`no_model`, `qdrant_down`, …) или `null`. */
+  degraded_reason: string | null;
+  /** Предупреждения (пока только о реранке). */
+  warnings: string[];
+}
+
+/** Гибридный поиск по пространствам пользователя (Human — только администратору). */
 export const search = (user: string, query: string, spaces: string[]) =>
-  call<{ items: SearchItem[] }>(
+  call<SearchResult>(
     'POST',
     'search',
     {
@@ -343,4 +355,68 @@ export const search = (user: string, query: string, spaces: string[]) =>
       format: 'json',
     },
     user,
+  );
+
+// ---- векторный индекс (администратор) ----
+
+export interface ReindexOutcome {
+  user: string | null;
+  space: string | null;
+  full: boolean;
+  finished_at: string;
+  result?: {
+    users: number;
+    nodes: number;
+    points: number;
+    folders: number;
+    misses: number;
+    folder_misses: number;
+    jobs: number;
+    gc_deleted: number;
+    recreated: boolean;
+    failed_users: { user_id: string; error: string }[];
+    elapsed_ms: number;
+  };
+  error?: string;
+}
+
+/** Ответ `GET /index/status` (crates/zam-server/src/api/index.rs). */
+export interface IndexStatus {
+  vector: { available: boolean; reason: string | null; hint: string | null };
+  /** `kind`: `cpu` | `cuda` | `null` (модель не загружена). */
+  device: { kind: string | null; reason: string };
+  model: { id: string | null; dim: number; collection_model: string | null; error: string | null };
+  qdrant: {
+    /** `off` | `starting` | `ready` | `restarting` | `broken` | `external`. */
+    state: string;
+    version: string | null;
+    rss_bytes: number | null;
+    points: number | null;
+    restarts: number;
+    error: string | null;
+  };
+  queue: { queued: number; running: number; failed: number; oldest: string | null };
+  failed_items: {
+    user_id: string;
+    node_id: string;
+    op: string;
+    error: string;
+    attempts: number;
+    updated_at: string;
+  }[];
+  reindex: { running: boolean; queued: boolean; last: ReindexOutcome | null };
+  /** Базы, пропущенные пересборкой коллекции (повтор — reindex). */
+  rebuild_skipped: { user_id: string; error: string; attempts: number }[];
+  /** Базы пользователей, которые не открылись (повреждены или недоступны). */
+  unavailable_dbs: { user_id: string; error: string }[];
+}
+
+export const indexStatus = () => call<IndexStatus>('GET', 'index/status');
+
+/** `POST /admin/reindex`: без `full` — из кэша embeddings, с `full` — перечанковка и инференс. */
+export const reindex = (full: boolean) =>
+  call<{ job_count: number; unavailable_dbs: { user_id: string; error: string }[] }>(
+    'POST',
+    'admin/reindex',
+    { full },
   );

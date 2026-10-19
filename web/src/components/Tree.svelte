@@ -26,7 +26,8 @@
     type Space,
     type User,
   } from '../lib/api';
-  import { go, href, type Route } from '../lib/router';
+  import { go, href, routeUser, type Route } from '../lib/router';
+  import IndexBadge from './IndexBadge.svelte';
 
   interface Props {
     /** Пользователи; свой — первым. */
@@ -69,15 +70,8 @@
   const parentPath = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
   const lastSegment = (p: string) => p.slice(p.lastIndexOf('/') + 1);
 
-  const INDEX_STATE: Record<string, string> = {
-    pending: 'индексация: в очереди',
-    indexed: 'индексация: готово',
-    failed: 'индексация: ошибка',
-    excluded: 'индексация: исключено',
-  };
-
   /** Пользователь корзины — тот, в чьём контексте открыт интерфейс. */
-  let trashUser = $derived(route.name !== 'admin' && route.user ? route.user : ownId);
+  let trashUser = $derived(routeUser(route) ?? ownId);
   let trashUserName = $derived(users.find((u) => u.id === trashUser)?.name ?? '');
 
   function fail(key: string, e: unknown) {
@@ -398,10 +392,7 @@
             >
               {@render icon('note')}<span class="name">{n.name}</span>
             </a>
-            <span
-              class="state state-{n.index_state}"
-              title={INDEX_STATE[n.index_state] ?? `индексация: ${n.index_state}`}
-            ></span>
+            <IndexBadge state={n.index_state} />
           {:else}
             <button
               type="button"
@@ -643,26 +634,6 @@
     border-radius: 8px;
     background: var(--chip);
     color: var(--muted);
-  }
-  .state {
-    flex: none;
-    width: 6px;
-    height: 6px;
-    margin: 0 4px;
-    border-radius: 50%;
-    background: transparent;
-  }
-  .state-pending {
-    background: var(--border);
-  }
-  .state-indexed {
-    background: #2e9d5b;
-  }
-  .state-failed {
-    background: var(--danger);
-  }
-  .state-excluded {
-    border: 1px solid var(--muted);
   }
   .more {
     flex: none;

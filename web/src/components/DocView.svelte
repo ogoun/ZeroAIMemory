@@ -6,6 +6,7 @@
   import { tick, untrack } from 'svelte';
   import Editor from './Editor.svelte';
   import History from './History.svelte';
+  import IndexBadge from './IndexBadge.svelte';
   import Lightbox from './Lightbox.svelte';
   import {
     ApiError,
@@ -189,6 +190,13 @@
     }
   }
 
+  /** Состояние индексации рядом с ревизией (подробная подсказка — у значка). */
+  const INDEX_SHORT: Record<string, string> = {
+    pending: 'в очереди на индексацию',
+    failed: 'индексация не удалась',
+    excluded: 'не индексируется',
+  };
+
   const fmtTime = (ts: string) => {
     const d = new Date(ts);
     return Number.isNaN(d.getTime()) ? ts : d.toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' });
@@ -220,6 +228,9 @@
     {#if info}
       <div class="meta muted">
         ревизия {info.current_rev} · изменено {fmtTime(info.updated_at)}
+        {#if info.kind === 'note' && info.index_state !== 'indexed'}
+          · <span class="istate"><IndexBadge state={info.index_state} />{INDEX_SHORT[info.index_state] ?? info.index_state}</span>
+        {/if}
       </div>
       {#if tags.length || description}
         <div class="front">
@@ -347,6 +358,9 @@
   .meta {
     margin-top: 2px;
     font-size: 12px;
+  }
+  .istate {
+    white-space: nowrap;
   }
   .front {
     display: flex;
