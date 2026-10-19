@@ -16,7 +16,7 @@ pub mod time;
 pub mod user_db;
 
 pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, resolve_attachment};
-pub use datadir::DataDir;
+pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS};
 pub use db::{Db, DbOptions};
 pub use embeddings::{
     Embedding, adopt_owned_embeddings, embed_input_of, embed_key_of, gc_embeddings, get_embeddings,
@@ -69,6 +69,19 @@ pub enum StoreError {
     BadInput(String),
     #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
     DataDirLocked(std::path::PathBuf),
+    /// Windows: путь каталога данных так длинен, что файлы внутри него (базы SQLite, их
+    /// копии перед миграцией, рабочий каталог Qdrant) выходят за MAX_PATH (260).
+    #[error(
+        "каталог данных {} слишком длинный для Windows: {len} символов при пределе {max} \
+         (пути файлов внутри него превысили бы MAX_PATH = 260). Укажите более короткий путь: \
+         data_dir в zam.toml, ZAM_DATA_DIR или --data-dir",
+        .path.display()
+    )]
+    DataDirTooLong {
+        path: std::path::PathBuf,
+        len: usize,
+        max: usize,
+    },
     #[error("повреждённые данные: {0}")]
     Corrupt(String),
     #[error("не поддерживается: {0}")]

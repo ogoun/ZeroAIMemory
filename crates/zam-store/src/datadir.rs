@@ -20,9 +20,37 @@ pub struct DataDir {
     _lock: File,
 }
 
+/// Предел длины абсолютного пути каталога данных на Windows, символов UTF-16 (так считает
+/// MAX_PATH = 260 с завершающим нулём). Rust и Qdrant (пути хранилища `\\?\`) работают с
+/// длинными путями, но SQLite открывает файлы обычными путями Win32, а рабочий каталог
+/// процесса Qdrant ограничен MAX_PATH всегда. Самый глубокий такой файл — журнал копии базы
+/// перед миграцией `users\<uuid>.db.bak-v<N>-journal`, ещё 62 символа; модели по умолчанию
+/// (`models\<id>\tokenizer.json`) — до 47. Запас — на номера миграций.
+pub const MAX_DATA_DIR_CHARS_WINDOWS: usize = 190;
+
+/// Windows: каталог данных не длиннее [`MAX_DATA_DIR_CHARS_WINDOWS`]; на Linux предела нет.
+/// Проверка до создания каталогов: иначе ошибка всплыла бы позже, на открытии базы, как
+/// «unable to open database file» без указания причины.
+fn check_len(root: &Path) -> Result<(), StoreError> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let abs = std::path::absolute(root)?;
+    let len = abs.as_os_str().to_string_lossy().encode_utf16().count();
+    if len > MAX_DATA_DIR_CHARS_WINDOWS {
+        return Err(StoreError::DataDirTooLong {
+            path: abs,
+            len,
+            max: MAX_DATA_DIR_CHARS_WINDOWS,
+        });
+    }
+    Ok(())
+}
+
 impl DataDir {
     /// Создаёт структуру каталогов и берёт эксклюзивный лок экземпляра.
     pub fn open(root: &Path) -> Result<DataDir, StoreError> {
+        check_len(root)?;
         std::fs::create_dir_all(root)?;
         for s in SUBDIRS {
             std::fs::create_dir_all(root.join(s))?;
