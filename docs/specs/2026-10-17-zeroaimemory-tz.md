@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| Версия | 1.0 (утверждено владельцем 2026-10-18) |
-| Дата | 2026-10-18 |
+| Версия | 1.1 (2026-10-19; v1.0 утверждена владельцем 2026-10-18) |
+| Дата | 2026-10-19 |
 | Исходный набросок | [`ZeroAIMemory.md`](../../ZeroAIMemory.md) |
-| Исследования | [`docs/research/`](../research/) — аналоги, MD-движки, стек, аудит библиотек и поставка Qdrant (04) |
+| Исследования | [`docs/research/`](../research/) — аналоги, MD-движки, стек, аудит библиотек и поставка Qdrant (04), индекс и ML (05) |
 | Исполнитель | AI-агент (Claude Code), владелец продукта — пользователь |
 
 Пометка **[решение исполнителя]** означает, что решение принял исполнитель, а не владелец; его можно пересмотреть. Всё остальное взято из наброска или из прямых указаний владельца.
@@ -178,7 +178,7 @@ Qdrant поставляется вместе с сервисом как нати
 - Официальные зрелые библиотеки: `qdrant-client`, `rmcp`, `rusqlite` (`bundled`, FTS5).
 
 ### 5.2. Библиотеки
-Выбор проверен аудитом 2026-10-18 (исследование 04): версии, активность, лицензии, альтернативы. В таблице указаны версии на дату аудита. При старте реализации они фиксируются в `Cargo.lock` и `package-lock.json`. Библиотеки с нестабильным API закрепляются точной версией (`=`) и обновляются отдельной задачей: это `ort`, `rmcp`, `jiff`, `qdrant-edge`. Спорные места подтверждаются прототипом на том этапе, где библиотека нужна.
+Выбор проверен аудитом 2026-10-18 (исследование 04): версии, активность, лицензии, альтернативы. В таблице указаны версии на дату аудита. При старте реализации они фиксируются в `Cargo.lock` и `package-lock.json`. Библиотеки с нестабильным API закрепляются точной версией (`=`) и обновляются отдельной задачей: это `ort`, `tokenizers`, `qdrant-client`, `process-wrap`, `rmcp`, `jiff`, `qdrant-edge`. Спорные места подтверждаются прототипом на том этапе, где библиотека нужна.
 
 **Сервер и CLI (Rust)**
 
@@ -190,8 +190,9 @@ Qdrant поставляется вместе с сервисом как нати
 | Markdown | `comrak` ≥ 0.56 в отдельном крейте `zam-markdown` | Единственный парсер Markdown во всей системе (§15.2). Подробнее в §5.3 |
 | Подсветка кода | `syntect` через `SyntaxHighlighterAdapter` comrak, вывод CSS-классами | Сделать бенчмарк против `arborium` (tree-sitter) |
 | Санитизация HTML | `ammonia` 4.2 | |
-| ML-инференс | `ort` `=2.0.0-rc.14` (ONNX Runtime 1.31, `load-dynamic`); `tokenizers` 0.23 (`default-features = false`) | Исполнители: только CPU и CUDA 13 (NVIDIA). DirectML не используется (решение владельца). Пулинг и sparse-голову bge-m3 берём по образцу `fastembed-rs`, сам крейт не подключаем. `candle`, `burn` и `tract` отклонены: на CPU int8 они медленнее ORT |
-| Векторный индекс | `qdrant-client` 1.19 (gRPC) за трейтом `VectorIndex`; экспериментально `qdrant-edge` 0.8 (feature `edge`) | §4.3 |
+| ML-инференс | `ort` `=2.0.0-rc.14` (ONNX Runtime 1.31; `default-features = false`, фичи `std`, `load-dynamic`, `api-31`, `cuda`, `half`, `tracing`); `tokenizers` `=0.23.2` (`default-features = false`, фича `fancy-regex`: без regex-бэкенда крейт не компилируется, `fancy-regex` — чистый Rust без C-сборки) | Исполнители: только CPU и CUDA 13 (NVIDIA). DirectML не используется (решение владельца). Пулинг и sparse-голову bge-m3 берём по образцу `fastembed-rs`, сам крейт не подключаем. `candle`, `burn` и `tract` отклонены: на CPU int8 они медленнее ORT |
+| Векторный индекс | `qdrant-client` `=1.19.0` (gRPC, `default-features = false`) за трейтом `VectorIndex`; экспериментально `qdrant-edge` 0.8 (feature `edge`) | §4.3 |
+| Супервизор Qdrant | `process-wrap` `=10.0.1` (`tokio1`, `job-object`, `kill-on-drop`, `creation-flags`) | Windows — Job Object с `KILL_ON_JOB_CLOSE`; Linux — свой `pre_exec` с `prctl(PR_SET_PDEATHSIG)` и группой процессов (§4.3) |
 | Документы: извлечение текста | DOCX и PPTX — `zip` + `quick-xml`; XLSX/XLS/ODS — `calamine` 0.36 (большие листы — потоково); PDF — `pdfium-render` 0.9 (pdfium из `pdfium-binaries` поставляется рядом) | `pdf_oxide` (чистый Rust) — кандидат на замену после A/B на корпусе `eval/docs/`. Отклонены: `pdf-extract`, `lopdf` (низкая доля разобранных файлов), `mupdf` (AGPL) |
 | Изображения | `image` 0.25 (декодирование) + `fast_image_resize` (SIMD-ресайз миниатюр) | AVIF и HEIC по умолчанию выключены: нужны C-библиотеки, у HEIC неясно с патентами |
 | Криптография | `argon2`, `chacha20poly1305` (XChaCha20-Poly1305), `sha2`, `blake3` | |
@@ -478,12 +479,12 @@ PRAGMA: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_
 
 | Роль | По умолчанию | Примечание |
 |---|---|---|
-| Эмбеддинги | **bge-m3**, ONNX, int8 (CPU) / fp16 (GPU) | Один проход даёт dense и sparse, плюс ColBERT опционально. CLS-токен в ColBERT отбрасывается, sparse собирается max-pool по token-id без спецтокенов |
-| Реранкер (опционально, по умолчанию выключен) | CPU: `jina-reranker-v2-base-multilingual` (278M); GPU: `bge-reranker-v2-m3` | Основной реранк делает агент (§9.3). Модель нужна для поиска в WebUI и для агентов, которые просят `rerank=on`. Финальный выбор — по eval |
+| Эмбеддинги | **bge-m3**, ONNX, int8 (CPU) / fp16 (GPU) | Один проход даёт dense и sparse, плюс ColBERT опционально. CLS-токен в ColBERT отбрасывается, sparse собирается max-pool по token-id без спецтокенов. Источники весов: CPU — `Xenova/bge-m3` `onnx/model_int8.onnx` (per-channel QInt8), GPU — `Xenova/bge-m3` `onnx/model_fp16.onnx`; `tokenizer.json` оттуда же; sparse-голова `sparse_linear.pt` — из оригинала `BAAI/bge-m3`. Пулинг и sparse считаются в Rust по `last_hidden_state`. Int8 проходит гейт качества против fp32 `BAAI/bge-m3` (исследование 05, §3.3) |
+| Реранкер (опционально, по умолчанию выключен) | CPU: `jina-reranker-v2-base-multilingual` (278M, int8) — **CC-BY-NC-4.0, не входит в `zam-models`, загрузка только с согласием** (`--accept-nc-license`); GPU: `bge-reranker-v2-m3` (Apache-2.0, ONNX-экспорт `onnx-community`, fp16) | Основной реранк делает агент (§9.3). Модель нужна для поиска в WebUI и для агентов, которые просят `rerank=on`. Jina оставлена решением владельца; её лицензия разрешает только некоммерческое использование. Финальный выбор — по eval |
 
 - **Исполнение.** `ml.device = auto|cpu|cuda`. При `auto` сервер пробует CUDA (NVIDIA), если она недоступна — CPU. Выбор и причина пишутся в лог и в `/index/status`. Других GPU-исполнителей (DirectML и т. п.) нет — решение владельца.
-- **Поставка.** Сборки `cpu` и `gpu`. ONNX Runtime подгружается динамически (`load-dynamic`) из библиотеки, которая лежит рядом с бинарником. Поэтому GPU-сборка работает и без GPU, а без библиотеки ORT сервер всё равно стартует в режиме FTS-only. Для CUDA нужен драйвер с поддержкой CUDA 13; в документации поставки это указано.
-- **Загрузка моделей.** `zam-server models fetch` скачивает модели с Hugging Face и проверяет sha256. Есть и архив поставки `-models`, где модели уже внутри, — для машин без интернета. Без моделей сервер работает в режиме FTS-only и сообщает об этом.
+- **Поставка.** Сборки `cpu` и `gpu`. ONNX Runtime подгружается динамически (`load-dynamic`) из библиотеки, которая лежит рядом с бинарником. Поэтому GPU-сборка работает и без GPU, а без библиотеки ORT сервер всё равно стартует в режиме FTS-only. Библиотеки NVIDIA (CUDA 13, cuDNN 9) в GPU-сборку не входят: их ставит `zam-server cuda fetch` или архив `zam-cuda-*` (§16.3). Для CUDA нужен драйвер с поддержкой CUDA 13 (ветка R580+); в документации поставки это указано.
+- **Загрузка моделей.** `zam-server models fetch` скачивает модели с Hugging Face и проверяет sha256. Модели, ревизии (коммит Hugging Face) и sha256 каждого файла закреплены в `deploy/models.toml`; при несовпадении загрузка падает. Есть и архив поставки `-models`, где модели уже внутри, — для машин без интернета. Без моделей сервер работает в режиме FTS-only и сообщает об этом.
 - **Память.** Модели загружаются лениво. Можно выгружать их по простою (`ml.unload_after`), по умолчанию выключено.
 
 ### 8.5. Граф связей
@@ -1041,13 +1042,14 @@ ZeroAIMemoryToken=zam_…
   | Архив | Содержимое |
   |---|---|
   | `zam-server-<ver>-windows-x64-cpu.zip` | `zam-server.exe` (с встроенным WebUI), `onnxruntime.dll` (CPU), `pdfium.dll`, `qdrant/<qver>/qdrant.exe` + `vcruntime140.dll`, `zam.exe` (для раздачи `GET /downloads/zam/…`), `config.example.toml`, `deploy/qdrant.toml`, `README-install.md`, `LICENSES/` |
-  | `zam-server-<ver>-windows-x64-gpu.zip` | то же + ONNX Runtime с CUDA EP и redistributable-библиотеки CUDA 13 и cuDNN (cudart, cublas, cudnn), которые NVIDIA разрешает распространять; от системы нужен только драйвер NVIDIA |
+  | `zam-server-<ver>-windows-x64-gpu.zip` | то же, но ONNX Runtime с CUDA EP (`onnxruntime_providers_cuda`, `onnxruntime_providers_shared`). Библиотек NVIDIA в комплекте нет (решение владельца): их ставит `zam-server cuda fetch` в `<exe_dir>/cuda/` по `deploy/cuda.toml` (sha256) или архив `zam-cuda-*`. Без GPU и без CUDA комплект работает на CPU |
   | `zam-server-<ver>-linux-x64-cpu.tar.gz` | `zam-server` (gnu; сборка на старой glibc, минимальная версия указывается в README), `libonnxruntime.so`, `libpdfium.so`, `qdrant/<qver>/qdrant` (musl), `zam` (musl, статический), юнит systemd, конфиг, лицензии |
-  | `zam-server-<ver>-linux-x64-gpu.tar.gz` | то же + ORT CUDA EP и библиотеки CUDA 13 / cuDNN |
+  | `zam-server-<ver>-linux-x64-gpu.tar.gz` | то же + ORT CUDA EP; библиотеки NVIDIA — так же, через `zam-server cuda fetch` или `zam-cuda-*` |
+  | `zam-cuda-<ver>-windows-x64.zip`, `zam-cuda-<ver>-linux-x64.tar.gz` | redistributable-библиотеки CUDA 13 и cuDNN 9 по `deploy/cuda.toml` (cudart, cublas, cublasLt, cufft, cudnn; на Linux ещё curand и nvrtc) для распаковки в `<exe_dir>/cuda/` — для машин без интернета. Каждый файл релиза меньше 2 ГиБ |
   | `zam-<ver>-windows-x64.zip`, `zam-<ver>-linux-x64.tar.gz` | только CLI |
-  | `zam-models-<ver>.zip` | ONNX-модели (bge-m3 и реранкер) с sha256-манифестом — для машин без интернета; при наличии интернета модели скачивает `zam-server models fetch` |
+  | `zam-models-<ver>.zip` | ONNX-модели с `bundle = true` из `deploy/models.toml` (bge-m3 int8 и fp16, реранкер `bge-reranker-v2-m3`) с sha256-манифестом — для машин без интернета; при наличии интернета модели скачивает `zam-server models fetch`. Реранкер jina (CC-BY-NC-4.0) в архив не входит |
 
-- **Откуда берутся зависимости.** Все сторонние бинарники скачиваются в CI по закреплённым версиям и SHA-256 из манифестов в `deploy/`: `qdrant.toml`, `onnxruntime.toml`, `pdfium.toml`, `cuda.toml`. Без совпадения хэша сборка падает.
+- **Откуда берутся зависимости.** Все сторонние бинарники скачиваются в CI по закреплённым версиям и SHA-256 из манифестов в `deploy/`: `qdrant.toml`, `onnxruntime.toml`, `onnxruntime-gpu.toml`, `pdfium.toml`, `cuda.toml`, `models.toml`. Без совпадения хэша сборка падает.
 - **Проверка перед публикацией (smoke-тест, на обеих ОС).** Комплект распаковывается в чистый каталог и запускается с пустым `data_dir`. Тест проверяет, что Qdrant поднялся, записывает заметку, находит её через FTS и через векторный поиск (на маленькой тестовой модели), запускает `zam status` и останавливает сервер. После остановки не должно остаться процессов Qdrant. GPU-комплект проверяется на CPU-раннере: без GPU он обязан работать на CPU.
 - **Версии.** SemVer для всех артефактов. `zam --version` и `GET /health` показывают версию, git-хэш и версии Qdrant и ORT.
 - **Лицензии.** В `LICENSES/` лежат лицензии всех поставляемых сторонних компонентов: Qdrant (Apache-2.0), ORT (MIT), pdfium (BSD/Apache), CUDA/cuDNN (лицензии NVIDIA), MSVC runtime, а также сводка Rust- и npm-зависимостей (`cargo-about`, `license-checker`).
@@ -1074,7 +1076,7 @@ ZeroAIMemoryToken=zam_…
 | `recall` для хуков (вместе с сетью LAN) | ≤ 250 мс | ≤ 150 мс |
 | Запись заметки до попадания в FTS | синхронно, ≤ 30 мс | то же |
 | Запись (≤ 10 чанков) до векторного индекса, очередь пуста | ≤ 5 с | ≤ 1 с |
-| Индексация bge-m3, чанк 400 токенов | ≥ 3 чанка/с (уточняется на M2) | ≥ 100 чанков/с |
+| Индексация bge-m3, чанк 400 токенов | ≥ 3 чанка/с (уточняется на M2) | цель уточняется замером на RTX 3090 (задача 17 M2); оценка — 30–50 чанков/с на RTX 3060, ≥ 100 на классе RTX 4080+ (исследование 05, §11) |
 | `reindex` из `embeddings` (без инференса) | ≥ 2000 чанков/с | то же |
 | Превью XLSX 10 тыс. строк | ≤ 1 с до первого экрана | то же |
 
@@ -1147,9 +1149,9 @@ crates/
 web/                       # Svelte 5 + Vite
 eval/                      # корпус, документы, запросы, results/
 benches/
-deploy/                    # манифесты зависимостей (qdrant/onnxruntime/pdfium/cuda.toml: версии и SHA-256), пример конфига, systemd, служба Windows, Dockerfile (по желанию)
+deploy/                    # манифесты зависимостей (qdrant/onnxruntime/onnxruntime-gpu/pdfium/cuda.toml: версии и SHA-256; models.toml: модели, ревизии и SHA-256), пример конфига, systemd, служба Windows, Dockerfile (по желанию)
 .github/workflows/         # ci.yml (Windows + Linux), release.yml (комплекты §16.3 + smoke-тест)
-xtask/                     # cargo xtask: fetch-deps по манифестам, package, smoke
+xtask/                     # cargo xtask: fetch-deps и fetch-models по манифестам, package, smoke
 docs/
   specs/  research/  adr/  plans/   # plans — планы реализации по этапам
   journal.md               # журнал работ
@@ -1210,3 +1212,9 @@ CHANGELOG.md
   - обязательные платформы — Windows x64 и Linux x64. Linux arm64 и macOS исключены из v1;
   - §16.3: каждый релиз собирает готовые комплекты под обе платформы с Qdrant, ORT, pdfium и библиотеками CUDA; smoke-тест перед публикацией;
   - `zam-server` под Linux собирается на glibc, `zam` и Qdrant — на musl.
+- **v1.1** (2026-10-19) — по исследованию 05 и решениям владельца перед M2:
+  - §5.2: точные версии и фичи `ort` (`std`, `load-dynamic`, `api-31`, `cuda`, `half`, `tracing`), `tokenizers` `=0.23.2` с `fancy-regex`, `qdrant-client` `=1.19.0`, супервизор `process-wrap` `=10.0.1`; список закрепляемых через `=` дополнен;
+  - §8.4: источники весов bge-m3 — Xenova int8 и fp16 плюс sparse-голова BAAI; модели, ревизии и sha256 — в `deploy/models.toml`;
+  - §8.4, решение владельца: CPU-реранкер `jina-reranker-v2-base-multilingual` остаётся, но из-за CC-BY-NC-4.0 не входит в `zam-models` и скачивается только с явным согласием (`--accept-nc-license`); GPU-реранкер — `bge-reranker-v2-m3` (Apache-2.0);
+  - §16.3, решение владельца: GPU-комплект без библиотек NVIDIA — их ставит `zam-server cuda fetch` по `deploy/cuda.toml` или отдельный архив `zam-cuda-<ver>-<os>-x64`; новые манифесты `onnxruntime-gpu.toml` и `models.toml`;
+  - §17, решение владельца: цель GPU для индексации фиксируется замером на RTX 3090 владельца (задача 17 M2) вместо «≥ 100 чанков/с на RTX 3060+», недостижимых на 3060 по оценке исследования 05.

@@ -48,7 +48,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04]
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-22.04
+            platform: linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -64,6 +68,19 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Распакованные зависимости (штампы <имя>.sha256) и модели; ключ — хэш манифестов deploy/*.toml.
+      # Шаг идёт после rust-cache: его post-шаг сохраняет кэш раньше, чем rust-cache чистит target/.
+      - name: кэш зависимостей и моделей
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/deps
+            target/models
+          key: deps-models-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
+      - name: fetch-deps
+        run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
+      - name: fetch-models
+        run: cargo xtask fetch-models --test
       - name: test
         run: cargo test --workspace
 

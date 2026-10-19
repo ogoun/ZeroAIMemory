@@ -1,0 +1,148 @@
+# Библиотеки NVIDIA для CUDA EP ONNX Runtime 1.31 (сборка gpu_cuda13: CUDA 13.0+, cuDNN 9.x).
+# В GPU-комплект zam-server не входят (решение владельца): их ставит `zam-server cuda fetch`
+# в <exe_dir>/cuda/ или архив zam-cuda-<ver>-<os>-x64. `cargo xtask fetch-deps` их не скачивает.
+#
+# Источники: redist-архивы NVIDIA; url, size и sha256 — из манифестов
+#   https://developer.download.nvidia.com/compute/cuda/redist/redistrib_13.4.3.json
+#   https://developer.download.nvidia.com/compute/cudnn/redist/redistrib_9.27.0.json (вариант cuda13).
+# Минимальный набор — `ort::ep::cuda::{CUDA_DYLIBS, CUDNN_DYLIBS}` (ort 2.0.0-rc.14); тест
+# xtask `real_cuda_manifest_covers_ort_dylibs` проверяет, что он покрыт.
+#
+# extract — пути внутри архива; файл кладётся в <exe_dir>/cuda/ под последним компонентом пути.
+# Windows: архивы zip, DLL лежат в <корень>/bin/x64/ (проверено по центральному каталогу zip).
+# Linux: архивы tar.xz, библиотеки в <корень>/lib/; имена с SONAME (libcudart.so.13) — это
+# символические ссылки на файл с полной версией (libcudart.so.13.4.92) в том же каталоге
+# (проверено на cuda_cudart). Извлекатель разрешает ссылку только на обычный файл того же
+# каталога архива и кладёт его под именем SONAME.
+#
+# Проверено по таблицам импорта ORT 1.31 gpu_cuda13: onnxruntime_providers_cuda.dll импортирует
+# cublas64_13 и cublasLt64_13, остальное грузит динамически; libonnxruntime_providers_cuda.so —
+# NEEDED libcublasLt.so.13, libcublas.so.13, libcurand.so.10, libcudart.so.13 (+ libcuda.so.1
+# драйвера). На Windows NVRTC и cuRAND не нужны: ort их не предзагружает, в импортах их нет,
+# cudnn_engines_runtime_compiled64_9.dll ссылается только на cudnn_graph64_9.dll.
+#
+# Совместимость: CUDA 13.x работает на драйвере ветки R580+ (minor version compatibility).
+cuda = "13.4.3"
+cudnn = "9.27.0"
+
+# ---- windows-x64 ----
+
+[[lib]]
+platform = "windows-x64"
+component = "cuda_cudart"
+version = "13.4.92"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.4.92-archive.zip"
+size = 2737397
+sha256 = "621a70c4778287b1abf8c27c61b841d797fda2aeff01033374dd19624bcfa249"
+extract = ["cuda_cudart-windows-x86_64-13.4.92-archive/bin/x64/cudart64_13.dll"]
+
+[[lib]]
+platform = "windows-x64"
+component = "libcublas"
+version = "13.8.0.4"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.8.0.4-archive.zip"
+size = 422415931
+sha256 = "0974318e9861a61cb9091cf7de8d4c2880e9787fe311cb4bcbd08865663c5f43"
+extract = [
+    "libcublas-windows-x86_64-13.8.0.4-archive/bin/x64/cublas64_13.dll",
+    "libcublas-windows-x86_64-13.8.0.4-archive/bin/x64/cublasLt64_13.dll",
+]
+
+[[lib]]
+platform = "windows-x64"
+component = "libcufft"
+version = "12.4.0.43"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-12.4.0.43-archive.zip"
+size = 159602693
+sha256 = "69d0ad8dc3a1be66f01a748a8206d0ceaafa56939474663fbe790dc3e91d2009"
+extract = ["libcufft-windows-x86_64-12.4.0.43-archive/bin/x64/cufft64_12.dll"]
+
+[[lib]]
+platform = "windows-x64"
+component = "cudnn"
+version = "9.27.0.42"
+url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.27.0.42_cuda13-archive.zip"
+size = 1330803635
+sha256 = "15595c7b52896262a0e590f02b3b3851c6a2c9046a72047526deaf59a9cbf7d5"
+extract = [
+    "cudnn-windows-x86_64-9.27.0.42_cuda13-archive/bin/x64/cudnn64_9.dll",
+    "cudnn-windows-x86_64-9.27.0.42_cuda13-archive/bin/x64/cudnn_graph64_9.dll",
+    "cudnn-windows-x86_64-9.27.0.42_cuda13-archive/bin/x64/cudnn_ops64_9.dll",
+    "cudnn-windows-x86_64-9.27.0.42_cuda13-archive/bin/x64/cudnn_heuristic64_9.dll",
+    "cudnn-windows-x86_64-9.27.0.42_cuda13-archive/bin/x64/cudnn_adv64_9.dll",
+    "cudnn-windows-x86_64-9.27.0.42_cuda13-archive/bin/x64/cudnn_cnn64_9.dll",
+    "cudnn-windows-x86_64-9.27.0.42_cuda13-archive/bin/x64/cudnn_engines_precompiled64_9.dll",
+    "cudnn-windows-x86_64-9.27.0.42_cuda13-archive/bin/x64/cudnn_engines_runtime_compiled64_9.dll",
+]
+
+# ---- linux-x64 ----
+
+[[lib]]
+platform = "linux-x64"
+component = "cuda_cudart"
+version = "13.4.92"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-13.4.92-archive.tar.xz"
+size = 1704640
+sha256 = "0ac5dbc538d04e9983bc493b410cce4b459e1ee9f5f6654b6464ef7b3e14a8b5"
+extract = ["cuda_cudart-linux-x86_64-13.4.92-archive/lib/libcudart.so.13"]
+
+[[lib]]
+platform = "linux-x64"
+component = "libcublas"
+version = "13.8.0.4"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/linux-x86_64/libcublas-linux-x86_64-13.8.0.4-archive.tar.xz"
+size = 877123136
+sha256 = "bd6ffcce561672da6abb928214a6694f392741e7d1e2d7dfde0da4bd651706b6"
+extract = [
+    "libcublas-linux-x86_64-13.8.0.4-archive/lib/libcublas.so.13",
+    "libcublas-linux-x86_64-13.8.0.4-archive/lib/libcublasLt.so.13",
+]
+
+[[lib]]
+platform = "linux-x64"
+component = "libcufft"
+version = "12.4.0.43"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/linux-x86_64/libcufft-linux-x86_64-12.4.0.43-archive.tar.xz"
+size = 249327988
+sha256 = "f7f8ac2cc67714989a3c8140cda39b1b7ed7d462a491e1ad3f53adb777f5070f"
+extract = ["libcufft-linux-x86_64-12.4.0.43-archive/lib/libcufft.so.12"]
+
+[[lib]]
+platform = "linux-x64"
+component = "libcurand"
+version = "10.4.4.72"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/libcurand/linux-x86_64/libcurand-linux-x86_64-10.4.4.72-archive.tar.xz"
+size = 86992868
+sha256 = "6f725f9187dc5f675308b830f786c163f5b1b499d86986f94fb60aa701c13c0b"
+extract = ["libcurand-linux-x86_64-10.4.4.72-archive/lib/libcurand.so.10"]
+
+[[lib]]
+platform = "linux-x64"
+component = "cuda_nvrtc"
+version = "13.4.92"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/linux-x86_64/cuda_nvrtc-linux-x86_64-13.4.92-archive.tar.xz"
+size = 72311456
+sha256 = "defc747cfa5953b86f4c67414fc349d21149e9d513c096cb89c64b8ec4c0c932"
+# libnvrtc-builtins загружается NVRTC динамически при компиляции ядер.
+extract = [
+    "cuda_nvrtc-linux-x86_64-13.4.92-archive/lib/libnvrtc.so.13",
+    "cuda_nvrtc-linux-x86_64-13.4.92-archive/lib/libnvrtc-builtins.so.13.4",
+]
+
+[[lib]]
+platform = "linux-x64"
+component = "cudnn"
+version = "9.27.0.42"
+url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.27.0.42_cuda13-archive.tar.xz"
+size = 937996620
+sha256 = "dd3245ba3aca8593934fc946d08649ad3a5ee8500e8da3870bc23bf7ddccd7f9"
+extract = [
+    "cudnn-linux-x86_64-9.27.0.42_cuda13-archive/lib/libcudnn.so.9",
+    "cudnn-linux-x86_64-9.27.0.42_cuda13-archive/lib/libcudnn_graph.so.9",
+    "cudnn-linux-x86_64-9.27.0.42_cuda13-archive/lib/libcudnn_ops.so.9",
+    "cudnn-linux-x86_64-9.27.0.42_cuda13-archive/lib/libcudnn_heuristic.so.9",
+    "cudnn-linux-x86_64-9.27.0.42_cuda13-archive/lib/libcudnn_adv.so.9",
+    "cudnn-linux-x86_64-9.27.0.42_cuda13-archive/lib/libcudnn_cnn.so.9",
+    "cudnn-linux-x86_64-9.27.0.42_cuda13-archive/lib/libcudnn_engines_precompiled.so.9",
+    "cudnn-linux-x86_64-9.27.0.42_cuda13-archive/lib/libcudnn_engines_runtime_compiled.so.9",
+]

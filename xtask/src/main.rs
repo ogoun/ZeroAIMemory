@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use manifest::{MANIFESTS, Manifest, PLATFORMS};
+use manifest::{
+    CUDA_MANIFEST, CudaManifest, MANIFESTS, MODELS_MANIFEST, Manifest, ModelsManifest, PLATFORMS,
+};
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -22,7 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Скачать зависимости поставки (Qdrant, ONNX Runtime, pdfium) в target/deps/<платформа>/
+    /// Скачать зависимости поставки (Qdrant, ONNX Runtime CPU и GPU, pdfium) в target/deps/<платформа>/;
+    /// библиотеки NVIDIA не скачиваются (их ставит `zam-server cuda fetch`)
     FetchDeps {
         /// windows-x64 | linux-x64
         #[arg(long)]
@@ -30,6 +33,19 @@ enum Cmd {
         /// Скачать и напечатать фактические SHA-256 (только при обновлении версий)
         #[arg(long)]
         print_hashes: bool,
+    },
+    /// Скачать модели из deploy/models.toml в target/models/<id>/ с проверкой SHA-256
+    /// (по умолчанию — модели комплекта zam-models, bundle = true)
+    FetchModels {
+        /// Только тестовые модели (role = "test"; для CI)
+        #[arg(long)]
+        test: bool,
+        /// Модель по id (можно повторять)
+        #[arg(long = "id", value_name = "ID")]
+        ids: Vec<String>,
+        /// Согласие с некоммерческой лицензией (CC-BY-NC-4.0) для моделей с requires_license_ack
+        #[arg(long)]
+        accept_nc_license: bool,
     },
     /// Собрать архивы поставки в target/dist/ и SHA256SUMS (сначала: fetch-deps и release-сборка)
     Package {
@@ -83,6 +99,9 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool) -> Result<()> {
     for m in &manifests {
         m.validate(print_hashes)?;
     }
+    // Библиотеки NVIDIA здесь не скачиваются (это `zam-server cuda fetch`), но манифест проверяется.
+    let cuda = CudaManifest::load(&root.join("deploy").join(CUDA_MANIFEST))?;
+    cuda.validate()?;
     if let Some(p) = platform.as_deref()
         && !PLATFORMS.contains(&p)
     {
@@ -114,6 +133,18 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool) -> Result<()> {
             PLATFORMS.join(", ")
         );
     }
+    let cuda_mb: u64 = cuda
+        .lib
+        .iter()
+        .filter(|l| l.platform == platform)
+        .map(|l| l.size)
+        .sum::<u64>()
+        / 1_000_000;
+    println!(
+        "cuda.toml: CUDA {}, cuDNN {} [{platform}] — {cuda_mb} МБ архивов NVIDIA \
+         не скачиваются (их ставит `zam-server cuda fetch`)",
+        cuda.cuda, cuda.cudnn
+    );
     for m in &manifests {
         let e = m
             .platform
@@ -132,6 +163,40 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool) -> Result<()> {
             },
             out.display()
         );
+    }
+    Ok(())
+}
+
+fn fetch_models(ids: Vec<String>, test: bool, accept_nc: bool) -> Result<()> {
+    let root = repo_root();
+    let manifest = ModelsManifest::load(&root.join("deploy").join(MODELS_MANIFEST))?;
+    manifest.validate()?;
+    let models = root.join("target").join("models");
+    for m in manifest.select(&ids, test, accept_nc)? {
+        let dir = models.join(&m.id);
+        let total: u64 = m.files.iter().map(|f| f.size).sum();
+        println!(
+            "{} ({:?}/{:?}, {}, {:.1} МБ): {}",
+            m.id,
+            m.role,
+            m.device,
+            m.license,
+            total as f64 / 1e6,
+            dir.display()
+        );
+        for f in &m.files {
+            let cached = fetch::fetch_file(&f.url, &f.sha256, &dir.join(&f.path))
+                .with_context(|| format!("{}: {}", m.id, f.path))?;
+            println!(
+                "  {}: {}",
+                f.path,
+                if cached {
+                    "на месте"
+                } else {
+                    "загружено"
+                }
+            );
+        }
     }
     Ok(())
 }
@@ -199,6 +264,11 @@ fn main() -> Result<()> {
             platform,
             print_hashes,
         } => fetch_deps(platform, print_hashes),
+        Cmd::FetchModels {
+            test,
+            ids,
+            accept_nc_license,
+        } => fetch_models(ids, test, accept_nc_license),
         Cmd::Package {
             platform,
             flavor,

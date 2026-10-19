@@ -40,14 +40,33 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     }
 }
 
-/// Скачивает `url` в `dest` (через прокси из окружения), с таймаутами.
+/// Адрес на локальной петле (`127.0.0.1`, `localhost`, `[::1]`): к нему прокси не применяется.
+fn is_loopback(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    let host = if host.starts_with('[') {
+        host.split_once(']').map_or(host, |(h, _)| &h[1..])
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Скачивает `url` в `dest` (через прокси из окружения, кроме локальной петли), с таймаутами.
 fn download(url: &str, dest: &Path) -> Result<()> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
-        .timeout_global(Some(Duration::from_secs(900)))
-        .build()
-        .into();
+        // крупные модели (до 1,2 ГБ) на медленном канале
+        .timeout_global(Some(Duration::from_secs(3600)));
+    if is_loopback(url) {
+        cfg = cfg.proxy(None);
+    }
+    let agent: ureq::Agent = cfg.build().into();
     let resp = agent
         .get(url)
         .call()
@@ -182,8 +201,66 @@ pub fn extract_atomic(archive: &Path, url: &str, entry: &PlatformEntry, out: &Pa
     Ok(())
 }
 
+/// Скачивает одиночный файл (без распаковки) в `dest` с проверкой SHA-256.
+/// Загрузка идёт во временный `<имя>.<pid>.part` рядом с `dest`; при ошибке или
+/// несовпадении хэша он удаляется. Если `dest` уже есть и хэш совпал — сеть не нужна,
+/// возвращается true; файл с чужим хэшем удаляется и скачивается заново.
+pub fn fetch_file(url: &str, sha256: &str, dest: &Path) -> Result<bool> {
+    let expected = sha256.trim().to_ascii_lowercase();
+    if dest.is_file() {
+        if sha256_file(dest)? == expected {
+            return Ok(true);
+        }
+        fs::remove_file(dest).with_context(|| format!("не удалось удалить {}", dest.display()))?;
+    }
+    let dir = dest.parent().context("у пути назначения нет каталога")?;
+    fs::create_dir_all(dir)?;
+    let mut part_name = dest.file_name().context("пустое имя файла")?.to_os_string();
+    part_name.push(format!(".{}.part", std::process::id()));
+    let part = dir.join(part_name);
+    println!("  загрузка {url}");
+    let checked = download(url, &part).and_then(|()| {
+        let actual = sha256_file(&part)?;
+        if actual == expected {
+            Ok(())
+        } else {
+            bail!("несовпадение SHA-256 для {url}: ожидалось {expected}, получено {actual}")
+        }
+    });
+    if let Err(e) = checked {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
+    fs::rename(&part, dest)
+        .with_context(|| format!("не удалось переименовать в {}", dest.display()))?;
+    Ok(false)
+}
+
+/// Штамп распакованной зависимости: `<out>.sha256` рядом с каталогом, хранит хэш архива.
+fn stamp_path(out: &Path) -> Result<PathBuf> {
+    let mut n = out
+        .file_name()
+        .context("пустое имя каталога")?
+        .to_os_string();
+    n.push(".sha256");
+    Ok(out.with_file_name(n))
+}
+
+/// Каталог `out` распакован из архива `expected` и все файлы на месте.
+fn is_up_to_date(entry: &PlatformEntry, out: &Path, expected: &str) -> Result<bool> {
+    let stamp = stamp_path(out)?;
+    let Ok(text) = fs::read_to_string(&stamp) else {
+        return Ok(false);
+    };
+    if text.trim() != expected {
+        return Ok(false);
+    }
+    Ok(dest_names(entry)?.iter().all(|n| out.join(n).is_file()))
+}
+
 /// Скачивает (если нет в кэше), проверяет хэш и распаковывает. `root` — каталог `target/`.
-/// Возвращает true, если файл взят из кэша.
+/// Возвращает true, если загрузка не понадобилась (архив в кэше или каталог уже распакован
+/// из того же архива — по штампу `<out>.sha256`; так CI достаточно кэшировать `target/deps`).
 pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> Result<bool> {
     if entry.sha256.trim().is_empty() {
         bail!(
@@ -191,6 +268,13 @@ pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> 
         );
     }
     let expected = entry.sha256.trim().to_ascii_lowercase();
+    if is_up_to_date(entry, out, &expected)? {
+        return Ok(true);
+    }
+    let stamp = stamp_path(out)?;
+    if stamp.exists() {
+        fs::remove_file(&stamp)?;
+    }
     let cache = root.join("deps-cache");
     let cached = cache.join(&expected);
     let from_cache = cached.is_file();
@@ -211,6 +295,7 @@ pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> 
         fs::rename(&part, &cached)?;
     }
     extract_atomic(&cached, &entry.url, entry, out).with_context(|| name.to_string())?;
+    fs::write(&stamp, format!("{expected}\n"))?;
     Ok(from_cache)
 }
 
@@ -227,6 +312,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn tmp(name: &str) -> PathBuf {
         let d = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -395,6 +481,93 @@ mod tests {
         let err = format!("{:#}", fetch_one("qdrant", &e, &d, &out).unwrap_err());
         assert!(err.contains("удалите файл кэша"), "{err}");
         assert!(!out.exists());
+    }
+
+    /// Локальный HTTP-сервер: отдаёт `body` на каждый из `n` запросов, затем закрывается.
+    /// Возвращает URL и счётчик обслуженных запросов.
+    fn serve(body: &'static [u8], n: usize) -> (String, std::sync::Arc<AtomicUsize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file.bin", l.local_addr().unwrap());
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut req = Vec::new();
+                let mut b = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match io::Read::read(&mut s, &mut b) {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => req.extend_from_slice(&b[..k]),
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body);
+                h.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (url, hits)
+    }
+
+    const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn fetch_file_downloads_verifies_and_reuses() {
+        let d = tmp("fetch_file_ok");
+        let (url, hits) = serve(b"hello", 1);
+        let dest = d.join("m").join("model.onnx");
+        assert!(!fetch_file(&url, HELLO_SHA, &dest).unwrap());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // повторный вызов: файл на месте и хэш совпал — без сети
+        assert!(fetch_file(&url, HELLO_SHA, &dest).unwrap());
+        // испорченный файл перекачивается (сервер уже закрыт — ошибка, файл удалён)
+        std::fs::write(&dest, b"broken").unwrap();
+        assert!(fetch_file(&url, HELLO_SHA, &dest).is_err());
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read_dir(d.join("m")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fetch_file_sha_mismatch_removes_partial() {
+        let d = tmp("fetch_file_bad_sha");
+        let (url, _) = serve(b"hello", 1);
+        let dest = d.join("m").join("model.onnx");
+        let wrong = "0".repeat(64);
+        let err = fetch_file(&url, &wrong, &dest).unwrap_err().to_string();
+        assert!(err.contains(&wrong) && err.contains(HELLO_SHA), "{err}");
+        assert!(!dest.exists());
+        // временный *.part удалён, каталог пуст
+        assert_eq!(std::fs::read_dir(d.join("m")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fetch_one_skips_when_stamp_matches() {
+        let d = tmp("stamp");
+        let zip_p = d.join("a.zip");
+        make_zip(&zip_p);
+        let hash = sha256_file(&zip_p).unwrap();
+        std::fs::create_dir_all(d.join("deps-cache")).unwrap();
+        std::fs::rename(&zip_p, d.join("deps-cache").join(&hash)).unwrap();
+        let mut e = entry(&["root/lib/a.dll"], &[]);
+        e.sha256 = hash.clone();
+        e.url = "https://x/a.zip".into();
+        let out = d.join("deps").join("dep");
+        // первая распаковка из кэша архивов пишет штамп рядом с каталогом
+        assert!(fetch_one("dep", &e, &d, &out).unwrap());
+        let stamp = d.join("deps").join("dep.sha256");
+        assert_eq!(std::fs::read_to_string(&stamp).unwrap().trim(), hash);
+        // без архива в кэше: штамп совпал и файлы на месте — ничего не скачиваем
+        std::fs::remove_dir_all(d.join("deps-cache")).unwrap();
+        assert!(fetch_one("dep", &e, &d, &out).unwrap());
+        // файла нет — штамп не доверенный, нужна загрузка (url недоступен — ошибка)
+        std::fs::remove_file(out.join("a.dll")).unwrap();
+        e.url = "https://127.0.0.1:1/a.zip".into();
+        assert!(fetch_one("dep", &e, &d, &out).is_err());
     }
 
     #[test]

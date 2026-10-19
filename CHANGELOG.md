@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### Added
+- Манифест моделей `deploy/models.toml`: bge-m3 int8 (CPU) и fp16 (GPU) от Xenova со sparse-головой BAAI, тестовая MiniLM-L6 int8, реранкеры `bge-reranker-v2-m3` (GPU) и `jina-reranker-v2` (CPU, CC-BY-NC-4.0: не входит в `zam-models`, загрузка только с `--accept-nc-license`). Каждый файл закреплён ревизией Hugging Face и SHA-256.
+- `cargo xtask fetch-models [--test] [--id ID]… [--accept-nc-license]` — загрузка моделей в `target/models/<id>/` с проверкой SHA-256; при несовпадении временный файл удаляется.
+- `deploy/onnxruntime-gpu.toml` (ONNX Runtime 1.31.0 gpu_cuda13): `cargo xtask fetch-deps` скачивает его в `target/deps/<платформа>/onnxruntime-gpu/`.
+- `deploy/cuda.toml`: redist-архивы NVIDIA CUDA 13.4.3 и cuDNN 9.27.0 (sha256 из `redistrib_*.json`) и список библиотек для `zam-server cuda fetch`; `fetch-deps` манифест проверяет, но не скачивает.
+- CI: кэш `target/deps` и `target/models`, `fetch-deps` и `fetch-models --test` перед тестами.
+
+### Changed
+- `fetch-deps` пишет штамп `<имя>.sha256` рядом с распакованной зависимостью и не скачивает архив повторно, если штамп совпал и файлы на месте.
+- ТЗ v1.1: версии и фичи `ort`, `tokenizers` (`fancy-regex`), `qdrant-client`, `process-wrap`; источники bge-m3; реранкер jina с ограничением лицензии; GPU-комплект без библиотек NVIDIA (`zam-server cuda fetch`, архив `zam-cuda-*`); цель GPU по индексации уточняется замером на RTX 3090.
+
 ## [0.0.2-m1] - 2026-10-18
 
 Этап M1: заметки. Markdown-заметки с историей, патчами секций, корзиной, вложениями и полнотекстовым поиском — через REST API, CLI `zam` и WebUI.
