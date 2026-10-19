@@ -29,14 +29,16 @@ pub struct DataDir {
 pub const MAX_DATA_DIR_CHARS_WINDOWS: usize = 190;
 
 /// Windows: каталог данных не длиннее [`MAX_DATA_DIR_CHARS_WINDOWS`]; на Linux предела нет.
-/// Проверка до создания каталогов: иначе ошибка всплыла бы позже, на открытии базы, как
-/// «unable to open database file» без указания причины.
-fn check_len(root: &Path) -> Result<(), StoreError> {
+/// Вызывается до любой работы с каталогом: в [`DataDir::open`] и в CLI до долгих загрузок
+/// (`models fetch`, `cuda fetch`, `qdrant …`) — иначе ошибка всплыла бы позже, на открытии
+/// базы, как «unable to open database file» без указания причины. Префикс `\\?\` не
+/// считается: SQLite и рабочий каталог Qdrant получают путь и без него.
+pub fn check_data_dir_len(root: &Path) -> Result<(), StoreError> {
     if !cfg!(windows) {
         return Ok(());
     }
     let abs = std::path::absolute(root)?;
-    let len = abs.as_os_str().to_string_lossy().encode_utf16().count();
+    let len = win32_len(&abs.as_os_str().to_string_lossy());
     if len > MAX_DATA_DIR_CHARS_WINDOWS {
         return Err(StoreError::DataDirTooLong {
             path: abs,
@@ -47,10 +49,20 @@ fn check_len(root: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Длина пути Win32 в символах UTF-16 без префикса `\\?\` (`\\?\UNC\сервер` считается
+/// как `\\сервер`).
+fn win32_len(p: &str) -> usize {
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        2 + rest.encode_utf16().count()
+    } else {
+        p.strip_prefix(r"\\?\").unwrap_or(p).encode_utf16().count()
+    }
+}
+
 impl DataDir {
     /// Создаёт структуру каталогов и берёт эксклюзивный лок экземпляра.
     pub fn open(root: &Path) -> Result<DataDir, StoreError> {
-        check_len(root)?;
+        check_data_dir_len(root)?;
         std::fs::create_dir_all(root)?;
         for s in SUBDIRS {
             std::fs::create_dir_all(root.join(s))?;
@@ -107,5 +119,18 @@ impl DataDir {
 
     pub fn qdrant(&self) -> PathBuf {
         self.root.join("qdrant")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::win32_len;
+
+    #[test]
+    fn verbatim_prefix_is_not_counted() {
+        assert_eq!(win32_len(r"C:\d"), 4);
+        assert_eq!(win32_len(r"\\?\C:\d"), 4);
+        assert_eq!(win32_len(r"\\?\UNC\srv\share"), win32_len(r"\\srv\share"));
+        assert_eq!(win32_len(r"C:\ж"), 4);
     }
 }

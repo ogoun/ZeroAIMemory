@@ -16,7 +16,7 @@ pub mod time;
 pub mod user_db;
 
 pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, resolve_attachment};
-pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS};
+pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
 pub use db::{Db, DbOptions};
 pub use embeddings::{
     Embedding, adopt_owned_embeddings, embed_input_of, embed_key_of, gc_embeddings, get_embeddings,

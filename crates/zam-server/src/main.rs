@@ -152,7 +152,11 @@ fn load(o: Opts) -> anyhow::Result<ServerConfig> {
         bind: o.bind,
         data_dir: o.data_dir,
     };
-    Ok(config::load(o.config.as_deref(), &env, &cli)?)
+    let cfg = config::load(o.config.as_deref(), &env, &cli)?;
+    // все команды с каталогом данных: на Windows слишком длинный путь — ошибка сразу,
+    // а не после долгой загрузки моделей или CUDA
+    zam_store::check_data_dir_len(&cfg.data_dir)?;
+    Ok(cfg)
 }
 
 fn read_password() -> anyhow::Result<String> {
