@@ -11,7 +11,7 @@ use toml::{Table, Value};
 
 /// Переменные `ZAM_*`, которые не являются слоем конфигурации:
 /// секреты и адрес клиента, а также сборочные (build.rs, xtask), попадающие в окружение CI.
-const RESERVED_ENV: [&str; 8] = [
+const RESERVED_ENV: [&str; 9] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
@@ -20,6 +20,7 @@ const RESERVED_ENV: [&str; 8] = [
     "ZAM_WEB_REBUILD",
     "ZAM_WEB_INDEX",
     "ZAM_VCRUNTIME_DLL",
+    "ZAM_VC_CRT_DIR",
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -784,6 +785,7 @@ note_max_bytes = 1000
             env("ZAM_WEB_REBUILD", "1"),
             env("ZAM_WEB_INDEX", "/x/index.html"),
             env("ZAM_VCRUNTIME_DLL", "C:/x/vcruntime140.dll"),
+            env("ZAM_VC_CRT_DIR", "C:/x/Microsoft.VC145.CRT"),
         ];
         assert_eq!(
             load(None, &env, &Default::default()).unwrap(),

@@ -1,0 +1,22 @@
+Библиотеки NVIDIA в архиве zam-cuda
+
+Архив zam-cuda-<версия>-<платформа> содержит неизменённые redistributable-библиотеки
+NVIDIA для CUDA Execution Provider ONNX Runtime. Состав, версии, адреса и SHA-256
+исходных архивов NVIDIA — в cuda.toml рядом (копия deploy/cuda.toml):
+
+  - CUDA 13 (cudart, cuBLAS, cuBLASLt, cuFFT; на Linux ещё cuRAND и NVRTC) —
+    NVIDIA CUDA Toolkit End User License Agreement, приложение A (Attachment A,
+    redistributable software): NVIDIA-CUDA-EULA.txt,
+    https://docs.nvidia.com/cuda/eula/index.html;
+  - cuDNN 9 — License Agreement for NVIDIA Software Development Kits:
+    NVIDIA-cuDNN-LICENSE.txt.
+
+Тексты лицензий взяты из redist-каталогов NVIDIA
+(https://developer.download.nvidia.com/compute/cuda/redist/<компонент>/LICENSE.txt,
+https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/LICENSE.txt).
+Библиотеки предназначены только для работы ZeroAIMemory (zam-server); права на них
+принадлежат NVIDIA Corporation. Для работы нужен драйвер NVIDIA с поддержкой CUDA 13
+(ветка R580 и новее).
+
+Без архива те же библиотеки ставит команда zam-server cuda fetch: она скачивает их с
+developer.download.nvidia.com по встроенному манифесту и сверяет размер и SHA-256.

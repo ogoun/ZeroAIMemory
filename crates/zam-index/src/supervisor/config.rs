@@ -132,20 +132,59 @@ impl RestartPolicy {
     }
 }
 
-/// Текст `config/zam.yaml`. Пути — от рабочего каталога `<data_dir>/qdrant/`.
+/// Текст `config/zam.yaml` для рабочего каталога `qdir` (`<data_dir>/qdrant/`).
 /// Ключа здесь нет: он передаётся только через `QDRANT__SERVICE__API_KEY`.
-pub(crate) fn render_yaml(c: &ManagedConfig) -> String {
-    format!(
+pub(crate) fn render_yaml(c: &ManagedConfig, qdir: &Path) -> std::io::Result<String> {
+    Ok(format!(
         "# Сгенерирован zam-server при каждом запуске Qdrant; правки будут перезаписаны.\n\
          log_level: INFO\n\
          logger:\n  format: json\n\
          telemetry_disabled: true\n\
-         storage:\n  storage_path: ./storage\n  snapshots_path: ./snapshots\n  temp_path: ./temp\n  on_disk_payload: true\n  \
+         storage:\n  storage_path: {}\n  snapshots_path: {}\n  temp_path: {}\n  on_disk_payload: true\n  \
          performance:\n    max_search_threads: {}\n    optimizer_cpu_budget: {}\n\
          service:\n  host: 127.0.0.1\n  http_port: {}\n  grpc_port: {}\n  enable_cors: false\n  enable_static_content: false\n\
          cluster:\n  enabled: false\n",
-        c.max_search_threads, c.optimizer_cpu_budget, c.http_port, c.grpc_port
-    )
+        storage_path(qdir, "storage")?,
+        storage_path(qdir, "snapshots")?,
+        storage_path(qdir, "temp")?,
+        c.max_search_threads,
+        c.optimizer_cpu_budget,
+        c.http_port,
+        c.grpc_port
+    ))
+}
+
+/// Путь подкаталога `name` рабочего каталога Qdrant для `zam.yaml`.
+///
+/// Linux — относительный (`./storage`). Windows — абсолютный с префиксом `\\?\`: файлы
+/// payload-индексов лежат глубоко (`storage/collections/<коллекция>/0/segments/<uuid>/
+/// payload_index/<id>-<поле>/…`), и при каталоге данных длиннее примерно 80 символов
+/// относительный путь превышает MAX_PATH (260): Qdrant 1.19 отвечает на создание
+/// payload-индекса ошибкой «failed to open mutable numeric index on gridstore» (os error 3),
+/// а при следующем запуске падает на загрузке коллекции. Путь с `\\?\` ограничения не имеет.
+fn storage_path(qdir: &Path, name: &str) -> std::io::Result<String> {
+    if cfg!(windows) {
+        let abs = std::path::absolute(qdir.join(name))?;
+        Ok(yaml_quote(&verbatim(&abs.to_string_lossy())))
+    } else {
+        Ok(format!("./{name}"))
+    }
+}
+
+/// Абсолютный путь Windows в форме `\\?\…` (UNC `\\сервер\ресурс` — `\\?\UNC\сервер\ресурс`).
+fn verbatim(p: &str) -> String {
+    if p.starts_with(r"\\?\") {
+        p.to_string()
+    } else if let Some(rest) = p.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{rest}")
+    } else {
+        format!(r"\\?\{p}")
+    }
+}
+
+/// Строка YAML в одинарных кавычках: обратные косые черты не экранируются, `'` удваивается.
+fn yaml_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -182,13 +221,12 @@ mod tests {
         let mut c = ManagedConfig::new(PathBuf::from("q"));
         c.http_port = 7333;
         c.grpc_port = 7334;
-        let y = render_yaml(&c);
+        let qdir = Path::new("data").join("qdrant");
+        let y = render_yaml(&c, &qdir).unwrap();
         for needle in [
             "log_level: INFO",
             "  format: json",
             "telemetry_disabled: true",
-            "  storage_path: ./storage",
-            "  snapshots_path: ./snapshots",
             "  on_disk_payload: true",
             "    max_search_threads: 2",
             "    optimizer_cpu_budget: 2",
@@ -201,6 +239,28 @@ mod tests {
         ] {
             assert!(y.contains(needle), "нет `{needle}` в\n{y}");
         }
+        if cfg!(windows) {
+            let abs = std::path::absolute(qdir.join("storage")).unwrap();
+            let want = format!("  storage_path: '\\\\?\\{}'", abs.display());
+            assert!(y.contains(&want), "нет `{want}` в\n{y}");
+            assert!(y.contains("snapshots'\n") && y.contains("temp'\n"), "{y}");
+        } else {
+            for needle in [
+                "  storage_path: ./storage",
+                "  snapshots_path: ./snapshots",
+                "  temp_path: ./temp",
+            ] {
+                assert!(y.contains(needle), "нет `{needle}` в\n{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn verbatim_paths_and_yaml_quoting() {
+        assert_eq!(verbatim(r"C:\d\qdrant\storage"), r"\\?\C:\d\qdrant\storage");
+        assert_eq!(verbatim(r"\\?\C:\d"), r"\\?\C:\d");
+        assert_eq!(verbatim(r"\\srv\share\d"), r"\\?\UNC\srv\share\d");
+        assert_eq!(yaml_quote(r"\\?\C:\O'Brien"), r"'\\?\C:\O''Brien'");
     }
 
     #[test]

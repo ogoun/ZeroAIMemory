@@ -1,5 +1,9 @@
-//! Smoke-тест комплекта: распаковка, запуск сервера, проверка API, клиента и Qdrant.
+//! Smoke-тест комплекта: распаковка, запуск сервера, проверка API, клиента и Qdrant,
+//! векторный поиск на тестовой модели (M2), устройство модели, завершение Qdrant вместе с
+//! сервером; для Windows — статический CRT наших exe и app-local MSVC runtime библиотек.
+//! `smoke-cuda` — проверка архива `zam-cuda`.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -14,7 +18,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::manifest::Manifest;
+use zam_fetch::{MODEL_LICENSE_FILE, MODEL_SPEC_FILE};
+
+use crate::manifest::{CudaManifest, Manifest, ModelsManifest, PLATFORMS};
 
 const TOKEN_PREFIX: &str = "ZeroAIMemoryToken=";
 const WAIT: Duration = Duration::from_secs(10);
@@ -136,19 +142,29 @@ fn free_port() -> Result<u16> {
 /// Дочерний zam-server; при ошибке теста гарантированно убивается.
 struct Server {
     child: Child,
-    log: Arc<Mutex<Vec<String>>>,
+    log: Arc<Mutex<VecDeque<String>>>,
     token_rx: Receiver<String>,
 }
 
+/// Сколько последних строк stderr сервера показывать при ошибке.
+const LOG_TAIL: usize = 80;
+
+/// Строка журнала, полезная при разборе ошибки smoke: без подробностей ORT и раздачи WebUI.
+fn interesting(line: &str) -> bool {
+    !line.contains("\"target\":\"ort::logging\"") && !line.contains("\"target\":\"memory_serve\"")
+}
+
 impl Server {
-    fn start(root: &Path, data: &Path, addr: SocketAddr) -> Result<Self> {
+    /// Запускает сервер; stderr целиком (кроме строки с токеном) пишется в `log_file`.
+    fn start(root: &Path, data: &Path, env: &SmokeEnv, log_file: &Path) -> Result<Self> {
         let mut cmd =
             Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")));
         let mut child = scrub_zam_env(&mut cmd, &["ZAM_ADMIN_PASSWORD"])
             .args(["serve", "--data-dir"])
             .arg(data)
-            .args(["--bind", &addr.to_string()])
+            .args(["--bind", &env.addr.to_string()])
             .env("ZAM_ADMIN_PASSWORD", "smoke")
+            .envs(env.vars.iter().map(|(k, v)| (k, v)))
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -156,17 +172,25 @@ impl Server {
             .spawn()
             .context("запуск zam-server")?;
         let stderr = child.stderr.take().context("stderr сервера")?;
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut file =
+            File::create(log_file).with_context(|| format!("создание {}", log_file.display()))?;
+        let log = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, token_rx) = mpsc::channel();
         let log2 = Arc::clone(&log);
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let Some(t) = line.strip_prefix(TOKEN_PREFIX) {
                     let _ = tx.send(t.trim().to_string());
-                } else if let Ok(mut l) = log2.lock()
-                    && l.len() < 200
+                    continue;
+                }
+                let _ = writeln!(file, "{line}");
+                if interesting(&line)
+                    && let Ok(mut l) = log2.lock()
                 {
-                    l.push(line);
+                    if l.len() == LOG_TAIL {
+                        l.pop_front();
+                    }
+                    l.push_back(line);
                 }
             }
         });
@@ -177,8 +201,12 @@ impl Server {
         })
     }
 
+    /// Последние строки stderr (без журнала ORT и раздачи WebUI).
     fn log_tail(&self) -> String {
-        self.log.lock().map(|l| l.join("\n")).unwrap_or_default()
+        self.log
+            .lock()
+            .map(|l| l.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
     }
 
     /// Остановка: Unix — SIGTERM, затем kill через 10 с; Windows — TerminateProcess.
@@ -386,33 +414,43 @@ fn zam_cmd(zam: &Path, dir: &Path, base: &str, token: &str) -> Command {
     cmd
 }
 
+/// `zam <args>` с проверкой: код 0, токен в выводе не появляется целиком.
+fn zam_ok(
+    zam: &Path,
+    home: &Path,
+    base: &str,
+    token: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Result<Output> {
+    let out = output_with_stdin(
+        zam_cmd(zam, home, base, token).args(args),
+        input,
+        CMD_TIMEOUT,
+    )?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains(token) {
+        bail!("вывод zam {} содержит токен целиком", args.join(" "));
+    }
+    if out.status.code() != Some(0) {
+        bail!(
+            "zam {}: код {:?}\n{text}",
+            args.join(" "),
+            out.status.code()
+        );
+    }
+    Ok(out)
+}
+
 /// Критерий M1: `zam write` из stdin → `zam search` находит путь → `zam read` возвращает текст.
 fn note_roundtrip(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
     let home = dir.join("notes-home");
     fs::create_dir_all(&home)?;
-    let run = |args: &[&str], input: Option<&[u8]>| -> Result<Output> {
-        let out = output_with_stdin(
-            zam_cmd(zam, &home, base, token).args(args),
-            input,
-            CMD_TIMEOUT,
-        )?;
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        if text.contains(token) {
-            bail!("вывод zam {} содержит токен целиком", args.join(" "));
-        }
-        if out.status.code() != Some(0) {
-            bail!(
-                "zam {}: код {:?}\n{text}",
-                args.join(" "),
-                out.status.code()
-            );
-        }
-        Ok(out)
-    };
+    let run = |args: &[&str], input: Option<&[u8]>| zam_ok(zam, &home, base, token, args, input);
     run(&["write", "knowledge:smoke/hello"], Some(SMOKE_NOTE))?;
     let found = run(&["search", "hello"], None)?;
     if !String::from_utf8_lossy(&found.stdout).contains("smoke/hello") {
@@ -471,29 +509,60 @@ fn check_static_crt(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Выполняет smoke-тест; при успехе печатает `SMOKE OK`.
-pub fn run(archive: &Path, target: &Path) -> Result<()> {
+/// Выполняет smoke-тест комплекта; при успехе печатает `SMOKE OK`. `repo` — корень
+/// репозитория (тестовая модель — из `target/models/`, распаковка — в `target/smoke/`).
+pub fn run(
+    archive: &Path,
+    cuda_archive: Option<&Path>,
+    expect_device: Option<DeviceKind>,
+    repo: &Path,
+) -> Result<()> {
     let name = archive_stem(archive)?;
-    let dir = target.join("smoke").join(&name);
+    let dir = repo.join("target").join("smoke").join(&name);
     let root = step(1, "распаковка", unpack(archive, &dir))?;
     step(
         11,
         "тексты лицензий WebUI в LICENSES/",
         check_web_notices(&root),
     )?;
+    let qv = Manifest::load(&root.join("deploy").join("qdrant.toml"))?.version;
+    let qdir = root.join("qdrant").join(&qv);
     if host_platform(&root) == "windows-x64" {
         step(
             9,
             "статический CRT (dumpbin /dependents)",
             check_static_crt(&root),
         )?;
+        step(
+            13,
+            "app-local MSVC runtime для ONNX Runtime и Qdrant (dumpbin /dependents)",
+            check_app_local_crt(&root, &qdir),
+        )?;
     }
     let data = dir.join("data");
-    let port = free_port()?;
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let env = SmokeEnv::new()?;
+    let addr = env.addr;
+    let port = addr.port();
     let base = format!("http://{addr}");
+    step(
+        14,
+        "тестовая модель в каталоге данных",
+        install_test_model(repo, &data),
+    )?;
+    if let Some(ca) = cuda_archive {
+        step(
+            15,
+            "распаковка zam-cuda в комплект и cuda fetch без загрузки",
+            cuda_from_archive(&env, ca, &root, &data),
+        )?;
+    }
 
-    let mut srv = step(2, "запуск zam-server", Server::start(&root, &data, addr))?;
+    let server_log = dir.join("zam-server.stderr.log");
+    let mut srv = step(
+        2,
+        "запуск zam-server",
+        Server::start(&root, &data, &env, &server_log),
+    )?;
     step(3, "ожидание /api/v1/health", wait_health(&mut srv, &base))?;
     let token = step(
         4,
@@ -540,8 +609,6 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
 
     step(6, "вход администратора и токен ro", admin_issue_ro(&base))?;
 
-    let qv = Manifest::load(&root.join("deploy").join("qdrant.toml"))?.version;
-    let qdir = root.join("qdrant").join(&qv);
     let qbin = qdir.join(crate::package::exe(host_platform(&root), "qdrant"));
     let out = step(
         7,
@@ -563,6 +630,26 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
         );
     }
 
+    let vr = step(
+        16,
+        "векторный поиск: 5 заметок, индексация, перефраз в top-3",
+        vector_search(&zam, &dir, &base, &token, expect_device).map_err(|e| {
+            anyhow!(
+                "{e:#}\nstderr сервера (целиком — {}):\n{}",
+                server_log.display(),
+                srv.log_tail()
+            )
+        }),
+    )?;
+    let (alive, qtext) = step(
+        17,
+        "Qdrant запущен сервером",
+        qdrant_alive(&env, &root, &data),
+    )?;
+    if !alive {
+        bail!("шаг 17: pid-файл Qdrant не указывает на живой процесс:\n{qtext}");
+    }
+
     step(8, "остановка сервера", srv.stop())?;
     if srv.child.try_wait()?.is_none() {
         bail!("шаг 8: процесс zam-server ещё жив");
@@ -570,7 +657,503 @@ pub fn run(archive: &Path, target: &Path) -> Result<()> {
     if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
         bail!("шаг 8: порт {port} всё ещё принимает соединения");
     }
+    step(
+        18,
+        "процесс Qdrant завершён вместе с сервером",
+        qdrant_gone(&env, &root, &data),
+    )?;
+    let reason = if vr.reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", vr.reason)
+    };
+    println!(
+        "векторный поиск: {VECTOR_TARGET} — №{} в top-3, каналы {}, индексация {:.1} с; \
+         модель {}, device={}{reason}",
+        vr.rank,
+        vr.sources,
+        vr.waited.as_secs_f32(),
+        vr.model,
+        vr.device
+    );
     println!("SMOKE OK");
+    Ok(())
+}
+
+// ---- M2: модель, векторный поиск, устройство, Qdrant, CUDA ----
+
+/// Устройство модели в `/index/status` (`device.kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DeviceKind {
+    Cpu,
+    Cuda,
+}
+
+impl DeviceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeviceKind::Cpu => "cpu",
+            DeviceKind::Cuda => "cuda",
+        }
+    }
+}
+
+/// Тестовая модель векторного шага (`role = "test"`, `cargo xtask fetch-models --test`):
+/// маленькая и англоязычная, поэтому заметки и запрос — на английском.
+const SMOKE_MODEL: &str = "minilm-l6-int8";
+
+/// Предел ожидания векторной индексации пяти заметок.
+const INDEX_WAIT: Duration = Duration::from_secs(60);
+
+/// Заметки векторного шага: (путь в Knowledge, текст).
+const VECTOR_NOTES: [(&str, &str); 5] = [
+    (
+        "smoke/vec/bread",
+        "# Sourdough bread\n\nMix flour, water and a starter, leave the dough to rise \
+         overnight, then bake it in a hot oven until the crust is golden.\n",
+    ),
+    (
+        "smoke/vec/cluster",
+        "# Container orchestration\n\nKubernetes schedules pods across cluster nodes and \
+         restarts crashed containers automatically.\n",
+    ),
+    (
+        "smoke/vec/marathon",
+        "# Marathon training\n\nRunners build endurance with long weekly runs, tempo \
+         sessions and a careful taper before race day.\n",
+    ),
+    (
+        "smoke/vec/photosynthesis",
+        "# Photosynthesis\n\nPlants convert sunlight, carbon dioxide and water into glucose \
+         and oxygen inside their chloroplasts.\n",
+    ),
+    (
+        "smoke/vec/taxes",
+        "# Personal income tax\n\nFile the annual return before the deadline and keep \
+         receipts for deductible expenses.\n",
+    ),
+];
+
+/// Перефраз без общих слов с целевой заметкой: найти её может только векторный канал.
+const VECTOR_QUERY: &str = "how do green leaves make sugar from light";
+const VECTOR_TARGET: &str = "smoke/vec/photosynthesis";
+
+/// Порты и окружение сервера smoke: модель — тестовая, Qdrant — на свободных портах
+/// (не мешает Qdrant разработчика и параллельным прогонам).
+struct SmokeEnv {
+    addr: SocketAddr,
+    qdrant_http: u16,
+    vars: Vec<(String, String)>,
+}
+
+impl SmokeEnv {
+    fn new() -> Result<Self> {
+        let addr: SocketAddr = ([127, 0, 0, 1], free_port()?).into();
+        let qdrant_http = free_port()?;
+        let qdrant_grpc = free_port()?;
+        Ok(Self {
+            addr,
+            qdrant_http,
+            vars: vec![
+                ("ZAM_ML__EMBED_MODEL".into(), SMOKE_MODEL.into()),
+                ("ZAM_QDRANT__HTTP_PORT".into(), qdrant_http.to_string()),
+                ("ZAM_QDRANT__GRPC_PORT".into(), qdrant_grpc.to_string()),
+            ],
+        })
+    }
+
+    /// `zam-server <args> --data-dir <data>` с окружением smoke.
+    fn server_cmd(&self, root: &Path, data: &Path, args: &[&str]) -> Command {
+        let mut cmd =
+            Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")));
+        scrub_zam_env(&mut cmd, &[])
+            .args(args)
+            .arg("--data-dir")
+            .arg(data)
+            .envs(self.vars.iter().map(|(k, v)| (k, v)))
+            .current_dir(root);
+        cmd
+    }
+}
+
+/// Копирует тестовую модель из `target/models/` в `<data>/models/`: только файлы манифеста,
+/// `LICENSE` и `model.toml` (без `*.part` и прочего).
+fn install_test_model(repo: &Path, data: &Path) -> Result<()> {
+    let manifest = ModelsManifest::load(&repo.join("deploy").join("models.toml"))?;
+    let m = manifest.get(SMOKE_MODEL)?;
+    let src = repo.join("target").join("models").join(SMOKE_MODEL);
+    let dst = data.join("models").join(SMOKE_MODEL);
+    fs::create_dir_all(&dst)?;
+    let names = m
+        .files
+        .iter()
+        .map(|f| f.path.as_str())
+        .chain([MODEL_LICENSE_FILE, MODEL_SPEC_FILE]);
+    for n in names {
+        let s = src.join(n);
+        if !s.is_file() {
+            bail!(
+                "нет {}: скачайте тестовую модель (cargo xtask fetch-models --test)",
+                s.display()
+            );
+        }
+        fs::copy(&s, dst.join(n)).with_context(|| format!("копирование {}", s.display()))?;
+    }
+    Ok(())
+}
+
+/// Запрос к API с токеном; возвращает статус и JSON ответа.
+fn api(base: &str, token: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
+    let a = agent();
+    let url = format!("{base}{path}");
+    let auth = format!("Bearer {token}");
+    let mut r = match body {
+        Some(b) => a
+            .post(&url)
+            .header("Authorization", &auth)
+            .content_type("application/json")
+            .send(b.to_string())?,
+        None => a.get(&url).header("Authorization", &auth).call()?,
+    };
+    let status = r.status().as_u16();
+    let text = r.body_mut().read_to_string()?;
+    let v = serde_json::from_str(&text)
+        .with_context(|| format!("{path}: HTTP {status}, ответ не JSON"))?;
+    Ok((status, v))
+}
+
+/// Пути и каналы выдачи (без текстов заметок).
+fn describe_items(v: &Value) -> String {
+    v["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|i| format!("{} {}", i["path"], i["sources"]))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default()
+}
+
+/// Итог векторного шага для печати.
+struct VectorReport {
+    rank: usize,
+    sources: String,
+    device: String,
+    reason: String,
+    model: String,
+    waited: Duration,
+}
+
+/// Критерий M2: 5 заметок → индексация (≤ 60 с) → перефраз находит нужную в top-3 через
+/// векторный канал без деградации; устройство и модель — по `/index/status`.
+fn vector_search(
+    zam: &Path,
+    dir: &Path,
+    base: &str,
+    token: &str,
+    expect: Option<DeviceKind>,
+) -> Result<VectorReport> {
+    let home = dir.join("vector-home");
+    fs::create_dir_all(&home)?;
+    for (path, text) in VECTOR_NOTES {
+        zam_ok(
+            zam,
+            &home,
+            base,
+            token,
+            &["write", &format!("knowledge:{path}")],
+            Some(text.as_bytes()),
+        )?;
+    }
+    let body = serde_json::json!({ "query": VECTOR_QUERY, "mode": "notes", "top_k": 3 });
+    let t0 = Instant::now();
+    let found = loop {
+        let (status, v) = api(base, token, "/api/v1/search", Some(&body))?;
+        if status != 200 {
+            bail!("POST /api/v1/search: HTTP {status}");
+        }
+        if v["degraded"] == false && v["pending_count"] == 0 {
+            break v;
+        }
+        if t0.elapsed() > INDEX_WAIT {
+            let (_, st) = api(base, token, "/api/v1/index/status", None)?;
+            bail!(
+                "за {} с заметки не проиндексированы или поиск деградирован: degraded = {}, \
+                 degraded_reason = {}, pending_count = {}; /index/status: vector = {}, \
+                 device = {}, model = {}, qdrant = {}, queue = {}",
+                INDEX_WAIT.as_secs(),
+                v["degraded"],
+                v["degraded_reason"],
+                v["pending_count"],
+                st["vector"],
+                st["device"],
+                st["model"],
+                st["qdrant"],
+                st["queue"]
+            );
+        }
+        thread::sleep(Duration::from_millis(500));
+    };
+    let waited = t0.elapsed();
+    let items = found["items"]
+        .as_array()
+        .context("в ответе поиска нет items")?;
+    let (rank, item) = items
+        .iter()
+        .take(3)
+        .enumerate()
+        .find(|(_, i)| {
+            i["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with(VECTOR_TARGET))
+        })
+        .with_context(|| {
+            format!(
+                "перефраз «{VECTOR_QUERY}» не нашёл {VECTOR_TARGET} в top-3: {}",
+                describe_items(&found)
+            )
+        })?;
+    let sources = item["sources"].to_string();
+    if !item["sources"]
+        .as_array()
+        .is_some_and(|s| s.iter().any(|x| x == "vector"))
+    {
+        bail!("{VECTOR_TARGET} найден без векторного канала: sources = {sources}");
+    }
+    let (status, st) = api(base, token, "/api/v1/index/status", None)?;
+    if status != 200 {
+        bail!("GET /api/v1/index/status: HTTP {status}");
+    }
+    if st["vector"]["available"] != true {
+        bail!("/index/status: векторный канал выключен: {}", st["vector"]);
+    }
+    let model = st["model"]["id"].as_str().unwrap_or_default().to_string();
+    if !model.starts_with(SMOKE_MODEL) {
+        bail!("/index/status: модель {model}, ожидалась {SMOKE_MODEL}");
+    }
+    let device = st["device"]["kind"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let reason = st["device"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if let Some(want) = expect
+        && device != want.as_str()
+    {
+        bail!(
+            "устройство {device}, ожидалось {} (причина: {reason})",
+            want.as_str()
+        );
+    }
+    if device.is_empty() {
+        bail!("/index/status: устройство не определено: {}", st["device"]);
+    }
+    Ok(VectorReport {
+        rank: rank + 1,
+        sources,
+        device,
+        reason,
+        model,
+        waited,
+    })
+}
+
+/// `zam-server qdrant status` по каталогу данных: pid-файл указывает на живой процесс.
+fn qdrant_alive(env: &SmokeEnv, root: &Path, data: &Path) -> Result<(bool, String)> {
+    let out = output_with_timeout(
+        &mut env.server_cmd(root, data, &["qdrant", "status"]),
+        CMD_TIMEOUT,
+    )?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !out.status.success() {
+        bail!(
+            "zam-server qdrant status: код {:?}\n{text}",
+            out.status.code()
+        );
+    }
+    Ok((text.contains("(жив)"), text))
+}
+
+/// После остановки сервера процесса Qdrant нет (pid-файл не указывает на живой процесс,
+/// порт HTTP закрыт); ждём не дольше 10 с.
+fn qdrant_gone(env: &SmokeEnv, root: &Path, data: &Path) -> Result<()> {
+    let addr: SocketAddr = ([127, 0, 0, 1], env.qdrant_http).into();
+    let t0 = Instant::now();
+    loop {
+        let (alive, text) = qdrant_alive(env, root, data)?;
+        let port = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok();
+        if !alive && !port {
+            return Ok(());
+        }
+        if t0.elapsed() > WAIT {
+            bail!(
+                "Qdrant работает через 10 с после остановки сервера (порт {} {}):\n{text}",
+                env.qdrant_http,
+                if port { "открыт" } else { "закрыт" }
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Распаковывает архив в существующий каталог (без очистки).
+fn extract_into(archive: &Path, dir: &Path) -> Result<()> {
+    let f = File::open(archive).with_context(|| format!("открытие {}", archive.display()))?;
+    if archive.to_string_lossy().ends_with(".zip") {
+        zip::ZipArchive::new(f)?.extract(dir)?;
+    } else {
+        tar::Archive::new(flate2::read::GzDecoder::new(f)).unpack(dir)?;
+    }
+    Ok(())
+}
+
+/// Пользователь распаковал `zam-cuda` в каталог `zam-server`: `cuda fetch` видит все
+/// библиотеки установленными по штампам и ничего не скачивает.
+fn cuda_from_archive(env: &SmokeEnv, archive: &Path, root: &Path, data: &Path) -> Result<()> {
+    extract_into(archive, root)?;
+    let out = output_with_timeout(
+        &mut env.server_cmd(root, data, &["cuda", "fetch"]),
+        Duration::from_secs(120),
+    )?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !out.status.success() {
+        bail!("zam-server cuda fetch: код {:?}\n{text}", out.status.code());
+    }
+    if !text.contains("загружено архивов 0 ") {
+        bail!("cuda fetch после распаковки zam-cuda что-то скачал:\n{text}");
+    }
+    Ok(())
+}
+
+/// Windows: импорты MSVC runtime у DLL комплекта и у `qdrant.exe` лежат рядом (app-local):
+/// на чистой системе без VC++ Redistributable ONNX Runtime и Qdrant загрузятся.
+fn check_app_local_crt(root: &Path, qdrant_dir: &Path) -> Result<()> {
+    let dumpbin = crate::package::find_dumpbin()?;
+    let files_in = |dir: &Path| -> Result<Vec<String>> {
+        Ok(fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect())
+    };
+    let mut targets: Vec<PathBuf> = files_in(root)?
+        .into_iter()
+        .filter(|n| n.to_ascii_lowercase().ends_with(".dll"))
+        .map(|n| root.join(n))
+        .collect();
+    targets.push(qdrant_dir.join("qdrant.exe"));
+    let mut bad = Vec::new();
+    for t in &targets {
+        let out = output_with_timeout(
+            Command::new(&dumpbin).arg("/dependents").arg(t),
+            CMD_TIMEOUT,
+        )?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() {
+            bail!(
+                "dumpbin /dependents {}: код {:?}",
+                t.display(),
+                out.status.code()
+            );
+        }
+        let dir = t.parent().context("каталог файла")?;
+        let missing = crate::package::missing_app_local(&text, &files_in(dir)?);
+        if !missing.is_empty() {
+            bad.push(format!(
+                "{}: нет рядом {}",
+                t.strip_prefix(root).unwrap_or(t).display(),
+                missing.join(", ")
+            ));
+        }
+    }
+    if !bad.is_empty() {
+        bail!(
+            "библиотеки MSVC runtime не найдутся на чистой Windows:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
+/// Проверка архива `zam-cuda`: размер меньше 2 ГиБ, корень `cuda/`, `cuda.toml` совпадает с
+/// `deploy/cuda.toml`, штамп каждого архива NVIDIA совпадает с манифестом и файлы на месте
+/// (`cuda fetch` после распаковки ничего не скачает), библиотеки — PE (Windows) или ELF
+/// (Linux), есть лицензии NVIDIA. При успехе печатает `SMOKE-CUDA OK`.
+pub fn run_cuda(archive: &Path, repo: &Path) -> Result<()> {
+    let name = archive_stem(archive)?;
+    let platform = *PLATFORMS
+        .iter()
+        .find(|p| name.starts_with("zam-cuda-") && name.ends_with(*p))
+        .with_context(|| format!("ожидается архив zam-cuda-<версия>-<платформа>: {name}"))?;
+    crate::package::check_release_size(archive, crate::package::MAX_RELEASE_FILE)?;
+    let dir = repo.join("target").join("smoke").join(&name);
+    let root = step(1, "распаковка", unpack(archive, &dir))?;
+    if root.file_name().and_then(|n| n.to_str()) != Some(crate::bundles::CUDA_DIR) {
+        bail!(
+            "корневой каталог архива — {}, ожидался cuda/",
+            root.display()
+        );
+    }
+    let manifest_path = repo.join("deploy").join("cuda.toml");
+    let m = CudaManifest::load(&manifest_path)?;
+    m.validate()?;
+    let inner = fs::read(root.join("cuda.toml")).context("в архиве нет cuda/cuda.toml")?;
+    if inner != fs::read(&manifest_path)? {
+        bail!("cuda/cuda.toml в архиве отличается от deploy/cuda.toml");
+    }
+    for l in m.libs(platform) {
+        if !zam_fetch::is_installed(&l.entry(), &root, &l.component)? {
+            bail!(
+                "{} {}: штамп не совпал с манифестом или нет файлов — cuda fetch стал бы \
+                 скачивать",
+                l.component,
+                l.version
+            );
+        }
+    }
+    let names = m.dest_names(platform)?;
+    let mut total = 0u64;
+    for n in &names {
+        let p = root.join(n);
+        let mut head = [0u8; 4];
+        File::open(&p)?.read_exact(&mut head)?;
+        let ok = if platform == "linux-x64" {
+            head == *b"\x7fELF"
+        } else {
+            head[..2] == *b"MZ"
+        };
+        if !ok {
+            bail!("{n}: не библиотека {platform}");
+        }
+        total += fs::metadata(&p)?.len();
+    }
+    let lic = root.join("LICENSES");
+    let has_lic = fs::read_dir(&lic)
+        .map(|d| d.filter_map(|e| e.ok()).any(|e| e.path().is_file()))
+        .unwrap_or(false);
+    if !has_lic {
+        bail!("в архиве нет cuda/LICENSES с лицензиями NVIDIA");
+    }
+    println!(
+        "{name}: {} библиотек ({:.0} МБ распакованными), архив {:.0} МБ; штампы совпадают с \
+         deploy/cuda.toml",
+        names.len(),
+        total as f64 / 1e6,
+        fs::metadata(archive)?.len() as f64 / 1e6
+    );
+    println!("SMOKE-CUDA OK");
     Ok(())
 }
 

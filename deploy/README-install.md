@@ -1,8 +1,19 @@
 # ZeroAIMemory: установка
 
 Комплект содержит сервер `zam-server`, клиент `zam`, библиотеки ONNX Runtime и pdfium,
-Qdrant (`qdrant/<версия>/`), пример конфигурации `config.example.toml` и лицензии (`LICENSES/`).
-Поддерживаются Windows x64 и Linux x64.
+Qdrant (`qdrant/<версия>/`), пример конфигурации `config.example.toml`, копии манифестов
+`deploy/` (что и откуда скачивают `qdrant fetch`, `models fetch` и `cuda fetch`; в
+`zam-server` они встроены) и лицензии (`LICENSES/`). Поддерживаются Windows x64 и Linux x64.
+
+| Архив релиза | Что внутри |
+|---|---|
+| `zam-server-<версия>-<os>-x64-cpu` | комплект с ONNX Runtime для CPU |
+| `zam-server-<версия>-<os>-x64-gpu` | то же, но ONNX Runtime с CUDA EP; библиотек NVIDIA нет (см. «GPU (CUDA)»), без GPU работает на CPU |
+| `zam-<версия>-<os>-x64` | только клиент `zam` |
+| `zam-models-<версия>-<модель>.zip` | одна модель с `bundle = true` — для машин без интернета (см. «Модели») |
+| `zam-cuda-<версия>-<os>-x64` | библиотеки NVIDIA для GPU-комплекта — для машин без интернета |
+
+`<os>` — `windows` (zip) или `linux` (tar.gz). Контрольные суммы всех архивов — в `SHA256SUMS`.
 
 ## Порты и данные
 
@@ -206,8 +217,13 @@ zam-server models status --config config.toml [--verify]   # что устано
 перекачивает файлы с верным хэшем. После загрузки перезапустите сервер; смена модели
 выключает векторный поиск до reindex (векторы разных моделей не смешиваются).
 
-Для машин без интернета есть архив `zam-models-<версия>.zip` (модели с `bundle = true`):
-распакуйте его в каталог моделей.
+Для машин без интернета модели с `bundle = true` выложены архивами `zam-models-<версия>-<id>.zip`,
+по одному на модель (вместе они больше предела 2 ГиБ на файл релиза): `bge-m3-int8` — для
+CPU, `bge-m3-fp16` и `bge-reranker-v2-m3` — для GPU. Распакуйте нужные в каталог моделей
+(`<data_dir>/models`): появятся `<id>/` с файлами модели, `LICENSE` и `model.toml`, а рядом
+`models.toml` — копия манифеста с SHA-256 каждого файла (во всех архивах он одинаковый,
+замену можно подтвердить). Проверка — `zam-server models status --verify`. Реранкер
+`jina-reranker-v2` (CC-BY-NC-4.0) в архивы не входит.
 
 ## Состояние индекса и reindex
 
@@ -275,8 +291,22 @@ zam-server cuda fetch --config config.toml
 (размер и SHA-256 сверяются), нужные библиотеки кладутся в `<каталог ONNX Runtime>/cuda/`
 (по умолчанию — `cuda/` рядом с `zam-server`), рядом с ними — штампы `.<компонент>.sha256`.
 Повторный запуск пропускает архив, только если штамп совпал с манифестом; после обновления
-`zam-server` с новым `cuda.toml` старые библиотеки заменяются. Другой вариант — распаковать
-туда архив `zam-cuda-<версия>-<os>-x64` (штампы в нём уже есть). Нужен драйвер NVIDIA с поддержкой CUDA 13 (ветка R580 и
+`zam-server` с новым `cuda.toml` старые библиотеки заменяются.
+
+Без интернета — архив `zam-cuda-<версия>-<os>-x64` той же версии, что и `zam-server`:
+распакуйте его в каталог `zam-server` (в архиве один каталог `cuda/`, он ляжет рядом с ONNX
+Runtime):
+
+```
+# Windows: содержимое zip (каталог cuda) — в каталог с zam-server.exe
+# Linux:
+sudo tar -xzf zam-cuda-<версия>-linux-x64.tar.gz -C /opt/zeroaimemory
+```
+
+В `cuda/` лежат библиотеки, штампы `.<компонент>.sha256`, `cuda.toml` и `LICENSES/` (CUDA
+Toolkit EULA, лицензия cuDNN). По штампам `zam-server cuda fetch` видит библиотеки
+установленными и ничего не скачивает — это и проверка распаковки: команда должна сообщить
+«загружено архивов 0». Нужен драйвер NVIDIA с поддержкой CUDA 13 (ветка R580 и
 новее); устанавливать CUDA Toolkit не нужно. Лицензия библиотек NVIDIA —
 https://docs.nvidia.com/cuda/eula/index.html.
 
@@ -308,9 +338,11 @@ zam-server models fetch --device cpu --reranker --accept-nc-license
 
 ## Windows
 
-1. Распакуйте архив `zam-server-<версия>-windows-x64-cpu.zip`, например в `C:\ZeroAIMemory`.
-2. `zam-server.exe` и `zam.exe` собраны со статическим CRT, а рядом с `qdrant.exe` лежит app-local
-   `vcruntime140.dll`: отдельная установка VC Redistributable не нужна.
+1. Распакуйте архив `zam-server-<версия>-windows-x64-cpu.zip` (или `-gpu.zip`), например в
+   `C:\ZeroAIMemory`.
+2. `zam-server.exe` и `zam.exe` собраны со статическим CRT, а библиотеки MSVC runtime, которые
+   нужны ONNX Runtime (`msvcp140*.dll`, `vcruntime140*.dll`) и Qdrant (`vcruntime140.dll` рядом с
+   `qdrant.exe`), лежат в комплекте app-local: отдельная установка VC++ Redistributable не нужна.
 3. Создайте `config.toml` и запустите `zam-server.exe serve --config config.toml`.
 4. Для работы в фоне зарегистрируйте запуск в Планировщике заданий или через менеджер служб (например, NSSM).
 
@@ -318,8 +350,8 @@ zam-server models fetch --device cpu --reranker --accept-nc-license
 
 ## Linux
 
-1. Распакуйте архив `zam-server-<версия>-linux-x64-cpu.tar.gz` в `/opt/zeroaimemory`
-   (лишний верхний каталог архива отбрасывается):
+1. Распакуйте архив `zam-server-<версия>-linux-x64-cpu.tar.gz` (или `-gpu.tar.gz`) в
+   `/opt/zeroaimemory` (лишний верхний каталог архива отбрасывается):
 
    ```
    sudo install -d /opt/zeroaimemory

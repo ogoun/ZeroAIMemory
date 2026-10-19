@@ -1,11 +1,18 @@
-Microsoft Visual C++ Runtime (vcruntime140.dll)
+Microsoft Visual C++ Runtime (vcruntime140.dll, vcruntime140_1.dll, msvcp140.dll,
+msvcp140_1.dll, msvcp140_atomic_wait.dll)
 
-Файл vcruntime140.dll входит в состав комплекта для Windows как app-local
-(рядом с qdrant.exe) копия распространяемого компонента Microsoft Visual C++
-Redistributable. Он распространяется на условиях, указанных в Microsoft Visual
-Studio License Terms, раздел "Distributable Code" (файлы из списка
-REDIST.TXT установленной Visual Studio):
+Комплект для Windows содержит app-local копии распространяемых компонентов Microsoft
+Visual C++ Redistributable:
+  - рядом с zam-server.exe — msvcp140.dll, msvcp140_1.dll, vcruntime140.dll,
+    vcruntime140_1.dll (их импортирует onnxruntime.dll), в GPU-комплекте ещё
+    msvcp140_atomic_wait.dll (его импортирует onnxruntime_providers_cuda.dll);
+  - рядом с qdrant.exe — vcruntime140.dll.
+Поэтому отдельная установка VC++ Redistributable не нужна. Сами zam-server.exe и zam.exe
+собраны со статическим CRT.
+
+Файлы распространяются на условиях Microsoft Visual Studio License Terms, раздел
+"Distributable Code" (файлы из списка REDIST.TXT установленной Visual Studio):
   https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution
   https://visualstudio.microsoft.com/license-terms/
 
-Файл не изменялся. Права на него принадлежат Microsoft Corporation.
+Файлы не изменялись. Права на них принадлежат Microsoft Corporation.

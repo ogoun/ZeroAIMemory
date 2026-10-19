@@ -1,0 +1,58 @@
+# Библиотеки NVIDIA для GPU-комплекта: загрузка redist-архивов по deploy/cuda.toml (~1,9 ГБ на
+# Windows, ~2,2 ГБ на Linux), проверка размера и SHA-256, извлечение (на Linux — SONAME из
+# символических ссылок tar.xz), штампы `.<компонент>.sha256`, архив zam-cuda и smoke-cuda:
+# после распаковки архива cuda fetch ничего не скачивает. GPU на раннерах нет, поэтому
+# загрузка библиотек в CUDA EP здесь не проверяется (ручной прогон на машине с NVIDIA).
+#
+# Дорого по трафику и времени, поэтому не на каждый push, а при изменении манифеста или кода
+# установки и вручную; в релизе то же делает package.yml (extras).
+name: CUDA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    tags-ignore: ['**']
+    paths:
+      - deploy/cuda.toml
+      - deploy/licenses/nvidia/**
+      - crates/zam-fetch/src/cuda.rs
+      - crates/zam-fetch/src/download.rs
+      - xtask/src/bundles.rs
+      - .github/workflows/cuda.yml
+
+concurrency:
+  group: cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cuda:
+    name: cuda (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+            ext: zip
+          - os: ubuntu-22.04
+            platform: linux-x64
+            ext: tar.gz
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - name: zam-cuda (загрузка, проверка, штампы, архив)
+        run: cargo xtask package --platform ${{ matrix.platform }} --version 0.0.0-ci --cuda --no-kit
+      - name: smoke-cuda
+        run: cargo xtask smoke-cuda --archive target/dist/zam-cuda-0.0.0-ci-${{ matrix.platform }}.${{ matrix.ext }}

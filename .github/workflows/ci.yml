@@ -102,6 +102,8 @@ jobs:
             exit 1
           fi
 
+  # Комплекты платформа × cpu|gpu, smoke с векторным поиском на тестовой модели (без
+  # zam-cuda и zam-models: их собирает релиз, zam-cuda при изменении манифеста — cuda.yml).
   package-smoke:
     name: package-smoke
     needs: web

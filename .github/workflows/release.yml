@@ -1,5 +1,6 @@
-# Релиз по тегу v*: web -> комплекты обеих платформ (сборка, упаковка, smoke) -> черновик GitHub Release.
-# Если упала любая платформа или любой smoke-тест, publish не запускается и релиз не создаётся.
+# Релиз по тегу v*: web -> комплекты (платформа × cpu|gpu: сборка, упаковка, smoke), архивы
+# zam-cuda обеих платформ и zam-models -> черновик GitHub Release.
+# Если упала любая задача или любой smoke-тест, publish не запускается и релиз не создаётся.
 name: Release
 
 on:
@@ -75,10 +76,24 @@ jobs:
         with:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@v2
+      # Тот же кэш, что в ci.yml (ключ — хэш deploy/*.toml): тег видит кэш ветки по умолчанию.
+      # Шаг идёт после rust-cache: его post-шаг сохраняет кэш раньше, чем rust-cache чистит target/.
+      - name: кэш зависимостей и моделей
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/deps
+            target/models
+          key: deps-models-v2-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
       # тесты zam-index запускают настоящий Qdrant из target/deps и без него падают
       - name: fetch-deps
         run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
+      - name: fetch-models
+        run: cargo xtask fetch-models --test
       - name: test
+        # тесты zam-ml без ORT или MiniLM падают, а не пропускаются
+        env:
+          ZAM_REQUIRE_ML: "1"
         run: cargo test --workspace
 
   package:
@@ -88,6 +103,7 @@ jobs:
     with:
       version: ${{ github.ref_name }}
       upload: true
+      extras: true
 
   publish:
     name: publish (draft)
@@ -102,13 +118,41 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
+      # Состав: zam-server (2 платформы × cpu|gpu), zam (2), zam-cuda (2) и zam-models (по
+      # архиву на модель с bundle = true в deploy/models.toml).
+      - name: состав архивов
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          models=$(grep -c '^bundle = true' ../deploy/models.toml)
+          check() { n=$(ls $1 2>/dev/null | wc -l); echo "$1: $n (ожидается $2)"; test "$n" -eq "$2"; }
+          check 'zam-server-*' 4
+          check 'zam-[0-9]*' 2
+          check 'zam-cuda-*' 2
+          check 'zam-models-*' "${models}"
+          test "$(ls | wc -l)" -eq $((8 + models))
       - name: SHA256SUMS по всем архивам
         working-directory: dist
         run: |
           set -euo pipefail
-          test "$(ls zam-*.zip zam-*.tar.gz | wc -l)" -eq 4
           sha256sum zam-*.zip zam-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
+      # GitHub не принимает файл релиза от 2 ГиБ: проверка до загрузки, с понятным текстом.
+      - name: каждый файл меньше 2 ГиБ
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          limit=$((2 * 1024 * 1024 * 1024))
+          bad=0
+          for f in *; do
+            s=$(stat -c %s "$f")
+            echo "$f: $((s / 1000000)) МБ"
+            if [ "$s" -ge "$limit" ]; then
+              echo "::error title=файл релиза больше 2 ГиБ::$f — $s байт; разбейте архив (xtask package)"
+              bad=1
+            fi
+          done
+          test "$bad" -eq 0
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1

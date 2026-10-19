@@ -128,7 +128,10 @@ impl Supervisor {
                 m2.stop_timeout,
             );
             let rebuilt = stamp::check_before_start(&q2, &m2.expected_version)?;
-            std::fs::write(q2.join("config").join("zam.yaml"), config::render_yaml(&m2))?;
+            std::fs::write(
+                q2.join("config").join("zam.yaml"),
+                config::render_yaml(&m2, &q2)?,
+            )?;
             Ok(rebuilt)
         })
         .await

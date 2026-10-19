@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Версия | 1.1 (2026-10-19; v1.0 утверждена владельцем 2026-10-18) |
+| Версия | 1.2 (2026-10-19; v1.0 утверждена владельцем 2026-10-18) |
 | Дата | 2026-10-19 |
 | Исходный набросок | [`ZeroAIMemory.md`](../../ZeroAIMemory.md) |
 | Исследования | [`docs/research/`](../research/) — аналоги, MD-движки, стек, аудит библиотек и поставка Qdrant (04), индекс и ML (05) |
@@ -1042,16 +1042,18 @@ ZeroAIMemoryToken=zam_…
 
   | Архив | Содержимое |
   |---|---|
-  | `zam-server-<ver>-windows-x64-cpu.zip` | `zam-server.exe` (с встроенным WebUI), `onnxruntime.dll` (CPU), `pdfium.dll`, `qdrant/<qver>/qdrant.exe` + `vcruntime140.dll`, `zam.exe` (для раздачи `GET /downloads/zam/…`), `config.example.toml`, `deploy/qdrant.toml`, `README-install.md`, `LICENSES/` |
-  | `zam-server-<ver>-windows-x64-gpu.zip` | то же, но ONNX Runtime с CUDA EP (`onnxruntime_providers_cuda`, `onnxruntime_providers_shared`). Библиотек NVIDIA в комплекте нет (решение владельца): их ставит `zam-server cuda fetch` в `<exe_dir>/cuda/` по `deploy/cuda.toml` (sha256) или архив `zam-cuda-*`. Без GPU и без CUDA комплект работает на CPU |
+  | `zam-server-<ver>-windows-x64-cpu.zip` | `zam-server.exe` (с встроенным WebUI), `onnxruntime.dll` (CPU), `pdfium.dll`, app-local MSVC runtime для ONNX Runtime (`msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`, `vcruntime140_1.dll`), `qdrant/<qver>/qdrant.exe` + `vcruntime140.dll`, `zam.exe` (для раздачи `GET /downloads/zam/…`), `config.example.toml`, `deploy/qdrant.toml`, `deploy/models.toml`, `README-install.md`, `LICENSES/` |
+  | `zam-server-<ver>-windows-x64-gpu.zip` | то же, но ONNX Runtime с CUDA EP (`onnxruntime_providers_cuda`, `onnxruntime_providers_shared`), ещё `msvcp140_atomic_wait.dll` (его импортирует CUDA EP) и `deploy/cuda.toml`. Библиотек NVIDIA в комплекте нет (решение владельца): их ставит `zam-server cuda fetch` в `<exe_dir>/cuda/` по `deploy/cuda.toml` (sha256) или архив `zam-cuda-*`. Без GPU и без CUDA комплект работает на CPU |
   | `zam-server-<ver>-linux-x64-cpu.tar.gz` | `zam-server` (gnu; сборка на старой glibc, минимальная версия указывается в README), `libonnxruntime.so`, `libpdfium.so`, `qdrant/<qver>/qdrant` (musl), `zam` (musl, статический), юнит systemd, конфиг, лицензии |
-  | `zam-server-<ver>-linux-x64-gpu.tar.gz` | то же + ORT CUDA EP; библиотеки NVIDIA — так же, через `zam-server cuda fetch` или `zam-cuda-*` |
-  | `zam-cuda-<ver>-windows-x64.zip`, `zam-cuda-<ver>-linux-x64.tar.gz` | redistributable-библиотеки CUDA 13 и cuDNN 9 по `deploy/cuda.toml` (cudart, cublas, cublasLt, cufft, cudnn; на Linux ещё curand и nvrtc) для распаковки в `<exe_dir>/cuda/` — для машин без интернета. Каждый файл релиза меньше 2 ГиБ |
+  | `zam-server-<ver>-linux-x64-gpu.tar.gz` | то же + ORT CUDA EP и `deploy/cuda.toml`; библиотеки NVIDIA — так же, через `zam-server cuda fetch` или `zam-cuda-*` |
+  | `zam-cuda-<ver>-windows-x64.zip`, `zam-cuda-<ver>-linux-x64.tar.gz` | каталог `cuda/`: redistributable-библиотеки CUDA 13 и cuDNN 9 по `deploy/cuda.toml` (cudart, cublas, cublasLt, cufft, cudnn; на Linux ещё curand и nvrtc), штампы `.<компонент>.sha256`, `cuda.toml` и лицензии NVIDIA — распаковывается в каталог `zam-server` (получается `<exe_dir>/cuda/`), после чего `cuda fetch` ничего не скачивает; для машин без интернета |
   | `zam-<ver>-windows-x64.zip`, `zam-<ver>-linux-x64.tar.gz` | только CLI |
-  | `zam-models-<ver>.zip` | ONNX-модели с `bundle = true` из `deploy/models.toml` (bge-m3 int8 и fp16, реранкер `bge-reranker-v2-m3`) с sha256-манифестом — для машин без интернета; при наличии интернета модели скачивает `zam-server models fetch`. Реранкер jina (CC-BY-NC-4.0) в архив не входит |
+  | `zam-models-<ver>-<id>.zip` | по архиву на ONNX-модель с `bundle = true` из `deploy/models.toml` (`bge-m3-int8`, `bge-m3-fp16`, `bge-reranker-v2-m3`): `<id>/` с файлами, `LICENSE` и `model.toml` плюс `models.toml` с sha256 — для машин без интернета, распаковывается в каталог моделей; при наличии интернета модели скачивает `zam-server models fetch`. Вместе модели больше 2 ГиБ, поэтому архив не один. Реранкер jina (CC-BY-NC-4.0) в архивы не входит |
+
+  Каждый файл релиза меньше 2 ГиБ (предел GitHub): `cargo xtask package` и publish проверяют это до загрузки.
 
 - **Откуда берутся зависимости.** Все сторонние бинарники скачиваются в CI по закреплённым версиям и SHA-256 из манифестов в `deploy/`: `qdrant.toml`, `onnxruntime.toml`, `onnxruntime-gpu.toml`, `pdfium.toml`, `cuda.toml`, `models.toml`. Без совпадения хэша сборка падает.
-- **Проверка перед публикацией (smoke-тест, на обеих ОС).** Комплект распаковывается в чистый каталог и запускается с пустым `data_dir`. Тест проверяет, что Qdrant поднялся, записывает заметку, находит её через FTS и через векторный поиск (на маленькой тестовой модели), запускает `zam status` и останавливает сервер. После остановки не должно остаться процессов Qdrant. GPU-комплект проверяется на CPU-раннере: без GPU он обязан работать на CPU.
+- **Проверка перед публикацией (smoke-тест, на обеих ОС, оба flavor).** Комплект распаковывается в чистый каталог и запускается с пустым `data_dir`. Тест проверяет, что Qdrant поднялся, записывает заметку, находит её через FTS и через векторный поиск (на маленькой тестовой модели: 5 заметок, перефраз в top-3 через векторный канал без `degraded`), запускает `zam status` и останавливает сервер. После остановки не должно остаться процессов Qdrant. GPU-комплект проверяется на CPU-раннере: без GPU он обязан работать на CPU; с распакованным `zam-cuda` команда `cuda fetch` не скачивает ничего. Архив `zam-cuda` проверяется отдельно (штампы, состав, формат библиотек). На Windows smoke проверяет, что MSVC runtime, который импортируют библиотеки комплекта, лежит рядом. Загрузка библиотек NVIDIA в CUDA EP проверяется вручную на машине с GPU (раннеров с GPU нет).
 - **Версии.** SemVer для всех артефактов. `zam --version` и `GET /health` показывают версию, git-хэш и версии Qdrant и ORT.
 - **Лицензии.** В `LICENSES/` лежат лицензии всех поставляемых сторонних компонентов: Qdrant (Apache-2.0), ORT (MIT), pdfium (BSD/Apache), CUDA/cuDNN (лицензии NVIDIA), MSVC runtime, а также сводка Rust- и npm-зависимостей (`cargo-about`, `license-checker`).
 
@@ -1220,3 +1222,7 @@ CHANGELOG.md
   - §16.3, решение владельца: GPU-комплект без библиотек NVIDIA — их ставит `zam-server cuda fetch` по `deploy/cuda.toml` или отдельный архив `zam-cuda-<ver>-<os>-x64`; новые манифесты `onnxruntime-gpu.toml` и `models.toml`;
   - §17, решение владельца: цель GPU для индексации фиксируется замером на RTX 3090 владельца (задача 17 M2) вместо «≥ 100 чанков/с на RTX 3060+», недостижимых на 3060 по оценке исследования 05.
   - §8.1, §12 (задача 10 M2): ключ кэша в `chunks.embed_key`, сборка мусора `embeddings`, правила reindex (из кэша / `full`, пересоздание коллекции чужой модели, повтор прерванного), исключение повреждённой базы из пересборки; поля `/index/status` и ответ `POST /admin/reindex`.
+- **v1.2** (2026-10-19) — по итогам упаковки M2 (задача 11) **[решение исполнителя]**:
+  - §16.3: `zam-models` — архив на модель (`zam-models-<ver>-<id>.zip`) вместо одного: три модели комплекта вместе ≈ 2,9 ГБ, больше предела 2 ГиБ на файл релиза GitHub;
+  - §16.3: комплект Windows содержит app-local MSVC runtime для ONNX Runtime (`onnxruntime.dll` импортирует MSVCP140, MSVCP140_1, VCRUNTIME140, VCRUNTIME140_1, CUDA EP — ещё MSVCP140_ATOMIC_WAIT): без него на Windows без VC++ Redistributable векторный поиск не включался;
+  - §16.3: состав `zam-cuda` (каталог `cuda/` со штампами, `cuda.toml` и лицензиями NVIDIA, распаковка в каталог `zam-server`), копии `deploy/models.toml` (оба flavor) и `deploy/cuda.toml` (gpu) в комплекте; smoke обоих flavor и проверка архива `zam-cuda`.
