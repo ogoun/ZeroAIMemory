@@ -4,10 +4,11 @@
 //! 1. Собственный текст каждой секции H1–H3 (и преамбулы) — от конца строк
 //!    заголовка до начала следующей секции, так что текст подсекции не
 //!    повторяется в родителе. Frontmatter и строки заголовков в листы не входят.
-//! 2. Короткие секции (< `merge_below`) склеиваются со следующими соседями того
-//!    же родителя, пока сумма не дойдёт до `merge_below` (и не превысит
-//!    `target_max`). Путь склейки — путь первой секции; строки заголовков
-//!    присоединённых секций остаются в тексте: диапазон листа непрерывен.
+//! 2. Короткие секции (< `merge_below`) склеиваются со следующим непустым
+//!    соседом того же родителя, если склейка не длиннее `target_max` (пустые
+//!    соседи цепочку не рвут); без следующего соседа — с предыдущей группой того
+//!    же родителя по тому же правилу. Путь склейки — путь первой секции; строки
+//!    заголовков присоединённых секций остаются в тексте: диапазон непрерывен.
 //! 3. Текст группы делится на блоки верхнего уровня по AST comrak. Блок кода,
 //!    таблица, список и цитата/callout — неделимые единицы, пока не длиннее
 //!    `hard_max`; длиннее — режутся по элементам (пункты, дочерние блоки) или
@@ -32,9 +33,10 @@ use comrak::{Arena, parse_document};
 use serde::Serialize;
 
 use crate::doc::Doc;
-use crate::levels::{L1_MAX_TOKENS, NOTE_L1_MAX_CHARS, fit_lines, l1_items, own_ranges, render};
+use crate::levels::{L1_MAX_TOKENS, NOTE_L1_MAX_CHARS, fit_items, l1_items, own_ranges};
 use crate::options::comrak_options;
 use crate::pos::LineIndex;
+use crate::render::is_callout;
 use crate::sentences::split_sentences;
 
 /// Счётчик токенов для бюджетов чанкера.
@@ -178,7 +180,11 @@ pub fn chunk_note(src: &str, doc: &Doc, p: &ChunkParams, tc: &dyn TokenCounter) 
         })
         .collect();
 
+    // L1 из одних заголовков не индексируется; L1 секции, совпавший с L1 заметки, — тоже
     let items = l1_items(src, doc, root);
+    let (note, note_has_sentence) = fit_items(&items, |t| {
+        t.chars().count() <= NOTE_L1_MAX_CHARS && tc.count(t) <= L1_MAX_TOKENS
+    });
     for (k, s) in doc.sections.iter().enumerate() {
         if !(1..=2).contains(&s.level) {
             continue;
@@ -195,8 +201,8 @@ pub fn chunk_note(src: &str, doc: &Doc, p: &ChunkParams, tc: &dyn TokenCounter) 
             .take_while(|it| s.range.contains(&it.start))
             .cloned()
             .collect();
-        let text = fit_lines(&render(&slice), |t| tc.count(t) <= L1_MAX_TOKENS);
-        if !text.is_empty() {
+        let (text, has_sentence) = fit_items(&slice, |t| tc.count(t) <= L1_MAX_TOKENS);
+        if has_sentence && text != note {
             out.push(level_draft(
                 ChunkLevel::Section,
                 s.path.join(" > "),
@@ -205,11 +211,8 @@ pub fn chunk_note(src: &str, doc: &Doc, p: &ChunkParams, tc: &dyn TokenCounter) 
             ));
         }
     }
-    let text = fit_lines(&render(&items), |t| {
-        t.chars().count() <= NOTE_L1_MAX_CHARS && tc.count(t) <= L1_MAX_TOKENS
-    });
-    if !text.is_empty() {
-        out.push(level_draft(ChunkLevel::Note, String::new(), text, tc));
+    if note_has_sentence {
+        out.push(level_draft(ChunkLevel::Note, String::new(), note, tc));
     }
     out
 }
@@ -274,6 +277,12 @@ fn top_blocks<'a>(
             NodeValue::CodeBlock(cb) if cb.fenced => b.header_end = Some(li.line_end(line)),
             // шапка и строка-разделитель
             NodeValue::Table(_) => b.header_end = Some(li.line_end(line + 1)),
+            // callout Obsidian (`> [!info]-`, `> [!заметка]`) — цитата с маркером:
+            // строка маркера повторяется в частях, как у GitHub alert
+            NodeValue::BlockQuote if is_callout(node) => {
+                b.elems = child_starts(node);
+                b.header_end = Some(li.line_end(line));
+            }
             NodeValue::List(_) | NodeValue::BlockQuote | NodeValue::MultilineBlockQuote(_) => {
                 b.elems = child_starts(node);
             }
@@ -298,6 +307,8 @@ fn top_blocks<'a>(
 struct Group {
     range: Range<usize>,
     path: String,
+    /// Индекс последней секции группы в `Doc::sections`.
+    last: usize,
 }
 
 /// Лист до сборки текста.
@@ -356,6 +367,12 @@ impl Chunker<'_> {
     }
 
     /// Группы секций с непустым собственным текстом, с учётом склейки коротких.
+    ///
+    /// Группа короче `merge_below` присоединяет следующего непустого соседа того
+    /// же родителя, если склейка не длиннее `target_max`; пустые соседи между
+    /// ними (только строка заголовка) цепочку не рвут. Если следующего непустого
+    /// соседа нет, короткая группа присоединяется к предыдущей группе того же
+    /// родителя по тому же правилу. Иначе секция остаётся отдельной.
     fn groups(&self, doc: &Doc, own: &[Range<usize>]) -> Vec<Group> {
         let tokens: Vec<Option<usize>> = own
             .iter()
@@ -365,30 +382,57 @@ impl Chunker<'_> {
             })
             .collect();
         let secs = &doc.sections;
-        let mut out = Vec::new();
+        let merged_tokens = |a: usize, b: usize| self.tc.count(self.src[a..b].trim());
+        // следующий непустой сосед `k` через пустых соседей
+        let next_sibling = |k: usize| -> Option<usize> {
+            let mut j = k + 1;
+            while j < secs.len() && siblings(&secs[k], &secs[j]) {
+                if tokens[j].is_some() {
+                    return Some(j);
+                }
+                j += 1;
+            }
+            None
+        };
+        let mut out: Vec<Group> = Vec::new();
         let mut i = 0;
         while i < secs.len() {
             let Some(mut total) = tokens[i] else {
                 i += 1;
                 continue;
             };
-            let first = i;
-            while total < self.p.merge_below
-                && i + 1 < secs.len()
-                && siblings(&secs[i], &secs[i + 1])
-            {
-                let Some(t) = tokens[i + 1] else { break };
-                if total + t > self.p.target_max {
+            let (first, mut last) = (i, i);
+            let mut no_next = false;
+            while total < self.p.merge_below {
+                let Some(j) = next_sibling(last) else {
+                    no_next = true;
+                    break;
+                };
+                let t = merged_tokens(own[first].start, own[j].end);
+                if t > self.p.target_max {
                     break;
                 }
-                total += t;
-                i += 1;
+                total = t;
+                last = j;
+            }
+            let range = own[first].start..own[last].end;
+            i = last + 1;
+            if total < self.p.merge_below
+                && no_next
+                && let Some(prev) = out.last_mut()
+                && (prev.last + 1..first).all(|k| tokens[k].is_none())
+                && (prev.last + 1..=first).all(|k| siblings(&secs[prev.last], &secs[k]))
+                && merged_tokens(prev.range.start, range.end) <= self.p.target_max
+            {
+                prev.range.end = range.end;
+                prev.last = last;
+                continue;
             }
             out.push(Group {
-                range: own[first].start..own[i].end,
+                range,
                 path: secs[first].path.join(" > "),
+                last,
             });
-            i += 1;
         }
         out
     }
@@ -548,6 +592,12 @@ impl Chunker<'_> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < units.len() {
+            // лист не начинается с пробельной единицы: её заголовок (хвост
+            // разрезанного блока) после обрезки достался бы следующему блоку
+            if self.src[units[i].range.clone()].trim().is_empty() {
+                i += 1;
+                continue;
+            }
             let header = units[i].header.clone();
             let mut est = header.as_ref().map_or(0, |h| self.count(h.clone())) + units[i].tokens;
             let mut j = i + 1;

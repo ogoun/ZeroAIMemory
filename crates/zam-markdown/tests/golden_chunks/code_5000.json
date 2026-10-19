@@ -1000,13 +1000,6 @@
     "head": "```rust title=\"gen.rs\"\nlet value_4954 = "
   },
   {
-    "level": "section",
-    "heading_path": "Код",
-    "token_count": 8,
-    "range": null,
-    "head": "Код — Генерированный модуль:"
-  },
-  {
     "level": "note",
     "heading_path": "",
     "token_count": 8,

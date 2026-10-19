@@ -337,17 +337,15 @@ fn set_text(node: &AstNode<'_>, text: String) {
     node.data_mut().value = NodeValue::Text(Cow::Owned(text));
 }
 
-/// Превращает цитату `> [!тип]± заголовок` в callout: удаляет маркер, отделяет
-/// первую строку абзаца как заголовок. Возвращает `(тип, fold, абзац-заголовок)`.
-fn make_callout<'a>(
-    arena: &'a Arena<'a>,
-    bq: &'a AstNode<'a>,
-) -> Option<(String, Fold, &'a AstNode<'a>)> {
+/// Первый абзац цитаты и его ведущие текстовые узлы (comrak может разбить
+/// `[!info]` на несколько): `(абзац, склеенный текст, [(узел, длина)])`.
+type CalloutLead<'a> = (&'a AstNode<'a>, String, Vec<(&'a AstNode<'a>, usize)>);
+
+fn callout_lead<'a>(bq: &'a AstNode<'a>) -> Option<CalloutLead<'a>> {
     let para = bq.first_child()?;
     if !matches!(para.data().value, NodeValue::Paragraph) {
         return None;
     }
-    // ведущие текстовые узлы: comrak может разбить `[!info]` на несколько
     let mut lead = String::new();
     let mut texts = Vec::new();
     let mut cur = para.first_child();
@@ -357,6 +355,23 @@ fn make_callout<'a>(
         texts.push((n, t.len()));
         cur = n.next_sibling();
     }
+    Some((para, lead, texts))
+}
+
+/// Цитата — callout Obsidian `> [!тип]± заголовок` (тот же разбор, что у рендера).
+/// GitHub-типы comrak разбирает сам (`NodeValue::Alert`), остальные приходят цитатой.
+pub(crate) fn is_callout<'a>(bq: &'a AstNode<'a>) -> bool {
+    matches!(bq.data().value, NodeValue::BlockQuote)
+        && callout_lead(bq).is_some_and(|(_, lead, _)| parse_marker(&lead).is_some())
+}
+
+/// Превращает цитату `> [!тип]± заголовок` в callout: удаляет маркер, отделяет
+/// первую строку абзаца как заголовок. Возвращает `(тип, fold, абзац-заголовок)`.
+fn make_callout<'a>(
+    arena: &'a Arena<'a>,
+    bq: &'a AstNode<'a>,
+) -> Option<(String, Fold, &'a AstNode<'a>)> {
+    let (para, lead, texts) = callout_lead(bq)?;
     let (kind, fold, marker_len) = parse_marker(&lead)?;
 
     // удалить маркер

@@ -41,7 +41,7 @@ pub fn note_l1(src: &str, doc: &Doc, max_chars: usize) -> String {
     let arena = Arena::new();
     let root = parse_document(&arena, src, &comrak_options());
     let items = l1_items(src, doc, root);
-    fit_lines(&render(&items), |t| t.chars().count() <= max_chars)
+    fit_items(&items, |t| t.chars().count() <= max_chars).0
 }
 
 /// L1 секции `s` (с подсекциями) не длиннее `max_tokens` по `tc`.
@@ -56,7 +56,7 @@ pub fn section_l1(src: &str, s: &Section, tc: &dyn TokenCounter, max_tokens: usi
     let root = parse_document(&arena, sub, &options);
     let doc = doc_from_root(sub, root);
     let items = l1_items(sub, &doc, root);
-    fit_lines(&render(&items), |t| tc.count(t) <= max_tokens)
+    fit_items(&items, |t| tc.count(t) <= max_tokens).0
 }
 
 /// Пункты L1 для всех секций `doc` по AST того же исходника.
@@ -115,8 +115,24 @@ pub(crate) fn own_ranges(doc: &Doc) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// Строки L1 по пунктам.
-pub(crate) fn render(items: &[L1Item]) -> Vec<String> {
+/// L1 по пунктам в пределах `fits` и признак «есть хотя бы одно предложение»
+/// среди вошедших строк (L1 из одних заголовков как уровень не индексируется).
+pub(crate) fn fit_items(items: &[L1Item], fits: impl Fn(&str) -> bool) -> (String, bool) {
+    let lines = render(items);
+    let texts: Vec<String> = lines.iter().map(|(t, _)| t.clone()).collect();
+    let text = fit_lines(&texts, fits);
+    // заголовки и предложения без переводов строк: строки текста = строки L1
+    let kept = if text.is_empty() {
+        0
+    } else {
+        text.split('\n').count()
+    };
+    let has_sentence = lines.iter().take(kept).any(|&(_, s)| s);
+    (text, has_sentence)
+}
+
+/// Строки L1 по пунктам и признак наличия предложения в строке.
+fn render(items: &[L1Item]) -> Vec<(String, bool)> {
     let base = items
         .iter()
         .filter(|i| i.level > 0)
@@ -136,14 +152,14 @@ pub(crate) fn render(items: &[L1Item]) -> Vec<String> {
                 }
             }
         };
-        out.push(line);
+        out.push((line, it.sentence.is_some()));
     }
     out
 }
 
 /// Строки, склеенные через `\n`, пока выполняется `fits`. Если не входит даже
 /// первая строка — её наибольший префикс с «…».
-pub(crate) fn fit_lines(lines: &[String], fits: impl Fn(&str) -> bool) -> String {
+fn fit_lines(lines: &[String], fits: impl Fn(&str) -> bool) -> String {
     let mut out = String::new();
     for line in lines {
         let candidate = if out.is_empty() {

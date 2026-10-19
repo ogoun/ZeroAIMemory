@@ -101,13 +101,6 @@
   },
   {
     "level": "section",
-    "heading_path": "Индексация заметок",
-    "token_count": 214,
-    "range": null,
-    "head": "Индексация заметок — Индексатор обрабаты"
-  },
-  {
-    "level": "section",
     "heading_path": "Индексация заметок > Разбор",
     "token_count": 60,
     "range": null,

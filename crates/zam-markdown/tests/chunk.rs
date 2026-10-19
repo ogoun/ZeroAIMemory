@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::md_doc;
+use common::{md_doc, md_line};
 use proptest::prelude::*;
 use serde::Serialize;
 use zam_markdown::{
@@ -385,6 +385,103 @@ fn short_sections_merge_with_next_sibling() {
     assert_eq!(paths, ["X", "X > Y", "Z"]);
 }
 
+fn leaf_paths(src: &str) -> Vec<String> {
+    leaves(&chunks(src))
+        .iter()
+        .map(|d| d.heading_path.clone())
+        .collect()
+}
+
+#[test]
+fn short_section_not_merged_beyond_target_max() {
+    // короткая A и длинный сосед B: склейка длиннее target_max — A остаётся отдельной
+    let long = "Длинный текст соседней секции для проверки. ".repeat(60);
+    let src = format!("## A\n\nКоротко A.\n\n## B\n\n{long}\n");
+    let all = chunks(&src);
+    let ls = leaves(&all);
+    assert_eq!(
+        (ls[0].heading_path.as_str(), ls[0].text.as_str()),
+        ("A", "Коротко A.")
+    );
+    assert!(ls.len() > 1 && ls[1..].iter().all(|d| d.heading_path == "B"));
+    // склейка в пределах target_max — под путём первой секции
+    let mid = "Средний текст соседа. ".repeat(10);
+    let src = format!("## A\n\nКоротко A.\n\n## B\n\n{mid}\n");
+    assert_eq!(leaf_paths(&src), ["A"]);
+}
+
+#[test]
+fn short_section_merges_through_empty_sibling_and_backwards() {
+    // пустой сосед (только заголовок) цепочку не рвёт
+    let src = "## A\n\nКоротко A.\n\n## Пусто\n\n## C\n\nКоротко C.\n";
+    let all = chunks(src);
+    let ls = leaves(&all);
+    assert_eq!(ls.len(), 1);
+    assert!(ls[0].text.contains("## Пусто") && ls[0].text.ends_with("Коротко C."));
+    // последняя короткая секция без следующего соседа — к предыдущему листу того же родителя
+    let body = "Обычный текст секции средней длины. ".repeat(20);
+    let src = format!(
+        "# P\n\n## A\n\n{body}\n\n## B\n\n{body}\n\n## Хвост\n\nКоротко.\n\n# Q\n\nТекст Q.\n"
+    );
+    let all = chunks(&src);
+    let ls = leaves(&all);
+    let paths: Vec<_> = ls.iter().map(|d| d.heading_path.as_str()).collect();
+    assert_eq!(paths, ["P > A", "P > B", "Q"], "{ls:?}");
+    assert!(ls[1].text.ends_with("## Хвост\n\nКоротко."));
+    // без предыдущего соседа того же родителя хвост остаётся отдельным
+    let src = "# P\n\nТекст P.\n\n## Один\n\nКоротко.\n";
+    assert_eq!(leaf_paths(src), ["P", "P > Один"]);
+}
+
+#[test]
+fn obsidian_callouts_repeat_marker_line() {
+    for marker in ["> [!info]- Заголовок callout", "> [!заметка]", "> [!tip]+"] {
+        for nl in ["\n", "\r\n"] {
+            let mut src = format!("# Callout{nl}{nl}{marker}{nl}");
+            for i in 0..400 {
+                src.push_str(&format!("> строка {i} длинного callout с пояснением{nl}"));
+                if i % 20 == 19 {
+                    src.push_str(&format!(">{nl}"));
+                }
+            }
+            let all = chunks(&src);
+            let ls = leaves(&all);
+            assert!(ls.len() > 2, "{marker}");
+            assert!(ls[0].text.starts_with(marker));
+            for d in &ls[1..] {
+                assert_eq!(header_of(&src, d), format!("{marker}{nl}"), "{marker}");
+                assert!(d.token_count <= 800);
+            }
+        }
+    }
+}
+
+#[test]
+fn level_l1_without_sentences_or_equal_to_note_is_skipped() {
+    // таблица без абзацев: L1 из одних заголовков не выдаётся
+    let mut src = String::from("# Таблица\n\n| a | b |\n|---|---|\n");
+    for i in 0..400 {
+        src.push_str(&format!("| {i} | значение {i} |\n"));
+    }
+    let all = chunks(&src);
+    assert!(leaves(&all).len() > 1);
+    assert!(
+        all.iter().all(|d| d.level == ChunkLevel::Chunk),
+        "{:?}",
+        all.last()
+    );
+    // единственная H1 с несколькими листами: L1 секции совпал бы с L1 заметки
+    let para = "Предложение о единственном разделе заметки. ".repeat(30);
+    let src = format!("# Один\n\nВводная фраза.\n\n## Первый\n\n{para}\n\n## Второй\n\n{para}\n");
+    let all = chunks(&src);
+    let levels: Vec<_> = all
+        .iter()
+        .filter(|d| d.level != ChunkLevel::Chunk)
+        .map(|d| (d.level, d.heading_path.as_str()))
+        .collect();
+    assert_eq!(levels, [(ChunkLevel::Note, "")]);
+}
+
 #[test]
 fn big_code_block_repeats_fence_header() {
     let mut src = String::from("# Код\n\n```python title=\"x.py\"\n");
@@ -616,8 +713,9 @@ fn check_invariants(src: &str, p: &ChunkParams) -> Result<(), TestCaseError> {
             prop_assert!(d.text.ends_with(body), "{:?} / {:?}", d.text, body);
             let head = &d.text[..d.text.len() - body.len()];
             prop_assert!(
-                head.ends_with('\n') && src.contains(head),
-                "заголовок {head:?}"
+                header_opens_block(src, head, r.start),
+                "заголовок {head:?} не открывает блок части с {}: {src:?}",
+                r.start
             );
         }
         covered[r].iter_mut().for_each(|c| *c = true);
@@ -636,9 +734,83 @@ fn check_invariants(src: &str, p: &ChunkParams) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-/// Документ из `md_doc` с длинными кусками: повтор строк даёт блоки больше бюджета.
+/// Повторённый заголовок `head` — строки исходника, открывающие блок, которому
+/// принадлежит часть с началом `start`: `head` стоит в исходнике с начала строки
+/// до `start`, это заголовок блока (ограждение кода, шапка таблицы с разделителем,
+/// маркер callout), и строки между ним и `start` блок не закрывают.
+fn header_opens_block(src: &str, head: &str, start: usize) -> bool {
+    let lines: Vec<&str> = head.lines().collect();
+    let first = lines.first().copied().unwrap_or("");
+    let t = first.trim_start_matches(' ');
+    let fence = t
+        .bytes()
+        .next()
+        .filter(|c| *c == b'`' || *c == b'~')
+        .map(|c| (c, t.bytes().take_while(|&b| b == c).count()))
+        .filter(|&(_, n)| n >= 3);
+    let is_delim = |l: &str| {
+        let l = l.trim();
+        l.contains('-') && l.chars().all(|c| matches!(c, '|' | ':' | '-' | ' '))
+    };
+    let kind_ok = match (fence, lines.len()) {
+        (Some(_), 1) => true,
+        (None, 2) => first.contains('|') && is_delim(lines[1]),
+        (None, 1) => t.starts_with('>') && t.contains("[!"),
+        _ => false,
+    };
+    if !kind_ok || !head.ends_with(['\n', '\r']) {
+        return false;
+    }
+    let at_line_start = |p: usize| p == 0 || src[..p].ends_with(['\n', '\r']);
+    src[..start].match_indices(head).any(|(p, _)| {
+        if !at_line_start(p) || p + head.len() > start {
+            return false;
+        }
+        // только целые строки: часть может начинаться внутри строки (резка по словам)
+        let between = &src[p + head.len()..start];
+        let mut full = between
+            .split_inclusive('\n')
+            .filter(|l| l.ends_with('\n'))
+            .map(str::trim_end);
+        match fence {
+            // между ограждением и частью нет закрывающего ограждения
+            Some((c, n)) => !full.any(|l| {
+                let l = l.trim_start_matches(' ');
+                l.bytes().take_while(|&b| b == c).count() >= n && l.trim().bytes().all(|b| b == c)
+            }),
+            // таблица и цитата кончаются на пустой строке
+            None => !full.any(|l| l.trim().is_empty()),
+        }
+    })
+}
+
+/// Строка для property-тестов чанкера: строки `md_line` и шапки блоков
+/// (таблицы, callout Obsidian и GitHub, ограждение с info).
+fn chunk_line() -> impl Strategy<Value = String> {
+    prop_oneof![
+        12 => md_line(),
+        1 => Just("> [!info]- Заголовок callout".to_string()),
+        1 => Just("> [!заметка]".to_string()),
+        1 => Just("> [!NOTE]".to_string()),
+        1 => Just("> строка цитаты с текстом".to_string()),
+        1 => Just("| a | b |".to_string()),
+        1 => Just("|---|---|".to_string()),
+        1 => Just("| 1 | значение |".to_string()),
+        1 => Just("```rust title=\"x.rs\"".to_string()),
+    ]
+}
+
+/// Документ из `chunk_line` с LF или CRLF.
+fn chunk_doc() -> impl Strategy<Value = String> {
+    (prop::collection::vec(chunk_line(), 0..24), any::<bool>()).prop_map(|(lines, crlf)| {
+        let nl = if crlf { "\r\n" } else { "\n" };
+        lines.join(nl)
+    })
+}
+
+/// Документ из `chunk_doc` с длинными кусками: повтор строк даёт блоки больше бюджета.
 fn long_doc() -> impl Strategy<Value = String> {
-    (md_doc(), 1usize..40).prop_map(|(d, k)| {
+    (chunk_doc(), 1usize..40).prop_map(|(d, k)| {
         let mut s = String::new();
         for _ in 0..k {
             s.push_str(&d);
@@ -652,7 +824,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
     #[test]
-    fn chunk_invariants_default(src in md_doc()) {
+    fn chunk_invariants_default(src in chunk_doc()) {
         check_invariants(&src, &ChunkParams::default())?;
     }
 

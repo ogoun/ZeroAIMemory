@@ -20,13 +20,6 @@
     "head": "```\r\ncode line\r\n```\r\n\r\nТекст после кода."
   },
   {
-    "level": "section",
-    "heading_path": "Заголовок",
-    "token_count": 17,
-    "range": null,
-    "head": "Заголовок — Первый абзац.\n  Подраздел — "
-  },
-  {
     "level": "note",
     "heading_path": "",
     "token_count": 17,

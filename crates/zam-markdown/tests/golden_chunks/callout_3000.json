@@ -70,13 +70,6 @@
     "head": "> [!WARNING]\n> Абзац 27, строка 1: callo"
   },
   {
-    "level": "section",
-    "heading_path": "Предупреждение",
-    "token_count": 11,
-    "range": null,
-    "head": "Предупреждение — Текст после callout."
-  },
-  {
     "level": "note",
     "heading_path": "",
     "token_count": 11,

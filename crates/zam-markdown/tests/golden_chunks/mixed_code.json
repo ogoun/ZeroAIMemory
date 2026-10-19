@@ -20,13 +20,6 @@
     "head": "```toml\n[index]\ntarget = 500\n```\n\nПараме"
   },
   {
-    "level": "section",
-    "heading_path": "Пример на Rust",
-    "token_count": 38,
-    "range": null,
-    "head": "Пример на Rust — Функция split_sentences"
-  },
-  {
     "level": "note",
     "heading_path": "",
     "token_count": 38,
