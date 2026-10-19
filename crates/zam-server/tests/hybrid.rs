@@ -449,9 +449,16 @@ async fn human_deleted_and_excluded_not_in_vector_channel() {
         json!({"query": "Grandmother", "scope": {"include_human": true}}),
     )
     .await;
-    assert_eq!(paths(&j)[0], "family/recipe", "{j}");
-    assert_eq!(j["items"][0]["sources"], json!(["fts"]), "{j}");
-    assert_eq!(j["items"][0]["node_id"], human.as_str());
+    // FTS-хит ранга 1 делит первое место с векторным хитом ранга 1 (равные веса RRF,
+    // ничья решается по chunk_id), поэтому позиция не проверяется — только источник
+    let it = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["path"] == "family/recipe")
+        .unwrap_or_else(|| panic!("{j}"));
+    assert_eq!(it["sources"], json!(["fts"]), "{j}");
+    assert_eq!(it["node_id"], human.as_str());
 
     // узел удалён (и другой исключён) в SQLite без delete в Qdrant: точки остались,
     // но векторный хит в выдачу не попадает
