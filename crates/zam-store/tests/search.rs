@@ -657,3 +657,137 @@ async fn note_level_only_when_no_leaf_matches() {
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!((hits[0].node_id, hits[0].heading_path.as_str()), (id, ""));
 }
+
+// ---------- каналы и проверка векторных хитов (M2) ----------
+
+#[tokio::test]
+async fn channels_are_separate_and_ordered() {
+    let (db, k, _) = setup("channels").await;
+    let a = add(&db, k, "a", "# A\n\nнастройка core.autocrlf для git\n").await;
+    let b = add(&db, k, "b", "# B\n\nнастройка редактора\n").await;
+    let ch = zam_store::search_fts_channels(&db, q("настройка core.autocrlf", &[k]))
+        .await
+        .unwrap();
+    // строгий bm25: оба слова есть только у a (лист и L1 заметки — без правила
+    // «сводка только без листа»); trigram — по идентификатору
+    assert!(ch.bm25.iter().all(|h| h.node_id == a), "{:?}", ch.bm25);
+    assert!(ch.bm25.iter().any(|h| h.level == "chunk"));
+    assert_eq!(ch.trigram[0].node_id, a);
+    assert_eq!(ch.bm25[0].score, 1.0);
+    assert!(ch.bm25[0].token_count > 0);
+    assert!(ch.bm25[0].snippet.contains(MARK_START));
+    // ослабленный bm25 даёт оба узла, у второго места балл 1/2
+    let ch = zam_store::search_fts_channels(&db, q("настройка редактора git", &[k]))
+        .await
+        .unwrap();
+    let mut got: Vec<Id> = ch.bm25.iter().map(|h| h.node_id).collect();
+    got.sort();
+    got.dedup();
+    let mut want = vec![a, b];
+    want.sort();
+    assert_eq!(got, want);
+    assert_eq!(ch.bm25[1].score, 0.5);
+    assert!(ch.trigram.is_empty());
+}
+
+#[tokio::test]
+async fn live_chunks_checks_sqlite() {
+    let (db, k, h) = setup("live").await;
+    let a = add(&db, k, "dir/a", "# A\n\nживой текст\n").await;
+    let gone = add(&db, k, "dir/gone", "# G\n\nудалённый текст\n").await;
+    let excl = add(
+        &db,
+        k,
+        "dir/ex",
+        "---\nindex: false\n---\n# E\n\nисключённый текст\n",
+    )
+    .await;
+    let hum = add(&db, h, "dir/h", "# H\n\nличный текст\n").await;
+    let id_of = async |n: Id| {
+        zam_store::node_leaves(&db, n).await.unwrap()[0]
+            .chunk_id
+            .clone()
+    };
+    let (ca, cg, ce, ch) = (
+        id_of(a).await,
+        id_of(gone).await,
+        id_of(excl).await,
+        id_of(hum).await,
+    );
+    delete_node(&db, gone).await.unwrap();
+    let ids = vec![
+        "нет-такого".to_string(),
+        cg.clone(),
+        ce.clone(),
+        ch.clone(),
+        ca.clone(),
+    ];
+    let scope = |indexable_only, prefix: Option<&str>| zam_store::ChunkScope {
+        space_ids: vec![k],
+        path_prefix: prefix.map(str::to_string),
+        indexable_only,
+    };
+    let got = zam_store::live_chunks(&db, ids.clone(), scope(true, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.iter().map(|h| h.chunk_id.clone()).collect::<Vec<_>>(),
+        vec![ca.clone()]
+    );
+    assert!(got[0].text.contains("живой текст"), "{}", got[0].text);
+    // без indexable_only исключённый узел виден (как в FTS); Human — нет (вне области)
+    let got = zam_store::live_chunks(&db, ids.clone(), scope(false, Some("dir/")))
+        .await
+        .unwrap();
+    let got: Vec<String> = got.into_iter().map(|h| h.chunk_id).collect();
+    assert_eq!(got, vec![ce, ca.clone()]);
+    assert!(
+        zam_store::live_chunks(&db, ids, scope(true, Some("other")))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn neighbors_of_leaf() {
+    let (db, k, _) = setup("neighbors").await;
+    let filler = |w: &str| format!("{w} ").repeat(400);
+    let body = format!(
+        "# Раздел\n\n{}\n\n{}\n\n{}\n",
+        filler("первое"),
+        filler("второе"),
+        filler("третье")
+    );
+    let n = add(&db, k, "long", &body).await;
+    let leaves = zam_store::node_leaves(&db, n).await.unwrap();
+    assert!(leaves.len() >= 3, "{}", leaves.len());
+    let (p, nx) = zam_store::neighbor_leaves(&db, leaves[1].chunk_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(p.as_deref(), Some(leaves[0].text.as_str()));
+    assert_eq!(nx.as_deref(), Some(leaves[2].text.as_str()));
+    let (p, _) = zam_store::neighbor_leaves(&db, leaves[0].chunk_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(p, None);
+    assert_eq!(
+        zam_store::neighbor_leaves(&db, "нет".into()).await.unwrap(),
+        (None, None)
+    );
+}
+
+#[test]
+fn needles_identifiers_then_words() {
+    assert_eq!(
+        zam_store::query_needles("как настроить core.autocrlf в git"),
+        vec![
+            "core.autocrlf",
+            "как",
+            "настроить",
+            "core",
+            "autocrlf",
+            "git"
+        ]
+    );
+}

@@ -235,7 +235,8 @@ fn read_tiers_section_and_json() {
         "сводка\n"
     );
     let s = ok(&e.run(&["read", "knowledge:t", "--tier", "l1"]));
-    assert!(s.starts_with("# A: Первое."), "{s}");
+    // L1 — note_l1 (§8.3): «<отступ><заголовок> — <первое предложение>»
+    assert!(s.starts_with("A — Первое.\n  B — Текст B."), "{s}");
     assert_eq!(
         ok(&e.run(&["read", "knowledge:t", "--section", "A > B"])),
         "## B\nТекст B.\n"

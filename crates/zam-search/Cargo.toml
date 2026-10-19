@@ -1,0 +1,11 @@
+[package]
+name = "zam-search"
+description = "Гибридный поиск ZeroAIMemory: weighted RRF каналов Qdrant и FTS, поправки, упаковка в бюджет"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zam-core = { path = "../zam-core" }
+jiff.workspace = true

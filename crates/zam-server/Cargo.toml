@@ -25,6 +25,8 @@ zam-store = { path = "../zam-store" }
 zam-index = { path = "../zam-index" }
 zam-ml = { path = "../zam-ml" }
 zam-fetch = { path = "../zam-fetch" }
+zam-search = { path = "../zam-search" }
+jiff.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
@@ -54,5 +56,3 @@ memory-serve.workspace = true
 zip.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
-
-jiff.workspace = true

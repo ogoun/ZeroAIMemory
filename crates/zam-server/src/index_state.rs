@@ -35,6 +35,11 @@ pub enum DegradedReason {
     QdrantLocked,
     /// `model_id` коллекции не совпадает с текущей моделью: нужен reindex.
     ModelMismatch,
+    /// Эмбеддинг запроса не удался (ошибка или паника инференса) — только в ответе поиска.
+    EmbedFailed,
+    /// Запрос к Qdrant не удался не из-за недоступности (ответ в неожиданном виде,
+    /// ключ, прочее) — только в ответе поиска.
+    SearchFailed,
 }
 
 impl DegradedReason {
@@ -47,6 +52,8 @@ impl DegradedReason {
             DegradedReason::Broken => "broken",
             DegradedReason::QdrantLocked => "qdrant_locked",
             DegradedReason::ModelMismatch => "model_mismatch",
+            DegradedReason::EmbedFailed => "embed_failed",
+            DegradedReason::SearchFailed => "search_failed",
         }
     }
 
@@ -66,6 +73,12 @@ impl DegradedReason {
             }
             DegradedReason::ModelMismatch => {
                 "индекс построен другой моделью: выполните reindex (векторы разных моделей не смешиваются)"
+            }
+            DegradedReason::EmbedFailed => {
+                "эмбеддинг запроса не удался: см. журнал (ERROR/WARN `search`), FTS работает"
+            }
+            DegradedReason::SearchFailed => {
+                "запрос к Qdrant не удался: см. журнал и `zam-server qdrant status`, FTS работает"
             }
         }
     }

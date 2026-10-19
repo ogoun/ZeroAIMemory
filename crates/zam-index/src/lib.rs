@@ -30,7 +30,8 @@ pub use vector::{
     VectorIndex, point_id,
 };
 pub use worker::{
-    PassageEmbedder, WorkerConfig, WorkerDeps, WorkerHandle, WorkerStatus, embed_input, embed_key,
+    PassageEmbedder, WorkerConfig, WorkerDeps, WorkerHandle, WorkerStatus, embed_input,
+    embed_input_of, embed_key, embed_key_of,
 };
 
 /// Ошибки векторного индекса. Тексты без векторов, текста чанков и секретов.

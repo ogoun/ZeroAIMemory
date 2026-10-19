@@ -1263,17 +1263,30 @@ async fn state_changed(rx: &mut Option<watch::Receiver<QdrantState>>) {
 
 /// Текст для модели: `context_prefix` участвует в эмбеддинге (§8.2 п. 6).
 pub fn embed_input(c: &IndexChunk) -> String {
-    if c.context_prefix.is_empty() {
-        c.text.clone()
+    embed_input_of(&c.context_prefix, &c.text)
+}
+
+/// [`embed_input`] по полям чанка (для чанков вне [`IndexChunk`], например листов поиска).
+pub fn embed_input_of(context_prefix: &str, text: &str) -> String {
+    if context_prefix.is_empty() {
+        text.to_string()
     } else {
-        format!("{}\n{}", c.context_prefix, c.text)
+        format!("{context_prefix}\n{text}")
     }
 }
 
 /// Ключ кэша `embeddings` чанка: blake3 (hex) ровно той строки, что уходит в модель
-/// ([`embed_input`]). Используется воркером и пересборкой из кэша (задача 10).
+/// ([`embed_input`]). Используется воркером, пересборкой из кэша (задача 10) и выбором
+/// лучшего листа в поиске.
 pub fn embed_key(c: &IndexChunk) -> String {
-    blake3::hash(embed_input(c).as_bytes()).to_hex().to_string()
+    embed_key_of(&c.context_prefix, &c.text)
+}
+
+/// [`embed_key`] по полям чанка.
+pub fn embed_key_of(context_prefix: &str, text: &str) -> String {
+    blake3::hash(embed_input_of(context_prefix, text).as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 /// Ключ кэша `embeddings` для текста, которого нет среди чанков (предложение L0,

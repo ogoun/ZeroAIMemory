@@ -4046,6 +4046,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zam-search"
+version = "0.0.2-m1"
+dependencies = [
+ "jiff",
+ "zam-core",
+]
+
+[[package]]
 name = "zam-server"
 version = "0.0.2-m1"
 dependencies = [
@@ -4081,6 +4089,7 @@ dependencies = [
  "zam-index",
  "zam-markdown",
  "zam-ml",
+ "zam-search",
  "zam-store",
  "zip",
 ]

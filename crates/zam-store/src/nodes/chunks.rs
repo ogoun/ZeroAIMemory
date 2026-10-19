@@ -47,6 +47,11 @@ pub(crate) fn token_counter() -> Arc<dyn TokenCounter> {
         .clone()
 }
 
+/// Число токенов `text` текущим счётчиком чанкера (бюджет выдачи поиска).
+pub fn count_tokens(text: &str) -> usize {
+    token_counter().count(text)
+}
+
 /// Предел длины автоматического L0, символов.
 pub(crate) const L0_AUTO_MAX_CHARS: usize = 200;
 

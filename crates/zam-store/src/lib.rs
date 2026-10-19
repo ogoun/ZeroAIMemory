@@ -26,14 +26,18 @@ pub use jobs::{
 };
 pub use migrate::Migration;
 pub use nodes::{
-    Attribution, AuthorKind, NewNote, Node, NodeKind, RevisionInfo, WriteError, create_folder,
-    create_note, delete_node, find_by_name, get_node, get_node_by_path, list_children,
-    list_revisions, list_trash, move_node, node_content, patch_note, patch_note_within,
-    restore_node, revert_note, set_auto_l0, set_folder_l0, set_token_counter, unified_diff,
-    update_note,
+    Attribution, AuthorKind, NewNote, Node, NodeKind, RevisionInfo, WriteError, count_tokens,
+    create_folder, create_note, delete_node, find_by_name, get_node, get_node_by_path,
+    list_children, list_revisions, list_trash, move_node, node_content, patch_note,
+    patch_note_within, restore_node, revert_note, set_auto_l0, set_folder_l0, set_token_counter,
+    unified_diff, update_note,
 };
 pub use paths::NodePath;
-pub use search::{FtsHit, FtsQuery, MARK_END, MARK_START, pending_count, sanitize_fts, search_fts};
+pub use search::{
+    ChunkScope, FtsChannels, FtsHit, FtsQuery, LeafChunk, MARK_END, MARK_START, live_chunks,
+    neighbor_leaves, node_leaves, pending_count, query_needles, sanitize_fts, search_fts,
+    search_fts_channels, text_snippet,
+};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,
 };

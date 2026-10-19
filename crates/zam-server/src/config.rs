@@ -32,6 +32,7 @@ pub struct ServerConfig {
     pub qdrant: QdrantSection,
     pub ml: MlSection,
     pub index: IndexSection,
+    pub search: SearchSection,
     pub limits: LimitsSection,
 }
 
@@ -263,6 +264,51 @@ pub struct IndexSection {
     pub rollup_debounce_ms: u64,
 }
 
+/// Секция `[search]` (§9.2): слияние каналов weighted RRF и поправки.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSection {
+    /// Константа RRF (> 0).
+    pub rrf_k: f64,
+    /// Вес векторного канала (Qdrant: dense + sparse + сводки).
+    pub w_vector: f64,
+    /// Вес канала FTS5 `bm25`.
+    pub w_fts: f64,
+    /// Вес канала FTS5 `trigram` (идентификаторы и код).
+    pub w_trigram: f64,
+    /// Полупериод затухания по свежести, дней; 0 — без затухания.
+    pub recency_half_life_days: f64,
+    /// Не больше чанков с одного узла (≥ 1).
+    pub max_per_node: usize,
+}
+
+impl SearchSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("search.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(self.rrf_k.is_finite() && self.rrf_k > 0.0) {
+            return Err(bad("rrf_k", "должно быть больше 0"));
+        }
+        for (k, v) in [
+            ("w_vector", self.w_vector),
+            ("w_fts", self.w_fts),
+            ("w_trigram", self.w_trigram),
+            ("recency_half_life_days", self.recency_half_life_days),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(bad(k, "должно быть конечным и не меньше 0"));
+            }
+        }
+        if self.max_per_node == 0 {
+            return Err(bad("max_per_node", "должно быть больше 0"));
+        }
+        Ok(())
+    }
+}
+
 /// Пределы размеров (§16.2): заметка и вложение, байт.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,6 +359,14 @@ impl Default for ServerConfig {
                 batch_tokens: 8192,
                 yield_ms: 5,
                 rollup_debounce_ms: 2000,
+            },
+            search: SearchSection {
+                rrf_k: 60.0,
+                w_vector: 1.0,
+                w_fts: 1.0,
+                w_trigram: 0.7,
+                recency_half_life_days: 180.0,
+                max_per_node: 3,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -490,6 +544,7 @@ pub fn load(
             message: "должно быть больше 0".into(),
         });
     }
+    cfg.search.validate()?;
     Ok(cfg)
 }
 
@@ -864,6 +919,37 @@ yield_ms = 1
         assert!(load(None, &e, &Default::default()).is_err());
         let e = vec![env("ZAM_INDEX__BATCH_TOKENS", "0")];
         assert!(load(None, &e, &Default::default()).is_err());
+    }
+
+    #[test]
+    fn search_section() {
+        let d = load(None, &[], &Default::default()).unwrap().search;
+        assert_eq!(
+            (d.rrf_k, d.w_vector, d.w_fts, d.w_trigram),
+            (60.0, 1.0, 1.0, 0.7)
+        );
+        assert_eq!((d.recency_half_life_days, d.max_per_node), (180.0, 3));
+        let e = vec![
+            env("ZAM_SEARCH__RRF_K", "30"),
+            env("ZAM_SEARCH__W_VECTOR", "1.5"),
+            env("ZAM_SEARCH__RECENCY_HALF_LIFE_DAYS", "0"),
+        ];
+        let c = load(None, &e, &Default::default()).unwrap().search;
+        assert_eq!(
+            (c.rrf_k, c.w_vector, c.recency_half_life_days),
+            (30.0, 1.5, 0.0)
+        );
+        for (k, v) in [
+            ("ZAM_SEARCH__RRF_K", "0"),
+            ("ZAM_SEARCH__W_FTS", "-1"),
+            ("ZAM_SEARCH__W_TRIGRAM", "nan"),
+            ("ZAM_SEARCH__MAX_PER_NODE", "0"),
+        ] {
+            let err = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("search."), "{k}={v}: {err}");
+        }
     }
 
     #[test]
