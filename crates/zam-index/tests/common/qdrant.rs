@@ -80,21 +80,8 @@ impl TestQdrant {
              service:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  enable_cors: false\n  enable_static_content: false\n\
              cluster:\n  enabled: false\n"
         );
-        let config_path = dir.join("config").join("zam.yaml");
-        std::fs::write(&config_path, config).expect("конфиг Qdrant");
-        let log = std::fs::File::create(dir.join("qdrant.log")).expect("лог Qdrant");
-        let child = Command::new(&bin)
-            .arg("--config-path")
-            .arg(&config_path)
-            .arg("--disable-telemetry")
-            .current_dir(&dir)
-            .env("QDRANT__SERVICE__API_KEY", &api_key)
-            .env("QDRANT_INIT_FILE_PATH", dir.join(".qdrant-initialized"))
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().expect("лог"))
-            .stderr(log)
-            .spawn()
-            .expect("запуск Qdrant");
+        std::fs::write(dir.join("config").join("zam.yaml"), config).expect("конфиг Qdrant");
+        let child = spawn(&bin, &dir, &api_key);
         let mut q = TestQdrant {
             child,
             dir,
@@ -104,6 +91,19 @@ impl TestQdrant {
         };
         q.wait_ready(Duration::from_secs(60));
         q
+    }
+
+    /// Останавливает процесс (данные и порты сохраняются для [`TestQdrant::restart`]).
+    pub fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Запускает процесс заново в том же каталоге, на тех же портах и с тем же ключом.
+    pub fn restart(&mut self) {
+        self.stop();
+        self.child = spawn(&qdrant_bin(), &self.dir, &self.api_key);
+        self.wait_ready(Duration::from_secs(60));
     }
 
     /// pid процесса.
@@ -136,6 +136,27 @@ impl TestQdrant {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Процесс Qdrant с конфигом `<dir>/config/zam.yaml`; журнал дописывается в `qdrant.log`.
+fn spawn(bin: &Path, dir: &Path, api_key: &str) -> Child {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("qdrant.log"))
+        .expect("лог Qdrant");
+    Command::new(bin)
+        .arg("--config-path")
+        .arg(dir.join("config").join("zam.yaml"))
+        .arg("--disable-telemetry")
+        .current_dir(dir)
+        .env("QDRANT__SERVICE__API_KEY", api_key)
+        .env("QDRANT_INIT_FILE_PATH", dir.join(".qdrant-initialized"))
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("лог"))
+        .stderr(log)
+        .spawn()
+        .expect("запуск Qdrant")
 }
 
 /// `GET /readyz` по HTTP/1.0 без внешних зависимостей; ключ не нужен.

@@ -636,7 +636,9 @@ pub async fn inspect(data_dir: &Path, http_port: u16) -> QdrantStatus {
 /// `zam-server qdrant reset`: стирает хранилище остановленного Qdrant; при следующем
 /// старте [`Supervisor::storage_rebuilt`] — индекс пересобирается из `embeddings`.
 /// Работающий супервизор — [`IndexError::Locked`]; осиротевший процесс (без лока)
-/// завершается той же проверкой, что и при старте.
+/// завершается той же проверкой, что и при старте. Если после этого жив процесс Qdrant
+/// (из pid-файла или отвечающий на нашем HTTP-порту) и наш порт занят, хранилище не
+/// стирается ([`IndexError::Process`]): из-под живого процесса файлы не удаляются.
 pub fn reset_storage(data_dir: &Path, cfg: &ManagedConfig) -> Result<(), IndexError> {
     let qdir = data_dir.join("qdrant");
     if !qdir
@@ -646,12 +648,29 @@ pub fn reset_storage(data_dir: &Path, cfg: &ManagedConfig) -> Result<(), IndexEr
         return Ok(());
     }
     let _lock = process::acquire_lock(&qdir)?;
-    process::cleanup_orphan(
-        &qdir,
-        &cfg.binary,
-        &[cfg.http_port, cfg.grpc_port],
-        cfg.stop_timeout,
-    );
+    let pid = process::read_pid_file(&qdir);
+    let ports = [cfg.http_port, cfg.grpc_port];
+    process::cleanup_orphan(&qdir, &cfg.binary, &ports, cfg.stop_timeout);
+    if let Some(port) = ports.iter().copied().find(|p| !process::port_free(*p)) {
+        let live_pid = pid.filter(|p| pid_alive(*p) && is_qdrant_process(*p));
+        // процесс мог только открыть порт: несколько попыток до ответа `GET /`
+        let answers = (0..10).find_map(|i| {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            http::version_blocking(cfg.http_port)
+        });
+        if live_pid.is_some() || answers.is_some() {
+            let who = match (live_pid, answers) {
+                (Some(p), _) => format!("процесс Qdrant pid {p}"),
+                (None, Some(v)) => format!("Qdrant {v} на 127.0.0.1:{}", cfg.http_port),
+                (None, None) => unreachable!("проверено выше"),
+            };
+            return Err(IndexError::Process(format!(
+                "{who} работает, порт 127.0.0.1:{port} занят: остановите его, хранилище не стёрто"
+            )));
+        }
+    }
     stamp::wipe_storage(&qdir, "zam-server qdrant reset")
         .map_err(|e| IndexError::Process(format!("стирание хранилища: {e}")))
 }

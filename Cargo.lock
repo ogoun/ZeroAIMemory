@@ -3990,7 +3990,9 @@ dependencies = [
 name = "zam-index"
 version = "0.0.2-m1"
 dependencies = [
+ "blake3",
  "fs4",
+ "jiff",
  "libc",
  "process-wrap",
  "qdrant-client",
@@ -4001,9 +4003,12 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "windows",
  "zam-core",
+ "zam-markdown",
+ "zam-store",
 ]
 
 [[package]]
@@ -4075,6 +4080,7 @@ dependencies = [
  "zam-fetch",
  "zam-index",
  "zam-markdown",
+ "zam-ml",
  "zam-store",
  "zip",
 ]

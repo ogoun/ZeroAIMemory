@@ -353,6 +353,39 @@ pub async fn fail_job(
     .await
 }
 
+/// Возвращает выдачу `claim_gen` задания `id` в очередь без неудачи: `attempts` и
+/// `not_before` не меняются, `dirty` снимается (следующая выдача и так возьмёт актуальную
+/// ревизию). Для заданий, которые воркер не смог выполнить не по своей вине (Qdrant
+/// недоступен, коллекция пересоздаётся): попытки не сгорают, пока индекс лежит.
+/// Результат — [`JobOutcome::Requeued`] или [`JobOutcome::Stale`].
+pub async fn release_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome, StoreError> {
+    db.write(move |tx| {
+        if claimed(tx, id, claim_gen)?.is_none() {
+            return Ok(JobOutcome::Stale);
+        }
+        tx.execute(
+            "UPDATE index_jobs SET state = 'queued', dirty = 0, updated_at = ?2 WHERE id = ?1",
+            params![id, fmt_ts(Timestamp::now())],
+        )?;
+        Ok(JobOutcome::Requeued)
+    })
+    .await
+}
+
+/// Число живых заметок с `index_state = 'indexed'`: есть ли что терять, если коллекция
+/// Qdrant создана заново (тогда нужен reindex из `embeddings`).
+pub async fn indexed_count(db: &Db) -> Result<i64, StoreError> {
+    db.read(|c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM nodes
+             WHERE kind = 'note' AND index_state = 'indexed' AND deleted_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+}
+
 /// При старте: задания, оставшиеся `running` после аварийного завершения, — снова
 /// `queued` (с `dirty = 0`: следующая выдача и так возьмёт актуальную ревизию).
 /// Возвращает их число.

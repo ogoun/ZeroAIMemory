@@ -48,6 +48,31 @@ grpc_port = 6334
 max_search_threads = 2
 optimizer_cpu_budget = 2
 
+[ml]
+# Устройство инференса: "auto" (CUDA, если доступна, иначе CPU), "cpu" или "cuda".
+device = "auto"
+# Каталог моделей. По умолчанию — <data_dir>/models; загрузка: zam-server models fetch.
+# models_dir = "/srv/zam/models"
+# Модель эмбеддингов. По умолчанию bge-m3-fp16 в GPU-комплекте при доступной CUDA,
+# иначе bge-m3-int8. Смена модели выключает векторный поиск до reindex.
+# embed_model = "bge-m3-int8"
+# Библиотека ONNX Runtime. По умолчанию — рядом с zam-server (onnxruntime.dll / libonnxruntime.so).
+# Без неё (или без модели) сервер работает в режиме FTS-only и сообщает об этом.
+# ort_dylib = "/opt/zam/libonnxruntime.so"
+# Потоки инференса: индексация (0 — авто) и запросы (зарезервированы под поиск).
+index_threads = 0
+query_threads = 2
+# Выгрузка модели после простоя: "" — выключено, иначе <число>s|m|h (например "30m").
+unload_after = ""
+
+[index]
+# Предел токенов одного вызова инференса при индексации.
+batch_tokens = 8192
+# Пауза между пачками заданий, мс: индексация уступает поиску.
+yield_ms = 5
+# Дебаунс свёртки L0 папок, мс.
+rollup_debounce_ms = 2000
+
 [limits]
 # Предел размера заметки, байт (5 МБ). Больше — 413 при создании, замене и PATCH.
 note_max_bytes = 5242880

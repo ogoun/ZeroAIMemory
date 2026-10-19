@@ -86,6 +86,7 @@ pub async fn create(
         }
     };
     st.render_gen.bump_space(sc.user.id, sc.space.id);
+    st.index.notify();
     Ok((StatusCode::CREATED, Json(node)))
 }
 
@@ -124,7 +125,10 @@ pub async fn replace(
     check_size(&st, &req.content)?;
     let attrib = attribution(&p, &headers, req.message)?;
     match update_note(&sc.db, sc.node.id, base, req.content, req.l0, attrib).await {
-        Ok(n) => Ok(Json(n)),
+        Ok(n) => {
+            st.index.notify();
+            Ok(Json(n))
+        }
         Err(e) => Err(write_error(&sc.db, sc.node.id, base, e).await),
     }
 }
@@ -150,7 +154,10 @@ pub async fn patch(
     let attrib = attribution(&p, &headers, req.message)?;
     let max = st.cfg.limits.note_max_bytes;
     match patch_note_within(&sc.db, sc.node.id, req.base_rev, req.ops, attrib, max).await {
-        Ok(n) => Ok(Json(n)),
+        Ok(n) => {
+            st.index.notify();
+            Ok(Json(n))
+        }
         Err(e) => Err(write_error(&sc.db, sc.node.id, req.base_rev, e).await),
     }
 }
@@ -174,6 +181,7 @@ pub async fn move_to(
     let path = NodePath::parse(&req.path)?;
     let node = move_node(&sc.db, sc.node.id, path).await?;
     st.render_gen.bump_space(sc.user.id, sc.space.id);
+    st.index.notify();
     Ok(Json(node))
 }
 
@@ -188,6 +196,7 @@ pub async fn remove(
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     let count = delete_node(&sc.db, sc.node.id).await?;
     st.render_gen.bump_space(sc.user.id, sc.space.id);
+    st.index.notify();
     let details = json!({ "space": sc.space.id, "path": sc.node.path, "nodes": count });
     audit_node(
         &st,
@@ -213,6 +222,7 @@ pub async fn restore(
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     let node = restore_node(&sc.db, sc.node.id).await?;
     st.render_gen.bump_space(sc.user.id, sc.space.id);
+    st.index.notify();
     let details = json!({ "space": sc.space.id, "path": node.path });
     audit_node(
         &st,

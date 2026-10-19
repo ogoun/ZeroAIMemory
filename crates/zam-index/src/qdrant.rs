@@ -369,6 +369,21 @@ impl QdrantIndex {
             .collect()
     }
 
+    async fn count_impl(&self, f: &VectorFilter) -> Result<u64, IndexError> {
+        Ok(self
+            .client
+            .count(
+                CountPointsBuilder::new(COLLECTION)
+                    .filter(count_filter(f))
+                    .exact(true),
+            )
+            .await
+            .map_err(|e| map_err("count", e))?
+            .result
+            .map(|r| r.count)
+            .unwrap_or(0))
+    }
+
     async fn drop_all_impl(&self) -> Result<(), IndexError> {
         let exists = self
             .client
@@ -415,6 +430,10 @@ impl VectorIndex for QdrantIndex {
         f: &'a VectorFilter,
     ) -> IndexFuture<'a, Vec<VectorHit>> {
         Box::pin(self.search_impl(q_dense, q_sparse, f))
+    }
+
+    fn count<'a>(&'a self, f: &'a VectorFilter) -> IndexFuture<'a, u64> {
+        Box::pin(self.count_impl(f))
     }
 
     fn drop_all(&self) -> IndexFuture<'_, ()> {
@@ -467,8 +486,17 @@ fn kw_any(field: &str, values: Vec<String>) -> Condition {
     Condition::matches(field, values)
 }
 
-/// Фильтр prefetch: тенант, пространства, путь и уровни этого prefetch.
-fn base_filter(f: &VectorFilter, levels: &[String]) -> Filter {
+/// Фильтр подсчёта: тенант, пространства, путь; уровни — только если заданы.
+fn count_filter(f: &VectorFilter) -> Filter {
+    let mut must = scope_conditions(f);
+    if !f.levels.is_empty() {
+        must.push(kw_any("level", f.levels.clone()));
+    }
+    Filter::must(must)
+}
+
+/// Тенант, пространства и префикс пути.
+fn scope_conditions(f: &VectorFilter) -> Vec<Condition> {
     let mut must = vec![kw("user_id", f.user_id.to_string())];
     if !f.space_ids.is_empty() {
         must.push(kw_any(
@@ -479,6 +507,12 @@ fn base_filter(f: &VectorFilter, levels: &[String]) -> Filter {
     if let Some(prefix) = &f.path_prefix {
         must.push(kw("path_ancestors", prefix.clone()));
     }
+    must
+}
+
+/// Фильтр prefetch: тенант, пространства, путь и уровни этого prefetch.
+fn base_filter(f: &VectorFilter, levels: &[String]) -> Filter {
+    let mut must = scope_conditions(f);
     must.push(kw_any("level", levels.to_vec()));
     Filter::must(must)
 }
@@ -507,9 +541,11 @@ fn map_err(op: &'static str, e: QdrantError) -> IndexError {
             let msg = truncate(status.message());
             match status.code() {
                 Code::Unauthenticated | Code::PermissionDenied => IndexError::Auth,
-                Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled => {
-                    IndexError::Unavailable(format!("{op}: {msg}"))
-                }
+                Code::Unavailable
+                | Code::DeadlineExceeded
+                | Code::Cancelled
+                | Code::ResourceExhausted => IndexError::Unavailable(format!("{op}: {msg}")),
+                Code::NotFound => IndexError::NotFound(format!("{op}: {msg}")),
                 // Ошибка соединения клиент оборачивает в Internal («Failed to connect to …»).
                 Code::Internal if msg.starts_with("Failed to connect") => {
                     IndexError::Unavailable(format!("{op}: {msg}"))
@@ -578,6 +614,14 @@ mod tests {
         assert!(matches!(
             map_err("t", st(Code::DeadlineExceeded)),
             IndexError::Unavailable(_)
+        ));
+        assert!(matches!(
+            map_err("t", st(Code::ResourceExhausted)),
+            IndexError::Unavailable(_)
+        ));
+        assert!(matches!(
+            map_err("t", st(Code::NotFound)),
+            IndexError::NotFound(_)
         ));
         assert!(matches!(
             map_err("t", st(Code::InvalidArgument)),

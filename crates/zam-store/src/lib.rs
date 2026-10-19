@@ -21,15 +21,16 @@ pub use db::{Db, DbOptions};
 pub use embeddings::{Embedding, get_embeddings, put_embeddings};
 pub use jobs::{
     IndexChunk, IndexState, Job, JobOp, JobOutcome, JobStats, NodePayload, chunks_for_index,
-    claim_jobs, complete_job, enqueue_reindex, fail_job, job_stats, requeue_running,
-    set_index_state,
+    claim_jobs, complete_job, enqueue_reindex, fail_job, indexed_count, job_stats, release_job,
+    requeue_running, set_index_state,
 };
 pub use migrate::Migration;
 pub use nodes::{
     Attribution, AuthorKind, NewNote, Node, NodeKind, RevisionInfo, WriteError, create_folder,
     create_note, delete_node, find_by_name, get_node, get_node_by_path, list_children,
     list_revisions, list_trash, move_node, node_content, patch_note, patch_note_within,
-    restore_node, revert_note, set_token_counter, unified_diff, update_note,
+    restore_node, revert_note, set_auto_l0, set_folder_l0, set_token_counter, unified_diff,
+    update_note,
 };
 pub use paths::NodePath;
 pub use search::{FtsHit, FtsQuery, MARK_END, MARK_START, pending_count, sanitize_fts, search_fts};

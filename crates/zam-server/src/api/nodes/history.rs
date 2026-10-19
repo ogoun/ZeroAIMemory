@@ -121,6 +121,7 @@ pub async fn revert(
     let attrib = attribution(&p, &headers, req.message)?;
     let from_rev = sc.node.current_rev;
     let node = revert_note(&sc.db, sc.node.id, req.rev, attrib).await?;
+    st.index.notify();
     let details = json!({ "space": sc.space.id, "to_rev": req.rev, "from_rev": from_rev, "new_rev": node.current_rev });
     audit_node(
         &st,

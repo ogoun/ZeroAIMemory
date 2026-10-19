@@ -30,6 +30,8 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     pub log: LogSection,
     pub qdrant: QdrantSection,
+    pub ml: MlSection,
+    pub index: IndexSection,
     pub limits: LimitsSection,
 }
 
@@ -171,6 +173,92 @@ impl QdrantSection {
     }
 }
 
+/// Устройство инференса (`ml.device`, §8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlDevice {
+    /// CUDA, если доступна, иначе CPU.
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl From<MlDevice> for zam_ml::DevicePref {
+    fn from(d: MlDevice) -> Self {
+        match d {
+            MlDevice::Auto => zam_ml::DevicePref::Auto,
+            MlDevice::Cpu => zam_ml::DevicePref::Cpu,
+            MlDevice::Cuda => zam_ml::DevicePref::Cuda,
+        }
+    }
+}
+
+/// Секция `[ml]` (§8.4): модель эмбеддингов и ONNX Runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MlSection {
+    pub device: MlDevice,
+    /// Каталог моделей; по умолчанию `<data_dir>/models`.
+    pub models_dir: Option<PathBuf>,
+    /// Модель эмбеддингов; по умолчанию `bge-m3-fp16` в GPU-комплекте при доступной CUDA,
+    /// иначе `bge-m3-int8`.
+    pub embed_model: Option<String>,
+    /// Библиотека ONNX Runtime; по умолчанию рядом с исполняемым файлом.
+    pub ort_dylib: Option<PathBuf>,
+    /// Потоки сессии индексации (0 — авто).
+    pub index_threads: usize,
+    /// Потоки сессии запросов.
+    pub query_threads: usize,
+    /// Выгрузка модели после простоя: `""` — выключено, иначе `<число>s|m|h`.
+    pub unload_after: String,
+}
+
+impl MlSection {
+    /// Каталог моделей с учётом умолчания.
+    pub fn models_dir(&self, data_dir: &Path) -> PathBuf {
+        self.models_dir
+            .clone()
+            .unwrap_or_else(|| data_dir.join("models"))
+    }
+
+    /// `unload_after` как длительность; `None` — выключено.
+    pub fn unload_after(&self) -> Result<Option<std::time::Duration>, ConfigError> {
+        let raw = self.unload_after.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let invalid = || ConfigError::Invalid {
+            key: "ml.unload_after".into(),
+            source_name: "итог".into(),
+            message: format!("ожидается \"\" или <число>s|m|h, получено `{raw}`"),
+        };
+        let (num, unit) = raw.split_at(raw.len() - 1);
+        let n: u64 = num.trim().parse().map_err(|_| invalid())?;
+        let secs = match unit {
+            "s" => n,
+            "m" => n * 60,
+            "h" => n * 3600,
+            _ => return Err(invalid()),
+        };
+        if secs == 0 {
+            return Err(invalid());
+        }
+        Ok(Some(std::time::Duration::from_secs(secs)))
+    }
+}
+
+/// Секция `[index]` (§8.1): воркер индексации.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexSection {
+    /// Предел токенов одного вызова инференса.
+    pub batch_tokens: usize,
+    /// Уступка между пачками, мс.
+    pub yield_ms: u64,
+    /// Дебаунс свёртки L0 папок, мс.
+    pub rollup_debounce_ms: u64,
+}
+
 /// Пределы размеров (§16.2): заметка и вложение, байт.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +295,20 @@ impl Default for ServerConfig {
                 max_search_threads: 2,
                 optimizer_cpu_budget: 2,
                 api_key: None,
+            },
+            ml: MlSection {
+                device: MlDevice::Auto,
+                models_dir: None,
+                embed_model: None,
+                ort_dylib: None,
+                index_threads: 0,
+                query_threads: 2,
+                unload_after: String::new(),
+            },
+            index: IndexSection {
+                batch_tokens: 8192,
+                yield_ms: 5,
+                rollup_debounce_ms: 2000,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -376,6 +478,14 @@ pub fn load(
                 message: e.message().to_string(),
             })?;
     cfg.server.base_path = normalize_base_path(&cfg.server.base_path);
+    cfg.ml.unload_after()?;
+    if cfg.index.batch_tokens == 0 {
+        return Err(ConfigError::Invalid {
+            key: "index.batch_tokens".into(),
+            source_name: "итог".into(),
+            message: "должно быть больше 0".into(),
+        });
+    }
     Ok(cfg)
 }
 
@@ -700,6 +810,56 @@ note_max_bytes = 1000
         let e = vec![env("ZAM_QDRANT__MODE", "edge")];
         let c = load(None, &e, &Default::default()).unwrap();
         assert!(c.qdrant.supervisor_config(exe).unwrap().is_none());
+    }
+
+    #[test]
+    fn ml_and_index_sections() {
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.ml.device, MlDevice::Auto);
+        assert_eq!((d.ml.index_threads, d.ml.query_threads), (0, 2));
+        assert_eq!((&d.ml.embed_model, &d.ml.ort_dylib), (&None, &None));
+        assert_eq!(d.ml.unload_after().unwrap(), None);
+        assert_eq!(
+            d.ml.models_dir(std::path::Path::new("dd")),
+            std::path::Path::new("dd").join("models")
+        );
+        assert_eq!(
+            (
+                d.index.batch_tokens,
+                d.index.yield_ms,
+                d.index.rollup_debounce_ms
+            ),
+            (8192, 5, 2000)
+        );
+        let f = write_in_target(
+            "ml.toml",
+            "[ml]
+device = \"cpu\"
+embed_model = \"minilm-l6-int8\"
+unload_after = \"30m\"
+[index]
+yield_ms = 1
+",
+        );
+        let e = vec![env("ZAM_ML__QUERY_THREADS", "4")];
+        let c = load(Some(&f), &e, &Default::default()).unwrap();
+        assert_eq!(c.ml.device, MlDevice::Cpu);
+        assert_eq!(c.ml.embed_model.as_deref(), Some("minilm-l6-int8"));
+        assert_eq!(c.ml.query_threads, 4);
+        assert_eq!(
+            c.ml.unload_after().unwrap(),
+            Some(std::time::Duration::from_secs(1800))
+        );
+        assert_eq!(c.index.yield_ms, 1);
+        for bad in ["10", "5x", "0s", "m"] {
+            let e = vec![env("ZAM_ML__UNLOAD_AFTER", bad)];
+            let err = load(None, &e, &Default::default()).unwrap_err().to_string();
+            assert!(err.contains("ml.unload_after"), "{bad}: {err}");
+        }
+        let e = vec![env("ZAM_ML__DEVICE", "directml")];
+        assert!(load(None, &e, &Default::default()).is_err());
+        let e = vec![env("ZAM_INDEX__BATCH_TOKENS", "0")];
+        assert!(load(None, &e, &Default::default()).is_err());
     }
 
     #[test]

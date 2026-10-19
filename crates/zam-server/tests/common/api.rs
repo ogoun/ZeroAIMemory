@@ -63,6 +63,12 @@ pub fn enc(s: &str) -> String {
 pub async fn api(name: &str, tweak: impl FnOnce(&mut ServerConfig)) -> Api {
     let mut c = super::cfg_in(super::tmp(&format!("api-{name}")));
     tweak(&mut c);
+    api_with(c).await
+}
+
+/// Сервер по готовой конфигурации (каталог данных не очищается: повторный старт).
+/// Первый токен есть только при первом старте каталога; при повторном — пустая строка.
+pub async fn api_with(c: ServerConfig) -> Api {
     let (app, st, rep) = build(c, Some(PW.into())).await.unwrap();
     let r = app
         .clone()
@@ -91,7 +97,7 @@ pub async fn api(name: &str, tweak: impl FnOnce(&mut ServerConfig)) -> Api {
     Api {
         app,
         st,
-        token: rep.initial_token.unwrap(),
+        token: rep.initial_token.unwrap_or_default(),
         cookie,
         csrf,
     }

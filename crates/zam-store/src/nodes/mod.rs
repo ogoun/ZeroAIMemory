@@ -13,6 +13,7 @@
 
 mod chunks;
 mod history;
+mod l0;
 mod read;
 mod revise;
 mod tree_ops;
@@ -34,6 +35,7 @@ use crate::time::{conv_err, ts_at, ts_opt};
 pub use chunks::set_token_counter;
 pub(crate) use chunks::{frontmatter_tags, rechunk_notes};
 pub use history::{RevisionInfo, list_revisions, unified_diff};
+pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
 pub use revise::{WriteError, patch_note, patch_note_within, revert_note, update_note};
 pub use tree_ops::{delete_node, list_trash, move_node, restore_node};

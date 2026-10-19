@@ -6,7 +6,9 @@ pub mod auth;
 pub mod bootstrap;
 pub mod config;
 pub mod error;
+pub mod index_state;
 pub mod logging;
+pub mod ml;
 pub mod qdrant;
 pub mod web;
 
@@ -45,6 +47,7 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+    state.shutdown().await;
     tracing::info!("zam-server остановлен");
     Ok(())
 }

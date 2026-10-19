@@ -23,6 +23,7 @@ thiserror.workspace = true
 argon2.workspace = true
 zam-store = { path = "../zam-store" }
 zam-index = { path = "../zam-index" }
+zam-ml = { path = "../zam-ml" }
 zam-fetch = { path = "../zam-fetch" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 pub mod api;
+pub mod qdrant;
 
 use zam_server::config::ServerConfig;
 

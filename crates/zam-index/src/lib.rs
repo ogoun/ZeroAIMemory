@@ -11,19 +11,25 @@
 //!   (Job Object / PDEATHSIG), готовность и версия, перезапуск с circuit breaker, метка
 //!   хранилища и пересборка, штатная остановка; `status`/`reset` для CLI.
 //!
+//! - [`worker`] — воркер индексации: outbox `index_jobs` → кэш `embeddings` → инференс →
+//!   upsert в Qdrant → `index_state`; свёртка L0 ([`rollup`], §8.3).
+//!
 //! Источник истины — SQLite: индекс пересобирается из `embeddings` без инференса.
 //! Пространство `human` в индекс никогда не попадает. В ошибки и логи не попадают
 //! векторы, текст чанков и API-ключ.
 
 mod qdrant;
+pub mod rollup;
 pub mod supervisor;
 mod vector;
+pub mod worker;
 
 pub use qdrant::{COLLECTION, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE};
 pub use vector::{
     IndexFuture, IndexMeta, IndexPoint, NAMESPACE_ZAM, PointPayload, VectorFilter, VectorHit,
     VectorIndex, point_id,
 };
+pub use worker::{PassageEmbedder, WorkerConfig, WorkerDeps, WorkerHandle, WorkerStatus};
 
 /// Ошибки векторного индекса. Тексты без векторов, текста чанков и секретов.
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +41,10 @@ pub enum IndexError {
     /// Неверный или отсутствующий API-ключ.
     #[error("Qdrant: ошибка аутентификации")]
     Auth,
+    /// Коллекции нет (стёрта, удалена `drop_all` или ещё не создана): воркер вызывает
+    /// [`VectorIndex::ensure`] и повторяет операцию, задание не считается неудачным.
+    #[error("Qdrant: коллекция не найдена: {0}")]
+    NotFound(String),
     /// Коллекция или ответ в неожиданном виде (нет вектора `dense`, нет полей payload).
     #[error("индекс повреждён: {0}")]
     Corrupt(String),

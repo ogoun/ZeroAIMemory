@@ -13,7 +13,8 @@ use zam_store::{DataDir, SystemStore, UserDbs};
 use crate::auth::AuthState;
 use crate::config::{AdminSecret, ServerConfig};
 use crate::error::not_found;
-use crate::{api, bootstrap, web};
+use crate::index_state::IndexRuntime;
+use crate::{api, bootstrap, ml, web};
 
 /// Git-хэш сборки (см. build.rs).
 pub const GIT_SHA: &str = env!("ZAM_GIT_SHA");
@@ -36,6 +37,15 @@ pub struct AppState {
     pub render_cache: api::render::RenderCache,
     /// Поколения ссылок для ключа кэша рендера.
     pub render_gen: Arc<api::render::RenderGenerations>,
+    /// Модель, Qdrant и воркер индексации.
+    pub index: Arc<IndexRuntime>,
+}
+
+impl AppState {
+    /// Штатная остановка фоновых частей: воркер индексации, перечанковка R1, Qdrant.
+    pub async fn shutdown(&self) {
+        self.index.shutdown(&self.system, &self.users).await;
+    }
 }
 
 // Вручную: хэш пароля и пути не должны попадать в отладочный вывод.
@@ -95,6 +105,13 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         admin_hash,
         data_dir,
     } = p;
+    // Модель — до первого открытия базы пользователя: перечанковка R1 и запись идут
+    // точным счётчиком токенов модели (без второй копии токенизатора).
+    let ml_cfg = cfg.clone();
+    let ml = tokio::task::spawn_blocking(move || ml::load(&ml_cfg)).await?;
+    if let Some(e) = &ml.embedder {
+        zam_store::set_token_counter(Arc::new(e.token_counter()));
+    }
     let system = SystemStore::open(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
     let admin_id = system
@@ -107,8 +124,11 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     let auth = tokio::task::spawn_blocking(move || AuthState::new(&real))
         .await?
         .map_err(|e| anyhow::anyhow!("не удалось подготовить проверку пароля: {e}"))?;
+    let users = UserDbs::new(data_dir.users_dir());
+    let index = Arc::new(IndexRuntime::start(&cfg, ml, &system, &users).await);
     let state = AppState {
-        users: UserDbs::new(data_dir.users_dir()),
+        users,
+        index,
         data_dir,
         system,
         admin_hash: Arc::new(admin_hash),

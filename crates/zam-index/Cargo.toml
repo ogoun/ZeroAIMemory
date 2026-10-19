@@ -1,6 +1,6 @@
 [package]
 name = "zam-index"
-description = "Векторный индекс ZeroAIMemory: трейт VectorIndex, адаптер Qdrant (named dense+sparse, RRF) и супервизор нативного Qdrant"
+description = "Векторный индекс ZeroAIMemory: трейт VectorIndex, адаптер Qdrant (named dense+sparse, RRF), супервизор нативного Qdrant и воркер индексации"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -29,6 +29,11 @@ rand.workspace = true
 fs4.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "net", "io-util", "process", "macros"] }
 zam-core = { path = "../zam-core" }
+# воркер индексации: outbox, кэш эмбеддингов, L0 (§8.1, §8.3)
+zam-store = { path = "../zam-store" }
+zam-markdown = { path = "../zam-markdown" }
+jiff.workspace = true
+blake3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { workspace = true, features = ["job-object", "creation-flags"] }
@@ -40,3 +45,4 @@ libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true

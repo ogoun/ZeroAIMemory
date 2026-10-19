@@ -343,6 +343,48 @@ async fn delete_node_removes_all_its_points() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_collection_is_not_found_and_count_filters() {
+    let q = TestQdrant::start("notfound");
+    let idx = connect(&q);
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    // Коллекции нет: upsert и delete — NotFound (воркер вызывает ensure и повторяет).
+    let err = idx
+        .upsert(vec![point(&ctx, Id::new(), "c1", 1, "a", "chunk")])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IndexError::NotFound(_)), "{err:?}");
+    let err = idx.delete_node(ctx.user, Id::new()).await.unwrap_err();
+    assert!(matches!(err, IndexError::NotFound(_)), "{err:?}");
+
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let other = Ctx {
+        user: ctx.user,
+        space: Id::new(),
+    };
+    idx.upsert(vec![
+        point(&ctx, Id::new(), "c1", 1, "a/b", "chunk"),
+        point(&ctx, Id::new(), "c2", 2, "a/b", "note"),
+        point(&other, Id::new(), "c3", 3, "x", "chunk"),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(idx.count(&filter(&ctx)).await.unwrap(), 2);
+    let mut f = filter(&ctx);
+    f.levels = vec!["note".into()];
+    assert_eq!(idx.count(&f).await.unwrap(), 1);
+    f = filter(&other);
+    f.path_prefix = Some("a".into());
+    assert_eq!(idx.count(&f).await.unwrap(), 0);
+    f.space_ids = vec![];
+    assert_eq!(idx.count(&f).await.unwrap(), 2);
+    f.user_id = Id::new();
+    assert_eq!(idx.count(&f).await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn human_space_is_rejected() {
     let q = TestQdrant::start("human");
     let idx = connect(&q);
@@ -380,8 +422,10 @@ async fn wrong_api_key_is_auth_error() {
     assert!(matches!(err, IndexError::Auth), "{err:?}");
     let err = idx.ensure(MODEL, DIM).await.unwrap_err();
     assert!(matches!(err, IndexError::Auth), "{err:?}");
-    // ключ не утекает в текст ошибки
-    assert!(!format!("{err} {err:?}").contains(&q.api_key));
+    // отправленный ключ не утекает в текст ошибки
+    let shown = format!("{err} {err:?}");
+    assert!(!shown.contains("wrong-key"), "{shown}");
+    assert!(!shown.contains(&q.api_key), "{shown}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

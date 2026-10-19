@@ -116,6 +116,10 @@ pub trait VectorIndex: Send + Sync {
         f: &'a VectorFilter,
     ) -> IndexFuture<'a, Vec<VectorHit>>;
 
+    /// Точное число точек по фильтру: тенант, пространства, префикс пути; пустой
+    /// `levels` — все уровни (для `/index/status` и проверок исключений).
+    fn count<'a>(&'a self, f: &'a VectorFilter) -> IndexFuture<'a, u64>;
+
     /// Удаляет коллекцию целиком (reindex, смена модели). Идемпотентно.
     fn drop_all(&self) -> IndexFuture<'_, ()>;
 

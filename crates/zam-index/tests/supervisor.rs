@@ -410,6 +410,56 @@ async fn orphan_from_pid_file_is_killed() {
     assert!(!st.storage_present && st.reindex_pending, "{st:?}");
 }
 
+/// reset не стирает хранилище из-под живого Qdrant: процесс без pid-файла (его нельзя
+/// опознать как нашего сироту) держит наш порт и отвечает как Qdrant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_refuses_while_live_qdrant_holds_our_port() {
+    let dir = data_dir("reset-live");
+    let cfg = managed();
+    let sup = Supervisor::start(SupervisorConfig::Managed(cfg.clone()), &dir)
+        .await
+        .unwrap();
+    let mut rx = sup.state();
+    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    sup.shutdown().await;
+
+    let qdir = dir.join("qdrant");
+    // процесс завершается и при панике теста (иначе он держит канал вывода cargo)
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let live = Kill(
+        Command::new(qdrant_bin())
+            .args(["--config-path", "config/zam.yaml", "--disable-telemetry"])
+            .current_dir(&qdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_listening(cfg.http_port);
+    // pid-файла нет: сирота не опознан, но процесс жив на нашем порту
+    let _ = std::fs::remove_file(qdir.join("qdrant.pid"));
+    let err = reset_storage(&dir, &cfg).unwrap_err();
+    assert!(
+        matches!(&err, IndexError::Process(m) if m.contains("не стёрто")),
+        "{err:?}"
+    );
+    assert!(pid_alive(live.0.id()), "живой Qdrant завершён");
+    let st = inspect(&dir, cfg.http_port).await;
+    assert!(st.storage_present && !st.reindex_pending, "{st:?}");
+
+    drop(live);
+    reset_storage(&dir, &cfg).unwrap();
+    let st = inspect(&dir, cfg.http_port).await;
+    assert!(!st.storage_present && st.reindex_pending, "{st:?}");
+}
+
 /// Ждёт, пока на порту 127.0.0.1 появится слушатель (до 20 с).
 fn wait_listening(port: u16) {
     let t = Instant::now();

@@ -8,8 +8,8 @@ use zam_core::Id;
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, IndexState, JobOp, JobOutcome, NewNote, NodePath,
     SpaceKind, USER_MIGRATIONS, UserDbs, chunks_for_index, claim_jobs, complete_job, create_note,
-    delete_node, enqueue_reindex, fail_job, get_node, job_stats, list_spaces, move_node,
-    requeue_running, restore_node, set_index_state, update_note,
+    delete_node, enqueue_reindex, fail_job, get_node, indexed_count, job_stats, list_spaces,
+    move_node, release_job, requeue_running, restore_node, set_index_state, update_note,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -760,4 +760,56 @@ async fn bench_r1_rechunk_10000_notes() {
         st.queued
     );
     assert_eq!(st.queued as usize, N + 1);
+}
+
+/// Возврат выдачи без неудачи (Qdrant недоступен): задание снова `queued`,
+/// попытки и backoff не меняются; устаревшая выдача — `Stale`.
+#[tokio::test]
+async fn release_returns_job_without_attempt() {
+    let (db, k, _) = setup("release").await;
+    let n = add(&db, k, "r", NOTE).await;
+    let now = Timestamp::now();
+    let j = claim_jobs(&db, 8, now).await.unwrap().remove(0);
+    assert_eq!(
+        release_job(&db, j.id, j.claim_gen).await.unwrap(),
+        JobOutcome::Requeued
+    );
+    assert_eq!(
+        jobs_of(&db, n).await,
+        [("upsert".into(), "queued".into(), 1)]
+    );
+    let again = claim_jobs(&db, 8, now).await.unwrap().remove(0);
+    assert_eq!((again.id, again.attempts), (j.id, 0));
+    assert_eq!(
+        release_job(&db, j.id, j.claim_gen).await.unwrap(),
+        JobOutcome::Stale
+    );
+    // правка во время обработки: release снимает dirty, следующая выдача берёт новую ревизию
+    update_note(&db, n, 1, format!("{NOTE}\nещё\n"), None, attrib())
+        .await
+        .unwrap();
+    release_job(&db, again.id, again.claim_gen).await.unwrap();
+    let third = claim_jobs(&db, 8, now).await.unwrap().remove(0);
+    assert_eq!(third.rev, 2);
+    assert_eq!(
+        complete_job(&db, third.id, third.claim_gen).await.unwrap(),
+        JobOutcome::Done
+    );
+}
+
+#[tokio::test]
+async fn indexed_count_counts_live_indexed_notes() {
+    let (db, k, _) = setup("indexed-count").await;
+    assert_eq!(indexed_count(&db).await.unwrap(), 0);
+    let a = add(&db, k, "a", NOTE).await;
+    let b = add(&db, k, "b", NOTE).await;
+    set_index_state(&db, a, 1, IndexState::Indexed)
+        .await
+        .unwrap();
+    set_index_state(&db, b, 1, IndexState::Indexed)
+        .await
+        .unwrap();
+    assert_eq!(indexed_count(&db).await.unwrap(), 2);
+    delete_node(&db, b).await.unwrap();
+    assert_eq!(indexed_count(&db).await.unwrap(), 1);
 }
