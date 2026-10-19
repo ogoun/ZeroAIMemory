@@ -28,15 +28,31 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Абсолютный путь к библиотеке ORT: относительный отсчитывается от каталога исполняемого
+/// файла (так же поступает `ort`, но там `current_exe().expect` — здесь ошибка вместо паники).
+pub(crate) fn resolve_dylib(dylib: &Path) -> Result<PathBuf, MlError> {
+    if dylib.is_absolute() {
+        return Ok(dylib.to_path_buf());
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| MlError::NoRuntime(format!("не определить каталог программы: {e}")))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| MlError::NoRuntime("у исполняемого файла нет каталога".into()))?;
+    Ok(dir.join(dylib))
+}
+
 /// Загружает ONNX Runtime из `dylib` и создаёт окружение. До загрузки версия проверяется
 /// `ort::util::probe`: нужна 1.[`ort::MINOR_VERSION`] или новее. Повторный вызов с тем же путём — `Ok`;
 /// с другим путём — `NoRuntime` (вторую библиотеку в процесс не загрузить, нужен перезапуск).
+/// Относительный путь отсчитывается от каталога исполняемого файла.
 pub fn init_runtime(dylib: &Path) -> Result<(), MlError> {
     environment(dylib).map(|_| ())
 }
 
 /// Окружение ORT для `dylib` (загружает библиотеку при первом вызове).
 pub(crate) fn environment(dylib: &Path) -> Result<Environment, MlError> {
+    let dylib = &resolve_dylib(dylib)?;
     let mut guard = RUNTIME.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(rt) = guard.as_ref() {
         if same_file(&rt.path, dylib) {
@@ -80,4 +96,23 @@ pub(crate) fn environment(dylib: &Path) -> Result<Environment, MlError> {
         env: env.clone(),
     });
     Ok(env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_dylib_resolves_from_exe_dir() {
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let r = resolve_dylib(Path::new("onnxruntime.dll")).unwrap();
+        assert!(r.is_absolute());
+        assert_eq!(r, exe_dir.join("onnxruntime.dll"));
+        let abs = exe_dir.join("x");
+        assert_eq!(resolve_dylib(&abs).unwrap(), abs);
+    }
 }

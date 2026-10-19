@@ -21,7 +21,7 @@ pub use device::{Device, DevicePref, DeviceReport};
 pub use embed::{Embedder, Embedding};
 pub use runtime::init_runtime;
 pub use sparse::SparseHead;
-pub use spec::{ModelSpec, Pooling};
+pub use spec::{ModelDevice, ModelSpec, Pooling};
 pub use tokenize::BgeTokenCounter;
 
 /// Ошибки zam-ml. `NoRuntime` и `NoModel` означают режим FTS-only (сервер стартует и сообщает причину).

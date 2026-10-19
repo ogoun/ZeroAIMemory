@@ -21,7 +21,13 @@ pub struct SparseHead {
     b: f32,
 }
 
-fn read_entry(z: &mut zip::ZipArchive<std::fs::File>, suffix: &str) -> Result<Vec<u8>, MlError> {
+/// Читает единственную запись `*<suffix>` ровно в `expected` байт. Размер из каталога zip
+/// не используется для выделения памяти: повреждённый файл даёт `Spec`, а не панику или OOM.
+fn read_entry(
+    z: &mut zip::ZipArchive<std::fs::File>,
+    suffix: &str,
+    expected: usize,
+) -> Result<Vec<u8>, MlError> {
     let names: Vec<String> = z
         .file_names()
         .filter_map(Result::ok)
@@ -34,11 +40,25 @@ fn read_entry(z: &mut zip::ZipArchive<std::fs::File>, suffix: &str) -> Result<Ve
             names.len()
         )));
     };
-    let mut f = z
+    let f = z
         .by_name(name)
         .map_err(|e| MlError::Spec(format!("{name}: {e}")))?;
-    let mut buf = Vec::with_capacity(f.size() as usize);
-    f.read_to_end(&mut buf)?;
+    if f.size() != expected as u64 {
+        return Err(MlError::Spec(format!(
+            "{name}: {} Б, ожидалось {expected} (fp16)",
+            f.size()
+        )));
+    }
+    let mut buf = Vec::with_capacity(expected);
+    f.take(expected as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| MlError::Spec(format!("{name}: {e}")))?;
+    if buf.len() != expected {
+        return Err(MlError::Spec(format!(
+            "{name}: прочитано {} Б, ожидалось {expected}",
+            buf.len()
+        )));
+    }
     Ok(buf)
 }
 
@@ -58,17 +78,12 @@ impl SparseHead {
             .map_err(|e| MlError::NoModel(format!("нет sparse-головы {}: {e}", path.display())))?;
         let mut z = zip::ZipArchive::new(f)
             .map_err(|e| MlError::Spec(format!("{}: не zip ({e})", path.display())))?;
-        let w = read_entry(&mut z, "/data/0")?;
-        let b = read_entry(&mut z, "/data/1")?;
-        if w.len() != dim * 2 || b.len() != 2 {
-            return Err(MlError::Spec(format!(
-                "{}: веса {} Б и bias {} Б, ожидалось {} и 2 (fp16, dim = {dim})",
-                path.display(),
-                w.len(),
-                b.len(),
-                dim * 2
-            )));
-        }
+        let ctx = |e: MlError| match e {
+            MlError::Spec(m) => MlError::Spec(format!("{} (dim = {dim}): {m}", path.display())),
+            e => e,
+        };
+        let w = read_entry(&mut z, "/data/0", dim * 2).map_err(ctx)?;
+        let b = read_entry(&mut z, "/data/1", 2).map_err(ctx)?;
         let w = f16s(&w);
         let b = f16s(&b)[0];
         if !w.iter().all(|x| x.is_finite()) || !b.is_finite() {
@@ -90,7 +105,9 @@ impl SparseHead {
     /// Результат отсортирован по id.
     pub fn pool(&self, hidden: &[f32], ids: &[u32], mask: &[u32]) -> Vec<(u32, f32)> {
         let h = self.w.len();
-        debug_assert_eq!(hidden.len(), ids.len() * h);
+        // несогласованные длины не паникуют: берётся общая часть
+        let n = ids.len().min(mask.len()).min(hidden.len() / h.max(1));
+        let (ids, mask) = (&ids[..n], &mask[..n]);
         let mut best: HashMap<u32, f32> = HashMap::new();
         for (t, (&id, &m)) in ids.iter().zip(mask).enumerate() {
             if m == 0 || id <= MAX_SPECIAL_ID {

@@ -4,7 +4,8 @@
 # Поля:
 #   id                    — каталог <data_dir>/models/<id>/ (в разработке: target/models/<id>/);
 #   role                  — embed | rerank | test;
-#   device                — cpu | gpu | any: для какого устройства предназначен вариант;
+#   device                — cpu | gpu | any: для какого устройства предназначен вариант
+#                           (cpu-вариант zam-ml запускает только на CPU, даже при ml.device = cuda);
 #   license               — SPDX-идентификатор лицензии весов;
 #   bundle                — входит ли модель в архив zam-models;
 #   requires_license_ack  — загрузка только с явным согласием (--accept-nc-license);

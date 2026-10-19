@@ -3546,6 +3546,7 @@ dependencies = [
  "lru",
  "ort",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror",
  "tokenizers",

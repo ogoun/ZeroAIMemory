@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokenizers::{Encoding, PostProcessor as _, Tokenizer, TruncationDirection};
 use zam_markdown::{ApproxCounter, TokenCounter};
@@ -13,9 +14,62 @@ use zam_markdown::{ApproxCounter, TokenCounter};
 use crate::MlError;
 use crate::models::{TOKENIZER_FILE, model_dir, require_file};
 
+/// Предел байт текста на один токен усечения: длиннее текст до токенизации не доходит
+/// (токен bge-m3 в среднем 3–5 байт UTF-8, запас на редкие длинные токены).
+const MAX_BYTES_PER_TOKEN: usize = 16;
+
+/// Префикс `text` не длиннее `max_tokens * 16` байт по границе символа: ограничивает работу
+/// токенизатора и размер ключа LRU для заведомо усекаемых текстов.
+pub(crate) fn cap_text(text: &str, max_tokens: usize) -> &str {
+    let limit = max_tokens.saturating_mul(MAX_BYTES_PER_TOKEN);
+    if text.len() <= limit {
+        text
+    } else {
+        &text[..text.floor_char_boundary(limit)]
+    }
+}
+
+/// Токенизатор и признак того, что счётчик хотя бы раз откатился на оценку.
+pub(crate) struct Shared {
+    tok: Tokenizer,
+    degraded: AtomicBool,
+}
+
+impl Shared {
+    fn new(tok: Tokenizer) -> Arc<Shared> {
+        Arc::new(Shared {
+            tok,
+            degraded: AtomicBool::new(false),
+        })
+    }
+
+    /// Число токенов без спецтокенов; при ошибке токенизатора — оценка с предупреждением.
+    fn count(&self, text: &str) -> usize {
+        match self.tok.encode_fast(text, false) {
+            Ok(e) => e.len(),
+            Err(e) => self.fallback(text, &e.to_string()),
+        }
+    }
+
+    /// Оценка вместо точного подсчёта: оценка лучше паники в транзакции записи.
+    /// Текст в лог не пишется; после первого отката счётчик сообщает `is_exact() == false`.
+    fn fallback(&self, text: &str, err: &str) -> usize {
+        if !self.degraded.swap(true, Ordering::Relaxed) {
+            tracing::warn!(error = %err, bytes = text.len(), "токенизатор не справился, счётчик перешёл на оценку");
+        } else {
+            tracing::debug!(error = %err, bytes = text.len(), "оценка числа токенов");
+        }
+        ApproxCounter.count(text)
+    }
+
+    fn is_exact(&self) -> bool {
+        !self.degraded.load(Ordering::Relaxed)
+    }
+}
+
 /// Токенизатор модели с параметрами обрамления.
 pub(crate) struct Tok {
-    pub inner: Arc<Tokenizer>,
+    pub inner: Arc<Shared>,
     /// Сколько спецтокенов добавляет пост-процессор к одному тексту.
     n_added: usize,
     /// Токен паддинга.
@@ -47,18 +101,21 @@ impl Tok {
         let (t, pad_id) = load_raw(path)?;
         let n_added = t.get_post_processor().map_or(0, |p| p.added_tokens(false));
         Ok(Tok {
-            inner: Arc::new(t),
+            inner: Shared::new(t),
             n_added,
             pad_id,
         })
     }
 
-    /// Кодирует тексты для модели: усечение до `max_tokens` вместе со спецтокенами.
+    /// Кодирует тексты для модели: усечение до `max_tokens` вместе со спецтокенами
+    /// (текст заранее обрезается до `max_tokens * 16` байт).
     pub fn encode(&self, texts: &[&str], max_tokens: usize) -> Result<Vec<Encoding>, MlError> {
         let budget = max_tokens.saturating_sub(self.n_added).max(1);
+        let capped: Vec<&str> = texts.iter().map(|t| cap_text(t, max_tokens)).collect();
         let raw = self
             .inner
-            .encode_batch_fast(texts.to_vec(), false)
+            .tok
+            .encode_batch_fast(capped, false)
             .map_err(tok_err)?;
         raw.into_iter()
             .map(|mut e| {
@@ -66,31 +123,25 @@ impl Tok {
                     e.truncate(budget, 0, TruncationDirection::Right);
                     e.take_overflowing();
                 }
-                self.inner.post_process(e, None, true).map_err(tok_err)
+                self.inner.tok.post_process(e, None, true).map_err(tok_err)
             })
             .collect()
     }
 
     /// Число токенов без спецтокенов.
     pub fn count(&self, text: &str) -> usize {
-        count(&self.inner, text)
-    }
-}
-
-fn count(t: &Tokenizer, text: &str) -> usize {
-    match t.encode_fast(text, false) {
-        Ok(e) => e.len(),
-        // не должно случаться; оценка лучше паники в транзакции записи
-        Err(_) => ApproxCounter.count(text),
+        self.inner.count(text)
     }
 }
 
 /// Точный счётчик токенов модели (без спецтокенов: чанкер складывает счётчики частей).
+/// Если токенизатор отказал, счётчик отдаёт оценку `ceil(символы / 3,5)`, пишет предупреждение
+/// и с этого момента сообщает `is_exact() == false`.
 #[derive(Clone)]
-pub struct BgeTokenCounter(Arc<Tokenizer>);
+pub struct BgeTokenCounter(Arc<Shared>);
 
 impl BgeTokenCounter {
-    pub(crate) fn new(t: Arc<Tokenizer>) -> Self {
+    pub(crate) fn new(t: Arc<Shared>) -> Self {
         BgeTokenCounter(t)
     }
 
@@ -98,7 +149,7 @@ impl BgeTokenCounter {
     pub fn load(models_dir: &Path, id: &str) -> Result<BgeTokenCounter, MlError> {
         let path = model_dir(models_dir, id)?.join(TOKENIZER_FILE);
         require_file(&path)?;
-        Ok(BgeTokenCounter(Arc::new(load_raw(&path)?.0)))
+        Ok(BgeTokenCounter(Shared::new(load_raw(&path)?.0)))
     }
 }
 
@@ -110,9 +161,36 @@ impl std::fmt::Debug for BgeTokenCounter {
 
 impl TokenCounter for BgeTokenCounter {
     fn count(&self, text: &str) -> usize {
-        count(&self.0, text)
+        self.0.count(text)
     }
     fn is_exact(&self) -> bool {
-        true
+        self.0.is_exact()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_text_on_char_boundary() {
+        assert_eq!(cap_text("abc", 1), "abc");
+        let s = "я".repeat(20); // 40 байт
+        let c = cap_text(&s, 1); // предел 16 байт
+        assert_eq!(c, "я".repeat(8));
+        let odd = format!("a{s}"); // граница 16 попадает внутрь символа
+        assert_eq!(cap_text(&odd, 1), format!("a{}", "я".repeat(7)));
+        assert_eq!(cap_text("abc", 0), "");
+    }
+
+    #[test]
+    fn fallback_marks_counter_inexact() {
+        let mut t = Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+        t.with_truncation(None).unwrap();
+        let sh = Shared::new(t);
+        let c = BgeTokenCounter::new(sh.clone());
+        assert!(c.is_exact());
+        assert_eq!(sh.fallback("abcdefg", "сбой"), 2);
+        assert!(!c.is_exact());
     }
 }

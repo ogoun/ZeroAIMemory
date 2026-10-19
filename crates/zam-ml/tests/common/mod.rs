@@ -138,3 +138,30 @@ pub fn rss_bytes() -> Option<u64> {
         Some(kb * 1024)
     }
 }
+
+/// Каталог моделей с копией MiniLM под именем `name` и своим `model.toml` (`extra` — доп. строки
+/// спеки; если в них есть `sparse_head`, рядом кладётся синтетическая голова). Возвращает корень.
+pub fn minilm_copy(name: &str, extra: &str) -> PathBuf {
+    let root = tmp_dir(name);
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = models_dir().join("minilm-l6-int8");
+    for f in ["model.onnx", "tokenizer.json"] {
+        std::fs::copy(src.join(f), dir.join(f)).unwrap();
+    }
+    if extra.contains("sparse_head") {
+        let w: Vec<f32> = (0..384)
+            .map(|i| ((i * 37 % 17) as f32 - 8.0) / 8.0)
+            .collect();
+        write_sparse_pt(&dir.join("sparse_linear.pt"), &w, 0.5);
+    }
+    std::fs::write(
+        dir.join("model.toml"),
+        format!(
+            "id = \"{name}\"\ndim = 384\npooling = \"mean\"\nmax_tokens_passage = 256\n\
+             max_tokens_query = 128\n{extra}"
+        ),
+    )
+    .unwrap();
+    root
+}

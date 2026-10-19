@@ -126,7 +126,7 @@ pub enum ModelRole {
 }
 
 /// Устройство, для которого предназначен вариант модели.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelDevice {
     Cpu,
@@ -208,6 +208,8 @@ fn is_false(b: &bool) -> bool {
 #[derive(Serialize)]
 struct ModelSpecFile<'a> {
     id: &'a str,
+    /// cpu | gpu | any: CPU-вариант zam-ml не запускает на GPU.
+    device: ModelDevice,
     #[serde(flatten)]
     spec: &'a ModelSpec,
 }
@@ -220,6 +222,7 @@ impl ModelEntry {
     pub fn spec_toml(&self) -> Result<String> {
         let body = toml::to_string(&ModelSpecFile {
             id: &self.id,
+            device: self.device,
             spec: &self.spec,
         })
         .context("не удалось сериализовать описатель модели")?;
@@ -747,6 +750,7 @@ max_tokens_query = 8
         let v: toml::Table = toml::from_str(&text).unwrap();
         assert_eq!(v["id"].as_str(), Some(m.model[0].id.as_str()));
         assert_eq!(v["dim"].as_integer(), Some(8));
+        assert_eq!(v["device"].as_str(), Some("cpu"));
         assert_eq!(v["pooling"].as_str(), Some("cls"));
         assert_eq!(v["sparse_head"].as_str(), Some("head.pt"));
         assert!(v.contains_key("max_tokens_passage") && v.contains_key("max_tokens_query"));

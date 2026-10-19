@@ -102,3 +102,20 @@ fn bge_m3_fp16_cuda_throughput() {
     );
     assert!(c > 0.999, "{c}");
 }
+
+#[test]
+fn cpu_model_stays_on_cpu_with_cuda_pref() {
+    if !have(&ort_gpu(), MINILM) {
+        return;
+    }
+    // вариант модели для CPU (device = "cpu") не уходит на GPU ни при cuda, ни при auto
+    let root = common::minilm_copy("minilm-cpu-only", "device = \"cpu\"\n");
+    for pref in [DevicePref::Cuda, DevicePref::Auto] {
+        let (e, rep) =
+            Embedder::load(&config(ort_gpu(), root.clone(), pref), "minilm-cpu-only").unwrap();
+        assert_eq!(rep.device, Device::Cpu, "{pref:?}");
+        assert!(rep.reason.contains("для CPU"), "{}", rep.reason);
+        assert_eq!(e.device(), &rep);
+        e.embed_query("cpu only").unwrap();
+    }
+}

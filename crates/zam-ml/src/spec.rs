@@ -18,6 +18,17 @@ pub enum Pooling {
     Mean,
 }
 
+/// Для какого устройства предназначен вариант модели (`device` в `deploy/models.toml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelDevice {
+    /// Только CPU (int8): с `ml.device = auto|cuda` всё равно работает на CPU.
+    Cpu,
+    Gpu,
+    #[default]
+    Any,
+}
+
 /// Описатель модели-эмбеддера.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
@@ -34,6 +45,8 @@ pub struct ModelSpec {
     /// Активации квантуются динамически по всему тензору (int8 `DynamicQuantizeLinear`):
     /// соседи по батчу меняют вектор, поэтому тексты прогоняются по одному.
     pub dynamic_quant: bool,
+    /// Устройство варианта модели; без поля в `model.toml` — `Any`.
+    pub device: ModelDevice,
 }
 
 /// `model.toml` как он лежит на диске (поля `[model.spec]` и `id`).
@@ -47,6 +60,8 @@ struct RawSpec {
     max_tokens_query: usize,
     #[serde(default)]
     dynamic_quant: bool,
+    #[serde(default)]
+    device: ModelDevice,
 }
 
 /// Имя файла без каталогов (защита от `../` в описателе).
@@ -108,6 +123,7 @@ impl ModelSpec {
             max_tokens_passage: raw.max_tokens_passage,
             max_tokens_query: raw.max_tokens_query,
             dynamic_quant: raw.dynamic_quant,
+            device: raw.device,
         })
     }
 }
@@ -120,13 +136,14 @@ mod tests {
     fn parses_bge_spec() {
         let s = ModelSpec::parse(
             "id = \"bge\"\ndim = 1024\npooling = \"cls\"\nsparse_head = \"sparse_linear.pt\"\n\
-             max_tokens_passage = 1024\nmax_tokens_query = 512\ndynamic_quant = true\n",
+             max_tokens_passage = 1024\nmax_tokens_query = 512\ndynamic_quant = true\ndevice = \"cpu\"\n",
             Path::new("m"),
         )
         .unwrap();
         assert_eq!(s.dim, 1024);
         assert_eq!(s.pooling, Pooling::Cls);
         assert!(s.dynamic_quant);
+        assert_eq!(s.device, ModelDevice::Cpu);
         assert_eq!(
             s.sparse_head.as_deref(),
             Some(Path::new("m").join("sparse_linear.pt").as_path())

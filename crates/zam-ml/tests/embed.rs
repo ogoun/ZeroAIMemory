@@ -136,36 +136,12 @@ fn texts17() -> Vec<String> {
         .collect()
 }
 
-/// Копия MiniLM в отдельном каталоге моделей со своим `model.toml` (`extra` — доп. строки спеки).
+/// Копия MiniLM (см. `common::minilm_copy`), загруженная на CPU-сборке ORT.
 fn minilm_copy(name: &str, extra: &str) -> Option<Embedder> {
     if !have(&ort_cpu(), MINILM) {
         return None;
     }
-    let root = tmp_dir(name);
-    let dir = root.join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = models_dir().join(MINILM);
-    for f in ["model.onnx", "tokenizer.json"] {
-        std::fs::copy(src.join(f), dir.join(f)).unwrap();
-    }
-    if extra.contains("sparse_head") {
-        let w: Vec<f32> = (0..384)
-            .map(|i| ((i * 37 % 17) as f32 - 8.0) / 8.0)
-            .collect();
-        write_sparse_pt(&dir.join("sparse_linear.pt"), &w, 0.5);
-    }
-    std::fs::write(
-        dir.join("model.toml"),
-        format!(
-            "id = \"{name}\"
-dim = 384
-pooling = \"mean\"
-max_tokens_passage = 256
-             max_tokens_query = 128
-{extra}"
-        ),
-    )
-    .unwrap();
+    let root = common::minilm_copy(name, extra);
     let cfg = config(ort_cpu(), root, DevicePref::Cpu);
     Some(Embedder::load(&cfg, name).unwrap().0)
 }
@@ -369,4 +345,128 @@ fn bge_m3_smoke() {
         mb(rss2),
         100.0 / dt.as_secs_f64()
     );
+}
+
+/// zip-файл с заданными записями (без сжатия).
+fn write_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+    use std::io::Write as _;
+    let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let opt =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in entries {
+        z.start_file(*name, opt).unwrap();
+        z.write_all(data).unwrap();
+    }
+    z.finish().unwrap();
+}
+
+#[test]
+fn corrupt_sparse_head_is_spec_error() {
+    let dir = tmp_dir("sparse-corrupt");
+    let spec = |p: &std::path::Path| match SparseHead::load(p, 4) {
+        Err(MlError::Spec(m)) => m,
+        other => panic!("{}: ожидался Spec, получено {other:?}", p.display()),
+    };
+    let w = [0u8; 8];
+    let b = [0u8; 2];
+    // не zip
+    let p = dir.join("not-zip.pt");
+    std::fs::write(&p, b"not a zip at all").unwrap();
+    spec(&p);
+    // обрезанный файл
+    let good = dir.join("good.pt");
+    write_sparse_pt(&good, &[1.0, 2.0, 3.0, 4.0], 0.5);
+    let bytes = std::fs::read(&good).unwrap();
+    let p = dir.join("truncated.pt");
+    std::fs::write(&p, &bytes[..bytes.len() / 2]).unwrap();
+    spec(&p);
+    // нет записи */data/0 и две записи */data/0
+    let p = dir.join("none.pt");
+    write_zip(&p, &[("s/data/1", &b)]);
+    assert!(spec(&p).contains("найдено 0"));
+    let p = dir.join("two.pt");
+    write_zip(&p, &[("a/data/0", &w), ("b/data/0", &w), ("a/data/1", &b)]);
+    assert!(spec(&p).contains("найдено 2"));
+    // запись не того размера
+    let p = dir.join("short.pt");
+    write_zip(&p, &[("s/data/0", &w[..6]), ("s/data/1", &b)]);
+    spec(&p);
+    // заголовок с огромным размером (центральный каталог правится вручную): ни паники, ни OOM
+    let mut bytes = std::fs::read(&good).unwrap();
+    let name = b"sparse_linear/data/0";
+    let cd = (0..bytes.len() - 46)
+        .find(|&i| bytes[i..i + 4] == *b"PK\x01\x02" && bytes[i + 46..].starts_with(name))
+        .expect("запись центрального каталога");
+    bytes[cd + 24..cd + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+    let p = dir.join("huge.pt");
+    std::fs::write(&p, &bytes).unwrap();
+    spec(&p);
+}
+
+#[test]
+fn sparse_pool_tolerates_inconsistent_lengths() {
+    let dir = tmp_dir("sparse-lengths");
+    let p = dir.join("h.pt");
+    write_sparse_pt(&p, &[1.0, 0.0], 0.0);
+    let head = SparseHead::load(&p, 2).unwrap();
+    // hidden на 1 токен, ids на 3, mask на 2 — берётся общая часть (1 токен)
+    let sp = head.pool(&[2.0, 0.0, 5.0], &[10, 11, 12], &[1, 1]);
+    assert_eq!(sp.len(), 1);
+    assert_eq!(sp[0].0, 10);
+    assert!(head.pool(&[], &[10], &[1]).is_empty());
+}
+
+#[test]
+fn empty_token_sequence_is_spec_error() {
+    if !have(&ort_cpu(), MINILM) {
+        return;
+    }
+    // токенизатор без пост-процессора: пустой текст даёт пустую последовательность
+    let root = common::minilm_copy("minilm-nopost", "");
+    let tj = root.join("minilm-nopost").join("tokenizer.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&tj).unwrap()).unwrap();
+    v["post_processor"] = serde_json::Value::Null;
+    std::fs::write(&tj, serde_json::to_string(&v).unwrap()).unwrap();
+    let (e, _) =
+        Embedder::load(&config(ort_cpu(), root, DevicePref::Cpu), "minilm-nopost").unwrap();
+    assert!(matches!(e.embed_passages(&[""]), Err(MlError::Spec(_))));
+    assert!(matches!(e.embed_query(""), Err(MlError::Spec(_))));
+    assert!(matches!(
+        e.embed_passages(&["ok", ""]),
+        Err(MlError::Spec(_))
+    ));
+    assert_eq!(e.embed_passages(&["ok"]).unwrap().len(), 1);
+}
+
+#[test]
+fn huge_texts_are_capped_before_tokenization() {
+    let Some(e) = minilm() else { return };
+    let huge = "word ".repeat(1_000_000); // 5 МБ
+    let t = Instant::now();
+    let q = e.embed_query(&huge).unwrap();
+    let p = e.embed_passages(&[&huge]).unwrap().remove(0);
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+    // запрос усекается до 128 токенов: префикс 2048 байт даёт тот же вектор
+    let prefix = &huge[..2048];
+    let (e2, _) =
+        Embedder::load(&config(ort_cpu(), models_dir(), DevicePref::Cpu), MINILM).unwrap();
+    assert!(cosine(&q.dense, &e2.embed_query(prefix).unwrap().dense) > 0.9999);
+    assert!((norm(&p.dense) - 1.0).abs() < 1e-4);
+    // кириллица: обрезка по границе символа, без паники
+    e.embed_query(&"я".repeat(100_000)).unwrap();
+}
+
+#[test]
+fn relative_missing_runtime_is_no_runtime() {
+    let root = fake_model("rel-runtime");
+    let cfg = config(
+        std::path::PathBuf::from("нет-такого").join(ort_name()),
+        root,
+        DevicePref::Auto,
+    );
+    assert!(matches!(
+        Embedder::load(&cfg, "fake"),
+        Err(MlError::NoRuntime(_))
+    ));
 }

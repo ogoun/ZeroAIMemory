@@ -17,11 +17,11 @@ use tokenizers::Encoding;
 
 use crate::device::build_sessions;
 use crate::models::{MODEL_FILE, TOKENIZER_FILE, model_dir, require_file, sha8};
-use crate::runtime::environment;
+use crate::runtime::{environment, resolve_dylib};
 use crate::sparse::SparseHead;
-use crate::spec::{ModelSpec, Pooling};
-use crate::tokenize::{BgeTokenCounter, Tok};
-use crate::{DeviceReport, MlConfig, MlError};
+use crate::spec::{ModelDevice, ModelSpec, Pooling};
+use crate::tokenize::{BgeTokenCounter, Tok, cap_text};
+use crate::{DevicePref, DeviceReport, MlConfig, MlError};
 
 /// Предел токенов в батче индексации (с паддингом): ограничивает пик памяти активаций.
 const MAX_BATCH_TOKENS: usize = 8192;
@@ -133,7 +133,8 @@ impl Embedder {
         if let Some(p) = &spec.sparse_head {
             require_file(p)?;
         }
-        let env = environment(&cfg.ort_dylib)?;
+        let ort_dylib = resolve_dylib(&cfg.ort_dylib)?;
+        let env = environment(&ort_dylib)?;
         let tok = Tok::load(&tokenizer)?;
         let sparse = spec
             .sparse_head
@@ -141,16 +142,30 @@ impl Embedder {
             .map(|p| SparseHead::load(p, spec.dim))
             .transpose()?;
         let full_id = format!("{}@{}", spec.id, sha8(&model)?);
-        let s = build_sessions(
+        // CPU-вариант модели (int8) на GPU не запускается: векторы CPU и CUDA под одним
+        // model_id не смешиваются, для GPU есть свой вариант (fp16)
+        let cpu_only = spec.device == ModelDevice::Cpu && cfg.device != DevicePref::Cpu;
+        let pref = if cpu_only {
+            DevicePref::Cpu
+        } else {
+            cfg.device
+        };
+        let mut s = build_sessions(
             &env,
-            cfg.device,
-            &cfg.ort_dylib,
+            pref,
+            &ort_dylib,
             &model,
             cfg.index_threads,
             cfg.query_threads,
         )?;
         let index = Runner::new(s.index, spec.dim)?;
         let query = Runner::new(s.query, spec.dim)?;
+        if cpu_only {
+            s.report.reason = format!(
+                "модель {} для CPU (device = \"cpu\" в манифесте), для GPU нужен её GPU-вариант",
+                spec.id
+            );
+        }
         let report = s.report;
         tracing::info!(
             model = %full_id,
@@ -240,6 +255,8 @@ impl Embedder {
 
     /// Эмбеддинг запроса (сессия запросов, LRU-кэш на 1024 запроса).
     pub fn embed_query(&self, text: &str) -> Result<Embedding, MlError> {
+        // длинный запрос всё равно усекается: ключ кэша — только значимый префикс
+        let text = cap_text(text, self.spec.max_tokens_query);
         if let Some(e) = lock(&self.cache).get(text) {
             return Ok(e.clone());
         }
@@ -268,6 +285,13 @@ impl Embedder {
     /// Один прогон модели на батче и пулинг.
     fn run(&self, runner: &mut Runner, batch: &[&Encoding]) -> Result<Vec<Embedding>, MlError> {
         let b = batch.len();
+        // токенизатор без пост-процессора даёт пустую последовательность на пустом тексте:
+        // ни CLS, ни среднего у неё нет, нулевой вектор в индекс не пишем
+        if batch.iter().any(|e| e.is_empty()) {
+            return Err(MlError::Spec(
+                "пустая последовательность токенов (у токенизатора нет спецтокенов)".into(),
+            ));
+        }
         let longest = batch.iter().map(|e| e.len()).max().unwrap_or(0);
         // один текст — без паддинга (паддинг влияет на масштаб динамического квантования)
         let t = if b == 1 {
@@ -339,9 +363,12 @@ impl Embedder {
                             n += 1.0;
                         }
                     }
-                    if n > 0.0 {
-                        acc.iter_mut().for_each(|a| *a /= n);
+                    if n == 0.0 {
+                        return Err(MlError::Spec(
+                            "mean pooling: ни одного токена под маской внимания".into(),
+                        ));
                     }
+                    acc.iter_mut().for_each(|a| *a /= n);
                     acc
                 }
             };
