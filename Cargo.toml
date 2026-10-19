@@ -60,6 +60,8 @@ proptest = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 # хеш текста и id чанков (§6.3)
 blake3 = "1"
+# M2: границы предложений UAX #29 (L0, перекрытие чанков §8.2)
+unicode-segmentation = "1.13"
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]

@@ -1,0 +1,1016 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 488,
+    "range": [
+      10,
+      1738
+    ],
+    "head": "Генерированный модуль:\n\n```rust title=\"g"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 490,
+    "range": [
+      1739,
+      3430
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_61 = co"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      3431,
+      5050
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_120 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      5051,
+      6670
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_174 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      6671,
+      8290
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_228 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      8291,
+      9910
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_282 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      9911,
+      11530
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_336 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      11531,
+      13150
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_390 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      13151,
+      14770
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_444 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      14771,
+      16390
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_498 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      16391,
+      18010
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_552 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      18011,
+      19630
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_606 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      19631,
+      21250
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_660 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      21251,
+      22870
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_714 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      22871,
+      24490
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_768 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      24491,
+      26110
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_822 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      26111,
+      27730
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_876 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 470,
+    "range": [
+      27731,
+      29350
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_930 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      29351,
+      30918
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_984 = c"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      30919,
+      32486
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1034 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      32487,
+      34054
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1083 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      34055,
+      35622
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1132 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      35623,
+      37190
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1181 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      37191,
+      38758
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1230 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      38759,
+      40326
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1279 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      40327,
+      41894
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1328 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      41895,
+      43462
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1377 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      43463,
+      45030
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1426 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      45031,
+      46598
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1475 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      46599,
+      48166
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1524 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      48167,
+      49734
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1573 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      49735,
+      51302
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1622 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      51303,
+      52870
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1671 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      52871,
+      54438
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1720 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      54439,
+      56006
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1769 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      56007,
+      57574
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1818 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      57575,
+      59142
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1867 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      59143,
+      60710
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1916 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      60711,
+      62278
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_1965 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      62279,
+      63846
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2014 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      63847,
+      65414
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2063 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      65415,
+      66982
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2112 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      66983,
+      68550
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2161 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      68551,
+      70118
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2210 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      70119,
+      71686
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2259 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      71687,
+      73254
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2308 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      73255,
+      74822
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2357 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      74823,
+      76390
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2406 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      76391,
+      77958
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2455 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      77959,
+      79526
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2504 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      79527,
+      81094
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2553 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      81095,
+      82662
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2602 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      82663,
+      84230
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2651 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      84231,
+      85798
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2700 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      85799,
+      87366
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2749 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      87367,
+      88934
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2798 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      88935,
+      90502
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2847 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      90503,
+      92070
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2896 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      92071,
+      93638
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2945 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      93639,
+      95206
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_2994 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      95207,
+      96774
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3043 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      96775,
+      98342
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3092 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      98343,
+      99910
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3141 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      99911,
+      101478
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3190 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      101479,
+      103046
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3239 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      103047,
+      104614
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3288 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      104615,
+      106182
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3337 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      106183,
+      107750
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3386 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      107751,
+      109318
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3435 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      109319,
+      110886
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3484 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      110887,
+      112454
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3533 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      112455,
+      114022
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3582 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      114023,
+      115590
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3631 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      115591,
+      117158
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3680 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      117159,
+      118726
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3729 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      118727,
+      120294
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3778 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      120295,
+      121862
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3827 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      121863,
+      123430
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3876 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      123431,
+      124998
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3925 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      124999,
+      126566
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_3974 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      126567,
+      128134
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4023 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      128135,
+      129702
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4072 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      129703,
+      131270
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4121 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      131271,
+      132838
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4170 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      132839,
+      134406
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4219 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      134407,
+      135974
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4268 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      135975,
+      137542
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4317 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      137543,
+      139110
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4366 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      139111,
+      140678
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4415 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      140679,
+      142246
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4464 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      142247,
+      143814
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4513 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      143815,
+      145382
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4562 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      145383,
+      146950
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4611 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      146951,
+      148518
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4660 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      148519,
+      150086
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4709 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      150087,
+      151654
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4758 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      151655,
+      153222
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4807 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      153223,
+      154790
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4856 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 455,
+    "range": [
+      154791,
+      156358
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4905 = "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Код",
+    "token_count": 442,
+    "range": [
+      156359,
+      157892
+    ],
+    "head": "```rust title=\"gen.rs\"\nlet value_4954 = "
+  },
+  {
+    "level": "section",
+    "heading_path": "Код",
+    "token_count": 8,
+    "range": null,
+    "head": "Код — Генерированный модуль:"
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 8,
+    "range": null,
+    "head": "Код — Генерированный модуль:"
+  }
+]

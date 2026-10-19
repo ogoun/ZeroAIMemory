@@ -1,0 +1,690 @@
+//! Чанкер Markdown (ТЗ §8.2).
+//!
+//! Порядок работы:
+//! 1. Собственный текст каждой секции H1–H3 (и преамбулы) — от конца строк
+//!    заголовка до начала следующей секции, так что текст подсекции не
+//!    повторяется в родителе. Frontmatter и строки заголовков в листы не входят.
+//! 2. Короткие секции (< `merge_below`) склеиваются со следующими соседями того
+//!    же родителя, пока сумма не дойдёт до `merge_below` (и не превысит
+//!    `target_max`). Путь склейки — путь первой секции; строки заголовков
+//!    присоединённых секций остаются в тексте: диапазон листа непрерывен.
+//! 3. Текст группы делится на блоки верхнего уровня по AST comrak. Блок кода,
+//!    таблица, список и цитата/callout — неделимые единицы, пока не длиннее
+//!    `hard_max`; длиннее — режутся по элементам (пункты, дочерние блоки) или
+//!    строкам, а заголовок блока (строка ограждения с info, шапка таблицы
+//!    с разделителем, маркер callout) повторяется в начале каждой следующей
+//!    части. Абзац длиннее `target_max` режется по предложениям. Последний
+//!    уровень дробления — слова, затем символы: `hard_max` соблюдается всегда.
+//! 4. Единицы жадно упаковываются в листы `target_min..=target_max`; лист,
+//!    не добравший `target_min`, может вырасти до `hard_max`.
+//! 5. Перекрытие: следующий лист той же группы начинается с последних
+//!    `overlap_sentences` предложений предыдущего, если тот кончается абзацем.
+//!    Перекрытие расширяет `range.start` назад, поэтому `src[range] == text`.
+//!
+//! Инвариант листа: `text == src[range]` либо `text == заголовок блока + src[range]`,
+//! где заголовок — целые строки исходника (с переводами строк документа).
+//! Счётчик токенов считается монотонным на подстроках.
+
+use std::ops::Range;
+
+use comrak::nodes::{AstNode, NodeValue};
+use comrak::{Arena, parse_document};
+use serde::Serialize;
+
+use crate::doc::Doc;
+use crate::levels::{L1_MAX_TOKENS, NOTE_L1_MAX_CHARS, fit_lines, l1_items, own_ranges, render};
+use crate::options::comrak_options;
+use crate::pos::LineIndex;
+use crate::sentences::split_sentences;
+
+/// Счётчик токенов для бюджетов чанкера.
+pub trait TokenCounter: Send + Sync {
+    /// Число токенов в `text`.
+    fn count(&self, text: &str) -> usize;
+    /// `true` — точный подсчёт токенизатором модели, `false` — оценка.
+    fn is_exact(&self) -> bool;
+}
+
+/// Оценка без токенизатора: `ceil(символы / 3,5)` (исследование 05 §10).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApproxCounter;
+
+impl TokenCounter for ApproxCounter {
+    fn count(&self, text: &str) -> usize {
+        // ceil(n / 3.5) = ceil(2n / 7) без плавающей точки
+        (text.chars().count() * 2).div_ceil(7)
+    }
+
+    fn is_exact(&self) -> bool {
+        false
+    }
+}
+
+/// Пороги чанкера (§8.2); значения по умолчанию подбираются на eval (§18.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkParams {
+    /// Нижняя граница размера листа, токенов.
+    pub target_min: usize,
+    /// Верхняя граница размера листа, токенов.
+    pub target_max: usize,
+    /// Предел размера любого листа, токенов.
+    pub hard_max: usize,
+    /// Секция короче — склеивается со следующей секцией того же родителя.
+    pub merge_below: usize,
+    /// Предложений перекрытия между соседними листами секции.
+    pub overlap_sentences: usize,
+}
+
+impl Default for ChunkParams {
+    fn default() -> Self {
+        Self {
+            target_min: 300,
+            target_max: 500,
+            hard_max: 800,
+            merge_below: 100,
+            overlap_sentences: 1,
+        }
+    }
+}
+
+impl ChunkParams {
+    /// Согласованные пороги: `1 ≤ target_max ≤ hard_max`, `target_min ≤ target_max`.
+    fn normalized(&self) -> Self {
+        let hard_max = self.hard_max.max(1);
+        let target_max = self.target_max.clamp(1, hard_max);
+        Self {
+            target_min: self.target_min.min(target_max),
+            target_max,
+            hard_max,
+            ..*self
+        }
+    }
+}
+
+/// Уровень чанка (колонка `chunks.level`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkLevel {
+    /// Листовой чанк — фрагмент исходника.
+    Chunk,
+    /// L1 секции H1–H2 из двух и более листов.
+    Section,
+    /// L1 всей заметки.
+    Note,
+}
+
+impl ChunkLevel {
+    /// Значение для колонки `chunks.level`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chunk => "chunk",
+            Self::Section => "section",
+            Self::Note => "note",
+        }
+    }
+}
+
+/// Чанк до записи в БД.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChunkDraft {
+    pub level: ChunkLevel,
+    /// Путь заголовков через `" > "`; у преамбулы и `Note` — пустой.
+    pub heading_path: String,
+    pub text: String,
+    /// Байты исходника для `Chunk`: `text == src[range]` или
+    /// `text == заголовок блока + src[range]`. У `Section` и `Note` — `None`.
+    pub range: Option<Range<usize>>,
+    /// Токены `text` по переданному счётчику.
+    pub token_count: usize,
+}
+
+/// Чанки заметки: листы в порядке документа, затем L1 секций, затем L1 заметки.
+/// Заметка без текста тела (только заголовки и frontmatter) даёт пустой список.
+/// `doc` — результат [`crate::parse`] того же `src`. Не паникует на любом входе.
+pub fn chunk_note(src: &str, doc: &Doc, p: &ChunkParams, tc: &dyn TokenCounter) -> Vec<ChunkDraft> {
+    let arena = Arena::new();
+    let root = parse_document(&arena, src, &comrak_options());
+    let li = LineIndex::new(src);
+    let ch = Chunker {
+        src,
+        p: p.normalized(),
+        tc,
+    };
+    let blocks = top_blocks(&li, root, doc.body_start, src.len());
+    let own = own_ranges(doc);
+
+    let mut leaves: Vec<(String, Leaf)> = Vec::new();
+    for g in ch.groups(doc, &own) {
+        let units = ch.units(g.range.clone(), &blocks);
+        let mut group = ch.pack(&units);
+        ch.add_overlap(&mut group);
+        leaves.extend(group.into_iter().map(|l| (g.path.clone(), l)));
+    }
+    if leaves.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<ChunkDraft> = leaves
+        .iter()
+        .map(|(path, l)| {
+            let text = ch.leaf_text(l.header.clone(), l.start, l.end);
+            ChunkDraft {
+                level: ChunkLevel::Chunk,
+                heading_path: path.clone(),
+                token_count: tc.count(&text),
+                text,
+                range: Some(l.start..l.end),
+            }
+        })
+        .collect();
+
+    let items = l1_items(src, doc, root);
+    for (k, s) in doc.sections.iter().enumerate() {
+        if !(1..=2).contains(&s.level) {
+            continue;
+        }
+        let n = leaves
+            .iter()
+            .filter(|(_, l)| s.range.contains(&l.core_start))
+            .count();
+        if n < 2 {
+            continue;
+        }
+        let slice: Vec<_> = items[k..]
+            .iter()
+            .take_while(|it| s.range.contains(&it.start))
+            .cloned()
+            .collect();
+        let text = fit_lines(&render(&slice), |t| tc.count(t) <= L1_MAX_TOKENS);
+        if !text.is_empty() {
+            out.push(level_draft(
+                ChunkLevel::Section,
+                s.path.join(" > "),
+                text,
+                tc,
+            ));
+        }
+    }
+    let text = fit_lines(&render(&items), |t| {
+        t.chars().count() <= NOTE_L1_MAX_CHARS && tc.count(t) <= L1_MAX_TOKENS
+    });
+    if !text.is_empty() {
+        out.push(level_draft(ChunkLevel::Note, String::new(), text, tc));
+    }
+    out
+}
+
+fn level_draft(
+    level: ChunkLevel,
+    heading_path: String,
+    text: String,
+    tc: &dyn TokenCounter,
+) -> ChunkDraft {
+    ChunkDraft {
+        level,
+        heading_path,
+        token_count: tc.count(&text),
+        text,
+        range: None,
+    }
+}
+
+/// Блок верхнего уровня по AST.
+#[derive(Debug)]
+struct Block {
+    /// Начало первой строки блока.
+    start: usize,
+    /// Абзац: режется по предложениям, даёт перекрытие.
+    prose: bool,
+    /// Конец заголовка блока (повторяется в частях), если он есть.
+    header_end: Option<usize>,
+    /// Начала строк элементов (пункты списка, дочерние блоки цитаты).
+    elems: Vec<usize>,
+}
+
+/// Блоки верхнего уровня тела, упорядоченные по началу.
+fn top_blocks<'a>(
+    li: &LineIndex,
+    root: &'a AstNode<'a>,
+    body_start: usize,
+    len: usize,
+) -> Vec<Block> {
+    let child_starts = |node: &'a AstNode<'a>| -> Vec<usize> {
+        node.children()
+            .map(|c| li.line_start(c.data().sourcepos.start.line))
+            .collect()
+    };
+    let mut out: Vec<Block> = Vec::new();
+    for node in root.children() {
+        let data = node.data();
+        let line = data.sourcepos.start.line;
+        let start = li.line_start(line);
+        if start < body_start || start >= len || out.last().is_some_and(|b| b.start >= start) {
+            continue;
+        }
+        let mut b = Block {
+            start,
+            prose: false,
+            header_end: None,
+            elems: Vec::new(),
+        };
+        match &data.value {
+            NodeValue::FrontMatter(_) => continue,
+            NodeValue::Paragraph => b.prose = true,
+            NodeValue::CodeBlock(cb) if cb.fenced => b.header_end = Some(li.line_end(line)),
+            // шапка и строка-разделитель
+            NodeValue::Table(_) => b.header_end = Some(li.line_end(line + 1)),
+            NodeValue::List(_) | NodeValue::BlockQuote | NodeValue::MultilineBlockQuote(_) => {
+                b.elems = child_starts(node);
+            }
+            NodeValue::Alert(_) => {
+                b.elems = child_starts(node);
+                b.header_end = Some(
+                    b.elems
+                        .first()
+                        .copied()
+                        .filter(|&h| h > start)
+                        .unwrap_or_else(|| li.line_end(line)),
+                );
+            }
+            _ => {}
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// Группа секций, режущаяся вместе.
+struct Group {
+    range: Range<usize>,
+    path: String,
+}
+
+/// Лист до сборки текста.
+#[derive(Debug, Clone)]
+struct Leaf {
+    /// Начало с учётом перекрытия.
+    start: usize,
+    end: usize,
+    /// Начало без перекрытия.
+    core_start: usize,
+    /// Повторяемый заголовок блока перед `src[start..end]`.
+    header: Option<Range<usize>>,
+    /// Начало абзаца, которым кончается лист (источник перекрытия).
+    last_para: Option<usize>,
+}
+
+/// Единица упаковки: непрерывный кусок исходника, единицы группы идут встык.
+#[derive(Debug)]
+struct Unit {
+    range: Range<usize>,
+    tokens: usize,
+    /// Заголовок блока, если лист начнётся с этой единицы.
+    header: Option<Range<usize>>,
+    /// Начало абзаца, если единица — абзац или его предложения.
+    para: Option<usize>,
+}
+
+/// Уровни дробления единицы, превышающей бюджет.
+#[derive(Debug, Clone, Copy)]
+enum Gran {
+    Lines,
+    Sentences,
+    Words,
+    Chars,
+}
+
+const BLOCK_STEPS: &[Gran] = &[Gran::Lines, Gran::Words, Gran::Chars];
+const PROSE_STEPS: &[Gran] = &[Gran::Words, Gran::Chars];
+
+struct Chunker<'s> {
+    src: &'s str,
+    p: ChunkParams,
+    tc: &'s dyn TokenCounter,
+}
+
+impl Chunker<'_> {
+    fn count(&self, r: Range<usize>) -> usize {
+        self.tc.count(&self.src[r])
+    }
+
+    fn leaf_text(&self, header: Option<Range<usize>>, start: usize, end: usize) -> String {
+        match header {
+            Some(h) => format!("{}{}", &self.src[h], &self.src[start..end]),
+            None => self.src[start..end].to_string(),
+        }
+    }
+
+    /// Группы секций с непустым собственным текстом, с учётом склейки коротких.
+    fn groups(&self, doc: &Doc, own: &[Range<usize>]) -> Vec<Group> {
+        let tokens: Vec<Option<usize>> = own
+            .iter()
+            .map(|r| {
+                let t = self.src[r.clone()].trim();
+                (!t.is_empty()).then(|| self.tc.count(t))
+            })
+            .collect();
+        let secs = &doc.sections;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < secs.len() {
+            let Some(mut total) = tokens[i] else {
+                i += 1;
+                continue;
+            };
+            let first = i;
+            while total < self.p.merge_below
+                && i + 1 < secs.len()
+                && siblings(&secs[i], &secs[i + 1])
+            {
+                let Some(t) = tokens[i + 1] else { break };
+                if total + t > self.p.target_max {
+                    break;
+                }
+                total += t;
+                i += 1;
+            }
+            out.push(Group {
+                range: own[first].start..own[i].end,
+                path: secs[first].path.join(" > "),
+            });
+            i += 1;
+        }
+        out
+    }
+
+    /// Единицы группы: блоки верхнего уровня, при необходимости раздробленные.
+    fn units(&self, r: Range<usize>, blocks: &[Block]) -> Vec<Unit> {
+        let lo = blocks.partition_point(|b| b.start < r.start);
+        let inner: Vec<&Block> = blocks[lo..]
+            .iter()
+            .take_while(|b| b.start < r.end)
+            .collect();
+        let mut bounds: Vec<(usize, Option<&Block>)> = Vec::with_capacity(inner.len() + 1);
+        if inner.first().is_none_or(|b| b.start > r.start) {
+            bounds.push((r.start, None));
+        }
+        bounds.extend(inner.iter().map(|b| (b.start, Some(*b))));
+        let mut out = Vec::new();
+        for (k, &(start, block)) in bounds.iter().enumerate() {
+            let end = bounds.get(k + 1).map_or(r.end, |n| n.0);
+            self.atom_units(start..end, block, &mut out);
+        }
+        out
+    }
+
+    fn atom_units(&self, r: Range<usize>, block: Option<&Block>, out: &mut Vec<Unit>) {
+        let tokens = self.count(r.clone());
+        let prose = block.is_some_and(|b| b.prose);
+        let fits = if prose {
+            tokens <= self.p.target_max
+        } else {
+            tokens <= self.p.hard_max
+        };
+        if fits || self.src[r.clone()].trim().is_empty() {
+            out.push(Unit {
+                range: r.clone(),
+                tokens,
+                header: None,
+                para: prose.then_some(r.start),
+            });
+            return;
+        }
+        if prose {
+            for t in self.split_by(r.clone(), Gran::Sentences) {
+                let mut pieces = Vec::new();
+                self.refine(t, PROSE_STEPS, None, &mut pieces);
+                out.extend(pieces.into_iter().map(|p| Unit {
+                    tokens: self.count(p.clone()),
+                    range: p,
+                    header: None,
+                    para: Some(r.start),
+                }));
+            }
+            return;
+        }
+
+        // длинный блок: заголовок повторяется, если он не съедает больше половины бюджета
+        let header = block
+            .and_then(|b| b.header_end)
+            .filter(|&h| h > r.start && h < r.end)
+            .map(|h| r.start..h)
+            .filter(|h| 2 * self.count(h.clone()) <= self.p.hard_max);
+        let body_start = header.as_ref().map_or(r.start, |h| h.end);
+        let elems = block.map_or(&[][..], |b| &b.elems[..]);
+        let elem_tiles = if elems.is_empty() {
+            line_tiles(self.src, body_start..r.end)
+        } else {
+            tiles(body_start..r.end, elems.iter().copied())
+        };
+        let mut pieces = Vec::new();
+        for t in elem_tiles {
+            self.refine(t, BLOCK_STEPS, header.as_ref(), &mut pieces);
+        }
+        for (k, p) in pieces.into_iter().enumerate() {
+            // первая часть начинается с самого заголовка — без повтора
+            let (range, head) = match (k, &header) {
+                (0, Some(h)) => (h.start..p.end, None),
+                _ => (p, header.clone()),
+            };
+            out.push(Unit {
+                tokens: self.count(range.clone()),
+                range,
+                header: head,
+                para: None,
+            });
+        }
+    }
+
+    /// Дробит `r`, пока `header + src[r]` не уложится в `hard_max`; части идут встык.
+    fn refine(
+        &self,
+        r: Range<usize>,
+        steps: &[Gran],
+        header: Option<&Range<usize>>,
+        out: &mut Vec<Range<usize>>,
+    ) {
+        let fits = match header {
+            Some(h) => self
+                .tc
+                .count(&self.leaf_text(Some(h.clone()), r.start, r.end)),
+            None => self.count(r.clone()),
+        } <= self.p.hard_max;
+        let Some((&step, rest)) = steps.split_first() else {
+            out.push(r);
+            return;
+        };
+        if fits {
+            out.push(r);
+            return;
+        }
+        let subs = self.split_by(r.clone(), step);
+        if subs.len() <= 1 {
+            self.refine(r, rest, header, out);
+        } else {
+            for s in subs {
+                self.refine(s, steps, header, out);
+            }
+        }
+    }
+
+    fn split_by(&self, r: Range<usize>, step: Gran) -> Vec<Range<usize>> {
+        let s = &self.src[r.clone()];
+        match step {
+            Gran::Lines => line_tiles(self.src, r),
+            Gran::Sentences => tiles(
+                r.clone(),
+                split_sentences(s).into_iter().map(|x| r.start + x.start),
+            ),
+            Gran::Words => {
+                let mut prev_ws = false;
+                let starts = s.char_indices().filter_map(|(i, c)| {
+                    let start = prev_ws && !c.is_whitespace();
+                    prev_ws = c.is_whitespace();
+                    start.then_some(r.start + i)
+                });
+                tiles(r.clone(), starts.collect::<Vec<_>>())
+            }
+            Gran::Chars => {
+                let mut mid = r.start + r.len() / 2;
+                while !self.src.is_char_boundary(mid) {
+                    mid += 1;
+                }
+                tiles(r, [mid])
+            }
+        }
+    }
+
+    /// Жадная упаковка единиц группы в листы.
+    ///
+    /// Балансировка: цель листа — `ceil(T / ceil(T / target_max))` в пределах
+    /// `target_min..=target_max`, где `T` — сумма группы. Так 620 токенов дают
+    /// два листа около 310, а не 500 и короткий хвост в 120.
+    fn pack(&self, units: &[Unit]) -> Vec<Leaf> {
+        let p = &self.p;
+        let total: usize = units.iter().map(|u| u.tokens).sum();
+        let parts = total.div_ceil(p.target_max).max(1);
+        let goal = total.div_ceil(parts).clamp(p.target_min, p.target_max);
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < units.len() {
+            let header = units[i].header.clone();
+            let mut est = header.as_ref().map_or(0, |h| self.count(h.clone())) + units[i].tokens;
+            let mut j = i + 1;
+            while let Some(u) = units.get(j) {
+                let next = est + u.tokens;
+                // лист закрывается, если единица перешагнула бы цель больше чем наполовину
+                let full = next > p.target_max || est + u.tokens / 2 > goal;
+                if next > p.hard_max || (est >= p.target_min && full) {
+                    break;
+                }
+                est = next;
+                j += 1;
+            }
+            // оценка — сумма по единицам; точный подсчёт может снять хвост
+            while j > i + 1 {
+                let text =
+                    self.leaf_text(header.clone(), units[i].range.start, units[j - 1].range.end);
+                if self.tc.count(&text) <= self.p.hard_max {
+                    break;
+                }
+                j -= 1;
+            }
+            if let Some(leaf) = self.make_leaf(header, &units[i..j]) {
+                out.push(leaf);
+            }
+            i = j;
+        }
+        // хвост короче половины target_min (остаток балансировки после повторённых
+        // заголовков и округлений) присоединяется к предыдущему листу в пределах hard_max
+        if let [.., prev, last] = &out[..] {
+            let short =
+                2 * self
+                    .tc
+                    .count(&self.leaf_text(last.header.clone(), last.start, last.end))
+                    < p.target_min;
+            let merged = self.leaf_text(prev.header.clone(), prev.start, last.end);
+            if short && self.tc.count(&merged) <= p.hard_max {
+                let (end, last_para) = (last.end, last.last_para);
+                out.pop();
+                if let Some(prev) = out.last_mut() {
+                    prev.end = end;
+                    prev.last_para = last_para;
+                }
+            }
+        }
+        out
+    }
+
+    /// Лист из единиц без краевых пустых строк и хвостовых пробелов.
+    fn make_leaf(&self, header: Option<Range<usize>>, units: &[Unit]) -> Option<Leaf> {
+        let (first, last) = (units.first()?, units.last()?);
+        let (mut start, mut end) = (first.range.start, last.range.end);
+        let s = &self.src[start..end];
+        end = start + s.trim_end().len();
+        let lead = s.len() - s.trim_start().len();
+        if start + lead >= end {
+            return None;
+        }
+        // отступ первой строки сохраняется: сдвиг только на целые пустые строки
+        let line = self.src[start..start + lead]
+            .rfind(['\n', '\r'])
+            .map_or(start, |k| start + k + 1);
+        start = line;
+        Some(Leaf {
+            start,
+            end,
+            core_start: start,
+            header,
+            last_para: last.para,
+        })
+    }
+
+    /// Перекрытие: лист начинается с последних предложений предыдущего листа группы.
+    fn add_overlap(&self, leaves: &mut [Leaf]) {
+        let want = self.p.overlap_sentences;
+        if want == 0 {
+            return;
+        }
+        for k in 1..leaves.len() {
+            let (prev, cur) = (&leaves[k - 1], &leaves[k]);
+            if cur.header.is_some() {
+                continue;
+            }
+            // окно — только предыдущий лист: предложение, начатое раньше, не подходит,
+            // а сегментация длинного абзаца с начала была бы квадратичной
+            let Some(from) = prev
+                .last_para
+                .map(|p| p.max(prev.core_start))
+                .filter(|&p| p <= prev.end)
+            else {
+                continue;
+            };
+            let sentences = split_sentences(&self.src[from..prev.end]);
+            let n = sentences.len();
+            let found = (1..=want.min(n)).rev().find_map(|m| {
+                let start = from + sentences[n - m].start;
+                let ok = start > prev.core_start && self.count(start..cur.end) <= self.p.hard_max;
+                ok.then_some(start)
+            });
+            if let Some(start) = found {
+                leaves[k].start = start;
+            }
+        }
+    }
+}
+
+/// Соседи одного родителя: одинаковый уровень и путь без последнего заголовка.
+fn siblings(a: &crate::doc::Section, b: &crate::doc::Section) -> bool {
+    a.level > 0
+        && a.level == b.level
+        && a.path.len() == b.path.len()
+        && a.path[..a.path.len().saturating_sub(1)] == b.path[..b.path.len().saturating_sub(1)]
+}
+
+/// Разбиение `r` встык по точкам `starts` (лишние и вне `r` пропускаются).
+fn tiles(r: Range<usize>, starts: impl IntoIterator<Item = usize>) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut cur = r.start;
+    for s in starts {
+        if s > cur && s < r.end {
+            out.push(cur..s);
+            cur = s;
+        }
+    }
+    if cur < r.end || out.is_empty() {
+        out.push(cur..r.end);
+    }
+    out
+}
+
+/// Разбиение `r` по строкам (`\n`, `\r\n`, одиночный `\r`).
+fn line_tiles(src: &str, r: Range<usize>) -> Vec<Range<usize>> {
+    let b = src.as_bytes();
+    let starts = (r.start..r.end).filter_map(|i| match b[i] {
+        b'\n' => Some(i + 1),
+        b'\r' if b.get(i + 1) != Some(&b'\n') => Some(i + 1),
+        _ => None,
+    });
+    tiles(r.clone(), starts.collect::<Vec<_>>())
+}

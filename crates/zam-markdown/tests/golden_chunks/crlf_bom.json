@@ -1,0 +1,36 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "Заголовок",
+    "token_count": 10,
+    "range": [
+      27,
+      88
+    ],
+    "head": "Первый абзац. Второе предложение."
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Заголовок > Подраздел",
+    "token_count": 12,
+    "range": [
+      117,
+      171
+    ],
+    "head": "```\r\ncode line\r\n```\r\n\r\nТекст после кода."
+  },
+  {
+    "level": "section",
+    "heading_path": "Заголовок",
+    "token_count": 17,
+    "range": null,
+    "head": "Заголовок — Первый абзац.\n  Подраздел — "
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 17,
+    "range": null,
+    "head": "Заголовок — Первый абзац.\n  Подраздел — "
+  }
+]

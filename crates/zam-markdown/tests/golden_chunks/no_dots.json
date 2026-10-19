@@ -1,0 +1,59 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "",
+    "token_count": 336,
+    "range": [
+      0,
+      1890
+    ],
+    "head": "Текст слово1 слово2 слово3 слово4 слово5"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "",
+    "token_count": 360,
+    "range": [
+      1891,
+      3850
+    ],
+    "head": "слово143 слово144 слово145 слово146 слов"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "",
+    "token_count": 360,
+    "range": [
+      3851,
+      5810
+    ],
+    "head": "слово283 слово284 слово285 слово286 слов"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "",
+    "token_count": 360,
+    "range": [
+      5811,
+      7770
+    ],
+    "head": "слово423 слово424 слово425 слово426 слов"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "",
+    "token_count": 355,
+    "range": [
+      7771,
+      9702
+    ],
+    "head": "слово563 слово564 слово565 слово566 слов"
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 58,
+    "range": null,
+    "head": "Текст слово1 слово2 слово3 слово4 слово5"
+  }
+]

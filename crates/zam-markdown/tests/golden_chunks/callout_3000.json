@@ -1,0 +1,86 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "Предупреждение",
+    "token_count": 495,
+    "range": [
+      32,
+      3009
+    ],
+    "head": "> [!WARNING]\n> Абзац 1, строка 1: callou"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Предупреждение",
+    "token_count": 496,
+    "range": [
+      3010,
+      5977
+    ],
+    "head": "> [!WARNING]\n> Абзац 6, строка 1: callou"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Предупреждение",
+    "token_count": 400,
+    "range": [
+      5978,
+      8361
+    ],
+    "head": "> [!WARNING]\n> Абзац 11, строка 1: callo"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Предупреждение",
+    "token_count": 400,
+    "range": [
+      8362,
+      10745
+    ],
+    "head": "> [!WARNING]\n> Абзац 15, строка 1: callo"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Предупреждение",
+    "token_count": 400,
+    "range": [
+      10746,
+      13129
+    ],
+    "head": "> [!WARNING]\n> Абзац 19, строка 1: callo"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Предупреждение",
+    "token_count": 400,
+    "range": [
+      13130,
+      15513
+    ],
+    "head": "> [!WARNING]\n> Абзац 23, строка 1: callo"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Предупреждение",
+    "token_count": 406,
+    "range": [
+      15514,
+      17927
+    ],
+    "head": "> [!WARNING]\n> Абзац 27, строка 1: callo"
+  },
+  {
+    "level": "section",
+    "heading_path": "Предупреждение",
+    "token_count": 11,
+    "range": null,
+    "head": "Предупреждение — Текст после callout."
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 11,
+    "range": null,
+    "head": "Предупреждение — Текст после callout."
+  }
+]

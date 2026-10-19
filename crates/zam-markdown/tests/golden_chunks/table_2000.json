@@ -1,0 +1,396 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 458,
+    "range": [
+      18,
+      2056
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 472,
+    "range": [
+      2057,
+      4080
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 472,
+    "range": [
+      4081,
+      6075
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      6076,
+      8019
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      8020,
+      9963
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      9964,
+      11907
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      11908,
+      13851
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      13852,
+      15795
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      15796,
+      17739
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      17740,
+      19683
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      19684,
+      21627
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      21628,
+      23571
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      23572,
+      25515
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      25516,
+      27459
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      27460,
+      29403
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      29404,
+      31347
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      31348,
+      33291
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 461,
+    "range": [
+      33292,
+      35235
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 485,
+    "range": [
+      35236,
+      37263
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 492,
+    "range": [
+      37264,
+      39315
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 492,
+    "range": [
+      39316,
+      41367
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 492,
+    "range": [
+      41368,
+      43419
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 492,
+    "range": [
+      43420,
+      45471
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 492,
+    "range": [
+      45472,
+      47523
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 492,
+    "range": [
+      47524,
+      49575
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 492,
+    "range": [
+      49576,
+      51627
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 459,
+    "range": [
+      51628,
+      53529
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      53530,
+      55401
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      55402,
+      57273
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      57274,
+      59145
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      59146,
+      61017
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      61018,
+      62889
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      62890,
+      64761
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      64762,
+      66633
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      66634,
+      68505
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      68506,
+      70377
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 453,
+    "range": [
+      70378,
+      72249
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Таблица",
+    "token_count": 489,
+    "range": [
+      72250,
+      74277
+    ],
+    "head": "| id | имя | значение |\n|---:|-----|----"
+  },
+  {
+    "level": "section",
+    "heading_path": "Таблица",
+    "token_count": 2,
+    "range": null,
+    "head": "Таблица"
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 2,
+    "range": null,
+    "head": "Таблица"
+  }
+]
