@@ -248,7 +248,8 @@ fn protected_spans(text: &str, lines: &[Line], fenced: &[bool]) -> Vec<Range<usi
                     break;
                 }
                 q += m;
-            } else if text[q..].starts_with("\n\n") || text[q..].starts_with("\n\r\n") {
+            // побайтно: `q` идёт по байтам и может стоять внутри многобайтового символа
+            } else if b[q..].starts_with(b"\n\n") || b[q..].starts_with(b"\n\r\n") {
                 break;
             } else {
                 q += 1;
@@ -412,6 +413,23 @@ fn starts_with_initial(b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Незакрытая обратная кавычка перед многобайтовым символом: поиск закрывающей серии
+    /// идёт по байтам и не должен резать UTF-8 (паника на корпусе eval, тире после `` ` ``).
+    #[test]
+    fn unclosed_backtick_before_multibyte_char() {
+        for text in [
+            "Флаг `--target — это тройка. Второе предложение.",
+            "a `b—c\n\nd. Ещё.",
+            "`—",
+        ] {
+            let spans = split_sentences(text);
+            assert!(!spans.is_empty(), "{text}");
+            for r in spans {
+                assert!(text.is_char_boundary(r.start) && text.is_char_boundary(r.end));
+            }
+        }
+    }
 
     #[test]
     fn abbrev_matching() {
