@@ -65,10 +65,12 @@ pub async fn run(cfg: ServerConfig, args: ReindexArgs) -> anyhow::Result<String>
     zam_store::set_token_counter(Arc::new(embedder.token_counter()));
     let system = SystemStore::open(&dd)?;
     let users = UserDbs::new(dd.users_dir());
-    let (user, space, notes) =
-        reindex_scope(&system, &users, args.user.as_deref(), args.space.as_deref())
-            .await
-            .map_err(api_err)?;
+    // база, указанная явно, должна открыться; при обходе всех повреждённые пропускаются
+    // (reindex отметит их исключёнными в system.db, отчёт их перечислит)
+    let scope = reindex_scope(&system, &users, args.user.as_deref(), args.space.as_deref())
+        .await
+        .map_err(api_err)?;
+    let (user, space, notes) = (scope.user, scope.space, scope.job_count);
 
     let exe_dir = crate::qdrant::exe_dir()?;
     let Some(sc) = cfg.qdrant.supervisor_config(&exe_dir)? else {
@@ -89,11 +91,13 @@ pub async fn run(cfg: ServerConfig, args: ReindexArgs) -> anyhow::Result<String>
             vector: &vector,
             model_id: embedder.model_id(),
             dim: embedder.dim(),
+            // L0 папок, которых нет в кэше, — моделью сразу (воркера здесь нет)
+            embedder: Some(Arc::new(crate::ml::EmbedderAdapter(embedder.clone()))),
         };
         let rep = reindex(&ctx, &req).await?;
-        // все базы пересобраны: стёртое хранилище восстановлено, флаг не нужен
-        if sup.storage_rebuilt() && (user.is_none() || rep.recreated) && rep.failed_users.is_empty()
-        {
+        // все базы пересобраны (неоткрывшиеся отмечены исключёнными и получат reindex,
+        // когда откроются): стёртое хранилище восстановлено, флаг не нужен
+        if sup.storage_rebuilt() && (user.is_none() || rep.recreated) {
             sup.ack_storage_rebuilt()?;
         }
         system
@@ -174,7 +178,10 @@ fn report(r: &ReindexReport, model: &str) -> String {
         ));
     }
     for (u, e) in &r.failed_users {
-        out.push_str(&format!("\nбаза пользователя {u} не обработана: {e}"));
+        out.push_str(&format!(
+            "\nбаза пользователя {u} не обработана и исключена из пересборки ({e}); \
+             после её восстановления сервер поставит reindex сам"
+        ));
     }
     out
 }

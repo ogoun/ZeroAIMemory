@@ -6,7 +6,7 @@
 //! - **из кэша** (по умолчанию): точки области удаляются (`delete_scope`), затем чанки
 //!   живых индексируемых заметок читаются страницами, их эмбеддинги берутся из
 //!   `embeddings` по `chunks.embed_key` и пишутся в Qdrant пачками по 256 точек
-//!   (`wait=true`, до 4 запросов одновременно; следующая страница читается, пока пишется
+//!   (`wait=true`, до [`PARALLEL_WRITES`] = 8 запросов одновременно; следующая страница читается, пока пишется
 //!   текущая). Заметка, у которой в кэше нет хотя бы одного чанка, получает
 //!   задание `upsert` (инференс воркером). Точки папок — из кэша по L0 папки.
 //! - **полный** (`full`): `enqueue_reindex` — перечанковка и задания для всех заметок
@@ -19,25 +19,28 @@
 //! До удаления точек в базе пользователя ставится отметка `reindex_pending`
 //! ([`mark_reindex`]), после восстановления — снимается: прерванный reindex повторяется
 //! воркером при следующем запуске. После пересборки всей базы пользователя — сборка мусора
-//! `embeddings` ([`gc_embeddings`]) пачками.
+//! `embeddings` ([`gc_embeddings`]) пачками. Базы, которые не открылись, отмечаются в
+//! `system.db` исключёнными: воркер поставит им reindex, когда они снова откроются.
 //!
 //! Выполняется воркером (последовательно с заданиями индексации: точки узла не
 //! переписываются параллельно) или командой `zam-server reindex` на остановленном сервере.
 //! В лог — только счётчики.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use zam_core::Id;
 use zam_store::{
-    Db, Embedding, ReindexNote, StoreError, SystemStore, UserDbs, enqueue_reindex, enqueue_upserts,
-    finish_reindexed, folders_for_index, gc_embeddings, get_embeddings, mark_reindex, reindex_page,
+    Db, Embedding, IndexFolder, ReindexNote, StoreError, SystemStore, UserDbs,
+    adopt_owned_embeddings, enqueue_reindex, enqueue_upserts, finish_reindexed, folders_for_index,
+    gc_embeddings, get_embeddings, mark_reindex, put_owned_embeddings, reindex_page,
 };
 
 use crate::worker::{chunk_point, folder_embed, folder_point};
-use crate::{IndexError, IndexPoint, VectorFilter, VectorIndex};
+use crate::{IndexError, IndexPoint, PassageEmbedder, VectorFilter, VectorIndex};
 
 /// Заметок на страницу чтения из SQLite.
 const PAGE_NOTES: usize = 256;
@@ -64,7 +67,7 @@ pub struct ReindexRequest {
 
 impl ReindexRequest {
     /// Отметка `reindex_pending` базы: режим и пространство.
-    fn spec(&self, space: Option<Id>) -> String {
+    pub(crate) fn spec(&self, space: Option<Id>) -> String {
         serde_json::json!({ "full": self.full, "space": space.map(|s| s.to_string()) }).to_string()
     }
 
@@ -93,8 +96,10 @@ pub struct ReindexReport {
     pub folders: u64,
     /// Заметок без эмбеддингов в кэше (для них поставлены задания).
     pub misses: u64,
-    /// Папок с L0 без эмбеддинга в кэше (точка появится при следующей свёртке).
+    /// Папок с L0 без эмбеддинга в кэше и без модели в контексте (точку построит свёртка).
     pub folder_misses: u64,
+    /// Эти папки `(пользователь, папка)`: воркер ставит им свёртку L0.
+    pub missed_folders: Vec<(Id, Id)>,
     /// Поставлено заданий индексации.
     pub jobs: u64,
     /// Удалено строк кэша сборкой мусора.
@@ -118,6 +123,9 @@ pub struct ReindexCtx<'a> {
     /// `model_id` текущей модели (ключ кэша `embeddings` и метаданные коллекции).
     pub model_id: &'a str,
     pub dim: usize,
+    /// Модель для L0 папок, которых нет в кэше (CLI); `None` — их свёртку ставит воркер.
+    /// Чанки заметок моделью не считаются никогда (промахи — задания).
+    pub embedder: Option<Arc<dyn PassageEmbedder>>,
 }
 
 /// Ошибка базы пользователя — в отчёт, ошибка Qdrant — наверх.
@@ -212,6 +220,14 @@ pub async fn reindex(
                 rep.failed_users.push((u, e.to_string()));
             }
             Err(UserFail::Vector(e)) => return Err(e),
+        }
+    }
+    // базы, которые не открылись или не пересобрались: отметка в system.db переживает
+    // перезапуск, воркер поставит им reindex, когда база снова откроется (точек в новой
+    // коллекции у них нет)
+    for (u, e) in &rep.failed_users {
+        if let Err(se) = ctx.system.index_skip(*u, e, 1).await {
+            tracing::warn!(user = %u, error = %se, "отметка исключённой базы не записана");
         }
     }
     rep.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -314,12 +330,39 @@ async fn cache_user(
         .collect();
     let embs = get_embeddings(db, ctx.model_id, &keys).await?;
     let mut fpts = Vec::new();
-    for (f, (_, key)) in folders.iter().zip(&embedded) {
-        match embs.get(key) {
-            Some(e) => fpts.push(folder_point(user, f, e.clone(), key.clone())),
-            None => rep.folder_misses += 1,
+    let mut missed: Vec<(&IndexFolder, &(String, String))> = Vec::new();
+    for (f, e) in folders.iter().zip(&embedded) {
+        match embs.get(&e.1) {
+            Some(v) => {
+                // строка до v5 (без владельца) — теперь папки, иначе её снимет сборка мусора
+                adopt_owned_embeddings(db, ctx.model_id, f.node_id, std::slice::from_ref(&e.1))
+                    .await?;
+                fpts.push(folder_point(user, f, v.clone(), e.1.clone()));
+            }
+            None => missed.push((f, e)),
         }
     }
+    // L0 папки нет в кэше: с моделью (CLI) — эмбеддинг сразу, иначе свёртку пересчитает
+    // воркер ([`ReindexReport::missed_folders`])
+    if let (Some(model), false) = (&ctx.embedder, missed.is_empty()) {
+        let inputs: Vec<String> = missed.iter().map(|(_, e)| e.0.clone()).collect();
+        let model = model.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+            model.embed_passages(&refs)
+        })
+        .await
+        .map_err(|e| IndexError::Other(format!("поток инференса: {e}")))?
+        .map_err(IndexError::Other)?;
+        for ((f, e), v) in missed.drain(..).zip(out) {
+            put_owned_embeddings(db, ctx.model_id, f.node_id, vec![(e.1.clone(), v.clone())])
+                .await?;
+            fpts.push(folder_point(user, f, v, e.1.clone()));
+        }
+    }
+    rep.folder_misses += missed.len() as u64;
+    rep.missed_folders
+        .extend(missed.iter().map(|(f, _)| (user, f.node_id)));
     rep.folders += fpts.len() as u64;
     write_points(ctx.vector, fpts).await?;
     Ok(())

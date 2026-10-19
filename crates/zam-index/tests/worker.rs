@@ -125,10 +125,24 @@ impl Env {
 
     /// Воркер с заданным периодом сборки мусора кэша.
     fn spawn_gc(&self, vector: Arc<dyn VectorIndex>, gc_interval: Duration) -> WorkerHandle {
+        self.spawn_full(self.users.clone(), vector, gc_interval)
+    }
+
+    /// Воркер со своим кэшем баз (файлы баз закрываются вместе с ним).
+    fn spawn_on(&self, users: UserDbs) -> WorkerHandle {
+        self.spawn_full(users, self.vector.clone(), Duration::from_millis(300))
+    }
+
+    fn spawn_full(
+        &self,
+        users: UserDbs,
+        vector: Arc<dyn VectorIndex>,
+        gc_interval: Duration,
+    ) -> WorkerHandle {
         WorkerHandle::spawn(
             WorkerDeps {
                 system: self.system.clone(),
-                users: self.users.clone(),
+                users,
                 embedder: self.fake.clone(),
                 vector,
                 supervisor: None,
@@ -195,12 +209,24 @@ impl Env {
             .unwrap()
     }
 
-    /// Ждёт покоя воркера: заданий нет (ни в очереди, ни в работе) и свёрток L0 не ждёт
-    /// ни одна папка — после этого модель без новых записей не вызывается.
+    /// Ждёт покоя воркера: заданий нет (ни в очереди, ни в работе), пачка (с auto-L0 после
+    /// закрытия заданий) не обрабатывается и свёрток L0 не ждёт ни одна папка — после
+    /// этого модель без новых записей не вызывается.
     async fn quiet(&self, w: &WorkerHandle) {
         self.until("воркер в покое", async || {
             let st = job_stats(&self.db).await.unwrap();
-            st.queued == 0 && st.running == 0 && w.status().rollups_pending == 0
+            let ws = w.status();
+            st.queued == 0 && st.running == 0 && !ws.batch_running && ws.rollups_pending == 0
+        })
+        .await;
+    }
+
+    /// [`Env::quiet`] по базе `db` (другого пользователя).
+    async fn quiet_on(&self, w: &WorkerHandle, db: &Db) {
+        self.until("воркер в покое", async || {
+            let st = job_stats(db).await.unwrap();
+            let ws = w.status();
+            st.queued == 0 && st.running == 0 && !ws.batch_running && ws.rollups_pending == 0
         })
         .await;
     }
@@ -672,6 +698,14 @@ async fn reindex_from_cache_without_inference() {
     })
     .await
     .unwrap();
+    // L0 папки docs тоже пропал из кэша (как строка до v5, снятая сборкой мусора)
+    let docs = get_node(&e.db, a).await.unwrap().parent_id.unwrap();
+    e.db.write(move |tx| {
+        tx.execute("DELETE FROM embeddings WHERE owner = ?1", [docs])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
     put_embeddings(
         &e.db,
         model,
@@ -705,7 +739,9 @@ async fn reindex_from_cache_without_inference() {
             },
         )
         .await;
-    assert_eq!((rep.nodes, rep.misses, rep.jobs, rep.folders), (2, 1, 1, 1));
+    assert_eq!((rep.nodes, rep.misses, rep.jobs, rep.folders), (2, 1, 1, 0));
+    assert_eq!(rep.folder_misses, 1);
+    assert_eq!(rep.missed_folders.len(), 1);
     assert_eq!(rep.points, e.chunks(a).await + e.chunks(r).await);
     assert!(rep.gc_deleted >= 1, "{rep:?}");
     assert!(
@@ -715,14 +751,16 @@ async fn reindex_from_cache_without_inference() {
             .is_empty()
     );
     assert_eq!(pending_reindex(&e.db).await.unwrap(), None);
-    // b — воркером, инференс только для пропавшего чанка
+    // b — воркером (инференс только для пропавшего чанка), точка папки — свёрткой
+    // (инференс L0 папки)
     e.indexed(b).await;
-    e.until("точки b", async || {
+    e.until("точки b и папки", async || {
         e.count(None, Some("docs/b"), &[]).await == e.chunks(b).await
+            && e.count(None, Some("docs"), &["folder"]).await == 1
     })
     .await;
-    assert_eq!(w.embedded_texts(), before + 1);
-    assert_eq!(e.count(None, Some("docs"), &["folder"]).await, 1);
+    e.quiet(&w).await;
+    assert_eq!(w.embedded_texts(), before + 2);
     w.shutdown().await;
 }
 
@@ -795,6 +833,26 @@ async fn interrupted_reindex_is_resumed_on_start() {
     let rep = e.reindexed(&w, None).await;
     assert_eq!(rep.nodes, 1);
     assert_eq!(e.count(None, Some("a"), &[]).await, e.chunks(a).await);
+    assert_eq!(pending_reindex(&e.db).await.unwrap(), None);
+    assert_eq!(w.embedded_texts(), 0);
+    w.shutdown().await;
+
+    // прерван при чужой модели коллекции: ворота заданий закрыты, но отметка читается
+    // при запуске, reindex пересоздаёт коллекцию
+    e.vector.drop_all().await.unwrap();
+    e.vector.ensure("other/model@ffff", DIM).await.unwrap();
+    mark_reindex(&e.db, Some("{\"full\":false,\"space\":null}".into()))
+        .await
+        .unwrap();
+    let w = e.spawn();
+    let rep = e.reindexed(&w, None).await;
+    assert!(rep.recreated);
+    assert_eq!(e.count(None, Some("a"), &[]).await, e.chunks(a).await);
+    e.until("канал включён", async || {
+        let st = w.status();
+        st.vector_ready && st.model_mismatch.is_none()
+    })
+    .await;
     assert_eq!(pending_reindex(&e.db).await.unwrap(), None);
     assert_eq!(w.embedded_texts(), 0);
     w.shutdown().await;
@@ -946,6 +1004,7 @@ async fn bench_reindex_from_embeddings() {
         vector: e.vector.as_ref(),
         model_id: MODEL_B,
         dim: BENCH_DIM,
+        embedder: None,
     };
     let req = ReindexRequest {
         user: Some(e.user),
@@ -973,4 +1032,112 @@ async fn bench_reindex_from_embeddings() {
             .await,
         total
     );
+}
+
+/// Исключённая из пересборки база (п. 2 ревью): отметка в `system.db` переживает
+/// перезапуск; после восстановления файла базы воркер сам ставит ей reindex из кэша —
+/// точки возвращаются без инференса, отметка снимается.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skipped_db_survives_restart_and_is_reindexed_after_restore() {
+    let e = env("skiprst").await;
+    let b = e.system.create_user("b", false).await.unwrap().id;
+    let file = e.users_dir.join(format!("{b}.db"));
+    let keep = e.users_dir.join(format!("{b}.keep"));
+    let b_points = async || {
+        e.vector
+            .count(&VectorFilter {
+                user_id: b,
+                space_ids: vec![],
+                path_prefix: None,
+                levels: vec![],
+            })
+            .await
+            .unwrap()
+    };
+    // b индексируется воркером на отдельном кэше баз: файл закроется вместе с ним
+    let pts = {
+        let users = UserDbs::new(e.users_dir.clone());
+        let db = users.get(b).await.unwrap();
+        let k = list_spaces(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind == SpaceKind::Knowledge)
+            .unwrap()
+            .id;
+        let n = create_note(
+            &db,
+            NewNote {
+                space_id: k,
+                path: NodePath::parse("bn").unwrap(),
+                content: NOTE.into(),
+                l0: None,
+                attrib: Attribution::new(AuthorKind::Agent),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let w = e.spawn_on(users.clone());
+        e.until("b indexed", async || {
+            get_node(&db, n).await.unwrap().index_state == "indexed"
+        })
+        .await;
+        e.quiet_on(&w, &db).await;
+        let pts = b_points().await;
+        assert!(pts > 0);
+        w.shutdown().await;
+        pts
+    };
+    // копия базы b; хранилище «стёрто» (точек b нет), файл b повреждён
+    std::fs::copy(&file, &keep).unwrap();
+    e.vector
+        .delete_scope(&VectorFilter {
+            user_id: b,
+            space_ids: vec![],
+            path_prefix: None,
+            levels: vec![],
+        })
+        .await
+        .unwrap();
+    std::fs::write(&file, b"not a sqlite database at all").unwrap();
+    {
+        let w = e.spawn_on(UserDbs::new(e.users_dir.clone()));
+        w.request_rebuild();
+        e.until("b исключена", async || {
+            w.status().rebuild_skipped.iter().any(|d| d.user == b)
+        })
+        .await;
+        w.shutdown().await;
+    }
+    let skipped = e.system.index_skipped().await.unwrap();
+    assert_eq!(
+        skipped.iter().map(|s| s.user_id).collect::<Vec<_>>(),
+        vec![b]
+    );
+    // перезапуск с той же повреждённой базой: исключение видно сразу (из system.db)
+    {
+        let w = e.spawn_on(UserDbs::new(e.users_dir.clone()));
+        e.until(
+            "исключение после перезапуска",
+            async || w.status().rebuild_skipped.iter().any(|d| d.user == b),
+        )
+        .await;
+        w.shutdown().await;
+    }
+    assert_eq!(b_points().await, 0);
+    // база восстановлена из копии, перезапуск: reindex из кэша без инференса
+    std::fs::copy(&keep, &file).unwrap();
+    let w = e.spawn_on(UserDbs::new(e.users_dir.clone()));
+    e.until("точки b восстановлены", async || {
+        b_points().await == pts
+    })
+    .await;
+    e.until("отметка снята", async || {
+        w.status().rebuild_skipped.is_empty()
+    })
+    .await;
+    assert!(e.system.index_skipped().await.unwrap().is_empty());
+    assert_eq!(w.embedded_texts(), 0);
+    w.shutdown().await;
 }

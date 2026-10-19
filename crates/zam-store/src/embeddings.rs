@@ -169,6 +169,33 @@ async fn put(
     .await
 }
 
+/// Присваивает узлу `owner` найденные в кэше служебные эмбеддинги `keys` без владельца:
+/// строки предложений L0 и L0 папок, записанные до миграции v5, иначе сборка мусора
+/// приняла бы их за сирот (ключи чанков на них не ссылаются). Возвращает число строк.
+pub async fn adopt_owned_embeddings(
+    db: &Db,
+    model_id: &str,
+    owner: Id,
+    keys: &[String],
+) -> Result<u64, StoreError> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let model_id = model_id.to_string();
+    let keys = serde_json::Value::from(keys.to_vec()).to_string();
+    db.write(move |tx| {
+        let n = tx
+            .prepare_cached(
+                "UPDATE embeddings SET owner = ?1
+                 WHERE owner IS NULL AND model_id = ?2
+                   AND text_hash IN (SELECT value FROM json_each(?3))",
+            )?
+            .execute(params![owner, model_id, keys])?;
+        Ok(n as u64)
+    })
+    .await
+}
+
 /// Удаляет служебные эмбеддинги модели `model_id` узла `owner`, не входящие в `keep`
 /// (текущий набор ключей L0 узла). Возвращает число удалённых строк.
 pub async fn prune_owned_embeddings(

@@ -100,8 +100,13 @@ const FIXED: [(SpaceKind, &str); 3] = [
 #[derive(Clone, Debug)]
 pub struct UserDbs {
     dir: PathBuf,
-    open: Arc<Mutex<HashMap<Id, OpenDb>>>,
+    /// Ячейка на пользователя: глобальный замок держится только на поиск ячейки, открытие
+    /// (миграции, копия, дозаполнение ключей) идёт под замком своей ячейки и не задерживает
+    /// другие базы.
+    open: Arc<Mutex<HashMap<Id, Slot>>>,
 }
+
+type Slot = Arc<Mutex<Option<OpenDb>>>;
 
 /// Открытая база и признак завершения разовой перечанковки (R1).
 #[derive(Debug)]
@@ -129,9 +134,11 @@ impl UserDbs {
     /// неё безопасны (пакеты идемпотентны и читают текущую ревизию в своей транзакции).
     /// Дождаться её — [`UserDbs::wait_rechunk`].
     pub async fn get(&self, user: Id) -> Result<Db, StoreError> {
-        // Открытие под замком: два одновременных вызова не создадут два Db на один файл.
-        let mut open = self.open.lock().await;
-        if let Some(e) = open.get(&user) {
+        let slot = self.open.lock().await.entry(user).or_default().clone();
+        // Открытие под замком ячейки: два одновременных вызова не создадут два Db на один
+        // файл; другие базы при этом открываются параллельно.
+        let mut cell = slot.lock().await;
+        if let Some(e) = cell.as_ref() {
             return Ok(e.db.clone());
         }
         let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
@@ -139,14 +146,11 @@ impl UserDbs {
         crate::nodes::backfill_embed_keys(&db).await?;
         let pending = rechunk_pending(&db).await? && !clear_rechunk_if_empty(&db).await?;
         let (done, rechunked) = watch::channel(!pending);
-        open.insert(
-            user,
-            OpenDb {
-                db: db.clone(),
-                rechunked,
-            },
-        );
-        drop(open);
+        *cell = Some(OpenDb {
+            db: db.clone(),
+            rechunked,
+        });
+        drop(cell);
         if pending {
             let bg = db.clone();
             tokio::spawn(async move {
@@ -163,12 +167,11 @@ impl UserDbs {
     /// Ждёт завершения разовой перечанковки (R1) базы `user`, если она открыта и
     /// перечанковка идёт; иначе возвращается сразу.
     pub async fn wait_rechunk(&self, user: Id) {
-        let rx = self
-            .open
-            .lock()
-            .await
-            .get(&user)
-            .map(|e| e.rechunked.clone());
+        let slot = self.open.lock().await.get(&user).cloned();
+        let rx = match slot {
+            Some(s) => s.lock().await.as_ref().map(|e| e.rechunked.clone()),
+            None => None,
+        };
         if let Some(mut rx) = rx {
             // ошибка — отправитель закрыт без `true` (задача прервана): ждать нечего
             let _ = rx.wait_for(|done| *done).await;

@@ -231,3 +231,64 @@ async fn gc_removes_orphans_and_prune_keeps_current_set() {
         .unwrap();
     assert_eq!(gc_embeddings(&db, 100).await.unwrap(), 0);
 }
+
+/// Служебная строка до v5 (без владельца) после `adopt_owned_embeddings` принадлежит узлу
+/// и сборкой мусора не снимается; исключённые из пересборки базы — в `system.db`.
+#[tokio::test]
+async fn adopt_legacy_owner_and_index_skipped() {
+    use zam_store::{
+        Attribution, AuthorKind, NewNote, NodePath, SpaceKind, SystemStore, adopt_owned_embeddings,
+        create_note, gc_embeddings, list_spaces,
+    };
+    let db = setup("adopt").await;
+    let k = list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    let n = create_note(
+        &db,
+        NewNote {
+            space_id: k,
+            path: NodePath::parse("f/n").unwrap(),
+            content: "текст".into(),
+            l0: None,
+            attrib: Attribution::new(AuthorKind::Agent),
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    put_embeddings(&db, "m@1", vec![("legacy".into(), sample(1.0))])
+        .await
+        .unwrap();
+    assert_eq!(
+        adopt_owned_embeddings(&db, "m@1", n, &["legacy".into(), "нет".into()])
+            .await
+            .unwrap(),
+        1
+    );
+    gc_embeddings(&db, 100).await.unwrap();
+    assert_eq!(
+        get_embeddings(&db, "m@1", &["legacy".into()])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("emb-skip");
+    let _ = std::fs::remove_dir_all(&dir);
+    let dd = DataDir::open(&dir).unwrap();
+    let sys = SystemStore::open(&dd).unwrap();
+    let u = sys.create_user("u", false).await.unwrap().id;
+    assert!(sys.index_skipped().await.unwrap().is_empty());
+    sys.index_skip(u, "файл не SQLite", 1).await.unwrap();
+    sys.index_skip(u, "файл не SQLite", 5).await.unwrap();
+    let s = sys.index_skipped().await.unwrap();
+    assert_eq!((s.len(), s[0].user_id, s[0].attempts), (1, u, 5));
+    sys.index_unskip(u).await.unwrap();
+    assert!(sys.index_skipped().await.unwrap().is_empty());
+}

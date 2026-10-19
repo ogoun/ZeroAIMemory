@@ -357,9 +357,20 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
     a.st.shutdown().await;
     drop(a);
 
-    // хранилище стёрто вручную: на остановленном сервере reindex из кэша
+    // хранилище стёрто вручную, у второго пользователя база повреждена: на остановленном
+    // сервере reindex всех баз из кэша пропускает её и называет в отчёте
     let qdir = dir.join("d").join("qdrant").join("storage");
     let _ = std::fs::remove_dir_all(&qdir);
+    let bad = {
+        let dd = zam_store::DataDir::open(&dir.join("d")).unwrap();
+        let sys = zam_store::SystemStore::open(&dd).unwrap();
+        sys.create_user("bad", false).await.unwrap().id
+    };
+    std::fs::write(
+        dir.join("d").join("users").join(format!("{bad}.db")),
+        b"not a sqlite database at all",
+    )
+    .unwrap();
     let out = zam_server(&["reindex", "--config", &conf_arg]);
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
@@ -371,6 +382,14 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
         text.contains("из кэша") && text.contains("заметок из кэша 1"),
         "{text}"
     );
+    assert!(
+        text.contains(&format!("базы пользователя {bad}"))
+            || text.contains(&format!("база пользователя {bad}")),
+        "{text}"
+    );
+    // явно указанная повреждённая база — ошибка команды
+    let out = zam_server(&["reindex", "--config", &conf_arg, "--user", &bad.to_string()]);
+    assert!(!out.status.success());
 
     // сервер снова: точки на месте сразу, модель не вызывалась
     let b = common::api::api_with(c).await;
@@ -385,6 +404,12 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
             .iter()
             .any(|r| r.action == "index.reindex" && r.actor == "cli")
     );
+    // исключение из CLI пережило перезапуск: сервер видит базу в статусе
+    let s = b
+        .adm(Method::GET, "/api/v1/index/status", None, None)
+        .await
+        .json();
+    assert_eq!(s["rebuild_skipped"][0]["user_id"], bad.to_string(), "{s}");
     // пространство без пользователя — ошибка разбора аргументов
     let out = zam_server(&["reindex", "--config", &conf_arg, "--space", "rules"]);
     assert!(!out.status.success());

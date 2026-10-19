@@ -629,6 +629,41 @@ async fn managed_storage_rebuild_reindexes_from_embeddings_without_inference() {
         skipped.iter().map(|d| d.user).collect::<Vec<_>>(),
         vec![bad]
     );
+    // повреждённая база не ломает статус администратора и reindex всех баз
+    let r = b.adm(Method::GET, "/api/v1/index/status", None, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let s = r.json();
+    assert_eq!(s["rebuild_skipped"][0]["user_id"], bad.to_string(), "{s}");
+    assert_eq!(s["unavailable_dbs"][0]["user_id"], bad.to_string(), "{s}");
+    // явно указанная повреждённая база — ошибка
+    let r = b
+        .adm(
+            Method::GET,
+            "/api/v1/index/status",
+            None,
+            Some(&bad.to_string()),
+        )
+        .await;
+    assert!(r.status.is_server_error(), "{}", r.text());
+    let r = b
+        .adm(Method::POST, "/api/v1/admin/reindex", Some(json!({})), None)
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(r.json()["unavailable_dbs"][0]["user_id"], bad.to_string());
+    until("reindex всех баз", READY, async || {
+        b.st.index
+            .worker
+            .status()
+            .last_reindex
+            .is_some_and(|o| o.result.is_ok())
+    })
+    .await;
+    let st = b.st.index.worker.status();
+    assert_eq!(
+        st.last_reindex.unwrap().result.unwrap().failed_users.len(),
+        1
+    );
+    assert!(st.rebuild_skipped.iter().any(|d| d.user == bad));
     b.st.shutdown().await;
 }
 

@@ -119,9 +119,24 @@ pub async fn status(
     // очередь и неудавшиеся задания видимых пользователей
     let mut queue = JobStats::default();
     let mut failed: Vec<(Id, FailedJob)> = Vec::new();
+    // при обходе всех баз неоткрывающаяся (повреждённая) не ломает ответ: она в
+    // `unavailable_dbs`; база, указанная явно, — ошибка как обычно
+    let mut unavailable: Vec<Value> = Vec::new();
     for u in &users {
-        let db = st.users.get(*u).await?;
-        let s = job_stats(&db).await?;
+        let one = async {
+            let db = st.users.get(*u).await?;
+            let s = job_stats(&db).await?;
+            let f = failed_jobs(&db, FAILED_ITEMS).await?;
+            Ok::<_, zam_store::StoreError>((s, f))
+        };
+        let (s, f) = match one.await {
+            Ok(v) => v,
+            Err(e) if all => {
+                unavailable.push(json!({ "user_id": u, "error": e.to_string() }));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         queue.queued += s.queued;
         queue.running += s.running;
         queue.failed += s.failed;
@@ -129,12 +144,7 @@ pub async fn status(
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        failed.extend(
-            failed_jobs(&db, FAILED_ITEMS)
-                .await?
-                .into_iter()
-                .map(|f| (*u, f)),
-        );
+        failed.extend(f.into_iter().map(|f| (*u, f)));
     }
     failed.sort_by_key(|(_, f)| std::cmp::Reverse(f.updated_at));
     failed.truncate(FAILED_ITEMS);
@@ -220,6 +230,7 @@ pub async fn status(
             "last": last,
         },
         "rebuild_skipped": skipped,
+        "unavailable_dbs": unavailable,
     })))
 }
 
@@ -232,14 +243,26 @@ struct ReindexBody {
     full: bool,
 }
 
-/// Область reindex: пользователь (проверен), пространство (проверено) и число заметок
-/// области (`job_count`). Общая для API и CLI.
+/// Область reindex (общая для API и CLI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReindexScope {
+    pub user: Option<Id>,
+    pub space: Option<Id>,
+    /// Индексируемых заметок в открывшихся базах области.
+    pub job_count: i64,
+    /// Базы, которые не открылись при обходе всех: `(пользователь, ошибка)`. Reindex их
+    /// пропустит и отметит исключёнными (reindex — когда база снова откроется).
+    pub unavailable: Vec<(Id, String)>,
+}
+
+/// Область reindex: пользователь (проверен), пространство (проверено), число заметок.
+/// База, указанная явно, должна открыться; при обходе всех неоткрывающиеся пропускаются.
 pub async fn reindex_scope(
     st_system: &zam_store::SystemStore,
     st_users: &zam_store::UserDbs,
     user: Option<&str>,
     space: Option<&str>,
-) -> Result<(Option<Id>, Option<Id>, i64), ApiError> {
+) -> Result<ReindexScope, ApiError> {
     let user = user
         .map(|u| {
             u.trim()
@@ -266,14 +289,27 @@ pub async fn reindex_scope(
     };
     let mut space_id = None;
     let mut job_count = 0i64;
+    let mut unavailable = Vec::new();
     for u in &users {
-        let db = st_users.get(*u).await?;
+        let db = match st_users.get(*u).await {
+            Ok(db) => db,
+            Err(e) if user.is_none() => {
+                unavailable.push((*u, e.to_string()));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if let Some(raw) = space {
             space_id = Some(find_space(&db, &SpaceRef::parse(raw)?).await?.id);
         }
         job_count += indexable_count(&db, space_id).await?;
     }
-    Ok((user, space_id, job_count))
+    Ok(ReindexScope {
+        user,
+        space: space_id,
+        job_count,
+        unavailable,
+    })
 }
 
 /// `POST /admin/reindex`.
@@ -296,13 +332,19 @@ pub async fn reindex(
             reason.map_or("см. журнал", |r| r.hint()),
         )));
     }
-    let (user, space, job_count) = reindex_scope(
+    let scope = reindex_scope(
         &st.system,
         &st.users,
         req.user.as_deref(),
         req.space.as_deref(),
     )
     .await?;
+    let (user, space, job_count) = (scope.user, scope.space, scope.job_count);
+    let unavailable: Vec<Value> = scope
+        .unavailable
+        .iter()
+        .map(|(u, e)| json!({ "user_id": u, "error": e }))
+        .collect();
     st.system
         .audit(
             "admin",
@@ -310,7 +352,10 @@ pub async fn reindex(
             "index.reindex",
             space.map(|s| s.to_string()).as_deref(),
             Some(&client.ip.to_string()),
-            json!({ "full": req.full, "space": space, "job_count": job_count }),
+            json!({
+                "full": req.full, "space": space, "job_count": job_count,
+                "unavailable_dbs": unavailable.len(),
+            }),
         )
         .await?;
     rt.worker.request_reindex(ReindexRequest {
@@ -331,6 +376,7 @@ pub async fn reindex(
             "user": user,
             "space": space,
             "full": req.full,
+            "unavailable_dbs": unavailable,
             "accepted_at": fmt_ts(Timestamp::now()),
         })),
     ))

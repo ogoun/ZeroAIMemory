@@ -289,13 +289,13 @@ pub fn pid_alive(pid: u32) -> bool {
     win::alive(pid)
 }
 
-/// Имя образа процесса — `qdrant.exe`.
 /// Резидентная память (рабочий набор) процесса, байт.
 #[cfg(windows)]
 pub fn rss_bytes(pid: u32) -> Option<u64> {
     win::rss_bytes(pid)
 }
 
+/// Имя образа процесса — `qdrant.exe`.
 #[cfg(windows)]
 pub fn is_qdrant_process(pid: u32) -> bool {
     win::image_path(pid)

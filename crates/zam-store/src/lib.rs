@@ -19,8 +19,8 @@ pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, reso
 pub use datadir::DataDir;
 pub use db::{Db, DbOptions};
 pub use embeddings::{
-    Embedding, embed_input_of, embed_key_of, gc_embeddings, get_embeddings, prune_owned_embeddings,
-    put_embeddings, put_owned_embeddings,
+    Embedding, adopt_owned_embeddings, embed_input_of, embed_key_of, gc_embeddings, get_embeddings,
+    prune_owned_embeddings, put_embeddings, put_owned_embeddings,
 };
 pub use jobs::{
     FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats, NodePayload,
@@ -44,7 +44,8 @@ pub use search::{
     query_needles, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use system::{
-    Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,
+    Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,
+    WebSession,
 };
 pub use user_db::{
     Space, SpaceKind, USER_MIGRATIONS, UserDbs, create_solution, get_solution, get_space,

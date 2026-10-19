@@ -13,8 +13,9 @@
 //!    индексация идёт и во время повторов. База, повреждённая навсегда (файл не SQLite,
 //!    схема новее) или не открывшаяся [`REBUILD_MAX_ATTEMPTS`] раз подряд, исключается из
 //!    пересборки: WARN, аудит `index.rebuild_skipped`, видна в `/index/status`
-//!    ([`WorkerStatus::rebuild_skipped`]); когда база снова откроется, её reindex
-//!    ставится сам. Для `storage_rebuilt` аудит `index.storage_rebuilt` и
+//!    ([`WorkerStatus::rebuild_skipped`]). Исключение хранится в `system.db`
+//!    (`index_skipped`) и переживает перезапуск; когда база снова откроется, в ней
+//!    ставится отметка reindex из кэша, исключение снимается. Для `storage_rebuilt` аудит `index.storage_rebuilt` и
 //!    `ack_storage_rebuilt()` — когда прошли (или исключены) все базы: флаг
 //!    `.zam-reindex` не держит полную перечанковку на каждом рестарте из-за одной базы.
 //! 3. **Reindex по запросу** ([`WorkerHandle::request_reindex`], `POST /admin/reindex`):
@@ -55,10 +56,11 @@ use zam_core::Id;
 use zam_markdown::ChunkLevel;
 use zam_store::{
     Db, Embedding, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, NodeKind,
-    SpaceKind, StoreError, SystemStore, UserDbs, chunks_for_index, claim_jobs, complete_job,
-    enqueue_reindex, fail_job, gc_embeddings, get_embeddings, get_node, get_space, indexed_count,
-    list_children, pending_reindex, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
-    release_job, requeue_running, set_auto_l0, set_folder_l0, set_index_state,
+    SpaceKind, StoreError, SystemStore, UserDbs, adopt_owned_embeddings, chunks_for_index,
+    claim_jobs, complete_job, enqueue_reindex, fail_job, gc_embeddings, get_embeddings, get_node,
+    get_space, indexed_count, list_children, pending_reindex, prune_owned_embeddings,
+    put_embeddings, put_owned_embeddings, release_job, requeue_running, set_auto_l0, set_folder_l0,
+    set_index_state,
 };
 
 use crate::reindex::{GC_BATCH, ReindexCtx, ReindexReport, ReindexRequest, reindex};
@@ -137,6 +139,10 @@ pub struct WorkerStatus {
     pub last_error: Option<String>,
     /// Папок, ждущих свёртки L0 (дебаунс или выполняется).
     pub rollups_pending: usize,
+    /// Пачка заданий в обработке: от выдачи до конца пачки, включая auto-L0 и отметку
+    /// `indexed` после закрытия заданий. Вместе с пустой очередью и `rollups_pending == 0`
+    /// означает, что воркер в покое.
+    pub batch_running: bool,
     /// Reindex по запросу выполняется сейчас.
     pub reindex_running: bool,
     /// Запросов reindex в очереди, включая выполняемый.
@@ -238,6 +244,8 @@ impl WorkerHandle {
             bad_users: HashMap::new(),
             reindex_retry: None,
             skipped_dbs: HashSet::new(),
+            pending_checked: HashSet::new(),
+            scanned: false,
             gc_due: HashMap::new(),
         };
         let task = tokio::spawn(w.run());
@@ -417,8 +425,12 @@ struct Worker {
     bad_users: HashMap<Id, Instant>,
     /// Повтор reindex по запросу после недоступности Qdrant не раньше срока.
     reindex_retry: Option<Instant>,
-    /// Базы, исключённые из пересборки: при успешном открытии — их reindex.
+    /// Базы, исключённые из пересборки (`system.db`): при успешном открытии — их reindex.
     skipped_dbs: HashSet<Id>,
+    /// Базы, в которых после запуска проверена отметка незавершённого reindex.
+    pending_checked: HashSet<Id>,
+    /// Все базы открыты (проверены отметки) хотя бы раз после запуска.
+    scanned: bool,
     /// Следующая сборка мусора кэша базы.
     gc_due: HashMap<Id, Instant>,
 }
@@ -572,6 +584,16 @@ impl Worker {
             {
                 self.rebuild_step().await;
             }
+            // 2. При запуске: исключённые базы из system.db и обход всех баз — отметки
+            // незавершённого reindex (в том числе при чужой модели коллекции, когда до
+            // заданий дело не доходит) и восстановленные исключённые базы
+            if !self.scanned {
+                self.scanned = true;
+                self.load_skipped().await;
+                for u in self.users().await {
+                    let _ = self.open_db(u).await;
+                }
+            }
             // 2a. Reindex по запросу (и при чужой модели коллекции: он её пересоздаёт)
             if self.reindex_retry.is_none_or(|t| Instant::now() >= t)
                 && let Some(req) = self.next_reindex()
@@ -697,6 +719,7 @@ impl Worker {
             vector: self.deps.vector.as_ref(),
             model_id: &model,
             dim: self.deps.embedder.dim(),
+            embedder: None,
         };
         let res = reindex(&ctx, &req).await;
         self.status(|s| s.reindex_running = false);
@@ -710,9 +733,9 @@ impl Worker {
                 Err(e.to_string())
             }
             Ok(rep) => {
-                // базы, которые не открылись: их reindex — при следующем успешном открытии
-                for (u, _) in &rep.failed_users {
-                    self.skipped_dbs.insert(*u);
+                // L0 папок, которых нет в кэше, — свёрткой (она же построит точку)
+                for (u, f) in &rep.missed_folders {
+                    self.rollups.schedule(*u, *f, self.cfg.rollup_debounce);
                 }
                 Ok(rep)
             }
@@ -753,6 +776,8 @@ impl Worker {
             s.reindex_queued = left;
             s.last_reindex = Some(outcome);
         });
+        // базы, которые reindex не открыл, он отметил в system.db
+        self.load_skipped().await;
         Ok(())
     }
 
@@ -987,6 +1012,9 @@ impl Worker {
         );
         self.skipped_dbs.insert(user);
         let err = e.to_string();
+        if let Err(se) = self.deps.system.index_skip(user, &err, attempts).await {
+            tracing::warn!(user = %user, error = %se, "отметка исключённой базы не записана");
+        }
         let audit = self
             .deps
             .system
@@ -1012,6 +1040,55 @@ impl Worker {
         });
     }
 
+    /// Исключённые из пересборки базы из `system.db` (переживают перезапуск) — в память
+    /// воркера и статус.
+    async fn load_skipped(&mut self) {
+        match self.deps.system.index_skipped().await {
+            Ok(list) => {
+                self.skipped_dbs = list.iter().map(|s| s.user_id).collect();
+                self.status(|s| {
+                    s.rebuild_skipped = list
+                        .into_iter()
+                        .map(|d| SkippedDb {
+                            user: d.user_id,
+                            error: d.error,
+                            attempts: d.attempts,
+                        })
+                        .collect();
+                });
+            }
+            Err(e) => tracing::warn!(error = %e, "список исключённых из пересборки баз"),
+        }
+    }
+
+    /// Исключённая база снова открылась: в ней ставится отметка reindex из кэша (её
+    /// подхватит проверка незавершённого reindex, после перезапуска тоже), затем отметка
+    /// исключения в `system.db` снимается. Сбой — повтор при следующем открытии.
+    async fn recover_skipped(&mut self, user: Id, db: &Db) {
+        let req = ReindexRequest {
+            user: Some(user),
+            space: None,
+            full: false,
+        };
+        let res = match zam_store::mark_reindex(db, Some(req.spec(None))).await {
+            Ok(()) => self.deps.system.index_unskip(user).await,
+            Err(e) => Err(e),
+        };
+        match res {
+            Ok(()) => {
+                tracing::info!(
+                    user = %user,
+                    "база, исключённая из пересборки, снова открылась: reindex"
+                );
+                self.skipped_dbs.remove(&user);
+                // отметку reindex прочитать заново
+                self.pending_checked.remove(&user);
+                self.status(|s| s.rebuild_skipped.retain(|d| d.user != user));
+            }
+            Err(e) => tracing::warn!(user = %user, error = %e, "reindex исключённой базы"),
+        }
+    }
+
     /// База пользователя; не открывшаяся — WARN не чаще раза в минуту и пропуск.
     /// Открывшаяся база, исключённая ранее из пересборки, получает свой reindex.
     async fn open_db(&mut self, user: Id) -> Option<Db> {
@@ -1026,17 +1103,28 @@ impl Worker {
             Ok(db) => {
                 self.bad_users.remove(&user);
                 if self.skipped_dbs.contains(&user) {
-                    match enqueue_reindex(&db, None).await {
-                        Ok(jobs) => {
-                            tracing::info!(
-                                user = %user,
-                                jobs,
-                                "база, исключённая из пересборки, снова открылась: reindex"
-                            );
-                            self.skipped_dbs.remove(&user);
-                            self.status(|s| s.rebuild_skipped.retain(|d| d.user != user));
+                    self.recover_skipped(user, &db).await;
+                }
+                // незавершённый reindex базы (отметка в ней самой) — в очередь; проверяется
+                // при первом открытии после запуска, до ворот коллекции: так возобновляется
+                // и reindex, прерванный при чужой модели коллекции
+                if self.pending_checked.insert(user) {
+                    match pending_reindex(&db).await {
+                        Ok(Some(spec)) => {
+                            tracing::info!(user = %user, "незавершённый reindex базы: повтор");
+                            let req = ReindexRequest::from_spec(user, &spec);
+                            let n = {
+                                let mut q = lock(&self.inner.reindex);
+                                q.push_back(req);
+                                q.len()
+                            };
+                            self.status(|s| s.reindex_queued = n);
                         }
-                        Err(e) => tracing::warn!(user = %user, error = %e, "reindex базы"),
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.pending_checked.remove(&user);
+                            tracing::warn!(user = %user, error = %e, "отметка reindex");
+                        }
                     }
                 }
                 Some(db)
@@ -1072,16 +1160,6 @@ impl Worker {
                     Ok(_) => {}
                     Err(e) => tracing::warn!(user = %user, error = %e, "requeue_running"),
                 }
-                match pending_reindex(&db).await {
-                    Ok(Some(spec)) => {
-                        tracing::info!(user = %user, "незавершённый reindex базы: повтор");
-                        let req = ReindexRequest::from_spec(user, &spec);
-                        lock(&self.inner.reindex).push_back(req);
-                        self.status(|s| s.reindex_queued += 1);
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(user = %user, error = %e, "отметка reindex"),
-                }
             }
             let jobs = match claim_jobs(&db, self.cfg.batch_jobs, Timestamp::now()).await {
                 Ok(j) => j,
@@ -1094,7 +1172,10 @@ impl Worker {
                 continue;
             }
             did = true;
-            self.batch(user, &db, jobs).await?;
+            self.status(|s| s.batch_running = true);
+            let res = self.batch(user, &db, jobs).await;
+            self.status(|s| s.batch_running = false);
+            res?;
             tokio::time::sleep(Duration::from_millis(self.cfg.yield_ms)).await;
         }
         *rr = rr.wrapping_add(1);
@@ -1181,11 +1262,16 @@ impl Worker {
                 HashMap::new()
             }
         };
-        // точки пачки; чанк без эмбеддинга — неудача только своего задания
+        // точки пачки (считаются один раз); чанк без эмбеддинга — неудача только своего
+        // задания
         let mut ready: Vec<(Job, Plan)> = Vec::with_capacity(plans.len());
+        let mut pts: Vec<IndexPoint> = Vec::new();
         for (j, plan) in plans {
             match plan_points(user, &plan, &embs) {
-                Ok(_) => ready.push((j, plan)),
+                Ok(p) => {
+                    pts.extend(p);
+                    ready.push((j, plan));
+                }
                 Err(e) => self.fail(db, &j, &e.to_string()).await,
             }
         }
@@ -1197,10 +1283,6 @@ impl Worker {
         // Qdrant: две записи на пачку (удалить старые точки узлов, записать новые), а не
         // две на задание — на HDD каждая запись `wait=true` стоит десятки миллисекунд
         let nodes: Vec<Id> = ready.iter().map(|(j, _)| j.target_id).collect();
-        let pts: Vec<IndexPoint> = ready
-            .iter()
-            .flat_map(|(_, p)| plan_points(user, p, &embs).unwrap_or_default())
-            .collect();
         match self.write_points(user, &nodes, pts).await {
             Ok(()) => {}
             Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
@@ -1210,6 +1292,7 @@ impl Worker {
             }
             Err(e) => {
                 // пачка отклонена: по одному, чтобы неудачным стало только виновное задание
+                // (точки узлов строятся заново только на этом редком пути)
                 tracing::debug!(error = %e, "запись пачки в Qdrant отклонена, по одному узлу");
                 let mut keep = Vec::with_capacity(ready.len());
                 let mut rest = ready.into_iter();
@@ -1234,8 +1317,8 @@ impl Worker {
         }
         // завершение заданий: только после подтверждённой записи
         for (j, plan) in ready {
-            // свёртка предков ставится до закрытия задания: пустая очередь и ноль свёрток
-            // в статусе означают, что воркер закончил всё по этим узлам
+            // свёртка предков ставится до закрытия задания, auto-L0 идёт после него: покой
+            // воркера — пустая очередь, `batch_running == false` и `rollups_pending == 0`
             let parent = get_node(db, j.target_id)
                 .await
                 .ok()
@@ -1306,6 +1389,15 @@ impl Worker {
         let mut found = get_embeddings(db, &model, &keys)
             .await
             .map_err(|e| EmbedFail::Other(format!("кэш эмбеддингов: {e}")))?;
+        // служебные строки до v5 (без владельца) — узлу: иначе их снимет сборка мусора
+        if let Some(o) = owner
+            && !found.is_empty()
+        {
+            let hit: Vec<String> = found.keys().cloned().collect();
+            if let Err(e) = adopt_owned_embeddings(db, &model, o, &hit).await {
+                tracing::debug!(node = %o, error = %e, "владелец служебных эмбеддингов");
+            }
+        }
         let mut seen = HashSet::new();
         let misses: Vec<EmbedItem> = items
             .into_iter()
