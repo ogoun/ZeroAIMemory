@@ -12,8 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use manifest::{
-    CUDA_MANIFEST, CudaManifest, MANIFESTS, MODEL_SPEC_FILE, MODELS_MANIFEST, Manifest,
-    ModelsManifest, PLATFORMS,
+    CUDA_MANIFEST, CudaManifest, MANIFESTS, MODELS_MANIFEST, Manifest, ModelsManifest, PLATFORMS,
 };
 
 #[derive(Parser)]
@@ -177,39 +176,34 @@ fn fetch_models(ids: Vec<String>, test: bool, accept_nc: bool) -> Result<()> {
     let manifest = ModelsManifest::load(&root.join("deploy").join(MODELS_MANIFEST))?;
     manifest.validate()?;
     let models = root.join("target").join("models");
+    // согласие с лицензией проверяется для всего набора до первой загрузки
     for m in manifest.select(&ids, test, accept_nc)? {
-        let dir = models.join(&m.id);
-        let total: u64 = m.files.iter().map(|f| f.size).sum();
         println!(
             "{} ({:?}/{:?}, {}, {:.1} МБ): {}",
             m.id,
             m.role,
             m.device,
             m.license,
-            total as f64 / 1e6,
-            dir.display()
+            m.total_size() as f64 / 1e6,
+            models.join(&m.id).display()
         );
-        for f in &m.files {
-            let cached = fetch::fetch_file(&f.url, &f.sha256, &dir.join(&f.path))
-                .with_context(|| format!("{}: {}", m.id, f.path))?;
+        let got = zam_fetch::fetch_model(&manifest, &m.id, &models, accept_nc)
+            .with_context(|| m.id.clone())?;
+        for (path, cached) in &got.files {
             println!(
-                "  {}: {}",
-                f.path,
-                if cached {
+                "  {path}: {}",
+                if *cached {
                     "на месте"
                 } else {
                     "загружено"
                 }
             );
         }
-        // описатель для zam-ml пишется атомарно (через временный файл в том же каталоге)
-        let spec = dir.join(MODEL_SPEC_FILE);
-        let tmp = dir.join(format!("{MODEL_SPEC_FILE}.part"));
-        std::fs::write(&tmp, m.spec_toml()?)
-            .with_context(|| format!("не удалось записать {}", tmp.display()))?;
-        std::fs::rename(&tmp, &spec)
-            .with_context(|| format!("не удалось записать {}", spec.display()))?;
-        println!("  {MODEL_SPEC_FILE}: записан");
+        println!(
+            "  {}, {}: записаны",
+            zam_fetch::MODEL_LICENSE_FILE,
+            zam_fetch::MODEL_SPEC_FILE
+        );
     }
     Ok(())
 }

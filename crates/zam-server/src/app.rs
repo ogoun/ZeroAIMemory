@@ -14,6 +14,7 @@ use crate::auth::AuthState;
 use crate::config::{AdminSecret, ServerConfig};
 use crate::error::not_found;
 use crate::index_state::IndexRuntime;
+use crate::rerank::RerankSlot;
 use crate::{api, bootstrap, ml, web};
 
 /// Git-хэш сборки (см. build.rs).
@@ -39,6 +40,8 @@ pub struct AppState {
     pub render_gen: Arc<api::render::RenderGenerations>,
     /// Модель, Qdrant и воркер индексации.
     pub index: Arc<IndexRuntime>,
+    /// Реранкер `rerank=on` (загружается при первом таком запросе).
+    pub rerank: Arc<RerankSlot>,
 }
 
 impl AppState {
@@ -133,9 +136,11 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         .map_err(|e| anyhow::anyhow!("не удалось подготовить проверку пароля: {e}"))?;
     let users = UserDbs::new(data_dir.users_dir());
     let index = Arc::new(IndexRuntime::start(&cfg, ml, &system, &users).await);
+    let rerank = Arc::new(RerankSlot::new(&cfg));
     let state = AppState {
         users,
         index,
+        rerank,
         data_dir,
         system,
         admin_hash: Arc::new(admin_hash),

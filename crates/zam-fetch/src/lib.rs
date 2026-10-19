@@ -1,20 +1,31 @@
 //! Зависимости поставки ZeroAIMemory по манифестам `deploy/*.toml`.
 //!
-//! Общая часть `cargo xtask fetch-deps` и команд сервера (`zam-server qdrant fetch`;
-//! далее `models fetch` и `cuda fetch`): разбор манифеста с закреплёнными URL и SHA-256,
-//! загрузка (`ureq`, прокси из окружения, кроме локальной петли), проверка хэша,
-//! извлечение перечисленных файлов из zip/tar.gz без симлинков и путей наружу,
-//! атомарная замена каталога. Временные файлы — только рядом с назначением
-//! (`*.part`, `<каталог>.tmp`), системный temp не используется.
+//! Общая часть `cargo xtask fetch-deps|fetch-models` и команд сервера (`zam-server qdrant
+//! fetch`, `models fetch|status`, `cuda fetch`): разбор манифестов с закреплёнными URL,
+//! размерами и SHA-256 (`deploy/{qdrant,onnxruntime*,pdfium}.toml`, `models.toml`,
+//! `cuda.toml`), загрузка (`ureq`, прокси из окружения, кроме локальной петли), проверка
+//! размера и хэша, извлечение перечисленных файлов из zip/tar.gz/tar.xz без путей наружу
+//! (в tar — ссылка на файл того же каталога, как SONAME в архивах NVIDIA), атомарная
+//! замена каталога. Временные файлы — только рядом с назначением (`*.part`,
+//! `<каталог>.tmp`; `*.part` прерванных загрузок удаляются при следующей), системный temp
+//! не используется.
 
+mod cuda;
 mod download;
 mod manifest;
+mod models;
 
+pub use cuda::{CudaLib, CudaManifest, install_cuda};
 pub use download::{
     dest_names, download, extract_atomic, extract_selected, fetch_file, install_archive,
     sha256_file, verify_sha256,
 };
 pub use manifest::{DepManifest, PLATFORMS, PlatformEntry, host_platform};
+pub use models::{
+    FetchedModel, MODEL_LICENSE_FILE, MODEL_SPEC_FILE, ManifestSpec, ModelDevice, ModelEntry,
+    ModelFile, ModelRole, ModelState, ModelsManifest, Pooling, check_license_ack, fetch_model,
+    fetch_model_with, model_state,
+};
 
 /// Ошибки загрузки и манифестов. Тексты на русском, без содержимого файлов.
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +46,18 @@ pub enum FetchError {
         expected: String,
         actual: String,
     },
+    /// Размер скачанного файла не совпал с манифестом.
+    #[error("несовпадение размера {what}: ожидалось {expected} байт, получено {actual}")]
+    SizeMismatch {
+        what: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// Модель с некоммерческой лицензией без явного согласия (`--accept-nc-license`).
+    #[error(
+        "модель '{id}' распространяется по лицензии {license} (только некоммерческое          использование) и не входит в комплект zam-models; для загрузки подтвердите согласие          с лицензией флагом --accept-nc-license"
+    )]
+    LicenseNotAccepted { id: String, license: String },
     /// Неверный манифест или архив (нет файла, не обычный файл, недопустимое имя).
     #[error("{0}")]
     Invalid(String),

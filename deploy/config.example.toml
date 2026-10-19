@@ -64,6 +64,18 @@ index_threads = 0
 query_threads = 2
 # Выгрузка модели после простоя: "" — выключено, иначе <число>s|m|h (например "30m").
 unload_after = ""
+# Серверный реранк (поиск с "rerank": "on"; по умолчанию выключен, в хуках не используется).
+# Модель выбирается по устройству эмбеддера и грузится при первом таком запросе.
+# CPU: jina-reranker-v2 — лицензия CC-BY-NC-4.0 (только некоммерческое использование), в
+# комплект моделей не входит: zam-server models fetch --device cpu --reranker --accept-nc-license.
+# GPU: bge-reranker-v2-m3 (Apache-2.0): zam-server models fetch --device gpu --reranker.
+# Для коммерческого использования на CPU задайте rerank_model_cpu = "bge-reranker-v2-m3"
+# (медленнее: около 8 с на 20 кандидатов против 1,6 с у jina на 12 ядрах).
+rerank_model_cpu = "jina-reranker-v2"
+rerank_model_gpu = "bge-reranker-v2-m3"
+# Сколько первых кандидатов слияния переранжировать и предел токенов фрагмента в паре.
+rerank_top = 20
+rerank_tokens = 256
 
 [index]
 # Предел токенов одного вызова инференса при индексации.

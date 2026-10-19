@@ -49,10 +49,20 @@ pub struct ModelSpec {
     pub device: ModelDevice,
 }
 
-/// `model.toml` как он лежит на диске (поля `[model.spec]` и `id`).
+/// Назначение модели (`role` в `model.toml`; в описателях до M2-T9 поля нет).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Role {
+    Embed,
+    Rerank,
+    Test,
+}
+
+/// `model.toml` как он лежит на диске (поля `[model.spec]`, `id`, `role`, `device`).
 #[derive(Deserialize)]
 struct RawSpec {
     id: String,
+    role: Option<Role>,
     dim: Option<usize>,
     pooling: Option<Pooling>,
     sparse_head: Option<String>,
@@ -70,31 +80,45 @@ fn is_plain_name(s: &str) -> bool {
     !s.is_empty() && p.file_name().is_some_and(|n| n == p.as_os_str())
 }
 
+/// Текст `<models_dir>/<id>/model.toml` и каталог модели. Нет каталога или файла — `NoModel`.
+fn read_spec(models_dir: &Path, id: &str) -> Result<(String, PathBuf, PathBuf), MlError> {
+    let dir = model_dir(models_dir, id)?;
+    let path = dir.join(SPEC_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(t) => Ok((t, dir, path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(MlError::NoModel(format!(
+            "нет {} (zam-server models fetch)",
+            path.display()
+        ))),
+        Err(e) => Err(MlError::Io(e)),
+    }
+}
+
+/// Ошибка разбора с путём к описателю.
+fn with_path(path: &Path) -> impl FnOnce(MlError) -> MlError + '_ {
+    move |e| match e {
+        MlError::Spec(m) => MlError::Spec(format!("{}: {m}", path.display())),
+        e => e,
+    }
+}
+
 impl ModelSpec {
     /// Читает `<models_dir>/<id>/model.toml`. Нет каталога или файла — `NoModel`, ошибка
-    /// разбора или не эмбеддер (реранкер без `dim`/`pooling`) — `Spec`.
+    /// разбора или не эмбеддер (реранкер: `role = "rerank"` или нет `dim`/`pooling`) — `Spec`.
     pub fn load(models_dir: &Path, id: &str) -> Result<ModelSpec, MlError> {
-        let dir = model_dir(models_dir, id)?;
-        let path = dir.join(SPEC_FILE);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(MlError::NoModel(format!(
-                    "нет {} (zam-server models fetch)",
-                    path.display()
-                )));
-            }
-            Err(e) => return Err(MlError::Io(e)),
-        };
-        Self::parse(&text, &dir).map_err(|e| match e {
-            MlError::Spec(m) => MlError::Spec(format!("{}: {m}", path.display())),
-            e => e,
-        })
+        let (text, dir, path) = read_spec(models_dir, id)?;
+        Self::parse(&text, &dir).map_err(with_path(&path))
     }
 
     /// Разбор текста `model.toml`; относительные пути отсчитываются от `dir`.
     pub fn parse(text: &str, dir: &Path) -> Result<ModelSpec, MlError> {
         let raw: RawSpec = toml::from_str(text).map_err(|e| MlError::Spec(e.to_string()))?;
+        if raw.role == Some(Role::Rerank) {
+            return Err(MlError::Spec(format!(
+                "модель {} — реранкер, а не эмбеддер",
+                raw.id
+            )));
+        }
         let (Some(dim), Some(pooling)) = (raw.dim, raw.pooling) else {
             return Err(MlError::Spec(format!(
                 "модель {} не эмбеддер: нет dim или pooling",
@@ -128,6 +152,55 @@ impl ModelSpec {
     }
 }
 
+/// Описатель реранкера (cross-encoder): пара «запрос — фрагмент» → один логит.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerankSpec {
+    pub id: String,
+    /// Предел пары целиком (со спецтокенами).
+    pub max_tokens_passage: usize,
+    /// Предел запроса (без спецтокенов пары).
+    pub max_tokens_query: usize,
+    /// См. [`ModelSpec::dynamic_quant`]: такие модели прогоняются по одной паре.
+    pub dynamic_quant: bool,
+    pub device: ModelDevice,
+}
+
+impl RerankSpec {
+    /// Читает `<models_dir>/<id>/model.toml` реранкера. Нет каталога или файла — `NoModel`;
+    /// эмбеддер (`role` не `rerank` или есть `dim`/`pooling`) — `Spec`.
+    pub fn load(models_dir: &Path, id: &str) -> Result<RerankSpec, MlError> {
+        let (text, _, path) = read_spec(models_dir, id)?;
+        Self::parse(&text).map_err(with_path(&path))
+    }
+
+    pub fn parse(text: &str) -> Result<RerankSpec, MlError> {
+        let raw: RawSpec = toml::from_str(text).map_err(|e| MlError::Spec(e.to_string()))?;
+        let is_rerank = match raw.role {
+            Some(r) => r == Role::Rerank,
+            // описатель без role: реранкер — тот, у кого нет dim и pooling
+            None => raw.dim.is_none() && raw.pooling.is_none(),
+        };
+        if !is_rerank || raw.dim.is_some() || raw.pooling.is_some() {
+            return Err(MlError::Spec(format!(
+                "модель {} не реранкер (role = \"rerank\", без dim и pooling)",
+                raw.id
+            )));
+        }
+        if raw.max_tokens_passage < 4 || raw.max_tokens_query < 1 {
+            return Err(MlError::Spec(
+                "max_tokens_passage ≥ 4 и max_tokens_query ≥ 1".into(),
+            ));
+        }
+        Ok(RerankSpec {
+            id: raw.id,
+            max_tokens_passage: raw.max_tokens_passage,
+            max_tokens_query: raw.max_tokens_query,
+            dynamic_quant: raw.dynamic_quant,
+            device: raw.device,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +221,73 @@ mod tests {
             s.sparse_head.as_deref(),
             Some(Path::new("m").join("sparse_linear.pt").as_path())
         );
+    }
+
+    #[test]
+    fn rerank_spec_parses_and_rejects_embedders() {
+        let r = RerankSpec::parse(
+            "id = \"jina\"
+role = \"rerank\"
+device = \"cpu\"
+max_tokens_passage = 1024
+             max_tokens_query = 256
+",
+        )
+        .unwrap();
+        assert_eq!((r.max_tokens_passage, r.max_tokens_query), (1024, 256));
+        assert_eq!(r.device, ModelDevice::Cpu);
+        assert!(!r.dynamic_quant);
+        // описатель без role (до M2-T9): по отсутствию dim и pooling
+        assert!(
+            RerankSpec::parse(
+                "id = \"r\"
+max_tokens_passage = 8
+max_tokens_query = 8
+"
+            )
+            .is_ok()
+        );
+        for bad in [
+            "id = \"e\"
+role = \"embed\"
+max_tokens_passage = 8
+max_tokens_query = 8
+",
+            "id = \"e\"
+dim = 4
+pooling = \"mean\"
+max_tokens_passage = 8
+max_tokens_query = 8
+",
+            "id = \"e\"
+role = \"rerank\"
+dim = 4
+max_tokens_passage = 8
+max_tokens_query = 8
+",
+            "id = \"e\"
+role = \"rerank\"
+max_tokens_passage = 2
+max_tokens_query = 8
+",
+        ] {
+            assert!(
+                matches!(RerankSpec::parse(bad), Err(MlError::Spec(_))),
+                "{bad}"
+            );
+        }
+        // реранкер не загружается как эмбеддер даже с dim
+        let e = ModelSpec::parse(
+            "id = \"r\"
+role = \"rerank\"
+dim = 4
+pooling = \"cls\"
+max_tokens_passage = 8
+max_tokens_query = 8
+",
+            Path::new("m"),
+        );
+        assert!(matches!(e, Err(MlError::Spec(m)) if m.contains("реранкер")));
     }
 
     #[test]

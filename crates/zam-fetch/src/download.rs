@@ -1,7 +1,8 @@
-//! Загрузка, проверка SHA-256 и извлечение файлов из архивов.
+//! Загрузка, проверка SHA-256 и размера, извлечение файлов из архивов.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -39,6 +40,25 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<(), FetchError> {
     }
 }
 
+/// Сверяет размер файла с ожидаемым (`None` — размер не закреплён).
+fn check_size(path: &Path, what: &str, expected: Option<u64>) -> Result<(), FetchError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = fs::metadata(path)
+        .map_err(FetchError::io(format!("размер {}", path.display())))?
+        .len();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(FetchError::SizeMismatch {
+            what: what.to_string(),
+            expected,
+            actual,
+        })
+    }
+}
+
 /// Адрес на локальной петле (`127.0.0.1`, `localhost`, `[::1]`): к нему прокси не применяется.
 fn is_loopback(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
@@ -58,11 +78,17 @@ fn is_loopback(url: &str) -> bool {
 /// Скачивает `url` в `dest` (через прокси из окружения, кроме локальной петли), с таймаутами.
 /// При ошибке частичный `dest` остаётся — его удаляет вызывающий.
 pub fn download(url: &str, dest: &Path) -> Result<(), FetchError> {
+    download_limited(url, dest, None)
+}
+
+/// [`download`] с пределом размера: тело длиннее `max` байт обрывает загрузку
+/// (сервер отдаёт не тот файл — гигабайты впустую не качаются).
+fn download_limited(url: &str, dest: &Path, max: Option<u64>) -> Result<(), FetchError> {
     let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
-        // крупные модели (до 1,2 ГБ) на медленном канале
-        .timeout_global(Some(Duration::from_secs(3600)));
+        // крупные архивы (cuDNN — 1,3 ГБ) на медленном канале
+        .timeout_global(Some(Duration::from_secs(4 * 3600)));
     if is_loopback(url) {
         cfg = cfg.proxy(None);
     }
@@ -77,10 +103,26 @@ pub fn download(url: &str, dest: &Path) -> Result<(), FetchError> {
         "не удалось создать {}",
         dest.display()
     )))?;
-    io::copy(&mut reader, &mut out).map_err(|e| FetchError::Http {
+    let copy_err = |e: io::Error| FetchError::Http {
         url: url.to_string(),
         message: e.to_string(),
-    })?;
+    };
+    match max {
+        None => {
+            io::copy(&mut reader, &mut out).map_err(copy_err)?;
+        }
+        Some(max) => {
+            let mut limited = reader.take(max.saturating_add(1));
+            let n = io::copy(&mut limited, &mut out).map_err(copy_err)?;
+            if n > max {
+                return Err(FetchError::SizeMismatch {
+                    what: url.to_string(),
+                    expected: max,
+                    actual: n,
+                });
+            }
+        }
+    }
     out.flush()
         .map_err(FetchError::io(format!("запись {}", dest.display())))?;
     Ok(())
@@ -144,7 +186,173 @@ fn set_mode(path: &Path, mode: Option<u32>) -> Result<(), FetchError> {
     Ok(())
 }
 
-/// Извлекает из архива только перечисленные в `entry.extract` обычные файлы в `out`.
+/// Каталог и имя файла пути внутри архива (`a/b/c` → (`a/b`, `c`)).
+fn split_dir(p: &str) -> (&str, &str) {
+    p.rsplit_once('/').unwrap_or(("", p))
+}
+
+/// Цель символической ссылки в архиве: только простое имя в том же каталоге
+/// (`libcudart.so.13 → libcudart.so.13.4.92`, в cuBLAS — `./libcublas.so.13.8.0.4`).
+/// Иное (`../x`, `/etc/x`, `sub/x`) — `None`.
+fn link_target(link_path: &str, target: &str) -> Option<String> {
+    let mut t = target.trim();
+    while let Some(rest) = t.strip_prefix("./") {
+        t = rest;
+    }
+    if t.is_empty() || t == "." || t == ".." || t.contains(['/', '\\']) {
+        return None;
+    }
+    let (dir, _) = split_dir(link_path);
+    Some(if dir.is_empty() {
+        t.to_string()
+    } else {
+        format!("{dir}/{t}")
+    })
+}
+
+/// Сколько ссылок подряд разрешается (`libX.so.13 → libX.so.13.4 → libX.so.13.4.92`).
+const MAX_LINK_HOPS: usize = 8;
+
+/// Извлечение из tar-потока (tar.gz, tar.xz) за один проход.
+///
+/// Обычный файл из `wanted` пишется под своим именем назначения. Если в `wanted` указана
+/// символическая ссылка (так в redist-архивах NVIDIA лежат имена SONAME:
+/// `lib/libcudart.so.13 → libcudart.so.13.4.92`), под её именем кладётся файл, на который она
+/// ведёт: только обычный файл того же каталога архива, имя которого начинается с имени
+/// ссылки (такие файлы распаковываются во временные, лишние потом удаляются). Ссылки
+/// наружу, жёсткие ссылки и прочие типы под нужными путями — ошибка.
+fn extract_tar<R: Read>(
+    reader: R,
+    wanted: &[String],
+    names: &[String],
+    out: &Path,
+    found: &mut [bool],
+) -> Result<(), FetchError> {
+    let out_ctx = || format!("запись в {}", out.display());
+    // кандидат в цели ссылки: тот же каталог, имя начинается с имени нужного файла
+    let is_candidate = |p: &str| {
+        let (dir, name) = split_dir(p);
+        wanted.iter().any(|w| {
+            let (wd, wn) = split_dir(w);
+            wd == dir && name.len() > wn.len() && name.starts_with(wn)
+        })
+    };
+    // путь в архиве → (временный файл, права)
+    let mut candidates: HashMap<String, (PathBuf, Option<u32>)> = HashMap::new();
+    // путь ссылки → путь цели (только простые цели в том же каталоге)
+    let mut links: HashMap<String, String> = HashMap::new();
+    let mut t = tar::Archive::new(reader);
+    let scan = (|| {
+        for e in t.entries().map_err(archive_err)? {
+            let mut e = e.map_err(archive_err)?;
+            let p = norm(&e.path().map_err(archive_err)?.to_string_lossy());
+            let kind = e.header().entry_type();
+            let mode = e.header().mode().ok();
+            let wanted_at = wanted.iter().position(|w| *w == p);
+            if kind.is_symlink() {
+                let target = e
+                    .link_name()
+                    .map_err(archive_err)?
+                    .map(|t| t.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match link_target(&p, &target) {
+                    Some(t) => {
+                        links.insert(p, t);
+                    }
+                    None if wanted_at.is_some() => {
+                        return Err(FetchError::Invalid(format!(
+                            "'{p}' в архиве — ссылка на '{target}' вне своего каталога"
+                        )));
+                    }
+                    None => {}
+                }
+                continue;
+            }
+            if let Some(i) = wanted_at {
+                if !kind.is_file() {
+                    return Err(FetchError::Invalid(format!(
+                        "'{p}' в архиве не является обычным файлом"
+                    )));
+                }
+                let to = out.join(&names[i]);
+                let mut o = File::create(&to).map_err(FetchError::io(out_ctx()))?;
+                io::copy(&mut e, &mut o).map_err(archive_err)?;
+                set_mode(&to, mode)?;
+                found[i] = true;
+            } else if kind.is_file() && is_candidate(&p) {
+                let to = out.join(format!(".zam-link-{}", candidates.len()));
+                let mut o = File::create(&to).map_err(FetchError::io(out_ctx()))?;
+                candidates.insert(p, (to, mode));
+                io::copy(&mut e, &mut o).map_err(archive_err)?;
+            }
+        }
+        Ok(())
+    })();
+    // ссылки из `wanted` → файлы, на которые они ведут
+    let result = scan.and_then(|()| {
+        for (i, w) in wanted.iter().enumerate() {
+            if found[i] {
+                continue;
+            }
+            let Some(mut cur) = links.get(w).cloned() else {
+                continue;
+            };
+            let mut hops = 1;
+            while let Some(next) = links.get(&cur) {
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return Err(FetchError::Invalid(format!(
+                        "'{w}': слишком длинная цепочка ссылок"
+                    )));
+                }
+                cur = next.clone();
+            }
+            let to = out.join(&names[i]);
+            if let Some((src, mode)) = candidates.get(&cur) {
+                fs::copy(src, &to).map_err(FetchError::io(out_ctx()))?;
+                set_mode(&to, *mode)?;
+            } else if let Some(j) = wanted.iter().position(|x| *x == cur).filter(|&j| found[j]) {
+                fs::copy(out.join(&names[j]), &to).map_err(FetchError::io(out_ctx()))?;
+            } else {
+                return Err(FetchError::Invalid(format!(
+                    "'{w}' — ссылка на '{cur}': такого обычного файла в каталоге архива нет \
+                     (или его имя не начинается с имени ссылки)"
+                )));
+            }
+            found[i] = true;
+        }
+        Ok(())
+    });
+    for (src, _) in candidates.values() {
+        let _ = fs::remove_file(src);
+    }
+    result
+}
+
+/// Формат архива по расширению URL.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Zip,
+    TarGz,
+    TarXz,
+}
+
+fn format_of(url: &str) -> Option<Format> {
+    let lower = url.to_ascii_lowercase();
+    if lower.ends_with(".zip") {
+        Some(Format::Zip)
+    } else if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
+        Some(Format::TarGz)
+    } else if lower.ends_with(".txz") || lower.ends_with(".tar.xz") {
+        Some(Format::TarXz)
+    } else {
+        None
+    }
+}
+
+/// Извлекает из архива (zip, tar.gz, tar.xz) только перечисленные в `entry.extract` файлы
+/// в `out`. В tar под нужным путём допускается ссылка на файл того же каталога
+/// (см. [`extract_tar`]); в zip — только обычные файлы.
 pub fn extract_selected(
     archive: &Path,
     url: &str,
@@ -152,62 +360,49 @@ pub fn extract_selected(
     out: &Path,
 ) -> Result<(), FetchError> {
     let wanted: Vec<String> = entry.extract.iter().map(|p| norm(p)).collect();
-    // Имена назначения проверяем до записи чего-либо.
+    // Имена назначения и формат проверяем до записи чего-либо.
     let names = dest_names(entry)?;
+    let format = format_of(url)
+        .ok_or_else(|| FetchError::Invalid(format!("неизвестный формат архива: {url}")))?;
     let out_ctx = || format!("запись в {}", out.display());
     fs::create_dir_all(out).map_err(FetchError::io(out_ctx()))?;
     let mut found = vec![false; wanted.len()];
     let open =
         || File::open(archive).map_err(FetchError::io(format!("открытие {}", archive.display())));
-    let lower = url.to_ascii_lowercase();
-    if lower.ends_with(".zip") {
-        let mut z = zip::ZipArchive::new(open()?)
-            .map_err(|e| FetchError::Invalid(format!("не zip-архив: {e}")))?;
-        for (i, w) in wanted.iter().enumerate() {
-            let mut f = match z.by_name(w) {
-                Ok(f) => f,
-                Err(zip::result::ZipError::FileNotFound) => continue,
-                Err(e) => {
+    match format {
+        Format::Zip => {
+            let mut z = zip::ZipArchive::new(open()?)
+                .map_err(|e| FetchError::Invalid(format!("не zip-архив: {e}")))?;
+            for (i, w) in wanted.iter().enumerate() {
+                let mut f = match z.by_name(w) {
+                    Ok(f) => f,
+                    Err(zip::result::ZipError::FileNotFound) => continue,
+                    Err(e) => {
+                        return Err(FetchError::Invalid(format!(
+                            "ошибка чтения '{w}' из zip: {e}"
+                        )));
+                    }
+                };
+                if !f.is_file() || f.is_symlink() {
                     return Err(FetchError::Invalid(format!(
-                        "ошибка чтения '{w}' из zip: {e}"
-                    )));
-                }
-            };
-            if !f.is_file() || f.is_symlink() {
-                return Err(FetchError::Invalid(format!(
-                    "'{w}' в архиве не является обычным файлом"
-                )));
-            }
-            let to = out.join(&names[i]);
-            let mut o = File::create(&to).map_err(FetchError::io(out_ctx()))?;
-            io::copy(&mut f, &mut o).map_err(archive_err)?;
-            set_mode(&to, f.unix_mode())?;
-            found[i] = true;
-        }
-    } else if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
-        let gz = flate2::read::GzDecoder::new(open()?);
-        let mut t = tar::Archive::new(gz);
-        for e in t.entries().map_err(archive_err)? {
-            let mut e = e.map_err(archive_err)?;
-            let p = norm(&e.path().map_err(archive_err)?.to_string_lossy());
-            if let Some(i) = wanted.iter().position(|w| *w == p) {
-                if !e.header().entry_type().is_file() {
-                    return Err(FetchError::Invalid(format!(
-                        "'{p}' в архиве не является обычным файлом"
+                        "'{w}' в архиве не является обычным файлом"
                     )));
                 }
                 let to = out.join(&names[i]);
-                let mode = e.header().mode().ok();
                 let mut o = File::create(&to).map_err(FetchError::io(out_ctx()))?;
-                io::copy(&mut e, &mut o).map_err(archive_err)?;
-                set_mode(&to, mode)?;
+                io::copy(&mut f, &mut o).map_err(archive_err)?;
+                set_mode(&to, f.unix_mode())?;
                 found[i] = true;
             }
         }
-    } else {
-        return Err(FetchError::Invalid(format!(
-            "неизвестный формат архива: {url}"
-        )));
+        Format::TarGz => {
+            let gz = flate2::read::GzDecoder::new(BufReader::new(open()?));
+            extract_tar(gz, &wanted, &names, out, &mut found)?;
+        }
+        Format::TarXz => {
+            let xz = lzma_rust2::XzReader::new(BufReader::new(open()?), true);
+            extract_tar(xz, &wanted, &names, out, &mut found)?;
+        }
     }
     let missing: Vec<&str> = wanted
         .iter()
@@ -234,6 +429,38 @@ fn sibling(out: &Path, suffix: &str) -> Result<PathBuf, FetchError> {
     Ok(out.with_file_name(name))
 }
 
+/// Временный файл загрузки `<out>.<pid>.part`. Старые `<out>.<число>.part` — следы
+/// прерванных загрузок прошлых запусков — удаляются (одновременная загрузка одного файла
+/// двумя процессами не поддерживается).
+fn fresh_part(out: &Path) -> Result<PathBuf, FetchError> {
+    let part = sibling(out, &format!(".{}.part", std::process::id()))?;
+    let (Some(dir), Some(name)) = (out.parent(), out.file_name().and_then(|n| n.to_str())) else {
+        return Ok(part);
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{name}.");
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Ok(part);
+    };
+    for e in rd.flatten() {
+        let n = e.file_name();
+        let Some(n) = n.to_str() else { continue };
+        let stale = n
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".part"))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+        if stale && e.file_type().is_ok_and(|t| t.is_file()) {
+            fs::remove_file(e.path())
+                .map_err(FetchError::io(format!("удаление {}", e.path().display())))?;
+        }
+    }
+    Ok(part)
+}
+
 /// Атомарная замена каталога: распаковка в `<out>.tmp`, затем подмена `out`.
 pub fn extract_atomic(
     archive: &Path,
@@ -257,14 +484,21 @@ pub fn extract_atomic(
     Ok(())
 }
 
-/// Скачивает одиночный файл (без распаковки) в `dest` с проверкой SHA-256.
-/// Загрузка идёт во временный `<имя>.<pid>.part` рядом с `dest`; при ошибке или
-/// несовпадении хэша он удаляется. Если `dest` уже есть и хэш совпал — сеть не нужна,
-/// возвращается true; файл с чужим хэшем удаляется и скачивается заново.
-pub fn fetch_file(url: &str, sha256: &str, dest: &Path) -> Result<bool, FetchError> {
+/// Скачивает одиночный файл (без распаковки) в `dest` с проверкой размера (если задан) и
+/// SHA-256. Загрузка идёт во временный `<имя>.<pid>.part` рядом с `dest`; при ошибке или
+/// несовпадении он удаляется, `*.part` прерванных прошлых загрузок — тоже. Если `dest` уже
+/// есть, а размер и хэш совпали — сеть не нужна, возвращается true; иначе файл удаляется
+/// и скачивается заново.
+pub fn fetch_file(
+    url: &str,
+    sha256: &str,
+    size: Option<u64>,
+    dest: &Path,
+) -> Result<bool, FetchError> {
     let expected = sha256.trim().to_ascii_lowercase();
     if dest.is_file() {
-        if sha256_file(dest)? == expected {
+        // размер — до хэша: чужой файл в гигабайт не хэшируется
+        if check_size(dest, url, size).is_ok() && sha256_file(dest)? == expected {
             return Ok(true);
         }
         fs::remove_file(dest).map_err(FetchError::io(format!(
@@ -276,8 +510,9 @@ pub fn fetch_file(url: &str, sha256: &str, dest: &Path) -> Result<bool, FetchErr
         .parent()
         .ok_or_else(|| FetchError::Invalid("у пути назначения нет каталога".into()))?;
     fs::create_dir_all(dir).map_err(FetchError::io(format!("создание {}", dir.display())))?;
-    let part = sibling(dest, &format!(".{}.part", std::process::id()))?;
-    let checked = download(url, &part).and_then(|()| {
+    let part = fresh_part(dest)?;
+    let checked = download_limited(url, &part, size).and_then(|()| {
+        check_size(&part, url, size)?;
         let actual = sha256_file(&part)?;
         if actual == expected {
             Ok(())
@@ -304,9 +539,10 @@ pub fn fetch_file(url: &str, sha256: &str, dest: &Path) -> Result<bool, FetchErr
 /// (например `vcruntime140.dll` рядом с `qdrant.exe` в комплекте Windows).
 ///
 /// Если все файлы `extract` уже на месте — сеть не нужна, возвращается true.
-/// Иначе архив скачивается во временный `<dir>.<pid>.part` рядом с каталогом, хэш
-/// сверяется с манифестом, файлы извлекаются в `<dir>.tmp` и переносятся в `dir`;
-/// временные файлы удаляются в любом исходе.
+/// Иначе архив скачивается во временный `<dir>.<pid>.part` рядом с каталогом (`*.part`
+/// прерванных прошлых загрузок удаляются), размер (если задан) и хэш сверяются с
+/// манифестом, файлы извлекаются в `<dir>.tmp` и переносятся в `dir`; временные файлы
+/// удаляются в любом исходе.
 pub fn install_archive(entry: &PlatformEntry, dir: &Path) -> Result<bool, FetchError> {
     let expected = entry.sha256.trim().to_ascii_lowercase();
     if expected.is_empty() {
@@ -323,10 +559,11 @@ pub fn install_archive(entry: &PlatformEntry, dir: &Path) -> Result<bool, FetchE
         fs::create_dir_all(parent)
             .map_err(FetchError::io(format!("создание {}", parent.display())))?;
     }
-    let part = sibling(dir, &format!(".{}.part", std::process::id()))?;
+    let part = fresh_part(dir)?;
     let tmp = sibling(dir, ".tmp")?;
     let result = (|| {
-        download(&entry.url, &part)?;
+        download_limited(&entry.url, &part, entry.size)?;
+        check_size(&part, &entry.url, entry.size)?;
         let actual = sha256_file(&part)?;
         if actual != expected {
             return Err(FetchError::Sha256Mismatch {
@@ -379,6 +616,7 @@ mod tests {
         PlatformEntry {
             url: String::new(),
             sha256: String::new(),
+            size: None,
             extract: extract.iter().map(|s| s.to_string()).collect(),
             rename: rename
                 .iter()
@@ -563,14 +801,14 @@ mod tests {
         let d = tmp("fetch_file_ok");
         let (url, hits) = serve(b"hello", "file.bin", 1);
         let dest = d.join("m").join("model.onnx");
-        assert!(!fetch_file(&url, HELLO_SHA, &dest).unwrap());
+        assert!(!fetch_file(&url, HELLO_SHA, None, &dest).unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // повторный вызов: файл на месте и хэш совпал — без сети
-        assert!(fetch_file(&url, HELLO_SHA, &dest).unwrap());
+        assert!(fetch_file(&url, HELLO_SHA, None, &dest).unwrap());
         // испорченный файл перекачивается (сервер уже закрыт — ошибка, файл удалён)
         std::fs::write(&dest, b"broken").unwrap();
-        assert!(fetch_file(&url, HELLO_SHA, &dest).is_err());
+        assert!(fetch_file(&url, HELLO_SHA, None, &dest).is_err());
         assert!(!dest.exists());
         assert_eq!(std::fs::read_dir(d.join("m")).unwrap().count(), 0);
     }
@@ -581,7 +819,9 @@ mod tests {
         let (url, _) = serve(b"hello", "file.bin", 1);
         let dest = d.join("m").join("model.onnx");
         let wrong = "0".repeat(64);
-        let err = fetch_file(&url, &wrong, &dest).unwrap_err().to_string();
+        let err = fetch_file(&url, &wrong, None, &dest)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(&wrong) && err.contains(HELLO_SHA), "{err}");
         assert!(!dest.exists());
         // временный *.part удалён, каталог пуст
@@ -649,6 +889,182 @@ mod tests {
         t.into_inner().unwrap().finish().unwrap();
         let err =
             extract_selected(&p, "u.tgz", &entry(&["root/link"], &[]), &d.join("o")).unwrap_err();
+        assert!(err.to_string().contains("вне своего каталога"), "{err}");
+
+        // жёсткая ссылка под нужным путём — не обычный файл
+        let p = d.join("h.tgz");
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&p).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut t = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_size(0);
+        t.append_link(&mut h, "root/hard", "root/other").unwrap();
+        t.into_inner().unwrap().finish().unwrap();
+        let err =
+            extract_selected(&p, "u.tgz", &entry(&["root/hard"], &[]), &d.join("o2")).unwrap_err();
         assert!(err.to_string().contains("обычным файлом"), "{err}");
+    }
+
+    /// Элемент tar для [`make_txz`]: обычный файл (путь, содержимое, права) или ссылка.
+    enum T<'a> {
+        File(&'a str, &'a str, u32),
+        Link(&'a str, &'a str),
+    }
+
+    /// tar.xz в `path` из элементов `items` (в заданном порядке).
+    fn make_txz(path: &Path, items: &[T]) {
+        let mut t = tar::Builder::new(Vec::new());
+        for it in items {
+            let mut h = tar::Header::new_gnu();
+            match it {
+                T::File(n, c, mode) => {
+                    h.set_size(c.len() as u64);
+                    h.set_mode(*mode);
+                    t.append_data(&mut h, n, c.as_bytes()).unwrap();
+                }
+                T::Link(n, target) => {
+                    h.set_entry_type(tar::EntryType::Symlink);
+                    h.set_size(0);
+                    t.append_link(&mut h, n, target).unwrap();
+                }
+            }
+        }
+        let tar_bytes = t.into_inner().unwrap();
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = lzma_rust2::XzWriter::new(f, lzma_rust2::XzOptions::with_preset(1)).unwrap();
+        w.write_all(&tar_bytes).unwrap();
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn tar_xz_soname_links_resolve_to_files_of_same_dir() {
+        let d = tmp("txz_links");
+        let p = d.join("cuda.tar.xz");
+        make_txz(
+            &p,
+            &[
+                // ссылка раньше своей цели и после неё
+                T::Link("a/lib/libx.so.13", "libx.so.13.4.92"),
+                T::File("a/lib/libx.so.13.4.92", "XXX", 0o755),
+                T::File("a/lib/liby.so.1.0.5", "YYY", 0o644),
+                T::Link("a/lib/liby.so.1.0", "liby.so.1.0.5"),
+                T::Link("a/lib/liby.so.1", "./liby.so.1.0"),
+                T::File("a/lib/libx_static.a", "big", 0o644),
+                T::File("a/lib/libplain.so.2", "PPP", 0o644),
+            ],
+        );
+        let e = entry(
+            &["a/lib/libx.so.13", "a/lib/liby.so.1", "a/lib/libplain.so.2"],
+            &[],
+        );
+        let out = d.join("out");
+        extract_selected(&p, "https://x/cuda.tar.xz", &e, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("libx.so.13")).unwrap(), b"XXX");
+        assert_eq!(std::fs::read(out.join("liby.so.1")).unwrap(), b"YYY");
+        assert_eq!(std::fs::read(out.join("libplain.so.2")).unwrap(), b"PPP");
+        // только нужные имена: ни целей ссылок, ни временных файлов
+        let mut left: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["libplain.so.2", "libx.so.13", "liby.so.1"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode =
+                |n: &str| std::fs::metadata(out.join(n)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode("libx.so.13"), 0o755);
+            assert_eq!(mode("liby.so.1"), 0o644);
+            // ссылка не создаётся: под именем SONAME лежит обычный файл
+            assert!(
+                !std::fs::symlink_metadata(out.join("libx.so.13"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn tar_xz_bad_links_are_errors() {
+        let d = tmp("txz_bad_links");
+        let cases: [(&str, &[T], &str); 4] = [
+            // цель вне каталога
+            (
+                "up",
+                &[T::Link("a/lib/libz.so.1", "../evil.so.1.0")],
+                "вне своего каталога",
+            ),
+            (
+                "abs",
+                &[T::Link("a/lib/libz.so.1", "/usr/lib/libz.so.1.0")],
+                "вне своего каталога",
+            ),
+            // цель — файл с чужим именем (не кандидат)
+            (
+                "other",
+                &[
+                    T::Link("a/lib/libz.so.1", "other.so"),
+                    T::File("a/lib/other.so", "O", 0o644),
+                ],
+                "a/lib/other.so",
+            ),
+            // цели нет в архиве
+            (
+                "dangling",
+                &[T::Link("a/lib/libz.so.1", "libz.so.1.2")],
+                "a/lib/libz.so.1.2",
+            ),
+        ];
+        for (name, items, needle) in cases {
+            let p = d.join(format!("{name}.tar.xz"));
+            make_txz(&p, items);
+            let out = d.join(format!("out-{name}"));
+            let err = extract_selected(&p, "u.tar.xz", &entry(&["a/lib/libz.so.1"], &[]), &out)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{name}: {err}");
+            // временные кандидаты удалены
+            let n = std::fs::read_dir(&out).map_or(0, |r| r.count());
+            assert_eq!(n, 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn fetch_file_checks_size_and_removes_stale_parts() {
+        let d = tmp("fetch_file_size");
+        let dest = d.join("m").join("model.onnx");
+        std::fs::create_dir_all(d.join("m")).unwrap();
+        // следы прерванных загрузок прошлых запусков; чужие файлы не трогаются
+        std::fs::write(d.join("m").join("model.onnx.4242.part"), b"old").unwrap();
+        std::fs::write(d.join("m").join("model.onnx.x.part"), b"keep").unwrap();
+        std::fs::write(d.join("m").join("tokenizer.json.77.part"), b"keep").unwrap();
+        // тело длиннее закреплённого размера — загрузка обрывается
+        let (url, _) = serve(b"hello", "file.bin", 1);
+        let err = fetch_file(&url, HELLO_SHA, Some(3), &dest).unwrap_err();
+        assert!(matches!(err, FetchError::SizeMismatch { .. }), "{err}");
+        // короче закреплённого — ошибка до хэша
+        let (url, _) = serve(b"hello", "file.bin", 1);
+        let err = fetch_file(&url, HELLO_SHA, Some(10), &dest).unwrap_err();
+        assert!(err.to_string().contains("10"), "{err}");
+        assert!(!dest.exists());
+        let (url, _) = serve(b"hello", "file.bin", 1);
+        assert!(!fetch_file(&url, HELLO_SHA, Some(5), &dest).unwrap());
+        let mut left: Vec<String> = std::fs::read_dir(d.join("m"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["model.onnx", "model.onnx.x.part", "tokenizer.json.77.part"]
+        );
+        // на месте, но другого размера — перекачивается (сервер закрыт — ошибка, файл удалён)
+        assert!(fetch_file(&url, HELLO_SHA, Some(6), &dest).is_err());
+        assert!(!dest.exists());
     }
 }

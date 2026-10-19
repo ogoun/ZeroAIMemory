@@ -17,7 +17,8 @@
 #                           до max_tokens_passage. dynamic_quant = true — граф квантует активации
 #                           динамически по всему тензору (DynamicQuantizeLinear): соседи по батчу
 #                           меняют вектор (косинус ≈ 0,99), поэтому такие модели прогоняются по
-#                           одному тексту. Пишется в <id>/model.toml для zam-ml.
+#                           одному тексту. Пишется в <id>/model.toml (с id, role и device) для
+#                           zam-ml; рядом — LICENSE (SPDX и ссылки на карточку модели).
 #
 # Источники и хэши: docs/research/2026-10-19-05-m2-index-ml.md (§3, §4, §9); полные sha256
 # сверены с API Hugging Face (lfs.sha256, X-Linked-ETag), для файлов без LFS — посчитаны при загрузке.

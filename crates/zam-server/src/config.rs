@@ -212,9 +212,47 @@ pub struct MlSection {
     pub query_threads: usize,
     /// Выгрузка модели после простоя: `""` — выключено, иначе `<число>s|m|h`.
     pub unload_after: String,
+    /// Реранкер при эмбеддере на CPU (`rerank=on`, §9.2 п. 5); `jina-reranker-v2` —
+    /// CC-BY-NC-4.0, ставится только `models fetch --reranker --accept-nc-license`.
+    pub rerank_model_cpu: String,
+    /// Реранкер при эмбеддере на CUDA (Apache-2.0, входит в `zam-models`).
+    pub rerank_model_gpu: String,
+    /// Сколько первых кандидатов слияния переранжируется (1..=100).
+    pub rerank_top: usize,
+    /// Предел токенов фрагмента в паре реранкера (8..=1024).
+    pub rerank_tokens: usize,
 }
 
 impl MlSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("ml.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        self.unload_after()?;
+        for (k, v) in [
+            ("rerank_model_cpu", &self.rerank_model_cpu),
+            ("rerank_model_gpu", &self.rerank_model_gpu),
+        ] {
+            let ok = !v.is_empty()
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                && v != "."
+                && v != "..";
+            if !ok {
+                return Err(bad(k, "id модели: латиница, цифры, '-', '_', '.'"));
+            }
+        }
+        if !(1..=100).contains(&self.rerank_top) {
+            return Err(bad("rerank_top", "от 1 до 100"));
+        }
+        if !(8..=1024).contains(&self.rerank_tokens) {
+            return Err(bad("rerank_tokens", "от 8 до 1024"));
+        }
+        Ok(())
+    }
+
     /// Каталог моделей с учётом умолчания.
     pub fn models_dir(&self, data_dir: &Path) -> PathBuf {
         self.models_dir
@@ -354,6 +392,10 @@ impl Default for ServerConfig {
                 index_threads: 0,
                 query_threads: 2,
                 unload_after: String::new(),
+                rerank_model_cpu: "jina-reranker-v2".into(),
+                rerank_model_gpu: "bge-reranker-v2-m3".into(),
+                rerank_top: 20,
+                rerank_tokens: 256,
             },
             index: IndexSection {
                 batch_tokens: 8192,
@@ -536,7 +578,7 @@ pub fn load(
                 message: e.message().to_string(),
             })?;
     cfg.server.base_path = normalize_base_path(&cfg.server.base_path);
-    cfg.ml.unload_after()?;
+    cfg.ml.validate()?;
     if cfg.index.batch_tokens == 0 {
         return Err(ConfigError::Invalid {
             key: "index.batch_tokens".into(),
@@ -917,6 +959,36 @@ yield_ms = 1
         }
         let e = vec![env("ZAM_ML__DEVICE", "directml")];
         assert!(load(None, &e, &Default::default()).is_err());
+        // реранкер
+        assert_eq!(
+            (
+                d.ml.rerank_model_cpu.as_str(),
+                d.ml.rerank_model_gpu.as_str()
+            ),
+            ("jina-reranker-v2", "bge-reranker-v2-m3")
+        );
+        assert_eq!((d.ml.rerank_top, d.ml.rerank_tokens), (20, 256));
+        let e = vec![
+            env("ZAM_ML__RERANK_TOP", "10"),
+            env("ZAM_ML__RERANK_MODEL_CPU", "bge-reranker-v2-m3"),
+        ];
+        let c = load(None, &e, &Default::default()).unwrap();
+        assert_eq!(
+            (c.ml.rerank_top, c.ml.rerank_model_cpu.as_str()),
+            (10, "bge-reranker-v2-m3")
+        );
+        for (k, v) in [
+            ("ZAM_ML__RERANK_TOP", "0"),
+            ("ZAM_ML__RERANK_TOP", "101"),
+            ("ZAM_ML__RERANK_TOKENS", "4"),
+            ("ZAM_ML__RERANK_MODEL_GPU", "../x"),
+            ("ZAM_ML__RERANK_MODEL_CPU", ""),
+        ] {
+            let err = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ml.rerank"), "{k}={v}: {err}");
+        }
         let e = vec![env("ZAM_INDEX__BATCH_TOKENS", "0")];
         assert!(load(None, &e, &Default::default()).is_err());
     }

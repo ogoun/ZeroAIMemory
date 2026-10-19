@@ -26,6 +26,64 @@ enum Cmd {
         #[command(subcommand)]
         cmd: QdrantCmd,
     },
+    /// Модели эмбеддингов и реранкера: загрузка по манифесту (SHA-256), состояние
+    Models {
+        #[command(subcommand)]
+        cmd: ModelsCmd,
+    },
+    /// Библиотеки NVIDIA (CUDA 13, cuDNN 9) для GPU-комплекта
+    Cuda {
+        #[command(subcommand)]
+        cmd: CudaCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCmd {
+    /// Скачать модели устройства в ml.models_dir (по умолчанию <data_dir>/models)
+    Fetch {
+        #[command(flatten)]
+        opts: Opts,
+        /// cpu | gpu; по умолчанию — по ml.device и комплекту (CUDA EP рядом с ORT — gpu)
+        #[arg(long, value_enum)]
+        device: Option<zam_server::models::FetchDevice>,
+        /// Также реранкер устройства (ml.rerank_model_cpu | ml.rerank_model_gpu)
+        #[arg(long)]
+        reranker: bool,
+        /// Модель по id вместо набора устройства (можно повторять)
+        #[arg(long = "id", value_name = "ID")]
+        ids: Vec<String>,
+        /// Согласие с лицензией CC-BY-NC-4.0 (только некоммерческое использование) для
+        /// реранкера jina-reranker-v2
+        #[arg(long)]
+        accept_nc_license: bool,
+        /// Манифест вместо встроенного при сборке (формат deploy/models.toml)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+    /// Показать модели манифеста и что установлено (ничего не скачивает)
+    Status {
+        #[command(flatten)]
+        opts: Opts,
+        /// Сверить SHA-256 файлов (долго для гигабайтных весов)
+        #[arg(long)]
+        verify: bool,
+        /// Манифест вместо встроенного при сборке
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CudaCmd {
+    /// Скачать библиотеки NVIDIA по манифесту (размер и SHA-256) в <каталог ORT>/cuda/
+    Fetch {
+        #[command(flatten)]
+        opts: Opts,
+        /// Манифест вместо встроенного при сборке (формат deploy/cuda.toml)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -103,6 +161,67 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Qdrant { cmd } => qdrant_cmd(cmd).await,
+        Cmd::Models { cmd } => models_cmd(cmd).await,
+        Cmd::Cuda { cmd } => cuda_cmd(cmd).await,
+    }
+}
+
+async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<()> {
+    use zam_server::models;
+    match cmd {
+        ModelsCmd::Fetch {
+            opts,
+            device,
+            reranker,
+            ids,
+            accept_nc_license,
+            manifest,
+        } => {
+            let cfg = load(opts)?;
+            let m = models::load_manifest(manifest.as_deref())?;
+            let device = device.unwrap_or_else(|| models::default_device(&cfg));
+            let dir = cfg.ml.models_dir(&cfg.data_dir);
+            // ureq блокирующий: загрузка вне потоков runtime
+            tokio::task::spawn_blocking(move || {
+                let list = models::plan(&m, &cfg, device, reranker, &ids)?;
+                models::fetch(&m, &list, &dir, accept_nc_license, &mut |l| println!("{l}"))?;
+                if ids.is_empty() && device == models::FetchDevice::Gpu {
+                    println!(
+                        "без CUDA сервер работает на CPU с {}: zam-server models fetch --device cpu",
+                        zam_server::ml::MODEL_CPU
+                    );
+                }
+                println!("перезапустите zam-server, чтобы подключить модели");
+                anyhow::Ok(())
+            })
+            .await?
+        }
+        ModelsCmd::Status {
+            opts,
+            verify,
+            manifest,
+        } => {
+            let cfg = load(opts)?;
+            let m = models::load_manifest(manifest.as_deref())?;
+            let out = tokio::task::spawn_blocking(move || models::status(&m, &cfg, verify)).await?;
+            println!("{out}");
+            Ok(())
+        }
+    }
+}
+
+async fn cuda_cmd(cmd: CudaCmd) -> anyhow::Result<()> {
+    match cmd {
+        CudaCmd::Fetch { opts, manifest } => {
+            let cfg = load(opts)?;
+            let m = zam_server::cuda::load_manifest(manifest.as_deref())?;
+            let report = tokio::task::spawn_blocking(move || {
+                zam_server::cuda::fetch(&cfg, &m, &mut |l| println!("{l}"))
+            })
+            .await??;
+            println!("{report}");
+            Ok(())
+        }
     }
 }
 

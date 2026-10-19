@@ -175,6 +175,82 @@ zam-server qdrant reset --yes --config config.toml   # стереть храни
 Внешний Qdrant: `mode = "external"`, `url` — его gRPC-адрес (например `http://10.0.0.5:6334`),
 ключ — `api_key` или переменная `ZAM_QDRANT__API_KEY`.
 
+## Модели
+
+Векторный поиск работает на встроенных ONNX-моделях (§8.4 ТЗ). Без моделей сервер стартует
+в режиме полнотекстового поиска (FTS-only): `degraded: true` в ответах поиска, причина и
+подсказка — в журнале.
+
+| Модель | Назначение | Устройство | Лицензия | Размер |
+|---|---|---|---|---|
+| `bge-m3-int8` | эмбеддинги | CPU | MIT | 586 МБ |
+| `bge-m3-fp16` | эмбеддинги | GPU (CUDA) | MIT | 1,15 ГБ |
+| `bge-reranker-v2-m3` | реранкер (`rerank=on`) | GPU (CUDA) | Apache-2.0 | 1,15 ГБ |
+| `jina-reranker-v2` | реранкер (`rerank=on`) | CPU | CC-BY-NC-4.0, по согласию | 297 МБ |
+
+Модели скачиваются с Hugging Face по ревизиям и SHA-256, закреплённым в `deploy/models.toml`
+(манифест встроен в `zam-server`); при несовпадении размера или хэша загрузка падает, а
+частичные файлы удаляются. Каталог — `ml.models_dir`, по умолчанию `<data_dir>/models`:
+
+```
+zam-server models fetch --config config.toml               # модель эмбеддингов устройства
+zam-server models fetch --config config.toml --reranker    # и реранкер устройства
+zam-server models fetch --device gpu --reranker            # явно: набор для GPU
+zam-server models status --config config.toml [--verify]   # что установлено (--verify — SHA-256)
+```
+
+Устройство по умолчанию — `gpu`, если рядом с ONNX Runtime лежит CUDA EP (GPU-комплект) и
+`ml.device` не `cpu`, иначе `cpu`. GPU-комплект без доступной CUDA работает на CPU с
+`bge-m3-int8`, поэтому на такой машине поставьте и CPU-набор (`--device cpu`). В каталоге
+каждой модели лежат `LICENSE` (лицензия и ссылки) и `model.toml`. Повторный запуск не
+перекачивает файлы с верным хэшем. После загрузки перезапустите сервер; смена модели
+выключает векторный поиск до reindex (векторы разных моделей не смешиваются).
+
+Для машин без интернета есть архив `zam-models-<версия>.zip` (модели с `bundle = true`):
+распакуйте его в каталог моделей.
+
+## GPU (CUDA)
+
+GPU-комплект содержит ONNX Runtime с CUDA EP, но не библиотеки NVIDIA (CUDA 13, cuDNN 9).
+Их ставит команда (около 1,9 ГБ архивов на Windows и 2,2 ГБ на Linux):
+
+```
+zam-server cuda fetch --config config.toml
+```
+
+Архивы redist NVIDIA скачиваются с `developer.download.nvidia.com` по `deploy/cuda.toml`
+(размер и SHA-256 сверяются), нужные библиотеки кладутся в `<каталог ONNX Runtime>/cuda/`
+(по умолчанию — `cuda/` рядом с `zam-server`). Другой вариант — распаковать туда архив
+`zam-cuda-<версия>-<os>-x64`. Нужен драйвер NVIDIA с поддержкой CUDA 13 (ветка R580 и
+новее); устанавливать CUDA Toolkit не нужно. Лицензия библиотек NVIDIA —
+https://docs.nvidia.com/cuda/eula/index.html.
+
+`ml.device = "auto"` (по умолчанию) включает CUDA, если она поднялась, иначе работает на CPU;
+`"cuda"` — то же с предупреждением в журнале при откате; `"cpu"` — без попытки CUDA.
+Фактическое устройство и причина отката пишутся в журнал при старте. В CPU-комплекте
+команда `cuda fetch` отказывает: библиотеки NVIDIA ему не нужны.
+
+## Реранкер и лицензия
+
+Серверный реранк включается в запросе поиска (`"rerank": "on"`, по умолчанию выключен; в
+хуках не используется): первые 20 кандидатов (`ml.rerank_top`) переставляются по баллу
+реранкера, у них в ответе появляется `rerank_score`. Модель выбирается по устройству модели
+эмбеддингов и загружается при первом таком запросе: на CPU — `ml.rerank_model_cpu`
+(`jina-reranker-v2`), на CUDA — `ml.rerank_model_gpu` (`bge-reranker-v2-m3`). Если реранкер
+не установлен, поиск отвечает без реранка и с `warnings: ["reranker not installed"]`.
+
+**Лицензия jina-reranker-v2 — CC-BY-NC-4.0: только некоммерческое использование.** Поэтому
+модель не входит в комплект `zam-models` и скачивается только с явным согласием:
+
+```
+zam-server models fetch --device cpu --reranker --accept-nc-license
+```
+
+Без флага команда завершается с объяснением и ничего не скачивает. Для коммерческого
+использования на CPU задайте `ml.rerank_model_cpu = "bge-reranker-v2-m3"` (Apache-2.0) и
+скачайте её (`zam-server models fetch --id bge-reranker-v2-m3`); на CPU она заметно медленнее
+(около 8 с на 20 кандидатов против 1,6 с у jina на 12 ядрах; на GPU RTX 3090 — 0,08 с).
+
 ## Windows
 
 1. Распакуйте архив `zam-server-<версия>-windows-x64-cpu.zip`, например в `C:\ZeroAIMemory`.

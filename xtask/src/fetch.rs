@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use zam_fetch::{PlatformEntry, download, extract_atomic, verify_sha256};
-pub use zam_fetch::{dest_names, fetch_file, sha256_file};
+pub use zam_fetch::{dest_names, sha256_file};
 
 /// Скачивает во временный `*.part` внутри кэша; возвращает путь и хэш.
 fn download_part(url: &str, cache: &Path) -> Result<(PathBuf, String)> {
@@ -111,6 +111,7 @@ mod tests {
         PlatformEntry {
             url: String::new(),
             sha256: String::new(),
+            size: None,
             extract: extract.iter().map(|s| s.to_string()).collect(),
             rename: BTreeMap::new(),
         }

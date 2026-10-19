@@ -44,6 +44,9 @@ assert_cmd = "2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
+# M2: tar.xz redist-архивов NVIDIA для Linux (`zam-server cuda fetch`): чистый Rust, без C liblzma;
+# та же версия, что у zip 9 (фичи lzma/xz); только декодер
+lzma-rust2 = { version = "=0.22.0", default-features = false, features = ["std", "optimization", "xz"] }
 # M1: Markdown, подсветка, санитизация, диффы, вложения, кэш рендера
 # тильда: comrak::Anchorizer — #[doc(hidden)], минорный выпуск может его сдвинуть
 comrak = { version = "~0.56", default-features = false }

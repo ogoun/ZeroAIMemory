@@ -527,3 +527,74 @@ async fn qdrant_down_degrades_to_fts() {
         "{t}"
     );
 }
+
+/// `rerank=on` с настоящим реранкером поверх выдачи FTS (эмбеддера нет — без Qdrant):
+/// релевантная заметка поднимается наверх, у переставленных — `rerank_score`. Реранкеры в CI
+/// не качаются: без весов в `target/models` тест пропускается
+/// (`cargo xtask fetch-models --id bge-reranker-v2-m3`; jina — с `--accept-nc-license`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rerank_on_reorders_fts_results() {
+    let models = common::ml::models();
+    let Some(id) = ["jina-reranker-v2", "bge-reranker-v2-m3"]
+        .into_iter()
+        .find(|id| models.join(id).join("model.toml").is_file())
+    else {
+        eprintln!("пропуск: нет весов реранкера в target/models");
+        return;
+    };
+    if !common::ml::ort_cpu().is_file() {
+        eprintln!("пропуск: нет ORT");
+        return;
+    }
+    let a = api("rerank-fts", |c| {
+        // эмбеддера нет (FTS-only), ORT и каталог моделей — из target/
+        ml(c, "no-such-embedder");
+        c.ml.rerank_model_cpu = id.into();
+        c.ml.index_threads = 0;
+    })
+    .await;
+    for (path, body) in [
+        (
+            "money/bread-tax",
+            "# Bread tax\n\nThe bread tax, bread prices and bread subsidies: bread, bread, bread \
+             in the city budget debate.\n",
+        ),
+        (
+            "kitchen/bread",
+            "# Baking bread at home\n\nMix flour, water, salt and yeast, knead the dough, let it \
+             rise for two hours and bake the bread in a hot oven for forty minutes.\n",
+        ),
+        (
+            "history/bread-riots",
+            "# Bread riots\n\nIn 1789 bread shortages led to bread riots in Paris.\n",
+        ),
+    ] {
+        a.note("knowledge", path, body).await;
+    }
+    let q = "how do I bake bread at home in the oven";
+    let base = search(&a, json!({"query": q})).await.json();
+    assert_eq!(base["warnings"], json!([]), "{base}");
+    let t = Instant::now();
+    let r = search(&a, json!({"query": q, "rerank": "on"})).await;
+    let first = t.elapsed();
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["warnings"], json!([]), "{j}");
+    assert!(j["timings"]["rerank_ms"].is_number(), "{j}");
+    let items = j["items"].as_array().unwrap();
+    assert_eq!(items[0]["path"], "kitchen/bread", "{j}");
+    let scores: Vec<f64> = items
+        .iter()
+        .map(|i| i["rerank_score"].as_f64().expect("rerank_score"))
+        .collect();
+    assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+    // второй запрос — реранкер уже в памяти
+    let t = Instant::now();
+    let j2 = search(&a, json!({"query": q, "rerank": "on", "format": "md"})).await;
+    eprintln!(
+        "rerank=on ({id}): первый запрос {first:?} (с загрузкой), второй {:?}",
+        t.elapsed()
+    );
+    assert!(j2.text().starts_with("1. "), "{}", j2.text());
+    assert!(!j2.text().contains("> warning"), "{}", j2.text());
+}

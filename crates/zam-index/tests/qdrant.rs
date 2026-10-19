@@ -440,3 +440,60 @@ async fn unreachable_server_is_unavailable() {
     let err = idx.health().await.unwrap_err();
     assert!(matches!(err, IndexError::Unavailable(_)), "{err:?}");
 }
+
+/// Qdrant падает посреди работы (процесс убит): все операции того же клиента — `Unavailable`
+/// (а не паника или иная ошибка), после перезапуска клиент работает снова без пересоздания.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killed_mid_work_is_unavailable_then_recovers() {
+    let mut q = TestQdrant::start("kill");
+    let idx = connect(&q);
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let node = Id::new();
+    idx.upsert(vec![point(&ctx, node, "c1", 1, "a/b", "chunk")])
+        .await
+        .unwrap();
+    q.stop();
+    let unavailable = |what: &str, e: IndexError| {
+        assert!(matches!(e, IndexError::Unavailable(_)), "{what}: {e:?}");
+    };
+    unavailable("health", idx.health().await.unwrap_err());
+    unavailable(
+        "search",
+        idx.search(&vec_for(1), &sparse_for(1), &filter(&ctx))
+            .await
+            .unwrap_err(),
+    );
+    unavailable(
+        "upsert",
+        idx.upsert(vec![point(&ctx, node, "c2", 2, "a/b", "chunk")])
+            .await
+            .unwrap_err(),
+    );
+    unavailable("count", idx.count(&filter(&ctx)).await.unwrap_err());
+    unavailable("ensure", idx.ensure(MODEL, DIM).await.unwrap_err());
+    unavailable("delete", idx.delete_node(ctx.user, node).await.unwrap_err());
+
+    q.restart();
+    // тот же клиент переподключается сам
+    let t = std::time::Instant::now();
+    while idx.health().await.is_err() {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(60),
+            "клиент не переподключился"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let hits = idx
+        .search(&vec_for(1), &sparse_for(1), &filter(&ctx))
+        .await
+        .unwrap();
+    assert_eq!(hits[0].chunk_id, "c1");
+    idx.upsert(vec![point(&ctx, node, "c2", 2, "a/b", "chunk")])
+        .await
+        .unwrap();
+    assert_eq!(idx.count(&filter(&ctx)).await.unwrap(), 2);
+}

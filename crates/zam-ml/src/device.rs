@@ -120,14 +120,12 @@ fn pair(
     Ok((index, query))
 }
 
-/// Пробует CUDA: предзагрузка библиотек NVIDIA и сборка сессий с CUDA EP.
-fn try_cuda(
-    env: &Environment,
+/// Пробует CUDA: предзагрузка библиотек NVIDIA из `<каталог ORT>/cuda/` и сборка сессий
+/// (`build(Some(id))`) с CUDA EP.
+fn try_cuda<T>(
     ort_dylib: &Path,
-    model: &Path,
-    index_threads: usize,
-    query_threads: usize,
-) -> Result<(Session, Session), String> {
+    build: &mut impl FnMut(Option<i32>) -> Result<T, MlError>,
+) -> Result<T, String> {
     match ep::CUDA::is_available() {
         Ok(true) => {}
         Ok(false) => return Err("ONNX Runtime собран без CUDA EP (CPU-комплект)".into()),
@@ -148,20 +146,54 @@ fn try_cuda(
         ));
     }
     // даже без своего каталога CUDA может найтись в системе — пробуем
-    pair(
-        env,
-        model,
-        index_threads,
-        query_threads,
-        Some(CUDA_DEVICE_ID),
-    )
-    .map_err(|e| {
+    build(Some(CUDA_DEVICE_ID)).map_err(|e| {
         notes.push(format!("CUDA EP не включился: {e}"));
         notes.join("; ")
     })
 }
 
-/// Собирает сессии на выбранном устройстве с откатом на CPU.
+/// Собирает сессии (`build(cuda)`: `Some(id)` — с CUDA EP, `None` — CPU) на выбранном
+/// устройстве с откатом на CPU; причина отката — в [`DeviceReport::reason`].
+fn with_device<T>(
+    pref: DevicePref,
+    ort_dylib: &Path,
+    mut build: impl FnMut(Option<i32>) -> Result<T, MlError>,
+) -> Result<(T, DeviceReport), MlError> {
+    let reason = match pref {
+        DevicePref::Cpu => "ml.device = cpu".to_string(),
+        DevicePref::Auto | DevicePref::Cuda => match try_cuda(ort_dylib, &mut build) {
+            Ok(v) => {
+                let device = Device::Cuda { id: CUDA_DEVICE_ID };
+                tracing::info!(%device, "сессии ORT на CUDA");
+                return Ok((
+                    v,
+                    DeviceReport {
+                        device,
+                        reason: String::new(),
+                    },
+                ));
+            }
+            Err(why) => {
+                if pref == DevicePref::Cuda {
+                    tracing::warn!(reason = %why, "ml.device = cuda, но CUDA недоступна: работаем на CPU");
+                } else {
+                    tracing::info!(reason = %why, "CUDA недоступна, CPU");
+                }
+                why
+            }
+        },
+    };
+    let v = build(None)?;
+    Ok((
+        v,
+        DeviceReport {
+            device: Device::Cpu,
+            reason,
+        },
+    ))
+}
+
+/// Собирает пару сессий (индексация и запросы) на выбранном устройстве с откатом на CPU.
 pub(crate) fn build_sessions(
     env: &Environment,
     pref: DevicePref,
@@ -170,40 +202,25 @@ pub(crate) fn build_sessions(
     index_threads: usize,
     query_threads: usize,
 ) -> Result<Sessions, MlError> {
-    let reason = match pref {
-        DevicePref::Cpu => "ml.device = cpu".to_string(),
-        DevicePref::Auto | DevicePref::Cuda => {
-            match try_cuda(env, ort_dylib, model, index_threads, query_threads) {
-                Ok((index, query)) => {
-                    let device = Device::Cuda { id: CUDA_DEVICE_ID };
-                    tracing::info!(%device, "сессии ORT на CUDA");
-                    return Ok(Sessions {
-                        index,
-                        query,
-                        report: DeviceReport {
-                            device,
-                            reason: String::new(),
-                        },
-                    });
-                }
-                Err(why) => {
-                    if pref == DevicePref::Cuda {
-                        tracing::warn!(reason = %why, "ml.device = cuda, но CUDA недоступна: работаем на CPU");
-                    } else {
-                        tracing::info!(reason = %why, "CUDA недоступна, CPU");
-                    }
-                    why
-                }
-            }
-        }
-    };
-    let (index, query) = pair(env, model, index_threads, query_threads, None)?;
+    let ((index, query), report) = with_device(pref, ort_dylib, |cuda| {
+        pair(env, model, index_threads, query_threads, cuda)
+    })?;
     Ok(Sessions {
         index,
         query,
-        report: DeviceReport {
-            device: Device::Cpu,
-            reason,
-        },
+        report,
+    })
+}
+
+/// Одна сессия (реранкер) на выбранном устройстве с откатом на CPU.
+pub(crate) fn build_session(
+    env: &Environment,
+    pref: DevicePref,
+    ort_dylib: &Path,
+    model: &Path,
+    threads: usize,
+) -> Result<(Session, DeviceReport), MlError> {
+    with_device(pref, ort_dylib, |cuda| {
+        session(env, model, threads, &PrepackedWeights::new(), cuda)
     })
 }

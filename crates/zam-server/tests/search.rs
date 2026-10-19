@@ -398,3 +398,44 @@ async fn webui_brief_budget_fits_top_k_20() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["items"].as_array().unwrap().len(), 20);
 }
+
+#[tokio::test]
+async fn rerank_on_without_model_warns_and_keeps_order() {
+    let a = api("search-rerank", |_| {}).await;
+    corpus(&a).await;
+    let base = search(&a, json!({"query": "скрипты"})).await.json();
+    assert_eq!(base["warnings"], json!([]), "{base}");
+    assert!(base["timings"]["rerank_ms"].is_null(), "{base}");
+    let r = search(&a, json!({"query": "скрипты", "rerank": "on"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["warnings"], json!(["reranker not installed"]), "{j}");
+    assert!(j["timings"]["rerank_ms"].is_number(), "{j}");
+    // без реранкера — порядок слияния, баллов реранка нет
+    assert_eq!(paths(&j), paths(&base));
+    assert!(
+        j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i.get("rerank_score").is_none()),
+        "{j}"
+    );
+    let t = search(
+        &a,
+        json!({"query": "скрипты", "rerank": "on", "format": "md"}),
+    )
+    .await
+    .text();
+    assert!(
+        t.trim_end().ends_with("> warning: reranker not installed"),
+        "{t}"
+    );
+    // rerank=off — как без поля
+    let off = search(&a, json!({"query": "скрипты", "rerank": "off"}))
+        .await
+        .json();
+    assert_eq!(off["warnings"], json!([]));
+    let r = search(&a, json!({"query": "скрипты", "rerank": "maybe"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}

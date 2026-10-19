@@ -2,13 +2,15 @@
 //! - ONNX Runtime только через `load-dynamic` из файла рядом с бинарником ([`init_runtime`]);
 //! - выбор устройства CPU / CUDA с откатом на CPU и причиной ([`DeviceReport`]);
 //! - токенизатор Hugging Face, счётчик токенов без спецтокенов ([`BgeTokenCounter`]);
-//! - эмбеддер ([`Embedder`]): bge-m3 (dense CLS + sparse-голова) и MiniLM (mean pooling).
+//! - эмбеддер ([`Embedder`]): bge-m3 (dense CLS + sparse-голова) и MiniLM (mean pooling);
+//! - реранкер ([`Reranker`]): cross-encoder jina-reranker-v2 (CPU) / bge-reranker-v2-m3 (GPU).
 //!
 //! В логи не попадает текст заметок и чанков: только id моделей, устройства и время.
 
 mod device;
 mod embed;
 mod models;
+mod rerank;
 mod runtime;
 mod sparse;
 mod spec;
@@ -19,9 +21,10 @@ use std::time::Duration;
 
 pub use device::{Device, DevicePref, DeviceReport};
 pub use embed::{Embedder, Embedding};
+pub use rerank::Reranker;
 pub use runtime::init_runtime;
 pub use sparse::SparseHead;
-pub use spec::{ModelDevice, ModelSpec, Pooling};
+pub use spec::{ModelDevice, ModelSpec, Pooling, RerankSpec};
 pub use tokenize::BgeTokenCounter;
 
 /// Ошибки zam-ml. `NoRuntime` и `NoModel` означают режим FTS-only (сервер стартует и сообщает причину).
@@ -62,7 +65,7 @@ pub struct MlConfig {
     /// Путь к `onnxruntime.{dll,so}`; по умолчанию рядом с исполняемым файлом
     /// ([`MlConfig::default_ort_dylib`]). Библиотеки CUDA ищутся в `<каталог ORT>/cuda/`.
     pub ort_dylib: PathBuf,
-    /// Потоки сессии индексации; 0 — авто (все физические ядра, решение ORT).
+    /// Потоки сессии индексации и реранкера; 0 — авто (все физические ядра, решение ORT).
     pub index_threads: usize,
     /// Потоки сессии запросов (по умолчанию 2).
     pub query_threads: usize,

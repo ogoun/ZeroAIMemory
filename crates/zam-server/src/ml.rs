@@ -92,7 +92,7 @@ pub fn ml_config(cfg: &ServerConfig) -> anyhow::Result<MlConfig> {
 }
 
 /// Абсолютный путь к ORT (относительный — от каталога программы, как в `zam-ml`).
-fn ort_path(p: &Path) -> PathBuf {
+pub(crate) fn ort_path(p: &Path) -> PathBuf {
     if p.is_absolute() {
         return p.to_path_buf();
     }
@@ -102,7 +102,7 @@ fn ort_path(p: &Path) -> PathBuf {
 }
 
 /// GPU-комплект: рядом с ORT лежит CUDA EP.
-fn gpu_kit(ort: &Path) -> bool {
+pub(crate) fn gpu_kit(ort: &Path) -> bool {
     let name = format!(
         "{}onnxruntime_providers_cuda{}",
         std::env::consts::DLL_PREFIX,

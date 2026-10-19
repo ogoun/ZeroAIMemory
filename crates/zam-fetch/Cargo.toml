@@ -1,6 +1,6 @@
 [package]
 name = "zam-fetch"
-description = "Зависимости поставки ZeroAIMemory по манифестам deploy/*.toml: загрузка, SHA-256, извлечение из zip/tar.gz"
+description = "Зависимости поставки ZeroAIMemory по манифестам deploy/*.toml: загрузка, размер и SHA-256, извлечение из zip/tar.gz/tar.xz, модели и CUDA"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,7 +14,10 @@ ureq.workspace = true
 zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
+lzma-rust2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 zip = { workspace = true, features = ["deflate"] }
+# tar.xz для тестов извлечения (кодер нужен только тестам)
+lzma-rust2 = { workspace = true, features = ["encoder"] }

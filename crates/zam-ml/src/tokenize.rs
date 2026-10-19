@@ -72,6 +72,8 @@ pub(crate) struct Tok {
     pub inner: Arc<Shared>,
     /// Сколько спецтокенов добавляет пост-процессор к одному тексту.
     n_added: usize,
+    /// Сколько спецтокенов добавляет пост-процессор к паре (реранкер: `<s> q </s></s> p </s>`).
+    n_added_pair: usize,
     /// Токен паддинга.
     pub pad_id: u32,
 }
@@ -100,11 +102,51 @@ impl Tok {
     pub fn load(path: &Path) -> Result<Tok, MlError> {
         let (t, pad_id) = load_raw(path)?;
         let n_added = t.get_post_processor().map_or(0, |p| p.added_tokens(false));
+        let n_added_pair = t.get_post_processor().map_or(0, |p| p.added_tokens(true));
         Ok(Tok {
             inner: Shared::new(t),
             n_added,
+            n_added_pair,
             pad_id,
         })
+    }
+
+    /// Кодирует пары «запрос — фрагмент» для реранкера: запрос усекается до `max_query`
+    /// токенов, фрагмент — до `max_passage`, и пара целиком (со спецтокенами) — до
+    /// `max_total` за счёт фрагмента. Спецтокены пары расставляет пост-процессор.
+    pub fn encode_pairs(
+        &self,
+        query: &str,
+        passages: &[&str],
+        max_query: usize,
+        max_passage: usize,
+        max_total: usize,
+    ) -> Result<Vec<Encoding>, MlError> {
+        let tok = &self.inner.tok;
+        let mut q = tok
+            .encode_fast(cap_text(query, max_query), false)
+            .map_err(tok_err)?;
+        let q_budget = max_query
+            .min(max_total.saturating_sub(self.n_added_pair + 1))
+            .max(1);
+        if q.len() > q_budget {
+            q.truncate(q_budget, 0, TruncationDirection::Right);
+            q.take_overflowing();
+        }
+        let p_budget = max_passage
+            .min(max_total.saturating_sub(self.n_added_pair + q.len()))
+            .max(1);
+        let capped: Vec<&str> = passages.iter().map(|t| cap_text(t, p_budget)).collect();
+        let raw = tok.encode_batch_fast(capped, false).map_err(tok_err)?;
+        raw.into_iter()
+            .map(|mut p| {
+                if p.len() > p_budget {
+                    p.truncate(p_budget, 0, TruncationDirection::Right);
+                    p.take_overflowing();
+                }
+                tok.post_process(q.clone(), Some(p), true).map_err(tok_err)
+            })
+            .collect()
     }
 
     /// Кодирует тексты для модели: усечение до `max_tokens` вместе со спецтокенами

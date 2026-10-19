@@ -8,7 +8,8 @@
 //! - `mode`: `brief` (по умолчанию) | `chunks` | `notes`;
 //! - `expand`: `none` (по умолчанию) | `section` (текст всей секции чанка) | `neighbors`
 //!   (чанк с соседними листами) | `graph` (400: будет в M3); действует в `mode=chunks`;
-//! - `top_k` (10, 1..=100), `budget_tokens` (800), `format`: `json` (по умолчанию) | `md`.
+//! - `top_k` (10, 1..=100), `budget_tokens` (800), `format`: `json` (по умолчанию) | `md`;
+//! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже).
 //!
 //! **Область.** `scope.spaces` задаёт пространства явно; иначе — `scope.solution`
 //! (или заголовок `X-Zam-Solution`) плюс Knowledge и Rules по флагам, а при
@@ -33,7 +34,14 @@
 //!    читаются одним запросом, тексты — вторым и только у листов-кандидатов (нужны для
 //!    ключа кэша), эмбеддинги — одним. Сводка за окном кандидатов без листа в выдаче
 //!    отбрасывается (узел, найденный только ею, не попадает). Лимит на узел — после замены.
-//! 4. `top_k` (в `notes` — узлов), `expand`, упаковка в `budget_tokens`.
+//! 4. `rerank=on` ([`crate::rerank`]): первые `ml.rerank_top` (20) кандидатов после
+//!    `note_to_leaf` и лимита на узел переставляются по баллу реранкера (пара «запрос —
+//!    заголовок секции и текст чанка», фрагмент до `ml.rerank_tokens` = 256 токенов), хвост
+//!    остаётся в порядке слияния; лимит на узел после перестановки соблюдается (набор тот
+//!    же). Реранкер — по устройству эмбеддера, грузится при первом таком запросе
+//!    (`spawn_blocking`). Нет модели — ответ без реранка и `warnings: ["reranker not
+//!    installed"]`; ошибка или паника загрузки и инференса — `["reranker failed"]`, не 500.
+//! 5. `top_k` (в `notes` — узлов), `expand`, упаковка в `budget_tokens`.
 //!
 //! **Деградация.** Нет модели, ORT, Qdrant, чужая модель коллекции или сбой запроса
 //! (эмбеддинг, Qdrant) — ответ из одного FTS, `degraded: true` и `degraded_reason`
@@ -53,15 +61,18 @@
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
 //! полного текста чанка, `updated_at`, `kind`, `snippet` | `l0`,
-//! `text`), `degraded`, `degraded_reason` (или `null`), `pending_count` — живые заметки
-//! области, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms, fuse_ms}`
-//! (`null` — этап не выполнялся). Маркеры совпадений в JSON — U+E000/U+E001.
+//! `text`, `rerank_score` 0..1 — у переставленных реранком), `degraded`, `degraded_reason`
+//! (или `null`), `warnings` (строки; пока только о реранке), `pending_count` — живые
+//! заметки области, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms,
+//! fuse_ms, rerank_ms}` (`null` — этап не выполнялся). Маркеры совпадений в JSON —
+//! U+E000/U+E001.
 //!
 //! **Формат `md`** — карточки §9.3, по одной на элемент:
 //! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N> · <дата> · ~<N> tok`,
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
-//! (`chunks`). При деградации последняя строка — `> degraded: <причина> (только FTS)`,
-//! в том числе при пустой выдаче (тогда она единственная).
+//! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
+//! `> degraded: <причина> (только FTS)`, в том числе при пустой выдаче (тогда она
+//! единственная), предупреждения — строками `> warning: <текст>` в конце.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -97,6 +108,7 @@ use crate::auth::Principal;
 use crate::config::SearchSection;
 use crate::error::ApiError;
 use crate::index_state::{DegradedReason, IndexRuntime};
+use crate::rerank;
 
 /// Заголовок текущего решения агента.
 pub const SOLUTION_HEADER: &str = "x-zam-solution";
@@ -121,6 +133,13 @@ enum SearchMode {
 enum OutFormat {
     Json,
     Md,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RerankMode {
+    Off,
+    On,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -154,6 +173,7 @@ struct SearchReq {
     budget_tokens: Option<usize>,
     format: Option<OutFormat>,
     expand: Option<Expand>,
+    rerank: Option<RerankMode>,
 }
 
 /// Пространства запроса с учётом политики доступа (см. модуль).
@@ -413,6 +433,60 @@ struct Item {
     l0: Option<String>,
     /// Текст для `chunks` (после `expand`) и его размер в токенах.
     text: Option<(String, usize)>,
+    /// Балл реранкера (0..1), если элемент переставлен реранком.
+    rerank_score: Option<f32>,
+}
+
+/// Текст пары реранкера: заголовок секции и текст чанка.
+fn rerank_text(h: &FtsHit) -> String {
+    if h.heading_path.is_empty() {
+        h.text.clone()
+    } else {
+        format!("{}\n{}", h.heading_path, h.text)
+    }
+}
+
+/// Не больше `max` элементов с одного узла, порядок сохраняется.
+fn cap_items(items: Vec<Item>, max: usize) -> Vec<Item> {
+    let mut seen: HashMap<Id, usize> = HashMap::new();
+    items
+        .into_iter()
+        .filter(|it| {
+            let n = seen.entry(it.hit.node_id).or_insert(0);
+            *n += 1;
+            *n <= max
+        })
+        .collect()
+}
+
+/// `rerank=on`: первые `ml.rerank_top` элементов — по баллу реранкера (см. модуль).
+/// Сбой — элементы как были и предупреждение.
+async fn rerank_items(
+    st: &AppState,
+    query: &str,
+    items: Vec<Item>,
+) -> (Vec<Item>, Option<&'static str>) {
+    let device = st.index.device.as_ref().map(|d| d.device);
+    let r = match st.rerank.get(device).await {
+        Ok(r) => r,
+        Err(w) => return (items, Some(w)),
+    };
+    let n = st.cfg.ml.rerank_top.min(items.len());
+    let texts: Vec<String> = items[..n].iter().map(|it| rerank_text(&it.hit)).collect();
+    match rerank::score(r, query.to_string(), texts, st.cfg.ml.rerank_tokens).await {
+        Ok(scores) => {
+            let out: Vec<Item> = rerank::reorder(items, &scores)
+                .into_iter()
+                .map(|(mut it, s)| {
+                    it.rerank_score = s;
+                    it
+                })
+                .collect();
+            // лимит на узел — и после перестановки
+            (cap_items(out, st.cfg.search.max_per_node), None)
+        }
+        Err(w) => (items, Some(w)),
+    }
 }
 
 /// `notes`: по одному элементу на узел (лучший чанк), не больше `top_k`.
@@ -617,6 +691,9 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
     o.insert("rev".into(), json!(h.rev));
     o.insert("chunk_ids".into(), json!(p.item.chunk_ids));
     o.insert("score".into(), json!(round_score(p.item.score)));
+    if let Some(r) = p.item.rerank_score {
+        o.insert("rerank_score".into(), json!(round_score(f64::from(r))));
+    }
     o.insert("sources".into(), json!(p.item.sources));
     o.insert("tokens".into(), json!(p.tokens));
     o.insert("updated_at".into(), json!(fmt_ts(h.updated_at)));
@@ -657,7 +734,7 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
     }
     line.push_str(&format!(
         "  [{:.2}] rev{} · {} · ~{} tok\n",
-        p.item.score,
+        p.item.rerank_score.map_or(p.item.score, f64::from),
         h.rev,
         h.updated_at.strftime("%Y-%m-%d"),
         p.tokens
@@ -852,7 +929,13 @@ pub async fn search(
     let ranked = note_to_leaf(ranked, |r| best.get(&r.chunk_id).cloned());
     // лимит на узел — после замены сводок листами
     let mut ranked = cap_per_node(ranked, weights.max_per_node);
-    ranked.truncate(window);
+    let rerank_on = req.rerank == Some(RerankMode::On);
+    // реранку — не меньше `rerank_top` кандидатов, даже при малом top_k
+    ranked.truncate(if rerank_on {
+        window.max(st.cfg.ml.rerank_top)
+    } else {
+        window
+    });
     let needles: Vec<&str> = needles.iter().map(String::as_str).collect();
     let items: Vec<Item> = ranked
         .into_iter()
@@ -868,12 +951,26 @@ pub async fn search(
                 sources: r.sources,
                 l0: None,
                 text: None,
+                rerank_score: None,
             })
         })
         .collect();
     let fuse_ms = ms(fuse_t);
 
-    // 4. top_k, режим, expand, упаковка
+    // 4. серверный реранк
+    let mut warnings: Vec<&'static str> = Vec::new();
+    let mut rerank_ms = None;
+    let items = if rerank_on && !items.is_empty() {
+        let t = Instant::now();
+        let (items, warning) = rerank_items(&st, &req.query, items).await;
+        rerank_ms = Some(ms(t));
+        warnings.extend(warning);
+        items
+    } else {
+        items
+    };
+
+    // 5. top_k, режим, expand, упаковка
     let mut items = match mode {
         SearchMode::Notes => group_by_node(items, top_k),
         SearchMode::Chunks => expand_items(&db, items, expand, top_k).await?,
@@ -900,12 +997,14 @@ pub async fn search(
                 "items": items,
                 "degraded": degraded.is_some(),
                 "degraded_reason": degraded.map(DegradedReason::as_str),
+                "warnings": warnings,
                 "pending_count": pending,
                 "timings": {
                     "fts_ms": fts_ms,
                     "embed_ms": vrun.embed_ms,
                     "vector_ms": vrun.vector_ms,
                     "fuse_ms": fuse_ms,
+                    "rerank_ms": rerank_ms,
                 },
             }))
             .into_response()
@@ -918,6 +1017,9 @@ pub async fn search(
                 .collect();
             if let Some(r) = degraded {
                 body.push_str(&format!("> degraded: {} (только FTS)\n", r.as_str()));
+            }
+            for w in &warnings {
+                body.push_str(&format!("> warning: {w}\n"));
             }
             let mut r = body.into_response();
             r.headers_mut().insert(
@@ -959,8 +1061,26 @@ mod tests {
                 score: 0.5,
                 sources: vec!["fts"],
                 l0: None,
+                rerank_score: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn rerank_text_and_cap_items() {
+        let a = Id::new();
+        let mut h = hit(a, "текст");
+        assert_eq!(rerank_text(&h), "текст");
+        h.heading_path = "A > B".into();
+        assert_eq!(rerank_text(&h), "A > B\nтекст");
+        let b = Id::new();
+        let its = items(
+            vec![hit(a, "1"), hit(a, "22"), hit(b, "333"), hit(a, "4444")],
+            false,
+        );
+        let capped = cap_items(its, 2);
+        let ids: Vec<&str> = capped.iter().map(|i| i.hit.chunk_id.as_str()).collect();
+        assert_eq!(ids, ["c1", "c2", "c3"]);
     }
 
     #[test]
