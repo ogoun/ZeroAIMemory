@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use zam_index::supervisor::{QdrantState, Supervisor};
-use zam_index::{QdrantIndex, VectorIndex, WorkerConfig, WorkerDeps, WorkerHandle};
+use zam_index::{IndexError, QdrantIndex, VectorIndex, WorkerConfig, WorkerDeps, WorkerHandle};
 use zam_ml::{DeviceReport, Embedder};
 use zam_store::{SystemStore, UserDbs};
 
@@ -28,8 +28,11 @@ pub enum DegradedReason {
     NoModel,
     /// Qdrant запускается, перезапускается, недоступен или коллекция ещё не проверена.
     QdrantDown,
-    /// Qdrant выключен супервизором (circuit breaker, чужая версия, нет бинарника).
+    /// Qdrant выключен супервизором (circuit breaker, чужая версия, нет бинарника) или не
+    /// запущен из-за ошибки конфигурации, режима `edge`, клиента.
     Broken,
+    /// Каталог `<data_dir>/qdrant/` занят другим экземпляром zam-server (лок супервизора).
+    QdrantLocked,
     /// `model_id` коллекции не совпадает с текущей моделью: нужен reindex.
     ModelMismatch,
 }
@@ -42,6 +45,7 @@ impl DegradedReason {
             DegradedReason::NoModel => "no_model",
             DegradedReason::QdrantDown => "qdrant_down",
             DegradedReason::Broken => "broken",
+            DegradedReason::QdrantLocked => "qdrant_locked",
             DegradedReason::ModelMismatch => "model_mismatch",
         }
     }
@@ -55,7 +59,10 @@ impl DegradedReason {
             DegradedReason::NoModel => "выполните `zam-server models fetch` и перезапустите сервер",
             DegradedReason::QdrantDown => "Qdrant запускается или недоступен; очередь догонит сама",
             DegradedReason::Broken => {
-                "Qdrant выключен супервизором: см. журнал и `zam-server qdrant status`"
+                "Qdrant выключен супервизором или не запущен: см. журнал и `zam-server qdrant status`"
+            }
+            DegradedReason::QdrantLocked => {
+                "каталог Qdrant занят другим экземпляром zam-server: остановите его и перезапустите сервер"
             }
             DegradedReason::ModelMismatch => {
                 "индекс построен другой моделью: выполните reindex (векторы разных моделей не смешиваются)"
@@ -74,6 +81,8 @@ pub struct IndexRuntime {
     pub vector: Option<Arc<dyn VectorIndex>>,
     /// Ошибка запуска супервизора или подключения к Qdrant.
     pub qdrant_error: Option<String>,
+    /// Причина деградации, если Qdrant не запущен (клиента нет).
+    qdrant_reason: Option<DegradedReason>,
     /// Супервизор (managed / external); забирается при остановке.
     supervisor: Mutex<Option<Arc<Supervisor>>>,
     qdrant_state: Option<tokio::sync::watch::Receiver<QdrantState>>,
@@ -102,6 +111,7 @@ impl IndexRuntime {
             ml_reason: Some(reason),
             vector: None,
             qdrant_error: None,
+            qdrant_reason: None,
             supervisor: Mutex::new(None),
             qdrant_state: None,
             worker: WorkerHandle::idle(),
@@ -132,6 +142,7 @@ impl IndexRuntime {
             ml_reason: None,
             vector: None,
             qdrant_error: None,
+            qdrant_reason: None,
             supervisor: Mutex::new(None),
             qdrant_state: None,
             worker: WorkerHandle::idle(),
@@ -144,6 +155,10 @@ impl IndexRuntime {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     tracing::warn!(error = %e, "супервизор Qdrant не запущен: векторный поиск выключен");
+                    rt.qdrant_reason = Some(match e {
+                        IndexError::Locked(_) => DegradedReason::QdrantLocked,
+                        _ => DegradedReason::Broken,
+                    });
                     rt.qdrant_error = Some(e.to_string());
                     return rt;
                 }
@@ -151,11 +166,13 @@ impl IndexRuntime {
             Ok(None) => {
                 let msg = "qdrant.mode = \"edge\" пока не поддерживается сервером".to_string();
                 tracing::warn!("{msg}: векторный поиск выключен");
+                rt.qdrant_reason = Some(DegradedReason::Broken);
                 rt.qdrant_error = Some(msg);
                 return rt;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "конфигурация Qdrant: векторный поиск выключен");
+                rt.qdrant_reason = Some(DegradedReason::Broken);
                 rt.qdrant_error = Some(e);
                 return rt;
             }
@@ -166,6 +183,7 @@ impl IndexRuntime {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
                     tracing::warn!(error = %e, "клиент Qdrant: векторный поиск выключен");
+                    rt.qdrant_reason = Some(DegradedReason::Broken);
                     rt.qdrant_error = Some(e.to_string());
                     *rt.supervisor.get_mut().unwrap_or_else(|p| p.into_inner()) = Some(sup);
                     return rt;
@@ -216,6 +234,12 @@ impl IndexRuntime {
         self.worker.status().model_mismatch
     }
 
+    /// Старый родитель перенесённого узла: пересчитать его свёртку L0 (воркер знает
+    /// только новое положение узла).
+    pub fn rollup_hint(&self, user: zam_core::Id, folder: zam_core::Id) {
+        self.worker.rollup_hint(user, folder);
+    }
+
     /// Будит воркер после записи узла.
     pub fn notify(&self) {
         self.worker.notify();
@@ -227,7 +251,7 @@ impl IndexRuntime {
             return Err(self.ml_reason.unwrap_or(DegradedReason::NoModel));
         }
         if self.vector.is_none() {
-            return Err(DegradedReason::QdrantDown);
+            return Err(self.qdrant_reason.unwrap_or(DegradedReason::QdrantDown));
         }
         match self.qdrant_state() {
             Some(QdrantState::Broken { .. }) => return Err(DegradedReason::Broken),

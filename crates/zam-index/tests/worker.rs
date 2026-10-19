@@ -12,12 +12,13 @@ use std::time::{Duration, Instant};
 use common::qdrant::TestQdrant;
 use zam_core::Id;
 use zam_index::{
-    PassageEmbedder, QdrantIndex, VectorFilter, VectorIndex, WorkerConfig, WorkerDeps, WorkerHandle,
+    PassageEmbedder, QdrantIndex, VectorFilter, VectorIndex, WorkerConfig, WorkerDeps,
+    WorkerHandle, embed_key,
 };
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, Embedding, NewNote, NodePath, SpaceKind, SystemStore,
-    UserDbs, chunks_for_index, create_note, delete_node, get_node, job_stats, list_spaces,
-    update_note,
+    UserDbs, chunks_for_index, create_note, delete_node, enqueue_reindex, get_node, job_stats,
+    list_spaces, update_note,
 };
 
 const DIM: usize = 16;
@@ -61,6 +62,7 @@ impl PassageEmbedder for Fake {
 
 struct Env {
     _q: TestQdrant,
+    users_dir: PathBuf,
     vector: Arc<dyn VectorIndex>,
     users: UserDbs,
     system: SystemStore,
@@ -86,7 +88,8 @@ async fn env(name: &str) -> Env {
     let dd = DataDir::open(&dir).unwrap();
     let system = SystemStore::open(&dd).unwrap();
     let user = system.create_user("u", false).await.unwrap().id;
-    let users = UserDbs::new(dd.users_dir());
+    let users_dir = dd.users_dir();
+    let users = UserDbs::new(users_dir.clone());
     let db = users.get(user).await.unwrap();
     let spaces = list_spaces(&db).await.unwrap();
     let find = |k: SpaceKind| spaces.iter().find(|s| s.kind == k).unwrap().id;
@@ -94,6 +97,7 @@ async fn env(name: &str) -> Env {
     std::mem::forget(dd);
     Env {
         _q: q,
+        users_dir,
         vector,
         users,
         system,
@@ -205,13 +209,21 @@ async fn indexes_replaces_and_deletes_points_and_skips_excluded() {
         ("excluded".into(), "excluded".into())
     );
 
-    // тот же текст в другой заметке: модель не вызывается (кэш по text_hash)
+    // та же эмбеддируемая строка (переиндексация того же содержимого): модель не вызывается
     let before = e.fake.texts.load(Ordering::SeqCst);
+    enqueue_reindex(&e.db, None).await.unwrap();
+    w.notify();
+    e.indexed(a).await;
+    assert_eq!(e.fake.texts.load(Ordering::SeqCst), before);
+    assert_eq!(w.embedded_texts(), before);
+    // тот же текст в другой заметке — другой context_prefix, отдельный вызов модели
     let b = e.note(e.knowledge, "docs/b", NOTE).await;
     w.notify();
     e.indexed(b).await;
-    assert_eq!(e.fake.texts.load(Ordering::SeqCst), before);
-    assert_eq!(w.embedded_texts(), before);
+    assert!(
+        w.embedded_texts() > before,
+        "другой префикс — другой вектор"
+    );
 
     // правка заменяет точки: старых chunk_id нет, число = текущие чанки
     update_note(
@@ -242,6 +254,82 @@ async fn indexes_replaces_and_deletes_points_and_skips_excluded() {
             == 0
     })
     .await;
+    assert_eq!(job_stats(&e.db).await.unwrap().queued, 0);
+    w.shutdown().await;
+}
+
+/// Одинаковая эмбеддируемая строка внутри пачки считается моделью один раз; ключ кэша —
+/// `embed_key` (blake3 строки `context_prefix + "\n" + text`); пустая заметка — `indexed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_embed_input_in_batch_is_embedded_once_and_empty_note_indexed() {
+    let e = env("dedup").await;
+    // две одинаковые секции под одним заголовком: одинаковые префикс и текст;
+    // ручной L0 — без предложений-кандидатов
+    let sec = "Повторяющийся абзац о сборке проекта и его тестах. ".repeat(12);
+    let content = format!("---\nl0: Ручная\n---\n# Раздел\n\n{sec}\n\n# Раздел\n\n{sec}\n");
+    let n = e.note(e.knowledge, "dup", &content).await;
+    let empty = e.note(e.knowledge, "empty", "").await;
+    let w = e.spawn();
+    e.indexed(n).await;
+    e.indexed(empty).await;
+    let chunks = chunks_for_index(&e.db, n).await.unwrap();
+    let keys: std::collections::HashSet<String> = chunks.iter().map(embed_key).collect();
+    assert!(
+        keys.len() < chunks.len(),
+        "в заметке нет повторов: {}",
+        chunks.len()
+    );
+    let ek = chunks_for_index(&e.db, empty).await.unwrap();
+    let all: std::collections::HashSet<String> = keys
+        .iter()
+        .cloned()
+        .chain(ek.iter().map(embed_key))
+        .collect();
+    assert_eq!(w.embedded_texts(), all.len() as u64);
+    // ключ — blake3 ровно той строки, что ушла в модель
+    let c = &chunks[0];
+    assert_eq!(
+        embed_key(c),
+        blake3::hash(format!("{}\n{}", c.context_prefix, c.text).as_bytes())
+            .to_hex()
+            .to_string()
+    );
+    w.shutdown().await;
+    assert!(!w.status().running && !w.status().vector_ready);
+}
+
+/// Сбой одной базы при пересборке: остальные базы пересобраны один раз и индексируются,
+/// повтор — только для сбойной.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_skips_broken_user_db_and_does_not_repeat_others() {
+    let e = env("rebuild-bad").await;
+    let a = e.note(e.knowledge, "a", NOTE).await;
+    // второй пользователь с повреждённым файлом базы
+    let bad = e.system.create_user("bad", false).await.unwrap().id;
+    std::fs::write(
+        e.users_dir.join(format!("{bad}.db")),
+        b"not a sqlite database at all",
+    )
+    .unwrap();
+    let w = e.spawn();
+    e.indexed(a).await;
+    w.request_rebuild();
+    // пересборка поставила задание для a: оно снова проиндексировано
+    e.until("reindex a", async || {
+        w.jobs_done() >= 2 && e.state(a).await == "indexed"
+    })
+    .await;
+    let done = w.jobs_done();
+    // новая запись индексируется, пока сбойная база повторяется
+    let b = e
+        .note(e.knowledge, "b", "Заметка во время повторов пересборки.\n")
+        .await;
+    w.notify();
+    e.indexed(b).await;
+    // несколько периодов повтора (retry_max = 500 мс): a повторно не перечанковывается
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(w.jobs_done(), done + 1);
+    assert_eq!(e.state(a).await, "indexed");
     assert_eq!(job_stats(&e.db).await.unwrap().queued, 0);
     w.shutdown().await;
 }

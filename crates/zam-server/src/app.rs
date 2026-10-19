@@ -108,7 +108,14 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     // Модель — до первого открытия базы пользователя: перечанковка R1 и запись идут
     // точным счётчиком токенов модели (без второй копии токенизатора).
     let ml_cfg = cfg.clone();
-    let ml = tokio::task::spawn_blocking(move || ml::load(&ml_cfg)).await?;
+    // паника загрузки (ORT, модель) не валит старт: сервер работает в режиме FTS-only
+    let ml = match tokio::task::spawn_blocking(move || ml::load(&ml_cfg)).await {
+        Ok(m) => m,
+        Err(e) => ml::MlLoad::failed(
+            crate::index_state::DegradedReason::NoModel,
+            format!("загрузка модели завершилась аварийно: {e}"),
+        ),
+    };
     if let Some(e) = &ml.embedder {
         zam_store::set_token_counter(Arc::new(e.token_counter()));
     }

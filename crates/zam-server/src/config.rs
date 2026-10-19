@@ -232,14 +232,18 @@ impl MlSection {
             source_name: "итог".into(),
             message: format!("ожидается \"\" или <число>s|m|h, получено `{raw}`"),
         };
-        let (num, unit) = raw.split_at(raw.len() - 1);
-        let n: u64 = num.trim().parse().map_err(|_| invalid())?;
-        let secs = match unit {
-            "s" => n,
-            "m" => n * 60,
-            "h" => n * 3600,
+        // последний символ — единица; многобайтовый символ («5м») — ошибка, не паника
+        let Some((at, unit)) = raw.char_indices().last() else {
+            return Err(invalid());
+        };
+        let n: u64 = raw[..at].trim().parse().map_err(|_| invalid())?;
+        let mul = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
             _ => return Err(invalid()),
         };
+        let secs = n.checked_mul(mul).ok_or_else(invalid)?;
         if secs == 0 {
             return Err(invalid());
         }
@@ -851,7 +855,7 @@ yield_ms = 1
             Some(std::time::Duration::from_secs(1800))
         );
         assert_eq!(c.index.yield_ms, 1);
-        for bad in ["10", "5x", "0s", "m"] {
+        for bad in ["10", "5x", "0s", "m", "5м", "м", "18446744073709551615h"] {
             let e = vec![env("ZAM_ML__UNLOAD_AFTER", bad)];
             let err = load(None, &e, &Default::default()).unwrap_err().to_string();
             assert!(err.contains("ml.unload_after"), "{bad}: {err}");

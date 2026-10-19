@@ -288,8 +288,10 @@ async fn twenty_notes_indexed_then_edit_and_delete_replace_points() {
     a.st.shutdown().await;
 }
 
+/// Одинаковая эмбеддируемая строка считается моделью один раз (переиндексация того же
+/// содержимого — без модели); тот же текст в другой заметке — другой префикс, отдельный вызов.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn same_text_in_two_notes_is_embedded_once() {
+async fn same_embed_input_once_other_prefix_separately() {
     if !have(MINILM) {
         return;
     }
@@ -307,14 +309,134 @@ async fn same_text_in_two_notes_is_embedded_once() {
     .await;
     let before = a.st.index.worker.embedded_texts();
     assert!(before > 0);
+    // переиндексация того же содержимого (reindex из кэша)
+    let db = a.st.users.get(uid(&a)).await.unwrap();
+    zam_store::enqueue_reindex(&db, None).await.unwrap();
+    a.st.index.notify();
+    until("x reindexed", Duration::from_secs(10), async || {
+        state(&a, &x).await == "indexed" && job_stats(&db).await.unwrap().queued == 0
+    })
+    .await;
+    assert_eq!(a.st.index.worker.embedded_texts(), before);
+    // тот же текст в другой заметке
     let y = id(&a.note("knowledge", "y", &body(7)).await);
     until("y indexed", Duration::from_secs(10), async || {
         state(&a, &y).await == "indexed"
     })
     .await;
-    assert_eq!(a.st.index.worker.embedded_texts(), before);
+    assert!(a.st.index.worker.embedded_texts() > before);
     assert_eq!(points(&a, None, Some("y")).await, chunk_count(&a, &y).await);
     a.st.shutdown().await;
+}
+
+/// Перенос заметки из папки: свёртка L0 и точка старой папки пересчитываются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn move_out_of_folder_updates_old_folder_rollup() {
+    if !have(MINILM) {
+        return;
+    }
+    let q = TestQdrant::start("srv-move");
+    let a = api("idx-move", |c| {
+        ml(c, MINILM);
+        external(c, &q);
+    })
+    .await;
+    vector_ready(&a).await;
+    let n1 = id(&a.note("knowledge", "a/n1", &body(1)).await);
+    let n2 = id(&a.note("knowledge", "a/n2", &body(2)).await);
+    a.note("knowledge", "b/keep", &body(3)).await;
+    let db = a.st.users.get(uid(&a)).await.unwrap();
+    let folder_a = get_node(&db, n1.parse().unwrap())
+        .await
+        .unwrap()
+        .parent_id
+        .unwrap();
+    let l0_a = async || {
+        get_node(&db, folder_a)
+            .await
+            .unwrap()
+            .l0
+            .unwrap_or_default()
+    };
+    let folder_points = async |prefix: &str| {
+        let f = VectorFilter {
+            user_id: uid(&a),
+            space_ids: vec![],
+            path_prefix: Some(prefix.into()),
+            levels: vec!["folder".into()],
+        };
+        a.st.index.vector.as_ref().unwrap().count(&f).await.unwrap()
+    };
+    until("свёртка a", Duration::from_secs(10), async || {
+        let l = l0_a().await;
+        l.contains("n1") && l.contains("n2") && folder_points("a").await == 1
+    })
+    .await;
+
+    let mv = async |node: &str, to: &str| {
+        let r = a
+            .t(
+                Method::POST,
+                &format!("/api/v1/nodes/{node}/move"),
+                Some(json!({ "path": to })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    };
+    mv(&n1, "b/n1").await;
+    until(
+        "строка n1 ушла из L0 папки a",
+        Duration::from_secs(10),
+        async || {
+            let l = l0_a().await;
+            !l.contains("n1") && l.contains("n2")
+        },
+    )
+    .await;
+    // последняя заметка ушла: L0 папки пуст, её точка удалена
+    mv(&n2, "b/n2").await;
+    until(
+        "папка a пуста",
+        Duration::from_secs(10),
+        async || {
+            get_node(&db, folder_a).await.unwrap().l0.is_none() && folder_points("a").await == 0
+        },
+    )
+    .await;
+    a.st.shutdown().await;
+}
+
+/// Каталог Qdrant занят другим супервизором: отдельная причина деградации.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn locked_qdrant_dir_is_reported_separately() {
+    if !have(MINILM) {
+        return;
+    }
+    let dir = common::tmp("api-idx-locked");
+    let (http, grpc) = (free_port(), free_port());
+    // чужой супервизор держит лок <data_dir>/qdrant (бинарника нет — процесса тоже)
+    let mut m = zam_index::supervisor::ManagedConfig::new(dir.join("нет").join("qdrant"));
+    m.http_port = http;
+    m.grpc_port = grpc;
+    let other = zam_index::supervisor::Supervisor::start(
+        zam_index::supervisor::SupervisorConfig::Managed(m),
+        &dir,
+    )
+    .await
+    .unwrap();
+    let mut c = common::cfg_in(dir);
+    ml(&mut c, MINILM);
+    c.qdrant.binary = Some(qdrant_bin());
+    c.qdrant.http_port = http;
+    c.qdrant.grpc_port = grpc;
+    let a = common::api::api_with(c).await;
+    assert_eq!(
+        a.st.index.vector_available(),
+        Err(DegradedReason::QdrantLocked)
+    );
+    assert_eq!(DegradedReason::QdrantLocked.as_str(), "qdrant_locked");
+    a.st.shutdown().await;
+    other.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

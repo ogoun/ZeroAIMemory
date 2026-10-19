@@ -40,6 +40,41 @@ impl std::fmt::Debug for MlLoad {
     }
 }
 
+impl MlLoad {
+    /// Модель не загружена: причина пишется в лог одной строкой WARN с подсказкой.
+    pub fn failed(reason: DegradedReason, msg: String) -> MlLoad {
+        tracing::warn!(
+            reason = reason.as_str(),
+            error = %msg,
+            hint = reason.hint(),
+            "векторный поиск выключен (FTS-only)"
+        );
+        MlLoad {
+            embedder: None,
+            device: None,
+            error: Some((reason, msg)),
+        }
+    }
+}
+
+/// Точный счётчик токенов модели без ONNX Runtime (только токенизатор): для
+/// `zam-server migrate`, где модель не нужна, а перечанковка R1 должна идти тем же
+/// счётчиком, что и сервер. Модели bge-m3 int8/fp16 делят один токенизатор.
+pub fn token_counter(cfg: &ServerConfig) -> Option<zam_ml::BgeTokenCounter> {
+    let dir = cfg.ml.models_dir(&cfg.data_dir);
+    let ids: Vec<&str> = match cfg
+        .ml
+        .embed_model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+    {
+        Some(m) => vec![m],
+        None => vec![MODEL_CPU, MODEL_GPU],
+    };
+    ids.into_iter()
+        .find_map(|id| zam_ml::BgeTokenCounter::load(&dir, id).ok())
+}
+
 /// Настройки `zam-ml` из `[ml]`.
 pub fn ml_config(cfg: &ServerConfig) -> anyhow::Result<MlConfig> {
     let ml = &cfg.ml;
@@ -82,19 +117,7 @@ fn have_model(models_dir: &Path, id: &str) -> bool {
 
 /// Загружает модель (блокирующий вызов: sha256 файла модели, сборка сессий).
 pub fn load(cfg: &ServerConfig) -> MlLoad {
-    let fail = |reason: DegradedReason, msg: String| {
-        tracing::warn!(
-            reason = reason.as_str(),
-            error = %msg,
-            hint = reason.hint(),
-            "векторный поиск выключен (FTS-only)"
-        );
-        MlLoad {
-            embedder: None,
-            device: None,
-            error: Some((reason, msg)),
-        }
-    };
+    let fail = MlLoad::failed;
     let mc = match ml_config(cfg) {
         Ok(c) => c,
         Err(e) => return fail(DegradedReason::NoModel, e.to_string()),

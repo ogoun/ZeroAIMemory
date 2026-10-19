@@ -29,7 +29,9 @@ pub use vector::{
     IndexFuture, IndexMeta, IndexPoint, NAMESPACE_ZAM, PointPayload, VectorFilter, VectorHit,
     VectorIndex, point_id,
 };
-pub use worker::{PassageEmbedder, WorkerConfig, WorkerDeps, WorkerHandle, WorkerStatus};
+pub use worker::{
+    PassageEmbedder, WorkerConfig, WorkerDeps, WorkerHandle, WorkerStatus, embed_input, embed_key,
+};
 
 /// Ошибки векторного индекса. Тексты без векторов, текста чанков и секретов.
 #[derive(Debug, thiserror::Error)]

@@ -181,6 +181,12 @@ pub async fn move_to(
     let path = NodePath::parse(&req.path)?;
     let node = move_node(&sc.db, sc.node.id, path).await?;
     st.render_gen.bump_space(sc.user.id, sc.space.id);
+    // свёртка L0 старого родителя: задания индексации знают только новое положение
+    if let Some(old) = sc.node.parent_id
+        && node.parent_id != Some(old)
+    {
+        st.index.rollup_hint(sc.user.id, old);
+    }
     st.index.notify();
     Ok(Json(node))
 }

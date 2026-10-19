@@ -8,10 +8,12 @@
 //! 2. **Пересборка.** `storage_rebuilt` супервизора, [`WorkerHandle::request_rebuild`]
 //!    или коллекция, созданная заново при уже проиндексированных узлах →
 //!    `enqueue_reindex` во всех базах (векторы из `embeddings`, без инференса для
-//!    известных текстов); для `storage_rebuilt` — аудит `index.storage_rebuilt` и
-//!    `ack_storage_rebuilt()`.
+//!    известных текстов). Сбой одной базы не останавливает остальные: она пропускается
+//!    и повторяется позже, уже обработанные базы повторно не перечанковываются;
+//!    индексация идёт и во время повторов. Для `storage_rebuilt` аудит
+//!    `index.storage_rebuilt` и `ack_storage_rebuilt()` — когда прошли все базы.
 //! 3. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла →
-//!    кэш `embeddings` по `text_hash` → инференс промахов (`spawn_blocking`, пачки не
+//!    кэш `embeddings` по [`embed_key`] → инференс промахов (`spawn_blocking`, пачки не
 //!    больше `batch_tokens`, уступка `yield_ms`) → `delete_node` + `upsert` (`wait=true`)
 //!    → `complete_job` → `index_state = 'indexed'` только при [`JobOutcome::Done`].
 //!    Qdrant недоступен или коллекции нет — задания возвращаются [`release_job`] без
@@ -20,8 +22,12 @@
 //!    папки-предки — свёртка L0 детей с дебаунсом `rollup_debounce`, папка индексируется
 //!    точкой уровня `folder`.
 //!
-//! Текст эмбеддинга чанка — `context_prefix + "\n" + text` (§8.2 п. 6), ключ кэша —
-//! `text_hash` текста чанка (§6.3). В лог не попадают тексты, векторы и ключ Qdrant.
+//! Текст эмбеддинга чанка — [`embed_input`]: `context_prefix + "\n" + text` (§8.2 п. 6);
+//! ключ кэша — [`embed_key`]: blake3 ровно этой строки. Одинаковая эмбеддируемая строка
+//! считается моделью один раз; тот же текст под другим префиксом (другая заметка) —
+//! отдельный вектор. Ключи предложений L0 и L0 папки — со своим доменом.
+//! Перенос узла: API сообщает старого родителя ([`WorkerHandle::rollup_hint`]), его
+//! свёртка пересчитывается. В лог не попадают тексты, векторы и ключ Qdrant.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -117,6 +123,8 @@ struct Inner {
     rebuild: AtomicBool,
     embedded: AtomicU64,
     jobs_done: AtomicU64,
+    /// Папки, свёртку которых нужно пересчитать (старый родитель при переносе).
+    hints: Mutex<Vec<(Id, Id)>>,
     stop: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -149,6 +157,7 @@ impl WorkerHandle {
                 rebuild: AtomicBool::new(false),
                 embedded: AtomicU64::new(0),
                 jobs_done: AtomicU64::new(0),
+                hints: Mutex::default(),
                 stop,
                 task: Mutex::new(None),
             }),
@@ -167,6 +176,9 @@ impl WorkerHandle {
             cfg,
             rollups: Rollups::default(),
             opened: HashSet::new(),
+            pending: None,
+            last_q: None,
+            bad_users: HashMap::new(),
         };
         let task = tokio::spawn(w.run());
         *lock(&h.inner.task) = Some(task);
@@ -193,6 +205,14 @@ impl WorkerHandle {
         self.inner.jobs_done.load(Ordering::SeqCst)
     }
 
+    /// Пересчитать свёртку L0 папки `folder` пользователя `user` и её предков (с дебаунсом):
+    /// API вызывает для старого родителя при переносе или переименовании узла — задание
+    /// индексации знает только новое положение.
+    pub fn rollup_hint(&self, user: Id, folder: Id) {
+        lock(&self.inner.hints).push((user, folder));
+        self.notify();
+    }
+
     /// Пересобрать индекс: `ensure` заново и `enqueue_reindex` во всех базах (после
     /// `drop_all` или смены модели). Выполняется воркером асинхронно.
     pub fn request_rebuild(&self) {
@@ -206,13 +226,21 @@ impl WorkerHandle {
         let _ = self.inner.stop.send(true);
         self.inner.notify.notify_one();
         let task = lock(&self.inner.task).take();
-        if let Some(mut t) = task
-            && tokio::time::timeout(STOP_TIMEOUT, &mut t).await.is_err()
-        {
-            tracing::warn!("воркер индексации не остановился за минуту, задача прервана");
-            t.abort();
+        if let Some(mut t) = task {
+            match tokio::time::timeout(STOP_TIMEOUT, &mut t).await {
+                Err(_) => {
+                    tracing::warn!("воркер индексации не остановился за минуту, задача прервана");
+                    t.abort();
+                }
+                Ok(Err(e)) if e.is_panic() => {
+                    tracing::error!(error = %e, "задача воркера индексации завершилась паникой");
+                }
+                Ok(_) => {}
+            }
         }
-        lock(&self.inner.status).running = false;
+        let mut st = lock(&self.inner.status);
+        st.running = false;
+        st.vector_ready = false;
     }
 }
 
@@ -295,7 +323,44 @@ struct Worker {
     rollups: Rollups,
     /// Базы, для которых выполнен `requeue_running` (задания после аварии).
     opened: HashSet<Id>,
+    /// Незавершённая пересборка: базы, которые ещё не прошли `enqueue_reindex`.
+    pending: Option<Rebuild>,
+    /// Последнее увиденное состояние Qdrant (смена — повод проверить ворота сразу).
+    last_q: Option<QdrantState>,
+    /// Базы, которые не открылись: следующая попытка не раньше срока (без шума в журнале).
+    bad_users: HashMap<Id, Instant>,
 }
+
+/// Пересборка, идущая по базам.
+struct Rebuild {
+    /// Хранилище Qdrant стёрто: по завершении — аудит и `ack_storage_rebuilt`.
+    storage: bool,
+    /// Базы, уже поставленные в очередь.
+    done: HashSet<Id>,
+    /// Поставлено заданий.
+    jobs: u64,
+    started: Instant,
+    /// Следующая попытка для неудавшихся баз.
+    next_try: Instant,
+}
+
+/// Задача воркера завершилась (штатно или паникой): векторный канал выключен, иначе
+/// `vector_available` продолжал бы отвечать «готов».
+struct ExitGuard(Arc<Inner>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!("воркер индексации завершился паникой: векторный поиск выключен");
+        }
+        let mut st = lock(&self.0.status);
+        st.running = false;
+        st.vector_ready = false;
+    }
+}
+
+/// Пауза между попытками для базы, которая не открылась.
+const BAD_USER_RETRY: Duration = Duration::from_secs(60);
 
 impl Worker {
     fn stopped(&self) -> bool {
@@ -323,6 +388,11 @@ impl Worker {
 
     /// Ждёт события: остановка, смена состояния Qdrant, `notify` (если `wake`) или срок.
     async fn wait(&mut self, until: Instant, wake: bool) -> Wake {
+        // состояние сменилось, пока воркер был занят (сигнал `changed` уже мог быть
+        // поглощён другим ожиданием): сразу назад, к воротам
+        if self.q_changed() {
+            return Wake::State;
+        }
         let mut stop = self.stop.clone();
         let mut q = self.qstate.clone();
         let inner = self.inner.clone();
@@ -332,15 +402,34 @@ impl Worker {
             () = inner.notify.notified(), if wake => Wake::Notify,
             () = tokio::time::sleep_until(until.into()) => Wake::Timer,
         };
-        if let (Some(mine), Some(mut theirs)) = (&mut self.qstate, q) {
-            // отметить увиденное значение: следующий `changed` — только на новое
-            theirs.borrow_and_update();
-            *mine = theirs;
+        if reason == Wake::Stop {
+            return reason;
         }
-        reason
+        // сравнение явное: какая бы ветка ни сработала, смена состояния не теряется
+        if self.q_changed() {
+            Wake::State
+        } else {
+            reason
+        }
+    }
+
+    /// Состояние Qdrant отличается от последнего увиденного (и отмечается увиденным).
+    fn q_changed(&mut self) -> bool {
+        let Some(rx) = &mut self.qstate else {
+            return false;
+        };
+        let cur = rx.borrow_and_update().clone();
+        if self.last_q.as_ref() == Some(&cur) {
+            return false;
+        }
+        let first = self.last_q.is_none();
+        self.last_q = Some(cur);
+        !first
     }
 
     async fn run(mut self) {
+        let _guard = ExitGuard(self.inner.clone());
+        self.q_changed();
         tracing::info!(model = %self.model(), "воркер индексации запущен");
         let mut ensured = false;
         let mut retry_at: Option<Instant> = None;
@@ -368,14 +457,20 @@ impl Worker {
                 .as_ref()
                 .is_some_and(|s| s.storage_rebuilt());
             let requested = self.inner.rebuild.swap(false, Ordering::SeqCst);
-            if storage || requested {
+            if requested {
+                // новый запрос — заново по всем базам
+                self.start_rebuild(storage);
                 ensured = false;
-                if let Err(e) = self.rebuild(storage).await {
-                    tracing::warn!(error = %e, "пересборка индекса не поставлена, повтор");
-                    self.inner.rebuild.store(requested, Ordering::SeqCst);
-                    self.wait(Instant::now() + self.cfg.retry_max, false).await;
-                    continue;
-                }
+            } else if storage && self.pending.is_none() {
+                self.start_rebuild(true);
+                ensured = false;
+            }
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|p| Instant::now() >= p.next_try)
+            {
+                self.rebuild_step().await;
             }
             // 3. Коллекция
             if !ensured {
@@ -422,6 +517,7 @@ impl Worker {
                 }
             };
             // 5. Свёртки L0
+            self.take_hints().await;
             match self.run_rollups().await {
                 Ok(()) => {}
                 Err(Halt::Stopped) => break,
@@ -429,6 +525,7 @@ impl Worker {
                     ensured = false;
                     self.vector_down(&e);
                     retry_at = Some(Instant::now() + backoff);
+                    backoff = (backoff * 2).min(self.cfg.retry_max);
                     continue;
                 }
             }
@@ -438,6 +535,9 @@ impl Worker {
                 let mut until = Instant::now() + self.cfg.idle_poll;
                 if let Some(d) = self.rollups.next_due() {
                     until = until.min(d);
+                }
+                if let Some(p) = &self.pending {
+                    until = until.min(p.next_try);
                 }
                 self.wait(until, true).await;
             }
@@ -496,19 +596,17 @@ impl Worker {
             // их нужно вернуть из `embeddings`
             let mut lost = 0i64;
             for u in self.users().await {
-                if let Ok(db) = self.deps.users.get(u).await {
+                if let Some(db) = self.open_db(u).await {
                     lost += indexed_count(&db).await.unwrap_or(0);
                 }
             }
-            if lost > 0 {
+            if lost > 0 && self.pending.is_none() {
                 tracing::warn!(
                     nodes = lost,
                     "коллекция Qdrant создана заново: пересборка из embeddings"
                 );
-                if let Err(e) = self.rebuild(false).await {
-                    tracing::warn!(error = %e, "пересборка не поставлена, повтор");
-                    self.inner.rebuild.store(true, Ordering::SeqCst);
-                }
+                self.start_rebuild(false);
+                self.rebuild_step().await;
             }
         }
         Ok(true)
@@ -524,23 +622,73 @@ impl Worker {
         }
     }
 
-    /// `enqueue_reindex` во всех базах; `storage` — хранилище Qdrant стёрто: аудит и ack.
-    async fn rebuild(&mut self, storage: bool) -> Result<(), StoreError> {
-        let started = Instant::now();
-        let mut jobs = 0u64;
-        let users = self.deps.system.list_users().await?;
+    /// Начинает пересборку по всем базам (прежняя незавершённая заменяется; флаг
+    /// `storage` сохраняется, пока стирание хранилища не подтверждено).
+    fn start_rebuild(&mut self, storage: bool) {
+        let storage = storage || self.pending.as_ref().is_some_and(|p| p.storage);
+        self.pending = Some(Rebuild {
+            storage,
+            done: HashSet::new(),
+            jobs: 0,
+            started: Instant::now(),
+            next_try: Instant::now(),
+        });
+    }
+
+    /// Шаг пересборки: `enqueue_reindex` в каждой ещё не обработанной базе. Сбой базы —
+    /// WARN и повтор позже только для неё. Когда прошли все базы: для стёртого хранилища
+    /// аудит `index.storage_rebuilt` и `ack_storage_rebuilt()`.
+    async fn rebuild_step(&mut self) {
+        let Some(mut p) = self.pending.take() else {
+            return;
+        };
+        let users = match self.deps.system.list_users().await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(error = %e, "пересборка: список пользователей недоступен");
+                p.next_try = Instant::now() + self.cfg.retry_max;
+                self.pending = Some(p);
+                return;
+            }
+        };
+        let mut failed = 0usize;
         for u in &users {
-            let db = self.deps.users.get(u.id).await?;
-            jobs += enqueue_reindex(&db, None).await?;
+            if p.done.contains(&u.id) || self.stopped() {
+                continue;
+            }
+            let res = match self.deps.users.get(u.id).await {
+                Ok(db) => enqueue_reindex(&db, None).await,
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(n) => {
+                    p.jobs += n;
+                    p.done.insert(u.id);
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(
+                        user = %u.id,
+                        error = %e,
+                        "пересборка: база пользователя пропущена, повтор позже"
+                    );
+                }
+            }
+        }
+        if failed > 0 || self.stopped() {
+            p.next_try = Instant::now() + self.cfg.retry_max;
+            self.pending = Some(p);
+            return;
         }
         tracing::info!(
             users = users.len(),
-            jobs,
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            jobs = p.jobs,
+            elapsed_ms = p.started.elapsed().as_millis() as u64,
             "пересборка индекса поставлена в очередь"
         );
-        if storage {
-            self.deps
+        if p.storage {
+            let audit = self
+                .deps
                 .system
                 .audit(
                     "system",
@@ -548,16 +696,43 @@ impl Worker {
                     "index.storage_rebuilt",
                     None,
                     None,
-                    serde_json::json!({ "users": users.len(), "jobs": jobs }),
+                    serde_json::json!({ "users": users.len(), "jobs": p.jobs }),
                 )
-                .await?;
+                .await;
+            if let Err(e) = audit {
+                tracing::warn!(error = %e, "аудит index.storage_rebuilt не записан, повтор");
+                p.next_try = Instant::now() + self.cfg.retry_max;
+                self.pending = Some(p);
+                return;
+            }
             if let Some(s) = &self.deps.supervisor
                 && let Err(e) = s.ack_storage_rebuilt()
             {
                 tracing::warn!(error = %e, "флаг пересборки хранилища не снят");
             }
         }
-        Ok(())
+    }
+
+    /// База пользователя; не открывшаяся — WARN не чаще раза в минуту и пропуск.
+    async fn open_db(&mut self, user: Id) -> Option<Db> {
+        if self
+            .bad_users
+            .get(&user)
+            .is_some_and(|t| Instant::now() < *t)
+        {
+            return None;
+        }
+        match self.deps.users.get(user).await {
+            Ok(db) => {
+                self.bad_users.remove(&user);
+                Some(db)
+            }
+            Err(e) => {
+                tracing::warn!(user = %user, error = %e, "база пользователя не открылась, пропуск");
+                self.bad_users.insert(user, Instant::now() + BAD_USER_RETRY);
+                None
+            }
+        }
     }
 
     /// Один круг по базам: не больше одной пачки на пользователя. `Ok(true)` — работа была.
@@ -572,12 +747,8 @@ impl Worker {
                 return Err(Halt::Stopped);
             }
             let user = users[(*rr + k) % users.len()];
-            let db = match self.deps.users.get(user).await {
-                Ok(db) => db,
-                Err(e) => {
-                    tracing::warn!(user = %user, error = %e, "база пользователя не открылась");
-                    continue;
-                }
+            let Some(db) = self.open_db(user).await else {
+                continue;
             };
             if self.opened.insert(user) {
                 match requeue_running(&db).await {
@@ -660,7 +831,7 @@ impl Worker {
             })
             .flatten()
             .map(|c| EmbedItem {
-                key: c.text_hash.clone(),
+                key: embed_key(c),
                 input: embed_input(c),
                 tokens: c.token_count.max(1) as usize + c.context_prefix.len() / 3,
             })
@@ -715,17 +886,24 @@ impl Worker {
                     if let Plan::Upsert(chunks) = &plan {
                         // L0 до отметки: `indexed` означает, что узел обработан целиком
                         self.auto_l0(db, j.target_id, j.rev, chunks, &embs).await;
-                        if let Err(e) =
+                    }
+                    // upsert без чанков (пустая заметка) тоже завершён: иначе вечный pending;
+                    // исключённый и удалённый узел set_index_state не меняет
+                    if j.op == JobOp::Upsert
+                        && let Err(e) =
                             set_index_state(db, j.target_id, j.rev, IndexState::Indexed).await
-                        {
-                            tracing::warn!(node = %j.target_id, error = %e, "index_state");
-                        }
+                    {
+                        tracing::warn!(node = %j.target_id, error = %e, "index_state");
                     }
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(job = j.id, error = %e, "complete_job"),
             }
-            self.schedule_ancestors(user, db, j.target_id).await;
+            let parent = get_node(db, j.target_id)
+                .await
+                .ok()
+                .and_then(|n| n.parent_id);
+            self.schedule_chain(user, db, parent).await;
         }
         Ok(())
     }
@@ -743,7 +921,7 @@ impl Worker {
             Plan::Upsert(chunks) => {
                 let mut pts = Vec::with_capacity(chunks.len());
                 for c in chunks {
-                    let e = embs.get(&c.text_hash).ok_or_else(|| {
+                    let e = embs.get(&embed_key(c)).ok_or_else(|| {
                         IndexError::Other(format!("нет эмбеддинга чанка {}", c.id))
                     })?;
                     pts.push(chunk_point(user, c, e));
@@ -842,7 +1020,7 @@ impl Worker {
             .iter()
             .filter(|c| c.level == ChunkLevel::Chunk)
             .filter_map(|c| {
-                embs.get(&c.text_hash)
+                embs.get(&embed_key(c))
                     .map(|e| (c.text.as_str(), &e.dense[..]))
             })
             .collect();
@@ -896,12 +1074,19 @@ impl Worker {
         }
     }
 
-    /// Папки-предки узла (включая удалённые) — в очередь свёртки.
-    async fn schedule_ancestors(&mut self, user: Id, db: &Db, node: Id) {
-        let mut cur = match get_node(db, node).await {
-            Ok(n) => n.parent_id,
-            Err(_) => return,
-        };
+    /// Подсказки API (старый родитель перенесённого узла) — в очередь свёртки.
+    async fn take_hints(&mut self) {
+        let hints = std::mem::take(&mut *lock(&self.inner.hints));
+        for (user, folder) in hints {
+            if let Some(db) = self.open_db(user).await {
+                self.schedule_chain(user, &db, Some(folder)).await;
+            }
+        }
+    }
+
+    /// Папка `start` и её предки (включая удалённые) — в очередь свёртки.
+    async fn schedule_chain(&mut self, user: Id, db: &Db, start: Option<Id>) {
+        let mut cur = start;
         // глубина дерева ограничена здравым смыслом; защита от цикла в повреждённых данных
         for _ in 0..256 {
             let Some(id) = cur else { break };
@@ -1083,8 +1268,14 @@ pub fn embed_input(c: &IndexChunk) -> String {
     }
 }
 
+/// Ключ кэша `embeddings` чанка: blake3 (hex) ровно той строки, что уходит в модель
+/// ([`embed_input`]). Используется воркером и пересборкой из кэша (задача 10).
+pub fn embed_key(c: &IndexChunk) -> String {
+    blake3::hash(embed_input(c).as_bytes()).to_hex().to_string()
+}
+
 /// Ключ кэша `embeddings` для текста, которого нет среди чанков (предложение L0,
-/// L0 папки): домен отделяет его от `text_hash` чанков.
+/// L0 папки): домен отделяет его от ключей чанков ([`embed_key`]).
 fn keyed_hash(domain: &str, text: &str) -> String {
     let mut h = blake3::Hasher::new();
     h.update(domain.as_bytes());
