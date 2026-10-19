@@ -498,6 +498,7 @@ async fn unavailable_qdrant_keeps_queue_and_catches_up() {
     let a = e.note(e.knowledge, "a", NOTE).await;
     w.notify();
     e.indexed(a).await;
+    assert_eq!(w.jobs_requeued(), 0);
 
     e._q.stop();
     let b = e
@@ -513,6 +514,8 @@ async fn unavailable_qdrant_keeps_queue_and_catches_up() {
     assert_eq!(e.state(b).await, "pending");
     let st = job_stats(&e.db).await.unwrap();
     assert_eq!((st.queued, st.failed), (1, 0));
+    // задание пачки возвращено в очередь записью, получившей Unavailable
+    assert!(w.jobs_requeued() >= 1, "{}", w.jobs_requeued());
     // попытки не сгорели
     let attempts: i64 =
         e.db.read(|c| Ok(c.query_row("SELECT max(attempts) FROM index_jobs", [], |r| r.get(0))?))

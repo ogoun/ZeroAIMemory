@@ -178,6 +178,8 @@ struct Inner {
     reindex: Mutex<VecDeque<ReindexRequest>>,
     embedded: AtomicU64,
     jobs_done: AtomicU64,
+    /// Заданий, возвращённых в очередь из-за недоступности Qdrant при записи пачки.
+    jobs_requeued: AtomicU64,
     /// Суммарное время инференса и записи в Qdrant, мкс (диагностика, `/index/status`).
     embed_us: AtomicU64,
     qdrant_us: AtomicU64,
@@ -218,6 +220,7 @@ impl WorkerHandle {
                 reindex: Mutex::default(),
                 embedded: AtomicU64::new(0),
                 jobs_done: AtomicU64::new(0),
+                jobs_requeued: AtomicU64::new(0),
                 embed_us: AtomicU64::new(0),
                 qdrant_us: AtomicU64::new(0),
                 hints: Mutex::default(),
@@ -271,6 +274,13 @@ impl WorkerHandle {
     /// Сколько заданий закрыто (`Done`).
     pub fn jobs_done(&self) -> u64 {
         self.inner.jobs_done.load(Ordering::SeqCst)
+    }
+
+    /// Сколько заданий возвращено в очередь из-за недоступности Qdrant (`Unavailable`
+    /// или пропавшая коллекция при записи пачки): запись не подтверждена, задание не
+    /// закрыто и не стало неудачным — повтор после возврата Qdrant.
+    pub fn jobs_requeued(&self) -> u64 {
+        self.inner.jobs_requeued.load(Ordering::SeqCst)
     }
 
     /// Суммарное время с запуска: `(инференс, запись в Qdrant)` — где воркер тратит время.
@@ -1182,12 +1192,27 @@ impl Worker {
         Ok(did)
     }
 
-    async fn release_all(&self, db: &Db, jobs: &[Job]) {
+    /// Возвращает задания в очередь; итог — сколько возвращено (устаревший захват —
+    /// задание уже перехвачено — не считается).
+    async fn release_all(&self, db: &Db, jobs: &[Job]) -> u64 {
+        let mut n = 0;
         for j in jobs {
-            if let Err(e) = release_job(db, j.id, j.claim_gen).await {
-                tracing::warn!(job = j.id, error = %e, "задание не возвращено в очередь");
+            match release_job(db, j.id, j.claim_gen).await {
+                Ok(JobOutcome::Requeued) => n += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(job = j.id, error = %e, "задание не возвращено в очередь")
+                }
             }
         }
+        n
+    }
+
+    /// Возвращает задания пачки в очередь из-за недоступности Qdrant (счётчик
+    /// [`WorkerHandle::jobs_requeued`]).
+    async fn requeue_unavailable(&self, db: &Db, jobs: &[Job]) {
+        let n = self.release_all(db, jobs).await;
+        self.inner.jobs_requeued.fetch_add(n, Ordering::SeqCst);
     }
 
     async fn fail(&self, db: &Db, j: &Job, err: &str) {
@@ -1287,7 +1312,7 @@ impl Worker {
             Ok(()) => {}
             Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
                 let back: Vec<Job> = ready.into_iter().map(|(j, _)| j).collect();
-                self.release_all(db, &back).await;
+                self.requeue_unavailable(db, &back).await;
                 return Err(Halt::Vector(e));
             }
             Err(e) => {
@@ -1306,7 +1331,7 @@ impl Worker {
                             let mut back: Vec<Job> = keep.into_iter().map(|(j, _)| j).collect();
                             back.push(j);
                             back.extend(rest.map(|(j, _)| j));
-                            self.release_all(db, &back).await;
+                            self.requeue_unavailable(db, &back).await;
                             return Err(Halt::Vector(e));
                         }
                         Err(e) => self.fail(db, &j, &e.to_string()).await,
