@@ -2,7 +2,8 @@
 //!
 //! Каждый [`TestQdrant`] — отдельный процесс в свежем каталоге под `CARGO_TARGET_TMPDIR`
 //! на свободных портах 127.0.0.1, со случайным API-ключом в `QDRANT__SERVICE__API_KEY`.
-//! Процесс завершается в `Drop`. Боевой супервизор (Job Object / PDEATHSIG, pid-файл) — задача 6.
+//! Процесс завершается в `Drop`. Боевой запуск — `zam_index::supervisor` (тесты в `supervisor.rs`);
+//! здесь — облегчённый вариант без лока, pid-файла и перезапусков для тестов адаптера.
 
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -34,7 +35,7 @@ pub fn qdrant_bin() -> PathBuf {
 }
 
 /// Свободный TCP-порт на 127.0.0.1 (порт освобождается сразу, гонка допустима для тестов).
-fn free_port() -> u16 {
+pub fn free_port() -> u16 {
     TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .and_then(|l| l.local_addr())
         .map(|a| a.port())

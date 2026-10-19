@@ -74,14 +74,101 @@ pub enum QdrantMode {
     Edge,
 }
 
-/// В M0 только разбирается.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Секция `[qdrant]` (§4.3). Супервизор строится из неё через [`QdrantSection::supervisor_config`].
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QdrantSection {
     pub mode: QdrantMode,
+    /// gRPC-адрес внешнего Qdrant (`mode = "external"`), например `http://127.0.0.1:6334`.
     pub url: Option<String>,
     pub http_port: u16,
     pub grpc_port: u16,
+    /// Бинарник управляемого Qdrant; по умолчанию `<exe_dir>/qdrant/<ver>/qdrant[.exe]`.
+    pub binary: Option<PathBuf>,
+    /// `storage.performance.max_search_threads` (0 — авто): не отбирать CPU у инференса.
+    pub max_search_threads: u32,
+    /// `storage.performance.optimizer_cpu_budget` (0 — авто).
+    pub optimizer_cpu_budget: u32,
+    /// API-ключ внешнего Qdrant. Для `managed` не задаётся: ключ случайный при каждом старте.
+    pub api_key: Option<String>,
+}
+
+// Вручную: ключ внешнего Qdrant не должен попадать в отладочный вывод.
+impl std::fmt::Debug for QdrantSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QdrantSection")
+            .field("mode", &self.mode)
+            .field("url", &self.url)
+            .field("http_port", &self.http_port)
+            .field("grpc_port", &self.grpc_port)
+            .field("binary", &self.binary)
+            .field("max_search_threads", &self.max_search_threads)
+            .field("optimizer_cpu_budget", &self.optimizer_cpu_budget)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+impl QdrantSection {
+    /// Бинарник управляемого Qdrant: из конфигурации или из комплекта рядом с `exe_dir`.
+    pub fn binary_path(&self, exe_dir: &Path) -> PathBuf {
+        self.binary
+            .clone()
+            .unwrap_or_else(|| zam_index::supervisor::default_binary(exe_dir))
+    }
+
+    /// Конфигурация супервизора; `None` — режим `edge` (экспериментальный, без процесса).
+    pub fn supervisor_config(
+        &self,
+        exe_dir: &Path,
+    ) -> Result<Option<zam_index::supervisor::SupervisorConfig>, ConfigError> {
+        use zam_index::supervisor::{ManagedConfig, SupervisorConfig};
+        let invalid = |key: &str, message: &str| ConfigError::Invalid {
+            key: key.into(),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        match self.mode {
+            QdrantMode::Managed => {
+                if self.api_key.is_some() {
+                    return Err(invalid(
+                        "qdrant.api_key",
+                        "задаётся только для mode = \"external\": управляемый Qdrant получает случайный ключ при каждом старте",
+                    ));
+                }
+                if self.http_port == self.grpc_port {
+                    return Err(invalid("qdrant.grpc_port", "совпадает с http_port"));
+                }
+                let mut m = ManagedConfig::new(self.binary_path(exe_dir));
+                m.http_port = self.http_port;
+                m.grpc_port = self.grpc_port;
+                m.max_search_threads = self.max_search_threads;
+                m.optimizer_cpu_budget = self.optimizer_cpu_budget;
+                Ok(Some(SupervisorConfig::Managed(m)))
+            }
+            QdrantMode::External => {
+                let url = self
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| {
+                        invalid(
+                            "qdrant.url",
+                            "обязателен для mode = \"external\" (gRPC-адрес)",
+                        )
+                    })?;
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(invalid("qdrant.url", "ожидается http:// или https://"));
+                }
+                Ok(Some(SupervisorConfig::external(
+                    url,
+                    self.api_key.clone().filter(|k| !k.is_empty()),
+                )))
+            }
+            QdrantMode::Edge => Ok(None),
+        }
+    }
 }
 
 /// Пределы размеров (§16.2): заметка и вложение, байт.
@@ -116,6 +203,10 @@ impl Default for ServerConfig {
                 url: None,
                 http_port: 6333,
                 grpc_port: 6334,
+                binary: None,
+                max_search_threads: 2,
+                optimizer_cpu_budget: 2,
+                api_key: None,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -394,6 +485,11 @@ mod tests {
         assert_eq!(c.log.max_files, 14);
         assert_eq!(c.qdrant.mode, QdrantMode::Managed);
         assert_eq!((c.qdrant.http_port, c.qdrant.grpc_port), (6333, 6334));
+        assert_eq!(
+            (c.qdrant.max_search_threads, c.qdrant.optimizer_cpu_budget),
+            (2, 2)
+        );
+        assert_eq!((&c.qdrant.binary, &c.qdrant.api_key), (&None, &None));
         assert_eq!(c.limits.note_max_bytes, 5_242_880);
         assert_eq!(c.limits.blob_max_bytes, 209_715_200);
     }
@@ -554,6 +650,56 @@ note_max_bytes = 1000
         let c = load(None, &env, &Default::default()).unwrap();
         assert_eq!(c.log.format, LogFormat::Text);
         assert_eq!(c.qdrant.mode, QdrantMode::External);
+    }
+
+    #[test]
+    fn qdrant_section_layers_and_supervisor_config() {
+        use zam_index::supervisor::{SupervisorConfig, default_binary};
+        let f = write_in_target(
+            "qdrant.toml",
+            "[qdrant]\nhttp_port = 7333\nmax_search_threads = 4\nbinary = \"/opt/q/qdrant\"\n",
+        );
+        let e = vec![
+            env("ZAM_QDRANT__GRPC_PORT", "7334"),
+            env("ZAM_QDRANT__OPTIMIZER_CPU_BUDGET", "1"),
+        ];
+        let c = load(Some(&f), &e, &Default::default()).unwrap();
+        let exe = std::path::Path::new("inst");
+        let Some(SupervisorConfig::Managed(m)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался managed");
+        };
+        assert_eq!((m.http_port, m.grpc_port), (7333, 7334));
+        assert_eq!((m.max_search_threads, m.optimizer_cpu_budget), (4, 1));
+        assert_eq!(m.binary, std::path::PathBuf::from("/opt/q/qdrant"));
+
+        // По умолчанию — бинарник из комплекта.
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.qdrant.binary_path(exe), default_binary(exe));
+
+        // Ключ — только для external; там же обязателен url.
+        let e = vec![env("ZAM_QDRANT__API_KEY", "s3cret-key")];
+        let c = load(None, &e, &Default::default()).unwrap();
+        let err = c.qdrant.supervisor_config(exe).unwrap_err().to_string();
+        assert!(err.contains("qdrant.api_key"), "{err}");
+        assert!(!format!("{c:?}").contains("s3cret-key"), "ключ в Debug");
+        let mut e = vec![
+            env("ZAM_QDRANT__MODE", "external"),
+            env("ZAM_QDRANT__API_KEY", "s3cret-key"),
+        ];
+        let c = load(None, &e, &Default::default()).unwrap();
+        let err = c.qdrant.supervisor_config(exe).unwrap_err().to_string();
+        assert!(err.contains("qdrant.url"), "{err}");
+        e.push(env("ZAM_QDRANT__URL", "http://10.0.0.5:6334"));
+        let c = load(None, &e, &Default::default()).unwrap();
+        let Some(SupervisorConfig::External(x)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался external");
+        };
+        assert_eq!(x.grpc_url, "http://10.0.0.5:6334");
+        assert_eq!(x.api_key.as_deref(), Some("s3cret-key"));
+
+        let e = vec![env("ZAM_QDRANT__MODE", "edge")];
+        let c = load(None, &e, &Default::default()).unwrap();
+        assert!(c.qdrant.supervisor_config(exe).unwrap().is_none());
     }
 
     #[test]

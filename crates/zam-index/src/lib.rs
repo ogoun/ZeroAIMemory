@@ -7,12 +7,16 @@
 //!   коллекция `zam_chunks` с именованными векторами `dense` и `sparse`, гибридный запрос
 //!   prefetch + RRF, фильтр по тенанту `user_id`.
 //! - [`point_id`] — детерминированный id точки (UUIDv5 от `chunk_id`): upsert идемпотентен.
+//! - [`supervisor`] — супервизор нативного Qdrant (§4.3): запуск с привязкой к родителю
+//!   (Job Object / PDEATHSIG), готовность и версия, перезапуск с circuit breaker, метка
+//!   хранилища и пересборка, штатная остановка; `status`/`reset` для CLI.
 //!
 //! Источник истины — SQLite: индекс пересобирается из `embeddings` без инференса.
 //! Пространство `human` в индекс никогда не попадает. В ошибки и логи не попадают
 //! векторы, текст чанков и API-ключ.
 
 mod qdrant;
+pub mod supervisor;
 mod vector;
 
 pub use qdrant::{COLLECTION, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE};
@@ -34,6 +38,12 @@ pub enum IndexError {
     /// Коллекция или ответ в неожиданном виде (нет вектора `dense`, нет полей payload).
     #[error("индекс повреждён: {0}")]
     Corrupt(String),
+    /// Каталог `<data_dir>/qdrant/` занят другим супервизором (второй экземпляр сервера).
+    #[error("каталог Qdrant {0} занят другим экземпляром zam-server")]
+    Locked(String),
+    /// Ошибка управления процессом Qdrant (каталог, поток, стирание хранилища).
+    #[error("супервизор Qdrant: {0}")]
+    Process(String),
     /// Прочие ошибки (неверный запрос, отклонённые данные).
     #[error("ошибка индекса: {0}")]
     Other(String),

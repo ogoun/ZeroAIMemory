@@ -89,7 +89,11 @@ fn repo_root() -> PathBuf {
 fn load_manifests(root: &Path) -> Result<Vec<Manifest>> {
     MANIFESTS
         .iter()
-        .map(|n| Manifest::load(&root.join("deploy").join(format!("{n}.toml"))))
+        .map(|n| {
+            Ok(Manifest::load(
+                &root.join("deploy").join(format!("{n}.toml")),
+            )?)
+        })
         .collect()
 }
 

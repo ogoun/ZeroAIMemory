@@ -21,6 +21,33 @@ enum Cmd {
     HashPassword,
     /// Открыть все базы (с миграциями) и выйти
     Migrate(Opts),
+    /// Управляемый Qdrant: загрузка бинарника, состояние, сброс хранилища
+    Qdrant {
+        #[command(subcommand)]
+        cmd: QdrantCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum QdrantCmd {
+    /// Скачать бинарник Qdrant по манифесту (SHA-256), если его нет
+    Fetch {
+        #[command(flatten)]
+        opts: Opts,
+        /// Манифест вместо встроенного при сборке (формат deploy/qdrant.toml)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+    /// Показать состояние: режим, версия, порты, pid, хранилище (ничего не запускает)
+    Status(Opts),
+    /// Стереть хранилище Qdrant (сервер остановлен); при старте — пересборка индекса
+    Reset {
+        #[command(flatten)]
+        opts: Opts,
+        /// Подтверждение
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -73,6 +100,31 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Migrate(o) => {
             let n = zam_server::migrate(load(o)?).await?;
             eprintln!("миграции применены: system.db и баз пользователей: {n}");
+            Ok(())
+        }
+        Cmd::Qdrant { cmd } => qdrant_cmd(cmd).await,
+    }
+}
+
+async fn qdrant_cmd(cmd: QdrantCmd) -> anyhow::Result<()> {
+    use zam_server::qdrant;
+    let exe_dir = qdrant::exe_dir()?;
+    match cmd {
+        QdrantCmd::Fetch { opts, manifest } => {
+            let cfg = load(opts)?;
+            let m = qdrant::load_manifest(manifest.as_deref())?;
+            let binary = cfg.qdrant.binary_path(&exe_dir);
+            // ureq блокирующий: загрузка вне потоков runtime.
+            let report = tokio::task::spawn_blocking(move || qdrant::fetch(&m, &binary)).await??;
+            println!("{report}");
+            Ok(())
+        }
+        QdrantCmd::Status(opts) => {
+            println!("{}", qdrant::status(&load(opts)?, &exe_dir).await?);
+            Ok(())
+        }
+        QdrantCmd::Reset { opts, yes } => {
+            println!("{}", qdrant::reset(&load(opts)?, yes)?);
             Ok(())
         }
     }

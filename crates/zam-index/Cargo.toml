@@ -1,10 +1,21 @@
 [package]
 name = "zam-index"
-description = "Векторный индекс ZeroAIMemory: трейт VectorIndex и адаптер Qdrant (named dense + sparse, RRF)"
+description = "Векторный индекс ZeroAIMemory: трейт VectorIndex, адаптер Qdrant (named dense+sparse, RRF) и супервизор нативного Qdrant"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+build = "build.rs"
+
+# Вспомогательный бинарник теста «родитель убит» (tests/supervisor.rs): запускает
+# супервизор и печатает pid Qdrant. В поставку не входит (xtask упаковывает только
+# zam-server и zam).
+[[bin]]
+name = "kill_parent_probe"
+path = "tests/bin/kill_parent_probe.rs"
+test = false
+doc = false
+bench = false
 
 [dependencies]
 qdrant-client.workspace = true
@@ -12,8 +23,20 @@ tonic.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+fs4.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "io-util", "process", "macros"] }
 zam-core = { path = "../zam-core" }
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { workspace = true, features = ["job-object", "creation-flags"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+process-wrap = { workspace = true, features = ["process-group"] }
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-rand.workspace = true

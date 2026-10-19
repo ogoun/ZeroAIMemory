@@ -22,6 +22,8 @@ ipnet.workspace = true
 thiserror.workspace = true
 argon2.workspace = true
 zam-store = { path = "../zam-store" }
+zam-index = { path = "../zam-index" }
+zam-fetch = { path = "../zam-fetch" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
@@ -48,6 +50,7 @@ tower = { workspace = true, features = ["util"] }
 memory-serve.workspace = true
 
 [dev-dependencies]
+zip.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 

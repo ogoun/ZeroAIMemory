@@ -72,6 +72,11 @@ half = "2"
 qdrant-client = { version = "=1.19.0", default-features = false }
 # только tonic::Code/Status для разбора ошибок qdrant-client (клиент tonic не реэкспортирует)
 tonic = { version = "0.14", default-features = false }
+# M2: супервизор нативного Qdrant — Job Object / группа процессов (исследование 05 §7.2)
+process-wrap = { version = "=10.0.1", default-features = false, features = ["tokio1", "kill-on-drop"] }
+libc = "0.2"
+# версия та же, что у process-wrap 10.0.1 (тип PROCESS_CREATION_FLAGS)
+windows = "0.62"
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]

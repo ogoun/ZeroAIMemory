@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod error;
 pub mod logging;
+pub mod qdrant;
 pub mod web;
 
 #[cfg(test)]

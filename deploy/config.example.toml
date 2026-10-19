@@ -33,11 +33,20 @@ max_files = 14
 [qdrant]
 # Режим Qdrant: "managed" (запускается сервером), "external" (внешний, нужен url) или "edge".
 mode = "managed"
-# Адрес внешнего Qdrant (для mode = "external").
-# url = "http://127.0.0.1:6333"
-# Порты управляемого Qdrant.
+# gRPC-адрес внешнего Qdrant (для mode = "external").
+# url = "http://127.0.0.1:6334"
+# API-ключ внешнего Qdrant (только для mode = "external"; лучше через ZAM_QDRANT__API_KEY).
+# Управляемый Qdrant получает новый случайный ключ при каждом старте.
+# api_key = "..."
+# Порты управляемого Qdrant (слушает только 127.0.0.1).
 http_port = 6333
 grpc_port = 6334
+# Бинарник управляемого Qdrant. По умолчанию — из комплекта: <каталог zam-server>/qdrant/<версия>/qdrant[.exe];
+# если его нет, скачайте: zam-server qdrant fetch.
+# binary = "/opt/zam/qdrant/1.19.2/qdrant"
+# Потоки поиска и бюджет CPU оптимизатора Qdrant (0 — авто): не отбирать CPU у инференса.
+max_search_threads = 2
+optimizer_cpu_budget = 2
 
 [limits]
 # Предел размера заметки, байт (5 МБ). Больше — 413 при создании, замене и PATCH.
