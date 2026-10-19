@@ -56,7 +56,10 @@ test('индекс: модели не загружены, подсказка к�
   const alert = page.locator('.alert').first();
   await expect(alert).toContainText('Векторный поиск недоступен: модели не загружены');
   await expect(alert).toContainText('Поиск работает в режиме полнотекстового (FTS)');
-  await expect(alert.locator('code.cmd')).toHaveText('zam-server models fetch');
+  // текст причины и подсказка — с сервера, команды выделены
+  await expect(alert.locator('code.cmd', { hasText: 'zam-server models fetch' })).toBeVisible();
+  // постоянные блоки статуса — не role=alert (alert — только ошибки загрузки и reindex)
+  await expect(page.getByRole('alert')).toHaveCount(0);
   await expect(page.locator('dl.grid')).toContainText('не загружена');
   // повреждённых и исключённых баз на свежем сервере нет
   await expect(page.getByText('Базы пользователей не открываются')).toHaveCount(0);
@@ -85,6 +88,9 @@ test('индекс: модели не загружены, подсказка к�
   // узкий экран: страница и шапка без горизонтальной прокрутки
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.locator('.alert').first()).toBeVisible();
+  // снимок — после окончания анимации выдвижной панели
+  await expect(page.locator('#sidebar')).not.toBeInViewport();
+  await page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'));
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: `${screens}index-status-narrow.png`, fullPage: true });
 
@@ -116,11 +122,70 @@ test('поиск: строка деградации, метки каналов, 
   await page.goto(`${base()}#/u/${uid}/s/knowledge/n/${second}`);
   await expect(page.locator('.doc').getByRole('heading', { level: 1, name: /^Вторая заметка/ })).toBeVisible();
   await expect(page.locator('.doc-head .meta')).toContainText('в очереди на индексацию');
-  await expect(page.locator('.doc-head .meta').getByRole('img', { name: 'Индексация: в очереди' })).toBeVisible();
+  // рядом с текстом значок скрыт от экранных читалок (не читается дважды)
+  await expect(page.locator('.doc-head .meta .ibadge-pending')).toHaveAttribute('aria-hidden', 'true');
   const row = page.locator('nav[aria-label="Дерево заметок"] li').filter({
     has: page.getByRole('link', { name: 'Вторая заметка' }),
   });
   await expect(row.getByRole('img', { name: 'Индексация: в очереди' }).first()).toBeVisible();
+
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('индекс: неудавшиеся задания одного узла, повреждённые базы, пауза на скрытой вкладке', async ({ page }) => {
+  const problems = watch(page);
+  const uid = await login(page);
+  const second = env('E2E_NOTE_SECOND');
+  // настоящий ответ сервера, дополненный тем, что на сервере e2e не воспроизвести:
+  // два неудавшихся задания одного узла (разные id), повреждённая и исключённая базы
+  let calls = 0;
+  await page.route('**/api/v1/index/status', async (route) => {
+    calls++;
+    const r = await route.fetch();
+    const body = await r.json();
+    const failed = (id: number) => ({
+      id,
+      user_id: uid,
+      node_id: second,
+      space_id: 'knowledge',
+      path: 'E2E/Вторая заметка',
+      op: 'upsert',
+      error: 'Qdrant: отказ',
+      attempts: 5,
+      updated_at: new Date().toISOString(),
+    });
+    body.failed_items = [failed(7), failed(3)];
+    body.unavailable_dbs = [{ user_id: 'u-broken', error: 'file is not a database' }];
+    body.rebuild_skipped = [{ user_id: 'u-skip', error: 'database is locked', attempts: 5 }];
+    await route.fulfill({ response: r, json: body });
+  });
+  await page.goto(`${base()}#/admin/index`);
+  const rows = page.locator('table tbody tr');
+  await expect(rows).toHaveCount(2);
+  await expect(rows.first().getByRole('link', { name: 'E2E/Вторая заметка' })).toBeVisible();
+  await expect(page.getByText('Базы пользователей не открываются: 1')).toBeVisible();
+  await expect(page.getByText('file is not a database')).toBeVisible();
+  await expect(page.getByText('Исключены из пересборки индекса: 1')).toBeVisible();
+  await page.screenshot({ path: `${screens}index-failed.png`, fullPage: true });
+
+  // вкладка скрыта — опрос на паузе; вернулась — статус сразу обновляется
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  const before = calls;
+  await page.waitForTimeout(6500);
+  expect(calls).toBe(before);
+  const next = page.waitForResponse((r) => r.url().endsWith('/api/v1/index/status'), { timeout: 1500 });
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await next;
+
+  // переход из таблицы к заметке
+  await rows.first().getByRole('link', { name: 'E2E/Вторая заметка' }).click();
+  await expect(page.locator('.doc').getByRole('heading', { level: 1, name: /^Вторая заметка/ })).toBeVisible();
 
   expect(problems, problems.join('\n')).toEqual([]);
 });

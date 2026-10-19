@@ -530,7 +530,7 @@ async fn qdrant_down_degrades_to_fts() {
         .text();
     assert!(
         t.trim_end()
-            .ends_with("> degraded: qdrant_down (только FTS)"),
+            .ends_with("> degraded: qdrant_down — векторная база Qdrant запускается или недоступна (только FTS)"),
         "{t}"
     );
 }

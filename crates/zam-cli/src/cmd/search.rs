@@ -67,21 +67,6 @@ pub fn run(ctx: &Ctx, query: &str, o: &Opts) -> Result<(), CliError> {
     emit(text.as_bytes())
 }
 
-/// Причина деградации (`degraded_reason`, `DegradedReason` сервера) — по-русски.
-fn reason_text(code: &str) -> &str {
-    match code {
-        "no_runtime" => "модели не загружены: не найдена библиотека ONNX Runtime",
-        "no_model" => "модели не загружены (zam-server models fetch)",
-        "qdrant_down" => "векторная база Qdrant запускается или недоступна",
-        "qdrant_locked" => "каталог Qdrant занят другим экземпляром сервера",
-        "broken" => "векторная база Qdrant выключена после сбоев",
-        "model_mismatch" => "индекс построен другой моделью, нужна переиндексация",
-        "embed_failed" => "не удалось вычислить эмбеддинг запроса",
-        "search_failed" => "запрос к векторной базе не удался",
-        other => other,
-    }
-}
-
 /// Предупреждение ответа (`warnings`) — по-русски.
 fn warning_text(w: &str) -> &str {
     match w {
@@ -93,15 +78,17 @@ fn warning_text(w: &str) -> &str {
     }
 }
 
-/// Строки для stderr: деградация и предупреждения из ответа (JSON или Markdown).
+/// Строки для stderr: деградация и предупреждения из ответа (JSON или Markdown). Текст
+/// причины берётся из ответа сервера (`degraded_text` или строка `> degraded: <код> —
+/// <текст> (только FTS)`): словарь причин один — `DegradedReason::text` сервера.
 fn notices(text: &str, json: bool) -> Vec<String> {
-    let (reason, warnings): (Option<String>, Vec<String>) = if json {
+    // (код, текст)
+    let (reason, warnings): (Option<(String, String)>, Vec<String>) = if json {
         let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
         let reason = (v["degraded"] == json!(true)).then(|| {
-            v["degraded_reason"]
-                .as_str()
-                .unwrap_or("причина не указана")
-                .to_string()
+            let code = v["degraded_reason"].as_str().unwrap_or("").to_string();
+            let text = v["degraded_text"].as_str().unwrap_or("").to_string();
+            (code, text)
         });
         let warnings = v["warnings"]
             .as_array()
@@ -113,15 +100,11 @@ fn notices(text: &str, json: bool) -> Vec<String> {
             .unwrap_or_default();
         (reason, warnings)
     } else {
-        // строки сервера: `> degraded: <код> (только FTS)` и `> warning: <текст>`
         let reason = text.lines().find_map(|l| {
             let r = l.strip_prefix("> degraded: ")?;
-            Some(
-                r.strip_suffix(" (только FTS)")
-                    .unwrap_or(r)
-                    .trim()
-                    .to_string(),
-            )
+            let r = r.strip_suffix(" (только FTS)").unwrap_or(r).trim();
+            let (code, text) = r.split_once(" — ").unwrap_or((r, ""));
+            Some((code.to_string(), text.to_string()))
         });
         let warnings = text
             .lines()
@@ -130,10 +113,15 @@ fn notices(text: &str, json: bool) -> Vec<String> {
         (reason, warnings)
     };
     let mut out = Vec::new();
-    if let Some(r) = reason {
+    if let Some((code, text)) = reason {
+        let why = match (text.is_empty(), code.is_empty()) {
+            (false, false) => format!("{text} [{code}]"),
+            (false, true) => text,
+            (true, false) => code,
+            (true, true) => "причина не указана".to_string(),
+        };
         out.push(format!(
-            "векторный поиск недоступен: {} [{r}] — показаны результаты полнотекстового поиска",
-            reason_text(&r)
+            "векторный поиск недоступен: {why} — показаны результаты полнотекстового поиска"
         ));
     }
     out.extend(
@@ -150,13 +138,19 @@ mod tests {
 
     #[test]
     fn notices_from_json() {
-        let t = r#"{"items":[],"degraded":true,"degraded_reason":"no_model","warnings":["reranker failed"]}"#;
+        let t = r#"{"items":[],"degraded":true,"degraded_reason":"no_model","degraded_text":"модели не загружены","warnings":["reranker failed"]}"#;
         assert_eq!(
             notices(t, true),
             [
-                "векторный поиск недоступен: модели не загружены (zam-server models fetch) [no_model] — показаны результаты полнотекстового поиска",
+                "векторный поиск недоступен: модели не загружены [no_model] — показаны результаты полнотекстового поиска",
                 "предупреждение: реранкер не сработал (см. журнал сервера), результаты без реранка",
             ]
+        );
+        // сервер без текста — код
+        let t = r#"{"items":[],"degraded":true,"degraded_reason":"x","warnings":[]}"#;
+        assert_eq!(
+            notices(t, true),
+            ["векторный поиск недоступен: x — показаны результаты полнотекстового поиска"]
         );
         let t = r#"{"items":[],"degraded":false,"degraded_reason":null,"warnings":[]}"#;
         assert!(notices(t, true).is_empty());
@@ -166,37 +160,20 @@ mod tests {
 
     #[test]
     fn notices_from_markdown() {
-        let t =
-            "1. **a**\n> degraded: qdrant_down (только FTS)\n> warning: reranker not installed\n";
+        let t = "1. **a**\n> degraded: qdrant_down — Qdrant недоступен (только FTS)\n\
+                 > warning: reranker not installed\n";
         let n = notices(t, false);
-        assert_eq!(n.len(), 2, "{n:?}");
-        assert!(
-            n[0].starts_with("векторный поиск недоступен: векторная база Qdrant")
-                && n[0].contains("[qdrant_down]"),
-            "{n:?}"
+        assert_eq!(
+            n,
+            [
+                "векторный поиск недоступен: Qdrant недоступен [qdrant_down] — показаны результаты полнотекстового поиска",
+                "предупреждение: реранкер не установлен (zam-server models fetch --reranker), результаты без реранка",
+            ]
         );
-        assert!(n[1].contains("реранкер не установлен"), "{n:?}");
-        // неизвестная причина и предупреждение — как есть
+        // старый формат без текста и неизвестное предупреждение — как есть
         let n = notices("> degraded: new_reason (только FTS)\n> warning: x\n", false);
-        assert!(n[0].contains("new_reason [new_reason]"), "{n:?}");
+        assert!(n[0].contains(": new_reason — показаны"), "{n:?}");
         assert_eq!(n[1], "предупреждение: x");
         assert!(notices("1. **a**\n", false).is_empty());
-    }
-
-    #[test]
-    fn every_server_reason_has_text() {
-        // полный список `DegradedReason::as_str` сервера
-        for r in [
-            "no_runtime",
-            "no_model",
-            "qdrant_down",
-            "qdrant_locked",
-            "broken",
-            "model_mismatch",
-            "embed_failed",
-            "search_failed",
-        ] {
-            assert_ne!(reason_text(r), r, "{r}");
-        }
     }
 }

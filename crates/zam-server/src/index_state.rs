@@ -57,11 +57,26 @@ impl DegradedReason {
         }
     }
 
-    /// Что сделать администратору.
+    /// Причина по-русски для человека (WebUI, CLI, строка `> degraded:` в Markdown) —
+    /// единый словарь: клиенты берут текст из ответа (`degraded_text`, `vector.text`).
+    pub fn text(self) -> &'static str {
+        match self {
+            DegradedReason::NoRuntime => "модели не загружены: не найдена библиотека ONNX Runtime",
+            DegradedReason::NoModel => "модели не загружены",
+            DegradedReason::QdrantDown => "векторная база Qdrant запускается или недоступна",
+            DegradedReason::Broken => "векторная база Qdrant выключена или не запущена",
+            DegradedReason::QdrantLocked => "каталог Qdrant занят другим экземпляром сервера",
+            DegradedReason::ModelMismatch => "индекс построен другой моделью, нужна переиндексация",
+            DegradedReason::EmbedFailed => "не удалось вычислить эмбеддинг запроса",
+            DegradedReason::SearchFailed => "запрос к векторной базе не удался",
+        }
+    }
+
+    /// Что сделать администратору (команды — в обратных кавычках: WebUI выделяет их).
     pub fn hint(self) -> &'static str {
         match self {
             DegradedReason::NoRuntime => {
-                "положите ONNX Runtime рядом с zam-server (комплект поставки) или задайте ml.ort_dylib"
+                "положите ONNX Runtime рядом с zam-server (комплект поставки) или задайте `ml.ort_dylib`, затем выполните `zam-server models fetch` и перезапустите сервер"
             }
             DegradedReason::NoModel => "выполните `zam-server models fetch` и перезапустите сервер",
             DegradedReason::QdrantDown => "Qdrant запускается или недоступен; очередь догонит сама",

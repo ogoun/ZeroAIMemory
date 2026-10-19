@@ -335,6 +335,8 @@ export interface SearchResult {
   degraded: boolean;
   /** Причина деградации (`no_model`, `qdrant_down`, …) или `null`. */
   degraded_reason: string | null;
+  /** Та же причина по-русски (словарь сервера). */
+  degraded_text?: string | null;
   /** Предупреждения (пока только о реранке). */
   warnings: string[];
 }
@@ -382,7 +384,8 @@ export interface ReindexOutcome {
 
 /** Ответ `GET /index/status` (crates/zam-server/src/api/index.rs). */
 export interface IndexStatus {
-  vector: { available: boolean; reason: string | null; hint: string | null };
+  /** `text` — причина по-русски, `hint` — что сделать (команды в обратных кавычках). */
+  vector: { available: boolean; reason: string | null; text?: string | null; hint: string | null };
   /** `kind`: `cpu` | `cuda` | `null` (модель не загружена). */
   device: { kind: string | null; reason: string };
   model: { id: string | null; dim: number; collection_model: string | null; error: string | null };
@@ -397,8 +400,13 @@ export interface IndexStatus {
   };
   queue: { queued: number; running: number; failed: number; oldest: string | null };
   failed_items: {
+    /** Id задания: у одного узла неудавшихся заданий может быть несколько. */
+    id: number;
     user_id: string;
     node_id: string;
+    /** Пространство и путь узла; `null` — узел удалён насовсем. */
+    space_id: string | null;
+    path: string | null;
     op: string;
     error: string;
     attempts: number;

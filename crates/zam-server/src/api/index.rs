@@ -68,8 +68,11 @@ fn qdrant_state(s: &Option<QdrantState>) -> (&'static str, Option<String>) {
 
 fn failed_json(user: Id, f: &FailedJob) -> Value {
     json!({
+        "id": f.id,
         "user_id": user,
         "node_id": f.node_id,
+        "space_id": f.space_id,
+        "path": f.path,
         "op": f.op.as_str(),
         "error": f.error,
         "attempts": f.attempts,
@@ -200,6 +203,7 @@ pub async fn status(
         "vector": {
             "available": reason.is_none(),
             "reason": reason.map(|r| r.as_str()),
+            "text": reason.map(|r| r.text()),
             "hint": reason.map(|r| r.hint()),
         },
         "device": device,

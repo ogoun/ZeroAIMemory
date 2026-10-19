@@ -1,14 +1,21 @@
 <script lang="ts">
   // Значок состояния индексации заметки (`index_state`) — встроенный SVG, без библиотек
   // иконок: `pending` — часы, `failed` — восклицательный знак, `excluded` — перечёркнутый
-  // круг. `indexed` — без значка (обычное состояние не шумит).
+  // круг. `indexed` — без значка (обычное состояние не шумит). `decorative` — рядом есть
+  // текст состояния: значок скрыт от экранных читалок, чтобы не читать его дважды.
   import { stateText } from '../lib/indexing';
 
-  let { state }: { state: string } = $props();
+  let { state, decorative = false }: { state: string; decorative?: boolean } = $props();
 </script>
 
 {#if state === 'pending' || state === 'failed' || state === 'excluded'}
-  <span class="ibadge ibadge-{state}" role="img" aria-label={stateText(state)} title={stateText(state)}>
+  <span
+    class="ibadge ibadge-{state}"
+    role={decorative ? undefined : 'img'}
+    aria-label={decorative ? undefined : stateText(state)}
+    aria-hidden={decorative ? 'true' : undefined}
+    title={decorative ? undefined : stateText(state)}
+  >
     <svg viewBox="0 0 16 16" aria-hidden="true">
       {#if state === 'pending'}
         <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5" />

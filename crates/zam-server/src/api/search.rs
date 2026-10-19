@@ -46,7 +46,7 @@
 //! **Деградация.** Нет модели, ORT, Qdrant, чужая модель коллекции или сбой запроса
 //! (эмбеддинг, Qdrant) — ответ из одного FTS, `degraded: true` и `degraded_reason`
 //! (`no_runtime`, `no_model`, `qdrant_down`, `qdrant_locked`, `broken`, `model_mismatch`,
-//! `embed_failed`, `search_failed`), а не ошибка.
+//! `embed_failed`, `search_failed`) с текстом по-русски `degraded_text`, а не ошибка.
 //!
 //! **Бюджет** — в токенах счётчика чанкера (токенизатор модели, без неё — оценка):
 //! карточка (путь, заголовок, сниппет или L0) плюс текст в `chunks` (`token_count`
@@ -62,7 +62,7 @@
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
 //! полного текста чанка, `updated_at`, `kind`, `snippet` | `l0`,
 //! `text`, `rerank_score` 0..1 — у переставленных реранком), `degraded`, `degraded_reason`
-//! (или `null`), `warnings` (строки; пока только о реранке), `pending_count` — живые
+//! и `degraded_text` (или `null`), `warnings` (строки; пока только о реранке), `pending_count` — живые
 //! заметки области, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms,
 //! fuse_ms, rerank_ms}` (`null` — этап не выполнялся). Маркеры совпадений в JSON —
 //! U+E000/U+E001.
@@ -71,7 +71,7 @@
 //! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N> · <дата> · ~<N> tok`,
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
 //! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
-//! `> degraded: <причина> (только FTS)`, в том числе при пустой выдаче (тогда она
+//! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
 //! единственная), предупреждения — строками `> warning: <текст>` в конце.
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -990,6 +990,7 @@ pub async fn search(
                 "items": items,
                 "degraded": degraded.is_some(),
                 "degraded_reason": degraded.map(DegradedReason::as_str),
+                "degraded_text": degraded.map(DegradedReason::text),
                 "warnings": warnings,
                 "pending_count": pending,
                 "timings": {
@@ -1009,7 +1010,11 @@ pub async fn search(
                 .map(|(i, p)| item_md(i + 1, p, mode, &by_id))
                 .collect();
             if let Some(r) = degraded {
-                body.push_str(&format!("> degraded: {} (только FTS)\n", r.as_str()));
+                body.push_str(&format!(
+                    "> degraded: {} — {} (только FTS)\n",
+                    r.as_str(),
+                    r.text()
+                ));
             }
             for w in &warnings {
                 body.push_str(&format!("> warning: {w}\n"));

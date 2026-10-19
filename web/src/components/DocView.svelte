@@ -7,6 +7,7 @@
   import Editor from './Editor.svelte';
   import History from './History.svelte';
   import IndexBadge from './IndexBadge.svelte';
+  import { stateShort, stateText } from '../lib/indexing';
   import Lightbox from './Lightbox.svelte';
   import {
     ApiError,
@@ -190,13 +191,6 @@
     }
   }
 
-  /** Состояние индексации рядом с ревизией (подробная подсказка — у значка). */
-  const INDEX_SHORT: Record<string, string> = {
-    pending: 'в очереди на индексацию',
-    failed: 'индексация не удалась',
-    excluded: 'не индексируется',
-  };
-
   const fmtTime = (ts: string) => {
     const d = new Date(ts);
     return Number.isNaN(d.getTime()) ? ts : d.toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' });
@@ -229,7 +223,7 @@
       <div class="meta muted">
         ревизия {info.current_rev} · изменено {fmtTime(info.updated_at)}
         {#if info.kind === 'note' && info.index_state !== 'indexed'}
-          · <span class="istate"><IndexBadge state={info.index_state} />{INDEX_SHORT[info.index_state] ?? info.index_state}</span>
+          · <span class="istate" title={stateText(info.index_state)}><IndexBadge state={info.index_state} decorative />{stateShort(info.index_state)}</span>
         {/if}
       </div>
       {#if tags.length || description}

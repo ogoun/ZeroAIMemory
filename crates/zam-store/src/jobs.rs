@@ -725,7 +725,12 @@ pub async fn finish_reindexed(db: &Db, items: Vec<(Id, i64)>) -> Result<(), Stor
 /// Задание, ушедшее в `failed` (для `/index/status`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedJob {
+    /// Id задания (`index_jobs.id`): у одного узла неудавшихся заданий может быть несколько.
+    pub id: i64,
     pub node_id: Id,
+    /// Пространство и путь узла; `None` — узел уже удалён насовсем.
+    pub space_id: Option<Id>,
+    pub path: Option<String>,
     pub op: JobOp,
     pub attempts: i64,
     /// Последняя ошибка (без текста заметок).
@@ -738,16 +743,21 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT target_id, op, attempts, last_error, updated_at FROM index_jobs
-             WHERE state = 'failed' ORDER BY updated_at DESC, id DESC LIMIT ?1",
+            "SELECT j.id, j.target_id, j.op, j.attempts, j.last_error, j.updated_at,
+                    n.space_id, n.path
+             FROM index_jobs j LEFT JOIN nodes n ON n.id = j.target_id
+             WHERE j.state = 'failed' ORDER BY j.updated_at DESC, j.id DESC LIMIT ?1",
         )?;
         let rows = st.query_map([limit], |r| {
             Ok(FailedJob {
-                node_id: r.get(0)?,
-                op: r.get(1)?,
-                attempts: r.get(2)?,
-                error: r.get(3)?,
-                updated_at: ts_at(r, 4)?,
+                id: r.get(0)?,
+                node_id: r.get(1)?,
+                op: r.get(2)?,
+                attempts: r.get(3)?,
+                error: r.get(4)?,
+                updated_at: ts_at(r, 5)?,
+                space_id: r.get(6)?,
+                path: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

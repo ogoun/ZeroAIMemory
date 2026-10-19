@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use zam_core::Id;
 use zam_index::VectorFilter;
 use zam_server::config::{QdrantMode, ServerConfig};
-use zam_store::{chunks_for_index, get_node};
+use zam_store::{chunks_for_index, claim_jobs, enqueue_upserts, fail_job, get_node};
 
 fn uid(a: &Api) -> Id {
     a.st.admin_id
@@ -68,6 +68,52 @@ async fn adm_status(a: &Api) -> Value {
     let r = a.adm(Method::GET, "/api/v1/index/status", None, None).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     r.json()
+}
+
+/// Две неудачи подряд одного узла — два задания `failed`: в `failed_items` различаются по
+/// `id` задания (ключ строк WebUI), у каждого — пространство и путь узла (переход к заметке).
+/// Без моделей воркер не запущен, задания выдаёт и проваливает сам тест.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_items_have_job_id_space_and_path() {
+    let a = api("ia-failed", |_| {}).await;
+    let n = a.note("knowledge", "Папка/сбой", NOTE).await;
+    let node: Id = id(&n).parse().unwrap();
+    let db = a.st.users.get(uid(&a)).await.unwrap();
+    let mut now = jiff::Timestamp::now();
+    // два захода по MAX_ATTEMPTS неудач; второе задание — новое после первого `failed`
+    for round in 0..2 {
+        if round == 1 {
+            assert_eq!(enqueue_upserts(&db, vec![node]).await.unwrap(), 1);
+        }
+        for _ in 0..zam_store::jobs::MAX_ATTEMPTS {
+            now += jiff::SignedDuration::from_hours(2);
+            let j = claim_jobs(&db, 10, now).await.unwrap().remove(0);
+            assert_eq!(j.target_id, node);
+            fail_job(&db, j.id, j.claim_gen, "Qdrant: отказ", now)
+                .await
+                .unwrap();
+        }
+    }
+    let s = adm_status(&a).await;
+    let items = s["failed_items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{s}");
+    assert_ne!(items[0]["id"], items[1]["id"], "{s}");
+    for it in items {
+        assert!(it["id"].is_i64(), "{it}");
+        assert_eq!(it["node_id"], node.to_string());
+        assert_eq!(it["path"], "Папка/сбой");
+        assert_eq!(it["space_id"], n["space_id"]);
+        assert_eq!(it["error"], "Qdrant: отказ");
+    }
+    // причина деградации — кодом и текстом для человека
+    // (без ORT рядом с тестом — `no_runtime`, с ним — `no_model`)
+    assert!(
+        s["vector"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("модели не загружены"),
+        "{s}"
+    );
 }
 
 /// Без моделей: векторный канал выключен с причиной `no_model` и подсказкой команды;
@@ -196,7 +242,7 @@ async fn status_ready_and_admin_reindex_restores_points_without_inference() {
     let s = status(&a).await;
     assert_eq!(
         s["vector"],
-        json!({"available": true, "reason": null, "hint": null})
+        json!({"available": true, "reason": null, "text": null, "hint": null})
     );
     assert_eq!(s["device"]["kind"], "cpu");
     assert!(s["model"]["id"].as_str().unwrap().starts_with(MINILM));

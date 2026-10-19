@@ -1,12 +1,14 @@
 <script lang="ts">
   // Страница «Индекс» (#/admin/index): состояние векторного индекса по GET /index/status
-  // (обновление раз в 5 с, пока страница открыта), причина деградации с действием,
+  // (обновление раз в 5 с, пока страница открыта и вкладка видна; при возвращении на
+  // вкладку — сразу), причина деградации с действием (тексты — с сервера),
   // повреждённые и исключённые из пересборки базы, неудавшиеся задания и переиндексация
   // (POST /admin/reindex) с подтверждением.
   import { Dialog } from 'bits-ui';
   import { onMount } from 'svelte';
   import { ApiError, indexStatus, reindex, type IndexStatus, type User } from '../lib/api';
-  import { actionFor, reasonText, transient } from '../lib/indexing';
+  import { hintParts, reasonText, transient } from '../lib/indexing';
+  import { href } from '../lib/router';
 
   let { users, onexpired }: { users: User[]; onexpired: () => void } = $props();
 
@@ -20,6 +22,8 @@
   let sending = $state(false);
   let reindexMsg = $state('');
   let reindexErr = $state('');
+  /** Поколение запроса статуса: ответ устаревшего запроса (таймер до POST) не затирает свежий. */
+  let seq = 0;
 
   const QDRANT_STATE: Record<string, string> = {
     off: 'не запущен',
@@ -50,11 +54,15 @@
   }
 
   async function load() {
+    const my = ++seq;
     try {
-      st = await indexStatus();
+      const r = await indexStatus();
+      if (my !== seq) return;
+      st = r;
       updated = new Date();
       error = '';
     } catch (e) {
+      if (my !== seq) return;
       if (expired(e)) return;
       error = e instanceof Error ? e.message : 'Ошибка';
     }
@@ -63,15 +71,28 @@
   onMount(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    // следующий запрос — после ответа на предыдущий: медленный сервер не копит запросы
+    // следующий запрос — после ответа на предыдущий: медленный сервер не копит запросы;
+    // скрытая вкладка не опрашивает сервер
     const tick = async () => {
+      clearTimeout(timer);
+      timer = undefined;
       await load();
-      if (alive) timer = setTimeout(tick, REFRESH_MS);
+      if (alive && !document.hidden && timer === undefined) timer = setTimeout(tick, REFRESH_MS);
     };
+    const onvis = () => {
+      if (document.hidden) {
+        clearTimeout(timer);
+        timer = undefined;
+      } else {
+        void tick();
+      }
+    };
+    document.addEventListener('visibilitychange', onvis);
     void tick();
     return () => {
       alive = false;
       clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onvis);
     };
   });
 
@@ -97,14 +118,13 @@
     }
   }
 
-  let action = $derived(st?.vector.reason ? actionFor(st.vector.reason, st.vector.hint) : null);
   let busyReindex = $derived(!!st && (st.reindex.running || st.reindex.queued));
 </script>
 
 <section class="panel index-page">
   <div class="head">
     <h2>Векторный индекс</h2>
-    <span class="muted small" role="status">
+    <span class="muted small">
       {#if updated}обновлено {updated.toLocaleTimeString('ru-RU')}{:else}загрузка…{/if}
     </span>
   </div>
@@ -112,13 +132,12 @@
 
   {#if st}
     {#if !st.vector.available && st.vector.reason}
-      <div class="alert" class:alert-warn={transient(st.vector.reason)} role="alert">
-        <p class="alert-title">Векторный поиск недоступен: {reasonText(st.vector.reason)}</p>
+      <div class="alert" class:alert-warn={transient(st.vector.reason)}>
+        <p class="alert-title">Векторный поиск недоступен: {reasonText(st.vector.reason, st.vector.text)}</p>
         <p>Поиск работает в режиме полнотекстового (FTS), запись заметок не затронута.</p>
-        {#if action}
-          <p>
-            {action.text}
-            {#if action.cmd}<code class="cmd">{action.cmd}</code>{/if}
+        {#if st.vector.hint}
+          <p class="hint">
+            Что сделать: {#each hintParts(st.vector.hint) as p, i (i)}{#if p.code}<code class="cmd">{p.t}</code>{:else}{p.t}{/if}{/each}
           </p>
         {/if}
         {#if st.model.error || st.qdrant.error}
@@ -130,7 +149,7 @@
         {/if}
       </div>
     {:else if st.vector.available}
-      <p class="ok" role="status">Векторный поиск работает.</p>
+      <p class="ok">Векторный поиск работает.</p>
     {/if}
 
     <dl class="grid">
@@ -155,21 +174,23 @@
         <dd>
           {QDRANT_STATE[st.qdrant.state] ?? st.qdrant.state}{#if st.qdrant.version}, версия {st.qdrant.version}{/if}
           <div class="muted small">
-            точек: {num(st.qdrant.points)} · память: {fmtBytes(st.qdrant.rss_bytes)} · перезапусков: {st.qdrant.restarts}
+            <span class="kv">точек: {num(st.qdrant.points)}</span> · <span class="kv">память: {fmtBytes(st.qdrant.rss_bytes)}</span> ·
+            <span class="kv">перезапусков: {st.qdrant.restarts}</span>
           </div>
         </dd>
       </div>
       <div>
         <dt>Очередь индексации</dt>
         <dd>
-          в очереди: {num(st.queue.queued)} · в работе: {num(st.queue.running)} · с ошибкой: {num(st.queue.failed)}
+          <span class="kv">в очереди: {num(st.queue.queued)}</span> · <span class="kv">в работе: {num(st.queue.running)}</span> ·
+          <span class="kv">с ошибкой: {num(st.queue.failed)}</span>
           {#if st.queue.oldest}<div class="muted small">старейшее задание: {fmtTime(st.queue.oldest)}</div>{/if}
         </dd>
       </div>
     </dl>
 
     {#if st.unavailable_dbs.length}
-      <div class="alert" role="alert">
+      <div class="alert">
         <p class="alert-title">Базы пользователей не открываются: {st.unavailable_dbs.length}</p>
         <p>
           Файл базы повреждён или недоступен: её очередь не учтена в статусе, переиндексация её
@@ -186,7 +207,7 @@
     {/if}
 
     {#if st.rebuild_skipped.length}
-      <div class="alert alert-warn" role="alert">
+      <div class="alert alert-warn">
         <p class="alert-title">Исключены из пересборки индекса: {st.rebuild_skipped.length}</p>
         <p>
           Эти базы не открылись при пересборке коллекции, их заметки не ищутся векторным поиском.
@@ -245,10 +266,16 @@
         <table>
           <thead><tr><th>Пользователь</th><th>Заметка</th><th>Операция</th><th>Ошибка</th><th>Попыток</th><th>Когда</th></tr></thead>
           <tbody>
-            {#each st.failed_items as f (`${f.user_id}:${f.node_id}:${f.op}`)}
+            {#each st.failed_items as f (`${f.user_id}:${f.id}`)}
               <tr>
                 <td>{userName(f.user_id)}</td>
-                <td><code>{f.node_id}</code></td>
+                <td>
+                  {#if f.space_id && f.path}
+                    <a href={href({ name: 'node', user: f.user_id, space: f.space_id, node: f.node_id, anchor: null })}>{f.path}</a>
+                  {:else}
+                    <code>{f.node_id}</code> <span class="muted">(удалена)</span>
+                  {/if}
+                </td>
                 <td>{f.op}</td>
                 <td class="err">{f.error}</td>
                 <td>{f.attempts}</td>
@@ -337,6 +364,12 @@
     border-radius: 4px;
     background: var(--code-bg);
     color: var(--text);
+  }
+  .kv {
+    white-space: nowrap;
+  }
+  .hint {
+    overflow-wrap: anywhere;
   }
   .ok {
     margin: 12px 0;

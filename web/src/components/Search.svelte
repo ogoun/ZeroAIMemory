@@ -30,7 +30,7 @@
   let error = $state('');
   let busy = $state(false);
   let searched = $state(false);
-  /** Векторный канал выключен: причина (`degraded_reason`), иначе `null`. */
+  /** Векторный канал выключен: причина по-русски, иначе `null`. */
   let degraded = $state<string | null>(null);
   let warnings = $state<string[]>([]);
   let field = $state<HTMLInputElement | null>(null);
@@ -97,7 +97,7 @@
       const r = await search(user, qtext, ids);
       if (my !== seq) return;
       items = r.items;
-      degraded = r.degraded ? (r.degraded_reason ?? '') : null;
+      degraded = r.degraded ? reasonText(r.degraded_reason, r.degraded_text) : null;
       warnings = r.warnings ?? [];
       active = 0;
       searched = true;
@@ -208,7 +208,7 @@
         <div class="notices" role="status">
           {#if degraded !== null}
             <p class="warn degraded">
-              Векторный поиск недоступен: {reasonText(degraded)} — показаны результаты полнотекстового поиска
+              Векторный поиск недоступен: {degraded} — показаны результаты полнотекстового поиска
             </p>
           {/if}
           {#each warnings as w, i (i)}<p class="warn">Предупреждение: {warningText(w)}</p>{/each}
