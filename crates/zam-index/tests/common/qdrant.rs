@@ -10,6 +10,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::Rng as _;
@@ -42,6 +43,46 @@ pub fn free_port() -> u16 {
         .expect("свободный порт")
 }
 
+/// Предел одновременно запущенных [`TestQdrant`] в процессе теста (по умолчанию 4,
+/// переменная `ZAM_TEST_QDRANT_MAX`). Тесты одного бинарника идут параллельно, и каждый
+/// поднимает свой Qdrant: на HDD десяток процессов, одновременно создающих коллекции
+/// с payload-индексами (fsync), растягивает каждую запись `wait=true` до сотен
+/// миллисекунд — тесты с пределами времени падают от взаимной нагрузки, а не от
+/// ошибки. Лишние тесты ждут слота до запуска своего Qdrant.
+fn max_running() -> usize {
+    std::env::var("ZAM_TEST_QDRANT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4)
+}
+
+static RUNNING: Mutex<usize> = Mutex::new(0);
+static FREED: Condvar = Condvar::new();
+
+/// Занятый слот запуска; освобождается в `Drop` (после остановки процесса).
+struct Slot;
+
+impl Slot {
+    fn take() -> Slot {
+        let max = max_running();
+        let mut n = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+        while *n >= max {
+            n = FREED.wait(n).unwrap_or_else(|p| p.into_inner());
+        }
+        *n += 1;
+        Slot
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut n = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+        *n -= 1;
+        FREED.notify_one();
+    }
+}
+
 /// Запущенный Qdrant для одного теста.
 pub struct TestQdrant {
     child: Child,
@@ -49,6 +90,8 @@ pub struct TestQdrant {
     pub http_port: u16,
     pub grpc_port: u16,
     pub api_key: String,
+    /// Последним полем: слот освобождается после остановки процесса в `Drop`.
+    _slot: Slot,
 }
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -62,6 +105,7 @@ impl TestQdrant {
             "нет бинарника Qdrant {}: выполните `cargo xtask fetch-deps`",
             bin.display()
         );
+        let slot = Slot::take();
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join("zam-index")
@@ -88,6 +132,7 @@ impl TestQdrant {
             http_port,
             grpc_port,
             api_key,
+            _slot: slot,
         };
         q.wait_ready(Duration::from_secs(60));
         q
