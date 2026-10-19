@@ -17,6 +17,11 @@ test = false
 doc = false
 bench = false
 
+[features]
+# Точка остановки воркера перед записью пачки в Qdrant — только для тестов (включает
+# dev-зависимость zam-server); в сборке сервера и релизе её нет.
+test-hooks = []
+
 [dependencies]
 qdrant-client.workspace = true
 tonic.workspace = true

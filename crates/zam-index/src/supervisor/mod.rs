@@ -68,6 +68,9 @@ struct Shared {
     pid: AtomicU32,
     /// Перезапусков после падения с момента старта супервизора (`/index/status`).
     restarts: AtomicU32,
+    /// Точка остановки тестов перед перезапуском после падения (фича `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    restart_hold: crate::test_hooks::Hold,
 }
 
 /// Супервизор процесса Qdrant (или описание внешнего Qdrant).
@@ -148,6 +151,8 @@ impl Supervisor {
             storage_rebuilt: AtomicBool::new(rebuilt),
             pid: AtomicU32::new(0),
             restarts: AtomicU32::new(0),
+            #[cfg(feature = "test-hooks")]
+            restart_hold: crate::test_hooks::Hold::default(),
         });
         let (stop_tx, stop_rx) = watch::channel(false);
         let ctx = Ctx {
@@ -421,6 +426,12 @@ async fn supervise(ctx: &mut Ctx) {
                     next_in,
                 });
                 ctx.shared.restarts.fetch_add(1, Ordering::SeqCst);
+                // тесты: Qdrant лежит, пока тест не отпустит (состояние уже Restarting)
+                #[cfg(feature = "test-hooks")]
+                tokio::select! {
+                    () = ctx.shared.restart_hold.park() => {}
+                    () = wait_stop(&mut ctx.stop) => return,
+                }
                 tokio::select! {
                     () = tokio::time::sleep(next_in) => {}
                     () = wait_stop(&mut ctx.stop) => return,
@@ -695,6 +706,36 @@ pub fn reset_storage(data_dir: &Path, cfg: &ManagedConfig) -> Result<(), IndexEr
     }
     stamp::wipe_storage(&qdir, "zam-server qdrant reset")
         .map_err(|e| IndexError::Process(format!("стирание хранилища: {e}")))
+}
+
+/// Точка остановки перед перезапуском упавшего Qdrant (фича `test-hooks`, см.
+/// [`crate::test_hooks`]): состояние уже `Restarting`, процесса нет.
+#[cfg(feature = "test-hooks")]
+impl Supervisor {
+    /// Взвести: следующий перезапуск после падения ждёт [`Self::release_restart`].
+    #[doc(hidden)]
+    pub fn hold_next_restart(&self) {
+        if let Some(s) = &self.shared {
+            s.restart_hold.arm();
+        }
+    }
+
+    /// Ждёт, пока супервизор встанет на точке; `false` — не встал за `limit`.
+    #[doc(hidden)]
+    pub async fn wait_restart_held(&self, limit: Duration) -> bool {
+        match &self.shared {
+            Some(s) => s.restart_hold.wait_parked(limit).await,
+            None => false,
+        }
+    }
+
+    /// Отпустить перезапуск (и снять взвод — на случай паники теста).
+    #[doc(hidden)]
+    pub fn release_restart(&self) {
+        if let Some(s) = &self.shared {
+            s.restart_hold.release();
+        }
+    }
 }
 
 #[cfg(test)]

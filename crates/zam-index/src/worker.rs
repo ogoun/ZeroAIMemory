@@ -189,6 +189,9 @@ struct Inner {
     hints: Mutex<HashSet<(Id, Id)>>,
     stop: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Точка остановки тестов перед записью пачки в Qdrant (фича `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    hold: crate::test_hooks::Hold,
 }
 
 /// Управление воркером; дёшево клонируется.
@@ -226,6 +229,8 @@ impl WorkerHandle {
                 hints: Mutex::default(),
                 stop,
                 task: Mutex::new(None),
+                #[cfg(feature = "test-hooks")]
+                hold: crate::test_hooks::Hold::default(),
             }),
         }
     }
@@ -1308,6 +1313,8 @@ impl Worker {
         // Qdrant: две записи на пачку (удалить старые точки узлов, записать новые), а не
         // две на задание — на HDD каждая запись `wait=true` стоит десятки миллисекунд
         let nodes: Vec<Id> = ready.iter().map(|(j, _)| j.target_id).collect();
+        #[cfg(feature = "test-hooks")]
+        self.inner.hold.park().await;
         match self.write_points(user, &nodes, pts).await {
             Ok(()) => {}
             Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
@@ -1861,6 +1868,29 @@ pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint
             rev: c.rev,
             text_hash: c.text_hash.clone(),
         },
+    }
+}
+
+/// Точка остановки перед записью пачки в Qdrant (фича `test-hooks`, см.
+/// [`crate::test_hooks`]): эмбеддинги пачки посчитаны, задания захвачены.
+#[cfg(feature = "test-hooks")]
+impl WorkerHandle {
+    /// Взвести: воркер встанет перед записью следующей пачки.
+    #[doc(hidden)]
+    pub fn hold_next_write(&self) {
+        self.inner.hold.arm();
+    }
+
+    /// Ждёт, пока воркер встанет на точке; `false` — не встал за `limit`.
+    #[doc(hidden)]
+    pub async fn wait_write_held(&self, limit: Duration) -> bool {
+        self.inner.hold.wait_parked(limit).await
+    }
+
+    /// Отпустить воркер (и снять взвод — на случай паники теста).
+    #[doc(hidden)]
+    pub fn release_write(&self) {
+        self.inner.hold.release();
     }
 }
 

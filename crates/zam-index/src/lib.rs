@@ -24,6 +24,8 @@ mod qdrant;
 pub mod reindex;
 pub mod rollup;
 pub mod supervisor;
+#[cfg(feature = "test-hooks")]
+mod test_hooks;
 mod vector;
 pub mod worker;
 

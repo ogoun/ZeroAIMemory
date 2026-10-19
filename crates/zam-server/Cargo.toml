@@ -53,6 +53,8 @@ tower = { workspace = true, features = ["util"] }
 memory-serve.workspace = true
 
 [dev-dependencies]
+# точка остановки воркера перед записью пачки (tests/qdrant_lifecycle.rs)
+zam-index = { path = "../zam-index", features = ["test-hooks"] }
 zip.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true

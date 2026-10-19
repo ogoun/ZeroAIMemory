@@ -43,11 +43,11 @@ use zam_store::{chunks_for_index, get_node, job_stats};
 /// Предел исчезновения Qdrant после смерти родителя или `kill` (§4.3: ≤ 5 с).
 const GONE: Duration = Duration::from_secs(5);
 
-/// Заметка из 12 разделов: пачка из 8 таких заметок — сотни чанков, инференс пачки
-/// длится заметное время, и убийство Qdrant успевает прийти до записи пачки.
+/// Заметка из двух разделов (порядок событий задают точки остановки, а не размер пачки:
+/// маленькие пачки — «быстрый» режим, в котором тайминг подвёл бы).
 fn body(i: usize) -> String {
     let mut s = format!("# Заметка {i}\n\n");
-    for k in 0..12 {
+    for k in 0..2 {
         s.push_str(&format!(
             "## Раздел {k}\n\nПроект номер {i} собирается командой cargo build, тесты идут через \
              cargo test, раздел {k}. Конфигурация лежит в каталоге deploy, журнал пишется в logs. \
@@ -132,6 +132,11 @@ impl Drop for ShutdownOnPanic {
         if !std::thread::panicking() {
             return;
         }
+        // воркер и супервизор могли остаться на тестовых точках остановки
+        self.0.index.worker.release_write();
+        if let Some(sup) = self.0.index.supervisor() {
+            sup.release_restart();
+        }
         let st = self.0.clone();
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
@@ -170,13 +175,21 @@ async fn status(a: &Api) -> Value {
     r.json()
 }
 
-/// Процесс Qdrant убит посреди индексации. Убийство приходится на пачку в работе
-/// (`batch_running`), поэтому запись пачки получает `Unavailable`: задания пачки
-/// возвращаются в очередь (счётчик воркера `jobs_requeued` — именно этот путь, а не
-/// ошибки свёрток L0, `ensure` или reindex), канал выключается. Супервизор перезапускает Qdrant (`restarts` в статусе),
-/// очередь догоняет без неудавшихся заданий, точки всех заметок на месте, поиск —
-/// без деградации. Если пачка успела записаться до убийства (воркер увидел падение
-/// по состоянию супервизора, не по ошибке записи), попытка повторяется на новой пачке.
+/// Процесс Qdrant убит посреди индексации. Порядок событий задаётся тестовыми точками
+/// остановки (фича `test-hooks` zam-index), а не таймингом:
+/// 1. воркер стоит перед записью пачки (`hold_next_write`): эмбеддинги посчитаны,
+///    задания захвачены;
+/// 2. Qdrant убит, супервизор стоит перед перезапуском (`hold_next_restart`, состояние
+///    `Restarting`) — Qdrant гарантированно лежит, пока идёт запись;
+/// 3. воркер отпущен: запись пачки получает `Unavailable`, задания пачки возвращаются
+///    в очередь (`jobs_requeued` — именно этот путь, а не ошибки свёрток L0, `ensure` или
+///    reindex), канал выключен;
+/// 4. перезапуск отпущен: новый процесс Qdrant (`restarts` = 1), очередь догоняет без
+///    неудавшихся заданий, точки всех заметок на месте, поиск — без деградации.
+///
+/// Без точки на перезапуске результат зависел от ОС: на Windows отказ соединения с
+/// закрытым портом localhost приходит лишь через ~2 с, клиент Qdrant переподключается,
+/// и к этому моменту супервизор успевал поднять Qdrant — запись просто проходила позже.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
     if !have(MINILM) {
@@ -190,86 +203,74 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
     let _guard = ShutdownOnPanic(a.st.clone());
     vector_ready(&a).await;
     let sup = a.st.index.supervisor().unwrap();
+    let w = &a.st.index.worker;
 
-    const BATCH: usize = 24;
-    const ATTEMPTS: usize = 3;
+    w.hold_next_write();
+    sup.hold_next_restart();
+    const NOTES: usize = 12;
     let mut notes = Vec::new();
-    let mut kills = 0u64;
-    let mut requeued = false;
-    let db = a.st.users.get(a.st.admin_id).await.unwrap();
-    for attempt in 0..ATTEMPTS {
-        for i in 0..BATCH {
-            let n = attempt * BATCH + i;
-            let v = a.note("knowledge", &format!("kill/n{n}"), &body(n)).await;
-            notes.push(v["id"].as_str().unwrap().to_string());
-            if n == BATCH / 2 {
-                // Human в той же очереди: и после перезапуска не попадает в Qdrant
-                let r = a
-                    .adm(
-                        Method::POST,
-                        "/api/v1/nodes",
-                        Some(json!({"space": "human", "path": format!("diary{n}"),
-                                    "kind": "note", "content": body(n)})),
-                        None,
-                    )
-                    .await;
-                assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-            }
-        }
-        // пачка в работе; очередь опустела раньше — следующая попытка
-        let t = Instant::now();
-        let caught = loop {
-            if a.st.index.worker.status().batch_running {
-                break true;
-            }
-            let st = job_stats(&db).await.unwrap();
-            if st.queued + st.running == 0 {
-                break false;
-            }
-            assert!(t.elapsed() < READY, "пачка не началась: {st:?}");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        if !caught {
-            continue;
-        }
-        let qpid = pid_file(&dir).expect("pid-файл Qdrant");
-        assert_eq!(Some(qpid), sup.pid());
-        let requeued0 = a.st.index.worker.jobs_requeued();
-        kill_pid(qpid);
-        kills += 1;
-        assert!(wait_gone(qpid, GONE), "Qdrant {qpid} не завершился");
-        // окно до готовности нового процесса: backoff ≥ 0,8 с и старт Qdrant
-        let t = Instant::now();
-        let mut saw_down = false;
-        loop {
-            let ws = a.st.index.worker.status();
-            saw_down |= a.st.index.vector_available().is_err();
-            let back =
-                sup.pid().is_some_and(|p| p != qpid) && a.st.index.vector_available().is_ok();
-            if back {
-                break;
-            }
-            assert!(t.elapsed() < READY, "Qdrant не вернулся: {ws:?}");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(saw_down, "канал не выключался после убийства Qdrant");
-        // новый процесс записан в pid-файл
-        assert_eq!(pid_file(&dir), sup.pid());
-        // запись пачки, начатой до убийства, не подтверждена: её задания вернулись в
-        // очередь (попытки не тратятся, неудачными не становятся)
-        requeued = a.st.index.worker.jobs_requeued() > requeued0;
-        if requeued {
-            break;
+    for n in 0..NOTES {
+        let v = a.note("knowledge", &format!("kill/n{n}"), &body(n)).await;
+        notes.push(v["id"].as_str().unwrap().to_string());
+        if n == NOTES / 2 {
+            // Human в той же очереди: и после перезапуска не попадает в Qdrant
+            let r = a
+                .adm(
+                    Method::POST,
+                    "/api/v1/nodes",
+                    Some(json!({"space": "human", "path": format!("diary{n}"),
+                                "kind": "note", "content": body(n)})),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
         }
     }
-    eprintln!(
-        "убийств Qdrant: {kills}, заданий возвращено в очередь: {}",
-        a.st.index.worker.jobs_requeued()
-    );
+    // 1. пачка у записи
     assert!(
-        requeued,
-        "за {kills} попыток запись пачки ни разу не получила Unavailable"
+        w.wait_write_held(READY).await,
+        "воркер не дошёл до записи пачки: {:?}",
+        w.status()
     );
+    assert!(w.status().batch_running);
+    let requeued0 = w.jobs_requeued();
+    // 2. Qdrant убит и не поднимается
+    let qpid = pid_file(&dir).expect("pid-файл Qdrant");
+    assert_eq!(Some(qpid), sup.pid());
+    kill_pid(qpid);
+    assert!(wait_gone(qpid, GONE), "Qdrant {qpid} не завершился");
+    assert!(
+        sup.wait_restart_held(GONE).await,
+        "супервизор не заметил падения"
+    );
+    until("канал выключен", GONE, async || {
+        a.st.index.vector_available().is_err()
+    })
+    .await;
+    // 3. запись пачки отказывает (на Windows отказ соединения — секунды, клиент
+    // переподключается): задания возвращены в очередь, не потрачены и не failed
+    let t = Instant::now();
+    w.release_write();
+    until(
+        "задания пачки вернулись в очередь",
+        Duration::from_secs(30),
+        async || w.jobs_requeued() > requeued0,
+    )
+    .await;
+    let requeued = w.jobs_requeued() - requeued0;
+    eprintln!(
+        "запись отказала через {:?}, заданий возвращено в очередь: {requeued}",
+        t.elapsed()
+    );
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    assert_eq!(job_stats(&db).await.unwrap().failed, 0);
+    // 4. перезапуск: новый процесс в pid-файле, канал включён
+    sup.release_restart();
+    until("Qdrant вернулся", READY, async || {
+        sup.pid().is_some_and(|p| p != qpid) && a.st.index.vector_available().is_ok()
+    })
+    .await;
+    assert_eq!(pid_file(&dir), sup.pid());
 
     // очередь догнала: все заметки проиндексированы, неудавшихся заданий нет
     until("очередь догнала", READY, async || {
@@ -293,7 +294,7 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
     assert!(count_space_kind(http_port, &key, "knowledge") >= want);
     let s = status(&a).await;
     assert_eq!(s["qdrant"]["state"], "ready", "{s}");
-    assert_eq!(s["qdrant"]["restarts"], kills, "{s}");
+    assert_eq!(s["qdrant"]["restarts"], 1, "{s}");
     assert_eq!(s["queue"]["failed"], 0, "{s}");
     assert_eq!(s["vector"]["available"], true, "{s}");
     let r = a
