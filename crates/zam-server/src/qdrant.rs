@@ -10,7 +10,7 @@ use zam_fetch::{DepManifest, host_platform, install_archive};
 use zam_index::supervisor::{QDRANT_VERSION, SupervisorConfig, inspect, qdrant_exe_name};
 use zam_index::{QdrantIndex, VectorIndex};
 
-use crate::config::{QdrantMode, ServerConfig};
+use crate::config::ServerConfig;
 
 /// Манифест, с которым собран сервер (`deploy/qdrant.toml`): его версию ждёт супервизор.
 const BUILT_IN_MANIFEST: &str = include_str!("../../../deploy/qdrant.toml");
@@ -166,17 +166,18 @@ pub async fn status(cfg: &ServerConfig, exe_dir: &Path) -> anyhow::Result<String
 
 /// `qdrant reset --yes`: стирает хранилище управляемого Qdrant (сервер должен быть
 /// остановлен); при следующем старте индекс пересобирается из `embeddings`.
-pub fn reset(cfg: &ServerConfig, yes: bool) -> anyhow::Result<String> {
-    if cfg.qdrant.mode != QdrantMode::Managed {
+/// Осиротевший процесс (сервер убит) завершается перед стиранием.
+pub fn reset(cfg: &ServerConfig, exe_dir: &Path, yes: bool) -> anyhow::Result<String> {
+    let Some(SupervisorConfig::Managed(m)) = cfg.qdrant.supervisor_config(exe_dir)? else {
         bail!("reset применим только к mode = \"managed\"");
-    }
+    };
     if !yes {
         bail!(
             "команда стирает {}; подтвердите флагом --yes",
             cfg.data_dir.join("qdrant").join("storage").display()
         );
     }
-    zam_index::supervisor::reset_storage(&cfg.data_dir)?;
+    zam_index::supervisor::reset_storage(&cfg.data_dir, &m)?;
     Ok(
         "хранилище Qdrant стёрто; индекс будет пересобран из embeddings при следующем старте"
             .into(),

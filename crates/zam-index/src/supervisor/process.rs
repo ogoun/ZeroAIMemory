@@ -85,11 +85,51 @@ pub(crate) fn port_free(port: u16) -> bool {
     TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).is_ok()
 }
 
-/// Завершает осиротевший Qdrant из pid-файла: процесс жив и это именно `qdrant`
-/// (защита от переиспользования pid). Возвращает pid завершённого процесса.
-pub(crate) fn cleanup_orphan(qdir: &Path, grace: Duration) -> Option<u32> {
+/// Два пути указывают на один файл (сравнение после `canonicalize`).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Процесс `pid` — наш Qdrant: запущен из `binary` (а на Linux ещё и с рабочим каталогом
+/// `qdir`). Защищает от переиспользования pid чужим Qdrant (другой каталог данных,
+/// Qdrant разработчика).
+pub(crate) fn is_our_qdrant(pid: u32, binary: &Path, qdir: &Path) -> bool {
+    let Some(exe) = process_exe(pid) else {
+        return false;
+    };
+    if !same_file(&exe, binary) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"));
+        if !cwd.is_ok_and(|c| same_file(&c, qdir)) {
+            return false;
+        }
+    }
+    #[cfg(windows)]
+    let _ = qdir;
+    true
+}
+
+/// Завершает осиротевший Qdrant из pid-файла. Условия: процесс жив, это наш бинарник
+/// (и на Linux наш рабочий каталог), и хотя бы один из наших портов занят. Иначе
+/// pid-файл считается устаревшим и просто удаляется. Возвращает pid завершённого процесса.
+pub(crate) fn cleanup_orphan(
+    qdir: &Path,
+    binary: &Path,
+    ports: &[u16],
+    grace: Duration,
+) -> Option<u32> {
     let pid = read_pid_file(qdir)?;
-    let killed = if pid != std::process::id() && pid_alive(pid) && is_qdrant_process(pid) {
+    let ours = pid != std::process::id()
+        && pid_alive(pid)
+        && is_our_qdrant(pid, binary, qdir)
+        && ports.iter().any(|p| !port_free(*p));
+    let killed = if ours {
         tracing::warn!(
             component = "qdrant",
             pid,
@@ -98,6 +138,11 @@ pub(crate) fn cleanup_orphan(qdir: &Path, grace: Duration) -> Option<u32> {
         terminate_pid(pid, grace);
         Some(pid)
     } else {
+        tracing::debug!(
+            component = "qdrant",
+            pid,
+            "устаревший pid-файл Qdrant удалён"
+        );
         None
     };
     remove_pid_file(qdir);
@@ -134,6 +179,12 @@ pub fn pid_alive(pid: u32) -> bool {
 #[cfg(unix)]
 pub fn is_qdrant_process(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "qdrant")
+}
+
+/// Исполняемый файл процесса.
+#[cfg(unix)]
+fn process_exe(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 /// SIGTERM, ожидание `grace`, затем SIGKILL.
@@ -187,7 +238,7 @@ mod win {
         unsafe { GetExitCodeProcess(p.0, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32
     }
 
-    pub(super) fn image_name(pid: u32) -> Option<String> {
+    pub(super) fn image_path(pid: u32) -> Option<std::path::PathBuf> {
         let p = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
         let mut buf = vec![0u16; 1024];
         let mut len = buf.len() as u32;
@@ -196,8 +247,7 @@ mod win {
             QueryFullProcessImageNameW(p.0, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
         }
         .ok()?;
-        let full = String::from_utf16_lossy(&buf[..len as usize]);
-        full.rsplit(['\\', '/']).next().map(str::to_string)
+        Some(String::from_utf16_lossy(&buf[..len as usize]).into())
     }
 
     pub(super) fn terminate(pid: u32) {
@@ -217,7 +267,15 @@ pub fn pid_alive(pid: u32) -> bool {
 /// Имя образа процесса — `qdrant.exe`.
 #[cfg(windows)]
 pub fn is_qdrant_process(pid: u32) -> bool {
-    win::image_name(pid).is_some_and(|n| n.eq_ignore_ascii_case("qdrant.exe"))
+    win::image_path(pid)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .is_some_and(|n| n.eq_ignore_ascii_case("qdrant.exe"))
+}
+
+/// Исполняемый файл процесса.
+#[cfg(windows)]
+fn process_exe(pid: u32) -> Option<std::path::PathBuf> {
+    win::image_path(pid)
 }
 
 /// Windows: Qdrant штатно останавливается только по Ctrl+C, которого у фонового процесса

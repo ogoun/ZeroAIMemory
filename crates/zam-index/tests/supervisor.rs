@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::qdrant::{free_port, qdrant_bin};
+use common::qdrant::{TestQdrant, free_port, qdrant_bin};
 use tokio::sync::watch;
 use zam_index::supervisor::{
     ManagedConfig, QDRANT_VERSION, QdrantState, Supervisor, SupervisorConfig, inspect,
@@ -123,7 +123,8 @@ async fn start_ready_restart_with_collection_and_clean_shutdown() {
     assert_eq!(
         st,
         QdrantState::Ready {
-            version: QDRANT_VERSION.to_string()
+            version: QDRANT_VERSION.to_string(),
+            rebuilt: false,
         }
     );
     assert!(!sup.storage_rebuilt());
@@ -263,13 +264,21 @@ async fn old_stamp_wipes_storage_and_sets_rebuilt() {
     assert!(sup.storage_rebuilt());
     assert!(!qdir.join("storage").join("marker").exists());
     let mut rx = sup.state();
-    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    let st = wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    assert!(
+        matches!(st, QdrantState::Ready { rebuilt: true, .. }),
+        "{st:?}"
+    );
     let stamp = std::fs::read_to_string(qdir.join("zam-storage.json")).unwrap();
     assert!(stamp.contains(QDRANT_VERSION), "{stamp}");
     assert!(inspect(&dir, cfg.http_port).await.reindex_pending);
     // Потребитель (воркер, задача 7) подтверждает постановку reindex.
     sup.ack_storage_rebuilt().unwrap();
     assert!(!sup.storage_rebuilt());
+    assert!(matches!(
+        *rx.borrow(),
+        QdrantState::Ready { rebuilt: false, .. }
+    ));
     assert!(!inspect(&dir, cfg.http_port).await.reindex_pending);
     sup.shutdown().await;
 }
@@ -305,7 +314,7 @@ async fn storage_panic_is_detected_wiped_and_restarted_once() {
         "метка совместима — до запуска не стираем"
     );
     let mut rx = sup.state();
-    wait_state(
+    let st = wait_state(
         &mut rx,
         Duration::from_secs(20),
         "Ready после wipe",
@@ -313,6 +322,10 @@ async fn storage_panic_is_detected_wiped_and_restarted_once() {
     )
     .await;
     assert!(sup.storage_rebuilt(), "детектор panic не сработал");
+    assert!(
+        matches!(st, QdrantState::Ready { rebuilt: true, .. }),
+        "{st:?}"
+    );
     let idx = QdrantIndex::connect(&sup.grpc_url(), sup.api_key().as_deref()).unwrap();
     assert!(idx.ensure("test/model@1", 8).await.unwrap().created);
     sup.shutdown().await;
@@ -332,10 +345,13 @@ async fn second_supervisor_on_same_dir_is_lock_error_and_reset_refuses() {
         .await
         .unwrap_err();
     assert!(matches!(err, IndexError::Locked(_)), "{err:?}");
-    assert!(matches!(reset_storage(&dir), Err(IndexError::Locked(_))));
+    assert!(matches!(
+        reset_storage(&dir, &cfg),
+        Err(IndexError::Locked(_))
+    ));
     a.shutdown().await;
     // Остановлен — reset стирает хранилище и требует reindex.
-    reset_storage(&dir).unwrap();
+    reset_storage(&dir, &cfg).unwrap();
     let st = inspect(&dir, cfg.http_port).await;
     assert!(!st.storage_present && st.reindex_pending, "{st:?}");
 }
@@ -354,29 +370,81 @@ async fn orphan_from_pid_file_is_killed() {
 
     // «Осиротевший» Qdrant: запущен мимо супервизора на тех же портах, pid в pid-файле.
     let qdir = dir.join("qdrant");
-    let mut orphan = Command::new(qdrant_bin())
-        .args(["--config-path", "config/zam.yaml", "--disable-telemetry"])
-        .current_dir(&qdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let spawn_orphan = || {
+        let child = Command::new(qdrant_bin())
+            .args(["--config-path", "config/zam.yaml", "--disable-telemetry"])
+            .current_dir(&qdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(qdir.join("qdrant.pid"), child.id().to_string()).unwrap();
+        wait_listening(cfg.http_port);
+        child
+    };
+    let mut orphan = spawn_orphan();
     let opid = orphan.id();
-    std::fs::write(qdir.join("qdrant.pid"), opid.to_string()).unwrap();
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(pid_alive(opid));
 
-    let sup = Supervisor::start(SupervisorConfig::Managed(cfg), &dir)
+    let sup = Supervisor::start(SupervisorConfig::Managed(cfg.clone()), &dir)
         .await
         .unwrap();
     // Очистка идёт до возврата start: сирота уже завершён.
+    assert!(wait_gone(opid, Duration::from_secs(2)), "сирота жив");
     let _ = orphan.wait();
-    assert!(!pid_alive(opid), "сирота жив");
     let mut rx = sup.state();
     wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
     assert_ne!(sup.pid(), Some(opid));
     sup.shutdown().await;
+
+    // reset при оставшемся сироте (сервер убит): сирота завершается, хранилище стирается.
+    let mut orphan = spawn_orphan();
+    let opid = orphan.id();
+    reset_storage(&dir, &cfg).unwrap();
+    assert!(
+        wait_gone(opid, Duration::from_secs(2)),
+        "сирота пережил reset"
+    );
+    let _ = orphan.wait();
+    let st = inspect(&dir, cfg.http_port).await;
+    assert!(!st.storage_present && st.reindex_pending, "{st:?}");
+}
+
+/// Ждёт, пока на порту 127.0.0.1 появится слушатель (до 20 с).
+fn wait_listening(port: u16) {
+    let t = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "порт {port} не открылся"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Устаревший pid-файл указывает на живой, но чужой Qdrant (другой каталог и порты):
+/// его не трогаем, pid-файл просто удаляется.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_pid_file_of_foreign_qdrant_is_not_killed() {
+    let foreign = TestQdrant::start("foreign");
+    let fpid = foreign.pid();
+    let dir = data_dir("foreign");
+    let qdir = dir.join("qdrant");
+    std::fs::create_dir_all(&qdir).unwrap();
+    std::fs::write(qdir.join("qdrant.pid"), fpid.to_string()).unwrap();
+
+    let sup = Supervisor::start(SupervisorConfig::Managed(managed()), &dir)
+        .await
+        .unwrap();
+    let mut rx = sup.state();
+    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    assert!(pid_alive(fpid), "чужой Qdrant убит");
+    let pid_file = std::fs::read_to_string(qdir.join("qdrant.pid")).unwrap();
+    assert_eq!(pid_file.trim(), sup.pid().unwrap().to_string());
+    assert_ne!(sup.pid(), Some(fpid));
+    sup.shutdown().await;
+    assert!(pid_alive(fpid), "чужой Qdrant убит при остановке");
+    drop(foreign);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

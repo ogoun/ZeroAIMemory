@@ -46,8 +46,10 @@ use crate::{IndexError, QdrantIndex, VectorIndex};
 pub enum QdrantState {
     /// Процесс запущен, готовность ещё не подтверждена.
     Starting,
-    /// `/readyz`, версия и gRPC health в порядке.
-    Ready { version: String },
+    /// `/readyz`, версия и gRPC health в порядке. `rebuilt` — хранилище стёрто после
+    /// последнего [`Supervisor::ack_storage_rebuilt`]: индекс пуст, нужна пересборка из
+    /// `embeddings` (воркер реагирует на переход в это состояние).
+    Ready { version: String, rebuilt: bool },
     /// Процесс упал; следующий запуск через `next_in`. `attempt` — номер падения в окне.
     Restarting { attempt: u32, next_in: Duration },
     /// Перезапусков больше не будет (circuit breaker, чужая версия, нет бинарника).
@@ -59,6 +61,8 @@ pub enum QdrantState {
 /// Общие с потоком супервизора поля.
 struct Shared {
     qdir: PathBuf,
+    /// Издатель состояния: у потока и у [`Supervisor::ack_storage_rebuilt`].
+    state: watch::Sender<QdrantState>,
     storage_rebuilt: AtomicBool,
     /// pid текущего процесса; 0 — процесса нет.
     pid: AtomicU32,
@@ -115,7 +119,12 @@ impl Supervisor {
         // Сирота и метка — блокирующие операции (до 10 с ожидания SIGTERM).
         let (m2, q2) = (m.clone(), qdir.clone());
         let rebuilt = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
-            process::cleanup_orphan(&q2, m2.stop_timeout);
+            process::cleanup_orphan(
+                &q2,
+                &m2.binary,
+                &[m2.http_port, m2.grpc_port],
+                m2.stop_timeout,
+            );
             let rebuilt = stamp::check_before_start(&q2, &m2.expected_version)?;
             std::fs::write(q2.join("config").join("zam.yaml"), config::render_yaml(&m2))?;
             Ok(rebuilt)
@@ -127,19 +136,19 @@ impl Supervisor {
         let mut rng = rand::rng();
         let api_key = format!("{:032x}{:032x}", rng.random::<u128>(), rng.random::<u128>());
         let grpc_url = format!("http://127.0.0.1:{}", m.grpc_port);
+        let (state_tx, state_rx) = watch::channel(QdrantState::Starting);
         let shared = Arc::new(Shared {
             qdir,
+            state: state_tx,
             storage_rebuilt: AtomicBool::new(rebuilt),
             pid: AtomicU32::new(0),
         });
-        let (state_tx, state_rx) = watch::channel(QdrantState::Starting);
         let (stop_tx, stop_rx) = watch::channel(false);
         let ctx = Ctx {
             cfg: m,
             shared: shared.clone(),
             api_key: Arc::from(api_key.as_str()),
             grpc_url: grpc_url.clone(),
-            state: state_tx,
             stop: stop_rx,
         };
         // Долгоживущий поток: на Linux PDEATHSIG привязан к потоку, сделавшему fork.
@@ -196,6 +205,13 @@ impl Supervisor {
         stamp::clear_reindex(&s.qdir)
             .map_err(|e| IndexError::Process(format!("флаг пересборки: {e}")))?;
         s.storage_rebuilt.store(false, Ordering::SeqCst);
+        s.state.send_if_modified(|st| match st {
+            QdrantState::Ready { rebuilt, .. } if *rebuilt => {
+                *rebuilt = false;
+                true
+            }
+            _ => false,
+        });
         Ok(())
     }
 
@@ -225,18 +241,33 @@ struct Ctx {
     shared: Arc<Shared>,
     api_key: Arc<str>,
     grpc_url: String,
-    state: watch::Sender<QdrantState>,
     stop: watch::Receiver<bool>,
 }
 
 impl Ctx {
     fn set(&self, s: QdrantState) {
-        self.state.send_replace(s);
+        self.shared.state.send_replace(s);
     }
 
     fn broken(&self, reason: String) {
-        tracing::error!(component = "qdrant", reason = %reason, "Qdrant выключен (Broken)");
-        self.set(QdrantState::Broken { reason });
+        publish_broken(&self.shared.state, reason);
+    }
+}
+
+fn publish_broken(state: &watch::Sender<QdrantState>, reason: String) {
+    tracing::error!(component = "qdrant", reason = %reason, "Qdrant выключен (Broken)");
+    state.send_replace(QdrantState::Broken { reason });
+}
+
+/// Причина `Broken` при панике потока супервизора.
+const PANIC_REASON: &str =
+    "supervisor thread panicked: поток супервизора Qdrant завершился паникой";
+
+/// Выполняет `f`; паника публикует `Broken`, а не оставляет устаревший `Ready`.
+/// Процесс Qdrant при раскрутке стека уничтожается (`KillOnDrop`).
+fn guard_panic(state: &watch::Sender<QdrantState>, f: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+        publish_broken(state, PANIC_REASON.into());
     }
 }
 
@@ -252,7 +283,8 @@ fn run_thread(mut ctx: Ctx, lock: std::fs::File) {
             return;
         }
     };
-    rt.block_on(supervise(&mut ctx));
+    let state = ctx.shared.state.clone();
+    guard_panic(&state, || rt.block_on(supervise(&mut ctx)));
     process::remove_pid_file(&ctx.shared.qdir);
     ctx.shared.pid.store(0, Ordering::SeqCst);
     drop(lock);
@@ -529,7 +561,10 @@ async fn run_once(ctx: &Ctx) -> Outcome {
         ready_ms = started.elapsed().as_millis() as u64,
         "Qdrant готов"
     );
-    ctx.set(QdrantState::Ready { version });
+    ctx.set(QdrantState::Ready {
+        version,
+        rebuilt: ctx.shared.storage_rebuilt.load(Ordering::SeqCst),
+    });
 
     let mut stop = ctx.stop.clone();
     let exited = tokio::select! {
@@ -589,9 +624,9 @@ pub async fn inspect(data_dir: &Path, http_port: u16) -> QdrantStatus {
         locked: process::lock_held(&qdir),
         pid,
         pid_alive: pid.is_some_and(|p| pid_alive(p) && is_qdrant_process(p)),
-        stamp_version: stamp::read_stamp(&qdir).filter(|v| !v.is_empty()),
+        stamp_version: stamp::read_stamp(&qdir).ok().flatten(),
         storage_present: qdir.join(stamp::STORAGE_DIR).exists(),
-        reindex_pending: stamp::reindex_pending(&qdir),
+        reindex_pending: stamp::reindex_pending(&qdir).unwrap_or(false),
         running_version,
         ready,
         qdir,
@@ -600,21 +635,47 @@ pub async fn inspect(data_dir: &Path, http_port: u16) -> QdrantStatus {
 
 /// `zam-server qdrant reset`: стирает хранилище остановленного Qdrant; при следующем
 /// старте [`Supervisor::storage_rebuilt`] — индекс пересобирается из `embeddings`.
-/// Работающий супервизор ([`IndexError::Locked`]) или живой процесс из pid-файла — отказ.
-pub fn reset_storage(data_dir: &Path) -> Result<(), IndexError> {
+/// Работающий супервизор — [`IndexError::Locked`]; осиротевший процесс (без лока)
+/// завершается той же проверкой, что и при старте.
+pub fn reset_storage(data_dir: &Path, cfg: &ManagedConfig) -> Result<(), IndexError> {
     let qdir = data_dir.join("qdrant");
-    if !qdir.exists() {
+    if !qdir
+        .try_exists()
+        .map_err(|e| IndexError::Process(format!("каталог {}: {e}", qdir.display())))?
+    {
         return Ok(());
     }
     let _lock = process::acquire_lock(&qdir)?;
-    if let Some(p) = process::read_pid_file(&qdir)
-        && pid_alive(p)
-        && is_qdrant_process(p)
-    {
-        return Err(IndexError::Process(format!(
-            "Qdrant (pid {p}) ещё работает: остановите zam-server"
-        )));
-    }
+    process::cleanup_orphan(
+        &qdir,
+        &cfg.binary,
+        &[cfg.http_port, cfg.grpc_port],
+        cfg.stop_timeout,
+    );
     stamp::wipe_storage(&qdir, "zam-server qdrant reset")
         .map_err(|e| IndexError::Process(format!("стирание хранилища: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_panic_publishes_broken() {
+        let (tx, rx) = watch::channel(QdrantState::Ready {
+            version: "1.19.2".into(),
+            rebuilt: false,
+        });
+        guard_panic(&tx, || panic!("тестовая паника"));
+        assert_eq!(
+            *rx.borrow(),
+            QdrantState::Broken {
+                reason: PANIC_REASON.into()
+            }
+        );
+        // Без паники состояние не трогается.
+        tx.send_replace(QdrantState::Starting);
+        guard_panic(&tx, || {});
+        assert_eq!(*rx.borrow(), QdrantState::Starting);
+    }
 }

@@ -124,7 +124,7 @@ async fn qdrant_cmd(cmd: QdrantCmd) -> anyhow::Result<()> {
             Ok(())
         }
         QdrantCmd::Reset { opts, yes } => {
-            println!("{}", qdrant::reset(&load(opts)?, yes)?);
+            println!("{}", qdrant::reset(&load(opts)?, &exe_dir, yes)?);
             Ok(())
         }
     }

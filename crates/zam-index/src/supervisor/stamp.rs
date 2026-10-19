@@ -30,24 +30,44 @@ struct Stamp {
     qdrant_version: String,
 }
 
-/// Версия из метки; `Some("")` — метка повреждена (считается несовместимой).
-pub(crate) fn read_stamp(qdir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(qdir.join(STAMP_FILE)).ok()?;
-    Some(
-        serde_json::from_str::<Stamp>(&text)
-            .map(|s| s.qdrant_version)
-            .unwrap_or_default(),
-    )
+/// Версия из метки. `Ok(None)` — метки нет или она нечитаема/пуста: такая метка считается
+/// отсутствующей (хранилище не стираем, решает детектор panic). Ошибки чтения, кроме
+/// «нет файла», возвращаются.
+pub(crate) fn read_stamp(qdir: &Path) -> io::Result<Option<String>> {
+    let text = match std::fs::read_to_string(qdir.join(STAMP_FILE)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match serde_json::from_str::<Stamp>(&text) {
+        Ok(s) if parse(&s.qdrant_version).is_some() => Ok(Some(s.qdrant_version)),
+        _ => {
+            tracing::warn!(
+                component = "qdrant",
+                "метка хранилища Qdrant нечитаема — считается отсутствующей"
+            );
+            Ok(None)
+        }
+    }
 }
 
+/// Пишет метку атомарно: временный файл, `fsync`, `rename` (на Unix — ещё `fsync` каталога).
 pub(crate) fn write_stamp(qdir: &Path, version: &str) -> io::Result<()> {
+    use std::io::Write as _;
     let body = serde_json::to_string(&Stamp {
         qdrant_version: version.to_string(),
     })
     .map_err(io::Error::other)?;
     let tmp = qdir.join(format!("{STAMP_FILE}.tmp"));
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, qdir.join(STAMP_FILE))
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, qdir.join(STAMP_FILE))?;
+    #[cfg(unix)]
+    std::fs::File::open(qdir)?.sync_all()?;
+    Ok(())
 }
 
 fn parse(v: &str) -> Option<(u64, u64, u64)> {
@@ -57,7 +77,7 @@ fn parse(v: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Хранилище версии `stored` открывается версией `current`: та же major, рост не больше
-/// чем на одну минорную, без отката. Нечитаемая версия — несовместима.
+/// чем на одну минорную, без отката. Неразбираемая версия — несовместима.
 pub(crate) fn compatible(stored: &str, current: &str) -> bool {
     let (Some(s), Some(c)) = (parse(stored), parse(current)) else {
         return false;
@@ -65,8 +85,8 @@ pub(crate) fn compatible(stored: &str, current: &str) -> bool {
     s <= c && s.0 == c.0 && c.1 - s.1 <= 1
 }
 
-pub(crate) fn reindex_pending(qdir: &Path) -> bool {
-    qdir.join(REINDEX_MARKER).exists()
+pub(crate) fn reindex_pending(qdir: &Path) -> io::Result<bool> {
+    qdir.join(REINDEX_MARKER).try_exists()
 }
 
 pub(crate) fn mark_reindex(qdir: &Path, reason: &str) -> io::Result<()> {
@@ -117,24 +137,24 @@ pub(crate) fn wipe_storage(qdir: &Path, reason: &str) -> io::Result<()> {
 /// (хранилище стёрто сейчас или раньше и пересборка ещё не подтверждена).
 pub(crate) fn check_before_start(qdir: &Path, current: &str) -> io::Result<bool> {
     let storage = qdir.join(STORAGE_DIR);
-    match read_stamp(qdir) {
+    match read_stamp(qdir)? {
         Some(stored) if !compatible(&stored, current) => {
-            let reason = if stored.is_empty() {
-                "метка хранилища повреждена".to_string()
-            } else {
-                format!("хранилище Qdrant {stored} несовместимо с {current}")
-            };
+            let reason = format!("хранилище Qdrant {stored} несовместимо с {current}");
             wipe_storage(qdir, &reason)?;
         }
         // Метка есть, а хранилища нет — его удалили вручную; embeddings в SQLite остались.
-        Some(_) if !storage.exists() => {
+        Some(_) if !storage.try_exists()? => {
             mark_reindex(qdir, "каталог storage удалён")?;
-            let _ = std::fs::remove_file(qdir.join(STAMP_FILE));
+            match std::fs::remove_file(qdir.join(STAMP_FILE)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
         }
-        // Хранилище без метки (до M2) или свежая установка: решает детектор panic.
+        // Хранилище без метки (до M2, нечитаемая метка) или свежая установка: решает
+        // детектор panic.
         _ => {}
     }
-    Ok(reindex_pending(qdir))
+    reindex_pending(qdir)
 }
 
 #[cfg(test)]
@@ -174,10 +194,10 @@ mod tests {
         let q = dir("wipe");
         std::fs::create_dir_all(q.join("storage").join("collections")).unwrap();
         write_stamp(&q, "1.16.0").unwrap();
-        assert_eq!(read_stamp(&q).as_deref(), Some("1.16.0"));
+        assert_eq!(read_stamp(&q).unwrap().as_deref(), Some("1.16.0"));
         assert!(check_before_start(&q, "1.19.2").unwrap());
         assert!(!q.join("storage").exists());
-        assert!(read_stamp(&q).is_none());
+        assert!(read_stamp(&q).unwrap().is_none());
         // Флаг держится до подтверждения.
         assert!(check_before_start(&q, "1.19.2").unwrap());
         clear_reindex(&q).unwrap();
@@ -197,12 +217,14 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_stamp_wipes() {
+    fn corrupt_or_empty_stamp_is_missing_and_keeps_storage() {
         let q = dir("corrupt");
         std::fs::create_dir_all(q.join("storage")).unwrap();
-        std::fs::write(q.join(STAMP_FILE), b"{not json").unwrap();
-        assert_eq!(read_stamp(&q).as_deref(), Some(""));
-        assert!(check_before_start(&q, "1.19.2").unwrap());
-        assert!(!q.join("storage").exists());
+        for body in [&b"{not json"[..], b"", br#"{"qdrant_version":""}"#] {
+            std::fs::write(q.join(STAMP_FILE), body).unwrap();
+            assert_eq!(read_stamp(&q).unwrap(), None);
+            assert!(!check_before_start(&q, "1.19.2").unwrap());
+            assert!(q.join("storage").exists());
+        }
     }
 }

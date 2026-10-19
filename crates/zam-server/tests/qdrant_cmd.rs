@@ -105,10 +105,12 @@ async fn status_and_reset_on_stopped_install() {
         assert!(s.contains(needle), "нет `{needle}` в\n{s}");
     }
 
-    let e = qdrant::reset(&cfg, false).unwrap_err().to_string();
+    let e = qdrant::reset(&cfg, &d.join("inst"), false)
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("--yes"), "{e}");
     std::fs::create_dir_all(d.join("qdrant").join("storage")).unwrap();
-    qdrant::reset(&cfg, true).unwrap();
+    qdrant::reset(&cfg, &d.join("inst"), true).unwrap();
     assert!(!d.join("qdrant").join("storage").exists());
     let s = qdrant::status(&cfg, &d.join("inst")).await.unwrap();
     assert!(s.contains("пересборка индекса: требуется"), "{s}");

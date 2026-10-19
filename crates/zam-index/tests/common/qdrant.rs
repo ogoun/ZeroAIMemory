@@ -106,6 +106,11 @@ impl TestQdrant {
         q
     }
 
+    /// pid процесса.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// gRPC-адрес для `QdrantIndex::connect`.
     pub fn grpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.grpc_port)
