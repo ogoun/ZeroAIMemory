@@ -1,10 +1,10 @@
 name: CI
 
-# Push в любую ветку (рабочие ветки этапов проверяются на обеих ОС до PR) и PR;
+# Push в любую ветку, кроме release-dry-run (её проверяет release.yml), и PR;
 # теги собирает release.yml.
 on:
   push:
-    branches: ['**']
+    branches: ['**', '!release-dry-run']
     tags-ignore: ['**']
   pull_request:
 

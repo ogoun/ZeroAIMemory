@@ -22,6 +22,7 @@ on:
       - xtask/src/package.rs
       - xtask/src/smoke.rs
       - xtask/src/main.rs
+      - xtask/src/manifest.rs
       - Cargo.lock
       - .github/workflows/cuda.yml
 

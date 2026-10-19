@@ -33,7 +33,7 @@ cargo xtask smoke --archive target/dist/zam-server-0.0.0-dev-windows-x64-cpu.zip
   проверка состава и предела 2 ГиБ на файл, черновик GitHub Release.
 - **Пробный прогон релиза без публикации** — push в ветку `release-dry-run` (например,
   `git push origin HEAD:release-dry-run`) или ручной запуск `release.yml` (Actions → Release →
-  Run workflow). Выполняется всё, что на теге, с версией `0.0.0-dry`: сборка, `zam-cuda` и
+  Run workflow, с любого ref, в том числе с тега). Выполняется всё, что на теге, с версией `0.0.0-dry`: сборка, `zam-cuda` и
   `zam-models`, smoke, проверка состава, размеров и `SHA256SUMS`; задача `publish`
   пропускается, архивы остаются артефактами прогона. Стоит запускать перед каждым тегом,
   если менялись упаковка, манифесты `deploy/` или workflow.
