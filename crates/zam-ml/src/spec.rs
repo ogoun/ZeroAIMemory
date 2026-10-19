@@ -56,6 +56,8 @@ enum Role {
     Embed,
     Rerank,
     Test,
+    /// Эталон fp32 для eval (`cargo xtask eval --quality-gate`) — эмбеддер.
+    Reference,
 }
 
 /// `model.toml` как он лежит на диске (поля `[model.spec]`, `id`, `role`, `device`).
@@ -221,6 +223,14 @@ mod tests {
             s.sparse_head.as_deref(),
             Some(Path::new("m").join("sparse_linear.pt").as_path())
         );
+        // fp32-эталон для eval (role = "reference") грузится как эмбеддер, но не как реранкер
+        let reference = "id = \"bge-m3-fp32\"\nrole = \"reference\"\ndim = 1024\npooling = \"cls\"\n\
+                         max_tokens_passage = 1024\nmax_tokens_query = 512\n";
+        assert_eq!(
+            ModelSpec::parse(reference, Path::new("m")).unwrap().device,
+            ModelDevice::Any
+        );
+        assert!(RerankSpec::parse(reference).is_err());
     }
 
     #[test]

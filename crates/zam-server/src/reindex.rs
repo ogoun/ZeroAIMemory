@@ -63,6 +63,7 @@ pub async fn run(cfg: ServerConfig, args: ReindexArgs) -> anyhow::Result<String>
         bail!("модель не загружена: {err}; {}", reason.hint());
     };
     zam_store::set_token_counter(Arc::new(embedder.token_counter()));
+    zam_store::set_chunk_params(cfg.index.chunk_params());
     let system = SystemStore::open(&dd)?;
     let users = UserDbs::new(dd.users_dir());
     // база, указанная явно, должна открыться; при обходе всех повреждённые пропускаются

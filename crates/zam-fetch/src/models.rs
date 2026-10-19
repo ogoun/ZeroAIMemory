@@ -23,6 +23,9 @@ pub enum ModelRole {
     Embed,
     Rerank,
     Test,
+    /// Эталон качества (fp32) для `cargo xtask eval --quality-gate`: эмбеддер, но не для
+    /// пользователя — не входит в `zam-models`, `zam-server models fetch` его не ставит.
+    Reference,
 }
 
 /// Устройство, для которого предназначен вариант модели.
@@ -259,6 +262,11 @@ impl ModelEntry {
         if self.requires_license_ack && self.bundle {
             return Err("requires_license_ack = true допустимо только при bundle = false".into());
         }
+        if self.role == ModelRole::Reference && self.bundle {
+            return Err(
+                "эталон (role = \"reference\") не входит в zam-models: bundle = false".into(),
+            );
+        }
         if self.files.is_empty() {
             return Err("пустой список files".into());
         }
@@ -294,7 +302,7 @@ impl ModelEntry {
             return Err("max_tokens_passage и max_tokens_query должны быть больше нуля".into());
         }
         match self.role {
-            ModelRole::Embed | ModelRole::Test => {
+            ModelRole::Embed | ModelRole::Test | ModelRole::Reference => {
                 if s.dim.is_none_or(|d| d == 0) {
                     return Err("для эмбеддера нужен spec.dim > 0".into());
                 }
@@ -656,6 +664,9 @@ max_tokens_query = 8
             "bundle = true\nrequires_license_ack = true",
             "requires_license_ack",
         );
+        // эталон для eval не входит в zam-models
+        // (первая запись образца — embed с bundle = true)
+        models_rejects("role = \"embed\"", "role = \"reference\"", "reference");
         models_rejects("id = \"t1\"", "id = \"m1\"", "m1");
         models_rejects("id = \"t1\"", "id = \"../x\"", "../x");
         models_rejects("path = \"head.pt\"", "path = \"../head.pt\"", "../head.pt");
@@ -747,6 +758,7 @@ max_tokens_query = 8
             [
                 "bge-m3-int8",
                 "bge-m3-fp16",
+                "bge-m3-fp32",
                 "minilm-l6-int8",
                 "bge-reranker-v2-m3",
                 "jina-reranker-v2"
@@ -768,6 +780,17 @@ max_tokens_query = 8
         assert_eq!(test[0].spec.dim, Some(384));
         assert_eq!(m.get("bge-m3-int8").unwrap().spec.dim, Some(1024));
         assert_eq!(m.get("bge-m3-fp16").unwrap().device, ModelDevice::Gpu);
+        // fp32-эталон BAAI — только для eval: вне zam-models и набора по умолчанию
+        let fp32 = m.get("bge-m3-fp32").unwrap();
+        assert_eq!(fp32.role, ModelRole::Reference);
+        assert!(!fp32.bundle && !fp32.requires_license_ack);
+        assert!(fp32.files.iter().any(|f| f.path == "model.onnx_data"));
+        assert!(
+            !m.select(&[], false, false)
+                .unwrap()
+                .iter()
+                .any(|e| e.id == "bge-m3-fp32")
+        );
         assert_eq!(
             jina.sources(),
             ["https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual"]

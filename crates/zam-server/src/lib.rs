@@ -62,6 +62,7 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
 pub async fn migrate(cfg: ServerConfig) -> anyhow::Result<usize> {
     let dir = zam_store::DataDir::open(&cfg.data_dir)?;
     let tc_cfg = cfg.clone();
+    zam_store::set_chunk_params(cfg.index.chunk_params());
     match tokio::task::spawn_blocking(move || ml::token_counter(&tc_cfg)).await {
         Ok(Some(tc)) => zam_store::set_token_counter(std::sync::Arc::new(tc)),
         _ => tracing::warn!(

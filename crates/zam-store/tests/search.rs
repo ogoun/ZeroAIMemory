@@ -676,6 +676,7 @@ async fn channels_are_separate_and_ordered() {
     assert_eq!(ch.bm25[0].score, 1.0);
     assert!(ch.bm25[0].token_count > 0);
     assert!(ch.bm25[0].snippet.contains(MARK_START));
+    assert!(!ch.relaxed, "строгий запрос нашёл");
     // ослабленный bm25 даёт оба узла, у второго места балл 1/2
     let ch = zam_store::search_fts_channels(&db, q("настройка редактора git", &[k]))
         .await
@@ -688,6 +689,8 @@ async fn channels_are_separate_and_ordered() {
     assert_eq!(got, want);
     assert_eq!(ch.bm25[1].score, 0.5);
     assert!(ch.trigram.is_empty());
+    // все слова не встретились ни в одном чанке — сработал ослабленный запрос
+    assert!(ch.relaxed);
 }
 
 #[tokio::test]

@@ -1,0 +1,18 @@
+# Проверка отдельного веса ослабленного bm25 (задача 14 M2, шаг 3). Сетка eval/grid.toml
+# выбрала w_fts = 0.25, но глобальный вес прячет FTS-only находки (Human не векторизуется,
+# свежие заметки до индексации): совпадение по точному слову проигрывает всем 60 векторным
+# кандидатам. Вес 0.25 оставлен только ослабленному запросу (любое слово).
+#   cargo xtask eval --grid eval/grid-relaxed.toml
+model = "bge-m3-fp16"
+device = "cuda"
+
+[[config]]
+name = "relaxed0.25"
+
+[[config]]
+name = "fts0.25-global"
+set = { "search.w_fts" = "0.25", "search.w_fts_relaxed" = "0.25" }
+
+[[config]]
+name = "relaxed1.0"
+set = { "search.w_fts_relaxed" = "1.0" }

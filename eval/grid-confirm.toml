@@ -1,0 +1,18 @@
+# Проверка выбора после сетки eval/grid.toml (задача 14 M2, шаг 3): база — лучший вес FTS
+# сетки; проверяется, сохраняется ли выигрыш чанков 150–300 вместе с ним и не лучше ли ещё
+# меньший вес FTS. Не расширение сетки: значения уже были в ней по отдельности.
+#   cargo xtask eval --grid eval/grid-confirm.toml
+model = "bge-m3-fp16"
+device = "cuda"
+
+[[config]]
+name = "fts0.25"
+set = { "search.w_fts" = "0.25" }
+
+[[config]]
+name = "fts0.25-chunk300"
+set = { "search.w_fts" = "0.25", "index.chunk_target_min" = "150", "index.chunk_target_max" = "300" }
+
+[[config]]
+name = "fts0.1"
+set = { "search.w_fts" = "0.1" }

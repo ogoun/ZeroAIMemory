@@ -301,6 +301,70 @@ pub struct IndexSection {
     pub yield_ms: u64,
     /// Дебаунс свёртки L0 папок, мс.
     pub rollup_debounce_ms: u64,
+    /// Чанкинг §8.2, токены счётчика модели: лист набирается до `chunk_target_min..=
+    /// chunk_target_max`, недобравший может вырасти до `chunk_hard_max` (предел любого листа).
+    pub chunk_target_min: usize,
+    pub chunk_target_max: usize,
+    pub chunk_hard_max: usize,
+    /// Секция короче склеивается с соседней.
+    pub chunk_merge_below: usize,
+    /// Предложений перекрытия соседних листов секции.
+    pub chunk_overlap_sentences: usize,
+}
+
+/// Предел `chunk_hard_max`: лист с префиксом контекста и спецтокенами должен уместиться в
+/// окно модели при индексации (`max_tokens_passage` bge-m3 — 1024).
+pub const CHUNK_HARD_MAX_LIMIT: usize = 960;
+/// Предел `chunk_overlap_sentences`.
+pub const CHUNK_OVERLAP_LIMIT: usize = 5;
+
+impl IndexSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: String| ConfigError::Invalid {
+            key: format!("index.{key}"),
+            source_name: "итог".into(),
+            message,
+        };
+        if self.batch_tokens == 0 {
+            return Err(bad("batch_tokens", "должно быть больше 0".into()));
+        }
+        if !(1..=CHUNK_HARD_MAX_LIMIT).contains(&self.chunk_hard_max) {
+            return Err(bad(
+                "chunk_hard_max",
+                format!("от 1 до {CHUNK_HARD_MAX_LIMIT}"),
+            ));
+        }
+        if !(1..=self.chunk_hard_max).contains(&self.chunk_target_max) {
+            return Err(bad("chunk_target_max", "от 1 до chunk_hard_max".into()));
+        }
+        if !(1..=self.chunk_target_max).contains(&self.chunk_target_min) {
+            return Err(bad("chunk_target_min", "от 1 до chunk_target_max".into()));
+        }
+        if self.chunk_merge_below > self.chunk_target_max {
+            return Err(bad(
+                "chunk_merge_below",
+                "не больше chunk_target_max".into(),
+            ));
+        }
+        if self.chunk_overlap_sentences > CHUNK_OVERLAP_LIMIT {
+            return Err(bad(
+                "chunk_overlap_sentences",
+                format!("от 0 до {CHUNK_OVERLAP_LIMIT}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Пороги чанкера для `zam_store::set_chunk_params`.
+    pub fn chunk_params(&self) -> zam_markdown::ChunkParams {
+        zam_markdown::ChunkParams {
+            target_min: self.chunk_target_min,
+            target_max: self.chunk_target_max,
+            hard_max: self.chunk_hard_max,
+            merge_below: self.chunk_merge_below,
+            overlap_sentences: self.chunk_overlap_sentences,
+        }
+    }
 }
 
 /// Секция `[search]` (§9.2): слияние каналов weighted RRF и поправки.
@@ -311,8 +375,11 @@ pub struct SearchSection {
     pub rrf_k: f64,
     /// Вес векторного канала (Qdrant: dense + sparse + сводки).
     pub w_vector: f64,
-    /// Вес канала FTS5 `bm25`.
+    /// Вес канала FTS5 `bm25`, когда нашлись чанки со всеми словами запроса.
     pub w_fts: f64,
+    /// Вес `bm25`, когда сработал только ослабленный запрос (любое слово): совпадения по
+    /// одному слову — слабый сигнал (по умолчанию 0,25 — подобран на eval, §18.2).
+    pub w_fts_relaxed: f64,
     /// Вес канала FTS5 `trigram` (идентификаторы и код).
     pub w_trigram: f64,
     /// Полупериод затухания по свежести, дней; 0 — без затухания.
@@ -334,6 +401,7 @@ impl SearchSection {
         for (k, v) in [
             ("w_vector", self.w_vector),
             ("w_fts", self.w_fts),
+            ("w_fts_relaxed", self.w_fts_relaxed),
             ("w_trigram", self.w_trigram),
             ("recency_half_life_days", self.recency_half_life_days),
         ] {
@@ -402,11 +470,17 @@ impl Default for ServerConfig {
                 batch_tokens: 8192,
                 yield_ms: 5,
                 rollup_debounce_ms: 2000,
+                chunk_target_min: 300,
+                chunk_target_max: 500,
+                chunk_hard_max: 800,
+                chunk_merge_below: 100,
+                chunk_overlap_sentences: 1,
             },
             search: SearchSection {
                 rrf_k: 60.0,
                 w_vector: 1.0,
                 w_fts: 1.0,
+                w_fts_relaxed: 0.25,
                 w_trigram: 0.7,
                 recency_half_life_days: 180.0,
                 max_per_node: 3,
@@ -580,13 +654,7 @@ pub fn load(
             })?;
     cfg.server.base_path = normalize_base_path(&cfg.server.base_path);
     cfg.ml.validate()?;
-    if cfg.index.batch_tokens == 0 {
-        return Err(ConfigError::Invalid {
-            key: "index.batch_tokens".into(),
-            source_name: "итог".into(),
-            message: "должно быть больше 0".into(),
-        });
-    }
+    cfg.index.validate()?;
     cfg.search.validate()?;
     Ok(cfg)
 }
@@ -961,6 +1029,36 @@ yield_ms = 1
         }
         let e = vec![env("ZAM_ML__DEVICE", "directml")];
         assert!(load(None, &e, &Default::default()).is_err());
+        // пороги чанкинга: умолчания сервера и чанкера совпадают (одно значение, подобранное
+        // на eval, §18.2), переопределение и проверка согласованности
+        assert_eq!(d.index.chunk_params(), zam_markdown::ChunkParams::default());
+        let e = vec![
+            env("ZAM_INDEX__CHUNK_TARGET_MAX", "700"),
+            env("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "2"),
+        ];
+        let c = load(None, &e, &Default::default()).unwrap();
+        assert_eq!(
+            (
+                c.index.chunk_params().target_max,
+                c.index.chunk_params().overlap_sentences
+            ),
+            (700, 2)
+        );
+        for (k, v) in [
+            ("ZAM_INDEX__CHUNK_TARGET_MAX", "900"),
+            ("ZAM_INDEX__CHUNK_TARGET_MIN", "0"),
+            ("ZAM_INDEX__CHUNK_TARGET_MIN", "600"),
+            ("ZAM_INDEX__CHUNK_HARD_MAX", "2000"),
+            ("ZAM_INDEX__CHUNK_MERGE_BELOW", "501"),
+            ("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "6"),
+            ("ZAM_INDEX__BATCH_TOKENS", "0"),
+        ] {
+            let field = k.trim_start_matches("ZAM_INDEX__").to_ascii_lowercase();
+            let err = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("index.{field}")), "{k}={v}: {err}");
+        }
         // реранкер
         assert_eq!(
             (
@@ -1003,6 +1101,8 @@ yield_ms = 1
             (60.0, 1.0, 1.0, 0.7)
         );
         assert_eq!((d.recency_half_life_days, d.max_per_node), (180.0, 3));
+        // ослабленный bm25 — вес по eval (§18.2)
+        assert_eq!(d.w_fts_relaxed, 0.25);
         let e = vec![
             env("ZAM_SEARCH__RRF_K", "30"),
             env("ZAM_SEARCH__W_VECTOR", "1.5"),

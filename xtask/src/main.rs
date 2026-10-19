@@ -2,6 +2,7 @@
 
 mod bundles;
 mod changelog;
+mod eval;
 mod fetch;
 mod manifest;
 mod package;
@@ -103,6 +104,9 @@ enum Cmd {
         #[arg(long, value_enum)]
         expect_device: Option<smoke::DeviceKind>,
     },
+    /// Eval качества поиска (ТЗ §18.2): корпус eval/, метрики recall@5, MRR@10, nDCG@10
+    /// по режимам и видам запросов; --quality-gate — int8 против fp32; --grid — подбор весов
+    Eval(eval::EvalArgs),
     /// Проверка архива zam-cuda: штампы совпадают с deploy/cuda.toml, файлы на месте
     /// (cuda fetch после распаковки ничего не скачает), формат библиотек, лицензии NVIDIA
     SmokeCuda {
@@ -388,6 +392,7 @@ fn main() -> Result<()> {
             &repo_root(),
         ),
         Cmd::SmokeCuda { archive } => smoke::run_cuda(&archive, &repo_root()),
+        Cmd::Eval(a) => eval::main(a, &repo_root()),
     }
 }
 

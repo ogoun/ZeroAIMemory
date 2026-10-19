@@ -85,6 +85,14 @@ pub fn plan<'a>(
     let mut out: Vec<&ModelEntry> = Vec::new();
     for id in &want {
         let e = m.get(id)?;
+        // fp32-эталон — инструмент разработки (`cargo xtask eval --quality-gate`), не модель
+        // для сервера: 2,3 ГБ без выигрыша против int8/fp16
+        if e.role == ModelRole::Reference {
+            bail!(
+                "{}: эталон качества для eval (cargo xtask eval --quality-gate), а не модель \n                 сервера",
+                e.id
+            );
+        }
         if !out.iter().any(|x| x.id == e.id) {
             out.push(e);
         }
@@ -147,7 +155,8 @@ pub fn fetch(
 pub fn status(m: &ModelsManifest, cfg: &ServerConfig, verify: bool) -> String {
     let dir = cfg.ml.models_dir(&cfg.data_dir);
     let mut out = vec![format!("каталог моделей: {}", dir.display())];
-    for e in &m.model {
+    // эталон для eval пользователю не предлагается
+    for e in m.model.iter().filter(|e| e.role != ModelRole::Reference) {
         let state = match model_state(e, &dir, verify) {
             ModelState::Installed if verify => "установлена (SHA-256 сверены)".to_string(),
             ModelState::Installed => "установлена".to_string(),
@@ -223,6 +232,12 @@ mod tests {
         cfg.ml.rerank_model_cpu = "bge-m3-int8".into();
         assert!(plan(&m, &cfg, FetchDevice::Cpu, true, &[]).is_err());
         assert!(plan(&m, &cfg, FetchDevice::Cpu, false, &["nope".into()]).is_err());
+        // fp32-эталон eval сервер не ставит и в status не показывает
+        let err = plan(&m, &cfg, FetchDevice::Cpu, false, &["bge-m3-fp32".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("eval"), "{err}");
+        assert!(!status(&m, &cfg, false).contains("bge-m3-fp32"));
         cfg.ml.device = MlDevice::Cpu;
         assert_eq!(default_device(&cfg), FetchDevice::Cpu);
     }

@@ -881,7 +881,12 @@ pub async fn search(
         vector: vector_ids,
         chunks,
     };
-    let weights = st.cfg.search.weights();
+    // ослабленный bm25 (ни одна заметка не содержит всех слов запроса) — свой вес: иначе
+    // его 50 случайных совпадений по одному слову вытесняют векторные находки (eval)
+    let mut weights = st.cfg.search.weights();
+    if fts.relaxed {
+        weights.w_fts = st.cfg.search.w_fts_relaxed;
+    }
     let ranked = fuse(&inputs, &weights, jiff::Timestamp::now());
     let window = top_k * OVERSAMPLE;
     let query_vec = vrun

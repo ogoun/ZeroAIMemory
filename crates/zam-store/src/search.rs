@@ -344,6 +344,9 @@ pub struct FtsChannels {
     pub bm25: Vec<FtsHit>,
     /// `trigram`, до 20: только если в запросе есть идентификаторы (или bm25 пуст).
     pub trigram: Vec<FtsHit>,
+    /// `bm25` получен ослабленным запросом (любое слово): строгий (все слова) ничего не
+    /// нашёл. Такие хиты слабее — гибрид даёт им отдельный вес (`search.w_fts_relaxed`).
+    pub relaxed: bool,
 }
 
 /// Кандидаты каналов `bm25` и `trigram` без слияния (гибридный поиск): та же область и
@@ -388,6 +391,7 @@ pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, St
         Ok(FtsChannels {
             bm25: take(&ch.a),
             trigram: take(&ch.b),
+            relaxed: ch.relaxed && !ch.a.is_empty(),
         })
     })
     .await
@@ -411,6 +415,8 @@ struct Channels<'q> {
     a: Vec<Cand>,
     b: Vec<Cand>,
     a_fts: Option<String>,
+    /// `a` — по ослабленному запросу.
+    relaxed: bool,
     needles: Vec<&'q str>,
 }
 
@@ -422,12 +428,14 @@ fn run_channels<'q>(
     spaces: &[Id],
 ) -> Result<Channels<'q>, StoreError> {
     let mut a_fts = sanitize_fts(text);
+    let mut relaxed = false;
     let mut a = match &a_fts {
         Some(fts) => run_channel(tx, Channel::Bm25, fts, prefix, spaces)?,
         None => Vec::new(),
     };
     if a.is_empty() && terms(text).len() > 1 {
         a_fts = sanitize_fts_any(text);
+        relaxed = true;
         if let Some(fts) = &a_fts {
             a = run_channel(tx, Channel::Bm25, fts, prefix, spaces)?;
         }
@@ -443,6 +451,7 @@ fn run_channels<'q>(
         a,
         b,
         a_fts,
+        relaxed,
         needles,
     })
 }

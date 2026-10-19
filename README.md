@@ -64,7 +64,7 @@
 `/search` с RRF и реранком, режим деградации до FTS, `GET /index/status`, reindex из кэша,
 команды `models`, `cuda` и `qdrant`, комплекты cpu и gpu, архивы `zam-models` и `zam-cuda`,
 e2e-тесты жизненного цикла Qdrant, страница «Индекс» в WebUI, строка деградации поиска и
-значки индексации, `zam search --rerank`. Ещё не сделано: набор `eval/` и гейт качества, замеры производительности §17, прототип `qdrant-edge` с ADR, приёмка этапа.
+значки индексации, `zam search --rerank`. Набор `eval/` и гейт качества — см. «Качество поиска» ниже. Ещё не сделано: замеры производительности §17, прототип `qdrant-edge` с ADR, приёмка этапа.
 
 ## Возможности
 
@@ -374,6 +374,7 @@ cargo build --release -p zam-server -p zam-cli
 | `smoke --archive … [--cuda-archive …] [--expect-device cpu\|cuda]` | smoke-тест комплекта: запуск, API, `zam`, Qdrant, векторный поиск на тестовой модели |
 | `smoke-cuda --archive …` | проверка архива `zam-cuda`: штампы, состав, формат библиотек, лицензии |
 | `changelog-section <версия>` | раздел версии из `CHANGELOG.md` для текста релиза |
+| `eval [--device cpu\|cuda] [--mode fts\|hybrid\|hybrid+rerank]… [--quality-gate] [--grid FILE] [--check]` | качество поиска на наборе `eval/`: recall@5, MRR@10, nDCG@10, гейт int8 против fp32, подбор весов и чанкинга |
 
 ```
 cargo xtask package --platform windows-x64 --flavor cpu --version 0.0.0-dev   # → target/dist/
@@ -385,6 +386,26 @@ cargo xtask smoke --archive target/dist/zam-server-0.0.0-dev-windows-x64-cpu.zip
 `cargo xtask fetch-models`), `--no-kit` — только эти архивы, без комплектов. Smoke
 GPU-комплекта на машине с NVIDIA:
 `--cuda-archive target/dist/zam-cuda-….zip --expect-device cuda`.
+
+### Качество поиска (eval)
+
+Набор `eval/` (ТЗ §18.2): 160 заметок на русском и английском, 197 запросов пяти видов, из них
+23 % — перефразы без единого общего слова с ответом. Прогон обязателен при изменении
+чанкинга, весов или моделей; результаты — в `eval/results/`, как запускать и что значат
+метрики — в [eval/README.md](eval/README.md).
+
+```
+cargo xtask eval --mode fts                                  # без моделей
+cargo xtask eval --mode hybrid --mode hybrid+rerank          # bge-m3 int8 на CPU
+cargo xtask eval --device cuda --mode hybrid --mode hybrid+rerank
+cargo xtask eval --quality-gate                              # int8 против fp32 BAAI
+```
+
+Последний прогон (2026-10-19, nDCG@10 по всем запросам): FTS-only 0,69; hybrid int8 CPU
+0,75, с реранком jina 0,83; hybrid fp16 CUDA 0,75, с реранком bge-reranker 0,84. int8 по
+поиску не отличается от fp32 (Δ nDCG@10 ≤ 0,2 п. п.), но порог косинуса dense 0,99 гейта
+не проходит (0,978) — решение и альтернативы в журнале
+[docs/plans/2026-10-19-m2-index-ml-log.md](docs/plans/2026-10-19-m2-index-ml-log.md).
 
 ### WebUI
 
@@ -417,14 +438,16 @@ crates/
   zam-server/      # axum: REST API, auth, WebUI, команды сервера
   zam-cli/         # клиент zam
 web/               # WebUI (Svelte 5 + Vite), e2e на Playwright
-xtask/             # cargo xtask: fetch-deps, fetch-models, package, smoke, smoke-cuda
+xtask/             # cargo xtask: fetch-deps, fetch-models, package, smoke, smoke-cuda, eval
+eval/              # набор eval: корпус, запросы, сетки, результаты (eval/README.md)
+tools/             # вспомогательные скрипты (квантование bge-m3 для гейта качества)
 deploy/            # манифесты зависимостей и моделей, пример конфига, systemd, лицензии, README-install.md
 scripts/           # dev-env.ps1, dev-env.sh
 docs/              # ТЗ, планы, исследования, журнал работ
 .github/workflows/ # ci, package, cuda, release
 ```
 
-Целевая структура описана в ТЗ §20. Крейт `zam-docs` и каталоги `eval/`, `benches/`,
+Целевая структура описана в ТЗ §20. Крейт `zam-docs` и каталоги `benches/`,
 `docs/adr/` появятся на следующих задачах и этапах.
 
 ### CI и релиз

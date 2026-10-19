@@ -1,8 +1,9 @@
 //! Метаданные заметки (frontmatter, L0), чанки §8.2 и постановка заданий индексации
 //! (§8.1–§8.3 ТЗ).
 //!
-//! Чанки строит `zam_markdown::chunk_note` с глобальным счётчиком токенов
-//! ([`set_token_counter`], по умолчанию `ApproxCounter`): листы `chunk`, L1 секций
+//! Чанки строит `zam_markdown::chunk_note` с глобальными счётчиком токенов
+//! ([`set_token_counter`], по умолчанию `ApproxCounter`) и порогами ([`set_chunk_params`],
+//! по умолчанию `ChunkParams::default()`, сервер ставит из `[index]`): листы `chunk`, L1 секций
 //! `section` и L1 заметки `note`. У заметки без текста тела — один `chunk`
 //! с заголовком или именем, чтобы она находилась поиском по названию.
 //! В FTS попадают только `chunk` и `note` (условие в триггерах миграции 0004).
@@ -38,6 +39,24 @@ fn counter_cell() -> &'static RwLock<Arc<dyn TokenCounter>> {
 /// есть до перезаписи или reindex.
 pub fn set_token_counter(tc: Arc<dyn TokenCounter>) {
     *counter_cell().write().unwrap_or_else(|e| e.into_inner()) = tc;
+}
+
+static CHUNK_PARAMS: OnceLock<RwLock<ChunkParams>> = OnceLock::new();
+
+fn params_cell() -> &'static RwLock<ChunkParams> {
+    CHUNK_PARAMS.get_or_init(|| RwLock::new(ChunkParams::default()))
+}
+
+/// Устанавливает пороги чанкера для всего процесса (`[index]` конфигурации сервера, §8.2).
+/// Как и смена счётчика, действует на заметки, записанные или перечанкованные после вызова:
+/// прежние чанки остаются до перезаписи или `reindex --full`.
+pub fn set_chunk_params(p: ChunkParams) {
+    *params_cell().write().unwrap_or_else(|e| e.into_inner()) = p;
+}
+
+/// Текущие пороги чанкера.
+pub fn chunk_params() -> ChunkParams {
+    *params_cell().read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Текущий счётчик токенов.
@@ -172,7 +191,7 @@ pub(crate) fn note_chunks(
     name: &str,
     tc: &dyn TokenCounter,
 ) -> Vec<ChunkRow> {
-    let drafts = chunk_note(src, doc, &ChunkParams::default(), tc);
+    let drafts = chunk_note(src, doc, &chunk_params(), tc);
     let has_leaf = drafts.iter().any(|d| d.level == ChunkLevel::Chunk);
     let mut out: Vec<ChunkRow> = Vec::with_capacity(drafts.len() + 1);
     if !has_leaf {

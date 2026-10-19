@@ -97,7 +97,9 @@ pub struct SearchInputs {
     pub chunks: HashMap<String, ChunkMeta>,
 }
 
-/// Параметры слияния (секция `[search]`).
+/// Параметры слияния (секция `[search]`). Умолчания библиотеки — равные веса каналов (на них
+/// держатся модульные тесты слияния); вес ослабленного bm25 (`w_fts_relaxed`) сервер
+/// подставляет в `w_fts` сам, когда строгий запрос FTS ничего не нашёл.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Weights {
     /// Константа RRF.

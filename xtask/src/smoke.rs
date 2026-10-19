@@ -135,15 +135,16 @@ fn scrub_zam_env<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
 }
 
 /// Свободный порт: bind на 127.0.0.1:0 и закрытие.
-fn free_port() -> Result<u16> {
+pub(crate) fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-/// Дочерний zam-server; при ошибке теста гарантированно убивается.
-struct Server {
-    child: Child,
+/// Дочерний zam-server; при ошибке теста гарантированно убивается. Общий со smoke
+/// `cargo xtask eval` (сервер из target/release на каталоге в target/eval).
+pub(crate) struct Server {
+    pub(crate) child: Child,
     log: Arc<Mutex<VecDeque<String>>>,
-    token_rx: Receiver<String>,
+    pub(crate) token_rx: Receiver<String>,
 }
 
 /// Сколько последних строк stderr сервера показывать при ошибке.
@@ -155,8 +156,9 @@ fn interesting(line: &str) -> bool {
 }
 
 impl Server {
-    /// Запускает сервер; stderr целиком (кроме строки с токеном) пишется в `log_file`.
-    fn start(root: &Path, data: &Path, env: &SmokeEnv, log_file: &Path) -> Result<Self> {
+    /// Запускает `zam-server` из каталога `root` (комплект или target/release); stderr
+    /// целиком (кроме строки с токеном) пишется в `log_file`.
+    pub(crate) fn start(root: &Path, data: &Path, env: &SmokeEnv, log_file: &Path) -> Result<Self> {
         let mut cmd =
             Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")));
         let mut child = scrub_zam_env(&mut cmd, &["ZAM_ADMIN_PASSWORD"])
@@ -202,7 +204,7 @@ impl Server {
     }
 
     /// Последние строки stderr (без журнала ORT и раздачи WebUI).
-    fn log_tail(&self) -> String {
+    pub(crate) fn log_tail(&self) -> String {
         self.log
             .lock()
             .map(|l| l.iter().cloned().collect::<Vec<_>>().join("\n"))
@@ -210,7 +212,7 @@ impl Server {
     }
 
     /// Остановка: Unix — SIGTERM, затем kill через 10 с; Windows — TerminateProcess.
-    fn stop(&mut self) -> Result<()> {
+    pub(crate) fn stop(&mut self) -> Result<()> {
         #[cfg(unix)]
         {
             let _ = Command::new("kill")
@@ -261,15 +263,25 @@ fn host_platform(root: &Path) -> &'static str {
 }
 
 fn agent() -> ureq::Agent {
+    agent_with(Duration::from_secs(10))
+}
+
+/// HTTP-клиент без прокси, коды ошибок не превращаются в `Err`, общий предел `timeout`.
+fn agent_with(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .proxy(None)
         .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(10)))
+        .timeout_global(Some(timeout))
         .build()
         .into()
 }
 
 fn wait_health(srv: &mut Server, base: &str) -> Result<()> {
+    wait_health_for(srv, base, WAIT)
+}
+
+/// Ждёт `/api/v1/health` не дольше `wait` (сервер отвечает после загрузки модели).
+pub(crate) fn wait_health_for(srv: &mut Server, base: &str, wait: Duration) -> Result<()> {
     let a = agent();
     let t0 = Instant::now();
     loop {
@@ -284,9 +296,10 @@ fn wait_health(srv: &mut Server, base: &str) -> Result<()> {
         {
             return Ok(());
         }
-        if t0.elapsed() > WAIT {
+        if t0.elapsed() > wait {
             bail!(
-                "/api/v1/health не ответил за 10 с; stderr:\n{}",
+                "/api/v1/health не ответил за {} с; stderr:\n{}",
+                wait.as_secs(),
                 srv.log_tail()
             );
         }
@@ -746,14 +759,19 @@ const VECTOR_TARGET: &str = "smoke/vec/photosynthesis";
 
 /// Порты и окружение сервера smoke: модель — тестовая, Qdrant — на свободных портах
 /// (не мешает Qdrant разработчика и параллельным прогонам).
-struct SmokeEnv {
-    addr: SocketAddr,
+pub(crate) struct SmokeEnv {
+    pub(crate) addr: SocketAddr,
     qdrant_http: u16,
-    vars: Vec<(String, String)>,
+    pub(crate) vars: Vec<(String, String)>,
 }
 
 impl SmokeEnv {
     fn new() -> Result<Self> {
+        Self::for_model(SMOKE_MODEL)
+    }
+
+    /// Свободные порты сервера и Qdrant, модель эмбеддингов `model` (`ml.embed_model`).
+    pub(crate) fn for_model(model: &str) -> Result<Self> {
         let addr: SocketAddr = ([127, 0, 0, 1], free_port()?).into();
         let qdrant_http = free_port()?;
         let qdrant_grpc = free_port()?;
@@ -761,7 +779,7 @@ impl SmokeEnv {
             addr,
             qdrant_http,
             vars: vec![
-                ("ZAM_ML__EMBED_MODEL".into(), SMOKE_MODEL.into()),
+                ("ZAM_ML__EMBED_MODEL".into(), model.into()),
                 ("ZAM_QDRANT__HTTP_PORT".into(), qdrant_http.to_string()),
                 ("ZAM_QDRANT__GRPC_PORT".into(), qdrant_grpc.to_string()),
             ],
@@ -809,8 +827,24 @@ fn install_test_model(repo: &Path, data: &Path) -> Result<()> {
 }
 
 /// Запрос к API с токеном; возвращает статус и JSON ответа.
-fn api(base: &str, token: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
-    let a = agent();
+pub(crate) fn api(
+    base: &str,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<(u16, Value)> {
+    api_timeout(base, token, path, body, Duration::from_secs(10))
+}
+
+/// То же с пределом времени запроса (реранк на CPU, загрузка реранкера).
+pub(crate) fn api_timeout(
+    base: &str,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+) -> Result<(u16, Value)> {
+    let a = agent_with(timeout);
     let url = format!("{base}{path}");
     let auth = format!("Bearer {token}");
     let mut r = match body {

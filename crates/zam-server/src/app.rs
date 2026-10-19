@@ -122,6 +122,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     if let Some(e) = &ml.embedder {
         zam_store::set_token_counter(Arc::new(e.token_counter()));
     }
+    zam_store::set_chunk_params(cfg.index.chunk_params());
     let system = SystemStore::open(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
     let admin_id = system

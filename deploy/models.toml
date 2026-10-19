@@ -3,7 +3,7 @@
 #
 # Поля:
 #   id                    — каталог <data_dir>/models/<id>/ (в разработке: target/models/<id>/);
-#   role                  — embed | rerank | test;
+#   role                  — embed | rerank | test | reference (эталон для eval, не для пользователя);
 #   device                — cpu | gpu | any: для какого устройства предназначен вариант
 #                           (cpu-вариант zam-ml запускает только на CPU, даже при ml.device = cuda);
 #   license               — SPDX-идентификатор лицензии весов;
@@ -53,6 +53,33 @@ bundle = true
 files = [
     { url = "https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/onnx/model_fp16.onnx", path = "model.onnx", size = 1133992936, sha256 = "4f1a646a3d4f39985589e9991a717044ede8278617fe55e3d246838bc05055e9" },
     { url = "https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/tokenizer.json", path = "tokenizer.json", size = 17082821, sha256 = "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/sparse_linear.pt", path = "sparse_linear.pt", size = 3516, sha256 = "45c93804d2142b8f6d7ec6914ae23a1eee9c6a1d27d83d908a20d2afb3595ad9" },
+]
+[model.spec]
+dim = 1024
+pooling = "cls"
+sparse_head = "sparse_linear.pt"
+max_tokens_passage = 1024
+max_tokens_query = 512
+
+# Эталон качества fp32 (BAAI, оригинальный ONNX-экспорт) — только для `cargo xtask eval
+# --quality-gate`: с ним сравниваются int8 и fp16 (косинус dense, Спирмен sparse, recall@5 и
+# nDCG@10). role = "reference": в zam-models не входит (bundle = false), `zam-server models
+# fetch` его не ставит и `models status` не показывает; скачивается только в target/models/.
+# Граф ссылается на внешние данные model.onnx_data и Constant_7_attr__value по имени — файлы
+# лежат рядом под исходными именами. Выход token_embeddings [B,T,1024]; токенизатор тот же,
+# что у Xenova (sha256 совпадает с BAAI/bge-m3/onnx/tokenizer.json).
+[[model]]
+id = "bge-m3-fp32"
+role = "reference"
+device = "any"
+license = "MIT"
+bundle = false
+files = [
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/onnx/model.onnx", path = "model.onnx", size = 724923, sha256 = "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/onnx/model.onnx_data", path = "model.onnx_data", size = 2266820608, sha256 = "1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/onnx/Constant_7_attr__value", path = "Constant_7_attr__value", size = 65552, sha256 = "cdf16f72c5d07b36484056e601ed9687f78477e5d85cee85a34f2406b7fb5906" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/onnx/tokenizer.json", path = "tokenizer.json", size = 17082821, sha256 = "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790" },
     { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/sparse_linear.pt", path = "sparse_linear.pt", size = 3516, sha256 = "45c93804d2142b8f6d7ec6914ae23a1eee9c6a1d27d83d908a20d2afb3595ad9" },
 ]
 [model.spec]
