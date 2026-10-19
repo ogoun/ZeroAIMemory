@@ -38,7 +38,13 @@ pub struct RerankSlot {
     ml: Option<MlConfig>,
     model_cpu: String,
     model_gpu: String,
-    state: tokio::sync::Mutex<State>,
+    /// Состояние под асинхронным мьютексом: загрузку держит отдельная задача (см. [`RerankSlot::get`]).
+    state: Arc<tokio::sync::Mutex<State>>,
+    /// Сколько раз запускалась загрузка (проверка в тестах: одна загрузка на слот).
+    loads: Arc<std::sync::atomic::AtomicUsize>,
+    /// Пауза перед загрузкой — только тесты (отмена запроса во время загрузки).
+    #[cfg(test)]
+    delay: Duration,
 }
 
 impl std::fmt::Debug for RerankSlot {
@@ -56,7 +62,10 @@ impl RerankSlot {
             ml: crate::ml::ml_config(cfg).ok(),
             model_cpu: cfg.ml.rerank_model_cpu.clone(),
             model_gpu: cfg.ml.rerank_model_gpu.clone(),
-            state: tokio::sync::Mutex::new(State::Empty),
+            state: Arc::new(tokio::sync::Mutex::new(State::Empty)),
+            loads: Arc::default(),
+            #[cfg(test)]
+            delay: Duration::ZERO,
         }
     }
 
@@ -69,8 +78,13 @@ impl RerankSlot {
     }
 
     /// Реранкер (загружает при первом вызове) или предупреждение для ответа.
+    ///
+    /// Загрузка идёт в отдельной задаче tokio, которая держит мьютекс состояния и сама
+    /// записывает итог: отмена запроса (клиент ушёл) не бросает загруженную модель, а
+    /// следующий запрос ждёт ту же загрузку, а не начинает вторую (вторая копия — до 1,1 ГБ
+    /// памяти или VRAM).
     pub async fn get(&self, embed_device: Option<Device>) -> Result<Arc<Reranker>, &'static str> {
-        let mut st = self.state.lock().await;
+        let mut st = self.state.clone().lock_owned().await;
         match &*st {
             State::Ready(r) => return Ok(r.clone()),
             State::Failed { at, warning } if at.elapsed() < RETRY_AFTER => return Err(warning),
@@ -84,33 +98,45 @@ impl RerankSlot {
         if !matches!(embed_device, Some(Device::Cuda { .. })) {
             ml.device = zam_ml::DevicePref::Cpu;
         }
-        let load_id = id.clone();
-        let loaded = tokio::task::spawn_blocking(move || Reranker::load(&ml, &load_id)).await;
-        let warning = match loaded {
-            Ok(Ok(r)) => {
-                let r = Arc::new(r);
-                *st = State::Ready(r.clone());
-                return Ok(r);
-            }
-            Ok(Err(MlError::NoModel(e))) => {
-                tracing::warn!(model = %id, error = %e, hint = "zam-server models fetch --reranker",
-                    "реранкер не установлен: поиск без реранка");
-                WARN_NOT_INSTALLED
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(model = %id, error = %e, "реранкер не загрузился: поиск без реранка");
-                WARN_FAILED
-            }
-            Err(j) => {
-                tracing::error!(model = %id, panic = j.is_panic(), "загрузка реранкера аварийно завершилась");
-                WARN_FAILED
-            }
-        };
-        *st = State::Failed {
-            at: Instant::now(),
-            warning,
-        };
-        Err(warning)
+        let loads = self.loads.clone();
+        #[cfg(test)]
+        let delay = self.delay;
+        let task = tokio::spawn(async move {
+            let load_id = id.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                #[cfg(test)]
+                std::thread::sleep(delay);
+                Reranker::load(&ml, &load_id)
+            })
+            .await;
+            let warning = match loaded {
+                Ok(Ok(r)) => {
+                    let r = Arc::new(r);
+                    *st = State::Ready(r.clone());
+                    return Ok(r);
+                }
+                Ok(Err(MlError::NoModel(e))) => {
+                    tracing::warn!(model = %id, error = %e, hint = "zam-server models fetch --reranker",
+                        "реранкер не установлен: поиск без реранка");
+                    WARN_NOT_INSTALLED
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(model = %id, error = %e, "реранкер не загрузился: поиск без реранка");
+                    WARN_FAILED
+                }
+                Err(j) => {
+                    tracing::error!(model = %id, panic = j.is_panic(), "загрузка реранкера аварийно завершилась");
+                    WARN_FAILED
+                }
+            };
+            *st = State::Failed {
+                at: Instant::now(),
+                warning,
+            };
+            Err(warning)
+        });
+        task.await.unwrap_or(Err(WARN_FAILED))
     }
 }
 
@@ -221,5 +247,20 @@ mod tests {
             State::Failed { warning, .. } if *warning == WARN_NOT_INSTALLED
         ));
         assert_eq!(slot.get(None).await.err(), Some(WARN_NOT_INSTALLED));
+        assert_eq!(slot.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_request_does_not_restart_loading() {
+        let mut cfg = ServerConfig::default();
+        cfg.ml.models_dir = Some(crate::test_util::dir_in_target("rerank-slot-cancel"));
+        let mut slot = RerankSlot::new(&cfg);
+        slot.delay = Duration::from_millis(400);
+        // клиент ушёл во время загрузки: future запроса брошен
+        let r = tokio::time::timeout(Duration::from_millis(50), slot.get(None)).await;
+        assert!(r.is_err(), "загрузка должна идти дольше таймаута");
+        // следующий запрос ждёт ту же загрузку, вторая не начинается
+        assert_eq!(slot.get(None).await.err(), Some(WARN_NOT_INSTALLED));
+        assert_eq!(slot.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

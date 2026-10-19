@@ -449,7 +449,7 @@ fn install(
     for f in &m.files {
         on_file(f);
         let cached = fetch_file(&f.url, &f.sha256, Some(f.size), &dir.join(&f.path))
-            .map_err(|e| FetchError::Invalid(format!("{}: {}: {e}", m.id, f.path)))?;
+            .map_err(|e| e.context(&format!("{}: {}", m.id, f.path)))?;
         files.push((f.path.clone(), cached));
     }
     write_atomic(&dir.join(MODEL_LICENSE_FILE), &m.license_text())?;
@@ -945,9 +945,10 @@ max_tokens_query = 8
         ]);
         let wrong = "0".repeat(64);
         let m = local_manifest(&base, "r2", false, Some(&wrong));
-        let err = fetch_model_unchecked(&m, "r2", &d, false)
-            .unwrap_err()
-            .to_string();
+        let err = fetch_model_unchecked(&m, "r2", &d, false).unwrap_err();
+        // вариант ошибки сохраняется, контекст — модель и файл
+        assert!(matches!(err, FetchError::Sha256Mismatch { .. }), "{err:?}");
+        let err = err.to_string();
         assert!(
             err.contains(&wrong) && err.contains("tokenizer.json"),
             "{err}"
@@ -980,6 +981,8 @@ max_tokens_query = 8
             s.contains("CC-BY-NC-4.0") && s.contains("--accept-nc-license"),
             "{s}"
         );
+        // текст одной строкой, без серий пробелов от переноса в исходнике
+        assert!(!s.contains("  ") && !s.contains('\n'), "{s}");
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert!(!d.join("nc1").exists());
         assert_eq!(model_state(&m.model[0], &d, false), ModelState::Missing);

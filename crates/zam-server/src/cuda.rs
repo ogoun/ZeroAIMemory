@@ -3,7 +3,9 @@
 //!
 //! В GPU-комплект они не входят (решение владельца). Файлы кладутся плоско в
 //! `<каталог ORT>/cuda/` — оттуда их предзагружает zam-ml перед включением CUDA EP. Каждый
-//! архив сверяется по размеру и SHA-256 манифеста; уже поставленные не перекачиваются.
+//! архив сверяется по размеру и SHA-256 манифеста, рядом пишется штамп `.<компонент>.sha256`.
+//! Архив пропускается, только если штамп совпал с манифестом и файлы на месте; иначе (новый
+//! выпуск в манифесте, файлы без штампа) — перекачка и замена.
 //! Linux: tar.xz, имена SONAME — файлы, на которые указывают ссылки архива.
 
 use std::path::{Path, PathBuf};
@@ -66,20 +68,27 @@ pub fn fetch(
         m.total_size(platform) as f64 / 1e6,
         dir.display()
     ));
-    let done = install_cuda(m, platform, &dir, &mut |l| {
-        log(&format!(
-            "  {} {} ({:.0} МБ) …",
-            l.component,
-            l.version,
-            l.size as f64 / 1e6
-        ));
+    let done = install_cuda(m, platform, &dir, &mut |l, installed| {
+        if installed {
+            log(&format!(
+                "  {} {}: уже установлено (штамп совпал)",
+                l.component, l.version
+            ));
+        } else {
+            log(&format!(
+                "  {} {} ({:.0} МБ) …",
+                l.component,
+                l.version,
+                l.size as f64 / 1e6
+            ));
+        }
     })?;
     let fresh = done.iter().filter(|(_, cached)| !*cached).count();
     let names = m.dest_names(platform)?;
     Ok(format!(
-        "библиотеки NVIDIA установлены: {} файлов в {} (загружено архивов {fresh}, уже на \
-         месте {}; размер и SHA-256 сверены).\nНужен драйвер NVIDIA с поддержкой CUDA 13 \
-         (ветка R580 и новее). Лицензия библиотек NVIDIA: {NVIDIA_EULA}\nПерезапустите \
+        "библиотеки NVIDIA: {} файлов в {}; загружено архивов {fresh} (размер и SHA-256 \
+         сверены), уже установлено {} (штамп совпал).\nНужен драйвер NVIDIA с поддержкой \
+         CUDA 13 (ветка R580 и новее). Лицензия библиотек NVIDIA: {NVIDIA_EULA}\nПерезапустите \
          zam-server: устройство и причина выбора — в журнале и /index/status.",
         names.len(),
         dir.display(),

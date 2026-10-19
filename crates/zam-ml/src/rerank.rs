@@ -217,12 +217,14 @@ impl Reranker {
             .get(&runner.output)
             .ok_or_else(|| MlError::Ort(format!("нет выхода {}", runner.output)))?;
         let logits: Vec<f32> = match value.try_extract_tensor::<f32>() {
-            Ok((shape, data)) => check_shape(&shape[..], b)
-                .map(|step| data.iter().step_by(step).copied().collect())?,
+            Ok((shape, data)) => {
+                check_shape(&shape[..], b)?;
+                data.to_vec()
+            }
             Err(_) => {
                 let (shape, data) = value.try_extract_tensor::<half::f16>()?;
-                let step = check_shape(&shape[..], b)?;
-                data.iter().step_by(step).map(|x| x.to_f32()).collect()
+                check_shape(&shape[..], b)?;
+                data.iter().map(|x| x.to_f32()).collect()
             }
         };
         if logits.len() != b || logits.iter().any(|x| !x.is_finite()) {
@@ -236,13 +238,14 @@ impl Reranker {
     }
 }
 
-/// Форма логитов `[B]` или `[B, k]`: шаг до логита следующей пары (берётся первый класс).
-fn check_shape(shape: &[i64], b: usize) -> Result<usize, MlError> {
+/// Форма логитов: `[B]` или `[B, 1]` — один логит релевантности на пару. Выход с
+/// несколькими классами (`[B, k]`, k > 1) — не реранкер этого вида: ошибка, а не молча
+/// первый столбец.
+fn check_shape(shape: &[i64], b: usize) -> Result<(), MlError> {
     match shape {
-        [n] if *n as usize == b => Ok(1),
-        [n, k] if *n as usize == b && *k >= 1 => Ok(*k as usize),
+        [n] | [n, 1] if *n as usize == b => Ok(()),
         _ => Err(MlError::Spec(format!(
-            "выход реранкера: форма {shape:?}, ожидалось [{b}, 1]"
+            "выход реранкера: форма {shape:?}, ожидалось [{b}, 1] (один логит на пару)"
         ))),
     }
 }
@@ -268,6 +271,19 @@ impl Runner {
                     outs.iter().map(|o| o.name()).collect::<Vec<_>>().join(", ")
                 ))
             })?;
+        // выход с несколькими классами отвергается при загрузке, если граф знает форму
+        if let Some(shape) = outs
+            .iter()
+            .find(|o| o.name() == output)
+            .and_then(|o| o.dtype().tensor_shape())
+            && shape.len() == 2
+            && shape[1] > 1
+        {
+            return Err(MlError::Spec(format!(
+                "выход {output}: {} классов, ожидался один логит на пару",
+                shape[1]
+            )));
+        }
         if let Some(ty) = outs
             .iter()
             .find(|o| o.name() == output)
@@ -298,9 +314,10 @@ mod tests {
 
     #[test]
     fn logits_shape() {
-        assert_eq!(check_shape(&[3], 3).unwrap(), 1);
-        assert_eq!(check_shape(&[3, 1], 3).unwrap(), 1);
-        assert_eq!(check_shape(&[2, 2], 2).unwrap(), 2);
+        assert!(check_shape(&[3], 3).is_ok());
+        assert!(check_shape(&[3, 1], 3).is_ok());
+        // несколько классов — ошибка, а не первый столбец
+        assert!(check_shape(&[2, 2], 2).is_err());
         assert!(check_shape(&[2, 1], 3).is_err());
         assert!(check_shape(&[3, 1, 1], 3).is_err());
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6 && sigmoid(10.0) > sigmoid(-10.0));

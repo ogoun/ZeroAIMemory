@@ -12,7 +12,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::models::{NVIDIA_REDIST, check_plain_name, check_sha256};
-use crate::{FetchError, PLATFORMS, PlatformEntry, install_archive};
+use crate::{FetchError, PLATFORMS, PlatformEntry, install_archive, is_installed};
 
 /// Манифест библиотек NVIDIA (CUDA и cuDNN) для CUDA EP.
 #[derive(Debug, Deserialize)]
@@ -134,13 +134,15 @@ impl CudaManifest {
 }
 
 /// Ставит библиотеки платформы в `dir` (плоско): архив за архивом через [`install_archive`]
-/// (размер и SHA-256 сверяются, файлы на месте не перекачиваются). `on_lib` вызывается перед
-/// каждым архивом (прогресс в CLI). Возвращает (компонент, был ли уже на месте).
+/// со штампом `.<компонент>.sha256` (размер и SHA-256 сверяются; архив пропускается, только
+/// если штамп совпал с манифестом и файлы на месте, иначе файлы заменяются). `on_lib`
+/// вызывается перед каждым архивом с признаком «уже установлен» (прогресс в CLI).
+/// Возвращает (компонент, был ли уже установлен — штамп совпал).
 pub fn install_cuda(
     manifest: &CudaManifest,
     platform: &str,
     dir: &Path,
-    on_lib: &mut dyn FnMut(&CudaLib),
+    on_lib: &mut dyn FnMut(&CudaLib, bool),
 ) -> Result<Vec<(String, bool)>, FetchError> {
     let libs: Vec<&CudaLib> = manifest.libs(platform).collect();
     if libs.is_empty() {
@@ -150,9 +152,10 @@ pub fn install_cuda(
     }
     let mut out = Vec::with_capacity(libs.len());
     for l in libs {
-        on_lib(l);
-        let cached = install_archive(&l.entry(), dir)
-            .map_err(|e| FetchError::Invalid(format!("{} {}: {e}", l.component, l.version)))?;
+        on_lib(l, is_installed(&l.entry(), dir, &l.component)?);
+        // штамп `.<компонент>.sha256`: новый выпуск в манифесте заменяет старые библиотеки
+        let cached = install_archive(&l.entry(), dir, &l.component)
+            .map_err(|e| e.context(&format!("{} {}", l.component, l.version)))?;
         out.push((l.component.clone(), cached));
     }
     Ok(out)
@@ -379,17 +382,19 @@ extract = ["a/lib/libcudart.so.13"]
         let m = CudaManifest::parse(&text).unwrap();
         let dir = d.join("ort").join("cuda");
         let mut seen = Vec::new();
-        let r = install_cuda(&m, "linux-x64", &dir, &mut |l| {
-            seen.push(l.component.clone())
+        let r = install_cuda(&m, "linux-x64", &dir, &mut |l, done| {
+            seen.push((l.component.clone(), done))
         })
         .unwrap();
         assert_eq!(r, [("cuda_cudart".to_string(), false)]);
-        assert_eq!(seen, ["cuda_cudart"]);
+        assert_eq!(seen, [("cuda_cudart".to_string(), false)]);
+        assert!(dir.join(".cuda_cudart.sha256").is_file());
         assert_eq!(
             std::fs::read(dir.join("libcudart.so.13")).unwrap(),
             b"CUDART"
         );
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // библиотека и штамп
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         // рядом с каталогом не осталось *.part и *.tmp
         let left: Vec<_> = std::fs::read_dir(d.join("ort"))
             .unwrap()
@@ -397,10 +402,10 @@ extract = ["a/lib/libcudart.so.13"]
             .collect();
         assert_eq!(left, ["cuda"]);
         // повторно — без сети (сервер обслужил единственный запрос)
-        let r = install_cuda(&m, "linux-x64", &dir, &mut |_| {}).unwrap();
+        let r = install_cuda(&m, "linux-x64", &dir, &mut |_, _| {}).unwrap();
         assert_eq!(r, [("cuda_cudart".to_string(), true)]);
         // платформы нет в манифесте — ошибка
-        assert!(install_cuda(&m, "windows-x64", &dir, &mut |_| {}).is_err());
+        assert!(install_cuda(&m, "windows-x64", &dir, &mut |_, _| {}).is_err());
     }
 
     /// Настоящие архивы NVIDIA по `deploy/cuda.toml` (сеть, ~2,2 ГБ для Linux, ~1,9 ГБ для
@@ -428,7 +433,7 @@ extract = ["a/lib/libcudart.so.13"]
             .join(format!("cuda-{platform}"))
             .join("cuda");
         let t = std::time::Instant::now();
-        install_cuda(&m, &platform, &dir, &mut |l| {
+        install_cuda(&m, &platform, &dir, &mut |l, _| {
             eprintln!("{} {} ({} МБ)", l.component, l.version, l.size / 1_000_000)
         })
         .unwrap();
@@ -436,6 +441,7 @@ extract = ["a/lib/libcudart.so.13"]
         let mut names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
             .collect();
         names.sort();
         let mut want = m.dest_names(&platform).unwrap();

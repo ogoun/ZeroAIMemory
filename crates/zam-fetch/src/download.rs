@@ -241,6 +241,8 @@ fn extract_tar<R: Read>(
     let mut candidates: HashMap<String, (PathBuf, Option<u32>)> = HashMap::new();
     // путь ссылки → путь цели (только простые цели в том же каталоге)
     let mut links: HashMap<String, String> = HashMap::new();
+    // номер временного файла кандидата (не число кандидатов: путь может повториться)
+    let mut seq = 0usize;
     let mut t = tar::Archive::new(reader);
     let scan = (|| {
         for e in t.entries().map_err(archive_err)? {
@@ -280,9 +282,13 @@ fn extract_tar<R: Read>(
                 set_mode(&to, mode)?;
                 found[i] = true;
             } else if kind.is_file() && is_candidate(&p) {
-                let to = out.join(format!(".zam-link-{}", candidates.len()));
+                seq += 1;
+                let to = out.join(format!(".zam-link-{seq}"));
                 let mut o = File::create(&to).map_err(FetchError::io(out_ctx()))?;
-                candidates.insert(p, (to, mode));
+                // повтор пути в tar: действует последний, прежний временный файл удаляется
+                if let Some((old, _)) = candidates.insert(p, (to, mode)) {
+                    let _ = fs::remove_file(old);
+                }
                 io::copy(&mut e, &mut o).map_err(archive_err)?;
             }
         }
@@ -535,15 +541,45 @@ pub fn fetch_file(
     Ok(false)
 }
 
+/// Штамп архива в каталоге установки: `<dir>/.<key>.sha256` с SHA-256 архива из манифеста
+/// и переводом строки (тот же формат, что у штампа `<каталог>.sha256` в `cargo xtask
+/// fetch-deps`). `key` — простое имя (компонент, `qdrant`).
+pub fn stamp_path(dir: &Path, key: &str) -> Result<PathBuf, FetchError> {
+    if key.is_empty()
+        || key.starts_with('.')
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(FetchError::Invalid(format!(
+            "недопустимый ключ штампа '{key}'"
+        )));
+    }
+    Ok(dir.join(format!(".{key}.sha256")))
+}
+
+/// Установлен ли архив `entry` под ключом `key`: штамп совпал с хэшем манифеста и все
+/// файлы `extract` на месте.
+pub fn is_installed(entry: &PlatformEntry, dir: &Path, key: &str) -> Result<bool, FetchError> {
+    let expected = entry.sha256.trim().to_ascii_lowercase();
+    let stamp = stamp_path(dir, key)?;
+    let ok = fs::read_to_string(&stamp)
+        .is_ok_and(|t| !expected.is_empty() && t.trim().eq_ignore_ascii_case(&expected));
+    Ok(ok && dest_names(entry)?.iter().all(|n| dir.join(n).is_file()))
+}
+
 /// Ставит файлы архива платформы в каталог `dir`, не трогая остальные файлы в нём
 /// (например `vcruntime140.dll` рядом с `qdrant.exe` в комплекте Windows).
 ///
-/// Если все файлы `extract` уже на месте — сеть не нужна, возвращается true.
-/// Иначе архив скачивается во временный `<dir>.<pid>.part` рядом с каталогом (`*.part`
-/// прерванных прошлых загрузок удаляются), размер (если задан) и хэш сверяются с
-/// манифестом, файлы извлекаются в `<dir>.tmp` и переносятся в `dir`; временные файлы
+/// Пропуск (без сети, возвращается true) — только если штамп `.<key>.sha256` совпал с хэшем
+/// манифеста и все файлы `extract` на месте ([`is_installed`]). Иначе (другой хэш в
+/// манифесте, нет штампа — файлы поставлены не нами или прошлым выпуском) архив
+/// скачивается во временный `<dir>.<pid>.part` рядом с каталогом (`*.part` прерванных
+/// прошлых загрузок удаляются), размер (если задан) и хэш сверяются с манифестом, файлы
+/// извлекаются в `<dir>.tmp` и заменяют прежние в `dir`, последним пишется штамп (до замены
+/// старый штамп удаляется: прерванная замена не выглядит установленной); временные файлы
 /// удаляются в любом исходе.
-pub fn install_archive(entry: &PlatformEntry, dir: &Path) -> Result<bool, FetchError> {
+pub fn install_archive(entry: &PlatformEntry, dir: &Path, key: &str) -> Result<bool, FetchError> {
     let expected = entry.sha256.trim().to_ascii_lowercase();
     if expected.is_empty() {
         return Err(FetchError::Invalid(format!(
@@ -552,7 +588,8 @@ pub fn install_archive(entry: &PlatformEntry, dir: &Path) -> Result<bool, FetchE
         )));
     }
     let names = dest_names(entry)?;
-    if names.iter().all(|n| dir.join(n).is_file()) {
+    let stamp = stamp_path(dir, key)?;
+    if is_installed(entry, dir, key)? {
         return Ok(true);
     }
     if let Some(parent) = dir.parent() {
@@ -578,6 +615,10 @@ pub fn install_archive(entry: &PlatformEntry, dir: &Path) -> Result<bool, FetchE
         }
         extract_selected(&part, &entry.url, entry, &tmp)?;
         fs::create_dir_all(dir).map_err(FetchError::io(format!("создание {}", dir.display())))?;
+        if stamp.exists() {
+            fs::remove_file(&stamp)
+                .map_err(FetchError::io(format!("удаление {}", stamp.display())))?;
+        }
         for n in &names {
             let to = dir.join(n);
             if to.exists() {
@@ -586,6 +627,10 @@ pub fn install_archive(entry: &PlatformEntry, dir: &Path) -> Result<bool, FetchE
             fs::rename(tmp.join(n), &to)
                 .map_err(FetchError::io(format!("перенос в {}", to.display())))?;
         }
+        let stamp_tmp = sibling(&stamp, ".part")?;
+        fs::write(&stamp_tmp, format!("{expected}\n"))
+            .and_then(|()| fs::rename(&stamp_tmp, &stamp))
+            .map_err(FetchError::io(format!("запись {}", stamp.display())))?;
         Ok(())
     })();
     let _ = fs::remove_file(&part);
@@ -841,8 +886,12 @@ mod tests {
         let dir = d.join("qdrant").join("1.0.0");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("vcruntime140.dll"), b"VC").unwrap();
-        assert!(!install_archive(&e, &dir).unwrap());
+        assert!(!install_archive(&e, &dir, "q").unwrap());
         assert_eq!(std::fs::read(dir.join("a.dll")).unwrap(), b"AAA");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".q.sha256")).unwrap(),
+            format!("{}\n", e.sha256)
+        );
         assert_eq!(std::fs::read(dir.join("vcruntime140.dll")).unwrap(), b"VC");
         // временные файлы рядом с каталогом удалены
         let left: Vec<_> = std::fs::read_dir(d.join("qdrant"))
@@ -850,9 +899,87 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["1.0.0"]);
-        // файлы на месте — без сети (сервер уже закрыт)
-        assert!(install_archive(&e, &dir).unwrap());
+        // штамп совпал и файлы на месте — без сети (сервер уже закрыт)
+        assert!(install_archive(&e, &dir, "q").unwrap());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn install_archive_replaces_on_new_hash_or_missing_stamp() {
+        let d = tmp("install_stamp");
+        let zip_p = d.join("src.zip");
+        make_zip(&zip_p);
+        let body: &'static [u8] = Box::leak(std::fs::read(&zip_p).unwrap().into_boxed_slice());
+        let sha = sha256_file(&zip_p).unwrap();
+        let dir = d.join("cuda");
+        std::fs::create_dir_all(&dir).unwrap();
+        // старые файлы без штампа (прошлый выпуск, ручная распаковка) — перекачка и замена
+        std::fs::write(dir.join("a.dll"), b"OLD").unwrap();
+        let (url, hits) = serve(body, "a.zip", 2);
+        let mut e = entry(&["root/lib/a.dll"], &[]);
+        e.url = url;
+        e.sha256 = sha.clone();
+        assert!(!is_installed(&e, &dir, "lib").unwrap());
+        assert!(!install_archive(&e, &dir, "lib").unwrap());
+        assert_eq!(std::fs::read(dir.join("a.dll")).unwrap(), b"AAA");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(is_installed(&e, &dir, "lib").unwrap());
+        // другой хэш в манифесте (новый выпуск) — перекачка; здесь тело то же, хэш не сойдётся,
+        // старые файлы и штамп остаются
+        let mut e2 = entry(&["root/lib/a.dll"], &[]);
+        e2.url = e.url.clone();
+        e2.sha256 = "1".repeat(64);
+        assert!(!is_installed(&e2, &dir, "lib").unwrap());
+        assert!(matches!(
+            install_archive(&e2, &dir, "lib"),
+            Err(FetchError::Sha256Mismatch { .. })
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read(dir.join("a.dll")).unwrap(), b"AAA");
+        assert!(is_installed(&e, &dir, "lib").unwrap());
+        // новый выпуск: другой архив и его хэш в манифесте — файлы и штамп заменяются
+        let new_zip = d.join("new.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&new_zip).unwrap());
+            z.start_file("root/lib/a.dll", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(b"NEW").unwrap();
+            z.finish().unwrap();
+        }
+        let new_body: &'static [u8] =
+            Box::leak(std::fs::read(&new_zip).unwrap().into_boxed_slice());
+        let (url3, hits3) = serve(new_body, "a.zip", 1);
+        let mut e3 = entry(&["root/lib/a.dll"], &[]);
+        e3.url = url3;
+        e3.sha256 = sha256_file(&new_zip).unwrap();
+        assert!(!install_archive(&e3, &dir, "lib").unwrap());
+        assert_eq!(hits3.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(dir.join("a.dll")).unwrap(), b"NEW");
+        assert!(is_installed(&e3, &dir, "lib").unwrap() && !is_installed(&e, &dir, "lib").unwrap());
+        // совпал — без сети (сервер закрыт)
+        assert!(install_archive(&e3, &dir, "lib").unwrap());
+        // штамп есть, а файла нет — не установлено
+        std::fs::remove_file(dir.join("a.dll")).unwrap();
+        assert!(!is_installed(&e, &dir, "lib").unwrap());
+        assert!(stamp_path(&dir, "../x").is_err() && stamp_path(&dir, "").is_err());
+    }
+
+    #[test]
+    fn tar_duplicate_candidate_leaves_no_temp_files() {
+        let d = tmp("txz_dup");
+        let p = d.join("a.tar.xz");
+        make_txz(
+            &p,
+            &[
+                T::File("a/lib/libq.so.1.0", "OLD", 0o644),
+                T::File("a/lib/libq.so.1.0", "NEW", 0o644),
+                T::Link("a/lib/libq.so.1", "libq.so.1.0"),
+            ],
+        );
+        let out = d.join("out");
+        extract_selected(&p, "u.tar.xz", &entry(&["a/lib/libq.so.1"], &[]), &out).unwrap();
+        assert_eq!(std::fs::read(out.join("libq.so.1")).unwrap(), b"NEW");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
     }
 
     #[test]
@@ -863,11 +990,11 @@ mod tests {
         e.url = url;
         e.sha256 = "0".repeat(64);
         let dir = d.join("qdrant").join("1.0.0");
-        let err = install_archive(&e, &dir).unwrap_err().to_string();
+        let err = install_archive(&e, &dir, "q").unwrap_err().to_string();
         assert!(err.contains(HELLO_SHA), "{err}");
         assert_eq!(std::fs::read_dir(d.join("qdrant")).unwrap().count(), 0);
         e.sha256.clear();
-        assert!(install_archive(&e, &dir).is_err());
+        assert!(install_archive(&e, &dir, "q").is_err());
     }
 
     #[test]

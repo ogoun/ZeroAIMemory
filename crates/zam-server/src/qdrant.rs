@@ -15,6 +15,9 @@ use crate::config::ServerConfig;
 /// Манифест, с которым собран сервер (`deploy/qdrant.toml`): его версию ждёт супервизор.
 const BUILT_IN_MANIFEST: &str = include_str!("../../../deploy/qdrant.toml");
 
+/// Ключ штампа архива Qdrant в каталоге версии (`.qdrant.sha256`).
+const STAMP_KEY: &str = "qdrant";
+
 /// Каталог исполняемого файла сервера (корень комплекта).
 pub fn exe_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("путь к исполняемому файлу")?;
@@ -51,15 +54,28 @@ fn check_url(url: &str) -> anyhow::Result<()> {
 
 /// `qdrant fetch`: ставит бинарник в каталог `binary`, если его там нет.
 /// Возвращает строку отчёта.
+///
+/// В отличие от `cuda fetch`, бинарник без штампа не перекачивается: каталог версии
+/// (`qdrant/<версия>/`) уже фиксирует выпуск, а комплект кладёт бинарник без штампа; версию
+/// запущенного процесса сверяет супервизор (чужая — `Broken`). Установка этой командой
+/// пишет штамп `.qdrant.sha256` (как у `install_archive` везде).
 pub fn fetch(manifest: &DepManifest, binary: &Path) -> anyhow::Result<String> {
-    if binary.is_file() {
-        return Ok(format!("Qdrant уже установлен: {}", binary.display()));
-    }
     let entry = manifest.entry(host_platform())?;
-    check_url(&entry.url)?;
     let dir = binary
         .parent()
         .with_context(|| format!("у пути {} нет каталога", binary.display()))?;
+    if binary.is_file() {
+        let how = if zam_fetch::is_installed(entry, dir, STAMP_KEY)? {
+            "штамп совпал"
+        } else {
+            "из комплекта; версию проверяет супервизор при старте"
+        };
+        return Ok(format!(
+            "Qdrant уже установлен ({how}): {}",
+            binary.display()
+        ));
+    }
+    check_url(&entry.url)?;
     let wanted = binary.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if !zam_fetch::dest_names(entry)?.iter().any(|n| n == wanted) {
         bail!(
@@ -67,7 +83,8 @@ pub fn fetch(manifest: &DepManifest, binary: &Path) -> anyhow::Result<String> {
             qdrant_exe_name()
         );
     }
-    install_archive(entry, dir).with_context(|| format!("qdrant {}", manifest.version))?;
+    install_archive(entry, dir, STAMP_KEY)
+        .with_context(|| format!("qdrant {}", manifest.version))?;
     if !binary.is_file() {
         bail!("после установки нет {}", binary.display());
     }

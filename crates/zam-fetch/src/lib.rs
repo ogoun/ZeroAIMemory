@@ -18,7 +18,7 @@ mod models;
 pub use cuda::{CudaLib, CudaManifest, install_cuda};
 pub use download::{
     dest_names, download, extract_atomic, extract_selected, fetch_file, install_archive,
-    sha256_file, verify_sha256,
+    is_installed, sha256_file, stamp_path, verify_sha256,
 };
 pub use manifest::{DepManifest, PLATFORMS, PlatformEntry, host_platform};
 pub use models::{
@@ -55,7 +55,9 @@ pub enum FetchError {
     },
     /// Модель с некоммерческой лицензией без явного согласия (`--accept-nc-license`).
     #[error(
-        "модель '{id}' распространяется по лицензии {license} (только некоммерческое          использование) и не входит в комплект zam-models; для загрузки подтвердите согласие          с лицензией флагом --accept-nc-license"
+        "модель '{id}' распространяется по лицензии {license} (только некоммерческое \
+         использование) и не входит в комплект zam-models; для загрузки подтвердите согласие \
+         с лицензией флагом --accept-nc-license"
     )]
     LicenseNotAccepted { id: String, license: String },
     /// Неверный манифест или архив (нет файла, не обычный файл, недопустимое имя).
@@ -64,6 +66,37 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    /// Та же ошибка с контекстом (компонент, модель и файл) — вариант сохраняется.
+    pub(crate) fn context(self, ctx: &str) -> FetchError {
+        match self {
+            FetchError::Io { context, err } => FetchError::Io {
+                context: format!("{ctx}: {context}"),
+                err,
+            },
+            FetchError::Sha256Mismatch {
+                what,
+                expected,
+                actual,
+            } => FetchError::Sha256Mismatch {
+                what: format!("{ctx}: {what}"),
+                expected,
+                actual,
+            },
+            FetchError::SizeMismatch {
+                what,
+                expected,
+                actual,
+            } => FetchError::SizeMismatch {
+                what: format!("{ctx}: {what}"),
+                expected,
+                actual,
+            },
+            FetchError::Invalid(m) => FetchError::Invalid(format!("{ctx}: {m}")),
+            // в URL уже видно, что качалось; согласие — о модели целиком
+            e @ (FetchError::Http { .. } | FetchError::LicenseNotAccepted { .. }) => e,
+        }
+    }
+
     pub(crate) fn io(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> FetchError {
         let context = context.into();
         move |err| FetchError::Io { context, err }
