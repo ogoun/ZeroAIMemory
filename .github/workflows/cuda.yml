@@ -13,12 +13,16 @@ on:
   push:
     branches: ['**']
     tags-ignore: ['**']
+    # всё, от чего зависят загрузка, упаковка и проверка zam-cuda
     paths:
       - deploy/cuda.toml
       - deploy/licenses/nvidia/**
-      - crates/zam-fetch/src/cuda.rs
-      - crates/zam-fetch/src/download.rs
+      - crates/zam-fetch/**
       - xtask/src/bundles.rs
+      - xtask/src/package.rs
+      - xtask/src/smoke.rs
+      - xtask/src/main.rs
+      - Cargo.lock
       - .github/workflows/cuda.yml
 
 concurrency:

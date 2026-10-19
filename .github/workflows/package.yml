@@ -1,13 +1,19 @@
-# Переиспользуемый конвейер: сборка, упаковка и smoke-тест комплектов (платформа × flavor).
+# Переиспользуемый конвейер: сборка, упаковка и smoke-тест комплектов обеих платформ.
 # Вызывается из ci.yml (без публикации) и release.yml (с загрузкой архивов для publish).
 # Артефакт web-dist должен быть загружен вызывающим workflow (job web).
 #
-# С extras (релиз) gpu-задачи собирают ещё zam-cuda своей платформы (библиотеки NVIDIA по
-# deploy/cuda.toml, ~1,9 ГБ архивов NVIDIA на Windows и ~2,2 ГБ на Linux) и проверяют его
-# (smoke-cuda и smoke GPU-комплекта с распакованным zam-cuda), а linux-x64 cpu — архивы
-# zam-models (по одному на модель с bundle = true, ~2,9 ГБ с Hugging Face). Без extras
-# (каждый push) этого не делается: трафик и время; zam-cuda на каждое изменение манифеста
-# проверяет cuda.yml.
+# Одна задача на платформу: release-бинарники собираются один раз, из них упаковываются оба
+# flavor (cpu и gpu) и прогоняются оба smoke. Отдельные задачи на flavor вдвое удлиняли бы
+# сборку (самая долгая часть), а передача бинарников артефактом добавила бы задачу и
+# загрузку/выгрузку ради одного exe; место на диске раннера это не экономит, потому что
+# распакованные smoke-каталоги удаляются сразу после проверки.
+#
+# С extras (релиз и пробный прогон release-dry-run) gpu-упаковка собирает ещё zam-cuda своей
+# платформы (библиотеки NVIDIA по deploy/cuda.toml, ~1,9 ГБ архивов на Windows и ~2,2 ГБ на
+# Linux) и проверяет его (smoke-cuda и smoke GPU-комплекта с распакованным zam-cuda), а
+# отдельная задача models собирает архивы zam-models (~2,9 ГБ с Hugging Face; от платформы
+# не зависят, бинарники не нужны). Без extras (каждый push) этого не делается: трафик и
+# время; zam-cuda на каждое изменение манифеста и кода проверяет cuda.yml.
 name: Package
 
 on:
@@ -18,11 +24,11 @@ on:
         type: string
         required: true
       upload:
-        description: "Загрузить архивы как артефакты dist-<платформа>-<flavor> (для publish)"
+        description: "Загрузить архивы как артефакты dist-* (для проверки состава и publish)"
         type: boolean
         default: false
       extras:
-        description: "Собрать zam-cuda (gpu) и zam-models (linux-x64 cpu)"
+        description: "Собрать zam-cuda (обе платформы) и zam-models"
         type: boolean
         default: false
 
@@ -31,14 +37,12 @@ env:
 
 jobs:
   package:
-    name: package (${{ matrix.platform }}, ${{ matrix.flavor }})
+    name: package (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        platform: [windows-x64, linux-x64]
-        flavor: [cpu, gpu]
         include:
           - platform: windows-x64
             os: windows-latest
@@ -54,10 +58,16 @@ jobs:
     env:
       # ring (rustls в ureq) под musl собирается C-компилятором musl-gcc.
       CC_x86_64_unknown_linux_musl: musl-gcc
-      # архивы для машин без интернета (только релиз)
-      WITH_CUDA: ${{ inputs.extras && matrix.flavor == 'gpu' }}
-      WITH_MODELS: ${{ inputs.extras && matrix.flavor == 'cpu' && matrix.platform == 'linux-x64' }}
+      EXTRAS: ${{ inputs.extras }}
     steps:
+      # zam-cuda на Linux: ~2,2 ГБ архивов NVIDIA, ~1,8 ГБ библиотек, ~1,2 ГБ архива и ~1,8 ГБ
+      # распаковки в smoke поверх сборки — освобождаем место от ненужных предустановок.
+      - name: место на диске (linux, extras)
+        if: matrix.platform == 'linux-x64' && inputs.extras
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
@@ -84,22 +94,19 @@ jobs:
         with:
           tool: cargo-about@0.9.2
       # Архивы зависимостей и тестовая модель smoke; ключ — хэш манифестов deploy/*.toml.
-      # Модели zam-models и библиотеки NVIDIA не кэшируются: ~3 и ~2 ГБ вытеснили бы кэш.
+      # Библиотеки NVIDIA не кэшируются: ~2 ГБ вытеснили бы кэш.
       - name: кэш зависимостей поставки и тестовой модели
         uses: actions/cache@v4
         with:
           path: |
             target/deps-cache
             target/models/minilm-l6-int8
-          key: deps-${{ matrix.platform }}-${{ matrix.flavor }}-${{ hashFiles('deploy/*.toml') }}
-      # только ONNX Runtime своей сборки (cpu или gpu)
+          key: deps-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
+      # обе сборки ONNX Runtime: упаковываются оба flavor
       - name: fetch-deps
-        run: cargo xtask fetch-deps --platform ${{ matrix.platform }} --flavor ${{ matrix.flavor }}
+        run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
       - name: fetch-models (тестовая модель для smoke)
         run: cargo xtask fetch-models --test
-      - name: fetch-models (комплект zam-models)
-        if: env.WITH_MODELS == 'true'
-        run: cargo xtask fetch-models
       # ZAM_GIT_SHA — только на шагах сборки: это сборочная переменная build.rs.
       - name: build (windows)
         if: matrix.platform == 'windows-x64'
@@ -113,42 +120,96 @@ jobs:
         run: |
           cargo build --release -p zam-server
           cargo build --release -p zam-cli --target x86_64-unknown-linux-musl
-      - name: package
+      - name: package (cpu)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: cargo xtask package --platform ${{ matrix.platform }} --flavor cpu --version "${VERSION#v}" ${{ matrix.cli_bin_arg }}
+      - name: smoke (cpu)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          name="zam-server-${VERSION#v}-${{ matrix.platform }}-cpu"
+          cargo xtask smoke --expect-device cpu --archive "target/dist/${name}.${{ matrix.ext }}"
+          rm -rf "target/smoke/${name}"
+      - name: package (gpu)
         env:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           extra=()
-          if [ "${WITH_CUDA}" = "true" ]; then extra+=(--cuda); fi
-          if [ "${WITH_MODELS}" = "true" ]; then extra+=(--with-models); fi
-          cargo xtask package --platform ${{ matrix.platform }} --flavor ${{ matrix.flavor }} \
+          if [ "${EXTRAS}" = "true" ]; then extra+=(--cuda); fi
+          cargo xtask package --platform ${{ matrix.platform }} --flavor gpu \
             --version "${VERSION#v}" ${{ matrix.cli_bin_arg }} "${extra[@]}"
       - name: smoke-cuda
-        if: env.WITH_CUDA == 'true'
+        if: inputs.extras
         env:
           VERSION: ${{ inputs.version }}
-        run: cargo xtask smoke-cuda --archive "target/dist/zam-cuda-${VERSION#v}-${{ matrix.platform }}.${{ matrix.ext }}"
-      # GPU на раннерах нет: и GPU-комплект должен работать на CPU (device=cpu с причиной).
-      # С zam-cuda он распаковывается в комплект, cuda fetch не должен ничего скачать.
-      - name: smoke
+        run: |
+          set -euo pipefail
+          name="zam-cuda-${VERSION#v}-${{ matrix.platform }}"
+          cargo xtask smoke-cuda --archive "target/dist/${name}.${{ matrix.ext }}"
+          rm -rf "target/smoke/${name}"
+          # библиотеки уже в архиве: распакованная копия больше не нужна
+          rm -rf "target/deps/${{ matrix.platform }}/onnxruntime-gpu/cuda"
+      # GPU на раннерах нет: GPU-комплект обязан работать на CPU (device=cpu с причиной).
+      # С extras в комплект распаковывается zam-cuda, cuda fetch не должен ничего скачать.
+      - name: smoke (gpu)
         env:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           v="${VERSION#v}"
+          name="zam-server-${v}-${{ matrix.platform }}-gpu"
           extra=()
-          if [ "${WITH_CUDA}" = "true" ]; then
+          if [ "${EXTRAS}" = "true" ]; then
             extra+=(--cuda-archive "target/dist/zam-cuda-${v}-${{ matrix.platform }}.${{ matrix.ext }}")
           fi
-          cargo xtask smoke --expect-device cpu \
-            --archive "target/dist/zam-server-${v}-${{ matrix.platform }}-${{ matrix.flavor }}.${{ matrix.ext }}" \
-            "${extra[@]}"
-      - name: артефакты
+          cargo xtask smoke --expect-device cpu --archive "target/dist/${name}.${{ matrix.ext }}" "${extra[@]}"
+          rm -rf "target/smoke/${name}"
+      # Архивы уже сжаты: повторное сжатие артефакта только тратит время.
+      - name: артефакты (комплекты)
         if: inputs.upload
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.platform }}-${{ matrix.flavor }}
+          name: dist-${{ matrix.platform }}
           path: |
-            target/dist/zam-*.zip
-            target/dist/zam-*.tar.gz
+            target/dist/zam-server-*.${{ matrix.ext }}
+            target/dist/zam-[0-9]*.${{ matrix.ext }}
+          compression-level: 0
+          if-no-files-found: error
+      - name: артефакты (zam-cuda)
+        if: inputs.upload && inputs.extras
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-cuda-${{ matrix.platform }}
+          path: target/dist/zam-cuda-*.${{ matrix.ext }}
+          compression-level: 0
+          if-no-files-found: error
+
+  # zam-models: от платформы не зависит, release-бинарники не нужны (только xtask).
+  models:
+    name: models
+    if: inputs.extras
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - name: fetch-models (комплект zam-models)
+        run: cargo xtask fetch-models
+      - name: package --with-models
+        env:
+          VERSION: ${{ inputs.version }}
+        run: cargo xtask package --platform linux-x64 --version "${VERSION#v}" --with-models --no-kit
+      - name: артефакты (zam-models)
+        if: inputs.upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-models
+          path: target/dist/zam-models-*.zip
+          compression-level: 0
           if-no-files-found: error

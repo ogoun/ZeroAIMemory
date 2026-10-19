@@ -99,6 +99,20 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.unicode-normalization-alignments]
 opt-level = 3
+# сжатие и распаковка архивов поставки (cargo xtask package|smoke, fetch в тестах): deflate
+# и xz без оптимизаций в debug медленнее на порядок — zam-models (2,9 ГБ) паковался 13 мин
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.zip]
+opt-level = 3
+[profile.dev.package.lzma-rust2]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

@@ -99,6 +99,9 @@ enum CudaCmd {
         /// Манифест вместо встроенного при сборке (формат deploy/cuda.toml)
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// Итог в JSON в stdout (`dir`, `files`, `downloaded`, `installed`), прогресс — в stderr
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -113,7 +116,13 @@ enum QdrantCmd {
         manifest: Option<PathBuf>,
     },
     /// Показать состояние: режим, версия, порты, pid, хранилище (ничего не запускает)
-    Status(Opts),
+    Status {
+        #[command(flatten)]
+        opts: Opts,
+        /// Вывод в JSON (для скриптов)
+        #[arg(long)]
+        json: bool,
+    },
     /// Стереть хранилище Qdrant (сервер остановлен); при старте — пересборка индекса
     Reset {
         #[command(flatten)]
@@ -238,14 +247,29 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<()> {
 
 async fn cuda_cmd(cmd: CudaCmd) -> anyhow::Result<()> {
     match cmd {
-        CudaCmd::Fetch { opts, manifest } => {
+        CudaCmd::Fetch {
+            opts,
+            manifest,
+            json,
+        } => {
             let cfg = load(opts)?;
             let m = zam_server::cuda::load_manifest(manifest.as_deref())?;
             let report = tokio::task::spawn_blocking(move || {
-                zam_server::cuda::fetch(&cfg, &m, &mut |l| println!("{l}"))
+                // с --json прогресс идёт в stderr: в stdout — только итог
+                zam_server::cuda::fetch(&cfg, &m, &mut |l| {
+                    if json {
+                        eprintln!("{l}")
+                    } else {
+                        println!("{l}")
+                    }
+                })
             })
             .await??;
-            println!("{report}");
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("{}", report.message());
+            }
             Ok(())
         }
     }
@@ -264,8 +288,13 @@ async fn qdrant_cmd(cmd: QdrantCmd) -> anyhow::Result<()> {
             println!("{report}");
             Ok(())
         }
-        QdrantCmd::Status(opts) => {
-            println!("{}", qdrant::status(&load(opts)?, &exe_dir).await?);
+        QdrantCmd::Status { opts, json } => {
+            let cfg = load(opts)?;
+            if json {
+                println!("{}", qdrant::status_json(&cfg, &exe_dir).await?);
+            } else {
+                println!("{}", qdrant::status(&cfg, &exe_dir).await?);
+            }
             Ok(())
         }
         QdrantCmd::Reset { opts, yes } => {

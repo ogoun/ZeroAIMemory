@@ -178,7 +178,7 @@ WebUI открывается по адресу сервера (`http://<хост
 Команды (с теми же `--config`/`--data-dir`, что и `serve`):
 
 ```
-zam-server qdrant status --config config.toml     # режим, версия, порты, pid, хранилище
+zam-server qdrant status --config config.toml     # режим, версия, порты, pid, хранилище (--json — для скриптов)
 zam-server qdrant fetch                           # скачать бинарник (SHA-256), если его нет
 zam-server qdrant reset --yes --config config.toml   # стереть хранилище (сервер остановлен)
 ```
@@ -306,7 +306,7 @@ sudo tar -xzf zam-cuda-<версия>-linux-x64.tar.gz -C /opt/zeroaimemory
 В `cuda/` лежат библиотеки, штампы `.<компонент>.sha256`, `cuda.toml` и `LICENSES/` (CUDA
 Toolkit EULA, лицензия cuDNN). По штампам `zam-server cuda fetch` видит библиотеки
 установленными и ничего не скачивает — это и проверка распаковки: команда должна сообщить
-«загружено архивов 0». Нужен драйвер NVIDIA с поддержкой CUDA 13 (ветка R580 и
+«загружено архивов 0» (с `--json` — `"downloaded": 0`). Нужен драйвер NVIDIA с поддержкой CUDA 13 (ветка R580 и
 новее); устанавливать CUDA Toolkit не нужно. Лицензия библиотек NVIDIA —
 https://docs.nvidia.com/cuda/eula/index.html.
 

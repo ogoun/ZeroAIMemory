@@ -172,8 +172,9 @@ fn storage_path(qdir: &Path, name: &str) -> std::io::Result<String> {
 }
 
 /// Абсолютный путь Windows в форме `\\?\…` (UNC `\\сервер\ресурс` — `\\?\UNC\сервер\ресурс`).
+/// Пути, уже минующие разбор Win32 (`\\?\…`, путь устройства `\\.\…`), не меняются.
 fn verbatim(p: &str) -> String {
-    if p.starts_with(r"\\?\") {
+    if p.starts_with(r"\\?\") || p.starts_with(r"\\.\") {
         p.to_string()
     } else if let Some(rest) = p.strip_prefix(r"\\") {
         format!(r"\\?\UNC\{rest}")
@@ -255,11 +256,35 @@ mod tests {
         }
     }
 
+    /// Относительный каталог данных (`data_dir = "./data"` по умолчанию): на Windows путь
+    /// хранилища становится абсолютным от текущего каталога, с `\\?\`; на Linux остаётся `./…`.
+    #[test]
+    fn relative_qdir_becomes_absolute_on_windows() {
+        let qdir = Path::new(".").join("rel-data").join("qdrant");
+        let p = storage_path(&qdir, "storage").unwrap();
+        if cfg!(windows) {
+            let cwd = std::env::current_dir().unwrap();
+            let want = format!(
+                "'\\\\?\\{}'",
+                cwd.join("rel-data")
+                    .join("qdrant")
+                    .join("storage")
+                    .display()
+            );
+            assert_eq!(p, want);
+            assert!(!p.contains(r"\.\"), "{p}");
+        } else {
+            assert_eq!(p, "./storage");
+        }
+    }
+
     #[test]
     fn verbatim_paths_and_yaml_quoting() {
         assert_eq!(verbatim(r"C:\d\qdrant\storage"), r"\\?\C:\d\qdrant\storage");
         assert_eq!(verbatim(r"\\?\C:\d"), r"\\?\C:\d");
         assert_eq!(verbatim(r"\\srv\share\d"), r"\\?\UNC\srv\share\d");
+        assert_eq!(verbatim(r"\\.\C:\d"), r"\\.\C:\d");
+        assert_eq!(verbatim(r"\\.\pipe\x"), r"\\.\pipe\x");
         assert_eq!(yaml_quote(r"\\?\C:\O'Brien"), r"'\\?\C:\O''Brien'");
     }
 

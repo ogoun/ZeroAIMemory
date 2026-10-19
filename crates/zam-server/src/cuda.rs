@@ -43,13 +43,42 @@ pub fn cuda_dir(cfg: &ServerConfig) -> anyhow::Result<(PathBuf, PathBuf)> {
     Ok((ort, dir))
 }
 
+/// Итог `cuda fetch` (`--json` печатает его как есть).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FetchReport {
+    /// Каталог библиотек (`<каталог ORT>/cuda/`).
+    pub dir: PathBuf,
+    /// Файлов библиотек платформы по манифесту.
+    pub files: usize,
+    /// Архивов NVIDIA скачано (размер и SHA-256 сверены).
+    pub downloaded: usize,
+    /// Архивов уже установлено (штамп совпал с манифестом) — без загрузки.
+    pub installed: usize,
+}
+
+impl FetchReport {
+    /// Текст для человека.
+    pub fn message(&self) -> String {
+        format!(
+            "библиотеки NVIDIA: {} файлов в {}; загружено архивов {} (размер и SHA-256 \
+             сверены), уже установлено {} (штамп совпал).\nНужен драйвер NVIDIA с поддержкой \
+             CUDA 13 (ветка R580 и новее). Лицензия библиотек NVIDIA: {NVIDIA_EULA}\nПерезапустите \
+             zam-server: устройство и причина выбора — в журнале и /index/status.",
+            self.files,
+            self.dir.display(),
+            self.downloaded,
+            self.installed
+        )
+    }
+}
+
 /// `cuda fetch`: ставит библиотеки платформы в `<каталог ORT>/cuda/`. Без CUDA EP рядом с
 /// ORT (CPU-комплект) — ошибка: CUDA ему не нужна. `log` — строки прогресса.
 pub fn fetch(
     cfg: &ServerConfig,
     m: &CudaManifest,
     log: &mut dyn FnMut(&str),
-) -> anyhow::Result<String> {
+) -> anyhow::Result<FetchReport> {
     let (ort, dir) = cuda_dir(cfg)?;
     if !gpu_kit(&ort) {
         bail!(
@@ -84,16 +113,12 @@ pub fn fetch(
         }
     })?;
     let fresh = done.iter().filter(|(_, cached)| !*cached).count();
-    let names = m.dest_names(platform)?;
-    Ok(format!(
-        "библиотеки NVIDIA: {} файлов в {}; загружено архивов {fresh} (размер и SHA-256 \
-         сверены), уже установлено {} (штамп совпал).\nНужен драйвер NVIDIA с поддержкой \
-         CUDA 13 (ветка R580 и новее). Лицензия библиотек NVIDIA: {NVIDIA_EULA}\nПерезапустите \
-         zam-server: устройство и причина выбора — в журнале и /index/status.",
-        names.len(),
-        dir.display(),
-        done.len() - fresh
-    ))
+    Ok(FetchReport {
+        files: m.dest_names(platform)?.len(),
+        dir,
+        downloaded: fresh,
+        installed: done.len() - fresh,
+    })
 }
 
 #[cfg(test)]

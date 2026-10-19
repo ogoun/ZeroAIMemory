@@ -175,6 +175,49 @@ pub async fn status(cfg: &ServerConfig, exe_dir: &Path) -> anyhow::Result<String
     Ok(out.join("\n"))
 }
 
+/// `qdrant status --json`: то же машиночитаемо (для скриптов и smoke). Поля managed:
+/// `mode`, `binary`, `binary_present`, `pinned_version`, `http_port`, `grpc_port`, `dir`,
+/// `locked`, `pid`, `pid_alive`, `storage_present`, `stamp_version`, `reindex_pending`,
+/// `running_version`, `ready`; external — `mode`, `grpc_url`, `healthy`, `error`; edge — `mode`.
+pub async fn status_json(cfg: &ServerConfig, exe_dir: &Path) -> anyhow::Result<serde_json::Value> {
+    use serde_json::json;
+    Ok(match cfg.qdrant.supervisor_config(exe_dir)? {
+        None => json!({ "mode": "edge" }),
+        Some(SupervisorConfig::External(x)) => {
+            let health = match QdrantIndex::connect(&x.grpc_url, x.api_key.as_deref()) {
+                Ok(c) => c.health().await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            json!({
+                "mode": "external",
+                "grpc_url": x.grpc_url,
+                "healthy": health.is_ok(),
+                "error": health.err(),
+            })
+        }
+        Some(SupervisorConfig::Managed(m)) => {
+            let st = inspect(&cfg.data_dir, m.http_port).await;
+            json!({
+                "mode": "managed",
+                "binary": m.binary,
+                "binary_present": m.binary.is_file(),
+                "pinned_version": QDRANT_VERSION,
+                "http_port": m.http_port,
+                "grpc_port": m.grpc_port,
+                "dir": st.qdir,
+                "locked": st.locked,
+                "pid": st.pid,
+                "pid_alive": st.pid_alive,
+                "storage_present": st.storage_present,
+                "stamp_version": st.stamp_version,
+                "reindex_pending": st.reindex_pending,
+                "running_version": st.running_version,
+                "ready": st.ready,
+            })
+        }
+    })
+}
+
 /// `qdrant reset --yes`: стирает хранилище управляемого Qdrant (сервер должен быть
 /// остановлен); при следующем старте индекс пересобирается из `embeddings`.
 /// Осиротевший процесс (сервер убит) завершается перед стиранием.

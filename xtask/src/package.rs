@@ -42,7 +42,9 @@ pub fn check_release_size(path: &Path, limit: u64) -> Result<()> {
         .len();
     if len >= limit {
         bail!(
-            "{}: {len} байт ({:.2} ГиБ) — не меньше предела {:.2} ГиБ на файл релиза GitHub;              разбейте содержимое на несколько архивов (zam-models — по одной модели на архив)              или уменьшите состав",
+            "{}: {len} байт ({:.2} ГиБ) — не меньше предела {:.2} ГиБ на файл релиза GitHub; \
+             разбейте содержимое на несколько архивов (zam-models — по одной модели на \
+             архив) или уменьшите состав",
             path.display(),
             len as f64 / (1u64 << 30) as f64,
             limit as f64 / (1u64 << 30) as f64
@@ -279,14 +281,7 @@ fn check_sources(entries: &[Entry]) -> Result<()> {
         .map(|e| format!("{} ({})", e.path, e.src.display()))
         .collect();
     if !missing.is_empty() {
-        bail!(
-            "не найдены исходные файлы:
-  {}",
-            missing.join(
-                "
-  "
-            )
-        );
+        bail!("не найдены исходные файлы:\n  {}", missing.join("\n  "));
     }
     Ok(())
 }
@@ -426,7 +421,7 @@ fn version_key(name: &str) -> Vec<u64> {
     name.split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
-/// Каталог `<vs>\VC\Redist\MSVC\<версия>d\Microsoft.VC*.CRT` с наибольшей версией, в
+/// Каталог `<vs>\VC\Redist\MSVC\<версия>\x64\Microsoft.VC*.CRT` с наибольшей версией, в
 /// котором есть все файлы `need`.
 fn crt_dir_in(vs_root: &Path, need: &[&str]) -> Result<PathBuf> {
     let msvc = vs_root.join("VC").join("Redist").join("MSVC");

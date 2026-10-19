@@ -104,6 +104,14 @@ async fn status_and_reset_on_stopped_install() {
     ] {
         assert!(s.contains(needle), "нет `{needle}` в\n{s}");
     }
+    let j = qdrant::status_json(&cfg, &d.join("inst")).await.unwrap();
+    assert_eq!(j["mode"], "managed");
+    assert_eq!(j["binary_present"], false);
+    assert_eq!(j["locked"], false);
+    assert!(j["pid"].is_null());
+    assert_eq!(j["pid_alive"], false);
+    assert_eq!(j["pinned_version"], QDRANT_VERSION);
+    assert!(j["running_version"].is_null());
 
     let e = qdrant::reset(&cfg, &d.join("inst"), false)
         .unwrap_err()

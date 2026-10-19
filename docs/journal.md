@@ -99,3 +99,17 @@
   - чтение узла по id: p50 0.41–0.44 мс, p95 0.56–0.82 мс (цель ≤ 5) — выполнено;
   - FTS-поиск: p50 4.2–4.6 мс, p95 8.5–8.9 мс (цель ≤ 20) — выполнено;
   - запись до FTS: p50 1.3–1.5 мс, p95 2.6–2.9 мс в пяти прогонах и 6.0 мс в одном (цель ≤ 30; было 33–66) — выполнено; max 28–70 мс, в двух прогонах из шести одна запись ждала 0.47 с (ввод-вывод HDD во время фонового checkpoint).
+
+## 2026-10-19 — Этап M2, задача 11: комплекты CPU и GPU, zam-models, zam-cuda
+- `cargo xtask package --flavor cpu|gpu [--with-models] [--cuda] [--no-kit]`. GPU-комплект содержит ORT с CUDA EP и не содержит библиотек NVIDIA. `zam-models` собирается по архиву на модель: вместе модели больше 2 ГиБ. `zam-cuda` — это каталог `cuda/` со штампами: после распаковки `cuda fetch` ничего не скачивает. Каждый архив и каждый файл релиза проверяются на предел 2 ГиБ. Отчёт: `.superpowers/sdd/2026-10-19-m2-index-ml/task-11-report.md`.
+- Найдено при упаковке:
+  - на Windows `onnxruntime.dll` (с M1) и CUDA EP импортируют MSVC runtime, поэтому на чистой системе ORT не загружался и сервер молча работал в режиме FTS-only. Решение: app-local `msvcp140*` и `vcruntime140*` в комплекте, smoke проверяет импорты через dumpbin;
+  - на Windows управляемый Qdrant падал из-за MAX_PATH, если каталог данных длиннее ~80 символов (файлы gridstore payload-индекса). Решение: пути хранилища в `zam.yaml` теперь `\\?\`-абсолютные.
+- Smoke обоих flavor: 5 заметок, перефраз без общих подстрок находит цель в top-3 только векторным каналом, устройство и завершение Qdrant проверяются по `--json`. Ручной прогон на RTX 3090: GPU-комплект + `zam-cuda` (CUDA Toolkit убран из PATH) → device=cuda:0; без `zam-cuda` — device=cpu с причиной.
+- Fix round 1 по ревью:
+  - пробный прогон релиза без публикации: ветка `release-dry-run` и `workflow_dispatch`; задача `dist` проверяет состав, 2 ГиБ и SHA256SUMS, `publish` выполняется только на теге;
+  - `package.yml`: одна задача на платформу (сборка один раз, оба flavor), отдельная задача `models`, артефакты с `compression-level: 0`;
+  - `qdrant status --json`, `cuda fetch --json`;
+  - `opt-level = 3` для пакетов сжатия в dev: упаковка zam-models на HDD ускорилась с 13 мин до 71 с при том же размере.
+- Прогоны (Windows 11): `fmt --check`, `clippy -D warnings`, actionlint — чисто; тесты xtask, zam-index, zam-server, zam-fetch — 305 passed, 0 failed; smoke cpu и gpu+cuda — `SMOKE OK`.
+- Не проверено локально: Linux-комплекты и путь extras — ждут пробного прогона `release-dry-run`; Linux GPU с драйвером — ручной прогон.
