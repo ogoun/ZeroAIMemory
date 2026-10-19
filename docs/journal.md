@@ -113,3 +113,12 @@
   - `opt-level = 3` для пакетов сжатия в dev: упаковка zam-models на HDD ускорилась с 13 мин до 71 с при том же размере.
 - Прогоны (Windows 11): `fmt --check`, `clippy -D warnings`, actionlint — чисто; тесты xtask, zam-index, zam-server, zam-fetch — 305 passed, 0 failed; smoke cpu и gpu+cuda — `SMOKE OK`.
 - Не проверено локально: Linux-комплекты и путь extras — ждут пробного прогона `release-dry-run`; Linux GPU с драйвером — ручной прогон.
+
+## 2026-10-19 — Этап M2, задача 12: e2e жизненного цикла Qdrant
+- `crates/zam-server/tests/qdrant_lifecycle.rs` (отчёт: `.superpowers/sdd/2026-10-19-m2-index-ml/task-12-report.md`):
+  - процесс Qdrant убит посреди индексации. Убийство приходится на пачку в работе (`batch_running`), поэтому запись получает `Unavailable`. Задания возвращаются в очередь, супервизор перезапускает Qdrant (`restarts` = 1). Очередь догоняет: 0 неудавшихся заданий, точки всех заметок на месте, поиск без деградации. Human из той же очереди в Qdrant не попадает: точный подсчёт REST API по payload `space_kind=human` = 0;
+  - настоящий процесс `zam-server` с каталогом данных длиной в предел Windows (190 символов, пути хранилища Qdrant до 352 символов). Индексация и векторный поиск работают. После жёсткого убийства сервера Qdrant из `qdrant.pid` исчезает за ≤ 5 с. Повторный старт: новый pid, точки те же, поиск векторный. На Linux дополнительно проверяется штатный SIGTERM;
+  - остальные сценарии §18.1 уже покрыты в `index_worker.rs`, `index_api.rs` и `zam-index/tests/supervisor.rs`, здесь они не дублируются.
+- Найдено: на Windows каталог данных длиннее ~210 символов ломал SQLite ошибкой «unable to open database file». Теперь `DataDir::open` проверяет длину (предел 190) и выдаёт понятную ошибку с подсказкой; предел описан в `deploy/README-install.md`.
+- CI: задача `check` по последним прогонам занимает 3–10 мин (шаг test — 2–5 мин). Новые тесты добавляют около 40 с, поэтому отдельная задача `lifecycle` не нужна.
+- Не проверено локально: Linux (PDEATHSIG, SIGTERM) — проверка в CI после push.

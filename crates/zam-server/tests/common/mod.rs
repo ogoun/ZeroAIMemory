@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub mod api;
 pub mod ml;
+pub mod process;
 pub mod qdrant;
 
 use zam_server::config::ServerConfig;
