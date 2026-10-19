@@ -99,6 +99,10 @@ enum Cmd {
         /// Число результатов (1–100)
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
         top_k: Option<u32>,
+        /// Серверный реранк первых кандидатов (медленнее, точнее порядок; нужна модель
+        /// реранкера: zam-server models fetch --reranker)
+        #[arg(long)]
+        rerank: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -194,12 +198,14 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             all,
             mode,
             top_k,
+            rerank,
             common,
         } => {
             let o = cmd::search::Opts {
                 all,
                 mode: &mode,
                 top_k,
+                rerank,
             };
             cmd::search::run(&cmd::connect(&common)?, &query, &o)
         }

@@ -381,6 +381,39 @@ fn solution_toml_scopes_write_and_search() {
     // --all — все решения
     let s = ok(&e.run(&["search", "квазар", "--all"]));
     assert!(s.contains("TradingPlatform/x"), "{s}");
+    // деградация — и человеческой строкой в stderr (stdout — ответ сервера как есть)
+    let o = e.run(&["search", "квазар", "--all"]);
+    assert!(
+        err(&o).contains("векторный поиск недоступен: модели не загружены"),
+        "{}",
+        err(&o)
+    );
+
+    // --rerank: серверу уходит rerank=on; без модели реранкера — предупреждение
+    // сервера в конце md и по-русски в stderr, выдача та же, код 0
+    let o = e.run(&["search", "квазар", "--all", "--rerank"]);
+    let s = ok(&o);
+    assert!(s.contains("TradingPlatform/x"), "{s}");
+    assert!(s.contains("> warning: reranker"), "{s}");
+    assert!(err(&o).contains("предупреждение: реранкер"), "{}", err(&o));
+    // в JSON — поле warnings и та же строка в stderr
+    let o = e.run(&["search", "квазар", "--all", "--rerank", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&ok(&o)).unwrap();
+    assert_eq!(v["degraded"], true);
+    assert!(
+        v["warnings"][0].as_str().unwrap().starts_with("reranker"),
+        "{v}"
+    );
+    assert!(err(&o).contains("предупреждение: реранкер"), "{}", err(&o));
+    assert!(
+        err(&o).contains("векторный поиск недоступен"),
+        "{}",
+        err(&o)
+    );
+    // без --rerank предупреждения нет
+    let o = e.run(&["search", "квазар", "--all", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&ok(&o)).unwrap();
+    assert_eq!(v["warnings"], serde_json::json!([]));
 
     // атрибуция машины: X-Zam-Machine из COMPUTERNAME/HOSTNAME
     let o = e
