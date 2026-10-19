@@ -22,6 +22,10 @@ CREATE TABLE index_jobs (
     state       TEXT NOT NULL DEFAULT 'queued'
                 CHECK (state IN ('queued', 'running', 'done', 'failed')),
     attempts    INTEGER NOT NULL DEFAULT 0,
+    -- узел переписан во время обработки (`running`): после завершения — снова в очередь
+    dirty       INTEGER NOT NULL DEFAULT 0,
+    -- номер выдачи: завершение принимается только от текущей
+    claim_gen   INTEGER NOT NULL DEFAULT 0,
     last_error  TEXT,
     priority    INTEGER NOT NULL DEFAULT 0,
     not_before  TEXT NOT NULL,

@@ -20,8 +20,9 @@ pub use datadir::DataDir;
 pub use db::{Db, DbOptions};
 pub use embeddings::{Embedding, get_embeddings, put_embeddings};
 pub use jobs::{
-    IndexChunk, IndexState, Job, JobOp, JobStats, NodePayload, chunks_for_index, claim_jobs,
-    complete_job, enqueue_reindex, fail_job, job_stats, requeue_running, set_index_state,
+    IndexChunk, IndexState, Job, JobOp, JobOutcome, JobStats, NodePayload, chunks_for_index,
+    claim_jobs, complete_job, enqueue_reindex, fail_job, job_stats, requeue_running,
+    set_index_state,
 };
 pub use migrate::Migration;
 pub use nodes::{

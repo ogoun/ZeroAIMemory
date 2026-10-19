@@ -2,10 +2,16 @@
 //!
 //! Задания ставятся записью узла в той же транзакции (см. `nodes`): на узел —
 //! не больше одного активного (`queued` | `running`) задания, новая запись
-//! заменяет активное. Если заменяемое уже `running`, оно возвращается в `queued`
-//! с новой ревизией и сброшенными попытками, а [`complete_job`] и [`fail_job`]
-//! действуют только на `running`: завершение устаревшей обработки задание
-//! не закрывает, и узел будет обработан заново.
+//! заменяет активное. Обработка узла сериализована:
+//! - заменяемое `queued` получает новые `rev`/`op` на месте;
+//! - заменяемое `running` остаётся `running` (второй раз воркеру не выдаётся),
+//!   получает новые `rev`/`op` и `dirty = 1`;
+//! - каждая выдача ([`claim_jobs`]) увеличивает `claim_gen`; [`complete_job`] и
+//!   [`fail_job`] принимаются только от текущей выдачи (`running` и тот же
+//!   `claim_gen`), иначе — [`JobOutcome::Stale`];
+//! - завершение «грязного» задания возвращает его в `queued` (`attempts = 0`,
+//!   `not_before = now`): новая ревизия обрабатывается следующей выдачей;
+//! - чистое завершение удаляет строку: выполненные задания не копятся.
 //!
 //! Backoff: после `n`-й неудачи `not_before = now + min(2^n с, 1 ч)`;
 //! после [`MAX_ATTEMPTS`]-й — `failed` (узел — `index_state = 'failed'`).
@@ -78,6 +84,26 @@ pub struct Job {
     pub op: JobOp,
     /// Неудачных попыток до этой выдачи.
     pub attempts: i64,
+    /// Номер выдачи: передаётся в [`complete_job`] и [`fail_job`].
+    pub claim_gen: i64,
+}
+
+/// Чем закончилось [`complete_job`] или [`fail_job`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobOutcome {
+    /// Задание выполнено, строка удалена.
+    Done,
+    /// Во время обработки узел переписан: задание снова в очереди с новой
+    /// ревизией и сброшенными попытками; результат воркера для узла не окончательный
+    /// (`set_index_state(Indexed)` не вызывать).
+    Requeued,
+    /// Неудача: повтор после backoff.
+    Retry,
+    /// Неудача [`MAX_ATTEMPTS`]-я: задание `failed`.
+    Failed,
+    /// Выдача устарела (задание перевыдано, сброшено при старте или его нет):
+    /// ничего не изменено.
+    Stale,
 }
 
 /// Состояние очереди для `/index/status`.
@@ -143,7 +169,8 @@ pub struct IndexChunk {
     pub node: NodePayload,
 }
 
-/// Ставит задание `op` для узла, заменяя его активное задание (если есть).
+/// Ставит задание `op` для узла, заменяя его активное задание (если есть):
+/// `queued` — на месте, `running` — на месте с `dirty = 1` (см. документацию модуля).
 /// Вызывается внутри транзакции писателя.
 pub(crate) fn enqueue(
     c: &Connection,
@@ -153,27 +180,39 @@ pub(crate) fn enqueue(
     priority: i64,
     now: &str,
 ) -> Result<(), StoreError> {
-    let replaced = c
+    let queued = c
         .prepare_cached(
             "UPDATE index_jobs
-             SET rev = ?2, op = ?3, state = 'queued', attempts = 0, last_error = NULL,
+             SET rev = ?2, op = ?3, attempts = 0, last_error = NULL,
                  priority = max(priority, ?4), not_before = ?5, updated_at = ?5
-             WHERE target_kind = 'node' AND target_id = ?1 AND state IN ('queued', 'running')",
+             WHERE target_kind = 'node' AND target_id = ?1 AND state = 'queued'",
         )?
         .execute(params![node, rev, op, priority, now])?;
-    if replaced == 0 {
-        c.prepare_cached(
-            "INSERT INTO index_jobs (target_kind, target_id, rev, op, state, attempts,
-                                     priority, not_before, enqueued_at, updated_at)
-             VALUES ('node', ?1, ?2, ?3, 'queued', 0, ?4, ?5, ?5, ?5)",
-        )?
-        .execute(params![node, rev, op, priority, now])?;
+    if queued > 0 {
+        return Ok(());
     }
+    let running = c
+        .prepare_cached(
+            "UPDATE index_jobs
+             SET rev = ?2, op = ?3, dirty = 1, priority = max(priority, ?4), updated_at = ?5
+             WHERE target_kind = 'node' AND target_id = ?1 AND state = 'running'",
+        )?
+        .execute(params![node, rev, op, priority, now])?;
+    if running > 0 {
+        return Ok(());
+    }
+    c.prepare_cached(
+        "INSERT INTO index_jobs (target_kind, target_id, rev, op, state, attempts,
+                                 priority, not_before, enqueued_at, updated_at)
+         VALUES ('node', ?1, ?2, ?3, 'queued', 0, ?4, ?5, ?5, ?5)",
+    )?
+    .execute(params![node, rev, op, priority, now])?;
     Ok(())
 }
 
 /// Выдаёт до `limit` заданий `queued` с `not_before ≤ now` (приоритет по убыванию,
-/// затем id) и атомарно переводит их в `running`.
+/// затем id) и атомарно переводит их в `running` с новым `claim_gen`. Узел, задание
+/// которого уже `running`, не выдаётся: активное задание у узла одно.
 pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job>, StoreError> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -181,7 +220,7 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     db.write(move |tx| {
         let now = fmt_ts(now);
-        let jobs: Vec<Job> = {
+        let mut jobs: Vec<Job> = {
             let mut st = tx.prepare_cached(
                 "SELECT id, target_id, rev, op, attempts FROM index_jobs
                  WHERE state = 'queued' AND not_before <= ?1
@@ -195,31 +234,63 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
                     rev: r.get(2)?,
                     op: r.get(3)?,
                     attempts: r.get(4)?,
+                    claim_gen: 0,
                 })
             })?
             .collect::<Result<_, _>>()?
         };
         let mut st = tx.prepare_cached(
-            "UPDATE index_jobs SET state = 'running', updated_at = ?2 WHERE id = ?1",
+            "UPDATE index_jobs SET state = 'running', claim_gen = claim_gen + 1, updated_at = ?2
+             WHERE id = ?1
+             RETURNING claim_gen",
         )?;
-        for j in &jobs {
-            st.execute(params![j.id, now])?;
+        for j in &mut jobs {
+            j.claim_gen = st.query_row(params![j.id, now], |r| r.get(0))?;
         }
         Ok(jobs)
     })
     .await
 }
 
-/// Закрывает задание `running` как `done`. Задание, заменённое записью во время
-/// обработки (снова `queued`), и чужие состояния не трогает.
-pub async fn complete_job(db: &Db, id: i64) -> Result<(), StoreError> {
+/// Строка задания текущей выдачи: `(target_id, rev, op, attempts, dirty)`.
+type ClaimedRow = (Id, i64, JobOp, i64, bool);
+
+/// Строка задания текущей выдачи; `None` — выдача устарела.
+fn claimed(c: &Connection, id: i64, claim_gen: i64) -> Result<Option<ClaimedRow>, StoreError> {
+    Ok(c.prepare_cached(
+        "SELECT target_id, rev, op, attempts, dirty FROM index_jobs
+         WHERE id = ?1 AND claim_gen = ?2 AND state = 'running'",
+    )?
+    .query_row(params![id, claim_gen], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .optional()?)
+}
+
+/// «Грязное» задание (узел переписан во время обработки) — снова в очередь сразу.
+fn requeue_dirty(c: &Connection, id: i64, now: &str) -> Result<JobOutcome, StoreError> {
+    c.prepare_cached(
+        "UPDATE index_jobs SET state = 'queued', attempts = 0, dirty = 0, last_error = NULL,
+                               not_before = ?2, updated_at = ?2
+         WHERE id = ?1",
+    )?
+    .execute(params![id, now])?;
+    Ok(JobOutcome::Requeued)
+}
+
+/// Завершает выдачу `claim_gen` задания `id`: чистое задание удаляется
+/// ([`JobOutcome::Done`]), «грязное» возвращается в очередь ([`JobOutcome::Requeued`]),
+/// устаревшая выдача ничего не меняет ([`JobOutcome::Stale`]).
+pub async fn complete_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome, StoreError> {
     db.write(move |tx| {
-        tx.execute(
-            "UPDATE index_jobs SET state = 'done', updated_at = ?2
-             WHERE id = ?1 AND state = 'running'",
-            params![id, fmt_ts(Timestamp::now())],
-        )?;
-        Ok(())
+        let Some((.., dirty)) = claimed(tx, id, claim_gen)? else {
+            return Ok(JobOutcome::Stale);
+        };
+        if dirty {
+            return requeue_dirty(tx, id, &fmt_ts(Timestamp::now()));
+        }
+        tx.execute("DELETE FROM index_jobs WHERE id = ?1", [id])?;
+        Ok(JobOutcome::Done)
     })
     .await
 }
@@ -234,26 +305,30 @@ fn backoff_secs(attempts: i64) -> i64 {
     }
 }
 
-/// Неудача задания `running`: `attempts + 1`, повтор через `min(2^attempts с, 1 ч)`
-/// от `now`; после [`MAX_ATTEMPTS`]-й неудачи — `failed`, а узел (если ревизия
-/// задания актуальна) — `index_state = 'failed'`. `err` не должен содержать текста
-/// заметок; длиннее 1000 символов обрезается.
-pub async fn fail_job(db: &Db, id: i64, err: &str, now: Timestamp) -> Result<(), StoreError> {
+/// Неудача выдачи `claim_gen` задания `id`: `attempts + 1`, повтор через
+/// `min(2^attempts с, 1 ч)` от `now` ([`JobOutcome::Retry`]); после
+/// [`MAX_ATTEMPTS`]-й неудачи — `failed` ([`JobOutcome::Failed`]), а узел (если
+/// ревизия задания актуальна) — `index_state = 'failed'`. «Грязное» задание
+/// возвращается в очередь с `attempts = 0` ([`JobOutcome::Requeued`]): новая
+/// ревизия ещё не пробовалась. Устаревшая выдача — [`JobOutcome::Stale`].
+/// `err` не должен содержать текста заметок; длиннее 1000 символов обрезается.
+pub async fn fail_job(
+    db: &Db,
+    id: i64,
+    claim_gen: i64,
+    err: &str,
+    now: Timestamp,
+) -> Result<JobOutcome, StoreError> {
     let err: String = err.chars().take(LAST_ERROR_MAX_CHARS).collect();
     db.write(move |tx| {
-        let row: Option<(Id, i64, JobOp, i64)> = tx
-            .query_row(
-                "SELECT target_id, rev, op, attempts FROM index_jobs
-                 WHERE id = ?1 AND state = 'running'",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let Some((node, rev, op, attempts)) = row else {
-            return Ok(());
+        let Some((node, rev, op, attempts, dirty)) = claimed(tx, id, claim_gen)? else {
+            return Ok(JobOutcome::Stale);
         };
-        let attempts = attempts + 1;
         let stamp = fmt_ts(now);
+        if dirty {
+            return requeue_dirty(tx, id, &stamp);
+        }
+        let attempts = attempts + 1;
         if attempts >= MAX_ATTEMPTS {
             tx.execute(
                 "UPDATE index_jobs SET state = 'failed', attempts = ?2, last_error = ?3,
@@ -264,26 +339,28 @@ pub async fn fail_job(db: &Db, id: i64, err: &str, now: Timestamp) -> Result<(),
             if op == JobOp::Upsert {
                 set_state(tx, node, rev, IndexState::Failed)?;
             }
-        } else {
-            let next = fmt_ts(now + SignedDuration::from_secs(backoff_secs(attempts)));
-            tx.execute(
-                "UPDATE index_jobs SET state = 'queued', attempts = ?2, last_error = ?3,
-                                       not_before = ?4, updated_at = ?5
-                 WHERE id = ?1",
-                params![id, attempts, err, next, stamp],
-            )?;
+            return Ok(JobOutcome::Failed);
         }
-        Ok(())
+        let next = fmt_ts(now + SignedDuration::from_secs(backoff_secs(attempts)));
+        tx.execute(
+            "UPDATE index_jobs SET state = 'queued', attempts = ?2, last_error = ?3,
+                                   not_before = ?4, updated_at = ?5
+             WHERE id = ?1",
+            params![id, attempts, err, next, stamp],
+        )?;
+        Ok(JobOutcome::Retry)
     })
     .await
 }
 
 /// При старте: задания, оставшиеся `running` после аварийного завершения, — снова
-/// `queued`. Возвращает их число.
+/// `queued` (с `dirty = 0`: следующая выдача и так возьмёт актуальную ревизию).
+/// Возвращает их число.
 pub async fn requeue_running(db: &Db) -> Result<u64, StoreError> {
     db.write(|tx| {
         let n = tx.execute(
-            "UPDATE index_jobs SET state = 'queued', updated_at = ?1 WHERE state = 'running'",
+            "UPDATE index_jobs SET state = 'queued', dirty = 0, updated_at = ?1
+             WHERE state = 'running'",
             [fmt_ts(Timestamp::now())],
         )?;
         Ok(n as u64)

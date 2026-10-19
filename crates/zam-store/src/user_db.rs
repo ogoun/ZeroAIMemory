@@ -8,7 +8,7 @@ use jiff::Timestamp;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use zam_core::Id;
 
 use crate::jobs::PRIORITY_REINDEX;
@@ -96,7 +96,15 @@ const FIXED: [(SpaceKind, &str); 3] = [
 #[derive(Clone, Debug)]
 pub struct UserDbs {
     dir: PathBuf,
-    open: Arc<Mutex<HashMap<Id, Db>>>,
+    open: Arc<Mutex<HashMap<Id, OpenDb>>>,
+}
+
+/// Открытая база и признак завершения разовой перечанковки (R1).
+#[derive(Debug)]
+struct OpenDb {
+    db: Db,
+    /// `true` — перечанковка не нужна или уже завершилась (успешно или с ошибкой).
+    rechunked: watch::Receiver<bool>,
 }
 
 impl UserDbs {
@@ -109,17 +117,55 @@ impl UserDbs {
     }
 
     /// База пользователя: открывается лениво (с миграцией и копией) и кэшируется.
+    ///
+    /// Если база только что обновлена до v4, разовая перечанковка (R1) запускается
+    /// фоновой задачей tokio один раз на открытие: `get` её не ждёт, записи во время
+    /// неё безопасны (пакеты идемпотентны и читают текущую ревизию в своей транзакции).
+    /// Дождаться её — [`UserDbs::wait_rechunk`].
     pub async fn get(&self, user: Id) -> Result<Db, StoreError> {
         // Открытие под замком: два одновременных вызова не создадут два Db на один файл.
         let mut open = self.open.lock().await;
-        if let Some(db) = open.get(&user) {
-            return Ok(db.clone());
+        if let Some(e) = open.get(&user) {
+            return Ok(e.db.clone());
         }
         let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
         ensure_fixed_spaces(&db).await?;
-        rechunk_after_v4(&db).await?;
-        open.insert(user, db.clone());
+        let pending = rechunk_pending(&db).await? && !clear_rechunk_if_empty(&db).await?;
+        let (done, rechunked) = watch::channel(!pending);
+        open.insert(
+            user,
+            OpenDb {
+                db: db.clone(),
+                rechunked,
+            },
+        );
+        drop(open);
+        if pending {
+            let bg = db.clone();
+            tokio::spawn(async move {
+                if let Err(e) = rechunk_after_v4(&bg).await {
+                    // повторится при следующем открытии базы
+                    tracing::warn!(error = %e, "перечанковка после миграции индекса прервана");
+                }
+                let _ = done.send(true);
+            });
+        }
         Ok(db)
+    }
+
+    /// Ждёт завершения разовой перечанковки (R1) базы `user`, если она открыта и
+    /// перечанковка идёт; иначе возвращается сразу.
+    pub async fn wait_rechunk(&self, user: Id) {
+        let rx = self
+            .open
+            .lock()
+            .await
+            .get(&user)
+            .map(|e| e.rechunked.clone());
+        if let Some(mut rx) = rx {
+            // ошибка — отправитель закрыт без `true` (задача прервана): ждать нечего
+            let _ = rx.wait_for(|done| *done).await;
+        }
     }
 }
 
@@ -143,26 +189,43 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
 /// Ключ `meta`: разовая перечанковка после миграции 0004 ещё не выполнена.
 const RECHUNK_V4: &str = "rechunk_v4";
 
+/// Флаг разовой перечанковки после миграции 0004 стоит.
+async fn rechunk_pending(db: &Db) -> Result<bool, StoreError> {
+    db.read(|c| {
+        Ok(c.query_row(
+            "SELECT 1 FROM meta WHERE key = ?1",
+            [RECHUNK_V4],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+    })
+    .await
+}
+
+/// База без живых заметок (новая или пустая) — флаг R1 снимается сразу, без фоновой
+/// задачи. `true` — снят.
+async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
+    db.write(|tx| {
+        let any: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !any {
+            tx.execute("DELETE FROM meta WHERE key = ?1", [RECHUNK_V4])?;
+        }
+        Ok(!any)
+    })
+    .await
+}
+
 /// Ruling R1: чанки M1 построены по секциям (`section`) и без векторов, поэтому при
 /// первом открытии базы v4 все живые заметки перечанковываются текущим счётчиком
 /// и получают `upsert`. Флаг снимается только после успеха: прерванная перечанковка
 /// повторится при следующем открытии (она идемпотентна). На большой базе — долго;
 /// в лог идут только счётчики.
 async fn rechunk_after_v4(db: &Db) -> Result<(), StoreError> {
-    let pending = db
-        .read(|c| {
-            Ok(c.query_row(
-                "SELECT 1 FROM meta WHERE key = ?1",
-                [RECHUNK_V4],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-        })
-        .await?;
-    if !pending {
-        return Ok(());
-    }
     tracing::info!("перечанковка заметок после миграции индекса (v4)");
     let started = std::time::Instant::now();
     let (notes, upserts) = crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX).await?;
