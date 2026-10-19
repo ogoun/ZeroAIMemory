@@ -120,6 +120,31 @@ fn wait_gone(pid: u32, limit: Duration) -> bool {
     !pid_alive(pid)
 }
 
+/// При панике теста штатно останавливает воркер и супервизор, а с ним Qdrant: иначе
+/// процесс Qdrant (и попытки супервизора его перезапустить) жили бы до конца тестового
+/// бинарника. Остановка идёт из отдельного потока через `Handle::block_on`: из `Drop`
+/// внутри runtime блокироваться нельзя, а задачи воркера выполняют потоки runtime теста
+/// (`multi_thread`).
+struct ShutdownOnPanic(zam_server::AppState);
+
+impl Drop for ShutdownOnPanic {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let st = self.0.clone();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let _ = std::thread::spawn(move || {
+            rt.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_secs(30), st.shutdown()).await;
+            });
+        })
+        .join();
+    }
+}
+
 async fn state(a: &Api, node: &str) -> String {
     let db = a.st.users.get(a.st.admin_id).await.unwrap();
     get_node(&db, node.parse().unwrap())
@@ -146,8 +171,9 @@ async fn status(a: &Api) -> Value {
 }
 
 /// Процесс Qdrant убит посреди индексации. Убийство приходится на пачку в работе
-/// (`batch_running`), поэтому запись пачки получает `Unavailable`: задания возвращаются
-/// в очередь, канал выключается. Супервизор перезапускает Qdrant (`restarts` в статусе),
+/// (`batch_running`), поэтому запись пачки получает `Unavailable`: задания пачки
+/// возвращаются в очередь (счётчик воркера `jobs_requeued` — именно этот путь, а не
+/// ошибки свёрток L0, `ensure` или reindex), канал выключается. Супервизор перезапускает Qdrant (`restarts` в статусе),
 /// очередь догоняет без неудавшихся заданий, точки всех заметок на месте, поиск —
 /// без деградации. Если пачка успела записаться до убийства (воркер увидел падение
 /// по состоянию супервизора, не по ошибке записи), попытка повторяется на новой пачке.
@@ -161,6 +187,7 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
     ml(&mut c, MINILM);
     let http_port = managed(&mut c);
     let a = common::api::api_with(c).await;
+    let _guard = ShutdownOnPanic(a.st.clone());
     vector_ready(&a).await;
     let sup = a.st.index.supervisor().unwrap();
 
@@ -168,7 +195,7 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
     const ATTEMPTS: usize = 3;
     let mut notes = Vec::new();
     let mut kills = 0u64;
-    let mut saw_unavailable = false;
+    let mut requeued = false;
     let db = a.st.users.get(a.st.admin_id).await.unwrap();
     for attempt in 0..ATTEMPTS {
         for i in 0..BATCH {
@@ -207,6 +234,7 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
         }
         let qpid = pid_file(&dir).expect("pid-файл Qdrant");
         assert_eq!(Some(qpid), sup.pid());
+        let requeued0 = a.st.index.worker.jobs_requeued();
         kill_pid(qpid);
         kills += 1;
         assert!(wait_gone(qpid, GONE), "Qdrant {qpid} не завершился");
@@ -216,10 +244,6 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
         loop {
             let ws = a.st.index.worker.status();
             saw_down |= a.st.index.vector_available().is_err();
-            saw_unavailable |= ws
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.starts_with("Qdrant недоступен"));
             let back =
                 sup.pid().is_some_and(|p| p != qpid) && a.st.index.vector_available().is_ok();
             if back {
@@ -231,13 +255,19 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
         assert!(saw_down, "канал не выключался после убийства Qdrant");
         // новый процесс записан в pid-файл
         assert_eq!(pid_file(&dir), sup.pid());
-        if saw_unavailable {
+        // запись пачки, начатой до убийства, не подтверждена: её задания вернулись в
+        // очередь (попытки не тратятся, неудачными не становятся)
+        requeued = a.st.index.worker.jobs_requeued() > requeued0;
+        if requeued {
             break;
         }
     }
-    eprintln!("убийств Qdrant до Unavailable: {kills}");
+    eprintln!(
+        "убийств Qdrant: {kills}, заданий возвращено в очередь: {}",
+        a.st.index.worker.jobs_requeued()
+    );
     assert!(
-        saw_unavailable,
+        requeued,
         "за {kills} попыток запись пачки ни разу не получила Unavailable"
     );
 
@@ -330,17 +360,23 @@ fn longest_path(dir: &Path) -> usize {
     best
 }
 
-/// Ждёт статуса, удовлетворяющего условию; возвращает последний.
-fn wait_status(srv: &ServerProc, token: &str, what: &str, f: impl Fn(&Value) -> bool) -> Value {
+/// Ждёт статуса, удовлетворяющего условию; возвращает последний. Отказ в соединении —
+/// «ещё не готов» (сервер слушает порт только после открытия баз и загрузки модели);
+/// умерший процесс — сразу паника с хвостом stderr.
+fn wait_status(srv: &mut ServerProc, token: &str, what: &str, f: impl Fn(&Value) -> bool) -> Value {
     let t = Instant::now();
+    let mut last: String;
     loop {
-        let (code, s) = srv.call("GET", "/api/v1/index/status", token, None);
-        if code == 200 && f(&s) {
-            return s;
+        srv.assert_running(what);
+        match srv.try_call("GET", "/api/v1/index/status", token, None) {
+            Ok((200, s)) if f(&s) => return s,
+            Ok((code, s)) => last = format!("{code} {s}"),
+            Err(e) => last = format!("нет ответа: {e}"),
         }
         assert!(
             t.elapsed() < READY,
-            "не дождались за {READY:?}: {what}; {s}"
+            "не дождались за {READY:?}: {what}; {last}\nstderr:\n{}",
+            srv.tail()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -388,7 +424,7 @@ fn killed_server_takes_qdrant_down_and_restarts_with_long_data_dir() {
 
     let mut srv = ServerProc::start(&conf, addr);
     let token = srv.initial_token(READY);
-    wait_status(&srv, &token, "векторный канал", |s| {
+    wait_status(&mut srv, &token, "векторный канал", |s| {
         s["vector"]["available"] == true
     });
     let (code, n) = srv.call(
@@ -401,7 +437,7 @@ fn killed_server_takes_qdrant_down_and_restarts_with_long_data_dir() {
         ),
     );
     assert_eq!(code, 201, "{n}");
-    let s = wait_status(&srv, &token, "индексация", settled);
+    let s = wait_status(&mut srv, &token, "индексация", settled);
     let pts = s["qdrant"]["points"].as_u64().unwrap();
     search_vector(&srv, &token);
     let deepest = longest_path(&data.join("qdrant").join("storage"));
@@ -424,7 +460,7 @@ fn killed_server_takes_qdrant_down_and_restarts_with_long_data_dir() {
 
     // повторный старт в том же каталоге: первый токен не выдаётся, прежний действует
     let mut srv = ServerProc::start(&conf, addr);
-    let s = wait_status(&srv, &token, "после перезапуска", |s| {
+    let s = wait_status(&mut srv, &token, "после перезапуска", |s| {
         settled(s) && s["qdrant"]["state"] == "ready"
     });
     assert_eq!(s["qdrant"]["points"], pts, "{s}");
@@ -450,7 +486,8 @@ fn killed_server_takes_qdrant_down_and_restarts_with_long_data_dir() {
     assert!(!srv.running());
 }
 
-/// Windows: каталог данных на символ длиннее предела — сервер не стартует и называет
+/// Windows: каталог данных на символ длиннее предела — сервер и команды CLI (миграции,
+/// загрузки моделей и CUDA, управление Qdrant) не стартуют и называют
 /// причину и способ её устранить (без проверки SQLite отказал бы позже с «unable to open
 /// database file»). Модели и Qdrant не нужны.
 #[cfg(windows)]
@@ -459,17 +496,32 @@ fn too_long_data_dir_fails_with_hint() {
     let root = common::tmp("lc-too-long");
     let mut data = long_data_dir(&root);
     data.as_mut_os_string().push("ж");
-    let out = common::process::command()
-        .arg("migrate")
-        .arg("--data-dir")
-        .arg(&data)
-        .output()
-        .expect("запуск zam-server");
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("слишком длинный") && err.contains("MAX_PATH") && err.contains("--data-dir"),
-        "{err}"
-    );
+    let missing = root.join("нет.toml");
+    let missing = missing.to_str().unwrap();
+    // каждая команда с каталогом данных проверяет длину до работы; у загрузок манифест
+    // заведомо отсутствует — без проверки длины ошибка была бы о манифесте, а не сеть
+    let cmds: [&[&str]; 5] = [
+        &["migrate"],
+        &["models", "fetch", "--manifest", missing],
+        &["cuda", "fetch", "--manifest", missing],
+        &["qdrant", "status"],
+        &["qdrant", "reset", "--yes"],
+    ];
+    for args in cmds {
+        let out = common::process::command()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data)
+            .output()
+            .expect("запуск zam-server");
+        assert!(!out.status.success(), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("слишком длинный")
+                && err.contains("MAX_PATH")
+                && err.contains("--data-dir"),
+            "{args:?}: {err}"
+        );
+    }
     assert!(!data.exists(), "каталог данных создан");
 }

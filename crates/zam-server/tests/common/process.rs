@@ -139,8 +139,33 @@ impl ServerProc {
         token: &str,
         body: Option<&Value>,
     ) -> (u16, Value) {
-        http(self.addr, method, path, Some(token), body)
+        self.try_call(method, path, token, body)
             .unwrap_or_else(|e| panic!("{method} {path}: {e}\nstderr:\n{}", self.tail()))
+    }
+
+    /// То же, что [`ServerProc::call`], но ошибка соединения — `Err` (сервер ещё не
+    /// слушает порт: bind идёт после открытия баз и загрузки модели).
+    pub fn try_call(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: Option<&Value>,
+    ) -> std::io::Result<(u16, Value)> {
+        http(self.addr, method, path, Some(token), body)
+    }
+
+    /// Процесс жив; умер — паника с кодом выхода и хвостом stderr (без ожидания
+    /// таймаута вызывающего).
+    pub fn assert_running(&mut self, what: &str) {
+        if let Ok(Some(st)) = self.child.try_wait() {
+            // поток чтения stderr дочитывает вывод умершего процесса
+            std::thread::sleep(Duration::from_millis(200));
+            panic!(
+                "zam-server завершился ({st}) до «{what}», stderr:\n{}",
+                self.tail()
+            );
+        }
     }
 }
 
@@ -209,9 +234,17 @@ pub fn http(
             if size == 0 {
                 break;
             }
+            // усечённый ответ (сервер умер посреди тела) — ошибка, а не паника по срезу
             let start = eol + 2;
-            body.extend_from_slice(&rest[start..start + size]);
-            rest = &rest[start + size + 2..];
+            let chunk = start
+                .checked_add(size)
+                .and_then(|end| rest.get(start..end))
+                .ok_or_else(|| std::io::Error::other("усечённый chunk"))?;
+            body.extend_from_slice(chunk);
+            rest = rest
+                .get(start + size..)
+                .and_then(|r| r.strip_prefix(b"\r\n"))
+                .ok_or_else(|| std::io::Error::other("chunk без завершающего CRLF"))?;
         }
     } else {
         body.extend_from_slice(rest);

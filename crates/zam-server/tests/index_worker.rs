@@ -457,6 +457,19 @@ async fn qdrant_down_queues_jobs_fts_works_and_queue_catches_up() {
     let st = job_stats(&db).await.unwrap();
     assert_eq!((st.queued + st.running, st.failed), (1, 0), "{st:?}");
     assert_eq!(state(&a, &n).await, "pending");
+    // поиск, пока Qdrant лежит: только FTS, ответ помечен деградацией с причиной
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "уникальноеслово"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["degraded"], true, "{j}");
+    assert_eq!(j["degraded_reason"], "qdrant_down", "{j}");
+    assert_eq!(j["items"][0]["path"], "down/n", "{j}");
 
     q.restart();
     until(
@@ -602,6 +615,25 @@ async fn managed_storage_rebuild_reindexes_from_embeddings_without_inference() {
         b.st.index.worker.embedded_texts(),
         0,
         "пересборка без инференса"
+    );
+    // поиск по пересобранному хранилищу — без деградации, модель снова не вызывалась
+    // второй старт каталога: первого токена нет — запрос администратора по cookie
+    let r = b
+        .adm(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "собирается командой cargo build"})),
+            Some(&b.admin_id()),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["degraded"], false, "{j}");
+    assert_eq!(j["items"][0]["path"], "keep/n", "{j}");
+    assert_eq!(
+        b.st.index.worker.embedded_texts(),
+        0,
+        "поиск без инференса заметок"
     );
     // повреждённая база исключена из пересборки, флаг пересборки снят — повторной
     // полной перечанковки на следующем старте не будет
