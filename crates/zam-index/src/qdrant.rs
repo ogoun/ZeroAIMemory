@@ -271,15 +271,30 @@ impl QdrantIndex {
         Ok(())
     }
 
-    async fn delete_node_impl(&self, user: Id, node: Id) -> Result<(), IndexError> {
+    async fn delete_nodes_impl(&self, user: Id, nodes: &[Id]) -> Result<(), IndexError> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
         let filter = Filter::must([
             kw("user_id", user.to_string()),
-            kw("node_id", node.to_string()),
+            kw_any("node_id", nodes.iter().map(Id::to_string).collect()),
         ]);
         self.client
             .delete_points(
                 DeletePointsBuilder::new(COLLECTION)
                     .points(filter)
+                    .wait(true),
+            )
+            .await
+            .map_err(|e| map_err("delete", e))?;
+        Ok(())
+    }
+
+    async fn delete_scope_impl(&self, f: &VectorFilter) -> Result<(), IndexError> {
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(COLLECTION)
+                    .points(count_filter(f))
                     .wait(true),
             )
             .await
@@ -419,8 +434,12 @@ impl VectorIndex for QdrantIndex {
         Box::pin(self.upsert_impl(pts))
     }
 
-    fn delete_node(&self, user: Id, node: Id) -> IndexFuture<'_, ()> {
-        Box::pin(self.delete_node_impl(user, node))
+    fn delete_nodes<'a>(&'a self, user: Id, nodes: &'a [Id]) -> IndexFuture<'a, ()> {
+        Box::pin(self.delete_nodes_impl(user, nodes))
+    }
+
+    fn delete_scope<'a>(&'a self, f: &'a VectorFilter) -> IndexFuture<'a, ()> {
+        Box::pin(self.delete_scope_impl(f))
     }
 
     fn search<'a>(

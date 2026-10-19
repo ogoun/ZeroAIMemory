@@ -21,6 +21,22 @@ enum Cmd {
     HashPassword,
     /// Открыть все базы (с миграциями) и выйти
     Migrate(Opts),
+    /// Пересобрать векторный индекс на остановленном сервере: из кэша эмбеддингов без
+    /// инференса (по умолчанию) или полностью (--full)
+    Reindex {
+        #[command(flatten)]
+        opts: Opts,
+        /// Только этот пользователь (id); по умолчанию — все
+        #[arg(long)]
+        user: Option<String>,
+        /// Только это пространство пользователя: rules | knowledge | GUID решения | id
+        #[arg(long, requires = "user")]
+        space: Option<String>,
+        /// Перечанковать и поставить задания (инференс для заметок без кэша) вместо
+        /// пересборки из кэша
+        #[arg(long)]
+        full: bool,
+    },
     /// Управляемый Qdrant: загрузка бинарника, состояние, сброс хранилища
     Qdrant {
         #[command(subcommand)]
@@ -158,6 +174,16 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Migrate(o) => {
             let n = zam_server::migrate(load(o)?).await?;
             eprintln!("миграции применены: system.db и баз пользователей: {n}");
+            Ok(())
+        }
+        Cmd::Reindex {
+            opts,
+            user,
+            space,
+            full,
+        } => {
+            let args = zam_server::reindex::ReindexArgs { user, space, full };
+            println!("{}", zam_server::reindex::run(load(opts)?, args).await?);
             Ok(())
         }
         Cmd::Qdrant { cmd } => qdrant_cmd(cmd).await,

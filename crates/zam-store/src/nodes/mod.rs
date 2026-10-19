@@ -32,8 +32,8 @@ use crate::StoreError;
 use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
+pub(crate) use chunks::{backfill_embed_keys, frontmatter_tags, rechunk_notes};
 pub use chunks::{count_tokens, set_token_counter};
-pub(crate) use chunks::{frontmatter_tags, rechunk_notes};
 pub use history::{RevisionInfo, list_revisions, unified_diff};
 pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};

@@ -12,13 +12,13 @@ use std::time::{Duration, Instant};
 use common::qdrant::TestQdrant;
 use zam_core::Id;
 use zam_index::{
-    PassageEmbedder, QdrantIndex, VectorFilter, VectorIndex, WorkerConfig, WorkerDeps,
-    WorkerHandle, embed_key,
+    PassageEmbedder, QdrantIndex, ReindexRequest, VectorFilter, VectorIndex, WorkerConfig,
+    WorkerDeps, WorkerHandle, embed_key,
 };
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, Embedding, NewNote, NodePath, SpaceKind, SystemStore,
-    UserDbs, chunks_for_index, create_note, delete_node, enqueue_reindex, get_node, job_stats,
-    list_spaces, update_note,
+    UserDbs, chunks_for_index, create_note, delete_node, enqueue_reindex, get_embeddings, get_node,
+    job_stats, list_spaces, mark_reindex, move_node, pending_reindex, put_embeddings, update_note,
 };
 
 const DIM: usize = 16;
@@ -70,6 +70,7 @@ struct Env {
     user: Id,
     db: Db,
     knowledge: Id,
+    rules: Id,
     human: Id,
     fake: Arc<Fake>,
 }
@@ -104,6 +105,7 @@ async fn env(name: &str) -> Env {
         system,
         user,
         knowledge: find(SpaceKind::Knowledge),
+        rules: find(SpaceKind::Rules),
         human: find(SpaceKind::Human),
         db,
         fake: Arc::new(Fake {
@@ -118,6 +120,11 @@ impl Env {
     }
 
     fn spawn_with(&self, vector: Arc<dyn VectorIndex>) -> WorkerHandle {
+        self.spawn_gc(vector, Duration::from_millis(300))
+    }
+
+    /// Воркер с заданным периодом сборки мусора кэша.
+    fn spawn_gc(&self, vector: Arc<dyn VectorIndex>, gc_interval: Duration) -> WorkerHandle {
         WorkerHandle::spawn(
             WorkerDeps {
                 system: self.system.clone(),
@@ -130,6 +137,7 @@ impl Env {
                 rollup_debounce: Duration::from_millis(200),
                 idle_poll: Duration::from_millis(200),
                 retry_max: Duration::from_millis(500),
+                gc_interval,
                 ..WorkerConfig::default()
             },
         )
@@ -174,6 +182,52 @@ impl Env {
         }
     }
 
+    /// Чанков узла (= точек его заметки в индексе).
+    async fn chunks(&self, node: Id) -> u64 {
+        chunks_for_index(&self.db, node).await.unwrap().len() as u64
+    }
+
+    /// Строк кэша эмбеддингов.
+    async fn cached(&self) -> i64 {
+        self.db
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM embeddings", [], |r| r.get(0))?))
+            .await
+            .unwrap()
+    }
+
+    /// Ждёт покоя воркера: заданий нет (ни в очереди, ни в работе) и свёрток L0 не ждёт
+    /// ни одна папка — после этого модель без новых записей не вызывается.
+    async fn quiet(&self, w: &WorkerHandle) {
+        self.until("воркер в покое", async || {
+            let st = job_stats(&self.db).await.unwrap();
+            st.queued == 0 && st.running == 0 && w.status().rollups_pending == 0
+        })
+        .await;
+    }
+
+    /// Запрос reindex воркеру и его итог.
+    async fn reindex(&self, w: &WorkerHandle, req: ReindexRequest) -> zam_index::ReindexReport {
+        let prev = w.status().last_reindex.map(|o| o.finished_at);
+        w.request_reindex(req);
+        self.reindexed(w, prev).await
+    }
+
+    /// Ждёт итога reindex, завершённого позже `prev`.
+    async fn reindexed(
+        &self,
+        w: &WorkerHandle,
+        prev: Option<jiff::Timestamp>,
+    ) -> zam_index::ReindexReport {
+        self.until("reindex завершён", async || {
+            let st = w.status();
+            st.last_reindex.as_ref().map(|o| o.finished_at) != prev
+                && !st.reindex_running
+                && st.reindex_queued == 0
+        })
+        .await;
+        w.status().last_reindex.unwrap().result.unwrap()
+    }
+
     async fn until(&self, what: &str, f: impl AsyncFn() -> bool) {
         let t = Instant::now();
         while !f().await {
@@ -210,6 +264,12 @@ async fn indexes_replaces_and_deletes_points_and_skips_excluded() {
         ("excluded".into(), "excluded".into())
     );
 
+    // свёртка папки docs (дебаунс после задания a) тоже вызывает модель — для L0 папки.
+    // Замер «до» — только когда воркер в покое: иначе под нагрузкой свёртка срабатывала
+    // между замером и проверкой (а при быстрой переиндексации дебаунс отодвигал её за
+    // проверку) — отсюда нестабильность теста.
+    e.quiet(&w).await;
+    assert_eq!(e.count(None, Some("docs"), &["folder"]).await, 1);
     // та же эмбеддируемая строка (переиндексация того же содержимого): модель не вызывается
     let before = e.fake.texts.load(Ordering::SeqCst);
     enqueue_reindex(&e.db, None).await.unwrap();
@@ -332,6 +392,18 @@ async fn rebuild_skips_broken_user_db_and_does_not_repeat_others() {
     assert_eq!(w.jobs_done(), done + 1);
     assert_eq!(e.state(a).await, "indexed");
     assert_eq!(job_stats(&e.db).await.unwrap().queued, 0);
+    // файл не SQLite — повреждение навсегда: база исключена сразу, видна в статусе и аудите
+    let skipped = w.status().rebuild_skipped;
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!((skipped[0].user, skipped[0].attempts), (bad, 1));
+    let audit = e.system.list_audit(50, None).await.unwrap();
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|r| r.action == "index.rebuild_skipped" && r.user_id == Some(bad))
+            .count(),
+        1
+    );
     w.shutdown().await;
 }
 
@@ -475,4 +547,430 @@ async fn auto_l0_and_folder_rollup() {
     })
     .await;
     w.shutdown().await;
+}
+
+/// Ключ кэша в `chunks.embed_key` — ровно значение помощника `embed_key` (единая
+/// формула): после записи, правки и переноса (префикс меняется).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunk_embed_key_column_equals_helper() {
+    // без Qdrant: только база
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("zam-index-worker")
+        .join(format!("ekey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dd = DataDir::open(&dir).unwrap();
+    let db = UserDbs::new(dd.users_dir()).get(Id::new()).await.unwrap();
+    let knowledge = list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    let a = create_note(
+        &db,
+        NewNote {
+            space_id: knowledge,
+            path: NodePath::parse("x/a").unwrap(),
+            content: NOTE.into(),
+            l0: None,
+            attrib: Attribution::new(AuthorKind::Agent),
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    let check = async |n: Id| {
+        let raw: Vec<(String, Option<String>)> = db
+            .read(move |c| {
+                let mut st = c.prepare("SELECT id, embed_key FROM chunks WHERE node_id = ?1")?;
+                let rows = st.query_map([n], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+            .unwrap();
+        let chunks = chunks_for_index(&db, n).await.unwrap();
+        assert_eq!(raw.len(), chunks.len());
+        for c in &chunks {
+            let col = raw.iter().find(|r| r.0 == c.id).unwrap().1.clone();
+            assert_eq!(col.as_deref(), Some(embed_key(c).as_str()), "{}", c.id);
+            assert_eq!(c.embed_key, embed_key(c));
+        }
+    };
+    check(a).await;
+    update_note(
+        &db,
+        a,
+        1,
+        "# Другое\n\nНовый текст.\n".into(),
+        None,
+        Attribution::new(AuthorKind::Agent),
+    )
+    .await
+    .unwrap();
+    check(a).await;
+    move_node(&db, a, NodePath::parse("y/b").unwrap())
+        .await
+        .unwrap();
+    check(a).await;
+}
+
+/// Reindex по запросу из кэша: модель не вызывается; область по пространству не трогает
+/// другие; заметка без эмбеддинга в кэше получает задание (инференс только для неё);
+/// сироты кэша убираются, точки папок восстанавливаются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reindex_from_cache_without_inference() {
+    let e = env("reidx").await;
+    let a = e.note(e.knowledge, "docs/a", NOTE).await;
+    let b = e
+        .note(
+            e.knowledge,
+            "docs/b",
+            "Вторая заметка про деплой и релизы.\n",
+        )
+        .await;
+    let r = e
+        .note(e.rules, "rule", "Правило: тесты перед коммитом.\n")
+        .await;
+    // сборка мусора в простое — редко: сироту должен убрать именно reindex
+    let w = e.spawn_gc(e.vector.clone(), Duration::from_secs(3600));
+    for n in [a, b, r] {
+        e.indexed(n).await;
+    }
+    e.quiet(&w).await;
+    assert_eq!(e.count(None, Some("docs"), &["folder"]).await, 1);
+    let before = w.embedded_texts();
+    let know = e.count(Some(e.knowledge), None, &[]).await;
+
+    // пространство Rules: только его точки
+    let rep = e
+        .reindex(
+            &w,
+            ReindexRequest {
+                user: Some(e.user),
+                space: Some(e.rules),
+                full: false,
+            },
+        )
+        .await;
+    assert_eq!((rep.users, rep.nodes, rep.misses), (1, 1, 0));
+    assert_eq!(rep.points, e.chunks(r).await);
+    assert!(!rep.recreated);
+    assert_eq!(e.count(Some(e.rules), None, &[]).await, e.chunks(r).await);
+    assert_eq!(e.count(Some(e.knowledge), None, &[]).await, know);
+    assert_eq!(w.embedded_texts(), before);
+
+    // кэш: у b пропал эмбеддинг одного чанка, плюс сирота без ссылок
+    let bk = chunks_for_index(&e.db, b).await.unwrap()[0]
+        .embed_key
+        .clone();
+    let model = "fake/test@00000001";
+    let k2 = bk.clone();
+    e.db.write(move |tx| {
+        tx.execute("DELETE FROM embeddings WHERE text_hash = ?1", [k2])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    put_embeddings(
+        &e.db,
+        model,
+        vec![(
+            "orphan".into(),
+            Embedding {
+                dense: vec![0.1; DIM],
+                sparse: vec![],
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    // все точки пользователя удалены (как после сбоя): reindex всей базы
+    e.vector
+        .delete_scope(&VectorFilter {
+            user_id: e.user,
+            space_ids: vec![],
+            path_prefix: None,
+            levels: vec![],
+        })
+        .await
+        .unwrap();
+    let rep = e
+        .reindex(
+            &w,
+            ReindexRequest {
+                user: Some(e.user),
+                space: None,
+                full: false,
+            },
+        )
+        .await;
+    assert_eq!((rep.nodes, rep.misses, rep.jobs, rep.folders), (2, 1, 1, 1));
+    assert_eq!(rep.points, e.chunks(a).await + e.chunks(r).await);
+    assert!(rep.gc_deleted >= 1, "{rep:?}");
+    assert!(
+        get_embeddings(&e.db, model, &["orphan".into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(pending_reindex(&e.db).await.unwrap(), None);
+    // b — воркером, инференс только для пропавшего чанка
+    e.indexed(b).await;
+    e.until("точки b", async || {
+        e.count(None, Some("docs/b"), &[]).await == e.chunks(b).await
+    })
+    .await;
+    assert_eq!(w.embedded_texts(), before + 1);
+    assert_eq!(e.count(None, Some("docs"), &["folder"]).await, 1);
+    w.shutdown().await;
+}
+
+/// Коллекция другой модели: векторный канал выключен до reindex; reindex пересоздаёт её
+/// для текущей модели и восстанавливает точки всех баз.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reindex_recreates_foreign_model_collection() {
+    let e = env("reforeign").await;
+    let a = e.note(e.knowledge, "a", NOTE).await;
+    // эмбеддинги текущей модели уже есть (индексировали раньше): reindex без инференса
+    {
+        let w = e.spawn();
+        e.indexed(a).await;
+        w.shutdown().await;
+    }
+    e.vector.drop_all().await.unwrap();
+    e.vector.ensure("other/model@ffff", DIM).await.unwrap();
+    let w = e.spawn();
+    e.until("mismatch", async || w.status().model_mismatch.is_some())
+        .await;
+    let before = w.embedded_texts();
+    let rep = e
+        .reindex(
+            &w,
+            ReindexRequest {
+                user: Some(e.user),
+                space: Some(e.knowledge),
+                full: false,
+            },
+        )
+        .await;
+    assert!(rep.recreated);
+    assert_eq!(rep.points, e.chunks(a).await);
+    e.until("канал включён", async || {
+        let st = w.status();
+        st.vector_ready && st.model_mismatch.is_none()
+    })
+    .await;
+    let meta = e.vector.ensure("fake/test@00000001", DIM).await.unwrap();
+    assert_eq!(meta.model_id.as_deref(), Some("fake/test@00000001"));
+    assert_eq!(e.count(None, Some("a"), &[]).await, e.chunks(a).await);
+    assert_eq!(w.embedded_texts(), before);
+    w.shutdown().await;
+}
+
+/// Прерванный reindex (отметка `reindex_pending` осталась) повторяется при запуске воркера.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_reindex_is_resumed_on_start() {
+    let e = env("resume").await;
+    let a = e.note(e.knowledge, "a", NOTE).await;
+    {
+        let w = e.spawn();
+        e.indexed(a).await;
+        w.shutdown().await;
+    }
+    // точки удалены, отметка стоит — как при остановке посреди reindex
+    e.vector
+        .delete_scope(&VectorFilter {
+            user_id: e.user,
+            space_ids: vec![],
+            path_prefix: None,
+            levels: vec![],
+        })
+        .await
+        .unwrap();
+    mark_reindex(&e.db, Some("{\"full\":false,\"space\":null}".into()))
+        .await
+        .unwrap();
+    let w = e.spawn();
+    let rep = e.reindexed(&w, None).await;
+    assert_eq!(rep.nodes, 1);
+    assert_eq!(e.count(None, Some("a"), &[]).await, e.chunks(a).await);
+    assert_eq!(pending_reindex(&e.db).await.unwrap(), None);
+    assert_eq!(w.embedded_texts(), 0);
+    w.shutdown().await;
+}
+
+/// Сборка мусора кэша в простое: сироты уходят, живые ключи остаются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_gc_removes_orphan_embeddings() {
+    let e = env("gc").await;
+    let a = e.note(e.knowledge, "a", NOTE).await;
+    let w = e.spawn();
+    e.indexed(a).await;
+    let live = e.cached().await;
+    put_embeddings(
+        &e.db,
+        "fake/test@00000001",
+        (0..5)
+            .map(|i| {
+                (
+                    format!("orphan{i}"),
+                    Embedding {
+                        dense: vec![0.1; DIM],
+                        sparse: vec![],
+                    },
+                )
+            })
+            .collect(),
+    )
+    .await
+    .unwrap();
+    // правка: ключи прежней ревизии тоже становятся сиротами
+    update_note(
+        &e.db,
+        a,
+        1,
+        "Совсем новый текст заметки.\n".into(),
+        None,
+        Attribution::new(AuthorKind::Agent),
+    )
+    .await
+    .unwrap();
+    w.notify();
+    e.indexed(a).await;
+    let old = live;
+    e.until("сироты убраны", async || {
+        get_embeddings(&e.db, "fake/test@00000001", &["orphan0".into()])
+            .await
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    // живые ключи текущей ревизии на месте; строк не больше, чем было до сирот
+    let mut keys: Vec<String> = chunks_for_index(&e.db, a)
+        .await
+        .unwrap()
+        .iter()
+        .map(|c| c.embed_key.clone())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let have = get_embeddings(&e.db, "fake/test@00000001", &keys)
+        .await
+        .unwrap();
+    assert_eq!(have.len(), keys.len());
+    e.until(
+        "ключи прежней ревизии убраны",
+        async || e.cached().await <= old,
+    )
+    .await;
+    w.shutdown().await;
+}
+
+/// Замер для отчёта: reindex из кэша `embeddings` 20 000 синтетических чанков (dense 1024,
+/// как bge-m3, и sparse на 40 токенов) в настоящий Qdrant, без инференса. Цель — не меньше
+/// 2000 чанков/с. Запуск:
+/// `cargo test --release -p zam-index --test worker -- --ignored bench_reindex --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_reindex_from_embeddings() {
+    const BENCH_DIM: usize = 1024;
+    const MODEL_B: &str = "bench/bge@00000000";
+    const TARGET: u64 = 20_000;
+    let e = env("bench").await;
+    // заметки по 16 разделов до 20 000 чанков (листы, L1 разделов и заметки)
+    let section = "Раздел о сборке и тестах проекта: команды, переменные окружения, каталоги \
+                   журналов и временных файлов, порядок запуска и проверки результатов. "
+        .repeat(6);
+    let mut total = 0u64;
+    let mut notes = 0u32;
+    let setup = Instant::now();
+    while total < TARGET {
+        let body: String = (0..16)
+            .map(|i| format!("## Раздел {i} заметки {notes}\n\n{section}\n\n"))
+            .collect();
+        let n = e
+            .note(
+                e.knowledge,
+                &format!("bench/d{}/n{notes}", notes % 20),
+                &body,
+            )
+            .await;
+        total += chunks_for_index(&e.db, n).await.unwrap().len() as u64;
+        notes += 1;
+    }
+    // кэш: эмбеддинг на каждый ключ чанка
+    let mut keys: Vec<String> = Vec::new();
+    let mut after = None;
+    loop {
+        let page = zam_store::reindex_page(&e.db, None, after, 500)
+            .await
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some(last.node_id);
+        keys.extend(
+            page.iter()
+                .flat_map(|n| n.chunks.iter().map(|c| c.embed_key.clone())),
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    for part in keys.chunks(1000) {
+        let rows = part
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let s = i as f32 * 0.013;
+                (
+                    k.clone(),
+                    Embedding {
+                        dense: (0..BENCH_DIM)
+                            .map(|j| ((j as f32) * 0.37 + s).sin() * 0.03)
+                            .collect(),
+                        sparse: (0..40u32).map(|t| (t * 997 + i as u32, 0.1)).collect(),
+                    },
+                )
+            })
+            .collect();
+        put_embeddings(&e.db, MODEL_B, rows).await.unwrap();
+    }
+    e.vector.ensure(MODEL_B, BENCH_DIM).await.unwrap();
+    eprintln!(
+        "T10-BENCH подготовка: заметок {notes}, чанков {total}, ключей {}, {} с",
+        keys.len(),
+        setup.elapsed().as_secs()
+    );
+    let ctx = zam_index::ReindexCtx {
+        system: &e.system,
+        users: &e.users,
+        vector: e.vector.as_ref(),
+        model_id: MODEL_B,
+        dim: BENCH_DIM,
+    };
+    let req = ReindexRequest {
+        user: Some(e.user),
+        space: None,
+        full: false,
+    };
+    for run in 1..=2 {
+        let t = Instant::now();
+        let rep = zam_index::reindex(&ctx, &req).await.unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        assert_eq!(rep.points, total);
+        assert_eq!(rep.misses, 0);
+        eprintln!(
+            "T10-BENCH прогон {run}: точек {} за {:.2} с — {:.0} чанков/с (чтение {} мс, \
+             удаление и запись {} мс)",
+            rep.points,
+            secs,
+            rep.points as f64 / secs,
+            rep.read_ms,
+            rep.write_ms
+        );
+    }
+    assert_eq!(
+        e.count(None, Some("bench"), &["chunk", "section", "note"])
+            .await,
+        total
+    );
 }

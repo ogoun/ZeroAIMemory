@@ -610,7 +610,7 @@ async fn migrate_from_v3_rechunks_once() {
         .read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
         .await
         .unwrap();
-    assert_eq!(ver, 4);
+    assert_eq!(ver, USER_MIGRATIONS.len() as u32);
     // старые чанки ушли из FTS вместе с таблицей
     let stale: i64 = db
         .read(|c| {

@@ -587,7 +587,7 @@ async fn migrate_from_v1() {
         .read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
         .await
         .unwrap();
-    assert_eq!(ver, 4);
+    assert_eq!(ver, zam_store::USER_MIGRATIONS.len() as u32);
     let spaces = list_spaces(&db).await.unwrap();
     assert!(spaces.iter().any(|s| s.id == sid && s.name == "Проект"));
     let n = create_note(&db, note(sid, "после/миграции", "# H\n\nтекст\n"))

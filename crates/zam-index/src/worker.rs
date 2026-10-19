@@ -10,26 +10,41 @@
 //!    `enqueue_reindex` во всех базах (векторы из `embeddings`, без инференса для
 //!    известных текстов). Сбой одной базы не останавливает остальные: она пропускается
 //!    и повторяется позже, уже обработанные базы повторно не перечанковываются;
-//!    индексация идёт и во время повторов. Для `storage_rebuilt` аудит
-//!    `index.storage_rebuilt` и `ack_storage_rebuilt()` — когда прошли все базы.
-//! 3. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла →
-//!    кэш `embeddings` по [`embed_key`] → инференс промахов (`spawn_blocking`, пачки не
-//!    больше `batch_tokens`, уступка `yield_ms`) → `delete_node` + `upsert` (`wait=true`)
-//!    → `complete_job` → `index_state = 'indexed'` только при [`JobOutcome::Done`].
+//!    индексация идёт и во время повторов. База, повреждённая навсегда (файл не SQLite,
+//!    схема новее) или не открывшаяся [`REBUILD_MAX_ATTEMPTS`] раз подряд, исключается из
+//!    пересборки: WARN, аудит `index.rebuild_skipped`, видна в `/index/status`
+//!    ([`WorkerStatus::rebuild_skipped`]); когда база снова откроется, её reindex
+//!    ставится сам. Для `storage_rebuilt` аудит `index.storage_rebuilt` и
+//!    `ack_storage_rebuilt()` — когда прошли (или исключены) все базы: флаг
+//!    `.zam-reindex` не держит полную перечанковку на каждом рестарте из-за одной базы.
+//! 3. **Reindex по запросу** ([`WorkerHandle::request_reindex`], `POST /admin/reindex`):
+//!    [`crate::reindex`] — из кэша без инференса или полный; выполняется здесь же,
+//!    последовательно с заданиями, в том числе при чужой модели коллекции (её он и
+//!    пересоздаёт). Прерванный reindex базы (отметка `reindex_pending`) повторяется при
+//!    первом открытии базы после запуска.
+//! 4. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла →
+//!    кэш `embeddings` по `chunks.embed_key` → инференс промахов (`spawn_blocking`, пачки
+//!    не больше `batch_tokens`, уступка `yield_ms`) → одна запись в Qdrant на пачку:
+//!    `delete_nodes` + `upsert` (`wait=true`; отказ пачки — по одному узлу) →
+//!    `complete_job` → `index_state = 'indexed'` только при [`JobOutcome::Done`].
 //!    Qdrant недоступен или коллекции нет — задания возвращаются [`release_job`] без
 //!    траты попыток; прочие ошибки — [`fail_job`] (backoff, после 5 — `failed`).
-//! 4. **L0** (§8.3): автоматический L0 заметки — предложение у центроида её чанков;
+//! 5. **L0** (§8.3): автоматический L0 заметки — предложение у центроида её чанков;
 //!    папки-предки — свёртка L0 детей с дебаунсом `rollup_debounce`, папка индексируется
 //!    точкой уровня `folder`.
+//! 6. **Сборка мусора кэша** в простое: раз в `gc_interval` на базу пачка
+//!    [`gc_embeddings`] (до [`GC_BATCH`] строк; полная пачка — следующая в ближайший простой).
 //!
 //! Текст эмбеддинга чанка — [`embed_input`]: `context_prefix + "\n" + text` (§8.2 п. 6);
-//! ключ кэша — [`embed_key`]: blake3 ровно этой строки. Одинаковая эмбеддируемая строка
-//! считается моделью один раз; тот же текст под другим префиксом (другая заметка) —
-//! отдельный вектор. Ключи предложений L0 и L0 папки — со своим доменом.
+//! ключ кэша — [`embed_key`]: blake3 ровно этой строки, формула одна
+//! ([`zam_store::embed_key_of`]) и хранится в `chunks.embed_key`. Одинаковая
+//! эмбеддируемая строка считается моделью один раз; тот же текст под другим префиксом
+//! (другая заметка) — отдельный вектор. Ключи предложений L0 и L0 папки — со своим
+//! доменом и владельцем-узлом (`embeddings.owner`): устаревшие снимаются при пересчёте L0.
 //! Перенос узла: API сообщает старого родителя ([`WorkerHandle::rollup_hint`]), его
 //! свёртка пересчитывается. В лог не попадают тексты, векторы и ключ Qdrant.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,12 +54,14 @@ use tokio::sync::{Notify, watch};
 use zam_core::Id;
 use zam_markdown::ChunkLevel;
 use zam_store::{
-    Db, Embedding, IndexChunk, IndexState, Job, JobOp, JobOutcome, NodeKind, SpaceKind, StoreError,
-    SystemStore, UserDbs, chunks_for_index, claim_jobs, complete_job, enqueue_reindex, fail_job,
-    get_embeddings, get_node, get_space, indexed_count, list_children, put_embeddings, release_job,
-    requeue_running, set_auto_l0, set_folder_l0, set_index_state,
+    Db, Embedding, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, NodeKind,
+    SpaceKind, StoreError, SystemStore, UserDbs, chunks_for_index, claim_jobs, complete_job,
+    enqueue_reindex, fail_job, gc_embeddings, get_embeddings, get_node, get_space, indexed_count,
+    list_children, pending_reindex, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
+    release_job, requeue_running, set_auto_l0, set_folder_l0, set_index_state,
 };
 
+use crate::reindex::{GC_BATCH, ReindexCtx, ReindexReport, ReindexRequest, reindex};
 use crate::rollup::{self, FolderChild};
 use crate::supervisor::{QdrantState, Supervisor};
 use crate::{IndexError, IndexPoint, PointPayload, VectorIndex};
@@ -77,6 +94,8 @@ pub struct WorkerConfig {
     pub idle_poll: Duration,
     /// Предел задержки повтора проверки Qdrant.
     pub retry_max: Duration,
+    /// Период сборки мусора кэша `embeddings` на базу (в простое).
+    pub gc_interval: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -88,6 +107,7 @@ impl Default for WorkerConfig {
             rollup_debounce: Duration::from_secs(2),
             idle_poll: Duration::from_secs(2),
             retry_max: Duration::from_secs(10),
+            gc_interval: Duration::from_secs(3600),
         }
     }
 }
@@ -115,14 +135,46 @@ pub struct WorkerStatus {
     pub model_mismatch: Option<(String, String)>,
     /// Последняя ошибка Qdrant или инференса (без текста заметок).
     pub last_error: Option<String>,
+    /// Папок, ждущих свёртки L0 (дебаунс или выполняется).
+    pub rollups_pending: usize,
+    /// Reindex по запросу выполняется сейчас.
+    pub reindex_running: bool,
+    /// Запросов reindex в очереди, включая выполняемый.
+    pub reindex_queued: usize,
+    /// Последний завершённый reindex по запросу.
+    pub last_reindex: Option<ReindexOutcome>,
+    /// Базы, исключённые из пересборки индекса (повреждены или не открываются).
+    pub rebuild_skipped: Vec<SkippedDb>,
+}
+
+/// Итог reindex по запросу.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReindexOutcome {
+    pub request: ReindexRequest,
+    pub finished_at: Timestamp,
+    /// Отчёт или ошибка (без текста заметок).
+    pub result: Result<ReindexReport, String>,
+}
+
+/// База пользователя, исключённая из пересборки индекса.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedDb {
+    pub user: Id,
+    pub error: String,
+    pub attempts: u32,
 }
 
 struct Inner {
     status: Mutex<WorkerStatus>,
     notify: Notify,
     rebuild: AtomicBool,
+    /// Запросы reindex по порядку поступления.
+    reindex: Mutex<VecDeque<ReindexRequest>>,
     embedded: AtomicU64,
     jobs_done: AtomicU64,
+    /// Суммарное время инференса и записи в Qdrant, мкс (диагностика, `/index/status`).
+    embed_us: AtomicU64,
+    qdrant_us: AtomicU64,
     /// Папки, свёртку которых нужно пересчитать (старый родитель при переносе).
     /// Множество: без воркера (FTS-only) подсказки не забираются, а размер ограничен
     /// числом папок.
@@ -157,8 +209,11 @@ impl WorkerHandle {
                 status: Mutex::default(),
                 notify: Notify::new(),
                 rebuild: AtomicBool::new(false),
+                reindex: Mutex::default(),
                 embedded: AtomicU64::new(0),
                 jobs_done: AtomicU64::new(0),
+                embed_us: AtomicU64::new(0),
+                qdrant_us: AtomicU64::new(0),
                 hints: Mutex::default(),
                 stop,
                 task: Mutex::new(None),
@@ -181,6 +236,9 @@ impl WorkerHandle {
             pending: None,
             last_q: None,
             bad_users: HashMap::new(),
+            reindex_retry: None,
+            skipped_dbs: HashSet::new(),
+            gc_due: HashMap::new(),
         };
         let task = tokio::spawn(w.run());
         *lock(&h.inner.task) = Some(task);
@@ -207,6 +265,14 @@ impl WorkerHandle {
         self.inner.jobs_done.load(Ordering::SeqCst)
     }
 
+    /// Суммарное время с запуска: `(инференс, запись в Qdrant)` — где воркер тратит время.
+    pub fn busy(&self) -> (Duration, Duration) {
+        (
+            Duration::from_micros(self.inner.embed_us.load(Ordering::SeqCst)),
+            Duration::from_micros(self.inner.qdrant_us.load(Ordering::SeqCst)),
+        )
+    }
+
     /// Пересчитать свёртку L0 папки `folder` пользователя `user` и её предков (с дебаунсом):
     /// API вызывает для старого родителя при переносе или переименовании узла — задание
     /// индексации знает только новое положение.
@@ -219,6 +285,19 @@ impl WorkerHandle {
     /// `drop_all` или смены модели). Выполняется воркером асинхронно.
     pub fn request_rebuild(&self) {
         self.inner.rebuild.store(true, Ordering::SeqCst);
+        self.notify();
+    }
+
+    /// Пересобрать индекс области ([`crate::reindex`]): из кэша `embeddings` без
+    /// инференса или полностью (`full`). Выполняется воркером асинхронно, по порядку
+    /// запросов; итог — [`WorkerStatus::last_reindex`].
+    pub fn request_reindex(&self, req: ReindexRequest) {
+        let n = {
+            let mut q = lock(&self.inner.reindex);
+            q.push_back(req);
+            q.len()
+        };
+        lock(&self.inner.status).reindex_queued = n;
         self.notify();
     }
 
@@ -244,6 +323,11 @@ impl WorkerHandle {
         st.running = false;
         st.vector_ready = false;
     }
+}
+
+/// Прибавляет к счётчику время с `t`, мкс.
+fn add_us(c: &AtomicU64, t: Instant) {
+    c.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -331,6 +415,12 @@ struct Worker {
     last_q: Option<QdrantState>,
     /// Базы, которые не открылись: следующая попытка не раньше срока (без шума в журнале).
     bad_users: HashMap<Id, Instant>,
+    /// Повтор reindex по запросу после недоступности Qdrant не раньше срока.
+    reindex_retry: Option<Instant>,
+    /// Базы, исключённые из пересборки: при успешном открытии — их reindex.
+    skipped_dbs: HashSet<Id>,
+    /// Следующая сборка мусора кэша базы.
+    gc_due: HashMap<Id, Instant>,
 }
 
 /// Пересборка, идущая по базам.
@@ -344,6 +434,10 @@ struct Rebuild {
     started: Instant,
     /// Следующая попытка для неудавшихся баз.
     next_try: Instant,
+    /// Неудачных попыток по базам.
+    attempts: HashMap<Id, u32>,
+    /// Исключены из пересборки (повреждены или не открылись [`REBUILD_MAX_ATTEMPTS`] раз).
+    skipped: Vec<Id>,
 }
 
 /// Задача воркера завершилась (штатно или паникой): векторный канал выключен, иначе
@@ -363,6 +457,10 @@ impl Drop for ExitGuard {
 
 /// Пауза между попытками для базы, которая не открылась.
 const BAD_USER_RETRY: Duration = Duration::from_secs(60);
+
+/// Неудачных попыток базы в пересборке, после которых она исключается (повреждённая
+/// навсегда исключается сразу).
+pub const REBUILD_MAX_ATTEMPTS: u32 = 5;
 
 impl Worker {
     fn stopped(&self) -> bool {
@@ -474,6 +572,29 @@ impl Worker {
             {
                 self.rebuild_step().await;
             }
+            // 2a. Reindex по запросу (и при чужой модели коллекции: он её пересоздаёт)
+            if self.reindex_retry.is_none_or(|t| Instant::now() >= t)
+                && let Some(req) = self.next_reindex()
+            {
+                match self.run_reindex(req).await {
+                    Ok(()) => {
+                        self.reindex_retry = None;
+                        // статус коллекции (модель, готовность) — заново через ensure
+                        ensured = false;
+                        retry_at = None;
+                        backoff = Duration::from_millis(500);
+                    }
+                    Err(e) => {
+                        ensured = false;
+                        self.vector_down(&e);
+                        let t = Instant::now() + backoff;
+                        retry_at = Some(t);
+                        self.reindex_retry = Some(t);
+                        backoff = (backoff * 2).min(self.cfg.retry_max);
+                        continue;
+                    }
+                }
+            }
             // 3. Коллекция
             if !ensured {
                 if let Some(t) = retry_at
@@ -481,9 +602,11 @@ impl Worker {
                 {
                     // смена состояния Qdrant (перезапуск, готовность) или запрос пересборки
                     // (он приходит через notify) — проверить сразу; запись узла — ждать срока
-                    if self.wait(t, true).await != Wake::State
-                        && !self.inner.rebuild.load(Ordering::SeqCst)
-                    {
+                    let woke = self.wait(t, true).await;
+                    if self.has_reindex() && self.reindex_retry.is_none() {
+                        continue;
+                    }
+                    if woke != Wake::State && !self.inner.rebuild.load(Ordering::SeqCst) {
                         continue;
                     }
                 }
@@ -520,7 +643,10 @@ impl Worker {
             };
             // 5. Свёртки L0
             self.take_hints().await;
-            match self.run_rollups().await {
+            let rolled = self.run_rollups().await;
+            let left = self.rollups.due.len();
+            self.status(|s| s.rollups_pending = left);
+            match rolled {
                 Ok(()) => {}
                 Err(Halt::Stopped) => break,
                 Err(Halt::Vector(e)) => {
@@ -534,6 +660,10 @@ impl Worker {
             if did {
                 tokio::time::sleep(Duration::from_millis(self.cfg.yield_ms)).await;
             } else {
+                // простой: сборка мусора кэша
+                if self.gc_tick().await {
+                    continue;
+                }
                 let mut until = Instant::now() + self.cfg.idle_poll;
                 if let Some(d) = self.rollups.next_due() {
                     until = until.min(d);
@@ -545,6 +675,119 @@ impl Worker {
             }
         }
         tracing::info!("воркер индексации остановлен");
+    }
+
+    fn has_reindex(&self) -> bool {
+        !lock(&self.inner.reindex).is_empty()
+    }
+
+    /// Следующий запрос reindex (остаётся в очереди до успешного выполнения).
+    fn next_reindex(&self) -> Option<ReindexRequest> {
+        lock(&self.inner.reindex).front().cloned()
+    }
+
+    /// Выполняет первый запрос reindex. Недоступность Qdrant — `Err` (запрос остаётся в
+    /// очереди, повтор после backoff); прочие ошибки — в итог запроса.
+    async fn run_reindex(&mut self, req: ReindexRequest) -> Result<(), IndexError> {
+        self.status(|s| s.reindex_running = true);
+        let model = self.model();
+        let ctx = ReindexCtx {
+            system: &self.deps.system,
+            users: &self.deps.users,
+            vector: self.deps.vector.as_ref(),
+            model_id: &model,
+            dim: self.deps.embedder.dim(),
+        };
+        let res = reindex(&ctx, &req).await;
+        self.status(|s| s.reindex_running = false);
+        let result = match res {
+            Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
+                tracing::warn!(error = %e, "reindex прерван: Qdrant недоступен, повтор позже");
+                return Err(e);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "reindex не выполнен");
+                Err(e.to_string())
+            }
+            Ok(rep) => {
+                // базы, которые не открылись: их reindex — при следующем успешном открытии
+                for (u, _) in &rep.failed_users {
+                    self.skipped_dbs.insert(*u);
+                }
+                Ok(rep)
+            }
+        };
+        let left = {
+            let mut q = lock(&self.inner.reindex);
+            q.pop_front();
+            q.len()
+        };
+        let outcome = ReindexOutcome {
+            request: req,
+            finished_at: Timestamp::now(),
+            result,
+        };
+        if let Ok(rep) = &outcome.result {
+            let audit = self
+                .deps
+                .system
+                .audit(
+                    "system",
+                    outcome.request.user,
+                    "index.reindex_done",
+                    None,
+                    None,
+                    serde_json::json!({
+                        "full": rep.full, "users": rep.users, "nodes": rep.nodes,
+                        "points": rep.points, "misses": rep.misses, "jobs": rep.jobs,
+                        "gc_deleted": rep.gc_deleted, "recreated": rep.recreated,
+                        "failed_users": rep.failed_users.len(), "elapsed_ms": rep.elapsed_ms,
+                    }),
+                )
+                .await;
+            if let Err(e) = audit {
+                tracing::warn!(error = %e, "аудит index.reindex_done не записан");
+            }
+        }
+        self.status(|s| {
+            s.reindex_queued = left;
+            s.last_reindex = Some(outcome);
+        });
+        Ok(())
+    }
+
+    /// Сборка мусора кэша в простое: одна пачка на базу, у которой подошёл срок.
+    /// `true` — пачка была полной (мусор ещё есть: продолжить без ожидания).
+    async fn gc_tick(&mut self) -> bool {
+        let now = Instant::now();
+        let mut more = false;
+        for u in self.users().await {
+            if self.stopped() || self.gc_due.get(&u).is_some_and(|t| now < *t) {
+                continue;
+            }
+            let Some(db) = self.open_db(u).await else {
+                continue;
+            };
+            let next = match gc_embeddings(&db, GC_BATCH).await {
+                Ok(n) if n >= GC_BATCH as u64 => {
+                    more = true;
+                    tracing::debug!(user = %u, deleted = n, "сборка мусора кэша эмбеддингов");
+                    now
+                }
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::debug!(user = %u, deleted = n, "сборка мусора кэша эмбеддингов");
+                    }
+                    now + self.cfg.gc_interval
+                }
+                Err(e) => {
+                    tracing::warn!(user = %u, error = %e, "сборка мусора кэша эмбеддингов");
+                    now + self.cfg.gc_interval
+                }
+            };
+            self.gc_due.insert(u, next);
+        }
+        more
     }
 
     fn vector_down(&self, e: &IndexError) {
@@ -634,6 +877,8 @@ impl Worker {
             jobs: 0,
             started: Instant::now(),
             next_try: Instant::now(),
+            attempts: HashMap::new(),
+            skipped: Vec::new(),
         });
     }
 
@@ -668,12 +913,22 @@ impl Worker {
                     p.done.insert(u.id);
                 }
                 Err(e) => {
-                    failed += 1;
-                    tracing::warn!(
-                        user = %u.id,
-                        error = %e,
-                        "пересборка: база пользователя пропущена, повтор позже"
-                    );
+                    let n = p.attempts.entry(u.id).or_insert(0);
+                    *n += 1;
+                    let attempts = *n;
+                    if e.is_permanent() || attempts >= REBUILD_MAX_ATTEMPTS {
+                        p.done.insert(u.id);
+                        p.skipped.push(u.id);
+                        self.skip_db(u.id, &e, attempts, p.storage).await;
+                    } else {
+                        failed += 1;
+                        tracing::warn!(
+                            user = %u.id,
+                            error = %e,
+                            attempts,
+                            "пересборка: база пользователя пропущена, повтор позже"
+                        );
+                    }
                 }
             }
         }
@@ -684,6 +939,7 @@ impl Worker {
         }
         tracing::info!(
             users = users.len(),
+            skipped = p.skipped.len(),
             jobs = p.jobs,
             elapsed_ms = p.started.elapsed().as_millis() as u64,
             "пересборка индекса поставлена в очередь"
@@ -698,7 +954,11 @@ impl Worker {
                     "index.storage_rebuilt",
                     None,
                     None,
-                    serde_json::json!({ "users": users.len(), "jobs": p.jobs }),
+                    serde_json::json!({
+                        "users": users.len(),
+                        "jobs": p.jobs,
+                        "skipped": p.skipped.iter().map(Id::to_string).collect::<Vec<_>>(),
+                    }),
                 )
                 .await;
             if let Err(e) = audit {
@@ -715,7 +975,45 @@ impl Worker {
         }
     }
 
+    /// База исключена из пересборки: WARN, аудит `index.rebuild_skipped`, статус. Когда
+    /// она снова откроется ([`Self::open_db`]), её reindex поставится сам.
+    async fn skip_db(&mut self, user: Id, e: &StoreError, attempts: u32, storage: bool) {
+        tracing::warn!(
+            user = %user,
+            error = %e,
+            attempts,
+            "пересборка индекса: база пользователя исключена (повреждена или не открывается); \
+             после восстановления базы выполните `zam-server reindex --user {user}`"
+        );
+        self.skipped_dbs.insert(user);
+        let err = e.to_string();
+        let audit = self
+            .deps
+            .system
+            .audit(
+                "system",
+                Some(user),
+                "index.rebuild_skipped",
+                Some(&user.to_string()),
+                None,
+                serde_json::json!({ "error": err, "attempts": attempts, "storage": storage }),
+            )
+            .await;
+        if let Err(a) = audit {
+            tracing::warn!(error = %a, "аудит index.rebuild_skipped не записан");
+        }
+        self.status(|s| {
+            s.rebuild_skipped.retain(|d| d.user != user);
+            s.rebuild_skipped.push(SkippedDb {
+                user,
+                error: err,
+                attempts,
+            });
+        });
+    }
+
     /// База пользователя; не открывшаяся — WARN не чаще раза в минуту и пропуск.
+    /// Открывшаяся база, исключённая ранее из пересборки, получает свой reindex.
     async fn open_db(&mut self, user: Id) -> Option<Db> {
         if self
             .bad_users
@@ -727,6 +1025,20 @@ impl Worker {
         match self.deps.users.get(user).await {
             Ok(db) => {
                 self.bad_users.remove(&user);
+                if self.skipped_dbs.contains(&user) {
+                    match enqueue_reindex(&db, None).await {
+                        Ok(jobs) => {
+                            tracing::info!(
+                                user = %user,
+                                jobs,
+                                "база, исключённая из пересборки, снова открылась: reindex"
+                            );
+                            self.skipped_dbs.remove(&user);
+                            self.status(|s| s.rebuild_skipped.retain(|d| d.user != user));
+                        }
+                        Err(e) => tracing::warn!(user = %user, error = %e, "reindex базы"),
+                    }
+                }
                 Some(db)
             }
             Err(e) => {
@@ -759,6 +1071,16 @@ impl Worker {
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(user = %user, error = %e, "requeue_running"),
+                }
+                match pending_reindex(&db).await {
+                    Ok(Some(spec)) => {
+                        tracing::info!(user = %user, "незавершённый reindex базы: повтор");
+                        let req = ReindexRequest::from_spec(user, &spec);
+                        lock(&self.inner.reindex).push_back(req);
+                        self.status(|s| s.reindex_queued += 1);
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(user = %user, error = %e, "отметка reindex"),
                 }
             }
             let jobs = match claim_jobs(&db, self.cfg.batch_jobs, Timestamp::now()).await {
@@ -833,12 +1155,12 @@ impl Worker {
             })
             .flatten()
             .map(|c| EmbedItem {
-                key: embed_key(c),
+                key: c.embed_key.clone(),
                 input: embed_input(c),
                 tokens: c.token_count.max(1) as usize + c.context_prefix.len() / 3,
             })
             .collect();
-        let embs = match self.embed_cached(db, items).await {
+        let embs = match self.embed_cached(db, items, None).await {
             Ok(m) => m,
             Err(EmbedFail::Stopped) => {
                 let all: Vec<Job> = plans.into_iter().map(|(j, _)| j).collect();
@@ -859,29 +1181,66 @@ impl Worker {
                 HashMap::new()
             }
         };
-        // Qdrant и завершение
-        let mut rest = plans.into_iter();
-        while let Some((j, plan)) = rest.next() {
-            if self.stopped() {
-                let mut back = vec![j];
-                back.extend(rest.map(|(j, _)| j));
+        // точки пачки; чанк без эмбеддинга — неудача только своего задания
+        let mut ready: Vec<(Job, Plan)> = Vec::with_capacity(plans.len());
+        for (j, plan) in plans {
+            match plan_points(user, &plan, &embs) {
+                Ok(_) => ready.push((j, plan)),
+                Err(e) => self.fail(db, &j, &e.to_string()).await,
+            }
+        }
+        if self.stopped() {
+            let back: Vec<Job> = ready.into_iter().map(|(j, _)| j).collect();
+            self.release_all(db, &back).await;
+            return Err(Halt::Stopped);
+        }
+        // Qdrant: две записи на пачку (удалить старые точки узлов, записать новые), а не
+        // две на задание — на HDD каждая запись `wait=true` стоит десятки миллисекунд
+        let nodes: Vec<Id> = ready.iter().map(|(j, _)| j.target_id).collect();
+        let pts: Vec<IndexPoint> = ready
+            .iter()
+            .flat_map(|(_, p)| plan_points(user, p, &embs).unwrap_or_default())
+            .collect();
+        match self.write_points(user, &nodes, pts).await {
+            Ok(()) => {}
+            Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
+                let back: Vec<Job> = ready.into_iter().map(|(j, _)| j).collect();
                 self.release_all(db, &back).await;
-                return Err(Halt::Stopped);
+                return Err(Halt::Vector(e));
             }
-            let res = self.apply(user, &j, &plan, &embs).await;
-            match res {
-                Ok(()) => {}
-                Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
-                    let mut back = vec![j];
-                    back.extend(rest.map(|(j, _)| j));
-                    self.release_all(db, &back).await;
-                    return Err(Halt::Vector(e));
+            Err(e) => {
+                // пачка отклонена: по одному, чтобы неудачным стало только виновное задание
+                tracing::debug!(error = %e, "запись пачки в Qdrant отклонена, по одному узлу");
+                let mut keep = Vec::with_capacity(ready.len());
+                let mut rest = ready.into_iter();
+                while let Some((j, plan)) = rest.next() {
+                    let pts = plan_points(user, &plan, &embs).unwrap_or_default();
+                    match self.write_points(user, &[j.target_id], pts).await {
+                        Ok(()) => keep.push((j, plan)),
+                        Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
+                            // записанные уже подтверждены, но их задания тоже
+                            // возвращаются в очередь: повтор идемпотентен
+                            let mut back: Vec<Job> = keep.into_iter().map(|(j, _)| j).collect();
+                            back.push(j);
+                            back.extend(rest.map(|(j, _)| j));
+                            self.release_all(db, &back).await;
+                            return Err(Halt::Vector(e));
+                        }
+                        Err(e) => self.fail(db, &j, &e.to_string()).await,
+                    }
                 }
-                Err(e) => {
-                    self.fail(db, &j, &e.to_string()).await;
-                    continue;
-                }
+                ready = keep;
             }
+        }
+        // завершение заданий: только после подтверждённой записи
+        for (j, plan) in ready {
+            // свёртка предков ставится до закрытия задания: пустая очередь и ноль свёрток
+            // в статусе означают, что воркер закончил всё по этим узлам
+            let parent = get_node(db, j.target_id)
+                .await
+                .ok()
+                .and_then(|n| n.parent_id);
+            self.schedule_chain(user, db, parent).await;
             match complete_job(db, j.id, j.claim_gen).await {
                 Ok(JobOutcome::Done) => {
                     self.inner.jobs_done.fetch_add(1, Ordering::SeqCst);
@@ -901,49 +1260,41 @@ impl Worker {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(job = j.id, error = %e, "complete_job"),
             }
-            let parent = get_node(db, j.target_id)
-                .await
-                .ok()
-                .and_then(|n| n.parent_id);
-            self.schedule_chain(user, db, parent).await;
         }
         Ok(())
     }
 
-    /// Точки узла в Qdrant: удалить старые, записать текущие.
-    async fn apply(
+    /// Точки узлов в Qdrant: удалить старые точки `nodes`, записать `pts` (`wait=true`).
+    async fn write_points(
         &self,
         user: Id,
-        j: &Job,
-        plan: &Plan,
-        embs: &HashMap<String, Embedding>,
+        nodes: &[Id],
+        pts: Vec<IndexPoint>,
     ) -> Result<(), IndexError> {
-        let pts = match plan {
-            Plan::Delete => Vec::new(),
-            Plan::Upsert(chunks) => {
-                let mut pts = Vec::with_capacity(chunks.len());
-                for c in chunks {
-                    let e = embs.get(&embed_key(c)).ok_or_else(|| {
-                        IndexError::Other(format!("нет эмбеддинга чанка {}", c.id))
-                    })?;
-                    pts.push(chunk_point(user, c, e));
-                }
-                pts
-            }
-        };
-        self.deps.vector.delete_node(user, j.target_id).await?;
-        if !pts.is_empty() {
-            self.deps.vector.upsert(pts).await?;
+        if nodes.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let t = Instant::now();
+        let res = async {
+            self.deps.vector.delete_nodes(user, nodes).await?;
+            if !pts.is_empty() {
+                self.deps.vector.upsert(pts).await?;
+            }
+            Ok(())
+        }
+        .await;
+        add_us(&self.inner.qdrant_us, t);
+        res
     }
 
     /// Эмбеддинги по ключам: кэш `embeddings`, промахи — через модель пачками по
-    /// `batch_tokens` с уступкой между ними, результат сразу в кэш.
+    /// `batch_tokens` с уступкой между ними, результат сразу в кэш (`owner` — узел
+    /// служебных эмбеддингов L0; `None` — эмбеддинги чанков).
     async fn embed_cached(
         &self,
         db: &Db,
         items: Vec<EmbedItem>,
+        owner: Option<Id>,
     ) -> Result<HashMap<String, Embedding>, EmbedFail> {
         if items.is_empty() {
             return Ok(HashMap::new());
@@ -976,13 +1327,16 @@ impl Worker {
             let inputs: Vec<String> = misses[start..end].iter().map(|i| i.input.clone()).collect();
             let emb = self.deps.embedder.clone();
             let n = inputs.len();
+            let t = Instant::now();
             let out = tokio::task::spawn_blocking(move || {
                 let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
                 emb.embed_passages(&refs)
             })
-            .await
-            .map_err(|e| EmbedFail::Other(format!("поток инференса: {e}")))?
-            .map_err(EmbedFail::Other)?;
+            .await;
+            add_us(&self.inner.embed_us, t);
+            let out = out
+                .map_err(|e| EmbedFail::Other(format!("поток инференса: {e}")))?
+                .map_err(EmbedFail::Other)?;
             if out.len() != n {
                 return Err(EmbedFail::Other(format!(
                     "модель вернула {} векторов на {n} текстов",
@@ -996,9 +1350,11 @@ impl Worker {
                 .map(|i| i.key.clone())
                 .zip(out)
                 .collect();
-            put_embeddings(db, &model, batch.clone())
-                .await
-                .map_err(|e| EmbedFail::Other(format!("кэш эмбеддингов: {e}")))?;
+            match owner {
+                None => put_embeddings(db, &model, batch.clone()).await,
+                Some(o) => put_owned_embeddings(db, &model, o, batch.clone()).await,
+            }
+            .map_err(|e| EmbedFail::Other(format!("кэш эмбеддингов: {e}")))?;
             found.extend(batch);
             start = end;
             if start < misses.len() {
@@ -1022,7 +1378,7 @@ impl Worker {
             .iter()
             .filter(|c| c.level == ChunkLevel::Chunk)
             .filter_map(|c| {
-                embs.get(&embed_key(c))
+                embs.get(&c.embed_key)
                     .map(|e| (c.text.as_str(), &e.dense[..]))
             })
             .collect();
@@ -1038,20 +1394,29 @@ impl Worker {
             return;
         };
         let cands = rollup::candidate_sentences(&leaves, &center);
+        // ключи кандидатов — текущий набор служебных эмбеддингов заметки
+        let keys: Vec<String> = if cands.len() > 1 {
+            cands.iter().map(|s| keyed_hash("l0-sentence", s)).collect()
+        } else {
+            Vec::new()
+        };
+        if let Err(e) = prune_owned_embeddings(db, &self.model(), node, &keys).await {
+            tracing::debug!(node = %node, error = %e, "устаревшие эмбеддинги L0");
+        }
         let pick = match cands.len() {
             0 => return,
             1 => 0,
             _ => {
                 let items: Vec<EmbedItem> = cands
                     .iter()
-                    .map(|s| EmbedItem {
-                        key: keyed_hash("l0-sentence", s),
+                    .zip(&keys)
+                    .map(|(s, k)| EmbedItem {
+                        key: k.clone(),
                         input: s.clone(),
                         tokens: s.len() / 3 + 1,
                     })
                     .collect();
-                let keys: Vec<String> = items.iter().map(|i| i.key.clone()).collect();
-                let Ok(m) = self.embed_cached(db, items).await else {
+                let Ok(m) = self.embed_cached(db, items, Some(node)).await else {
                     return;
                 };
                 let vs: Vec<&[f32]> = keys
@@ -1098,6 +1463,8 @@ impl Worker {
                 Err(_) => break,
             };
         }
+        let n = self.rollups.due.len();
+        self.status(|s| s.rollups_pending = n);
     }
 
     /// Созревшие свёртки: глубокие папки раньше (L0 родителя строится из L0 детей).
@@ -1188,16 +1555,23 @@ impl Worker {
             return Ok(());
         }
         let Some(text) = l0 else {
+            if let Err(e) = prune_owned_embeddings(db, &self.model(), folder, &[]).await {
+                tracing::debug!(folder = %folder, error = %e, "устаревшие эмбеддинги L0 папки");
+            }
             return ok_or_vector(self.deps.vector.delete_node(user, folder).await);
         };
-        let input = format!("[{}/{}] {}\n{text}", space.name, f.path, f.name);
-        let key = keyed_hash("folder", &input);
+        let (input, key) = folder_embed(&space.name, &f.path, &f.name, &text);
+        if let Err(e) =
+            prune_owned_embeddings(db, &self.model(), folder, std::slice::from_ref(&key)).await
+        {
+            tracing::debug!(folder = %folder, error = %e, "устаревшие эмбеддинги L0 папки");
+        }
         let item = EmbedItem {
             key: key.clone(),
             input,
             tokens: text.len() / 3 + 1,
         };
-        let e = match self.embed_cached(db, vec![item]).await {
+        let e = match self.embed_cached(db, vec![item], Some(folder)).await {
             Ok(mut m) => match m.remove(&key) {
                 Some(e) => e,
                 None => return Ok(()),
@@ -1208,27 +1582,22 @@ impl Worker {
                 return Ok(());
             }
         };
-        let point = IndexPoint {
-            chunk_id: folder_chunk_id(folder),
-            dense: e.dense,
-            sparse: e.sparse,
-            payload: PointPayload {
-                user_id: user,
-                space_id: f.space_id,
-                space_kind: space.kind.as_str().to_string(),
-                solution_guid: space.solution_guid.clone(),
-                node_id: folder,
-                path_ancestors: path_ancestors(&f.path),
-                area: None,
-                level: "folder".into(),
-                kind: "folder".into(),
-                tags: Vec::new(),
-                updated_at: f.updated_at.as_second(),
-                rev: 0,
-                text_hash: key,
-            },
+        let info = IndexFolder {
+            node_id: folder,
+            space_id: f.space_id,
+            space_kind: space.kind,
+            space_name: space.name,
+            solution_guid: space.solution_guid,
+            path: f.path,
+            name: f.name,
+            l0: text,
+            updated_at: f.updated_at,
         };
-        ok_or_vector(self.deps.vector.upsert(vec![point]).await)
+        let point = folder_point(user, &info, e, key);
+        let t = Instant::now();
+        let res = self.deps.vector.upsert(vec![point]).await;
+        add_us(&self.inner.qdrant_us, t);
+        ok_or_vector(res)
     }
 }
 
@@ -1261,32 +1630,26 @@ async fn state_changed(rx: &mut Option<watch::Receiver<QdrantState>>) {
     }
 }
 
+pub use zam_store::{embed_input_of, embed_key_of};
+
 /// Текст для модели: `context_prefix` участвует в эмбеддинге (§8.2 п. 6).
 pub fn embed_input(c: &IndexChunk) -> String {
     embed_input_of(&c.context_prefix, &c.text)
 }
 
-/// [`embed_input`] по полям чанка (для чанков вне [`IndexChunk`], например листов поиска).
-pub fn embed_input_of(context_prefix: &str, text: &str) -> String {
-    if context_prefix.is_empty() {
-        text.to_string()
-    } else {
-        format!("{context_prefix}\n{text}")
-    }
-}
-
 /// Ключ кэша `embeddings` чанка: blake3 (hex) ровно той строки, что уходит в модель
-/// ([`embed_input`]). Используется воркером, пересборкой из кэша (задача 10) и выбором
-/// лучшего листа в поиске.
+/// ([`embed_input`]), по формуле [`embed_key_of`] — той же, что пишет `chunks.embed_key`.
+/// Воркер, пересборка из кэша и поиск берут готовый ключ из `chunks.embed_key`
+/// ([`IndexChunk::embed_key`]); эта функция — для проверки и чанков вне базы.
 pub fn embed_key(c: &IndexChunk) -> String {
     embed_key_of(&c.context_prefix, &c.text)
 }
 
-/// [`embed_key`] по полям чанка.
-pub fn embed_key_of(context_prefix: &str, text: &str) -> String {
-    blake3::hash(embed_input_of(context_prefix, text).as_bytes())
-        .to_hex()
-        .to_string()
+/// Текст эмбеддинга L0 папки и его ключ кэша (домен `folder`).
+pub(crate) fn folder_embed(space: &str, path: &str, name: &str, l0: &str) -> (String, String) {
+    let input = format!("[{space}/{path}] {name}\n{l0}");
+    let key = keyed_hash("folder", &input);
+    (input, key)
 }
 
 /// Ключ кэша `embeddings` для текста, которого нет среди чанков (предложение L0,
@@ -1317,8 +1680,51 @@ fn path_ancestors(path: &str) -> Vec<String> {
         .collect()
 }
 
+/// Точки узла по плану задания; нет эмбеддинга какого-либо чанка — ошибка.
+fn plan_points(
+    user: Id,
+    plan: &Plan,
+    embs: &HashMap<String, Embedding>,
+) -> Result<Vec<IndexPoint>, IndexError> {
+    match plan {
+        Plan::Delete => Ok(Vec::new()),
+        Plan::Upsert(chunks) => chunks
+            .iter()
+            .map(|c| {
+                embs.get(&c.embed_key)
+                    .map(|e| chunk_point(user, c, e))
+                    .ok_or_else(|| IndexError::Other(format!("нет эмбеддинга чанка {}", c.id)))
+            })
+            .collect(),
+    }
+}
+
+/// Точка уровня `folder` (одна на папку; `text_hash` — ключ кэша её L0).
+pub(crate) fn folder_point(user: Id, f: &IndexFolder, e: Embedding, key: String) -> IndexPoint {
+    IndexPoint {
+        chunk_id: folder_chunk_id(f.node_id),
+        dense: e.dense,
+        sparse: e.sparse,
+        payload: PointPayload {
+            user_id: user,
+            space_id: f.space_id,
+            space_kind: f.space_kind.as_str().to_string(),
+            solution_guid: f.solution_guid.clone(),
+            node_id: f.node_id,
+            path_ancestors: path_ancestors(&f.path),
+            area: None,
+            level: "folder".into(),
+            kind: "folder".into(),
+            tags: Vec::new(),
+            updated_at: f.updated_at.as_second(),
+            rev: 0,
+            text_hash: key,
+        },
+    }
+}
+
 /// Точка чанка заметки.
-fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint {
+pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint {
     IndexPoint {
         chunk_id: c.id.clone(),
         dense: e.dense.clone(),

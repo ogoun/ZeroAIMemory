@@ -175,6 +175,16 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Резидентная память процесса, байт (`/proc/<pid>/statm`, второе поле в страницах).
+#[cfg(unix)]
+pub fn rss_bytes(pid: u32) -> Option<u64> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf без побочных эффектов.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    Some(pages * u64::try_from(page).ok().filter(|p| *p > 0)?)
+}
+
 /// Имя процесса — `qdrant`.
 #[cfg(unix)]
 pub fn is_qdrant_process(pid: u32) -> bool {
@@ -250,6 +260,21 @@ mod win {
         Some(String::from_utf16_lossy(&buf[..len as usize]).into())
     }
 
+    /// Рабочий набор процесса (`GetProcessMemoryInfo`), байт.
+    pub(super) fn rss_bytes(pid: u32) -> Option<u64> {
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        let p = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let mut c = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: валидный handle, структура нужного размера на стеке.
+        unsafe { GetProcessMemoryInfo(p.0, &mut c, c.cb) }.ok()?;
+        Some(c.WorkingSetSize as u64)
+    }
+
     pub(super) fn terminate(pid: u32) {
         if let Some(p) = open(pid, PROCESS_TERMINATE) {
             // SAFETY: валидный handle с правом PROCESS_TERMINATE.
@@ -265,6 +290,12 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 /// Имя образа процесса — `qdrant.exe`.
+/// Резидентная память (рабочий набор) процесса, байт.
+#[cfg(windows)]
+pub fn rss_bytes(pid: u32) -> Option<u64> {
+    win::rss_bytes(pid)
+}
+
 #[cfg(windows)]
 pub fn is_qdrant_process(pid: u32) -> bool {
     win::image_path(pid)

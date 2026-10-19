@@ -4054,6 +4054,7 @@ version = "0.0.2-m1"
 dependencies = [
  "blake3",
  "fs4",
+ "futures-util",
  "jiff",
  "libc",
  "process-wrap",

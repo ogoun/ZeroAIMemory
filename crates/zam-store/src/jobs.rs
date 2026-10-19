@@ -161,8 +161,10 @@ pub struct IndexChunk {
     pub ordinal: i64,
     pub text: String,
     pub context_prefix: String,
-    /// blake3 hex текста — ключ кэша `embeddings`.
+    /// blake3 hex текста (payload точки, `chunk_id`).
     pub text_hash: String,
+    /// Ключ кэша `embeddings` (`chunks.embed_key`, [`crate::embed_key_of`]).
+    pub embed_key: String,
     pub token_count: i64,
     /// Ревизия, по которой построен чанк.
     pub rev: i64,
@@ -410,6 +412,40 @@ pub async fn enqueue_reindex(db: &Db, space: Option<Id>) -> Result<u64, StoreErr
     Ok(jobs)
 }
 
+/// Ключ `meta`: незавершённая пересборка индекса базы из кэша (reindex).
+const REINDEX_KEY: &str = "reindex_pending";
+
+/// Отмечает (`Some(spec)`) или снимает (`None`) незавершённую пересборку индекса базы:
+/// отметка ставится до удаления точек области и снимается после её восстановления, так что
+/// прерванный reindex (остановка, авария) повторяется при следующем запуске воркера.
+/// `spec` — описание запроса вызывающего (JSON).
+pub async fn mark_reindex(db: &Db, spec: Option<String>) -> Result<(), StoreError> {
+    db.write(move |tx| {
+        match spec {
+            Some(s) => tx.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                params![REINDEX_KEY, s],
+            )?,
+            None => tx.execute("DELETE FROM meta WHERE key = ?1", [REINDEX_KEY])?,
+        };
+        Ok(())
+    })
+    .await
+}
+
+/// Незавершённая пересборка индекса базы ([`mark_reindex`]), если есть.
+pub async fn pending_reindex(db: &Db) -> Result<Option<String>, StoreError> {
+    db.read(|c| {
+        Ok(c.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [REINDEX_KEY],
+            |r| r.get(0),
+        )
+        .optional()?)
+    })
+    .await
+}
+
 /// Счётчики очереди.
 pub async fn job_stats(db: &Db) -> Result<JobStats, StoreError> {
     db.read(|c| {
@@ -462,89 +498,302 @@ fn parse_level(s: &str) -> Option<ChunkLevel> {
 pub async fn chunks_for_index(db: &Db, node: Id) -> Result<Vec<IndexChunk>, StoreError> {
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
-        let row = tx
-            .query_row(
-                "SELECT n.space_id, s.kind, s.solution_guid, n.path, n.frontmatter,
-                        n.updated_at, n.kind, n.index_state, n.deleted_at IS NOT NULL
-                 FROM nodes n JOIN spaces s ON s.id = n.space_id
-                 WHERE n.id = ?1",
-                [node],
-                |r| {
-                    Ok((
-                        NodePayload {
-                            node_id: node,
-                            space_id: r.get(0)?,
-                            space_kind: r.get(1)?,
-                            solution_guid: r.get(2)?,
-                            path: r.get(3)?,
-                            path_ancestors: Vec::new(),
-                            tags: Vec::new(),
-                            updated_at: ts_at(r, 5)?,
-                        },
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, String>(6)?,
-                        r.get::<_, String>(7)?,
-                        r.get::<_, bool>(8)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((mut payload, fm, kind, state, deleted)) = row else {
-            return Err(StoreError::NotFound);
-        };
-        if deleted
-            || kind != "note"
-            || state == IndexState::Excluded.as_str()
-            || payload.space_kind == SpaceKind::Human
-        {
-            return Ok(Vec::new());
-        }
-        payload.path_ancestors = path_ancestors(&payload.path);
-        payload.tags = match fm.as_deref() {
-            Some(s) => crate::nodes::frontmatter_tags(s)
-                .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node}: {e}")))?,
-            None => Vec::new(),
-        };
-        let mut st = tx.prepare_cached(
-            "SELECT id, level, heading_path, ordinal, text, context_prefix, text_hash,
-                    token_count, rev
-             FROM chunks WHERE node_id = ?1 ORDER BY ordinal",
-        )?;
-        let rows = st.query_map([node], |r| {
+        index_chunks(&tx, node)
+    })
+    .await
+}
+
+/// Строка чанка: `(id, level, heading_path, ordinal)` и
+/// `(text, context_prefix, text_hash, token_count, rev, embed_key)`.
+type ChunkRowRead = (
+    (String, String, String, i64),
+    (String, String, String, i64, i64, Option<String>),
+);
+
+/// [`chunks_for_index`] внутри открытой транзакции чтения.
+fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError> {
+    let row = tx
+        .prepare_cached(
+            "SELECT n.space_id, s.kind, s.solution_guid, n.path, n.frontmatter,
+                    n.updated_at, n.kind, n.index_state, n.deleted_at IS NOT NULL
+             FROM nodes n JOIN spaces s ON s.id = n.space_id
+             WHERE n.id = ?1",
+        )?
+        .query_row([node], |r| {
             Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
+                NodePayload {
+                    node_id: node,
+                    space_id: r.get(0)?,
+                    space_kind: r.get(1)?,
+                    solution_guid: r.get(2)?,
+                    path: r.get(3)?,
+                    path_ancestors: Vec::new(),
+                    tags: Vec::new(),
+                    updated_at: ts_at(r, 5)?,
+                },
+                r.get::<_, Option<String>>(4)?,
                 r.get::<_, String>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, i64>(8)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, bool>(8)?,
             ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, level, heading_path, ordinal, text, context_prefix, text_hash, tokens, rev) =
-                row?;
-            // папки и вложения (этап M3) векторизуются не здесь
-            let Some(level) = parse_level(&level) else {
-                continue;
-            };
-            out.push(IndexChunk {
-                id,
-                level,
-                heading_path,
-                ordinal,
-                text,
-                context_prefix,
-                text_hash,
-                token_count: tokens,
+        })
+        .optional()?;
+    let Some((mut payload, fm, kind, state, deleted)) = row else {
+        return Err(StoreError::NotFound);
+    };
+    if deleted
+        || kind != "note"
+        || state == IndexState::Excluded.as_str()
+        || payload.space_kind == SpaceKind::Human
+    {
+        return Ok(Vec::new());
+    }
+    payload.path_ancestors = path_ancestors(&payload.path);
+    payload.tags = match fm.as_deref() {
+        Some(s) => crate::nodes::frontmatter_tags(s)
+            .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node}: {e}")))?,
+        None => Vec::new(),
+    };
+    let mut st = tx.prepare_cached(
+        "SELECT id, level, heading_path, ordinal, text, context_prefix, text_hash,
+                token_count, rev, embed_key
+         FROM chunks WHERE node_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = st.query_map([node], |r| -> rusqlite::Result<ChunkRowRead> {
+        Ok((
+            (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
+            (
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+            ),
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (
+            (id, level, heading_path, ordinal),
+            (text, context_prefix, text_hash, tokens, rev, key),
+        ) = row?;
+        // папки и вложения (этап M3) векторизуются не здесь
+        let Some(level) = parse_level(&level) else {
+            continue;
+        };
+        // строка без ключа (вставлена в обход записи чанков) — ключ по той же формуле
+        let embed_key = key
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| crate::embed_key_of(&context_prefix, &text));
+        out.push(IndexChunk {
+            id,
+            level,
+            heading_path,
+            ordinal,
+            text,
+            context_prefix,
+            text_hash,
+            embed_key,
+            token_count: tokens,
+            rev,
+            node: payload.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Условие «живая индексируемая заметка» (алиасы: `n` — nodes, `s` — spaces): то, что
+/// должно лежать в векторном индексе.
+const INDEXABLE: &str = "n.kind = 'note' AND n.deleted_at IS NULL
+     AND n.index_state <> 'excluded' AND s.kind <> 'human'";
+
+/// Заметка для пересборки индекса из кэша: текущая ревизия и её чанки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReindexNote {
+    pub node_id: Id,
+    pub rev: i64,
+    pub chunks: Vec<IndexChunk>,
+}
+
+/// Страница живых индексируемых заметок пространства `space` (`None` — всех) с чанками:
+/// по возрастанию id после `after`, не больше `limit` заметок, одним снимком чтения.
+pub async fn reindex_page(
+    db: &Db,
+    space: Option<Id>,
+    after: Option<Id>,
+    limit: usize,
+) -> Result<Vec<ReindexNote>, StoreError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let ids: Vec<(Id, i64)> = {
+            let mut st = tx.prepare_cached(&format!(
+                "SELECT n.id, n.current_rev FROM nodes n JOIN spaces s ON s.id = n.space_id
+                 WHERE {INDEXABLE}
+                   AND (?1 IS NULL OR n.space_id = ?1) AND (?2 IS NULL OR n.id > ?2)
+                 ORDER BY n.id LIMIT ?3"
+            ))?;
+            st.query_map(params![space, after, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for (node_id, rev) in ids {
+            out.push(ReindexNote {
+                node_id,
                 rev,
-                node: payload.clone(),
+                chunks: index_chunks(&tx, node_id)?,
             });
         }
         Ok(out)
+    })
+    .await
+}
+
+/// Число живых индексируемых заметок пространства `space` (`None` — всех).
+pub async fn indexable_count(db: &Db, space: Option<Id>) -> Result<i64, StoreError> {
+    db.read(move |c| {
+        Ok(c.query_row(
+            &format!(
+                "SELECT count(*) FROM nodes n JOIN spaces s ON s.id = n.space_id
+                 WHERE {INDEXABLE} AND (?1 IS NULL OR n.space_id = ?1)"
+            ),
+            [space],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+}
+
+/// Ставит `upsert` (приоритет reindex) живым индексируемым заметкам из `nodes` по их
+/// текущей ревизии и переводит их в `pending`: эмбеддингов в кэше нет, нужен инференс.
+/// Возвращает число поставленных заданий.
+pub async fn enqueue_upserts(db: &Db, nodes: Vec<Id>) -> Result<u64, StoreError> {
+    if nodes.is_empty() {
+        return Ok(0);
+    }
+    db.write(move |tx| {
+        let now = fmt_ts(Timestamp::now());
+        let mut pick = tx.prepare_cached(&format!(
+            "UPDATE nodes SET index_state = 'pending'
+             WHERE id = ?1 AND EXISTS (SELECT 1 FROM nodes n JOIN spaces s ON s.id = n.space_id
+                                       WHERE n.id = ?1 AND {INDEXABLE})
+             RETURNING current_rev"
+        ))?;
+        let mut jobs = 0u64;
+        for node in nodes {
+            let rev: Option<i64> = pick.query_row([node], |r| r.get(0)).optional()?;
+            if let Some(rev) = rev {
+                enqueue(tx, node, rev, JobOp::Upsert, PRIORITY_REINDEX, &now)?;
+                jobs += 1;
+            }
+        }
+        Ok(jobs)
+    })
+    .await
+}
+
+/// Точки заметок `(узел, ревизия)` восстановлены из кэша и подтверждены Qdrant:
+/// неудавшиеся (`failed`) задания этих узлов снимаются, узел без активного задания —
+/// `indexed` по этой ревизии. Переписанный с тех пор узел не меняется (его задание впереди).
+pub async fn finish_reindexed(db: &Db, items: Vec<(Id, i64)>) -> Result<(), StoreError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    db.write(move |tx| {
+        let mut drop_failed = tx.prepare_cached(
+            "DELETE FROM index_jobs
+             WHERE target_kind = 'node' AND target_id = ?1 AND state = 'failed'",
+        )?;
+        let mut active = tx.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM index_jobs
+                            WHERE target_kind = 'node' AND target_id = ?1
+                              AND state IN ('queued', 'running'))",
+        )?;
+        for (node, rev) in items {
+            drop_failed.execute([node])?;
+            let busy: bool = active.query_row([node], |r| r.get(0))?;
+            if !busy {
+                set_state(tx, node, rev, IndexState::Indexed)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Задание, ушедшее в `failed` (для `/index/status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedJob {
+    pub node_id: Id,
+    pub op: JobOp,
+    pub attempts: i64,
+    /// Последняя ошибка (без текста заметок).
+    pub error: Option<String>,
+    pub updated_at: Timestamp,
+}
+
+/// До `limit` заданий `failed`, новые первыми.
+pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT target_id, op, attempts, last_error, updated_at FROM index_jobs
+             WHERE state = 'failed' ORDER BY updated_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = st.query_map([limit], |r| {
+            Ok(FailedJob {
+                node_id: r.get(0)?,
+                op: r.get(1)?,
+                attempts: r.get(2)?,
+                error: r.get(3)?,
+                updated_at: ts_at(r, 4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// Папка с L0 для точки уровня `folder` (пересборка индекса из кэша).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexFolder {
+    pub node_id: Id,
+    pub space_id: Id,
+    pub space_kind: SpaceKind,
+    pub space_name: String,
+    pub solution_guid: Option<String>,
+    pub path: String,
+    pub name: String,
+    pub l0: String,
+    pub updated_at: Timestamp,
+}
+
+/// Живые папки с L0 пространства `space` (`None` — всех), кроме Human.
+pub async fn folders_for_index(db: &Db, space: Option<Id>) -> Result<Vec<IndexFolder>, StoreError> {
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT n.id, n.space_id, s.kind, s.name, s.solution_guid, n.path, n.name, n.l0,
+                    n.updated_at
+             FROM nodes n JOIN spaces s ON s.id = n.space_id
+             WHERE n.kind = 'folder' AND n.deleted_at IS NULL AND n.l0 IS NOT NULL
+               AND s.kind <> 'human' AND (?1 IS NULL OR n.space_id = ?1)
+             ORDER BY n.id",
+        )?;
+        let rows = st.query_map([space], |r| {
+            Ok(IndexFolder {
+                node_id: r.get(0)?,
+                space_id: r.get(1)?,
+                space_kind: r.get(2)?,
+                space_name: r.get(3)?,
+                solution_guid: r.get(4)?,
+                path: r.get(5)?,
+                name: r.get(6)?,
+                l0: r.get(7)?,
+                updated_at: ts_at(r, 8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
 }

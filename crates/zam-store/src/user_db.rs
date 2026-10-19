@@ -33,6 +33,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: include_str!("../migrations/user/0004_index.sql"),
     },
+    Migration {
+        version: 5,
+        sql: include_str!("../migrations/user/0005_embed_key.sql"),
+    },
 ];
 
 /// Вид пространства.
@@ -118,6 +122,8 @@ impl UserDbs {
 
     /// База пользователя: открывается лениво (с миграцией и копией) и кэшируется.
     ///
+    /// Чанки без `embed_key` (созданные до v5) получают ключ сразу, до возврата базы.
+    ///
     /// Если база только что обновлена до v4, разовая перечанковка (R1) запускается
     /// фоновой задачей tokio один раз на открытие: `get` её не ждёт, записи во время
     /// неё безопасны (пакеты идемпотентны и читают текущую ревизию в своей транзакции).
@@ -130,6 +136,7 @@ impl UserDbs {
         }
         let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
         ensure_fixed_spaces(&db).await?;
+        crate::nodes::backfill_embed_keys(&db).await?;
         let pending = rechunk_pending(&db).await? && !clear_rechunk_if_empty(&db).await?;
         let (done, rechunked) = watch::channel(!pending);
         open.insert(

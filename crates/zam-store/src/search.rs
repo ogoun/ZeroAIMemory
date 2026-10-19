@@ -553,6 +553,8 @@ pub struct LeafChunk {
     pub ordinal: i64,
     pub text: String,
     pub context_prefix: String,
+    /// Ключ кэша `embeddings` (`chunks.embed_key`): эмбеддинг листа без чтения текста.
+    pub embed_key: String,
 }
 
 /// Листы (`level = 'chunk'`) узла по порядку.
@@ -566,7 +568,7 @@ pub async fn node_leaves(db: &Db, node: Id) -> Result<Vec<LeafChunk>, StoreError
 /// Листы нескольких узлов одним запросом: `узел → листы по порядку`; узла без листов
 /// в ответе нет (замена сводок листами в поиске — без запроса на каждую сводку).
 /// `with_text = false` — без `text` и `context_prefix` (пустые строки): тексты сотен
-/// листов не читаются, если нужны только пути и порядок.
+/// листов не читаются, если нужны только пути, порядок и ключи кэша эмбеддингов.
 pub async fn leaves_of_nodes(
     db: &Db,
     nodes: Vec<Id>,
@@ -582,7 +584,8 @@ pub async fn leaves_of_nodes(
         let mut st = tx.prepare_cached(
             "SELECT id, heading_path, ordinal,
                     CASE WHEN ?2 THEN text ELSE '' END,
-                    CASE WHEN ?2 THEN context_prefix ELSE '' END
+                    CASE WHEN ?2 THEN context_prefix ELSE '' END,
+                    embed_key
              FROM chunks WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
         )?;
         let mut out: HashMap<Id, Vec<LeafChunk>> = HashMap::new();
@@ -594,6 +597,8 @@ pub async fn leaves_of_nodes(
                     ordinal: r.get(2)?,
                     text: r.get(3)?,
                     context_prefix: r.get(4)?,
+                    // NULL только у строк в обход записи чанков (база дозаполняется при открытии)
+                    embed_key: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 })
             })?;
             let leaves: Vec<LeafChunk> = rows.collect::<Result<_, _>>()?;
@@ -602,27 +607,6 @@ pub async fn leaves_of_nodes(
             }
         }
         Ok(out)
-    })
-    .await
-}
-
-/// Тексты чанков `ids`: `chunk_id → (text, context_prefix)`; отсутствующие пропускаются.
-/// Одним запросом (дочитать тексты только отобранных листов).
-pub async fn chunk_texts(
-    db: &Db,
-    ids: Vec<String>,
-) -> Result<HashMap<String, (String, String)>, StoreError> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let list = serde_json::Value::from(ids).to_string();
-    db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT c.id, c.text, c.context_prefix
-             FROM json_each(?1) j CROSS JOIN chunks c ON c.id = j.value",
-        )?;
-        let rows = st.query_map([list], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
-        Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
 }

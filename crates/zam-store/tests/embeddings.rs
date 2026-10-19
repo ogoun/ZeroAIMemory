@@ -99,3 +99,135 @@ async fn corrupt_blob_is_error() {
     let err = get_embeddings(&db, "m", &["h".into()]).await.unwrap_err();
     assert!(matches!(err, zam_store::StoreError::Corrupt(_)), "{err}");
 }
+
+/// Сборка мусора: строки чанков без ссылки из `chunks.embed_key` и служебные строки
+/// удалённых узлов уходят (пачками), живые — остаются; устаревшие служебные строки
+/// живого узла снимает `prune_owned_embeddings`.
+#[tokio::test]
+async fn gc_removes_orphans_and_prune_keeps_current_set() {
+    use zam_store::{
+        Attribution, AuthorKind, NewNote, NodePath, SpaceKind, create_note, delete_node,
+        gc_embeddings, list_spaces, prune_owned_embeddings, put_owned_embeddings,
+    };
+    let db = setup("gc").await;
+    let k = list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    let note = |p: &str| NewNote {
+        space_id: k,
+        path: NodePath::parse(p).unwrap(),
+        content: "# Т\n\nтекст заметки про сборку.\n".into(),
+        l0: None,
+        attrib: Attribution::new(AuthorKind::Agent),
+    };
+    let live = create_note(&db, note("live")).await.unwrap().id;
+    let gone = create_note(&db, note("gone")).await.unwrap().id;
+    let keys = |n: Id| {
+        let db = db.clone();
+        async move {
+            db.read(move |c| {
+                let mut st = c.prepare("SELECT embed_key FROM chunks WHERE node_id = ?1")?;
+                let rows = st.query_map([n], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let live_keys = keys(live).await;
+    let gone_keys = keys(gone).await;
+    let m = "m@1";
+    let mut rows: Vec<(String, Embedding)> = live_keys
+        .iter()
+        .chain(&gone_keys)
+        .map(|k| (k.clone(), sample(1.0)))
+        .collect();
+    // сироты без ссылок — больше одной пачки
+    rows.extend((0..7).map(|i| (format!("orphan{i}"), sample(2.0))));
+    put_embeddings(&db, m, rows.clone()).await.unwrap();
+    put_embeddings(&db, "other@2", rows).await.unwrap();
+    put_owned_embeddings(
+        &db,
+        m,
+        live,
+        vec![("l0a".into(), sample(3.0)), ("l0b".into(), sample(3.0))],
+    )
+    .await
+    .unwrap();
+    put_owned_embeddings(&db, m, gone, vec![("l0g".into(), sample(3.0))])
+        .await
+        .unwrap();
+    delete_node(&db, gone).await.unwrap();
+
+    let count = || {
+        let db = db.clone();
+        async move {
+            db.read(|c| {
+                Ok(c.query_row("SELECT count(*) FROM embeddings", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let total = count().await;
+    // пачками по 4: сироты обеих моделей, ключи удалённой заметки, служебная строка удалённой
+    let mut deleted = 0;
+    loop {
+        let n = gc_embeddings(&db, 4).await.unwrap();
+        assert!(n <= 4);
+        deleted += n;
+        if n < 4 {
+            break;
+        }
+    }
+    let want = 2 * (7 + gone_keys.len() as u64) + 1;
+    assert_eq!(deleted, want);
+    assert_eq!(count().await, total - want as i64);
+    let left = get_embeddings(
+        &db,
+        m,
+        &[
+            live_keys.clone(),
+            vec!["l0a".into(), "l0b".into(), "l0g".into(), "orphan0".into()],
+        ]
+        .concat(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(left.len(), live_keys.len() + 2);
+    assert!(!left.contains_key("l0g") && !left.contains_key("orphan0"));
+    assert_eq!(gc_embeddings(&db, 4).await.unwrap(), 0);
+
+    // текущий набор L0 узла — только l0b
+    assert_eq!(
+        prune_owned_embeddings(&db, m, live, &["l0b".into()])
+            .await
+            .unwrap(),
+        1
+    );
+    let l0 = get_embeddings(&db, m, &["l0a".into(), "l0b".into()])
+        .await
+        .unwrap();
+    assert_eq!(l0.keys().collect::<Vec<_>>(), vec!["l0b"]);
+
+    // база с чанком без ключа (до v5) — сборка мусора ничего не трогает
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE chunks SET embed_key = NULL WHERE rowid = (SELECT min(rowid) FROM chunks)",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    put_embeddings(&db, m, vec![("orphan-late".into(), sample(4.0))])
+        .await
+        .unwrap();
+    assert_eq!(gc_embeddings(&db, 100).await.unwrap(), 0);
+}

@@ -37,7 +37,7 @@ pub use config::{
     ExternalConfig, ManagedConfig, QDRANT_VERSION, RestartPolicy, SupervisorConfig, default_binary,
     qdrant_exe_name,
 };
-pub use process::{is_qdrant_process, pid_alive};
+pub use process::{is_qdrant_process, pid_alive, rss_bytes};
 
 use crate::{IndexError, QdrantIndex, VectorIndex};
 
@@ -66,6 +66,8 @@ struct Shared {
     storage_rebuilt: AtomicBool,
     /// pid текущего процесса; 0 — процесса нет.
     pid: AtomicU32,
+    /// Перезапусков после падения с момента старта супервизора (`/index/status`).
+    restarts: AtomicU32,
 }
 
 /// Супервизор процесса Qdrant (или описание внешнего Qdrant).
@@ -142,6 +144,7 @@ impl Supervisor {
             state: state_tx,
             storage_rebuilt: AtomicBool::new(rebuilt),
             pid: AtomicU32::new(0),
+            restarts: AtomicU32::new(0),
         });
         let (stop_tx, stop_rx) = watch::channel(false);
         let ctx = Ctx {
@@ -186,6 +189,20 @@ impl Supervisor {
     pub fn pid(&self) -> Option<u32> {
         let pid = self.shared.as_ref()?.pid.load(Ordering::SeqCst);
         (pid != 0).then_some(pid)
+    }
+
+    /// Перезапусков Qdrant после падения с момента старта (external — 0).
+    pub fn restarts(&self) -> u32 {
+        self.shared
+            .as_ref()
+            .map_or(0, |s| s.restarts.load(Ordering::SeqCst))
+    }
+
+    /// Резидентная память процесса Qdrant из ОС, байт (метрика `zam_qdrant_rss_bytes`,
+    /// §17): Windows — `GetProcessMemoryInfo`, Linux — `/proc/<pid>/statm`. Нет процесса
+    /// (external, ещё не запущен) — `None`.
+    pub fn rss_bytes(&self) -> Option<u64> {
+        rss_bytes(self.pid()?)
     }
 
     /// Хранилище стёрто (метка версии, panic хранилища или `qdrant reset`) и пересборка
@@ -356,6 +373,7 @@ async fn supervise(ctx: &mut Ctx) {
                     match wiped {
                         Ok(Ok(())) => {
                             ctx.shared.storage_rebuilt.store(true, Ordering::SeqCst);
+                            ctx.shared.restarts.fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
                         Ok(Err(e)) => {
@@ -399,6 +417,7 @@ async fn supervise(ctx: &mut Ctx) {
                     attempt: n,
                     next_in,
                 });
+                ctx.shared.restarts.fetch_add(1, Ordering::SeqCst);
                 tokio::select! {
                     () = tokio::time::sleep(next_in) => {}
                     () = wait_stop(&mut ctx.stop) => return,

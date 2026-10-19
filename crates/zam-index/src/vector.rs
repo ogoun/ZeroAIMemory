@@ -105,7 +105,17 @@ pub trait VectorIndex: Send + Sync {
     fn upsert(&self, pts: Vec<IndexPoint>) -> IndexFuture<'_, ()>;
 
     /// Удаляет все точки узла пользователя (по фильтру `user_id` + `node_id`), `wait=true`.
-    fn delete_node(&self, user: Id, node: Id) -> IndexFuture<'_, ()>;
+    fn delete_node(&self, user: Id, node: Id) -> IndexFuture<'_, ()> {
+        Box::pin(async move { self.delete_nodes(user, &[node]).await })
+    }
+
+    /// Удаляет все точки узлов `nodes` пользователя одной операцией, `wait=true`
+    /// (пачка заданий воркера).
+    fn delete_nodes<'a>(&'a self, user: Id, nodes: &'a [Id]) -> IndexFuture<'a, ()>;
+
+    /// Удаляет точки области по фильтру (тенант, пространства, префикс пути; пустой
+    /// `levels` — все уровни), `wait=true`: reindex области из кэша `embeddings`.
+    fn delete_scope<'a>(&'a self, f: &'a VectorFilter) -> IndexFuture<'a, ()>;
 
     /// Гибридный поиск: prefetch dense и sparse по чанкам + dense по заметкам и секциям,
     /// слияние RRF.

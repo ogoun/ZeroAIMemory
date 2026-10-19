@@ -86,7 +86,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zam_core::Id;
-use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, embed_key_of};
+use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex};
 use zam_ml::Embedding;
 use zam_search::{
     ChunkMeta, Cost, Fit, LeafRef, Level, Ranked, SearchInputs, Weights, cap_per_node,
@@ -96,9 +96,9 @@ use zam_search::{
 use zam_store::time::fmt_ts;
 use zam_store::{
     ChunkScope, Db, FtsChannels, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
-    chunk_texts, count_tokens, get_embeddings, get_node, get_solution, leaf_term_hits,
-    leaves_of_nodes, list_spaces, live_chunks, neighbor_leaves, node_content, pending_count,
-    query_needles, search_fts_channels, text_snippet,
+    count_tokens, get_embeddings, get_node, get_solution, leaf_term_hits, leaves_of_nodes,
+    list_spaces, live_chunks, neighbor_leaves, node_content, pending_count, query_needles,
+    search_fts_channels, text_snippet,
 };
 
 use super::json_body;
@@ -330,10 +330,9 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 ///   ([`query_needles`]), при равенстве — первый; ни одного — сводка остаётся как есть
 ///   (как в M1).
 ///
-/// Всё пакетно, без запроса на каждую сводку: совпадения слов — по индексу FTS без
-/// чтения текстов листов; при векторе — пути листов всех узлов одним чтением, тексты
-/// (из них строится ключ кэша `embeddings`) — только листов-кандидатов одним запросом,
-/// эмбеддинги — одним `get_embeddings`.
+/// Всё пакетно, без запроса на каждую сводку и без чтения текстов листов: совпадения
+/// слов — по индексу FTS; при векторе — пути и ключи кэша (`chunks.embed_key`) листов
+/// всех узлов одним чтением, эмбеддинги листов-кандидатов — одним `get_embeddings`.
 async fn best_leaves(
     db: &Db,
     summaries: &[&Ranked],
@@ -349,7 +348,7 @@ async fn best_leaves(
     let fits = |r: &Ranked, hp: &str| r.level == Level::Note || in_section(hp, &r.heading_path);
     let mut out: HashMap<String, LeafRef> = HashMap::new();
     if let Some((q, model)) = query {
-        // пути листов без текстов; тексты (для ключа кэша) — только листов-кандидатов
+        // пути и ключи кэша листов без текстов; эмбеддинги — только листов-кандидатов
         let leaves = leaves_of_nodes(db, nodes.clone(), false).await?;
         let mut need: Vec<String> = summaries
             .iter()
@@ -358,19 +357,13 @@ async fn best_leaves(
                     .get(&r.node_id)
                     .into_iter()
                     .flatten()
-                    .filter(|l| fits(r, &l.heading_path))
-                    .map(|l| l.chunk_id.clone())
+                    .filter(|l| fits(r, &l.heading_path) && !l.embed_key.is_empty())
+                    .map(|l| l.embed_key.clone())
             })
             .collect();
         need.sort();
         need.dedup();
-        let texts = chunk_texts(db, need).await?;
-        let keys: HashMap<&str, String> = texts
-            .iter()
-            .map(|(id, (text, prefix))| (id.as_str(), embed_key_of(prefix, text)))
-            .collect();
-        let all: Vec<String> = keys.values().cloned().collect();
-        let embs = get_embeddings(db, model, &all).await?;
+        let embs = get_embeddings(db, model, &need).await?;
         for r in summaries {
             let best = leaves
                 .get(&r.node_id)
@@ -378,7 +371,7 @@ async fn best_leaves(
                 .flatten()
                 .filter(|l| fits(r, &l.heading_path))
                 .filter_map(|l| {
-                    let e = embs.get(keys.get(l.chunk_id.as_str())?)?;
+                    let e = embs.get(&l.embed_key)?;
                     Some((dot(q, &e.dense), l))
                 })
                 .max_by(|a, b| a.0.total_cmp(&b.0));
@@ -1135,7 +1128,10 @@ mod tests {
         fn upsert(&self, _: Vec<zam_index::IndexPoint>) -> zam_index::IndexFuture<'_, ()> {
             unreachable!()
         }
-        fn delete_node(&self, _: Id, _: Id) -> zam_index::IndexFuture<'_, ()> {
+        fn delete_scope<'a>(&'a self, _: &'a VectorFilter) -> zam_index::IndexFuture<'a, ()> {
+            unreachable!()
+        }
+        fn delete_nodes<'a>(&'a self, _: Id, _: &'a [Id]) -> zam_index::IndexFuture<'a, ()> {
             unreachable!()
         }
         fn search<'a>(

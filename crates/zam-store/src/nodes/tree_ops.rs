@@ -17,6 +17,7 @@ use super::chunks::{
 };
 use super::write::{ensure_ancestors, ensure_free};
 use super::{NODE_COLS, Node, NodeKind, live_by_path, load_node, node_row, revision_text};
+use crate::embeddings::embed_key_of;
 use crate::jobs::{JobOp, PRIORITY_WRITE, enqueue};
 use crate::paths::NodePath;
 use crate::time::fmt_ts;
@@ -244,7 +245,7 @@ fn raw_deleted_at(c: &Connection, id: Id) -> Result<Option<String>, StoreError> 
     )
 }
 
-/// Пересчитывает `context_prefix` чанков узла по его текущим пути, имени и тегам
+/// Пересчитывает `context_prefix` и `embed_key` чанков узла по его текущим пути, имени и тегам
 /// (триггер `chunks_au` обновляет FTS). У папки и удалённого узла чанков нет.
 fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), StoreError> {
     let (path, name, fm): (String, String, Option<String>) = c.query_row(
@@ -257,17 +258,18 @@ fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), Stor
             .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node_id}: {e}")))?,
         None => Vec::new(),
     };
-    let chunks: Vec<(i64, String)> = {
-        let mut st = c.prepare_cached("SELECT seq, heading_path FROM chunks WHERE node_id = ?1")?;
-        st.query_map([node_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let chunks: Vec<(i64, String, String)> = {
+        let mut st =
+            c.prepare_cached("SELECT seq, heading_path, text FROM chunks WHERE node_id = ?1")?;
+        st.query_map([node_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?
     };
-    let mut upd = c.prepare_cached("UPDATE chunks SET context_prefix = ?2 WHERE seq = ?1")?;
-    for (seq, heading) in chunks {
-        upd.execute(params![
-            seq,
-            context_prefix(space, &path, &name, &heading, &tags)
-        ])?;
+    // ключ кэша зависит от префикса: пересчитывается вместе с ним
+    let mut upd =
+        c.prepare_cached("UPDATE chunks SET context_prefix = ?2, embed_key = ?3 WHERE seq = ?1")?;
+    for (seq, heading, text) in chunks {
+        let prefix = context_prefix(space, &path, &name, &heading, &tags);
+        upd.execute(params![seq, prefix, embed_key_of(&prefix, &text)])?;
     }
     Ok(())
 }

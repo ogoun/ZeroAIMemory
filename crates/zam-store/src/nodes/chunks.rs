@@ -21,6 +21,7 @@ use zam_markdown::{
 };
 
 use super::{hex, revision_text};
+use crate::embeddings::embed_key_of;
 use crate::jobs::{JobOp, PRIORITY_WRITE, enqueue};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
@@ -276,11 +277,12 @@ pub(crate) fn rebuild_chunks(
     let chunks = note_chunks(content, &meta.doc, &name, tc.as_ref());
     let mut st = c.prepare_cached(
         "INSERT INTO chunks (id, node_id, rev, level, heading_path, ordinal, text,
-                             context_prefix, token_count, text_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                             context_prefix, token_count, text_hash, embed_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for (ordinal, ch) in chunks.iter().enumerate() {
         let ordinal = ordinal as i64;
+        let prefix = context_prefix(&space, &path, &name, &ch.heading_path, tags);
         st.execute(params![
             chunk_id(node_id, ordinal, &ch.text_hash),
             node_id,
@@ -289,12 +291,51 @@ pub(crate) fn rebuild_chunks(
             ch.heading_path,
             ordinal,
             ch.text,
-            context_prefix(&space, &path, &name, &ch.heading_path, tags),
+            prefix,
             ch.token_count,
             ch.text_hash,
+            embed_key_of(&prefix, &ch.text),
         ])?;
     }
     Ok(chunks.len())
+}
+
+/// Строк в одной транзакции дозаполнения `embed_key`.
+const BACKFILL_BATCH: i64 = 500;
+
+/// Дозаполняет `chunks.embed_key` у строк, созданных до миграции v5 (формула ключа —
+/// только в Rust, SQL-миграция её не посчитает). Пакетами по [`BACKFILL_BATCH`] строк
+/// в отдельных транзакциях; повторный вызов безопасен. Возвращает число строк.
+pub(crate) async fn backfill_embed_keys(db: &Db) -> Result<u64, StoreError> {
+    let mut total = 0u64;
+    loop {
+        let n = db
+            .write(|tx| {
+                let rows: Vec<(i64, String, String)> = {
+                    let mut st = tx.prepare_cached(
+                        "SELECT seq, context_prefix, text FROM chunks
+                         WHERE embed_key IS NULL LIMIT ?1",
+                    )?;
+                    st.query_map([BACKFILL_BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                        .collect::<Result<_, _>>()?
+                };
+                let mut upd =
+                    tx.prepare_cached("UPDATE chunks SET embed_key = ?2 WHERE seq = ?1")?;
+                for (seq, prefix, text) in &rows {
+                    upd.execute(params![seq, embed_key_of(prefix, text)])?;
+                }
+                Ok(rows.len() as u64)
+            })
+            .await?;
+        total += n;
+        if n < BACKFILL_BATCH as u64 {
+            break;
+        }
+    }
+    if total > 0 {
+        tracing::info!(chunks = total, "ключи кэша эмбеддингов дозаполнены (v5)");
+    }
+    Ok(total)
 }
 
 /// Ставит задание индексации по уже записанному `nodes.index_state` узла.

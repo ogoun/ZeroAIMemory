@@ -18,11 +18,16 @@ pub mod user_db;
 pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, resolve_attachment};
 pub use datadir::DataDir;
 pub use db::{Db, DbOptions};
-pub use embeddings::{Embedding, get_embeddings, put_embeddings};
+pub use embeddings::{
+    Embedding, embed_input_of, embed_key_of, gc_embeddings, get_embeddings, prune_owned_embeddings,
+    put_embeddings, put_owned_embeddings,
+};
 pub use jobs::{
-    IndexChunk, IndexState, Job, JobOp, JobOutcome, JobStats, NodePayload, chunks_for_index,
-    claim_jobs, complete_job, enqueue_reindex, fail_job, indexed_count, job_stats, release_job,
-    requeue_running, set_index_state,
+    FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats, NodePayload,
+    ReindexNote, chunks_for_index, claim_jobs, complete_job, enqueue_reindex, enqueue_upserts,
+    fail_job, failed_jobs, finish_reindexed, folders_for_index, indexable_count, indexed_count,
+    job_stats, mark_reindex, pending_reindex, reindex_page, release_job, requeue_running,
+    set_index_state,
 };
 pub use migrate::Migration;
 pub use nodes::{
@@ -35,8 +40,8 @@ pub use nodes::{
 pub use paths::NodePath;
 pub use search::{
     ChunkScope, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END, MARK_START,
-    chunk_texts, leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves, node_leaves,
-    pending_count, query_needles, sanitize_fts, search_fts, search_fts_channels, text_snippet,
+    leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves, node_leaves, pending_count,
+    query_needles, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,
@@ -71,4 +76,22 @@ pub enum StoreError {
     InvalidMigrations(String),
     #[error("база закрыта или операция аварийно прервана")]
     Closed,
+}
+
+impl StoreError {
+    /// Файл базы повреждён или не читается этой версией: повтор не поможет (нужны
+    /// восстановление из копии или обновление программы), в отличие от занятости и
+    /// ошибок ввода-вывода.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            StoreError::Corrupt(_)
+            | StoreError::SchemaTooNew { .. }
+            | StoreError::InvalidMigrations(_) => true,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)) => matches!(
+                f.code,
+                rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt
+            ),
+            _ => false,
+        }
+    }
 }

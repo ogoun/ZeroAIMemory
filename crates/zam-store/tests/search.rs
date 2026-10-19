@@ -770,16 +770,14 @@ async fn neighbors_of_leaf() {
     assert_eq!(many.len(), 2);
     assert_eq!(many[&n], leaves);
     assert_eq!(many[&other].len(), 1);
-    // тексты отобранных листов — одним запросом
-    let texts = zam_store::chunk_texts(&db, vec![leaves[1].chunk_id.clone(), "нет".into()])
-        .await
-        .unwrap();
-    assert_eq!(texts.len(), 1);
-    assert_eq!(
-        texts[&leaves[1].chunk_id],
-        (leaves[1].text.clone(), leaves[1].context_prefix.clone())
-    );
-    // без текста — те же листы, пустые text и context_prefix
+    // ключ кэша листа — та же формула, что у воркера
+    for l in &leaves {
+        assert_eq!(
+            l.embed_key,
+            zam_store::embed_key_of(&l.context_prefix, &l.text)
+        );
+    }
+    // без текста — те же листы и ключи, пустые text и context_prefix
     let bare = zam_store::leaves_of_nodes(&db, vec![n], false)
         .await
         .unwrap();
@@ -788,6 +786,12 @@ async fn neighbors_of_leaf() {
         bare[&n]
             .iter()
             .all(|l| l.text.is_empty() && l.context_prefix.is_empty())
+    );
+    assert!(
+        bare[&n]
+            .iter()
+            .zip(&leaves)
+            .all(|(b, l)| b.embed_key == l.embed_key)
     );
     // совпадения слов запроса по листам — через индекс FTS
     let hits = zam_store::leaf_term_hits(

@@ -2,6 +2,7 @@
 pub mod admin;
 pub mod blobs;
 pub mod health;
+pub mod index;
 pub mod nodes;
 pub mod render;
 pub mod scope;
@@ -98,6 +99,8 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         )
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
         .route("/api/v1/search", post(search::search))
+        .route("/api/v1/index/status", get(index::status))
+        .route("/api/v1/admin/reindex", post(index::reindex))
         .route(
             "/api/v1/admin/users",
             get(admin::list_users).post(admin::create_user),

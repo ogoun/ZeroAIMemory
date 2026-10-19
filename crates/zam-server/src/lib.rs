@@ -12,6 +12,7 @@ pub mod logging;
 pub mod ml;
 pub mod models;
 pub mod qdrant;
+pub mod reindex;
 pub mod rerank;
 pub mod web;
 

@@ -113,11 +113,14 @@ async fn twenty_notes_indexed_then_edit_and_delete_replace_points() {
     )
     .await;
     let indexed = t0.elapsed();
+    let (embed, qdrant) = a.st.index.worker.busy();
     eprintln!(
-        "T7-METRIC minilm: запись 20 заметок {} мс, все indexed через {} мс, текстов в модели {}",
+        "T7-METRIC minilm: запись 20 заметок {} мс, все indexed через {} мс, текстов в модели {}, инференс {} мс, Qdrant {} мс",
         written.as_millis(),
         indexed.as_millis(),
-        a.st.index.worker.embedded_texts()
+        a.st.index.worker.embedded_texts(),
+        embed.as_millis(),
+        qdrant.as_millis()
     );
     let mut total = 0;
     for n in &ids {
@@ -570,8 +573,15 @@ async fn managed_storage_rebuild_reindexes_from_embeddings_without_inference() {
     .await;
     let pts = points(&a, None, Some("keep")).await;
     assert!(pts > 0);
+    // второй пользователь, чья база будет повреждена навсегда
+    let bad = a.st.system.create_user("bad", false).await.unwrap().id;
     a.st.shutdown().await;
     drop(a);
+    std::fs::write(
+        dir.join("users").join(format!("{bad}.db")),
+        b"not a sqlite database at all",
+    )
+    .unwrap();
 
     // «откат» версии хранилища: при старте супервизор стирает storage/
     std::fs::write(
@@ -593,14 +603,32 @@ async fn managed_storage_rebuild_reindexes_from_embeddings_without_inference() {
         0,
         "пересборка без инференса"
     );
+    // повреждённая база исключена из пересборки, флаг пересборки снят — повторной
+    // полной перечанковки на следующем старте не будет
     let sup = b.st.index.supervisor().unwrap();
-    assert!(!sup.storage_rebuilt());
+    until(
+        "флаг пересборки снят",
+        READY,
+        async || !sup.storage_rebuilt(),
+    )
+    .await;
+    assert!(!dir.join("qdrant").join(".zam-reindex").exists());
     let audit = b.st.system.list_audit(50, None).await.unwrap();
     let ev = audit
         .iter()
         .find(|r| r.action == "index.storage_rebuilt")
         .expect("аудит index.storage_rebuilt");
     assert_eq!(ev.actor, "system");
+    assert!(
+        audit
+            .iter()
+            .any(|r| r.action == "index.rebuild_skipped" && r.user_id == Some(bad))
+    );
+    let skipped = b.st.index.worker.status().rebuild_skipped;
+    assert_eq!(
+        skipped.iter().map(|d| d.user).collect::<Vec<_>>(),
+        vec![bad]
+    );
     b.st.shutdown().await;
 }
 

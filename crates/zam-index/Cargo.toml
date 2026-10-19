@@ -34,10 +34,12 @@ zam-store = { path = "../zam-store" }
 zam-markdown = { path = "../zam-markdown" }
 jiff.workspace = true
 blake3.workspace = true
+# параллельная запись пачек точек при reindex (уже в дереве через tonic)
+futures-util = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { workspace = true, features = ["job-object", "creation-flags"] }
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
 
 [target.'cfg(unix)'.dependencies]
 process-wrap = { workspace = true, features = ["process-group"] }
