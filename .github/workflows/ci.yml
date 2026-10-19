@@ -1,13 +1,17 @@
 name: CI
 
+# Push в любую ветку (рабочие ветки этапов проверяются на обеих ОС до PR) и PR;
+# теги собирает release.yml.
 on:
   push:
-    branches: [main]
+    branches: ['**']
+    tags-ignore: ['**']
   pull_request:
 
+# Новый push в тот же ref отменяет устаревший прогон.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
