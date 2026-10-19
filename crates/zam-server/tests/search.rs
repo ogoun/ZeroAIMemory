@@ -285,6 +285,49 @@ async fn modes_budget_and_md_format() {
 }
 
 #[tokio::test]
+async fn summary_replaced_by_leaf_with_most_query_words() {
+    // FTS-only: все три слова вместе — только в L1 заметки; лист «Вторая» содержит два
+    // из них, «Первая» — одно
+    let a = api("search-summary", |_| {}).await;
+    let filler = "текст ".repeat(80);
+    a.note(
+        "knowledge",
+        "две",
+        &format!(
+            "# Первая\n\nАльфаслово открывает раздел. {filler}\n\n# Вторая\n\n\
+             Бетаслово и гаммаслово открывают раздел. {filler}\n"
+        ),
+    )
+    .await;
+    let j = search(&a, json!({"query": "альфаслово бетаслово гаммаслово"}))
+        .await
+        .json();
+    let items = j["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{j}");
+    assert_eq!(items[0]["level"], "chunk", "{j}");
+    assert_eq!(items[0]["heading_path"], "Вторая", "{j}");
+    // сниппет листа подсвечивает слово запроса
+    assert!(
+        items[0]["snippet"].as_str().unwrap().contains('\u{E000}'),
+        "{j}"
+    );
+}
+
+#[tokio::test]
+async fn md_empty_result_still_reports_degraded() {
+    let a = api("search-md-empty", |_| {}).await;
+    corpus(&a).await;
+    let r = search(&a, json!({"query": "несуществующееслово", "format": "md"})).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let t = r.text();
+    assert!(
+        t.starts_with("> degraded: ") && t.trim_end().ends_with("(только FTS)"),
+        "{t}"
+    );
+    assert_eq!(t.lines().count(), 1, "{t}");
+}
+
+#[tokio::test]
 async fn fts_syntax_is_plain_words() {
     let a = api("search-syntax", |_| {}).await;
     corpus(&a).await;

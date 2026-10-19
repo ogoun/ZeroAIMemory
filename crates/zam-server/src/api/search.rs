@@ -25,9 +25,12 @@
 //! 2. Векторные хиты проверяются по SQLite ([`live_chunks`]): чанк текущей ревизии, узел
 //!    жив, не в корзине, не исключён (`index: false`), в области. Точка, оставшаяся
 //!    в Qdrant после неудачного `delete`, в выдачу не попадает.
-//! 3. `fuse` (weighted RRF + затухание + ≤ `max_per_node` с узла) → `note_to_leaf`:
-//!    сводка (L1 заметки или секции) заменяется лучшим листом узла — ближайшим к запросу
-//!    по косинусу (эмбеддинги из кэша `embeddings`), без вектора — первым листом секции.
+//! 3. `fuse` (weighted RRF + затухание) → `note_to_leaf` → ≤ `max_per_node` с узла:
+//!    сводка (L1 заметки или секции) сливается с найденным листом своего узла (для
+//!    секции — листом этой секции) или заменяется лучшим листом: ближайшим к запросу по
+//!    косинусу (эмбеддинги из кэша `embeddings`), без вектора — листом с наибольшим числом
+//!    слов запроса; ни одного совпадения — сводка остаётся. Листы всех сводок читаются
+//!    одним запросом, эмбеддинги — одним. Лимит на узел — после замены.
 //! 4. `top_k` (в `notes` — узлов), `expand`, упаковка в `budget_tokens`.
 //!
 //! **Деградация.** Нет модели, ORT, Qdrant, чужая модель коллекции или сбой запроса
@@ -46,7 +49,8 @@
 //!
 //! **Ответ JSON:** `items` (у элемента — `node_id`, `space`, `path`, `heading_path`,
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
-//! `tokens` — размер полного текста чанка, `updated_at`, `kind`, `snippet` | `l0`,
+//! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
+//! полного текста чанка, `updated_at`, `kind`, `snippet` | `l0`,
 //! `text`), `degraded`, `degraded_reason` (или `null`), `pending_count` — живые заметки
 //! области, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms, fuse_ms}`
 //! (`null` — этап не выполнялся). Маркеры совпадений в JSON — U+E000/U+E001.
@@ -54,8 +58,9 @@
 //! **Формат `md`** — карточки §9.3, по одной на элемент:
 //! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N> · <дата> · ~<N> tok`,
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
-//! (`chunks`). При деградации последняя строка — `> degraded: <причина> (только FTS)`.
-use std::collections::{HashMap, HashSet};
+//! (`chunks`). При деградации последняя строка — `> degraded: <причина> (только FTS)`,
+//! в том числе при пустой выдаче (тогда она единственная).
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,15 +76,15 @@ use zam_core::Id;
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, embed_key_of};
 use zam_ml::Embedding;
 use zam_search::{
-    ChunkMeta, Cost, Fit, Level, Ranked, SearchInputs, Weights, fuse, note_to_leaf, pack,
-    truncate_to_tokens,
+    ChunkMeta, Cost, Fit, LeafRef, Level, Ranked, SearchInputs, Weights, cap_per_node, fuse,
+    in_section, note_to_leaf, pack, summaries_without_leaf, truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
-    ChunkScope, Db, FtsChannels, FtsHit, FtsQuery, MARK_END, MARK_START, Space, SpaceKind,
-    count_tokens, get_embeddings, get_node, get_solution, list_spaces, live_chunks,
-    neighbor_leaves, node_content, node_leaves, pending_count, query_needles, search_fts_channels,
-    text_snippet,
+    ChunkScope, Db, FtsChannels, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
+    count_tokens, get_embeddings, get_node, get_solution, leaf_term_hits, leaves_of_nodes,
+    list_spaces, live_chunks, neighbor_leaves, node_content, pending_count, query_needles,
+    search_fts_channels, text_snippet,
 };
 
 use super::json_body;
@@ -259,6 +264,7 @@ async fn run_vector_channel(
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "эмбеддинг запроса не удался: поиск без векторного канала");
             run.failed = Some(DegradedReason::EmbedFailed);
+            run.embed_ms = Some(ms(t));
             return run;
         }
         Err(j) => {
@@ -267,6 +273,7 @@ async fn run_vector_channel(
                 "эмбеддинг запроса аварийно завершился: поиск без векторного канала"
             );
             run.failed = Some(DegradedReason::EmbedFailed);
+            run.embed_ms = Some(ms(t));
             return run;
         }
     };
@@ -292,60 +299,94 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Лучший лист для каждой сводки без листа своего узла в `ranked`: `chunk_id сводки →
-/// chunk_id листа`. Кандидаты — листы секции сводки (`section`) или всей заметки
-/// (`note`); с вектором запроса — ближайший по косинусу среди листов с эмбеддингом
-/// в кэше, иначе первый по порядку.
+/// Лист для каждой сводки из `summaries` (у них нет подходящего листа в выдаче):
+/// `chunk_id сводки → лист`. Кандидаты — листы секции сводки (`section`) или всей
+/// заметки (`note`):
+/// - с вектором запроса — ближайший по косинусу среди листов с эмбеддингом в кэше;
+/// - иначе (или без эмбеддингов) — лист, где FTS находит больше всего слов запроса
+///   ([`query_needles`]), при равенстве — первый; ни одного — сводка остаётся как есть
+///   (как в M1).
+///
+/// Всё пакетно, без запроса на каждую сводку: совпадения слов — по индексу FTS без
+/// чтения текстов листов; листы с текстами (из них строится ключ кэша `embeddings`) —
+/// только при векторе, одним чтением на все узлы, эмбеддинги — одним `get_embeddings`.
 async fn best_leaves(
     db: &Db,
-    ranked: &[Ranked],
-    hits: &HashMap<String, FtsHit>,
+    summaries: &[&Ranked],
+    needles: &[String],
     query: Option<(&[f32], &str)>,
-) -> Result<HashMap<String, String>, ApiError> {
-    let with_leaf: HashSet<Id> = ranked
-        .iter()
-        .filter(|r| r.level == Level::Chunk)
-        .map(|r| r.node_id)
-        .collect();
-    let mut out = HashMap::new();
-    for r in ranked {
-        if !r.level.is_summary() || with_leaf.contains(&r.node_id) {
-            continue;
-        }
-        let leaves = node_leaves(db, r.node_id).await?;
-        let hp = hits
-            .get(&r.chunk_id)
-            .map_or("", |h| h.heading_path.as_str());
-        let in_section = |l: &&zam_store::LeafChunk| {
-            r.level == Level::Note
-                || hp.is_empty()
-                || l.heading_path == hp
-                || l.heading_path.starts_with(&format!("{hp} > "))
-        };
-        let mut cands: Vec<&zam_store::LeafChunk> = leaves.iter().filter(in_section).collect();
-        if cands.is_empty() {
-            cands = leaves.iter().collect();
-        }
-        let Some(first) = cands.first() else {
-            continue;
-        };
-        let mut best = first.chunk_id.clone();
-        if let Some((q, model)) = query {
-            let keys: Vec<String> = cands
-                .iter()
-                .map(|l| embed_key_of(&l.context_prefix, &l.text))
-                .collect();
-            let embs = get_embeddings(db, model, &keys).await?;
-            let scored = cands
-                .iter()
-                .zip(&keys)
-                .filter_map(|(l, k)| embs.get(k).map(|e| (dot(q, &e.dense), l)))
+) -> Result<HashMap<String, LeafRef>, ApiError> {
+    let mut nodes: Vec<Id> = summaries.iter().map(|r| r.node_id).collect();
+    nodes.sort();
+    nodes.dedup();
+    if nodes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let fits = |r: &Ranked, hp: &str| r.level == Level::Note || in_section(hp, &r.heading_path);
+    let mut out: HashMap<String, LeafRef> = HashMap::new();
+    if let Some((q, model)) = query {
+        let leaves = leaves_of_nodes(db, nodes.clone(), true).await?;
+        let keys: HashMap<&str, String> = leaves
+            .values()
+            .flatten()
+            .map(|l| {
+                (
+                    l.chunk_id.as_str(),
+                    embed_key_of(&l.context_prefix, &l.text),
+                )
+            })
+            .collect();
+        let all: Vec<String> = keys.values().cloned().collect();
+        let embs = get_embeddings(db, model, &all).await?;
+        for r in summaries {
+            let best = leaves
+                .get(&r.node_id)
+                .into_iter()
+                .flatten()
+                .filter(|l| fits(r, &l.heading_path))
+                .filter_map(|l| {
+                    let e = embs.get(keys.get(l.chunk_id.as_str())?)?;
+                    Some((dot(q, &e.dense), l))
+                })
                 .max_by(|a, b| a.0.total_cmp(&b.0));
-            if let Some((_, l)) = scored {
-                best = l.chunk_id.clone();
+            if let Some((_, l)) = best {
+                out.insert(
+                    r.chunk_id.clone(),
+                    LeafRef {
+                        chunk_id: l.chunk_id.clone(),
+                        heading_path: l.heading_path.clone(),
+                    },
+                );
             }
         }
-        out.insert(r.chunk_id.clone(), best);
+    }
+    // без вектора или без эмбеддингов в кэше — по словам запроса
+    if summaries.iter().any(|r| !out.contains_key(&r.chunk_id)) {
+        let hits = leaf_term_hits(db, nodes, needles.to_vec()).await?;
+        for r in summaries {
+            if out.contains_key(&r.chunk_id) {
+                continue;
+            }
+            // по узлу и ordinal: при равном числе совпадений остаётся первый лист
+            let mut best: Option<&LeafHit> = None;
+            for h in hits
+                .iter()
+                .filter(|h| h.node_id == r.node_id && fits(r, &h.heading_path))
+            {
+                if best.is_none_or(|b| h.hits > b.hits) {
+                    best = Some(h);
+                }
+            }
+            if let Some(h) = best {
+                out.insert(
+                    r.chunk_id.clone(),
+                    LeafRef {
+                        chunk_id: h.chunk_id.clone(),
+                        heading_path: h.heading_path.clone(),
+                    },
+                );
+            }
+        }
     }
     Ok(out)
 }
@@ -379,32 +420,56 @@ fn group_by_node(items: Vec<Item>, top_k: usize) -> Vec<Item> {
 }
 
 /// Собственный текст секции `heading_path` (заголовок и текст до первой подсекции);
-/// пустой путь — преамбула. `None` — секции нет.
-fn own_section<'a>(src: &'a str, heading_path: &str) -> Option<&'a str> {
+/// пустой путь — преамбула. Если секций с таким путём несколько, берётся та, где лежит
+/// лист `leaf` (по его последней непустой строке: перекрытие чанкер добавляет в начало
+/// листа), иначе первая. `None` — секции нет.
+fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a str> {
     let doc = zam_markdown::parse(src);
-    let i = doc.sections.iter().position(|s| {
-        if heading_path.is_empty() {
-            s.level == 0
-        } else {
-            s.level > 0 && s.path.join(" > ") == heading_path
-        }
-    })?;
-    let s = &doc.sections[i];
-    let end = doc
-        .sections
-        .get(i + 1)
-        .map_or(s.range.end, |n| n.range.start.min(s.range.end))
-        .max(s.body.start.min(s.range.end));
-    src.get(s.range.start..end).map(str::trim_end)
+    let own = |i: usize| {
+        let s = &doc.sections[i];
+        let end = doc
+            .sections
+            .get(i + 1)
+            .map_or(s.range.end, |n| n.range.start.min(s.range.end))
+            .max(s.body.start.min(s.range.end));
+        src.get(s.range.start..end).map(str::trim_end)
+    };
+    let found: Vec<usize> = (0..doc.sections.len())
+        .filter(|&i| {
+            let s = &doc.sections[i];
+            if heading_path.is_empty() {
+                s.level == 0
+            } else {
+                s.level > 0 && s.path.join(" > ") == heading_path
+            }
+        })
+        .collect();
+    let last = leaf.lines().rev().map(str::trim).find(|l| !l.is_empty());
+    let by_leaf = last.and_then(|line| {
+        found
+            .iter()
+            .copied()
+            .find(|&i| own(i).is_some_and(|t| t.contains(line)))
+    });
+    own(by_leaf.or(found.first().copied())?)
 }
 
-/// `expand=section|neighbors` для `chunks`: текст элемента заменяется расширенным;
-/// повторная секция того же узла сливается в первый элемент (`chunk_ids`).
-async fn expand_items(db: &Db, items: Vec<Item>, how: Expand) -> Result<Vec<Item>, ApiError> {
-    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+/// `mode=chunks`: текст элементов (с `expand=section|neighbors` — расширенный), не
+/// больше `top_k` элементов. Повторная секция того же узла сливается в первый элемент
+/// (`chunk_ids`), а выдача добирается следующими кандидатами окна.
+async fn expand_items(
+    db: &Db,
+    items: Vec<Item>,
+    how: Expand,
+    top_k: usize,
+) -> Result<Vec<Item>, ApiError> {
+    let mut out: Vec<Item> = Vec::with_capacity(top_k);
     let mut sections: HashMap<(Id, String), usize> = HashMap::new();
     let mut contents: HashMap<(Id, i64), Arc<String>> = HashMap::new();
     for mut it in items {
+        if out.len() >= top_k {
+            break;
+        }
         let base = it.hit.text.clone();
         let text = match how {
             Expand::Section => {
@@ -426,7 +491,7 @@ async fn expand_items(db: &Db, items: Vec<Item>, how: Expand) -> Result<Vec<Item
                     }
                 };
                 // склеенные чанкером короткие секции: лист может быть длиннее секции
-                match own_section(&src, &it.hit.heading_path) {
+                match own_section(&src, &it.hit.heading_path, &base) {
                     Some(sec) if sec.chars().count() >= base.chars().count() => sec.to_string(),
                     _ => base,
                 }
@@ -452,6 +517,9 @@ async fn expand_items(db: &Db, items: Vec<Item>, how: Expand) -> Result<Vec<Item
 struct Packed {
     item: Item,
     text: Option<(String, bool)>,
+    /// Размер в токенах: отданного текста (`chunks`, после `expand` и усечения), иначе —
+    /// полного текста чанка (сколько стоит его прочитать).
+    tokens: usize,
 }
 
 /// Строка карточки без текста: по ней считается стоимость в токенах.
@@ -481,11 +549,22 @@ fn pack_items(items: Vec<Item>, mode: SearchMode, budget_tokens: usize) -> Vec<P
         .into_iter()
         .zip(fits)
         .map(|(mut it, fit)| {
-            let text = it.text.take().map(|(t, _)| match fit {
-                Fit::Whole => (t, false),
-                Fit::Truncated(n) => (truncate_to_tokens(&t, n, &count_tokens).to_string(), true),
+            let text = it.text.take().map(|(t, n_full)| match fit {
+                Fit::Whole => (t, false, n_full),
+                Fit::Truncated(n) => {
+                    let t = truncate_to_tokens(&t, n, &count_tokens).to_string();
+                    let n = count_tokens(&t);
+                    (t, true, n)
+                }
             });
-            Packed { item: it, text }
+            let tokens = text
+                .as_ref()
+                .map_or(it.hit.token_count.max(0) as usize, |t| t.2);
+            Packed {
+                item: it,
+                text: text.map(|(t, tr, _)| (t, tr)),
+                tokens,
+            }
         })
         .collect()
 }
@@ -507,7 +586,7 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
     o.insert("chunk_ids".into(), json!(p.item.chunk_ids));
     o.insert("score".into(), json!(round_score(p.item.score)));
     o.insert("sources".into(), json!(p.item.sources));
-    o.insert("tokens".into(), json!(h.token_count));
+    o.insert("tokens".into(), json!(p.tokens));
     o.insert("updated_at".into(), json!(fmt_ts(h.updated_at)));
     o.insert("kind".into(), json!("note"));
     if mode == SearchMode::Notes {
@@ -549,7 +628,7 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
         p.item.score,
         h.rev,
         h.updated_at.strftime("%Y-%m-%d"),
-        h.token_count
+        p.tokens
     ));
     match &p.text {
         Some((t, _)) => {
@@ -688,6 +767,7 @@ pub async fn search(
                 ChunkMeta {
                     node_id: h.node_id,
                     level: Level::parse(&h.level)?,
+                    heading_path: h.heading_path.clone(),
                     updated_at: h.updated_at,
                 },
             ))
@@ -699,19 +779,24 @@ pub async fn search(
         vector: vector_ids,
         chunks,
     };
-    let mut ranked = fuse(&inputs, &st.cfg.search.weights(), jiff::Timestamp::now());
-    ranked.truncate(top_k * OVERSAMPLE);
+    let weights = st.cfg.search.weights();
+    let ranked = fuse(&inputs, &weights, jiff::Timestamp::now());
+    let window = top_k * OVERSAMPLE;
     let query_vec = vrun
         .dense
         .as_deref()
         .zip(st.index.model_id())
         .filter(|_| vrun.hits.is_some());
-    let best = best_leaves(&db, &ranked, &hits, query_vec).await?;
-    let ranked = note_to_leaf(ranked, |r| best.get(&r.chunk_id).cloned());
-    let missing: Vec<String> = ranked
-        .iter()
-        .filter(|r| !hits.contains_key(&r.chunk_id))
-        .map(|r| r.chunk_id.clone())
+    let needles = query_needles(&req.query);
+    // листы — только для сводок окна: дальше окна выдача всё равно не идёт
+    let summaries = summaries_without_leaf(&ranked[..ranked.len().min(window)]);
+    let mut best = best_leaves(&db, &summaries, &needles, query_vec).await?;
+    // листы-замены — живые чанки области; не нашёлся (узел перезаписан между чтениями) —
+    // сводка остаётся как есть
+    let missing: Vec<String> = best
+        .values()
+        .filter(|l| !hits.contains_key(&l.chunk_id))
+        .map(|l| l.chunk_id.clone())
         .collect();
     if !missing.is_empty() {
         let scope = ChunkScope {
@@ -723,7 +808,17 @@ pub async fn search(
             hits.insert(h.chunk_id.clone(), h);
         }
     }
-    let needles = query_needles(&req.query);
+    best.retain(|summary, l| {
+        let ok = hits.contains_key(&l.chunk_id);
+        if !ok {
+            tracing::debug!(summary, leaf = %l.chunk_id, "лист-замена сводки не найден: сводка остаётся");
+        }
+        ok
+    });
+    let ranked = note_to_leaf(ranked, |r| best.get(&r.chunk_id).cloned());
+    // лимит на узел — после замены сводок листами
+    let mut ranked = cap_per_node(ranked, weights.max_per_node);
+    ranked.truncate(window);
     let needles: Vec<&str> = needles.iter().map(String::as_str).collect();
     let items: Vec<Item> = ranked
         .into_iter()
@@ -747,7 +842,8 @@ pub async fn search(
     // 4. top_k, режим, expand, упаковка
     let mut items = match mode {
         SearchMode::Notes => group_by_node(items, top_k),
-        _ => items.into_iter().take(top_k).collect(),
+        SearchMode::Chunks => expand_items(&db, items, expand, top_k).await?,
+        SearchMode::Brief => items.into_iter().take(top_k).collect(),
     };
     match mode {
         SearchMode::Notes => {
@@ -755,8 +851,7 @@ pub async fn search(
                 it.l0 = get_node(&db, it.hit.node_id).await?.l0;
             }
         }
-        SearchMode::Chunks => items = expand_items(&db, items, expand).await?,
-        SearchMode::Brief => {}
+        SearchMode::Chunks | SearchMode::Brief => {}
     }
     // заметки области, ещё не прошедшие векторную индексацию (без `index: false` и Human)
     let pending = pending_count(&db, space_ids.clone(), prefix.clone()).await?;
@@ -787,9 +882,7 @@ pub async fn search(
                 .enumerate()
                 .map(|(i, p)| item_md(i + 1, p, mode, &by_id))
                 .collect();
-            if let Some(r) = degraded
-                && !packed.is_empty()
-            {
+            if let Some(r) = degraded {
                 body.push_str(&format!("> degraded: {} (только FTS)\n", r.as_str()));
             }
             let mut r = body.into_response();
@@ -932,10 +1025,11 @@ mod tests {
         let idx = FailingIndex(|| unreachable!("до индекса не доходит"));
         let r = run_vector_channel(|| Err("сбой".into()), &idx, filter()).await;
         assert_eq!(r.failed, Some(DegradedReason::EmbedFailed));
-        assert!(r.hits.is_none() && r.embed_ms.is_none());
+        // время до сбоя, а не null
+        assert!(r.hits.is_none() && r.embed_ms.is_some() && r.vector_ms.is_none());
         let r = run_vector_channel(|| panic!("инференс упал"), &idx, filter()).await;
         assert_eq!(r.failed, Some(DegradedReason::EmbedFailed));
-        assert!(r.hits.is_none());
+        assert!(r.hits.is_none() && r.embed_ms.is_some());
     }
 
     #[tokio::test]
@@ -969,11 +1063,19 @@ mod tests {
     #[test]
     fn own_section_text() {
         let src = "Преамбула.\n\n# A\n\nтекст A\n\n## B\n\nтекст B\n\n# C\n\nтекст C\n";
-        assert_eq!(own_section(src, "A"), Some("# A\n\nтекст A"));
-        assert_eq!(own_section(src, "A > B"), Some("## B\n\nтекст B"));
-        assert_eq!(own_section(src, ""), Some("Преамбула."));
-        assert_eq!(own_section(src, "C"), Some("# C\n\nтекст C"));
-        assert_eq!(own_section(src, "Q"), None);
+        assert_eq!(own_section(src, "A", ""), Some("# A\n\nтекст A"));
+        assert_eq!(own_section(src, "A > B", ""), Some("## B\n\nтекст B"));
+        assert_eq!(own_section(src, "", ""), Some("Преамбула."));
+        assert_eq!(own_section(src, "C", ""), Some("# C\n\nтекст C"));
+        assert_eq!(own_section(src, "Q", ""), None);
+        // повторяющийся путь: секция — та, где лежит лист
+        let dup = "# A\n\nпервая\n\n# A\n\nвторая строка\n";
+        assert_eq!(
+            own_section(dup, "A", "# A\nвторая строка"),
+            Some("# A\n\nвторая строка")
+        );
+        assert_eq!(own_section(dup, "A", "первая"), Some("# A\n\nпервая"));
+        assert_eq!(own_section(dup, "A", "нет такого"), Some("# A\n\nпервая"));
     }
 
     #[test]
@@ -984,11 +1086,12 @@ mod tests {
         let p = Packed {
             item: it,
             text: None,
+            tokens: 7,
         };
         let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         let want = format!(
-            "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · ~{} tok\n   **s**\n",
-            p.item.hit.node_id, p.item.hit.token_count
+            "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · ~7 tok\n   **s**\n",
+            p.item.hit.node_id
         );
         assert_eq!(s, want);
     }

@@ -3,8 +3,12 @@
 //! Балл чанка — `Σ w_канала / (rrf_k + ранг)` по каналам, где он найден (ранг с 1),
 //! умноженный на [`recency_factor`] узла и нормированный на наибольший возможный балл
 //! (первое место во всех непустых каналах у свежей заметки = 1,0). Затем — порядок по
-//! убыванию балла (при равенстве — по `chunk_id`, чтобы выдача была детерминированной)
-//! и не больше `max_per_node` чанков с одного узла.
+//! убыванию балла (при равенстве — по `chunk_id`, чтобы выдача была детерминированной).
+//!
+//! Лимит `max_per_node` чанков с узла здесь не применяется: сводки ещё не заменены листами
+//! ([`note_to_leaf`](crate::note_to_leaf)), и ранний лимит отбрасывал бы листы, в которые
+//! сводки потом сливаются. Порядок вызовов: `fuse` → `note_to_leaf` →
+//! [`cap_per_node`](crate::cap_per_node).
 
 use std::collections::HashMap;
 
@@ -76,6 +80,8 @@ impl Level {
 pub struct ChunkMeta {
     pub node_id: Id,
     pub level: Level,
+    /// Путь заголовков (`A > B`): секция сводки уровня `section` и листа.
+    pub heading_path: String,
     /// Время последнего изменения узла — для затухания.
     pub updated_at: Timestamp,
 }
@@ -124,13 +130,15 @@ pub struct Ranked {
     pub chunk_id: String,
     pub node_id: Id,
     pub level: Level,
+    /// Путь заголовков чанка.
+    pub heading_path: String,
     /// Нормированный балл, 0..=1.
     pub score: f64,
     /// Каналы, нашедшие чанк, в порядке `vector`, `fts`, `trigram`.
     pub sources: Vec<&'static str>,
 }
 
-/// Weighted RRF + затухание + не больше `max_per_node` с узла (см. модуль).
+/// Weighted RRF + затухание, без лимита на узел (см. модуль).
 pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
     let empty = Vec::new();
     let channels = [
@@ -175,6 +183,7 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
                 chunk_id: id.to_string(),
                 node_id: m.node_id,
                 level: m.level,
+                heading_path: m.heading_path.clone(),
                 score,
                 sources,
             }
@@ -184,12 +193,6 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
         b.score
             .total_cmp(&a.score)
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
-    });
-    let mut per_node: HashMap<Id, usize> = HashMap::new();
-    all.retain(|r| {
-        let n = per_node.entry(r.node_id).or_default();
-        *n += 1;
-        *n <= w.max_per_node.max(1)
     });
     all
 }
@@ -212,6 +215,7 @@ mod tests {
                     ChunkMeta {
                         node_id: *n,
                         level: Level::Chunk,
+                        heading_path: String::new(),
                         updated_at: now(),
                     },
                 )
@@ -323,13 +327,12 @@ mod tests {
             chunks: meta(&refs),
             ..Default::default()
         };
-        let r = fuse(&inp, &Weights::default(), now());
+        // fuse лимит не применяет: его применяет cap_per_node после note_to_leaf
+        let all = fuse(&inp, &Weights::default(), now());
+        assert_eq!(all.len(), 7);
+        let r = crate::cap_per_node(all.clone(), Weights::default().max_per_node);
         assert_eq!(ids(&r), vec!["n0", "n1", "n2", "m0"]);
-        let w = Weights {
-            max_per_node: 1,
-            ..Weights::default()
-        };
-        assert_eq!(ids(&fuse(&inp, &w, now())), vec!["n0", "m0"]);
+        assert_eq!(ids(&crate::cap_per_node(all, 1)), vec!["n0", "m0"]);
     }
 
     #[test]

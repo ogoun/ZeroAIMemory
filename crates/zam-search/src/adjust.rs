@@ -28,36 +28,70 @@ pub fn recency_factor(updated_at: Timestamp, now: Timestamp, half_life_days: f64
     RECENCY_FLOOR + (1.0 - RECENCY_FLOOR) * (-age_days / half_life_days).exp2()
 }
 
-/// §9.2 п. 6: сводка заметки или секции (`note`/`section`) в выдаче заменяется лучшим
-/// листом узла.
+/// Лист, которым заменяется сводка.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafRef {
+    pub chunk_id: String,
+    pub heading_path: String,
+}
+
+/// Лист с путём `leaf` лежит в секции `section` (равен ей или вложен: `A > B` в `A`).
+/// Пустой путь секции — вся заметка.
+pub fn in_section(leaf: &str, section: &str) -> bool {
+    section.is_empty()
+        || leaf == section
+        || leaf
+            .strip_prefix(section)
+            .is_some_and(|rest| rest.starts_with(" > "))
+}
+
+/// Подходит ли лист `leaf` на замену сводке `s`: тот же узел, для `section` — та же
+/// секция (или вложенная).
+fn leaf_fits(s: &Ranked, leaf: &Ranked) -> bool {
+    leaf.level == Level::Chunk
+        && leaf.node_id == s.node_id
+        && (s.level == Level::Note || in_section(&leaf.heading_path, &s.heading_path))
+}
+
+/// Сводки, для которых в `r` нет подходящего листа: для них вызывающий выбирает лист
+/// сам (`best_leaf` у [`note_to_leaf`]).
+pub fn summaries_without_leaf(r: &[Ranked]) -> Vec<&Ranked> {
+    r.iter()
+        .filter(|s| s.level.is_summary() && !r.iter().any(|l| leaf_fits(s, l)))
+        .collect()
+}
+
+/// §9.2 п. 6: сводка заметки или секции (`note`/`section`) в выдаче заменяется листом.
 ///
-/// - Если лист того же узла уже есть в выдаче, сводка с ним сливается: балл — больший из
-///   двух, каналы — объединение, место — по новому баллу.
-/// - Иначе вместо сводки берётся лист `best_leaf(сводка)` (выбирает вызывающий: например,
+/// - Если подходящий лист уже есть в выдаче (для `note` — любой лист узла, для `section` —
+///   лист той же секции или вложенной), сводка с ним сливается: балл — больший из двух,
+///   каналы — объединение, место — по новому баллу.
+/// - Иначе вместо сводки берётся `best_leaf(сводка)` (выбирает вызывающий: например,
 ///   ближайший к запросу по косинусу лист секции); `None` — сводка остаётся как есть.
 ///
 /// Повторы одного `chunk_id` после замены сливаются так же. Порядок — по убыванию балла,
-/// при равенстве — прежний.
-pub fn note_to_leaf(r: Vec<Ranked>, best_leaf: impl Fn(&Ranked) -> Option<String>) -> Vec<Ranked> {
-    // лучший (первый по месту) лист каждого узла среди уже найденных
-    let mut leaf_of: HashMap<Id, String> = HashMap::new();
-    for x in &r {
-        if x.level == Level::Chunk {
-            leaf_of
-                .entry(x.node_id)
-                .or_insert_with(|| x.chunk_id.clone());
-        }
-    }
+/// при равенстве — прежний. Лимит на узел — после замены ([`cap_per_node`]).
+pub fn note_to_leaf(r: Vec<Ranked>, best_leaf: impl Fn(&Ranked) -> Option<LeafRef>) -> Vec<Ranked> {
+    // найденные листы в порядке выдачи: первый подходящий — лучший
+    let leaves: Vec<Ranked> = r
+        .iter()
+        .filter(|x| x.level == Level::Chunk)
+        .cloned()
+        .collect();
     let mut out: Vec<Ranked> = Vec::with_capacity(r.len());
     let mut pos: HashMap<String, usize> = HashMap::new();
     for mut x in r {
         if x.level.is_summary() {
-            let target = match leaf_of.get(&x.node_id) {
-                Some(id) => Some(id.clone()),
+            let target = match leaves.iter().find(|l| leaf_fits(&x, l)) {
+                Some(l) => Some(LeafRef {
+                    chunk_id: l.chunk_id.clone(),
+                    heading_path: l.heading_path.clone(),
+                }),
                 None => best_leaf(&x),
             };
-            if let Some(id) = target {
-                x.chunk_id = id;
+            if let Some(l) = target {
+                x.chunk_id = l.chunk_id;
+                x.heading_path = l.heading_path;
                 x.level = Level::Chunk;
             }
         }
@@ -66,6 +100,17 @@ pub fn note_to_leaf(r: Vec<Ranked>, best_leaf: impl Fn(&Ranked) -> Option<String
     // sort_by стабилен: при равном балле порядок прежний
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     out
+}
+
+/// Не больше `max` элементов с одного узла (§9.2 п. 6), порядок сохраняется.
+pub fn cap_per_node(mut r: Vec<Ranked>, max: usize) -> Vec<Ranked> {
+    let mut per_node: HashMap<Id, usize> = HashMap::new();
+    r.retain(|x| {
+        let n = per_node.entry(x.node_id).or_default();
+        *n += 1;
+        *n <= max.max(1)
+    });
+    r
 }
 
 /// Добавляет `x` или сливает с уже добавленным тем же `chunk_id`.
@@ -94,13 +139,61 @@ mod tests {
     use jiff::SignedDuration;
 
     fn r(chunk: &str, node: Id, level: Level, score: f64, src: &'static str) -> Ranked {
+        rh(chunk, node, level, "", score, src)
+    }
+
+    fn rh(chunk: &str, node: Id, level: Level, hp: &str, score: f64, src: &'static str) -> Ranked {
         Ranked {
             chunk_id: chunk.into(),
             node_id: node,
             level,
+            heading_path: hp.into(),
             score,
             sources: vec![src],
         }
+    }
+
+    fn leaf(id: &str, hp: &str) -> Option<LeafRef> {
+        Some(LeafRef {
+            chunk_id: id.into(),
+            heading_path: hp.into(),
+        })
+    }
+
+    #[test]
+    fn section_summary_merges_only_into_leaf_of_its_section() {
+        // note 0.9, лист секции A 0.8, сводка секции B 0.7, лист секции B 0.6: обе сводки
+        // не должны схлопнуться в лист A, лист B не теряется и лимит на узел — после замены
+        let n = Id::new();
+        let list = vec![
+            rh("note", n, Level::Note, "", 0.9, "vector"),
+            rh("leaf-a", n, Level::Chunk, "A", 0.8, "fts"),
+            rh("sec-b", n, Level::Section, "B", 0.7, "vector"),
+            rh("leaf-b", n, Level::Chunk, "B > C", 0.6, "fts"),
+        ];
+        assert!(summaries_without_leaf(&list).is_empty());
+        let out = cap_per_node(note_to_leaf(list, |_| unreachable!()), 3);
+        let got: Vec<(&str, f64)> = out.iter().map(|x| (x.chunk_id.as_str(), x.score)).collect();
+        assert_eq!(got, vec![("leaf-a", 0.9), ("leaf-b", 0.7)]);
+        assert_eq!(out[1].sources, vec!["vector", "fts"]);
+        // без листа своей секции — best_leaf, а не лист чужой секции
+        let list = vec![
+            rh("leaf-a", n, Level::Chunk, "A", 0.8, "fts"),
+            rh("sec-b", n, Level::Section, "B", 0.7, "vector"),
+        ];
+        assert_eq!(summaries_without_leaf(&list).len(), 1);
+        let out = note_to_leaf(list, |x| {
+            assert_eq!(x.chunk_id, "sec-b");
+            leaf("leaf-b", "B")
+        });
+        assert_eq!(out[1].chunk_id, "leaf-b");
+        assert_eq!(out[1].heading_path, "B");
+    }
+
+    #[test]
+    fn section_paths() {
+        assert!(in_section("A", "A") && in_section("A > B", "A") && in_section("x", ""));
+        assert!(!in_section("AB", "A") && !in_section("B", "A") && !in_section("A", "A > B"));
     }
 
     #[test]
@@ -129,7 +222,13 @@ mod tests {
             // сводка без листа и без замены остаётся
             r("c-none", Id::new(), Level::Note, 0.4, "fts"),
         ];
-        let out = note_to_leaf(list, |x| (x.node_id == b).then(|| "b-leaf".to_string()));
+        let out = note_to_leaf(list, |x| {
+            if x.node_id == b {
+                leaf("b-leaf", "")
+            } else {
+                None
+            }
+        });
         let got: Vec<(&str, f64, Level)> = out
             .iter()
             .map(|x| (x.chunk_id.as_str(), x.score, x.level))
@@ -154,7 +253,7 @@ mod tests {
                 r("n", a, Level::Note, 0.6, "vector"),
                 r("s", a, Level::Section, 0.3, "fts"),
             ],
-            |_| Some("leaf".into()),
+            |_| leaf("leaf", ""),
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].chunk_id, "leaf");

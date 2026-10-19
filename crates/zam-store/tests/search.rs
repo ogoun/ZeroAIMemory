@@ -762,6 +762,49 @@ async fn neighbors_of_leaf() {
     let n = add(&db, k, "long", &body).await;
     let leaves = zam_store::node_leaves(&db, n).await.unwrap();
     assert!(leaves.len() >= 3, "{}", leaves.len());
+    // пакетный вариант: узел без листов в ответ не входит
+    let other = add(&db, k, "short", "# Короткая\n\nтекст\n").await;
+    let many = zam_store::leaves_of_nodes(&db, vec![n, other, Id::new()], true)
+        .await
+        .unwrap();
+    assert_eq!(many.len(), 2);
+    assert_eq!(many[&n], leaves);
+    assert_eq!(many[&other].len(), 1);
+    // без текста — те же листы, пустые text и context_prefix
+    let bare = zam_store::leaves_of_nodes(&db, vec![n], false)
+        .await
+        .unwrap();
+    assert_eq!(bare[&n].len(), leaves.len());
+    assert!(
+        bare[&n]
+            .iter()
+            .all(|l| l.text.is_empty() && l.context_prefix.is_empty())
+    );
+    // совпадения слов запроса по листам — через индекс FTS
+    let hits = zam_store::leaf_term_hits(
+        &db,
+        vec![n, other],
+        vec![
+            "второе".into(),
+            "третье".into(),
+            "текст".into(),
+            "нет".into(),
+        ],
+    )
+    .await
+    .unwrap();
+    for l in leaves.iter().chain(&many[&other]) {
+        let want = ["второе", "третье", "текст"]
+            .iter()
+            .filter(|w| l.text.contains(*w))
+            .count();
+        let got = hits.iter().find(|h| h.chunk_id == l.chunk_id);
+        assert_eq!(got.map_or(0, |h| h.hits), want, "{hits:?}");
+        if let Some(h) = got {
+            assert_eq!((&h.heading_path, h.ordinal), (&l.heading_path, l.ordinal));
+        }
+    }
+    assert!(!hits.is_empty());
     let (p, nx) = zam_store::neighbor_leaves(&db, leaves[1].chunk_id.clone())
         .await
         .unwrap();

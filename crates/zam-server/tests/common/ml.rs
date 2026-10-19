@@ -14,7 +14,7 @@ use super::qdrant::{TestQdrant, qdrant_bin};
 /// Тестовая модель (англоязычная MiniLM-L6, int8).
 pub const MINILM: &str = "minilm-l6-int8";
 /// Предел ожидания готовности коллекции (создание payload-индексов на HDD — секунды).
-pub const READY: Duration = Duration::from_secs(90);
+pub const READY: Duration = Duration::from_secs(240);
 
 pub fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")

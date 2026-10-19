@@ -34,9 +34,9 @@ pub use nodes::{
 };
 pub use paths::NodePath;
 pub use search::{
-    ChunkScope, FtsChannels, FtsHit, FtsQuery, LeafChunk, MARK_END, MARK_START, live_chunks,
-    neighbor_leaves, node_leaves, pending_count, query_needles, sanitize_fts, search_fts,
-    search_fts_channels, text_snippet,
+    ChunkScope, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END, MARK_START,
+    leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves, node_leaves, pending_count,
+    query_needles, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SystemStore, TokenInfo, User, WebSession,

@@ -28,9 +28,19 @@ pub fn run(ctx: &Ctx, query: &str, o: &Opts) -> Result<(), CliError> {
         body["top_k"] = json!(k);
     }
     let mut text = read_text(ctx.client.post_json("/search", &body)?)?;
-    if text.is_empty() {
+    // в md пустая выдача — пустое тело или только строка деградации сервера
+    // (`> degraded: …`): её тоже печатаем, агент должен знать, что искал только FTS
+    let empty = if ctx.json {
+        text.is_empty()
+    } else {
+        text.lines()
+            .all(|l| l.trim().is_empty() || l.starts_with("> degraded:"))
+    };
+    if empty {
         eprintln!("ничего не найдено");
-        return Ok(());
+        if text.trim().is_empty() {
+            return Ok(());
+        }
     }
     if !text.ends_with('\n') {
         text.push('\n');

@@ -189,7 +189,7 @@ async fn indexed(name: &str) -> Option<(Api, TestQdrant, Vec<(String, String)>)>
     }
     until(
         "корпус проиндексирован",
-        Duration::from_secs(60),
+        Duration::from_secs(240),
         async || {
             for (_, id) in &ids {
                 if state(&a, id).await != "indexed" {
@@ -338,19 +338,42 @@ async fn hybrid_paraphrase_identifier_expand_budget() {
     )
     .await
     .json();
-    let words = |j: &Value| -> usize {
+    // токены — тем же счётчиком, что у сервера (токенизатор MiniLM в этом процессе)
+    let tokens = |j: &Value| -> usize {
         j["items"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|i| i["text"].as_str().unwrap().split_whitespace().count())
+            .map(|i| {
+                let n = zam_store::count_tokens(i["text"].as_str().unwrap());
+                // `tokens` — размер отданного текста
+                assert_eq!(i["tokens"], n, "{i}");
+                n
+            })
             .sum()
     };
     let items = small["items"].as_array().unwrap();
     assert!(!items.is_empty(), "{small}");
-    assert!(words(&small) < words(&big), "{small}");
-    assert!(words(&small) <= 200, "{small}");
+    assert!(tokens(&small) < tokens(&big), "{small}");
+    assert!(tokens(&small) <= 200, "{small}");
     assert_eq!(items.last().unwrap()["text_truncated"], true, "{small}");
+
+    // повторная секция в expand=section сливается, выдача добирается до top_k
+    let j = search(
+        &a,
+        json!({"query": "scales arpeggios", "mode": "chunks", "expand": "section",
+               "top_k": 3, "budget_tokens": 20000}),
+    )
+    .await
+    .json();
+    let items = j["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "{j}");
+    let piano: Vec<&Value> = items
+        .iter()
+        .filter(|i| i["path"] == "music/piano")
+        .collect();
+    assert_eq!(piano.len(), 1, "{j}");
+    assert!(piano[0]["chunk_ids"].as_array().unwrap().len() >= 2, "{j}");
 
     // замер: p50/p95 гибридного /search (brief, разные запросы — мимо LRU запросов)
     let queries = [

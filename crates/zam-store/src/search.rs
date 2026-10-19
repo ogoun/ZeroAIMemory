@@ -557,21 +557,112 @@ pub struct LeafChunk {
 
 /// Листы (`level = 'chunk'`) узла по порядку.
 pub async fn node_leaves(db: &Db, node: Id) -> Result<Vec<LeafChunk>, StoreError> {
+    Ok(leaves_of_nodes(db, vec![node], true)
+        .await?
+        .remove(&node)
+        .unwrap_or_default())
+}
+
+/// Листы нескольких узлов одним запросом: `узел → листы по порядку`; узла без листов
+/// в ответе нет (замена сводок листами в поиске — без запроса на каждую сводку).
+/// `with_text = false` — без `text` и `context_prefix` (пустые строки): тексты сотен
+/// листов не читаются, если нужны только пути и порядок.
+pub async fn leaves_of_nodes(
+    db: &Db,
+    nodes: Vec<Id>,
+    with_text: bool,
+) -> Result<HashMap<Id, Vec<LeafChunk>>, StoreError> {
+    if nodes.is_empty() {
+        return Ok(HashMap::new());
+    }
     db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT id, heading_path, ordinal, text, context_prefix FROM chunks
-             WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
+        // один снимок и один подготовленный запрос по индексу `chunks_node` на узел:
+        // соединение с json_each здесь медленнее (сортировка всех листов)
+        let tx = c.unchecked_transaction()?;
+        let mut st = tx.prepare_cached(
+            "SELECT id, heading_path, ordinal,
+                    CASE WHEN ?2 THEN text ELSE '' END,
+                    CASE WHEN ?2 THEN context_prefix ELSE '' END
+             FROM chunks WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
         )?;
-        let rows = st.query_map([node], |r| {
-            Ok(LeafChunk {
-                chunk_id: r.get(0)?,
-                heading_path: r.get(1)?,
-                ordinal: r.get(2)?,
-                text: r.get(3)?,
-                context_prefix: r.get(4)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut out: HashMap<Id, Vec<LeafChunk>> = HashMap::new();
+        for node in nodes {
+            let rows = st.query_map(params![node, with_text], |r| {
+                Ok(LeafChunk {
+                    chunk_id: r.get(0)?,
+                    heading_path: r.get(1)?,
+                    ordinal: r.get(2)?,
+                    text: r.get(3)?,
+                    context_prefix: r.get(4)?,
+                })
+            })?;
+            let leaves: Vec<LeafChunk> = rows.collect::<Result<_, _>>()?;
+            if !leaves.is_empty() {
+                out.insert(node, leaves);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Лист узла с числом найденных в нём слов запроса ([`leaf_term_hits`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafHit {
+    pub node_id: Id,
+    pub chunk_id: String,
+    pub heading_path: String,
+    pub ordinal: i64,
+    /// Сколько слов запроса найдено в листе (≥ 1).
+    pub hits: usize,
+}
+
+/// Листы узлов `nodes`, в которых FTS5 находит слова запроса (`needles`, каждое — как
+/// запрос [`sanitize_fts`]), с числом найденных слов; по узлу и `ordinal`. Листы без
+/// совпадений в ответ не входят. Тексты не читаются: по одному запросу к индексу на
+/// слово, в одной читающей транзакции.
+pub async fn leaf_term_hits(
+    db: &Db,
+    nodes: Vec<Id>,
+    needles: Vec<String>,
+) -> Result<Vec<LeafHit>, StoreError> {
+    if nodes.is_empty() || needles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list =
+        serde_json::Value::from(nodes.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let mut st = tx.prepare_cached(
+            "SELECT DISTINCT c.id, c.node_id, c.heading_path, c.ordinal FROM chunks_fts f
+             CROSS JOIN chunks c ON c.seq = f.rowid
+             WHERE chunks_fts MATCH ?1 AND c.level = 'chunk'
+               AND c.node_id IN (SELECT value FROM json_each(?2))",
+        )?;
+        let mut out: HashMap<String, LeafHit> = HashMap::new();
+        for n in needles.iter().take(MAX_TERMS) {
+            let Some(fts) = sanitize_fts(n) else {
+                continue;
+            };
+            let rows = st.query_map(params![fts, list], |r| {
+                Ok(LeafHit {
+                    chunk_id: r.get(0)?,
+                    node_id: r.get(1)?,
+                    heading_path: r.get(2)?,
+                    ordinal: r.get(3)?,
+                    hits: 1,
+                })
+            })?;
+            for h in rows {
+                let h = h?;
+                out.entry(h.chunk_id.clone())
+                    .and_modify(|e| e.hits += 1)
+                    .or_insert(h);
+            }
+        }
+        let mut v: Vec<LeafHit> = out.into_values().collect();
+        v.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(a.ordinal.cmp(&b.ordinal)));
+        Ok(v)
     })
     .await
 }

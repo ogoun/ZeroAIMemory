@@ -23,8 +23,9 @@ use zam_store::{
 
 const DIM: usize = 16;
 const MODEL: &str = "fake/test@00000001";
-/// Предел ожиданий: создание коллекции с payload-индексами на HDD занимает секунды.
-const LIMIT: Duration = Duration::from_secs(60);
+/// Предел ожиданий: создание коллекции с payload-индексами на HDD занимает секунды, а при
+/// параллельном прогоне тестов (до 7 процессов Qdrant) — до минуты и больше.
+const LIMIT: Duration = Duration::from_secs(240);
 
 /// Детерминированная «модель»: вектор из blake3 текста, считает вызовы.
 struct Fake {
@@ -164,7 +165,7 @@ impl Env {
         get_node(&self.db, node).await.unwrap().index_state
     }
 
-    /// Ждёт `index_state = 'indexed'` (до 60 с: создание коллекции на HDD — секунды).
+    /// Ждёт `index_state = 'indexed'` (до [`LIMIT`]: создание коллекции на HDD).
     async fn indexed(&self, node: Id) {
         let t = Instant::now();
         while self.state(node).await != "indexed" {

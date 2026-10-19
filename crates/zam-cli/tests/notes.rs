@@ -369,8 +369,15 @@ fn solution_toml_scopes_write_and_search() {
     // поиск из каталога решения находит, вне его — нет (решение не в области)
     let s = ok(&e.run_in(&sub, &["search", "квазар"], b""));
     assert!(s.contains("TradingPlatform/x"), "{s}");
-    let s = ok(&e.run(&["search", "квазар"]));
+    let o = e.run(&["search", "квазар"]);
+    let s = ok(&o);
     assert!(!s.contains("/x"), "{s}");
+    // пустая выдача без моделей: «ничего не найдено» и строка деградации
+    assert!(err(&o).contains("ничего не найдено"), "{}", err(&o));
+    assert!(
+        s.starts_with("> degraded: ") && s.trim_end().ends_with("(только FTS)"),
+        "{s}"
+    );
     // --all — все решения
     let s = ok(&e.run(&["search", "квазар", "--all"]));
     assert!(s.contains("TradingPlatform/x"), "{s}");
