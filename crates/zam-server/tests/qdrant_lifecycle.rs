@@ -479,6 +479,25 @@ fn settled(s: &Value) -> bool {
         && s["qdrant"]["points"].as_u64().is_some_and(|p| p > 0)
 }
 
+/// Число точек после покоя индексации, которое не меняется дольше отложенной свёртки L0
+/// (2 с) с запасом: 4 с подряд при пустой очереди.
+fn stable_points(srv: &mut ServerProc, token: &str) -> u64 {
+    const QUIET: Duration = Duration::from_secs(4);
+    let mut last = None;
+    let mut since = Instant::now();
+    loop {
+        let s = wait_status(srv, token, "покой индексации", settled);
+        let p = s["qdrant"]["points"].as_u64().unwrap();
+        if last != Some(p) {
+            last = Some(p);
+            since = Instant::now();
+        } else if since.elapsed() >= QUIET {
+            return p;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn search_vector(srv: &ServerProc, token: &str) {
     let (code, j) = srv.call(
         "POST",
@@ -526,8 +545,12 @@ fn killed_server_takes_qdrant_down_and_restarts_with_long_data_dir() {
         ),
     );
     assert_eq!(code, 201, "{n}");
-    let s = wait_status(&mut srv, &token, "индексация", settled);
-    let pts = s["qdrant"]["points"].as_u64().unwrap();
+    wait_status(&mut srv, &token, "индексация", settled);
+    // Пустая очередь ещё не покой: L0 папки `long` воркер пишет отложенной свёрткой
+    // (`index.rollup_debounce_ms`, 2 с) уже после закрытия задания, а `worker` (с
+    // `rollups_pending`) по токену не отдаётся. Без этого ожидания точек до убийства
+    // бывало 2, а после перезапуска — 3 (флейк на HDD, задача 17 M2).
+    let pts = stable_points(&mut srv, &token);
     search_vector(&srv, &token);
     let deepest = longest_path(&data.join("qdrant").join("storage"));
     eprintln!(

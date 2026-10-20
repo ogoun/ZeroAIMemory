@@ -584,6 +584,19 @@ async fn managed_storage_rebuild_reindexes_from_embeddings_without_inference() {
         state(&a, &n).await == "indexed"
     })
     .await;
+    // покой воркера, а не только `indexed`: L0 папки `keep` пишется отложенной свёрткой
+    // (2 с) после закрытия задания. Остановка раньше оставляла папку без эмбеддинга в
+    // кэше, после пересборки её свёртка шла через модель — `embedded_texts` = 1 вместо 0
+    // (флейк на HDD, задача 17 M2)
+    until(
+        "покой воркера",
+        Duration::from_secs(20),
+        async || {
+            let s = a.st.index.worker.status();
+            s.rollups_pending == 0 && !s.batch_running
+        },
+    )
+    .await;
     let pts = points(&a, None, Some("keep")).await;
     assert!(pts > 0);
     // второй пользователь, чья база будет повреждена навсегда
