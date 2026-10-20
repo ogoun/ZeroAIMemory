@@ -23,6 +23,8 @@ mod config;
 mod http;
 mod process;
 mod stamp;
+#[cfg(feature = "edge")]
+pub(crate) use stamp::write_atomic;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

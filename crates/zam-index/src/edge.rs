@@ -16,8 +16,14 @@
 //! записи ([`EdgeOptions::optimize_debounce`]). До оптимизации новые точки ищутся полным
 //! перебором в appendable-сегменте.
 //!
-//! Подтверждение записи — как у Qdrant с `wait=true`: запись в WAL и применение к сегментам;
-//! сброс на диск (`flush`) — после оптимизации и при закрытии.
+//! **Долговечность не как у Qdrant.** `update` пишет WAL и применяет операцию к сегментам,
+//! но Edge 0.8 WAL при `load` не воспроизводит (вызова `SerdeWal::read_all` в крейте нет) и
+//! не усекает (`ack` не вызывается), а сегменты попадают на диск только в `flush` — после
+//! оптимизации и при закрытии. Поэтому подтверждённый upsert теряется, если процесс завершится
+//! до `flush` (тест `confirmed_upsert_survives_process_exit`, `#[ignore]`), а WAL растёт
+//! без предела и целиком читается при открытии (ADR 0001). Для сервера это нарушило бы
+//! правило «задание закрывается только после подтверждённого upsert»; прототип оставлен
+//! как замерен, без `flush` на каждую запись.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -104,8 +110,12 @@ struct Open {
 struct Inner {
     dir: PathBuf,
     opts: EdgeOptions,
-    /// `None` — коллекции нет.
+    /// `None` — коллекции нет. Замок короткий (взять или подменить `Arc`): его берут и из
+    /// async-кода ([`Inner::shard`]), поэтому загрузка и удаление шарда идут вне его.
     slot: Mutex<Option<Open>>,
+    /// Сериализует открытие, создание и удаление шарда (секунды на HDD). Берётся только в
+    /// блокирующих потоках (`spawn_blocking`), никогда — из async-кода.
+    lifecycle: Mutex<()>,
 }
 
 impl Inner {
@@ -153,10 +163,12 @@ impl EdgeIndex {
             dir: dir.to_path_buf(),
             opts,
             slot: Mutex::new(None),
+            lifecycle: Mutex::new(()),
         });
         let sdir = inner.shard_dir();
         if sdir.exists() {
-            *inner.lock() = Some(load_shard(&sdir, &inner.opts)?);
+            let open = load_shard(&sdir, &inner.opts)?;
+            *inner.lock() = Some(open);
         }
         let (tx, rx) = channel();
         let worker = inner.clone();
@@ -343,11 +355,13 @@ impl EdgeIndex {
     async fn drop_all_impl(&self) -> Result<(), IndexError> {
         let inner = self.inner.clone();
         run_blocking("drop_all", move || {
+            let _life = inner.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
             let taken = inner.lock().take();
             if let Some(open) = taken {
                 // Каталог удаляется только после закрытия шарда (на Windows открытые mmap
-                // не дают удалить файлы): ждём завершения вызовов, держащих ссылку
-                // (в том числе идущей оптимизации).
+                // не дают удалить файлы): ждём завершения вызовов, держащих ссылку. Идущую
+                // оптимизацию не прервать — в `EdgeShard::optimize` флаг остановки локальный,
+                // отмены в API 0.8 нет; `drop_all` ждёт её конца (минуты на 1 млн точек).
                 let mut shard = open.shard;
                 loop {
                     match Arc::try_unwrap(shard) {
@@ -376,6 +390,8 @@ impl EdgeIndex {
 impl Drop for EdgeIndex {
     fn drop(&mut self) {
         // Закрытие канала останавливает оптимизатор; ждём его, чтобы шард закрылся до выхода.
+        // Идущий `optimize()` отменить нельзя (в API Edge 0.8 нет отмены): `Drop` ждёт его
+        // конца — на 1 млн точек это до десятков минут.
         self.dirty.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(h) = self
             .optimizer
@@ -496,12 +512,11 @@ fn read_meta(sdir: &Path) -> Option<ShardMeta> {
     serde_json::from_slice(&raw).ok()
 }
 
-/// Атомарная запись `zam_meta.json`: временный файл в том же каталоге и переименование.
+/// Атомарная запись `zam_meta.json` с `fsync` (как метка хранилища Qdrant).
 fn write_meta(sdir: &Path, meta: &ShardMeta) -> Result<(), IndexError> {
-    let tmp = sdir.join(format!("{META_FILE}.tmp"));
     let body = serde_json::to_vec(meta).map_err(|e| IndexError::Other(e.to_string()))?;
-    std::fs::write(&tmp, body).map_err(|e| io_err("метаданные Edge", e))?;
-    std::fs::rename(&tmp, sdir.join(META_FILE)).map_err(|e| io_err("метаданные Edge", e))
+    crate::supervisor::write_atomic(sdir, META_FILE, &body)
+        .map_err(|e| io_err("метаданные Edge", e))
 }
 
 fn edge_config(dim: usize, opts: &EdgeOptions) -> Result<EdgeConfig, IndexError> {
@@ -541,9 +556,11 @@ fn edge_config(dim: usize, opts: &EdgeOptions) -> Result<EdgeConfig, IndexError>
 }
 
 fn ensure_blocking(inner: &Inner, model_id: &str, dim: usize) -> Result<IndexMeta, IndexError> {
-    let mut slot = inner.lock();
+    // Открытие и создание — под замком жизненного цикла, слот при этом свободен: поиск и
+    // запись (`NotFound` до открытия) не ждут загрузки сегментов.
+    let _life = inner.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
     let mut created = false;
-    if slot.is_none() {
+    if inner.lock().is_none() {
         let sdir = inner.shard_dir();
         let open = if sdir.exists() {
             load_shard(&sdir, &inner.opts)?
@@ -564,12 +581,13 @@ fn ensure_blocking(inner: &Inner, model_id: &str, dim: usize) -> Result<IndexMet
                 meta: Some(meta),
             }
         };
-        *slot = Some(open);
+        *inner.lock() = Some(open);
     }
-    let open = slot.as_ref().expect("шард открыт выше");
-    let shard = open.shard.clone();
-    let meta = open.meta.clone();
-    drop(slot);
+    let (shard, meta) = {
+        let slot = inner.lock();
+        let open = slot.as_ref().expect("шард открыт выше");
+        (open.shard.clone(), open.meta.clone())
+    };
     let info = shard.info().map_err(|e| map_err("info", e))?;
     let own = meta.as_ref().is_some_and(|m| m.model_id == model_id);
     // Недостающие payload-индексы досоздаём только в «своём» шарде (как у managed).

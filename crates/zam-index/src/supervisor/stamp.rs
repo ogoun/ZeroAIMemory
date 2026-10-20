@@ -51,22 +51,28 @@ pub(crate) fn read_stamp(qdir: &Path) -> io::Result<Option<String>> {
     }
 }
 
-/// Пишет метку атомарно: временный файл, `fsync`, `rename` (на Unix — ещё `fsync` каталога).
+/// Пишет метку атомарно ([`write_atomic`]).
 pub(crate) fn write_stamp(qdir: &Path, version: &str) -> io::Result<()> {
-    use std::io::Write as _;
     let body = serde_json::to_string(&Stamp {
         qdrant_version: version.to_string(),
     })
     .map_err(io::Error::other)?;
-    let tmp = qdir.join(format!("{STAMP_FILE}.tmp"));
+    write_atomic(qdir, STAMP_FILE, body.as_bytes())
+}
+
+/// Атомарная запись файла `dir/name`: временный файл, `fsync`, `rename` (на Unix — ещё
+/// `fsync` каталога). Общая для метки хранилища и метаданных шарда Edge.
+pub(crate) fn write_atomic(dir: &Path, name: &str, body: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let tmp = dir.join(format!("{name}.tmp"));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(body.as_bytes())?;
+        f.write_all(body)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, qdir.join(STAMP_FILE))?;
+    std::fs::rename(&tmp, dir.join(name))?;
     #[cfg(unix)]
-    std::fs::File::open(qdir)?.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 

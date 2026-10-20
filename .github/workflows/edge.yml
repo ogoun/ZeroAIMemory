@@ -1,0 +1,47 @@
+# Прототип Qdrant Edge (feature `edge` у zam-index, ADR 0001): в сервер и комплекты не входит,
+# поэтому в ci.yml не собирается (+~8 мин на ОС). Здесь — только то, что прототип не отстал от
+# трейта VectorIndex и от qdrant-edge: clippy со всеми целями (тесты, пример index_bench).
+# Интеграционные тесты Edge и bench — вручную при пересмотре ADR.
+# Раз в неделю, при изменении трейта или прототипа и вручную; одна ОС — Linux (сборка Edge на
+# Windows проверена локально, условия пересмотра ADR требуют её повторить).
+name: Edge
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+  push:
+    branches: ['**']
+    tags-ignore: ['**']
+    paths:
+      - crates/zam-index/**
+      - crates/zam-core/**
+      - crates/zam-store/**
+      - crates/zam-markdown/**
+      - deploy/qdrant.toml
+      - Cargo.lock
+      - .github/workflows/edge.yml
+
+concurrency:
+  group: edge-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  edge:
+    name: clippy zam-index --features edge
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: edge
+      - name: clippy (edge)
+        run: cargo clippy -p zam-index --all-targets --features edge -- -D warnings

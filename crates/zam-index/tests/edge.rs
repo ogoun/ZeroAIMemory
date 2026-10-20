@@ -137,3 +137,47 @@ async fn background_optimizer_and_drop_all() {
     assert!(m.created);
     assert_eq!(m.points, 0);
 }
+
+/// Переменная окружения дочернего процесса теста устойчивости: каталог индекса.
+const CHILD_DIR: &str = "ZAM_EDGE_CHILD_DIR";
+
+/// Дочерняя половина [`confirmed_upsert_survives_process_exit`]: без переменной окружения
+/// ничего не делает. С ней — upsert 100 точек (подтверждён: `Ok`) и выход процесса без
+/// `Drop` (как убийство: `flush` в `Drop` шарда не выполняется).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_upsert_then_exit() {
+    let Ok(dir) = std::env::var(CHILD_DIR) else {
+        return;
+    };
+    let idx = EdgeIndex::open(Path::new(&dir), opts()).unwrap();
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let (c, node) = (ctx(), Id::new());
+    let pts: Vec<IndexPoint> = (0..100)
+        .map(|i| point(&c, node, &format!("c-{i}"), i, "a", "chunk"))
+        .collect();
+    idx.upsert(pts).await.unwrap();
+    std::process::exit(0);
+}
+
+/// Подтверждённый upsert переживает завершение процесса без `flush` (убийство, сбой).
+/// Edge 0.8 этого не обеспечивает: `EdgeShard::load` не воспроизводит WAL
+/// (`src/edge/edge_shard/mod.rs`, вызова `SerdeWal::read_all` нет нигде в крейте), а
+/// сегменты сбрасываются на диск только в `flush`. Тест фиксирует дефект (ADR 0001,
+/// «Зрелость API»); ожидаемо падает — запуск: `--features edge -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "известный дефект qdrant-edge 0.8: WAL не воспроизводится при load (ADR 0001)"]
+async fn confirmed_upsert_survives_process_exit() {
+    let dir = TestDir::new("crash");
+    let st = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["child_upsert_then_exit", "--exact", "--nocapture"])
+        .env(CHILD_DIR, &dir.0)
+        .status()
+        .unwrap();
+    assert!(st.success(), "дочерний процесс: {st:?}");
+    let idx = EdgeIndex::open(&dir.0, opts()).unwrap();
+    let m = idx.ensure(MODEL, DIM).await.unwrap();
+    assert_eq!(
+        m.points, 100,
+        "подтверждённые точки потеряны после выхода без flush"
+    );
+}
