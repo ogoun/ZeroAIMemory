@@ -119,14 +119,14 @@ fn rows(r: &BenchResult) -> Vec<Row> {
         &r.rerank,
         Some(if gpu { 150.0 } else { 1500.0 }),
     ));
-    // §17: «чанк 400 токенов» — итог по токенам/с (чанки корпуса — ~200 токенов): CPU — 3
-    // чанка по 400 = 1200 токенов/с; GPU — цель предложена по замеру (3000 токенов/с ≈ 7,5
-    // чанка по 400), ждёт решения владельца — справочно
+    // §17 (ТЗ v1.7): «чанк 400 токенов» — итог по токенам/с (чанки корпуса — ~200 токенов):
+    // CPU — 3 чанка по 400 = 1200 токенов/с; GPU — ≥ 3000 токенов/с (решение владельца
+    // 2026-10-20, RTX 3090, HDD)
     for (name, run) in [("корпус eval", &r.index_base), ("копии", &r.index_copies)] {
-        let target = if gpu {
-            "предложено ≥ 3000 ток./с (≈ 7,5 чанка по 400), ждёт решения владельца"
+        let (target, lim) = if gpu {
+            ("≥ 3000 ток./с (≈ 7,5 чанка по 400)", 3000.0)
         } else {
-            "≥ 3 чанка по 400 ток./с (≥ 1200 ток./с)"
+            ("≥ 3 чанка по 400 ток./с (≥ 1200 ток./с)", 1200.0)
         };
         out.push(match run {
             Some(i) => row(
@@ -143,7 +143,7 @@ fn rows(r: &BenchResult) -> Vec<Row> {
                     i.embed_secs,
                     i.qdrant_secs
                 ),
-                (!gpu).then_some(i.chunks_per_sec * i.avg_tokens >= 1200.0),
+                Some(i.chunks_per_sec * i.avg_tokens >= lim),
             ),
             None => row(&format!("Индексация, {name}"), target, "не замерялось".into(), None),
         });
@@ -254,11 +254,12 @@ fn rows(r: &BenchResult) -> Vec<Row> {
         mb(r.rss_fts_loaded),
         mb_ok(r.rss_fts_loaded, 50.0),
     ));
-    let model_lim = if gpu { 600.0 } else { 1100.0 };
+    // CPU — 1,5 ГБ на две сессии ORT (решение владельца 2026-10-20, ТЗ v1.7)
+    let model_lim = if gpu { 600.0 } else { 1500.0 };
     let model_target = if gpu {
         "≤ 0,6 ГБ (572 МиБ)"
     } else {
-        "≤ 1,1 ГБ (1049 МиБ)"
+        "≤ 1,5 ГБ (1431 МиБ)"
     };
     let with_private = |rss: Option<u64>, private: Option<u64>| match private {
         Some(_) => format!("{} (частная {})", mb(rss), mb(private)),
@@ -282,39 +283,60 @@ fn rows(r: &BenchResult) -> Vec<Row> {
     };
     out.push(row(
         "Реранкер, дополнительно",
+        // ТЗ v1.7: CPU — по факту при `ml.rerank_sessions` (решение владельца), справочно
         if gpu {
             "VRAM"
         } else {
-            "≤ 0,5 ГБ (477 МиБ)"
+            "по факту при `ml.rerank_sessions` (справочно)"
         },
         format!("{} (всего {})", mb(extra), mb(r.rss_after_rerank)),
-        (!gpu).then(|| mb_ok(extra, 500.0)).flatten(),
+        None,
     ));
-    let fmax = |f: &dyn Fn(&super::Startup) -> Option<f64>| {
-        r.startup
-            .iter()
+    let fmax_of = |list: &[super::Startup], f: &dyn Fn(&super::Startup) -> Option<f64>| {
+        list.iter()
             .filter_map(f)
             .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))))
     };
-    out.push(match fmax(&|s| s.qdrant_from_start_ms) {
+    let fmax = |f: &dyn Fn(&super::Startup) -> Option<f64>| fmax_of(&r.startup, f);
+    // ТЗ v1.7: цель 5 с — для штатного перезапуска. Первый старт прогона идёт сразу за
+    // массовой индексацией (этап index → search) — справочно (решение владельца 2026-10-20)
+    let (first, regular): (&[super::Startup], &[super::Startup]) =
+        if r.index_copies.is_some() && !r.startup.is_empty() {
+            r.startup.split_at(1)
+        } else {
+            (&[], &r.startup)
+        };
+    out.push(match fmax_of(regular, &|s| s.qdrant_from_start_ms) {
         None => row(
-            "Старт до готовности Qdrant",
+            "Старт до готовности Qdrant, штатный перезапуск",
             "≤ 5 с",
             "не замерялось".into(),
             None,
         ),
         Some(q) => row(
-            "Старт `zam-server` до готовности Qdrant (коллекция на диске)",
+            "Старт `zam-server` до готовности Qdrant, штатный перезапуск (коллекция на диске)",
             "≤ 5 с",
             format!(
                 "max {} из {} стартов (сам процесс Qdrant — max {})",
                 ms(q),
-                r.startup.len(),
-                fmax(&|s| s.qdrant_ready_ms).map_or("—".into(), ms)
+                regular.len(),
+                fmax_of(regular, &|s| s.qdrant_ready_ms).map_or("—".into(), ms)
             ),
             Some(q <= 5000.0),
         ),
     });
+    if let Some(q) = fmax_of(first, &|s| s.qdrant_from_start_ms) {
+        out.push(row(
+            "Первый старт после массовой индексации, до готовности Qdrant",
+            "справочно (исследуется: WAL Qdrant, очерёдность чтения с HDD)",
+            format!(
+                "{} (сам процесс Qdrant — {})",
+                ms(q),
+                fmax_of(first, &|s| s.qdrant_ready_ms).map_or("—".into(), ms)
+            ),
+            None,
+        ));
+    }
     if let Some(v) = fmax(&|s| Some(s.ready_ms)) {
         out.push(row(
             "Старт до готовности векторного канала (модель + Qdrant)",
@@ -443,4 +465,72 @@ pub fn write(out: &Path, r: &BenchResult) -> Result<(PathBuf, PathBuf)> {
     fs::write(&json, serde_json::to_string_pretty(r)? + "\n")?;
     fs::write(&md, markdown(r))?;
     Ok((json, md))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{IndexRun, Startup};
+    use super::*;
+
+    fn startup(qdrant_ms: f64) -> Startup {
+        Startup {
+            health_ms: 100.0,
+            ready_ms: qdrant_ms,
+            qdrant_from_start_ms: Some(qdrant_ms),
+            qdrant_ready_ms: Some(qdrant_ms / 2.0),
+            model_load_ms: None,
+        }
+    }
+
+    fn find<'a>(rows: &'a [Row], prefix: &str) -> &'a Row {
+        rows.iter()
+            .find(|r| r.metric.starts_with(prefix))
+            .unwrap_or_else(|| panic!("нет строки «{prefix}»"))
+    }
+
+    /// Цели ТЗ v1.7: RSS CPU 1,5 ГБ (10^9 байт), реранкер CPU справочно, GPU-индексация
+    /// ≥ 3000 ток./с с оценкой, старт 5 с — без первого старта после массовой индексации.
+    #[test]
+    fn targets_follow_spec_v1_7() {
+        let index = IndexRun {
+            notes: 1,
+            chunks: 100,
+            avg_tokens: 200.0,
+            secs: 10.0,
+            load_secs: 0.0,
+            chunks_per_sec: 20.0, // 4000 ток./с
+            post: None,
+            embed_secs: 1.0,
+            qdrant_secs: 1.0,
+        };
+        let mut r = BenchResult {
+            profile: Some(Profile::Cpu),
+            rss_idle_model: Some(1416 * 1024 * 1024),
+            rss_after_search: Some(1439 * 1024 * 1024), // 1,509 ГБ > 1,5 ГБ
+            rss_after_rerank: Some(2394 * 1024 * 1024),
+            index_copies: Some(index.clone()),
+            startup: vec![startup(9600.0), startup(1700.0), startup(1100.0)],
+            ..Default::default()
+        };
+        let rows = rows(&r);
+        assert_eq!(find(&rows, "RSS с bge-m3 в простое").ok, Some(true));
+        assert_eq!(find(&rows, "RSS с bge-m3 после поиска").ok, Some(false));
+        assert_eq!(find(&rows, "Реранкер, дополнительно").ok, None);
+        let regular = find(&rows, "Старт `zam-server` до готовности Qdrant, штатный");
+        assert_eq!(regular.ok, Some(true), "{}", regular.value);
+        let first = find(&rows, "Первый старт после массовой индексации");
+        assert_eq!(first.ok, None);
+        assert!(first.value.starts_with("9.60 с"), "{}", first.value);
+
+        r.profile = Some(Profile::Gpu);
+        let rows_gpu = super::rows(&r);
+        assert_eq!(find(&rows_gpu, "Индексация, копии").ok, Some(true));
+        r.index_copies = Some(IndexRun {
+            chunks_per_sec: 10.0, // 2000 ток./с
+            ..index
+        });
+        let rows_gpu = super::rows(&r);
+        assert_eq!(find(&rows_gpu, "Индексация, копии").ok, Some(false));
+        assert!(rows_gpu.iter().all(|r| !r.target.contains("владельц")));
+    }
 }
