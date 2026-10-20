@@ -682,7 +682,58 @@ pub fn git_rev(repo: &Path) -> String {
     };
     let sha = run(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "?".into());
     let dirty = run(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
-    if dirty { format!("{sha}+dirty") } else { sha }
+    if !dirty {
+        return sha;
+    }
+    match dirty_hash(repo) {
+        Some(h) => format!("{sha}+dirty.{h}"),
+        None => format!("{sha}+dirty"),
+    }
+}
+
+/// Отпечаток незакоммиченных изменений: `git hash-object` от `git diff HEAD --binary` и
+/// хэшей неотслеживаемых файлов (не из `.gitignore`) — одинаковое дерево даёт одинаковый
+/// отпечаток, по нему прогоны одного «грязного» кода сопоставимы. 8 hex-символов.
+fn dirty_hash(repo: &Path) -> Option<String> {
+    use std::io::Write as _;
+    let out = |args: &[&str]| -> Option<Vec<u8>> {
+        Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+    };
+    let mut buf = out(&["diff", "HEAD", "--binary"])?;
+    let untracked =
+        String::from_utf8(out(&["ls-files", "--others", "--exclude-standard"])?).ok()?;
+    let files: Vec<&str> = untracked.lines().filter(|l| !l.is_empty()).collect();
+    if !files.is_empty() {
+        let mut args = vec!["hash-object", "--"];
+        args.extend(files.iter().copied());
+        let hashes = out(&args)?;
+        for (f, h) in files.iter().zip(String::from_utf8_lossy(&hashes).lines()) {
+            buf.extend_from_slice(
+                format!(
+                    "
+{f} {h}"
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(&buf).ok()?;
+    let o = child.wait_with_output().ok()?;
+    let h = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    (h.len() >= 8).then(|| h[..8].to_string())
 }
 
 /// Сегодняшняя дата `YYYY-MM-DD` (местное время).

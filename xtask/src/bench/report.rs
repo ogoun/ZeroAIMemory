@@ -53,16 +53,20 @@ fn pass_row(metric: &str, p: &Option<Pass>, limit_ms: Option<f64>) -> Row {
             }
             if p.under_load.is_some() {
                 v.push_str(&format!(
-                    "; воркер за проход: заданий {}, инференс {}",
+                    "; воркер за проход: заданий {} ({:.2}/с, без запросов {}), инференс {}, уступка {}",
                     p.jobs_done,
-                    ms(p.index_embed_ms)
+                    p.jobs_per_sec,
+                    p.baseline_jobs_per_sec
+                        .map_or("—".into(), |b| format!("{b:.2}/с")),
+                    ms(p.index_embed_ms),
+                    ms(p.index_yield_ms)
                 ));
                 if p.attempts > 1 {
                     v.push_str(&format!(" (попытка {})", p.attempts));
                 }
             }
             if p.under_load == Some(false) {
-                v.push_str(" — **недействителен: воркер не индексировал**");
+                v.push_str(" — **недействителен: воркер почти не индексировал**");
                 return row(metric, &target, v, None);
             }
             row(
@@ -384,6 +388,29 @@ pub fn markdown(r: &BenchResult) -> String {
             "| {} | {} | {} | {ok} |\n",
             x.metric, x.target, x.value
         ));
+    }
+    if r.search_full_queue_attempts.len() > 1 {
+        s.push_str(
+            "
+Полная очередь, все попытки:
+",
+        );
+        for p in &r.search_full_queue_attempts {
+            let c = p.client.as_ref();
+            s.push_str(&format!(
+                "- попытка {}: p95 {}, заданий {} ({:.2}/с), {}
+",
+                p.attempts,
+                c.map_or("—".into(), |c| ms(c.p95)),
+                p.jobs_done,
+                p.jobs_per_sec,
+                if p.under_load == Some(true) {
+                    "засчитана"
+                } else {
+                    "недействительна"
+                }
+            ));
+        }
     }
     for (name, p) in [
         ("полная очередь", &r.search_full_queue),

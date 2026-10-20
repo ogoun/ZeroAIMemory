@@ -44,7 +44,8 @@ const SHA8_SUFFIX: &str = "sha8";
 
 /// Ключ кэша: размер, время изменения (нс от эпохи) и признак самого файла — Linux:
 /// inode и ctime (ctime из пространства пользователя не задать, `touch -r` его не
-/// подделает); Windows: серийный номер тома и номер файла (`GetFileInformationByHandle`):
+/// подделает); Windows: серийный номер тома, номер файла (`GetFileInformationByHandle`) и
+/// ChangeTime (`GetFileInformationByHandleEx(FileBasicInfo)`, аналог ctime):
 /// время создания не годится — NTFS «туннелирует» его на новый файл с тем же именем.
 /// Новый файл на месте старого (`models fetch`, копирование с сохранённым mtime) даёт
 /// другой ключ.
@@ -74,15 +75,29 @@ fn file_identity(path: &Path, _: &std::fs::Metadata) -> Option<String> {
     use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
     };
     let f = std::fs::File::open(path).ok()?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: handle открытого `File` жив до конца функции, структура — на стеке нужного типа.
     unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }.ok()?;
+    // ChangeTime меняется при любой записи данных и метаданных (в том числе при возврате
+    // mtime на прежнее значение) и из пространства пользователя не задаётся
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: тот же живой handle, буфер — структура FILE_BASIC_INFO на стеке своего размера.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(f.as_raw_handle()),
+            FileBasicInfo,
+            (&raw mut basic).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .ok()?;
     Some(format!(
-        "v{:x}f{:x}{:08x}",
-        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+        "v{:x}f{:x}{:08x}c{}",
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow, basic.ChangeTime
     ))
 }
 
@@ -181,6 +196,19 @@ mod tests {
         let full = Sha256::digest(b"weights v9");
         let want9: String = full[..4].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(v9, want9);
+        // правка на месте тем же размером с возвратом mtime: файл тот же, но ctime /
+        // ChangeTime другие — хэш заново
+        std::fs::write(&f, b"weights v8").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let v8 = sha8(&f).unwrap();
+        let full = Sha256::digest(b"weights v8");
+        let want8: String = full[..4].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(v8, want8);
         // замена файла (другой размер) — хэш заново
         std::fs::write(&f, b"weights version 2").unwrap();
         let v2 = sha8(&f).unwrap();

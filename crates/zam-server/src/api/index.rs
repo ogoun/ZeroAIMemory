@@ -209,6 +209,8 @@ pub async fn status(
                 "jobs_done": rt.worker.jobs_done(),
                 "embed_ms": embed.as_millis() as u64,
                 "qdrant_ms": qdrant.as_millis() as u64,
+                // ожидание уступки эмбеддингам запросов (в embed_ms не входит)
+                "yield_ms": rt.worker.yield_wait().as_millis() as u64,
             })
         }
         Principal::Token(_) => Value::Null,

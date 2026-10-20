@@ -470,3 +470,57 @@ fn relative_missing_runtime_is_no_runtime() {
         Err(MlError::NoRuntime(_))
     ));
 }
+
+/// Уступка индексации запросам (задача 15 M2): пока запрос в инференсе (слот занят),
+/// `embed_passages` ждёт; ожидание учитывается отдельно (`yield_wait`), а не как инференс.
+/// Без запросов уступки нет. `embed_query` держит счётчик запросов только на время
+/// инференса.
+#[test]
+fn passages_yield_to_running_query_and_query_holds_counter() {
+    let Some(e) = minilm() else { return };
+    let texts = ["первый текст для индексации", "second passage to embed"];
+    // без запросов — уступки нет
+    let y0 = e.yield_wait();
+    e.embed_passages(&texts).unwrap();
+    assert_eq!(e.yield_wait(), y0, "уступка без запросов");
+    // запрос «в работе» 60 мс: индексация ждёт его конца, ожидание — в yield_wait
+    let waited = std::thread::scope(|sc| {
+        let slot = e.hold_query_slot();
+        assert_eq!(e.queries_in_flight(), 1);
+        sc.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(slot);
+        });
+        let t = std::time::Instant::now();
+        e.embed_passages(&["третий текст, пока идёт запрос"])
+            .unwrap();
+        t.elapsed()
+    });
+    let y = e.yield_wait() - y0;
+    assert!(waited >= std::time::Duration::from_millis(50), "{waited:?}");
+    assert!(
+        y >= std::time::Duration::from_millis(40),
+        "yield_wait {y:?}"
+    );
+    assert_eq!(e.queries_in_flight(), 0);
+    // embed_query держит счётчик во время инференса: наблюдатель видит его ненулевым
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                seen.fetch_max(e.queries_in_flight(), std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        for i in 0..200 {
+            // разные тексты — мимо кэша запросов
+            e.embed_query(&format!("запрос номер {i}")).unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+    });
+    assert!(
+        seen.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "счётчик не наблюдался"
+    );
+    assert_eq!(e.queries_in_flight(), 0, "счётчик освобождён");
+}

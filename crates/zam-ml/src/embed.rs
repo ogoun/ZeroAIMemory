@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -47,6 +47,9 @@ fn wait_queries(queries: &AtomicUsize, max: std::time::Duration) -> std::time::D
     }
     t0.elapsed()
 }
+
+/// Слот запроса из [`Embedder::hold_query_slot`]; освобождается при `drop`.
+pub struct QuerySlot<'a>(#[allow(dead_code)] QueryGuard<'a>);
 
 /// Счётчик запросов в работе на время инференса запроса.
 struct QueryGuard<'a>(&'a AtomicUsize);
@@ -138,6 +141,9 @@ pub struct Embedder {
     /// Запросов в работе (`embed_query` после промаха кэша): батч индексации перед запуском
     /// ждёт, пока их нет (не дольше [`QUERY_YIELD_MAX`]) — §8: индексация уступает поиску.
     queries: AtomicUsize,
+    /// Суммарное время уступки запросам в `embed_passages`, мкс: не инференс, воркер
+    /// вычитает его из времени инференса (`/index/status` → `worker.yield_ms`).
+    yield_us: AtomicU64,
     report: DeviceReport,
     /// Окружение ORT живёт не меньше сессий.
     _env: Environment,
@@ -220,6 +226,7 @@ impl Embedder {
                 NonZeroUsize::new(QUERY_CACHE).expect("ненулевой размер"),
             )),
             queries: AtomicUsize::new(0),
+            yield_us: AtomicU64::new(0),
             report: report.clone(),
             _env: env,
         };
@@ -272,7 +279,11 @@ impl Embedder {
             };
             let end = (start + rows).min(order.len());
             let batch: Vec<&Encoding> = order[start..end].iter().map(|&i| &encs[i]).collect();
-            self.yield_to_queries();
+            // уступка — перед каждым батчем; у `dynamic_quant` «батч» — один текст, поэтому
+            // один раз на вызов: иначе ожидание на каждом тексте растягивало бы индексацию
+            if start == 0 || !self.spec.dynamic_quant {
+                self.yield_to_queries();
+            }
             for (k, e) in self.run(&mut runner, &batch)?.into_iter().enumerate() {
                 out[order[start + k]] = Some(e);
             }
@@ -314,7 +325,29 @@ impl Embedder {
     /// Перед батчем индексации: пока выполняются запросы, подождать (не дольше
     /// [`QUERY_YIELD_MAX`]), чтобы батч не занял устройство посреди их инференса.
     fn yield_to_queries(&self) {
-        wait_queries(&self.queries, QUERY_YIELD_MAX);
+        let waited = wait_queries(&self.queries, QUERY_YIELD_MAX);
+        // ожидание без запросов — время одной проверки; учитываем только реальную уступку
+        if waited >= std::time::Duration::from_micros(500) {
+            self.yield_us
+                .fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Суммарное время, которое `embed_passages` уступил запросам (не инференс).
+    pub fn yield_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.yield_us.load(Ordering::Relaxed))
+    }
+
+    /// Запросов в инференсе сейчас (диагностика и тесты).
+    pub fn queries_in_flight(&self) -> usize {
+        self.queries.load(Ordering::Acquire)
+    }
+
+    /// Занять «слот запроса», как `embed_query` на время инференса: пока слот держится,
+    /// `embed_passages` уступает (не дольше 100 мс на батч). Для тестов.
+    #[doc(hidden)]
+    pub fn hold_query_slot(&self) -> QuerySlot<'_> {
+        QuerySlot(QueryGuard::new(&self.queries))
     }
 
     /// Число токенов текста без спецтокенов (для `token_count` чанков).

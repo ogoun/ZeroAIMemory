@@ -79,6 +79,11 @@ pub trait PassageEmbedder: Send + Sync + 'static {
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Embedding>, String>;
     /// Токены текста без спецтокенов (предел L0).
     fn count_tokens(&self, text: &str) -> usize;
+    /// Суммарное время, которое эмбеддер уступил запросам внутри `embed_passages` (не
+    /// инференс; вычитается из `embed_ms`). По умолчанию — уступки нет.
+    fn yield_wait(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// Настройки воркера (`[index]` конфигурации сервера).
@@ -182,6 +187,8 @@ struct Inner {
     jobs_requeued: AtomicU64,
     /// Суммарное время инференса и записи в Qdrant, мкс (диагностика, `/index/status`).
     embed_us: AtomicU64,
+    /// Ожидание уступки запросам внутри инференса, мкс (в `embed_us` не входит).
+    yield_us: AtomicU64,
     qdrant_us: AtomicU64,
     /// Папки, свёртку которых нужно пересчитать (старый родитель при переносе).
     /// Множество: без воркера (FTS-only) подсказки не забираются, а размер ограничен
@@ -225,6 +232,7 @@ impl WorkerHandle {
                 jobs_done: AtomicU64::new(0),
                 jobs_requeued: AtomicU64::new(0),
                 embed_us: AtomicU64::new(0),
+                yield_us: AtomicU64::new(0),
                 qdrant_us: AtomicU64::new(0),
                 hints: Mutex::default(),
                 stop,
@@ -286,6 +294,12 @@ impl WorkerHandle {
     /// закрыто и не стало неудачным — повтор после возврата Qdrant.
     pub fn jobs_requeued(&self) -> u64 {
         self.inner.jobs_requeued.load(Ordering::SeqCst)
+    }
+
+    /// Суммарное ожидание уступки запросам внутри инференса с запуска (в [`Self::busy`] не
+    /// входит).
+    pub fn yield_wait(&self) -> Duration {
+        Duration::from_micros(self.inner.yield_us.load(Ordering::SeqCst))
     }
 
     /// Суммарное время с запуска: `(инференс, запись в Qdrant)` — где воркер тратит время.
@@ -1452,12 +1466,21 @@ impl Worker {
             let emb = self.deps.embedder.clone();
             let n = inputs.len();
             let t = Instant::now();
+            let y0 = self.deps.embedder.yield_wait();
             let out = tokio::task::spawn_blocking(move || {
                 let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
                 emb.embed_passages(&refs)
             })
             .await;
-            add_us(&self.inner.embed_us, t);
+            // уступка запросам — не инференс: отдельный счётчик
+            let waited = self.deps.embedder.yield_wait().saturating_sub(y0);
+            let busy = t.elapsed().saturating_sub(waited);
+            self.inner
+                .embed_us
+                .fetch_add(busy.as_micros() as u64, Ordering::SeqCst);
+            self.inner
+                .yield_us
+                .fetch_add(waited.as_micros() as u64, Ordering::SeqCst);
             let out = out
                 .map_err(|e| EmbedFail::Other(format!("поток инференса: {e}")))?
                 .map_err(EmbedFail::Other)?;

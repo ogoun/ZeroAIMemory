@@ -213,6 +213,10 @@ impl PassageEmbedder for EmbedderAdapter {
         self.0.model_id()
     }
 
+    fn yield_wait(&self) -> std::time::Duration {
+        self.0.yield_wait()
+    }
+
     fn dim(&self) -> usize {
         self.0.dim()
     }

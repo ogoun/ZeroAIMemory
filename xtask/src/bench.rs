@@ -57,6 +57,14 @@ const KILL_MARGIN: Duration = Duration::from_secs(3);
 const KILL_WAIT: Duration = Duration::from_secs(180);
 /// Попыток прохода при полной очереди (см. `phase_index`).
 const FULL_QUEUE_ATTEMPTS: usize = 3;
+/// Проход при полной очереди засчитывается, если воркер закрыл за него не меньше стольких
+/// заданий (заметок). Медленный профиль (CPU int8, копии по 1–3 чанка) закрывает 1,5–2
+/// задания/с, проход длится ~13 с — ожидается 20–25; на GPU (~10/с, проход ~7 с) — 60–80.
+/// 10 — половина ожидаемого на CPU: меньше значит, что воркер простаивал больше половины
+/// прохода (запись на HDD, свёртки), и «полной очереди» как нагрузки не было.
+const FULL_QUEUE_MIN_JOBS: u64 = 10;
+/// Окно замера скорости воркера без запросов перед проходом, с.
+const BASELINE_WINDOW: Duration = Duration::from_secs(10);
 /// Заметки для замера записи — не длиннее (≈ 5–8 чанков по ~200 токенов).
 const WRITE_MAX_BYTES: usize = 6000;
 
@@ -191,6 +199,14 @@ pub struct Pass {
     /// (`/index/status` → `worker`, сессия администратора).
     pub jobs_done: u64,
     pub index_embed_ms: f64,
+    /// Ожидание индексации, уступавшей запросам, за проход, мс.
+    pub index_yield_ms: f64,
+    /// Длительность прохода, с.
+    pub secs: f64,
+    /// Скорость воркера (заданий/с) за проход и за окно той же длины прямо перед ним без
+    /// запросов — во сколько раз поток запросов замедляет индексацию (только полная очередь).
+    pub jobs_per_sec: f64,
+    pub baseline_jobs_per_sec: Option<f64>,
     /// Проход «при полной очереди» действителен, только если воркер за него реально
     /// индексировал (`jobs_done > 0` и инференс шёл); иначе — `false` и пометка в отчёте.
     pub under_load: Option<bool>,
@@ -224,6 +240,8 @@ struct WorkerStat {
     jobs_done: u64,
     embed_ms: f64,
     qdrant_ms: f64,
+    /// Ожидание уступки запросам внутри инференса (в `embed_ms` не входит).
+    yield_ms: f64,
 }
 
 impl WorkerStat {
@@ -236,6 +254,7 @@ impl WorkerStat {
             jobs_done: w["jobs_done"].as_u64().unwrap_or(0),
             embed_ms: w["embed_ms"].as_f64().unwrap_or(0.0),
             qdrant_ms: w["qdrant_ms"].as_f64().unwrap_or(0.0),
+            yield_ms: w["yield_ms"].as_f64().unwrap_or(0.0),
         })
     }
 
@@ -245,6 +264,7 @@ impl WorkerStat {
             jobs_done: self.jobs_done.saturating_sub(before.jobs_done),
             embed_ms: self.embed_ms - before.embed_ms,
             qdrant_ms: self.qdrant_ms - before.qdrant_ms,
+            yield_ms: self.yield_ms - before.yield_ms,
         }
     }
 }
@@ -367,6 +387,8 @@ pub struct BenchResult {
     pub index_copies: Option<IndexRun>,
     pub write: Option<WriteRun>,
     pub search_full_queue: Option<Pass>,
+    /// Все попытки прохода при полной очереди (недействительные — `under_load = false`).
+    pub search_full_queue_attempts: Vec<Pass>,
     pub search_empty_queue: Option<Pass>,
     pub search_cached: Option<Pass>,
     pub rerank: Option<Pass>,
@@ -467,6 +489,7 @@ impl Http {
 fn pass(h: &Http, queries: &[String], rerank: bool) -> Result<Pass> {
     let queue_before = h.queue()?;
     let w0 = WorkerStat::of(&h.status()?)?;
+    let t0 = Instant::now();
     let mut client = Vec::with_capacity(queries.len());
     let mut server: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let (mut degraded, mut warnings) = (0, 0);
@@ -500,6 +523,10 @@ fn pass(h: &Http, queries: &[String], rerank: bool) -> Result<Pass> {
         queue_after: h.queue()?,
         jobs_done: 0,
         index_embed_ms: 0.0,
+        index_yield_ms: 0.0,
+        secs: 0.0,
+        jobs_per_sec: 0.0,
+        baseline_jobs_per_sec: None,
         under_load: None,
         attempts: 1,
     })
@@ -507,6 +534,9 @@ fn pass(h: &Http, queries: &[String], rerank: bool) -> Result<Pass> {
         let w = WorkerStat::of(&h.status()?)?.since(w0);
         p.jobs_done = w.jobs_done;
         p.index_embed_ms = w.embed_ms;
+        p.index_yield_ms = w.yield_ms;
+        p.secs = t0.elapsed().as_secs_f64();
+        p.jobs_per_sec = w.jobs_done as f64 / p.secs.max(1e-9);
         Ok(p)
     })
 }
@@ -919,36 +949,60 @@ fn phase_index(c: &Ctx, corpus: &Corpus, a: &BenchArgs, r: &mut BenchResult) -> 
     // Воркер на HDD бывает занят секундами записи (Qdrant `wait=true`, checkpoint SQLite) и
     // за проход в ~6 с не закрывает ни одного задания: тогда проход повторяется после
     // перезапуска сервера (холодный кэш запросов, очередь — в SQLite, не теряется).
-    let mut p = None;
+    // время перезапусков между попытками в скорость индексации копий не входит, счётчики
+    // воркера нового процесса начинаются с нуля — копятся по процессам
+    let mut paused = Duration::ZERO;
+    let mut busy_acc = (0.0, 0.0);
+    let mut w0 = w0;
+    let mut valid = None;
     for attempt in 1..=FULL_QUEUE_ATTEMPTS {
         if attempt > 1 {
             println!("  повтор {attempt}: перезапуск сервера (холодный кэш запросов)");
+            let w = worker_busy(&h)?;
+            busy_acc = (busy_acc.0 + w.0 - w0.0, busy_acc.1 + w.1 - w0.1);
+            let tp = Instant::now();
             c.stop(s, &format!("index-try{}", attempt - 1))?;
             (s, h, _) = c.start(r)?;
+            paused += tp.elapsed();
+            w0 = worker_busy(&h)?;
         }
         if !wait_worker_progress(&h, Duration::from_secs(120))? {
             println!("  ВНИМАНИЕ: воркер не закрыл ни одного задания за 120 с");
         }
+        // скорость воркера без запросов — окно перед проходом
+        let b0 = WorkerStat::of(&h.status()?)?;
+        let tb = Instant::now();
+        thread::sleep(BASELINE_WINDOW);
+        let b = WorkerStat::of(&h.status()?)?.since(b0);
+        let baseline = b.jobs_done as f64 / tb.elapsed().as_secs_f64();
         let mut q = pass(&h, &c.queries, false)?;
         q.attempts = attempt;
-        q.under_load = Some(q.jobs_done > 0 && q.index_embed_ms > 0.0);
+        q.baseline_jobs_per_sec = Some(baseline);
+        q.under_load = Some(q.jobs_done >= FULL_QUEUE_MIN_JOBS && q.index_embed_ms > 0.0);
         let ok = q.under_load == Some(true);
         print_pass("chunks, полная очередь", &q);
-        p = Some(q);
+        println!(
+            "  воркер: без запросов {baseline:.2} задания/с, под потоком запросов {:.2} задания/с, уступка {:.0} мс",
+            q.jobs_per_sec, q.index_yield_ms
+        );
+        r.search_full_queue_attempts.push(q.clone());
         if ok {
+            valid = Some(q);
             break;
         }
-        println!("  за проход воркер не индексировал — замер недействителен");
+        println!(
+            "  за проход воркер закрыл меньше {FULL_QUEUE_MIN_JOBS} заданий — замер недействителен"
+        );
     }
-    let p = p.expect("хотя бы одна попытка");
-    r.search_full_queue = Some(p);
+    r.search_full_queue = valid.or_else(|| r.search_full_queue_attempts.last().cloned());
     if a.no_copies_wait {
         println!("  --no-copies-wait: индексация копий не дожидается");
         return c.stop(s, "index");
     }
     wait_idle(&mut s, &h, t0, INDEX_WAIT)?;
-    let secs = t0.elapsed().as_secs_f64();
-    let w1 = worker_busy(&h)?;
+    let secs = t0.elapsed().saturating_sub(paused).as_secs_f64();
+    let w = worker_busy(&h)?;
+    let w1 = (busy_acc.0 + w.0, busy_acc.1 + w.1);
     let (n, avg, _) = chunk_stats(&s.data, "bench/%")?;
     let run = IndexRun {
         notes: list.len(),
