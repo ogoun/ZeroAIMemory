@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+## [0.0.3-m2] - 2026-10-20
+
+Этап M2: индекс и ML. Гибридный поиск (полнотекст + векторы bge-m3, слияние RRF), встроенные
+модели на CPU (int8) и CUDA (fp16), управляемый нативный Qdrant с перезапуском и
+деградацией до полнотекста, очередь индексации, сводки L0/L1, необязательный серверный
+реранк, страница «Индекс» в WebUI. Комплекты cpu и gpu для Windows x64 и Linux x64, модели —
+архивами `zam-models` или `zam-server models fetch`, библиотеки NVIDIA — `zam-server cuda
+fetch` или архив `zam-cuda`. Качество поиска на наборе `eval/` (160 заметок, 197 запросов):
+гибрид bge-m3 int8 — recall@5 0,750, nDCG@10 0,746 (только FTS — 0,713 / 0,686), с реранком —
+0,853 / 0,831 (`eval/results/2026-10-20-*`).
+
 ### Added
 - Манифест моделей `deploy/models.toml`: bge-m3 int8 (CPU) и fp16 (GPU) от Xenova со sparse-головой BAAI, тестовая MiniLM-L6 int8, реранкеры `bge-reranker-v2-m3` (GPU) и `jina-reranker-v2` (CPU, CC-BY-NC-4.0: не входит в `zam-models`, загрузка только с `--accept-nc-license`). Каждый файл закреплён ревизией Hugging Face и SHA-256.
 - `cargo xtask fetch-models [--test] [--id ID]… [--accept-nc-license]` — загрузка моделей в `target/models/<id>/` с проверкой SHA-256; при несовпадении временный файл удаляется.
@@ -122,6 +133,22 @@
 - Нестабильные под нагрузкой HDD тесты: `zam-index worker::indexes_replaces_and_deletes_points_and_skips_excluded` (гонка теста: замер счётчика модели до отложенной свёртки L0 папки; теперь ожидание покоя воркера) и `zam-server index_worker::twenty_notes_indexed…` (медленные записи `wait=true` — по две на задание при десятке параллельных Qdrant; исправлено пакетной записью). Помощник тестов `TestQdrant` ограничивает число одновременно запущенных Qdrant в бинарнике теста (`ZAM_TEST_QDRANT_MAX`, по умолчанию 4): тесты zam-index worker — 128 с вместо 345 с.
 - Windows: управляемый Qdrant ломался на длинном каталоге данных (от ~80 символов, например внутри `target/smoke/…`): относительные пути `./storage` в `zam.yaml` вместе с глубокими файлами payload-индексов превышали MAX_PATH (260), создание индекса `updated_at` давало «failed to open mutable numeric index on gridstore» (os error 3), векторная индексация не начиналась, а следующий запуск Qdrant падал при загрузке коллекции. Теперь на Windows `storage_path`, `snapshots_path` и `temp_path` пишутся абсолютными в форме `\\?\…` (UNC — `\\?\UNC\…`, пути `\\?\…` и `\\.\…` не меняются; относительный `data_dir` — от текущего каталога); на Linux — по-прежнему относительные. Найдено smoke-тестом комплекта.
 - Windows: `onnxruntime.dll` (и CPU, и GPU) импортирует MSVCP140, MSVCP140_1, VCRUNTIME140 и VCRUNTIME140_1, а `onnxruntime_providers_cuda.dll` ещё MSVCP140_ATOMIC_WAIT; на чистой Windows без VC++ Redistributable ONNX Runtime не загружался и сервер работал только по полнотексту. Теперь эти библиотеки лежат app-local рядом с `zam-server.exe` (из VC Redist установленной Visual Studio, `LICENSES/MSVC-RUNTIME-NOTICE.txt`), smoke проверяет таблицы импорта.
+- `zam-server cuda fetch` (и любая замена файлов по манифесту: `qdrant fetch`) проверяет до загрузки и до удаления штампа, что существующие файлы можно заменить: на Windows при работающем сервере библиотеки CUDA заняты — ошибка с подсказкой остановить сервер, файлы и штампы не меняются (раньше замена обрывалась на середине и оставляла смесь библиотек без штампа). Тест `install_archive_refuses_busy_file_before_download`.
+- Тесты: `zam-ml models::tests::sha8_is_cached_by_file_identity` падал в CI на обеих ОС (с `b4c1b85`): ctime/ChangeTime ставятся по грубым часам ядра, правка на месте сразу за переименованием давала тот же ключ кэша; `qdrant_lifecycle::killed_server_takes_qdrant_down_and_restarts_with_long_data_dir` и `index_worker::managed_storage_rebuild_reindexes_from_embeddings_without_inference` нестабильно падали на HDD — не ждали отложенной свёртки L0 папки.
+- `cargo xtask smoke --cuda-archive`: первый старт с только что распакованным `zam-cuda` ждёт `/health` до 120 с (было 10 с) и печатает время.
+
+### Known limitations
+- Не все цели §17 ТЗ выполнены; отступления приняты владельцем 2026-10-20 (ТЗ v1.7, `docs/journal.md`): индексация на CPU — 690–770 токенов/с (цель — 3 чанка по 400 токенов в секунду); поиск FTS-only — p95 30–32 мс на 10 тыс. заметок (цель 20 мс, HDD); поиск на GPU при полной очереди индексации — p95 52 мс (цель 50). Цели пересмотрены владельцем: RSS с bge-m3 на CPU — 1,5 ГБ (две сессии ORT), память реранкера jina — по факту `ml.rerank_sessions`, индексация на GPU — ≥ 3000 токенов/с (RTX 3090, HDD; замер 4323–7141).
+- Не выполнено и открыто: RSS на GPU — 808–1248 МиБ при цели 0,6 ГБ (библиотеки CUDA/cuDNN, замер на Windows; на Linux не мерился); RSS без моделей на 10 тыс. заметок — 54 МиБ при 50 МБ (кэш страниц SQLite).
+- Первый старт после жёсткой остановки сразу за массовой индексацией на HDD — 5,4 с (GPU) и 9,6 с (CPU) до готовности векторного поиска: Qdrant повторяет WAL после `TerminateProcess`; цель 5 с относится к штатному перезапуску (1,1–2,0 с). Сброс WAL перед остановкой и очерёдность чтения с HDD — исследуются.
+- Перефразы без общих слов с запросом находятся плохо (recall@5 ≈ 0,11 у гибрида без реранка): bge-m3 на коротких заметках корпуса eval; реранк поднимает общую выдачу (nDCG@10 0,746 → 0,831).
+- Гейт качества int8 по порогу косинуса dense 0,99 не пройден (Xenova int8 — 0,978); по поиску ухудшения нет, int8 оставлен решением владельца.
+- Хвост записи до FTS при массовой загрузке во время индексации на HDD — до 8–10 с (фоновый `RESTART` checkpoint SQLite), p95 — 13–24 мс.
+- `qdrant.mode = "edge"` — прототип за feature `edge`, в сервер и комплекты не входит (ADR 0001: не переходить; у qdrant-edge 0.8 WAL не воспроизводится при открытии — тест `confirmed_upsert_survives_process_exit` под `#[ignore]`).
+- На Windows каталог данных — не длиннее 190 символов (MAX_PATH у SQLite и рабочего каталога Qdrant).
+- `zam-server service install`, `doctor`, `backup`/`restore` — этап M7. Журналы, граф, vault — M3; MCP, хуки, проактивное вспоминание — M4.
+- GPU на Linux с драйвером NVIDIA вручную не проверялся (в CI — сборка и smoke GPU-комплекта на CPU).
+- Реранкер jina (CC-BY-NC-4.0) не входит в `zam-models` и скачивается только с `--accept-nc-license`; без него `rerank: on` на CPU отвечает предупреждением и прежним порядком.
 
 ## [0.0.2-m1] - 2026-10-18
 

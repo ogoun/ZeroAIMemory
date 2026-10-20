@@ -31,7 +31,9 @@ format = "json"
 max_files = 14
 
 [qdrant]
-# Режим Qdrant: "managed" (запускается сервером), "external" (внешний, нужен url) или "edge".
+# Режим Qdrant: "managed" (запускается сервером) или "external" (внешний, нужен url).
+# "edge" (встроенный qdrant-edge) — прототип M2, в сервер не подключён (docs/adr/0001-qdrant-edge.md):
+# конфиг его принимает, но векторный поиск выключается с причиной в журнале и /index/status.
 mode = "managed"
 # gRPC-адрес внешнего Qdrant (для mode = "external").
 # url = "http://127.0.0.1:6334"
