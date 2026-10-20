@@ -566,7 +566,7 @@ disjoint = true
 
 [[query]]
 id = "d-02"
-text = "fn handing back a borrowed piece of one of several inputs won't build"
+text = "routine handing back a borrowed piece of one of several inputs won't build"
 lang = "en"
 expect = ["en/rust/e0106-missing-lifetime-specifier"]
 kind = "paraphrase"
@@ -590,7 +590,7 @@ disjoint = true
 
 [[query]]
 id = "d-05"
-text = "примитив синхронизации для редко изменяемых данных с массой потребителей"
+text = "примитив синхронизации для нечасто изменяемых данных с массой потребителей"
 lang = "ru"
 expect = ["ru/rust/rwlock-vs-mutex"]
 kind = "paraphrase"
@@ -938,7 +938,7 @@ kind = "broad"
 
 [[query]]
 id = "f-01"
-text = "насколько можно доверять разнице оценок качества на малом наборе вопросов"
+text = "можно ли верить, что одна выдача лучше другой, когда контрольных вопросов немного"
 lang = "ru"
 expect = ["ru/research/butstrep-intervaly"]
 kind = "paraphrase"
@@ -985,7 +985,7 @@ kind = "paraphrase"
 
 [[query]]
 id = "f-07"
-text = "как ИИ-помощнику запоминать прошлые разговоры и выученные уроки"
+text = "как ИИ-помощнику запоминать прошлые разговоры и накопленный опыт"
 lang = "ru"
 expect = ["ru/research/pamyat-agentov"]
 kind = "paraphrase"
@@ -1323,7 +1323,7 @@ disjoint = true
 
 [[query]]
 id = "h-05"
-text = "web backend stalls, handlers stuck expecting a DB handle"
+text = "web service freezes, workers stuck awaiting a spare datastore link"
 lang = "en"
 expect = ["en/db/connection-pool-exhaustion"]
 kind = "paraphrase"

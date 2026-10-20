@@ -401,10 +401,11 @@ cargo xtask eval --device cuda --mode hybrid --mode hybrid+rerank
 cargo xtask eval --quality-gate                              # int8 против fp32 BAAI
 ```
 
-Последний прогон (2026-10-19, nDCG@10 по всем запросам): FTS-only 0,69; hybrid int8 CPU
-0,75, с реранком jina 0,83; hybrid fp16 CUDA 0,75, с реранком bge-reranker 0,84. int8 по
-поиску не отличается от fp32 (Δ nDCG@10 ≤ 0,2 п. п.), но порог косинуса dense 0,99 гейта
-не проходит (0,978) — решение и альтернативы в журнале
+Последний прогон (2026-10-20, nDCG@10 по всем запросам): FTS-only 0,69; hybrid int8 CPU
+0,75, с реранком jina 0,83; hybrid fp16 CUDA 0,75, с реранком bge-reranker 0,83. Веса
+подобраны на том же наборе, так что оценка после подбора завышена. Ухудшения поиска int8
+относительно fp32 не обнаружено (95 % интервал Δ nDCG@10 −0,007…+0,012), но порог
+косинуса dense 0,99 гейта int8 не проходит (0,978) — решение и альтернативы в журнале
 [docs/plans/2026-10-19-m2-index-ml-log.md](docs/plans/2026-10-19-m2-index-ml-log.md).
 
 ### WebUI

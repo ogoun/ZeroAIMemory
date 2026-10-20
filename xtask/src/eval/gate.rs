@@ -26,7 +26,7 @@ use half::f16;
 use serde::Serialize;
 
 use super::corpus::{Corpus, Query};
-use super::metrics::{cosine, quantile, spearman};
+use super::metrics::{QueryMetrics, cosine, paired_diff, quantile, spearman};
 use super::report::{self, est};
 use super::run::{self, RunResult, RunSpec, Session};
 use super::{Device, EvalArgs, Mode, Paths};
@@ -199,6 +199,8 @@ pub struct Check {
     pub value: f64,
     pub threshold: String,
     pub pass: bool,
+    /// 95 % интервал парного бутстрепа разности по запросам (только для метрик поиска).
+    pub ci: Option<[f64; 2]>,
 }
 
 fn check(name: &str, value: f64, threshold: String, pass: bool) -> Check {
@@ -207,14 +209,27 @@ fn check(name: &str, value: f64, threshold: String, pass: bool) -> Check {
         value,
         threshold,
         pass,
+        ci: None,
+    }
+}
+
+/// Разность метрики кандидата и эталона по одним запросам: среднее и 95 % интервал.
+fn metric_check(name: &str, m: &RunResult, r: &RunResult, f: fn(&QueryMetrics) -> f64) -> Check {
+    let col = |x: &RunResult| x.queries.iter().map(|q| f(&q.metrics)).collect::<Vec<_>>();
+    let d = paired_diff(&col(r), &col(m));
+    Check {
+        ci: Some([d.lo, d.hi]),
+        ..check(
+            name,
+            d.mean,
+            format!("≥ −{METRIC_DROP_MAX}"),
+            d.mean >= -METRIC_DROP_MAX,
+        )
     }
 }
 
 /// Проверки одной модели против эталона.
 fn checks(v: &VectorCompare, m: &RunResult, r: &RunResult) -> Vec<Check> {
-    let (mo, ro) = (&m.metrics.overall, &r.metrics.overall);
-    let dr = mo.recall5.mean - ro.recall5.mean;
-    let dn = mo.ndcg10.mean - ro.ndcg10.mean;
     vec![
         check(
             "dense: средний косинус",
@@ -234,18 +249,8 @@ fn checks(v: &VectorCompare, m: &RunResult, r: &RunResult) -> Vec<Check> {
             format!("≥ {SPARSE_MEAN_MIN}"),
             v.sparse_spearman_mean >= SPARSE_MEAN_MIN,
         ),
-        check(
-            "recall@5: разница с fp32",
-            dr,
-            format!("≥ −{METRIC_DROP_MAX}"),
-            dr >= -METRIC_DROP_MAX,
-        ),
-        check(
-            "nDCG@10: разница с fp32",
-            dn,
-            format!("≥ −{METRIC_DROP_MAX}"),
-            dn >= -METRIC_DROP_MAX,
-        ),
+        metric_check("recall@5: разница с fp32", m, r, |q| q.recall5),
+        metric_check("nDCG@10: разница с fp32", m, r, |q| q.ndcg10),
     ]
 }
 
@@ -432,12 +437,18 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) -> Resul
 }
 
 fn checks_table(c: &[Check]) -> String {
-    let mut s = String::from("| Проверка | Значение | Порог | Итог |\n|---|---:|---|---|\n");
+    let mut s = String::from(
+        "| Проверка | Значение | 95 % интервал (парный бутстреп) | Порог | Итог |\n\
+         |---|---:|---|---|---|\n",
+    );
     for x in c {
+        let ci = x.ci.map_or("—".to_string(), |[lo, hi]| {
+            format!("{:+.4} … {:+.4}", lo + 0.0, hi + 0.0)
+        });
         s.push_str(&format!(
-            "| {} | {:.4} | {} | {} |\n",
+            "| {} | {:.4} | {ci} | {} | {} |\n",
             x.name,
-            x.value,
+            x.value + 0.0,
             x.threshold,
             if x.pass { "да" } else { "**нет**" }
         ));

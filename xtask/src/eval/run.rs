@@ -162,6 +162,42 @@ pub struct Session {
     /// `/index/status` после индексации.
     pub status: Value,
     pub index_secs: f64,
+    /// Действующие `[search]` и `[index]` сервера (из его журнала при старте).
+    pub server_config: Value,
+    /// Начало загрузки корпуса: от него считается время индексации.
+    loaded_at: Option<Instant>,
+}
+
+/// Сообщение журнала сервера с действующими `[search]` и `[index]`.
+const CONFIG_LOG_MESSAGE: &str = "параметры поиска и индексации";
+
+/// Действующие `[search]` и `[index]` из журнала сервера (JSON-строки поля `fields`).
+fn server_config(log: &Path) -> Result<Value> {
+    let t0 = Instant::now();
+    loop {
+        let text = fs::read_to_string(log).unwrap_or_default();
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let f = &v["fields"];
+            if f["message"] == CONFIG_LOG_MESSAGE {
+                let parse = |k: &str| {
+                    f[k].as_str()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or(Value::Null)
+                };
+                return Ok(json!({ "search": parse("search"), "index": parse("index") }));
+            }
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            bail!(
+                "в журнале {} нет строки «{CONFIG_LOG_MESSAGE}»",
+                log.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Окружение сервера прогона.
@@ -237,6 +273,7 @@ impl Session {
         let log = dir.join("zam-server.stderr.log");
         let mut srv = Server::start(server, &data, &env, &log)?;
         wait_health_for(&mut srv, &base, HEALTH_WAIT)?;
+        let server_config = server_config(&log)?;
         let token_file = dir.join(TOKEN_FILE);
         let token = match srv.token_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(t) => {
@@ -261,6 +298,8 @@ impl Session {
             spec: spec.clone(),
             status: Value::Null,
             index_secs: 0.0,
+            server_config,
+            loaded_at: None,
         })
     }
 
@@ -269,7 +308,8 @@ impl Session {
     }
 
     /// Пишет заметки корпуса в Knowledge (`POST /nodes`).
-    pub fn load_corpus(&self, corpus: &Corpus) -> Result<()> {
+    pub fn load_corpus(&mut self, corpus: &Corpus) -> Result<()> {
+        self.loaded_at = Some(Instant::now());
         for n in corpus.notes.values() {
             let body = json!({
                 "space": "knowledge",
@@ -297,7 +337,8 @@ impl Session {
     /// Ждёт векторной индексации: очередь пуста, векторный канал доступен, проверочный
     /// поиск без деградации и `pending_count = 0`. Неудавшиеся задания — ошибка.
     pub fn wait_indexed(&mut self) -> Result<()> {
-        let t0 = Instant::now();
+        // время индексации — от начала загрузки корпуса (запись и очередь идут параллельно)
+        let t0 = self.loaded_at.unwrap_or_else(Instant::now);
         let probe = json!({ "query": "eval", "mode": "notes", "top_k": 1 });
         let mut last_print = Instant::now();
         loop {
@@ -565,9 +606,13 @@ pub struct RunInfo {
     pub device_reason: Option<String>,
     pub reranker: Option<String>,
     pub sets: BTreeMap<String, String>,
+    /// Действующие `[search]` и `[index]` сервера (итог слоёв конфигурации).
+    pub server_config: Value,
     pub notes: usize,
     pub corpus_fingerprint: String,
     pub queries: usize,
+    /// Отпечаток запросов (FNV-1a по TOML запросов): результаты на разных наборах не сравнимы.
+    pub queries_fingerprint: String,
     pub index_secs: f64,
     pub query_ms_p50: f64,
     pub query_ms_p95: f64,
@@ -647,9 +692,11 @@ pub fn result(
                 .then(|| st["device"]["reason"].as_str().unwrap_or_default().into()),
             reranker: (mode == Mode::HybridRerank).then(|| effective_reranker(&s.spec, st)),
             sets: s.spec.sets.iter().cloned().collect(),
+            server_config: s.server_config.clone(),
             notes: corpus.notes.len(),
             corpus_fingerprint: corpus.fingerprint(),
             queries: queries.len(),
+            queries_fingerprint: queries_fingerprint(queries),
             index_secs: s.index_secs,
             query_ms_p50: quantile(&ms, 0.5),
             query_ms_p95: quantile(&ms, 0.95),
@@ -725,4 +772,13 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
         println!("  {}\n  {}", json.display(), md.display());
     }
     s.stop()
+}
+
+/// Отпечаток набора запросов: FNV-1a по id, тексту, ожидаемым заметкам и виду.
+pub fn queries_fingerprint(queries: &[Query]) -> String {
+    let text: String = queries
+        .iter()
+        .map(|q| format!("{}\0{}\0{}\0{}\0", q.id, q.text, q.expect.join(","), q.kind))
+        .collect();
+    super::corpus::fnv1a(text.into_bytes())
 }

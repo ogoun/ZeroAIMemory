@@ -7,10 +7,12 @@
 //! и учитывается в лексической проверке.
 //!
 //! **Общие слова.** Слово — непрерывная последовательность букв и цифр в нижнем регистре
-//! длиной от 3 символов, не из списка служебных слов. Два слова считаются одним, если
-//! совпадают их первые `min(5, длина)` символов: так грубо склеиваются словоформы
-//! («настройка» / «настроить», «config» / «configuration») и повторяется префиксный поиск
-//! FTS5 (`"слово"*`). Запрос с `disjoint = true` не должен иметь ни одного общего слова
+//! длиной от 2 символов, не из списка служебных слов. Два слова считаются одним, если
+//! совпадают их основы Snowball (`rust-stemmers`: русский для кириллицы, английский для
+//! латиницы) или — у слов от 3 символов — первые `min(5, длина)` символов: префикс повторяет
+//! префиксный поиск FTS5 (`"слово"*`) и ловит то, что стеммер разводит («настройка» /
+//! «настроить», «config» / «configuration»); слова из 2 символов — только целиком или по
+//! основе. Запрос с `disjoint = true` не должен иметь ни одного общего слова
 //! с текстом и путём каждой ожидаемой заметки — его не найдут ни bm25, ни trigram по
 //! словам, только векторный канал.
 
@@ -123,8 +125,10 @@ struct QueryFile {
 const NOTE_MAX_BYTES: usize = 64 * 1024;
 /// Предел длины запроса (`/search`: 512 символов).
 const QUERY_MAX_CHARS: usize = 512;
-/// Слово короче не считается (как префиксный поиск FTS5 от 3 символов).
-const MIN_WORD: usize = 3;
+/// Слово короче не считается.
+const MIN_WORD: usize = 2;
+/// Префиксное сравнение — для слов от этой длины (как префиксный поиск FTS5).
+const MIN_PREFIX: usize = 3;
 /// Длина «основы» слова для сравнения словоформ.
 const STEM: usize = 5;
 
@@ -241,6 +245,31 @@ const STOPWORDS: &[&str] = &[
     "ways",
     "thing",
     "things",
+    // служебные слова из 2 символов (слова от 2 символов тоже сравниваются)
+    "in",
+    "on",
+    "to",
+    "of",
+    "is",
+    "it",
+    "at",
+    "as",
+    "by",
+    "or",
+    "an",
+    "be",
+    "do",
+    "if",
+    "no",
+    "so",
+    "up",
+    "we",
+    "my",
+    "me",
+    "us",
+    "am",
+    "he",
+    "vs",
     // ru
     "как",
     "что",
@@ -347,6 +376,33 @@ const STOPWORDS: &[&str] = &[
     "чтоб",
     "куда",
     "откуда",
+    // служебные слова из 2 символов (слова от 2 символов тоже сравниваются)
+    "то",
+    "же",
+    "бы",
+    "мы",
+    "вы",
+    "их",
+    "ей",
+    "им",
+    "он",
+    "да",
+    "ну",
+    "уж",
+    "ее",
+    "ты",
+    // местоимения: в перефразе «мой код» не делает слово общим
+    "мой",
+    "моя",
+    "моё",
+    "мое",
+    "мои",
+    "моего",
+    "моей",
+    "моих",
+    "твой",
+    "наш",
+    "ваш",
 ];
 
 fn is_stopword(w: &str) -> bool {
@@ -363,19 +419,53 @@ pub fn content_words(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Одно ли это слово с точностью до словоформы: совпадают первые `min(5, длины)` символов.
-pub fn same_word(a: &str, b: &str) -> bool {
+/// Основа Snowball: русский стеммер для слов с кириллицей, английский — для остальных.
+pub fn stem(w: &str) -> String {
+    use rust_stemmers::{Algorithm, Stemmer};
+    use std::sync::OnceLock;
+    static RU: OnceLock<Stemmer> = OnceLock::new();
+    static EN: OnceLock<Stemmer> = OnceLock::new();
+    let cyr = w.chars().any(|c| matches!(c, 'а'..='я' | 'ё'));
+    let s = if cyr {
+        RU.get_or_init(|| Stemmer::create(Algorithm::Russian))
+    } else {
+        EN.get_or_init(|| Stemmer::create(Algorithm::English))
+    };
+    s.stem(w).into_owned()
+}
+
+/// Одно ли это слово с точностью до словоформы: совпали основы Snowball или (у слов от
+/// 3 символов) первые `min(5, длины)` символов.
+#[cfg(test)]
+fn same_word(a: &str, b: &str) -> bool {
+    same_word_stemmed(a, &stem(a), b, &stem(b))
+}
+
+fn same_word_stemmed(a: &str, sa: &str, b: &str, sb: &str) -> bool {
+    if a == b || sa == sb {
+        return true;
+    }
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let k = STEM.min(a.len()).min(b.len());
-    k >= MIN_WORD && a[..k] == b[..k]
+    k >= MIN_PREFIX && a[..k] == b[..k]
 }
 
 /// Общие слова запроса и текста: пары (слово запроса, слово текста).
 pub fn shared_words(query: &str, text: &str) -> Vec<(String, String)> {
-    let note = content_words(text);
+    let note: Vec<(String, String)> = content_words(text)
+        .into_iter()
+        .map(|w| {
+            let s = stem(&w);
+            (w, s)
+        })
+        .collect();
     let mut out = Vec::new();
     for q in content_words(query) {
-        if let Some(n) = note.iter().find(|n| same_word(&q, n)) {
+        let sq = stem(&q);
+        if let Some((n, _)) = note
+            .iter()
+            .find(|(n, sn)| same_word_stemmed(&q, &sq, n, sn))
+        {
             out.push((q, n.clone()));
         }
     }
@@ -730,8 +820,14 @@ mod tests {
             ),
             [("plants".to_string(), "plants".to_string())]
         );
-        // служебные слова и слова короче 3 символов не считаются
-        assert!(shared_words("how is it in the ok", "the ok how it is").is_empty());
+        // служебные слова не считаются; слова из 2 символов — считаются (целиком)
+        assert!(shared_words("how is it in the", "the how it is").is_empty());
+        assert_eq!(
+            shared_words("ok then", "it is ok"),
+            [("ok".into(), "ok".into())]
+        );
+        // основа Snowball: «индексы» / «индексов», «running» / «runs»
+        assert!(same_word("индексы", "индексов") && same_word("running", "runs"));
     }
 
     #[test]

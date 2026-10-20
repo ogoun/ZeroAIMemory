@@ -21,3 +21,5 @@ jiff.workspace = true
 # гейт качества: эмбеддинги прогонов из SQLite сервера (dense f16, sparse u32+f16)
 rusqlite.workspace = true
 half.workspace = true
+# проверка набора eval: стемминг Snowball ru/en
+rust-stemmers.workspace = true

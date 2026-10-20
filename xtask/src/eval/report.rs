@@ -105,8 +105,8 @@ pub fn run_md(r: &RunResult) -> String {
     let _ = writeln!(s, "- дата {}, коммит `{}`", i.date, i.git);
     let _ = writeln!(
         s,
-        "- корпус: {} заметок (отпечаток `{}`), запросов {}",
-        i.notes, i.corpus_fingerprint, i.queries
+        "- корпус: {} заметок (отпечаток `{}`), запросов {} (отпечаток `{}`)",
+        i.notes, i.corpus_fingerprint, i.queries, i.queries_fingerprint
     );
     if let Some(m) = &i.model_id {
         let _ = writeln!(
@@ -123,6 +123,11 @@ pub fn run_md(r: &RunResult) -> String {
         let sets: Vec<String> = i.sets.iter().map(|(k, v)| format!("`{k}={v}`")).collect();
         let _ = writeln!(s, "- конфигурация: {}", sets.join(", "));
     }
+    let _ = writeln!(
+        s,
+        "- действующие `[search]` сервера: `{}`; `[index]`: `{}`",
+        i.server_config["search"], i.server_config["index"]
+    );
     if i.index_secs > 0.0 {
         let _ = writeln!(s, "- индексация корпуса: {:.1} с", i.index_secs);
     }
