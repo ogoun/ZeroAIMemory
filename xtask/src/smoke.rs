@@ -282,6 +282,25 @@ fn wait_health(srv: &mut Server, base: &str) -> Result<()> {
     wait_health_for(srv, base, WAIT)
 }
 
+/// Порог «медленного» первого старта с zam-cuda: обычный — 4–5 с (задача 17 M2).
+const CUDA_SLOW_START_SECS: f64 = 15.0;
+
+/// Предупреждение о медленном первом старте с zam-cuda (`None` — уложился в порог); в
+/// GitHub Actions — аннотация `::warning::`.
+fn slow_cuda_start_warning(secs: f64, github: bool) -> Option<String> {
+    (secs > CUDA_SLOW_START_SECS).then(|| {
+        let msg = format!(
+            "ВНИМАНИЕ: первый старт с zam-cuda до /health — {secs:.1} с (> {CUDA_SLOW_START_SECS:.0} с): \
+             загрузка библиотек NVIDIA и модели медленнее обычного"
+        );
+        if github {
+            format!("::warning title=smoke zam-cuda::{msg}")
+        } else {
+            msg
+        }
+    })
+}
+
 /// Ждёт `/api/v1/health` не дольше `wait` (сервер отвечает после загрузки модели).
 pub(crate) fn wait_health_for(srv: &mut Server, base: &str, wait: Duration) -> Result<()> {
     let a = agent();
@@ -647,10 +666,12 @@ pub fn run(
             "ожидание /api/v1/health (первая загрузка CUDA)",
             wait_health_for(&mut srv, &base, CUDA_FIRST_WAIT),
         )?;
-        println!(
-            "первый старт с zam-cuda до /health: {:.1} с",
-            t0.elapsed().as_secs_f64()
-        );
+        let secs = t0.elapsed().as_secs_f64();
+        println!("первый старт с zam-cuda до /health: {secs:.1} с");
+        if let Some(w) = slow_cuda_start_warning(secs, std::env::var_os("GITHUB_ACTIONS").is_some())
+        {
+            eprintln!("{w}");
+        }
     } else {
         s.run("ожидание /api/v1/health", wait_health(&mut srv, &base))?;
     }
@@ -1234,6 +1255,22 @@ pub fn run_cuda(archive: &Path, repo: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_cuda_start_warns_and_annotates_in_actions() {
+        assert_eq!(slow_cuda_start_warning(4.8, true), None);
+        assert_eq!(slow_cuda_start_warning(15.0, false), None);
+        let local = slow_cuda_start_warning(16.2, false).unwrap();
+        assert!(
+            local.starts_with("ВНИМАНИЕ") && local.contains("16.2 с"),
+            "{local}"
+        );
+        let gh = slow_cuda_start_warning(16.2, true).unwrap();
+        assert!(
+            gh.starts_with("::warning title=smoke zam-cuda::ВНИМАНИЕ"),
+            "{gh}"
+        );
+    }
 
     #[cfg(windows)]
     fn echo() -> Command {
