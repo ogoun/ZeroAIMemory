@@ -568,6 +568,29 @@ pub fn is_installed(entry: &PlatformEntry, dir: &Path, key: &str) -> Result<bool
     Ok(ok && dest_names(entry)?.iter().all(|n| dir.join(n).is_file()))
 }
 
+/// Каждый уже существующий файл из `names` в `dir` можно заменить: он открывается на запись
+/// без усечения (содержимое не меняется). На Windows загруженная библиотека (например
+/// CUDA у работающего `zam-server`) или запущенный `qdrant.exe` дают отказ (ERROR_SHARING_
+/// VIOLATION / ERROR_ACCESS_DENIED), на Linux запущенный исполняемый файл — ETXTBSY. Иначе
+/// замена прервалась бы после удаления штампа и части файлов — смесь старых и новых
+/// библиотек; теперь до загрузки — понятная ошибка с подсказкой остановить сервер.
+fn ensure_replaceable(dir: &Path, names: &[String]) -> Result<(), FetchError> {
+    for n in names {
+        let p = dir.join(n);
+        if !p.is_file() {
+            continue;
+        }
+        if let Err(err) = fs::OpenOptions::new().write(true).open(&p) {
+            return Err(FetchError::Invalid(format!(
+                "файл {} занят или недоступен для замены ({err}). Остановите zam-server (вместе \
+                 с ним завершится и Qdrant) и повторите команду; установленные файлы не тронуты",
+                p.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Ставит файлы архива платформы в каталог `dir`, не трогая остальные файлы в нём
 /// (например `vcruntime140.dll` рядом с `qdrant.exe` в комплекте Windows).
 ///
@@ -592,6 +615,8 @@ pub fn install_archive(entry: &PlatformEntry, dir: &Path, key: &str) -> Result<b
     if is_installed(entry, dir, key)? {
         return Ok(true);
     }
+    // до загрузки и до удаления штампа: занятый файл сорвал бы замену на середине
+    ensure_replaceable(dir, &names)?;
     if let Some(parent) = dir.parent() {
         fs::create_dir_all(parent)
             .map_err(FetchError::io(format!("создание {}", parent.display())))?;
@@ -995,6 +1020,35 @@ mod tests {
         assert_eq!(std::fs::read_dir(d.join("qdrant")).unwrap().count(), 0);
         e.sha256.clear();
         assert!(install_archive(&e, &dir, "q").is_err());
+    }
+
+    /// Файл занят (как DLL, загруженная работающим сервером): замена не начинается — ни
+    /// загрузки, ни удаления штампа, файлы прежние, ошибка подсказывает остановить сервер.
+    #[cfg(windows)]
+    #[test]
+    fn install_archive_refuses_busy_file_before_download() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let d = tmp("install_archive_busy");
+        let (url, hits) = serve(b"hello", "q.zip", 1);
+        let mut e = entry(&["root/lib/a.dll"], &[]);
+        e.url = url;
+        e.sha256 = "1".repeat(64);
+        let dir = d.join("cuda");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.dll"), b"OLD").unwrap();
+        std::fs::write(dir.join(".q.sha256"), "2".repeat(64) + "\n").unwrap();
+        // без общего доступа на запись — так держит файл загрузчик образов Windows
+        let busy = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ
+            .open(dir.join("a.dll"))
+            .unwrap();
+        let err = install_archive(&e, &dir, "q").unwrap_err().to_string();
+        assert!(err.contains("Остановите zam-server"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(dir.join("a.dll")).unwrap(), b"OLD");
+        assert!(dir.join(".q.sha256").is_file());
+        drop(busy);
     }
 
     #[test]
