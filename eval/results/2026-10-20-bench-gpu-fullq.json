@@ -1,0 +1,157 @@
+{
+  "date": "2026-10-20",
+  "git": "0bb32f7+dirty",
+  "profile": "gpu",
+  "label": "fullq",
+  "host": {
+    "gpu": "NVIDIA GeForce RTX 3090, 1771 MiB, 24576 MiB, 0 %",
+    "logical_cpus": 24,
+    "os": "windows"
+  },
+  "model_id": "bge-m3-fp16@4f1a646a",
+  "device": {
+    "kind": "cuda",
+    "reason": ""
+  },
+  "reranker": null,
+  "sets": {},
+  "notes": 10000,
+  "queries": 197,
+  "rss_idle_no_models": null,
+  "rss_idle_model": null,
+  "private_idle_model": null,
+  "rss_after_search": null,
+  "private_after_search": null,
+  "rss_after_rerank": null,
+  "rss_fts_loaded": null,
+  "qdrant_rss": null,
+  "qdrant_points": null,
+  "index_base": {
+    "notes": 160,
+    "chunks": 666,
+    "avg_tokens": 200.18168168168168,
+    "secs": 21.5294785,
+    "load_secs": 2.9850892,
+    "chunks_per_sec": 30.934330341536143,
+    "post": null,
+    "embed_secs": 6.845,
+    "qdrant_secs": 5.054
+  },
+  "index_copies": null,
+  "write": {
+    "post": {
+      "n": 99,
+      "p50": 5.4394,
+      "p95": 13.055069999999995,
+      "max": 16.4545,
+      "mean": 6.6007565656565665
+    },
+    "to_vector": {
+      "n": 99,
+      "p50": 190.51870000000002,
+      "p95": 669.1628699999997,
+      "max": 3714.0894,
+      "mean": 319.7456434343436
+    },
+    "embed": {
+      "n": 99,
+      "p50": 48.0,
+      "p95": 128.8999999999999,
+      "max": 372.0,
+      "mean": 58.75757575757576
+    },
+    "qdrant": {
+      "n": 99,
+      "p50": 104.0,
+      "p95": 438.79999999999995,
+      "max": 990.0,
+      "mean": 152.5151515151515
+    },
+    "other": {
+      "n": 99,
+      "p50": 16.159699999999987,
+      "p95": 212.07623999999905,
+      "max": 3470.6454,
+      "mean": 101.87215959595959
+    },
+    "chunks_avg": 3.2525252525252526,
+    "chunks_max": 9,
+    "excluded": 1
+  },
+  "search_full_queue": {
+    "rerank": false,
+    "client": {
+      "n": 197,
+      "p50": 33.8267,
+      "p95": 52.95646,
+      "max": 57.753400000000006,
+      "mean": 35.18399543147208
+    },
+    "server": {
+      "embed_ms": {
+        "n": 197,
+        "p50": 12.45,
+        "p95": 29.557999999999993,
+        "max": 35.12,
+        "mean": 15.693959390862945
+      },
+      "expand_ms": {
+        "n": 197,
+        "p50": 3.08,
+        "p95": 6.704,
+        "max": 9.98,
+        "mean": 3.4431472081218253
+      },
+      "fts_ms": {
+        "n": 197,
+        "p50": 19.57,
+        "p95": 35.31999999999999,
+        "max": 48.44,
+        "mean": 20.16284263959391
+      },
+      "fuse_ms": {
+        "n": 197,
+        "p50": 1.72,
+        "p95": 7.269999999999999,
+        "max": 9.29,
+        "mean": 2.620913705583756
+      },
+      "pending_ms": {
+        "n": 197,
+        "p50": 1.23,
+        "p95": 2.1719999999999997,
+        "max": 2.29,
+        "mean": 1.35492385786802
+      },
+      "total_ms": {
+        "n": 197,
+        "p50": 32.88,
+        "p95": 51.94199999999999,
+        "max": 56.91,
+        "mean": 34.3499492385787
+      },
+      "vector_ms": {
+        "n": 197,
+        "p50": 3.1,
+        "p95": 3.6879999999999997,
+        "max": 6.43,
+        "mean": 3.104416243654821
+      }
+    },
+    "degraded": 0,
+    "warnings": 0,
+    "queue_before": 9261,
+    "queue_after": 9143,
+    "jobs_done": 118,
+    "index_embed_ms": 2848.0,
+    "under_load": true,
+    "attempts": 1
+  },
+  "search_empty_queue": null,
+  "search_cached": null,
+  "rerank": null,
+  "fts_only": null,
+  "startup": [],
+  "kill": null,
+  "reindex": null
+}

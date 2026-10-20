@@ -478,6 +478,36 @@ pub enum ModelState {
     Missing,
     /// Установка неполная или файлы не совпали с манифестом: что не так.
     Broken(String),
+    /// Файлы на месте, но `model.toml` не совпадает с описателем манифеста (манифест
+    /// обновился, например появился `dynamic_quant`): что отличается. Лечится повторным
+    /// `models fetch` — веса не перекачиваются, `model.toml` переписывается.
+    Stale(String),
+}
+
+/// Чем установленный `<models_dir>/<id>/model.toml` отличается от описателя манифеста
+/// (сравниваются значения TOML, комментарии не важны); `None` — совпадает или файла нет.
+pub fn spec_stale(m: &ModelEntry, models_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(models_dir.join(&m.id).join(MODEL_SPEC_FILE)).ok()?;
+    let installed: toml::Table = match toml::from_str(&text) {
+        Ok(t) => t,
+        Err(_) => return Some(format!("{MODEL_SPEC_FILE} не разбирается")),
+    };
+    let want: toml::Table = toml::from_str(&m.spec_toml().ok()?).ok()?;
+    if installed == want {
+        return None;
+    }
+    let mut keys: Vec<&String> = want
+        .keys()
+        .chain(installed.keys())
+        .filter(|k| want.get(*k) != installed.get(*k))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let keys: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+    Some(format!(
+        "{MODEL_SPEC_FILE} устарел (отличается: {})",
+        keys.join(", ")
+    ))
 }
 
 /// Проверяет установку модели: файлы и размеры; с `verify` — ещё и SHA-256 (долго для
@@ -511,10 +541,12 @@ pub fn model_state(m: &ModelEntry, models_dir: &Path, verify: bool) -> ModelStat
     if !spec_ok {
         problems.push(format!("нет {MODEL_SPEC_FILE} (загрузка не завершена)"));
     }
-    if problems.is_empty() {
-        ModelState::Installed
-    } else {
-        ModelState::Broken(problems.join("; "))
+    if !problems.is_empty() {
+        return ModelState::Broken(problems.join("; "));
+    }
+    match spec_stale(m, models_dir) {
+        Some(why) => ModelState::Stale(why),
+        None => ModelState::Installed,
     }
 }
 
@@ -957,6 +989,27 @@ max_tokens_query = 8
             names,
             ["LICENSE", "model.onnx", "model.toml", "tokenizer.json"]
         );
+        // описатель старой установки (без поля из нового манифеста) — Stale с именем поля;
+        // комментарии и порядок строк не важны
+        assert_eq!(spec_stale(&m.model[0], &d), None);
+        let old_spec = std::fs::read_to_string(dir.join(MODEL_SPEC_FILE)).unwrap();
+        std::fs::write(
+            dir.join(MODEL_SPEC_FILE),
+            format!(
+                "# другой комментарий
+{old_spec}dynamic_quant = true
+"
+            ),
+        )
+        .unwrap();
+        match model_state(&m.model[0], &d, false) {
+            ModelState::Stale(why) => assert!(why.contains("dynamic_quant"), "{why}"),
+            other => panic!("ожидался Stale: {other:?}"),
+        }
+        // повторная установка переписывает описатель без загрузки весов
+        fetch_model_unchecked(&m, "r1", &d, false).unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), n);
+        assert_eq!(model_state(&m.model[0], &d, false), ModelState::Installed);
     }
 
     #[test]

@@ -151,6 +151,37 @@ pub fn fetch(
     Ok(())
 }
 
+/// Команда переустановки описателя модели (`--accept-nc-license` — для моделей по согласию).
+fn refetch_cmd(e: &zam_fetch::ModelEntry) -> String {
+    let ack = if e.requires_license_ack {
+        " --accept-nc-license"
+    } else {
+        ""
+    };
+    format!("zam-server models fetch --id {}{ack}", e.id)
+}
+
+/// Предупреждение в журнал, если `model.toml` загруженной модели `id` отличается от
+/// описателя встроенного манифеста (модель поставлена старой версией): поведение модели
+/// задаёт описатель, например `dynamic_quant` реранкера jina. Модели вне манифеста не
+/// проверяются.
+pub fn warn_if_stale(models_dir: &Path, id: &str) {
+    let Ok(m) = load_manifest(None) else {
+        return;
+    };
+    let Ok(e) = m.get(id) else {
+        return;
+    };
+    if let Some(why) = zam_fetch::spec_stale(e, models_dir) {
+        tracing::warn!(
+            model = id,
+            problem = %why,
+            hint = format!("{} (веса не перекачиваются)", refetch_cmd(e)),
+            "описатель модели устарел относительно встроенного манифеста"
+        );
+    }
+}
+
 /// `models status`: модели манифеста и их состояние в `models_dir`; какие модели возьмёт
 /// сервер. С `verify` сверяются SHA-256 (долго для гигабайтных весов).
 pub fn status(m: &ModelsManifest, cfg: &ServerConfig, verify: bool) -> String {
@@ -163,6 +194,10 @@ pub fn status(m: &ModelsManifest, cfg: &ServerConfig, verify: bool) -> String {
             ModelState::Installed => "установлена".to_string(),
             ModelState::Missing => "нет".to_string(),
             ModelState::Broken(why) => format!("неполная: {why}"),
+            ModelState::Stale(why) => format!(
+                "установлена, {why}: нужен `{}` (веса не перекачиваются)",
+                refetch_cmd(e)
+            ),
         };
         let pack = if e.requires_license_ack {
             ", по согласию (--accept-nc-license)"

@@ -107,7 +107,11 @@ impl RerankSlot {
                 loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 #[cfg(test)]
                 std::thread::sleep(delay);
-                Reranker::load(&ml, &load_id)
+                let r = Reranker::load(&ml, &load_id);
+                if r.is_ok() {
+                    crate::models::warn_if_stale(&ml.models_dir, &load_id);
+                }
+                r
             })
             .await;
             let warning = match loaded {

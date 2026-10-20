@@ -324,8 +324,16 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
 /// сверяется с живостью процесса (`Supervisor::process_alive`), а соединение ограничено
 /// 300 мс. Перезапуск держит тестовая точка (`hold_next_restart`): Qdrant гарантированно
 /// лежит всё время проверки.
+///
+/// Предел ответа — 250 мс (`FAST`): на Windows без проверки процесса запрос ушёл бы в
+/// закрытый порт и ждал бы не меньше двух попыток соединения по 300 мс (≥ 600 мс), то есть
+/// тест падает и с одним только пределом соединения (без исправления — 4,07 с). На Linux
+/// отказ соединения приходит сразу (RST), медленного пути нет: там тест проверяет предел
+/// ответа и то, что канал выключается сразу после смерти процесса.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn search_right_after_qdrant_kill_degrades_without_waiting() {
+    // FTS-only на нескольких заметках в debug — десятки миллисекунд
+    const FAST: Duration = Duration::from_millis(250);
     if !have(MINILM) {
         return;
     }
@@ -374,7 +382,10 @@ async fn search_right_after_qdrant_kill_degrades_without_waiting() {
             .is_some_and(|p| p.starts_with("kill-search/")),
         "FTS находит заметку: {j}"
     );
-    assert!(dt < Duration::from_secs(1), "поиск ждал {dt:?}");
+    assert!(dt < FAST, "поиск ждал {dt:?}");
+    // канал выключен по живости процесса, даже если супервизор ещё не сменил состояние
+    assert!(!sup.process_alive());
+    assert!(a.st.index.vector_available().is_err());
     // и пока Qdrant лежит — так же быстро
     assert!(
         sup.wait_restart_held(GONE).await,
@@ -382,7 +393,7 @@ async fn search_right_after_qdrant_kill_degrades_without_waiting() {
     );
     let (dt, j) = search().await;
     assert_eq!(j["degraded"], true, "{j}");
-    assert!(dt < Duration::from_secs(1), "поиск ждал {dt:?}");
+    assert!(dt < FAST, "поиск ждал {dt:?}");
     sup.release_restart();
     until("Qdrant вернулся", READY, async || {
         sup.pid().is_some_and(|p| p != qpid) && a.st.index.vector_available().is_ok()

@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -23,14 +24,45 @@ use crate::spec::{ModelDevice, ModelSpec, Pooling};
 use crate::tokenize::{BgeTokenCounter, Tok, cap_text};
 use crate::{DevicePref, DeviceReport, MlConfig, MlError};
 
-/// Предел токенов в батче индексации (с паддингом): ограничивает пик памяти активаций.
-const MAX_BATCH_TOKENS: usize = 8192;
+/// Предел токенов в батче индексации (с паддингом): ограничивает пик памяти активаций и
+/// время, на которое батч занимает устройство. Запрос, пришедший во время батча, ждёт его
+/// конца: на RTX 3090 батч 8192 токенов давал эмбеддингу запроса p95 74 мс при полной
+/// очереди (цель поиска GPU — 50 мс, замер задачи 15 M2).
+const MAX_BATCH_TOKENS: usize = 2048;
+/// Сколько батч индексации ждёт, пока выполняются запросы, прежде чем всё-таки занять
+/// устройство (непрерывный поток запросов не останавливает индексацию совсем).
+const QUERY_YIELD_MAX: std::time::Duration = std::time::Duration::from_millis(100);
 /// Длина батча округляется вверх до кратного 8.
 const PAD_MULTIPLE: usize = 8;
 /// Размер LRU-кэша эмбеддингов запросов.
 const QUERY_CACHE: usize = 1024;
 /// Имена выхода со скрытыми состояниями токенов (Xenova / BAAI).
 const HIDDEN_OUTPUTS: [&str; 2] = ["last_hidden_state", "token_embeddings"];
+
+/// Ждёт, пока `queries` не обнулится, но не дольше `max`; время ожидания.
+fn wait_queries(queries: &AtomicUsize, max: std::time::Duration) -> std::time::Duration {
+    let t0 = Instant::now();
+    while queries.load(Ordering::Acquire) > 0 && t0.elapsed() < max {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    t0.elapsed()
+}
+
+/// Счётчик запросов в работе на время инференса запроса.
+struct QueryGuard<'a>(&'a AtomicUsize);
+
+impl<'a> QueryGuard<'a> {
+    fn new(c: &'a AtomicUsize) -> Self {
+        c.fetch_add(1, Ordering::AcqRel);
+        QueryGuard(c)
+    }
+}
+
+impl Drop for QueryGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Вектор текста.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +135,9 @@ pub struct Embedder {
     index: Mutex<Runner>,
     query: Mutex<Runner>,
     cache: Mutex<LruCache<String, Embedding>>,
+    /// Запросов в работе (`embed_query` после промаха кэша): батч индексации перед запуском
+    /// ждёт, пока их нет (не дольше [`QUERY_YIELD_MAX`]) — §8: индексация уступает поиску.
+    queries: AtomicUsize,
     report: DeviceReport,
     /// Окружение ORT живёт не меньше сессий.
     _env: Environment,
@@ -184,6 +219,7 @@ impl Embedder {
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(QUERY_CACHE).expect("ненулевой размер"),
             )),
+            queries: AtomicUsize::new(0),
             report: report.clone(),
             _env: env,
         };
@@ -211,7 +247,8 @@ impl Embedder {
     }
 
     /// Эмбеддинги чанков (сессия индексации). Тексты сортируются по длине и режутся на батчи
-    /// не больше 8192 токенов с паддингом до кратного 8; порядок результата — порядок `texts`.
+    /// не больше [`MAX_BATCH_TOKENS`] токенов с паддингом до кратного 8; перед каждым батчем —
+    /// уступка запросам; порядок результата — порядок `texts`.
     /// Модели с `dynamic_quant` (CPU int8) прогоняются по одному тексту без паддинга: масштаб
     /// квантования активаций считается по всему батчу, и соседи сдвигали бы вектор (косинус ≈ 0,99).
     pub fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Embedding>, MlError> {
@@ -235,6 +272,7 @@ impl Embedder {
             };
             let end = (start + rows).min(order.len());
             let batch: Vec<&Encoding> = order[start..end].iter().map(|&i| &encs[i]).collect();
+            self.yield_to_queries();
             for (k, e) in self.run(&mut runner, &batch)?.into_iter().enumerate() {
                 out[order[start + k]] = Some(e);
             }
@@ -262,6 +300,7 @@ impl Embedder {
         }
         let encs = self.tok.encode(&[text], self.spec.max_tokens_query)?;
         let e = {
+            let _busy = QueryGuard::new(&self.queries);
             let mut runner = lock(&self.query);
             let refs: Vec<&Encoding> = encs.iter().collect();
             self.run(&mut runner, &refs)?
@@ -270,6 +309,12 @@ impl Embedder {
         };
         lock(&self.cache).put(text.to_string(), e.clone());
         Ok(e)
+    }
+
+    /// Перед батчем индексации: пока выполняются запросы, подождать (не дольше
+    /// [`QUERY_YIELD_MAX`]), чтобы батч не занял устройство посреди их инференса.
+    fn yield_to_queries(&self) {
+        wait_queries(&self.queries, QUERY_YIELD_MAX);
     }
 
     /// Число токенов текста без спецтокенов (для `token_count` чанков).
@@ -391,6 +436,31 @@ fn pad_len(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Батч индексации уступает запросам: ждёт, пока запрос не закончится, но не дольше
+    /// предела; без запросов — не ждёт.
+    #[test]
+    fn index_batch_yields_to_running_queries() {
+        use std::time::Duration;
+        let q = AtomicUsize::new(0);
+        assert!(wait_queries(&q, Duration::from_secs(1)) < Duration::from_millis(5));
+        // запрос в работе 50 мс: батч ждёт его конца
+        let waited = std::thread::scope(|sc| {
+            let g = QueryGuard::new(&q);
+            sc.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                drop(g);
+            });
+            wait_queries(&q, Duration::from_secs(5))
+        });
+        assert!(waited >= Duration::from_millis(40), "{waited:?}");
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
+        assert_eq!(q.load(Ordering::SeqCst), 0);
+        // запросы идут непрерывно: не дольше предела
+        let _g = QueryGuard::new(&q);
+        let waited = wait_queries(&q, Duration::from_millis(30));
+        assert!(waited >= Duration::from_millis(30) && waited < Duration::from_millis(500));
+    }
 
     #[test]
     fn embedder_is_send_sync() {

@@ -17,8 +17,8 @@
 //! - `reindex` — пересборка Qdrant из `embeddings` без инференса;
 //! - `fts` — сервер без моделей на том же каталоге: поиск FTS-only и RSS.
 //!
-//! Каждый замеряемый проход идёт после перезапуска сервера с прогревом одним посторонним
-//! запросом: LRU-кэш эмбеддингов запросов не подменяет инференс. Итог —
+//! Каждый замеряемый проход идёт после перезапуска сервера с прогревом двумя посторонними
+//! запросами: LRU-кэш эмбеддингов запросов не подменяет инференс. Итог —
 //! `eval/results/<дата>-bench-<профиль>[-метка].{json,md}`; каталог данных удаляется (кроме
 //! `--keep`).
 
@@ -55,6 +55,8 @@ const IDLE: Duration = Duration::from_secs(3);
 const KILL_MARGIN: Duration = Duration::from_secs(3);
 /// Предел ожидания восстановления после убийства Qdrant.
 const KILL_WAIT: Duration = Duration::from_secs(180);
+/// Попыток прохода при полной очереди (см. `phase_index`).
+const FULL_QUEUE_ATTEMPTS: usize = 3;
 /// Заметки для замера записи — не длиннее (≈ 5–8 чанков по ~200 токенов).
 const WRITE_MAX_BYTES: usize = 6000;
 
@@ -118,8 +120,13 @@ pub struct BenchArgs {
     #[arg(long, default_value_t = 100)]
     pub rerank_queries: usize,
     /// Записей в замере «запись до векторного индекса»
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 100)]
     pub writes: usize,
+    /// Этап index заканчивается после поиска при полной очереди: индексация копий не
+    /// дожидается (скорость на 10 тыс. заметок не замеряется; на CPU это ~2 ч); остальные
+    /// этапы тогда работают на частично проиндексированном каталоге — только с `--phase index`
+    #[arg(long)]
+    pub no_copies_wait: bool,
     /// Не пересоздавать каталог: этапы на уже проиндексированных данных прошлого прогона
     /// (`--keep`); этапы rss и index при этом недоступны
     #[arg(long)]
@@ -180,6 +187,16 @@ pub struct Pass {
     /// Заданий индексации в очереди (queued + running) до и после прохода.
     pub queue_before: u64,
     pub queue_after: u64,
+    /// Работа воркера за проход: закрытых заданий и время инференса индексации, мс
+    /// (`/index/status` → `worker`, сессия администратора).
+    pub jobs_done: u64,
+    pub index_embed_ms: f64,
+    /// Проход «при полной очереди» действителен, только если воркер за него реально
+    /// индексировал (`jobs_done > 0` и инференс шёл); иначе — `false` и пометка в отчёте.
+    pub under_load: Option<bool>,
+    /// Попытка, давшая этот проход (полная очередь: повтор после перезапуска, если воркер
+    /// за проход не индексировал).
+    pub attempts: usize,
 }
 
 /// Индексация части корпуса.
@@ -201,13 +218,55 @@ pub struct IndexRun {
     pub qdrant_secs: f64,
 }
 
+/// Счётчики воркера с запуска сервера (`/index/status` → `worker`, только администратору).
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkerStat {
+    jobs_done: u64,
+    embed_ms: f64,
+    qdrant_ms: f64,
+}
+
+impl WorkerStat {
+    fn of(status: &Value) -> Result<WorkerStat> {
+        let w = &status["worker"];
+        if w.is_null() {
+            bail!("в /index/status нет worker: статус запрошен не администратором");
+        }
+        Ok(WorkerStat {
+            jobs_done: w["jobs_done"].as_u64().unwrap_or(0),
+            embed_ms: w["embed_ms"].as_f64().unwrap_or(0.0),
+            qdrant_ms: w["qdrant_ms"].as_f64().unwrap_or(0.0),
+        })
+    }
+
+    /// Разность `self - before`.
+    fn since(self, before: WorkerStat) -> WorkerStat {
+        WorkerStat {
+            jobs_done: self.jobs_done.saturating_sub(before.jobs_done),
+            embed_ms: self.embed_ms - before.embed_ms,
+            qdrant_ms: self.qdrant_ms - before.qdrant_ms,
+        }
+    }
+}
+
 /// `(инференс, Qdrant)` воркера с запуска сервера, с.
 fn worker_busy(h: &Http) -> Result<(f64, f64)> {
-    let w = &h.status()?["worker"];
-    Ok((
-        w["embed_ms"].as_f64().unwrap_or(0.0) / 1000.0,
-        w["qdrant_ms"].as_f64().unwrap_or(0.0) / 1000.0,
-    ))
+    let w = WorkerStat::of(&h.status()?)?;
+    Ok((w.embed_ms / 1000.0, w.qdrant_ms / 1000.0))
+}
+
+/// Ждёт, пока воркер закроет хотя бы одно задание (индексация идёт), не дольше `limit`.
+fn wait_worker_progress(h: &Http, limit: Duration) -> Result<bool> {
+    let w0 = WorkerStat::of(&h.status()?)?;
+    let t0 = Instant::now();
+    while t0.elapsed() < limit {
+        thread::sleep(Duration::from_millis(100));
+        let w = WorkerStat::of(&h.status()?)?.since(w0);
+        if w.jobs_done > 0 && w.embed_ms > 0.0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Старт сервера на готовом каталоге.
@@ -264,10 +323,19 @@ pub struct ReindexRun {
 pub struct WriteRun {
     /// `POST /nodes` (до FTS).
     pub post: Option<Stats>,
-    /// От `POST` до пустой очереди (точки записаны с `wait=true`).
+    /// От `POST` до пустой очереди: задание закрыто после подтверждённой записи точек
+    /// (`wait=true`).
     pub to_vector: Option<Stats>,
+    /// Разбивка одной записи по счётчикам воркера: инференс, запись в Qdrant (удаление и
+    /// upsert) и остальное (ожидание задания, SQLite, планирование свёрток) — `to_vector`
+    /// минус `post`, инференс и Qdrant.
+    pub embed: Option<Stats>,
+    pub qdrant: Option<Stats>,
+    pub other: Option<Stats>,
     pub chunks_avg: f64,
     pub chunks_max: u64,
+    /// Записей больше чем на 10 чанков — не в замере.
+    pub excluded: usize,
 }
 
 /// Результат прогона.
@@ -313,15 +381,18 @@ struct Http {
     agent: ureq::Agent,
     base: String,
     token: String,
+    /// Cookie сессии администратора: статус (`worker` виден только ему) и reindex.
+    admin: crate::smoke::AdminSession,
 }
 
 impl Http {
-    fn new(s: &Session) -> Http {
-        Http {
+    fn new(s: &Session) -> Result<Http> {
+        Ok(Http {
             agent: agent_with(REQUEST_TIMEOUT),
             base: s.base.clone(),
             token: s.token().to_string(),
-        }
+            admin: admin_login(&s.base)?,
+        })
     }
 
     fn call(&self, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
@@ -341,12 +412,19 @@ impl Http {
         Ok((st, serde_json::from_str(&text).unwrap_or(Value::Null)))
     }
 
+    /// `/index/status` сессией администратора (у прогона один пользователь — он же).
     fn status(&self) -> Result<Value> {
-        let (st, v) = self.call("/api/v1/index/status", None)?;
+        let mut r = self
+            .agent
+            .get(&format!("{}/api/v1/index/status", self.base))
+            .header("Cookie", &self.admin.cookie)
+            .call()?;
+        let st = r.status().as_u16();
+        let text = r.body_mut().read_to_string()?;
         if st != 200 {
             bail!("GET /index/status: HTTP {st}");
         }
-        Ok(v)
+        Ok(serde_json::from_str(&text)?)
     }
 
     /// Заданий в очереди (queued + running).
@@ -388,6 +466,7 @@ impl Http {
 /// Проход запросов `queries` (`chunks`, top 10, Knowledge) по одному, по порядку.
 fn pass(h: &Http, queries: &[String], rerank: bool) -> Result<Pass> {
     let queue_before = h.queue()?;
+    let w0 = WorkerStat::of(&h.status()?)?;
     let mut client = Vec::with_capacity(queries.len());
     let mut server: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let (mut degraded, mut warnings) = (0, 0);
@@ -419,14 +498,33 @@ fn pass(h: &Http, queries: &[String], rerank: bool) -> Result<Pass> {
         warnings,
         queue_before,
         queue_after: h.queue()?,
+        jobs_done: 0,
+        index_embed_ms: 0.0,
+        under_load: None,
+        attempts: 1,
+    })
+    .and_then(|mut p| {
+        let w = WorkerStat::of(&h.status()?)?.since(w0);
+        p.jobs_done = w.jobs_done;
+        p.index_embed_ms = w.embed_ms;
+        Ok(p)
     })
 }
 
 fn print_pass(name: &str, p: &Pass) {
     if let Some(c) = &p.client {
         println!(
-            "  {name}: p50 {:.1} мс, p95 {:.1} мс, max {:.1} мс (n = {}, degraded {}, warnings {}, очередь {} → {})",
-            c.p50, c.p95, c.max, c.n, p.degraded, p.warnings, p.queue_before, p.queue_after
+            "  {name}: p50 {:.1} мс, p95 {:.1} мс, max {:.1} мс (n = {}, degraded {}, warnings {}, очередь {} → {}, воркер: заданий {}, инференс {:.0} мс)",
+            c.p50,
+            c.p95,
+            c.max,
+            c.n,
+            p.degraded,
+            p.warnings,
+            p.queue_before,
+            p.queue_after,
+            p.jobs_done,
+            p.index_embed_ms
         );
     }
 }
@@ -497,6 +595,23 @@ fn chunk_stats(data: &Path, like: &str) -> Result<(u64, f64, u64)> {
         |r| r.get(0),
     )?;
     Ok((n as u64, avg, max as u64))
+}
+
+/// Листовых чанков по путям заметок (шаблон `LIKE`).
+fn chunks_per_path(data: &Path, like: &str) -> Result<BTreeMap<String, u64>> {
+    let c = rusqlite::Connection::open_with_flags(
+        crate::eval::gate::user_db(data)?,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut st = c.prepare(
+        "SELECT n.path, count(*) FROM chunks c JOIN nodes n ON n.id = c.node_id
+         WHERE c.level = 'chunk' AND n.deleted_at IS NULL AND n.path LIKE ?1
+         GROUP BY n.path",
+    )?;
+    let rows = st.query_map([like], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// Ждёт пустой очереди и доступного векторного канала; печатает прогресс.
@@ -596,7 +711,7 @@ impl Ctx {
         let t0 = Instant::now();
         let mut s = Session::start(&self.paths, &self.spec, &self.server, false)?;
         let health_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let h = Http::new(&s);
+        let h = Http::new(&s)?;
         wait_ready(&mut s, &h)?;
         let ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
         s.check_model()?;
@@ -626,7 +741,7 @@ impl Ctx {
 
     fn start_fts(&self) -> Result<(Session, Http)> {
         let s = Session::start(&self.paths, &self.fts_spec(), &self.server, false)?;
-        let h = Http::new(&s);
+        let h = Http::new(&s)?;
         Ok((s, h))
     }
 }
@@ -653,14 +768,9 @@ fn phase_rss(c: &Ctx, r: &mut BenchResult) -> Result<()> {
 }
 
 /// Этап `index`.
-fn phase_index(
-    c: &Ctx,
-    corpus: &Corpus,
-    notes: usize,
-    writes: usize,
-    r: &mut BenchResult,
-) -> Result<()> {
-    let (mut s, h, _) = c.start(r)?;
+fn phase_index(c: &Ctx, corpus: &Corpus, a: &BenchArgs, r: &mut BenchResult) -> Result<()> {
+    let (notes, writes) = (a.notes, a.writes);
+    let (mut s, mut h, _) = c.start(r)?;
     // 1. корпус eval: чанков/с
     println!("[index] корпус eval: {} заметок", corpus.notes.len());
     let w0 = worker_busy(&h)?;
@@ -705,45 +815,84 @@ fn phase_index(
 
     // 2. запись ≤ 10 чанков при пустой очереди
     println!("[index] запись до векторного индекса: {writes} заметок");
-    let mut post = Vec::new();
-    let mut total = Vec::new();
-    // заметки корпуса до ~6 КБ: не больше 10 чанков (цель §17 — запись ≤ 10 чанков)
-    let small = corpus
+    let (mut post, mut total) = (Vec::new(), Vec::new());
+    let (mut embed, mut qdrant, mut other) = (Vec::new(), Vec::new(), Vec::new());
+    // заметки корпуса до ~6 КБ: не больше 10 чанков (цель §17 — запись ≤ 10 чанков); по
+    // кругу, если их меньше `writes` (путь копии другой — кэш эмбеддингов не срабатывает)
+    let small: Vec<_> = corpus
         .notes
         .values()
-        .filter(|n| n.text.len() <= WRITE_MAX_BYTES);
-    for (i, n) in small.take(writes).enumerate() {
+        .filter(|n| n.text.len() <= WRITE_MAX_BYTES)
+        .collect();
+    if small.is_empty() {
+        bail!("в корпусе нет заметок до {WRITE_MAX_BYTES} байт");
+    }
+    for i in 0..writes {
+        let n = small[i % small.len()];
         let path = format!("bench-write/w{i:03}");
         let text = format!("# Запись {i}\n\n{}", n.text);
+        let w0 = WorkerStat::of(&h.status()?)?;
         let t0 = Instant::now();
         h.post_note(&path, &text)?;
-        post.push(t0.elapsed().as_secs_f64() * 1000.0);
-        loop {
-            if h.queue()? == 0 {
-                break;
+        let p_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let w = loop {
+            let st = h.status()?;
+            let q = &st["queue"];
+            if q["queued"] == 0 && q["running"] == 0 {
+                break WorkerStat::of(&st)?.since(w0);
             }
             if t0.elapsed() > Duration::from_secs(120) {
                 bail!("запись {path}: очередь не опустела за 120 с");
             }
             thread::sleep(Duration::from_millis(10));
-        }
-        total.push(t0.elapsed().as_secs_f64() * 1000.0);
+        };
+        let t_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        post.push(p_ms);
+        total.push(t_ms);
+        embed.push(w.embed_ms);
+        qdrant.push(w.qdrant_ms);
+        other.push((t_ms - p_ms - w.embed_ms - w.qdrant_ms).max(0.0));
     }
-    let (wn, _, wmax) = chunk_stats(&s.data, "bench-write/%")?;
+    // цель §17 — запись не больше 10 чанков: записи, нарезанные на большее число, в замер
+    // не входят (заметка до 6 КБ иногда даёт 11 листов)
+    let counts = chunks_per_path(&s.data, "bench-write/%")?;
+    let keep: Vec<usize> = (0..writes)
+        .filter(|i| {
+            counts
+                .get(&format!("bench-write/w{i:03}"))
+                .is_some_and(|n| *n <= 10)
+        })
+        .collect();
+    let pick = |v: &[f64]| -> Vec<f64> { keep.iter().map(|&i| v[i]).collect() };
+    let kept: Vec<u64> = (0..writes)
+        .filter_map(|i| counts.get(&format!("bench-write/w{i:03}")).copied())
+        .filter(|n| *n <= 10)
+        .collect();
     let w = WriteRun {
-        post: stats(&post),
-        to_vector: stats(&total),
-        chunks_avg: if writes > 0 {
-            wn as f64 / writes as f64
-        } else {
+        post: stats(&pick(&post)),
+        to_vector: stats(&pick(&total)),
+        embed: stats(&pick(&embed)),
+        qdrant: stats(&pick(&qdrant)),
+        other: stats(&pick(&other)),
+        chunks_avg: if kept.is_empty() {
             0.0
+        } else {
+            kept.iter().sum::<u64>() as f64 / kept.len() as f64
         },
-        chunks_max: wmax,
+        chunks_max: kept.iter().copied().max().unwrap_or(0),
+        excluded: writes - keep.len(),
     };
-    if let Some(t) = &w.to_vector {
+    if w.excluded > 0 {
+        println!("  записей больше 10 чанков, не в замере: {}", w.excluded);
+    }
+    if let (Some(t), Some(e), Some(q), Some(o)) = (&w.to_vector, &w.embed, &w.qdrant, &w.other) {
         println!(
             "  до векторного индекса: p50 {:.0} мс, p95 {:.0} мс, max {:.0} мс; чанков в среднем {:.1}, max {}",
             t.p50, t.p95, t.max, w.chunks_avg, w.chunks_max
+        );
+        println!(
+            "  из них (p50 / p95): инференс {:.0} / {:.0} мс, Qdrant {:.0} / {:.0} мс, остальное {:.0} / {:.0} мс",
+            e.p50, e.p95, q.p50, q.p95, o.p50, o.p95
         );
     }
     r.write = Some(w);
@@ -765,9 +914,38 @@ fn phase_index(
     }
     let load_secs = t0.elapsed().as_secs_f64();
     println!("  загружено за {load_secs:.1} с, поиск при полной очереди…");
-    let p = pass(&h, &c.queries, false)?;
-    print_pass("chunks, полная очередь", &p);
+    // воркер должен реально индексировать: иначе «полная очередь» — просто длинный список
+    // заданий без нагрузки (так было в первом прогоне GPU: очередь 9279 → 9279)
+    // Воркер на HDD бывает занят секундами записи (Qdrant `wait=true`, checkpoint SQLite) и
+    // за проход в ~6 с не закрывает ни одного задания: тогда проход повторяется после
+    // перезапуска сервера (холодный кэш запросов, очередь — в SQLite, не теряется).
+    let mut p = None;
+    for attempt in 1..=FULL_QUEUE_ATTEMPTS {
+        if attempt > 1 {
+            println!("  повтор {attempt}: перезапуск сервера (холодный кэш запросов)");
+            c.stop(s, &format!("index-try{}", attempt - 1))?;
+            (s, h, _) = c.start(r)?;
+        }
+        if !wait_worker_progress(&h, Duration::from_secs(120))? {
+            println!("  ВНИМАНИЕ: воркер не закрыл ни одного задания за 120 с");
+        }
+        let mut q = pass(&h, &c.queries, false)?;
+        q.attempts = attempt;
+        q.under_load = Some(q.jobs_done > 0 && q.index_embed_ms > 0.0);
+        let ok = q.under_load == Some(true);
+        print_pass("chunks, полная очередь", &q);
+        p = Some(q);
+        if ok {
+            break;
+        }
+        println!("  за проход воркер не индексировал — замер недействителен");
+    }
+    let p = p.expect("хотя бы одна попытка");
     r.search_full_queue = Some(p);
+    if a.no_copies_wait {
+        println!("  --no-copies-wait: индексация копий не дожидается");
+        return c.stop(s, "index");
+    }
     wait_idle(&mut s, &h, t0, INDEX_WAIT)?;
     let secs = t0.elapsed().as_secs_f64();
     let w1 = worker_busy(&h)?;
@@ -999,7 +1177,7 @@ fn phase_reindex(c: &Ctx, r: &mut BenchResult) -> Result<()> {
     let (mut s, h, st) = c.start(r)?;
     r.startup.push(st);
     let prev = h.status()?["reindex"]["last"]["finished_at"].clone();
-    let adm = admin_login(&s.base)?;
+    let adm = &h.admin;
     // пересборка базы пользователя прогона (администратора): итог `reindex.last` виден
     // его токену, а итог reindex «всех пользователей» — только сессии администратора
     let mut me = h
@@ -1110,6 +1288,9 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
     }
     phases.sort();
     phases.dedup();
+    if a.no_copies_wait && phases != [Phase::Index] {
+        bail!("--no-copies-wait — только с --phase index: каталог остаётся недоиндексированным");
+    }
     if a.reuse && (phases.contains(&Phase::Rss) || phases.contains(&Phase::Index)) {
         bail!("--reuse: этапы rss и index пересоздают или дописывают каталог — уберите их");
     }
@@ -1173,7 +1354,7 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         for ph in &phases {
             match ph {
                 Phase::Rss => phase_rss(&c, &mut r)?,
-                Phase::Index => phase_index(&c, &corpus, a.notes, a.writes, &mut r)?,
+                Phase::Index => phase_index(&c, &corpus, &a, &mut r)?,
                 Phase::Search => phase_search(&c, &mut r)?,
                 Phase::Rerank => phase_rerank(&c, a.rerank_queries, &mut r)?,
                 Phase::Kill => phase_kill(&c, &mut r)?,

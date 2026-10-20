@@ -198,8 +198,17 @@ impl IndexRuntime {
             rt.device = ml.device;
             if let Some(Ok(sup)) = early {
                 tracing::info!("модель не загрузилась: Qdrant останавливается");
-                if let Ok(s) = Arc::try_unwrap(sup) {
-                    s.shutdown().await;
+                match Arc::try_unwrap(sup) {
+                    Ok(s) => s.shutdown().await,
+                    // клонов здесь нет (супервизор ещё никому не отдан); если появятся — Drop
+                    // последнего клона шлёт стоп, но без ожидания остановки процесса
+                    Err(s) => {
+                        tracing::warn!(
+                            refs = Arc::strong_count(&s),
+                            "супервизор Qdrant ещё используется: остановка без ожидания (Drop)"
+                        );
+                        drop(s);
+                    }
                 }
             } else {
                 tracing::info!("Qdrant не запускается: без модели векторный индекс не нужен");

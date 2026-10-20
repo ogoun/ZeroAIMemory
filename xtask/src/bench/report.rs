@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 
 use super::{BenchResult, Pass, Profile};
 
-/// Байты → «N МБ».
+/// Байты → «N МиБ» (все объёмы памяти в отчёте — двоичные единицы).
 pub fn mb(b: Option<u64>) -> String {
     match b {
-        Some(b) => format!("{:.0} МБ", b as f64 / 1_048_576.0),
+        Some(b) => format!("{:.0} МиБ", b as f64 / 1_048_576.0),
         None => "—".into(),
     }
 }
@@ -50,6 +50,20 @@ fn pass_row(metric: &str, p: &Option<Pass>, limit_ms: Option<f64>) -> Row {
             }
             if p.warnings > 0 {
                 v.push_str(&format!("; без реранка: {}", p.warnings));
+            }
+            if p.under_load.is_some() {
+                v.push_str(&format!(
+                    "; воркер за проход: заданий {}, инференс {}",
+                    p.jobs_done,
+                    ms(p.index_embed_ms)
+                ));
+                if p.attempts > 1 {
+                    v.push_str(&format!(" (попытка {})", p.attempts));
+                }
+            }
+            if p.under_load == Some(false) {
+                v.push_str(" — **недействителен: воркер не индексировал**");
+                return row(metric, &target, v, None);
             }
             row(
                 metric,
@@ -101,11 +115,14 @@ fn rows(r: &BenchResult) -> Vec<Row> {
         &r.rerank,
         Some(if gpu { 150.0 } else { 1500.0 }),
     ));
+    // §17: «чанк 400 токенов» — итог по токенам/с (чанки корпуса — ~200 токенов): CPU — 3
+    // чанка по 400 = 1200 токенов/с; GPU — цель предложена по замеру (3000 токенов/с ≈ 7,5
+    // чанка по 400), ждёт решения владельца — справочно
     for (name, run) in [("корпус eval", &r.index_base), ("копии", &r.index_copies)] {
         let target = if gpu {
-            "замер на RTX 3090"
+            "предложено ≥ 3000 ток./с (≈ 7,5 чанка по 400), ждёт решения владельца"
         } else {
-            "≥ 3 чанка/с"
+            "≥ 3 чанка по 400 ток./с (≥ 1200 ток./с)"
         };
         out.push(match run {
             Some(i) => row(
@@ -122,7 +139,7 @@ fn rows(r: &BenchResult) -> Vec<Row> {
                     i.embed_secs,
                     i.qdrant_secs
                 ),
-                (!gpu).then_some(i.chunks_per_sec >= 3.0),
+                (!gpu).then_some(i.chunks_per_sec * i.avg_tokens >= 1200.0),
             ),
             None => row(&format!("Индексация, {name}"), target, "не замерялось".into(), None),
         });
@@ -137,14 +154,31 @@ fn rows(r: &BenchResult) -> Vec<Row> {
             Some((w, t)) => row(
                 "Запись (≤ 10 чанков) до векторного индекса, очередь пуста",
                 &format!("≤ {}", ms(wl)),
-                format!(
-                    "p50 {} / p95 {} / max {}; чанков {:.1} (max {})",
-                    ms(t.p50),
-                    ms(t.p95),
-                    ms(t.max),
-                    w.chunks_avg,
-                    w.chunks_max
-                ),
+                {
+                    let mut v = format!(
+                        "p50 {} / p95 {} / max {} (n = {}; больше 10 чанков, не в замере: {}); чанков {:.1} (max {})",
+                        ms(t.p50),
+                        ms(t.p95),
+                        ms(t.max),
+                        t.n,
+                        w.excluded,
+                        w.chunks_avg,
+                        w.chunks_max
+                    );
+                    let part = |name: &str, s: &Option<super::Stats>| {
+                        s.as_ref().map_or(String::new(), |s| {
+                            format!("{name} {} / {}", ms(s.p50), ms(s.p95))
+                        })
+                    };
+                    v.push_str(&format!(
+                        "; p50 / p95 по частям: {}, {}, {}, {}",
+                        part("POST", &w.post),
+                        part("инференс", &w.embed),
+                        part("Qdrant", &w.qdrant),
+                        part("остальное", &w.other)
+                    ));
+                    v
+                },
                 Some(t.p95 <= wl && w.chunks_max <= 10),
             ),
             None => row(
@@ -202,21 +236,26 @@ fn rows(r: &BenchResult) -> Vec<Row> {
             None,
         ),
     });
-    let mb_ok = |b: Option<u64>, lim: f64| b.map(|b| (b as f64 / 1_048_576.0) <= lim);
+    // цели ТЗ — в МБ/ГБ (10^6/10^9 байт), замеры — в МиБ: сравниваются байты
+    let mb_ok = |b: Option<u64>, lim_mb: f64| b.map(|b| b as f64 <= lim_mb * 1e6);
     out.push(row(
         "RSS в простое без моделей, пустой каталог",
-        "≤ 50 МБ",
+        "≤ 50 МБ (47,7 МиБ)",
         mb(r.rss_idle_no_models),
         mb_ok(r.rss_idle_no_models, 50.0),
     ));
     out.push(row(
         "RSS без моделей, 10 тыс. заметок, после поиска",
-        "≤ 50 МБ",
+        "≤ 50 МБ (47,7 МиБ)",
         mb(r.rss_fts_loaded),
         mb_ok(r.rss_fts_loaded, 50.0),
     ));
     let model_lim = if gpu { 600.0 } else { 1100.0 };
-    let model_target = if gpu { "≤ 0,6 ГБ" } else { "≤ 1,1 ГБ" };
+    let model_target = if gpu {
+        "≤ 0,6 ГБ (572 МиБ)"
+    } else {
+        "≤ 1,1 ГБ (1049 МиБ)"
+    };
     let with_private = |rss: Option<u64>, private: Option<u64>| match private {
         Some(_) => format!("{} (частная {})", mb(rss), mb(private)),
         None => mb(rss),
@@ -239,9 +278,13 @@ fn rows(r: &BenchResult) -> Vec<Row> {
     };
     out.push(row(
         "Реранкер, дополнительно",
-        if gpu { "VRAM" } else { "≤ 0,5 ГБ" },
+        if gpu {
+            "VRAM"
+        } else {
+            "≤ 0,5 ГБ (477 МиБ)"
+        },
         format!("{} (всего {})", mb(extra), mb(r.rss_after_rerank)),
-        (!gpu).then(|| mb_ok(extra, 512.0)).flatten(),
+        (!gpu).then(|| mb_ok(extra, 500.0)).flatten(),
     ));
     let fmax = |f: &dyn Fn(&super::Startup) -> Option<f64>| {
         r.startup

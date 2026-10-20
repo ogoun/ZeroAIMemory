@@ -24,7 +24,7 @@ pub use manifest::{DepManifest, PLATFORMS, PlatformEntry, host_platform};
 pub use models::{
     FetchedModel, MODEL_LICENSE_FILE, MODEL_SPEC_FILE, ManifestSpec, ModelDevice, ModelEntry,
     ModelFile, ModelRole, ModelState, ModelsManifest, Pooling, check_license_ack, fetch_model,
-    fetch_model_with, model_state,
+    fetch_model_with, model_state, spec_stale,
 };
 
 /// Ошибки загрузки и манифестов. Тексты на русском, без содержимого файлов.

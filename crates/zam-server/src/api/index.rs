@@ -4,7 +4,9 @@
 //!   пользователя (очередь, неудавшиеся задания, точки); администратор — пользователя из
 //!   `X-Zam-User` или, без заголовка, сумму по всем. Модель, устройство и Qdrant (состояние,
 //!   версия, RSS процесса — метрика `zam_qdrant_rss_bytes`, перезапуски) и RSS самого
-//!   `zam-server` (`server.rss_bytes`, цели §17) общие для сервера.
+//!   `zam-server` (`server.rss_bytes`, цели §17) общие для сервера; время воркера
+//!   (`worker`: заданий, инференс, запись в Qdrant — сумма по всем пользователям) — только
+//!   администратору, токену — `null`.
 //! - `POST /admin/reindex {user?, space?, full?}` — только администратор, аудит
 //!   `index.reindex`, ответ 202 с `job_count` (заметок области). Без `full` — точки
 //!   области удаляются и пишутся заново из кэша `embeddings` без инференса (промахи кэша —
@@ -200,6 +202,17 @@ pub async fn status(
         .filter(|d| own(Some(d.user)))
         .map(|d| json!({"user_id": d.user, "error": d.error, "attempts": d.attempts}))
         .collect();
+    let worker = match p {
+        Principal::Admin { .. } => {
+            let (embed, qdrant) = rt.worker.busy();
+            json!({
+                "jobs_done": rt.worker.jobs_done(),
+                "embed_ms": embed.as_millis() as u64,
+                "qdrant_ms": qdrant.as_millis() as u64,
+            })
+        }
+        Principal::Token(_) => Value::Null,
+    };
     Ok(Json(json!({
         "vector": {
             "available": reason.is_none(),
@@ -233,12 +246,9 @@ pub async fn status(
             "oldest": queue.oldest.map(fmt_ts),
         },
         "failed_items": failed.iter().map(|(u, f)| failed_json(*u, f)).collect::<Vec<_>>(),
-        // где воркер тратит время с запуска сервера (общие для сервера, как и Qdrant)
-        "worker": {
-            "jobs_done": rt.worker.jobs_done(),
-            "embed_ms": rt.worker.busy().0.as_millis() as u64,
-            "qdrant_ms": rt.worker.busy().1.as_millis() as u64,
-        },
+        // где воркер тратит время с запуска сервера: сумма по всем пользователям — только
+        // администратору (токен видит только своего пользователя)
+        "worker": worker,
         "reindex": {
             "running": wst.reindex_running,
             "queued": wst.reindex_queued,

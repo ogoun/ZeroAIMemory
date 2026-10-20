@@ -164,6 +164,15 @@ async fn status_without_models_and_queue_visibility() {
     assert_eq!(s["queue"]["queued"], 2);
     assert!(s["queue"]["oldest"].is_string());
     assert_eq!(s["failed_items"], json!([]));
+    // RSS сервера — всем; время воркера (сумма по всем пользователям) — только администратору
+    assert!(
+        s["server"]["rss_bytes"].as_u64().is_some_and(|b| b > 0),
+        "{s}"
+    );
+    assert_eq!(s["worker"], Value::Null, "{s}");
+    let adm = adm_status(&a).await;
+    assert!(adm["worker"]["jobs_done"].is_u64(), "{adm}");
+    assert!(adm["worker"]["embed_ms"].is_u64() && adm["worker"]["qdrant_ms"].is_u64());
 
     // токен второго пользователя — только его очередь (X-Zam-User по токену игнорируется)
     let r = a

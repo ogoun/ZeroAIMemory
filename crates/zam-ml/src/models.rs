@@ -42,7 +42,12 @@ pub(crate) fn require_file(path: &Path) -> Result<(), MlError> {
 /// Суффикс файла-кэша [`sha8`] рядом с моделью.
 const SHA8_SUFFIX: &str = "sha8";
 
-/// Ключ кэша: размер и время изменения файла (нс от эпохи).
+/// Ключ кэша: размер, время изменения (нс от эпохи) и признак самого файла — Linux:
+/// inode и ctime (ctime из пространства пользователя не задать, `touch -r` его не
+/// подделает); Windows: серийный номер тома и номер файла (`GetFileInformationByHandle`):
+/// время создания не годится — NTFS «туннелирует» его на новый файл с тем же именем.
+/// Новый файл на месте старого (`models fetch`, копирование с сохранённым mtime) даёт
+/// другой ключ.
 fn sha8_key(path: &Path) -> Option<String> {
     let m = std::fs::metadata(path).ok()?;
     let t = m
@@ -50,15 +55,43 @@ fn sha8_key(path: &Path) -> Option<String> {
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
-    Some(format!("{} {}", m.len(), t.as_nanos()))
+    Some(format!(
+        "{} {} {}",
+        m.len(),
+        t.as_nanos(),
+        file_identity(path, &m)?
+    ))
+}
+
+#[cfg(unix)]
+fn file_identity(_: &Path, m: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(format!("i{}c{}.{}", m.ino(), m.ctime(), m.ctime_nsec()))
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path, _: &std::fs::Metadata) -> Option<String> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let f = std::fs::File::open(path).ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: handle открытого `File` жив до конца функции, структура — на стеке нужного типа.
+    unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }.ok()?;
+    Some(format!(
+        "v{:x}f{:x}{:08x}",
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+    ))
 }
 
 /// Первые 8 hex-символов SHA-256 файла: часть `model_id`, меняется при замене весов.
 ///
 /// Хэш файла модели (0,5–1,1 ГБ) при каждом старте — секунды на HDD (замер задачи 15 M2:
 /// fp16 — до 11 с при холодном кэше), поэтому итог кэшируется рядом с файлом в
-/// `<файл>.sha8` («<размер> <mtime, нс> <sha8>»). Замена файла (`models fetch`, копирование)
-/// меняет размер или время изменения, и хэш считается заново. Каталог только для чтения —
+/// `<файл>.sha8` («<ключ> <sha8>», ключ — [`sha8_key`]). Замена файла (`models fetch`,
+/// копирование, в том числе с сохранённым mtime) меняет ключ, и хэш считается заново. Каталог только для чтения —
 /// без кэша. Целостность весов проверяет `models fetch` по sha256 манифеста; здесь — только
 /// идентификатор.
 pub(crate) fn sha8(path: &Path) -> Result<String, MlError> {
@@ -113,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn sha8_is_cached_by_size_and_mtime() {
+    fn sha8_is_cached_by_file_identity() {
         let d = dir("sha8");
         let f = d.join("model.onnx");
         std::fs::write(&f, b"weights v1").unwrap();
@@ -129,6 +162,25 @@ mod tests {
         let (k, _) = text.trim().rsplit_once(' ').unwrap();
         std::fs::write(&side, format!("{k} deadbeef\n")).unwrap();
         assert_eq!(sha8(&f).unwrap(), "deadbeef");
+        // новый файл того же размера с тем же mtime на месте старого (копирование с
+        // сохранением времени) — ключ другой, хэш заново
+        let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let tmp = d.join("model.onnx.new");
+        std::fs::write(&tmp, b"weights v9").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::remove_file(&f).unwrap();
+        std::fs::rename(&tmp, &f).unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().modified().unwrap(), mtime);
+        let v9 = sha8(&f).unwrap();
+        assert_ne!(v9, "deadbeef");
+        let full = Sha256::digest(b"weights v9");
+        let want9: String = full[..4].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(v9, want9);
         // замена файла (другой размер) — хэш заново
         std::fs::write(&f, b"weights version 2").unwrap();
         let v2 = sha8(&f).unwrap();

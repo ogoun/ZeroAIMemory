@@ -19,5 +19,9 @@ thiserror.workspace = true
 tracing.workspace = true
 zam-markdown = { path = "../zam-markdown" }
 
+# номер файла и том для ключа кэша sha8 (как в zam-index: тот же крейт и версия)
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 serde_json.workspace = true

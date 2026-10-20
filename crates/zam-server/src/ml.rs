@@ -184,6 +184,10 @@ pub fn load(cfg: &ServerConfig) -> MlLoad {
             Err(e) => return fail(reason_of(&e), e.to_string()),
         }
     }
+    // описатель модели старой установки (манифест обновился) — предупреждение с командой
+    if let Some((id, _)) = emb.model_id().split_once('@') {
+        crate::models::warn_if_stale(&mc.models_dir, id);
+    }
     if mc.unload_after.is_some() {
         tracing::warn!("ml.unload_after задан, но выгрузка по простою пока не реализована");
     }
