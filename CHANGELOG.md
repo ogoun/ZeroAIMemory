@@ -135,7 +135,10 @@ fetch` или архив `zam-cuda`. Качество поиска на набо
 - Windows: `onnxruntime.dll` (и CPU, и GPU) импортирует MSVCP140, MSVCP140_1, VCRUNTIME140 и VCRUNTIME140_1, а `onnxruntime_providers_cuda.dll` ещё MSVCP140_ATOMIC_WAIT; на чистой Windows без VC++ Redistributable ONNX Runtime не загружался и сервер работал только по полнотексту. Теперь эти библиотеки лежат app-local рядом с `zam-server.exe` (из VC Redist установленной Visual Studio, `LICENSES/MSVC-RUNTIME-NOTICE.txt`), smoke проверяет таблицы импорта.
 - `zam-server cuda fetch` (и любая замена файлов по манифесту: `qdrant fetch`) проверяет до загрузки и до удаления штампа, что существующие файлы можно заменить: на Windows при работающем сервере библиотеки CUDA заняты — ошибка с подсказкой остановить сервер, файлы и штампы не меняются (раньше замена обрывалась на середине и оставляла смесь библиотек без штампа). Тест `install_archive_refuses_busy_file_before_download`.
 - Тесты: `zam-ml models::tests::sha8_is_cached_by_file_identity` падал в CI на обеих ОС (с `b4c1b85`): ctime/ChangeTime ставятся по грубым часам ядра, правка на месте сразу за переименованием давала тот же ключ кэша; `qdrant_lifecycle::killed_server_takes_qdrant_down_and_restarts_with_long_data_dir` и `index_worker::managed_storage_rebuild_reindexes_from_embeddings_without_inference` нестабильно падали на HDD — не ждали отложенной свёртки L0 папки.
-- `cargo xtask smoke --cuda-archive`: первый старт с только что распакованным `zam-cuda` ждёт `/health` до 120 с (было 10 с) и печатает время.
+- `cargo xtask smoke --cuda-archive`: первый старт с только что распакованным `zam-cuda` ждёт `/health` до 120 с (было 10 с), печатает время и при старте дольше 15 с выводит предупреждение (в GitHub Actions — `::warning::`). Причина двух медленных стартов (> 10 с) при приёмке не установлена; следующие старты — 3,9–4,8 с.
+- `zam-server qdrant fetch` при запущенном Qdrant на Linux (ETXTBSY) и на Windows отказывает до загрузки с подсказкой остановить сервер — та же проверка, что у `cuda fetch`.
+- CI: `cargo test --workspace --no-fail-fast` — падение одного крейта больше не скрывает остальные тесты (в M2 красный `zam-ml` скрыл, что e2e Qdrant на Linux не выполнялись).
+- `GET /index/status` в сессии администратора: `worker.batch_running` и `worker.rollups_pending` (покой воркера); `cargo xtask bench` оценивает по целям ТЗ v1.7.
 
 ### Known limitations
 - Не все цели §17 ТЗ выполнены; отступления приняты владельцем 2026-10-20 (ТЗ v1.7, `docs/journal.md`): индексация на CPU — 690–770 токенов/с (цель — 3 чанка по 400 токенов в секунду); поиск FTS-only — p95 30–32 мс на 10 тыс. заметок (цель 20 мс, HDD); поиск на GPU при полной очереди индексации — p95 52 мс (цель 50). Цели пересмотрены владельцем: RSS с bge-m3 на CPU — 1,5 ГБ (две сессии ORT), память реранкера jina — по факту `ml.rerank_sessions`, индексация на GPU — ≥ 3000 токенов/с (RTX 3090, HDD; замер 4323–7141).
@@ -145,6 +148,8 @@ fetch` или архив `zam-cuda`. Качество поиска на набо
 - Гейт качества int8 по порогу косинуса dense 0,99 не пройден (Xenova int8 — 0,978); по поиску ухудшения нет, int8 оставлен решением владельца.
 - Хвост записи до FTS при массовой загрузке во время индексации на HDD — до 8–10 с (фоновый `RESTART` checkpoint SQLite), p95 — 13–24 мс.
 - `qdrant.mode = "edge"` — прототип за feature `edge`, в сервер и комплекты не входит (ADR 0001: не переходить; у qdrant-edge 0.8 WAL не воспроизводится при открытии — тест `confirmed_upsert_survives_process_exit` под `#[ignore]`).
+- Первый старт с CUDA может занять больше 10 с: `/health` молчит, пока не загружены модель и библиотеки NVIDIA (~1,4 ГБ).
+- RSS с bge-m3 на CPU после поиска — 1439 МиБ (1,509 ГБ) при цели 1,5 ГБ: превышение 0,6 % (в простое 1416 МиБ — в пределах).
 - На Windows каталог данных — не длиннее 190 символов (MAX_PATH у SQLite и рабочего каталога Qdrant).
 - `zam-server service install`, `doctor`, `backup`/`restore` — этап M7. Журналы, граф, vault — M3; MCP, хуки, проактивное вспоминание — M4.
 - GPU на Linux с драйвером NVIDIA вручную не проверялся (в CI — сборка и smoke GPU-комплекта на CPU).
