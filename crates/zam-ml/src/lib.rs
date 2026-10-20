@@ -21,7 +21,7 @@ use std::time::Duration;
 
 pub use device::{Device, DevicePref, DeviceReport};
 pub use embed::{Embedder, Embedding};
-pub use rerank::Reranker;
+pub use rerank::{Reranker, rerank_sessions_auto};
 pub use runtime::init_runtime;
 pub use sparse::SparseHead;
 pub use spec::{ModelDevice, ModelSpec, Pooling, RerankSpec};
@@ -69,6 +69,10 @@ pub struct MlConfig {
     pub index_threads: usize,
     /// Потоки сессии запросов (по умолчанию 2).
     pub query_threads: usize,
+    /// Параллельных сессий реранкера с динамическим int8 (пары прогоняются по одной, см.
+    /// [`Reranker`]); 0 — авто ([`rerank_sessions_auto`]). Модели, которые батчатся, всегда
+    /// работают одной сессией.
+    pub rerank_sessions: usize,
     /// Выгрузка моделей после простоя (`None` — выключено, по умолчанию). Применяет владелец
     /// [`Embedder`] (сервер), сам эмбеддер её не делает.
     pub unload_after: Option<Duration>,
@@ -84,6 +88,7 @@ impl MlConfig {
             ort_dylib: Self::default_ort_dylib(),
             index_threads: 0,
             query_threads: 2,
+            rerank_sessions: 0,
             unload_after: None,
         }
     }

@@ -62,6 +62,12 @@ const RRF_K: u32 = 60;
 const QUERY_LIMIT: u64 = 60;
 /// Предел длины сообщения сервера в ошибке.
 const MAX_ERR_MSG: usize = 200;
+/// Предел установки соединения. Qdrant — на localhost (§4.3), соединение занимает доли
+/// миллисекунды; на Windows отказ соединения с закрытым портом localhost приходит лишь
+/// через ~2 с (повторы SYN), а клиент повторяет запрос после ошибки транспорта — упавший
+/// Qdrant задерживал поиск на ~4 с (замер задачи 15 M2). С пределом — не дольше двух
+/// попыток по 300 мс.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 
 const LEVEL_CHUNK: &str = "chunk";
 const LEVELS_NOTE: [&str; 2] = ["note", "section"];
@@ -96,7 +102,7 @@ impl QdrantIndex {
         let client = Qdrant::from_url(grpc_url)
             .api_key(api_key)
             .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(5))
+            .connect_timeout(CONNECT_TIMEOUT)
             .skip_compatibility_check()
             .build()
             .map_err(|e| map_err("connect", e))?;

@@ -156,3 +156,62 @@ fn rerank_smoke_cuda() {
     drop(r);
     smoke(ID, ort_gpu(), DevicePref::Cuda);
 }
+
+/// Сессии jina (динамический int8, пары по одной): время 20 × 256 и память при 1–6
+/// параллельных сессиях, баллы совпадают с одной сессией (задача 15 M2). Запуск:
+/// `cargo test --release -p zam-ml --test rerank rerank_sessions_sweep -- --ignored --nocapture`.
+#[test]
+#[ignore = "нужны веса jina-reranker-v2 (cargo xtask fetch-models --id jina-reranker-v2 --accept-nc-license)"]
+fn rerank_sessions_sweep() {
+    const ID: &str = "jina-reranker-v2";
+    if !have_reranker(ID) {
+        return;
+    }
+    let (q, ps) = corpus();
+    let refs: Vec<&str> = ps.iter().map(String::as_str).collect();
+    let mut base: Option<Vec<f32>> = None;
+    for sessions in [1usize, 2, 3, 4, 6] {
+        let rss0 = rss_bytes().unwrap_or(0);
+        let mut cfg = config(ort_cpu(), models_dir(), DevicePref::Cpu);
+        cfg.index_threads = 0;
+        cfg.rerank_sessions = sessions;
+        let r = Reranker::load(&cfg, ID).expect("загрузка реранкера");
+        if r.sessions() != sessions {
+            // модель батчится (без dynamic_quant): сессия одна, перебор не нужен
+            eprintln!("{ID}: батчится, сессий {} — перебор пропущен", r.sessions());
+            assert_eq!(r.sessions(), 1);
+            break;
+        }
+        let scores = r.score_capped(&q, &refs, 256).unwrap();
+        let rss1 = rss_bytes().unwrap_or(0);
+        let runs = 5;
+        let mut times = Vec::new();
+        for _ in 0..runs {
+            let t = Instant::now();
+            let s = r.score_capped(&q, &refs, 256).unwrap();
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(s.len(), 20);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "{ID}: сессий {sessions}: реранк 20×256 — медиана {:.0} мс, min {:.0}, max {:.0}; \
+             RSS +{} МБ",
+            times[runs / 2],
+            times[0],
+            times[runs - 1],
+            rss1.saturating_sub(rss0) / 1_048_576
+        );
+        match &base {
+            None => {
+                eprintln!("{ID}: баллы {scores:?}");
+                base = Some(scores);
+            }
+            Some(b) => {
+                for (x, y) in b.iter().zip(&scores) {
+                    assert!((x - y).abs() < 1e-4, "баллы разошлись: {b:?} / {scores:?}");
+                }
+            }
+        }
+        drop(r);
+    }
+}

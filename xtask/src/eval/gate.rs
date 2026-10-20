@@ -77,7 +77,7 @@ fn decode(dense: &[u8], sparse: &[u8]) -> Result<(Vec<f32>, Sparse)> {
 }
 
 /// База пользователя прогона (единственный пользователь — администратор).
-fn user_db(data: &Path) -> Result<PathBuf> {
+pub(crate) fn user_db(data: &Path) -> Result<PathBuf> {
     let dir = data.join("users");
     let dbs: Vec<PathBuf> = fs::read_dir(&dir)
         .with_context(|| format!("чтение {}", dir.display()))?

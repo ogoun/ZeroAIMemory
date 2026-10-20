@@ -87,6 +87,7 @@ pub fn ml_config(cfg: &ServerConfig) -> anyhow::Result<MlConfig> {
             .unwrap_or_else(MlConfig::default_ort_dylib),
         index_threads: ml.index_threads,
         query_threads: ml.query_threads,
+        rerank_sessions: ml.rerank_sessions,
         unload_after: ml.unload_after()?,
     })
 }
@@ -113,6 +114,21 @@ pub(crate) fn gpu_kit(ort: &Path) -> bool {
 
 fn have_model(models_dir: &Path, id: &str) -> bool {
     models_dir.join(id).join("model.toml").is_file()
+}
+
+/// Установлена ли модель, которую попробует [`load`] (`ml.embed_model` или одна из моделей
+/// по умолчанию): дешёвая проверка до загрузки, чтобы запускать Qdrant параллельно с ней.
+pub fn model_installed(cfg: &ServerConfig) -> bool {
+    let dir = cfg.ml.models_dir(&cfg.data_dir);
+    match cfg
+        .ml
+        .embed_model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+    {
+        Some(m) => have_model(&dir, m),
+        None => have_model(&dir, MODEL_CPU) || have_model(&dir, MODEL_GPU),
+    }
 }
 
 /// Загружает модель (блокирующий вызов: sha256 файла модели, сборка сессий).

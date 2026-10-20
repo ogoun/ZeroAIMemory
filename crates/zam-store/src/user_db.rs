@@ -37,6 +37,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         version: 5,
         sql: include_str!("../migrations/user/0005_embed_key.sql"),
     },
+    Migration {
+        version: 6,
+        sql: include_str!("../migrations/user/0006_pending_index.sql"),
+    },
 ];
 
 /// Вид пространства.

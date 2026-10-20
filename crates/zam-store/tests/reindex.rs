@@ -121,7 +121,7 @@ async fn embed_key_written_moved_and_backfilled() {
         .read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
         .await
         .unwrap();
-    assert_eq!(ver, 5);
+    assert_eq!(ver, zam_store::USER_MIGRATIONS.len() as u32);
 }
 
 /// Страницы индексируемых заметок (без Human, `index: false`, удалённых), задания для

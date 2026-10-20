@@ -146,11 +146,47 @@ impl IndexRuntime {
         }
     }
 
-    /// Запускает Qdrant (если модель загружена) и воркер. Ошибки пишутся в лог и в
+    /// Супервизор Qdrant по `[qdrant]` (готовности не ждёт). Ошибка — причина деградации и
+    /// текст для статуса (уже в журнале).
+    pub async fn start_supervisor(
+        cfg: &ServerConfig,
+    ) -> Result<Arc<Supervisor>, (DegradedReason, String)> {
+        let sup_cfg = crate::qdrant::exe_dir()
+            .map_err(|e| e.to_string())
+            .and_then(|d| cfg.qdrant.supervisor_config(&d).map_err(|e| e.to_string()));
+        match sup_cfg {
+            Ok(Some(sc)) => match Supervisor::start(sc, &cfg.data_dir).await {
+                Ok(s) => Ok(Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "супервизор Qdrant не запущен: векторный поиск выключен");
+                    let reason = match e {
+                        IndexError::Locked(_) => DegradedReason::QdrantLocked,
+                        _ => DegradedReason::Broken,
+                    };
+                    Err((reason, e.to_string()))
+                }
+            },
+            Ok(None) => {
+                let msg = "qdrant.mode = \"edge\" пока не поддерживается сервером".to_string();
+                tracing::warn!("{msg}: векторный поиск выключен");
+                Err((DegradedReason::Broken, msg))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "конфигурация Qdrant: векторный поиск выключен");
+                Err((DegradedReason::Broken, e))
+            }
+        }
+    }
+
+    /// Запускает Qdrant (если модель загружена) и воркер. `early` — супервизор, запущенный
+    /// параллельно с загрузкой модели ([`IndexRuntime::start_supervisor`]): Qdrant
+    /// поднимается, пока модель читается с диска (§17: готовность Qdrant ≤ 5 с от старта).
+    /// Модель не загрузилась — такой супервизор останавливается. Ошибки пишутся в лог и в
     /// состояние, сервер стартует в любом случае.
     pub async fn start(
         cfg: &ServerConfig,
         ml: MlLoad,
+        early: Option<Result<Arc<Supervisor>, (DegradedReason, String)>>,
         system: &SystemStore,
         users: &UserDbs,
     ) -> IndexRuntime {
@@ -160,7 +196,14 @@ impl IndexRuntime {
                 .unwrap_or((DegradedReason::NoModel, "модель не загружена".into()));
             let mut rt = IndexRuntime::disabled(reason, err);
             rt.device = ml.device;
-            tracing::info!("Qdrant не запускается: без модели векторный индекс не нужен");
+            if let Some(Ok(sup)) = early {
+                tracing::info!("модель не загрузилась: Qdrant останавливается");
+                if let Ok(s) = Arc::try_unwrap(sup) {
+                    s.shutdown().await;
+                }
+            } else {
+                tracing::info!("Qdrant не запускается: без модели векторный индекс не нужен");
+            }
             return rt;
         };
         let mut rt = IndexRuntime {
@@ -175,33 +218,15 @@ impl IndexRuntime {
             qdrant_state: None,
             worker: WorkerHandle::idle(),
         };
-        let sup_cfg = crate::qdrant::exe_dir()
-            .map_err(|e| e.to_string())
-            .and_then(|d| cfg.qdrant.supervisor_config(&d).map_err(|e| e.to_string()));
-        let sup = match sup_cfg {
-            Ok(Some(sc)) => match Supervisor::start(sc, &cfg.data_dir).await {
-                Ok(s) => Arc::new(s),
-                Err(e) => {
-                    tracing::warn!(error = %e, "супервизор Qdrant не запущен: векторный поиск выключен");
-                    rt.qdrant_reason = Some(match e {
-                        IndexError::Locked(_) => DegradedReason::QdrantLocked,
-                        _ => DegradedReason::Broken,
-                    });
-                    rt.qdrant_error = Some(e.to_string());
-                    return rt;
-                }
-            },
-            Ok(None) => {
-                let msg = "qdrant.mode = \"edge\" пока не поддерживается сервером".to_string();
-                tracing::warn!("{msg}: векторный поиск выключен");
-                rt.qdrant_reason = Some(DegradedReason::Broken);
+        let started = match early {
+            Some(r) => r,
+            None => Self::start_supervisor(cfg).await,
+        };
+        let sup = match started {
+            Ok(s) => s,
+            Err((reason, msg)) => {
+                rt.qdrant_reason = Some(reason);
                 rt.qdrant_error = Some(msg);
-                return rt;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "конфигурация Qdrant: векторный поиск выключен");
-                rt.qdrant_reason = Some(DegradedReason::Broken);
-                rt.qdrant_error = Some(e);
                 return rt;
             }
         };
@@ -283,7 +308,13 @@ impl IndexRuntime {
         }
         match self.qdrant_state() {
             Some(QdrantState::Broken { .. }) => return Err(DegradedReason::Broken),
-            Some(QdrantState::Ready { .. } | QdrantState::External) | None => {}
+            // процесс уже мёртв, а супервизор ещё не сменил состояние — сразу FTS-only
+            Some(QdrantState::Ready { .. }) => {
+                if self.supervisor().is_some_and(|s| !s.process_alive()) {
+                    return Err(DegradedReason::QdrantDown);
+                }
+            }
+            Some(QdrantState::External) | None => {}
             Some(_) => return Err(DegradedReason::QdrantDown),
         }
         let st = self.worker.status();

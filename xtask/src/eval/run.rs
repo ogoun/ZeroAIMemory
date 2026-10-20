@@ -121,21 +121,26 @@ fn path_without_cuda() -> Option<String> {
 
 /// Собирает `zam-server` в release (или берёт `--server-bin`); возвращает его каталог.
 pub fn server_dir(a: &EvalArgs, p: &Paths) -> Result<PathBuf> {
-    let exe = match &a.server_bin {
-        Some(b) => b.clone(),
+    build_server(&p.repo, a.server_bin.as_deref())
+}
+
+/// `server_bin` или собранный `cargo build --release -p zam-server`; возвращает каталог
+/// исполняемого файла (общий для `eval` и `bench`).
+pub fn build_server(repo: &Path, server_bin: Option<&Path>) -> Result<PathBuf> {
+    let exe = match server_bin {
+        Some(b) => b.to_path_buf(),
         None => {
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
             println!("сборка zam-server (cargo build --release -p zam-server)…");
             let st = Command::new(cargo)
                 .args(["build", "--release", "-p", "zam-server"])
-                .current_dir(&p.repo)
+                .current_dir(repo)
                 .status()
                 .context("запуск cargo build")?;
             if !st.success() {
                 bail!("cargo build --release -p zam-server: {st}");
             }
-            p.repo
-                .join("target")
+            repo.join("target")
                 .join("release")
                 .join(crate::package::exe(platform(), "zam-server"))
         }
@@ -275,20 +280,30 @@ impl Session {
         wait_health_for(&mut srv, &base, HEALTH_WAIT)?;
         let server_config = server_config(&log)?;
         let token_file = dir.join(TOKEN_FILE);
-        let token = match srv.token_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(t) => {
-                fs::write(&token_file, &t)?;
-                t
-            }
-            Err(_) => fs::read_to_string(&token_file)
-                .map(|t| t.trim().to_string())
-                .map_err(|_| {
-                    anyhow!(
-                        "нет токена: ни в stderr сервера, ни в {}; stderr:\n{}",
-                        token_file.display(),
-                        srv.log_tail()
-                    )
-                })?,
+        // повторный старт на том же каталоге: токен уже выдан, stderr его не напечатает —
+        // без ожидания (иначе 5 с к каждому перезапуску; bench меряет время старта)
+        let saved = (!fresh)
+            .then(|| fs::read_to_string(&token_file).ok())
+            .flatten()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let token = match saved {
+            Some(t) => t,
+            None => match srv.token_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(t) => {
+                    fs::write(&token_file, &t)?;
+                    t
+                }
+                Err(_) => fs::read_to_string(&token_file)
+                    .map(|t| t.trim().to_string())
+                    .map_err(|_| {
+                        anyhow!(
+                            "нет токена: ни в stderr сервера, ни в {}; stderr:\n{}",
+                            token_file.display(),
+                            srv.log_tail()
+                        )
+                    })?,
+            },
         };
         Ok(Session {
             srv,
@@ -307,9 +322,37 @@ impl Session {
         api(&self.base, &self.token, path, body)
     }
 
+    /// Токен прогона (для своих клиентов `bench`).
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// pid процесса `zam-server`.
+    pub fn pid(&self) -> u32 {
+        self.srv.child.id()
+    }
+
+    /// Сервер ещё работает; завершился — ошибка с хвостом журнала.
+    pub fn ensure_alive(&mut self) -> Result<()> {
+        if let Some(st) = self.srv.child.try_wait()? {
+            bail!(
+                "сервер завершился ({st}); stderr:
+{}",
+                self.srv.log_tail()
+            );
+        }
+        Ok(())
+    }
+
+    /// Отметка начала загрузки: от неё [`Session::wait_indexed`] считает время индексации
+    /// (для загрузки своими средствами, без [`Session::load_corpus`]).
+    pub fn begin_load(&mut self) {
+        self.loaded_at = Some(Instant::now());
+    }
+
     /// Пишет заметки корпуса в Knowledge (`POST /nodes`).
     pub fn load_corpus(&mut self, corpus: &Corpus) -> Result<()> {
-        self.loaded_at = Some(Instant::now());
+        self.begin_load();
         for n in corpus.notes.values() {
             let body = json!({
                 "space": "knowledge",

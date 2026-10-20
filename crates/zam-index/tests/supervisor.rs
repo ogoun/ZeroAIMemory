@@ -246,6 +246,45 @@ async fn external_kill_restarts_and_five_crashes_break() {
     }
 }
 
+/// Смерть процесса видна [`Supervisor::process_alive`] сразу, без ожидания супервизора:
+/// поиск по ней уходит в FTS-only, не дожидаясь отказа соединения (на Windows — ~2 с на
+/// попытку; задача 15 M2). Перезапуск отложен на 3 с, чтобы новый процесс не успел
+/// подняться за время проверки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn process_alive_drops_right_after_kill() {
+    let dir = data_dir("alive");
+    let mut cfg = managed();
+    cfg.restart.initial = Duration::from_secs(3);
+    cfg.restart.max = Duration::from_secs(3);
+    let sup = Supervisor::start(SupervisorConfig::Managed(cfg), &dir)
+        .await
+        .unwrap();
+    let mut rx = sup.state();
+    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    assert!(sup.process_alive());
+    let pid = sup.pid().expect("pid");
+    let t = Instant::now();
+    kill_external(pid);
+    while sup.process_alive() {
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "process_alive() = true через {:?} после убийства",
+            t.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    eprintln!("процесс мёртв для process_alive через {:?}", t.elapsed());
+    // супервизор потом всё равно перезапускает Qdrant
+    wait_state(&mut rx, READY_LIMIT, "Restarting", |s| {
+        matches!(s, QdrantState::Restarting { .. })
+    })
+    .await;
+    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    assert!(sup.process_alive());
+    assert_ne!(sup.pid(), Some(pid));
+    sup.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn old_stamp_wipes_storage_and_sets_rebuilt() {
     let dir = data_dir("stamp");
@@ -526,6 +565,8 @@ async fn missing_binary_is_broken_and_external_has_no_process() {
     assert_eq!(ext.grpc_url(), "http://127.0.0.1:1");
     assert_eq!(ext.api_key().as_deref(), Some("k"));
     assert!(ext.pid().is_none());
+    // у внешнего Qdrant процесса нет: доступность — только по запросам
+    assert!(ext.process_alive());
     assert!(!format!("{ext:?}").contains("\"k\""));
     ext.shutdown().await;
 }

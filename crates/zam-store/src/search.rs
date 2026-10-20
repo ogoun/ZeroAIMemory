@@ -637,8 +637,15 @@ pub struct LeafHit {
 
 /// Листы узлов `nodes`, в которых FTS5 находит слова запроса (`needles`, каждое — как
 /// запрос [`sanitize_fts`]), с числом найденных слов; по узлу и `ordinal`. Листы без
-/// совпадений в ответ не входят. Тексты не читаются: по одному запросу к индексу на
-/// слово, в одной читающей транзакции.
+/// совпадений в ответ не входят. Тексты не читаются; в одной читающей транзакции: листы
+/// узлов (по индексу `chunks_node`) и по одному проходу индекса FTS на слово — только
+/// `rowid` совпадений, пересечение с листами — в памяти.
+///
+/// Соединение совпадений с `chunks` и фильтр по узлам в SQL (как было) читали строку
+/// `chunks` на каждое совпадение: на 10 тыс. заметок частое слово («и», «the») — 16 тыс.
+/// строк и 25 мс; проверка `MATCH … AND rowid = c.seq` по каждому листу — 0,05–0,1 мс на
+/// лист и слово, сотни листов у окна сводок. Проход одних `rowid` — 2–5 мс на самое
+/// частое слово (замеры `cargo xtask bench`, задача 15 M2).
 pub async fn leaf_term_hits(
     db: &Db,
     nodes: Vec<Id>,
@@ -652,33 +659,38 @@ pub async fn leaf_term_hits(
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
         let mut st = tx.prepare_cached(
-            "SELECT DISTINCT c.id, c.node_id, c.heading_path, c.ordinal FROM chunks_fts f
-             CROSS JOIN chunks c ON c.seq = f.rowid
-             WHERE chunks_fts MATCH ?1 AND c.level = 'chunk'
-               AND c.node_id IN (SELECT value FROM json_each(?2))",
+            "SELECT c.seq, c.id, c.node_id, c.heading_path, c.ordinal FROM chunks c
+             WHERE c.level = 'chunk' AND c.node_id IN (SELECT value FROM json_each(?1))",
         )?;
-        let mut out: HashMap<String, LeafHit> = HashMap::new();
+        let mut leaves: HashMap<i64, LeafHit> = st
+            .query_map([&list], |r| {
+                Ok((
+                    r.get(0)?,
+                    LeafHit {
+                        chunk_id: r.get(1)?,
+                        node_id: r.get(2)?,
+                        heading_path: r.get(3)?,
+                        ordinal: r.get(4)?,
+                        hits: 0,
+                    },
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        if leaves.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut st = tx.prepare_cached("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1")?;
         for n in needles.iter().take(MAX_TERMS) {
             let Some(fts) = sanitize_fts(n) else {
                 continue;
             };
-            let rows = st.query_map(params![fts, list], |r| {
-                Ok(LeafHit {
-                    chunk_id: r.get(0)?,
-                    node_id: r.get(1)?,
-                    heading_path: r.get(2)?,
-                    ordinal: r.get(3)?,
-                    hits: 1,
-                })
-            })?;
-            for h in rows {
-                let h = h?;
-                out.entry(h.chunk_id.clone())
-                    .and_modify(|e| e.hits += 1)
-                    .or_insert(h);
+            for seq in st.query_map([fts], |r| r.get::<_, i64>(0))? {
+                if let Some(l) = leaves.get_mut(&seq?) {
+                    l.hits += 1;
+                }
             }
         }
-        let mut v: Vec<LeafHit> = out.into_values().collect();
+        let mut v: Vec<LeafHit> = leaves.into_values().filter(|l| l.hits > 0).collect();
         v.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(a.ordinal.cmp(&b.ordinal)));
         Ok(v)
     })

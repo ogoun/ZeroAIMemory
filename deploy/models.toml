@@ -138,3 +138,6 @@ files = [
 [model.spec]
 max_tokens_passage = 1024
 max_tokens_query = 256
+# граф квантует активации динамически (DynamicQuantizeLinear): баллы пары зависели бы от
+# соседей по батчу — пары идут по одной, параллельно в ml.rerank_sessions сессиях
+dynamic_quant = true

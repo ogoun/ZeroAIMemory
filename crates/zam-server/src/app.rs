@@ -111,8 +111,16 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     // Модель — до первого открытия базы пользователя: перечанковка R1 и запись идут
     // точным счётчиком токенов модели (без второй копии токенизатора).
     let ml_cfg = cfg.clone();
+    let ml_task = tokio::task::spawn_blocking(move || ml::load(&ml_cfg));
+    // Qdrant — параллельно с загрузкой модели (секунды с HDD, CUDA): к её концу он уже
+    // готов (§17). Без установленной модели не запускается — векторный индекс не нужен.
+    let early_sup = if ml::model_installed(&cfg) {
+        Some(IndexRuntime::start_supervisor(&cfg).await)
+    } else {
+        None
+    };
     // паника загрузки (ORT, модель) не валит старт: сервер работает в режиме FTS-only
-    let ml = match tokio::task::spawn_blocking(move || ml::load(&ml_cfg)).await {
+    let ml = match ml_task.await {
         Ok(m) => m,
         Err(e) => ml::MlLoad::failed(
             crate::index_state::DegradedReason::NoModel,
@@ -136,7 +144,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         .await?
         .map_err(|e| anyhow::anyhow!("не удалось подготовить проверку пароля: {e}"))?;
     let users = UserDbs::new(data_dir.users_dir());
-    let index = Arc::new(IndexRuntime::start(&cfg, ml, &system, &users).await);
+    let index = Arc::new(IndexRuntime::start(&cfg, ml, early_sup, &system, &users).await);
     let rerank = Arc::new(RerankSlot::new(&cfg));
     let state = AppState {
         users,

@@ -3,7 +3,8 @@
 //! - `GET /index/status` — любой аутентифицированный. Токен видит только своего
 //!   пользователя (очередь, неудавшиеся задания, точки); администратор — пользователя из
 //!   `X-Zam-User` или, без заголовка, сумму по всем. Модель, устройство и Qdrant (состояние,
-//!   версия, RSS процесса — метрика `zam_qdrant_rss_bytes`, перезапуски) общие для сервера.
+//!   версия, RSS процесса — метрика `zam_qdrant_rss_bytes`, перезапуски) и RSS самого
+//!   `zam-server` (`server.rss_bytes`, цели §17) общие для сервера.
 //! - `POST /admin/reindex {user?, space?, full?}` — только администратор, аудит
 //!   `index.reindex`, ответ 202 с `job_count` (заметок области). Без `full` — точки
 //!   области удаляются и пишутся заново из кэша `embeddings` без инференса (промахи кэша —
@@ -207,6 +208,10 @@ pub async fn status(
             "hint": reason.map(|r| r.hint()),
         },
         "device": device,
+        // RSS самого zam-server (рабочий набор на Windows), без Qdrant — цели §17
+        "server": {
+            "rss_bytes": zam_index::supervisor::rss_bytes(std::process::id()),
+        },
         "model": {
             "id": rt.model_id(),
             "dim": rt.embedder.as_ref().map_or(0, |e| e.dim()),
@@ -228,6 +233,12 @@ pub async fn status(
             "oldest": queue.oldest.map(fmt_ts),
         },
         "failed_items": failed.iter().map(|(u, f)| failed_json(*u, f)).collect::<Vec<_>>(),
+        // где воркер тратит время с запуска сервера (общие для сервера, как и Qdrant)
+        "worker": {
+            "jobs_done": rt.worker.jobs_done(),
+            "embed_ms": rt.worker.busy().0.as_millis() as u64,
+            "qdrant_ms": rt.worker.busy().1.as_millis() as u64,
+        },
         "reindex": {
             "running": wst.reindex_running,
             "queued": wst.reindex_queued,

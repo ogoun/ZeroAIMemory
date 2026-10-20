@@ -6,10 +6,17 @@
 //! `[B, 1]` (или `[B]`), f32 или f16. Балл — `sigmoid(logit)` в 0..1, порядок — по логиту.
 //! Пары кодируются токенизатором модели (`<s> запрос </s></s> фрагмент </s>`).
 //!
-//! Одна сессия на модель (реранк — по запросу, без фоновой нагрузки), под мьютексом. Вариант
-//! для CPU (`device = "cpu"`, int8) на GPU не запускается — как у эмбеддера.
+//! Модель, которая батчится (fp16/fp32), — одна сессия под мьютексом, пары идут батчами.
+//! Модель с динамическим int8 (`dynamic_quant`: масштаб активаций — на весь тензор, соседи по
+//! батчу меняли бы баллы) прогоняет пары по одной, поэтому у неё несколько сессий
+//! (`ml.rerank_sessions`, авто — [`rerank_sessions_auto`]) с общими перепакованными весами:
+//! пары раздаются сессиям параллельно, самые длинные — первыми. Прогон одной пары длиной
+//! ~300 токенов плохо масштабируется на все ядра, несколько сессий по нескольку потоков
+//! загружают их лучше (замер — задача 15 M2). Вариант для CPU (`device = "cpu"`, int8) на
+//! GPU не запускается — как у эмбеддера.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -18,7 +25,7 @@ use ort::session::{Session, SessionInputValue};
 use ort::value::{Tensor, TensorElementType};
 use tokenizers::Encoding;
 
-use crate::device::build_session;
+use crate::device::build_session_pool;
 use crate::models::{MODEL_FILE, TOKENIZER_FILE, model_dir, require_file, sha8};
 use crate::runtime::{environment, resolve_dylib};
 use crate::spec::{ModelDevice, RerankSpec};
@@ -29,6 +36,46 @@ use crate::{DevicePref, DeviceReport, MlConfig, MlError};
 const LOGITS: &str = "logits";
 /// Предел токенов в батче (с паддингом): 20 пар × 256 укладываются в один прогон.
 const MAX_BATCH_TOKENS: usize = 16384;
+/// Предел параллельных сессий реранкера с динамическим int8 (авто). Замер jina на 12 ядрах
+/// (20 × 256, задача 15 M2): 1 сессия — 1,9 с / +0,6 ГБ, 2 — 1,4 с / +0,9 ГБ, 4 — 1,15 с /
+/// +1,55 ГБ (веса int8 у каждой сессии свои, `PrepackedWeights` для `MatMulInteger` ничего не
+/// разделяет). Две — компромисс цели §17 по времени (≤ 1,5 с) и памяти.
+const MAX_AUTO_SESSIONS: usize = 2;
+
+/// Физических ядер — оценка: половина логических (SMT), не меньше одного. ORT при
+/// `intra_threads = 0` берёт физические ядра; их и делим между сессиями.
+fn physical_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
+}
+
+/// Сессий реранкера с динамическим int8 по умолчанию: до [`MAX_AUTO_SESSIONS`], но не
+/// меньше двух физических ядер на сессию.
+pub fn rerank_sessions_auto() -> usize {
+    (physical_cores() / 2).clamp(1, MAX_AUTO_SESSIONS)
+}
+
+/// Сессий и потоков у каждой: батчащаяся модель — одна сессия на `threads` потоков (0 —
+/// решение ORT); динамический int8 — `sessions` (0 — авто), ядра (`threads`, 0 — все
+/// физические) делятся между ними поровну.
+fn pool_shape(dynamic_quant: bool, sessions: usize, threads: usize) -> (usize, usize) {
+    if !dynamic_quant {
+        return (1, threads);
+    }
+    let n = if sessions == 0 {
+        rerank_sessions_auto()
+    } else {
+        sessions
+    };
+    if n == 1 {
+        return (1, threads);
+    }
+    let total = if threads == 0 {
+        physical_cores()
+    } else {
+        threads
+    };
+    (n, (total / n).max(1))
+}
 
 struct Runner {
     session: Session,
@@ -41,7 +88,8 @@ pub struct Reranker {
     spec: RerankSpec,
     model_id: String,
     tok: Tok,
-    runner: Mutex<Runner>,
+    /// Сессии: у батчащейся модели одна, у динамического int8 — несколько (см. модуль).
+    runners: Vec<Mutex<Runner>>,
     report: DeviceReport,
     /// Окружение ORT живёт не меньше сессии.
     _env: Environment,
@@ -57,9 +105,10 @@ fn sigmoid(x: f32) -> f32 {
 
 impl Reranker {
     /// Загружает реранкер `<models_dir>/<id>`: описатель (`role = "rerank"`), файлы, ORT,
-    /// токенизатор и сессию на выбранном устройстве (с откатом на CPU). Потоки — как у
+    /// токенизатор и сессии на выбранном устройстве (с откатом на CPU). Потоки — как у
     /// сессии индексации (`ml.index_threads`, 0 — все физические ядра): 20 × 256 токенов на
-    /// двух потоках запросов шли бы секунды.
+    /// двух потоках запросов шли бы секунды; у динамического int8 они делятся между
+    /// `ml.rerank_sessions` сессиями.
     pub fn load(cfg: &MlConfig, id: &str) -> Result<Reranker, MlError> {
         let t0 = Instant::now();
         let spec = RerankSpec::load(&cfg.models_dir, id)?;
@@ -78,9 +127,14 @@ impl Reranker {
         } else {
             cfg.device
         };
-        let (session, mut report) =
-            build_session(&env, pref, &ort_dylib, &model, cfg.index_threads)?;
-        let runner = Runner::new(session)?;
+        let (count, threads) =
+            pool_shape(spec.dynamic_quant, cfg.rerank_sessions, cfg.index_threads);
+        let (sessions, mut report) =
+            build_session_pool(&env, pref, &ort_dylib, &model, threads, count)?;
+        let runners = sessions
+            .into_iter()
+            .map(|s| Runner::new(s).map(Mutex::new))
+            .collect::<Result<Vec<_>, _>>()?;
         if cpu_only {
             report.reason = format!(
                 "модель {} для CPU (device = \"cpu\" в манифесте), для GPU нужен её GPU-вариант",
@@ -91,6 +145,8 @@ impl Reranker {
             model = %full_id,
             device = %report.device,
             reason = %report.reason,
+            sessions = count,
+            threads,
             ms = t0.elapsed().as_millis() as u64,
             "реранкер загружен"
         );
@@ -98,7 +154,7 @@ impl Reranker {
             spec,
             model_id: full_id,
             tok,
-            runner: Mutex::new(runner),
+            runners,
             report,
             _env: env,
         })
@@ -146,24 +202,11 @@ impl Reranker {
         )?;
         let mut order: Vec<usize> = (0..encs.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(encs[i].len()));
-        let mut out = vec![0f32; encs.len()];
-        let mut runner = lock(&self.runner);
-        let mut start = 0;
-        while start < order.len() {
-            let width = encs[order[start]].len().max(1);
-            let rows = if self.spec.dynamic_quant {
-                1
-            } else {
-                (MAX_BATCH_TOKENS / width).max(1)
-            };
-            let end = (start + rows).min(order.len());
-            let batch: Vec<&Encoding> = order[start..end].iter().map(|&i| &encs[i]).collect();
-            for (k, logit) in self.run(&mut runner, &batch)?.into_iter().enumerate() {
-                out[order[start + k]] = sigmoid(logit);
-            }
-            start = end;
-        }
-        drop(runner);
+        let out = if self.spec.dynamic_quant {
+            self.score_single(&encs, &order)?
+        } else {
+            self.score_batched(&encs, &order)?
+        };
         tracing::debug!(
             model = %self.model_id,
             pairs = passages.len(),
@@ -171,6 +214,74 @@ impl Reranker {
             "реранк"
         );
         Ok(out)
+    }
+
+    /// Батчами до [`MAX_BATCH_TOKENS`] (с паддингом) на одной сессии; `order` — по
+    /// убыванию длины.
+    fn score_batched(&self, encs: &[Encoding], order: &[usize]) -> Result<Vec<f32>, MlError> {
+        let mut out = vec![0f32; encs.len()];
+        let mut runner = lock(&self.runners[0]);
+        let mut start = 0;
+        while start < order.len() {
+            let width = encs[order[start]].len().max(1);
+            let rows = (MAX_BATCH_TOKENS / width).max(1);
+            let end = (start + rows).min(order.len());
+            let batch: Vec<&Encoding> = order[start..end].iter().map(|&i| &encs[i]).collect();
+            for (k, logit) in self.run(&mut runner, &batch)?.into_iter().enumerate() {
+                out[order[start + k]] = sigmoid(logit);
+            }
+            start = end;
+        }
+        Ok(out)
+    }
+
+    /// По одной паре (динамический int8): пары в порядке `order` раздаются сессиям, каждая —
+    /// в своём потоке. Балл пары не зависит от того, какая сессия её считала.
+    fn score_single(&self, encs: &[Encoding], order: &[usize]) -> Result<Vec<f32>, MlError> {
+        let next = AtomicUsize::new(0);
+        let work = |m: &Mutex<Runner>| -> Result<Vec<(usize, f32)>, MlError> {
+            let mut runner = lock(m);
+            let mut got = Vec::new();
+            loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&i) = order.get(k) else {
+                    return Ok(got);
+                };
+                let logit = self.run(&mut runner, &[&encs[i]])?;
+                got.push((i, sigmoid(logit[0])));
+            }
+        };
+        let n = self.runners.len().min(order.len()).max(1);
+        let parts: Vec<Result<Vec<(usize, f32)>, MlError>> = if n == 1 {
+            vec![work(&self.runners[0])]
+        } else {
+            std::thread::scope(|sc| {
+                let handles: Vec<_> = self.runners[..n]
+                    .iter()
+                    .map(|m| sc.spawn(|| work(m)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(MlError::Ort("поток реранкера аварийно завершился".into()))
+                        })
+                    })
+                    .collect()
+            })
+        };
+        let mut out = vec![0f32; encs.len()];
+        for part in parts {
+            for (i, s) in part? {
+                out[i] = s;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Сессий реранкера (у динамического int8 — параллельных).
+    pub fn sessions(&self) -> usize {
+        self.runners.len()
     }
 
     /// Один прогон: логиты пар батча.

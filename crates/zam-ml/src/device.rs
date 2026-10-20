@@ -212,15 +212,20 @@ pub(crate) fn build_sessions(
     })
 }
 
-/// Одна сессия (реранкер) на выбранном устройстве с откатом на CPU.
-pub(crate) fn build_session(
+/// `count` сессий одной модели (реранкер) на выбранном устройстве с откатом на CPU; по
+/// `threads` потоков у каждой, перепакованные веса MatMul общие (`PrepackedWeights`).
+pub(crate) fn build_session_pool(
     env: &Environment,
     pref: DevicePref,
     ort_dylib: &Path,
     model: &Path,
     threads: usize,
-) -> Result<(Session, DeviceReport), MlError> {
+    count: usize,
+) -> Result<(Vec<Session>, DeviceReport), MlError> {
     with_device(pref, ort_dylib, |cuda| {
-        session(env, model, threads, &PrepackedWeights::new(), cuda)
+        let pw = PrepackedWeights::new();
+        (0..count.max(1))
+            .map(|_| session(env, model, threads, &pw, cuda))
+            .collect()
     })
 }

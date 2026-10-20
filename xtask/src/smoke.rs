@@ -267,7 +267,7 @@ fn agent() -> ureq::Agent {
 }
 
 /// HTTP-клиент без прокси, коды ошибок не превращаются в `Err`, общий предел `timeout`.
-fn agent_with(timeout: Duration) -> ureq::Agent {
+pub(crate) fn agent_with(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .proxy(None)
         .http_status_as_error(false)
@@ -307,8 +307,14 @@ pub(crate) fn wait_health_for(srv: &mut Server, base: &str, wait: Duration) -> R
     }
 }
 
-/// Вход администратора и выпуск токена `ro`; возвращает plaintext.
-fn admin_issue_ro(base: &str) -> Result<String> {
+/// Сессия администратора WebUI: cookie `zam_session` и CSRF-токен.
+pub(crate) struct AdminSession {
+    pub(crate) cookie: String,
+    pub(crate) csrf: String,
+}
+
+/// Вход администратора (`admin` / пароль smoke из `ZAM_ADMIN_PASSWORD`).
+pub(crate) fn admin_login(base: &str) -> Result<AdminSession> {
     let a = agent();
     let mut r = a
         .post(&format!("{base}/api/v1/auth/login"))
@@ -332,7 +338,13 @@ fn admin_issue_ro(base: &str) -> Result<String> {
         .as_str()
         .context("в ответе входа нет csrf")?
         .to_string();
+    Ok(AdminSession { cookie, csrf })
+}
 
+/// Вход администратора и выпуск токена `ro`; возвращает plaintext.
+fn admin_issue_ro(base: &str) -> Result<String> {
+    let a = agent();
+    let AdminSession { cookie, csrf } = admin_login(base)?;
     let mut r = a
         .get(&format!("{base}/api/v1/auth/me"))
         .header("Cookie", &cookie)

@@ -199,6 +199,18 @@ impl Supervisor {
         (pid != 0).then_some(pid)
     }
 
+    /// Процесс Qdrant жив: managed — pid есть и процесс не завершён (проверка ОС, без
+    /// обращения к Qdrant); external — всегда `true`. Поиск сверяется с ним при состоянии
+    /// `Ready`: между смертью процесса и сменой состояния супервизором (ожидание журнала —
+    /// до 2 с) запрос иначе ушёл бы в закрытый порт, а на Windows отказ соединения с
+    /// localhost приходит только через ~2 с на попытку.
+    pub fn process_alive(&self) -> bool {
+        match &self.shared {
+            None => true,
+            Some(_) => self.pid().is_some_and(pid_alive),
+        }
+    }
+
     /// Перезапусков Qdrant после падения с момента старта (external — 0).
     pub fn restarts(&self) -> u32 {
         self.shared

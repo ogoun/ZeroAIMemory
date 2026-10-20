@@ -316,6 +316,83 @@ async fn qdrant_killed_mid_indexing_restarts_and_queue_catches_up() {
     a.st.shutdown().await;
 }
 
+/// Поиск сразу после убийства Qdrant (задача 15 M2): ответ из FTS с `degraded: true` и
+/// `qdrant_down` за доли секунды, а не после отказа соединения. На Windows отказ соединения
+/// с закрытым портом localhost приходит через ~2 с на попытку, клиент Qdrant повторяет
+/// запрос, а супервизор меняет состояние только после разбора журнала процесса: до
+/// исправления первый поиск после падения ждал 2–4 с. Теперь доступность при `Ready`
+/// сверяется с живостью процесса (`Supervisor::process_alive`), а соединение ограничено
+/// 300 мс. Перезапуск держит тестовая точка (`hold_next_restart`): Qdrant гарантированно
+/// лежит всё время проверки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_right_after_qdrant_kill_degrades_without_waiting() {
+    if !have(MINILM) {
+        return;
+    }
+    let dir = common::tmp("lc-kill-search");
+    let mut c = common::cfg_in(dir.clone());
+    ml(&mut c, MINILM);
+    managed(&mut c);
+    let a = common::api::api_with(c).await;
+    let _guard = ShutdownOnPanic(a.st.clone());
+    vector_ready(&a).await;
+    let v = a.note("knowledge", "kill-search/n0", &body(0)).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    until(
+        "заметка проиндексирована",
+        READY,
+        async || state(&a, &id).await == "indexed",
+    )
+    .await;
+    let search = async || {
+        let t = Instant::now();
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/search",
+                Some(json!({"query": "собирается командой cargo build", "mode": "chunks"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        (t.elapsed(), r.json())
+    };
+    let (_, j) = search().await;
+    assert_eq!(j["degraded"], false, "{j}");
+
+    let sup = a.st.index.supervisor().unwrap();
+    sup.hold_next_restart();
+    let qpid = sup.pid().expect("pid Qdrant");
+    kill_pid(qpid);
+    // без ожидания супервизора: первый же поиск после смерти процесса
+    let (dt, j) = search().await;
+    eprintln!("первый поиск после убийства Qdrant: {dt:?}");
+    assert_eq!(j["degraded"], true, "{j}");
+    assert_eq!(j["degraded_reason"], "qdrant_down", "{j}");
+    assert!(
+        j["items"][0]["path"]
+            .as_str()
+            .is_some_and(|p| p.starts_with("kill-search/")),
+        "FTS находит заметку: {j}"
+    );
+    assert!(dt < Duration::from_secs(1), "поиск ждал {dt:?}");
+    // и пока Qdrant лежит — так же быстро
+    assert!(
+        sup.wait_restart_held(GONE).await,
+        "супервизор не заметил падения"
+    );
+    let (dt, j) = search().await;
+    assert_eq!(j["degraded"], true, "{j}");
+    assert!(dt < Duration::from_secs(1), "поиск ждал {dt:?}");
+    sup.release_restart();
+    until("Qdrant вернулся", READY, async || {
+        sup.pid().is_some_and(|p| p != qpid) && a.st.index.vector_available().is_ok()
+    })
+    .await;
+    let (_, j) = search().await;
+    assert_eq!(j["degraded"], false, "{j}");
+    a.st.shutdown().await;
+}
+
 /// Длина пути в символах UTF-16 (так считает MAX_PATH).
 fn wlen(p: &Path) -> usize {
     p.to_string_lossy().encode_utf16().count()

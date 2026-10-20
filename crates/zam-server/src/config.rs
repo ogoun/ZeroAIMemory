@@ -222,6 +222,10 @@ pub struct MlSection {
     pub rerank_top: usize,
     /// Предел токенов фрагмента в паре реранкера (8..=1024).
     pub rerank_tokens: usize,
+    /// Параллельных сессий реранкера с динамическим int8 (jina): 0 — авто (до 2, не меньше
+    /// двух физических ядер на сессию), иначе 1..=16. Ядра `index_threads` делятся между
+    /// сессиями; каждая сессия держит свою копию весов (~0,3 ГБ у jina).
+    pub rerank_sessions: usize,
 }
 
 impl MlSection {
@@ -250,6 +254,9 @@ impl MlSection {
         }
         if !(8..=1024).contains(&self.rerank_tokens) {
             return Err(bad("rerank_tokens", "от 8 до 1024"));
+        }
+        if self.rerank_sessions > 16 {
+            return Err(bad("rerank_sessions", "0 (авто) или от 1 до 16"));
         }
         Ok(())
     }
@@ -465,6 +472,7 @@ impl Default for ServerConfig {
                 rerank_model_gpu: "bge-reranker-v2-m3".into(),
                 rerank_top: 20,
                 rerank_tokens: 256,
+                rerank_sessions: 0,
             },
             index: IndexSection {
                 batch_tokens: 8192,

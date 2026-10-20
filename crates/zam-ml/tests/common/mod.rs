@@ -85,6 +85,7 @@ pub fn config(ort: PathBuf, models: PathBuf, device: DevicePref) -> MlConfig {
         ort_dylib: ort,
         index_threads: 2,
         query_threads: 2,
+        rerank_sessions: 0,
         unload_after: Some(Duration::from_secs(600)),
     }
 }

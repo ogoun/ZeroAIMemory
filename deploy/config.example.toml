@@ -70,12 +70,17 @@ unload_after = ""
 # комплект моделей не входит: zam-server models fetch --device cpu --reranker --accept-nc-license.
 # GPU: bge-reranker-v2-m3 (Apache-2.0): zam-server models fetch --device gpu --reranker.
 # Для коммерческого использования на CPU задайте rerank_model_cpu = "bge-reranker-v2-m3"
-# (медленнее: около 8 с на 20 кандидатов против 1,6 с у jina на 12 ядрах).
+# (медленнее: около 8 с на 20 кандидатов против 1,4 с у jina на 12 ядрах).
 rerank_model_cpu = "jina-reranker-v2"
 rerank_model_gpu = "bge-reranker-v2-m3"
 # Сколько первых кандидатов слияния переранжировать и предел токенов фрагмента в паре.
 rerank_top = 20
 rerank_tokens = 256
+# Параллельных сессий jina-reranker-v2 (динамический int8 считает пары по одной): 0 — авто
+# (до 2, ядра index_threads делятся между ними). Каждая сессия — ещё ~0,3 ГБ памяти, на
+# 12 ядрах: 1 — 1,9 с, 2 — 1,4 с, 4 — 1,15 с на 20 кандидатов. У bge-reranker-v2-m3 сессия
+# всегда одна.
+rerank_sessions = 0
 
 [index]
 # Предел токенов одного вызова инференса при индексации.

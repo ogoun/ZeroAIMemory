@@ -66,7 +66,8 @@
 //! `text`, `rerank_score` 0..1 — у переставленных реранком), `degraded`, `degraded_reason`
 //! и `degraded_text` (или `null`), `warnings` (строки; пока только о реранке), `pending_count` — живые
 //! заметки области, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms,
-//! fuse_ms, rerank_ms}` (`null` — этап не выполнялся). Маркеры совпадений в JSON —
+//! fuse_ms, rerank_ms, expand_ms, pending_ms, total_ms}` (`null` — этап не выполнялся;
+//! `total_ms` — весь обработчик без сериализации ответа). Маркеры совпадений в JSON —
 //! U+E000/U+E001.
 //!
 //! **Формат `md`** — карточки §9.3, по одной на элемент:
@@ -762,6 +763,7 @@ pub async fn search(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
+    let total_t = Instant::now();
     let req: SearchReq = json_body(body)?;
     let mode = req.mode.unwrap_or(SearchMode::Brief);
     let format = req.format.unwrap_or(OutFormat::Json);
@@ -984,6 +986,7 @@ pub async fn search(
     };
 
     // 5. top_k, режим, expand, упаковка
+    let expand_t = Instant::now();
     let mut items = match mode {
         SearchMode::Notes => group_by_node(items, top_k),
         SearchMode::Chunks => expand_items(&db, items, expand, top_k).await?,
@@ -997,8 +1000,11 @@ pub async fn search(
         }
         SearchMode::Chunks | SearchMode::Brief => {}
     }
+    let expand_ms = ms(expand_t);
     // заметки области, ещё не прошедшие векторную индексацию (без `index: false` и Human)
+    let pending_t = Instant::now();
     let pending = pending_count(&db, space_ids.clone(), prefix.clone()).await?;
+    let pending_ms = ms(pending_t);
     let packed = pack_items(items, mode, budget);
     let degraded = available.err().or(vrun.failed);
     let by_id: HashMap<Id, Space> = spaces.into_iter().map(|s| (s.id, s)).collect();
@@ -1019,6 +1025,10 @@ pub async fn search(
                     "vector_ms": vrun.vector_ms,
                     "fuse_ms": fuse_ms,
                     "rerank_ms": rerank_ms,
+                    "expand_ms": expand_ms,
+                    "pending_ms": pending_ms,
+                    // от разбора запроса до ответа (без сериализации JSON)
+                    "total_ms": ms(total_t),
                 },
             }))
             .into_response()

@@ -9,6 +9,12 @@
 //! задания делает `wal_checkpoint(RESTART)`, когда WAL больше
 //! [`DbOptions::wal_limit_bytes`]. При закрытии — `wal_checkpoint(TRUNCATE)`,
 //! затем закрывается последнее соединение и SQLite удаляет `-wal`/`-shm`.
+//!
+//! **Ожидание блокировки писателем** — [`WRITER_BUSY_TIMEOUT`] (30 с), у читателей и
+//! фонового потока — 5 с и 50 мс. Фоновый `RESTART` с переносом остатка держит блокировку
+//! записи на время копирования кадров и fsync: на HDD под нагрузкой индексации это секунды
+//! (замер задачи 15 M2: загрузка 10 тыс. заметок при работающем воркере — `POST /nodes`
+//! получил «database is locked» через 5,6 с). Запись должна дождаться, а не упасть.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -25,6 +31,8 @@ use crate::StoreError;
 use crate::migrate::{self, Migration};
 
 const READERS: usize = 4;
+/// Ожидание блокировки записи потоком-писателем (см. документацию модуля).
+pub const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 type WriterJob = Box<dyn FnOnce(&mut Connection) + Send>;
 
@@ -262,6 +270,7 @@ impl Db {
     ) -> Result<Db, StoreError> {
         let mut conn = Connection::open(path)?;
         set_common_pragmas(&conn)?;
+        conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(StoreError::Unsupported(format!(
