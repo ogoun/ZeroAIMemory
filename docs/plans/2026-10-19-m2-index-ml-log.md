@@ -1,7 +1,7 @@
 # M2 — журнал выполнения (решения и отложенные замечания)
 
 План: [2026-10-19-m2-index-ml.md](2026-10-19-m2-index-ml.md). Ветка `m2-index`.
-Spec: docs/specs/2026-10-17-zeroaimemory-tz.md (v1.1 → v1.4). Рабочий журнал процесса SDD
+Spec: docs/specs/2026-10-17-zeroaimemory-tz.md (v1.1 → v1.6). Рабочий журнал процесса SDD
 (задачи 1–13, rulings, переносы) — в `.superpowers/` (не в git); перенос итогов в этот файл —
 задача 17. Здесь — решения, которые нужны в репозитории сразу.
 
@@ -315,3 +315,15 @@ CPU — 35 против 65 мс). `index_secs` — от начала загру�
   - первый старт после массовой индексации.
 
   Запись до векторного индекса на GPU выполнена (0,46 с).
+
+### Task 16 — прототип Qdrant Edge и ADR
+
+- **`EdgeIndex`** (`crates/zam-index/src/edge.rs`, feature `edge`): `qdrant-edge =0.8.0` собирается на Windows и Rust 1.99.1 без правок. Решения:
+  - метаданные коллекции — в `zam_meta.json` рядом с шардом (у Edge их нет); шард без файла — «не наш»;
+  - все вызовы — `spawn_blocking`, паника Edge → `IndexError::Other`; `OperationError::ServiceError` → `Unavailable`, `InconsistentStorage`/`FileNotFound` → `Corrupt`;
+  - `optimize()` — фоновый поток с дебаунсом 2 с после последней записи; `optimize_now()` — для замеров и тестов; `drop_all` ждёт освобождения шарда (идущую оптимизацию не отменить);
+  - `EdgeOptions`: 2 потока поиска и 2 потока HNSW — как `max_search_threads` и `optimizer_cpu_budget` managed.
+- **Тесты.** Общие случаи контракта `VectorIndex` вынесены в `tests/common/cases.rs` (макрос `vector_index_cases!`), `tests/qdrant.rs` и `tests/edge.rs` их подключают. Каталог теста — первые 8 символов имени: длинные имена выводили путь сегментов Qdrant за MAX_PATH на Windows.
+- **Bench.** `cargo xtask bench --edge` (`xtask/src/bench/edge.rs`) и пример `zam-index/examples/index_bench.rs`: отдельная чистая сборка на вариант, отдельный процесс на каждый замер.
+- **Итог** (`eval/results/2026-10-20-bench-edge.*`): p95 13,7 против 21,9 мс (1,60×), RSS 9,2 против 4,3 ГиБ, пересборка 101 против 27 мин. Критерий исследования 05 не выполнен → **не переходить** (`docs/adr/0001-qdrant-edge.md`). CI с `--features edge` не добавлен: feature нужна только для пересмотра ADR.
+- **Отложено:** причина высокого RSS Edge после загрузки шарда и медленного upsert без фоновой оптимизации не разбиралась (на решение не влияет); гипотезы — в ADR.

@@ -232,3 +232,20 @@
 | остальное | 16 / 89 мс | — |
 
 **Прогоны** (Windows 11): `cargo fmt --check` и `cargo clippy --workspace --all-targets -D warnings` — чисто; `ZAM_REQUIRE_ML=1 cargo test --workspace` — результат в отчёте задачи (fix round 2): 688 passed, 0 failed, 15 ignored.
+
+## 2026-10-20 — Этап M2, задача 16: прототип Qdrant Edge и ADR
+
+- **Прототип.** `EdgeIndex` на `qdrant-edge =0.8.0` за трейтом `VectorIndex` (feature `edge` у `zam-index`, не по умолчанию, вне комплектов). Схема коллекции та же, что у managed; общий набор тестов контракта (`tests/common/cases.rs`) проходит для обоих вариантов на Windows.
+- **Замер** — `cargo xtask bench --edge`, 1 млн × 1024, HDD; итог `eval/results/2026-10-20-bench-edge.*` (код `2e7387a`):
+
+  | Метрика | managed | Edge |
+  |---|---|---|
+  | p95 гибридного запроса | 21,9 мс | 13,7 мс (выигрыш 1,60×) |
+  | RSS после 1000 запросов | 4 264 МиБ | 9 196 МиБ (×2,16) |
+  | Полная пересборка | 26,8 мин | 101,3 мин |
+  | На диске | 7,1 ГиБ | 12,8 ГиБ |
+  | Чистая release-сборка / exe | 101 с / 9,7 МиБ | 500 с / 33,2 МиБ |
+  | Крейтов `zam-index` (хост) | 235 | 433 |
+
+- **Решение** — `docs/adr/0001-qdrant-edge.md`: не переходить. По критерию исследования 05 не выполнены оба условия (p95 < 2×, RSS выше), Edge ещё 0.8 (бета). Условия пересмотра — в ADR.
+- **Отчёт** — `.superpowers/sdd/2026-10-19-m2-index-ml/task-16-report.md`.
