@@ -17,10 +17,19 @@ test = false
 doc = false
 bench = false
 
+# Замер managed Qdrant против Qdrant Edge (ADR 0001): запускает `cargo xtask bench --edge`;
+# вариант edge — только при сборке с feature `edge`. В поставку не входит.
+[[example]]
+name = "index_bench"
+test = false
+
 [features]
 # Точка остановки воркера перед записью пачки в Qdrant — только для тестов (включает
 # dev-зависимость zam-server); в сборке сервера и релизе её нет.
 test-hooks = []
+# Прототип встроенного индекса Qdrant Edge (задача 16 M2, ADR 0001): не по умолчанию,
+# в сервер и релизные комплекты не входит; включается только для тестов и `cargo xtask bench --edge`.
+edge = ["dep:qdrant-edge"]
 
 [dependencies]
 qdrant-client.workspace = true
@@ -41,6 +50,8 @@ jiff.workspace = true
 blake3.workspace = true
 # параллельная запись пачек точек при reindex (уже в дереве через tonic)
 futures-util = { workspace = true, features = ["alloc"] }
+# только под feature `edge` (ADR 0001)
+qdrant-edge = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { workspace = true, features = ["job-object", "creation-flags"] }
@@ -51,5 +62,7 @@ process-wrap = { workspace = true, features = ["process-group"] }
 libc.workspace = true
 
 [dev-dependencies]
+# index_bench: sparse-векторы из корпуса eval токенизатором bge-m3 (крейт уже в дереве через zam-ml)
+tokenizers.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true

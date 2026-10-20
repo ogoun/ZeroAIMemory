@@ -80,6 +80,9 @@ qdrant-client = { version = "=1.19.0", default-features = false }
 tonic = { version = "0.14", default-features = false }
 # M2: супервизор нативного Qdrant — Job Object / группа процессов (исследование 05 §7.2)
 process-wrap = { version = "=10.0.1", default-features = false, features = ["tokio1", "kill-on-drop"] }
+# M2, задача 16: прототип встроенного Qdrant Edge — только feature `edge` у zam-index, в комплекты
+# не входит (ADR 0001); бета, API и формат хранилища меняются между минорными версиями
+qdrant-edge = { version = "=0.8.0", default-features = false }
 libc = "0.2"
 # версия та же, что у process-wrap 10.0.1 (тип PROCESS_CREATION_FLAGS)
 windows = "0.62"

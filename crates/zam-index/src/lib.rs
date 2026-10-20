@@ -16,10 +16,15 @@
 //! - [`reindex`] — пересборка области из кэша `embeddings` без инференса (или полная):
 //!   выполняется воркером по запросу и командой `zam-server reindex`.
 //!
+//! - [`EdgeIndex`] (feature `edge`, не по умолчанию) — прототип того же трейта на встроенном
+//!   Qdrant Edge для сравнения с managed-вариантом (задача 16, ADR 0001).
+//!
 //! Источник истины — SQLite: индекс пересобирается из `embeddings` без инференса.
 //! Пространство `human` в индекс никогда не попадает. В ошибки и логи не попадают
 //! векторы, текст чанков и API-ключ.
 
+#[cfg(feature = "edge")]
+mod edge;
 mod qdrant;
 pub mod reindex;
 pub mod rollup;
@@ -29,6 +34,8 @@ mod test_hooks;
 mod vector;
 pub mod worker;
 
+#[cfg(feature = "edge")]
+pub use edge::{EdgeIndex, EdgeOptions};
 pub use qdrant::{COLLECTION, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE};
 pub use reindex::{ReindexCtx, ReindexReport, ReindexRequest, reindex};
 pub use vector::{

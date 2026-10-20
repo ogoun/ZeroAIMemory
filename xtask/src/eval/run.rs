@@ -97,7 +97,8 @@ fn ort_dylib(repo: &Path, device: Device) -> PathBuf {
         .join(name)
 }
 
-fn qdrant_bin(repo: &Path) -> PathBuf {
+/// Бинарник Qdrant из `target/deps/<платформа>/qdrant/` (также `bench --edge`).
+pub fn qdrant_bin(repo: &Path) -> PathBuf {
     repo.join("target")
         .join("deps")
         .join(platform())

@@ -17,12 +17,17 @@
 //! - `reindex` — пересборка Qdrant из `embeddings` без инференса;
 //! - `fts` — сервер без моделей на том же каталоге: поиск FTS-only и RSS.
 //!
+//! С `--edge` — отдельный замер векторного индекса для ADR 0001: managed Qdrant против
+//! встроенного Qdrant Edge на синтетике 1 млн × 1024 ([`edge`]); профиль и этапы сервера
+//! тогда не используются.
+//!
 //! Каждый замеряемый проход идёт после перезапуска сервера с прогревом двумя посторонними
 //! запросами: LRU-кэш эмбеддингов запросов не подменяет инференс. Итог —
 //! `eval/results/<дата>-bench-<профиль>[-метка].{json,md}`; каталог данных удаляется (кроме
 //! `--keep`).
 
 pub mod copies;
+pub mod edge;
 pub mod report;
 
 use std::collections::BTreeMap;
@@ -109,9 +114,9 @@ pub enum Phase {
 #[derive(Debug, clap::Args)]
 pub struct BenchArgs {
     /// cpu — bge-m3-int8 и jina-reranker-v2 на CPU; gpu — bge-m3-fp16 и bge-reranker-v2-m3
-    /// на CUDA
-    #[arg(long, value_enum)]
-    pub profile: Profile,
+    /// на CUDA (не нужен с --edge)
+    #[arg(long, value_enum, required_unless_present = "edge")]
+    pub profile: Option<Profile>,
     /// Заметок всего: корпус eval и компактные копии до этого числа
     #[arg(long, default_value_t = 10_000)]
     pub notes: usize,
@@ -157,6 +162,28 @@ pub struct BenchArgs {
     /// Не убирать из PATH сервера каталоги CUDA Toolkit
     #[arg(long)]
     pub keep_cuda_path: bool,
+    /// Замер векторного индекса для ADR 0001: managed Qdrant против Qdrant Edge
+    /// (синтетика, данные в target/bench-edge; итог eval/results/<дата>-bench-edge)
+    #[arg(long)]
+    pub edge: bool,
+    /// --edge: точек в индексе
+    #[arg(long, default_value_t = 1_000_000)]
+    pub points: u64,
+    /// --edge: размерность dense
+    #[arg(long, default_value_t = 1024)]
+    pub dim: usize,
+    /// --edge: прогонов поиска на вариант (каждый — новый процесс)
+    #[arg(long, default_value_t = 3)]
+    pub runs: usize,
+    /// --edge: запросов в прогоне поиска
+    #[arg(long, default_value_t = 1000)]
+    pub search_queries: usize,
+    /// --edge: потоков индексации (managed — optimizer_cpu_budget, Edge — HNSW); 2 — как в сервере
+    #[arg(long, default_value_t = 2)]
+    pub index_threads: usize,
+    /// --edge: не пересобирать примеры с нуля (время сборки тогда не замеряется)
+    #[arg(long)]
+    pub no_clean_build: bool,
 }
 
 /// Сводка времён, мс.
@@ -1328,6 +1355,10 @@ fn host() -> Value {
 
 /// Точка входа `cargo xtask bench`.
 pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
+    if a.edge {
+        return edge::main(&a, repo);
+    }
+    let profile = a.profile.context("нужен --profile cpu|gpu")?;
     let mut phases = a.phases.clone();
     if phases.is_empty() {
         phases = vec![
@@ -1358,14 +1389,14 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
     };
     let corpus = Corpus::load(&paths.corpus)?;
     let queries: Vec<Query> = load_queries(&paths.queries)?;
-    let device = a.profile.device();
+    let device = profile.device();
     let model = a
         .model
         .clone()
         .unwrap_or_else(|| default_model(device).to_string());
     let name = match &a.label {
-        Some(l) if !l.is_empty() => format!("{}-{l}", a.profile.as_str()),
-        _ => a.profile.as_str().to_string(),
+        Some(l) if !l.is_empty() => format!("{}-{l}", profile.as_str()),
+        _ => profile.as_str().to_string(),
     };
     let spec = RunSpec {
         name,
@@ -1392,7 +1423,7 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
     let mut r = BenchResult {
         date: today(),
         git: git_rev(repo),
-        profile: Some(a.profile),
+        profile: Some(profile),
         label: a.label.clone(),
         host: host(),
         sets: c.spec.sets.iter().cloned().collect(),
