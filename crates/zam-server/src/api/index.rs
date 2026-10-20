@@ -211,6 +211,9 @@ pub async fn status(
                 "qdrant_ms": qdrant.as_millis() as u64,
                 // ожидание уступки эмбеддингам запросов (в embed_ms не входит)
                 "yield_ms": rt.worker.yield_wait().as_millis() as u64,
+                // покой воркера: нет пачки в работе и отложенных свёрток L0 папок
+                "batch_running": wst.batch_running,
+                "rollups_pending": wst.rollups_pending,
             })
         }
         Principal::Token(_) => Value::Null,

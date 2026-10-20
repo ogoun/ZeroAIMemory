@@ -155,6 +155,37 @@ impl ServerProc {
         http(self.addr, method, path, Some(token), body)
     }
 
+    /// Вход администратора (пароль первого старта): значение cookie `zam_session`.
+    pub fn admin_session(&self) -> String {
+        let (code, head, v) = http_with(
+            self.addr,
+            "POST",
+            "/api/v1/auth/login",
+            &[],
+            Some(&serde_json::json!({"login": "admin", "password": PASSWORD})),
+        )
+        .unwrap_or_else(|e| panic!("вход администратора: {e}\nstderr:\n{}", self.tail()));
+        assert_eq!(code, 200, "вход администратора: {v}");
+        head.lines()
+            .filter_map(|l| l.split_once(':'))
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("set-cookie"))
+            .find_map(|(_, c)| {
+                c.trim()
+                    .split(';')
+                    .next()
+                    .and_then(|kv| kv.trim().strip_prefix("zam_session="))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| panic!("нет cookie zam_session: {head}"))
+    }
+
+    /// GET в сессии администратора (`session` — из [`ServerProc::admin_session`]).
+    pub fn admin_get(&self, path: &str, session: &str) -> std::io::Result<(u16, Value)> {
+        let cookie = format!("zam_session={session}");
+        http_with(self.addr, "GET", path, &[("Cookie", &cookie)], None)
+            .map(|(code, _, v)| (code, v))
+    }
+
     /// Процесс жив; умер — паника с кодом выхода и хвостом stderr (без ожидания
     /// таймаута вызывающего).
     pub fn assert_running(&mut self, what: &str) {
@@ -188,12 +219,26 @@ pub fn http(
     token: Option<&str>,
     body: Option<&Value>,
 ) -> std::io::Result<(u16, Value)> {
+    let auth = token.map(|t| format!("Bearer {t}"));
+    let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("Authorization", a.as_str())).collect();
+    http_with(addr, method, path, &headers, body).map(|(code, _, v)| (code, v))
+}
+
+/// То же, что [`http`], с произвольными заголовками запроса; ответ — (код, заголовки
+/// ответа как есть, тело JSON).
+pub fn http_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&Value>,
+) -> std::io::Result<(u16, String, Value)> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     s.set_read_timeout(Some(Duration::from_secs(60)))?;
     let payload = body.map(Value::to_string).unwrap_or_default();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
-    if let Some(t) = token {
-        req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
     }
     if body.is_some() {
         req.push_str("Content-Type: application/json\r\n");
@@ -207,7 +252,8 @@ pub fn http(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| std::io::Error::other("ответ без заголовков"))?;
-    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    let head_raw = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let head = head_raw.to_ascii_lowercase();
     let code: u16 = head
         .split_whitespace()
         .nth(1)
@@ -259,5 +305,5 @@ pub fn http(
             ))
         })?
     };
-    Ok((code, v))
+    Ok((code, head_raw, v))
 }

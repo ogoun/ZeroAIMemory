@@ -479,22 +479,31 @@ fn settled(s: &Value) -> bool {
         && s["qdrant"]["points"].as_u64().is_some_and(|p| p > 0)
 }
 
-/// Число точек после покоя индексации, которое не меняется дольше отложенной свёртки L0
-/// (2 с) с запасом: 4 с подряд при пустой очереди.
-fn stable_points(srv: &mut ServerProc, token: &str) -> u64 {
-    const QUIET: Duration = Duration::from_secs(4);
-    let mut last = None;
-    let mut since = Instant::now();
+/// Число точек в покое воркера: очередь пуста, пачки в работе нет и отложенных свёрток
+/// L0 папок нет (`worker` статуса — только в сессии администратора). Общий предел — `READY`.
+fn idle_points(srv: &mut ServerProc) -> u64 {
+    let session = srv.admin_session();
+    let t = Instant::now();
+    let mut last: String;
     loop {
-        let s = wait_status(srv, token, "покой индексации", settled);
-        let p = s["qdrant"]["points"].as_u64().unwrap();
-        if last != Some(p) {
-            last = Some(p);
-            since = Instant::now();
-        } else if since.elapsed() >= QUIET {
-            return p;
+        srv.assert_running("покой воркера");
+        match srv.admin_get("/api/v1/index/status", &session) {
+            Ok((200, s))
+                if settled(&s)
+                    && s["worker"]["batch_running"] == false
+                    && s["worker"]["rollups_pending"] == 0 =>
+            {
+                return s["qdrant"]["points"].as_u64().unwrap();
+            }
+            Ok((code, s)) => last = format!("{code} {s}"),
+            Err(e) => last = format!("нет ответа: {e}"),
         }
-        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            t.elapsed() < READY,
+            "не дождались покоя воркера за {READY:?}; {last}\nstderr:\n{}",
+            srv.tail()
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -545,12 +554,10 @@ fn killed_server_takes_qdrant_down_and_restarts_with_long_data_dir() {
         ),
     );
     assert_eq!(code, 201, "{n}");
-    wait_status(&mut srv, &token, "индексация", settled);
     // Пустая очередь ещё не покой: L0 папки `long` воркер пишет отложенной свёрткой
-    // (`index.rollup_debounce_ms`, 2 с) уже после закрытия задания, а `worker` (с
-    // `rollups_pending`) по токену не отдаётся. Без этого ожидания точек до убийства
-    // бывало 2, а после перезапуска — 3 (флейк на HDD, задача 17 M2).
-    let pts = stable_points(&mut srv, &token);
+    // (`index.rollup_debounce_ms`, 2 с) уже после закрытия задания. Без ожидания покоя
+    // воркера точек до убийства бывало 2, а после перезапуска — 3 (флейк на HDD, задача 17 M2).
+    let pts = idle_points(&mut srv);
     search_vector(&srv, &token);
     let deepest = longest_path(&data.join("qdrant").join("storage"));
     eprintln!(
