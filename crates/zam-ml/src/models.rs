@@ -197,7 +197,11 @@ mod tests {
         let want9: String = full[..4].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(v9, want9);
         // правка на месте тем же размером с возвратом mtime: файл тот же, но ctime /
-        // ChangeTime другие — хэш заново
+        // ChangeTime другие — хэш заново. ctime (Linux) и ChangeTime (Windows) ядро ставит
+        // по грубым часам — шаг таймера 4–16 мс: на быстром диске (раннеры CI) правка сразу
+        // за переименованием получала то же время, ключ совпадал и тест падал. Пауза больше
+        // шага — в жизни правки весов на месте не идут чаще.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&f, b"weights v8").unwrap();
         std::fs::File::options()
             .write(true)
