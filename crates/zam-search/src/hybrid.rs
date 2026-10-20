@@ -10,7 +10,7 @@
 //! сводки потом сливаются. Порядок вызовов: `fuse` → `note_to_leaf` →
 //! [`cap_per_node`](crate::cap_per_node).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
 use zam_core::Id;
@@ -95,17 +95,26 @@ pub struct SearchInputs {
     pub vector: Option<Vec<String>>,
     /// Метаданные всех кандидатов. Кандидат без метаданных отбрасывается.
     pub chunks: HashMap<String, ChunkMeta>,
+    /// `fts` получен ослабленным запросом (любое слово): строгий ничего не нашёл.
+    pub fts_relaxed: bool,
+    /// Чанки, которых векторный канал не видит в принципе (Human, узел не проиндексирован):
+    /// им ослабленный bm25 не понижается — соревноваться с векторными кандидатами им нечем.
+    pub vector_blind: HashSet<String>,
 }
 
-/// Параметры слияния (секция `[search]`). Умолчания библиотеки — равные веса каналов (на них
-/// держатся модульные тесты слияния); вес ослабленного bm25 (`w_fts_relaxed`) сервер
-/// подставляет в `w_fts` сам, когда строгий запрос FTS ничего не нашёл.
+/// Параметры слияния (секция `[search]`). Умолчания библиотеки — веса `w_vector = w_fts = 1`,
+/// `w_trigram = 0,7` и `w_fts_relaxed = w_fts` (на них держатся модульные тесты слияния);
+/// рабочий `w_fts_relaxed` сервера подобран на eval.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Weights {
     /// Константа RRF.
     pub rrf_k: f64,
     pub w_vector: f64,
     pub w_fts: f64,
+    /// Вес `fts`, полученного ослабленным запросом (`SearchInputs::fts_relaxed`), — только
+    /// при работающем векторном канале и только для чанков, которые он видит
+    /// (не из `vector_blind`); иначе действует `w_fts`.
+    pub w_fts_relaxed: f64,
     pub w_trigram: f64,
     /// Полупериод затухания по свежести, дней; 0 — без затухания.
     pub recency_half_life_days: f64,
@@ -119,6 +128,7 @@ impl Default for Weights {
             rrf_k: 60.0,
             w_vector: 1.0,
             w_fts: 1.0,
+            w_fts_relaxed: 1.0,
             w_trigram: 0.7,
             recency_half_life_days: 180.0,
             max_per_node: 3,
@@ -152,10 +162,14 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
         (Channel::Fts, w.w_fts, &inp.fts),
         (Channel::Trigram, w.w_trigram, &inp.trigram),
     ];
+    // ослабленный bm25 понижается, только если есть с кем соревноваться: векторный канал
+    // работает, а чанк ему виден (FTS-only и Human — с обычным весом)
+    let relaxed = inp.fts_relaxed && inp.vector.is_some();
     let mut by_chunk: HashMap<&str, (f64, Vec<&'static str>)> = HashMap::new();
     let mut max = 0.0;
     for (ch, weight, list) in channels {
-        let mut seen = false;
+        // наибольший применённый вес канала — для нормировки балла в 0..=1
+        let mut top: Option<f64> = None;
         // ранг — среди живых кандидатов канала: отброшенные не сдвигают остальных вниз
         let mut rank = 0usize;
         for id in list {
@@ -167,12 +181,17 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
                 continue;
             }
             rank += 1;
-            seen = true;
+            let weight = if ch == Channel::Fts && relaxed && !inp.vector_blind.contains(id) {
+                w.w_fts_relaxed
+            } else {
+                weight
+            };
+            top = Some(top.map_or(weight, |t: f64| t.max(weight)));
             e.0 += weight / (w.rrf_k + rank as f64);
             e.1.push(ch.as_str());
         }
-        if seen {
-            max += weight / (w.rrf_k + 1.0);
+        if let Some(t) = top {
+            max += t / (w.rrf_k + 1.0);
         }
     }
     let mut all: Vec<Ranked> = by_chunk
@@ -249,6 +268,40 @@ mod tests {
         // равные баллы «a» и «c» — по chunk_id
         assert_eq!((r[1].chunk_id.as_str(), &r[1].sources), ("a", &vec!["fts"]));
         assert!(r.iter().all(|x| x.score > 0.0 && x.score <= 1.0));
+    }
+
+    #[test]
+    fn relaxed_fts_weight_only_for_vector_visible_chunks() {
+        let ids3 = (Id::new(), Id::new(), Id::new());
+        let mk = |relaxed: bool, vector: bool, blind: &[&str]| {
+            let inp = SearchInputs {
+                // «h» — Human или не проиндексирован, «f» — обычный: оба только в ослабленном bm25
+                fts: list(&["h", "f"]),
+                vector: vector.then(|| list(&["v"])),
+                chunks: meta(&[("h", ids3.0), ("f", ids3.1), ("v", ids3.2)]),
+                fts_relaxed: relaxed,
+                vector_blind: blind.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            };
+            let w = Weights {
+                w_fts_relaxed: 0.25,
+                ..Weights::default()
+            };
+            fuse(&inp, &w, now())
+        };
+        // строгий запрос — обычный вес: «h» на равных с векторным первым местом
+        assert_eq!(ids(&mk(false, true, &["h"]))[..2], ["h", "v"]);
+        // ослабленный: видимый вектору «f» понижен ниже векторного кандидата, «h» — нет
+        let r = mk(true, true, &["h"]);
+        assert_eq!(ids(&r), vec!["h", "v", "f"]);
+        assert!(r.iter().all(|x| x.score <= 1.0));
+        // без векторного канала (FTS-only) вес не меняется: порядок и баллы как у строгого
+        let (a, b) = (mk(true, false, &[]), mk(false, false, &[]));
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(
+            a.iter().map(|x| x.score).collect::<Vec<_>>(),
+            b.iter().map(|x| x.score).collect::<Vec<_>>()
+        );
     }
 
     #[test]

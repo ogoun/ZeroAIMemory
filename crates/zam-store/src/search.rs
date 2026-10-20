@@ -101,6 +101,9 @@ pub struct FtsHit {
     pub snippet: String,
     /// Полный текст чанка (обрезку под бюджет делает сервер).
     pub text: String,
+    /// `nodes.index_state` узла: `indexed` — его чанки есть в векторном индексе; `pending`,
+    /// `failed`, `excluded` — нет (гибрид не понижает такие хиты ослабленного bm25).
+    pub index_state: String,
 }
 
 /// Слова запроса: всё, что не буква и не цифра (Unicode), — разделитель.
@@ -518,7 +521,7 @@ pub async fn live_chunks(
         args.extend(scope.space_ids.iter().map(|s| s as &dyn ToSql));
         let mut st = c.prepare_cached(&format!(
             "SELECT c.id, c.node_id, n.space_id, n.path, c.heading_path, c.rev, n.updated_at,
-                    c.text, c.level, c.token_count
+                    c.text, c.level, c.token_count, n.index_state
              FROM json_each(?1) j
              CROSS JOIN chunks c ON c.id = j.value
              CROSS JOIN nodes n ON n.id = c.node_id
@@ -544,6 +547,7 @@ pub async fn live_chunks(
                 updated_at: ts_at(r, 6)?,
                 snippet: String::new(),
                 text: r.get(7)?,
+                index_state: r.get(10)?,
             })
         })?;
         let mut by_id: HashMap<String, FtsHit> = rows
@@ -770,7 +774,7 @@ fn fetch_hits(
     let seqs: Vec<i64> = ranked.iter().map(|r| r.seq).collect();
     let mut st = c.prepare_cached(
         "SELECT c.seq, c.id, c.node_id, n.space_id, n.path, c.heading_path, c.rev,
-                n.updated_at, c.text, c.level, c.token_count
+                n.updated_at, c.text, c.level, c.token_count, n.index_state
          FROM json_each(?1) j
          CROSS JOIN chunks c ON c.seq = j.value
          CROSS JOIN nodes n ON n.id = c.node_id",
@@ -791,6 +795,7 @@ fn fetch_hits(
                 updated_at: ts_at(r, 7)?,
                 snippet: String::new(),
                 text: r.get(8)?,
+                index_state: r.get(11)?,
             },
         ))
     })?;

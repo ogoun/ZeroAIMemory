@@ -26,7 +26,9 @@
 //! 2. Векторные хиты проверяются по SQLite ([`live_chunks`]): чанк текущей ревизии, узел
 //!    жив, не в корзине, не исключён (`index: false`), в области. Точка, оставшаяся
 //!    в Qdrant после неудачного `delete`, в выдачу не попадает.
-//! 3. `fuse` (weighted RRF + затухание) → `note_to_leaf` → ≤ `max_per_node` с узла:
+//! 3. `fuse` (weighted RRF + затухание; bm25 ослабленного запроса — с весом
+//!    `w_fts_relaxed`, если векторный канал работает и чанк ему виден, т. е. не Human и узел
+//!    проиндексирован) → `note_to_leaf` → ≤ `max_per_node` с узла:
 //!    сводка (L1 заметки или секции) сливается с найденным листом своего узла (для
 //!    секции — листом этой секции) или заменяется лучшим листом: ближайшим к запросу по
 //!    косинусу (эмбеддинги из кэша `embeddings`), без вектора — листом с наибольшим числом
@@ -240,6 +242,7 @@ impl SearchSection {
             rrf_k: self.rrf_k,
             w_vector: self.w_vector,
             w_fts: self.w_fts,
+            w_fts_relaxed: self.w_fts_relaxed,
             w_trigram: self.w_trigram,
             recency_half_life_days: self.recency_half_life_days,
             max_per_node: self.max_per_node,
@@ -875,18 +878,30 @@ pub async fn search(
             ))
         })
         .collect();
+    // чанки, которых векторный канал не видит (Human, узел не проиндексирован): ослабленный
+    // bm25 для них не понижается — иначе такая находка проигрывает всем векторным кандидатам
+    let human: Vec<Id> = spaces
+        .iter()
+        .filter(|s| s.kind == SpaceKind::Human)
+        .map(|s| s.id)
+        .collect();
+    let vector_blind = hits
+        .values()
+        .filter(|h| human.contains(&h.space_id) || h.index_state != "indexed")
+        .map(|h| h.chunk_id.clone())
+        .collect();
     let inputs = SearchInputs {
         fts: fts.bm25.iter().map(|h| h.chunk_id.clone()).collect(),
         trigram: fts.trigram.iter().map(|h| h.chunk_id.clone()).collect(),
         vector: vector_ids,
         chunks,
+        // ослабленный bm25 (ни один чанк не содержит всех слов запроса) — свой вес
+        // `w_fts_relaxed`: его случайные совпадения по одному слову вытесняли векторные
+        // находки (eval); действует только при векторном канале
+        fts_relaxed: fts.relaxed,
+        vector_blind,
     };
-    // ослабленный bm25 (ни одна заметка не содержит всех слов запроса) — свой вес: иначе
-    // его 50 случайных совпадений по одному слову вытесняют векторные находки (eval)
-    let mut weights = st.cfg.search.weights();
-    if fts.relaxed {
-        weights.w_fts = st.cfg.search.w_fts_relaxed;
-    }
+    let weights = st.cfg.search.weights();
     let ranked = fuse(&inputs, &weights, jiff::Timestamp::now());
     let window = top_k * OVERSAMPLE;
     let query_vec = vrun
@@ -1052,6 +1067,7 @@ mod tests {
             updated_at: jiff::Timestamp::now(),
             snippet: format!("{MARK_START}s{MARK_END}"),
             text: text.into(),
+            index_state: "indexed".into(),
         }
     }
 

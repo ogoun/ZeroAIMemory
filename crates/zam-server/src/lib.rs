@@ -45,6 +45,13 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
         print_initial_token(t);
     }
     tracing::info!(addr = %listener.local_addr()?, version = state.version, "zam-server запущен");
+    // действующие веса поиска и пороги чанкинга (секретов нет): по ним eval записывает
+    // итоговую конфигурацию прогона
+    tracing::info!(
+        search = %serde_json::to_string(&state.cfg.search).unwrap_or_default(),
+        index = %serde_json::to_string(&state.cfg.index).unwrap_or_default(),
+        "параметры поиска и индексации"
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

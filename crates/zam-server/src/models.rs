@@ -89,7 +89,8 @@ pub fn plan<'a>(
         // для сервера: 2,3 ГБ без выигрыша против int8/fp16
         if e.role == ModelRole::Reference {
             bail!(
-                "{}: эталон качества для eval (cargo xtask eval --quality-gate), а не модель \n                 сервера",
+                "{}: эталон качества для eval (cargo xtask eval --quality-gate), а не модель \
+                 сервера",
                 e.id
             );
         }

@@ -459,6 +459,16 @@ async fn human_deleted_and_excluded_not_in_vector_channel() {
         .unwrap_or_else(|| panic!("{j}"));
     assert_eq!(it["sources"], json!(["fts"]), "{j}");
     assert_eq!(it["node_id"], human.as_str());
+    // смешанная область (Knowledge + Human), ослабленный запрос: ни в одном чанке нет обоих
+    // слов. Human-заметку векторный канал не видит, поэтому её bm25 не понижается
+    // `w_fts_relaxed` (0,25) и она не тонет под ~20 векторными кандидатами Knowledge
+    let j = search_adm(
+        &a,
+        json!({"query": "Grandmother zeppelin", "scope": {"include_human": true}}),
+    )
+    .await;
+    assert_eq!(j["degraded"], false, "{j}");
+    assert!(paths(&j).contains(&"family/recipe".to_string()), "{j}");
 
     // узел удалён (и другой исключён) в SQLite без delete в Qdrant: точки остались,
     // но векторный хит в выдачу не попадает
@@ -525,6 +535,18 @@ async fn qdrant_down_degrades_to_fts() {
         )
         .await;
     }
+    // FTS-only: вес ослабленного bm25 не меняется. «sourdough 0502» — ни в одном чанке нет
+    // обоих слов (ослабленный запрос): bm25 находит только хлеб, trigram по «0502» — только
+    // заметку о Rust (`E0502`). С `w_fts = 1.0` первым идёт bm25, с 0,25 первой была бы
+    // trigram-находка (вес 0,7)
+    let j = search(&a, json!({"query": "sourdough 0502"})).await.json();
+    assert_eq!(j["degraded"], true, "{j}");
+    assert_eq!(
+        paths(&j)[..2],
+        ["kitchen/sourdough", "dev/rust-ownership"],
+        "{j}"
+    );
+    assert_eq!(j["items"][1]["sources"], json!(["trigram"]), "{j}");
     let t = search(&a, json!({"query": "sourdough bread", "format": "md"}))
         .await
         .text();
