@@ -24,6 +24,8 @@ use crate::manifest::{CudaManifest, Manifest, ModelsManifest, PLATFORMS};
 
 const TOKEN_PREFIX: &str = "ZeroAIMemoryToken=";
 const WAIT: Duration = Duration::from_secs(10);
+/// Предел готовности сервера при первой загрузке только что распакованного `zam-cuda`.
+const CUDA_FIRST_WAIT: Duration = Duration::from_secs(120);
 /// Предел для коротких вызовов (`zam status`, `qdrant --version`).
 const CMD_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -634,7 +636,24 @@ pub fn run(
         "запуск zam-server",
         Server::start(&root, &data, &env, &server_log),
     )?;
-    s.run("ожидание /api/v1/health", wait_health(&mut srv, &base))?;
+    if cuda_archive.is_some() {
+        // сервер отвечает на /health после загрузки модели, а с CUDA — после загрузки
+        // библиотек NVIDIA (~1,4 ГБ, cuDNN). Задача 17 M2 (Windows, HDD, VRAM почти
+        // занята сторонним процессом): два прогона подряд не уложились в 10 с, следующие —
+        // 3,9 и 4,8 с; причина не установлена (кандидаты — проверка антивирусом свежих DLL,
+        // конкуренция за GPU). Предел шире, время печатается.
+        let t0 = Instant::now();
+        s.run(
+            "ожидание /api/v1/health (первая загрузка CUDA)",
+            wait_health_for(&mut srv, &base, CUDA_FIRST_WAIT),
+        )?;
+        println!(
+            "первый старт с zam-cuda до /health: {:.1} с",
+            t0.elapsed().as_secs_f64()
+        );
+    } else {
+        s.run("ожидание /api/v1/health", wait_health(&mut srv, &base))?;
+    }
     let token = s.run(
         "первый токен в stderr",
         srv.token_rx.recv_timeout(WAIT).map_err(|_| {
