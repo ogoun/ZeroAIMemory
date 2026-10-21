@@ -114,3 +114,10 @@ async fn killed_mid_work_is_unavailable_then_recovers() {
         .unwrap();
     assert_eq!(idx.count(&filter(&ctx)).await.unwrap(), 2);
 }
+
+#[test]
+fn free_port_is_not_issued_twice_in_process() {
+    let ports: Vec<u16> = (0..200).map(|_| common::qdrant::free_port()).collect();
+    let unique: std::collections::HashSet<u16> = ports.iter().copied().collect();
+    assert_eq!(unique.len(), ports.len());
+}
