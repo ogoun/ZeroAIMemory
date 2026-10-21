@@ -12,7 +12,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use axum::http::{Method, StatusCode};
-use common::api::{Api, Resp, api};
+use common::api::{Api, Resp, api, api_with};
 use common::ml::{MINILM, external, have, ml, until, vector_ready};
 use common::qdrant::TestQdrant;
 use serde_json::{Value, json};
@@ -504,6 +504,106 @@ async fn expand_section_and_neighbors_in_owner_db() {
         .await;
     assert_eq!(j["items"][0]["node_id"], node.as_str(), "{j}");
     assert!(j["items"][0].get("l0").is_some(), "{j}");
+}
+
+/// База владельца испорчена до первого обращения (перезапуск на том же каталоге данных):
+/// участник получает 200 по личной базе и `solution unavailable`, без 500.
+#[tokio::test]
+async fn broken_owner_db_excluded_with_warning() {
+    let dir = common::tmp("multi-broken");
+    let c = common::cfg_in(dir.clone());
+    let w = {
+        let a = api_with(c.clone()).await;
+        let (a_id, a_tok) = a.new_user("Анна").await;
+        let (b_id, b_tok) = a.new_user("Борис").await;
+        let (c_id, c_tok) = a.new_user("Вера").await;
+        W {
+            a,
+            a_id,
+            a_tok,
+            b_id,
+            b_tok,
+            c_id,
+            c_tok,
+        }
+    };
+    w.shared().await;
+    let n = corpus(&w).await;
+    let (a_id, b_tok) = (w.a_id.clone(), w.b_tok.clone());
+    w.a.st.shutdown().await;
+    drop(w);
+    // заголовок файла базы A перезаписан мусором, WAL и SHM убраны
+    let users = dir.join("users");
+    for ext in ["db-wal", "db-shm"] {
+        let _ = std::fs::remove_file(users.join(format!("{a_id}.{ext}")));
+    }
+    std::fs::write(
+        users.join(format!("{a_id}.db")),
+        b"not a sqlite database at all",
+    )
+    .unwrap();
+
+    let a = api_with(c).await;
+    for (scope, mode) in [
+        (json!({"solution": G}), "brief"),
+        (json!({"solution": G}), "chunks"),
+        (json!({"all_solutions": true}), "notes"),
+        (json!({"spaces": [G, "knowledge"]}), "brief"),
+    ] {
+        let r = a
+            .tok(
+                &b_tok,
+                Method::POST,
+                "/api/v1/search",
+                Some(json!({"query": WORD, "scope": scope, "mode": mode, "expand": "section"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{scope} {mode}: {}", r.text());
+        let j = r.json();
+        assert_eq!(ids(&j), vec![n.b_knowledge.clone()], "{scope} {mode}: {j}");
+        assert_eq!(j["warnings"], json!(["solution unavailable"]), "{j}");
+        assert_eq!(j["pending_count"], 1, "{j}");
+    }
+    a.st.shutdown().await;
+}
+
+/// Поздний сбой базы владельца: FTS читается, а ревизии — нет (таблица `revisions`
+/// переименована), `expand=section` падает уже после FTS. Участник получает 200 без
+/// элементов решения и `solution unavailable`; владельцу (личная база) — ошибка, как в M2.
+#[tokio::test]
+async fn late_owner_db_failure_excluded_with_warning() {
+    let w = world("late").await;
+    w.shared().await;
+    let n = corpus(&w).await;
+    let body = json!({"query": WORD, "scope": {"solution": G}, "mode": "chunks",
+                      "expand": "section", "budget_tokens": 5000});
+    // контроль: до порчи решение в выдаче
+    let j = w.search(&w.b_tok, body.clone()).await;
+    assert!(ids(&j).contains(&n.a_solution), "{j}");
+    let a: Id = w.a_id.parse().unwrap();
+    let db = w.a.st.users.get(a).await.unwrap();
+    db.write(|tx| {
+        tx.execute_batch("ALTER TABLE revisions RENAME TO revisions_broken")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    // FTS по базе A по-прежнему работает (без expand решение находится)
+    let j = w
+        .search(&w.b_tok, json!({"query": WORD, "scope": {"solution": G}}))
+        .await;
+    assert!(ids(&j).contains(&n.a_solution), "{j}");
+    assert_eq!(j["warnings"], json!([]), "{j}");
+    let j = w.search(&w.b_tok, body.clone()).await;
+    assert_eq!(ids(&j), vec![n.b_knowledge.clone()], "{j}");
+    assert_eq!(j["warnings"], json!(["solution unavailable"]), "{j}");
+    // pending_count исключённой цели не прибавляется
+    assert_eq!(j["pending_count"], 1, "{j}");
+    // владельцу сбой его личной базы — ошибка запроса
+    let r =
+        w.a.tok(&w.a_tok, Method::POST, "/api/v1/search", Some(body))
+            .await;
+    assert!(r.status.is_server_error(), "{} {}", r.status, r.text());
 }
 
 // ---- векторный канал ----

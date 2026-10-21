@@ -85,9 +85,10 @@
 //! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
 //! единственная), предупреждения — строками `> warning: <текст>` в конце.
 //!
-//! **Ошибки баз владельцев.** Сбой FTS, проверки векторных хитов или `pending_count` в базе
-//! чужого решения — решение исключается (WARN в журнал, `solution unavailable`), ответ строится
-//! по остальным целям; сбой личной базы — ошибка запроса, как в M2.
+//! **Ошибки баз владельцев.** Любой сбой чтения базы чужого решения — FTS, проверка векторных
+//! хитов, листы сводок, `expand`, L0, `pending_count` — исключает решение целиком ([`Health`]):
+//! WARN в журнал, `warnings: ["solution unavailable"]`, элементы этой цели убираются из
+//! выдачи, ответ строится по остальным целям. Сбой личной базы — ошибка запроса, как в M2.
 pub mod merge;
 pub mod targets;
 
@@ -114,7 +115,7 @@ use zam_search::{
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
-    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind, StoreError,
+    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
     count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_nodes, live_chunks,
     neighbor_leaves, node_content, pending_count, query_needles, search_fts_channels, text_snippet,
 };
@@ -138,8 +139,10 @@ const DEFAULT_TOP_K: usize = 10;
 const DEFAULT_BUDGET_TOKENS: usize = 800;
 /// Предел top_k в FTS (`zam_store::search`).
 const TOP_K_MAX: usize = 100;
-/// Кандидатов слитого канала FTS нескольких баз (как `bm25` одной базы в `zam_store`).
-const FTS_CHANNEL_TOP: usize = 50;
+/// Кандидатов слитого канала `bm25` нескольких баз (как в одной базе, `zam_store`).
+const FTS_BM25_TOP: usize = 50;
+/// Кандидатов слитого канала `trigram` нескольких баз (как в одной базе, `zam_store`).
+const FTS_TRIGRAM_TOP: usize = 20;
 /// Сколько кандидатов слияния (× `top_k`) проходит замену сводок листами: после
 /// слияния сводки с листом выдача короче, нужен запас.
 const OVERSAMPLE: usize = 3;
@@ -522,11 +525,12 @@ fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a s
 /// (`chunk_ids`), а выдача добирается следующими кандидатами окна. Текст секции и соседи
 /// читаются из базы цели элемента.
 async fn expand_items(
-    targets: &[SearchTarget],
+    health: &mut Health<'_>,
     items: Vec<Item>,
     how: Expand,
     top_k: usize,
 ) -> Result<Vec<Item>, ApiError> {
+    let targets = health.targets;
     let mut out: Vec<Item> = Vec::with_capacity(top_k);
     let mut sections: HashMap<(TargetRef, String), usize> = HashMap::new();
     let mut contents: HashMap<(Id, i64), Arc<String>> = HashMap::new();
@@ -534,7 +538,11 @@ async fn expand_items(
         if out.len() >= top_k {
             break;
         }
-        let db = &targets[it.target].db;
+        if !health.alive[it.target] {
+            continue;
+        }
+        let ti = it.target;
+        let db = &targets[ti].db;
         let base = it.hit.text.clone();
         // секции и соседние листы — только у узлов
         let how = if it.hit.target.kind == TargetKind::Node {
@@ -555,7 +563,11 @@ async fn expand_items(
                 let src = match contents.get(&ck) {
                     Some(s) => s.clone(),
                     None => {
-                        let (_, s) = node_content(db, it.hit.target.id, Some(it.hit.rev)).await?;
+                        let r = node_content(db, it.hit.target.id, Some(it.hit.rev)).await;
+                        let Some((_, s)) = health.soft(ti, r)? else {
+                            drop_target(&mut out, &mut sections, ti);
+                            continue;
+                        };
                         let s = Arc::new(s);
                         contents.insert(ck, s.clone());
                         s
@@ -568,7 +580,11 @@ async fn expand_items(
                 }
             }
             Expand::Neighbors => {
-                let (prev, next) = neighbor_leaves(db, it.hit.chunk_id.clone()).await?;
+                let r = neighbor_leaves(db, it.hit.chunk_id.clone()).await;
+                let Some((prev, next)) = health.soft(ti, r)? else {
+                    drop_target(&mut out, &mut sections, ti);
+                    continue;
+                };
                 [prev, Some(base), next]
                     .into_iter()
                     .flatten()
@@ -582,6 +598,15 @@ async fn expand_items(
         out.push(it);
     }
     Ok(out)
+}
+
+/// Убирает из `out` элементы исключённой цели `t` и пересобирает индекс секций.
+fn drop_target(out: &mut Vec<Item>, sections: &mut HashMap<(TargetRef, String), usize>, t: usize) {
+    out.retain(|it| it.target != t);
+    sections.clear();
+    for (i, it) in out.iter().enumerate() {
+        sections.insert((it.hit.target, it.hit.heading_path.clone()), i);
+    }
 }
 
 /// Упакованный элемент: элемент и (для `chunks`) текст с признаком обрезки.
@@ -732,23 +757,42 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
     line
 }
 
-/// Результат чтения базы цели: сбой в базе чужого решения исключает решение (WARN в журнал,
-/// `solution unavailable`) и даёт `None`; сбой личной базы — ошибка запроса.
-fn soft<T>(
-    t: &SearchTarget,
-    r: Result<T, StoreError>,
-    warnings: &mut Vec<String>,
-) -> Result<Option<T>, ApiError> {
-    match r {
-        Ok(v) => Ok(Some(v)),
-        Err(e) => match &t.solution {
-            Some(info) => {
-                skip_foreign(info, &e);
-                warnings.push(WARN_SOLUTION_UNAVAILABLE.into());
-                Ok(None)
-            }
-            None => Err(e.into()),
-        },
+/// Состояние целей запроса: какие ещё в выдаче, и предупреждения ответа.
+struct Health<'a> {
+    targets: &'a [SearchTarget],
+    /// Цель не исключена сбоем чтения своей базы.
+    alive: Vec<bool>,
+    warnings: Vec<String>,
+}
+
+impl<'a> Health<'a> {
+    fn new(targets: &'a [SearchTarget], warnings: Vec<String>) -> Health<'a> {
+        Health {
+            targets,
+            alive: vec![true; targets.len()],
+            warnings,
+        }
+    }
+
+    /// Результат чтения базы цели `i`: сбой в базе чужого решения исключает решение (WARN
+    /// в журнал, `solution unavailable`, цель больше не жива) и даёт `None`; сбой личной
+    /// базы — ошибка запроса.
+    fn soft<T, E>(&mut self, i: usize, r: Result<T, E>) -> Result<Option<T>, ApiError>
+    where
+        E: std::fmt::Display + Into<ApiError>,
+    {
+        match r {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => match &self.targets[i].solution {
+                Some(info) => {
+                    skip_foreign(info, &e);
+                    self.alive[i] = false;
+                    self.warnings.push(WARN_SOLUTION_UNAVAILABLE.into());
+                    Ok(None)
+                }
+                None => Err(e.into()),
+            },
+        }
     }
 }
 
@@ -780,7 +824,8 @@ pub async fn search(
         )));
     }
     let budget = req.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS);
-    let (targets, mut warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
+    let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
+    let mut health = Health::new(&targets, warnings);
     let prefix = req
         .scope
         .path_prefix
@@ -833,15 +878,13 @@ pub async fn search(
     };
     let ((runs, fts_ms), vrun) = tokio::join!(fts, vector);
     // цель, чья база не прочиталась (чужое решение), исключается из выдачи целиком
-    let mut alive = vec![true; targets.len()];
     let mut per_db = Vec::with_capacity(targets.len());
     for (i, r) in runs.into_iter().enumerate() {
-        match soft(&targets[i], r, &mut warnings)? {
-            Some(ch) => per_db.push((i, ch)),
-            None => alive[i] = false,
+        if let Some(ch) = health.soft(i, r)? {
+            per_db.push((i, ch));
         }
     }
-    let fts = merge_channels(per_db, FTS_CHANNEL_TOP);
+    let fts = merge_channels(per_db, FTS_BM25_TOP, FTS_TRIGRAM_TOP);
 
     // 2. векторные хиты — в базу своего владельца, только живые чанки пространств цели
     let fuse_t = Instant::now();
@@ -854,7 +897,7 @@ pub async fn search(
         Some(vh) => {
             let mut live: HashMap<String, (usize, FtsHit)> = HashMap::new();
             for (i, t) in targets.iter().enumerate() {
-                if !alive[i] {
+                if !health.alive[i] {
                     continue;
                 }
                 let ids: Vec<String> = vh
@@ -870,13 +913,10 @@ pub async fn search(
                     path_prefix: prefix.clone(),
                     indexable_only: true,
                 };
-                match soft(t, live_chunks(&t.db, ids, scope).await, &mut warnings)? {
-                    Some(found) => {
-                        for h in found {
-                            live.entry(h.chunk_id.clone()).or_insert((i, h));
-                        }
+                if let Some(found) = health.soft(i, live_chunks(&t.db, ids, scope).await)? {
+                    for h in found {
+                        live.entry(h.chunk_id.clone()).or_insert((i, h));
                     }
-                    None => alive[i] = false,
                 }
             }
             // порядок векторного канала; хит засчитывается только из базы своего владельца
@@ -897,7 +937,7 @@ pub async fn search(
     };
     // база, не прочитавшаяся при проверке векторных хитов, — вне выдачи целиком (кандидаты
     // без метаданных `fuse` отбрасывает)
-    hits.retain(|_, (i, _)| alive[*i]);
+    hits.retain(|_, (i, _)| health.alive[*i]);
 
     // 3. слияние, сводки → листы
     let chunks: HashMap<String, ChunkMeta> = hits
@@ -965,7 +1005,10 @@ pub async fn search(
         }
         for (i, group) in by_target {
             let t = &targets[i];
-            let found = best_leaves(&t.db, &group, &needles, query_vec).await?;
+            let r = best_leaves(&t.db, &group, &needles, query_vec).await;
+            let Some(found) = health.soft(i, r)? else {
+                continue;
+            };
             // листы-замены — живые чанки области цели; не нашёлся (узел перезаписан между
             // чтениями) — сводка остаётся как есть
             let missing: Vec<String> = found
@@ -979,13 +1022,18 @@ pub async fn search(
                     path_prefix: prefix.clone(),
                     indexable_only: false,
                 };
-                for h in live_chunks(&t.db, missing, scope).await? {
+                let Some(leaves) = health.soft(i, live_chunks(&t.db, missing, scope).await)? else {
+                    continue;
+                };
+                for h in leaves {
                     hits.insert(h.chunk_id.clone(), (i, h));
                 }
             }
             best.extend(found);
         }
     }
+    // база, не прочитавшаяся при выборе листов, — вне выдачи целиком
+    hits.retain(|_, (i, _)| health.alive[*i]);
     best.retain(|summary, l| {
         let ok = hits.contains_key(&l.chunk_id);
         if !ok {
@@ -1028,14 +1076,16 @@ pub async fn search(
 
     // 4. серверный реранк; пересборка индекса — предупреждение о неполной векторной выдаче
     if st.index.reindexing() {
-        warnings.push(crate::index_state::WARN_REINDEXING.into());
+        health
+            .warnings
+            .push(crate::index_state::WARN_REINDEXING.into());
     }
     let mut rerank_ms = None;
     let items = if rerank_on && !items.is_empty() {
         let t = Instant::now();
         let (items, warning) = rerank_items(&st, &req.query, items).await;
         rerank_ms = Some(ms(t));
-        warnings.extend(warning.map(String::from));
+        health.warnings.extend(warning.map(String::from));
         items
     } else {
         items
@@ -1045,29 +1095,37 @@ pub async fn search(
     let expand_t = Instant::now();
     let mut items = match mode {
         SearchMode::Notes => group_by_node(items, top_k),
-        SearchMode::Chunks => expand_items(&targets, items, expand, top_k).await?,
+        SearchMode::Chunks => expand_items(&mut health, items, expand, top_k).await?,
         SearchMode::Brief => items.into_iter().take(top_k).collect(),
     };
     if mode == SearchMode::Notes {
         for it in &mut items {
-            if it.hit.target.kind == TargetKind::Node {
-                it.l0 = get_node(&targets[it.target].db, it.hit.target.id).await?.l0;
+            if it.hit.target.kind == TargetKind::Node && health.alive[it.target] {
+                let r = get_node(&targets[it.target].db, it.hit.target.id).await;
+                if let Some(n) = health.soft(it.target, r)? {
+                    it.l0 = n.l0;
+                }
             }
         }
     }
+    // элементы целей, исключённых на этих шагах, — прочь
+    items.retain(|it| health.alive[it.target]);
     let expand_ms = ms(expand_t);
     // заметки области всех целей, ещё не прошедшие векторную индексацию (без `index: false`
     // и Human)
     let pending_t = Instant::now();
     let mut pending = 0;
     for (i, t) in targets.iter().enumerate() {
-        if !alive[i] {
+        if !health.alive[i] {
             continue;
         }
         let r = pending_count(&t.db, t.space_ids(), prefix.clone()).await;
-        pending += soft(t, r, &mut warnings)?.unwrap_or(0);
+        pending += health.soft(i, r)?.unwrap_or(0);
     }
     let pending_ms = ms(pending_t);
+    // pending_count цели, исключённой на этом шаге, уже не прибавлен; её элементы — прочь
+    items.retain(|it| health.alive[it.target]);
+    let mut warnings = health.warnings;
     dedup_keep_order(&mut warnings);
     let packed = pack_items(items, mode, budget);
     let degraded = available.err().or(vrun.failed);
@@ -1130,6 +1188,7 @@ pub async fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zam_store::StoreError;
 
     fn hit(node: Id, text: &str) -> FtsHit {
         FtsHit {
@@ -1358,6 +1417,69 @@ mod tests {
             own_section(tie, "A", "общая длинная строка\ny2"),
             Some("# A\n\nобщая длинная строка\ny2")
         );
+    }
+
+    /// Сбой чтения базы чужого решения исключает цель с предупреждением, сбой личной базы —
+    /// ошибка запроса (инъекция ошибки в `Health::soft`).
+    #[tokio::test]
+    async fn health_excludes_foreign_target_personal_fails() {
+        let dir = crate::test_util::dir_in_target("search-health");
+        let db = Db::open(&dir.join("u.db"), zam_store::USER_MIGRATIONS).unwrap();
+        let sp = Space {
+            id: Id::new(),
+            kind: SpaceKind::Solution,
+            solution_guid: None,
+            name: "s".into(),
+        };
+        let mk = |solution| SearchTarget {
+            owner: Id::new(),
+            db: db.clone(),
+            spaces: vec![sp.clone()],
+            role: super::super::scope::Role::Personal,
+            solution,
+        };
+        let info = zam_store::SolutionInfo {
+            guid: zam_core::SolutionGuid::new_v7(),
+            owner_id: Id::new(),
+            space_id: sp.id,
+            name: "x".into(),
+            created_at: jiff::Timestamp::now(),
+        };
+        let targets = vec![mk(None), mk(Some(info))];
+        let mut h = Health::new(&targets, vec!["solution access pending".into()]);
+        let fail = || Err::<i64, StoreError>(StoreError::NotFound);
+        assert_eq!(h.soft(1, Ok::<i64, StoreError>(5)).unwrap(), Some(5));
+        assert_eq!(h.soft(1, fail()).unwrap(), None);
+        assert_eq!(h.alive, vec![true, false]);
+        assert_eq!(
+            h.warnings,
+            vec!["solution access pending", "solution unavailable"]
+        );
+        // ошибка сервера (best_leaves) — так же
+        assert!(
+            h.soft(1, Err::<(), ApiError>(ApiError::NotFound))
+                .unwrap()
+                .is_none()
+        );
+        // личная база — ошибка запроса, цель остаётся
+        assert!(h.soft(0, fail()).is_err());
+        assert!(h.alive[0]);
+
+        // drop_target: элементы цели убраны, индекс секций пересобран
+        let mut out = items(
+            vec![
+                hit(Id::new(), "1"),
+                hit(Id::new(), "22"),
+                hit(Id::new(), "333"),
+            ],
+            false,
+        );
+        out[1].target = 1;
+        let mut sections = HashMap::new();
+        drop_target(&mut out, &mut sections, 1);
+        assert_eq!(out.len(), 2);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[&(out[1].hit.target, String::new())], 1);
     }
 
     #[test]

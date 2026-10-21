@@ -1,6 +1,7 @@
 //! Слияние каналов FTS нескольких баз (§9.2 п. 2b): FTS идёт по каждой базе отдельно в
 //! пределах пространств её цели, затем каждый канал (`bm25`, `trigram`) сливается по
-//! сырому баллу FTS5 (`FtsHit::raw_score`, меньше — лучше) и обрезается до `top_k`; балл
+//! сырому баллу FTS5 (`FtsHit::raw_score`, меньше — лучше) и обрезается до своего предела
+//! (`bm25_top`, `trigram_top` — как у канала одной базы); балл
 //! хита — `1/место` в слитом канале.
 //!
 //! - Порядок при равном `raw_score` — порядок целей, внутри цели — порядок канала (сортировка
@@ -26,7 +27,11 @@ pub struct MergedChannels {
 }
 
 /// Слияние каналов баз `per_db` (`(индекс цели, каналы её базы)`, в порядке целей).
-pub fn merge_channels(per_db: Vec<(usize, FtsChannels)>, top_k: usize) -> MergedChannels {
+pub fn merge_channels(
+    per_db: Vec<(usize, FtsChannels)>,
+    bm25_top: usize,
+    trigram_top: usize,
+) -> MergedChannels {
     let strict = per_db.iter().any(|(_, c)| !c.relaxed && !c.bm25.is_empty());
     let mut bm25 = Vec::new();
     let mut trigram = Vec::new();
@@ -38,8 +43,8 @@ pub fn merge_channels(per_db: Vec<(usize, FtsChannels)>, top_k: usize) -> Merged
     }
     MergedChannels {
         relaxed: !strict && !bm25.is_empty(),
-        bm25: rank(bm25, top_k),
-        trigram: rank(trigram, top_k),
+        bm25: rank(bm25, bm25_top),
+        trigram: rank(trigram, trigram_top),
     }
 }
 
@@ -101,6 +106,7 @@ mod tests {
                 (1, ch(&[("b1", -3.0), ("b2", -0.5)], &[("tb", -4.0)], false)),
             ],
             50,
+            20,
         );
         assert_eq!(
             ids(&m.bm25),
@@ -118,6 +124,7 @@ mod tests {
                 (1, ch(&[("z", -1.0)], &[], false)),
             ],
             50,
+            20,
         );
         assert_eq!(ids(&m.bm25), vec![(0, "x"), (0, "y"), (1, "z")]);
     }
@@ -138,13 +145,15 @@ mod tests {
                 (1, ch(&r(&b), &r(&b), false)),
             ],
             50,
+            20,
         );
         assert_eq!(m.bm25.len(), 50);
-        assert_eq!(m.trigram.len(), 50);
+        // trigram — свой предел, как у канала одной базы
+        assert_eq!(m.trigram.len(), 20);
         // лучшие (самые отрицательные) попали, худшие отброшены
         assert_eq!(m.bm25[0].1.raw_score, -29.0);
         assert!(m.bm25.iter().all(|(_, h)| h.raw_score <= -5.0));
-        let m = merge_channels(vec![(0, ch(&r(&a), &[], false))], 3);
+        let m = merge_channels(vec![(0, ch(&r(&a), &[], false))], 3, 3);
         assert_eq!(ids(&m.bm25), vec![(0, "a29"), (0, "a28"), (0, "a27")]);
     }
 
@@ -154,11 +163,12 @@ mod tests {
         let m = merge_channels(
             vec![(3, ch(&[("a", -9.0), ("b", -4.0)], &[("t", -1.0)], true))],
             50,
+            20,
         );
         assert_eq!(ids(&m.bm25), vec![(3, "a"), (3, "b")]);
         assert_eq!(ids(&m.trigram), vec![(3, "t")]);
         assert!(m.relaxed);
-        assert!(merge_channels(Vec::new(), 50).bm25.is_empty());
+        assert!(merge_channels(Vec::new(), 50, 20).bm25.is_empty());
     }
 
     #[test]
@@ -169,6 +179,7 @@ mod tests {
                 (1, ch(&[("strict", -1.0)], &[], false)),
             ],
             50,
+            20,
         );
         assert_eq!(ids(&m.bm25), vec![(1, "strict")]);
         assert_eq!(ids(&m.trigram), vec![(0, "t0")]);
@@ -181,6 +192,7 @@ mod tests {
                 (2, ch(&[("r2", -3.0)], &[], true)),
             ],
             50,
+            20,
         );
         assert_eq!(ids(&m.bm25), vec![(2, "r2"), (0, "r0")]);
         assert!(m.relaxed);

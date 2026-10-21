@@ -277,7 +277,7 @@ fn run_channel(
     let (table, order, limit) = channel_spec(ch);
     let over = limit * OVERSAMPLE;
     let mut st = c.prepare_cached(&format!(
-        "SELECT rowid, {order} FROM {table} WHERE {table} MATCH ?1 ORDER BY {order}, rowid          LIMIT {over}"
+        "SELECT rowid, {order} FROM {table} WHERE {table} MATCH ?1 ORDER BY {order}, rowid LIMIT {over}"
     ))?;
     let top_raw: Vec<(i64, f64)> = st
         .query_map([fts], |r| Ok((r.get(0)?, r.get(1)?)))?
