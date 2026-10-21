@@ -368,7 +368,7 @@ PRAGMA: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_
 - **Оценка памяти Qdrant** на 1 млн чанков: около 1,5–2,5 ГБ RAM, около 5 ГБ на диске.
 - **Payload и индексы:** `user_id` (`is_tenant`; владелец базы), `space_id`, `space_kind`, `solution_guid`, `node_id`, `entry_id`, `path_ancestors`, `area`, `level`, `kind`, `insight_kind`, `status`, `certainty`, `tags`, `updated_at`, `rev`, `text_hash`.
 - **Область поиска.** Тенант точки — пользователь-владелец базы (`user_id`). Общее решение лежит в базе владельца, поэтому фильтр поиска — дизъюнкция областей: «`user_id` пользователя и его пространства» ИЛИ «`user_id` владельца и `space_id` решения» для каждого доступного общего решения (§11.6); `path_prefix` применяется внутри каждой области. Пустой набор областей даёт пустую выдачу **[решение владельца 2026-10-21]**.
-- **Новые поля payload** (`entry_id`, `kind`, `status`, `insight_kind`, `certainty`, `area`) добавляются вместе с их payload-индексами в существующую коллекцию без пересборки (`metadata.schema` остаётся 1). Фильтр статуса — исключающий («не `superseded` и не `retracted`»), поэтому точки без поля `status` (заметки, папки, точки M2) проходят. Фильтр `certainty` включается, только если запрошен.
+- **Новые поля payload** (`entry_id`, `status`, `insight_kind`, `certainty`) добавляются в существующую коллекцию без пересборки; payload-индексы создаются для них и ещё для `kind` и `area` (`metadata.schema` остаётся 1). Фильтр статуса — исключающий («не `superseded` и не `retracted`»), поэтому точки без поля `status` (заметки, папки, точки M2) проходят. Фильтр `certainty` включается, только если запрошен.
 - **Никогда не попадают в Qdrant:** пространство `human`, значения vault, узлы с `index: false`.
 - **Идентификатор модели** (`model_id`) хранится в метаданных коллекции. Если он расходится с текущим, векторный поиск запрещается до переиндексации, и поиск явно сообщает об этом.
 
@@ -426,7 +426,7 @@ PRAGMA: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_
     "experiment": {"hypothesis": "…", "method": "…",
                    "result": "confirmed" | "refuted" | "inconclusive",
                    "metrics": {}, "revisit_if": "условие пересмотра"},
-    "evidence": ["заметки, коммиты, логи"], "confidence": "low" | "medium" | "high"
+    "evidence": {"checked": "что проверено", "method": "как проверено", "result": "результат"}   // обязателен для theorem (§7.5)
   },
   "triggers": [{"type": "file_glob", "pattern": "**/*.sh", "tools": ["Write","Edit"]},
                {"type": "error_regex", "pattern": "\\^M|bad interpreter"}],
@@ -954,7 +954,7 @@ zam cache list|show|rm
 zam tree [path] [--depth N]
 zam write <path> [--file f.md | stdin] [--message] [--base-rev N]
 zam attach <path-заметки> <файл>
-zam log changelog|insight|release …     # --trigger file_glob:**/*.sh, --link relates_to:node:<id>
+zam log changelog|insight|release …     # --trigger file_glob:**/*.sh, --link relates_to:node:<id>; insight: --certainty theorem|hypothesis, --evidence-file F
 zam insight list|show|supersede|retract|revisit|append
 zam insight certify <id> axiom|theorem|hypothesis --reason R [--evidence-file F] [--human]   # --human: человеческий токен (§11.4)
 zam release add|compare [--from-git]
@@ -1031,7 +1031,7 @@ ZeroAIMemoryToken=zam_…
 - **Вход:** только администратор, по логину и паролю из конфигурации. Cookie `HttpOnly` + `SameSite=Strict` (+ `Secure` за HTTPS-прокси), CSRF.
 - **Левая панель — дерево:**
   - вверху закреплены `Rules`, `Human`, `Knowledge`;
-  - ниже — `Solutions`. Каждое решение раскрывается: сначала `Changelog`, `Releases`, `Insights`, затем его дерево; общие решения других пользователей помечены владельцем и режимом доступа, у решения есть раздел «Доступ» (запросы, участники, отзыв, §11.6); Vault — отдельный раздел пользователя;
+  - ниже — `Solutions`. Каждое решение раскрывается: сначала закреплены `Changelog`, `Releases`, `Insights`, `Vault`, затем его дерево; общие решения других пользователей помечены владельцем и режимом доступа; у `Knowledge` закреплены `Insights` и `Vault`; управление доступом (запросы, участники, отзыв, §11.6) — «Администрирование → Решения»;
   - корень дерева — «Пользователи»: сначала свой пользователь, под каждым — его поддерево;
   - ленивая подгрузка, drag-and-drop, контекстное меню, значки статуса индексации.
 - **Правая панель** — просмотр или правка выбранного узла. Вкладки: «Документ», «История», «Связи».
@@ -1379,4 +1379,5 @@ CHANGELOG.md
   - §8.2: H4–H6 входят в путь заголовков и `context_prefix`, лист не кончается заголовком и вводной фразой на «:», ключи `chunk_boundary_lambda|chunk_cohesion|chunk_prefix_l0`; §8.5: формат `relations:`, рёбра внутри базы;
   - §9.1–9.2: `X-Zam-Area`, `scope.area`, `filters.kinds` без `folder`, `filters.certainty`, канал точек папок `w_folder`, бусты `gotcha`/`failure`/области/`certainty`; §9.4, §10.3: кэш и вспоминание общего решения — M4;
   - §11.1: ключ `agent_solution_id`; §12, §13.2, §13.3: новые эндпоинты и команды (`zam solution|log|insight|release|vault|link`); §15.1–15.2 и §5.2: раскладка ELK для Mermaid (EPL-2.0, решение владельца);
+  - §6.5 (вложения общего решения), §8.1 (reindex: базы пользователей), §8.3 (поиск по точкам папок — M3), §11.2 (`X-Zam-Area`), §14.2 (агентский блок: `agent_solution_id`), §12 (`/auth/me` с `human`, `tokens {human?}`);
   - §8.4, §18.2, решение владельца: гейт int8 по нижней границе 95 % интервала парного бутстрепа Δ nDCG@10 и Δ recall@5 ≥ −0,01 (косинус и Спирмен — справочно); eval «вспомнил отменённое», «надёжное выше гипотезы», chunk-recall@5; §19: состав и критерий M3.
