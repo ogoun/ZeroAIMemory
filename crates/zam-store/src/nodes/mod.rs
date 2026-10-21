@@ -112,6 +112,8 @@ pub struct Attribution {
     pub session_id: Option<String>,
     pub machine: Option<String>,
     pub message: Option<String>,
+    /// Пользователь-автор (участник общего решения в базе владельца); `None` — владелец базы.
+    pub user_id: Option<Id>,
 }
 
 impl Attribution {
@@ -123,6 +125,7 @@ impl Attribution {
             session_id: None,
             machine: None,
             message: None,
+            user_id: None,
         }
     }
 }

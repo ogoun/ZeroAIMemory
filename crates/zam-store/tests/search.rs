@@ -35,6 +35,7 @@ fn attrib() -> Attribution {
         session_id: None,
         machine: None,
         message: None,
+        user_id: None,
     }
 }
 

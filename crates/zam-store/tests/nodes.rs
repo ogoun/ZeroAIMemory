@@ -40,6 +40,7 @@ fn agent() -> Attribution {
         session_id: Some("s1".into()),
         machine: Some("box".into()),
         message: Some("первая версия".into()),
+        user_id: None,
     }
 }
 
@@ -603,6 +604,7 @@ const TWO: &str = "# Альфа\n\nстарое слово\n\n# Бета\n\nвт
 fn human(msg: &str) -> Attribution {
     Attribution {
         message: Some(msg.into()),
+        user_id: None,
         ..Attribution::new(AuthorKind::Human)
     }
 }

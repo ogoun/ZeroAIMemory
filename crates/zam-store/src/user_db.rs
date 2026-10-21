@@ -9,9 +9,9 @@ use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
-use zam_core::Id;
+use zam_core::{Id, SolutionGuid};
 
-use crate::jobs::PRIORITY_REINDEX;
+use crate::jobs::{JobOp, PRIORITY_REINDEX};
 use crate::time::fmt_ts;
 use crate::{Db, Migration, StoreError};
 
@@ -40,6 +40,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 6,
         sql: include_str!("../migrations/user/0006_pending_index.sql"),
+    },
+    Migration {
+        version: 7,
+        sql: include_str!("../migrations/user/0007_attribution.sql"),
     },
 ];
 
@@ -403,6 +407,99 @@ pub async fn create_solution(db: &Db, guid: &str, name: &str) -> Result<(Space, 
         )?;
         let s = solution_by_guid(tx, &guid)?.ok_or(StoreError::NotFound)?;
         Ok((s, true))
+    })
+    .await
+}
+
+/// Создаёт пространство `solution` с заданным id (`space_id` из реестра `system.db`).
+/// Идемпотентно: то же пространство с этим GUID уже есть — возвращается оно (`false`, имя
+/// не меняется). GUID у другого пространства или id занят — `Conflict`.
+pub async fn create_solution_with_id(
+    db: &Db,
+    space_id: Id,
+    guid: &SolutionGuid,
+    name: &str,
+) -> Result<(Space, bool), StoreError> {
+    let (guid, name) = (guid.clone(), name.to_string());
+    db.write(move |tx| {
+        if let Some(s) = solution_by_guid(tx, guid.as_str())? {
+            if s.id == space_id {
+                return Ok((s, false));
+            }
+            return Err(StoreError::Conflict(format!(
+                "решение {guid} уже у другого пространства"
+            )));
+        }
+        let taken = tx
+            .query_row("SELECT 1 FROM spaces WHERE id = ?1", [space_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if taken {
+            return Err(StoreError::Conflict(format!(
+                "пространство {space_id} уже существует"
+            )));
+        }
+        tx.execute(
+            "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
+             VALUES (?1, 'solution', ?2, ?3, ?4)",
+            params![space_id, guid, name, fmt_ts(Timestamp::now())],
+        )?;
+        let s = solution_by_guid(tx, guid.as_str())?.ok_or(StoreError::NotFound)?;
+        Ok((s, true))
+    })
+    .await
+}
+
+/// Меняет GUID пространства решения `space_id` (конфликт GUID при регистрации решений
+/// M1–M2). Узлы, ревизии и чанки остаются на месте; живые индексируемые заметки получают
+/// `upsert`, чтобы точки Qdrant получили новый `solution_guid` в payload. Нет такого
+/// пространства решения — `NotFound`, GUID занят — `Conflict`.
+pub async fn rename_solution_guid(
+    db: &Db,
+    space_id: Id,
+    new: &SolutionGuid,
+) -> Result<(), StoreError> {
+    let new = new.clone();
+    db.write(move |tx| {
+        let cur: Option<Option<String>> = tx
+            .query_row(
+                "SELECT solution_guid FROM spaces WHERE id = ?1 AND kind = 'solution'",
+                [space_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(cur) = cur else {
+            return Err(StoreError::NotFound);
+        };
+        if cur.as_deref() == Some(new.as_str()) {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE spaces SET solution_guid = ?2 WHERE id = ?1",
+            params![space_id, new],
+        )
+        .map_err(|e| {
+            if crate::system::is_unique_violation(&e) {
+                StoreError::Conflict(format!("решение {new} уже есть в базе"))
+            } else {
+                e.into()
+            }
+        })?;
+        let now = fmt_ts(Timestamp::now());
+        let notes: Vec<(Id, i64)> = {
+            let mut st = tx.prepare(
+                "UPDATE nodes SET index_state = 'pending'
+                 WHERE space_id = ?1 AND kind = 'note' AND deleted_at IS NULL
+                   AND index_state <> 'excluded'
+                 RETURNING id, current_rev",
+            )?;
+            st.query_map([space_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        for (node, rev) in notes {
+            crate::jobs::enqueue(tx, node, rev, JobOp::Upsert, PRIORITY_REINDEX, &now)?;
+        }
+        Ok(())
     })
     .await
 }

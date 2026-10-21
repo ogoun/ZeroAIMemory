@@ -1,7 +1,9 @@
 //! Хранилище ZeroAIMemory: открытие SQLite, поток-писатель, пул читателей, миграции,
 //! узлы и ревизии заметок с синхронной индексацией (чанки §8.2, FTS5), outbox векторной
-//! индексации (`index_jobs`), кэш эмбеддингов, полнотекстовый поиск, блобы вложений.
+//! индексации (`index_jobs`), кэш эмбеддингов, полнотекстовый поиск, блобы вложений,
+//! реестр решений и доступ участников (`system.db`).
 
+pub mod access;
 pub mod blobs;
 pub mod datadir;
 pub mod db;
@@ -11,10 +13,12 @@ pub mod migrate;
 pub mod nodes;
 pub mod paths;
 pub mod search;
+pub mod solution_registry;
 pub mod system;
 pub mod time;
 pub mod user_db;
 
+pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, resolve_attachment};
 pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
 pub use db::{Db, DbOptions};
@@ -43,13 +47,14 @@ pub use search::{
     leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves, node_leaves, pending_count,
     query_needles, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
+pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,
     WebSession,
 };
 pub use user_db::{
-    Space, SpaceKind, USER_MIGRATIONS, UserDbs, create_solution, get_solution, get_space,
-    list_spaces, space_of_kind,
+    Space, SpaceKind, USER_MIGRATIONS, UserDbs, create_solution, create_solution_with_id,
+    get_solution, get_space, list_spaces, rename_solution_guid, space_of_kind,
 };
 
 /// Ошибки слоя хранения.

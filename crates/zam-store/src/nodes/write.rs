@@ -154,8 +154,8 @@ fn insert_revision(
 ) -> Result<(), StoreError> {
     c.execute(
         "INSERT INTO revisions (node_id, rev, content, content_hash, size, author_kind,
-                                token_id, session_id, machine, message, ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                token_id, session_id, machine, message, ts, user_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             node_id,
             rev,
@@ -168,6 +168,7 @@ fn insert_revision(
             a.machine,
             a.message,
             now,
+            a.user_id,
         ],
     )?;
     Ok(())

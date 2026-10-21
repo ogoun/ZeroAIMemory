@@ -1,4 +1,5 @@
 //! `system.db`: пользователи, токены, веб-сессии, аудит, настройки (§6.2 ТЗ).
+//! Реестр решений и доступ участников — в [`crate::access`].
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -6,9 +7,9 @@ use jiff::{Span, Timestamp};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-use rusqlite::{OptionalExtension, Row, params};
-use serde::Serialize;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use zam_core::{Id, generate_token, hash_token};
 
 use crate::time::{conv_err, fmt_ts, ts_at, ts_opt};
@@ -23,6 +24,10 @@ pub static SYSTEM_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: include_str!("../migrations/system/0002_index_skipped.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("../migrations/system/0003_solutions.sql"),
     },
 ];
 
@@ -50,8 +55,9 @@ pub struct User {
     pub disabled_at: Option<Timestamp>,
 }
 
-/// Режим доступа токена.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Режим доступа токена или участника решения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Access {
     Rw,
     Ro,
@@ -131,7 +137,7 @@ pub struct AuditRow {
 /// Хранилище `system.db`; дёшево клонируется.
 #[derive(Clone, Debug)]
 pub struct SystemStore {
-    db: Db,
+    pub(crate) db: Db,
 }
 
 fn user_row(r: &Row) -> rusqlite::Result<User> {
@@ -163,12 +169,12 @@ fn token_row(r: &Row) -> rusqlite::Result<TokenInfo> {
 const TOKEN_COLS: &str =
     "id, user_id, name, prefix, access, created_at, last_used_at, last_ip, revoked_at";
 
-fn is_unique_violation(e: &rusqlite::Error) -> bool {
+pub(crate) fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _)
         if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
 }
 
-fn json_err(e: serde_json::Error) -> StoreError {
+pub(crate) fn json_err(e: serde_json::Error) -> StoreError {
     StoreError::Corrupt(format!("некорректный JSON: {e}"))
 }
 
@@ -179,6 +185,34 @@ fn random_b64() -> String {
         .try_fill_bytes(&mut b)
         .expect("источник случайности ОС");
     URL_SAFE_NO_PAD.encode(b)
+}
+
+/// Пишет запись аудита в транзакции вызывающего (действие и его аудит — атомарно).
+/// `details` не должен содержать секретов.
+pub(crate) fn audit_tx(
+    c: &Connection,
+    actor: &str,
+    user_id: Option<Id>,
+    action: &str,
+    target: Option<&str>,
+    ip: Option<&str>,
+    details: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let details = serde_json::to_string(details).map_err(json_err)?;
+    c.execute(
+        "INSERT INTO audit (ts, actor, user_id, action, target, ip, details)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            fmt_ts(Timestamp::now()),
+            actor,
+            user_id,
+            action,
+            target,
+            ip,
+            details
+        ],
+    )?;
+    Ok(())
 }
 
 impl SystemStore {
@@ -555,23 +589,17 @@ impl SystemStore {
     ) -> Result<(), StoreError> {
         let (actor, action) = (actor.to_string(), action.to_string());
         let (target, ip) = (target.map(str::to_string), ip.map(str::to_string));
-        let details = serde_json::to_string(&details).map_err(json_err)?;
         self.db
             .write(move |tx| {
-                tx.execute(
-                    "INSERT INTO audit (ts, actor, user_id, action, target, ip, details)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        fmt_ts(Timestamp::now()),
-                        actor,
-                        user_id,
-                        action,
-                        target,
-                        ip,
-                        details
-                    ],
-                )?;
-                Ok(())
+                audit_tx(
+                    tx,
+                    &actor,
+                    user_id,
+                    &action,
+                    target.as_deref(),
+                    ip.as_deref(),
+                    &details,
+                )
             })
             .await
     }
