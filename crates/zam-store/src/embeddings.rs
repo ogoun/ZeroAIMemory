@@ -196,6 +196,31 @@ pub async fn adopt_owned_embeddings(
     .await
 }
 
+/// [`adopt_owned_embeddings`] для многих узлов одной транзакцией: пары `(владелец, ключ)`
+/// (reindex из кэша — строки L0 всех папок базы). Возвращает число присвоенных строк.
+pub async fn adopt_owned_embeddings_batch(
+    db: &Db,
+    model_id: &str,
+    items: Vec<(Id, String)>,
+) -> Result<u64, StoreError> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let model_id = model_id.to_string();
+    db.write(move |tx| {
+        let mut st = tx.prepare_cached(
+            "UPDATE embeddings SET owner = ?1
+             WHERE owner IS NULL AND model_id = ?2 AND text_hash = ?3",
+        )?;
+        let mut n = 0u64;
+        for (owner, key) in &items {
+            n += st.execute(params![owner, model_id, key])? as u64;
+        }
+        Ok(n)
+    })
+    .await
+}
+
 /// Удаляет служебные эмбеддинги модели `model_id` узла `owner`, не входящие в `keep`
 /// (текущий набор ключей L0 узла). Возвращает число удалённых строк.
 pub async fn prune_owned_embeddings(

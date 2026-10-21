@@ -619,7 +619,8 @@ impl SystemStore {
                     "INSERT INTO index_skipped (user_id, error, attempts, skipped_at)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(user_id) DO UPDATE SET error = excluded.error,
-                         attempts = excluded.attempts, skipped_at = excluded.skipped_at",
+                         attempts = max(attempts, excluded.attempts),
+                         skipped_at = excluded.skipped_at",
                     params![user, error, attempts, fmt_ts(Timestamp::now())],
                 )?;
                 Ok(())

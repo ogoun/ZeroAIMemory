@@ -898,6 +898,13 @@ pub fn text_snippet(text: &str, needles: &[&str]) -> String {
 /// Сколько живых заметок в `space_ids` (и под `path_prefix`, если задан) ждут
 /// векторной индексации (`index_state = 'pending'`) — `pending_count` выдачи поиска.
 /// Заметки с `index: false` (`excluded`) не считаются.
+/// Запрос [`pending_count`]: условия совпадают с частичным индексом `nodes_pending`
+/// (миграция 0006), поэтому считаются только заметки в очереди.
+const PENDING_COUNT_SQL: &str = "SELECT count(*) FROM nodes n
+     WHERE n.kind = 'note' AND n.index_state = 'pending' AND n.deleted_at IS NULL
+       AND n.space_id IN (SELECT value FROM json_each(?1))
+       AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')";
+
 pub async fn pending_count(
     db: &Db,
     space_ids: Vec<Id>,
@@ -914,14 +921,7 @@ pub async fn pending_count(
         .filter(|p| !p.is_empty())
         .map(str::to_string);
     db.read(move |c| {
-        Ok(c.query_row(
-            "SELECT count(*) FROM nodes n
-             WHERE n.kind = 'note' AND n.index_state = 'pending' AND n.deleted_at IS NULL
-               AND n.space_id IN (SELECT value FROM json_each(?1))
-               AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
-            params![ids, prefix],
-            |r| r.get(0),
-        )?)
+        Ok(c.query_row(PENDING_COUNT_SQL, params![ids, prefix], |r| r.get(0))?)
     })
     .await
 }
@@ -929,6 +929,25 @@ pub async fn pending_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pending_count` идёт по частичному индексу `nodes_pending`, а не обходом узлов области.
+    #[test]
+    fn pending_count_uses_partial_index() {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        let mut st = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {PENDING_COUNT_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = st
+            .query_map(params!["[\"x\"]", "a"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("; ");
+        assert!(plan.contains("nodes_pending"), "{plan}");
+    }
 
     #[test]
     fn identifier_detection() {

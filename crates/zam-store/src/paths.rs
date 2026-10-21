@@ -11,6 +11,15 @@ pub const SEGMENT_MAX_BYTES: usize = 255;
 /// Предел длины всего пути, байт.
 pub const PATH_MAX_BYTES: usize = 1024;
 
+/// Все префиксы пути по целым сегментам, включая сам путь: `"a/b/c"` → `a`, `a/b`, `a/b/c`
+/// (payload `path_ancestors` точек Qdrant — фильтр по префиксу пути).
+pub fn path_ancestors(path: &str) -> Vec<String> {
+    path.match_indices('/')
+        .map(|(i, _)| path[..i].to_string())
+        .chain(std::iter::once(path.to_string()))
+        .collect()
+}
+
 /// Проверенный путь узла: сегменты через `/`, без ведущего и замыкающего `/`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodePath(String);
@@ -79,6 +88,12 @@ impl fmt::Display for NodePath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ancestors() {
+        assert_eq!(path_ancestors("a"), vec!["a"]);
+        assert_eq!(path_ancestors("a/b/c"), vec!["a", "a/b", "a/b/c"]);
+    }
 
     #[test]
     fn ancestors_in_order() {

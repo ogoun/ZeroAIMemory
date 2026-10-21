@@ -176,6 +176,8 @@ async fn confirmed_upsert_survives_process_exit() {
     assert!(st.success(), "дочерний процесс: {st:?}");
     let idx = EdgeIndex::open(&dir.0, opts()).unwrap();
     let m = idx.ensure(MODEL, DIM).await.unwrap();
+    // коллекция дочернего процесса найдена, а не создана заново (иначе 0 точек — по другой причине)
+    assert!(!m.created, "коллекция создана заново: {m:?}");
     assert_eq!(
         m.points, 100,
         "подтверждённые точки потеряны после выхода без flush"

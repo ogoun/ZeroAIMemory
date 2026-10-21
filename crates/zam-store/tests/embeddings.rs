@@ -238,7 +238,7 @@ async fn gc_removes_orphans_and_prune_keeps_current_set() {
 async fn adopt_legacy_owner_and_index_skipped() {
     use zam_store::{
         Attribution, AuthorKind, NewNote, NodePath, SpaceKind, SystemStore, adopt_owned_embeddings,
-        create_note, gc_embeddings, list_spaces,
+        adopt_owned_embeddings_batch, create_note, gc_embeddings, list_spaces,
     };
     let db = setup("adopt").await;
     let k = list_spaces(&db)
@@ -270,13 +270,35 @@ async fn adopt_legacy_owner_and_index_skipped() {
             .unwrap(),
         1
     );
+    // пачкой (reindex из кэша: строки папок одной транзакцией)
+    put_embeddings(
+        &db,
+        "m@1",
+        vec![("l2".into(), sample(2.0)), ("l3".into(), sample(3.0))],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        adopt_owned_embeddings_batch(
+            &db,
+            "m@1",
+            vec![(n, "l2".into()), (n, "l3".into()), (n, "нет".into())]
+        )
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        adopt_owned_embeddings_batch(&db, "m@1", vec![]).await.unwrap(),
+        0
+    );
     gc_embeddings(&db, 100).await.unwrap();
     assert_eq!(
-        get_embeddings(&db, "m@1", &["legacy".into()])
+        get_embeddings(&db, "m@1", &["legacy".into(), "l2".into(), "l3".into()])
             .await
             .unwrap()
             .len(),
-        1
+        3
     );
 
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("emb-skip");
@@ -289,6 +311,10 @@ async fn adopt_legacy_owner_and_index_skipped() {
     sys.index_skip(u, "файл не SQLite", 5).await.unwrap();
     let s = sys.index_skipped().await.unwrap();
     assert_eq!((s.len(), s[0].user_id, s[0].attempts), (1, u, 5));
+    // повторная отметка reindex (attempts = 1) счётчик попыток воркера не затирает
+    sys.index_skip(u, "файл всё ещё не SQLite", 1).await.unwrap();
+    let s = sys.index_skipped().await.unwrap();
+    assert_eq!((s[0].attempts, s[0].error.as_str()), (5, "файл всё ещё не SQLite"));
     sys.index_unskip(u).await.unwrap();
     assert!(sys.index_skipped().await.unwrap().is_empty());
 }

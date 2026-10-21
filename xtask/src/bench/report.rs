@@ -100,17 +100,28 @@ fn rows(r: &BenchResult) -> Vec<Row> {
         &r.search_empty_queue,
         Some(search),
     ));
-    out.push(pass_row(
+    // ТЗ v1.7 §17: на GPU при полной очереди на M2 принято фактическое p95 52 мс, FTS-only —
+    // 30–32 мс на 10 тыс. заметок (решения владельца 2026-10-20); вердикт — по цели ТЗ
+    const ACCEPTED: &str = " (на M2 принято владельцем 2026-10-20: ";
+    let mut full = pass_row(
         "Поиск `chunks` без реранка, полная очередь",
         &r.search_full_queue,
         Some(search),
-    ));
+    );
+    if gpu {
+        full.target.push_str(ACCEPTED);
+        full.target.push_str("p95 52 мс)");
+    }
+    out.push(full);
     out.push(pass_row(
         "Поиск `chunks`, повтор (кэш запросов)",
         &r.search_cached,
         None,
     ));
-    out.push(pass_row("Поиск FTS-only", &r.fts_only, Some(20.0)));
+    let mut fts = pass_row("Поиск FTS-only", &r.fts_only, Some(20.0));
+    fts.target.push_str(ACCEPTED);
+    fts.target.push_str("p95 30–32 мс)");
+    out.push(fts);
     out.push(pass_row(
         &format!(
             "Поиск с реранком 20×256 ({})",
@@ -259,7 +270,7 @@ fn rows(r: &BenchResult) -> Vec<Row> {
     let model_target = if gpu {
         "≤ 0,6 ГБ (572 МиБ)"
     } else {
-        "≤ 1,5 ГБ (1431 МиБ)"
+        "≤ 1,5 ГБ (1430,5 МиБ)"
     };
     let with_private = |rss: Option<u64>, private: Option<u64>| match private {
         Some(_) => format!("{} (частная {})", mb(rss), mb(private)),
@@ -299,7 +310,11 @@ fn rows(r: &BenchResult) -> Vec<Row> {
     };
     let fmax = |f: &dyn Fn(&super::Startup) -> Option<f64>| fmax_of(&r.startup, f);
     // ТЗ v1.7: цель 5 с — для штатного перезапуска. Первый старт прогона идёт сразу за
-    // массовой индексацией (этап index → search) — справочно (решение владельца 2026-10-20)
+    // массовой индексацией (этап index → search) — справочно (решение владельца 2026-10-20).
+    // Первым считается старт только если в этом прогоне была индексация копий (`index_copies`;
+    // этапы идут в порядке rss → index → search…, rss старт не записывает). При поэтапном
+    // запуске (`--phase index --keep`, затем `--reuse`) первый старт второго прогона тоже идёт
+    // за массовой индексацией, но считается штатным: вердикт по 5 с строже, а не мягче
     let (first, regular): (&[super::Startup], &[super::Startup]) =
         if r.index_copies.is_some() && !r.startup.is_empty() {
             r.startup.split_at(1)
@@ -531,6 +546,19 @@ mod tests {
         });
         let rows_gpu = super::rows(&r);
         assert_eq!(find(&rows_gpu, "Индексация, копии").ok, Some(false));
-        assert!(rows_gpu.iter().all(|r| !r.target.contains("владельц")));
+        assert!(rows_gpu.iter().all(|r| !r.target.contains("ожидает")));
+        // принятые владельцем фактические значения — пометкой у цели, вердикт по цели ТЗ
+        let full = find(&rows_gpu, "Поиск `chunks` без реранка, полная очередь");
+        assert!(full.target.contains("принято владельцем") && full.target.contains("52 мс"));
+        let fts = find(&rows_gpu, "Поиск FTS-only");
+        assert!(fts.target.starts_with("p95 ≤ 20 мс") && fts.target.contains("принято"));
+        assert!(
+            !find(&rows, "Поиск `chunks` без реранка, полная очередь")
+                .target
+                .contains("принято"),
+            "на CPU цель 120 мс без пометки"
+        );
+        let cpu = find(&rows, "RSS с bge-m3 в простое");
+        assert!(cpu.target.contains("1430,5 МиБ"), "{}", cpu.target);
     }
 }

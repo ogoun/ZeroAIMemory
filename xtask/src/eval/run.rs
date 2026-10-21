@@ -670,7 +670,31 @@ pub struct RunResult {
     pub queries: Vec<QueryRun>,
 }
 
-/// Короткий хэш HEAD и признак незакоммиченных изменений.
+/// Пути, от которых зависят замеры eval и bench: код, манифесты сборки и поставки, корпус
+/// и запросы eval. Правки документации и результатов (`eval/results/`, `docs/`) прогон не
+/// делают «грязным».
+const MEASURED_PATHS: &[&str] = &[
+    "crates",
+    "xtask",
+    "Cargo.toml",
+    "Cargo.lock",
+    "deploy",
+    "eval/corpus",
+    "eval/queries.toml",
+    "eval/grid.toml",
+    "eval/grid-confirm.toml",
+    "eval/grid-relaxed.toml",
+];
+
+/// `git <args> -- <MEASURED_PATHS>`.
+fn with_paths<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut v = args.to_vec();
+    v.push("--");
+    v.extend_from_slice(MEASURED_PATHS);
+    v
+}
+
+/// Короткий хэш HEAD и признак незакоммиченных изменений в [`MEASURED_PATHS`].
 pub fn git_rev(repo: &Path) -> String {
     let run = |args: &[&str]| {
         Command::new("git")
@@ -682,7 +706,7 @@ pub fn git_rev(repo: &Path) -> String {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     let sha = run(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "?".into());
-    let dirty = run(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+    let dirty = run(&with_paths(&["status", "--porcelain"])).is_some_and(|s| !s.is_empty());
     if !dirty {
         return sha;
     }
@@ -692,9 +716,10 @@ pub fn git_rev(repo: &Path) -> String {
     }
 }
 
-/// Отпечаток незакоммиченных изменений: `git hash-object` от `git diff HEAD --binary` и
-/// хэшей неотслеживаемых файлов (не из `.gitignore`) — одинаковое дерево даёт одинаковый
-/// отпечаток, по нему прогоны одного «грязного» кода сопоставимы. 8 hex-символов.
+/// Отпечаток незакоммиченных изменений в [`MEASURED_PATHS`]: `git hash-object` от
+/// `git diff HEAD --binary` и хэшей неотслеживаемых файлов (не из `.gitignore`) — одинаковое
+/// дерево даёт одинаковый отпечаток, по нему прогоны одного «грязного» кода сопоставимы.
+/// 8 hex-символов.
 fn dirty_hash(repo: &Path) -> Option<String> {
     use std::io::Write as _;
     let out = |args: &[&str]| -> Option<Vec<u8>> {
@@ -706,9 +731,13 @@ fn dirty_hash(repo: &Path) -> Option<String> {
             .filter(|o| o.status.success())
             .map(|o| o.stdout)
     };
-    let mut buf = out(&["diff", "HEAD", "--binary"])?;
-    let untracked =
-        String::from_utf8(out(&["ls-files", "--others", "--exclude-standard"])?).ok()?;
+    let mut buf = out(&with_paths(&["diff", "HEAD", "--binary"]))?;
+    let untracked = String::from_utf8(out(&with_paths(&[
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+    ]))?)
+    .ok()?;
     let files: Vec<&str> = untracked.lines().filter(|l| !l.is_empty()).collect();
     if !files.is_empty() {
         let mut args = vec!["hash-object", "--"];

@@ -1828,13 +1828,6 @@ pub fn folder_chunk_id(folder: Id) -> String {
         .collect()
 }
 
-fn path_ancestors(path: &str) -> Vec<String> {
-    path.match_indices('/')
-        .map(|(i, _)| path[..i].to_string())
-        .chain(std::iter::once(path.to_string()))
-        .collect()
-}
-
 /// Точки узла по плану задания; нет эмбеддинга какого-либо чанка — ошибка.
 fn plan_points(
     user: Id,
@@ -1866,7 +1859,7 @@ pub(crate) fn folder_point(user: Id, f: &IndexFolder, e: Embedding, key: String)
             space_kind: f.space_kind.as_str().to_string(),
             solution_guid: f.solution_guid.clone(),
             node_id: f.node_id,
-            path_ancestors: path_ancestors(&f.path),
+            path_ancestors: zam_store::path_ancestors(&f.path),
             area: None,
             level: "folder".into(),
             kind: "folder".into(),

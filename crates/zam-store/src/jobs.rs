@@ -22,6 +22,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::ChunkLevel;
 
+use crate::paths::path_ancestors;
 use crate::time::{fmt_ts, parse_ts, ts_at, ts_opt};
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
@@ -497,14 +498,6 @@ pub async fn job_stats(db: &Db) -> Result<JobStats, StoreError> {
     .await
 }
 
-/// Все префиксы пути по сегментам, включая сам путь.
-fn path_ancestors(path: &str) -> Vec<String> {
-    path.match_indices('/')
-        .map(|(i, _)| path[..i].to_string())
-        .chain(std::iter::once(path.to_string()))
-        .collect()
-}
-
 fn parse_level(s: &str) -> Option<ChunkLevel> {
     match s {
         "chunk" => Some(ChunkLevel::Chunk),
@@ -863,9 +856,4 @@ mod tests {
         assert_eq!(backoff_secs(i64::MAX), 3600);
     }
 
-    #[test]
-    fn ancestors() {
-        assert_eq!(path_ancestors("a"), vec!["a"]);
-        assert_eq!(path_ancestors("a/b/c"), vec!["a", "a/b", "a/b/c"]);
-    }
 }

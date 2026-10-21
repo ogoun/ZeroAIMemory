@@ -76,11 +76,13 @@ pub fn file_stem(r: &RunResult) -> String {
     s
 }
 
+/// Компактный JSON (одна строка): результаты прогонов с поэлементными запросами — сотни
+/// КБ, отступы удваивали размер `eval/results/` (прежние файлы не переписываются).
 fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<()> {
     if let Some(d) = path.parent() {
         fs::create_dir_all(d)?;
     }
-    fs::write(path, serde_json::to_string_pretty(v)? + "\n")?;
+    fs::write(path, serde_json::to_string(v)? + "\n")?;
     Ok(())
 }
 

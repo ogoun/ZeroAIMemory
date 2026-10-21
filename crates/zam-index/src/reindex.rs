@@ -35,7 +35,7 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use zam_core::Id;
 use zam_store::{
     Db, Embedding, IndexFolder, ReindexNote, StoreError, SystemStore, UserDbs,
-    adopt_owned_embeddings, enqueue_reindex, enqueue_upserts, finish_reindexed, folders_for_index,
+    adopt_owned_embeddings_batch, enqueue_reindex, enqueue_upserts, finish_reindexed, folders_for_index,
     gc_embeddings, get_embeddings, mark_reindex, put_owned_embeddings, reindex_page,
 };
 
@@ -335,17 +335,19 @@ async fn cache_user(
     let embs = get_embeddings(db, ctx.model_id, &keys).await?;
     let mut fpts = Vec::new();
     let mut missed: Vec<(&IndexFolder, &(String, String))> = Vec::new();
+    let mut adopt: Vec<(Id, String)> = Vec::new();
     for (f, e) in folders.iter().zip(&embedded) {
         match embs.get(&e.1) {
             Some(v) => {
-                // строка до v5 (без владельца) — теперь папки, иначе её снимет сборка мусора
-                adopt_owned_embeddings(db, ctx.model_id, f.node_id, std::slice::from_ref(&e.1))
-                    .await?;
+                adopt.push((f.node_id, e.1.clone()));
                 fpts.push(folder_point(user, f, v.clone(), e.1.clone()));
             }
             None => missed.push((f, e)),
         }
     }
+    // строки до v5 (без владельца) — теперь папок, иначе их снимет сборка мусора; одна
+    // транзакция на базу, а не на папку
+    adopt_owned_embeddings_batch(db, ctx.model_id, adopt).await?;
     // L0 папки нет в кэше: с моделью (CLI) — эмбеддинг сразу, иначе свёртку пересчитает
     // воркер ([`ReindexReport::missed_folders`])
     if let (Some(model), false) = (&ctx.embedder, missed.is_empty()) {

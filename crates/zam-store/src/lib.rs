@@ -19,7 +19,7 @@ pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, reso
 pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
 pub use db::{Db, DbOptions};
 pub use embeddings::{
-    Embedding, adopt_owned_embeddings, embed_input_of, embed_key_of, gc_embeddings, get_embeddings,
+    Embedding, adopt_owned_embeddings, adopt_owned_embeddings_batch, embed_input_of, embed_key_of, gc_embeddings, get_embeddings,
     prune_owned_embeddings, put_embeddings, put_owned_embeddings,
 };
 pub use jobs::{
@@ -37,7 +37,7 @@ pub use nodes::{
     patch_note, patch_note_within, restore_node, revert_note, set_auto_l0, set_chunk_params,
     set_folder_l0, set_token_counter, token_counter_exact, unified_diff, update_note,
 };
-pub use paths::NodePath;
+pub use paths::{NodePath, path_ancestors};
 pub use search::{
     ChunkScope, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END, MARK_START,
     leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves, node_leaves, pending_count,
