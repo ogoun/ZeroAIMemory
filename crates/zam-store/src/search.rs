@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
 use rusqlite::{Connection, ToSql, params, params_from_iter};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::time::ts_at;
 use crate::{Db, StoreError};
@@ -83,7 +83,8 @@ pub struct FtsQuery {
 #[derive(Debug, Clone)]
 pub struct FtsHit {
     pub chunk_id: String,
-    pub node_id: Id,
+    /// Цель чанка: узел (записи журналов — с задачи 7 M3).
+    pub target: TargetRef,
     pub space_id: Id,
     pub path: String,
     pub heading_path: String,
@@ -96,6 +97,10 @@ pub struct FtsHit {
     /// [`search_fts`] — слитый RRF-балл, [`search_fts_channels`] — `1/место` в канале,
     /// [`live_chunks`] — 0. Больше — лучше.
     pub score: f64,
+    /// [`search_fts_channels`] — сырой балл `bm25()` канала, в списке которого лежит хит
+    /// (у чанка, найденного обоими каналами, в каждом списке свой): меньше — лучше. По нему
+    /// сервер сливает каналы нескольких баз. [`search_fts`] и [`live_chunks`] — 0.
+    pub raw_score: f64,
     pub updated_at: Timestamp,
     /// Фрагмент с совпадениями между [`MARK_START`] и [`MARK_END`].
     pub snippet: String,
@@ -104,6 +109,14 @@ pub struct FtsHit {
     /// `nodes.index_state` узла: `indexed` — его чанки есть в векторном индексе; `pending`,
     /// `failed`, `excluded` — нет (гибрид не понижает такие хиты ослабленного bm25).
     pub index_state: String,
+}
+
+/// Цель-узел чанка.
+fn node_target(id: Id) -> TargetRef {
+    TargetRef {
+        kind: TargetKind::Node,
+        id,
+    }
 }
 
 /// Слова запроса: всё, что не буква и не цифра (Unicode), — разделитель.
@@ -243,8 +256,8 @@ fn json_ids(ids: &[i64]) -> String {
     format!("[{}]", items.join(","))
 }
 
-/// Кандидат канала: `(seq, node_id, это L1 заметки)`.
-type Cand = (i64, Id, bool);
+/// Кандидат канала: `(seq, node_id, это L1 заметки, bm25 канала)`.
+type Cand = (i64, Id, bool, f64);
 
 /// Выполняет канал: кандидаты по убыванию релевантности канала.
 ///
@@ -264,11 +277,12 @@ fn run_channel(
     let (table, order, limit) = channel_spec(ch);
     let over = limit * OVERSAMPLE;
     let mut st = c.prepare_cached(&format!(
-        "SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY {order}, rowid LIMIT {over}"
+        "SELECT rowid, {order} FROM {table} WHERE {table} MATCH ?1 ORDER BY {order}, rowid          LIMIT {over}"
     ))?;
-    let top: Vec<i64> = st
-        .query_map([fts], |r| r.get(0))?
+    let top_raw: Vec<(i64, f64)> = st
+        .query_map([fts], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
+    let top: Vec<i64> = top_raw.iter().map(|t| t.0).collect();
     if top.is_empty() {
         return Ok(Vec::new());
     }
@@ -289,9 +303,13 @@ fn run_channel(
             Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
         })?
         .collect::<Result<_, _>>()?;
-    let out: Vec<Cand> = top
+    let out: Vec<Cand> = top_raw
         .iter()
-        .filter_map(|seq| allowed.get(seq).map(|(node, note)| (*seq, *node, *note)))
+        .filter_map(|(seq, raw)| {
+            allowed
+                .get(seq)
+                .map(|(node, note)| (*seq, *node, *note, *raw))
+        })
         .take(limit as usize)
         .collect();
     if out.len() as i64 == limit || (top.len() as i64) < over {
@@ -301,7 +319,7 @@ fn run_channel(
     let mut args: Vec<&dyn ToSql> = vec![&fts, &prefix];
     args.extend(spaces.iter().map(|s| s as &dyn ToSql));
     let mut st = c.prepare_cached(&format!(
-        "SELECT f.rowid, c.node_id, c.level = 'note'
+        "SELECT f.rowid, c.node_id, c.level = 'note', {order}
          FROM {table} f
          CROSS JOIN chunks c ON c.seq = f.rowid
          CROSS JOIN nodes n ON n.id = c.node_id
@@ -311,7 +329,7 @@ fn run_channel(
         scope_sql(spaces.len())
     ))?;
     let rows = st.query_map(params_from_iter(args), |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
@@ -366,7 +384,7 @@ pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, St
         // текст и сниппеты — одним шагом для объединения каналов; сниппет чанка,
         // найденного bm25, — из FTS5 `snippet()`
         let mut all: Vec<Ranked> = Vec::with_capacity(ch.a.len() + ch.b.len());
-        for (seq, _, _) in ch.a.iter().chain(&ch.b) {
+        for (seq, _, _, _) in ch.a.iter().chain(&ch.b) {
             if !all.iter().any(|r| r.seq == *seq) {
                 all.push(Ranked {
                     seq: *seq,
@@ -384,9 +402,10 @@ pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, St
         let take = |l: &[Cand]| -> Vec<FtsHit> {
             l.iter()
                 .enumerate()
-                .filter_map(|(i, (seq, _, _))| {
+                .filter_map(|(i, (seq, _, _, raw))| {
                     let mut h = hits.get(seq_ids.get(seq)?)?.clone();
                     h.score = 1.0 / (i + 1) as f64;
+                    h.raw_score = *raw;
                     Some(h)
                 })
                 .collect()
@@ -536,7 +555,7 @@ pub async fn live_chunks(
         let rows = st.query_map(params_from_iter(args), |r| {
             Ok(FtsHit {
                 chunk_id: r.get(0)?,
-                node_id: r.get(1)?,
+                target: node_target(r.get(1)?),
                 space_id: r.get(2)?,
                 path: r.get(3)?,
                 heading_path: r.get(4)?,
@@ -544,6 +563,7 @@ pub async fn live_chunks(
                 rev: r.get(5)?,
                 token_count: r.get(9)?,
                 score: 0.0,
+                raw_score: 0.0,
                 updated_at: ts_at(r, 6)?,
                 snippet: String::new(),
                 text: r.get(7)?,
@@ -729,14 +749,14 @@ fn merge(a: Vec<Cand>, b: Vec<Cand>, top_k: usize) -> Vec<Ranked> {
     let with_leaf: HashSet<Id> = a
         .iter()
         .chain(&b)
-        .filter(|(_, _, note)| !note)
-        .map(|(_, node, _)| *node)
+        .filter(|(_, _, note, _)| !note)
+        .map(|(_, node, _, _)| *node)
         .collect();
     let keep = |c: &Cand| !c.2 || !with_leaf.contains(&c.1);
     let strip = |l: Vec<Cand>| -> Vec<(i64, Id)> {
         l.into_iter()
             .filter(keep)
-            .map(|(seq, node, _)| (seq, node))
+            .map(|(seq, node, _, _)| (seq, node))
             .collect()
     };
     rrf(strip(a), strip(b), top_k)
@@ -796,7 +816,7 @@ fn fetch_hits(
             r.get::<_, i64>(0)?,
             FtsHit {
                 chunk_id: r.get(1)?,
-                node_id: r.get(2)?,
+                target: node_target(r.get(2)?),
                 space_id: r.get(3)?,
                 path: r.get(4)?,
                 heading_path: r.get(5)?,
@@ -804,6 +824,7 @@ fn fetch_hits(
                 rev: r.get(6)?,
                 token_count: r.get(10)?,
                 score: 0.0,
+                raw_score: 0.0,
                 updated_at: ts_at(r, 7)?,
                 snippet: String::new(),
                 text: r.get(8)?,

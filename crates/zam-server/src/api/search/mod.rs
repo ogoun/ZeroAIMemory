@@ -11,21 +11,26 @@
 //! - `top_k` (10, 1..=100), `budget_tokens` (800), `format`: `json` (по умолчанию) | `md`;
 //! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже).
 //!
-//! **Область.** `scope.spaces` задаёт пространства явно; иначе — `scope.solution`
-//! (или заголовок `X-Zam-Solution`) плюс Knowledge и Rules по флагам, а при
-//! `all_solutions` — все решения. Неизвестное решение или пространство из списка
-//! просто не добавляет пространства (ответ 200, возможно пустой). Human — только
-//! администратору и только с `include_human: true`; токен его не видит никогда.
-//! Human ищется только каналом FTS: в Qdrant его нет, и сервер не передаёт его
-//! в фильтр векторного запроса.
+//! **Область** ([`targets`]): цели — личная база пользователя (Knowledge, Rules, свои
+//! решения, Human — только администратору с `include_human: true`) и базы владельцев
+//! доступных чужих решений (у каждой — ровно пространство решения). `scope.spaces` задаёт
+//! пространства явно; иначе — `scope.solution` (или заголовок `X-Zam-Solution`) плюс
+//! Knowledge и Rules по флагам, а при `all_solutions` — все доступные решения. Неизвестное
+//! решение или пространство из списка просто не добавляет пространства (ответ 200, возможно
+//! пустой); чужое решение без одобренного доступа исключается с предупреждением
+//! `solution access pending|rejected|revoked`. Human ищется только каналом FTS: в Qdrant его
+//! нет, и сервер не передаёт его в фильтр векторного запроса.
 //!
 //! **Алгоритм** (§9.2):
-//! 1. Параллельно: каналы FTS и — если векторный канал доступен
+//! 1. Параллельно: каналы FTS по каждой цели в пределах её пространств (базы — параллельно,
+//!    затем [`merge::merge_channels`] по сырому баллу FTS5) и — если векторный канал доступен
 //!    ([`IndexRuntime::vector_available`]) — эмбеддинг запроса (`spawn_blocking`, сессия
-//!    запросов) и `VectorIndex::search` по пространствам области без Human.
-//! 2. Векторные хиты проверяются по SQLite ([`live_chunks`]): чанк текущей ревизии, узел
+//!    запросов) и **один** `VectorIndex::search` с областями всех целей без Human.
+//! 2. Векторные хиты направляются в базу владельца (`VectorHit::user_id`) и проверяются по
+//!    SQLite ([`live_chunks`]) в пространствах своей цели: чанк текущей ревизии, узел
 //!    жив, не в корзине, не исключён (`index: false`), в области. Точка, оставшаяся
-//!    в Qdrant после неудачного `delete`, в выдачу не попадает.
+//!    в Qdrant после неудачного `delete`, в выдачу не попадает. Все дальнейшие чтения
+//!    (листы сводок, `expand`, L0, `pending_count`) идут в базу цели элемента.
 //! 3. `fuse` (weighted RRF + затухание; bm25 ослабленного запроса — с весом
 //!    `w_fts_relaxed`, если векторный канал работает и чанк ему виден, т. е. не Human и узел
 //!    проиндексирован) → `note_to_leaf` → ≤ `max_per_node` с узла:
@@ -46,7 +51,7 @@
 //! 5. `top_k` (в `notes` — узлов), `expand`, упаковка в `budget_tokens`.
 //!
 //! **Деградация.** Нет модели, ORT, Qdrant, чужая модель коллекции или сбой запроса
-//! (эмбеддинг, Qdrant) — ответ из одного FTS, `degraded: true` и `degraded_reason`
+//! (эмбеддинг, Qdrant) — ответ из одного FTS (по всем целям), `degraded: true` и `degraded_reason`
 //! (`no_runtime`, `no_model`, `qdrant_down`, `qdrant_locked`, `broken`, `model_mismatch`,
 //! `embed_failed`, `search_failed`) с текстом по-русски `degraded_text`, а не ошибка.
 //!
@@ -59,14 +64,16 @@
 //! **Режимы.** `brief` — карточки со `snippet`; `chunks` — плюс `text`; `notes` — по
 //! одному элементу на узел (лучший чанк), `l0` вместо `snippet`.
 //!
-//! **Ответ JSON:** `items` (у элемента — `node_id`, `space`, `path`, `heading_path`,
+//! **Ответ JSON:** `items` (у элемента — `node_id`, `space`, `agent_solution_id` — у элемента
+//! решения (своего или чужого), `path`, `heading_path`,
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
 //! полного текста чанка, `updated_at`, `kind`, `snippet` | `l0`,
 //! `text`, `rerank_score` 0..1 — у переставленных реранком), `degraded`, `degraded_reason`
-//! и `degraded_text` (или `null`), `warnings` (строки: о реранке и `index rebuilding` — индекс
-//! пересобирается, векторная выдача может быть неполной), `pending_count` — живые
-//! заметки области, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms,
+//! и `degraded_text` (или `null`), `warnings` (строки: о реранке, `index rebuilding` — индекс
+//! пересобирается, векторная выдача может быть неполной, `solution access …` и
+//! `solution unavailable` — решение исключено из области), `pending_count` — живые
+//! заметки области всех целей, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms,
 //! fuse_ms, rerank_ms, expand_ms, pending_ms, total_ms}` (`null` — этап не выполнялся;
 //! `total_ms` — весь обработчик без сериализации ответа). Маркеры совпадений в JSON —
 //! U+E000/U+E001.
@@ -77,7 +84,14 @@
 //! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
 //! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
 //! единственная), предупреждения — строками `> warning: <текст>` в конце.
-use std::collections::HashMap;
+//!
+//! **Ошибки баз владельцев.** Сбой FTS, проверки векторных хитов или `pending_count` в базе
+//! чужого решения — решение исключается (WARN в журнал, `solution unavailable`), ответ строится
+//! по остальным целям; сбой личной базы — ошибка запроса, как в M2.
+pub mod merge;
+pub mod targets;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -87,10 +101,11 @@ use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
+use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use zam_core::{Id, SolutionGuid};
-use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex};
+use zam_core::{Id, TargetKind, TargetRef};
+use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
     ChunkMeta, Cost, Fit, LeafRef, Level, Ranked, SearchInputs, Weights, cap_per_node,
@@ -99,14 +114,17 @@ use zam_search::{
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
-    ChunkScope, Db, FtsChannels, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
-    count_tokens, get_embeddings, get_node, get_solution, leaf_term_hits, leaves_of_nodes,
-    list_spaces, live_chunks, neighbor_leaves, node_content, pending_count, query_needles,
-    search_fts_channels, text_snippet,
+    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind, StoreError,
+    count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_nodes, live_chunks,
+    neighbor_leaves, node_content, pending_count, query_needles, search_fts_channels, text_snippet,
 };
 
+use self::merge::merge_channels;
+use self::targets::{
+    ScopeReq, SearchTarget, WARN_SOLUTION_UNAVAILABLE, dedup_keep_order, resolve_targets,
+};
 use super::json_body;
-use super::scope::{SpaceRef, find_space, token_can_read, user_db};
+use super::scope::skip_foreign;
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::config::SearchSection;
@@ -120,6 +138,8 @@ const DEFAULT_TOP_K: usize = 10;
 const DEFAULT_BUDGET_TOKENS: usize = 800;
 /// Предел top_k в FTS (`zam_store::search`).
 const TOP_K_MAX: usize = 100;
+/// Кандидатов слитого канала FTS нескольких баз (как `bm25` одной базы в `zam_store`).
+const FTS_CHANNEL_TOP: usize = 50;
 /// Сколько кандидатов слияния (× `top_k`) проходит замену сводок листами: после
 /// слияния сводки с листом выдача короче, нужен запас.
 const OVERSAMPLE: usize = 3;
@@ -155,18 +175,6 @@ enum Expand {
     Graph,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ScopeReq {
-    solution: Option<String>,
-    include_knowledge: Option<bool>,
-    include_rules: Option<bool>,
-    all_solutions: bool,
-    path_prefix: Option<String>,
-    spaces: Option<Vec<String>>,
-    include_human: bool,
-}
-
 #[derive(Deserialize)]
 struct SearchReq {
     query: String,
@@ -178,64 +186,6 @@ struct SearchReq {
     format: Option<OutFormat>,
     expand: Option<Expand>,
     rerank: Option<RerankMode>,
-}
-
-/// Пространства запроса с учётом политики доступа (см. модуль).
-async fn resolve_spaces(
-    db: &Db,
-    p: &Principal,
-    headers: &HeaderMap,
-    sc: &ScopeReq,
-) -> Result<Vec<Space>, ApiError> {
-    let human_ok = matches!(p, Principal::Admin { .. }) && sc.include_human;
-    let mut out: Vec<Space> = Vec::new();
-    if let Some(list) = &sc.spaces {
-        for raw in list {
-            // неизвестная форма или пространство — просто не добавляется
-            let Ok(r) = SpaceRef::parse(raw) else {
-                continue;
-            };
-            match find_space(db, &r).await {
-                Ok(s) => out.push(s),
-                Err(ApiError::NotFound) => {}
-                Err(e) => return Err(e),
-            }
-        }
-    } else {
-        let solution = match &sc.solution {
-            Some(g) => Some(
-                g.trim()
-                    .parse::<SolutionGuid>()
-                    .map_err(|_| ApiError::BadRequest("scope.solution: GUID решения".into()))?,
-            ),
-            // заголовок агента: некорректное значение игнорируется
-            None => headers
-                .get(SOLUTION_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<SolutionGuid>().ok()),
-        };
-        if let Some(g) = solution
-            && let Some(s) = get_solution(db, g.as_str()).await?
-        {
-            out.push(s);
-        }
-        let all = list_spaces(db).await?;
-        for s in all {
-            let take = match s.kind {
-                SpaceKind::Knowledge => sc.include_knowledge.unwrap_or(true),
-                SpaceKind::Rules => sc.include_rules.unwrap_or(true),
-                SpaceKind::Solution => sc.all_solutions,
-                SpaceKind::Human => human_ok,
-            };
-            if take {
-                out.push(s);
-            }
-        }
-    }
-    out.retain(|s| token_can_read(p, s) && (s.kind != SpaceKind::Human || human_ok));
-    out.sort_by_key(|s| s.id);
-    out.dedup_by_key(|s| s.id);
-    Ok(out)
 }
 
 impl SearchSection {
@@ -345,7 +295,13 @@ async fn best_leaves(
     needles: &[String],
     query: Option<(&[f32], &str)>,
 ) -> Result<HashMap<String, LeafRef>, ApiError> {
-    let mut nodes: Vec<Id> = summaries.iter().map(|r| r.node_id).collect();
+    // сводки есть только у узлов
+    let summaries: Vec<&Ranked> = summaries
+        .iter()
+        .copied()
+        .filter(|r| r.target.kind == TargetKind::Node)
+        .collect();
+    let mut nodes: Vec<Id> = summaries.iter().map(|r| r.target.id).collect();
     nodes.sort();
     nodes.dedup();
     if nodes.is_empty() {
@@ -360,7 +316,7 @@ async fn best_leaves(
             .iter()
             .flat_map(|r| {
                 leaves
-                    .get(&r.node_id)
+                    .get(&r.target.id)
                     .into_iter()
                     .flatten()
                     .filter(|l| fits(r, &l.heading_path) && !l.embed_key.is_empty())
@@ -370,9 +326,9 @@ async fn best_leaves(
         need.sort();
         need.dedup();
         let embs = get_embeddings(db, model, &need).await?;
-        for r in summaries {
+        for r in &summaries {
             let best = leaves
-                .get(&r.node_id)
+                .get(&r.target.id)
                 .into_iter()
                 .flatten()
                 .filter(|l| fits(r, &l.heading_path))
@@ -395,7 +351,7 @@ async fn best_leaves(
     // без вектора или без эмбеддингов в кэше — по словам запроса
     if summaries.iter().any(|r| !out.contains_key(&r.chunk_id)) {
         let hits = leaf_term_hits(db, nodes, needles.to_vec()).await?;
-        for r in summaries {
+        for r in &summaries {
             if out.contains_key(&r.chunk_id) {
                 continue;
             }
@@ -403,7 +359,7 @@ async fn best_leaves(
             let mut best: Option<&LeafHit> = None;
             for h in hits
                 .iter()
-                .filter(|h| h.node_id == r.node_id && fits(r, &h.heading_path))
+                .filter(|h| h.node_id == r.target.id && fits(r, &h.heading_path))
             {
                 if best.is_none_or(|b| h.hits > b.hits) {
                     best = Some(h);
@@ -425,6 +381,8 @@ async fn best_leaves(
 
 /// Элемент выдачи до упаковки.
 struct Item {
+    /// Индекс цели (базы) элемента.
+    target: usize,
     hit: FtsHit,
     score: f64,
     sources: Vec<&'static str>,
@@ -445,13 +403,13 @@ fn rerank_text(h: &FtsHit) -> String {
     }
 }
 
-/// Не больше `max` элементов с одного узла, порядок сохраняется.
+/// Не больше `max` элементов с одной цели (узла), порядок сохраняется.
 fn cap_items(items: Vec<Item>, max: usize) -> Vec<Item> {
-    let mut seen: HashMap<Id, usize> = HashMap::new();
+    let mut seen: HashMap<TargetRef, usize> = HashMap::new();
     items
         .into_iter()
         .filter(|it| {
-            let n = seen.entry(it.hit.node_id).or_insert(0);
+            let n = seen.entry(it.hit.target).or_insert(0);
             *n += 1;
             *n <= max
         })
@@ -491,12 +449,12 @@ async fn rerank_items(
 /// `notes`: по одному элементу на узел (лучший чанк), не больше `top_k`.
 fn group_by_node(items: Vec<Item>, top_k: usize) -> Vec<Item> {
     let mut order: Vec<Item> = Vec::new();
-    let mut pos: HashMap<Id, usize> = HashMap::new();
+    let mut pos: HashMap<TargetRef, usize> = HashMap::new();
     for it in items {
-        match pos.get(&it.hit.node_id) {
+        match pos.get(&it.hit.target) {
             Some(&i) => order[i].chunk_ids.push(it.hit.chunk_id),
             None => {
-                pos.insert(it.hit.node_id, order.len());
+                pos.insert(it.hit.target, order.len());
                 order.push(it);
             }
         }
@@ -561,35 +519,43 @@ fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a s
 
 /// `mode=chunks`: текст элементов (с `expand=section|neighbors` — расширенный), не
 /// больше `top_k` элементов. Повторная секция того же узла сливается в первый элемент
-/// (`chunk_ids`), а выдача добирается следующими кандидатами окна.
+/// (`chunk_ids`), а выдача добирается следующими кандидатами окна. Текст секции и соседи
+/// читаются из базы цели элемента.
 async fn expand_items(
-    db: &Db,
+    targets: &[SearchTarget],
     items: Vec<Item>,
     how: Expand,
     top_k: usize,
 ) -> Result<Vec<Item>, ApiError> {
     let mut out: Vec<Item> = Vec::with_capacity(top_k);
-    let mut sections: HashMap<(Id, String), usize> = HashMap::new();
+    let mut sections: HashMap<(TargetRef, String), usize> = HashMap::new();
     let mut contents: HashMap<(Id, i64), Arc<String>> = HashMap::new();
     for mut it in items {
         if out.len() >= top_k {
             break;
         }
+        let db = &targets[it.target].db;
         let base = it.hit.text.clone();
+        // секции и соседние листы — только у узлов
+        let how = if it.hit.target.kind == TargetKind::Node {
+            how
+        } else {
+            Expand::None
+        };
         let text = match how {
             Expand::Section => {
-                let key = (it.hit.node_id, it.hit.heading_path.clone());
+                let key = (it.hit.target, it.hit.heading_path.clone());
                 if let Some(&i) = sections.get(&key) {
                     let ids = std::mem::take(&mut it.chunk_ids);
                     out[i].chunk_ids.extend(ids);
                     continue;
                 }
                 sections.insert(key, out.len());
-                let ck = (it.hit.node_id, it.hit.rev);
+                let ck = (it.hit.target.id, it.hit.rev);
                 let src = match contents.get(&ck) {
                     Some(s) => s.clone(),
                     None => {
-                        let (_, s) = node_content(db, it.hit.node_id, Some(it.hit.rev)).await?;
+                        let (_, s) = node_content(db, it.hit.target.id, Some(it.hit.rev)).await?;
                         let s = Arc::new(s);
                         contents.insert(ck, s.clone());
                         s
@@ -682,8 +648,16 @@ fn round_score(s: f64) -> f64 {
 fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value {
     let h = &p.item.hit;
     let mut o = Map::new();
-    o.insert("node_id".into(), json!(h.node_id));
-    o.insert("space".into(), json!(spaces.get(&h.space_id)));
+    let id_key = match h.target.kind {
+        TargetKind::Node => "node_id",
+        TargetKind::Entry => "entry_id",
+    };
+    o.insert(id_key.into(), json!(h.target.id));
+    let space = spaces.get(&h.space_id);
+    o.insert("space".into(), json!(space));
+    if let Some(g) = space.and_then(|s| s.solution_guid.as_ref()) {
+        o.insert("agent_solution_id".into(), json!(g));
+    }
     o.insert("path".into(), json!(h.path));
     o.insert("heading_path".into(), json!(h.heading_path));
     o.insert("level".into(), json!(h.level));
@@ -726,7 +700,7 @@ fn md_inline(s: &str) -> String {
 fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
     let h = &p.item.hit;
     let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
-    let mut line = format!("{n}. n:{} {space}/{}", h.node_id, h.path);
+    let mut line = format!("{n}. {} {space}/{}", h.target, h.path);
     if !h.heading_path.is_empty() {
         line.push_str(" › ");
         line.push_str(&h.heading_path);
@@ -758,6 +732,26 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
     line
 }
 
+/// Результат чтения базы цели: сбой в базе чужого решения исключает решение (WARN в журнал,
+/// `solution unavailable`) и даёт `None`; сбой личной базы — ошибка запроса.
+fn soft<T>(
+    t: &SearchTarget,
+    r: Result<T, StoreError>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<T>, ApiError> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => match &t.solution {
+            Some(info) => {
+                skip_foreign(info, &e);
+                warnings.push(WARN_SOLUTION_UNAVAILABLE.into());
+                Ok(None)
+            }
+            None => Err(e.into()),
+        },
+    }
+}
+
 /// `POST /search`.
 pub async fn search(
     State(st): State<AppState>,
@@ -786,15 +780,7 @@ pub async fn search(
         )));
     }
     let budget = req.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS);
-    let (user, db) = user_db(&st, &p, &headers).await?;
-    let spaces = resolve_spaces(&db, &p, &headers, &req.scope).await?;
-    let space_ids: Vec<Id> = spaces.iter().map(|s| s.id).collect();
-    // Human в Qdrant нет никогда: векторный запрос — только по остальным пространствам
-    let vec_spaces: Vec<Id> = spaces
-        .iter()
-        .filter(|s| s.kind != SpaceKind::Human)
-        .map(|s| s.id)
-        .collect();
+    let (targets, mut warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
     let prefix = req
         .scope
         .path_prefix
@@ -802,78 +788,125 @@ pub async fn search(
         .map(|p| p.trim_end_matches('/'))
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    // Human в Qdrant нет никогда: векторный запрос — по областям целей без него; цель без
+    // других пространств в фильтр не входит (область без пространств ничего не пропускает)
+    let scopes: Vec<VectorScope> = targets
+        .iter()
+        .filter_map(|t| {
+            let space_ids = t.vector_space_ids();
+            (!space_ids.is_empty()).then_some(VectorScope {
+                user_id: t.owner,
+                space_ids,
+            })
+        })
+        .collect();
     let available = st.index.vector_available();
-    let run_vector = available.is_ok() && !vec_spaces.is_empty() && !req.query.trim().is_empty();
+    let run_vector = available.is_ok() && !scopes.is_empty() && !req.query.trim().is_empty();
 
-    // 1. каналы FTS и векторный — параллельно
+    // 1. каналы FTS (по базе на цель, параллельно) и векторный (один запрос) — параллельно
     let fts = async {
         let t = Instant::now();
-        let r = if space_ids.is_empty() {
-            Ok(FtsChannels::default())
-        } else {
+        let runs = join_all(targets.iter().map(|tg| {
             search_fts_channels(
-                &db,
+                &tg.db,
                 FtsQuery {
                     text: req.query.clone(),
-                    space_ids: space_ids.clone(),
+                    space_ids: tg.space_ids(),
                     path_prefix: prefix.clone(),
                     top_k: TOP_K_MAX,
                 },
             )
-            .await
-        };
-        (r, ms(t))
+        }))
+        .await;
+        (runs, ms(t))
     };
     let vector = async {
         if !run_vector {
             return VectorRun::default();
         }
-        // одна область — личная база (поиск по базам владельцев решений — задача 5 M3)
         let filter = VectorFilter {
+            scopes: scopes.clone(),
             path_prefix: prefix.clone(),
-            ..VectorFilter::scope(user.id, vec_spaces.clone())
+            ..VectorFilter::default()
         };
         vector_channel(&st.index, filter, req.query.clone()).await
     };
-    let ((fts, fts_ms), vrun) = tokio::join!(fts, vector);
-    let fts = fts?;
+    let ((runs, fts_ms), vrun) = tokio::join!(fts, vector);
+    // цель, чья база не прочиталась (чужое решение), исключается из выдачи целиком
+    let mut alive = vec![true; targets.len()];
+    let mut per_db = Vec::with_capacity(targets.len());
+    for (i, r) in runs.into_iter().enumerate() {
+        match soft(&targets[i], r, &mut warnings)? {
+            Some(ch) => per_db.push((i, ch)),
+            None => alive[i] = false,
+        }
+    }
+    let fts = merge_channels(per_db, FTS_CHANNEL_TOP);
 
-    // 2. векторные хиты — только живые чанки области по SQLite
+    // 2. векторные хиты — в базу своего владельца, только живые чанки пространств цели
     let fuse_t = Instant::now();
-    let mut hits: HashMap<String, FtsHit> = HashMap::new();
-    for h in fts.bm25.iter().chain(&fts.trigram) {
-        hits.entry(h.chunk_id.clone()).or_insert_with(|| h.clone());
+    let mut hits: HashMap<String, (usize, FtsHit)> = HashMap::new();
+    for (t, h) in fts.bm25.iter().chain(&fts.trigram) {
+        hits.entry(h.chunk_id.clone())
+            .or_insert_with(|| (*t, h.clone()));
     }
     let vector_ids: Option<Vec<String>> = match &vrun.hits {
         Some(vh) => {
-            let ids: Vec<String> = vh.iter().map(|h| h.chunk_id.clone()).collect();
-            let live = live_chunks(
-                &db,
-                ids,
-                ChunkScope {
-                    space_ids: vec_spaces.clone(),
+            let mut live: HashMap<String, (usize, FtsHit)> = HashMap::new();
+            for (i, t) in targets.iter().enumerate() {
+                if !alive[i] {
+                    continue;
+                }
+                let ids: Vec<String> = vh
+                    .iter()
+                    .filter(|h| h.user_id == t.owner)
+                    .map(|h| h.chunk_id.clone())
+                    .collect();
+                if ids.is_empty() {
+                    continue;
+                }
+                let scope = ChunkScope {
+                    space_ids: t.vector_space_ids(),
                     path_prefix: prefix.clone(),
                     indexable_only: true,
-                },
-            )
-            .await?;
-            let ids = live.iter().map(|h| h.chunk_id.clone()).collect();
-            for h in live {
-                hits.entry(h.chunk_id.clone()).or_insert(h);
+                };
+                match soft(t, live_chunks(&t.db, ids, scope).await, &mut warnings)? {
+                    Some(found) => {
+                        for h in found {
+                            live.entry(h.chunk_id.clone()).or_insert((i, h));
+                        }
+                    }
+                    None => alive[i] = false,
+                }
+            }
+            // порядок векторного канала; хит засчитывается только из базы своего владельца
+            let ids: Vec<String> = vh
+                .iter()
+                .filter(|h| {
+                    live.get(&h.chunk_id)
+                        .is_some_and(|(i, _)| targets[*i].owner == h.user_id)
+                })
+                .map(|h| h.chunk_id.clone())
+                .collect();
+            for (id, v) in live {
+                hits.entry(id).or_insert(v);
             }
             Some(ids)
         }
         None => None,
     };
+    // база, не прочитавшаяся при проверке векторных хитов, — вне выдачи целиком (кандидаты
+    // без метаданных `fuse` отбрасывает)
+    hits.retain(|_, (i, _)| alive[*i]);
 
     // 3. слияние, сводки → листы
     let chunks: HashMap<String, ChunkMeta> = hits
         .iter()
-        .filter_map(|(id, h)| {
+        .filter_map(|(id, (_, h))| {
             Some((
                 id.clone(),
                 ChunkMeta {
-                    node_id: h.node_id,
+                    target: h.target,
                     level: Level::parse(&h.level)?,
                     heading_path: h.heading_path.clone(),
                     updated_at: h.updated_at,
@@ -883,19 +916,24 @@ pub async fn search(
         .collect();
     // чанки, которых векторный канал не видит (Human, узел не проиндексирован): ослабленный
     // bm25 для них не понижается — иначе такая находка проигрывает всем векторным кандидатам
-    let human: Vec<Id> = spaces
+    let human: HashSet<Id> = targets
         .iter()
+        .flat_map(|t| &t.spaces)
         .filter(|s| s.kind == SpaceKind::Human)
         .map(|s| s.id)
         .collect();
     let vector_blind = hits
         .values()
-        .filter(|h| human.contains(&h.space_id) || h.index_state != "indexed")
-        .map(|h| h.chunk_id.clone())
+        .filter(|(_, h)| human.contains(&h.space_id) || h.index_state != "indexed")
+        .map(|(_, h)| h.chunk_id.clone())
         .collect();
     let inputs = SearchInputs {
-        fts: fts.bm25.iter().map(|h| h.chunk_id.clone()).collect(),
-        trigram: fts.trigram.iter().map(|h| h.chunk_id.clone()).collect(),
+        fts: fts.bm25.iter().map(|(_, h)| h.chunk_id.clone()).collect(),
+        trigram: fts
+            .trigram
+            .iter()
+            .map(|(_, h)| h.chunk_id.clone())
+            .collect(),
         vector: vector_ids,
         chunks,
         // ослабленный bm25 (ни один чанк не содержит всех слов запроса) — свой вес
@@ -916,23 +954,36 @@ pub async fn search(
     // сводки за окном без своего листа — прочь (лист им не выбирается); листы ищутся
     // для сводок окна, а наличие листа проверяется по всему списку
     let ranked = drop_unresolved_tail(ranked, window);
-    let summaries = summaries_without_leaf(&ranked, window);
-    let mut best = best_leaves(&db, &summaries, &needles, query_vec).await?;
-    // листы-замены — живые чанки области; не нашёлся (узел перезаписан между чтениями) —
-    // сводка остаётся как есть
-    let missing: Vec<String> = best
-        .values()
-        .filter(|l| !hits.contains_key(&l.chunk_id))
-        .map(|l| l.chunk_id.clone())
-        .collect();
-    if !missing.is_empty() {
-        let scope = ChunkScope {
-            space_ids: space_ids.clone(),
-            path_prefix: prefix.clone(),
-            indexable_only: false,
-        };
-        for h in live_chunks(&db, missing, scope).await? {
-            hits.insert(h.chunk_id.clone(), h);
+    let mut best: HashMap<String, LeafRef> = HashMap::new();
+    {
+        // листы сводок — в базе цели сводки
+        let mut by_target: HashMap<usize, Vec<&Ranked>> = HashMap::new();
+        for r in summaries_without_leaf(&ranked, window) {
+            if let Some((i, _)) = hits.get(&r.chunk_id) {
+                by_target.entry(*i).or_default().push(r);
+            }
+        }
+        for (i, group) in by_target {
+            let t = &targets[i];
+            let found = best_leaves(&t.db, &group, &needles, query_vec).await?;
+            // листы-замены — живые чанки области цели; не нашёлся (узел перезаписан между
+            // чтениями) — сводка остаётся как есть
+            let missing: Vec<String> = found
+                .values()
+                .filter(|l| !hits.contains_key(&l.chunk_id))
+                .map(|l| l.chunk_id.clone())
+                .collect();
+            if !missing.is_empty() {
+                let scope = ChunkScope {
+                    space_ids: t.space_ids(),
+                    path_prefix: prefix.clone(),
+                    indexable_only: false,
+                };
+                for h in live_chunks(&t.db, missing, scope).await? {
+                    hits.insert(h.chunk_id.clone(), (i, h));
+                }
+            }
+            best.extend(found);
         }
     }
     best.retain(|summary, l| {
@@ -943,7 +994,7 @@ pub async fn search(
         ok
     });
     let ranked = note_to_leaf(ranked, |r| best.get(&r.chunk_id).cloned());
-    // лимит на узел — после замены сводок листами
+    // лимит на цель — после замены сводок листами
     let mut ranked = cap_per_node(ranked, weights.max_per_node);
     let rerank_on = req.rerank == Some(RerankMode::On);
     // реранку — не меньше `rerank_top` кандидатов, даже при малом top_k
@@ -956,11 +1007,13 @@ pub async fn search(
     let items: Vec<Item> = ranked
         .into_iter()
         .filter_map(|r| {
-            let mut hit = hits.get(&r.chunk_id)?.clone();
+            let (target, hit) = hits.get(&r.chunk_id)?;
+            let mut hit = hit.clone();
             if hit.snippet.is_empty() {
                 hit.snippet = text_snippet(&hit.text, &needles);
             }
             Some(Item {
+                target: *target,
                 chunk_ids: vec![hit.chunk_id.clone()],
                 hit,
                 score: r.score,
@@ -974,16 +1027,15 @@ pub async fn search(
     let fuse_ms = ms(fuse_t);
 
     // 4. серверный реранк; пересборка индекса — предупреждение о неполной векторной выдаче
-    let mut warnings: Vec<&'static str> = Vec::new();
     if st.index.reindexing() {
-        warnings.push(crate::index_state::WARN_REINDEXING);
+        warnings.push(crate::index_state::WARN_REINDEXING.into());
     }
     let mut rerank_ms = None;
     let items = if rerank_on && !items.is_empty() {
         let t = Instant::now();
         let (items, warning) = rerank_items(&st, &req.query, items).await;
         rerank_ms = Some(ms(t));
-        warnings.extend(warning);
+        warnings.extend(warning.map(String::from));
         items
     } else {
         items
@@ -993,25 +1045,37 @@ pub async fn search(
     let expand_t = Instant::now();
     let mut items = match mode {
         SearchMode::Notes => group_by_node(items, top_k),
-        SearchMode::Chunks => expand_items(&db, items, expand, top_k).await?,
+        SearchMode::Chunks => expand_items(&targets, items, expand, top_k).await?,
         SearchMode::Brief => items.into_iter().take(top_k).collect(),
     };
-    match mode {
-        SearchMode::Notes => {
-            for it in &mut items {
-                it.l0 = get_node(&db, it.hit.node_id).await?.l0;
+    if mode == SearchMode::Notes {
+        for it in &mut items {
+            if it.hit.target.kind == TargetKind::Node {
+                it.l0 = get_node(&targets[it.target].db, it.hit.target.id).await?.l0;
             }
         }
-        SearchMode::Chunks | SearchMode::Brief => {}
     }
     let expand_ms = ms(expand_t);
-    // заметки области, ещё не прошедшие векторную индексацию (без `index: false` и Human)
+    // заметки области всех целей, ещё не прошедшие векторную индексацию (без `index: false`
+    // и Human)
     let pending_t = Instant::now();
-    let pending = pending_count(&db, space_ids.clone(), prefix.clone()).await?;
+    let mut pending = 0;
+    for (i, t) in targets.iter().enumerate() {
+        if !alive[i] {
+            continue;
+        }
+        let r = pending_count(&t.db, t.space_ids(), prefix.clone()).await;
+        pending += soft(t, r, &mut warnings)?.unwrap_or(0);
+    }
     let pending_ms = ms(pending_t);
+    dedup_keep_order(&mut warnings);
     let packed = pack_items(items, mode, budget);
     let degraded = available.err().or(vrun.failed);
-    let by_id: HashMap<Id, Space> = spaces.into_iter().map(|s| (s.id, s)).collect();
+    let by_id: HashMap<Id, Space> = targets
+        .into_iter()
+        .flat_map(|t| t.spaces)
+        .map(|s| (s.id, s))
+        .collect();
 
     Ok(match format {
         OutFormat::Json => {
@@ -1070,7 +1134,10 @@ mod tests {
     fn hit(node: Id, text: &str) -> FtsHit {
         FtsHit {
             chunk_id: format!("c{}", text.len()),
-            node_id: node,
+            target: TargetRef {
+                kind: TargetKind::Node,
+                id: node,
+            },
             space_id: Id::new(),
             path: "p".into(),
             heading_path: String::new(),
@@ -1078,6 +1145,7 @@ mod tests {
             rev: 1,
             token_count: count_tokens(text) as i64,
             score: 1.0,
+            raw_score: 0.0,
             updated_at: jiff::Timestamp::now(),
             snippet: format!("{MARK_START}s{MARK_END}"),
             text: text.into(),
@@ -1088,6 +1156,7 @@ mod tests {
     fn items(hits: Vec<FtsHit>, with_text: bool) -> Vec<Item> {
         hits.into_iter()
             .map(|h| Item {
+                target: 0,
                 chunk_ids: vec![h.chunk_id.clone()],
                 text: with_text.then(|| (h.text.clone(), h.token_count as usize)),
                 hit: h,
@@ -1304,7 +1373,7 @@ mod tests {
         let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         let want = format!(
             "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · ~7 tok\n   **s**\n",
-            p.item.hit.node_id
+            p.item.hit.target.id
         );
         assert_eq!(s, want);
     }

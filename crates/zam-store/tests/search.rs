@@ -106,7 +106,7 @@ async fn russian_word_found_by_prefix_and_case() {
     let hits = search_fts(&db, q("Скрипт", &[k])).await.unwrap();
     assert_eq!(hits.len(), 1);
     let h = &hits[0];
-    assert_eq!(h.node_id, id);
+    assert_eq!(h.target.id, id);
     assert_eq!(h.space_id, k);
     assert_eq!(h.path, "Инструменты/Bash скрипты");
     assert_eq!(h.heading_path, "Обзор");
@@ -656,7 +656,7 @@ async fn note_level_only_when_no_leaf_matches() {
         .await
         .unwrap();
     assert_eq!(hits.len(), 1, "{hits:?}");
-    assert_eq!((hits[0].node_id, hits[0].heading_path.as_str()), (id, ""));
+    assert_eq!((hits[0].target.id, hits[0].heading_path.as_str()), (id, ""));
 }
 
 // ---------- каналы и проверка векторных хитов (M2) ----------
@@ -671,9 +671,9 @@ async fn channels_are_separate_and_ordered() {
         .unwrap();
     // строгий bm25: оба слова есть только у a (лист и L1 заметки — без правила
     // «сводка только без листа»); trigram — по идентификатору
-    assert!(ch.bm25.iter().all(|h| h.node_id == a), "{:?}", ch.bm25);
+    assert!(ch.bm25.iter().all(|h| h.target.id == a), "{:?}", ch.bm25);
     assert!(ch.bm25.iter().any(|h| h.level == "chunk"));
-    assert_eq!(ch.trigram[0].node_id, a);
+    assert_eq!(ch.trigram[0].target.id, a);
     assert_eq!(ch.bm25[0].score, 1.0);
     assert!(ch.bm25[0].token_count > 0);
     assert!(ch.bm25[0].snippet.contains(MARK_START));
@@ -682,13 +682,20 @@ async fn channels_are_separate_and_ordered() {
     let ch = zam_store::search_fts_channels(&db, q("настройка редактора git", &[k]))
         .await
         .unwrap();
-    let mut got: Vec<Id> = ch.bm25.iter().map(|h| h.node_id).collect();
+    let mut got: Vec<Id> = ch.bm25.iter().map(|h| h.target.id).collect();
     got.sort();
     got.dedup();
     let mut want = vec![a, b];
     want.sort();
     assert_eq!(got, want);
     assert_eq!(ch.bm25[1].score, 0.5);
+    // сырой bm25 канала: отрицательный, по возрастанию (меньше — лучше)
+    assert!(ch.bm25.iter().all(|h| h.raw_score < 0.0), "{:?}", ch.bm25);
+    assert!(
+        ch.bm25.windows(2).all(|w| w[0].raw_score <= w[1].raw_score),
+        "{:?}",
+        ch.bm25
+    );
     assert!(ch.trigram.is_empty());
     // все слова не встретились ни в одном чанке — сработал ослабленный запрос
     assert!(ch.relaxed);

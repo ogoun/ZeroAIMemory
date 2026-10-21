@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
-use zam_core::Id;
+use zam_core::TargetRef;
 
 use crate::adjust::recency_factor;
 
@@ -78,7 +78,8 @@ impl Level {
 /// Метаданные чанка из SQLite (только живые чанки области).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkMeta {
-    pub node_id: Id,
+    /// Цель чанка (узел или запись журнала): по ней — лимит на цель и замена сводки листом.
+    pub target: TargetRef,
     pub level: Level,
     /// Путь заголовков (`A > B`): секция сводки уровня `section` и листа.
     pub heading_path: String,
@@ -140,7 +141,7 @@ impl Default for Weights {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ranked {
     pub chunk_id: String,
-    pub node_id: Id,
+    pub target: TargetRef,
     pub level: Level,
     /// Путь заголовков чанка.
     pub heading_path: String,
@@ -202,7 +203,7 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
             let score = if max > 0.0 { raw * decay / max } else { 0.0 };
             Ranked {
                 chunk_id: id.to_string(),
-                node_id: m.node_id,
+                target: m.target,
                 level: m.level,
                 heading_path: m.heading_path.clone(),
                 score,
@@ -221,6 +222,7 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zam_core::{Id, TargetKind};
 
     fn now() -> Timestamp {
         "2026-10-19T12:00:00Z".parse().unwrap()
@@ -234,7 +236,10 @@ mod tests {
                 (
                     c.to_string(),
                     ChunkMeta {
-                        node_id: *n,
+                        target: TargetRef {
+                            kind: TargetKind::Node,
+                            id: *n,
+                        },
                         level: Level::Chunk,
                         heading_path: String::new(),
                         updated_at: now(),

@@ -626,7 +626,7 @@ POST /api/v1/search
    - `graph` — по §8.5.
 8. **Упаковка в `budget_tokens`.**
    - Каждый элемент: `node_id|entry_id`, `space`, `path`, `heading_path`, `locator`, `rev`, `chunk_ids`, `score`, `updated_at`, `status`, `kind`, `text`.
-   - Весь ответ: `degraded`, `pending_count`, `warnings`, `timings` (`fts_ms`, `embed_ms`, `vector_ms`, `fuse_ms`, `rerank_ms`, `expand_ms`, `pending_ms`, `total_ms`). `warnings` — коды предупреждений: `reranker not installed`, `reranker failed`, `index rebuilding` (идёт reindex или пересборка индекса после потери хранилища Qdrant — векторная выдача может быть неполной) **[решение исполнителя, M2]**.
+   - Весь ответ: `degraded`, `pending_count`, `warnings`, `timings` (`fts_ms`, `embed_ms`, `vector_ms`, `fuse_ms`, `rerank_ms`, `expand_ms`, `pending_ms`, `total_ms`). `warnings` — коды предупреждений: `reranker not installed`, `reranker failed`, `index rebuilding` (идёт reindex или пересборка индекса после потери хранилища Qdrant — векторная выдача может быть неполной) **[решение исполнителя, M2]**; `solution access pending|rejected|revoked` (§9.1) и `solution unavailable` — база владельца решения не открылась или не читается, решение исключено, ответ строится по остальным базам **[решение исполнителя, M3]**. Элемент из решения (своего или чужого) несёт `agent_solution_id`.
 
 ### 9.3. Выжимку делает агент: протокол с экономией токенов
 

@@ -687,7 +687,7 @@ async fn migrate_from_v3_rechunks_once() {
     )
     .await
     .unwrap();
-    assert!(found.iter().any(|f| f.node_id == n1));
+    assert!(found.iter().any(|f| f.target.id == n1));
     drop((db, dbs));
 
     // повторное открытие перечанковку не повторяет
@@ -727,7 +727,7 @@ async fn bench_write_until_fts_1000_notes() {
         .await
         .unwrap();
         lat.push(t.elapsed());
-        assert!(found.iter().any(|h| h.node_id == id));
+        assert!(found.iter().any(|h| h.target.id == id));
     }
     lat.sort();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;

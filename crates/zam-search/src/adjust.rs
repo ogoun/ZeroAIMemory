@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use jiff::Timestamp;
-use zam_core::Id;
+use zam_core::TargetRef;
 
 use crate::hybrid::{Level, Ranked};
 
@@ -45,11 +45,11 @@ pub fn in_section(leaf: &str, section: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(" > "))
 }
 
-/// Подходит ли лист `leaf` на замену сводке `s`: тот же узел, для `section` — та же
+/// Подходит ли лист `leaf` на замену сводке `s`: та же цель (узел), для `section` — та же
 /// секция (или вложенная).
 fn leaf_fits(s: &Ranked, leaf: &Ranked) -> bool {
     leaf.level == Level::Chunk
-        && leaf.node_id == s.node_id
+        && leaf.target == s.target
         && (s.level == Level::Note || in_section(&leaf.heading_path, &s.heading_path))
 }
 
@@ -119,11 +119,12 @@ pub fn note_to_leaf(r: Vec<Ranked>, best_leaf: impl Fn(&Ranked) -> Option<LeafRe
     out
 }
 
-/// Не больше `max` элементов с одного узла (§9.2 п. 6), порядок сохраняется.
+/// Не больше `max` элементов с одной цели — узла или записи журнала (§9.2 п. 6), порядок
+/// сохраняется.
 pub fn cap_per_node(mut r: Vec<Ranked>, max: usize) -> Vec<Ranked> {
-    let mut per_node: HashMap<Id, usize> = HashMap::new();
+    let mut per_node: HashMap<TargetRef, usize> = HashMap::new();
     r.retain(|x| {
-        let n = per_node.entry(x.node_id).or_default();
+        let n = per_node.entry(x.target).or_default();
         *n += 1;
         *n <= max.max(1)
     });
@@ -154,6 +155,7 @@ fn merge(into: &mut Ranked, x: Ranked) {
 mod tests {
     use super::*;
     use jiff::SignedDuration;
+    use zam_core::Id;
 
     fn r(chunk: &str, node: Id, level: Level, score: f64, src: &'static str) -> Ranked {
         rh(chunk, node, level, "", score, src)
@@ -162,7 +164,10 @@ mod tests {
     fn rh(chunk: &str, node: Id, level: Level, hp: &str, score: f64, src: &'static str) -> Ranked {
         Ranked {
             chunk_id: chunk.into(),
-            node_id: node,
+            target: TargetRef {
+                kind: zam_core::TargetKind::Node,
+                id: node,
+            },
             level,
             heading_path: hp.into(),
             score,
@@ -278,7 +283,7 @@ mod tests {
             r("c-none", Id::new(), Level::Note, 0.4, "fts"),
         ];
         let out = note_to_leaf(list, |x| {
-            if x.node_id == b {
+            if x.target.id == b {
                 leaf("b-leaf", "")
             } else {
                 None
