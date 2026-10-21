@@ -801,9 +801,13 @@ impl Worker {
                 tracing::warn!(error = %e, "аудит index.reindex_done не записан");
             }
         }
+        // свёртки папок без кэша видны в статусе вместе с итогом: покой воркера
+        // (`rollups_pending == 0`) не наступает раньше, чем они построены
+        let rollups = self.rollups.due.len();
         self.status(|s| {
             s.reindex_queued = left;
             s.last_reindex = Some(outcome);
+            s.rollups_pending = rollups;
         });
         // базы, которые reindex не открыл, он отметил в system.db
         self.load_skipped().await;

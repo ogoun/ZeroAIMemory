@@ -108,6 +108,9 @@ pub struct ReindexReport {
     pub recreated: bool,
     /// Базы, которые не удалось обработать: `(пользователь, ошибка)`.
     pub failed_users: Vec<(Id, String)>,
+    /// Сколько из них не получили отметку исключения в `system.db` (`index_skip` не записан):
+    /// такая база не восстановится сама, поэтому флаг стёртого хранилища снимать нельзя.
+    pub skip_unrecorded: usize,
     pub elapsed_ms: u64,
     /// Чтение страниц и кэша из SQLite, мс (идёт параллельно с записью).
     pub read_ms: u64,
@@ -228,6 +231,7 @@ pub async fn reindex(
     for (u, e) in &rep.failed_users {
         if let Err(se) = ctx.system.index_skip(*u, e, 1).await {
             tracing::warn!(user = %u, error = %se, "отметка исключённой базы не записана");
+            rep.skip_unrecorded += 1;
         }
     }
     rep.elapsed_ms = started.elapsed().as_millis() as u64;

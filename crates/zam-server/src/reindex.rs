@@ -97,7 +97,7 @@ pub async fn run(cfg: ServerConfig, args: ReindexArgs) -> anyhow::Result<String>
         let rep = reindex(&ctx, &req).await?;
         // все базы пересобраны (неоткрывшиеся отмечены исключёнными и получат reindex,
         // когда откроются): стёртое хранилище восстановлено, флаг не нужен
-        if sup.storage_rebuilt() && (user.is_none() || rep.recreated) {
+        if may_ack_storage(sup.storage_rebuilt(), user.is_none(), &rep) {
             sup.ack_storage_rebuilt()?;
         }
         system
@@ -127,6 +127,14 @@ pub async fn run(cfg: ServerConfig, args: ReindexArgs) -> anyhow::Result<String>
     }
     sup.shutdown().await;
     Ok(report(&res?, embedder.model_id()))
+}
+
+/// Снимать ли флаг стёртого хранилища `.zam-reindex`: пересобраны все базы (команда без
+/// `--user` или коллекция создана заново), а каждая необработанная база отмечена исключённой
+/// в `system.db` — иначе она не восстановится сама, и флаг оставляется: сервер повторит
+/// пересборку при старте.
+fn may_ack_storage(storage_rebuilt: bool, all_users: bool, rep: &ReindexReport) -> bool {
+    storage_rebuilt && (all_users || rep.recreated) && rep.skip_unrecorded == 0
 }
 
 /// Ждёт готовности Qdrant (managed — `Ready`, external — ответ на запрос с ключом).
@@ -177,6 +185,13 @@ fn report(r: &ReindexReport, model: &str) -> String {
             r.jobs, r.misses
         ));
     }
+    if r.skip_unrecorded > 0 {
+        out.push_str(&format!(
+            "\nотметки исключённых баз не записаны ({}): флаг пересборки хранилища оставлен, \
+             сервер повторит пересборку при старте",
+            r.skip_unrecorded
+        ));
+    }
     for (u, e) in &r.failed_users {
         out.push_str(&format!(
             "\nбаза пользователя {u} не обработана и исключена из пересборки ({e}); \
@@ -184,4 +199,37 @@ fn report(r: &ReindexReport, model: &str) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_flag_kept_when_skip_marks_unrecorded() {
+        let mut rep = ReindexReport::default();
+        assert!(may_ack_storage(true, true, &rep));
+        assert!(
+            !may_ack_storage(false, true, &rep),
+            "хранилище не стиралось"
+        );
+        assert!(!may_ack_storage(true, false, &rep), "одна база — не все");
+        rep.recreated = true;
+        assert!(
+            may_ack_storage(true, false, &rep),
+            "новая коллекция: пересобраны все"
+        );
+        rep.failed_users
+            .push((zam_core::Id::new(), "повреждена".into()));
+        assert!(
+            may_ack_storage(true, true, &rep),
+            "исключённая база отмечена"
+        );
+        rep.skip_unrecorded = 1;
+        assert!(
+            !may_ack_storage(true, true, &rep),
+            "отметка не записана — флаг остаётся"
+        );
+        assert!(report(&rep, "m").contains("флаг пересборки хранилища оставлен"));
+    }
 }

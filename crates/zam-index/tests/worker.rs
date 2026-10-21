@@ -745,6 +745,12 @@ async fn reindex_from_cache_without_inference() {
     assert_eq!((rep.nodes, rep.misses, rep.jobs, rep.folders), (2, 1, 1, 0));
     assert_eq!(rep.folder_misses, 1);
     assert_eq!(rep.missed_folders.len(), 1);
+    // свёртка папки без кэша видна в статусе сразу с итогом reindex (или уже выполнена)
+    let pending = w.status().rollups_pending;
+    assert!(
+        pending >= 1 || e.count(None, Some("docs"), &["folder"]).await == 1,
+        "rollups_pending = {pending} до свёртки папки"
+    );
     assert_eq!(rep.points, e.chunks(a).await + e.chunks(r).await);
     assert!(rep.gc_deleted >= 1, "{rep:?}");
     assert!(
