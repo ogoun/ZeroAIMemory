@@ -895,9 +895,6 @@ pub fn text_snippet(text: &str, needles: &[&str]) -> String {
     s
 }
 
-/// Сколько живых заметок в `space_ids` (и под `path_prefix`, если задан) ждут
-/// векторной индексации (`index_state = 'pending'`) — `pending_count` выдачи поиска.
-/// Заметки с `index: false` (`excluded`) не считаются.
 /// Запрос [`pending_count`]: условия совпадают с частичным индексом `nodes_pending`
 /// (миграция 0006), поэтому считаются только заметки в очереди.
 const PENDING_COUNT_SQL: &str = "SELECT count(*) FROM nodes n
@@ -905,6 +902,9 @@ const PENDING_COUNT_SQL: &str = "SELECT count(*) FROM nodes n
        AND n.space_id IN (SELECT value FROM json_each(?1))
        AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')";
 
+/// Сколько живых заметок в `space_ids` (и под `path_prefix`, если задан) ждут
+/// векторной индексации (`index_state = 'pending'`) — `pending_count` выдачи поиска.
+/// Заметки с `index: false` (`excluded`) не считаются.
 pub async fn pending_count(
     db: &Db,
     space_ids: Vec<Id>,
