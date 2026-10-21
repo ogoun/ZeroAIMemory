@@ -605,10 +605,12 @@ fn killed_server_takes_qdrant_down_and_restarts_with_long_data_dir() {
     assert!(!srv.running());
 }
 
-/// Windows: каталог данных на символ длиннее предела — сервер и команды CLI (миграции,
-/// загрузки моделей и CUDA, управление Qdrant) не стартуют и называют
-/// причину и способ её устранить (без проверки SQLite отказал бы позже с «unable to open
-/// database file»). Модели и Qdrant не нужны.
+/// Windows: каталог данных на символ длиннее предела — сервер и команды CLI, которым нужен
+/// каталог данных (миграции, загрузка моделей в `<data_dir>/models`, управление Qdrant), не
+/// стартуют и называют причину и способ её устранить (без проверки SQLite отказал бы позже
+/// с «unable to open database file»). Команды, которым каталог данных не нужен (`cuda fetch`,
+/// `qdrant fetch`, `models` при заданном `ml.models_dir`), длину не проверяют. Модели и Qdrant
+/// не нужны.
 #[cfg(windows)]
 #[test]
 fn too_long_data_dir_fails_with_hint() {
@@ -617,30 +619,51 @@ fn too_long_data_dir_fails_with_hint() {
     data.as_mut_os_string().push("ж");
     let missing = root.join("нет.toml");
     let missing = missing.to_str().unwrap();
+    let models = root.join("models");
+    let models = models.to_str().unwrap();
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let out = common::process::command()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data)
+            .envs(env.iter().copied())
+            .output()
+            .expect("запуск zam-server");
+        assert!(!out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let too_long = |err: &str| {
+        err.contains("слишком длинный") && err.contains("MAX_PATH") && err.contains("--data-dir")
+    };
     // каждая команда с каталогом данных проверяет длину до работы; у загрузок манифест
     // заведомо отсутствует — без проверки длины ошибка была бы о манифесте, а не сеть
     let cmds: [&[&str]; 5] = [
         &["migrate"],
         &["models", "fetch", "--manifest", missing],
-        &["cuda", "fetch", "--manifest", missing],
+        &["models", "status", "--manifest", missing],
         &["qdrant", "status"],
         &["qdrant", "reset", "--yes"],
     ];
     for args in cmds {
-        let out = common::process::command()
-            .args(args)
-            .arg("--data-dir")
-            .arg(&data)
-            .output()
-            .expect("запуск zam-server");
-        assert!(!out.status.success(), "{args:?}");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            err.contains("слишком длинный")
-                && err.contains("MAX_PATH")
-                && err.contains("--data-dir"),
-            "{args:?}: {err}"
-        );
+        let err = run(args, &[]);
+        assert!(too_long(&err), "{args:?}: {err}");
+    }
+    // каталог данных не нужен: ошибка — об отсутствующем манифесте, а не о длине пути
+    let free: [(&[&str], &[(&str, &str)]); 4] = [
+        (&["cuda", "fetch", "--manifest", missing], &[]),
+        (&["qdrant", "fetch", "--manifest", missing], &[]),
+        (
+            &["models", "fetch", "--manifest", missing],
+            &[("ZAM_ML__MODELS_DIR", models)],
+        ),
+        (
+            &["models", "status", "--manifest", missing],
+            &[("ZAM_ML__MODELS_DIR", models)],
+        ),
+    ];
+    for (args, env) in free {
+        let err = run(args, env);
+        assert!(!too_long(&err) && err.contains("нет.toml"), "{args:?}: {err}");
     }
     assert!(!data.exists(), "каталог данных создан");
 }

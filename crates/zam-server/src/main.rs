@@ -146,16 +146,32 @@ struct Opts {
     data_dir: Option<PathBuf>,
 }
 
+/// Конфигурация команды, которой нужен каталог данных: на Windows слишком длинный путь —
+/// ошибка сразу, а не после долгой загрузки моделей или открытия баз.
 fn load(o: Opts) -> anyhow::Result<ServerConfig> {
+    let cfg = load_config(o)?;
+    zam_store::check_data_dir_len(&cfg.data_dir)?;
+    Ok(cfg)
+}
+
+/// Конфигурация без проверки длины каталога данных: для команд, которые его не трогают
+/// (`cuda fetch`, `qdrant fetch`, `models` при заданном `ml.models_dir`).
+fn load_config(o: Opts) -> anyhow::Result<ServerConfig> {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let cli = CliOverrides {
         bind: o.bind,
         data_dir: o.data_dir,
     };
-    let cfg = config::load(o.config.as_deref(), &env, &cli)?;
-    // все команды с каталогом данных: на Windows слишком длинный путь — ошибка сразу,
-    // а не после долгой загрузки моделей или CUDA
-    zam_store::check_data_dir_len(&cfg.data_dir)?;
+    Ok(config::load(o.config.as_deref(), &env, &cli)?)
+}
+
+/// Конфигурация команд `models`: модели лежат в `<data_dir>/models`, если `ml.models_dir`
+/// не задан, — тогда длина каталога данных проверяется.
+fn load_for_models(o: Opts) -> anyhow::Result<ServerConfig> {
+    let cfg = load_config(o)?;
+    if cfg.ml.models_dir.is_none() {
+        zam_store::check_data_dir_len(&cfg.data_dir)?;
+    }
     Ok(cfg)
 }
 
@@ -216,7 +232,7 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<()> {
             accept_nc_license,
             manifest,
         } => {
-            let cfg = load(opts)?;
+            let cfg = load_for_models(opts)?;
             let m = models::load_manifest(manifest.as_deref())?;
             let device = device.unwrap_or_else(|| models::default_device(&cfg));
             let dir = cfg.ml.models_dir(&cfg.data_dir);
@@ -240,7 +256,7 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<()> {
             verify,
             manifest,
         } => {
-            let cfg = load(opts)?;
+            let cfg = load_for_models(opts)?;
             let m = models::load_manifest(manifest.as_deref())?;
             let out = tokio::task::spawn_blocking(move || models::status(&m, &cfg, verify)).await?;
             println!("{out}");
@@ -256,7 +272,7 @@ async fn cuda_cmd(cmd: CudaCmd) -> anyhow::Result<()> {
             manifest,
             json,
         } => {
-            let cfg = load(opts)?;
+            let cfg = load_config(opts)?;
             let m = zam_server::cuda::load_manifest(manifest.as_deref())?;
             let report = tokio::task::spawn_blocking(move || {
                 // с --json прогресс идёт в stderr: в stdout — только итог
@@ -284,7 +300,7 @@ async fn qdrant_cmd(cmd: QdrantCmd) -> anyhow::Result<()> {
     let exe_dir = qdrant::exe_dir()?;
     match cmd {
         QdrantCmd::Fetch { opts, manifest } => {
-            let cfg = load(opts)?;
+            let cfg = load_config(opts)?;
             let m = qdrant::load_manifest(manifest.as_deref())?;
             let binary = cfg.qdrant.binary_path(&exe_dir);
             // ureq блокирующий: загрузка вне потоков runtime.
