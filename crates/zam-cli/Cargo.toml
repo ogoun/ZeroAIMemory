@@ -21,6 +21,7 @@ toml.workspace = true
 
 [dev-dependencies]
 zam-server = { path = "../zam-server" }
+zam-store = { path = "../zam-store" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 axum.workspace = true
 assert_cmd.workspace = true

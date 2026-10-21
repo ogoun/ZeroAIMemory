@@ -194,7 +194,7 @@ async fn solutions_idempotent_and_addressable() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let s1 = r.json();
     assert_eq!(s1["kind"], "solution");
-    assert_eq!(s1["solution_guid"], guid.to_lowercase());
+    assert_eq!(s1["agent_solution_id"], guid.to_lowercase());
     let r = a
         .t(
             Method::POST,

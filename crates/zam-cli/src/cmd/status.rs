@@ -1,4 +1,5 @@
-//! `zam status`: сервер, токен, пользователь, solution.toml (M0, холодный старт ≤ 20 мс).
+//! `zam status`: сервер, токен, пользователь, solution.toml, роль в решении и число
+//! ожидающих запросов доступа к решениям пользователя (M0, холодный старт ≤ 20 мс).
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -72,6 +73,8 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
         user: None,
         access: None,
         solution,
+        role: None,
+        pending: None,
     };
 
     // 2. токен: /spaces
@@ -88,6 +91,18 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
             let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             rep.user = Some((str_of(&v["user"]["name"]), str_of(&v["user"]["id"])));
             rep.access = Some(str_of(&v["access"]));
+            rep.pending = v["access_requests_pending"].as_u64();
+            if let Some(path) = &rep.solution
+                && let Ok(s) = crate::target::load_solution(path)
+            {
+                rep.role = Some(solution_role(
+                    &agent,
+                    &rep.url.value,
+                    &token.value,
+                    &v,
+                    &s.id,
+                ));
+            }
             rep.print(as_json, None);
             0
         }
@@ -106,6 +121,44 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
     }
 }
 
+/// Роль пользователя в решении `guid`: из `/spaces`, иначе по ответу `/solutions/{guid}`.
+fn solution_role(
+    agent: &ureq::Agent,
+    url: &str,
+    token: &str,
+    spaces: &Value,
+    guid: &str,
+) -> String {
+    let found = spaces["spaces"]
+        .as_array()
+        .and_then(|l| l.iter().find(|s| s["agent_solution_id"] == guid));
+    if let Some(s) = found {
+        return match s["role"].as_str() {
+            Some("member") => format!("участник ({})", str_of(&s["access"])),
+            Some("owner") => "владелец".into(),
+            other => other.unwrap_or("?").to_string(),
+        };
+    }
+    match get(
+        agent,
+        &format!("{url}/api/v1/solutions/{guid}"),
+        Some(token),
+    ) {
+        Ok((200, body)) => serde_json::from_str::<Value>(&body)
+            .map(|v| str_of(&v["role"]))
+            .unwrap_or_else(|_| "?".into()),
+        Ok((403, body)) => {
+            let state = serde_json::from_str::<Value>(&body)
+                .map(|v| str_of(&v["state"]))
+                .unwrap_or_else(|_| "?".into());
+            format!("нет доступа (запрос: {state})")
+        }
+        Ok((404, _)) => "не зарегистрировано (zam write зарегистрирует)".into(),
+        Ok((code, _)) => format!("неизвестна (HTTP {code})"),
+        Err(e) => format!("неизвестна ({e})"),
+    }
+}
+
 fn str_of(v: &Value) -> String {
     v.as_str().unwrap_or("?").to_string()
 }
@@ -118,6 +171,10 @@ struct Report {
     user: Option<(String, String)>,
     access: Option<String>,
     solution: Option<PathBuf>,
+    /// Роль в решении из `solution.toml`.
+    role: Option<String>,
+    /// Ожидающие запросы доступа к решениям пользователя.
+    pending: Option<u64>,
 }
 
 impl Report {
@@ -135,6 +192,8 @@ impl Report {
                 "access": self.access,
                 "user": self.user.as_ref().map(|(n, i)| json!({ "name": n, "id": i })),
                 "solution": sol.map(|d| d.to_string()),
+                "solution_role": self.role,
+                "access_requests_pending": self.pending,
                 "error": problem,
             });
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -163,6 +222,12 @@ impl Report {
         match sol {
             Some(d) => println!("Решение:  {d}"),
             None => println!("Решение:  не найдено"),
+        }
+        if let Some(r) = &self.role {
+            println!("Роль в решении: {r}");
+        }
+        if let Some(n) = self.pending.filter(|n| *n > 0) {
+            println!("Ожидают подтверждения доступа: {n} (zam solution access requests)");
         }
         if let Some(p) = problem {
             eprintln!("{p}");

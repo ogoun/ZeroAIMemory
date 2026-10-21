@@ -231,6 +231,9 @@ pub struct AttachScope {
     pub prefer_space: Option<Id>,
     /// `false` — вложения узлов пространства Human не видны (запрос по токену).
     pub allow_human: bool,
+    /// `true` — только пространство `prefer_space` (участник общего решения в базе
+    /// владельца не видит вложений других его пространств, §11.6).
+    pub only_space: bool,
 }
 
 /// Ссылка `_attachments/<sha16>/<имя>` → `(sha256, mime)`. `sha16` — без учёта
@@ -255,9 +258,16 @@ pub async fn resolve_attachment(
              JOIN spaces s ON s.id = n.space_id
              WHERE substr(a.blob_sha256, 1, 16) = ?1 AND a.filename = ?2
                AND (?3 OR s.kind <> 'human')
+               AND (NOT ?5 OR n.space_id IS ?4)
              ORDER BY (n.space_id IS ?4) DESC, (n.deleted_at IS NULL) DESC, a.created_at DESC
              LIMIT 1",
-            params![sha16, name, scope.allow_human, scope.prefer_space],
+            params![
+                sha16,
+                name,
+                scope.allow_human,
+                scope.prefer_space,
+                scope.only_space
+            ],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
@@ -286,6 +296,33 @@ pub async fn blob_meta(
                  ORDER BY (n.deleted_at IS NULL) DESC, a.created_at DESC
                  LIMIT 1",
                 params![sha, name, allow_human],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(m, s)| (m, u64::try_from(s).unwrap_or(0))))
+    })
+    .await
+}
+
+/// MIME и размер пары (sha256, имя), если она привязана хоть к одному узлу пространства
+/// `space` (участник общего решения в базе владельца — только пространство решения).
+pub async fn blob_meta_in_space(
+    db: &Db,
+    sha256: &str,
+    filename: &str,
+    space: Id,
+) -> Result<Option<(String, u64)>, StoreError> {
+    let (sha, name) = (sha256.to_string(), filename.to_string());
+    db.read(move |c| {
+        let row: Option<(String, i64)> = c
+            .query_row(
+                "SELECT COALESCE(a.mime, 'application/octet-stream'), a.size
+                 FROM attachments a
+                 JOIN nodes n ON n.id = a.node_id
+                 WHERE a.blob_sha256 = ?1 AND a.filename = ?2 AND n.space_id = ?3
+                 ORDER BY (n.deleted_at IS NULL) DESC, a.created_at DESC
+                 LIMIT 1",
+                params![sha, name, space],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;

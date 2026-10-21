@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 use zam_core::Id;
-use zam_store::blobs::{AttachScope, BlobStore, attach, blob_meta, resolve_attachment};
+use zam_store::blobs::{
+    AttachScope, BlobStore, attach, blob_meta, blob_meta_in_space, resolve_attachment,
+};
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, NewNote, NodePath, SpaceKind, StoreError, UserDbs,
     create_note, list_spaces,
@@ -189,10 +191,12 @@ async fn resolve_and_meta_respect_human() {
     let token = AttachScope {
         prefer_space: Some(k),
         allow_human: false,
+        only_space: false,
     };
     let admin = AttachScope {
         prefer_space: None,
         allow_human: true,
+        only_space: false,
     };
     // sha16 без учёта регистра
     let up = s1[..16].to_ascii_uppercase();
@@ -229,4 +233,31 @@ async fn resolve_and_meta_respect_human() {
         Some(("application/pdf".to_string(), n2))
     );
     assert_eq!(blob_meta(&db, &s1, "b.pdf", true).await.unwrap(), None);
+
+    // участник общего решения: только пространство решения
+    let only_h = AttachScope {
+        prefer_space: Some(h),
+        allow_human: true,
+        only_space: true,
+    };
+    assert_eq!(
+        resolve_attachment(&db, &s1[..16], "a.png", only_h)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_attachment(&db, &s2[..16], "b.pdf", only_h)
+            .await
+            .unwrap(),
+        Some((s2.clone(), "application/pdf".to_string()))
+    );
+    assert_eq!(
+        blob_meta_in_space(&db, &s1, "a.png", k).await.unwrap(),
+        Some(("image/png".to_string(), n1))
+    );
+    assert_eq!(
+        blob_meta_in_space(&db, &s1, "a.png", h).await.unwrap(),
+        None
+    );
 }

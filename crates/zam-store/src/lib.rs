@@ -19,7 +19,10 @@ pub mod time;
 pub mod user_db;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
-pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, resolve_attachment};
+pub use blobs::{
+    AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_in_space,
+    resolve_attachment,
+};
 pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
 pub use db::{Db, DbOptions};
 pub use embeddings::{

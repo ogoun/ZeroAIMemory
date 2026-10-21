@@ -3,6 +3,7 @@ pub mod attach;
 pub mod history;
 pub mod read;
 pub mod search;
+pub mod solution;
 pub mod status;
 pub mod tree;
 pub mod write;
@@ -128,6 +129,8 @@ impl Ctx {
     }
 
     /// Регистрация решения из `solution.toml` (идемпотентно) перед записью в него.
+    /// Чужое решение: сервер создаёт запрос доступа (202) — запись затем получит 403
+    /// `solution-access`, пока владелец не подтвердит (§11.6).
     pub fn ensure_solution(&self, loc: &Loc) -> Result<(), CliError> {
         if let (
             Loc::Path {
@@ -136,9 +139,19 @@ impl Ctx {
             Some(s),
         ) = (loc, &self.solution)
         {
-            self.client
-                .post_json("/solutions", &json!({ "id": s.id, "name": s.name }))
+            let r = self
+                .client
+                .post_json(
+                    "/solutions",
+                    &json!({ "agent_solution_id": s.id, "name": s.name }),
+                )
                 .map_err(|e| e.context("регистрация решения"))?;
+            if r.status().as_u16() == 202 {
+                eprintln!(
+                    "решение {} принадлежит другому пользователю: запрос доступа ждёт подтверждения владельца",
+                    s.id
+                );
+            }
         }
         Ok(())
     }

@@ -113,6 +113,84 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Решение: совместный доступ
+    Solution {
+        #[command(subcommand)]
+        cmd: SolutionCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SolutionCmd {
+    /// Доступ других пользователей к решению (владелец или администратор)
+    Access {
+        #[command(subcommand)]
+        cmd: AccessCmd,
+    },
+}
+
+/// Решение и подключение для команд доступа.
+#[derive(clap::Args)]
+struct AccessOpts {
+    /// GUID решения (иначе agent_solution_id из solution.toml)
+    #[arg(long)]
+    solution: Option<String>,
+    #[command(flatten)]
+    common: Common,
+}
+
+#[derive(Subcommand)]
+enum AccessCmd {
+    /// Все запросы и участники
+    List {
+        #[command(flatten)]
+        opts: AccessOpts,
+    },
+    /// Ожидающие подтверждения запросы
+    Requests {
+        #[command(flatten)]
+        opts: AccessOpts,
+    },
+    /// Одобрить запрос (по умолчанию rw) или сменить режим участника
+    Approve {
+        /// Пользователь: имя или id
+        user: String,
+        /// Только чтение
+        #[arg(long)]
+        ro: bool,
+        #[command(flatten)]
+        opts: AccessOpts,
+    },
+    /// Отклонить ожидающий запрос
+    Reject {
+        /// Пользователь: имя или id
+        user: String,
+        /// Причина
+        #[arg(long)]
+        reason: Option<String>,
+        #[command(flatten)]
+        opts: AccessOpts,
+    },
+    /// Отозвать доступ участника (действует со следующего запроса)
+    Revoke {
+        /// Пользователь: имя или id
+        user: String,
+        #[command(flatten)]
+        opts: AccessOpts,
+    },
+}
+
+impl AccessCmd {
+    fn split(self) -> (cmd::solution::Action, AccessOpts) {
+        use cmd::solution::Action;
+        match self {
+            AccessCmd::List { opts } => (Action::List, opts),
+            AccessCmd::Requests { opts } => (Action::Requests, opts),
+            AccessCmd::Approve { user, ro, opts } => (Action::Approve { user, ro }, opts),
+            AccessCmd::Reject { user, reason, opts } => (Action::Reject { user, reason }, opts),
+            AccessCmd::Revoke { user, opts } => (Action::Revoke { user }, opts),
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -214,5 +292,15 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             file,
             common,
         } => cmd::attach::run(&cmd::connect(&common)?, &target, &file),
+        Cmd::Solution {
+            cmd: SolutionCmd::Access { cmd },
+        } => {
+            let (action, opts) = cmd.split();
+            cmd::solution::run(
+                &cmd::connect(&opts.common)?,
+                opts.solution.as_deref(),
+                &action,
+            )
+        }
     }
 }

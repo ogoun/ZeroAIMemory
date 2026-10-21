@@ -128,6 +128,7 @@ pub async fn revert(
         &p,
         &client,
         sc.user.id,
+        sc.owner,
         "node.revert",
         node.id,
         details,

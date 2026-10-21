@@ -25,16 +25,24 @@ fn actor(p: &Principal) -> String {
     }
 }
 
-/// Запись аудита операции над узлом; `details` — без текста заметки.
+/// Запись аудита операции над узлом; `details` — без текста заметки. `user` — кто
+/// действует; узел в базе другого владельца (общее решение) — `details.owner`.
+#[allow(clippy::too_many_arguments)]
 async fn audit_node(
     st: &AppState,
     p: &Principal,
     client: &Client,
     user: Id,
+    owner: Id,
     action: &str,
     node: Id,
-    details: Value,
+    mut details: Value,
 ) -> Result<(), ApiError> {
+    if owner != user
+        && let Value::Object(o) = &mut details
+    {
+        o.insert("owner".into(), json!(owner));
+    }
     st.system
         .audit(
             &actor(p),

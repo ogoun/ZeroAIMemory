@@ -300,3 +300,31 @@ async fn migration_v6_to_v7_keeps_revisions() {
         .await;
     assert!(upd.is_err());
 }
+
+#[tokio::test]
+async fn failed_space_skipped_others_registered() {
+    let dd = datadir("skip");
+    let sys = SystemStore::open(&dd).unwrap();
+    let dbs = UserDbs::new(dd.users_dir());
+    let a = sys.create_user("a", false).await.unwrap().id;
+    let b = sys.create_user("b", false).await.unwrap().id;
+    let db_b = dbs.get(b).await.unwrap();
+    let (g1, g2, ga) = (
+        SolutionGuid::new_v7(),
+        SolutionGuid::new_v7(),
+        SolutionGuid::new_v7(),
+    );
+    let (x, _) = create_solution(&db_b, g1.as_str(), "x").await.unwrap();
+    let (y, _) = create_solution(&db_b, g2.as_str(), "y").await.unwrap();
+    // пространство x уже в реестре за чужим решением: его регистрация падает Conflict
+    sys.register_solution(&ga, a, x.id, "чужое").await.unwrap();
+    let r = register_user_solutions(&sys, &db_b, b).await.unwrap();
+    assert_eq!((r.registered, r.already, r.failed), (1, 0, 1));
+    assert!(sys.get_solution(&g1).await.unwrap().is_none());
+    assert_eq!(sys.get_solution(&g2).await.unwrap().unwrap().space_id, y.id);
+    // итоги складываются
+    let mut total = zam_store::RegistryReport::default();
+    total.absorb(r.clone());
+    total.absorb(r);
+    assert_eq!((total.registered, total.failed), (2, 2));
+}

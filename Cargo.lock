@@ -6068,6 +6068,7 @@ dependencies = [
  "ureq",
  "zam-core",
  "zam-server",
+ "zam-store",
 ]
 
 [[package]]

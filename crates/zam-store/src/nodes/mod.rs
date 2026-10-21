@@ -112,7 +112,8 @@ pub struct Attribution {
     pub session_id: Option<String>,
     pub machine: Option<String>,
     pub message: Option<String>,
-    /// Пользователь-автор (участник общего решения в базе владельца); `None` — владелец базы.
+    /// Пользователь-автор: пользователь токена записи (владелец базы или участник общего решения).
+    /// `None` — запись без токена (администратор, система) и ревизии до M3.
     pub user_id: Option<Id>,
 }
 

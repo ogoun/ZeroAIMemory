@@ -3,6 +3,7 @@ use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
+use zam_core::SolutionGuid;
 use zam_store::StoreError;
 
 #[derive(Debug, thiserror::Error)]
@@ -13,6 +14,16 @@ pub enum ApiError {
     Unauthorized,
     #[error("доступ запрещён")]
     Forbidden,
+    /// 403 с пояснением (например, запись участником с режимом `ro`).
+    #[error("{0}")]
+    Denied(String),
+    /// Нет доступа к общему решению (§11.6): запрос ждёт, отклонён или отозван.
+    #[error("нет доступа к решению {guid}: {}", access_state_text(state))]
+    SolutionAccess {
+        guid: SolutionGuid,
+        /// `pending` | `rejected` | `revoked`.
+        state: &'static str,
+    },
     #[error("ресурс не найден")]
     NotFound,
     /// `extra` — расширения RFC 9457: поля попадают в тело problem рядом с `detail`.
@@ -49,7 +60,14 @@ impl ApiError {
         match self {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "about:blank", "Bad Request"),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "about:blank", "Unauthorized"),
-            ApiError::Forbidden => (StatusCode::FORBIDDEN, "about:blank", "Forbidden"),
+            ApiError::Forbidden | ApiError::Denied(_) => {
+                (StatusCode::FORBIDDEN, "about:blank", "Forbidden")
+            }
+            ApiError::SolutionAccess { .. } => (
+                StatusCode::FORBIDDEN,
+                "/problems/solution-access",
+                "Forbidden",
+            ),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "about:blank", "Not Found"),
             ApiError::Conflict { .. } => (StatusCode::CONFLICT, "/problems/conflict", "Conflict"),
             ApiError::PayloadTooLarge(_) => (
@@ -86,6 +104,16 @@ impl ApiError {
     }
 }
 
+/// Пояснение состояния запроса доступа для `detail`.
+fn access_state_text(state: &str) -> &'static str {
+    match state {
+        "pending" => "запрос ждёт подтверждения владельца",
+        "rejected" => "запрос отклонён владельцем",
+        "revoked" => "доступ отозван владельцем",
+        _ => "доступа нет",
+    }
+}
+
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         match e {
@@ -114,6 +142,10 @@ impl IntoResponse for ApiError {
                 // стандартные поля problem не перекрываются
                 o.entry(k.clone()).or_insert_with(|| v.clone());
             }
+        }
+        if let (ApiError::SolutionAccess { guid, state }, Value::Object(o)) = (&self, &mut body) {
+            o.insert("state".into(), json!(state));
+            o.insert("agent_solution_id".into(), json!(guid));
         }
         let mut resp = (status, Json(body)).into_response();
         let h = resp.headers_mut();

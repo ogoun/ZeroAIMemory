@@ -142,6 +142,8 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         .await?
         .map_err(|e| anyhow::anyhow!("не удалось подготовить проверку пароля: {e}"))?;
     let users = UserDbs::new(data_dir.users_dir());
+    // реестр решений — до индексации и приёма запросов (§11.6)
+    bootstrap::register_solutions(&system, &users).await;
     let index = Arc::new(IndexRuntime::start(&cfg, ml, early_sup, &system, &users).await);
     let rerank = Arc::new(RerankSlot::new(&cfg));
     let state = AppState {

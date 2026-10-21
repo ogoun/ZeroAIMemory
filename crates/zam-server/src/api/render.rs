@@ -11,14 +11,16 @@
 //!
 //! Ссылки на вложения `_attachments/<sha16>/<имя>` тоже разрешаются заранее
 //! (`resolve_attachment`): сначала в пространстве заметки, затем в любом доступном
-//! зрителю (по токену — кроме Human). URL — `api/v1/blobs/<sha256>/<имя в
+//! зрителю (по токену — кроме Human; участнику общего решения — только пространство
+//! решения, §11.6). URL — `api/v1/blobs/<sha256>/<имя в
 //! percent-encoding>`; администратору, действующему от имени другого пользователя,
 //! добавляется `?user=<id>` (браузер не передаёт `X-Zam-User` в `<img src>`).
 //!
 //! **Кэш.** LRU на 512 записей; ключ — `(content_hash, RENDER_VERSION, space_id,
-//! user_id, viewer, поколение)`: href вики-ссылок зависят от узлов пространства и от
-//! пользователя (`X-Zam-User`), URL вложений — ещё и от вида зрителя ([`Viewer`]:
-//! токен не видит вложений Human, администратору от имени другого нужен `?user=`).
+//! user_id, viewer, поколение)`: `user_id` — владелец базы заметки; href вики-ссылок
+//! зависят от узлов пространства, URL вложений — ещё и от вида зрителя ([`Viewer`]:
+//! токен не видит вложений Human, участник — вложений вне решения, администратору от
+//! имени другого нужен `?user=`).
 //! Поколение ([`RenderGenerations`]) растёт при создании, переносе, удалении и
 //! восстановлении узлов пространства и при загрузке вложения, поэтому появление или
 //! исчезновение цели ссылки сразу видно в HTML. Поколение читается до разрешения
@@ -46,7 +48,7 @@ use zam_store::{
 };
 
 use super::json_body;
-use super::scope::{Mode, node_scope};
+use super::scope::{Mode, Role, node_scope};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -67,6 +69,8 @@ const WIKI_TARGETS_MAX: usize = 500;
 pub enum Viewer {
     /// Токен: вложения узлов Human не разрешаются.
     Token,
+    /// Токен участника общего решения: только вложения пространства решения.
+    Member,
     /// Администратор в своей базе.
     Admin,
     /// Администратор от имени другого пользователя: URL блобов с `?user=<id>`.
@@ -74,12 +78,13 @@ pub enum Viewer {
 }
 
 impl Viewer {
-    /// Вид зрителя для принципала `p`, читающего базу пользователя `user`.
-    pub fn of(st: &AppState, p: &Principal, user: Id) -> Viewer {
+    /// Вид зрителя для принципала `p` с ролью `role`, читающего базу пользователя `owner`.
+    pub fn of(st: &AppState, p: &Principal, owner: Id, role: Role) -> Viewer {
         match p {
+            Principal::Token(_) if matches!(role, Role::Member(_)) => Viewer::Member,
             Principal::Token(_) => Viewer::Token,
-            Principal::Admin { .. } if user == st.admin_id => Viewer::Admin,
-            Principal::Admin { .. } => Viewer::AdminFor(user),
+            Principal::Admin { .. } if owner == st.admin_id => Viewer::Admin,
+            Principal::Admin { .. } => Viewer::AdminFor(owner),
         }
     }
 }
@@ -228,7 +233,8 @@ async fn resolve_attachments(
     refs.truncate(WIKI_TARGETS_MAX);
     let scope = AttachScope {
         prefer_space: Some(ctx.space),
-        allow_human: ctx.viewer != Viewer::Token,
+        allow_human: !matches!(ctx.viewer, Viewer::Token | Viewer::Member),
+        only_space: ctx.viewer == Viewer::Member,
     };
     let mut out = HashMap::new();
     for (sha16, name) in refs {
@@ -369,7 +375,7 @@ pub async fn preview(
             let sc = node_scope(&st, &p, &headers, id, Mode::Read).await?;
             let ctx = RenderCtx {
                 space: sc.space.id,
-                viewer: Viewer::of(&st, &p, sc.user.id),
+                viewer: Viewer::of(&st, &p, sc.owner, sc.role),
             };
             (Some(sc.db), Some(ctx))
         }

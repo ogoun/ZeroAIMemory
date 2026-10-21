@@ -141,7 +141,7 @@ export type SpaceKind = 'rules' | 'human' | 'knowledge' | 'solution';
 export interface Space {
   id: string;
   kind: SpaceKind;
-  solution_guid: string | null;
+  agent_solution_id: string | null;
   name: string;
 }
 
@@ -186,7 +186,7 @@ export interface RenderedNode {
 /** Ссылка на пространство в API и в адресе страницы: вид фиксированного, GUID решения или id. */
 export function spaceRef(s: Space): string {
   if (s.kind !== 'solution') return s.kind;
-  return s.solution_guid ?? s.id;
+  return s.agent_solution_id ?? s.id;
 }
 
 /** Пространство соответствует ссылке `ref` (форма ссылки — как у `spaceRef`, либо id). */

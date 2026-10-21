@@ -1,4 +1,4 @@
-//! Админ-API: пользователи, токены, аудит (§12). Только `AdminOnly`.
+//! Админ-API: пользователи, токены, аудит, настройки (§12). Только `AdminOnly`.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
@@ -14,6 +14,7 @@ use crate::app::AppState;
 use crate::auth::{AdminOnly, Client};
 use crate::error::ApiError;
 
+use super::scope::RULES_AGENT_WRITE;
 use super::{parse_body, parse_id};
 
 const NAME_MAX_CHARS: usize = 64;
@@ -346,4 +347,68 @@ pub async fn list_audit(
         "items": rows.iter().map(audit_json).collect::<Vec<_>>(),
         "next": next,
     })))
+}
+
+// ---- настройки ----
+
+/// `{rules: {agent_write}}`.
+async fn settings_json(st: &AppState) -> Result<Value, ApiError> {
+    let agent_write = st
+        .system
+        .get_setting::<bool>(RULES_AGENT_WRITE)
+        .await?
+        .unwrap_or(false);
+    Ok(json!({ "rules": { "agent_write": agent_write } }))
+}
+
+/// `GET /admin/settings`.
+pub async fn get_settings(
+    _: AdminOnly,
+    State(st): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(settings_json(&st).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesPatch {
+    agent_write: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsPatch {
+    rules: Option<RulesPatch>,
+}
+
+/// `PATCH /admin/settings {rules: {agent_write}}`; аудит `settings.update` при изменении.
+pub async fn patch_settings(
+    _: AdminOnly,
+    State(st): State<AppState>,
+    client: Client,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let req: SettingsPatch = parse_body(&body)?;
+    let Some(to) = req.rules.and_then(|r| r.agent_write) else {
+        return Err(ApiError::BadRequest("нужно поле rules.agent_write".into()));
+    };
+    let from = st
+        .system
+        .get_setting::<bool>(RULES_AGENT_WRITE)
+        .await?
+        .unwrap_or(false);
+    if from != to {
+        st.system.set_setting(RULES_AGENT_WRITE, &to).await?;
+        st.system
+            .audit(
+                ACTOR,
+                None,
+                "settings.update",
+                Some(RULES_AGENT_WRITE),
+                Some(&client.ip.to_string()),
+                json!({ "key": RULES_AGENT_WRITE, "from": from, "to": to }),
+            )
+            .await?;
+    }
+    Ok(Json(settings_json(&st).await?))
 }

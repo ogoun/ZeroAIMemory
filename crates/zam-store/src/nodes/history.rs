@@ -25,7 +25,8 @@ pub struct RevisionInfo {
     pub session_id: Option<String>,
     pub machine: Option<String>,
     pub message: Option<String>,
-    /// Пользователь-автор; `None` — владелец базы (и все ревизии до M3).
+    /// Пользователь-автор (пользователь токена записи); `None` — запись без токена
+    /// (администратор, система) и ревизии до M3.
     pub user_id: Option<Id>,
     #[serde(serialize_with = "crate::time::ser_ts")]
     pub ts: Timestamp,

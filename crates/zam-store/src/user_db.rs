@@ -93,6 +93,8 @@ impl FromSql for SpaceKind {
 pub struct Space {
     pub id: Id,
     pub kind: SpaceKind,
+    /// GUID решения; в JSON API — `agent_solution_id` (§11.6).
+    #[serde(rename = "agent_solution_id")]
     pub solution_guid: Option<String>,
     pub name: String,
 }

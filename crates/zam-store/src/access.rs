@@ -512,6 +512,35 @@ impl SystemStore {
             .await
     }
 
+    /// Решения, к которым у пользователя есть запрос доступа в любом состоянии (`Member`,
+    /// `Pending`, `Rejected`, `Revoked`), по времени регистрации. Свои решения не входят.
+    /// Нужен серверу, чтобы на узел отозванного решения ответить 403, а не 404.
+    pub async fn member_solutions(
+        &self,
+        user: Id,
+    ) -> Result<Vec<(SolutionInfo, SolutionRole)>, StoreError> {
+        self.db
+            .read(move |c| {
+                let mut st = c.prepare(
+                    "SELECT s.guid, s.owner_id, s.space_id, s.name, s.created_at, a.state, a.access
+                     FROM solutions s JOIN solution_access a ON a.guid = s.guid
+                     WHERE a.user_id = ?1 AND s.owner_id <> ?1
+                     ORDER BY s.created_at, s.guid",
+                )?;
+                let rows = st.query_map([user], |r| {
+                    let role = match r.get::<_, AccessState>(5)? {
+                        AccessState::Approved => SolutionRole::Member(r.get(6)?),
+                        AccessState::Pending => SolutionRole::Pending,
+                        AccessState::Rejected => SolutionRole::Rejected,
+                        AccessState::Revoked => SolutionRole::Revoked,
+                    };
+                    Ok((solution_row(r)?, role))
+                })?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+    }
+
     /// Число ожидающих запросов ко всем решениям владельца.
     pub async fn pending_requests_for_owner(&self, owner: Id) -> Result<u64, StoreError> {
         self.db

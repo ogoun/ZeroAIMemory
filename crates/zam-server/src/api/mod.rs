@@ -59,8 +59,27 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         .route("/api/v1/auth/me", get(login::me))
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
-        .route("/api/v1/solutions", post(solutions::register))
+        .route(
+            "/api/v1/solutions",
+            get(solutions::list).post(solutions::register),
+        )
         .route("/api/v1/solutions/{guid}", get(solutions::get))
+        .route(
+            "/api/v1/solutions/{guid}/access",
+            get(solutions::access_list),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/approve",
+            post(solutions::approve),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/reject",
+            post(solutions::reject),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/revoke",
+            post(solutions::revoke),
+        )
         .route(
             "/api/v1/nodes",
             post(nodes::write::create).layer(note_limit),
@@ -115,6 +134,10 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         )
         .route("/api/v1/admin/tokens/{id}", delete(admin::revoke_token))
         .route("/api/v1/admin/audit", get(admin::list_audit))
+        .route(
+            "/api/v1/admin/settings",
+            get(admin::get_settings).patch(admin::patch_settings),
+        )
 }
 
 // ---- разбор входных данных (общий для обработчиков) ----

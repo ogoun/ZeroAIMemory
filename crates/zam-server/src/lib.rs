@@ -63,8 +63,8 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
     Ok(())
 }
 
-/// Открывает все базы (с миграциями), дожидается разовой перечанковки R1 и возвращает
-/// число пользователей. Если токенизатор модели доступен, R1 идёт её точным счётчиком
+/// Открывает все базы (с миграциями), регистрирует решения M1–M2 в реестре (§11.6),
+/// дожидается разовой перечанковки R1 и возвращает число пользователей. Если токенизатор модели доступен, R1 идёт её точным счётчиком
 /// и порогами под её окно (как у сервера), иначе — приближённым (`ApproxCounter`).
 pub async fn migrate(cfg: ServerConfig) -> anyhow::Result<usize> {
     let dir = zam_store::DataDir::open(&cfg.data_dir)?;
@@ -76,6 +76,7 @@ pub async fn migrate(cfg: ServerConfig) -> anyhow::Result<usize> {
     for u in &list {
         users.get(u.id).await?;
     }
+    bootstrap::register_solutions(&system, &users).await;
     for u in &list {
         users.wait_rechunk(u.id).await;
     }

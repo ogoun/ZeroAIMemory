@@ -89,7 +89,7 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use zam_core::Id;
+use zam_core::{Id, SolutionGuid};
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex};
 use zam_ml::Embedding;
 use zam_search::{
@@ -106,7 +106,7 @@ use zam_store::{
 };
 
 use super::json_body;
-use super::scope::{SpaceRef, canonical_guid, find_space, token_can_read, user_db};
+use super::scope::{SpaceRef, find_space, token_can_read, user_db};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::config::SearchSection;
@@ -204,17 +204,18 @@ async fn resolve_spaces(
     } else {
         let solution = match &sc.solution {
             Some(g) => Some(
-                canonical_guid(g.trim())
-                    .ok_or_else(|| ApiError::BadRequest("scope.solution: GUID решения".into()))?,
+                g.trim()
+                    .parse::<SolutionGuid>()
+                    .map_err(|_| ApiError::BadRequest("scope.solution: GUID решения".into()))?,
             ),
             // заголовок агента: некорректное значение игнорируется
             None => headers
                 .get(SOLUTION_HEADER)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| canonical_guid(v.trim())),
+                .and_then(|v| v.trim().parse::<SolutionGuid>().ok()),
         };
         if let Some(g) = solution
-            && let Some(s) = get_solution(db, &g).await?
+            && let Some(s) = get_solution(db, g.as_str()).await?
         {
             out.push(s);
         }

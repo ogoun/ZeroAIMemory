@@ -435,3 +435,22 @@ async fn migration_v2_to_v3_keeps_data() {
     s.register_solution(&g, user, Id::new(), "p").await.unwrap();
     assert_eq!(s.list_solutions().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn member_solutions_all_states_without_own() {
+    let (_dd, s, owner, member, g) = setup("member-solutions").await;
+    assert!(s.member_solutions(member).await.unwrap().is_empty());
+    s.request_access(&g, member, None).await.unwrap();
+    let l = s.member_solutions(member).await.unwrap();
+    assert_eq!(l.len(), 1);
+    assert_eq!((&l[0].0.guid, l[0].1), (&g, SolutionRole::Pending));
+    for (st, role) in [
+        (AccessState::Approved, SolutionRole::Member(Access::Rw)),
+        (AccessState::Revoked, SolutionRole::Revoked),
+    ] {
+        bring_to(&s, &g, member, st).await;
+        assert_eq!(s.member_solutions(member).await.unwrap()[0].1, role);
+    }
+    // свои решения сюда не входят
+    assert!(s.member_solutions(owner).await.unwrap().is_empty());
+}
