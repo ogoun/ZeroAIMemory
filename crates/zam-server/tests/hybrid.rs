@@ -513,6 +513,43 @@ async fn human_deleted_and_excluded_not_in_vector_channel() {
     }
 }
 
+/// Узел Knowledge, который векторный канал не видит (`index_state` `pending` — в очереди,
+/// `failed` — индексация не удалась, точек нет): ослабленный bm25 для него не понижается
+/// `w_fts_relaxed`, иначе находка только по слову заметки тонет под векторными кандидатами.
+/// Контроль — тот же узел без точек, но `indexed`: вес понижен, заметка вне top-10.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_and_failed_notes_keep_relaxed_fts_weight() {
+    let Some((a, _q, ids)) = indexed("hyb-blind").await else {
+        return;
+    };
+    let cat: Id = id_of(&ids, "pets/cat-food").parse().unwrap();
+    // точки узла удалены (как у заметки, ещё не проиндексированной или с неудачей)
+    a.st.index
+        .vector
+        .as_ref()
+        .unwrap()
+        .delete_nodes(a.st.admin_id, &[cat])
+        .await
+        .unwrap();
+    assert_eq!(node_points(&a, "pets/cat-food").await, 0);
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    // «zeppelin» нет ни в одном чанке: ослабленный запрос, bm25 находит только cat-food
+    let q = json!({"query": "carbohydrates zeppelin", "top_k": 10});
+    for st in ["indexed", "pending", "failed"] {
+        let sql = format!("UPDATE nodes SET index_state = '{st}' WHERE id = ?1");
+        db.write(move |tx| {
+            tx.execute(&sql, [cat])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let j = search(&a, q.clone()).await.json();
+        assert_eq!(j["degraded"], false, "{st}: {j}");
+        let found = paths(&j).contains(&"pets/cat-food".to_string());
+        assert_eq!(found, st != "indexed", "{st}: {j}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn qdrant_down_degrades_to_fts() {
     let Some((a, mut q, _ids)) = indexed("hyb-down").await else {

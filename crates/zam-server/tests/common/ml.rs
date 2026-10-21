@@ -78,24 +78,46 @@ pub fn external(c: &mut ServerConfig, q: &TestQdrant) {
     c.qdrant.api_key = Some(q.api_key.clone());
 }
 
+/// Состояние векторного канала для сообщения о таймауте: причина деградации, состояние
+/// Qdrant (у `Broken` — причина) и снимок воркера (ошибка Qdrant, очередь, model_mismatch).
+pub fn vector_diag(a: &Api) -> String {
+    format!(
+        "vector_available = {:?}; qdrant = {:?}; worker = {:?}",
+        a.st.index.vector_available(),
+        a.st.index.qdrant_state(),
+        a.st.index.worker.status()
+    )
+}
+
 /// Ждёт включения векторного канала (коллекция создана и проверена).
 pub async fn vector_ready(a: &Api) {
-    let t = Instant::now();
-    while a.st.index.vector_available().is_err() {
-        assert!(
-            t.elapsed() < READY,
-            "векторный канал не включился: {:?}",
-            a.st.index.vector_available()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    until_diag(
+        "векторный канал не включился",
+        READY,
+        async || a.st.index.vector_available().is_ok(),
+        async || vector_diag(a),
+    )
+    .await;
 }
 
 /// Ждёт условия не дольше `limit`.
 pub async fn until(what: &str, limit: Duration, f: impl AsyncFn() -> bool) {
+    until_diag(what, limit, f, async || String::new()).await;
+}
+
+/// [`until`] с диагностикой: при таймауте в сообщение идёт `diag()` (состояние на момент
+/// отказа, а не только «не дождались»).
+pub async fn until_diag(
+    what: &str,
+    limit: Duration,
+    f: impl AsyncFn() -> bool,
+    diag: impl AsyncFn() -> String,
+) {
     let t = Instant::now();
     while !f().await {
-        assert!(t.elapsed() < limit, "не дождались за {limit:?}: {what}");
+        if t.elapsed() >= limit {
+            panic!("не дождались за {limit:?}: {what}; {}", diag().await);
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

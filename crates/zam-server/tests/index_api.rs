@@ -10,7 +10,9 @@ use std::process::Command;
 
 use axum::http::{Method, StatusCode};
 use common::api::{Api, api};
-use common::ml::{MINILM, READY, external, have, ml, until, vector_ready};
+use common::ml::{
+    MINILM, READY, external, have, ml, until, until_diag, vector_diag, vector_ready,
+};
 use common::qdrant::{TestQdrant, free_port, qdrant_bin};
 use serde_json::{Value, json};
 use zam_core::Id;
@@ -395,9 +397,12 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
     let a = common::api::api_with(c.clone()).await;
     vector_ready(&a).await;
     let n = id(&a.note("knowledge", "keep/n", NOTE).await);
-    until("n indexed", READY, async || {
-        state(&a, &n).await == "indexed"
-    })
+    until_diag(
+        "n indexed",
+        READY,
+        async || state(&a, &n).await == "indexed",
+        async || format!("{}; status = {}", vector_diag(&a), status(&a).await),
+    )
     .await;
     let s = status(&a).await;
     assert_eq!(s["qdrant"]["state"], "ready");
@@ -456,9 +461,21 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
 
     // сервер снова: точки на месте сразу, модель не вызывалась
     let b = common::api::api_with(c).await;
-    until("точки", READY, async || {
-        b.st.index.vector_available().is_ok() && points(&b, Some("keep")).await == pts
-    })
+    until_diag(
+        "точки",
+        READY,
+        async || b.st.index.vector_available().is_ok() && points(&b, Some("keep")).await == pts,
+        async || {
+            // qdrant.error и state.reason — причина, по которой канал не включился
+            let s = status(&b).await;
+            format!(
+                "{}; qdrant = {}; vector = {}; ожидалось точек {pts}",
+                vector_diag(&b),
+                s["qdrant"],
+                s["vector"]
+            )
+        },
+    )
     .await;
     assert_eq!(b.st.index.worker.embedded_texts(), 0);
     let audit = b.st.system.list_audit(50, None).await.unwrap();
