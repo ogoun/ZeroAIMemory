@@ -319,9 +319,15 @@ pub struct IndexSection {
     pub chunk_overlap_sentences: usize,
 }
 
-/// Предел `chunk_hard_max`: лист с префиксом контекста и спецтокенами должен уместиться в
-/// окно модели при индексации (`max_tokens_passage` bge-m3 — 1024).
-pub const CHUNK_HARD_MAX_LIMIT: usize = 960;
+/// Санитарный предел `chunk_hard_max` в конфигурации. Действующий предел задаёт модель:
+/// лист с префиксом контекста и спецтокенами должен уместиться в её окно при индексации
+/// (`max_tokens_passage` минус [`CHUNK_PREFIX_BUDGET`], см. [`IndexSection::chunk_params_for`]).
+pub const CHUNK_HARD_MAX_CAP: usize = 8192;
+/// Бюджет префикса контекста (`[space/path] имя > заголовки | теги`) и спецтокенов в окне
+/// модели, токенов.
+pub const CHUNK_PREFIX_BUDGET: usize = 64;
+/// Окно модели, когда она неизвестна (токенизатора нет, счёт оценкой): bge-m3 — 1024.
+pub const DEFAULT_PASSAGE_WINDOW: usize = 1024;
 /// Предел `chunk_overlap_sentences`.
 pub const CHUNK_OVERLAP_LIMIT: usize = 5;
 
@@ -335,10 +341,10 @@ impl IndexSection {
         if self.batch_tokens == 0 {
             return Err(bad("batch_tokens", "должно быть больше 0".into()));
         }
-        if !(1..=CHUNK_HARD_MAX_LIMIT).contains(&self.chunk_hard_max) {
+        if !(1..=CHUNK_HARD_MAX_CAP).contains(&self.chunk_hard_max) {
             return Err(bad(
                 "chunk_hard_max",
-                format!("от 1 до {CHUNK_HARD_MAX_LIMIT}"),
+                format!("от 1 до {CHUNK_HARD_MAX_CAP}"),
             ));
         }
         if !(1..=self.chunk_hard_max).contains(&self.chunk_target_max) {
@@ -362,7 +368,25 @@ impl IndexSection {
         Ok(())
     }
 
-    /// Пороги чанкера для `zam_store::set_chunk_params`.
+    /// Пороги чанкера для модели с окном `window` токенов (`max_tokens_passage`; `None` —
+    /// модель неизвестна, [`DEFAULT_PASSAGE_WINDOW`]): `chunk_hard_max` не больше окна минус
+    /// [`CHUNK_PREFIX_BUDGET`], остальные пороги — не больше него. Второе значение — `true`,
+    /// если пороги конфигурации пришлось уменьшить.
+    pub fn chunk_params_for(&self, window: Option<usize>) -> (zam_markdown::ChunkParams, bool) {
+        let want = self.chunk_params();
+        let limit = window
+            .unwrap_or(DEFAULT_PASSAGE_WINDOW)
+            .saturating_sub(CHUNK_PREFIX_BUDGET)
+            .max(1);
+        let mut p = want;
+        p.hard_max = p.hard_max.min(limit);
+        p.target_max = p.target_max.min(p.hard_max);
+        p.target_min = p.target_min.min(p.target_max);
+        p.merge_below = p.merge_below.min(p.target_max);
+        (p, p != want)
+    }
+
+    /// Пороги чанкера из конфигурации как есть (без учёта окна модели).
     pub fn chunk_params(&self) -> zam_markdown::ChunkParams {
         zam_markdown::ChunkParams {
             target_min: self.chunk_target_min,
@@ -1056,7 +1080,7 @@ yield_ms = 1
             ("ZAM_INDEX__CHUNK_TARGET_MAX", "900"),
             ("ZAM_INDEX__CHUNK_TARGET_MIN", "0"),
             ("ZAM_INDEX__CHUNK_TARGET_MIN", "600"),
-            ("ZAM_INDEX__CHUNK_HARD_MAX", "2000"),
+            ("ZAM_INDEX__CHUNK_HARD_MAX", "8193"),
             ("ZAM_INDEX__CHUNK_MERGE_BELOW", "501"),
             ("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "6"),
             ("ZAM_INDEX__BATCH_TOKENS", "0"),
@@ -1067,6 +1091,29 @@ yield_ms = 1
                 .to_string();
             assert!(err.contains(&format!("index.{field}")), "{k}={v}: {err}");
         }
+        // предел листа — от окна модели (минус бюджет префикса), а не константа
+        let c = load(
+            None,
+            &[env("ZAM_INDEX__CHUNK_HARD_MAX", "2000")],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(c.index.chunk_params().hard_max, 2000);
+        assert_eq!(c.index.chunk_params_for(Some(4096)).0.hard_max, 2000);
+        let (p, clamped) = c.index.chunk_params_for(None);
+        assert!(clamped);
+        assert_eq!(p.hard_max, DEFAULT_PASSAGE_WINDOW - CHUNK_PREFIX_BUDGET);
+        let (p, clamped) = d.index.chunk_params_for(Some(1024));
+        assert!(!clamped, "умолчания укладываются в окно bge-m3");
+        assert_eq!(p, d.index.chunk_params());
+        // MiniLM (256): все пороги не больше 192, порядок порогов сохранён
+        let (p, clamped) = d.index.chunk_params_for(Some(256));
+        assert!(clamped);
+        assert_eq!(
+            (p.hard_max, p.target_max, p.target_min, p.merge_below),
+            (192, 192, 192, 100)
+        );
+        assert_eq!(d.index.chunk_params_for(Some(10)).0.hard_max, 1);
         // реранкер
         assert_eq!(
             (

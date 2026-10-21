@@ -407,8 +407,12 @@ pub async fn requeue_running(db: &Db) -> Result<u64, StoreError> {
 /// счётчиком токенов и ставит `upsert` индексируемым (не Human, не `index: false`)
 /// с низким приоритетом. Узел с активным заданием получает одно задание, не два.
 /// Возвращает число поставленных `upsert`. Идёт пакетами по отдельным транзакциям.
+/// Перечанковка всей базы точным счётчиком снимает отметку «чанки по оценке».
 pub async fn enqueue_reindex(db: &Db, space: Option<Id>) -> Result<u64, StoreError> {
     let (_, jobs) = crate::nodes::rechunk_notes(db, space, PRIORITY_REINDEX).await?;
+    if space.is_none() {
+        crate::user_db::clear_approx_if_exact(db).await?;
+    }
     Ok(jobs)
 }
 

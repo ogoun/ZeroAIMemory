@@ -148,19 +148,22 @@ impl UserDbs {
         let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
         ensure_fixed_spaces(&db).await?;
         crate::nodes::backfill_embed_keys(&db).await?;
-        let pending = rechunk_pending(&db).await? && !clear_rechunk_if_empty(&db).await?;
-        let (done, rechunked) = watch::channel(!pending);
+        let pending = match rechunk_pending(&db).await? {
+            Some(why) if !clear_rechunk_if_empty(&db).await? => Some(why),
+            _ => None,
+        };
+        let (done, rechunked) = watch::channel(pending.is_none());
         *cell = Some(OpenDb {
             db: db.clone(),
             rechunked,
         });
         drop(cell);
-        if pending {
+        if let Some(why) = pending {
             let bg = db.clone();
             tokio::spawn(async move {
-                if let Err(e) = rechunk_after_v4(&bg).await {
+                if let Err(e) = rechunk_all(&bg, why).await {
                     // повторится при следующем открытии базы
-                    tracing::warn!(error = %e, "перечанковка после миграции индекса прервана");
+                    tracing::warn!(error = %e, reason = why.as_str(), "перечанковка заметок прервана");
                 }
                 let _ = done.send(true);
             });
@@ -203,22 +206,54 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
 /// Ключ `meta`: разовая перечанковка после миграции 0004 ещё не выполнена.
 const RECHUNK_V4: &str = "rechunk_v4";
 
-/// Флаг разовой перечанковки после миграции 0004 стоит.
-async fn rechunk_pending(db: &Db) -> Result<bool, StoreError> {
-    db.read(|c| {
-        Ok(c.query_row(
-            "SELECT 1 FROM meta WHERE key = ?1",
-            [RECHUNK_V4],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+/// Ключ `meta`: часть чанков базы нарезана приближённым счётчиком токенов (свежая установка
+/// без моделей, `ApproxCounter`). Ставится в транзакции нарезки, снимается после перенарезки
+/// всех живых заметок точным счётчиком.
+pub(crate) const CHUNKED_APPROX: &str = "chunked_approx";
+
+/// Почему база перечанковывается при открытии.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rechunk {
+    /// Ruling R1: база M1 обновлена до v4.
+    AfterV4,
+    /// Чанки по оценке, а счётчик теперь точный (модель установлена после записи заметок).
+    ExactCounter,
+}
+
+impl Rechunk {
+    fn as_str(self) -> &'static str {
+        match self {
+            Rechunk::AfterV4 => "after_v4",
+            Rechunk::ExactCounter => "exact_counter",
+        }
+    }
+}
+
+fn has_meta(c: &Connection, key: &str) -> rusqlite::Result<bool> {
+    Ok(
+        c.query_row("SELECT 1 FROM meta WHERE key = ?1", [key], |_| Ok(()))
+            .optional()?
+            .is_some(),
+    )
+}
+
+/// Нужна ли перечанковка при открытии: флаг R1 или чанки по оценке при точном счётчике.
+async fn rechunk_pending(db: &Db) -> Result<Option<Rechunk>, StoreError> {
+    let exact = crate::nodes::token_counter_exact();
+    db.read(move |c| {
+        Ok(if has_meta(c, RECHUNK_V4)? {
+            Some(Rechunk::AfterV4)
+        } else if exact && has_meta(c, CHUNKED_APPROX)? {
+            Some(Rechunk::ExactCounter)
+        } else {
+            None
+        })
     })
     .await
 }
 
-/// База без живых заметок (новая или пустая) — флаг R1 снимается сразу, без фоновой
-/// задачи. `true` — снят.
+/// База без живых заметок (новая или пустая) — флаги перечанковки снимаются сразу, без
+/// фоновой задачи. `true` — сняты.
 async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
     db.write(|tx| {
         let any: bool = tx.query_row(
@@ -227,20 +262,40 @@ async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
             |r| r.get(0),
         )?;
         if !any {
-            tx.execute("DELETE FROM meta WHERE key = ?1", [RECHUNK_V4])?;
+            tx.execute(
+                "DELETE FROM meta WHERE key IN (?1, ?2)",
+                [RECHUNK_V4, CHUNKED_APPROX],
+            )?;
         }
         Ok(!any)
     })
     .await
 }
 
-/// Ruling R1: чанки M1 построены по секциям (`section`) и без векторов, поэтому при
-/// первом открытии базы v4 все живые заметки перечанковываются текущим счётчиком
-/// и получают `upsert`. Флаг снимается только после успеха: прерванная перечанковка
-/// повторится при следующем открытии (она идемпотентна). На большой базе — долго;
-/// в лог идут только счётчики.
-async fn rechunk_after_v4(db: &Db) -> Result<(), StoreError> {
-    tracing::info!("перечанковка заметок после миграции индекса (v4)");
+/// Снимает отметку «чанки по оценке», если счётчик точный: вызывается после перечанковки
+/// всех живых заметок базы. Заметка, записанная во время перечанковки, нарезана тем же
+/// точным счётчиком; счётчик, откатившийся на оценку посреди работы, отметку не снимает.
+pub(crate) async fn clear_approx_if_exact(db: &Db) -> Result<(), StoreError> {
+    if !crate::nodes::token_counter_exact() {
+        return Ok(());
+    }
+    db.write(|tx| {
+        tx.execute("DELETE FROM meta WHERE key = ?1", [CHUNKED_APPROX])?;
+        Ok(())
+    })
+    .await
+}
+
+/// Перечанковка всех живых заметок текущим счётчиком с заданиями `upsert`.
+///
+/// Ruling R1: чанки M1 построены по секциям (`section`) и без векторов, поэтому при первом
+/// открытии базы v4 все живые заметки перечанковываются. То же — при первом открытии с точным
+/// счётчиком базы, чанки которой нарезаны оценкой: иначе листы могут не уложиться в окно
+/// модели (усечение при инференсе) и разойтись с порогами §8.2. Флаги снимаются только после
+/// успеха: прерванная перечанковка повторится при следующем открытии (она идемпотентна).
+/// На большой базе — долго (и полный повторный инференс); в лог идут только счётчики.
+async fn rechunk_all(db: &Db, why: Rechunk) -> Result<(), StoreError> {
+    tracing::info!(reason = why.as_str(), "перечанковка заметок базы");
     let started = std::time::Instant::now();
     let (notes, upserts) = crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX).await?;
     db.write(|tx| {
@@ -248,11 +303,13 @@ async fn rechunk_after_v4(db: &Db) -> Result<(), StoreError> {
         Ok(())
     })
     .await?;
+    clear_approx_if_exact(db).await?;
     tracing::info!(
+        reason = why.as_str(),
         notes,
         upserts,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "перечанковка после миграции индекса завершена"
+        "перечанковка заметок базы завершена"
     );
     Ok(())
 }

@@ -65,17 +65,11 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
 
 /// Открывает все базы (с миграциями), дожидается разовой перечанковки R1 и возвращает
 /// число пользователей. Если токенизатор модели доступен, R1 идёт её точным счётчиком
-/// (как у сервера), иначе — приближённым (`ApproxCounter`).
+/// и порогами под её окно (как у сервера), иначе — приближённым (`ApproxCounter`).
 pub async fn migrate(cfg: ServerConfig) -> anyhow::Result<usize> {
     let dir = zam_store::DataDir::open(&cfg.data_dir)?;
     let tc_cfg = cfg.clone();
-    zam_store::set_chunk_params(cfg.index.chunk_params());
-    match tokio::task::spawn_blocking(move || ml::token_counter(&tc_cfg)).await {
-        Ok(Some(tc)) => zam_store::set_token_counter(std::sync::Arc::new(tc)),
-        _ => tracing::warn!(
-            "токенизатор модели недоступен: перечанковка по приближённому счётчику токенов"
-        ),
-    }
+    tokio::task::spawn_blocking(move || ml::setup_chunker(&tc_cfg, None)).await?;
     let system = zam_store::SystemStore::open(&dir)?;
     let users = zam_store::UserDbs::new(dir.users_dir());
     let list = system.list_users().await?;

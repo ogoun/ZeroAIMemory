@@ -35,8 +35,9 @@ fn counter_cell() -> &'static RwLock<Arc<dyn TokenCounter>> {
 }
 
 /// Устанавливает счётчик токенов чанкера для всего процесса (например, токенизатор
-/// bge-m3 после загрузки модели). Заметки, разбитые прежним счётчиком, остаются как
-/// есть до перезаписи или reindex.
+/// bge-m3 после загрузки модели). Заметки, разбитые прежним точным счётчиком, остаются
+/// как есть до перезаписи или reindex; разбитые оценкой (`is_exact() == false`) отмечены
+/// в `meta` базы и перенарезаются в фоне при первом её открытии с точным счётчиком.
 pub fn set_token_counter(tc: Arc<dyn TokenCounter>) {
     *counter_cell().write().unwrap_or_else(|e| e.into_inner()) = tc;
 }
@@ -65,6 +66,11 @@ pub(crate) fn token_counter() -> Arc<dyn TokenCounter> {
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// Текущий счётчик чанкера точный (токенизатор модели), а не оценка.
+pub fn token_counter_exact() -> bool {
+    token_counter().is_exact()
 }
 
 /// Число токенов `text` текущим счётчиком чанкера (бюджет выдачи поиска).
@@ -315,6 +321,11 @@ pub(crate) fn rebuild_chunks(
             ch.text_hash,
             embed_key_of(&prefix, &ch.text),
         ])?;
+    }
+    // после нарезки: счётчик мог откатиться на оценку посреди заметки
+    if !tc.is_exact() {
+        c.prepare_cached("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')")?
+            .execute([crate::user_db::CHUNKED_APPROX])?;
     }
     Ok(chunks.len())
 }

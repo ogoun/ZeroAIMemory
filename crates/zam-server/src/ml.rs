@@ -57,10 +57,23 @@ impl MlLoad {
     }
 }
 
-/// Точный счётчик токенов модели без ONNX Runtime (только токенизатор): для
-/// `zam-server migrate`, где модель не нужна, а перечанковка R1 должна идти тем же
-/// счётчиком, что и сервер. Модели bge-m3 int8/fp16 делят один токенизатор.
-pub fn token_counter(cfg: &ServerConfig) -> Option<zam_ml::BgeTokenCounter> {
+/// Счётчик токенов и окно (`max_tokens_passage`) модели для чанкера.
+pub struct ChunkModel {
+    pub counter: zam_ml::BgeTokenCounter,
+    pub window: usize,
+}
+
+/// Счётчик и окно модели для чанкера: загруженного эмбеддера, а без него (ORT нет, модель не
+/// загрузилась, `zam-server migrate`) — токенизатора и описателя установленной модели без ONNX
+/// Runtime (`ml.embed_model` или bge-m3 int8/fp16: у них один токенизатор). `None` — модели
+/// не установлены, чанкер считает оценкой.
+pub fn chunk_model(cfg: &ServerConfig, embedder: Option<&Embedder>) -> Option<ChunkModel> {
+    if let Some(e) = embedder {
+        return Some(ChunkModel {
+            counter: e.token_counter(),
+            window: e.spec().max_tokens_passage,
+        });
+    }
     let dir = cfg.ml.models_dir(&cfg.data_dir);
     let ids: Vec<&str> = match cfg
         .ml
@@ -71,8 +84,47 @@ pub fn token_counter(cfg: &ServerConfig) -> Option<zam_ml::BgeTokenCounter> {
         Some(m) => vec![m],
         None => vec![MODEL_CPU, MODEL_GPU],
     };
-    ids.into_iter()
-        .find_map(|id| zam_ml::BgeTokenCounter::load(&dir, id).ok())
+    ids.into_iter().find_map(|id| {
+        let spec = zam_ml::ModelSpec::load(&dir, id).ok()?;
+        let counter = zam_ml::BgeTokenCounter::load(&dir, id).ok()?;
+        Some(ChunkModel {
+            counter,
+            window: spec.max_tokens_passage,
+        })
+    })
+}
+
+/// Ставит счётчик токенов и пороги чанкера процесса (§8.2) до первого открытия базы
+/// пользователя: точный счётчик модели (см. [`chunk_model`]) и пороги `[index]`, ограниченные
+/// окном модели. Возвращает `true`, если счётчик точный. Без модели — оценка
+/// (`ApproxCounter`): такие чанки отмечаются в базе и перенарезаются при первом открытии с
+/// точным счётчиком.
+pub fn setup_chunker(cfg: &ServerConfig, embedder: Option<&Embedder>) -> bool {
+    let model = chunk_model(cfg, embedder);
+    let window = model.as_ref().map(|m| m.window);
+    let (params, clamped) = cfg.index.chunk_params_for(window);
+    if clamped {
+        tracing::warn!(
+            window = window.unwrap_or(crate::config::DEFAULT_PASSAGE_WINDOW),
+            hard_max = params.hard_max,
+            target_max = params.target_max,
+            "пороги чанкинга [index] уменьшены под окно модели"
+        );
+    }
+    zam_store::set_chunk_params(params);
+    match model {
+        Some(m) => {
+            zam_store::set_token_counter(Arc::new(m.counter));
+            true
+        }
+        None => {
+            tracing::warn!(
+                "токенизатор модели недоступен: чанки считаются оценкой и будут перенарезаны \
+                 после установки моделей (zam-server models fetch)"
+            );
+            false
+        }
+    }
 }
 
 /// Настройки `zam-ml` из `[ml]`.
