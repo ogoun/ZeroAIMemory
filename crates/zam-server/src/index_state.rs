@@ -108,6 +108,14 @@ impl DegradedReason {
     }
 }
 
+/// Предупреждение `/search`: индекс пересобирается, векторная выдача может быть неполной.
+pub const WARN_REINDEXING: &str = "index rebuilding";
+
+/// См. [`IndexRuntime::reindexing`]; `storage` — флаг стёртого хранилища супервизора.
+fn reindexing(ws: &zam_index::WorkerStatus, storage: bool) -> bool {
+    ws.running && (ws.reindex_running || ws.reindex_queued > 0 || ws.rebuilding || storage)
+}
+
 /// Модель, Qdrant и воркер индексации (в `AppState` за `Arc`).
 pub struct IndexRuntime {
     pub embedder: Option<Arc<Embedder>>,
@@ -316,6 +324,15 @@ impl IndexRuntime {
         self.worker.notify();
     }
 
+    /// Индекс пересобирается: reindex по запросу (из кэша или полный) выполняется или ждёт,
+    /// пересборка по всем базам не закончила постановку заданий, или хранилище Qdrant стёрто
+    /// и ещё не восстановлено (`Ready { rebuilt }`). Векторная выдача в это время неполна —
+    /// `/search` добавляет предупреждение [`WARN_REINDEXING`].
+    pub fn reindexing(&self) -> bool {
+        let storage = self.supervisor().is_some_and(|s| s.storage_rebuilt());
+        reindexing(&self.worker.status(), storage)
+    }
+
     /// Можно ли идти в векторный канал; иначе — причина деградации.
     pub fn vector_available(&self) -> Result<(), DegradedReason> {
         if self.embedder.is_none() {
@@ -383,5 +400,38 @@ impl IndexRuntime {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reindexing_from_worker_status_and_storage_flag() {
+        let idle = zam_index::WorkerStatus {
+            running: true,
+            ..Default::default()
+        };
+        assert!(!reindexing(&idle, false));
+        assert!(reindexing(&idle, true), "хранилище стёрто, ещё не восстановлено");
+        for ws in [
+            zam_index::WorkerStatus {
+                reindex_running: true,
+                ..idle.clone()
+            },
+            zam_index::WorkerStatus {
+                reindex_queued: 1,
+                ..idle.clone()
+            },
+            zam_index::WorkerStatus {
+                rebuilding: true,
+                ..idle.clone()
+            },
+        ] {
+            assert!(reindexing(&ws, false), "{ws:?}");
+        }
+        // воркера нет (FTS-only): предупреждать не о чем, причина — в degraded
+        assert!(!reindexing(&zam_index::WorkerStatus::default(), true));
     }
 }

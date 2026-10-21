@@ -64,7 +64,8 @@
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
 //! полного текста чанка, `updated_at`, `kind`, `snippet` | `l0`,
 //! `text`, `rerank_score` 0..1 — у переставленных реранком), `degraded`, `degraded_reason`
-//! и `degraded_text` (или `null`), `warnings` (строки; пока только о реранке), `pending_count` — живые
+//! и `degraded_text` (или `null`), `warnings` (строки: о реранке и `index rebuilding` — индекс
+//! пересобирается, векторная выдача может быть неполной), `pending_count` — живые
 //! заметки области, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms,
 //! fuse_ms, rerank_ms, expand_ms, pending_ms, total_ms}` (`null` — этап не выполнялся;
 //! `total_ms` — весь обработчик без сериализации ответа). Маркеры совпадений в JSON —
@@ -972,8 +973,11 @@ pub async fn search(
         .collect();
     let fuse_ms = ms(fuse_t);
 
-    // 4. серверный реранк
+    // 4. серверный реранк; пересборка индекса — предупреждение о неполной векторной выдаче
     let mut warnings: Vec<&'static str> = Vec::new();
+    if st.index.reindexing() {
+        warnings.push(crate::index_state::WARN_REINDEXING);
+    }
     let mut rerank_ms = None;
     let items = if rerank_on && !items.is_empty() {
         let t = Instant::now();

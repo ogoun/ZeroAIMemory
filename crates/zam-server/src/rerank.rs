@@ -19,7 +19,8 @@ use zam_ml::{Device, MlConfig, MlError, Reranker};
 
 use crate::config::ServerConfig;
 
-/// Реранкер не установлен (`zam-server models fetch --reranker`).
+/// Реранкер не установлен (`zam-server models fetch --reranker`; CPU-реранкер jina —
+/// ещё с `--accept-nc-license`).
 pub const WARN_NOT_INSTALLED: &str = "reranker not installed";
 /// Реранкер не загрузился или инференс не удался (подробности — в журнале).
 pub const WARN_FAILED: &str = "reranker failed";

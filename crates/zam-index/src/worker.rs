@@ -152,6 +152,9 @@ pub struct WorkerStatus {
     pub reindex_running: bool,
     /// Запросов reindex в очереди, включая выполняемый.
     pub reindex_queued: usize,
+    /// Пересборка индекса по всем базам (стёртое хранилище, новая коллекция, запрос
+    /// [`WorkerHandle::request_rebuild`]) ещё не поставила задания во все базы.
+    pub rebuilding: bool,
     /// Последний завершённый reindex по запросу.
     pub last_reindex: Option<ReindexOutcome>,
     /// Базы, исключённые из пересборки индекса (повреждены или не открываются).
@@ -938,12 +941,19 @@ impl Worker {
             attempts: HashMap::new(),
             skipped: Vec::new(),
         });
+        self.status(|s| s.rebuilding = true);
     }
 
     /// Шаг пересборки: `enqueue_reindex` в каждой ещё не обработанной базе. Сбой базы —
     /// WARN и повтор позже только для неё. Когда прошли все базы: для стёртого хранилища
     /// аудит `index.storage_rebuilt` и `ack_storage_rebuilt()`.
     async fn rebuild_step(&mut self) {
+        self.rebuild_pass().await;
+        let r = self.pending.is_some();
+        self.status(|s| s.rebuilding = r);
+    }
+
+    async fn rebuild_pass(&mut self) {
         let Some(mut p) = self.pending.take() else {
             return;
         };

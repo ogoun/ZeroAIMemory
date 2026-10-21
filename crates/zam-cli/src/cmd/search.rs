@@ -71,7 +71,11 @@ pub fn run(ctx: &Ctx, query: &str, o: &Opts) -> Result<(), CliError> {
 fn warning_text(w: &str) -> &str {
     match w {
         "reranker not installed" => {
-            "реранкер не установлен (zam-server models fetch --reranker), результаты без реранка"
+            "реранкер не установлен (zam-server models fetch --reranker; для CPU-реранкера \
+             jina — ещё --accept-nc-license), результаты без реранка"
+        }
+        "index rebuilding" => {
+            "индекс пересобирается (reindex): векторная выдача может быть неполной"
         }
         "reranker failed" => "реранкер не сработал (см. журнал сервера), результаты без реранка",
         other => other,
@@ -161,13 +165,14 @@ mod tests {
     #[test]
     fn notices_from_markdown() {
         let t = "1. **a**\n> degraded: qdrant_down — Qdrant недоступен (только FTS)\n\
-                 > warning: reranker not installed\n";
+                 > warning: reranker not installed\n> warning: index rebuilding\n";
         let n = notices(t, false);
         assert_eq!(
             n,
             [
                 "векторный поиск недоступен: Qdrant недоступен [qdrant_down] — показаны результаты полнотекстового поиска",
-                "предупреждение: реранкер не установлен (zam-server models fetch --reranker), результаты без реранка",
+                "предупреждение: реранкер не установлен (zam-server models fetch --reranker; для CPU-реранкера jina — ещё --accept-nc-license), результаты без реранка",
+                "предупреждение: индекс пересобирается (reindex): векторная выдача может быть неполной",
             ]
         );
         // старый формат без текста и неизвестное предупреждение — как есть

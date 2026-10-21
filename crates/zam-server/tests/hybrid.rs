@@ -235,6 +235,8 @@ async fn hybrid_paraphrase_identifier_expand_budget() {
     let j = r.json();
     assert_eq!(j["degraded"], false, "{j}");
     assert!(j["degraded_reason"].is_null(), "{j}");
+    // индекс не пересобирается — предупреждения index rebuilding нет
+    assert_eq!(j["warnings"], json!([]), "{j}");
     for t in ["fts_ms", "embed_ms", "vector_ms", "fuse_ms"] {
         assert!(j["timings"][t].is_number(), "{t}: {j}");
     }

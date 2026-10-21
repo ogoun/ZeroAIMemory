@@ -23,7 +23,9 @@ export function hintParts(hint: string): { t: string; code: boolean }[] {
 
 /** Предупреждения ответа /search (`warnings`) — по-русски. */
 const WARNING: Record<string, string> = {
-  'reranker not installed': 'реранкер не установлен — порядок результатов без реранка',
+  'reranker not installed':
+    'реранкер не установлен (zam-server models fetch --reranker; для CPU-реранкера jina — ещё --accept-nc-license) — порядок результатов без реранка',
+  'index rebuilding': 'индекс пересобирается — векторная выдача может быть неполной',
   'reranker failed': 'реранкер не сработал — порядок результатов без реранка (подробности в журнале)',
 };
 
