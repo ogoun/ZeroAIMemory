@@ -855,5 +855,4 @@ mod tests {
         assert_eq!(backoff_secs(12), 3600);
         assert_eq!(backoff_secs(i64::MAX), 3600);
     }
-
 }

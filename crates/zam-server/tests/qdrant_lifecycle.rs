@@ -632,6 +632,8 @@ fn too_long_data_dir_fails_with_hint() {
         assert!(!out.status.success(), "{args:?}");
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
+    /// Аргументы команды и переменные окружения.
+    type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
     let too_long = |err: &str| {
         err.contains("слишком длинный") && err.contains("MAX_PATH") && err.contains("--data-dir")
     };
@@ -649,7 +651,7 @@ fn too_long_data_dir_fails_with_hint() {
         assert!(too_long(&err), "{args:?}: {err}");
     }
     // каталог данных не нужен: ошибка — об отсутствующем манифесте, а не о длине пути
-    let free: [(&[&str], &[(&str, &str)]); 4] = [
+    let free: [Case; 4] = [
         (&["cuda", "fetch", "--manifest", missing], &[]),
         (&["qdrant", "fetch", "--manifest", missing], &[]),
         (
@@ -663,7 +665,10 @@ fn too_long_data_dir_fails_with_hint() {
     ];
     for (args, env) in free {
         let err = run(args, env);
-        assert!(!too_long(&err) && err.contains("нет.toml"), "{args:?}: {err}");
+        assert!(
+            !too_long(&err) && err.contains("нет.toml"),
+            "{args:?}: {err}"
+        );
     }
     assert!(!data.exists(), "каталог данных создан");
 }

@@ -414,7 +414,10 @@ mod tests {
             ..Default::default()
         };
         assert!(!reindexing(&idle, false));
-        assert!(reindexing(&idle, true), "хранилище стёрто, ещё не восстановлено");
+        assert!(
+            reindexing(&idle, true),
+            "хранилище стёрто, ещё не восстановлено"
+        );
         for ws in [
             zam_index::WorkerStatus {
                 reindex_running: true,

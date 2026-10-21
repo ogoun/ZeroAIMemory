@@ -289,7 +289,9 @@ async fn adopt_legacy_owner_and_index_skipped() {
         2
     );
     assert_eq!(
-        adopt_owned_embeddings_batch(&db, "m@1", vec![]).await.unwrap(),
+        adopt_owned_embeddings_batch(&db, "m@1", vec![])
+            .await
+            .unwrap(),
         0
     );
     gc_embeddings(&db, 100).await.unwrap();
@@ -312,9 +314,14 @@ async fn adopt_legacy_owner_and_index_skipped() {
     let s = sys.index_skipped().await.unwrap();
     assert_eq!((s.len(), s[0].user_id, s[0].attempts), (1, u, 5));
     // повторная отметка reindex (attempts = 1) счётчик попыток воркера не затирает
-    sys.index_skip(u, "файл всё ещё не SQLite", 1).await.unwrap();
+    sys.index_skip(u, "файл всё ещё не SQLite", 1)
+        .await
+        .unwrap();
     let s = sys.index_skipped().await.unwrap();
-    assert_eq!((s[0].attempts, s[0].error.as_str()), (5, "файл всё ещё не SQLite"));
+    assert_eq!(
+        (s[0].attempts, s[0].error.as_str()),
+        (5, "файл всё ещё не SQLite")
+    );
     sys.index_unskip(u).await.unwrap();
     assert!(sys.index_skipped().await.unwrap().is_empty());
 }

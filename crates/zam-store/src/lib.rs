@@ -19,8 +19,8 @@ pub use blobs::{AttachScope, BlobStore, attach, attachment_link, blob_meta, reso
 pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
 pub use db::{Db, DbOptions};
 pub use embeddings::{
-    Embedding, adopt_owned_embeddings, adopt_owned_embeddings_batch, embed_input_of, embed_key_of, gc_embeddings, get_embeddings,
-    prune_owned_embeddings, put_embeddings, put_owned_embeddings,
+    Embedding, adopt_owned_embeddings, adopt_owned_embeddings_batch, embed_input_of, embed_key_of,
+    gc_embeddings, get_embeddings, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
 };
 pub use jobs::{
     FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats, NodePayload,

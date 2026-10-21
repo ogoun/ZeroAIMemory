@@ -10,9 +10,7 @@ use std::process::Command;
 
 use axum::http::{Method, StatusCode};
 use common::api::{Api, api};
-use common::ml::{
-    MINILM, READY, external, have, ml, until, until_diag, vector_diag, vector_ready,
-};
+use common::ml::{MINILM, READY, external, have, ml, until, until_diag, vector_diag, vector_ready};
 use common::qdrant::{TestQdrant, free_port, qdrant_bin};
 use serde_json::{Value, json};
 use zam_core::Id;

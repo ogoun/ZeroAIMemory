@@ -920,10 +920,8 @@ pub async fn pending_count(
         .map(|p| p.trim_end_matches('/'))
         .filter(|p| !p.is_empty())
         .map(str::to_string);
-    db.read(move |c| {
-        Ok(c.query_row(PENDING_COUNT_SQL, params![ids, prefix], |r| r.get(0))?)
-    })
-    .await
+    db.read(move |c| Ok(c.query_row(PENDING_COUNT_SQL, params![ids, prefix], |r| r.get(0))?))
+        .await
 }
 
 #[cfg(test)]

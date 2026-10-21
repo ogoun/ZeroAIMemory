@@ -35,8 +35,9 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use zam_core::Id;
 use zam_store::{
     Db, Embedding, IndexFolder, ReindexNote, StoreError, SystemStore, UserDbs,
-    adopt_owned_embeddings_batch, enqueue_reindex, enqueue_upserts, finish_reindexed, folders_for_index,
-    gc_embeddings, get_embeddings, mark_reindex, put_owned_embeddings, reindex_page,
+    adopt_owned_embeddings_batch, enqueue_reindex, enqueue_upserts, finish_reindexed,
+    folders_for_index, gc_embeddings, get_embeddings, mark_reindex, put_owned_embeddings,
+    reindex_page,
 };
 
 use crate::worker::{chunk_point, folder_embed, folder_point};
