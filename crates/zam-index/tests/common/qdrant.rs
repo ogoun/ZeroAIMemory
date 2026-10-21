@@ -170,7 +170,10 @@ impl TestQdrant {
                     self.dir.join("qdrant.log").display()
                 );
             }
-            if readyz(self.http_port) {
+            // gRPC-порт Qdrant открывает отдельно от HTTP и бывает, что позже `/readyz`
+            // (флейк на Linux CI: ConnectionRefused первого `health()`); супервизор по той же
+            // причине ждёт gRPC health.
+            if readyz(self.http_port) && port_open(self.grpc_port) {
                 return;
             }
             assert!(
@@ -202,6 +205,12 @@ fn spawn(bin: &Path, dir: &Path, api_key: &str) -> Child {
         .stderr(log)
         .spawn()
         .expect("запуск Qdrant")
+}
+
+/// На порту 127.0.0.1 есть слушатель.
+fn port_open(port: u16) -> bool {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
 /// `GET /readyz` по HTTP/1.0 без внешних зависимостей; ключ не нужен.
