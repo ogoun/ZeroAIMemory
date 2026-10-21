@@ -18,6 +18,10 @@ env:
   # фиксированное зерно proptest: прогоны в CI воспроизводимы (случайный поиск — локально)
   PROPTEST_RNG_SEED: "20261018"
 
+# только чтение репозитория: workflow ничего не публикует
+permissions:
+  contents: read
+
 jobs:
   web:
     name: web

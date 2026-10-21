@@ -29,6 +29,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# только чтение репозитория: workflow ничего не публикует
+permissions:
+  contents: read
+
 jobs:
   edge:
     name: clippy zam-index --features edge
