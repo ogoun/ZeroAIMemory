@@ -95,7 +95,7 @@ pub enum JobOutcome {
     Done,
     /// Во время обработки узел переписан: задание снова в очереди с новой
     /// ревизией и сброшенными попытками; результат воркера для узла не окончательный
-    /// (`set_index_state(Indexed)` не вызывать).
+    /// (узел остаётся `pending`).
     Requeued,
     /// Неудача: повтор после backoff.
     Retry,
@@ -283,18 +283,36 @@ fn requeue_dirty(c: &Connection, id: i64, now: &str) -> Result<JobOutcome, Store
 /// Завершает выдачу `claim_gen` задания `id`: чистое задание удаляется
 /// ([`JobOutcome::Done`]), «грязное» возвращается в очередь ([`JobOutcome::Requeued`]),
 /// устаревшая выдача ничего не меняет ([`JobOutcome::Stale`]).
+///
+/// Выполненный `upsert` в той же транзакции отмечает узел `indexed` (ревизия задания
+/// актуальна, узел жив и не исключён, активного задания у узла нет — как
+/// [`finish_reindexed`]): между закрытием задания и отметкой не вклинится перенос или
+/// восстановление, поставившее новое задание.
 pub async fn complete_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome, StoreError> {
     db.write(move |tx| {
-        let Some((.., dirty)) = claimed(tx, id, claim_gen)? else {
+        let Some((node, rev, op, _, dirty)) = claimed(tx, id, claim_gen)? else {
             return Ok(JobOutcome::Stale);
         };
         if dirty {
             return requeue_dirty(tx, id, &fmt_ts(Timestamp::now()));
         }
         tx.execute("DELETE FROM index_jobs WHERE id = ?1", [id])?;
+        if op == JobOp::Upsert && !has_active_job(tx, node)? {
+            set_state(tx, node, rev, IndexState::Indexed)?;
+        }
         Ok(JobOutcome::Done)
     })
     .await
+}
+
+/// У узла есть задание `queued` или `running`.
+fn has_active_job(c: &Connection, node: Id) -> Result<bool, StoreError> {
+    Ok(c.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM index_jobs
+                        WHERE target_kind = 'node' AND target_id = ?1
+                          AND state IN ('queued', 'running'))",
+    )?
+    .query_row([node], |r| r.get(0))?)
 }
 
 /// Задержка повтора после `attempts`-й неудачи, секунд.
@@ -709,15 +727,9 @@ pub async fn finish_reindexed(db: &Db, items: Vec<(Id, i64)>) -> Result<(), Stor
             "DELETE FROM index_jobs
              WHERE target_kind = 'node' AND target_id = ?1 AND state = 'failed'",
         )?;
-        let mut active = tx.prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM index_jobs
-                            WHERE target_kind = 'node' AND target_id = ?1
-                              AND state IN ('queued', 'running'))",
-        )?;
         for (node, rev) in items {
             drop_failed.execute([node])?;
-            let busy: bool = active.query_row([node], |r| r.get(0))?;
-            if !busy {
+            if !has_active_job(tx, node)? {
                 set_state(tx, node, rev, IndexState::Indexed)?;
             }
         }

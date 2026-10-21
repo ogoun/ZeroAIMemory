@@ -27,7 +27,8 @@
 //!    кэш `embeddings` по `chunks.embed_key` → инференс промахов (`spawn_blocking`, пачки
 //!    не больше `batch_tokens`, уступка `yield_ms`) → одна запись в Qdrant на пачку:
 //!    `delete_nodes` + `upsert` (`wait=true`; отказ пачки — по одному узлу) →
-//!    `complete_job` → `index_state = 'indexed'` только при [`JobOutcome::Done`].
+//!    auto-L0 → `complete_job`, который в своей транзакции ставит `index_state = 'indexed'`
+//!    только при [`JobOutcome::Done`] и без активного задания узла.
 //!    Qdrant недоступен или коллекции нет — задания возвращаются [`release_job`] без
 //!    траты попыток; прочие ошибки — [`fail_job`] (backoff, после 5 — `failed`).
 //! 5. **L0** (§8.3): автоматический L0 заметки — предложение у центроида её чанков;
@@ -60,7 +61,6 @@ use zam_store::{
     claim_jobs, complete_job, enqueue_reindex, fail_job, gc_embeddings, get_embeddings, get_node,
     get_space, indexed_count, list_children, pending_reindex, prune_owned_embeddings,
     put_embeddings, put_owned_embeddings, release_job, requeue_running, set_auto_l0, set_folder_l0,
-    set_index_state,
 };
 
 use crate::reindex::{GC_BATCH, ReindexCtx, ReindexReport, ReindexRequest, reindex};
@@ -1363,28 +1363,22 @@ impl Worker {
         }
         // завершение заданий: только после подтверждённой записи
         for (j, plan) in ready {
-            // свёртка предков ставится до закрытия задания, auto-L0 идёт после него: покой
-            // воркера — пустая очередь, `batch_running == false` и `rollups_pending == 0`
+            // свёртка предков и auto-L0 — до закрытия задания: покой воркера — пустая
+            // очередь, `batch_running == false` и `rollups_pending == 0`, а `indexed`
+            // означает, что узел обработан целиком (L0 — по ревизии задания)
             let parent = get_node(db, j.target_id)
                 .await
                 .ok()
                 .and_then(|n| n.parent_id);
             self.schedule_chain(user, db, parent).await;
+            if let Plan::Upsert(chunks) = &plan {
+                self.auto_l0(db, j.target_id, j.rev, chunks, &embs).await;
+            }
+            // `indexed` ставит complete_job в своей транзакции (upsert, Done, без активного
+            // задания); upsert без чанков (пустая заметка) тоже завершён: иначе вечный pending
             match complete_job(db, j.id, j.claim_gen).await {
                 Ok(JobOutcome::Done) => {
                     self.inner.jobs_done.fetch_add(1, Ordering::SeqCst);
-                    if let Plan::Upsert(chunks) = &plan {
-                        // L0 до отметки: `indexed` означает, что узел обработан целиком
-                        self.auto_l0(db, j.target_id, j.rev, chunks, &embs).await;
-                    }
-                    // upsert без чанков (пустая заметка) тоже завершён: иначе вечный pending;
-                    // исключённый и удалённый узел set_index_state не меняет
-                    if j.op == JobOp::Upsert
-                        && let Err(e) =
-                            set_index_state(db, j.target_id, j.rev, IndexState::Indexed).await
-                    {
-                        tracing::warn!(node = %j.target_id, error = %e, "index_state");
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(job = j.id, error = %e, "complete_job"),

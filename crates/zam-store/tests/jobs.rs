@@ -407,6 +407,49 @@ async fn move_replaces_running_job() {
     assert_eq!(chunks[0].node.path, "y/a");
 }
 
+/// `indexed` ставит сам `complete_job` (в той же транзакции, только `Done` upsert и без
+/// активного задания): перенос во время обработки оставляет узел `pending`, а не `indexed`.
+#[tokio::test]
+async fn complete_marks_indexed_atomically() {
+    let (db, k, _) = setup("complete-indexed").await;
+    let a = add(&db, k, "x/a", NOTE).await;
+    let state = async |db: &Db| get_node(db, a).await.unwrap().index_state;
+    let j = claim_jobs(&db, 10, Timestamp::now())
+        .await
+        .unwrap()
+        .remove(0);
+    move_node(&db, a, NodePath::parse("y/a").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        complete_job(&db, j.id, j.claim_gen).await.unwrap(),
+        JobOutcome::Requeued
+    );
+    assert_eq!(state(&db).await, "pending");
+    let j = claim_jobs(&db, 10, Timestamp::now())
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        complete_job(&db, j.id, j.claim_gen).await.unwrap(),
+        JobOutcome::Done
+    );
+    assert_eq!(
+        state(&db).await,
+        "indexed",
+        "без отдельного set_index_state"
+    );
+    // устаревшая выдача ничего не меняет
+    assert_eq!(
+        complete_job(&db, j.id, j.claim_gen).await.unwrap(),
+        JobOutcome::Stale
+    );
+    // delete не трогает состояние
+    delete_node(&db, a).await.unwrap();
+    restore_node(&db, a).await.unwrap();
+    assert_eq!(state(&db).await, "pending");
+}
+
 /// Восстановление заметки, ставшей `index: false` до удаления: заданий нет.
 #[tokio::test]
 async fn restore_of_excluded_note_has_no_job() {

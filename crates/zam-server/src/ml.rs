@@ -6,13 +6,16 @@
 //!
 //! Модель по умолчанию: `bge-m3-fp16` в GPU-комплекте (рядом с ORT лежит CUDA EP), если
 //! `ml.device` не `cpu` и CUDA действительно поднялась; иначе `bge-m3-int8`. GPU-комплект
-//! без GPU откатывается на int8 (fp16 на CPU медленнее и дал бы другой `model_id`).
+//! без GPU откатывается на int8 (fp16 на CPU медленнее и дал бы другой `model_id`). Модель
+//! для GPU (`device = "gpu"` в манифесте), оказавшаяся на CPU (int8 не установлена, или
+//! `ml.embed_model` задан явно), не загружается: режим FTS-only с причиной
+//! `gpu_model_on_cpu` и подсказкой `zam-server models fetch --device cpu`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use zam_index::PassageEmbedder;
-use zam_ml::{Device, DeviceReport, Embedder, MlConfig, MlError};
+use zam_ml::{Device, DeviceReport, Embedder, MlConfig, MlError, ModelDevice};
 
 use crate::config::{MlDevice, ServerConfig};
 use crate::index_state::DegradedReason;
@@ -191,14 +194,21 @@ pub fn load(cfg: &ServerConfig) -> MlLoad {
         Err(e) => return fail(DegradedReason::NoModel, e.to_string()),
     };
     let ort = ort_path(&mc.ort_dylib);
-    if let Err(e) = zam_ml::init_runtime(&ort) {
-        return fail(reason_of(&e), e.to_string());
-    }
     let explicit = cfg
         .ml
         .embed_model
         .as_deref()
         .filter(|m| !m.trim().is_empty());
+    // GPU-вариант при `ml.device = "cpu"` — отказ до загрузки весов (секунды с HDD)
+    if let Some(m) = explicit
+        && cfg.ml.device == MlDevice::Cpu
+        && zam_ml::ModelSpec::load(&mc.models_dir, m).is_ok_and(|s| s.device == ModelDevice::Gpu)
+    {
+        return gpu_model_on_cpu(m, "ml.device = \"cpu\"");
+    }
+    if let Err(e) = zam_ml::init_runtime(&ort) {
+        return fail(reason_of(&e), e.to_string());
+    }
     let first = match explicit {
         Some(m) => m.to_string(),
         None if cfg.ml.device != MlDevice::Cpu
@@ -236,6 +246,14 @@ pub fn load(cfg: &ServerConfig) -> MlLoad {
             Err(e) => return fail(reason_of(&e), e.to_string()),
         }
     }
+    // GPU-вариант (fp16), откатившийся на CPU: векторы CPU легли бы под model_id варианта
+    // для CUDA и смешались бы с векторами CUDA в одной коллекции (Review Focus 3), а fp16 на
+    // CPU к тому же медленнее int8 — режим FTS-only с подсказкой поставить модель для CPU
+    if emb.spec().device == ModelDevice::Gpu && report.device == Device::Cpu {
+        let id = emb.spec().id.clone();
+        drop(emb);
+        return gpu_model_on_cpu(&id, &report.reason);
+    }
     // описатель модели старой установки (манифест обновился) — предупреждение с командой
     if let Some((id, _)) = emb.model_id().split_once('@') {
         crate::models::warn_if_stale(&mc.models_dir, id);
@@ -248,6 +266,14 @@ pub fn load(cfg: &ServerConfig) -> MlLoad {
         device: Some(report),
         error: None,
     }
+}
+
+/// Модель для GPU не будет исполняться на CPU: FTS-only с подсказкой.
+fn gpu_model_on_cpu(id: &str, why: &str) -> MlLoad {
+    MlLoad::failed(
+        DegradedReason::GpuModelOnCpu,
+        format!("модель {id} только для GPU, а CUDA недоступна ({why})"),
+    )
 }
 
 fn reason_of(e: &MlError) -> DegradedReason {
@@ -289,5 +315,71 @@ impl PassageEmbedder for EmbedderAdapter {
 
     fn count_tokens(&self, text: &str) -> usize {
         self.0.count_tokens(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::dir_in_target;
+
+    fn repo_models() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("models")
+    }
+
+    /// Без эмбеддера (ORT нет) счётчик и окно берутся из токенизатора и описателя модели.
+    #[test]
+    fn chunk_model_without_embedder_uses_tokenizer() {
+        let models = repo_models();
+        if !models
+            .join("minilm-l6-int8")
+            .join("tokenizer.json")
+            .is_file()
+        {
+            assert!(
+                std::env::var_os("ZAM_REQUIRE_ML").is_none(),
+                "нет target/models/minilm-l6-int8: cargo xtask fetch-models --test"
+            );
+            eprintln!("пропуск: нет модели minilm-l6-int8");
+            return;
+        }
+        let mut cfg = ServerConfig::default();
+        cfg.ml.models_dir = Some(models);
+        cfg.ml.embed_model = Some("minilm-l6-int8".into());
+        let m = chunk_model(&cfg, None).expect("токенизатор есть");
+        assert_eq!(m.window, 256);
+        assert!(zam_markdown::TokenCounter::is_exact(&m.counter));
+        // моделей нет — оценка
+        cfg.ml.models_dir = Some(dir_in_target("ml-no-models"));
+        assert!(chunk_model(&cfg, None).is_none());
+    }
+
+    /// Модель для GPU при `ml.device = "cpu"` не загружается (векторы CPU не ложатся под
+    /// `model_id` варианта CUDA): FTS-only с подсказкой про модель для CPU.
+    #[test]
+    fn gpu_model_refused_on_cpu() {
+        let dir = dir_in_target("ml-gpu-on-cpu");
+        let m = dir.join("fake-gpu");
+        std::fs::create_dir_all(&m).unwrap();
+        std::fs::write(
+            m.join("model.toml"),
+            "id = \"fake-gpu\"\nrole = \"embed\"\ndevice = \"gpu\"\ndim = 4\n\
+             pooling = \"cls\"\nmax_tokens_passage = 16\nmax_tokens_query = 8\n",
+        )
+        .unwrap();
+        let mut cfg = ServerConfig::default();
+        cfg.ml.models_dir = Some(dir);
+        cfg.ml.embed_model = Some("fake-gpu".into());
+        cfg.ml.device = MlDevice::Cpu;
+        let ml = load(&cfg);
+        assert!(ml.embedder.is_none());
+        let (reason, msg) = ml.error.unwrap();
+        assert_eq!(reason, DegradedReason::GpuModelOnCpu);
+        assert!(msg.contains("fake-gpu"), "{msg}");
+        assert!(reason.hint().contains("models fetch --device cpu"));
     }
 }

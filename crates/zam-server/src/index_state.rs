@@ -26,6 +26,8 @@ pub enum DegradedReason {
     NoRuntime,
     /// Модель не загружена (нет каталога, файлов или ошибка загрузки).
     NoModel,
+    /// Установлена только модель для GPU (fp16), а CUDA недоступна или `ml.device = "cpu"`.
+    GpuModelOnCpu,
     /// Qdrant запускается, перезапускается, недоступен или коллекция ещё не проверена.
     QdrantDown,
     /// Qdrant выключен супервизором (circuit breaker, чужая версия, нет бинарника) или не
@@ -48,6 +50,7 @@ impl DegradedReason {
         match self {
             DegradedReason::NoRuntime => "no_runtime",
             DegradedReason::NoModel => "no_model",
+            DegradedReason::GpuModelOnCpu => "gpu_model_on_cpu",
             DegradedReason::QdrantDown => "qdrant_down",
             DegradedReason::Broken => "broken",
             DegradedReason::QdrantLocked => "qdrant_locked",
@@ -63,6 +66,9 @@ impl DegradedReason {
         match self {
             DegradedReason::NoRuntime => "модели не загружены: не найдена библиотека ONNX Runtime",
             DegradedReason::NoModel => "модели не загружены",
+            DegradedReason::GpuModelOnCpu => {
+                "модели не загружены: модель для GPU, а CUDA недоступна"
+            }
             DegradedReason::QdrantDown => "векторная база Qdrant запускается или недоступна",
             DegradedReason::Broken => "векторная база Qdrant выключена или не запущена",
             DegradedReason::QdrantLocked => "каталог Qdrant занят другим экземпляром сервера",
@@ -79,6 +85,9 @@ impl DegradedReason {
                 "положите ONNX Runtime рядом с zam-server (комплект поставки) или задайте `ml.ort_dylib`, затем выполните `zam-server models fetch` и перезапустите сервер"
             }
             DegradedReason::NoModel => "выполните `zam-server models fetch` и перезапустите сервер",
+            DegradedReason::GpuModelOnCpu => {
+                "модель для GPU на CPU не запускается: установите модель для CPU `zam-server models fetch --device cpu` (или уберите `ml.embed_model`) и перезапустите сервер"
+            }
             DegradedReason::QdrantDown => "Qdrant запускается или недоступен; очередь догонит сама",
             DegradedReason::Broken => {
                 "Qdrant выключен супервизором или не запущен: см. журнал и `zam-server qdrant status`"
