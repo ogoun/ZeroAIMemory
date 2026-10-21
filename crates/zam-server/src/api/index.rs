@@ -76,6 +76,7 @@ fn failed_json(user: Id, f: &FailedJob) -> Value {
         "node_id": f.node_id,
         "space_id": f.space_id,
         "path": f.path,
+        "deleted_at": f.deleted_at.map(fmt_ts),
         "op": f.op.as_str(),
         "error": f.error,
         "attempts": f.attempts,

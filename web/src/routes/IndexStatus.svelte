@@ -272,6 +272,7 @@
                 <td>
                   {#if f.space_id && f.path}
                     <a href={href({ name: 'node', user: f.user_id, space: f.space_id, node: f.node_id, anchor: null })}>{f.path}</a>
+                    {#if f.deleted_at}<span class="muted">(в корзине)</span>{/if}
                   {:else}
                     <code>{f.node_id}</code> <span class="muted">(удалена)</span>
                   {/if}

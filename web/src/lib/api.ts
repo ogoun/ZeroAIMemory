@@ -407,6 +407,8 @@ export interface IndexStatus {
     /** Пространство и путь узла; `null` — узел удалён насовсем. */
     space_id: string | null;
     path: string | null;
+    /** Узел в корзине (время удаления); `null` — жив или удалён насовсем. */
+    deleted_at: string | null;
     op: string;
     error: string;
     attempts: number;

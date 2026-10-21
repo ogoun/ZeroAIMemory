@@ -104,6 +104,14 @@ async fn failed_items_have_job_id_space_and_path() {
         assert_eq!(it["path"], "Папка/сбой");
         assert_eq!(it["space_id"], n["space_id"]);
         assert_eq!(it["error"], "Qdrant: отказ");
+        assert!(it["deleted_at"].is_null(), "{it}");
+    }
+    // заметка в корзине: ссылка остаётся, WebUI помечает «(в корзине)»
+    zam_store::delete_node(&db, node).await.unwrap();
+    let s = adm_status(&a).await;
+    for it in s["failed_items"].as_array().unwrap() {
+        assert!(it["deleted_at"].is_string(), "{it}");
+        assert_eq!(it["path"], "Папка/сбой");
     }
     // причина деградации — кодом и текстом для человека
     // (без ORT рядом с тестом — `no_runtime`, с ним — `no_model`)

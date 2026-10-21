@@ -136,25 +136,32 @@ test('индекс: неудавшиеся задания одного узла,
   const problems = watch(page);
   const uid = await login(page);
   const second = env('E2E_NOTE_SECOND');
+  // ULID пространства Knowledge — как в настоящем ответе /index/status
+  const sp = await page.request.get(`${base()}api/v1/spaces`);
+  expect(sp.status()).toBe(200);
+  const spaces = (await sp.json()).spaces as { id: string; kind: string }[];
+  const knowledge = spaces.find((s) => s.kind === 'knowledge')!.id;
   // настоящий ответ сервера, дополненный тем, что на сервере e2e не воспроизвести:
-  // два неудавшихся задания одного узла (разные id), повреждённая и исключённая базы
+  // два неудавшихся задания одного узла (разные id, второе — заметка уже в корзине),
+  // повреждённая и исключённая базы
   let calls = 0;
   await page.route('**/api/v1/index/status', async (route) => {
     calls++;
     const r = await route.fetch();
     const body = await r.json();
-    const failed = (id: number) => ({
+    const failed = (id: number, deleted_at: string | null) => ({
       id,
       user_id: uid,
       node_id: second,
-      space_id: 'knowledge',
+      space_id: knowledge,
       path: 'E2E/Вторая заметка',
+      deleted_at,
       op: 'upsert',
       error: 'Qdrant: отказ',
       attempts: 5,
       updated_at: new Date().toISOString(),
     });
-    body.failed_items = [failed(7), failed(3)];
+    body.failed_items = [failed(7, null), failed(3, new Date().toISOString())];
     body.unavailable_dbs = [{ user_id: 'u-broken', error: 'file is not a database' }];
     body.rebuild_skipped = [{ user_id: 'u-skip', error: 'database is locked', attempts: 5 }];
     await route.fulfill({ response: r, json: body });
@@ -163,6 +170,12 @@ test('индекс: неудавшиеся задания одного узла,
   const rows = page.locator('table tbody tr');
   await expect(rows).toHaveCount(2);
   await expect(rows.first().getByRole('link', { name: 'E2E/Вторая заметка' })).toBeVisible();
+  await expect(rows.first().getByRole('link', { name: 'E2E/Вторая заметка' })).toHaveAttribute(
+    'href',
+    new RegExp(`/s/${knowledge}/`),
+  );
+  await expect(rows.first()).not.toContainText('(в корзине)');
+  await expect(rows.nth(1)).toContainText('(в корзине)');
   await expect(page.getByText('Базы пользователей не открываются: 1')).toBeVisible();
   await expect(page.getByText('file is not a database')).toBeVisible();
   await expect(page.getByText('Исключены из пересборки индекса: 1')).toBeVisible();

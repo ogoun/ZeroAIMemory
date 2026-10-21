@@ -22,7 +22,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::ChunkLevel;
 
-use crate::time::{fmt_ts, parse_ts, ts_at};
+use crate::time::{fmt_ts, parse_ts, ts_at, ts_opt};
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
 
@@ -747,6 +747,8 @@ pub struct FailedJob {
     /// Пространство и путь узла; `None` — узел уже удалён насовсем.
     pub space_id: Option<Id>,
     pub path: Option<String>,
+    /// Узел в корзине (удалён мягко); `None` — жив или удалён насовсем.
+    pub deleted_at: Option<Timestamp>,
     pub op: JobOp,
     pub attempts: i64,
     /// Последняя ошибка (без текста заметок).
@@ -760,7 +762,7 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
     db.read(move |c| {
         let mut st = c.prepare_cached(
             "SELECT j.id, j.target_id, j.op, j.attempts, j.last_error, j.updated_at,
-                    n.space_id, n.path
+                    n.space_id, n.path, n.deleted_at
              FROM index_jobs j LEFT JOIN nodes n ON n.id = j.target_id
              WHERE j.state = 'failed' ORDER BY j.updated_at DESC, j.id DESC LIMIT ?1",
         )?;
@@ -774,6 +776,7 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
                 updated_at: ts_at(r, 5)?,
                 space_id: r.get(6)?,
                 path: r.get(7)?,
+                deleted_at: ts_opt(r, 8)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
