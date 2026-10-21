@@ -828,11 +828,10 @@ pub async fn search(
         if !run_vector {
             return VectorRun::default();
         }
+        // одна область — личная база (поиск по базам владельцев решений — задача 5 M3)
         let filter = VectorFilter {
-            user_id: user.id,
-            space_ids: vec_spaces.clone(),
             path_prefix: prefix.clone(),
-            levels: Vec::new(),
+            ..VectorFilter::scope(user.id, vec_spaces.clone())
         };
         vector_channel(&st.index, filter, req.query.clone()).await
     };
@@ -1172,7 +1171,19 @@ mod tests {
         fn delete_scope<'a>(&'a self, _: &'a VectorFilter) -> zam_index::IndexFuture<'a, ()> {
             unreachable!()
         }
-        fn delete_nodes<'a>(&'a self, _: Id, _: &'a [Id]) -> zam_index::IndexFuture<'a, ()> {
+        fn delete_targets<'a>(
+            &'a self,
+            _: Id,
+            _: &'a [zam_core::TargetRef],
+        ) -> zam_index::IndexFuture<'a, ()> {
+            unreachable!()
+        }
+        fn nearest_dense<'a>(
+            &'a self,
+            _: &'a [f32],
+            _: &'a VectorFilter,
+            _: usize,
+        ) -> zam_index::IndexFuture<'a, Vec<VectorHit>> {
             unreachable!()
         }
         fn search<'a>(
@@ -1196,12 +1207,7 @@ mod tests {
     }
 
     fn filter() -> VectorFilter {
-        VectorFilter {
-            user_id: Id::new(),
-            space_ids: vec![Id::new()],
-            path_prefix: None,
-            levels: Vec::new(),
-        }
+        VectorFilter::scope(Id::new(), vec![Id::new()])
     }
 
     fn emb() -> Result<Embedding, String> {

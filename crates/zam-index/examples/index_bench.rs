@@ -244,9 +244,10 @@ impl Data {
                 space_id: Data::space(u128::from(i) % SPACES),
                 space_kind: "knowledge".into(),
                 solution_guid: None,
-                node_id: Id::from(Uuid::from_u128(
+                node_id: Some(Id::from(Uuid::from_u128(
                     0x7a6d_4000_0000_0000_0000_0000_0000_0000 + u128::from(i / 4),
-                )),
+                ))),
+                entry_id: None,
                 path_ancestors: Data::path(i).to_vec(),
                 area: None,
                 level: Data::level(i).into(),
@@ -255,6 +256,9 @@ impl Data {
                 updated_at: 1_760_000_000 + i as i64,
                 rev: 1,
                 text_hash: format!("h{i}"),
+                status: None,
+                insight_kind: None,
+                certainty: None,
             },
         }
     }
@@ -598,12 +602,7 @@ async fn cmd_build(a: &Args) -> Res<Value> {
     let total_ms = t0.elapsed().as_millis() as u64;
     let count = o
         .idx
-        .count(&VectorFilter {
-            user_id: data.user,
-            space_ids: vec![],
-            path_prefix: None,
-            levels: vec![],
-        })
+        .count(&VectorFilter::scope(data.user, Data::spaces()))
         .await?;
     let rss_after = rss_now(o.qdrant_pid());
     let peak = sampler.finish();
@@ -677,10 +676,8 @@ fn queries(data: &Data, points: u64, n: usize, seed: u64) -> Vec<Q> {
             dense: data.dense(target, Some((seed ^ k, QUERY_NOISE))),
             sparse: data.query_sparse(target, seed ^ k),
             filter: VectorFilter {
-                user_id: data.user,
-                space_ids: Data::spaces(),
                 path_prefix,
-                levels: vec![],
+                ..VectorFilter::scope(data.user, Data::spaces())
             },
         });
     }

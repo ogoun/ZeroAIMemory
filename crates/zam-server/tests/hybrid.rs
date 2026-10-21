@@ -210,10 +210,9 @@ fn id_of<'a>(ids: &'a [(String, String)], path: &str) -> &'a str {
 /// Точек узла в Qdrant (все уровни заметки).
 async fn node_points(a: &Api, prefix: &str) -> u64 {
     let f = VectorFilter {
-        user_id: a.st.admin_id,
-        space_ids: vec![],
         path_prefix: Some(prefix.into()),
         levels: ["chunk", "section", "note"].map(String::from).to_vec(),
+        ..common::api::vector_base(a, a.st.admin_id).await
     };
     a.st.index.vector.as_ref().unwrap().count(&f).await.unwrap()
 }
@@ -530,7 +529,7 @@ async fn pending_and_failed_notes_keep_relaxed_fts_weight() {
         .vector
         .as_ref()
         .unwrap()
-        .delete_nodes(a.st.admin_id, &[cat])
+        .delete_node(a.st.admin_id, cat)
         .await
         .unwrap();
     assert_eq!(node_points(&a, "pets/cat-food").await, 0);

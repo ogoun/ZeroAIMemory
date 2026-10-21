@@ -121,3 +121,91 @@ fn free_port_is_not_issued_twice_in_process() {
     let unique: std::collections::HashSet<u16> = ports.iter().copied().collect();
     assert_eq!(unique.len(), ports.len());
 }
+
+/// Коллекция M2 (без payload-индексов записей журналов): `ensure` досоздаёт индексы
+/// `entry_id`, `kind`, `status`, `insight_kind`, `certainty`, `area` на месте — коллекция
+/// не пересоздаётся, точки остаются, `metadata.schema` по-прежнему 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_adds_indexes_to_existing_collection() {
+    use qdrant_client::Qdrant;
+    use qdrant_client::qdrant::DeleteFieldIndexCollectionBuilder;
+
+    const M3_FIELDS: [&str; 6] = [
+        "entry_id",
+        "kind",
+        "status",
+        "insight_kind",
+        "certainty",
+        "area",
+    ];
+    let q = TestQdrant::start("upgr");
+    let idx = connect(&q);
+    let raw = Qdrant::from_url(&q.grpc_url())
+        .api_key(Some(q.api_key.clone()))
+        .skip_compatibility_check()
+        .build()
+        .unwrap();
+    assert!(idx.ensure(MODEL, DIM).await.unwrap().created);
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    idx.upsert(vec![
+        point(&ctx, Id::new(), "m2-a", 1, "a", "chunk"),
+        point(&ctx, Id::new(), "m2-b", 2, "a", "note"),
+    ])
+    .await
+    .unwrap();
+    // приводим коллекцию к схеме M2: индексов полей записей нет
+    for field in M3_FIELDS {
+        raw.delete_field_index(
+            DeleteFieldIndexCollectionBuilder::new(zam_index::COLLECTION, field).wait(true),
+        )
+        .await
+        .unwrap();
+    }
+    let schema = async || -> Vec<String> {
+        let info = raw
+            .collection_info(zam_index::COLLECTION)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        info.payload_schema.into_keys().collect()
+    };
+    let before = schema().await;
+    assert!(
+        M3_FIELDS.iter().all(|f| !before.iter().any(|s| s == f)),
+        "{before:?}"
+    );
+
+    let m = idx.ensure(MODEL, DIM).await.unwrap();
+    assert!(!m.created);
+    assert_eq!(m.points, 2);
+    let after = schema().await;
+    for f in M3_FIELDS.iter().chain(&[
+        "user_id",
+        "space_id",
+        "node_id",
+        "path_ancestors",
+        "level",
+        "updated_at",
+    ]) {
+        assert!(after.iter().any(|s| s == f), "нет индекса {f}: {after:?}");
+    }
+    let info = raw
+        .collection_info(zam_index::COLLECTION)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let schema_v = info.config.unwrap().metadata.get("schema").cloned();
+    assert_eq!(schema_v, Some(qdrant_client::qdrant::Value::from(1i64)));
+    // точки на месте и находятся; фильтр статуса пропускает точки без status
+    let mut f = filter(&ctx);
+    f.exclude_statuses = vec!["superseded".into(), "retracted".into()];
+    let hits = idx.search(&vec_for(1), &sparse_for(1), &f).await.unwrap();
+    assert_eq!(hits.len(), 2);
+    // повторный ensure — без изменений
+    assert!(!idx.ensure(MODEL, DIM).await.unwrap().created);
+}

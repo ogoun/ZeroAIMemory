@@ -8,7 +8,11 @@
 //! - `sparse` — sparse-индекс `Memory::Cached`, без IDF-модификатора;
 //! - `on_disk_payload`, 2 сегмента, метаданные `{model_id, schema}`;
 //! - payload-индексы: `user_id` (keyword, `is_tenant`), `space_id`, `node_id`,
-//!   `path_ancestors`, `level` (keyword), `updated_at` (integer).
+//!   `path_ancestors`, `level` (keyword), `updated_at` (integer); с M3 — `entry_id`, `kind`,
+//!   `status`, `insight_kind`, `certainty`, `area` (keyword). Коллекцию M2 `ensure` дополняет
+//!   недостающими индексами на месте, `schema` остаётся 1;
+//! - фильтр — дизъюнкция областей `(user_id, space_id ∈ …)` (`should`) и общие условия
+//!   (`must`, статусы — `must_not`), один для всех prefetch.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -23,17 +27,18 @@ use qdrant_client::qdrant::{
     HnswConfigDiffBuilder, KeywordIndexParamsBuilder, Memory, NamedVectors,
     OptimizersConfigDiffBuilder, PayloadIncludeSelector, PointStruct, PrefetchQueryBuilder,
     QuantizationSearchParamsBuilder, Query, QueryPointsBuilder, RrfBuilder,
-    ScalarQuantizationBuilder, SearchParamsBuilder, SparseIndexConfigBuilder,
+    ScalarQuantizationBuilder, ScoredPoint, SearchParamsBuilder, SparseIndexConfigBuilder,
     SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpsertPointsBuilder, Value, Vector,
     VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
 };
 use qdrant_client::{Payload, Qdrant, QdrantError};
 use tonic::Code;
-use zam_core::Id;
+use zam_core::{Id, TargetRef};
 
 use crate::IndexError;
 use crate::vector::{
-    IndexFuture, IndexMeta, IndexPoint, VectorFilter, VectorHit, VectorIndex, point_id,
+    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, VectorFilter, VectorHit, VectorIndex,
+    VectorScope, check_points, hit_target, point_id, split_targets,
 };
 
 /// Имя коллекции (§6.4).
@@ -72,14 +77,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const LEVEL_CHUNK: &str = "chunk";
 const LEVELS_NOTE: [&str; 2] = ["note", "section"];
 
-/// Payload-индексы коллекции: (поле, тип, тенант).
-const PAYLOAD_INDEXES: [(&str, FieldType, bool); 6] = [
+/// Payload-индексы коллекции: (поле, тип, тенант). Последние шесть добавлены в M3:
+/// `ensure` досоздаёт их в существующей коллекции.
+const PAYLOAD_INDEXES: [(&str, FieldType, bool); 12] = [
     ("user_id", FieldType::Keyword, true),
     ("space_id", FieldType::Keyword, false),
     ("node_id", FieldType::Keyword, false),
     ("path_ancestors", FieldType::Keyword, false),
     ("level", FieldType::Keyword, false),
     ("updated_at", FieldType::Integer, false),
+    ("entry_id", FieldType::Keyword, false),
+    ("kind", FieldType::Keyword, false),
+    ("status", FieldType::Keyword, false),
+    ("insight_kind", FieldType::Keyword, false),
+    ("certainty", FieldType::Keyword, false),
+    ("area", FieldType::Keyword, false),
 ];
 
 /// Векторный индекс на Qdrant (gRPC, API-ключ в заголовке `api-key`).
@@ -134,13 +146,19 @@ impl QdrantIndex {
         }
         let (mut meta, schema) = self.read_meta().await?;
         meta.created = created;
-        // Недостающие payload-индексы (обрыв между созданием коллекции и индексов)
-        // досоздаём только в «своей» коллекции: чужую модель не трогаем.
+        // Недостающие payload-индексы (обрыв между созданием коллекции и индексов, коллекция
+        // M2 без индексов полей записей) досоздаём только в «своей» коллекции: чужую модель
+        // не трогаем. Создание индекса на существующей коллекции точки не трогает.
         if meta.model_id.as_deref() == Some(model_id) {
+            let mut added = 0;
             for (field, ty, tenant) in PAYLOAD_INDEXES {
                 if !schema.iter().any(|s| s == field) {
                     self.create_index(field, ty, tenant).await?;
+                    added += 1;
                 }
+            }
+            if added > 0 && !created {
+                tracing::info!(collection = COLLECTION, added, "добавлены payload-индексы");
             }
         }
         Ok(meta)
@@ -255,17 +273,7 @@ impl QdrantIndex {
 
     async fn upsert_impl(&self, pts: Vec<IndexPoint>) -> Result<(), IndexError> {
         // Неизменное ограничение §6.4: Human никогда не попадает в Qdrant.
-        if pts
-            .iter()
-            .any(|p| p.payload.space_kind.eq_ignore_ascii_case("human"))
-        {
-            return Err(IndexError::Other(
-                "пространство human не индексируется".into(),
-            ));
-        }
-        if pts.iter().any(|p| p.dense.is_empty()) {
-            return Err(IndexError::Other("точка без dense-вектора".into()));
-        }
+        check_points(&pts)?;
         let mut it = pts.into_iter().peekable();
         while it.peek().is_some() {
             let batch: Vec<PointStruct> = it.by_ref().take(UPSERT_BATCH).map(to_point).collect();
@@ -277,14 +285,23 @@ impl QdrantIndex {
         Ok(())
     }
 
-    async fn delete_nodes_impl(&self, user: Id, nodes: &[Id]) -> Result<(), IndexError> {
-        if nodes.is_empty() {
+    async fn delete_targets_impl(&self, user: Id, targets: &[TargetRef]) -> Result<(), IndexError> {
+        let (nodes, entries) = split_targets(targets);
+        let mut any = Vec::new();
+        if !nodes.is_empty() {
+            any.push(kw_any("node_id", nodes));
+        }
+        if !entries.is_empty() {
+            any.push(kw_any("entry_id", entries));
+        }
+        if any.is_empty() {
             return Ok(());
         }
-        let filter = Filter::must([
-            kw("user_id", user.to_string()),
-            kw_any("node_id", nodes.iter().map(Id::to_string).collect()),
-        ]);
+        let filter = Filter {
+            must: vec![kw("user_id", user.to_string())],
+            should: any,
+            ..Filter::default()
+        };
         self.client
             .delete_points(
                 DeletePointsBuilder::new(COLLECTION)
@@ -297,10 +314,14 @@ impl QdrantIndex {
     }
 
     async fn delete_scope_impl(&self, f: &VectorFilter) -> Result<(), IndexError> {
+        // Фильтр без областей Qdrant понял бы как «все точки»: удалять нечего.
+        let Some(filter) = point_filter(f, &f.levels) else {
+            return Ok(());
+        };
         self.client
             .delete_points(
                 DeletePointsBuilder::new(COLLECTION)
-                    .points(count_filter(f))
+                    .points(filter)
                     .wait(true),
             )
             .await
@@ -316,9 +337,10 @@ impl QdrantIndex {
     ) -> Result<Vec<VectorHit>, IndexError> {
         let leaf_levels = allowed_levels(&[LEVEL_CHUNK], &f.levels);
         let note_levels = allowed_levels(&LEVELS_NOTE, &f.levels);
-        let rescore = || {
-            SearchParamsBuilder::default()
-                .quantization(QuantizationSearchParamsBuilder::default().rescore(true))
+        let (Some(leaf_filter), Some(note_filter)) =
+            (point_filter(f, &leaf_levels), point_filter(f, &note_levels))
+        else {
+            return Ok(Vec::new());
         };
 
         let mut q = QueryPointsBuilder::new(COLLECTION);
@@ -328,7 +350,7 @@ impl QdrantIndex {
                 PrefetchQueryBuilder::default()
                     .query(Query::new_nearest(q_dense.to_vec()))
                     .using(DENSE)
-                    .filter(base_filter(f, &leaf_levels))
+                    .filter(leaf_filter.clone())
                     .params(rescore())
                     .limit(LEAF_PREFETCH),
             );
@@ -339,7 +361,7 @@ impl QdrantIndex {
                 PrefetchQueryBuilder::default()
                     .query(Query::new_nearest(VectorInput::from(q_sparse)))
                     .using(SPARSE)
-                    .filter(base_filter(f, &leaf_levels))
+                    .filter(leaf_filter)
                     .limit(LEAF_PREFETCH),
             );
             prefetches += 1;
@@ -349,7 +371,7 @@ impl QdrantIndex {
                 PrefetchQueryBuilder::default()
                     .query(Query::new_nearest(q_dense.to_vec()))
                     .using(DENSE)
-                    .filter(base_filter(f, &note_levels))
+                    .filter(note_filter)
                     .params(rescore())
                     .limit(NOTE_PREFETCH),
             );
@@ -361,41 +383,51 @@ impl QdrantIndex {
         let q = q
             .query(Query::new_rrf(RrfBuilder::with_k(RRF_K)))
             .limit(QUERY_LIMIT)
-            .with_payload(SelectorOptions::Include(PayloadIncludeSelector {
-                fields: vec!["chunk_id".into(), "node_id".into(), "level".into()],
-            }));
+            .with_payload(hit_payload());
         let resp = self
             .client
             .query(q)
             .await
             .map_err(|e| map_err("query", e))?;
-        resp.result
-            .into_iter()
-            .map(|p| {
-                let get = |k: &str| p.payload.get(k).and_then(value_str);
-                let chunk_id = get("chunk_id")
-                    .ok_or_else(|| IndexError::Corrupt("точка без chunk_id".into()))?;
-                let node_id = get("node_id")
-                    .and_then(|s| s.parse::<Id>().ok())
-                    .ok_or_else(|| IndexError::Corrupt("точка без корректного node_id".into()))?;
-                let level =
-                    get("level").ok_or_else(|| IndexError::Corrupt("точка без level".into()))?;
-                Ok(VectorHit {
-                    chunk_id,
-                    node_id,
-                    score: p.score,
-                    level,
-                })
-            })
-            .collect()
+        resp.result.into_iter().map(to_hit).collect()
+    }
+
+    async fn nearest_dense_impl(
+        &self,
+        v: &[f32],
+        f: &VectorFilter,
+        limit: usize,
+    ) -> Result<Vec<VectorHit>, IndexError> {
+        let Some(filter) = point_filter(f, &f.levels) else {
+            return Ok(Vec::new());
+        };
+        if v.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let q = QueryPointsBuilder::new(COLLECTION)
+            .query(Query::new_nearest(v.to_vec()))
+            .using(DENSE)
+            .filter(filter)
+            .params(rescore())
+            .limit(limit as u64)
+            .with_payload(hit_payload());
+        let resp = self
+            .client
+            .query(q)
+            .await
+            .map_err(|e| map_err("query", e))?;
+        resp.result.into_iter().map(to_hit).collect()
     }
 
     async fn count_impl(&self, f: &VectorFilter) -> Result<u64, IndexError> {
+        let Some(filter) = point_filter(f, &f.levels) else {
+            return Ok(0);
+        };
         Ok(self
             .client
             .count(
                 CountPointsBuilder::new(COLLECTION)
-                    .filter(count_filter(f))
+                    .filter(filter)
                     .exact(true),
             )
             .await
@@ -440,8 +472,8 @@ impl VectorIndex for QdrantIndex {
         Box::pin(self.upsert_impl(pts))
     }
 
-    fn delete_nodes<'a>(&'a self, user: Id, nodes: &'a [Id]) -> IndexFuture<'a, ()> {
-        Box::pin(self.delete_nodes_impl(user, nodes))
+    fn delete_targets<'a>(&'a self, user: Id, targets: &'a [TargetRef]) -> IndexFuture<'a, ()> {
+        Box::pin(self.delete_targets_impl(user, targets))
     }
 
     fn delete_scope<'a>(&'a self, f: &'a VectorFilter) -> IndexFuture<'a, ()> {
@@ -455,6 +487,15 @@ impl VectorIndex for QdrantIndex {
         f: &'a VectorFilter,
     ) -> IndexFuture<'a, Vec<VectorHit>> {
         Box::pin(self.search_impl(q_dense, q_sparse, f))
+    }
+
+    fn nearest_dense<'a>(
+        &'a self,
+        v: &'a [f32],
+        f: &'a VectorFilter,
+        limit: usize,
+    ) -> IndexFuture<'a, Vec<VectorHit>> {
+        Box::pin(self.nearest_dense_impl(v, f, limit))
     }
 
     fn count<'a>(&'a self, f: &'a VectorFilter) -> IndexFuture<'a, u64> {
@@ -486,7 +527,12 @@ fn to_point(p: IndexPoint) -> PointStruct {
     if let Some(g) = pl.solution_guid {
         payload.insert("solution_guid", g);
     }
-    payload.insert("node_id", pl.node_id.to_string());
+    if let Some(n) = pl.node_id {
+        payload.insert("node_id", n.to_string());
+    }
+    if let Some(e) = pl.entry_id {
+        payload.insert("entry_id", e.to_string());
+    }
     payload.insert("path_ancestors", pl.path_ancestors);
     if let Some(a) = pl.area {
         payload.insert("area", a);
@@ -497,6 +543,15 @@ fn to_point(p: IndexPoint) -> PointStruct {
     payload.insert("updated_at", pl.updated_at);
     payload.insert("rev", pl.rev);
     payload.insert("text_hash", pl.text_hash);
+    for (k, v) in [
+        ("status", pl.status),
+        ("insight_kind", pl.insight_kind),
+        ("certainty", pl.certainty),
+    ] {
+        if let Some(v) = v {
+            payload.insert(k, v);
+        }
+    }
     PointStruct::new(point_id(&p.chunk_id).to_string(), vectors, payload)
 }
 
@@ -511,35 +566,86 @@ fn kw_any(field: &str, values: Vec<String>) -> Condition {
     Condition::matches(field, values)
 }
 
-/// Фильтр подсчёта: тенант, пространства, путь; уровни — только если заданы.
-fn count_filter(f: &VectorFilter) -> Filter {
-    let mut must = scope_conditions(f);
-    if !f.levels.is_empty() {
-        must.push(kw_any("level", f.levels.clone()));
-    }
-    Filter::must(must)
+/// Тенант и пространства одной области.
+fn scope_must(s: &VectorScope) -> Vec<Condition> {
+    vec![
+        kw("user_id", s.user_id.to_string()),
+        kw_any("space_id", s.space_ids.iter().map(Id::to_string).collect()),
+    ]
 }
 
-/// Тенант, пространства и префикс пути.
-fn scope_conditions(f: &VectorFilter) -> Vec<Condition> {
-    let mut must = vec![kw("user_id", f.user_id.to_string())];
-    if !f.space_ids.is_empty() {
-        must.push(kw_any(
-            "space_id",
-            f.space_ids.iter().map(Id::to_string).collect(),
-        ));
+/// Фильтр точек: дизъюнкция областей (одна область — прямо в `must`, условие на тенанта
+/// остаётся верхнеуровневым), путь, уровни `levels` (пустой — все), виды, виды инсайтов,
+/// `certainty` и `area` — в `must`, исключаемые статусы — в `must_not` (точки без `status`
+/// проходят). `None` — нет ни одной области с пространствами: фильтр не пропускает ничего
+/// (пустой фильтр Qdrant пропустил бы всё).
+fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
+    let scopes: Vec<&VectorScope> = f.live_scopes().collect();
+    let mut filter = Filter::default();
+    match scopes.as_slice() {
+        [] => return None,
+        [one] => filter.must = scope_must(one),
+        many => {
+            filter.should = many
+                .iter()
+                .map(|s| Condition::from(Filter::must(scope_must(s))))
+                .collect();
+        }
     }
     if let Some(prefix) = &f.path_prefix {
-        must.push(kw("path_ancestors", prefix.clone()));
+        filter.must.push(kw("path_ancestors", prefix.clone()));
     }
-    must
+    for (field, values) in [
+        ("level", levels),
+        ("kind", f.kinds.as_slice()),
+        ("insight_kind", f.insight_kinds.as_slice()),
+        ("certainty", f.certainty.as_slice()),
+    ] {
+        if !values.is_empty() {
+            filter.must.push(kw_any(field, values.to_vec()));
+        }
+    }
+    if let Some(area) = &f.area {
+        filter.must.push(kw("area", area.clone()));
+    }
+    if !f.exclude_statuses.is_empty() {
+        filter
+            .must_not
+            .push(kw_any("status", f.exclude_statuses.clone()));
+    }
+    Some(filter)
 }
 
-/// Фильтр prefetch: тенант, пространства, путь и уровни этого prefetch.
-fn base_filter(f: &VectorFilter, levels: &[String]) -> Filter {
-    let mut must = scope_conditions(f);
-    must.push(kw_any("level", levels.to_vec()));
-    Filter::must(must)
+/// Поиск по int8 с rescoring по оригиналам.
+fn rescore() -> SearchParamsBuilder {
+    SearchParamsBuilder::default()
+        .quantization(QuantizationSearchParamsBuilder::default().rescore(true))
+}
+
+/// Поля payload для выдачи.
+fn hit_payload() -> SelectorOptions {
+    SelectorOptions::Include(PayloadIncludeSelector {
+        fields: HIT_FIELDS.iter().map(|f| (*f).to_string()).collect(),
+    })
+}
+
+/// Точка выдачи → [`VectorHit`].
+fn to_hit(p: ScoredPoint) -> Result<VectorHit, IndexError> {
+    let get = |k: &str| p.payload.get(k).and_then(value_str);
+    let chunk_id =
+        get("chunk_id").ok_or_else(|| IndexError::Corrupt("точка без chunk_id".into()))?;
+    let user_id = get("user_id")
+        .and_then(|s| s.parse::<Id>().ok())
+        .ok_or_else(|| IndexError::Corrupt("точка без корректного user_id".into()))?;
+    let target = hit_target(get("node_id"), get("entry_id"))?;
+    let level = get("level").ok_or_else(|| IndexError::Corrupt("точка без level".into()))?;
+    Ok(VectorHit {
+        chunk_id,
+        user_id,
+        target,
+        score: p.score,
+        level,
+    })
 }
 
 /// Уровни prefetch с учётом фильтра вызывающего (пустой фильтр — все уровни prefetch).

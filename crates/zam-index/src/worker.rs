@@ -26,7 +26,7 @@
 //! 4. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла →
 //!    кэш `embeddings` по `chunks.embed_key` → инференс промахов (`spawn_blocking`, пачки
 //!    не больше `batch_tokens`, уступка `yield_ms`) → одна запись в Qdrant на пачку:
-//!    `delete_nodes` + `upsert` (`wait=true`; отказ пачки — по одному узлу) →
+//!    `delete_targets` + `upsert` (`wait=true`; отказ пачки — по одному узлу) →
 //!    auto-L0 → `complete_job`, который в своей транзакции ставит `index_state = 'indexed'`
 //!    только при [`JobOutcome::Done`] и без активного задания узла.
 //!    Qdrant недоступен или коллекции нет — задания возвращаются [`release_job`] без
@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use tokio::sync::{Notify, watch};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::ChunkLevel;
 use zam_store::{
     Db, Embedding, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, NodeKind,
@@ -1413,7 +1413,14 @@ impl Worker {
         }
         let t = Instant::now();
         let res = async {
-            self.deps.vector.delete_nodes(user, nodes).await?;
+            let targets: Vec<TargetRef> = nodes
+                .iter()
+                .map(|&id| TargetRef {
+                    kind: TargetKind::Node,
+                    id,
+                })
+                .collect();
+            self.deps.vector.delete_targets(user, &targets).await?;
             if !pts.is_empty() {
                 self.deps.vector.upsert(pts).await?;
             }
@@ -1858,7 +1865,8 @@ pub(crate) fn folder_point(user: Id, f: &IndexFolder, e: Embedding, key: String)
             space_id: f.space_id,
             space_kind: f.space_kind.as_str().to_string(),
             solution_guid: f.solution_guid.clone(),
-            node_id: f.node_id,
+            node_id: Some(f.node_id),
+            entry_id: None,
             path_ancestors: zam_store::path_ancestors(&f.path),
             area: None,
             level: "folder".into(),
@@ -1867,31 +1875,49 @@ pub(crate) fn folder_point(user: Id, f: &IndexFolder, e: Embedding, key: String)
             updated_at: f.updated_at.as_second(),
             rev: 0,
             text_hash: key,
+            status: None,
+            insight_kind: None,
+            certainty: None,
         },
     }
 }
 
-/// Точка чанка заметки.
+/// Точка чанка заметки или записи журнала (`c.entry`): у записи цель — `entry_id`, вид и
+/// поля записи — из [`zam_store::EntryPayload`].
 pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint {
+    let mut payload = PointPayload {
+        user_id: user,
+        space_id: c.node.space_id,
+        space_kind: c.node.space_kind.as_str().to_string(),
+        solution_guid: c.node.solution_guid.clone(),
+        node_id: Some(c.node.node_id),
+        entry_id: None,
+        path_ancestors: c.node.path_ancestors.clone(),
+        area: None,
+        level: c.level.as_str().to_string(),
+        kind: "note".into(),
+        tags: c.node.tags.clone(),
+        updated_at: c.node.updated_at.as_second(),
+        rev: c.rev,
+        text_hash: c.text_hash.clone(),
+        status: None,
+        insight_kind: None,
+        certainty: None,
+    };
+    if let Some(en) = &c.entry {
+        payload.node_id = None;
+        payload.entry_id = Some(en.entry_id);
+        payload.kind = en.kind.clone();
+        payload.status = en.status.clone();
+        payload.insight_kind = en.insight_kind.clone();
+        payload.certainty = en.certainty.clone();
+        payload.area = en.area.clone();
+    }
     IndexPoint {
         chunk_id: c.id.clone(),
         dense: e.dense.clone(),
         sparse: e.sparse.clone(),
-        payload: PointPayload {
-            user_id: user,
-            space_id: c.node.space_id,
-            space_kind: c.node.space_kind.as_str().to_string(),
-            solution_guid: c.node.solution_guid.clone(),
-            node_id: c.node.node_id,
-            path_ancestors: c.node.path_ancestors.clone(),
-            area: None,
-            level: c.level.as_str().to_string(),
-            kind: "note".into(),
-            tags: c.node.tags.clone(),
-            updated_at: c.node.updated_at.as_second(),
-            rev: c.rev,
-            text_hash: c.text_hash.clone(),
-        },
+        payload,
     }
 }
 

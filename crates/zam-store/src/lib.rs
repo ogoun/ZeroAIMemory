@@ -30,11 +30,11 @@ pub use embeddings::{
     gc_embeddings, get_embeddings, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
 };
 pub use jobs::{
-    FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats, NodePayload,
-    ReindexNote, chunks_for_index, claim_jobs, complete_job, enqueue_reindex, enqueue_upserts,
-    fail_job, failed_jobs, finish_reindexed, folders_for_index, indexable_count, indexed_count,
-    job_stats, mark_reindex, pending_reindex, reindex_page, release_job, requeue_running,
-    set_index_state,
+    EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats,
+    NodePayload, ReindexNote, chunks_for_index, claim_jobs, complete_job, enqueue_reindex,
+    enqueue_upserts, fail_job, failed_jobs, finish_reindexed, folders_for_index, indexable_count,
+    indexed_count, job_stats, mark_reindex, pending_reindex, reindex_page, release_job,
+    requeue_running, set_index_state,
 };
 pub use migrate::Migration;
 pub use nodes::{

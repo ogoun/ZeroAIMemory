@@ -25,10 +25,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_index::supervisor::QdrantState;
-use zam_index::{ReindexOutcome, ReindexRequest, VectorFilter};
+use zam_index::{ReindexOutcome, ReindexRequest, VectorFilter, VectorScope};
 use zam_ml::Device;
 use zam_store::time::fmt_ts;
-use zam_store::{FailedJob, JobStats, failed_jobs, indexable_count, job_stats};
+use zam_store::{FailedJob, JobStats, failed_jobs, indexable_count, job_stats, list_spaces};
 
 use crate::app::AppState;
 use crate::auth::{AdminOnly, Client, Principal, USER_HEADER, target_user};
@@ -129,14 +129,17 @@ pub async fn status(
     // при обходе всех баз неоткрывающаяся (повреждённая) не ломает ответ: она в
     // `unavailable_dbs`; база, указанная явно, — ошибка как обычно
     let mut unavailable: Vec<Value> = Vec::new();
+    // области точек: база каждого видимого пользователя со всеми её пространствами
+    let mut scopes: Vec<VectorScope> = Vec::new();
     for u in &users {
         let one = async {
             let db = st.users.get(*u).await?;
             let s = job_stats(&db).await?;
             let f = failed_jobs(&db, FAILED_ITEMS).await?;
-            Ok::<_, zam_store::StoreError>((s, f))
+            let sp: Vec<Id> = list_spaces(&db).await?.into_iter().map(|s| s.id).collect();
+            Ok::<_, zam_store::StoreError>((s, f, sp))
         };
-        let (s, f) = match one.await {
+        let (s, f, sp) = match one.await {
             Ok(v) => v,
             Err(e) if all => {
                 unavailable.push(json!({ "user_id": u, "error": e.to_string() }));
@@ -144,6 +147,10 @@ pub async fn status(
             }
             Err(e) => return Err(e.into()),
         };
+        scopes.push(VectorScope {
+            user_id: *u,
+            space_ids: sp,
+        });
         queue.queued += s.queued;
         queue.running += s.running;
         queue.failed += s.failed;
@@ -164,23 +171,14 @@ pub async fn status(
     // точки видимых пользователей; Qdrant недоступен или долго отвечает — null
     let points = match &rt.vector {
         Some(v) if wst.vector_ready => {
-            let count = async {
-                let mut n = 0u64;
-                for u in &users {
-                    let f = VectorFilter {
-                        user_id: *u,
-                        space_ids: Vec::new(),
-                        path_prefix: None,
-                        levels: Vec::new(),
-                    };
-                    n += v.count(&f).await.ok()?;
-                }
-                Some(n)
+            let f = VectorFilter {
+                scopes,
+                ..VectorFilter::default()
             };
-            tokio::time::timeout(POINTS_TIMEOUT, count)
+            tokio::time::timeout(POINTS_TIMEOUT, v.count(&f))
                 .await
                 .ok()
-                .flatten()
+                .and_then(Result::ok)
         }
         _ => None,
     };

@@ -36,8 +36,8 @@ use zam_core::Id;
 use zam_store::{
     Db, Embedding, IndexFolder, ReindexNote, StoreError, SystemStore, UserDbs,
     adopt_owned_embeddings_batch, enqueue_reindex, enqueue_upserts, finish_reindexed,
-    folders_for_index, gc_embeddings, get_embeddings, mark_reindex, put_owned_embeddings,
-    reindex_page,
+    folders_for_index, gc_embeddings, get_embeddings, list_spaces, mark_reindex,
+    put_owned_embeddings, reindex_page,
 };
 
 use crate::worker::{chunk_point, folder_embed, folder_point};
@@ -272,13 +272,14 @@ async fn cache_user(
 ) -> Result<(), UserFail> {
     if !fresh {
         let t = Instant::now();
+        // область — пространство или все пространства базы (область без пространств
+        // фильтр не пропускает, «весь тенант» — это перечень его пространств)
+        let spaces = match space {
+            Some(s) => vec![s],
+            None => list_spaces(db).await?.into_iter().map(|s| s.id).collect(),
+        };
         ctx.vector
-            .delete_scope(&VectorFilter {
-                user_id: user,
-                space_ids: space.into_iter().collect(),
-                path_prefix: None,
-                levels: Vec::new(),
-            })
+            .delete_scope(&VectorFilter::scope(user, spaces))
             .await?;
         rep.write_ms += t.elapsed().as_millis() as u64;
     }

@@ -40,7 +40,7 @@ pub use qdrant::{COLLECTION, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE};
 pub use reindex::{ReindexCtx, ReindexReport, ReindexRequest, reindex};
 pub use vector::{
     IndexFuture, IndexMeta, IndexPoint, NAMESPACE_ZAM, PointPayload, VectorFilter, VectorHit,
-    VectorIndex, point_id,
+    VectorIndex, VectorScope, point_id,
 };
 pub use worker::{
     PassageEmbedder, ReindexOutcome, SkippedDb, WorkerConfig, WorkerDeps, WorkerHandle,

@@ -161,10 +161,9 @@ async fn state(a: &Api, node: &str) -> String {
 /// Точки заметок (без папок) под префиксом пути.
 async fn points(a: &Api, prefix: &str) -> u64 {
     let f = VectorFilter {
-        user_id: a.st.admin_id,
-        space_ids: vec![],
         path_prefix: Some(prefix.into()),
         levels: ["chunk", "section", "note"].map(String::from).to_vec(),
+        ..common::api::vector_base(a, a.st.admin_id).await
     };
     a.st.index.vector.as_ref().unwrap().count(&f).await.unwrap()
 }

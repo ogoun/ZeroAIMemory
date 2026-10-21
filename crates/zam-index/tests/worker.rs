@@ -61,6 +61,16 @@ impl PassageEmbedder for Fake {
     }
 }
 
+/// Все пространства базы.
+async fn all_spaces(db: &Db) -> Vec<Id> {
+    list_spaces(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect()
+}
+
 struct Env {
     _q: TestQdrant,
     users_dir: PathBuf,
@@ -174,13 +184,21 @@ impl Env {
     }
 
     async fn count(&self, space: Option<Id>, prefix: Option<&str>, levels: &[&str]) -> u64 {
+        let spaces = match space {
+            Some(s) => vec![s],
+            None => all_spaces(&self.db).await,
+        };
         let f = VectorFilter {
-            user_id: self.user,
-            space_ids: space.into_iter().collect(),
             path_prefix: prefix.map(str::to_string),
             levels: levels.iter().map(|l| l.to_string()).collect(),
+            ..VectorFilter::scope(self.user, spaces)
         };
         self.vector.count(&f).await.unwrap()
+    }
+
+    /// Фильтр всей базы пользователя теста (все её пространства).
+    async fn whole_base(&self) -> VectorFilter {
+        VectorFilter::scope(self.user, all_spaces(&self.db).await)
     }
 
     async fn state(&self, node: Id) -> String {
@@ -723,15 +741,7 @@ async fn reindex_from_cache_without_inference() {
     .await
     .unwrap();
     // все точки пользователя удалены (как после сбоя): reindex всей базы
-    e.vector
-        .delete_scope(&VectorFilter {
-            user_id: e.user,
-            space_ids: vec![],
-            path_prefix: None,
-            levels: vec![],
-        })
-        .await
-        .unwrap();
+    e.vector.delete_scope(&e.whole_base().await).await.unwrap();
     let rep = e
         .reindex(
             &w,
@@ -826,15 +836,7 @@ async fn interrupted_reindex_is_resumed_on_start() {
         w.shutdown().await;
     }
     // точки удалены, отметка стоит — как при остановке посреди reindex
-    e.vector
-        .delete_scope(&VectorFilter {
-            user_id: e.user,
-            space_ids: vec![],
-            path_prefix: None,
-            levels: vec![],
-        })
-        .await
-        .unwrap();
+    e.vector.delete_scope(&e.whole_base().await).await.unwrap();
     mark_reindex(&e.db, Some("{\"full\":false,\"space\":null}".into()))
         .await
         .unwrap();
@@ -1052,17 +1054,12 @@ async fn skipped_db_survives_restart_and_is_reindexed_after_restore() {
     let b = e.system.create_user("b", false).await.unwrap().id;
     let file = e.users_dir.join(format!("{b}.db"));
     let keep = e.users_dir.join(format!("{b}.keep"));
-    let b_points = async || {
-        e.vector
-            .count(&VectorFilter {
-                user_id: b,
-                space_ids: vec![],
-                path_prefix: None,
-                levels: vec![],
-            })
-            .await
-            .unwrap()
+    // пространства b — до порчи файла (отдельный кэш баз закрывает файл при выходе)
+    let b_all = {
+        let users = UserDbs::new(e.users_dir.clone());
+        VectorFilter::scope(b, all_spaces(&users.get(b).await.unwrap()).await)
     };
+    let b_points = async || e.vector.count(&b_all).await.unwrap();
     // b индексируется воркером на отдельном кэше баз: файл закроется вместе с ним
     let pts = {
         let users = UserDbs::new(e.users_dir.clone());
@@ -1100,15 +1097,7 @@ async fn skipped_db_survives_restart_and_is_reindexed_after_restore() {
     };
     // копия базы b; хранилище «стёрто» (точек b нет), файл b повреждён
     std::fs::copy(&file, &keep).unwrap();
-    e.vector
-        .delete_scope(&VectorFilter {
-            user_id: b,
-            space_ids: vec![],
-            path_prefix: None,
-            levels: vec![],
-        })
-        .await
-        .unwrap();
+    e.vector.delete_scope(&b_all).await.unwrap();
     std::fs::write(&file, b"not a sqlite database at all").unwrap();
     {
         let w = e.spawn_on(UserDbs::new(e.users_dir.clone()));

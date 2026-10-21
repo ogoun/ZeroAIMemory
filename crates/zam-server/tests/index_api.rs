@@ -41,10 +41,8 @@ async fn chunk_count(a: &Api, node: &str) -> u64 {
 /// Точки пользователя администратора (все уровни, в том числе папки).
 async fn points(a: &Api, prefix: Option<&str>) -> u64 {
     let f = VectorFilter {
-        user_id: uid(a),
-        space_ids: vec![],
         path_prefix: prefix.map(str::to_string),
-        levels: vec![],
+        ..common::api::vector_base(a, uid(a)).await
     };
     a.st.index.vector.as_ref().unwrap().count(&f).await.unwrap()
 }

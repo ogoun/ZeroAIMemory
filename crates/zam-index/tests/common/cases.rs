@@ -4,8 +4,8 @@
 //! индекс; тесты, специфичные для процесса Qdrant (ключ, недоступность, падение), остаются
 //! в `tests/qdrant.rs`.
 
-use zam_core::Id;
-use zam_index::{IndexError, IndexPoint, PointPayload, VectorFilter, VectorIndex};
+use zam_core::{Id, TargetKind, TargetRef};
+use zam_index::{IndexError, IndexPoint, PointPayload, VectorFilter, VectorIndex, VectorScope};
 
 pub const DIM: usize = 16;
 pub const MODEL: &str = "test/minilm@abc123";
@@ -57,7 +57,8 @@ pub fn point(
             space_id: ctx.space,
             space_kind: "knowledge".into(),
             solution_guid: None,
-            node_id: node,
+            node_id: Some(node),
+            entry_id: None,
             path_ancestors: ancestors(path),
             area: None,
             level: level.into(),
@@ -66,17 +67,71 @@ pub fn point(
             updated_at: 1_760_000_000,
             rev: 1,
             text_hash: format!("h{seed}"),
+            status: None,
+            insight_kind: None,
+            certainty: None,
         },
     }
 }
 
+/// Точка записи журнала `entry` (вид `kind`) вместо узла.
+pub fn entry_point(ctx: &Ctx, entry: Id, chunk_id: &str, seed: u64, kind: &str) -> IndexPoint {
+    let mut p = point(ctx, entry, chunk_id, seed, "j", "chunk");
+    p.payload.node_id = None;
+    p.payload.entry_id = Some(entry);
+    p.payload.kind = kind.into();
+    p
+}
+
+pub fn node_ref(id: Id) -> TargetRef {
+    TargetRef {
+        kind: TargetKind::Node,
+        id,
+    }
+}
+
+pub fn entry_ref(id: Id) -> TargetRef {
+    TargetRef {
+        kind: TargetKind::Entry,
+        id,
+    }
+}
+
+/// Фильтр одной области: пользователь и его пространство.
 pub fn filter(ctx: &Ctx) -> VectorFilter {
     VectorFilter {
-        user_id: ctx.user,
-        space_ids: vec![ctx.space],
-        path_prefix: None,
-        levels: vec![],
+        scopes: vec![VectorScope {
+            user_id: ctx.user,
+            space_ids: vec![ctx.space],
+        }],
+        ..VectorFilter::default()
     }
+}
+
+/// Отсортированные `chunk_id` выдачи гибридного поиска.
+async fn search_ids(idx: &dyn VectorIndex, seed: u64, f: &VectorFilter) -> Vec<String> {
+    let mut ids: Vec<String> = idx
+        .search(&vec_for(seed), &sparse_for(seed), f)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.chunk_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Отсортированные `chunk_id` выдачи `nearest_dense`.
+async fn nearest_ids(idx: &dyn VectorIndex, seed: u64, f: &VectorFilter) -> Vec<String> {
+    let mut ids: Vec<String> = idx
+        .nearest_dense(&vec_for(seed), f, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.chunk_id)
+        .collect();
+    ids.sort();
+    ids
 }
 
 pub async fn ensure_creates_collection_and_is_idempotent(idx: &dyn VectorIndex) {
@@ -131,7 +186,8 @@ pub async fn upsert_200_and_search_finds_itself_first(idx: &dyn VectorIndex) {
     assert!(!hits.is_empty());
     assert!(hits.len() <= 60);
     assert_eq!(hits[0].chunk_id, "chunk-77");
-    assert_eq!(hits[0].node_id, node);
+    assert_eq!(hits[0].target, node_ref(node));
+    assert_eq!(hits[0].user_id, ctx.user);
     assert_eq!(hits[0].level, "chunk");
 }
 
@@ -197,7 +253,7 @@ pub async fn filters_isolate_users_and_spaces(idx: &dyn VectorIndex) {
 
     // Оба пространства пользователя A — match any; чужой пользователь не виден.
     let mut f = filter(&a);
-    f.space_ids = vec![a.space, a2.space, b.space];
+    f.scopes[0].space_ids = vec![a.space, a2.space, b.space];
     let mut ids: Vec<String> = idx
         .search(&vec_for(5), &sparse_for(5), &f)
         .await
@@ -306,7 +362,7 @@ pub async fn delete_node_removes_all_its_points(idx: &dyn VectorIndex) {
         .search(&vec_for(2), &sparse_for(2), &filter(&ctx))
         .await
         .unwrap();
-    assert!(hits.iter().all(|h| h.node_id == n2));
+    assert!(hits.iter().all(|h| h.target == node_ref(n2)));
 }
 
 pub async fn missing_collection_is_not_found_and_count_filters(idx: &dyn VectorIndex) {
@@ -342,9 +398,16 @@ pub async fn missing_collection_is_not_found_and_count_filters(idx: &dyn VectorI
     f = filter(&other);
     f.path_prefix = Some("a".into());
     assert_eq!(idx.count(&f).await.unwrap(), 0);
-    f.space_ids = vec![];
-    assert_eq!(idx.count(&f).await.unwrap(), 2);
-    f.user_id = Id::new();
+    f.scopes[0].space_ids = vec![ctx.space, other.space];
+    f.path_prefix = None;
+    assert_eq!(idx.count(&f).await.unwrap(), 3);
+    f.scopes[0].user_id = Id::new();
+    assert_eq!(idx.count(&f).await.unwrap(), 0);
+    // область без пространств и пустой список областей не пропускают ничего
+    f = filter(&ctx);
+    f.scopes[0].space_ids.clear();
+    assert_eq!(idx.count(&f).await.unwrap(), 0);
+    f.scopes.clear();
     assert_eq!(idx.count(&f).await.unwrap(), 0);
 }
 
@@ -372,6 +435,261 @@ pub async fn drop_all_removes_collection(idx: &dyn VectorIndex) {
     assert_eq!(m.dim, 8);
 }
 
+/// Дизъюнкция областей: «B и его Knowledge» ИЛИ «A и его Solution» — Knowledge A не виден.
+pub async fn scopes_disjunction_isolates_users_and_spaces(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let a_know = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let a_sol = Ctx {
+        user: a_know.user,
+        space: Id::new(),
+    };
+    let b_know = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    idx.upsert(vec![
+        point(&a_know, Id::new(), "ak", 5, "p/x", "chunk"),
+        point(&a_sol, Id::new(), "as", 5, "p/x", "chunk"),
+        point(&a_sol, Id::new(), "as-other", 5, "q", "chunk"),
+        point(&b_know, Id::new(), "bk", 5, "p/x", "chunk"),
+    ])
+    .await
+    .unwrap();
+    let mut f = VectorFilter {
+        scopes: vec![
+            VectorScope {
+                user_id: b_know.user,
+                space_ids: vec![b_know.space],
+            },
+            VectorScope {
+                user_id: a_know.user,
+                space_ids: vec![a_sol.space],
+            },
+        ],
+        ..VectorFilter::default()
+    };
+    assert_eq!(search_ids(idx, 5, &f).await, ["as", "as-other", "bk"]);
+    assert_eq!(nearest_ids(idx, 5, &f).await, ["as", "as-other", "bk"]);
+    assert_eq!(idx.count(&f).await.unwrap(), 3);
+    // выдача несёт владельца базы
+    let hits = idx.nearest_dense(&vec_for(5), &f, 10).await.unwrap();
+    for h in &hits {
+        let owner = if h.chunk_id == "bk" {
+            b_know.user
+        } else {
+            a_know.user
+        };
+        assert_eq!(h.user_id, owner, "{h:?}");
+    }
+    // префикс пути — внутри каждой области
+    f.path_prefix = Some("p".into());
+    assert_eq!(search_ids(idx, 5, &f).await, ["as", "bk"]);
+    // пространство A под тенантом B — не область B
+    let cross = VectorFilter {
+        scopes: vec![VectorScope {
+            user_id: b_know.user,
+            space_ids: vec![a_know.space],
+        }],
+        ..VectorFilter::default()
+    };
+    assert!(search_ids(idx, 5, &cross).await.is_empty());
+    assert_eq!(idx.count(&cross).await.unwrap(), 0);
+    // пустой список областей — пустая выдача, удаление области ничего не трогает
+    let none = VectorFilter::default();
+    assert!(search_ids(idx, 5, &none).await.is_empty());
+    assert!(nearest_ids(idx, 5, &none).await.is_empty());
+    idx.delete_scope(&none).await.unwrap();
+    assert_eq!(idx.ensure(MODEL, DIM).await.unwrap().points, 4);
+    // удаление по дизъюнкции областей — только их точки
+    f.path_prefix = None;
+    idx.delete_scope(&f).await.unwrap();
+    assert_eq!(idx.ensure(MODEL, DIM).await.unwrap().points, 1);
+    assert_eq!(search_ids(idx, 5, &filter(&a_know)).await, ["ak"]);
+}
+
+/// Исключающий фильтр статуса: точки M2 без `status` проходят.
+pub async fn exclude_statuses_keeps_points_without_status(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let mut pts = vec![point(&ctx, Id::new(), "m2", 3, "a", "chunk")];
+    for st in ["active", "revisit", "superseded", "retracted"] {
+        let mut p = entry_point(&ctx, Id::new(), st, 3, "insight");
+        p.payload.status = Some(st.into());
+        pts.push(p);
+    }
+    idx.upsert(pts).await.unwrap();
+    let mut f = filter(&ctx);
+    f.exclude_statuses = vec!["superseded".into(), "retracted".into()];
+    assert_eq!(search_ids(idx, 3, &f).await, ["active", "m2", "revisit"]);
+    assert_eq!(nearest_ids(idx, 3, &f).await, ["active", "m2", "revisit"]);
+    assert_eq!(idx.count(&f).await.unwrap(), 3);
+    // без фильтра — все
+    assert_eq!(idx.count(&filter(&ctx)).await.unwrap(), 5);
+}
+
+/// Фильтры вида, вида инсайта, `certainty` и области (`area`).
+pub async fn kinds_insight_kinds_certainty_area_filters(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let note = point(&ctx, Id::new(), "note", 4, "a", "chunk");
+    let mut ax = entry_point(&ctx, Id::new(), "ins-axiom", 4, "insight");
+    ax.payload.insight_kind = Some("pattern".into());
+    ax.payload.certainty = Some("axiom".into());
+    ax.payload.area = Some("backend".into());
+    let mut hy = entry_point(&ctx, Id::new(), "ins-hypo", 4, "insight");
+    hy.payload.insight_kind = Some("gotcha".into());
+    hy.payload.certainty = Some("hypothesis".into());
+    hy.payload.area = Some("frontend".into());
+    let mut bare = entry_point(&ctx, Id::new(), "ins-bare", 4, "insight");
+    bare.payload.insight_kind = Some("gotcha".into());
+    let log = entry_point(&ctx, Id::new(), "changelog", 4, "changelog");
+    idx.upsert(vec![note, ax, hy, bare, log]).await.unwrap();
+
+    let all = ["changelog", "ins-axiom", "ins-bare", "ins-hypo", "note"];
+    assert_eq!(search_ids(idx, 4, &filter(&ctx)).await, all);
+    let mut f = filter(&ctx);
+    f.kinds = vec!["insight".into()];
+    assert_eq!(
+        search_ids(idx, 4, &f).await,
+        ["ins-axiom", "ins-bare", "ins-hypo"]
+    );
+    f.kinds = vec!["note".into(), "changelog".into()];
+    assert_eq!(nearest_ids(idx, 4, &f).await, ["changelog", "note"]);
+    f = filter(&ctx);
+    f.insight_kinds = vec!["gotcha".into()];
+    assert_eq!(search_ids(idx, 4, &f).await, ["ins-bare", "ins-hypo"]);
+    f = filter(&ctx);
+    f.certainty = vec!["axiom".into(), "theorem".into()];
+    assert_eq!(search_ids(idx, 4, &f).await, ["ins-axiom"]);
+    assert_eq!(idx.count(&f).await.unwrap(), 1);
+    f = filter(&ctx);
+    f.area = Some("frontend".into());
+    assert_eq!(nearest_ids(idx, 4, &f).await, ["ins-hypo"]);
+    // сочетание условий — конъюнкция
+    f.kinds = vec!["insight".into()];
+    f.certainty = vec!["axiom".into()];
+    assert!(search_ids(idx, 4, &f).await.is_empty());
+}
+
+/// Удаление по узлам и записям — только тенанта `user`.
+pub async fn delete_targets_by_node_and_entry(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let (n1, e1, e2) = (Id::new(), Id::new(), Id::new());
+    idx.upsert(vec![
+        point(&ctx, n1, "n1-a", 1, "a", "chunk"),
+        point(&ctx, n1, "n1-b", 2, "a", "note"),
+        entry_point(&ctx, e1, "e1-a", 3, "insight"),
+        entry_point(&ctx, e1, "e1-b", 4, "insight"),
+        entry_point(&ctx, e2, "e2-a", 5, "changelog"),
+    ])
+    .await
+    .unwrap();
+    // пустой список — ничего; чужой тенант с теми же id — ничего
+    idx.delete_targets(ctx.user, &[]).await.unwrap();
+    idx.delete_targets(Id::new(), &[node_ref(n1), entry_ref(e1)])
+        .await
+        .unwrap();
+    assert_eq!(idx.ensure(MODEL, DIM).await.unwrap().points, 5);
+    // id узла как id записи (и наоборот) — не та цель
+    idx.delete_targets(ctx.user, &[entry_ref(n1), node_ref(e1)])
+        .await
+        .unwrap();
+    assert_eq!(idx.ensure(MODEL, DIM).await.unwrap().points, 5);
+
+    idx.delete_targets(ctx.user, &[node_ref(n1), entry_ref(e1)])
+        .await
+        .unwrap();
+    assert_eq!(idx.ensure(MODEL, DIM).await.unwrap().points, 1);
+    let hits = idx
+        .search(&vec_for(5), &sparse_for(5), &filter(&ctx))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].target, entry_ref(e2));
+}
+
+/// `nearest_dense`: score — косинус, порядок по убыванию, предел и фильтр соблюдаются.
+pub async fn nearest_dense_returns_cosine(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let other = Ctx {
+        user: Id::new(),
+        space: ctx.space,
+    };
+    let e = Id::new();
+    let mut pts: Vec<IndexPoint> = (1..=6)
+        .map(|i| point(&ctx, Id::new(), &format!("c{i}"), i, "a", "chunk"))
+        .collect();
+    pts.push(entry_point(&ctx, e, "entry", 1, "insight"));
+    pts.push(point(&other, Id::new(), "foreign", 1, "a", "chunk"));
+    idx.upsert(pts).await.unwrap();
+
+    let q = vec_for(1);
+    let hits = idx.nearest_dense(&q, &filter(&ctx), 4).await.unwrap();
+    assert_eq!(hits.len(), 4);
+    assert!(hits.iter().all(|h| h.chunk_id != "foreign"), "{hits:?}");
+    assert!(
+        hits.windows(2).all(|w| w[0].score >= w[1].score),
+        "{hits:?}"
+    );
+    let cos = |seed: u64| -> f32 { q.iter().zip(vec_for(seed)).map(|(a, b)| a * b).sum() };
+    for h in &hits {
+        let expected = match h.chunk_id.as_str() {
+            "entry" => {
+                assert_eq!(h.target, entry_ref(e));
+                1.0
+            }
+            id => cos(id[1..].parse().unwrap()),
+        };
+        assert!(
+            (h.score - expected).abs() < 1e-3,
+            "{}: {} против {expected}",
+            h.chunk_id,
+            h.score
+        );
+    }
+    // совпадающий вектор — косинус 1
+    assert!((hits[0].score - 1.0).abs() < 1e-3, "{hits:?}");
+    // уровни ограничивают выдачу
+    let mut f = filter(&ctx);
+    f.levels = vec!["note".into()];
+    assert!(idx.nearest_dense(&q, &f, 4).await.unwrap().is_empty());
+}
+
+/// Точка ровно с одной целью: узел или запись.
+pub async fn upsert_requires_exactly_one_target(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let mut none = point(&ctx, Id::new(), "none", 1, "a", "chunk");
+    none.payload.node_id = None;
+    let err = idx.upsert(vec![none]).await.unwrap_err();
+    assert!(matches!(err, IndexError::Other(_)), "{err:?}");
+    let mut both = point(&ctx, Id::new(), "both", 1, "a", "chunk");
+    both.payload.entry_id = Some(Id::new());
+    let err = idx.upsert(vec![both]).await.unwrap_err();
+    assert!(matches!(err, IndexError::Other(_)), "{err:?}");
+    assert_eq!(idx.ensure(MODEL, DIM).await.unwrap().points, 0);
+}
+
 /// Тест на каждый общий случай: `$make(короткое имя)` возвращает свежий индекс и охрану его
 /// окружения (процесс Qdrant или каталог Edge), которая живёт до конца теста.
 #[macro_export]
@@ -389,6 +707,12 @@ macro_rules! vector_index_cases {
             missing_collection_is_not_found_and_count_filters,
             human_space_is_rejected,
             drop_all_removes_collection,
+            scopes_disjunction_isolates_users_and_spaces,
+            exclude_statuses_keeps_points_without_status,
+            kinds_insight_kinds_certainty_area_filters,
+            delete_targets_by_node_and_entry,
+            nearest_dense_returns_cosine,
+            upsert_requires_exactly_one_target,
         );
     };
     (@each $make:path; $($name:ident,)*) => {

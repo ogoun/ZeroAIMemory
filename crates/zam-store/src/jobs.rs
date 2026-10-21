@@ -152,6 +152,21 @@ pub struct NodePayload {
     pub updated_at: Timestamp,
 }
 
+/// Поля записи журнала для payload точек Qdrant (M3). Чанк записи несёт их вместо узла:
+/// точка получает `entry_id` и эти поля. [решение исполнителя] Задача 4 закладывает только
+/// форму; чанки записей строит задача 6, до неё у всех чанков `entry: None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryPayload {
+    pub entry_id: Id,
+    /// `insight` / `changelog` / `release`.
+    pub kind: String,
+    pub status: Option<String>,
+    /// Вид инсайта (`data.kind`).
+    pub insight_kind: Option<String>,
+    pub certainty: Option<String>,
+    pub area: Option<String>,
+}
+
 /// Чанк для построения точки Qdrant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexChunk {
@@ -170,6 +185,8 @@ pub struct IndexChunk {
     /// Ревизия, по которой построен чанк.
     pub rev: i64,
     pub node: NodePayload,
+    /// Поля записи журнала; `None` — чанк заметки.
+    pub entry: Option<EntryPayload>,
 }
 
 /// Ставит задание `op` для узла, заменяя его активное задание (если есть):
@@ -613,6 +630,7 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
             token_count: tokens,
             rev,
             node: payload.clone(),
+            entry: None,
         });
     }
     Ok(out)

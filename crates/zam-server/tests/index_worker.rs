@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use axum::http::{Method, StatusCode};
-use common::api::{Api, api};
+use common::api::{Api, api, vector_base};
 use common::ml::{MINILM, READY, external, have, ml, until, vector_ready};
 use common::qdrant::{TestQdrant, free_port, qdrant_bin};
 use serde_json::{Value, json};
@@ -45,11 +45,14 @@ async fn state(a: &Api, node: &str) -> String {
 
 /// Число точек заметок (без точек папок) по пространству и префиксу пути.
 async fn points(a: &Api, space: Option<Id>, prefix: Option<&str>) -> u64 {
+    let base = match space {
+        Some(s) => VectorFilter::scope(uid(a), vec![s]),
+        None => vector_base(a, uid(a)).await,
+    };
     let f = VectorFilter {
-        user_id: uid(a),
-        space_ids: space.into_iter().collect(),
         path_prefix: prefix.map(str::to_string),
         levels: ["chunk", "section", "note"].map(String::from).to_vec(),
+        ..base
     };
     a.st.index.vector.as_ref().unwrap().count(&f).await.unwrap()
 }
@@ -133,10 +136,9 @@ async fn twenty_notes_indexed_then_edit_and_delete_replace_points() {
         Duration::from_secs(10),
         async || {
             let f = VectorFilter {
-                user_id: uid(&a),
-                space_ids: vec![],
                 path_prefix: Some("bulk".into()),
                 levels: vec!["folder".into()],
+                ..vector_base(&a, uid(&a)).await
             };
             a.st.index.vector.as_ref().unwrap().count(&f).await.unwrap() == 1
         },
@@ -176,10 +178,8 @@ async fn twenty_notes_indexed_then_edit_and_delete_replace_points() {
     let emb = a.st.index.embedder.clone().unwrap();
     let qv = emb.embed_query("выпуск релиза и теги git").unwrap();
     let f = VectorFilter {
-        user_id: uid(&a),
-        space_ids: vec![],
         path_prefix: Some("bulk/n00".into()),
-        levels: vec![],
+        ..vector_base(&a, uid(&a)).await
     };
     let hits =
         a.st.index
@@ -278,10 +278,9 @@ async fn move_out_of_folder_updates_old_folder_rollup() {
     };
     let folder_points = async |prefix: &str| {
         let f = VectorFilter {
-            user_id: uid(&a),
-            space_ids: vec![],
             path_prefix: Some(prefix.into()),
             levels: vec!["folder".into()],
+            ..vector_base(&a, uid(&a)).await
         };
         a.st.index.vector.as_ref().unwrap().count(&f).await.unwrap()
     };
@@ -755,4 +754,140 @@ async fn bench_twenty_notes_bge_m3_int8() {
         a.st.index.device
     );
     a.st.shutdown().await;
+}
+
+/// Поля payload, индексы которых появились в M3 (записи журналов).
+const M3_INDEXES: [&str; 6] = [
+    "entry_id",
+    "kind",
+    "status",
+    "insight_kind",
+    "certainty",
+    "area",
+];
+
+/// REST-запрос к тестовому Qdrant с его ключом.
+fn qdrant_rest(q: &TestQdrant, method: &str, path: &str, body: Option<&Value>) -> Value {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, q.http_port));
+    let (code, v) =
+        common::process::http(addr, method, path, Some(&q.api_key), body).expect("REST Qdrant");
+    assert_eq!(code, 200, "{method} {path}: {v}");
+    v
+}
+
+/// Индексированные поля payload коллекции.
+fn payload_schema(q: &TestQdrant) -> Vec<String> {
+    let v = qdrant_rest(
+        q,
+        "GET",
+        &format!("/collections/{}", zam_index::COLLECTION),
+        None,
+    );
+    v["result"]["payload_schema"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Снимок точек коллекции: (id, векторы) по возрастанию id.
+fn points_snapshot(q: &TestQdrant) -> Vec<(String, String)> {
+    let v = qdrant_rest(
+        q,
+        "POST",
+        &format!("/collections/{}/points/scroll", zam_index::COLLECTION),
+        Some(&json!({"limit": 10000, "with_vector": true, "with_payload": false})),
+    );
+    let mut out: Vec<(String, String)> = v["result"]["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["id"].to_string(), p["vector"].to_string()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Коллекция M2 (без payload-индексов полей записей журналов) после обновления сервера
+/// остаётся: `ensure` досоздаёт индексы на месте, reindex не ставится, модель не
+/// вызывается, точки те же (id и векторы), поиск работает без деградации.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m2_collection_kept_and_upgraded_without_reindex() {
+    if !have(MINILM) {
+        return;
+    }
+    let q = TestQdrant::start("srv-upgr");
+    let mut c = common::cfg_in(common::tmp("api-idx-upgr"));
+    ml(&mut c, MINILM);
+    external(&mut c, &q);
+    let a = common::api::api_with(c.clone()).await;
+    vector_ready(&a).await;
+    let n = id(&a.note("knowledge", "keep/n", &body(4)).await);
+    until("n indexed", Duration::from_secs(10), async || {
+        state(&a, &n).await == "indexed"
+    })
+    .await;
+    // покой воркера: отложенная свёртка L0 папки тоже записана
+    until(
+        "покой воркера",
+        Duration::from_secs(20),
+        async || {
+            let s = a.st.index.worker.status();
+            s.rollups_pending == 0 && !s.batch_running
+        },
+    )
+    .await;
+    let pts = points(&a, None, Some("keep")).await;
+    assert!(pts > 0);
+    a.st.shutdown().await;
+    drop(a);
+
+    // коллекция «как в M2»: индексов полей записей нет
+    for f in M3_INDEXES {
+        qdrant_rest(
+            &q,
+            "DELETE",
+            &format!("/collections/{}/index/{f}?wait=true", zam_index::COLLECTION),
+            None,
+        );
+    }
+    let before = payload_schema(&q);
+    assert!(
+        M3_INDEXES.iter().all(|f| !before.iter().any(|s| s == f)),
+        "{before:?}"
+    );
+    let snapshot = points_snapshot(&q);
+    assert!(!snapshot.is_empty());
+
+    let b = common::api::api_with(c).await;
+    vector_ready(&b).await;
+    let after = payload_schema(&q);
+    for f in M3_INDEXES {
+        assert!(after.iter().any(|s| s == f), "нет индекса {f}: {after:?}");
+    }
+    assert_eq!(points_snapshot(&q), snapshot, "точки пересозданы");
+    assert_eq!(points(&b, None, Some("keep")).await, pts);
+    assert_eq!(state(&b, &n).await, "indexed");
+    let db = b.st.users.get(uid(&b)).await.unwrap();
+    assert_eq!(job_stats(&db).await.unwrap().queued, 0);
+    let st = b.st.index.worker.status();
+    assert!(st.last_reindex.is_none(), "{:?}", st.last_reindex);
+    // второй старт каталога: первого токена нет — запрос администратора по cookie
+    let r = b
+        .adm(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "собирается командой cargo build"})),
+            Some(&b.admin_id()),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["degraded"], false, "{j}");
+    assert_eq!(j["items"][0]["path"], "keep/n", "{j}");
+    assert_eq!(
+        b.st.index.worker.embedded_texts(),
+        0,
+        "обновление коллекции без инференса"
+    );
+    b.st.shutdown().await;
 }
