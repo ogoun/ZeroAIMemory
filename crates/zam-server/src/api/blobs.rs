@@ -36,7 +36,7 @@ use zam_store::blobs::{check_filename, is_sha256};
 use zam_store::{BlobStore, NodeKind, StoreError, attach, blob_meta, blob_meta_in_space};
 
 use super::query;
-use super::scope::{Mode, foreign_solutions, live, node_scope, user_db};
+use super::scope::{Mode, foreign_solutions, live, node_scope, owner_db, skip_foreign, user_db};
 use crate::app::AppState;
 use crate::auth::{Principal, USER_HEADER};
 use crate::error::ApiError;
@@ -282,10 +282,16 @@ async fn locate_blob(
         return Ok((user.id, mime));
     }
     for (info, role) in foreign_solutions(st, p, &user).await? {
-        let odb = st.users.get(info.owner_id).await?;
-        if let Some((mime, _)) = blob_meta_in_space(&odb, sha, filename, info.space_id).await? {
-            role?;
-            return Ok((info.owner_id, mime));
+        let Some(odb) = owner_db(st, &info).await else {
+            continue;
+        };
+        match blob_meta_in_space(&odb, sha, filename, info.space_id).await {
+            Ok(Some((mime, _))) => {
+                role?;
+                return Ok((info.owner_id, mime));
+            }
+            Ok(None) => {}
+            Err(e) => skip_foreign(&info, &e),
         }
     }
     Err(ApiError::NotFound)

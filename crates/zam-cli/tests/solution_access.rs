@@ -199,7 +199,7 @@ fn solution_access_flow() {
     let o = zam(&url, &b, &r, &["write", "план"], "# правка\n".as_bytes());
     assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(
-        err(&o).contains("ro") && err(&o).contains("403"),
+        err(&o).contains("доступ участника к решению — ro") && err(&o).contains("403"),
         "{}",
         err(&o)
     );

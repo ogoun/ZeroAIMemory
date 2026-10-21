@@ -383,7 +383,10 @@ async fn ro_member_and_ro_token_cannot_write() {
     let r = w.put(&w.b_tok, &nid, 1, "# правка\n").await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
     assert!(
-        r.json()["detail"].as_str().unwrap().contains("ro"),
+        r.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("доступ участника к решению — ro"),
         "{}",
         r.text()
     );
@@ -541,12 +544,12 @@ async fn only_owner_rw_or_admin_manage_access() {
     assert_eq!(w.register(&w.a_tok).await.status, StatusCode::CREATED);
     assert_eq!(w.register(&w.b_tok).await.status, StatusCode::ACCEPTED);
     let access = format!("/api/v1/solutions/{G}/access");
-    // посторонний и сам участник управлять не могут
-    assert_eq!(w.get(&w.c_tok, &access).await.status, StatusCode::FORBIDDEN);
+    // посторонний (без запроса) решения не видит — 404; ожидающий участник — 403
+    assert_eq!(w.get(&w.c_tok, &access).await.status, StatusCode::NOT_FOUND);
     assert_eq!(w.get(&w.b_tok, &access).await.status, StatusCode::FORBIDDEN);
     assert_eq!(
         w.decide(&w.c_tok, &w.b_id, "approve", None).await.status,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         w.decide(&w.b_tok, &w.b_id, "approve", None).await.status,
@@ -964,5 +967,101 @@ async fn startup_registers_m2_solution() {
         .expect("решение M2 в /spaces");
     assert_eq!(s["role"], "owner");
     assert_eq!(s["shared"], false);
+    a.st.shutdown().await;
+}
+
+#[tokio::test]
+async fn outsider_without_request_sees_nothing() {
+    let w = world("outsider").await;
+    w.shared(None).await;
+    let n = w.note(&w.a_tok, G, "n", "# n\n").await.json();
+    let nid = sid(&n);
+    let up = w.upload(&w.a_tok, &nid, "a.bin", b"payload").await;
+    let sha = up.json()["sha256"].as_str().unwrap().to_string();
+    for uri in [
+        format!("/api/v1/nodes/{nid}"),
+        format!("/api/v1/nodes/{nid}/revisions"),
+        format!("/api/v1/blobs/{sha}/a.bin"),
+        format!("/api/v1/solutions/{G}"),
+        format!("/api/v1/spaces/{G}/tree"),
+    ] {
+        let r = w.get(&w.c_tok, &uri).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}: {}", r.text());
+    }
+    assert_eq!(
+        w.put(&w.c_tok, &nid, 1, "# x\n").await.status,
+        StatusCode::NOT_FOUND
+    );
+    // участник видит то же самое
+    assert_eq!(
+        w.get(&w.b_tok, &format!("/api/v1/blobs/{sha}/a.bin"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn broken_owner_db_skipped_not_500() {
+    let dir = common::tmp("access-broken");
+    let c = common::cfg_in(dir.clone());
+    let w = {
+        let a = api_with(c.clone()).await;
+        let (a_id, a_tok) = a.new_user("Анна").await;
+        let (b_id, b_tok) = a.new_user("Борис").await;
+        let (_, c_tok) = a.new_user("Вера").await;
+        W {
+            a,
+            a_id,
+            a_tok,
+            b_id,
+            b_tok,
+            c_tok,
+        }
+    };
+    w.shared(None).await;
+    let sol = sid(&w.note(&w.a_tok, G, "n", "# n\n").await.json());
+    let own = sid(&w.note(&w.b_tok, "knowledge", "своё", "# b\n").await.json());
+    let (a_id, b_tok) = (w.a_id.clone(), w.b_tok.clone());
+    w.a.st.shutdown().await;
+    drop(w);
+    // база владельца испорчена
+    let users = dir.join("users");
+    for ext in ["db-wal", "db-shm"] {
+        let _ = std::fs::remove_file(users.join(format!("{a_id}.{ext}")));
+    }
+    std::fs::write(
+        users.join(format!("{a_id}.db")),
+        b"not a sqlite database at all",
+    )
+    .unwrap();
+
+    let a = api_with(c).await;
+    let r = a
+        .tok(&b_tok, Method::GET, &format!("/api/v1/nodes/{sol}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = a
+        .tok(&b_tok, Method::GET, &format!("/api/v1/nodes/{own}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = a.tok(&b_tok, Method::GET, "/api/v1/spaces", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        !r.json()["spaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["agent_solution_id"] == G)
+    );
+    let r = a
+        .tok(
+            &b_tok,
+            Method::GET,
+            &format!("/api/v1/blobs/{}/x.bin", "a".repeat(64)),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
     a.st.shutdown().await;
 }

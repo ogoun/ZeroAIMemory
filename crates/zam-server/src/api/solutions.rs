@@ -272,7 +272,8 @@ pub async fn list(
 }
 
 /// Решение для управления доступом: администратор или владелец (токен его пользователя;
-/// `write` — только `rw`-токен). Остальным — 403, незарегистрированный GUID — 404.
+/// `write` — только `rw`-токен). Участнику и запросившему доступ — 403; постороннему и для
+/// незарегистрированного GUID — 404.
 async fn managed(
     st: &AppState,
     p: &Principal,
@@ -293,7 +294,11 @@ async fn managed(
             }
             Ok(info)
         }
-        Principal::Token(_) => Err(ApiError::Forbidden),
+        // участник и запросивший доступ — 403; посторонний — как незарегистрированный GUID
+        Principal::Token(t) => match st.system.solution_role(&info.guid, t.user_id).await? {
+            Some(_) => Err(ApiError::Forbidden),
+            None => Err(ApiError::NotFound),
+        },
     }
 }
 
