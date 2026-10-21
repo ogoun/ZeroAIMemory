@@ -1,0 +1,29 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "",
+    "token_count": 426,
+    "range": [
+      0,
+      2686
+    ],
+    "head": "Абзац 1 без заголовков. Заметка режется "
+  },
+  {
+    "level": "chunk",
+    "heading_path": "",
+    "token_count": 441,
+    "range": [
+      2603,
+      5379
+    ],
+    "head": "Здесь ещё одно предложение для объёма те"
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 7,
+    "range": null,
+    "head": "Абзац 1 без заголовков."
+  }
+]

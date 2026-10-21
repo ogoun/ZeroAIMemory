@@ -1,14 +1,16 @@
 //! Запись узлов. Каждая операция — одна транзакция писателя: ревизия, узел,
-//! разбор, чанки и FTS фиксируются вместе или не фиксируются вовсе (§8.1 ТЗ).
+//! разбор, чанки, FTS и задание outbox (`index_jobs`) фиксируются вместе или не
+//! фиксируются вовсе (§8.1 ТЗ).
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 
-use super::chunks::{NoteMeta, note_meta, rebuild_chunks};
+use super::chunks::{NoteMeta, index_note, index_state, note_meta};
 use super::{Attribution, NewNote, Node, NodeKind, live_by_path, load_node, sha256_hex};
 use crate::paths::NodePath;
 use crate::time::fmt_ts;
+use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
 
 /// Создаёт заметку и недостающие папки-предки (mkdir -p).
@@ -16,7 +18,7 @@ use crate::{Db, StoreError};
 pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
     db.write(move |tx| {
         let now = fmt_ts(Timestamp::now());
-        ensure_space(tx, n.space_id)?;
+        let kind = ensure_space(tx, n.space_id)?;
         ensure_free(tx, n.space_id, &n.path)?;
         let parent = ensure_ancestors(tx, n.space_id, &n.path, &now)?;
 
@@ -38,11 +40,11 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
                 meta.frontmatter.as_ref().map(|v| v.to_string()),
                 meta.l0,
                 meta.l0_source,
-                index_state(&meta),
+                index_state(&meta, kind),
                 now,
             ],
         )?;
-        store_revision(tx, id, 1, &n.content, &hash, &meta, &n.attrib, &now)?;
+        store_revision(tx, id, 1, &n.content, &hash, &meta, &n.attrib, None, &now)?;
         load_node(tx, id)
     })
     .await
@@ -61,15 +63,13 @@ pub async fn create_folder(db: &Db, space_id: Id, path: NodePath) -> Result<Node
     .await
 }
 
-/// `pending` — ждёт векторизации; `excluded` — `index: false` во frontmatter.
-pub(crate) fn index_state(meta: &NoteMeta) -> &'static str {
-    if meta.index { "pending" } else { "excluded" }
-}
-
-fn ensure_space(c: &Connection, space_id: Id) -> Result<(), StoreError> {
-    c.query_row("SELECT 1 FROM spaces WHERE id = ?1", [space_id], |_| Ok(()))
-        .optional()?
-        .ok_or(StoreError::NotFound)
+/// Вид пространства; нет пространства → `NotFound`.
+fn ensure_space(c: &Connection, space_id: Id) -> Result<SpaceKind, StoreError> {
+    c.query_row("SELECT kind FROM spaces WHERE id = ?1", [space_id], |r| {
+        r.get(0)
+    })
+    .optional()?
+    .ok_or(StoreError::NotFound)
 }
 
 pub(crate) fn ensure_free(c: &Connection, space_id: Id, path: &NodePath) -> Result<(), StoreError> {
@@ -121,8 +121,10 @@ fn insert_folder(
     Ok(id)
 }
 
-/// Общая часть создания и правки заметки: дописывает ревизию `rev` и пересобирает
-/// чанки и FTS по её тексту. Строка `nodes` к этому моменту уже указывает на `rev`.
+/// Общая часть создания и правки заметки: дописывает ревизию `rev`, пересобирает
+/// чанки и FTS по её тексту и ставит задание индексации. Строка `nodes` к этому
+/// моменту уже указывает на `rev` и новый `index_state`; `prev_state` — прежний
+/// `index_state` (`None` у новой заметки).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn store_revision(
     c: &Connection,
@@ -132,10 +134,11 @@ pub(crate) fn store_revision(
     hash: &str,
     meta: &NoteMeta,
     a: &Attribution,
+    prev_state: Option<&str>,
     now: &str,
 ) -> Result<(), StoreError> {
     insert_revision(c, node_id, rev, content, hash, a, now)?;
-    rebuild_chunks(c, node_id, rev, content, meta)?;
+    index_note(c, node_id, rev, content, meta, prev_state, now)?;
     Ok(())
 }
 

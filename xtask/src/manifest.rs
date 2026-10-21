@@ -1,77 +1,22 @@
 //! Манифесты зависимостей поставки (`deploy/*.toml`).
 
-use std::collections::BTreeMap;
-use std::path::Path;
-
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-
-/// Платформы поставки.
-pub const PLATFORMS: [&str; 2] = ["windows-x64", "linux-x64"];
+// Манифесты и их проверка — общие с сервером (`zam-server qdrant fetch`, `models fetch`,
+// `cuda fetch`): один разбор `deploy/*.toml` в крейте zam-fetch.
+pub use zam_fetch::{CudaManifest, DepManifest as Manifest, ModelsManifest, PLATFORMS};
 
 /// Манифесты, входящие в поставку (имена файлов в `deploy/`).
-pub const MANIFESTS: [&str; 3] = ["qdrant", "onnxruntime", "pdfium"];
+pub const MANIFESTS: [&str; 4] = ["qdrant", "onnxruntime", "onnxruntime-gpu", "pdfium"];
 
-#[derive(Debug, Deserialize)]
-pub struct Manifest {
-    pub name: String,
-    pub version: String,
-    pub platform: BTreeMap<String, PlatformEntry>,
-}
+/// Манифест моделей (`deploy/models.toml`).
+pub const MODELS_MANIFEST: &str = "models.toml";
 
-#[derive(Debug, Deserialize)]
-pub struct PlatformEntry {
-    pub url: String,
-    /// Пустая строка — хэш ещё не закреплён.
-    #[serde(default)]
-    pub sha256: String,
-    /// Пути внутри архива (с корневым каталогом архива, если он есть).
-    pub extract: Vec<String>,
-    /// Необязательное переименование при извлечении: путь в архиве → имя файла.
-    #[serde(default)]
-    pub rename: BTreeMap<String, String>,
-}
-
-impl Manifest {
-    pub fn parse(text: &str) -> Result<Self> {
-        toml::from_str(text).context("не удалось разобрать манифест")
-    }
-
-    pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("не удалось прочитать {}", path.display()))?;
-        Self::parse(&text).with_context(|| path.display().to_string())
-    }
-
-    /// Проверка манифеста; `allow_empty_hash` — только для режима `--print-hashes`.
-    pub fn validate(&self, allow_empty_hash: bool) -> Result<()> {
-        for (plat, e) in &self.platform {
-            let ctx = || format!("{} [{plat}]", self.name);
-            if !e.url.starts_with("https://") {
-                bail!("{}: url должен начинаться с https://", ctx());
-            }
-            let h = e.sha256.trim();
-            if h.is_empty() {
-                if !allow_empty_hash {
-                    bail!("{}: sha256 не задан; используйте --print-hashes", ctx());
-                }
-            } else if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
-                bail!("{}: sha256 должен быть 64 hex-символа", ctx());
-            }
-            crate::fetch::dest_names(e).with_context(ctx)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn platforms(&self) -> Vec<&str> {
-        self.platform.keys().map(String::as_str).collect()
-    }
-}
+/// Манифест библиотек NVIDIA для CUDA EP (`deploy/cuda.toml`).
+pub const CUDA_MANIFEST: &str = "cuda.toml";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     const SAMPLE: &str = r#"
 name = "qdrant"
@@ -91,7 +36,8 @@ rename = { "qdrant" = "qdrant-bin" }
         let m = Manifest::parse(SAMPLE).unwrap();
         assert_eq!(m.name, "qdrant");
         assert_eq!(m.version, "1.19.2");
-        assert_eq!(m.platforms(), vec!["linux-x64", "windows-x64"]);
+        let plats: Vec<&str> = m.platform.keys().map(String::as_str).collect();
+        assert_eq!(plats, vec!["linux-x64", "windows-x64"]);
         let win = &m.platform["windows-x64"];
         assert_eq!(win.sha256, "abc");
         assert_eq!(win.extract, vec!["qdrant.exe"]);
@@ -103,6 +49,7 @@ rename = { "qdrant" = "qdrant-bin" }
     #[test]
     fn real_manifests_are_valid() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy");
+        assert!(MANIFESTS.contains(&"onnxruntime-gpu"));
         for name in MANIFESTS {
             let m = Manifest::load(&dir.join(format!("{name}.toml"))).unwrap();
             assert_eq!(m.name, name);

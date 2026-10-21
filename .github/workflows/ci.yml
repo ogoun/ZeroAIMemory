@@ -1,18 +1,26 @@
 name: CI
 
+# Push в любую ветку, кроме release-dry-run (её проверяет release.yml), и PR;
+# теги собирает release.yml.
 on:
   push:
-    branches: [main]
+    branches: ['**', '!release-dry-run']
+    tags-ignore: ['**']
   pull_request:
 
+# Новый push в тот же ref отменяет устаревший прогон.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   # фиксированное зерно proptest: прогоны в CI воспроизводимы (случайный поиск — локально)
   PROPTEST_RNG_SEED: "20261018"
+
+# только чтение репозитория: workflow ничего не публикует
+permissions:
+  contents: read
 
 jobs:
   web:
@@ -48,7 +56,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04]
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-22.04
+            platform: linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -64,9 +76,40 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Распакованные зависимости (штампы <имя>.sha256) и модели; ключ — хэш манифестов deploy/*.toml.
+      # Шаг идёт после rust-cache: его post-шаг сохраняет кэш раньше, чем rust-cache чистит target/.
+      - name: кэш зависимостей и моделей
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/deps
+            target/models
+          key: deps-models-v2-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
+      - name: fetch-deps
+        run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
+      - name: fetch-models
+        run: cargo xtask fetch-models --test
       - name: test
-        run: cargo test --workspace
+        # тесты zam-ml без ORT или MiniLM падают, а не пропускаются
+        # причина падения выносится в аннотацию: она видна через публичный API без логов
+        # --no-fail-fast: падение одного крейта не останавливает остальные (в M2 красный zam-ml
+        # в прогонах b4c1b85–8b87c99 скрыл невыполненные e2e жизненного цикла Qdrant на Linux)
+        env:
+          ZAM_REQUIRE_ML: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace --no-fail-fast 2>&1 | tee target/test.log; then
+            summary=$(grep -E -A12 "panicked at|^error(\[|:)|^---- .* stdout ----|FAILED|failures:" target/test.log | head -c 3500)
+            summary=${summary//'%'/'%25'}
+            summary=${summary//$'\r'/}
+            summary=${summary//$'\n'/'%0A'}
+            echo "::error title=cargo test::${summary}"
+            exit 1
+          fi
 
+  # Комплекты платформа × cpu|gpu, smoke с векторным поиском на тестовой модели (без
+  # zam-cuda и zam-models: их собирает релиз, zam-cuda при изменении манифеста — cuda.yml).
   package-smoke:
     name: package-smoke
     needs: web

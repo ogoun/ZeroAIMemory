@@ -1,0 +1,29 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "Пример на Rust",
+    "token_count": 70,
+    "range": [
+      26,
+      366
+    ],
+    "head": "Функция `split_sentences` не режет код в"
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Пример на Rust > Конфигурация",
+    "token_count": 18,
+    "range": [
+      397,
+      481
+    ],
+    "head": "```toml\n[index]\ntarget = 500\n```\n\nПараме"
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 38,
+    "range": null,
+    "head": "Пример на Rust — Функция split_sentences"
+  }
+]

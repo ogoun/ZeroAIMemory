@@ -15,10 +15,25 @@ use crate::time::{conv_err, fmt_ts, ts_at, ts_opt};
 use crate::{DataDir, Db, Migration, StoreError};
 
 /// Миграции `system.db`.
-pub static SYSTEM_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/system/0001_init.sql"),
-}];
+pub static SYSTEM_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/system/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/system/0002_index_skipped.sql"),
+    },
+];
+
+/// База пользователя, исключённая из пересборки векторного индекса (`index_skipped`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedIndex {
+    pub user_id: Id,
+    pub error: String,
+    pub attempts: u32,
+    pub skipped_at: Timestamp,
+}
 
 /// Срок жизни веб-сессии.
 const SESSION_TTL_HOURS: i64 = 12;
@@ -584,6 +599,59 @@ impl SystemStore {
                         target: r.get(5)?,
                         ip: r.get(6)?,
                         details: serde_json::from_str(&details).map_err(|e| conv_err(7, e))?,
+                    })
+                })?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+    }
+
+    // ---- исключённые из пересборки индекса базы ----
+
+    /// Отмечает базу пользователя исключённой из пересборки индекса (повторная отметка
+    /// обновляет ошибку и попытки). Переживает перезапуск: снимается [`Self::index_unskip`],
+    /// когда база снова открылась и ей поставлен reindex.
+    pub async fn index_skip(&self, user: Id, error: &str, attempts: u32) -> Result<(), StoreError> {
+        let error: String = error.chars().take(1000).collect();
+        self.db
+            .write(move |tx| {
+                tx.execute(
+                    "INSERT INTO index_skipped (user_id, error, attempts, skipped_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(user_id) DO UPDATE SET error = excluded.error,
+                         attempts = max(attempts, excluded.attempts),
+                         skipped_at = excluded.skipped_at",
+                    params![user, error, attempts, fmt_ts(Timestamp::now())],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Снимает отметку исключения базы.
+    pub async fn index_unskip(&self, user: Id) -> Result<(), StoreError> {
+        self.db
+            .write(move |tx| {
+                tx.execute("DELETE FROM index_skipped WHERE user_id = ?1", [user])?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Исключённые из пересборки базы, по времени отметки.
+    pub async fn index_skipped(&self) -> Result<Vec<SkippedIndex>, StoreError> {
+        self.db
+            .read(|c| {
+                let mut st = c.prepare(
+                    "SELECT user_id, error, attempts, skipped_at FROM index_skipped
+                     ORDER BY skipped_at, user_id",
+                )?;
+                let rows = st.query_map([], |r| {
+                    Ok(SkippedIndex {
+                        user_id: r.get(0)?,
+                        error: r.get(1)?,
+                        attempts: r.get(2)?,
+                        skipped_at: ts_at(r, 3)?,
                     })
                 })?;
                 Ok(rows.collect::<Result<_, _>>()?)

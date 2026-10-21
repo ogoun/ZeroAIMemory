@@ -1,0 +1,143 @@
+# Модели ZeroAIMemory (§8.4, §16.3). Каждая модель закреплена ревизией (commit Hugging Face
+# в пути /resolve/<ревизия>/) и sha256 каждого файла; при несовпадении загрузка падает.
+#
+# Поля:
+#   id                    — каталог <data_dir>/models/<id>/ (в разработке: target/models/<id>/);
+#   role                  — embed | rerank | test | reference (эталон для eval, не для пользователя);
+#   device                — cpu | gpu | any: для какого устройства предназначен вариант
+#                           (cpu-вариант zam-ml запускает только на CPU, даже при ml.device = cuda);
+#   license               — SPDX-идентификатор лицензии весов;
+#   bundle                — входит ли модель в архив zam-models;
+#   requires_license_ack  — загрузка только с явным согласием (--accept-nc-license);
+#                           допустимо только при bundle = false;
+#   files                 — url (https), path (имя файла в каталоге модели), size (байт), sha256;
+#   [model.spec]          — описатель для zam-ml: dim и pooling (cls | mean) для embed/test,
+#                           sparse_head (имя файла из files), max_tokens_passage и max_tokens_query.
+#                           Для реранкера запрос усекается до max_tokens_query, пара целиком —
+#                           до max_tokens_passage. dynamic_quant = true — граф квантует активации
+#                           динамически по всему тензору (DynamicQuantizeLinear): соседи по батчу
+#                           меняют вектор (косинус ≈ 0,99), поэтому такие модели прогоняются по
+#                           одному тексту. Пишется в <id>/model.toml (с id, role и device) для
+#                           zam-ml; рядом — LICENSE (SPDX и ссылки на карточку модели).
+#
+# Источники и хэши: docs/research/2026-10-19-05-m2-index-ml.md (§3, §4, §9); полные sha256
+# сверены с API Hugging Face (lfs.sha256, X-Linked-ETag), для файлов без LFS — посчитаны при загрузке.
+
+# bge-m3 для CPU: динамический int8 (per-channel) от Xenova, sparse-голова из оригинала BAAI.
+[[model]]
+id = "bge-m3-int8"
+role = "embed"
+device = "cpu"
+license = "MIT"
+bundle = true
+files = [
+    { url = "https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/onnx/model_int8.onnx", path = "model.onnx", size = 568456694, sha256 = "a206e10e995aa2a833924bcd725ba5dd6c3425cd34bac3cf2b5677cd2a1c51d6" },
+    { url = "https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/tokenizer.json", path = "tokenizer.json", size = 17082821, sha256 = "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/sparse_linear.pt", path = "sparse_linear.pt", size = 3516, sha256 = "45c93804d2142b8f6d7ec6914ae23a1eee9c6a1d27d83d908a20d2afb3595ad9" },
+]
+[model.spec]
+dim = 1024
+pooling = "cls"
+sparse_head = "sparse_linear.pt"
+max_tokens_passage = 1024
+max_tokens_query = 512
+dynamic_quant = true
+
+# bge-m3 для GPU: fp16 от Xenova (входы i64, выход f32), токенизатор и sparse-голова те же.
+[[model]]
+id = "bge-m3-fp16"
+role = "embed"
+device = "gpu"
+license = "MIT"
+bundle = true
+files = [
+    { url = "https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/onnx/model_fp16.onnx", path = "model.onnx", size = 1133992936, sha256 = "4f1a646a3d4f39985589e9991a717044ede8278617fe55e3d246838bc05055e9" },
+    { url = "https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/tokenizer.json", path = "tokenizer.json", size = 17082821, sha256 = "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/sparse_linear.pt", path = "sparse_linear.pt", size = 3516, sha256 = "45c93804d2142b8f6d7ec6914ae23a1eee9c6a1d27d83d908a20d2afb3595ad9" },
+]
+[model.spec]
+dim = 1024
+pooling = "cls"
+sparse_head = "sparse_linear.pt"
+max_tokens_passage = 1024
+max_tokens_query = 512
+
+# Эталон качества fp32 (BAAI, оригинальный ONNX-экспорт) — только для `cargo xtask eval
+# --quality-gate`: с ним сравниваются int8 и fp16 (косинус dense, Спирмен sparse, recall@5 и
+# nDCG@10). role = "reference": в zam-models не входит (bundle = false), `zam-server models
+# fetch` его не ставит и `models status` не показывает; скачивается только в target/models/.
+# Граф ссылается на внешние данные model.onnx_data и Constant_7_attr__value по имени — файлы
+# лежат рядом под исходными именами. Выход token_embeddings [B,T,1024]; токенизатор тот же,
+# что у Xenova (sha256 совпадает с BAAI/bge-m3/onnx/tokenizer.json).
+[[model]]
+id = "bge-m3-fp32"
+role = "reference"
+device = "any"
+license = "MIT"
+bundle = false
+files = [
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/onnx/model.onnx", path = "model.onnx", size = 724923, sha256 = "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/onnx/model.onnx_data", path = "model.onnx_data", size = 2266820608, sha256 = "1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/onnx/Constant_7_attr__value", path = "Constant_7_attr__value", size = 65552, sha256 = "cdf16f72c5d07b36484056e601ed9687f78477e5d85cee85a34f2406b7fb5906" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/onnx/tokenizer.json", path = "tokenizer.json", size = 17082821, sha256 = "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790" },
+    { url = "https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181/sparse_linear.pt", path = "sparse_linear.pt", size = 3516, sha256 = "45c93804d2142b8f6d7ec6914ae23a1eee9c6a1d27d83d908a20d2afb3595ad9" },
+]
+[model.spec]
+dim = 1024
+pooling = "cls"
+sparse_head = "sparse_linear.pt"
+max_tokens_passage = 1024
+max_tokens_query = 512
+
+# Маленькая тестовая модель для CI и интеграционных тестов (англоязычная, вход token_type_ids).
+[[model]]
+id = "minilm-l6-int8"
+role = "test"
+device = "any"
+license = "Apache-2.0"
+bundle = false
+files = [
+    { url = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/onnx/model_int8.onnx", path = "model.onnx", size = 22972370, sha256 = "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1" },
+    { url = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/tokenizer.json", path = "tokenizer.json", size = 711661, sha256 = "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0" },
+]
+[model.spec]
+dim = 384
+pooling = "mean"
+max_tokens_passage = 256
+max_tokens_query = 128
+dynamic_quant = true
+
+# Реранкер для GPU: fp16-экспорт onnx-community от BAAI/bge-reranker-v2-m3 (Apache-2.0).
+[[model]]
+id = "bge-reranker-v2-m3"
+role = "rerank"
+device = "gpu"
+license = "Apache-2.0"
+bundle = true
+files = [
+    { url = "https://huggingface.co/onnx-community/bge-reranker-v2-m3-ONNX/resolve/6f5ff65298512715a1e669753bc754d2bc8f367b/onnx/model_fp16.onnx", path = "model.onnx", size = 1136209678, sha256 = "9b26f9185d2d26051f724c9fc3565e5d9614a9dd459b784c806c246232a70fe3" },
+    { url = "https://huggingface.co/onnx-community/bge-reranker-v2-m3-ONNX/resolve/6f5ff65298512715a1e669753bc754d2bc8f367b/tokenizer.json", path = "tokenizer.json", size = 17082900, sha256 = "8bf8afbfd11306bd872018c53bfdf2e160a56f8edbcf49933324404791c148d3" },
+]
+[model.spec]
+max_tokens_passage = 1024
+max_tokens_query = 256
+
+# Реранкер для CPU (решение владельца): лицензия CC-BY-NC-4.0 — только некоммерческое
+# использование. В zam-models не входит, загружается только с --accept-nc-license.
+[[model]]
+id = "jina-reranker-v2"
+role = "rerank"
+device = "cpu"
+license = "CC-BY-NC-4.0"
+bundle = false
+requires_license_ack = true
+files = [
+    { url = "https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual/resolve/9cfeff2df7d40d1b78e75e5e9cebec92a99813c9/onnx/model_int8.onnx", path = "model.onnx", size = 279577152, sha256 = "c5220cf8fe023f8aa0ed2a3eb787d4451a7f17cf53f6b787e35718dd4b8815c3" },
+    { url = "https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual/resolve/9cfeff2df7d40d1b78e75e5e9cebec92a99813c9/tokenizer.json", path = "tokenizer.json", size = 17082734, sha256 = "3a56def25aa40facc030ea8b0b87f3688e4b3c39eb8b45d5702b3a1300fe2a20" },
+]
+[model.spec]
+max_tokens_passage = 1024
+max_tokens_query = 256
+# граф квантует активации динамически (DynamicQuantizeLinear): баллы пары зависели бы от
+# соседей по батчу — пары идут по одной, параллельно в ml.rerank_sessions сессиях
+dynamic_quant = true

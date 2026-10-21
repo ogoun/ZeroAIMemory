@@ -2,6 +2,7 @@
 //
 // Маршруты:
 // - `#/admin` — администрирование (пользователи и токены);
+// - `#/admin/index` — состояние векторного индекса и переиндексация;
 // - `#/u/<user_id>` — пространства пользователя;
 // - `#/u/<user_id>/s/<space_ref>/n/<node_id>[#<якорь>]` — документ, якорь — `id`
 //   элемента в percent-encoding (как в href вики-ссылок сервера: `#/n/<id>#h-<slug>`).
@@ -9,6 +10,7 @@
 
 export type Route =
   | { name: 'admin' }
+  | { name: 'index' }
   | { name: 'home'; user: string | null }
   | { name: 'node'; user: string; space: string; node: string; anchor: string | null };
 
@@ -33,6 +35,7 @@ export function parse(hash: string): Route {
   }
   const parts = h.split('/').filter((p) => p !== '');
   if (parts.length === 1 && parts[0] === 'admin') return { name: 'admin' };
+  if (parts.length === 2 && parts[0] === 'admin' && parts[1] === 'index') return { name: 'index' };
   if (parts[0] === 'u' && parts[1]) {
     const user = dec(parts[1]);
     if (parts.length === 6 && parts[2] === 's' && parts[4] === 'n') {
@@ -43,11 +46,17 @@ export function parse(hash: string): Route {
   return { name: 'home', user: null };
 }
 
+/** Пользователь маршрута (заметки), если он в адресе. */
+export const routeUser = (r: Route): string | null =>
+  r.name === 'home' || r.name === 'node' ? r.user : null;
+
 /** Адрес маршрута (`#/…`). */
 export function href(r: Route): string {
   switch (r.name) {
     case 'admin':
       return '#/admin';
+    case 'index':
+      return '#/admin/index';
     case 'home':
       return r.user ? `#/u/${enc(r.user)}` : '#/';
     case 'node':

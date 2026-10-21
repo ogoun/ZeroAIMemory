@@ -5,8 +5,15 @@ pub mod attrib;
 pub mod auth;
 pub mod bootstrap;
 pub mod config;
+pub mod cuda;
 pub mod error;
+pub mod index_state;
 pub mod logging;
+pub mod ml;
+pub mod models;
+pub mod qdrant;
+pub mod reindex;
+pub mod rerank;
 pub mod web;
 
 #[cfg(test)]
@@ -38,24 +45,39 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
         print_initial_token(t);
     }
     tracing::info!(addr = %listener.local_addr()?, version = state.version, "zam-server запущен");
+    // действующие веса поиска и пороги чанкинга (секретов нет): по ним eval записывает
+    // итоговую конфигурацию прогона
+    tracing::info!(
+        search = %serde_json::to_string(&state.cfg.search).unwrap_or_default(),
+        index = %serde_json::to_string(&state.cfg.index).unwrap_or_default(),
+        "параметры поиска и индексации"
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+    state.shutdown().await;
     tracing::info!("zam-server остановлен");
     Ok(())
 }
 
-/// Открывает все базы (с миграциями) и возвращает число пользователей.
+/// Открывает все базы (с миграциями), дожидается разовой перечанковки R1 и возвращает
+/// число пользователей. Если токенизатор модели доступен, R1 идёт её точным счётчиком
+/// и порогами под её окно (как у сервера), иначе — приближённым (`ApproxCounter`).
 pub async fn migrate(cfg: ServerConfig) -> anyhow::Result<usize> {
     let dir = zam_store::DataDir::open(&cfg.data_dir)?;
+    let tc_cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || ml::setup_chunker(&tc_cfg, None)).await?;
     let system = zam_store::SystemStore::open(&dir)?;
     let users = zam_store::UserDbs::new(dir.users_dir());
     let list = system.list_users().await?;
     for u in &list {
         users.get(u.id).await?;
+    }
+    for u in &list {
+        users.wait_rechunk(u.id).await;
     }
     Ok(list.len())
 }

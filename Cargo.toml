@@ -5,14 +5,14 @@ members = ["crates/*", "xtask"]
 exclude = ["crates/zam-markdown/fuzz"]
 
 [workspace.package]
-version = "0.0.2-m1"
+version = "0.0.3-m2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.92"
 
 # Общие версии зависимостей; крейты подключают через `dep.workspace = true`
 [workspace.dependencies]
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v7", "v5"] }
 rand = "0.9"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -44,6 +44,9 @@ assert_cmd = "2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
+# M2: tar.xz redist-архивов NVIDIA для Linux (`zam-server cuda fetch`): чистый Rust, без C liblzma;
+# та же версия, что у zip 9 (фичи lzma/xz); только декодер
+lzma-rust2 = { version = "=0.22.0", default-features = false, features = ["std", "optimization", "xz"] }
 # M1: Markdown, подсветка, санитизация, диффы, вложения, кэш рендера
 # тильда: comrak::Anchorizer — #[doc(hidden)], минорный выпуск может его сдвинуть
 comrak = { version = "~0.56", default-features = false }
@@ -60,11 +63,61 @@ proptest = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 # хеш текста и id чанков (§6.3)
 blake3 = "1"
+# xtask eval: Snowball-стемминг ru/en для проверки «перефраз без общих слов» (не в продукте);
+# MIT/BSD-3-Clause, без unsafe, зависимости serde/serde_derive — уже в дереве
+rust-stemmers = "=1.2.0"
+# M2: границы предложений UAX #29 (L0, перекрытие чанков §8.2)
+unicode-segmentation = "1.13"
+# M2: ONNX Runtime только load-dynamic (dylib рядом с exe), без ndarray (исследование 05 §1.3)
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "load-dynamic", "api-31", "cuda", "half", "tracing"] }
+# без regex-фичи tokenizers не собирается; fancy-regex — чистый Rust (исследование 05 §2.2)
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+# fp16-веса sparse-головы bge-m3 (sparse_linear.pt)
+half = "2"
+# M2: gRPC-клиент Qdrant без download_snapshots (reqwest) и serde (исследование 05 §5.2)
+qdrant-client = { version = "=1.19.0", default-features = false }
+# только tonic::Code/Status для разбора ошибок qdrant-client (клиент tonic не реэкспортирует)
+tonic = { version = "0.14", default-features = false }
+# M2: супервизор нативного Qdrant — Job Object / группа процессов (исследование 05 §7.2)
+process-wrap = { version = "=10.0.1", default-features = false, features = ["tokio1", "kill-on-drop"] }
+# M2, задача 16: прототип встроенного Qdrant Edge — только feature `edge` у zam-index, в комплекты
+# не входит (ADR 0001); бета, API и формат хранилища меняются между минорными версиями
+qdrant-edge = { version = "=0.8.0", default-features = false }
+libc = "0.2"
+# версия та же, что у process-wrap 10.0.1 (тип PROCESS_CREATION_FLAGS)
+windows = "0.62"
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]
+opt-level = 3
+# sha256 файла модели (model_id в zam-ml): bge-m3 — 568 МБ
+[profile.dev.package.sha2]
+opt-level = 3
+# токенизатор (счётчик токенов чанкера и бюджета поиска) без оптимизаций в debug
+# медленнее в десятки раз: ~1 мс на карточку выдачи в тестах и замерах
+[profile.dev.package.tokenizers]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.unicode-normalization-alignments]
+opt-level = 3
+# сжатие и распаковка архивов поставки (cargo xtask package|smoke, fetch в тестах): deflate
+# и xz без оптимизаций в debug медленнее на порядок — zam-models (2,9 ГБ) паковался 13 мин
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.zip]
+opt-level = 3
+[profile.dev.package.lzma-rust2]
 opt-level = 3
 
 [profile.release]

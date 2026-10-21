@@ -13,7 +13,9 @@ use zam_store::{DataDir, SystemStore, UserDbs};
 use crate::auth::AuthState;
 use crate::config::{AdminSecret, ServerConfig};
 use crate::error::not_found;
-use crate::{api, bootstrap, web};
+use crate::index_state::IndexRuntime;
+use crate::rerank::RerankSlot;
+use crate::{api, bootstrap, ml, web};
 
 /// Git-хэш сборки (см. build.rs).
 pub const GIT_SHA: &str = env!("ZAM_GIT_SHA");
@@ -36,6 +38,17 @@ pub struct AppState {
     pub render_cache: api::render::RenderCache,
     /// Поколения ссылок для ключа кэша рендера.
     pub render_gen: Arc<api::render::RenderGenerations>,
+    /// Модель, Qdrant и воркер индексации.
+    pub index: Arc<IndexRuntime>,
+    /// Реранкер `rerank=on` (загружается при первом таком запросе).
+    pub rerank: Arc<RerankSlot>,
+}
+
+impl AppState {
+    /// Штатная остановка фоновых частей: воркер индексации, перечанковка R1, Qdrant.
+    pub async fn shutdown(&self) {
+        self.index.shutdown(&self.system, &self.users).await;
+    }
 }
 
 // Вручную: хэш пароля и пути не должны попадать в отладочный вывод.
@@ -95,6 +108,27 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         admin_hash,
         data_dir,
     } = p;
+    // Модель — до первого открытия базы пользователя: перечанковка R1 и запись идут
+    // точным счётчиком токенов модели (без второй копии токенизатора).
+    let ml_cfg = cfg.clone();
+    let ml_task = tokio::task::spawn_blocking(move || ml::load(&ml_cfg));
+    // Qdrant — параллельно с загрузкой модели (секунды с HDD, CUDA): к её концу он уже
+    // готов (§17). Без установленной модели не запускается — векторный индекс не нужен.
+    let early_sup = if ml::model_installed(&cfg) {
+        Some(IndexRuntime::start_supervisor(&cfg).await)
+    } else {
+        None
+    };
+    // паника загрузки (ORT, модель) не валит старт: сервер работает в режиме FTS-only
+    let ml = match ml_task.await {
+        Ok(m) => m,
+        Err(e) => ml::MlLoad::failed(
+            crate::index_state::DegradedReason::NoModel,
+            format!("загрузка модели завершилась аварийно: {e}"),
+        ),
+    };
+    // без эмбеддера — токенизатор установленной модели (если есть): чанки сразу точные
+    ml::setup_chunker(&cfg, ml.embedder.as_deref());
     let system = SystemStore::open(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
     let admin_id = system
@@ -107,8 +141,13 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     let auth = tokio::task::spawn_blocking(move || AuthState::new(&real))
         .await?
         .map_err(|e| anyhow::anyhow!("не удалось подготовить проверку пароля: {e}"))?;
+    let users = UserDbs::new(data_dir.users_dir());
+    let index = Arc::new(IndexRuntime::start(&cfg, ml, early_sup, &system, &users).await);
+    let rerank = Arc::new(RerankSlot::new(&cfg));
     let state = AppState {
-        users: UserDbs::new(data_dir.users_dir()),
+        users,
+        index,
+        rerank,
         data_dir,
         system,
         admin_hash: Arc::new(admin_hash),

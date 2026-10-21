@@ -1,0 +1,29 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "",
+    "token_count": 7,
+    "range": [
+      88,
+      131
+    ],
+    "head": "Преамбула до заголовка."
+  },
+  {
+    "level": "chunk",
+    "heading_path": "Тема",
+    "token_count": 8,
+    "range": [
+      145,
+      196
+    ],
+    "head": "Текст темы. Ещё предложение."
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 12,
+    "range": null,
+    "head": "Преамбула до заголовка.\nТема — Текст тем"
+  }
+]

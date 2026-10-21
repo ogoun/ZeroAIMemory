@@ -63,3 +63,27 @@ async fn cyrillic_and_spaces_in_path() {
     .await
     .unwrap();
 }
+
+/// Windows: каталог данных длиннее предела — понятная ошибка до создания каталогов
+/// (иначе SQLite отказал бы позже с «unable to open database file»); Linux — без предела.
+#[test]
+fn too_long_data_dir_is_refused_on_windows() {
+    let base = tmp("dd-long");
+    let mut p = base.clone();
+    while p.to_string_lossy().encode_utf16().count() <= zam_store::MAX_DATA_DIR_CHARS_WINDOWS {
+        p.push("очень-длинный-уровень");
+    }
+    let r = DataDir::open(&p);
+    if cfg!(windows) {
+        let err = r.unwrap_err();
+        assert!(matches!(err, StoreError::DataDirTooLong { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MAX_PATH") && msg.contains("--data-dir"),
+            "{msg}"
+        );
+        assert!(!base.exists(), "каталоги созданы до проверки");
+    } else {
+        assert!(r.unwrap().root().join("users").is_dir());
+    }
+}

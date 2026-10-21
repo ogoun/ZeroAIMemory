@@ -1,7 +1,7 @@
 {
   "name": "zam-web",
   "private": true,
-  "version": "0.0.2-m1",
+  "version": "0.0.3-m2",
   "type": "module",
   "scripts": {
     "dev": "vite",

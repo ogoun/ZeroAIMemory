@@ -1,4 +1,5 @@
-//! Узлы пространства (папки и заметки), ревизии и синхронная индексация (§6.3, §8.1 ТЗ).
+//! Узлы пространства (папки и заметки), ревизии, синхронная индексация FTS и outbox
+//! векторной индексации (§6.3, §8.1 ТЗ).
 //!
 //! Структура модуля:
 //! - `mod.rs` — типы и отображение строк `nodes`;
@@ -7,10 +8,12 @@
 //! - [`read`] — чтение: узел, содержимое ревизии, дети, поиск по имени;
 //! - [`history`] — список ревизий и унифицированный дифф;
 //! - [`tree_ops`] — корзина (мягкое удаление поддерева, восстановление) и перенос узла;
-//! - [`chunks`] — метаданные заметки (frontmatter, L0) и чанки секций с FTS.
+//! - [`chunks`] — метаданные заметки (frontmatter, L0), чанки §8.2 с FTS и задания
+//!   индексации (outbox, §8.1) в той же транзакции.
 
 mod chunks;
 mod history;
+mod l0;
 mod read;
 mod revise;
 mod tree_ops;
@@ -29,7 +32,12 @@ use crate::StoreError;
 use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
+pub(crate) use chunks::{backfill_embed_keys, frontmatter_tags, rechunk_notes};
+pub use chunks::{
+    chunk_params, count_tokens, set_chunk_params, set_token_counter, token_counter_exact,
+};
 pub use history::{RevisionInfo, list_revisions, unified_diff};
+pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
 pub use revise::{WriteError, patch_note, patch_note_within, revert_note, update_note};
 pub use tree_ops::{delete_node, list_trash, move_node, restore_node};

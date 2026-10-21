@@ -5,21 +5,27 @@
 //! метка задаёт «пакет удаления». Восстановление возвращает ровно этот пакет;
 //! потомки, удалённые раньше отдельно, остаются в корзине. Поддерево строится по
 //! `parent_id` (индекс `nodes_parent`), а не по префиксу пути: удалённые узлы
-//! могут делить путь с живыми. Каждая операция — одна транзакция писателя.
+//! могут делить путь с живыми. Каждая операция — одна транзакция писателя и ставит
+//! задания outbox (§8.1): удаление — `delete`, восстановление и перенос — `upsert`.
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 
-use super::chunks::{context_prefix, note_meta, rebuild_chunks};
+use super::chunks::{
+    context_prefix, frontmatter_tags, index_note, index_state, note_meta, space_kind,
+};
 use super::write::{ensure_ancestors, ensure_free};
 use super::{NODE_COLS, Node, NodeKind, live_by_path, load_node, node_row, revision_text};
+use crate::embeddings::embed_key_of;
+use crate::jobs::{JobOp, PRIORITY_WRITE, enqueue};
 use crate::paths::NodePath;
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
 
 /// Мягко удаляет узел и всех его живых потомков одной меткой времени; их чанки
-/// удаляются (триггеры убирают их из FTS). Возвращает число помеченных узлов.
+/// удаляются (триггеры убирают их из FTS), заметкам, которые могли попасть в векторный
+/// индекс (не `excluded`), ставится `delete`. Возвращает число помеченных узлов.
 /// Нет узла или он уже удалён → `NotFound`.
 pub async fn delete_node(db: &Db, id: Id) -> Result<u64, StoreError> {
     db.write(move |tx| {
@@ -31,9 +37,20 @@ pub async fn delete_node(db: &Db, id: Id) -> Result<u64, StoreError> {
         let ids = subtree(tx, &node, None)?;
         let mut mark = tx.prepare_cached("UPDATE nodes SET deleted_at = ?2 WHERE id = ?1")?;
         let mut drop_chunks = tx.prepare_cached("DELETE FROM chunks WHERE node_id = ?1")?;
+        let mut state = tx.prepare_cached(
+            "SELECT current_rev, index_state FROM nodes WHERE id = ?1 AND kind = 'note'",
+        )?;
         for &nid in &ids {
             mark.execute(params![nid, now])?;
             drop_chunks.execute([nid])?;
+            let note: Option<(i64, String)> = state
+                .query_row([nid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some((rev, st)) = note
+                && st != "excluded"
+            {
+                enqueue(tx, nid, rev, JobOp::Delete, PRIORITY_WRITE, &now)?;
+            }
         }
         Ok(ids.len() as u64)
     })
@@ -43,7 +60,8 @@ pub async fn delete_node(db: &Db, id: Id) -> Result<u64, StoreError> {
 /// Восстанавливает удалённый узел вместе с поддеревом, удалённым той же меткой
 /// времени, и удалённых предков (каждого — только сам узел, без его поддерева).
 /// Путь любого восстанавливаемого узла занят живым → `Conflict`, ничего не меняется.
-/// Чанки заметок пересобираются из текущей ревизии.
+/// Чанки заметок пересобираются из текущей ревизии, `index_state` пересчитывается,
+/// индексируемым ставится `upsert` (заменяя `delete` от удаления).
 /// Нет узла → `NotFound`; узел жив → `BadInput`.
 pub async fn restore_node(db: &Db, id: Id) -> Result<Node, StoreError> {
     db.write(move |tx| {
@@ -66,10 +84,22 @@ pub async fn restore_node(db: &Db, id: Id) -> Result<Node, StoreError> {
         for n in &restored {
             unmark.execute([n.id])?;
         }
+        let now = fmt_ts(Timestamp::now());
+        let mut set_state = tx.prepare_cached("UPDATE nodes SET index_state = ?2 WHERE id = ?1")?;
         for n in restored.iter().filter(|n| n.kind == NodeKind::Note) {
             let content = revision_text(tx, n.id, n.current_rev)?;
             let meta = note_meta(&content, None);
-            rebuild_chunks(tx, n.id, n.current_rev, &content, &meta)?;
+            let kind = space_kind(tx, n.space_id)?;
+            set_state.execute(params![n.id, index_state(&meta, kind)])?;
+            index_note(
+                tx,
+                n.id,
+                n.current_rev,
+                &content,
+                &meta,
+                Some(&n.index_state),
+                &now,
+            )?;
         }
         load_node(tx, id)
     })
@@ -96,7 +126,8 @@ pub async fn list_trash(db: &Db, space_id: Option<Id>) -> Result<Vec<Node>, Stor
 /// Переносит (переименовывает) живой узел в `new_path` того же пространства:
 /// недостающие папки-предки создаются, пути потомков (в том числе удалённых —
 /// чтобы восстановление вернуло их на место) переписываются заменой префикса,
-/// `context_prefix` чанков узла и потомков пересчитывается.
+/// `context_prefix` чанков узла и потомков пересчитывается, живым индексируемым
+/// заметкам поддерева ставится `upsert` (в payload точек меняются путь и префикс).
 /// Тот же путь → узел без изменений; перенос в собственное поддерево → `BadInput`;
 /// путь занят или предок назначения — заметка → `Conflict`; нет узла или удалён → `NotFound`.
 pub async fn move_node(db: &Db, id: Id, new_path: NodePath) -> Result<Node, StoreError> {
@@ -142,8 +173,10 @@ pub async fn move_node(db: &Db, id: Id, new_path: NodePath) -> Result<Node, Stor
             |r| r.get(0),
         )?;
         refresh_prefixes(tx, &space, id)?;
+        requeue_moved(tx, id, &now)?;
         for (nid, _) in &descendants {
             refresh_prefixes(tx, &space, *nid)?;
+            requeue_moved(tx, *nid, &now)?;
         }
         load_node(tx, id)
     })
@@ -212,7 +245,7 @@ fn raw_deleted_at(c: &Connection, id: Id) -> Result<Option<String>, StoreError> 
     )
 }
 
-/// Пересчитывает `context_prefix` чанков узла по его текущим пути, имени и тегам
+/// Пересчитывает `context_prefix` и `embed_key` чанков узла по его текущим пути, имени и тегам
 /// (триггер `chunks_au` обновляет FTS). У папки и удалённого узла чанков нет.
 fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), StoreError> {
     let (path, name, fm): (String, String, Option<String>) = c.query_row(
@@ -225,27 +258,35 @@ fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), Stor
             .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node_id}: {e}")))?,
         None => Vec::new(),
     };
-    let chunks: Vec<(i64, String)> = {
-        let mut st = c.prepare_cached("SELECT seq, heading_path FROM chunks WHERE node_id = ?1")?;
-        st.query_map([node_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let chunks: Vec<(i64, String, String)> = {
+        let mut st =
+            c.prepare_cached("SELECT seq, heading_path, text FROM chunks WHERE node_id = ?1")?;
+        st.query_map([node_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?
     };
-    let mut upd = c.prepare_cached("UPDATE chunks SET context_prefix = ?2 WHERE seq = ?1")?;
-    for (seq, heading) in chunks {
-        upd.execute(params![
-            seq,
-            context_prefix(space, &path, &name, &heading, &tags)
-        ])?;
+    // ключ кэша зависит от префикса: пересчитывается вместе с ним
+    let mut upd =
+        c.prepare_cached("UPDATE chunks SET context_prefix = ?2, embed_key = ?3 WHERE seq = ?1")?;
+    for (seq, heading, text) in chunks {
+        let prefix = context_prefix(space, &path, &name, &heading, &tags);
+        upd.execute(params![seq, prefix, embed_key_of(&prefix, &text)])?;
     }
     Ok(())
 }
 
-/// Теги из JSON `nodes.frontmatter` (тот же список, что попадает в чанки при записи).
-fn frontmatter_tags(json: &str) -> Result<Vec<String>, serde_json::Error> {
-    #[derive(serde::Deserialize)]
-    struct Fm {
-        #[serde(default)]
-        tags: Vec<String>,
+/// `upsert` для живой индексируемой заметки после переноса; ревизия не меняется.
+fn requeue_moved(c: &Connection, node_id: Id, now: &str) -> Result<(), StoreError> {
+    let rev: Option<i64> = c
+        .prepare_cached(
+            "UPDATE nodes SET index_state = 'pending'
+             WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL
+               AND index_state <> 'excluded'
+             RETURNING current_rev",
+        )?
+        .query_row([node_id], |r| r.get(0))
+        .optional()?;
+    if let Some(rev) = rev {
+        enqueue(c, node_id, rev, JobOp::Upsert, PRIORITY_WRITE, now)?;
     }
-    Ok(serde_json::from_str::<Fm>(json)?.tags)
+    Ok(())
 }

@@ -1,10 +1,12 @@
 <script lang="ts">
   // Глобальный поиск (Ctrl+K): POST /search по всем пространствам пользователя
   // (Human — для администратора), подсветка совпадений текстовыми узлами и <mark>,
+  // метки каналов (`vector`, `fts`), строка деградации и предупреждения сервера,
   // переход к заметке и разделу.
   import { Dialog } from 'bits-ui';
   import { untrack } from 'svelte';
   import { ApiError, getOutline, listSpaces, search, spaceRef, type SearchItem } from '../lib/api';
+  import { reasonText, warningText } from '../lib/indexing';
   import { go } from '../lib/router';
 
   let {
@@ -14,6 +16,11 @@
   }: { open: boolean; user: string; onexpired: () => void } = $props();
 
   const DEBOUNCE_MS = 200;
+  const SOURCE_TITLE: Record<string, string> = {
+    vector: 'Найдено векторным (смысловым) поиском',
+    fts: 'Найдено полнотекстовым поиском',
+    trigram: 'Найдено поиском по подстроке',
+  };
   const MARK_START = '';
   const MARK_END = '';
 
@@ -23,6 +30,9 @@
   let error = $state('');
   let busy = $state(false);
   let searched = $state(false);
+  /** Векторный канал выключен: причина по-русски, иначе `null`. */
+  let degraded = $state<string | null>(null);
+  let warnings = $state<string[]>([]);
   let field = $state<HTMLInputElement | null>(null);
 
   let seq = 0;
@@ -72,6 +82,8 @@
     if (!qtext) {
       items = [];
       searched = false;
+      degraded = null;
+      warnings = [];
       busy = false;
       return;
     }
@@ -85,6 +97,8 @@
       const r = await search(user, qtext, ids);
       if (my !== seq) return;
       items = r.items;
+      degraded = r.degraded ? reasonText(r.degraded_reason, r.degraded_text) : null;
+      warnings = r.warnings ?? [];
       active = 0;
       searched = true;
     } catch (e) {
@@ -190,6 +204,16 @@
         autocomplete="off"
       />
       {#if error}<p class="error" role="alert">{error}</p>{/if}
+      {#if searched && query.trim() && (degraded !== null || warnings.length)}
+        <div class="notices" role="status">
+          {#if degraded !== null}
+            <p class="warn degraded">
+              Векторный поиск недоступен: {degraded} — показаны результаты полнотекстового поиска
+            </p>
+          {/if}
+          {#each warnings as w, i (i)}<p class="warn">Предупреждение: {warningText(w)}</p>{/each}
+        </div>
+      {/if}
       {#if items.length}
         <ul id="search-results" class="results" role="listbox" aria-label="Результаты поиска">
           {#each items as it, i (`${it.node_id}:${i}`)}
@@ -204,6 +228,7 @@
             >
               <div class="where">
                 <span class="space">{it.space?.name ?? '?'}</span>{` / ${it.path}`}{#if it.heading_path}<span class="section">{` › ${it.heading_path}`}</span>{/if}
+                {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}
               </div>
               <div class="snippet">
                 {#each parts(it.snippet ?? '') as p, j (j)}{#if p.m}<mark>{p.t}</mark>{:else}{p.t}{/if}{/each}
@@ -271,6 +296,25 @@
     background: var(--flash);
     color: inherit;
     border-radius: 2px;
+  }
+  .notices {
+    display: grid;
+    gap: 4px;
+    margin-top: 8px;
+  }
+  .notices p {
+    margin: 0;
+    font-size: 13px;
+  }
+  .src {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 5px;
+    font: 11px/16px ui-monospace, Consolas, monospace;
+    border-radius: 4px;
+    background: var(--chip);
+    color: var(--muted);
+    vertical-align: 1px;
   }
   .empty {
     margin: 12px 4px 4px;

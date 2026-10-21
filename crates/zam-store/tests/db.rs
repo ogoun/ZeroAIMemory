@@ -83,6 +83,39 @@ async fn write_error_rolls_back() {
     assert_eq!(cnt, 0);
 }
 
+/// Чужое соединение держит блокировку записи дольше 5 с (как фоновый `RESTART` с fsync на
+/// HDD под нагрузкой): запись ждёт её снятия, а не падает «database is locked» (задача 15
+/// M2, `WRITER_BUSY_TIMEOUT`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writer_waits_out_long_foreign_write_lock() {
+    let p = tmp("long-lock");
+    let db = Db::open(&p, MIGS).unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let hold = std::thread::spawn(move || {
+        let c = rusqlite::Connection::open(&p).unwrap();
+        c.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(6500));
+        c.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv().unwrap();
+    let t = std::time::Instant::now();
+    db.write(|tx| Ok(tx.execute("UPDATE t SET n=n+1", [])?))
+        .await
+        .expect("запись дождалась блокировки");
+    assert!(
+        t.elapsed() >= std::time::Duration::from_secs(5),
+        "{:?}",
+        t.elapsed()
+    );
+    hold.join().unwrap();
+    let n: i64 = db
+        .read(|c| Ok(c.query_row("SELECT n FROM t", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_are_serialized() {
     let db = Db::open(&tmp("concurrent"), MIGS).unwrap();

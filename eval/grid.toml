@@ -1,0 +1,57 @@
+# Сетка подбора весов [search] и порогов чанкинга [index] (задача 14 M2, шаг 3):
+#   cargo xtask eval --grid eval/grid.toml
+# Не больше 12 конфигураций; первая — базовая (умолчания), с ней сравниваются остальные
+# (парный бутстреп по запросам). Конфигурации с одинаковыми index.chunk_* делят один индекс.
+# Прогон на GPU (fp16): чанкинг и веса не зависят от точности модели, а индексация в разы
+# быстрее; выбранные значения проверяются прогоном hybrid на CPU int8.
+model = "bge-m3-fp16"
+device = "cuda"
+
+[[config]]
+name = "base"
+
+# веса каналов слияния RRF
+[[config]]
+name = "fts0.25"
+set = { "search.w_fts" = "0.25" }
+
+[[config]]
+name = "vec1.5"
+set = { "search.w_vector" = "1.5" }
+
+[[config]]
+name = "vec2"
+set = { "search.w_vector" = "2.0" }
+
+[[config]]
+name = "fts0.5"
+set = { "search.w_fts" = "0.5" }
+
+[[config]]
+name = "tri0.3"
+set = { "search.w_trigram" = "0.3" }
+
+[[config]]
+name = "tri1.0"
+set = { "search.w_trigram" = "1.0" }
+
+[[config]]
+name = "k20"
+set = { "search.rrf_k" = "20" }
+
+# чанкинг: размер листа 150–300 / 300–500 (база) / 500–800, перекрытие 0 / 1 (база) / 2
+[[config]]
+name = "chunk300"
+set = { "index.chunk_target_min" = "150", "index.chunk_target_max" = "300" }
+
+[[config]]
+name = "chunk800"
+set = { "index.chunk_target_min" = "500", "index.chunk_target_max" = "800" }
+
+[[config]]
+name = "overlap0"
+set = { "index.chunk_overlap_sentences" = "0" }
+
+[[config]]
+name = "overlap2"
+set = { "index.chunk_overlap_sentences" = "2" }

@@ -21,6 +21,8 @@ sha2.workspace = true
 blake3.workspace = true
 similar.workspace = true
 zam-markdown = { path = "../zam-markdown" }
+half.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

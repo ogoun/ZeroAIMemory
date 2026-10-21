@@ -1,5 +1,7 @@
 # Qdrant: закреплённая версия и SHA-256 архивов. Формат и правила обновления: см. xtask (cargo xtask fetch-deps).
 # vcruntime140.dll для Windows здесь не загружается: при упаковке копируется из установленного VC Redist.
+# Версия встраивается при сборке: zam-index/build.rs (ожидаемая версия супервизора, путь qdrant/<ver>/) и
+# zam-server (манифест `zam-server qdrant fetch`); после правки нужна пересборка сервера.
 name = "qdrant"
 version = "1.19.2"
 

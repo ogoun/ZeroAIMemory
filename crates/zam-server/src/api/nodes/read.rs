@@ -5,8 +5,8 @@
 //! - `format=md` → байты ревизии как сохранены (`text/markdown`, `ETag: "<rev>"`);
 //! - `format=html` → `{html, toc, warnings, rev}` из кэша рендера;
 //! - `tier=L0` → `{l0, rev}` (сводка текущей ревизии);
-//! - `tier=L1` → `{l1, rev}`: оглавление и первое предложение каждой секции, ≤ 1200
-//!   символов простого текста **[решение исполнителя до M2]**; `L2` — полный текст;
+//! - `tier=L1` → `{l1, rev}`: `note_l1` (§8.3) — оглавление и первое предложение каждой
+//!   секции строками `<отступ><заголовок> — <предложение>`, ≤ 1200 символов; `L2` — полный текст;
 //! - `section="A > B"` → только байты секции (нет — 404, неоднозначно — 422);
 //! - `rev=N` → старая ревизия.
 use axum::Json;
@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use zam_markdown::{OutlineItem, first_paragraph, outline as doc_outline, parse};
+use zam_markdown::{NOTE_L1_MAX_CHARS, OutlineItem, note_l1, outline as doc_outline, parse};
 use zam_store::{NodeKind, NodePath, get_node_by_path, node_content};
 
 use crate::api::query;
@@ -26,11 +26,6 @@ use crate::api::scope::{Mode, NodeScope, live, node_scope, space_scope};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
-
-/// Предел длины L1, символов.
-const L1_MAX_CHARS: usize = 1200;
-/// Предел длины первого предложения секции в L1, символов.
-const L1_SENTENCE_MAX_CHARS: usize = 200;
 
 #[derive(Deserialize, Default)]
 pub struct ReadQuery {
@@ -249,48 +244,10 @@ fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
     text.get(s.range.clone()).ok_or(ApiError::NotFound)
 }
 
-/// L1: по строке на секцию — `#… Заголовок: первое предложение` собственного текста
-/// секции (до первой подсекции); обрезается до 1200 символов.
+/// L1 (§8.3): оглавление и первое предложение каждой секции — тот же `note_l1`, что
+/// чанкер индексирует как сводку заметки, не длиннее [`NOTE_L1_MAX_CHARS`] символов.
 fn l1(text: &str) -> String {
-    let doc = parse(text);
-    let sections: Vec<_> = doc.sections.iter().filter(|s| s.level > 0).collect();
-    let mut lines = Vec::with_capacity(sections.len());
-    for (i, s) in sections.iter().enumerate() {
-        let own_end = sections
-            .get(i + 1)
-            .map_or(s.range.end, |n| n.range.start.min(s.range.end))
-            .max(s.body.start);
-        let own = text.get(s.body.start..own_end).unwrap_or("");
-        let mut line = format!("{} {}", "#".repeat(s.level as usize), s.title);
-        if let Some(p) = first_paragraph(own, &parse(own)) {
-            line.push_str(": ");
-            line.push_str(&first_sentence(&p));
-        }
-        lines.push(line);
-    }
-    let all = lines.join("\n");
-    match all.char_indices().nth(L1_MAX_CHARS) {
-        Some((cut, _)) => all[..cut].to_string(),
-        None => all,
-    }
-}
-
-/// Первое предложение: до `.`, `!`, `?` или `…`, за которыми пробел или конец;
-/// не длиннее 200 символов.
-fn first_sentence(p: &str) -> String {
-    let mut out = String::new();
-    let mut chars = p.chars().peekable();
-    while let Some(c) = chars.next() {
-        out.push(c);
-        if matches!(c, '.' | '!' | '?' | '…') && chars.peek().is_none_or(|n| n.is_whitespace()) {
-            break;
-        }
-        if out.chars().count() >= L1_SENTENCE_MAX_CHARS {
-            out.push('…');
-            break;
-        }
-    }
-    out
+    note_l1(text, &parse(text), NOTE_L1_MAX_CHARS)
 }
 
 #[cfg(test)]
@@ -327,21 +284,29 @@ mod tests {
     }
 
     #[test]
-    fn sentence_cut() {
-        assert_eq!(first_sentence("Раз. Два."), "Раз.");
-        assert_eq!(first_sentence("v1.2 вышла! Да"), "v1.2 вышла!");
-        assert_eq!(first_sentence("без точки"), "без точки");
-        assert_eq!(first_sentence(&"я".repeat(300)).chars().count(), 201);
-    }
-
-    #[test]
     fn l1_outline_and_limit() {
-        let t = "# A\nПервое. Второе.\n## B\nТекст B.\n# C\n";
-        assert_eq!(l1(t), "# A: Первое.\n## B: Текст B.\n# C");
+        let t = "# A
+Первое. Второе.
+## B
+Текст B.
+# C
+";
+        assert_eq!(
+            l1(t),
+            "A — Первое.
+  B — Текст B.
+C"
+        );
         let big: String = (0..200)
-            .map(|i| format!("# Заголовок {i}\nТекст.\n"))
+            .map(|i| {
+                format!(
+                    "# Заголовок {i}
+Текст.
+"
+                )
+            })
             .collect();
-        assert_eq!(l1(&big).chars().count(), L1_MAX_CHARS);
+        assert!(l1(&big).chars().count() <= NOTE_L1_MAX_CHARS);
     }
 
     #[test]

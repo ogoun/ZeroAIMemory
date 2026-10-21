@@ -6,6 +6,8 @@
   import { tick, untrack } from 'svelte';
   import Editor from './Editor.svelte';
   import History from './History.svelte';
+  import IndexBadge from './IndexBadge.svelte';
+  import { stateShort, stateText } from '../lib/indexing';
   import Lightbox from './Lightbox.svelte';
   import {
     ApiError,
@@ -220,6 +222,9 @@
     {#if info}
       <div class="meta muted">
         ревизия {info.current_rev} · изменено {fmtTime(info.updated_at)}
+        {#if info.kind === 'note' && info.index_state !== 'indexed'}
+          · <span class="istate" title={stateText(info.index_state)}><IndexBadge state={info.index_state} decorative />{stateShort(info.index_state)}</span>
+        {/if}
       </div>
       {#if tags.length || description}
         <div class="front">
@@ -347,6 +352,9 @@
   .meta {
     margin-top: 2px;
     font-size: 12px;
+  }
+  .istate {
+    white-space: nowrap;
   }
   .front {
     display: flex;

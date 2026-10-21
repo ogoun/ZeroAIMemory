@@ -1,0 +1,19 @@
+[
+  {
+    "level": "chunk",
+    "heading_path": "Справочник > Альфа",
+    "token_count": 306,
+    "range": [
+      39,
+      1943
+    ],
+    "head": "Короткая заметка про Альфа.\n\n## Бета\n\nКо"
+  },
+  {
+    "level": "note",
+    "heading_path": "",
+    "token_count": 102,
+    "range": null,
+    "head": "Справочник\n  Альфа — Короткая заметка пр"
+  }
+]

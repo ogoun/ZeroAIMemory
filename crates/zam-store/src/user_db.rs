@@ -8,9 +8,10 @@ use jiff::Timestamp;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use zam_core::Id;
 
+use crate::jobs::PRIORITY_REINDEX;
 use crate::time::fmt_ts;
 use crate::{Db, Migration, StoreError};
 
@@ -27,6 +28,18 @@ pub static USER_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: include_str!("../migrations/user/0003_revisions_append_only.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("../migrations/user/0004_index.sql"),
+    },
+    Migration {
+        version: 5,
+        sql: include_str!("../migrations/user/0005_embed_key.sql"),
+    },
+    Migration {
+        version: 6,
+        sql: include_str!("../migrations/user/0006_pending_index.sql"),
     },
 ];
 
@@ -91,7 +104,20 @@ const FIXED: [(SpaceKind, &str); 3] = [
 #[derive(Clone, Debug)]
 pub struct UserDbs {
     dir: PathBuf,
-    open: Arc<Mutex<HashMap<Id, Db>>>,
+    /// Ячейка на пользователя: глобальный замок держится только на поиск ячейки, открытие
+    /// (миграции, копия, дозаполнение ключей) идёт под замком своей ячейки и не задерживает
+    /// другие базы.
+    open: Arc<Mutex<HashMap<Id, Slot>>>,
+}
+
+type Slot = Arc<Mutex<Option<OpenDb>>>;
+
+/// Открытая база и признак завершения разовой перечанковки (R1).
+#[derive(Debug)]
+struct OpenDb {
+    db: Db,
+    /// `true` — перечанковка не нужна или уже завершилась (успешно или с ошибкой).
+    rechunked: watch::Receiver<bool>,
 }
 
 impl UserDbs {
@@ -104,16 +130,59 @@ impl UserDbs {
     }
 
     /// База пользователя: открывается лениво (с миграцией и копией) и кэшируется.
+    ///
+    /// Чанки без `embed_key` (созданные до v5) получают ключ сразу, до возврата базы.
+    ///
+    /// Если база только что обновлена до v4, разовая перечанковка (R1) запускается
+    /// фоновой задачей tokio один раз на открытие: `get` её не ждёт, записи во время
+    /// неё безопасны (пакеты идемпотентны и читают текущую ревизию в своей транзакции).
+    /// Дождаться её — [`UserDbs::wait_rechunk`].
     pub async fn get(&self, user: Id) -> Result<Db, StoreError> {
-        // Открытие под замком: два одновременных вызова не создадут два Db на один файл.
-        let mut open = self.open.lock().await;
-        if let Some(db) = open.get(&user) {
-            return Ok(db.clone());
+        let slot = self.open.lock().await.entry(user).or_default().clone();
+        // Открытие под замком ячейки: два одновременных вызова не создадут два Db на один
+        // файл; другие базы при этом открываются параллельно.
+        let mut cell = slot.lock().await;
+        if let Some(e) = cell.as_ref() {
+            return Ok(e.db.clone());
         }
         let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
         ensure_fixed_spaces(&db).await?;
-        open.insert(user, db.clone());
+        crate::nodes::backfill_embed_keys(&db).await?;
+        let pending = match rechunk_pending(&db).await? {
+            Some(why) if !clear_rechunk_if_empty(&db).await? => Some(why),
+            _ => None,
+        };
+        let (done, rechunked) = watch::channel(pending.is_none());
+        *cell = Some(OpenDb {
+            db: db.clone(),
+            rechunked,
+        });
+        drop(cell);
+        if let Some(why) = pending {
+            let bg = db.clone();
+            tokio::spawn(async move {
+                if let Err(e) = rechunk_all(&bg, why).await {
+                    // повторится при следующем открытии базы
+                    tracing::warn!(error = %e, reason = why.as_str(), "перечанковка заметок прервана");
+                }
+                let _ = done.send(true);
+            });
+        }
         Ok(db)
+    }
+
+    /// Ждёт завершения разовой перечанковки (R1) базы `user`, если она открыта и
+    /// перечанковка идёт; иначе возвращается сразу.
+    pub async fn wait_rechunk(&self, user: Id) {
+        let slot = self.open.lock().await.get(&user).cloned();
+        let rx = match slot {
+            Some(s) => s.lock().await.as_ref().map(|e| e.rechunked.clone()),
+            None => None,
+        };
+        if let Some(mut rx) = rx {
+            // ошибка — отправитель закрыт без `true` (задача прервана): ждать нечего
+            let _ = rx.wait_for(|done| *done).await;
+        }
     }
 }
 
@@ -132,6 +201,117 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
         Ok(())
     })
     .await
+}
+
+/// Ключ `meta`: разовая перечанковка после миграции 0004 ещё не выполнена.
+const RECHUNK_V4: &str = "rechunk_v4";
+
+/// Ключ `meta`: часть чанков базы нарезана приближённым счётчиком токенов (свежая установка
+/// без моделей, `ApproxCounter`). Ставится в транзакции нарезки, снимается после перенарезки
+/// всех живых заметок точным счётчиком.
+pub(crate) const CHUNKED_APPROX: &str = "chunked_approx";
+
+/// Почему база перечанковывается при открытии.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rechunk {
+    /// Ruling R1: база M1 обновлена до v4.
+    AfterV4,
+    /// Чанки по оценке, а счётчик теперь точный (модель установлена после записи заметок).
+    ExactCounter,
+}
+
+impl Rechunk {
+    fn as_str(self) -> &'static str {
+        match self {
+            Rechunk::AfterV4 => "after_v4",
+            Rechunk::ExactCounter => "exact_counter",
+        }
+    }
+}
+
+fn has_meta(c: &Connection, key: &str) -> rusqlite::Result<bool> {
+    Ok(
+        c.query_row("SELECT 1 FROM meta WHERE key = ?1", [key], |_| Ok(()))
+            .optional()?
+            .is_some(),
+    )
+}
+
+/// Нужна ли перечанковка при открытии: флаг R1 или чанки по оценке при точном счётчике.
+async fn rechunk_pending(db: &Db) -> Result<Option<Rechunk>, StoreError> {
+    let exact = crate::nodes::token_counter_exact();
+    db.read(move |c| {
+        Ok(if has_meta(c, RECHUNK_V4)? {
+            Some(Rechunk::AfterV4)
+        } else if exact && has_meta(c, CHUNKED_APPROX)? {
+            Some(Rechunk::ExactCounter)
+        } else {
+            None
+        })
+    })
+    .await
+}
+
+/// База без живых заметок (новая или пустая) — флаги перечанковки снимаются сразу, без
+/// фоновой задачи. `true` — сняты.
+async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
+    db.write(|tx| {
+        let any: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !any {
+            tx.execute(
+                "DELETE FROM meta WHERE key IN (?1, ?2)",
+                [RECHUNK_V4, CHUNKED_APPROX],
+            )?;
+        }
+        Ok(!any)
+    })
+    .await
+}
+
+/// Снимает отметку «чанки по оценке», если счётчик точный: вызывается после перечанковки
+/// всех живых заметок базы. Заметка, записанная во время перечанковки, нарезана тем же
+/// точным счётчиком; счётчик, откатившийся на оценку посреди работы, отметку не снимает.
+pub(crate) async fn clear_approx_if_exact(db: &Db) -> Result<(), StoreError> {
+    if !crate::nodes::token_counter_exact() {
+        return Ok(());
+    }
+    db.write(|tx| {
+        tx.execute("DELETE FROM meta WHERE key = ?1", [CHUNKED_APPROX])?;
+        Ok(())
+    })
+    .await
+}
+
+/// Перечанковка всех живых заметок текущим счётчиком с заданиями `upsert`.
+///
+/// Ruling R1: чанки M1 построены по секциям (`section`) и без векторов, поэтому при первом
+/// открытии базы v4 все живые заметки перечанковываются. То же — при первом открытии с точным
+/// счётчиком базы, чанки которой нарезаны оценкой: иначе листы могут не уложиться в окно
+/// модели (усечение при инференсе) и разойтись с порогами §8.2. Флаги снимаются только после
+/// успеха: прерванная перечанковка повторится при следующем открытии (она идемпотентна).
+/// На большой базе — долго (и полный повторный инференс); в лог идут только счётчики.
+async fn rechunk_all(db: &Db, why: Rechunk) -> Result<(), StoreError> {
+    tracing::info!(reason = why.as_str(), "перечанковка заметок базы");
+    let started = std::time::Instant::now();
+    let (notes, upserts) = crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX).await?;
+    db.write(|tx| {
+        tx.execute("DELETE FROM meta WHERE key = ?1", [RECHUNK_V4])?;
+        Ok(())
+    })
+    .await?;
+    clear_approx_if_exact(db).await?;
+    tracing::info!(
+        reason = why.as_str(),
+        notes,
+        upserts,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "перечанковка заметок базы завершена"
+    );
+    Ok(())
 }
 
 /// Пространства: rules, human, knowledge, затем решения по имени.

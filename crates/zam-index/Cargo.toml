@@ -1,0 +1,68 @@
+[package]
+name = "zam-index"
+description = "Векторный индекс ZeroAIMemory: трейт VectorIndex, адаптер Qdrant (named dense+sparse, RRF), супервизор нативного Qdrant и воркер индексации"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+# Вспомогательный бинарник теста «родитель убит» (tests/supervisor.rs): запускает
+# супервизор и печатает pid Qdrant. В поставку не входит (xtask упаковывает только
+# zam-server и zam).
+[[bin]]
+name = "kill_parent_probe"
+path = "tests/bin/kill_parent_probe.rs"
+test = false
+doc = false
+bench = false
+
+# Замер managed Qdrant против Qdrant Edge (ADR 0001): запускает `cargo xtask bench --edge`;
+# вариант edge — только при сборке с feature `edge`. В поставку не входит.
+[[example]]
+name = "index_bench"
+test = false
+
+[features]
+# Точка остановки воркера перед записью пачки в Qdrant — только для тестов (включает
+# dev-зависимость zam-server); в сборке сервера и релизе её нет.
+test-hooks = []
+# Прототип встроенного индекса Qdrant Edge (задача 16 M2, ADR 0001): не по умолчанию,
+# в сервер и релизные комплекты не входит; включается только для тестов и `cargo xtask bench --edge`.
+edge = ["dep:qdrant-edge"]
+
+[dependencies]
+qdrant-client.workspace = true
+tonic.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+fs4.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "io-util", "process", "macros"] }
+zam-core = { path = "../zam-core" }
+# воркер индексации: outbox, кэш эмбеддингов, L0 (§8.1, §8.3)
+zam-store = { path = "../zam-store" }
+zam-markdown = { path = "../zam-markdown" }
+jiff.workspace = true
+blake3.workspace = true
+# параллельная запись пачек точек при reindex (уже в дереве через tonic)
+futures-util = { workspace = true, features = ["alloc"] }
+# только под feature `edge` (ADR 0001)
+qdrant-edge = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { workspace = true, features = ["job-object", "creation-flags"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
+
+[target.'cfg(unix)'.dependencies]
+process-wrap = { workspace = true, features = ["process-group"] }
+libc.workspace = true
+
+[dev-dependencies]
+# index_bench: sparse-векторы из корпуса eval токенизатором bge-m3 (крейт уже в дереве через zam-ml)
+tokenizers.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true

@@ -1,4 +1,5 @@
-//! `POST /search` (FTS, M1): область, Human, режимы, бюджет, форматы, синтаксис FTS5.
+//! `POST /search` без моделей (FTS-only, деградация): область, Human, режимы, бюджет,
+//! форматы, синтаксис FTS5. Гибрид с векторами — `hybrid.rs`.
 mod common;
 
 use axum::http::{Method, StatusCode};
@@ -73,10 +74,15 @@ async fn finds_note_and_reports_degraded() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
     assert_eq!(j["degraded"], true);
-    assert_eq!(j["degraded_reason"], "vector index not available (M1)");
+    // без ORT и моделей векторный канал выключен: причина из DegradedReason
+    let reason = j["degraded_reason"].as_str().unwrap();
+    assert!(["no_runtime", "no_model"].contains(&reason), "{j}");
     // Knowledge и Rules (решение не задано): по одной заметке, обе ждут векторов
     assert_eq!(j["pending_count"], 2, "{j}");
     assert!(j["timings"]["fts_ms"].is_number(), "{j}");
+    assert!(j["timings"]["fuse_ms"].is_number(), "{j}");
+    // векторный канал не запускался
+    assert!(j["timings"]["embed_ms"].is_null() && j["timings"]["vector_ms"].is_null());
     let items = j["items"].as_array().unwrap();
     let it = &items[0];
     assert_eq!(it["path"], "Инструменты/Bash скрипты");
@@ -85,6 +91,9 @@ async fn finds_note_and_reports_degraded() {
     assert_eq!(it["rev"], 1);
     assert!(it["node_id"].is_string() && it["updated_at"].is_string());
     assert!(it["score"].is_number());
+    assert_eq!(it["sources"], json!(["fts"]), "{it}");
+    assert_eq!(it["level"], "chunk", "{it}");
+    assert!(it["tokens"].as_u64().unwrap() > 0, "{it}");
     assert!(!it["chunk_ids"].as_array().unwrap().is_empty());
     let snip = it["snippet"].as_str().unwrap();
     assert!(
@@ -197,6 +206,9 @@ async fn scope_defaults_solution_and_flags() {
     for bad in [
         json!({"query": q, "mode": "x"}),
         json!({"query": q, "format": "x"}),
+        json!({"query": q, "expand": "x"}),
+        // граф знаний — M3
+        json!({"query": q, "mode": "chunks", "expand": "graph"}),
         json!({"query": q, "top_k": 0}),
         json!({"query": q, "scope": {"solution": "nope"}}),
         json!({"nope": 1}),
@@ -229,6 +241,7 @@ async fn modes_budget_and_md_format() {
         .iter()
         .map(|i| i["text"].as_str().unwrap().chars().count())
         .sum();
+    // бюджет в токенах (без модели — оценка ~3,5 символа на токен)
     assert!(total <= 50 * 4, "{total}");
     // бюджет 0 — хотя бы один элемент
     let j = search(
@@ -262,12 +275,56 @@ async fn modes_budget_and_md_format() {
     assert_eq!(r.status, StatusCode::OK);
     assert!(r.header("content-type").starts_with("text/markdown"));
     let t = r.text();
-    assert!(
-        t.starts_with("- [Knowledge/Инструменты/Bash скрипты › "),
-        "{t}"
-    );
+    // карточка §9.3 и строка деградации в конце
+    assert!(t.starts_with("1. n:"), "{t}");
+    assert!(t.contains(" Knowledge/Инструменты/Bash скрипты › "), "{t}");
+    assert!(t.contains(" tok\n   "), "{t}");
     assert!(t.contains("**"), "{t}");
     assert!(!t.contains('\u{E000}'), "{t}");
+    assert!(t.trim_end().ends_with("(только FTS)"), "{t}");
+}
+
+#[tokio::test]
+async fn summary_replaced_by_leaf_with_most_query_words() {
+    // FTS-only: все три слова вместе — только в L1 заметки; лист «Вторая» содержит два
+    // из них, «Первая» — одно
+    let a = api("search-summary", |_| {}).await;
+    let filler = "текст ".repeat(80);
+    a.note(
+        "knowledge",
+        "две",
+        &format!(
+            "# Первая\n\nАльфаслово открывает раздел. {filler}\n\n# Вторая\n\n\
+             Бетаслово и гаммаслово открывают раздел. {filler}\n"
+        ),
+    )
+    .await;
+    let j = search(&a, json!({"query": "альфаслово бетаслово гаммаслово"}))
+        .await
+        .json();
+    let items = j["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{j}");
+    assert_eq!(items[0]["level"], "chunk", "{j}");
+    assert_eq!(items[0]["heading_path"], "Вторая", "{j}");
+    // сниппет листа подсвечивает слово запроса
+    assert!(
+        items[0]["snippet"].as_str().unwrap().contains('\u{E000}'),
+        "{j}"
+    );
+}
+
+#[tokio::test]
+async fn md_empty_result_still_reports_degraded() {
+    let a = api("search-md-empty", |_| {}).await;
+    corpus(&a).await;
+    let r = search(&a, json!({"query": "несуществующееслово", "format": "md"})).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let t = r.text();
+    assert!(
+        t.starts_with("> degraded: ") && t.trim_end().ends_with("(только FTS)"),
+        "{t}"
+    );
+    assert_eq!(t.lines().count(), 1, "{t}");
 }
 
 #[tokio::test]
@@ -340,4 +397,45 @@ async fn webui_brief_budget_fits_top_k_20() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["items"].as_array().unwrap().len(), 20);
+}
+
+#[tokio::test]
+async fn rerank_on_without_model_warns_and_keeps_order() {
+    let a = api("search-rerank", |_| {}).await;
+    corpus(&a).await;
+    let base = search(&a, json!({"query": "скрипты"})).await.json();
+    assert_eq!(base["warnings"], json!([]), "{base}");
+    assert!(base["timings"]["rerank_ms"].is_null(), "{base}");
+    let r = search(&a, json!({"query": "скрипты", "rerank": "on"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["warnings"], json!(["reranker not installed"]), "{j}");
+    assert!(j["timings"]["rerank_ms"].is_number(), "{j}");
+    // без реранкера — порядок слияния, баллов реранка нет
+    assert_eq!(paths(&j), paths(&base));
+    assert!(
+        j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i.get("rerank_score").is_none()),
+        "{j}"
+    );
+    let t = search(
+        &a,
+        json!({"query": "скрипты", "rerank": "on", "format": "md"}),
+    )
+    .await
+    .text();
+    assert!(
+        t.trim_end().ends_with("> warning: reranker not installed"),
+        "{t}"
+    );
+    // rerank=off — как без поля
+    let off = search(&a, json!({"query": "скрипты", "rerank": "off"}))
+        .await
+        .json();
+    assert_eq!(off["warnings"], json!([]));
+    let r = search(&a, json!({"query": "скрипты", "rerank": "maybe"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }

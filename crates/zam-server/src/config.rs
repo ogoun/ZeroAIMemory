@@ -11,7 +11,7 @@ use toml::{Table, Value};
 
 /// Переменные `ZAM_*`, которые не являются слоем конфигурации:
 /// секреты и адрес клиента, а также сборочные (build.rs, xtask), попадающие в окружение CI.
-const RESERVED_ENV: [&str; 8] = [
+const RESERVED_ENV: [&str; 9] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
@@ -20,6 +20,7 @@ const RESERVED_ENV: [&str; 8] = [
     "ZAM_WEB_REBUILD",
     "ZAM_WEB_INDEX",
     "ZAM_VCRUNTIME_DLL",
+    "ZAM_VC_CRT_DIR",
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +31,9 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     pub log: LogSection,
     pub qdrant: QdrantSection,
+    pub ml: MlSection,
+    pub index: IndexSection,
+    pub search: SearchSection,
     pub limits: LimitsSection,
 }
 
@@ -74,14 +78,373 @@ pub enum QdrantMode {
     Edge,
 }
 
-/// В M0 только разбирается.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Секция `[qdrant]` (§4.3). Супервизор строится из неё через [`QdrantSection::supervisor_config`].
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QdrantSection {
     pub mode: QdrantMode,
+    /// gRPC-адрес внешнего Qdrant (`mode = "external"`), например `http://127.0.0.1:6334`.
     pub url: Option<String>,
     pub http_port: u16,
     pub grpc_port: u16,
+    /// Бинарник управляемого Qdrant; по умолчанию `<exe_dir>/qdrant/<ver>/qdrant[.exe]`.
+    pub binary: Option<PathBuf>,
+    /// `storage.performance.max_search_threads` (0 — авто): не отбирать CPU у инференса.
+    pub max_search_threads: u32,
+    /// `storage.performance.optimizer_cpu_budget` (0 — авто).
+    pub optimizer_cpu_budget: u32,
+    /// API-ключ внешнего Qdrant. Для `managed` не задаётся: ключ случайный при каждом старте.
+    pub api_key: Option<String>,
+}
+
+// Вручную: ключ внешнего Qdrant не должен попадать в отладочный вывод.
+impl std::fmt::Debug for QdrantSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QdrantSection")
+            .field("mode", &self.mode)
+            .field("url", &self.url)
+            .field("http_port", &self.http_port)
+            .field("grpc_port", &self.grpc_port)
+            .field("binary", &self.binary)
+            .field("max_search_threads", &self.max_search_threads)
+            .field("optimizer_cpu_budget", &self.optimizer_cpu_budget)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+impl QdrantSection {
+    /// Бинарник управляемого Qdrant: из конфигурации или из комплекта рядом с `exe_dir`.
+    pub fn binary_path(&self, exe_dir: &Path) -> PathBuf {
+        self.binary
+            .clone()
+            .unwrap_or_else(|| zam_index::supervisor::default_binary(exe_dir))
+    }
+
+    /// Конфигурация супервизора; `None` — режим `edge` (экспериментальный, без процесса).
+    pub fn supervisor_config(
+        &self,
+        exe_dir: &Path,
+    ) -> Result<Option<zam_index::supervisor::SupervisorConfig>, ConfigError> {
+        use zam_index::supervisor::{ManagedConfig, SupervisorConfig};
+        let invalid = |key: &str, message: &str| ConfigError::Invalid {
+            key: key.into(),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        match self.mode {
+            QdrantMode::Managed => {
+                if self.api_key.is_some() {
+                    return Err(invalid(
+                        "qdrant.api_key",
+                        "задаётся только для mode = \"external\": управляемый Qdrant получает случайный ключ при каждом старте",
+                    ));
+                }
+                if self.http_port == self.grpc_port {
+                    return Err(invalid("qdrant.grpc_port", "совпадает с http_port"));
+                }
+                let mut m = ManagedConfig::new(self.binary_path(exe_dir));
+                m.http_port = self.http_port;
+                m.grpc_port = self.grpc_port;
+                m.max_search_threads = self.max_search_threads;
+                m.optimizer_cpu_budget = self.optimizer_cpu_budget;
+                Ok(Some(SupervisorConfig::Managed(m)))
+            }
+            QdrantMode::External => {
+                let url = self
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| {
+                        invalid(
+                            "qdrant.url",
+                            "обязателен для mode = \"external\" (gRPC-адрес)",
+                        )
+                    })?;
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(invalid("qdrant.url", "ожидается http:// или https://"));
+                }
+                Ok(Some(SupervisorConfig::external(
+                    url,
+                    self.api_key.clone().filter(|k| !k.is_empty()),
+                )))
+            }
+            QdrantMode::Edge => Ok(None),
+        }
+    }
+}
+
+/// Устройство инференса (`ml.device`, §8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlDevice {
+    /// CUDA, если доступна, иначе CPU.
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl From<MlDevice> for zam_ml::DevicePref {
+    fn from(d: MlDevice) -> Self {
+        match d {
+            MlDevice::Auto => zam_ml::DevicePref::Auto,
+            MlDevice::Cpu => zam_ml::DevicePref::Cpu,
+            MlDevice::Cuda => zam_ml::DevicePref::Cuda,
+        }
+    }
+}
+
+/// Секция `[ml]` (§8.4): модель эмбеддингов и ONNX Runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MlSection {
+    pub device: MlDevice,
+    /// Каталог моделей; по умолчанию `<data_dir>/models`.
+    pub models_dir: Option<PathBuf>,
+    /// Модель эмбеддингов; по умолчанию `bge-m3-fp16` в GPU-комплекте при доступной CUDA,
+    /// иначе `bge-m3-int8`.
+    pub embed_model: Option<String>,
+    /// Библиотека ONNX Runtime; по умолчанию рядом с исполняемым файлом.
+    pub ort_dylib: Option<PathBuf>,
+    /// Потоки сессии индексации (0 — авто).
+    pub index_threads: usize,
+    /// Потоки сессии запросов.
+    pub query_threads: usize,
+    /// Выгрузка модели после простоя: `""` — выключено, иначе `<число>s|m|h`.
+    pub unload_after: String,
+    /// Реранкер при эмбеддере на CPU (`rerank=on`, §9.2 п. 5); `jina-reranker-v2` —
+    /// CC-BY-NC-4.0, ставится только `models fetch --reranker --accept-nc-license`.
+    pub rerank_model_cpu: String,
+    /// Реранкер при эмбеддере на CUDA (Apache-2.0, входит в `zam-models`).
+    pub rerank_model_gpu: String,
+    /// Сколько первых кандидатов слияния переранжируется (1..=100).
+    pub rerank_top: usize,
+    /// Предел токенов фрагмента в паре реранкера (8..=1024).
+    pub rerank_tokens: usize,
+    /// Параллельных сессий реранкера с динамическим int8 (jina): 0 — авто (до 2, не меньше
+    /// двух физических ядер на сессию), иначе 1..=16. Ядра `index_threads` делятся между
+    /// сессиями; каждая сессия держит свою копию весов (~0,3 ГБ у jina).
+    pub rerank_sessions: usize,
+}
+
+impl MlSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("ml.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        self.unload_after()?;
+        for (k, v) in [
+            ("rerank_model_cpu", &self.rerank_model_cpu),
+            ("rerank_model_gpu", &self.rerank_model_gpu),
+        ] {
+            let ok = !v.is_empty()
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                && v != "."
+                && v != "..";
+            if !ok {
+                return Err(bad(k, "id модели: латиница, цифры, '-', '_', '.'"));
+            }
+        }
+        if !(1..=100).contains(&self.rerank_top) {
+            return Err(bad("rerank_top", "от 1 до 100"));
+        }
+        if !(8..=1024).contains(&self.rerank_tokens) {
+            return Err(bad("rerank_tokens", "от 8 до 1024"));
+        }
+        if self.rerank_sessions > 16 {
+            return Err(bad("rerank_sessions", "0 (авто) или от 1 до 16"));
+        }
+        Ok(())
+    }
+
+    /// Каталог моделей с учётом умолчания.
+    pub fn models_dir(&self, data_dir: &Path) -> PathBuf {
+        self.models_dir
+            .clone()
+            .unwrap_or_else(|| data_dir.join("models"))
+    }
+
+    /// `unload_after` как длительность; `None` — выключено.
+    pub fn unload_after(&self) -> Result<Option<std::time::Duration>, ConfigError> {
+        let raw = self.unload_after.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let invalid = || ConfigError::Invalid {
+            key: "ml.unload_after".into(),
+            source_name: "итог".into(),
+            message: format!("ожидается \"\" или <число>s|m|h, получено `{raw}`"),
+        };
+        // последний символ — единица; многобайтовый символ («5м») — ошибка, не паника
+        let Some((at, unit)) = raw.char_indices().last() else {
+            return Err(invalid());
+        };
+        let n: u64 = raw[..at].trim().parse().map_err(|_| invalid())?;
+        let mul = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            _ => return Err(invalid()),
+        };
+        let secs = n.checked_mul(mul).ok_or_else(invalid)?;
+        if secs == 0 {
+            return Err(invalid());
+        }
+        Ok(Some(std::time::Duration::from_secs(secs)))
+    }
+}
+
+/// Секция `[index]` (§8.1): воркер индексации.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexSection {
+    /// Предел токенов одного вызова инференса.
+    pub batch_tokens: usize,
+    /// Уступка между пачками, мс.
+    pub yield_ms: u64,
+    /// Дебаунс свёртки L0 папок, мс.
+    pub rollup_debounce_ms: u64,
+    /// Чанкинг §8.2, токены счётчика модели: лист набирается до `chunk_target_min..=
+    /// chunk_target_max`, недобравший может вырасти до `chunk_hard_max` (предел любого листа).
+    pub chunk_target_min: usize,
+    pub chunk_target_max: usize,
+    pub chunk_hard_max: usize,
+    /// Секция короче склеивается с соседней.
+    pub chunk_merge_below: usize,
+    /// Предложений перекрытия соседних листов секции.
+    pub chunk_overlap_sentences: usize,
+}
+
+/// Санитарный предел `chunk_hard_max` в конфигурации. Действующий предел задаёт модель:
+/// лист с префиксом контекста и спецтокенами должен уместиться в её окно при индексации
+/// (`max_tokens_passage` минус [`CHUNK_PREFIX_BUDGET`], см. [`IndexSection::chunk_params_for`]).
+pub const CHUNK_HARD_MAX_CAP: usize = 8192;
+/// Бюджет префикса контекста (`[space/path] имя > заголовки | теги`) и спецтокенов в окне
+/// модели, токенов.
+pub const CHUNK_PREFIX_BUDGET: usize = 64;
+/// Окно модели, когда она неизвестна (токенизатора нет, счёт оценкой): bge-m3 — 1024.
+pub const DEFAULT_PASSAGE_WINDOW: usize = 1024;
+/// Предел `chunk_overlap_sentences`.
+pub const CHUNK_OVERLAP_LIMIT: usize = 5;
+
+impl IndexSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: String| ConfigError::Invalid {
+            key: format!("index.{key}"),
+            source_name: "итог".into(),
+            message,
+        };
+        if self.batch_tokens == 0 {
+            return Err(bad("batch_tokens", "должно быть больше 0".into()));
+        }
+        if !(1..=CHUNK_HARD_MAX_CAP).contains(&self.chunk_hard_max) {
+            return Err(bad(
+                "chunk_hard_max",
+                format!("от 1 до {CHUNK_HARD_MAX_CAP}"),
+            ));
+        }
+        if !(1..=self.chunk_hard_max).contains(&self.chunk_target_max) {
+            return Err(bad("chunk_target_max", "от 1 до chunk_hard_max".into()));
+        }
+        if !(1..=self.chunk_target_max).contains(&self.chunk_target_min) {
+            return Err(bad("chunk_target_min", "от 1 до chunk_target_max".into()));
+        }
+        if self.chunk_merge_below > self.chunk_target_max {
+            return Err(bad(
+                "chunk_merge_below",
+                "не больше chunk_target_max".into(),
+            ));
+        }
+        if self.chunk_overlap_sentences > CHUNK_OVERLAP_LIMIT {
+            return Err(bad(
+                "chunk_overlap_sentences",
+                format!("от 0 до {CHUNK_OVERLAP_LIMIT}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Пороги чанкера для модели с окном `window` токенов (`max_tokens_passage`; `None` —
+    /// модель неизвестна, [`DEFAULT_PASSAGE_WINDOW`]): `chunk_hard_max` не больше окна минус
+    /// [`CHUNK_PREFIX_BUDGET`], остальные пороги — не больше него. Второе значение — `true`,
+    /// если пороги конфигурации пришлось уменьшить.
+    pub fn chunk_params_for(&self, window: Option<usize>) -> (zam_markdown::ChunkParams, bool) {
+        let want = self.chunk_params();
+        let limit = window
+            .unwrap_or(DEFAULT_PASSAGE_WINDOW)
+            .saturating_sub(CHUNK_PREFIX_BUDGET)
+            .max(1);
+        let mut p = want;
+        p.hard_max = p.hard_max.min(limit);
+        p.target_max = p.target_max.min(p.hard_max);
+        p.target_min = p.target_min.min(p.target_max);
+        p.merge_below = p.merge_below.min(p.target_max);
+        (p, p != want)
+    }
+
+    /// Пороги чанкера из конфигурации как есть (без учёта окна модели).
+    pub fn chunk_params(&self) -> zam_markdown::ChunkParams {
+        zam_markdown::ChunkParams {
+            target_min: self.chunk_target_min,
+            target_max: self.chunk_target_max,
+            hard_max: self.chunk_hard_max,
+            merge_below: self.chunk_merge_below,
+            overlap_sentences: self.chunk_overlap_sentences,
+        }
+    }
+}
+
+/// Секция `[search]` (§9.2): слияние каналов weighted RRF и поправки.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSection {
+    /// Константа RRF (> 0).
+    pub rrf_k: f64,
+    /// Вес векторного канала (Qdrant: dense + sparse + сводки).
+    pub w_vector: f64,
+    /// Вес канала FTS5 `bm25`, когда нашлись чанки со всеми словами запроса.
+    pub w_fts: f64,
+    /// Вес `bm25`, когда сработал только ослабленный запрос (любое слово): совпадения по
+    /// одному слову — слабый сигнал (по умолчанию 0,25 — подобран на eval, §18.2).
+    pub w_fts_relaxed: f64,
+    /// Вес канала FTS5 `trigram` (идентификаторы и код).
+    pub w_trigram: f64,
+    /// Полупериод затухания по свежести, дней; 0 — без затухания.
+    pub recency_half_life_days: f64,
+    /// Не больше чанков с одного узла (≥ 1).
+    pub max_per_node: usize,
+}
+
+impl SearchSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("search.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(self.rrf_k.is_finite() && self.rrf_k > 0.0) {
+            return Err(bad("rrf_k", "должно быть больше 0"));
+        }
+        for (k, v) in [
+            ("w_vector", self.w_vector),
+            ("w_fts", self.w_fts),
+            ("w_fts_relaxed", self.w_fts_relaxed),
+            ("w_trigram", self.w_trigram),
+            ("recency_half_life_days", self.recency_half_life_days),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(bad(k, "должно быть конечным и не меньше 0"));
+            }
+        }
+        if self.max_per_node == 0 {
+            return Err(bad("max_per_node", "должно быть больше 0"));
+        }
+        Ok(())
+    }
 }
 
 /// Пределы размеров (§16.2): заметка и вложение, байт.
@@ -116,6 +479,43 @@ impl Default for ServerConfig {
                 url: None,
                 http_port: 6333,
                 grpc_port: 6334,
+                binary: None,
+                max_search_threads: 2,
+                optimizer_cpu_budget: 2,
+                api_key: None,
+            },
+            ml: MlSection {
+                device: MlDevice::Auto,
+                models_dir: None,
+                embed_model: None,
+                ort_dylib: None,
+                index_threads: 0,
+                query_threads: 2,
+                unload_after: String::new(),
+                rerank_model_cpu: "jina-reranker-v2".into(),
+                rerank_model_gpu: "bge-reranker-v2-m3".into(),
+                rerank_top: 20,
+                rerank_tokens: 256,
+                rerank_sessions: 0,
+            },
+            index: IndexSection {
+                batch_tokens: 8192,
+                yield_ms: 5,
+                rollup_debounce_ms: 2000,
+                chunk_target_min: 300,
+                chunk_target_max: 500,
+                chunk_hard_max: 800,
+                chunk_merge_below: 100,
+                chunk_overlap_sentences: 1,
+            },
+            search: SearchSection {
+                rrf_k: 60.0,
+                w_vector: 1.0,
+                w_fts: 1.0,
+                w_fts_relaxed: 0.25,
+                w_trigram: 0.7,
+                recency_half_life_days: 180.0,
+                max_per_node: 3,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -285,6 +685,9 @@ pub fn load(
                 message: e.message().to_string(),
             })?;
     cfg.server.base_path = normalize_base_path(&cfg.server.base_path);
+    cfg.ml.validate()?;
+    cfg.index.validate()?;
+    cfg.search.validate()?;
     Ok(cfg)
 }
 
@@ -394,6 +797,11 @@ mod tests {
         assert_eq!(c.log.max_files, 14);
         assert_eq!(c.qdrant.mode, QdrantMode::Managed);
         assert_eq!((c.qdrant.http_port, c.qdrant.grpc_port), (6333, 6334));
+        assert_eq!(
+            (c.qdrant.max_search_threads, c.qdrant.optimizer_cpu_budget),
+            (2, 2)
+        );
+        assert_eq!((&c.qdrant.binary, &c.qdrant.api_key), (&None, &None));
         assert_eq!(c.limits.note_max_bytes, 5_242_880);
         assert_eq!(c.limits.blob_max_bytes, 209_715_200);
     }
@@ -477,6 +885,7 @@ note_max_bytes = 1000
             env("ZAM_WEB_REBUILD", "1"),
             env("ZAM_WEB_INDEX", "/x/index.html"),
             env("ZAM_VCRUNTIME_DLL", "C:/x/vcruntime140.dll"),
+            env("ZAM_VC_CRT_DIR", "C:/x/Microsoft.VC145.CRT"),
         ];
         assert_eq!(
             load(None, &env, &Default::default()).unwrap(),
@@ -554,6 +963,222 @@ note_max_bytes = 1000
         let c = load(None, &env, &Default::default()).unwrap();
         assert_eq!(c.log.format, LogFormat::Text);
         assert_eq!(c.qdrant.mode, QdrantMode::External);
+    }
+
+    #[test]
+    fn qdrant_section_layers_and_supervisor_config() {
+        use zam_index::supervisor::{SupervisorConfig, default_binary};
+        let f = write_in_target(
+            "qdrant.toml",
+            "[qdrant]\nhttp_port = 7333\nmax_search_threads = 4\nbinary = \"/opt/q/qdrant\"\n",
+        );
+        let e = vec![
+            env("ZAM_QDRANT__GRPC_PORT", "7334"),
+            env("ZAM_QDRANT__OPTIMIZER_CPU_BUDGET", "1"),
+        ];
+        let c = load(Some(&f), &e, &Default::default()).unwrap();
+        let exe = std::path::Path::new("inst");
+        let Some(SupervisorConfig::Managed(m)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался managed");
+        };
+        assert_eq!((m.http_port, m.grpc_port), (7333, 7334));
+        assert_eq!((m.max_search_threads, m.optimizer_cpu_budget), (4, 1));
+        assert_eq!(m.binary, std::path::PathBuf::from("/opt/q/qdrant"));
+
+        // По умолчанию — бинарник из комплекта.
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.qdrant.binary_path(exe), default_binary(exe));
+
+        // Ключ — только для external; там же обязателен url.
+        let e = vec![env("ZAM_QDRANT__API_KEY", "s3cret-key")];
+        let c = load(None, &e, &Default::default()).unwrap();
+        let err = c.qdrant.supervisor_config(exe).unwrap_err().to_string();
+        assert!(err.contains("qdrant.api_key"), "{err}");
+        assert!(!format!("{c:?}").contains("s3cret-key"), "ключ в Debug");
+        let mut e = vec![
+            env("ZAM_QDRANT__MODE", "external"),
+            env("ZAM_QDRANT__API_KEY", "s3cret-key"),
+        ];
+        let c = load(None, &e, &Default::default()).unwrap();
+        let err = c.qdrant.supervisor_config(exe).unwrap_err().to_string();
+        assert!(err.contains("qdrant.url"), "{err}");
+        e.push(env("ZAM_QDRANT__URL", "http://10.0.0.5:6334"));
+        let c = load(None, &e, &Default::default()).unwrap();
+        let Some(SupervisorConfig::External(x)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался external");
+        };
+        assert_eq!(x.grpc_url, "http://10.0.0.5:6334");
+        assert_eq!(x.api_key.as_deref(), Some("s3cret-key"));
+
+        let e = vec![env("ZAM_QDRANT__MODE", "edge")];
+        let c = load(None, &e, &Default::default()).unwrap();
+        assert!(c.qdrant.supervisor_config(exe).unwrap().is_none());
+    }
+
+    #[test]
+    fn ml_and_index_sections() {
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.ml.device, MlDevice::Auto);
+        assert_eq!((d.ml.index_threads, d.ml.query_threads), (0, 2));
+        assert_eq!((&d.ml.embed_model, &d.ml.ort_dylib), (&None, &None));
+        assert_eq!(d.ml.unload_after().unwrap(), None);
+        assert_eq!(
+            d.ml.models_dir(std::path::Path::new("dd")),
+            std::path::Path::new("dd").join("models")
+        );
+        assert_eq!(
+            (
+                d.index.batch_tokens,
+                d.index.yield_ms,
+                d.index.rollup_debounce_ms
+            ),
+            (8192, 5, 2000)
+        );
+        let f = write_in_target(
+            "ml.toml",
+            "[ml]
+device = \"cpu\"
+embed_model = \"minilm-l6-int8\"
+unload_after = \"30m\"
+[index]
+yield_ms = 1
+",
+        );
+        let e = vec![env("ZAM_ML__QUERY_THREADS", "4")];
+        let c = load(Some(&f), &e, &Default::default()).unwrap();
+        assert_eq!(c.ml.device, MlDevice::Cpu);
+        assert_eq!(c.ml.embed_model.as_deref(), Some("minilm-l6-int8"));
+        assert_eq!(c.ml.query_threads, 4);
+        assert_eq!(
+            c.ml.unload_after().unwrap(),
+            Some(std::time::Duration::from_secs(1800))
+        );
+        assert_eq!(c.index.yield_ms, 1);
+        for bad in ["10", "5x", "0s", "m", "5м", "м", "18446744073709551615h"] {
+            let e = vec![env("ZAM_ML__UNLOAD_AFTER", bad)];
+            let err = load(None, &e, &Default::default()).unwrap_err().to_string();
+            assert!(err.contains("ml.unload_after"), "{bad}: {err}");
+        }
+        let e = vec![env("ZAM_ML__DEVICE", "directml")];
+        assert!(load(None, &e, &Default::default()).is_err());
+        // пороги чанкинга: умолчания сервера и чанкера совпадают (одно значение, подобранное
+        // на eval, §18.2), переопределение и проверка согласованности
+        assert_eq!(d.index.chunk_params(), zam_markdown::ChunkParams::default());
+        let e = vec![
+            env("ZAM_INDEX__CHUNK_TARGET_MAX", "700"),
+            env("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "2"),
+        ];
+        let c = load(None, &e, &Default::default()).unwrap();
+        assert_eq!(
+            (
+                c.index.chunk_params().target_max,
+                c.index.chunk_params().overlap_sentences
+            ),
+            (700, 2)
+        );
+        for (k, v) in [
+            ("ZAM_INDEX__CHUNK_TARGET_MAX", "900"),
+            ("ZAM_INDEX__CHUNK_TARGET_MIN", "0"),
+            ("ZAM_INDEX__CHUNK_TARGET_MIN", "600"),
+            ("ZAM_INDEX__CHUNK_HARD_MAX", "8193"),
+            ("ZAM_INDEX__CHUNK_MERGE_BELOW", "501"),
+            ("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "6"),
+            ("ZAM_INDEX__BATCH_TOKENS", "0"),
+        ] {
+            let field = k.trim_start_matches("ZAM_INDEX__").to_ascii_lowercase();
+            let err = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("index.{field}")), "{k}={v}: {err}");
+        }
+        // предел листа — от окна модели (минус бюджет префикса), а не константа
+        let c = load(
+            None,
+            &[env("ZAM_INDEX__CHUNK_HARD_MAX", "2000")],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(c.index.chunk_params().hard_max, 2000);
+        assert_eq!(c.index.chunk_params_for(Some(4096)).0.hard_max, 2000);
+        let (p, clamped) = c.index.chunk_params_for(None);
+        assert!(clamped);
+        assert_eq!(p.hard_max, DEFAULT_PASSAGE_WINDOW - CHUNK_PREFIX_BUDGET);
+        let (p, clamped) = d.index.chunk_params_for(Some(1024));
+        assert!(!clamped, "умолчания укладываются в окно bge-m3");
+        assert_eq!(p, d.index.chunk_params());
+        // MiniLM (256): все пороги не больше 192, порядок порогов сохранён
+        let (p, clamped) = d.index.chunk_params_for(Some(256));
+        assert!(clamped);
+        assert_eq!(
+            (p.hard_max, p.target_max, p.target_min, p.merge_below),
+            (192, 192, 192, 100)
+        );
+        assert_eq!(d.index.chunk_params_for(Some(10)).0.hard_max, 1);
+        // реранкер
+        assert_eq!(
+            (
+                d.ml.rerank_model_cpu.as_str(),
+                d.ml.rerank_model_gpu.as_str()
+            ),
+            ("jina-reranker-v2", "bge-reranker-v2-m3")
+        );
+        assert_eq!((d.ml.rerank_top, d.ml.rerank_tokens), (20, 256));
+        let e = vec![
+            env("ZAM_ML__RERANK_TOP", "10"),
+            env("ZAM_ML__RERANK_MODEL_CPU", "bge-reranker-v2-m3"),
+        ];
+        let c = load(None, &e, &Default::default()).unwrap();
+        assert_eq!(
+            (c.ml.rerank_top, c.ml.rerank_model_cpu.as_str()),
+            (10, "bge-reranker-v2-m3")
+        );
+        for (k, v) in [
+            ("ZAM_ML__RERANK_TOP", "0"),
+            ("ZAM_ML__RERANK_TOP", "101"),
+            ("ZAM_ML__RERANK_TOKENS", "4"),
+            ("ZAM_ML__RERANK_MODEL_GPU", "../x"),
+            ("ZAM_ML__RERANK_MODEL_CPU", ""),
+        ] {
+            let err = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ml.rerank"), "{k}={v}: {err}");
+        }
+        let e = vec![env("ZAM_INDEX__BATCH_TOKENS", "0")];
+        assert!(load(None, &e, &Default::default()).is_err());
+    }
+
+    #[test]
+    fn search_section() {
+        let d = load(None, &[], &Default::default()).unwrap().search;
+        assert_eq!(
+            (d.rrf_k, d.w_vector, d.w_fts, d.w_trigram),
+            (60.0, 1.0, 1.0, 0.7)
+        );
+        assert_eq!((d.recency_half_life_days, d.max_per_node), (180.0, 3));
+        // ослабленный bm25 — вес по eval (§18.2)
+        assert_eq!(d.w_fts_relaxed, 0.25);
+        let e = vec![
+            env("ZAM_SEARCH__RRF_K", "30"),
+            env("ZAM_SEARCH__W_VECTOR", "1.5"),
+            env("ZAM_SEARCH__RECENCY_HALF_LIFE_DAYS", "0"),
+        ];
+        let c = load(None, &e, &Default::default()).unwrap().search;
+        assert_eq!(
+            (c.rrf_k, c.w_vector, c.recency_half_life_days),
+            (30.0, 1.5, 0.0)
+        );
+        for (k, v) in [
+            ("ZAM_SEARCH__RRF_K", "0"),
+            ("ZAM_SEARCH__W_FTS", "-1"),
+            ("ZAM_SEARCH__W_TRIGRAM", "nan"),
+            ("ZAM_SEARCH__MAX_PER_NODE", "0"),
+        ] {
+            let err = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("search."), "{k}={v}: {err}");
+        }
     }
 
     #[test]

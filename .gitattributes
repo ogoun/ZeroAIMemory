@@ -19,3 +19,4 @@
 *.xlsx binary
 # Golden-фикстуры Markdown хранятся побайтно: диапазоны зависят от CRLF и BOM
 crates/zam-markdown/tests/golden/*.md -text
+crates/zam-markdown/tests/golden_chunks/*.md -text

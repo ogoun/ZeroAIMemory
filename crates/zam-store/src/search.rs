@@ -9,6 +9,14 @@
 //!   запроса (токен ≥ 3 символов с `_ . / - :` или цифрами) через OR; если
 //!   идентификаторов нет — вся фраза, и только когда канал A ничего не нашёл.
 //! - Слияние weighted RRF (k = 60, веса 1.0 и 0.7), не больше 3 чанков на узел, top_k.
+//! - В FTS лежат листы (`chunk`) и L1 заметки (`note`, §8.2; L1 секций — только для
+//!   векторов). L1 заметки попадает в выдачу, только если ни один лист узла не найден:
+//!   он повторяет предложения листов, но находит заметку по словам из разных листов.
+//!
+//! Для гибридного поиска (M2) каналы отдаются раздельно — [`search_fts_channels`]: их
+//! сливает `zam-search` вместе с векторным каналом и весами из конфигурации; там же
+//! правило «сводка → лучший лист». [`live_chunks`] — метаданные и текст векторных хитов
+//! с проверкой по SQLite (живой узел, не исключён, в области).
 //!
 //! Выборка двухшаговая в одной читающей транзакции: каналы отбирают только
 //! `rowid` и узел (глобальный top с запасом из индекса FTS, затем фильтр области;
@@ -16,7 +24,7 @@
 //! и `snippet()` читаются лишь для итоговых top_k. Фильтр области (пространства,
 //! префикс пути, живые узлы) действует до отсечения top-N канала.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
 use rusqlite::{Connection, ToSql, params, params_from_iter};
@@ -71,7 +79,7 @@ pub struct FtsQuery {
     pub top_k: usize,
 }
 
-/// Найденный чанк.
+/// Найденный чанк (FTS или — через [`live_chunks`] — векторный хит).
 #[derive(Debug, Clone)]
 pub struct FtsHit {
     pub chunk_id: String,
@@ -79,15 +87,23 @@ pub struct FtsHit {
     pub space_id: Id,
     pub path: String,
     pub heading_path: String,
+    /// `chunk` / `section` / `note`.
+    pub level: String,
     /// Ревизия, по которой построен чанк.
     pub rev: i64,
-    /// Слитый RRF-балл (больше — лучше).
+    /// Токенов в тексте чанка (счётчик чанкера).
+    pub token_count: i64,
+    /// [`search_fts`] — слитый RRF-балл, [`search_fts_channels`] — `1/место` в канале,
+    /// [`live_chunks`] — 0. Больше — лучше.
     pub score: f64,
     pub updated_at: Timestamp,
     /// Фрагмент с совпадениями между [`MARK_START`] и [`MARK_END`].
     pub snippet: String,
     /// Полный текст чанка (обрезку под бюджет делает сервер).
     pub text: String,
+    /// `nodes.index_state` узла: `indexed` — его чанки есть в векторном индексе; `pending`,
+    /// `failed`, `excluded` — нет (гибрид не понижает такие хиты ослабленного bm25).
+    pub index_state: String,
 }
 
 /// Слова запроса: всё, что не буква и не цифра (Unicode), — разделитель.
@@ -97,6 +113,21 @@ fn terms(query: &str) -> Vec<&str> {
         .filter(|t| !t.is_empty())
         .take(MAX_TERMS)
         .collect()
+}
+
+/// Подстроки запроса для подсветки сниппета у хита без FTS-сниппета (векторный канал,
+/// замена сводки листом): идентификаторы, затем слова от 3 символов, без повторов.
+pub fn query_needles(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let words = terms(query)
+        .into_iter()
+        .filter(|t| t.chars().count() >= MIN_PREFIX_CHARS);
+    for t in identifiers(query).into_iter().chain(words) {
+        if !out.iter().any(|o| o == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 /// Строка в кавычках FTS5 (кавычки внутри удваиваются): операторы теряют смысл.
@@ -212,7 +243,10 @@ fn json_ids(ids: &[i64]) -> String {
     format!("[{}]", items.join(","))
 }
 
-/// Выполняет канал: `(seq, node_id)` по убыванию релевантности канала.
+/// Кандидат канала: `(seq, node_id, это L1 заметки)`.
+type Cand = (i64, Id, bool);
+
+/// Выполняет канал: кандидаты по убыванию релевантности канала.
 ///
 /// Ранжирование с соединением `chunks`/`nodes` для каждого совпадения дорого
 /// (на 30 тыс. чанков частое слово — ~30 мс), поэтому сначала берётся
@@ -226,7 +260,7 @@ fn run_channel(
     fts: &str,
     prefix: Option<&str>,
     spaces: &[Id],
-) -> Result<Vec<(i64, Id)>, StoreError> {
+) -> Result<Vec<Cand>, StoreError> {
     let (table, order, limit) = channel_spec(ch);
     let over = limit * OVERSAMPLE;
     let mut st = c.prepare_cached(&format!(
@@ -243,19 +277,21 @@ fn run_channel(
     let mut args: Vec<&dyn ToSql> = vec![&ids, &prefix];
     args.extend(spaces.iter().map(|s| s as &dyn ToSql));
     let mut st = c.prepare_cached(&format!(
-        "SELECT c.seq, c.node_id
+        "SELECT c.seq, c.node_id, c.level = 'note'
          FROM json_each(?1) j
          CROSS JOIN chunks c ON c.seq = j.value
          CROSS JOIN nodes n ON n.id = c.node_id
          WHERE {}",
         scope_sql(spaces.len())
     ))?;
-    let allowed: HashMap<i64, Id> = st
-        .query_map(params_from_iter(args), |r| Ok((r.get(0)?, r.get(1)?)))?
+    let allowed: HashMap<i64, (Id, bool)> = st
+        .query_map(params_from_iter(args), |r| {
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+        })?
         .collect::<Result<_, _>>()?;
-    let out: Vec<(i64, Id)> = top
+    let out: Vec<Cand> = top
         .iter()
-        .filter_map(|seq| allowed.get(seq).map(|node| (*seq, *node)))
+        .filter_map(|seq| allowed.get(seq).map(|(node, note)| (*seq, *node, *note)))
         .take(limit as usize)
         .collect();
     if out.len() as i64 == limit || (top.len() as i64) < over {
@@ -265,7 +301,7 @@ fn run_channel(
     let mut args: Vec<&dyn ToSql> = vec![&fts, &prefix];
     args.extend(spaces.iter().map(|s| s as &dyn ToSql));
     let mut st = c.prepare_cached(&format!(
-        "SELECT f.rowid, c.node_id
+        "SELECT f.rowid, c.node_id, c.level = 'note'
          FROM {table} f
          CROSS JOIN chunks c ON c.seq = f.rowid
          CROSS JOIN nodes n ON n.id = c.node_id
@@ -274,7 +310,9 @@ fn run_channel(
          LIMIT {limit}",
         scope_sql(spaces.len())
     ))?;
-    let rows = st.query_map(params_from_iter(args), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let rows = st.query_map(params_from_iter(args), |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -290,6 +328,139 @@ struct Ranked {
 /// Запрос без слов (и без фразы для trigram) — пустая выдача.
 /// `top_k` вне 1..=100, пустой `space_ids` или запрос длиннее 512 символов → `BadInput`.
 pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError> {
+    let (spaces, prefix) = check_query(&q)?;
+    db.read(move |c| {
+        // один снимок данных для обоих шагов; транзакция только читает и
+        // откатывается при выходе
+        let tx = c.unchecked_transaction()?;
+        let ch = run_channels(&tx, &q.text, prefix.as_deref(), &spaces)?;
+        let ranked = merge(ch.a, ch.b, q.top_k);
+        fetch_hits(&tx, &ranked, ch.a_fts.as_deref(), &ch.needles)
+    })
+    .await
+}
+
+/// Каналы FTS по отдельности: кандидаты в порядке канала (лучший первый).
+#[derive(Debug, Clone, Default)]
+pub struct FtsChannels {
+    /// `bm25` (unicode61), до 50.
+    pub bm25: Vec<FtsHit>,
+    /// `trigram`, до 20: только если в запросе есть идентификаторы (или bm25 пуст).
+    pub trigram: Vec<FtsHit>,
+    /// `bm25` получен ослабленным запросом (любое слово): строгий (все слова) ничего не
+    /// нашёл. Такие хиты слабее — гибрид даёт им отдельный вес (`search.w_fts_relaxed`).
+    pub relaxed: bool,
+}
+
+/// Кандидаты каналов `bm25` и `trigram` без слияния (гибридный поиск): та же область и
+/// те же правила запроса, что у [`search_fts`], но без лимита на узел, без `top_k` и без
+/// правила для L1 заметки — их применяет `zam-search`. Чанк, найденный обоими каналами,
+/// есть в обоих списках. `top_k` запроса не используется, но проверяется, как и
+/// остальные поля.
+pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, StoreError> {
+    let (spaces, prefix) = check_query(&q)?;
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let ch = run_channels(&tx, &q.text, prefix.as_deref(), &spaces)?;
+        let in_a: HashSet<i64> = ch.a.iter().map(|c| c.0).collect();
+        // текст и сниппеты — одним шагом для объединения каналов; сниппет чанка,
+        // найденного bm25, — из FTS5 `snippet()`
+        let mut all: Vec<Ranked> = Vec::with_capacity(ch.a.len() + ch.b.len());
+        for (seq, _, _) in ch.a.iter().chain(&ch.b) {
+            if !all.iter().any(|r| r.seq == *seq) {
+                all.push(Ranked {
+                    seq: *seq,
+                    score: 0.0,
+                    in_bm25: in_a.contains(seq),
+                });
+            }
+        }
+        let hits: HashMap<String, FtsHit> =
+            fetch_hits(&tx, &all, ch.a_fts.as_deref(), &ch.needles)?
+                .into_iter()
+                .map(|h| (h.chunk_id.clone(), h))
+                .collect();
+        let seq_ids: HashMap<i64, String> = chunk_ids_of(&tx, &all)?;
+        let take = |l: &[Cand]| -> Vec<FtsHit> {
+            l.iter()
+                .enumerate()
+                .filter_map(|(i, (seq, _, _))| {
+                    let mut h = hits.get(seq_ids.get(seq)?)?.clone();
+                    h.score = 1.0 / (i + 1) as f64;
+                    Some(h)
+                })
+                .collect()
+        };
+        Ok(FtsChannels {
+            bm25: take(&ch.a),
+            trigram: take(&ch.b),
+            relaxed: ch.relaxed && !ch.a.is_empty(),
+        })
+    })
+    .await
+}
+
+/// `seq → chunks.id` для кандидатов.
+fn chunk_ids_of(c: &Connection, ranked: &[Ranked]) -> Result<HashMap<i64, String>, StoreError> {
+    if ranked.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let seqs: Vec<i64> = ranked.iter().map(|r| r.seq).collect();
+    let mut st = c.prepare_cached(
+        "SELECT c.seq, c.id FROM json_each(?1) j CROSS JOIN chunks c ON c.seq = j.value",
+    )?;
+    let rows = st.query_map([json_ids(&seqs)], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Кандидаты каналов, запрос bm25 (для `snippet()`) и подстроки trigram.
+struct Channels<'q> {
+    a: Vec<Cand>,
+    b: Vec<Cand>,
+    a_fts: Option<String>,
+    /// `a` — по ослабленному запросу.
+    relaxed: bool,
+    needles: Vec<&'q str>,
+}
+
+/// Канал A (строгий запрос, при пустой выдаче — ослабленный) и канал B.
+fn run_channels<'q>(
+    tx: &Connection,
+    text: &'q str,
+    prefix: Option<&str>,
+    spaces: &[Id],
+) -> Result<Channels<'q>, StoreError> {
+    let mut a_fts = sanitize_fts(text);
+    let mut relaxed = false;
+    let mut a = match &a_fts {
+        Some(fts) => run_channel(tx, Channel::Bm25, fts, prefix, spaces)?,
+        None => Vec::new(),
+    };
+    if a.is_empty() && terms(text).len() > 1 {
+        a_fts = sanitize_fts_any(text);
+        relaxed = true;
+        if let Some(fts) = &a_fts {
+            a = run_channel(tx, Channel::Bm25, fts, prefix, spaces)?;
+        }
+    }
+    let (b, needles) = match trigram_query(text, a.is_empty()) {
+        Some((fts, needles)) => (
+            run_channel(tx, Channel::Trigram, &fts, prefix, spaces)?,
+            needles,
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    Ok(Channels {
+        a,
+        b,
+        a_fts,
+        relaxed,
+        needles,
+    })
+}
+
+/// Проверка запроса: `(пространства без повторов, нормализованный префикс)`.
+fn check_query(q: &FtsQuery) -> Result<(Vec<Id>, Option<String>), StoreError> {
     if !(1..=TOP_K_MAX).contains(&q.top_k) {
         return Err(StoreError::BadInput(format!(
             "top_k должен быть в 1..={TOP_K_MAX}, получено {}",
@@ -309,46 +480,270 @@ pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError>
     let mut spaces = q.space_ids.clone();
     spaces.sort();
     spaces.dedup();
-    let prefix = q
-        .path_prefix
-        .as_deref()
-        .map(|p| p.trim_end_matches('/'))
-        .filter(|p| !p.is_empty())
-        .map(str::to_string);
+    Ok((spaces, norm_prefix(q.path_prefix.as_deref())))
+}
 
+/// Префикс пути без завершающих `/`; пустой — `None`.
+fn norm_prefix(p: Option<&str>) -> Option<String> {
+    p.map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
+/// Область для [`live_chunks`].
+#[derive(Debug, Clone)]
+pub struct ChunkScope {
+    /// Разрешённые пространства; пусто — пустая выдача.
+    pub space_ids: Vec<Id>,
+    /// Префикс пути (как в [`FtsQuery`]).
+    pub path_prefix: Option<String>,
+    /// Только узлы, которые векторизуются (`index_state <> 'excluded'`): для векторных
+    /// хитов — точка исключённого узла могла остаться в Qdrant.
+    pub indexable_only: bool,
+}
+
+/// Чанки `ids` живых узлов области (с текстом, без сниппета, `score = 0`) в порядке
+/// `ids`; отсутствующие (старая ревизия, узел удалён или в корзине, вне области,
+/// исключён при `indexable_only`) пропускаются. Источник истины для векторных хитов:
+/// точки в Qdrant могут пережить неудачное задание `delete`.
+pub async fn live_chunks(
+    db: &Db,
+    ids: Vec<String>,
+    scope: ChunkScope,
+) -> Result<Vec<FtsHit>, StoreError> {
+    if ids.is_empty() || scope.space_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prefix = norm_prefix(scope.path_prefix.as_deref());
+    let list = serde_json::Value::from(ids.clone()).to_string();
     db.read(move |c| {
-        // один снимок данных для обоих шагов; транзакция только читает и
-        // откатывается при выходе
-        let tx = c.unchecked_transaction()?;
-        let prefix = prefix.as_deref();
-        // канал A: строгий запрос, при пустой выдаче — ослабленный
-        let mut a_fts = sanitize_fts(&q.text);
-        let mut a = match &a_fts {
-            Some(fts) => run_channel(&tx, Channel::Bm25, fts, prefix, &spaces)?,
-            None => Vec::new(),
-        };
-        if a.is_empty() && terms(&q.text).len() > 1 {
-            a_fts = sanitize_fts_any(&q.text);
-            if let Some(fts) = &a_fts {
-                a = run_channel(&tx, Channel::Bm25, fts, prefix, &spaces)?;
+        let mut args: Vec<&dyn ToSql> = vec![&list, &prefix];
+        args.extend(scope.space_ids.iter().map(|s| s as &dyn ToSql));
+        let mut st = c.prepare_cached(&format!(
+            "SELECT c.id, c.node_id, n.space_id, n.path, c.heading_path, c.rev, n.updated_at,
+                    c.text, c.level, c.token_count, n.index_state
+             FROM json_each(?1) j
+             CROSS JOIN chunks c ON c.id = j.value
+             CROSS JOIN nodes n ON n.id = c.node_id
+             WHERE {} {}",
+            scope_sql(scope.space_ids.len()),
+            if scope.indexable_only {
+                "AND n.index_state <> 'excluded'"
+            } else {
+                ""
             }
-        }
-        // канал B
-        let (b, needles) = match trigram_query(&q.text, a.is_empty()) {
-            Some((fts, needles)) => (
-                run_channel(&tx, Channel::Trigram, &fts, prefix, &spaces)?,
-                needles,
-            ),
-            None => (Vec::new(), Vec::new()),
-        };
-        let ranked = merge(a, b, q.top_k);
-        fetch_hits(&tx, &ranked, a_fts.as_deref(), &needles)
+        ))?;
+        let rows = st.query_map(params_from_iter(args), |r| {
+            Ok(FtsHit {
+                chunk_id: r.get(0)?,
+                node_id: r.get(1)?,
+                space_id: r.get(2)?,
+                path: r.get(3)?,
+                heading_path: r.get(4)?,
+                level: r.get(8)?,
+                rev: r.get(5)?,
+                token_count: r.get(9)?,
+                score: 0.0,
+                updated_at: ts_at(r, 6)?,
+                snippet: String::new(),
+                text: r.get(7)?,
+                index_state: r.get(10)?,
+            })
+        })?;
+        let mut by_id: HashMap<String, FtsHit> = rows
+            .map(|h| h.map(|h| (h.chunk_id.clone(), h)))
+            .collect::<Result<_, _>>()?;
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
     })
     .await
 }
 
+/// Лист заметки для замены сводки (§9.2 п. 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafChunk {
+    pub chunk_id: String,
+    pub heading_path: String,
+    pub ordinal: i64,
+    pub text: String,
+    pub context_prefix: String,
+    /// Ключ кэша `embeddings` (`chunks.embed_key`): эмбеддинг листа без чтения текста.
+    pub embed_key: String,
+}
+
+/// Листы (`level = 'chunk'`) узла по порядку.
+pub async fn node_leaves(db: &Db, node: Id) -> Result<Vec<LeafChunk>, StoreError> {
+    Ok(leaves_of_nodes(db, vec![node], true)
+        .await?
+        .remove(&node)
+        .unwrap_or_default())
+}
+
+/// Листы нескольких узлов одним запросом: `узел → листы по порядку`; узла без листов
+/// в ответе нет (замена сводок листами в поиске — без запроса на каждую сводку).
+/// `with_text = false` — без `text` и `context_prefix` (пустые строки): тексты сотен
+/// листов не читаются, если нужны только пути, порядок и ключи кэша эмбеддингов.
+pub async fn leaves_of_nodes(
+    db: &Db,
+    nodes: Vec<Id>,
+    with_text: bool,
+) -> Result<HashMap<Id, Vec<LeafChunk>>, StoreError> {
+    if nodes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    db.read(move |c| {
+        // один снимок и один подготовленный запрос по индексу `chunks_node` на узел:
+        // соединение с json_each здесь медленнее (сортировка всех листов)
+        let tx = c.unchecked_transaction()?;
+        let mut st = tx.prepare_cached(
+            "SELECT id, heading_path, ordinal,
+                    CASE WHEN ?2 THEN text ELSE '' END,
+                    CASE WHEN ?2 THEN context_prefix ELSE '' END,
+                    embed_key
+             FROM chunks WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
+        )?;
+        let mut out: HashMap<Id, Vec<LeafChunk>> = HashMap::new();
+        for node in nodes {
+            let rows = st.query_map(params![node, with_text], |r| {
+                Ok(LeafChunk {
+                    chunk_id: r.get(0)?,
+                    heading_path: r.get(1)?,
+                    ordinal: r.get(2)?,
+                    text: r.get(3)?,
+                    context_prefix: r.get(4)?,
+                    // NULL только у строк в обход записи чанков (база дозаполняется при открытии)
+                    embed_key: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                })
+            })?;
+            let leaves: Vec<LeafChunk> = rows.collect::<Result<_, _>>()?;
+            if !leaves.is_empty() {
+                out.insert(node, leaves);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Лист узла с числом найденных в нём слов запроса ([`leaf_term_hits`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafHit {
+    pub node_id: Id,
+    pub chunk_id: String,
+    pub heading_path: String,
+    pub ordinal: i64,
+    /// Сколько слов запроса найдено в листе (≥ 1).
+    pub hits: usize,
+}
+
+/// Листы узлов `nodes`, в которых FTS5 находит слова запроса (`needles`, каждое — как
+/// запрос [`sanitize_fts`]), с числом найденных слов; по узлу и `ordinal`. Листы без
+/// совпадений в ответ не входят. Тексты не читаются; в одной читающей транзакции: листы
+/// узлов (по индексу `chunks_node`) и по одному проходу индекса FTS на слово — только
+/// `rowid` совпадений, пересечение с листами — в памяти.
+///
+/// Соединение совпадений с `chunks` и фильтр по узлам в SQL (как было) читали строку
+/// `chunks` на каждое совпадение: на 10 тыс. заметок частое слово («и», «the») — 16 тыс.
+/// строк и 25 мс; проверка `MATCH … AND rowid = c.seq` по каждому листу — 0,05–0,1 мс на
+/// лист и слово, сотни листов у окна сводок. Проход одних `rowid` — 2–5 мс на самое
+/// частое слово (замеры `cargo xtask bench`, задача 15 M2).
+pub async fn leaf_term_hits(
+    db: &Db,
+    nodes: Vec<Id>,
+    needles: Vec<String>,
+) -> Result<Vec<LeafHit>, StoreError> {
+    if nodes.is_empty() || needles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list =
+        serde_json::Value::from(nodes.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let mut st = tx.prepare_cached(
+            "SELECT c.seq, c.id, c.node_id, c.heading_path, c.ordinal FROM chunks c
+             WHERE c.level = 'chunk' AND c.node_id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let mut leaves: HashMap<i64, LeafHit> = st
+            .query_map([&list], |r| {
+                Ok((
+                    r.get(0)?,
+                    LeafHit {
+                        chunk_id: r.get(1)?,
+                        node_id: r.get(2)?,
+                        heading_path: r.get(3)?,
+                        ordinal: r.get(4)?,
+                        hits: 0,
+                    },
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        if leaves.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut st = tx.prepare_cached("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1")?;
+        for n in needles.iter().take(MAX_TERMS) {
+            let Some(fts) = sanitize_fts(n) else {
+                continue;
+            };
+            for seq in st.query_map([fts], |r| r.get::<_, i64>(0))? {
+                if let Some(l) = leaves.get_mut(&seq?) {
+                    l.hits += 1;
+                }
+            }
+        }
+        let mut v: Vec<LeafHit> = leaves.into_values().filter(|l| l.hits > 0).collect();
+        v.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(a.ordinal.cmp(&b.ordinal)));
+        Ok(v)
+    })
+    .await
+}
+
+/// Тексты соседних листов того же узла: `(предыдущий, следующий)` по `ordinal`
+/// (`expand=neighbors`). Нет чанка или он не лист — `(None, None)`.
+pub async fn neighbor_leaves(
+    db: &Db,
+    chunk_id: String,
+) -> Result<(Option<String>, Option<String>), StoreError> {
+    db.read(move |c| {
+        let one = |sql: &str| -> Result<Option<String>, StoreError> {
+            let mut st = c.prepare_cached(sql)?;
+            let mut rows = st.query([&chunk_id])?;
+            Ok(match rows.next()? {
+                Some(r) => Some(r.get(0)?),
+                None => None,
+            })
+        };
+        let prev = one("SELECT n.text FROM chunks c JOIN chunks n
+               ON n.node_id = c.node_id AND n.level = 'chunk' AND n.ordinal < c.ordinal
+             WHERE c.id = ?1 AND c.level = 'chunk' ORDER BY n.ordinal DESC LIMIT 1")?;
+        let next = one("SELECT n.text FROM chunks c JOIN chunks n
+               ON n.node_id = c.node_id AND n.level = 'chunk' AND n.ordinal > c.ordinal
+             WHERE c.id = ?1 AND c.level = 'chunk' ORDER BY n.ordinal LIMIT 1")?;
+        Ok((prev, next))
+    })
+    .await
+}
+
+/// Weighted RRF по чанкам, L1 заметки — только у узлов без найденных листов,
+/// лимит на узел, top_k.
+fn merge(a: Vec<Cand>, b: Vec<Cand>, top_k: usize) -> Vec<Ranked> {
+    let with_leaf: HashSet<Id> = a
+        .iter()
+        .chain(&b)
+        .filter(|(_, _, note)| !note)
+        .map(|(_, node, _)| *node)
+        .collect();
+    let keep = |c: &Cand| !c.2 || !with_leaf.contains(&c.1);
+    let strip = |l: Vec<Cand>| -> Vec<(i64, Id)> {
+        l.into_iter()
+            .filter(keep)
+            .map(|(seq, node, _)| (seq, node))
+            .collect()
+    };
+    rrf(strip(a), strip(b), top_k)
+}
+
 /// Weighted RRF по чанкам, лимит на узел, top_k.
-fn merge(a: Vec<(i64, Id)>, b: Vec<(i64, Id)>, top_k: usize) -> Vec<Ranked> {
+fn rrf(a: Vec<(i64, Id)>, b: Vec<(i64, Id)>, top_k: usize) -> Vec<Ranked> {
     let mut by_seq: HashMap<i64, (Id, f64, bool)> = HashMap::new();
     for (w, list, is_a) in [(W_BM25, a, true), (W_TRIGRAM, b, false)] {
         for (i, (seq, node)) in list.into_iter().enumerate() {
@@ -391,7 +786,7 @@ fn fetch_hits(
     let seqs: Vec<i64> = ranked.iter().map(|r| r.seq).collect();
     let mut st = c.prepare_cached(
         "SELECT c.seq, c.id, c.node_id, n.space_id, n.path, c.heading_path, c.rev,
-                n.updated_at, c.text
+                n.updated_at, c.text, c.level, c.token_count, n.index_state
          FROM json_each(?1) j
          CROSS JOIN chunks c ON c.seq = j.value
          CROSS JOIN nodes n ON n.id = c.node_id",
@@ -405,11 +800,14 @@ fn fetch_hits(
                 space_id: r.get(3)?,
                 path: r.get(4)?,
                 heading_path: r.get(5)?,
+                level: r.get(9)?,
                 rev: r.get(6)?,
+                token_count: r.get(10)?,
                 score: 0.0,
                 updated_at: ts_at(r, 7)?,
                 snippet: String::new(),
                 text: r.get(8)?,
+                index_state: r.get(11)?,
             },
         ))
     })?;
@@ -449,24 +847,30 @@ fn fetch_hits(
         .collect())
 }
 
-/// Первое вхождение `pat` в `chars` без учёта регистра: индекс символа.
-fn find_ci(chars: &[char], pat: &str) -> Option<usize> {
-    let pat: Vec<char> = pat.chars().collect();
-    if pat.is_empty() || pat.len() > chars.len() {
+/// Символ в нижнем регистре (первый символ `to_lowercase`): индексы символов сохраняются.
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Первое вхождение `pat` в `folded` (текст после [`fold`]) без учёта регистра: индекс
+/// символа. Текст сворачивается один раз на все подстроки, а не на каждое сравнение.
+fn find_ci(folded: &[char], pat: &str) -> Option<usize> {
+    let pat: Vec<char> = pat.chars().map(fold).collect();
+    if pat.is_empty() || pat.len() > folded.len() {
         return None;
     }
-    let same = |x: char, y: char| x == y || x.to_lowercase().eq(y.to_lowercase());
-    (0..=chars.len() - pat.len()).find(|&i| pat.iter().zip(&chars[i..]).all(|(&p, &t)| same(p, t)))
+    folded.windows(pat.len()).position(|w| w == pat.as_slice())
 }
 
 /// Сниппет из текста: до [`SNIPPET_CHARS`] символов вокруг первого вхождения
 /// первой найденной из `needles` подстроки без учёта регистра, вхождение — между
 /// маркерами. Ничего не нашлось — начало текста. Режется только по границам символов.
-fn text_snippet(text: &str, needles: &[&str]) -> String {
+pub fn text_snippet(text: &str, needles: &[&str]) -> String {
     let chars: Vec<char> = text.chars().collect();
+    let folded: Vec<char> = chars.iter().copied().map(fold).collect();
     let (start, len) = needles
         .iter()
-        .find_map(|n| find_ci(&chars, n).map(|i| (i, n.chars().count())))
+        .find_map(|n| find_ci(&folded, n).map(|i| (i, n.chars().count())))
         .unwrap_or((0, 0));
     let budget = SNIPPET_CHARS.saturating_sub(len);
     let mut from = start.saturating_sub(budget / 2);
@@ -491,6 +895,13 @@ fn text_snippet(text: &str, needles: &[&str]) -> String {
     s
 }
 
+/// Запрос [`pending_count`]: условия совпадают с частичным индексом `nodes_pending`
+/// (миграция 0006), поэтому считаются только заметки в очереди.
+const PENDING_COUNT_SQL: &str = "SELECT count(*) FROM nodes n
+     WHERE n.kind = 'note' AND n.index_state = 'pending' AND n.deleted_at IS NULL
+       AND n.space_id IN (SELECT value FROM json_each(?1))
+       AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')";
+
 /// Сколько живых заметок в `space_ids` (и под `path_prefix`, если задан) ждут
 /// векторной индексации (`index_state = 'pending'`) — `pending_count` выдачи поиска.
 /// Заметки с `index: false` (`excluded`) не считаются.
@@ -509,22 +920,32 @@ pub async fn pending_count(
         .map(|p| p.trim_end_matches('/'))
         .filter(|p| !p.is_empty())
         .map(str::to_string);
-    db.read(move |c| {
-        Ok(c.query_row(
-            "SELECT count(*) FROM nodes n
-             WHERE n.kind = 'note' AND n.index_state = 'pending' AND n.deleted_at IS NULL
-               AND n.space_id IN (SELECT value FROM json_each(?1))
-               AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
-            params![ids, prefix],
-            |r| r.get(0),
-        )?)
-    })
-    .await
+    db.read(move |c| Ok(c.query_row(PENDING_COUNT_SQL, params![ids, prefix], |r| r.get(0))?))
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pending_count` идёт по частичному индексу `nodes_pending`, а не обходом узлов области.
+    #[test]
+    fn pending_count_uses_partial_index() {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        let mut st = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {PENDING_COUNT_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = st
+            .query_map(params!["[\"x\"]", "a"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("; ");
+        assert!(plan.contains("nodes_pending"), "{plan}");
+    }
 
     #[test]
     fn identifier_detection() {

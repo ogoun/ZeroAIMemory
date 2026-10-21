@@ -1,0 +1,25 @@
+# ONNX Runtime с CUDA EP (сборка gpu_cuda13: CUDA 13.0+, cuDNN 9.x) для GPU-комплекта.
+# Библиотеки NVIDIA сюда не входят: их ставит `zam-server cuda fetch` по deploy/cuda.toml
+# или архив zam-cuda-<ver>-<os>-x64. sha256 — поле digest ассетов релиза в GitHub API.
+# Пути extract включают корневой каталог архива; tensorrt-провайдер и .pdb не берём.
+name = "onnxruntime-gpu"
+version = "1.31.0"
+
+[platform.windows-x64]
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-gpu_cuda13-1.31.0.zip"
+sha256 = "d332ccf84acb769a11364cddd4e8d2992a168d16be472d5ba70b279b644552f5"
+extract = [
+    "onnxruntime-win-x64-gpu_cuda13-1.31.0/lib/onnxruntime.dll",
+    "onnxruntime-win-x64-gpu_cuda13-1.31.0/lib/onnxruntime_providers_cuda.dll",
+    "onnxruntime-win-x64-gpu_cuda13-1.31.0/lib/onnxruntime_providers_shared.dll",
+]
+
+[platform.linux-x64]
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-gpu_cuda13-1.31.0.tgz"
+sha256 = "2867dec99c6a4926e8142361b9d4d1518c16c85b854b4d41d28d65d3b2c81135"
+extract = [
+    "onnxruntime-linux-x64-gpu_cuda13-1.31.0/lib/libonnxruntime.so.1.31.0",
+    "onnxruntime-linux-x64-gpu_cuda13-1.31.0/lib/libonnxruntime_providers_cuda.so",
+    "onnxruntime-linux-x64-gpu_cuda13-1.31.0/lib/libonnxruntime_providers_shared.so",
+]
+rename = { "onnxruntime-linux-x64-gpu_cuda13-1.31.0/lib/libonnxruntime.so.1.31.0" = "libonnxruntime.so" }

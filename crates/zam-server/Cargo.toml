@@ -22,6 +22,11 @@ ipnet.workspace = true
 thiserror.workspace = true
 argon2.workspace = true
 zam-store = { path = "../zam-store" }
+zam-index = { path = "../zam-index" }
+zam-ml = { path = "../zam-ml" }
+zam-fetch = { path = "../zam-fetch" }
+zam-search = { path = "../zam-search" }
+jiff.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
@@ -48,7 +53,8 @@ tower = { workspace = true, features = ["util"] }
 memory-serve.workspace = true
 
 [dev-dependencies]
+# точка остановки воркера перед записью пачки (tests/qdrant_lifecycle.rs)
+zam-index = { path = "../zam-index", features = ["test-hooks"] }
+zip.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
-
-jiff.workspace = true

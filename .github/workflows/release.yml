@@ -1,10 +1,22 @@
-# Релиз по тегу v*: web -> комплекты обеих платформ (сборка, упаковка, smoke) -> черновик GitHub Release.
-# Если упала любая платформа или любой smoke-тест, publish не запускается и релиз не создаётся.
+# Релиз по тегу v*: web -> комплекты (платформа × cpu|gpu: сборка, упаковка, smoke), архивы
+# zam-cuda обеих платформ и zam-models -> проверка состава и размеров -> черновик GitHub Release.
+# Если упала любая задача или любой smoke-тест, publish не запускается и релиз не создаётся.
+#
+# Пробный прогон без публикации — push в ветку release-dry-run или ручной запуск
+# (workflow_dispatch): всё то же с версией 0.0.0-dry, включая extras (zam-cuda, zam-models),
+# smoke и проверку состава и предела 2 ГиБ; задача publish пропускается.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+    branches: [release-dry-run]
+  workflow_dispatch:
+
+# Два прогона одного ref не идут параллельно (тяжёлые загрузки и одни артефакты).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -39,19 +51,32 @@ jobs:
           path: web/dist
           if-no-files-found: error
 
+  # Версия комплектов: на теге — тег (без v, проверяется против версии workspace), в
+  # пробном прогоне — 0.0.0-dry.
   verify-version:
     name: verify-version
     runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: тег без v == версия workspace
+      - name: версия
+        id: v
+        env:
+          IS_TAG: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           set -euo pipefail
+          if [ "${IS_TAG}" != "true" ]; then
+            echo "пробный прогон (${GITHUB_REF}): версия 0.0.0-dry, публикации не будет"
+            echo "version=0.0.0-dry" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           ws=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"$/\1/')
           tag="${GITHUB_REF_NAME#v}"
           echo "тег: ${tag}, workspace: ${ws}"
           test -n "${ws}"
           test "${tag}" = "${ws}"
+          echo "version=${tag}" >> "$GITHUB_OUTPUT"
 
   test:
     name: test (${{ matrix.os }})
@@ -60,7 +85,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04]
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-22.04
+            platform: linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -71,20 +100,93 @@ jobs:
         with:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@v2
+      # Тот же кэш, что в ci.yml (ключ — хэш deploy/*.toml): тег видит кэш ветки по умолчанию.
+      # Шаг идёт после rust-cache: его post-шаг сохраняет кэш раньше, чем rust-cache чистит target/.
+      - name: кэш зависимостей и моделей
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/deps
+            target/models
+          key: deps-models-v2-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
+      # тесты zam-index запускают настоящий Qdrant из target/deps и без него падают
+      - name: fetch-deps
+        run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
+      - name: fetch-models
+        run: cargo xtask fetch-models --test
       - name: test
-        run: cargo test --workspace
+        # тесты zam-ml без ORT или MiniLM падают, а не пропускаются
+        env:
+          ZAM_REQUIRE_ML: "1"
+        run: cargo test --workspace --no-fail-fast
 
   package:
     name: package
     needs: [web, verify-version]
     uses: ./.github/workflows/package.yml
     with:
-      version: ${{ github.ref_name }}
+      version: ${{ needs.verify-version.outputs.version }}
       upload: true
+      extras: true
 
+  # Проверка состава и размеров — и на теге, и в пробном прогоне (без публикации).
+  dist:
+    name: dist (состав, < 2 ГиБ, SHA256SUMS)
+    needs: [package, test]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      # Состав: zam-server (2 платформы × cpu|gpu), zam (2), zam-cuda (2) и zam-models (по
+      # архиву на модель с bundle = true в deploy/models.toml).
+      - name: состав архивов
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          models=$(grep -c '^bundle = true' ../deploy/models.toml)
+          check() { n=$(ls $1 2>/dev/null | wc -l); echo "$1: $n (ожидается $2)"; test "$n" -eq "$2"; }
+          check 'zam-server-*' 4
+          check 'zam-[0-9]*' 2
+          check 'zam-cuda-*' 2
+          check 'zam-models-*' "${models}"
+          test "$(ls | wc -l)" -eq $((8 + models))
+      # GitHub не принимает файл релиза от 2 ГиБ: проверка до загрузки, с понятным текстом.
+      - name: каждый файл меньше 2 ГиБ
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          limit=$((2 * 1024 * 1024 * 1024))
+          bad=0
+          for f in *; do
+            s=$(stat -c %s "$f")
+            echo "$f: $((s / 1000000)) МБ"
+            if [ "$s" -ge "$limit" ]; then
+              echo "::error title=файл релиза больше 2 ГиБ::$f — $s байт; разбейте архив (xtask package)"
+              bad=1
+            fi
+          done
+          test "$bad" -eq 0
+      - name: SHA256SUMS по всем архивам
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum zam-*.zip zam-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  # Только тег v*: пробный прогон (ветка release-dry-run, ручной запуск, даже с тега) здесь заканчивается.
   publish:
     name: publish (draft)
-    needs: [package, test]
+    needs: [dist]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -95,13 +197,13 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      - name: SHA256SUMS по всем архивам
+      - uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+          path: dist
+      - name: SHA256SUMS совпадает с архивами
         working-directory: dist
-        run: |
-          set -euo pipefail
-          test "$(ls zam-*.zip zam-*.tar.gz | wc -l)" -eq 4
-          sha256sum zam-*.zip zam-*.tar.gz > SHA256SUMS
-          cat SHA256SUMS
+        run: sha256sum -c SHA256SUMS
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1

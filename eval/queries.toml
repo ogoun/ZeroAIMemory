@@ -1,0 +1,1457 @@
+# Запросы eval (ТЗ §18.2). Формат и правила — eval/README.md.
+# Группы: a — Windows, b — git, c — Linux и Docker, d — Rust, e — документы проекта,
+# f — исследования поиска и ML, g — инструменты разработки, h — эксплуатация и БД.
+
+# ---- группа a ----
+# Группа A — Windows
+
+[[query]]
+id = "a-01"
+text = "пауэршелл блокирует старт моего кода, как побороть"
+lang = "ru"
+expect = ["ru/windows/execution-policy"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "a-02"
+text = "сценарий оболочки, созданный в виндовс, не исполняется в линуксе из-за возврата каретки"
+lang = "ru"
+expect = ["ru/windows/crlf-bash-scripts"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "a-03"
+text = "буквы родного языка отображаются иероглифами в батнике"
+lang = "ru"
+expect = ["ru/windows/cmd-chcp-65001"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "a-04"
+text = "встроенный антивирус сильно замедляет билд, как ускорить"
+lang = "ru"
+expect = ["ru/windows/defender-exclusions-build"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "a-05"
+text = "automate software provisioning on a new laptop"
+lang = "en"
+expect = ["en/windows/winget-package-setup"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "a-06"
+text = "как узнать, какая программа слушает порт 8080"
+lang = "ru"
+expect = ["ru/windows/busy-port-netstat"]
+kind = "paraphrase"
+
+[[query]]
+id = "a-07"
+text = "коды выхода robocopy меньше 8 — успех, обёртка для планировщика"
+lang = "ru"
+expect = ["ru/windows/services-schtasks-robocopy"]
+kind = "exact"
+
+[[query]]
+id = "a-08"
+text = "доступ к дискам Windows идёт по сети через протокол 9P"
+lang = "ru"
+expect = ["ru/windows/wsl-mnt-c-performance"]
+kind = "exact"
+
+[[query]]
+id = "a-09"
+text = "Format-* only at the very end of an interactive pipeline"
+lang = "en"
+expect = ["en/windows/powershell-pipeline-objects"]
+kind = "exact"
+
+[[query]]
+id = "a-10"
+text = "bash пишет command not found из-за CRLF"
+lang = "ru"
+expect = ["ru/windows/crlf-bash-scripts", "ru/windows/git-autocrlf-gitattributes"]
+kind = "identifier"
+
+[[query]]
+id = "a-11"
+text = "ERROR_SHARING_VIOLATION при копировании бинарника"
+lang = "ru"
+expect = ["ru/windows/file-locked-running-exe"]
+kind = "identifier"
+
+[[query]]
+id = "a-12"
+text = "MSYS_NO_PATHCONV"
+lang = "ru"
+expect = ["ru/windows/git-bash-paths-cygpath"]
+kind = "identifier"
+
+[[query]]
+id = "a-13"
+text = "NativeCommandError when redirecting 2>&1"
+lang = "en"
+expect = ["en/windows/powershell-native-stderr"]
+kind = "identifier"
+
+[[query]]
+id = "a-14"
+text = "LongPathsEnabled Filename too long"
+lang = "ru"
+expect = ["ru/windows/long-paths-max-path"]
+kind = "identifier"
+
+[[query]]
+id = "a-15"
+text = "служба не стартует с ошибкой 1053, нужна обёртка WinSW"
+lang = "ru"
+expect = ["ru/windows/services-schtasks-robocopy"]
+kind = "identifier"
+
+[[query]]
+id = "a-16"
+text = "setx truncates PATH to 1024 characters"
+lang = "en"
+expect = ["ru/windows/path-setx-truncation"]
+kind = "cross-lang"
+
+[[query]]
+id = "a-17"
+text = "find which process is holding a port on Windows"
+lang = "en"
+expect = ["ru/windows/busy-port-netstat"]
+kind = "cross-lang"
+
+[[query]]
+id = "a-18"
+text = "cannot overwrite exe while it is running, LNK1104"
+lang = "en"
+expect = ["ru/windows/file-locked-running-exe"]
+kind = "cross-lang"
+
+[[query]]
+id = "a-19"
+text = "как включить mirrored режим сети в WSL2"
+lang = "ru"
+expect = ["en/windows/wsl2-localhost-forwarding"]
+kind = "cross-lang"
+
+[[query]]
+id = "a-20"
+text = "почему ConvertTo-Json теряет вложенные объекты"
+lang = "ru"
+expect = ["en/windows/powershell-pipeline-objects"]
+kind = "cross-lang"
+
+[[query]]
+id = "a-21"
+text = "CRLF ломает скрипты и git на Windows, как настроить"
+lang = "ru"
+expect = ["ru/windows/crlf-bash-scripts", "ru/windows/git-autocrlf-gitattributes"]
+kind = "broad"
+
+[[query]]
+id = "a-22"
+text = "кириллица превращается в мусор в консоли Windows"
+lang = "ru"
+expect = ["ru/windows/powershell-encoding", "ru/windows/cmd-chcp-65001"]
+kind = "broad"
+
+# ---- группа b ----
+# Группа B — git (en/git, ru/git)
+
+[[query]]
+id = "b-01"
+text = "publish rewritten history without clobbering a teammate's upload"
+lang = "en"
+expect = ["en/git/force-with-lease"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "b-02"
+text = "make the vcs memorize how I settled a recurring clash"
+lang = "en"
+expect = ["en/git/rerere"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "b-03"
+text = "keeping enormous artwork and movie footage out of the codebase"
+lang = "en"
+expect = ["en/git/lfs"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "b-04"
+text = "почему при возврате к старой версии исчезают мои изменения"
+lang = "ru"
+expect = ["ru/git/detached-head"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "b-05"
+text = "чем маркер версии с комментарием отличается от базового"
+lang = "ru"
+expect = ["ru/git/tags-annotated-lightweight"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "b-06"
+text = "выяснить, чьих рук эта логика, если её сдвигали и выравнивали"
+lang = "ru"
+expect = ["ru/git/blame-ignore-whitespace-moves"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "b-07"
+text = "how to fold small fix commits into earlier ones before review"
+lang = "en"
+expect = ["en/git/interactive-rebase-autosquash"]
+kind = "paraphrase"
+
+[[query]]
+id = "b-08"
+text = "find dangling objects after a dropped stash with git fsck"
+lang = "en"
+expect = ["en/git/reflog-recovery", "en/git/stash-pitfalls"]
+kind = "exact"
+
+[[query]]
+id = "b-09"
+text = "склеить последние три коммита в один через reset --soft"
+lang = "ru"
+expect = ["ru/git/revert-vs-reset"]
+kind = "exact"
+
+[[query]]
+id = "b-10"
+text = "one branch one worktree: branch already checked out"
+lang = "en"
+expect = ["en/git/worktree"]
+kind = "exact"
+
+[[query]]
+id = "b-11"
+text = "cherry-pick диапазона теряет первый коммит"
+lang = "ru"
+expect = ["ru/git/cherry-pick-range"]
+kind = "exact"
+
+[[query]]
+id = "b-12"
+text = "--force-with-lease stale info"
+lang = "en"
+expect = ["en/git/force-with-lease"]
+kind = "identifier"
+
+[[query]]
+id = "b-13"
+text = "gpg.ssh.allowedSignersFile needs to be configured"
+lang = "en"
+expect = ["en/git/signing-commits-ssh-gpg"]
+kind = "identifier"
+
+[[query]]
+id = "b-14"
+text = "check-ignore: файл в .gitignore всё равно отслеживается"
+lang = "ru"
+expect = ["ru/git/gitignore-tracked-file"]
+kind = "identifier"
+
+[[query]]
+id = "b-15"
+text = ".git-blame-ignore-revs для коммитов форматирования"
+lang = "ru"
+expect = ["ru/git/blame-ignore-whitespace-moves"]
+kind = "identifier"
+
+[[query]]
+id = "b-16"
+text = "submodule.recurse pull leaves old checkout"
+lang = "en"
+expect = ["en/git/submodules-pitfalls"]
+kind = "identifier"
+
+[[query]]
+id = "b-17"
+text = "bisect run exit code 125 skip"
+lang = "en"
+expect = ["en/git/bisect-run"]
+kind = "identifier"
+
+[[query]]
+id = "b-18"
+text = "как двоичным поиском найти коммит, который сломал сборку"
+lang = "ru"
+expect = ["en/git/bisect-run"]
+kind = "cross-lang"
+
+[[query]]
+id = "b-19"
+text = "восстановить удалённую ветку после reset --hard"
+lang = "ru"
+expect = ["en/git/reflog-recovery"]
+kind = "cross-lang"
+
+[[query]]
+id = "b-20"
+text = "revert or reset for a commit already pushed to a shared branch"
+lang = "en"
+expect = ["ru/git/revert-vs-reset"]
+kind = "cross-lang"
+
+[[query]]
+id = "b-21"
+text = "git clean -fdx deleted my untracked files"
+lang = "en"
+expect = ["ru/git/clean-fdx"]
+kind = "cross-lang"
+
+[[query]]
+id = "b-22"
+text = "частичный клон и sparse-checkout для огромного монорепозитория"
+lang = "ru"
+expect = ["en/git/sparse-checkout-partial-clone"]
+kind = "cross-lang"
+
+[[query]]
+id = "b-23"
+text = "undo a bad rebase or recover lost commits"
+lang = "en"
+expect = ["en/git/reflog-recovery", "en/git/interactive-rebase-autosquash", "en/git/merge-vs-rebase"]
+kind = "broad"
+
+[[query]]
+id = "b-24"
+text = "rewriting branch history: rebase, amend and force push"
+lang = "en"
+expect = ["en/git/interactive-rebase-autosquash", "en/git/merge-vs-rebase", "en/git/force-with-lease"]
+kind = "broad"
+
+[[query]]
+id = "b-25"
+text = "как откатить или выбросить локальные изменения"
+lang = "ru"
+expect = ["ru/git/revert-vs-reset", "ru/git/clean-fdx"]
+kind = "broad"
+
+# ---- группа c ----
+# Группа C — Linux и Docker
+
+[[query]]
+id = "c-01"
+text = "backend boots too early, before its sql engine accepts queries"
+lang = "en"
+expect = ["en/docker/compose-healthcheck-depends-on"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "c-02"
+text = "storage claims spare capacity yet saving is refused"
+lang = "en"
+expect = ["en/linux/disk-full-but-df-shows-space"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "c-03"
+text = "перенос папки на запасную машину уничтожил чужие директории"
+lang = "ru"
+expect = ["ru/linux/rsync-delete-trailing-slash"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "c-04"
+text = "бэкенд исчерпал квоту хэндлов, новые подключения отклоняются"
+lang = "ru"
+expect = ["ru/linux/ulimit-open-files-emfile"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "c-05"
+text = "safest method to hop via a gateway onto inner nodes"
+lang = "en"
+expect = ["en/linux/ssh-config-agent-forwarding"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "c-06"
+text = "журналы приложений в докере переполнили накопитель"
+lang = "ru"
+expect = ["ru/docker/container-log-rotation"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "c-07"
+text = "scheduled job silently skipped while the server was powered off"
+lang = "en"
+expect = ["en/linux/systemd-timers-vs-cron"]
+kind = "paraphrase"
+
+[[query]]
+id = "c-08"
+text = "service stays dead after a crash, make it come back automatically"
+lang = "en"
+expect = ["en/linux/systemd-unit-restart"]
+kind = "paraphrase"
+
+[[query]]
+id = "c-09"
+text = "inode exhaustion while df shows free space"
+lang = "en"
+expect = ["en/linux/disk-full-but-df-shows-space"]
+kind = "exact"
+
+[[query]]
+id = "c-10"
+text = "слэш в конце источника rsync"
+lang = "ru"
+expect = ["ru/linux/rsync-delete-trailing-slash"]
+kind = "exact"
+
+[[query]]
+id = "c-11"
+text = "depends_on does not wait for the database to be ready"
+lang = "en"
+expect = ["en/docker/compose-healthcheck-depends-on"]
+kind = "exact"
+
+[[query]]
+id = "c-12"
+text = "анонимный том и docker system prune --volumes"
+lang = "ru"
+expect = ["ru/docker/named-volume-backup"]
+kind = "exact"
+
+[[query]]
+id = "c-13"
+text = "journalctl errors from previous boot -b -1"
+lang = "en"
+expect = ["en/linux/journalctl-filters"]
+kind = "exact"
+
+[[query]]
+id = "c-14"
+text = "OOMKilled true exit code 137"
+lang = "en"
+expect = ["en/docker/exit-code-137-container-oom"]
+kind = "identifier"
+
+[[query]]
+id = "c-15"
+text = "LimitNOFILE не применяется из limits.conf"
+lang = "ru"
+expect = ["ru/linux/ulimit-open-files-emfile"]
+kind = "identifier"
+
+[[query]]
+id = "c-16"
+text = "OnCalendar Persistent=true RandomizedDelaySec"
+lang = "en"
+expect = ["en/linux/systemd-timers-vs-cron"]
+kind = "identifier"
+
+[[query]]
+id = "c-17"
+text = "IdentitiesOnly Too many authentication failures"
+lang = "en"
+expect = ["en/linux/ssh-config-agent-forwarding"]
+kind = "identifier"
+
+[[query]]
+id = "c-18"
+text = "--userns=keep-id права на bind mount"
+lang = "ru"
+expect = ["ru/docker/rootless-podman"]
+kind = "identifier"
+
+[[query]]
+id = "c-19"
+text = "musl ndots:5 короткие имена не резолвятся"
+lang = "ru"
+expect = ["en/docker/alpine-musl-dns"]
+kind = "cross-lang"
+
+[[query]]
+id = "c-20"
+text = "многоэтапная сборка образа и порядок COPY для кэша слоёв"
+lang = "ru"
+expect = ["en/docker/multistage-build-layer-cache"]
+kind = "cross-lang"
+
+[[query]]
+id = "c-21"
+text = "собрать образ сразу под arm64 и amd64"
+lang = "ru"
+expect = ["en/docker/buildx-multi-arch"]
+kind = "cross-lang"
+
+[[query]]
+id = "c-22"
+text = "setuid bit ignored on shell scripts"
+lang = "en"
+expect = ["ru/linux/setuid-sticky-permissions"]
+kind = "cross-lang"
+
+[[query]]
+id = "c-23"
+text = "как по dmesg понять, что процесс убил OOM killer на хосте"
+lang = "ru"
+expect = ["en/linux/oom-killer-dmesg"]
+kind = "cross-lang"
+
+[[query]]
+id = "c-24"
+text = "crontab percent sign and missing PATH"
+lang = "en"
+expect = ["ru/linux/crontab-gotchas"]
+kind = "cross-lang"
+
+[[query]]
+id = "c-25"
+text = "configuring systemd services and timers"
+lang = "en"
+expect = ["en/linux/systemd-unit-restart", "en/linux/systemd-timers-vs-cron"]
+kind = "broad"
+
+[[query]]
+id = "c-26"
+text = "out of memory kills: container limit vs whole host"
+lang = "en"
+expect = ["en/linux/oom-killer-dmesg", "en/docker/exit-code-137-container-oom"]
+kind = "broad"
+
+[[query]]
+id = "c-27"
+text = "где Docker хранит данные контейнеров на диске: тома и логи"
+lang = "ru"
+expect = ["ru/docker/named-volume-backup", "ru/docker/container-log-rotation"]
+kind = "broad"
+
+[[query]]
+id = "c-28"
+text = "Dockerfile build techniques: multi-stage and multi-platform images"
+lang = "en"
+expect = ["en/docker/multistage-build-layer-cache", "en/docker/buildx-multi-arch"]
+kind = "broad"
+
+# ---- группа d ----
+# Группа D — Rust
+
+[[query]]
+id = "d-01"
+text = "obtain a pair of exclusive views into a single array at once"
+lang = "en"
+expect = ["en/rust/split-at-mut"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "d-02"
+text = "routine handing back a borrowed piece of one of several inputs won't build"
+lang = "en"
+expect = ["en/rust/e0106-missing-lifetime-specifier"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "d-03"
+text = "expensive number crunching starves concurrent coroutines"
+lang = "en"
+expect = ["en/rust/tokio-spawn-blocking"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "d-04"
+text = "автоматически отклонять пул-реквест при замечаниях статического анализатора"
+lang = "ru"
+expect = ["ru/rust/clippy-ci-deny-warnings"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "d-05"
+text = "примитив синхронизации для нечасто изменяемых данных с массой потребителей"
+lang = "ru"
+expect = ["ru/rust/rwlock-vs-mutex"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "d-06"
+text = "appending to growable list refused while older handle to element remains"
+lang = "en"
+expect = ["en/rust/e0502-mutable-borrow-while-shared"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "d-07"
+text = "calling a &mut self helper method inside iter_mut loop over a field"
+lang = "en"
+expect = ["en/rust/e0499-two-mutable-borrows"]
+kind = "paraphrase"
+
+[[query]]
+id = "d-08"
+text = "which error crate should a library expose and which should an app use"
+lang = "en"
+expect = ["en/rust/thiserror-vs-anyhow"]
+kind = "paraphrase"
+
+[[query]]
+id = "d-09"
+text = "dependency compiled with extra features nobody in my crate asked for"
+lang = "en"
+expect = ["en/rust/cargo-feature-unification-resolver"]
+kind = "paraphrase"
+
+[[query]]
+id = "d-10"
+text = "MutexGuard held across await, future is not Send"
+lang = "en"
+expect = ["en/rust/future-not-send-mutexguard-await"]
+kind = "exact"
+
+[[query]]
+id = "d-11"
+text = "musl malloc slow under multi-threaded load, swap global allocator"
+lang = "en"
+expect = ["en/rust/musl-static-cross-compile"]
+kind = "exact"
+
+[[query]]
+id = "d-12"
+text = "повторный захват mutex в том же потоке взаимоблокировка"
+lang = "ru"
+expect = ["ru/rust/arc-mutex-deadlock"]
+kind = "exact"
+
+[[query]]
+id = "d-13"
+text = "deny_unknown_fields does not combine with flatten"
+lang = "en"
+expect = ["en/rust/serde-attributes-rename-flatten"]
+kind = "exact"
+
+[[query]]
+id = "d-14"
+text = "E0502"
+lang = "en"
+expect = ["en/rust/e0502-mutable-borrow-while-shared"]
+kind = "identifier"
+
+[[query]]
+id = "d-15"
+text = "split_at_mut"
+lang = "en"
+expect = ["en/rust/split-at-mut"]
+kind = "identifier"
+
+[[query]]
+id = "d-16"
+text = "rerun-if-changed build script reruns every time"
+lang = "en"
+expect = ["en/rust/build-rs-rerun-if-changed"]
+kind = "identifier"
+
+[[query]]
+id = "d-17"
+text = "E0038 trait is not dyn compatible"
+lang = "en"
+expect = ["en/rust/dyn-trait-object-safety"]
+kind = "identifier"
+
+[[query]]
+id = "d-18"
+text = "E0597 borrowed value does not live long enough"
+lang = "en"
+expect = ["en/rust/e0597-does-not-live-long-enough"]
+kind = "identifier"
+
+[[query]]
+id = "d-19"
+text = "чем thiserror отличается от anyhow и что выбрать для библиотеки"
+lang = "ru"
+expect = ["en/rust/thiserror-vs-anyhow"]
+kind = "cross-lang"
+
+[[query]]
+id = "d-20"
+text = "как оптимизировать зависимости в отладочной сборке cargo"
+lang = "ru"
+expect = ["en/rust/workspace-dependencies-and-profiles"]
+kind = "cross-lang"
+
+[[query]]
+id = "d-21"
+text = "dangling pointer from CString temporary passed to C function"
+lang = "en"
+expect = ["ru/rust/ffi-cstring-repr-c"]
+kind = "cross-lang"
+
+[[query]]
+id = "d-22"
+text = "rust tests flaky because cargo test runs them in parallel threads"
+lang = "en"
+expect = ["ru/rust/cargo-test-parallel-flaky-proptest"]
+kind = "cross-lang"
+
+[[query]]
+id = "d-23"
+text = "когда возвращать Cow<str> вместо String"
+lang = "ru"
+expect = ["ru/rust/string-str-cow"]
+kind = "paraphrase"
+
+[[query]]
+id = "d-24"
+text = "Rust borrow checker errors and how to fix them"
+lang = "en"
+expect = ["en/rust/e0502-mutable-borrow-while-shared", "en/rust/e0499-two-mutable-borrows", "en/rust/e0597-does-not-live-long-enough", "en/rust/e0106-missing-lifetime-specifier", "en/rust/split-at-mut"]
+kind = "broad"
+
+[[query]]
+id = "d-25"
+text = "блокировки и синхронизация потоков в Rust: Mutex и RwLock"
+lang = "ru"
+expect = ["ru/rust/arc-mutex-deadlock", "ru/rust/rwlock-vs-mutex"]
+kind = "broad"
+
+[[query]]
+id = "d-26"
+text = "cargo configuration: features, workspace dependencies, profiles, build scripts"
+lang = "en"
+expect = ["en/rust/cargo-feature-unification-resolver", "en/rust/workspace-dependencies-and-profiles", "en/rust/build-rs-rerun-if-changed"]
+kind = "broad"
+
+# ---- группа e ----
+# Группа E — документы проекта ZeroAIMemory (ru/zam, en/zam)
+
+# --- identifier ---
+[[query]]
+id = "e-01"
+text = "что ограничивает max_per_node в выдаче поиска"
+lang = "ru"
+expect = ["ru/zam/hybrid-search-rrf"]
+kind = "identifier"
+
+[[query]]
+id = "e-02"
+text = "zam-server reindex --full на остановленном сервере"
+lang = "ru"
+expect = ["ru/zam/reindex-from-embeddings"]
+kind = "identifier"
+
+[[query]]
+id = "e-03"
+text = "ZAM_ADMIN_PASSWORD вместо password_hash"
+lang = "ru"
+expect = ["ru/zam/config-layers-env"]
+kind = "identifier"
+
+[[query]]
+id = "e-04"
+text = "PR_SET_PDEATHSIG из долгоживущего потока"
+lang = "ru"
+expect = ["ru/zam/qdrant-managed-process"]
+kind = "identifier"
+
+[[query]]
+id = "e-05"
+text = "degraded_reason qdrant_down в ответе поиска"
+lang = "ru"
+expect = ["ru/zam/degraded-search-mode"]
+kind = "identifier"
+
+[[query]]
+id = "e-06"
+text = "--accept-nc-license flag for models fetch"
+lang = "en"
+expect = ["en/zam/reranker-license"]
+kind = "identifier"
+
+# --- exact ---
+[[query]]
+id = "e-07"
+text = "контекстный префикс участвует в эмбеддинге и FTS"
+lang = "ru"
+expect = ["ru/zam/markdown-chunking"]
+kind = "exact"
+
+[[query]]
+id = "e-08"
+text = "сводка от агента l0_source не перезаписывается автоматикой"
+lang = "ru"
+expect = ["ru/zam/l0-l1-levels"]
+kind = "exact"
+
+[[query]]
+id = "e-09"
+text = "задание закрывается только после подтверждённого upsert"
+lang = "ru"
+expect = ["ru/zam/index-jobs-outbox"]
+kind = "exact"
+
+[[query]]
+id = "e-10"
+text = "GitHub limits a release asset to 2 GiB, models split per archive"
+lang = "en"
+expect = ["en/zam/release-bundles"]
+kind = "exact"
+
+# --- paraphrase ---
+[[query]]
+id = "e-11"
+text = "куда складывать логины и пароли от баз"
+lang = "ru"
+expect = ["ru/zam/vault-secrets"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "e-12"
+text = "почему ретраи отправки в векторную БД не создают двойных копий"
+lang = "ru"
+expect = ["ru/zam/index-jobs-outbox"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "e-13"
+text = "какая настройка главнее, если она указана в двух местах"
+lang = "ru"
+expect = ["ru/zam/config-layers-env"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "e-14"
+text = "may a for-profit firm legally run this ranking neural net"
+lang = "en"
+expect = ["en/zam/reranker-license"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "e-15"
+text = "why does the service abort at launch when its folder is buried under many nested levels"
+lang = "en"
+expect = ["en/zam/windows-data-dir-path-limit"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "e-16"
+text = "приватные мысли хозяина, скрытые от бота"
+lang = "ru"
+expect = ["ru/zam/spaces-and-human-isolation"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "e-17"
+text = "чем пересборка индекса из кэша отличается от полной перечанковки"
+lang = "ru"
+expect = ["ru/zam/reindex-from-embeddings"]
+kind = "paraphrase"
+
+# --- cross-lang ---
+[[query]]
+id = "e-18"
+text = "сколько весят архивы библиотек NVIDIA для GPU-комплекта"
+lang = "ru"
+expect = ["en/zam/cuda-fetch"]
+kind = "cross-lang"
+
+[[query]]
+id = "e-19"
+text = "можно ли использовать jina-реранкер в коммерческом продукте"
+lang = "ru"
+expect = ["en/zam/reranker-license"]
+kind = "cross-lang"
+
+[[query]]
+id = "e-20"
+text = "ограничение длины пути каталога данных на Windows"
+lang = "ru"
+expect = ["en/zam/windows-data-dir-path-limit"]
+kind = "cross-lang"
+
+[[query]]
+id = "e-21"
+text = "how does Linux kill the Qdrant child when the parent server dies"
+lang = "en"
+expect = ["ru/zam/qdrant-managed-process"]
+kind = "cross-lang"
+
+[[query]]
+id = "e-22"
+text = "what happens to an indexing job after five failed attempts"
+lang = "en"
+expect = ["ru/zam/index-jobs-outbox"]
+kind = "cross-lang"
+
+# --- broad ---
+[[query]]
+id = "e-23"
+text = "почему поиск не находит по смыслу и как это починить"
+lang = "ru"
+expect = ["ru/zam/degraded-search-mode", "ru/zam/reindex-from-embeddings"]
+kind = "broad"
+
+[[query]]
+id = "e-24"
+text = "как агенту тратить меньше контекста при чтении памяти"
+lang = "ru"
+expect = ["ru/zam/l0-l1-levels", "ru/zam/hybrid-search-rrf"]
+kind = "broad"
+
+[[query]]
+id = "e-25"
+text = "как устроен управляемый Qdrant и его векторный индекс"
+lang = "ru"
+expect = ["ru/zam/qdrant-managed-process", "ru/zam/index-jobs-outbox", "ru/zam/reindex-from-embeddings"]
+kind = "broad"
+
+# ---- группа f ----
+# Группа F — исследования по поиску и ML (ru/research, en/research)
+
+[[query]]
+id = "f-01"
+text = "можно ли верить, что одна выдача лучше другой, когда контрольных вопросов немного"
+lang = "ru"
+expect = ["ru/research/butstrep-intervaly"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "f-02"
+text = "как объединить выдачу ранжировщиков взвешенным сложением уверенности"
+lang = "ru"
+expect = ["ru/research/lineynaya-smes-ballov"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "f-03"
+text = "нейросеть сочиняет вымышленную справку, по ней подбираются близкие материалы"
+lang = "ru"
+expect = ["ru/research/hyde-gipoteticheskiy-dokument"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "f-04"
+text = "AI generates a brief preamble for every fragment ahead of storage"
+lang = "en"
+expect = ["en/research/contextual-retrieval"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "f-05"
+text = "enrich a request with extra vocabulary from initial hits"
+lang = "en"
+expect = ["en/research/query-expansion-prf"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "f-06"
+text = "почему второй этап с моделью, читающей запрос и документ вместе, такой медленный"
+lang = "ru"
+expect = ["ru/research/kross-enkodery-rerank"]
+kind = "paraphrase"
+
+[[query]]
+id = "f-07"
+text = "как ИИ-помощнику запоминать прошлые разговоры и накопленный опыт"
+lang = "ru"
+expect = ["ru/research/pamyat-agentov"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "f-08"
+text = "сглаживающая константа k в Reciprocal Rank Fusion"
+lang = "ru"
+expect = ["ru/research/rrf-sliyanie"]
+kind = "exact"
+
+[[query]]
+id = "f-09"
+text = "триграммный токенизатор для поиска подстрок через LIKE"
+lang = "ru"
+expect = ["ru/research/fts5-tokenizatory"]
+kind = "exact"
+
+[[query]]
+id = "f-10"
+text = "structure-aware splitting by Markdown headings with heading path"
+lang = "en"
+expect = ["en/research/chunking-strategies"]
+kind = "exact"
+
+[[query]]
+id = "f-11"
+text = "эпизодическая и семантическая память агентов"
+lang = "ru"
+expect = ["ru/research/pamyat-agentov"]
+kind = "exact"
+
+[[query]]
+id = "f-12"
+text = "как выбрать ef_construction и M для HNSW"
+lang = "ru"
+expect = ["ru/research/hnsw-parametry"]
+kind = "identifier"
+
+[[query]]
+id = "f-13"
+text = "BM25 что означают k1 и b"
+lang = "ru"
+expect = ["ru/research/bm25-parametry"]
+kind = "identifier"
+
+[[query]]
+id = "f-14"
+text = "quantize_dynamic per_channel потеря точности"
+lang = "ru"
+expect = ["ru/research/kvantovanie-int8"]
+kind = "identifier"
+
+[[query]]
+id = "f-15"
+text = "как считать nDCG@10 через IDCG"
+lang = "ru"
+expect = ["ru/research/metriki-ir"]
+kind = "identifier"
+
+[[query]]
+id = "f-16"
+text = "get_providers returns only CPUExecutionProvider, CUDA silently missing"
+lang = "en"
+expect = ["en/research/onnx-runtime-execution-providers"]
+kind = "identifier"
+
+[[query]]
+id = "f-17"
+text = "позднее взаимодействие ColBERT и MaxSim по токенам"
+lang = "ru"
+expect = ["en/research/colbert-late-interaction"]
+kind = "cross-lang"
+
+[[query]]
+id = "f-18"
+text = "лексические веса bge-m3 и расширение терминов в SPLADE"
+lang = "ru"
+expect = ["en/research/learned-sparse-splade"]
+kind = "cross-lang"
+
+[[query]]
+id = "f-19"
+text = "cross-encoder reranking latency cost on CPU"
+lang = "en"
+expect = ["ru/research/kross-enkodery-rerank"]
+kind = "cross-lang"
+
+[[query]]
+id = "f-20"
+text = "мультиязычные эмбеддинги: поиск по-русски в английских текстах"
+lang = "ru"
+expect = ["en/research/multilingual-embeddings"]
+kind = "cross-lang"
+
+[[query]]
+id = "f-21"
+text = "SQLite FTS5 porter stemmer and Russian text"
+lang = "en"
+expect = ["ru/research/fts5-tokenizatory"]
+kind = "cross-lang"
+
+[[query]]
+id = "f-22"
+text = "гибридный поиск: слияние лексического и векторного списков"
+lang = "ru"
+expect = ["ru/research/rrf-sliyanie", "ru/research/lineynaya-smes-ballov", "ru/research/dense-vs-sparse"]
+kind = "broad"
+
+[[query]]
+id = "f-23"
+text = "late interaction and learned sparse alternatives to single-vector dense retrieval"
+lang = "en"
+expect = ["en/research/colbert-late-interaction", "en/research/learned-sparse-splade"]
+kind = "broad"
+
+[[query]]
+id = "f-24"
+text = "формулы метрик ранжирования и доверительные интервалы к ним"
+lang = "ru"
+expect = ["ru/research/metriki-ir", "ru/research/butstrep-intervaly"]
+kind = "broad"
+
+# ---- группа g ----
+# Группа G — инструменты разработки (en/devtools, ru/devtools)
+
+[[query]]
+id = "g-01"
+text = "kill stale builds automatically when newer code arrives"
+lang = "en"
+expect = ["en/devtools/gha-workflow-concurrency"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "g-02"
+text = "GNU utility ignores my recipe because a same-titled folder exists"
+lang = "en"
+expect = ["en/devtools/makefile-phony-targets"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "g-03"
+text = "two style tools keep undoing each other's whitespace edits"
+lang = "en"
+expect = ["en/devtools/eslint-prettier-conflict"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "g-04"
+text = "отдельная песочница библиотек под каждое приложение на питоне"
+lang = "ru"
+expect = ["ru/devtools/python-venv"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "g-05"
+text = "проверки стиля запускаются сами перед сохранением правок в репозиторий"
+lang = "ru"
+expect = ["ru/devtools/pre-commit-hooks"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "g-06"
+text = "how to stop fork contributors from stealing CI secrets"
+lang = "en"
+expect = ["en/devtools/gha-pull-request-target-secrets"]
+kind = "paraphrase"
+
+[[query]]
+id = "g-07"
+text = "actions/cache restore-keys prefix hashFiles lockfile key"
+lang = "en"
+expect = ["en/devtools/gha-cache-keys"]
+kind = "exact"
+
+[[query]]
+id = "g-08"
+text = "карантин нестабильных тестов владелец и срок"
+lang = "ru"
+expect = ["ru/devtools/flaky-tests-quarantine"]
+kind = "exact"
+
+[[query]]
+id = "g-09"
+text = "matrix fail-fast false with include and exclude"
+lang = "en"
+expect = ["en/devtools/gha-matrix-strategy"]
+kind = "exact"
+
+[[query]]
+id = "g-10"
+text = "Keep a Changelog разделы Added Changed Fixed"
+lang = "ru"
+expect = ["ru/devtools/semver-and-changelog"]
+kind = "exact"
+
+[[query]]
+id = "g-11"
+text = "npm ci error package-lock.json not in sync"
+lang = "en"
+expect = ["en/devtools/npm-ci-clean-install"]
+kind = "identifier"
+
+[[query]]
+id = "g-12"
+text = "noUncheckedIndexedAccess array index returns undefined"
+lang = "en"
+expect = ["en/devtools/typescript-strict-flags"]
+kind = "identifier"
+
+[[query]]
+id = "g-13"
+text = "is pull_request_target safe with checkout of PR head"
+lang = "en"
+expect = ["en/devtools/gha-pull-request-target-secrets"]
+kind = "identifier"
+
+[[query]]
+id = "g-14"
+text = "ошибка externally-managed-environment при pip install"
+lang = "ru"
+expect = ["ru/devtools/python-venv"]
+kind = "identifier"
+
+[[query]]
+id = "g-15"
+text = "отменять устаревшие прогоны GitHub Actions при новом пуше"
+lang = "ru"
+expect = ["en/devtools/gha-workflow-concurrency"]
+kind = "cross-lang"
+
+[[query]]
+id = "g-16"
+text = "конфликт ESLint и Prettier, отключить правила форматирования"
+lang = "ru"
+expect = ["en/devtools/eslint-prettier-conflict"]
+kind = "cross-lang"
+
+[[query]]
+id = "g-17"
+text = "replace pip-tools and venv with uv lock and uv sync"
+lang = "en"
+expect = ["ru/devtools/uv-package-manager"]
+kind = "cross-lang"
+
+[[query]]
+id = "g-18"
+text = "как отлаживать падающие тесты Playwright через трассы"
+lang = "ru"
+expect = ["en/devtools/playwright-flaky-e2e"]
+kind = "cross-lang"
+
+[[query]]
+id = "g-19"
+text = "Node.js dependency installs and version pinning"
+lang = "en"
+expect = ["en/devtools/npm-ci-clean-install", "en/devtools/npm-install-and-lockfile", "en/devtools/node-version-pinning"]
+kind = "broad"
+
+[[query]]
+id = "g-20"
+text = "управление зависимостями и окружениями Python"
+lang = "ru"
+expect = ["ru/devtools/python-venv", "ru/devtools/uv-package-manager", "ru/devtools/pyproject-editable-install"]
+kind = "broad"
+
+[[query]]
+id = "g-21"
+text = "GitHub Actions workflow configuration tips"
+lang = "en"
+expect = ["en/devtools/gha-matrix-strategy", "en/devtools/gha-workflow-concurrency", "en/devtools/gha-cache-keys", "en/devtools/gha-pull-request-target-secrets"]
+kind = "broad"
+
+[[query]]
+id = "g-22"
+text = "на что смотреть, когда проверяешь чужой пулреквест"
+lang = "ru"
+expect = ["ru/devtools/code-review-checklist"]
+kind = "paraphrase"
+
+[[query]]
+id = "g-23"
+text = "CI install that uses exactly the locked versions and refuses to update them"
+lang = "en"
+expect = ["en/devtools/npm-ci-clean-install"]
+kind = "paraphrase"
+
+[[query]]
+id = "g-24"
+text = "почему после смены конфига webpack отдаёт старый результат"
+lang = "ru"
+expect = ["ru/devtools/local-build-cache"]
+kind = "paraphrase"
+
+# ---- группа h ----
+# Группа H — эксплуатация и базы данных
+
+[[query]]
+id = "h-01"
+text = "лавина обращений обрушивает бэкенд, едва его починили"
+lang = "ru"
+expect = ["ru/ops/retries-backoff-jitter"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "h-02"
+text = "журнал сервиса разросся на десятки гигабайт и съел хранилище"
+lang = "ru"
+expect = ["ru/ops/log-rotation"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "h-03"
+text = "обсуждение аварии без обвинений сотрудников"
+lang = "ru"
+expect = ["ru/ops/postmortem-blameless"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "h-04"
+text = "previous machine still receiving visitors after repointing the domain"
+lang = "en"
+expect = ["en/ops/dns-ttl-migration"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "h-05"
+text = "web service freezes, workers stuck awaiting a spare datastore link"
+lang = "en"
+expect = ["en/db/connection-pool-exhaustion"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "h-06"
+text = "stress benchmark looks fine typically yet shoppers complain things feel sluggish"
+lang = "en"
+expect = ["en/ops/load-testing-percentiles"]
+kind = "paraphrase"
+disjoint = true
+
+[[query]]
+id = "h-07"
+text = "почему мобильное приложение не доверяет сертификату, а Chrome доверяет"
+lang = "ru"
+expect = ["ru/ops/tls-incomplete-chain"]
+kind = "paraphrase"
+
+[[query]]
+id = "h-08"
+text = "certbot продлил сертификат, но nginx не перезагрузили"
+lang = "ru"
+expect = ["ru/ops/tls-expired-certificate"]
+kind = "exact"
+
+[[query]]
+id = "h-09"
+text = "SQLite файл не уменьшается после DELETE, свободные страницы"
+lang = "ru"
+expect = ["ru/db/sqlite-vacuum"]
+kind = "exact"
+
+[[query]]
+id = "h-10"
+text = "multi-window multi-burn-rate alerts and error budget"
+lang = "en"
+expect = ["en/ops/slo-burn-rate-alerts"]
+kind = "exact"
+
+[[query]]
+id = "h-11"
+text = "SQLITE_BUSY database is locked"
+lang = "ru"
+expect = ["ru/db/sqlite-busy-timeout"]
+kind = "identifier"
+
+[[query]]
+id = "h-12"
+text = "какой busy_timeout ставить и зачем BEGIN IMMEDIATE"
+lang = "ru"
+expect = ["ru/db/sqlite-busy-timeout"]
+kind = "identifier"
+
+[[query]]
+id = "h-13"
+text = "X-Forwarded-Proto бесконечный редирект на https за nginx"
+lang = "ru"
+expect = ["ru/ops/nginx-reverse-proxy-headers"]
+kind = "identifier"
+
+[[query]]
+id = "h-14"
+text = "CREATE INDEX CONCURRENTLY падает внутри транзакции миграции"
+lang = "ru"
+expect = ["ru/db/postgres-zero-downtime-migrations"]
+kind = "identifier"
+
+[[query]]
+id = "h-15"
+text = "idle_in_transaction_session_timeout"
+lang = "en"
+expect = ["en/db/connection-pool-exhaustion"]
+kind = "identifier"
+
+[[query]]
+id = "h-16"
+text = "как выставить Cache-Control и ETag для статики и index.html"
+lang = "ru"
+expect = ["en/ops/http-cache-headers"]
+kind = "cross-lang"
+
+[[query]]
+id = "h-17"
+text = "как читать EXPLAIN ANALYZE и подобрать составной индекс"
+lang = "ru"
+expect = ["en/db/postgres-explain-analyze"]
+kind = "cross-lang"
+
+[[query]]
+id = "h-18"
+text = "полнотекстовый поиск FTS5 по обычной таблице SQLite, синхронизация триггерами"
+lang = "ru"
+expect = ["en/db/sqlite-fts5-search-index"]
+kind = "cross-lang"
+
+[[query]]
+id = "h-19"
+text = "SQLite WAL file keeps growing, checkpoint does not shrink it"
+lang = "en"
+expect = ["ru/db/sqlite-wal"]
+kind = "cross-lang"
+
+[[query]]
+id = "h-20"
+text = "сертификаты TLS: типичные поломки и проверка через openssl"
+lang = "ru"
+expect = ["ru/ops/tls-incomplete-chain", "ru/ops/tls-expired-certificate"]
+kind = "broad"
+
+[[query]]
+id = "h-21"
+text = "таймауты и повторы при вызовах внешних сервисов"
+lang = "ru"
+expect = ["ru/ops/timeouts", "ru/ops/retries-backoff-jitter"]
+kind = "broad"
+
+[[query]]
+id = "h-22"
+text = "PostgreSQL slow queries, indexes and connection limits"
+lang = "en"
+expect = ["en/db/postgres-explain-analyze", "en/db/connection-pool-exhaustion"]
+kind = "broad"
+
+[[query]]
+id = "h-23"
+text = "настройка SQLite для конкурентной записи: WAL, блокировки, размер файла"
+lang = "ru"
+expect = ["ru/db/sqlite-wal", "ru/db/sqlite-busy-timeout", "ru/db/sqlite-vacuum"]
+kind = "broad"
