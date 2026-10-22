@@ -633,3 +633,100 @@ async fn member_cannot_read_owner_knowledge_entry_404() {
         .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn restore_release_with_taken_version_409() {
+    let w = world("restore-ver", None).await;
+    let r1 = w.release("1.0.0", "старый").await;
+    let uri = format!("/api/v1/entries/{}", id_of(&r1));
+    let r = w.a.tok(&w.a_tok, Method::DELETE, &uri, None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r2 = w.release("1.0.0", "новый").await;
+    let r =
+        w.a.tok(&w.a_tok, Method::POST, &format!("{uri}/restore"), None)
+            .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    // удалённая остаётся удалённой, живая одна
+    assert_eq!(w.get(&w.a_tok, &uri).await.status, StatusCode::NOT_FOUND);
+    // освободили версию — восстановление проходит
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::DELETE,
+            &format!("/api/v1/entries/{}", id_of(&r2)),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r =
+        w.a.tok(&w.a_tok, Method::POST, &format!("{uri}/restore"), None)
+            .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+#[tokio::test]
+async fn release_patch_merges_data_and_retry_without_date_is_idempotent() {
+    let w = world("merge", None).await;
+    let body = json!({"kind": "release", "title": "Релиз", "body": "",
+        "data": {"version": "1.0.0", "git_tag": "v1", "commits": [{"sha": "a", "subject": "s"}]}});
+    let r = w.post(&w.a_tok, body.clone(), Some("rel-k")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let e = r.json();
+    let today = e["data"]["date"].as_str().unwrap().to_string();
+    let uri = format!("/api/v1/entries/{}", id_of(&e));
+    // PATCH меняет только версию: date, git_tag и commits сохраняются
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::PATCH,
+            &uri,
+            Some(json!({"data": {"version": "1.0.1"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let d = &r.json()["data"];
+    assert_eq!(d["version"], "1.0.1");
+    assert_eq!(d["date"], today.as_str());
+    assert_eq!(d["git_tag"], "v1");
+    assert_eq!(d["commits"][0]["sha"], "a");
+    // смена даты правкой не мешает повтору исходного запроса (как после полуночи UTC)
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::PATCH,
+            &uri,
+            Some(json!({"data": {"date": "2000-01-01"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = w.post(&w.a_tok, body, Some("rel-k")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["id"], e["id"]);
+}
+
+#[tokio::test]
+async fn empty_title_is_422_and_compare_not_truncated() {
+    let w = world("title", None).await;
+    for t in ["", "   "] {
+        let r = w
+            .post(
+                &w.a_tok,
+                json!({"kind": "changelog", "title": t, "data": {"kind": "fix"}}),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{t:?}");
+    }
+    let e = w.changelog("fix", "ok").await;
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::PATCH,
+            &format!("/api/v1/entries/{}", id_of(&e)),
+            Some(json!({"title": " "})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let r1 = w.release("1.0.0", "").await;
+    assert_eq!(w.compare(&id_of(&r1), None).await["truncated"], false);
+}

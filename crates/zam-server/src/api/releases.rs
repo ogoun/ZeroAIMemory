@@ -17,7 +17,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use zam_store::{Entry, EntryFilter, EntryKind, changelog_between, get_entry, list_entries};
+use zam_store::{
+    CHANGELOG_BETWEEN_MAX, Entry, EntryFilter, EntryKind, changelog_between, get_entry,
+    list_entries,
+};
 
 use super::entries::CHANGELOG_KINDS;
 use super::nodes::diff_blocking;
@@ -44,7 +47,7 @@ fn release_of(e: Entry) -> Result<Entry, ApiError> {
 }
 
 /// Группировка changelog по `data.kind`; неизвестный вид — в `other`.
-fn group_by_kind(items: Vec<Entry>) -> Value {
+fn group_by_kind(items: Vec<Entry>) -> Result<Value, ApiError> {
     let mut groups: Map<String, Value> = Map::new();
     for e in items {
         let k = e
@@ -53,7 +56,8 @@ fn group_by_kind(items: Vec<Entry>) -> Value {
             .and_then(Value::as_str)
             .filter(|k| CHANGELOG_KINDS.contains(k))
             .unwrap_or("other");
-        let v = serde_json::to_value(&e).unwrap_or(Value::Null);
+        let v = serde_json::to_value(&e)
+            .map_err(|e| ApiError::Internal(format!("сериализация записи: {e}")))?;
         groups
             .entry(k)
             .or_insert_with(|| Value::Array(Vec::new()))
@@ -61,7 +65,7 @@ fn group_by_kind(items: Vec<Entry>) -> Value {
             .expect("массив")
             .push(v);
     }
-    Value::Object(groups)
+    Ok(Value::Object(groups))
 }
 
 /// `GET /releases/{id}/compare?with=prev|<id>`.
@@ -107,6 +111,7 @@ pub async fn compare(
         to.created_at,
     )
     .await?;
+    let truncated = items.len() >= CHANGELOG_BETWEEN_MAX;
     let old = from.as_ref().map(|f| f.body.clone()).unwrap_or_default();
     let label = |e: &Entry| {
         e.data
@@ -121,7 +126,8 @@ pub async fn compare(
     Ok(Json(json!({
         "from": from,
         "to": to,
-        "changelog": group_by_kind(items),
+        "changelog": group_by_kind(items)?,
+        "truncated": truncated,
         "notes_diff": notes_diff,
         "commits": commits,
     })))

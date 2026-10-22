@@ -68,6 +68,11 @@ fn previous_tag() -> Result<Option<String>, CliError> {
 /// тега до `HEAD`.
 fn git_range(spec: &str) -> Result<String, CliError> {
     let spec = spec.trim();
+    if spec.starts_with('-') {
+        return Err(CliError::input(
+            "--from-git: диапазон не может начинаться с «-»",
+        ));
+    }
     if spec.is_empty() {
         return Ok(match previous_tag()? {
             Some(t) => format!("{t}..HEAD"),
@@ -241,6 +246,7 @@ mod tests {
         assert_eq!(git_range("v1..v2").unwrap(), "v1..v2");
         assert_eq!(git_range("v1").unwrap(), "v1..HEAD");
         assert_eq!(git_range("..v2").unwrap(), "..v2");
+        assert!(git_range("--output=x").is_err());
     }
 
     #[test]

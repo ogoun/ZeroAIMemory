@@ -209,6 +209,35 @@ fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<Entry, StoreE
     Ok(ex)
 }
 
+/// Версия релиза свободна среди живых релизов пространства (кроме `except`) — иначе
+/// `Conflict`. Вызывается внутри транзакции писателя (`BEGIN IMMEDIATE`), поэтому проверка и
+/// запись атомарны.
+fn ensure_release_version_free(
+    c: &Connection,
+    space: Id,
+    data: &serde_json::Value,
+    except: Option<Id>,
+) -> Result<(), StoreError> {
+    let Some(v) = data.get("version").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    let other: Option<Id> = c
+        .prepare_cached(
+            "SELECT id FROM entries
+             WHERE space_id = ?1 AND kind = 'release' AND deleted_at IS NULL
+               AND json_extract(data, '$.version') = ?2 AND (?3 IS NULL OR id <> ?3)
+             LIMIT 1",
+        )?
+        .query_row(params![space, v, except], |r| r.get(0))
+        .optional()?;
+    if other.is_some() {
+        return Err(StoreError::Conflict(format!(
+            "релиз с версией «{v}» уже есть в пространстве"
+        )));
+    }
+    Ok(())
+}
+
 /// Статус новой записи: у insight — `active` по умолчанию, `active` или `revisit`; у
 /// остальных видов статуса нет.
 fn new_status(kind: EntryKind, s: Option<EntryStatus>) -> Result<Option<EntryStatus>, StoreError> {
@@ -235,6 +264,9 @@ fn insert_entry(
 ) -> Result<Id, StoreError> {
     let space_kind = space_kind_of(c, e.space_id)?;
     check_data(&e.data)?;
+    if e.kind == EntryKind::Release {
+        ensure_release_version_free(c, e.space_id, &e.data, None)?;
+    }
     let status = new_status(e.kind, e.status)?;
     if e.kind != EntryKind::Insight && e.certainty.is_some() {
         return Err(bad("certainty есть только у insight"));
@@ -436,6 +468,9 @@ pub async fn update_entry(
         }
         if let Some(d) = p.data {
             check_data(&d)?;
+            if cur.kind == EntryKind::Release {
+                ensure_release_version_free(tx, cur.space_id, &d, Some(cur.id))?;
+            }
             f.data = d;
         }
         if let Some(t) = p.tags {
@@ -504,6 +539,9 @@ pub async fn restore_entry(db: &Db, id: Id, a: &Attribution) -> Result<Entry, St
         let cur = load_entry(tx, id)?;
         if cur.deleted_at.is_none() {
             return Err(bad("запись не удалена"));
+        }
+        if cur.kind == EntryKind::Release {
+            ensure_release_version_free(tx, cur.space_id, &cur.data, Some(cur.id))?;
         }
         let now = fmt_ts(Timestamp::now());
         tx.execute(

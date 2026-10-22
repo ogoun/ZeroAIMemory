@@ -32,11 +32,11 @@ pub use embeddings::{
 };
 pub use entries::{
     AuthorView, CHANGELOG_BETWEEN_MAX, Certainty, Entry, EntryFilter, EntryKind, EntryPatch,
-    EntryRevision, EntryStatus, NewEntry, ReindexEntry, changelog_between, create_entry,
-    delete_entry, enqueue_entry_upserts, entry_by_idempotency_key, entry_chunks_for_index,
-    entry_revisions, find_release_by_version, finish_entries_reindexed, get_entry, list_entries,
-    normalize_title, reindex_entries_page, restore_entry, retract_entry, supersede_entry,
-    update_entry,
+    EntryRevision, EntryStatus, NewEntry, ReindexEntry, TITLE_MAX_CHARS, changelog_between,
+    create_entry, delete_entry, enqueue_entry_upserts, entry_by_idempotency_key,
+    entry_chunks_for_index, entry_revisions, find_release_by_version, finish_entries_reindexed,
+    get_entry, list_entries, normalize_title, reindex_entries_page, restore_entry, retract_entry,
+    supersede_entry, update_entry,
 };
 pub use jobs::{
     EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats,

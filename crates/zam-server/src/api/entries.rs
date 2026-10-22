@@ -20,12 +20,10 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
-use zam_core::Id;
 use zam_store::{
-    Certainty, Db, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, NewEntry, SpaceKind,
-    create_entry, delete_entry, entry_by_idempotency_key, entry_revisions, find_release_by_version,
-    list_entries, restore_entry, update_entry,
+    Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, NewEntry, SpaceKind,
+    create_entry, delete_entry, entry_by_idempotency_key, entry_revisions, list_entries,
+    restore_entry, update_entry,
 };
 
 use super::nodes::{audit_node, write::if_match};
@@ -53,10 +51,6 @@ const TAG_MAX_CHARS: usize = 200;
 const SUBJECT_MAX_CHARS: usize = 1000;
 /// Лента по умолчанию.
 const LIST_DEFAULT: usize = 50;
-
-/// Проверка уникальности версии релиза и запись — под одним замком (один процесс сервера,
-/// один писатель). [решение исполнителя]
-static RELEASE_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn unprocessable(m: impl Into<String>) -> ApiError {
     ApiError::Unprocessable(m.into())
@@ -206,19 +200,13 @@ fn check_size(st: &AppState, body: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Версия свободна в пространстве (кроме записи `except`) — иначе 409.
-async fn ensure_version_free(
-    db: &Db,
-    space: Id,
-    data: &Value,
-    except: Option<Id>,
-) -> Result<(), ApiError> {
-    let v = data.get("version").and_then(Value::as_str).unwrap_or("");
-    if let Some(ex) = find_release_by_version(db, space, v).await?
-        && Some(ex.id) != except
-    {
-        return Err(ApiError::conflict(format!(
-            "релиз с версией «{v}» уже есть в пространстве"
+/// Заголовок: непустой, до 500 символов — иначе 422 (как прочие ошибки проверки).
+fn check_title(t: &str) -> Result<(), ApiError> {
+    let t = t.trim();
+    if t.is_empty() || t.chars().count() > zam_store::TITLE_MAX_CHARS {
+        return Err(unprocessable(format!(
+            "title: от 1 до {} символов",
+            zam_store::TITLE_MAX_CHARS
         )));
     }
     Ok(())
@@ -269,10 +257,22 @@ pub async fn create(
             "changelog и release ведутся только в пространстве решения",
         ));
     }
-    let data = check_data(req.kind, &req.data)?;
+    check_title(&req.title)?;
+    let mut data = check_data(req.kind, &req.data)?;
     check_size(&st, &req.body)?;
     let attrib = attribution(&p, &headers, req.message)?;
     let key = idempotency_key(&headers)?;
+    // повтор без даты после смены суток: отпечаток снимается с исходного запроса, поэтому
+    // подставленная при первом создании дата берётся у уже созданной записи
+    if req.kind == EntryKind::Release
+        && req.data.get("date").is_none_or(Value::is_null)
+        && let Some(k) = &key
+        && let Some(ex) = entry_by_idempotency_key(&sc.db, &attrib, k).await?
+        && let Some(first) = entry_revisions(&sc.db, ex.id).await?.into_iter().next()
+        && let Some(d) = first.data.get("date")
+    {
+        data["date"] = d.clone();
+    }
     let new = NewEntry {
         space_id: sc.space.id,
         kind: req.kind,
@@ -285,24 +285,6 @@ pub async fn create(
         certainty: None,
         idempotency_key: key.clone(),
     };
-    let release = req.kind == EntryKind::Release;
-    let _guard = if release {
-        Some(RELEASE_LOCK.lock().await)
-    } else {
-        None
-    };
-    if release {
-        // повтор запроса по ключу версию не проверяет: его решает идемпотентность
-        let repeat = match &key {
-            Some(k) => entry_by_idempotency_key(&sc.db, &attrib, k)
-                .await?
-                .is_some(),
-            None => false,
-        };
-        if !repeat {
-            ensure_version_free(&sc.db, sc.space.id, &new.data, None).await?;
-        }
-    }
     let (entry, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {
         st.index.notify();
@@ -449,9 +431,23 @@ pub async fn patch(
     for t in [&req.body, &req.append_body].into_iter().flatten() {
         check_size(&st, t)?;
     }
-    let data = match &req.data {
-        Some(d) => Some(check_data(sc.entry.kind, d)?),
-        None => None,
+    if let Some(t) = &req.title {
+        check_title(t)?;
+    }
+    // release: поля, не указанные в PATCH, сохраняются (слияние на верхнем уровне);
+    // changelog: data заменяется целиком
+    let data = match (&req.data, sc.entry.kind) {
+        (Some(Value::Object(new)), EntryKind::Release) => {
+            let mut merged = sc.entry.data.clone();
+            if let Some(m) = merged.as_object_mut() {
+                for (k, v) in new {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
+            Some(check_data(sc.entry.kind, &merged)?)
+        }
+        (Some(d), kind) => Some(check_data(kind, d)?),
+        (None, _) => None,
     };
     let attrib = attribution(&p, &headers, req.message)?;
     let patch = EntryPatch {
@@ -465,12 +461,6 @@ pub async fn patch(
         certainty: None,
         reason: req.reason,
     };
-    let _guard = RELEASE_LOCK.lock().await;
-    if sc.entry.kind == EntryKind::Release
-        && let Some(d) = &patch.data
-    {
-        ensure_version_free(&sc.db, sc.entry.space_id, d, Some(sc.entry.id)).await?;
-    }
     let before = sc.entry.rev;
     let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;
     if e.rev != before {
