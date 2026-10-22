@@ -15,6 +15,7 @@ pub mod secrets;
 pub mod solutions;
 pub mod spaces;
 pub mod triggers;
+pub mod vault;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -137,6 +138,15 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
             "/api/v1/entries/{id}/backlinks",
             get(graph::entry_backlinks),
         )
+        .route(
+            "/api/v1/spaces/{space}/vault",
+            get(vault::list).post(vault::create),
+        )
+        .route(
+            "/api/v1/vault/{id}",
+            get(vault::get).patch(vault::patch).delete(vault::remove),
+        )
+        .route("/api/v1/vault/{id}/revisions", get(vault::revisions))
         .route("/api/v1/graph", get(graph::graph))
         .route("/api/v1/edges", post(graph::create))
         .route("/api/v1/edges/{id}", delete(graph::remove))

@@ -128,6 +128,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ReleaseCmd,
     },
+    /// Vault: секреты (значение — только из stdin или скрытого ввода)
+    Vault {
+        #[command(subcommand)]
+        cmd: VaultCmd,
+    },
     /// Решение: совместный доступ
     Solution {
         #[command(subcommand)]
@@ -369,6 +374,96 @@ enum ReleaseCmd {
         #[command(flatten)]
         common: Common,
     },
+}
+
+/// Область Vault и подключение.
+#[derive(clap::Args)]
+struct VaultOpts {
+    /// Личный Vault (Knowledge, для всех проектов) вместо Vault решения
+    #[arg(long)]
+    global: bool,
+    /// GUID решения (иначе agent_solution_id из solution.toml)
+    #[arg(long, conflicts_with = "global")]
+    solution: Option<String>,
+    #[command(flatten)]
+    common: Common,
+}
+
+impl VaultOpts {
+    fn area(&self) -> cmd::vault::Area<'_> {
+        cmd::vault::Area {
+            global: self.global,
+            solution: self.solution.as_deref(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum VaultCmd {
+    /// Записи без значений: имя, тип, пользователь или адрес, id
+    List {
+        /// Поиск по имени, url и описанию
+        #[arg(long = "q")]
+        q: Option<String>,
+        #[command(flatten)]
+        opts: VaultOpts,
+    },
+    /// Значение записи в stdout (раскрытие пишется в аудит)
+    Get {
+        name: String,
+        /// Без перевода строки в конце
+        #[arg(long)]
+        raw: bool,
+        #[command(flatten)]
+        opts: VaultOpts,
+    },
+    /// Записать значение из stdin или скрытого ввода с терминала (не из аргументов)
+    Set {
+        name: String,
+        /// Тип: password, token, ssh_key, connection_string, url, repo, note
+        #[arg(long = "type", value_parser = ["password", "token", "ssh_key", "connection_string", "url", "repo", "note"])]
+        kind: String,
+        /// Имя пользователя (data.username)
+        #[arg(long)]
+        username: Option<String>,
+        /// Адрес ресурса (data.url; `--url` — адрес сервера zam)
+        #[arg(long = "link", value_name = "URL")]
+        link: Option<String>,
+        /// Описание (data.description)
+        #[arg(long)]
+        description: Option<String>,
+        #[command(flatten)]
+        opts: VaultOpts,
+    },
+}
+
+fn vault(c: VaultCmd) -> Result<(), CliError> {
+    use cmd::vault as v;
+    match c {
+        VaultCmd::List { q, opts } => {
+            v::list(&cmd::connect(&opts.common)?, &opts.area(), q.as_deref())
+        }
+        VaultCmd::Get { name, raw, opts } => {
+            v::get(&cmd::connect(&opts.common)?, &opts.area(), &name, raw)
+        }
+        VaultCmd::Set {
+            name,
+            kind,
+            username,
+            link,
+            description,
+            opts,
+        } => {
+            let s = v::Set {
+                name: &name,
+                kind: &kind,
+                username: username.as_deref(),
+                url: link.as_deref(),
+                description: description.as_deref(),
+            };
+            v::set(&cmd::connect(&opts.common)?, &opts.area(), &s)
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -641,6 +736,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             cmd::insight::log(&cmd::connect(&common)?, &o)
         }
         Cmd::Insight { cmd } => insight(cmd),
+        Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {
             cmd:
                 ReleaseCmd::Add {

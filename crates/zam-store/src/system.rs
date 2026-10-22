@@ -33,6 +33,10 @@ pub static SYSTEM_MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: include_str!("../migrations/system/0004_human_tokens.sql"),
     },
+    Migration {
+        version: 5,
+        sql: include_str!("../migrations/system/0005_vault_keys.sql"),
+    },
 ];
 
 /// База пользователя, исключённая из пересборки векторного индекса (`index_skipped`).

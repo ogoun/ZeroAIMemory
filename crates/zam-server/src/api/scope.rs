@@ -301,7 +301,7 @@ fn access_role(guid: &SolutionGuid, r: Option<SolutionRole>) -> Result<Role, Api
 }
 
 /// Роль принципала в решении: администратор — `Admin`, токен — по реестру.
-async fn solution_role(
+pub(crate) async fn solution_role(
     st: &AppState,
     p: &Principal,
     user: &User,

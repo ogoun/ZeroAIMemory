@@ -57,6 +57,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         version: 10,
         sql: include_str!("../migrations/user/0010_edges.sql"),
     },
+    Migration {
+        version: 11,
+        sql: include_str!("../migrations/user/0011_vault.sql"),
+    },
 ];
 
 /// Вид пространства.

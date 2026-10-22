@@ -10,6 +10,7 @@ pub mod search;
 pub mod solution;
 pub mod status;
 pub mod tree;
+pub mod vault;
 pub mod write;
 
 use std::io::Write;

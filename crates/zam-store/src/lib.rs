@@ -2,7 +2,7 @@
 //! узлы и ревизии заметок с синхронной индексацией (чанки §8.2, FTS5), outbox векторной
 //! индексации (`index_jobs`), кэш эмбеддингов, полнотекстовый поиск, блобы вложений,
 //! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
-//! участников (`system.db`).
+//! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3).
 
 pub mod access;
 pub mod blobs;
@@ -22,6 +22,7 @@ pub mod solution_registry;
 pub mod system;
 pub mod time;
 pub mod user_db;
+pub mod vault;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use blobs::{
@@ -83,6 +84,11 @@ pub use system::{
 pub use user_db::{
     Space, SpaceKind, USER_MIGRATIONS, UserDbs, create_solution, create_solution_with_id,
     get_solution, get_space, list_spaces, rename_solution_guid, space_of_kind,
+};
+pub use vault::{
+    KEY_CHECK_SETTING, VAULT_TITLE_MAX_CHARS, VaultMeta, VaultRevision, VaultScope,
+    check_vault_title, vault_delete, vault_get, vault_list, vault_put, vault_revision_secret,
+    vault_revisions, vault_update,
 };
 
 /// Ошибки слоя хранения.

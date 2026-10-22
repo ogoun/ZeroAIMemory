@@ -57,6 +57,10 @@ pub enum ApiError {
     RateLimited { retry_after_s: u64 },
     #[error("{0}")]
     Unavailable(String),
+    /// 503 `/problems/vault-locked` (§7.6): мастер-ключ не подходит или файла ключа нет при
+    /// существующих ключах; в `detail` — причина (без путей и ключей).
+    #[error("Vault заблокирован: {0}")]
+    VaultLocked(String),
     /// Подробности только в лог; клиенту уходит общий текст.
     #[error("внутренняя ошибка")]
     Internal(String),
@@ -127,6 +131,11 @@ impl ApiError {
             ApiError::Unavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "about:blank",
+                "Service Unavailable",
+            ),
+            ApiError::VaultLocked(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "/problems/vault-locked",
                 "Service Unavailable",
             ),
             ApiError::Internal(_) => (

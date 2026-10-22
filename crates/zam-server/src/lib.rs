@@ -15,6 +15,7 @@ pub mod models;
 pub mod qdrant;
 pub mod reindex;
 pub mod rerank;
+pub mod vault;
 pub mod web;
 
 #[cfg(test)]

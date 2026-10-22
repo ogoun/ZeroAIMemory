@@ -18,6 +18,8 @@ ureq.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# скрытый ввод значения `zam vault set` с терминала (Apache-2.0, уже у zam-server)
+rpassword.workspace = true
 
 [dev-dependencies]
 zam-server = { path = "../zam-server" }

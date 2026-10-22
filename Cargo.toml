@@ -88,6 +88,11 @@ process-wrap = { version = "=10.0.1", default-features = false, features = ["tok
 # не входит (ADR 0001); бета, API и формат хранилища меняются между минорными версиями
 qdrant-edge = { version = "=0.8.0", default-features = false }
 libc = "0.2"
+# M3, задача 12: шифрование Vault (§7.6) — XChaCha20-Poly1305 (RustCrypto, Apache-2.0 OR MIT);
+# без getrandom/rand_core 0.6: nonce и ключи берутся из rand::rngs::OsRng (как токены)
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# затирание ключей и расшифрованных значений в памяти (Apache-2.0 OR MIT, уже в дереве)
+zeroize = { version = "1", features = ["serde"] }
 # версия та же, что у process-wrap 10.0.1 (тип PROCESS_CREATION_FLAGS)
 windows = "0.62"
 

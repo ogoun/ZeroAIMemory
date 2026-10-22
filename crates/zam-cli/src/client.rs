@@ -214,6 +214,22 @@ impl Client {
         )
     }
 
+    /// PATCH JSON с `If-Match: "<rev>"`.
+    pub fn patch_json_if(
+        &self,
+        path: &str,
+        body: &Value,
+        if_match: i64,
+    ) -> Result<Response<Body>, CliError> {
+        let rb = self
+            .prepare(self.agent.patch(&self.url(path)))
+            .header("If-Match", format!("\"{if_match}\""));
+        self.check(
+            rb.content_type("application/json")
+                .send(body.to_string().as_bytes()),
+        )
+    }
+
     /// PUT с `If-Match: "<rev>"`.
     pub fn put_json(
         &self,

@@ -36,6 +36,7 @@ pub struct ServerConfig {
     pub search: SearchSection,
     pub insights: InsightsSection,
     pub limits: LimitsSection,
+    pub vault: VaultSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -500,6 +501,15 @@ impl InsightsSection {
     }
 }
 
+/// Секция `[vault]` (§7.6): файл мастер-ключа. Сам ключ — только в файле или в
+/// `ZAM_MASTER_KEY` (переменная важнее файла), в конфигурацию он не попадает.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultSection {
+    /// Файл мастер-ключа (base64 32 байт); по умолчанию `<data_dir>/master.key`.
+    pub master_key_file: Option<PathBuf>,
+}
+
 /// Пределы размеров (§16.2): заметка и вложение, байт.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -584,6 +594,7 @@ impl Default for ServerConfig {
                 note_max_bytes: 5_242_880,
                 blob_max_bytes: 209_715_200,
             },
+            vault: VaultSection::default(),
         }
     }
 }
@@ -1331,6 +1342,38 @@ yield_ms = 1
         let env = vec![env("ZAM_ADMIN__PASSWORD_HASH", "plain")];
         let c = load(None, &env, &Default::default()).unwrap();
         assert!(c.admin_secret(None).is_err());
+    }
+
+    #[test]
+    fn vault_master_key_file_from_file_and_env() {
+        assert_eq!(ServerConfig::default().vault.master_key_file, None);
+        let f = crate::test_util::write_in_target(
+            "vault.toml",
+            "[vault]
+master_key_file = \"/srv/k/master.key\"
+",
+        );
+        let c = load(Some(&f), &[], &Default::default()).unwrap();
+        assert_eq!(
+            c.vault.master_key_file,
+            Some(std::path::PathBuf::from("/srv/k/master.key"))
+        );
+        let e = vec![env("ZAM_VAULT__MASTER_KEY_FILE", "/x/m.key")];
+        let c = load(Some(&f), &e, &Default::default()).unwrap();
+        assert_eq!(
+            c.vault.master_key_file,
+            Some(std::path::PathBuf::from("/x/m.key"))
+        );
+        // сам ключ — не ключ конфигурации
+        let e = vec![env("ZAM_MASTER_KEY", "x")];
+        assert!(load(None, &e, &Default::default()).is_ok());
+        let f = crate::test_util::write_in_target(
+            "vault-bad.toml",
+            "[vault]
+master_key = \"x\"
+",
+        );
+        assert!(load(Some(&f), &[], &Default::default()).is_err());
     }
 
     #[test]
