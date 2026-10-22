@@ -41,6 +41,7 @@ fn agent() -> Attribution {
         machine: Some("box".into()),
         message: Some("первая версия".into()),
         user_id: None,
+        area: None,
     }
 }
 
@@ -605,6 +606,7 @@ fn human(msg: &str) -> Attribution {
     Attribution {
         message: Some(msg.into()),
         user_id: None,
+        area: None,
         ..Attribution::new(AuthorKind::Human)
     }
 }

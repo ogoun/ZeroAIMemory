@@ -267,6 +267,7 @@ async fn hybrid_paraphrase_identifier_expand_budget() {
                 space_ids: vec![k],
                 path_prefix: None,
                 top_k: 10,
+                targets: Default::default(),
             },
         )
         .await

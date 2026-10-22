@@ -36,6 +36,7 @@ fn attrib() -> Attribution {
         machine: None,
         message: None,
         user_id: None,
+        area: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn q(text: &str, spaces: &[Id]) -> FtsQuery {
         space_ids: spaces.to_vec(),
         path_prefix: None,
         top_k: 20,
+        targets: Default::default(),
     }
 }
 
@@ -737,6 +739,7 @@ async fn live_chunks_checks_sqlite() {
         space_ids: vec![k],
         path_prefix: prefix.map(str::to_string),
         indexable_only,
+        targets: Default::default(),
     };
     let got = zam_store::live_chunks(&db, ids.clone(), scope(true, None))
         .await

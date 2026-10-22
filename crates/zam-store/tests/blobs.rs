@@ -41,6 +41,7 @@ async fn note(db: &Db, space: Id, path: &str) -> Id {
                 machine: None,
                 message: None,
                 user_id: None,
+                area: None,
             },
         },
     )

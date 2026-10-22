@@ -32,7 +32,10 @@ use crate::StoreError;
 use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
-pub(crate) use chunks::{backfill_embed_keys, frontmatter_tags, rechunk_notes};
+pub(crate) use chunks::{
+    backfill_embed_keys, chunk_id, context_prefix, frontmatter_tags, note_chunks, rechunk_notes,
+    token_counter,
+};
 pub use chunks::{
     chunk_params, count_tokens, set_chunk_params, set_token_counter, token_counter_exact,
 };
@@ -104,6 +107,19 @@ impl ToSql for AuthorKind {
     }
 }
 
+impl FromSql for AuthorKind {
+    fn column_result(v: ValueRef<'_>) -> FromSqlResult<Self> {
+        match v.as_str()? {
+            "human" => Ok(AuthorKind::Human),
+            "agent" => Ok(AuthorKind::Agent),
+            "system" => Ok(AuthorKind::System),
+            other => Err(rusqlite::types::FromSqlError::Other(
+                format!("неизвестный автор: {other}").into(),
+            )),
+        }
+    }
+}
+
 /// Атрибуция ревизии.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribution {
@@ -115,6 +131,8 @@ pub struct Attribution {
     /// Пользователь-автор: пользователь токена записи (владелец базы или участник общего решения).
     /// `None` — запись без токена (администратор, система) и ревизии до M3.
     pub user_id: Option<Id>,
+    /// Область по умолчанию (`X-Zam-Area`, §11.2) для новых узлов и записей журналов.
+    pub area: Option<String>,
 }
 
 impl Attribution {
@@ -127,6 +145,7 @@ impl Attribution {
             machine: None,
             message: None,
             user_id: None,
+            area: None,
         }
     }
 }

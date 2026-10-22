@@ -82,6 +82,7 @@ mod tests {
             snippet: String::new(),
             text: String::new(),
             index_state: "indexed".into(),
+            entry: None,
         }
     }
 

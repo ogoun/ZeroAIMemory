@@ -19,7 +19,8 @@
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params};
-use zam_core::Id;
+use serde::Serialize;
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::ChunkLevel;
 
 use crate::paths::path_ancestors;
@@ -78,15 +79,48 @@ impl FromSql for JobOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub id: i64,
-    /// Узел (`target_kind = 'node'`).
+    /// Вид цели: узел (`target_kind = 'node'`) или запись журнала (`'entry'`, M3).
+    pub target_kind: TargetKind,
+    /// Узел или запись.
     pub target_id: Id,
-    /// Ревизия узла на момент постановки.
+    /// Ревизия цели на момент постановки.
     pub rev: i64,
     pub op: JobOp,
     /// Неудачных попыток до этой выдачи.
     pub attempts: i64,
     /// Номер выдачи: передаётся в [`complete_job`] и [`fail_job`].
     pub claim_gen: i64,
+}
+
+impl Job {
+    /// Цель задания.
+    pub fn target(&self) -> TargetRef {
+        TargetRef {
+            kind: self.target_kind,
+            id: self.target_id,
+        }
+    }
+}
+
+/// `index_jobs.target_kind` цели.
+pub(crate) fn target_kind_sql(k: TargetKind) -> &'static str {
+    match k {
+        TargetKind::Node => "node",
+        TargetKind::Entry => "entry",
+    }
+}
+
+/// Вид цели из `index_jobs.target_kind`.
+fn parse_target_kind(s: &str) -> rusqlite::Result<TargetKind> {
+    match s {
+        "node" => Ok(TargetKind::Node),
+        "entry" => Ok(TargetKind::Entry),
+        other => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("неизвестный вид цели задания: {other}").into(),
+        )),
+    }
 }
 
 /// Чем закончилось [`complete_job`] или [`fail_job`].
@@ -117,8 +151,9 @@ pub struct JobStats {
     pub oldest: Option<Timestamp>,
 }
 
-/// Состояние векторной индексации узла (`nodes.index_state`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Состояние векторной индексации узла или записи (`index_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum IndexState {
     Pending,
     Indexed,
@@ -137,6 +172,20 @@ impl IndexState {
     }
 }
 
+impl FromSql for IndexState {
+    fn column_result(v: ValueRef<'_>) -> FromSqlResult<Self> {
+        match v.as_str()? {
+            "pending" => Ok(IndexState::Pending),
+            "indexed" => Ok(IndexState::Indexed),
+            "failed" => Ok(IndexState::Failed),
+            "excluded" => Ok(IndexState::Excluded),
+            other => Err(rusqlite::types::FromSqlError::Other(
+                format!("неизвестное состояние индексации: {other}").into(),
+            )),
+        }
+    }
+}
+
 /// Поля узла для payload точек Qdrant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePayload {
@@ -147,14 +196,15 @@ pub struct NodePayload {
     pub path: String,
     /// Все префиксы пути по сегментам, включая сам путь: `a`, `a/b`, `a/b/c`.
     pub path_ancestors: Vec<String>,
-    /// Теги из frontmatter.
+    /// Теги из frontmatter (у записи журнала — её теги).
     pub tags: Vec<String>,
+    /// Область (`nodes.area` / `entries.area`).
+    pub area: Option<String>,
     pub updated_at: Timestamp,
 }
 
 /// Поля записи журнала для payload точек Qdrant (M3). Чанк записи несёт их вместо узла:
-/// точка получает `entry_id` и эти поля. [решение исполнителя] Задача 4 закладывает только
-/// форму; чанки записей строит задача 6, до неё у всех чанков `entry: None`.
+/// точка получает `entry_id` и эти поля ([`crate::entry_chunks_for_index`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryPayload {
     pub entry_id: Id,
@@ -184,6 +234,7 @@ pub struct IndexChunk {
     pub token_count: i64,
     /// Ревизия, по которой построен чанк.
     pub rev: i64,
+    /// Поля цели для payload. У записи журнала `node_id` — id записи, `path` пуст.
     pub node: NodePayload,
     /// Поля записи журнала; `None` — чанк заметки.
     pub entry: Option<EntryPayload>,
@@ -200,14 +251,28 @@ pub(crate) fn enqueue(
     priority: i64,
     now: &str,
 ) -> Result<(), StoreError> {
+    enqueue_target(c, TargetKind::Node, node, rev, op, priority, now)
+}
+
+/// [`enqueue`] для цели любого вида (узел или запись журнала).
+pub(crate) fn enqueue_target(
+    c: &Connection,
+    kind: TargetKind,
+    id: Id,
+    rev: i64,
+    op: JobOp,
+    priority: i64,
+    now: &str,
+) -> Result<(), StoreError> {
+    let kind = target_kind_sql(kind);
     let queued = c
         .prepare_cached(
             "UPDATE index_jobs
              SET rev = ?2, op = ?3, attempts = 0, last_error = NULL,
                  priority = max(priority, ?4), not_before = ?5, updated_at = ?5
-             WHERE target_kind = 'node' AND target_id = ?1 AND state = 'queued'",
+             WHERE target_kind = ?6 AND target_id = ?1 AND state = 'queued'",
         )?
-        .execute(params![node, rev, op, priority, now])?;
+        .execute(params![id, rev, op, priority, now, kind])?;
     if queued > 0 {
         return Ok(());
     }
@@ -215,18 +280,18 @@ pub(crate) fn enqueue(
         .prepare_cached(
             "UPDATE index_jobs
              SET rev = ?2, op = ?3, dirty = 1, priority = max(priority, ?4), updated_at = ?5
-             WHERE target_kind = 'node' AND target_id = ?1 AND state = 'running'",
+             WHERE target_kind = ?6 AND target_id = ?1 AND state = 'running'",
         )?
-        .execute(params![node, rev, op, priority, now])?;
+        .execute(params![id, rev, op, priority, now, kind])?;
     if running > 0 {
         return Ok(());
     }
     c.prepare_cached(
         "INSERT INTO index_jobs (target_kind, target_id, rev, op, state, attempts,
                                  priority, not_before, enqueued_at, updated_at)
-         VALUES ('node', ?1, ?2, ?3, 'queued', 0, ?4, ?5, ?5, ?5)",
+         VALUES (?6, ?1, ?2, ?3, 'queued', 0, ?4, ?5, ?5, ?5)",
     )?
-    .execute(params![node, rev, op, priority, now])?;
+    .execute(params![id, rev, op, priority, now, kind])?;
     Ok(())
 }
 
@@ -242,7 +307,7 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
         let now = fmt_ts(now);
         let mut jobs: Vec<Job> = {
             let mut st = tx.prepare_cached(
-                "SELECT id, target_id, rev, op, attempts FROM index_jobs
+                "SELECT id, target_id, rev, op, attempts, target_kind FROM index_jobs
                  WHERE state = 'queued' AND not_before <= ?1
                  ORDER BY priority DESC, id
                  LIMIT ?2",
@@ -250,6 +315,7 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
             st.query_map(params![now, limit], |r| {
                 Ok(Job {
                     id: r.get(0)?,
+                    target_kind: parse_target_kind(&r.get::<_, String>(5)?)?,
                     target_id: r.get(1)?,
                     rev: r.get(2)?,
                     op: r.get(3)?,
@@ -272,17 +338,21 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
     .await
 }
 
-/// Строка задания текущей выдачи: `(target_id, rev, op, attempts, dirty)`.
-type ClaimedRow = (Id, i64, JobOp, i64, bool);
+/// Строка задания текущей выдачи: `(цель, rev, op, attempts, dirty)`.
+type ClaimedRow = (TargetRef, i64, JobOp, i64, bool);
 
 /// Строка задания текущей выдачи; `None` — выдача устарела.
 fn claimed(c: &Connection, id: i64, claim_gen: i64) -> Result<Option<ClaimedRow>, StoreError> {
     Ok(c.prepare_cached(
-        "SELECT target_id, rev, op, attempts, dirty FROM index_jobs
+        "SELECT target_id, rev, op, attempts, dirty, target_kind FROM index_jobs
          WHERE id = ?1 AND claim_gen = ?2 AND state = 'running'",
     )?
     .query_row(params![id, claim_gen], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        let target = TargetRef {
+            kind: parse_target_kind(&r.get::<_, String>(5)?)?,
+            id: r.get(0)?,
+        };
+        Ok((target, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
     })
     .optional()?)
 }
@@ -315,8 +385,8 @@ pub async fn complete_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome
             return requeue_dirty(tx, id, &fmt_ts(Timestamp::now()));
         }
         tx.execute("DELETE FROM index_jobs WHERE id = ?1", [id])?;
-        if op == JobOp::Upsert && !has_active_job(tx, node)? {
-            set_state(tx, node, rev, IndexState::Indexed)?;
+        if op == JobOp::Upsert && !has_active_target(tx, node)? {
+            set_target_state(tx, node, rev, IndexState::Indexed)?;
         }
         Ok(JobOutcome::Done)
     })
@@ -325,12 +395,23 @@ pub async fn complete_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome
 
 /// У узла есть задание `queued` или `running`.
 fn has_active_job(c: &Connection, node: Id) -> Result<bool, StoreError> {
+    has_active_target(
+        c,
+        TargetRef {
+            kind: TargetKind::Node,
+            id: node,
+        },
+    )
+}
+
+/// У цели есть задание `queued` или `running`.
+pub(crate) fn has_active_target(c: &Connection, t: TargetRef) -> Result<bool, StoreError> {
     Ok(c.prepare_cached(
         "SELECT EXISTS (SELECT 1 FROM index_jobs
-                        WHERE target_kind = 'node' AND target_id = ?1
+                        WHERE target_kind = ?2 AND target_id = ?1
                           AND state IN ('queued', 'running'))",
     )?
-    .query_row([node], |r| r.get(0))?)
+    .query_row(params![t.id, target_kind_sql(t.kind)], |r| r.get(0))?)
 }
 
 /// Задержка повтора после `attempts`-й неудачи, секунд.
@@ -375,7 +456,7 @@ pub async fn fail_job(
                 params![id, attempts, err, stamp],
             )?;
             if op == JobOp::Upsert {
-                set_state(tx, node, rev, IndexState::Failed)?;
+                set_target_state(tx, node, rev, IndexState::Failed)?;
             }
             return Ok(JobOutcome::Failed);
         }
@@ -410,13 +491,15 @@ pub async fn release_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome,
     .await
 }
 
-/// Число живых заметок с `index_state = 'indexed'`: есть ли что терять, если коллекция
-/// Qdrant создана заново (тогда нужен reindex из `embeddings`).
+/// Число живых заметок и записей журналов с `index_state = 'indexed'`: есть ли что
+/// терять, если коллекция Qdrant создана заново (тогда нужен reindex из `embeddings`).
 pub async fn indexed_count(db: &Db) -> Result<i64, StoreError> {
     db.read(|c| {
         Ok(c.query_row(
-            "SELECT count(*) FROM nodes
-             WHERE kind = 'note' AND index_state = 'indexed' AND deleted_at IS NULL",
+            "SELECT (SELECT count(*) FROM nodes
+                     WHERE kind = 'note' AND index_state = 'indexed' AND deleted_at IS NULL)
+                  + (SELECT count(*) FROM entries
+                     WHERE index_state = 'indexed' AND deleted_at IS NULL)",
             [],
             |r| r.get(0),
         )?)
@@ -439,13 +522,14 @@ pub async fn requeue_running(db: &Db) -> Result<u64, StoreError> {
     .await
 }
 
-/// Перечанковывает живые заметки пространства `space` (`None` — всех) текущим
-/// счётчиком токенов и ставит `upsert` индексируемым (не Human, не `index: false`)
-/// с низким приоритетом. Узел с активным заданием получает одно задание, не два.
+/// Перечанковывает живые заметки и записи журналов пространства `space` (`None` — всех)
+/// текущим счётчиком токенов и ставит `upsert` индексируемым (не Human, не `index: false`)
+/// с низким приоритетом. Цель с активным заданием получает одно задание, не два.
 /// Возвращает число поставленных `upsert`. Идёт пакетами по отдельным транзакциям.
 /// Перечанковка всей базы точным счётчиком снимает отметку «чанки по оценке».
 pub async fn enqueue_reindex(db: &Db, space: Option<Id>) -> Result<u64, StoreError> {
-    let (_, jobs) = crate::nodes::rechunk_notes(db, space, PRIORITY_REINDEX).await?;
+    let (_, mut jobs) = crate::nodes::rechunk_notes(db, space, PRIORITY_REINDEX).await?;
+    jobs += crate::entries::rechunk_entries(db, space, PRIORITY_REINDEX).await?;
     if space.is_none() {
         crate::user_db::clear_approx_if_exact(db).await?;
     }
@@ -547,7 +631,7 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
     let row = tx
         .prepare_cached(
             "SELECT n.space_id, s.kind, s.solution_guid, n.path, n.frontmatter,
-                    n.updated_at, n.kind, n.index_state, n.deleted_at IS NOT NULL
+                    n.updated_at, n.kind, n.index_state, n.deleted_at IS NOT NULL, n.area
              FROM nodes n JOIN spaces s ON s.id = n.space_id
              WHERE n.id = ?1",
         )?
@@ -561,6 +645,7 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
                     path: r.get(3)?,
                     path_ancestors: Vec::new(),
                     tags: Vec::new(),
+                    area: r.get(9)?,
                     updated_at: ts_at(r, 5)?,
                 },
                 r.get::<_, Option<String>>(4)?,
@@ -586,12 +671,27 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
             .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node}: {e}")))?,
         None => Vec::new(),
     };
-    let mut st = tx.prepare_cached(
+    read_index_chunks(
+        tx,
         "SELECT id, level, heading_path, ordinal, text, context_prefix, text_hash,
                 token_count, rev, embed_key
          FROM chunks WHERE node_id = ?1 ORDER BY ordinal",
-    )?;
-    let rows = st.query_map([node], |r| -> rusqlite::Result<ChunkRowRead> {
+        node,
+        &payload,
+        None,
+    )
+}
+
+/// Чанки цели `id` запросом `sql` (колонки — как в [`index_chunks`]) с полями payload.
+pub(crate) fn read_index_chunks(
+    tx: &Connection,
+    sql: &str,
+    id: Id,
+    payload: &NodePayload,
+    entry: Option<&EntryPayload>,
+) -> Result<Vec<IndexChunk>, StoreError> {
+    let mut st = tx.prepare_cached(sql)?;
+    let rows = st.query_map([id], |r| -> rusqlite::Result<ChunkRowRead> {
         Ok((
             (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
             (
@@ -630,7 +730,7 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
             token_count: tokens,
             rev,
             node: payload.clone(),
-            entry: None,
+            entry: entry.cloned(),
         });
     }
     Ok(out)
@@ -683,13 +783,17 @@ pub async fn reindex_page(
     .await
 }
 
-/// Число живых индексируемых заметок пространства `space` (`None` — всех).
+/// Число живых индексируемых заметок и записей журналов пространства `space`
+/// (`None` — всех).
 pub async fn indexable_count(db: &Db, space: Option<Id>) -> Result<i64, StoreError> {
     db.read(move |c| {
         Ok(c.query_row(
             &format!(
-                "SELECT count(*) FROM nodes n JOIN spaces s ON s.id = n.space_id
-                 WHERE {INDEXABLE} AND (?1 IS NULL OR n.space_id = ?1)"
+                "SELECT (SELECT count(*) FROM nodes n JOIN spaces s ON s.id = n.space_id
+                         WHERE {INDEXABLE} AND (?1 IS NULL OR n.space_id = ?1))
+                      + (SELECT count(*) FROM entries e
+                         WHERE e.deleted_at IS NULL AND e.index_state <> 'excluded'
+                           AND (?1 IS NULL OR e.space_id = ?1))"
             ),
             [space],
             |r| r.get(0),
@@ -754,11 +858,14 @@ pub async fn finish_reindexed(db: &Db, items: Vec<(Id, i64)>) -> Result<(), Stor
 pub struct FailedJob {
     /// Id задания (`index_jobs.id`): у одного узла неудавшихся заданий может быть несколько.
     pub id: i64,
+    /// Вид цели: узел или запись журнала.
+    pub target_kind: TargetKind,
+    /// Id узла или записи.
     pub node_id: Id,
-    /// Пространство и путь узла; `None` — узел уже удалён насовсем.
+    /// Пространство и путь узла; `None` — цель удалена насовсем (у записи пути нет).
     pub space_id: Option<Id>,
     pub path: Option<String>,
-    /// Узел в корзине (удалён мягко); `None` — жив или удалён насовсем.
+    /// Цель удалена мягко; `None` — жива или удалена насовсем.
     pub deleted_at: Option<Timestamp>,
     pub op: JobOp,
     pub attempts: i64,
@@ -773,13 +880,17 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
     db.read(move |c| {
         let mut st = c.prepare_cached(
             "SELECT j.id, j.target_id, j.op, j.attempts, j.last_error, j.updated_at,
-                    n.space_id, n.path, n.deleted_at
-             FROM index_jobs j LEFT JOIN nodes n ON n.id = j.target_id
+                    coalesce(n.space_id, e.space_id), n.path,
+                    coalesce(n.deleted_at, e.deleted_at), j.target_kind
+             FROM index_jobs j
+             LEFT JOIN nodes n ON j.target_kind = 'node' AND n.id = j.target_id
+             LEFT JOIN entries e ON j.target_kind = 'entry' AND e.id = j.target_id
              WHERE j.state = 'failed' ORDER BY j.updated_at DESC, j.id DESC LIMIT ?1",
         )?;
         let rows = st.query_map([limit], |r| {
             Ok(FailedJob {
                 id: r.get(0)?,
+                target_kind: parse_target_kind(&r.get::<_, String>(9)?)?,
                 node_id: r.get(1)?,
                 op: r.get(2)?,
                 attempts: r.get(3)?,
@@ -836,6 +947,19 @@ pub async fn folders_for_index(db: &Db, space: Option<Id>) -> Result<Vec<IndexFo
         Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
+}
+
+/// `index_state` цели (узла или записи), если `rev` — её текущая ревизия и она жива.
+fn set_target_state(
+    c: &Connection,
+    t: TargetRef,
+    rev: i64,
+    state: IndexState,
+) -> Result<(), StoreError> {
+    match t.kind {
+        TargetKind::Node => set_state(c, t.id, rev, state),
+        TargetKind::Entry => crate::entries::set_entry_state(c, t.id, rev, state),
+    }
 }
 
 /// `nodes.index_state` узла, если `rev` — его текущая ревизия и узел жив.

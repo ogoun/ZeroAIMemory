@@ -13,7 +13,8 @@ use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
 
-/// Создаёт заметку и недостающие папки-предки (mkdir -p).
+/// Создаёт заметку и недостающие папки-предки (mkdir -p). Область заметки (`nodes.area`)
+/// — `attrib.area` (`X-Zam-Area`).
 /// Путь занят живым узлом или предок — заметка → `Conflict`; нет пространства → `NotFound`.
 pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
     db.write(move |tx| {
@@ -28,8 +29,8 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
         tx.execute(
             "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, current_rev,
                                 content_hash, frontmatter, l0, l0_source, index_state,
-                                created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'note', ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                                created_at, updated_at, area)
+             VALUES (?1, ?2, ?3, 'note', ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
             params![
                 id,
                 n.space_id,
@@ -42,6 +43,8 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
                 meta.l0_source,
                 index_state(&meta, kind),
                 now,
+                // область по умолчанию — из `X-Zam-Area` запроса создания
+                n.attrib.area,
             ],
         )?;
         store_revision(tx, id, 1, &n.content, &hash, &meta, &n.attrib, None, &now)?;

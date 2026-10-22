@@ -683,6 +683,7 @@ async fn migrate_from_v3_rechunks_once() {
             space_ids: vec![k],
             path_prefix: None,
             top_k: 10,
+            targets: Default::default(),
         },
     )
     .await
@@ -722,6 +723,7 @@ async fn bench_write_until_fts_1000_notes() {
                 space_ids: vec![k],
                 path_prefix: None,
                 top_k: 5,
+                targets: Default::default(),
             },
         )
         .await

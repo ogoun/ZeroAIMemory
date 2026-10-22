@@ -69,11 +69,15 @@ fn qdrant_state(s: &Option<QdrantState>) -> (&'static str, Option<String>) {
     }
 }
 
+/// Неудавшееся задание: цель — `node_id` у узла, `entry_id` у записи журнала.
 fn failed_json(user: Id, f: &FailedJob) -> Value {
-    json!({
+    let id_key = match f.target_kind {
+        zam_core::TargetKind::Node => "node_id",
+        zam_core::TargetKind::Entry => "entry_id",
+    };
+    let mut v = json!({
         "id": f.id,
         "user_id": user,
-        "node_id": f.node_id,
         "space_id": f.space_id,
         "path": f.path,
         "deleted_at": f.deleted_at.map(fmt_ts),
@@ -81,7 +85,9 @@ fn failed_json(user: Id, f: &FailedJob) -> Value {
         "error": f.error,
         "attempts": f.attempts,
         "updated_at": fmt_ts(f.updated_at),
-    })
+    });
+    v[id_key] = json!(f.node_id);
+    v
 }
 
 fn reindex_json(o: &ReindexOutcome) -> Value {
@@ -97,6 +103,7 @@ fn reindex_json(o: &ReindexOutcome) -> Value {
             v["result"] = json!({
                 "users": r.users,
                 "nodes": r.nodes,
+                "entries": r.entries,
                 "points": r.points,
                 "folders": r.folders,
                 "misses": r.misses,

@@ -1,13 +1,14 @@
 //! Хранилище ZeroAIMemory: открытие SQLite, поток-писатель, пул читателей, миграции,
 //! узлы и ревизии заметок с синхронной индексацией (чанки §8.2, FTS5), outbox векторной
 //! индексации (`index_jobs`), кэш эмбеддингов, полнотекстовый поиск, блобы вложений,
-//! реестр решений и доступ участников (`system.db`).
+//! записи журналов решения (`entries`, M3), реестр решений и доступ участников (`system.db`).
 
 pub mod access;
 pub mod blobs;
 pub mod datadir;
 pub mod db;
 pub mod embeddings;
+pub mod entries;
 pub mod jobs;
 pub mod migrate;
 pub mod nodes;
@@ -29,6 +30,13 @@ pub use embeddings::{
     Embedding, adopt_owned_embeddings, adopt_owned_embeddings_batch, embed_input_of, embed_key_of,
     gc_embeddings, get_embeddings, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
 };
+pub use entries::{
+    AuthorView, Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryRevision, EntryStatus,
+    NewEntry, ReindexEntry, create_entry, delete_entry, enqueue_entry_upserts,
+    entry_chunks_for_index, entry_revisions, finish_entries_reindexed, get_entry, list_entries,
+    normalize_title, reindex_entries_page, restore_entry, retract_entry, supersede_entry,
+    update_entry,
+};
 pub use jobs::{
     EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats,
     NodePayload, ReindexNote, chunks_for_index, claim_jobs, complete_job, enqueue_reindex,
@@ -46,9 +54,9 @@ pub use nodes::{
 };
 pub use paths::{NodePath, path_ancestors};
 pub use search::{
-    ChunkScope, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END, MARK_START,
-    leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves, node_leaves, pending_count,
-    query_needles, sanitize_fts, search_fts, search_fts_channels, text_snippet,
+    ChunkScope, EntryHit, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END, MARK_START,
+    TargetFilter, leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves, node_leaves,
+    pending_count, query_needles, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{

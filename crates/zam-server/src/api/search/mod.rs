@@ -9,7 +9,13 @@
 //! - `expand`: `none` (по умолчанию) | `section` (текст всей секции чанка) | `neighbors`
 //!   (чанк с соседними листами) | `graph` (400: будет в M3); действует в `mode=chunks`;
 //! - `top_k` (10, 1..=100), `budget_tokens` (800), `format`: `json` (по умолчанию) | `md`;
-//! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже).
+//! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже);
+//! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release` (по умолчанию все
+//!   четыре), `folder` и `attachment` принимаются, но чанков не находят (папки — канал
+//!   подъёма, вложения — M5); `filters.status` — статусы insight (по умолчанию `active`,
+//!   `revisit`); `include_history: true` снимает фильтр статуса. Фильтр действует и в Qdrant
+//!   (`kinds`, `must_not` по исключённым статусам), и в FTS, и в проверке векторных хитов
+//!   ([`live_chunks`]); у changelog и release статуса нет — они проходят всегда.
 //!
 //! **Область** ([`targets`]): цели — личная база пользователя (Knowledge, Rules, свои
 //! решения, Human — только администратору с `include_human: true`) и базы владельцев
@@ -68,7 +74,7 @@
 //! решения (своего или чужого), `path`, `heading_path`,
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
-//! полного текста чанка, `updated_at`, `kind`, `snippet` | `l0`,
+//! полного текста чанка, `updated_at`, `kind` (`note` или вид записи), `snippet` | `l0`,
 //! `text`, `rerank_score` 0..1 — у переставленных реранком), `degraded`, `degraded_reason`
 //! и `degraded_text` (или `null`), `warnings` (строки: о реранке, `index rebuilding` — индекс
 //! пересобирается, векторная выдача может быть неполной, `solution access …` и
@@ -78,8 +84,14 @@
 //! `total_ms` — весь обработчик без сериализации ответа). Маркеры совпадений в JSON —
 //! U+E000/U+E001.
 //!
+//! Элемент записи журнала вместо `node_id` несёт `entry_id` и поля записи: `kind`,
+//! `status`, `insight_kind` (`data.kind`), `certainty`, `title`; путь у записи пуст,
+//! `expand` и L0 к записям не применяются.
+//!
 //! **Формат `md`** — карточки §9.3, по одной на элемент:
-//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N> · <дата> · ~<N> tok`,
+//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N> · <дата> · ~<N> tok`;
+//! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> · ~<N>
+//! tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются),
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
 //! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
 //! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
@@ -116,8 +128,9 @@ use zam_search::{
 use zam_store::time::fmt_ts;
 use zam_store::{
     ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
-    count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_nodes, live_chunks,
-    neighbor_leaves, node_content, pending_count, query_needles, search_fts_channels, text_snippet,
+    TargetFilter, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_nodes,
+    live_chunks, neighbor_leaves, node_content, pending_count, query_needles, search_fts_channels,
+    text_snippet,
 };
 
 use self::merge::merge_channels;
@@ -178,11 +191,90 @@ enum Expand {
     Graph,
 }
 
+/// `filters` запроса (§9.1); остальные поля пока игнорируются.
+#[derive(Deserialize, Default)]
+struct Filters {
+    kinds: Option<Vec<String>>,
+    status: Option<Vec<String>>,
+}
+
+/// Допустимые виды целей `filters.kinds`.
+const KINDS: [&str; 6] = [
+    "note",
+    "insight",
+    "changelog",
+    "release",
+    "folder",
+    "attachment",
+];
+/// Виды по умолчанию (§9.1).
+const DEFAULT_KINDS: [&str; 4] = ["note", "insight", "changelog", "release"];
+/// Статусы insight.
+const STATUSES: [&str; 4] = ["active", "revisit", "superseded", "retracted"];
+/// Статусы по умолчанию (§7.5): действующие.
+const DEFAULT_STATUSES: [&str; 2] = ["active", "revisit"];
+
+/// Список значений фильтра: пустой или не задан — `default`; неизвестное значение — 400.
+fn filter_list(
+    name: &str,
+    v: Option<&Vec<String>>,
+    allowed: &[&str],
+    default: &[&str],
+) -> Result<Vec<String>, ApiError> {
+    let v: Vec<String> = match v.filter(|v| !v.is_empty()) {
+        Some(v) => v.clone(),
+        None => default.iter().map(|s| s.to_string()).collect(),
+    };
+    if let Some(bad) = v.iter().find(|s| !allowed.contains(&s.as_str())) {
+        return Err(ApiError::BadRequest(format!(
+            "{name}: неизвестное значение «{bad}»; допустимы {}",
+            allowed.join(", ")
+        )));
+    }
+    Ok(v)
+}
+
+/// Фильтр целей запроса: виды и статусы (`include_history` — любые статусы).
+fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, ApiError> {
+    let kinds = filter_list("filters.kinds", f.kinds.as_ref(), &KINDS, &DEFAULT_KINDS)?;
+    let statuses = filter_list(
+        "filters.status",
+        f.status.as_ref(),
+        &STATUSES,
+        &DEFAULT_STATUSES,
+    )?;
+    Ok(TargetFilter {
+        kinds,
+        statuses: if include_history {
+            Vec::new()
+        } else {
+            statuses
+        },
+    })
+}
+
+/// Статусы, которые векторный фильтр исключает (`must_not`): точки без статуса (узлы,
+/// changelog, release, точки M2) проходят.
+fn excluded_statuses(t: &TargetFilter) -> Vec<String> {
+    if t.statuses.is_empty() {
+        return Vec::new();
+    }
+    STATUSES
+        .iter()
+        .filter(|s| !t.statuses.iter().any(|x| x == *s))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct SearchReq {
     query: String,
     #[serde(default)]
     scope: ScopeReq,
+    #[serde(default)]
+    filters: Filters,
+    #[serde(default)]
+    include_history: bool,
     mode: Option<SearchMode>,
     top_k: Option<usize>,
     budget_tokens: Option<usize>,
@@ -695,7 +787,18 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
     o.insert("sources".into(), json!(p.item.sources));
     o.insert("tokens".into(), json!(p.tokens));
     o.insert("updated_at".into(), json!(fmt_ts(h.updated_at)));
-    o.insert("kind".into(), json!("note"));
+    match &h.entry {
+        Some(e) => {
+            o.insert("kind".into(), json!(e.kind));
+            o.insert("status".into(), json!(e.status));
+            o.insert("insight_kind".into(), json!(e.insight_kind));
+            o.insert("certainty".into(), json!(e.certainty));
+            o.insert("title".into(), json!(e.title));
+        }
+        None => {
+            o.insert("kind".into(), json!("note"));
+        }
+    }
     if mode == SearchMode::Notes {
         o.insert("l0".into(), json!(p.item.l0));
     } else {
@@ -721,22 +824,54 @@ fn md_inline(s: &str) -> String {
         .replace([MARK_START, MARK_END], "**")
 }
 
-/// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · ~340 tok`.
+/// Заголовок карточки записи журнала (§9.3):
+/// `i:<id> insight/<вид> «<заголовок>»  [0.77] active · hypothesis · ~120 tok`.
+fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> String {
+    let letter = match e.kind.as_str() {
+        "insight" => "i",
+        "changelog" => "c",
+        "release" => "r",
+        _ => "e",
+    };
+    let mut line = format!("{letter}:{id} {}", e.kind);
+    if let Some(k) = &e.insight_kind {
+        line.push('/');
+        line.push_str(&md_inline(k));
+    }
+    line.push_str(&format!(" «{}»", md_inline(&e.title)));
+    let mut parts: Vec<String> = [&e.status, &e.certainty]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    parts.push(format!("~{tokens} tok"));
+    line.push_str(&format!("  [{score:.2}] {}\n", parts.join(" · ")));
+    line
+}
+
+/// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · ~340 tok`
+/// (у записи журнала — [`entry_card`]).
 fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
     let h = &p.item.hit;
-    let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
-    let mut line = format!("{n}. {} {space}/{}", h.target, h.path);
-    if !h.heading_path.is_empty() {
-        line.push_str(" › ");
-        line.push_str(&h.heading_path);
-    }
-    line.push_str(&format!(
-        "  [{:.2}] rev{} · {} · ~{} tok\n",
-        p.item.rerank_score.map_or(p.item.score, f64::from),
-        h.rev,
-        h.updated_at.strftime("%Y-%m-%d"),
-        p.tokens
-    ));
+    let score = p.item.rerank_score.map_or(p.item.score, f64::from);
+    let mut line = match &h.entry {
+        Some(e) => format!("{n}. {}", entry_card(e, h.target.id, score, p.tokens)),
+        None => {
+            let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
+            let mut line = format!("{n}. {} {space}/{}", h.target, h.path);
+            if !h.heading_path.is_empty() {
+                line.push_str(" › ");
+                line.push_str(&h.heading_path);
+            }
+            line.push_str(&format!(
+                "  [{score:.2}] rev{} · {} · ~{} tok\n",
+                h.rev,
+                h.updated_at.strftime("%Y-%m-%d"),
+                p.tokens
+            ));
+            line
+        }
+    };
     match &p.text {
         Some((t, _)) => {
             for l in t.lines() {
@@ -824,6 +959,7 @@ pub async fn search(
         )));
     }
     let budget = req.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS);
+    let kinds = target_filter(&req.filters, req.include_history)?;
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
     let mut health = Health::new(&targets, warnings);
     let prefix = req
@@ -859,6 +995,7 @@ pub async fn search(
                     space_ids: tg.space_ids(),
                     path_prefix: prefix.clone(),
                     top_k: TOP_K_MAX,
+                    targets: kinds.clone(),
                 },
             )
         }))
@@ -872,6 +1009,8 @@ pub async fn search(
         let filter = VectorFilter {
             scopes: scopes.clone(),
             path_prefix: prefix.clone(),
+            kinds: kinds.kinds.clone(),
+            exclude_statuses: excluded_statuses(&kinds),
             ..VectorFilter::default()
         };
         vector_channel(&st.index, filter, req.query.clone()).await
@@ -912,6 +1051,7 @@ pub async fn search(
                     space_ids: t.vector_space_ids(),
                     path_prefix: prefix.clone(),
                     indexable_only: true,
+                    targets: kinds.clone(),
                 };
                 if let Some(found) = health.soft(i, live_chunks(&t.db, ids, scope).await)? {
                     for h in found {
@@ -1021,6 +1161,7 @@ pub async fn search(
                     space_ids: t.space_ids(),
                     path_prefix: prefix.clone(),
                     indexable_only: false,
+                    targets: kinds.clone(),
                 };
                 let Some(leaves) = health.soft(i, live_chunks(&t.db, missing, scope).await)? else {
                     continue;
@@ -1209,6 +1350,7 @@ mod tests {
             snippet: format!("{MARK_START}s{MARK_END}"),
             text: text.into(),
             index_state: "indexed".into(),
+            entry: None,
         }
     }
 
@@ -1498,5 +1640,94 @@ mod tests {
             p.item.hit.target.id
         );
         assert_eq!(s, want);
+    }
+
+    #[test]
+    fn md_entry_card_format() {
+        let id = Id::new();
+        let mut it = items(vec![hit(id, "текст")], false).remove(0);
+        it.hit.target = TargetRef {
+            kind: TargetKind::Entry,
+            id,
+        };
+        it.hit.entry = Some(zam_store::EntryHit {
+            kind: "insight".into(),
+            status: Some("active".into()),
+            insight_kind: Some("gotcha".into()),
+            certainty: Some("hypothesis".into()),
+            title: "Bash-скрипты должны иметь LF".into(),
+        });
+        let mut p = Packed {
+            item: it,
+            text: None,
+            tokens: 120,
+        };
+        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new());
+        assert_eq!(
+            s,
+            format!(
+                "2. i:{id} insight/gotcha «Bash-скрипты должны иметь LF»  [0.50] active · \
+                 hypothesis · ~120 tok\n   **s**\n"
+            )
+        );
+        // changelog без статуса и certainty
+        p.item.hit.entry = Some(zam_store::EntryHit {
+            kind: "changelog".into(),
+            status: None,
+            insight_kind: Some("fix".into()),
+            certainty: None,
+            title: "Исправлен CRLF".into(),
+        });
+        p.tokens = 9;
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
+        assert!(
+            s.starts_with(&format!(
+                "1. c:{id} changelog/fix «Исправлен CRLF»  [0.50] ~9 tok\n"
+            )),
+            "{s}"
+        );
+        let j = item_json(&p, SearchMode::Brief, &HashMap::new());
+        assert_eq!(j["entry_id"], json!(id));
+        assert!(j.get("node_id").is_none());
+        assert_eq!(j["kind"], "changelog");
+        assert_eq!(j["insight_kind"], "fix");
+        assert_eq!(j["title"], "Исправлен CRLF");
+        assert!(j["status"].is_null());
+    }
+
+    #[test]
+    fn filters_defaults_and_validation() {
+        let f = target_filter(&Filters::default(), false).unwrap();
+        assert_eq!(f.kinds, DEFAULT_KINDS.map(String::from).to_vec());
+        assert_eq!(f.statuses, DEFAULT_STATUSES.map(String::from).to_vec());
+        assert_eq!(excluded_statuses(&f), vec!["superseded", "retracted"]);
+        // include_history снимает фильтр статуса
+        let f = target_filter(&Filters::default(), true).unwrap();
+        assert!(f.statuses.is_empty() && excluded_statuses(&f).is_empty());
+        let f = target_filter(
+            &Filters {
+                kinds: Some(vec!["insight".into()]),
+                status: Some(vec!["retracted".into()]),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(f.kinds, vec!["insight"]);
+        assert_eq!(
+            excluded_statuses(&f),
+            vec!["active", "revisit", "superseded"]
+        );
+        for bad in [
+            Filters {
+                kinds: Some(vec!["nope".into()]),
+                status: None,
+            },
+            Filters {
+                kinds: None,
+                status: Some(vec!["Active".into()]),
+            },
+        ] {
+            assert!(target_filter(&bad, false).is_err());
+        }
     }
 }

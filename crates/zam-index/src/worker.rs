@@ -23,12 +23,13 @@
 //!    последовательно с заданиями, в том числе при чужой модели коллекции (её он и
 //!    пересоздаёт). Прерванный reindex базы (отметка `reindex_pending`) повторяется при
 //!    первом открытии базы после запуска.
-//! 4. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла →
+//! 4. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла или
+//!    записи журнала (`target_kind = 'entry'`, M3: точки с `entry_id` и полями записи) →
 //!    кэш `embeddings` по `chunks.embed_key` → инференс промахов (`spawn_blocking`, пачки
 //!    не больше `batch_tokens`, уступка `yield_ms`) → одна запись в Qdrant на пачку:
-//!    `delete_targets` + `upsert` (`wait=true`; отказ пачки — по одному узлу) →
-//!    auto-L0 → `complete_job`, который в своей транзакции ставит `index_state = 'indexed'`
-//!    только при [`JobOutcome::Done`] и без активного задания узла.
+//!    `delete_targets` + `upsert` (`wait=true`; отказ пачки — по одной цели) →
+//!    auto-L0 (только узлы) → `complete_job`, который в своей транзакции ставит
+//!    `index_state = 'indexed'` только при [`JobOutcome::Done`] и без активного задания цели.
 //!    Qdrant недоступен или коллекции нет — задания возвращаются [`release_job`] без
 //!    траты попыток; прочие ошибки — [`fail_job`] (backoff, после 5 — `failed`).
 //! 5. **L0** (§8.3): автоматический L0 заметки — предложение у центроида её чанков;
@@ -58,9 +59,10 @@ use zam_markdown::ChunkLevel;
 use zam_store::{
     Db, Embedding, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, NodeKind,
     SpaceKind, StoreError, SystemStore, UserDbs, adopt_owned_embeddings, chunks_for_index,
-    claim_jobs, complete_job, enqueue_reindex, fail_job, gc_embeddings, get_embeddings, get_node,
-    get_space, indexed_count, list_children, pending_reindex, prune_owned_embeddings,
-    put_embeddings, put_owned_embeddings, release_job, requeue_running, set_auto_l0, set_folder_l0,
+    claim_jobs, complete_job, enqueue_reindex, entry_chunks_for_index, fail_job, gc_embeddings,
+    get_embeddings, get_node, get_space, indexed_count, list_children, pending_reindex,
+    prune_owned_embeddings, put_embeddings, put_owned_embeddings, release_job, requeue_running,
+    set_auto_l0, set_folder_l0,
 };
 
 use crate::reindex::{GC_BATCH, ReindexCtx, ReindexReport, ReindexRequest, reindex};
@@ -1251,15 +1253,15 @@ impl Worker {
     async fn fail(&self, db: &Db, j: &Job, err: &str) {
         match fail_job(db, j.id, j.claim_gen, err, Timestamp::now()).await {
             Ok(JobOutcome::Failed) if j.op == JobOp::Delete => tracing::warn!(
-                node = %j.target_id,
+                target = %j.target(),
                 error = err,
-                "задание delete завершилось неудачей: точки узла остаются в Qdrant (поиск их отфильтрует)"
+                "задание delete завершилось неудачей: точки цели остаются в Qdrant (поиск их отфильтрует)"
             ),
             Ok(JobOutcome::Failed) => {
-                tracing::warn!(node = %j.target_id, error = err, "задание индексации failed")
+                tracing::warn!(target = %j.target(), error = err, "задание индексации failed")
             }
             Ok(_) => {
-                tracing::debug!(node = %j.target_id, error = err, "задание индексации: повтор")
+                tracing::debug!(target = %j.target(), error = err, "задание индексации: повтор")
             }
             Err(e) => tracing::warn!(job = j.id, error = %e, "fail_job"),
         }
@@ -1272,16 +1274,22 @@ impl Worker {
         for j in jobs {
             let plan = match j.op {
                 JobOp::Delete => Plan::Delete,
-                JobOp::Upsert => match chunks_for_index(db, j.target_id).await {
-                    Ok(c) if c.is_empty() => Plan::Delete,
-                    Ok(c) => Plan::Upsert(c),
-                    // узла нет: убрать возможные точки
-                    Err(StoreError::NotFound) => Plan::Delete,
-                    Err(e) => {
-                        self.fail(db, &j, &format!("чанки узла: {e}")).await;
-                        continue;
+                JobOp::Upsert => {
+                    let chunks = match j.target_kind {
+                        TargetKind::Node => chunks_for_index(db, j.target_id).await,
+                        TargetKind::Entry => entry_chunks_for_index(db, j.target_id).await,
+                    };
+                    match chunks {
+                        Ok(c) if c.is_empty() => Plan::Delete,
+                        Ok(c) => Plan::Upsert(c),
+                        // цели нет: убрать возможные точки
+                        Err(StoreError::NotFound) => Plan::Delete,
+                        Err(e) => {
+                            self.fail(db, &j, &format!("чанки цели: {e}")).await;
+                            continue;
+                        }
                     }
-                },
+                }
             };
             plans.push((j, plan));
         }
@@ -1338,12 +1346,12 @@ impl Worker {
             self.release_all(db, &back).await;
             return Err(Halt::Stopped);
         }
-        // Qdrant: две записи на пачку (удалить старые точки узлов, записать новые), а не
+        // Qdrant: две записи на пачку (удалить старые точки целей, записать новые), а не
         // две на задание — на HDD каждая запись `wait=true` стоит десятки миллисекунд
-        let nodes: Vec<Id> = ready.iter().map(|(j, _)| j.target_id).collect();
+        let targets: Vec<TargetRef> = ready.iter().map(|(j, _)| j.target()).collect();
         #[cfg(feature = "test-hooks")]
         self.inner.hold.park().await;
-        match self.write_points(user, &nodes, pts).await {
+        match self.write_points(user, &targets, pts).await {
             Ok(()) => {}
             Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
                 let back: Vec<Job> = ready.into_iter().map(|(j, _)| j).collect();
@@ -1353,12 +1361,12 @@ impl Worker {
             Err(e) => {
                 // пачка отклонена: по одному, чтобы неудачным стало только виновное задание
                 // (точки узлов строятся заново только на этом редком пути)
-                tracing::debug!(error = %e, "запись пачки в Qdrant отклонена, по одному узлу");
+                tracing::debug!(error = %e, "запись пачки в Qdrant отклонена, по одной цели");
                 let mut keep = Vec::with_capacity(ready.len());
                 let mut rest = ready.into_iter();
                 while let Some((j, plan)) = rest.next() {
                     let pts = plan_points(user, &plan, &embs).unwrap_or_default();
-                    match self.write_points(user, &[j.target_id], pts).await {
+                    match self.write_points(user, &[j.target()], pts).await {
                         Ok(()) => keep.push((j, plan)),
                         Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
                             // записанные уже подтверждены, но их задания тоже
@@ -1379,14 +1387,17 @@ impl Worker {
         for (j, plan) in ready {
             // свёртка предков и auto-L0 — до закрытия задания: покой воркера — пустая
             // очередь, `batch_running == false` и `rollups_pending == 0`, а `indexed`
-            // означает, что узел обработан целиком (L0 — по ревизии задания)
-            let parent = get_node(db, j.target_id)
-                .await
-                .ok()
-                .and_then(|n| n.parent_id);
-            self.schedule_chain(user, db, parent).await;
-            if let Plan::Upsert(chunks) = &plan {
-                self.auto_l0(db, j.target_id, j.rev, chunks, &embs).await;
+            // означает, что узел обработан целиком (L0 — по ревизии задания); у записей
+            // журналов нет ни папок-предков, ни L0
+            if j.target_kind == TargetKind::Node {
+                let parent = get_node(db, j.target_id)
+                    .await
+                    .ok()
+                    .and_then(|n| n.parent_id);
+                self.schedule_chain(user, db, parent).await;
+                if let Plan::Upsert(chunks) = &plan {
+                    self.auto_l0(db, j.target_id, j.rev, chunks, &embs).await;
+                }
             }
             // `indexed` ставит complete_job в своей транзакции (upsert, Done, без активного
             // задания); upsert без чанков (пустая заметка) тоже завершён: иначе вечный pending
@@ -1401,26 +1412,19 @@ impl Worker {
         Ok(())
     }
 
-    /// Точки узлов в Qdrant: удалить старые точки `nodes`, записать `pts` (`wait=true`).
+    /// Точки целей в Qdrant: удалить старые точки `targets`, записать `pts` (`wait=true`).
     async fn write_points(
         &self,
         user: Id,
-        nodes: &[Id],
+        targets: &[TargetRef],
         pts: Vec<IndexPoint>,
     ) -> Result<(), IndexError> {
-        if nodes.is_empty() {
+        if targets.is_empty() {
             return Ok(());
         }
         let t = Instant::now();
         let res = async {
-            let targets: Vec<TargetRef> = nodes
-                .iter()
-                .map(|&id| TargetRef {
-                    kind: TargetKind::Node,
-                    id,
-                })
-                .collect();
-            self.deps.vector.delete_targets(user, &targets).await?;
+            self.deps.vector.delete_targets(user, targets).await?;
             if !pts.is_empty() {
                 self.deps.vector.upsert(pts).await?;
             }
@@ -1893,7 +1897,7 @@ pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint
         node_id: Some(c.node.node_id),
         entry_id: None,
         path_ancestors: c.node.path_ancestors.clone(),
-        area: None,
+        area: c.node.area.clone(),
         level: c.level.as_str().to_string(),
         kind: "note".into(),
         tags: c.node.tags.clone(),

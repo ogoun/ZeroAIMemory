@@ -8,9 +8,10 @@
 //!   `embeddings` по `chunks.embed_key` и пишутся в Qdrant пачками по 256 точек
 //!   (`wait=true`, до [`PARALLEL_WRITES`] = 8 запросов одновременно; следующая страница читается, пока пишется
 //!   текущая). Заметка, у которой в кэше нет хотя бы одного чанка, получает
-//!   задание `upsert` (инференс воркером). Точки папок — из кэша по L0 папки.
-//! - **полный** (`full`): `enqueue_reindex` — перечанковка и задания для всех заметок
-//!   области, инференс для промахов кэша.
+//!   задание `upsert` (инференс воркером). Записи журналов (M3) — так же, страницами
+//!   после заметок. Точки папок — из кэша по L0 папки.
+//! - **полный** (`full`): `enqueue_reindex` — перечанковка и задания для всех заметок и
+//!   записей журналов области, инференс для промахов кэша.
 //!
 //! Коллекция чужой модели (Review Focus 3) удаляется и создаётся заново для текущей;
 //! после пересоздания (или если коллекцию удалили извне) область расширяется до всех
@@ -35,9 +36,9 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use zam_core::Id;
 use zam_store::{
     Db, Embedding, IndexFolder, ReindexNote, StoreError, SystemStore, UserDbs,
-    adopt_owned_embeddings_batch, enqueue_reindex, enqueue_upserts, finish_reindexed,
-    folders_for_index, gc_embeddings, get_embeddings, list_spaces, mark_reindex,
-    put_owned_embeddings, reindex_page,
+    adopt_owned_embeddings_batch, enqueue_entry_upserts, enqueue_reindex, enqueue_upserts,
+    finish_entries_reindexed, finish_reindexed, folders_for_index, gc_embeddings, get_embeddings,
+    list_spaces, mark_reindex, put_owned_embeddings, reindex_entries_page, reindex_page,
 };
 
 use crate::worker::{chunk_point, folder_embed, folder_point};
@@ -91,11 +92,13 @@ pub struct ReindexReport {
     pub users: usize,
     /// Заметок восстановлено из кэша.
     pub nodes: u64,
+    /// Записей журналов восстановлено из кэша.
+    pub entries: u64,
     /// Точек чанков записано.
     pub points: u64,
     /// Точек папок записано.
     pub folders: u64,
-    /// Заметок без эмбеддингов в кэше (для них поставлены задания).
+    /// Заметок и записей без эмбеддингов в кэше (для них поставлены задания).
     pub misses: u64,
     /// Папок с L0 без эмбеддинга в кэше и без модели в контексте (точку построит свёртка).
     pub folder_misses: u64,
@@ -240,6 +243,7 @@ pub async fn reindex(
         full = rep.full,
         users = rep.users,
         nodes = rep.nodes,
+        entries = rep.entries,
         points = rep.points,
         folders = rep.folders,
         misses = rep.misses,
@@ -322,6 +326,7 @@ async fn cache_user(
     }
     rep.misses += misses.len() as u64;
     rep.jobs += enqueue_upserts(db, misses).await?;
+    cache_entries(ctx, user, db, space, rep).await?;
     // точки папок по их L0 (кэш служебных эмбеддингов)
     let folders = folders_for_index(db, space).await?;
     let embedded: Vec<(String, String)> = folders
@@ -373,6 +378,63 @@ async fn cache_user(
         .extend(missed.iter().map(|(f, _)| (user, f.node_id)));
     rep.folders += fpts.len() as u64;
     write_points(ctx.vector, fpts).await?;
+    Ok(())
+}
+
+/// Записи журналов области из кэша: страницами по [`PAGE_NOTES`]; запись, у которой в кэше
+/// нет хотя бы одного чанка, получает задание `upsert`. Точки области уже удалены.
+async fn cache_entries(
+    ctx: &ReindexCtx<'_>,
+    user: Id,
+    db: &Db,
+    space: Option<Id>,
+    rep: &mut ReindexReport,
+) -> Result<(), UserFail> {
+    let mut after: Option<Id> = None;
+    let mut misses: Vec<Id> = Vec::new();
+    loop {
+        let t = Instant::now();
+        let page = reindex_entries_page(db, space, after, PAGE_NOTES).await?;
+        if page.is_empty() {
+            rep.read_ms += t.elapsed().as_millis() as u64;
+            break;
+        }
+        after = page.last().map(|e| e.entry_id);
+        let mut keys: Vec<String> = page
+            .iter()
+            .flat_map(|e| e.chunks.iter().map(|c| c.embed_key.clone()))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let embs = get_embeddings(db, ctx.model_id, &keys).await?;
+        rep.read_ms += t.elapsed().as_millis() as u64;
+        let mut pts: Vec<IndexPoint> = Vec::new();
+        let mut done: Vec<(Id, i64)> = Vec::new();
+        for e in &page {
+            if e.chunks.iter().all(|c| embs.contains_key(&c.embed_key)) {
+                pts.extend(
+                    e.chunks
+                        .iter()
+                        .map(|c| chunk_point(user, c, &embs[&c.embed_key])),
+                );
+                done.push((e.entry_id, e.rev));
+            } else {
+                misses.push(e.entry_id);
+            }
+        }
+        let n = pts.len() as u64;
+        let t = Instant::now();
+        write_points(ctx.vector, pts).await?;
+        rep.write_ms += t.elapsed().as_millis() as u64;
+        rep.points += n;
+        rep.entries += done.len() as u64;
+        finish_entries_reindexed(db, done).await?;
+        if page.len() < PAGE_NOTES {
+            break;
+        }
+    }
+    rep.misses += misses.len() as u64;
+    rep.jobs += enqueue_entry_upserts(db, misses).await?;
     Ok(())
 }
 

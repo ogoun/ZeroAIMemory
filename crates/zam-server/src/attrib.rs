@@ -5,6 +5,8 @@
 //!   владельца общего решения, §11.6); у администратора — нет;
 //! - `X-Zam-Session`, `X-Zam-Machine` — до 128 символов UTF-8 без управляющих,
 //!   иначе 400; пустое значение равно отсутствию заголовка;
+//! - `X-Zam-Area` (§11.2) — область по умолчанию для новых узлов и записей журналов, те же
+//!   правила;
 //! - `message` — из тела запроса.
 use axum::http::HeaderMap;
 use zam_store::{Attribution, AuthorKind};
@@ -16,6 +18,8 @@ use crate::error::ApiError;
 pub const SESSION_HEADER: &str = "x-zam-session";
 /// Заголовок имени машины.
 pub const MACHINE_HEADER: &str = "x-zam-machine";
+/// Заголовок текущей области (монорепозиторий, §11.2).
+pub const AREA_HEADER: &str = "x-zam-area";
 /// Предел длины значений заголовков атрибуции, символов.
 pub const ATTRIB_MAX_CHARS: usize = 128;
 /// Предел длины сообщения ревизии, символов.
@@ -47,6 +51,7 @@ pub fn attribution(
         machine: header_value(headers, MACHINE_HEADER)?,
         message,
         user_id,
+        area: header_value(headers, AREA_HEADER)?,
     })
 }
 
@@ -92,14 +97,20 @@ mod tests {
         assert_eq!(a.machine.as_deref(), Some("box"));
         assert_eq!(a.session_id.as_deref(), Some("сессия"));
         assert_eq!(a.message.as_deref(), Some("m"));
+        assert_eq!(a.area, None);
+        h.insert(AREA_HEADER, HeaderValue::from_static(" services/parser "));
+        let a = attribution(&admin(), &h, None).unwrap();
+        assert_eq!(a.area.as_deref(), Some("services/parser"));
     }
 
     #[test]
     fn bad_headers_rejected() {
         for bad in ["a\tb".to_string(), "x".repeat(129)] {
-            let mut h = HeaderMap::new();
-            h.insert(MACHINE_HEADER, HeaderValue::from_str(&bad).unwrap());
-            assert!(attribution(&admin(), &h, None).is_err(), "{bad}");
+            for name in [MACHINE_HEADER, AREA_HEADER] {
+                let mut h = HeaderMap::new();
+                h.insert(name, HeaderValue::from_str(&bad).unwrap());
+                assert!(attribution(&admin(), &h, None).is_err(), "{name}: {bad}");
+            }
         }
         let mut h = HeaderMap::new();
         h.insert(
