@@ -180,10 +180,41 @@ async fn graph_api_and_backlinks() {
         .await
         .json();
     assert_eq!(srcs(&j), vec![format!("n:{b_id}")]);
+    // исходящие связи записи: явное ребро insight → заметка
+    let r = edge(
+        &a,
+        &tok,
+        &format!("e:{ins_id}"),
+        "relates_to",
+        &format!("node:{a_id}"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = get(&a, &tok, &format!("/api/v1/entries/{ins_id}/links")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["items"].as_array().unwrap().len(), 1, "{j}");
+    assert_eq!(j["items"][0]["src"], format!("e:{ins_id}"));
+    assert_eq!(j["items"][0]["dst"], format!("n:{a_id}"));
+    assert_eq!(j["nodes"][0]["path"], "a");
+    assert_eq!(
+        get(
+            &a,
+            &tok,
+            &format!("/api/v1/entries/{}/links", zam_core::Id::new())
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
     let r = get(&a, &tok, &format!("/api/v1/graph?entry={ins_id}")).await;
     assert_eq!(
         graph_refs(&r.json()),
-        sorted(vec![format!("e:{ins_id}"), format!("n:{b_id}")])
+        sorted(vec![
+            format!("e:{ins_id}"),
+            format!("n:{a_id}"),
+            format!("n:{b_id}")
+        ])
     );
 
     // Human не виден токену ни узлом, ни соседом, ни обратной ссылкой

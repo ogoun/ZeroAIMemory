@@ -10,8 +10,9 @@
 //!   409; цель не найдена — 404 (`[[Имя]]` — 422);
 //! - `DELETE /edges/{id}` → 204; удаляются только `explicit` (выведенные и системные — 422);
 //! - `GET /nodes/{id}/backlinks`, `GET /entries/{id}/backlinks` → `{items, nodes}`: рёбра в
-//!   цель от живых источников и узлы-источники; `GET /nodes/{id}/links` → `{items, nodes}`:
-//!   исходящие рёбра, в том числе неразрешённые ссылки (`dst: null`, ключ в `dst_raw`).
+//!   цель от живых источников и узлы-источники; `GET /nodes/{id}/links`,
+//!   `GET /entries/{id}/links` → `{items, nodes}`: исходящие рёбра, в том числе неразрешённые
+//!   ссылки (`dst: null`, ключ в `dst_raw`).
 //!
 //! **Область.** Узел, запись и ребро ищутся по правилам `scope` (Human по токену — 404;
 //! участник общего решения — только пространство решения в базе владельца). Видимость графа —
@@ -444,8 +445,32 @@ pub async fn node_links(
         kind: TargetKind::Node,
         id: super::parse_id(&id)?,
     };
-    let t = live_target(&st, &p, &headers, r, Mode::Read).await?;
-    let spaces = graph_spaces(&p, &t.db, &t.space, t.role).await?;
+    links_of(&st, &p, &headers, r).await
+}
+
+/// `GET /entries/{id}/links` — исходящие связи записи журнала.
+pub async fn entry_links(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let r = TargetRef {
+        kind: TargetKind::Entry,
+        id: super::parse_id(&id)?,
+    };
+    links_of(&st, &p, &headers, r).await
+}
+
+/// Исходящие рёбра цели в видимых принципалу пространствах.
+async fn links_of(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    r: TargetRef,
+) -> Result<Json<Value>, ApiError> {
+    let t = live_target(st, p, headers, r, Mode::Read).await?;
+    let spaces = graph_spaces(p, &t.db, &t.space, t.role).await?;
     let items = t.db.outgoing(t.r, &spaces).await?;
     edges_reply(&t.db, items, |e| e.dst).await
 }

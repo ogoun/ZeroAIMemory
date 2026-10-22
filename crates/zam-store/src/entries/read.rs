@@ -37,8 +37,9 @@ fn json_list<T>(v: &[T], f: impl Fn(&T) -> &'static str) -> Option<String> {
 /// Лента живых записей пространства: новые первыми (`created_at`, затем id по убыванию),
 /// не больше `limit` (1..=200, иначе `BadInput`). Вторым значением — курсор следующей
 /// страницы (`None` — страниц больше нет); некорректный курсор → `BadInput`. Фильтры:
-/// вид, статусы (пусто — любые), `certainty` (пусто — любые), область, тег, интервал
-/// `created_at` `[since, until)`.
+/// вид, статусы (пусто — любые), `certainty` (пусто — любые), область, тег, `data.kind`
+/// (`json_extract(data, '$.kind')`), интервал `created_at` `[since, until)`. Фильтры
+/// применяются в SQL до `LIMIT`, поэтому курсор не теряет записей между страницами.
 pub async fn list_entries(
     db: &Db,
     f: EntryFilter,
@@ -68,6 +69,7 @@ pub async fn list_entries(
                AND (?7 IS NULL OR e.created_at >= ?7)
                AND (?8 IS NULL OR e.created_at < ?8)
                AND (?9 IS NULL OR e.created_at < ?9 OR (e.created_at = ?9 AND e.id < ?10))
+               AND (?12 IS NULL OR json_extract(e.data, '$.kind') = ?12)
              ORDER BY e.created_at DESC, e.id DESC
              LIMIT ?11"
         ))?;
@@ -84,6 +86,7 @@ pub async fn list_entries(
                 c_ts,
                 c_id,
                 (limit + 1) as i64,
+                f.data_kind,
             ],
             entry_row,
         )?;

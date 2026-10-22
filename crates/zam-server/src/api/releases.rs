@@ -89,6 +89,7 @@ pub async fn compare(
                 certainty: Vec::new(),
                 area: None,
                 tag: None,
+                data_kind: None,
                 since: None,
                 until: Some(to.created_at),
                 cursor: None,

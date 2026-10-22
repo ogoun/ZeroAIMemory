@@ -253,6 +253,8 @@ pub struct EntryFilter {
     pub certainty: Vec<Certainty>,
     pub area: Option<String>,
     pub tag: Option<String>,
+    /// `data.kind` записи (вид changelog или insight); `None` — любой.
+    pub data_kind: Option<String>,
     /// `created_at >= since`.
     pub since: Option<Timestamp>,
     /// `created_at < until`.

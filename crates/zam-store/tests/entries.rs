@@ -794,6 +794,7 @@ async fn deleted_entry_not_in_fts_restore_returns() {
         certainty: Vec::new(),
         area: None,
         tag: None,
+        data_kind: None,
         since: None,
         until: None,
         cursor: None,
@@ -839,6 +840,9 @@ async fn list_entries_cursor_and_filters() {
             Vec::new()
         };
         n.area = (i < 2).then(|| "core".to_string());
+        if i % 2 == 0 {
+            n.data = json!({"kind": "feat"});
+        }
         ids.push(create_entry(&db, n, &agent()).await.unwrap().0.id);
     }
     let (ins, _) = create_entry(&db, insight(k, "инсайт", "b"), &agent())
@@ -860,6 +864,7 @@ async fn list_entries_cursor_and_filters() {
         certainty: Vec::new(),
         area: None,
         tag: None,
+        data_kind: None,
         since: None,
         until: None,
         cursor: None,
@@ -929,6 +934,27 @@ async fn list_entries_cursor_and_filters() {
         ..base.clone()
     };
     assert_eq!(list_entries(&db, f).await.unwrap().0.len(), 3);
+    // data.kind: фильтр в SQL до LIMIT — курсор переходит границу страницы без потерь
+    let mut f = EntryFilter {
+        data_kind: Some("feat".into()),
+        limit: 2,
+        ..base.clone()
+    };
+    let (p1, next) = list_entries(&db, f.clone()).await.unwrap();
+    assert_eq!(
+        p1.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![ids[4], ids[2]]
+    );
+    f.cursor = Some(next.expect("вторая страница"));
+    let (p2, next) = list_entries(&db, f).await.unwrap();
+    assert_eq!(p2.iter().map(|e| e.id).collect::<Vec<_>>(), vec![ids[0]]);
+    assert!(next.is_none());
+    let f = EntryFilter {
+        data_kind: Some("gotcha".into()),
+        limit: 200,
+        ..base.clone()
+    };
+    assert_eq!(list_entries(&db, f).await.unwrap().0.len(), 2);
     // интервал времени
     let all = list_entries(
         &db,

@@ -138,6 +138,7 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
             "/api/v1/entries/{id}/backlinks",
             get(graph::entry_backlinks),
         )
+        .route("/api/v1/entries/{id}/links", get(graph::entry_links))
         .route(
             "/api/v1/spaces/{space}/vault",
             get(vault::list).post(vault::create),

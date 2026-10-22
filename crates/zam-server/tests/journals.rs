@@ -256,6 +256,50 @@ async fn changelog_crud_idempotency_and_revisions() {
 }
 
 #[tokio::test]
+async fn feed_filters_by_data_kind_across_pages() {
+    let w = world("datakind", None).await;
+    // feat, fix, feat, fix, feat — новые первыми: feat5, fix4, feat3, fix2, feat1
+    let mut feats = Vec::new();
+    for i in 1..=5 {
+        let kind = if i % 2 == 1 { "feat" } else { "fix" };
+        let e = w.changelog(kind, &format!("{kind} {i}")).await;
+        if kind == "feat" {
+            feats.push(id_of(&e));
+        }
+    }
+    feats.reverse();
+    // страница из двух записей: третья feat — на второй странице, без пропусков
+    let base = format!("/api/v1/spaces/{G}/entries?kind=changelog&data_kind=feat&limit=2");
+    let r = w.get(&w.a_tok, &base).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let p1 = r.json();
+    let mut got: Vec<String> = p1["items"].as_array().unwrap().iter().map(id_of).collect();
+    let cursor = p1["next_cursor"].as_str().expect("курсор").to_string();
+    let r = w
+        .get(
+            &w.a_tok,
+            &format!(
+                "{base}&cursor={}",
+                cursor.replace('|', "%7C").replace(':', "%3A")
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let p2 = r.json();
+    got.extend(p2["items"].as_array().unwrap().iter().map(id_of));
+    assert!(p2["next_cursor"].is_null());
+    assert_eq!(got, feats);
+    // неизвестный вид — 400
+    let r = w
+        .get(
+            &w.a_tok,
+            &format!("/api/v1/spaces/{G}/entries?data_kind=oops"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn changelog_kind_validated_422() {
     let w = world("kind", None).await;
     for data in [

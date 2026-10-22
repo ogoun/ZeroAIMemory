@@ -1,6 +1,8 @@
 //! Записи журналов решения (§7.2–7.5, §12): Changelog, Releases и общие операции записей.
 //!
-//! - `GET/POST /spaces/{space}/entries` — лента и создание (`Idempotency-Key`: 201, повтор —
+//! - `GET/POST /spaces/{space}/entries` — лента (фильтры `kind`, `status`, `certainty`,
+//!   `area`, `tag`, `data_kind` — вид changelog или insight из `data.kind`, `since`, `until`;
+//!   курсор `cursor`, `limit`) и создание (`Idempotency-Key`: 201, повтор —
 //!   200; ключ действует в границах автора, расхождение запроса → 422
 //!   `/problems/idempotency-mismatch`, ключ удалённой записи → 409);
 //! - `GET/PATCH/DELETE /entries/{id}` (`If-Match: <rev>` необязателен, расхождение → 409),
@@ -323,10 +325,28 @@ pub struct ListQuery {
     certainty: Option<String>,
     area: Option<String>,
     tag: Option<String>,
+    /// `data.kind`: вид changelog ([`CHANGELOG_KINDS`]) или insight
+    /// ([`super::insights::INSIGHT_KINDS`]).
+    data_kind: Option<String>,
     since: Option<String>,
     until: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
+}
+
+/// `data_kind` ленты: пусто — без фильтра, иначе один из видов changelog или insight (400).
+fn parse_data_kind(raw: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(k) = raw.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) else {
+        return Ok(None);
+    };
+    if CHANGELOG_KINDS.contains(&k.as_str()) || super::insights::INSIGHT_KINDS.contains(&k.as_str())
+    {
+        Ok(Some(k))
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "data_kind: неизвестное значение «{k}»"
+        )))
+    }
 }
 
 /// Список значений через запятую → перечисление; неизвестное → 400.
@@ -382,6 +402,7 @@ pub async fn list(
         certainty: parse_list(q.certainty.as_deref(), "certainty", Certainty::parse)?,
         area: q.area.filter(|a| !a.is_empty()),
         tag: q.tag.filter(|a| !a.is_empty()),
+        data_kind: parse_data_kind(q.data_kind)?,
         since: q
             .since
             .as_deref()
