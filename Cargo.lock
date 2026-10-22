@@ -6147,11 +6147,13 @@ dependencies = [
  "mime_guess",
  "proptest",
  "pulldown-cmark",
+ "regex",
  "serde",
  "serde_json",
  "syntect",
  "thiserror 2.0.21",
  "unicode-segmentation",
+ "zam-core",
 ]
 
 [[package]]

@@ -16,6 +16,7 @@ mod patch;
 mod pos;
 mod render;
 mod sanitize;
+mod secrets;
 mod sentences;
 
 pub use chunk::{ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, TokenCounter, chunk_note};
@@ -33,4 +34,5 @@ pub use render::{
     LinkResolution, NoResolve, RENDER_VERSION, Rendered, Resolver, attachment_ref, render_html,
 };
 pub use sanitize::sanitize_html;
+pub use secrets::{SECRET_MARK, SecretHit, SecretKind, mask_secrets, mask_text, scan_secrets};
 pub use sentences::split_sentences;

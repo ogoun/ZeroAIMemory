@@ -448,6 +448,7 @@ pub async fn create(
             .await?;
         }
         let mut v = entry_json(&sc.db, &n).await?;
+        super::secrets::attach_entry(&mut v, &n);
         v["superseded"] =
             serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
         v["dedup"] = json!(DedupMode::Skipped.as_str());
@@ -483,6 +484,7 @@ pub async fn create(
         st.index.notify();
     }
     let mut v = entry_json(&sc.db, &e).await?;
+    super::secrets::attach_entry(&mut v, &e);
     v["dedup"] = json!(mode.as_str());
     let status = if created {
         StatusCode::CREATED
@@ -555,10 +557,12 @@ pub async fn supersede(
     } else {
         StatusCode::CREATED
     };
+    let mut entry = entry_json(&sc.db, &n).await?;
+    super::secrets::attach_entry(&mut entry, &n);
     Ok((
         status,
         Json(json!({
-            "entry": entry_json(&sc.db, &n).await?,
+            "entry": entry,
             "superseded": entry_json(&sc.db, &o).await?,
         })),
     ))

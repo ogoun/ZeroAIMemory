@@ -34,7 +34,7 @@ use crate::time::{conv_err, ts_at, ts_opt};
 
 pub(crate) use chunks::{
     backfill_certainty, backfill_embed_keys, chunk_id, context_prefix, frontmatter_tags,
-    note_chunks, rechunk_notes, token_counter,
+    note_chunks, rechunk_notes, rescan_secrets, token_counter,
 };
 pub use chunks::{
     chunk_params, count_tokens, set_chunk_params, set_token_counter, token_counter_exact,

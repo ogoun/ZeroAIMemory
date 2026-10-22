@@ -309,7 +309,9 @@ pub async fn create(
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(json!(entry))))
+    let mut v = json!(entry);
+    super::secrets::attach_entry(&mut v, &entry);
+    Ok((status, Json(v)))
 }
 
 #[derive(Deserialize)]
@@ -531,7 +533,9 @@ pub async fn patch(
     if e.rev != before {
         st.index.notify();
     }
-    Ok(Json(entry_json(&sc.db, &e).await?))
+    let mut v = entry_json(&sc.db, &e).await?;
+    super::secrets::attach_entry(&mut v, &e);
+    Ok(Json(v))
 }
 
 /// Детали аудита операций записи (без текста записи).

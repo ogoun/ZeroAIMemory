@@ -11,6 +11,7 @@ pub mod releases;
 pub mod render;
 pub mod scope;
 pub mod search;
+pub mod secrets;
 pub mod solutions;
 pub mod spaces;
 pub mod triggers;

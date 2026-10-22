@@ -5,7 +5,8 @@
 //! `certainty_not_recognized` — во frontmatter ключ `certainty`/`evidence` в нераспознаваемом
 //! написании (в кавычках, с заглавными буквами): такой ключ статус не задаёт (§7.5);
 //! `unknown relation type: <тип>` и `invalid relation: <строка>` — строка `relations:`, не
-//! давшая ребра графа (§8.5).
+//! давшая ребра графа (§8.5); `secrets_detected` (+ `secrets_detected: [{kind, line}]`) — в тексте
+//! найдены секреты, в индекс они уходят замаскированными (§7.6, [`crate::api::secrets`]).
 //!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
@@ -74,6 +75,7 @@ fn node_reply(node: &Node, content: &str) -> Result<Value, ApiError> {
     {
         o.insert("warnings".into(), json!(w));
     }
+    crate::api::secrets::attach(&mut v, content);
     Ok(v)
 }
 

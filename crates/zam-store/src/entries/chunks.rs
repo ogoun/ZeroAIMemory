@@ -12,7 +12,7 @@
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::{Id, TargetKind, TargetRef};
-use zam_markdown::parse;
+use zam_markdown::{parse, scan_secrets};
 
 use super::{EntryKind, data_kind};
 use crate::embeddings::embed_key_of;
@@ -405,4 +405,52 @@ pub(crate) async fn rechunk_entries(
         }
     }
     Ok(upserts)
+}
+
+/// Разовая перенарезка записей с секретами (миграция на сканер §7.6): живые записи, чей
+/// документ `# <title>\n\n<body>` содержит секреты, пересобирают чанки из замаскированного
+/// текста и получают `upsert` с приоритетом `priority`. Записи без секретов не трогаются.
+/// Пакетами по [`RECHUNK_BATCH`]; идемпотентно. Возвращает число перенарезанных записей.
+pub(crate) async fn rescan_entry_secrets(db: &Db, priority: i64) -> Result<u64, StoreError> {
+    let (mut total, mut after) = (0u64, None::<Id>);
+    loop {
+        let cursor = after;
+        let (n, found, last) = db
+            .write(move |tx| {
+                let now = fmt_ts(Timestamp::now());
+                let batch: Vec<(Id, IndexState, String, String)> = {
+                    let mut st = tx.prepare_cached(
+                        "SELECT id, index_state, title, body FROM entries
+                         WHERE deleted_at IS NULL AND (?1 IS NULL OR id > ?1)
+                         ORDER BY id LIMIT ?2",
+                    )?;
+                    st.query_map(params![cursor, RECHUNK_BATCH], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?
+                    .collect::<Result<_, _>>()?
+                };
+                let mut found = 0u64;
+                for (id, prev, title, body) in &batch {
+                    if scan_secrets(&entry_doc(title, body)).is_empty() {
+                        continue;
+                    }
+                    found += 1;
+                    index_entry(tx, *id, Some(*prev), priority, &now)?;
+                }
+                Ok((batch.len() as i64, found, batch.last().map(|b| b.0)))
+            })
+            .await?;
+        total += found;
+        match last {
+            Some(l) if n == RECHUNK_BATCH => after = Some(l),
+            _ => break,
+        }
+    }
+    if total > 0 {
+        tracing::info!(
+            entries = total,
+            "секреты записей: чанки перенарезаны без значений"
+        );
+    }
+    Ok(total)
 }

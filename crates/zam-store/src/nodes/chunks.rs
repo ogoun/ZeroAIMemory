@@ -8,6 +8,11 @@
 //! с заголовком или именем, чтобы она находилась поиском по названию.
 //! В FTS попадают только `chunk` и `note` (условие в триггерах миграции 0004).
 //!
+//! Сканер секретов (§7.6): нарезка идёт по тексту с замаскированными секретами
+//! (`zam_markdown::scan_secrets`, значение → `‹secret›`), поэтому значения не попадают ни в
+//! `chunks.text` (FTS), ни в эмбеддинги и Qdrant; ревизии и чтение заметки остаются
+//! исходными. Автоматический L0 тоже маскируется.
+//!
 //! После пересборки чанков ставится задание outbox (в той же транзакции):
 //! индексируемая заметка → `upsert`; Human и `index: false` → без задания
 //! (`index_state = 'excluded'`), но заметка, бывшая индексируемой, получает `delete`.
@@ -18,7 +23,8 @@ use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::{
-    ApproxCounter, ChunkLevel, ChunkParams, Doc, TokenCounter, chunk_note, first_paragraph, parse,
+    ApproxCounter, ChunkLevel, ChunkParams, Doc, TokenCounter, chunk_note, first_paragraph,
+    mask_secrets, mask_text, parse, scan_secrets,
 };
 
 use super::{hex, revision_text};
@@ -153,6 +159,8 @@ pub(crate) fn note_meta(content: &str, agent_l0: Option<&str>) -> NoteMeta {
     } else {
         (None, None)
     };
+    // L0 попадает в payload индекса и выдачу: значения секретов в нём не нужны
+    let l0 = l0.map(|s| mask_text(&s));
     let index = fm.and_then(|f| f.index) != Some(false);
     let certainty_raw = fm.and_then(|f| f.certainty.clone());
     let evidence = crate::certainty::Evidence::from_note(fm.and_then(|f| f.evidence.as_deref()));
@@ -226,6 +234,18 @@ pub(crate) fn note_chunks(
     name: &str,
     tc: &dyn TokenCounter,
 ) -> Vec<ChunkRow> {
+    // секреты маскируются до нарезки: границы чанков и заголовки считаются по тексту
+    // без значений (индексируется только он); без секретов — обычный путь без повторного разбора
+    let hits = scan_secrets(src);
+    let masked_src;
+    let masked_doc;
+    let (src, doc) = if hits.is_empty() {
+        (src, doc)
+    } else {
+        masked_src = mask_secrets(src, &hits);
+        masked_doc = parse(&masked_src);
+        (masked_src.as_str(), &masked_doc)
+    };
     let drafts = chunk_note(src, doc, &chunk_params(), tc);
     let has_leaf = drafts.iter().any(|d| d.level == ChunkLevel::Chunk);
     let mut out: Vec<ChunkRow> = Vec::with_capacity(drafts.len() + 1);
@@ -550,6 +570,74 @@ pub(crate) fn index_note(
     crate::graph::rebuild_derived(c, node_id, &meta.doc, now)?;
     enqueue_for_note(c, node_id, rev, prev_state, PRIORITY_WRITE, now)?;
     Ok(())
+}
+
+/// Разовая перенарезка заметок с секретами (миграция на сканер §7.6).
+///
+/// До задачи 11 M3 значения секретов попадали в `chunks.text` (и FTS) и, после индексации, в
+/// эмбеддинги и Qdrant. Для каждой живой заметки, текущий текст которой (или L0) содержит
+/// секреты, чанки пересобираются из замаскированного текста, L0 маскируется, ставится
+/// `upsert` с приоритетом `priority` (кэш эмбеддингов ключуется по тексту: новый текст — новый
+/// ключ, старый вектор со значением остаётся в `embeddings` неиспользуемым до очистки кэша).
+/// Заметки без секретов не трогаются. Пакетами по [`RECHUNK_BATCH`] заметок; идемпотентно.
+/// Возвращает число перенарезанных заметок. В лог — только счётчики.
+pub(crate) async fn rescan_secrets(db: &Db, priority: i64) -> Result<u64, StoreError> {
+    let (mut total, mut after) = (0u64, None::<Id>);
+    loop {
+        let cursor = after;
+        let (n, found, last) = db
+            .write(move |tx| {
+                let now = fmt_ts(Timestamp::now());
+                let batch: Vec<(Id, i64, String, Option<String>)> = {
+                    let mut st = tx.prepare_cached(
+                        "SELECT id, current_rev, index_state, l0 FROM nodes
+                         WHERE kind = 'note' AND deleted_at IS NULL
+                           AND (?1 IS NULL OR id > ?1)
+                         ORDER BY id LIMIT ?2",
+                    )?;
+                    st.query_map(params![cursor, RECHUNK_BATCH], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?
+                    .collect::<Result<_, _>>()?
+                };
+                let mut found = 0u64;
+                for (id, rev, state, l0) in &batch {
+                    let content = revision_text(tx, *id, *rev)?;
+                    let text_hit = !scan_secrets(&content).is_empty();
+                    let masked_l0 = l0
+                        .as_deref()
+                        .map(mask_text)
+                        .filter(|m| Some(m.as_str()) != l0.as_deref());
+                    if !text_hit && masked_l0.is_none() {
+                        continue;
+                    }
+                    found += 1;
+                    if let Some(m) = masked_l0 {
+                        tx.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
+                            .execute(params![id, m])?;
+                    }
+                    if text_hit {
+                        let meta = note_meta(&content, None);
+                        rebuild_chunks(tx, *id, *rev, &content, &meta)?;
+                    }
+                    enqueue_for_note(tx, *id, *rev, Some(state), priority, &now)?;
+                }
+                Ok((batch.len() as i64, found, batch.last().map(|b| b.0)))
+            })
+            .await?;
+        total += found;
+        match last {
+            Some(l) if n == RECHUNK_BATCH => after = Some(l),
+            _ => break,
+        }
+    }
+    if total > 0 {
+        tracing::info!(
+            notes = total,
+            "секреты заметок: чанки перенарезаны без значений"
+        );
+    }
+    Ok(total)
 }
 
 /// Заметок в одной транзакции перечанковки: писатель не занят надолго.

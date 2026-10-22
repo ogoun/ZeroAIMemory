@@ -36,7 +36,7 @@ pub use chunks::{
     ReindexEntry, enqueue_entry_upserts, entry_chunks_for_index, finish_entries_reindexed,
     reindex_entries_page,
 };
-pub(crate) use chunks::{rechunk_entries, set_entry_state};
+pub(crate) use chunks::{rechunk_entries, rescan_entry_secrets, set_entry_state};
 pub use read::{
     CHANGELOG_BETWEEN_MAX, DEDUP_CANDIDATES_MAX, DedupCandidate, changelog_between,
     entry_revisions, find_release_by_version, get_entry, list_entries, title_duplicates,

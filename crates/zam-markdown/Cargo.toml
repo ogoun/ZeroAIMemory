@@ -10,6 +10,7 @@ rust-version.workspace = true
 ammonia.workspace = true
 comrak.workspace = true
 mime_guess.workspace = true
+regex.workspace = true
 serde.workspace = true
 syntect.workspace = true
 thiserror.workspace = true
@@ -19,3 +20,4 @@ unicode-segmentation.workspace = true
 serde_json.workspace = true
 proptest.workspace = true
 pulldown-cmark.workspace = true
+zam-core = { path = "../zam-core" }

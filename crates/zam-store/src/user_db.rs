@@ -175,13 +175,14 @@ impl UserDbs {
             _ => None,
         };
         let edges = crate::graph::backfill_pending(&db).await?;
-        let (done, rechunked) = watch::channel(pending.is_none() && !edges);
+        let secrets = secrets_scan_pending(&db).await?;
+        let (done, rechunked) = watch::channel(pending.is_none() && !edges && !secrets);
         *cell = Some(OpenDb {
             db: db.clone(),
             rechunked,
         });
         drop(cell);
-        if pending.is_some() || edges {
+        if pending.is_some() || edges || secrets {
             let bg = db.clone();
             tokio::spawn(async move {
                 if let Some(why) = pending
@@ -192,6 +193,10 @@ impl UserDbs {
                 }
                 if edges && let Err(e) = crate::graph::backfill_edges(&bg).await {
                     tracing::warn!(error = %e, "дозаполнение рёбер графа прервано");
+                }
+                if secrets && let Err(e) = rescan_secrets(&bg).await {
+                    // повторится при следующем открытии базы
+                    tracing::warn!(error = %e, "перенарезка заметок и записей с секретами прервана");
                 }
                 let _ = done.send(true);
             });
@@ -229,6 +234,53 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
         Ok(())
     })
     .await
+}
+
+/// Ключ `meta`: разовая перенарезка заметок и записей со значениями секретов (сканер §7.6,
+/// задача 11 M3) выполнена. Отсутствует у баз, открытых до сканера; у новой пустой базы
+/// ставится сразу (все её записи нарезаются уже замаскированными).
+const SECRETS_SCANNED: &str = "secrets_scanned_v1";
+
+/// Нужна ли перенарезка секретов: ключа нет и в базе есть живые заметки или записи.
+/// В пустой базе ключ ставится сразу.
+async fn secrets_scan_pending(db: &Db) -> Result<bool, StoreError> {
+    db.write(|tx| {
+        if has_meta(tx, SECRETS_SCANNED)? {
+            return Ok(false);
+        }
+        let any: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM entries WHERE deleted_at IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !any {
+            tx.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
+                [SECRETS_SCANNED],
+            )?;
+        }
+        Ok(any)
+    })
+    .await
+}
+
+/// Перенарезка живых заметок и записей, в которых сканер находит секреты: значения из версий
+/// до сканера остаются в `chunks`/FTS и Qdrant, пока текст не перенарезан (нарушение инварианта
+/// «значения не в FTS/Qdrant»). Флаг ставится после успеха; прерванная работа повторится.
+async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
+    let notes = crate::nodes::rescan_secrets(db, PRIORITY_REINDEX).await?;
+    let entries = crate::entries::rescan_entry_secrets(db, PRIORITY_REINDEX).await?;
+    db.write(|tx| {
+        tx.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
+            [SECRETS_SCANNED],
+        )?;
+        Ok(())
+    })
+    .await?;
+    tracing::info!(notes, entries, "перенарезка секретов базы завершена");
+    Ok(())
 }
 
 /// Ключ `meta`: разовая перечанковка после миграции 0004 ещё не выполнена.
