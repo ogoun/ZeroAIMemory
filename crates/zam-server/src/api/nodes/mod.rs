@@ -18,7 +18,7 @@ use crate::auth::{Client, Principal};
 use crate::error::ApiError;
 
 /// Актор аудита: `admin` (сессия WebUI) или id токена.
-fn actor(p: &Principal) -> String {
+pub(crate) fn actor(p: &Principal) -> String {
     match p {
         Principal::Token(t) => t.token_id.to_string(),
         Principal::Admin { .. } => "admin".into(),
@@ -28,7 +28,7 @@ fn actor(p: &Principal) -> String {
 /// Запись аудита операции над узлом; `details` — без текста заметки. `user` — кто
 /// действует; узел в базе другого владельца (общее решение) — `details.owner`.
 #[allow(clippy::too_many_arguments)]
-async fn audit_node(
+pub(crate) async fn audit_node(
     st: &AppState,
     p: &Principal,
     client: &Client,

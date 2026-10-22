@@ -38,6 +38,9 @@ pub enum ApiError {
     PreconditionRequired,
     #[error("{0}")]
     Unprocessable(String),
+    /// 422 `/problems/idempotency-mismatch`: ключ повторён с другим запросом.
+    #[error("{0}")]
+    IdempotencyMismatch(String),
     #[error("слишком много запросов")]
     RateLimited { retry_after_s: u64 },
     #[error("{0}")]
@@ -85,6 +88,11 @@ impl ApiError {
                 "/problems/unprocessable",
                 "Unprocessable Content",
             ),
+            ApiError::IdempotencyMismatch(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "/problems/idempotency-mismatch",
+                "Unprocessable Content",
+            ),
             ApiError::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "/problems/rate-limited",
@@ -120,6 +128,7 @@ impl From<StoreError> for ApiError {
             StoreError::NotFound => ApiError::NotFound,
             StoreError::Conflict(m) => ApiError::conflict(m),
             StoreError::BadInput(m) => ApiError::BadRequest(m),
+            StoreError::IdempotencyMismatch(m) => ApiError::IdempotencyMismatch(m),
             other => ApiError::Internal(other.to_string()),
         }
     }

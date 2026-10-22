@@ -11,7 +11,8 @@
 //! - `Id` пространства — в личной базе, иначе только `space_id` решения из реестра;
 //! - узел по id ([`node_scope`]) — в личной базе, затем в базах владельцев решений, где у
 //!   пользователя есть запрос доступа; узел принимается, только если он в пространстве
-//!   решения (иначе 404: Rules, Human, Knowledge владельца участнику не видны).
+//!   решения (иначе 404: Rules, Human, Knowledge владельца участнику не видны);
+//! - запись журнала по id ([`entry_scope`]) — то же правило, что у узла.
 //!
 //! **Политика:**
 //! - `Human` по токену → 404 (существование не раскрывается) — для чтения и записи;
@@ -26,8 +27,8 @@
 use axum::http::HeaderMap;
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Access, Db, Node, SolutionInfo, SolutionRole, Space, SpaceKind, StoreError, User, get_node,
-    get_solution, get_space, list_spaces, space_of_kind,
+    Access, Db, Entry, Node, SolutionInfo, SolutionRole, Space, SpaceKind, StoreError, User,
+    get_entry, get_node, get_solution, get_space, list_spaces, space_of_kind,
 };
 
 use crate::app::AppState;
@@ -223,6 +224,16 @@ pub struct NodeScope {
     pub db: Db,
     pub space: Space,
     pub node: Node,
+    pub role: Role,
+}
+
+/// То же плюс запись журнала (в том числе удалённая — решает обработчик).
+pub struct EntryScope {
+    pub user: User,
+    pub owner: Id,
+    pub db: Db,
+    pub space: Space,
+    pub entry: Entry,
     pub role: Role,
 }
 
@@ -437,30 +448,44 @@ pub async fn owner_db(st: &AppState, info: &SolutionInfo) -> Option<Db> {
     }
 }
 
-/// Узел по id с проверкой доступа к его пространству.
-pub async fn node_scope(
+/// Объект базы (узел, запись) в доступной принципалу области.
+struct Located<T> {
+    user: User,
+    owner: Id,
+    db: Db,
+    space: Space,
+    item: T,
+    role: Role,
+}
+
+/// Находит объект по id: сначала в личной базе пользователя, затем в базах владельцев
+/// решений, к которым у него есть запрос доступа. Чужой объект принимается, только если он
+/// в пространстве решения (иначе 404); сбой чужой базы — пропуск решения с WARN.
+/// `get` читает объект из базы, `space_of` отдаёт его пространство.
+async fn locate<T>(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
-    raw_id: &str,
+    id: Id,
     mode: Mode,
-) -> Result<NodeScope, ApiError> {
-    let id = super::parse_id(raw_id)?;
+    get: impl AsyncFn(&Db, Id) -> Result<T, StoreError>,
+    space_of: impl Fn(&T) -> Id,
+) -> Result<Located<T>, ApiError> {
     let user = target_user(st, p, headers).await?;
     let db = st.users.get(user.id).await?;
-    match get_node(&db, id).await {
-        Ok(node) => {
-            let space = get_space(&db, node.space_id)
+    match get(&db, id).await {
+        Ok(item) => {
+            let space = get_space(&db, space_of(&item))
                 .await?
                 .ok_or(ApiError::NotFound)?;
             authorize(st, p, &space, mode).await?;
-            return Ok(NodeScope {
+            return Ok(Located {
                 owner: user.id,
                 role: personal_role(p, &space),
                 user,
                 db,
                 space,
-                node,
+                item,
             });
         }
         Err(StoreError::NotFound) => {}
@@ -470,7 +495,7 @@ pub async fn node_scope(
         let Some(odb) = owner_db(st, &info).await else {
             continue;
         };
-        let node = match get_node(&odb, id).await {
+        let item = match get(&odb, id).await {
             Ok(n) => n,
             Err(StoreError::NotFound) => continue,
             Err(e) => {
@@ -478,8 +503,8 @@ pub async fn node_scope(
                 continue;
             }
         };
-        // узел владельца вне пространства решения участнику не существует
-        if node.space_id != info.space_id {
+        // объект владельца вне пространства решения участнику не существует
+        if space_of(&item) != info.space_id {
             continue;
         }
         let role = role?;
@@ -492,16 +517,76 @@ pub async fn node_scope(
             }
         };
         authorize_role(st, p, &space, role, mode).await?;
-        return Ok(NodeScope {
+        return Ok(Located {
             user,
             owner: info.owner_id,
             db,
             space,
-            node,
+            item,
             role,
         });
     }
     Err(ApiError::NotFound)
+}
+
+/// Узел по id с проверкой доступа к его пространству.
+pub async fn node_scope(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    raw_id: &str,
+    mode: Mode,
+) -> Result<NodeScope, ApiError> {
+    let id = super::parse_id(raw_id)?;
+    let l = locate(
+        st,
+        p,
+        headers,
+        id,
+        mode,
+        async |db: &Db, id| get_node(db, id).await,
+        |n: &Node| n.space_id,
+    )
+    .await?;
+    Ok(NodeScope {
+        user: l.user,
+        owner: l.owner,
+        db: l.db,
+        space: l.space,
+        node: l.item,
+        role: l.role,
+    })
+}
+
+/// Запись журнала по id с проверкой доступа к её пространству: то же правило, что у
+/// [`node_scope`] (в чужой базе — только записи пространства решения; Knowledge, Rules и
+/// Human владельца участнику не существуют).
+pub async fn entry_scope(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    raw_id: &str,
+    mode: Mode,
+) -> Result<EntryScope, ApiError> {
+    let id = super::parse_id(raw_id)?;
+    let l = locate(
+        st,
+        p,
+        headers,
+        id,
+        mode,
+        async |db: &Db, id| get_entry(db, id).await,
+        |e: &Entry| e.space_id,
+    )
+    .await?;
+    Ok(EntryScope {
+        user: l.user,
+        owner: l.owner,
+        db: l.db,
+        space: l.space,
+        entry: l.item,
+        role: l.role,
+    })
 }
 
 /// Читаемые области пользователя `user`: личная база (пространства, видимые принципалу)
@@ -540,6 +625,14 @@ pub async fn readable_areas(
         }
     }
     Ok(out)
+}
+
+/// Живая запись (удалённая → 404).
+pub fn live_entry(s: &EntryScope) -> Result<(), ApiError> {
+    match s.entry.deleted_at {
+        Some(_) => Err(ApiError::NotFound),
+        None => Ok(()),
+    }
 }
 
 /// Живой узел (удалённый → 404).

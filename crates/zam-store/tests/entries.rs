@@ -293,11 +293,12 @@ async fn create_entry_chunks_fts_and_job() {
 #[tokio::test]
 async fn idempotency_key_returns_same_entry() {
     let (db, k, h) = setup("idem").await;
+    let me = agent();
     let mut n = changelog(k, "Исправлен перенос строк");
     n.idempotency_key = Some("key-1".into());
-    let (a, created) = create_entry(&db, n.clone(), &agent()).await.unwrap();
+    let (a, created) = create_entry(&db, n.clone(), &me).await.unwrap();
     assert!(created);
-    let (b, created) = create_entry(&db, n.clone(), &agent()).await.unwrap();
+    let (b, created) = create_entry(&db, n.clone(), &me).await.unwrap();
     assert!(!created);
     assert_eq!(a.id, b.id);
     let count: i64 = db
@@ -306,12 +307,68 @@ async fn idempotency_key_returns_same_entry() {
         .unwrap();
     assert_eq!(count, 1);
     assert_eq!(entry_revisions(&db, a.id).await.unwrap().len(), 1);
-    // тот же ключ у записи другого пространства — конфликт
-    n.space_id = h;
+    // правка записи не мешает повтору исходного запроса
+    let p = EntryPatch {
+        body: Some("Другой текст.".into()),
+        ..EntryPatch::default()
+    };
+    update_entry(&db, a.id, None, p, &me).await.unwrap();
+    let (c, created) = create_entry(&db, n.clone(), &me).await.unwrap();
+    assert!(!created);
+    assert_eq!(c.id, a.id);
+    // тот же ключ при другом пространстве, заголовке, теле, данных или виде — расхождение
+    let mut other_space = n.clone();
+    other_space.space_id = h;
+    let mut other_title = n.clone();
+    other_title.title = "Иное".into();
+    let mut other_body = n.clone();
+    other_body.body = "Иное тело".into();
+    let mut other_data = n.clone();
+    other_data.data = json!({"kind": "feat"});
+    let mut other_kind = n.clone();
+    other_kind.kind = EntryKind::Release;
+    for bad in [other_space, other_title, other_body, other_data, other_kind] {
+        assert!(matches!(
+            create_entry(&db, bad, &me).await,
+            Err(StoreError::IdempotencyMismatch(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn idempotency_key_is_per_author() {
+    let (db, k, _) = setup("idem-author").await;
+    let mut n = changelog(k, "Общий заголовок");
+    n.idempotency_key = Some("same".into());
+    let (a, created_a) = create_entry(&db, n.clone(), &agent()).await.unwrap();
+    // другой автор с тем же ключом получает свою запись, а не чужую
+    let (b, created_b) = create_entry(&db, n.clone(), &agent()).await.unwrap();
+    assert!(created_a && created_b);
+    assert_ne!(a.id, b.id);
+    // и даже с другим содержимым — расхождения нет
+    n.title = "Другой".into();
+    let (c, created_c) = create_entry(&db, n, &agent()).await.unwrap();
+    assert!(created_c);
+    assert_ne!(c.id, b.id);
+}
+
+#[tokio::test]
+async fn idempotency_key_of_deleted_entry_conflicts() {
+    let (db, k, _) = setup("idem-deleted").await;
+    let me = agent();
+    let mut n = changelog(k, "Удаляемая");
+    n.idempotency_key = Some("del-1".into());
+    let (a, _) = create_entry(&db, n.clone(), &me).await.unwrap();
+    delete_entry(&db, a.id, &me).await.unwrap();
     assert!(matches!(
-        create_entry(&db, n, &agent()).await,
+        create_entry(&db, n.clone(), &me).await,
         Err(StoreError::Conflict(_))
     ));
+    // после восстановления повтор снова возвращает запись
+    restore_entry(&db, a.id, &me).await.unwrap();
+    let (b, created) = create_entry(&db, n, &me).await.unwrap();
+    assert!(!created);
+    assert_eq!(b.id, a.id);
 }
 
 #[tokio::test]
@@ -511,7 +568,8 @@ async fn supersede_marks_old_links_new_one_tx() {
         "Параметры были неверны.",
     );
     new.idempotency_key = Some("sup-1".into());
-    let (n, o) = supersede_entry(&db, old.id, new.clone(), &agent())
+    let me = agent();
+    let (n, o) = supersede_entry(&db, old.id, new.clone(), &me)
         .await
         .unwrap();
     assert_eq!(n.supersedes_id, Some(old.id));
@@ -547,7 +605,7 @@ async fn supersede_marks_old_links_new_one_tx() {
     want.sort();
     assert_eq!(all, want);
     // повтор с тем же ключом — та же пара
-    let (n2, o2) = supersede_entry(&db, old.id, new.clone(), &agent())
+    let (n2, o2) = supersede_entry(&db, old.id, new.clone(), &me)
         .await
         .unwrap();
     assert_eq!((n2.id, o2.id), (n.id, old.id));

@@ -1,6 +1,6 @@
 //! Чтение записей журналов: запись по id, лента пространства с курсором, ревизии.
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use zam_core::Id;
 
 use super::{
@@ -129,6 +129,53 @@ pub async fn entry_revisions(db: &Db, id: Id) -> Result<Vec<EntryRevision>, Stor
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// Предел выдачи [`changelog_between`].
+pub const CHANGELOG_BETWEEN_MAX: usize = 10_000;
+
+/// Живые записи changelog пространства с `created_at` в `(after, upto]` по возрастанию
+/// времени (`after = None` — с начала журнала); не больше [`CHANGELOG_BETWEEN_MAX`].
+pub async fn changelog_between(
+    db: &Db,
+    space_id: Id,
+    after: Option<jiff::Timestamp>,
+    upto: jiff::Timestamp,
+) -> Result<Vec<Entry>, StoreError> {
+    let after = after.map(fmt_ts);
+    let upto = fmt_ts(upto);
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {ENTRY_COLS} FROM entries e
+             WHERE e.space_id = ?1 AND e.kind = 'changelog' AND e.deleted_at IS NULL
+               AND (?2 IS NULL OR e.created_at > ?2) AND e.created_at <= ?3
+             ORDER BY e.created_at, e.id
+             LIMIT {CHANGELOG_BETWEEN_MAX}"
+        ))?;
+        let rows = st.query_map(params![space_id, after, upto], entry_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// Живой релиз пространства с `data.version = version`, если есть.
+pub async fn find_release_by_version(
+    db: &Db,
+    space_id: Id,
+    version: &str,
+) -> Result<Option<Entry>, StoreError> {
+    let version = version.to_string();
+    db.read(move |c| {
+        Ok(c.prepare_cached(&format!(
+            "SELECT {ENTRY_COLS} FROM entries e
+             WHERE e.space_id = ?1 AND e.kind = 'release' AND e.deleted_at IS NULL
+               AND json_extract(e.data, '$.version') = ?2
+             ORDER BY e.created_at, e.id LIMIT 1"
+        ))?
+        .query_row(params![space_id, version], entry_row)
+        .optional()?)
     })
     .await
 }

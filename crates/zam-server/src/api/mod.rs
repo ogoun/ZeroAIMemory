@@ -1,9 +1,11 @@
 //! Маршруты HTTP API.
 pub mod admin;
 pub mod blobs;
+pub mod entries;
 pub mod health;
 pub mod index;
 pub mod nodes;
+pub mod releases;
 pub mod render;
 pub mod scope;
 pub mod search;
@@ -107,6 +109,20 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         .route("/api/v1/nodes/{id}/diff", get(nodes::history::diff))
         .route("/api/v1/nodes/{id}/revert", post(nodes::history::revert))
         .route("/api/v1/trash", get(nodes::write::trash))
+        .route(
+            "/api/v1/spaces/{space}/entries",
+            get(entries::list).post(entries::create).layer(note_limit),
+        )
+        .route(
+            "/api/v1/entries/{id}",
+            get(entries::get)
+                .patch(entries::patch)
+                .delete(entries::remove)
+                .layer(note_limit),
+        )
+        .route("/api/v1/entries/{id}/restore", post(entries::restore))
+        .route("/api/v1/entries/{id}/revisions", get(entries::revisions))
+        .route("/api/v1/releases/{id}/compare", get(releases::compare))
         .route(
             "/api/v1/render",
             post(render::preview).layer(DefaultBodyLimit::max(render::RENDER_BODY_MAX)),

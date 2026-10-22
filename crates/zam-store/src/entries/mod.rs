@@ -35,9 +35,13 @@ pub use chunks::{
     reindex_entries_page,
 };
 pub(crate) use chunks::{rechunk_entries, set_entry_state};
-pub use read::{entry_revisions, get_entry, list_entries};
+pub use read::{
+    CHANGELOG_BETWEEN_MAX, changelog_between, entry_revisions, find_release_by_version, get_entry,
+    list_entries,
+};
 pub use write::{
-    create_entry, delete_entry, restore_entry, retract_entry, supersede_entry, update_entry,
+    create_entry, delete_entry, entry_by_idempotency_key, restore_entry, retract_entry,
+    supersede_entry, update_entry,
 };
 
 /// Строковое перечисление с отображением в SQL (`TEXT`) и serde (нижний регистр).

@@ -144,7 +144,19 @@ fn space_kind_of(c: &Connection, space: Id) -> Result<SpaceKind, StoreError> {
         .ok_or(StoreError::NotFound)
 }
 
-/// Запись с ключом идемпотентности `key`, если есть.
+/// Ключ идемпотентности в границах автора: `<автор>:<ключ>`, автор — пользователь, иначе
+/// токен, иначе `-` (администратор без пользователя). Идемпотентность по `(автор, ключ)`:
+/// в общем решении ключ участника не совпадает с ключом владельца. [решение исполнителя]
+fn scoped_key(a: &Attribution, key: &str) -> String {
+    let who = a
+        .user_id
+        .map(|u| u.to_string())
+        .or_else(|| a.token_id.map(|t| format!("t{t}")))
+        .unwrap_or_else(|| "-".into());
+    format!("{who}:{key}")
+}
+
+/// Запись с ключом идемпотентности `key` (уже с автором), если есть.
 fn by_key(c: &Connection, key: &str) -> Result<Option<Entry>, StoreError> {
     let id: Option<Id> = c
         .prepare_cached("SELECT id FROM entries WHERE idempotency_key = ?1")?
@@ -153,15 +165,48 @@ fn by_key(c: &Connection, key: &str) -> Result<Option<Entry>, StoreError> {
     id.map(|id| load_entry(c, id)).transpose()
 }
 
-/// Повтор запроса с тем же ключом: та же запись, если пространство и вид совпадают.
-fn same_request(ex: Entry, e: &NewEntry) -> Result<Entry, StoreError> {
-    if ex.space_id == e.space_id && ex.kind == e.kind {
-        Ok(ex)
-    } else {
-        Err(StoreError::Conflict(
-            "Idempotency-Key уже использован другой записью".into(),
-        ))
+/// Запись автора `a` по `Idempotency-Key` (в том числе удалённая), если есть.
+pub async fn entry_by_idempotency_key(
+    db: &Db,
+    a: &Attribution,
+    key: &str,
+) -> Result<Option<Entry>, StoreError> {
+    let key = check_key(Some(key.to_string()))?.map(|k| scoped_key(a, &k));
+    db.read(move |c| match key {
+        Some(k) => by_key(c, &k),
+        None => Ok(None),
+    })
+    .await
+}
+
+/// Повтор запроса с тем же ключом: та же запись, если отпечаток запроса (вид, пространство,
+/// заголовок, тело, `data`) совпал с первой ревизией; расхождение → `IdempotencyMismatch`,
+/// удалённая запись → `Conflict`.
+fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<Entry, StoreError> {
+    let (title, body, data): (String, String, String) = c
+        .prepare_cached(
+            "SELECT title, body, data FROM entry_revisions WHERE entry_id = ?1 AND rev = 1",
+        )?
+        .query_row([ex.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let data: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    if ex.space_id != e.space_id
+        || ex.kind != e.kind
+        || title != e.title.trim()
+        || body != e.body
+        || data != e.data
+    {
+        return Err(StoreError::IdempotencyMismatch(
+            "Idempotency-Key уже использован запросом с другим содержимым".into(),
+        ));
     }
+    if ex.deleted_at.is_some() {
+        return Err(StoreError::Conflict(
+            "запись по этому Idempotency-Key удалена: восстановите её или используйте новый ключ"
+                .into(),
+        ));
+    }
+    Ok(ex)
 }
 
 /// Статус новой записи: у insight — `active` по умолчанию, `active` или `revisit`; у
@@ -327,7 +372,9 @@ fn live_entry(c: &Connection, id: Id) -> Result<Entry, StoreError> {
 
 /// Создаёт запись журнала (ревизия 1, чанки, FTS, задание `upsert` — одной транзакцией).
 /// Повтор с тем же `idempotency_key` возвращает уже созданную запись и `false`; ключ,
-/// занятый записью другого пространства или вида, → `Conflict`. Нет пространства →
+/// расходящийся по отпечатку (вид, пространство, заголовок, тело, `data`) →
+/// `IdempotencyMismatch`, удалённая запись → `Conflict`. Ключ действует в границах автора
+/// (пользователь или токен). Нет пространства →
 /// `NotFound`; пустой заголовок, `data` не объект, статус или `certainty` не у insight →
 /// `BadInput`. Область по умолчанию — `a.area` (`X-Zam-Area`).
 pub async fn create_entry(
@@ -337,11 +384,11 @@ pub async fn create_entry(
 ) -> Result<(Entry, bool), StoreError> {
     let a = a.clone();
     db.write(move |tx| {
-        let key = check_key(e.idempotency_key.clone())?;
+        let key = check_key(e.idempotency_key.clone())?.map(|k| scoped_key(&a, &k));
         if let Some(k) = &key
             && let Some(ex) = by_key(tx, k)?
         {
-            return same_request(ex, &e).map(|ex| (ex, false));
+            return same_request(tx, ex, &e).map(|ex| (ex, false));
         }
         let now = fmt_ts(Timestamp::now());
         let id = insert_entry(tx, e, key, &a, None, &now)?;
@@ -492,16 +539,17 @@ pub async fn supersede_entry(
         if new.space_id != o.space_id {
             return Err(bad("новая запись — в пространстве замещаемой"));
         }
-        let key = check_key(new.idempotency_key.clone())?;
+        let key = check_key(new.idempotency_key.clone())?.map(|k| scoped_key(&a, &k));
         if let Some(k) = &key
             && let Some(ex) = by_key(tx, k)?
         {
-            if ex.supersedes_id == Some(old) {
-                return Ok((ex, load_entry(tx, old)?));
+            if ex.supersedes_id != Some(old) {
+                return Err(StoreError::IdempotencyMismatch(
+                    "Idempotency-Key уже использован другим запросом".into(),
+                ));
             }
-            return Err(StoreError::Conflict(
-                "Idempotency-Key уже использован другой записью".into(),
-            ));
+            let ex = same_request(tx, ex, &new)?;
+            return Ok((ex, load_entry(tx, old)?));
         }
         if let Some(s @ (EntryStatus::Superseded | EntryStatus::Retracted)) = o.status {
             return Err(StoreError::Conflict(format!(

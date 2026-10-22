@@ -183,6 +183,23 @@ impl Client {
         )
     }
 
+    /// POST JSON с дополнительными заголовками (`Idempotency-Key`, `X-Zam-Area`).
+    pub fn post_json_with(
+        &self,
+        path: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) -> Result<Response<Body>, CliError> {
+        let mut rb = self.prepare(self.agent.post(&self.url(path)));
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        self.check(
+            rb.content_type("application/json")
+                .send(body.to_string().as_bytes()),
+        )
+    }
+
     /// PUT с `If-Match: "<rev>"`.
     pub fn put_json(
         &self,

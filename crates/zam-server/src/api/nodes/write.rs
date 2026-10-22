@@ -91,7 +91,7 @@ pub async fn create(
 }
 
 /// Ревизия из `If-Match`: `3`, `"3"` или `W/"3"`.
-fn if_match(headers: &HeaderMap) -> Result<i64, ApiError> {
+pub(crate) fn if_match(headers: &HeaderMap) -> Result<i64, ApiError> {
     let v = headers
         .get(header::IF_MATCH)
         .ok_or(ApiError::PreconditionRequired)?;

@@ -31,9 +31,10 @@ pub use embeddings::{
     gc_embeddings, get_embeddings, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
 };
 pub use entries::{
-    AuthorView, Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryRevision, EntryStatus,
-    NewEntry, ReindexEntry, create_entry, delete_entry, enqueue_entry_upserts,
-    entry_chunks_for_index, entry_revisions, finish_entries_reindexed, get_entry, list_entries,
+    AuthorView, CHANGELOG_BETWEEN_MAX, Certainty, Entry, EntryFilter, EntryKind, EntryPatch,
+    EntryRevision, EntryStatus, NewEntry, ReindexEntry, changelog_between, create_entry,
+    delete_entry, enqueue_entry_upserts, entry_by_idempotency_key, entry_chunks_for_index,
+    entry_revisions, find_release_by_version, finish_entries_reindexed, get_entry, list_entries,
     normalize_title, reindex_entries_page, restore_entry, retract_entry, supersede_entry,
     update_entry,
 };
@@ -83,6 +84,9 @@ pub enum StoreError {
     Conflict(String),
     #[error("некорректные данные: {0}")]
     BadInput(String),
+    /// `Idempotency-Key` повторён с другим содержимым запроса.
+    #[error("{0}")]
+    IdempotencyMismatch(String),
     #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
     DataDirLocked(std::path::PathBuf),
     /// Windows: путь каталога данных так длинен, что файлы внутри него (базы SQLite, их

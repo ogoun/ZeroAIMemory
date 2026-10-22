@@ -113,10 +113,90 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Журналы решения: запись в Changelog
+    Log {
+        #[command(subcommand)]
+        cmd: LogCmd,
+    },
+    /// Релизы решения: добавить, сравнить
+    Release {
+        #[command(subcommand)]
+        cmd: ReleaseCmd,
+    },
     /// Решение: совместный доступ
     Solution {
         #[command(subcommand)]
         cmd: SolutionCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogCmd {
+    /// Запись об изменении (текст — из --body-file или stdin)
+    Changelog {
+        /// Вид: feat, fix, refactor, docs, research, ops, other
+        #[arg(long, value_parser = ["feat", "fix", "refactor", "docs", "research", "ops", "other"])]
+        kind: String,
+        #[arg(long)]
+        title: String,
+        /// Файл с текстом (иначе stdin)
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Ссылка: commit:SHA | file:PATH | note:ID | issue:X (можно повторять)
+        #[arg(long = "ref")]
+        refs: Vec<String>,
+        /// Область (монорепозиторий)
+        #[arg(long)]
+        area: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        /// Ключ идемпотентности: повтор с тем же ключом не создаёт вторую запись
+        #[arg(long)]
+        key: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseCmd {
+    /// Добавить релиз
+    Add {
+        version: String,
+        /// Дата YYYY-MM-DD (по умолчанию сегодня, UTC)
+        #[arg(long)]
+        date: Option<String>,
+        /// Git-тег релиза
+        #[arg(long)]
+        tag: Option<String>,
+        /// Файл с описанием релиза
+        #[arg(long)]
+        notes_file: Option<PathBuf>,
+        /// Собрать коммиты из git: FROM..TO (без диапазона — от предыдущего тега до HEAD)
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        from_git: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        /// Ключ идемпотентности
+        #[arg(long)]
+        key: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Сравнить релиз с предыдущим или указанным: changelog, описание, коммиты
+    Compare {
+        /// Версия или id релиза
+        release: String,
+        /// С чем сравнивать: prev (по умолчанию), версия или id
+        #[arg(long = "with")]
+        with: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
     },
 }
 
@@ -292,6 +372,68 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             file,
             common,
         } => cmd::attach::run(&cmd::connect(&common)?, &target, &file),
+        Cmd::Log {
+            cmd:
+                LogCmd::Changelog {
+                    kind,
+                    title,
+                    body_file,
+                    refs,
+                    area,
+                    solution,
+                    key,
+                    common,
+                },
+        } => {
+            let o = cmd::log::Changelog {
+                kind: &kind,
+                title: &title,
+                body_file: body_file.as_deref(),
+                refs: &refs,
+                area: area.as_deref(),
+                solution: solution.as_deref(),
+                key: key.as_deref(),
+            };
+            cmd::log::changelog(&cmd::connect(&common)?, &o)
+        }
+        Cmd::Release {
+            cmd:
+                ReleaseCmd::Add {
+                    version,
+                    date,
+                    tag,
+                    notes_file,
+                    from_git,
+                    solution,
+                    key,
+                    common,
+                },
+        } => {
+            let o = cmd::release::Add {
+                version: &version,
+                date: date.as_deref(),
+                tag: tag.as_deref(),
+                notes_file: notes_file.as_deref(),
+                from_git: from_git.as_deref(),
+                solution: solution.as_deref(),
+                key: key.as_deref(),
+            };
+            cmd::release::add(&cmd::connect(&common)?, &o)
+        }
+        Cmd::Release {
+            cmd:
+                ReleaseCmd::Compare {
+                    release,
+                    with,
+                    solution,
+                    common,
+                },
+        } => cmd::release::compare(
+            &cmd::connect(&common)?,
+            &release,
+            with.as_deref(),
+            solution.as_deref(),
+        ),
         Cmd::Solution {
             cmd: SolutionCmd::Access { cmd },
         } => {

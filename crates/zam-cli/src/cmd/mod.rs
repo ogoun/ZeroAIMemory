@@ -1,7 +1,9 @@
 //! Команды `zam`. Общее: флаги подключения, разрешение цели, вывод в stdout.
 pub mod attach;
 pub mod history;
+pub mod log;
 pub mod read;
+pub mod release;
 pub mod search;
 pub mod solution;
 pub mod status;
@@ -188,4 +190,50 @@ pub fn emit_written(ctx: &Ctx, node: &Value, created: bool) -> Result<(), CliErr
         }));
     }
     emit(format!("{id}@{rev}\n").as_bytes())
+}
+
+/// GUID решения для команд журналов: флаг `--solution` или `solution.toml`.
+pub fn solution_guid(ctx: &Ctx, flag: Option<&str>) -> Result<String, CliError> {
+    match flag {
+        Some(g) if crate::target::is_guid(g.trim()) => Ok(g.trim().to_ascii_lowercase()),
+        Some(_) => Err(CliError::input("--solution: UUID с дефисами")),
+        None => ctx.solution.as_ref().map(|s| s.id.clone()).ok_or_else(|| {
+            CliError::config(
+                "решение не задано: --solution GUID или .zeroaimemory/solution.toml в текущем каталоге или выше",
+            )
+        }),
+    }
+}
+
+/// Создаёт запись журнала в пространстве решения (`POST /spaces/{guid}/entries`); решение
+/// из `solution.toml` регистрируется (идемпотентно). Печатает `<id>@<rev>` или JSON записи.
+pub fn post_entry(
+    ctx: &Ctx,
+    guid: &str,
+    body: &Value,
+    key: Option<&str>,
+    area: Option<&str>,
+) -> Result<(), CliError> {
+    let own = ctx.solution.as_ref().is_some_and(|s| s.id == guid);
+    ctx.ensure_solution(&Loc::Path {
+        space: guid.to_string(),
+        path: String::new(),
+        own_solution: own,
+    })?;
+    let mut headers: Vec<(&str, &str)> = Vec::new();
+    if let Some(k) = key {
+        headers.push(("Idempotency-Key", k));
+    }
+    if let Some(a) = area {
+        headers.push(("X-Zam-Area", a));
+    }
+    let r = ctx
+        .client
+        .post_json_with(&format!("/spaces/{guid}/entries"), body, &headers)?;
+    let created = r.status().as_u16() == 201;
+    let e = read_json(r)?;
+    if ctx.json {
+        return emit_json(&json!({ "entry": e, "created": created }));
+    }
+    emit(format!("{}@{}\n", e["id"].as_str().unwrap_or("?"), e["rev"]).as_bytes())
 }
