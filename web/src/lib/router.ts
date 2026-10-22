@@ -3,14 +3,25 @@
 // Маршруты:
 // - `#/admin` — администрирование (пользователи и токены);
 // - `#/admin/index` — состояние векторного индекса и переиндексация;
+// - `#/admin/solutions` — реестр решений и запросы доступа; `#/admin/settings` — настройки;
 // - `#/u/<user_id>` — пространства пользователя;
 // - `#/u/<user_id>/s/<space_ref>/n/<node_id>[#<якорь>]` — документ, якорь — `id`
-//   элемента в percent-encoding (как в href вики-ссылок сервера: `#/n/<id>#h-<slug>`).
+//   элемента в percent-encoding (как в href вики-ссылок сервера: `#/n/<id>#h-<slug>`);
+// - `#/u/<user_id>/s/<space_ref>/j/<журнал>[/<entry_id>]` — журнал пространства
+//   (`changelog`, `releases`, `insights`, `vault`), необязательно — открытая запись.
 // Пустой или неизвестный адрес — `home` без пользователя (Shell выбирает своего).
+
+/** Журналы пространства: у решения — все четыре, у Knowledge — Insights и Vault. */
+export type Journal = 'changelog' | 'releases' | 'insights' | 'vault';
+export const JOURNALS: Journal[] = ['changelog', 'releases', 'insights', 'vault'];
+const isJournal = (s: string): s is Journal => (JOURNALS as string[]).includes(s);
 
 export type Route =
   | { name: 'admin' }
   | { name: 'index' }
+  | { name: 'solutions' }
+  | { name: 'settings' }
+  | { name: 'journal'; user: string; space: string; journal: Journal; entry: string | null }
   | { name: 'home'; user: string | null }
   | { name: 'node'; user: string; space: string; node: string; anchor: string | null };
 
@@ -35,9 +46,20 @@ export function parse(hash: string): Route {
   }
   const parts = h.split('/').filter((p) => p !== '');
   if (parts.length === 1 && parts[0] === 'admin') return { name: 'admin' };
-  if (parts.length === 2 && parts[0] === 'admin' && parts[1] === 'index') return { name: 'index' };
+  if (parts.length === 2 && parts[0] === 'admin') {
+    if (parts[1] === 'index') return { name: 'index' };
+    if (parts[1] === 'solutions') return { name: 'solutions' };
+    if (parts[1] === 'settings') return { name: 'settings' };
+  }
   if (parts[0] === 'u' && parts[1]) {
     const user = dec(parts[1]);
+    if ((parts.length === 6 || parts.length === 7) && parts[2] === 's' && parts[4] === 'j') {
+      const journal = dec(parts[5]);
+      if (isJournal(journal)) {
+        const entry = parts[6] ? dec(parts[6]) : null;
+        return { name: 'journal', user, space: dec(parts[3]), journal, entry };
+      }
+    }
     if (parts.length === 6 && parts[2] === 's' && parts[4] === 'n') {
       return { name: 'node', user, space: dec(parts[3]), node: dec(parts[5]), anchor };
     }
@@ -48,7 +70,7 @@ export function parse(hash: string): Route {
 
 /** Пользователь маршрута (заметки), если он в адресе. */
 export const routeUser = (r: Route): string | null =>
-  r.name === 'home' || r.name === 'node' ? r.user : null;
+  r.name === 'home' || r.name === 'node' || r.name === 'journal' ? r.user : null;
 
 /** Адрес маршрута (`#/…`). */
 export function href(r: Route): string {
@@ -57,6 +79,14 @@ export function href(r: Route): string {
       return '#/admin';
     case 'index':
       return '#/admin/index';
+    case 'solutions':
+      return '#/admin/solutions';
+    case 'settings':
+      return '#/admin/settings';
+    case 'journal':
+      return (
+        `#/u/${enc(r.user)}/s/${enc(r.space)}/j/${r.journal}` + (r.entry ? `/${enc(r.entry)}` : '')
+      );
     case 'home':
       return r.user ? `#/u/${enc(r.user)}` : '#/';
     case 'node':

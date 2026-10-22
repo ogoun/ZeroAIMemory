@@ -1,13 +1,16 @@
 <script lang="ts">
   // Глобальный поиск (Ctrl+K): POST /search по всем пространствам пользователя
   // (Human — для администратора), подсветка совпадений текстовыми узлами и <mark>,
-  // метки каналов (`vector`, `fts`), строка деградации и предупреждения сервера,
-  // переход к заметке и разделу.
+  // метки каналов (`vector`, `fts`), строка деградации и предупреждения сервера (в том числе
+  // о доступе к чужим решениям), переход к заметке и разделу. Записи журналов (insight,
+  // changelog, release) — карточками с видом, статусом и надёжностью; переход — в журнал.
   import { Dialog } from 'bits-ui';
   import { untrack } from 'svelte';
+  import CertaintyBadge from './CertaintyBadge.svelte';
   import { ApiError, getOutline, listSpaces, search, spaceRef, type SearchItem } from '../lib/api';
   import { reasonText, warningText } from '../lib/indexing';
-  import { go } from '../lib/router';
+  import { STATUS_TEXT } from '../lib/journals';
+  import { go, type Journal } from '../lib/router';
 
   let {
     open = $bindable(),
@@ -131,9 +134,16 @@
     return out;
   }
 
+  /** Журнал записи по её виду. */
+  const JOURNAL_OF: Record<string, Journal> = {
+    insight: 'insights',
+    changelog: 'changelog',
+    release: 'releases',
+  };
+
   /** Якорь раздела по `heading_path` (оглавление сервера: точный путь, иначе последний заголовок). */
   async function anchorFor(it: SearchItem): Promise<string | null> {
-    if (!it.heading_path) return null;
+    if (!it.heading_path || !it.node_id) return null;
     try {
       const toc = await getOutline(user, it.node_id);
       const segs = it.heading_path.split(' > ');
@@ -149,9 +159,16 @@
 
   async function choose(it: SearchItem | undefined) {
     if (!it || !it.space) return;
+    const space = spaceRef(it.space);
+    if (it.entry_id) {
+      open = false;
+      go({ name: 'journal', user, space, journal: JOURNAL_OF[it.kind ?? ''] ?? 'insights', entry: it.entry_id });
+      return;
+    }
+    if (!it.node_id) return;
     const anchor = await anchorFor(it);
     open = false;
-    go({ name: 'node', user, space: spaceRef(it.space), node: it.node_id, anchor });
+    go({ name: 'node', user, space, node: it.node_id, anchor });
   }
 
   function onkeydown(e: KeyboardEvent) {
@@ -216,7 +233,7 @@
       {/if}
       {#if items.length}
         <ul id="search-results" class="results" role="listbox" aria-label="Результаты поиска">
-          {#each items as it, i (`${it.node_id}:${i}`)}
+          {#each items as it, i (`${it.node_id ?? it.entry_id}:${i}`)}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <li
               id={`search-opt-${i}`}
@@ -226,10 +243,22 @@
               onclick={() => choose(it)}
               onmousemove={() => (active = i)}
             >
-              <div class="where">
-                <span class="space">{it.space?.name ?? '?'}</span>{` / ${it.path}`}{#if it.heading_path}<span class="section">{` › ${it.heading_path}`}</span>{/if}
-                {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}
-              </div>
+              {#if it.entry_id}
+                <div class="where entry-card">
+                  <span class="ekind">{it.kind}{it.insight_kind ? `/${it.insight_kind}` : ''}</span>
+                  <span class="space">{it.space?.name ?? '?'}</span>
+                  <span class="etitle">{it.title ?? ''}</span>
+                  {#if it.status}<span class="estatus">{STATUS_TEXT[it.status] ?? it.status}</span>{/if}
+                  <CertaintyBadge value={it.certainty} />
+                  {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}
+                </div>
+              {:else}
+                <div class="where">
+                  <span class="space">{it.space?.name ?? '?'}</span>{` / ${it.path}`}{#if it.heading_path}<span class="section">{` › ${it.heading_path}`}</span>{/if}
+                  <CertaintyBadge value={it.certainty} />
+                  {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}
+                </div>
+              {/if}
               <div class="snippet">
                 {#each parts(it.snippet ?? '') as p, j (j)}{#if p.m}<mark>{p.t}</mark>{:else}{p.t}{/if}{/each}
               </div>
@@ -286,6 +315,25 @@
   .space {
     color: var(--text);
     font-weight: 500;
+  }
+  .entry-card {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  .ekind {
+    font: 11px/16px ui-monospace, Consolas, monospace;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: var(--selected);
+    color: var(--text);
+  }
+  .etitle {
+    color: var(--text);
+  }
+  .estatus {
+    font-size: 12px;
   }
   .snippet {
     margin-top: 2px;

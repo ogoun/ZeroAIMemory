@@ -27,6 +27,10 @@ const WARNING: Record<string, string> = {
     'реранкер не установлен (zam-server models fetch --reranker; для CPU-реранкера jina — ещё --accept-nc-license) — порядок результатов без реранка',
   'index rebuilding': 'индекс пересобирается — векторная выдача может быть неполной',
   'reranker failed': 'реранкер не сработал — порядок результатов без реранка (подробности в журнале)',
+  'solution access pending': 'решение исключено из поиска: запрос доступа ждёт подтверждения владельца',
+  'solution access rejected': 'решение исключено из поиска: запрос доступа отклонён владельцем',
+  'solution access revoked': 'решение исключено из поиска: доступ отозван владельцем',
+  'solution unavailable': 'решение исключено из поиска: база владельца недоступна',
 };
 
 export const warningText = (w: string): string => WARNING[w] ?? w;

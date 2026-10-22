@@ -145,6 +145,20 @@ export interface Space {
   kind: SpaceKind;
   agent_solution_id: string | null;
   name: string;
+  /** Роль пользователя (`GET /spaces`): `personal` — фиксированное, `owner` — своё решение,
+   * `member` — чужое решение из базы владельца (§11.6). */
+  role?: 'personal' | 'owner' | 'member';
+  /** Своё решение с одобренными участниками. */
+  shared?: boolean;
+  /** Режим участника чужого решения. */
+  access?: Access;
+  /** Владелец чужого решения. */
+  owner?: UserRef | null;
+}
+
+export interface UserRef {
+  id: string;
+  name: string | null;
 }
 
 export type NodeKind = 'note' | 'folder';
@@ -200,7 +214,15 @@ export function spaceMatches(s: Space, ref: string): boolean {
 const q = encodeURIComponent;
 
 export const listSpaces = (user: string) =>
-  call<{ user: { id: string; name: string }; access: string; spaces: Space[] }>(
+  call<{
+    user: { id: string; name: string };
+    access: string;
+    /** Запрос пишет как человек (сессия WebUI — всегда). */
+    human: boolean;
+    spaces: Space[];
+    /** Ожидающие запросы доступа к решениям пользователя. */
+    access_requests_pending: number;
+  }>(
     'GET',
     'spaces',
     undefined,
@@ -333,7 +355,18 @@ export const getOutline = (user: string, id: string) =>
   call<OutlineItem[]>('GET', `nodes/${q(id)}/outline`, undefined, user);
 
 export interface SearchItem {
-  node_id: string;
+  /** У заметки; у записи журнала — `entry_id`. */
+  node_id?: string;
+  entry_id?: string;
+  /** `note` или вид записи (`insight`, `changelog`, `release`). */
+  kind?: string;
+  /** Статус insight. */
+  status?: EntryStatus | null;
+  /** `data.kind` insight. */
+  insight_kind?: string | null;
+  certainty?: Certainty | null;
+  /** Заголовок записи. */
+  title?: string;
   space: Space | null;
   path: string;
   heading_path: string;
@@ -446,3 +479,312 @@ export const reindex = (full: boolean) =>
     'admin/reindex',
     { full },
   );
+
+// ---- журналы решения: Changelog, Releases, Insights (§7.2–7.5) ----
+
+/** Эпистемический статус (§7.5): `axiom` ставит и меняет только человек. */
+export type Certainty = 'axiom' | 'theorem' | 'hypothesis';
+export type EntryKind = 'changelog' | 'release' | 'insight';
+export type EntryStatus = 'active' | 'revisit' | 'superseded' | 'retracted';
+export type TriggerType = 'file_glob' | 'command_regex' | 'error_regex' | 'keyword';
+
+export interface AuthorView {
+  /** `human` | `agent` | `system`. */
+  kind: string;
+  user_id: string | null;
+  token_id: string | null;
+  session_id: string | null;
+  machine: string | null;
+}
+
+export interface Trigger {
+  id: string;
+  type: TriggerType;
+  pattern: string;
+  tools: string[] | null;
+  created_at: string;
+}
+
+/** Новый триггер (набор в `PATCH` заменяется целиком). */
+export interface NewTrigger {
+  type: TriggerType;
+  pattern: string;
+  tools?: string[] | null;
+}
+
+/** Доказательство `theorem` (`data.evidence`). */
+export interface Evidence {
+  checked: string;
+  method: string;
+  result: string;
+}
+
+export interface Entry {
+  id: string;
+  space_id: string;
+  kind: EntryKind;
+  title: string;
+  body: string;
+  data: Record<string, unknown>;
+  tags: string[];
+  area: string | null;
+  status: EntryStatus | null;
+  certainty: Certainty | null;
+  supersedes_id: string | null;
+  superseded_by_id: string | null;
+  retract_reason: string | null;
+  rev: number;
+  author: AuthorView;
+  index_state: IndexState;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  /** У insight в `GET`/`PATCH`. */
+  triggers?: Trigger[];
+}
+
+export interface EntryQuery {
+  kind?: EntryKind;
+  status?: EntryStatus[];
+  certainty?: Certainty[];
+  area?: string;
+  tag?: string;
+  cursor?: string | null;
+  limit?: number;
+}
+
+/** Лента записей пространства (новые — первыми), курсор — `next_cursor`. */
+export function listEntries(user: string, space: string, f: EntryQuery) {
+  const p = new URLSearchParams();
+  if (f.kind) p.set('kind', f.kind);
+  if (f.status?.length) p.set('status', f.status.join(','));
+  if (f.certainty?.length) p.set('certainty', f.certainty.join(','));
+  if (f.area) p.set('area', f.area);
+  if (f.tag) p.set('tag', f.tag);
+  if (f.cursor) p.set('cursor', f.cursor);
+  if (f.limit) p.set('limit', String(f.limit));
+  return call<{ items: Entry[]; next_cursor: string | null }>(
+    'GET',
+    `spaces/${q(space)}/entries?${p}`,
+    undefined,
+    user,
+  );
+}
+
+export const getEntry = (user: string, id: string) =>
+  call<Entry>('GET', `entries/${q(id)}`, undefined, user);
+
+export interface EntryPatch {
+  title?: string;
+  body?: string;
+  data?: Record<string, unknown>;
+  tags?: string[];
+  status?: 'active' | 'revisit';
+  triggers?: NewTrigger[];
+  /** `null` — снять статус. */
+  certainty?: Certainty | null;
+  reason?: string;
+  message?: string;
+}
+
+export const patchEntry = (user: string, id: string, patch: EntryPatch) =>
+  call<Entry>('PATCH', `entries/${q(id)}`, patch, user);
+
+export interface InsightDraft {
+  title: string;
+  body: string;
+  data: Record<string, unknown>;
+  tags?: string[];
+  area?: string | null;
+  certainty?: Certainty;
+  message?: string;
+}
+
+/** Замещение insight: старая запись — `superseded`, ничего не удаляется. */
+export const supersedeEntry = (user: string, id: string, draft: InsightDraft) =>
+  call<{ entry: Entry; superseded: Entry }>('POST', `entries/${q(id)}/supersede`, draft, user);
+
+export const retractEntry = (user: string, id: string, reason: string) =>
+  call<Entry>('POST', `entries/${q(id)}/retract`, { reason }, user);
+
+export interface ReleaseCompare {
+  from: Entry | null;
+  to: Entry;
+  /** Записи changelog интервала по `data.kind`. */
+  changelog: Record<string, Entry[]>;
+  truncated: boolean;
+  notes_diff: string;
+  commits: { sha: string; subject?: string | null }[];
+}
+
+/** Сравнение релиза с предыдущим (`withId` не задан) или с релизом `withId`. */
+export const compareRelease = (user: string, id: string, withId?: string) =>
+  call<ReleaseCompare>(
+    'GET',
+    `releases/${q(id)}/compare${withId ? `?with=${q(withId)}` : ''}`,
+    undefined,
+    user,
+  );
+
+// ---- граф: исходящие и обратные ссылки (§8.5) ----
+
+export interface EdgeView {
+  id: string;
+  /** `n:<id>` | `e:<id>`. */
+  src: string;
+  src_space: string;
+  /** `null` — неразрешённая ссылка (ключ в `dst_raw`). */
+  dst: string | null;
+  dst_space: string | null;
+  dst_raw: string | null;
+  dst_anchor: string | null;
+  type: string;
+  /** `wikilink` | `frontmatter` | `explicit` | `system`. */
+  origin: string;
+  created_at: string;
+}
+
+export interface GraphNode {
+  ref: string;
+  space_id: string;
+  title: string;
+  path: string | null;
+  status: EntryStatus | null;
+  certainty: Certainty | null;
+  deleted: boolean;
+}
+
+export interface EdgeList {
+  items: EdgeView[];
+  nodes: GraphNode[];
+}
+
+export const nodeLinks = (user: string, id: string) =>
+  call<EdgeList>('GET', `nodes/${q(id)}/links`, undefined, user);
+export const nodeBacklinks = (user: string, id: string) =>
+  call<EdgeList>('GET', `nodes/${q(id)}/backlinks`, undefined, user);
+export const entryBacklinks = (user: string, id: string) =>
+  call<EdgeList>('GET', `entries/${q(id)}/backlinks`, undefined, user);
+/** Подграф на шаг вокруг записи: исходящие связи записи — рёбра с `src = e:<id>`. */
+export const entryGraph = (user: string, id: string) =>
+  call<{ nodes: GraphNode[]; edges: EdgeView[] }>(
+    'GET',
+    `graph?entry=${q(id)}&depth=1`,
+    undefined,
+    user,
+  );
+
+// ---- Vault (§7.6): значения не кэшируются и не логируются ----
+
+export interface VaultItem {
+  id: string;
+  /** `knowledge` или GUID решения. */
+  space: string;
+  agent_solution_id: string | null;
+  title: string;
+  data: { type: string; username?: string; url?: string; description?: string };
+  rev: number;
+  author: AuthorView;
+  created_at: string;
+  updated_at: string;
+}
+
+export const listVault = (user: string, space: string) =>
+  call<{ items: VaultItem[] }>('GET', `spaces/${q(space)}/vault`, undefined, user);
+
+/** Значение секрета: ответ `no-store`, раскрытие записывается в аудит. */
+export async function revealVault(user: string, id: string): Promise<string> {
+  const r = await call<{ secret?: unknown }>('GET', `vault/${q(id)}?reveal=1`, undefined, user);
+  if (typeof r.secret !== 'string') throw new ApiError(500, 'сервер не вернул значение');
+  return r.secret;
+}
+
+// ---- решения и совместный доступ (§11.6) ----
+
+export interface SolutionItem {
+  agent_solution_id: string;
+  name: string;
+  space_id: string;
+  owner: UserRef;
+  /** Отношение пользователя запроса: `owner` | `member` | `admin`. */
+  role: string;
+  access: string | null;
+  created_at: string;
+}
+
+export type AccessState = 'pending' | 'approved' | 'rejected' | 'revoked';
+
+export interface AccessEntry {
+  user_id: string;
+  user_name: string;
+  access: Access;
+  state: AccessState;
+  requested_at: string;
+  decided_at: string | null;
+  decided_by: string | null;
+}
+
+export const listSolutions = () => call<SolutionItem[]>('GET', 'solutions');
+export const solutionAccess = (guid: string) =>
+  call<{ agent_solution_id: string; owner: UserRef; members: AccessEntry[]; pending: number }>(
+    'GET',
+    `solutions/${q(guid)}/access`,
+  );
+export const approveAccess = (guid: string, user: string, access: Access) =>
+  call<AccessEntry>('POST', `solutions/${q(guid)}/access/${q(user)}/approve`, { access });
+export const rejectAccess = (guid: string, user: string, reason: string) =>
+  call<AccessEntry>(
+    'POST',
+    `solutions/${q(guid)}/access/${q(user)}/reject`,
+    reason ? { reason } : {},
+  );
+export const revokeAccess = (guid: string, user: string) =>
+  call<AccessEntry>('POST', `solutions/${q(guid)}/access/${q(user)}/revoke`);
+
+// ---- настройки сервера (администратор) ----
+
+export interface Settings {
+  rules: { agent_write: boolean };
+}
+
+export const getSettings = () => call<Settings>('GET', 'admin/settings');
+export const setAgentWrite = (on: boolean) =>
+  call<Settings>('PATCH', 'admin/settings', { rules: { agent_write: on } });
+
+// ---- понятные сообщения об ошибках (RFC 9457) ----
+
+const CERTAINTY_TEXT: Record<string, string> = {
+  'axiom-requires-human': 'Статус axiom ставит, меняет и снимает только человек.',
+  'evidence-required':
+    'Для theorem нужно доказательство: что проверено, каким методом и с каким результатом.',
+  'reason-required': 'Укажите причину смены статуса надёжности.',
+  'invalid-transition': 'Такой переход статуса надёжности недопустим.',
+};
+
+const ACCESS_TEXT: Record<string, string> = {
+  pending: 'запрос доступа к решению ждёт подтверждения владельца',
+  rejected: 'запрос доступа к решению отклонён владельцем',
+  revoked: 'доступ к решению отозван владельцем',
+};
+
+/** Ошибка → текст для человека: известные `type`/`code` problem+json — по-русски. */
+export function errorText(e: unknown): string {
+  if (!(e instanceof ApiError)) return e instanceof Error ? e.message : 'Ошибка';
+  const p = e.problem;
+  const type = typeof p?.type === 'string' ? p.type : '';
+  const code = typeof p?.code === 'string' ? p.code : '';
+  if (type === '/problems/certainty' && CERTAINTY_TEXT[code]) return CERTAINTY_TEXT[code];
+  if (type === '/problems/solution-access') {
+    const st = typeof p?.state === 'string' ? p.state : '';
+    return `Нет доступа: ${ACCESS_TEXT[st] ?? 'доступа к решению нет'}.`;
+  }
+  if (type === '/problems/vault-locked') return e.message;
+  if (type === '/problems/possible-duplicate') return `Похоже на уже записанный insight: ${e.message}`;
+  if (e.status === 404) return 'Не найдено: запись удалена или недоступна.';
+  if (e.status === 403) return `Недостаточно прав: ${e.message}`;
+  return e.message;
+}
+
+/** 503 `/problems/vault-locked`. */
+export const isVaultLocked = (e: unknown): boolean =>
+  e instanceof ApiError && e.status === 503 && e.problem?.type === '/problems/vault-locked';
