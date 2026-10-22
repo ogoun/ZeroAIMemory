@@ -4,7 +4,7 @@
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
-import { MEMBER_NAME, SOLUTION_GUID, SOLUTION_NAME } from './seed';
+import { GUEST_NAME, MEMBER_NAME, SOLUTION_GUID, SOLUTION_NAME } from './seed';
 
 const env = (k: string) => {
   const v = process.env[k];
@@ -67,7 +67,7 @@ test('Решения: одобрение ro, метки в дереве, отз�
   const row = page.locator(`tr[data-solution="${SOLUTION_GUID}"]`);
   await expect(row).toContainText(SOLUTION_NAME);
   await expect(row).toContainText('admin');
-  await expect(row.locator('.badge')).toHaveText('1');
+  await expect(row.locator('.badge')).toHaveText('2');
   await row.getByRole('button', { name: 'Доступ' }).click();
   const m = page.locator(`tr[data-member="${MEMBER_NAME}"]`);
   await expect(m).toContainText('ждёт решения');
@@ -112,6 +112,20 @@ test('Решения: одобрение ro, метки в дереве, отз�
   const p = await r.json();
   expect(p.type).toBe('/problems/solution-access');
   expect(p.state).toBe('revoked');
+
+  // отклонение с причиной: окно требует причину, запрос — rejected
+  const g = page.locator(`tr[data-member="${GUEST_NAME}"]`);
+  await expect(g).toContainText('ждёт решения');
+  await g.getByRole('button', { name: 'Отклонить' }).click();
+  const dlg = page.getByRole('dialog');
+  await dlg.getByLabel('Причина').fill('решение закрытое');
+  await dlg.getByRole('button', { name: 'Отклонить' }).click();
+  await expect(dlg).toBeHidden();
+  await expect(g).toContainText('отклонён');
+  await expect(row.locator('.badge')).toHaveCount(0);
+  r = await bearer(request, env('E2E_GUEST_TOKEN')).get(entries);
+  expect(r.status()).toBe(403);
+  expect((await r.json()).state).toBe('rejected');
   await request.dispose();
   expect(problems, problems.join('\n')).toEqual([]);
 });

@@ -549,6 +549,8 @@ export interface EntryQuery {
   certainty?: Certainty[];
   area?: string;
   tag?: string;
+  /** `data.kind`: вид changelog или insight (фильтр на сервере, курсор его учитывает). */
+  dataKind?: string;
   cursor?: string | null;
   limit?: number;
 }
@@ -561,6 +563,7 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
   if (f.certainty?.length) p.set('certainty', f.certainty.join(','));
   if (f.area) p.set('area', f.area);
   if (f.tag) p.set('tag', f.tag);
+  if (f.dataKind) p.set('data_kind', f.dataKind);
   if (f.cursor) p.set('cursor', f.cursor);
   if (f.limit) p.set('limit', String(f.limit));
   return call<{ items: Entry[]; next_cursor: string | null }>(
@@ -663,16 +666,10 @@ export const nodeLinks = (user: string, id: string) =>
   call<EdgeList>('GET', `nodes/${q(id)}/links`, undefined, user);
 export const nodeBacklinks = (user: string, id: string) =>
   call<EdgeList>('GET', `nodes/${q(id)}/backlinks`, undefined, user);
+export const entryLinks = (user: string, id: string) =>
+  call<EdgeList>('GET', `entries/${q(id)}/links`, undefined, user);
 export const entryBacklinks = (user: string, id: string) =>
   call<EdgeList>('GET', `entries/${q(id)}/backlinks`, undefined, user);
-/** Подграф на шаг вокруг записи: исходящие связи записи — рёбра с `src = e:<id>`. */
-export const entryGraph = (user: string, id: string) =>
-  call<{ nodes: GraphNode[]; edges: EdgeView[] }>(
-    'GET',
-    `graph?entry=${q(id)}&depth=1`,
-    undefined,
-    user,
-  );
 
 // ---- Vault (§7.6): значения не кэшируются и не логируются ----
 
@@ -779,6 +776,8 @@ export function errorText(e: unknown): string {
     return `Нет доступа: ${ACCESS_TEXT[st] ?? 'доступа к решению нет'}.`;
   }
   if (type === '/problems/vault-locked') return e.message;
+  if (type === '/problems/idempotency-mismatch')
+    return `Повтор запроса с тем же ключом, но другим содержимым: ${e.message}`;
   if (type === '/problems/possible-duplicate') return `Похоже на уже записанный insight: ${e.message}`;
   if (e.status === 404) return 'Не найдено: запись удалена или недоступна.';
   if (e.status === 403) return `Недостаточно прав: ${e.message}`;

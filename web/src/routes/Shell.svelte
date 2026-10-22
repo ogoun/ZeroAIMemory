@@ -15,6 +15,7 @@
   import Users from './Users.svelte';
   import {
     ApiError,
+    errorText,
     listSpaces,
     listUsers,
     spaceMatches,
@@ -115,6 +116,7 @@
 
   // Пространство открытого журнала: имя и вид — для заголовка и вкладок журналов.
   let journalSpaces = $state<{ user: string; spaces: Space[] } | null>(null);
+  let journalError = $state('');
   $effect(() => {
     const r = route;
     // вне журналов кэш сбрасывается: роли и решения могли измениться
@@ -124,12 +126,16 @@
     }
     if (untrack(() => journalSpaces?.user) === r.user) return;
     const u = r.user;
+    journalError = '';
     listSpaces(u)
       .then((x) => (journalSpaces = { user: u, spaces: x.spaces }))
       .catch((e) => {
-        if (e instanceof ApiError && e.status === 401) onexpired();
+        if (e instanceof ApiError && e.status === 401) return onexpired();
+        journalError = errorText(e);
       });
   });
+  /** Пространства пользователя журнала загружены. */
+  let journalLoaded = $derived(route.name === 'journal' && journalSpaces?.user === route.user);
   let journalSpace = $derived.by(() => {
     const r = route;
     if (r.name !== 'journal' || journalSpaces?.user !== r.user) return null;
@@ -223,7 +229,7 @@
           </div>
           <h1>{JOURNAL_TITLE[r.journal]}</h1>
           <nav class="subnav" aria-label="Журналы пространства">
-            {#each journalsOf(journalSpace?.kind ?? (r.space === 'knowledge' ? 'knowledge' : 'solution')) as j (j)}
+            {#each journalsOf(journalSpace?.kind ?? '') as j (j)}
               <a
                 href={href({ name: 'journal', user: r.user, space: r.space, journal: j, entry: null })}
                 aria-current={r.journal === j ? 'page' : undefined}>{JOURNAL_TITLE[j]}</a
@@ -231,7 +237,18 @@
             {/each}
           </nav>
         </header>
-        {#if r.journal === 'changelog'}
+        {#if journalError}
+          <p class="error" role="alert">{journalError}</p>
+        {:else if !journalLoaded}
+          <p class="muted">Загрузка…</p>
+        {:else if !journalSpace}
+          <p class="error" role="alert">Пространство «{r.space}» не найдено или недоступно.</p>
+        {:else if !journalsOf(journalSpace.kind).includes(r.journal)}
+          <p class="warn" role="alert">
+            У пространства «{journalSpace.name}» нет журнала {JOURNAL_TITLE[r.journal]}: журналы ведутся в
+            решениях (Changelog, Releases, Insights, Vault) и в Knowledge (Insights, Vault).
+          </p>
+        {:else if r.journal === 'changelog'}
           <ChangelogView user={r.user} space={r.space} entry={r.entry} {onexpired} />
         {:else if r.journal === 'releases'}
           <ReleasesView user={r.user} space={r.space} entry={r.entry} {onexpired} />

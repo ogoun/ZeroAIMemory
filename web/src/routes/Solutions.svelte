@@ -28,6 +28,8 @@
 
   let solutions = $state<SolutionItem[]>([]);
   let members = $state<Record<string, AccessEntry[]>>({});
+  /** Ошибка загрузки или действия — у строки решения. */
+  let rowErrors = $state<Record<string, string>>({});
   let open = $state<string | null>(null);
   let error = $state('');
   let loading = $state(false);
@@ -43,11 +45,23 @@
     error = '';
     try {
       solutions = (await listSolutions()).sort((a, b) => a.name.localeCompare(b.name));
-      // запросы всех решений сразу: число ожидающих — в строке реестра
-      const lists = await Promise.all(
+      // запросы всех решений сразу: число ожидающих — в строке реестра; сбой одного
+      // решения — ошибка его строки, остальные показываются
+      const lists = await Promise.allSettled(
         solutions.map((s) => solutionAccess(s.agent_solution_id).then((r) => r.members)),
       );
-      members = Object.fromEntries(solutions.map((s, i) => [s.agent_solution_id, lists[i]]));
+      const m: Record<string, AccessEntry[]> = {};
+      const errs: Record<string, string> = {};
+      solutions.forEach((s, i) => {
+        const r = lists[i];
+        if (r.status === 'fulfilled') m[s.agent_solution_id] = r.value;
+        else {
+          if (r.reason instanceof ApiError && r.reason.status === 401) onexpired();
+          errs[s.agent_solution_id] = errorText(r.reason);
+        }
+      });
+      members = m;
+      rowErrors = errs;
     } catch (e) {
       fail(e);
     } finally {
@@ -57,15 +71,17 @@
 
   async function refresh(guid: string) {
     members[guid] = (await solutionAccess(guid)).members;
+    delete rowErrors[guid];
   }
 
   async function run(guid: string, fn: () => Promise<unknown>) {
-    error = '';
+    delete rowErrors[guid];
     try {
       await fn();
       await refresh(guid);
     } catch (e) {
-      fail(e);
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      rowErrors[guid] = errorText(e);
     }
   }
 
@@ -118,6 +134,7 @@
           <td>
             <strong>{s.name}</strong>
             <div class="muted small"><code>{guid}</code> · {fmtTime(s.created_at)}</div>
+            {#if rowErrors[guid]}<p class="error small" role="alert">{rowErrors[guid]}</p>{/if}
           </td>
           <td>{s.owner.name ?? s.owner.id}</td>
           <td>{approvedOf(guid)}</td>

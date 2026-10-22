@@ -6,7 +6,7 @@
   import {
     ApiError,
     entryBacklinks,
-    entryGraph,
+    entryLinks,
     errorText,
     getEntry,
     listSpaces,
@@ -64,11 +64,8 @@
     loading = true;
     error = '';
     try {
-      const self = `${k === 'node' ? 'n' : 'e'}:${i}`;
       const [out, back, sp] = await Promise.all([
-        k === 'node'
-          ? nodeLinks(u, i)
-          : entryGraph(u, i).then((g) => ({ items: g.edges.filter((e) => e.src === self), nodes: g.nodes })),
+        k === 'node' ? nodeLinks(u, i) : entryLinks(u, i),
         k === 'node' ? nodeBacklinks(u, i) : entryBacklinks(u, i),
         listSpaces(u),
       ]);

@@ -1,7 +1,6 @@
 <script lang="ts">
   // Changelog решения (§7.3): лента записей (новые — первыми) с курсором, фильтры по виду
-  // (`data.kind`) и области (`area`). Область фильтрует сервер; вид — клиент по загруженным
-  // страницам: у API ленты нет фильтра по `data.kind` [решение исполнителя].
+  // (`data_kind`) и области (`area`) — на сервере, курсор их учитывает.
   import { untrack } from 'svelte';
   import { ApiError, errorText, getEntry, listEntries, type Entry } from '../lib/api';
   import { AUTHOR_TEXT, CHANGELOG_KINDS, dataStr, fmtTime } from '../lib/journals';
@@ -70,6 +69,7 @@
       const r = await listEntries(u, s, {
         kind: 'changelog',
         area: appliedArea || undefined,
+        dataKind: kind || undefined,
         cursor: reset ? null : next,
         limit: PAGE,
       });
@@ -91,7 +91,6 @@
     load(user, space, true);
   }
 
-  let shown = $derived(kind ? items.filter((e) => dataStr(e.data, 'kind') === kind) : items);
 
   const refsOf = (e: Entry): [string, string[]][] => {
     const r = e.data.refs;
@@ -132,7 +131,7 @@
   <form class="filters row" onsubmit={applyArea}>
     <label class="row">
       Вид
-      <select bind:value={kind} aria-label="Вид записи">
+      <select bind:value={kind} aria-label="Вид записи" onchange={() => load(user, space, true)}>
         <option value="">все</option>
         {#each CHANGELOG_KINDS as k (k)}<option value={k}>{k}</option>{/each}
       </select>
@@ -154,11 +153,11 @@
   {/if}
 
   <div class="feed" aria-label="Лента changelog" role="feed" aria-busy={loading}>
-    {#each shown as e (e.id)}
+    {#each items as e (e.id)}
       {@render card(e, false)}
     {/each}
   </div>
-  {#if !loading && shown.length === 0 && !error}
+  {#if !loading && items.length === 0 && !error}
     <p class="muted">Записей нет{kind || appliedArea ? ' по выбранным фильтрам' : ''}.</p>
   {/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}

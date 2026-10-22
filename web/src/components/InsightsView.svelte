@@ -64,6 +64,8 @@
   let cur = $state<Entry | null>(null);
   let curError = $state('');
   let chain = $state<Entry[]>([]);
+  /** Цепочка оборвалась (запись недоступна или предел шагов): до и после. */
+  let chainCut = $state({ before: false, after: false });
   type Mode = 'none' | 'supersede' | 'retract' | 'certainty' | 'triggers';
   let mode = $state<Mode>('none');
   let busy = $state(false);
@@ -122,6 +124,7 @@
         certainty: fCertainty ? [fCertainty] : undefined,
         area: fArea.trim() || undefined,
         tag: fTag.trim() || undefined,
+        dataKind: fKind || undefined,
         cursor: reset ? null : next,
         limit: PAGE,
       });
@@ -144,7 +147,6 @@
     reloadList();
   }
 
-  let shown = $derived(fKind ? items.filter((e) => dataStr(e.data, 'kind') === fKind) : items);
 
   async function open(u: string, id: string | null) {
     const my = ++eseq;
@@ -152,6 +154,7 @@
     actionError = '';
     curError = '';
     chain = [];
+    chainCut = { before: false, after: false };
     if (!id) {
       cur = null;
       return;
@@ -165,7 +168,10 @@
         return;
       }
       cur = e;
-      chain = await chainOf(u, e);
+      const c = await chainOf(u, e);
+      if (my !== eseq) return;
+      chain = c.items;
+      chainCut = c.cut;
     } catch (e) {
       if (my !== eseq) return;
       cur = null;
@@ -174,31 +180,30 @@
   }
 
   /** Цепочка замещения: от самой ранней записи к самой поздней (сама запись — внутри). */
-  async function chainOf(u: string, e: Entry): Promise<Entry[]> {
-    if (!e.supersedes_id && !e.superseded_by_id) return [];
-    const before: Entry[] = [];
-    const after: Entry[] = [];
-    let p = e.supersedes_id;
-    for (let i = 0; p && i < CHAIN_MAX; i++) {
-      try {
-        const x = await getEntry(u, p);
-        before.unshift(x);
-        p = x.supersedes_id;
-      } catch {
-        break;
+  async function chainOf(
+    u: string,
+    e: Entry,
+  ): Promise<{ items: Entry[]; cut: { before: boolean; after: boolean } }> {
+    if (!e.supersedes_id && !e.superseded_by_id) return { items: [], cut: { before: false, after: false } };
+    /** Шаги в одну сторону; `true` вторым значением — дальше есть, но недоступно. */
+    async function walk(start: string | null, next: (x: Entry) => string | null): Promise<[Entry[], boolean]> {
+      const out: Entry[] = [];
+      let id = start;
+      for (let i = 0; id; i++) {
+        if (i >= CHAIN_MAX) return [out, true];
+        try {
+          const x = await getEntry(u, id);
+          out.push(x);
+          id = next(x);
+        } catch {
+          return [out, true];
+        }
       }
+      return [out, false];
     }
-    let n = e.superseded_by_id;
-    for (let i = 0; n && i < CHAIN_MAX; i++) {
-      try {
-        const x = await getEntry(u, n);
-        after.push(x);
-        n = x.superseded_by_id;
-      } catch {
-        break;
-      }
-    }
-    return [...before, e, ...after];
+    const [before, cb] = await walk(e.supersedes_id, (x) => x.supersedes_id);
+    const [after, ca] = await walk(e.superseded_by_id, (x) => x.superseded_by_id);
+    return { items: [...before.reverse(), e, ...after], cut: { before: cb, after: ca } };
   }
 
   function select(id: string) {
@@ -359,7 +364,7 @@
   <form class="filters row" onsubmit={applyText}>
     <label class="row">
       Вид
-      <select bind:value={fKind} aria-label="Вид insight">
+      <select bind:value={fKind} aria-label="Вид insight" onchange={reloadList}>
         <option value="">все</option>
         {#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}
       </select>
@@ -391,7 +396,7 @@
         <tr><th>Надёжность</th><th>Заголовок</th><th>Вид</th><th>Статус</th><th>Область</th><th>Изменено</th></tr>
       </thead>
       <tbody>
-        {#each shown as e (e.id)}
+        {#each items as e (e.id)}
           <tr class:selected={e.id === entry} class="st-{e.status}" data-entry={e.id}>
             <td><CertaintyBadge value={e.certainty} /></td>
             <td>
@@ -407,7 +412,7 @@
       </tbody>
     </table>
   </div>
-  {#if !loading && shown.length === 0 && !error}<p class="muted">Записей нет.</p>{/if}
+  {#if !loading && items.length === 0 && !error}<p class="muted">Записей нет.</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}
   {#if next && !loading}
     <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
@@ -433,7 +438,8 @@
       {#if c.body}<p class="body">{c.body}</p>{/if}
       {#if evidenceOf(c)}
         {@const ev = evidenceOf(c)!}
-        <dl class="evidence">
+        {#if c.certainty !== 'theorem'}<p class="muted small ev-title">Прежнее доказательство</p>{/if}
+        <dl class="evidence" class:old={c.certainty !== 'theorem'}>
           <dt>Проверено</dt><dd>{String(ev.checked ?? '')}</dd>
           <dt>Метод</dt><dd>{String(ev.method ?? '')}</dd>
           <dt>Результат</dt><dd>{String(ev.result ?? '')}</dd>
@@ -445,6 +451,7 @@
         <div class="chain">
           <h3>Цепочка замещения</h3>
           <ol>
+            {#if chainCut.before}<li class="muted cut">…дальше недоступно</li>{/if}
             {#each chain as x (x.id)}
               <li class:here={x.id === c.id}>
                 {#if x.id === c.id}
@@ -455,6 +462,7 @@
                 <span class="muted small">{x.status ? STATUS_TEXT[x.status] : ''}</span>
               </li>
             {/each}
+            {#if chainCut.after}<li class="muted cut">…дальше недоступно</li>{/if}
           </ol>
         </div>
       {/if}
@@ -522,7 +530,7 @@
           {@render formEnd('Сохранить')}
         </form>
       {:else if mode === 'triggers'}
-        <div class="form" aria-label="Триггеры">
+        <div class="form" role="group" aria-label="Триггеры">
           <h3>Триггеры</h3>
           {#if tDraft.length === 0}<p class="muted">Триггеров нет.</p>{/if}
           <ul class="triggers">
@@ -623,6 +631,15 @@
     gap: 2px 12px;
     margin: 8px 0;
     font-size: 14px;
+  }
+  .evidence.old {
+    opacity: 0.75;
+  }
+  .ev-title {
+    margin: 8px 0 0;
+  }
+  .cut {
+    list-style: none;
   }
   .evidence dt {
     color: var(--muted);

@@ -117,6 +117,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_INSIGHT_HYP = journals.hypothesis;
     process.env.E2E_MEMBER_ID = journals.memberId;
     process.env.E2E_MEMBER_TOKEN = journals.memberToken;
+    process.env.E2E_GUEST_TOKEN = journals.guestToken;
   } catch (e) {
     child.kill();
     log.end();

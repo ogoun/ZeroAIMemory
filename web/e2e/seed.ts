@@ -158,6 +158,8 @@ export const SOLUTION_NAME = 'E2E решение';
 /** Значение секрета Vault: должно показываться только по «Показать». */
 export const VAULT_SECRET = 'e2e-vault-value-7Qm2';
 export const MEMBER_NAME = 'e2e-member';
+/** Второй запросивший доступ — для отклонения с причиной. */
+export const GUEST_NAME = 'e2e-guest';
 
 /** Запрос от имени администратора (cookie-сессия + CSRF): админ-API токеном недоступно. */
 export type AdminCall = <T>(method: string, path: string, body?: unknown) => Promise<T>;
@@ -169,6 +171,7 @@ export interface JournalSeed {
   hypothesis: string;
   memberId: string;
   memberToken: string;
+  guestToken: string;
 }
 
 interface EntryResp {
@@ -233,21 +236,25 @@ export async function seedJournals(base: string, token: string, admin: AdminCall
     secret: VAULT_SECRET,
   }));
 
-  // второй пользователь запрашивает доступ к решению: 202 pending
-  const member = await admin<{ user: { id: string }; token: { plaintext: string } }>('POST', 'admin/users', {
-    name: MEMBER_NAME,
-  });
-  const r = await fetch(`${base}api/v1/solutions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${member.token.plaintext}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ agent_solution_id: SOLUTION_GUID, name: SOLUTION_NAME }),
-  });
-  if (r.status !== 202) throw new Error(`запрос доступа участника: HTTP ${r.status} ${await r.text()}`);
+  // ещё два пользователя запрашивают доступ к решению: 202 pending
+  const requester = async (name: string) => {
+    const u = await admin<{ user: { id: string }; token: { plaintext: string } }>('POST', 'admin/users', { name });
+    const r = await fetch(`${base}api/v1/solutions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${u.token.plaintext}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_solution_id: SOLUTION_GUID, name: SOLUTION_NAME }),
+    });
+    if (r.status !== 202) throw new Error(`запрос доступа ${name}: HTTP ${r.status} ${await r.text()}`);
+    return u;
+  };
+  const member = await requester(MEMBER_NAME);
+  const guest = await requester(GUEST_NAME);
 
   return {
     oldInsight: old.id,
     hypothesis: hyp.id,
     memberId: member.user.id,
     memberToken: member.token.plaintext,
+    guestToken: guest.token.plaintext,
   };
 }

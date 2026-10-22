@@ -46,14 +46,21 @@
   let copied = $state('');
   let timer: ReturnType<typeof setTimeout> | undefined;
   let seq = 0;
+  /** Поколение раскрытия: смена области, «Скрыть», уход — поздний ответ отбрасывается. */
+  let rseq = 0;
+  let destroyed = false;
 
   function hide() {
+    rseq++;
     clearTimeout(timer);
     shown = null;
     copied = '';
   }
 
-  onDestroy(hide);
+  onDestroy(() => {
+    destroyed = true;
+    hide();
+  });
 
   $effect(() => {
     const u = user;
@@ -92,12 +99,16 @@
 
   async function reveal(it: VaultItem) {
     hide();
+    const my = rseq;
     error = '';
     try {
       const value = await revealVault(user, it.id);
+      // за время запроса ушли со страницы, сменили область или нажали «Скрыть»
+      if (destroyed || my !== rseq) return;
       shown = { id: it.id, value };
       timer = setTimeout(hide, REVEAL_MS);
     } catch (e) {
+      if (destroyed || my !== rseq) return;
       fail(e);
     }
   }

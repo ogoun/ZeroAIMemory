@@ -63,7 +63,10 @@ test('Changelog: лента и фильтры по виду и области', 
   await expect(cards.first()).toContainText('Описан формат журналов');
   await page.screenshot({ path: `${screens}changelog.png`, fullPage: true });
 
+  // вид фильтрует сервер (data_kind), а не клиент по загруженной странице
+  const filtered = page.waitForRequest((r) => r.url().includes('data_kind=fix'));
   await page.getByLabel('Вид записи').selectOption('fix');
+  await filtered;
   await expect(cards).toHaveCount(1);
   await expect(cards.first()).toContainText('Исправлен CRLF в хэше');
 
@@ -106,6 +109,11 @@ test('Releases: список и сравнение с предыдущим', asy
   await expect(page.getByRole('heading', { name: 'Релиз 0.1.0' })).toBeVisible();
   await expect(page.getByText('Интервал: начало журнала → 0.1.0')).toBeVisible();
   await expect(page.locator('[data-group="feat"]')).toContainText('Добавлен экспорт в Markdown');
+
+  // «Сравнить с» другим релизом: 0.1.0 от 0.2.0 — интервал пуст
+  await page.getByLabel('Сравнить с').selectOption({ label: '0.2.0' });
+  await expect(page.getByText('Интервал: 0.2.0 → 0.1.0')).toBeVisible();
+  await expect(page.getByText('Записей changelog в интервале нет.')).toBeVisible();
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
@@ -168,7 +176,53 @@ test('Insights: замена записи и повышение до theorem с 
   await cf.getByLabel(/^Причина/).fill('подтверждено владельцем');
   await cf.getByRole('button', { name: 'Сохранить' }).click();
   await expect(card.locator('header [data-certainty="axiom"]')).toBeVisible();
+  // доказательство не удаляется, но подписано как прежнее
+  await expect(card.getByText('Прежнее доказательство')).toBeVisible();
+  await expect(card.locator('.evidence')).toContainText('в 8 раз быстрее из кэша');
   await page.screenshot({ path: `${screens}insights.png`, fullPage: true });
+
+  // Пересмотр и возврат
+  await card.getByRole('button', { name: 'Пересмотреть' }).click();
+  await expect(card.getByRole('status')).toHaveText('Запись отправлена на пересмотр.');
+  await expect(card.locator('header .status')).toHaveText('на пересмотре');
+  await card.getByRole('button', { name: 'Вернуть в действующие' }).click();
+  await expect(card.getByRole('status')).toHaveText('Запись снова действует.');
+  await expect(card.locator('header .status')).toHaveText('действует');
+
+  // Триггеры: добавить, сохранить, удалить
+  await card.getByRole('button', { name: 'Триггеры' }).click();
+  const tr = card.getByLabel('Триггеры', { exact: true });
+  await tr.getByLabel('Тип триггера').selectOption('file_glob');
+  await tr.getByLabel('Шаблон триггера').fill('**/qdrant/*.rs');
+  await tr.getByLabel('Инструменты').fill('Write, Edit');
+  await tr.getByRole('button', { name: 'Добавить' }).click();
+  await tr.getByRole('button', { name: 'Сохранить триггеры' }).click();
+  await expect(card.getByRole('status')).toHaveText('Триггеры сохранены.');
+  const saved = await page.request.get(`${base()}api/v1/entries/${env('E2E_INSIGHT_HYP')}`);
+  expect((await saved.json()).triggers).toMatchObject([
+    { type: 'file_glob', pattern: '**/qdrant/*.rs', tools: ['Write', 'Edit'] },
+  ]);
+  await card.getByRole('button', { name: 'Триггеры' }).click();
+  await expect(tr.locator('.triggers li')).toHaveCount(1);
+  await tr.getByRole('button', { name: 'Удалить триггер **/qdrant/*.rs' }).click();
+  await tr.getByRole('button', { name: 'Сохранить триггеры' }).click();
+  await expect(card.getByRole('status')).toHaveText('Триггеры сохранены.');
+  const cleared = await page.request.get(`${base()}api/v1/entries/${env('E2E_INSIGHT_HYP')}`);
+  expect((await cleared.json()).triggers).toEqual([]);
+
+  // Отзыв заменившей записи: причина обязательна, запись остаётся в истории
+  await table.getByRole('button', { name: 'Новый вывод о Qdrant' }).click();
+  await expect(card.getByRole('heading', { name: 'Новый вывод о Qdrant' })).toBeVisible();
+  await card.getByRole('button', { name: 'Отозвать' }).click();
+  const rf = card.getByRole('form', { name: 'Отзыв insight' });
+  await rf.getByRole('button', { name: 'Отозвать' }).click();
+  await expect(rf.getByRole('alert')).toHaveText('Укажите причину отзыва.');
+  await rf.getByLabel('Причина').fill('Qdrant заменён в задаче 4');
+  await rf.getByRole('button', { name: 'Отозвать' }).click();
+  await expect(card.getByRole('status')).toHaveText('Запись отозвана.');
+  await expect(card.locator('header .status')).toHaveText('отозван');
+  await expect(card).toContainText('Отозвано: Qdrant заменён в задаче 4');
+  await expect(card.getByRole('button', { name: 'Заменить' })).toHaveCount(0);
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
@@ -192,6 +246,15 @@ test('Vault: маска, раскрытие по «Показать», скры�
   await expect(item.getByLabel('Значение скрыто')).toBeVisible();
   expect(await page.content()).not.toContain(VAULT_SECRET);
   expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('журнал по прямому адресу у Rules: понятное сообщение', async ({ page }) => {
+  await page.goto(base());
+  await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+  const user = new URL(page.url()).hash.split('/')[2];
+  await page.goto(`${base()}#/u/${user}/s/rules/j/insights`);
+  await expect(page.getByRole('alert')).toContainText('У пространства «Rules» нет журнала Insights');
+  await expect(page.getByRole('table', { name: 'Insights' })).toHaveCount(0);
 });
 
 test('Vault: баннер vault-locked (503)', async ({ page }) => {
