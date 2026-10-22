@@ -795,7 +795,6 @@ fn pack_items(items: Vec<Item>, mode: SearchMode, budget_tokens: usize) -> Vec<P
         .collect()
 }
 
-/// Балл в ответе: 4 знака.
 /// Балл ответа: 0..1 с точностью 1e-4 (после бустов слитый балл может превысить 1 — порядок
 /// при этом сохраняется, шкала ответа — нет).
 fn round_score(s: f64) -> f64 {

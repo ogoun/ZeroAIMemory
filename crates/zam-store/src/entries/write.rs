@@ -10,7 +10,7 @@ use super::chunks::{entry_index_state, index_entry_now, unindex_entry};
 use super::{
     AREA_MAX_CHARS, Certainty, Entry, EntryKind, EntryPatch, EntryStatus, KEY_MAX_CHARS, NewEntry,
     REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, check_triggers, load_entry,
-    normalize_title, replace_triggers,
+    normalize_title, replace_triggers, same_triggers,
 };
 use crate::nodes::Attribution;
 use crate::time::fmt_ts;
@@ -181,8 +181,10 @@ pub async fn entry_by_idempotency_key(
 }
 
 /// Повтор запроса с тем же ключом: та же запись, если отпечаток запроса (вид, пространство,
-/// заголовок, тело, `data`) совпал с первой ревизией; расхождение → `IdempotencyMismatch`,
-/// удалённая запись → `Conflict`.
+/// заголовок, тело, `data`) совпал с первой ревизией, а триггеры — с текущим набором записи
+/// (триггеры в ревизию не входят: после замены набора правкой повтор исходного запроса
+/// расходится) **[решение исполнителя]**; расхождение → `IdempotencyMismatch`, удалённая
+/// запись → `Conflict`.
 fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<Entry, StoreError> {
     let (title, body, data): (String, String, String) = c
         .prepare_cached(
@@ -196,6 +198,7 @@ fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<Entry, StoreE
         || title != e.title.trim()
         || body != e.body
         || data != e.data
+        || !same_triggers(c, ex.id, &e.triggers)?
     {
         return Err(StoreError::IdempotencyMismatch(
             "Idempotency-Key уже использован запросом с другим содержимым".into(),
@@ -399,6 +402,20 @@ fn save(
     index_entry_now(c, cur.id, Some(cur.index_state), now)
 }
 
+/// Содержимое insight `superseded`/`retracted` не переписывается (история только дописывается:
+/// для исправления создаётся новая запись) → `Conflict`.
+pub(crate) fn ensure_editable(e: &Entry) -> Result<(), StoreError> {
+    match e.status {
+        Some(s @ (EntryStatus::Superseded | EntryStatus::Retracted)) => {
+            Err(StoreError::Conflict(format!(
+                "запись {}: содержимое не меняется — для исправления создайте новую запись",
+                s.as_str()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Живая запись по id: нет или удалена → `NotFound`.
 fn live_entry(c: &Connection, id: Id) -> Result<Entry, StoreError> {
     let e = load_entry(c, id)?;
@@ -441,7 +458,8 @@ pub async fn create_entry(
 /// `active`/`revisit`, пустая причина → `BadInput`; смена статуса у `superseded` или
 /// `retracted` → `Conflict`. Правка без изменений возвращает запись как есть, без ревизии.
 /// `triggers` заменяет набор триггеров insight в той же транзакции (неверный → `BadInput`);
-/// триггеры в ревизию не входят.
+/// триггеры в ревизию не входят. Правка содержимого (заголовок, тело, `data`, теги, область,
+/// триггеры) insight `superseded`/`retracted` → `Conflict`.
 pub async fn update_entry(
     db: &Db,
     id: Id,
@@ -461,6 +479,16 @@ pub async fn update_entry(
             )));
         }
         let reason = check_reason(p.reason)?;
+        let content = p.title.is_some()
+            || p.body.is_some()
+            || p.append_body.is_some()
+            || p.data.is_some()
+            || p.tags.is_some()
+            || p.area.is_some()
+            || p.triggers.is_some();
+        if content {
+            ensure_editable(&cur)?;
+        }
         if p.body.is_some() && p.append_body.is_some() {
             return Err(bad("body и append_body вместе"));
         }

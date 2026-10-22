@@ -1063,3 +1063,189 @@ async fn strict_area_filter() {
         assert_eq!(hit_ids(&r.json())[0], id_of(first), "{area}");
     }
 }
+
+/// Строки аудита с действием `action`: цели (`target`) по порядку.
+async fn audit_targets(w: &W, action: &str) -> Vec<String> {
+    let r =
+        w.a.adm(Method::GET, "/api/v1/admin/audit?limit=200", None, None)
+            .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["action"] == action)
+        .map(|i| i["target"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn supersede_audited_on_both_paths() {
+    let w = world("supersede-audit", false).await;
+    let a = w.created(insight("Аудит А", "")).await;
+    let b = w.created(insight("Аудит Б", "")).await;
+    // POST /entries/{id}/supersede
+    let r = w
+        .req(
+            &w.a_tok,
+            Method::POST,
+            &format!("/api/v1/entries/{}/supersede", id_of(&a)),
+            Some(json!({"title": "Аудит А2", "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // supersedes_id при создании; повтор по ключу новой строки не добавляет
+    let body = with(insight("Аудит Б2", ""), "supersedes_id", b["id"].clone());
+    for want in [StatusCode::CREATED, StatusCode::OK] {
+        let r = w
+            .post_in(&w.a_tok, G, body.clone(), &[("idempotency-key", "sup-b")])
+            .await;
+        assert_eq!(r.status, want, "{}", r.text());
+    }
+    let mut got = audit_targets(&w, "entry.supersede").await;
+    got.sort();
+    let mut want = vec![id_of(&a), id_of(&b)];
+    want.sort();
+    assert_eq!(got, want);
+}
+
+#[tokio::test]
+async fn superseded_and_retracted_content_is_frozen_409() {
+    let w = world("frozen", false).await;
+    let a = w.created(insight("Замороженная", "Текст.")).await;
+    let r = w
+        .req(
+            &w.a_tok,
+            Method::POST,
+            &format!("/api/v1/entries/{}/supersede", id_of(&a)),
+            Some(json!({"title": "Новая", "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let b = w.created(insight("Отозванная", "Текст.")).await;
+    let r = w
+        .req(
+            &w.a_tok,
+            Method::POST,
+            &format!("/api/v1/entries/{}/retract", id_of(&b)),
+            Some(json!({"reason": "неверно"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    for id in [id_of(&a), id_of(&b)] {
+        for patch in [
+            json!({"title": "Переписано"}),
+            json!({"body": "Переписано"}),
+            json!({"append_body": "Ещё"}),
+            json!({"data": {"kind": "failure"}}),
+            json!({"tags": ["x"]}),
+            json!({"area": "web"}),
+            json!({"triggers": [{"type": "keyword", "pattern": "x"}]}),
+        ] {
+            let r = w.patch(&id, patch.clone()).await;
+            assert_eq!(r.status, StatusCode::CONFLICT, "{patch}: {}", r.text());
+        }
+        let e = w.entry(&id).await;
+        assert_eq!(
+            (e["rev"].clone(), e["body"].clone()),
+            (json!(2), json!("Текст."))
+        );
+    }
+    // действующая запись правится как обычно
+    let n = w.created(insight("Живая", "")).await;
+    let r = w.patch(&id_of(&n), json!({"title": "Живая 2"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+#[tokio::test]
+async fn idempotency_fingerprint_includes_triggers() {
+    let w = world("idem-triggers", false).await;
+    let body = with(
+        insight("С триггерами", ""),
+        "triggers",
+        json!([{"type": "keyword", "pattern": "lf"}]),
+    );
+    let k = [("idempotency-key", "trig-1")];
+    let r = w.post_in(&w.a_tok, G, body.clone(), &k).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // тот же набор (ключевое слово с пробелами нормализуется) — та же запись
+    let same = with(
+        body.clone(),
+        "triggers",
+        json!([{"type": "keyword", "pattern": " lf "}]),
+    );
+    let r2 = w.post_in(&w.a_tok, G, same, &k).await;
+    assert_eq!(r2.status, StatusCode::OK, "{}", r2.text());
+    assert_eq!(r2.json()["id"], r.json()["id"]);
+    // иной набор — 422 idempotency-mismatch
+    for other in [
+        json!([{"type": "keyword", "pattern": "crlf"}]),
+        json!([]),
+        json!([{"type": "keyword", "pattern": "lf"}, {"type": "keyword", "pattern": "x"}]),
+    ] {
+        let r = w
+            .post_in(
+                &w.a_tok,
+                G,
+                with(body.clone(), "triggers", other.clone()),
+                &k,
+            )
+            .await;
+        assert_eq!(
+            r.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{other}: {}",
+            r.text()
+        );
+        assert_eq!(r.json()["type"], "/problems/idempotency-mismatch");
+    }
+}
+
+#[tokio::test]
+async fn search_boosts_gotcha_above_equal_note() {
+    let w = world("boost", false).await;
+    let title = "Кодировка конца строк";
+    let body = "Скрипты оболочки ломаются от символа возврата каретки.";
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::POST,
+            "/api/v1/nodes",
+            Some(json!({"space": G, "path": "notes/eol", "kind": "note",
+                        "content": format!("# {title}\n\n{body}\n")})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let note = id_of(&r.json());
+    let gotcha = w.created(insight(title, body)).await;
+    // тот же текст другого вида — без буста
+    let plain = w
+        .created(with(
+            with(insight(title, body), "data", json!({"kind": "discovery"})),
+            "force",
+            json!(true),
+        ))
+        .await;
+    let j = w
+        .search(json!({"query": "возврата каретки", "scope": {"solution": G}, "mode": "chunks"}))
+        .await;
+    let items = j["items"].as_array().unwrap();
+    let pos = |key: &str, id: &str| {
+        items
+            .iter()
+            .position(|i| i[key] == id)
+            .unwrap_or_else(|| panic!("нет {id}: {j}"))
+    };
+    let (g, p, n) = (
+        pos("entry_id", &id_of(&gotcha)),
+        pos("entry_id", &id_of(&plain)),
+        pos("node_id", &note),
+    );
+    assert_eq!(g, 0, "{j}");
+    assert!(g < n && g < p, "{j}");
+    // буст — множитель 1,15 к баллу записи того же текста другого вида
+    let score = |i: usize| items[i]["score"].as_f64().unwrap();
+    if score(g) < 1.0 {
+        assert!((score(g) / score(p) - 1.15).abs() < 0.01, "{j}");
+    }
+}

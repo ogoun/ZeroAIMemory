@@ -168,31 +168,8 @@ enum LogCmd {
         /// Вид: gotcha, failure, discovery, decision, experiment, pattern
         #[arg(long, value_parser = ["gotcha", "failure", "discovery", "decision", "experiment", "pattern"])]
         kind: String,
-        /// Заголовок
-        #[arg(long)]
-        title: String,
-        /// Файл с текстом (иначе stdin)
-        #[arg(long)]
-        body_file: Option<PathBuf>,
-        /// Эпистемический статус: theorem (с --evidence-file) или hypothesis
-        #[arg(long, value_parser = ["theorem", "hypothesis"])]
-        certainty: Option<String>,
-        /// JSON-файл доказательства {checked, method, result} → data.evidence
-        #[arg(long)]
-        evidence_file: Option<PathBuf>,
-        /// Триггер вспоминания ВИД:ШАБЛОН: file_glob:**/*.sh, command_regex:…, error_regex:…,
-        /// keyword:… (можно повторять)
-        #[arg(long = "trigger")]
-        triggers: Vec<String>,
-        /// Тег (можно повторять)
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        /// Область (монорепозиторий)
-        #[arg(long)]
-        area: Option<String>,
-        /// Ключ идемпотентности
-        #[arg(long)]
-        key: Option<String>,
+        #[command(flatten)]
+        new: InsightArgs,
         /// solution (по умолчанию) или global — в Knowledge, для всех проектов
         #[arg(long, value_parser = ["solution", "global"])]
         scope: Option<String>,
@@ -208,6 +185,52 @@ enum LogCmd {
         #[command(flatten)]
         common: Common,
     },
+}
+
+/// Поля новой записи insight (`log insight`, `insight supersede`).
+#[derive(clap::Args)]
+struct InsightArgs {
+    /// Заголовок
+    #[arg(long)]
+    title: String,
+    /// Файл с текстом (иначе stdin)
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+    /// Эпистемический статус: theorem (с --evidence-file) или hypothesis
+    #[arg(long, value_parser = ["theorem", "hypothesis"])]
+    certainty: Option<String>,
+    /// JSON-файл доказательства {checked, method, result} → data.evidence
+    #[arg(long)]
+    evidence_file: Option<PathBuf>,
+    /// Триггер вспоминания ВИД:ШАБЛОН: file_glob:**/*.sh, command_regex:…, error_regex:…,
+    /// keyword:… (можно повторять)
+    #[arg(long = "trigger")]
+    triggers: Vec<String>,
+    /// Тег (можно повторять)
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// Область (монорепозиторий)
+    #[arg(long)]
+    area: Option<String>,
+    /// Ключ идемпотентности
+    #[arg(long)]
+    key: Option<String>,
+}
+
+impl InsightArgs {
+    fn fields<'a>(&'a self, kind: Option<&'a str>) -> cmd::insight::Fields<'a> {
+        cmd::insight::Fields {
+            kind,
+            title: &self.title,
+            body_file: self.body_file.as_deref(),
+            certainty: self.certainty.as_deref(),
+            evidence_file: self.evidence_file.as_deref(),
+            triggers: &self.triggers,
+            tags: &self.tags,
+            area: self.area.as_deref(),
+            key: self.key.as_deref(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -240,31 +263,8 @@ enum InsightCmd {
         /// Вид (по умолчанию — как у замещаемой)
         #[arg(long, value_parser = ["gotcha", "failure", "discovery", "decision", "experiment", "pattern"])]
         kind: Option<String>,
-        /// Заголовок
-        #[arg(long)]
-        title: String,
-        /// Файл с текстом (иначе stdin)
-        #[arg(long)]
-        body_file: Option<PathBuf>,
-        /// Эпистемический статус: theorem (с --evidence-file) или hypothesis
-        #[arg(long, value_parser = ["theorem", "hypothesis"])]
-        certainty: Option<String>,
-        /// JSON-файл доказательства {checked, method, result} → data.evidence
-        #[arg(long)]
-        evidence_file: Option<PathBuf>,
-        /// Триггер вспоминания ВИД:ШАБЛОН: file_glob:**/*.sh, command_regex:…, error_regex:…,
-        /// keyword:… (можно повторять)
-        #[arg(long = "trigger")]
-        triggers: Vec<String>,
-        /// Тег (можно повторять)
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        /// Область (монорепозиторий)
-        #[arg(long)]
-        area: Option<String>,
-        /// Ключ идемпотентности
-        #[arg(long)]
-        key: Option<String>,
+        #[command(flatten)]
+        new: InsightArgs,
         #[command(flatten)]
         common: Common,
     },
@@ -455,29 +455,9 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
         InsightCmd::Supersede {
             id,
             kind,
-            title,
-            body_file,
-            certainty,
-            evidence_file,
-            triggers,
-            tags,
-            area,
-            key,
+            new,
             common,
-        } => {
-            let f = i::Fields {
-                kind: kind.as_deref(),
-                title: &title,
-                body_file: body_file.as_deref(),
-                certainty: certainty.as_deref(),
-                evidence_file: evidence_file.as_deref(),
-                triggers: &triggers,
-                tags: &tags,
-                area: area.as_deref(),
-                key: key.as_deref(),
-            };
-            i::supersede(&cmd::connect(&common)?, &id, &f)
-        }
+        } => i::supersede(&cmd::connect(&common)?, &id, &new.fields(kind.as_deref())),
         InsightCmd::Retract { id, reason, common } => {
             i::retract(&cmd::connect(&common)?, &id, &reason)
         }
@@ -592,14 +572,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             cmd:
                 LogCmd::Insight {
                     kind,
-                    title,
-                    body_file,
-                    certainty,
-                    evidence_file,
-                    triggers,
-                    tags,
-                    area,
-                    key,
+                    new,
                     scope,
                     force,
                     supersedes,
@@ -608,17 +581,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 },
         } => {
             let o = cmd::insight::Log {
-                fields: cmd::insight::Fields {
-                    kind: Some(&kind),
-                    title: &title,
-                    body_file: body_file.as_deref(),
-                    certainty: certainty.as_deref(),
-                    evidence_file: evidence_file.as_deref(),
-                    triggers: &triggers,
-                    tags: &tags,
-                    area: area.as_deref(),
-                    key: key.as_deref(),
-                },
+                fields: new.fields(Some(&kind)),
                 scope: scope.as_deref(),
                 force,
                 supersedes: supersedes.as_deref(),

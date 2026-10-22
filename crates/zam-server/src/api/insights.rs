@@ -8,7 +8,8 @@
 //!   `triggers`, `tags`, `area`, `message`; плюс `force` и `supersedes_id`;
 //! - `scope: global` — запись в Knowledge пользователя запроса (пространство пути проверяется
 //!   только на чтение: отзыв доступа к решению — 403 и здесь); без `scope` — по пространству
-//!   пути: решение — `solution`, Knowledge — `global`; Rules и Human — 422;
+//!   пути: решение — `solution`, Knowledge — `global`; Rules и Human — 422, если запись туда
+//!   разрешена правами (администратор, `rules.agent_write`), иначе раньше — 403/404 доступа;
 //! - дедупликация (без `force` и `supersedes_id`, [`dedup`]): тот же нормализованный
 //!   заголовок у `active`/`revisit` той же области и — при доступном векторном канале —
 //!   dense-косинус `embed_query(title + "\n" + body)` с insight той же области не ниже
@@ -46,7 +47,9 @@ use zam_store::{
     validate_trigger,
 };
 
-use super::entries::{check_size, check_title, idempotency_key};
+use super::entries::{
+    audit_details, check_size, check_title, empty_object, idempotency_key, unprocessable,
+};
 use super::json_body;
 use super::nodes::audit_node;
 use super::scope::{EntryScope, MemScope, Mode, entry_scope, live_entry, space_scope};
@@ -69,10 +72,6 @@ const EXPERIMENT_RESULTS: [&str; 3] = ["confirmed", "refuted", "inconclusive"];
 /// Ближайших точек на запрос дедупликации: у записи несколько чанков, часть кандидатов
 /// отсеивается проверкой по SQLite. [решение исполнителя]
 const DEDUP_NEAREST: usize = 20;
-
-fn unprocessable(m: impl Into<String>) -> ApiError {
-    ApiError::Unprocessable(m.into())
-}
 
 /// Тело создания или замещения insight (поля §7.5).
 #[derive(Deserialize)]
@@ -99,10 +98,6 @@ pub struct InsightReq {
     #[serde(default)]
     force: bool,
     supersedes_id: Option<String>,
-}
-
-fn empty_object() -> Value {
-    json!({})
 }
 
 /// `data` insight: `kind` из [`INSIGHT_KINDS`]; `experiment` и `evidence`, если заданы, —
@@ -388,6 +383,7 @@ pub async fn create(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
+    client: &Client,
     space: &str,
     body: Value,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
@@ -423,6 +419,20 @@ pub async fn create(
         let new = new_entry(req, sc.space.id, key, triggers);
         let (n, o) = supersede_entry(&sc.db, old, new, &attrib).await?;
         st.index.notify();
+        // аудит — как у POST /entries/{id}/supersede (повтор по ключу — без новой строки)
+        if !repeat {
+            audit_node(
+                st,
+                p,
+                client,
+                sc.user.id,
+                sc.owner,
+                "entry.supersede",
+                old,
+                audit_details(sc.space.id, EntryKind::Insight),
+            )
+            .await?;
+        }
         let mut v = entry_json(&sc.db, &n).await?;
         v["superseded"] =
             serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -477,10 +487,6 @@ fn live_insight(sc: &EntryScope) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn audit_details(sc: &EntryScope) -> Value {
-    json!({ "space": sc.space.id, "kind": sc.entry.kind.as_str() })
-}
-
 /// `POST /entries/{id}/supersede {новая запись}` → 201 `{entry, superseded}` (повтор по
 /// `Idempotency-Key` — 200); старая — `superseded`, новая — со ссылкой на неё; ничего не
 /// удаляется. Уже `superseded`/`retracted` → 409. Аудит `entry.supersede`.
@@ -521,7 +527,7 @@ pub async fn supersede(
             sc.owner,
             "entry.supersede",
             sc.entry.id,
-            audit_details(&sc),
+            audit_details(sc.space.id, sc.entry.kind),
         )
         .await?;
     }
@@ -582,7 +588,7 @@ pub async fn retract(
         sc.owner,
         "entry.retract",
         sc.entry.id,
-        audit_details(&sc),
+        audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
     Ok(Json(entry_json(&sc.db, &e).await?))

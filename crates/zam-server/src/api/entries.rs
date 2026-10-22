@@ -32,7 +32,7 @@ use zam_store::{
 
 use super::insights::{entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
-use super::scope::{EntryScope, Mode, entry_scope, live_entry, space_scope};
+use super::scope::{Mode, entry_scope, live_entry, space_scope};
 use super::{json_body, query};
 use crate::app::AppState;
 use crate::attrib::attribution;
@@ -57,7 +57,7 @@ const SUBJECT_MAX_CHARS: usize = 1000;
 /// Лента по умолчанию.
 const LIST_DEFAULT: usize = 50;
 
-fn unprocessable(m: impl Into<String>) -> ApiError {
+pub(crate) fn unprocessable(m: impl Into<String>) -> ApiError {
     ApiError::Unprocessable(m.into())
 }
 
@@ -232,7 +232,7 @@ pub struct Create {
     message: Option<String>,
 }
 
-fn empty_object() -> Value {
+pub(crate) fn empty_object() -> Value {
     json!({})
 }
 
@@ -253,12 +253,13 @@ pub async fn create(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    client: Client,
     Path(space): Path<String>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let raw: Value = json_body(body)?;
     if raw.get("kind").and_then(Value::as_str) == Some(EntryKind::Insight.as_str()) {
-        return super::insights::create(&st, &p, &headers, &space, raw).await;
+        return super::insights::create(&st, &p, &headers, &client, &space, raw).await;
     }
     let req: Create = serde_json::from_value(raw)
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
@@ -522,8 +523,9 @@ pub async fn patch(
     Ok(Json(entry_json(&sc.db, &e).await?))
 }
 
-fn audit_details(sc: &EntryScope) -> Value {
-    json!({ "space": sc.space.id, "kind": sc.entry.kind.as_str() })
+/// Детали аудита операций записи (без текста записи).
+pub(crate) fn audit_details(space: zam_core::Id, kind: EntryKind) -> Value {
+    json!({ "space": space, "kind": kind.as_str() })
 }
 
 /// `DELETE /entries/{id}` — мягкое удаление → 204; аудит `entry.delete`.
@@ -547,7 +549,7 @@ pub async fn remove(
         sc.owner,
         "entry.delete",
         sc.entry.id,
-        audit_details(&sc),
+        audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -573,7 +575,7 @@ pub async fn restore(
         sc.owner,
         "entry.restore",
         sc.entry.id,
-        audit_details(&sc),
+        audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
     Ok(Json(e))

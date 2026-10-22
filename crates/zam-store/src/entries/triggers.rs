@@ -227,6 +227,29 @@ pub(crate) fn replace_triggers(
     Ok(())
 }
 
+/// Текущий набор триггеров записи `entry` совпадает с `ts` (после нормализации
+/// [`check_triggers`]; порядок важен) — отпечаток повтора по `Idempotency-Key`.
+pub(crate) fn same_triggers(
+    c: &Connection,
+    entry: Id,
+    ts: &[NewTrigger],
+) -> Result<bool, StoreError> {
+    let want = check_triggers(ts.to_vec())?;
+    let mut st = c.prepare_cached(
+        "SELECT type, pattern, tools FROM triggers WHERE entry_id = ?1 ORDER BY rowid",
+    )?;
+    let have: Vec<NewTrigger> = st
+        .query_map([entry], |r| {
+            Ok(NewTrigger {
+                kind: r.get(0)?,
+                pattern: r.get(1)?,
+                tools: tools_col(r, 2)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(have == want)
+}
+
 /// JSON-массив инструментов из колонки `tools`.
 fn tools_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<Vec<String>>> {
     let s: Option<String> = r.get(i)?;
@@ -249,6 +272,7 @@ pub async fn set_triggers(db: &Db, entry: Id, ts: Vec<NewTrigger>) -> Result<(),
                 "триггеры есть только у insight".into(),
             ));
         }
+        super::write::ensure_editable(&e)?;
         replace_triggers(tx, entry, &ts, &fmt_ts(Timestamp::now()))
     })
     .await

@@ -44,7 +44,7 @@ pub use triggers::{
     KEYWORD_MAX_CHARS, NewTrigger, PATTERN_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger,
     TriggerKind, TriggerRow, active_triggers, entry_triggers, set_triggers, validate_trigger,
 };
-pub(crate) use triggers::{check_triggers, replace_triggers};
+pub(crate) use triggers::{check_triggers, replace_triggers, same_triggers};
 pub use write::{
     create_entry, delete_entry, entry_by_idempotency_key, restore_entry, retract_entry,
     supersede_entry, update_entry,
