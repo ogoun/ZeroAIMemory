@@ -1,3 +1,6 @@
+---
+index: false
+---
 # Reading GET /index/status and the Index page
 
 `GET /api/v1/index/status` is the first place to look when semantic search "doesn't work".

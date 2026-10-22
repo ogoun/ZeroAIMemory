@@ -1,3 +1,6 @@
+---
+index: false
+---
 # Named volumes vs bind mounts, and the uid mismatch behind "Permission denied"
 
 ## Short version

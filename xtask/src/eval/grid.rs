@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use super::corpus::{Corpus, Query};
 use super::metrics::{Estimate, paired_diff};
-use super::report::{self, est};
+use super::report::{self, diff, est};
 use super::run::{self, QueryRun, RunResult, RunSpec, Session};
 use super::{Device, EvalArgs, Mode, Paths};
 
@@ -67,6 +67,12 @@ pub struct ConfigResult {
     pub d_mrr10: Estimate,
     pub d_ndcg10: Estimate,
     pub d_ndcg10_disjoint: Estimate,
+    /// Набор M3: разности по запросам `chunk` (листы) и по запросам к длинным заметкам.
+    pub d_chunk_recall5: Option<Estimate>,
+    pub d_chunk_ndcg10: Option<Estimate>,
+    pub d_ndcg10_long: Option<Estimate>,
+    /// Листовых чанков заметок в индексе конфигурации (критерий ±5 % задачи нарезки).
+    pub leaf_chunks: usize,
     /// Устойчиво лучше базовой: нижняя граница интервала разности nDCG@10 > 0.
     pub better: bool,
     /// Устойчиво хуже: верхняя граница < 0.
@@ -124,6 +130,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
         }
     }
     let mut results: Vec<Option<(RunResult, f64)>> = (0..g.config.len()).map(|_| None).collect();
+    let mut leaf_counts = vec![0usize; g.config.len()];
     for (gi, (_, members)) in groups.iter().enumerate() {
         let mut session: Option<Session> = None;
         let mut index_secs = 0.0;
@@ -162,6 +169,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
                 est(&r.metrics.overall.ndcg10),
                 est(&r.metrics.overall.recall5)
             );
+            leaf_counts[ci] = run::leaf_cores(&s.data)?.len();
             results[ci] = Some((r, index_secs));
             session = Some(s);
         }
@@ -179,7 +187,8 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
     let configs = results
         .iter()
         .zip(&g.config)
-        .map(|((r, secs), c)| {
+        .zip(&leaf_counts)
+        .map(|(((r, secs), c), &leaf_chunks)| {
             let q = &r.queries;
             let dis: Vec<&QueryRun> = q.iter().filter(|x| x.disjoint).collect();
             let d_ndcg10 = paired_diff(
@@ -206,6 +215,10 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
                         .collect::<Vec<_>>(),
                     &dis.iter().map(|x| x.metrics.ndcg10).collect::<Vec<_>>(),
                 ),
+                d_chunk_recall5: subset_diff(base, q, |x| x.metrics.chunk_recall5),
+                d_chunk_ndcg10: subset_diff(base, q, |x| x.metrics.chunk_ndcg10),
+                d_ndcg10_long: subset_diff(base, q, |x| x.long.then_some(x.metrics.ndcg10)),
+                leaf_chunks,
                 better: d_ndcg10.lo > 0.0,
                 worse: d_ndcg10.hi < 0.0,
                 per_query: q
@@ -237,8 +250,23 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
     Ok(())
 }
 
-fn diff(e: &Estimate) -> String {
-    format!("{:+.3} [{:+.3}…{:+.3}]", e.mean, e.lo, e.hi)
+/// Парная разность по запросам, у которых метрика есть в обеих конфигурациях (одни id в
+/// одном порядке); `None` — таких запросов нет.
+fn subset_diff(
+    base: &[QueryRun],
+    q: &[QueryRun],
+    f: fn(&QueryRun) -> Option<f64>,
+) -> Option<Estimate> {
+    let (a, b): (Vec<f64>, Vec<f64>) = base
+        .iter()
+        .zip(q)
+        .filter_map(|(x, y)| Some((f(x)?, f(y)?)))
+        .unzip();
+    (!a.is_empty()).then(|| paired_diff(&a, &b))
+}
+
+fn opt_diff(e: &Option<Estimate>) -> String {
+    e.as_ref().map_or("—".into(), diff)
 }
 
 /// Markdown сетки.
@@ -250,8 +278,8 @@ pub fn grid_md(g: &GridResult) -> String {
         g.model, g.device, g.date, g.git, g.notes, g.queries
     );
     s.push_str(
-        "| Конфигурация | переопределения | индексация, с | recall@5 | nDCG@10 | Δ recall@5 | Δ MRR@10 | Δ nDCG@10 | Δ nDCG@10 без общих слов | итог |\n\
-         |---|---|---:|---|---|---|---|---|---|---|\n",
+        "| Конфигурация | переопределения | индексация, с | листов | recall@5 | nDCG@10 | chunk-recall@5 | Δ recall@5 | Δ MRR@10 | Δ nDCG@10 | Δ nDCG@10 без общих слов | Δ chunk-recall@5 | Δ chunk-nDCG@10 | Δ nDCG@10 длинных | итог |\n\
+         |---|---|---:|---:|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for c in &g.configs {
         let sets: Vec<String> = c
@@ -262,7 +290,7 @@ pub fn grid_md(g: &GridResult) -> String {
             .collect();
         let _ = writeln!(
             s,
-            "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             c.config.name,
             if sets.is_empty() {
                 "умолчания".into()
@@ -270,12 +298,21 @@ pub fn grid_md(g: &GridResult) -> String {
                 sets.join(", ")
             },
             c.index_secs,
+            c.leaf_chunks,
             est(&c.metrics.overall.recall5),
             est(&c.metrics.overall.ndcg10),
+            c.metrics
+                .overall
+                .chunk_recall5
+                .as_ref()
+                .map_or("—".into(), est),
             diff(&c.d_recall5),
             diff(&c.d_mrr10),
             diff(&c.d_ndcg10),
             diff(&c.d_ndcg10_disjoint),
+            opt_diff(&c.d_chunk_recall5),
+            opt_diff(&c.d_chunk_ndcg10),
+            opt_diff(&c.d_ndcg10_long),
             if c.better {
                 "лучше"
             } else if c.worse {

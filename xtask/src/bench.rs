@@ -1384,6 +1384,8 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         repo: repo.to_path_buf(),
         corpus: eval.join("corpus"),
         queries: eval.join("queries.toml"),
+        // замеры §17 — на заметках; insight набора M3 bench не загружает
+        insights: eval.join("insights.toml"),
         results: a.out.clone().unwrap_or_else(|| eval.join("results")),
         work: repo.join("target").join("bench"),
     };

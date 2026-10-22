@@ -1,0 +1,707 @@
+# Insight набора eval M3 (ТЗ §18.2, задача 16 M3). Формат и правила — eval/README.md.
+#
+# Загрузчик (`cargo xtask eval`) создаёт записи в порядке файла: `supersedes` — замещение
+# записи, определённой выше (`POST /entries/{id}/supersede`), `retract_reason` — отзыв после
+# создания всех записей. `certainty = "axiom"` пишет человеческий токен администратора
+# прогона, остальное — токен агента; `theorem` — с `evidence {checked, method, result}`.
+# Без `certainty` запись агента получает `hypothesis`.
+#
+# Группы ключей: c — цепочки замещения, r — отзывы и верные выводы на их месте,
+# p — пары противоречий «надёжное — гипотеза».
+
+# ---- c01: TTL кеша тарифов доставки ----
+
+[[insight]]
+key = "c01-a"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+title = "Кеш тарифов доставки живёт 10 минут"
+body = "Тарифы доставки кешируются на 10 минут по ключу регион и тип доставки. Дольше держать нельзя: тарифы меняются при обновлении договоров со службами доставки."
+
+[[insight]]
+key = "c01-b"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+supersedes = "c01-a"
+title = "Кеш тарифов доставки живёт 60 минут и прогревается перед распродажей"
+body = "Срок жизни кеша тарифов доставки увеличен до 60 минут: тарифы меняются раз в сутки, а при обновлении договора кеш сбрасывается событием. За 10 минут до старта распродажи задача прогрева заполняет все сочетания региона и типа доставки за последний месяц."
+
+# ---- c02: сборка Rust на Windows ----
+
+[[insight]]
+key = "c02-a"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+title = "Сборка Rust на Windows падает из-за длинных путей"
+body = "Ошибки «os error 3» при сборке на Windows вызваны пределом длины пути в 260 символов. Нужно включить LongPathsEnabled в реестре и перезапустить терминал."
+
+[[insight]]
+key = "c02-b"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+supersedes = "c02-a"
+title = "Сборка Rust на Windows: виноват Defender, а не длина путей"
+body = "Повторный разбор показал, что сборка падала, потому что антивирус Defender удерживал только что записанные файлы в каталоге target, и компоновщик не мог их открыть. Помогло исключение каталога target и кеша cargo из проверки в реальном времени; LongPathsEnabled ни на что не влиял."
+
+# ---- c03: synchronous в SQLite WAL ----
+
+[[insight]]
+key = "c03-a"
+lang = "en"
+kind = "decision"
+scope = "global"
+title = "Run the index SQLite database with synchronous=FULL"
+body = "The index database runs in WAL mode with synchronous=FULL so that no committed transaction can be lost on power failure."
+
+[[insight]]
+key = "c03-b"
+lang = "en"
+kind = "decision"
+scope = "global"
+supersedes = "c03-a"
+title = "synchronous=NORMAL is enough for the WAL-mode index database"
+body = "In WAL mode, synchronous=NORMAL keeps the database consistent after power loss; only the last transactions before the crash may be rolled back, and the index can be rebuilt from the source of truth anyway. On HDD, FULL tripled write latency because every commit waited for an fsync of the WAL file, so the setting was switched to NORMAL."
+
+# ---- c04: восстановление снимка Qdrant ----
+
+[[insight]]
+key = "c04-a"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+title = "Restoring a Qdrant snapshot requires stopping the server"
+body = "To restore a collection snapshot, stop Qdrant, put the snapshot file into the snapshots directory and start it with the snapshot path flag."
+
+[[insight]]
+key = "c04-b"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+supersedes = "c04-a"
+title = "Qdrant restores collection snapshots through the API without a restart"
+body = "Current Qdrant versions recover a collection from a snapshot while running: call PUT /collections/{name}/snapshots/recover with the snapshot location. The server keeps serving other collections, and no restart is needed."
+
+# ---- c05: версия Node.js для фронтенда (три шага) ----
+
+[[insight]]
+key = "c05-a"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+title = "Фронтенд собирается на Node.js 18"
+body = "Версия Node.js для сборки фронтенда закреплена на 18 в файле версий репозитория: на ней работают все плагины сборщика."
+
+[[insight]]
+key = "c05-b"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+supersedes = "c05-a"
+title = "Фронтенд переведён на Node.js 20"
+body = "Node.js 18 выходит из поддержки, сборка фронтенда переведена на Node.js 20; плагин генерации иконок пришлось обновить до новой мажорной версии."
+
+[[insight]]
+key = "c05-c"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+supersedes = "c05-b"
+title = "Фронтенд собирается на Node.js 22 LTS"
+body = "Сборка фронтенда переведена на Node.js 22 LTS: на ней сборщик быстрее примерно на 15 процентов, а все плагины уже поддерживают её. Версия закреплена в файле версий, CI берёт её оттуда же."
+
+# ---- c06: глубина реранка (три шага) ----
+
+[[insight]]
+key = "c06-a"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+title = "Rerank the top 50 search candidates"
+body = "The reranker rescoring step takes the top 50 fused candidates; deeper windows should catch relevant items that fusion ranks low."
+
+[[insight]]
+key = "c06-b"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+supersedes = "c06-a"
+title = "Rerank the top 30 search candidates"
+body = "Reranking 50 candidates on CPU exceeded the latency budget; 30 candidates keep nearly the same nDCG@10 at about 60 percent of the cost."
+
+[[insight]]
+key = "c06-c"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+supersedes = "c06-b"
+title = "Rerank only the top 20 search candidates"
+body = "Measurements on the eval set showed no significant nDCG@10 difference between reranking 20 and 30 candidates, while 20 halves reranker latency on CPU. The rerank window is now 20 candidates on every device."
+
+# ---- c07: ротация журналов шлюза ----
+
+[[insight]]
+key = "c07-a"
+lang = "ru"
+kind = "decision"
+scope = "global"
+title = "Журналы шлюза ротируются раз в сутки в 03:00"
+body = "Журналы доступа шлюза ротируются ежедневно в 03:00 системной ротацией, хранятся 14 файлов со сжатием."
+
+[[insight]]
+key = "c07-b"
+lang = "ru"
+kind = "decision"
+scope = "global"
+supersedes = "c07-a"
+title = "Журналы шлюза ротируются каждый час, правила лежат в репозитории сервиса"
+body = "После инцидента с переполнением диска журналы шлюза ротируются каждый час и хранятся 48 файлов. Правила ротации лежат в репозитории сервиса и устанавливаются при развёртывании, сигнал на переоткрытие файла получает сам процесс шлюза, а не обёртка."
+
+# ---- c08: ключ кеша зависимостей CI ----
+
+[[insight]]
+key = "c08-a"
+lang = "en"
+kind = "pattern"
+scope = "solution"
+title = "CI dependency cache key includes the branch name"
+body = "The dependency cache key is the branch name plus the lockfile hash, so that branches never share cache entries."
+
+[[insight]]
+key = "c08-b"
+lang = "en"
+kind = "pattern"
+scope = "solution"
+supersedes = "c08-a"
+title = "CI dependency cache key is the lockfile hash, written only from main"
+body = "Including the branch in the cache key made every new branch start cold. The key is now the lockfile hash with a prefix restore key, all branches read the shared cache, and only jobs on the main branch may write to it, so a branch cannot poison the cache."
+
+# ---- c09: алерт на заполнение диска (три шага) ----
+
+[[insight]]
+key = "c09-a"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+title = "Алерт на диск срабатывает на 95 процентах"
+body = "Алерт на заполнение корневого раздела узлов срабатывает при 95 процентах, данные снимаются раз в пять минут."
+
+[[insight]]
+key = "c09-b"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+supersedes = "c09-a"
+title = "Алерт на диск срабатывает на 90 процентах"
+body = "Порог алерта на заполнение диска понижен до 90 процентов: на 95 процентах до полного заполнения оставалось около семи минут."
+
+[[insight]]
+key = "c09-c"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+supersedes = "c09-b"
+title = "Прогнозный алерт на диск: заполнение меньше чем через четыре часа"
+body = "Основной алерт на диск теперь прогнозный: predict_linear по последнему часу, срабатывает, если до полного заполнения меньше четырёх часов, и держится 15 минут подряд. Уровневый алерт остался страховкой с порогом в абсолютной величине свободного места для каждого класса узлов."
+
+# ---- c10: max.poll.records потребителя индекса (три шага) ----
+
+[[insight]]
+key = "c10-a"
+lang = "en"
+kind = "decision"
+scope = "solution"
+title = "Search indexer consumer uses max.poll.records 500"
+body = "The search indexer Kafka consumer fetches batches of 500 records with the default five-minute max.poll.interval.ms; bigger batches make bulk writes to the search engine efficient."
+
+[[insight]]
+key = "c10-b"
+lang = "en"
+kind = "failure"
+scope = "solution"
+supersedes = "c10-a"
+title = "Search indexer consumer reduced to max.poll.records 100"
+body = "Heavy price-change events made a 500-record batch take longer than five minutes, the consumer missed its poll deadline and triggered cascading rebalances. As a stopgap, max.poll.records is 100 and max.poll.interval.ms is ten minutes."
+
+[[insight]]
+key = "c10-c"
+lang = "en"
+kind = "decision"
+scope = "solution"
+supersedes = "c10-b"
+title = "Search indexer back to max.poll.records 500 after the category mapping fix"
+body = "With category lookup replaced by a prebuilt map, the heaviest event takes 120 ms, so the batch size is back to 500 records. The ten-minute max.poll.interval.ms stays as a safety margin, and the group uses the cooperative sticky assignor."
+
+# ---- c11: где хранится токен агента ----
+
+[[insight]]
+key = "c11-a"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+title = "Токен агента передаётся через переменную окружения"
+body = "Агент получает токен ZeroAIMemory из переменной окружения, которую пользователь задаёт в профиле оболочки."
+
+[[insight]]
+key = "c11-b"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+supersedes = "c11-a"
+title = "Токен агента и адрес сервера лежат в блоке CLAUDE.md"
+body = "Решение владельца: адрес сервера и bearer-токен агента лежат прямо в блоке zeroaimemory файла CLAUDE.md или AGENTS.md. Переменные окружения не нужны, а утёкший токен отзывается в WebUI."
+
+# ---- c12: модель эмбеддингов по устройствам ----
+
+[[insight]]
+key = "c12-a"
+lang = "en"
+kind = "decision"
+scope = "solution"
+title = "Use bge-m3 int8 everywhere"
+body = "The int8 quantized bge-m3 model is used on every device, including GPUs, so that vectors are identical everywhere."
+
+[[insight]]
+key = "c12-b"
+lang = "en"
+kind = "decision"
+scope = "solution"
+supersedes = "c12-a"
+title = "bge-m3 fp16 on CUDA, int8 only on CPU"
+body = "On CUDA the embedder runs bge-m3 fp16, which is faster on the GPU than the int8 model and matches fp32 more closely; the int8 model stays the CPU default. Switching devices changes the collection model and requires a full reindex."
+
+# ---- c13: проверка резервных копий ----
+
+[[insight]]
+key = "c13-a"
+lang = "ru"
+kind = "pattern"
+scope = "global"
+title = "Резервная копия считается сделанной, если файл появился в архиве"
+body = "Задание резервного копирования проверяет, что файл копии за сутки появился в архиве и не пустой."
+
+[[insight]]
+key = "c13-b"
+lang = "ru"
+kind = "pattern"
+scope = "global"
+supersedes = "c13-a"
+title = "Резервная копия проверяется ежедневным восстановлением"
+body = "Наличие файла ничего не доказывает: полгода ночной дамп писал пустой архив. Теперь каждую ночь последняя копия одной из баз восстанавливается на временном сервере в изолированной сети, и проверки сверяют число строк и свежесть журнальных таблиц."
+
+# ---- c14: сроки сертификатов (три шага) ----
+
+[[insight]]
+key = "c14-a"
+lang = "en"
+kind = "decision"
+scope = "solution"
+title = "Internal TLS certificates are issued manually for one year"
+body = "Internal service certificates are requested through a ticket and signed by hand on the offline CA machine, valid for one year."
+
+[[insight]]
+key = "c14-b"
+lang = "en"
+kind = "decision"
+scope = "solution"
+supersedes = "c14-a"
+title = "Internal TLS certificates are issued for 90 days through internal ACME"
+body = "Server certificates come from the intermediate CA over ACME with DNS validation, valid for at most 90 days and renewed automatically 30 days before expiry."
+
+[[insight]]
+key = "c14-c"
+lang = "en"
+kind = "decision"
+scope = "solution"
+supersedes = "c14-b"
+title = "Certificate lifetimes: 90 days for servers, 30 in sensitive zones, 24 hours for mTLS clients"
+body = "Server certificates stay at 90 days, but in the payment and personal data zones they are issued for 30 days. Client certificates for service-to-service mTLS live 24 hours and are renewed every 8 hours, so revocation is rarely needed."
+
+# ---- r01: нестабильные тесты уведомлений (отзыв) ----
+
+[[insight]]
+key = "r01-wrong"
+lang = "ru"
+kind = "failure"
+scope = "solution"
+title = "Тесты сервиса уведомлений падают из-за гонки в брокере сообщений"
+body = "Нестабильные интеграционные тесты уведомлений вызваны гонкой в брокере: сообщение иногда доставляется до подтверждения подписки."
+retract_reason = "Гонки в брокере нет: тест ждал сообщение с фиксированным таймаутом 2 секунды, а на загруженном агенте доставка занимала 3–4 секунды."
+
+[[insight]]
+key = "r01-fix"
+lang = "ru"
+kind = "failure"
+scope = "solution"
+title = "Нестабильные тесты уведомлений: фиксированный таймаут ожидания сообщения"
+body = "Интеграционные тесты сервиса уведомлений ждали сообщение в очереди фиксированные 2 секунды, а на загруженном агенте CI брокер доставлял его за 3–4. Тесты переписаны на ожидание с опросом и общим пределом 30 секунд."
+
+# ---- r02: причина DNS-аварии (отзыв) ----
+
+[[insight]]
+key = "r02-wrong"
+lang = "en"
+kind = "failure"
+scope = "global"
+title = "Internal DNS outage was caused by overloaded authoritative servers"
+body = "The intermittent SERVFAIL responses came from the authoritative servers for internal zones, which could not keep up with query volume."
+retract_reason = "Authoritative servers were healthy; resolvers exhausted their shared worker pool waiting on an unreachable forwarder."
+
+[[insight]]
+key = "r02-fix"
+lang = "en"
+kind = "failure"
+scope = "global"
+title = "DNS outage: a forwarded zone with an unreachable target exhausted the resolver worker pool"
+body = "A new conditional forwarder pointed at servers reachable from only one region. Elsewhere, forwarded queries waited for the full timeout and filled the shared worker pool, blocking resolution of every zone. Per-forwarder concurrency limits and short timeouts contain it."
+
+# ---- r03: медленная загрузка на HDD (отзыв) ----
+
+[[insight]]
+key = "r03-wrong"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+title = "Медленная загрузка корпуса на HDD из-за Qdrant"
+body = "Загрузка тысяч заметок на HDD идёт медленно, потому что Qdrant не успевает записывать точки."
+retract_reason = "Qdrant ни при чём: замер показал, что время уходит на fsync SQLite при отдельной транзакции на каждую заметку."
+
+[[insight]]
+key = "r03-fix"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+title = "Загрузка на HDD упиралась в fsync каждой транзакции SQLite"
+body = "При загрузке корпуса на HDD каждая заметка писалась отдельной транзакцией, и каждая ждала fsync журнала. Пакетная запись по сотне заметок в одной транзакции ускорила загрузку примерно в шесть раз."
+
+# ---- r04: всплеск задержки поиска (отзыв) ----
+
+[[insight]]
+key = "r04-wrong"
+lang = "en"
+kind = "failure"
+scope = "solution"
+title = "Search latency spike after deploy was caused by downloading the reranker model"
+body = "The first search requests after a deploy were slow because the reranker model was being downloaded from the registry."
+retract_reason = "The model is baked into the image; the slow requests were the ONNX session compiling kernels on first use."
+
+[[insight]]
+key = "r04-fix"
+lang = "en"
+kind = "failure"
+scope = "solution"
+title = "Slow first requests after deploy: cold ONNX session, fixed by warm-up"
+body = "After a deploy the first few hundred requests to the GPU reranker were up to ten times slower while the runtime compiled kernels and allocated memory for new input shapes. The server now replays recorded requests of varied length before reporting ready."
+
+# ---- r05: ошибки 502 на шлюзе (отзыв) ----
+
+[[insight]]
+key = "r05-wrong"
+lang = "ru"
+kind = "failure"
+scope = "global"
+title = "Ошибки 502 на загрузках файлов вызывает сервис хранения"
+body = "Ошибки 502 при загрузке файлов партнёрами идут от сервиса хранения файлов, который не справляется с потоком."
+retract_reason = "Сервис хранения был исправен; шлюз не мог записать временный файл буфера на переполненный корневой раздел."
+
+[[insight]]
+key = "r05-fix"
+lang = "ru"
+kind = "failure"
+scope = "global"
+title = "502 на загрузках: переполнен корневой раздел с буферами тел запросов"
+body = "Большие тела запросов шлюз буферизует во временный файл на корневом разделе. Когда раздел заполнился журналами без ротации, запись буфера падала и шлюз отвечал 502, хотя вышестоящий сервис хранения не участвовал."
+
+# ---- p01: UTF-8 без BOM в PowerShell 5.1 ----
+
+[[insight]]
+key = "p01-h"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+certainty = "hypothesis"
+title = "В Windows PowerShell 5.1 нельзя записать файл в UTF-8 без BOM"
+body = "Out-File и Set-Content с кодировкой utf8 в Windows PowerShell 5.1 всегда добавляют BOM, поэтому записать UTF-8 без BOM из 5.1 невозможно — нужен PowerShell 7."
+
+[[insight]]
+key = "p01-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+certainty = "theorem"
+title = "UTF-8 без BOM в Windows PowerShell 5.1: [IO.File]::WriteAllText с UTF8Encoding($false)"
+body = "Командлеты 5.1 с utf8 пишут BOM, но .NET-метод [IO.File]::WriteAllText(путь, текст, (New-Object Text.UTF8Encoding $false)) записывает UTF-8 без BOM прямо из Windows PowerShell 5.1."
+evidence = { checked = "запись файла из Windows PowerShell 5.1", method = "Format-Hex первых байтов файла", result = "файл начинается с текста, байтов EF BB BF нет" }
+
+# ---- p02: Qdrant на Windows без Docker ----
+
+[[insight]]
+key = "p02-h"
+lang = "en"
+kind = "gotcha"
+scope = "global"
+certainty = "hypothesis"
+title = "Qdrant cannot run on Windows without Docker"
+body = "Qdrant is a Linux service and on Windows it only runs inside a Docker container or WSL."
+
+[[insight]]
+key = "p02-t"
+lang = "en"
+kind = "discovery"
+scope = "global"
+certainty = "theorem"
+title = "Qdrant runs natively on Windows from the release archive"
+body = "The Qdrant release archive for Windows contains qdrant.exe, which runs as a normal process with a config file; no Docker or WSL is involved."
+evidence = { checked = "qdrant.exe from the Windows x64 release archive", method = "started it with a local config and requested /readyz", result = "HTTP 200 and collections created over the REST API" }
+
+# ---- p03: ONNX Runtime CUDA без CUDA Toolkit ----
+
+[[insight]]
+key = "p03-h"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+certainty = "hypothesis"
+title = "ONNX Runtime с CUDA не работает без установленного CUDA Toolkit"
+body = "Для CUDA-провайдера ONNX Runtime пользователь должен установить CUDA Toolkit и cuDNN системно, иначе провайдер не загрузится."
+
+[[insight]]
+key = "p03-t"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+certainty = "theorem"
+title = "ONNX Runtime с CUDA работает без CUDA Toolkit, если рядом лежат библиотеки NVIDIA"
+body = "CUDA-провайдеру ONNX Runtime нужны только cudart, cublas и cudnn нужных версий рядом с библиотекой ORT; CUDA Toolkit ставить не нужно, достаточно драйвера NVIDIA."
+evidence = { checked = "запуск CUDA-провайдера на чистой машине с одним драйвером", method = "PATH без каталогов CUDA Toolkit, библиотеки NVIDIA в каталоге ORT", result = "сессия создана на CUDA, эмбеддинги совпали с эталоном" }
+
+# ---- p04: симлинки git на Windows ----
+
+[[insight]]
+key = "p04-h"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+certainty = "hypothesis"
+title = "Git cannot check out symlinks on Windows"
+body = "On Windows, git always checks out symbolic links as small text files containing the link target."
+
+[[insight]]
+key = "p04-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+certainty = "theorem"
+title = "Git checks out real symlinks on Windows with core.symlinks and Developer Mode"
+body = "With Developer Mode enabled and core.symlinks=true set before cloning, Git for Windows creates real symbolic links; without either, links become plain text files."
+evidence = { checked = "clone of a repository with file and directory symlinks", method = "Developer Mode on, git clone -c core.symlinks=true, then dir /AL", result = "both links listed as SYMLINK and SYMLINKD" }
+
+# ---- p05: качество bge-m3 int8 ----
+
+[[insight]]
+key = "p05-h"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+certainty = "hypothesis"
+title = "Квантованная bge-m3 int8 заметно хуже fp32 в поиске"
+body = "Квантование bge-m3 в int8 должно сильно портить эмбеддинги, поэтому поиск на int8 будет заметно хуже, чем на fp32."
+
+[[insight]]
+key = "p05-t"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+certainty = "theorem"
+title = "bge-m3 int8 проходит гейт качества против fp32"
+body = "Гейт качества сравнил векторы чанков корпуса eval: средний косинус dense int8 к fp32 не ниже 0,99, а recall@5 и nDCG@10 хуже fp32 не больше чем на один процентный пункт."
+evidence = { checked = "векторы чанков корпуса eval и метрики поиска int8 против fp32", method = "cargo xtask eval --quality-gate", result = "средний косинус ≥ 0,99, разности recall@5 и nDCG@10 в пределах 1 п. п." }
+
+# ---- p06: что тормозит cargo build ----
+
+[[insight]]
+key = "p06-h"
+lang = "en"
+kind = "discovery"
+scope = "global"
+certainty = "hypothesis"
+title = "cargo build is slow mostly because of the linker"
+body = "Most of the release build time of the server is spent linking, so switching linkers is the main way to speed it up."
+
+[[insight]]
+key = "p06-t"
+lang = "en"
+kind = "discovery"
+scope = "global"
+certainty = "theorem"
+title = "Release build time of the server is dominated by codegen, not linking"
+body = "Build timings show that codegen of a few large crates takes most of the release build; linking is a few seconds. Lower codegen-units contention and fewer generic instantiations help more than another linker."
+evidence = { checked = "release build of zam-server on the dev machine", method = "cargo build --release --timings", result = "codegen of the heaviest crates took most of the wall time; the link step took under ten seconds" }
+
+# ---- p07: перекрытие чанков и recall ----
+
+[[insight]]
+key = "p07-h"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+certainty = "hypothesis"
+title = "Перекрытие чанков на одно предложение заметно улучшает recall"
+body = "Если каждый лист начинается с последнего предложения предыдущего, факты на границах листов не теряются, и recall@5 поиска заметно растёт."
+
+[[insight]]
+key = "p07-t"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+certainty = "theorem"
+title = "Перекрытие 0, 1 или 2 предложения не меняет recall@5 на eval M2"
+body = "Сетка M2 показала нулевую разность recall@5 между перекрытием 0, 1 и 2 предложения: набор M2 к нарезке почти нечувствителен, и пользы перекрытия на нём не видно."
+evidence = { checked = "сетка чанкинга M2 на eval/ (160 заметок, 197 запросов)", method = "cargo xtask eval --grid с chunk_overlap_sentences 0/1/2, парный бутстреп", result = "разность recall@5 +0,000, nDCG@10 в пределах шума" }
+
+# ---- p08: trigram FTS5 и кириллица ----
+
+[[insight]]
+key = "p08-h"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+certainty = "hypothesis"
+title = "SQLite FTS5 trigram tokenizer does not match Cyrillic text"
+body = "The trigram tokenizer only works for ASCII, so substring search over Russian notes cannot use it."
+
+[[insight]]
+key = "p08-t"
+lang = "en"
+kind = "discovery"
+scope = "solution"
+certainty = "theorem"
+title = "FTS5 trigram tokenizer matches Cyrillic substrings"
+body = "The trigram tokenizer works on UTF-8 characters, not bytes, so any substring of three or more characters matches, including Cyrillic ones; case folding of Cyrillic depends on the case_sensitive option."
+evidence = { checked = "FTS5 table with tokenize='trigram' over Russian text", method = "MATCH queries for three- and five-letter Cyrillic substrings", result = "rows containing the substrings were returned" }
+
+# ---- p09: коды выхода robocopy ----
+
+[[insight]]
+key = "p09-h"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+certainty = "hypothesis"
+title = "robocopy возвращает ненулевой код только при ошибке"
+body = "Если robocopy вернул не ноль, копирование не удалось, и задание планировщика нужно считать проваленным."
+triggers = [{ type = "keyword", pattern = "robocopy" }]
+
+[[insight]]
+key = "p09-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+certainty = "theorem"
+title = "Коды выхода robocopy меньше 8 означают успех"
+body = "robocopy возвращает битовую маску: 1 — файлы скопированы, 2 — есть лишние файлы, 4 — несовпадения; ошибкой считается код 8 и выше. Обёртка для планировщика должна переводить коды 0–7 в 0."
+evidence = { checked = "копирование каталога с новыми и изменёнными файлами", method = "robocopy с последующим echo %ERRORLEVEL%", result = "код 1 при успешном копировании, 8 — при недоступном каталоге назначения" }
+triggers = [{ type = "keyword", pattern = "robocopy" }]
+
+# ---- p10: Human и Qdrant (axiom) ----
+
+[[insight]]
+key = "p10-h"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+certainty = "hypothesis"
+title = "Заметки Human находятся векторным поиском с include_human"
+body = "Если администратор ищет с include_human, заметки пространства Human попадают в выдачу и векторного канала."
+
+[[insight]]
+key = "p10-a"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+certainty = "axiom"
+title = "Пространство Human никогда не попадает в Qdrant"
+body = "Заметки Human не векторизуются и не пишутся в Qdrant ни при каких настройках; администратор с include_human находит их только каналом FTS."
+
+# ---- p11: force-push в main (axiom) ----
+
+[[insight]]
+key = "p11-h"
+lang = "en"
+kind = "pattern"
+scope = "solution"
+certainty = "hypothesis"
+title = "Force-pushing to main is fine with --force-with-lease"
+body = "--force-with-lease refuses to overwrite commits you have not seen, so it is safe enough to rewrite history on main when cleaning up."
+
+[[insight]]
+key = "p11-a"
+lang = "en"
+kind = "decision"
+scope = "solution"
+certainty = "axiom"
+title = "Never force-push to main; undo with revert commits"
+body = "History on main is never rewritten, with or without lease. Mistakes on main are undone with revert commits, and deleting remote branches is also not allowed without the owner."
+
+# ---- p12: Docker в проекте (axiom) ----
+
+[[insight]]
+key = "p12-h"
+lang = "ru"
+kind = "pattern"
+scope = "solution"
+certainty = "hypothesis"
+title = "Qdrant для разработки проще поднимать в Docker"
+body = "Для локальной разработки Qdrant удобнее всего запускать контейнером Docker с томом под данные."
+
+[[insight]]
+key = "p12-a"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+certainty = "axiom"
+title = "Docker в проекте не используется: зависимости — нативные бинарники"
+body = "Решение владельца: проект работает без Docker. Qdrant, ONNX Runtime и остальные зависимости — нативные бинарники для Windows x64 и Linux x64, которые сервер запускает и обновляет сам."
+
+# ---- p13: временные файлы (axiom) ----
+
+[[insight]]
+key = "p13-h"
+lang = "en"
+kind = "pattern"
+scope = "solution"
+certainty = "hypothesis"
+title = "Tests may put scratch files into the system temp directory"
+body = "Using std::env::temp_dir for scratch files in tests is harmless, since the operating system cleans the temp directory."
+
+[[insight]]
+key = "p13-a"
+lang = "en"
+kind = "decision"
+scope = "solution"
+certainty = "axiom"
+title = "Temporary files live only under the project's .tmp or target directory"
+body = "Temporary files, run logs and test data stay inside the project: .tmp/ or target/, with CARGO_TARGET_TMPDIR in tests. The system temp directory, /tmp and std::env::temp_dir are forbidden."
+
+# ---- p14: Vault и индексы (axiom) ----
+
+[[insight]]
+key = "p14-h"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+certainty = "hypothesis"
+title = "Значения Vault индексируются FTS для поиска по секретам"
+body = "Чтобы агент мог найти нужный секрет по описанию, значения записей Vault попадают в полнотекстовый индекс."
+
+[[insight]]
+key = "p14-a"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+certainty = "axiom"
+title = "Значения Vault никогда не попадают в FTS, Qdrant, выдачу поиска и журналы"
+body = "Значение секрета хранится только зашифрованным в Vault; ни FTS, ни Qdrant, ни ответы поиска, ни журналы его не видят. Искать можно только по метаданным записи."

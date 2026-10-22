@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::Serialize;
 
+use super::corpus::Kind;
 use super::metrics::{Aggregate, Estimate};
-use super::run::{Breakdown, RunResult, TOP_K};
+use super::run::{Breakdown, QueryRun, RunResult, TOP_K};
 
 /// `0.812 [0.75–0.86]`.
 pub fn est(e: &Estimate) -> String {
@@ -42,10 +43,80 @@ pub fn metrics_table(m: &Breakdown) -> String {
     if m.disjoint.n > 0 {
         let _ = write!(s, "\n{}", row("перефраз без общих слов", &m.disjoint));
     }
+    if m.long.n > 0 {
+        let _ = write!(s, "\n{}", row("длинные заметки", &m.long));
+    }
+    if m.fts_only.n > 0 {
+        let _ = write!(s, "\n{}", row("FTS-only (index: false)", &m.fts_only));
+    }
     for (l, a) in &m.by_lang {
         let _ = write!(s, "\n{}", row(&format!("запрос {l}"), a));
     }
     s
+}
+
+/// Таблица метрик M3 (устаревание, надёжность, листы длинных заметок); пусто — в наборе
+/// нет запросов M3.
+pub fn m3_table(r: &RunResult) -> String {
+    let m = &r.metrics.overall;
+    let n = |f: fn(&QueryRun) -> bool| r.queries.iter().filter(|q| f(q)).count();
+    let rows: [(&str, usize, Option<Estimate>); 7] = [
+        (
+            "cancelled@5 (цель 0)",
+            n(|q| q.metrics.cancelled5.is_some()),
+            m.cancelled5,
+        ),
+        (
+            "cancelled@5 с include_history (контроль, > 0)",
+            n(|q| q.cancelled5_history.is_some()),
+            r.metrics.cancelled5_history,
+        ),
+        (
+            "reliable_first, бусты certainty сервера",
+            n(|q| q.metrics.reliable_first.is_some()),
+            m.reliable_first,
+        ),
+        (
+            "reliable_first без бустов",
+            n(|q| q.reliable_first_no_boost.is_some()),
+            r.metrics.reliable_first_no_boost,
+        ),
+        (
+            "chunk-recall@5 (свой текст листа)",
+            n(|q| q.metrics.chunk_recall5.is_some()),
+            m.chunk_recall5,
+        ),
+        (
+            "chunk-nDCG@10",
+            n(|q| q.metrics.chunk_ndcg10.is_some()),
+            m.chunk_ndcg10,
+        ),
+        (
+            "chunk-recall@5 с перекрытием (справочно)",
+            n(|q| q.kind == Kind::Chunk),
+            r.metrics.chunk_recall5_with_overlap,
+        ),
+    ];
+    let mut s = String::new();
+    for (name, count, e) in rows {
+        if let Some(e) = e {
+            if s.is_empty() {
+                s.push_str("| Метрика M3 | n | значение |\n|---|---:|---|");
+            }
+            let _ = write!(s, "\n| {name} | {count} | {} |", est(&e));
+        }
+    }
+    s
+}
+
+/// `+0.012 [-0.004…+0.030]`.
+pub fn diff(e: &Estimate) -> String {
+    format!(
+        "{:+.3} [{:+.3}…{:+.3}]",
+        e.mean + 0.0,
+        e.lo + 0.0,
+        e.hi + 0.0
+    )
 }
 
 /// Доли каналов найденных заметок.
@@ -148,6 +219,41 @@ pub fn run_md(r: &RunResult) -> String {
         "\n\nКаналы, которыми найдены ожидаемые заметки в top-{TOP_K}: {}.",
         channels_line(&r.metrics)
     );
+    let m3 = m3_table(r);
+    if !m3.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n## Метрики M3\n\ncancelled@5 — доля запросов `superseded` с замещённым или \
+             отозванным insight в top-5; reliable_first — доля запросов `certainty`, где \
+             theorem/axiom выше противоречащей hypothesis; chunk-* — по листам `mode = chunks` \
+             (лист целиком содержит `evidence`, перекрытие с предыдущим листом не \
+             считается).\n\n{m3}"
+        );
+    }
+    if let Some(c) = &r.compare {
+        let _ = writeln!(
+            s,
+            "\n## Сравнение с прежним прогоном\n\n`{}` (запросы `{}`, корпус `{}`): общих \
+             запросов {}.\n\n| Разность (новый − прежний) | n | значение |\n|---|---:|---|\n\
+             | Δ recall@5 | {} | {} |\n| Δ nDCG@10 | {} | {} |\n\
+             | Δ nDCG@10 без группы e | {} | {} |\n\n{}",
+            c.against,
+            c.against_queries_fingerprint,
+            c.against_corpus_fingerprint,
+            c.n,
+            c.n,
+            diff(&c.d_recall5),
+            c.n,
+            diff(&c.d_ndcg10),
+            c.n_without_e,
+            diff(&c.d_ndcg10_without_e),
+            if c.regression {
+                "**Регрессия:** интервал Δ nDCG@10 целиком ниже нуля."
+            } else {
+                "Интервал Δ nDCG@10 не лежит целиком ниже нуля — регрессии нет."
+            }
+        );
+    }
     let misses: Vec<_> = r
         .queries
         .iter()
@@ -184,6 +290,17 @@ pub fn run_md(r: &RunResult) -> String {
 /// Краткая сводка в консоль.
 pub fn print_run(r: &RunResult) {
     let m = &r.metrics.overall;
+    let opt = |e: Option<Estimate>| e.map_or("—".to_string(), |e| est(&e));
+    println!(
+        "  M3: cancelled@5 {}, с историей {}, reliable_first {} (без бустов {}), \
+         chunk-recall@5 {}, chunk-nDCG@10 {}",
+        opt(m.cancelled5),
+        opt(r.metrics.cancelled5_history),
+        opt(m.reliable_first),
+        opt(r.metrics.reliable_first_no_boost),
+        opt(m.chunk_recall5),
+        opt(m.chunk_ndcg10)
+    );
     println!(
         "{} {}: recall@5 {}, MRR@10 {}, nDCG@10 {} (n = {}); без общих слов nDCG@10 {}",
         r.info.model.as_deref().unwrap_or("fts"),

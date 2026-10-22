@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use corpus::{Corpus, Query, load_queries, validate};
+use corpus::{Corpus, Query, load_insights, load_queries, validate};
 
 /// Режим поиска прогона.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, serde::Serialize)]
@@ -128,6 +128,10 @@ pub struct EvalArgs {
     /// корпусе (target/eval/<прогон>), например с другими весами --set
     #[arg(long)]
     pub reuse: bool,
+    /// Прежний результат (JSON eval/results/…): парная разность recall@5 и nDCG@10 по общим
+    /// запросам (тот же id, вид и expect) — в отчёт прогона
+    #[arg(long, value_name = "FILE")]
+    pub compare: Option<PathBuf>,
 }
 
 /// Каталоги и файлы набора.
@@ -135,6 +139,8 @@ pub struct Paths {
     pub repo: PathBuf,
     pub corpus: PathBuf,
     pub queries: PathBuf,
+    /// `eval/insights.toml` — insight набора M3.
+    pub insights: PathBuf,
     pub results: PathBuf,
     /// `target/eval` — каталоги данных прогонов.
     pub work: PathBuf,
@@ -150,6 +156,7 @@ impl Paths {
                 .queries
                 .clone()
                 .unwrap_or_else(|| eval.join("queries.toml")),
+            insights: eval.join("insights.toml"),
             results: a.out.clone().unwrap_or_else(|| eval.join("results")),
             work: repo.join("target").join("eval"),
         }
@@ -158,7 +165,8 @@ impl Paths {
 
 /// Корпус и запросы после проверки (полный набор — со всеми требованиями).
 pub fn load_set(p: &Paths, full: bool) -> Result<(Corpus, Vec<Query>, corpus::Summary)> {
-    let corpus = Corpus::load(&p.corpus)?;
+    let mut corpus = Corpus::load(&p.corpus)?;
+    corpus.insights = load_insights(&p.insights)?;
     let queries = load_queries(&p.queries)?;
     let s = validate(&corpus, &queries, full)?;
     Ok((corpus, queries, s))
@@ -168,7 +176,7 @@ fn print_summary(s: &corpus::Summary) {
     let kinds: Vec<String> = s.by_kind.iter().map(|(k, n)| format!("{k} {n}")).collect();
     println!(
         "корпус: {} заметок (ru {}, en {}; без запросов {}); запросов {}: {}; \
-         перефразов без общих слов {} ({:.0} %)",
+         перефразов без общих слов {} ({:.0} % запросов видов M2)",
         s.notes,
         s.notes_ru,
         s.notes_en,
@@ -178,6 +186,13 @@ fn print_summary(s: &corpus::Summary) {
         s.disjoint,
         s.disjoint_share() * 100.0
     );
+    if s.insights > 0 || s.long_notes > 0 {
+        println!(
+            "набор M3: insight {} (цепочек замещения {}, отзывов {}, пар противоречий {}), \
+             длинных заметок {}, заметок с index: false {}",
+            s.insights, s.chains, s.retracted, s.contradictions, s.long_notes, s.fts_only_notes
+        );
+    }
 }
 
 /// Точка входа `cargo xtask eval`.

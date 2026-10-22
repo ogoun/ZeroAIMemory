@@ -18,12 +18,58 @@ pub const BOOTSTRAP: usize = 2000;
 /// Зерно генератора бутстрепа.
 const SEED: u64 = 0x5eed_2026_1019;
 
-/// Метрики одного запроса.
+/// Метрики одного запроса. Поля M3 — только у запросов своего вида (`None` у остальных):
+/// `cancelled5` — `superseded`, `reliable_first` — `certainty`, `chunk_*` — `chunk`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct QueryMetrics {
     pub recall5: f64,
     pub mrr10: f64,
     pub ndcg10: f64,
+    /// В top-5 есть замещённый или отозванный insight из `forbid`.
+    pub cancelled5: Option<bool>,
+    /// Надёжный ответ (`expect`) стоит выше противоречащей гипотезы (`weaker`).
+    pub reliable_first: Option<bool>,
+    /// Среди первых 5 листов есть лист, целиком содержащий `evidence`.
+    pub chunk_recall5: Option<f64>,
+    /// nDCG@10 по листам: релевантен лист, целиком содержащий `evidence`.
+    pub chunk_ndcg10: Option<f64>,
+}
+
+/// `cancelled@5`: хоть одна цель из `forbid` среди первых 5 выдачи.
+pub fn cancelled_at_5(ranked: &[String], forbid: &[String]) -> bool {
+    ranked.iter().take(5).any(|p| forbid.contains(p))
+}
+
+/// `reliable_first`: лучшая из `expect` найдена в top-10 и стоит выше лучшей из `weaker`
+/// (гипотезы нет в top-10 — надёжное выше).
+pub fn reliable_first(ranked: &[String], expect: &[String], weaker: &[String]) -> bool {
+    let top: Vec<&String> = ranked.iter().take(10).collect();
+    let pos = |set: &[String]| top.iter().position(|p| set.contains(p));
+    match (pos(expect), pos(weaker)) {
+        (Some(e), Some(w)) => e < w,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// Лист содержит `evidence` целиком (пробельные символы сравниваются как один пробел).
+pub fn leaf_contains(leaf: &str, evidence: &str) -> bool {
+    let ev = super::corpus::squash_ws(evidence);
+    !ev.is_empty() && super::corpus::squash_ws(leaf).contains(&ev)
+}
+
+/// `chunk-recall@5` и `chunk-nDCG@10` по текстам листов выдачи (по убыванию балла, без
+/// перекрытия — см. `run`): релевантен лист, целиком содержащий `evidence`. Идеальная
+/// выдача — один такой лист на первом месте (собственные тексты листов не пересекаются).
+pub fn chunk_scores(leaves: &[String], evidence: &str) -> (f64, f64) {
+    let first = leaves
+        .iter()
+        .take(10)
+        .position(|l| leaf_contains(l, evidence));
+    match first {
+        Some(i) => (if i < 5 { 1.0 } else { 0.0 }, 1.0 / (i as f64 + 2.0).log2()),
+        None => (0.0, 0.0),
+    }
 }
 
 /// Метрики выдачи `ranked` (пути заметок по убыванию балла) при ожидаемых `expect`.
@@ -52,6 +98,7 @@ pub fn score(ranked: &[String], expect: &[String]) -> QueryMetrics {
         recall5: found5 as f64 / expect.len() as f64,
         mrr10,
         ndcg10: dcg / ideal,
+        ..QueryMetrics::default()
     }
 }
 
@@ -70,6 +117,11 @@ pub struct Aggregate {
     pub recall5: Estimate,
     pub mrr10: Estimate,
     pub ndcg10: Estimate,
+    /// Метрики M3 — по запросам, у которых они есть (`None` — таких запросов нет).
+    pub cancelled5: Option<Estimate>,
+    pub reliable_first: Option<Estimate>,
+    pub chunk_recall5: Option<Estimate>,
+    pub chunk_ndcg10: Option<Estimate>,
 }
 
 /// splitmix64: детерминированный генератор для бутстрепа (без внешних зависимостей).
@@ -138,14 +190,27 @@ pub fn estimate(values: &[f64]) -> Estimate {
     }
 }
 
+/// Доля: `true` — 1, `false` — 0.
+fn flag(b: Option<bool>) -> Option<f64> {
+    b.map(|b| if b { 1.0 } else { 0.0 })
+}
+
 /// Сводка по метрикам запросов.
 pub fn aggregate(per_query: &[QueryMetrics]) -> Aggregate {
     let col = |f: fn(&QueryMetrics) -> f64| per_query.iter().map(f).collect::<Vec<_>>();
+    let opt = |f: fn(&QueryMetrics) -> Option<f64>| {
+        let v: Vec<f64> = per_query.iter().filter_map(f).collect();
+        (!v.is_empty()).then(|| estimate(&v))
+    };
     Aggregate {
         n: per_query.len(),
         recall5: estimate(&col(|m| m.recall5)),
         mrr10: estimate(&col(|m| m.mrr10)),
         ndcg10: estimate(&col(|m| m.ndcg10)),
+        cancelled5: opt(|m| flag(m.cancelled5)),
+        reliable_first: opt(|m| flag(m.reliable_first)),
+        chunk_recall5: opt(|m| m.chunk_recall5),
+        chunk_ndcg10: opt(|m| m.chunk_ndcg10),
     }
 }
 
@@ -244,6 +309,56 @@ mod tests {
         let late = score(&s(&["1", "2", "3", "4", "5", "a"]), &s(&["a"]));
         assert_eq!((late.recall5, late.mrr10), (0.0, 1.0 / 6.0));
         assert_eq!(score(&[], &s(&["a"])), QueryMetrics::default());
+    }
+
+    #[test]
+    fn cancelled_at_5_counts_forbidden_in_top5() {
+        let ranked = s(&["a", "b", "c", "d", "e", "old"]);
+        // запрещённый на шестом месте — не в top-5
+        assert!(!cancelled_at_5(&ranked, &s(&["old"])));
+        assert!(cancelled_at_5(&ranked, &s(&["zzz", "c"])));
+        assert!(!cancelled_at_5(&[], &s(&["old"])));
+        assert!(!cancelled_at_5(&ranked, &[]));
+    }
+
+    #[test]
+    fn reliable_first_compares_ranks() {
+        let ranked = s(&["x", "proof", "guess"]);
+        assert!(reliable_first(&ranked, &s(&["proof"]), &s(&["guess"])));
+        assert!(!reliable_first(&ranked, &s(&["guess"]), &s(&["proof"])));
+        // гипотезы нет в top-10, надёжное есть — выше
+        assert!(reliable_first(&ranked, &s(&["proof"]), &s(&["none"])));
+        // надёжного нет — не выше
+        assert!(!reliable_first(&ranked, &s(&["none"]), &s(&["guess"])));
+        // за десятым местом не считается
+        let mut long: Vec<String> = (0..10).map(|i| format!("n{i}")).collect();
+        long.push("proof".into());
+        assert!(!reliable_first(&long, &s(&["proof"]), &s(&["guess"])));
+        // лучшая из гипотез решает
+        let r = s(&["g2", "proof", "g1"]);
+        assert!(!reliable_first(&r, &s(&["proof"]), &s(&["g1", "g2"])));
+    }
+
+    #[test]
+    fn chunk_recall_requires_whole_evidence_in_leaf() {
+        let ev = "worker retries a batch four times";
+        // доказательство разрезано между листами — не засчитывается
+        let split = s(&["intro. The worker retries", "a batch four times. Then"]);
+        assert_eq!(chunk_scores(&split, ev), (0.0, 0.0));
+        // целиком во втором листе; переводы строк и лишние пробелы не мешают
+        let whole = s(&["intro", "The worker  retries a\nbatch four times. Then"]);
+        let (r, n) = chunk_scores(&whole, ev);
+        assert_eq!(r, 1.0);
+        assert!((n - 1.0 / 3f64.log2()).abs() < 1e-12);
+        // за пятым листом: recall 0, nDCG по десяти
+        let mut late: Vec<String> = (0..5).map(|i| format!("leaf {i}")).collect();
+        late.push(format!("x {ev} y"));
+        let (r, n) = chunk_scores(&late, ev);
+        assert_eq!(r, 0.0);
+        assert!((n - 1.0 / 7f64.log2()).abs() < 1e-12);
+        // повтор доказательства ниже не добавляет (идеальная выдача — один лист)
+        let twice = s(&[ev, ev]);
+        assert_eq!(chunk_scores(&twice, ev), (1.0, 1.0));
     }
 
     #[test]

@@ -1,3 +1,6 @@
+---
+index: false
+---
 # Windows Terminal: profiles and command-line launch
 
 Windows Terminal keeps its configuration in a `settings.json` (open it with Ctrl+Shift+,).

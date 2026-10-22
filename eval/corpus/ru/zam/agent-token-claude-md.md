@@ -1,4 +1,5 @@
 ---
+index: false
 tags: [агенты, токены, claude-md]
 ---
 # Токен агента и блок zeroaimemory в CLAUDE.md
