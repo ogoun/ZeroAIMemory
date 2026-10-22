@@ -13,7 +13,8 @@
 //! Хранилище проверяет только целостность: статус есть только у insight; переходы
 //! `active ↔ revisit` — правкой, `→ superseded` — замещением, `→ retracted` — отзывом с
 //! непустой причиной; из `superseded` и `retracted` обратно не возвращаются. Права на
-//! `certainty` (кто и когда может ставить `axiom`/`theorem`) проверяет сервер (задача 9).
+//! `certainty` (кто и когда может ставить `axiom`/`theorem`) — [`crate::certainty`]: каждая
+//! операция записи проверяет их в своей транзакции.
 
 mod chunks;
 mod read;
@@ -116,7 +117,8 @@ text_enum!(
 );
 
 text_enum!(
-    /// Эпистемический статус (§7.5): насколько записи можно доверять. Правила — задача 9.
+    /// Эпистемический статус (§7.5): насколько записи можно доверять. Правила —
+    /// [`crate::certainty`].
     Certainty {
         Axiom => "axiom",
         Theorem => "theorem",
@@ -227,7 +229,9 @@ pub struct EntryPatch {
     pub area: Option<Option<String>>,
     /// Только `active` или `revisit` и только у insight.
     pub status: Option<EntryStatus>,
-    pub certainty: Option<Certainty>,
+    /// Только у insight; `Some(None)` — снять статус. Смена — по матрице прав
+    /// [`crate::check_certainty`] с причиной `reason`.
+    pub certainty: Option<Option<Certainty>>,
     /// Причина смены статуса или `certainty` (в ревизию).
     pub reason: Option<String>,
     /// Заменить набор триггеров (только у insight); ревизии не создаёт.

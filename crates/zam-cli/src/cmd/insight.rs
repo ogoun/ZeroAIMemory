@@ -13,6 +13,10 @@
 //!   `show ID` — карточка с текстом и триггерами; `supersede ID --title T [--kind K] …` —
 //!   замещение (вид по умолчанию — у старой записи); `retract ID --reason R`; `revisit ID
 //!   [--reason R]`; `append ID [--body-file F | stdin]` — дописать к телу.
+//! - `zam insight certify ID axiom|theorem|hypothesis|none --reason R [--evidence-file F]
+//!   [--human]` — смена эпистемического статуса (§7.5): `theorem` от агента — с доказательством
+//!   (`--evidence-file` дописывается в `data.evidence`), `axiom` и любая правка `axiom` — только
+//!   с `--human` (человеческий токен из `~/.zeroaimemory/config.toml`, поле `human_token`).
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -367,6 +371,66 @@ pub fn revisit(ctx: &Ctx, id: &str, reason: Option<&str>) -> Result<(), CliError
     emit_changed(ctx, &read_json(r)?)
 }
 
+/// Тело `PATCH` смены статуса: `certainty` (`none` → `null`), причина и — при доказательстве —
+/// `data` записи с `evidence` (insight `data` заменяется целиком, поэтому берётся текущая).
+fn certify_body(
+    current: Option<&Value>,
+    certainty: &str,
+    reason: &str,
+    evidence: Option<Value>,
+) -> Value {
+    let c = if certainty == "none" {
+        Value::Null
+    } else {
+        json!(certainty)
+    };
+    let mut body = json!({ "certainty": c, "reason": reason });
+    if let (Some(ev), Some(cur)) = (evidence, current) {
+        let mut data = cur["data"].clone();
+        if !data.is_object() {
+            data = json!({});
+        }
+        data["evidence"] = ev;
+        body["data"] = data;
+    }
+    body
+}
+
+/// `zam insight certify <id> <certainty> --reason R [--evidence-file F]`.
+pub fn certify(
+    ctx: &Ctx,
+    id: &str,
+    certainty: &str,
+    reason: &str,
+    evidence_file: Option<&Path>,
+) -> Result<(), CliError> {
+    if reason.trim().is_empty() {
+        return Err(CliError::input(
+            "--reason: причина смены статуса обязательна",
+        ));
+    }
+    let evidence = evidence_file.map(read_evidence).transpose()?;
+    let current = match evidence {
+        Some(_) => Some(get_entry(ctx, id)?),
+        None => None,
+    };
+    let body = certify_body(current.as_ref(), certainty, reason, evidence);
+    let r = ctx.client.patch_json(&format!("/entries/{id}"), &body)?;
+    let e = read_json(r)?;
+    if ctx.json {
+        return emit_json(&e);
+    }
+    emit(
+        format!(
+            "{}@{} {}\n",
+            e["id"].as_str().unwrap_or("?"),
+            e["rev"],
+            e["certainty"].as_str().unwrap_or("none")
+        )
+        .as_bytes(),
+    )
+}
+
 /// `zam insight append <id>` — текст из `--body-file` или stdin; пустой → код 6.
 pub fn append(ctx: &Ctx, id: &str, body_file: Option<&Path>) -> Result<(), CliError> {
     let text = read_text(body_file)?;
@@ -403,6 +467,24 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn certify_body_forms() {
+        assert_eq!(
+            certify_body(None, "axiom", "R", None),
+            json!({"certainty": "axiom", "reason": "R"})
+        );
+        assert_eq!(
+            certify_body(None, "none", "R", None),
+            json!({"certainty": null, "reason": "R"})
+        );
+        let cur = json!({"data": {"kind": "gotcha", "experiment": {"result": "confirmed"}}});
+        let ev = json!({"checked": "c", "method": "m", "result": "r"});
+        let b = certify_body(Some(&cur), "theorem", "R", Some(ev.clone()));
+        assert_eq!(b["data"]["kind"], "gotcha");
+        assert_eq!(b["data"]["experiment"]["result"], "confirmed");
+        assert_eq!(b["data"]["evidence"], ev);
     }
 
     #[test]

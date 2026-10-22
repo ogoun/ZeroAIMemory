@@ -58,7 +58,7 @@ async fn bad_token_not_in_logs() {
     let admin = st.system.admin_user().await.unwrap().unwrap();
     let (info, revoked) = st
         .system
-        .issue_token(admin.id, "logs", zam_store::Access::Ro)
+        .issue_token(admin.id, "logs", zam_store::Access::Ro, false)
         .await
         .unwrap();
     st.system.revoke_token(info.id).await.unwrap();

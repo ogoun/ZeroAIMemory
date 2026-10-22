@@ -1,8 +1,9 @@
 //! Поправки ранжирования (§9.2 пп. 4, 6).
 //!
 //! - затухание по свежести ([`recency_factor`], внутри слияния);
-//! - бусты ([`apply_boosts`]): вид инсайта (`gotcha`, `failure`), надёжность (`certainty`,
-//!   значения — задача 9) и текущая область (`X-Zam-Area`) — множители слитого балла;
+//! - бусты ([`apply_boosts`]): вид инсайта (`gotcha`, `failure`), надёжность (`certainty`
+//!   заметки или записи: `search.boost_axiom` > `boost_theorem` > `boost_hypothesis`, §7.5) и
+//!   текущая область (`X-Zam-Area`) — множители слитого балла;
 //! - замена сводки листом и лимит на цель.
 //!
 //! `superseded`/`retracted` исключает фильтр статусов поиска (сервер), а не поправка.
@@ -19,7 +20,8 @@ use crate::hybrid::{ChunkMeta, Level, Ranked};
 pub struct Boosts {
     /// Вид инсайта → множитель (`gotcha`, `failure` → `search.boost_gotcha`, `boost_failure`).
     pub insight_kinds: HashMap<String, f64>,
-    /// `certainty` → множитель (`axiom > theorem > hypothesis`; заполняет задача 9).
+    /// `certainty` заметки или записи → множитель (`axiom > theorem > hypothesis`,
+    /// `search.boost_axiom`/`boost_theorem`/`boost_hypothesis`); без статуса — 1.
     pub certainty: HashMap<String, f64>,
     /// Текущая область и её множитель (`search.boost_area`).
     pub area: Option<(String, f64)>,
@@ -288,6 +290,38 @@ mod tests {
         let before = list.clone();
         apply_boosts(&mut list, &meta, &Boosts::default());
         assert_eq!(list, before);
+    }
+
+    #[test]
+    fn certainty_boost_orders_reliable_first() {
+        let with_c = |c: Option<&str>| ChunkMeta {
+            certainty: c.map(String::from),
+            ..meta(None, None)
+        };
+        // равный балл: гипотеза и заметка без статуса раньше по порядку
+        let mut list = vec![
+            r("hyp", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("plain", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("thm", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("ax", Id::new(), Level::Chunk, 0.5, "fts"),
+        ];
+        let meta = metas(vec![
+            ("hyp", with_c(Some("hypothesis"))),
+            ("plain", with_c(None)),
+            ("thm", with_c(Some("theorem"))),
+            ("ax", with_c(Some("axiom"))),
+        ]);
+        let b = Boosts {
+            certainty: [("axiom", 1.20), ("theorem", 1.10), ("hypothesis", 1.00)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ..Boosts::default()
+        };
+        apply_boosts(&mut list, &meta, &b);
+        let ids: Vec<&str> = list.iter().map(|x| x.chunk_id.as_str()).collect();
+        assert_eq!(ids, vec!["ax", "thm", "hyp", "plain"]);
+        assert!((list[0].score - 0.6).abs() < 1e-12);
     }
 
     #[test]

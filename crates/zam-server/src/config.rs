@@ -424,6 +424,12 @@ pub struct SearchSection {
     pub boost_gotcha: f64,
     pub boost_failure: f64,
     pub boost_area: f64,
+    /// Множители по эпистемическому статусу `certainty` заметок и записей (§7.5, §9.2 п. 4):
+    /// `axiom` 1,20, `theorem` 1,10, `hypothesis` 1,00; без статуса — 1. Значения подтверждает
+    /// сетка eval (задача 18).
+    pub boost_axiom: f64,
+    pub boost_theorem: f64,
+    pub boost_hypothesis: f64,
 }
 
 impl SearchSection {
@@ -454,6 +460,9 @@ impl SearchSection {
             ("boost_gotcha", self.boost_gotcha),
             ("boost_failure", self.boost_failure),
             ("boost_area", self.boost_area),
+            ("boost_axiom", self.boost_axiom),
+            ("boost_theorem", self.boost_theorem),
+            ("boost_hypothesis", self.boost_hypothesis),
         ] {
             if !(v.is_finite() && v > 0.0) {
                 return Err(bad(k, "должно быть конечным и больше 0 (1 — без буста)"));
@@ -557,6 +566,9 @@ impl Default for ServerConfig {
                 boost_gotcha: 1.15,
                 boost_failure: 1.15,
                 boost_area: 1.10,
+                boost_axiom: 1.20,
+                boost_theorem: 1.10,
+                boost_hypothesis: 1.00,
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
@@ -857,6 +869,14 @@ mod tests {
             ),
             (1.15, 1.15, 1.10)
         );
+        assert_eq!(
+            (
+                c.search.boost_axiom,
+                c.search.boost_theorem,
+                c.search.boost_hypothesis
+            ),
+            (1.20, 1.10, 1.00)
+        );
         assert_eq!(c.insights.dedup_threshold, 0.90);
     }
 
@@ -875,6 +895,8 @@ mod tests {
             ("ZAM_SEARCH__BOOST_GOTCHA", "0"),
             ("ZAM_SEARCH__BOOST_FAILURE", "-1.0"),
             ("ZAM_SEARCH__BOOST_AREA", "nan"),
+            ("ZAM_SEARCH__BOOST_AXIOM", "0"),
+            ("ZAM_SEARCH__BOOST_HYPOTHESIS", "-1"),
             ("ZAM_INSIGHTS__DEDUP_THRESHOLD", "1.5"),
         ] {
             let e = load(None, &[env(k, v)], &Default::default());

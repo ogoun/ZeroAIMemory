@@ -10,8 +10,9 @@
 //! уходит в [`super::insights::create`] (дедупликация, `scope`, триггеры, замещение).
 //! У insight `GET`/`PATCH` отдают и `triggers`; `PATCH` принимает `status: active | revisit`
 //! (из `superseded`/`retracted` и в них — 422 **[решение исполнителя]**: замещение и отзыв —
-//! отдельные операции, возврата нет) и `triggers` (набор заменяется целиком, ошибка — 422
-//! `triggers[i]: …`).
+//! отдельные операции, возврата нет), `triggers` (набор заменяется целиком, ошибка — 422
+//! `triggers[i]: …`) и `certainty` (`null` — снять) с `reason` — по матрице прав §7.5
+//! ([`crate::certainty`]): запись `axiom` агент не меняет и не удаляет (403).
 //! Доступ — как у узлов: участник общего решения работает в базе владельца только с
 //! записями пространства решения, автор записи — он сам. В логи и аудит текст записей не
 //! попадает.
@@ -407,9 +408,11 @@ pub async fn get(
     Ok(Json(entry_json(&sc.db, &sc.entry).await?))
 }
 
-/// `Some(None)` для `null`, `Some(Some(s))` для строки, `None` для отсутствующего поля.
-fn double_option<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(d).map(Some)
+/// `Some(None)` для `null`, `Some(Some(v))` для значения, `None` для отсутствующего поля.
+fn double_option<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -426,6 +429,10 @@ pub struct Patch {
     status: Option<EntryStatus>,
     /// Только insight: новый набор триггеров целиком.
     triggers: Option<Vec<Value>>,
+    /// Только insight: `axiom | theorem | hypothesis`, `null` — снять статус; смена — по
+    /// матрице прав (§7.5) с `reason`, `theorem` от агента — с `data.evidence`.
+    #[serde(default, deserialize_with = "double_option")]
+    certainty: Option<Option<Certainty>>,
     reason: Option<String>,
     message: Option<String>,
 }
@@ -476,6 +483,9 @@ pub async fn patch(
     if let Some(s) = req.status {
         check_status_change(&sc.entry, s)?;
     }
+    if req.certainty.is_some() && sc.entry.kind != EntryKind::Insight {
+        return Err(unprocessable("certainty есть только у insight"));
+    }
     let triggers = match req.triggers {
         Some(_) if sc.entry.kind != EntryKind::Insight => {
             return Err(unprocessable("triggers есть только у insight"));
@@ -511,7 +521,7 @@ pub async fn patch(
         tags: req.tags,
         area: req.area,
         status: req.status,
-        certainty: None,
+        certainty: req.certainty,
         reason: req.reason,
         triggers,
     };

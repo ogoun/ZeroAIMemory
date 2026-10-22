@@ -275,7 +275,9 @@ async fn deleted_node_not_found() {
         search_fts(&db, q("исчезающее", &[k])).await.unwrap().len(),
         1
     );
-    delete_node(&db, id).await.unwrap();
+    delete_node(&db, id, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert!(
         search_fts(&db, q("исчезающее", &[k]))
             .await
@@ -624,7 +626,9 @@ async fn pending_count_by_scope() {
     add(&db, k, "dir/b", "# B\n").await;
     add(&db, k, "skip", "---\nindex: false\n---\n# С\n").await;
     let gone = add(&db, k, "gone", "# Г\n").await;
-    delete_node(&db, gone).await.unwrap();
+    delete_node(&db, gone, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     add(&db, h, "личное", "x").await;
     // папка dir, заметка с index: false, удалённая и Human (никогда не векторизуется,
     // `excluded`) не считаются
@@ -727,7 +731,9 @@ async fn live_chunks_checks_sqlite() {
         id_of(excl).await,
         id_of(hum).await,
     );
-    delete_node(&db, gone).await.unwrap();
+    delete_node(&db, gone, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     let ids = vec![
         "нет-такого".to_string(),
         cg.clone(),

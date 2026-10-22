@@ -275,6 +275,7 @@ mod tests {
             updated_at: now,
             deleted_at: None,
             has_children: false,
+            certainty: None,
         };
         assert_eq!(key_hash(&node, 2, "что угодно"), "hash-of-rev-2");
         // прочитана другая ревизия — ключ по её собственному тексту

@@ -10,6 +10,7 @@
     ApiError,
     conflictOf,
     getNode,
+    needsCertaintyReason,
     renderPreview,
     replaceNode,
     uploadBlob,
@@ -167,14 +168,15 @@
     if (!ok && preview === r) previewNote = 'Не удалось загрузить модуль формул или диаграмм.';
   }
 
-  /** Сохранение с базовой ревизией `base` (по умолчанию — загруженная). */
-  async function save(base?: number): Promise<boolean> {
+  /** Сохранение с базовой ревизией `base` (по умолчанию — загруженная) и сообщением
+   * ревизии `revMessage` (спрашивается, если сервер требует причину смены `certainty:`, §7.5). */
+  async function save(base?: number, revMessage?: string): Promise<boolean> {
     if (!cm || saving) return false;
     const text = cm.text();
     saving = true;
     error = '';
     try {
-      const n = await replaceNode(user, node, base ?? rev, text);
+      const n = await replaceNode(user, node, base ?? rev, text, revMessage);
       rev = n.current_rev;
       saved = text;
       dirty = isDirty();
@@ -186,6 +188,13 @@
       if (c) {
         conflictError = '';
         conflict = { ...c, text };
+      } else if (needsCertaintyReason(e) && revMessage === undefined) {
+        const why = window.prompt('Статус certainty изменён: укажите причину (сообщение ревизии)');
+        if (why?.trim()) {
+          saving = false;
+          return save(base, why.trim());
+        }
+        error = 'Не сохранено: смена certainty требует причины';
       } else if (!expired(e)) {
         error =
           e instanceof ApiError && e.status === 413

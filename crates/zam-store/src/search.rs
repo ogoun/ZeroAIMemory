@@ -83,6 +83,9 @@ pub struct TargetFilter {
     /// Строгий фильтр области (`scope.area`, §9.1): только узлы и записи с `area`, равной
     /// значению; `None` — любые (и без области).
     pub area: Option<String>,
+    /// Разрешённые `certainty` (`filters.certainty`, §7.5); пусто — любые (и без статуса).
+    /// Непустой список пропускает только заметки и записи с этими статусами.
+    pub certainty: Vec<String>,
 }
 
 /// Виды записей журналов.
@@ -98,6 +101,8 @@ struct TargetArgs {
     statuses: Option<String>,
     /// Область или `None` (любые).
     area: Option<String>,
+    /// JSON-массив разрешённых `certainty` или `None` (любые).
+    certainty: Option<String>,
 }
 
 impl TargetFilter {
@@ -113,6 +118,8 @@ impl TargetFilter {
             statuses: (!self.statuses.is_empty())
                 .then(|| serde_json::Value::from(self.statuses.clone()).to_string()),
             area: self.area.clone(),
+            certainty: (!self.certainty.is_empty())
+                .then(|| serde_json::Value::from(self.certainty.clone()).to_string()),
         }
     }
 }
@@ -167,6 +174,8 @@ pub struct FtsHit {
     pub entry: Option<EntryHit>,
     /// Область узла или записи (`nodes.area` / `entries.area`).
     pub area: Option<String>,
+    /// `certainty` узла или записи (`nodes.certainty` / `entries.certainty`, §7.5).
+    pub certainty: Option<String>,
 }
 
 /// Поля записи журнала в хите поиска.
@@ -210,7 +219,7 @@ const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.spac
     coalesce(n.path, ''), c.heading_path, c.rev, coalesce(n.updated_at, e.updated_at), c.text,
     c.level, c.token_count, coalesce(n.index_state, e.index_state), e.kind, e.status,
     CASE WHEN json_type(e.data, '$.kind') = 'text' THEN json_extract(e.data, '$.kind') END,
-    e.certainty, e.title, coalesce(n.area, e.area)";
+    e.certainty, e.title, coalesce(n.area, e.area), coalesce(n.certainty, e.certainty)";
 
 /// Хит по колонкам [`HIT_COLS`], начиная с колонки `o`.
 fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
@@ -242,6 +251,7 @@ fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
         index_state: r.get(o + 11)?,
         entry,
         area: r.get(o + 17)?,
+        certainty: r.get(o + 18)?,
     })
 }
 
@@ -369,17 +379,20 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
 fn scope_sql(n_spaces: usize) -> String {
     let sp = placeholders(3, n_spaces);
     let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
+    let cert = 7 + n_spaces;
     format!(
         "((c.node_id IS NOT NULL AND ?{notes} AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
            AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
-           AND (?{area} IS NULL OR n.area = ?{area}))
+           AND (?{area} IS NULL OR n.area = ?{area})
+           AND (?{cert} IS NULL OR n.certainty IN (SELECT value FROM json_each(?{cert}))))
           OR (c.entry_id IS NOT NULL AND ?2 IS NULL AND e.deleted_at IS NULL
            AND e.space_id IN ({sp})
            AND e.kind IN (SELECT value FROM json_each(?{kinds}))
            AND (e.status IS NULL OR ?{statuses} IS NULL
                 OR e.status IN (SELECT value FROM json_each(?{statuses})))
-           AND (?{area} IS NULL OR e.area = ?{area})))"
+           AND (?{area} IS NULL OR e.area = ?{area})
+           AND (?{cert} IS NULL OR e.certainty IN (SELECT value FROM json_each(?{cert})))))"
     )
 }
 
@@ -396,6 +409,7 @@ fn scope_args<'a>(
     args.push(&t.kinds);
     args.push(&t.statuses);
     args.push(&t.area);
+    args.push(&t.certainty);
     args
 }
 

@@ -179,7 +179,8 @@ pub async fn move_to(
     live(&sc)?;
     let req: Move = json_body(body)?;
     let path = NodePath::parse(&req.path)?;
-    let node = move_node(&sc.db, sc.node.id, path).await?;
+    let author = attribution(&p, &headers, None)?.author_kind;
+    let node = move_node(&sc.db, sc.node.id, path, author).await?;
     st.render_gen.bump_space(sc.owner, sc.space.id);
     // свёртка L0 старого родителя: задания индексации знают только новое положение
     if let Some(old) = sc.node.parent_id
@@ -200,7 +201,8 @@ pub async fn remove(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
-    let count = delete_node(&sc.db, sc.node.id).await?;
+    let author = attribution(&p, &headers, None)?.author_kind;
+    let count = delete_node(&sc.db, sc.node.id, author).await?;
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
     let details = json!({ "space": sc.space.id, "path": sc.node.path, "nodes": count });
@@ -227,7 +229,8 @@ pub async fn restore(
     Path(id): Path<String>,
 ) -> Result<Json<Node>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
-    let node = restore_node(&sc.db, sc.node.id).await?;
+    let author = attribution(&p, &headers, None)?.author_kind;
+    let node = restore_node(&sc.db, sc.node.id, author).await?;
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
     let details = json!({ "space": sc.space.id, "path": node.path });

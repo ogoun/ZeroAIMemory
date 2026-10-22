@@ -393,7 +393,7 @@ async fn patch_creates_revision_with_reason_and_enqueues() {
         title: Some("Новый заголовок".into()),
         tags: Some(vec!["x".into()]),
         status: Some(EntryStatus::Revisit),
-        certainty: Some(Certainty::Theorem),
+        certainty: Some(Some(Certainty::Theorem)),
         reason: Some("проверено на CI".into()),
         ..EntryPatch::default()
     };
@@ -433,7 +433,7 @@ async fn patch_creates_revision_with_reason_and_enqueues() {
         .await
         .unwrap();
     let p = EntryPatch {
-        certainty: Some(Certainty::Hypothesis),
+        certainty: Some(Some(Certainty::Hypothesis)),
         reason: Some("пересмотр".into()),
         ..EntryPatch::default()
     };
@@ -446,7 +446,7 @@ async fn patch_creates_revision_with_reason_and_enqueues() {
 
     // правка без изменений — без ревизии
     let p = EntryPatch {
-        certainty: Some(Certainty::Hypothesis),
+        certainty: Some(Some(Certainty::Hypothesis)),
         ..EntryPatch::default()
     };
     assert_eq!(
@@ -845,6 +845,8 @@ async fn list_entries_cursor_and_filters() {
     let mut rev = insight(k, "пересмотреть", "b");
     rev.status = Some(EntryStatus::Revisit);
     rev.certainty = Some(Certainty::Theorem);
+    // theorem от агента — только с доказательством (§7.5)
+    rev.data["evidence"] = json!({"checked": "c", "method": "m", "result": "r"});
     let (rv, _) = create_entry(&db, rev, &agent()).await.unwrap();
     create_entry(&db, changelog(h, "чужое пространство"), &agent())
         .await
@@ -1161,6 +1163,7 @@ async fn triggers_stored_replaced_and_active_only() {
             trig(TriggerKind::Keyword, "ok"),
             trig(TriggerKind::CommandRegex, "("),
         ],
+        AuthorKind::Agent,
     )
     .await;
     assert!(
@@ -1169,9 +1172,14 @@ async fn triggers_stored_replaced_and_active_only() {
     );
     assert_eq!(entry_triggers(&db, a.id).await.unwrap().len(), 2);
     // замена набора целиком
-    set_triggers(&db, a.id, vec![trig(TriggerKind::Keyword, "crlf")])
-        .await
-        .unwrap();
+    set_triggers(
+        &db,
+        a.id,
+        vec![trig(TriggerKind::Keyword, "crlf")],
+        AuthorKind::Agent,
+    )
+    .await
+    .unwrap();
     let ts = entry_triggers(&db, a.id).await.unwrap();
     assert_eq!(ts.len(), 1);
     assert_eq!(ts[0].pattern, "crlf");
@@ -1227,7 +1235,7 @@ async fn triggers_stored_replaced_and_active_only() {
         .await
         .unwrap();
     assert!(matches!(
-        set_triggers(&db, ch.id, vec![]).await,
+        set_triggers(&db, ch.id, vec![], AuthorKind::Agent).await,
         Err(StoreError::BadInput(_))
     ));
 }

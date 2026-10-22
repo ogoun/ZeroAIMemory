@@ -21,6 +21,8 @@ export interface TokenInfo {
   last_used_at: string | null;
   last_ip: string | null;
   revoked_at: string | null;
+  /** Человеческий токен (§7.5): запись по нему — от человека, ставит и меняет axiom. */
+  human: boolean;
 }
 
 export interface IssuedToken {
@@ -130,8 +132,8 @@ export const listTokens = (userId: string) =>
   call<TokenInfo[]>('GET', `admin/users/${userId}/tokens`);
 export const createUser = (name: string) =>
   call<{ user: User; token: IssuedToken }>('POST', 'admin/users', { name });
-export const issueToken = (userId: string, name: string, access: Access) =>
-  call<IssuedToken>('POST', `admin/users/${userId}/tokens`, { name, access });
+export const issueToken = (userId: string, name: string, access: Access, human = false) =>
+  call<IssuedToken>('POST', `admin/users/${userId}/tokens`, { name, access, human });
 export const revokeToken = (id: string) => call<void>('DELETE', `admin/tokens/${id}`);
 
 // ---- пространства и узлы (администратор — от имени пользователя `user`) ----
@@ -255,11 +257,25 @@ export function conflictOf(e: unknown): Conflict | null {
   return { current_rev: rev, diff: typeof diff === 'string' ? diff : '' };
 }
 
-/** `PUT /nodes/{id}` с `If-Match: <rev>`: замена текста целиком. */
-export const replaceNode = async (user: string, id: string, rev: number, content: string) =>
+/** Ответ 422 «нужна причина смены certainty» (§7.5): сохранить с сообщением ревизии. */
+export const needsCertaintyReason = (e: unknown): boolean =>
+  e instanceof ApiError &&
+  e.status === 422 &&
+  e.problem?.type === '/problems/certainty' &&
+  e.problem?.code === 'reason-required';
+
+/** `PUT /nodes/{id}` с `If-Match: <rev>`: замена текста целиком; `message` — сообщение ревизии
+ * (обязательно при смене `certainty:` во frontmatter). */
+export const replaceNode = async (
+  user: string,
+  id: string,
+  rev: number,
+  content: string,
+  message?: string,
+) =>
   (await (
     await request('PUT', `nodes/${q(id)}`, {
-      body: { content },
+      body: message ? { content, message } : { content },
       user,
       headers: { 'If-Match': `"${rev}"` },
     })

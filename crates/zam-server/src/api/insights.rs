@@ -1,6 +1,8 @@
 //! Insights (§7.5, §10.3, §12): создание с дедупликацией, замещение, отзыв, пересмотр,
-//! триггеры. Правила `certainty` (кто и когда ставит `axiom`/`theorem`) — задача 9: здесь
-//! поле лишь передаётся в хранилище.
+//! триггеры. Правила `certainty` ([`crate::certainty`]) проверяет хранилище в транзакции
+//! каждой операции: без `certainty` insight агента — `hypothesis`, человека — `axiom`;
+//! `axiom` создаёт, замещает и отзывает только человек (403), `theorem` агента — только с
+//! `data.evidence {checked, method, result}` (422).
 //!
 //! **Создание** — `POST /spaces/{space}/entries` с `kind: "insight"` ([`create`]):
 //! - поля §7.5: `title`, `body`, `data {kind, experiment?, evidence?, …}` (`data.kind` — один

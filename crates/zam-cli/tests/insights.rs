@@ -21,6 +21,12 @@ fn tmp(name: &str) -> PathBuf {
 
 /// Сервер в фоновом потоке: адрес и токен `rw` пользователя «Анна».
 fn start(name: &str) -> (String, String) {
+    let (url, tok, _) = start_human(name);
+    (url, tok)
+}
+
+/// [`start`] и человеческий токен «Анны» (§7.5).
+fn start_human(name: &str) -> (String, String, String) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -35,10 +41,19 @@ fn start(name: &str) -> (String, String) {
             };
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
-            let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
+            let (_, t) = st
+                .system
+                .issue_token(u.id, "t", Access::Rw, false)
+                .await
+                .unwrap();
+            let (_, h) = st
+                .system
+                .issue_token(u.id, "h", Access::Rw, true)
+                .await
+                .unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            tx.send((url, t)).unwrap();
+            tx.send((url, t, h)).unwrap();
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -101,6 +116,112 @@ fn json(o: &Output) -> serde_json::Value {
 /// Id из короткого вывода `<id>@<rev>…`.
 fn id_of(s: &str) -> String {
     s.trim().split('@').next().unwrap().to_string()
+}
+
+/// `zam insight certify`: агент повышает до theorem с доказательством (без него — 422, код 6),
+/// axiom без `--human` — 403 (код 3), с `--human` (human_token из
+/// `~/.zeroaimemory/config.toml`) — ставится; без поля в конфигурации — ошибка токена (код 3).
+#[test]
+fn insight_certify_evidence_and_human_token() {
+    let (url, tok, human) = start_human("certify");
+    let r = tmp("certify-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "experiment",
+            "--title",
+            "Метод нерабочий",
+            "--scope",
+            "global",
+        ],
+        "Не сработал на наших данных.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    assert_eq!(
+        json(&z(&["insight", "show", &id, "--json"]))["certainty"],
+        "hypothesis"
+    );
+    // theorem без доказательства — отказ сервера (422)
+    let o = z(&[
+        "insight",
+        "certify",
+        &id,
+        "theorem",
+        "--reason",
+        "перепроверил",
+    ]);
+    assert_eq!(o.status.code(), Some(6), "{}", out(&o));
+    assert!(err(&o).contains("evidence"), "{}", err(&o));
+    let ev = r.join("ev.json");
+    std::fs::write(
+        &ev,
+        r#"{"checked": "3 набора данных", "method": "повторный прогон", "result": "не работает"}"#,
+    )
+    .unwrap();
+    let o = z(&[
+        "insight",
+        "certify",
+        &id,
+        "theorem",
+        "--reason",
+        "подтверждено",
+        "--evidence-file",
+        ev.to_str().unwrap(),
+    ]);
+    assert!(ok(&o).trim().ends_with("theorem"), "{}", out(&o));
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["certainty"], "theorem");
+    assert_eq!(e["data"]["kind"], "experiment", "data сохранена: {e}");
+    assert_eq!(e["data"]["evidence"]["method"], "повторный прогон");
+    // axiom агентским токеном — 403
+    let o = z(&["insight", "certify", &id, "axiom", "--reason", "уверен"]);
+    assert_eq!(o.status.code(), Some(3), "{}", out(&o));
+    assert!(err(&o).contains("axiom"), "{}", err(&o));
+    // --human без human_token в конфигурации — ошибка токена, запроса нет
+    let o = z(&[
+        "insight",
+        "certify",
+        &id,
+        "axiom",
+        "--reason",
+        "уверен",
+        "--human",
+    ]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(err(&o).contains("human_token"), "{}", err(&o));
+    // human_token в ~/.zeroaimemory/config.toml — ставится
+    std::fs::create_dir_all(r.join(".zeroaimemory")).unwrap();
+    std::fs::write(
+        r.join(".zeroaimemory").join("config.toml"),
+        format!("human_token = \"{human}\"\n"),
+    )
+    .unwrap();
+    let o = z(&[
+        "insight",
+        "certify",
+        &id,
+        "axiom",
+        "--reason",
+        "утверждено",
+        "--human",
+    ]);
+    assert!(ok(&o).trim().ends_with("axiom"), "{}", out(&o));
+    // агент её больше не меняет
+    let o = z(&[
+        "insight",
+        "certify",
+        &id,
+        "hypothesis",
+        "--reason",
+        "сомнение",
+    ]);
+    assert_eq!(o.status.code(), Some(3), "{}", out(&o));
 }
 
 #[test]

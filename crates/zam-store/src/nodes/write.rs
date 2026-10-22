@@ -8,6 +8,7 @@ use zam_core::Id;
 
 use super::chunks::{NoteMeta, index_note, index_state, note_meta};
 use super::{Attribution, NewNote, Node, NodeKind, live_by_path, load_node, sha256_hex};
+use crate::certainty::{CertaintyChange, check_certainty};
 use crate::paths::NodePath;
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
@@ -15,7 +16,9 @@ use crate::{Db, StoreError};
 
 /// Создаёт заметку и недостающие папки-предки (mkdir -p). Область заметки (`nodes.area`)
 /// — `attrib.area` (`X-Zam-Area`).
-/// Путь занят живым узлом или предок — заметка → `Conflict`; нет пространства → `NotFound`.
+/// Путь занят живым узлом или предок — заметка → `Conflict`; нет пространства → `NotFound`;
+/// неизвестный `certainty:` во frontmatter → `BadInput`; статус против матрицы прав
+/// (`axiom` не от человека, `theorem` агента без `evidence:`) → `Certainty`.
 pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
     db.write(move |tx| {
         let now = fmt_ts(Timestamp::now());
@@ -24,13 +27,21 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
         let parent = ensure_ancestors(tx, n.space_id, &n.path, &now)?;
 
         let meta = note_meta(&n.content, n.l0.as_deref());
+        let certainty = meta.certainty()?;
+        check_certainty(
+            n.attrib.author_kind,
+            None,
+            &CertaintyChange::Create(certainty),
+            meta.evidence.as_ref(),
+            None,
+        )?;
         let id = Id::new();
         let hash = sha256_hex(n.content.as_bytes());
         tx.execute(
             "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, current_rev,
                                 content_hash, frontmatter, l0, l0_source, index_state,
-                                created_at, updated_at, area)
-             VALUES (?1, ?2, ?3, 'note', ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
+                                created_at, updated_at, area, certainty)
+             VALUES (?1, ?2, ?3, 'note', ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12, ?13)",
             params![
                 id,
                 n.space_id,
@@ -45,6 +56,7 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
                 now,
                 // область по умолчанию — из `X-Zam-Area` запроса создания
                 n.attrib.area,
+                certainty,
             ],
         )?;
         store_revision(tx, id, 1, &n.content, &hash, &meta, &n.attrib, None, &now)?;

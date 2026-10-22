@@ -49,6 +49,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         version: 8,
         sql: include_str!("../migrations/user/0008_entries.sql"),
     },
+    Migration {
+        version: 9,
+        sql: include_str!("../migrations/user/0009_node_certainty.sql"),
+    },
 ];
 
 /// Вид пространства.
@@ -158,6 +162,8 @@ impl UserDbs {
         let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
         ensure_fixed_spaces(&db).await?;
         crate::nodes::backfill_embed_keys(&db).await?;
+        // статус заметок из frontmatter (v9) — до первой записи: права certainty читают столбец
+        crate::nodes::backfill_certainty(&db).await?;
         let pending = match rechunk_pending(&db).await? {
             Some(why) if !clear_rechunk_if_empty(&db).await? => Some(why),
             _ => None,

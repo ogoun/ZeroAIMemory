@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use zam_core::Id;
 
 use super::{Certainty, EntryKind, load_entry};
+use crate::certainty::{CertaintyChange, check_certainty};
+use crate::nodes::AuthorKind;
 use crate::time::{fmt_ts, ts_at};
 use crate::{Db, StoreError};
 
@@ -259,14 +261,27 @@ fn tools_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<Vec<String>
 
 /// Заменяет все триггеры insight `entry` набором `ts` одной транзакцией. Неверный триггер
 /// (`triggers[i]: …`), больше [`TRIGGERS_MAX`] или запись не insight → `BadInput`; нет
-/// записи или удалена → `NotFound`.
-pub async fn set_triggers(db: &Db, entry: Id, ts: Vec<NewTrigger>) -> Result<(), StoreError> {
+/// записи или удалена → `NotFound`; запись `axiom`, а автор не человек →
+/// [`CertaintyError::AxiomRequiresHuman`](crate::CertaintyError).
+pub async fn set_triggers(
+    db: &Db,
+    entry: Id,
+    ts: Vec<NewTrigger>,
+    author: AuthorKind,
+) -> Result<(), StoreError> {
     let ts = check_triggers(ts)?;
     db.write(move |tx| {
         let e = load_entry(tx, entry)?;
         if e.deleted_at.is_some() {
             return Err(StoreError::NotFound);
         }
+        check_certainty(
+            author,
+            e.certainty,
+            &CertaintyChange::ModifyOther,
+            None,
+            None,
+        )?;
         if e.kind != EntryKind::Insight {
             return Err(StoreError::BadInput(
                 "триггеры есть только у insight".into(),

@@ -351,7 +351,9 @@ async fn indexes_replaces_and_deletes_points_and_skips_excluded() {
     assert!(e.count(None, Some("docs/a"), &[]).await < chunks);
 
     // удаление убирает точки
-    delete_node(&e.db, a).await.unwrap();
+    delete_node(&e.db, a, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     w.notify();
     e.until("удаление точек", async || {
         e.count(None, Some("docs/a"), &["chunk", "note", "section"])
@@ -656,9 +658,14 @@ async fn chunk_embed_key_column_equals_helper() {
     .await
     .unwrap();
     check(a).await;
-    move_node(&db, a, NodePath::parse("y/b").unwrap())
-        .await
-        .unwrap();
+    move_node(
+        &db,
+        a,
+        NodePath::parse("y/b").unwrap(),
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     check(a).await;
 }
 

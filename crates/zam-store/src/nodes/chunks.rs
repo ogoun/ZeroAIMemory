@@ -15,7 +15,7 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
 use jiff::Timestamp;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::{
     ApproxCounter, ChunkLevel, ChunkParams, Doc, TokenCounter, chunk_note, first_paragraph, parse,
@@ -23,7 +23,8 @@ use zam_markdown::{
 
 use super::{hex, revision_text};
 use crate::embeddings::embed_key_of;
-use crate::jobs::{JobOp, PRIORITY_WRITE, enqueue};
+use crate::entries::Certainty;
+use crate::jobs::{JobOp, PRIORITY_REINDEX, PRIORITY_WRITE, enqueue};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
@@ -91,6 +92,30 @@ pub(crate) struct NoteMeta {
     pub l0_source: Option<&'static str>,
     /// `frontmatter.index != false`.
     pub index: bool,
+    /// `certainty:` из frontmatter как в исходнике (`None` — поля нет); значение проверяет
+    /// [`NoteMeta::certainty`].
+    pub certainty_raw: Option<String>,
+    /// Доказательство `evidence:` из frontmatter.
+    pub evidence: Option<crate::certainty::Evidence>,
+}
+
+impl NoteMeta {
+    /// Статус заметки; неизвестное значение `certainty:` → `BadInput` (при записи — 400).
+    pub fn certainty(&self) -> Result<Option<Certainty>, StoreError> {
+        match self.certainty_raw.as_deref() {
+            None => Ok(None),
+            Some(c) => Certainty::parse(c).map(Some).ok_or_else(|| {
+                StoreError::BadInput(format!(
+                    "frontmatter certainty: axiom, theorem или hypothesis, не «{c}»"
+                ))
+            }),
+        }
+    }
+
+    /// Статус для чтения уже записанной заметки: неизвестное значение — статуса нет.
+    pub fn certainty_lenient(&self) -> Option<Certainty> {
+        self.certainty_raw.as_deref().and_then(Certainty::parse)
+    }
 }
 
 /// Разбор заметки и выбор L0: `agent_l0` → `l0` из frontmatter → `description` →
@@ -129,12 +154,16 @@ pub(crate) fn note_meta(content: &str, agent_l0: Option<&str>) -> NoteMeta {
         (None, None)
     };
     let index = fm.and_then(|f| f.index) != Some(false);
+    let certainty_raw = fm.and_then(|f| f.certainty.clone());
+    let evidence = crate::certainty::Evidence::from_note(fm.and_then(|f| f.evidence.as_deref()));
     NoteMeta {
         doc,
         frontmatter,
         l0,
         l0_source,
         index,
+        certainty_raw,
+        evidence,
     }
 }
 
@@ -364,6 +393,91 @@ pub(crate) async fn backfill_embed_keys(db: &Db) -> Result<u64, StoreError> {
     }
     if total > 0 {
         tracing::info!(chunks = total, "ключи кэша эмбеддингов дозаполнены (v5)");
+    }
+    Ok(total)
+}
+
+/// Ключ `meta`: `nodes.certainty` ещё не дозаполнен из frontmatter (миграция 0009).
+pub(crate) const CERTAINTY_BACKFILL: &str = "certainty_backfill";
+
+/// Дозаполняет `nodes.certainty` живых заметок из frontmatter текущей ревизии (миграция 0009
+/// добавила столбец пустым: разбор Markdown SQL не посчитает). Заметкам со статусом
+/// ставится `upsert` с приоритетом reindex (статус попадает в payload Qdrant). Пакетами по
+/// [`BACKFILL_BATCH`] заметок; флаг `meta.certainty_backfill` снимается после последнего
+/// пакета, прерванное дозаполнение повторится при следующем открытии (оно идемпотентно).
+/// Возвращает число заметок со статусом.
+pub(crate) async fn backfill_certainty(db: &Db) -> Result<u64, StoreError> {
+    let pending = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM meta WHERE key = ?1",
+                [CERTAINTY_BACKFILL],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+        .await?;
+    if !pending {
+        return Ok(0);
+    }
+    let (mut total, mut after) = (0u64, None::<Id>);
+    loop {
+        let cursor = after;
+        let (n, found, last) = db
+            .write(move |tx| {
+                let now = fmt_ts(Timestamp::now());
+                let batch: Vec<(Id, i64)> = {
+                    let mut st = tx.prepare_cached(
+                        "SELECT id, current_rev FROM nodes
+                         WHERE kind = 'note' AND deleted_at IS NULL
+                           AND (?1 IS NULL OR id > ?1)
+                         ORDER BY id LIMIT ?2",
+                    )?;
+                    st.query_map(params![cursor, BACKFILL_BATCH], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?
+                    .collect::<Result<_, _>>()?
+                };
+                let mut found = 0u64;
+                for &(id, rev) in &batch {
+                    let content = revision_text(tx, id, rev)?;
+                    let Some(c) = note_meta(&content, None).certainty_lenient() else {
+                        continue;
+                    };
+                    found += 1;
+                    tx.prepare_cached("UPDATE nodes SET certainty = ?2 WHERE id = ?1")?
+                        .execute(params![id, c])?;
+                    let state: Option<i64> = tx
+                        .prepare_cached(
+                            "UPDATE nodes SET index_state = 'pending'
+                             WHERE id = ?1 AND index_state <> 'excluded'
+                             RETURNING current_rev",
+                        )?
+                        .query_row([id], |r| r.get(0))
+                        .optional()?;
+                    if let Some(rev) = state {
+                        enqueue(tx, id, rev, JobOp::Upsert, PRIORITY_REINDEX, &now)?;
+                    }
+                }
+                let last = batch.last().map(|b| b.0);
+                if (batch.len() as i64) < BACKFILL_BATCH {
+                    tx.execute("DELETE FROM meta WHERE key = ?1", [CERTAINTY_BACKFILL])?;
+                }
+                Ok((batch.len() as i64, found, last))
+            })
+            .await?;
+        total += found;
+        match last {
+            Some(l) if n == BACKFILL_BATCH => after = Some(l),
+            _ => break,
+        }
+    }
+    if total > 0 {
+        tracing::info!(
+            notes = total,
+            "certainty заметок дозаполнен из frontmatter (v9)"
+        );
     }
     Ok(total)
 }

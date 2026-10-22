@@ -466,7 +466,8 @@ PRAGMA: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_
   | любое изменение записи или заметки `axiom` (правка, смена `certainty`, supersede, retract, delete, move) | нет (403) | да |
   | снять `certainty` | только у `hypothesis`, с `reason` | да |
 
-  Нарушение прав — 403, нехватка `evidence` или `reason` — 422.
+  Нарушение прав — 403, нехватка `evidence` или `reason` — 422 (`/problems/certainty`, поле `code`: `axiom-requires-human` | `evidence-required` | `reason-required` | `invalid-transition`).
+- **Где проверяется** **[решение исполнителя]**: в транзакции хранилища каждой операции, меняющей запись или заметку, по текущему состоянию цели — создание, правка (PUT, PATCH, `revert`), смена `certainty`, триггеры, supersede, retract, delete, restore, move (вместе с поддеревом), вложение. Запрос агента к `axiom` отвечает 403 раньше конфликта ревизий. Внутренние операции (`author_kind = system`) имеют права агента. Снятие статуса и человеком — с `reason` (каждая смена — ревизия с причиной); у заметки без статуса установка `certainty:` — переход (причина; агенту для `theorem` — `evidence:`). Доказательство заметки — непустой `evidence:` (свободный текст).
 - **История.** Каждая смена `certainty` — новая ревизия с `reason`; у заметок причина — сообщение ревизии (обязательно).
 - **Пример.** Агент прочитал статью, применил метод, метод не сработал: записывает `hypothesis` «метод X нерабочий». Перепроверка либо подтверждает вывод (`→ theorem` с `evidence`), либо выясняется, что параметры были неверны: запись замещается новой (`supersede`) или отзывается с причиной (`retract`). Устаревшее не удаляется и не выдаётся как действующее.
 - **Поиск.** Статус виден в карточках и элементах выдачи, `filters.certainty` ограничивает выдачу, а бусты `axiom > theorem > hypothesis` поднимают надёжное выше предположения при равной релевантности (§9.2).
@@ -960,7 +961,7 @@ zam write <path> [--file f.md | stdin] [--message] [--base-rev N]
 zam attach <path-заметки> <файл>
 zam log changelog|insight|release …     # --trigger file_glob:**/*.sh, --link relates_to:node:<id>; insight: --certainty theorem|hypothesis, --evidence-file F
 zam insight list|show|supersede|retract|revisit|append
-zam insight certify <id> axiom|theorem|hypothesis --reason R [--evidence-file F] [--human]   # --human: человеческий токен (§11.4)
+zam insight certify <id> axiom|theorem|hypothesis|none --reason R [--evidence-file F] [--human]   # --human: человеческий токен (§11.4)
 zam release add|compare [--from-git]
 zam vault list|get|set [--global]       # значение — только из stdin или скрытого ввода
 zam link <src> <type> <dst>             # также: zam link rm <edge-id>, zam links <id>

@@ -105,7 +105,9 @@ async fn failed_items_have_job_id_space_and_path() {
         assert!(it["deleted_at"].is_null(), "{it}");
     }
     // заметка в корзине: ссылка остаётся, WebUI помечает «(в корзине)»
-    zam_store::delete_node(&db, node).await.unwrap();
+    zam_store::delete_node(&db, node, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     let s = adm_status(&a).await;
     for it in s["failed_items"].as_array().unwrap() {
         assert!(it["deleted_at"].is_string(), "{it}");

@@ -75,7 +75,9 @@ pub async fn ensure_admin_user(
             (system.create_user(login, true).await?, "bootstrap")
         }
     };
-    let (_, plain) = system.issue_token(user.id, "initial", Access::Rw).await?;
+    let (_, plain) = system
+        .issue_token(user.id, "initial", Access::Rw, false)
+        .await?;
     system
         .audit(
             "system",

@@ -84,6 +84,7 @@ mod tests {
             index_state: "indexed".into(),
             entry: None,
             area: None,
+            certainty: None,
         }
     }
 

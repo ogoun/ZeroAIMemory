@@ -33,8 +33,8 @@ use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
 pub(crate) use chunks::{
-    backfill_embed_keys, chunk_id, context_prefix, frontmatter_tags, note_chunks, rechunk_notes,
-    token_counter,
+    backfill_certainty, backfill_embed_keys, chunk_id, context_prefix, frontmatter_tags,
+    note_chunks, rechunk_notes, token_counter,
 };
 pub use chunks::{
     chunk_params, count_tokens, set_chunk_params, set_token_counter, token_counter_exact,
@@ -178,6 +178,8 @@ pub struct Node {
     pub deleted_at: Option<Timestamp>,
     /// Есть живой дочерний узел.
     pub has_children: bool,
+    /// Эпистемический статус заметки (`certainty:` во frontmatter текущей ревизии, §7.5).
+    pub certainty: Option<crate::entries::Certainty>,
 }
 
 /// Новая заметка.
@@ -197,7 +199,8 @@ pub(crate) const NODE_COLS: &str = "n.id, n.space_id, n.parent_id, n.kind, n.nam
     n.current_rev, n.content_hash, n.frontmatter, n.l0, n.l0_source,
     n.created_at, n.updated_at, n.deleted_at, n.index_state,
     EXISTS (SELECT 1 FROM nodes c
-            WHERE c.space_id = n.space_id AND c.parent_id = n.id AND c.deleted_at IS NULL)";
+            WHERE c.space_id = n.space_id AND c.parent_id = n.id AND c.deleted_at IS NULL),
+    n.certainty";
 
 pub(crate) fn node_row(r: &Row) -> rusqlite::Result<Node> {
     let frontmatter = r
@@ -221,6 +224,7 @@ pub(crate) fn node_row(r: &Row) -> rusqlite::Result<Node> {
         deleted_at: ts_opt(r, 13)?,
         index_state: r.get(14)?,
         has_children: r.get(15)?,
+        certainty: r.get(16)?,
     })
 }
 

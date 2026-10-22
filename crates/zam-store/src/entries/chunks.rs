@@ -214,6 +214,8 @@ fn entry_index_chunks(tx: &Connection, id: Id) -> Result<Vec<IndexChunk>, StoreE
                     tags,
                     area: area.clone(),
                     updated_at: ts_at(r, 5)?,
+                    // статус записи — в `EntryPayload`
+                    certainty: None,
                 },
                 EntryPayload {
                     entry_id: id,

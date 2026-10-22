@@ -155,6 +155,17 @@ pub async fn upload(
             "вложение привязывается только к заметке".into(),
         ));
     }
+    // вложение — изменение заметки: к заметке axiom его добавляет только человек (§7.5);
+    // проверка до приёма файла (окончательная — в транзакции привязки)
+    let author = crate::attrib::attribution(&p, &headers, None)?.author_kind;
+    zam_store::check_certainty(
+        author,
+        sc.node.certainty,
+        &zam_store::CertaintyChange::ModifyOther,
+        None,
+        None,
+    )
+    .map_err(zam_store::StoreError::from)?;
     let f = next_field(&mut mp)
         .await?
         .ok_or_else(|| ApiError::BadRequest("нет поля file".into()))?;
@@ -176,7 +187,7 @@ pub async fn upload(
         .put(reader, limit)
         .await
         .map_err(|e| put_err(e, limit))?;
-    let link = attach(&sc.db, sc.node.id, &sha, size, &filename, &mime).await?;
+    let link = attach(&sc.db, sc.node.id, &sha, size, &filename, &mime, author).await?;
     st.render_gen.bump_user(sc.owner);
     tracing::info!(node = %sc.node.id, sha256 = %sha, size, "вложение загружено");
     Ok((

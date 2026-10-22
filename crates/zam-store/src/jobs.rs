@@ -201,6 +201,8 @@ pub struct NodePayload {
     /// Область (`nodes.area` / `entries.area`).
     pub area: Option<String>,
     pub updated_at: Timestamp,
+    /// `certainty` заметки (`nodes.certainty`, §7.5); у записи журнала — в [`EntryPayload`].
+    pub certainty: Option<String>,
 }
 
 /// Поля записи журнала для payload точек Qdrant (M3). Чанк записи несёт их вместо узла:
@@ -631,7 +633,8 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
     let row = tx
         .prepare_cached(
             "SELECT n.space_id, s.kind, s.solution_guid, n.path, n.frontmatter,
-                    n.updated_at, n.kind, n.index_state, n.deleted_at IS NOT NULL, n.area
+                    n.updated_at, n.kind, n.index_state, n.deleted_at IS NOT NULL, n.area,
+                    n.certainty
              FROM nodes n JOIN spaces s ON s.id = n.space_id
              WHERE n.id = ?1",
         )?
@@ -647,6 +650,7 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
                     tags: Vec::new(),
                     area: r.get(9)?,
                     updated_at: ts_at(r, 5)?,
+                    certainty: r.get(10)?,
                 },
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, String>(6)?,

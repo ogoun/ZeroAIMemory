@@ -4,6 +4,7 @@ pub mod app;
 pub mod attrib;
 pub mod auth;
 pub mod bootstrap;
+pub mod certainty;
 pub mod config;
 pub mod cuda;
 pub mod error;

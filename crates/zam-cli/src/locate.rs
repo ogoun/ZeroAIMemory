@@ -142,6 +142,26 @@ fn parse_md(text: &str) -> (Option<String>, Option<String>) {
 struct HomeConfig {
     url: Option<String>,
     token: Option<String>,
+    /// Человеческий токен (§7.5): только для команд с флагом `--human`.
+    human_token: Option<String>,
+}
+
+/// Человеческий токен из `~/.zeroaimemory/config.toml` (`human_token`) — для команд с флагом
+/// `--human` (например, `zam insight certify ID axiom --reason R --human`). Других источников
+/// нет намеренно: флаги, окружение и CLAUDE.md/AGENTS.md видит агент, а запись по этому
+/// токену атрибутируется человеку **[решение исполнителя]**. Нет файла или поля — `None`.
+pub fn human_token(home: &Path) -> Result<Option<Found>, String> {
+    let path = home.join(".zeroaimemory").join("config.toml");
+    let cfg: HomeConfig = match read_limited(&path) {
+        Read::Skip => return Ok(None),
+        Read::Failed(e) => return Err(format!("не удалось прочитать {}: {e}", path.display())),
+        Read::Text(t) => toml::from_str(&t)
+            .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
+    };
+    Ok(nonempty(cfg.human_token.as_deref()).map(|value| Found {
+        value,
+        source: Source::Home(path),
+    }))
 }
 
 fn nonempty(v: Option<&str>) -> Option<String> {
@@ -291,6 +311,26 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn human_token_only_from_home_config() {
+        let root = tmp("human");
+        let home = root.join("home");
+        assert_eq!(human_token(&home).unwrap(), None);
+        std::fs::create_dir_all(home.join(".zeroaimemory")).unwrap();
+        let cfg = home.join(".zeroaimemory/config.toml");
+        std::fs::write(&cfg, "token = \"agent-token\"\n").unwrap();
+        assert_eq!(human_token(&home).unwrap(), None);
+        std::fs::write(&cfg, "token = \"a\"\nhuman_token = \" human-token \"\n").unwrap();
+        let f = human_token(&home).unwrap().unwrap();
+        assert_eq!(f.value, "human-token");
+        assert_eq!(f.source, Source::Home(cfg.clone()));
+        // обычный поиск токена его не берёт
+        let r = res(&Flags::default(), &[], &root, &home);
+        assert_eq!(r.token.unwrap().value, "a");
+        std::fs::write(&cfg, "human_token = [1]\n").unwrap();
+        assert!(human_token(&home).is_err());
     }
 
     #[test]

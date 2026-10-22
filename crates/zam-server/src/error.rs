@@ -48,6 +48,11 @@ pub enum ApiError {
     /// 422 `/problems/idempotency-mismatch`: ключ повторён с другим запросом.
     #[error("{0}")]
     IdempotencyMismatch(String),
+    /// `/problems/certainty` (§7.5): нарушение матрицы прав `certainty` — 403 (`axiom` не от
+    /// человека) или 422 (нет доказательства или причины, недопустимый переход); `code` —
+    /// машинный код ([`zam_store::CertaintyError::code`]).
+    #[error("{0}")]
+    Certainty(zam_store::CertaintyError),
     #[error("слишком много запросов")]
     RateLimited { retry_after_s: u64 },
     #[error("{0}")]
@@ -105,6 +110,15 @@ impl ApiError {
                 "/problems/idempotency-mismatch",
                 "Unprocessable Content",
             ),
+            ApiError::Certainty(e) => {
+                let status = crate::certainty::status_of(*e);
+                let title = if status == StatusCode::FORBIDDEN {
+                    "Forbidden"
+                } else {
+                    "Unprocessable Content"
+                };
+                (status, "/problems/certainty", title)
+            }
             ApiError::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "/problems/rate-limited",
@@ -141,6 +155,7 @@ impl From<StoreError> for ApiError {
             StoreError::Conflict(m) => ApiError::conflict(m),
             StoreError::BadInput(m) => ApiError::BadRequest(m),
             StoreError::IdempotencyMismatch(m) => ApiError::IdempotencyMismatch(m),
+            StoreError::Certainty(c) => ApiError::Certainty(c),
             other => ApiError::Internal(other.to_string()),
         }
     }
@@ -167,6 +182,9 @@ impl IntoResponse for ApiError {
                 // стандартные поля problem не перекрываются
                 o.entry(k.clone()).or_insert_with(|| v.clone());
             }
+        }
+        if let (ApiError::Certainty(c), Value::Object(o)) = (&self, &mut body) {
+            o.insert("code".into(), json!(c.code()));
         }
         if let (ApiError::SolutionAccess { guid, state }, Value::Object(o)) = (&self, &mut body) {
             o.insert("state".into(), json!(state));

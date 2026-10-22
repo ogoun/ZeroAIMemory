@@ -35,6 +35,11 @@ pub struct Frontmatter {
     pub description: Option<String>,
     pub l0: Option<String>,
     pub index: Option<bool>,
+    /// Эпистемический статус (§7.5): `axiom` | `theorem` | `hypothesis` как в исходнике
+    /// (проверку значения делает хранилище); без поля — статуса нет.
+    pub certainty: Option<String>,
+    /// Доказательство для `theorem` — свободный текст (скаляр или блок `|`).
+    pub evidence: Option<String>,
 }
 
 /// Заголовок верхнего уровня.

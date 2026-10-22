@@ -1,7 +1,7 @@
 //! Разбор полей frontmatter.
 //!
 //! Нужны только плоские ключи верхнего уровня (`tags`, `description`, `l0`,
-//! `index`), поэтому вместо YAML-библиотеки — узкое подмножество YAML:
+//! `index`, `certainty`, `evidence`), поэтому вместо YAML-библиотеки — узкое подмножество YAML:
 //! скаляры (простые, `"…"`, `'…'`, в том числе многострочные), блочные
 //! скаляры `|` и `>` с модификаторами `-`/`+` и цифрой отступа, `~`/`null`,
 //! булевы значения, списки `[a, b]` и блочные списки `- a`.
@@ -19,6 +19,8 @@ pub(crate) fn parse(block: &str, delimiter: &str) -> Frontmatter {
         description: None,
         l0: None,
         index: None,
+        certainty: None,
+        evidence: None,
     };
     let lines: Vec<&str> = raw.lines().collect();
     let mut i = 0;
@@ -50,6 +52,10 @@ pub(crate) fn parse(block: &str, delimiter: &str) -> Frontmatter {
             "description" => fm.description = string_value(value, &lines, &mut i),
             "l0" => fm.l0 = string_value(value, &lines, &mut i),
             "index" => fm.index = boolean(value),
+            "certainty" => {
+                fm.certainty = string_value(value, &lines, &mut i).map(|c| c.trim().to_string())
+            }
+            "evidence" => fm.evidence = string_value(value, &lines, &mut i),
             _ => {}
         }
     }
@@ -425,6 +431,37 @@ mod tests {
         let f = fm("description: \"раз\n  два\"\nl0: 'it''s\n  ok'\n");
         assert_eq!(f.description.as_deref(), Some("раз два"));
         assert_eq!(f.l0.as_deref(), Some("it's ok"));
+    }
+
+    #[test]
+    fn frontmatter_certainty_and_evidence() {
+        let f = fm("certainty: theorem
+evidence: |
+  проверено на CI
+  метод: прогон
+");
+        assert_eq!(f.certainty.as_deref(), Some("theorem"));
+        assert_eq!(
+            f.evidence.as_deref(),
+            Some(
+                "проверено на CI
+метод: прогон
+"
+            )
+        );
+        let f = fm("certainty: 'axiom' # человек
+evidence: \"тест\"
+");
+        assert_eq!(f.certainty.as_deref(), Some("axiom"));
+        assert_eq!(f.evidence.as_deref(), Some("тест"));
+        // без поля и с null — статуса нет
+        let f = fm("tags: [a]
+");
+        assert_eq!((f.certainty, f.evidence), (None, None));
+        let f = fm("certainty: ~
+evidence:
+");
+        assert_eq!((f.certainty, f.evidence), (None, None));
     }
 
     #[test]

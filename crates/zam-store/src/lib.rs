@@ -5,6 +5,7 @@
 
 pub mod access;
 pub mod blobs;
+pub mod certainty;
 pub mod datadir;
 pub mod db;
 pub mod embeddings;
@@ -23,6 +24,9 @@ pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, Solutio
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_in_space,
     resolve_attachment,
+};
+pub use certainty::{
+    CertaintyChange, CertaintyError, Evidence, check_certainty, default_certainty,
 };
 pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
 pub use db::{Db, DbOptions};
@@ -90,6 +94,9 @@ pub enum StoreError {
     /// `Idempotency-Key` повторён с другим содержимым запроса.
     #[error("{0}")]
     IdempotencyMismatch(String),
+    /// Нарушение матрицы прав `certainty` ([`certainty::check_certainty`]).
+    #[error(transparent)]
+    Certainty(#[from] CertaintyError),
     #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
     DataDirLocked(std::path::PathBuf),
     /// Windows: путь каталога данных так длинен, что файлы внутри него (базы SQLite, их

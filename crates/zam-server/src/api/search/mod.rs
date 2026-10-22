@@ -18,6 +18,10 @@
 //!   `revisit`); `include_history: true` снимает фильтр статуса. Фильтр действует и в Qdrant
 //!   (`kinds`, `must_not` по исключённым статусам), и в FTS, и в проверке векторных хитов
 //!   ([`live_chunks`]); у changelog и release статуса нет — они проходят всегда.
+//!   `filters.certainty` — эпистемические статусы (`axiom`, `theorem`, `hypothesis`, §7.5)
+//!   заметок и записей; пусто — любые, иначе цели без статуса не проходят (Qdrant, FTS и
+//!   проверка хитов). Бусты `search.boost_axiom`/`boost_theorem`/`boost_hypothesis`
+//!   (1,20 / 1,10 / 1,00) — множители слитого балла по `certainty`.
 //!
 //! **Область** ([`targets`]): цели — личная база пользователя (Knowledge, Rules, свои
 //! решения, Human — только администратору с `include_human: true`) и базы владельцев
@@ -89,12 +93,13 @@
 //! `total_ms` — весь обработчик без сериализации ответа). Маркеры совпадений в JSON —
 //! U+E000/U+E001.
 //!
+//! Элемент заметки несёт `certainty` её текущей ревизии (`null` — без статуса).
 //! Элемент записи журнала вместо `node_id` несёт `entry_id` и поля записи: `kind`,
 //! `status`, `insight_kind` (`data.kind`), `certainty`, `title`; путь у записи пуст,
 //! `expand` и L0 к записям не применяются.
 //!
 //! **Формат `md`** — карточки §9.3, по одной на элемент:
-//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N> · <дата> · ~<N> tok`;
+//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N>[ · <certainty>] · <дата> · ~<N> tok`;
 //! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> · ~<N>
 //! tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются),
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
@@ -202,6 +207,8 @@ enum Expand {
 struct Filters {
     kinds: Option<Vec<String>>,
     status: Option<Vec<String>>,
+    /// `axiom | theorem | hypothesis` (§7.5); пусто — любые, в том числе без статуса.
+    certainty: Option<Vec<String>>,
 }
 
 /// Допустимые виды целей `filters.kinds`.
@@ -219,6 +226,8 @@ const DEFAULT_KINDS: [&str; 4] = ["note", "insight", "changelog", "release"];
 const STATUSES: [&str; 4] = ["active", "revisit", "superseded", "retracted"];
 /// Статусы по умолчанию (§7.5): действующие.
 const DEFAULT_STATUSES: [&str; 2] = ["active", "revisit"];
+/// Эпистемические статусы `filters.certainty` (§7.5).
+const CERTAINTIES: [&str; 3] = ["axiom", "theorem", "hypothesis"];
 
 /// Список значений фильтра: пустой или не задан — `default`; неизвестное значение — 400.
 fn filter_list(
@@ -256,7 +265,8 @@ fn area_filter(a: Option<&str>) -> Result<Option<String>, ApiError> {
 }
 
 impl SearchSection {
-    /// Бусты §9.2 п. 4: виды инсайтов и текущая область (`X-Zam-Area`, если задана).
+    /// Бусты §9.2 п. 4: виды инсайтов, `certainty` (§7.5) и текущая область (`X-Zam-Area`,
+    /// если задана).
     fn boosts(&self, area: Option<String>) -> Boosts {
         Boosts {
             insight_kinds: [
@@ -265,7 +275,13 @@ impl SearchSection {
             ]
             .into_iter()
             .collect(),
-            certainty: HashMap::new(),
+            certainty: [
+                ("axiom".to_string(), self.boost_axiom),
+                ("theorem".to_string(), self.boost_theorem),
+                ("hypothesis".to_string(), self.boost_hypothesis),
+            ]
+            .into_iter()
+            .collect(),
             area: area.map(|a| (a, self.boost_area)),
         }
     }
@@ -280,6 +296,7 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
         &STATUSES,
         &DEFAULT_STATUSES,
     )?;
+    let certainty = filter_list("filters.certainty", f.certainty.as_ref(), &CERTAINTIES, &[])?;
     Ok(TargetFilter {
         kinds,
         statuses: if include_history {
@@ -288,6 +305,7 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
             statuses
         },
         area: None,
+        certainty,
     })
 }
 
@@ -836,6 +854,7 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
         }
         None => {
             o.insert("kind".into(), json!("note"));
+            o.insert("certainty".into(), json!(h.certainty));
         }
     }
     if mode == SearchMode::Notes {
@@ -902,8 +921,13 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
                 line.push_str(" › ");
                 line.push_str(&h.heading_path);
             }
+            let certainty = h
+                .certainty
+                .as_ref()
+                .map(|c| format!(" · {c}"))
+                .unwrap_or_default();
             line.push_str(&format!(
-                "  [{score:.2}] rev{} · {} · ~{} tok\n",
+                "  [{score:.2}] rev{}{certainty} · {} · ~{} tok\n",
                 h.rev,
                 h.updated_at.strftime("%Y-%m-%d"),
                 p.tokens
@@ -1053,6 +1077,7 @@ pub async fn search(
             kinds: kinds.kinds.clone(),
             exclude_statuses: excluded_statuses(&kinds),
             area: kinds.area.clone(),
+            certainty: kinds.certainty.clone(),
             ..VectorFilter::default()
         };
         vector_channel(&st.index, filter, req.query.clone()).await
@@ -1138,7 +1163,8 @@ pub async fn search(
                         .as_ref()
                         .filter(|e| e.kind == "insight")
                         .and_then(|e| e.insight_kind.clone()),
-                    certainty: h.entry.as_ref().and_then(|e| e.certainty.clone()),
+                    // статус заметки или записи (бусты надёжности, §7.5)
+                    certainty: h.certainty.clone(),
                     area: h.area.clone(),
                 },
             ))
@@ -1403,6 +1429,7 @@ mod tests {
             index_state: "indexed".into(),
             entry: None,
             area: None,
+            certainty: None,
         }
     }
 
@@ -1760,11 +1787,20 @@ mod tests {
             &Filters {
                 kinds: Some(vec!["insight".into()]),
                 status: Some(vec!["retracted".into()]),
+                certainty: Some(vec!["axiom".into(), "theorem".into()]),
             },
             false,
         )
         .unwrap();
         assert_eq!(f.kinds, vec!["insight"]);
+        assert_eq!(f.certainty, vec!["axiom", "theorem"]);
+        // по умолчанию certainty не ограничен
+        assert!(
+            target_filter(&Filters::default(), false)
+                .unwrap()
+                .certainty
+                .is_empty()
+        );
         assert_eq!(
             excluded_statuses(&f),
             vec!["active", "revisit", "superseded"]
@@ -1772,11 +1808,15 @@ mod tests {
         for bad in [
             Filters {
                 kinds: Some(vec!["nope".into()]),
-                status: None,
+                ..Filters::default()
             },
             Filters {
-                kinds: None,
                 status: Some(vec!["Active".into()]),
+                ..Filters::default()
+            },
+            Filters {
+                certainty: Some(vec!["certain".into()]),
+                ..Filters::default()
             },
         ] {
             assert!(target_filter(&bad, false).is_err());

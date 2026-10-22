@@ -12,7 +12,8 @@ use super::{
     REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, check_triggers, load_entry,
     normalize_title, replace_triggers, same_triggers,
 };
-use crate::nodes::Attribution;
+use crate::certainty::{CertaintyChange, Evidence, check_certainty, default_certainty};
+use crate::nodes::{Attribution, AuthorKind};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
@@ -275,6 +276,17 @@ fn insert_entry(
     if e.kind != EntryKind::Insight && e.certainty.is_some() {
         return Err(bad("certainty есть только у insight"));
     }
+    // без явного статуса insight агента — hypothesis, человека — axiom (§7.5)
+    let certainty = e
+        .certainty
+        .or_else(|| default_certainty(a.author_kind, e.kind));
+    check_certainty(
+        a.author_kind,
+        None,
+        &CertaintyChange::Create(certainty),
+        Evidence::from_data(&e.data).as_ref(),
+        None,
+    )?;
     if e.kind != EntryKind::Insight && !e.triggers.is_empty() {
         return Err(bad("триггеры есть только у insight"));
     }
@@ -286,7 +298,7 @@ fn insert_entry(
         tags: check_tags(e.tags)?,
         area: check_area(e.area.or_else(|| a.area.clone()))?,
         status,
-        certainty: e.certainty,
+        certainty,
     };
     let id = Id::new();
     c.prepare_cached(
@@ -416,6 +428,18 @@ pub(crate) fn ensure_editable(e: &Entry) -> Result<(), StoreError> {
     }
 }
 
+/// Любое изменение записи (правка, замещение, отзыв, удаление, восстановление, триггеры) —
+/// по матрице `certainty`: запись `axiom` меняет только человек.
+fn ensure_may_modify(e: &Entry, author: AuthorKind) -> Result<(), StoreError> {
+    Ok(check_certainty(
+        author,
+        e.certainty,
+        &CertaintyChange::ModifyOther,
+        None,
+        None,
+    )?)
+}
+
 /// Живая запись по id: нет или удалена → `NotFound`.
 fn live_entry(c: &Connection, id: Id) -> Result<Entry, StoreError> {
     let e = load_entry(c, id)?;
@@ -470,6 +494,8 @@ pub async fn update_entry(
     let a = a.clone();
     db.write(move |tx| {
         let cur = live_entry(tx, id)?;
+        // запись axiom агент не меняет никак (проверка по текущему состоянию, до записи)
+        ensure_may_modify(&cur, a.author_kind)?;
         if let Some(r) = if_rev
             && r != cur.rev
         {
@@ -538,7 +564,20 @@ pub async fn update_entry(
             if cur.kind != EntryKind::Insight {
                 return Err(bad("certainty есть только у insight"));
             }
-            f.certainty = Some(c);
+            f.certainty = c;
+        }
+        if f.certainty != cur.certainty {
+            // доказательство — в итоговой `data` (переданной в этой же правке или прежней)
+            check_certainty(
+                a.author_kind,
+                cur.certainty,
+                &CertaintyChange::Transition {
+                    from: cur.certainty,
+                    to: f.certainty,
+                },
+                Evidence::from_data(&f.data).as_ref(),
+                reason.as_deref(),
+            )?;
         }
         let now = fmt_ts(Timestamp::now());
         if let Some(ts) = p.triggers {
@@ -557,12 +596,13 @@ pub async fn update_entry(
 }
 
 /// Мягко удаляет запись: чанки убираются (и из FTS), индексируемой — `delete`. Ревизии
-/// остаются. Нет записи или уже удалена → `NotFound`. Атрибуция — для проверок сервера
-/// (задача 9); в строке записи автор удаления не хранится, как и у узлов.
+/// остаются. Нет записи или уже удалена → `NotFound`; запись `axiom`, а автор не человек →
+/// `Certainty`. В строке записи автор удаления не хранится, как и у узлов.
 pub async fn delete_entry(db: &Db, id: Id, a: &Attribution) -> Result<(), StoreError> {
-    let _ = a;
+    let author = a.author_kind;
     db.write(move |tx| {
         let cur = live_entry(tx, id)?;
+        ensure_may_modify(&cur, author)?;
         let now = fmt_ts(Timestamp::now());
         tx.execute(
             "UPDATE entries SET deleted_at = ?2 WHERE id = ?1",
@@ -574,11 +614,12 @@ pub async fn delete_entry(db: &Db, id: Id, a: &Attribution) -> Result<(), StoreE
 }
 
 /// Восстанавливает удалённую запись: чанки из текущих полей, `upsert`. Нет → `NotFound`;
-/// не удалена → `BadInput`.
+/// не удалена → `BadInput`; запись `axiom`, а автор не человек → `Certainty`.
 pub async fn restore_entry(db: &Db, id: Id, a: &Attribution) -> Result<Entry, StoreError> {
-    let _ = a;
+    let author = a.author_kind;
     db.write(move |tx| {
         let cur = load_entry(tx, id)?;
+        ensure_may_modify(&cur, author)?;
         if cur.deleted_at.is_none() {
             return Err(bad("запись не удалена"));
         }
@@ -613,6 +654,8 @@ pub async fn supersede_entry(
     let a = a.clone();
     db.write(move |tx| {
         let o = live_entry(tx, old)?;
+        // замещение — изменение старой записи: axiom замещает только человек
+        ensure_may_modify(&o, a.author_kind)?;
         if o.kind != EntryKind::Insight || new.kind != EntryKind::Insight {
             return Err(bad("замещаются только insight"));
         }
@@ -664,6 +707,7 @@ pub async fn retract_entry(
     let a = a.clone();
     db.write(move |tx| {
         let cur = live_entry(tx, id)?;
+        ensure_may_modify(&cur, a.author_kind)?;
         if cur.kind != EntryKind::Insight {
             return Err(bad("отзываются только insight"));
         }

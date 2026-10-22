@@ -90,9 +90,14 @@ async fn embed_key_written_moved_and_backfilled() {
         let n = add(&db, k, "a/note", NOTE).await;
         assert_keys(&raw_keys(&db, n).await);
         let before = raw_keys(&db, n).await;
-        move_node(&db, n, NodePath::parse("b/renamed").unwrap())
-            .await
-            .unwrap();
+        move_node(
+            &db,
+            n,
+            NodePath::parse("b/renamed").unwrap(),
+            zam_store::AuthorKind::System,
+        )
+        .await
+        .unwrap();
         let after = raw_keys(&db, n).await;
         assert_keys(&after);
         assert_ne!(before[0].2, after[0].2, "префикс сменился — ключ тоже");

@@ -47,6 +47,7 @@ fn token_json(t: &TokenInfo) -> Value {
         "last_used_at": t.last_used_at.map(fmt_ts),
         "last_ip": t.last_ip,
         "revoked_at": t.revoked_at.map(fmt_ts),
+        "human": t.human,
     })
 }
 
@@ -128,7 +129,7 @@ pub async fn create_user(
         .await?;
     let (info, plain) = st
         .system
-        .issue_token(user.id, "default", Access::Rw)
+        .issue_token(user.id, "default", Access::Rw, false)
         .await?;
     audit_token_issue(&st, &info, &plain, &ip).await?;
     Ok((
@@ -243,6 +244,7 @@ async fn audit_token_issue(
                 "token": mask_token(plain),
                 "name": info.name,
                 "access": info.access.as_str(),
+                "human": info.human,
             }),
         )
         .await?;
@@ -264,6 +266,11 @@ pub async fn list_tokens(
 struct IssueToken {
     name: String,
     access: Option<String>,
+    /// Человеческий токен (§7.5): запись по нему — `author_kind = human` (ставит и меняет
+    /// `axiom`). Выпускает только администратор (маршрут `AdminOnly`) **[решение
+    /// исполнителя]**; хранить его в CLAUDE.md/AGENTS.md нельзя — агент станет «человеком».
+    #[serde(default)]
+    human: bool,
 }
 
 pub async fn issue_token(
@@ -287,7 +294,7 @@ pub async fn issue_token(
             "пользователь отключён: токен выпустить нельзя",
         ));
     }
-    let (info, plain) = st.system.issue_token(id, &name, access).await?;
+    let (info, plain) = st.system.issue_token(id, &name, access, req.human).await?;
     audit_token_issue(&st, &info, &plain, &client.ip.to_string()).await?;
     Ok((
         StatusCode::CREATED,

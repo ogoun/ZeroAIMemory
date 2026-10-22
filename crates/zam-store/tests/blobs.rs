@@ -109,23 +109,55 @@ async fn same_content_is_one_file_and_refcount_counts_new_pairs_only() {
     assert_eq!(files, 1);
     assert!(incoming_is_empty(&bs));
 
-    let link = attach(&db, a, &sha, size, "cat.png", "image/png")
-        .await
-        .unwrap();
+    let link = attach(
+        &db,
+        a,
+        &sha,
+        size,
+        "cat.png",
+        "image/png",
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     assert_eq!(link, format!("_attachments/{}/cat.png", &sha[..16]));
     assert_eq!(refcount(&db, &sha).await, 1);
     // та же пара — счётчик не растёт
-    attach(&db, a, &sha, size, "cat.png", "image/png")
-        .await
-        .unwrap();
+    attach(
+        &db,
+        a,
+        &sha,
+        size,
+        "cat.png",
+        "image/png",
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     assert_eq!(refcount(&db, &sha).await, 1);
     // новая пара: другой узел или другое имя
-    attach(&db, b, &sha, size, "cat.png", "image/png")
-        .await
-        .unwrap();
-    attach(&db, a, &sha, size, "кот 2.png", "image/png")
-        .await
-        .unwrap();
+    attach(
+        &db,
+        b,
+        &sha,
+        size,
+        "cat.png",
+        "image/png",
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
+    attach(
+        &db,
+        a,
+        &sha,
+        size,
+        "кот 2.png",
+        "image/png",
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     assert_eq!(refcount(&db, &sha).await, 3);
 }
 
@@ -149,9 +181,17 @@ async fn link_encodes_markdown_breaking_characters() {
     let (_dd, db, bs, k, _) = setup("link").await;
     let a = note(&db, k, "a").await;
     let (sha, size) = bs.put(&b"x"[..], 10).await.unwrap();
-    let link = attach(&db, a, &sha, size, "мой (1) <a>.png", "image/png")
-        .await
-        .unwrap();
+    let link = attach(
+        &db,
+        a,
+        &sha,
+        size,
+        "мой (1) <a>.png",
+        "image/png",
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         link,
         format!("_attachments/{}/мой%20%281%29%20%3Ca%3E.png", &sha[..16])
@@ -159,18 +199,45 @@ async fn link_encodes_markdown_breaking_characters() {
     for bad in ["", "a/b", "..", "a\\b", "x\u{1}"] {
         assert!(
             matches!(
-                attach(&db, a, &sha, size, bad, "x/y").await,
+                attach(
+                    &db,
+                    a,
+                    &sha,
+                    size,
+                    bad,
+                    "x/y",
+                    zam_store::AuthorKind::System
+                )
+                .await,
                 Err(StoreError::BadInput(_))
             ),
             "{bad:?}"
         );
     }
     assert!(matches!(
-        attach(&db, a, "nothex", size, "a.png", "image/png").await,
+        attach(
+            &db,
+            a,
+            "nothex",
+            size,
+            "a.png",
+            "image/png",
+            zam_store::AuthorKind::System
+        )
+        .await,
         Err(StoreError::BadInput(_))
     ));
     assert!(matches!(
-        attach(&db, Id::new(), &sha, size, "a.png", "image/png").await,
+        attach(
+            &db,
+            Id::new(),
+            &sha,
+            size,
+            "a.png",
+            "image/png",
+            zam_store::AuthorKind::System
+        )
+        .await,
         Err(StoreError::NotFound)
     ));
 }
@@ -182,12 +249,28 @@ async fn resolve_and_meta_respect_human() {
     let hn = note(&db, h, "h").await;
     let (s1, n1) = bs.put(&b"knowledge file"[..], 100).await.unwrap();
     let (s2, n2) = bs.put(&b"human file"[..], 100).await.unwrap();
-    attach(&db, kn, &s1, n1, "a.png", "image/png")
-        .await
-        .unwrap();
-    attach(&db, hn, &s2, n2, "b.pdf", "application/pdf")
-        .await
-        .unwrap();
+    attach(
+        &db,
+        kn,
+        &s1,
+        n1,
+        "a.png",
+        "image/png",
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
+    attach(
+        &db,
+        hn,
+        &s2,
+        n2,
+        "b.pdf",
+        "application/pdf",
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
 
     let token = AttachScope {
         prefer_space: Some(k),

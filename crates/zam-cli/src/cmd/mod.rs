@@ -57,6 +57,26 @@ pub struct Ctx {
     pub json: bool,
 }
 
+/// Подключение с человеческим токеном (`--human`, §7.5): URL — как обычно, токен — только
+/// `human_token` из `~/.zeroaimemory/config.toml` (флаг `--token` и прочие источники не
+/// действуют). Нет поля → код токена.
+pub fn connect_human(c: &Common) -> Result<Ctx, CliError> {
+    let human = locate::human_token(&home_dir())
+        .map_err(CliError::config)?
+        .ok_or_else(|| {
+            CliError::new(
+                EXIT_TOKEN,
+                "--human: нет human_token в ~/.zeroaimemory/config.toml (человеческий токен \
+                 выпускает администратор в WebUI; не кладите его в CLAUDE.md/AGENTS.md)",
+            )
+        })?;
+    let c = Common {
+        token: Some(human.value),
+        ..c.clone()
+    };
+    connect(&c)
+}
+
 /// URL и токен (`locate` M0), `solution.toml` — и клиент API.
 pub fn connect(c: &Common) -> Result<Ctx, CliError> {
     let cwd = std::env::current_dir().unwrap_or_default();

@@ -129,6 +129,10 @@ max_per_node = 3
 boost_gotcha = 1.15
 boost_failure = 1.15
 boost_area = 1.10
+# Эпистемический статус certainty заметок и записей (§7.5): axiom > theorem > hypothesis.
+boost_axiom = 1.20
+boost_theorem = 1.10
+boost_hypothesis = 1.00
 
 [insights]
 # Дедупликация при записи insight (§7.5): действующий insight той же области с dense-косинусом

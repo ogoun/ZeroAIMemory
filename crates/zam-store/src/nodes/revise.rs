@@ -13,7 +13,8 @@ use zam_markdown::{PatchError, PatchOp, apply_patch, section_bytes};
 
 use super::chunks::{index_state, note_meta, space_kind};
 use super::write::store_revision;
-use super::{Attribution, Node, NodeKind, load_node, revision_text, sha256_hex};
+use super::{Attribution, AuthorKind, Node, NodeKind, load_node, revision_text, sha256_hex};
+use crate::certainty::{CertaintyChange, check_certainty};
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
 
@@ -82,6 +83,7 @@ pub async fn update_note(
 ) -> Result<Node, WriteError> {
     write_note(db, move |tx| {
         let node = live_note(tx, id)?;
+        ensure_may_modify(&node, a.author_kind)?;
         if base_rev != node.current_rev {
             return Err(rev_mismatch(tx, &node)?);
         }
@@ -119,6 +121,7 @@ pub async fn patch_note_within(
 ) -> Result<Node, WriteError> {
     write_note(db, move |tx| {
         let node = live_note(tx, id)?;
+        ensure_may_modify(&node, a.author_kind)?;
         if ops.is_empty() {
             return Err(StoreError::BadInput("пустой список операций PATCH".into()).into());
         }
@@ -161,6 +164,7 @@ pub async fn patch_note_within(
 pub async fn revert_note(db: &Db, id: Id, to_rev: i64, a: Attribution) -> Result<Node, StoreError> {
     db.write(move |tx| {
         let node = live_note(tx, id)?;
+        ensure_may_modify(&node, a.author_kind)?;
         let text = revision_text(tx, id, to_rev)?;
         commit_text(tx, node, &text, None, &a)
     })
@@ -180,6 +184,18 @@ async fn write_note(
         Err(e) => Ok(Err(e)),
     })
     .await?
+}
+
+/// Заметку `axiom` меняет только человек: проверка по текущей ревизии до любой записи
+/// (`PUT`, `PATCH`, `revert`), раньше конфликта ревизий.
+fn ensure_may_modify(node: &Node, author: AuthorKind) -> Result<(), StoreError> {
+    Ok(check_certainty(
+        author,
+        node.certainty,
+        &CertaintyChange::ModifyOther,
+        None,
+        None,
+    )?)
 }
 
 /// Живая заметка: нет или удалена → `NotFound`, папка → `BadInput`.
@@ -211,7 +227,8 @@ fn op_section(op: &PatchOp) -> Option<&str> {
     }
 }
 
-/// Записывает `content` новой ревизией заметки `node` (если текст изменился).
+/// Записывает `content` новой ревизией заметки `node` (если текст изменился). Смена
+/// `certainty:` — по матрице прав с причиной из сообщения ревизии (`message`).
 fn commit_text(
     tx: &Connection,
     node: Node,
@@ -219,17 +236,31 @@ fn commit_text(
     agent_l0: Option<&str>,
     a: &Attribution,
 ) -> Result<Node, StoreError> {
+    ensure_may_modify(&node, a.author_kind)?;
     let hash = sha256_hex(content.as_bytes());
     if node.content_hash.as_deref() == Some(hash.as_str()) {
         return Ok(node);
     }
     let now = fmt_ts(Timestamp::now());
     let meta = note_meta(content, agent_l0);
+    let certainty = meta.certainty()?;
+    if certainty != node.certainty {
+        check_certainty(
+            a.author_kind,
+            node.certainty,
+            &CertaintyChange::Transition {
+                from: node.certainty,
+                to: certainty,
+            },
+            meta.evidence.as_ref(),
+            a.message.as_deref(),
+        )?;
+    }
     let kind = space_kind(tx, node.space_id)?;
     let rev = node.current_rev + 1;
     tx.execute(
         "UPDATE nodes SET current_rev = ?2, content_hash = ?3, frontmatter = ?4, l0 = ?5,
-                          l0_source = ?6, index_state = ?7, updated_at = ?8
+                          l0_source = ?6, index_state = ?7, updated_at = ?8, certainty = ?9
          WHERE id = ?1",
         params![
             node.id,
@@ -240,6 +271,7 @@ fn commit_text(
             meta.l0_source,
             index_state(&meta, kind),
             now,
+            certainty,
         ],
     )?;
     store_revision(

@@ -8,7 +8,9 @@
     ],
     "description": "Описание: с двоеточием",
     "l0": "Краткая суть заметки.",
-    "index": true
+    "index": true,
+    "certainty": null,
+    "evidence": null
   },
   "sections": [
     {

@@ -473,7 +473,7 @@ async fn status_change_updates_payload() {
     let embedded = a.st.index.worker.embedded_texts();
     let p = EntryPatch {
         status: Some(EntryStatus::Revisit),
-        certainty: Some(Certainty::Theorem),
+        certainty: Some(Some(Certainty::Theorem)),
         reason: Some("checked on staging".into()),
         ..EntryPatch::default()
     };

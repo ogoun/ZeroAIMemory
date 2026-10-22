@@ -1906,7 +1906,8 @@ pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint
         text_hash: c.text_hash.clone(),
         status: None,
         insight_kind: None,
-        certainty: None,
+        // статус заметки (§7.5); у записи журнала его заменит поле записи ниже
+        certainty: c.node.certainty.clone(),
     };
     if let Some(en) = &c.entry {
         payload.node_id = None;

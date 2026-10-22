@@ -24,6 +24,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use zam_core::Id;
 
+use crate::certainty::{CertaintyChange, check_certainty};
+use crate::entries::Certainty;
+use crate::nodes::AuthorKind;
 use crate::paths::NodePath;
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
@@ -173,7 +176,8 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
 
 /// Привязывает блоб к живой заметке `node`; возвращает ссылку для Markdown.
 /// Новая пара (узел, sha256, имя) добавляет строку `attachments` и увеличивает
-/// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет.
+/// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет. Вложение — изменение
+/// заметки: к заметке `axiom` его добавляет только человек (`author`), иначе `Certainty`.
 pub async fn attach(
     db: &Db,
     node: Id,
@@ -181,6 +185,7 @@ pub async fn attach(
     size: u64,
     filename: &str,
     mime: &str,
+    author: AuthorKind,
 ) -> Result<String, StoreError> {
     if !is_sha256(sha256) {
         return Err(StoreError::BadInput("sha256: 64 символа hex".into()));
@@ -190,16 +195,18 @@ pub async fn attach(
     let size = i64::try_from(size).map_err(|_| StoreError::BadInput("размер".into()))?;
     let (sha, name, mime) = (sha256.to_string(), filename.to_string(), mime.to_string());
     db.write(move |t| {
-        let live_note: Option<i64> = t
+        let live_note: Option<Option<Certainty>> = t
             .query_row(
-                "SELECT 1 FROM nodes WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL",
+                "SELECT certainty FROM nodes
+                 WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL",
                 [node],
                 |r| r.get(0),
             )
             .optional()?;
-        if live_note.is_none() {
+        let Some(certainty) = live_note else {
             return Err(StoreError::NotFound);
-        }
+        };
+        check_certainty(author, certainty, &CertaintyChange::ModifyOther, None, None)?;
         let now = fmt_ts(Timestamp::now());
         t.execute(
             "INSERT INTO blobs (sha256, size, mime, refcount, created_at)
