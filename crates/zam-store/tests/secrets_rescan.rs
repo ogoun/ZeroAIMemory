@@ -13,7 +13,7 @@ use zam_store::{
     list_spaces,
 };
 
-const FLAG: &str = "secrets_scanned_v1";
+const FLAG: &str = "secrets_scanned_v2";
 
 fn secret() -> String {
     format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5")

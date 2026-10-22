@@ -239,7 +239,7 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
 /// Ключ `meta`: разовая перенарезка заметок и записей со значениями секретов (сканер §7.6,
 /// задача 11 M3) выполнена. Отсутствует у баз, открытых до сканера; у новой пустой базы
 /// ставится сразу (все её записи нарезаются уже замаскированными).
-const SECRETS_SCANNED: &str = "secrets_scanned_v1";
+const SECRETS_SCANNED: &str = "secrets_scanned_v2";
 
 /// Нужна ли перенарезка секретов: ключа нет и в базе есть живые заметки или записи.
 /// В пустой базе ключ ставится сразу.
@@ -271,6 +271,17 @@ async fn secrets_scan_pending(db: &Db) -> Result<bool, StoreError> {
 async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
     let notes = crate::nodes::rescan_secrets(db, PRIORITY_REINDEX).await?;
     let entries = crate::entries::rescan_entry_secrets(db, PRIORITY_REINDEX).await?;
+    // векторы старых (незамаскированных) чанков больше не нужны: чистим кэш эмбеддингов
+    let mut pruned = 0u64;
+    if notes + entries > 0 {
+        loop {
+            let n = crate::embeddings::gc_embeddings(db, 1000).await?;
+            pruned += n;
+            if n < 1000 {
+                break;
+            }
+        }
+    }
     db.write(|tx| {
         tx.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
@@ -279,7 +290,12 @@ async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
         Ok(())
     })
     .await?;
-    tracing::info!(notes, entries, "перенарезка секретов базы завершена");
+    tracing::info!(
+        notes,
+        entries,
+        pruned,
+        "перенарезка секретов базы завершена"
+    );
     Ok(())
 }
 

@@ -209,7 +209,9 @@ pub(crate) fn context_prefix(
         s.push_str(" | ");
         s.push_str(&tags.join(", "));
     }
-    s
+    // имя, путь, заголовок записи и теги задаёт автор: секрет в них попадает в
+    // `chunks_fts.context_prefix` и во вход эмбеддинга, поэтому префикс маскируется целиком (§7.6)
+    mask_text(&s)
 }
 
 /// Чанк до вставки в БД.
@@ -572,6 +574,22 @@ pub(crate) fn index_note(
     Ok(())
 }
 
+/// В записанных чанках владельца (`col` — `node_id` или `entry_id`) есть секрет в
+/// `context_prefix` (имя, путь, заголовок записи, теги): сканер маскирует префикс при записи,
+/// а чанки старых баз хранят его как есть.
+pub(crate) fn stored_prefix_hit(c: &Connection, col: &str, id: Id) -> Result<bool, StoreError> {
+    let mut st = c.prepare_cached(&format!(
+        "SELECT DISTINCT context_prefix FROM chunks WHERE {col} = ?1"
+    ))?;
+    let rows = st.query_map([id], |r| r.get::<_, String>(0))?;
+    for p in rows {
+        if !scan_secrets(&p?).is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Разовая перенарезка заметок с секретами (миграция на сканер §7.6).
 ///
 /// До задачи 11 M3 значения секретов попадали в `chunks.text` (и FTS) и, после индексации, в
@@ -603,7 +621,9 @@ pub(crate) async fn rescan_secrets(db: &Db, priority: i64) -> Result<u64, StoreE
                 let mut found = 0u64;
                 for (id, rev, state, l0) in &batch {
                     let content = revision_text(tx, *id, *rev)?;
-                    let text_hit = !scan_secrets(&content).is_empty();
+                    // секрет в тексте или в уже записанных префиксах чанков (путь, имя, теги)
+                    let text_hit = !scan_secrets(&content).is_empty()
+                        || stored_prefix_hit(tx, "node_id", *id)?;
                     let masked_l0 = l0
                         .as_deref()
                         .map(mask_text)

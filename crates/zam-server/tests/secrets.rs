@@ -191,3 +191,57 @@ async fn entry_body_secret_masked() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["secrets_detected"].as_array().unwrap().len(), 2);
 }
+
+/// Секрет в заголовке записи и в теге не попадает ни в `chunks.context_prefix`, ни в FTS.
+#[tokio::test]
+async fn secret_in_title_and_tag_masked_in_prefix() {
+    let a = api("secrets-prefix", |_| {}).await;
+    let s = secret();
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(json!({"kind": "insight", "title": format!("Ключ {s} утёк"),
+                        "body": "Обычный текст записи.", "tags": [format!("tok-{s}")],
+                        "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let id: Id = r.json()["id"].as_str().unwrap().parse().unwrap();
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let chunks = entry_chunks_for_index(&db, id).await.unwrap();
+    assert!(!chunks.is_empty());
+    for c in &chunks {
+        assert!(
+            !c.text.contains(&s) && !c.context_prefix.contains(&s),
+            "{c:?}"
+        );
+    }
+    let like = format!("%{s}%");
+    let n: i64 = db
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM chunks WHERE context_prefix LIKE ?1 OR text LIKE ?1",
+                [like],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    assert_eq!(count(&search(&a, &s).await), 0);
+
+    // заметка: секрет в теге frontmatter и в имени
+    let n = a
+        .note(
+            "knowledge",
+            "ops/tags",
+            &format!("---\ntags: [\"api_key={s}\"]\n---\n# Теги\n\nтекст заметки\n"),
+        )
+        .await;
+    let nid: Id = n["id"].as_str().unwrap().parse().unwrap();
+    for c in chunks_for_index(&db, nid).await.unwrap() {
+        assert!(!c.context_prefix.contains(&s), "{}", c.context_prefix);
+    }
+    assert_eq!(count(&search(&a, &s).await), 0);
+}

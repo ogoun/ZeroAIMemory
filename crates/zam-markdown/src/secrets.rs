@@ -101,15 +101,19 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Ключ-значение; необязательная кавычка перед разделителем покрывает JSON (`"password": "…"`)
 /// [решение исполнителя]. Значение — группа 2.
+///
+/// Значение в кавычках берётся до закрывающей кавычки (пароль-фраза с пробелами); без кавычек —
+/// до пробела. Словарь ключей расширен `secret_key`, `signing_key`, `private_key`
+/// [решение исполнителя]. Значение — группа 1 (в `"`), 2 (в `'`) или 3 (без кавычек).
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     rx(
-        r#"(?i)(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)["']?\s*[:=]\s*["']?([^\s"'`]{6,})"#,
+        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key)["']?\s*[:=]\s*(?:"([^"\r\n]{6,})"|'([^'\r\n]{6,})'|([^\s"'`]{6,}))"#,
     )
 });
 
 /// Пароль в URL; пароль — группа 1.
 static URL_PASSWORD: LazyLock<Regex> =
-    LazyLock::new(|| rx(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:([^\s/@]+)@"));
+    LazyLock::new(|| rx(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]*:([^\s/@]+)@"));
 
 static ENTROPY_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| rx(r"[A-Za-z0-9+/_=-]{32,}"));
 
@@ -127,6 +131,10 @@ fn is_placeholder(v: &str) -> bool {
         || v.starts_with('$')
         || (v.starts_with('%') && v.ends_with('%'))
         || v.bytes().all(|b| b == b'*' || b == b'x' || b == b'X')
+        // пути, а не пароли; короткие числа (порты, счётчики, PIN)
+        || v.starts_with('/')
+        || v.starts_with('~')
+        || (v.len() < 12 && v.bytes().all(|b| b.is_ascii_digit()))
         || l == "changeme"
         || l == "example"
 }
@@ -148,7 +156,7 @@ fn shannon(s: &str) -> f64 {
 }
 
 /// Кандидат правила энтропии — настоящий секрет, а не идентификатор.
-fn is_high_entropy_secret(s: &str, word: &str) -> bool {
+fn is_high_entropy_secret(s: &str, url_token: &str) -> bool {
     let b = s.as_bytes();
     // хэши, UUID: только hex-символы и дефисы
     if b.iter().all(|c| c.is_ascii_hexdigit() || *c == b'-') {
@@ -167,9 +175,9 @@ fn is_high_entropy_secret(s: &str, word: &str) -> bool {
     {
         return false;
     }
-    // слово целиком — URL: пути и query-значения идентификаторами не считаются;
+    // кандидат внутри URL-токена: пути и query-значения идентификаторами не считаются;
     // секреты в query ловит правило «ключ-значение»
-    if word.contains("://") {
+    if url_token.contains("://") {
         return false;
     }
     // путь файловой системы: сегменты-слова, а не случайная строка
@@ -186,18 +194,24 @@ fn is_wordlike(p: &str) -> bool {
             .all(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'-')
 }
 
-/// Слово (по ASCII-пробелам) вокруг диапазона.
-fn word_around<'a>(text: &'a str, r: &Range<usize>) -> &'a str {
+/// Граница URL-токена: пробел и `" ' , ) > ] \``.
+fn is_url_delim(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b')' | b'>' | b']' | b'`')
+}
+
+/// URL-токен вокруг диапазона: от ближайшей границы слева до ближайшей справа. В однострочном
+/// JSON соседний ключ за кавычкой в токен не попадает.
+fn url_token_around<'a>(text: &'a str, r: &Range<usize>) -> &'a str {
     let b = text.as_bytes();
     let mut s = r.start;
-    while s > 0 && !b[s - 1].is_ascii_whitespace() {
+    while s > 0 && !is_url_delim(b[s - 1]) {
         s -= 1;
     }
     let mut e = r.end;
-    while e < b.len() && !b[e].is_ascii_whitespace() {
+    while e < b.len() && !is_url_delim(b[e]) {
         e += 1;
     }
-    // ASCII-пробелы не бывают продолжением многобайтового символа: границы корректны
+    // границы — ASCII-байты, не бывающие продолжением многобайтового символа
     text.get(s..e).unwrap_or("")
 }
 
@@ -217,7 +231,7 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
         raw.push((m.range(), SecretKind::PrivateKey));
     }
     for c in KEY_VALUE.captures_iter(text) {
-        if let Some(v) = c.get(2)
+        if let Some(v) = c.get(1).or_else(|| c.get(2)).or_else(|| c.get(3))
             && !is_placeholder(v.as_str())
         {
             raw.push((v.range(), SecretKind::KeyValue));
@@ -239,7 +253,7 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
                 continue;
             }
         }
-        if is_high_entropy_secret(&text[r.clone()], word_around(text, &r)) {
+        if is_high_entropy_secret(&text[r.clone()], url_token_around(text, &r)) {
             raw.push((r, SecretKind::HighEntropy));
         }
     }

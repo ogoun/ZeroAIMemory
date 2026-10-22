@@ -185,6 +185,52 @@ fn masks_only_value_in_key_value() {
 }
 
 #[test]
+fn url_token_boundary_in_one_line_json() {
+    // URL рядом не должен «закрывать» энтропийное правило для соседнего ключа
+    let k = rnd(40, 60);
+    let t = format!(r#"{{"url":"https://a.example/c","k":"{k}"}}"#);
+    let hits = scan_secrets(&t);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(&t[hits[0].range.clone()], k);
+    // а кандидат внутри самого URL по-прежнему не маскируется
+    let url = format!("(https://a.example/{}/x)", rnd(40, 61));
+    assert!(scan_secrets(&url).is_empty());
+}
+
+#[test]
+fn minor_rules() {
+    // пользователь в URL может быть пустым
+    assert_eq!(
+        mask_text("redis://:pw123456@host:6379"),
+        format!("redis://:{SECRET_MARK}@host:6379")
+    );
+    // значение в кавычках — до закрывающей кавычки
+    assert_eq!(
+        mask_text(r#"password: "correct horse battery" ok"#),
+        format!(r#"password: "{SECRET_MARK}" ok"#)
+    );
+    // расширенный словарь ключей
+    for k in ["secret_key", "SECRET_KEY", "signing_key", "private-key"] {
+        assert_eq!(
+            one(&format!("{k} = abcdef123456")),
+            SecretKind::KeyValue,
+            "{k}"
+        );
+    }
+    // пути и короткие числа — не секреты
+    for t in [
+        "password=/etc/ssl/private.pem",
+        "token: ~/.config/tok",
+        "token=100000",
+        "pwd=12345678901",
+    ] {
+        assert!(scan_secrets(t).is_empty(), "{t}");
+    }
+    // длинные числа — по-прежнему значение
+    assert_eq!(one("password=123456789012"), SecretKind::KeyValue);
+}
+
+#[test]
 fn private_key_block_whole() {
     let body = rnd(64, 30);
     let t = format!(
@@ -256,6 +302,30 @@ proptest! {
         }
         masked_expected.push_str(&text[pos..]);
         prop_assert_eq!(mask_secrets(&text, &hits), masked_expected);
+    }
+
+    /// Повторная маскировка ничего не меняет.
+    #[test]
+    fn mask_is_idempotent(
+        parts in proptest::collection::vec(
+            prop_oneof![
+                "[ -~]{0,40}",
+                "\\PC{0,20}",
+                Just("password=abcdef123".to_string()),
+                Just("token: \"two words here\"".to_string()),
+                Just("-----BEGIN PRIVATE KEY-----".to_string()),
+                Just("
+".to_string()),
+                "[A-Za-z0-9=]{32,60}",
+                Just("postgres://u:pw12345@h/".to_string()),
+                Just(SECRET_MARK.to_string()),
+            ],
+            0..12,
+        )
+    ) {
+        let text = parts.concat();
+        let once = mask_text(&text);
+        prop_assert_eq!(mask_text(&once), once);
     }
 }
 

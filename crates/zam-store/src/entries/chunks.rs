@@ -431,7 +431,9 @@ pub(crate) async fn rescan_entry_secrets(db: &Db, priority: i64) -> Result<u64, 
                 };
                 let mut found = 0u64;
                 for (id, prev, title, body) in &batch {
-                    if scan_secrets(&entry_doc(title, body)).is_empty() {
+                    if scan_secrets(&entry_doc(title, body)).is_empty()
+                        && !crate::nodes::stored_prefix_hit(tx, "entry_id", *id)?
+                    {
                         continue;
                     }
                     found += 1;
