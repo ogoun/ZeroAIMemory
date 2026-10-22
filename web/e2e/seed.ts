@@ -44,6 +44,20 @@ graph TD
 [^1]: Текст сноски.
 `;
 
+const ELK_NOTE = `# Диаграмма ELK
+
+\`\`\`mermaid
+---
+config:
+  layout: elk
+---
+graph TD
+  A[Старт ELK] --> B{Проверка}
+  B -->|да| C[Готово]
+  B -->|нет| A
+\`\`\`
+`;
+
 const SECOND_NOTE = `# Вторая заметка
 
 ${'Абзац для прокрутки. '.repeat(40)}
@@ -125,7 +139,7 @@ const json = (body: unknown): RequestInit => ({
 });
 
 /** Создаёт заметки; возвращает их id. */
-export async function seed(base: string, token: string): Promise<{ media: string; second: string }> {
+export async function seed(base: string, token: string): Promise<{ media: string; second: string; elk: string }> {
   const second = await api<Node>(base, token, 'POST', 'nodes', json({
     space: 'knowledge',
     path: 'E2E/Вторая заметка',
@@ -147,7 +161,14 @@ export async function seed(base: string, token: string): Promise<{ media: string
     headers: { 'Content-Type': 'application/json', 'If-Match': String(media.current_rev) },
     body: JSON.stringify({ content: MEDIA_NOTE(blob.link) }),
   });
-  return { media: media.id, second: second.id };
+  // диаграмма с раскладкой ELK — отдельной заметкой: ленивый чанк ELK не должен грузиться в других сценариях
+  const elk = await api<Node>(base, token, 'POST', 'nodes', json({
+    space: 'knowledge',
+    path: 'E2E/Диаграмма ELK',
+    kind: 'note',
+    content: ELK_NOTE,
+  }));
+  return { media: media.id, second: second.id, elk: elk.id };
 }
 
 // ---- журналы решения, Vault и совместный доступ (M3) ----

@@ -111,6 +111,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_ADMIN_PASSWORD = ADMIN_PASSWORD;
     process.env.E2E_NOTE_MEDIA = ids.media;
     process.env.E2E_NOTE_SECOND = ids.second;
+    process.env.E2E_NOTE_ELK = ids.elk;
     // токен администратора — для правок «из другого места» в сценариях конфликта
     process.env.E2E_ADMIN_TOKEN = token;
     process.env.E2E_INSIGHT_OLD = journals.oldInsight;

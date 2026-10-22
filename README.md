@@ -513,6 +513,13 @@ docs/              # ТЗ, планы, исследования, журнал р
 сводкой Rust- и npm-зависимостей (cargo-about, license-checker):
 
 - Qdrant — Apache-2.0; ONNX Runtime — MIT; pdfium — BSD/Apache.
+- WebUI: бандл содержит `elkjs` (раскладка ELK для диаграмм Mermaid с `layout: elk`) под
+  **EPL-2.0** — слабым копилефтом на уровне файлов, не заражающим остальной код под MIT.
+  Это единственное исключение из списка допустимых лицензий бандла (решение владельца
+  2026-10-21; проверка по имени пакета и лицензии — `web/build/license-policy.ts`). Код ELK
+  лежит в отдельном ленивом чанке и загружается только при первой такой диаграмме. Текст
+  EPL-2.0 и ссылка на исходники (<https://github.com/kieler/elkjs>, версия указана там же)
+  входят в `THIRD-PARTY-NOTICES.txt` бандла WebUI.
 - MSVC runtime в комплекте Windows распространяется на условиях Microsoft
   (`MSVC-RUNTIME-NOTICE.txt`).
 - Библиотеки NVIDIA CUDA и cuDNN входят только в архив `zam-cuda` (или ставятся

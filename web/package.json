@@ -8,6 +8,7 @@
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "size": "size-limit",
+    "test:build": "node --experimental-strip-types --test build/license-policy.test.ts",
     "e2e": "node e2e/run.mjs"
   },
   "devDependencies": {

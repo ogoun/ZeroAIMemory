@@ -242,6 +242,12 @@ fix round задачи 1 — по редакции 2). Журнал предыд
     - `errorText`: `/problems/idempotency-mismatch`;
     - e2e: отзыв, пересмотр и возврат, правка триггеров, отклонение с причиной (второй запросивший `e2e-guest`), «Сравнить с», сообщение для Rules, серверный фильтр вида.
   - **E2E:** `seed.ts` (`seedJournals`) — решение, changelog трёх видов, два релиза с коммитами, insights hypothesis/theorem, секрет Vault, пользователь `e2e-member` с запросом доступа (202); вход администратора в `global-setup` теперь до наполнения (админ-API — по сессии с CSRF). `journals.spec.ts` (7), `access.spec.ts` (3); снимки — `.tmp/e2e/screens/`. Полный прогон — 25/25.
+- **Задача 14 — раскладка ELK для Mermaid (2026-10-22).**
+  - **Аудит пакета:** в `mermaid` 12.2.0 ELK встроен в ядро (`elkLayoutLoaders` в `chunks/mermaid.core/chunk-DSNLSHJZ.mjs` регистрирует загрузчик `elk` → динамический `import("./elk-QONTBCTQ.mjs")`, который импортирует `elkjs/lib/elk.bundled.js`). Отдельный `@mermaid-js/layout-elk` для регистрации не нужен — новых npm-зависимостей нет, `package-lock.json` не менялся. `elkjs` 0.9.3, EPL-2.0 (`kieler/elkjs`).
+  - **Лицензия:** политика вынесена в `web/build/license-policy.ts` (`ALLOWED` + `ALLOWED_FOR_PACKAGE = {elkjs: 'EPL-2.0'}`: пакет и лицензия должны совпасть оба); модульный тест `npm run test:build` (4 теста: elkjs/EPL ок, другой пакет с EPL — отказ, elkjs с иной лицензией — отказ, обычные лицензии). `THIRD-PARTY-NOTICES.txt` — текст EPL-2.0 + строка «Исходный код (версия 0.9.3): https://github.com/kieler/elkjs». README: абзац о EPL-2.0.
+  - **Поведение:** алиас-заглушка и `elk-stub.ts` удалены; по умолчанию `layout: 'dagre'`, `layout: elk` включается самой диаграммой (frontmatter или `%%{init}%%`). ELK — отдельный ленивый чанк `assets/elk-*.js`.
+  - **Размеры:** начальный бандл (`npm run size`) 78.05 КБ gzip до и после (предел 300 КБ); ленивый чанк ELK 1 462.87 КБ raw / 455.84 КБ gzip, грузится только при первой диаграмме `layout: elk`.
+  - **E2E:** `mermaid.spec.ts` `mermaid_elk_layout_renders` (без elk чанк не запрашивается; с elk — SVG без ошибки и запрос чанка); заметка «Диаграмма ELK» в `seed.ts`, `E2E_NOTE_ELK`.
 
 ## Отложенные замечания
 
