@@ -9,7 +9,8 @@
 //! - `PATCH /vault/{id} {title?, data?, secret?}` (`If-Match: <rev>` необязателен) — новая
 //!   ревизия; `DELETE /vault/{id}` — мягко, аудит `vault.delete`;
 //! - `GET /vault/{id}/revisions` — ревизии без значений; `?reveal=1&rev=N` — значение
-//!   старой ревизии, только администратору (аудит `vault.reveal` с `rev`).
+//!   старой ревизии, только администратору (аудит `vault.reveal` с `rev`); администратору
+//!   история доступна и после удаления записи.
 //!
 //! **Область.** `{space}` — `knowledge` (личный Vault) или GUID доступного решения (своего
 //! или одобренного участника): записи **пользователя запроса** в его собственной базе с
@@ -35,8 +36,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Db, User, VaultMeta, VaultScope, check_vault_title, vault_delete, vault_get, vault_list,
-    vault_put, vault_revision_secret, vault_revisions, vault_update,
+    Db, User, VaultMeta, VaultScope, check_vault_title, vault_delete, vault_get, vault_get_any,
+    vault_list, vault_put, vault_revision_secret, vault_revisions, vault_update,
 };
 use zeroize::Zeroizing;
 
@@ -223,6 +224,27 @@ async fn item(
         effective_write(p, role)?;
     }
     Ok((Area { user, db }, meta, blob))
+}
+
+/// Запись для истории: администратору — и удалённая (история не теряется с удалением,
+/// §7.6 «администратор видит всё»), токену — только живая ([`item`]).
+async fn history_item(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    raw_id: &str,
+) -> Result<(Area, VaultMeta), ApiError> {
+    if !matches!(p, Principal::Admin { .. }) {
+        let (a, m, _) = item(st, p, headers, raw_id, false).await?;
+        return Ok((a, m));
+    }
+    st.vault.ready()?;
+    let id = parse_id(raw_id)?;
+    let user = target_user(st, p, headers).await?;
+    let db = st.users.get(user.id).await?;
+    let (meta, _deleted) = vault_get_any(&db, id).await?;
+    scope_role(st, p, &user, &meta.scope).await?;
+    Ok((Area { user, db }, meta))
 }
 
 /// JSON метаданных: `space` (`knowledge` или GUID), `agent_solution_id`.
@@ -438,7 +460,7 @@ pub async fn patch(
         .vault
         .encrypt(a.user.id, m.id, expected + 1, &plain)
         .await?;
-    let m = vault_update(&a.db, m.id, expected, title, data, Some(new_blob), &attrib).await?;
+    let m = vault_update(&a.db, m.id, expected, title, data, new_blob, &attrib).await?;
     Ok(Json(meta_json(&m)))
 }
 
@@ -485,7 +507,7 @@ pub async fn revisions(
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
     let reveal = flag(q.reveal.as_deref())?;
-    let (a, m, _) = item(&st, &p, &headers, &id, false).await?;
+    let (a, m) = history_item(&st, &p, &headers, &id).await?;
     let items = vault_revisions(&a.db, m.id).await?;
     if !reveal {
         return Ok(Json(json!({ "items": items })).into_response());

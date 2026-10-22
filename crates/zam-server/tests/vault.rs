@@ -167,6 +167,20 @@ async fn agent_sets_and_reveals_secret_audited() {
             .iter()
             .any(|x| x.action == "vault.delete" && x.target.as_deref() == Some(id.as_str()))
     );
+    // история удалённой записи: токену — 404, администратору — видна и раскрывается
+    let hist = format!("/api/v1/vault/{id}/revisions");
+    assert_eq!(
+        a.t(Method::GET, &hist, None).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let r = a.adm(Method::GET, &hist, None, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["items"].as_array().unwrap().len(), 1);
+    let r = a
+        .adm(Method::GET, &format!("{hist}?reveal=1&rev=1"), None, None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["secret"], v);
 }
 
 #[tokio::test]
@@ -640,6 +654,18 @@ fn vault_values_not_in_fts_qdrant_logs() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let v = value("logs");
+    // заметка: очередь индексации и чанки не пусты — проверки ниже содержательны
+    let (code, n) = srv.call(
+        "POST",
+        "/api/v1/nodes",
+        &token,
+        Some(
+            &json!({"space": "knowledge", "path": "ops/deploy", "kind": "note",
+            "content": "# Деплой\n\nКлюч GitHub лежит в Vault под именем github.\n"}),
+        ),
+    );
+    assert_eq!(code, 201, "{n}");
+    let note_id = n["id"].as_str().unwrap().to_string();
     let (code, j) = srv.call(
         "POST",
         "/api/v1/spaces/knowledge/vault",
@@ -683,7 +709,7 @@ fn vault_values_not_in_fts_qdrant_logs() {
     );
     let tail = srv.tail();
     assert!(!tail.contains(&v), "значение в stderr сервера");
-    // очередь индексации (FTS и Qdrant) не получила ничего: заметок нет, Vault не индексируется
+    // очередь индексации (FTS и Qdrant) и чанки: заметка есть, записи Vault и значения — нет
     let users: Vec<PathBuf> = std::fs::read_dir(data.join("users"))
         .unwrap()
         .flatten()
@@ -691,20 +717,46 @@ fn vault_values_not_in_fts_qdrant_logs() {
         .filter(|p| p.extension().is_some_and(|x| x == "db"))
         .collect();
     assert!(!users.is_empty());
+    let (mut note_jobs, mut note_chunks) = (0, 0);
     for p in users {
         let db = zam_store::Db::open(&p, zam_store::USER_MIGRATIONS).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let (jobs, chunks): (i64, i64) = rt
-            .block_on(db.read(|c| {
+        let (id, note, v) = (id.clone(), note_id.clone(), v.clone());
+        let (nj, nc, vault_jobs, vault_chunks, value_chunks): (i64, i64, i64, i64, i64) = rt
+            .block_on(db.read(move |c| {
+                let q = |sql: &str, arg: &str| -> Result<i64, zam_store::StoreError> {
+                    c.query_row(sql, [arg], |r| r.get(0))
+                        .map_err(zam_store::StoreError::from)
+                };
                 Ok((
-                    c.query_row("SELECT count(*) FROM index_jobs", [], |r| r.get(0))?,
-                    c.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?,
+                    q(
+                        "SELECT count(*) FROM index_jobs WHERE target_id = ?1",
+                        &note,
+                    )?,
+                    q("SELECT count(*) FROM chunks WHERE node_id = ?1", &note)?,
+                    q("SELECT count(*) FROM index_jobs WHERE target_id = ?1", &id)?,
+                    q(
+                        "SELECT count(*) FROM chunks WHERE node_id = ?1 OR entry_id = ?1",
+                        &id,
+                    )?,
+                    q("SELECT count(*) FROM chunks WHERE instr(text, ?1) > 0", &v)?,
                 ))
             }))
             .unwrap();
-        assert_eq!((jobs, chunks), (0, 0), "{}", p.display());
+        assert_eq!(
+            (vault_jobs, vault_chunks, value_chunks),
+            (0, 0, 0),
+            "{}",
+            p.display()
+        );
+        note_jobs += nj;
+        note_chunks += nc;
     }
+    assert!(
+        note_jobs >= 1 && note_chunks >= 1,
+        "заметка в очереди и чанках"
+    );
 }

@@ -319,6 +319,18 @@ fn terminate_pid(pid: u32, _grace: Duration) {
 
 // ---------------------------------------------------------------- запуск и остановка
 
+/// Секреты zam-server, которые дочернему Qdrant не передаются.
+pub(crate) const SECRET_ENV: [&str; 3] = ["ZAM_MASTER_KEY", "ZAM_ADMIN_PASSWORD", "ZAM_TOKEN"];
+
+/// Переменная окружения убирается при запуске Qdrant: унаследованные `QDRANT*` и
+/// `RUN_MODE` перекрыли бы наш конфиг (в том числе host), секреты zam-server
+/// ([`SECRET_ENV`]) Qdrant не нужны. Регистр имени на Windows не важен.
+pub(crate) fn scrubbed_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let name = if cfg!(windows) { upper.as_str() } else { name };
+    name.starts_with("QDRANT") || name == "RUN_MODE" || SECRET_ENV.contains(&name)
+}
+
 /// Запускает Qdrant в `qdir`. Вызывать только из потока «qdrant-supervisor» (PDEATHSIG).
 pub(crate) fn spawn(
     cfg: &ManagedConfig,
@@ -326,10 +338,9 @@ pub(crate) fn spawn(
     api_key: &str,
 ) -> io::Result<Box<dyn ChildWrapper>> {
     let mut cmd = CommandWrap::with_new(&cfg.binary, |c| {
-        // Унаследованные QDRANT__* и RUN_MODE перекрыли бы наш конфиг (в том числе host).
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy();
-            if k.starts_with("QDRANT") || k == "RUN_MODE" {
+            if scrubbed_env(&k) {
                 c.env_remove(&*k);
             }
         }
@@ -505,6 +516,26 @@ pub(crate) async fn forward<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_and_qdrant_env_scrubbed() {
+        for k in [
+            "ZAM_MASTER_KEY",
+            "ZAM_ADMIN_PASSWORD",
+            "ZAM_TOKEN",
+            "QDRANT__SERVICE__HOST",
+            "QDRANT_INIT_FILE_PATH",
+            "RUN_MODE",
+        ] {
+            assert!(scrubbed_env(k), "{k}");
+        }
+        for k in ["PATH", "ZAM_URL", "ZAM_DATA_DIR", "SYSTEMROOT", "HOME"] {
+            assert!(!scrubbed_env(k), "{k}");
+        }
+        if cfg!(windows) {
+            assert!(scrubbed_env("zam_master_key"));
+        }
+    }
 
     #[test]
     fn parses_qdrant_json_line() {

@@ -6300,6 +6300,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows",
  "zam-core",
  "zam-fetch",
  "zam-index",

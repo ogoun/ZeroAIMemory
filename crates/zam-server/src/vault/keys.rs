@@ -5,8 +5,9 @@
 //! 2. файл `[vault] master_key_file` (по умолчанию `<data_dir>/master.key`, одна строка base64).
 //!
 //! Файл создаётся только при первом запуске Vault — когда в `system.db` нет ни
-//! `user_keys`, ни `vault.key_check`; на Linux с правами 0600 (на Windows права наследуются от
-//! каталога данных — его ACL ограничивает администратор, см. `deploy/config.example.toml`).
+//! `user_keys`, ни `vault.key_check`, — атомарно и без перезаписи ([`publish_key_file`]) до
+//! записи `vault.key_check`; на Linux с правами 0600, на Windows с DACL только владельцу,
+//! SYSTEM и администраторам.
 //!
 //! **Блокировка** ([`VaultState::Locked`]): ключ не прошёл `vault.key_check` (подменён или
 //! расходится с `ZAM_MASTER_KEY`), файла нет при существующих ключах, ключ не base64 32 байт,
@@ -104,24 +105,102 @@ fn decode_key(text: &str) -> Option<SecretKey> {
     crypto::key_from(&raw)
 }
 
-/// Новый файл ключа (только если его нет): base64 и перевод строки, на Linux 0600.
-fn create_key_file(path: &Path, key: &SecretKey) -> std::io::Result<()> {
-    if let Some(dir) = path.parent()
-        && !dir.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(dir)?;
+/// Временный файл публикации ключа: `<имя>.tmp` в том же каталоге.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// Остаток `<имя>.tmp` прошлого сбоя публикации: ключ из него ещё нигде не использован
+/// (`key_check` пишется после публикации) — удаляется.
+fn remove_stale_tmp(path: &Path) {
+    let tmp = tmp_path(path);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => tracing::warn!(
+            path = %tmp.display(),
+            "удалён остаток прерванного создания мастер-ключа Vault"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %tmp.display(),
+            error = %e.kind(),
+            "не удалось удалить остаток создания мастер-ключа Vault"
+        ),
     }
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
+}
+
+/// Файловая система не поддерживает жёсткие ссылки (FAT, часть сетевых ФС).
+fn link_unsupported(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{PermissionDenied, Unsupported};
+    // Windows: ERROR_INVALID_FUNCTION (1) / ERROR_NOT_SUPPORTED (50) на FAT и сетевых ФС;
+    // Linux: EPERM (vfat), EOPNOTSUPP
+    matches!(e.kind(), Unsupported | PermissionDenied)
+        || (cfg!(windows) && matches!(e.raw_os_error(), Some(1 | 50)))
+}
+
+/// fsync каталога: запись имени нового файла переживает сбой питания (Linux). На Windows
+/// каталог так не синхронизируется — NTFS журналирует метаданные сама.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
+        std::fs::File::open(dir)?.sync_all()?;
     }
-    let mut f = o.open(path)?;
-    let text = Zeroizing::new(format!("{}\n", STANDARD.encode(key.as_slice())));
-    f.write_all(text.as_bytes())?;
-    f.sync_all()
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Атомарная публикация нового файла ключа **без перезаписи**: `<имя>.tmp` (на Linux сразу
+/// 0600, на Windows — DACL только владельцу, SYSTEM и администраторам), `write_all` +
+/// `sync_all`, затем `hard_link(tmp, path)` — занятое имя даёт `AlreadyExists` (ключ
+/// создаётся один раз), `tmp` удаляется, каталог синхронизируется. Без жёстких ссылок —
+/// `rename` после проверки отсутствия `path` (между проверкой и `rename` окна защищает
+/// только лок каталога данных: ограничение записано в журнале M3). Читатель никогда не
+/// видит пустой или обрезанный ключ.
+fn publish_key_file(path: &Path, key: &SecretKey) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&dir)?;
+    let tmp = tmp_path(path);
+    let _ = std::fs::remove_file(&tmp);
+    let written = (|| {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let mut f = o.open(&tmp)?;
+        let text = Zeroizing::new(format!("{}\n", STANDARD.encode(key.as_slice())));
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        #[cfg(windows)]
+        super::acl::restrict_to_owner(&tmp)?;
+        Ok::<_, std::io::Error>(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let published = match std::fs::hard_link(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) if link_unsupported(&e) => {
+            if path.exists() {
+                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            } else {
+                std::fs::rename(&tmp, path)
+            }
+        }
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_file(&tmp);
+    published?;
+    sync_dir(&dir)
 }
 
 /// Сбой хранилища при проверке ключа: повреждённая настройка — блокировка, прочее — ошибка
@@ -155,6 +234,7 @@ async fn resolve(
         });
     }
     let path = master_key_path(cfg);
+    remove_stale_tmp(&path);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
             let text = Zeroizing::new(text);
@@ -179,7 +259,7 @@ async fn resolve(
                 Ok(false) => {}
             }
             let key = crypto::random_key();
-            match create_key_file(&path, &key) {
+            match publish_key_file(&path, &key) {
                 Ok(()) => {
                     tracing::info!(
                         path = %path.display(),
@@ -429,6 +509,48 @@ mod tests {
             v.encrypt(u, item, 2, b"x").await,
             Err(ApiError::VaultLocked(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_tmp_removed_and_key_created() {
+        let (cfg, sys, _dd) = setup("stale-tmp");
+        let path = master_key_path(&cfg);
+        // остаток прерванной публикации: обрезанный ключ во временном файле
+        std::fs::write(tmp_path(&path), "QUFB").unwrap();
+        let v = VaultKeys::load_with(&cfg, &sys, None).await.unwrap();
+        assert_eq!(v.state(), &VaultState::Ready);
+        assert!(!tmp_path(&path).exists(), "остаток .tmp удалён");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(decode_key(&text).is_some(), "полный ключ: {text}");
+        assert!(text.ends_with('\n'));
+        // остаток рядом с уже опубликованным ключом — тоже удаляется, ключ не меняется
+        std::fs::write(tmp_path(&path), "мусор").unwrap();
+        let v = VaultKeys::load_with(&cfg, &sys, None).await.unwrap();
+        assert_eq!(v.state(), &VaultState::Ready);
+        assert!(!tmp_path(&path).exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn publish_never_overwrites_existing_key_file() {
+        let d = dir("publish");
+        let path = d.join("sub").join("master.key");
+        let k1 = crypto::random_key();
+        publish_key_file(&path, &k1).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(decode_key(&first).unwrap().as_slice(), k1.as_slice());
+        assert!(!tmp_path(&path).exists());
+        // второй ключ не перезаписывает первый: AlreadyExists, файл тот же, .tmp убран
+        let e = publish_key_file(&path, &crypto::random_key()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        assert!(!tmp_path(&path).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[tokio::test]

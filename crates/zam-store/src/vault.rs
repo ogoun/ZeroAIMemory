@@ -6,7 +6,7 @@
 //! создаёт сервер и шифрует значение до вызова (AAD связывает шифротекст с пользователем,
 //! записью и ревизией). Поэтому каждая новая ревизия получает свой шифротекст: правка без
 //! нового значения — тоже перешифрованное прежнее значение (`secret_blob` у
-//! [`vault_update`] сервер передаёт всегда).
+//! [`vault_update`] обязателен).
 //!
 //! Открытые поля — `title` (имя, уникально среди живых записей одной области) и `data`
 //! (`{type, username?, url?, description?}`, проверяет сервер). Значения нигде не
@@ -171,6 +171,16 @@ fn load_live(c: &Connection, id: Id) -> Result<(VaultMeta, Vec<u8>), StoreError>
     .ok_or(StoreError::NotFound)
 }
 
+/// Запись (в том числе удалённая) и признак удаления; нет — `NotFound`.
+fn load_any(c: &Connection, id: Id) -> Result<(VaultMeta, bool), StoreError> {
+    c.prepare_cached(&format!(
+        "SELECT {ITEM_COLS}, deleted_at IS NOT NULL FROM vault_items WHERE id = ?1"
+    ))?
+    .query_row([id], |r| Ok((meta_row(r)?, r.get(13)?)))
+    .optional()?
+    .ok_or(StoreError::NotFound)
+}
+
 /// Ревизия `rev` записи `id` — полный снимок с автором `a`.
 #[allow(clippy::too_many_arguments)]
 fn insert_revision(
@@ -301,22 +311,23 @@ pub async fn vault_put(
 
 /// Новая ревизия `expected_rev + 1`: `None` — поле не меняется. Текущая ревизия не
 /// `expected_rev` → `Conflict`; имя занято → `Conflict`; удалённой или нет → `NotFound`.
-/// `secret_blob` — шифротекст новой ревизии (`None` — прежний шифротекст: годится, только
-/// если AAD шифротекста не зависит от ревизии; сервер передаёт значение всегда).
+/// `secret_blob` — шифротекст новой ревизии, обязателен: AAD шифротекста привязан к номеру
+/// ревизии, прежний под новым номером не расшифруется (сигнатура брифа с `Option` изменена,
+/// решение исполнителя — журнал M3).
 pub async fn vault_update(
     db: &Db,
     id: Id,
     expected_rev: i64,
     title: Option<String>,
     data: Option<serde_json::Value>,
-    secret_blob: Option<Vec<u8>>,
+    secret_blob: Vec<u8>,
     a: &Attribution,
 ) -> Result<VaultMeta, StoreError> {
     let title = title.as_deref().map(check_vault_title).transpose()?;
     let data = data.as_ref().map(check_data).transpose()?;
     let a = a.clone();
     db.write(move |tx| {
-        let (cur, cur_secret) = load_live(tx, id)?;
+        let (cur, _) = load_live(tx, id)?;
         if cur.rev != expected_rev {
             return Err(StoreError::Conflict(format!(
                 "ревизия записи Vault {}, а не {expected_rev}",
@@ -328,7 +339,7 @@ pub async fn vault_update(
             Some(d) => d,
             None => serde_json::to_string(&cur.data).map_err(json_err)?,
         };
-        let secret = secret_blob.unwrap_or(cur_secret);
+        let secret = secret_blob;
         let rev = cur.rev + 1;
         let now = fmt_ts(Timestamp::now());
         let r = tx
@@ -367,10 +378,16 @@ pub async fn vault_delete(db: &Db, id: Id, _a: &Attribution) -> Result<(), Store
     .await
 }
 
-/// Ревизии живой записи по возрастанию номера (без значений).
+/// Запись по id, в том числе удалённая (история для администратора), и признак удаления.
+pub async fn vault_get_any(db: &Db, id: Id) -> Result<(VaultMeta, bool), StoreError> {
+    db.read(move |c| load_any(c, id)).await
+}
+
+/// Ревизии записи (в том числе удалённой) по возрастанию номера, без значений. Кому
+/// показывать историю удалённой записи, решает сервер.
 pub async fn vault_revisions(db: &Db, id: Id) -> Result<Vec<VaultRevision>, StoreError> {
     db.read(move |c| {
-        load_live(c, id)?;
+        load_any(c, id)?;
         let mut st = c.prepare_cached(
             "SELECT rev, title, data, ts, author_kind, user_id, token_id, session_id, machine
              FROM vault_revisions WHERE item_id = ?1 ORDER BY rev",
@@ -395,10 +412,10 @@ pub async fn vault_revisions(db: &Db, id: Id) -> Result<Vec<VaultRevision>, Stor
     .await
 }
 
-/// Шифротекст ревизии `rev` живой записи; нет — `NotFound`.
+/// Шифротекст ревизии `rev` записи (в том числе удалённой); нет — `NotFound`.
 pub async fn vault_revision_secret(db: &Db, id: Id, rev: i64) -> Result<Vec<u8>, StoreError> {
     db.read(move |c| {
-        load_live(c, id)?;
+        load_any(c, id)?;
         c.query_row(
             "SELECT secret FROM vault_revisions WHERE item_id = ?1 AND rev = ?2",
             params![id, rev],
@@ -535,19 +552,11 @@ mod tests {
         let e = vault_put(&db, Id::new(), &k, "gh", d.clone(), vec![3], &agent()).await;
         assert!(matches!(e, Err(StoreError::Conflict(_))), "{e:?}");
         // устаревшая ревизия — 409; новая ревизия со своим шифротекстом
-        let e = vault_update(&db, id, 7, None, None, Some(vec![9]), &agent()).await;
+        let e = vault_update(&db, id, 7, None, None, vec![9], &agent()).await;
         assert!(matches!(e, Err(StoreError::Conflict(_))), "{e:?}");
-        let m = vault_update(
-            &db,
-            id,
-            1,
-            Some("gh2".into()),
-            None,
-            Some(vec![4]),
-            &agent(),
-        )
-        .await
-        .unwrap();
+        let m = vault_update(&db, id, 1, Some("gh2".into()), None, vec![4], &agent())
+            .await
+            .unwrap();
         assert_eq!((m.title.as_str(), m.rev), ("gh2", 2));
         assert_eq!(vault_get(&db, id).await.unwrap().1, vec![4]);
         assert_eq!(vault_revision_secret(&db, id, 1).await.unwrap(), vec![1]);
@@ -567,6 +576,10 @@ mod tests {
             vault_delete(&db, id, &agent()).await,
             Err(StoreError::NotFound)
         ));
+        // история удалённой записи доступна (кому — решает сервер)
+        assert!(vault_get_any(&db, id).await.unwrap().1);
+        assert_eq!(vault_revisions(&db, id).await.unwrap().len(), 2);
+        assert_eq!(vault_revision_secret(&db, id, 2).await.unwrap(), vec![4]);
         vault_put(&db, Id::new(), &k, "gh2", d, vec![5], &agent())
             .await
             .unwrap();

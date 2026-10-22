@@ -87,8 +87,8 @@ pub use user_db::{
 };
 pub use vault::{
     KEY_CHECK_SETTING, VAULT_TITLE_MAX_CHARS, VaultMeta, VaultRevision, VaultScope,
-    check_vault_title, vault_delete, vault_get, vault_list, vault_put, vault_revision_secret,
-    vault_revisions, vault_update,
+    check_vault_title, vault_delete, vault_get, vault_get_any, vault_list, vault_put,
+    vault_revision_secret, vault_revisions, vault_update,
 };
 
 /// Ошибки слоя хранения.
