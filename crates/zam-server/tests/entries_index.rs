@@ -17,8 +17,8 @@ use zam_core::Id;
 use zam_index::VectorFilter;
 use zam_store::{
     Attribution, AuthorKind, Certainty, Db, Entry, EntryKind, EntryPatch, EntryStatus, IndexState,
-    NewEntry, SpaceKind, create_entry, get_entry, list_spaces, retract_entry, supersede_entry,
-    update_entry,
+    NewEntry, SpaceKind, create_entry, get_entry, job_stats, list_spaces, retract_entry,
+    supersede_entry, update_entry,
 };
 
 /// Предел ожидания индексации (инференс на CPU, запись в Qdrant на HDD).
@@ -81,7 +81,12 @@ async fn setup(name: &str) -> Option<(Api, TestQdrant, Db, Id)> {
     Some((a, q, db, k))
 }
 
-/// Ждёт, пока записи `ids` станут `indexed` (воркер будится).
+/// Ждёт, пока записи `ids` станут `indexed` (воркер будится), а затем — покоя воркера:
+/// очередь заданий базы пуста, пачка не выполняется, отложенных свёрток папок нет. Без покоя
+/// счётчик `embedded_texts` мог «доехать» позже: заметка из [`setup`] и свёртка L0 её папки
+/// (`dev`, отложенная на `rollup_debounce_ms`) индексируются параллельно с записями, и под
+/// нагрузкой их эмбеддинг попадал между снятием базового счётчика и проверкой (флейк
+/// `status_change_updates_payload`: 5 вместо 4).
 async fn wait_indexed(a: &Api, db: &Db, ids: &[Id]) {
     a.st.index.worker.notify();
     until(
@@ -96,6 +101,21 @@ async fn wait_indexed(a: &Api, db: &Db, ids: &[Id]) {
             true
         },
     )
+    .await;
+    // покой: условие должно держаться при двух проверках подряд (свёртка папки ставится по
+    // закрытию задания, пачка может начаться между проверками)
+    let idle = async || {
+        let st = job_stats(db).await.unwrap();
+        let w = a.st.index.worker.status();
+        st.queued + st.running == 0 && !w.batch_running && w.rollups_pending == 0
+    };
+    until("покой воркера", INDEXED, async || {
+        if !idle().await {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        idle().await
+    })
     .await;
 }
 
