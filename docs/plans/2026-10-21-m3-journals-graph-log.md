@@ -166,6 +166,14 @@ fix round задачи 1 — по редакции 2). Журнал предыд
   - **Человеческий токен:** `POST /admin/users/{id}/tokens {human: true}` (маршрут только для cookie администратора; по любому токену — 403); `TokenInfo.human`, аудит `token_issue` с `human`; `/auth/me` → `human: true`, `GET /spaces` → `human` принципала. WebUI: флажок «для человека» с предупреждением не класть токен в CLAUDE.md/AGENTS.md, пометка «человек» в списке токенов; редактор заметки при `reason-required` спрашивает причину (`window.prompt`) и повторяет сохранение с `message`.
   - **CLI:** `zam insight certify <id> axiom|theorem|hypothesis|none --reason R [--evidence-file F] [--human]`; `--evidence-file` дописывается в текущую `data` записи; `--human` берёт токен только из `~/.zeroaimemory/config.toml` (`human_token`), флаги, окружение и CLAUDE.md/AGENTS.md для него не читаются **[решение исполнителя]**.
   - Зависимостей не добавлено.
+  - **Fix round 1 (ревью):**
+    - дозаполнение `nodes.certainty` идёт и по удалённым заметкам (столбец описывает текущую ревизию, `restore_node` его не пересчитывает); `axiom` сохраняется, только если текущая ревизия записана человеком (`revisions.author_kind = 'human'`), иначе — `hypothesis`, число понижений — INFO в лог. Текст заметки не меняется: агент, правящий понижённую заметку, должен убрать `axiom` из frontmatter (иначе 403);
+    - `theorem` агента — полное доказательство в итоговом состоянии любой правки (`check_final_state`: `update_entry`, `commit_text`), иначе 422 `evidence-required`; человеку — без ограничений;
+    - **`--human`:** адрес — только `url` из `~/.zeroaimemory/config.toml` рядом с `human_token` (флаг, `ZAM_URL`, CLAUDE.md/AGENTS.md игнорируются, расхождение — предупреждение в stderr); **ruling контроллера** (до ответа владельца): только интерактивный терминал (stdin и stderr — TTY) и подтверждение вводом id записи, без терминала — отказ, код 3, «подтверждение аксиом — только человеком: WebUI или интерактивный терминал»; описано в ТЗ §11.4 и `deploy/README-install.md`;
+    - порядок ответов: перенос — 403 прав раньше 409 занятости пути; у заметок проверка `axiom` осталась одна — в `commit_text`, поэтому устаревший `If-Match`/`base_rev` даёт 409 раньше 403 (записи нет в обоих случаях);
+    - ответ записи заметки (создание, PUT, PATCH) несёт `warnings: ["certainty_not_recognized"]`, если во frontmatter ключ `certainty`/`evidence` в нераспознаваемом написании (`zam_markdown::unrecognized_certainty_keys`);
+    - тест: агент-участник общего решения не меняет, не отзывает, не удаляет и не создаёт `axiom` в базе владельца (403);
+    - **не перепроверяются:** записи insight с `certainty: axiom` от агента, созданные на ветке `m3-journals` до задачи 9 (в `entries` правила не было) — это только данные разработки, в выпусках M2 записей журналов нет.
 
 ## Отложенные замечания
 

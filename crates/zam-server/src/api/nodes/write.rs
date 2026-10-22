@@ -1,6 +1,10 @@
 //! Запись узлов: создание, замена (`If-Match`), PATCH секций, перенос, удаление в
 //! корзину, восстановление и список корзины.
 //!
+//! Ответ записи заметки (создание, замена, PATCH) — `Node` и, если во frontmatter есть ключ
+//! `certainty`/`evidence` в нераспознаваемом написании (в кавычках, с заглавными буквами),
+//! `warnings: ["certainty_not_recognized"]`: такой ключ статус не задаёт (§7.5).
+//!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
 //! слоем `DefaultBodyLimit` (см. `api::router`).
@@ -14,7 +18,7 @@ use serde_json::{Value, json};
 use zam_markdown::PatchOp;
 use zam_store::{
     NewNote, Node, NodePath, create_folder, create_note, delete_node, list_trash, move_node,
-    patch_note_within, restore_node, update_note,
+    node_content, patch_note_within, restore_node, update_note,
 };
 
 use super::{audit_node, write_error};
@@ -43,6 +47,32 @@ pub struct Create {
     message: Option<String>,
 }
 
+/// Предупреждение: ключ `certainty`/`evidence` во frontmatter написан так, что не распознан.
+pub const CERTAINTY_NOT_RECOGNIZED: &str = "certainty_not_recognized";
+
+/// Предупреждения записи заметки по её тексту.
+fn note_warnings(content: &str) -> Vec<&'static str> {
+    let doc = zam_markdown::parse(content);
+    match doc.frontmatter {
+        Some(f) if !zam_markdown::unrecognized_certainty_keys(&f.raw).is_empty() => {
+            vec![CERTAINTY_NOT_RECOGNIZED]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `Node` как JSON с `warnings` (только непустые).
+fn node_reply(node: &Node, content: &str) -> Result<Value, ApiError> {
+    let mut v = serde_json::to_value(node).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let w = note_warnings(content);
+    if !w.is_empty()
+        && let Value::Object(o) = &mut v
+    {
+        o.insert("warnings".into(), json!(w));
+    }
+    Ok(v)
+}
+
 fn check_size(st: &AppState, content: &str) -> Result<(), ApiError> {
     let max = st.cfg.limits.note_max_bytes;
     if content.len() > max {
@@ -60,16 +90,19 @@ pub async fn create(
     p: Principal,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
-) -> Result<(StatusCode, Json<Node>), ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let req: Create = json_body(body)?;
     let path = NodePath::parse(&req.path)?;
     let sc = space_scope(&st, &p, &headers, &req.space, Mode::Write).await?;
-    let node = match req.kind {
+    let (node, content) = match req.kind {
         Kind::Folder => {
             if req.content.is_some() || req.l0.is_some() {
                 return Err(ApiError::BadRequest("у папки нет content и l0".into()));
             }
-            create_folder(&sc.db, sc.space.id, path).await?
+            (
+                create_folder(&sc.db, sc.space.id, path).await?,
+                String::new(),
+            )
         }
         Kind::Note => {
             let content = req.content.unwrap_or_default();
@@ -78,16 +111,16 @@ pub async fn create(
             let n = NewNote {
                 space_id: sc.space.id,
                 path,
-                content,
+                content: content.clone(),
                 l0: req.l0,
                 attrib,
             };
-            create_note(&sc.db, n).await?
+            (create_note(&sc.db, n).await?, content)
         }
     };
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
-    Ok((StatusCode::CREATED, Json(node)))
+    Ok((StatusCode::CREATED, Json(node_reply(&node, &content)?)))
 }
 
 /// Ревизия из `If-Match`: `3`, `"3"` или `W/"3"`.
@@ -117,17 +150,18 @@ pub async fn replace(
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let base = if_match(&headers)?;
     let req: Replace = json_body(body)?;
     check_size(&st, &req.content)?;
     let attrib = attribution(&p, &headers, req.message)?;
+    let content = req.content.clone();
     match update_note(&sc.db, sc.node.id, base, req.content, req.l0, attrib).await {
         Ok(n) => {
             st.index.notify();
-            Ok(Json(n))
+            Ok(Json(node_reply(&n, &content)?))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, base, e).await),
     }
@@ -147,7 +181,7 @@ pub async fn patch(
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let req: Patch = json_body(body)?;
@@ -156,7 +190,8 @@ pub async fn patch(
     match patch_note_within(&sc.db, sc.node.id, req.base_rev, req.ops, attrib, max).await {
         Ok(n) => {
             st.index.notify();
-            Ok(Json(n))
+            let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
+            Ok(Json(node_reply(&n, &text)?))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, req.base_rev, e).await),
     }

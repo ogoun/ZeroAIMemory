@@ -613,11 +613,8 @@ async fn agent_note_axiom_frontmatter_403_and_axiom_note_write_move_delete_403()
                     "ops": [{"op": "prepend", "content": "---\ncertainty: axiom\n---\n"}]})),
     )
     .await;
-    assert!(
-        r.status == StatusCode::FORBIDDEN || r.status == StatusCode::UNPROCESSABLE_ENTITY,
-        "{}",
-        r.text()
-    );
+    // итог PATCH с frontmatter `certainty: axiom` — перевод в axiom, 403
+    assert_certainty(&r, StatusCode::FORBIDDEN, "axiom-requires-human");
     assert_eq!(get_node(&a, &id_of(&n0)).await["certainty"], Value::Null);
 
     // заметка axiom человека в папке
@@ -650,10 +647,11 @@ async fn agent_note_axiom_frontmatter_403_and_axiom_note_write_move_delete_403()
         )
         .await,
     );
-    // устаревшая ревизия тоже 403 (проверка до конфликта ревизий)
+    // устаревшая ревизия — 409: конфликт ревизии проверяется раньше прав, записи нет
     let mut stale = ax.clone();
     stale["current_rev"] = json!(7);
-    forbidden(put_note(&a, Who::Agent, &stale, "x", None).await);
+    let r = put_note(&a, Who::Agent, &stale, "x", None).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
     forbidden(
         call(
             &a,
@@ -1186,10 +1184,43 @@ async fn certainty_backfill_from_frontmatter() {
         .t(Method::DELETE, &format!("/api/v1/nodes/{gone}"), None)
         .await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    // аксиома человека в корзине
+    let axgone =
+        id_of(&created_note(&a, Who::Web, "b/axgone", &note(Some("axiom"), None, "x")).await);
+    let r = a
+        .adm(
+            Method::DELETE,
+            &format!("/api/v1/nodes/{axgone}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    // заметка, которой агент до задачи 9 записал `certainty: axiom`
+    let fake = id_of(
+        &created_note(
+            &a,
+            Who::Agent,
+            "b/fake",
+            &note(Some("hypothesis"), None, "x"),
+        )
+        .await,
+    );
     // база «до миграции 0009»: столбец пуст, флаг дозаполнения стоит, очередь пуста
     let admin = a.st.admin_id;
     let db = a.st.users.get(admin).await.unwrap();
-    db.write(|tx| {
+    let fake_id: Id = fake.parse().unwrap();
+    db.write(move |tx| {
+        let text = note(Some("axiom"), None, "агент сам объявил аксиому");
+        tx.execute(
+            "INSERT INTO revisions (node_id, rev, content, content_hash, size, author_kind, ts)
+             VALUES (?1, 2, ?2, 'h2', ?3, 'agent', '2026-10-20T00:00:00.000000Z')",
+            (fake_id, &text, text.len() as i64),
+        )?;
+        tx.execute(
+            "UPDATE nodes SET current_rev = 2, content_hash = 'h2' WHERE id = ?1",
+            [fake_id],
+        )?;
         tx.execute("UPDATE nodes SET certainty = NULL", [])?;
         tx.execute("DELETE FROM index_jobs", [])?;
         tx.execute(
@@ -1210,8 +1241,11 @@ async fn certainty_backfill_from_frontmatter() {
     assert_eq!(get_node(&b, &ax).await["certainty"], "axiom");
     assert_eq!(get_node(&b, &th).await["certainty"], "theorem");
     assert_eq!(get_node(&b, &pl).await["certainty"], Value::Null);
+    // axiom не от человека понижен до hypothesis
+    assert_eq!(get_node(&b, &fake).await["certainty"], "hypothesis");
     let db = b.st.users.get(b.st.admin_id).await.unwrap();
-    let (flag, jobs, gone_c): (bool, Vec<String>, Option<String>) = db
+    let ids = [gone.clone(), axgone.clone()];
+    let (flag, jobs, deleted): (bool, Vec<String>, Vec<Option<String>>) = db
         .read(move |c| {
             let flag = c
                 .query_row(
@@ -1226,24 +1260,247 @@ async fn certainty_backfill_from_frontmatter() {
             let jobs = st
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<Result<_, _>>()?;
-            let g = c.query_row(
-                "SELECT certainty FROM nodes WHERE id = ?1",
-                [gone.parse::<Id>().unwrap()],
-                |r| r.get(0),
-            )?;
-            Ok((flag, jobs, g))
+            let mut deleted = Vec::new();
+            for id in &ids {
+                deleted.push(c.query_row(
+                    "SELECT certainty FROM nodes WHERE id = ?1",
+                    [id.parse::<Id>().unwrap()],
+                    |r| r.get(0),
+                )?);
+            }
+            Ok((flag, jobs, deleted))
         })
         .await
         .unwrap();
     assert!(!flag, "флаг снят");
-    // upsert — заметкам со статусом (payload Qdrant), удалённые не трогаются
-    let mut want = vec![ax.clone(), th.clone()];
+    // upsert — живым заметкам со статусом (payload Qdrant); удалённые без задания
+    let mut want = vec![ax.clone(), th.clone(), fake.clone()];
     want.sort();
     assert_eq!(jobs, want);
-    assert_eq!(gone_c, None);
-    // после дозаполнения права действуют: агент не трогает axiom
+    // удалённые заметки дозаполнены тоже: столбец описывает текущую ревизию
+    assert_eq!(
+        deleted,
+        vec![Some("hypothesis".to_string()), Some("axiom".to_string())]
+    );
+    // после дозаполнения права действуют: агент не трогает axiom, в том числе из корзины
     let r = b
         .tok(&agent, Method::DELETE, &format!("/api/v1/nodes/{ax}"), None)
         .await;
     assert_certainty(&r, StatusCode::FORBIDDEN, "axiom-requires-human");
+    let r = b
+        .tok(
+            &agent,
+            Method::POST,
+            &format!("/api/v1/nodes/{axgone}/restore"),
+            None,
+        )
+        .await;
+    assert_certainty(&r, StatusCode::FORBIDDEN, "axiom-requires-human");
+    // понижённая заметка: агент не может переписать её, оставив axiom во frontmatter
+    let n = get_node(&b, &fake).await;
+    let r = b
+        .tok_h(
+            &agent,
+            Method::PUT,
+            &format!("/api/v1/nodes/{fake}"),
+            Some(json!({"content": note(Some("axiom"), None, "y"), "message": "m"})),
+            &[("if-match", n["current_rev"].to_string().as_str())],
+        )
+        .await;
+    assert_certainty(&r, StatusCode::FORBIDDEN, "axiom-requires-human");
+}
+
+#[tokio::test]
+async fn agent_theorem_loses_evidence_422() {
+    let a = api("cert-theorem-final", |_| {}).await;
+    // заметка theorem: агентская правка без evidence: — 422, с ним — 200
+    let n = created_note(
+        &a,
+        Who::Agent,
+        "f/th",
+        &note(Some("theorem"), Some("прогон CI"), "x"),
+    )
+    .await;
+    let r = put_note(&a, Who::Agent, &n, &note(Some("theorem"), None, "y"), None).await;
+    assert_certainty(&r, StatusCode::UNPROCESSABLE_ENTITY, "evidence-required");
+    let r = put_note(
+        &a,
+        Who::Agent,
+        &n,
+        &note(Some("theorem"), Some("прогон CI"), "y"),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // theorem человека без доказательства: агент правит только с доказательством
+    let h = created_note(&a, Who::Web, "f/human", &note(Some("theorem"), None, "x")).await;
+    let r = put_note(&a, Who::Agent, &h, &note(Some("theorem"), None, "y"), None).await;
+    assert_certainty(&r, StatusCode::UNPROCESSABLE_ENTITY, "evidence-required");
+    // запись theorem: PATCH data без evidence — 422
+    let mut body = insight("Теорема с доказательством");
+    body["certainty"] = json!("theorem");
+    body["data"]["evidence"] = evidence();
+    let id = id_of(&created_insight(&a, Who::Agent, body).await);
+    let r = patch_entry(&a, Who::Agent, &id, json!({"data": {"kind": "discovery"}})).await;
+    assert_certainty(&r, StatusCode::UNPROCESSABLE_ENTITY, "evidence-required");
+    let r = patch_entry(
+        &a,
+        Who::Agent,
+        &id,
+        json!({"data": {"kind": "discovery", "evidence": {"checked": "c", "method": "", "result": "r"}}}),
+    )
+    .await;
+    assert_certainty(&r, StatusCode::UNPROCESSABLE_ENTITY, "evidence-required");
+    // прочие правки с сохранённым доказательством — можно
+    let r = patch_entry(&a, Who::Agent, &id, json!({"append_body": "уточнение"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // человек может убрать доказательство
+    let r = patch_entry(&a, Who::Web, &id, json!({"data": {"kind": "discovery"}})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+#[tokio::test]
+async fn note_write_warns_on_unrecognized_certainty_key() {
+    let a = api("cert-warn", |_| {}).await;
+    let r = create_note(
+        &a,
+        Who::Agent,
+        "w/q",
+        "---\n\"certainty\": theorem\nEvidence: x\n---\n# Q\n",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let v = r.json();
+    assert_eq!(v["warnings"], json!(["certainty_not_recognized"]), "{v}");
+    assert_eq!(
+        v["certainty"],
+        Value::Null,
+        "ключ в кавычках статус не задаёт"
+    );
+    let ok = created_note(&a, Who::Agent, "w/ok", &note(Some("hypothesis"), None, "x")).await;
+    assert!(ok.get("warnings").is_none(), "{ok}");
+    // PUT и PATCH — тоже
+    let r = put_note(
+        &a,
+        Who::Agent,
+        &ok,
+        "---\nCertainty: axiom\n---\n# X\n",
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "снятие hypothesis без причины"
+    );
+    let r = put_note(
+        &a,
+        Who::Agent,
+        &ok,
+        "---\nCertainty: axiom\n---\n# X\n",
+        Some("снять"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["warnings"], json!(["certainty_not_recognized"]));
+    let r = call(
+        &a,
+        Who::Agent,
+        Method::PATCH,
+        &format!("/api/v1/nodes/{}", id_of(&ok)),
+        Some(json!({"base_rev": 2, "ops": [{"op": "append", "content": "\nещё\n"}]})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["warnings"], json!(["certainty_not_recognized"]));
+}
+
+const SHARED: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e77";
+
+#[tokio::test]
+async fn member_agent_cannot_touch_owner_axiom() {
+    let a = api("cert-member", |_| {}).await;
+    let (owner, otok) = a.new_user("Владелец").await;
+    let (member, mtok) = a.new_user("Участник").await;
+    let reg = json!({"agent_solution_id": SHARED, "name": "Общее"});
+    let r = a
+        .tok(&otok, Method::POST, "/api/v1/solutions", Some(reg.clone()))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = a
+        .tok(&mtok, Method::POST, "/api/v1/solutions", Some(reg))
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let r = a
+        .tok(
+            &otok,
+            Method::POST,
+            &format!("/api/v1/solutions/{SHARED}/access/{member}/approve"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let entries = format!("/api/v1/spaces/{SHARED}/entries");
+    // аксиома владельца — из WebUI администратора в базе владельца
+    let r = a
+        .adm(
+            Method::POST,
+            &entries,
+            Some(insight("Правило решения")),
+            Some(&owner),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let ax = r.json();
+    assert_eq!(ax["certainty"], "axiom");
+    let id = id_of(&ax);
+    let forbidden = |r: Resp| assert_certainty(&r, StatusCode::FORBIDDEN, "axiom-requires-human");
+    // участник (агент) не меняет, не отзывает и не удаляет её
+    forbidden(
+        a.tok(
+            &mtok,
+            Method::PATCH,
+            &format!("/api/v1/entries/{id}"),
+            Some(json!({"append_body": "участник"})),
+        )
+        .await,
+    );
+    forbidden(
+        a.tok(
+            &mtok,
+            Method::POST,
+            &format!("/api/v1/entries/{id}/retract"),
+            Some(json!({"reason": "r"})),
+        )
+        .await,
+    );
+    forbidden(
+        a.tok(
+            &mtok,
+            Method::DELETE,
+            &format!("/api/v1/entries/{id}"),
+            None,
+        )
+        .await,
+    );
+    // и не создаёт axiom в решении владельца
+    let mut body = insight("Аксиома участника");
+    body["certainty"] = json!("axiom");
+    forbidden(a.tok(&mtok, Method::POST, &entries, Some(body)).await);
+    // запись участника без статуса — hypothesis
+    let r = a
+        .tok(
+            &mtok,
+            Method::POST,
+            &entries,
+            Some(insight("Вывод участника")),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["certainty"], "hypothesis");
+    let cur = a
+        .tok(&otok, Method::GET, &format!("/api/v1/entries/{id}"), None)
+        .await
+        .json();
+    assert_eq!((&cur["rev"], &cur["status"]), (&json!(1), &json!("active")));
 }

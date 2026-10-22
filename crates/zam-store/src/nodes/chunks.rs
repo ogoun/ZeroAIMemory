@@ -400,12 +400,20 @@ pub(crate) async fn backfill_embed_keys(db: &Db) -> Result<u64, StoreError> {
 /// Ключ `meta`: `nodes.certainty` ещё не дозаполнен из frontmatter (миграция 0009).
 pub(crate) const CERTAINTY_BACKFILL: &str = "certainty_backfill";
 
-/// Дозаполняет `nodes.certainty` живых заметок из frontmatter текущей ревизии (миграция 0009
-/// добавила столбец пустым: разбор Markdown SQL не посчитает). Заметкам со статусом
-/// ставится `upsert` с приоритетом reindex (статус попадает в payload Qdrant). Пакетами по
-/// [`BACKFILL_BATCH`] заметок; флаг `meta.certainty_backfill` снимается после последнего
-/// пакета, прерванное дозаполнение повторится при следующем открытии (оно идемпотентно).
-/// Возвращает число заметок со статусом.
+/// Дозаполняет `nodes.certainty` всех заметок — живых и удалённых (столбец описывает текущую
+/// ревизию, восстановление его не пересчитывает) — из frontmatter текущей ревизии (миграция
+/// 0009 добавила столбец пустым: разбор Markdown SQL не посчитает).
+///
+/// `axiom` ставит только человек: до задачи 9 агент мог записать `certainty: axiom` в
+/// frontmatter, поэтому `axiom` сохраняется, только если текущая ревизия записана с
+/// `author_kind = 'human'`, иначе статус понижается до `hypothesis` (счётчик понижений — в лог)
+/// **[решение исполнителя]**. Текст заметки не меняется: агент, правящий такую заметку, должен
+/// убрать `axiom` из frontmatter (перевод в `axiom` — 403).
+///
+/// Живым индексируемым заметкам со статусом ставится `upsert` с приоритетом reindex (статус
+/// попадает в payload Qdrant). Пакетами по [`BACKFILL_BATCH`] заметок; флаг
+/// `meta.certainty_backfill` снимается после последнего пакета, прерванное дозаполнение
+/// повторится при следующем открытии (оно идемпотентно). Возвращает число заметок со статусом.
 pub(crate) async fn backfill_certainty(db: &Db) -> Result<u64, StoreError> {
     let pending = db
         .read(|c| {
@@ -421,30 +429,36 @@ pub(crate) async fn backfill_certainty(db: &Db) -> Result<u64, StoreError> {
     if !pending {
         return Ok(0);
     }
-    let (mut total, mut after) = (0u64, None::<Id>);
+    let (mut total, mut demoted_total, mut after) = (0u64, 0u64, None::<Id>);
     loop {
         let cursor = after;
-        let (n, found, last) = db
+        let (n, found, demoted, last) = db
             .write(move |tx| {
                 let now = fmt_ts(Timestamp::now());
-                let batch: Vec<(Id, i64)> = {
+                let batch: Vec<(Id, i64, String)> = {
                     let mut st = tx.prepare_cached(
-                        "SELECT id, current_rev FROM nodes
-                         WHERE kind = 'note' AND deleted_at IS NULL
-                           AND (?1 IS NULL OR id > ?1)
-                         ORDER BY id LIMIT ?2",
+                        "SELECT n.id, n.current_rev, r.author_kind
+                         FROM nodes n JOIN revisions r
+                              ON r.node_id = n.id AND r.rev = n.current_rev
+                         WHERE n.kind = 'note' AND (?1 IS NULL OR n.id > ?1)
+                         ORDER BY n.id LIMIT ?2",
                     )?;
                     st.query_map(params![cursor, BACKFILL_BATCH], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                     })?
                     .collect::<Result<_, _>>()?
                 };
-                let mut found = 0u64;
-                for &(id, rev) in &batch {
+                let (mut found, mut demoted) = (0u64, 0u64);
+                for (id, rev, author) in &batch {
+                    let (id, rev) = (*id, *rev);
                     let content = revision_text(tx, id, rev)?;
-                    let Some(c) = note_meta(&content, None).certainty_lenient() else {
+                    let Some(mut c) = note_meta(&content, None).certainty_lenient() else {
                         continue;
                     };
+                    if c == Certainty::Axiom && author != "human" {
+                        c = Certainty::Hypothesis;
+                        demoted += 1;
+                    }
                     found += 1;
                     tx.prepare_cached("UPDATE nodes SET certainty = ?2 WHERE id = ?1")?
                         .execute(params![id, c])?;
@@ -452,6 +466,7 @@ pub(crate) async fn backfill_certainty(db: &Db) -> Result<u64, StoreError> {
                         .prepare_cached(
                             "UPDATE nodes SET index_state = 'pending'
                              WHERE id = ?1 AND index_state <> 'excluded'
+                               AND deleted_at IS NULL
                              RETURNING current_rev",
                         )?
                         .query_row([id], |r| r.get(0))
@@ -464,14 +479,21 @@ pub(crate) async fn backfill_certainty(db: &Db) -> Result<u64, StoreError> {
                 if (batch.len() as i64) < BACKFILL_BATCH {
                     tx.execute("DELETE FROM meta WHERE key = ?1", [CERTAINTY_BACKFILL])?;
                 }
-                Ok((batch.len() as i64, found, last))
+                Ok((batch.len() as i64, found, demoted, last))
             })
             .await?;
         total += found;
+        demoted_total += demoted;
         match last {
             Some(l) if n == BACKFILL_BATCH => after = Some(l),
             _ => break,
         }
+    }
+    if demoted_total > 0 {
+        tracing::info!(
+            notes = demoted_total,
+            "certainty: axiom заметок не от человека понижен до hypothesis (v9)"
+        );
     }
     if total > 0 {
         tracing::info!(

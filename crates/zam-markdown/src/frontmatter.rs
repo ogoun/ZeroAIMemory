@@ -62,6 +62,28 @@ pub(crate) fn parse(block: &str, delimiter: &str) -> Frontmatter {
     fm
 }
 
+/// Ключи `certainty`/`evidence` верхнего уровня в нераспознаваемом написании (в кавычках,
+/// с заглавными буквами и т. п.): такой ключ не задаёт статус, и
+/// автор, скорее всего, ошибся. Возвращает канонические имена найденных ключей без повторов.
+pub fn unrecognized_certainty_keys(raw: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        if line.starts_with([' ', '\t', '#', '-']) {
+            continue;
+        }
+        let Some((key, _)) = line.split_once(':') else {
+            continue;
+        };
+        let norm = key.trim().trim_matches(['"', '\'']).trim().to_lowercase();
+        for want in ["certainty", "evidence"] {
+            if norm == want && key.trim() != want && !out.contains(&want) {
+                out.push(want);
+            }
+        }
+    }
+    out
+}
+
 /// Текст между строками-разделителями.
 fn inner_yaml<'a>(block: &'a str, delimiter: &str) -> &'a str {
     // первая строка — разделитель
@@ -462,6 +484,21 @@ evidence: \"тест\"
 evidence:
 ");
         assert_eq!((f.certainty, f.evidence), (None, None));
+    }
+
+    #[test]
+    fn misspelled_certainty_keys_detected() {
+        assert!(unrecognized_certainty_keys("certainty: axiom\nevidence: x\n").is_empty());
+        assert_eq!(
+            unrecognized_certainty_keys("\"certainty\": axiom\nEvidence: x\ntags: [a]\n"),
+            vec!["certainty", "evidence"]
+        );
+        // пробел перед двоеточием разбор принимает
+        assert!(unrecognized_certainty_keys("certainty : theorem\n").is_empty());
+        // вложенные ключи и списки не считаются
+        assert!(unrecognized_certainty_keys("meta:\n  Certainty: x\n- certainty\n").is_empty());
+        // распознанный ключ действительно задаёт поле, нераспознанный — нет
+        assert_eq!(fm("'certainty': axiom\n").certainty, None);
     }
 
     #[test]

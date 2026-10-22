@@ -146,11 +146,14 @@ struct HomeConfig {
     human_token: Option<String>,
 }
 
-/// Человеческий токен из `~/.zeroaimemory/config.toml` (`human_token`) — для команд с флагом
-/// `--human` (например, `zam insight certify ID axiom --reason R --human`). Других источников
-/// нет намеренно: флаги, окружение и CLAUDE.md/AGENTS.md видит агент, а запись по этому
-/// токену атрибутируется человеку **[решение исполнителя]**. Нет файла или поля — `None`.
-pub fn human_token(home: &Path) -> Result<Option<Found>, String> {
+/// Адрес и человеческий токен для команд с флагом `--human` (например,
+/// `zam insight certify ID axiom --reason R --human`): **оба — только из
+/// `~/.zeroaimemory/config.toml`** (ключи `url` и `human_token`). Флаги, окружение и
+/// CLAUDE.md/AGENTS.md проекта не читаются: их видит и меняет агент, а запрос с этим токеном
+/// атрибутируется человеку — подменённый адрес отдал бы токен чужому серверу
+/// **[решение исполнителя]**. Нет файла или `human_token` — `Ok(None)`; токен есть, а `url` нет
+/// или он не http(s) — ошибка.
+pub fn human_target(home: &Path) -> Result<Option<(Found, Found)>, String> {
     let path = home.join(".zeroaimemory").join("config.toml");
     let cfg: HomeConfig = match read_limited(&path) {
         Read::Skip => return Ok(None),
@@ -158,10 +161,44 @@ pub fn human_token(home: &Path) -> Result<Option<Found>, String> {
         Read::Text(t) => toml::from_str(&t)
             .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
     };
-    Ok(nonempty(cfg.human_token.as_deref()).map(|value| Found {
-        value,
-        source: Source::Home(path),
-    }))
+    let Some(token) = nonempty(cfg.human_token.as_deref()) else {
+        return Ok(None);
+    };
+    let url = nonempty(cfg.url.as_deref()).ok_or_else(|| {
+        format!(
+            "--human: в {} нужен url сервера рядом с human_token (адрес из флагов, окружения и \
+             CLAUDE.md/AGENTS.md для человеческого токена не используется)",
+            path.display()
+        )
+    })?;
+    check_url(&url)?;
+    let src = Source::Home(path);
+    Ok(Some((
+        Found {
+            value: norm_url(url),
+            source: src.clone(),
+        },
+        Found {
+            value: token,
+            source: src,
+        },
+    )))
+}
+
+/// Предупреждение для `--human`: адрес из флага, окружения или файлов проекта расходится с
+/// адресом `~/.zeroaimemory/config.toml` (используется последний). Совпадает или задан только
+/// в домашнем файле — `None`.
+pub fn human_url_warning(home_url: &str, other: Option<&Found>) -> Option<String> {
+    let o = other?;
+    if matches!(o.source, Source::Home(_)) || norm_url(o.value.clone()) == home_url {
+        return None;
+    }
+    Some(format!(
+        "предупреждение: --human игнорирует адрес {} ({}) и использует {home_url} из \
+         ~/.zeroaimemory/config.toml",
+        o.value,
+        o.source.describe()
+    ))
 }
 
 fn nonempty(v: Option<&str>) -> Option<String> {
@@ -314,23 +351,67 @@ mod tests {
     }
 
     #[test]
-    fn human_token_only_from_home_config() {
+    fn human_target_only_from_home_config() {
         let root = tmp("human");
         let home = root.join("home");
-        assert_eq!(human_token(&home).unwrap(), None);
+        assert_eq!(human_target(&home).unwrap(), None);
         std::fs::create_dir_all(home.join(".zeroaimemory")).unwrap();
         let cfg = home.join(".zeroaimemory/config.toml");
-        std::fs::write(&cfg, "token = \"agent-token\"\n").unwrap();
-        assert_eq!(human_token(&home).unwrap(), None);
-        std::fs::write(&cfg, "token = \"a\"\nhuman_token = \" human-token \"\n").unwrap();
-        let f = human_token(&home).unwrap().unwrap();
-        assert_eq!(f.value, "human-token");
-        assert_eq!(f.source, Source::Home(cfg.clone()));
+        std::fs::write(&cfg, "url = \"http://h:1\"\ntoken = \"agent-token\"\n").unwrap();
+        assert_eq!(human_target(&home).unwrap(), None);
+        // токен без url — ошибка: адрес из других источников не берётся
+        std::fs::write(&cfg, "human_token = \"h\"\n").unwrap();
+        assert!(human_target(&home).unwrap_err().contains("url"));
+        std::fs::write(&cfg, "url = \"ftp://h\"\nhuman_token = \"h\"\n").unwrap();
+        assert!(human_target(&home).is_err());
+        std::fs::write(
+            &cfg,
+            "url = \"http://home:1/\"\ntoken = \"a\"\nhuman_token = \" human-token \"\n",
+        )
+        .unwrap();
+        let (u, t) = human_target(&home).unwrap().unwrap();
+        assert_eq!(
+            (u.value.as_str(), t.value.as_str()),
+            ("http://home:1", "human-token")
+        );
+        assert_eq!(t.source, Source::Home(cfg.clone()));
         // обычный поиск токена его не берёт
         let r = res(&Flags::default(), &[], &root, &home);
         assert_eq!(r.token.unwrap().value, "a");
         std::fs::write(&cfg, "human_token = [1]\n").unwrap();
-        assert!(human_token(&home).is_err());
+        assert!(human_target(&home).is_err());
+    }
+
+    #[test]
+    fn human_url_warning_on_mismatch() {
+        let f = |v: &str, source: Source| Found {
+            value: v.into(),
+            source,
+        };
+        assert_eq!(human_url_warning("http://h:1", None), None);
+        assert_eq!(
+            human_url_warning("http://h:1", Some(&f("http://h:1/", Source::Flag))),
+            None
+        );
+        assert_eq!(
+            human_url_warning(
+                "http://h:1",
+                Some(&f("http://x", Source::Home(PathBuf::from("c"))))
+            ),
+            None
+        );
+        let w = human_url_warning(
+            "http://h:1",
+            Some(&f(
+                "http://evil:9",
+                Source::File(PathBuf::from("CLAUDE.md")),
+            )),
+        )
+        .unwrap();
+        assert!(w.contains("http://evil:9") && w.contains("CLAUDE.md") && w.contains("http://h:1"));
+        assert!(
+            human_url_warning("http://h:1", Some(&f("http://e", Source::Env("ZAM_URL")))).is_some()
+        );
     }
 
     #[test]

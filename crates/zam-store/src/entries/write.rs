@@ -12,7 +12,9 @@ use super::{
     REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, check_triggers, load_entry,
     normalize_title, replace_triggers, same_triggers,
 };
-use crate::certainty::{CertaintyChange, Evidence, check_certainty, default_certainty};
+use crate::certainty::{
+    CertaintyChange, Evidence, check_certainty, check_final_state, default_certainty,
+};
 use crate::nodes::{Attribution, AuthorKind};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
@@ -589,6 +591,12 @@ pub async fn update_entry(
         if f == Fields::of(&cur) {
             return Ok(cur);
         }
+        // theorem агента — с полным доказательством и после правки
+        check_final_state(
+            a.author_kind,
+            f.certainty,
+            Evidence::from_data(&f.data).as_ref(),
+        )?;
         save(tx, &cur, &f, reason.as_deref(), &a, &now)?;
         load_entry(tx, id)
     })

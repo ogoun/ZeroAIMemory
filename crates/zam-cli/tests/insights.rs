@@ -119,8 +119,8 @@ fn id_of(s: &str) -> String {
 }
 
 /// `zam insight certify`: агент повышает до theorem с доказательством (без него — 422, код 6),
-/// axiom без `--human` — 403 (код 3), с `--human` (human_token из
-/// `~/.zeroaimemory/config.toml`) — ставится; без поля в конфигурации — ошибка токена (код 3).
+/// axiom без `--human` — 403 (код 3); `--human` без интерактивного терминала — отказ (код 3)
+/// до запроса к серверу. Путь подтверждения в терминале — юнит-тест `human_gate`.
 #[test]
 fn insight_certify_evidence_and_human_token() {
     let (url, tok, human) = start_human("certify");
@@ -183,23 +183,12 @@ fn insight_certify_evidence_and_human_token() {
     let o = z(&["insight", "certify", &id, "axiom", "--reason", "уверен"]);
     assert_eq!(o.status.code(), Some(3), "{}", out(&o));
     assert!(err(&o).contains("axiom"), "{}", err(&o));
-    // --human без human_token в конфигурации — ошибка токена, запроса нет
-    let o = z(&[
-        "insight",
-        "certify",
-        &id,
-        "axiom",
-        "--reason",
-        "уверен",
-        "--human",
-    ]);
-    assert_eq!(o.status.code(), Some(3));
-    assert!(err(&o).contains("human_token"), "{}", err(&o));
-    // human_token в ~/.zeroaimemory/config.toml — ставится
+    // --human без терминала (агент вызывает CLI неинтерактивно) — отказ до любого запроса,
+    // даже при настроенном human_token (ruling контроллера, §11.4)
     std::fs::create_dir_all(r.join(".zeroaimemory")).unwrap();
     std::fs::write(
         r.join(".zeroaimemory").join("config.toml"),
-        format!("human_token = \"{human}\"\n"),
+        format!("url = \"{url}\"\nhuman_token = \"{human}\"\n"),
     )
     .unwrap();
     let o = z(&[
@@ -211,17 +200,14 @@ fn insight_certify_evidence_and_human_token() {
         "утверждено",
         "--human",
     ]);
-    assert!(ok(&o).trim().ends_with("axiom"), "{}", out(&o));
-    // агент её больше не меняет
-    let o = z(&[
-        "insight",
-        "certify",
-        &id,
-        "hypothesis",
-        "--reason",
-        "сомнение",
-    ]);
     assert_eq!(o.status.code(), Some(3), "{}", out(&o));
+    assert!(
+        err(&o).contains("подтверждение аксиом — только человеком"),
+        "{}",
+        err(&o)
+    );
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["certainty"], "theorem", "запись не изменилась: {e}");
 }
 
 #[test]

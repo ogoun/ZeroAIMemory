@@ -26,7 +26,8 @@ pub use blobs::{
     resolve_attachment,
 };
 pub use certainty::{
-    CertaintyChange, CertaintyError, Evidence, check_certainty, default_certainty,
+    CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,
+    default_certainty,
 };
 pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
 pub use db::{Db, DbOptions};

@@ -295,8 +295,9 @@ enum InsightCmd {
         /// JSON-файл доказательства {checked, method, result} → data.evidence
         #[arg(long)]
         evidence_file: Option<PathBuf>,
-        /// Человеческий токен (human_token из ~/.zeroaimemory/config.toml): axiom ставит и
-        /// меняет только человек
+        /// Человеческий токен (url и human_token — только из ~/.zeroaimemory/config.toml);
+        /// только в интерактивном терминале с подтверждением вводом id: axiom ставит и меняет
+        /// только человек
         #[arg(long)]
         human: bool,
         #[command(flatten)]
@@ -496,7 +497,7 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
             common,
         } => {
             let ctx = if human {
-                cmd::connect_human(&common)?
+                cmd::connect_human(&common, &id)?
             } else {
                 cmd::connect(&common)?
             };

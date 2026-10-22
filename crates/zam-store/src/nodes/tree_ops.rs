@@ -165,12 +165,13 @@ pub async fn move_node(
                 "нельзя перенести «{old}» внутрь самого себя"
             )));
         }
-        ensure_free(tx, node.space_id, &new_path)?;
+        // права (403) — раньше занятости пути (409)
         let descendants = all_descendants(tx, node.space_id, id)?;
         let moved: Vec<Id> = std::iter::once(id)
             .chain(descendants.iter().map(|d| d.0))
             .collect();
         ensure_no_axiom(tx, &moved, author)?;
+        ensure_free(tx, node.space_id, &new_path)?;
         let now = fmt_ts(Timestamp::now());
         let parent = ensure_ancestors(tx, node.space_id, &new_path, &now)?;
 

@@ -16,7 +16,8 @@
 //! - `zam insight certify ID axiom|theorem|hypothesis|none --reason R [--evidence-file F]
 //!   [--human]` — смена эпистемического статуса (§7.5): `theorem` от агента — с доказательством
 //!   (`--evidence-file` дописывается в `data.evidence`), `axiom` и любая правка `axiom` — только
-//!   с `--human` (человеческий токен из `~/.zeroaimemory/config.toml`, поле `human_token`).
+//!   с `--human`: адрес и токен — только из `~/.zeroaimemory/config.toml` (`url`,
+//!   `human_token`), только в интерактивном терминале с подтверждением вводом id записи.
 use std::path::Path;
 
 use serde_json::{Value, json};

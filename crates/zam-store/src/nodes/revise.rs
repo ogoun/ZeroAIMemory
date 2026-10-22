@@ -14,7 +14,7 @@ use zam_markdown::{PatchError, PatchOp, apply_patch, section_bytes};
 use super::chunks::{index_state, note_meta, space_kind};
 use super::write::store_revision;
 use super::{Attribution, AuthorKind, Node, NodeKind, load_node, revision_text, sha256_hex};
-use crate::certainty::{CertaintyChange, check_certainty};
+use crate::certainty::{CertaintyChange, check_certainty, check_final_state};
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
 
@@ -83,7 +83,6 @@ pub async fn update_note(
 ) -> Result<Node, WriteError> {
     write_note(db, move |tx| {
         let node = live_note(tx, id)?;
-        ensure_may_modify(&node, a.author_kind)?;
         if base_rev != node.current_rev {
             return Err(rev_mismatch(tx, &node)?);
         }
@@ -121,7 +120,6 @@ pub async fn patch_note_within(
 ) -> Result<Node, WriteError> {
     write_note(db, move |tx| {
         let node = live_note(tx, id)?;
-        ensure_may_modify(&node, a.author_kind)?;
         if ops.is_empty() {
             return Err(StoreError::BadInput("пустой список операций PATCH".into()).into());
         }
@@ -164,7 +162,6 @@ pub async fn patch_note_within(
 pub async fn revert_note(db: &Db, id: Id, to_rev: i64, a: Attribution) -> Result<Node, StoreError> {
     db.write(move |tx| {
         let node = live_note(tx, id)?;
-        ensure_may_modify(&node, a.author_kind)?;
         let text = revision_text(tx, id, to_rev)?;
         commit_text(tx, node, &text, None, &a)
     })
@@ -187,7 +184,9 @@ async fn write_note(
 }
 
 /// Заметку `axiom` меняет только человек: проверка по текущей ревизии до любой записи
-/// (`PUT`, `PATCH`, `revert`), раньше конфликта ревизий.
+/// ([`commit_text`] — общий шаг `PUT`, `PATCH`, `revert`). Порядок ответов: конфликт ревизии
+/// (`If-Match`/`base_rev` устарел — 409) и ошибки PATCH проверяются раньше; при актуальной
+/// ревизии агент получает 403, ничего не записав.
 fn ensure_may_modify(node: &Node, author: AuthorKind) -> Result<(), StoreError> {
     Ok(check_certainty(
         author,
@@ -244,6 +243,8 @@ fn commit_text(
     let now = fmt_ts(Timestamp::now());
     let meta = note_meta(content, agent_l0);
     let certainty = meta.certainty()?;
+    // theorem агента — с непустым evidence: и после правки
+    check_final_state(a.author_kind, certainty, meta.evidence.as_ref())?;
     if certainty != node.certainty {
         check_certainty(
             a.author_kind,

@@ -175,6 +175,24 @@ pub fn check_certainty(
     }
 }
 
+/// Итоговое состояние после правки агентом: если статус цели — `theorem`, доказательство
+/// должно быть полным и в итоговом состоянии (`data.evidence` записи, `evidence:` заметки), иначе
+/// [`CertaintyError::EvidenceRequired`] — `theorem` не переживает удаление доказательства.
+/// Свежесть доказательства не проверяется. Человеку — без ограничений.
+pub fn check_final_state(
+    author: AuthorKind,
+    certainty: Option<Certainty>,
+    evidence: Option<&Evidence>,
+) -> Result<(), CertaintyError> {
+    if author != AuthorKind::Human
+        && certainty == Some(Certainty::Theorem)
+        && !evidence.is_some_and(Evidence::is_complete)
+    {
+        return Err(CertaintyError::EvidenceRequired);
+    }
+    Ok(())
+}
+
 /// Статус новой записи без явного `certainty`: insight агента (и системы) — `hypothesis`,
 /// insight человека — `axiom` **[решение исполнителя]**; у остальных видов статуса нет.
 pub fn default_certainty(author: AuthorKind, kind: EntryKind) -> Option<Certainty> {
@@ -460,6 +478,23 @@ mod tests {
             for a in [Agent, Human, System] {
                 assert_eq!(default_certainty(a, k), None);
             }
+        }
+    }
+
+    #[test]
+    fn final_theorem_needs_evidence_from_agent() {
+        assert_eq!(
+            check_final_state(Agent, Some(Theorem), None),
+            Err(EvidenceRequired)
+        );
+        assert_eq!(
+            check_final_state(System, Some(Theorem), None),
+            Err(EvidenceRequired)
+        );
+        assert_eq!(check_final_state(Agent, Some(Theorem), Some(&ev())), Ok(()));
+        assert_eq!(check_final_state(Human, Some(Theorem), None), Ok(()));
+        for c in [None, Some(Hypothesis), Some(Axiom)] {
+            assert_eq!(check_final_state(Agent, c, None), Ok(()));
         }
     }
 
