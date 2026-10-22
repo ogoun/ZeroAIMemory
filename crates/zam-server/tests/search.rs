@@ -202,13 +202,18 @@ async fn scope_defaults_solution_and_flags() {
         .json(),
     );
     assert_eq!(p, vec!["Инструменты/Bash скрипты".to_string()]);
+    // expand=graph — с M3 (граф знаний, задача 10): принимается
+    assert_eq!(
+        search(&a, json!({"query": q, "mode": "chunks", "expand": "graph"}))
+            .await
+            .status,
+        StatusCode::OK
+    );
     // некорректные параметры → 400
     for bad in [
         json!({"query": q, "mode": "x"}),
         json!({"query": q, "format": "x"}),
         json!({"query": q, "expand": "x"}),
-        // граф знаний — M3
-        json!({"query": q, "mode": "chunks", "expand": "graph"}),
         json!({"query": q, "top_k": 0}),
         json!({"query": q, "scope": {"solution": "nope"}}),
         json!({"nope": 1}),

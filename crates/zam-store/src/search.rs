@@ -32,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
-use rusqlite::{Connection, ToSql, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::time::ts_at;
@@ -794,6 +794,42 @@ pub async fn leaves_of_nodes(
             let leaves: Vec<LeafChunk> = rows.collect::<Result<_, _>>()?;
             if !leaves.is_empty() {
                 out.insert(node, leaves);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Первый лист (`level = 'chunk'`, наименьший `ordinal`) каждой цели — узла или записи:
+/// `цель → id чанка`; целей без листов в ответе нет. Карточка соседа по графу в
+/// `expand=graph` поиска (область и фильтры проверяет [`live_chunks`]).
+pub async fn first_leaves(
+    db: &Db,
+    targets: Vec<TargetRef>,
+) -> Result<HashMap<TargetRef, String>, StoreError> {
+    if targets.is_empty() {
+        return Ok(HashMap::new());
+    }
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let mut by_node = tx.prepare_cached(
+            "SELECT id FROM chunks WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal LIMIT 1",
+        )?;
+        let mut by_entry = tx.prepare_cached(
+            "SELECT id FROM chunks WHERE entry_id = ?1 AND level = 'chunk' ORDER BY ordinal LIMIT 1",
+        )?;
+        let mut out = HashMap::new();
+        for t in targets {
+            let st = match t.kind {
+                TargetKind::Node => &mut by_node,
+                TargetKind::Entry => &mut by_entry,
+            };
+            if let Some(id) = st
+                .query_row([t.id], |r| r.get::<_, String>(0))
+                .optional()?
+            {
+                out.insert(t, id);
             }
         }
         Ok(out)

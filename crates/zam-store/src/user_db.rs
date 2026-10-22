@@ -53,6 +53,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: include_str!("../migrations/user/0009_node_certainty.sql"),
     },
+    Migration {
+        version: 10,
+        sql: include_str!("../migrations/user/0010_edges.sql"),
+    },
 ];
 
 /// Вид пространства.
@@ -126,11 +130,12 @@ pub struct UserDbs {
 
 type Slot = Arc<Mutex<Option<OpenDb>>>;
 
-/// Открытая база и признак завершения разовой перечанковки (R1).
+/// Открытая база и признак завершения разовых фоновых задач открытия (перечанковка R1,
+/// дозаполнение рёбер графа).
 #[derive(Debug)]
 struct OpenDb {
     db: Db,
-    /// `true` — перечанковка не нужна или уже завершилась (успешно или с ошибкой).
+    /// `true` — фоновые задачи не нужны или уже завершились (успешно или с ошибкой).
     rechunked: watch::Receiver<bool>,
 }
 
@@ -150,7 +155,8 @@ impl UserDbs {
     /// Если база только что обновлена до v4, разовая перечанковка (R1) запускается
     /// фоновой задачей tokio один раз на открытие: `get` её не ждёт, записи во время
     /// неё безопасны (пакеты идемпотентны и читают текущую ревизию в своей транзакции).
-    /// Дождаться её — [`UserDbs::wait_rechunk`].
+    /// Так же, следом за ней, — дозаполнение рёбер графа базы, обновлённой до v10
+    /// (`meta.edges_backfill`, задача 10 M3). Дождаться обеих — [`UserDbs::wait_rechunk`].
     pub async fn get(&self, user: Id) -> Result<Db, StoreError> {
         let slot = self.open.lock().await.entry(user).or_default().clone();
         // Открытие под замком ячейки: два одновременных вызова не создадут два Db на один
@@ -168,18 +174,24 @@ impl UserDbs {
             Some(why) if !clear_rechunk_if_empty(&db).await? => Some(why),
             _ => None,
         };
-        let (done, rechunked) = watch::channel(pending.is_none());
+        let edges = crate::graph::backfill_pending(&db).await?;
+        let (done, rechunked) = watch::channel(pending.is_none() && !edges);
         *cell = Some(OpenDb {
             db: db.clone(),
             rechunked,
         });
         drop(cell);
-        if let Some(why) = pending {
+        if pending.is_some() || edges {
             let bg = db.clone();
             tokio::spawn(async move {
-                if let Err(e) = rechunk_all(&bg, why).await {
+                if let Some(why) = pending
+                    && let Err(e) = rechunk_all(&bg, why).await
+                {
                     // повторится при следующем открытии базы
                     tracing::warn!(error = %e, reason = why.as_str(), "перечанковка заметок прервана");
+                }
+                if edges && let Err(e) = crate::graph::backfill_edges(&bg).await {
+                    tracing::warn!(error = %e, "дозаполнение рёбер графа прервано");
                 }
                 let _ = done.send(true);
             });
@@ -187,8 +199,8 @@ impl UserDbs {
         Ok(db)
     }
 
-    /// Ждёт завершения разовой перечанковки (R1) базы `user`, если она открыта и
-    /// перечанковка идёт; иначе возвращается сразу.
+    /// Ждёт завершения разовых фоновых задач открытия базы `user` (перечанковка R1,
+    /// дозаполнение рёбер графа), если она открыта и они идут; иначе возвращается сразу.
     pub async fn wait_rechunk(&self, user: Id) {
         let slot = self.open.lock().await.get(&user).cloned();
         let rx = match slot {

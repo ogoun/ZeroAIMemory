@@ -60,6 +60,8 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
             ],
         )?;
         store_revision(tx, id, 1, &n.content, &hash, &meta, &n.attrib, None, &now)?;
+        // ожидавшие эту заметку ссылки пространства разрешаются
+        crate::graph::tree_changed(tx, n.space_id, &[id], &[])?;
         load_node(tx, id)
     })
     .await

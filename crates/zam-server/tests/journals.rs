@@ -600,6 +600,7 @@ async fn member_cannot_read_owner_knowledge_entry_404() {
             certainty: None,
             idempotency_key: None,
             triggers: Vec::new(),
+            links: Vec::new(),
         },
         &Attribution::new(AuthorKind::Human),
     )

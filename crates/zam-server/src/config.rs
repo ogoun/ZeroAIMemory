@@ -430,6 +430,9 @@ pub struct SearchSection {
     pub boost_axiom: f64,
     pub boost_theorem: f64,
     pub boost_hypothesis: f64,
+    /// `expand=graph` (§8.5, §9.2 п. 7): балл соседа по графу — балл найденного элемента,
+    /// умноженный на этот вес (0..=1, по умолчанию 0,5).
+    pub graph_weight: f64,
 }
 
 impl SearchSection {
@@ -467,6 +470,9 @@ impl SearchSection {
             if !(v.is_finite() && v > 0.0) {
                 return Err(bad(k, "должно быть конечным и больше 0 (1 — без буста)"));
             }
+        }
+        if !(self.graph_weight.is_finite() && (0.0..=1.0).contains(&self.graph_weight)) {
+            return Err(bad("graph_weight", "должно быть в 0..=1"));
         }
         Ok(())
     }
@@ -569,6 +575,7 @@ impl Default for ServerConfig {
                 boost_axiom: 1.20,
                 boost_theorem: 1.10,
                 boost_hypothesis: 1.00,
+                graph_weight: 0.5,
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
@@ -877,6 +884,7 @@ mod tests {
             ),
             (1.20, 1.10, 1.00)
         );
+        assert_eq!(c.search.graph_weight, 0.5);
         assert_eq!(c.insights.dedup_threshold, 0.90);
     }
 
@@ -897,6 +905,7 @@ mod tests {
             ("ZAM_SEARCH__BOOST_AREA", "nan"),
             ("ZAM_SEARCH__BOOST_AXIOM", "0"),
             ("ZAM_SEARCH__BOOST_HYPOTHESIS", "-1"),
+            ("ZAM_SEARCH__GRAPH_WEIGHT", "1.5"),
             ("ZAM_INSIGHTS__DEDUP_THRESHOLD", "1.5"),
         ] {
             let e = load(None, &[env(k, v)], &Default::default());

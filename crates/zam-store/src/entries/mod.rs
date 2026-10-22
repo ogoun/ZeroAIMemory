@@ -167,6 +167,10 @@ pub struct NewEntry {
     pub idempotency_key: Option<String>,
     /// Триггеры вспоминания (только у insight); пишутся в той же транзакции.
     pub triggers: Vec<NewTrigger>,
+    /// Явные связи записи (`links` insight, §8.5): `(тип, цель)`, цель — живая заметка или
+    /// запись этой базы; пишутся в той же транзакции (нет цели → `NotFound`, `supersedes` →
+    /// `BadInput`). Область видимости цели проверяет сервер.
+    pub links: Vec<(crate::graph::EdgeType, zam_core::TargetRef)>,
 }
 
 /// Запись журнала.

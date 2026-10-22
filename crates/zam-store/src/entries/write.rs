@@ -293,6 +293,7 @@ fn insert_entry(
         return Err(bad("триггеры есть только у insight"));
     }
     let triggers = check_triggers(e.triggers)?;
+    let links = e.links;
     let f = Fields {
         title: check_title(&e.title)?,
         body: e.body,
@@ -336,6 +337,7 @@ fn insert_entry(
     insert_revision(c, id, 1, &f, None, a, now)?;
     replace_triggers(c, id, &triggers, now)?;
     index_entry_now(c, id, None, now)?;
+    crate::graph::insert_entry_links(c, id, &links, a, now)?;
     Ok(id)
 }
 
@@ -649,8 +651,8 @@ pub async fn restore_entry(db: &Db, id: Id, a: &Attribution) -> Result<Entry, St
 }
 
 /// Замещает insight `old` новой записью одной транзакцией: новая получает
-/// `supersedes_id = old`, старая — `superseded`, `superseded_by_id` и новую ревизию; обе
-/// переиндексируются. Возвращает `(новая, старая)`. Повтор с тем же `idempotency_key`
+/// `supersedes_id = old` и системное ребро графа `supersedes` (новая → старая), старая —
+/// `superseded`, `superseded_by_id` и новую ревизию; обе переиндексируются. Возвращает `(новая, старая)`. Повтор с тем же `idempotency_key`
 /// возвращает ту же пару. Не insight, другое пространство → `BadInput`; старая уже
 /// `superseded`/`retracted` → `Conflict`; нет или удалена → `NotFound`.
 pub async fn supersede_entry(
@@ -690,6 +692,8 @@ pub async fn supersede_entry(
         }
         let now = fmt_ts(Timestamp::now());
         let nid = insert_entry(tx, new, key, &a, Some(old), &now)?;
+        // системная связь графа: новая → старая (§8.5)
+        crate::graph::insert_supersedes(tx, nid, old, o.space_id, Some(&a), &now)?;
         tx.execute(
             "UPDATE entries SET superseded_by_id = ?2 WHERE id = ?1",
             params![old, nid],

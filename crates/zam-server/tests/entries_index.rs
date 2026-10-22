@@ -43,6 +43,7 @@ fn insight(space: Id, title: &str, body: &str) -> NewEntry {
         certainty: Some(Certainty::Hypothesis),
         idempotency_key: None,
         triggers: Vec::new(),
+        links: Vec::new(),
     }
 }
 
@@ -262,6 +263,7 @@ async fn search_returns_entry_items_with_kind_status() {
             certainty: None,
             idempotency_key: None,
             triggers: Vec::new(),
+            links: Vec::new(),
         },
         &agent(),
     )

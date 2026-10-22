@@ -10,7 +10,8 @@
     "l0": null,
     "index": false,
     "certainty": null,
-    "evidence": null
+    "evidence": null,
+    "relations": []
   },
   "sections": [
     {

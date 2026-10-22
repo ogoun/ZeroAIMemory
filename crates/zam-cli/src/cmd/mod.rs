@@ -2,6 +2,7 @@
 pub mod attach;
 pub mod history;
 pub mod insight;
+pub mod link;
 pub mod log;
 pub mod read;
 pub mod release;

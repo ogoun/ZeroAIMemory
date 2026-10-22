@@ -10,7 +10,8 @@
     "l0": "Краткая суть заметки.",
     "index": true,
     "certainty": null,
-    "evidence": null
+    "evidence": null,
+    "relations": []
   },
   "sections": [
     {

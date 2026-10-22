@@ -200,6 +200,11 @@ impl Client {
         )
     }
 
+    /// DELETE `/api/v1{path}`.
+    pub fn delete(&self, path: &str) -> Result<Response<Body>, CliError> {
+        self.check(self.prepare(self.agent.delete(&self.url(path))).call())
+    }
+
     /// PATCH JSON.
     pub fn patch_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
         let rb = self.prepare(self.agent.patch(&self.url(path)));

@@ -133,6 +133,8 @@ boost_area = 1.10
 boost_axiom = 1.20
 boost_theorem = 1.10
 boost_hypothesis = 1.00
+# expand=graph (§8.5): соседи найденных элементов по графу получают балл родителя × вес (0..=1).
+graph_weight = 0.5
 
 [insights]
 # Дедупликация при записи insight (§7.5): действующий insight той же области с dense-косинусом

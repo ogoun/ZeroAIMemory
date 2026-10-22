@@ -9,7 +9,9 @@
 //!   проверка векторных хитов; до 128 печатных символов, пустая — без фильтра);
 //! - `mode`: `brief` (по умолчанию) | `chunks` | `notes`;
 //! - `expand`: `none` (по умолчанию) | `section` (текст всей секции чанка) | `neighbors`
-//!   (чанк с соседними листами) | `graph` (400: будет в M3); действует в `mode=chunks`;
+//!   (чанк с соседними листами) — в `mode=chunks`; `graph` — в любом режиме: соседи первых
+//!   `top_k` элементов по графу (§8.5, [`graph`]: до `ceil(top_k / 2)` новых элементов с
+//!   баллом `родитель × search.graph_weight`, `sources: ["graph"]`, `via: {type, from}`);
 //! - `top_k` (10, 1..=100), `budget_tokens` (800), `format`: `json` (по умолчанию) | `md`;
 //! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже);
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release` (по умолчанию все
@@ -63,7 +65,8 @@
 //!    же). Реранкер — по устройству эмбеддера, грузится при первом таком запросе
 //!    (`spawn_blocking`). Нет модели — ответ без реранка и `warnings: ["reranker not
 //!    installed"]`; ошибка или паника загрузки и инференса — `["reranker failed"]`, не 500.
-//! 5. `top_k` (в `notes` — узлов), `expand`, упаковка в `budget_tokens`.
+//! 5. `top_k` (в `notes` — узлов), `expand` (`graph` — соседи после `top_k`), упаковка в
+//!    `budget_tokens`.
 //!
 //! **Деградация.** Нет модели, ORT, Qdrant, чужая модель коллекции или сбой запроса
 //! (эмбеддинг, Qdrant) — ответ из одного FTS (по всем целям), `degraded: true` и `degraded_reason`
@@ -84,7 +87,8 @@
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
 //! полного текста чанка, `updated_at`, `kind` (`note` или вид записи), `snippet` | `l0`,
-//! `text`, `rerank_score` 0..1 — у переставленных реранком), `degraded`, `degraded_reason`
+//! `text`, `rerank_score` 0..1 — у переставленных реранком, `via {type, from}` — у соседей
+//! `expand=graph`), `degraded`, `degraded_reason`
 //! и `degraded_text` (или `null`), `warnings` (строки: о реранке, `index rebuilding` — индекс
 //! пересобирается, векторная выдача может быть неполной, `solution access …` и
 //! `solution unavailable` — решение исключено из области), `pending_count` — живые
@@ -101,7 +105,8 @@
 //! **Формат `md`** — карточки §9.3, по одной на элемент:
 //! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N>[ · <certainty>] · <дата> · ~<N> tok`;
 //! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> · ~<N>
-//! tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются),
+//! tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются; у соседа
+//! `expand=graph` — ` · via <тип> ← <родитель>`),
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
 //! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
 //! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
@@ -111,6 +116,7 @@
 //! хитов, листы сводок, `expand`, L0, `pending_count` — исключает решение целиком ([`Health`]):
 //! WARN в журнал, `warnings: ["solution unavailable"]`, элементы этой цели убираются из
 //! выдачи, ответ строится по остальным целям. Сбой личной базы — ошибка запроса, как в M2.
+pub mod graph;
 pub mod merge;
 pub mod targets;
 
@@ -543,6 +549,8 @@ struct Item {
     text: Option<(String, usize)>,
     /// Балл реранкера (0..1), если элемент переставлен реранком.
     rerank_score: Option<f32>,
+    /// Сосед `expand=graph`: тип ребра и родитель.
+    via: Option<(zam_store::EdgeType, TargetRef)>,
 }
 
 /// Текст пары реранкера: заголовок секции и текст чанка.
@@ -841,6 +849,9 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
     if let Some(r) = p.item.rerank_score {
         o.insert("rerank_score".into(), json!(round_score(f64::from(r))));
     }
+    if let Some((t, from)) = &p.item.via {
+        o.insert("via".into(), json!({"type": t, "from": from}));
+    }
     o.insert("sources".into(), json!(p.item.sources));
     o.insert("tokens".into(), json!(p.tokens));
     o.insert("updated_at".into(), json!(fmt_ts(h.updated_at)));
@@ -935,6 +946,12 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
             line
         }
     };
+    if let Some((t, from)) = &p.item.via {
+        if line.ends_with('\n') {
+            line.pop();
+        }
+        line.push_str(&format!(" · via {} ← {from}\n", t.as_str()));
+    }
     match &p.text {
         Some((t, _)) => {
             for l in t.lines() {
@@ -1009,11 +1026,6 @@ pub async fn search(
     let top_k = req.top_k.unwrap_or(DEFAULT_TOP_K);
     if !(1..=TOP_K_MAX).contains(&top_k) {
         return Err(ApiError::BadRequest(format!("top_k: от 1 до {TOP_K_MAX}")));
-    }
-    if expand == Expand::Graph {
-        return Err(ApiError::BadRequest(
-            "expand=graph будет в M3 (граф знаний)".into(),
-        ));
     }
     if req.query.chars().count() > zam_store::search::QUERY_MAX_CHARS {
         return Err(ApiError::BadRequest(format!(
@@ -1287,6 +1299,7 @@ pub async fn search(
                 l0: None,
                 text: None,
                 rerank_score: None,
+                via: None,
             })
         })
         .collect();
@@ -1316,6 +1329,20 @@ pub async fn search(
         SearchMode::Chunks => expand_items(&mut health, items, expand, top_k).await?,
         SearchMode::Brief => items.into_iter().take(top_k).collect(),
     };
+    if expand == Expand::Graph {
+        let extra = graph::expand_graph(
+            &mut health,
+            &items,
+            top_k,
+            st.cfg.search.graph_weight,
+            &kinds,
+            prefix.clone(),
+            &needles,
+            mode == SearchMode::Chunks,
+        )
+        .await?;
+        items.extend(extra);
+    }
     if mode == SearchMode::Notes {
         for it in &mut items {
             if it.hit.target.kind == TargetKind::Node && health.alive[it.target] {
@@ -1444,6 +1471,7 @@ mod tests {
                 sources: vec!["fts"],
                 l0: None,
                 rerank_score: None,
+                via: None,
             })
             .collect()
     }

@@ -1,7 +1,8 @@
 //! Хранилище ZeroAIMemory: открытие SQLite, поток-писатель, пул читателей, миграции,
 //! узлы и ревизии заметок с синхронной индексацией (чанки §8.2, FTS5), outbox векторной
 //! индексации (`index_jobs`), кэш эмбеддингов, полнотекстовый поиск, блобы вложений,
-//! записи журналов решения (`entries`, M3), реестр решений и доступ участников (`system.db`).
+//! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
+//! участников (`system.db`).
 
 pub mod access;
 pub mod blobs;
@@ -10,7 +11,9 @@ pub mod datadir;
 pub mod db;
 pub mod embeddings;
 pub mod entries;
+pub mod graph;
 pub mod jobs;
+pub mod links;
 pub mod migrate;
 pub mod nodes;
 pub mod paths;
@@ -46,6 +49,10 @@ pub use entries::{
     reindex_entries_page, restore_entry, retract_entry, set_triggers, supersede_entry,
     title_duplicates, update_entry, validate_trigger,
 };
+pub use graph::{
+    EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, Graph, GraphNode, GraphStore, NewEdge,
+    get_edge, graph_node, graph_nodes,
+};
 pub use jobs::{
     EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats,
     NodePayload, ReindexNote, chunks_for_index, claim_jobs, complete_job, enqueue_reindex,
@@ -64,8 +71,9 @@ pub use nodes::{
 pub use paths::{NodePath, path_ancestors};
 pub use search::{
     ChunkScope, EntryHit, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END, MARK_START,
-    TargetFilter, leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves, node_leaves,
-    pending_count, query_needles, sanitize_fts, search_fts, search_fts_channels, text_snippet,
+    TargetFilter, first_leaves, leaf_term_hits, leaves_of_nodes, live_chunks, neighbor_leaves,
+    node_leaves, pending_count, query_needles, sanitize_fts, search_fts, search_fts_channels,
+    text_snippet,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{

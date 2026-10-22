@@ -535,8 +535,8 @@ pub(crate) fn enqueue_for_note(
     Ok(op)
 }
 
-/// Пересборка чанков и задание после записи заметки (создание, правка, откат,
-/// восстановление) в транзакции писателя.
+/// Пересборка чанков, выведенных рёбер графа (`crate::graph::rebuild_derived`) и задание после
+/// записи заметки (создание, правка, откат, восстановление) в транзакции писателя.
 pub(crate) fn index_note(
     c: &Connection,
     node_id: Id,
@@ -547,6 +547,7 @@ pub(crate) fn index_note(
     now: &str,
 ) -> Result<(), StoreError> {
     rebuild_chunks(c, node_id, rev, content, meta)?;
+    crate::graph::rebuild_derived(c, node_id, &meta.doc, now)?;
     enqueue_for_note(c, node_id, rev, prev_state, PRIORITY_WRITE, now)?;
     Ok(())
 }

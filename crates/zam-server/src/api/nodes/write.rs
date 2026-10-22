@@ -1,9 +1,11 @@
 //! Запись узлов: создание, замена (`If-Match`), PATCH секций, перенос, удаление в
 //! корзину, восстановление и список корзины.
 //!
-//! Ответ записи заметки (создание, замена, PATCH) — `Node` и, если во frontmatter есть ключ
-//! `certainty`/`evidence` в нераспознаваемом написании (в кавычках, с заглавными буквами),
-//! `warnings: ["certainty_not_recognized"]`: такой ключ статус не задаёт (§7.5).
+//! Ответ записи заметки (создание, замена, PATCH) — `Node` и непустые `warnings`:
+//! `certainty_not_recognized` — во frontmatter ключ `certainty`/`evidence` в нераспознаваемом
+//! написании (в кавычках, с заглавными буквами): такой ключ статус не задаёт (§7.5);
+//! `unknown relation type: <тип>` и `invalid relation: <строка>` — строка `relations:`, не
+//! давшая ребра графа (§8.5).
 //!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
@@ -51,14 +53,16 @@ pub struct Create {
 pub const CERTAINTY_NOT_RECOGNIZED: &str = "certainty_not_recognized";
 
 /// Предупреждения записи заметки по её тексту.
-fn note_warnings(content: &str) -> Vec<&'static str> {
+fn note_warnings(content: &str) -> Vec<String> {
     let doc = zam_markdown::parse(content);
-    match doc.frontmatter {
-        Some(f) if !zam_markdown::unrecognized_certainty_keys(&f.raw).is_empty() => {
-            vec![CERTAINTY_NOT_RECOGNIZED]
-        }
-        _ => Vec::new(),
+    let mut out = Vec::new();
+    if let Some(f) = &doc.frontmatter
+        && !zam_markdown::unrecognized_certainty_keys(&f.raw).is_empty()
+    {
+        out.push(CERTAINTY_NOT_RECOGNIZED.to_string());
     }
+    out.extend(zam_store::links::relation_warnings(&doc));
+    out
 }
 
 /// `Node` как JSON с `warnings` (только непустые).

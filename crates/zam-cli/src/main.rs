@@ -133,6 +133,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SolutionCmd,
     },
+    /// Связь графа: `SRC TYPE DST` — создать (TYPE: links_to, relates_to, depends_on,
+    /// part_of, caused_by, fixes, derived_from, mentions; DST — ещё и [[Имя]]); `rm EDGE-ID`
+    /// — удалить явную связь
+    Link {
+        /// SRC TYPE DST или rm EDGE-ID; SRC и DST — n:<id>, e:<id> (i:/c:/r:) или [space:]path
+        #[arg(required = true, num_args = 2..=3, value_names = ["SRC|rm", "TYPE|EDGE-ID", "DST"])]
+        args: Vec<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Связи узла или записи: исходящие (→) и обратные (←)
+    Links {
+        /// n:<id>, e:<id> (i:/c:/r:) или [space:]path
+        target: String,
+        #[command(flatten)]
+        common: Common,
+    },
 }
 
 #[derive(Subcommand)]
@@ -662,6 +679,14 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             with.as_deref(),
             solution.as_deref(),
         ),
+        Cmd::Link { args, common } => match args.as_slice() {
+            [rm, id] if rm == "rm" => cmd::link::remove(&cmd::connect(&common)?, id),
+            [src, kind, dst] => cmd::link::create(&cmd::connect(&common)?, src, kind, dst),
+            _ => Err(CliError::input(
+                "zam link SRC TYPE DST или zam link rm EDGE-ID",
+            )),
+        },
+        Cmd::Links { target, common } => cmd::link::list(&cmd::connect(&common)?, &target),
         Cmd::Solution {
             cmd: SolutionCmd::Access { cmd },
         } => {

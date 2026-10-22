@@ -1,7 +1,7 @@
 //! Разбор полей frontmatter.
 //!
 //! Нужны только плоские ключи верхнего уровня (`tags`, `description`, `l0`,
-//! `index`, `certainty`, `evidence`), поэтому вместо YAML-библиотеки — узкое подмножество YAML:
+//! `index`, `certainty`, `evidence`, `relations`), поэтому вместо YAML-библиотеки — узкое подмножество YAML:
 //! скаляры (простые, `"…"`, `'…'`, в том числе многострочные), блочные
 //! скаляры `|` и `>` с модификаторами `-`/`+` и цифрой отступа, `~`/`null`,
 //! булевы значения, списки `[a, b]` и блочные списки `- a`.
@@ -21,6 +21,7 @@ pub(crate) fn parse(block: &str, delimiter: &str) -> Frontmatter {
         index: None,
         certainty: None,
         evidence: None,
+        relations: Vec::new(),
     };
     let lines: Vec<&str> = raw.lines().collect();
     let mut i = 0;
@@ -35,20 +36,8 @@ pub(crate) fn parse(block: &str, delimiter: &str) -> Frontmatter {
         };
         let value = strip_comment(value).trim();
         match key.trim() {
-            "tags" => {
-                fm.tags = if value.is_empty() {
-                    let (items, next) = block_list(&lines, i);
-                    i = next;
-                    items
-                } else if let Some(inner) =
-                    value.strip_prefix('[').and_then(|v| v.strip_suffix(']'))
-                {
-                    flow_list(inner)
-                } else {
-                    plain_or_null(value).into_iter().collect()
-                };
-                fm.tags.retain(|t| !t.is_empty());
-            }
+            "tags" => fm.tags = string_list(value, &lines, &mut i),
+            "relations" => fm.relations = string_list(value, &lines, &mut i),
             "description" => fm.description = string_value(value, &lines, &mut i),
             "l0" => fm.l0 = string_value(value, &lines, &mut i),
             "index" => fm.index = boolean(value),
@@ -99,6 +88,22 @@ fn inner_yaml<'a>(block: &'a str, delimiter: &str) -> &'a str {
         pos += line.len();
     }
     body
+}
+
+/// Список строк: блочный (`- a` на следующих строках), flow (`[a, "b"]`) или один скаляр;
+/// пустые элементы, `~` и `null` отбрасываются. `i` сдвигается за строки блочного списка.
+fn string_list(value: &str, lines: &[&str], i: &mut usize) -> Vec<String> {
+    let mut items = if value.is_empty() {
+        let (items, next) = block_list(lines, *i);
+        *i = next;
+        items
+    } else if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+        flow_list(inner)
+    } else {
+        plain_or_null(value).into_iter().collect()
+    };
+    items.retain(|t| !t.is_empty());
+    items
 }
 
 /// Элементы блочного списка `- a`, начиная со строки `from`; возвращает и индекс следующей строки.

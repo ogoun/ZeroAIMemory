@@ -2,10 +2,11 @@
 //! `GET /render/highlight.css`, резолвер ссылок сервера и кэш HTML заметок.
 //!
 //! **Резолвер.** `Resolver` из `zam-markdown` синхронный, а поиск узлов — асинхронный,
-//! поэтому цели вики-ссылок разрешаются заранее, до рендера:
+//! поэтому цели вики-ссылок разрешаются заранее, до рендера, одним чтением базы — общим с
+//! рёбрами графа кодом [`zam_store::links::resolve_link`] (граф и HTML не расходятся):
 //! - цель декодируется из percent-encoding;
-//! - цель с `/` — путь в том же пространстве (`get_node_by_path`, только заметки);
-//! - иначе `find_by_name` — первая по `path`;
+//! - цель с `/` — путь в том же пространстве (только живые заметки);
+//! - иначе имя — первая по `path`;
 //! - href — `#/n/<node_id>`, с якорем `#h-<slug(якорь)>`;
 //! - не найдено → `None` (битая ссылка, предупреждение рендера).
 //!
@@ -43,9 +44,8 @@ use zam_markdown::{
     HEADER_ID_PREFIX, LinkKind, LinkResolution, RENDER_VERSION, Rendered, Resolver, attachment_ref,
     highlight_css, parse, render_html, slug,
 };
-use zam_store::{
-    AttachScope, Db, NodeKind, NodePath, find_by_name, get_node_by_path, resolve_attachment,
-};
+use zam_store::links::{percent_decode, resolve_link};
+use zam_store::{AttachScope, Db, resolve_attachment};
 
 use super::json_body;
 use super::scope::{Mode, Role, node_scope};
@@ -262,71 +262,29 @@ pub fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Цели вики-ссылок документа → id заметок (неразрешённые отсутствуют).
+/// Цели вики-ссылок документа → id заметок (неразрешённые отсутствуют): одно чтение базы,
+/// разрешение — [`resolve_link`] (общее с рёбрами графа).
 async fn resolve_wiki(db: &Db, space: Id, text: &str) -> Result<HashMap<String, Id>, ApiError> {
-    let mut targets: Vec<String> = parse(text)
+    let mut links: Vec<zam_markdown::Link> = parse(text)
         .links
         .into_iter()
         .filter(|l| l.kind == LinkKind::Wiki)
-        .map(|l| l.target)
         .collect();
-    targets.sort();
-    targets.dedup();
-    targets.truncate(WIKI_TARGETS_MAX);
-    let mut out = HashMap::new();
-    for raw in targets {
-        if let Some(id) = resolve_one(db, space, &raw).await? {
-            out.insert(raw, id);
-        }
-    }
-    Ok(out)
-}
-
-async fn resolve_one(db: &Db, space: Id, raw: &str) -> Result<Option<Id>, ApiError> {
-    let target = percent_decode(raw);
-    let target = target.trim();
-    if target.is_empty() {
-        return Ok(None);
-    }
-    if target.contains('/') {
-        let Ok(path) = NodePath::parse(target) else {
-            return Ok(None);
-        };
-        return match get_node_by_path(db, space, &path).await {
-            Ok(n) if n.kind == NodeKind::Note => Ok(Some(n.id)),
-            Ok(_) | Err(zam_store::StoreError::NotFound) => Ok(None),
-            Err(e) => Err(e.into()),
-        };
-    }
-    Ok(find_by_name(db, space, target)
-        .await?
-        .into_iter()
-        .next()
-        .map(|n| n.id))
-}
-
-/// Декодирует `%XX`; некорректные последовательности и не-UTF-8 остаются как есть.
-fn percent_decode(s: &str) -> String {
-    if !s.contains('%') {
-        return s.to_string();
-    }
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let hex = |c: u8| (c as char).to_digit(16);
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
-        {
-            out.push((h * 16 + l) as u8);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+    links.sort_by(|a, b| a.target.cmp(&b.target));
+    links.dedup_by(|a, b| a.target == b.target);
+    links.truncate(WIKI_TARGETS_MAX);
+    Ok(db
+        .read(move |c| {
+            let mut out = HashMap::new();
+            for l in links {
+                // путь источника вики-ссылке не нужен: цель — имя или путь от корня
+                if let Some(id) = resolve_link(c, space, "", &l)? {
+                    out.insert(l.target, id);
+                }
+            }
+            Ok(out)
+        })
+        .await?)
 }
 
 /// Резолвер по заранее разрешённым целям.
@@ -441,16 +399,6 @@ mod tests {
         assert_eq!((g.get(u, s1), g.get(u, s2)), (2, 1));
         // другой пользователь не затронут
         assert_eq!(g.get(Id::new(), s1), 0);
-    }
-
-    #[test]
-    fn percent_decode_cases() {
-        assert_eq!(percent_decode("%D0%A6%D0%B5%D0%BB%D1%8C"), "Цель");
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("%zz"), "%zz");
-        assert_eq!(percent_decode("%FF"), "%FF");
-        assert_eq!(percent_decode("Цель"), "Цель");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 pub mod admin;
 pub mod blobs;
 pub mod entries;
+pub mod graph;
 pub mod health;
 pub mod index;
 pub mod insights;
@@ -109,6 +110,8 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
             get(nodes::history::revision),
         )
         .route("/api/v1/nodes/{id}/diff", get(nodes::history::diff))
+        .route("/api/v1/nodes/{id}/backlinks", get(graph::node_backlinks))
+        .route("/api/v1/nodes/{id}/links", get(graph::node_links))
         .route("/api/v1/nodes/{id}/revert", post(nodes::history::revert))
         .route("/api/v1/trash", get(nodes::write::trash))
         .route(
@@ -129,6 +132,13 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         )
         .route("/api/v1/entries/{id}/retract", post(insights::retract))
         .route("/api/v1/entries/{id}/revisions", get(entries::revisions))
+        .route(
+            "/api/v1/entries/{id}/backlinks",
+            get(graph::entry_backlinks),
+        )
+        .route("/api/v1/graph", get(graph::graph))
+        .route("/api/v1/edges", post(graph::create))
+        .route("/api/v1/edges/{id}", delete(graph::remove))
         .route("/api/v1/releases/{id}/compare", get(releases::compare))
         .route(
             "/api/v1/render",

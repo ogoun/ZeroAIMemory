@@ -40,6 +40,9 @@ pub struct Frontmatter {
     pub certainty: Option<String>,
     /// Доказательство для `theorem` — свободный текст (скаляр или блок `|`).
     pub evidence: Option<String>,
+    /// Связи графа (§8.5): строки `"<тип>: <цель>"` из списка `relations:` (flow или block)
+    /// как в исходнике; тип и цель разбирает хранилище (`zam_store::links`).
+    pub relations: Vec<String>,
 }
 
 /// Заголовок верхнего уровня.

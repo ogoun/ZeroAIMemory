@@ -55,6 +55,7 @@ fn insight(space: Id, title: &str, body: &str) -> NewEntry {
         certainty: Some(Certainty::Hypothesis),
         idempotency_key: None,
         triggers: Vec::new(),
+        links: Vec::new(),
     }
 }
 
@@ -71,6 +72,7 @@ fn changelog(space: Id, title: &str) -> NewEntry {
         certainty: None,
         idempotency_key: None,
         triggers: Vec::new(),
+        links: Vec::new(),
     }
 }
 

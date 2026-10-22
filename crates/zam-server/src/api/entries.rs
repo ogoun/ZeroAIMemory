@@ -298,6 +298,7 @@ pub async fn create(
         certainty: None,
         idempotency_key: key.clone(),
         triggers: Vec::new(),
+        links: Vec::new(),
     };
     let (entry, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {

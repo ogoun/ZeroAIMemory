@@ -7,7 +7,9 @@
 //! **Создание** — `POST /spaces/{space}/entries` с `kind: "insight"` ([`create`]):
 //! - поля §7.5: `title`, `body`, `data {kind, experiment?, evidence?, …}` (`data.kind` — один
 //!   из [`INSIGHT_KINDS`]), `scope: solution|global`, `status: active|revisit`, `certainty`,
-//!   `triggers`, `tags`, `area`, `message`; плюс `force` и `supersedes_id`;
+//!   `triggers`, `tags`, `area`, `message`, `links: [{type, target}]` (явные связи графа,
+//!   §8.5: `target` — `node:<id>` | `entry:<id>` | `[[Имя]]`, в той же транзакции;
+//!   [`super::graph::insight_links`]); плюс `force` и `supersedes_id`;
 //! - `scope: global` — запись в Knowledge пользователя запроса (пространство пути проверяется
 //!   только на чтение: отзыв доступа к решению — 403 и здесь); без `scope` — по пространству
 //!   пути: решение — `solution`, Knowledge — `global`; Rules и Human — 422, если запись туда
@@ -40,18 +42,19 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use zam_core::{Id, TargetKind};
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_index::{VectorFilter, VectorScope};
 use zam_store::{
-    Certainty, DEDUP_CANDIDATES_MAX, Db, DedupCandidate, Entry, EntryKind, EntryStatus, NewEntry,
-    NewTrigger, REASON_MAX_CHARS, SpaceKind, TRIGGERS_MAX, create_entry, entry_by_idempotency_key,
-    entry_triggers, get_entry, normalize_area, retract_entry, supersede_entry, title_duplicates,
-    validate_trigger,
+    Certainty, DEDUP_CANDIDATES_MAX, Db, DedupCandidate, EdgeType, Entry, EntryKind, EntryStatus,
+    NewEntry, NewTrigger, REASON_MAX_CHARS, SpaceKind, TRIGGERS_MAX, create_entry,
+    entry_by_idempotency_key, entry_triggers, get_entry, normalize_area, retract_entry,
+    supersede_entry, title_duplicates, validate_trigger,
 };
 
 use super::entries::{
     audit_details, check_size, check_title, empty_object, idempotency_key, unprocessable,
 };
+use super::graph::insight_links;
 use super::json_body;
 use super::nodes::audit_node;
 use super::scope::{EntryScope, MemScope, Mode, entry_scope, live_entry, space_scope};
@@ -100,6 +103,8 @@ pub struct InsightReq {
     #[serde(default)]
     force: bool,
     supersedes_id: Option<String>,
+    /// Явные связи графа `[{type, target}]`.
+    links: Option<Vec<Value>>,
 }
 
 /// `data` insight: `kind` из [`INSIGHT_KINDS`]; `experiment` и `evidence`, если заданы, —
@@ -335,6 +340,7 @@ fn new_entry(
     space: Id,
     key: Option<String>,
     triggers: Vec<NewTrigger>,
+    links: Vec<(EdgeType, TargetRef)>,
 ) -> NewEntry {
     NewEntry {
         space_id: space,
@@ -348,6 +354,7 @@ fn new_entry(
         certainty: req.certainty,
         idempotency_key: key,
         triggers,
+        links,
     }
 }
 
@@ -393,6 +400,11 @@ pub async fn create(
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
     let sc = target_scope(st, p, headers, space, req.scope.as_deref()).await?;
     let triggers = check_request(st, &mut req)?;
+    let raw_links = req.links.take().unwrap_or_default();
+    let links = insight_links(
+        st, p, headers, &sc.db, sc.owner, &sc.space, sc.role, raw_links,
+    )
+    .await?;
     let attrib = attribution(p, headers, req.message.take())?;
     let key = idempotency_key(headers)?;
     let repeat = match &key {
@@ -418,7 +430,7 @@ pub async fn create(
                 "supersedes_id: insight того же пространства, что и новая запись",
             ));
         }
-        let new = new_entry(req, sc.space.id, key, triggers);
+        let new = new_entry(req, sc.space.id, key, triggers, links);
         let (n, o) = supersede_entry(&sc.db, old, new, &attrib).await?;
         st.index.notify();
         // аудит — как у POST /entries/{id}/supersede (повтор по ключу — без новой строки)
@@ -465,7 +477,7 @@ pub async fn create(
         }
         mode
     };
-    let new = new_entry(req, sc.space.id, key, triggers);
+    let new = new_entry(req, sc.space.id, key, triggers, links);
     let (e, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {
         st.index.notify();
@@ -509,6 +521,11 @@ pub async fn supersede(
         ));
     }
     let triggers = check_request(&st, &mut req)?;
+    let raw_links = req.links.take().unwrap_or_default();
+    let links = insight_links(
+        &st, &p, &headers, &sc.db, sc.owner, &sc.space, sc.role, raw_links,
+    )
+    .await?;
     let attrib = attribution(&p, &headers, req.message.take())?;
     let key = idempotency_key(&headers)?;
     let repeat = match &key {
@@ -517,7 +534,7 @@ pub async fn supersede(
             .is_some(),
         None => false,
     };
-    let new = new_entry(req, sc.space.id, key, triggers);
+    let new = new_entry(req, sc.space.id, key, triggers, links);
     let (n, o) = supersede_entry(&sc.db, sc.entry.id, new, &attrib).await?;
     st.index.notify();
     if !repeat {

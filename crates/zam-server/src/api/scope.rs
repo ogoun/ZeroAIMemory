@@ -12,7 +12,9 @@
 //! - узел по id ([`node_scope`]) — в личной базе, затем в базах владельцев решений, где у
 //!   пользователя есть запрос доступа; узел принимается, только если он в пространстве
 //!   решения (иначе 404: Rules, Human, Knowledge владельца участнику не видны);
-//! - запись журнала по id ([`entry_scope`]) — то же правило, что у узла.
+//! - запись журнала по id ([`entry_scope`]) — то же правило, что у узла;
+//! - ребро графа по id ([`edge_scope`]) — по пространству источника; видимость цели и
+//!   область графа ([`graph_spaces`]) — участнику только пространство решения.
 //!
 //! **Политика:**
 //! - `Human` по токену → 404 (существование не раскрывается) — для чтения и записи;
@@ -27,8 +29,8 @@
 use axum::http::HeaderMap;
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Access, Db, Entry, Node, SolutionInfo, SolutionRole, Space, SpaceKind, StoreError, User,
-    get_entry, get_node, get_solution, get_space, list_spaces, space_of_kind,
+    Access, Db, EdgeView, Entry, Node, SolutionInfo, SolutionRole, Space, SpaceKind, StoreError,
+    User, get_edge, get_entry, get_node, get_solution, get_space, list_spaces, space_of_kind,
 };
 
 use crate::app::AppState;
@@ -234,6 +236,16 @@ pub struct EntryScope {
     pub db: Db,
     pub space: Space,
     pub entry: Entry,
+    pub role: Role,
+}
+
+/// То же плюс ребро графа (живое; `space` — пространство источника).
+pub struct EdgeScope {
+    pub user: User,
+    pub owner: Id,
+    pub db: Db,
+    pub space: Space,
+    pub edge: EdgeView,
     pub role: Role,
 }
 
@@ -587,6 +599,57 @@ pub async fn entry_scope(
         entry: l.item,
         role: l.role,
     })
+}
+
+/// Ребро графа по id с проверкой доступа к пространству источника (правило [`node_scope`]).
+/// Видимость цели ребра проверяет обработчик ([`graph_spaces`]).
+pub async fn edge_scope(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    raw_id: &str,
+    mode: Mode,
+) -> Result<EdgeScope, ApiError> {
+    let id = super::parse_id(raw_id)?;
+    let l = locate(
+        st,
+        p,
+        headers,
+        id,
+        mode,
+        async |db: &Db, id| get_edge(db, id).await?.ok_or(StoreError::NotFound),
+        |e: &EdgeView| e.src_space,
+    )
+    .await?;
+    Ok(EdgeScope {
+        user: l.user,
+        owner: l.owner,
+        db: l.db,
+        space: l.space,
+        edge: l.item,
+        role: l.role,
+    })
+}
+
+/// Область графа запроса в базе области (`role` из [`MemScope`]/[`NodeScope`]): участнику
+/// чужого решения — только пространство решения `space` (Knowledge, Rules, Human, другие
+/// решения владельца ему не видны, §11.6); иначе — пространства базы, видимые принципалу
+/// (по токену — без Human).
+pub async fn graph_spaces(
+    p: &Principal,
+    db: &Db,
+    space: &Space,
+    role: Role,
+) -> Result<Vec<Id>, ApiError> {
+    if let Role::Member(_) = role {
+        return Ok(vec![space.id]);
+    }
+    Ok(list_spaces(db)
+        .await?
+        .into_iter()
+        .filter(|s| token_can_read(p, s))
+        .map(|s| s.id)
+        .collect())
 }
 
 /// Читаемые области пользователя `user`: личная база (пространства, видимые принципалу)

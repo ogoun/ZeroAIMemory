@@ -6,7 +6,8 @@
 //! потомки, удалённые раньше отдельно, остаются в корзине. Поддерево строится по
 //! `parent_id` (индекс `nodes_parent`), а не по префиксу пути: удалённые узлы
 //! могут делить путь с живыми. Каждая операция — одна транзакция писателя и ставит
-//! задания outbox (§8.1): удаление — `delete`, восстановление и перенос — `upsert`.
+//! задания outbox (§8.1): удаление — `delete`, восстановление и перенос — `upsert`. В той же
+//! транзакции перепроверяются выведенные рёбра графа пространства (`crate::graph::tree_changed`).
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -58,6 +59,9 @@ pub async fn delete_node(db: &Db, id: Id, author: AuthorKind) -> Result<u64, Sto
                 enqueue(tx, nid, rev, JobOp::Delete, PRIORITY_WRITE, &now)?;
             }
         }
+        // ссылки на удалённые заметки разрешаются заново (другая с тем же именем или битая);
+        // рёбра самих удалённых остаются, но не видны, пока источник в корзине
+        crate::graph::tree_changed(tx, node.space_id, &ids, &[])?;
         Ok(ids.len() as u64)
     })
     .await
@@ -110,6 +114,7 @@ pub async fn restore_node(db: &Db, id: Id, author: AuthorKind) -> Result<Node, S
                 &now,
             )?;
         }
+        crate::graph::tree_changed(tx, node.space_id, &restored_ids, &[])?;
         load_node(tx, id)
     })
     .await
@@ -172,6 +177,14 @@ pub async fn move_node(
             .collect();
         ensure_no_axiom(tx, &moved, author)?;
         ensure_free(tx, node.space_id, &new_path)?;
+        // прежние имена и пути: ссылки на них разрешаются заново
+        let old_keys: Vec<(String, String)> =
+            std::iter::once((node.name.clone(), node.path.clone()))
+                .chain(descendants.iter().map(|(_, p)| {
+                    let name = p.rsplit_once('/').map_or(p.as_str(), |(_, n)| n);
+                    (name.to_string(), p.clone())
+                }))
+                .collect();
         let now = fmt_ts(Timestamp::now());
         let parent = ensure_ancestors(tx, node.space_id, &new_path, &now)?;
 
@@ -199,6 +212,12 @@ pub async fn move_node(
             refresh_prefixes(tx, &space, *nid)?;
             requeue_moved(tx, *nid, &now)?;
         }
+        // граф: относительные ссылки перенесённых заметок — от нового места; ссылки на
+        // старые и новые имена и пути пространства — заново
+        for &nid in &moved {
+            crate::graph::rebuild_moved(tx, nid, &now)?;
+        }
+        crate::graph::tree_changed(tx, node.space_id, &moved, &old_keys)?;
         load_node(tx, id)
     })
     .await
