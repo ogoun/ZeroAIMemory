@@ -8,10 +8,11 @@ use serde_json::json;
 use zam_core::{Id, TargetKind};
 use zam_store::{
     Attribution, AuthorKind, Certainty, DataDir, Db, EntryFilter, EntryKind, EntryPatch,
-    EntryStatus, FtsQuery, IndexState, JobOp, JobOutcome, NewEntry, SpaceKind, StoreError,
-    TargetFilter, USER_MIGRATIONS, UserDbs, claim_jobs, complete_job, create_entry, delete_entry,
-    entry_chunks_for_index, entry_revisions, get_entry, list_entries, list_spaces, normalize_title,
-    restore_entry, retract_entry, search_fts, supersede_entry, update_entry,
+    EntryStatus, FtsQuery, IndexState, JobOp, JobOutcome, NewEntry, NewTrigger, SpaceKind,
+    StoreError, TargetFilter, TriggerKind, USER_MIGRATIONS, UserDbs, active_triggers, claim_jobs,
+    complete_job, create_entry, delete_entry, entry_chunks_for_index, entry_revisions,
+    entry_triggers, get_entry, list_entries, list_spaces, normalize_title, restore_entry,
+    retract_entry, search_fts, set_triggers, supersede_entry, title_duplicates, update_entry,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -53,6 +54,7 @@ fn insight(space: Id, title: &str, body: &str) -> NewEntry {
         status: None,
         certainty: Some(Certainty::Hypothesis),
         idempotency_key: None,
+        triggers: Vec::new(),
     }
 }
 
@@ -68,6 +70,7 @@ fn changelog(space: Id, title: &str) -> NewEntry {
         status: None,
         certainty: None,
         idempotency_key: None,
+        triggers: Vec::new(),
     }
 }
 
@@ -1048,4 +1051,223 @@ async fn migration_v7_to_v8_keeps_data() {
         })
         .await;
     assert!(bad.is_err());
+}
+
+/// Число строк таблицы `table`.
+async fn count(db: &Db, table: &'static str) -> i64 {
+    db.read(move |c| Ok(c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?))
+        .await
+        .unwrap()
+}
+
+fn trig(kind: TriggerKind, pattern: &str) -> NewTrigger {
+    NewTrigger {
+        kind,
+        pattern: pattern.into(),
+        tools: None,
+    }
+}
+
+/// Счётчики таблиц, которые пишет создание или замещение записи.
+async fn footprint(db: &Db) -> [i64; 5] {
+    [
+        count(db, "entries").await,
+        count(db, "entry_revisions").await,
+        count(db, "chunks").await,
+        count(db, "index_jobs").await,
+        count(db, "triggers").await,
+    ]
+}
+
+#[tokio::test]
+async fn supersede_rolls_back_after_partial_write() {
+    let (db, k, _) = setup("supersede-rollback").await;
+    let (old, _) = create_entry(&db, insight(k, "Старый вывод", "Текст."), &agent())
+        .await
+        .unwrap();
+    let before = footprint(&db).await;
+    // сбой уже после вставки новой записи (ревизия, чанки, задание, триггер) и
+    // `superseded_by_id` у старой: смену статуса старой отклоняет триггер SQLite
+    db.write(|tx| {
+        tx.execute_batch(
+            "CREATE TRIGGER fail_supersede BEFORE UPDATE OF status ON entries
+             WHEN NEW.status = 'superseded' BEGIN SELECT RAISE(ABORT, 'сбой теста'); END;",
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut new = insight(k, "Новый вывод", "Исправленный текст.");
+    new.triggers = vec![trig(TriggerKind::Keyword, "вывод")];
+    assert!(
+        supersede_entry(&db, old.id, new.clone(), &agent())
+            .await
+            .is_err()
+    );
+    // ничего не записано: старая как была, новой нет
+    assert_eq!(get_entry(&db, old.id).await.unwrap(), old);
+    assert_eq!(entry_revisions(&db, old.id).await.unwrap().len(), 1);
+    assert_eq!(footprint(&db).await, before);
+    // без сбоя замещение проходит
+    db.write(|tx| {
+        tx.execute_batch("DROP TRIGGER fail_supersede")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (n, o) = supersede_entry(&db, old.id, new, &agent()).await.unwrap();
+    assert_eq!(o.status, Some(EntryStatus::Superseded));
+    assert_eq!(entry_triggers(&db, n.id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn triggers_stored_replaced_and_active_only() {
+    let (db, k, _) = setup("triggers").await;
+    let mut e = insight(k, "LF в скриптах", "Текст.");
+    e.triggers = vec![
+        NewTrigger {
+            tools: Some(vec![" Write ".into(), "Edit".into()]),
+            ..trig(TriggerKind::FileGlob, "**/*.sh")
+        },
+        trig(TriggerKind::ErrorRegex, r"\^M|bad interpreter"),
+    ];
+    let (a, _) = create_entry(&db, e, &agent()).await.unwrap();
+    let ts = entry_triggers(&db, a.id).await.unwrap();
+    assert_eq!(
+        ts.iter()
+            .map(|t| (t.kind, t.pattern.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (TriggerKind::FileGlob, "**/*.sh"),
+            (TriggerKind::ErrorRegex, r"\^M|bad interpreter")
+        ]
+    );
+    assert_eq!(
+        ts[0].tools,
+        Some(vec!["Write".to_string(), "Edit".to_string()])
+    );
+    let act = active_triggers(&db, &[k]).await.unwrap();
+    assert_eq!(act.len(), 2);
+    assert_eq!(act[0].entry_id, a.id);
+    assert_eq!(act[0].title, "LF в скриптах");
+    assert_eq!(act[0].insight_kind, "gotcha");
+    assert_eq!(act[0].certainty, Some(Certainty::Hypothesis));
+    assert_eq!(act[0].space_id, k);
+    // неверный триггер — BadInput с индексом, набор не меняется
+    let bad = set_triggers(
+        &db,
+        a.id,
+        vec![
+            trig(TriggerKind::Keyword, "ok"),
+            trig(TriggerKind::CommandRegex, "("),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(&bad, Err(StoreError::BadInput(m)) if m.contains("triggers[1]")),
+        "{bad:?}"
+    );
+    assert_eq!(entry_triggers(&db, a.id).await.unwrap().len(), 2);
+    // замена набора целиком
+    set_triggers(&db, a.id, vec![trig(TriggerKind::Keyword, "crlf")])
+        .await
+        .unwrap();
+    let ts = entry_triggers(&db, a.id).await.unwrap();
+    assert_eq!(ts.len(), 1);
+    assert_eq!(ts[0].pattern, "crlf");
+    // правкой — тоже, в той же транзакции; ревизии триггеры не создают
+    let p = EntryPatch {
+        triggers: Some(vec![trig(TriggerKind::Keyword, "lf")]),
+        ..EntryPatch::default()
+    };
+    let same = update_entry(&db, a.id, None, p, &agent()).await.unwrap();
+    assert_eq!(same.rev, a.rev);
+    assert_eq!(entry_triggers(&db, a.id).await.unwrap()[0].pattern, "lf");
+    // revisit остаётся в выдаче, superseded, retracted и удалённые — нет
+    let with = |title: &str, kw: &str, status: Option<EntryStatus>| NewEntry {
+        status,
+        triggers: vec![trig(TriggerKind::Keyword, kw)],
+        ..insight(k, title, "")
+    };
+    let (b, _) = create_entry(&db, with("Б", "b", Some(EntryStatus::Revisit)), &agent())
+        .await
+        .unwrap();
+    let (c, _) = create_entry(&db, with("В", "c", None), &agent())
+        .await
+        .unwrap();
+    let (d, _) = create_entry(&db, with("Г", "d", None), &agent())
+        .await
+        .unwrap();
+    let ids = |v: Vec<zam_store::TriggerRow>| {
+        let mut v: Vec<Id> = v.into_iter().map(|t| t.entry_id).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let mut want = vec![a.id, b.id, c.id, d.id];
+    want.sort();
+    assert_eq!(ids(active_triggers(&db, &[k]).await.unwrap()), want);
+    retract_entry(&db, c.id, "неверно", &agent()).await.unwrap();
+    delete_entry(&db, d.id, &agent()).await.unwrap();
+    supersede_entry(&db, a.id, insight(k, "Новая", ""), &agent())
+        .await
+        .unwrap();
+    assert_eq!(ids(active_triggers(&db, &[k]).await.unwrap()), vec![b.id]);
+    // чужое пространство и пустой список — пусто
+    assert!(active_triggers(&db, &[Id::new()]).await.unwrap().is_empty());
+    assert!(active_triggers(&db, &[]).await.unwrap().is_empty());
+    // триггеры только у insight
+    let mut ch = changelog(k, "ch");
+    ch.triggers = vec![trig(TriggerKind::Keyword, "x")];
+    assert!(matches!(
+        create_entry(&db, ch, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+    let (ch, _) = create_entry(&db, changelog(k, "ch"), &agent())
+        .await
+        .unwrap();
+    assert!(matches!(
+        set_triggers(&db, ch.id, vec![]).await,
+        Err(StoreError::BadInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn title_duplicates_same_area_and_active_only() {
+    let (db, k, _) = setup("title-dups").await;
+    let mut web = agent();
+    web.area = Some("web".into());
+    let (a, _) = create_entry(&db, insight(k, "Bash-скрипты: LF!", "x"), &web)
+        .await
+        .unwrap();
+    create_entry(&db, insight(k, "bash скрипты lf", "без области"), &agent())
+        .await
+        .unwrap();
+    let got = title_duplicates(&db, k, "  BASH скрипты — LF ", Some(" web "))
+        .await
+        .unwrap();
+    assert_eq!(got.iter().map(|c| c.id).collect::<Vec<_>>(), vec![a.id]);
+    assert_eq!((got[0].reason, got[0].score), ("title", None));
+    assert_eq!(got[0].status, EntryStatus::Active);
+    // без области — только запись без области; другая область — ничего
+    let dups = |area: Option<&'static str>| {
+        let db = db.clone();
+        async move {
+            title_duplicates(&db, k, "bash скрипты lf", area)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!(dups(None).await, 1);
+    assert_eq!(dups(Some("api")).await, 0);
+    // отозванная — не дубль; заголовок без букв и цифр дублей не имеет
+    retract_entry(&db, a.id, "ошибка", &agent()).await.unwrap();
+    assert_eq!(dups(Some("web")).await, 0);
+    assert!(
+        title_duplicates(&db, k, "—", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

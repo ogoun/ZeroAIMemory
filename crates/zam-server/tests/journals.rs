@@ -292,11 +292,11 @@ async fn changelog_kind_validated_422() {
     // дата по умолчанию — сегодня
     let r = w.release("1.0.0", "").await;
     assert_eq!(r["data"]["date"].as_str().unwrap().len(), 10);
-    // insight через /entries не создаётся
+    // insight через /entries — со своими правилами data (вид инсайта, а не changelog)
     let r = w
         .post(
             &w.a_tok,
-            json!({"kind": "insight", "title": "t", "data": {"kind": "gotcha"}}),
+            json!({"kind": "insight", "title": "t", "data": {"kind": "fix"}}),
             None,
         )
         .await;
@@ -599,6 +599,7 @@ async fn member_cannot_read_owner_knowledge_entry_404() {
             status: None,
             certainty: None,
             idempotency_key: None,
+            triggers: Vec::new(),
         },
         &Attribution::new(AuthorKind::Human),
     )

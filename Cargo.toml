@@ -63,6 +63,10 @@ proptest = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 # хеш текста и id чанков (§6.3)
 blake3 = "1"
+# M3: проверка триггеров инсайтов (§10.3): regex без обратных ссылок (ReDoS невозможен) —
+# MIT OR Apache-2.0, уже в дереве; globset — маски file_glob, Unlicense OR MIT (берём MIT)
+regex = "1"
+globset = { version = "0.4", default-features = false }
 # xtask eval: Snowball-стемминг ru/en для проверки «перефраз без общих слов» (не в продукте);
 # MIT/BSD-3-Clause, без unsafe, зависимости serde/serde_derive — уже в дереве
 rust-stemmers = "=1.2.0"

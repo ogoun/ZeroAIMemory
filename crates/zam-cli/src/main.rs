@@ -113,10 +113,15 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Журналы решения: запись в Changelog
+    /// Журналы решения: запись в Changelog или Insights
     Log {
         #[command(subcommand)]
         cmd: LogCmd,
+    },
+    /// Insights: лента, карточка, замещение, отзыв, пересмотр, дописывание
+    Insight {
+        #[command(subcommand)]
+        cmd: InsightCmd,
     },
     /// Релизы решения: добавить, сравнить
     Release {
@@ -154,6 +159,136 @@ enum LogCmd {
         /// Ключ идемпотентности: повтор с тем же ключом не создаёт вторую запись
         #[arg(long)]
         key: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Открытие, провал, эксперимент (текст — из --body-file или stdin); похожий insight —
+    /// код 4 со списком кандидатов
+    Insight {
+        /// Вид: gotcha, failure, discovery, decision, experiment, pattern
+        #[arg(long, value_parser = ["gotcha", "failure", "discovery", "decision", "experiment", "pattern"])]
+        kind: String,
+        /// Заголовок
+        #[arg(long)]
+        title: String,
+        /// Файл с текстом (иначе stdin)
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Эпистемический статус: theorem (с --evidence-file) или hypothesis
+        #[arg(long, value_parser = ["theorem", "hypothesis"])]
+        certainty: Option<String>,
+        /// JSON-файл доказательства {checked, method, result} → data.evidence
+        #[arg(long)]
+        evidence_file: Option<PathBuf>,
+        /// Триггер вспоминания ВИД:ШАБЛОН: file_glob:**/*.sh, command_regex:…, error_regex:…,
+        /// keyword:… (можно повторять)
+        #[arg(long = "trigger")]
+        triggers: Vec<String>,
+        /// Тег (можно повторять)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Область (монорепозиторий)
+        #[arg(long)]
+        area: Option<String>,
+        /// Ключ идемпотентности
+        #[arg(long)]
+        key: Option<String>,
+        /// solution (по умолчанию) или global — в Knowledge, для всех проектов
+        #[arg(long, value_parser = ["solution", "global"])]
+        scope: Option<String>,
+        /// Записать, даже если похожий insight уже есть
+        #[arg(long)]
+        force: bool,
+        /// Заменить существующий insight (id) этой записью
+        #[arg(long)]
+        supersedes: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+#[derive(Subcommand)]
+enum InsightCmd {
+    /// Лента insight решения (или Knowledge с --global)
+    List {
+        /// Статусы через запятую: active, revisit, superseded, retracted
+        #[arg(long)]
+        status: Option<String>,
+        /// Knowledge вместо решения
+        #[arg(long)]
+        global: bool,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=200))]
+        limit: Option<u32>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Карточка insight: статус, связи, триггеры, текст
+    Show {
+        id: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Заменить insight новой записью (старая — superseded, ничего не удаляется)
+    Supersede {
+        id: String,
+        /// Вид (по умолчанию — как у замещаемой)
+        #[arg(long, value_parser = ["gotcha", "failure", "discovery", "decision", "experiment", "pattern"])]
+        kind: Option<String>,
+        /// Заголовок
+        #[arg(long)]
+        title: String,
+        /// Файл с текстом (иначе stdin)
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Эпистемический статус: theorem (с --evidence-file) или hypothesis
+        #[arg(long, value_parser = ["theorem", "hypothesis"])]
+        certainty: Option<String>,
+        /// JSON-файл доказательства {checked, method, result} → data.evidence
+        #[arg(long)]
+        evidence_file: Option<PathBuf>,
+        /// Триггер вспоминания ВИД:ШАБЛОН: file_glob:**/*.sh, command_regex:…, error_regex:…,
+        /// keyword:… (можно повторять)
+        #[arg(long = "trigger")]
+        triggers: Vec<String>,
+        /// Тег (можно повторять)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Область (монорепозиторий)
+        #[arg(long)]
+        area: Option<String>,
+        /// Ключ идемпотентности
+        #[arg(long)]
+        key: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Отозвать insight с причиной (ничего не удаляется)
+    Retract {
+        id: String,
+        #[arg(long)]
+        reason: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Пометить «пересмотреть при новых идеях»
+    Revisit {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Дописать к тексту insight (из --body-file или stdin)
+    Append {
+        id: String,
+        #[arg(long)]
+        body_file: Option<PathBuf>,
         #[command(flatten)]
         common: Common,
     },
@@ -300,6 +435,63 @@ fn main() -> ExitCode {
     }
 }
 
+fn insight(c: InsightCmd) -> Result<(), CliError> {
+    use cmd::insight as i;
+    match c {
+        InsightCmd::List {
+            status,
+            global,
+            solution,
+            limit,
+            common,
+        } => i::list(
+            &cmd::connect(&common)?,
+            status.as_deref(),
+            global,
+            solution.as_deref(),
+            limit,
+        ),
+        InsightCmd::Show { id, common } => i::show(&cmd::connect(&common)?, &id),
+        InsightCmd::Supersede {
+            id,
+            kind,
+            title,
+            body_file,
+            certainty,
+            evidence_file,
+            triggers,
+            tags,
+            area,
+            key,
+            common,
+        } => {
+            let f = i::Fields {
+                kind: kind.as_deref(),
+                title: &title,
+                body_file: body_file.as_deref(),
+                certainty: certainty.as_deref(),
+                evidence_file: evidence_file.as_deref(),
+                triggers: &triggers,
+                tags: &tags,
+                area: area.as_deref(),
+                key: key.as_deref(),
+            };
+            i::supersede(&cmd::connect(&common)?, &id, &f)
+        }
+        InsightCmd::Retract { id, reason, common } => {
+            i::retract(&cmd::connect(&common)?, &id, &reason)
+        }
+        InsightCmd::Revisit { id, reason, common } => {
+            i::revisit(&cmd::connect(&common)?, &id, reason.as_deref())
+        }
+        InsightCmd::Append {
+            id,
+            body_file,
+            common,
+        } => i::append(&cmd::connect(&common)?, &id, body_file.as_deref()),
+    }
+}
+
 fn dispatch(c: Cmd) -> Result<(), CliError> {
     match c {
         Cmd::Status { .. } => unreachable!("обработан в main"),
@@ -396,6 +588,45 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             };
             cmd::log::changelog(&cmd::connect(&common)?, &o)
         }
+        Cmd::Log {
+            cmd:
+                LogCmd::Insight {
+                    kind,
+                    title,
+                    body_file,
+                    certainty,
+                    evidence_file,
+                    triggers,
+                    tags,
+                    area,
+                    key,
+                    scope,
+                    force,
+                    supersedes,
+                    solution,
+                    common,
+                },
+        } => {
+            let o = cmd::insight::Log {
+                fields: cmd::insight::Fields {
+                    kind: Some(&kind),
+                    title: &title,
+                    body_file: body_file.as_deref(),
+                    certainty: certainty.as_deref(),
+                    evidence_file: evidence_file.as_deref(),
+                    triggers: &triggers,
+                    tags: &tags,
+                    area: area.as_deref(),
+                    key: key.as_deref(),
+                },
+                scope: scope.as_deref(),
+                force,
+                supersedes: supersedes.as_deref(),
+                solution: solution.as_deref(),
+            };
+            cmd::insight::log(&cmd::connect(&common)?, &o)
+        }
+        Cmd::Insight { cmd } => insight(cmd),
         Cmd::Release {
             cmd:
                 ReleaseCmd::Add {

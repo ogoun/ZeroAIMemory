@@ -200,6 +200,15 @@ impl Client {
         )
     }
 
+    /// PATCH JSON.
+    pub fn patch_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
+        let rb = self.prepare(self.agent.patch(&self.url(path)));
+        self.check(
+            rb.content_type("application/json")
+                .send(body.to_string().as_bytes()),
+        )
+    }
+
     /// PUT с `If-Match: "<rev>"`.
     pub fn put_json(
         &self,

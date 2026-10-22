@@ -1,11 +1,13 @@
-//! Чтение записей журналов: запись по id, лента пространства с курсором, ревизии.
+//! Чтение записей журналов: запись по id, лента пространства с курсором, ревизии,
+//! кандидаты в дубли insight по заголовку.
 
 use rusqlite::{OptionalExtension, params};
+use serde::Serialize;
 use zam_core::Id;
 
 use super::{
-    AuthorView, ENTRY_COLS, Entry, EntryFilter, EntryRevision, LIST_LIMIT_MAX, entry_row, json_col,
-    load_entry,
+    AuthorView, Certainty, ENTRY_COLS, Entry, EntryFilter, EntryRevision, EntryStatus,
+    LIST_LIMIT_MAX, entry_row, json_col, load_entry, normalize_area, normalize_title,
 };
 use crate::time::{fmt_ts, ts_at};
 use crate::{Db, StoreError};
@@ -176,6 +178,61 @@ pub async fn find_release_by_version(
         ))?
         .query_row(params![space_id, version], entry_row)
         .optional()?)
+    })
+    .await
+}
+
+/// Предел кандидатов в дубли в ответе 409 (§7.5).
+pub const DEDUP_CANDIDATES_MAX: usize = 5;
+
+/// Кандидат в дубли нового insight (§7.5): действующая запись той же области.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DedupCandidate {
+    pub id: Id,
+    pub title: String,
+    pub status: EntryStatus,
+    pub certainty: Option<Certainty>,
+    /// `title` — совпал нормализованный заголовок, `vector` — косинус выше порога.
+    pub reason: &'static str,
+    /// Косинус у `vector`.
+    pub score: Option<f32>,
+}
+
+/// Живые insight пространства `space_id` со статусом `active` или `revisit`, той же области
+/// (`area` после обрезки; пустая — без области, и тогда совпадают только записи без
+/// области) и с тем же [`normalize_title`]; не больше [`DEDUP_CANDIDATES_MAX`], новые
+/// первыми. Заголовок без букв и цифр (нормализуется в пустую строку) дублей не имеет.
+pub async fn title_duplicates(
+    db: &Db,
+    space_id: Id,
+    title: &str,
+    area: Option<&str>,
+) -> Result<Vec<DedupCandidate>, StoreError> {
+    let norm = normalize_title(title);
+    if norm.is_empty() {
+        return Ok(Vec::new());
+    }
+    let area = normalize_area(area);
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT e.id, e.title, e.status, e.certainty FROM entries e
+             WHERE e.space_id = ?1 AND e.kind = 'insight' AND e.title_norm = ?2
+               AND e.deleted_at IS NULL AND e.status IN ('active', 'revisit')
+               AND e.area IS ?3
+             ORDER BY e.created_at DESC, e.id DESC
+             LIMIT {DEDUP_CANDIDATES_MAX}"
+        ))?;
+        let rows = st.query_map(params![space_id, norm, area], |r| {
+            Ok(DedupCandidate {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                status: r.get(2)?,
+                certainty: r.get(3)?,
+                reason: "title",
+                score: None,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
 }

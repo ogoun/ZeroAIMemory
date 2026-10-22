@@ -83,6 +83,7 @@ mod tests {
             text: String::new(),
             index_state: "indexed".into(),
             entry: None,
+            area: None,
         }
     }
 

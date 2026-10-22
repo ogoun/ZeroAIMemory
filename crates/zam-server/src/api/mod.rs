@@ -4,6 +4,7 @@ pub mod blobs;
 pub mod entries;
 pub mod health;
 pub mod index;
+pub mod insights;
 pub mod nodes;
 pub mod releases;
 pub mod render;
@@ -11,6 +12,7 @@ pub mod scope;
 pub mod search;
 pub mod solutions;
 pub mod spaces;
+pub mod triggers;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -121,6 +123,11 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
                 .layer(note_limit),
         )
         .route("/api/v1/entries/{id}/restore", post(entries::restore))
+        .route(
+            "/api/v1/entries/{id}/supersede",
+            post(insights::supersede).layer(note_limit),
+        )
+        .route("/api/v1/entries/{id}/retract", post(insights::retract))
         .route("/api/v1/entries/{id}/revisions", get(entries::revisions))
         .route("/api/v1/releases/{id}/compare", get(releases::compare))
         .route(
@@ -134,6 +141,7 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         )
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
         .route("/api/v1/search", post(search::search))
+        .route("/api/v1/triggers", get(triggers::list))
         .route("/api/v1/index/status", get(index::status))
         .route("/api/v1/admin/reindex", post(index::reindex))
         .route(

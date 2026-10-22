@@ -48,6 +48,8 @@ pub struct ScopeReq {
     pub path_prefix: Option<String>,
     pub spaces: Option<Vec<String>>,
     pub include_human: bool,
+    /// Строгий фильтр области (§9.1): только узлы и записи с этой `area`.
+    pub area: Option<String>,
 }
 
 /// Цель поиска: база и её пространства в области запроса (непустой список).

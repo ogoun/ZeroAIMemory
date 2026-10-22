@@ -56,7 +56,7 @@ pub fn attribution(
 }
 
 /// Значение заголовка атрибуции: UTF-8, ≤ 128 символов, только печатные.
-fn header_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ApiError> {
+pub fn header_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ApiError> {
     let Some(v) = headers.get(name) else {
         return Ok(None);
     };

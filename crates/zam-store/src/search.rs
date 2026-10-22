@@ -71,8 +71,8 @@ const SNIPPET_TOKENS: i64 = 16;
 /// Длина сниппета trigram-хита в символах (без многоточий).
 const SNIPPET_CHARS: usize = 160;
 
-/// Виды и статусы целей поиска. По умолчанию — всё: заметки, записи всех видов, любые
-/// статусы.
+/// Виды, статусы и область целей поиска. По умолчанию — всё: заметки, записи всех видов,
+/// любые статусы и области.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetFilter {
     /// `note` (заметки) и виды записей (`insight`, `changelog`, `release`); пусто — все.
@@ -80,6 +80,9 @@ pub struct TargetFilter {
     pub kinds: Vec<String>,
     /// Разрешённые статусы insight; пусто — любые. Записи без статуса и узлы проходят.
     pub statuses: Vec<String>,
+    /// Строгий фильтр области (`scope.area`, §9.1): только узлы и записи с `area`, равной
+    /// значению; `None` — любые (и без области).
+    pub area: Option<String>,
 }
 
 /// Виды записей журналов.
@@ -93,6 +96,8 @@ struct TargetArgs {
     kinds: String,
     /// JSON-массив разрешённых статусов или `None` (любые).
     statuses: Option<String>,
+    /// Область или `None` (любые).
+    area: Option<String>,
 }
 
 impl TargetFilter {
@@ -107,6 +112,7 @@ impl TargetFilter {
             kinds: serde_json::Value::from(kinds).to_string(),
             statuses: (!self.statuses.is_empty())
                 .then(|| serde_json::Value::from(self.statuses.clone()).to_string()),
+            area: self.area.clone(),
         }
     }
 }
@@ -159,6 +165,8 @@ pub struct FtsHit {
     pub index_state: String,
     /// Поля записи журнала; `None` — чанк заметки.
     pub entry: Option<EntryHit>,
+    /// Область узла или записи (`nodes.area` / `entries.area`).
+    pub area: Option<String>,
 }
 
 /// Поля записи журнала в хите поиска.
@@ -202,7 +210,7 @@ const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.spac
     coalesce(n.path, ''), c.heading_path, c.rev, coalesce(n.updated_at, e.updated_at), c.text,
     c.level, c.token_count, coalesce(n.index_state, e.index_state), e.kind, e.status,
     CASE WHEN json_type(e.data, '$.kind') = 'text' THEN json_extract(e.data, '$.kind') END,
-    e.certainty, e.title";
+    e.certainty, e.title, coalesce(n.area, e.area)";
 
 /// Хит по колонкам [`HIT_COLS`], начиная с колонки `o`.
 fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
@@ -233,6 +241,7 @@ fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
         text: r.get(o + 8)?,
         index_state: r.get(o + 11)?,
         entry,
+        area: r.get(o + 17)?,
     })
 }
 
@@ -354,21 +363,23 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
 
 /// Условие области для `chunks c` с [`TARGET_JOIN`]: `?2` — префикс пути или NULL,
 /// пространства — с `?3`, за ними [`TargetArgs`]: «узлы проходят», JSON видов записей,
-/// JSON статусов или NULL (см. [`scope_args`]). Префикс сравнивается через substr, а не
+/// JSON статусов или NULL, область или NULL (см. [`scope_args`]). Префикс сравнивается через substr, а не
 /// LIKE: LIKE в SQLite нечувствителен к регистру ASCII и требует экранирования `%` и `_`.
 /// У записи пути нет: при префиксе она не проходит.
 fn scope_sql(n_spaces: usize) -> String {
     let sp = placeholders(3, n_spaces);
-    let (notes, kinds, statuses) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces);
+    let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
     format!(
         "((c.node_id IS NOT NULL AND ?{notes} AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
-           AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/'))
+           AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
+           AND (?{area} IS NULL OR n.area = ?{area}))
           OR (c.entry_id IS NOT NULL AND ?2 IS NULL AND e.deleted_at IS NULL
            AND e.space_id IN ({sp})
            AND e.kind IN (SELECT value FROM json_each(?{kinds}))
            AND (e.status IS NULL OR ?{statuses} IS NULL
-                OR e.status IN (SELECT value FROM json_each(?{statuses})))))"
+                OR e.status IN (SELECT value FROM json_each(?{statuses})))
+           AND (?{area} IS NULL OR e.area = ?{area})))"
     )
 }
 
@@ -384,6 +395,7 @@ fn scope_args<'a>(
     args.push(&t.notes);
     args.push(&t.kinds);
     args.push(&t.statuses);
+    args.push(&t.area);
     args
 }
 

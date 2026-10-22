@@ -1,4 +1,4 @@
-//! Записи журналов решения (§7.2–7.4, §12): Changelog и Releases.
+//! Записи журналов решения (§7.2–7.5, §12): Changelog, Releases и общие операции записей.
 //!
 //! - `GET/POST /spaces/{space}/entries` — лента и создание (`Idempotency-Key`: 201, повтор —
 //!   200; ключ действует в границах автора, расхождение запроса → 422
@@ -6,8 +6,12 @@
 //! - `GET/PATCH/DELETE /entries/{id}` (`If-Match: <rev>` необязателен, расхождение → 409),
 //!   `POST /entries/{id}/restore`, `GET /entries/{id}/revisions`.
 //!
-//! Changelog и release создаются только в пространстве решения (иначе 422); insight имеет
-//! собственные правила (`certainty`, замещение, отзыв) и через этот маршрут не создаётся.
+//! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
+//! уходит в [`super::insights::create`] (дедупликация, `scope`, триггеры, замещение).
+//! У insight `GET`/`PATCH` отдают и `triggers`; `PATCH` принимает `status: active | revisit`
+//! (из `superseded`/`retracted` и в них — 422 **[решение исполнителя]**: замещение и отзыв —
+//! отдельные операции, возврата нет) и `triggers` (набор заменяется целиком, ошибка — 422
+//! `triggers[i]: …`).
 //! Доступ — как у узлов: участник общего решения работает в базе владельца только с
 //! записями пространства решения, автор записи — он сам. В логи и аудит текст записей не
 //! попадает.
@@ -26,6 +30,7 @@ use zam_store::{
     restore_entry, update_entry,
 };
 
+use super::insights::{entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
 use super::scope::{EntryScope, Mode, entry_scope, live_entry, space_scope};
 use super::{json_body, query};
@@ -189,7 +194,7 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
     }
 }
 
-fn check_size(st: &AppState, body: &str) -> Result<(), ApiError> {
+pub(crate) fn check_size(st: &AppState, body: &str) -> Result<(), ApiError> {
     let max = st.cfg.limits.note_max_bytes;
     if body.len() > max {
         return Err(ApiError::PayloadTooLarge(format!(
@@ -201,7 +206,7 @@ fn check_size(st: &AppState, body: &str) -> Result<(), ApiError> {
 }
 
 /// Заголовок: непустой, до 500 символов — иначе 422 (как прочие ошибки проверки).
-fn check_title(t: &str) -> Result<(), ApiError> {
+pub(crate) fn check_title(t: &str) -> Result<(), ApiError> {
     let t = t.trim();
     if t.is_empty() || t.chars().count() > zam_store::TITLE_MAX_CHARS {
         return Err(unprocessable(format!(
@@ -232,7 +237,7 @@ fn empty_object() -> Value {
 }
 
 /// `Idempotency-Key` из заголовка: UTF-8; пустой равен отсутствию.
-fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     let Some(v) = headers.get("idempotency-key") else {
         return Ok(None);
     };
@@ -243,14 +248,20 @@ fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
 }
 
 /// `POST /spaces/{space}/entries` → 201 `Entry`; повтор с тем же `Idempotency-Key` — 200.
+/// `kind: insight` — [`super::insights::create`].
 pub async fn create(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
     Path(space): Path<String>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<(StatusCode, Json<Entry>), ApiError> {
-    let req: Create = json_body(body)?;
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let raw: Value = json_body(body)?;
+    if raw.get("kind").and_then(Value::as_str) == Some(EntryKind::Insight.as_str()) {
+        return super::insights::create(&st, &p, &headers, &space, raw).await;
+    }
+    let req: Create = serde_json::from_value(raw)
+        .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
     let sc = space_scope(&st, &p, &headers, &space, Mode::Write).await?;
     if sc.space.kind != SpaceKind::Solution {
         return Err(unprocessable(
@@ -284,6 +295,7 @@ pub async fn create(
         status: None,
         certainty: None,
         idempotency_key: key.clone(),
+        triggers: Vec::new(),
     };
     let (entry, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {
@@ -294,7 +306,7 @@ pub async fn create(
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(entry)))
+    Ok((status, Json(json!(entry))))
 }
 
 #[derive(Deserialize)]
@@ -382,16 +394,16 @@ pub async fn list(
     Ok(Json(json!({ "items": items, "next_cursor": next })))
 }
 
-/// `GET /entries/{id}` → `Entry`.
+/// `GET /entries/{id}` → `Entry` (у insight — с `triggers`).
 pub async fn get(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<Entry>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
-    Ok(Json(sc.entry))
+    Ok(Json(entry_json(&sc.db, &sc.entry).await?))
 }
 
 /// `Some(None)` для `null`, `Some(Some(s))` для строки, `None` для отсутствующего поля.
@@ -409,8 +421,34 @@ pub struct Patch {
     tags: Option<Vec<String>>,
     #[serde(default, deserialize_with = "double_option")]
     area: Option<Option<String>>,
+    /// Только insight: `active` | `revisit`.
+    status: Option<EntryStatus>,
+    /// Только insight: новый набор триггеров целиком.
+    triggers: Option<Vec<Value>>,
     reason: Option<String>,
     message: Option<String>,
+}
+
+/// Смена статуса insight правкой: только `active ↔ revisit` — иначе 422.
+fn check_status_change(e: &Entry, s: EntryStatus) -> Result<(), ApiError> {
+    if e.kind != EntryKind::Insight {
+        return Err(unprocessable("status есть только у insight"));
+    }
+    if !matches!(s, EntryStatus::Active | EntryStatus::Revisit) {
+        return Err(unprocessable(
+            "status: правкой — только active или revisit; superseded — POST …/supersede, \
+             retracted — POST …/retract",
+        ));
+    }
+    if let Some(old @ (EntryStatus::Superseded | EntryStatus::Retracted)) = e.status
+        && old != s
+    {
+        return Err(unprocessable(format!(
+            "запись {}: статус больше не меняется (возврата из замещения и отзыва нет)",
+            old.as_str()
+        )));
+    }
+    Ok(())
 }
 
 /// `PATCH /entries/{id}` (необязательный `If-Match: <rev>`) → 200 `Entry` / 409 / 413 / 422.
@@ -420,7 +458,7 @@ pub async fn patch(
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<Json<Entry>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live_entry(&sc)?;
     let req: Patch = json_body(body)?;
@@ -434,6 +472,16 @@ pub async fn patch(
     if let Some(t) = &req.title {
         check_title(t)?;
     }
+    if let Some(s) = req.status {
+        check_status_change(&sc.entry, s)?;
+    }
+    let triggers = match req.triggers {
+        Some(_) if sc.entry.kind != EntryKind::Insight => {
+            return Err(unprocessable("triggers есть только у insight"));
+        }
+        Some(raw) => Some(parse_triggers(raw)?),
+        None => None,
+    };
     // release: поля, не указанные в PATCH, сохраняются (слияние на верхнем уровне);
     // changelog: data заменяется целиком
     let data = match (&req.data, sc.entry.kind) {
@@ -446,6 +494,10 @@ pub async fn patch(
             }
             Some(check_data(sc.entry.kind, &merged)?)
         }
+        (Some(d), EntryKind::Insight) => {
+            super::insights::check_insight_data(d)?;
+            Some(d.clone())
+        }
         (Some(d), kind) => Some(check_data(kind, d)?),
         (None, _) => None,
     };
@@ -457,16 +509,17 @@ pub async fn patch(
         data,
         tags: req.tags,
         area: req.area,
-        status: None,
+        status: req.status,
         certainty: None,
         reason: req.reason,
+        triggers,
     };
     let before = sc.entry.rev;
     let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;
     if e.rev != before {
         st.index.notify();
     }
-    Ok(Json(e))
+    Ok(Json(entry_json(&sc.db, &e).await?))
 }
 
 fn audit_details(sc: &EntryScope) -> Value {

@@ -31,12 +31,15 @@ pub use embeddings::{
     gc_embeddings, get_embeddings, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
 };
 pub use entries::{
-    AuthorView, CHANGELOG_BETWEEN_MAX, Certainty, Entry, EntryFilter, EntryKind, EntryPatch,
-    EntryRevision, EntryStatus, NewEntry, ReindexEntry, TITLE_MAX_CHARS, changelog_between,
-    create_entry, delete_entry, enqueue_entry_upserts, entry_by_idempotency_key,
-    entry_chunks_for_index, entry_revisions, find_release_by_version, finish_entries_reindexed,
-    get_entry, list_entries, normalize_title, reindex_entries_page, restore_entry, retract_entry,
-    supersede_entry, update_entry,
+    AREA_MAX_CHARS, AuthorView, CHANGELOG_BETWEEN_MAX, Certainty, DEDUP_CANDIDATES_MAX,
+    DedupCandidate, Entry, EntryFilter, EntryKind, EntryPatch, EntryRevision, EntryStatus,
+    KEYWORD_MAX_CHARS, NewEntry, NewTrigger, PATTERN_MAX_CHARS, REASON_MAX_CHARS, ReindexEntry,
+    TITLE_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger, TriggerKind, TriggerRow, active_triggers,
+    changelog_between, create_entry, delete_entry, enqueue_entry_upserts, entry_by_idempotency_key,
+    entry_chunks_for_index, entry_revisions, entry_triggers, find_release_by_version,
+    finish_entries_reindexed, get_entry, list_entries, normalize_area, normalize_title,
+    reindex_entries_page, restore_entry, retract_entry, set_triggers, supersede_entry,
+    title_duplicates, update_entry, validate_trigger,
 };
 pub use jobs::{
     EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats,

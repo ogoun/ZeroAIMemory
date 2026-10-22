@@ -17,6 +17,7 @@
 
 mod chunks;
 mod read;
+mod triggers;
 mod write;
 
 use jiff::Timestamp;
@@ -36,9 +37,14 @@ pub use chunks::{
 };
 pub(crate) use chunks::{rechunk_entries, set_entry_state};
 pub use read::{
-    CHANGELOG_BETWEEN_MAX, changelog_between, entry_revisions, find_release_by_version, get_entry,
-    list_entries,
+    CHANGELOG_BETWEEN_MAX, DEDUP_CANDIDATES_MAX, DedupCandidate, changelog_between,
+    entry_revisions, find_release_by_version, get_entry, list_entries, title_duplicates,
 };
+pub use triggers::{
+    KEYWORD_MAX_CHARS, NewTrigger, PATTERN_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger,
+    TriggerKind, TriggerRow, active_triggers, entry_triggers, set_triggers, validate_trigger,
+};
+pub(crate) use triggers::{check_triggers, replace_triggers};
 pub use write::{
     create_entry, delete_entry, entry_by_idempotency_key, restore_entry, retract_entry,
     supersede_entry, update_entry,
@@ -157,6 +163,8 @@ pub struct NewEntry {
     pub status: Option<EntryStatus>,
     pub certainty: Option<Certainty>,
     pub idempotency_key: Option<String>,
+    /// Триггеры вспоминания (только у insight); пишутся в той же транзакции.
+    pub triggers: Vec<NewTrigger>,
 }
 
 /// Запись журнала.
@@ -222,6 +230,8 @@ pub struct EntryPatch {
     pub certainty: Option<Certainty>,
     /// Причина смены статуса или `certainty` (в ревизию).
     pub reason: Option<String>,
+    /// Заменить набор триггеров (только у insight); ревизии не создаёт.
+    pub triggers: Option<Vec<NewTrigger>>,
 }
 
 /// Фильтр ленты записей пространства.
@@ -254,6 +264,13 @@ pub fn normalize_title(s: &str) -> String {
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     mapped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Область для сравнения: без пробелов по краям, пустая — `None` (как при записи).
+pub fn normalize_area(a: Option<&str>) -> Option<String> {
+    a.map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
 }
 
 /// Колонки записи для [`entry_row`]; таблица `entries` под псевдонимом `e`.
@@ -328,6 +345,25 @@ mod tests {
         assert_eq!(normalize_title("A.B,C;(d)"), "a b c d");
         assert_eq!(normalize_title("—"), "");
         assert_eq!(normalize_title("Ёж\tИ\nЛис"), "ёж и лис");
+    }
+
+    #[test]
+    fn normalize_title_cases() {
+        // регистр (в том числе кириллица и немецкая ß → ss нет: to_lowercase посимвольно)
+        assert_eq!(
+            normalize_title("CRLF в Bash-Скриптах"),
+            normalize_title("crlf в bash скриптах")
+        );
+        // пунктуация, кавычки и тире — разделители; повторы пробелов схлопываются
+        assert_eq!(
+            normalize_title("«Bash» — скрипты:  LF!!!"),
+            normalize_title("bash скрипты lf")
+        );
+        // цифры и подчёркивание: цифры значимы, `_` — разделитель
+        assert_eq!(normalize_title("Python_3.12 venv"), "python 3 12 venv");
+        assert_ne!(normalize_title("Ошибка 1"), normalize_title("Ошибка 2"));
+        // заголовок без букв и цифр — пусто (дублей у него нет)
+        assert_eq!(normalize_title("?!… —"), "");
     }
 
     #[test]

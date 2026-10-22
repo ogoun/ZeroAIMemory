@@ -34,6 +34,7 @@ pub struct ServerConfig {
     pub ml: MlSection,
     pub index: IndexSection,
     pub search: SearchSection,
+    pub insights: InsightsSection,
     pub limits: LimitsSection,
 }
 
@@ -417,6 +418,12 @@ pub struct SearchSection {
     pub recency_half_life_days: f64,
     /// Не больше чанков с одного узла (≥ 1).
     pub max_per_node: usize,
+    /// Множители слитого балла (§9.2 п. 4) для insight вида `gotcha` и `failure` и для узлов и
+    /// записей текущей области (`X-Zam-Area`). Значения по умолчанию (1,15 / 1,15 / 1,10) —
+    /// **[решение исполнителя, M3]**, проверка — сеткой eval.
+    pub boost_gotcha: f64,
+    pub boost_failure: f64,
+    pub boost_area: f64,
 }
 
 impl SearchSection {
@@ -442,6 +449,37 @@ impl SearchSection {
         }
         if self.max_per_node == 0 {
             return Err(bad("max_per_node", "должно быть больше 0"));
+        }
+        for (k, v) in [
+            ("boost_gotcha", self.boost_gotcha),
+            ("boost_failure", self.boost_failure),
+            ("boost_area", self.boost_area),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(bad(k, "должно быть конечным и больше 0 (1 — без буста)"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Секция `[insights]` (§7.5): дедупликация при записи insight.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InsightsSection {
+    /// Порог dense-косинуса, с которого действующий insight той же области — кандидат в
+    /// дубли (0..=1, по умолчанию 0,90).
+    pub dedup_threshold: f32,
+}
+
+impl InsightsSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(self.dedup_threshold.is_finite() && (0.0..=1.0).contains(&self.dedup_threshold)) {
+            return Err(ConfigError::Invalid {
+                key: "insights.dedup_threshold".into(),
+                source_name: "итог".into(),
+                message: "должно быть в 0..=1".into(),
+            });
         }
         Ok(())
     }
@@ -516,6 +554,12 @@ impl Default for ServerConfig {
                 w_trigram: 0.7,
                 recency_half_life_days: 180.0,
                 max_per_node: 3,
+                boost_gotcha: 1.15,
+                boost_failure: 1.15,
+                boost_area: 1.10,
+            },
+            insights: InsightsSection {
+                dedup_threshold: 0.90,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -688,6 +732,7 @@ pub fn load(
     cfg.ml.validate()?;
     cfg.index.validate()?;
     cfg.search.validate()?;
+    cfg.insights.validate()?;
     Ok(cfg)
 }
 
@@ -804,6 +849,37 @@ mod tests {
         assert_eq!((&c.qdrant.binary, &c.qdrant.api_key), (&None, &None));
         assert_eq!(c.limits.note_max_bytes, 5_242_880);
         assert_eq!(c.limits.blob_max_bytes, 209_715_200);
+        assert_eq!(
+            (
+                c.search.boost_gotcha,
+                c.search.boost_failure,
+                c.search.boost_area
+            ),
+            (1.15, 1.15, 1.10)
+        );
+        assert_eq!(c.insights.dedup_threshold, 0.90);
+    }
+
+    #[test]
+    fn boosts_and_dedup_threshold_validated() {
+        let ok = vec![
+            env("ZAM_SEARCH__BOOST_AREA", "1.0"),
+            env("ZAM_INSIGHTS__DEDUP_THRESHOLD", "0.85"),
+        ];
+        let c = load(None, &ok, &Default::default()).unwrap();
+        assert_eq!(
+            (c.search.boost_area, c.insights.dedup_threshold),
+            (1.0, 0.85)
+        );
+        for (k, v) in [
+            ("ZAM_SEARCH__BOOST_GOTCHA", "0"),
+            ("ZAM_SEARCH__BOOST_FAILURE", "-1.0"),
+            ("ZAM_SEARCH__BOOST_AREA", "nan"),
+            ("ZAM_INSIGHTS__DEDUP_THRESHOLD", "1.5"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default());
+            assert!(e.is_err(), "{k}={v}");
+        }
     }
 
     #[test]

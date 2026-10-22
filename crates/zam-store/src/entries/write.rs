@@ -9,7 +9,8 @@ use zam_core::Id;
 use super::chunks::{entry_index_state, index_entry_now, unindex_entry};
 use super::{
     AREA_MAX_CHARS, Certainty, Entry, EntryKind, EntryPatch, EntryStatus, KEY_MAX_CHARS, NewEntry,
-    REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, load_entry, normalize_title,
+    REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, check_triggers, load_entry,
+    normalize_title, replace_triggers,
 };
 use crate::nodes::Attribution;
 use crate::time::fmt_ts;
@@ -271,6 +272,10 @@ fn insert_entry(
     if e.kind != EntryKind::Insight && e.certainty.is_some() {
         return Err(bad("certainty есть только у insight"));
     }
+    if e.kind != EntryKind::Insight && !e.triggers.is_empty() {
+        return Err(bad("триггеры есть только у insight"));
+    }
+    let triggers = check_triggers(e.triggers)?;
     let f = Fields {
         title: check_title(&e.title)?,
         body: e.body,
@@ -312,6 +317,7 @@ fn insert_entry(
         now,
     ])?;
     insert_revision(c, id, 1, &f, None, a, now)?;
+    replace_triggers(c, id, &triggers, now)?;
     index_entry_now(c, id, None, now)?;
     Ok(id)
 }
@@ -434,6 +440,8 @@ pub async fn create_entry(
 /// `body` вместе с `append_body`, статус или `certainty` не у insight, статус кроме
 /// `active`/`revisit`, пустая причина → `BadInput`; смена статуса у `superseded` или
 /// `retracted` → `Conflict`. Правка без изменений возвращает запись как есть, без ревизии.
+/// `triggers` заменяет набор триггеров insight в той же транзакции (неверный → `BadInput`);
+/// триггеры в ревизию не входят.
 pub async fn update_entry(
     db: &Db,
     id: Id,
@@ -504,10 +512,16 @@ pub async fn update_entry(
             }
             f.certainty = Some(c);
         }
+        let now = fmt_ts(Timestamp::now());
+        if let Some(ts) = p.triggers {
+            if cur.kind != EntryKind::Insight {
+                return Err(bad("триггеры есть только у insight"));
+            }
+            replace_triggers(tx, id, &check_triggers(ts)?, &now)?;
+        }
         if f == Fields::of(&cur) {
             return Ok(cur);
         }
-        let now = fmt_ts(Timestamp::now());
         save(tx, &cur, &f, reason.as_deref(), &a, &now)?;
         load_entry(tx, id)
     })

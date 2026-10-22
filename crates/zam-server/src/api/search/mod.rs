@@ -4,7 +4,9 @@
 //! **Тело** (остальные поля §9.1 принимаются и пока игнорируются):
 //! - `query` — до 512 символов, синтаксис FTS5 в нём не действует;
 //! - `scope`: `solution`, `include_knowledge` (true), `include_rules` (true),
-//!   `all_solutions` (false), `path_prefix`, `spaces: [SpaceRef]`, `include_human`;
+//!   `all_solutions` (false), `path_prefix`, `spaces: [SpaceRef]`, `include_human`,
+//!   `area` — строгий фильтр области (только узлы и записи с этой `area`: FTS, Qdrant и
+//!   проверка векторных хитов; до 128 печатных символов, пустая — без фильтра);
 //! - `mode`: `brief` (по умолчанию) | `chunks` | `notes`;
 //! - `expand`: `none` (по умолчанию) | `section` (текст всей секции чанка) | `neighbors`
 //!   (чанк с соседними листами) | `graph` (400: будет в M3); действует в `mode=chunks`;
@@ -39,7 +41,10 @@
 //!    (листы сводок, `expand`, L0, `pending_count`) идут в базу цели элемента.
 //! 3. `fuse` (weighted RRF + затухание; bm25 ослабленного запроса — с весом
 //!    `w_fts_relaxed`, если векторный канал работает и чанк ему виден, т. е. не Human и узел
-//!    проиндексирован) → `note_to_leaf` → ≤ `max_per_node` с узла:
+//!    проиндексирован) → бусты ([`zam_search::apply_boosts`], §9.2 п. 4: insight `gotcha` и
+//!    `failure` — `search.boost_gotcha`/`boost_failure`, узлы и записи области из
+//!    `X-Zam-Area` — `search.boost_area`; балл в ответе ограничен 1) → `note_to_leaf` →
+//!    ≤ `max_per_node` с узла:
 //!    сводка (L1 заметки или секции) сливается с найденным листом своего узла (для
 //!    секции — листом этой секции) или заменяется лучшим листом: ближайшим к запросу по
 //!    косинусу (эмбеддинги из кэша `embeddings`), без вектора — листом с наибольшим числом
@@ -121,9 +126,9 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
-    ChunkMeta, Cost, Fit, LeafRef, Level, Ranked, SearchInputs, Weights, cap_per_node,
-    drop_unresolved_tail, fuse, in_section, note_to_leaf, pack, summaries_without_leaf,
-    truncate_to_tokens,
+    Boosts, ChunkMeta, Cost, Fit, LeafRef, Level, Ranked, SearchInputs, Weights, apply_boosts,
+    cap_per_node, drop_unresolved_tail, fuse, in_section, note_to_leaf, pack,
+    summaries_without_leaf, truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
@@ -140,6 +145,7 @@ use self::targets::{
 use super::json_body;
 use super::scope::skip_foreign;
 use crate::app::AppState;
+use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
 use crate::config::SearchSection;
 use crate::error::ApiError;
@@ -234,6 +240,37 @@ fn filter_list(
     Ok(v)
 }
 
+/// Строгий фильтр области `scope.area`: без пробелов по краям, пустая — `None`; длиннее
+/// [`zam_store::AREA_MAX_CHARS`] или с управляющими символами → 400.
+fn area_filter(a: Option<&str>) -> Result<Option<String>, ApiError> {
+    let a = zam_store::normalize_area(a);
+    if a.as_ref().is_some_and(|a| {
+        a.chars().count() > zam_store::AREA_MAX_CHARS || a.chars().any(char::is_control)
+    }) {
+        return Err(ApiError::BadRequest(format!(
+            "scope.area: до {} печатных символов",
+            zam_store::AREA_MAX_CHARS
+        )));
+    }
+    Ok(a)
+}
+
+impl SearchSection {
+    /// Бусты §9.2 п. 4: виды инсайтов и текущая область (`X-Zam-Area`, если задана).
+    fn boosts(&self, area: Option<String>) -> Boosts {
+        Boosts {
+            insight_kinds: [
+                ("gotcha".to_string(), self.boost_gotcha),
+                ("failure".to_string(), self.boost_failure),
+            ]
+            .into_iter()
+            .collect(),
+            certainty: HashMap::new(),
+            area: area.map(|a| (a, self.boost_area)),
+        }
+    }
+}
+
 /// Фильтр целей запроса: виды и статусы (`include_history` — любые статусы).
 fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, ApiError> {
     let kinds = filter_list("filters.kinds", f.kinds.as_ref(), &KINDS, &DEFAULT_KINDS)?;
@@ -250,6 +287,7 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
         } else {
             statuses
         },
+        area: None,
     })
 }
 
@@ -758,8 +796,10 @@ fn pack_items(items: Vec<Item>, mode: SearchMode, budget_tokens: usize) -> Vec<P
 }
 
 /// Балл в ответе: 4 знака.
+/// Балл ответа: 0..1 с точностью 1e-4 (после бустов слитый балл может превысить 1 — порядок
+/// при этом сохраняется, шкала ответа — нет).
 fn round_score(s: f64) -> f64 {
-    (s * 10_000.0).round() / 10_000.0
+    (s.min(1.0) * 10_000.0).round() / 10_000.0
 }
 
 fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value {
@@ -853,7 +893,7 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> Str
 /// (у записи журнала — [`entry_card`]).
 fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
     let h = &p.item.hit;
-    let score = p.item.rerank_score.map_or(p.item.score, f64::from);
+    let score = p.item.rerank_score.map_or(p.item.score, f64::from).min(1.0);
     let mut line = match &h.entry {
         Some(e) => format!("{n}. {}", entry_card(e, h.target.id, score, p.tokens)),
         None => {
@@ -959,7 +999,9 @@ pub async fn search(
         )));
     }
     let budget = req.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS);
-    let kinds = target_filter(&req.filters, req.include_history)?;
+    let mut kinds = target_filter(&req.filters, req.include_history)?;
+    kinds.area = area_filter(req.scope.area.as_deref())?;
+    let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
     let mut health = Health::new(&targets, warnings);
     let prefix = req
@@ -1011,6 +1053,7 @@ pub async fn search(
             path_prefix: prefix.clone(),
             kinds: kinds.kinds.clone(),
             exclude_statuses: excluded_statuses(&kinds),
+            area: kinds.area.clone(),
             ..VectorFilter::default()
         };
         vector_channel(&st.index, filter, req.query.clone()).await
@@ -1090,6 +1133,14 @@ pub async fn search(
                     level: Level::parse(&h.level)?,
                     heading_path: h.heading_path.clone(),
                     updated_at: h.updated_at,
+                    // вид инсайта — только у insight (у changelog `data.kind` — вид изменения)
+                    insight_kind: h
+                        .entry
+                        .as_ref()
+                        .filter(|e| e.kind == "insight")
+                        .and_then(|e| e.insight_kind.clone()),
+                    certainty: h.entry.as_ref().and_then(|e| e.certainty.clone()),
+                    area: h.area.clone(),
                 },
             ))
         })
@@ -1123,7 +1174,8 @@ pub async fn search(
         vector_blind,
     };
     let weights = st.cfg.search.weights();
-    let ranked = fuse(&inputs, &weights, jiff::Timestamp::now());
+    let mut ranked = fuse(&inputs, &weights, jiff::Timestamp::now());
+    apply_boosts(&mut ranked, &inputs.chunks, &boosts);
     let window = top_k * OVERSAMPLE;
     let query_vec = vrun
         .dense
@@ -1351,6 +1403,7 @@ mod tests {
             text: text.into(),
             index_state: "indexed".into(),
             entry: None,
+            area: None,
         }
     }
 

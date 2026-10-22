@@ -85,6 +85,12 @@ pub struct ChunkMeta {
     pub heading_path: String,
     /// Время последнего изменения узла — для затухания.
     pub updated_at: Timestamp,
+    /// Вид инсайта (`data.kind` записи `insight`); у заметок и прочих записей — `None`.
+    pub insight_kind: Option<String>,
+    /// `certainty` записи (бусты надёжности).
+    pub certainty: Option<String>,
+    /// Область узла или записи (буст текущей области).
+    pub area: Option<String>,
 }
 
 /// Входы слияния: каналы — `chunk_id` по убыванию релевантности канала.
@@ -243,6 +249,9 @@ mod tests {
                         level: Level::Chunk,
                         heading_path: String::new(),
                         updated_at: now(),
+                        insight_kind: None,
+                        certainty: None,
+                        area: None,
                     },
                 )
             })

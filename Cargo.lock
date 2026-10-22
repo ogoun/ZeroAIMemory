@@ -1964,6 +1964,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6176,6 +6188,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "axum",
+ "blake3",
  "clap",
  "cookie",
  "futures-util",
@@ -6217,9 +6230,11 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "fs4",
+ "globset",
  "half 2.7.1",
  "jiff",
  "rand 0.9.5",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -28,6 +28,8 @@ zam-fetch = { path = "../zam-fetch" }
 zam-search = { path = "../zam-search" }
 jiff.workspace = true
 serde_json.workspace = true
+# ETag кэша триггеров (§10.3)
+blake3.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true, features = ["fs"] }

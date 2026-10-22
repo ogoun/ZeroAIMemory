@@ -32,6 +32,13 @@ pub enum ApiError {
         detail: String,
         extra: Map<String, Value>,
     },
+    /// 409 `/problems/possible-duplicate` (§7.5): похожий insight уже есть; `extra` —
+    /// `candidates` и `dedup`.
+    #[error("{detail}")]
+    PossibleDuplicate {
+        detail: String,
+        extra: Map<String, Value>,
+    },
     #[error("{0}")]
     PayloadTooLarge(String),
     #[error("требуется заголовок If-Match с ревизией")]
@@ -73,6 +80,11 @@ impl ApiError {
             ),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "about:blank", "Not Found"),
             ApiError::Conflict { .. } => (StatusCode::CONFLICT, "/problems/conflict", "Conflict"),
+            ApiError::PossibleDuplicate { .. } => (
+                StatusCode::CONFLICT,
+                "/problems/possible-duplicate",
+                "Conflict",
+            ),
             ApiError::PayloadTooLarge(_) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "/problems/too-large",
@@ -146,7 +158,11 @@ impl IntoResponse for ApiError {
             "status": status.as_u16(),
             "detail": self.to_string(),
         });
-        if let (ApiError::Conflict { extra, .. }, Value::Object(o)) = (&self, &mut body) {
+        if let (
+            ApiError::Conflict { extra, .. } | ApiError::PossibleDuplicate { extra, .. },
+            Value::Object(o),
+        ) = (&self, &mut body)
+        {
             for (k, v) in extra {
                 // стандартные поля problem не перекрываются
                 o.entry(k.clone()).or_insert_with(|| v.clone());
