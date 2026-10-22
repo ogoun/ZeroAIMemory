@@ -240,6 +240,8 @@ mod tests {
             insight_kind: insight_kind.map(String::from),
             certainty: None,
             area: area.map(String::from),
+            space_id: Id::new(),
+            path: String::new(),
         }
     }
 

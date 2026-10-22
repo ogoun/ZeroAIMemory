@@ -12,7 +12,10 @@
 //!   `status`, `insight_kind`, `certainty`, `area` (keyword). Коллекцию M2 `ensure` дополняет
 //!   недостающими индексами на месте, `schema` остаётся 1;
 //! - фильтр — дизъюнкция областей `(user_id, space_id ∈ …)` (`should`) и общие условия
-//!   (`must`, статусы — `must_not`), один для всех prefetch.
+//!   (`must`, статусы — `must_not`), один для prefetch чанков и сводок;
+//! - с `VectorFilter::folders` (M3, канал папок §8.3) — ещё prefetch dense top-10 по точкам
+//!   папок со своим фильтром ([`VectorFilter::folder_filter`]); итоговый лимит растёт на
+//!   его размер, так что точки папок не вытесняют чанки из выдачи M2.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -37,8 +40,8 @@ use zam_core::{Id, TargetRef};
 
 use crate::IndexError;
 use crate::vector::{
-    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, VectorFilter, VectorHit, VectorIndex,
-    VectorScope, check_points, hit_target, point_id, split_targets,
+    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, VectorFilter, VectorHit,
+    VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
 };
 
 /// Имя коллекции (§6.4).
@@ -61,6 +64,8 @@ const UPSERT_BATCH: usize = 256;
 const LEAF_PREFETCH: u64 = 50;
 /// Prefetch dense по заметкам и секциям.
 const NOTE_PREFETCH: u64 = 10;
+/// Prefetch dense по папкам (канал папок).
+const FOLDER_PREFETCH: u64 = 10;
 /// Параметр k у RRF.
 const RRF_K: u32 = 60;
 /// Итоговый лимит слияния.
@@ -377,12 +382,31 @@ impl QdrantIndex {
             );
             prefetches += 1;
         }
+        // точки папок — своим prefetch; лимит слияния растёт на его размер: папки не
+        // занимают места чанков (каждая точка — только в одном prefetch, RRF не меняет
+        // взаимный порядок остальных)
+        let mut limit = QUERY_LIMIT;
+        if f.folders
+            && !q_dense.is_empty()
+            && let Some(folder_filter) = point_filter(&f.folder_filter(), &[LEVEL_FOLDER.into()])
+        {
+            q = q.add_prefetch(
+                PrefetchQueryBuilder::default()
+                    .query(Query::new_nearest(q_dense.to_vec()))
+                    .using(DENSE)
+                    .filter(folder_filter)
+                    .params(rescore())
+                    .limit(FOLDER_PREFETCH),
+            );
+            prefetches += 1;
+            limit += FOLDER_PREFETCH;
+        }
         if prefetches == 0 {
             return Ok(Vec::new());
         }
         let q = q
             .query(Query::new_rrf(RrfBuilder::with_k(RRF_K)))
-            .limit(QUERY_LIMIT)
+            .limit(limit)
             .with_payload(hit_payload());
         let resp = self
             .client

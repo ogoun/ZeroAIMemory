@@ -109,6 +109,10 @@ pub struct VectorFilter {
     pub certainty: Vec<String>,
     /// Область знаний (`area`, точное совпадение).
     pub area: Option<String>,
+    /// Гибридный поиск ([`VectorIndex::search`]) добавляет prefetch dense по точкам папок
+    /// (`level = kind = folder`, канал папок §8.3): фильтр точек папок — [`Self::folder_filter`].
+    /// Остальные методы поле не читают.
+    pub folders: bool,
 }
 
 impl VectorFilter {
@@ -128,6 +132,19 @@ impl VectorFilter {
     /// Фильтр не пропускает ни одной точки: нет области с пространствами.
     pub fn matches_nothing(&self) -> bool {
         self.live_scopes().next().is_none()
+    }
+
+    /// Фильтр prefetch папок: те же области и префикс пути, уровень и вид `folder`. Виды,
+    /// статусы, `certainty`, `area` и виды инсайтов к папке не относятся (у её точки этих
+    /// полей нет): по ним фильтруются поднимаемые папкой потомки.
+    pub fn folder_filter(&self) -> VectorFilter {
+        VectorFilter {
+            scopes: self.scopes.clone(),
+            path_prefix: self.path_prefix.clone(),
+            levels: vec![LEVEL_FOLDER.to_string()],
+            kinds: vec![LEVEL_FOLDER.to_string()],
+            ..VectorFilter::default()
+        }
     }
 }
 
@@ -285,6 +302,9 @@ pub(crate) fn hit_target(
     }
 }
 
+/// Уровень и вид точки папки.
+pub const LEVEL_FOLDER: &str = "folder";
+
 /// Поля payload, которые читает выдача поиска.
 pub(crate) const HIT_FIELDS: [&str; 5] = ["chunk_id", "user_id", "node_id", "entry_id", "level"];
 
@@ -310,6 +330,29 @@ mod tests {
         assert!(VectorFilter::default().matches_nothing());
         assert!(VectorFilter::scope(u, vec![]).matches_nothing());
         assert!(!VectorFilter::scope(u, vec![Id::new()]).matches_nothing());
+    }
+
+    #[test]
+    fn folder_filter_keeps_scope_and_prefix_only() {
+        let u = Id::new();
+        let f = VectorFilter {
+            path_prefix: Some("ops".into()),
+            kinds: vec!["note".into()],
+            certainty: vec!["axiom".into()],
+            area: Some("db".into()),
+            exclude_statuses: vec!["retracted".into()],
+            folders: true,
+            ..VectorFilter::scope(u, vec![Id::new()])
+        };
+        let g = f.folder_filter();
+        assert_eq!(g.scopes, f.scopes);
+        assert_eq!(g.path_prefix.as_deref(), Some("ops"));
+        assert_eq!(
+            (g.levels, g.kinds),
+            (vec!["folder".to_string()], vec!["folder".to_string()])
+        );
+        assert!(g.certainty.is_empty() && g.area.is_none() && g.exclude_statuses.is_empty());
+        assert!(!g.folders);
     }
 
     #[test]

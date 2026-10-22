@@ -33,7 +33,7 @@ use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
 pub(crate) use chunks::{
-    backfill_certainty, backfill_embed_keys, chunk_id, context_prefix, frontmatter_tags,
+    backfill_certainty, backfill_embed_keys, chunk_id, context_prefix, frontmatter_tags, mask_tags,
     note_chunks, rechunk_notes, rescan_secrets, stored_prefix_hit, token_counter,
 };
 pub use chunks::{

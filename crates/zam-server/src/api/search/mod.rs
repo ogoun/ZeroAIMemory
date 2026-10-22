@@ -15,8 +15,8 @@
 //! - `top_k` (10, 1..=100), `budget_tokens` (800), `format`: `json` (по умолчанию) | `md`;
 //! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже);
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release` (по умолчанию все
-//!   четыре), `folder` и `attachment` принимаются, но чанков не находят (папки — канал
-//!   подъёма, вложения — M5); `filters.status` — статусы insight (по умолчанию `active`,
+//!   четыре), `folder` — карточки папок (см. «Папки»), `attachment` принимается, но ничего не
+//!   находит (вложения — M5); `filters.status` — статусы insight (по умолчанию `active`,
 //!   `revisit`); `include_history: true` снимает фильтр статуса. Фильтр действует и в Qdrant
 //!   (`kinds`, `must_not` по исключённым статусам), и в FTS, и в проверке векторных хитов
 //!   ([`live_chunks`]); у changelog и release статуса нет — они проходят всегда.
@@ -67,6 +67,23 @@
 //!    installed"]`; ошибка или паника загрузки и инференса — `["reranker failed"]`, не 500.
 //! 5. `top_k` (в `notes` — узлов), `expand` (`graph` — соседи после `top_k`), упаковка в
 //!    `budget_tokens`.
+//!
+//! **Папки** (§8.3, §9.2). Векторный запрос добавляет prefetch dense top-10 по точкам папок
+//! (`VectorFilter::folders`), если включён канал папок (`search.w_folder > 0`, по умолчанию
+//! 0 — до сетки задачи 18) или запрошены карточки (`filters.kinds ∋ folder`). Точки папок
+//! направляются в базу владельца и проверяются по SQLite ([`live_folders`]: папка жива, не в
+//! корзине, не Human, в пространствах цели и под `path_prefix`); удалённая папка, точка
+//! которой осталась в Qdrant, не действует. Ранг папки — среди живых, по порядку векторной
+//! выдачи. Канал `folder`: чанку узла под путём папки (того же пространства) прибавляется
+//! `w_folder / (rrf_k + ранг)` по лучшей папке-предку, один раз (`sources` получает
+//! `folder`). Карточки — только при `filters.kinds ∋ folder`, не больше `search.max_folders`
+//! (2) лучших папок, сверх `top_k` **[решение исполнителя]**: балл — как у кандидата только
+//! векторного канала того же места ([`zam_search::folder_score`]), карточка встаёт перед
+//! первым элементом с меньшим баллом (соседей `expand=graph` она не обходит), не
+//! реранжируется и не расширяется. JSON карточки: `node_id`, `kind: "folder"`, `level:
+//! "folder"`, `space`, `path`, `score`, `sources: ["folder"]`, `child_count`, `l0` (в `notes`)
+//! или `snippet` (L0), `chunk_ids: []`; md — `<n>. f:<id> <пространство>/<путь>/  [score] ·
+//! <N> детей` и L0 строкой ниже.
 //!
 //! **Деградация.** Нет модели, ORT, Qdrant, чужая модель коллекции или сбой запроса
 //! (эмбеддинг, Qdrant) — ответ из одного FTS (по всем целям), `degraded: true` и `degraded_reason`
@@ -137,16 +154,16 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
-    Boosts, ChunkMeta, Cost, Fit, LeafRef, Level, Ranked, SearchInputs, Weights, apply_boosts,
-    cap_per_node, drop_unresolved_tail, fuse, in_section, note_to_leaf, pack,
-    summaries_without_leaf, truncate_to_tokens,
+    Boosts, ChunkMeta, Cost, Fit, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights,
+    apply_boosts, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed, in_section,
+    note_to_leaf, pack, summaries_without_leaf, truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
     ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
     TargetFilter, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_nodes,
-    live_chunks, neighbor_leaves, node_content, pending_count, query_needles, search_fts_channels,
-    text_snippet,
+    live_chunks, live_folders, neighbor_leaves, node_content, pending_count, query_needles,
+    search_fts_channels, text_snippet,
 };
 
 use self::merge::merge_channels;
@@ -354,6 +371,7 @@ impl SearchSection {
             w_fts: self.w_fts,
             w_fts_relaxed: self.w_fts_relaxed,
             w_trigram: self.w_trigram,
+            w_folder: self.w_folder,
             recency_half_life_days: self.recency_half_life_days,
             max_per_node: self.max_per_node,
         }
@@ -551,6 +569,8 @@ struct Item {
     rerank_score: Option<f32>,
     /// Сосед `expand=graph`: тип ребра и родитель.
     via: Option<(zam_store::EdgeType, TargetRef)>,
+    /// Карточка папки: число живых детей (см. модуль, «Папки»).
+    folder: Option<i64>,
 }
 
 /// Текст пары реранкера: заголовок секции и текст чанка.
@@ -827,7 +847,37 @@ fn round_score(s: f64) -> f64 {
     (s.min(1.0) * 10_000.0).round() / 10_000.0
 }
 
+/// JSON карточки папки (см. модуль, «Папки»).
+fn folder_json(p: &Packed, children: i64, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value {
+    let h = &p.item.hit;
+    let space = spaces.get(&h.space_id);
+    let mut o = Map::new();
+    o.insert("node_id".into(), json!(h.target.id));
+    o.insert("space".into(), json!(space));
+    if let Some(g) = space.and_then(|s| s.solution_guid.as_ref()) {
+        o.insert("agent_solution_id".into(), json!(g));
+    }
+    o.insert("path".into(), json!(h.path));
+    o.insert("heading_path".into(), json!(""));
+    o.insert("level".into(), json!(h.level));
+    o.insert("kind".into(), json!("folder"));
+    o.insert("chunk_ids".into(), json!(p.item.chunk_ids));
+    o.insert("score".into(), json!(round_score(p.item.score)));
+    o.insert("sources".into(), json!(p.item.sources));
+    o.insert("tokens".into(), json!(p.tokens));
+    o.insert("child_count".into(), json!(children));
+    if mode == SearchMode::Notes {
+        o.insert("l0".into(), json!(p.item.l0));
+    } else {
+        o.insert("snippet".into(), json!(h.snippet));
+    }
+    Value::Object(o)
+}
+
 fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value {
+    if let Some(children) = p.item.folder {
+        return folder_json(p, children, mode, spaces);
+    }
     let h = &p.item.hit;
     let mut o = Map::new();
     let id_key = match h.target.kind {
@@ -923,9 +973,17 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> Str
 fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
     let h = &p.item.hit;
     let score = p.item.rerank_score.map_or(p.item.score, f64::from).min(1.0);
-    let mut line = match &h.entry {
-        Some(e) => format!("{n}. {}", entry_card(e, h.target.id, score, p.tokens)),
-        None => {
+    let mut line = match (&h.entry, p.item.folder) {
+        // карточка папки: `f:<id> <пространство>/<путь>/  [0.61] · 4 детей`
+        (_, Some(children)) => {
+            let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
+            format!(
+                "{n}. f:{} {space}/{}/  [{score:.2}] · {children} детей\n",
+                h.target.id, h.path
+            )
+        }
+        (Some(e), None) => format!("{n}. {}", entry_card(e, h.target.id, score, p.tokens)),
+        (None, None) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             let mut line = format!("{n}. {} {space}/{}", h.target, h.path);
             if !h.heading_path.is_empty() {
@@ -1011,6 +1069,89 @@ impl<'a> Health<'a> {
     }
 }
 
+/// Точка папки векторной выдачи.
+fn is_folder(h: &VectorHit) -> bool {
+    h.level == zam_index::LEVEL_FOLDER
+}
+
+/// Точки папок `vh` — по базам владельцев: живые папки пространств цели без Human
+/// ([`live_folders`]) как `(цель, папка, ранг)`, ранг — с 1 среди живых по порядку векторной
+/// выдачи. Папка засчитывается только из базы своего владельца; сбой чтения базы чужого
+/// решения исключает решение ([`Health::soft`]).
+async fn check_folders(
+    health: &mut Health<'_>,
+    vh: &[VectorHit],
+    prefix: Option<&str>,
+) -> Result<Vec<(usize, zam_store::FolderRow, usize)>, ApiError> {
+    let targets = health.targets;
+    let mut live: HashMap<(Id, Id), (usize, zam_store::FolderRow)> = HashMap::new();
+    for (i, t) in targets.iter().enumerate() {
+        if !health.alive[i] {
+            continue;
+        }
+        let ids: Vec<Id> = vh
+            .iter()
+            .filter(|h| is_folder(h) && h.user_id == t.owner && h.target.kind == TargetKind::Node)
+            .map(|h| h.target.id)
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let r = live_folders(&t.db, ids, &t.vector_space_ids(), prefix).await;
+        if let Some(found) = health.soft(i, r)? {
+            for f in found {
+                live.entry((t.owner, f.id)).or_insert((i, f));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for h in vh.iter().filter(|h| is_folder(h)) {
+        if let Some((i, f)) = live.remove(&(h.user_id, h.target.id)) {
+            let rank = out.len() + 1;
+            out.push((i, f, rank));
+        }
+    }
+    Ok(out)
+}
+
+/// Карточка папки цели `target` с баллом `score` (см. модуль, «Папки»).
+fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
+    let l0 = f.l0.clone().unwrap_or_default();
+    Item {
+        target,
+        hit: FtsHit {
+            chunk_id: String::new(),
+            target: TargetRef {
+                kind: TargetKind::Node,
+                id: f.id,
+            },
+            space_id: f.space_id,
+            path: f.path.clone(),
+            heading_path: String::new(),
+            level: zam_index::LEVEL_FOLDER.into(),
+            rev: 0,
+            token_count: 0,
+            score,
+            raw_score: 0.0,
+            updated_at: jiff::Timestamp::UNIX_EPOCH,
+            snippet: l0,
+            text: String::new(),
+            index_state: "indexed".into(),
+            entry: None,
+            area: None,
+            certainty: None,
+        },
+        score,
+        sources: vec![zam_search::Channel::Folder.as_str()],
+        chunk_ids: Vec::new(),
+        l0: f.l0.clone(),
+        text: None,
+        rerank_score: None,
+        via: None,
+        folder: Some(f.child_count),
+    }
+}
+
 /// `POST /search`.
 pub async fn search(
     State(st): State<AppState>,
@@ -1060,6 +1201,9 @@ pub async fn search(
         .collect();
     let available = st.index.vector_available();
     let run_vector = available.is_ok() && !scopes.is_empty() && !req.query.trim().is_empty();
+    // точки папок: карточки по `filters.kinds ∋ folder`, канал подъёма — при `w_folder > 0`
+    let want_folders = kinds.kinds.iter().any(|k| k == "folder");
+    let folder_channel = st.cfg.search.w_folder > 0.0;
 
     // 1. каналы FTS (по базе на цель, параллельно) и векторный (один запрос) — параллельно
     let fts = async {
@@ -1090,6 +1234,7 @@ pub async fn search(
             exclude_statuses: excluded_statuses(&kinds),
             area: kinds.area.clone(),
             certainty: kinds.certainty.clone(),
+            folders: want_folders || folder_channel,
             ..VectorFilter::default()
         };
         vector_channel(&st.index, filter, req.query.clone()).await
@@ -1120,7 +1265,7 @@ pub async fn search(
                 }
                 let ids: Vec<String> = vh
                     .iter()
-                    .filter(|h| h.user_id == t.owner)
+                    .filter(|h| h.user_id == t.owner && !is_folder(h))
                     .map(|h| h.chunk_id.clone())
                     .collect();
                 if ids.is_empty() {
@@ -1141,6 +1286,7 @@ pub async fn search(
             // порядок векторного канала; хит засчитывается только из базы своего владельца
             let ids: Vec<String> = vh
                 .iter()
+                .filter(|h| !is_folder(h))
                 .filter(|h| {
                     live.get(&h.chunk_id)
                         .is_some_and(|(i, _)| targets[*i].owner == h.user_id)
@@ -1154,9 +1300,15 @@ pub async fn search(
         }
         None => None,
     };
+    // точки папок — в базу своего владельца, только живые папки пространств цели
+    let mut folders = match &vrun.hits {
+        Some(vh) => check_folders(&mut health, vh, prefix.as_deref()).await?,
+        None => Vec::new(),
+    };
     // база, не прочитавшаяся при проверке векторных хитов, — вне выдачи целиком (кандидаты
     // без метаданных `fuse` отбрасывает)
     hits.retain(|_, (i, _)| health.alive[*i]);
+    folders.retain(|(i, _, _)| health.alive[*i]);
 
     // 3. слияние, сводки → листы
     let chunks: HashMap<String, ChunkMeta> = hits
@@ -1178,6 +1330,8 @@ pub async fn search(
                     // статус заметки или записи (бусты надёжности, §7.5)
                     certainty: h.certainty.clone(),
                     area: h.area.clone(),
+                    space_id: h.space_id,
+                    path: h.path.clone(),
                 },
             ))
         })
@@ -1209,9 +1363,18 @@ pub async fn search(
         // находки (eval); действует только при векторном канале
         fts_relaxed: fts.relaxed,
         vector_blind,
+        folders: folders
+            .iter()
+            .map(|(_, f, rank)| FolderHit {
+                folder: f.id,
+                space_id: f.space_id,
+                path_prefix: f.path.clone(),
+                rank: *rank,
+            })
+            .collect(),
     };
     let weights = st.cfg.search.weights();
-    let mut ranked = fuse(&inputs, &weights, jiff::Timestamp::now());
+    let (mut ranked, norm_max) = fuse_normed(&inputs, &weights, jiff::Timestamp::now());
     apply_boosts(&mut ranked, &inputs.chunks, &boosts);
     let window = top_k * OVERSAMPLE;
     let query_vec = vrun
@@ -1300,9 +1463,20 @@ pub async fn search(
                 text: None,
                 rerank_score: None,
                 via: None,
+                folder: None,
             })
         })
         .collect();
+    // карточки папок (только по `filters.kinds ∋ folder`): лучшие живые папки канала
+    let cards: Vec<Item> = if want_folders {
+        folders
+            .iter()
+            .take(st.cfg.search.max_folders)
+            .map(|(i, f, rank)| folder_card(*i, f, folder_score(*rank, &weights, norm_max)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let fuse_ms = ms(fuse_t);
 
     // 4. серверный реранк; пересборка индекса — предупреждение о неполной векторной выдаче
@@ -1343,9 +1517,20 @@ pub async fn search(
         .await?;
         items.extend(extra);
     }
+    // карточки папок — по баллу среди найденных, до соседей по графу
+    for card in cards {
+        let pos = items
+            .iter()
+            .position(|it| it.via.is_some() || it.score < card.score)
+            .unwrap_or(items.len());
+        items.insert(pos, card);
+    }
     if mode == SearchMode::Notes {
         for it in &mut items {
-            if it.hit.target.kind == TargetKind::Node && health.alive[it.target] {
+            if it.hit.target.kind == TargetKind::Node
+                && it.folder.is_none()
+                && health.alive[it.target]
+            {
                 let r = get_node(&targets[it.target].db, it.hit.target.id).await;
                 if let Some(n) = health.soft(it.target, r)? {
                     it.l0 = n.l0;
@@ -1472,6 +1657,7 @@ mod tests {
                 l0: None,
                 rerank_score: None,
                 via: None,
+                folder: None,
             })
             .collect()
     }

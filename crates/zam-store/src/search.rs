@@ -16,7 +16,8 @@
 //! Для гибридного поиска (M2) каналы отдаются раздельно — [`search_fts_channels`]: их
 //! сливает `zam-search` вместе с векторным каналом и весами из конфигурации; там же
 //! правило «сводка → лучший лист». [`live_chunks`] — метаданные и текст векторных хитов
-//! с проверкой по SQLite (живой узел, не исключён, в области).
+//! с проверкой по SQLite (живой узел, не исключён, в области); [`live_folders`] — то же для
+//! точек папок (канал папок M3, §8.3).
 //!
 //! С M3 цель чанка — узел или запись журнала (`entries`, [`FtsHit::entry`]). Фильтр видов
 //! и статусов ([`TargetFilter`]) действует в обоих каналах и в [`live_chunks`]: виды —
@@ -729,6 +730,69 @@ pub async fn live_chunks(
         let rows = st.query_map(params_from_iter(args), |r| hit_row(r, 0))?;
         let mut by_id: HashMap<String, FtsHit> = rows
             .map(|h| h.map(|h| (h.chunk_id.clone(), h)))
+            .collect::<Result<_, _>>()?;
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    })
+    .await
+}
+
+/// Папка векторного канала папок, прошедшая проверку по SQLite ([`live_folders`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRow {
+    pub id: Id,
+    pub space_id: Id,
+    pub path: String,
+    /// Свёртка L0 папки (§8.3), замаскированная сканером секретов.
+    pub l0: Option<String>,
+    /// Живых (не удалённых и не в корзине) детей первого уровня.
+    pub child_count: i64,
+}
+
+/// Папки `ids` (точки уровня `folder` векторной выдачи) в порядке `ids`: только живые
+/// (не удалённые, не в корзине) папки пространств `space_ids`, кроме Human, под префиксом
+/// `path_prefix` (по целым сегментам; сама папка с этим путём проходит). Отсутствующие и
+/// не прошедшие проверку пропускаются: точка в Qdrant может пережить удаление папки.
+/// Пустой `space_ids` — пустая выдача.
+pub async fn live_folders(
+    db: &Db,
+    ids: Vec<Id>,
+    space_ids: &[Id],
+    path_prefix: Option<&str>,
+) -> Result<Vec<FolderRow>, StoreError> {
+    if ids.is_empty() || space_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prefix = norm_prefix(path_prefix);
+    let spaces = space_ids.to_vec();
+    let list =
+        serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT n.id, n.space_id, n.path, n.l0,
+                    (SELECT count(*) FROM nodes ch
+                     WHERE ch.space_id = n.space_id AND ch.parent_id = n.id
+                       AND ch.deleted_at IS NULL)
+             FROM json_each(?1) j
+             CROSS JOIN nodes n ON n.id = j.value
+             JOIN spaces s ON s.id = n.space_id
+             WHERE n.kind = 'folder' AND n.deleted_at IS NULL AND s.kind <> 'human'
+               AND n.space_id IN ({})
+               AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
+            placeholders(3, spaces.len())
+        ))?;
+        let mut args: Vec<&dyn ToSql> = vec![&list, &prefix];
+        args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+        let rows = st.query_map(params_from_iter(args), |r| {
+            Ok(FolderRow {
+                id: r.get(0)?,
+                space_id: r.get(1)?,
+                path: r.get(2)?,
+                l0: r.get(3)?,
+                child_count: r.get(4)?,
+            })
+        })?;
+        let mut by_id: HashMap<Id, FolderRow> = rows
+            .map(|f| f.map(|f| (f.id, f)))
             .collect::<Result<_, _>>()?;
         Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
     })

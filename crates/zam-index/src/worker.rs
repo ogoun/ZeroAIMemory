@@ -1712,7 +1712,9 @@ impl Worker {
                 updated_at: c.updated_at.as_second(),
             })
             .collect();
-        let l0 = rollup::folder_l0(&kids);
+        // имена детей задаёт автор: значение секрета в свёртке маскируется (L0 папки виден
+        // в карточках папок поиска)
+        let l0 = rollup::folder_l0(&kids).map(|s| zam_markdown::mask_text(&s));
         if let Err(e) = set_folder_l0(db, folder, l0.as_deref()).await {
             tracing::warn!(folder = %folder, error = %e, "L0 папки");
             return Ok(());
@@ -1811,9 +1813,10 @@ pub fn embed_key(c: &IndexChunk) -> String {
     embed_key_of(&c.context_prefix, &c.text)
 }
 
-/// Текст эмбеддинга L0 папки и его ключ кэша (домен `folder`).
+/// Текст эмбеддинга L0 папки и его ключ кэша (домен `folder`). Текст —
+/// [`zam_store::folder_embed_input`]: значения секретов в имени, пути и L0 замаскированы.
 pub(crate) fn folder_embed(space: &str, path: &str, name: &str, l0: &str) -> (String, String) {
-    let input = format!("[{space}/{path}] {name}\n{l0}");
+    let input = zam_store::folder_embed_input(space, path, name, l0);
     let key = keyed_hash("folder", &input);
     (input, key)
 }
@@ -1963,6 +1966,19 @@ mod tests {
         r.schedule(u, f, Duration::from_secs(60));
         assert!(r.take_due().is_empty());
         assert!(r.next_due().unwrap() > Instant::now());
+    }
+
+    #[test]
+    fn folder_embed_masks_secrets() {
+        let s = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+        let (clean, clean_key) = folder_embed("K", "ops", "ops", "- a: b");
+        assert_eq!(clean, "[K/ops] ops\n- a: b");
+        assert_eq!(clean_key, keyed_hash("folder", &clean));
+        let (input, key) = folder_embed("K", &format!("ops/{s}"), &s, &format!("- x: {s}"));
+        assert!(!input.contains(&s), "{input}");
+        assert!(input.contains(zam_markdown::SECRET_MARK), "{input}");
+        // ключ — от замаскированной строки
+        assert_eq!(key, keyed_hash("folder", &input));
     }
 
     #[test]

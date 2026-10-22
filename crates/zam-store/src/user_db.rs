@@ -180,6 +180,9 @@ impl UserDbs {
         };
         let edges = crate::graph::backfill_pending(&db).await?;
         let secrets = secrets_scan_pending(&db).await?;
+        // теги payload и вход эмбеддинга папок (v3): до возврата базы — воркер проверяет
+        // отметку reindex при первом её открытии
+        rescan_payload_secrets(&db).await?;
         let (done, rechunked) = watch::channel(pending.is_none() && !edges && !secrets);
         *cell = Some(OpenDb {
             db: db.clone(),
@@ -300,6 +303,114 @@ async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
         pruned,
         "перенарезка секретов базы завершена"
     );
+    Ok(())
+}
+
+/// Ключ `meta`: разовая проверка payload и точек папок на значения секретов (ревью задачи 11,
+/// задача 15 M3) выполнена. Теги точек Qdrant и вход эмбеддинга L0 папки маскируются с
+/// задачи 15; у новой пустой базы ключ ставится сразу.
+const SECRETS_PAYLOAD: &str = "secrets_scanned_v3";
+
+/// Разовая проверка базы, открытой до маскировки тегов payload и входа эмбеддинга папок: если
+/// у живой заметки или записи вне Human тег содержит секрет, или вход эмбеддинга L0 папки
+/// (пространство, путь, имя, L0) содержит секрет, ставится отметка reindex базы из кэша
+/// (`reindex_pending`, без инференса для известных текстов; уже стоящая отметка не
+/// заменяется): воркер перепишет точки — теги уже замаскированы, у затронутых папок новый вход
+/// эмбеддинга не найдётся в кэше и их свёртка пересчитается (`missed_folders`), а старые
+/// точки области удаляются пересборкой. L0 папок с секретом маскируется сразу (он виден в
+/// карточках папок). Синхронно, в одной транзакции писателя, до возврата базы: воркер
+/// проверяет отметку при первом открытии базы после запуска. В лог — только счётчики.
+async fn rescan_payload_secrets(db: &Db) -> Result<(), StoreError> {
+    let found = db
+        .write(|tx| {
+            if has_meta(tx, SECRETS_PAYLOAD)? {
+                return Ok(None);
+            }
+            let secret = |s: &str| !zam_markdown::scan_secrets(s).is_empty();
+            let mut notes = 0u64;
+            {
+                let mut st = tx.prepare(
+                    "SELECT n.frontmatter FROM nodes n JOIN spaces s ON s.id = n.space_id
+                     WHERE n.kind = 'note' AND n.deleted_at IS NULL AND s.kind <> 'human'
+                       AND n.frontmatter IS NOT NULL",
+                )?;
+                for fm in st.query_map([], |r| r.get::<_, String>(0))? {
+                    let tags = crate::nodes::frontmatter_tags(&fm?).unwrap_or_default();
+                    if tags.iter().any(|t| secret(t)) {
+                        notes += 1;
+                    }
+                }
+            }
+            let mut entries = 0u64;
+            {
+                let mut st = tx.prepare(
+                    "SELECT e.tags FROM entries e JOIN spaces s ON s.id = e.space_id
+                     WHERE e.deleted_at IS NULL AND s.kind <> 'human'",
+                )?;
+                for tags in st.query_map([], |r| r.get::<_, String>(0))? {
+                    let tags: Vec<String> = serde_json::from_str(&tags?).unwrap_or_default();
+                    if tags.iter().any(|t| secret(t)) {
+                        entries += 1;
+                    }
+                }
+            }
+            let folders: Vec<(Id, bool, String, String, String, String)> = {
+                let mut st = tx.prepare(
+                    "SELECT n.id, s.kind = 'human', s.name, n.path, n.name, n.l0
+                     FROM nodes n JOIN spaces s ON s.id = n.space_id
+                     WHERE n.kind = 'folder' AND n.deleted_at IS NULL AND n.l0 IS NOT NULL",
+                )?;
+                st.query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<Result<_, _>>()?
+            };
+            let mut stale_folders = 0u64;
+            for (id, human, space, path, name, l0) in &folders {
+                let masked = zam_markdown::mask_text(l0);
+                if &masked != l0 {
+                    tx.execute(
+                        "UPDATE nodes SET l0 = ?2 WHERE id = ?1",
+                        params![id, masked],
+                    )?;
+                }
+                if !human && secret(&crate::jobs::folder_embed_raw(space, path, name, l0)) {
+                    stale_folders += 1;
+                }
+            }
+            if notes + entries + stale_folders > 0 {
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+                    params![
+                        crate::jobs::REINDEX_KEY,
+                        serde_json::json!({"full": false, "space": null}).to_string()
+                    ],
+                )?;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
+                [SECRETS_PAYLOAD],
+            )?;
+            Ok(Some((notes, entries, stale_folders)))
+        })
+        .await?;
+    if let Some((notes, entries, folders)) = found
+        && notes + entries + folders > 0
+    {
+        tracing::info!(
+            notes,
+            entries,
+            folders,
+            "секреты в тегах payload и папках: отмечена пересборка индекса базы из кэша"
+        );
+    }
     Ok(())
 }
 

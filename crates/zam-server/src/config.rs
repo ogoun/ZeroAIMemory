@@ -434,6 +434,12 @@ pub struct SearchSection {
     /// `expand=graph` (§8.5, §9.2 п. 7): балл соседа по графу — балл найденного элемента,
     /// умноженный на этот вес (0..=1, по умолчанию 0,5).
     pub graph_weight: f64,
+    /// Вес канала папок (§8.3, §9.2): найденная векторным поиском папка поднимает чанки
+    /// узлов своего поддерева на `w_folder / (rrf_k + ранг папки)`. По умолчанию 0 — канал
+    /// выключен до сетки eval задачи 18 (`{0; 0,3; 0,5; 1,0}`, без значимого выигрыша — 0).
+    pub w_folder: f64,
+    /// Не больше карточек папок в выдаче при `filters.kinds ∋ folder` (по умолчанию 2).
+    pub max_folders: usize,
 }
 
 impl SearchSection {
@@ -451,6 +457,7 @@ impl SearchSection {
             ("w_fts", self.w_fts),
             ("w_fts_relaxed", self.w_fts_relaxed),
             ("w_trigram", self.w_trigram),
+            ("w_folder", self.w_folder),
             ("recency_half_life_days", self.recency_half_life_days),
         ] {
             if !(v.is_finite() && v >= 0.0) {
@@ -586,6 +593,8 @@ impl Default for ServerConfig {
                 boost_theorem: 1.10,
                 boost_hypothesis: 1.00,
                 graph_weight: 0.5,
+                w_folder: 0.0,
+                max_folders: 2,
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
@@ -896,6 +905,8 @@ mod tests {
             (1.20, 1.10, 1.00)
         );
         assert_eq!(c.search.graph_weight, 0.5);
+        // канал папок выключен до сетки задачи 18, карточек папок — не больше двух
+        assert_eq!((c.search.w_folder, c.search.max_folders), (0.0, 2));
         assert_eq!(c.insights.dedup_threshold, 0.90);
     }
 
@@ -1291,6 +1302,7 @@ yield_ms = 1
             ("ZAM_SEARCH__W_FTS", "-1"),
             ("ZAM_SEARCH__W_TRIGRAM", "nan"),
             ("ZAM_SEARCH__MAX_PER_NODE", "0"),
+            ("ZAM_SEARCH__W_FOLDER", "-0.5"),
         ] {
             let err = load(None, &[env(k, v)], &Default::default())
                 .unwrap_err()

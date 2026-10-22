@@ -340,6 +340,43 @@ pub async fn levels_filter_and_note_prefetch(idx: &dyn VectorIndex) {
     assert_eq!(hits[0].level, "note");
 }
 
+/// Точки папок (канал папок, M3): только с `folders`, своим фильтром — виды и `certainty`
+/// запроса к ним не применяются, области и префикс пути — применяются.
+pub async fn folders_prefetch_on_request(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let (node, folder) = (Id::new(), Id::new());
+    let mut f_pt = point(&ctx, folder, "f-ops", 11, "ops", "folder");
+    f_pt.payload.kind = "folder".into();
+    idx.upsert(vec![point(&ctx, node, "c-ops", 11, "ops/a", "chunk"), f_pt])
+        .await
+        .unwrap();
+    let mut f = filter(&ctx);
+    f.kinds = vec!["note".into()];
+    assert_eq!(search_ids(idx, 11, &f).await, ["c-ops"]);
+    f.folders = true;
+    f.certainty = vec!["axiom".into()];
+    // чанк без certainty отфильтрован, папка — нет
+    let hits = idx.search(&vec_for(11), &sparse_for(11), &f).await.unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(
+        (hits[0].chunk_id.as_str(), hits[0].level.as_str()),
+        ("f-ops", "folder")
+    );
+    assert_eq!(hits[0].target, node_ref(folder));
+    f.certainty.clear();
+    assert_eq!(search_ids(idx, 11, &f).await, ["c-ops", "f-ops"]);
+    // префикс пути и области — и для папок
+    f.path_prefix = Some("other".into());
+    assert!(search_ids(idx, 11, &f).await.is_empty());
+    f.path_prefix = None;
+    f.scopes[0].space_ids = vec![Id::new()];
+    assert!(search_ids(idx, 11, &f).await.is_empty());
+}
+
 pub async fn delete_node_removes_all_its_points(idx: &dyn VectorIndex) {
     idx.ensure(MODEL, DIM).await.unwrap();
     let ctx = Ctx {
@@ -703,6 +740,7 @@ macro_rules! vector_index_cases {
             filters_isolate_users_and_spaces,
             path_prefix_uses_path_ancestors,
             levels_filter_and_note_prefetch,
+            folders_prefetch_on_request,
             delete_node_removes_all_its_points,
             missing_collection_is_not_found_and_count_filters,
             human_space_is_rejected,

@@ -214,6 +214,12 @@ pub(crate) fn context_prefix(
     mask_text(&s)
 }
 
+/// Теги для payload точек Qdrant: теги задаёт автор, значение секрета в теге маскируется
+/// так же, как в `context_prefix` (§7.6; ревью задачи 11 M3).
+pub(crate) fn mask_tags(tags: Vec<String>) -> Vec<String> {
+    tags.into_iter().map(|t| mask_text(&t)).collect()
+}
+
 /// Чанк до вставки в БД.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChunkRow {

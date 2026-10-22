@@ -45,8 +45,8 @@ use zam_core::{Id, TargetRef};
 use crate::IndexError;
 use crate::qdrant::{COLLECTION, DENSE, SCHEMA_VERSION, SPARSE};
 use crate::vector::{
-    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, VectorFilter, VectorHit, VectorIndex,
-    VectorScope, check_points, hit_target, point_id, split_targets,
+    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, VectorFilter, VectorHit,
+    VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
 };
 
 /// Файл метаданных шарда (аналог `metadata` коллекции Qdrant).
@@ -57,6 +57,7 @@ const SEGMENTS: usize = 2;
 const UPSERT_BATCH: usize = 256;
 const LEAF_PREFETCH: usize = 50;
 const NOTE_PREFETCH: usize = 10;
+const FOLDER_PREFETCH: usize = 10;
 const RRF_K: usize = 60;
 const QUERY_LIMIT: usize = 60;
 const MAX_ERR_MSG: usize = 200;
@@ -307,11 +308,25 @@ impl EdgeIndex {
                 NOTE_PREFETCH,
             ));
         }
+        // точки папок — своим prefetch, лимит растёт на его размер (как у managed)
+        let mut limit = QUERY_LIMIT;
+        if f.folders
+            && !q_dense.is_empty()
+            && let Some(folder_filter) = point_filter(&f.folder_filter(), &[LEVEL_FOLDER.into()])
+        {
+            prefetches.push(prefetch(
+                dense_query(q_dense),
+                folder_filter,
+                Some(rescore()),
+                FOLDER_PREFETCH,
+            ));
+            limit += FOLDER_PREFETCH;
+        }
         let shard = self.inner.shard()?;
         if prefetches.is_empty() {
             return Ok(Vec::new());
         }
-        let mut req = QueryRequest::new(QUERY_LIMIT);
+        let mut req = QueryRequest::new(limit);
         req.prefetches = prefetches;
         req.query = Some(ScoringQuery::Fusion(Fusion::Rrf {
             k: RRF_K,

@@ -196,7 +196,7 @@ pub struct NodePayload {
     pub path: String,
     /// Все префиксы пути по сегментам, включая сам путь: `a`, `a/b`, `a/b/c`.
     pub path_ancestors: Vec<String>,
-    /// Теги из frontmatter (у записи журнала — её теги).
+    /// Теги из frontmatter (у записи журнала — её теги), значения секретов замаскированы.
     pub tags: Vec<String>,
     /// Область (`nodes.area` / `entries.area`).
     pub area: Option<String>,
@@ -539,7 +539,7 @@ pub async fn enqueue_reindex(db: &Db, space: Option<Id>) -> Result<u64, StoreErr
 }
 
 /// Ключ `meta`: незавершённая пересборка индекса базы из кэша (reindex).
-const REINDEX_KEY: &str = "reindex_pending";
+pub(crate) const REINDEX_KEY: &str = "reindex_pending";
 
 /// Отмечает (`Some(spec)`) или снимает (`None`) незавершённую пересборку индекса базы:
 /// отметка ставится до удаления точек области и снимается после её восстановления, так что
@@ -671,8 +671,10 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
     }
     payload.path_ancestors = path_ancestors(&payload.path);
     payload.tags = match fm.as_deref() {
-        Some(s) => crate::nodes::frontmatter_tags(s)
-            .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node}: {e}")))?,
+        Some(s) => crate::nodes::mask_tags(
+            crate::nodes::frontmatter_tags(s)
+                .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node}: {e}")))?,
+        ),
         None => Vec::new(),
     };
     read_index_chunks(
@@ -908,6 +910,19 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
         Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
+}
+
+/// Строка входа эмбеддинга L0 папки до маскировки: `[<пространство>/<путь>] <имя>\n<L0>`.
+pub(crate) fn folder_embed_raw(space: &str, path: &str, name: &str, l0: &str) -> String {
+    format!("[{space}/{path}] {name}\n{l0}")
+}
+
+/// Вход эмбеддинга L0 папки (точка уровня `folder`, §8.3): имя пространства, путь и имя
+/// папки задаёт автор, L0 — свёртка имён и L0 детей, поэтому строка маскируется сканером
+/// секретов целиком (как `context_prefix` чанков, §7.6). Без секретов — строка как есть
+/// (ключ кэша чистых папок не меняется).
+pub fn folder_embed_input(space: &str, path: &str, name: &str, l0: &str) -> String {
+    zam_markdown::mask_text(&folder_embed_raw(space, path, name, l0))
 }
 
 /// Папка с L0 для точки уровня `folder` (пересборка индекса из кэша).

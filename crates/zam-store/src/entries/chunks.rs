@@ -199,7 +199,8 @@ fn entry_index_chunks(tx: &Connection, id: Id) -> Result<Vec<IndexChunk>, StoreE
              WHERE e.id = ?1",
         )?
         .query_row([id], |r| {
-            let tags: Vec<String> = super::json_col(r, 3)?;
+            // теги — в payload точек: значения секретов маскируются (§7.6)
+            let tags = crate::nodes::mask_tags(super::json_col(r, 3)?);
             let data: serde_json::Value = super::json_col(r, 8)?;
             let area: Option<String> = r.get(4)?;
             let kind: EntryKind = r.get(6)?;

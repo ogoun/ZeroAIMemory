@@ -39,8 +39,8 @@ pub use edge::{EdgeIndex, EdgeOptions};
 pub use qdrant::{COLLECTION, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE};
 pub use reindex::{ReindexCtx, ReindexReport, ReindexRequest, reindex};
 pub use vector::{
-    IndexFuture, IndexMeta, IndexPoint, NAMESPACE_ZAM, PointPayload, VectorFilter, VectorHit,
-    VectorIndex, VectorScope, point_id,
+    IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, NAMESPACE_ZAM, PointPayload, VectorFilter,
+    VectorHit, VectorIndex, VectorScope, point_id,
 };
 pub use worker::{
     PassageEmbedder, ReindexOutcome, SkippedDb, WorkerConfig, WorkerDeps, WorkerHandle,
