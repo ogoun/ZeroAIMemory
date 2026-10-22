@@ -7,7 +7,7 @@ Our public API is used by about nine hundred partner integrations, ranging from 
 
 ## Versioning model
 
-### Dated versions
+#### Dated versions
 
 The API uses dated versions, such as `2025-03-01`, passed in a request header. Each partner account has a default version, pinned to the version that was current when the account first made a request, and a request can override it with the header. When we release a new version, nothing changes for existing partners until they opt in by changing their default or sending the header. Inside our code, each version is a set of transformations applied to requests and responses on top of the latest internal representation, so the core business logic only ever deals with the newest shape of the data. Example of a request that explicitly selects a version:
 
@@ -19,7 +19,7 @@ curl https://api.example.com/v1/orders/ord_123 \
 
 We chose dated versions over a major version in the URL after living with `/v1/` and `/v2/` for several years. The URL scheme encouraged big-bang releases, where a new major version bundled dozens of changes and partners had to migrate everything at once, so most of them never migrated. With dated versions, each version contains only a few changes, and a partner who moves forward one version at a time has a small, well-documented diff to handle each step.
 
-#### Version transformations
+##### Version transformations
 
 Each version is described by a list of changes, and each change is implemented as a pair of functions: one that transforms an incoming request from the old shape to the new one, and one that transforms an outgoing response from the new shape to the old one. When a partner pinned to an old version makes a request, the request passes through every transformation from their version up to the latest, the handler runs, and the response passes back down through the same transformations in reverse. A change that renames a field is two lines; a change that splits one field into two is a few more. This layering has a cost: a partner pinned to a version from three years ago passes through about forty transformations, which adds roughly two milliseconds per request. We consider that acceptable.
 
@@ -27,17 +27,17 @@ Each version is described by a list of changes, and each change is implemented a
 
 The most important part of the guide is the list of changes that require a new version. We publish it to partners, and internally it is enforced by a contract test suite that runs against every pull request touching the API layer. Breaking changes include removing or renaming a field, an endpoint or an enum value; changing the type or format of a field; making an optional request field required; changing the meaning of an existing field; and changing error codes for existing error conditions.
 
-### Changes that are not breaking, officially
+#### Changes that are not breaking, officially
 
 Adding a new optional request field, a new response field, a new endpoint or a new event type is not breaking according to our published policy, and partners are told that their integrations must tolerate unknown fields. In practice, this is where most real breakage happens. The first incident that taught us this was adding a value to the order status enum: we added `partially_refunded`, which was non-breaking by our own rules, and a widely used open-source plugin for one shop platform crashed on any order with that status because it mapped statuses with an exhaustive switch and threw on unknown values. About a hundred and forty shops using that plugin stopped syncing orders until the plugin author released a fix nine days later. Since then, new enum values in responses are themselves versioned: partners on older versions receive the closest older value, in this case `refunded` with an additional field, and only partners on the new version see the new value.
 
-#### Ordering, pagination and defaults
+##### Ordering, pagination and defaults
 
 Other changes that are technically compatible but break integrations in practice include changing the default sort order of a list endpoint, changing the default page size, and changing which fields are included by default when a response supports expansion. We now treat all of these as breaking changes that require a new version, even though the published policy does not strictly require it. A partner who relied on the default sort order without specifying one is wrong according to our documentation, but the partner's customers do not care whose fault it is.
 
 ## Deprecation
 
-### Timeline
+#### Timeline
 
 When a version or an endpoint is deprecated, we announce it with at least twelve months' notice for versions and six months for individual endpoints in older versions. Deprecated responses carry a `Deprecation` header with the date and a `Sunset` header with the removal date, following the relevant standards, plus a link to the migration guide. The partner dashboard shows a list of deprecated features the partner has used in the last thirty days, with request counts and example request ids. Example of the headers on a deprecated response:
 
@@ -47,11 +47,11 @@ Sunset: Wed, 01 Jul 2026 00:00:00 GMT
 Link: <https://docs.example.com/migrations/2025-03-01>; rel="deprecation"
 ```
 
-#### Reaching the partners who do not read
+##### Reaching the partners who do not read
 
 Headers and dashboards reach the partners who look at them. A large share of partners never do. For those, we rely on usage data: three months before a sunset date, every partner account that still used the deprecated feature in the last thirty days gets an email to the technical contact on file and to the account owner. One month before, partners with significant volume get a call from their account manager. Two weeks before, we run brownouts: the deprecated feature returns an error for one hour at a scheduled time, announced in advance, so that integrations that nobody monitors produce failures that somebody notices. Brownouts were controversial internally because they deliberately break integrations, but they are the only mechanism that reliably reaches unmaintained integrations before the permanent removal. In our last major removal, the first brownout cut the remaining traffic on the deprecated endpoint by about half within a week, because the brownout triggered support tickets at the shops that used those integrations, and the shops then contacted whoever built them.
 
-### Removal
+#### Removal
 
 On the sunset date, the deprecated feature starts returning a `410 Gone` error with a message pointing to the migration guide. We keep the old code path in place for a further thirty days behind a per-partner override, so that a partner with a genuine emergency can be given a short extension by support. In the last removal, fourteen partners received an extension, and all of them migrated within the thirty days.
 
@@ -59,11 +59,11 @@ On the sunset date, the deprecated feature starts returning a `410 Gone` error w
 
 We publish official client libraries in four languages, generated from the API description and then lightly hand-edited. Each SDK release targets one API version, and upgrading the SDK is the most common way partners move to a new version, often without realizing it. That makes SDK releases part of the versioning story. A major SDK version bump is required whenever the underlying API version changes, so that partners pinned to an SDK major version are also pinned to an API version, and SDK changelogs repeat the relevant API changes in the SDK's own terms, because most partners read the changelog of the package they install, not ours.
 
-### Generated code and unknown values
+#### Generated code and unknown values
 
 The generated clients were the second source of enum trouble. Early versions of the generator produced strict enum types that failed to deserialize unknown values, which made any new enum value a breaking change for anyone using the official SDK, contradicting our own policy that unknown values must be tolerated. We changed the generator so that every enum type has an explicit unknown variant that carries the raw string, and every SDK's tests include a case that deserializes a response with an invented enum value. Partners who generate their own clients from the API description get a warning in the description itself: each enum is marked as extensible, and the documentation explains what that means for generated code.
 
-#### Pagination helpers
+##### Pagination helpers
 
 The SDKs also hide pagination behind iterators, which turned out to have a subtle interaction with versioning. When we changed cursor encoding in one version, partners using the SDK iterators upgraded seamlessly, while partners who had copied cursors into their own databases to resume long synchronisations found that cursors from the old version were rejected by the new one. We now treat cursor format as part of the versioned contract: cursors carry the version they were issued under, and the API accepts cursors from any supported version for their full validity period, translating them internally. This was not part of the original design, and it is a good example of something partners store that we did not think of as stored data.
 
@@ -73,11 +73,11 @@ The worst incident related to versioning was not about the request API at all, b
 
 ## Internal practices
 
-### Review checklist
+#### Review checklist
 
 Every pull request that changes the public API layer must answer a short set of questions in its description: does it add, remove or change any field, endpoint, enum value or default; if so, is the change gated behind a new version; is there a transformation for older versions; and is the changelog entry written in terms a partner understands. The API review group, a rotating set of four engineers, approves every such pull request, and the contract test suite fails the build if the response shape for any existing version changes without a corresponding version entry.
 
-#### Contract tests
+##### Contract tests
 
 The contract test suite stores example requests and responses for every endpoint in every supported version and replays them on each build. A difference in any response for any version fails the build, unless the difference is listed as expected in the version's change list. This catches accidental breaking changes, such as a serializer upgrade that started omitting null fields, which happened once and would have broken partners who checked for the presence of a field rather than its value. Run the suite locally for one endpoint with:
 
@@ -85,7 +85,7 @@ The contract test suite stores example requests and responses for every endpoint
 make api-contract ENDPOINT=orders.retrieve VERSIONS=all
 ```
 
-##### Measuring version adoption
+###### Measuring version adoption
 
 We track how many partners and how much traffic are on each version. Today about sixty percent of traffic comes from the latest two versions, but the long tail is long: there is still meaningful traffic on versions more than three years old. We do not force partners to upgrade unless we are removing something, because every forced upgrade costs partners effort and costs us goodwill. The cost of carrying old versions is mainly in the transformation layer and the contract tests, and so far it has stayed manageable.
 

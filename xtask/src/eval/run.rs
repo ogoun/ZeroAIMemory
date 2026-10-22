@@ -1121,6 +1121,7 @@ const MEASURED_PATHS: &[&str] = &[
     "eval/insights.toml",
     "eval/grid.toml",
     "eval/grid-overlap.toml",
+    "eval/grid-chunk-size.toml",
     "eval/grid-confirm.toml",
     "eval/grid-relaxed.toml",
 ];

@@ -1232,8 +1232,12 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                                 }
                             }
                         }
-                        if ev.contains("\n#") || ev.starts_with('#') {
-                            bad("evidence захватывает строку заголовка".into());
+                        // строки H1–H3 в листы не входят (секции нарезки); H4–H6 — текст листа
+                        if ev.lines().any(|l| {
+                            let hashes = l.chars().take_while(|&c| c == '#').count();
+                            (1..=3).contains(&hashes) && l[hashes..].starts_with(' ')
+                        }) {
+                            bad("evidence захватывает строку заголовка H1–H3".into());
                         }
                     }
                     (Some(_), None) => {}
@@ -1473,7 +1477,7 @@ mod tests {
             "en/long/ingest",
             &format!(
                 "# Ingest\n\n{filler}\n\n#### Retries\n\nThe ingest worker retries a failed batch \
-                 exactly four times before parking it.\n\n{filler}\n"
+                 exactly four times before parking it.\n\n## Part two\n\n{filler}\n"
             ),
         )
     }
@@ -1517,7 +1521,15 @@ mod tests {
         cert.weaker = vec!["insight:cache-guess".into()];
         let mut chunk = m3_query("k1", Kind::Chunk, "en/long/ingest");
         chunk.evidence = Some("The ingest worker retries a failed batch exactly four times".into());
-        let s = validate(&c, &[sup.clone(), sup2, cert.clone(), chunk.clone()], false).unwrap();
+        // строка H4 — текст листа, в evidence допустима
+        let mut h4 = m3_query("k2", Kind::Chunk, "en/long/ingest");
+        h4.evidence = Some("#### Retries\n\nThe ingest worker retries a failed batch".into());
+        let s = validate(
+            &c,
+            &[sup.clone(), sup2, cert.clone(), chunk.clone(), h4],
+            false,
+        )
+        .unwrap();
         assert_eq!((s.chains, s.retracted, s.contradictions), (1, 1, 1));
         assert_eq!((s.long_notes, s.insights, s.queries_m2), (1, 6, 0));
 
@@ -1534,14 +1546,20 @@ mod tests {
         bad_ev.id = "b4".into();
         bad_ev.evidence =
             Some("The ingest worker retries a failed batch exactly five times".into());
-        let mut edge_ev = chunk;
+        let mut edge_ev = chunk.clone();
         edge_ev.id = "b5".into();
         edge_ev.evidence = Some("lorem ipsum dolor sit amet lorem ipsum dolor sit amet".into());
+        // строка H2 в листы не входит — evidence с ней не найдётся ни в одном листе
+        let mut h2 = chunk.clone();
+        h2.id = "b7".into();
+        h2.evidence = Some("exactly four times before parking it.\n\n## Part two".into());
         let mut stray = m3_query("b6", Kind::Exact, "en/long/ingest");
         stray.evidence = Some("x".into());
         let err = validate(
             &c,
-            &[bad_forbid, bad_weaker, bad_expect, bad_ev, edge_ev, stray],
+            &[
+                bad_forbid, bad_weaker, bad_expect, bad_ev, edge_ev, stray, h2,
+            ],
             false,
         )
         .unwrap_err()
@@ -1554,6 +1572,7 @@ mod tests {
             "запрос b4: evidence нет дословно",
             "запрос b5: evidence не из середины",
             "запрос b6: evidence — только у chunk",
+            "запрос b7: evidence захватывает строку заголовка H1–H3",
         ] {
             assert!(err.contains(needle), "{needle}: {err}");
         }

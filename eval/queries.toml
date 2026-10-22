@@ -1928,15 +1928,15 @@ text = "почему при сверке контрольных сумм пос�
 lang = "ru"
 expect = ["ru/long/postgres-major-upgrade-runbook"]
 kind = "chunk"
-evidence = "Расхождение нашлось ровно в одном диапазоне, и причиной была не репликация, а триггер на старом кластере, который при обновлении строки дописывал служебное поле с текущим временем"
+evidence = "Расхождение нашлось ровно в одном диапазоне, и причиной была не репликация, а триггер на старом кластере, который при обновлении строки дописывал служебное поле с текущим временем: на новом кластере триггер тоже срабатывал при применении изменений, и время получалось другим. Это важный урок, потому что триггеры при логической репликации по умолчанию не срабатывают у подписчика, если таблица не помечена особым образом, а у нас именно этот триггер был объявлен с `ENABLE ALWAYS` ещё со времён старой схемы аудита."
 
 [[query]]
 id = "k-02"
-text = "сколько длился простой на запись при боевом переключении кластера заказов"
+text = "какие параметры автоочистки выставили на новом кластере PostgreSQL 16"
 lang = "ru"
 expect = ["ru/long/postgres-major-upgrade-runbook"]
 kind = "chunk"
-evidence = "В боевом переключении мы заранее завершили такие сеансы, и весь простой на запись составил три минуты сорок секунд по журналу пула соединений, из которых больше минуты ушло на ожидание нулевой задержки подписок"
+evidence = "половина из них уже не имела смысла после изменения нагрузки. Пример:\n\n```ini\nautovacuum_vacuum_scale_factor = 0.02"
 
 [[query]]
 id = "k-03"
@@ -1944,15 +1944,15 @@ text = "из-за чего нестабильно падали интеграц�
 lang = "ru"
 expect = ["ru/long/ci-pipeline-retrospective"]
 kind = "chunk"
-evidence = "Через месяц стало видно, что почти все нестабильные падения дают всего двадцать три теста, и больше половины из них — интеграционные тесты одного сервиса уведомлений, где тест ждал появления сообщения в очереди с фиксированным таймаутом в две секунды"
+evidence = "Через месяц стало видно, что почти все нестабильные падения дают всего двадцать три теста, и больше половины из них — интеграционные тесты одного сервиса уведомлений, где тест ждал появления сообщения в очереди с фиксированным таймаутом в две секунды, а на загруженном агенте брокер успевал доставить сообщение только за три-четыре. Мы переписали эти тесты на ожидание с опросом и общим пределом в тридцать секунд, и доля невоспроизводимых падений на основной ветке за следующий месяц упала до полутора процентов."
 
 [[query]]
 id = "k-04"
-text = "почему удалённый кеш артефактов сборки поначалу почти не давал попаданий"
+text = "как выглядел исходный ключ кеша зависимостей в CI с именем ветки"
 lang = "ru"
 expect = ["ru/long/ci-pipeline-retrospective"]
 kind = "chunk"
-evidence = "Причина нашлась в переменных окружения: в ключ кеша попадал путь к рабочему каталогу агента, а он содержал номер сборки, поэтому ключ был уникальным для каждой задачи."
+evidence = "Пример исходного ключа:\n\n```yaml\nkey: deps-${{ branch }}-${{ hashFiles('package-lock.json') }}"
 
 [[query]]
 id = "k-05"
@@ -1960,15 +1960,15 @@ text = "за какое время заполнялись последние п�
 lang = "ru"
 expect = ["ru/long/incident-disk-full-logs"]
 kind = "chunk"
-evidence = "При нашем темпе записи журналов, около ста двадцати мегабайт в минуту на узел в часы пик, последние пять процентов диска заполнялись примерно за семь минут"
+evidence = "При нашем темпе записи журналов, около ста двадцати мегабайт в минуту на узел в часы пик, последние пять процентов диска заполнялись примерно за семь минут, и между срабатыванием алерта и полным заполнением оставалось слишком мало времени, чтобы дежурный успел среагировать. Более того, алерт сработал в 14:01, но ушёл в общий канал с низким приоритетом, где в тот момент шло обсуждение другого предупреждения, и его заметили только в 14:15, уже после первых жалоб партнёров."
 
 [[query]]
 id = "k-06"
-text = "почему после принудительной ротации журналов место на диске шлюза не освободилось"
+text = "когда пришла первая жалоба партнёра и с какой гипотезы начал дежурный"
 lang = "ru"
 expect = ["ru/long/incident-disk-full-logs"]
 kind = "chunk"
-evidence = "Первая проверка показала, что ротация срабатывает, но шлюз продолжает писать в старый, уже переименованный файл, и место не освобождается: сигнал на переоткрытие журналов отправлялся процессу-обёртке, а не самому шлюзу."
+evidence = "#### Во время инцидента\n\nВ 14:09 первый партнёр написал в канал поддержки об ошибках при загрузке файлов. В 14:12 дежурный по шлюзу увидел рост доли ошибок 502 на общем графике и начал разбор, предположив проблему у вышестоящего сервиса хранения файлов, потому что ошибки были сосредоточены на загрузках."
 
 [[query]]
 id = "k-07"
@@ -1976,15 +1976,15 @@ text = "почему экземпляры индексатора выпадал�
 lang = "ru"
 expect = ["ru/long/kafka-consumer-lag-analysis"]
 kind = "chunk"
-evidence = "Пачка из пятисот сообщений, в которой оказывалось несколько десятков таких событий, обрабатывалась дольше пяти минут, экземпляр не успевал вызвать опрос, и брокер исключал его из группы, запуская перебалансировку"
+evidence = "Пачка из пятисот сообщений, в которой оказывалось несколько десятков таких событий, обрабатывалась дольше пяти минут, экземпляр не успевал вызвать опрос, и брокер исключал его из группы, запуская перебалансировку, после которой тот же экземпляр получал те же разделы с той же тяжёлой пачкой. Пример настройки, которую мы поменяли первой, чтобы разорвать этот круг, пока чинили код преобразования:"
 
 [[query]]
 id = "k-08"
-text = "как переигрывание старых событий топика не затирает свежие документы поискового индекса"
+text = "подтвердилась ли гипотеза о перекосе нагрузки по разделам топика"
 lang = "ru"
 expect = ["ru/long/kafka-consumer-lag-analysis"]
 kind = "chunk"
-evidence = "Поскольку запись документа идемпотентна и в документе хранится номер версии заказа, более старое событие не может перезаписать более свежий документ: движок отклоняет запись с меньшим номером версии."
+evidence = "##### Перекос разделов\n\nВторой гипотезой был перекос нагрузки по разделам: если несколько крупных клиентов генерируют много событий, их заказы могли концентрироваться в нескольких разделах. Мы построили график отставания по каждому разделу и действительно увидели перекос, но умеренный, в пределах полутора раз между самым загруженным и самым свободным разделом, и он не объяснял падение пропускной способности всей группы до нуля."
 
 [[query]]
 id = "k-09"
@@ -1992,15 +1992,15 @@ text = "насколько медленнее ставятся зависимо�
 lang = "ru"
 expect = ["ru/long/dev-environment-onboarding"]
 kind = "chunk"
-evidence = "Мы измеряли это на типичном ноутбуке команды: установка зависимостей фронтенда каталога заняла четыре минуты на смонтированном диске и одиннадцать секунд внутри файловой системы Linux, а полная сборка бэкенда — семь минут против пятидесяти секунд."
+evidence = "Мы измеряли это на типичном ноутбуке команды: установка зависимостей фронтенда каталога заняла четыре минуты на смонтированном диске и одиннадцать секунд внутри файловой системы Linux, а полная сборка бэкенда — семь минут против пятидесяти секунд. Редактор можно запускать в Windows с подключением к WSL, это работает хорошо. Второй нюанс — переводы строк: настройте git так, чтобы он не конвертировал их, а репозитории содержат файл атрибутов, который фиксирует LF для всех текстовых файлов."
 
 [[query]]
 id = "k-10"
-text = "какой якобы тестовый ключ платёжного шлюза из старого файла пришлось срочно отзывать"
+text = "где держать репозитории при работе через WSL2 и почему"
 lang = "ru"
 expect = ["ru/long/dev-environment-onboarding"]
 kind = "chunk"
-evidence = "Был случай, когда тестовый ключ платёжного шлюза в одном из старых файлов на самом деле оказался ключом от песочницы партнёра с реальными лимитами, и его пришлось срочно отзывать."
+evidence = "##### Особенности WSL2\n\nЕсли вы работаете на Windows через WSL2, держите репозитории внутри файловой системы Linux, а не на смонтированном диске Windows. Доступ к файлам Windows из WSL2 идёт через сетевой протокол, и операции с большим числом мелких файлов, например установка зависимостей или сборка, на смонтированном диске медленнее в десятки раз."
 
 [[query]]
 id = "k-11"
@@ -2008,15 +2008,15 @@ text = "какое поле оказалось переоценённым при
 lang = "ru"
 expect = ["ru/long/catalog-search-relevance-study"]
 kind = "chunk"
-evidence = "Сетка из сорока восьми комбинаций весов названия, бренда, категории и описания, оценённая на наборе, показала, что вес описания был сильно завышен: длинные описания с перечислением всего подряд давали совпадения по запросам, к которым товар не имел отношения."
+evidence = "Первым делом мы переподобрали веса полей. Сетка из сорока восьми комбинаций весов названия, бренда, категории и описания, оценённая на наборе, показала, что вес описания был сильно завышен: длинные описания с перечислением всего подряд давали совпадения по запросам, к которым товар не имел отношения. Снижение веса описания в четыре раза и повышение веса категории дало прирост nDCG на 0,031 с интервалом от 0,019 до 0,044, и это изменение выкатили первым, без онлайн-теста, потому что оно было простым и обратимым."
 
 [[query]]
 id = "k-12"
-text = "почему два прогона офлайн-оценки одной и той же конфигурации ранжирования давали разный nDCG"
+text = "как размечали результаты поиска и по какой шкале"
 lang = "ru"
 expect = ["ru/long/catalog-search-relevance-study"]
 kind = "chunk"
-evidence = "Первая — недетерминированный порядок товаров с одинаковым баллом: движок возвращал их в порядке внутренних идентификаторов сегментов, который менялся после слияния сегментов."
+evidence = "##### Разметка\n\nДля каждого запроса мы брали первые двадцать результатов текущего поиска и ещё до двадцати кандидатов из экспериментальных вариантов ранжирования, объединяли их и отдавали на разметку. Разметчики оценивали каждый товар по шкале из четырёх уровней: точно то, что искали; подходит; слабо связан; не подходит."
 
 [[query]]
 id = "k-13"
@@ -2024,15 +2024,15 @@ text = "сколько на самом деле заняло восстанов�
 lang = "ru"
 expect = ["ru/long/object-storage-backup-strategy"]
 kind = "chunk"
-evidence = "Первая же проверка показала семь часов десять минут, из которых больше пяти ушло на скачивание копии из хранилища на временный сервер с сетевым ограничением, о котором никто не знал."
+evidence = "До внедрения автоматической проверки в плане было написано «восстановление основной базы — около двух часов». Первая же проверка показала семь часов десять минут, из которых больше пяти ушло на скачивание копии из хранилища на временный сервер с сетевым ограничением, о котором никто не знал. После перехода на тип сервера с более широкой сетью и параллельного скачивания частей копии время сократилось до двух часов сорока минут, и именно эта цифра теперь записана в плане."
 
 [[query]]
 id = "k-14"
-text = "что выявило первое квартальное учение по восстановлению файлов пользователей из версий"
+text = "как часто формируется отчёт о резервных копиях и что в нём"
 lang = "ru"
 expect = ["ru/long/object-storage-backup-strategy"]
 kind = "chunk"
-evidence = "Первое такое учение выявило, что метаданные объектов, в которых хранится исходное имя файла, при репликации копировались, а при восстановлении из версии — нет, потому что скрипт восстановления использовал простое копирование содержимого."
+evidence = "###### Отчётность\n\nРаз в месяц формируется отчёт: какие копии сделаны, какие проверки восстановления прошли и сколько они заняли, сколько стоит хранение."
 
 [[query]]
 id = "k-15"
@@ -2040,15 +2040,15 @@ text = "из-за чего первое автоматическое обнов�
 lang = "ru"
 expect = ["ru/long/tls-certificate-rotation"]
 kind = "chunk"
-evidence = "Поначалу эта команда в одном из сервисов перезаписывала хранилище с паролем по умолчанию, а сервис ожидал другой пароль из своей конфигурации, и первое же автоматическое обновление уронило сервис при перезапуске."
+evidence = "Поначалу эта команда в одном из сервисов перезаписывала хранилище с паролем по умолчанию, а сервис ожидал другой пароль из своей конфигурации, и первое же автоматическое обновление уронило сервис при перезапуске. Это нашлось на тестовом окружении, где мы специально выставили срок действия сертификатов в два дня, чтобы обновление происходило часто и все такие проблемы вылезали до продуктового окружения. Этот приём — короткие сроки на тестовом окружении — оказался самым полезным во всём проекте, и мы оставили его насовсем."
 
 [[query]]
 id = "k-16"
-text = "на какой срок выпускаются клиентские сертификаты для взаимной аутентификации сервисов платёжного контура"
+text = "почему сертификаты на десять лет опаснее коротких"
 lang = "ru"
 expect = ["ru/long/tls-certificate-rotation"]
 kind = "chunk"
-evidence = "Клиентские сертификаты выпускаются на двадцать четыре часа и обновляются каждые восемь. При таком сроке отзыв почти не нужен: скомпрометированный сертификат перестанет действовать максимум через сутки"
+evidence = "##### Сроки действия\n\nСроки действия сертификатов были самые разные: от девяноста дней у тех, что выпускались автоматически, до десяти лет у некоторых внутренних, выпущенных когда-то вручную. Сертификаты со сроком десять лет выглядят удобными, но на деле они опаснее всего: за десять лет все, кто знал, где они стоят и как их обновлять, успевают уйти из компании, и истечение превращается в археологию."
 
 [[query]]
 id = "k-17"
@@ -2056,15 +2056,15 @@ text = "почему сервис заказов исчерпывал пул с�
 lang = "ru"
 expect = ["ru/long/checkout-load-testing-report"]
 kind = "chunk"
-evidence = "Самый популярный товар распродажи, на который по прогнозу приходилась почти десятая часть всех заказов, создавал горячую строку, и все транзакции резервирования выстраивались в очередь за блокировкой этой строки."
+evidence = "Самый популярный товар распродажи, на который по прогнозу приходилась почти десятая часть всех заказов, создавал горячую строку, и все транзакции резервирования выстраивались в очередь за блокировкой этой строки. Пока они ждали, сервис заказов держал свои соединения, и пул в пятьдесят соединений на экземпляр заканчивался. Это классическая картина каскада: проблема в одном месте, видна в другом."
 
 [[query]]
 id = "k-18"
-text = "сколько хранился ключ идемпотентности создания заказа и почему срок увеличили"
+text = "по какому профилю подавалась нагрузка в тесте оформления заказа"
 lang = "ru"
 expect = ["ru/long/checkout-load-testing-report"]
 kind = "chunk"
-evidence = "Без этой проверки мы бы не узнали, что ключ идемпотентности хранится в кеше всего пять минут, а мобильное приложение при плохой связи может повторить запрос через десять."
+evidence = "###### Профиль нагрузки\n\nНагрузка подавалась не ровным потоком, а ступенями и пиком: десять минут прогрева на десяти процентах от целевой, затем рост до целевой за две минуты, удержание пятнадцать минут, всплеск до полутора целевых на пять минут и плавное снижение. Резкий рост за две минуты специально имитирует старт распродажи, когда все приходят одновременно по уведомлению."
 
 [[query]]
 id = "k-19"
@@ -2072,15 +2072,15 @@ text = "почему при обезличивании заказов новый
 lang = "ru"
 expect = ["ru/long/personal-data-retention-policy"]
 kind = "chunk"
-evidence = "Отдельная тонкость: случайный идентификатор генерируется заново, а не вычисляется хешем от старого, потому что хеш от известного идентификатора можно пересчитать и восстановить связь."
+evidence = "Через тридцать дней после удаления учётной записи сервис заказов заменяет идентификатор пользователя в его заказах на случайный идентификатор, общий для всех заказов этого пользователя, чтобы аналитика повторных покупок продолжала работать, но без возможности сопоставить его с человеком. Адрес доставки заменяется на код региона, имя получателя и телефон удаляются. Отдельная тонкость: случайный идентификатор генерируется заново, а не вычисляется хешем от старого, потому что хеш от известного идентификатора можно пересчитать и восстановить связь."
 
 [[query]]
 id = "k-20"
-text = "какой сервис только скрывал флагом данные удалённых пользователей вместо удаления"
+text = "какое правило действует для персональных данных в журналах приложений"
 lang = "ru"
 expect = ["ru/long/personal-data-retention-policy"]
 kind = "chunk"
-evidence = "Первое такое учение показало, что повторное применение работает для всех сервисов, кроме сервиса отзывов, который подтверждал удаление в реестре, но фактически только скрывал отзывы удалённых пользователей флагом, не удаляя текст."
+evidence = "##### Журналы и трассы\n\nЖурналы приложений — самый частый источник утечек персональных данных в непредусмотренные места. Мы ввели правило: персональные данные не пишутся в журналы вообще, а идентифицировать пользователя в журнале можно только по внутреннему идентификатору."
 
 [[query]]
 id = "k-21"
@@ -2088,15 +2088,15 @@ text = "почему новая версия приложения падала �
 lang = "ru"
 expect = ["ru/long/mobile-release-train"]
 kind = "chunk"
-evidence = "Падения приходились на устройства с операционной системой трёхлетней давности, которых на ферме не было: новая версия библиотеки работы с изображениями использовала системный вызов, появившийся в более поздней версии системы"
+evidence = "В четвёртом поезде доля сессий без падений на одной платформе упала на первой же ступени раскатки на полпроцента. Падения приходились на устройства с операционной системой трёхлетней давности, которых на ферме не было: новая версия библиотеки работы с изображениями использовала системный вызов, появившийся в более поздней версии системы, и на старых устройствах приложение падало при открытии карточки товара. Сквозные тесты этого не поймали, потому что на ферме самое старое устройство было на версию новее."
 
 [[query]]
 id = "k-22"
-text = "из-за чего у части пользователей мобильного приложения корзина вдруг стала пустой после отката бэкенда"
+text = "как вручную запустить сквозные тесты релизной сборки на ферме устройств"
 lang = "ru"
 expect = ["ru/long/mobile-release-train"]
 kind = "chunk"
-evidence = "После отката сервис корзины перестал отдавать новое поле, и новая версия приложения, которая к тому моменту была у двадцати процентов пользователей, показывала пустую корзину, потому что код не был готов к отсутствию поля."
+evidence = "Выполните, чтобы запустить сквозные тесты релизной сборки на ферме вручную:\n\n```sh\ndevice-farm run --app build/release.apk --suite regression --devices pool:release"
 
 [[query]]
 id = "k-23"
@@ -2104,15 +2104,15 @@ text = "why did the recently viewed feature create one huge sorted set before th
 lang = "en"
 expect = ["en/long/redis-cluster-migration"]
 kind = "chunk"
-evidence = "The scan found one surprise: a single sorted set used for the \"recently viewed\" feature had grown to 1.9 GB because the trimming job that capped each user's list had been silently failing for months after a deploy changed its schedule format."
+evidence = "The scan found one surprise: a single sorted set used for the \"recently viewed\" feature had grown to 1.9 GB because the trimming job that capped each user's list had been silently failing for months after a deploy changed its schedule format. Every user's recent views lived in one key, keyed internally by user id. In a cluster that key would have pinned 1.9 GB and a large share of reads to whichever shard owned its slot. We rewrote the feature to use one small sorted set per user, which distributes naturally, and fixed the trimming job."
 
 [[query]]
 id = "k-24"
-text = "how often does the split rate limiter consume a user's budget without serving the request"
+text = "what Redis Cluster client configuration did most services settle on"
 lang = "en"
 expect = ["en/long/redis-cluster-migration"]
 kind = "chunk"
-evidence = "In the worst case a request can pass the user check and then fail the global check, having consumed one unit of the user's budget without being served. We measured how often this happens under synthetic load at about one request in fifty thousand"
+evidence = "Example client configuration we settled on for most services:\n\n```yaml\nredis:\n  mode: cluster"
 
 [[query]]
 id = "k-25"
@@ -2120,15 +2120,15 @@ text = "why were production hosts doing reverse lookups that got forwarded to th
 lang = "en"
 expect = ["en/long/dns-outage-postmortem"]
 kind = "chunk"
-evidence = "On top of that, a monitoring agent on production hosts did reverse lookups on peer addresses, and the acquired company's address ranges overlapped with one of our old, partially decommissioned internal ranges"
+evidence = "On top of that, a monitoring agent on production hosts did reverse lookups on peer addresses, and the acquired company's address ranges overlapped with one of our old, partially decommissioned internal ranges, so reverse lookups for addresses in that range were forwarded to the new servers as well. Neither path was large on its own, but together they produced a few hundred queries per second for the forwarded zone in each region, which was more than enough to exhaust the worker pool when each query took several seconds to time out."
 
 [[query]]
 id = "k-26"
-text = "why did rolling back the resolver configuration take so long during the DNS outage"
+text = "where were the acquired company private DNS servers and how were they reached"
 lang = "en"
 expect = ["en/long/dns-outage-postmortem"]
 kind = "chunk"
-evidence = "The rollback took seventeen minutes from decision to effect, because the configuration management agent on the resolver hosts runs on a thirty-minute schedule"
+evidence = "###### The forwarding change\n\nAfter the acquisition, engineers needed to resolve names in the acquired company's private zone, which was served by their own DNS servers inside a VPN tunnel. The tunnel terminated in one of our three regions."
 
 [[query]]
 id = "k-27"
@@ -2136,15 +2136,15 @@ text = "why was automatic freezing of expired feature flags removed from the pla
 lang = "en"
 expect = ["en/long/feature-flag-platform"]
 kind = "chunk"
-evidence = "We tried harder enforcement in the first year: expired flags were automatically frozen, so their rules could not be changed. That backfired badly when an expired flag needed to be turned off during an incident and nobody on call could unfreeze it quickly."
+evidence = "It opens a ticket for the owning team, it adds a warning to the flag's page, and after another thirty days it starts emitting a daily metric that feeds into the owning team's engineering health score. We tried harder enforcement in the first year: expired flags were automatically frozen, so their rules could not be changed. That backfired badly when an expired flag needed to be turned off during an incident and nobody on call could unfreeze it quickly. Freezing was removed after that incident, and we now rely on visibility rather than force."
 
 [[query]]
 id = "k-28"
-text = "how did the new pricing calculation flag get enabled for every user by accident"
+text = "where are feature flags evaluated and how does the client get the ruleset"
 lang = "en"
 expect = ["en/long/feature-flag-platform"]
 kind = "chunk"
-evidence = "The rule editor at the time had a percentage slider directly beside the segment selector, and the slider had been dragged to one hundred percent by accident while selecting the segment."
+evidence = "#### Evaluation in the client\n\nFlags are evaluated inside each service by a client library, not by a remote call. The library downloads the full ruleset for its environment at startup, keeps it in memory and receives updates through a streaming connection."
 
 [[query]]
 id = "k-29"
@@ -2152,15 +2152,15 @@ text = "why are info logs that share a trace id with an error always kept despit
 lang = "en"
 expect = ["en/long/observability-stack-design"]
 kind = "chunk"
-evidence = "That last rule matters a lot, because it means the full log context of a failed request is almost always available even when routine logs for that service are being heavily sampled."
+evidence = "That last rule matters a lot, because it means the full log context of a failed request is almost always available even when routine logs for that service are being heavily sampled. Daily volume is now about three terabytes, and in incident reviews nobody has reported missing logs that they needed."
 
 [[query]]
 id = "k-30"
-text = "why was tail-based trace sampling abandoned after the pilot"
+text = "why must metric label cardinality stay bounded"
 lang = "en"
 expect = ["en/long/observability-stack-design"]
 kind = "chunk"
-evidence = "It was abandoned for now because the collectors needed to buffer complete traces in memory, and for our longest asynchronous workflows a trace can take minutes to complete"
+evidence = "##### Cardinality\n\nThe single most important rule for metrics is to keep label cardinality bounded. Every unique combination of label values is a separate time series, and the cost of the database grows with the number of active series, not with the number of samples."
 
 [[query]]
 id = "k-31"
@@ -2168,15 +2168,15 @@ text = "what happened to shop plugins when the partially refunded order status w
 lang = "en"
 expect = ["en/long/api-versioning-guide"]
 kind = "chunk"
-evidence = "we added `partially_refunded`, which was non-breaking by our own rules, and a widely used open-source plugin for one shop platform crashed on any order with that status because it mapped statuses with an exhaustive switch and threw on unknown values."
+evidence = "In practice, this is where most real breakage happens. The first incident that taught us this was adding a value to the order status enum: we added `partially_refunded`, which was non-breaking by our own rules, and a widely used open-source plugin for one shop platform crashed on any order with that status because it mapped statuses with an exhaustive switch and threw on unknown values. About a hundred and forty shops using that plugin stopped syncing orders until the plugin author released a fix nine days later."
 
 [[query]]
 id = "k-32"
-text = "why did some partners reject every webhook after the signature scheme change"
+text = "how are version transformations applied to requests and responses for old API versions"
 lang = "en"
 expect = ["en/long/api-versioning-guide"]
 kind = "chunk"
-evidence = "What we missed was that webhook delivery used the partner's default version, while some partners had pinned their requests to a newer version using the header but never changed their default."
+evidence = "##### Version transformations\n\nEach version is described by a list of changes, and each change is implemented as a pair of functions: one that transforms an incoming request from the old shape to the new one, and one that transforms an outgoing response from the new shape to the old one. When a partner pinned to an old version makes a request, the request passes through every transformation from their version up to the latest, the handler runs, and the response passes back down through the same transformations in reverse."
 
 [[query]]
 id = "k-33"
@@ -2184,15 +2184,15 @@ text = "why did node drains get stuck during the Kubernetes upgrade in staging"
 lang = "en"
 expect = ["en/long/kubernetes-upgrade-log"]
 kind = "chunk"
-evidence = "The cause in almost every case was a pod disruption budget that could not be satisfied: a deployment with one replica and a budget that required at least one available pod, which makes the pod impossible to evict voluntarily."
+evidence = "Drains got stuck on about one node in five. The cause in almost every case was a pod disruption budget that could not be satisfied: a deployment with one replica and a budget that required at least one available pod, which makes the pod impossible to evict voluntarily. These budgets had been created by a deployment template that set `minAvailable: 1` for every service regardless of its replica count. For services with three or more replicas this is fine, but for single-replica services it blocks every drain forever."
 
 [[query]]
 id = "k-34"
-text = "why did long polling connections break when ingress controller pods were rescheduled"
+text = "which ingress controller setting restored the longer shutdown grace period"
 lang = "en"
 expect = ["en/long/kubernetes-upgrade-log"]
 kind = "chunk"
-evidence = "The new ingress controller version, which we had upgraded as a prerequisite, terminated connections on shutdown faster than the old one: the old version waited for in-flight requests for up to thirty seconds, while the new one used a shorter default grace period that cut off long-polling connections."
+evidence = "Example of the setting:\n\n```yaml\ncontroller:\n  config:\n    worker-shutdown-timeout: \"30s\""
 
 [[query]]
 id = "k-35"
@@ -2200,15 +2200,15 @@ text = "why did the first deploy of the new webhook endpoint reject about two pe
 lang = "en"
 expect = ["en/long/payment-webhooks-reliability"]
 kind = "chunk"
-evidence = "One trap we fell into during the redesign was verifying the signature over the parsed and re-serialized JSON instead of the raw request body. Re-serialization can change whitespace and key order, and the signature then fails for perfectly valid events."
+evidence = "One trap we fell into during the redesign was verifying the signature over the parsed and re-serialized JSON instead of the raw request body. Re-serialization can change whitespace and key order, and the signature then fails for perfectly valid events. The first deploy of the new endpoint rejected about two percent of events for exactly this reason, on events whose payload contained characters our JSON library escaped differently from the provider's. The fix was to capture the raw body bytes before any parsing and verify against those."
 
 [[query]]
 id = "k-36"
-text = "what bug in the loyalty points consumer did the randomized webhook test find"
+text = "how does the payment webhook worker lock per payment id"
 lang = "en"
 expect = ["en/long/payment-webhooks-reliability"]
 kind = "chunk"
-evidence = "The first was in the outbox consumer for loyalty points, which recorded the outbox id as processed in a separate transaction after crediting the points, so a crash between the two steps credited points twice on retry."
+evidence = "Example of the locking step:\n\n```sql\nSELECT pg_try_advisory_xact_lock(hashtext($1));"
 
 [[query]]
 id = "k-37"
@@ -2216,15 +2216,15 @@ text = "why does the partial index for stuck warehouse orders stay small as the 
 lang = "en"
 expect = ["en/long/postgres-index-tuning-notes"]
 kind = "chunk"
-evidence = "rows enter it when an order reaches an intermediate status and leave it when the order moves on, so its size tracks the number of orders in flight, not the size of the table."
+evidence = "A partial index on `(warehouse_id, status, updated_at)` restricted to those three statuses was about 300 MB, compared to tens of gigabytes for a full index on the same columns, and the query went from around four seconds to under ten milliseconds. The interesting thing about this index is that it stays small forever: rows enter it when an order reaches an intermediate status and leave it when the order moves on, so its size tracks the number of orders in flight, not the size of the table."
 
 [[query]]
 id = "k-38"
-text = "what was the exact duplicate index found on the orders table and where did it come from"
+text = "does lowering the fill factor affect pages already written in the orders table"
 lang = "en"
 expect = ["en/long/postgres-index-tuning-notes"]
 kind = "chunk"
-evidence = "two identical indexes on `(status)` with different names, one created by a migration in the application and one created by hand during an incident two years earlier and never removed. The duplicate alone was 18 GB."
+evidence = "###### Fill factor\n\nLowering the fill factor of an existing table only affects pages written after the change"
 
 [[query]]
 id = "k-39"
@@ -2232,15 +2232,15 @@ text = "why did the browser start downloading the main product image so late on 
 lang = "en"
 expect = ["en/long/frontend-performance-audit"]
 kind = "chunk"
-evidence = "Separately, the image used a lazy-loading attribute set by a shared image component that applied lazy loading to every image by default, including the one image on the page that should be loaded eagerly."
+evidence = "Separately, the image used a lazy-loading attribute set by a shared image component that applied lazy loading to every image by default, including the one image on the page that should be loaded eagerly. Either problem alone would have delayed the image; together they delayed it by more than a second and a half. The fix was to render the main image's markup on the server, with eager loading and a high fetch priority, and to keep the rest of the gallery client-rendered. Example of the markup for the main image:"
 
 [[query]]
 id = "k-40"
-text = "why did clicking a filter checkbox on search results feel slow on mid-range phones"
+text = "what was the largest contentful element on product pages and how was LCP broken down"
 lang = "en"
 expect = ["en/long/frontend-performance-audit"]
 kind = "chunk"
-evidence = "The fetch is asynchronous and does not block the interaction, but before fetching, the code synchronously recomputed facet counts for all filters from the current result set, which took about 200 ms on a mid-range device for large categories."
+evidence = "##### Largest Contentful Paint on product pages\n\nOn product pages the largest contentful element was almost always the main product image. The attribution data broke LCP into four parts: time to first byte, the delay before the image request started, the time to download the image, and the delay between download and rendering."
 
 [[query]]
 id = "k-41"
@@ -2248,15 +2248,15 @@ text = "why did recommendations flicker during the day for users far from UTC"
 lang = "en"
 expect = ["en/long/ml-model-serving-notes"]
 kind = "chunk"
-evidence = "Offline, it was computed from the order table with the date truncated to midnight in UTC; online, it was computed from a cached user profile with timestamps in the user's local time zone."
+evidence = "One memorable example was a feature for the number of days since the user's last purchase. Offline, it was computed from the order table with the date truncated to midnight in UTC; online, it was computed from a cached user profile with timestamps in the user's local time zone. For users in time zones far from UTC the feature was off by one for part of every day, and since the model had learned a sharp effect around the first day after a purchase, recommendations for those users flickered between two quite different sets during the day."
 
 [[query]]
 id = "k-42"
-text = "what effect did raising the cross-encoder batch timeout to three milliseconds have on GPU utilization"
+text = "which runtimes does the model server use for tree ensembles and neural models"
 lang = "en"
 expect = ["en/long/ml-model-serving-notes"]
 kind = "chunk"
-evidence = "With three milliseconds, the median batch reached the maximum of sixty-four at peak, GPU utilization rose to about seventy percent, and the 99th percentile latency increased by only two milliseconds"
+evidence = "##### Model server\n\nAll three families are served by the same model server, which loads models from the model registry, exposes a gRPC endpoint per model version and handles batching, metrics and health checks. Tree ensembles run on CPU nodes through a compiled inference library, and neural models are exported to ONNX and run through ONNX Runtime, on CPU for the user tower and with the CUDA execution provider for the cross-encoder."
 
 [[query]]
 id = "k-43"
@@ -2264,12 +2264,124 @@ text = "why is the on-call access check mandatory before a shift"
 lang = "en"
 expect = ["en/long/oncall-handbook"]
 kind = "chunk"
-evidence = "The access check exists because of an incident in which the primary was paged at 03:00 for a full disk on a database node, and discovered that their access to the database hosts had expired the week before during a routine access review."
+evidence = "The access check exists because of an incident in which the primary was paged at 03:00 for a full disk on a database node, and discovered that their access to the database hosts had expired the week before during a routine access review. They spent forty minutes getting emergency access approved while the disk filled up. Since then, access expiry for on-call roles is aligned with the rotation schedule, and the preflight is mandatory."
 
 [[query]]
 id = "k-44"
-text = "what share of declared incidents were later downgraded to minor"
+text = "what does the on-call access check verify before a primary shift"
 lang = "en"
 expect = ["en/long/oncall-handbook"]
 kind = "chunk"
-evidence = "During the first year of the current process, about a third of declared incidents were later downgraded to minor, and we consider that a healthy ratio."
+evidence = "##### Access check\n\nThe week before your primary shift, run the access check, which verifies that you can do everything on-call might require: log in to every production cluster, read logs and traces, use the deploy tool's rollback, open the database consoles for the platform's own databases, access the secrets store for break-glass credentials, and receive a test page on your phone. Run it with:"
+
+[[query]]
+id = "k-45"
+text = "which headers does a deprecated API response carry"
+lang = "en"
+expect = ["en/long/api-versioning-guide"]
+kind = "chunk"
+evidence = "The partner dashboard shows a list of deprecated features the partner has used in the last thirty days, with request counts and example request ids. Example of the headers on a deprecated response:\n\n```text\nDeprecation: @1735689600"
+
+[[query]]
+id = "k-46"
+text = "what resolver setting now limits concurrent queries per forwarder"
+lang = "en"
+expect = ["en/long/dns-outage-postmortem"]
+kind = "chunk"
+evidence = "The resolver supports a per-upstream limit on concurrent queries, which would have contained the damage, but it was not configured. Example of the setting we have now added for every forwarder:\n\n```text\nforward-zone:"
+
+[[query]]
+id = "k-47"
+text = "what configuration does a service pass to the feature flag client library"
+lang = "en"
+expect = ["en/long/feature-flag-platform"]
+kind = "chunk"
+evidence = "Example of the configuration a service passes to the library:\n\n```yaml\nflags:"
+
+[[query]]
+id = "k-48"
+text = "what markup is used for the server-rendered main product image"
+lang = "en"
+expect = ["en/long/frontend-performance-audit"]
+kind = "chunk"
+evidence = "The fix was to render the main image's markup on the server, with eager loading and a high fetch priority, and to keep the rest of the gallery client-rendered. Example of the markup for the main image:\n\n```html\n<img src=\"/img/p/123/main-800.webp\""
+
+[[query]]
+id = "k-49"
+text = "what does the serving configuration of a model version contain"
+lang = "en"
+expect = ["en/long/ml-model-serving-notes"]
+kind = "chunk"
+evidence = "Example of the serving configuration for a model version:\n\n```yaml\nmodel: search-rerank"
+
+[[query]]
+id = "k-50"
+text = "how is a typical service latency histogram metric defined"
+lang = "en"
+expect = ["en/long/observability-stack-design"]
+kind = "chunk"
+evidence = "Example of a typical service metric definition:\n\n```go\nvar requestDuration = prometheus.NewHistogramVec("
+
+[[query]]
+id = "k-51"
+text = "which command runs the on-call access preflight check"
+lang = "en"
+expect = ["en/long/oncall-handbook"]
+kind = "chunk"
+evidence = "Run it with:\n\n```sh\noncall-preflight --role platform-primary"
+
+[[query]]
+id = "k-52"
+text = "как выглядит запись словаря синонимов поиска в новом формате"
+lang = "ru"
+expect = ["ru/long/catalog-search-relevance-study"]
+kind = "chunk"
+evidence = "Пример записи в новом формате:\n\n```text\nкуртка => куртка, ветровка, бомбер"
+
+[[query]]
+id = "k-53"
+text = "как описан сценарий оформления заказа в генераторе нагрузки"
+lang = "ru"
+expect = ["ru/long/checkout-load-testing-report"]
+kind = "chunk"
+evidence = "Пример фрагмента описания сценария:\n\n```python\n@task(weight=1)"
+
+[[query]]
+id = "k-54"
+text = "что лежит в файле версий инструментов в корне репозитория каталога"
+lang = "ru"
+expect = ["ru/long/dev-environment-onboarding"]
+kind = "chunk"
+evidence = "Все версии инструментов закреплены в файле в корне репозитория, и менеджер версий подхватывает их автоматически при входе в каталог. Пример содержимого файла версий:\n\n```text\nnodejs 20.11.1"
+
+[[query]]
+id = "k-55"
+text = "как выглядит правило ротации журналов шлюза в репозитории сервиса"
+lang = "ru"
+expect = ["ru/long/incident-disk-full-logs"]
+kind = "chunk"
+evidence = "Пример правила, которое теперь лежит в репозитории сервиса:\n\n```text\n/var/log/gateway/*.log {"
+
+[[query]]
+id = "k-56"
+text = "какую настройку потребителя поменяли первой, чтобы остановить каскад перебалансировок"
+lang = "ru"
+expect = ["ru/long/kafka-consumer-lag-analysis"]
+kind = "chunk"
+evidence = "Пример настройки, которую мы поменяли первой, чтобы разорвать этот круг, пока чинили код преобразования:\n\n```properties\nmax.poll.records=100"
+
+[[query]]
+id = "k-57"
+text = "как настроено маскирование персональных данных в библиотеке журналирования"
+lang = "ru"
+expect = ["ru/long/personal-data-retention-policy"]
+kind = "chunk"
+evidence = "Пример правила маскирования в конфигурации библиотеки:\n\n```yaml\nredact:"
+
+[[query]]
+id = "k-58"
+text = "какая политика DNS разрешает клиенту ACME создавать записи проверки только в своём поддомене"
+lang = "ru"
+expect = ["ru/long/tls-certificate-rotation"]
+kind = "chunk"
+evidence = "Пример фрагмента политики, разрешающей клиенту каталога создавать только записи проверки в своём поддомене:\n\n```text\nallow update: key catalog-acme; name _acme-challenge.catalog.internal; type TXT"
