@@ -444,3 +444,74 @@ async fn rerank_on_without_model_warns_and_keeps_order() {
     let r = search(&a, json!({"query": "скрипты", "rerank": "maybe"})).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
+
+/// Листы под H4–H6 (путь `H2 > H4`, задача 17 M3): `expand=section` отдаёт секцию H1–H3,
+/// в которой лежит лист, а листы одной секции под разными H4 сливаются в один элемент.
+#[tokio::test]
+async fn expand_section_for_leaves_under_h4() {
+    let a = api("search-expand-h4", |_| {}).await;
+    let filler = |m: &str| {
+        (0..150)
+            .map(|i| format!("{m}{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let content = format!(
+        "# Док\n\nВступление.\n\n## Детали\n\nНачало секции.\n\n#### Первый\n\n\
+         АЛЬФАМЕТКА общеслово. {}\n\n#### Второй\n\nБЕТАМЕТКА общеслово. {}\n\n\
+         ## Другое\n\nПро другое.\n",
+        filler("первый"),
+        filler("второй")
+    );
+    let node = a.note("knowledge", "глубокая", &content).await;
+    let node = node["id"].as_str().unwrap();
+    let body = |q: &str, extra: Value| {
+        let mut b = json!({"query": q, "mode": "chunks", "top_k": 5, "budget_tokens": 20000});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    };
+    // контроль: без expand — два отдельных листа; второй начинается под H4 (путь до H4)
+    let j = search(&a, body("общеслово", json!({}))).await.json();
+    let mut hp: Vec<&str> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["node_id"] == node)
+        .map(|i| i["heading_path"].as_str().unwrap())
+        .collect();
+    hp.sort();
+    assert_eq!(hp, ["Док > Детали", "Док > Детали > Второй"], "{j}");
+
+    // лист под H4 разворачивается в свою секцию H2
+    let j = search(
+        &a,
+        body("БЕТАМЕТКА", json!({"expand": "section", "top_k": 1})),
+    )
+    .await
+    .json();
+    let sec = j["items"][0]["text"].as_str().unwrap();
+    assert!(sec.starts_with("## Детали"), "{sec}");
+    for m in ["Начало секции", "АЛЬФАМЕТКА", "БЕТАМЕТКА"] {
+        assert!(sec.contains(m), "{m}: {sec}");
+    }
+    assert!(!sec.contains("Про другое"), "{sec}");
+
+    // два листа одной секции под разными H4 — один элемент
+    let j = search(&a, body("общеслово", json!({"expand": "section"})))
+        .await
+        .json();
+    let mine: Vec<&Value> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["node_id"] == node)
+        .collect();
+    assert_eq!(mine.len(), 1, "{j}");
+    assert_eq!(mine[0]["chunk_ids"].as_array().unwrap().len(), 2, "{j}");
+    assert!(
+        mine[0]["text"].as_str().unwrap().starts_with("## Детали"),
+        "{j}"
+    );
+}

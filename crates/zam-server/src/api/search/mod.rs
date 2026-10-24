@@ -642,13 +642,21 @@ fn group_by_node(items: Vec<Item>, top_k: usize) -> Vec<Item> {
     order
 }
 
-/// Собственный текст секции `heading_path` (заголовок и текст до первой подсекции);
-/// пустой путь — преамбула. Если секций с таким путём несколько, берётся та, где лежит
-/// лист `leaf`: секции, содержащие самую длинную (наиболее специфичную) строку листа, а
-/// среди них — с наибольшей долей строк листа. Короткие однотипные строки (```` ``` ````,
-/// `---`, `</details>`) так секцию не решают. Ни одна не подошла — первая. `None` —
-/// секции нет.
-fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a str> {
+/// Секция листа для `expand=section`: начало секции H1–H3 (или преамбулы) в байтах
+/// исходника — ключ слияния — и её собственный текст (заголовок и текст до первой
+/// подсекции).
+///
+/// С задачи 17 путь листа включает H4–H6 (`A > B > Глубокий`), а секции `Doc` — только
+/// H1–H3, поэтому кандидаты — секции, чей путь является префиксом `heading_path` по
+/// компонентам (` > `); преамбула — префикс любого пути. Секция определяется по месту
+/// листа: среди кандидатов, содержащих самую длинную (наиболее специфичную) строку листа,
+/// — с наибольшей долей строк листа, при равенстве — самая глубокая. Собственные тексты
+/// секций не пересекаются, поэтому так находится секция, где лист действительно лежит, —
+/// и при повторяющихся путях, и при « > » в тексте заголовка. Короткие однотипные строки
+/// (```` ``` ````, `---`, `</details>`) секцию не решают. Лист не найден в тексте (например,
+/// исходник другой ревизии) — запасной вариант: самый длинный префикс пути, первый из
+/// равных. `None` — подходящей секции нет.
+fn leaf_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<(usize, &'a str)> {
     let doc = zam_markdown::parse(src);
     let own = |i: usize| {
         let s = &doc.sections[i];
@@ -659,14 +667,19 @@ fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a s
             .max(s.body.start.min(s.range.end));
         src.get(s.range.start..end).map(str::trim_end)
     };
-    let found: Vec<usize> = (0..doc.sections.len())
-        .filter(|&i| {
+    // (индекс, глубина) кандидатов
+    let found: Vec<(usize, usize)> = (0..doc.sections.len())
+        .filter_map(|i| {
             let s = &doc.sections[i];
-            if heading_path.is_empty() {
-                s.level == 0
-            } else {
-                s.level > 0 && s.path.join(" > ") == heading_path
+            if s.level == 0 {
+                return Some((i, 0));
             }
+            let p = s.path.join(" > ");
+            let prefix = heading_path == p
+                || heading_path
+                    .strip_prefix(p.as_str())
+                    .is_some_and(|rest| rest.starts_with(" > "));
+            prefix.then_some((i, s.path.len()))
         })
         .collect();
     let lines: Vec<&str> = leaf
@@ -680,20 +693,41 @@ fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a s
         _ => Some(l),
     });
     let by_leaf = longest.and_then(|key| {
-        let mut best: Option<(usize, usize)> = None;
-        for &i in &found {
+        let mut best: Option<(usize, usize, usize)> = None;
+        for &(i, depth) in &found {
             let Some(t) = own(i) else { continue };
             if !t.contains(key) {
                 continue;
             }
             let n = lines.iter().filter(|l| t.contains(*l)).count();
-            if best.is_none_or(|(_, m)| n > m) {
-                best = Some((i, n));
+            if best.is_none_or(|(_, m, d)| (n, depth) > (m, d)) {
+                best = Some((i, n, depth));
             }
         }
-        best.map(|(i, _)| i)
+        best.map(|(i, _, _)| i)
     });
-    own(by_leaf.or(found.first().copied())?)
+    // запасной вариант: самый длинный префикс пути (преамбула — только для пустого пути)
+    let by_path = || {
+        let depth = if heading_path.is_empty() { 0 } else { 1 };
+        found
+            .iter()
+            .filter(|&&(_, d)| d >= depth)
+            .fold(None::<(usize, usize)>, |b, &(i, d)| match b {
+                Some((_, bd)) if bd >= d => b,
+                _ => Some((i, d)),
+            })
+            .map(|(i, _)| i)
+    };
+    let i = by_leaf.or_else(by_path)?;
+    Some((doc.sections[i].range.start, own(i)?))
+}
+
+/// Ключ слияния секций в `expand=section`: секция H1–H3 листа (по её началу в исходнике),
+/// если найдена, иначе — путь заголовков листа.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SectionKey {
+    At(usize),
+    Path(String),
 }
 
 /// `mode=chunks`: текст элементов (с `expand=section|neighbors` — расширенный), не
@@ -708,7 +742,7 @@ async fn expand_items(
 ) -> Result<Vec<Item>, ApiError> {
     let targets = health.targets;
     let mut out: Vec<Item> = Vec::with_capacity(top_k);
-    let mut sections: HashMap<(TargetRef, String), usize> = HashMap::new();
+    let mut sections: HashMap<(TargetRef, SectionKey), usize> = HashMap::new();
     let mut contents: HashMap<(Id, i64), Arc<String>> = HashMap::new();
     for mut it in items {
         if out.len() >= top_k {
@@ -728,13 +762,6 @@ async fn expand_items(
         };
         let text = match how {
             Expand::Section => {
-                let key = (it.hit.target, it.hit.heading_path.clone());
-                if let Some(&i) = sections.get(&key) {
-                    let ids = std::mem::take(&mut it.chunk_ids);
-                    out[i].chunk_ids.extend(ids);
-                    continue;
-                }
-                sections.insert(key, out.len());
                 let ck = (it.hit.target.id, it.hit.rev);
                 let src = match contents.get(&ck) {
                     Some(s) => s.clone(),
@@ -749,9 +776,25 @@ async fn expand_items(
                         s
                     }
                 };
+                let sec = leaf_section(&src, &it.hit.heading_path, &base);
+                let key = (
+                    it.hit.target,
+                    sec.map_or_else(
+                        || SectionKey::Path(it.hit.heading_path.clone()),
+                        |(at, _)| SectionKey::At(at),
+                    ),
+                );
+                if let Some(&i) = sections.get(&key) {
+                    let ids = std::mem::take(&mut it.chunk_ids);
+                    out[i].chunk_ids.extend(ids);
+                    continue;
+                }
+                sections.insert(key, out.len());
                 // склеенные чанкером короткие секции: лист может быть длиннее секции
-                match own_section(&src, &it.hit.heading_path, &base) {
-                    Some(sec) if sec.chars().count() >= base.chars().count() => sec.to_string(),
+                match sec {
+                    Some((_, sec)) if sec.chars().count() >= base.chars().count() => {
+                        sec.to_string()
+                    }
                     _ => base,
                 }
             }
@@ -776,13 +819,30 @@ async fn expand_items(
     Ok(out)
 }
 
-/// Убирает из `out` элементы исключённой цели `t` и пересобирает индекс секций.
-fn drop_target(out: &mut Vec<Item>, sections: &mut HashMap<(TargetRef, String), usize>, t: usize) {
+/// Убирает из `out` элементы исключённой цели `t` и переиндексирует секции оставшихся.
+fn drop_target(
+    out: &mut Vec<Item>,
+    sections: &mut HashMap<(TargetRef, SectionKey), usize>,
+    t: usize,
+) {
+    let mut kept = 0;
+    let pos: Vec<Option<usize>> = out
+        .iter()
+        .map(|it| {
+            (it.target != t).then(|| {
+                kept += 1;
+                kept - 1
+            })
+        })
+        .collect();
     out.retain(|it| it.target != t);
-    sections.clear();
-    for (i, it) in out.iter().enumerate() {
-        sections.insert((it.hit.target, it.hit.heading_path.clone()), i);
-    }
+    sections.retain(|_, i| match pos.get(*i).copied().flatten() {
+        Some(j) => {
+            *i = j;
+            true
+        }
+        None => false,
+    });
 }
 
 /// Упакованный элемент: элемент и (для `chunks`) текст с признаком обрезки.
@@ -1820,6 +1880,11 @@ mod tests {
         assert_eq!(md_inline("a\u{E000}b\u{E001}\nc"), "a**b** c");
     }
 
+    /// Текст секции листа (без ключа).
+    fn own_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<&'a str> {
+        leaf_section(src, heading_path, leaf).map(|(_, t)| t)
+    }
+
     #[test]
     fn own_section_text() {
         let src = "Преамбула.\n\n# A\n\nтекст A\n\n## B\n\nтекст B\n\n# C\n\nтекст C\n";
@@ -1852,6 +1917,46 @@ mod tests {
             own_section(tie, "A", "общая длинная строка\ny2"),
             Some("# A\n\nобщая длинная строка\ny2")
         );
+    }
+
+    /// Путь листа с H4–H6 (задача 17): секция — H1–H3, в которой лежит лист; листы одной
+    /// секции под разными H4 дают один ключ слияния, одноимённые секции — разные.
+    #[test]
+    fn leaf_section_for_h4_paths() {
+        let src = "# A\n\n## B\n\nначало B\n\n#### Глубокий\n\nтекст под H4\n\n\
+                   ##### Ещё глубже\n\nтекст под H5\n\n## C\n\nтекст C\n";
+        let b = "## B\n\nначало B\n\n#### Глубокий\n\nтекст под H4\n\n##### Ещё глубже\n\n\
+                 текст под H5";
+        let k4 = leaf_section(src, "A > B > Глубокий", "#### Глубокий\n\nтекст под H4");
+        assert_eq!(k4.map(|(_, t)| t), Some(b));
+        let k5 = leaf_section(
+            src,
+            "A > B > Глубокий > Ещё глубже",
+            "##### Ещё глубже\n\nтекст под H5",
+        );
+        assert_eq!(k5, k4);
+        // лист не найден в тексте — самый длинный префикс пути
+        assert_eq!(own_section(src, "A > B > Глубокий", "нет такого"), Some(b));
+        assert_eq!(own_section(src, "A > Q", "нет такого"), Some("# A"));
+        assert_eq!(own_section(src, "Q > B", "нет такого"), None);
+        // « > » в тексте заголовка не путает: «B > X» — не подсекция B
+        let gt = "# A\n\n## B\n\nпро B\n\n## B > X\n\nпро B > X\n\n#### H\n\nлист\n";
+        assert_eq!(
+            own_section(gt, "A > B > X > H", "#### H\n\nлист"),
+            Some("## B > X\n\nпро B > X\n\n#### H\n\nлист")
+        );
+        // H4 в преамбуле (до первого H1–H3) — преамбула
+        let pre = "#### Сначала\n\nтекст до заголовков\n\n# A\n\nтекст A\n";
+        assert_eq!(
+            own_section(pre, "Сначала", "#### Сначала\nтекст до заголовков"),
+            Some("#### Сначала\n\nтекст до заголовков")
+        );
+        // одноимённые секции с H4 внутри — разные ключи
+        let dup = "# A\n\n#### X\n\nпервый лист\n\n# A\n\n#### X\n\nвторой лист\n";
+        let k1 = leaf_section(dup, "A > X", "#### X\nпервый лист").unwrap();
+        let k2 = leaf_section(dup, "A > X", "#### X\nвторой лист").unwrap();
+        assert_ne!(k1.0, k2.0);
+        assert_eq!(k2.1, "# A\n\n#### X\n\nвторой лист");
     }
 
     /// Сбой чтения базы чужого решения исключает цель с предупреждением, сбой личной базы —
@@ -1910,11 +2015,16 @@ mod tests {
             false,
         );
         out[1].target = 1;
-        let mut sections = HashMap::new();
+        let mut sections: HashMap<(TargetRef, SectionKey), usize> = out
+            .iter()
+            .enumerate()
+            .map(|(i, it)| ((it.hit.target, SectionKey::At(i)), i))
+            .collect();
         drop_target(&mut out, &mut sections, 1);
         assert_eq!(out.len(), 2);
         assert_eq!(sections.len(), 2);
-        assert_eq!(sections[&(out[1].hit.target, String::new())], 1);
+        assert_eq!(sections[&(out[0].hit.target, SectionKey::At(0))], 0);
+        assert_eq!(sections[&(out[1].hit.target, SectionKey::At(2))], 1);
     }
 
     #[test]
