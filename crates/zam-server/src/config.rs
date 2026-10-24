@@ -430,6 +430,13 @@ impl IndexSection {
             heading_path_h4: self.chunk_heading_path_h4,
         }
     }
+
+    /// `chunk_cohesion = true` при `chunk_boundary_lambda = 0`: связность входит только в силу
+    /// границы DP, а при λ = 0 работает жадная упаковка — флаг ничего не меняет (при старте —
+    /// предупреждение в журнал).
+    pub fn cohesion_ignored(&self) -> bool {
+        self.chunk_cohesion && self.chunk_boundary_lambda == 0.0
+    }
 }
 
 /// Секция `[search]` (§9.2): слияние каналов weighted RRF и поправки.
@@ -1297,6 +1304,13 @@ yield_ms = 1
             (0.5, false, true)
         );
         assert!(!d.index.chunk_prefix_l0);
+        // связность без λ ничего не делает — признак для предупреждения при старте
+        assert!(!d.index.cohesion_ignored());
+        let mut i = d.index.clone();
+        i.chunk_cohesion = true;
+        assert!(!i.cohesion_ignored());
+        i.chunk_boundary_lambda = 0.0;
+        assert!(i.cohesion_ignored());
         let c = load(
             None,
             &[

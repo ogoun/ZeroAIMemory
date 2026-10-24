@@ -114,6 +114,12 @@ pub fn setup_chunker(cfg: &ServerConfig, embedder: Option<&Embedder>) -> bool {
             "пороги чанкинга [index] уменьшены под окно модели"
         );
     }
+    if cfg.index.cohesion_ignored() {
+        tracing::warn!(
+            "[index] chunk_cohesion = true при chunk_boundary_lambda = 0 ничего не меняет: \
+             связность учитывается только при λ > 0"
+        );
+    }
     zam_store::set_chunk_params(params);
     zam_store::set_prefix_l0(cfg.index.chunk_prefix_l0);
     match model {
