@@ -29,6 +29,8 @@
 //!   только благодаря перекрытию, не засчитывается **[решение исполнителя]** (исследование
 //!   нарезки §5: «без учёта перекрытия»).
 
+mod load;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,12 +42,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::compare::{Comparison, compare};
 use super::corpus::{
-    Corpus, EVAL_SOLUTION, INSIGHT_REF, Insight, Kind, Lang, Note, Query, in_solution, is_long_path,
+    Corpus, EVAL_SOLUTION, INSIGHT_REF, Kind, Lang, Note, Query, in_solution, is_long_path,
 };
+use super::leaves::{LeafHit, SplitStats, chunk_leaves, leaf_cores, split_stats};
 use super::metrics::{
-    Aggregate, Estimate, QueryMetrics, aggregate, cancelled_at_5, chunk_scores, estimate,
-    leaf_contains, paired_diff, quantile, reliable_first, score,
+    Aggregate, Estimate, QueryMetrics, aggregate, cancelled_at_5, chunk_scores, estimate, quantile,
+    reliable_first, score,
 };
 use super::report;
 use super::{Device, EvalArgs, Mode, Paths};
@@ -420,129 +424,6 @@ impl Session {
         self.load_insights(&corpus.insights)
     }
 
-    /// Человеческий токен администратора прогона (`axiom` пишет только человек): вход
-    /// администратора WebUI (пароль обвязки smoke), `POST /admin/users/{id}/tokens
-    /// {human: true}` с cookie сессии и CSRF.
-    fn human_token(&self) -> Result<String> {
-        let s = crate::smoke::admin_login(&self.base)?;
-        let a = crate::smoke::agent_with(Duration::from_secs(10));
-        let mut r = a
-            .get(&format!("{}/api/v1/auth/me", self.base))
-            .header("Cookie", &s.cookie)
-            .call()?;
-        let me: Value = serde_json::from_str(&r.body_mut().read_to_string()?)?;
-        let id = me["user_id"]
-            .as_str()
-            .context("в /auth/me нет user_id")?
-            .to_string();
-        let mut r = a
-            .post(&format!("{}/api/v1/admin/users/{id}/tokens", self.base))
-            .header("Cookie", &s.cookie)
-            .header("X-CSRF-Token", &s.csrf)
-            .content_type("application/json")
-            .send(r#"{"name":"eval-human","human":true}"#)?;
-        let status = r.status().as_u16();
-        let v: Value = serde_json::from_str(&r.body_mut().read_to_string()?)?;
-        if status != 201 || v["info"]["human"] != true {
-            bail!("выпуск человеческого токена: HTTP {status}");
-        }
-        v["plaintext"]
-            .as_str()
-            .map(String::from)
-            .context("нет plaintext в ответе выпуска токена")
-    }
-
-    /// Создаёт, замещает и отзывает insight набора (порядок файла: замещаемая запись
-    /// определена раньше); проверяет итоговый `certainty`.
-    fn load_insights(&mut self, insights: &[Insight]) -> Result<()> {
-        if insights.is_empty() {
-            return Ok(());
-        }
-        let human = insights
-            .iter()
-            .any(|i| i.certainty.as_deref() == Some("axiom"))
-            .then(|| self.human_token())
-            .transpose()?;
-        let mut ids: BTreeMap<&str, String> = BTreeMap::new();
-        for i in insights {
-            let token = match (i.certainty.as_deref(), &human) {
-                (Some("axiom"), Some(h)) => h.as_str(),
-                _ => self.token.as_str(),
-            };
-            let mut data = json!({ "kind": i.kind });
-            if let Some(e) = &i.evidence {
-                data["evidence"] = json!(e);
-            }
-            let mut body = json!({
-                "title": i.title,
-                "body": i.body,
-                "data": data,
-                "triggers": i.triggers,
-                "force": true,
-            });
-            if let Some(a) = &i.area {
-                body["area"] = json!(a);
-            }
-            if let Some(c) = &i.certainty {
-                body["certainty"] = json!(c);
-            }
-            let (path, entry_field) = match &i.supersedes {
-                Some(old) => {
-                    let old_id = ids
-                        .get(old.as_str())
-                        .with_context(|| format!("insight {}: {old} ещё не создан", i.key))?;
-                    (format!("/api/v1/entries/{old_id}/supersede"), "entry")
-                }
-                None => {
-                    body["kind"] = json!("insight");
-                    body["scope"] = json!(i.scope);
-                    (format!("/api/v1/spaces/{EVAL_SOLUTION}/entries"), "")
-                }
-            };
-            let (st, v) = api(&self.base, token, &path, Some(&body))?;
-            if st != 201 {
-                bail!("insight {}: POST {path}: HTTP {st}: {v}", i.key);
-            }
-            let e = if entry_field.is_empty() {
-                &v
-            } else {
-                &v[entry_field]
-            };
-            let id = e["id"]
-                .as_str()
-                .with_context(|| format!("insight {}: нет id в ответе {v}", i.key))?
-                .to_string();
-            let want = i.certainty.as_deref().unwrap_or("hypothesis");
-            if e["certainty"] != want {
-                bail!(
-                    "insight {}: certainty {}, ожидался {want}",
-                    i.key,
-                    e["certainty"]
-                );
-            }
-            self.entry_keys.insert(id.clone(), i.key.clone());
-            ids.insert(&i.key, id);
-        }
-        for i in insights {
-            if let Some(reason) = &i.retract_reason {
-                let id = &ids[i.key.as_str()];
-                let (st, v) = self.api(
-                    &format!("/api/v1/entries/{id}/retract"),
-                    Some(&json!({ "reason": reason })),
-                )?;
-                if st != 200 {
-                    bail!("insight {}: отзыв: HTTP {st}: {v}", i.key);
-                }
-            }
-        }
-        let dir = self.data.parent().context("каталог прогона")?;
-        fs::write(
-            dir.join(ENTRIES_FILE),
-            serde_json::to_string(&self.entry_keys)?,
-        )?;
-        Ok(())
-    }
-
     /// `/index/status`.
     pub fn index_status(&self) -> Result<Value> {
         let (st, v) = self.api("/api/v1/index/status", None)?;
@@ -720,7 +601,7 @@ impl Session {
             let (v, ms) = self.search(q, mode, &Self::search_body(q, mode, "notes", false))?;
             let items = self.hits(&v);
             let ranked: Vec<String> = items.iter().map(|h| h.path.clone()).collect();
-            let mut metrics = score(&ranked, &q.expect);
+            let mut metrics = score(&ranked, &q.relevant());
             let mut cancelled5_history = None;
             let mut leaf_hits = Vec::new();
             match q.kind {
@@ -748,10 +629,12 @@ impl Session {
             }
             out.push(QueryRun {
                 id: q.id.clone(),
+                text: q.text.clone(),
                 kind: q.kind,
                 lang: q.lang,
                 disjoint: q.disjoint,
                 expect: q.expect.clone(),
+                also: q.also.clone(),
                 forbid: q.forbid.clone(),
                 weaker: q.weaker.clone(),
                 long: false,
@@ -792,83 +675,20 @@ pub struct Hit {
     pub reranked: bool,
 }
 
-/// Лист выдачи `mode = chunks` (запросы `chunk`).
-#[derive(Debug, Clone, Serialize)]
-pub struct LeafHit {
-    pub chunk_id: String,
-    pub path: String,
-    /// Собственный текст листа (без перекрытия) содержит `evidence` целиком.
-    pub evidence: bool,
-    /// С перекрытием — справочно: доказательство попало в лист только перекрытием.
-    pub evidence_with_overlap: bool,
-}
-
-/// Собственный текст листа: без начала, совпадающего с концом предыдущего листа той же
-/// секции (перекрытие `chunk_overlap_sentences`, не короче [`OVERLAP_MIN`] байт).
-#[derive(Debug, Clone)]
-pub struct LeafText {
-    pub path: String,
-    pub text: String,
-    pub core: String,
-}
-
-/// Короче — совпадение конца и начала листов считается случайным, а не перекрытием.
-const OVERLAP_MIN: usize = 10;
-
-/// Длина перекрытия: самый длинный префикс `cur`, которым кончается `prev`.
-pub fn overlap_len(prev: &str, cur: &str) -> usize {
-    let max = prev.len().min(cur.len());
-    (OVERLAP_MIN..=max)
-        .rev()
-        .find(|&l| cur.is_char_boundary(l) && prev.ends_with(&cur[..l]))
-        .unwrap_or(0)
-}
-
-/// Листы текущих ревизий заметок из SQLite прогона: id чанка → путь, текст, свой
-/// текст без перекрытия.
-pub fn leaf_cores(data: &Path) -> Result<HashMap<String, LeafText>> {
-    let c = rusqlite::Connection::open_with_flags(
-        super::gate::user_db(data)?,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    let mut st = c.prepare(
-        "SELECT c.id, c.node_id, c.heading_path, c.text, n.path FROM chunks c
-         JOIN nodes n ON n.id = c.node_id
-         WHERE c.level = 'chunk' AND n.deleted_at IS NULL AND c.rev = n.current_rev
-         ORDER BY c.node_id, c.ordinal",
-    )?;
-    let rows = st.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-        ))
-    })?;
-    let mut out = HashMap::new();
-    let mut prev: Option<(String, String, String)> = None;
-    for row in rows {
-        let (id, node, heading, text, path) = row?;
-        let cut = match &prev {
-            Some((pn, ph, pt)) if *pn == node && *ph == heading => overlap_len(pt, &text),
-            _ => 0,
-        };
-        let core = text[cut..].to_string();
-        prev = Some((node, heading, text.clone()));
-        out.insert(id, LeafText { path, text, core });
-    }
-    Ok(out)
-}
-
 /// Итог одного запроса.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryRun {
     pub id: String,
+    /// Текст запроса (для `--compare` будущих прогонов).
+    #[serde(default)]
+    pub text: String,
     pub kind: Kind,
     pub lang: Lang,
     pub disjoint: bool,
     pub expect: Vec<String>,
+    /// Дополнительно релевантные цели (`also`): в метриках прогона, не в `--compare`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub forbid: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1030,81 +850,10 @@ pub struct RunResult {
     /// Сравнение с прежним прогоном (`--compare`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compare: Option<Comparison>,
+    /// Разрезанные границами листов доказательства запросов `chunk` (по данным прогона).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitStats>,
     pub queries: Vec<QueryRun>,
-}
-
-/// Парная разность с прежним прогоном по общим запросам (тот же id, вид и `expect`).
-#[derive(Debug, Clone, Serialize)]
-pub struct Comparison {
-    /// Файл прежнего прогона.
-    pub against: String,
-    pub against_queries_fingerprint: String,
-    pub against_corpus_fingerprint: String,
-    pub n: usize,
-    pub d_recall5: Estimate,
-    pub d_ndcg10: Estimate,
-    /// Без группы `e` (её заметки переехали в пространство решения: префикс контекста
-    /// чанков другой).
-    pub n_without_e: usize,
-    pub d_ndcg10_without_e: Estimate,
-    /// Интервал Δ nDCG@10 целиком ниже нуля — регрессия, разбирается.
-    pub regression: bool,
-}
-
-/// Сравнение `r` с прежним результатом `prev` (JSON `eval/results/…`).
-pub fn compare(prev: &Path, r: &RunResult) -> Result<Comparison> {
-    let text = fs::read_to_string(prev).with_context(|| format!("чтение {}", prev.display()))?;
-    let v: Value =
-        serde_json::from_str(&text).with_context(|| format!("разбор {}", prev.display()))?;
-    let old: HashMap<&str, &Value> = v["queries"]
-        .as_array()
-        .context("в прежнем результате нет queries")?
-        .iter()
-        .filter_map(|q| q["id"].as_str().map(|id| (id, q)))
-        .collect();
-    let mut pairs: Vec<(&QueryRun, &Value)> = Vec::new();
-    for q in &r.queries {
-        let Some(o) = old.get(q.id.as_str()) else {
-            continue;
-        };
-        let same_expect = o["expect"].as_array().is_some_and(|e| {
-            e.iter()
-                .filter_map(Value::as_str)
-                .eq(q.expect.iter().map(String::as_str))
-        });
-        if same_expect && o["kind"] == q.kind.as_str() {
-            pairs.push((q, o));
-        }
-    }
-    let m = |o: &Value, k: &str| o["metrics"][k].as_f64().unwrap_or(0.0);
-    let diff = |sel: &[&(&QueryRun, &Value)], f: fn(&QueryMetrics) -> f64, k: &str| {
-        let a: Vec<f64> = sel.iter().map(|(_, o)| m(o, k)).collect();
-        let b: Vec<f64> = sel.iter().map(|(q, _)| f(&q.metrics)).collect();
-        paired_diff(&a, &b)
-    };
-    let all: Vec<&(&QueryRun, &Value)> = pairs.iter().collect();
-    let no_e: Vec<&(&QueryRun, &Value)> = pairs
-        .iter()
-        .filter(|(q, _)| !q.id.starts_with("e-"))
-        .collect();
-    let d_ndcg10 = diff(&all, |x| x.ndcg10, "ndcg10");
-    Ok(Comparison {
-        against: prev.display().to_string(),
-        against_queries_fingerprint: v["info"]["queries_fingerprint"]
-            .as_str()
-            .unwrap_or_default()
-            .into(),
-        against_corpus_fingerprint: v["info"]["corpus_fingerprint"]
-            .as_str()
-            .unwrap_or_default()
-            .into(),
-        n: all.len(),
-        d_recall5: diff(&all, |x| x.recall5, "recall5"),
-        d_ndcg10,
-        n_without_e: no_e.len(),
-        d_ndcg10_without_e: diff(&no_e, |x| x.ndcg10, "ndcg10"),
-        regression: d_ndcg10.hi < 0.0,
-    })
 }
 
 /// Пути, от которых зависят замеры eval и bench: код, манифесты сборки и поставки, корпус
@@ -1274,6 +1023,7 @@ pub fn result(
         },
         metrics: breakdown(&runs),
         compare: None,
+        split: None,
         queries: runs,
     }
 }
@@ -1337,10 +1087,13 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
             s.index_secs, s.status["qdrant"]["points"]
         );
     }
+    let split = chunk_split(&s, queries)?;
     let mut results = Vec::new();
     for &mode in &a.modes {
         let runs = s.run_queries(queries, mode)?;
-        results.push(result(&s, p, corpus, queries, mode, label.as_deref(), runs));
+        let mut r = result(&s, p, corpus, queries, mode, label.as_deref(), runs);
+        r.split = split;
+        results.push(r);
     }
     s.stop()?;
     // reliable_first без бустов certainty: тот же индекс, перезапуск с search.boost_* = 1
@@ -1370,7 +1123,7 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
     let mut failed = Vec::new();
     for mut r in results {
         if let Some(prev) = &a.compare {
-            r.compare = Some(compare(prev, &r)?);
+            r.compare = Some(compare(&p.repo, prev, &r)?);
         }
         let (json, md) = report::write_run(&p.results, &r)?;
         report::print_run(&r);
@@ -1381,6 +1134,14 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
         bail!("{}", failed.join("; "));
     }
     Ok(())
+}
+
+/// Разрезанные доказательства запросов `chunk` по листам прогона (`None` — таких запросов нет).
+pub fn chunk_split(s: &Session, queries: &[Query]) -> Result<Option<SplitStats>> {
+    if !queries.iter().any(|q| q.kind == Kind::Chunk) {
+        return Ok(None);
+    }
+    Ok(Some(split_stats(&leaf_cores(&s.data)?, queries)))
 }
 
 /// `reliable_first` прохода без бустов → `reliable_first_no_boost` запросов результата.
@@ -1407,52 +1168,6 @@ pub fn history_control(r: &RunResult) -> Option<String> {
     }
 }
 
-/// Листы выдачи `mode = chunks` (первые 10 элементов уровня `chunk`) и их собственные
-/// тексты: лист заметки — из `leaves` (без перекрытия), лист записи журнала — текст ответа.
-pub fn chunk_leaves(
-    v: &Value,
-    leaves: &HashMap<String, LeafText>,
-    evidence: &str,
-) -> (Vec<LeafHit>, Vec<String>) {
-    let mut hits = Vec::new();
-    let mut cores = Vec::new();
-    for i in v["items"].as_array().into_iter().flatten() {
-        if i["level"] != "chunk" {
-            continue;
-        }
-        let ids: Vec<&str> = i["chunk_ids"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        let found = ids.iter().find_map(|id| leaves.get(*id).map(|l| (*id, l)));
-        let (id, path, text, core) = match found {
-            Some((id, l)) => (id, l.path.clone(), l.text.clone(), l.core.clone()),
-            None => {
-                let t = i["text"].as_str().unwrap_or_default().to_string();
-                (
-                    ids.first().copied().unwrap_or_default(),
-                    i["path"].as_str().unwrap_or_default().to_string(),
-                    t.clone(),
-                    t,
-                )
-            }
-        };
-        hits.push(LeafHit {
-            chunk_id: id.to_string(),
-            path,
-            evidence: leaf_contains(&core, evidence),
-            evidence_with_overlap: leaf_contains(&text, evidence),
-        });
-        cores.push(core);
-        if cores.len() == TOP_K {
-            break;
-        }
-    }
-    (hits, cores)
-}
-
 /// Отпечаток набора запросов: FNV-1a по id, тексту, ожидаемым заметкам и виду.
 pub fn queries_fingerprint(queries: &[Query]) -> String {
     let text: String = queries
@@ -1460,12 +1175,17 @@ pub fn queries_fingerprint(queries: &[Query]) -> String {
         .map(|q| {
             let mut s = format!("{}\0{}\0{}\0{}\0", q.id, q.text, q.expect.join(","), q.kind);
             // поля M3 — только если заданы: отпечаток запросов M2 не меняется
-            if !q.forbid.is_empty() || !q.weaker.is_empty() || q.evidence.is_some() {
+            if !q.forbid.is_empty()
+                || !q.weaker.is_empty()
+                || q.evidence.is_some()
+                || !q.also.is_empty()
+            {
                 s.push_str(&format!(
-                    "{}\0{}\0{}\0",
+                    "{}\0{}\0{}\0{}\0",
                     q.forbid.join(","),
                     q.weaker.join(","),
-                    q.evidence.as_deref().unwrap_or("")
+                    q.evidence.as_deref().unwrap_or(""),
+                    q.also.join(",")
                 ));
             }
             s
@@ -1477,75 +1197,6 @@ pub fn queries_fingerprint(queries: &[Query]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn overlap_is_the_longest_shared_suffix_prefix() {
-        let prev = "Первое предложение. Второе предложение о повторах.";
-        let cur = "Второе предложение о повторах. Новый текст листа.";
-        let n = overlap_len(prev, cur);
-        assert_eq!(&cur[..n], "Второе предложение о повторах.");
-        // случайное совпадение короче предела — не перекрытие
-        assert_eq!(overlap_len("abc. x", "x and more"), 0);
-        assert_eq!(overlap_len("", "text"), 0);
-    }
-
-    fn leaf(path: &str, text: &str, core: &str) -> LeafText {
-        LeafText {
-            path: path.into(),
-            text: text.into(),
-            core: core.into(),
-        }
-    }
-
-    /// Листы выдачи: только уровень `chunk`, свой текст — из SQLite, перекрытие отрезано.
-    #[test]
-    fn chunk_leaves_use_core_text_and_skip_summaries() {
-        let ev = "batch is retried four times";
-        let leaves: HashMap<String, LeafText> = [
-            (
-                "c1".to_string(),
-                leaf("en/long/a", "Intro. The batch is", "Intro. The batch is"),
-            ),
-            (
-                "c2".to_string(),
-                // начало листа — перекрытие с c1: доказательство целиком только с ним
-                leaf(
-                    "en/long/a",
-                    "Intro. The batch is retried four times. Done.",
-                    "retried four times. Done.",
-                ),
-            ),
-            (
-                "c3".to_string(),
-                leaf(
-                    "en/long/b",
-                    "So the batch is retried four times here.",
-                    "So the batch is retried four times here.",
-                ),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let v = json!({"items": [
-            {"level": "section", "chunk_ids": ["s1"], "path": "en/long/a"},
-            {"level": "chunk", "chunk_ids": ["c2"], "path": "en/long/a"},
-            {"level": "chunk", "chunk_ids": ["e1"], "path": "", "text": "entry text"},
-            {"level": "chunk", "chunk_ids": ["s9", "c3"], "path": "en/long/b"},
-        ]});
-        let (hits, cores) = chunk_leaves(&v, &leaves, ev);
-        let ids: Vec<&str> = hits.iter().map(|h| h.chunk_id.as_str()).collect();
-        assert_eq!(ids, ["c2", "e1", "c3"]);
-        assert_eq!(
-            hits.iter()
-                .map(|h| (h.evidence, h.evidence_with_overlap))
-                .collect::<Vec<_>>(),
-            [(false, true), (false, false), (true, true)]
-        );
-        assert_eq!(cores[1], "entry text");
-        let (r5, n10) = chunk_scores(&cores, ev);
-        assert_eq!(r5, 1.0);
-        assert!((n10 - 1.0 / 4f64.log2()).abs() < 1e-12);
-    }
 
     #[test]
     fn history_control_fails_on_zero() {
@@ -1577,6 +1228,7 @@ mod tests {
             },
             metrics: breakdown(&[]),
             compare: None,
+            split: None,
             queries: Vec::new(),
         };
         // нет запросов superseded — контроля нет

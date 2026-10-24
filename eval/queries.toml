@@ -35,6 +35,7 @@ text = "встроенный антивирус сильно замедляет 
 lang = "ru"
 expect = ["ru/windows/defender-exclusions-build"]
 kind = "paraphrase"
+also = ["insight:c02-b"]
 disjoint = true
 
 [[query]]
@@ -58,6 +59,7 @@ text = "коды выхода robocopy меньше 8 — успех, обёрт
 lang = "ru"
 expect = ["ru/windows/services-schtasks-robocopy"]
 kind = "exact"
+also = ["insight:p09-t"]
 
 [[query]]
 id = "a-08"
@@ -312,6 +314,7 @@ text = "revert or reset for a commit already pushed to a shared branch"
 lang = "en"
 expect = ["ru/git/revert-vs-reset"]
 kind = "cross-lang"
+also = ["insight:p11-a"]
 
 [[query]]
 id = "b-21"
@@ -340,6 +343,7 @@ text = "rewriting branch history: rebase, amend and force push"
 lang = "en"
 expect = ["en/git/interactive-rebase-autosquash", "en/git/merge-vs-rebase", "en/git/force-with-lease"]
 kind = "broad"
+also = ["insight:p11-a"]
 
 [[query]]
 id = "b-25"
@@ -1053,6 +1057,7 @@ text = "get_providers returns only CPUExecutionProvider, CUDA silently missing"
 lang = "en"
 expect = ["en/research/onnx-runtime-execution-providers"]
 kind = "identifier"
+also = ["insight:p03-t"]
 
 [[query]]
 id = "f-17"
@@ -1074,6 +1079,7 @@ text = "cross-encoder reranking latency cost on CPU"
 lang = "en"
 expect = ["ru/research/kross-enkodery-rerank"]
 kind = "cross-lang"
+also = ["insight:c06-c"]
 
 [[query]]
 id = "f-20"
@@ -1095,6 +1101,7 @@ text = "гибридный поиск: слияние лексического �
 lang = "ru"
 expect = ["ru/research/rrf-sliyanie", "ru/research/lineynaya-smes-ballov", "ru/research/dense-vs-sparse"]
 kind = "broad"
+also = ["ru/long/catalog-search-relevance-study"]
 
 [[query]]
 id = "f-23"
@@ -1166,6 +1173,7 @@ text = "actions/cache restore-keys prefix hashFiles lockfile key"
 lang = "en"
 expect = ["en/devtools/gha-cache-keys"]
 kind = "exact"
+also = ["insight:c08-b"]
 
 [[query]]
 id = "g-08"
@@ -1173,6 +1181,7 @@ text = "карантин нестабильных тестов владелец 
 lang = "ru"
 expect = ["ru/devtools/flaky-tests-quarantine"]
 kind = "exact"
+also = ["ru/long/ci-pipeline-retrospective"]
 
 [[query]]
 id = "g-09"
@@ -1250,6 +1259,7 @@ text = "Node.js dependency installs and version pinning"
 lang = "en"
 expect = ["en/devtools/npm-ci-clean-install", "en/devtools/npm-install-and-lockfile", "en/devtools/node-version-pinning"]
 kind = "broad"
+also = ["insight:c05-c"]
 
 [[query]]
 id = "g-20"
@@ -1303,6 +1313,7 @@ text = "журнал сервиса разросся на десятки гиг�
 lang = "ru"
 expect = ["ru/ops/log-rotation"]
 kind = "paraphrase"
+also = ["insight:c07-b", "ru/long/incident-disk-full-logs"]
 disjoint = true
 
 [[query]]
@@ -1434,6 +1445,7 @@ text = "сертификаты TLS: типичные поломки и пров�
 lang = "ru"
 expect = ["ru/ops/tls-incomplete-chain", "ru/ops/tls-expired-certificate"]
 kind = "broad"
+also = ["ru/long/tls-certificate-rotation"]
 
 [[query]]
 id = "h-21"
@@ -1448,6 +1460,7 @@ text = "PostgreSQL slow queries, indexes and connection limits"
 lang = "en"
 expect = ["en/db/postgres-explain-analyze", "en/db/connection-pool-exhaustion"]
 kind = "broad"
+also = ["en/long/postgres-index-tuning-notes"]
 
 [[query]]
 id = "h-23"
@@ -1728,7 +1741,7 @@ forbid = ["insight:r05-wrong"]
 
 [[query]]
 id = "r-01"
-text = "как записать файл в UTF-8 без BOM из Windows PowerShell 5.1"
+text = "работает ли [IO.File]::WriteAllText с UTF8Encoding($false) в Windows PowerShell 5.1"
 lang = "ru"
 expect = ["insight:p01-t"]
 kind = "certainty"
@@ -1736,7 +1749,7 @@ weaker = ["insight:p01-h"]
 
 [[query]]
 id = "r-02"
-text = "can Qdrant run on Windows without Docker"
+text = "does Qdrant on Windows only run inside a Docker container or WSL"
 lang = "en"
 expect = ["insight:p02-t"]
 kind = "certainty"
@@ -1744,7 +1757,7 @@ weaker = ["insight:p02-h"]
 
 [[query]]
 id = "r-03"
-text = "нужен ли CUDA Toolkit для ONNX Runtime с CUDA"
+text = "хватит ли драйвера NVIDIA и библиотек cudart, cublas, cudnn рядом с ORT"
 lang = "ru"
 expect = ["insight:p03-t"]
 kind = "certainty"
@@ -1760,7 +1773,7 @@ weaker = ["insight:p04-h"]
 
 [[query]]
 id = "r-05"
-text = "насколько квантованная bge-m3 int8 хуже fp32 в поиске"
+text = "проходит ли bge-m3 int8 гейт качества против fp32"
 lang = "ru"
 expect = ["insight:p05-t"]
 kind = "certainty"
@@ -1776,7 +1789,7 @@ weaker = ["insight:p06-h"]
 
 [[query]]
 id = "r-07"
-text = "помогает ли перекрытие чанков на одно предложение recall"
+text = "меняет ли перекрытие 0, 1 или 2 предложения recall@5 на eval M2"
 lang = "ru"
 expect = ["insight:p07-t"]
 kind = "certainty"
@@ -1784,7 +1797,7 @@ weaker = ["insight:p07-h"]
 
 [[query]]
 id = "r-08"
-text = "does the FTS5 trigram tokenizer match Cyrillic text"
+text = "can substring search over Russian notes use the trigram tokenizer or does it only work for ASCII"
 lang = "en"
 expect = ["insight:p08-t"]
 kind = "certainty"
@@ -1792,7 +1805,7 @@ weaker = ["insight:p08-h"]
 
 [[query]]
 id = "r-09"
-text = "какие коды выхода robocopy означают ошибку"
+text = "какие коды выхода robocopy меньше 8 считаются успехом"
 lang = "ru"
 expect = ["insight:p09-t"]
 kind = "certainty"
@@ -1800,7 +1813,7 @@ weaker = ["insight:p09-h"]
 
 [[query]]
 id = "r-10"
-text = "попадают ли заметки Human в векторный поиск"
+text = "находит ли векторный поиск заметки Human с include_human"
 lang = "ru"
 expect = ["insight:p10-a"]
 kind = "certainty"
@@ -1808,7 +1821,7 @@ weaker = ["insight:p10-h"]
 
 [[query]]
 id = "r-11"
-text = "is it ok to force-push to main with force-with-lease"
+text = "undo mistakes on main with revert commits instead of rewriting history"
 lang = "en"
 expect = ["insight:p11-a"]
 kind = "certainty"
@@ -1816,7 +1829,7 @@ weaker = ["insight:p11-h"]
 
 [[query]]
 id = "r-12"
-text = "как запускать Qdrant для разработки, в Docker или нативно"
+text = "удобнее ли запускать Qdrant для локальной разработки контейнером Docker с томом"
 lang = "ru"
 expect = ["insight:p12-a"]
 kind = "certainty"
@@ -1832,7 +1845,7 @@ weaker = ["insight:p13-h"]
 
 [[query]]
 id = "r-14"
-text = "индексируются ли значения секретов Vault полнотекстовым поиском"
+text = "индексируются ли значения записей Vault полнотекстовым индексом для поиска по секретам"
 lang = "ru"
 expect = ["insight:p14-a"]
 kind = "certainty"
@@ -1948,11 +1961,11 @@ evidence = "Через месяц стало видно, что почти вс�
 
 [[query]]
 id = "k-04"
-text = "как выглядел исходный ключ кеша зависимостей в CI с именем ветки"
+text = "как распределены интеграционные тесты по шардам в конвейере"
 lang = "ru"
 expect = ["ru/long/ci-pipeline-retrospective"]
 kind = "chunk"
-evidence = "Пример исходного ключа:\n\n```yaml\nkey: deps-${{ branch }}-${{ hashFiles('package-lock.json') }}"
+evidence = "Мы разбили их на четыре шарда по историческому времени выполнения, а не по количеству тестов: распределитель берёт длительности из предыдущих прогонов и раскладывает тесты так, чтобы суммарное время шардов было примерно равным. Пример конфигурации:\n\n```yaml\nstrategy:"
 
 [[query]]
 id = "k-05"
@@ -2028,11 +2041,11 @@ evidence = "До внедрения автоматической проверк�
 
 [[query]]
 id = "k-14"
-text = "как часто формируется отчёт о резервных копиях и что в нём"
+text = "как устроена иерархия ключей шифрования резервных копий"
 lang = "ru"
 expect = ["ru/long/object-storage-backup-strategy"]
 kind = "chunk"
-evidence = "###### Отчётность\n\nРаз в месяц формируется отчёт: какие копии сделаны, какие проверки восстановления прошли и сколько они заняли, сколько стоит хранение."
+evidence = "##### Иерархия ключей\n\nКаждая база шифруется своим ключом данных, а ключи данных зашифрованы главным ключом из системы управления ключами облака в отдельной учётной записи. Инструмент копирования при старте запрашивает расшифровку ключа данных, получает его в память и не пишет на диск."
 
 [[query]]
 id = "k-15"
@@ -2275,86 +2288,6 @@ kind = "chunk"
 evidence = "##### Access check\n\nThe week before your primary shift, run the access check, which verifies that you can do everything on-call might require: log in to every production cluster, read logs and traces, use the deploy tool's rollback, open the database consoles for the platform's own databases, access the secrets store for break-glass credentials, and receive a test page on your phone. Run it with:"
 
 [[query]]
-id = "k-45"
-text = "which headers does a deprecated API response carry"
-lang = "en"
-expect = ["en/long/api-versioning-guide"]
-kind = "chunk"
-evidence = "The partner dashboard shows a list of deprecated features the partner has used in the last thirty days, with request counts and example request ids. Example of the headers on a deprecated response:\n\n```text\nDeprecation: @1735689600"
-
-[[query]]
-id = "k-46"
-text = "what resolver setting now limits concurrent queries per forwarder"
-lang = "en"
-expect = ["en/long/dns-outage-postmortem"]
-kind = "chunk"
-evidence = "The resolver supports a per-upstream limit on concurrent queries, which would have contained the damage, but it was not configured. Example of the setting we have now added for every forwarder:\n\n```text\nforward-zone:"
-
-[[query]]
-id = "k-47"
-text = "what configuration does a service pass to the feature flag client library"
-lang = "en"
-expect = ["en/long/feature-flag-platform"]
-kind = "chunk"
-evidence = "Example of the configuration a service passes to the library:\n\n```yaml\nflags:"
-
-[[query]]
-id = "k-48"
-text = "what markup is used for the server-rendered main product image"
-lang = "en"
-expect = ["en/long/frontend-performance-audit"]
-kind = "chunk"
-evidence = "The fix was to render the main image's markup on the server, with eager loading and a high fetch priority, and to keep the rest of the gallery client-rendered. Example of the markup for the main image:\n\n```html\n<img src=\"/img/p/123/main-800.webp\""
-
-[[query]]
-id = "k-49"
-text = "what does the serving configuration of a model version contain"
-lang = "en"
-expect = ["en/long/ml-model-serving-notes"]
-kind = "chunk"
-evidence = "Example of the serving configuration for a model version:\n\n```yaml\nmodel: search-rerank"
-
-[[query]]
-id = "k-50"
-text = "how is a typical service latency histogram metric defined"
-lang = "en"
-expect = ["en/long/observability-stack-design"]
-kind = "chunk"
-evidence = "Example of a typical service metric definition:\n\n```go\nvar requestDuration = prometheus.NewHistogramVec("
-
-[[query]]
-id = "k-51"
-text = "which command runs the on-call access preflight check"
-lang = "en"
-expect = ["en/long/oncall-handbook"]
-kind = "chunk"
-evidence = "Run it with:\n\n```sh\noncall-preflight --role platform-primary"
-
-[[query]]
-id = "k-52"
-text = "как выглядит запись словаря синонимов поиска в новом формате"
-lang = "ru"
-expect = ["ru/long/catalog-search-relevance-study"]
-kind = "chunk"
-evidence = "Пример записи в новом формате:\n\n```text\nкуртка => куртка, ветровка, бомбер"
-
-[[query]]
-id = "k-53"
-text = "как описан сценарий оформления заказа в генераторе нагрузки"
-lang = "ru"
-expect = ["ru/long/checkout-load-testing-report"]
-kind = "chunk"
-evidence = "Пример фрагмента описания сценария:\n\n```python\n@task(weight=1)"
-
-[[query]]
-id = "k-54"
-text = "что лежит в файле версий инструментов в корне репозитория каталога"
-lang = "ru"
-expect = ["ru/long/dev-environment-onboarding"]
-kind = "chunk"
-evidence = "Все версии инструментов закреплены в файле в корне репозитория, и менеджер версий подхватывает их автоматически при входе в каталог. Пример содержимого файла версий:\n\n```text\nnodejs 20.11.1"
-
-[[query]]
 id = "k-55"
 text = "как выглядит правило ротации журналов шлюза в репозитории сервиса"
 lang = "ru"
@@ -2385,3 +2318,99 @@ lang = "ru"
 expect = ["ru/long/tls-certificate-rotation"]
 kind = "chunk"
 evidence = "Пример фрагмента политики, разрешающей клиенту каталога создавать только записи проверки в своём поддомене:\n\n```text\nallow update: key catalog-acme; name _acme-challenge.catalog.internal; type TXT"
+
+[[query]]
+id = "k-59"
+text = "какую долю диска брокеров занимали топики без активных потребителей"
+lang = "ru"
+expect = ["ru/long/kafka-consumer-lag-analysis"]
+kind = "chunk"
+evidence = "Совсем другая история, которая выяснилась по ходу дела и к отставанию отношения не имела, касалась учёта затрат на брокеры. Когда мы смотрели на нагрузку брокеров, оказалось, что почти треть их дискового пространства занимают топики, у которых нет ни одного активного потребителя: это были топики старых интеграций, отключённых год назад, и топики экспериментов, которые никто не удалил."
+
+[[query]]
+id = "k-60"
+text = "почему в журналах индексатора не было записей о выходе из группы потребителей"
+lang = "ru"
+expect = ["ru/long/kafka-consumer-lag-analysis"]
+kind = "chunk"
+evidence = "Возвращаясь к самим перебалансировкам, нужно сказать ещё об одной детали, которая долго сбивала с толку: в журналах сервиса индексации не было ни одной записи о выходе из группы, потому что клиентская библиотека писала такие события на уровне отладки, а уровень журналов в продуктовом окружении был информационным. Экземпляр выпадал из группы, получал разделы обратно и продолжал работать, а в журнале не оставалось никаких следов."
+
+[[query]]
+id = "k-61"
+text = "что такое правило двух ключей при восстановлении продуктовой базы"
+lang = "ru"
+expect = ["ru/long/object-storage-backup-strategy"]
+kind = "chunk"
+evidence = "Мы ввели правило двух ключей: восстановление продуктовой базы на место текущей требует подтверждения второго человека из короткого списка, а восстановление на отдельный сервер для извлечения данных дежурный по-прежнему делает сам. Это не замедлило ни одного реального восстановления за полгода, потому что все они были восстановлениями на отдельный сервер с последующим переносом строк, а полная замена базы ни разу не понадобилась."
+
+[[query]]
+id = "k-62"
+text = "почему исправление опечатки в документации занимало агента CI больше двадцати минут"
+lang = "ru"
+expect = ["ru/long/ci-pipeline-retrospective"]
+kind = "chunk"
+evidence = "Совсем другой сюжет, который неожиданно оказался связан с конвейером, касался документации. Документация продукта собиралась тем же конвейером, что и код, и каждое исправление опечатки в документации проходило полную сборку и все тесты, занимая агента на двадцать с лишним минут."
+
+[[query]]
+id = "k-63"
+text = "почему старый сервер отчётов отвергал соединения после каждого обновления сертификата"
+lang = "ru"
+expect = ["ru/long/tls-certificate-rotation"]
+kind = "chunk"
+evidence = "Один из старых серверов отчётов жил с системными часами, отстающими на одиннадцать минут, потому что синхронизация времени на нём была отключена много лет назад по причине, которую никто не помнил. Сертификаты, выпущенные с моментом начала действия «сейчас», этот сервер считал ещё не начавшими действовать и отвергал соединения первые одиннадцать минут после каждого обновления."
+
+[[query]]
+id = "k-64"
+text = "почему персональные данные легче всего оседают в аналитическом хранилище"
+lang = "ru"
+expect = ["ru/long/personal-data-retention-policy"]
+kind = "chunk"
+evidence = "Совсем другой вопрос, который возник на этом этапе, касался аналитиков. Аналитическое хранилище оказалось местом, куда персональные данные попадают легче всего: аналитик берёт выгрузку из реплики для разового исследования, сохраняет её как таблицу, чтобы не выгружать заново, и через полгода эта таблица всё ещё лежит в хранилище, хотя исследование давно закончено."
+
+[[query]]
+id = "k-65"
+text = "how long after the DNS incident was declared was the status page first updated"
+lang = "en"
+expect = ["en/long/dns-outage-postmortem"]
+kind = "chunk"
+evidence = "A rather different lesson from the same hour concerns communication with customers. The status page was updated twenty-six minutes after the incident was declared, and the first update said that we were investigating elevated error rates on the API, without saying which part of the API or what customers should do."
+
+[[query]]
+id = "k-66"
+text = "why did gateway errors persist for twenty minutes after the resolver rollback"
+lang = "en"
+expect = ["en/long/dns-outage-postmortem"]
+kind = "chunk"
+evidence = "The reason turned out to be negative caching in the gateway's own resolver library: during the outage it had cached failures for some upstream names, with a negative cache lifetime that came from the zone's SOA record and was set to fifteen minutes years ago, when the internal zones were first created. Every gateway instance kept returning cached failures for those names until the entries expired, and the instances that had been restarted early in the incident were the last to recover."
+
+[[query]]
+id = "k-67"
+text = "what is the most effective way for new members to learn the systems before going on call"
+lang = "en"
+expect = ["en/long/oncall-handbook"]
+kind = "chunk"
+evidence = "A completely different question that comes up just as often is how to learn the systems well enough to be useful on call. Reading documentation helps, but the most effective way we have found is shadowing: before their first primary week, every new member spends one full week as a third person on the rotation, receiving every page in parallel with the primary, joining every incident channel and asking questions afterwards, without any responsibility for acting."
+
+[[query]]
+id = "k-68"
+text = "how did the larger ranking model with five hundred features fit into the latency budget"
+lang = "en"
+expect = ["en/long/ml-model-serving-notes"]
+kind = "chunk"
+evidence = "When the data science team proposed a ranking model with about five hundred features instead of two hundred, the offline metrics were clearly better, but the feature fetch for five hundred features took 31 milliseconds at the 99th percentile on its own, and the model could not fit in what was left. The compromise was to keep the larger model but to precompute the hundred most expensive features per user in a nightly batch job and store them alongside the user embedding, so that the online fetch for those features is a single key lookup rather than a computation."
+
+[[query]]
+id = "k-69"
+text = "why did clients take fifteen seconds to notice a partitioned Redis node"
+lang = "en"
+expect = ["en/long/redis-cluster-migration"]
+kind = "chunk"
+evidence = "When we repeated the test by dropping packets to the node with a firewall rule instead of killing the process, clients took up to fifteen seconds to notice, because our client timeouts were set to ten seconds for commands and the cluster topology refresh happened only after a timeout. We lowered the command timeout to two seconds for latency-sensitive services and enabled periodic topology refresh every thirty seconds, after which the partition test showed recovery within about eight seconds, in line with what we then saw in production."
+
+[[query]]
+id = "k-70"
+text = "why did partners experience the lowered order search rate limit as a breaking change"
+lang = "en"
+expect = ["en/long/api-versioning-guide"]
+kind = "chunk"
+evidence = "A quite different matter that partners raise just as often is rate limiting, which is not versioned at all and has caused at least as much friction as any breaking change. Rate limits are applied per partner account and per endpoint group, and when we lowered the limit on the order search endpoint after a single partner's polling loop degraded the service for everyone, several other partners who polled less aggressively but in large bursts at the start of each hour hit the new limit too."

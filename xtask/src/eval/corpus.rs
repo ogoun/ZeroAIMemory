@@ -22,6 +22,9 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+
+use super::insights::validate_insights;
+pub use super::insights::{Insight, load_insights};
 use serde::{Deserialize, Serialize};
 
 /// Язык заметки или запроса.
@@ -186,6 +189,18 @@ pub struct Query {
     /// `chunk`: дословная подстрока ожидаемой заметки — лист должен содержать её целиком.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// Дополнительно релевантные цели (`insight:<key>` или заметки M3): засчитываются в метриках
+    /// прогона вместе с `expect`, в сравнении с прежним прогоном (`--compare`) не участвуют —
+    /// разметка M2 (`id`, `expect`) не меняется.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<String>,
+}
+
+impl Query {
+    /// Релевантные цели прогона: `expect` и `also`.
+    pub fn relevant(&self) -> Vec<String> {
+        self.expect.iter().chain(&self.also).cloned().collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -193,113 +208,6 @@ pub struct Query {
 struct QueryFile {
     #[serde(default)]
     query: Vec<Query>,
-}
-
-/// Доказательство `theorem` (`data.evidence` записи).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Evidence {
-    pub checked: String,
-    pub method: String,
-    pub result: String,
-}
-
-impl Evidence {
-    fn is_complete(&self) -> bool {
-        [&self.checked, &self.method, &self.result]
-            .iter()
-            .all(|s| !s.trim().is_empty())
-    }
-}
-
-/// Insight набора M3 (`eval/insights.toml`, `[[insight]]`): загрузчик создаёт его
-/// `POST /spaces/{решение}/entries`, замещает (`supersedes`) и отзывает (`retract_reason`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Insight {
-    /// Ключ набора: `insight:<key>` в запросах.
-    pub key: String,
-    pub lang: Lang,
-    /// `data.kind`: `gotcha | failure | discovery | decision | experiment | pattern`.
-    pub kind: String,
-    /// `solution` (пространство решения набора) | `global` (Knowledge).
-    pub scope: String,
-    #[serde(default)]
-    pub area: Option<String>,
-    /// `axiom` (создаёт человеческий токен) | `theorem` (с `evidence`) | `hypothesis`; без
-    /// поля — статус по умолчанию агента (`hypothesis`).
-    #[serde(default)]
-    pub certainty: Option<String>,
-    #[serde(default)]
-    pub evidence: Option<Evidence>,
-    pub title: String,
-    pub body: String,
-    /// Триггеры как в API (`{type, pattern, tools?}`).
-    #[serde(default)]
-    pub triggers: Vec<serde_json::Value>,
-    /// Ключ insight, который этот замещает (`POST /entries/{id}/supersede`).
-    #[serde(default)]
-    pub supersedes: Option<String>,
-    /// Отзыв после создания (`POST /entries/{id}/retract`).
-    #[serde(default)]
-    pub retract_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InsightFile {
-    #[serde(default)]
-    insight: Vec<Insight>,
-}
-
-/// Виды insight (`data.kind`, как в API).
-const INSIGHT_KINDS: [&str; 6] = [
-    "gotcha",
-    "failure",
-    "discovery",
-    "decision",
-    "experiment",
-    "pattern",
-];
-const CERTAINTIES: [&str; 3] = ["axiom", "theorem", "hypothesis"];
-
-impl Corpus {
-    /// Insight по ключу.
-    pub fn insight(&self, key: &str) -> Option<&Insight> {
-        self.insights.iter().find(|i| i.key == key)
-    }
-
-    /// Ключи insight, замещённых другими.
-    pub fn superseded_keys(&self) -> BTreeSet<&str> {
-        self.insights
-            .iter()
-            .filter_map(|i| i.supersedes.as_deref())
-            .collect()
-    }
-
-    /// Insight действует (не замещён и не отозван).
-    pub fn insight_active(&self, key: &str) -> bool {
-        self.insight(key)
-            .is_some_and(|i| i.retract_reason.is_none())
-            && !self.superseded_keys().contains(key)
-    }
-
-    /// Итоговый статус insight по умолчанию агента: явный или `hypothesis`.
-    pub fn insight_certainty(&self, key: &str) -> Option<&str> {
-        self.insight(key)
-            .map(|i| i.certainty.as_deref().unwrap_or("hypothesis"))
-    }
-}
-
-/// Читает insight из TOML (`[[insight]]`); нет файла — пусто.
-pub fn load_insights(path: &Path) -> Result<Vec<Insight>> {
-    if !path.is_file() {
-        return Ok(Vec::new());
-    }
-    let text = fs::read_to_string(path).with_context(|| format!("чтение {}", path.display()))?;
-    let f: InsightFile =
-        toml::from_str(&text).with_context(|| format!("разбор {}", path.display()))?;
-    Ok(f.insight)
 }
 
 /// Предел размера заметки корпуса.
@@ -818,6 +726,14 @@ pub struct Summary {
     pub retracted: usize,
     /// Пары противоречий «надёжное — гипотеза» из запросов `certainty`.
     pub contradictions: usize,
+    /// Пары `certainty`, где надёжная запись лексически ближе к запросу, чем гипотеза, и
+    /// наоборот (общие слова [`shared_words`] с заголовком и телом) — баланс набора.
+    pub certainty_reliable_closer: usize,
+    pub certainty_hypothesis_closer: usize,
+    /// Бесструктурных абзацев длинных заметок длиннее [`LONG_PARAGRAPH_CHARS`].
+    pub long_paragraphs: usize,
+    /// Запросов с `also`.
+    pub with_also: usize,
 }
 
 impl Summary {
@@ -844,6 +760,33 @@ pub const MIN_INSIGHTS: usize = 48;
 pub const MIN_CHAINS: usize = 12;
 pub const MIN_RETRACTED: usize = 4;
 pub const MIN_CONTRADICTIONS: usize = 12;
+/// Абзац прозы длиннее этого числа символов — заведомо больше `chunk_hard_max` (800 токенов
+/// bge-m3 ≈ 3300–3500 символов): жадная упаковка режет его внутри (fix round 1 задачи 16).
+pub const LONG_PARAGRAPH_CHARS: usize = 3800;
+pub const MIN_LONG_PARAGRAPHS: usize = 8;
+/// Доля пар `certainty` каждого направления лексической близости — не меньше.
+const CERTAINTY_BALANCE: f64 = 0.4;
+
+/// Бесструктурные абзацы заметки (не заголовок, не код, не список, не таблица, не цитата)
+/// длиннее [`LONG_PARAGRAPH_CHARS`] символов.
+pub fn long_paragraphs(text: &str) -> usize {
+    let mut fence = false;
+    let mut n = 0;
+    for block in text.split("\n\n") {
+        if block.lines().filter(|l| l.starts_with("```")).count() % 2 == 1 {
+            fence = !fence;
+            continue;
+        }
+        let prose = !block
+            .trim_start()
+            .starts_with(['#', '`', '-', '*', '|', '>'])
+            && !block.trim_start().starts_with(|c: char| c.is_ascii_digit());
+        if !fence && prose && block.chars().count() > LONG_PARAGRAPH_CHARS {
+            n += 1;
+        }
+    }
+    n
+}
 /// `evidence` запроса `chunk` — из середины заметки: начало не раньше этой доли текста,
 /// конец не позже `1 − доля`.
 const EVIDENCE_MARGIN: f64 = 0.10;
@@ -851,7 +794,7 @@ const EVIDENCE_MARGIN: f64 = 0.10;
 const EVIDENCE_CHARS: std::ops::RangeInclusive<usize> = 40..=600;
 
 /// Ключ insight: `[a-z0-9-]`, непустой.
-fn valid_key(k: &str) -> bool {
+pub(super) fn valid_key(k: &str) -> bool {
     !k.is_empty()
         && k.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -860,93 +803,6 @@ fn valid_key(k: &str) -> bool {
 /// Пробелы и переводы строк — одним пробелом (сравнение `evidence` с текстом листа).
 pub fn squash_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Проверка insight набора: ключи, виды, статусы, доказательства, цепочки замещения без
-/// циклов (замещаемая запись определена раньше), отзывы.
-fn validate_insights(corpus: &Corpus, errs: &mut Vec<String>) {
-    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut successor: BTreeMap<&str, &str> = BTreeMap::new();
-    for (idx, i) in corpus.insights.iter().enumerate() {
-        let mut bad = |m: String| errs.push(format!("insight {}: {m}", i.key));
-        if !valid_key(&i.key) {
-            bad("ключ — [a-z0-9-]".into());
-        }
-        if seen.insert(&i.key, idx).is_some() {
-            bad("ключ повторяется".into());
-        }
-        if !INSIGHT_KINDS.contains(&i.kind.as_str()) {
-            bad(format!("kind — одно из {}", INSIGHT_KINDS.join(", ")));
-        }
-        if !matches!(i.scope.as_str(), "solution" | "global") {
-            bad("scope — solution или global".into());
-        }
-        let title = i.title.trim().chars().count();
-        if title == 0 || title > 500 || i.body.trim().is_empty() {
-            bad("заголовок 1–500 символов и непустое тело".into());
-        }
-        if i.body.contains('\r') || i.title.contains('\r') {
-            bad("переводы строк CRLF".into());
-        }
-        match i.certainty.as_deref() {
-            None | Some("hypothesis") | Some("axiom") => {}
-            Some("theorem") => {
-                if !i.evidence.as_ref().is_some_and(Evidence::is_complete) {
-                    bad("theorem без evidence {checked, method, result}".into());
-                }
-            }
-            Some(c) => bad(format!("certainty «{c}»: {}", CERTAINTIES.join(" | "))),
-        }
-        if i.retract_reason
-            .as_ref()
-            .is_some_and(|r| r.trim().is_empty())
-        {
-            bad("пустая retract_reason".into());
-        }
-        if let Some(old) = &i.supersedes {
-            match seen.get(old.as_str()) {
-                Some(&j) if j < idx => {
-                    let o = &corpus.insights[j];
-                    if o.retract_reason.is_some() {
-                        bad(format!("замещает отозванный {old}"));
-                    }
-                    if o.certainty.as_deref() == Some("axiom")
-                        || i.certainty.as_deref() == Some("axiom")
-                    {
-                        bad("цепочки замещения без axiom (axiom меняет только человек)".into());
-                    }
-                    if o.scope != i.scope {
-                        bad(format!("scope отличается от замещаемого {old}"));
-                    }
-                }
-                _ => bad(format!(
-                    "supersedes {old}: нет insight с таким ключом выше по файлу"
-                )),
-            }
-            if let Some(prev) = successor.insert(old, &i.key) {
-                bad(format!("{old} уже замещён записью {prev}"));
-            }
-        }
-    }
-    // циклы: путь по замещениям от любой записи конечен (при «выше по файлу» их нет, но
-    // проверка независима от порядка)
-    let by_key: BTreeMap<&str, &Insight> = corpus
-        .insights
-        .iter()
-        .map(|i| (i.key.as_str(), i))
-        .collect();
-    for i in &corpus.insights {
-        let mut cur = i;
-        let mut steps = 0;
-        while let Some(next) = cur.supersedes.as_deref().and_then(|k| by_key.get(k)) {
-            steps += 1;
-            if steps > corpus.insights.len() {
-                errs.push(format!("insight {}: цикл замещений", i.key));
-                break;
-            }
-            cur = next;
-        }
-    }
 }
 
 /// Цель запроса: заметка корпуса или insight.
@@ -1033,6 +889,12 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
             .filter(|q| Kind::M2.contains(&q.kind))
             .count(),
         long_notes: corpus.notes.values().filter(|n| n.is_long()).count(),
+        long_paragraphs: corpus
+            .notes
+            .values()
+            .filter(|n| n.is_long())
+            .map(|n| long_paragraphs(&n.text))
+            .sum(),
         fts_only_notes: corpus.notes.values().filter(|n| n.index_disabled()).count(),
         insights: corpus.insights.len(),
         chains: {
@@ -1053,6 +915,8 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
     let mut referenced: BTreeSet<&str> = BTreeSet::new();
     let mut exact_targets: BTreeSet<&str> = BTreeSet::new();
     let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    // общие слова «надёжное/гипотеза» по запросам certainty — в сообщение о дисбалансе
+    let mut closeness_log: Vec<String> = Vec::new();
     for q in queries {
         let mut bad = |m: String| errs.push(format!("запрос {}: {m}", q.id));
         if !ids.insert(&q.id) {
@@ -1072,6 +936,20 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                 None => bad(format!("нет заметки или insight {p}")),
             }
             referenced.insert(p.as_str());
+        }
+        for p in &q.also {
+            if resolve(corpus, p).is_none() {
+                bad(format!("also {p}: нет заметки или insight"));
+            }
+            if q.expect.contains(p) {
+                bad(format!("{p} и в expect, и в also"));
+            }
+            if q.forbid.contains(p) || q.weaker.contains(p) {
+                bad(format!("{p} и в also, и в forbid/weaker"));
+            }
+        }
+        if !q.also.is_empty() {
+            s.with_also += 1;
         }
         let notes: Vec<&Note> = targets
             .iter()
@@ -1179,6 +1057,20 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                             t.name()
                         )),
                     }
+                }
+                let closeness = |r: &str| match resolve(corpus, r) {
+                    Some(Target::Insight(i)) => {
+                        shared_words(&q.text, &format!("{} {}", i.title, i.body)).len()
+                    }
+                    _ => 0,
+                };
+                let reliable = q.expect.iter().map(|e| closeness(e)).max().unwrap_or(0);
+                let hypothesis = q.weaker.iter().map(|w| closeness(w)).max().unwrap_or(0);
+                closeness_log.push(format!("{} {reliable}/{hypothesis}", q.id));
+                if reliable > hypothesis {
+                    s.certainty_reliable_closer += 1;
+                } else if hypothesis > reliable {
+                    s.certainty_hypothesis_closer += 1;
                 }
                 for w in &q.weaker {
                     match resolve(corpus, w) {
@@ -1333,6 +1225,24 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                 errs.push(format!("нет длинных заметок на {lang:?}"));
             }
         }
+        if s.long_paragraphs < MIN_LONG_PARAGRAPHS {
+            errs.push(format!(
+                "бесструктурных абзацев длиннее {LONG_PARAGRAPH_CHARS} символов {} < {MIN_LONG_PARAGRAPHS}",
+                s.long_paragraphs
+            ));
+        }
+        let cert = count(Kind::Certainty) as f64;
+        if (s.certainty_reliable_closer as f64) < cert * CERTAINTY_BALANCE
+            || (s.certainty_hypothesis_closer as f64) < cert * CERTAINTY_BALANCE
+        {
+            errs.push(format!(
+                "пары certainty не сбалансированы: надёжное ближе к запросу в {}, гипотеза — в {} из {} (общие слова надёжное/гипотеза: {})",
+                s.certainty_reliable_closer,
+                s.certainty_hypothesis_closer,
+                cert,
+                closeness_log.join(", ")
+            ));
+        }
         if s.fts_only_notes < MIN_FTS_ONLY {
             errs.push(format!(
                 "заметок с index: false {} < {MIN_FTS_ONLY}",
@@ -1376,6 +1286,23 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         );
     }
     Ok(s)
+}
+
+/// Запрос `chunk` для тестов соседних модулей.
+#[cfg(test)]
+pub fn tests_query(id: &str, note: &str) -> Query {
+    Query {
+        id: id.into(),
+        text: "query".into(),
+        lang: Lang::En,
+        expect: vec![note.into()],
+        kind: Kind::Chunk,
+        disjoint: false,
+        forbid: Vec::new(),
+        weaker: Vec::new(),
+        evidence: None,
+        also: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1450,6 +1377,7 @@ mod tests {
             forbid: Vec::new(),
             weaker: Vec::new(),
             evidence: None,
+            also: Vec::new(),
         }
     }
 
@@ -1487,7 +1415,7 @@ mod tests {
         let n = long_note();
         c.notes.insert(n.path.clone(), n);
         let mut proven = insight("cache-ok", Some("theorem"), None);
-        proven.evidence = Some(Evidence {
+        proven.evidence = Some(crate::eval::insights::Evidence {
             checked: "c".into(),
             method: "m".into(),
             result: "r".into(),
@@ -1553,12 +1481,14 @@ mod tests {
         let mut h2 = chunk.clone();
         h2.id = "b7".into();
         h2.evidence = Some("exactly four times before parking it.\n\n## Part two".into());
+        let mut bad_also = m3_query("b8", Kind::Exact, "en/long/ingest");
+        bad_also.also = vec!["insight:nope".into(), "en/long/ingest".into()];
         let mut stray = m3_query("b6", Kind::Exact, "en/long/ingest");
         stray.evidence = Some("x".into());
         let err = validate(
             &c,
             &[
-                bad_forbid, bad_weaker, bad_expect, bad_ev, edge_ev, stray, h2,
+                bad_forbid, bad_weaker, bad_expect, bad_ev, edge_ev, stray, h2, bad_also,
             ],
             false,
         )
@@ -1573,6 +1503,8 @@ mod tests {
             "запрос b5: evidence не из середины",
             "запрос b6: evidence — только у chunk",
             "запрос b7: evidence захватывает строку заголовка H1–H3",
+            "запрос b8: also insight:nope: нет заметки или insight",
+            "запрос b8: en/long/ingest и в expect, и в also",
         ] {
             assert!(err.contains(needle), "{needle}: {err}");
         }

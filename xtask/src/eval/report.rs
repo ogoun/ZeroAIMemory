@@ -219,6 +219,19 @@ pub fn run_md(r: &RunResult) -> String {
         "\n\nКаналы, которыми найдены ожидаемые заметки в top-{TOP_K}: {}.",
         channels_line(&r.metrics)
     );
+    if let Some(sp) = &r.split {
+        let _ = writeln!(
+            s,
+            "\nРазрезано границами листов доказательств запросов `chunk`: {} из {} (из них целиком в \
+             листе вместе с перекрытием — {}); листов длинных заметок {}. Потолок chunk-recall@5 — \
+             {:.3}.",
+            sp.split,
+            sp.queries,
+            sp.split_whole_with_overlap,
+            sp.long_leaves,
+            1.0 - sp.split as f64 / sp.queries.max(1) as f64
+        );
+    }
     let m3 = m3_table(r);
     if !m3.is_empty() {
         let _ = writeln!(
@@ -236,7 +249,11 @@ pub fn run_md(r: &RunResult) -> String {
             "\n## Сравнение с прежним прогоном\n\n`{}` (запросы `{}`, корпус `{}`): общих \
              запросов {}.\n\n| Разность (новый − прежний) | n | значение |\n|---|---:|---|\n\
              | Δ recall@5 | {} | {} |\n| Δ nDCG@10 | {} | {} |\n\
-             | Δ nDCG@10 без группы e | {} | {} |\n\n{}",
+             | Δ nDCG@10 без группы e | {} | {} |\n\
+             | Δ nDCG@10 без новых целей корпуса | {} | {} |\n\n\
+             Общий запрос — тот же id, вид, `expect`{}; метрики нового прогона — по `expect` \
+             (без `also`). «Без новых целей» — из выдачи убраны insight и заметки, которых не \
+             было в корпусе прежнего коммита.\n\n{}",
             c.against,
             c.against_queries_fingerprint,
             c.against_corpus_fingerprint,
@@ -247,6 +264,13 @@ pub fn run_md(r: &RunResult) -> String {
             diff(&c.d_ndcg10),
             c.n_without_e,
             diff(&c.d_ndcg10_without_e),
+            c.n,
+            c.d_ndcg10_without_new.as_ref().map_or("—".into(), diff),
+            if c.text_checked {
+                " и текст"
+            } else {
+                " (текст прежнего прогона не найден — не сверялся)"
+            },
             if c.regression {
                 "**Регрессия:** интервал Δ nDCG@10 целиком ниже нуля."
             } else {

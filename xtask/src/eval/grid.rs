@@ -69,6 +69,11 @@ pub struct ConfigResult {
     pub d_ndcg10_disjoint: Estimate,
     /// Набор M3: разности по запросам `chunk` (листы) и по запросам к длинным заметкам.
     pub d_chunk_recall5: Option<Estimate>,
+    /// Справочно: chunk-recall@5 с перекрытием (зонд сетки перекрытия: лист вместе с
+    /// повторённым началом).
+    pub d_chunk_recall5_with_overlap: Option<Estimate>,
+    /// Разрезанные границами листов доказательства запросов `chunk`.
+    pub split: Option<crate::eval::leaves::SplitStats>,
     pub d_chunk_ndcg10: Option<Estimate>,
     pub d_ndcg10_long: Option<Estimate>,
     /// Листовых чанков заметок в индексе конфигурации (критерий ±5 % задачи нарезки).
@@ -131,6 +136,8 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
     }
     let mut results: Vec<Option<(RunResult, f64)>> = (0..g.config.len()).map(|_| None).collect();
     let mut leaf_counts = vec![0usize; g.config.len()];
+    let mut splits = vec![None; g.config.len()];
+    let mut failed: Vec<String> = Vec::new();
     for (gi, (_, members)) in groups.iter().enumerate() {
         let mut session: Option<Session> = None;
         let mut index_secs = 0.0;
@@ -169,7 +176,12 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
                 est(&r.metrics.overall.ndcg10),
                 est(&r.metrics.overall.recall5)
             );
-            leaf_counts[ci] = run::leaf_cores(&s.data)?.len();
+            let leaves = crate::eval::leaves::leaf_cores(&s.data)?;
+            leaf_counts[ci] = leaves.len();
+            splits[ci] = run::chunk_split(&s, queries)?;
+            // контроль устаревания — и в сетке: конфигурация, у которой запросы superseded
+            // не находят замещённых даже с историей, не годится для сравнения
+            failed.extend(run::history_control(&r).map(|e| format!("{}: {e}", c.name)));
             results[ci] = Some((r, index_secs));
             session = Some(s);
         }
@@ -188,7 +200,8 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
         .iter()
         .zip(&g.config)
         .zip(&leaf_counts)
-        .map(|(((r, secs), c), &leaf_chunks)| {
+        .zip(&splits)
+        .map(|((((r, secs), c), &leaf_chunks), &split)| {
             let q = &r.queries;
             let dis: Vec<&QueryRun> = q.iter().filter(|x| x.disjoint).collect();
             let d_ndcg10 = paired_diff(
@@ -216,6 +229,16 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
                     &dis.iter().map(|x| x.metrics.ndcg10).collect::<Vec<_>>(),
                 ),
                 d_chunk_recall5: subset_diff(base, q, |x| x.metrics.chunk_recall5),
+                d_chunk_recall5_with_overlap: subset_diff(base, q, |x| {
+                    (x.kind == crate::eval::corpus::Kind::Chunk).then(|| {
+                        if x.leaves.iter().take(5).any(|l| l.evidence_with_overlap) {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                }),
+                split,
                 d_chunk_ndcg10: subset_diff(base, q, |x| x.metrics.chunk_ndcg10),
                 d_ndcg10_long: subset_diff(base, q, |x| x.long.then_some(x.metrics.ndcg10)),
                 leaf_chunks,
@@ -247,6 +270,9 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
     let md = grid_md(&gr);
     let (json, mdp) = report::write_pair(&p.results, &stem, &gr, &md)?;
     println!("{md}\n{}\n{}", json.display(), mdp.display());
+    if !failed.is_empty() {
+        bail!("{}", failed.join("; "));
+    }
     Ok(())
 }
 
@@ -278,8 +304,8 @@ pub fn grid_md(g: &GridResult) -> String {
         g.model, g.device, g.date, g.git, g.notes, g.queries
     );
     s.push_str(
-        "| Конфигурация | переопределения | индексация, с | листов | recall@5 | nDCG@10 | chunk-recall@5 | Δ recall@5 | Δ MRR@10 | Δ nDCG@10 | Δ nDCG@10 без общих слов | Δ chunk-recall@5 | Δ chunk-nDCG@10 | Δ nDCG@10 длинных | итог |\n\
-         |---|---|---:|---:|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| Конфигурация | переопределения | индексация, с | листов | recall@5 | nDCG@10 | chunk-recall@5 | Δ recall@5 | Δ MRR@10 | Δ nDCG@10 | Δ nDCG@10 без общих слов | Δ chunk-recall@5 | Δ chunk-recall@5 с перекрытием | разрезано evidence | Δ chunk-nDCG@10 | Δ nDCG@10 длинных | итог |\n\
+         |---|---|---:|---:|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for c in &g.configs {
         let sets: Vec<String> = c
@@ -290,7 +316,7 @@ pub fn grid_md(g: &GridResult) -> String {
             .collect();
         let _ = writeln!(
             s,
-            "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             c.config.name,
             if sets.is_empty() {
                 "умолчания".into()
@@ -311,6 +337,11 @@ pub fn grid_md(g: &GridResult) -> String {
             diff(&c.d_ndcg10),
             diff(&c.d_ndcg10_disjoint),
             opt_diff(&c.d_chunk_recall5),
+            opt_diff(&c.d_chunk_recall5_with_overlap),
+            c.split.map_or("—".into(), |s| format!(
+                "{} из {} ({} целиком с перекрытием)",
+                s.split, s.queries, s.split_whole_with_overlap
+            )),
             opt_diff(&c.d_chunk_ndcg10),
             opt_diff(&c.d_ndcg10_long),
             if c.better {
