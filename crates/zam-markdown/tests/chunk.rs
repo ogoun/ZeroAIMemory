@@ -669,7 +669,7 @@ fn ends_with_heading(text: &str, levels: std::ops::RangeInclusive<usize>) -> boo
 /// заголовком, заголовок уходит в лист со своим содержимым.
 fn check_heading_never_ends_leaf(marks: &str) {
     let level = marks.len();
-    for lambda in [0.0, 1.0, 2.0] {
+    for lambda in [0.0, 0.5, 1.0, 2.0] {
         for p1 in (280..=330).step_by(3) {
             let src = format!(
                 "# Заметка\n\n{}\n\n{marks} Подзаголовок\n\n{}\n",
@@ -709,6 +709,70 @@ fn h5_h6_never_end_leaf() {
     check_heading_never_ends_leaf("######");
 }
 
+/// Склеенная секция (короче `merge_below`, склеена со следующей того же родителя): строка
+/// H1–H3 второй секции внутри группы — тоже заголовок; лист ею не кончается, заголовок
+/// уходит в лист со своим содержимым (fix round 1 задачи 17).
+///
+/// Склейка допускается, только если группа целиком не длиннее `target_max`, поэтому разрез
+/// внутри неё возникает лишь там, где сумма оценок единиц больше оценки текста группы:
+/// у каждой единицы своё округление вверх (здесь — абзацы из одной буквы: 1 токен на
+/// единицу против ~0,86 в тексте группы). Сценарий перебирает длины секций и проверяет, что
+/// разрез внутри склеенной группы действительно случается.
+#[test]
+fn glued_section_heading_never_ends_leaf() {
+    let mut cut_inside = 0;
+    for lambda in [0.0, 0.5, 1.0, 2.0] {
+        for k in (20..=60).step_by(4) {
+            for m in (4..=40).step_by(4) {
+                let src = format!(
+                    "# Заметка\n\n## Короткая\n\n{}## Следующая\n\n{}",
+                    "а\n\n".repeat(k),
+                    "б\n\n".repeat(m)
+                );
+                let p = ChunkParams {
+                    target_min: 5,
+                    target_max: 60,
+                    hard_max: 200,
+                    merge_below: 60,
+                    overlap_sentences: 0,
+                    ..with(lambda, false)
+                };
+                let all = chunks_with(&src, &p);
+                let ls = leaves(&all);
+                // строка H1–H3 второй секции есть в тексте листа, только если секции склеены
+                // (у отдельной секции заголовок — в `heading_path`, не в тексте)
+                let Some(second) = ls.iter().find(|l| l.text.contains("## Следующая"))
+                else {
+                    continue;
+                };
+                assert_eq!(second.heading_path, "Заметка > Короткая", "путь группы");
+                let group: Vec<_> = ls
+                    .iter()
+                    .filter(|l| l.heading_path == "Заметка > Короткая")
+                    .collect();
+                if group.len() > 1 {
+                    cut_inside += 1;
+                }
+                for l in &group {
+                    assert!(
+                        !ends_with_heading(&l.text, 1..=3),
+                        "λ={lambda}, k={k}, m={m}: лист кончается строкой H1–H3: …{:?}",
+                        l.text.lines().rev().take(3).collect::<Vec<_>>()
+                    );
+                }
+                assert!(
+                    second.text.contains("б"),
+                    "λ={lambda}, k={k}, m={m}: заголовок без содержимого"
+                );
+            }
+        }
+    }
+    assert!(
+        cut_inside > 0,
+        "склеенная группа ни разу не разрезана — сценарий пустой"
+    );
+}
+
 #[test]
 fn colon_intro_stays_with_block() {
     let code: String = (0..40)
@@ -726,7 +790,7 @@ fn colon_intro_stays_with_block() {
         (table, "| ключ |"),
     ];
     for (block, start) in &blocks {
-        for lambda in [0.0, 1.0] {
+        for lambda in [0.0, 0.5, 1.0] {
             for p1 in (280..=330).step_by(5) {
                 let src = format!(
                     "# Заметка\n\n{} Пример настройки:\n\n{block}\nПосле блока.\n",
@@ -740,6 +804,40 @@ fn colon_intro_stays_with_block() {
                 assert!(
                     l.text.contains(start),
                     "λ={lambda}, P1={p1}: вводная фраза оторвана от {start:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Вводная фраза в выделении (`**Пример:**`, `__…:__`, `*…:*`, `_…:_`) — тоже вводная:
+/// завершающая разметка выделения не мешает признаку «:» (fix round 1 задачи 17).
+#[test]
+fn emphasized_colon_intro_stays_with_block() {
+    let code: String = (0..40)
+        .map(|i| format!("let value_{i} = compute(input_{i}, options);\n"))
+        .collect();
+    for intro in [
+        "**Пример настройки:**",
+        "__Пример настройки:__",
+        "*Пример настройки:*",
+        "_Пример настройки:_",
+        "**Пример настройки**:",
+    ] {
+        for lambda in [0.0, 0.5] {
+            for p1 in (280..=330).step_by(5) {
+                let src = format!(
+                    "# Заметка\n\n{} {intro}\n\n```rust\n{code}```\n\nПосле блока.\n",
+                    prose(p1, "ввод")
+                );
+                let all = chunks_with(&src, &with(lambda, false));
+                let l = leaves(&all)
+                    .into_iter()
+                    .find(|l| l.text.contains(intro))
+                    .expect("лист с вводной фразой");
+                assert!(
+                    l.text.contains("```rust"),
+                    "{intro} λ={lambda}, P1={p1}: вводная фраза оторвана от кода"
                 );
             }
         }
@@ -1166,7 +1264,7 @@ proptest! {
     #[test]
     fn chunk_invariants_boundary_lambda(
         src in chunk_doc(),
-        lambda in prop::sample::select(vec![0.0, 1.0, 2.0]),
+        lambda in prop::sample::select(vec![0.0, 0.5, 1.0, 2.0]),
         cohesion in any::<bool>(),
     ) {
         check_invariants(&src, &with(lambda, cohesion))?;
@@ -1176,7 +1274,7 @@ proptest! {
     fn chunk_invariants_boundary_lambda_small_budgets(
         src in long_doc(),
         hard in 4usize..60,
-        lambda in prop::sample::select(vec![0.0, 1.0, 2.0]),
+        lambda in prop::sample::select(vec![0.0, 0.5, 1.0, 2.0]),
         cohesion in any::<bool>(),
     ) {
         let p = ChunkParams {

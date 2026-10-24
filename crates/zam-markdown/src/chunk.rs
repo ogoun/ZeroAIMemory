@@ -267,6 +267,15 @@ fn level_draft(
     }
 }
 
+/// Абзац кончается на «:» — вводная фраза к следующему блоку. Завершающая разметка
+/// выделения (`**Пример:**`, `__…:__`, `*…:*`, `_…:_`, `` `…:` ``) снимается перед проверкой.
+fn ends_with_colon(text: &str) -> bool {
+    text.trim_end()
+        .trim_end_matches(['*', '_', '`'])
+        .trim_end()
+        .ends_with(':')
+}
+
 /// Путь заголовков листа: путь группы и заголовки H4–H6, действующие в начале собственного
 /// текста листа (`core_start`, первый непробельный символ). Строка H1–H3 сбрасывает H4–H6;
 /// H5 после H4 вкладывается, следующий H4 замещает предыдущий.
@@ -633,7 +642,7 @@ impl Chunker<'_> {
         let tokens = self.count(r.clone());
         let prose = block.is_some_and(|b| b.prose);
         let kind = block.map_or(UnitKind::Other, |b| b.kind);
-        let colon = prose && self.src[r.clone()].trim_end().ends_with(':');
+        let colon = prose && ends_with_colon(&self.src[r.clone()]);
         let first = out.len();
         let fits = if prose {
             tokens <= self.p.target_max
@@ -1042,6 +1051,26 @@ mod tests {
             kind,
             start,
             colon_end,
+        }
+    }
+
+    #[test]
+    fn colon_intro_with_emphasis() {
+        for t in [
+            "Пример:",
+            "Пример:  \n",
+            "**Пример:**",
+            "__Пример:__",
+            "*Пример:*",
+            "_Пример:_",
+            "`config:`",
+            "**Пример**:",
+            "Текст и **Пример:** ",
+        ] {
+            assert!(ends_with_colon(t), "{t:?}");
+        }
+        for t in ["Пример.", "**Пример**", "a: b", "*", "", "snake_case_"] {
+            assert!(!ends_with_colon(t), "{t:?}");
         }
     }
 
