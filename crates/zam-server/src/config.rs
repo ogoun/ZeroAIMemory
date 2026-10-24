@@ -321,8 +321,8 @@ pub struct IndexSection {
     pub chunk_overlap_sentences: usize,
     /// Вес силы границы λ при выборе разреза листа (задача 17 M3): 0 — жадная упаковка M2
     /// (с исправлениями висячего заголовка и вводной фразы), больше 0 — динамическое
-    /// программирование по силе границ. По умолчанию 1 — по сетке `eval/grid-chunking.toml`
-    /// (задача 17 M3: λ от 0,5 до 2 дают одинаковые разрезы).
+    /// программирование по силе границ. По умолчанию 0,5 — по сетке `eval/grid-chunking.toml`
+    /// (задача 17 M3: λ от 0,5 до 2 дают одинаковые разрезы, выбрано наименьшее).
     pub chunk_boundary_lambda: f64,
     /// Лексическая связность прозы (основы слов) в силе границы при λ > 0.
     pub chunk_cohesion: bool,
@@ -609,7 +609,7 @@ impl Default for ServerConfig {
                 chunk_hard_max: 800,
                 chunk_merge_below: 100,
                 chunk_overlap_sentences: 1,
-                chunk_boundary_lambda: 1.0,
+                chunk_boundary_lambda: 0.5,
                 chunk_cohesion: false,
                 chunk_prefix_l0: false,
                 chunk_heading_path_h4: true,
@@ -1232,7 +1232,7 @@ yield_ms = 1
         assert_eq!(
             d.index.chunk_params(),
             zam_markdown::ChunkParams {
-                boundary_lambda: 1.0,
+                boundary_lambda: 0.5,
                 ..zam_markdown::ChunkParams::default()
             }
         );
@@ -1289,12 +1289,12 @@ yield_ms = 1
             (192, 192, 192, 100)
         );
         assert_eq!(d.index.chunk_params_for(Some(10)).0.hard_max, 1);
-        // сила границ (задача 17 M3): умолчание λ = 1, флаги — в пороги чанкера; L0 в префиксе
+        // сила границ (задача 17 M3): умолчание λ = 0,5, флаги — в пороги чанкера; L0 в префиксе
         // уменьшает предел листа на свой бюджет
         let p = d.index.chunk_params();
         assert_eq!(
             (p.boundary_lambda, p.cohesion, p.heading_path_h4),
-            (1.0, false, true)
+            (0.5, false, true)
         );
         assert!(!d.index.chunk_prefix_l0);
         let c = load(

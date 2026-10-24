@@ -1,0 +1,20 @@
+# Проверка выбора сетки eval/grid-chunking.toml на int8 CPU (задача 17 M3): база «m2» — нарезка M2
+# (бинарник коммита a00e67c, см. eval/grid-chunking.toml), «fixes» — исправления без λ, «lambda0.5» —
+# выбранное умолчание [index] chunk_boundary_lambda.
+#   cargo xtask eval --grid eval/grid-chunking-cpu.toml
+model = "bge-m3-int8"
+device = "cpu"
+second_base = "fixes"
+
+[[config]]
+name = "m2"
+server_bin = ".tmp/m3/task-17/m2-bin/zam-server.exe"
+set = {}
+
+[[config]]
+name = "fixes"
+set = { "index.chunk_boundary_lambda" = "0" }
+
+[[config]]
+name = "lambda0.5"
+set = { "index.chunk_boundary_lambda" = "0.5" }

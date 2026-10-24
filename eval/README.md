@@ -158,6 +158,7 @@ cargo xtask eval --device cuda --label m3-base \
 cargo xtask eval --grid eval/grid-overlap.toml                          # чувствительность к нарезке
 cargo xtask eval --grid eval/grid-chunk-size.toml                       # границы листов: размер
 cargo xtask eval --grid eval/grid-chunking.toml                         # сила границ (задача 17 M3)
+cargo xtask eval --grid eval/grid-chunking-cpu.toml                     # то же, проверка на int8 CPU
 cargo xtask eval --device cuda --corpus <каталог> --insights <файл> --queries <файл> \
   --label <метка> --out <каталог>                                         # контрольный прогон
 ```
