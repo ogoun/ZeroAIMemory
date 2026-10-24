@@ -1,0 +1,61 @@
+# Нарезка с учётом силы границ (задача 17 M3; исследование
+# docs/research/2026-10-21-chunking-semantic.md §5, шаги 2–3).
+#
+# База «m2» — нарезка M2 до исправлений висячего H4–H6 и вводной фразы «:» (ruling R11): zam-server,
+# собранный из коммита a00e67c (последний до задачи 17), например:
+#   git worktree add .tmp/m2-src a00e67c
+#   cargo build --release -p zam-server --manifest-path .tmp/m2-src/Cargo.toml \
+#     --target-dir .tmp/m2-src/target
+#   и копия .tmp/m2-src/target/release/zam-server[.exe] в .tmp/m3/task-17/m2-bin/
+# (на Linux — путь без .exe). Вклад исправлений — строка «fixes» (M2 → M2 + исправления, λ = 0);
+# вклад λ, связности, L0 в префиксе и размера — таблица «Разности со второй базой «fixes»».
+# Размер листа (ruling R12): 500–800 с hard_max по окну модели минус префикс (1024 − 64 = 960).
+#   cargo xtask eval --grid eval/grid-chunking.toml
+model = "bge-m3-fp16"
+device = "cuda"
+second_base = "fixes"
+
+[[config]]
+name = "m2"
+server_bin = ".tmp/m3/task-17/m2-bin/zam-server.exe"
+set = {}
+
+[[config]]
+name = "fixes"
+set = { "index.chunk_boundary_lambda" = "0" }
+
+[[config]]
+name = "fixes-h4path-off"
+set = { "index.chunk_boundary_lambda" = "0", "index.chunk_heading_path_h4" = "false" }
+
+[[config]]
+name = "lambda0.5"
+set = { "index.chunk_boundary_lambda" = "0.5" }
+
+[[config]]
+name = "lambda1"
+set = { "index.chunk_boundary_lambda" = "1" }
+
+[[config]]
+name = "lambda2"
+set = { "index.chunk_boundary_lambda" = "2" }
+
+[[config]]
+name = "lambda1-cohesion"
+set = { "index.chunk_boundary_lambda" = "1", "index.chunk_cohesion" = "true" }
+
+[[config]]
+name = "lambda1-prefix-l0"
+set = { "index.chunk_boundary_lambda" = "1", "index.chunk_prefix_l0" = "true" }
+
+[[config]]
+name = "lambda1-chunk150-300"
+set = { "index.chunk_boundary_lambda" = "1", "index.chunk_target_min" = "150", "index.chunk_target_max" = "300", "index.chunk_hard_max" = "600" }
+
+[[config]]
+name = "lambda1-chunk500-800"
+set = { "index.chunk_boundary_lambda" = "1", "index.chunk_target_min" = "500", "index.chunk_target_max" = "800", "index.chunk_hard_max" = "960" }
+
+[[config]]
+name = "fixes-chunk500-800"
+set = { "index.chunk_boundary_lambda" = "0", "index.chunk_target_min" = "500", "index.chunk_target_max" = "800", "index.chunk_hard_max" = "960" }

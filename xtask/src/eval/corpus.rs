@@ -752,7 +752,9 @@ impl Summary {
 /// Требования к набору M3 (задача 16 M3).
 pub const MIN_SUPERSEDED: usize = 30;
 pub const MIN_CERTAINTY: usize = 12;
-pub const CHUNK_QUERIES: std::ops::RangeInclusive<usize> = 40..=60;
+/// Запросов `chunk`: 40–60 фактов из середины длинных заметок и до 10 сторожей «вводная фраза
+/// + код» (задача 17 M3: проверка исправления «:» и λ на регрессию).
+pub const CHUNK_QUERIES: std::ops::RangeInclusive<usize> = 40..=70;
 pub const LONG_NOTES: std::ops::RangeInclusive<usize> = 20..=30;
 pub const LONG_WORDS: std::ops::RangeInclusive<usize> = 2000..=5000;
 pub const MIN_FTS_ONLY: usize = 10;
@@ -761,8 +763,10 @@ pub const MIN_CHAINS: usize = 12;
 pub const MIN_RETRACTED: usize = 4;
 pub const MIN_CONTRADICTIONS: usize = 12;
 /// Абзац прозы длиннее этого числа символов — заведомо больше `chunk_hard_max` (800 токенов
-/// bge-m3 ≈ 3300–3500 символов): жадная упаковка режет его внутри (fix round 1 задачи 16).
-pub const LONG_PARAGRAPH_CHARS: usize = 3800;
+/// bge-m3: у абзацев набора 4000–4400 символов — 900–1012 токенов, ≈ 4,3 символа на токен,
+/// так что 4200 символов — не меньше ~950 токенов): нарезка режет его внутри (fix round 1
+/// задачи 16; порог поднят с 3800 по ревью задачи 16 в задаче 17).
+pub const LONG_PARAGRAPH_CHARS: usize = 4200;
 pub const MIN_LONG_PARAGRAPHS: usize = 8;
 /// Доля пар `certainty` каждого направления лексической близости — не меньше.
 const CERTAINTY_BALANCE: f64 = 0.4;

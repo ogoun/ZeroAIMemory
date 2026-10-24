@@ -32,12 +32,14 @@ use crate::StoreError;
 use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
-pub(crate) use chunks::{
-    backfill_certainty, backfill_embed_keys, chunk_id, context_prefix, frontmatter_tags, mask_tags,
-    note_chunks, rechunk_notes, rescan_secrets, stored_prefix_hit, token_counter,
-};
 pub use chunks::{
-    chunk_params, count_tokens, set_chunk_params, set_token_counter, token_counter_exact,
+    PREFIX_L0_MAX_TOKENS, chunk_params, count_tokens, prefix_l0, set_chunk_params, set_prefix_l0,
+    set_token_counter, token_counter_exact,
+};
+pub(crate) use chunks::{
+    backfill_certainty, backfill_embed_keys, chunk_id, chunker_fingerprint, context_prefix,
+    frontmatter_tags, mask_tags, note_chunks, rechunk_notes, rescan_secrets, stored_prefix_hit,
+    token_counter,
 };
 pub use history::{RevisionInfo, list_revisions, unified_diff};
 pub use l0::{set_auto_l0, set_folder_l0};

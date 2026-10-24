@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 
 use super::chunks::{
-    context_prefix, frontmatter_tags, index_note, index_state, note_meta, space_kind,
+    frontmatter_tags, index_note, index_state, note_meta, note_prefix, space_kind,
 };
 use super::write::{ensure_ancestors, ensure_free};
 use super::{
@@ -302,10 +302,10 @@ fn raw_deleted_at(c: &Connection, id: Id) -> Result<Option<String>, StoreError> 
 /// Пересчитывает `context_prefix` и `embed_key` чанков узла по его текущим пути, имени и тегам
 /// (триггер `chunks_au` обновляет FTS). У папки и удалённого узла чанков нет.
 fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), StoreError> {
-    let (path, name, fm): (String, String, Option<String>) = c.query_row(
-        "SELECT path, name, frontmatter FROM nodes WHERE id = ?1",
+    let (path, name, fm, l0): (String, String, Option<String>, Option<String>) = c.query_row(
+        "SELECT path, name, frontmatter, l0 FROM nodes WHERE id = ?1",
         [node_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     let tags = match fm.as_deref() {
         Some(s) => frontmatter_tags(s)
@@ -322,7 +322,7 @@ fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), Stor
     let mut upd =
         c.prepare_cached("UPDATE chunks SET context_prefix = ?2, embed_key = ?3 WHERE seq = ?1")?;
     for (seq, heading, text) in chunks {
-        let prefix = context_prefix(space, &path, &name, &heading, &tags);
+        let prefix = note_prefix(space, &path, &name, &heading, &tags, l0.as_deref());
         upd.execute(params![seq, prefix, embed_key_of(&prefix, &text)])?;
     }
     Ok(())

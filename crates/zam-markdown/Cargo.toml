@@ -11,6 +11,8 @@ ammonia.workspace = true
 comrak.workspace = true
 mime_guess.workspace = true
 regex.workspace = true
+# сила границы при нарезке (`chunk_cohesion`): основы слов Snowball ru/en, задача 17 M3
+rust-stemmers.workspace = true
 serde.workspace = true
 syntect.workspace = true
 thiserror.workspace = true

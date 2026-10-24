@@ -1092,7 +1092,7 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
     for &mode in &a.modes {
         let runs = s.run_queries(queries, mode)?;
         let mut r = result(&s, p, corpus, queries, mode, label.as_deref(), runs);
-        r.split = split;
+        r.split = split.clone();
         results.push(r);
     }
     s.stop()?;

@@ -17,6 +17,7 @@
 //! индексируемая заметка → `upsert`; Human и `index: false` → без задания
 //! (`index_state = 'excluded'`), но заметка, бывшая индексируемой, получает `delete`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use jiff::Timestamp;
@@ -56,8 +57,9 @@ fn params_cell() -> &'static RwLock<ChunkParams> {
 }
 
 /// Устанавливает пороги чанкера для всего процесса (`[index]` конфигурации сервера, §8.2).
-/// Как и смена счётчика, действует на заметки, записанные или перечанкованные после вызова:
-/// прежние чанки остаются до перезаписи или `reindex --full`.
+/// Действует на заметки, записанные или перечанкованные после вызова. Базу, нарезанную
+/// другими настройками (отпечаток [`chunker_fingerprint`] в `meta`), перенарезает разовая
+/// фоновая задача при её открытии (задача 17 M3); вызывать до первого открытия баз.
 pub fn set_chunk_params(p: ChunkParams) {
     *params_cell().write().unwrap_or_else(|e| e.into_inner()) = p;
 }
@@ -65,6 +67,46 @@ pub fn set_chunk_params(p: ChunkParams) {
 /// Текущие пороги чанкера.
 pub fn chunk_params() -> ChunkParams {
     *params_cell().read().unwrap_or_else(|e| e.into_inner())
+}
+
+static PREFIX_L0: AtomicBool = AtomicBool::new(false);
+
+/// Эксперимент `[index] chunk_prefix_l0` (задача 17 M3): контекстный префикс листов заметки
+/// дополняется L0 заметки (`… — <L0>`, не длиннее [`PREFIX_L0_MAX_TOKENS`]). Для всего процесса,
+/// до первого открытия баз, как [`set_chunk_params`].
+pub fn set_prefix_l0(on: bool) {
+    PREFIX_L0.store(on, Ordering::Relaxed);
+}
+
+/// Включён ли L0 в префиксе листов заметок.
+pub fn prefix_l0() -> bool {
+    PREFIX_L0.load(Ordering::Relaxed)
+}
+
+/// Предел L0 в префиксе, токенов счётчика чанкера.
+pub const PREFIX_L0_MAX_TOKENS: usize = 50;
+
+/// Версия алгоритма нарезки: 2 — задача 17 M3 (лист не кончается заголовком и вводной фразой
+/// на «:», H4–H6 в пути заголовков, выбор разреза по силе границы).
+const CHUNKER_VERSION: u32 = 2;
+
+/// Отпечаток нарезки процесса: версия алгоритма, пороги и флаги `[index]`, L0 в префиксе.
+/// Хранится в `meta` базы (`chunker`): база, нарезанная с другим отпечатком, перенарезается
+/// при открытии (кэш эмбеддингов по `embed_key` — повторный инференс только изменённых листов).
+pub(crate) fn chunker_fingerprint() -> String {
+    let p = chunk_params();
+    format!(
+        "v{CHUNKER_VERSION};{}/{}/{}/{}/{};lambda={};cohesion={};h4={};l0={}",
+        p.target_min,
+        p.target_max,
+        p.hard_max,
+        p.merge_below,
+        p.overlap_sentences,
+        p.boundary_lambda,
+        u8::from(p.cohesion),
+        u8::from(p.heading_path_h4),
+        u8::from(prefix_l0()),
+    )
 }
 
 /// Текущий счётчик токенов.
@@ -214,6 +256,61 @@ pub(crate) fn context_prefix(
     mask_text(&s)
 }
 
+/// Префикс листа заметки: [`context_prefix`] и, если включён [`set_prefix_l0`], `" — " + L0`
+/// заметки, обрезанный по словам до [`PREFIX_L0_MAX_TOKENS`] токенов. L0 берётся на момент
+/// нарезки: экстрактивный L0 воркера (`set_auto_l0`) префикс не меняет — иначе каждая новая
+/// сводка инвалидировала бы эмбеддинги заметки **[решение исполнителя]**.
+pub(crate) fn note_prefix(
+    space: &str,
+    path: &str,
+    name: &str,
+    heading_path: &str,
+    tags: &[String],
+    l0: Option<&str>,
+) -> String {
+    let base = context_prefix(space, path, name, heading_path, tags);
+    let l0 = l0.map(str::trim).filter(|s| !s.is_empty());
+    match l0 {
+        Some(l0) if prefix_l0() => {
+            let tc = token_counter();
+            let l0 = truncate_tokens(l0, PREFIX_L0_MAX_TOKENS, tc.as_ref());
+            if l0.is_empty() {
+                base
+            } else {
+                mask_text(&format!("{base} — {l0}"))
+            }
+        }
+        _ => base,
+    }
+}
+
+/// Префикс `s` по границе слова не длиннее `max` токенов счётчика `tc`.
+fn truncate_tokens(s: &str, max: usize, tc: &dyn TokenCounter) -> String {
+    if tc.count(s) <= max {
+        return s.to_string();
+    }
+    let ends: Vec<usize> = s
+        .char_indices()
+        .filter(|&(_, c)| c.is_whitespace())
+        .map(|(i, _)| i)
+        .collect();
+    // счётчик монотонен на префиксах: двоичный поиск по концам слов
+    let (mut lo, mut hi) = (0usize, ends.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if tc.count(&s[..ends[mid - 1]]) <= max {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo == 0 {
+        String::new()
+    } else {
+        s[..ends[lo - 1]].trim_end().to_string()
+    }
+}
+
 /// Теги для payload точек Qdrant: теги задаёт автор, значение секрета в теге маскируется
 /// так же, как в `context_prefix` (§7.6; ревью задачи 11 M3).
 pub(crate) fn mask_tags(tags: Vec<String>) -> Vec<String> {
@@ -344,11 +441,13 @@ pub(crate) fn rebuild_chunks(
 ) -> Result<usize, StoreError> {
     c.prepare_cached("DELETE FROM chunks WHERE node_id = ?1")?
         .execute([node_id])?;
-    let (space, path, name): (String, String, String) = c.query_row(
-        "SELECT s.name, n.path, n.name FROM nodes n JOIN spaces s ON s.id = n.space_id
+    // L0 — записанный в узле (агентский, ручной или авто): строка узла обновляется до нарезки,
+    // а перенарезка не знает агентского L0 из запроса записи
+    let (space, path, name, l0): (String, String, String, Option<String>) = c.query_row(
+        "SELECT s.name, n.path, n.name, n.l0 FROM nodes n JOIN spaces s ON s.id = n.space_id
          WHERE n.id = ?1",
         [node_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     let tags = meta
         .doc
@@ -364,7 +463,7 @@ pub(crate) fn rebuild_chunks(
     )?;
     for (ordinal, ch) in chunks.iter().enumerate() {
         let ordinal = ordinal as i64;
-        let prefix = context_prefix(&space, &path, &name, &ch.heading_path, tags);
+        let prefix = note_prefix(&space, &path, &name, &ch.heading_path, tags, l0.as_deref());
         st.execute(params![
             chunk_id(node_id, ordinal, &ch.text_hash),
             node_id,
@@ -784,6 +883,17 @@ b text.
         assert_eq!(a.len(), 32);
         assert_ne!(a, chunk_id(n, 1, "h"));
         assert_ne!(a, chunk_id(Id::new(), 0, "h"));
+    }
+
+    #[test]
+    fn truncate_tokens_by_words() {
+        let tc = ApproxCounter;
+        assert_eq!(truncate_tokens("коротко", 50, &tc), "коротко");
+        let long = "слово ".repeat(100);
+        let t = truncate_tokens(long.trim(), 50, &tc);
+        assert!(tc.count(&t) <= 50 && t.ends_with("слово"), "{t:?}");
+        assert!(tc.count(&format!("{t} слово")) > 50);
+        assert_eq!(truncate_tokens("оченьдлинноеслово", 1, &tc), "");
     }
 
     #[test]

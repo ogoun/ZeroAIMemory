@@ -107,11 +107,14 @@ pub fn leaf_cores(data: &Path) -> Result<HashMap<String, LeafText>> {
 
 /// Разрезанные доказательства: `evidence` запроса `chunk` не помещается целиком в собственный
 /// текст ни одного листа ожидаемой заметки (потолок chunk-recall@5 — `1 − split / queries`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SplitStats {
     pub queries: usize,
     /// Нет листа, собственный текст которого содержит `evidence`.
     pub split: usize,
+    /// Id разрезанных запросов (какие доказательства режет конфигурация).
+    #[serde(default)]
+    pub split_ids: Vec<String>,
     /// Из разрезанных — целиком в листе вместе с перекрытием.
     pub split_whole_with_overlap: usize,
     /// Листов длинных заметок (`<язык>/long/`).
@@ -135,12 +138,55 @@ pub fn split_stats(leaves: &HashMap<String, LeafText>, queries: &[Query]) -> Spl
         let of_note = || leaves.values().filter(|l| &l.path == note);
         if !of_note().any(|l| leaf_contains(&l.core, ev)) {
             s.split += 1;
+            s.split_ids.push(q.id.clone());
             if of_note().any(|l| leaf_contains(&l.text, ev)) {
                 s.split_whole_with_overlap += 1;
             }
         }
     }
     s
+}
+
+/// Объём индексации прогона: чанки индексируемых заметок и записей (все уровни) и их токены —
+/// текст по счётчику чанкера (`chunks.token_count`), префикс — оценкой `символы / 3,5`
+/// (точного счётчика в xtask нет). Критерий ±5 % задачи 17 M3.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct IndexVolume {
+    pub chunks: usize,
+    pub text_tokens: usize,
+    pub prefix_tokens: usize,
+}
+
+impl IndexVolume {
+    /// Токенов индексации всего (текст + префикс).
+    pub fn tokens(&self) -> usize {
+        self.text_tokens + self.prefix_tokens
+    }
+}
+
+/// [`IndexVolume`] базы прогона.
+pub fn index_volume(data: &Path) -> Result<IndexVolume> {
+    let c = rusqlite::Connection::open_with_flags(
+        super::gate::user_db(data)?,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let (chunks, text, prefix_chars): (i64, i64, i64) = c.query_row(
+        "SELECT count(*), coalesce(sum(c.token_count), 0),
+                coalesce(sum(length(c.context_prefix)), 0)
+         FROM chunks c
+         LEFT JOIN nodes n ON n.id = c.node_id
+         LEFT JOIN entries e ON e.id = c.entry_id
+         WHERE (n.id IS NOT NULL AND n.deleted_at IS NULL AND n.index_state <> 'excluded'
+                AND c.rev = n.current_rev)
+            OR (e.id IS NOT NULL AND e.deleted_at IS NULL AND e.index_state <> 'excluded')",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    Ok(IndexVolume {
+        chunks: chunks as usize,
+        text_tokens: text as usize,
+        prefix_tokens: (prefix_chars as usize * 2).div_ceil(7),
+    })
 }
 
 /// Листы выдачи `mode = chunks` (первые 10 элементов уровня `chunk`) и их собственные

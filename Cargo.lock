@@ -6230,6 +6230,7 @@ dependencies = [
  "proptest",
  "pulldown-cmark",
  "regex",
+ "rust-stemmers",
  "serde",
  "serde_json",
  "syntect",

@@ -127,12 +127,14 @@ also = ["insight:p09-t"]              # дополнительно релева�
 - у `theorem` полное `evidence`;
 - `forbid` — замещённые или отозванные, `weaker` — действующие `hypothesis`, `expect` запроса
   `certainty` — действующие `theorem`/`axiom`;
-- ≥ 30 запросов `superseded`, ≥ 12 `certainty`, 40–60 `chunk`;
+- ≥ 30 запросов `superseded`, ≥ 12 `certainty`, 40–70 `chunk` (из них `k-71…k-80` — сторожа
+  «вводная фраза + код»: `evidence` — фраза на «:» и начало следующего блока, задача 17 M3);
 - 20–30 длинных заметок по 2000–5000 слов с заголовком H4, на обоих языках;
 - `evidence` запроса `chunk` — 40–600 символов, дословно в ожидаемой длинной заметке, от 10 %
   до 90 % её текста, без строки заголовка H1–H3 (строки H4–H6 — текст листа и допустимы);
 - ≥ 10 заметок с `index: false`, к каждой есть запрос `exact`;
-- ≥ 8 бесструктурных абзацев длинных заметок длиннее 3800 символов (> `chunk_hard_max`);
+- ≥ 8 бесструктурных абзацев длинных заметок длиннее 4200 символов (≈ 950+ токенов bge-m3,
+  > `chunk_hard_max`);
 - ключи `also` существуют и не совпадают с `expect`, `forbid`, `weaker`;
 - пары `certainty` сбалансированы по лексической близости (≥ 40 % в каждую сторону).
 
@@ -155,6 +157,7 @@ cargo xtask eval --device cuda --label m3-base \
   --compare eval/results/2026-10-20-bge-m3-fp16-hybrid-tuned.json        # сравнение с M2
 cargo xtask eval --grid eval/grid-overlap.toml                          # чувствительность к нарезке
 cargo xtask eval --grid eval/grid-chunk-size.toml                       # границы листов: размер
+cargo xtask eval --grid eval/grid-chunking.toml                         # сила границ (задача 17 M3)
 cargo xtask eval --device cuda --corpus <каталог> --insights <файл> --queries <файл> \
   --label <метка> --out <каталог>                                         # контрольный прогон
 ```

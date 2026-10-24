@@ -422,6 +422,11 @@ const RECHUNK_V4: &str = "rechunk_v4";
 /// всех живых заметок точным счётчиком.
 pub(crate) const CHUNKED_APPROX: &str = "chunked_approx";
 
+/// Ключ `meta`: отпечаток нарезки, которой нарезаны живые заметки и записи базы
+/// (`crate::nodes::chunker_fingerprint`: версия алгоритма, пороги и флаги `[index]`, L0 в
+/// префиксе). Ставится у пустой базы при открытии и после перенарезки всей базы.
+const CHUNKER_KEY: &str = "chunker";
+
 /// Почему база перечанковывается при открытии.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rechunk {
@@ -429,6 +434,10 @@ enum Rechunk {
     AfterV4,
     /// Чанки по оценке, а счётчик теперь точный (модель установлена после записи заметок).
     ExactCounter,
+    /// Другой алгоритм или настройки нарезки (задача 17 M3: без висячих заголовков и вводных
+    /// фраз, H4–H6 в пути — меняются `embed_key` затронутых листов; или изменены `[index]
+    /// chunk_*`). База без отпечатка нарезана до задачи 17.
+    Chunker,
 }
 
 impl Rechunk {
@@ -436,6 +445,7 @@ impl Rechunk {
         match self {
             Rechunk::AfterV4 => "after_v4",
             Rechunk::ExactCounter => "exact_counter",
+            Rechunk::Chunker => "chunker",
         }
     }
 }
@@ -448,14 +458,25 @@ fn has_meta(c: &Connection, key: &str) -> rusqlite::Result<bool> {
     )
 }
 
-/// Нужна ли перечанковка при открытии: флаг R1 или чанки по оценке при точном счётчике.
+/// Нужна ли перечанковка при открытии: флаг R1, чанки по оценке при точном счётчике или
+/// отпечаток нарезки базы не совпадает с текущим.
 async fn rechunk_pending(db: &Db) -> Result<Option<Rechunk>, StoreError> {
     let exact = crate::nodes::token_counter_exact();
+    let fingerprint = crate::nodes::chunker_fingerprint();
     db.read(move |c| {
+        let stored: Option<String> = c
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [CHUNKER_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
         Ok(if has_meta(c, RECHUNK_V4)? {
             Some(Rechunk::AfterV4)
         } else if exact && has_meta(c, CHUNKED_APPROX)? {
             Some(Rechunk::ExactCounter)
+        } else if stored.as_deref() != Some(fingerprint.as_str()) {
+            Some(Rechunk::Chunker)
         } else {
             None
         })
@@ -463,12 +484,30 @@ async fn rechunk_pending(db: &Db) -> Result<Option<Rechunk>, StoreError> {
     .await
 }
 
-/// База без живых заметок (новая или пустая) — флаги перечанковки снимаются сразу, без
-/// фоновой задачи. `true` — сняты.
+/// Отпечаток нарезки базы — текущий: вызывается после перечанковки всех живых заметок и
+/// записей (`reindex --full` без области).
+pub(crate) async fn mark_chunker_current(db: &Db) -> Result<(), StoreError> {
+    let fingerprint = crate::nodes::chunker_fingerprint();
+    db.write(move |tx| Ok(put_chunker(tx, &fingerprint)?)).await
+}
+
+/// Записывает текущий отпечаток нарезки базы.
+fn put_chunker(tx: &Connection, fingerprint: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![CHUNKER_KEY, fingerprint],
+    )?;
+    Ok(())
+}
+
+/// База без живых заметок и записей (новая или пустая) — флаги перечанковки снимаются сразу,
+/// отпечаток нарезки ставится текущий, без фоновой задачи. `true` — сняты.
 async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
-    db.write(|tx| {
+    let fingerprint = crate::nodes::chunker_fingerprint();
+    db.write(move |tx| {
         let any: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)",
+            "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM entries WHERE deleted_at IS NULL)",
             [],
             |r| r.get(0),
         )?;
@@ -477,6 +516,7 @@ async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
                 "DELETE FROM meta WHERE key IN (?1, ?2)",
                 [RECHUNK_V4, CHUNKED_APPROX],
             )?;
+            put_chunker(tx, &fingerprint)?;
         }
         Ok(!any)
     })
@@ -497,20 +537,26 @@ pub(crate) async fn clear_approx_if_exact(db: &Db) -> Result<(), StoreError> {
     .await
 }
 
-/// Перечанковка всех живых заметок текущим счётчиком с заданиями `upsert`.
+/// Перечанковка всех живых заметок и записей журналов текущими счётчиком и настройками
+/// нарезки с заданиями `upsert`.
 ///
 /// Ruling R1: чанки M1 построены по секциям (`section`) и без векторов, поэтому при первом
 /// открытии базы v4 все живые заметки перечанковываются. То же — при первом открытии с точным
 /// счётчиком базы, чанки которой нарезаны оценкой: иначе листы могут не уложиться в окно
-/// модели (усечение при инференсе) и разойтись с порогами §8.2. Флаги снимаются только после
-/// успеха: прерванная перечанковка повторится при следующем открытии (она идемпотентна).
-/// На большой базе — долго (и полный повторный инференс); в лог идут только счётчики.
+/// модели (усечение при инференсе) и разойтись с порогами §8.2. И при смене алгоритма или
+/// настроек нарезки (отпечаток `meta.chunker`, задача 17 M3). Кэш эмбеддингов ключуется по
+/// `embed_key`: повторный инференс — только у листов, текст или префикс которых изменился.
+/// Флаги снимаются, а отпечаток ставится только после успеха: прерванная перечанковка
+/// повторится при следующем открытии (она идемпотентна). В лог идут только счётчики.
 async fn rechunk_all(db: &Db, why: Rechunk) -> Result<(), StoreError> {
     tracing::info!(reason = why.as_str(), "перечанковка заметок базы");
     let started = std::time::Instant::now();
+    let fingerprint = crate::nodes::chunker_fingerprint();
     let (notes, upserts) = crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX).await?;
-    db.write(|tx| {
+    let entries = crate::entries::rechunk_entries(db, None, PRIORITY_REINDEX).await?;
+    db.write(move |tx| {
         tx.execute("DELETE FROM meta WHERE key = ?1", [RECHUNK_V4])?;
+        put_chunker(tx, &fingerprint)?;
         Ok(())
     })
     .await?;
@@ -519,6 +565,7 @@ async fn rechunk_all(db: &Db, why: Rechunk) -> Result<(), StoreError> {
         reason = why.as_str(),
         notes,
         upserts,
+        entries,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "перечанковка заметок базы завершена"
     );

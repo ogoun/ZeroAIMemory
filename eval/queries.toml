@@ -2414,3 +2414,83 @@ lang = "en"
 expect = ["en/long/api-versioning-guide"]
 kind = "chunk"
 evidence = "A quite different matter that partners raise just as often is rate limiting, which is not versioned at all and has caused at least as much friction as any breaking change. Rate limits are applied per partner account and per endpoint group, and when we lowered the limit on the order search endpoint after a single partner's polling loop degraded the service for everyone, several other partners who polled less aggressively but in large bursts at the start of each hour hit the new limit too."
+
+[[query]]
+id = "k-71"
+text = "which headers does a deprecated API response carry"
+lang = "en"
+expect = ["en/long/api-versioning-guide"]
+kind = "chunk"
+evidence = "The partner dashboard shows a list of deprecated features the partner has used in the last thirty days, with request counts and example request ids. Example of the headers on a deprecated response:\n\n```text\nDeprecation: @1735689600"
+
+[[query]]
+id = "k-72"
+text = "what resolver setting now limits concurrent queries per forwarder"
+lang = "en"
+expect = ["en/long/dns-outage-postmortem"]
+kind = "chunk"
+evidence = "The resolver supports a per-upstream limit on concurrent queries, which would have contained the damage, but it was not configured. Example of the setting we have now added for every forwarder:\n\n```text\nforward-zone:"
+
+[[query]]
+id = "k-73"
+text = "what configuration does a service pass to the feature flag client library"
+lang = "en"
+expect = ["en/long/feature-flag-platform"]
+kind = "chunk"
+evidence = "Example of the configuration a service passes to the library:\n\n```yaml\nflags:"
+
+[[query]]
+id = "k-74"
+text = "what markup is used for the server-rendered main product image"
+lang = "en"
+expect = ["en/long/frontend-performance-audit"]
+kind = "chunk"
+evidence = "The fix was to render the main image's markup on the server, with eager loading and a high fetch priority, and to keep the rest of the gallery client-rendered. Example of the markup for the main image:\n\n```html\n<img src=\"/img/p/123/main-800.webp\""
+
+[[query]]
+id = "k-75"
+text = "what does the serving configuration of a model version contain"
+lang = "en"
+expect = ["en/long/ml-model-serving-notes"]
+kind = "chunk"
+evidence = "Example of the serving configuration for a model version:\n\n```yaml\nmodel: search-rerank"
+
+[[query]]
+id = "k-76"
+text = "how is a typical service latency histogram metric defined"
+lang = "en"
+expect = ["en/long/observability-stack-design"]
+kind = "chunk"
+evidence = "Example of a typical service metric definition:\n\n```go\nvar requestDuration = prometheus.NewHistogramVec("
+
+[[query]]
+id = "k-77"
+text = "which command runs the on-call access preflight check"
+lang = "en"
+expect = ["en/long/oncall-handbook"]
+kind = "chunk"
+evidence = "Run it with:\n\n```sh\noncall-preflight --role platform-primary"
+
+[[query]]
+id = "k-78"
+text = "как выглядит запись словаря синонимов поиска в новом формате"
+lang = "ru"
+expect = ["ru/long/catalog-search-relevance-study"]
+kind = "chunk"
+evidence = "Пример записи в новом формате:\n\n```text\nкуртка => куртка, ветровка, бомбер"
+
+[[query]]
+id = "k-79"
+text = "как описан сценарий оформления заказа в генераторе нагрузки"
+lang = "ru"
+expect = ["ru/long/checkout-load-testing-report"]
+kind = "chunk"
+evidence = "Пример фрагмента описания сценария:\n\n```python\n@task(weight=1)"
+
+[[query]]
+id = "k-80"
+text = "что лежит в файле версий инструментов в корне репозитория каталога"
+lang = "ru"
+expect = ["ru/long/dev-environment-onboarding"]
+kind = "chunk"
+evidence = "Все версии инструментов закреплены в файле в корне репозитория, и менеджер версий подхватывает их автоматически при входе в каталог. Пример содержимого файла версий:\n\n```text\nnodejs 20.11.1"

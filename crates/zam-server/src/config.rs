@@ -319,7 +319,22 @@ pub struct IndexSection {
     pub chunk_merge_below: usize,
     /// Предложений перекрытия соседних листов секции.
     pub chunk_overlap_sentences: usize,
+    /// Вес силы границы λ при выборе разреза листа (задача 17 M3): 0 — жадная упаковка M2
+    /// (с исправлениями висячего заголовка и вводной фразы), больше 0 — динамическое
+    /// программирование по силе границ. По умолчанию 1 — по сетке `eval/grid-chunking.toml`
+    /// (задача 17 M3: λ от 0,5 до 2 дают одинаковые разрезы).
+    pub chunk_boundary_lambda: f64,
+    /// Лексическая связность прозы (основы слов) в силе границы при λ > 0.
+    pub chunk_cohesion: bool,
+    /// Эксперимент: L0 заметки (до 50 токенов) в контекстном префиксе листов.
+    pub chunk_prefix_l0: bool,
+    /// H4–H6 в пути заголовков листа и тем самым в контекстном префиксе (`false` — путь M2
+    /// по H1–H3; переключатель сетки eval).
+    pub chunk_heading_path_h4: bool,
 }
+
+/// Предел `chunk_boundary_lambda`.
+pub const CHUNK_LAMBDA_MAX: f64 = 10.0;
 
 /// Санитарный предел `chunk_hard_max` в конфигурации. Действующий предел задаёт модель:
 /// лист с префиксом контекста и спецтокенами должен уместиться в её окно при индексации
@@ -367,18 +382,32 @@ impl IndexSection {
                 format!("от 0 до {CHUNK_OVERLAP_LIMIT}"),
             ));
         }
+        if !(self.chunk_boundary_lambda.is_finite()
+            && (0.0..=CHUNK_LAMBDA_MAX).contains(&self.chunk_boundary_lambda))
+        {
+            return Err(bad(
+                "chunk_boundary_lambda",
+                format!("от 0 до {CHUNK_LAMBDA_MAX}"),
+            ));
+        }
         Ok(())
     }
 
     /// Пороги чанкера для модели с окном `window` токенов (`max_tokens_passage`; `None` —
     /// модель неизвестна, [`DEFAULT_PASSAGE_WINDOW`]): `chunk_hard_max` не больше окна минус
-    /// [`CHUNK_PREFIX_BUDGET`], остальные пороги — не больше него. Второе значение — `true`,
-    /// если пороги конфигурации пришлось уменьшить.
+    /// [`CHUNK_PREFIX_BUDGET`] (и минус L0 в префиксе при `chunk_prefix_l0`), остальные
+    /// пороги — не больше него. Второе значение — `true`, если пороги конфигурации пришлось
+    /// уменьшить.
     pub fn chunk_params_for(&self, window: Option<usize>) -> (zam_markdown::ChunkParams, bool) {
         let want = self.chunk_params();
+        let l0 = if self.chunk_prefix_l0 {
+            zam_store::PREFIX_L0_MAX_TOKENS
+        } else {
+            0
+        };
         let limit = window
             .unwrap_or(DEFAULT_PASSAGE_WINDOW)
-            .saturating_sub(CHUNK_PREFIX_BUDGET)
+            .saturating_sub(CHUNK_PREFIX_BUDGET + l0)
             .max(1);
         let mut p = want;
         p.hard_max = p.hard_max.min(limit);
@@ -396,6 +425,9 @@ impl IndexSection {
             hard_max: self.chunk_hard_max,
             merge_below: self.chunk_merge_below,
             overlap_sentences: self.chunk_overlap_sentences,
+            boundary_lambda: self.chunk_boundary_lambda,
+            cohesion: self.chunk_cohesion,
+            heading_path_h4: self.chunk_heading_path_h4,
         }
     }
 }
@@ -577,6 +609,10 @@ impl Default for ServerConfig {
                 chunk_hard_max: 800,
                 chunk_merge_below: 100,
                 chunk_overlap_sentences: 1,
+                chunk_boundary_lambda: 1.0,
+                chunk_cohesion: false,
+                chunk_prefix_l0: false,
+                chunk_heading_path_h4: true,
             },
             search: SearchSection {
                 rrf_k: 60.0,
@@ -1191,8 +1227,15 @@ yield_ms = 1
         let e = vec![env("ZAM_ML__DEVICE", "directml")];
         assert!(load(None, &e, &Default::default()).is_err());
         // пороги чанкинга: умолчания сервера и чанкера совпадают (одно значение, подобранное
-        // на eval, §18.2), переопределение и проверка согласованности
-        assert_eq!(d.index.chunk_params(), zam_markdown::ChunkParams::default());
+        // на eval, §18.2), кроме λ: у чанкера 0 — жадная упаковка M2 (golden-фикстуры), у
+        // сервера — по сетке задачи 17 M3; переопределение и проверка согласованности
+        assert_eq!(
+            d.index.chunk_params(),
+            zam_markdown::ChunkParams {
+                boundary_lambda: 1.0,
+                ..zam_markdown::ChunkParams::default()
+            }
+        );
         let e = vec![
             env("ZAM_INDEX__CHUNK_TARGET_MAX", "700"),
             env("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "2"),
@@ -1213,6 +1256,9 @@ yield_ms = 1
             ("ZAM_INDEX__CHUNK_MERGE_BELOW", "501"),
             ("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "6"),
             ("ZAM_INDEX__BATCH_TOKENS", "0"),
+            ("ZAM_INDEX__CHUNK_BOUNDARY_LAMBDA", "-1"),
+            ("ZAM_INDEX__CHUNK_BOUNDARY_LAMBDA", "11"),
+            ("ZAM_INDEX__CHUNK_BOUNDARY_LAMBDA", "nan"),
         ] {
             let field = k.trim_start_matches("ZAM_INDEX__").to_ascii_lowercase();
             let err = load(None, &[env(k, v)], &Default::default())
@@ -1243,6 +1289,36 @@ yield_ms = 1
             (192, 192, 192, 100)
         );
         assert_eq!(d.index.chunk_params_for(Some(10)).0.hard_max, 1);
+        // сила границ (задача 17 M3): умолчание λ = 1, флаги — в пороги чанкера; L0 в префиксе
+        // уменьшает предел листа на свой бюджет
+        let p = d.index.chunk_params();
+        assert_eq!(
+            (p.boundary_lambda, p.cohesion, p.heading_path_h4),
+            (1.0, false, true)
+        );
+        assert!(!d.index.chunk_prefix_l0);
+        let c = load(
+            None,
+            &[
+                env("ZAM_INDEX__CHUNK_BOUNDARY_LAMBDA", "2"),
+                env("ZAM_INDEX__CHUNK_COHESION", "true"),
+                env("ZAM_INDEX__CHUNK_HEADING_PATH_H4", "false"),
+                env("ZAM_INDEX__CHUNK_PREFIX_L0", "true"),
+                env("ZAM_INDEX__CHUNK_HARD_MAX", "2000"),
+            ],
+            &Default::default(),
+        )
+        .unwrap();
+        let (p, _) = c.index.chunk_params_for(Some(1024));
+        assert_eq!(
+            (p.boundary_lambda, p.cohesion, p.heading_path_h4, p.hard_max),
+            (
+                2.0,
+                true,
+                false,
+                1024 - CHUNK_PREFIX_BUDGET - zam_store::PREFIX_L0_MAX_TOKENS
+            )
+        );
         // реранкер
         assert_eq!(
             (

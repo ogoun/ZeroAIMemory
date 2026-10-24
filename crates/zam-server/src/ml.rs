@@ -115,6 +115,7 @@ pub fn setup_chunker(cfg: &ServerConfig, embedder: Option<&Embedder>) -> bool {
         );
     }
     zam_store::set_chunk_params(params);
+    zam_store::set_prefix_l0(cfg.index.chunk_prefix_l0);
     match model {
         Some(m) => {
             zam_store::set_token_counter(Arc::new(m.counter));
