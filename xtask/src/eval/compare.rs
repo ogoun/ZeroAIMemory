@@ -1,9 +1,9 @@
 //! `--compare`: парная разность с прежним прогоном eval по общим запросам (задача 16 M3).
 //!
-//! **Общий запрос** — тот же `id`, вид, `expect` и текст. Текст берётся из прежнего JSON
-//! (поле `text` у запроса, с M3) или, у прогонов до M3, из `eval/queries.toml` коммита прежнего
-//! прогона (`git show <коммит>:eval/queries.toml`); не нашёлся — сравнение по `id`, виду и
-//! `expect`, и это видно в отчёте (`text_checked = false`).
+//! **Общий запрос** — тот же `id`, вид, `expect` и текст. Тексты прежнего прогона — из его JSON
+//! (поле `text`, с M3), из `eval/queries.toml` его коммита или текущие — тот источник, на
+//! котором воспроизводится отпечаток запросов прежнего прогона ([`old_texts`]); не нашёлся —
+//! сравнение по `id`, виду и `expect`, и это видно в отчёте (`text_checked = false`).
 //!
 //! **Метрики нового прогона пересчитываются по `expect`**: `also` (дополнительно релевантные
 //! цели M3) в сравнении не участвует — разметка прежнего прогона их не знала.
@@ -65,31 +65,63 @@ fn commit_of(info_git: &str) -> &str {
     info_git.split('+').next().unwrap_or("")
 }
 
-/// Тексты запросов прежнего прогона: из JSON или из `queries.toml` его коммита.
-fn old_texts(repo: &Path, v: &Value) -> Option<HashMap<String, String>> {
+/// Тексты запросов прежнего прогона: первый источник, на котором сходится его отпечаток
+/// запросов (`info.queries_fingerprint`), — JSON прогона (поле `text`, с M3), `queries.toml`
+/// коммита прогона, текущие запросы. Коммит «грязного» прогона мог содержать другие тексты,
+/// поэтому источник без совпадения отпечатка не используется; ни один не сошёлся — `None`.
+fn old_texts(repo: &Path, v: &Value, current: &[QueryRun]) -> Option<HashMap<String, String>> {
+    let want = v["info"]["queries_fingerprint"].as_str()?;
     let from_json: HashMap<String, String> = v["queries"]
         .as_array()?
         .iter()
         .filter_map(|q| Some((q["id"].as_str()?.into(), q["text"].as_str()?.into())))
         .collect();
-    if !from_json.is_empty() {
-        return Some(from_json);
-    }
-    let commit = commit_of(v["info"]["git"].as_str()?);
-    let toml_text = git(repo, &["show", &format!("{commit}:eval/queries.toml")])?;
-    let t: toml::Value = toml::from_str(&toml_text).ok()?;
-    Some(
-        t.get("query")?
+    let from_git = || -> Option<HashMap<String, String>> {
+        let commit = commit_of(v["info"]["git"].as_str()?);
+        let toml_text = git(repo, &["show", &format!("{commit}:eval/queries.toml")])?;
+        let t: toml::Value = toml::from_str(&toml_text).ok()?;
+        Some(
+            t.get("query")?
+                .as_array()?
+                .iter()
+                .filter_map(|q| {
+                    Some((
+                        q.get("id")?.as_str()?.into(),
+                        q.get("text")?.as_str()?.into(),
+                    ))
+                })
+                .collect(),
+        )
+    };
+    let from_current: HashMap<String, String> = current
+        .iter()
+        .map(|q| (q.id.clone(), q.text.clone()))
+        .collect();
+    [Some(from_json), from_git(), Some(from_current)]
+        .into_iter()
+        .flatten()
+        .find(|m| !m.is_empty() && old_fingerprint(v, m).as_deref() == Some(want))
+}
+
+/// Отпечаток запросов прежнего прогона (как [`super::run::queries_fingerprint`] у запросов без
+/// полей M3) при текстах `texts`; текста какого-то запроса нет — `None`.
+fn old_fingerprint(v: &Value, texts: &HashMap<String, String>) -> Option<String> {
+    let mut s = String::new();
+    for q in v["queries"].as_array()? {
+        let id = q["id"].as_str()?;
+        let expect: Vec<&str> = q["expect"]
             .as_array()?
             .iter()
-            .filter_map(|q| {
-                Some((
-                    q.get("id")?.as_str()?.into(),
-                    q.get("text")?.as_str()?.into(),
-                ))
-            })
-            .collect(),
-    )
+            .filter_map(Value::as_str)
+            .collect();
+        s.push_str(&format!(
+            "{id}\0{}\0{}\0{}\0",
+            texts.get(id)?,
+            expect.join(","),
+            q["kind"].as_str()?
+        ));
+    }
+    Some(super::corpus::fnv1a(s.into_bytes()))
 }
 
 /// Пути заметок прежнего корпуса (`git ls-tree` коммита прежнего прогона).
@@ -119,7 +151,7 @@ pub fn compare(repo: &Path, prev: &Path, r: &RunResult) -> Result<Comparison> {
         .iter()
         .filter_map(|q| q["id"].as_str().map(|id| (id, q)))
         .collect();
-    let texts = old_texts(repo, &v);
+    let texts = old_texts(repo, &v, &r.queries);
     let corpus = old_corpus(repo, &v);
     let mut pairs: Vec<(&QueryRun, &Value)> = Vec::new();
     for q in &r.queries {
@@ -187,6 +219,23 @@ pub fn compare(repo: &Path, prev: &Path, r: &RunResult) -> Result<Comparison> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Отпечаток по текстам воспроизводит отпечаток запросов прогона: по нему выбирается
+    /// источник текстов прежнего прогона.
+    #[test]
+    fn old_fingerprint_matches_queries_fingerprint() {
+        let q = crate::eval::corpus::tests_query("a-01", "en/long/x");
+        let fp = crate::eval::run::queries_fingerprint(std::slice::from_ref(&q));
+        let v = serde_json::json!({
+            "info": {"queries_fingerprint": fp},
+            "queries": [{"id": "a-01", "expect": ["en/long/x"], "kind": "chunk"}],
+        });
+        let good: HashMap<String, String> = [("a-01".into(), q.text.clone())].into();
+        let bad: HashMap<String, String> = [("a-01".into(), "other".into())].into();
+        assert_eq!(old_fingerprint(&v, &good), Some(fp.clone()));
+        assert_ne!(old_fingerprint(&v, &bad), Some(fp));
+        assert_eq!(old_fingerprint(&v, &HashMap::new()), None);
+    }
 
     #[test]
     fn commit_of_strips_dirty_suffix() {
