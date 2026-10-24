@@ -268,12 +268,30 @@ fn level_draft(
 }
 
 /// Абзац кончается на «:» — вводная фраза к следующему блоку. Завершающая разметка
-/// выделения (`**Пример:**`, `__…:__`, `*…:*`, `_…:_`, `` `…:` ``) снимается перед проверкой.
+/// выделения (`**Пример:**`, `__…:__`, `*…:*`, `_…:_`, HTML `<b>`, `<strong>`, `<i>`, `<em>`)
+/// снимается перед проверкой. Inline-код на «:» (`` `std::` ``, `` `http:` ``) — не вводная
+/// фраза: обратная кавычка не снимается.
 fn ends_with_colon(text: &str) -> bool {
-    text.trim_end()
-        .trim_end_matches(['*', '_', '`'])
-        .trim_end()
-        .ends_with(':')
+    const CLOSE: [&str; 4] = ["</b>", "</strong>", "</i>", "</em>"];
+    let mut t = text.trim_end();
+    loop {
+        let before = t.len();
+        t = t.trim_end_matches(['*', '_']).trim_end();
+        for tag in CLOSE {
+            if let Some(head) = t
+                .len()
+                .checked_sub(tag.len())
+                .filter(|&i| t.is_char_boundary(i) && t[i..].eq_ignore_ascii_case(tag))
+                .map(|i| &t[..i])
+            {
+                t = head.trim_end();
+            }
+        }
+        if t.len() == before {
+            break;
+        }
+    }
+    t.ends_with(':')
 }
 
 /// Путь заголовков листа: путь группы и заголовки H4–H6, действующие в начале собственного
@@ -1063,13 +1081,28 @@ mod tests {
             "__Пример:__",
             "*Пример:*",
             "_Пример:_",
-            "`config:`",
             "**Пример**:",
             "Текст и **Пример:** ",
+            "<b>Пример:</b>",
+            "<strong>Пример:</strong>",
+            "<em>Пример:</em> ",
+            "**<b>Пример:</b>**",
         ] {
             assert!(ends_with_colon(t), "{t:?}");
         }
-        for t in ["Пример.", "**Пример**", "a: b", "*", "", "snake_case_"] {
+        // inline-код на «:» — не вводная фраза (`std::`, `http:`)
+        for t in [
+            "Пример.",
+            "**Пример**",
+            "a: b",
+            "*",
+            "",
+            "snake_case_",
+            "символы из `std::`",
+            "префикс `http:`",
+            "`config:`",
+            "<b>Пример</b>",
+        ] {
             assert!(!ends_with_colon(t), "{t:?}");
         }
     }
