@@ -138,6 +138,7 @@ pub mod merge;
 pub mod targets;
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -642,84 +643,153 @@ fn group_by_node(items: Vec<Item>, top_k: usize) -> Vec<Item> {
     order
 }
 
-/// Секция листа для `expand=section`: начало секции H1–H3 (или преамбулы) в байтах
-/// исходника — ключ слияния — и её собственный текст (заголовок и текст до первой
-/// подсекции).
-///
-/// С задачи 17 путь листа включает H4–H6 (`A > B > Глубокий`), а секции `Doc` — только
-/// H1–H3, поэтому кандидаты — секции, чей путь является префиксом `heading_path` по
-/// компонентам (` > `); преамбула — префикс любого пути. Секция определяется по месту
-/// листа: среди кандидатов, содержащих самую длинную (наиболее специфичную) строку листа,
-/// — с наибольшей долей строк листа, при равенстве — самая глубокая. Собственные тексты
-/// секций не пересекаются, поэтому так находится секция, где лист действительно лежит, —
-/// и при повторяющихся путях, и при « > » в тексте заголовка. Короткие однотипные строки
-/// (```` ``` ````, `---`, `</details>`) секцию не решают. Лист не найден в тексте (например,
-/// исходник другой ревизии) — запасной вариант: самый длинный префикс пути, первый из
-/// равных. `None` — подходящей секции нет.
-fn leaf_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<(usize, &'a str)> {
-    let doc = zam_markdown::parse(src);
-    let own = |i: usize| {
-        let s = &doc.sections[i];
-        let end = doc
-            .sections
-            .get(i + 1)
-            .map_or(s.range.end, |n| n.range.start.min(s.range.end))
-            .max(s.body.start.min(s.range.end));
-        src.get(s.range.start..end).map(str::trim_end)
-    };
-    // (индекс, глубина) кандидатов
-    let found: Vec<(usize, usize)> = (0..doc.sections.len())
-        .filter_map(|i| {
-            let s = &doc.sections[i];
-            if s.level == 0 {
-                return Some((i, 0));
-            }
-            let p = s.path.join(" > ");
-            let prefix = heading_path == p
-                || heading_path
-                    .strip_prefix(p.as_str())
-                    .is_some_and(|rest| rest.starts_with(" > "));
-            prefix.then_some((i, s.path.len()))
-        })
-        .collect();
-    let lines: Vec<&str> = leaf
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    // первая из самых длинных строк
-    let longest = lines.iter().copied().fold(None::<&str>, |b, l| match b {
-        Some(b) if b.chars().count() >= l.chars().count() => Some(b),
-        _ => Some(l),
-    });
-    let by_leaf = longest.and_then(|key| {
-        let mut best: Option<(usize, usize, usize)> = None;
-        for &(i, depth) in &found {
-            let Some(t) = own(i) else { continue };
-            if !t.contains(key) {
-                continue;
-            }
-            let n = lines.iter().filter(|l| t.contains(*l)).count();
-            if best.is_none_or(|(_, m, d)| (n, depth) > (m, d)) {
-                best = Some((i, n, depth));
-            }
-        }
-        best.map(|(i, _, _)| i)
-    });
-    // запасной вариант: самый длинный префикс пути (преамбула — только для пустого пути)
-    let by_path = || {
-        let depth = if heading_path.is_empty() { 0 } else { 1 };
-        found
-            .iter()
-            .filter(|&&(_, d)| d >= depth)
-            .fold(None::<(usize, usize)>, |b, &(i, d)| match b {
-                Some((_, bd)) if bd >= d => b,
-                _ => Some((i, d)),
+/// Секции одной ревизии заметки для `expand=section`: собственные диапазоны секций H1–H3 и
+/// преамбулы (заголовок и текст до первой подсекции) с путями. Строится одним разбором
+/// исходника ([`SectionTable::build`]) на `(узел, ревизия)` за запрос — см. [`SectionCache`].
+struct SectionTable {
+    src: String,
+    secs: Vec<SecRow>,
+}
+
+/// Секция в [`SectionTable`].
+struct SecRow {
+    /// Начало секции в исходнике — ключ слияния.
+    start: usize,
+    /// Собственный текст секции (без хвостовых пробелов).
+    own: Range<usize>,
+    /// Путь через ` > `; у преамбулы — пустой.
+    path: String,
+    /// Число заголовков в пути; 0 — преамбула.
+    depth: usize,
+}
+
+impl SectionTable {
+    /// Разбор исходника (CPU, до `note_max_bytes`): вызывать вне async-потока.
+    fn build(src: String) -> Self {
+        let doc = zam_markdown::parse(&src);
+        let secs = (0..doc.sections.len())
+            .filter_map(|i| {
+                let s = &doc.sections[i];
+                let end = doc
+                    .sections
+                    .get(i + 1)
+                    .map_or(s.range.end, |n| n.range.start.min(s.range.end))
+                    .max(s.body.start.min(s.range.end));
+                let t = src.get(s.range.start..end)?;
+                let preamble = s.level == 0;
+                Some(SecRow {
+                    start: s.range.start,
+                    own: s.range.start..s.range.start + t.trim_end().len(),
+                    path: if preamble {
+                        String::new()
+                    } else {
+                        s.path.join(" > ")
+                    },
+                    depth: if preamble { 0 } else { s.path.len() },
+                })
             })
-            .map(|(i, _)| i)
-    };
-    let i = by_leaf.or_else(by_path)?;
-    Some((doc.sections[i].range.start, own(i)?))
+            .collect();
+        Self { src, secs }
+    }
+
+    fn own(&self, r: &SecRow) -> &str {
+        &self.src[r.own.clone()]
+    }
+
+    /// Секция листа: начало секции H1–H3 (или преамбулы) — ключ слияния — и её собственный
+    /// диапазон.
+    ///
+    /// С задачи 17 путь листа включает H4–H6 (`A > B > Глубокий`), а секции `Doc` — только
+    /// H1–H3, поэтому кандидаты — секции, чей путь является префиксом `heading_path` по
+    /// компонентам (` > `); преамбула — префикс любого пути. Секция определяется по месту
+    /// листа: кандидат, содержащий самую длинную (наиболее специфичную) строку листа; если
+    /// таких несколько — с наибольшей долей строк листа, при равенстве — самый глубокий, затем
+    /// первый. Собственные тексты секций не пересекаются, поэтому так находится секция, где
+    /// лист действительно лежит, — и при повторяющихся путях, и при « > » в тексте заголовка.
+    /// Короткие однотипные строки (```` ``` ````, `---`, `</details>`) секцию не решают.
+    /// Дословно повторяющийся текст в одноимённой более глубокой секции (лист под
+    /// `# A > #### X` и такой же текст в `## X` под `# A`) отдаёт более глубокую — известное
+    /// ограничение. Лист не найден в тексте (исходник другой ревизии; строка листа с маской
+    /// секрета — листы режутся по замаскированному исходнику, а здесь исходник ревизии) —
+    /// запасной вариант: самый длинный префикс пути, первый из равных. `None` — подходящей
+    /// секции нет.
+    ///
+    /// Стоимость: один проход по собственным текстам кандидатов (вместе — не больше
+    /// исходника); доля строк — только при нескольких кандидатах со строкой. Вызывать вне
+    /// async-потока: на заметке в 5 МБ проход — миллисекунды.
+    fn locate(&self, heading_path: &str, leaf: &str) -> Option<(usize, Range<usize>)> {
+        let cands: Vec<&SecRow> = self
+            .secs
+            .iter()
+            .filter(|r| {
+                r.depth == 0
+                    || heading_path == r.path
+                    || heading_path
+                        .strip_prefix(r.path.as_str())
+                        .is_some_and(|rest| rest.starts_with(" > "))
+            })
+            .collect();
+        let lines: Vec<&str> = leaf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        // первая из самых длинных строк
+        let longest = lines.iter().copied().fold(None::<&str>, |b, l| match b {
+            Some(b) if b.chars().count() >= l.chars().count() => Some(b),
+            _ => Some(l),
+        });
+        let by_leaf = longest.and_then(|key| {
+            let holders: Vec<&SecRow> = cands
+                .iter()
+                .copied()
+                .filter(|r| self.own(r).contains(key))
+                .collect();
+            if holders.len() <= 1 {
+                return holders.first().copied();
+            }
+            let mut best: Option<(&SecRow, usize)> = None;
+            for r in holders {
+                let t = self.own(r);
+                let n = lines.iter().filter(|l| t.contains(*l)).count();
+                if best.is_none_or(|(b, m)| (n, r.depth) > (m, b.depth)) {
+                    best = Some((r, n));
+                }
+            }
+            best.map(|(r, _)| r)
+        });
+        // запасной вариант: самый длинный префикс пути (преамбула — только для пустого пути)
+        let by_path = || {
+            let depth = usize::from(!heading_path.is_empty());
+            cands
+                .iter()
+                .copied()
+                .filter(|r| r.depth >= depth)
+                .fold(None::<&SecRow>, |b, r| match b {
+                    Some(b) if b.depth >= r.depth => Some(b),
+                    _ => Some(r),
+                })
+        };
+        let r = by_leaf.or_else(by_path)?;
+        Some((r.start, r.own.clone()))
+    }
+}
+
+/// Таблицы секций за один запрос `expand=section`: исходник ревизии читается и разбирается
+/// один раз на `(узел, ревизия)`, сколько бы листов этой заметки ни было в окне.
+#[derive(Default)]
+struct SectionCache {
+    tables: HashMap<(Id, i64), Arc<SectionTable>>,
+    /// Сколько раз разобран исходник (для тестов).
+    builds: usize,
+}
+
+/// Секция листа по исходнику `src` (разбор на каждый вызов — для тестов).
+#[cfg(test)]
+fn leaf_section<'a>(src: &'a str, heading_path: &str, leaf: &str) -> Option<(usize, &'a str)> {
+    let t = SectionTable::build(src.to_string());
+    let (at, own) = t.locate(heading_path, leaf)?;
+    Some((at, &src[own]))
 }
 
 /// Ключ слияния секций в `expand=section`: секция H1–H3 листа (по её началу в исходнике),
@@ -734,16 +804,19 @@ enum SectionKey {
 /// больше `top_k` элементов. Повторная секция того же узла сливается в первый элемент
 /// (`chunk_ids`), а выдача добирается следующими кандидатами окна. Текст секции и соседи
 /// читаются из базы цели элемента.
+///
+/// Исходник ревизии читается и разбирается один раз на `(узел, ревизия)` (`cache`), разбор и
+/// поиск секции листа — в `spawn_blocking`.
 async fn expand_items(
     health: &mut Health<'_>,
     items: Vec<Item>,
     how: Expand,
     top_k: usize,
+    cache: &mut SectionCache,
 ) -> Result<Vec<Item>, ApiError> {
     let targets = health.targets;
     let mut out: Vec<Item> = Vec::with_capacity(top_k);
     let mut sections: HashMap<(TargetRef, SectionKey), usize> = HashMap::new();
-    let mut contents: HashMap<(Id, i64), Arc<String>> = HashMap::new();
     for mut it in items {
         if out.len() >= top_k {
             break;
@@ -763,25 +836,34 @@ async fn expand_items(
         let text = match how {
             Expand::Section => {
                 let ck = (it.hit.target.id, it.hit.rev);
-                let src = match contents.get(&ck) {
-                    Some(s) => s.clone(),
+                let table = match cache.tables.get(&ck) {
+                    Some(t) => t.clone(),
                     None => {
                         let r = node_content(db, it.hit.target.id, Some(it.hit.rev)).await;
                         let Some((_, s)) = health.soft(ti, r)? else {
                             drop_target(&mut out, &mut sections, ti);
                             continue;
                         };
-                        let s = Arc::new(s);
-                        contents.insert(ck, s.clone());
-                        s
+                        let t = tokio::task::spawn_blocking(move || SectionTable::build(s))
+                            .await
+                            .map_err(|e| {
+                                ApiError::Internal(format!("разбор заметки прерван: {e}"))
+                            })?;
+                        let t = Arc::new(t);
+                        cache.builds += 1;
+                        cache.tables.insert(ck, t.clone());
+                        t
                     }
                 };
-                let sec = leaf_section(&src, &it.hit.heading_path, &base);
+                let (t, hp, leaf) = (table.clone(), it.hit.heading_path.clone(), base.clone());
+                let sec = tokio::task::spawn_blocking(move || t.locate(&hp, &leaf))
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("поиск секции прерван: {e}")))?;
                 let key = (
                     it.hit.target,
-                    sec.map_or_else(
+                    sec.as_ref().map_or_else(
                         || SectionKey::Path(it.hit.heading_path.clone()),
-                        |(at, _)| SectionKey::At(at),
+                        |(at, _)| SectionKey::At(*at),
                     ),
                 );
                 if let Some(&i) = sections.get(&key) {
@@ -791,10 +873,8 @@ async fn expand_items(
                 }
                 sections.insert(key, out.len());
                 // склеенные чанкером короткие секции: лист может быть длиннее секции
-                match sec {
-                    Some((_, sec)) if sec.chars().count() >= base.chars().count() => {
-                        sec.to_string()
-                    }
+                match sec.map(|(_, own)| &table.src[own]) {
+                    Some(sec) if sec.chars().count() >= base.chars().count() => sec.to_string(),
                     _ => base,
                 }
             }
@@ -1560,7 +1640,10 @@ pub async fn search(
     let expand_t = Instant::now();
     let mut items = match mode {
         SearchMode::Notes => group_by_node(items, top_k),
-        SearchMode::Chunks => expand_items(&mut health, items, expand, top_k).await?,
+        SearchMode::Chunks => {
+            let mut cache = SectionCache::default();
+            expand_items(&mut health, items, expand, top_k, &mut cache).await?
+        }
         SearchMode::Brief => items.into_iter().take(top_k).collect(),
     };
     if expand == Expand::Graph {
@@ -1957,6 +2040,109 @@ mod tests {
         let k2 = leaf_section(dup, "A > X", "#### X\nвторой лист").unwrap();
         assert_ne!(k1.0, k2.0);
         assert_eq!(k2.1, "# A\n\n#### X\n\nвторой лист");
+    }
+
+    /// Заметка `content` в личной базе: цель поиска и id узла.
+    async fn note_target(name: &str, content: String) -> (SearchTarget, Id) {
+        let dir = crate::test_util::dir_in_target(name);
+        let db = zam_store::UserDbs::new(dir).get(Id::new()).await.unwrap();
+        let sp = zam_store::list_spaces(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind == SpaceKind::Knowledge)
+            .unwrap();
+        let n = zam_store::create_note(
+            &db,
+            zam_store::NewNote {
+                space_id: sp.id,
+                path: zam_store::NodePath::parse("длинная").unwrap(),
+                content,
+                l0: None,
+                attrib: zam_store::Attribution::new(zam_store::AuthorKind::Agent),
+            },
+        )
+        .await
+        .unwrap();
+        let t = SearchTarget {
+            owner: Id::new(),
+            db,
+            spaces: vec![sp],
+            role: super::super::scope::Role::Personal,
+            solution: None,
+        };
+        (t, n.id)
+    }
+
+    /// Хиты-листы `paras` одной секции `heading_path` узла `node` (ревизия 1).
+    fn section_hits(node: Id, heading_path: &str, paras: &[String]) -> Vec<Item> {
+        let hits = paras
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut h = hit(node, p);
+                h.chunk_id = format!("c{i}");
+                h.heading_path = heading_path.into();
+                h
+            })
+            .collect();
+        items(hits, false)
+    }
+
+    /// `expand=section`: 60 листов одной секции (путь с H4) — исходник разобран один раз,
+    /// листы слиты в один элемент с текстом секции H2 (ревью fix round 1 задачи 17).
+    #[tokio::test]
+    async fn expand_section_parses_note_once() {
+        let paras: Vec<String> = (0..60)
+            .map(|i| format!("Абзац номер {i} про перенос данных пакетами."))
+            .collect();
+        let content = format!(
+            "# Док\n\n## Детали\n\n#### Глубже\n\n{}\n\n## Другое\n\nтекст\n",
+            paras.join("\n\n")
+        );
+        let (t, node) = note_target("search-expand-once", content).await;
+        let targets = vec![t];
+        let mut h = Health::new(&targets, Vec::new());
+        let mut cache = SectionCache::default();
+        let its = section_hits(node, "Док > Детали > Глубже", &paras);
+        let out = expand_items(&mut h, its, Expand::Section, 100, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(cache.builds, 1, "исходник разобран один раз");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chunk_ids.len(), 60);
+        let text = &out[0].text.as_ref().unwrap().0;
+        assert!(text.starts_with("## Детали") && text.contains("Абзац номер 59 "));
+        assert!(!text.contains("## Другое"));
+    }
+
+    /// Замер `expand=section` (ревью fix round 1 задачи 17): заметка ~1 МБ без H1–H3,
+    /// 300 кандидатов окна из её конца. Запуск:
+    /// `cargo test -p zam-server --release --lib bench_expand_section_big_note -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "замер"]
+    async fn bench_expand_section_big_note() {
+        let paras: Vec<String> = (0..12_000)
+            .map(|i| format!("Абзац номер {i} про перенос данных пакетами, проверка {i}."))
+            .collect();
+        let content = paras.join("\n\n");
+        eprintln!("заметка: {} байт", content.len());
+        let (t, node) = note_target("search-expand-bench", content).await;
+        let targets = vec![t];
+        let mut h = Health::new(&targets, Vec::new());
+        let mut cache = SectionCache::default();
+        let its = section_hits(node, "", &paras[paras.len() - 300..]);
+        let t0 = Instant::now();
+        let out = expand_items(&mut h, its, Expand::Section, 100, &mut cache)
+            .await
+            .unwrap();
+        eprintln!(
+            "300 кандидатов: {:?}, разборов {}, элементов {}",
+            t0.elapsed(),
+            cache.builds,
+            out.len()
+        );
+        assert_eq!(cache.builds, 1);
     }
 
     /// Сбой чтения базы чужого решения исключает цель с предупреждением, сбой личной базы —
