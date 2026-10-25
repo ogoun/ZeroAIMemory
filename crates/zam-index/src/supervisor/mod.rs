@@ -12,7 +12,9 @@
 //! 3. Падение → `Restarting` с задержкой 1→60 с и jitter; 5 падений за 10 минут →
 //!    `Broken` (circuit breaker), сервер продолжает работу в деградированном режиме.
 //!    panic несовместимого хранилища → стирание `storage/` и один немедленный перезапуск.
-//! 4. [`Supervisor::shutdown`]: Linux — SIGTERM, 10 с, SIGKILL; Windows — `TerminateProcess`.
+//! 4. [`Supervisor::shutdown`]: после недавней записи — ожидание сброса WAL (не дольше
+//!    `shutdown_flush_wait`, задача 19 M3); затем Linux — SIGTERM, 10 с, SIGKILL; Windows —
+//!    `TerminateProcess`.
 //!
 //! Режим `external`: процесса нет, состояние всегда `External`, доступность проверяет
 //! `VectorIndex::health`.
@@ -36,12 +38,13 @@ use rand::Rng as _;
 use tokio::sync::watch;
 
 pub use config::{
+    DEFAULT_FLUSH_INTERVAL_SEC, DEFAULT_SHUTDOWN_FLUSH_WAIT, DEFAULT_WAL_CAPACITY_MB,
     ExternalConfig, ManagedConfig, QDRANT_VERSION, RestartPolicy, SupervisorConfig, default_binary,
-    qdrant_exe_name,
+    flush_wait, qdrant_exe_name,
 };
 pub use process::{is_qdrant_process, pid_alive, rss_bytes};
 
-use crate::{IndexError, QdrantIndex, VectorIndex};
+use crate::{CollectionTuning, IndexError, QdrantIndex, VectorIndex, WriteMark};
 
 /// Состояние Qdrant для `/index/status`, деградации поиска и воркера индексации.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +88,11 @@ pub struct Supervisor {
     shared: Option<Arc<Shared>>,
     stop: Option<watch::Sender<bool>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Последняя запись клиентов [`Self::connect_index`].
+    writes: WriteMark,
+    /// managed: параметры коллекции и ожидание сброса WAL при остановке (задача 19 M3).
+    tuning: Option<CollectionTuning>,
+    shutdown_flush_wait: Duration,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -113,6 +121,9 @@ impl Supervisor {
                     shared: None,
                     stop: None,
                     thread: None,
+                    writes: WriteMark::default(),
+                    tuning: None,
+                    shutdown_flush_wait: Duration::ZERO,
                 });
             }
             SupervisorConfig::Managed(m) => m,
@@ -157,6 +168,8 @@ impl Supervisor {
             restart_hold: crate::test_hooks::Hold::default(),
         });
         let (stop_tx, stop_rx) = watch::channel(false);
+        let tuning = Some(m.tuning());
+        let shutdown_flush_wait = m.shutdown_flush_wait;
         let ctx = Ctx {
             cfg: m,
             shared: shared.clone(),
@@ -177,6 +190,20 @@ impl Supervisor {
             shared: Some(shared),
             stop: Some(stop_tx),
             thread: Some(thread),
+            writes: WriteMark::default(),
+            tuning,
+            shutdown_flush_wait,
+        })
+    }
+
+    /// Клиент Qdrant этого супервизора: ключ, параметры коллекции (managed) и отметка
+    /// записей, по которой [`Self::shutdown`] ждёт сброса WAL.
+    pub fn connect_index(&self) -> Result<QdrantIndex, IndexError> {
+        let idx = QdrantIndex::connect(&self.grpc_url, self.api_key.as_deref())?
+            .with_write_mark(self.writes.clone());
+        Ok(match self.tuning {
+            Some(t) => idx.with_tuning(t),
+            None => idx,
         })
     }
 
@@ -254,8 +281,43 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Операций записи точек, ещё не подтверждённых Qdrant в WAL: последний `operation_id`
+    /// клиентов [`Self::connect_index`] минус `ack_index`. Ненулевое значение — следующий
+    /// старт после жёсткой остановки повторит WAL (задача 19 M3). `None` — external, записей
+    /// не было или файла WAL нет.
+    pub fn wal_pending(&self) -> Option<u64> {
+        let shared = self.shared.as_ref()?;
+        let op = self.writes.last_op()?;
+        Some(op.saturating_sub(wal_ack_index(&shared.qdir)?))
+    }
+
+    /// Отметка записей клиентов [`Self::connect_index`] (время и номер операции WAL).
+    pub fn write_mark(&self) -> WriteMark {
+        self.writes.clone()
+    }
+
     /// Останавливает Qdrant и ждёт завершения потока супервизора.
+    ///
+    /// managed, после записи клиентов [`Self::connect_index`] (вызывающий уже остановил
+    /// запись): сначала ждёт, пока Qdrant подтвердит её в WAL, — иначе следующий старт
+    /// повторяет неподтверждённый WAL (на Windows Qdrant завершается только
+    /// `TerminateProcess`; задача 19 M3). Подтверждение — `ack_index` файла `first-index`
+    /// WAL коллекции не меньше последнего `operation_id` (опрос раз в 100 мс); файла нет —
+    /// ожидание по времени ([`flush_wait`]). Не дольше `shutdown_flush_wait`.
     pub async fn shutdown(mut self) {
+        if let (Some(t), Some(shared)) = (self.tuning, &self.shared)
+            && matches!(*self.state.borrow(), QdrantState::Ready { .. })
+            && !self.shutdown_flush_wait.is_zero()
+        {
+            let qdir = shared.qdir.clone();
+            wait_wal_ack(
+                &qdir,
+                &self.writes,
+                t.flush_interval_sec,
+                self.shutdown_flush_wait,
+            )
+            .await;
+        }
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(true);
         }
@@ -271,6 +333,58 @@ impl Drop for Supervisor {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(true);
         }
+    }
+}
+
+/// Подтверждённая часть WAL коллекции: `ack_index` из
+/// `storage/collections/zam_chunks/0/wal/first-index` (Qdrant 1.19, `SerdeWal::ack` пишет
+/// туда `WalState`). Повтор WAL при старте начинается с этого номера.
+pub fn wal_ack_index(qdir: &Path) -> Option<u64> {
+    let f = qdir
+        .join(stamp::STORAGE_DIR)
+        .join("collections")
+        .join(crate::COLLECTION)
+        .join("0")
+        .join("wal")
+        .join("first-index");
+    let text = std::fs::read_to_string(f).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("ack_index")?
+        .as_u64()
+}
+
+/// Ожидание подтверждения WAL перед остановкой (см. [`Supervisor::shutdown`]).
+async fn wait_wal_ack(qdir: &Path, writes: &WriteMark, flush_interval_sec: u64, cap: Duration) {
+    let Some(since) = writes.since_last() else {
+        return;
+    };
+    let t0 = Instant::now();
+    // `acked` — WAL подтверждён; `timeout` — предел вышел раньше; `time` — файла WAL нет
+    // (или ни одной записи точек): ожидание по времени
+    let result = match (writes.last_op(), wal_ack_index(qdir)) {
+        (Some(op), Some(_)) => loop {
+            if wal_ack_index(qdir).is_some_and(|a| a >= op) {
+                break "acked";
+            }
+            if t0.elapsed() >= cap {
+                break "timeout";
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        },
+        _ => {
+            tokio::time::sleep(flush_wait(Some(since), flush_interval_sec, cap)).await;
+            "time"
+        }
+    };
+    let waited = t0.elapsed();
+    if waited >= Duration::from_millis(100) || result == "timeout" {
+        tracing::info!(
+            component = "qdrant",
+            wait_ms = waited.as_millis() as u64,
+            result,
+            "ожидание подтверждения WAL Qdrant перед остановкой"
+        );
     }
 }
 

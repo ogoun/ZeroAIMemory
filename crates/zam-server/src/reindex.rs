@@ -78,7 +78,7 @@ pub async fn run(cfg: ServerConfig, args: ReindexArgs) -> anyhow::Result<String>
     };
     let sup = Supervisor::start(sc, &cfg.data_dir).await?;
     let res = async {
-        let vector = QdrantIndex::connect(&sup.grpc_url(), sup.api_key().as_deref())?;
+        let vector = sup.connect_index()?;
         wait_ready(&sup, &vector).await?;
         let req = ReindexRequest {
             user,

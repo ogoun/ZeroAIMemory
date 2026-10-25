@@ -98,7 +98,19 @@ async fn shutdown_signal() {
             Err(_) => std::future::pending::<()>().await,
         }
     };
-    #[cfg(not(unix))]
+    // Windows: Ctrl+Break — штатная остановка процесса без окна консоли (его группе процессов
+    // шлёт `GenerateConsoleCtrlEvent`: `cargo xtask bench --scenario first-start`, менеджеры
+    // служб); Ctrl+C такой группе не доставляется.
+    #[cfg(windows)]
+    let term = async {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }

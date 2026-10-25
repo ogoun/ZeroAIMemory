@@ -144,6 +144,7 @@ pub struct EvalArgs {
 }
 
 /// Каталоги и файлы набора.
+#[derive(Clone)]
 pub struct Paths {
     pub repo: PathBuf,
     pub corpus: PathBuf,

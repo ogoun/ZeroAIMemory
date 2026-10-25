@@ -23,3 +23,8 @@ rusqlite.workspace = true
 half.workspace = true
 # проверка набора eval: стемминг Snowball ru/en
 rust-stemmers.workspace = true
+
+# bench --scenario first-start: штатная остановка сервера на Windows (Ctrl+Break группе
+# процессов, GenerateConsoleCtrlEvent); крейт уже в дереве (MIT OR Apache-2.0)
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Console"] }

@@ -97,6 +97,16 @@ pub struct QdrantSection {
     pub optimizer_cpu_budget: u32,
     /// API-ключ внешнего Qdrant. Для `managed` не задаётся: ключ случайный при каждом старте.
     pub api_key: Option<String>,
+    /// `optimizers.flush_interval_sec` коллекции managed Qdrant (1..=60): как часто Qdrant
+    /// сбрасывает сегменты и подтверждает WAL; меньше — короче повтор WAL после жёсткой
+    /// остановки (задача 19 M3).
+    pub flush_interval_sec: u64,
+    /// `wal.wal_capacity_mb` новой коллекции, МБ (1..=1024); у существующей — после
+    /// `zam-server qdrant reset`.
+    pub wal_capacity_mb: u64,
+    /// Предел ожидания сброса WAL при штатной остановке после записи, мс (0..=60000;
+    /// 0 — не ждать).
+    pub shutdown_flush_wait_ms: u64,
 }
 
 // Вручную: ключ внешнего Qdrant не должен попадать в отладочный вывод.
@@ -111,6 +121,9 @@ impl std::fmt::Debug for QdrantSection {
             .field("max_search_threads", &self.max_search_threads)
             .field("optimizer_cpu_budget", &self.optimizer_cpu_budget)
             .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("flush_interval_sec", &self.flush_interval_sec)
+            .field("wal_capacity_mb", &self.wal_capacity_mb)
+            .field("shutdown_flush_wait_ms", &self.shutdown_flush_wait_ms)
             .finish()
     }
 }
@@ -145,11 +158,24 @@ impl QdrantSection {
                 if self.http_port == self.grpc_port {
                     return Err(invalid("qdrant.grpc_port", "совпадает с http_port"));
                 }
+                if !(1..=60).contains(&self.flush_interval_sec) {
+                    return Err(invalid("qdrant.flush_interval_sec", "от 1 до 60"));
+                }
+                if !(1..=1024).contains(&self.wal_capacity_mb) {
+                    return Err(invalid("qdrant.wal_capacity_mb", "от 1 до 1024"));
+                }
+                if self.shutdown_flush_wait_ms > 60_000 {
+                    return Err(invalid("qdrant.shutdown_flush_wait_ms", "от 0 до 60000"));
+                }
                 let mut m = ManagedConfig::new(self.binary_path(exe_dir));
                 m.http_port = self.http_port;
                 m.grpc_port = self.grpc_port;
                 m.max_search_threads = self.max_search_threads;
                 m.optimizer_cpu_budget = self.optimizer_cpu_budget;
+                m.flush_interval_sec = self.flush_interval_sec;
+                m.wal_capacity_mb = self.wal_capacity_mb;
+                m.shutdown_flush_wait =
+                    std::time::Duration::from_millis(self.shutdown_flush_wait_ms);
                 Ok(Some(SupervisorConfig::Managed(m)))
             }
             QdrantMode::External => {
@@ -596,6 +622,10 @@ impl Default for ServerConfig {
                 max_search_threads: 2,
                 optimizer_cpu_budget: 2,
                 api_key: None,
+                flush_interval_sec: zam_index::supervisor::DEFAULT_FLUSH_INTERVAL_SEC,
+                wal_capacity_mb: zam_index::supervisor::DEFAULT_WAL_CAPACITY_MB,
+                shutdown_flush_wait_ms: zam_index::supervisor::DEFAULT_SHUTDOWN_FLUSH_WAIT
+                    .as_millis() as u64,
             },
             ml: MlSection {
                 device: MlDevice::Auto,
@@ -1140,6 +1170,65 @@ note_max_bytes = 1000
         let c = load(None, &env, &Default::default()).unwrap();
         assert_eq!(c.log.format, LogFormat::Text);
         assert_eq!(c.qdrant.mode, QdrantMode::External);
+    }
+
+    /// `[qdrant]` WAL и сброс (задача 19 M3): слои, перенос в супервизор, пределы.
+    #[test]
+    fn qdrant_wal_options_layer_and_validate() {
+        use zam_index::supervisor::SupervisorConfig;
+        let exe = std::path::Path::new("inst");
+        let d = load(None, &[], &Default::default()).unwrap();
+        let Some(SupervisorConfig::Managed(m)) = d.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался managed");
+        };
+        assert_eq!(
+            (
+                m.flush_interval_sec,
+                m.wal_capacity_mb,
+                m.shutdown_flush_wait
+            ),
+            (
+                zam_index::supervisor::DEFAULT_FLUSH_INTERVAL_SEC,
+                zam_index::supervisor::DEFAULT_WAL_CAPACITY_MB,
+                zam_index::supervisor::DEFAULT_SHUTDOWN_FLUSH_WAIT
+            )
+        );
+        let f = write_in_target(
+            "qdrant-wal.toml",
+            "[qdrant]\nflush_interval_sec = 2\nwal_capacity_mb = 8\n",
+        );
+        let e = vec![env("ZAM_QDRANT__SHUTDOWN_FLUSH_WAIT_MS", "1500")];
+        let c = load(Some(&f), &e, &Default::default()).unwrap();
+        let Some(SupervisorConfig::Managed(m)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался managed");
+        };
+        assert_eq!((m.flush_interval_sec, m.wal_capacity_mb), (2, 8));
+        assert_eq!(
+            m.shutdown_flush_wait,
+            std::time::Duration::from_millis(1500)
+        );
+        for (k, v, key) in [
+            (
+                "ZAM_QDRANT__FLUSH_INTERVAL_SEC",
+                "0",
+                "qdrant.flush_interval_sec",
+            ),
+            (
+                "ZAM_QDRANT__FLUSH_INTERVAL_SEC",
+                "61",
+                "qdrant.flush_interval_sec",
+            ),
+            ("ZAM_QDRANT__WAL_CAPACITY_MB", "0", "qdrant.wal_capacity_mb"),
+            (
+                "ZAM_QDRANT__SHUTDOWN_FLUSH_WAIT_MS",
+                "60001",
+                "qdrant.shutdown_flush_wait_ms",
+            ),
+        ] {
+            let c = load(None, &[env(k, v)], &Default::default()).unwrap();
+            let err = c.qdrant.supervisor_config(exe).unwrap_err().to_string();
+            assert!(err.contains(key), "{k}={v}: {err}");
+        }
     }
 
     #[test]

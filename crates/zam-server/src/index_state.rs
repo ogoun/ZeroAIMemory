@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use zam_index::supervisor::{QdrantState, Supervisor};
-use zam_index::{IndexError, QdrantIndex, VectorIndex, WorkerConfig, WorkerDeps, WorkerHandle};
+use zam_index::{IndexError, VectorIndex, WorkerConfig, WorkerDeps, WorkerHandle};
 use zam_ml::{DeviceReport, Embedder};
 use zam_store::{SystemStore, UserDbs};
 
@@ -256,18 +256,16 @@ impl IndexRuntime {
                 return rt;
             }
         };
-        let api_key = sup.api_key();
-        let vector: Arc<dyn VectorIndex> =
-            match QdrantIndex::connect(&sup.grpc_url(), api_key.as_deref()) {
-                Ok(c) => Arc::new(c),
-                Err(e) => {
-                    tracing::warn!(error = %e, "клиент Qdrant: векторный поиск выключен");
-                    rt.qdrant_reason = Some(DegradedReason::Broken);
-                    rt.qdrant_error = Some(e.to_string());
-                    *rt.supervisor.get_mut().unwrap_or_else(|p| p.into_inner()) = Some(sup);
-                    return rt;
-                }
-            };
+        let vector: Arc<dyn VectorIndex> = match sup.connect_index() {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "клиент Qdrant: векторный поиск выключен");
+                rt.qdrant_reason = Some(DegradedReason::Broken);
+                rt.qdrant_error = Some(e.to_string());
+                *rt.supervisor.get_mut().unwrap_or_else(|p| p.into_inner()) = Some(sup);
+                return rt;
+            }
+        };
         rt.qdrant_state = Some(sup.state());
         let wcfg = WorkerConfig {
             batch_tokens: cfg.index.batch_tokens,

@@ -3,7 +3,8 @@
 //! - `GET /index/status` — любой аутентифицированный. Токен видит только своего
 //!   пользователя (очередь, неудавшиеся задания, точки); администратор — пользователя из
 //!   `X-Zam-User` или, без заголовка, сумму по всем. Модель, устройство и Qdrant (состояние,
-//!   версия, RSS процесса — метрика `zam_qdrant_rss_bytes`, перезапуски) и RSS самого
+//!   версия, RSS процесса — метрика `zam_qdrant_rss_bytes`, перезапуски, неподтверждённые
+//!   в WAL записи `wal_pending_ops`) и RSS самого
 //!   `zam-server` (`server.rss_bytes`, цели §17) общие для сервера; время воркера
 //!   (`worker`: заданий, инференс, запись в Qdrant — сумма по всем пользователям) — только
 //!   администратору, токену — `null`.
@@ -248,6 +249,9 @@ pub async fn status(
             "rss_bytes": sup.as_ref().and_then(|s| s.rss_bytes()),
             "points": points,
             "restarts": sup.as_ref().map_or(0, |s| s.restarts()),
+            // записей точек, не подтверждённых в WAL Qdrant (жёсткая остановка сейчас —
+            // повтор WAL при следующем старте; задача 19 M3)
+            "wal_pending_ops": sup.as_ref().and_then(|s| s.wal_pending()),
             "error": rt.qdrant_error,
         },
         "queue": {

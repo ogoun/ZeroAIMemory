@@ -655,6 +655,16 @@ impl Session {
     pub fn stop(mut self) -> Result<()> {
         self.srv.stop()
     }
+
+    /// Штатная остановка (Ctrl+Break / SIGTERM) не дольше `limit`; время до выхода.
+    pub fn stop_graceful(mut self, limit: Duration) -> Result<Duration> {
+        self.srv.stop_graceful(limit)
+    }
+
+    /// Жёсткое завершение сервера и вместе с ним Qdrant.
+    pub fn kill(mut self) -> Result<()> {
+        self.srv.kill()
+    }
 }
 
 /// Пространство заметки при загрузке: группа `e` — решение набора, остальное — Knowledge.

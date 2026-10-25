@@ -36,7 +36,9 @@ pub mod worker;
 
 #[cfg(feature = "edge")]
 pub use edge::{EdgeIndex, EdgeOptions};
-pub use qdrant::{COLLECTION, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE};
+pub use qdrant::{
+    COLLECTION, CollectionTuning, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE, WriteMark,
+};
 pub use reindex::{ReindexCtx, ReindexReport, ReindexRequest, reindex};
 pub use vector::{
     IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, NAMESPACE_ZAM, PointPayload, VectorFilter,

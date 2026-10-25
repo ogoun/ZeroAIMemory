@@ -163,6 +163,14 @@ impl Server {
     pub(crate) fn start(root: &Path, data: &Path, env: &SmokeEnv, log_file: &Path) -> Result<Self> {
         let mut cmd =
             Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")));
+        // Windows: своя группа процессов — ей можно послать Ctrl+Break (`stop_graceful`), и
+        // Ctrl+C терминала не роняет сервер раньше, чем его остановит обвязка
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
         let mut child = scrub_zam_env(&mut cmd, &["ZAM_ADMIN_PASSWORD"])
             .args(["serve", "--data-dir"])
             .arg(data)
@@ -242,6 +250,54 @@ impl Server {
             bail!("сервер завершился с кодом {st} после SIGTERM");
         }
         let _ = st;
+        Ok(())
+    }
+}
+
+impl Server {
+    /// Штатная остановка с ожиданием выхода не дольше `limit`: Unix — SIGTERM, Windows —
+    /// Ctrl+Break группе процессов сервера (`GenerateConsoleCtrlEvent`; нужна общая консоль с
+    /// xtask). Возвращает время до выхода; не вышел за `limit` — убивается, ошибка.
+    pub(crate) fn stop_graceful(&mut self, limit: Duration) -> Result<Duration> {
+        let t0 = Instant::now();
+        let pid = self.child.id();
+        #[cfg(unix)]
+        {
+            let st = Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status()?;
+            if !st.success() {
+                bail!("kill -TERM {pid}: {st}");
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+            // SAFETY: вызов WinAPI без указателей; pid — группа процессов, созданная при
+            // запуске сервера (CREATE_NEW_PROCESS_GROUP).
+            unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) }
+                .map_err(|e| anyhow!("Ctrl+Break серверу {pid}: {e}"))?;
+        }
+        while self.child.try_wait()?.is_none() {
+            if t0.elapsed() > limit {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                bail!(
+                    "сервер не завершился за {} с после штатной остановки, убит",
+                    limit.as_secs()
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(t0.elapsed())
+    }
+
+    /// Жёсткое завершение (TerminateProcess / SIGKILL); Qdrant завершается вместе с сервером
+    /// (Job Object / PDEATHSIG).
+    pub(crate) fn kill(&mut self) -> Result<()> {
+        self.child.kill()?;
+        self.child.wait()?;
         Ok(())
     }
 }

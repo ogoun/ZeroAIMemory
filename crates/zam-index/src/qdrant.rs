@@ -16,9 +16,16 @@
 //! - с `VectorFilter::folders` (M3, канал папок §8.3) — ещё prefetch dense top-10 по точкам
 //!   папок со своим фильтром ([`VectorFilter::folder_filter`]); итоговый лимит растёт на
 //!   его размер, так что точки папок не вытесняют чанки из выдачи M2.
+//!
+//! Задача 19 M3 — первый старт после жёсткой остановки ([`CollectionTuning`]): клиент
+//! супервизора создаёт коллекцию с заданными `flush_interval_sec` и `wal_capacity_mb`, у
+//! существующей обновляет `flush_interval_sec` (размер блока WAL Qdrant 1.19 у существующей
+//! коллекции не меняет: в `UpdateCollection` нет `wal_config`) и отмечает время каждой
+//! записи в [`WriteMark`] — по нему супервизор ждёт сброса WAL перед остановкой.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use qdrant_client::qdrant::r#match::MatchValue;
 use qdrant_client::qdrant::value::Kind;
@@ -31,8 +38,9 @@ use qdrant_client::qdrant::{
     OptimizersConfigDiffBuilder, PayloadIncludeSelector, PointStruct, PrefetchQueryBuilder,
     QuantizationSearchParamsBuilder, Query, QueryPointsBuilder, RrfBuilder,
     ScalarQuantizationBuilder, ScoredPoint, SearchParamsBuilder, SparseIndexConfigBuilder,
-    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpsertPointsBuilder, Value, Vector,
-    VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
+    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpdateCollectionBuilder,
+    UpsertPointsBuilder, Value, Vector, VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
+    WalConfigDiffBuilder,
 };
 use qdrant_client::{Payload, Qdrant, QdrantError};
 use tonic::Code;
@@ -99,9 +107,66 @@ const PAYLOAD_INDEXES: [(&str, FieldType, bool); 12] = [
     ("area", FieldType::Keyword, false),
 ];
 
+/// Умолчания Qdrant 1.19 (`config/config.yaml`): `optimizers.flush_interval_sec` и
+/// `wal.wal_capacity_mb` — если в конфигурации коллекции поля нет.
+const QDRANT_FLUSH_INTERVAL_SEC: u64 = 5;
+const QDRANT_WAL_CAPACITY_MB: u64 = 32;
+
+/// Параметры WAL и сброса коллекции (задача 19 M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionTuning {
+    /// `optimizers.flush_interval_sec`.
+    pub flush_interval_sec: u64,
+    /// `wal.wal_capacity_mb` (только при создании коллекции).
+    pub wal_capacity_mb: u64,
+}
+
+/// Последняя запись в Qdrant (upsert, удаление, схема) — общая у клиентов одного
+/// супервизора: время и наибольший номер операции WAL (`operation_id` ответов upsert и
+/// удаления точек).
+#[derive(Debug, Clone, Default)]
+pub struct WriteMark(Arc<Mutex<MarkState>>);
+
+#[derive(Debug, Default)]
+struct MarkState {
+    at: Option<Instant>,
+    op: Option<u64>,
+}
+
+impl WriteMark {
+    fn state(&self) -> std::sync::MutexGuard<'_, MarkState> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Отметить запись сейчас.
+    pub fn touch(&self) {
+        self.state().at = Some(Instant::now());
+    }
+
+    /// Подтверждённая Qdrant операция с номером `op` (WAL).
+    pub fn record_op(&self, op: u64) {
+        let mut s = self.state();
+        s.at = Some(Instant::now());
+        s.op = Some(s.op.map_or(op, |o| o.max(op)));
+    }
+
+    /// Сколько прошло с последней записи; `None` — записей не было.
+    pub fn since_last(&self) -> Option<Duration> {
+        self.state().at.map(|t| t.elapsed())
+    }
+
+    /// Наибольший номер операции WAL среди записей точек; `None` — их не было.
+    pub fn last_op(&self) -> Option<u64> {
+        self.state().op
+    }
+}
+
 /// Векторный индекс на Qdrant (gRPC, API-ключ в заголовке `api-key`).
 pub struct QdrantIndex {
     client: Qdrant,
+    /// Параметры коллекции; `None` — умолчания Qdrant (внешний Qdrant, тесты).
+    tuning: Option<CollectionTuning>,
+    writes: WriteMark,
 }
 
 impl std::fmt::Debug for QdrantIndex {
@@ -123,7 +188,31 @@ impl QdrantIndex {
             .skip_compatibility_check()
             .build()
             .map_err(|e| map_err("connect", e))?;
-        Ok(QdrantIndex { client })
+        Ok(QdrantIndex {
+            client,
+            tuning: None,
+            writes: WriteMark::default(),
+        })
+    }
+
+    /// Создавать коллекцию с `t` и обновлять у существующей `flush_interval_sec`.
+    pub fn with_tuning(mut self, t: CollectionTuning) -> Self {
+        self.tuning = Some(t);
+        self
+    }
+
+    /// Номер операции WAL из ответа записи точек — в отметку записей.
+    fn note_op(&self, r: &qdrant_client::qdrant::PointsOperationResponse) {
+        match r.result.and_then(|u| u.operation_id) {
+            Some(op) => self.writes.record_op(op),
+            None => self.writes.touch(),
+        }
+    }
+
+    /// Отмечать записи в общей отметке `mark` (супервизора).
+    pub fn with_write_mark(mut self, mark: WriteMark) -> Self {
+        self.writes = mark;
+        self
     }
 
     async fn ensure_impl(&self, model_id: &str, dim: usize) -> Result<IndexMeta, IndexError> {
@@ -149,7 +238,7 @@ impl QdrantIndex {
                 }
             }
         }
-        let (mut meta, schema) = self.read_meta().await?;
+        let (mut meta, schema, current) = self.read_meta().await?;
         meta.created = created;
         // Недостающие payload-индексы (обрыв между созданием коллекции и индексов, коллекция
         // M2 без индексов полей записей) досоздаём только в «своей» коллекции: чужую модель
@@ -165,8 +254,44 @@ impl QdrantIndex {
             if added > 0 && !created {
                 tracing::info!(collection = COLLECTION, added, "добавлены payload-индексы");
             }
+            if let Some(t) = self.tuning {
+                self.apply_tuning(t, current).await?;
+            }
         }
         Ok(meta)
+    }
+
+    /// Параметры сброса существующей коллекции: `flush_interval_sec` — `update_collection`;
+    /// другой размер блока WAL — только запись в журнал (меняется пересозданием коллекции).
+    async fn apply_tuning(
+        &self,
+        t: CollectionTuning,
+        current: CollectionTuning,
+    ) -> Result<(), IndexError> {
+        if current.flush_interval_sec != t.flush_interval_sec {
+            self.writes.touch();
+            self.client
+                .update_collection(UpdateCollectionBuilder::new(COLLECTION).optimizers_config(
+                    OptimizersConfigDiffBuilder::default().flush_interval_sec(t.flush_interval_sec),
+                ))
+                .await
+                .map_err(|e| map_err("update_collection", e))?;
+            tracing::info!(
+                collection = COLLECTION,
+                from = current.flush_interval_sec,
+                to = t.flush_interval_sec,
+                "flush_interval_sec коллекции обновлён"
+            );
+        }
+        if current.wal_capacity_mb != t.wal_capacity_mb {
+            tracing::info!(
+                collection = COLLECTION,
+                current = current.wal_capacity_mb,
+                configured = t.wal_capacity_mb,
+                "размер блока WAL коллекции отличается от qdrant.wal_capacity_mb: применится после пересоздания коллекции (zam-server qdrant reset)"
+            );
+        }
+        Ok(())
     }
 
     async fn create_collection(&self, model_id: &str, dim: usize) -> Result<(), IndexError> {
@@ -193,19 +318,24 @@ impl QdrantIndex {
             SparseVectorParamsBuilder::default()
                 .index(SparseIndexConfigBuilder::default().memory(Memory::Cached)),
         );
+        let mut optimizers =
+            OptimizersConfigDiffBuilder::default().default_segment_number(SEGMENTS);
         let mut req = CreateCollectionBuilder::new(COLLECTION)
             .vectors_config(vectors)
             .sparse_vectors_config(sparse)
-            .on_disk_payload(true)
-            .optimizers_config(
-                OptimizersConfigDiffBuilder::default().default_segment_number(SEGMENTS),
-            )
-            .build();
+            .on_disk_payload(true);
+        if let Some(t) = self.tuning {
+            optimizers = optimizers.flush_interval_sec(t.flush_interval_sec);
+            req =
+                req.wal_config(WalConfigDiffBuilder::default().wal_capacity_mb(t.wal_capacity_mb));
+        }
+        let mut req = req.optimizers_config(optimizers).build();
         // Метаданные кладём в поле напрямую: `.metadata()` билдера требует фичу `serde`.
         req.metadata = HashMap::from([
             ("model_id".to_string(), Value::from(model_id)),
             ("schema".to_string(), Value::from(SCHEMA_VERSION)),
         ]);
+        self.writes.touch();
         self.client
             .create_collection(req)
             .await
@@ -223,6 +353,7 @@ impl QdrantIndex {
         ty: FieldType,
         tenant: bool,
     ) -> Result<(), IndexError> {
+        self.writes.touch();
         let mut req = CreateFieldIndexCollectionBuilder::new(COLLECTION, field, ty).wait(true);
         if ty == FieldType::Keyword {
             req = req.field_index_params(KeywordIndexParamsBuilder::default().is_tenant(tenant));
@@ -234,8 +365,9 @@ impl QdrantIndex {
         Ok(())
     }
 
-    /// Метаданные, размерность, число точек и список проиндексированных полей payload.
-    async fn read_meta(&self) -> Result<(IndexMeta, Vec<String>), IndexError> {
+    /// Метаданные, размерность, число точек, список проиндексированных полей payload и
+    /// текущие параметры сброса (нет поля — умолчание Qdrant).
+    async fn read_meta(&self) -> Result<(IndexMeta, Vec<String>, CollectionTuning), IndexError> {
         let info = self
             .client
             .collection_info(COLLECTION)
@@ -247,6 +379,18 @@ impl QdrantIndex {
             .config
             .ok_or_else(|| IndexError::Corrupt("collection_info без config".into()))?;
         let model_id = config.metadata.get("model_id").and_then(value_str);
+        let current = CollectionTuning {
+            flush_interval_sec: config
+                .optimizer_config
+                .as_ref()
+                .and_then(|o| o.flush_interval_sec)
+                .unwrap_or(QDRANT_FLUSH_INTERVAL_SEC),
+            wal_capacity_mb: config
+                .wal_config
+                .as_ref()
+                .and_then(|w| w.wal_capacity_mb)
+                .unwrap_or(QDRANT_WAL_CAPACITY_MB),
+        };
         let dim = match config
             .params
             .and_then(|p| p.vectors_config)
@@ -273,6 +417,7 @@ impl QdrantIndex {
                 created: false,
             },
             schema,
+            current,
         ))
     }
 
@@ -282,10 +427,13 @@ impl QdrantIndex {
         let mut it = pts.into_iter().peekable();
         while it.peek().is_some() {
             let batch: Vec<PointStruct> = it.by_ref().take(UPSERT_BATCH).map(to_point).collect();
-            self.client
+            self.writes.touch();
+            let r = self
+                .client
                 .upsert_points(UpsertPointsBuilder::new(COLLECTION, batch).wait(true))
                 .await
                 .map_err(|e| map_err("upsert", e))?;
+            self.note_op(&r);
         }
         Ok(())
     }
@@ -307,7 +455,9 @@ impl QdrantIndex {
             should: any,
             ..Filter::default()
         };
-        self.client
+        self.writes.touch();
+        let r = self
+            .client
             .delete_points(
                 DeletePointsBuilder::new(COLLECTION)
                     .points(filter)
@@ -315,6 +465,7 @@ impl QdrantIndex {
             )
             .await
             .map_err(|e| map_err("delete", e))?;
+        self.note_op(&r);
         Ok(())
     }
 
@@ -323,7 +474,9 @@ impl QdrantIndex {
         let Some(filter) = point_filter(f, &f.levels) else {
             return Ok(());
         };
-        self.client
+        self.writes.touch();
+        let r = self
+            .client
             .delete_points(
                 DeletePointsBuilder::new(COLLECTION)
                     .points(filter)
@@ -331,6 +484,7 @@ impl QdrantIndex {
             )
             .await
             .map_err(|e| map_err("delete", e))?;
+        self.note_op(&r);
         Ok(())
     }
 
@@ -468,6 +622,7 @@ impl QdrantIndex {
             .await
             .map_err(|e| map_err("collection_exists", e))?;
         if exists {
+            self.writes.touch();
             self.client
                 .delete_collection(DeleteCollectionBuilder::new(COLLECTION))
                 .await
