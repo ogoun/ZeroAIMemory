@@ -459,14 +459,16 @@ pub struct SearchSection {
     /// Не больше чанков с одного узла (≥ 1).
     pub max_per_node: usize,
     /// Множители слитого балла (§9.2 п. 4) для insight вида `gotcha` и `failure` и для узлов и
-    /// записей текущей области (`X-Zam-Area`). Значения по умолчанию (1,15 / 1,15 / 1,10) —
-    /// **[решение исполнителя, M3]**, проверка — сеткой eval.
+    /// записей текущей области (`X-Zam-Area`). По умолчанию 1,0 / 1,0 / 1,10: сетка eval задачи 18
+    /// M3 — буст вида поднимал гипотезы `gotcha` над противоречащими им `theorem`
+    /// (`reliable_first` 0,857 → 1,000, Δ nDCG@10 +0,006 [+0,001…+0,013] без него); буст области
+    /// набором не проверяется — **[решение исполнителя, M3]**.
     pub boost_gotcha: f64,
     pub boost_failure: f64,
     pub boost_area: f64,
     /// Множители по эпистемическому статусу `certainty` заметок и записей (§7.5, §9.2 п. 4):
-    /// `axiom` 1,20, `theorem` 1,10, `hypothesis` 1,00; без статуса — 1. Значения подтверждает
-    /// сетка eval (задача 18).
+    /// `axiom` 1,20, `theorem` 1,10, `hypothesis` 1,00; без статуса — 1. Подтверждено сеткой eval
+    /// задачи 18 M3 (1,10/1,05 и 1,0 — ниже `reliable_first` и nDCG@10).
     pub boost_axiom: f64,
     pub boost_theorem: f64,
     pub boost_hypothesis: f64,
@@ -475,7 +477,8 @@ pub struct SearchSection {
     pub graph_weight: f64,
     /// Вес канала папок (§8.3, §9.2): найденная векторным поиском папка поднимает чанки
     /// узлов своего поддерева на `w_folder / (rrf_k + ранг папки)`. По умолчанию 0 — канал
-    /// выключен до сетки eval задачи 18 (`{0; 0,3; 0,5; 1,0}`, без значимого выигрыша — 0).
+    /// выключен по сетке eval задачи 18 M3: 0,3 / 0,5 / 1,0 устойчиво хуже (Δ nDCG@10 −0,052 и
+    /// ниже) — подъём узлов обходит записи журналов, у которых папки нет.
     pub w_folder: f64,
     /// Не больше карточек папок в выдаче при `filters.kinds ∋ folder` (по умолчанию 2).
     pub max_folders: usize,
@@ -629,8 +632,8 @@ impl Default for ServerConfig {
                 w_trigram: 0.7,
                 recency_half_life_days: 180.0,
                 max_per_node: 3,
-                boost_gotcha: 1.15,
-                boost_failure: 1.15,
+                boost_gotcha: 1.0,
+                boost_failure: 1.0,
                 boost_area: 1.10,
                 boost_axiom: 1.20,
                 boost_theorem: 1.10,
@@ -937,7 +940,8 @@ mod tests {
                 c.search.boost_failure,
                 c.search.boost_area
             ),
-            (1.15, 1.15, 1.10)
+            // сетка задачи 18 M3: буст вида выключен (поднимал gotcha-гипотезы над теоремами)
+            (1.0, 1.0, 1.10)
         );
         assert_eq!(
             (
@@ -948,7 +952,7 @@ mod tests {
             (1.20, 1.10, 1.00)
         );
         assert_eq!(c.search.graph_weight, 0.5);
-        // канал папок выключен до сетки задачи 18, карточек папок — не больше двух
+        // канал папок выключен по сетке задачи 18 M3, карточек папок — не больше двух
         assert_eq!((c.search.w_folder, c.search.max_folders), (0.0, 2));
         assert_eq!(c.insights.dedup_threshold, 0.90);
     }

@@ -16,6 +16,7 @@ use common::ml::{MINILM, external, have, ml, until, vector_ready};
 use common::qdrant::TestQdrant;
 use serde_json::{Value, json};
 use zam_core::Id;
+use zam_server::config::ServerConfig;
 use zam_store::{IndexState, SpaceKind, get_entry, list_spaces};
 
 const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e21";
@@ -32,7 +33,11 @@ struct W {
 
 /// Владелец A регистрирует решение `G`; при `member` участник B получает доступ `rw`.
 async fn world(name: &str, member: bool) -> W {
-    let a = api(&format!("insights-{name}"), |_| {}).await;
+    world_with(name, member, |_| {}).await
+}
+
+async fn world_with(name: &str, member: bool, tweak: impl FnOnce(&mut ServerConfig)) -> W {
+    let a = api(&format!("insights-{name}"), tweak).await;
     let (a_id, a_tok) = a.new_user("Анна").await;
     let (b_id, b_tok) = a.new_user("Борис").await;
     let w = W {
@@ -1203,7 +1208,12 @@ async fn idempotency_fingerprint_includes_triggers() {
 
 #[tokio::test]
 async fn search_boosts_gotcha_above_equal_note() {
-    let w = world("boost", false).await;
+    // умолчания задачи 18 M3 — без буста вида (1,0); механизм проверяется на явных 1,15
+    let w = world_with("boost", false, |c| {
+        c.search.boost_gotcha = 1.15;
+        c.search.boost_failure = 1.15;
+    })
+    .await;
     let title = "Кодировка конца строк";
     let body = "Скрипты оболочки ломаются от символа возврата каретки.";
     let r =
@@ -1245,13 +1255,13 @@ async fn search_boosts_gotcha_above_equal_note() {
     assert!(g < n && g < p, "{j}");
     // буст — множитель 1,15 к баллу записи того же текста другого вида, и при балле выше 1
     // после буста: нормировка делением на лучший сохраняет отношение (раньше проверка шла
-    // только при балле < 1). Равные тексты стоят в каналах на соседних местах — до бустов
-    // баллы различаются не больше чем в (rrf_k + 2) / (rrf_k + 1) ≈ 1,7 % раза.
+    // только при балле < 1). Три равных текста стоят в канале на местах 1–3 — до бустов
+    // баллы различаются не больше чем в (rrf_k + 3) / (rrf_k + 1) ≈ 3,3 % раза.
     let score = |i: usize| items[i]["score"].as_f64().unwrap();
     assert!(score(g) <= 1.0, "{j}");
     let ratio = score(g) / score(p);
     assert!(
-        ratio > 1.15 * 61.0 / 62.0 - 1e-3 && ratio < 1.15 * 62.0 / 61.0 + 1e-3,
+        ratio > 1.15 * 61.0 / 63.0 - 1e-3 && ratio < 1.15 * 63.0 / 61.0 + 1e-3,
         "{ratio}: {j}"
     );
 }
