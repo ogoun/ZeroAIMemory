@@ -16,6 +16,7 @@
 | `grid-chunk-size.toml` | чувствительность к положению границ: размер листа 150–300, 300–500, 500–800 (M3) |
 | `grid-chunking.toml`, `grid-chunking-cpu.toml` | нарезка с учётом силы границ: λ, связность, L0 в префиксе, размер листа (задача 17 M3) |
 | `grid-m3.toml` | веса поиска M3: канал папок `w_folder`, бусты вида insight и `certainty` (задача 18 M3, ≤ 10 конфигураций) |
+| `grid-m3-kind.toml` | буст вида insight ниже буста `theorem`: 1,0 / 1,05 / 1,10 (задача 18 M3, fix round 1) |
 | `results/` | результаты прогонов: `.json` (полные, по запросам) и `.md` (таблицы) |
 
 **Корпус** — заметки инженера по темам: Windows и кодировки (CRLF, PowerShell), git, Linux и
@@ -162,6 +163,7 @@ cargo xtask eval --grid eval/grid-chunk-size.toml                       # гра
 cargo xtask eval --grid eval/grid-chunking.toml                         # сила границ (задача 17 M3)
 cargo xtask eval --grid eval/grid-chunking-cpu.toml                     # то же, проверка на int8 CPU
 cargo xtask eval --grid eval/grid-m3.toml                               # веса поиска M3 (задача 18)
+cargo xtask eval --grid eval/grid-m3-kind.toml                          # буст вида ниже theorem (задача 18)
 cargo xtask eval --device cuda --corpus <каталог> --insights <файл> --queries <файл> \
   --label <метка> --out <каталог>                                         # контрольный прогон
 ```
@@ -233,6 +235,9 @@ Toolkit (`--keep-cuda-path` — оставить): библиотеки NVIDIA �
 интервала парного бутстрепа разности int8 − fp32 по запросам (10 000 выборок, фиксированное
 зерно) не ниже −0,01 и для nDCG@10, и для recall@5. Среднее разности и верхняя граница на
 вердикт не влияют: при шумном наборе ухудшение, которое нельзя исключить, — провал.
+Оговорка M3: разность int8 − fp32 на 326 запросах дискретна и редка (различаются 2–4 запроса),
+и два прогона одного кода на разных индексах Qdrant дают разный вердикт (2026-10-25: −0,018 и
+−0,009 по нижней границе recall@5) — см. примечание в `results/2026-10-25-quality-gate.md`.
 
 | Проверка | Порог | Влияет на вердикт |
 |---|---|---|
@@ -287,7 +292,7 @@ frontmatter), запросы — в `queries.toml` с уникальным `id`.
 
 **Финальные прогоны M3** (задача 18, 2026-10-25, коммит `67c074f`, умолчания `[search]` по
 сетке `results/2026-10-25-grid-m3-bge-m3-fp16.*`): `results/2026-10-25-*-m3-final.*` — FTS,
-hybrid int8 CPU, hybrid fp16 CUDA, hybrid+rerank (bge-reranker на GPU); гейт int8 —
+hybrid int8 CPU, hybrid fp16 CUDA, hybrid+rerank (bge-reranker на GPU) — с бустом вида 1,0, умолчание 1,05 выбрано позже сеткой `results/2026-10-25-grid-m3-kind-*` (Δ nDCG@10 −0,001); гейт int8 —
 `results/2026-10-25-quality-gate.*` и прогоны внутри него `*-gate`. Итоги и решения — в журнале
 этапа `docs/plans/2026-10-21-m3-journals-graph-log.md` (раздел «Задача 18»).
 
