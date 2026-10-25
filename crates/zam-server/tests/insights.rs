@@ -1208,7 +1208,7 @@ async fn idempotency_fingerprint_includes_triggers() {
 
 #[tokio::test]
 async fn search_boosts_gotcha_above_equal_note() {
-    // умолчания задачи 18 M3 — без буста вида (1,0); механизм проверяется на явных 1,15
+    // умолчание задачи 18 M3 — 1,05 (ниже theorem); механизм проверяется на явных 1,15
     let w = world_with("boost", false, |c| {
         c.search.boost_gotcha = 1.15;
         c.search.boost_failure = 1.15;
