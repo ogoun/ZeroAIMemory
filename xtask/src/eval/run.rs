@@ -874,6 +874,7 @@ const MEASURED_PATHS: &[&str] = &[
     "eval/grid-confirm.toml",
     "eval/grid-relaxed.toml",
     "eval/grid-m3.toml",
+    "eval/grid-m3-kind.toml",
 ];
 
 /// `git <args> -- <MEASURED_PATHS>`.
