@@ -164,8 +164,10 @@ Qdrant поставляется вместе с сервисом как нати
   - **Падение и поиск.** При состоянии `Ready` поиск сверяется с живостью процесса по pid (проверка ОС, без обращения к Qdrant): между смертью процесса и сменой состояния супервизором запрос не уходит в закрытый порт. Соединение с Qdrant ограничено 300 мс: на Windows отказ соединения с закрытым портом localhost приходит лишь через ~2 с на попытку, и до этого правила первый поиск после падения ждал 2–4 с **[решение исполнителя, задача 15 M2]**.
   - **Перезапуск при падении.** Экспоненциальная задержка от 1 до 60 с с jitter. После 5 падений за 10 минут — circuit breaker: сервер работает в режиме деградации (§4.1 п. 6) и показывает алерт в WebUI и в `/index/status`.
   - **Остановка.**
-    1. Прекратить отправку записей; все записи идут с `wait=true`.
-    2. Linux: SIGTERM, ждать 10 с, затем SIGKILL. Windows: `TerminateProcess` — Qdrant на Windows слушает только Ctrl+C, а целостность обеспечивают его WAL и пересборка из SQLite.
+    1. Прекратить отправку записей (остановить воркер индексации); все записи идут с `wait=true`.
+    2. Если после записи прошло мало времени — дождаться, пока Qdrant подтвердит её в WAL (`ack_index` в `wal/first-index` не меньше последнего `operation_id`), не дольше `qdrant.shutdown_flush_wait_ms` (10 с): иначе следующий старт повторяет неподтверждённый WAL и синхронно сбрасывает сегменты (на HDD ~5 с вместо ~2 с) **[решение исполнителя, задача 19 M3]**.
+    3. Linux: SIGTERM, ждать 10 с, затем SIGKILL. Windows: `TerminateProcess` — Qdrant на Windows слушает только Ctrl+C, а целостность обеспечивают его WAL и пересборка из SQLite.
+    4. Сам `zam-server` останавливается по Ctrl+C, SIGTERM и (Windows) Ctrl+Break. Предел остановки у менеджера служб — не меньше 40 с (`TimeoutStopSec` юнита systemd; NSSM — `AppStopMethodConsole`).
 - **Согласованность с SQLite.** Задания `index_jobs` работают как outbox: задание закрывается только после подтверждённого upsert. Повтор идемпотентен, потому что id точки детерминирован.
 - **Обновление Qdrant.** Пропускать минорные версии формат хранения не позволяет. Индекс у нас производный, поэтому если новая версия старше хранилища больше чем на одну минорную, при откате или при ошибке миграции сервер удаляет `<data_dir>/qdrant/storage` и пересобирает индекс из таблицы `embeddings`, без инференса. Это событие пишется в аудит.
 - **Ресурсы.** Пределы памяти и потоков Qdrant задаются в конфиге (`qdrant.max_search_threads`, `qdrant.optimizer_threads`), чтобы он не отбирал CPU у инференса.
@@ -920,7 +922,7 @@ name              = "TradingPlatform"
 | Кэш выжимок | `POST /cache {query, summary, sources, promote?}`, `GET /cache?q=&solution=&session=`, `GET /cache/{id}`, `DELETE /cache/{id}`, `POST /cache/{id}/promote` |
 | Чтение пачкой | `POST /read {items:[{id, tier?, section?, locator?, max_tokens?, if_rev?}], session_id, format}` |
 | Подключение агента | `GET /agent-setup?user=&token=&agent=claude\|agents\|codex&solution=` → готовый текст блока и фрагменты конфигов (§15.5) |
-| Индекс | `GET /index/status` (векторный канал с причиной и подсказкой, модель, устройство, RSS самого сервера `server.rss_bytes`, Qdrant: состояние, версия, `rss_bytes`, точки, перезапуски; очередь, до 20 ошибок (у узла в корзине — `deleted_at`), время воркера `worker` (инференс, запись в Qdrant; администратору ещё `worker.batch_running` и `worker.rollups_pending` — покой воркера), последний reindex, исключённые базы; токен — только свой пользователь). `POST /admin/reindex {user?, space?, full?}` → 202 `{job_count}` |
+| Индекс | `GET /index/status` (векторный канал с причиной и подсказкой, модель, устройство, RSS самого сервера `server.rss_bytes`, Qdrant: состояние, версия, `rss_bytes`, точки, перезапуски, `wal_pending_ops` — записей точек, ещё не подтверждённых в WAL (задача 19 M3); очередь, до 20 ошибок (у узла в корзине — `deleted_at`), время воркера `worker` (инференс, запись в Qdrant; администратору ещё `worker.batch_running` и `worker.rollups_pending` — покой воркера), последний reindex, исключённые базы; токен — только свой пользователь). `POST /admin/reindex {user?, space?, full?}` → 202 `{job_count}` |
 | Экспорт/импорт | `GET /spaces/{space}/export` (zip: `.md` + `_attachments/`), `POST /spaces/{space}/import` (zip или папка `.md`) |
 | Служебное | `GET /health`, `GET /ready`, `GET /metrics` |
 
