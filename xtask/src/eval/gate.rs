@@ -7,10 +7,13 @@
 //! токенизатор у моделей один, поэтому чанки совпадают. Сравниваются ровно те векторы, что
 //! лежат в индексе (dense — f16, sparse — пары u32 + f16).
 //!
-//! Пороги:
+//! **Вердикт** (решение владельца 2026-10-21, ТЗ §8.4, §18.2): «пройден», если нижняя граница
+//! 95 % интервала парного бутстрепа (10 000 выборок, фиксированное зерно) разности
+//! кандидат − fp32 не ниже −0,01 и для nDCG@10, и для recall@5.
+//!
+//! **Справочно** (в отчёте, на вердикт не влияют — пороги M2):
 //! - косинус dense: средний ≥ 0,99, минимальный ≥ 0,97;
-//! - корреляция Спирмена весов sparse (объединение токенов, отсутствующий = 0): средняя ≥ 0,95;
-//! - recall@5 и nDCG@10 int8 хуже fp32 не больше чем на 1 п. п.
+//! - корреляция Спирмена весов sparse (объединение токенов, отсутствующий = 0): средняя ≥ 0,95.
 //!
 //! Если доступна CUDA (`target/deps/<платформа>/onnxruntime-gpu`), так же сравнивается fp16 —
 //! для решения «одна модель CPU и GPU или разные `model_id`» (исследование 05 §3.3); на
@@ -26,7 +29,7 @@ use half::f16;
 use serde::Serialize;
 
 use super::corpus::{Corpus, Query};
-use super::metrics::{QueryMetrics, cosine, paired_diff, quantile, spearman};
+use super::metrics::{QueryMetrics, cosine, paired_diff_with, quantile, spearman};
 use super::report::{self, est};
 use super::run::{self, RunResult, RunSpec, Session};
 use super::{Device, EvalArgs, Mode, Paths};
@@ -41,6 +44,8 @@ const DENSE_MIN_MIN: f64 = 0.97;
 const SPARSE_MEAN_MIN: f64 = 0.95;
 /// Допустимое ухудшение recall@5 и nDCG@10 (доля, 1 п. п.).
 const METRIC_DROP_MAX: f64 = 0.01;
+/// Выборок парного бутстрепа разности метрик гейта (решение владельца 2026-10-21).
+const GATE_BOOTSTRAP: usize = 10_000;
 
 /// Эмбеддинг из базы прогона.
 struct Vecs {
@@ -201,6 +206,9 @@ pub struct Check {
     pub pass: bool,
     /// 95 % интервал парного бутстрепа разности по запросам (только для метрик поиска).
     pub ci: Option<[f64; 2]>,
+    /// Справочная проверка: в отчёте, на вердикт не влияет.
+    #[serde(default)]
+    pub informational: bool,
 }
 
 fn check(name: &str, value: f64, threshold: String, pass: bool) -> Check {
@@ -210,27 +218,53 @@ fn check(name: &str, value: f64, threshold: String, pass: bool) -> Check {
         threshold,
         pass,
         ci: None,
+        informational: false,
     }
 }
 
-/// Разность метрики кандидата и эталона по одним запросам: среднее и 95 % интервал.
-fn metric_check(name: &str, m: &RunResult, r: &RunResult, f: fn(&QueryMetrics) -> f64) -> Check {
-    let col = |x: &RunResult| x.queries.iter().map(|q| f(&q.metrics)).collect::<Vec<_>>();
-    let d = paired_diff(&col(r), &col(m));
+/// Разность метрики кандидата и эталона по одним запросам (`reference`, `candidate` — значения
+/// метрики по запросам в одном порядке): среднее и 95 % интервал парного бутстрепа
+/// ([`GATE_BOOTSTRAP`] выборок, фиксированное зерно). Пройдено, если **нижняя граница**
+/// интервала не ниже −[`METRIC_DROP_MAX`] (решение владельца 2026-10-21): среднее и верхняя
+/// граница на вердикт не влияют.
+fn metric_check_values(name: &str, reference: &[f64], candidate: &[f64]) -> Check {
+    let d = paired_diff_with(reference, candidate, GATE_BOOTSTRAP);
     Check {
         ci: Some([d.lo, d.hi]),
         ..check(
             name,
             d.mean,
-            format!("≥ −{METRIC_DROP_MAX}"),
-            d.mean >= -METRIC_DROP_MAX,
+            format!("нижняя граница 95 % ≥ −{METRIC_DROP_MAX}"),
+            d.lo >= -METRIC_DROP_MAX,
         )
     }
 }
 
+/// [`metric_check_values`] по результатам прогонов кандидата `m` и эталона `r`.
+fn metric_check(name: &str, m: &RunResult, r: &RunResult, f: fn(&QueryMetrics) -> f64) -> Check {
+    let col = |x: &RunResult| x.queries.iter().map(|q| f(&q.metrics)).collect::<Vec<_>>();
+    metric_check_values(name, &col(r), &col(m))
+}
+
+/// Вердикт гейта: все проверки, кроме справочных (векторы), пройдены.
+fn verdict(checks: &[Check]) -> bool {
+    checks.iter().filter(|c| !c.informational).all(|c| c.pass)
+}
+
 /// Проверки одной модели против эталона.
 fn checks(v: &VectorCompare, m: &RunResult, r: &RunResult) -> Vec<Check> {
-    vec![
+    let mut out = vector_checks(v);
+    out.extend([
+        metric_check("recall@5: разница с fp32", m, r, |q| q.recall5),
+        metric_check("nDCG@10: разница с fp32", m, r, |q| q.ndcg10),
+    ]);
+    out
+}
+
+/// Проверки векторов (косинус dense, Спирмен sparse) — справочные: на вердикт не влияют
+/// (решение владельца 2026-10-21), пороги M2 остаются в отчёте для сравнения.
+fn vector_checks(v: &VectorCompare) -> Vec<Check> {
+    let mut out = vec![
         check(
             "dense: средний косинус",
             v.dense_mean,
@@ -249,9 +283,11 @@ fn checks(v: &VectorCompare, m: &RunResult, r: &RunResult) -> Vec<Check> {
             format!("≥ {SPARSE_MEAN_MIN}"),
             v.sparse_spearman_mean >= SPARSE_MEAN_MIN,
         ),
-        metric_check("recall@5: разница с fp32", m, r, |q| q.recall5),
-        metric_check("nDCG@10: разница с fp32", m, r, |q| q.ndcg10),
-    ]
+    ];
+    for c in &mut out {
+        c.informational = true;
+    }
+    out
 }
 
 /// Итог гейта.
@@ -409,7 +445,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) -> Resul
             fp16_note = Some(format!("пропущен: {e:#}"));
         }
     }
-    let pass = checks8.iter().all(|c| c.pass);
+    let pass = verdict(&checks8);
     let g = GateResult {
         date: run::today(),
         git: run::git_rev(&p.repo),
@@ -470,7 +506,19 @@ pub fn gate_md(g: &GateResult) -> String {
             "не пройден"
         }
     );
-    s.push_str(&checks_table(&g.checks));
+    let (info, verdict): (Vec<Check>, Vec<Check>) =
+        g.checks.iter().cloned().partition(|c| c.informational);
+    s.push_str(&format!(
+        "Вердикт — по нижней границе 95 % интервала парного бутстрепа разности {} − {} \
+         ({GATE_BOOTSTRAP} выборок, фиксированное зерно): не ниже −{METRIC_DROP_MAX} и для \
+         recall@5, и для nDCG@10.\n\n",
+        g.candidate, g.reference
+    ));
+    s.push_str(&checks_table(&verdict));
+    if !info.is_empty() {
+        s.push_str("\n## Справочно: векторы (на вердикт не влияют)\n\n");
+        s.push_str(&checks_table(&info));
+    }
     s.push_str("\n## Векторы (чанки корпуса, общие по embed_key)\n\n");
     s.push_str(
         "| Пара | чанков | dense: средний | dense: мин. | dense: 1 % | sparse ρ: средний | sparse ρ: мин. | sparse ρ: 5 % |\n\
@@ -514,4 +562,118 @@ pub fn gate_md(g: &GateResult) -> String {
         s.push_str(&format!("\nfp16: {n}\n"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Значения метрики по 200 запросам: эталон — 0,5, у кандидата к первым прибавлены `deltas`.
+    fn cols(deltas: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        let reference = vec![0.5; 200];
+        let mut candidate = reference.clone();
+        for (c, d) in candidate.iter_mut().zip(deltas) {
+            *c += d;
+        }
+        (reference, candidate)
+    }
+
+    fn vc(dense_mean: f64, dense_min: f64, sparse: f64) -> VectorCompare {
+        VectorCompare {
+            a: INT8.into(),
+            b: FP32.into(),
+            chunks: 10,
+            chunks_by_level: BTreeMap::new(),
+            dense_mean,
+            dense_min,
+            dense_p01: dense_min,
+            sparse_spearman_mean: sparse,
+            sparse_spearman_min: sparse,
+            sparse_spearman_p05: sparse,
+            sparse_skipped: 0,
+        }
+    }
+
+    #[test]
+    fn verdict_uses_lower_bound_only() {
+        // среднее −0,005 (не хуже порога), но разброс велик: нижняя граница < −0,01 — провал
+        let mut d = vec![-0.5; 6];
+        d.extend([0.5; 5]);
+        let (r, c) = cols(&d);
+        let ch = metric_check_values("nDCG@10", &r, &c);
+        let [lo, hi] = ch.ci.unwrap();
+        assert!(
+            ch.value > -METRIC_DROP_MAX && lo < -METRIC_DROP_MAX,
+            "{ch:?}"
+        );
+        assert!(hi > 0.0);
+        assert!(
+            !ch.pass,
+            "среднее выше порога, но нижняя граница ниже: {ch:?}"
+        );
+        assert!(!verdict(&[ch]));
+        // ровный сдвиг −0,005 на всех запросах: интервал вырожден, нижняя граница −0,005
+        let (r, c) = cols(&[-0.005; 200]);
+        let ch = metric_check_values("recall@5", &r, &c);
+        assert!(ch.pass, "{ch:?}");
+        // ровный сдвиг −0,011 — нижняя граница ниже порога
+        let (r, c) = cols(&[-0.011; 200]);
+        assert!(!metric_check_values("recall@5", &r, &c).pass);
+        // широкая верхняя граница не мешает: кандидат лучше — пройдено
+        let (r, c) = cols(&[0.5; 10]);
+        let ch = metric_check_values("recall@5", &r, &c);
+        assert!(ch.pass && ch.ci.unwrap()[0] >= 0.0, "{ch:?}");
+        // интервал — 10 000 выборок парного бутстрепа с фиксированным зерном
+        let (r, c) = cols(&d);
+        let e = paired_diff_with(&r, &c, GATE_BOOTSTRAP);
+        assert_eq!(GATE_BOOTSTRAP, 10_000);
+        assert_eq!(metric_check_values("x", &r, &c).ci, Some([e.lo, e.hi]));
+        assert_eq!(metric_check_values("x", &r, &c).ci, Some([e.lo, e.hi]));
+        // порог в отчёте называет нижнюю границу
+        assert!(ch.threshold.contains("нижняя граница"), "{}", ch.threshold);
+    }
+
+    #[test]
+    fn cosine_is_informational() {
+        // косинус и Спирмен ниже порогов, поиск не хуже — гейт пройден
+        let v = vc(0.978, 0.90, 0.90);
+        let vecs = vector_checks(&v);
+        assert_eq!(vecs.len(), 3);
+        assert!(vecs.iter().all(|c| c.informational && !c.pass), "{vecs:?}");
+        let (r, c) = cols(&[]);
+        let mut all = vecs.clone();
+        all.push(metric_check_values("recall@5", &r, &c));
+        all.push(metric_check_values("nDCG@10", &r, &c));
+        assert!(all[3..].iter().all(|c| !c.informational));
+        assert!(verdict(&all), "{all:?}");
+        // поиск хуже — не пройден, как бы хороши ни были векторы
+        let mut all = vector_checks(&vc(0.999, 0.99, 0.99));
+        let (r, c) = cols(&[-0.02; 200]);
+        all.push(metric_check_values("nDCG@10", &r, &c));
+        assert!(!verdict(&all));
+        // в отчёте векторные проверки — в разделе «справочно», вердикт — «пройден»
+        let g = GateResult {
+            date: "2026-10-25".into(),
+            git: "x".into(),
+            reference: FP32.into(),
+            candidate: INT8.into(),
+            pass: true,
+            checks: {
+                let mut c = vector_checks(&v);
+                let (r, q) = cols(&[]);
+                c.push(metric_check_values("nDCG@10: разница с fp32", &r, &q));
+                c
+            },
+            vectors: vec![v],
+            runs: BTreeMap::new(),
+            fp16_checks: Vec::new(),
+            fp16_note: None,
+        };
+        let md = gate_md(&g);
+        assert!(md.contains("итог: **пройден**"), "{md}");
+        let (verdict_part, info_part) = md.split_once("Справочно").expect("раздел «Справочно»");
+        assert!(verdict_part.contains("nDCG@10: разница с fp32"), "{md}");
+        assert!(!verdict_part.contains("dense: средний косинус"), "{md}");
+        assert!(info_part.contains("dense: средний косинус"), "{md}");
+    }
 }

@@ -163,8 +163,13 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     }
 }
 
-/// Среднее значений и 95 % интервал бутстрепа.
+/// Среднее значений и 95 % интервал бутстрепа ([`BOOTSTRAP`] выборок).
 pub fn estimate(values: &[f64]) -> Estimate {
+    estimate_with(values, BOOTSTRAP)
+}
+
+/// Среднее значений и 95 % интервал бутстрепа из `samples` выборок (то же зерно).
+pub fn estimate_with(values: &[f64], samples: usize) -> Estimate {
     let m = mean(values);
     if values.len() < 2 {
         return Estimate {
@@ -174,7 +179,7 @@ pub fn estimate(values: &[f64]) -> Estimate {
         };
     }
     let mut rng = Rng(SEED);
-    let mut means: Vec<f64> = (0..BOOTSTRAP)
+    let mut means: Vec<f64> = (0..samples.max(1))
         .map(|_| {
             (0..values.len())
                 .map(|_| values[rng.below(values.len())])
@@ -216,9 +221,14 @@ pub fn aggregate(per_query: &[QueryMetrics]) -> Aggregate {
 
 /// Парная разница `b − a` (одни запросы в одном порядке) с 95 % интервалом бутстрепа.
 pub fn paired_diff(a: &[f64], b: &[f64]) -> Estimate {
+    paired_diff_with(a, b, BOOTSTRAP)
+}
+
+/// [`paired_diff`] с `samples` выборками бутстрепа (гейт int8 — 10 000).
+pub fn paired_diff_with(a: &[f64], b: &[f64], samples: usize) -> Estimate {
     assert_eq!(a.len(), b.len(), "парное сравнение на одних запросах");
     let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| y - x).collect();
-    estimate(&d)
+    estimate_with(&d, samples)
 }
 
 /// Ранговая корреляция Спирмена (средние ранги при равенствах; Пирсон рангов).

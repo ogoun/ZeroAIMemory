@@ -3,7 +3,8 @@
 //! - затухание по свежести ([`recency_factor`], внутри слияния);
 //! - бусты ([`apply_boosts`]): вид инсайта (`gotcha`, `failure`), надёжность (`certainty`
 //!   заметки или записи: `search.boost_axiom` > `boost_theorem` > `boost_hypothesis`, §7.5) и
-//!   текущая область (`X-Zam-Area`) — множители слитого балла;
+//!   текущая область (`X-Zam-Area`) — множители слитого балла; балл выше 1 после них —
+//!   деление всех баллов на лучший ([`rescale_overflow`]);
 //! - замена сводки листом и лимит на цель.
 //!
 //! `superseded`/`retracted` исключает фильтр статусов поиска (сервер), а не поправка.
@@ -52,8 +53,8 @@ impl Boosts {
 
 /// Умножает балл каждого кандидата на его бусты ([`Boosts`]) и пересортировывает по
 /// убыванию балла (при равенстве — прежний порядок). Кандидат без метаданных не меняется.
-/// Балл после бустов может превысить 1: порядок важнее шкалы, шкалу при выдаче ограничивает
-/// вызывающий.
+/// Балл после бустов может превысить 1: порядок важнее шкалы, шкалу затем приводит
+/// [`rescale_overflow`].
 pub fn apply_boosts(r: &mut [Ranked], meta: &HashMap<String, ChunkMeta>, b: &Boosts) {
     for x in r.iter_mut() {
         if let Some(m) = meta.get(&x.chunk_id) {
@@ -61,6 +62,22 @@ pub fn apply_boosts(r: &mut [Ranked], meta: &HashMap<String, ChunkMeta>, b: &Boo
         }
     }
     r.sort_by(|a, b| b.score.total_cmp(&a.score));
+}
+
+/// Нормировка шкалы после бустов и канала папок: если лучший балл `r` (список по убыванию)
+/// больше 1, все баллы делятся на него — порядок и отношения баллов не меняются, лучший
+/// становится 1, а различие кандидатов выше 1 не теряется при ограничении шкалы ответа.
+/// Без переполнения шкала прежняя (1,0 — первое место во всех каналах слияния). Возвращает
+/// делитель (1 — без изменений): им же масштабируются баллы вне списка (карточки папок).
+pub fn rescale_overflow(r: &mut [Ranked]) -> f64 {
+    let top = r.first().map_or(0.0, |x| x.score);
+    if !(top > 1.0 && top.is_finite()) {
+        return 1.0;
+    }
+    for x in r.iter_mut() {
+        x.score /= top;
+    }
+    top
 }
 
 /// Нижняя граница множителя свежести **[решение исполнителя]**: память хранит и давние
@@ -324,6 +341,31 @@ mod tests {
         let ids: Vec<&str> = list.iter().map(|x| x.chunk_id.as_str()).collect();
         assert_eq!(ids, vec!["ax", "thm", "hyp", "plain"]);
         assert!((list[0].score - 0.6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn overflow_rescaled_by_top_keeps_order_and_ratios() {
+        // бусты подняли первые выше 1: делим всех на лучший балл — порядок и отношения прежние,
+        // лучший — ровно 1, различие двух бывших «1+» видно в шкале
+        let mut list = vec![
+            r("a", Id::new(), Level::Chunk, 1.38, "fts"),
+            r("b", Id::new(), Level::Chunk, 1.15, "fts"),
+            r("c", Id::new(), Level::Chunk, 0.69, "fts"),
+        ];
+        let k = rescale_overflow(&mut list);
+        assert!((k - 1.38).abs() < 1e-12);
+        let got: Vec<f64> = list.iter().map(|x| (x.score * 1e6).round() / 1e6).collect();
+        assert_eq!(got, vec![1.0, 0.833333, 0.5]);
+        assert!(list.iter().all(|x| x.score <= 1.0));
+        // без переполнения шкала не меняется (1,0 — первое место во всех каналах)
+        let mut list = vec![
+            r("a", Id::new(), Level::Chunk, 1.0, "fts"),
+            r("b", Id::new(), Level::Chunk, 0.4, "fts"),
+        ];
+        let before = list.clone();
+        assert_eq!(rescale_overflow(&mut list), 1.0);
+        assert_eq!(list, before);
+        assert_eq!(rescale_overflow(&mut []), 1.0);
     }
 
     #[test]

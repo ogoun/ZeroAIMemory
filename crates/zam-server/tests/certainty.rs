@@ -1143,7 +1143,7 @@ async fn axiom_boost_orders_above_equal_hypothesis() {
         let r = search(&a, json!({"query": word, "top_k": 5})).await;
         let order: Vec<String> = items(&r).into_iter().map(|(i, _)| i).collect();
         assert_eq!(order, vec![ax.clone(), hy.clone()], "{word}: {}", r.text());
-        // балл в ответе ограничен 1 (нормировка — задача 18), порядок — по полному баллу
+        // балл в ответе не выше 1 (деление на лучший после бустов), порядок — по полному баллу
         let s = r.json();
         assert!(s["items"][0]["score"].as_f64().unwrap() <= 1.0);
     }

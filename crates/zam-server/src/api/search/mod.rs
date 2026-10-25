@@ -49,7 +49,8 @@
 //!    `w_fts_relaxed`, если векторный канал работает и чанк ему виден, т. е. не Human и узел
 //!    проиндексирован) → бусты ([`zam_search::apply_boosts`], §9.2 п. 4: insight `gotcha` и
 //!    `failure` — `search.boost_gotcha`/`boost_failure`, узлы и записи области из
-//!    `X-Zam-Area` — `search.boost_area`; балл в ответе ограничен 1) → `note_to_leaf` →
+//!    `X-Zam-Area` — `search.boost_area`; балл выше 1 после бустов и канала папок — деление
+//!    всех баллов на лучший, `zam_search::rescale_overflow`) → `note_to_leaf` →
 //!    ≤ `max_per_node` с узла:
 //!    сводка (L1 заметки или секции) сливается с найденным листом своего узла (для
 //!    секции — листом этой секции) или заменяется лучшим листом: ближайшим к запросу по
@@ -70,7 +71,7 @@
 //!
 //! **Папки** (§8.3, §9.2). Векторный запрос добавляет prefetch dense top-10 по точкам папок
 //! (`VectorFilter::folders`), если включён канал папок (`search.w_folder > 0`, по умолчанию
-//! 0 — до сетки задачи 18) или запрошены карточки (`filters.kinds ∋ folder`). Точки папок
+//! 0 — по сетке задачи 18 M3) или запрошены карточки (`filters.kinds ∋ folder`). Точки папок
 //! направляются в базу владельца и проверяются по SQLite ([`live_folders`]: папка жива, не в
 //! корзине, не Human, в пространствах цели и под `path_prefix`); удалённая папка, точка
 //! которой осталась в Qdrant, не действует. Ранг папки — среди живых, по порядку векторной
@@ -157,7 +158,7 @@ use zam_ml::Embedding;
 use zam_search::{
     Boosts, ChunkMeta, Cost, Fit, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights,
     apply_boosts, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed, in_section,
-    note_to_leaf, pack, summaries_without_leaf, truncate_to_tokens,
+    note_to_leaf, pack, rescale_overflow, summaries_without_leaf, truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
@@ -1516,6 +1517,8 @@ pub async fn search(
     let weights = st.cfg.search.weights();
     let (mut ranked, norm_max) = fuse_normed(&inputs, &weights, jiff::Timestamp::now());
     apply_boosts(&mut ranked, &inputs.chunks, &boosts);
+    // балл выше 1 после бустов и канала папок: все баллы делятся на лучший (порядок прежний)
+    let overflow = rescale_overflow(&mut ranked);
     let window = top_k * OVERSAMPLE;
     let query_vec = vrun
         .dense
@@ -1612,7 +1615,9 @@ pub async fn search(
         folders
             .iter()
             .take(st.cfg.search.max_folders)
-            .map(|(i, f, rank)| folder_card(*i, f, folder_score(*rank, &weights, norm_max)))
+            .map(|(i, f, rank)| {
+                folder_card(*i, f, folder_score(*rank, &weights, norm_max) / overflow)
+            })
             .collect()
     } else {
         Vec::new()

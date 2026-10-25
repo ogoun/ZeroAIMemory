@@ -94,6 +94,11 @@ pub struct ConfigResult {
     /// следующего блока, задача 17 M3): исправление «:» и λ не должны их ронять.
     #[serde(default)]
     pub d_chunk_recall5_intro: Option<Estimate>,
+    /// Набор M3: Δ `reliable_first` (запросы `certainty`) и Δ `cancelled@5` (`superseded`).
+    #[serde(default)]
+    pub d_reliable_first: Option<Estimate>,
+    #[serde(default)]
+    pub d_cancelled5: Option<Estimate>,
     /// Листовых чанков заметок в индексе конфигурации (критерий ±5 % задачи нарезки).
     pub leaf_chunks: usize,
     /// Объём индексации: чанки и токены (критерий ±5 % задачи 17 M3).
@@ -301,6 +306,8 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
                 d_chunk_ndcg10: subset_diff(base, q, |x| x.metrics.chunk_ndcg10),
                 d_ndcg10_long: subset_diff(base, q, |x| x.long.then_some(x.metrics.ndcg10)),
                 d_chunk_recall5_intro: intro_diff(base, q, &intro),
+                d_reliable_first: subset_diff(base, q, |x| flag(x.metrics.reliable_first)),
+                d_cancelled5: subset_diff(base, q, |x| flag(x.metrics.cancelled5)),
                 vs_second: second.map(|si| {
                     let b = &results[si].0.queries;
                     SecondDiff {
@@ -402,6 +409,11 @@ fn subset_diff(
     (!a.is_empty()).then(|| paired_diff(&a, &b))
 }
 
+/// Флаг запроса как доля: `true` — 1, `false` — 0.
+fn flag(b: Option<bool>) -> Option<f64> {
+    b.map(|b| if b { 1.0 } else { 0.0 })
+}
+
 fn opt_diff(e: &Option<Estimate>) -> String {
     e.as_ref().map_or("—".into(), diff)
 }
@@ -469,6 +481,27 @@ pub fn grid_md(g: &GridResult) -> String {
                 "в пределах шума"
             }
         );
+    }
+    if g.configs.iter().any(|c| c.d_reliable_first.is_some()) {
+        s.push_str(
+            "\n## Метрики M3: надёжное выше гипотезы и отменённое\n\n\
+             | Конфигурация | reliable_first | Δ reliable_first | cancelled@5 | Δ cancelled@5 | Δ nDCG@10 | Δ recall@5 |\n\
+             |---|---|---|---|---|---|---|\n",
+        );
+        for c in &g.configs {
+            let o = &c.metrics.overall;
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {} | {} | {} |",
+                c.config.name,
+                o.reliable_first.as_ref().map_or("—".into(), est),
+                opt_diff(&c.d_reliable_first),
+                o.cancelled5.as_ref().map_or("—".into(), est),
+                opt_diff(&c.d_cancelled5),
+                diff(&c.d_ndcg10),
+                diff(&c.d_recall5),
+            );
+        }
     }
     if let Some(base) = g
         .configs
