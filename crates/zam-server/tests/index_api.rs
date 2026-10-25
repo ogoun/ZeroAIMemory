@@ -169,6 +169,7 @@ async fn status_without_models_and_queue_visibility() {
     assert_eq!(s["qdrant"]["state"], "off");
     assert_eq!(s["qdrant"]["points"], Value::Null);
     assert_eq!(s["qdrant"]["rss_bytes"], Value::Null);
+    assert_eq!(s["qdrant"]["wal_pending_ops"], Value::Null);
     assert_eq!(s["queue"]["queued"], 2);
     assert!(s["queue"]["oldest"].is_string());
     assert_eq!(s["failed_items"], json!([]));
@@ -409,6 +410,8 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
         s["qdrant"]["rss_bytes"].as_u64().unwrap() > 1_000_000,
         "{s}"
     );
+    // заметка записана: номер операции WAL известен, подтверждение — счётчик (0 или больше)
+    assert!(s["qdrant"]["wal_pending_ops"].as_u64().is_some(), "{s}");
 
     // сервер работает: каталог данных занят
     let out = zam_server(&["reindex", "--config", &conf_arg]);

@@ -124,7 +124,9 @@ pub const DEFAULT_FLUSH_INTERVAL_SEC: u64 = 5;
 /// Умолчание `qdrant.wal_capacity_mb` (Qdrant — 32 МБ).
 pub const DEFAULT_WAL_CAPACITY_MB: u64 = 32;
 /// Умолчание `qdrant.shutdown_flush_wait_ms`.
-pub const DEFAULT_SHUTDOWN_FLUSH_WAIT: Duration = Duration::from_millis(6000);
+/// 10 с: на HDD подтверждение после пачки приходило за 6,0–8,4 с (задача 19, ожидание до
+/// 15 с, 4 из 4), при пределе 6 с — 1 раз из 4; ожидание кончается с подтверждением.
+pub const DEFAULT_SHUTDOWN_FLUSH_WAIT: Duration = Duration::from_millis(10_000);
 
 /// Сколько ждать перед остановкой Qdrant, если последняя запись была `since_write` назад.
 ///

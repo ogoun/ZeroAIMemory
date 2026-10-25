@@ -24,6 +24,10 @@ use crate::manifest::{CudaManifest, Manifest, ModelsManifest, PLATFORMS};
 
 const TOKEN_PREFIX: &str = "ZeroAIMemoryToken=";
 const WAIT: Duration = Duration::from_secs(10);
+/// Unix: предел выхода сервера по SIGTERM — ожидание подтверждения WAL Qdrant
+/// (`qdrant.shutdown_flush_wait_ms`, до 10 с), SIGTERM Qdrant (до 10 с) и запас 10 с.
+#[cfg(unix)]
+const STOP_WAIT: Duration = Duration::from_secs(30);
 /// Предел готовности сервера при первой загрузке только что распакованного `zam-cuda`.
 const CUDA_FIRST_WAIT: Duration = Duration::from_secs(120);
 /// Предел для коротких вызовов (`zam status`, `qdrant --version`).
@@ -160,17 +164,26 @@ fn interesting(line: &str) -> bool {
 impl Server {
     /// Запускает `zam-server` из каталога `root` (комплект или target/release); stderr
     /// целиком (кроме строки с токеном) пишется в `log_file`.
-    pub(crate) fn start(root: &Path, data: &Path, env: &SmokeEnv, log_file: &Path) -> Result<Self> {
+    /// `own_group` (Windows) — своя группа процессов для Ctrl+Break ([`Self::stop_graceful`]);
+    /// Ctrl+C терминала до сервера тогда не доходит. Процесс в любом случае назначается в
+    /// Job Object xtask ([`crate::procjob`]): аварийный выход xtask не оставляет сирот.
+    pub(crate) fn start(
+        root: &Path,
+        data: &Path,
+        env: &SmokeEnv,
+        log_file: &Path,
+        own_group: bool,
+    ) -> Result<Self> {
         let mut cmd =
             Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")));
-        // Windows: своя группа процессов — ей можно послать Ctrl+Break (`stop_graceful`), и
-        // Ctrl+C терминала не роняет сервер раньше, чем его остановит обвязка
         #[cfg(windows)]
-        {
+        if own_group {
             use std::os::windows::process::CommandExt as _;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
+        #[cfg(not(windows))]
+        let _ = own_group;
         let mut child = scrub_zam_env(&mut cmd, &["ZAM_ADMIN_PASSWORD"])
             .args(["serve", "--data-dir"])
             .arg(data)
@@ -183,6 +196,7 @@ impl Server {
             .stderr(Stdio::piped())
             .spawn()
             .context("запуск zam-server")?;
+        crate::procjob::adopt(&child);
         let stderr = child.stderr.take().context("stderr сервера")?;
         let mut file =
             File::create(log_file).with_context(|| format!("создание {}", log_file.display()))?;
@@ -231,10 +245,13 @@ impl Server {
                 .status();
             let t0 = Instant::now();
             while self.child.try_wait()?.is_none() {
-                if t0.elapsed() > WAIT {
+                if t0.elapsed() > STOP_WAIT {
                     self.child.kill()?;
                     self.child.wait()?;
-                    bail!("сервер не завершился по SIGTERM за 10 с, убит принудительно");
+                    bail!(
+                        "сервер не завершился по SIGTERM за {} с, убит принудительно",
+                        STOP_WAIT.as_secs()
+                    );
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -709,7 +726,7 @@ pub fn run(
     let server_log = dir.join("zam-server.stderr.log");
     let mut srv = s.run(
         "запуск zam-server",
-        Server::start(&root, &data, &env, &server_log),
+        Server::start(&root, &data, &env, &server_log, false),
     )?;
     if cuda_archive.is_some() {
         // сервер отвечает на /health после загрузки модели, а с CUDA — после загрузки

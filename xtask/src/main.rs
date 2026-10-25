@@ -7,6 +7,7 @@ mod eval;
 mod fetch;
 mod manifest;
 mod package;
+mod procjob;
 mod smoke;
 
 use std::path::{Path, PathBuf};

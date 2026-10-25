@@ -59,10 +59,10 @@ use zam_markdown::ChunkLevel;
 use zam_store::{
     Db, Embedding, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, NodeKind,
     SpaceKind, StoreError, SystemStore, UserDbs, adopt_owned_embeddings, chunks_for_index,
-    claim_jobs, complete_job, enqueue_reindex, entry_chunks_for_index, fail_job, gc_embeddings,
-    get_embeddings, get_node, get_space, indexed_count, list_children, pending_reindex,
-    prune_owned_embeddings, put_embeddings, put_owned_embeddings, release_job, requeue_running,
-    set_auto_l0, set_folder_l0,
+    claim_jobs, complete_job, enqueue_reindex, entry_chunks_for_index, fail_job, folders_for_index,
+    gc_embeddings, get_embeddings, get_node, get_space, indexed_count, list_children,
+    pending_reindex, prune_owned_embeddings, put_embeddings, put_owned_embeddings, release_job,
+    requeue_running, set_auto_l0, set_folder_l0,
 };
 
 use crate::reindex::{GC_BATCH, ReindexCtx, ReindexReport, ReindexRequest, reindex};
@@ -267,6 +267,7 @@ impl WorkerHandle {
             skipped_dbs: HashSet::new(),
             pending_checked: HashSet::new(),
             scanned: false,
+            folders_checked: false,
             gc_due: HashMap::new(),
         };
         let task = tokio::spawn(w.run());
@@ -465,6 +466,8 @@ struct Worker {
     pending_checked: HashSet<Id>,
     /// Все базы открыты (проверены отметки) хотя бы раз после запуска.
     scanned: bool,
+    /// Точки папок сверены с L0 в SQLite после запуска ([`Worker::reconcile_folders`]).
+    folders_checked: bool,
     /// Следующая сборка мусора кэша базы.
     gc_due: HashMap<Id, Instant>,
 }
@@ -682,6 +685,24 @@ impl Worker {
                         retry_at = Some(Instant::now() + backoff);
                         backoff = (backoff * 2).min(self.cfg.retry_max);
                         continue;
+                    }
+                }
+            }
+            // 3a. Один раз за запуск: точки папок против L0 в SQLite (свёртка, прерванная
+            // остановкой, оставила бы устаревший вектор папки)
+            if !self.folders_checked {
+                match self.reconcile_folders().await {
+                    Ok(()) => self.folders_checked = true,
+                    Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
+                        ensured = false;
+                        self.vector_down(&e);
+                        retry_at = Some(Instant::now() + backoff);
+                        backoff = (backoff * 2).min(self.cfg.retry_max);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "сверка точек папок пропущена");
+                        self.folders_checked = true;
                     }
                 }
             }
@@ -1607,6 +1628,67 @@ impl Worker {
         }
     }
 
+    /// Сверка точек папок с L0 в SQLite (раз за запуск, задача 19 M3): очередь свёрток
+    /// живёт в памяти, и остановка посреди [`Self::rollup_folder`] (L0 уже записан, кэш
+    /// старого снят, точка ещё прежняя) или до неё оставляла бы в Qdrant устаревший вектор
+    /// папки (а `reindex` — «лишнюю» точку и промах кэша). Папке, у которой точки нет или её
+    /// `text_hash` не равен ключу L0 из SQLite, ставится свёртка; точка папки, которой нет
+    /// среди живых с L0, — тоже (свёртка удалённой или пустой папки удаляет точку), а точка
+    /// узла, которого нет в базе, удаляется сразу. Сравнение — по фактическому состоянию
+    /// Qdrant и SQLite, поэтому не зависит от того, в какой момент процесс был убит.
+    async fn reconcile_folders(&mut self) -> Result<(), IndexError> {
+        for user in self.users().await {
+            let Some(db) = self.open_db(user).await else {
+                continue;
+            };
+            let Some(points) = self.deps.vector.folder_hashes(user).await? else {
+                return Ok(());
+            };
+            let folders = match folders_for_index(&db, None).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(user = %user, error = %e, "папки для сверки точек");
+                    continue;
+                }
+            };
+            let want: HashMap<Id, String> = folders
+                .iter()
+                .map(|f| {
+                    (
+                        f.node_id,
+                        folder_embed(&f.space_name, &f.path, &f.name, &f.l0).1,
+                    )
+                })
+                .collect();
+            let have: HashMap<Id, String> = points.into_iter().collect();
+            let mut stale = 0usize;
+            for (id, key) in &want {
+                if have.get(id) != Some(key) {
+                    self.rollups.schedule(user, *id, self.cfg.rollup_debounce);
+                    stale += 1;
+                }
+            }
+            for id in have.keys().filter(|id| !want.contains_key(id)) {
+                stale += 1;
+                if get_node(&db, *id).await.is_ok() {
+                    self.rollups.schedule(user, *id, self.cfg.rollup_debounce);
+                } else {
+                    ok_or_vector(self.deps.vector.delete_node(user, *id).await)?;
+                }
+            }
+            if stale > 0 {
+                tracing::info!(
+                    user = %user,
+                    folders = stale,
+                    "точки папок расходятся с L0: свёртка заново"
+                );
+            }
+        }
+        let n = self.rollups.due.len();
+        self.status(|s| s.rollups_pending = n);
+        Ok(())
+    }
+
     /// Подсказки API (старый родитель перенесённого узла) — в очередь свёртки.
     async fn take_hints(&mut self) {
         let hints = std::mem::take(&mut *lock(&self.inner.hints));
@@ -1815,6 +1897,11 @@ pub fn embed_key(c: &IndexChunk) -> String {
 
 /// Текст эмбеддинга L0 папки и его ключ кэша (домен `folder`). Текст —
 /// [`zam_store::folder_embed_input`]: значения секретов в имени, пути и L0 замаскированы.
+/// Ключ кэша и `text_hash` точки папки для её L0 (как пишет воркер).
+pub fn folder_embed_key(space: &str, path: &str, name: &str, l0: &str) -> String {
+    folder_embed(space, path, name, l0).1
+}
+
 pub(crate) fn folder_embed(space: &str, path: &str, name: &str, l0: &str) -> (String, String) {
     let input = zam_store::folder_embed_input(space, path, name, l0);
     let key = keyed_hash("folder", &input);

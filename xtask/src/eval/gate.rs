@@ -364,6 +364,7 @@ fn eval_model(
         reranker: None,
         sets: run::parse_sets(&a.sets)?,
         keep_cuda_path: a.keep_cuda_path,
+        ctrl_break: false,
     };
     let t0 = Instant::now();
     // --reuse: прогон эталона (и fp16), уже проиндексированный в target/eval/gate-<модель>

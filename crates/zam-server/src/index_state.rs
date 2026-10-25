@@ -216,7 +216,9 @@ impl IndexRuntime {
             if let Some(Ok(sup)) = early {
                 tracing::info!("модель не загрузилась: Qdrant останавливается");
                 match Arc::try_unwrap(sup) {
-                    Ok(s) => s.shutdown().await,
+                    Ok(s) => {
+                        s.shutdown().await;
+                    }
                     // клонов здесь нет (супервизор ещё никому не отдан); если появятся — Drop
                     // последнего клона шлёт стоп, но без ожидания остановки процесса
                     Err(s) => {
@@ -390,7 +392,9 @@ impl IndexRuntime {
             .take();
         if let Some(sup) = sup {
             match Arc::try_unwrap(sup) {
-                Ok(s) => s.shutdown().await,
+                Ok(s) => {
+                    s.shutdown().await;
+                }
                 // клон ещё жив (например, задача воркера прервана): Drop супервизора шлёт стоп
                 Err(s) => {
                     tracing::warn!("супервизор Qdrant ещё используется: остановка без ожидания");

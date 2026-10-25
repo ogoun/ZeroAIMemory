@@ -11,9 +11,10 @@ WorkingDirectory=/opt/zeroaimemory
 ExecStart=/opt/zeroaimemory/zam-server serve --config /etc/zeroaimemory/config.toml
 Restart=on-failure
 RestartSec=3
-# Сервер корректно завершается по SIGTERM
+# Сервер корректно завершается по SIGTERM: воркер индексации (обычно < 1 с, пачка — до 60 с),
+# ожидание подтверждения WAL Qdrant (qdrant.shutdown_flush_wait_ms, до 10 с), SIGTERM Qdrant (до 10 с)
 KillSignal=SIGTERM
-TimeoutStopSec=20
+TimeoutStopSec=40
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

@@ -200,6 +200,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
                 reranker: None,
                 sets,
                 keep_cuda_path: a.keep_cuda_path,
+                ctrl_break: false,
             };
             let fresh = session.is_none();
             if let Some(s) = session.take() {

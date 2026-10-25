@@ -37,10 +37,10 @@ use qdrant_client::qdrant::{
     HnswConfigDiffBuilder, KeywordIndexParamsBuilder, Memory, NamedVectors,
     OptimizersConfigDiffBuilder, PayloadIncludeSelector, PointStruct, PrefetchQueryBuilder,
     QuantizationSearchParamsBuilder, Query, QueryPointsBuilder, RrfBuilder,
-    ScalarQuantizationBuilder, ScoredPoint, SearchParamsBuilder, SparseIndexConfigBuilder,
-    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpdateCollectionBuilder,
-    UpsertPointsBuilder, Value, Vector, VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
-    WalConfigDiffBuilder,
+    ScalarQuantizationBuilder, ScoredPoint, ScrollPointsBuilder, SearchParamsBuilder,
+    SparseIndexConfigBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
+    UpdateCollectionBuilder, UpsertPointsBuilder, Value, Vector, VectorInput, VectorParamsBuilder,
+    VectorsConfigBuilder, WalConfigDiffBuilder,
 };
 use qdrant_client::{Payload, Qdrant, QdrantError};
 use tonic::Code;
@@ -148,6 +148,11 @@ impl WriteMark {
         let mut s = self.state();
         s.at = Some(Instant::now());
         s.op = Some(s.op.map_or(op, |o| o.max(op)));
+    }
+
+    /// Забыть номер операции WAL (коллекция удалена, нумерация новой — с начала).
+    pub fn reset_ops(&self) {
+        self.state().op = None;
     }
 
     /// Сколько прошло с последней записи; `None` — записей не было.
@@ -358,10 +363,14 @@ impl QdrantIndex {
         if ty == FieldType::Keyword {
             req = req.field_index_params(KeywordIndexParamsBuilder::default().is_tenant(tenant));
         }
-        self.client
+        // операция над схемой тоже идёт через WAL: её номер — в отметку, иначе ожидание при
+        // остановке закончилось бы на последнем upsert, а индекс повторился бы при старте
+        let r = self
+            .client
             .create_field_index(req)
             .await
             .map_err(|e| map_err("create_field_index", e))?;
+        self.note_op(&r);
         Ok(())
     }
 
@@ -627,9 +636,55 @@ impl QdrantIndex {
                 .delete_collection(DeleteCollectionBuilder::new(COLLECTION))
                 .await
                 .map_err(|e| map_err("delete_collection", e))?;
+            // у новой коллекции нумерация WAL с начала: прежний максимум держал бы
+            // `wal_pending_ops` и ожидание при остановке на старом номере
+            self.writes.reset_ops();
             tracing::info!(collection = COLLECTION, "коллекция удалена");
         }
         Ok(())
+    }
+
+    async fn folder_hashes_impl(&self, user: Id) -> Result<Option<Vec<(Id, String)>>, IndexError> {
+        let filter = Filter::must([
+            kw("user_id", user.to_string()),
+            kw("level", LEVEL_FOLDER.to_string()),
+        ]);
+        let mut out = Vec::new();
+        let mut offset: Option<qdrant_client::qdrant::PointId> = None;
+        loop {
+            let mut req = ScrollPointsBuilder::new(COLLECTION)
+                .filter(filter.clone())
+                .limit(1000)
+                .with_payload(SelectorOptions::Include(PayloadIncludeSelector {
+                    fields: vec!["node_id".into(), "text_hash".into()],
+                }))
+                .with_vectors(false);
+            if let Some(o) = offset.take() {
+                req = req.offset(o);
+            }
+            let resp = self
+                .client
+                .scroll(req)
+                .await
+                .map_err(|e| map_err("scroll", e))?;
+            for p in resp.result {
+                let node = p
+                    .payload
+                    .get("node_id")
+                    .and_then(value_str)
+                    .and_then(|s| s.parse::<Id>().ok());
+                let hash = p.payload.get("text_hash").and_then(value_str);
+                if let (Some(n), Some(h)) = (node, hash) {
+                    out.push((n, h));
+                }
+            }
+            match resp.next_page_offset {
+                Some(o) => offset = Some(o),
+                None => break,
+            }
+        }
+        out.sort();
+        Ok(Some(out))
     }
 
     async fn health_impl(&self) -> Result<(), IndexError> {
@@ -687,6 +742,10 @@ impl VectorIndex for QdrantIndex {
 
     fn health(&self) -> IndexFuture<'_, ()> {
         Box::pin(self.health_impl())
+    }
+
+    fn folder_hashes(&self, user: Id) -> IndexFuture<'_, Option<Vec<(Id, String)>>> {
+        Box::pin(self.folder_hashes_impl(user))
     }
 }
 
@@ -937,6 +996,21 @@ mod tests {
             map_err("t", st(Code::InvalidArgument)),
             IndexError::Other(_)
         ));
+    }
+
+    #[test]
+    fn write_mark_keeps_max_op_and_resets() {
+        let m = WriteMark::default();
+        assert_eq!((m.last_op(), m.since_last()), (None, None));
+        m.record_op(5);
+        m.record_op(3);
+        assert_eq!(m.last_op(), Some(5));
+        // коллекция пересоздана: нумерация WAL с начала, время записи остаётся
+        m.reset_ops();
+        assert_eq!(m.last_op(), None);
+        assert!(m.since_last().is_some());
+        m.record_op(2);
+        assert_eq!(m.last_op(), Some(2));
     }
 
     #[test]

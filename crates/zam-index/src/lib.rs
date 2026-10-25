@@ -46,7 +46,7 @@ pub use vector::{
 };
 pub use worker::{
     PassageEmbedder, ReindexOutcome, SkippedDb, WorkerConfig, WorkerDeps, WorkerHandle,
-    WorkerStatus, embed_input, embed_input_of, embed_key, embed_key_of,
+    WorkerStatus, embed_input, embed_input_of, embed_key, embed_key_of, folder_embed_key,
 };
 
 /// Ошибки векторного индекса. Тексты без векторов, текста чанков и секретов.

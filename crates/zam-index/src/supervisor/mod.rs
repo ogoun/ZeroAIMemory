@@ -304,13 +304,17 @@ impl Supervisor {
     /// `TerminateProcess`; задача 19 M3). Подтверждение — `ack_index` файла `first-index`
     /// WAL коллекции не меньше последнего `operation_id` (опрос раз в 100 мс); файла нет —
     /// ожидание по времени ([`flush_wait`]). Не дольше `shutdown_flush_wait`.
-    pub async fn shutdown(mut self) {
+    ///
+    /// Итог — как прошло ожидание (`None` — не ждали: external, Qdrant не готов, предел 0
+    /// или записей не было).
+    pub async fn shutdown(mut self) -> Option<WalWait> {
+        let mut waited = None;
         if let (Some(t), Some(shared)) = (self.tuning, &self.shared)
             && matches!(*self.state.borrow(), QdrantState::Ready { .. })
             && !self.shutdown_flush_wait.is_zero()
         {
             let qdir = shared.qdir.clone();
-            wait_wal_ack(
+            waited = wait_wal_ack(
                 &qdir,
                 &self.writes,
                 t.flush_interval_sec,
@@ -324,7 +328,18 @@ impl Supervisor {
         if let Some(t) = self.thread.take() {
             let _ = tokio::task::spawn_blocking(move || t.join()).await;
         }
+        waited
     }
+}
+
+/// Ожидание подтверждения WAL при [`Supervisor::shutdown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalWait {
+    /// Сколько ждали.
+    pub waited: Duration,
+    /// `acked` — подтверждено; `timeout` — вышел предел; `time` — пауза по времени
+    /// (файла WAL или номера операции нет).
+    pub result: &'static str,
 }
 
 impl Drop for Supervisor {
@@ -355,10 +370,13 @@ pub fn wal_ack_index(qdir: &Path) -> Option<u64> {
 }
 
 /// Ожидание подтверждения WAL перед остановкой (см. [`Supervisor::shutdown`]).
-async fn wait_wal_ack(qdir: &Path, writes: &WriteMark, flush_interval_sec: u64, cap: Duration) {
-    let Some(since) = writes.since_last() else {
-        return;
-    };
+async fn wait_wal_ack(
+    qdir: &Path,
+    writes: &WriteMark,
+    flush_interval_sec: u64,
+    cap: Duration,
+) -> Option<WalWait> {
+    let since = writes.since_last()?;
     let t0 = Instant::now();
     // `acked` — WAL подтверждён; `timeout` — предел вышел раньше; `time` — файла WAL нет
     // (или ни одной записи точек): ожидание по времени
@@ -386,6 +404,7 @@ async fn wait_wal_ack(qdir: &Path, writes: &WriteMark, flush_interval_sec: u64, 
             "ожидание подтверждения WAL Qdrant перед остановкой"
         );
     }
+    Some(WalWait { waited, result })
 }
 
 /// Контекст потока супервизора.

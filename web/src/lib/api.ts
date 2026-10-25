@@ -445,6 +445,8 @@ export interface IndexStatus {
     rss_bytes: number | null;
     points: number | null;
     restarts: number;
+    /** Записей точек, не подтверждённых в WAL Qdrant (`null` — external, записей не было). */
+    wal_pending_ops: number | null;
     error: string | null;
   };
   queue: { queued: number; running: number; failed: number; oldest: string | null };

@@ -706,6 +706,7 @@ async fn write_batches(idx: &QdrantIndex, batches: u64) {
 /// Итог одного прогона [`shutdown_waits_for_flush_bounded`].
 struct FlushRun {
     took: Duration,
+    wait: Option<zam_index::supervisor::WalWait>,
     last_op: Option<u64>,
     ack: Option<u64>,
 }
@@ -732,10 +733,11 @@ async fn flush_run(name: &str, flush: u64, cap: Duration, write: bool, idle: Dur
     tokio::time::sleep(idle).await;
     let last_op = sup.write_mark().last_op();
     let t = Instant::now();
-    sup.shutdown().await;
+    let wait = sup.shutdown().await;
     let took = t.elapsed();
     FlushRun {
         took,
+        wait,
         last_op,
         ack: zam_index::supervisor::wal_ack_index(&dir.join("qdrant")),
     }
@@ -763,6 +765,12 @@ async fn shutdown_waits_for_flush_bounded() {
         full.ack
     );
     assert!(full.took < Duration::from_secs(29), "{:?}", full.took);
+    assert_eq!(
+        full.wait.map(|w| w.result),
+        Some("acked"),
+        "{:?}",
+        full.wait
+    );
     // интервал 5 с, предел 1 с: подтверждения не будет раньше первого сброса — ждёт предел
     let capped = flush_run(
         "flushwait-cap",
@@ -773,13 +781,22 @@ async fn shutdown_waits_for_flush_bounded() {
     )
     .await;
     assert!(
-        capped.took >= Duration::from_millis(900) && capped.took < Duration::from_millis(2500),
+        capped.took >= Duration::from_millis(900) && capped.took < Duration::from_secs(6),
         "{:?}",
         capped.took
     );
+    let w = capped.wait.expect("ожидание было");
+    assert_eq!(w.result, "timeout");
+    assert!(
+        w.waited >= Duration::from_secs(1) && w.waited < Duration::from_secs(2),
+        "{w:?}"
+    );
     // предел 0 — вариант выключен
     let off = flush_run("flushwait-off", 5, Duration::ZERO, true, Duration::ZERO).await;
-    assert!(off.took < Duration::from_millis(1500), "{:?}", off.took);
+    // верхние пределы — с запасом на остановку Qdrant по SIGTERM (Linux: начатый проход
+    // сброса доходит до конца); проверяется, что ожидания нет, а не скорость выхода
+    assert!(off.took < Duration::from_secs(5), "{:?}", off.took);
+    assert_eq!(off.wait, None, "при пределе 0 ожидания нет");
     // запись давно подтверждена — не ждёт
     let idle = flush_run(
         "flushwait-idle",
@@ -795,7 +812,13 @@ async fn shutdown_waits_for_flush_bounded() {
         idle.ack,
         idle.last_op
     );
-    assert!(idle.took < Duration::from_millis(1500), "{:?}", idle.took);
+    assert!(idle.took < Duration::from_secs(5), "{:?}", idle.took);
+    let w = idle.wait.expect("запись была — проверка подтверждения");
+    assert_eq!(w.result, "acked");
+    assert!(
+        w.waited < Duration::from_millis(200),
+        "подтверждённое не ждут: {w:?}"
+    );
     eprintln!(
         "FLUSH_WAIT full={:?} (op {op}, ack {:?}) capped={:?} off={:?} idle={:?}",
         full.took, full.ack, capped.took, off.took, idle.took

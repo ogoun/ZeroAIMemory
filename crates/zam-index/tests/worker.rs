@@ -13,12 +13,13 @@ use common::qdrant::TestQdrant;
 use zam_core::Id;
 use zam_index::{
     PassageEmbedder, QdrantIndex, ReindexRequest, VectorFilter, VectorIndex, WorkerConfig,
-    WorkerDeps, WorkerHandle, embed_key,
+    WorkerDeps, WorkerHandle, embed_key, folder_embed_key,
 };
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, Embedding, NewNote, NodePath, SpaceKind, SystemStore,
     UserDbs, chunks_for_index, create_note, delete_node, enqueue_reindex, get_embeddings, get_node,
-    job_stats, list_spaces, mark_reindex, move_node, pending_reindex, put_embeddings, update_note,
+    job_stats, list_spaces, mark_reindex, move_node, pending_reindex, prune_owned_embeddings,
+    put_embeddings, set_folder_l0, update_note,
 };
 
 const DIM: usize = 16;
@@ -1144,5 +1145,73 @@ async fn skipped_db_survives_restart_and_is_reindexed_after_restore() {
     .await;
     assert!(e.system.index_skipped().await.unwrap().is_empty());
     assert_eq!(w.embedded_texts(), 0);
+    w.shutdown().await;
+}
+
+/// Остановка посреди свёртки L0 папки (задача 19 M3, fix round 1): свёртка записала новый L0
+/// в SQLite и сняла эмбеддинг старого, а точку папки в Qdrant обновить не успела (очередь
+/// свёрток живёт в памяти). После старта воркер сверяет точки папок с L0 в SQLite и
+/// досворачивает расходящиеся: вектор папки соответствует её L0, `reindex` не находит
+/// ни лишних точек, ни промахов кэша папок.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_point_fresh_after_stop_mid_rollup() {
+    let e = env("rollup-stop").await;
+    let n = e.note(e.knowledge, "proj/a", NOTE).await;
+    let folder = get_node(&e.db, n).await.unwrap().parent_id.unwrap();
+    {
+        let w = e.spawn();
+        e.indexed(n).await;
+        e.quiet(&w).await;
+        e.until("точка папки", async || {
+            e.count(None, Some("proj"), &["folder"]).await == 1
+        })
+        .await;
+        w.shutdown().await;
+    }
+    let space = list_spaces(&e.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == e.knowledge)
+        .unwrap();
+    let old = get_node(&e.db, folder).await.unwrap();
+    let old_key = folder_embed_key(
+        &space.name,
+        &old.path,
+        &old.name,
+        old.l0.as_deref().unwrap(),
+    );
+    let before = e.vector.folder_hashes(e.user).await.unwrap().unwrap();
+    assert_eq!(before, vec![(folder, old_key.clone())]);
+    // состояние после остановки между `set_folder_l0` и upsert точки: новый L0, эмбеддинга
+    // старого нет, в Qdrant — точка старого L0
+    set_folder_l0(&e.db, folder, Some("a: устаревшая сводка папки"))
+        .await
+        .unwrap();
+    prune_owned_embeddings(&e.db, MODEL, folder, &[])
+        .await
+        .unwrap();
+
+    let w = e.spawn();
+    e.until(
+        "точка папки совпадает с L0 в SQLite",
+        async || {
+            let f = get_node(&e.db, folder).await.unwrap();
+            let want =
+                folder_embed_key(&space.name, &f.path, &f.name, f.l0.as_deref().unwrap_or(""));
+            e.vector.folder_hashes(e.user).await.unwrap().unwrap() == vec![(folder, want)]
+        },
+    )
+    .await;
+    e.quiet(&w).await;
+    let total = e.vector.count(&e.whole_base().await).await.unwrap();
+    let rep = e.reindex(&w, ReindexRequest::default()).await;
+    assert_eq!(rep.folder_misses, 0, "{rep:?}");
+    assert_eq!(rep.folders, 1);
+    assert_eq!(
+        e.vector.count(&e.whole_base().await).await.unwrap(),
+        total,
+        "reindex нашёл лишние точки"
+    );
     w.shutdown().await;
 }

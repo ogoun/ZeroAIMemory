@@ -1466,6 +1466,8 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         reranker: a.reranker.clone(),
         sets: parse_sets(&a.sets)?,
         keep_cuda_path: a.keep_cuda_path,
+        // Ctrl+Break для штатной остановки нужен только first-start
+        ctrl_break: a.scenario == Scenario::FirstStart,
     };
     let dir = paths.work.join(&spec.name);
     if a.reuse && !dir.join("data").is_dir() {

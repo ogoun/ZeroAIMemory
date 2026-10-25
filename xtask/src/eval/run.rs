@@ -77,6 +77,10 @@ pub struct RunSpec {
     /// Переопределения конфигурации (`search.w_fts`, `index.chunk_target_max`, …).
     pub sets: Vec<(String, String)>,
     pub keep_cuda_path: bool,
+    /// Windows: сервер в своей группе процессов — ему можно послать Ctrl+Break
+    /// ([`Session::stop_graceful`], `bench --scenario first-start`), но Ctrl+C терминала до
+    /// него тогда не доходит (зачистку при прерывании xtask даёт Job Object, `procjob`).
+    pub ctrl_break: bool,
 }
 
 /// `KEY=VALUE` → (`search.w_fts`, `0.8`).
@@ -317,7 +321,7 @@ impl Session {
         let env = server_env(p, spec, &dir)?;
         let base = format!("http://{}", env.addr);
         let log = dir.join("zam-server.stderr.log");
-        let mut srv = Server::start(server, &data, &env, &log)?;
+        let mut srv = Server::start(server, &data, &env, &log, spec.ctrl_break)?;
         wait_health_for(&mut srv, &base, HEALTH_WAIT)?;
         let server_config = server_config(&log)?;
         let token_file = dir.join(TOKEN_FILE);
@@ -1075,6 +1079,7 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
         reranker: a.reranker.clone(),
         sets: parse_sets(&a.sets)?,
         keep_cuda_path: a.keep_cuda_path,
+        ctrl_break: false,
     };
     let mut s = Session::start(p, &spec, &server, !a.reuse)?;
     s.check_model()?;

@@ -241,6 +241,14 @@ pub trait VectorIndex: Send + Sync {
 
     /// Проверка доступности и ключа (аутентифицированный запрос).
     fn health(&self) -> IndexFuture<'_, ()>;
+
+    /// Точки папок пользователя: `(node_id, text_hash)` по возрастанию id — сверка с L0
+    /// в SQLite при старте воркера (свёртка, прерванная остановкой). `None` — адаптер
+    /// не умеет перечислять точки (сверка пропускается).
+    fn folder_hashes(&self, user: Id) -> IndexFuture<'_, Option<Vec<(Id, String)>>> {
+        let _ = user;
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Проверка точек перед upsert (общая для адаптеров): Human никогда не попадает в индекс
