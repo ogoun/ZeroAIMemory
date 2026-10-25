@@ -283,12 +283,13 @@ impl Supervisor {
 
     /// Операций записи точек, ещё не подтверждённых Qdrant в WAL: последний `operation_id`
     /// клиентов [`Self::connect_index`] минус `ack_index`. Ненулевое значение — следующий
-    /// старт после жёсткой остановки повторит WAL (задача 19 M3). `None` — external, записей
-    /// не было или файла WAL нет.
+    /// старт после жёсткой остановки повторит WAL (задача 19 M3). Файла `first-index` ещё
+    /// нет — не подтверждено ничего. `None` — external, записей с номером не было или формат
+    /// файла не разобран.
     pub fn wal_pending(&self) -> Option<u64> {
         let shared = self.shared.as_ref()?;
         let op = self.writes.last_op()?;
-        Some(op.saturating_sub(wal_ack_index(&shared.qdir)?))
+        pending_of(op, wal_ack(&shared.qdir))
     }
 
     /// Отметка записей клиентов [`Self::connect_index`] (время и номер операции WAL).
@@ -351,10 +352,22 @@ impl Drop for Supervisor {
     }
 }
 
-/// Подтверждённая часть WAL коллекции: `ack_index` из
-/// `storage/collections/zam_chunks/0/wal/first-index` (Qdrant 1.19, `SerdeWal::ack` пишет
-/// туда `WalState`). Повтор WAL при старте начинается с этого номера.
-pub fn wal_ack_index(qdir: &Path) -> Option<u64> {
+/// Состояние подтверждённой части WAL коллекции.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalAck {
+    /// Файла `first-index` нет: Qdrant ещё ни разу не подтверждал WAL (новая коллекция до
+    /// первого прохода сброса) — не подтверждено ничего.
+    Missing,
+    /// `ack_index`: повтор WAL при старте начнётся с этого номера.
+    Index(u64),
+    /// Файл есть, но не читается или формат другой (другая версия Qdrant).
+    Unreadable,
+}
+
+/// Подтверждённая часть WAL коллекции по `storage/collections/zam_chunks/0/wal/first-index`
+/// (Qdrant 1.19: файл пишет только `SerdeWal::ack` — `WalState { ack_index }`, при создании
+/// коллекции его нет).
+pub fn wal_ack(qdir: &Path) -> WalAck {
     let f = qdir
         .join(stamp::STORAGE_DIR)
         .join("collections")
@@ -362,11 +375,33 @@ pub fn wal_ack_index(qdir: &Path) -> Option<u64> {
         .join("0")
         .join("wal")
         .join("first-index");
-    let text = std::fs::read_to_string(f).ok()?;
+    let text = match std::fs::read_to_string(f) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return WalAck::Missing,
+        Err(_) => return WalAck::Unreadable,
+    };
     serde_json::from_str::<serde_json::Value>(&text)
-        .ok()?
-        .get("ack_index")?
-        .as_u64()
+        .ok()
+        .and_then(|v| v.get("ack_index")?.as_u64())
+        .map_or(WalAck::Unreadable, WalAck::Index)
+}
+
+/// `ack_index`, если файл есть и разобран (см. [`wal_ack`]).
+pub fn wal_ack_index(qdir: &Path) -> Option<u64> {
+    match wal_ack(qdir) {
+        WalAck::Index(a) => Some(a),
+        WalAck::Missing | WalAck::Unreadable => None,
+    }
+}
+
+/// Неподтверждённых записей при последнем номере операции `op`: файла нет — все
+/// (номера WAL с 0, `op + 1`); формат не разобран — неизвестно.
+fn pending_of(op: u64, ack: WalAck) -> Option<u64> {
+    match ack {
+        WalAck::Index(a) => Some(op.saturating_sub(a)),
+        WalAck::Missing => Some(op.saturating_add(1)),
+        WalAck::Unreadable => None,
+    }
 }
 
 /// Ожидание подтверждения WAL перед остановкой (см. [`Supervisor::shutdown`]).
@@ -378,10 +413,11 @@ async fn wait_wal_ack(
 ) -> Option<WalWait> {
     let since = writes.since_last()?;
     let t0 = Instant::now();
-    // `acked` — WAL подтверждён; `timeout` — предел вышел раньше; `time` — файла WAL нет
-    // (или ни одной записи точек): ожидание по времени
-    let result = match (writes.last_op(), wal_ack_index(qdir)) {
-        (Some(op), Some(_)) => loop {
+    // `acked` — WAL подтверждён; `timeout` — предел вышел раньше; `time` — формат файла не
+    // разобран (или нет номера операции): ожидание по времени. Файла нет — подтверждений
+    // ещё не было: опрос до его появления с `ack_index ≥ op`
+    let result = match (writes.last_op(), wal_ack(qdir)) {
+        (Some(op), WalAck::Index(_) | WalAck::Missing) => loop {
             if wal_ack_index(qdir).is_some_and(|a| a >= op) {
                 break "acked";
             }
@@ -888,6 +924,14 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_counts_missing_file_as_nothing_acked() {
+        assert_eq!(pending_of(27, WalAck::Index(27)), Some(0));
+        assert_eq!(pending_of(27, WalAck::Index(20)), Some(7));
+        assert_eq!(pending_of(27, WalAck::Missing), Some(28));
+        assert_eq!(pending_of(27, WalAck::Unreadable), None);
+    }
 
     #[test]
     fn thread_panic_publishes_broken() {

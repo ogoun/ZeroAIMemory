@@ -824,3 +824,83 @@ async fn shutdown_waits_for_flush_bounded() {
         full.took, full.ack, capped.took, off.took, idle.took
     );
 }
+
+/// Файл `first-index` WAL коллекции (Qdrant 1.19).
+fn first_index(dir: &Path) -> PathBuf {
+    dir.join("qdrant")
+        .join("storage")
+        .join("collections")
+        .join(zam_index::COLLECTION)
+        .join("0")
+        .join("wal")
+        .join("first-index")
+}
+
+/// Коллекция создана и записана, первого прохода сброса ещё не было: `flush_interval_sec`
+/// = 3600 — первый проход сброса через час, файла `first-index` нет (его пишет только
+/// `SerdeWal::ack`) при любой скорости диска и нагрузке параллельных тестов (с 60 с при
+/// параллельном прогоне на HDD подтверждение успевало). Супервизор с пределом `cap`.
+async fn unacked(name: &str, cap: Duration) -> (PathBuf, Supervisor) {
+    let dir = data_dir(name);
+    let mut cfg = managed();
+    cfg.flush_interval_sec = 3600;
+    cfg.shutdown_flush_wait = cap;
+    let sup = Supervisor::start(SupervisorConfig::Managed(cfg), &dir)
+        .await
+        .unwrap();
+    let mut rx = sup.state();
+    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    let idx = sup.connect_index().unwrap();
+    idx.ensure(common::cases::MODEL, common::cases::DIM)
+        .await
+        .unwrap();
+    write_batches(&idx, 2).await;
+    (dir, sup)
+}
+
+/// Файла `first-index` нет — подтверждений ещё не было (задача 19, fix round 2): все записи
+/// не подтверждены, `wal_pending` — их число, ожидание при остановке опрашивает файл до
+/// предела (`timeout`), а не переходит на паузу по времени.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_first_index_means_nothing_acked() {
+    let (dir, sup) = unacked("noack", Duration::from_millis(1500)).await;
+    assert!(
+        !first_index(&dir).exists(),
+        "до первого прохода сброса файла нет"
+    );
+    assert_eq!(
+        zam_index::supervisor::wal_ack(&dir.join("qdrant")),
+        zam_index::supervisor::WalAck::Missing
+    );
+    let op = sup.write_mark().last_op().expect("номер операции");
+    assert_eq!(sup.wal_pending(), Some(op + 1));
+    let w = sup.shutdown().await.expect("ожидание было");
+    assert_eq!(w.result, "timeout", "{w:?}");
+    assert!(w.waited >= Duration::from_millis(1500), "{w:?}");
+}
+
+/// Файл `first-index` есть, но не разбирается (формат другой версии Qdrant): число
+/// неподтверждённых неизвестно (`None`), ожидание — пауза по времени (`time`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_first_index_falls_back_to_time() {
+    let (dir, sup) = unacked("badack", Duration::from_millis(1500)).await;
+    let f = first_index(&dir);
+    std::fs::write(&f, "не JSON").unwrap();
+    assert_eq!(
+        zam_index::supervisor::wal_ack(&dir.join("qdrant")),
+        zam_index::supervisor::WalAck::Unreadable
+    );
+    assert_eq!(sup.wal_pending(), None);
+    let w = sup.shutdown().await.expect("ожидание было");
+    assert_eq!(w.result, "time", "{w:?}");
+    // пауза — `2 · 3600 + 1` с, урезанная пределом
+    assert!(
+        w.waited >= Duration::from_millis(1400) && w.waited < Duration::from_secs(3),
+        "{w:?}"
+    );
+    std::fs::write(&f, "{\"ack_index\":7}").unwrap();
+    assert_eq!(
+        zam_index::supervisor::wal_ack(&dir.join("qdrant")),
+        zam_index::supervisor::WalAck::Index(7)
+    );
+}
