@@ -161,7 +161,9 @@ async fn gc_removes_orphans_and_prune_keeps_current_set() {
     put_owned_embeddings(&db, m, gone, vec![("l0g".into(), sample(3.0))])
         .await
         .unwrap();
-    delete_node(&db, gone).await.unwrap();
+    delete_node(&db, gone, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
 
     let count = || {
         let db = db.clone();

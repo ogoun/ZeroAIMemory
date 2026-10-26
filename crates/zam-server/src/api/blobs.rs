@@ -1,13 +1,16 @@
 //! Вложения (§6.5, §12): `POST /blobs` и `GET /blobs/{sha256}/{filename}`.
 //!
 //! **Загрузка.** Multipart: сначала поле `node` (id живой заметки), затем `file`
-//! с именем файла. Доступ — как запись в пространство узла. Файл пишется потоком
+//! с именем файла. Доступ — как запись в пространство узла; файл ложится в каталог блобов
+//! владельца базы узла (узел общего решения — к владельцу решения, §11.6). Файл пишется потоком
 //! (`BlobStore::put`), в памяти целиком не держится; больше
 //! `limits.blob_max_bytes` → 413. MIME — `mime_guess` по имени, иначе тип части,
 //! иначе `application/octet-stream`. Ответ 201 `{sha256, link, mime, size}`.
 //!
 //! **Отдача.** Пара (sha256, имя) должна быть привязана к узлу, который принципал
-//! может читать (по токену — не в Human), иначе 404. `?user=` выбирает пользователя
+//! может читать (по токену — не в Human), иначе 404: сначала личная база, затем базы
+//! владельцев чужих решений — только узлы пространства решения (отозванный или
+//! неодобренный доступ — 403 `solution-access`). `?user=` выбирает пользователя
 //! только для администратора (браузер не ставит `X-Zam-User` в `<img src>`);
 //! для токена игнорируется, как и `X-Zam-User`. Файл отдаёт `ServeFile`
 //! (`Range`/206, `If-Modified-Since`); `ETag` — `"<sha256>"` (содержимое неизменно),
@@ -28,11 +31,12 @@ use serde_json::{Value, json};
 use tokio_util::io::StreamReader;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
+use zam_core::Id;
 use zam_store::blobs::{check_filename, is_sha256};
-use zam_store::{BlobStore, NodeKind, StoreError, attach, blob_meta};
+use zam_store::{BlobStore, NodeKind, StoreError, attach, blob_meta, blob_meta_in_space};
 
 use super::query;
-use super::scope::{Mode, live, node_scope, user_db};
+use super::scope::{Mode, foreign_solutions, live, node_scope, owner_db, skip_foreign, user_db};
 use crate::app::AppState;
 use crate::auth::{Principal, USER_HEADER};
 use crate::error::ApiError;
@@ -151,6 +155,17 @@ pub async fn upload(
             "вложение привязывается только к заметке".into(),
         ));
     }
+    // вложение — изменение заметки: к заметке axiom его добавляет только человек (§7.5);
+    // проверка до приёма файла (окончательная — в транзакции привязки)
+    let author = crate::attrib::attribution(&p, &headers, None)?.author_kind;
+    zam_store::check_certainty(
+        author,
+        sc.node.certainty,
+        &zam_store::CertaintyChange::ModifyOther,
+        None,
+        None,
+    )
+    .map_err(zam_store::StoreError::from)?;
     let f = next_field(&mut mp)
         .await?
         .ok_or_else(|| ApiError::BadRequest("нет поля file".into()))?;
@@ -166,14 +181,14 @@ pub async fn upload(
     check_filename(&filename)?;
     let mime = pick_mime(&filename, f.content_type());
     let limit = st.cfg.limits.blob_max_bytes as u64;
-    let store = BlobStore::new(&st.data_dir.blobs_dir(), sc.user.id);
+    let store = BlobStore::new(&st.data_dir.blobs_dir(), sc.owner);
     let reader = StreamReader::new(f.map_err(stream_err));
     let (sha, size) = store
         .put(reader, limit)
         .await
         .map_err(|e| put_err(e, limit))?;
-    let link = attach(&sc.db, sc.node.id, &sha, size, &filename, &mime).await?;
-    st.render_gen.bump_user(sc.user.id);
+    let link = attach(&sc.db, sc.node.id, &sha, size, &filename, &mime, author).await?;
+    st.render_gen.bump_user(sc.owner);
     tracing::info!(node = %sc.node.id, sha256 = %sha, size, "вложение загружено");
     Ok((
         StatusCode::CREATED,
@@ -263,6 +278,36 @@ const FORWARDED: [header::HeaderName; 4] = [
     header::IF_UNMODIFIED_SINCE,
 ];
 
+/// Владелец базы с привязкой пары (sha256, имя) и её MIME: личная база, затем базы
+/// владельцев чужих решений в пределах пространства решения.
+async fn locate_blob(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    sha: &str,
+    filename: &str,
+) -> Result<(Id, String), ApiError> {
+    let admin = matches!(p, Principal::Admin { .. });
+    let (user, db) = user_db(st, p, headers).await?;
+    if let Some((mime, _)) = blob_meta(&db, sha, filename, admin).await? {
+        return Ok((user.id, mime));
+    }
+    for (info, role) in foreign_solutions(st, p, &user).await? {
+        let Some(odb) = owner_db(st, &info).await else {
+            continue;
+        };
+        match blob_meta_in_space(&odb, sha, filename, info.space_id).await {
+            Ok(Some((mime, _))) => {
+                role?;
+                return Ok((info.owner_id, mime));
+            }
+            Ok(None) => {}
+            Err(e) => skip_foreign(&info, &e),
+        }
+    }
+    Err(ApiError::NotFound)
+}
+
 /// `GET /blobs/{sha256}/{filename}[?user=]`.
 pub async fn download(
     State(st): State<AppState>,
@@ -284,11 +329,8 @@ pub async fn download(
             .map_err(|_| ApiError::BadRequest("некорректный user".into()))?;
         headers.insert(USER_HEADER, v);
     }
-    let (user, db) = user_db(&st, &p, &headers).await?;
-    let (mime, _size) = blob_meta(&db, &sha, &filename, admin)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let path = BlobStore::new(&st.data_dir.blobs_dir(), user.id).path_of(&sha);
+    let (owner, mime) = locate_blob(&st, &p, &headers, &sha, &filename).await?;
+    let path = BlobStore::new(&st.data_dir.blobs_dir(), owner).path_of(&sha);
     if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
         tracing::warn!(sha256 = %sha, "файл блоба отсутствует при записи в attachments");
         return Err(ApiError::NotFound);

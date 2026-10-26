@@ -35,6 +35,14 @@ pub struct Frontmatter {
     pub description: Option<String>,
     pub l0: Option<String>,
     pub index: Option<bool>,
+    /// Эпистемический статус (§7.5): `axiom` | `theorem` | `hypothesis` как в исходнике
+    /// (проверку значения делает хранилище); без поля — статуса нет.
+    pub certainty: Option<String>,
+    /// Доказательство для `theorem` — свободный текст (скаляр или блок `|`).
+    pub evidence: Option<String>,
+    /// Связи графа (§8.5): строки `"<тип>: <цель>"` из списка `relations:` (flow или block)
+    /// как в исходнике; тип и цель разбирает хранилище (`zam_store::links`).
+    pub relations: Vec<String>,
 }
 
 /// Заголовок верхнего уровня.

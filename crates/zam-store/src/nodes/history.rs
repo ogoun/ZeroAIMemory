@@ -25,6 +25,9 @@ pub struct RevisionInfo {
     pub session_id: Option<String>,
     pub machine: Option<String>,
     pub message: Option<String>,
+    /// Пользователь-автор (пользователь токена записи); `None` — запись без токена
+    /// (администратор, система) и ревизии до M3.
+    pub user_id: Option<Id>,
     #[serde(serialize_with = "crate::time::ser_ts")]
     pub ts: Timestamp,
 }
@@ -38,7 +41,7 @@ pub async fn list_revisions(db: &Db, id: Id) -> Result<Vec<RevisionInfo>, StoreE
             .ok_or(StoreError::NotFound)?;
         let mut st = c.prepare(
             "SELECT rev, content_hash, size, author_kind, token_id, session_id, machine,
-                    message, ts
+                    message, ts, user_id
              FROM revisions WHERE node_id = ?1 ORDER BY rev DESC",
         )?;
         let rows = st.query_map([id], |r| {
@@ -52,6 +55,7 @@ pub async fn list_revisions(db: &Db, id: Id) -> Result<Vec<RevisionInfo>, StoreE
                 machine: r.get(6)?,
                 message: r.get(7)?,
                 ts: ts_at(r, 8)?,
+                user_id: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

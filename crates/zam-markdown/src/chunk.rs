@@ -16,11 +16,19 @@
 //!    с разделителем, маркер callout) повторяется в начале каждой следующей
 //!    части. Абзац длиннее `target_max` режется по предложениям. Последний
 //!    уровень дробления — слова, затем символы: `hard_max` соблюдается всегда.
-//! 4. Единицы жадно упаковываются в листы `target_min..=target_max`; лист,
-//!    не добравший `target_min`, может вырасти до `hard_max`.
+//! 4. Единицы упаковываются в листы `target_min..=target_max`; лист, не добравший
+//!    `target_min`, может вырасти до `hard_max`. При `boundary_lambda = 0` — жадно (M2), при
+//!    `boundary_lambda > 0` — динамическим программированием с учётом силы границы перед
+//!    каждой единицей ([`boundary_strength`], `crate::boundary`), по флагу `cohesion` — с
+//!    лексической связностью прозы. В обоих режимах лист не кончается заголовком (H4–H6 или
+//!    строкой H1–H3 склеенной секции) и абзацем на «:» — разрез после них запрещён, пока
+//!    следующая единица умещается в `hard_max` (задача 17 M3).
 //! 5. Перекрытие: следующий лист той же группы начинается с последних
 //!    `overlap_sentences` предложений предыдущего, если тот кончается абзацем.
 //!    Перекрытие расширяет `range.start` назад, поэтому `src[range] == text`.
+//!
+//! 6. Путь заголовков листа — путь группы (H1–H3) и, при `heading_path_h4`, действующие
+//!    в начале листа заголовки H4–H6 (`H1 > H2 > H3 > H4`); секции по-прежнему по H1–H3.
 //!
 //! Инвариант листа: `text == src[range]` либо `text == заголовок блока + src[range]`,
 //! где заголовок — целые строки исходника (с переводами строк документа).
@@ -32,6 +40,7 @@ use comrak::nodes::{AstNode, NodeValue};
 use comrak::{Arena, parse_document};
 use serde::Serialize;
 
+use crate::boundary::{self, Budget, Cand, FORBIDDEN};
 use crate::doc::Doc;
 use crate::levels::{L1_MAX_TOKENS, NOTE_L1_MAX_CHARS, fit_items, l1_items, own_ranges};
 use crate::options::comrak_options;
@@ -45,6 +54,10 @@ pub trait TokenCounter: Send + Sync {
     fn count(&self, text: &str) -> usize;
     /// `true` — точный подсчёт токенизатором модели, `false` — оценка.
     fn is_exact(&self) -> bool;
+    /// Идентификатор токенизатора для отпечатка нарезки: у счётчиков, считающих одинаково,
+    /// он совпадает, у разных — различается (например, хэш `tokenizer.json`). Смена
+    /// идентификатора при точном счётчике перенарезает базу.
+    fn tokenizer_id(&self) -> String;
 }
 
 /// Оценка без токенизатора: `ceil(символы / 3,5)` (исследование 05 §10).
@@ -60,10 +73,14 @@ impl TokenCounter for ApproxCounter {
     fn is_exact(&self) -> bool {
         false
     }
+
+    fn tokenizer_id(&self) -> String {
+        "approx".into()
+    }
 }
 
 /// Пороги чанкера (§8.2); значения по умолчанию подбираются на eval (§18.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChunkParams {
     /// Нижняя граница размера листа, токенов.
     pub target_min: usize,
@@ -75,6 +92,15 @@ pub struct ChunkParams {
     pub merge_below: usize,
     /// Предложений перекрытия между соседними листами секции.
     pub overlap_sentences: usize,
+    /// Вес силы границы λ при выборе разреза (задача 17 M3): 0 — жадная упаковка M2
+    /// (с исправлениями висячего заголовка и вводной фразы), больше 0 — динамическое
+    /// программирование по кандидатам разреза.
+    pub boundary_lambda: f64,
+    /// Лексическая связность соседних окон прозы (основы слов) добавляется к силе границы
+    /// при λ > 0.
+    pub cohesion: bool,
+    /// H4–H6 входят в `heading_path` листа (`H1 > H2 > H3 > H4`); `false` — путь M2 по H1–H3.
+    pub heading_path_h4: bool,
 }
 
 impl Default for ChunkParams {
@@ -85,19 +111,29 @@ impl Default for ChunkParams {
             hard_max: 800,
             merge_below: 100,
             overlap_sentences: 1,
+            boundary_lambda: 0.0,
+            cohesion: false,
+            heading_path_h4: true,
         }
     }
 }
 
 impl ChunkParams {
-    /// Согласованные пороги: `1 ≤ target_max ≤ hard_max`, `target_min ≤ target_max`.
+    /// Согласованные пороги: `1 ≤ target_max ≤ hard_max`, `target_min ≤ target_max`,
+    /// `boundary_lambda` — конечное неотрицательное (иначе 0).
     fn normalized(&self) -> Self {
         let hard_max = self.hard_max.max(1);
         let target_max = self.target_max.clamp(1, hard_max);
+        let lambda = self.boundary_lambda;
         Self {
             target_min: self.target_min.min(target_max),
             target_max,
             hard_max,
+            boundary_lambda: if lambda.is_finite() && lambda > 0.0 {
+                lambda
+            } else {
+                0.0
+            },
             ..*self
         }
     }
@@ -160,7 +196,14 @@ pub fn chunk_note(src: &str, doc: &Doc, p: &ChunkParams, tc: &dyn TokenCounter) 
         let units = ch.units(g.range.clone(), &blocks);
         let mut group = ch.pack(&units);
         ch.add_overlap(&mut group);
-        leaves.extend(group.into_iter().map(|l| (g.path.clone(), l)));
+        leaves.extend(group.into_iter().map(|l| {
+            let path = if ch.p.heading_path_h4 {
+                deep_path(src, doc, &g.path, l.core_start, l.end)
+            } else {
+                g.path.clone()
+            };
+            (path, l)
+        }));
     }
     if leaves.is_empty() {
         return Vec::new();
@@ -232,11 +275,114 @@ fn level_draft(
     }
 }
 
+/// Абзац кончается на «:» — вводная фраза к следующему блоку. Завершающая разметка
+/// выделения (`**Пример:**`, `__…:__`, `*…:*`, `_…:_`, HTML `<b>`, `<strong>`, `<i>`, `<em>`)
+/// снимается перед проверкой. Inline-код на «:» (`` `std::` ``, `` `http:` ``) — не вводная
+/// фраза: обратная кавычка не снимается.
+fn ends_with_colon(text: &str) -> bool {
+    const CLOSE: [&str; 4] = ["</b>", "</strong>", "</i>", "</em>"];
+    let mut t = text.trim_end();
+    loop {
+        let before = t.len();
+        t = t.trim_end_matches(['*', '_']).trim_end();
+        for tag in CLOSE {
+            if let Some(head) = t
+                .len()
+                .checked_sub(tag.len())
+                .filter(|&i| t.is_char_boundary(i) && t[i..].eq_ignore_ascii_case(tag))
+                .map(|i| &t[..i])
+            {
+                t = head.trim_end();
+            }
+        }
+        if t.len() == before {
+            break;
+        }
+    }
+    t.ends_with(':')
+}
+
+/// Путь заголовков листа: путь группы и заголовки H4–H6, действующие в начале собственного
+/// текста листа (`core_start`, первый непробельный символ). Строка H1–H3 сбрасывает H4–H6;
+/// H5 после H4 вкладывается, следующий H4 замещает предыдущий.
+fn deep_path(src: &str, doc: &Doc, group: &str, core_start: usize, end: usize) -> String {
+    let lead = src
+        .get(core_start..end)
+        .map_or(0, |s| s.len() - s.trim_start().len());
+    let pos = core_start + lead;
+    let mut stack: Vec<(u8, &str)> = Vec::new();
+    for h in doc.headings.iter().take_while(|h| h.range.start <= pos) {
+        if h.level <= 3 {
+            stack.clear();
+            continue;
+        }
+        while stack.last().is_some_and(|&(l, _)| l >= h.level) {
+            stack.pop();
+        }
+        stack.push((h.level, h.text.as_str()));
+    }
+    let mut path = group.to_string();
+    for (_, t) in stack.iter().filter(|(_, t)| !t.trim().is_empty()) {
+        if !path.is_empty() {
+            path.push_str(" > ");
+        }
+        path.push_str(t.trim());
+    }
+    path
+}
+
+/// Вид блока, которому принадлежит единица упаковки (для силы границы).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnitKind {
+    /// Абзац.
+    Prose,
+    /// Заголовок любого уровня (H4–H6 внутри секции или строка H1–H3 склеенной секции).
+    Heading,
+    /// Тематический разрыв `---`.
+    Break,
+    /// Код, таблица, список, цитата, callout.
+    Structure,
+    /// Прочее (HTML, начало группы до первого блока).
+    Other,
+}
+
+/// С чего начинается единица относительно своего блока.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnitStart {
+    /// С начала блока: граница между блоками.
+    Block,
+    /// С элемента разрезанного блока (пункт списка, дочерний блок цитаты).
+    Element,
+    /// С предложения разрезанного абзаца.
+    Sentence,
+    /// Со строки, слова или символа (фолбэк дробления).
+    Fragment,
+}
+
+/// Сила границы перед единицей `next` (`prev` — предыдущая единица группы, задача 17 M3):
+/// - перед заголовком и `---` — 4;
+/// - между блоками (абзацы, код, таблица, список, цитата) — 2;
+/// - между предложениями абзаца и элементами разрезанного блока — 1;
+/// - внутри строки, слова или предложения (фолбэк дробления) — 0;
+/// - после заголовка или после абзаца на «:» — [`FORBIDDEN`] (−5, разрез запрещён).
+pub(crate) fn boundary_strength(prev: &Unit, next: &Unit) -> i32 {
+    match next.start {
+        UnitStart::Block if prev.kind == UnitKind::Heading || prev.colon_end => FORBIDDEN,
+        UnitStart::Block => match next.kind {
+            UnitKind::Heading | UnitKind::Break => 4,
+            _ => 2,
+        },
+        UnitStart::Element | UnitStart::Sentence => 1,
+        UnitStart::Fragment => 0,
+    }
+}
+
 /// Блок верхнего уровня по AST.
 #[derive(Debug)]
 struct Block {
     /// Начало первой строки блока.
     start: usize,
+    kind: UnitKind,
     /// Абзац: режется по предложениям, даёт перекрытие.
     prose: bool,
     /// Конец заголовка блока (повторяется в частях), если он есть.
@@ -267,13 +413,20 @@ fn top_blocks<'a>(
         }
         let mut b = Block {
             start,
+            kind: UnitKind::Structure,
             prose: false,
             header_end: None,
             elems: Vec::new(),
         };
         match &data.value {
             NodeValue::FrontMatter(_) => continue,
-            NodeValue::Paragraph => b.prose = true,
+            NodeValue::Paragraph => {
+                b.prose = true;
+                b.kind = UnitKind::Prose;
+            }
+            NodeValue::Heading(_) => b.kind = UnitKind::Heading,
+            NodeValue::ThematicBreak => b.kind = UnitKind::Break,
+            NodeValue::HtmlBlock(_) => b.kind = UnitKind::Other,
             NodeValue::CodeBlock(cb) if cb.fenced => b.header_end = Some(li.line_end(line)),
             // шапка и строка-разделитель
             NodeValue::Table(_) => b.header_end = Some(li.line_end(line + 1)),
@@ -327,13 +480,17 @@ struct Leaf {
 
 /// Единица упаковки: непрерывный кусок исходника, единицы группы идут встык.
 #[derive(Debug)]
-struct Unit {
+pub(crate) struct Unit {
     range: Range<usize>,
     tokens: usize,
     /// Заголовок блока, если лист начнётся с этой единицы.
     header: Option<Range<usize>>,
     /// Начало абзаца, если единица — абзац или его предложения.
     para: Option<usize>,
+    kind: UnitKind,
+    start: UnitStart,
+    /// Последняя часть абзаца, который кончается на «:» (вводная фраза к следующему блоку).
+    colon_end: bool,
 }
 
 /// Уровни дробления единицы, превышающей бюджет.
@@ -454,12 +611,65 @@ impl Chunker<'_> {
             let end = bounds.get(k + 1).map_or(r.end, |n| n.0);
             self.atom_units(start..end, block, &mut out);
         }
+        self.split_long_intros(out)
+    }
+
+    /// Вводная фраза на «:», которая вместе с первой частью следующего блока не умещается
+    /// в `hard_max`: целый абзац дробится по предложениям, чтобы к блоку ушло хотя бы
+    /// последнее предложение (иначе разрез на запрещённой границе неизбежен).
+    fn split_long_intros(&self, units: Vec<Unit>) -> Vec<Unit> {
+        let needs = |k: usize| {
+            let (u, next) = (&units[k], units.get(k + 1));
+            u.colon_end
+                && u.start == UnitStart::Block
+                && next.is_some_and(|n| {
+                    n.start == UnitStart::Block && u.tokens + n.tokens > self.p.hard_max
+                })
+        };
+        if !(0..units.len()).any(needs) {
+            return units;
+        }
+        let split: Vec<bool> = (0..units.len()).map(needs).collect();
+        let mut out = Vec::with_capacity(units.len() + 8);
+        for (u, split) in units.into_iter().zip(split) {
+            if split {
+                let first = out.len();
+                self.prose_pieces(u.range.clone(), u.kind, &mut out);
+                mark_block(&mut out[first..], true);
+            } else {
+                out.push(u);
+            }
+        }
         out
+    }
+
+    /// Абзац по предложениям (предложение длиннее `hard_max` — по словам и символам).
+    fn prose_pieces(&self, r: Range<usize>, kind: UnitKind, out: &mut Vec<Unit>) {
+        for t in self.split_by(r.clone(), Gran::Sentences) {
+            let mut pieces = Vec::new();
+            self.refine(t, PROSE_STEPS, None, &mut pieces);
+            out.extend(pieces.into_iter().enumerate().map(|(k, p)| Unit {
+                tokens: self.count(p.clone()),
+                range: p,
+                header: None,
+                para: Some(r.start),
+                kind,
+                start: if k == 0 {
+                    UnitStart::Sentence
+                } else {
+                    UnitStart::Fragment
+                },
+                colon_end: false,
+            }));
+        }
     }
 
     fn atom_units(&self, r: Range<usize>, block: Option<&Block>, out: &mut Vec<Unit>) {
         let tokens = self.count(r.clone());
         let prose = block.is_some_and(|b| b.prose);
+        let kind = block.map_or(UnitKind::Other, |b| b.kind);
+        let colon = prose && ends_with_colon(&self.src[r.clone()]);
+        let first = out.len();
         let fits = if prose {
             tokens <= self.p.target_max
         } else {
@@ -471,20 +681,15 @@ impl Chunker<'_> {
                 tokens,
                 header: None,
                 para: prose.then_some(r.start),
+                kind,
+                start: UnitStart::Block,
+                colon_end: colon,
             });
             return;
         }
         if prose {
-            for t in self.split_by(r.clone(), Gran::Sentences) {
-                let mut pieces = Vec::new();
-                self.refine(t, PROSE_STEPS, None, &mut pieces);
-                out.extend(pieces.into_iter().map(|p| Unit {
-                    tokens: self.count(p.clone()),
-                    range: p,
-                    header: None,
-                    para: Some(r.start),
-                }));
-            }
+            self.prose_pieces(r, kind, out);
+            mark_block(&mut out[first..], colon);
             return;
         }
 
@@ -495,15 +700,26 @@ impl Chunker<'_> {
             .map(|h| r.start..h)
             .filter(|h| 2 * self.count(h.clone()) <= self.p.hard_max);
         let body_start = header.as_ref().map_or(r.start, |h| h.end);
+        let mut starts_of: Vec<UnitStart> = Vec::new();
         let elems = block.map_or(&[][..], |b| &b.elems[..]);
         let elem_tiles = if elems.is_empty() {
             line_tiles(self.src, body_start..r.end)
         } else {
             tiles(body_start..r.end, elems.iter().copied())
         };
+        let elem_start = if elems.is_empty() {
+            UnitStart::Fragment
+        } else {
+            UnitStart::Element
+        };
         let mut pieces = Vec::new();
         for t in elem_tiles {
+            let at = pieces.len();
             self.refine(t, BLOCK_STEPS, header.as_ref(), &mut pieces);
+            starts_of.resize(pieces.len(), UnitStart::Fragment);
+            if let Some(s) = starts_of.get_mut(at) {
+                *s = elem_start;
+            }
         }
         for (k, p) in pieces.into_iter().enumerate() {
             // первая часть начинается с самого заголовка — без повтора
@@ -516,8 +732,12 @@ impl Chunker<'_> {
                 range,
                 header: head,
                 para: None,
+                kind,
+                start: starts_of[k],
+                colon_end: false,
             });
         }
+        mark_block(&mut out[first..], false);
     }
 
     /// Дробит `r`, пока `header + src[r]` не уложится в `hard_max`; части идут встык.
@@ -579,52 +799,26 @@ impl Chunker<'_> {
         }
     }
 
-    /// Жадная упаковка единиц группы в листы.
+    /// Упаковка единиц группы в листы.
     ///
     /// Балансировка: цель листа — `ceil(T / ceil(T / target_max))` в пределах
     /// `target_min..=target_max`, где `T` — сумма группы. Так 620 токенов дают
-    /// два листа около 310, а не 500 и короткий хвост в 120.
+    /// два листа около 310, а не 500 и короткий хвост в 120. При `boundary_lambda = 0` —
+    /// жадно ([`Self::pack_greedy`]), иначе — DP по силе границ ([`Self::pack_dp`]).
     fn pack(&self, units: &[Unit]) -> Vec<Leaf> {
         let p = &self.p;
         let total: usize = units.iter().map(|u| u.tokens).sum();
         let parts = total.div_ceil(p.target_max).max(1);
         let goal = total.div_ceil(parts).clamp(p.target_min, p.target_max);
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < units.len() {
-            // лист не начинается с пробельной единицы: её заголовок (хвост
-            // разрезанного блока) после обрезки достался бы следующему блоку
-            if self.src[units[i].range.clone()].trim().is_empty() {
-                i += 1;
-                continue;
-            }
-            let header = units[i].header.clone();
-            let mut est = header.as_ref().map_or(0, |h| self.count(h.clone())) + units[i].tokens;
-            let mut j = i + 1;
-            while let Some(u) = units.get(j) {
-                let next = est + u.tokens;
-                // лист закрывается, если единица перешагнула бы цель больше чем наполовину
-                let full = next > p.target_max || est + u.tokens / 2 > goal;
-                if next > p.hard_max || (est >= p.target_min && full) {
-                    break;
-                }
-                est = next;
-                j += 1;
-            }
-            // оценка — сумма по единицам; точный подсчёт может снять хвост
-            while j > i + 1 {
-                let text =
-                    self.leaf_text(header.clone(), units[i].range.start, units[j - 1].range.end);
-                if self.tc.count(&text) <= self.p.hard_max {
-                    break;
-                }
-                j -= 1;
-            }
-            if let Some(leaf) = self.make_leaf(header, &units[i..j]) {
-                out.push(leaf);
-            }
-            i = j;
-        }
+        let ranges = if p.boundary_lambda > 0.0 {
+            self.pack_dp(units, goal)
+        } else {
+            self.pack_greedy(units, goal)
+        };
+        let mut out: Vec<Leaf> = ranges
+            .into_iter()
+            .filter_map(|r| self.make_leaf(units[r.start].header.clone(), &units[r]))
+            .collect();
         // хвост короче половины target_min (остаток балансировки после повторённых
         // заголовков и округлений) присоединяется к предыдущему листу в пределах hard_max
         if let [.., prev, last] = &out[..] {
@@ -641,6 +835,126 @@ impl Chunker<'_> {
                     prev.end = end;
                     prev.last_para = last_para;
                 }
+            }
+        }
+        out
+    }
+
+    /// Разрез перед `units[j]` запрещён: после заголовка или вводной фразы на «:».
+    fn forbidden(units: &[Unit], j: usize) -> bool {
+        j > 0 && j < units.len() && boundary_strength(&units[j - 1], &units[j]) == FORBIDDEN
+    }
+
+    /// Жадная упаковка M2: диапазоны индексов единиц. Лист закрывается, когда следующая
+    /// единица перешагнула бы цель больше чем наполовину, — но не на запрещённой границе,
+    /// пока следующая единица умещается в `hard_max` (задача 17 M3).
+    fn pack_greedy(&self, units: &[Unit], goal: usize) -> Vec<Range<usize>> {
+        let p = &self.p;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < units.len() {
+            // лист не начинается с пробельной единицы: её заголовок (хвост
+            // разрезанного блока) после обрезки достался бы следующему блоку
+            if self.src[units[i].range.clone()].trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            let header = units[i].header.clone();
+            let mut est = header.as_ref().map_or(0, |h| self.count(h.clone())) + units[i].tokens;
+            let mut j = i + 1;
+            while let Some(u) = units.get(j) {
+                let next = est + u.tokens;
+                // лист закрывается, если единица перешагнула бы цель больше чем наполовину
+                let full = next > p.target_max || est + u.tokens / 2 > goal;
+                if next > p.hard_max || (est >= p.target_min && full && !Self::forbidden(units, j))
+                {
+                    break;
+                }
+                est = next;
+                j += 1;
+            }
+            // оценка — сумма по единицам; точный подсчёт может снять хвост; лист,
+            // упёршийся в hard_max на запрещённой границе, отступает до разрешённой
+            while j > i + 1 {
+                let text =
+                    self.leaf_text(header.clone(), units[i].range.start, units[j - 1].range.end);
+                if self.tc.count(&text) <= self.p.hard_max && !Self::forbidden(units, j) {
+                    break;
+                }
+                j -= 1;
+            }
+            out.push(i..j);
+            i = j;
+        }
+        out
+    }
+
+    /// Выбор разреза динамическим программированием по силе границ (`crate::boundary`).
+    /// DP считает по оценке (сумма токенов единиц); лист, который точным подсчётом
+    /// не уложился в `hard_max`, режется жадно.
+    fn pack_dp(&self, units: &[Unit], goal: usize) -> Vec<Range<usize>> {
+        let p = &self.p;
+        let bonus = if p.cohesion {
+            let bags: Vec<_> = units
+                .iter()
+                .map(|u| {
+                    (u.kind == UnitKind::Prose).then(|| boundary::stems(&self.src[u.range.clone()]))
+                })
+                .collect();
+            let eligible: Vec<bool> = (0..units.len())
+                .map(|j| {
+                    j > 0
+                        && units[j - 1].kind == UnitKind::Prose
+                        && units[j].kind == UnitKind::Prose
+                        && matches!(units[j].start, UnitStart::Block | UnitStart::Sentence)
+                        && !units[j - 1].colon_end
+                })
+                .collect();
+            boundary::cohesion_bonus(&bags, &eligible)
+        } else {
+            vec![0.0; units.len()]
+        };
+        let cands: Vec<Cand> = units
+            .iter()
+            .enumerate()
+            .map(|(j, u)| {
+                let strength = if j == 0 {
+                    0
+                } else {
+                    boundary_strength(&units[j - 1], u)
+                };
+                Cand {
+                    tokens: u.tokens,
+                    header: u.header.as_ref().map_or(0, |h| self.count(h.clone())),
+                    can_start: !self.src[u.range.clone()].trim().is_empty(),
+                    strength: f64::from(strength.max(0)) + bonus[j],
+                    forbidden: strength == FORBIDDEN,
+                }
+            })
+            .collect();
+        let budget = Budget {
+            goal,
+            target_min: p.target_min,
+            target_max: p.target_max,
+            hard_max: p.hard_max,
+        };
+        let mut out = Vec::new();
+        for r in boundary::choose_cuts(&cands, &budget, p.boundary_lambda) {
+            let first = &units[r.start];
+            let text = self.leaf_text(
+                first.header.clone(),
+                first.range.start,
+                units[r.end - 1].range.end,
+            );
+            if r.len() > 1 && self.tc.count(&text) > p.hard_max {
+                let base = r.start;
+                out.extend(
+                    self.pack_greedy(&units[r], goal)
+                        .into_iter()
+                        .map(|x| x.start + base..x.end + base),
+                );
+            } else {
+                out.push(r);
             }
         }
         out
@@ -704,6 +1018,17 @@ impl Chunker<'_> {
     }
 }
 
+/// Отметки частей одного блока: вводная фраза — только у последней части абзаца на «:»,
+/// первая часть начинается с границы блока.
+fn mark_block(parts: &mut [Unit], colon: bool) {
+    if let Some(u) = parts.first_mut() {
+        u.start = UnitStart::Block;
+    }
+    if let Some(u) = parts.last_mut() {
+        u.colon_end = colon;
+    }
+}
+
 /// Соседи одного родителя: одинаковый уровень и путь без последнего заголовка.
 fn siblings(a: &crate::doc::Section, b: &crate::doc::Section) -> bool {
     a.level > 0
@@ -737,4 +1062,86 @@ fn line_tiles(src: &str, r: Range<usize>) -> Vec<Range<usize>> {
         _ => None,
     });
     tiles(r.clone(), starts.collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(kind: UnitKind, start: UnitStart, colon_end: bool) -> Unit {
+        Unit {
+            range: 0..1,
+            tokens: 1,
+            header: None,
+            para: None,
+            kind,
+            start,
+            colon_end,
+        }
+    }
+
+    #[test]
+    fn colon_intro_with_emphasis() {
+        for t in [
+            "Пример:",
+            "Пример:  \n",
+            "**Пример:**",
+            "__Пример:__",
+            "*Пример:*",
+            "_Пример:_",
+            "**Пример**:",
+            "Текст и **Пример:** ",
+            "<b>Пример:</b>",
+            "<strong>Пример:</strong>",
+            "<em>Пример:</em> ",
+            "**<b>Пример:</b>**",
+        ] {
+            assert!(ends_with_colon(t), "{t:?}");
+        }
+        // inline-код на «:» — не вводная фраза (`std::`, `http:`)
+        for t in [
+            "Пример.",
+            "**Пример**",
+            "a: b",
+            "*",
+            "",
+            "snake_case_",
+            "символы из `std::`",
+            "префикс `http:`",
+            "`config:`",
+            "<b>Пример</b>",
+        ] {
+            assert!(!ends_with_colon(t), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn boundary_strength_table() {
+        use UnitKind::*;
+        use UnitStart::*;
+        let prose = unit(Prose, Block, false);
+        let s = |prev: &Unit, next: &Unit| boundary_strength(prev, next);
+        assert_eq!(s(&prose, &unit(Heading, Block, false)), 4);
+        assert_eq!(s(&prose, &unit(Break, Block, false)), 4);
+        assert_eq!(s(&prose, &unit(Prose, Block, false)), 2);
+        assert_eq!(s(&prose, &unit(Structure, Block, false)), 2);
+        assert_eq!(s(&unit(Structure, Block, false), &prose), 2);
+        assert_eq!(s(&prose, &unit(Prose, Sentence, false)), 1);
+        assert_eq!(s(&prose, &unit(Structure, Element, false)), 1);
+        assert_eq!(s(&prose, &unit(Prose, Fragment, false)), 0);
+        // после заголовка и после вводной фразы на «:» резать нельзя
+        assert_eq!(s(&unit(Heading, Block, false), &prose), FORBIDDEN);
+        assert_eq!(
+            s(&unit(Prose, Sentence, true), &unit(Structure, Block, false)),
+            FORBIDDEN
+        );
+        // внутри заголовка или абзаца на «:» (дробление) запрета нет: он только на границе блока
+        assert_eq!(
+            s(
+                &unit(Heading, Block, false),
+                &unit(Heading, Fragment, false)
+            ),
+            0
+        );
+    }
 }

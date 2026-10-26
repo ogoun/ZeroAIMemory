@@ -1,9 +1,13 @@
 //! Атрибуция ревизий (§11.3, §12): кто пишет, с какой машины и в какой сессии.
 //!
-//! - `author_kind`: токен — `agent`, администратор (cookie WebUI) — `human`;
-//! - `token_id` — id токена запроса;
+//! - `author_kind`: токен — `agent`, человеческий токен (`human`, §7.5) и администратор
+//!   (cookie WebUI) — `human`;
+//! - `token_id` — id токена запроса, `user_id` — его пользователь (автор ревизии в базе
+//!   владельца общего решения, §11.6); у администратора — нет;
 //! - `X-Zam-Session`, `X-Zam-Machine` — до 128 символов UTF-8 без управляющих,
 //!   иначе 400; пустое значение равно отсутствию заголовка;
+//! - `X-Zam-Area` (§11.2) — область по умолчанию для новых узлов и записей журналов, те же
+//!   правила;
 //! - `message` — из тела запроса.
 use axum::http::HeaderMap;
 use zam_store::{Attribution, AuthorKind};
@@ -15,6 +19,8 @@ use crate::error::ApiError;
 pub const SESSION_HEADER: &str = "x-zam-session";
 /// Заголовок имени машины.
 pub const MACHINE_HEADER: &str = "x-zam-machine";
+/// Заголовок текущей области (монорепозиторий, §11.2).
+pub const AREA_HEADER: &str = "x-zam-area";
 /// Предел длины значений заголовков атрибуции, символов.
 pub const ATTRIB_MAX_CHARS: usize = 128;
 /// Предел длины сообщения ревизии, символов.
@@ -26,9 +32,16 @@ pub fn attribution(
     headers: &HeaderMap,
     message: Option<String>,
 ) -> Result<Attribution, ApiError> {
-    let (author_kind, token_id) = match p {
-        Principal::Token(t) => (AuthorKind::Agent, Some(t.token_id)),
-        Principal::Admin { .. } => (AuthorKind::Human, None),
+    let (author_kind, token_id, user_id) = match p {
+        Principal::Token(t) => {
+            let kind = if t.human {
+                AuthorKind::Human
+            } else {
+                AuthorKind::Agent
+            };
+            (kind, Some(t.token_id), Some(t.user_id))
+        }
+        Principal::Admin { .. } => (AuthorKind::Human, None, None),
     };
     let message = message.filter(|m| !m.trim().is_empty());
     if message
@@ -45,11 +58,13 @@ pub fn attribution(
         session_id: header_value(headers, SESSION_HEADER)?,
         machine: header_value(headers, MACHINE_HEADER)?,
         message,
+        user_id,
+        area: header_value(headers, AREA_HEADER)?,
     })
 }
 
 /// Значение заголовка атрибуции: UTF-8, ≤ 128 символов, только печатные.
-fn header_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ApiError> {
+pub fn header_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ApiError> {
     let Some(v) = headers.get(name) else {
         return Ok(None);
     };
@@ -90,14 +105,40 @@ mod tests {
         assert_eq!(a.machine.as_deref(), Some("box"));
         assert_eq!(a.session_id.as_deref(), Some("сессия"));
         assert_eq!(a.message.as_deref(), Some("m"));
+        assert_eq!(a.area, None);
+        h.insert(AREA_HEADER, HeaderValue::from_static(" services/parser "));
+        let a = attribution(&admin(), &h, None).unwrap();
+        assert_eq!(a.area.as_deref(), Some("services/parser"));
+    }
+
+    #[test]
+    fn token_author_kind_by_human_flag() {
+        let tok = |human| {
+            Principal::Token(zam_store::AuthToken {
+                token_id: zam_core::Id::new(),
+                user_id: zam_core::Id::new(),
+                access: zam_store::Access::Rw,
+                human,
+            })
+        };
+        let h = HeaderMap::new();
+        assert_eq!(
+            attribution(&tok(false), &h, None).unwrap().author_kind,
+            AuthorKind::Agent
+        );
+        let a = attribution(&tok(true), &h, None).unwrap();
+        assert_eq!(a.author_kind, AuthorKind::Human);
+        assert!(a.token_id.is_some() && a.user_id.is_some());
     }
 
     #[test]
     fn bad_headers_rejected() {
         for bad in ["a\tb".to_string(), "x".repeat(129)] {
-            let mut h = HeaderMap::new();
-            h.insert(MACHINE_HEADER, HeaderValue::from_str(&bad).unwrap());
-            assert!(attribution(&admin(), &h, None).is_err(), "{bad}");
+            for name in [MACHINE_HEADER, AREA_HEADER] {
+                let mut h = HeaderMap::new();
+                h.insert(name, HeaderValue::from_str(&bad).unwrap());
+                assert!(attribution(&admin(), &h, None).is_err(), "{name}: {bad}");
+            }
         }
         let mut h = HeaderMap::new();
         h.insert(

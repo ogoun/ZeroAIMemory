@@ -1,3 +1,6 @@
+---
+index: false
+---
 # Conventional Commits in practice
 
 We adopted the Conventional Commits format so that release tooling can derive the next

@@ -1,14 +1,21 @@
 //! Маршруты HTTP API.
 pub mod admin;
 pub mod blobs;
+pub mod entries;
+pub mod graph;
 pub mod health;
 pub mod index;
+pub mod insights;
 pub mod nodes;
+pub mod releases;
 pub mod render;
 pub mod scope;
 pub mod search;
+pub mod secrets;
 pub mod solutions;
 pub mod spaces;
+pub mod triggers;
+pub mod vault;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -59,8 +66,27 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         .route("/api/v1/auth/me", get(login::me))
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
-        .route("/api/v1/solutions", post(solutions::register))
+        .route(
+            "/api/v1/solutions",
+            get(solutions::list).post(solutions::register),
+        )
         .route("/api/v1/solutions/{guid}", get(solutions::get))
+        .route(
+            "/api/v1/solutions/{guid}/access",
+            get(solutions::access_list),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/approve",
+            post(solutions::approve),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/reject",
+            post(solutions::reject),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/revoke",
+            post(solutions::revoke),
+        )
         .route(
             "/api/v1/nodes",
             post(nodes::write::create).layer(note_limit),
@@ -86,8 +112,46 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
             get(nodes::history::revision),
         )
         .route("/api/v1/nodes/{id}/diff", get(nodes::history::diff))
+        .route("/api/v1/nodes/{id}/backlinks", get(graph::node_backlinks))
+        .route("/api/v1/nodes/{id}/links", get(graph::node_links))
         .route("/api/v1/nodes/{id}/revert", post(nodes::history::revert))
         .route("/api/v1/trash", get(nodes::write::trash))
+        .route(
+            "/api/v1/spaces/{space}/entries",
+            get(entries::list).post(entries::create).layer(note_limit),
+        )
+        .route(
+            "/api/v1/entries/{id}",
+            get(entries::get)
+                .patch(entries::patch)
+                .delete(entries::remove)
+                .layer(note_limit),
+        )
+        .route("/api/v1/entries/{id}/restore", post(entries::restore))
+        .route(
+            "/api/v1/entries/{id}/supersede",
+            post(insights::supersede).layer(note_limit),
+        )
+        .route("/api/v1/entries/{id}/retract", post(insights::retract))
+        .route("/api/v1/entries/{id}/revisions", get(entries::revisions))
+        .route(
+            "/api/v1/entries/{id}/backlinks",
+            get(graph::entry_backlinks),
+        )
+        .route("/api/v1/entries/{id}/links", get(graph::entry_links))
+        .route(
+            "/api/v1/spaces/{space}/vault",
+            get(vault::list).post(vault::create),
+        )
+        .route(
+            "/api/v1/vault/{id}",
+            get(vault::get).patch(vault::patch).delete(vault::remove),
+        )
+        .route("/api/v1/vault/{id}/revisions", get(vault::revisions))
+        .route("/api/v1/graph", get(graph::graph))
+        .route("/api/v1/edges", post(graph::create))
+        .route("/api/v1/edges/{id}", delete(graph::remove))
+        .route("/api/v1/releases/{id}/compare", get(releases::compare))
         .route(
             "/api/v1/render",
             post(render::preview).layer(DefaultBodyLimit::max(render::RENDER_BODY_MAX)),
@@ -99,6 +163,7 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         )
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
         .route("/api/v1/search", post(search::search))
+        .route("/api/v1/triggers", get(triggers::list))
         .route("/api/v1/index/status", get(index::status))
         .route("/api/v1/admin/reindex", post(index::reindex))
         .route(
@@ -115,6 +180,10 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         )
         .route("/api/v1/admin/tokens/{id}", delete(admin::revoke_token))
         .route("/api/v1/admin/audit", get(admin::list_audit))
+        .route(
+            "/api/v1/admin/settings",
+            get(admin::get_settings).patch(admin::patch_settings),
+        )
 }
 
 // ---- разбор входных данных (общий для обработчиков) ----

@@ -41,10 +41,8 @@ async fn chunk_count(a: &Api, node: &str) -> u64 {
 /// Точки пользователя администратора (все уровни, в том числе папки).
 async fn points(a: &Api, prefix: Option<&str>) -> u64 {
     let f = VectorFilter {
-        user_id: uid(a),
-        space_ids: vec![],
         path_prefix: prefix.map(str::to_string),
-        levels: vec![],
+        ..common::api::vector_base(a, uid(a)).await
     };
     a.st.index.vector.as_ref().unwrap().count(&f).await.unwrap()
 }
@@ -107,7 +105,9 @@ async fn failed_items_have_job_id_space_and_path() {
         assert!(it["deleted_at"].is_null(), "{it}");
     }
     // заметка в корзине: ссылка остаётся, WebUI помечает «(в корзине)»
-    zam_store::delete_node(&db, node).await.unwrap();
+    zam_store::delete_node(&db, node, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     let s = adm_status(&a).await;
     for it in s["failed_items"].as_array().unwrap() {
         assert!(it["deleted_at"].is_string(), "{it}");
@@ -169,6 +169,7 @@ async fn status_without_models_and_queue_visibility() {
     assert_eq!(s["qdrant"]["state"], "off");
     assert_eq!(s["qdrant"]["points"], Value::Null);
     assert_eq!(s["qdrant"]["rss_bytes"], Value::Null);
+    assert_eq!(s["qdrant"]["wal_pending_ops"], Value::Null);
     assert_eq!(s["queue"]["queued"], 2);
     assert!(s["queue"]["oldest"].is_string());
     assert_eq!(s["failed_items"], json!([]));
@@ -409,6 +410,8 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
         s["qdrant"]["rss_bytes"].as_u64().unwrap() > 1_000_000,
         "{s}"
     );
+    // заметка записана: номер операции WAL известен, подтверждение — счётчик (0 или больше)
+    assert!(s["qdrant"]["wal_pending_ops"].as_u64().is_some(), "{s}");
 
     // сервер работает: каталог данных занят
     let out = zam_server(&["reindex", "--config", &conf_arg]);
@@ -464,8 +467,10 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
         READY,
         async || b.st.index.vector_available().is_ok() && points(&b, Some("keep")).await == pts,
         async || {
-            // qdrant.error и state.reason — причина, по которой канал не включился
-            let s = status(&b).await;
+            // qdrant.error и state.reason — причина, по которой канал не включился; статус —
+            // сессией администратора: после перезапуска первичного токена нет (`initial_token`
+            // выдаётся только при создании администратора), запрос по токену дал бы 401
+            let s = adm_status(&b).await;
             format!(
                 "{}; qdrant = {}; vector = {}; ожидалось точек {pts}",
                 vector_diag(&b),

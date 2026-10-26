@@ -1,4 +1,5 @@
 //! `system.db`: пользователи, токены, веб-сессии, аудит, настройки (§6.2 ТЗ).
+//! Реестр решений и доступ участников — в [`crate::access`].
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -6,9 +7,9 @@ use jiff::{Span, Timestamp};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-use rusqlite::{OptionalExtension, Row, params};
-use serde::Serialize;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use zam_core::{Id, generate_token, hash_token};
 
 use crate::time::{conv_err, fmt_ts, ts_at, ts_opt};
@@ -23,6 +24,18 @@ pub static SYSTEM_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: include_str!("../migrations/system/0002_index_skipped.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("../migrations/system/0003_solutions.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("../migrations/system/0004_human_tokens.sql"),
+    },
+    Migration {
+        version: 5,
+        sql: include_str!("../migrations/system/0005_vault_keys.sql"),
     },
 ];
 
@@ -50,8 +63,9 @@ pub struct User {
     pub disabled_at: Option<Timestamp>,
 }
 
-/// Режим доступа токена.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Режим доступа токена или участника решения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Access {
     Rw,
     Ro,
@@ -96,6 +110,8 @@ pub struct TokenInfo {
     pub last_used_at: Option<Timestamp>,
     pub last_ip: Option<String>,
     pub revoked_at: Option<Timestamp>,
+    /// Человеческий токен (§7.5): запись по нему — `author_kind = human`.
+    pub human: bool,
 }
 
 /// Результат успешной проверки токена.
@@ -104,6 +120,8 @@ pub struct AuthToken {
     pub token_id: Id,
     pub user_id: Id,
     pub access: Access,
+    /// Человеческий токен: запись по нему атрибутируется человеку (ставит и меняет `axiom`).
+    pub human: bool,
 }
 
 /// Веб-сессия администратора (идентификатор сессии в ответ не входит).
@@ -131,7 +149,7 @@ pub struct AuditRow {
 /// Хранилище `system.db`; дёшево клонируется.
 #[derive(Clone, Debug)]
 pub struct SystemStore {
-    db: Db,
+    pub(crate) db: Db,
 }
 
 fn user_row(r: &Row) -> rusqlite::Result<User> {
@@ -157,18 +175,19 @@ fn token_row(r: &Row) -> rusqlite::Result<TokenInfo> {
         last_used_at: ts_opt(r, 6)?,
         last_ip: r.get(7)?,
         revoked_at: ts_opt(r, 8)?,
+        human: r.get(9)?,
     })
 }
 
 const TOKEN_COLS: &str =
-    "id, user_id, name, prefix, access, created_at, last_used_at, last_ip, revoked_at";
+    "id, user_id, name, prefix, access, created_at, last_used_at, last_ip, revoked_at, human";
 
-fn is_unique_violation(e: &rusqlite::Error) -> bool {
+pub(crate) fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _)
         if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
 }
 
-fn json_err(e: serde_json::Error) -> StoreError {
+pub(crate) fn json_err(e: serde_json::Error) -> StoreError {
     StoreError::Corrupt(format!("некорректный JSON: {e}"))
 }
 
@@ -179,6 +198,34 @@ fn random_b64() -> String {
         .try_fill_bytes(&mut b)
         .expect("источник случайности ОС");
     URL_SAFE_NO_PAD.encode(b)
+}
+
+/// Пишет запись аудита в транзакции вызывающего (действие и его аудит — атомарно).
+/// `details` не должен содержать секретов.
+pub(crate) fn audit_tx(
+    c: &Connection,
+    actor: &str,
+    user_id: Option<Id>,
+    action: &str,
+    target: Option<&str>,
+    ip: Option<&str>,
+    details: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let details = serde_json::to_string(details).map_err(json_err)?;
+    c.execute(
+        "INSERT INTO audit (ts, actor, user_id, action, target, ip, details)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            fmt_ts(Timestamp::now()),
+            actor,
+            user_id,
+            action,
+            target,
+            ip,
+            details
+        ],
+    )?;
+    Ok(())
 }
 
 impl SystemStore {
@@ -311,11 +358,14 @@ impl SystemStore {
     // ---- токены ----
 
     /// Выпускает токен; открытый текст возвращается один раз, в БД — только sha256.
+    /// `human` — человеческий токен (§7.5): выпускать его вправе только администратор,
+    /// это проверяет сервер.
     pub async fn issue_token(
         &self,
         user: Id,
         name: &str,
         access: Access,
+        human: bool,
     ) -> Result<(TokenInfo, String), StoreError> {
         let name = name.to_string();
         let nt = generate_token();
@@ -340,10 +390,12 @@ impl SystemStore {
                     last_used_at: None,
                     last_ip: None,
                     revoked_at: None,
+                    human,
                 };
                 tx.execute(
-                    "INSERT INTO tokens (id, user_id, name, prefix, secret_hash, access, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO tokens (id, user_id, name, prefix, secret_hash, access, created_at,
+                                         human)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         info.id,
                         info.user_id,
@@ -351,7 +403,8 @@ impl SystemStore {
                         info.prefix,
                         nt.secret_hash,
                         info.access,
-                        fmt_ts(info.created_at)
+                        fmt_ts(info.created_at),
+                        info.human
                     ],
                 )?;
                 Ok(info)
@@ -412,7 +465,8 @@ impl SystemStore {
             .db
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT t.id, t.user_id, t.access, t.revoked_at, t.last_used_at, u.disabled_at
+                    "SELECT t.id, t.user_id, t.access, t.revoked_at, t.last_used_at, u.disabled_at,
+                            t.human
                      FROM tokens t JOIN users u ON u.id = t.user_id
                      WHERE t.secret_hash = ?1",
                     [&hash],
@@ -421,6 +475,7 @@ impl SystemStore {
                             token_id: r.get(0)?,
                             user_id: r.get(1)?,
                             access: r.get(2)?,
+                            human: r.get(6)?,
                         };
                         let revoked = r.get::<_, Option<String>>(3)?.is_some();
                         let last_used = ts_opt(r, 4).unwrap_or(None);
@@ -555,23 +610,17 @@ impl SystemStore {
     ) -> Result<(), StoreError> {
         let (actor, action) = (actor.to_string(), action.to_string());
         let (target, ip) = (target.map(str::to_string), ip.map(str::to_string));
-        let details = serde_json::to_string(&details).map_err(json_err)?;
         self.db
             .write(move |tx| {
-                tx.execute(
-                    "INSERT INTO audit (ts, actor, user_id, action, target, ip, details)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        fmt_ts(Timestamp::now()),
-                        actor,
-                        user_id,
-                        action,
-                        target,
-                        ip,
-                        details
-                    ],
-                )?;
-                Ok(())
+                audit_tx(
+                    tx,
+                    &actor,
+                    user_id,
+                    &action,
+                    target.as_deref(),
+                    ip.as_deref(),
+                    &details,
+                )
             })
             .await
     }

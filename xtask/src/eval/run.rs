@@ -7,8 +7,31 @@
 //! `target/deps/<платформа>/` (`ml.ort_dylib`, `qdrant.binary`). Для CUDA из `PATH` сервера
 //! убираются каталоги CUDA Toolkit: библиотеки NVIDIA берутся только из `<ORT>/cuda`, как
 //! у пользователя после `zam-server cuda fetch`.
+//!
+//! **Набор M3.** Загрузчик регистрирует решение набора ([`EVAL_SOLUTION`]): заметки группы
+//! `e` (`<язык>/zam/…`) пишутся в его пространство, остальные — в Knowledge; insight
+//! `eval/insights.toml` создаются `POST /spaces/{решение}/entries` (`kind: insight`,
+//! `force: true` — дедупликация набора не нужна), замещаются `POST /entries/{id}/supersede` и
+//! отзываются `POST /entries/{id}/retract`. `axiom` создаёт человеческий токен, выпущенный
+//! администратором прогона (`POST /admin/users/{id}/tokens {human: true}`), остальное —
+//! токен прогона (агент; `theorem` — с `data.evidence`). Соответствие id записей и ключей
+//! набора сохраняется в каталоге прогона (`entries.json`) — для перезапусков на том же
+//! индексе. Поиск — `scope.solution` набора с Knowledge, без Rules.
+//!
+//! Метрики M3 по видам запросов:
+//! - `superseded` — `cancelled@5` в обычном поиске и контроль с `include_history: true`
+//!   (там замещённые видны — иначе набор устаревания ничего не проверяет);
+//! - `certainty` — `reliable_first` (с бустами `certainty` сервера; без бустов — второй
+//!   проход в [`run_modes`] на том же индексе с `search.boost_* = 1`);
+//! - `chunk` — второй запрос `mode = chunks` (`expand = none`): листы выдачи сравниваются с
+//!   `evidence` по **собственному** тексту листа — перекрытие с предыдущим листом
+//!   (`chunk_overlap_sentences`) отрезается ([`leaf_cores`]): лист, получивший доказательство
+//!   только благодаря перекрытию, не засчитывается **[решение исполнителя]** (исследование
+//!   нарезки §5: «без учёта перекрытия»).
 
-use std::collections::BTreeMap;
+mod load;
+
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,8 +42,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::corpus::{Corpus, Kind, Lang, Query};
-use super::metrics::{Aggregate, QueryMetrics, aggregate, quantile, score};
+use super::compare::{Comparison, compare};
+use super::corpus::{
+    Corpus, EVAL_SOLUTION, INSIGHT_REF, Kind, Lang, Note, Query, in_solution, is_long_path,
+};
+use super::leaves::{LeafHit, SplitStats, chunk_leaves, leaf_cores, split_stats};
+use super::metrics::{
+    Aggregate, Estimate, QueryMetrics, aggregate, cancelled_at_5, chunk_scores, estimate, quantile,
+    reliable_first, score,
+};
 use super::report;
 use super::{Device, EvalArgs, Mode, Paths};
 use crate::smoke::{Server, SmokeEnv, api, api_timeout, wait_health_for};
@@ -47,6 +77,10 @@ pub struct RunSpec {
     /// Переопределения конфигурации (`search.w_fts`, `index.chunk_target_max`, …).
     pub sets: Vec<(String, String)>,
     pub keep_cuda_path: bool,
+    /// Windows: сервер в своей группе процессов — ему можно послать Ctrl+Break
+    /// ([`Session::stop_graceful`], `bench --scenario first-start`), но Ctrl+C терминала до
+    /// него тогда не доходит (зачистку при прерывании xtask даёт Job Object, `procjob`).
+    pub ctrl_break: bool,
 }
 
 /// `KEY=VALUE` → (`search.w_fts`, `0.8`).
@@ -172,6 +206,8 @@ pub struct Session {
     pub server_config: Value,
     /// Начало загрузки корпуса: от него считается время индексации.
     loaded_at: Option<Instant>,
+    /// id записи журнала → ключ insight набора.
+    entry_keys: BTreeMap<String, String>,
 }
 
 /// Сообщение журнала сервера с действующими `[search]` и `[index]`.
@@ -264,6 +300,14 @@ fn server_env(p: &Paths, spec: &RunSpec, dir: &Path) -> Result<SmokeEnv> {
 /// Файл токена прогона: первый токен печатается только при создании администратора,
 /// повторные запуски на том же каталоге (сетка весов) берут его отсюда.
 const TOKEN_FILE: &str = "token.txt";
+/// Соответствие id записей и ключей insight набора (для перезапусков на том же каталоге).
+const ENTRIES_FILE: &str = "entries.json";
+/// Бусты `certainty` выключены — второй проход `reliable_first`.
+pub const NO_CERTAINTY_BOOSTS: [(&str, &str); 3] = [
+    ("search.boost_axiom", "1.0"),
+    ("search.boost_theorem", "1.0"),
+    ("search.boost_hypothesis", "1.0"),
+];
 
 impl Session {
     /// Запускает сервер на `target/eval/<name>/data`; `fresh` — каталог очищается.
@@ -277,7 +321,7 @@ impl Session {
         let env = server_env(p, spec, &dir)?;
         let base = format!("http://{}", env.addr);
         let log = dir.join("zam-server.stderr.log");
-        let mut srv = Server::start(server, &data, &env, &log)?;
+        let mut srv = Server::start(server, &data, &env, &log, spec.ctrl_break)?;
         wait_health_for(&mut srv, &base, HEALTH_WAIT)?;
         let server_config = server_config(&log)?;
         let token_file = dir.join(TOKEN_FILE);
@@ -306,6 +350,14 @@ impl Session {
                     })?,
             },
         };
+        let entry_keys = if fresh {
+            BTreeMap::new()
+        } else {
+            fs::read_to_string(dir.join(ENTRIES_FILE))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default()
+        };
         Ok(Session {
             srv,
             base,
@@ -316,6 +368,7 @@ impl Session {
             index_secs: 0.0,
             server_config,
             loaded_at: None,
+            entry_keys,
         })
     }
 
@@ -351,12 +404,18 @@ impl Session {
         self.loaded_at = Some(Instant::now());
     }
 
-    /// Пишет заметки корпуса в Knowledge (`POST /nodes`).
+    /// Регистрирует решение набора, пишет заметки (`POST /nodes`: группа `e` — в решение,
+    /// остальные — в Knowledge) и insight набора (см. модуль).
     pub fn load_corpus(&mut self, corpus: &Corpus) -> Result<()> {
         self.begin_load();
+        let reg = json!({ "agent_solution_id": EVAL_SOLUTION, "name": "eval" });
+        let (st, v) = self.api("/api/v1/solutions", Some(&reg))?;
+        if st != 201 && st != 200 {
+            bail!("POST /solutions: HTTP {st}: {v}");
+        }
         for n in corpus.notes.values() {
             let body = json!({
-                "space": "knowledge",
+                "space": note_space(&n.path),
                 "path": n.path,
                 "kind": "note",
                 "content": n.text,
@@ -366,7 +425,7 @@ impl Session {
                 bail!("POST /nodes {}: HTTP {st}: {v}", n.path);
             }
         }
-        Ok(())
+        self.load_insights(&corpus.insights)
     }
 
     /// `/index/status`.
@@ -448,81 +507,146 @@ impl Session {
         Ok(())
     }
 
-    /// Выполняет запросы в режиме `mode`.
+    /// Тело `POST /search` запроса набора: `out` — `notes` | `chunks`, `history` —
+    /// `include_history`.
+    fn search_body(q: &Query, mode: Mode, out: &str, history: bool) -> Value {
+        json!({
+            "query": q.text,
+            "mode": out,
+            "top_k": TOP_K,
+            "budget_tokens": BUDGET_TOKENS,
+            "scope": { "solution": EVAL_SOLUTION, "include_rules": false },
+            "include_history": history,
+            "rerank": if mode == Mode::HybridRerank { "on" } else { "off" },
+        })
+    }
+
+    /// `POST /search` с проверками режима (деградация, реранк); ответ и время на клиенте, мс.
+    fn search(&self, q: &Query, mode: Mode, body: &Value) -> Result<(Value, f64)> {
+        let t0 = Instant::now();
+        let (st, v) = api_timeout(
+            &self.base,
+            &self.token,
+            "/api/v1/search",
+            Some(body),
+            SEARCH_TIMEOUT,
+        )?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if st != 200 {
+            bail!("запрос {}: HTTP {st}: {v}", q.id);
+        }
+        let degraded = v["degraded"] == true;
+        if mode != Mode::Fts && degraded {
+            bail!(
+                "запрос {}: поиск деградирован ({}) в режиме {}",
+                q.id,
+                v["degraded_reason"],
+                mode.as_str()
+            );
+        }
+        if mode == Mode::Fts && !degraded {
+            bail!("режим fts, но векторный канал включён (degraded = false)");
+        }
+        let warnings: Vec<String> = v["warnings"]
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if mode == Mode::HybridRerank && !warnings.is_empty() {
+            bail!("запрос {}: реранк не выполнен: {warnings:?}", q.id);
+        }
+        Ok((v, ms))
+    }
+
+    /// Элементы выдачи: путь заметки или `insight:<key>` записи набора (чужая запись —
+    /// `entry:<id>`).
+    fn hits(&self, v: &Value) -> Vec<Hit> {
+        v["items"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|i| Hit {
+                        path: match i["entry_id"].as_str() {
+                            Some(id) => match self.entry_keys.get(id) {
+                                Some(k) => format!("{INSIGHT_REF}{k}"),
+                                None => format!("entry:{id}"),
+                            },
+                            None => i["path"].as_str().unwrap_or_default().to_string(),
+                        },
+                        score: i["score"].as_f64().unwrap_or(0.0),
+                        sources: i["sources"]
+                            .as_array()
+                            .map(|s| {
+                                s.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        reranked: !i["rerank_score"].is_null(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Выполняет запросы в режиме `mode`: основной поиск `mode = notes` и, по виду запроса,
+    /// контроль `include_history` (`superseded`) или поиск листов `mode = chunks` (`chunk`).
     pub fn run_queries(&self, queries: &[Query], mode: Mode) -> Result<Vec<QueryRun>> {
+        let leaves = if queries.iter().any(|q| q.kind == Kind::Chunk) {
+            leaf_cores(&self.data)?
+        } else {
+            HashMap::new()
+        };
         let mut out = Vec::with_capacity(queries.len());
         for q in queries {
-            let body = json!({
-                "query": q.text,
-                "mode": "notes",
-                "top_k": TOP_K,
-                "budget_tokens": BUDGET_TOKENS,
-                "scope": { "spaces": ["knowledge"] },
-                "rerank": if mode == Mode::HybridRerank { "on" } else { "off" },
-            });
-            let t0 = Instant::now();
-            let (st, v) = api_timeout(
-                &self.base,
-                &self.token,
-                "/api/v1/search",
-                Some(&body),
-                SEARCH_TIMEOUT,
-            )?;
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            if st != 200 {
-                bail!("запрос {}: HTTP {st}: {v}", q.id);
-            }
-            let degraded = v["degraded"] == true;
-            if mode != Mode::Fts && degraded {
-                bail!(
-                    "запрос {}: поиск деградирован ({}) в режиме {}",
-                    q.id,
-                    v["degraded_reason"],
-                    mode.as_str()
-                );
-            }
-            if mode == Mode::Fts && !degraded {
-                bail!("режим fts, но векторный канал включён (degraded = false)");
-            }
-            let warnings: Vec<String> = v["warnings"]
-                .as_array()
-                .map(|w| {
-                    w.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if mode == Mode::HybridRerank && !warnings.is_empty() {
-                bail!("запрос {}: реранк не выполнен: {warnings:?}", q.id);
-            }
-            let items: Vec<Hit> = v["items"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .map(|i| Hit {
-                            path: i["path"].as_str().unwrap_or_default().to_string(),
-                            score: i["score"].as_f64().unwrap_or(0.0),
-                            sources: i["sources"]
-                                .as_array()
-                                .map(|s| {
-                                    s.iter()
-                                        .filter_map(|x| x.as_str().map(String::from))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            reranked: !i["rerank_score"].is_null(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let (v, ms) = self.search(q, mode, &Self::search_body(q, mode, "notes", false))?;
+            let items = self.hits(&v);
             let ranked: Vec<String> = items.iter().map(|h| h.path.clone()).collect();
+            let mut metrics = score(&ranked, &q.relevant());
+            let mut cancelled5_history = None;
+            let mut leaf_hits = Vec::new();
+            match q.kind {
+                Kind::Superseded => {
+                    metrics.cancelled5 = Some(cancelled_at_5(&ranked, &q.forbid));
+                    let body = Self::search_body(q, mode, "notes", true);
+                    let (h, _) = self.search(q, mode, &body)?;
+                    let hr: Vec<String> = self.hits(&h).into_iter().map(|h| h.path).collect();
+                    cancelled5_history = Some(cancelled_at_5(&hr, &q.forbid));
+                }
+                Kind::Certainty => {
+                    metrics.reliable_first = Some(reliable_first(&ranked, &q.expect, &q.weaker));
+                }
+                Kind::Chunk => {
+                    let ev = q.evidence.as_deref().unwrap_or_default();
+                    let body = Self::search_body(q, mode, "chunks", false);
+                    let (c, _) = self.search(q, mode, &body)?;
+                    let (hits, cores) = chunk_leaves(&c, &leaves, ev);
+                    let (r5, n10) = chunk_scores(&cores, ev);
+                    metrics.chunk_recall5 = Some(r5);
+                    metrics.chunk_ndcg10 = Some(n10);
+                    leaf_hits = hits;
+                }
+                _ => {}
+            }
             out.push(QueryRun {
                 id: q.id.clone(),
+                text: q.text.clone(),
                 kind: q.kind,
                 lang: q.lang,
                 disjoint: q.disjoint,
                 expect: q.expect.clone(),
-                metrics: score(&ranked, &q.expect),
+                also: q.also.clone(),
+                forbid: q.forbid.clone(),
+                weaker: q.weaker.clone(),
+                long: false,
+                fts_only: false,
+                metrics,
+                cancelled5_history,
+                reliable_first_no_boost: None,
+                leaves: leaf_hits,
                 hits: items,
                 ms,
                 server_ms: v["timings"].clone(),
@@ -535,9 +659,28 @@ impl Session {
     pub fn stop(mut self) -> Result<()> {
         self.srv.stop()
     }
+
+    /// Штатная остановка (Ctrl+Break / SIGTERM) не дольше `limit`; время до выхода.
+    pub fn stop_graceful(mut self, limit: Duration) -> Result<Duration> {
+        self.srv.stop_graceful(limit)
+    }
+
+    /// Жёсткое завершение сервера и вместе с ним Qdrant.
+    pub fn kill(mut self) -> Result<()> {
+        self.srv.kill()
+    }
 }
 
-/// Элемент выдачи.
+/// Пространство заметки при загрузке: группа `e` — решение набора, остальное — Knowledge.
+pub fn note_space(path: &str) -> &'static str {
+    if in_solution(path) {
+        EVAL_SOLUTION
+    } else {
+        "knowledge"
+    }
+}
+
+/// Элемент выдачи: путь заметки или `insight:<key>` записи набора.
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub path: String,
@@ -550,11 +693,34 @@ pub struct Hit {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryRun {
     pub id: String,
+    /// Текст запроса (для `--compare` будущих прогонов).
+    #[serde(default)]
+    pub text: String,
     pub kind: Kind,
     pub lang: Lang,
     pub disjoint: bool,
     pub expect: Vec<String>,
+    /// Дополнительно релевантные цели (`also`): в метриках прогона, не в `--compare`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub forbid: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub weaker: Vec<String>,
+    /// Ожидается длинная заметка (подмножество «длинные заметки»).
+    pub long: bool,
+    /// Ожидается заметка с `index: false` (находит только FTS).
+    pub fts_only: bool,
     pub metrics: QueryMetrics,
+    /// `superseded`: `cancelled@5` в поиске с `include_history: true` (контроль).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled5_history: Option<bool>,
+    /// `certainty`: `reliable_first` без бустов `certainty`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reliable_first_no_boost: Option<bool>,
+    /// `chunk`: первые 10 листов `mode = chunks`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub leaves: Vec<LeafHit>,
     pub hits: Vec<Hit>,
     /// Время ответа на клиенте, мс.
     pub ms: f64,
@@ -570,8 +736,28 @@ pub struct Breakdown {
     pub by_lang: BTreeMap<String, Aggregate>,
     /// Перефразы без общих слов.
     pub disjoint: Aggregate,
+    /// Запросы к длинным заметкам.
+    pub long: Aggregate,
+    /// Запросы к заметкам с `index: false` (FTS-only находки).
+    pub fts_only: Aggregate,
+    /// Контроль устаревания: `cancelled@5` с `include_history: true`.
+    pub cancelled5_history: Option<Estimate>,
+    /// `reliable_first` без бустов `certainty`.
+    pub reliable_first_no_boost: Option<Estimate>,
+    /// `chunk-recall@5`, если засчитывать и перекрытие (справочно).
+    pub chunk_recall5_with_overlap: Option<Estimate>,
     /// Доля найденных в top-10 ожидаемых заметок по каналам.
     pub channels: BTreeMap<String, f64>,
+}
+
+/// Среднее с интервалом по флагам запросов (`None` — флага нет ни у одного).
+fn flag_estimate(runs: &[QueryRun], f: fn(&QueryRun) -> Option<bool>) -> Option<Estimate> {
+    let v: Vec<f64> = runs
+        .iter()
+        .filter_map(f)
+        .map(|b| if b { 1.0 } else { 0.0 })
+        .collect();
+    (!v.is_empty()).then(|| estimate(&v))
 }
 
 pub fn breakdown(runs: &[QueryRun]) -> Breakdown {
@@ -633,6 +819,14 @@ pub fn breakdown(runs: &[QueryRun]) -> Breakdown {
         by_kind,
         by_lang,
         disjoint: agg(&|r| r.disjoint),
+        long: agg(&|r| r.long),
+        fts_only: agg(&|r| r.fts_only),
+        cancelled5_history: flag_estimate(runs, |r| r.cancelled5_history),
+        reliable_first_no_boost: flag_estimate(runs, |r| r.reliable_first_no_boost),
+        chunk_recall5_with_overlap: flag_estimate(runs, |r| {
+            (r.kind == Kind::Chunk)
+                .then(|| r.leaves.iter().take(5).any(|l| l.evidence_with_overlap))
+        }),
         channels,
     }
 }
@@ -667,6 +861,12 @@ pub struct RunInfo {
 pub struct RunResult {
     pub info: RunInfo,
     pub metrics: Breakdown,
+    /// Сравнение с прежним прогоном (`--compare`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compare: Option<Comparison>,
+    /// Разрезанные границами листов доказательства запросов `chunk` (по данным прогона).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitStats>,
     pub queries: Vec<QueryRun>,
 }
 
@@ -681,9 +881,14 @@ const MEASURED_PATHS: &[&str] = &[
     "deploy",
     "eval/corpus",
     "eval/queries.toml",
+    "eval/insights.toml",
     "eval/grid.toml",
+    "eval/grid-overlap.toml",
+    "eval/grid-chunk-size.toml",
     "eval/grid-confirm.toml",
     "eval/grid-relaxed.toml",
+    "eval/grid-m3.toml",
+    "eval/grid-m3-kind.toml",
 ];
 
 /// `git <args> -- <MEASURED_PATHS>`.
@@ -798,8 +1003,15 @@ pub fn result(
     queries: &[Query],
     mode: Mode,
     label: Option<&str>,
-    runs: Vec<QueryRun>,
+    mut runs: Vec<QueryRun>,
 ) -> RunResult {
+    for r in &mut runs {
+        r.long = r.expect.iter().any(|p| is_long_path(p));
+        r.fts_only = r
+            .expect
+            .iter()
+            .any(|p| corpus.get(p).is_some_and(Note::index_disabled));
+    }
     let ms: Vec<f64> = runs.iter().map(|r| r.ms).collect();
     let st = &s.status;
     let with_model = s.spec.model.is_some();
@@ -826,6 +1038,8 @@ pub fn result(
             query_ms_p95: quantile(&ms, 0.95),
         },
         metrics: breakdown(&runs),
+        compare: None,
+        split: None,
         queries: runs,
     }
 }
@@ -865,6 +1079,7 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
         reranker: a.reranker.clone(),
         sets: parse_sets(&a.sets)?,
         keep_cuda_path: a.keep_cuda_path,
+        ctrl_break: false,
     };
     let mut s = Session::start(p, &spec, &server, !a.reuse)?;
     s.check_model()?;
@@ -876,8 +1091,9 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
         let t0 = Instant::now();
         s.load_corpus(corpus)?;
         println!(
-            "корпус загружен: {} заметок за {:.1} с",
+            "корпус загружен: {} заметок и {} insight за {:.1} с",
             corpus.notes.len(),
+            corpus.insights.len(),
             t0.elapsed().as_secs_f64()
         );
     }
@@ -888,21 +1104,162 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
             s.index_secs, s.status["qdrant"]["points"]
         );
     }
+    let split = chunk_split(&s, queries)?;
+    let mut results = Vec::new();
     for &mode in &a.modes {
         let runs = s.run_queries(queries, mode)?;
-        let r = result(&s, p, corpus, queries, mode, label.as_deref(), runs);
+        let mut r = result(&s, p, corpus, queries, mode, label.as_deref(), runs);
+        r.split = split.clone();
+        results.push(r);
+    }
+    s.stop()?;
+    // reliable_first без бустов certainty: тот же индекс, перезапуск с search.boost_* = 1
+    let certainty: Vec<Query> = queries
+        .iter()
+        .filter(|q| q.kind == Kind::Certainty)
+        .cloned()
+        .collect();
+    if !certainty.is_empty() {
+        let mut nb = spec.clone();
+        nb.sets.extend(
+            NO_CERTAINTY_BOOSTS
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let mut s = Session::start(p, &nb, &server, false)?;
+        s.check_model()?;
+        if nb.model.is_some() {
+            s.wait_indexed()?;
+        }
+        for r in &mut results {
+            let runs = s.run_queries(&certainty, r.info.mode)?;
+            apply_no_boost(r, &runs);
+        }
+        s.stop()?;
+    }
+    let mut failed = Vec::new();
+    for mut r in results {
+        if let Some(prev) = &a.compare {
+            r.compare = Some(compare(&p.repo, prev, &r)?);
+        }
         let (json, md) = report::write_run(&p.results, &r)?;
         report::print_run(&r);
         println!("  {}\n  {}", json.display(), md.display());
+        failed.extend(history_control(&r));
     }
-    s.stop()
+    if !failed.is_empty() {
+        bail!("{}", failed.join("; "));
+    }
+    Ok(())
+}
+
+/// Разрезанные доказательства запросов `chunk` по листам прогона (`None` — таких запросов нет).
+pub fn chunk_split(s: &Session, queries: &[Query]) -> Result<Option<SplitStats>> {
+    if !queries.iter().any(|q| q.kind == Kind::Chunk) {
+        return Ok(None);
+    }
+    Ok(Some(split_stats(&leaf_cores(&s.data)?, queries)))
+}
+
+/// `reliable_first` прохода без бустов → `reliable_first_no_boost` запросов результата.
+pub fn apply_no_boost(r: &mut RunResult, runs: &[QueryRun]) {
+    for x in runs {
+        if let Some(q) = r.queries.iter_mut().find(|q| q.id == x.id) {
+            q.reliable_first_no_boost = x.metrics.reliable_first;
+        }
+    }
+    r.metrics = breakdown(&r.queries);
+}
+
+/// Контроль устаревания: с `include_history: true` замещённые и отозванные insight должны
+/// попадать в top-5 хотя бы иногда (`cancelled@5 > 0`); ноль — набор не проверяет фильтр
+/// статусов (запросы не находят старые записи и с историей), прогон завершается ошибкой.
+pub fn history_control(r: &RunResult) -> Option<String> {
+    match r.metrics.cancelled5_history {
+        Some(e) if e.mean <= 0.0 => Some(format!(
+            "{}: контроль include_history — cancelled@5 = 0, запросы superseded не находят \
+             замещённые записи даже с историей (набор устаревания нечувствителен)",
+            r.info.mode.as_str()
+        )),
+        _ => None,
+    }
 }
 
 /// Отпечаток набора запросов: FNV-1a по id, тексту, ожидаемым заметкам и виду.
 pub fn queries_fingerprint(queries: &[Query]) -> String {
     let text: String = queries
         .iter()
-        .map(|q| format!("{}\0{}\0{}\0{}\0", q.id, q.text, q.expect.join(","), q.kind))
+        .map(|q| {
+            let mut s = format!("{}\0{}\0{}\0{}\0", q.id, q.text, q.expect.join(","), q.kind);
+            // поля M3 — только если заданы: отпечаток запросов M2 не меняется
+            if !q.forbid.is_empty()
+                || !q.weaker.is_empty()
+                || q.evidence.is_some()
+                || !q.also.is_empty()
+            {
+                s.push_str(&format!(
+                    "{}\0{}\0{}\0{}\0",
+                    q.forbid.join(","),
+                    q.weaker.join(","),
+                    q.evidence.as_deref().unwrap_or(""),
+                    q.also.join(",")
+                ));
+            }
+            s
+        })
         .collect();
     super::corpus::fnv1a(text.into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_control_fails_on_zero() {
+        let est = |m: f64| Estimate {
+            mean: m,
+            lo: m,
+            hi: m,
+        };
+        let mut r = RunResult {
+            info: RunInfo {
+                date: String::new(),
+                git: String::new(),
+                label: None,
+                mode: Mode::Hybrid,
+                model: None,
+                model_id: None,
+                device: None,
+                device_reason: None,
+                reranker: None,
+                sets: BTreeMap::new(),
+                server_config: Value::Null,
+                notes: 0,
+                corpus_fingerprint: String::new(),
+                queries: 0,
+                queries_fingerprint: String::new(),
+                index_secs: 0.0,
+                query_ms_p50: 0.0,
+                query_ms_p95: 0.0,
+            },
+            metrics: breakdown(&[]),
+            compare: None,
+            split: None,
+            queries: Vec::new(),
+        };
+        // нет запросов superseded — контроля нет
+        assert!(history_control(&r).is_none());
+        r.metrics.cancelled5_history = Some(est(0.0));
+        assert!(history_control(&r).is_some());
+        r.metrics.cancelled5_history = Some(est(0.2));
+        assert!(history_control(&r).is_none());
+    }
+
+    #[test]
+    fn group_e_notes_go_to_the_solution() {
+        assert_eq!(note_space("ru/zam/vault-secrets"), EVAL_SOLUTION);
+        assert_eq!(note_space("en/long/oncall-handbook"), "knowledge");
+        assert!(EVAL_SOLUTION.parse::<String>().is_ok() && EVAL_SOLUTION.len() == 36);
+    }
 }

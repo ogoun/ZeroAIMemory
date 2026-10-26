@@ -1,0 +1,176 @@
+{
+  "build": null,
+  "cycles": [
+    {
+      "burst_chunks": 1352,
+      "burst_notes": 600,
+      "chunks_per_sec": 13.962090668420593,
+      "data_ok": true,
+      "index_secs": 96.8336356,
+      "jobs_before_stop": 600,
+      "kind": "graceful",
+      "points_expected": 35520,
+      "points_qdrant": 35520,
+      "queue_at_stop": 0,
+      "rep": 0,
+      "shutdown_wait_ms": 6070.0,
+      "shutdown_wait_result": "timeout",
+      "start": {
+        "model_load_ms": 3450.0,
+        "qdrant_from_start_ms": 12345.9897,
+        "qdrant_ready_ms": 12308.0,
+        "replay_done_ms": 11910.503999999999,
+        "vector_ready_ms": 12373.050299999999,
+        "wal_ops": 34
+      },
+      "stop_ms": 7247.7654999999995,
+      "wal_pending_at_stop": 33
+    },
+    {
+      "burst_chunks": null,
+      "burst_notes": 600,
+      "chunks_per_sec": null,
+      "data_ok": true,
+      "index_secs": null,
+      "jobs_before_stop": 233,
+      "kind": "kill",
+      "points_expected": 35520,
+      "points_qdrant": 35520,
+      "queue_at_stop": 367,
+      "rep": 0,
+      "shutdown_wait_ms": null,
+      "shutdown_wait_result": null,
+      "start": {
+        "model_load_ms": 3247.0,
+        "qdrant_from_start_ms": 12076.4891,
+        "qdrant_ready_ms": 12030.0,
+        "replay_done_ms": 11536.729,
+        "vector_ready_ms": 12105.5999,
+        "wal_ops": 54
+      },
+      "stop_ms": null,
+      "wal_pending_at_stop": 53
+    },
+    {
+      "burst_chunks": 1352,
+      "burst_notes": 600,
+      "chunks_per_sec": 11.029411020902058,
+      "data_ok": true,
+      "index_secs": 122.5813416,
+      "jobs_before_stop": 600,
+      "kind": "graceful",
+      "points_expected": 35520,
+      "points_qdrant": 35520,
+      "queue_at_stop": 0,
+      "rep": 1,
+      "shutdown_wait_ms": 6020.0,
+      "shutdown_wait_result": "timeout",
+      "start": {
+        "model_load_ms": 3535.0,
+        "qdrant_from_start_ms": 5793.7426,
+        "qdrant_ready_ms": 5750.0,
+        "replay_done_ms": 5428.78,
+        "vector_ready_ms": 5812.7452,
+        "wal_ops": 36
+      },
+      "stop_ms": 6286.5066,
+      "wal_pending_at_stop": 35
+    },
+    {
+      "burst_chunks": null,
+      "burst_notes": 600,
+      "chunks_per_sec": null,
+      "data_ok": true,
+      "index_secs": null,
+      "jobs_before_stop": 81,
+      "kind": "kill",
+      "points_expected": 35520,
+      "points_qdrant": 35520,
+      "queue_at_stop": 519,
+      "rep": 1,
+      "shutdown_wait_ms": null,
+      "shutdown_wait_result": null,
+      "start": {
+        "model_load_ms": 3387.0,
+        "qdrant_from_start_ms": 6037.6685,
+        "qdrant_ready_ms": 5992.0,
+        "replay_done_ms": 5185.879,
+        "vector_ready_ms": 6053.728300000001,
+        "wal_ops": 19
+      },
+      "stop_ms": null,
+      "wal_pending_at_stop": 18
+    },
+    {
+      "burst_chunks": 1352,
+      "burst_notes": 600,
+      "chunks_per_sec": 11.844853031131182,
+      "data_ok": true,
+      "index_secs": 114.142404,
+      "jobs_before_stop": 600,
+      "kind": "graceful",
+      "points_expected": 35520,
+      "points_qdrant": 35520,
+      "queue_at_stop": 0,
+      "rep": 2,
+      "shutdown_wait_ms": 6014.0,
+      "shutdown_wait_result": "timeout",
+      "start": {
+        "model_load_ms": 3266.0,
+        "qdrant_from_start_ms": 5460.5161,
+        "qdrant_ready_ms": 5420.0,
+        "replay_done_ms": 5190.635,
+        "vector_ready_ms": 5494.883,
+        "wal_ops": 16
+      },
+      "stop_ms": 6284.5181999999995,
+      "wal_pending_at_stop": 27
+    },
+    {
+      "burst_chunks": null,
+      "burst_notes": 600,
+      "chunks_per_sec": null,
+      "data_ok": true,
+      "index_secs": null,
+      "jobs_before_stop": 49,
+      "kind": "kill",
+      "points_expected": 35520,
+      "points_qdrant": 35520,
+      "queue_at_stop": 551,
+      "rep": 2,
+      "shutdown_wait_ms": null,
+      "shutdown_wait_result": null,
+      "start": {
+        "model_load_ms": 3323.0,
+        "qdrant_from_start_ms": 6151.659000000001,
+        "qdrant_ready_ms": 6108.0,
+        "replay_done_ms": 5797.6849999999995,
+        "vector_ready_ms": 6179.5685,
+        "wal_ops": 8
+      },
+      "stop_ms": null,
+      "wal_pending_at_stop": 6
+    }
+  ],
+  "date": "2026-10-25",
+  "device": {
+    "kind": "cuda",
+    "reason": ""
+  },
+  "git": "bd6c722+dirty.a2c11a2d",
+  "host": {
+    "gpu": "NVIDIA GeForce RTX 3090, 1934 MiB, 24576 MiB, 0 %",
+    "logical_cpus": 24,
+    "os": "windows"
+  },
+  "label": "a",
+  "model_id": "bge-m3-fp16@4f1a646a",
+  "notes": 10000,
+  "prepare_secs": 676.1305444,
+  "profile": "gpu",
+  "sets": {
+    "qdrant.flush_interval_sec": "5",
+    "qdrant.shutdown_flush_wait_ms": "6000",
+    "qdrant.wal_capacity_mb": "32"
+  }
+}

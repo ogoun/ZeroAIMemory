@@ -15,6 +15,7 @@ use crate::config::{AdminSecret, ServerConfig};
 use crate::error::not_found;
 use crate::index_state::IndexRuntime;
 use crate::rerank::RerankSlot;
+use crate::vault::VaultKeys;
 use crate::{api, bootstrap, ml, web};
 
 /// Git-хэш сборки (см. build.rs).
@@ -42,6 +43,8 @@ pub struct AppState {
     pub index: Arc<IndexRuntime>,
     /// Реранкер `rerank=on` (загружается при первом таком запросе).
     pub rerank: Arc<RerankSlot>,
+    /// Ключи Vault (§7.6): мастер-ключ, ключи пользователей, состояние блокировки.
+    pub vault: Arc<VaultKeys>,
 }
 
 impl AppState {
@@ -141,13 +144,18 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     let auth = tokio::task::spawn_blocking(move || AuthState::new(&real))
         .await?
         .map_err(|e| anyhow::anyhow!("не удалось подготовить проверку пароля: {e}"))?;
+    // Vault: блокировка (ключ подменён или потерян) — не ошибка старта
+    let vault = Arc::new(VaultKeys::load(&cfg, &system).await?);
     let users = UserDbs::new(data_dir.users_dir());
+    // реестр решений — до индексации и приёма запросов (§11.6)
+    bootstrap::register_solutions(&system, &users).await;
     let index = Arc::new(IndexRuntime::start(&cfg, ml, early_sup, &system, &users).await);
     let rerank = Arc::new(RerankSlot::new(&cfg));
     let state = AppState {
         users,
         index,
         rerank,
+        vault,
         data_dir,
         system,
         admin_hash: Arc::new(admin_hash),

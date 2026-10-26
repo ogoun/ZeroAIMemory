@@ -7,6 +7,8 @@
   import Editor from './Editor.svelte';
   import History from './History.svelte';
   import IndexBadge from './IndexBadge.svelte';
+  import CertaintyBadge from './CertaintyBadge.svelte';
+  import Links from './Links.svelte';
   import { stateShort, stateText } from '../lib/indexing';
   import Lightbox from './Lightbox.svelte';
   import {
@@ -15,9 +17,11 @@
     getNodeHtml,
     listSpaces,
     spaceMatches,
+    type Certainty,
     type NodeInfo,
     type RenderedNode,
   } from '../lib/api';
+  import { CERTAINTIES } from '../lib/journals';
   import { copyText } from '../lib/clipboard';
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
@@ -201,6 +205,11 @@
     const t = info?.frontmatter?.tags;
     return Array.isArray(t) ? t.filter((x): x is string => typeof x === 'string') : [];
   });
+  /** `certainty:` во frontmatter заметки (§7.5). */
+  let certainty = $derived.by((): Certainty | null => {
+    const c = info?.frontmatter?.certainty;
+    return typeof c === 'string' && (CERTAINTIES as string[]).includes(c) ? (c as Certainty) : null;
+  });
   let description = $derived.by(() => {
     const d = info?.frontmatter?.description;
     return typeof d === 'string' ? d : '';
@@ -221,6 +230,7 @@
     </div>
     {#if info}
       <div class="meta muted">
+        {#if certainty}<CertaintyBadge value={certainty} /> ·{/if}
         ревизия {info.current_rev} · изменено {fmtTime(info.updated_at)}
         {#if info.kind === 'note' && info.index_state !== 'indexed'}
           · <span class="istate" title={stateText(info.index_state)}><IndexBadge state={info.index_state} decorative />{stateShort(info.index_state)}</span>
@@ -309,7 +319,9 @@
     {/if}
   </div>
   <div role="tabpanel" hidden={tab !== 'links'}>
-    <p class="muted placeholder">Связи и обратные ссылки появятся в M3.</p>
+    {#if tab === 'links' && info}
+      <Links {user} kind="node" id={info.id} {onexpired} />
+    {/if}
   </div>
 </article>
 
@@ -394,9 +406,6 @@
   .tabs button[aria-selected='true'] {
     color: var(--text);
     border-bottom-color: var(--accent);
-  }
-  .placeholder {
-    padding: 24px 0;
   }
   .render-warnings,
   .toc {

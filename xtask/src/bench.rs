@@ -17,6 +17,10 @@
 //! - `reindex` — пересборка Qdrant из `embeddings` без инференса;
 //! - `fts` — сервер без моделей на том же каталоге: поиск FTS-only и RSS.
 //!
+//! `--scenario first-start` — первый старт Qdrant после массовой индексации (задача 19 M3,
+//! [`first_start`]): свои циклы вместо этапов, итог
+//! `eval/results/<дата>-bench-first-start-<профиль>[-метка].{json,md}`.
+//!
 //! С `--edge` — отдельный замер векторного индекса для ADR 0001: managed Qdrant против
 //! встроенного Qdrant Edge на синтетике 1 млн × 1024 ([`edge`]); профиль и этапы сервера
 //! тогда не используются.
@@ -28,6 +32,7 @@
 
 pub mod copies;
 pub mod edge;
+pub mod first_start;
 pub mod report;
 
 use std::collections::BTreeMap;
@@ -110,6 +115,16 @@ pub enum Phase {
     Fts,
 }
 
+/// Сценарий замера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Scenario {
+    /// Этапы §17 (`--phase`).
+    Phases,
+    /// Первый старт Qdrant после массовой индексации (задача 19 M3).
+    FirstStart,
+}
+
 /// Аргументы `cargo xtask bench`.
 #[derive(Debug, clap::Args)]
 pub struct BenchArgs {
@@ -184,6 +199,35 @@ pub struct BenchArgs {
     /// --edge: не пересобирать примеры с нуля (время сборки тогда не замеряется)
     #[arg(long)]
     pub no_clean_build: bool,
+    /// Сценарий: этапы §17 или first-start (задача 19 M3)
+    #[arg(long, value_enum, default_value = "phases")]
+    pub scenario: Scenario,
+    /// first-start: повторов каждого цикла (graceful и kill)
+    #[arg(long, default_value_t = 3)]
+    pub reps: usize,
+    /// first-start: заметок в пачке цикла (по умолчанию gpu 600, cpu 60)
+    #[arg(long)]
+    pub burst: Option<usize>,
+    /// first-start: через сколько секунд после начала пачки убить сервер (цикл kill)
+    #[arg(long, default_value_t = 15)]
+    pub kill_after: u64,
+    /// first-start: проиндексировать каталог с нуля, даже если он есть
+    #[arg(long)]
+    pub rebuild: bool,
+    /// first-start: не пересоздавать коллекцию перед циклами (варианты без смены
+    /// `qdrant.wal_capacity_mb`)
+    #[arg(long)]
+    pub no_prepare: bool,
+    /// first-start: только циклы graceful (без kill)
+    #[arg(long)]
+    pub graceful_only: bool,
+    /// first-start: вариант `ИМЯ:KEY=VALUE,KEY=VALUE` поверх `--set` (можно повторять;
+    /// циклы чередуют варианты внутри повтора)
+    #[arg(long = "variant", value_name = "NAME:KEY=VALUE,…")]
+    pub variants: Vec<String>,
+    /// Каталог данных прогонов вместо target/bench (first-start: каталог переживает запуски)
+    #[arg(long)]
+    pub work: Option<PathBuf>,
 }
 
 /// Сводка времён, мс.
@@ -739,6 +783,7 @@ fn wait_ready(s: &mut Session, h: &Http) -> Result<()> {
 }
 
 /// Контекст прогона.
+#[derive(Clone)]
 struct Ctx {
     paths: Paths,
     server: PathBuf,
@@ -1252,11 +1297,9 @@ fn phase_kill(c: &Ctx, r: &mut BenchResult) -> Result<()> {
     c.stop(s, "kill")
 }
 
-/// Этап `reindex`: `POST /admin/reindex` (из кэша) и ожидание итога.
-fn phase_reindex(c: &Ctx, r: &mut BenchResult) -> Result<()> {
-    println!("[reindex] пересборка Qdrant из embeddings");
-    let (mut s, h, st) = c.start(r)?;
-    r.startup.push(st);
+/// `POST /admin/reindex` (из кэша) базы пользователя прогона и ожидание итога:
+/// `reindex.last` статуса (поле `result` — отчёт, `null` — ошибка).
+fn run_reindex(s: &mut Session, h: &Http) -> Result<Value> {
     let prev = h.status()?["reindex"]["last"]["finished_at"].clone();
     let adm = &h.admin;
     // пересборка базы пользователя прогона (администратора): итог `reindex.last` виден
@@ -1295,6 +1338,16 @@ fn phase_reindex(c: &Ctx, r: &mut BenchResult) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(50));
     };
+    Ok(last)
+}
+
+/// Этап `reindex`: `POST /admin/reindex` (из кэша) и ожидание итога.
+fn phase_reindex(c: &Ctx, r: &mut BenchResult) -> Result<()> {
+    println!("[reindex] пересборка Qdrant из embeddings");
+    let (mut s, h, st) = c.start(r)?;
+    r.startup.push(st);
+    let t0 = Instant::now();
+    let last = run_reindex(&mut s, &h)?;
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let res = &last["result"];
     if res.is_null() {
@@ -1384,8 +1437,14 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         repo: repo.to_path_buf(),
         corpus: eval.join("corpus"),
         queries: eval.join("queries.toml"),
+        // замеры §17 — на заметках; insight набора M3 bench не загружает
+        insights: eval.join("insights.toml"),
         results: a.out.clone().unwrap_or_else(|| eval.join("results")),
-        work: repo.join("target").join("bench"),
+        // абсолютный: сервер запускается из каталога бинарника
+        work: match &a.work {
+            Some(w) => std::path::absolute(w)?,
+            None => repo.join("target").join("bench"),
+        },
     };
     let corpus = Corpus::load(&paths.corpus)?;
     let queries: Vec<Query> = load_queries(&paths.queries)?;
@@ -1394,8 +1453,10 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         .model
         .clone()
         .unwrap_or_else(|| default_model(device).to_string());
-    let name = match &a.label {
-        Some(l) if !l.is_empty() => format!("{}-{l}", profile.as_str()),
+    let name = match (&a.label, a.scenario) {
+        // first-start: один каталог на профиль для всех вариантов (метка — только в итоге)
+        (_, Scenario::FirstStart) => format!("{}-first-start", profile.as_str()),
+        (Some(l), _) if !l.is_empty() => format!("{}-{l}", profile.as_str()),
         _ => profile.as_str().to_string(),
     };
     let spec = RunSpec {
@@ -1405,6 +1466,8 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         reranker: a.reranker.clone(),
         sets: parse_sets(&a.sets)?,
         keep_cuda_path: a.keep_cuda_path,
+        // Ctrl+Break для штатной остановки нужен только first-start
+        ctrl_break: a.scenario == Scenario::FirstStart,
     };
     let dir = paths.work.join(&spec.name);
     if a.reuse && !dir.join("data").is_dir() {
@@ -1420,6 +1483,9 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         spec,
         queries: queries.iter().map(|q| q.text.clone()).collect(),
     };
+    if a.scenario == Scenario::FirstStart {
+        return first_start_main(&a, &c, &corpus, profile, repo);
+    }
     let mut r = BenchResult {
         date: today(),
         git: git_rev(repo),
@@ -1463,4 +1529,87 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `--scenario first-start`: каталог данных не удаляется (переиспользуется вариантами).
+fn first_start_main(
+    a: &BenchArgs,
+    c: &Ctx,
+    corpus: &Corpus,
+    profile: Profile,
+    repo: &Path,
+) -> Result<()> {
+    let args = first_start::Args {
+        notes: a.notes,
+        reps: a.reps,
+        burst: a.burst.unwrap_or(match profile {
+            Profile::Gpu => 600,
+            Profile::Cpu => 60,
+        }),
+        kill_after: Duration::from_secs(a.kill_after),
+        rebuild: a.rebuild,
+        no_prepare: a.no_prepare,
+        graceful_only: a.graceful_only,
+        variants: a
+            .variants
+            .iter()
+            .map(|v| parse_variant(v))
+            .collect::<Result<_>>()?,
+    };
+    let mut r = first_start::FirstStartResult {
+        date: today(),
+        git: git_rev(repo),
+        profile: Some(profile),
+        label: a.label.clone(),
+        host: host(),
+        sets: c.spec.sets.iter().cloned().collect(),
+        notes: a.notes,
+        ..Default::default()
+    };
+    let res = first_start::run(c, corpus, &args, &mut r);
+    let (json_file, md_file) = first_start::write(&c.paths.results, &r)?;
+    println!("{}", first_start::markdown(&r));
+    println!("  {}\n  {}", json_file.display(), md_file.display());
+    res
+}
+
+/// `ИМЯ:KEY=VALUE,KEY=VALUE` → имя и переопределения.
+fn parse_variant(v: &str) -> Result<(String, Vec<(String, String)>)> {
+    let (name, rest) = v
+        .split_once(':')
+        .with_context(|| format!("--variant {v}: ожидается ИМЯ:KEY=VALUE,…"))?;
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        bail!("--variant {v}: имя — латиница, цифры и '-'");
+    }
+    let sets: Vec<String> = rest
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    Ok((name.to_string(), parse_sets(&sets)?))
+}
+
+#[cfg(test)]
+mod first_start_args_tests {
+    use super::parse_variant;
+
+    #[test]
+    fn variant_name_and_sets() {
+        let (n, s) =
+            parse_variant("ac6:qdrant.flush_interval_sec=1,qdrant.shutdown_flush_wait_ms=6000")
+                .unwrap();
+        assert_eq!(n, "ac6");
+        assert_eq!(
+            s,
+            vec![
+                ("qdrant.flush_interval_sec".to_string(), "1".to_string()),
+                (
+                    "qdrant.shutdown_flush_wait_ms".to_string(),
+                    "6000".to_string()
+                )
+            ]
+        );
+        assert!(parse_variant("без-двоеточия").is_err());
+        assert!(parse_variant("a b:x=1").is_err());
+    }
 }

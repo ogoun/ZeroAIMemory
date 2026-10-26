@@ -1,0 +1,19 @@
+# Чувствительность набора M3 к нарезке (задача 16 M3): перекрытие листов 0/1/2 предложения
+# при прочих умолчаниях. Набор чувствителен, если разности chunk-recall@5 с базой ненулевые
+# (исследование docs/research/2026-10-21-chunking-semantic.md, §5, шаг 1). База — текущее
+# умолчание (1 предложение). У каждой конфигурации свой индекс (меняется `index.chunk_*`).
+#   cargo xtask eval --grid eval/grid-overlap.toml
+model = "bge-m3-fp16"
+device = "cuda"
+
+[[config]]
+name = "overlap1"
+set = { "index.chunk_overlap_sentences" = "1" }
+
+[[config]]
+name = "overlap0"
+set = { "index.chunk_overlap_sentences" = "0" }
+
+[[config]]
+name = "overlap2"
+set = { "index.chunk_overlap_sentences" = "2" }

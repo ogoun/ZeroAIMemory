@@ -15,9 +15,12 @@
 //! ([`gate`]); `--grid` подбирает веса `[search]` и пороги чанкинга ([`grid`]); `--check`
 //! только проверяет корпус и запросы ([`corpus::validate`]).
 
+pub mod compare;
 pub mod corpus;
 pub mod gate;
 pub mod grid;
+pub mod insights;
+pub mod leaves;
 pub mod metrics;
 pub mod report;
 pub mod run;
@@ -26,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use corpus::{Corpus, Query, load_queries, validate};
+use corpus::{Corpus, Query, load_insights, load_queries, validate};
 
 /// Режим поиска прогона.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, serde::Serialize)]
@@ -120,6 +123,12 @@ pub struct EvalArgs {
     /// Каталог результатов (по умолчанию eval/results)
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Каталог корпуса вместо eval/corpus (контрольные прогоны; проверка — как у фрагмента)
+    #[arg(long, value_name = "DIR")]
+    pub corpus: Option<PathBuf>,
+    /// Файл insight вместо eval/insights.toml (несуществующий — без insight)
+    #[arg(long, value_name = "FILE")]
+    pub insights: Option<PathBuf>,
     /// Не убирать из PATH сервера каталоги CUDA Toolkit (по умолчанию убираются: библиотеки
     /// NVIDIA берутся только из <ORT>/cuda, как у пользователя)
     #[arg(long)]
@@ -128,13 +137,20 @@ pub struct EvalArgs {
     /// корпусе (target/eval/<прогон>), например с другими весами --set
     #[arg(long)]
     pub reuse: bool,
+    /// Прежний результат (JSON eval/results/…): парная разность recall@5 и nDCG@10 по общим
+    /// запросам (тот же id, вид и expect) — в отчёт прогона
+    #[arg(long, value_name = "FILE")]
+    pub compare: Option<PathBuf>,
 }
 
 /// Каталоги и файлы набора.
+#[derive(Clone)]
 pub struct Paths {
     pub repo: PathBuf,
     pub corpus: PathBuf,
     pub queries: PathBuf,
+    /// `eval/insights.toml` — insight набора M3.
+    pub insights: PathBuf,
     pub results: PathBuf,
     /// `target/eval` — каталоги данных прогонов.
     pub work: PathBuf,
@@ -145,11 +161,15 @@ impl Paths {
         let eval = repo.join("eval");
         Paths {
             repo: repo.to_path_buf(),
-            corpus: eval.join("corpus"),
+            corpus: a.corpus.clone().unwrap_or_else(|| eval.join("corpus")),
             queries: a
                 .queries
                 .clone()
                 .unwrap_or_else(|| eval.join("queries.toml")),
+            insights: a
+                .insights
+                .clone()
+                .unwrap_or_else(|| eval.join("insights.toml")),
             results: a.out.clone().unwrap_or_else(|| eval.join("results")),
             work: repo.join("target").join("eval"),
         }
@@ -158,7 +178,8 @@ impl Paths {
 
 /// Корпус и запросы после проверки (полный набор — со всеми требованиями).
 pub fn load_set(p: &Paths, full: bool) -> Result<(Corpus, Vec<Query>, corpus::Summary)> {
-    let corpus = Corpus::load(&p.corpus)?;
+    let mut corpus = Corpus::load(&p.corpus)?;
+    corpus.insights = load_insights(&p.insights)?;
     let queries = load_queries(&p.queries)?;
     let s = validate(&corpus, &queries, full)?;
     Ok((corpus, queries, s))
@@ -168,7 +189,7 @@ fn print_summary(s: &corpus::Summary) {
     let kinds: Vec<String> = s.by_kind.iter().map(|(k, n)| format!("{k} {n}")).collect();
     println!(
         "корпус: {} заметок (ru {}, en {}; без запросов {}); запросов {}: {}; \
-         перефразов без общих слов {} ({:.0} %)",
+         перефразов без общих слов {} ({:.0} % запросов видов M2)",
         s.notes,
         s.notes_ru,
         s.notes_en,
@@ -178,6 +199,30 @@ fn print_summary(s: &corpus::Summary) {
         s.disjoint,
         s.disjoint_share() * 100.0
     );
+    if s.insights > 0 || s.long_notes > 0 {
+        println!(
+            "набор M3: insight {} (цепочек замещения {}, отзывов {}, пар противоречий {}; \
+             надёжное лексически ближе к запросу в {}, гипотеза — в {}), длинных заметок {} \
+             (бесструктурных абзацев длиннее {} символов: {}), заметок с index: false {}, \
+             запросов с also {}",
+            s.insights,
+            s.chains,
+            s.retracted,
+            s.contradictions,
+            s.certainty_reliable_closer,
+            s.certainty_hypothesis_closer,
+            s.long_notes,
+            corpus::LONG_PARAGRAPH_CHARS,
+            s.long_paragraphs,
+            s.fts_only_notes,
+            s.with_also
+        );
+    }
+}
+
+/// Полный набор `eval/` (все требования проверки) — без своих корпуса, insight и запросов.
+fn full_set(a: &EvalArgs) -> bool {
+    a.queries.is_none() && a.corpus.is_none() && a.insights.is_none()
 }
 
 /// Точка входа `cargo xtask eval`.
@@ -185,12 +230,12 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     let p = Paths::new(repo, &a);
     if a.check {
         // фрагмент (--queries) проверяется без требований к полному набору
-        let (_, _, s) = load_set(&p, a.queries.is_none())?;
+        let (_, _, s) = load_set(&p, full_set(&a))?;
         print_summary(&s);
         println!("EVAL-CHECK OK");
         return Ok(());
     }
-    let (corpus, queries, s) = load_set(&p, a.queries.is_none())?;
+    let (corpus, queries, s) = load_set(&p, full_set(&a))?;
     print_summary(&s);
     if a.quality_gate {
         return gate::run(&a, &p, &corpus, &queries);

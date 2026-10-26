@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use sha2::{Digest, Sha256};
 use tokenizers::{Encoding, PostProcessor as _, Tokenizer, TruncationDirection};
 use zam_markdown::{ApproxCounter, TokenCounter};
 
@@ -29,16 +30,20 @@ pub(crate) fn cap_text(text: &str, max_tokens: usize) -> &str {
     }
 }
 
-/// Токенизатор и признак того, что счётчик хотя бы раз откатился на оценку.
+/// Токенизатор, его идентификатор и признак того, что счётчик хотя бы раз откатился на оценку.
 pub(crate) struct Shared {
     tok: Tokenizer,
+    /// `sha256:<первые 16 hex>` содержимого `tokenizer.json` ([`TokenCounter::tokenizer_id`]):
+    /// у моделей с одним токенизатором (bge-m3 int8 и fp16) совпадает.
+    id: String,
     degraded: AtomicBool,
 }
 
 impl Shared {
-    fn new(tok: Tokenizer) -> Arc<Shared> {
+    fn new(tok: Tokenizer, id: String) -> Arc<Shared> {
         Arc::new(Shared {
             tok,
+            id,
             degraded: AtomicBool::new(false),
         })
     }
@@ -82,11 +87,21 @@ fn tok_err(e: impl std::fmt::Display) -> MlError {
     MlError::Tokenizer(e.to_string())
 }
 
+/// Идентификатор токенизатора по содержимому `tokenizer.json`.
+fn tokenizer_id(bytes: &[u8]) -> String {
+    let h = Sha256::digest(bytes);
+    let hex: String = h[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
 /// Загружает `tokenizer.json` и снимает зашитые в него усечение и паддинг.
-/// Возвращает токенизатор и id паддинга (из `tokenizer.json`, иначе `<pad>`/`[PAD]`, иначе 0).
-fn load_raw(path: &Path) -> Result<(Tokenizer, u32), MlError> {
-    let mut t = Tokenizer::from_file(path)
-        .map_err(|e| MlError::Tokenizer(format!("{}: {e}", path.display())))?;
+/// Возвращает токенизатор, id паддинга (из `tokenizer.json`, иначе `<pad>`/`[PAD]`, иначе 0)
+/// и идентификатор токенизатора ([`tokenizer_id`]).
+fn load_raw(path: &Path) -> Result<(Tokenizer, u32, String), MlError> {
+    let bad = |e: &dyn std::fmt::Display| MlError::Tokenizer(format!("{}: {e}", path.display()));
+    let bytes = std::fs::read(path).map_err(|e| bad(&e))?;
+    let id = tokenizer_id(&bytes);
+    let mut t = Tokenizer::from_bytes(&bytes).map_err(|e| bad(&e))?;
     let pad_id = t
         .get_padding()
         .map(|p| p.pad_id)
@@ -95,16 +110,16 @@ fn load_raw(path: &Path) -> Result<(Tokenizer, u32), MlError> {
         .unwrap_or(0);
     t.with_truncation(None).map_err(tok_err)?;
     t.with_padding(None);
-    Ok((t, pad_id))
+    Ok((t, pad_id, id))
 }
 
 impl Tok {
     pub fn load(path: &Path) -> Result<Tok, MlError> {
-        let (t, pad_id) = load_raw(path)?;
+        let (t, pad_id, id) = load_raw(path)?;
         let n_added = t.get_post_processor().map_or(0, |p| p.added_tokens(false));
         let n_added_pair = t.get_post_processor().map_or(0, |p| p.added_tokens(true));
         Ok(Tok {
-            inner: Shared::new(t),
+            inner: Shared::new(t, id),
             n_added,
             n_added_pair,
             pad_id,
@@ -191,7 +206,8 @@ impl BgeTokenCounter {
     pub fn load(models_dir: &Path, id: &str) -> Result<BgeTokenCounter, MlError> {
         let path = model_dir(models_dir, id)?.join(TOKENIZER_FILE);
         require_file(&path)?;
-        Ok(BgeTokenCounter(Shared::new(load_raw(&path)?.0)))
+        let (t, _, id) = load_raw(&path)?;
+        Ok(BgeTokenCounter(Shared::new(t, id)))
     }
 }
 
@@ -207,6 +223,9 @@ impl TokenCounter for BgeTokenCounter {
     }
     fn is_exact(&self) -> bool {
         self.0.is_exact()
+    }
+    fn tokenizer_id(&self) -> String {
+        self.0.id.clone()
     }
 }
 
@@ -229,10 +248,23 @@ mod tests {
     fn fallback_marks_counter_inexact() {
         let mut t = Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
         t.with_truncation(None).unwrap();
-        let sh = Shared::new(t);
+        let sh = Shared::new(t, "test".into());
         let c = BgeTokenCounter::new(sh.clone());
         assert!(c.is_exact());
         assert_eq!(sh.fallback("abcdefg", "сбой"), 2);
         assert!(!c.is_exact());
+        assert_eq!(
+            c.tokenizer_id(),
+            "test",
+            "откат на оценку идентификатор не меняет"
+        );
+    }
+
+    #[test]
+    fn tokenizer_id_by_content() {
+        assert_eq!(tokenizer_id(b"{}"), tokenizer_id(b"{}"));
+        assert_ne!(tokenizer_id(b"{}"), tokenizer_id(b"{ }"));
+        assert!(tokenizer_id(b"{}").starts_with("sha256:"));
+        assert_eq!(tokenizer_id(b"{}").len(), "sha256:".len() + 16);
     }
 }

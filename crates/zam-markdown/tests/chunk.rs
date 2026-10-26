@@ -625,6 +625,424 @@ fn note_l1_respects_max_chars_and_section_l1_max_tokens() {
     assert!(ApproxCounter.count(&s) <= 20 && s.ends_with('…'), "{s:?}");
 }
 
+// ---------- Сила границ (задача 17 M3) ----------
+
+/// Абзац прозы не короче `tokens` токенов оценки: предложения с меткой `tag`.
+fn prose(tokens: usize, tag: &str) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while ApproxCounter.count(&s) < tokens {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(&format!("Фраза {tag} номер {i} про нарезку."));
+        i += 1;
+    }
+    s
+}
+
+fn with(lambda: f64, cohesion: bool) -> ChunkParams {
+    ChunkParams {
+        boundary_lambda: lambda,
+        cohesion,
+        ..ChunkParams::default()
+    }
+}
+
+fn chunks_with(src: &str, p: &ChunkParams) -> Vec<ChunkDraft> {
+    chunk_note(src, &parse(src), p, &ApproxCounter)
+}
+
+/// Последняя непустая строка — заголовок ATX уровня из `levels`.
+fn ends_with_heading(text: &str, levels: std::ops::RangeInclusive<usize>) -> bool {
+    let last = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    let t = last.trim_start();
+    let n = t.bytes().take_while(|&b| b == b'#').count();
+    levels.contains(&n) && t[n..].starts_with(' ')
+}
+
+/// Сценарий исследования (§2): P1 около 310 токенов, H4–H6, P2 = 300. Лист не кончается
+/// заголовком, заголовок уходит в лист со своим содержимым.
+fn check_heading_never_ends_leaf(marks: &str) {
+    let level = marks.len();
+    for lambda in [0.0, 0.5, 1.0, 2.0] {
+        for p1 in (280..=330).step_by(3) {
+            let src = format!(
+                "# Заметка\n\n{}\n\n{marks} Подзаголовок\n\n{}\n",
+                prose(p1, "первый"),
+                prose(300, "второй")
+            );
+            let all = chunks_with(&src, &with(lambda, false));
+            let ls = leaves(&all);
+            for l in &ls {
+                assert!(
+                    !ends_with_heading(&l.text, level..=level),
+                    "λ={lambda}, P1={p1}: лист кончается заголовком: …{:?}",
+                    l.text.lines().rev().take(3).collect::<Vec<_>>()
+                );
+            }
+            let head = format!("{marks} Подзаголовок");
+            let l = ls
+                .iter()
+                .find(|l| l.text.contains(&head))
+                .expect("лист с заголовком");
+            assert!(
+                l.text.contains("Фраза второй номер 0 "),
+                "λ={lambda}, P1={p1}: заголовок без содержимого"
+            );
+        }
+    }
+}
+
+#[test]
+fn h4_heading_never_ends_leaf() {
+    check_heading_never_ends_leaf("####");
+}
+
+#[test]
+fn h5_h6_never_end_leaf() {
+    check_heading_never_ends_leaf("#####");
+    check_heading_never_ends_leaf("######");
+}
+
+/// Склеенная секция (короче `merge_below`, склеена со следующей того же родителя): строка
+/// H1–H3 второй секции внутри группы — тоже заголовок; лист ею не кончается, заголовок
+/// уходит в лист со своим содержимым (fix round 1 задачи 17).
+///
+/// Склейка допускается, только если группа целиком не длиннее `target_max`, поэтому разрез
+/// внутри неё возникает лишь там, где сумма оценок единиц больше оценки текста группы:
+/// у каждой единицы своё округление вверх (здесь — абзацы из одной буквы: 1 токен на
+/// единицу против ~0,86 в тексте группы). Сценарий перебирает длины секций и проверяет, что
+/// разрез внутри склеенной группы действительно случается. Это сторож округления оценщика
+/// токенов: при его смене тест упадёт громко (`cut_inside > 0`), а не пройдёт пусто.
+#[test]
+fn glued_section_heading_never_ends_leaf() {
+    let mut cut_inside = 0;
+    for lambda in [0.0, 0.5, 1.0, 2.0] {
+        for k in (20..=60).step_by(4) {
+            for m in (4..=40).step_by(4) {
+                let src = format!(
+                    "# Заметка\n\n## Короткая\n\n{}## Следующая\n\n{}",
+                    "а\n\n".repeat(k),
+                    "б\n\n".repeat(m)
+                );
+                let p = ChunkParams {
+                    target_min: 5,
+                    target_max: 60,
+                    hard_max: 200,
+                    merge_below: 60,
+                    overlap_sentences: 0,
+                    ..with(lambda, false)
+                };
+                let all = chunks_with(&src, &p);
+                let ls = leaves(&all);
+                // строка H1–H3 второй секции есть в тексте листа, только если секции склеены
+                // (у отдельной секции заголовок — в `heading_path`, не в тексте)
+                let Some(second) = ls.iter().find(|l| l.text.contains("## Следующая"))
+                else {
+                    continue;
+                };
+                assert_eq!(second.heading_path, "Заметка > Короткая", "путь группы");
+                let group: Vec<_> = ls
+                    .iter()
+                    .filter(|l| l.heading_path == "Заметка > Короткая")
+                    .collect();
+                if group.len() > 1 {
+                    cut_inside += 1;
+                }
+                for l in &group {
+                    assert!(
+                        !ends_with_heading(&l.text, 1..=3),
+                        "λ={lambda}, k={k}, m={m}: лист кончается строкой H1–H3: …{:?}",
+                        l.text.lines().rev().take(3).collect::<Vec<_>>()
+                    );
+                }
+                assert!(
+                    second.text.contains("б"),
+                    "λ={lambda}, k={k}, m={m}: заголовок без содержимого"
+                );
+            }
+        }
+    }
+    assert!(
+        cut_inside > 0,
+        "склеенная группа ни разу не разрезана — сценарий пустой"
+    );
+}
+
+#[test]
+fn colon_intro_stays_with_block() {
+    let code: String = (0..40)
+        .map(|i| format!("let value_{i} = compute(input_{i}, options);\n"))
+        .collect();
+    let list: String = (0..40)
+        .map(|i| format!("- пункт списка номер {i} с пояснением\n"))
+        .collect();
+    let table: String = std::iter::once("| ключ | значение |\n|---|---|\n".to_string())
+        .chain((0..40).map(|i| format!("| k{i} | значение номер {i} |\n")))
+        .collect();
+    let blocks = [
+        (format!("```rust\n{code}```\n"), "```rust"),
+        (list, "- пункт списка номер 0 "),
+        (table, "| ключ |"),
+    ];
+    for (block, start) in &blocks {
+        for lambda in [0.0, 0.5, 1.0] {
+            for p1 in (280..=330).step_by(5) {
+                let src = format!(
+                    "# Заметка\n\n{} Пример настройки:\n\n{block}\nПосле блока.\n",
+                    prose(p1, "ввод")
+                );
+                let all = chunks_with(&src, &with(lambda, false));
+                let l = leaves(&all)
+                    .into_iter()
+                    .find(|l| l.text.contains("Пример настройки:"))
+                    .expect("лист с вводной фразой");
+                assert!(
+                    l.text.contains(start),
+                    "λ={lambda}, P1={p1}: вводная фраза оторвана от {start:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Вводная фраза в выделении (`**Пример:**`, `__…:__`, `*…:*`, `_…:_`) — тоже вводная:
+/// завершающая разметка выделения не мешает признаку «:» (fix round 1 задачи 17).
+#[test]
+fn emphasized_colon_intro_stays_with_block() {
+    let code: String = (0..40)
+        .map(|i| format!("let value_{i} = compute(input_{i}, options);\n"))
+        .collect();
+    for intro in [
+        "**Пример настройки:**",
+        "__Пример настройки:__",
+        "*Пример настройки:*",
+        "_Пример настройки:_",
+        "**Пример настройки**:",
+        // HTML-выделение (ревью fix round 2 задачи 17, Minor 3)
+        "<b>Пример настройки:</b>",
+        "<strong>Пример настройки:</strong>",
+        "<b>Пример настройки</b>:",
+    ] {
+        for lambda in [0.0, 0.5] {
+            for p1 in (280..=330).step_by(5) {
+                let src = format!(
+                    "# Заметка\n\n{} {intro}\n\n```rust\n{code}```\n\nПосле блока.\n",
+                    prose(p1, "ввод")
+                );
+                let all = chunks_with(&src, &with(lambda, false));
+                let l = leaves(&all)
+                    .into_iter()
+                    .find(|l| l.text.contains(intro))
+                    .expect("лист с вводной фразой");
+                assert!(
+                    l.text.contains("```rust"),
+                    "{intro} λ={lambda}, P1={p1}: вводная фраза оторвана от кода"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn heading_path_includes_h4() {
+    let src = format!(
+        "# A\n\n## B\n\n{}\n\n#### Глубокий\n\n{}\n\n##### Ещё\n\n{}\n\n### C\n\n{}\n",
+        prose(400, "один"),
+        prose(400, "два"),
+        prose(400, "три"),
+        prose(400, "четыре")
+    );
+    let path_of = |all: &[ChunkDraft], needle: &str| -> String {
+        leaves(all)
+            .into_iter()
+            .find(|l| l.text.contains(needle))
+            .map(|l| l.heading_path.clone())
+            .expect("лист")
+    };
+    let all = chunks(&src);
+    assert_eq!(path_of(&all, "Фраза один номер 0 "), "A > B");
+    assert_eq!(path_of(&all, "Фраза два номер 0 "), "A > B > Глубокий");
+    assert_eq!(
+        path_of(&all, "Фраза три номер 0 "),
+        "A > B > Глубокий > Ещё"
+    );
+    // H3 сбрасывает H4–H6
+    assert_eq!(path_of(&all, "Фраза четыре номер 0 "), "A > B > C");
+    // L1 секций по-прежнему по H1–H2
+    assert!(
+        all.iter()
+            .filter(|d| d.level == ChunkLevel::Section)
+            .all(|d| !d.heading_path.contains("Глубокий"))
+    );
+    // выключатель: путь только по H1–H3, как в M2
+    let p = ChunkParams {
+        heading_path_h4: false,
+        ..ChunkParams::default()
+    };
+    let all = chunks_with(&src, &p);
+    assert_eq!(path_of(&all, "Фраза три номер 0 "), "A > B");
+}
+
+/// Фикстура golden без H4–H6 и без абзацев на «:» — исправления задачи 17 её не касаются.
+fn untouched_by_fixes(src: &str) -> bool {
+    !src.lines().any(|l| {
+        let t = l.trim_start();
+        let n = t.bytes().take_while(|&b| b == b'#').count();
+        ((4..=6).contains(&n) && t[n..].starts_with(' ')) || l.trim_end().ends_with(':')
+    })
+}
+
+#[test]
+fn dp_matches_greedy_when_lambda_zero() {
+    // λ = 0 — жадная упаковка M2: golden-фикстуры M2 без H4–H6 и «:» не меняются,
+    // в том числе с включённой связностью (она влияет только на выбор разреза при λ > 0)
+    let mut checked = 0;
+    let mut sources: Vec<PathBuf> = fs::read_dir(golden_dir())
+        .expect("каталог golden_chunks")
+        .map(|e| e.expect("запись").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .collect();
+    sources.sort();
+    for path in &sources {
+        let src = fs::read_to_string(path).expect("фикстура");
+        if !untouched_by_fixes(&src) {
+            continue;
+        }
+        let expected = fs::read_to_string(path.with_extension("json"))
+            .expect("golden .json")
+            .replace("\r\n", "\n");
+        for cohesion in [false, true] {
+            let actual = golden_json(&chunks_with(&src, &with(0.0, cohesion)));
+            assert_eq!(actual, expected, "{} (cohesion={cohesion})", path.display());
+        }
+        checked += 1;
+    }
+    assert!(checked >= 10, "фикстур без H4–H6 и «:» {checked} < 10");
+}
+
+#[test]
+fn dp_prefers_strong_boundary_when_lambda_positive() {
+    let ends = |src: &str, p: &ChunkParams| -> Vec<usize> {
+        leaves(&chunks_with(src, p))
+            .iter()
+            .map(|l| l.range.clone().expect("диапазон").end)
+            .collect()
+    };
+    // Граница абзацев против границы предложений. Q и R — целые абзацы, P длиннее
+    // target_max и режется по предложениям. Жадная упаковка дописывает к Q начало P до
+    // цели (разрезы — между предложениями), DP с λ > 0 закрывает лист на конце Q (сила 2).
+    let (q, p, r) = (prose(300, "кью"), prose(600, "пэ"), prose(300, "эр"));
+    let src = format!(
+        "# T
+
+{q}
+
+{p}
+
+{r}
+"
+    );
+    let q_end = src.find(&q).expect("Q") + q.len();
+    assert!(
+        !ends(&src, &with(0.0, false)).contains(&q_end),
+        "жадная режет внутри P"
+    );
+    for lambda in [0.5, 1.0, 2.0] {
+        assert!(
+            ends(&src, &with(lambda, false)).contains(&q_end),
+            "λ={lambda}: разрез не на границе абзацев"
+        );
+    }
+    // Заголовок H4 против границы абзацев: абзацы 190, 150, 150, H4, 150, 150 (цель около 400).
+    // Жадная закрывает первый лист после двух абзацев, DP — перед H4 (сила 4 против 2).
+    let paras: Vec<String> = [("а", 190), ("б", 150), ("в", 150), ("г", 150), ("д", 150)]
+        .iter()
+        .map(|&(t, n)| prose(n, t))
+        .collect();
+    let src = format!(
+        "# T
+
+{}
+
+{}
+
+{}
+
+#### Раздел
+
+{}
+
+{}
+",
+        paras[0], paras[1], paras[2], paras[3], paras[4]
+    );
+    let c_end = src.find(&paras[2]).expect("абзац в") + paras[2].len();
+    assert!(
+        !ends(&src, &with(0.0, false)).contains(&c_end),
+        "жадная режет перед в"
+    );
+    for lambda in [0.5, 1.0, 2.0] {
+        assert!(
+            ends(&src, &with(lambda, false)).contains(&c_end),
+            "λ={lambda}: разрез не перед H4"
+        );
+    }
+}
+
+#[test]
+fn cohesion_moves_cut_to_topic_change() {
+    // Один длинный абзац: две темы с разной лексикой. При λ > 0 и связности разрез
+    // ставится на смене темы, а не на ближайшем к цели предложении.
+    let topic_a: String = (0..6)
+        .map(|i| {
+            format!("Репликация базы данных отстаёт на реплике {i}, журнал репликации растёт. ")
+        })
+        .collect();
+    let topic_b: String = (0..9)
+        .map(|i| {
+            format!("Сертификаты шлюза истекают через {i} дней, обновление сертификатов падает. ")
+        })
+        .collect();
+    let src = format!("# T\n\n{}{}\n", topic_a, topic_b.trim_end());
+    let shift = src
+        .find("Сертификаты шлюза истекают через 0")
+        .expect("смена темы");
+    let mut p = ChunkParams {
+        target_min: 100,
+        target_max: 200,
+        hard_max: 400,
+        merge_below: 20,
+        overlap_sentences: 0,
+        boundary_lambda: 1.0,
+        cohesion: true,
+        heading_path_h4: true,
+    };
+    let cuts = |p: &ChunkParams| -> Vec<usize> {
+        leaves(&chunks_with(&src, p))
+            .iter()
+            .skip(1)
+            .map(|l| l.range.clone().expect("диапазон").start)
+            .collect()
+    };
+    let with_cohesion = cuts(&p);
+    assert!(
+        with_cohesion.contains(&shift),
+        "разрезы {with_cohesion:?}, смена темы {shift}"
+    );
+    p.cohesion = false;
+    let without = cuts(&p);
+    assert!(
+        !without.contains(&shift),
+        "без связности разрез у цели: {without:?}"
+    );
+}
+
 // ---------- Golden ----------
 
 #[derive(Serialize)]
@@ -634,6 +1052,21 @@ struct GoldenChunk<'a> {
     token_count: usize,
     range: Option<[usize; 2]>,
     head: String,
+}
+
+/// JSON golden-файла по чанкам.
+fn golden_json(all: &[ChunkDraft]) -> String {
+    let golden: Vec<_> = all
+        .iter()
+        .map(|d| GoldenChunk {
+            level: d.level.as_str(),
+            heading_path: &d.heading_path,
+            token_count: d.token_count,
+            range: d.range.clone().map(|r| [r.start, r.end]),
+            head: d.text.chars().take(40).collect(),
+        })
+        .collect();
+    serde_json::to_string_pretty(&golden).expect("json") + "\n"
 }
 
 fn golden_dir() -> PathBuf {
@@ -655,18 +1088,7 @@ fn golden_chunks() {
     let mut failed = Vec::new();
     for path in &sources {
         let src = fs::read_to_string(path).expect("чтение фикстуры");
-        let all = chunks(&src);
-        let golden: Vec<_> = all
-            .iter()
-            .map(|d| GoldenChunk {
-                level: d.level.as_str(),
-                heading_path: &d.heading_path,
-                token_count: d.token_count,
-                range: d.range.clone().map(|r| [r.start, r.end]),
-                head: d.text.chars().take(40).collect(),
-            })
-            .collect();
-        let actual = serde_json::to_string_pretty(&golden).expect("json") + "\n";
+        let actual = golden_json(&chunks(&src));
         let json_path = path.with_extension("json");
         if bless {
             fs::write(&json_path, &actual).expect("запись golden");
@@ -837,7 +1259,67 @@ proptest! {
             hard_max: hard,
             merge_below: hard / 6,
             overlap_sentences: 1,
+            ..ChunkParams::default()
         };
         check_invariants(&src, &p)?;
+    }
+
+    /// Выбор разреза DP (λ > 0) и связность: те же инварианты (`src[range] == text`,
+    /// `hard_max`, покрытие тела).
+    #[test]
+    fn chunk_invariants_boundary_lambda(
+        src in chunk_doc(),
+        lambda in prop::sample::select(vec![0.0, 0.5, 1.0, 2.0]),
+        cohesion in any::<bool>(),
+    ) {
+        check_invariants(&src, &with(lambda, cohesion))?;
+    }
+
+    #[test]
+    fn chunk_invariants_boundary_lambda_small_budgets(
+        src in long_doc(),
+        hard in 4usize..60,
+        lambda in prop::sample::select(vec![0.0, 0.5, 1.0, 2.0]),
+        cohesion in any::<bool>(),
+    ) {
+        let p = ChunkParams {
+            target_min: hard / 3,
+            target_max: hard * 2 / 3,
+            hard_max: hard,
+            merge_below: hard / 6,
+            overlap_sentences: 1,
+            boundary_lambda: lambda,
+            cohesion,
+            heading_path_h4: true,
+        };
+        check_invariants(&src, &p)?;
+    }
+
+    /// Фаззинг: произвольный текст и пороги — без паник, листы в пределах `hard_max`,
+    /// `text` кончается на `src[range]`.
+    #[test]
+    fn chunk_note_fuzz_never_panics(
+        src in "(\\PC|\n|#|:|`|-|\\|){0,1500}",
+        hard in 1usize..200,
+        lambda in 0.0f64..3.0,
+        cohesion in any::<bool>(),
+        h4 in any::<bool>(),
+    ) {
+        let p = ChunkParams {
+            target_min: hard / 2,
+            target_max: hard,
+            hard_max: hard,
+            merge_below: hard / 4,
+            overlap_sentences: 2,
+            boundary_lambda: lambda,
+            cohesion,
+            heading_path_h4: h4,
+        };
+        for d in chunk_note(&src, &parse(&src), &p, &ApproxCounter) {
+            if let Some(r) = d.range.clone() {
+                prop_assert!(d.token_count <= hard);
+                prop_assert!(d.text.ends_with(&src[r]));
+            }
+        }
     }
 }

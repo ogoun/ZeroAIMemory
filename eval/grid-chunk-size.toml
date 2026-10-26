@@ -1,0 +1,19 @@
+# Чувствительность набора M3 к положению границ листов (задача 16 M3): размер листа при прочих
+# умолчаниях. Перекрытие (eval/grid-overlap.toml) границы собственного текста листов не
+# двигает — упаковка идёт до перекрытия, — поэтому chunk-recall@5 по собственному тексту листа
+# от него не зависит; границы двигает размер. База — умолчание 300–500/800.
+#   cargo xtask eval --grid eval/grid-chunk-size.toml
+model = "bge-m3-fp16"
+device = "cuda"
+
+[[config]]
+name = "chunk300-500"
+set = {}
+
+[[config]]
+name = "chunk150-300"
+set = { "index.chunk_target_min" = "150", "index.chunk_target_max" = "300", "index.chunk_hard_max" = "600" }
+
+[[config]]
+name = "chunk500-800"
+set = { "index.chunk_target_min" = "500", "index.chunk_target_max" = "800", "index.chunk_hard_max" = "960" }

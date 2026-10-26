@@ -1,6 +1,13 @@
 //! Запись узлов: создание, замена (`If-Match`), PATCH секций, перенос, удаление в
 //! корзину, восстановление и список корзины.
 //!
+//! Ответ записи заметки (создание, замена, PATCH) — `Node` и непустые `warnings`:
+//! `certainty_not_recognized` — во frontmatter ключ `certainty`/`evidence` в нераспознаваемом
+//! написании (в кавычках, с заглавными буквами): такой ключ статус не задаёт (§7.5);
+//! `unknown relation type: <тип>` и `invalid relation: <строка>` — строка `relations:`, не
+//! давшая ребра графа (§8.5); `secrets_detected` (+ `secrets_detected: [{kind, line}]`) — в тексте
+//! найдены секреты, в индекс они уходят замаскированными (§7.6, [`crate::api::secrets`]).
+//!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
 //! слоем `DefaultBodyLimit` (см. `api::router`).
@@ -14,7 +21,7 @@ use serde_json::{Value, json};
 use zam_markdown::PatchOp;
 use zam_store::{
     NewNote, Node, NodePath, create_folder, create_note, delete_node, list_trash, move_node,
-    patch_note_within, restore_node, update_note,
+    node_content, patch_note_within, restore_node, update_note,
 };
 
 use super::{audit_node, write_error};
@@ -43,6 +50,35 @@ pub struct Create {
     message: Option<String>,
 }
 
+/// Предупреждение: ключ `certainty`/`evidence` во frontmatter написан так, что не распознан.
+pub const CERTAINTY_NOT_RECOGNIZED: &str = "certainty_not_recognized";
+
+/// Предупреждения записи заметки по её тексту.
+fn note_warnings(content: &str) -> Vec<String> {
+    let doc = zam_markdown::parse(content);
+    let mut out = Vec::new();
+    if let Some(f) = &doc.frontmatter
+        && !zam_markdown::unrecognized_certainty_keys(&f.raw).is_empty()
+    {
+        out.push(CERTAINTY_NOT_RECOGNIZED.to_string());
+    }
+    out.extend(zam_store::links::relation_warnings(&doc));
+    out
+}
+
+/// `Node` как JSON с `warnings` (только непустые).
+fn node_reply(node: &Node, content: &str) -> Result<Value, ApiError> {
+    let mut v = serde_json::to_value(node).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let w = note_warnings(content);
+    if !w.is_empty()
+        && let Value::Object(o) = &mut v
+    {
+        o.insert("warnings".into(), json!(w));
+    }
+    crate::api::secrets::attach(&mut v, content);
+    Ok(v)
+}
+
 fn check_size(st: &AppState, content: &str) -> Result<(), ApiError> {
     let max = st.cfg.limits.note_max_bytes;
     if content.len() > max {
@@ -60,16 +96,19 @@ pub async fn create(
     p: Principal,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
-) -> Result<(StatusCode, Json<Node>), ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let req: Create = json_body(body)?;
     let path = NodePath::parse(&req.path)?;
     let sc = space_scope(&st, &p, &headers, &req.space, Mode::Write).await?;
-    let node = match req.kind {
+    let (node, content) = match req.kind {
         Kind::Folder => {
             if req.content.is_some() || req.l0.is_some() {
                 return Err(ApiError::BadRequest("у папки нет content и l0".into()));
             }
-            create_folder(&sc.db, sc.space.id, path).await?
+            (
+                create_folder(&sc.db, sc.space.id, path).await?,
+                String::new(),
+            )
         }
         Kind::Note => {
             let content = req.content.unwrap_or_default();
@@ -78,20 +117,20 @@ pub async fn create(
             let n = NewNote {
                 space_id: sc.space.id,
                 path,
-                content,
+                content: content.clone(),
                 l0: req.l0,
                 attrib,
             };
-            create_note(&sc.db, n).await?
+            (create_note(&sc.db, n).await?, content)
         }
     };
-    st.render_gen.bump_space(sc.user.id, sc.space.id);
+    st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
-    Ok((StatusCode::CREATED, Json(node)))
+    Ok((StatusCode::CREATED, Json(node_reply(&node, &content)?)))
 }
 
 /// Ревизия из `If-Match`: `3`, `"3"` или `W/"3"`.
-fn if_match(headers: &HeaderMap) -> Result<i64, ApiError> {
+pub(crate) fn if_match(headers: &HeaderMap) -> Result<i64, ApiError> {
     let v = headers
         .get(header::IF_MATCH)
         .ok_or(ApiError::PreconditionRequired)?;
@@ -117,17 +156,18 @@ pub async fn replace(
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let base = if_match(&headers)?;
     let req: Replace = json_body(body)?;
     check_size(&st, &req.content)?;
     let attrib = attribution(&p, &headers, req.message)?;
+    let content = req.content.clone();
     match update_note(&sc.db, sc.node.id, base, req.content, req.l0, attrib).await {
         Ok(n) => {
             st.index.notify();
-            Ok(Json(n))
+            Ok(Json(node_reply(&n, &content)?))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, base, e).await),
     }
@@ -147,7 +187,7 @@ pub async fn patch(
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let req: Patch = json_body(body)?;
@@ -156,7 +196,8 @@ pub async fn patch(
     match patch_note_within(&sc.db, sc.node.id, req.base_rev, req.ops, attrib, max).await {
         Ok(n) => {
             st.index.notify();
-            Ok(Json(n))
+            let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
+            Ok(Json(node_reply(&n, &text)?))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, req.base_rev, e).await),
     }
@@ -179,13 +220,14 @@ pub async fn move_to(
     live(&sc)?;
     let req: Move = json_body(body)?;
     let path = NodePath::parse(&req.path)?;
-    let node = move_node(&sc.db, sc.node.id, path).await?;
-    st.render_gen.bump_space(sc.user.id, sc.space.id);
+    let author = attribution(&p, &headers, None)?.author_kind;
+    let node = move_node(&sc.db, sc.node.id, path, author).await?;
+    st.render_gen.bump_space(sc.owner, sc.space.id);
     // свёртка L0 старого родителя: задания индексации знают только новое положение
     if let Some(old) = sc.node.parent_id
         && node.parent_id != Some(old)
     {
-        st.index.rollup_hint(sc.user.id, old);
+        st.index.rollup_hint(sc.owner, old);
     }
     st.index.notify();
     Ok(Json(node))
@@ -200,8 +242,9 @@ pub async fn remove(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
-    let count = delete_node(&sc.db, sc.node.id).await?;
-    st.render_gen.bump_space(sc.user.id, sc.space.id);
+    let author = attribution(&p, &headers, None)?.author_kind;
+    let count = delete_node(&sc.db, sc.node.id, author).await?;
+    st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
     let details = json!({ "space": sc.space.id, "path": sc.node.path, "nodes": count });
     audit_node(
@@ -209,6 +252,7 @@ pub async fn remove(
         &p,
         &client,
         sc.user.id,
+        sc.owner,
         "node.delete",
         sc.node.id,
         details,
@@ -226,8 +270,9 @@ pub async fn restore(
     Path(id): Path<String>,
 ) -> Result<Json<Node>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
-    let node = restore_node(&sc.db, sc.node.id).await?;
-    st.render_gen.bump_space(sc.user.id, sc.space.id);
+    let author = attribution(&p, &headers, None)?.author_kind;
+    let node = restore_node(&sc.db, sc.node.id, author).await?;
+    st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
     let details = json!({ "space": sc.space.id, "path": node.path });
     audit_node(
@@ -235,6 +280,7 @@ pub async fn restore(
         &p,
         &client,
         sc.user.id,
+        sc.owner,
         "node.restore",
         node.id,
         details,

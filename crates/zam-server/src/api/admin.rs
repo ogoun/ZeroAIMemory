@@ -1,4 +1,4 @@
-//! Админ-API: пользователи, токены, аудит (§12). Только `AdminOnly`.
+//! Админ-API: пользователи, токены, аудит, настройки (§12). Только `AdminOnly`.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
@@ -14,6 +14,7 @@ use crate::app::AppState;
 use crate::auth::{AdminOnly, Client};
 use crate::error::ApiError;
 
+use super::scope::RULES_AGENT_WRITE;
 use super::{parse_body, parse_id};
 
 const NAME_MAX_CHARS: usize = 64;
@@ -46,6 +47,7 @@ fn token_json(t: &TokenInfo) -> Value {
         "last_used_at": t.last_used_at.map(fmt_ts),
         "last_ip": t.last_ip,
         "revoked_at": t.revoked_at.map(fmt_ts),
+        "human": t.human,
     })
 }
 
@@ -127,7 +129,7 @@ pub async fn create_user(
         .await?;
     let (info, plain) = st
         .system
-        .issue_token(user.id, "default", Access::Rw)
+        .issue_token(user.id, "default", Access::Rw, false)
         .await?;
     audit_token_issue(&st, &info, &plain, &ip).await?;
     Ok((
@@ -242,6 +244,7 @@ async fn audit_token_issue(
                 "token": mask_token(plain),
                 "name": info.name,
                 "access": info.access.as_str(),
+                "human": info.human,
             }),
         )
         .await?;
@@ -263,6 +266,11 @@ pub async fn list_tokens(
 struct IssueToken {
     name: String,
     access: Option<String>,
+    /// Человеческий токен (§7.5): запись по нему — `author_kind = human` (ставит и меняет
+    /// `axiom`). Выпускает только администратор (маршрут `AdminOnly`) **[решение
+    /// исполнителя]**; хранить его в CLAUDE.md/AGENTS.md нельзя — агент станет «человеком».
+    #[serde(default)]
+    human: bool,
 }
 
 pub async fn issue_token(
@@ -286,7 +294,7 @@ pub async fn issue_token(
             "пользователь отключён: токен выпустить нельзя",
         ));
     }
-    let (info, plain) = st.system.issue_token(id, &name, access).await?;
+    let (info, plain) = st.system.issue_token(id, &name, access, req.human).await?;
     audit_token_issue(&st, &info, &plain, &client.ip.to_string()).await?;
     Ok((
         StatusCode::CREATED,
@@ -346,4 +354,68 @@ pub async fn list_audit(
         "items": rows.iter().map(audit_json).collect::<Vec<_>>(),
         "next": next,
     })))
+}
+
+// ---- настройки ----
+
+/// `{rules: {agent_write}}`.
+async fn settings_json(st: &AppState) -> Result<Value, ApiError> {
+    let agent_write = st
+        .system
+        .get_setting::<bool>(RULES_AGENT_WRITE)
+        .await?
+        .unwrap_or(false);
+    Ok(json!({ "rules": { "agent_write": agent_write } }))
+}
+
+/// `GET /admin/settings`.
+pub async fn get_settings(
+    _: AdminOnly,
+    State(st): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(settings_json(&st).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesPatch {
+    agent_write: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsPatch {
+    rules: Option<RulesPatch>,
+}
+
+/// `PATCH /admin/settings {rules: {agent_write}}`; аудит `settings.update` при изменении.
+pub async fn patch_settings(
+    _: AdminOnly,
+    State(st): State<AppState>,
+    client: Client,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let req: SettingsPatch = parse_body(&body)?;
+    let Some(to) = req.rules.and_then(|r| r.agent_write) else {
+        return Err(ApiError::BadRequest("нужно поле rules.agent_write".into()));
+    };
+    let from = st
+        .system
+        .get_setting::<bool>(RULES_AGENT_WRITE)
+        .await?
+        .unwrap_or(false);
+    if from != to {
+        st.system.set_setting(RULES_AGENT_WRITE, &to).await?;
+        st.system
+            .audit(
+                ACTOR,
+                None,
+                "settings.update",
+                Some(RULES_AGENT_WRITE),
+                Some(&client.ip.to_string()),
+                json!({ "key": RULES_AGENT_WRITE, "from": from, "to": to }),
+            )
+            .await?;
+    }
+    Ok(Json(settings_json(&st).await?))
 }

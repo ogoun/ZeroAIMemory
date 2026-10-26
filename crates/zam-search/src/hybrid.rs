@@ -9,11 +9,19 @@
 //! ([`note_to_leaf`](crate::note_to_leaf)), и ранний лимит отбрасывал бы листы, в которые
 //! сводки потом сливаются. Порядок вызовов: `fuse` → `note_to_leaf` →
 //! [`cap_per_node`](crate::cap_per_node).
+//!
+//! **Канал папок** (§8.3, §9.2): точка папки, найденная векторным поиском, поднимает уже
+//! найденные другими каналами чанки узлов своего поддерева — чанку прибавляется
+//! `w_folder / (rrf_k + ранг папки)` один раз, по лучшей (с наименьшим рангом) папке-предку
+//! того же пространства. В знаменатель нормировки канал не входит: прибавка — поправка поверх
+//! слияния, как бусты; балл выше 1 после них приводит к шкале
+//! [`rescale_overflow`](crate::rescale_overflow) (деление всех баллов на лучший, задача 18 M3).
+//! При `w_folder = 0` (умолчание, сетка задачи 18 M3) выдача совпадает с M2.
 
 use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::adjust::recency_factor;
 
@@ -26,6 +34,8 @@ pub enum Channel {
     Fts,
     /// FTS5 `trigram`: идентификаторы и код.
     Trigram,
+    /// Подъём потомков найденной папки (см. модуль).
+    Folder,
 }
 
 impl Channel {
@@ -35,6 +45,7 @@ impl Channel {
             Channel::Vector => "vector",
             Channel::Fts => "fts",
             Channel::Trigram => "trigram",
+            Channel::Folder => "folder",
         }
     }
 }
@@ -78,12 +89,46 @@ impl Level {
 /// Метаданные чанка из SQLite (только живые чанки области).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkMeta {
-    pub node_id: Id,
+    /// Цель чанка (узел или запись журнала): по ней — лимит на цель и замена сводки листом.
+    pub target: TargetRef,
     pub level: Level,
     /// Путь заголовков (`A > B`): секция сводки уровня `section` и листа.
     pub heading_path: String,
     /// Время последнего изменения узла — для затухания.
     pub updated_at: Timestamp,
+    /// Вид инсайта (`data.kind` записи `insight`); у заметок и прочих записей — `None`.
+    pub insight_kind: Option<String>,
+    /// `certainty` записи (бусты надёжности).
+    pub certainty: Option<String>,
+    /// Область узла или записи (буст текущей области).
+    pub area: Option<String>,
+    /// Пространство цели (канал папок: папка поднимает только узлы своего пространства).
+    pub space_id: Id,
+    /// Путь узла; у записи журнала пуст (под папкой не лежит).
+    pub path: String,
+}
+
+/// Точка папки векторного канала, прошедшая проверку по SQLite: жива, не Human, в области
+/// цели. Ранг — среди живых папок, с 1, по порядку векторной выдачи.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderHit {
+    pub folder: Id,
+    /// Пространство папки: одинаковый путь в другом пространстве — не её поддерево.
+    pub space_id: Id,
+    /// Путь папки: её поддерево — узлы с этим путём или путём `<path_prefix>/…`.
+    pub path_prefix: String,
+    pub rank: usize,
+}
+
+impl FolderHit {
+    /// Узел `path` пространства `space` лежит в поддереве папки (по целым сегментам).
+    fn covers(&self, space: Id, path: &str) -> bool {
+        space == self.space_id
+            && !self.path_prefix.is_empty()
+            && path
+                .strip_prefix(self.path_prefix.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    }
 }
 
 /// Входы слияния: каналы — `chunk_id` по убыванию релевантности канала.
@@ -100,11 +145,13 @@ pub struct SearchInputs {
     /// Чанки, которых векторный канал не видит в принципе (Human, узел не проиндексирован):
     /// им ослабленный bm25 не понижается — соревноваться с векторными кандидатами им нечем.
     pub vector_blind: HashSet<String>,
+    /// Канал папок (см. модуль); пустой — подъёма нет.
+    pub folders: Vec<FolderHit>,
 }
 
 /// Параметры слияния (секция `[search]`). Умолчания библиотеки — веса `w_vector = w_fts = 1`,
-/// `w_trigram = 0,7` и `w_fts_relaxed = w_fts` (на них держатся модульные тесты слияния);
-/// рабочий `w_fts_relaxed` сервера подобран на eval.
+/// `w_trigram = 0,7`, `w_fts_relaxed = w_fts` и `w_folder = 0` (на них держатся модульные
+/// тесты слияния); рабочий `w_fts_relaxed` сервера подобран на eval.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Weights {
     /// Константа RRF.
@@ -116,6 +163,8 @@ pub struct Weights {
     /// (не из `vector_blind`); иначе действует `w_fts`.
     pub w_fts_relaxed: f64,
     pub w_trigram: f64,
+    /// Вес канала папок (см. модуль); 0 — канал выключен (выдача M2).
+    pub w_folder: f64,
     /// Полупериод затухания по свежести, дней; 0 — без затухания.
     pub recency_half_life_days: f64,
     /// Не больше чанков с одного узла.
@@ -130,6 +179,7 @@ impl Default for Weights {
             w_fts: 1.0,
             w_fts_relaxed: 1.0,
             w_trigram: 0.7,
+            w_folder: 0.0,
             recency_half_life_days: 180.0,
             max_per_node: 3,
         }
@@ -140,18 +190,24 @@ impl Default for Weights {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ranked {
     pub chunk_id: String,
-    pub node_id: Id,
+    pub target: TargetRef,
     pub level: Level,
     /// Путь заголовков чанка.
     pub heading_path: String,
     /// Нормированный балл, 0..=1.
     pub score: f64,
-    /// Каналы, нашедшие чанк, в порядке `vector`, `fts`, `trigram`.
+    /// Каналы, нашедшие чанк, в порядке `vector`, `fts`, `trigram`, `folder`.
     pub sources: Vec<&'static str>,
 }
 
 /// Weighted RRF + затухание, без лимита на узел (см. модуль).
 pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
+    fuse_normed(inp, w, now).0
+}
+
+/// [`fuse`] и знаменатель нормировки балла (наибольший возможный сырой балл; 0 — нет
+/// ни одного кандидата): по нему сервер ставит балл карточкам папок ([`folder_score`]).
+pub fn fuse_normed(inp: &SearchInputs, w: &Weights, now: Timestamp) -> (Vec<Ranked>, f64) {
     let empty = Vec::new();
     let channels = [
         (
@@ -194,6 +250,25 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
             max += t / (w.rrf_k + 1.0);
         }
     }
+    // канал папок: прибавка по лучшей папке-предку, один раз на чанк
+    if w.w_folder > 0.0 && !inp.folders.is_empty() {
+        for (id, e) in by_chunk.iter_mut() {
+            let m = &inp.chunks[*id];
+            if m.target.kind != TargetKind::Node {
+                continue;
+            }
+            let best = inp
+                .folders
+                .iter()
+                .filter(|f| f.covers(m.space_id, &m.path))
+                .map(|f| f.rank.max(1))
+                .min();
+            if let Some(rank) = best {
+                e.0 += w.w_folder / (w.rrf_k + rank as f64);
+                e.1.push(Channel::Folder.as_str());
+            }
+        }
+    }
     let mut all: Vec<Ranked> = by_chunk
         .into_iter()
         .map(|(id, (raw, sources))| {
@@ -202,7 +277,7 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
             let score = if max > 0.0 { raw * decay / max } else { 0.0 };
             Ranked {
                 chunk_id: id.to_string(),
-                node_id: m.node_id,
+                target: m.target,
                 level: m.level,
                 heading_path: m.heading_path.clone(),
                 score,
@@ -215,7 +290,21 @@ pub fn fuse(inp: &SearchInputs, w: &Weights, now: Timestamp) -> Vec<Ranked> {
             .total_cmp(&a.score)
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
-    all
+    (all, max)
+}
+
+/// Балл карточки папки ранга `rank` (с 1) в шкале выдачи: как у кандидата только
+/// векторного канала того же места — `w_vector / (rrf_k + rank)`, делённый на знаменатель
+/// нормировки слияния `max` ([`fuse_normed`]); без кандидатов — на первое место векторного
+/// канала. Затухание к папке не применяется.
+pub fn folder_score(rank: usize, w: &Weights, max: f64) -> f64 {
+    let raw = w.w_vector / (w.rrf_k + rank.max(1) as f64);
+    let max = if max > 0.0 {
+        max
+    } else {
+        w.w_vector / (w.rrf_k + 1.0)
+    };
+    if max > 0.0 { raw / max } else { 0.0 }
 }
 
 #[cfg(test)]
@@ -234,10 +323,18 @@ mod tests {
                 (
                     c.to_string(),
                     ChunkMeta {
-                        node_id: *n,
+                        target: TargetRef {
+                            kind: TargetKind::Node,
+                            id: *n,
+                        },
                         level: Level::Chunk,
                         heading_path: String::new(),
                         updated_at: now(),
+                        insight_kind: None,
+                        certainty: None,
+                        area: None,
+                        space_id: Id::new(),
+                        path: String::new(),
                     },
                 )
             })
@@ -426,5 +523,122 @@ mod tests {
         assert_eq!(r[0].score, r[1].score);
         // пустые каналы — пустая выдача
         assert!(fuse(&SearchInputs::default(), &Weights::default(), now()).is_empty());
+    }
+
+    /// Чанк узла `node` с путём `path` в пространстве `space`.
+    fn at(node: Id, space: Id, path: &str) -> ChunkMeta {
+        ChunkMeta {
+            target: TargetRef {
+                kind: TargetKind::Node,
+                id: node,
+            },
+            level: Level::Chunk,
+            heading_path: String::new(),
+            updated_at: now(),
+            insight_kind: None,
+            certainty: None,
+            area: None,
+            space_id: space,
+            path: path.into(),
+        }
+    }
+
+    fn folder(space: Id, path: &str, rank: usize) -> FolderHit {
+        FolderHit {
+            folder: Id::new(),
+            space_id: space,
+            path_prefix: path.into(),
+            rank,
+        }
+    }
+
+    /// Каналы: «c» и «a1» в обоих, «a2», «d», «x» и запись «e» — только в FTS.
+    fn folder_inputs(s: Id, other: Id) -> SearchInputs {
+        let entry = ChunkMeta {
+            target: TargetRef {
+                kind: TargetKind::Entry,
+                id: Id::new(),
+            },
+            path: String::new(),
+            ..at(Id::new(), s, "")
+        };
+        let chunks: HashMap<String, ChunkMeta> = [
+            ("c", at(Id::new(), s, "other/c")),
+            ("a1", at(Id::new(), s, "ops/a")),
+            ("a2", at(Id::new(), s, "ops/sub/b")),
+            // сегмент «opsx» — не потомок «ops»
+            ("d", at(Id::new(), s, "opsx/d")),
+            // тот же путь в другом пространстве
+            ("x", at(Id::new(), other, "ops/x")),
+            ("e", entry),
+        ]
+        .into_iter()
+        .map(|(k, m)| (k.to_string(), m))
+        .collect();
+        SearchInputs {
+            fts: list(&["c", "a1", "d", "x", "e", "a2"]),
+            vector: Some(list(&["c", "a1"])),
+            chunks,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn folder_channel_boosts_descendants_once() {
+        let (s, other) = (Id::new(), Id::new());
+        let base = folder_inputs(s, other);
+        let w = Weights {
+            w_folder: 1.0,
+            ..Weights::default()
+        };
+        // «ops» — второе место канала папок, «ops/sub» — первое: «a2» лежит под обеими
+        let mut inp = base.clone();
+        inp.folders = vec![folder(s, "ops/sub", 1), folder(s, "ops", 2)];
+        let r = fuse(&inp, &w, now());
+        let plain = fuse(&base, &w, now());
+        let score = |r: &[Ranked], id: &str| r.iter().find(|x| x.chunk_id == id).unwrap().score;
+        let sources =
+            |r: &[Ranked], id: &str| r.iter().find(|x| x.chunk_id == id).unwrap().sources.clone();
+        // нормировка без канала папок — прибавка в долях того же максимума
+        let max = 1.0 / 61.0 + 1.0 / 61.0;
+        let lift = |id: &str| (score(&r, id) - score(&plain, id)) * max;
+        // лучшая папка-предок «a2» — «ops/sub» (ранг 1), прибавка одна
+        assert!((lift("a2") - 1.0 / 61.0).abs() < 1e-12, "{}", lift("a2"));
+        assert!((lift("a1") - 1.0 / 62.0).abs() < 1e-12, "{}", lift("a1"));
+        assert_eq!(sources(&r, "a2"), vec!["fts", "folder"]);
+        assert_eq!(sources(&r, "a1"), vec!["vector", "fts", "folder"]);
+        // не потомки: другой сегмент, другое пространство, запись журнала, чужой путь
+        for id in ["d", "x", "e", "c"] {
+            assert_eq!(score(&r, id), score(&plain, id), "{id}");
+            assert!(!sources(&r, id).contains(&"folder"), "{id}");
+        }
+        // «a2» из хвоста FTS поднимается над «d», «x» и «e»
+        let order = ids(&r);
+        let pos = |id: &str| order.iter().position(|x| *x == id).unwrap();
+        assert!(pos("a2") < pos("d") && pos("a2") < pos("x"), "{order:?}");
+        // папка совпадает с путём узла целиком — узел тоже её потомок
+        let mut inp = base.clone();
+        inp.folders = vec![folder(s, "ops/sub/b", 1)];
+        let r2 = fuse(&inp, &w, now());
+        assert!(sources(&r2, "a2").contains(&"folder"));
+    }
+
+    #[test]
+    fn no_folder_hits_equals_m2_order() {
+        let (s, other) = (Id::new(), Id::new());
+        let base = folder_inputs(s, other);
+        // умолчание библиотеки — канал выключен (сетка задачи 18)
+        assert_eq!(Weights::default().w_folder, 0.0);
+        let m2 = fuse(&base, &Weights::default(), now());
+        // нет хитов папок при любом весе — выдача M2
+        let w = Weights {
+            w_folder: 1.0,
+            ..Weights::default()
+        };
+        assert_eq!(fuse(&base, &w, now()), m2);
+        // хиты есть, но вес 0 — тоже M2 (ни балла, ни источника `folder`)
+        let mut inp = base.clone();
+        inp.folders = vec![folder(s, "ops", 1)];
+        assert_eq!(fuse(&inp, &Weights::default(), now()), m2);
     }
 }

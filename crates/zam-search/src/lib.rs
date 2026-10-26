@@ -3,9 +3,10 @@
 //! - [`hybrid`] — слияние каналов weighted RRF: Qdrant (`vector`, внутри — dense, sparse и
 //!   сводки, уже слитые RRF в Qdrant), FTS5 `bm25` (`fts`) и FTS5 `trigram` (`trigram`);
 //!   затухание по свежести.
-//! - [`adjust`] — поправки: затухание ([`recency_factor`]), замена сводки заметки или
-//!   секции лучшим листом ([`note_to_leaf`], §9.2 п. 6), затем не больше `max_per_node`
-//!   элементов с узла ([`cap_per_node`]).
+//! - [`adjust`] — поправки: затухание ([`recency_factor`]), бусты вида инсайта, надёжности и
+//!   текущей области ([`apply_boosts`]) и нормировка шкалы после них ([`rescale_overflow`]),
+//!   замена сводки заметки или секции лучшим листом ([`note_to_leaf`], §9.2 п. 6), затем не
+//!   больше `max_per_node` элементов с узла ([`cap_per_node`]).
 //! - [`pack`] — упаковка в `budget_tokens` по числу токенов элементов.
 //!
 //! Сервер готовит входы (каналы — списки `chunk_id` по убыванию релевантности, метаданные
@@ -18,8 +19,11 @@ pub mod hybrid;
 pub mod pack;
 
 pub use adjust::{
-    LeafRef, RECENCY_FLOOR, cap_per_node, drop_unresolved_tail, in_section, note_to_leaf,
-    recency_factor, summaries_without_leaf,
+    Boosts, LeafRef, RECENCY_FLOOR, apply_boosts, cap_per_node, drop_unresolved_tail, in_section,
+    note_to_leaf, recency_factor, rescale_overflow, summaries_without_leaf,
 };
-pub use hybrid::{Channel, ChunkMeta, Level, Ranked, SearchInputs, Weights, fuse};
+pub use hybrid::{
+    Channel, ChunkMeta, FolderHit, Level, Ranked, SearchInputs, Weights, folder_score, fuse,
+    fuse_normed,
+};
 pub use pack::{Cost, Fit, pack, truncate_to_tokens};

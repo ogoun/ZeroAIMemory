@@ -79,6 +79,16 @@ pub struct ManagedConfig {
     pub ready_timeout: Duration,
     /// Linux: ожидание после SIGTERM до SIGKILL.
     pub stop_timeout: Duration,
+    /// `optimizers.flush_interval_sec` коллекции: как часто Qdrant сбрасывает сегменты на
+    /// диск и подтверждает (`ack`) WAL. После жёсткой остановки повторяется WAL с последнего
+    /// подтверждения (задача 19 M3).
+    pub flush_interval_sec: u64,
+    /// `wal.wal_capacity_mb` — размер блока WAL новой коллекции, МБ. У существующей
+    /// коллекции Qdrant 1.19 его не меняет (только пересоздание: `qdrant reset`).
+    pub wal_capacity_mb: u64,
+    /// Предел ожидания сброса WAL при штатной остановке после записи (вариант A задачи 19);
+    /// ноль — не ждать. См. [`flush_wait`].
+    pub shutdown_flush_wait: Duration,
 }
 
 impl ManagedConfig {
@@ -94,8 +104,48 @@ impl ManagedConfig {
             restart: RestartPolicy::default(),
             ready_timeout: Duration::from_secs(180),
             stop_timeout: Duration::from_secs(10),
+            flush_interval_sec: DEFAULT_FLUSH_INTERVAL_SEC,
+            wal_capacity_mb: DEFAULT_WAL_CAPACITY_MB,
+            shutdown_flush_wait: DEFAULT_SHUTDOWN_FLUSH_WAIT,
         }
     }
+
+    /// Параметры коллекции, которые задаёт клиент супервизора.
+    pub fn tuning(&self) -> crate::qdrant::CollectionTuning {
+        crate::qdrant::CollectionTuning {
+            flush_interval_sec: self.flush_interval_sec,
+            wal_capacity_mb: self.wal_capacity_mb,
+        }
+    }
+}
+
+/// Умолчание `qdrant.flush_interval_sec` (Qdrant — 5 с; выбор — задача 19 M3).
+pub const DEFAULT_FLUSH_INTERVAL_SEC: u64 = 5;
+/// Умолчание `qdrant.wal_capacity_mb` (Qdrant — 32 МБ).
+pub const DEFAULT_WAL_CAPACITY_MB: u64 = 32;
+/// Умолчание `qdrant.shutdown_flush_wait_ms`.
+/// 10 с: на HDD подтверждение после пачки приходило за 6,0–8,4 с (задача 19, ожидание до
+/// 15 с, 4 из 4), при пределе 6 с — 1 раз из 4; ожидание кончается с подтверждением.
+pub const DEFAULT_SHUTDOWN_FLUSH_WAIT: Duration = Duration::from_millis(10_000);
+
+/// Сколько ждать перед остановкой Qdrant, если последняя запись была `since_write` назад.
+///
+/// Поток сброса Qdrant 1.19 (`update_workers/flush_workers.rs`) раз в `flush_interval_sec`
+/// запускает фоновый сброс сегментов (`FlushMode::Background`) и подтверждает в WAL версию,
+/// сохранённую **предыдущими** сбросами: только что запущенный ещё не закончился
+/// (`segment_holder/flush.rs`, `flush_all_up_to`). Запись попадает в подтверждённую часть
+/// WAL не позже чем через два прохода — `2 · flush_interval_sec` плюс время самого сброса
+/// (запас 1 с). Ожидание не больше `cap`; без записи (`None`) — ноль.
+pub fn flush_wait(
+    since_write: Option<Duration>,
+    flush_interval_sec: u64,
+    cap: Duration,
+) -> Duration {
+    let Some(since) = since_write else {
+        return Duration::ZERO;
+    };
+    let window = Duration::from_secs(flush_interval_sec.saturating_mul(2)) + Duration::from_secs(1);
+    window.saturating_sub(since).min(cap)
 }
 
 /// Перезапуск при падении: экспоненциальная задержка с jitter и circuit breaker.
@@ -141,7 +191,9 @@ pub(crate) fn render_yaml(c: &ManagedConfig, qdir: &Path) -> std::io::Result<Str
          logger:\n  format: json\n\
          telemetry_disabled: true\n\
          storage:\n  storage_path: {}\n  snapshots_path: {}\n  temp_path: {}\n  on_disk_payload: true\n  \
-         performance:\n    max_search_threads: {}\n    optimizer_cpu_budget: {}\n\
+         performance:\n    max_search_threads: {}\n    optimizer_cpu_budget: {}\n  \
+         wal:\n    wal_capacity_mb: {}\n  \
+         optimizers:\n    flush_interval_sec: {}\n\
          service:\n  host: 127.0.0.1\n  http_port: {}\n  grpc_port: {}\n  enable_cors: false\n  enable_static_content: false\n\
          cluster:\n  enabled: false\n",
         storage_path(qdir, "storage")?,
@@ -149,6 +201,8 @@ pub(crate) fn render_yaml(c: &ManagedConfig, qdir: &Path) -> std::io::Result<Str
         storage_path(qdir, "temp")?,
         c.max_search_threads,
         c.optimizer_cpu_budget,
+        c.wal_capacity_mb,
+        c.flush_interval_sec,
         c.http_port,
         c.grpc_port
     ))
@@ -231,6 +285,8 @@ mod tests {
             "  on_disk_payload: true",
             "    max_search_threads: 2",
             "    optimizer_cpu_budget: 2",
+            "  wal:\n    wal_capacity_mb: 32\n",
+            "  optimizers:\n    flush_interval_sec: 5\n",
             "  host: 127.0.0.1",
             "  http_port: 7333",
             "  grpc_port: 7334",
@@ -286,6 +342,22 @@ mod tests {
         assert_eq!(verbatim(r"\\.\C:\d"), r"\\.\C:\d");
         assert_eq!(verbatim(r"\\.\pipe\x"), r"\\.\pipe\x");
         assert_eq!(yaml_quote(r"\\?\C:\O'Brien"), r"'\\?\C:\O''Brien'");
+    }
+
+    #[test]
+    fn flush_wait_two_passes_bounded() {
+        let s = Duration::from_secs;
+        assert_eq!(flush_wait(None, 5, s(6)), Duration::ZERO);
+        // окно 2 · 1 + 1 = 3 с
+        assert_eq!(flush_wait(Some(Duration::ZERO), 1, s(6)), s(3));
+        assert_eq!(flush_wait(Some(s(1)), 1, s(6)), s(2));
+        assert_eq!(flush_wait(Some(s(5)), 1, s(6)), Duration::ZERO);
+        // окно 11 с упирается в предел
+        assert_eq!(flush_wait(Some(Duration::ZERO), 5, s(6)), s(6));
+        assert_eq!(
+            flush_wait(Some(Duration::ZERO), 5, Duration::ZERO),
+            Duration::ZERO
+        );
     }
 
     #[test]

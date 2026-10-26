@@ -24,6 +24,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aae1277d39aeec15cb388266ecc24b11c80469deae6067e17a1a7aa9e5c1f234"
 
 [[package]]
+name = "aead"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
+dependencies = [
+ "crypto-common 0.1.7",
+ "generic-array",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -824,6 +834,17 @@ dependencies = [
 
 [[package]]
 name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "chacha20"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
@@ -831,6 +852,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20 0.9.1",
+ "cipher",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -863,6 +897,17 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common 0.1.7",
+ "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -1964,6 +2009,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2462,6 +2519,15 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -3161,6 +3227,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "opaque-debug"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3448,6 +3520,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "poly1305"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3614,7 +3697,7 @@ dependencies = [
  "bit-set 0.11.1",
  "bit-vec 0.10.1",
  "bitflags 2.13.2",
- "chacha20",
+ "chacha20 0.10.2",
  "core_detect",
  "num-traits",
  "rand 0.10.3",
@@ -3876,7 +3959,7 @@ version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
- "chacha20",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -5447,6 +5530,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
 
 [[package]]
+name = "universal-hash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
+dependencies = [
+ "crypto-common 0.1.7",
+ "subtle",
+]
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6007,7 +6100,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "anyhow",
  "clap",
@@ -6021,6 +6114,7 @@ dependencies = [
  "tar",
  "toml",
  "ureq",
+ "windows",
  "zam-fetch",
  "zip",
 ]
@@ -6056,11 +6150,12 @@ dependencies = [
 
 [[package]]
 name = "zam-cli"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "assert_cmd",
  "axum",
  "clap",
+ "rpassword",
  "serde",
  "serde_json",
  "tokio",
@@ -6068,11 +6163,12 @@ dependencies = [
  "ureq",
  "zam-core",
  "zam-server",
+ "zam-store",
 ]
 
 [[package]]
 name = "zam-core"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "rand 0.9.5",
  "rusqlite",
@@ -6084,7 +6180,7 @@ dependencies = [
 
 [[package]]
 name = "zam-fetch"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "flate2",
  "lzma-rust2",
@@ -6099,7 +6195,7 @@ dependencies = [
 
 [[package]]
 name = "zam-index"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "blake3",
  "fs4",
@@ -6110,6 +6206,7 @@ dependencies = [
  "qdrant-client",
  "qdrant-edge",
  "rand 0.9.5",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -6127,23 +6224,26 @@ dependencies = [
 
 [[package]]
 name = "zam-markdown"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "ammonia",
  "comrak",
  "mime_guess",
  "proptest",
  "pulldown-cmark",
+ "regex",
+ "rust-stemmers",
  "serde",
  "serde_json",
  "syntect",
  "thiserror 2.0.21",
  "unicode-segmentation",
+ "zam-core",
 ]
 
 [[package]]
 name = "zam-ml"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "half 2.7.1",
  "lru",
@@ -6162,7 +6262,7 @@ dependencies = [
 
 [[package]]
 name = "zam-search"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "jiff",
  "zam-core",
@@ -6170,11 +6270,14 @@ dependencies = [
 
 [[package]]
 name = "zam-server"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "anyhow",
  "argon2",
  "axum",
+ "base64 0.22.1",
+ "blake3",
+ "chacha20poly1305",
  "clap",
  "cookie",
  "futures-util",
@@ -6184,6 +6287,7 @@ dependencies = [
  "lru",
  "memory-serve",
  "mime_guess",
+ "rand 0.9.5",
  "rpassword",
  "serde",
  "serde_json",
@@ -6199,6 +6303,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows",
  "zam-core",
  "zam-fetch",
  "zam-index",
@@ -6206,19 +6311,22 @@ dependencies = [
  "zam-ml",
  "zam-search",
  "zam-store",
+ "zeroize",
  "zip",
 ]
 
 [[package]]
 name = "zam-store"
-version = "0.0.3-m2"
+version = "0.0.4-m3"
 dependencies = [
  "base64 0.22.1",
  "blake3",
  "fs4",
+ "globset",
  "half 2.7.1",
  "jiff",
  "rand 0.9.5",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -6347,6 +6455,9 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zerotrie"

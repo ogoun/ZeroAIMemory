@@ -39,6 +39,10 @@ jobs:
       - run: npm ci
       - name: svelte-check
         run: npm run check
+      # политика лицензий бандла (EPL-2.0 — только elkjs): node --experimental-strip-types,
+      # Node ≥ 22.6 (engines в web/package.json)
+      - name: test:build
+        run: npm run test:build
       - name: build
         run: npm run build
       - name: size-limit

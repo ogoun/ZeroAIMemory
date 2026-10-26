@@ -1,4 +1,5 @@
 ---
+index: false
 tags: [editors, line-endings]
 ---
 # Line endings in editors: VS Code, Visual Studio, Notepad, .editorconfig

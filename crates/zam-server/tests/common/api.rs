@@ -215,3 +215,16 @@ impl Api {
         r.json()
     }
 }
+
+/// Фильтр векторного индекса по всей базе пользователя `user` — одна область со всеми
+/// пространствами базы (область без пространств фильтр не пропускает).
+pub async fn vector_base(a: &Api, user: zam_core::Id) -> zam_index::VectorFilter {
+    let db = a.st.users.get(user).await.unwrap();
+    let spaces = zam_store::list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    zam_index::VectorFilter::scope(user, spaces)
+}

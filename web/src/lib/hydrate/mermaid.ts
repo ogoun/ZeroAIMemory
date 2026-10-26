@@ -17,8 +17,9 @@ function init(): void {
     startOnLoad: false,
     securityLevel: 'strict',
     theme: want,
-    // Mermaid 12 по умолчанию раскладывает через ELK, а elkjs (EPL-2.0) в бандл не входит
-    // (см. elk-stub.ts) — раскладка dagre
+    // Mermaid 12 по умолчанию раскладывает через ELK; по умолчанию оставляем dagre, а ELK
+    // (elkjs, EPL-2.0, ленивый чанк) включается самой диаграммой: `layout: elk` во frontmatter
+    // или `%%{init: {"layout": "elk"}}%%`
     layout: 'dagre',
     state: { layout: 'dagre' },
     // подписи — текст SVG, без foreignObject с HTML внутри

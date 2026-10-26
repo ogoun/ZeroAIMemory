@@ -26,7 +26,8 @@
     type Space,
     type User,
   } from '../lib/api';
-  import { go, href, routeUser, type Route } from '../lib/router';
+  import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
+  import { go, href, routeUser, type Journal, type Route } from '../lib/router';
   import IndexBadge from './IndexBadge.svelte';
 
   interface Props {
@@ -51,6 +52,8 @@
 
   let open = $state<Record<string, boolean>>({});
   let spaces = $state<Record<string, Space[]>>({});
+  /** Ожидающие запросы доступа к решениям пользователя. */
+  let pending = $state<Record<string, number>>({});
   let kids = $state<Record<string, NodeInfo[]>>({});
   let trash = $state<Record<string, NodeInfo[]>>({});
   let busy = $state<Record<string, boolean>>({});
@@ -95,7 +98,9 @@
     busy[k] = true;
     delete errs[k];
     try {
-      spaces[uid] = (await listSpaces(uid)).spaces;
+      const r = await listSpaces(uid);
+      spaces[uid] = r.spaces;
+      pending[uid] = r.access_requests_pending ?? 0;
     } catch (e) {
       fail(k, e);
     } finally {
@@ -315,6 +320,22 @@
 
   const isSelected = (uid: string, id: string) =>
     route.name === 'node' && route.user === uid && route.node === id;
+
+  const isJournal = (uid: string, ref: string, j: Journal) =>
+    route.name === 'journal' && route.user === uid && route.space === ref && route.journal === j;
+
+  /** Метка роли решения: своё (общее — с участниками) или чужое с режимом и владельцем. */
+  function roleTags(s: Space): { text: string; title: string }[] {
+    if (s.kind !== 'solution') return [];
+    if (s.role === 'member') {
+      const owner = s.owner?.name ?? s.owner?.id ?? '?';
+      const access = s.access ?? '?';
+      return [{ text: `участник ${access} · ${owner}`, title: `Чужое решение: владелец ${owner}, доступ ${access}` }];
+    }
+    const tags = [{ text: 'владелец', title: 'Своё решение' }];
+    if (s.shared) tags.push({ text: 'общее', title: 'У решения есть одобренные участники' });
+    return tags;
+  }
 </script>
 
 {#snippet chevron(isOpen: boolean)}
@@ -338,6 +359,14 @@
       <path d="M2 3.5h5v4H2z M9 3.5h5v4H9z M2 9.5h5v4H2z M9 9.5h5v4H9z" fill="none" stroke="currentColor" stroke-width="1.2" />
     {:else if kind === 'human'}
       <path d="M8 14s-5.5-3.2-5.5-7.2A3 3 0 0 1 8 5a3 3 0 0 1 5.5 1.8C13.5 10.8 8 14 8 14z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+    {:else if kind === 'j-changelog'}
+      <path d="M3 3.5h10 M3 6.5h10 M3 9.5h7 M3 12.5h5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+    {:else if kind === 'j-releases'}
+      <path d="M2.5 8.2L8 2.5h5.5V8L8 13.5z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /><circle cx="10.6" cy="5.4" r="1" fill="currentColor" />
+    {:else if kind === 'j-insights'}
+      <path d="M8 1.8a4.2 4.2 0 0 0-2.4 7.6V11h4.8V9.4A4.2 4.2 0 0 0 8 1.8z M6 13.3h4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" />
+    {:else if kind === 'j-vault'}
+      <path d="M3.5 7h9v6.5h-9z M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
     {:else if kind === 'rules'}
       <path d="M3 2.5h10v11H3z M5.5 5.5h5 M5.5 8h5 M5.5 10.5h3" fill="none" stroke="currentColor" stroke-width="1.2" />
     {:else}
@@ -430,10 +459,30 @@
       </button>
       <button type="button" class="label" onclick={() => toggle(k, () => loadKids(uid, ref, ''), !!kids[k])}>
         {@render icon(s.kind)}<span class="name">{s.name}</span>
+        {#each roleTags(s) as t (t.text)}<span class="tag role" title={t.title}>{t.text}</span>{/each}
       </button>
       <button type="button" class="more" aria-label="Действия: {s.name}" onclick={(e) => menuBelow(e, target)}>⋯</button>
     </div>
     {#if open[k]}
+      {@const js = journalsOf(s.kind)}
+      {#if js.length}
+        <ul class="journals" aria-label="Журналы: {s.name}">
+          {#each js as j (j)}
+            <li>
+              <div class="tree-row" class:selected={isJournal(uid, ref, j)} style:--depth={depth + 1}>
+                <span class="twisty"></span>
+                <a
+                  class="label journal"
+                  href={href({ name: 'journal', user: uid, space: ref, journal: j, entry: null })}
+                  aria-current={isJournal(uid, ref, j) ? 'page' : undefined}
+                >
+                  {@render icon(`j-${j}`)}<span class="name">{JOURNAL_TITLE[j]}</span>
+                </a>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
       {@render nodeList(uid, s, k, depth + 1)}
     {/if}
   </li>
@@ -483,6 +532,11 @@
                     {@render icon('solutions')}<span class="name">Solutions</span>
                     <span class="count">{solutions(spaces[u.id]).length}</span>
                   </button>
+                  {#if pending[u.id]}
+                    <a class="tag pending" href={href({ name: 'solutions' })} title="Запросы доступа к решениям ждут решения">
+                      запросы: {pending[u.id]}
+                    </a>
+                  {/if}
                 </div>
                 {#if open[kSol(u.id)]}
                   {#if solutions(spaces[u.id]).length === 0}
@@ -634,6 +688,20 @@
     border-radius: 8px;
     background: var(--chip);
     color: var(--muted);
+  }
+  .tag.role {
+    color: var(--text);
+  }
+  .tag.pending {
+    background: var(--accent);
+    color: var(--accent-text);
+    text-decoration: none;
+  }
+  .label.journal .name {
+    color: var(--muted);
+  }
+  .tree-row.selected .label.journal .name {
+    color: var(--text);
   }
   .more {
     flex: none;

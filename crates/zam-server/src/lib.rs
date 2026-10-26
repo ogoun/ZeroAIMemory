@@ -4,6 +4,7 @@ pub mod app;
 pub mod attrib;
 pub mod auth;
 pub mod bootstrap;
+pub mod certainty;
 pub mod config;
 pub mod cuda;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod models;
 pub mod qdrant;
 pub mod reindex;
 pub mod rerank;
+pub mod vault;
 pub mod web;
 
 #[cfg(test)]
@@ -63,8 +65,8 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
     Ok(())
 }
 
-/// Открывает все базы (с миграциями), дожидается разовой перечанковки R1 и возвращает
-/// число пользователей. Если токенизатор модели доступен, R1 идёт её точным счётчиком
+/// Открывает все базы (с миграциями), регистрирует решения M1–M2 в реестре (§11.6),
+/// дожидается разовой перечанковки R1 и возвращает число пользователей. Если токенизатор модели доступен, R1 идёт её точным счётчиком
 /// и порогами под её окно (как у сервера), иначе — приближённым (`ApproxCounter`).
 pub async fn migrate(cfg: ServerConfig) -> anyhow::Result<usize> {
     let dir = zam_store::DataDir::open(&cfg.data_dir)?;
@@ -76,6 +78,7 @@ pub async fn migrate(cfg: ServerConfig) -> anyhow::Result<usize> {
     for u in &list {
         users.get(u.id).await?;
     }
+    bootstrap::register_solutions(&system, &users).await;
     for u in &list {
         users.wait_rechunk(u.id).await;
     }
@@ -95,7 +98,19 @@ async fn shutdown_signal() {
             Err(_) => std::future::pending::<()>().await,
         }
     };
-    #[cfg(not(unix))]
+    // Windows: Ctrl+Break — штатная остановка процесса без окна консоли (его группе процессов
+    // шлёт `GenerateConsoleCtrlEvent`: `cargo xtask bench --scenario first-start`, менеджеры
+    // служб); Ctrl+C такой группе не доставляется.
+    #[cfg(windows)]
+    let term = async {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }

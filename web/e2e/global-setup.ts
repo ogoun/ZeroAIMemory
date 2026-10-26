@@ -6,7 +6,7 @@ import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { request } from '@playwright/test';
-import { seed } from './seed';
+import { seed, seedJournals, type AdminCall } from './seed';
 import { ADMIN_STATE } from './session';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
@@ -94,14 +94,31 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     const rc = await request.newContext({ baseURL: base });
     const r = await rc.post('api/v1/auth/login', { data: { login: 'admin', password: ADMIN_PASSWORD } });
     if (!r.ok()) throw new Error(`вход администратора: HTTP ${r.status()}`);
+    const { csrf } = (await r.json()) as { csrf: string };
+    const admin: AdminCall = async <T>(method: string, path: string, body?: unknown) => {
+      const resp = await rc.fetch(`api/v1/${path}`, {
+        method,
+        headers: { 'X-CSRF-Token': csrf },
+        data: body,
+      });
+      if (!resp.ok()) throw new Error(`${method} ${path}: HTTP ${resp.status()} ${await resp.text()}`);
+      return (await resp.json()) as T;
+    };
+    const journals = await seedJournals(base, token, admin);
     await rc.storageState({ path: ADMIN_STATE });
     await rc.dispose();
     process.env.E2E_BASE_URL = base;
     process.env.E2E_ADMIN_PASSWORD = ADMIN_PASSWORD;
     process.env.E2E_NOTE_MEDIA = ids.media;
     process.env.E2E_NOTE_SECOND = ids.second;
+    process.env.E2E_NOTE_ELK = ids.elk;
     // токен администратора — для правок «из другого места» в сценариях конфликта
     process.env.E2E_ADMIN_TOKEN = token;
+    process.env.E2E_INSIGHT_OLD = journals.oldInsight;
+    process.env.E2E_INSIGHT_HYP = journals.hypothesis;
+    process.env.E2E_MEMBER_ID = journals.memberId;
+    process.env.E2E_MEMBER_TOKEN = journals.memberToken;
+    process.env.E2E_GUEST_TOKEN = journals.guestToken;
   } catch (e) {
     child.kill();
     log.end();

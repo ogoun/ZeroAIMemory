@@ -64,5 +64,7 @@ libc.workspace = true
 [dev-dependencies]
 # index_bench: sparse-векторы из корпуса eval токенизатором bge-m3 (крейт уже в дереве через zam-ml)
 tokenizers.workspace = true
+# bench_index_with_trash: checkpoint WAL базы после подготовки (крейт уже в дереве через zam-store)
+rusqlite.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true

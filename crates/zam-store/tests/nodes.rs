@@ -40,6 +40,8 @@ fn agent() -> Attribution {
         session_id: Some("s1".into()),
         machine: Some("box".into()),
         message: Some("первая версия".into()),
+        user_id: None,
+        area: None,
     }
 }
 
@@ -603,6 +605,8 @@ const TWO: &str = "# Альфа\n\nстарое слово\n\n# Бета\n\nвт
 fn human(msg: &str) -> Attribution {
     Attribution {
         message: Some(msg.into()),
+        user_id: None,
+        area: None,
         ..Attribution::new(AuthorKind::Human)
     }
 }
@@ -931,7 +935,12 @@ async fn delete_folder_and_restore_cycle() {
     let y = create_note(&db, note(space, "a/y", WORDY)).await.unwrap();
     let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
 
-    assert_eq!(delete_node(&db, a.id).await.unwrap(), 3);
+    assert_eq!(
+        delete_node(&db, a.id, zam_store::AuthorKind::System)
+            .await
+            .unwrap(),
+        3
+    );
     let mut stamps = Vec::new();
     for id in [a.id, x.id, y.id] {
         stamps.push(get_node(&db, id).await.unwrap().deleted_at.expect("удалён"));
@@ -945,19 +954,19 @@ async fn delete_folder_and_restore_cycle() {
     ));
     // повторное удаление — NotFound
     assert!(matches!(
-        delete_node(&db, a.id).await,
+        delete_node(&db, a.id, zam_store::AuthorKind::System).await,
         Err(StoreError::NotFound)
     ));
 
     // путь свободен: новая папка с тем же путём
     let a2 = create_folder(&db, space, p("a")).await.unwrap();
     assert!(matches!(
-        restore_node(&db, a.id).await,
+        restore_node(&db, a.id, zam_store::AuthorKind::System).await,
         Err(StoreError::Conflict(_))
     ));
     // ребёнок тянет за собой предка, путь которого занят
     assert!(matches!(
-        restore_node(&db, x.id).await,
+        restore_node(&db, x.id, zam_store::AuthorKind::System).await,
         Err(StoreError::Conflict(_))
     ));
     assert!(get_node(&db, x.id).await.unwrap().deleted_at.is_some());
@@ -967,14 +976,21 @@ async fn delete_folder_and_restore_cycle() {
         vec![a.id]
     );
 
-    assert_eq!(delete_node(&db, a2.id).await.unwrap(), 1);
+    assert_eq!(
+        delete_node(&db, a2.id, zam_store::AuthorKind::System)
+            .await
+            .unwrap(),
+        1
+    );
     assert_eq!(
         ids(&list_trash(&db, None).await.unwrap()),
         vec![a2.id, a.id],
         "новые удаления первыми"
     );
 
-    let r = restore_node(&db, a.id).await.unwrap();
+    let r = restore_node(&db, a.id, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert_eq!(r.id, a.id);
     assert!(r.deleted_at.is_none());
     assert!(r.has_children);
@@ -988,11 +1004,11 @@ async fn delete_folder_and_restore_cycle() {
     );
     // живой узел восстанавливать нечего
     assert!(matches!(
-        restore_node(&db, a.id).await,
+        restore_node(&db, a.id, zam_store::AuthorKind::System).await,
         Err(StoreError::BadInput(_))
     ));
     assert!(matches!(
-        restore_node(&db, Id::new()).await,
+        restore_node(&db, Id::new(), zam_store::AuthorKind::System).await,
         Err(StoreError::NotFound)
     ));
     assert_eq!(
@@ -1009,9 +1025,16 @@ async fn restore_child_restores_only_ancestors() {
     let y = create_note(&db, note(space, "a/y", WORDY)).await.unwrap();
     let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
     let b = get_node_by_path(&db, space, &p("a/b")).await.unwrap();
-    assert_eq!(delete_node(&db, a.id).await.unwrap(), 4);
+    assert_eq!(
+        delete_node(&db, a.id, zam_store::AuthorKind::System)
+            .await
+            .unwrap(),
+        4
+    );
 
-    restore_node(&db, x.id).await.unwrap();
+    restore_node(&db, x.id, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     for id in [a.id, b.id, x.id] {
         assert!(get_node(&db, id).await.unwrap().deleted_at.is_none());
     }
@@ -1030,14 +1053,26 @@ async fn earlier_deleted_descendant_stays_deleted() {
     let x = create_note(&db, note(space, "a/x", WORDY)).await.unwrap();
     let y = create_note(&db, note(space, "a/y", WORDY)).await.unwrap();
     let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
-    assert_eq!(delete_node(&db, y.id).await.unwrap(), 1);
-    assert_eq!(delete_node(&db, a.id).await.unwrap(), 2);
+    assert_eq!(
+        delete_node(&db, y.id, zam_store::AuthorKind::System)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        delete_node(&db, a.id, zam_store::AuthorKind::System)
+            .await
+            .unwrap(),
+        2
+    );
 
     assert_eq!(
         ids(&list_trash(&db, Some(space)).await.unwrap()),
         vec![a.id, y.id]
     );
-    restore_node(&db, a.id).await.unwrap();
+    restore_node(&db, a.id, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert!(get_node(&db, x.id).await.unwrap().deleted_at.is_none());
     assert!(get_node(&db, y.id).await.unwrap().deleted_at.is_some());
     assert_eq!(chunk_count(&db, y.id).await, 0);
@@ -1057,7 +1092,9 @@ async fn move_folder_rewrites_descendants() {
     let a = get_node_by_path(&db, space, &p("a")).await.unwrap();
     let sub = get_node_by_path(&db, space, &p("a/sub")).await.unwrap();
 
-    let m = move_node(&db, a.id, p("b/c")).await.unwrap();
+    let m = move_node(&db, a.id, p("b/c"), zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert_eq!((m.path.as_str(), m.name.as_str()), ("b/c", "c"));
     let b = get_node_by_path(&db, space, &p("b")).await.unwrap();
     assert_eq!(b.kind, NodeKind::Folder);
@@ -1100,37 +1137,43 @@ async fn move_rename_and_errors() {
 
     // перенос в собственное поддерево
     assert!(matches!(
-        move_node(&db, a.id, p("a/z")).await,
+        move_node(&db, a.id, p("a/z"), zam_store::AuthorKind::System).await,
         Err(StoreError::BadInput(_))
     ));
     assert!(matches!(
-        move_node(&db, x.id, p("a/w")).await,
+        move_node(&db, x.id, p("a/w"), zam_store::AuthorKind::System).await,
         Err(StoreError::Conflict(_))
     ));
     // предок назначения — заметка
     assert!(matches!(
-        move_node(&db, x.id, p("a/w/q")).await,
+        move_node(&db, x.id, p("a/w/q"), zam_store::AuthorKind::System).await,
         Err(StoreError::Conflict(_))
     ));
     assert_eq!(get_node(&db, x.id).await.unwrap().path, "a/x");
     assert!(get_node(&db, w.id).await.unwrap().deleted_at.is_none());
 
-    let same = move_node(&db, x.id, p("a/x")).await.unwrap();
+    let same = move_node(&db, x.id, p("a/x"), zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert_eq!(same, get_node(&db, x.id).await.unwrap());
 
     // переименование заметки; «a/xx» — не потомок «a/x»
-    let r = move_node(&db, x.id, p("a/xx")).await.unwrap();
+    let r = move_node(&db, x.id, p("a/xx"), zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert_eq!((r.path.as_str(), r.name.as_str()), ("a/xx", "xx"));
     assert_eq!(r.parent_id, Some(a.id));
     assert_eq!(prefix_hits(&db, x.id, "xx").await, 1);
 
-    delete_node(&db, x.id).await.unwrap();
+    delete_node(&db, x.id, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert!(matches!(
-        move_node(&db, x.id, p("q")).await,
+        move_node(&db, x.id, p("q"), zam_store::AuthorKind::System).await,
         Err(StoreError::NotFound)
     ));
     assert!(matches!(
-        move_node(&db, Id::new(), p("q")).await,
+        move_node(&db, Id::new(), p("q"), zam_store::AuthorKind::System).await,
         Err(StoreError::NotFound)
     ));
 }

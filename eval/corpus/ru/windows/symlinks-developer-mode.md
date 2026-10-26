@@ -1,4 +1,5 @@
 ---
+index: false
 tags: [windows, symlink]
 ---
 # Символические ссылки на Windows и режим разработчика

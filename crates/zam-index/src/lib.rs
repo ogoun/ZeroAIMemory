@@ -36,15 +36,17 @@ pub mod worker;
 
 #[cfg(feature = "edge")]
 pub use edge::{EdgeIndex, EdgeOptions};
-pub use qdrant::{COLLECTION, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE};
+pub use qdrant::{
+    COLLECTION, CollectionTuning, DENSE, QdrantIndex, SCHEMA_VERSION, SPARSE, WriteMark,
+};
 pub use reindex::{ReindexCtx, ReindexReport, ReindexRequest, reindex};
 pub use vector::{
-    IndexFuture, IndexMeta, IndexPoint, NAMESPACE_ZAM, PointPayload, VectorFilter, VectorHit,
-    VectorIndex, point_id,
+    IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, NAMESPACE_ZAM, PointPayload, VectorFilter,
+    VectorHit, VectorIndex, VectorScope, point_id,
 };
 pub use worker::{
     PassageEmbedder, ReindexOutcome, SkippedDb, WorkerConfig, WorkerDeps, WorkerHandle,
-    WorkerStatus, embed_input, embed_input_of, embed_key, embed_key_of,
+    WorkerStatus, embed_input, embed_input_of, embed_key, embed_key_of, folder_embed_key,
 };
 
 /// Ошибки векторного индекса. Тексты без векторов, текста чанков и секретов.

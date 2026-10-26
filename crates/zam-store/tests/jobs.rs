@@ -128,14 +128,18 @@ async fn delete_enqueues_delete_and_restore_upsert() {
     let dir = zam_store::get_node_by_path(&db, k, &NodePath::parse("dir").unwrap())
         .await
         .unwrap();
-    delete_node(&db, dir.id).await.unwrap();
+    delete_node(&db, dir.id, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert_eq!(
         jobs_of(&db, id).await,
         vec![("delete".into(), "queued".into(), 1)]
     );
     assert!(chunks_for_index(&db, id).await.unwrap().is_empty());
 
-    restore_node(&db, dir.id).await.unwrap();
+    restore_node(&db, dir.id, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     let jobs = jobs_of(&db, id).await;
     assert_eq!(
         jobs,
@@ -157,7 +161,9 @@ async fn human_and_index_false_get_no_jobs() {
         // FTS по-прежнему работает: чанки есть
         assert!(!levels_of(&db, id).await.is_empty());
     }
-    delete_node(&db, a).await.unwrap();
+    delete_node(&db, a, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert!(jobs_of(&db, a).await.is_empty());
 
     // индексированная заметка, ставшая index: false, удаляется из индекса
@@ -392,9 +398,14 @@ async fn move_replaces_running_job() {
         .await
         .unwrap()
         .remove(0);
-    move_node(&db, a, NodePath::parse("y/a").unwrap())
-        .await
-        .unwrap();
+    move_node(
+        &db,
+        a,
+        NodePath::parse("y/a").unwrap(),
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         complete_job(&db, j.id, j.claim_gen).await.unwrap(),
         JobOutcome::Requeued
@@ -418,9 +429,14 @@ async fn complete_marks_indexed_atomically() {
         .await
         .unwrap()
         .remove(0);
-    move_node(&db, a, NodePath::parse("y/a").unwrap())
-        .await
-        .unwrap();
+    move_node(
+        &db,
+        a,
+        NodePath::parse("y/a").unwrap(),
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         complete_job(&db, j.id, j.claim_gen).await.unwrap(),
         JobOutcome::Requeued
@@ -445,8 +461,12 @@ async fn complete_marks_indexed_atomically() {
         JobOutcome::Stale
     );
     // delete не трогает состояние
-    delete_node(&db, a).await.unwrap();
-    restore_node(&db, a).await.unwrap();
+    delete_node(&db, a, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
+    restore_node(&db, a, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert_eq!(state(&db).await, "pending");
 }
 
@@ -476,12 +496,16 @@ async fn restore_of_excluded_note_has_no_job() {
         .remove(0);
     assert_eq!(j.op, JobOp::Delete);
     complete_job(&db, j.id, j.claim_gen).await.unwrap();
-    delete_node(&db, a).await.unwrap();
+    delete_node(&db, a, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert!(
         jobs_of(&db, a).await.is_empty(),
         "excluded: delete не нужен"
     );
-    let n = restore_node(&db, a).await.unwrap();
+    let n = restore_node(&db, a, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert_eq!(n.index_state, "excluded");
     assert!(jobs_of(&db, a).await.is_empty());
     assert!(chunks_for_index(&db, a).await.unwrap().is_empty());
@@ -560,9 +584,14 @@ async fn chunks_for_index_payload() {
     for j in claim_jobs(&db, 10, now).await.unwrap() {
         complete_job(&db, j.id, j.claim_gen).await.unwrap();
     }
-    move_node(&db, id, NodePath::parse("Rust/Сборка").unwrap())
-        .await
-        .unwrap();
+    move_node(
+        &db,
+        id,
+        NodePath::parse("Rust/Сборка").unwrap(),
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     let jobs = jobs_of(&db, id).await;
     assert_eq!(jobs.last().unwrap(), &("upsert".into(), "queued".into(), 1));
     let chunks = chunks_for_index(&db, id).await.unwrap();
@@ -683,11 +712,12 @@ async fn migrate_from_v3_rechunks_once() {
             space_ids: vec![k],
             path_prefix: None,
             top_k: 10,
+            targets: Default::default(),
         },
     )
     .await
     .unwrap();
-    assert!(found.iter().any(|f| f.node_id == n1));
+    assert!(found.iter().any(|f| f.target.id == n1));
     drop((db, dbs));
 
     // повторное открытие перечанковку не повторяет
@@ -722,12 +752,13 @@ async fn bench_write_until_fts_1000_notes() {
                 space_ids: vec![k],
                 path_prefix: None,
                 top_k: 5,
+                targets: Default::default(),
             },
         )
         .await
         .unwrap();
         lat.push(t.elapsed());
-        assert!(found.iter().any(|h| h.node_id == id));
+        assert!(found.iter().any(|h| h.target.id == id));
     }
     lat.sort();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -853,6 +884,8 @@ async fn indexed_count_counts_live_indexed_notes() {
         .await
         .unwrap();
     assert_eq!(indexed_count(&db).await.unwrap(), 2);
-    delete_node(&db, b).await.unwrap();
+    delete_node(&db, b, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert_eq!(indexed_count(&db).await.unwrap(), 1);
 }

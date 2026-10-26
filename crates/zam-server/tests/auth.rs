@@ -96,7 +96,7 @@ async fn bearer_token_lists_spaces() {
     assert_eq!(j["user"]["name"], "admin");
     assert_eq!(j["access"], "rw");
     let s0 = &j["spaces"][0];
-    assert!(s0["id"].is_string() && s0["name"] == "Rules" && s0["solution_guid"].is_null());
+    assert!(s0["id"].is_string() && s0["name"] == "Rules" && s0["agent_solution_id"].is_null());
 }
 
 #[tokio::test]
@@ -449,7 +449,7 @@ async fn admin_selects_user_via_header() {
     // токен пользователя заголовок игнорирует: видит только своё
     let (_, bob_token) = st
         .system
-        .issue_token(bob.id, "t", zam_store::Access::Ro)
+        .issue_token(bob.id, "t", zam_store::Access::Ro, false)
         .await
         .unwrap();
     let admin = st.system.admin_user().await.unwrap().unwrap();

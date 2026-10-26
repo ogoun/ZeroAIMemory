@@ -28,6 +28,8 @@ zam-fetch = { path = "../zam-fetch" }
 zam-search = { path = "../zam-search" }
 jiff.workspace = true
 serde_json.workspace = true
+# ETag кэша триггеров (§10.3)
+blake3.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true, features = ["fs"] }
@@ -48,6 +50,15 @@ mime_guess.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
 tower = { workspace = true, features = ["util"] }
+# Vault (§7.6): шифрование, мастер-ключ в base64, случайность ОС
+chacha20poly1305.workspace = true
+zeroize.workspace = true
+base64.workspace = true
+rand.workspace = true
+
+# Vault: DACL файла мастер-ключа (только владелец, SYSTEM, администраторы)
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [build-dependencies]
 memory-serve.workspace = true

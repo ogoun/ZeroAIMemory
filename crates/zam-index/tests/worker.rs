@@ -13,12 +13,13 @@ use common::qdrant::TestQdrant;
 use zam_core::Id;
 use zam_index::{
     PassageEmbedder, QdrantIndex, ReindexRequest, VectorFilter, VectorIndex, WorkerConfig,
-    WorkerDeps, WorkerHandle, embed_key,
+    WorkerDeps, WorkerHandle, embed_key, folder_embed_key,
 };
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, Embedding, NewNote, NodePath, SpaceKind, SystemStore,
     UserDbs, chunks_for_index, create_note, delete_node, enqueue_reindex, get_embeddings, get_node,
-    job_stats, list_spaces, mark_reindex, move_node, pending_reindex, put_embeddings, update_note,
+    job_stats, list_spaces, mark_reindex, move_node, pending_reindex, prune_owned_embeddings,
+    put_embeddings, set_folder_l0, update_note,
 };
 
 const DIM: usize = 16;
@@ -59,6 +60,16 @@ impl PassageEmbedder for Fake {
     fn count_tokens(&self, text: &str) -> usize {
         text.split_whitespace().count()
     }
+}
+
+/// Все пространства базы.
+async fn all_spaces(db: &Db) -> Vec<Id> {
+    list_spaces(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect()
 }
 
 struct Env {
@@ -174,13 +185,21 @@ impl Env {
     }
 
     async fn count(&self, space: Option<Id>, prefix: Option<&str>, levels: &[&str]) -> u64 {
+        let spaces = match space {
+            Some(s) => vec![s],
+            None => all_spaces(&self.db).await,
+        };
         let f = VectorFilter {
-            user_id: self.user,
-            space_ids: space.into_iter().collect(),
             path_prefix: prefix.map(str::to_string),
             levels: levels.iter().map(|l| l.to_string()).collect(),
+            ..VectorFilter::scope(self.user, spaces)
         };
         self.vector.count(&f).await.unwrap()
+    }
+
+    /// Фильтр всей базы пользователя теста (все её пространства).
+    async fn whole_base(&self) -> VectorFilter {
+        VectorFilter::scope(self.user, all_spaces(&self.db).await)
     }
 
     async fn state(&self, node: Id) -> String {
@@ -333,7 +352,9 @@ async fn indexes_replaces_and_deletes_points_and_skips_excluded() {
     assert!(e.count(None, Some("docs/a"), &[]).await < chunks);
 
     // удаление убирает точки
-    delete_node(&e.db, a).await.unwrap();
+    delete_node(&e.db, a, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     w.notify();
     e.until("удаление точек", async || {
         e.count(None, Some("docs/a"), &["chunk", "note", "section"])
@@ -638,9 +659,14 @@ async fn chunk_embed_key_column_equals_helper() {
     .await
     .unwrap();
     check(a).await;
-    move_node(&db, a, NodePath::parse("y/b").unwrap())
-        .await
-        .unwrap();
+    move_node(
+        &db,
+        a,
+        NodePath::parse("y/b").unwrap(),
+        zam_store::AuthorKind::System,
+    )
+    .await
+    .unwrap();
     check(a).await;
 }
 
@@ -723,15 +749,7 @@ async fn reindex_from_cache_without_inference() {
     .await
     .unwrap();
     // все точки пользователя удалены (как после сбоя): reindex всей базы
-    e.vector
-        .delete_scope(&VectorFilter {
-            user_id: e.user,
-            space_ids: vec![],
-            path_prefix: None,
-            levels: vec![],
-        })
-        .await
-        .unwrap();
+    e.vector.delete_scope(&e.whole_base().await).await.unwrap();
     let rep = e
         .reindex(
             &w,
@@ -826,15 +844,7 @@ async fn interrupted_reindex_is_resumed_on_start() {
         w.shutdown().await;
     }
     // точки удалены, отметка стоит — как при остановке посреди reindex
-    e.vector
-        .delete_scope(&VectorFilter {
-            user_id: e.user,
-            space_ids: vec![],
-            path_prefix: None,
-            levels: vec![],
-        })
-        .await
-        .unwrap();
+    e.vector.delete_scope(&e.whole_base().await).await.unwrap();
     mark_reindex(&e.db, Some("{\"full\":false,\"space\":null}".into()))
         .await
         .unwrap();
@@ -1052,17 +1062,12 @@ async fn skipped_db_survives_restart_and_is_reindexed_after_restore() {
     let b = e.system.create_user("b", false).await.unwrap().id;
     let file = e.users_dir.join(format!("{b}.db"));
     let keep = e.users_dir.join(format!("{b}.keep"));
-    let b_points = async || {
-        e.vector
-            .count(&VectorFilter {
-                user_id: b,
-                space_ids: vec![],
-                path_prefix: None,
-                levels: vec![],
-            })
-            .await
-            .unwrap()
+    // пространства b — до порчи файла (отдельный кэш баз закрывает файл при выходе)
+    let b_all = {
+        let users = UserDbs::new(e.users_dir.clone());
+        VectorFilter::scope(b, all_spaces(&users.get(b).await.unwrap()).await)
     };
+    let b_points = async || e.vector.count(&b_all).await.unwrap();
     // b индексируется воркером на отдельном кэше баз: файл закроется вместе с ним
     let pts = {
         let users = UserDbs::new(e.users_dir.clone());
@@ -1100,15 +1105,7 @@ async fn skipped_db_survives_restart_and_is_reindexed_after_restore() {
     };
     // копия базы b; хранилище «стёрто» (точек b нет), файл b повреждён
     std::fs::copy(&file, &keep).unwrap();
-    e.vector
-        .delete_scope(&VectorFilter {
-            user_id: b,
-            space_ids: vec![],
-            path_prefix: None,
-            levels: vec![],
-        })
-        .await
-        .unwrap();
+    e.vector.delete_scope(&b_all).await.unwrap();
     std::fs::write(&file, b"not a sqlite database at all").unwrap();
     {
         let w = e.spawn_on(UserDbs::new(e.users_dir.clone()));
@@ -1149,4 +1146,226 @@ async fn skipped_db_survives_restart_and_is_reindexed_after_restore() {
     assert!(e.system.index_skipped().await.unwrap().is_empty());
     assert_eq!(w.embedded_texts(), 0);
     w.shutdown().await;
+}
+
+/// Остановка посреди свёртки L0 папки (задача 19 M3, fix round 1): свёртка записала новый L0
+/// в SQLite и сняла эмбеддинг старого, а точку папки в Qdrant обновить не успела (очередь
+/// свёрток живёт в памяти). После старта воркер сверяет точки папок с L0 в SQLite и
+/// досворачивает расходящиеся: вектор папки соответствует её L0, `reindex` не находит
+/// ни лишних точек, ни промахов кэша папок.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_point_fresh_after_stop_mid_rollup() {
+    let e = env("rollup-stop").await;
+    let n = e.note(e.knowledge, "proj/a", NOTE).await;
+    let folder = get_node(&e.db, n).await.unwrap().parent_id.unwrap();
+    {
+        let w = e.spawn();
+        e.indexed(n).await;
+        e.quiet(&w).await;
+        e.until("точка папки", async || {
+            e.count(None, Some("proj"), &["folder"]).await == 1
+        })
+        .await;
+        w.shutdown().await;
+    }
+    let space = list_spaces(&e.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == e.knowledge)
+        .unwrap();
+    let old = get_node(&e.db, folder).await.unwrap();
+    let old_key = folder_embed_key(
+        &space.name,
+        &old.path,
+        &old.name,
+        old.l0.as_deref().unwrap(),
+    );
+    let before = e.vector.folder_hashes(e.user).await.unwrap().unwrap();
+    assert_eq!(before, vec![(folder, old_key.clone())]);
+    // состояние после остановки между `set_folder_l0` и upsert точки: новый L0, эмбеддинга
+    // старого нет, в Qdrant — точка старого L0
+    set_folder_l0(&e.db, folder, Some("a: устаревшая сводка папки"))
+        .await
+        .unwrap();
+    prune_owned_embeddings(&e.db, MODEL, folder, &[])
+        .await
+        .unwrap();
+
+    let w = e.spawn();
+    e.until(
+        "точка папки совпадает с L0 в SQLite",
+        async || {
+            let f = get_node(&e.db, folder).await.unwrap();
+            let want =
+                folder_embed_key(&space.name, &f.path, &f.name, f.l0.as_deref().unwrap_or(""));
+            e.vector.folder_hashes(e.user).await.unwrap().unwrap() == vec![(folder, want)]
+        },
+    )
+    .await;
+    e.quiet(&w).await;
+    let total = e.vector.count(&e.whole_base().await).await.unwrap();
+    let rep = e.reindex(&w, ReindexRequest::default()).await;
+    assert_eq!(rep.folder_misses, 0, "{rep:?}");
+    assert_eq!(rep.folders, 1);
+    assert_eq!(
+        e.vector.count(&e.whole_base().await).await.unwrap(),
+        total,
+        "reindex нашёл лишние точки"
+    );
+    w.shutdown().await;
+}
+
+/// Пользовательское процессорное время процесса теста (воркер, писатель SQLite, тестовая
+/// модель; Qdrant — отдельный процесс). Время ядра не входит: в нём ввод-вывод checkpoint.
+fn user_cpu() -> Duration {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let (mut c, mut x, mut k, mut u) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: псевдодескриптор текущего процесса и указатели на локальные FILETIME
+        unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut x, &mut k, &mut u) }.unwrap();
+        let ticks = (u64::from(u.dwHighDateTime) << 32) | u64::from(u.dwLowDateTime);
+        Duration::from_nanos(ticks * 100)
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: getrusage пишет в локальную структуру
+        let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) }, 0);
+        Duration::from_secs(r.ru_utime.tv_sec as u64)
+            + Duration::from_micros(r.ru_utime.tv_usec as u64)
+    }
+}
+
+/// Одна индексация пачки (задача 19b M3): `BATCH` новых заметок в живой папке рядом с
+/// удалёнными, от первой записи до покоя воркера (задания, auto-L0, свёртки L0 папок).
+/// Возвращает секунды: общее время и пользовательское процессорное время процесса.
+async fn trash_bench_run(trash: usize) -> (f64, f64) {
+    const BATCH: usize = 300;
+    const PER_FOLDER: usize = 1000;
+    let e = env(&format!("bench-trash-{trash}")).await;
+    let body = |tag: &str| {
+        format!(
+            "# Заметка {tag}
+
+Сборка проекта {tag}: команды, переменные окружения и каталоги              журналов.
+
+## Проверка {tag}
+
+Порядок запуска и проверки результатов {tag}.
+"
+        )
+    };
+    // корзина как у `cargo xtask bench first-start`: пачки в папках `burst/b/g<k>`, папка
+    // пачки удаляется целиком; без воркера, а задания удаления снимаются — точек этих заметок
+    // в Qdrant нет, как после их обработки
+    let setup = Instant::now();
+    for k in 0..trash.div_ceil(PER_FOLDER) {
+        let n = PER_FOLDER.min(trash - k * PER_FOLDER);
+        for i in 0..n {
+            e.note(
+                e.knowledge,
+                &format!("burst/b/g{k}/{i:04}-n"),
+                &body(&format!("g{k}-{i}")),
+            )
+            .await;
+        }
+        let folder = zam_store::get_node_by_path(
+            &e.db,
+            e.knowledge,
+            &NodePath::parse(&format!("burst/b/g{k}")).unwrap(),
+        )
+        .await
+        .unwrap();
+        delete_node(&e.db, folder.id, AuthorKind::Agent)
+            .await
+            .unwrap();
+    }
+    e.db.write(|tx| Ok(tx.execute("DELETE FROM index_jobs", [])?))
+        .await
+        .unwrap();
+    let deleted: i64 =
+        e.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM nodes WHERE deleted_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    // хвост WAL подготовки переносится в базу до замера (fix round 1, M2): иначе фоновый
+    // checkpoint десятков мегабайт кадров на HDD попадал в замер и держал запись
+    {
+        let c = rusqlite::Connection::open(e.users_dir.join(format!("{}.db", e.user))).unwrap();
+        c.busy_timeout(Duration::from_secs(60)).unwrap();
+        let busy: i64 = c
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 0, "checkpoint WAL после подготовки не завершён");
+    }
+    // живая папка с одной заметкой: коллекция создана, воркер в покое
+    let w = e.spawn_gc(e.vector.clone(), Duration::from_secs(3600));
+    let first = e
+        .note(e.knowledge, "burst/b/live/0000-n", &body("first"))
+        .await;
+    e.indexed(first).await;
+    e.quiet(&w).await;
+    eprintln!(
+        "T19B-BENCH корзина {deleted} узлов: подготовка {} с",
+        setup.elapsed().as_secs()
+    );
+    let t = Instant::now();
+    let cpu0 = user_cpu();
+    for i in 1..=BATCH {
+        e.note(
+            e.knowledge,
+            &format!("burst/b/live/{i:04}-n"),
+            &body(&format!("live-{i}")),
+        )
+        .await;
+    }
+    e.quiet(&w).await;
+    let secs = t.elapsed().as_secs_f64();
+    let cpu = (user_cpu() - cpu0).as_secs_f64();
+    eprintln!(
+        "T19B-BENCH корзина {deleted} узлов: {BATCH} заметок за {secs:.2} с ({:.1} заданий/с), процессор (user) {cpu:.2} с",
+        BATCH as f64 / secs
+    );
+    w.shutdown().await;
+    (secs, cpu)
+}
+
+/// Бенч задачи 19b M3: индексация пачки при пустой корзине и при 50 тыс. удалённых узлов
+/// (`ZAM_BENCH_TRASH`) — пользовательское процессорное время растёт не больше чем в 1,5 раза.
+/// До исправления каждая свёртка L0 папки и обход поддерева просматривали все узлы
+/// пространства вместе с корзиной на каждом шаге рекурсии — работа процессора (одно ядро на
+/// стенде). Общее время печатается справочно: на HDD в нём растут checkpoint WAL и ожидание
+/// записи у файла большего размера (fix round 1, M2), а не просмотр корзины. Запуск:
+/// `cargo test --release -p zam-index --test worker -- --ignored bench_index_with_trash --nocapture --test-threads=1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_index_with_trash() {
+    let trash: usize = std::env::var("ZAM_BENCH_TRASH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+    let (wall0, cpu0) = trash_bench_run(0).await;
+    let (wall1, cpu1) = trash_bench_run(trash).await;
+    let ratio = cpu1 / cpu0;
+    eprintln!(
+        "T19B-BENCH рост процессорного времени индексации: {ratio:.2}× (предел 1,5×); общего времени — {:.2}× (справочно)",
+        wall1 / wall0
+    );
+    assert!(
+        ratio <= 1.5,
+        "процессор при корзине {cpu1:.2} с против {cpu0:.2} с"
+    );
 }

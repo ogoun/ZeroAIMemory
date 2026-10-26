@@ -1,0 +1,17 @@
+# Буст вида insight не выше буста theorem (задача 18 M3, fix round 1 ревью): снимает ли он
+# конфликт «gotcha-гипотеза над theorem» и возвращает ли пользу буста (s-29, failure)?
+#   cargo xtask eval --grid eval/grid-m3-kind.toml
+# База — умолчания после задачи 18 (boost_gotcha = boost_failure = 1,0; theorem 1,10).
+model = "bge-m3-fp16"
+device = "cuda"
+
+[[config]]
+name = "default-kind1.0"
+
+[[config]]
+name = "kind1.05"
+set = { "search.boost_gotcha" = "1.05", "search.boost_failure" = "1.05" }
+
+[[config]]
+name = "kind1.10"
+set = { "search.boost_gotcha" = "1.10", "search.boost_failure" = "1.10" }

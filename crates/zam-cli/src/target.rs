@@ -11,9 +11,11 @@ use std::path::Path;
 
 use crate::client::CliError;
 
-/// Решение из `solution.toml`.
+/// Решение из `solution.toml`: ключ `agent_solution_id` (§11.1), прежний `id` читается.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct Solution {
+    /// `agent_solution_id` (GUID решения).
+    #[serde(rename = "agent_solution_id", alias = "id")]
     pub id: String,
     pub name: String,
 }
@@ -21,7 +23,7 @@ pub struct Solution {
 /// Предел размера `solution.toml`, байт.
 const SOLUTION_MAX: u64 = 64 * 1024;
 
-/// Читает `solution.toml`: поля `id` (GUID) и `name`.
+/// Читает `solution.toml`: поля `agent_solution_id` (GUID; прежнее имя — `id`) и `name`.
 pub fn load_solution(path: &Path) -> Result<Solution, CliError> {
     let fail = |m: String| CliError::config(format!("{}: {m}", path.display()));
     let meta = std::fs::metadata(path).map_err(|e| fail(e.to_string()))?;
@@ -31,7 +33,7 @@ pub fn load_solution(path: &Path) -> Result<Solution, CliError> {
     let text = std::fs::read_to_string(path).map_err(|e| fail(e.to_string()))?;
     let s: Solution = toml::from_str(&text).map_err(|e| fail(e.message().to_string()))?;
     if !is_guid(s.id.trim()) {
-        return Err(fail("id — UUID с дефисами".into()));
+        return Err(fail("agent_solution_id — UUID с дефисами".into()));
     }
     if s.name.trim().is_empty() {
         return Err(fail("name не задан".into()));
@@ -251,7 +253,15 @@ mod tests {
                 name: "T".into()
             }
         );
-        for bad in ["id = [", "name = \"x\"", "id = \"nope\"\nname = \"x\""] {
+        // новый ключ
+        std::fs::write(&f, format!("agent_solution_id = \"{G}\"\nname = \"T\"\n")).unwrap();
+        assert_eq!(load_solution(&f).unwrap().id, G);
+        for bad in [
+            "id = [",
+            "name = \"x\"",
+            "id = \"nope\"\nname = \"x\"",
+            "agent_solution_id = \"nope\"\nname = \"x\"",
+        ] {
             std::fs::write(&f, bad).unwrap();
             let e = load_solution(&f).unwrap_err();
             assert_eq!(e.code, crate::client::EXIT_CONFIG, "{bad}");

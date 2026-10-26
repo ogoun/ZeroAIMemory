@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::search::{FtsQuery, MARK_END, MARK_START, sanitize_fts, search_fts};
 use zam_store::time::fmt_ts;
 use zam_store::{
@@ -35,6 +35,8 @@ fn attrib() -> Attribution {
         session_id: None,
         machine: None,
         message: None,
+        user_id: None,
+        area: None,
     }
 }
 
@@ -60,6 +62,7 @@ fn q(text: &str, spaces: &[Id]) -> FtsQuery {
         space_ids: spaces.to_vec(),
         path_prefix: None,
         top_k: 20,
+        targets: Default::default(),
     }
 }
 
@@ -105,7 +108,7 @@ async fn russian_word_found_by_prefix_and_case() {
     let hits = search_fts(&db, q("Скрипт", &[k])).await.unwrap();
     assert_eq!(hits.len(), 1);
     let h = &hits[0];
-    assert_eq!(h.node_id, id);
+    assert_eq!(h.target.id, id);
     assert_eq!(h.space_id, k);
     assert_eq!(h.path, "Инструменты/Bash скрипты");
     assert_eq!(h.heading_path, "Обзор");
@@ -272,7 +275,9 @@ async fn deleted_node_not_found() {
         search_fts(&db, q("исчезающее", &[k])).await.unwrap().len(),
         1
     );
-    delete_node(&db, id).await.unwrap();
+    delete_node(&db, id, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     assert!(
         search_fts(&db, q("исчезающее", &[k]))
             .await
@@ -621,7 +626,9 @@ async fn pending_count_by_scope() {
     add(&db, k, "dir/b", "# B\n").await;
     add(&db, k, "skip", "---\nindex: false\n---\n# С\n").await;
     let gone = add(&db, k, "gone", "# Г\n").await;
-    delete_node(&db, gone).await.unwrap();
+    delete_node(&db, gone, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     add(&db, h, "личное", "x").await;
     // папка dir, заметка с index: false, удалённая и Human (никогда не векторизуется,
     // `excluded`) не считаются
@@ -655,7 +662,7 @@ async fn note_level_only_when_no_leaf_matches() {
         .await
         .unwrap();
     assert_eq!(hits.len(), 1, "{hits:?}");
-    assert_eq!((hits[0].node_id, hits[0].heading_path.as_str()), (id, ""));
+    assert_eq!((hits[0].target.id, hits[0].heading_path.as_str()), (id, ""));
 }
 
 // ---------- каналы и проверка векторных хитов (M2) ----------
@@ -670,9 +677,9 @@ async fn channels_are_separate_and_ordered() {
         .unwrap();
     // строгий bm25: оба слова есть только у a (лист и L1 заметки — без правила
     // «сводка только без листа»); trigram — по идентификатору
-    assert!(ch.bm25.iter().all(|h| h.node_id == a), "{:?}", ch.bm25);
+    assert!(ch.bm25.iter().all(|h| h.target.id == a), "{:?}", ch.bm25);
     assert!(ch.bm25.iter().any(|h| h.level == "chunk"));
-    assert_eq!(ch.trigram[0].node_id, a);
+    assert_eq!(ch.trigram[0].target.id, a);
     assert_eq!(ch.bm25[0].score, 1.0);
     assert!(ch.bm25[0].token_count > 0);
     assert!(ch.bm25[0].snippet.contains(MARK_START));
@@ -681,13 +688,20 @@ async fn channels_are_separate_and_ordered() {
     let ch = zam_store::search_fts_channels(&db, q("настройка редактора git", &[k]))
         .await
         .unwrap();
-    let mut got: Vec<Id> = ch.bm25.iter().map(|h| h.node_id).collect();
+    let mut got: Vec<Id> = ch.bm25.iter().map(|h| h.target.id).collect();
     got.sort();
     got.dedup();
     let mut want = vec![a, b];
     want.sort();
     assert_eq!(got, want);
     assert_eq!(ch.bm25[1].score, 0.5);
+    // сырой bm25 канала: отрицательный, по возрастанию (меньше — лучше)
+    assert!(ch.bm25.iter().all(|h| h.raw_score < 0.0), "{:?}", ch.bm25);
+    assert!(
+        ch.bm25.windows(2).all(|w| w[0].raw_score <= w[1].raw_score),
+        "{:?}",
+        ch.bm25
+    );
     assert!(ch.trigram.is_empty());
     // все слова не встретились ни в одном чанке — сработал ослабленный запрос
     assert!(ch.relaxed);
@@ -717,7 +731,9 @@ async fn live_chunks_checks_sqlite() {
         id_of(excl).await,
         id_of(hum).await,
     );
-    delete_node(&db, gone).await.unwrap();
+    delete_node(&db, gone, zam_store::AuthorKind::System)
+        .await
+        .unwrap();
     let ids = vec![
         "нет-такого".to_string(),
         cg.clone(),
@@ -729,6 +745,7 @@ async fn live_chunks_checks_sqlite() {
         space_ids: vec![k],
         path_prefix: prefix.map(str::to_string),
         indexable_only,
+        targets: Default::default(),
     };
     let got = zam_store::live_chunks(&db, ids.clone(), scope(true, None))
         .await
@@ -767,12 +784,17 @@ async fn neighbors_of_leaf() {
     assert!(leaves.len() >= 3, "{}", leaves.len());
     // пакетный вариант: узел без листов в ответ не входит
     let other = add(&db, k, "short", "# Короткая\n\nтекст\n").await;
-    let many = zam_store::leaves_of_nodes(&db, vec![n, other, Id::new()], true)
+    let node = |id| TargetRef {
+        kind: TargetKind::Node,
+        id,
+    };
+    let (tn, tother) = (node(n), node(other));
+    let many = zam_store::leaves_of_targets(&db, vec![tn, tother, node(Id::new())], true)
         .await
         .unwrap();
     assert_eq!(many.len(), 2);
-    assert_eq!(many[&n], leaves);
-    assert_eq!(many[&other].len(), 1);
+    assert_eq!(many[&tn], leaves);
+    assert_eq!(many[&tother].len(), 1);
     // ключ кэша листа — та же формула, что у воркера
     for l in &leaves {
         assert_eq!(
@@ -781,17 +803,17 @@ async fn neighbors_of_leaf() {
         );
     }
     // без текста — те же листы и ключи, пустые text и context_prefix
-    let bare = zam_store::leaves_of_nodes(&db, vec![n], false)
+    let bare = zam_store::leaves_of_targets(&db, vec![tn], false)
         .await
         .unwrap();
-    assert_eq!(bare[&n].len(), leaves.len());
+    assert_eq!(bare[&tn].len(), leaves.len());
     assert!(
-        bare[&n]
+        bare[&tn]
             .iter()
             .all(|l| l.text.is_empty() && l.context_prefix.is_empty())
     );
     assert!(
-        bare[&n]
+        bare[&tn]
             .iter()
             .zip(&leaves)
             .all(|(b, l)| b.embed_key == l.embed_key)
@@ -799,7 +821,7 @@ async fn neighbors_of_leaf() {
     // совпадения слов запроса по листам — через индекс FTS
     let hits = zam_store::leaf_term_hits(
         &db,
-        vec![n, other],
+        vec![tn, tother],
         vec![
             "второе".into(),
             "третье".into(),
@@ -809,7 +831,7 @@ async fn neighbors_of_leaf() {
     )
     .await
     .unwrap();
-    for l in leaves.iter().chain(&many[&other]) {
+    for l in leaves.iter().chain(&many[&tother]) {
         let want = ["второе", "третье", "текст"]
             .iter()
             .filter(|w| l.text.contains(*w))
@@ -849,4 +871,48 @@ fn needles_identifiers_then_words() {
             "git"
         ]
     );
+}
+
+#[tokio::test]
+async fn entry_leaves_and_term_hits() {
+    // листы записи журнала для замены её сводки (финальная волна M3, задача 6)
+    let (db, k, _) = setup("entry-leaves").await;
+    let filler = "текст ".repeat(400);
+    let (e, _) = zam_store::create_entry(
+        &db,
+        zam_store::NewEntry {
+            space_id: k,
+            kind: zam_store::EntryKind::Insight,
+            title: "Две части".into(),
+            body: format!("## Первая\n\nальфаслово {filler}\n\n## Вторая\n\nбетаслово {filler}\n"),
+            data: serde_json::json!({"kind": "gotcha"}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: None,
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &attrib(),
+    )
+    .await
+    .unwrap();
+    let t = TargetRef {
+        kind: TargetKind::Entry,
+        id: e.id,
+    };
+    let leaves = zam_store::leaves_of_targets(&db, vec![t], true)
+        .await
+        .unwrap()
+        .remove(&t)
+        .unwrap();
+    assert!(leaves.len() >= 2, "{leaves:?}");
+    assert!(leaves.windows(2).all(|w| w[0].ordinal < w[1].ordinal));
+    let hits = zam_store::leaf_term_hits(&db, vec![t], vec!["бетаслово".into()])
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].target, t);
+    assert!(hits[0].heading_path.ends_with("Вторая"), "{hits:?}");
 }

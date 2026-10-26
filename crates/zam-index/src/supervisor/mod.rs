@@ -12,7 +12,9 @@
 //! 3. Падение → `Restarting` с задержкой 1→60 с и jitter; 5 падений за 10 минут →
 //!    `Broken` (circuit breaker), сервер продолжает работу в деградированном режиме.
 //!    panic несовместимого хранилища → стирание `storage/` и один немедленный перезапуск.
-//! 4. [`Supervisor::shutdown`]: Linux — SIGTERM, 10 с, SIGKILL; Windows — `TerminateProcess`.
+//! 4. [`Supervisor::shutdown`]: после недавней записи — ожидание сброса WAL (не дольше
+//!    `shutdown_flush_wait`, задача 19 M3); затем Linux — SIGTERM, 10 с, SIGKILL; Windows —
+//!    `TerminateProcess`.
 //!
 //! Режим `external`: процесса нет, состояние всегда `External`, доступность проверяет
 //! `VectorIndex::health`.
@@ -36,12 +38,13 @@ use rand::Rng as _;
 use tokio::sync::watch;
 
 pub use config::{
+    DEFAULT_FLUSH_INTERVAL_SEC, DEFAULT_SHUTDOWN_FLUSH_WAIT, DEFAULT_WAL_CAPACITY_MB,
     ExternalConfig, ManagedConfig, QDRANT_VERSION, RestartPolicy, SupervisorConfig, default_binary,
-    qdrant_exe_name,
+    flush_wait, qdrant_exe_name,
 };
 pub use process::{is_qdrant_process, pid_alive, rss_bytes};
 
-use crate::{IndexError, QdrantIndex, VectorIndex};
+use crate::{CollectionTuning, IndexError, QdrantIndex, VectorIndex, WriteMark};
 
 /// Состояние Qdrant для `/index/status`, деградации поиска и воркера индексации.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +88,11 @@ pub struct Supervisor {
     shared: Option<Arc<Shared>>,
     stop: Option<watch::Sender<bool>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Последняя запись клиентов [`Self::connect_index`].
+    writes: WriteMark,
+    /// managed: параметры коллекции и ожидание сброса WAL при остановке (задача 19 M3).
+    tuning: Option<CollectionTuning>,
+    shutdown_flush_wait: Duration,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -113,6 +121,9 @@ impl Supervisor {
                     shared: None,
                     stop: None,
                     thread: None,
+                    writes: WriteMark::default(),
+                    tuning: None,
+                    shutdown_flush_wait: Duration::ZERO,
                 });
             }
             SupervisorConfig::Managed(m) => m,
@@ -157,6 +168,8 @@ impl Supervisor {
             restart_hold: crate::test_hooks::Hold::default(),
         });
         let (stop_tx, stop_rx) = watch::channel(false);
+        let tuning = Some(m.tuning());
+        let shutdown_flush_wait = m.shutdown_flush_wait;
         let ctx = Ctx {
             cfg: m,
             shared: shared.clone(),
@@ -177,6 +190,20 @@ impl Supervisor {
             shared: Some(shared),
             stop: Some(stop_tx),
             thread: Some(thread),
+            writes: WriteMark::default(),
+            tuning,
+            shutdown_flush_wait,
+        })
+    }
+
+    /// Клиент Qdrant этого супервизора: ключ, параметры коллекции (managed) и отметка
+    /// записей, по которой [`Self::shutdown`] ждёт сброса WAL.
+    pub fn connect_index(&self) -> Result<QdrantIndex, IndexError> {
+        let idx = QdrantIndex::connect(&self.grpc_url, self.api_key.as_deref())?
+            .with_write_mark(self.writes.clone());
+        Ok(match self.tuning {
+            Some(t) => idx.with_tuning(t),
+            None => idx,
         })
     }
 
@@ -254,15 +281,66 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Операций записи точек, ещё не подтверждённых Qdrant в WAL: последний `operation_id`
+    /// клиентов [`Self::connect_index`] минус `ack_index`. Ненулевое значение — следующий
+    /// старт после жёсткой остановки повторит WAL (задача 19 M3). Файла `first-index` ещё
+    /// нет — не подтверждено ничего. `None` — external, записей с номером не было или формат
+    /// файла не разобран.
+    pub fn wal_pending(&self) -> Option<u64> {
+        let shared = self.shared.as_ref()?;
+        let op = self.writes.last_op()?;
+        pending_of(op, wal_ack(&shared.qdir))
+    }
+
+    /// Отметка записей клиентов [`Self::connect_index`] (время и номер операции WAL).
+    pub fn write_mark(&self) -> WriteMark {
+        self.writes.clone()
+    }
+
     /// Останавливает Qdrant и ждёт завершения потока супервизора.
-    pub async fn shutdown(mut self) {
+    ///
+    /// managed, после записи клиентов [`Self::connect_index`] (вызывающий уже остановил
+    /// запись): сначала ждёт, пока Qdrant подтвердит её в WAL, — иначе следующий старт
+    /// повторяет неподтверждённый WAL (на Windows Qdrant завершается только
+    /// `TerminateProcess`; задача 19 M3). Подтверждение — `ack_index` файла `first-index`
+    /// WAL коллекции не меньше последнего `operation_id` (опрос раз в 100 мс); файла нет —
+    /// ожидание по времени ([`flush_wait`]). Не дольше `shutdown_flush_wait`.
+    ///
+    /// Итог — как прошло ожидание (`None` — не ждали: external, Qdrant не готов, предел 0
+    /// или записей не было).
+    pub async fn shutdown(mut self) -> Option<WalWait> {
+        let mut waited = None;
+        if let (Some(t), Some(shared)) = (self.tuning, &self.shared)
+            && matches!(*self.state.borrow(), QdrantState::Ready { .. })
+            && !self.shutdown_flush_wait.is_zero()
+        {
+            let qdir = shared.qdir.clone();
+            waited = wait_wal_ack(
+                &qdir,
+                &self.writes,
+                t.flush_interval_sec,
+                self.shutdown_flush_wait,
+            )
+            .await;
+        }
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(true);
         }
         if let Some(t) = self.thread.take() {
             let _ = tokio::task::spawn_blocking(move || t.join()).await;
         }
+        waited
     }
+}
+
+/// Ожидание подтверждения WAL при [`Supervisor::shutdown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalWait {
+    /// Сколько ждали.
+    pub waited: Duration,
+    /// `acked` — подтверждено; `timeout` — вышел предел; `time` — пауза по времени
+    /// (файла WAL или номера операции нет).
+    pub result: &'static str,
 }
 
 impl Drop for Supervisor {
@@ -272,6 +350,97 @@ impl Drop for Supervisor {
             let _ = stop.send(true);
         }
     }
+}
+
+/// Состояние подтверждённой части WAL коллекции.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalAck {
+    /// Файла `first-index` нет: Qdrant ещё ни разу не подтверждал WAL (новая коллекция до
+    /// первого прохода сброса) — не подтверждено ничего.
+    Missing,
+    /// `ack_index`: повтор WAL при старте начнётся с этого номера.
+    Index(u64),
+    /// Файл есть, но не читается или формат другой (другая версия Qdrant).
+    Unreadable,
+}
+
+/// Подтверждённая часть WAL коллекции по `storage/collections/zam_chunks/0/wal/first-index`
+/// (Qdrant 1.19: файл пишет только `SerdeWal::ack` — `WalState { ack_index }`, при создании
+/// коллекции его нет).
+pub fn wal_ack(qdir: &Path) -> WalAck {
+    let f = qdir
+        .join(stamp::STORAGE_DIR)
+        .join("collections")
+        .join(crate::COLLECTION)
+        .join("0")
+        .join("wal")
+        .join("first-index");
+    let text = match std::fs::read_to_string(f) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return WalAck::Missing,
+        Err(_) => return WalAck::Unreadable,
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("ack_index")?.as_u64())
+        .map_or(WalAck::Unreadable, WalAck::Index)
+}
+
+/// `ack_index`, если файл есть и разобран (см. [`wal_ack`]).
+pub fn wal_ack_index(qdir: &Path) -> Option<u64> {
+    match wal_ack(qdir) {
+        WalAck::Index(a) => Some(a),
+        WalAck::Missing | WalAck::Unreadable => None,
+    }
+}
+
+/// Неподтверждённых записей при последнем номере операции `op`: файла нет — все
+/// (номера WAL с 0, `op + 1`); формат не разобран — неизвестно.
+fn pending_of(op: u64, ack: WalAck) -> Option<u64> {
+    match ack {
+        WalAck::Index(a) => Some(op.saturating_sub(a)),
+        WalAck::Missing => Some(op.saturating_add(1)),
+        WalAck::Unreadable => None,
+    }
+}
+
+/// Ожидание подтверждения WAL перед остановкой (см. [`Supervisor::shutdown`]).
+async fn wait_wal_ack(
+    qdir: &Path,
+    writes: &WriteMark,
+    flush_interval_sec: u64,
+    cap: Duration,
+) -> Option<WalWait> {
+    let since = writes.since_last()?;
+    let t0 = Instant::now();
+    // `acked` — WAL подтверждён; `timeout` — предел вышел раньше; `time` — формат файла не
+    // разобран (или нет номера операции): ожидание по времени. Файла нет — подтверждений
+    // ещё не было: опрос до его появления с `ack_index ≥ op`
+    let result = match (writes.last_op(), wal_ack(qdir)) {
+        (Some(op), WalAck::Index(_) | WalAck::Missing) => loop {
+            if wal_ack_index(qdir).is_some_and(|a| a >= op) {
+                break "acked";
+            }
+            if t0.elapsed() >= cap {
+                break "timeout";
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        },
+        _ => {
+            tokio::time::sleep(flush_wait(Some(since), flush_interval_sec, cap)).await;
+            "time"
+        }
+    };
+    let waited = t0.elapsed();
+    if waited >= Duration::from_millis(100) || result == "timeout" {
+        tracing::info!(
+            component = "qdrant",
+            wait_ms = waited.as_millis() as u64,
+            result,
+            "ожидание подтверждения WAL Qdrant перед остановкой"
+        );
+    }
+    Some(WalWait { waited, result })
 }
 
 /// Контекст потока супервизора.
@@ -755,6 +924,14 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_counts_missing_file_as_nothing_acked() {
+        assert_eq!(pending_of(27, WalAck::Index(27)), Some(0));
+        assert_eq!(pending_of(27, WalAck::Index(20)), Some(7));
+        assert_eq!(pending_of(27, WalAck::Missing), Some(28));
+        assert_eq!(pending_of(27, WalAck::Unreadable), None);
+    }
 
     #[test]
     fn thread_panic_publishes_broken() {

@@ -1,3 +1,6 @@
+---
+index: false
+---
 # Recall@k or nDCG@10: picking the metric per pipeline stage
 
 Short rule I keep coming back to:

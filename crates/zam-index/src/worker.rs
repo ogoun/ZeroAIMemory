@@ -23,12 +23,13 @@
 //!    последовательно с заданиями, в том числе при чужой модели коллекции (её он и
 //!    пересоздаёт). Прерванный reindex базы (отметка `reindex_pending`) повторяется при
 //!    первом открытии базы после запуска.
-//! 4. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла →
+//! 4. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла или
+//!    записи журнала (`target_kind = 'entry'`, M3: точки с `entry_id` и полями записи) →
 //!    кэш `embeddings` по `chunks.embed_key` → инференс промахов (`spawn_blocking`, пачки
 //!    не больше `batch_tokens`, уступка `yield_ms`) → одна запись в Qdrant на пачку:
-//!    `delete_nodes` + `upsert` (`wait=true`; отказ пачки — по одному узлу) →
-//!    auto-L0 → `complete_job`, который в своей транзакции ставит `index_state = 'indexed'`
-//!    только при [`JobOutcome::Done`] и без активного задания узла.
+//!    `delete_targets` + `upsert` (`wait=true`; отказ пачки — по одной цели) →
+//!    auto-L0 (только узлы) → `complete_job`, который в своей транзакции ставит
+//!    `index_state = 'indexed'` только при [`JobOutcome::Done`] и без активного задания цели.
 //!    Qdrant недоступен или коллекции нет — задания возвращаются [`release_job`] без
 //!    траты попыток; прочие ошибки — [`fail_job`] (backoff, после 5 — `failed`).
 //! 5. **L0** (§8.3): автоматический L0 заметки — предложение у центроида её чанков;
@@ -53,14 +54,15 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use tokio::sync::{Notify, watch};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::ChunkLevel;
 use zam_store::{
     Db, Embedding, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, NodeKind,
     SpaceKind, StoreError, SystemStore, UserDbs, adopt_owned_embeddings, chunks_for_index,
-    claim_jobs, complete_job, enqueue_reindex, fail_job, gc_embeddings, get_embeddings, get_node,
-    get_space, indexed_count, list_children, pending_reindex, prune_owned_embeddings,
-    put_embeddings, put_owned_embeddings, release_job, requeue_running, set_auto_l0, set_folder_l0,
+    claim_jobs, complete_job, enqueue_reindex, entry_chunks_for_index, fail_job, folders_for_index,
+    gc_embeddings, get_embeddings, get_node, get_space, indexed_count, list_children,
+    pending_reindex, prune_owned_embeddings, put_embeddings, put_owned_embeddings, release_job,
+    requeue_running, set_auto_l0, set_folder_l0,
 };
 
 use crate::reindex::{GC_BATCH, ReindexCtx, ReindexReport, ReindexRequest, reindex};
@@ -265,6 +267,7 @@ impl WorkerHandle {
             skipped_dbs: HashSet::new(),
             pending_checked: HashSet::new(),
             scanned: false,
+            folders_checked: false,
             gc_due: HashMap::new(),
         };
         let task = tokio::spawn(w.run());
@@ -463,6 +466,8 @@ struct Worker {
     pending_checked: HashSet<Id>,
     /// Все базы открыты (проверены отметки) хотя бы раз после запуска.
     scanned: bool,
+    /// Точки папок сверены с L0 в SQLite после запуска ([`Worker::reconcile_folders`]).
+    folders_checked: bool,
     /// Следующая сборка мусора кэша базы.
     gc_due: HashMap<Id, Instant>,
 }
@@ -680,6 +685,24 @@ impl Worker {
                         retry_at = Some(Instant::now() + backoff);
                         backoff = (backoff * 2).min(self.cfg.retry_max);
                         continue;
+                    }
+                }
+            }
+            // 3a. Один раз за запуск: точки папок против L0 в SQLite (свёртка, прерванная
+            // остановкой, оставила бы устаревший вектор папки)
+            if !self.folders_checked {
+                match self.reconcile_folders().await {
+                    Ok(()) => self.folders_checked = true,
+                    Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
+                        ensured = false;
+                        self.vector_down(&e);
+                        retry_at = Some(Instant::now() + backoff);
+                        backoff = (backoff * 2).min(self.cfg.retry_max);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "сверка точек папок пропущена");
+                        self.folders_checked = true;
                     }
                 }
             }
@@ -1251,15 +1274,15 @@ impl Worker {
     async fn fail(&self, db: &Db, j: &Job, err: &str) {
         match fail_job(db, j.id, j.claim_gen, err, Timestamp::now()).await {
             Ok(JobOutcome::Failed) if j.op == JobOp::Delete => tracing::warn!(
-                node = %j.target_id,
+                target = %j.target(),
                 error = err,
-                "задание delete завершилось неудачей: точки узла остаются в Qdrant (поиск их отфильтрует)"
+                "задание delete завершилось неудачей: точки цели остаются в Qdrant (поиск их отфильтрует)"
             ),
             Ok(JobOutcome::Failed) => {
-                tracing::warn!(node = %j.target_id, error = err, "задание индексации failed")
+                tracing::warn!(target = %j.target(), error = err, "задание индексации failed")
             }
             Ok(_) => {
-                tracing::debug!(node = %j.target_id, error = err, "задание индексации: повтор")
+                tracing::debug!(target = %j.target(), error = err, "задание индексации: повтор")
             }
             Err(e) => tracing::warn!(job = j.id, error = %e, "fail_job"),
         }
@@ -1272,16 +1295,22 @@ impl Worker {
         for j in jobs {
             let plan = match j.op {
                 JobOp::Delete => Plan::Delete,
-                JobOp::Upsert => match chunks_for_index(db, j.target_id).await {
-                    Ok(c) if c.is_empty() => Plan::Delete,
-                    Ok(c) => Plan::Upsert(c),
-                    // узла нет: убрать возможные точки
-                    Err(StoreError::NotFound) => Plan::Delete,
-                    Err(e) => {
-                        self.fail(db, &j, &format!("чанки узла: {e}")).await;
-                        continue;
+                JobOp::Upsert => {
+                    let chunks = match j.target_kind {
+                        TargetKind::Node => chunks_for_index(db, j.target_id).await,
+                        TargetKind::Entry => entry_chunks_for_index(db, j.target_id).await,
+                    };
+                    match chunks {
+                        Ok(c) if c.is_empty() => Plan::Delete,
+                        Ok(c) => Plan::Upsert(c),
+                        // цели нет: убрать возможные точки
+                        Err(StoreError::NotFound) => Plan::Delete,
+                        Err(e) => {
+                            self.fail(db, &j, &format!("чанки цели: {e}")).await;
+                            continue;
+                        }
                     }
-                },
+                }
             };
             plans.push((j, plan));
         }
@@ -1338,12 +1367,12 @@ impl Worker {
             self.release_all(db, &back).await;
             return Err(Halt::Stopped);
         }
-        // Qdrant: две записи на пачку (удалить старые точки узлов, записать новые), а не
+        // Qdrant: две записи на пачку (удалить старые точки целей, записать новые), а не
         // две на задание — на HDD каждая запись `wait=true` стоит десятки миллисекунд
-        let nodes: Vec<Id> = ready.iter().map(|(j, _)| j.target_id).collect();
+        let targets: Vec<TargetRef> = ready.iter().map(|(j, _)| j.target()).collect();
         #[cfg(feature = "test-hooks")]
         self.inner.hold.park().await;
-        match self.write_points(user, &nodes, pts).await {
+        match self.write_points(user, &targets, pts).await {
             Ok(()) => {}
             Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
                 let back: Vec<Job> = ready.into_iter().map(|(j, _)| j).collect();
@@ -1353,12 +1382,12 @@ impl Worker {
             Err(e) => {
                 // пачка отклонена: по одному, чтобы неудачным стало только виновное задание
                 // (точки узлов строятся заново только на этом редком пути)
-                tracing::debug!(error = %e, "запись пачки в Qdrant отклонена, по одному узлу");
+                tracing::debug!(error = %e, "запись пачки в Qdrant отклонена, по одной цели");
                 let mut keep = Vec::with_capacity(ready.len());
                 let mut rest = ready.into_iter();
                 while let Some((j, plan)) = rest.next() {
                     let pts = plan_points(user, &plan, &embs).unwrap_or_default();
-                    match self.write_points(user, &[j.target_id], pts).await {
+                    match self.write_points(user, &[j.target()], pts).await {
                         Ok(()) => keep.push((j, plan)),
                         Err(e @ (IndexError::Unavailable(_) | IndexError::NotFound(_))) => {
                             // записанные уже подтверждены, но их задания тоже
@@ -1379,14 +1408,17 @@ impl Worker {
         for (j, plan) in ready {
             // свёртка предков и auto-L0 — до закрытия задания: покой воркера — пустая
             // очередь, `batch_running == false` и `rollups_pending == 0`, а `indexed`
-            // означает, что узел обработан целиком (L0 — по ревизии задания)
-            let parent = get_node(db, j.target_id)
-                .await
-                .ok()
-                .and_then(|n| n.parent_id);
-            self.schedule_chain(user, db, parent).await;
-            if let Plan::Upsert(chunks) = &plan {
-                self.auto_l0(db, j.target_id, j.rev, chunks, &embs).await;
+            // означает, что узел обработан целиком (L0 — по ревизии задания); у записей
+            // журналов нет ни папок-предков, ни L0
+            if j.target_kind == TargetKind::Node {
+                let parent = get_node(db, j.target_id)
+                    .await
+                    .ok()
+                    .and_then(|n| n.parent_id);
+                self.schedule_chain(user, db, parent).await;
+                if let Plan::Upsert(chunks) = &plan {
+                    self.auto_l0(db, j.target_id, j.rev, chunks, &embs).await;
+                }
             }
             // `indexed` ставит complete_job в своей транзакции (upsert, Done, без активного
             // задания); upsert без чанков (пустая заметка) тоже завершён: иначе вечный pending
@@ -1401,19 +1433,19 @@ impl Worker {
         Ok(())
     }
 
-    /// Точки узлов в Qdrant: удалить старые точки `nodes`, записать `pts` (`wait=true`).
+    /// Точки целей в Qdrant: удалить старые точки `targets`, записать `pts` (`wait=true`).
     async fn write_points(
         &self,
         user: Id,
-        nodes: &[Id],
+        targets: &[TargetRef],
         pts: Vec<IndexPoint>,
     ) -> Result<(), IndexError> {
-        if nodes.is_empty() {
+        if targets.is_empty() {
             return Ok(());
         }
         let t = Instant::now();
         let res = async {
-            self.deps.vector.delete_nodes(user, nodes).await?;
+            self.deps.vector.delete_targets(user, targets).await?;
             if !pts.is_empty() {
                 self.deps.vector.upsert(pts).await?;
             }
@@ -1596,6 +1628,67 @@ impl Worker {
         }
     }
 
+    /// Сверка точек папок с L0 в SQLite (раз за запуск, задача 19 M3): очередь свёрток
+    /// живёт в памяти, и остановка посреди [`Self::rollup_folder`] (L0 уже записан, кэш
+    /// старого снят, точка ещё прежняя) или до неё оставляла бы в Qdrant устаревший вектор
+    /// папки (а `reindex` — «лишнюю» точку и промах кэша). Папке, у которой точки нет или её
+    /// `text_hash` не равен ключу L0 из SQLite, ставится свёртка; точка папки, которой нет
+    /// среди живых с L0, — тоже (свёртка удалённой или пустой папки удаляет точку), а точка
+    /// узла, которого нет в базе, удаляется сразу. Сравнение — по фактическому состоянию
+    /// Qdrant и SQLite, поэтому не зависит от того, в какой момент процесс был убит.
+    async fn reconcile_folders(&mut self) -> Result<(), IndexError> {
+        for user in self.users().await {
+            let Some(db) = self.open_db(user).await else {
+                continue;
+            };
+            let Some(points) = self.deps.vector.folder_hashes(user).await? else {
+                return Ok(());
+            };
+            let folders = match folders_for_index(&db, None).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(user = %user, error = %e, "папки для сверки точек");
+                    continue;
+                }
+            };
+            let want: HashMap<Id, String> = folders
+                .iter()
+                .map(|f| {
+                    (
+                        f.node_id,
+                        folder_embed(&f.space_name, &f.path, &f.name, &f.l0).1,
+                    )
+                })
+                .collect();
+            let have: HashMap<Id, String> = points.into_iter().collect();
+            let mut stale = 0usize;
+            for (id, key) in &want {
+                if have.get(id) != Some(key) {
+                    self.rollups.schedule(user, *id, self.cfg.rollup_debounce);
+                    stale += 1;
+                }
+            }
+            for id in have.keys().filter(|id| !want.contains_key(id)) {
+                stale += 1;
+                if get_node(&db, *id).await.is_ok() {
+                    self.rollups.schedule(user, *id, self.cfg.rollup_debounce);
+                } else {
+                    ok_or_vector(self.deps.vector.delete_node(user, *id).await)?;
+                }
+            }
+            if stale > 0 {
+                tracing::info!(
+                    user = %user,
+                    folders = stale,
+                    "точки папок расходятся с L0: свёртка заново"
+                );
+            }
+        }
+        let n = self.rollups.due.len();
+        self.status(|s| s.rollups_pending = n);
+        Ok(())
+    }
+
     /// Подсказки API (старый родитель перенесённого узла) — в очередь свёртки.
     async fn take_hints(&mut self) {
         let hints = std::mem::take(&mut *lock(&self.inner.hints));
@@ -1701,7 +1794,9 @@ impl Worker {
                 updated_at: c.updated_at.as_second(),
             })
             .collect();
-        let l0 = rollup::folder_l0(&kids);
+        // имена детей задаёт автор: значение секрета в свёртке маскируется (L0 папки виден
+        // в карточках папок поиска)
+        let l0 = rollup::folder_l0(&kids).map(|s| zam_markdown::mask_text(&s));
         if let Err(e) = set_folder_l0(db, folder, l0.as_deref()).await {
             tracing::warn!(folder = %folder, error = %e, "L0 папки");
             return Ok(());
@@ -1800,9 +1895,15 @@ pub fn embed_key(c: &IndexChunk) -> String {
     embed_key_of(&c.context_prefix, &c.text)
 }
 
-/// Текст эмбеддинга L0 папки и его ключ кэша (домен `folder`).
+/// Текст эмбеддинга L0 папки и его ключ кэша (домен `folder`). Текст —
+/// [`zam_store::folder_embed_input`]: значения секретов в имени, пути и L0 замаскированы.
+/// Ключ кэша и `text_hash` точки папки для её L0 (как пишет воркер).
+pub fn folder_embed_key(space: &str, path: &str, name: &str, l0: &str) -> String {
+    folder_embed(space, path, name, l0).1
+}
+
 pub(crate) fn folder_embed(space: &str, path: &str, name: &str, l0: &str) -> (String, String) {
-    let input = format!("[{space}/{path}] {name}\n{l0}");
+    let input = zam_store::folder_embed_input(space, path, name, l0);
     let key = keyed_hash("folder", &input);
     (input, key)
 }
@@ -1858,7 +1959,8 @@ pub(crate) fn folder_point(user: Id, f: &IndexFolder, e: Embedding, key: String)
             space_id: f.space_id,
             space_kind: f.space_kind.as_str().to_string(),
             solution_guid: f.solution_guid.clone(),
-            node_id: f.node_id,
+            node_id: Some(f.node_id),
+            entry_id: None,
             path_ancestors: zam_store::path_ancestors(&f.path),
             area: None,
             level: "folder".into(),
@@ -1867,31 +1969,50 @@ pub(crate) fn folder_point(user: Id, f: &IndexFolder, e: Embedding, key: String)
             updated_at: f.updated_at.as_second(),
             rev: 0,
             text_hash: key,
+            status: None,
+            insight_kind: None,
+            certainty: None,
         },
     }
 }
 
-/// Точка чанка заметки.
+/// Точка чанка заметки или записи журнала (`c.entry`): у записи цель — `entry_id`, вид и
+/// поля записи — из [`zam_store::EntryPayload`].
 pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint {
+    let mut payload = PointPayload {
+        user_id: user,
+        space_id: c.node.space_id,
+        space_kind: c.node.space_kind.as_str().to_string(),
+        solution_guid: c.node.solution_guid.clone(),
+        node_id: Some(c.node.node_id),
+        entry_id: None,
+        path_ancestors: c.node.path_ancestors.clone(),
+        area: c.node.area.clone(),
+        level: c.level.as_str().to_string(),
+        kind: "note".into(),
+        tags: c.node.tags.clone(),
+        updated_at: c.node.updated_at.as_second(),
+        rev: c.rev,
+        text_hash: c.text_hash.clone(),
+        status: None,
+        insight_kind: None,
+        // статус заметки (§7.5); у записи журнала его заменит поле записи ниже
+        certainty: c.node.certainty.clone(),
+    };
+    if let Some(en) = &c.entry {
+        payload.node_id = None;
+        payload.entry_id = Some(en.entry_id);
+        payload.kind = en.kind.clone();
+        payload.status = en.status.clone();
+        payload.insight_kind = en.insight_kind.clone();
+        payload.certainty = en.certainty.clone();
+        payload.area = en.area.clone();
+    }
     IndexPoint {
         chunk_id: c.id.clone(),
         dense: e.dense.clone(),
         sparse: e.sparse.clone(),
-        payload: PointPayload {
-            user_id: user,
-            space_id: c.node.space_id,
-            space_kind: c.node.space_kind.as_str().to_string(),
-            solution_guid: c.node.solution_guid.clone(),
-            node_id: c.node.node_id,
-            path_ancestors: c.node.path_ancestors.clone(),
-            area: None,
-            level: c.level.as_str().to_string(),
-            kind: "note".into(),
-            tags: c.node.tags.clone(),
-            updated_at: c.node.updated_at.as_second(),
-            rev: c.rev,
-            text_hash: c.text_hash.clone(),
-        },
+        payload,
     }
 }
 
@@ -1932,6 +2053,19 @@ mod tests {
         r.schedule(u, f, Duration::from_secs(60));
         assert!(r.take_due().is_empty());
         assert!(r.next_due().unwrap() > Instant::now());
+    }
+
+    #[test]
+    fn folder_embed_masks_secrets() {
+        let s = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+        let (clean, clean_key) = folder_embed("K", "ops", "ops", "- a: b");
+        assert_eq!(clean, "[K/ops] ops\n- a: b");
+        assert_eq!(clean_key, keyed_hash("folder", &clean));
+        let (input, key) = folder_embed("K", &format!("ops/{s}"), &s, &format!("- x: {s}"));
+        assert!(!input.contains(&s), "{input}");
+        assert!(input.contains(zam_markdown::SECRET_MARK), "{input}");
+        // ключ — от замаскированной строки
+        assert_eq!(key, keyed_hash("folder", &input));
     }
 
     #[test]

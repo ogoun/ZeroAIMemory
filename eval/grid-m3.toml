@@ -1,0 +1,50 @@
+# Веса поиска M3 (задача 18): канал папок w_folder, бусты вида insight (gotcha/failure) и
+# бусты certainty (axiom/theorem). Нарезка — умолчания задачи 17 (λ = 0,5) и в сетку не входит.
+#   cargo xtask eval --grid eval/grid-m3.toml
+# Все конфигурации делят один индекс (меняются только search.*). База — умолчания до задачи 18
+# (w_folder 0, gotcha/failure 1,15, axiom/theorem 1,20/1,10). Сначала один фактор за раз от
+# базы, затем сочетания по итогам предварительного прогона (.tmp, тот же набор): без буста вида
+# с ослабленными и выключенными бустами certainty и без буста вида при w_folder > 0.
+# boost_area на наборе не проверяется: у insight набора нет области, запросы без X-Zam-Area.
+# Выбор — парный бутстреп по nDCG@10 и reliable_first (цель ≥ 0,9).
+model = "bge-m3-fp16"
+device = "cuda"
+
+[[config]]
+name = "base"
+
+[[config]]
+name = "folder0.3"
+set = { "search.w_folder" = "0.3" }
+
+[[config]]
+name = "folder0.5"
+set = { "search.w_folder" = "0.5" }
+
+[[config]]
+name = "folder1.0"
+set = { "search.w_folder" = "1.0" }
+
+[[config]]
+name = "kind1.0"
+set = { "search.boost_gotcha" = "1.0", "search.boost_failure" = "1.0" }
+
+[[config]]
+name = "cert1.0"
+set = { "search.boost_axiom" = "1.0", "search.boost_theorem" = "1.0" }
+
+[[config]]
+name = "cert1.1-1.05"
+set = { "search.boost_axiom" = "1.1", "search.boost_theorem" = "1.05" }
+
+[[config]]
+name = "kind1.0-cert1.1-1.05"
+set = { "search.boost_gotcha" = "1.0", "search.boost_failure" = "1.0", "search.boost_axiom" = "1.1", "search.boost_theorem" = "1.05" }
+
+[[config]]
+name = "kind1.0-cert1.0"
+set = { "search.boost_gotcha" = "1.0", "search.boost_failure" = "1.0", "search.boost_axiom" = "1.0", "search.boost_theorem" = "1.0" }
+
+[[config]]
+name = "kind1.0-folder0.3"
+set = { "search.boost_gotcha" = "1.0", "search.boost_failure" = "1.0", "search.w_folder" = "0.3" }

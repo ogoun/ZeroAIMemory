@@ -3,7 +3,8 @@
 //! - `GET /index/status` — любой аутентифицированный. Токен видит только своего
 //!   пользователя (очередь, неудавшиеся задания, точки); администратор — пользователя из
 //!   `X-Zam-User` или, без заголовка, сумму по всем. Модель, устройство и Qdrant (состояние,
-//!   версия, RSS процесса — метрика `zam_qdrant_rss_bytes`, перезапуски) и RSS самого
+//!   версия, RSS процесса — метрика `zam_qdrant_rss_bytes`, перезапуски, неподтверждённые
+//!   в WAL записи `wal_pending_ops`) и RSS самого
 //!   `zam-server` (`server.rss_bytes`, цели §17) общие для сервера; время воркера
 //!   (`worker`: заданий, инференс, запись в Qdrant — сумма по всем пользователям) — только
 //!   администратору, токену — `null`.
@@ -25,10 +26,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_index::supervisor::QdrantState;
-use zam_index::{ReindexOutcome, ReindexRequest, VectorFilter};
+use zam_index::{ReindexOutcome, ReindexRequest, VectorFilter, VectorScope};
 use zam_ml::Device;
 use zam_store::time::fmt_ts;
-use zam_store::{FailedJob, JobStats, failed_jobs, indexable_count, job_stats};
+use zam_store::{FailedJob, JobStats, failed_jobs, indexable_count, job_stats, list_spaces};
 
 use crate::app::AppState;
 use crate::auth::{AdminOnly, Client, Principal, USER_HEADER, target_user};
@@ -69,11 +70,15 @@ fn qdrant_state(s: &Option<QdrantState>) -> (&'static str, Option<String>) {
     }
 }
 
+/// Неудавшееся задание: цель — `node_id` у узла, `entry_id` у записи журнала.
 fn failed_json(user: Id, f: &FailedJob) -> Value {
-    json!({
+    let id_key = match f.target_kind {
+        zam_core::TargetKind::Node => "node_id",
+        zam_core::TargetKind::Entry => "entry_id",
+    };
+    let mut v = json!({
         "id": f.id,
         "user_id": user,
-        "node_id": f.node_id,
         "space_id": f.space_id,
         "path": f.path,
         "deleted_at": f.deleted_at.map(fmt_ts),
@@ -81,7 +86,9 @@ fn failed_json(user: Id, f: &FailedJob) -> Value {
         "error": f.error,
         "attempts": f.attempts,
         "updated_at": fmt_ts(f.updated_at),
-    })
+    });
+    v[id_key] = json!(f.node_id);
+    v
 }
 
 fn reindex_json(o: &ReindexOutcome) -> Value {
@@ -97,6 +104,7 @@ fn reindex_json(o: &ReindexOutcome) -> Value {
             v["result"] = json!({
                 "users": r.users,
                 "nodes": r.nodes,
+                "entries": r.entries,
                 "points": r.points,
                 "folders": r.folders,
                 "misses": r.misses,
@@ -129,14 +137,17 @@ pub async fn status(
     // при обходе всех баз неоткрывающаяся (повреждённая) не ломает ответ: она в
     // `unavailable_dbs`; база, указанная явно, — ошибка как обычно
     let mut unavailable: Vec<Value> = Vec::new();
+    // области точек: база каждого видимого пользователя со всеми её пространствами
+    let mut scopes: Vec<VectorScope> = Vec::new();
     for u in &users {
         let one = async {
             let db = st.users.get(*u).await?;
             let s = job_stats(&db).await?;
             let f = failed_jobs(&db, FAILED_ITEMS).await?;
-            Ok::<_, zam_store::StoreError>((s, f))
+            let sp: Vec<Id> = list_spaces(&db).await?.into_iter().map(|s| s.id).collect();
+            Ok::<_, zam_store::StoreError>((s, f, sp))
         };
-        let (s, f) = match one.await {
+        let (s, f, sp) = match one.await {
             Ok(v) => v,
             Err(e) if all => {
                 unavailable.push(json!({ "user_id": u, "error": e.to_string() }));
@@ -144,6 +155,10 @@ pub async fn status(
             }
             Err(e) => return Err(e.into()),
         };
+        scopes.push(VectorScope {
+            user_id: *u,
+            space_ids: sp,
+        });
         queue.queued += s.queued;
         queue.running += s.running;
         queue.failed += s.failed;
@@ -164,23 +179,14 @@ pub async fn status(
     // точки видимых пользователей; Qdrant недоступен или долго отвечает — null
     let points = match &rt.vector {
         Some(v) if wst.vector_ready => {
-            let count = async {
-                let mut n = 0u64;
-                for u in &users {
-                    let f = VectorFilter {
-                        user_id: *u,
-                        space_ids: Vec::new(),
-                        path_prefix: None,
-                        levels: Vec::new(),
-                    };
-                    n += v.count(&f).await.ok()?;
-                }
-                Some(n)
+            let f = VectorFilter {
+                scopes,
+                ..VectorFilter::default()
             };
-            tokio::time::timeout(POINTS_TIMEOUT, count)
+            tokio::time::timeout(POINTS_TIMEOUT, v.count(&f))
                 .await
                 .ok()
-                .flatten()
+                .and_then(Result::ok)
         }
         _ => None,
     };
@@ -243,6 +249,9 @@ pub async fn status(
             "rss_bytes": sup.as_ref().and_then(|s| s.rss_bytes()),
             "points": points,
             "restarts": sup.as_ref().map_or(0, |s| s.restarts()),
+            // записей точек, не подтверждённых в WAL Qdrant (жёсткая остановка сейчас —
+            // повтор WAL при следующем старте; задача 19 M3)
+            "wal_pending_ops": sup.as_ref().and_then(|s| s.wal_pending()),
             "error": rt.qdrant_error,
         },
         "queue": {

@@ -24,6 +24,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use zam_core::Id;
 
+use crate::certainty::{CertaintyChange, check_certainty};
+use crate::entries::Certainty;
+use crate::nodes::AuthorKind;
 use crate::paths::NodePath;
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
@@ -173,7 +176,8 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
 
 /// Привязывает блоб к живой заметке `node`; возвращает ссылку для Markdown.
 /// Новая пара (узел, sha256, имя) добавляет строку `attachments` и увеличивает
-/// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет.
+/// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет. Вложение — изменение
+/// заметки: к заметке `axiom` его добавляет только человек (`author`), иначе `Certainty`.
 pub async fn attach(
     db: &Db,
     node: Id,
@@ -181,6 +185,7 @@ pub async fn attach(
     size: u64,
     filename: &str,
     mime: &str,
+    author: AuthorKind,
 ) -> Result<String, StoreError> {
     if !is_sha256(sha256) {
         return Err(StoreError::BadInput("sha256: 64 символа hex".into()));
@@ -190,16 +195,18 @@ pub async fn attach(
     let size = i64::try_from(size).map_err(|_| StoreError::BadInput("размер".into()))?;
     let (sha, name, mime) = (sha256.to_string(), filename.to_string(), mime.to_string());
     db.write(move |t| {
-        let live_note: Option<i64> = t
+        let live_note: Option<Option<Certainty>> = t
             .query_row(
-                "SELECT 1 FROM nodes WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL",
+                "SELECT certainty FROM nodes
+                 WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL",
                 [node],
                 |r| r.get(0),
             )
             .optional()?;
-        if live_note.is_none() {
+        let Some(certainty) = live_note else {
             return Err(StoreError::NotFound);
-        }
+        };
+        check_certainty(author, certainty, &CertaintyChange::ModifyOther, None, None)?;
         let now = fmt_ts(Timestamp::now());
         t.execute(
             "INSERT INTO blobs (sha256, size, mime, refcount, created_at)
@@ -231,6 +238,9 @@ pub struct AttachScope {
     pub prefer_space: Option<Id>,
     /// `false` — вложения узлов пространства Human не видны (запрос по токену).
     pub allow_human: bool,
+    /// `true` — только пространство `prefer_space` (участник общего решения в базе
+    /// владельца не видит вложений других его пространств, §11.6).
+    pub only_space: bool,
 }
 
 /// Ссылка `_attachments/<sha16>/<имя>` → `(sha256, mime)`. `sha16` — без учёта
@@ -255,9 +265,16 @@ pub async fn resolve_attachment(
              JOIN spaces s ON s.id = n.space_id
              WHERE substr(a.blob_sha256, 1, 16) = ?1 AND a.filename = ?2
                AND (?3 OR s.kind <> 'human')
+               AND (NOT ?5 OR n.space_id IS ?4)
              ORDER BY (n.space_id IS ?4) DESC, (n.deleted_at IS NULL) DESC, a.created_at DESC
              LIMIT 1",
-            params![sha16, name, scope.allow_human, scope.prefer_space],
+            params![
+                sha16,
+                name,
+                scope.allow_human,
+                scope.prefer_space,
+                scope.only_space
+            ],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
@@ -286,6 +303,33 @@ pub async fn blob_meta(
                  ORDER BY (n.deleted_at IS NULL) DESC, a.created_at DESC
                  LIMIT 1",
                 params![sha, name, allow_human],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(m, s)| (m, u64::try_from(s).unwrap_or(0))))
+    })
+    .await
+}
+
+/// MIME и размер пары (sha256, имя), если она привязана хоть к одному узлу пространства
+/// `space` (участник общего решения в базе владельца — только пространство решения).
+pub async fn blob_meta_in_space(
+    db: &Db,
+    sha256: &str,
+    filename: &str,
+    space: Id,
+) -> Result<Option<(String, u64)>, StoreError> {
+    let (sha, name) = (sha256.to_string(), filename.to_string());
+    db.read(move |c| {
+        let row: Option<(String, i64)> = c
+            .query_row(
+                "SELECT COALESCE(a.mime, 'application/octet-stream'), a.size
+                 FROM attachments a
+                 JOIN nodes n ON n.id = a.node_id
+                 WHERE a.blob_sha256 = ?1 AND a.filename = ?2 AND n.space_id = ?3
+                 ORDER BY (n.deleted_at IS NULL) DESC, a.created_at DESC
+                 LIMIT 1",
+                params![sha, name, space],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;

@@ -41,6 +41,9 @@ jobs:
       - run: npm ci
       - name: svelte-check
         run: npm run check
+      # политика лицензий бандла (EPL-2.0 — только elkjs), как в ci.yml
+      - name: test:build
+        run: npm run test:build
       - name: build
         run: npm run build
       - name: size-limit

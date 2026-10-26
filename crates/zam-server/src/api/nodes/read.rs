@@ -97,9 +97,11 @@ pub async fn by_path(
     let node = get_node_by_path(&sc.db, sc.space.id, &NodePath::parse(path)?).await?;
     let ns = NodeScope {
         user: sc.user,
+        owner: sc.owner,
         db: sc.db,
         space: sc.space,
         node,
+        role: sc.role,
     };
     read(&st, &p, ns, q).await
 }
@@ -133,7 +135,7 @@ async fn read(
     let node = &sc.node;
     let ctx = RenderCtx {
         space: sc.space.id,
-        viewer: Viewer::of(st, p, sc.user.id),
+        viewer: Viewer::of(st, p, sc.owner, sc.role),
     };
     if tier == Tier::L0 {
         return Ok(Json(json!({ "l0": node.l0, "rev": node.current_rev })).into_response());
@@ -154,10 +156,7 @@ async fn read(
         && q.section.is_none()
         && current
         && let Some(hash) = &node.content_hash
-        && let Some(r) = cache_get(
-            st,
-            &cache_key(st, hash, sc.space.id, sc.user.id, ctx.viewer),
-        )
+        && let Some(r) = cache_get(st, &cache_key(st, hash, sc.space.id, sc.owner, ctx.viewer))
     {
         return Ok(html_json(&r, node.current_rev));
     }
@@ -178,7 +177,7 @@ async fn read(
         Format::Json => Json(json!({ "node": node, "content": text, "rev": rev })).into_response(),
         Format::Html if whole => {
             let hash = key_hash(node, rev, &text);
-            let key = cache_key(st, &hash, sc.space.id, sc.user.id, ctx.viewer);
+            let key = cache_key(st, &hash, sc.space.id, sc.owner, ctx.viewer);
             let r = render_cached(st, key, &sc.db, ctx, text).await?;
             html_json(&r, rev)
         }
@@ -276,6 +275,7 @@ mod tests {
             updated_at: now,
             deleted_at: None,
             has_children: false,
+            certainty: None,
         };
         assert_eq!(key_hash(&node, 2, "что угодно"), "hash-of-rev-2");
         // прочитана другая ревизия — ключ по её собственному тексту

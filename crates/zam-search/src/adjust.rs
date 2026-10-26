@@ -1,14 +1,84 @@
 //! Поправки ранжирования (§9.2 пп. 4, 6).
 //!
-//! Бусты `gotcha`/`failure` и текущей области — в M3 (журналов и областей ещё нет);
-//! `superseded`/`retracted` — тоже в M3.
+//! - затухание по свежести ([`recency_factor`], внутри слияния);
+//! - бусты ([`apply_boosts`]): вид инсайта (`gotcha`, `failure`), надёжность (`certainty`
+//!   заметки или записи: `search.boost_axiom` > `boost_theorem` > `boost_hypothesis`, §7.5) и
+//!   текущая область (`X-Zam-Area`) — множители слитого балла; балл выше 1 после них —
+//!   деление всех баллов на лучший ([`rescale_overflow`]);
+//! - замена сводки листом и лимит на цель.
+//!
+//! `superseded`/`retracted` исключает фильтр статусов поиска (сервер), а не поправка.
 
 use std::collections::HashMap;
 
 use jiff::Timestamp;
-use zam_core::Id;
+use zam_core::TargetRef;
 
-use crate::hybrid::{Level, Ranked};
+use crate::hybrid::{ChunkMeta, Level, Ranked};
+
+/// Множители балла (§9.2 п. 4). Пустые таблицы и `area: None` — без бустов.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Boosts {
+    /// Вид инсайта → множитель (`gotcha`, `failure` → `search.boost_gotcha`, `boost_failure`).
+    pub insight_kinds: HashMap<String, f64>,
+    /// `certainty` заметки или записи → множитель (`axiom > theorem > hypothesis`,
+    /// `search.boost_axiom`/`boost_theorem`/`boost_hypothesis`); без статуса — 1.
+    pub certainty: HashMap<String, f64>,
+    /// Текущая область и её множитель (`search.boost_area`).
+    pub area: Option<(String, f64)>,
+}
+
+impl Boosts {
+    /// Итоговый множитель чанка: произведение подходящих бустов (нет подходящих — 1).
+    fn factor(&self, m: &ChunkMeta) -> f64 {
+        let kind = m
+            .insight_kind
+            .as_ref()
+            .and_then(|k| self.insight_kinds.get(k))
+            .copied()
+            .unwrap_or(1.0);
+        let certainty = m
+            .certainty
+            .as_ref()
+            .and_then(|c| self.certainty.get(c))
+            .copied()
+            .unwrap_or(1.0);
+        let area = match (&self.area, &m.area) {
+            (Some((want, f)), Some(a)) if a == want => *f,
+            _ => 1.0,
+        };
+        kind * certainty * area
+    }
+}
+
+/// Умножает балл каждого кандидата на его бусты ([`Boosts`]) и пересортировывает по
+/// убыванию балла (при равенстве — прежний порядок). Кандидат без метаданных не меняется.
+/// Балл после бустов может превысить 1: порядок важнее шкалы, шкалу затем приводит
+/// [`rescale_overflow`].
+pub fn apply_boosts(r: &mut [Ranked], meta: &HashMap<String, ChunkMeta>, b: &Boosts) {
+    for x in r.iter_mut() {
+        if let Some(m) = meta.get(&x.chunk_id) {
+            x.score *= b.factor(m);
+        }
+    }
+    r.sort_by(|a, b| b.score.total_cmp(&a.score));
+}
+
+/// Нормировка шкалы после бустов и канала папок: если лучший балл `r` (список по убыванию)
+/// больше 1, все баллы делятся на него — порядок и отношения баллов не меняются, лучший
+/// становится 1, а различие кандидатов выше 1 не теряется при ограничении шкалы ответа.
+/// Без переполнения шкала прежняя (1,0 — первое место во всех каналах слияния). Возвращает
+/// делитель (1 — без изменений): им же масштабируются баллы вне списка (карточки папок).
+pub fn rescale_overflow(r: &mut [Ranked]) -> f64 {
+    let top = r.first().map_or(0.0, |x| x.score);
+    if !(top > 1.0 && top.is_finite()) {
+        return 1.0;
+    }
+    for x in r.iter_mut() {
+        x.score /= top;
+    }
+    top
+}
 
 /// Нижняя граница множителя свежести **[решение исполнителя]**: память хранит и давние
 /// правила, и решения, поэтому старая заметка теряет не больше половины балла и
@@ -45,11 +115,11 @@ pub fn in_section(leaf: &str, section: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(" > "))
 }
 
-/// Подходит ли лист `leaf` на замену сводке `s`: тот же узел, для `section` — та же
+/// Подходит ли лист `leaf` на замену сводке `s`: та же цель (узел), для `section` — та же
 /// секция (или вложенная).
 fn leaf_fits(s: &Ranked, leaf: &Ranked) -> bool {
     leaf.level == Level::Chunk
-        && leaf.node_id == s.node_id
+        && leaf.target == s.target
         && (s.level == Level::Note || in_section(&leaf.heading_path, &s.heading_path))
 }
 
@@ -119,11 +189,12 @@ pub fn note_to_leaf(r: Vec<Ranked>, best_leaf: impl Fn(&Ranked) -> Option<LeafRe
     out
 }
 
-/// Не больше `max` элементов с одного узла (§9.2 п. 6), порядок сохраняется.
+/// Не больше `max` элементов с одной цели — узла или записи журнала (§9.2 п. 6), порядок
+/// сохраняется.
 pub fn cap_per_node(mut r: Vec<Ranked>, max: usize) -> Vec<Ranked> {
-    let mut per_node: HashMap<Id, usize> = HashMap::new();
+    let mut per_node: HashMap<TargetRef, usize> = HashMap::new();
     r.retain(|x| {
-        let n = per_node.entry(x.node_id).or_default();
+        let n = per_node.entry(x.target).or_default();
         *n += 1;
         *n <= max.max(1)
     });
@@ -154,6 +225,7 @@ fn merge(into: &mut Ranked, x: Ranked) {
 mod tests {
     use super::*;
     use jiff::SignedDuration;
+    use zam_core::Id;
 
     fn r(chunk: &str, node: Id, level: Level, score: f64, src: &'static str) -> Ranked {
         rh(chunk, node, level, "", score, src)
@@ -162,12 +234,175 @@ mod tests {
     fn rh(chunk: &str, node: Id, level: Level, hp: &str, score: f64, src: &'static str) -> Ranked {
         Ranked {
             chunk_id: chunk.into(),
-            node_id: node,
+            target: TargetRef {
+                kind: zam_core::TargetKind::Node,
+                id: node,
+            },
             level,
             heading_path: hp.into(),
             score,
             sources: vec![src],
         }
+    }
+
+    fn meta(insight_kind: Option<&str>, area: Option<&str>) -> ChunkMeta {
+        ChunkMeta {
+            target: TargetRef {
+                kind: zam_core::TargetKind::Entry,
+                id: Id::new(),
+            },
+            level: Level::Chunk,
+            heading_path: String::new(),
+            updated_at: Timestamp::UNIX_EPOCH,
+            insight_kind: insight_kind.map(String::from),
+            certainty: None,
+            area: area.map(String::from),
+            space_id: Id::new(),
+            path: String::new(),
+        }
+    }
+
+    fn boosts() -> Boosts {
+        Boosts {
+            insight_kinds: [("gotcha".to_string(), 1.15), ("failure".to_string(), 1.15)]
+                .into_iter()
+                .collect(),
+            certainty: HashMap::new(),
+            area: None,
+        }
+    }
+
+    fn metas(v: Vec<(&str, ChunkMeta)>) -> HashMap<String, ChunkMeta> {
+        v.into_iter().map(|(k, m)| (k.to_string(), m)).collect()
+    }
+
+    #[test]
+    fn boost_gotcha_orders_above_equal_note() {
+        // равный балл: заметка раньше по порядку, gotcha и failure поднимаются над ней,
+        // discovery (без буста) остаётся на месте
+        let n = Id::new();
+        let mut list = vec![
+            r("note", n, Level::Chunk, 0.5, "fts"),
+            r("discovery", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("gotcha", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("failure", Id::new(), Level::Chunk, 0.5, "fts"),
+        ];
+        let meta = metas(vec![
+            ("note", meta(None, None)),
+            ("discovery", meta(Some("discovery"), None)),
+            ("gotcha", meta(Some("gotcha"), None)),
+            ("failure", meta(Some("failure"), None)),
+        ]);
+        apply_boosts(&mut list, &meta, &boosts());
+        let ids: Vec<&str> = list.iter().map(|x| x.chunk_id.as_str()).collect();
+        assert_eq!(ids, vec!["gotcha", "failure", "note", "discovery"]);
+        assert!((list[0].score - 0.575).abs() < 1e-12);
+        assert_eq!(list[2].score, 0.5);
+        // буст — множитель, а не подмена ранга: заметно лучшая заметка остаётся выше
+        let mut list = vec![
+            r("note", n, Level::Chunk, 0.9, "fts"),
+            r("gotcha", Id::new(), Level::Chunk, 0.6, "fts"),
+        ];
+        apply_boosts(&mut list, &meta, &boosts());
+        assert_eq!(list[0].chunk_id, "note");
+        // без бустов порядок и баллы прежние
+        let before = list.clone();
+        apply_boosts(&mut list, &meta, &Boosts::default());
+        assert_eq!(list, before);
+    }
+
+    #[test]
+    fn certainty_boost_orders_reliable_first() {
+        let with_c = |c: Option<&str>| ChunkMeta {
+            certainty: c.map(String::from),
+            ..meta(None, None)
+        };
+        // равный балл: гипотеза и заметка без статуса раньше по порядку
+        let mut list = vec![
+            r("hyp", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("plain", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("thm", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("ax", Id::new(), Level::Chunk, 0.5, "fts"),
+        ];
+        let meta = metas(vec![
+            ("hyp", with_c(Some("hypothesis"))),
+            ("plain", with_c(None)),
+            ("thm", with_c(Some("theorem"))),
+            ("ax", with_c(Some("axiom"))),
+        ]);
+        let b = Boosts {
+            certainty: [("axiom", 1.20), ("theorem", 1.10), ("hypothesis", 1.00)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ..Boosts::default()
+        };
+        apply_boosts(&mut list, &meta, &b);
+        let ids: Vec<&str> = list.iter().map(|x| x.chunk_id.as_str()).collect();
+        assert_eq!(ids, vec!["ax", "thm", "hyp", "plain"]);
+        assert!((list[0].score - 0.6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn overflow_rescaled_by_top_keeps_order_and_ratios() {
+        // бусты подняли первые выше 1: делим всех на лучший балл — порядок и отношения прежние,
+        // лучший — ровно 1, различие двух бывших «1+» видно в шкале
+        let mut list = vec![
+            r("a", Id::new(), Level::Chunk, 1.38, "fts"),
+            r("b", Id::new(), Level::Chunk, 1.15, "fts"),
+            r("c", Id::new(), Level::Chunk, 0.69, "fts"),
+        ];
+        let k = rescale_overflow(&mut list);
+        assert!((k - 1.38).abs() < 1e-12);
+        let got: Vec<f64> = list.iter().map(|x| (x.score * 1e6).round() / 1e6).collect();
+        assert_eq!(got, vec![1.0, 0.833333, 0.5]);
+        assert!(list.iter().all(|x| x.score <= 1.0));
+        // без переполнения шкала не меняется (1,0 — первое место во всех каналах)
+        let mut list = vec![
+            r("a", Id::new(), Level::Chunk, 1.0, "fts"),
+            r("b", Id::new(), Level::Chunk, 0.4, "fts"),
+        ];
+        let before = list.clone();
+        assert_eq!(rescale_overflow(&mut list), 1.0);
+        assert_eq!(list, before);
+        assert_eq!(rescale_overflow(&mut []), 1.0);
+    }
+
+    #[test]
+    fn area_boost_multiplies_only_matching() {
+        let mut list = vec![
+            r("other", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("none", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("web", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("gotcha-web", Id::new(), Level::Chunk, 0.5, "fts"),
+            r("unknown", Id::new(), Level::Chunk, 0.5, "fts"),
+        ];
+        let meta = metas(vec![
+            ("other", meta(None, Some("api"))),
+            ("none", meta(None, None)),
+            ("web", meta(None, Some("web"))),
+            ("gotcha-web", meta(Some("gotcha"), Some("web"))),
+        ]);
+        let b = Boosts {
+            area: Some(("web".into(), 1.10)),
+            ..boosts()
+        };
+        apply_boosts(&mut list, &meta, &b);
+        let got: Vec<(&str, f64)> = list
+            .iter()
+            .map(|x| (x.chunk_id.as_str(), (x.score * 1e6).round() / 1e6))
+            .collect();
+        // бусты перемножаются; область — точное совпадение; без метаданных — без изменений
+        assert_eq!(
+            got,
+            vec![
+                ("gotcha-web", 0.6325),
+                ("web", 0.55),
+                ("other", 0.5),
+                ("none", 0.5),
+                ("unknown", 0.5),
+            ]
+        );
     }
 
     fn leaf(id: &str, hp: &str) -> Option<LeafRef> {
@@ -278,7 +513,7 @@ mod tests {
             r("c-none", Id::new(), Level::Note, 0.4, "fts"),
         ];
         let out = note_to_leaf(list, |x| {
-            if x.node_id == b {
+            if x.target.id == b {
                 leaf("b-leaf", "")
             } else {
                 None

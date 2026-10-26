@@ -1,4 +1,5 @@
 ---
+index: false
 tags: [git, хуки, автоматизация]
 ---
 # Хуки git: pre-commit и commit-msg своими руками

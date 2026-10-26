@@ -24,6 +24,9 @@ impl TokenCounter for Words {
     fn is_exact(&self) -> bool {
         true
     }
+    fn tokenizer_id(&self) -> String {
+        "words".into()
+    }
 }
 
 async fn approx_mark(db: &Db) -> bool {

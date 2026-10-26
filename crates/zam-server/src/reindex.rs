@@ -78,7 +78,7 @@ pub async fn run(cfg: ServerConfig, args: ReindexArgs) -> anyhow::Result<String>
     };
     let sup = Supervisor::start(sc, &cfg.data_dir).await?;
     let res = async {
-        let vector = QdrantIndex::connect(&sup.grpc_url(), sup.api_key().as_deref())?;
+        let vector = sup.connect_index()?;
         wait_ready(&sup, &vector).await?;
         let req = ReindexRequest {
             user,
@@ -109,7 +109,7 @@ pub async fn run(cfg: ServerConfig, args: ReindexArgs) -> anyhow::Result<String>
                 None,
                 serde_json::json!({
                     "full": args.full, "job_count": notes, "users": rep.users,
-                    "nodes": rep.nodes, "points": rep.points, "misses": rep.misses,
+                    "nodes": rep.nodes, "entries": rep.entries, "points": rep.points, "misses": rep.misses,
                     "jobs": rep.jobs, "gc_deleted": rep.gc_deleted,
                     "recreated": rep.recreated, "failed_users": rep.failed_users.len(),
                     "elapsed_ms": rep.elapsed_ms,
@@ -162,8 +162,8 @@ async fn wait_ready(sup: &Supervisor, vector: &QdrantIndex) -> anyhow::Result<()
 /// Отчёт команды: счётчики без текстов.
 fn report(r: &ReindexReport, model: &str) -> String {
     let mut out = format!(
-        "reindex ({}, модель {model}): баз {}, заметок из кэша {}, точек {} (+{} папок), \
-         удалено строк кэша {}, {} мс",
+        "reindex ({}, модель {model}): баз {}, заметок из кэша {}, записей журналов {}, \
+         точек {} (+{} папок), удалено строк кэша {}, {} мс",
         if r.full {
             "полный"
         } else {
@@ -171,6 +171,7 @@ fn report(r: &ReindexReport, model: &str) -> String {
         },
         r.users,
         r.nodes,
+        r.entries,
         r.points,
         r.folders,
         r.gc_deleted,

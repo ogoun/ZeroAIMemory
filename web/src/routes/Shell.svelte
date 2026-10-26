@@ -1,13 +1,30 @@
 <script lang="ts">
   // Оболочка после входа: шапка, дерево слева (на узком экране — выдвижная панель),
   // справа — документ, стартовый экран пользователя или администрирование.
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import DocView from '../components/DocView.svelte';
   import Search from '../components/Search.svelte';
   import Tree, { type Reveal, type TreeChange } from '../components/Tree.svelte';
+  import ChangelogView from '../components/ChangelogView.svelte';
+  import InsightsView from '../components/InsightsView.svelte';
+  import ReleasesView from '../components/ReleasesView.svelte';
+  import VaultView from '../components/VaultView.svelte';
   import IndexStatus from './IndexStatus.svelte';
+  import Settings from './Settings.svelte';
+  import Solutions from './Solutions.svelte';
   import Users from './Users.svelte';
-  import { ApiError, listUsers, type Me, type NodeInfo, type User } from '../lib/api';
+  import {
+    ApiError,
+    errorText,
+    listSpaces,
+    listUsers,
+    spaceMatches,
+    type Me,
+    type NodeInfo,
+    type Space,
+    type User,
+  } from '../lib/api';
+  import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
   import { current, go, href, listen, routeUser, type Route } from '../lib/router';
 
   let { me, onlogout, onexpired }: { me: Me; onlogout: () => void; onexpired: () => void } = $props();
@@ -60,12 +77,12 @@
     loadUsers();
     const off = listen((r) => {
       if (!normalize(r)) return;
-      const wasAdmin = route.name === 'admin';
+      const wasAdmin = isAdmin(route);
       route = r;
       nav++;
       drawer = false;
       // после администрирования список пользователей мог измениться
-      if (wasAdmin && r.name !== 'admin') loadUsers();
+      if (wasAdmin && !isAdmin(r)) loadUsers();
     });
     return () => {
       off();
@@ -93,6 +110,37 @@
       reloadKey++;
     }
   }
+
+  /** Разделы администрирования (подменю «Пользователи», «Решения», «Настройки»). */
+  const isAdmin = (r: Route) => r.name === 'admin' || r.name === 'solutions' || r.name === 'settings';
+
+  // Пространство открытого журнала: имя и вид — для заголовка и вкладок журналов.
+  let journalSpaces = $state<{ user: string; spaces: Space[] } | null>(null);
+  let journalError = $state('');
+  $effect(() => {
+    const r = route;
+    // вне журналов кэш сбрасывается: роли и решения могли измениться
+    if (r.name !== 'journal') {
+      if (untrack(() => journalSpaces) !== null) journalSpaces = null;
+      return;
+    }
+    if (untrack(() => journalSpaces?.user) === r.user) return;
+    const u = r.user;
+    journalError = '';
+    listSpaces(u)
+      .then((x) => (journalSpaces = { user: u, spaces: x.spaces }))
+      .catch((e) => {
+        if (e instanceof ApiError && e.status === 401) return onexpired();
+        journalError = errorText(e);
+      });
+  });
+  /** Пространства пользователя журнала загружены. */
+  let journalLoaded = $derived(route.name === 'journal' && journalSpaces?.user === route.user);
+  let journalSpace = $derived.by(() => {
+    const r = route;
+    if (r.name !== 'journal' || journalSpaces?.user !== r.user) return null;
+    return journalSpaces.spaces.find((s) => spaceMatches(s, r.space)) ?? null;
+  });
 
   /** Пользователь, в заметках которого ищет Ctrl+K: открытый, иначе свой. */
   let searchUser = $derived(routeUser(route) ?? me.user_id);
@@ -130,7 +178,7 @@
       <a href={href({ name: 'home', user: me.user_id })} aria-current={routeUser(route) ? 'page' : undefined}>Заметки</a>
       <a href={href({ name: 'index' })} aria-current={route.name === 'index' ? 'page' : undefined}>Индекс</a>
       <!-- на узком экране — короткая подпись (имя ссылки для доступности — полное) -->
-      <a href={href({ name: 'admin' })} aria-current={route.name === 'admin' ? 'page' : undefined} aria-label="Администрирование"
+      <a href={href({ name: 'admin' })} aria-current={isAdmin(route) ? 'page' : undefined} aria-label="Администрирование"
         ><span class="long">Администрирование</span><span class="short" aria-hidden="true">Админ</span></a
       >
     </nav>
@@ -154,9 +202,61 @@
   <div class="scrim" onclick={() => (drawer = false)}></div>
 
   <main class="content">
-    {#if route.name === 'admin'}
+    {#if isAdmin(route)}
       <div class="admin">
-        <Users onExpired={onexpired} />
+        <nav class="subnav" aria-label="Администрирование">
+          <a href={href({ name: 'admin' })} aria-current={route.name === 'admin' ? 'page' : undefined}>Пользователи</a>
+          <a href={href({ name: 'solutions' })} aria-current={route.name === 'solutions' ? 'page' : undefined}>Решения</a>
+          <a href={href({ name: 'settings' })} aria-current={route.name === 'settings' ? 'page' : undefined}>Настройки</a>
+        </nav>
+        {#if route.name === 'solutions'}
+          <Solutions {onexpired} />
+        {:else if route.name === 'settings'}
+          <Settings {onexpired} />
+        {:else}
+          <Users onExpired={onexpired} />
+        {/if}
+      </div>
+    {:else if route.name === 'journal'}
+      {@const r = route}
+      <div class="journal-page">
+        <header class="journal-head">
+          <div class="crumbs muted">
+            {userName ? `${userName} / ` : ''}{journalSpace?.name ?? r.space}
+            {#if journalSpace?.role === 'member'}
+              <span class="tag">участник {journalSpace.access} · владелец {journalSpace.owner?.name ?? '?'}</span>
+            {/if}
+          </div>
+          <h1>{JOURNAL_TITLE[r.journal]}</h1>
+          <nav class="subnav" aria-label="Журналы пространства">
+            {#each journalsOf(journalSpace?.kind ?? '') as j (j)}
+              <a
+                href={href({ name: 'journal', user: r.user, space: r.space, journal: j, entry: null })}
+                aria-current={r.journal === j ? 'page' : undefined}>{JOURNAL_TITLE[j]}</a
+              >
+            {/each}
+          </nav>
+        </header>
+        {#if journalError}
+          <p class="error" role="alert">{journalError}</p>
+        {:else if !journalLoaded}
+          <p class="muted">Загрузка…</p>
+        {:else if !journalSpace}
+          <p class="error" role="alert">Пространство «{r.space}» не найдено или недоступно.</p>
+        {:else if !journalsOf(journalSpace.kind).includes(r.journal)}
+          <p class="warn" role="alert">
+            У пространства «{journalSpace.name}» нет журнала {JOURNAL_TITLE[r.journal]}: журналы ведутся в
+            решениях (Changelog, Releases, Insights, Vault) и в Knowledge (Insights, Vault).
+          </p>
+        {:else if r.journal === 'changelog'}
+          <ChangelogView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+        {:else if r.journal === 'releases'}
+          <ReleasesView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+        {:else if r.journal === 'insights'}
+          <InsightsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+        {:else}
+          <VaultView user={r.user} space={r.space} {onexpired} />
+        {/if}
       </div>
     {:else if route.name === 'index'}
       <div class="admin">
@@ -289,6 +389,44 @@
   .admin {
     max-width: 880px;
     margin: 0 auto;
+  }
+  .journal-page {
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  .journal-head {
+    margin-bottom: 16px;
+  }
+  .journal-head h1 {
+    margin: 2px 0 8px;
+  }
+  .crumbs {
+    font-size: 13px;
+  }
+  .tag {
+    margin-left: 6px;
+    font-size: 11px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: var(--chip);
+  }
+  .subnav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .subnav a {
+    padding: 6px 12px;
+    margin-bottom: -1px;
+    color: var(--muted);
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+  }
+  .subnav a[aria-current='page'] {
+    color: var(--text);
+    border-bottom-color: var(--accent);
   }
   .welcome {
     max-width: 640px;

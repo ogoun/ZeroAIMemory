@@ -16,7 +16,13 @@
 //! Для гибридного поиска (M2) каналы отдаются раздельно — [`search_fts_channels`]: их
 //! сливает `zam-search` вместе с векторным каналом и весами из конфигурации; там же
 //! правило «сводка → лучший лист». [`live_chunks`] — метаданные и текст векторных хитов
-//! с проверкой по SQLite (живой узел, не исключён, в области).
+//! с проверкой по SQLite (живой узел, не исключён, в области); [`live_folders`] — то же для
+//! точек папок (канал папок M3, §8.3).
+//!
+//! С M3 цель чанка — узел или запись журнала (`entries`, [`FtsHit::entry`]). Фильтр видов
+//! и статусов ([`TargetFilter`]) действует в обоих каналах и в [`live_chunks`]: виды —
+//! `note` (заметки) и виды записей, статусы — только у insight (записи без статуса проходят
+//! всегда). У записей нет пути: при `path_prefix` они не выдаются.
 //!
 //! Выборка двухшаговая в одной читающей транзакции: каналы отбирают только
 //! `rowid` и узел (глобальный top с запасом из индекса FTS, затем фильтр области;
@@ -27,8 +33,8 @@
 use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
-use rusqlite::{Connection, ToSql, params, params_from_iter};
-use zam_core::Id;
+use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
+use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::time::ts_at;
 use crate::{Db, StoreError};
@@ -66,6 +72,59 @@ const SNIPPET_TOKENS: i64 = 16;
 /// Длина сниппета trigram-хита в символах (без многоточий).
 const SNIPPET_CHARS: usize = 160;
 
+/// Виды, статусы и область целей поиска. По умолчанию — всё: заметки, записи всех видов,
+/// любые статусы и области.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetFilter {
+    /// `note` (заметки) и виды записей (`insight`, `changelog`, `release`); пусто — все.
+    /// Остальные значения (`folder`, `attachment`) чанков не находят.
+    pub kinds: Vec<String>,
+    /// Разрешённые статусы insight; пусто — любые. Записи без статуса и узлы проходят.
+    pub statuses: Vec<String>,
+    /// Строгий фильтр области (`scope.area`, §9.1): только узлы и записи с `area`, равной
+    /// значению; `None` — любые (и без области).
+    pub area: Option<String>,
+    /// Разрешённые `certainty` (`filters.certainty`, §7.5); пусто — любые (и без статуса).
+    /// Непустой список пропускает только заметки и записи с этими статусами.
+    pub certainty: Vec<String>,
+}
+
+/// Виды записей журналов.
+const ENTRY_KINDS: [&str; 3] = ["changelog", "release", "insight"];
+
+/// Параметры SQL фильтра целей.
+struct TargetArgs {
+    /// Узлы проходят.
+    notes: bool,
+    /// JSON-массив разрешённых видов записей.
+    kinds: String,
+    /// JSON-массив разрешённых статусов или `None` (любые).
+    statuses: Option<String>,
+    /// Область или `None` (любые).
+    area: Option<String>,
+    /// JSON-массив разрешённых `certainty` или `None` (любые).
+    certainty: Option<String>,
+}
+
+impl TargetFilter {
+    fn args(&self) -> TargetArgs {
+        let all = self.kinds.is_empty();
+        let kinds: Vec<&str> = ENTRY_KINDS
+            .into_iter()
+            .filter(|k| all || self.kinds.iter().any(|x| x == k))
+            .collect();
+        TargetArgs {
+            notes: all || self.kinds.iter().any(|k| k == "note"),
+            kinds: serde_json::Value::from(kinds).to_string(),
+            statuses: (!self.statuses.is_empty())
+                .then(|| serde_json::Value::from(self.statuses.clone()).to_string()),
+            area: self.area.clone(),
+            certainty: (!self.certainty.is_empty())
+                .then(|| serde_json::Value::from(self.certainty.clone()).to_string()),
+        }
+    }
+}
+
 /// Запрос полнотекстового поиска.
 #[derive(Debug, Clone)]
 pub struct FtsQuery {
@@ -77,13 +136,16 @@ pub struct FtsQuery {
     pub path_prefix: Option<String>,
     /// Размер выдачи, 1..=100.
     pub top_k: usize,
+    /// Виды и статусы целей.
+    pub targets: TargetFilter,
 }
 
 /// Найденный чанк (FTS или — через [`live_chunks`] — векторный хит).
 #[derive(Debug, Clone)]
 pub struct FtsHit {
     pub chunk_id: String,
-    pub node_id: Id,
+    /// Цель чанка: узел или запись журнала.
+    pub target: TargetRef,
     pub space_id: Id,
     pub path: String,
     pub heading_path: String,
@@ -96,6 +158,10 @@ pub struct FtsHit {
     /// [`search_fts`] — слитый RRF-балл, [`search_fts_channels`] — `1/место` в канале,
     /// [`live_chunks`] — 0. Больше — лучше.
     pub score: f64,
+    /// [`search_fts_channels`] — сырой балл `bm25()` канала, в списке которого лежит хит
+    /// (у чанка, найденного обоими каналами, в каждом списке свой): меньше — лучше. По нему
+    /// сервер сливает каналы нескольких баз. [`search_fts`] и [`live_chunks`] — 0.
+    pub raw_score: f64,
     pub updated_at: Timestamp,
     /// Фрагмент с совпадениями между [`MARK_START`] и [`MARK_END`].
     pub snippet: String,
@@ -103,7 +169,91 @@ pub struct FtsHit {
     pub text: String,
     /// `nodes.index_state` узла: `indexed` — его чанки есть в векторном индексе; `pending`,
     /// `failed`, `excluded` — нет (гибрид не понижает такие хиты ослабленного bm25).
+    /// У записи — `entries.index_state`.
     pub index_state: String,
+    /// Поля записи журнала; `None` — чанк заметки.
+    pub entry: Option<EntryHit>,
+    /// Область узла или записи (`nodes.area` / `entries.area`).
+    pub area: Option<String>,
+    /// `certainty` узла или записи (`nodes.certainty` / `entries.certainty`, §7.5).
+    pub certainty: Option<String>,
+}
+
+/// Поля записи журнала в хите поиска.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryHit {
+    /// `insight` / `changelog` / `release`.
+    pub kind: String,
+    pub status: Option<String>,
+    /// `data.kind` записи (вид инсайта, вид изменения changelog).
+    pub insight_kind: Option<String>,
+    pub certainty: Option<String>,
+    pub title: String,
+}
+
+/// Цель чанка по `chunks.node_id` / `chunks.entry_id`.
+fn chunk_target(node: Option<Id>, entry: Option<Id>) -> rusqlite::Result<TargetRef> {
+    match (node, entry) {
+        (Some(id), None) => Ok(TargetRef {
+            kind: TargetKind::Node,
+            id,
+        }),
+        (None, Some(id)) => Ok(TargetRef {
+            kind: TargetKind::Entry,
+            id,
+        }),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            "у чанка нет ровно одной цели (node_id / entry_id)".into(),
+        )),
+    }
+}
+
+/// Соединение чанка `c` с его узлом `n` или записью `e`. LEFT JOIN, как и CROSS JOIN,
+/// фиксирует порядок: сначала чанки, затем цель по первичному ключу.
+const TARGET_JOIN: &str =
+    "LEFT JOIN nodes n ON n.id = c.node_id LEFT JOIN entries e ON e.id = c.entry_id";
+
+/// Колонки хита для [`hit_row`] (после [`TARGET_JOIN`]).
+const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.space_id),
+    coalesce(n.path, ''), c.heading_path, c.rev, coalesce(n.updated_at, e.updated_at), c.text,
+    c.level, c.token_count, coalesce(n.index_state, e.index_state), e.kind, e.status,
+    CASE WHEN json_type(e.data, '$.kind') = 'text' THEN json_extract(e.data, '$.kind') END,
+    e.certainty, e.title, coalesce(n.area, e.area), coalesce(n.certainty, e.certainty)";
+
+/// Хит по колонкам [`HIT_COLS`], начиная с колонки `o`.
+fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
+    let target = chunk_target(r.get(o + 1)?, r.get(o + 2)?)?;
+    let entry = match target.kind {
+        TargetKind::Node => None,
+        TargetKind::Entry => Some(EntryHit {
+            kind: r.get(o + 12)?,
+            status: r.get(o + 13)?,
+            insight_kind: r.get(o + 14)?,
+            certainty: r.get(o + 15)?,
+            title: r.get(o + 16)?,
+        }),
+    };
+    Ok(FtsHit {
+        chunk_id: r.get(o)?,
+        target,
+        space_id: r.get(o + 3)?,
+        path: r.get(o + 4)?,
+        heading_path: r.get(o + 5)?,
+        level: r.get(o + 9)?,
+        rev: r.get(o + 6)?,
+        token_count: r.get(o + 10)?,
+        score: 0.0,
+        raw_score: 0.0,
+        updated_at: ts_at(r, o + 7)?,
+        snippet: String::new(),
+        text: r.get(o + 8)?,
+        index_state: r.get(o + 11)?,
+        entry,
+        area: r.get(o + 17)?,
+        certainty: r.get(o + 18)?,
+    })
 }
 
 /// Слова запроса: всё, что не буква и не цифра (Unicode), — разделитель.
@@ -222,16 +372,46 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
     }
 }
 
-/// Условие области для `chunks c JOIN nodes n`: `?2` — префикс пути или NULL,
-/// пространства — с `?3`. Префикс сравнивается через substr, а не LIKE: LIKE
-/// в SQLite нечувствителен к регистру ASCII и требует экранирования `%` и `_`.
+/// Условие области для `chunks c` с [`TARGET_JOIN`]: `?2` — префикс пути или NULL,
+/// пространства — с `?3`, за ними [`TargetArgs`]: «узлы проходят», JSON видов записей,
+/// JSON статусов или NULL, область или NULL (см. [`scope_args`]). Префикс сравнивается через substr, а не
+/// LIKE: LIKE в SQLite нечувствителен к регистру ASCII и требует экранирования `%` и `_`.
+/// У записи пути нет: при префиксе она не проходит.
 fn scope_sql(n_spaces: usize) -> String {
+    let sp = placeholders(3, n_spaces);
+    let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
+    let cert = 7 + n_spaces;
     format!(
-        "n.deleted_at IS NULL
-         AND n.space_id IN ({})
-         AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
-        placeholders(3, n_spaces)
+        "((c.node_id IS NOT NULL AND ?{notes} AND n.deleted_at IS NULL
+           AND n.space_id IN ({sp})
+           AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
+           AND (?{area} IS NULL OR n.area = ?{area})
+           AND (?{cert} IS NULL OR n.certainty IN (SELECT value FROM json_each(?{cert}))))
+          OR (c.entry_id IS NOT NULL AND ?2 IS NULL AND e.deleted_at IS NULL
+           AND e.space_id IN ({sp})
+           AND e.kind IN (SELECT value FROM json_each(?{kinds}))
+           AND (e.status IS NULL OR ?{statuses} IS NULL
+                OR e.status IN (SELECT value FROM json_each(?{statuses})))
+           AND (?{area} IS NULL OR e.area = ?{area})
+           AND (?{cert} IS NULL OR e.certainty IN (SELECT value FROM json_each(?{cert})))))"
     )
+}
+
+/// Параметры [`scope_sql`] после `?1`: префикс, пространства, фильтр целей.
+fn scope_args<'a>(
+    first: &'a dyn ToSql,
+    prefix: &'a Option<&'a str>,
+    spaces: &'a [Id],
+    t: &'a TargetArgs,
+) -> Vec<&'a dyn ToSql> {
+    let mut args: Vec<&dyn ToSql> = vec![first, prefix];
+    args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+    args.push(&t.notes);
+    args.push(&t.kinds);
+    args.push(&t.statuses);
+    args.push(&t.area);
+    args.push(&t.certainty);
+    args
 }
 
 /// JSON-массив чисел для `json_each`: один текст SQL при любом размере списка.
@@ -243,8 +423,8 @@ fn json_ids(ids: &[i64]) -> String {
     format!("[{}]", items.join(","))
 }
 
-/// Кандидат канала: `(seq, node_id, это L1 заметки)`.
-type Cand = (i64, Id, bool);
+/// Кандидат канала: `(seq, цель, это L1 заметки или записи, bm25 канала)`.
+type Cand = (i64, TargetRef, bool, f64);
 
 /// Выполняет канал: кандидаты по убыванию релевантности канала.
 ///
@@ -260,58 +440,67 @@ fn run_channel(
     fts: &str,
     prefix: Option<&str>,
     spaces: &[Id],
+    targets: &TargetArgs,
 ) -> Result<Vec<Cand>, StoreError> {
     let (table, order, limit) = channel_spec(ch);
     let over = limit * OVERSAMPLE;
     let mut st = c.prepare_cached(&format!(
-        "SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY {order}, rowid LIMIT {over}"
+        "SELECT rowid, {order} FROM {table} WHERE {table} MATCH ?1 ORDER BY {order}, rowid LIMIT {over}"
     ))?;
-    let top: Vec<i64> = st
-        .query_map([fts], |r| r.get(0))?
+    let top_raw: Vec<(i64, f64)> = st
+        .query_map([fts], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
+    let top: Vec<i64> = top_raw.iter().map(|t| t.0).collect();
     if top.is_empty() {
         return Ok(Vec::new());
     }
 
     let ids = json_ids(&top);
-    let mut args: Vec<&dyn ToSql> = vec![&ids, &prefix];
-    args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+    let args = scope_args(&ids, &prefix, spaces, targets);
     let mut st = c.prepare_cached(&format!(
-        "SELECT c.seq, c.node_id, c.level = 'note'
+        "SELECT c.seq, c.node_id, c.entry_id, c.level = 'note'
          FROM json_each(?1) j
          CROSS JOIN chunks c ON c.seq = j.value
-         CROSS JOIN nodes n ON n.id = c.node_id
+         {TARGET_JOIN}
          WHERE {}",
         scope_sql(spaces.len())
     ))?;
-    let allowed: HashMap<i64, (Id, bool)> = st
+    let allowed: HashMap<i64, (TargetRef, bool)> = st
         .query_map(params_from_iter(args), |r| {
-            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+            Ok((r.get(0)?, (chunk_target(r.get(1)?, r.get(2)?)?, r.get(3)?)))
         })?
         .collect::<Result<_, _>>()?;
-    let out: Vec<Cand> = top
+    let out: Vec<Cand> = top_raw
         .iter()
-        .filter_map(|seq| allowed.get(seq).map(|(node, note)| (*seq, *node, *note)))
+        .filter_map(|(seq, raw)| {
+            allowed
+                .get(seq)
+                .map(|(node, note)| (*seq, *node, *note, *raw))
+        })
         .take(limit as usize)
         .collect();
     if out.len() as i64 == limit || (top.len() as i64) < over {
         return Ok(out);
     }
 
-    let mut args: Vec<&dyn ToSql> = vec![&fts, &prefix];
-    args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+    let args = scope_args(&fts, &prefix, spaces, targets);
     let mut st = c.prepare_cached(&format!(
-        "SELECT f.rowid, c.node_id, c.level = 'note'
+        "SELECT f.rowid, c.node_id, c.entry_id, c.level = 'note', {order}
          FROM {table} f
          CROSS JOIN chunks c ON c.seq = f.rowid
-         CROSS JOIN nodes n ON n.id = c.node_id
+         {TARGET_JOIN}
          WHERE {table} MATCH ?1 AND {}
          ORDER BY {order}, f.rowid
          LIMIT {limit}",
         scope_sql(spaces.len())
     ))?;
     let rows = st.query_map(params_from_iter(args), |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        Ok((
+            r.get(0)?,
+            chunk_target(r.get(1)?, r.get(2)?)?,
+            r.get(3)?,
+            r.get(4)?,
+        ))
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
@@ -324,7 +513,8 @@ struct Ranked {
     in_bm25: bool,
 }
 
-/// Полнотекстовый поиск по чанкам живых узлов в пределах `space_ids` и `path_prefix`.
+/// Полнотекстовый поиск по чанкам живых узлов и записей в пределах `space_ids`,
+/// `path_prefix` и фильтра целей.
 /// Запрос без слов (и без фразы для trigram) — пустая выдача.
 /// `top_k` вне 1..=100, пустой `space_ids` или запрос длиннее 512 символов → `BadInput`.
 pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError> {
@@ -333,7 +523,7 @@ pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError>
         // один снимок данных для обоих шагов; транзакция только читает и
         // откатывается при выходе
         let tx = c.unchecked_transaction()?;
-        let ch = run_channels(&tx, &q.text, prefix.as_deref(), &spaces)?;
+        let ch = run_channels(&tx, &q.text, prefix.as_deref(), &spaces, &q.targets.args())?;
         let ranked = merge(ch.a, ch.b, q.top_k);
         fetch_hits(&tx, &ranked, ch.a_fts.as_deref(), &ch.needles)
     })
@@ -361,12 +551,12 @@ pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, St
     let (spaces, prefix) = check_query(&q)?;
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
-        let ch = run_channels(&tx, &q.text, prefix.as_deref(), &spaces)?;
+        let ch = run_channels(&tx, &q.text, prefix.as_deref(), &spaces, &q.targets.args())?;
         let in_a: HashSet<i64> = ch.a.iter().map(|c| c.0).collect();
         // текст и сниппеты — одним шагом для объединения каналов; сниппет чанка,
         // найденного bm25, — из FTS5 `snippet()`
         let mut all: Vec<Ranked> = Vec::with_capacity(ch.a.len() + ch.b.len());
-        for (seq, _, _) in ch.a.iter().chain(&ch.b) {
+        for (seq, _, _, _) in ch.a.iter().chain(&ch.b) {
             if !all.iter().any(|r| r.seq == *seq) {
                 all.push(Ranked {
                     seq: *seq,
@@ -384,9 +574,10 @@ pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, St
         let take = |l: &[Cand]| -> Vec<FtsHit> {
             l.iter()
                 .enumerate()
-                .filter_map(|(i, (seq, _, _))| {
+                .filter_map(|(i, (seq, _, _, raw))| {
                     let mut h = hits.get(seq_ids.get(seq)?)?.clone();
                     h.score = 1.0 / (i + 1) as f64;
+                    h.raw_score = *raw;
                     Some(h)
                 })
                 .collect()
@@ -429,23 +620,24 @@ fn run_channels<'q>(
     text: &'q str,
     prefix: Option<&str>,
     spaces: &[Id],
+    t: &TargetArgs,
 ) -> Result<Channels<'q>, StoreError> {
     let mut a_fts = sanitize_fts(text);
     let mut relaxed = false;
     let mut a = match &a_fts {
-        Some(fts) => run_channel(tx, Channel::Bm25, fts, prefix, spaces)?,
+        Some(fts) => run_channel(tx, Channel::Bm25, fts, prefix, spaces, t)?,
         None => Vec::new(),
     };
     if a.is_empty() && terms(text).len() > 1 {
         a_fts = sanitize_fts_any(text);
         relaxed = true;
         if let Some(fts) = &a_fts {
-            a = run_channel(tx, Channel::Bm25, fts, prefix, spaces)?;
+            a = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t)?;
         }
     }
     let (b, needles) = match trigram_query(text, a.is_empty()) {
         Some((fts, needles)) => (
-            run_channel(tx, Channel::Trigram, &fts, prefix, spaces)?,
+            run_channel(tx, Channel::Trigram, &fts, prefix, spaces, t)?,
             needles,
         ),
         None => (Vec::new(), Vec::new()),
@@ -497,14 +689,16 @@ pub struct ChunkScope {
     pub space_ids: Vec<Id>,
     /// Префикс пути (как в [`FtsQuery`]).
     pub path_prefix: Option<String>,
-    /// Только узлы, которые векторизуются (`index_state <> 'excluded'`): для векторных
+    /// Только цели, которые векторизуются (`index_state <> 'excluded'`): для векторных
     /// хитов — точка исключённого узла могла остаться в Qdrant.
     pub indexable_only: bool,
+    /// Виды и статусы целей (как в [`FtsQuery`]).
+    pub targets: TargetFilter,
 }
 
-/// Чанки `ids` живых узлов области (с текстом, без сниппета, `score = 0`) в порядке
-/// `ids`; отсутствующие (старая ревизия, узел удалён или в корзине, вне области,
-/// исключён при `indexable_only`) пропускаются. Источник истины для векторных хитов:
+/// Чанки `ids` живых узлов и записей области (с текстом, без сниппета, `score = 0`) в
+/// порядке `ids`; отсутствующие (старая ревизия, цель удалена или в корзине, вне области
+/// или фильтра целей, исключена при `indexable_only`) пропускаются. Источник истины для векторных хитов:
 /// точки в Qdrant могут пережить неудачное задание `delete`.
 pub async fn live_chunks(
     db: &Db,
@@ -516,40 +710,24 @@ pub async fn live_chunks(
     }
     let prefix = norm_prefix(scope.path_prefix.as_deref());
     let list = serde_json::Value::from(ids.clone()).to_string();
+    let t = scope.targets.args();
     db.read(move |c| {
-        let mut args: Vec<&dyn ToSql> = vec![&list, &prefix];
-        args.extend(scope.space_ids.iter().map(|s| s as &dyn ToSql));
+        let prefix = prefix.as_deref();
+        let args = scope_args(&list, &prefix, &scope.space_ids, &t);
         let mut st = c.prepare_cached(&format!(
-            "SELECT c.id, c.node_id, n.space_id, n.path, c.heading_path, c.rev, n.updated_at,
-                    c.text, c.level, c.token_count, n.index_state
+            "SELECT {HIT_COLS}
              FROM json_each(?1) j
              CROSS JOIN chunks c ON c.id = j.value
-             CROSS JOIN nodes n ON n.id = c.node_id
+             {TARGET_JOIN}
              WHERE {} {}",
             scope_sql(scope.space_ids.len()),
             if scope.indexable_only {
-                "AND n.index_state <> 'excluded'"
+                "AND coalesce(n.index_state, e.index_state) <> 'excluded'"
             } else {
                 ""
             }
         ))?;
-        let rows = st.query_map(params_from_iter(args), |r| {
-            Ok(FtsHit {
-                chunk_id: r.get(0)?,
-                node_id: r.get(1)?,
-                space_id: r.get(2)?,
-                path: r.get(3)?,
-                heading_path: r.get(4)?,
-                level: r.get(8)?,
-                rev: r.get(5)?,
-                token_count: r.get(9)?,
-                score: 0.0,
-                updated_at: ts_at(r, 6)?,
-                snippet: String::new(),
-                text: r.get(7)?,
-                index_state: r.get(10)?,
-            })
-        })?;
+        let rows = st.query_map(params_from_iter(args), |r| hit_row(r, 0))?;
         let mut by_id: HashMap<String, FtsHit> = rows
             .map(|h| h.map(|h| (h.chunk_id.clone(), h)))
             .collect::<Result<_, _>>()?;
@@ -558,7 +736,70 @@ pub async fn live_chunks(
     .await
 }
 
-/// Лист заметки для замены сводки (§9.2 п. 6).
+/// Папка векторного канала папок, прошедшая проверку по SQLite ([`live_folders`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRow {
+    pub id: Id,
+    pub space_id: Id,
+    pub path: String,
+    /// Свёртка L0 папки (§8.3), замаскированная сканером секретов.
+    pub l0: Option<String>,
+    /// Живых (не удалённых и не в корзине) детей первого уровня.
+    pub child_count: i64,
+}
+
+/// Папки `ids` (точки уровня `folder` векторной выдачи) в порядке `ids`: только живые
+/// (не удалённые, не в корзине) папки пространств `space_ids`, кроме Human, под префиксом
+/// `path_prefix` (по целым сегментам; сама папка с этим путём проходит). Отсутствующие и
+/// не прошедшие проверку пропускаются: точка в Qdrant может пережить удаление папки.
+/// Пустой `space_ids` — пустая выдача.
+pub async fn live_folders(
+    db: &Db,
+    ids: Vec<Id>,
+    space_ids: &[Id],
+    path_prefix: Option<&str>,
+) -> Result<Vec<FolderRow>, StoreError> {
+    if ids.is_empty() || space_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prefix = norm_prefix(path_prefix);
+    let spaces = space_ids.to_vec();
+    let list =
+        serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT n.id, n.space_id, n.path, n.l0,
+                    (SELECT count(*) FROM nodes ch
+                     WHERE ch.space_id = n.space_id AND ch.parent_id = n.id
+                       AND ch.deleted_at IS NULL)
+             FROM json_each(?1) j
+             CROSS JOIN nodes n ON n.id = j.value
+             JOIN spaces s ON s.id = n.space_id
+             WHERE n.kind = 'folder' AND n.deleted_at IS NULL AND s.kind <> 'human'
+               AND n.space_id IN ({})
+               AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
+            placeholders(3, spaces.len())
+        ))?;
+        let mut args: Vec<&dyn ToSql> = vec![&list, &prefix];
+        args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+        let rows = st.query_map(params_from_iter(args), |r| {
+            Ok(FolderRow {
+                id: r.get(0)?,
+                space_id: r.get(1)?,
+                path: r.get(2)?,
+                l0: r.get(3)?,
+                child_count: r.get(4)?,
+            })
+        })?;
+        let mut by_id: HashMap<Id, FolderRow> = rows
+            .map(|f| f.map(|f| (f.id, f)))
+            .collect::<Result<_, _>>()?;
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    })
+    .await
+}
+
+/// Лист заметки или записи журнала для замены сводки (§9.2 п. 6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafChunk {
     pub chunk_id: String,
@@ -572,38 +813,51 @@ pub struct LeafChunk {
 
 /// Листы (`level = 'chunk'`) узла по порядку.
 pub async fn node_leaves(db: &Db, node: Id) -> Result<Vec<LeafChunk>, StoreError> {
-    Ok(leaves_of_nodes(db, vec![node], true)
+    let t = TargetRef {
+        kind: TargetKind::Node,
+        id: node,
+    };
+    Ok(leaves_of_targets(db, vec![t], true)
         .await?
-        .remove(&node)
+        .remove(&t)
         .unwrap_or_default())
 }
 
-/// Листы нескольких узлов одним запросом: `узел → листы по порядку`; узла без листов
-/// в ответе нет (замена сводок листами в поиске — без запроса на каждую сводку).
-/// `with_text = false` — без `text` и `context_prefix` (пустые строки): тексты сотен
-/// листов не читаются, если нужны только пути, порядок и ключи кэша эмбеддингов.
-pub async fn leaves_of_nodes(
+/// Листы нескольких целей (узлов и записей журналов) одним чтением: `цель → листы по
+/// порядку`; цели без листов в ответе нет (замена сводок листами в поиске — без запроса на
+/// каждую сводку). `with_text = false` — без `text` и `context_prefix` (пустые строки):
+/// тексты сотен листов не читаются, если нужны только пути, порядок и ключи кэша эмбеддингов.
+pub async fn leaves_of_targets(
     db: &Db,
-    nodes: Vec<Id>,
+    targets: Vec<TargetRef>,
     with_text: bool,
-) -> Result<HashMap<Id, Vec<LeafChunk>>, StoreError> {
-    if nodes.is_empty() {
+) -> Result<HashMap<TargetRef, Vec<LeafChunk>>, StoreError> {
+    if targets.is_empty() {
         return Ok(HashMap::new());
     }
     db.read(move |c| {
-        // один снимок и один подготовленный запрос по индексу `chunks_node` на узел:
-        // соединение с json_each здесь медленнее (сортировка всех листов)
+        // один снимок и один подготовленный запрос по индексу `chunks_node` (`chunks_entry`)
+        // на цель: соединение с json_each здесь медленнее (сортировка всех листов)
         let tx = c.unchecked_transaction()?;
-        let mut st = tx.prepare_cached(
-            "SELECT id, heading_path, ordinal,
-                    CASE WHEN ?2 THEN text ELSE '' END,
-                    CASE WHEN ?2 THEN context_prefix ELSE '' END,
-                    embed_key
-             FROM chunks WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
-        )?;
-        let mut out: HashMap<Id, Vec<LeafChunk>> = HashMap::new();
-        for node in nodes {
-            let rows = st.query_map(params![node, with_text], |r| {
+        let sql = |col: &str| {
+            format!(
+                "SELECT id, heading_path, ordinal,
+                        CASE WHEN ?2 THEN text ELSE '' END,
+                        CASE WHEN ?2 THEN context_prefix ELSE '' END,
+                        embed_key
+                 FROM chunks WHERE {col} = ?1 AND {col} IS NOT NULL AND level = 'chunk'
+                 ORDER BY ordinal"
+            )
+        };
+        let mut by_node = tx.prepare_cached(&sql("node_id"))?;
+        let mut by_entry = tx.prepare_cached(&sql("entry_id"))?;
+        let mut out: HashMap<TargetRef, Vec<LeafChunk>> = HashMap::new();
+        for t in targets {
+            let st = match t.kind {
+                TargetKind::Node => &mut by_node,
+                TargetKind::Entry => &mut by_entry,
+            };
+            let rows = st.query_map(params![t.id, with_text], |r| {
                 Ok(LeafChunk {
                     chunk_id: r.get(0)?,
                     heading_path: r.get(1)?,
@@ -616,7 +870,7 @@ pub async fn leaves_of_nodes(
             })?;
             let leaves: Vec<LeafChunk> = rows.collect::<Result<_, _>>()?;
             if !leaves.is_empty() {
-                out.insert(node, leaves);
+                out.insert(t, leaves);
             }
         }
         Ok(out)
@@ -624,10 +878,47 @@ pub async fn leaves_of_nodes(
     .await
 }
 
-/// Лист узла с числом найденных в нём слов запроса ([`leaf_term_hits`]).
+/// Первый лист (`level = 'chunk'`, наименьший `ordinal`) каждой цели — узла или записи:
+/// `цель → id чанка`; целей без листов в ответе нет. Карточка соседа по графу в
+/// `expand=graph` поиска (область и фильтры проверяет [`live_chunks`]).
+pub async fn first_leaves(
+    db: &Db,
+    targets: Vec<TargetRef>,
+) -> Result<HashMap<TargetRef, String>, StoreError> {
+    if targets.is_empty() {
+        return Ok(HashMap::new());
+    }
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let mut by_node = tx.prepare_cached(
+            "SELECT id FROM chunks WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal LIMIT 1",
+        )?;
+        let mut by_entry = tx.prepare_cached(
+            "SELECT id FROM chunks WHERE entry_id = ?1 AND level = 'chunk' ORDER BY ordinal LIMIT 1",
+        )?;
+        let mut out = HashMap::new();
+        for t in targets {
+            let st = match t.kind {
+                TargetKind::Node => &mut by_node,
+                TargetKind::Entry => &mut by_entry,
+            };
+            if let Some(id) = st
+                .query_row([t.id], |r| r.get::<_, String>(0))
+                .optional()?
+            {
+                out.insert(t, id);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Лист цели (узла или записи журнала) с числом найденных в нём слов запроса
+/// ([`leaf_term_hits`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafHit {
-    pub node_id: Id,
+    pub target: TargetRef,
     pub chunk_id: String,
     pub heading_path: String,
     pub ordinal: i64,
@@ -635,11 +926,11 @@ pub struct LeafHit {
     pub hits: usize,
 }
 
-/// Листы узлов `nodes`, в которых FTS5 находит слова запроса (`needles`, каждое — как
-/// запрос [`sanitize_fts`]), с числом найденных слов; по узлу и `ordinal`. Листы без
-/// совпадений в ответ не входят. Тексты не читаются; в одной читающей транзакции: листы
-/// узлов (по индексу `chunks_node`) и по одному проходу индекса FTS на слово — только
-/// `rowid` совпадений, пересечение с листами — в памяти.
+/// Листы целей `targets` (узлов и записей журналов), в которых FTS5 находит слова запроса
+/// (`needles`, каждое — как запрос [`sanitize_fts`]), с числом найденных слов; по цели и
+/// `ordinal`. Листы без совпадений в ответ не входят. Тексты не читаются; в одной читающей
+/// транзакции: листы целей (по индексам `chunks_node` и `chunks_entry`) и по одному проходу
+/// индекса FTS на слово — только `rowid` совпадений, пересечение с листами — в памяти.
 ///
 /// Соединение совпадений с `chunks` и фильтр по узлам в SQL (как было) читали строку
 /// `chunks` на каждое совпадение: на 10 тыс. заметок частое слово («и», «the») — 16 тыс.
@@ -648,34 +939,59 @@ pub struct LeafHit {
 /// частое слово (замеры `cargo xtask bench`, задача 15 M2).
 pub async fn leaf_term_hits(
     db: &Db,
-    nodes: Vec<Id>,
+    targets: Vec<TargetRef>,
     needles: Vec<String>,
 ) -> Result<Vec<LeafHit>, StoreError> {
-    if nodes.is_empty() || needles.is_empty() {
+    if targets.is_empty() || needles.is_empty() {
         return Ok(Vec::new());
     }
-    let list =
-        serde_json::Value::from(nodes.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    let list = |kind: TargetKind| {
+        serde_json::Value::from(
+            targets
+                .iter()
+                .filter(|t| t.kind == kind)
+                .map(|t| t.id.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .to_string()
+    };
+    let lists = [
+        (TargetKind::Node, list(TargetKind::Node)),
+        (TargetKind::Entry, list(TargetKind::Entry)),
+    ];
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
-        let mut st = tx.prepare_cached(
-            "SELECT c.seq, c.id, c.node_id, c.heading_path, c.ordinal FROM chunks c
-             WHERE c.level = 'chunk' AND c.node_id IN (SELECT value FROM json_each(?1))",
-        )?;
-        let mut leaves: HashMap<i64, LeafHit> = st
-            .query_map([&list], |r| {
+        let mut leaves: HashMap<i64, LeafHit> = HashMap::new();
+        for (kind, list) in &lists {
+            let col = match kind {
+                TargetKind::Node => "node_id",
+                TargetKind::Entry => "entry_id",
+            };
+            let mut st = tx.prepare_cached(&format!(
+                "SELECT c.seq, c.id, c.{col}, c.heading_path, c.ordinal FROM chunks c
+                 WHERE c.level = 'chunk' AND c.{col} IS NOT NULL
+                   AND c.{col} IN (SELECT value FROM json_each(?1))"
+            ))?;
+            let rows = st.query_map([list], |r| {
                 Ok((
                     r.get(0)?,
                     LeafHit {
                         chunk_id: r.get(1)?,
-                        node_id: r.get(2)?,
+                        target: TargetRef {
+                            kind: *kind,
+                            id: r.get(2)?,
+                        },
                         heading_path: r.get(3)?,
                         ordinal: r.get(4)?,
                         hits: 0,
                     },
                 ))
-            })?
-            .collect::<Result<_, _>>()?;
+            })?;
+            for row in rows {
+                let (seq, hit) = row?;
+                leaves.insert(seq, hit);
+            }
+        }
         if leaves.is_empty() {
             return Ok(Vec::new());
         }
@@ -691,7 +1007,7 @@ pub async fn leaf_term_hits(
             }
         }
         let mut v: Vec<LeafHit> = leaves.into_values().filter(|l| l.hits > 0).collect();
-        v.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(a.ordinal.cmp(&b.ordinal)));
+        v.sort_by(|a, b| a.target.cmp(&b.target).then(a.ordinal.cmp(&b.ordinal)));
         Ok(v)
     })
     .await
@@ -723,28 +1039,28 @@ pub async fn neighbor_leaves(
     .await
 }
 
-/// Weighted RRF по чанкам, L1 заметки — только у узлов без найденных листов,
-/// лимит на узел, top_k.
+/// Weighted RRF по чанкам, L1 заметки — только у целей без найденных листов,
+/// лимит на цель, top_k.
 fn merge(a: Vec<Cand>, b: Vec<Cand>, top_k: usize) -> Vec<Ranked> {
-    let with_leaf: HashSet<Id> = a
+    let with_leaf: HashSet<TargetRef> = a
         .iter()
         .chain(&b)
-        .filter(|(_, _, note)| !note)
-        .map(|(_, node, _)| *node)
+        .filter(|(_, _, note, _)| !note)
+        .map(|(_, node, _, _)| *node)
         .collect();
     let keep = |c: &Cand| !c.2 || !with_leaf.contains(&c.1);
-    let strip = |l: Vec<Cand>| -> Vec<(i64, Id)> {
+    let strip = |l: Vec<Cand>| -> Vec<(i64, TargetRef)> {
         l.into_iter()
             .filter(keep)
-            .map(|(seq, node, _)| (seq, node))
+            .map(|(seq, node, _, _)| (seq, node))
             .collect()
     };
     rrf(strip(a), strip(b), top_k)
 }
 
-/// Weighted RRF по чанкам, лимит на узел, top_k.
-fn rrf(a: Vec<(i64, Id)>, b: Vec<(i64, Id)>, top_k: usize) -> Vec<Ranked> {
-    let mut by_seq: HashMap<i64, (Id, f64, bool)> = HashMap::new();
+/// Weighted RRF по чанкам, лимит на цель, top_k.
+fn rrf(a: Vec<(i64, TargetRef)>, b: Vec<(i64, TargetRef)>, top_k: usize) -> Vec<Ranked> {
+    let mut by_seq: HashMap<i64, (TargetRef, f64, bool)> = HashMap::new();
     for (w, list, is_a) in [(W_BM25, a, true), (W_TRIGRAM, b, false)] {
         for (i, (seq, node)) in list.into_iter().enumerate() {
             let e = by_seq.entry(seq).or_insert((node, 0.0, false));
@@ -752,10 +1068,10 @@ fn rrf(a: Vec<(i64, Id)>, b: Vec<(i64, Id)>, top_k: usize) -> Vec<Ranked> {
             e.2 |= is_a;
         }
     }
-    let mut all: Vec<(i64, (Id, f64, bool))> = by_seq.into_iter().collect();
+    let mut all: Vec<(i64, (TargetRef, f64, bool))> = by_seq.into_iter().collect();
     all.sort_by(|(x, (_, sx, _)), (y, (_, sy, _))| sy.total_cmp(sx).then(x.cmp(y)));
 
-    let mut per_node: HashMap<Id, usize> = HashMap::new();
+    let mut per_node: HashMap<TargetRef, usize> = HashMap::new();
     all.into_iter()
         .filter(|(_, (node, _, _))| {
             let n = per_node.entry(*node).or_default();
@@ -784,32 +1100,14 @@ fn fetch_hits(
         return Ok(Vec::new());
     }
     let seqs: Vec<i64> = ranked.iter().map(|r| r.seq).collect();
-    let mut st = c.prepare_cached(
-        "SELECT c.seq, c.id, c.node_id, n.space_id, n.path, c.heading_path, c.rev,
-                n.updated_at, c.text, c.level, c.token_count, n.index_state
+    let mut st = c.prepare_cached(&format!(
+        "SELECT c.seq, {HIT_COLS}
          FROM json_each(?1) j
          CROSS JOIN chunks c ON c.seq = j.value
-         CROSS JOIN nodes n ON n.id = c.node_id",
-    )?;
+         {TARGET_JOIN}"
+    ))?;
     let rows = st.query_map([json_ids(&seqs)], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            FtsHit {
-                chunk_id: r.get(1)?,
-                node_id: r.get(2)?,
-                space_id: r.get(3)?,
-                path: r.get(4)?,
-                heading_path: r.get(5)?,
-                level: r.get(9)?,
-                rev: r.get(6)?,
-                token_count: r.get(10)?,
-                score: 0.0,
-                updated_at: ts_at(r, 7)?,
-                snippet: String::new(),
-                text: r.get(8)?,
-                index_state: r.get(11)?,
-            },
-        ))
+        Ok((r.get::<_, i64>(0)?, hit_row(r, 1)?))
     })?;
     let mut by_seq: HashMap<i64, FtsHit> = rows.collect::<Result<_, _>>()?;
 
@@ -895,16 +1193,22 @@ pub fn text_snippet(text: &str, needles: &[&str]) -> String {
     s
 }
 
-/// Запрос [`pending_count`]: условия совпадают с частичным индексом `nodes_pending`
-/// (миграция 0006), поэтому считаются только заметки в очереди.
-const PENDING_COUNT_SQL: &str = "SELECT count(*) FROM nodes n
+/// Запрос [`pending_count`]: условия совпадают с частичными индексами `nodes_pending`
+/// (миграция 0006) и `entries_pending` (0008), поэтому считаются только цели в очереди.
+/// `INDEXED BY` — с миграцией 0012 (задача 19b M3) планировщик без статистики выбирал
+/// `nodes_live_children (space_id=?)`, то есть обход всех живых узлов области.
+const PENDING_COUNT_SQL: &str = "SELECT (SELECT count(*) FROM nodes n INDEXED BY nodes_pending
      WHERE n.kind = 'note' AND n.index_state = 'pending' AND n.deleted_at IS NULL
        AND n.space_id IN (SELECT value FROM json_each(?1))
-       AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')";
+       AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/'))
+     + (SELECT count(*) FROM entries e
+        WHERE e.index_state = 'pending' AND e.deleted_at IS NULL AND ?2 IS NULL
+          AND e.space_id IN (SELECT value FROM json_each(?1)))";
 
-/// Сколько живых заметок в `space_ids` (и под `path_prefix`, если задан) ждут
-/// векторной индексации (`index_state = 'pending'`) — `pending_count` выдачи поиска.
-/// Заметки с `index: false` (`excluded`) не считаются.
+/// Сколько живых заметок и записей журналов в `space_ids` (и под `path_prefix`, если задан;
+/// у записей пути нет — при префиксе они не считаются) ждут векторной индексации
+/// (`index_state = 'pending'`) — `pending_count` выдачи поиска. Заметки с `index: false`
+/// (`excluded`) не считаются.
 pub async fn pending_count(
     db: &Db,
     space_ids: Vec<Id>,
@@ -945,6 +1249,7 @@ mod tests {
             .collect();
         let plan = plan.join("; ");
         assert!(plan.contains("nodes_pending"), "{plan}");
+        assert!(plan.contains("entries_pending"), "{plan}");
     }
 
     #[test]

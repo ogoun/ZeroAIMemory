@@ -69,17 +69,22 @@ pub async fn list_children(
 }
 
 /// Запрос поддерева для [`list_children`]: `?1` — пространство, `?2` — родитель,
-/// `?3` — глубина. Шаг рекурсии ограничен `space_id`, чтобы работал индекс `nodes_parent`.
+/// `?3` — глубина. Шаг рекурсии ограничен `space_id`, чтобы работал индекс
+/// `nodes_live_children`. `CROSS JOIN` фиксирует порядок (задача 19b M3): от строки очереди
+/// `t` к её детям по полному ключу `(space_id, parent_id)` и от `t` к строке узла. При
+/// обычном `JOIN` планировщик ставил `nodes` внешним циклом: каждый шаг рекурсии
+/// просматривал все узлы пространства (с корзиной), а итоговая выборка — всю таблицу.
 pub(crate) fn children_sql() -> String {
     format!(
         "WITH RECURSIVE t (id, lvl) AS (
              SELECT id, 1 FROM nodes
              WHERE space_id = ?1 AND parent_id IS ?2 AND deleted_at IS NULL
              UNION ALL
-             SELECT c.id, t.lvl + 1 FROM nodes c JOIN t ON c.parent_id = t.id
-             WHERE c.space_id = ?1 AND c.deleted_at IS NULL AND t.lvl < ?3
+             SELECT c.id, t.lvl + 1 FROM t CROSS JOIN nodes c
+             ON c.space_id = ?1 AND c.parent_id = t.id AND c.deleted_at IS NULL
+             WHERE t.lvl < ?3
          )
-         SELECT {NODE_COLS} FROM nodes n JOIN t ON n.id = t.id"
+         SELECT {NODE_COLS} FROM t CROSS JOIN nodes n ON n.id = t.id"
     )
 }
 

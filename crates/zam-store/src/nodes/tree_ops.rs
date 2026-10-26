@@ -4,20 +4,25 @@
 //! Удаление помечает узел и всех его живых потомков одной меткой `deleted_at`:
 //! метка задаёт «пакет удаления». Восстановление возвращает ровно этот пакет;
 //! потомки, удалённые раньше отдельно, остаются в корзине. Поддерево строится по
-//! `parent_id` (индекс `nodes_parent`), а не по префиксу пути: удалённые узлы
-//! могут делить путь с живыми. Каждая операция — одна транзакция писателя и ставит
-//! задания outbox (§8.1): удаление — `delete`, восстановление и перенос — `upsert`.
+//! `parent_id` (индексы `nodes_live_children` и `nodes_parent`), а не по префиксу пути:
+//! удалённые узлы могут делить путь с живыми. Каждая операция — одна транзакция писателя и ставит
+//! задания outbox (§8.1): удаление — `delete`, восстановление и перенос — `upsert`. В той же
+//! транзакции перепроверяются выведенные рёбра графа пространства (`crate::graph::tree_changed`).
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 
 use super::chunks::{
-    context_prefix, frontmatter_tags, index_note, index_state, note_meta, space_kind,
+    frontmatter_tags, index_note, index_state, note_meta, note_prefix, space_kind,
 };
 use super::write::{ensure_ancestors, ensure_free};
-use super::{NODE_COLS, Node, NodeKind, live_by_path, load_node, node_row, revision_text};
+use super::{
+    AuthorKind, NODE_COLS, Node, NodeKind, live_by_path, load_node, node_row, revision_text,
+};
+use crate::certainty::{CertaintyChange, check_certainty};
 use crate::embeddings::embed_key_of;
+use crate::entries::Certainty;
 use crate::jobs::{JobOp, PRIORITY_WRITE, enqueue};
 use crate::paths::NodePath;
 use crate::time::fmt_ts;
@@ -26,8 +31,9 @@ use crate::{Db, StoreError};
 /// Мягко удаляет узел и всех его живых потомков одной меткой времени; их чанки
 /// удаляются (триггеры убирают их из FTS), заметкам, которые могли попасть в векторный
 /// индекс (не `excluded`), ставится `delete`. Возвращает число помеченных узлов.
-/// Нет узла или он уже удалён → `NotFound`.
-pub async fn delete_node(db: &Db, id: Id) -> Result<u64, StoreError> {
+/// Нет узла или он уже удалён → `NotFound`; в поддереве есть заметка `axiom`, а `author` не
+/// человек → `Certainty` (ничего не удалено).
+pub async fn delete_node(db: &Db, id: Id, author: AuthorKind) -> Result<u64, StoreError> {
     db.write(move |tx| {
         let node = load_node(tx, id)?;
         if node.deleted_at.is_some() {
@@ -35,6 +41,7 @@ pub async fn delete_node(db: &Db, id: Id) -> Result<u64, StoreError> {
         }
         let now = fmt_ts(Timestamp::now());
         let ids = subtree(tx, &node, None)?;
+        ensure_no_axiom(tx, &ids, author)?;
         let mut mark = tx.prepare_cached("UPDATE nodes SET deleted_at = ?2 WHERE id = ?1")?;
         let mut drop_chunks = tx.prepare_cached("DELETE FROM chunks WHERE node_id = ?1")?;
         let mut state = tx.prepare_cached(
@@ -52,6 +59,9 @@ pub async fn delete_node(db: &Db, id: Id) -> Result<u64, StoreError> {
                 enqueue(tx, nid, rev, JobOp::Delete, PRIORITY_WRITE, &now)?;
             }
         }
+        // ссылки на удалённые заметки разрешаются заново (другая с тем же именем или битая);
+        // рёбра самих удалённых остаются, но не видны, пока источник в корзине
+        crate::graph::tree_changed(tx, node.space_id, &ids, &[])?;
         Ok(ids.len() as u64)
     })
     .await
@@ -62,8 +72,9 @@ pub async fn delete_node(db: &Db, id: Id) -> Result<u64, StoreError> {
 /// Путь любого восстанавливаемого узла занят живым → `Conflict`, ничего не меняется.
 /// Чанки заметок пересобираются из текущей ревизии, `index_state` пересчитывается,
 /// индексируемым ставится `upsert` (заменяя `delete` от удаления).
-/// Нет узла → `NotFound`; узел жив → `BadInput`.
-pub async fn restore_node(db: &Db, id: Id) -> Result<Node, StoreError> {
+/// Нет узла → `NotFound`; узел жив → `BadInput`; среди восстанавливаемых есть заметка `axiom`,
+/// а `author` не человек → `Certainty`.
+pub async fn restore_node(db: &Db, id: Id, author: AuthorKind) -> Result<Node, StoreError> {
     db.write(move |tx| {
         let node = load_node(tx, id)?;
         let Some(stamp) = raw_deleted_at(tx, id)? else {
@@ -80,6 +91,8 @@ pub async fn restore_node(db: &Db, id: Id) -> Result<Node, StoreError> {
             }
             restored.push(n);
         }
+        let restored_ids: Vec<Id> = restored.iter().map(|n| n.id).collect();
+        ensure_no_axiom(tx, &restored_ids, author)?;
         let mut unmark = tx.prepare_cached("UPDATE nodes SET deleted_at = NULL WHERE id = ?1")?;
         for n in &restored {
             unmark.execute([n.id])?;
@@ -101,6 +114,7 @@ pub async fn restore_node(db: &Db, id: Id) -> Result<Node, StoreError> {
                 &now,
             )?;
         }
+        crate::graph::tree_changed(tx, node.space_id, &restored_ids, &[])?;
         load_node(tx, id)
     })
     .await
@@ -129,8 +143,15 @@ pub async fn list_trash(db: &Db, space_id: Option<Id>) -> Result<Vec<Node>, Stor
 /// `context_prefix` чанков узла и потомков пересчитывается, живым индексируемым
 /// заметкам поддерева ставится `upsert` (в payload точек меняются путь и префикс).
 /// Тот же путь → узел без изменений; перенос в собственное поддерево → `BadInput`;
-/// путь занят или предок назначения — заметка → `Conflict`; нет узла или удалён → `NotFound`.
-pub async fn move_node(db: &Db, id: Id, new_path: NodePath) -> Result<Node, StoreError> {
+/// путь занят или предок назначения — заметка → `Conflict`; нет узла или удалён → `NotFound`;
+/// в поддереве (в том числе среди удалённых потомков) есть заметка `axiom`, а `author` не
+/// человек → `Certainty`.
+pub async fn move_node(
+    db: &Db,
+    id: Id,
+    new_path: NodePath,
+    author: AuthorKind,
+) -> Result<Node, StoreError> {
     db.write(move |tx| {
         let node = load_node(tx, id)?;
         if node.deleted_at.is_some() {
@@ -149,7 +170,21 @@ pub async fn move_node(db: &Db, id: Id, new_path: NodePath) -> Result<Node, Stor
                 "нельзя перенести «{old}» внутрь самого себя"
             )));
         }
+        // права (403) — раньше занятости пути (409)
+        let descendants = all_descendants(tx, node.space_id, id)?;
+        let moved: Vec<Id> = std::iter::once(id)
+            .chain(descendants.iter().map(|d| d.0))
+            .collect();
+        ensure_no_axiom(tx, &moved, author)?;
         ensure_free(tx, node.space_id, &new_path)?;
+        // прежние имена и пути: ссылки на них разрешаются заново
+        let old_keys: Vec<(String, String)> =
+            std::iter::once((node.name.clone(), node.path.clone()))
+                .chain(descendants.iter().map(|(_, p)| {
+                    let name = p.rsplit_once('/').map_or(p.as_str(), |(_, n)| n);
+                    (name.to_string(), p.clone())
+                }))
+                .collect();
         let now = fmt_ts(Timestamp::now());
         let parent = ensure_ancestors(tx, node.space_id, &new_path, &now)?;
 
@@ -158,7 +193,6 @@ pub async fn move_node(db: &Db, id: Id, new_path: NodePath) -> Result<Node, Stor
              WHERE id = ?1",
             params![id, new, new_path.name(), parent, now],
         )?;
-        let descendants = all_descendants(tx, node.space_id, id)?;
         let mut set_path = tx.prepare_cached("UPDATE nodes SET path = ?2 WHERE id = ?1")?;
         for (nid, path) in &descendants {
             let rest = path
@@ -178,25 +212,83 @@ pub async fn move_node(db: &Db, id: Id, new_path: NodePath) -> Result<Node, Stor
             refresh_prefixes(tx, &space, *nid)?;
             requeue_moved(tx, *nid, &now)?;
         }
+        // граф: относительные ссылки перенесённых заметок — от нового места; ссылки на
+        // старые и новые имена и пути пространства — заново
+        for &nid in &moved {
+            crate::graph::rebuild_moved(tx, nid, &now)?;
+        }
+        crate::graph::tree_changed(tx, node.space_id, &moved, &old_keys)?;
         load_node(tx, id)
     })
     .await
 }
 
+/// Операция над узлами `ids` (удаление, восстановление, перенос) — по матрице `certainty`:
+/// заметку `axiom` меняет только человек.
+fn ensure_no_axiom(c: &Connection, ids: &[Id], author: AuthorKind) -> Result<(), StoreError> {
+    if author == AuthorKind::Human {
+        return Ok(());
+    }
+    let mut st = c.prepare_cached("SELECT certainty FROM nodes WHERE id = ?1")?;
+    for &nid in ids {
+        let cur: Option<Certainty> = st.query_row([nid], |r| r.get(0))?;
+        check_certainty(author, cur, &CertaintyChange::ModifyOther, None, None)?;
+    }
+    Ok(())
+}
+
+/// Запрос [`subtree`] по живым потомкам: `?1` — пространство, `?2` — корень.
+/// `CROSS JOIN` — от строки очереди к детям по `(space_id, parent_id)` частичного индекса
+/// `nodes_live_children` (задача 19b M3, см. `children_sql`): при обычном `JOIN` каждый шаг
+/// просматривал все узлы пространства вместе с корзиной.
+pub(crate) const SUBTREE_SQL: &str = "WITH RECURSIVE t (id) AS (
+             SELECT ?2
+             UNION ALL
+             SELECT c.id FROM t CROSS JOIN nodes c
+             ON c.space_id = ?1 AND c.parent_id = t.id AND c.deleted_at IS NULL
+         )
+         SELECT id FROM t";
+
+/// Запрос [`subtree`] по потомкам, удалённым меткой `?3` (восстановление; порядок
+/// соединений — как в [`SUBTREE_SQL`]). Дети ищутся по `nodes_parent (space_id, parent_id)`,
+/// метка — фильтр: унарный `+` снимает `deleted_at = ?3` с индекса. Без него планировщик
+/// (статистики нет) брал частичный `nodes_deleted (deleted_at=?)` и для каждой строки
+/// очереди перебирал весь пакет удаления — восстановление K узлов стоило K² шагов
+/// (fix round 1 задачи 19b M3). `+`, а не `INDEXED BY nodes_parent`: план остаётся за
+/// планировщиком (подходящих индексов у оставшихся условий нет, кроме `nodes_parent`), а
+/// переименование индекса не превращается в ошибку запроса; план закреплён тестом
+/// `tree_walks_search_children_by_full_key`.
+pub(crate) const SUBTREE_STAMP_SQL: &str = "WITH RECURSIVE t (id) AS (
+             SELECT ?2
+             UNION ALL
+             SELECT c.id FROM t CROSS JOIN nodes c
+             ON c.space_id = ?1 AND c.parent_id = t.id AND +c.deleted_at = ?3
+         )
+         SELECT id FROM t";
+
+/// Запрос [`all_descendants`]: `?1` — пространство, `?2` — корень (порядок соединений —
+/// как в [`SUBTREE_SQL`]).
+pub(crate) const DESCENDANTS_SQL: &str = "WITH RECURSIVE t (id) AS (
+             SELECT c.id FROM nodes c WHERE c.space_id = ?1 AND c.parent_id = ?2
+             UNION ALL
+             SELECT c.id FROM t CROSS JOIN nodes c ON c.space_id = ?1 AND c.parent_id = t.id
+         )
+         SELECT n.id, n.path FROM t CROSS JOIN nodes n ON n.id = t.id";
+
 /// Сам узел и его потомки по `parent_id`, в порядке обхода в ширину.
 /// `stamp = None` — только живые потомки; `Some(t)` — удалённые меткой `t`.
 fn subtree(c: &Connection, root: &Node, stamp: Option<&str>) -> Result<Vec<Id>, StoreError> {
-    let mut st = c.prepare_cached(
-        "WITH RECURSIVE t (id) AS (
-             SELECT ?2
-             UNION ALL
-             SELECT c.id FROM nodes c JOIN t ON c.parent_id = t.id
-             WHERE c.space_id = ?1 AND c.deleted_at IS ?3
-         )
-         SELECT id FROM t",
-    )?;
-    let rows = st.query_map(params![root.space_id, root.id, stamp], |r| r.get(0))?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let rows: Vec<Id> = match stamp {
+        None => c
+            .prepare_cached(SUBTREE_SQL)?
+            .query_map(params![root.space_id, root.id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?,
+        Some(t) => c
+            .prepare_cached(SUBTREE_STAMP_SQL)?
+            .query_map(params![root.space_id, root.id, t], |r| r.get(0))?
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(rows)
 }
 
 /// Все потомки узла по `parent_id` (живые и удалённые) с их путями.
@@ -205,14 +297,7 @@ fn all_descendants(
     space_id: Id,
     root: Id,
 ) -> Result<Vec<(Id, String)>, StoreError> {
-    let mut st = c.prepare_cached(
-        "WITH RECURSIVE t (id) AS (
-             SELECT c.id FROM nodes c WHERE c.space_id = ?1 AND c.parent_id = ?2
-             UNION ALL
-             SELECT c.id FROM nodes c JOIN t ON c.parent_id = t.id WHERE c.space_id = ?1
-         )
-         SELECT n.id, n.path FROM nodes n JOIN t ON n.id = t.id",
-    )?;
+    let mut st = c.prepare_cached(DESCENDANTS_SQL)?;
     let rows = st.query_map(params![space_id, root], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
@@ -248,10 +333,10 @@ fn raw_deleted_at(c: &Connection, id: Id) -> Result<Option<String>, StoreError> 
 /// Пересчитывает `context_prefix` и `embed_key` чанков узла по его текущим пути, имени и тегам
 /// (триггер `chunks_au` обновляет FTS). У папки и удалённого узла чанков нет.
 fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), StoreError> {
-    let (path, name, fm): (String, String, Option<String>) = c.query_row(
-        "SELECT path, name, frontmatter FROM nodes WHERE id = ?1",
+    let (path, name, fm, l0): (String, String, Option<String>, Option<String>) = c.query_row(
+        "SELECT path, name, frontmatter, l0 FROM nodes WHERE id = ?1",
         [node_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     let tags = match fm.as_deref() {
         Some(s) => frontmatter_tags(s)
@@ -268,7 +353,7 @@ fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), Stor
     let mut upd =
         c.prepare_cached("UPDATE chunks SET context_prefix = ?2, embed_key = ?3 WHERE seq = ?1")?;
     for (seq, heading, text) in chunks {
-        let prefix = context_prefix(space, &path, &name, &heading, &tags);
+        let prefix = note_prefix(space, &path, &name, &heading, &tags, l0.as_deref());
         upd.execute(params![seq, prefix, embed_key_of(&prefix, &text)])?;
     }
     Ok(())

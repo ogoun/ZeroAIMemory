@@ -1,3 +1,6 @@
+---
+index: false
+---
 # Trusted proxies: getting the real client IP without letting clients spoof it
 
 Short version of a security review finding. Our app read the client address from the first

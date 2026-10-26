@@ -1,4 +1,8 @@
-//! `GET /spaces` — пространства пользователя запроса (§6.3; токену — без Human);
+//! `GET /spaces` — пространства пользователя запроса (§6.3, §11.6; токену — без Human):
+//! личные (свои решения — `role: owner`, `shared`: есть одобренные участники) и
+//! пространства чужих решений из баз владельцев (`role: member`, `access`, `owner`);
+//! `access_requests_pending` — ожидающие запросы к решениям пользователя; `human` — запрос
+//! пишет как человек (сессия WebUI или человеческий токен, §7.5).
 //! `GET /spaces/{space}/tree` — дерево узлов пространства.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
@@ -6,10 +10,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use zam_store::{NodePath, get_node_by_path, list_children, list_spaces};
+use zam_store::{AccessState, NodePath, SpaceKind, get_node_by_path, list_children, list_spaces};
 
 use super::query;
-use super::scope::{Mode, space_scope, token_can_read};
+use super::scope::{Mode, Role, readable_areas, space_scope, token_can_read};
 use crate::app::AppState;
 use crate::auth::{Principal, target_user};
 use crate::error::ApiError;
@@ -24,20 +28,67 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     let user = target_user(&st, &p, &headers).await?;
     // Human токену не виден ни в каком виде (его узлы по токену — 404)
-    let spaces: Vec<_> = list_spaces(&st.users.get(user.id).await?)
-        .await?
-        .into_iter()
-        .filter(|s| token_can_read(&p, s))
-        .collect();
-    let access = match &p {
-        Principal::Token(t) => t.access.as_str(),
-        Principal::Admin { .. } => "admin",
+    let mut spaces = Vec::new();
+    for area in readable_areas(&st, &p, &user).await? {
+        let owner = match area.role {
+            Role::Member(_) => Some(json!({
+                "id": area.owner,
+                "name": st.system.get_user(area.owner).await?.map(|u| u.name),
+            })),
+            _ => None,
+        };
+        for s in area.spaces {
+            let mut v = serde_json::to_value(&s)
+                .map_err(|e| ApiError::Internal(format!("сериализация пространства: {e}")))?;
+            let Value::Object(o) = &mut v else {
+                continue;
+            };
+            match (area.role, s.kind) {
+                (Role::Member(a), _) => {
+                    o.insert("role".into(), json!("member"));
+                    o.insert("access".into(), json!(a.as_str()));
+                    o.insert("owner".into(), owner.clone().unwrap_or(Value::Null));
+                }
+                (_, SpaceKind::Solution) => {
+                    o.insert("role".into(), json!("owner"));
+                    o.insert("shared".into(), json!(shared(&st, &s).await?));
+                }
+                _ => {
+                    o.insert("role".into(), json!("personal"));
+                }
+            }
+            spaces.push(v);
+        }
+    }
+    let pending = st.system.pending_requests_for_owner(user.id).await?;
+    let (access, human) = match &p {
+        Principal::Token(t) => (t.access.as_str(), t.human),
+        Principal::Admin { .. } => ("admin", true),
     };
     Ok(Json(json!({
         "user": { "id": user.id, "name": user.name },
         "access": access,
+        // запись как человек (§7.5): сессия WebUI или человеческий токен
+        "human": human,
         "spaces": spaces,
+        "access_requests_pending": pending,
     })))
+}
+
+/// У решения есть одобренные участники (незарегистрированное — нет).
+async fn shared(st: &AppState, s: &zam_store::Space) -> Result<bool, ApiError> {
+    let Some(guid) = s
+        .solution_guid
+        .as_deref()
+        .and_then(|g| g.parse::<zam_core::SolutionGuid>().ok())
+    else {
+        return Ok(false);
+    };
+    match st.system.list_access(&guid).await {
+        Ok(l) => Ok(l.iter().any(|e| e.state == AccessState::Approved)),
+        Err(zam_store::StoreError::NotFound) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Deserialize)]

@@ -1,6 +1,7 @@
 //! Smoke-тест комплекта: распаковка, запуск сервера, проверка API, клиента и Qdrant,
 //! векторный поиск на тестовой модели (M2), устройство модели, завершение Qdrant вместе с
-//! сервером; для Windows — статический CRT наших exe и app-local MSVC runtime библиотек.
+//! сервером; память решения (M3): регистрация решения, insight в выдаче, Vault; для
+//! Windows — статический CRT наших exe и app-local MSVC runtime библиотек.
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
 use std::collections::VecDeque;
@@ -24,6 +25,10 @@ use crate::manifest::{CudaManifest, Manifest, ModelsManifest, PLATFORMS};
 
 const TOKEN_PREFIX: &str = "ZeroAIMemoryToken=";
 const WAIT: Duration = Duration::from_secs(10);
+/// Unix: предел выхода сервера по SIGTERM — ожидание подтверждения WAL Qdrant
+/// (`qdrant.shutdown_flush_wait_ms`, до 10 с), SIGTERM Qdrant (до 10 с) и запас 10 с.
+#[cfg(unix)]
+const STOP_WAIT: Duration = Duration::from_secs(30);
 /// Предел готовности сервера при первой загрузке только что распакованного `zam-cuda`.
 const CUDA_FIRST_WAIT: Duration = Duration::from_secs(120);
 /// Предел для коротких вызовов (`zam status`, `qdrant --version`).
@@ -160,9 +165,26 @@ fn interesting(line: &str) -> bool {
 impl Server {
     /// Запускает `zam-server` из каталога `root` (комплект или target/release); stderr
     /// целиком (кроме строки с токеном) пишется в `log_file`.
-    pub(crate) fn start(root: &Path, data: &Path, env: &SmokeEnv, log_file: &Path) -> Result<Self> {
+    /// `own_group` (Windows) — своя группа процессов для Ctrl+Break ([`Self::stop_graceful`]);
+    /// Ctrl+C терминала до сервера тогда не доходит. Процесс в любом случае назначается в
+    /// Job Object xtask ([`crate::procjob`]): аварийный выход xtask не оставляет сирот.
+    pub(crate) fn start(
+        root: &Path,
+        data: &Path,
+        env: &SmokeEnv,
+        log_file: &Path,
+        own_group: bool,
+    ) -> Result<Self> {
         let mut cmd =
             Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")));
+        #[cfg(windows)]
+        if own_group {
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        #[cfg(not(windows))]
+        let _ = own_group;
         let mut child = scrub_zam_env(&mut cmd, &["ZAM_ADMIN_PASSWORD"])
             .args(["serve", "--data-dir"])
             .arg(data)
@@ -175,6 +197,7 @@ impl Server {
             .stderr(Stdio::piped())
             .spawn()
             .context("запуск zam-server")?;
+        crate::procjob::adopt(&child);
         let stderr = child.stderr.take().context("stderr сервера")?;
         let mut file =
             File::create(log_file).with_context(|| format!("создание {}", log_file.display()))?;
@@ -223,10 +246,13 @@ impl Server {
                 .status();
             let t0 = Instant::now();
             while self.child.try_wait()?.is_none() {
-                if t0.elapsed() > WAIT {
+                if t0.elapsed() > STOP_WAIT {
                     self.child.kill()?;
                     self.child.wait()?;
-                    bail!("сервер не завершился по SIGTERM за 10 с, убит принудительно");
+                    bail!(
+                        "сервер не завершился по SIGTERM за {} с, убит принудительно",
+                        STOP_WAIT.as_secs()
+                    );
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -242,6 +268,54 @@ impl Server {
             bail!("сервер завершился с кодом {st} после SIGTERM");
         }
         let _ = st;
+        Ok(())
+    }
+}
+
+impl Server {
+    /// Штатная остановка с ожиданием выхода не дольше `limit`: Unix — SIGTERM, Windows —
+    /// Ctrl+Break группе процессов сервера (`GenerateConsoleCtrlEvent`; нужна общая консоль с
+    /// xtask). Возвращает время до выхода; не вышел за `limit` — убивается, ошибка.
+    pub(crate) fn stop_graceful(&mut self, limit: Duration) -> Result<Duration> {
+        let t0 = Instant::now();
+        let pid = self.child.id();
+        #[cfg(unix)]
+        {
+            let st = Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status()?;
+            if !st.success() {
+                bail!("kill -TERM {pid}: {st}");
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+            // SAFETY: вызов WinAPI без указателей; pid — группа процессов, созданная при
+            // запуске сервера (CREATE_NEW_PROCESS_GROUP).
+            unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) }
+                .map_err(|e| anyhow!("Ctrl+Break серверу {pid}: {e}"))?;
+        }
+        while self.child.try_wait()?.is_none() {
+            if t0.elapsed() > limit {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                bail!(
+                    "сервер не завершился за {} с после штатной остановки, убит",
+                    limit.as_secs()
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(t0.elapsed())
+    }
+
+    /// Жёсткое завершение (TerminateProcess / SIGKILL); Qdrant завершается вместе с сервером
+    /// (Job Object / PDEATHSIG).
+    pub(crate) fn kill(&mut self) -> Result<()> {
+        self.child.kill()?;
+        self.child.wait()?;
         Ok(())
     }
 }
@@ -653,7 +727,7 @@ pub fn run(
     let server_log = dir.join("zam-server.stderr.log");
     let mut srv = s.run(
         "запуск zam-server",
-        Server::start(&root, &data, &env, &server_log),
+        Server::start(&root, &data, &env, &server_log, false),
     )?;
     if cuda_archive.is_some() {
         // сервер отвечает на /health после загрузки модели, а с CUDA — после загрузки
@@ -714,6 +788,21 @@ pub fn run(
                 srv.log_tail()
             )
         }),
+    )?;
+    s.run("M3: регистрация решения", register_solution(&base, &token))?;
+    s.run(
+        "M3: insight-гипотеза в top-3 поиска по решению",
+        insight_found(&zam, &dir, &base, &token).map_err(|e| {
+            anyhow!(
+                "{e:#}\nstderr сервера (целиком — {}):\n{}",
+                server_log.display(),
+                srv.log_tail()
+            )
+        }),
+    )?;
+    s.run(
+        "M3: zam vault set → get возвращает то же значение",
+        vault_roundtrip(&zam, &dir, &base, &token),
     )?;
     s.run(
         "Qdrant запущен сервером (pid-файл, qdrant status --json)",
@@ -1008,11 +1097,7 @@ fn vector_search(
             )
         })?;
     let sources = item["sources"].to_string();
-    let channels: Vec<&str> = item["sources"]
-        .as_array()
-        .map(|s| s.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    if channels != ["vector"] {
+    if channels(item) != ["vector"] {
         bail!(
             "{VECTOR_TARGET} должен найтись только векторным каналом (у перефраза нет общих \
              с заметкой подстрок для fts и trigram): sources = {sources}"
@@ -1056,6 +1141,172 @@ fn vector_search(
         model,
         waited,
     })
+}
+
+// ---- M3: память решения ----
+
+/// GUID решения smoke-теста (`agent_solution_id`).
+const SMOKE_SOLUTION: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e99";
+
+/// Insight smoke-теста: заголовок, текст и запрос (английский — тестовая модель англоязычная).
+const INSIGHT_TITLE: &str = "Shell scripts need LF line endings";
+const INSIGHT_BODY: &str = "Scripts saved with CRLF fail with bad interpreter errors on Linux.";
+const INSIGHT_QUERY: &str = "bad interpreter error in shell scripts";
+
+/// Значение секрета smoke-теста (только stdin `zam vault set`, не аргументы).
+const SMOKE_SECRET: &str = "smoke-vault-value-5f2c9e";
+
+/// Критерий M3: `POST /solutions` регистрирует решение (201).
+fn register_solution(base: &str, token: &str) -> Result<()> {
+    let body = serde_json::json!({ "agent_solution_id": SMOKE_SOLUTION, "name": "smoke" });
+    let (status, v) = api(base, token, "/api/v1/solutions", Some(&body))?;
+    if status != 201 {
+        bail!("POST /api/v1/solutions: HTTP {status}: {v}");
+    }
+    if v["role"] != "owner" || v["kind"] != "solution" {
+        bail!(
+            "решение зарегистрировано не владельцем: role = {}, kind = {}",
+            v["role"],
+            v["kind"]
+        );
+    }
+    Ok(())
+}
+
+/// Каналы поиска (`sources`) элемента выдачи.
+fn channels(item: &Value) -> Vec<&str> {
+    item["sources"]
+        .as_array()
+        .map(|s| s.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Критерий M3: `zam log insight --certainty hypothesis` → поиск по решению находит запись
+/// в top-3 с `kind = insight` и `certainty = hypothesis` (ожидание индексации ≤ 60 с), и
+/// находит её в том числе векторный канал (`sources ∋ vector`): запрос пересекается с
+/// заголовком по словам, одного FTS хватило бы, а шаг проверяет векторизацию записей.
+fn insight_found(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let home = dir.join("insight-home");
+    fs::create_dir_all(&home)?;
+    zam_ok(
+        zam,
+        &home,
+        base,
+        token,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            INSIGHT_TITLE,
+            "--certainty",
+            "hypothesis",
+            "--solution",
+            SMOKE_SOLUTION,
+        ],
+        Some(INSIGHT_BODY.as_bytes()),
+    )?;
+    let body = serde_json::json!({
+        "query": INSIGHT_QUERY,
+        "scope": { "solution": SMOKE_SOLUTION },
+        "top_k": 3,
+    });
+    let t0 = Instant::now();
+    let found = loop {
+        let (status, v) = api(base, token, "/api/v1/search", Some(&body))?;
+        if status != 200 {
+            bail!("POST /api/v1/search: HTTP {status}");
+        }
+        if v["degraded"] == false && v["pending_count"] == 0 {
+            break v;
+        }
+        if t0.elapsed() > INDEX_WAIT {
+            bail!(
+                "за {} с insight не проиндексирован или поиск деградирован: degraded = {}, \
+                 degraded_reason = {}, pending_count = {}",
+                INDEX_WAIT.as_secs(),
+                v["degraded"],
+                v["degraded_reason"],
+                v["pending_count"]
+            );
+        }
+        thread::sleep(Duration::from_millis(500));
+    };
+    let items = found["items"]
+        .as_array()
+        .context("в ответе поиска нет items")?;
+    let hit = items
+        .iter()
+        .take(3)
+        .find(|i| i["title"] == INSIGHT_TITLE)
+        .with_context(|| {
+            format!(
+                "«{INSIGHT_QUERY}» не нашёл insight в top-3: {}",
+                describe_items(&found)
+            )
+        })?;
+    if hit["kind"] != "insight" || hit["certainty"] != "hypothesis" {
+        bail!(
+            "найденная запись: kind = {}, certainty = {} (ожидались insight и hypothesis)",
+            hit["kind"],
+            hit["certainty"]
+        );
+    }
+    if !channels(hit).contains(&"vector") {
+        bail!(
+            "insight найден без векторного канала (запись не векторизована?): sources = {}",
+            hit["sources"]
+        );
+    }
+    Ok(())
+}
+
+/// Критерий M3: `zam vault set` (значение из stdin) → `zam vault get --raw` возвращает то же
+/// значение; в выводе `set` значения нет.
+fn vault_roundtrip(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let home = dir.join("vault-home");
+    fs::create_dir_all(&home)?;
+    let run = |args: &[&str], input: Option<&[u8]>| zam_ok(zam, &home, base, token, args, input);
+    let set = run(
+        &[
+            "vault",
+            "set",
+            "smoke-key",
+            "--type",
+            "token",
+            "--solution",
+            SMOKE_SOLUTION,
+        ],
+        Some(SMOKE_SECRET.as_bytes()),
+    )?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&set.stdout),
+        String::from_utf8_lossy(&set.stderr)
+    );
+    if text.contains(SMOKE_SECRET) {
+        bail!("вывод zam vault set содержит значение");
+    }
+    let got = run(
+        &[
+            "vault",
+            "get",
+            "smoke-key",
+            "--raw",
+            "--solution",
+            SMOKE_SOLUTION,
+        ],
+        None,
+    )?;
+    if got.stdout != SMOKE_SECRET.as_bytes() {
+        bail!(
+            "zam vault get вернул другое значение ({} байт вместо {})",
+            got.stdout.len(),
+            SMOKE_SECRET.len()
+        );
+    }
+    Ok(())
 }
 
 /// `zam-server qdrant status --json` по каталогу данных: pid-файл указывает на живой процесс
@@ -1310,6 +1561,14 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn channels_of_item() {
+        let it = serde_json::json!({"sources": ["fts", "vector"]});
+        assert_eq!(channels(&it), ["fts", "vector"]);
+        assert!(channels(&serde_json::json!({})).is_empty());
+        assert!(channels(&serde_json::json!({"sources": "vector"})).is_empty());
     }
 
     #[test]

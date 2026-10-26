@@ -23,3 +23,10 @@ rusqlite.workspace = true
 half.workspace = true
 # проверка набора eval: стемминг Snowball ru/en
 rust-stemmers.workspace = true
+
+# Windows: штатная остановка сервера в bench --scenario first-start (Ctrl+Break группе
+# процессов, GenerateConsoleCtrlEvent) и Job Object xtask, завершающий дочерние процессы при
+# аварийном выходе xtask (procjob.rs; JOBOBJECT_EXTENDED_LIMIT_INFORMATION в windows 0.62 —
+# за фичей Win32_System_Threading); крейт уже в дереве (MIT OR Apache-2.0)
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }

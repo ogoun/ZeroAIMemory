@@ -44,6 +44,20 @@ graph TD
 [^1]: Текст сноски.
 `;
 
+const ELK_NOTE = `# Диаграмма ELK
+
+\`\`\`mermaid
+---
+config:
+  layout: elk
+---
+graph TD
+  A[Старт ELK] --> B{Проверка}
+  B -->|да| C[Готово]
+  B -->|нет| A
+\`\`\`
+`;
+
 const SECOND_NOTE = `# Вторая заметка
 
 ${'Абзац для прокрутки. '.repeat(40)}
@@ -125,7 +139,7 @@ const json = (body: unknown): RequestInit => ({
 });
 
 /** Создаёт заметки; возвращает их id. */
-export async function seed(base: string, token: string): Promise<{ media: string; second: string }> {
+export async function seed(base: string, token: string): Promise<{ media: string; second: string; elk: string }> {
   const second = await api<Node>(base, token, 'POST', 'nodes', json({
     space: 'knowledge',
     path: 'E2E/Вторая заметка',
@@ -147,5 +161,121 @@ export async function seed(base: string, token: string): Promise<{ media: string
     headers: { 'Content-Type': 'application/json', 'If-Match': String(media.current_rev) },
     body: JSON.stringify({ content: MEDIA_NOTE(blob.link) }),
   });
-  return { media: media.id, second: second.id };
+  // диаграмма с раскладкой ELK — отдельной заметкой: ленивый чанк ELK не должен грузиться в других сценариях
+  const elk = await api<Node>(base, token, 'POST', 'nodes', json({
+    space: 'knowledge',
+    path: 'E2E/Диаграмма ELK',
+    kind: 'note',
+    content: ELK_NOTE,
+  }));
+  return { media: media.id, second: second.id, elk: elk.id };
+}
+
+// ---- журналы решения, Vault и совместный доступ (M3) ----
+
+/** GUID решения E2E (каталог данных пересоздаётся на каждый прогон). */
+export const SOLUTION_GUID = '0e2e0000-0000-4000-8000-000000000013';
+export const SOLUTION_NAME = 'E2E решение';
+/** Значение секрета Vault: должно показываться только по «Показать». */
+export const VAULT_SECRET = 'e2e-vault-value-7Qm2';
+export const MEMBER_NAME = 'e2e-member';
+/** Второй запросивший доступ — для отклонения с причиной. */
+export const GUEST_NAME = 'e2e-guest';
+
+/** Запрос от имени администратора (cookie-сессия + CSRF): админ-API токеном недоступно. */
+export type AdminCall = <T>(method: string, path: string, body?: unknown) => Promise<T>;
+
+export interface JournalSeed {
+  /** Insight для замещения. */
+  oldInsight: string;
+  /** Гипотеза для повышения до theorem. */
+  hypothesis: string;
+  memberId: string;
+  memberToken: string;
+  guestToken: string;
+}
+
+interface EntryResp {
+  id: string;
+}
+
+/**
+ * Решение администратора с журналами (changelog разных видов и областей, два релиза, insights
+ * разной надёжности), секрет Vault и второй пользователь с запросом доступа к решению.
+ * Записи — по токену администратора (агент): hypothesis по умолчанию, theorem — с evidence.
+ */
+export async function seedJournals(base: string, token: string, admin: AdminCall): Promise<JournalSeed> {
+  const post = <T>(path: string, body: unknown) => api<T>(base, token, 'POST', path, json(body));
+  const sp = `spaces/${SOLUTION_GUID}`;
+  await post('solutions', { agent_solution_id: SOLUTION_GUID, name: SOLUTION_NAME });
+
+  const changelog = (title: string, kind: string, area: string, body = '') =>
+    post<EntryResp>(`${sp}/entries`, { kind: 'changelog', title, body, area, data: { kind } });
+  await changelog('Добавлен экспорт в Markdown', 'feat', 'web', 'Кнопка «Экспорт» в меню заметки.');
+  await post<EntryResp>(`${sp}/entries`, {
+    kind: 'release',
+    title: 'Релиз 0.1.0',
+    body: 'Первый релиз.\nЭкспорт заметок.\n',
+    data: { version: '0.1.0', date: '2026-10-01' },
+  });
+  await changelog('Исправлен CRLF в хэше', 'fix', 'store');
+  await changelog('Описан формат журналов', 'docs', 'web');
+  await post<EntryResp>(`${sp}/entries`, {
+    kind: 'release',
+    title: 'Релиз 0.2.0',
+    body: 'Первый релиз.\nИсправления хранилища.\n',
+    data: {
+      version: '0.2.0',
+      date: '2026-10-20',
+      git_tag: 'v0.2.0',
+      commits: [
+        { sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678', subject: 'fix(store): CRLF' },
+        { sha: 'b2c3d4e5f60718293a4b5c6d7e8f901234567890', subject: 'docs: журналы' },
+      ],
+    },
+  });
+
+  const insight = (title: string, kind: string, extra: Record<string, unknown> = {}) =>
+    post<{ id: string }>(`${sp}/entries`, {
+      kind: 'insight',
+      title,
+      body: `${title}: подробности.`,
+      area: 'index',
+      ...extra,
+      data: { kind, ...((extra.data as object) ?? {}) },
+    });
+  const hyp = await insight('Кэш эмбеддингов ускоряет переиндексацию', 'discovery', { tags: ['perf'] });
+  await insight('CRLF ломает хэш содержимого', 'gotcha', {
+    certainty: 'theorem',
+    data: { evidence: { checked: 'хэш файла с CRLF и LF', method: 'тест store', result: 'хэши различаются' } },
+  });
+  const old = await insight('Старый вывод о Qdrant', 'decision');
+
+  await api(base, token, 'POST', `${sp}/vault`, json({
+    title: 'E2E токен деплоя',
+    data: { type: 'token', username: 'deploy-bot', url: 'https://deploy.example.test' },
+    secret: VAULT_SECRET,
+  }));
+
+  // ещё два пользователя запрашивают доступ к решению: 202 pending
+  const requester = async (name: string) => {
+    const u = await admin<{ user: { id: string }; token: { plaintext: string } }>('POST', 'admin/users', { name });
+    const r = await fetch(`${base}api/v1/solutions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${u.token.plaintext}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_solution_id: SOLUTION_GUID, name: SOLUTION_NAME }),
+    });
+    if (r.status !== 202) throw new Error(`запрос доступа ${name}: HTTP ${r.status} ${await r.text()}`);
+    return u;
+  };
+  const member = await requester(MEMBER_NAME);
+  const guest = await requester(GUEST_NAME);
+
+  return {
+    oldInsight: old.id,
+    hypothesis: hyp.id,
+    memberId: member.user.id,
+    memberToken: member.token.plaintext,
+    guestToken: guest.token.plaintext,
+  };
 }

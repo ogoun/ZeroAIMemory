@@ -32,6 +32,12 @@ pub fn command() -> Command {
     cmd
 }
 
+/// Сессия администратора WebUI: cookie `zam_session=…` и CSRF-токен.
+pub struct AdminWeb {
+    pub cookie: String,
+    pub csrf: String,
+}
+
 /// Дочерний `zam-server serve`; в `Drop` завершается жёстко.
 pub struct ServerProc {
     child: Child,
@@ -157,6 +163,16 @@ impl ServerProc {
 
     /// Вход администратора (пароль первого старта): значение cookie `zam_session`.
     pub fn admin_session(&self) -> String {
+        let web = self.admin_login();
+        web.cookie
+            .strip_prefix("zam_session=")
+            .unwrap_or(&web.cookie)
+            .to_string()
+    }
+
+    /// Вход администратора (пароль первого старта): cookie `zam_session=…` и CSRF-токен
+    /// для изменяющих запросов WebUI.
+    pub fn admin_login(&self) -> AdminWeb {
         let (code, head, v) = http_with(
             self.addr,
             "POST",
@@ -164,19 +180,82 @@ impl ServerProc {
             &[],
             Some(&serde_json::json!({"login": "admin", "password": PASSWORD})),
         )
-        .unwrap_or_else(|e| panic!("вход администратора: {e}\nstderr:\n{}", self.tail()));
+        .unwrap_or_else(|e| self.fail("вход администратора", e));
         assert_eq!(code, 200, "вход администратора: {v}");
-        head.lines()
+        let cookie = head
+            .lines()
             .filter_map(|l| l.split_once(':'))
             .filter(|(k, _)| k.trim().eq_ignore_ascii_case("set-cookie"))
             .find_map(|(_, c)| {
                 c.trim()
                     .split(';')
                     .next()
-                    .and_then(|kv| kv.trim().strip_prefix("zam_session="))
-                    .map(str::to_string)
+                    .filter(|kv| kv.trim().starts_with("zam_session="))
+                    .map(|kv| kv.trim().to_string())
             })
-            .unwrap_or_else(|| panic!("нет cookie zam_session: {head}"))
+            .unwrap_or_else(|| panic!("нет cookie zam_session: {head}"));
+        let csrf = v["csrf"]
+            .as_str()
+            .unwrap_or_else(|| panic!("нет csrf: {v}"))
+            .to_string();
+        AdminWeb { cookie, csrf }
+    }
+
+    /// Запрос администратора WebUI (cookie и CSRF); `user` — `X-Zam-User`.
+    pub fn admin_call(
+        &self,
+        web: &AdminWeb,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        user: Option<&str>,
+    ) -> (u16, Value) {
+        let mut h = vec![
+            ("Cookie", web.cookie.as_str()),
+            ("X-CSRF-Token", web.csrf.as_str()),
+        ];
+        if let Some(u) = user {
+            h.push(("X-Zam-User", u));
+        }
+        http_with(self.addr, method, path, &h, body)
+            .map(|(code, _, v)| (code, v))
+            .unwrap_or_else(|e| self.fail(&format!("{method} {path}"), e))
+    }
+
+    /// Запрос с токеном и дополнительными заголовками (`X-Zam-Session`, `If-Match` …).
+    pub fn call_h(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: Option<&Value>,
+        extra: &[(&str, &str)],
+    ) -> (u16, Value) {
+        let auth = format!("Bearer {token}");
+        let mut h = vec![("Authorization", auth.as_str())];
+        h.extend_from_slice(extra);
+        http_with(self.addr, method, path, &h, body)
+            .map(|(code, _, v)| (code, v))
+            .unwrap_or_else(|e| self.fail(&format!("{method} {path}"), e))
+    }
+
+    /// Запрос с токеном и сырым телом (`multipart/form-data`); ответ — сырые байты.
+    pub fn call_bytes(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: Option<(&str, &[u8])>,
+    ) -> (u16, Vec<u8>) {
+        let auth = format!("Bearer {token}");
+        http_bytes(self.addr, method, path, &[("Authorization", &auth)], body)
+            .map(|(code, _, b)| (code, b))
+            .unwrap_or_else(|e| self.fail(&format!("{method} {path}"), e))
+    }
+
+    /// Паника «что: ошибка» с хвостом stderr сервера.
+    fn fail(&self, what: &str, e: std::io::Error) -> ! {
+        panic!("{what}: {e}\nstderr:\n{}", self.tail())
     }
 
     /// GET в сессии администратора (`session` — из [`ServerProc::admin_session`]).
@@ -233,19 +312,46 @@ pub fn http_with(
     headers: &[(&str, &str)],
     body: Option<&Value>,
 ) -> std::io::Result<(u16, String, Value)> {
+    let payload = body.map(Value::to_string);
+    let raw = payload
+        .as_deref()
+        .map(|p| ("application/json", p.as_bytes()));
+    let (code, head, body) = http_bytes(addr, method, path, headers, raw)?;
+    let v = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            std::io::Error::other(format!(
+                "не JSON ({e}), код {code}: {}",
+                String::from_utf8_lossy(&body)
+            ))
+        })?
+    };
+    Ok((code, head, v))
+}
+
+/// Один HTTP/1.1-запрос с `Connection: close` и сырым телом `(Content-Type, байты)`;
+/// ответ — (код, заголовки ответа как есть, тело байтами).
+pub fn http_bytes(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<(&str, &[u8])>,
+) -> std::io::Result<(u16, String, Vec<u8>)> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     s.set_read_timeout(Some(Duration::from_secs(60)))?;
-    let payload = body.map(Value::to_string).unwrap_or_default();
+    let payload: &[u8] = body.map_or(&[], |(_, b)| b);
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
-    if body.is_some() {
-        req.push_str("Content-Type: application/json\r\n");
+    if let Some((ct, _)) = body {
+        req.push_str(&format!("Content-Type: {ct}\r\n"));
     }
     req.push_str(&format!("Content-Length: {}\r\n\r\n", payload.len()));
     s.write_all(req.as_bytes())?;
-    s.write_all(payload.as_bytes())?;
+    s.write_all(payload)?;
     let mut raw = Vec::new();
     s.read_to_end(&mut raw)?;
     let split = raw
@@ -295,15 +401,5 @@ pub fn http_with(
     } else {
         body.extend_from_slice(rest);
     }
-    let v = if body.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&body).map_err(|e| {
-            std::io::Error::other(format!(
-                "не JSON ({e}), код {code}: {}",
-                String::from_utf8_lossy(&body)
-            ))
-        })?
-    };
-    Ok((code, head_raw, v))
+    Ok((code, head_raw, body))
 }

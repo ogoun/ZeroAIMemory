@@ -19,7 +19,8 @@
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params};
-use zam_core::Id;
+use serde::Serialize;
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::ChunkLevel;
 
 use crate::paths::path_ancestors;
@@ -78,15 +79,48 @@ impl FromSql for JobOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub id: i64,
-    /// Узел (`target_kind = 'node'`).
+    /// Вид цели: узел (`target_kind = 'node'`) или запись журнала (`'entry'`, M3).
+    pub target_kind: TargetKind,
+    /// Узел или запись.
     pub target_id: Id,
-    /// Ревизия узла на момент постановки.
+    /// Ревизия цели на момент постановки.
     pub rev: i64,
     pub op: JobOp,
     /// Неудачных попыток до этой выдачи.
     pub attempts: i64,
     /// Номер выдачи: передаётся в [`complete_job`] и [`fail_job`].
     pub claim_gen: i64,
+}
+
+impl Job {
+    /// Цель задания.
+    pub fn target(&self) -> TargetRef {
+        TargetRef {
+            kind: self.target_kind,
+            id: self.target_id,
+        }
+    }
+}
+
+/// `index_jobs.target_kind` цели.
+pub(crate) fn target_kind_sql(k: TargetKind) -> &'static str {
+    match k {
+        TargetKind::Node => "node",
+        TargetKind::Entry => "entry",
+    }
+}
+
+/// Вид цели из `index_jobs.target_kind`.
+fn parse_target_kind(s: &str) -> rusqlite::Result<TargetKind> {
+    match s {
+        "node" => Ok(TargetKind::Node),
+        "entry" => Ok(TargetKind::Entry),
+        other => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("неизвестный вид цели задания: {other}").into(),
+        )),
+    }
 }
 
 /// Чем закончилось [`complete_job`] или [`fail_job`].
@@ -117,8 +151,9 @@ pub struct JobStats {
     pub oldest: Option<Timestamp>,
 }
 
-/// Состояние векторной индексации узла (`nodes.index_state`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Состояние векторной индексации узла или записи (`index_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum IndexState {
     Pending,
     Indexed,
@@ -137,6 +172,20 @@ impl IndexState {
     }
 }
 
+impl FromSql for IndexState {
+    fn column_result(v: ValueRef<'_>) -> FromSqlResult<Self> {
+        match v.as_str()? {
+            "pending" => Ok(IndexState::Pending),
+            "indexed" => Ok(IndexState::Indexed),
+            "failed" => Ok(IndexState::Failed),
+            "excluded" => Ok(IndexState::Excluded),
+            other => Err(rusqlite::types::FromSqlError::Other(
+                format!("неизвестное состояние индексации: {other}").into(),
+            )),
+        }
+    }
+}
+
 /// Поля узла для payload точек Qdrant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePayload {
@@ -147,9 +196,27 @@ pub struct NodePayload {
     pub path: String,
     /// Все префиксы пути по сегментам, включая сам путь: `a`, `a/b`, `a/b/c`.
     pub path_ancestors: Vec<String>,
-    /// Теги из frontmatter.
+    /// Теги из frontmatter (у записи журнала — её теги), значения секретов замаскированы.
     pub tags: Vec<String>,
+    /// Область (`nodes.area` / `entries.area`).
+    pub area: Option<String>,
     pub updated_at: Timestamp,
+    /// `certainty` заметки (`nodes.certainty`, §7.5); у записи журнала — в [`EntryPayload`].
+    pub certainty: Option<String>,
+}
+
+/// Поля записи журнала для payload точек Qdrant (M3). Чанк записи несёт их вместо узла:
+/// точка получает `entry_id` и эти поля ([`crate::entry_chunks_for_index`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryPayload {
+    pub entry_id: Id,
+    /// `insight` / `changelog` / `release`.
+    pub kind: String,
+    pub status: Option<String>,
+    /// Вид инсайта (`data.kind`).
+    pub insight_kind: Option<String>,
+    pub certainty: Option<String>,
+    pub area: Option<String>,
 }
 
 /// Чанк для построения точки Qdrant.
@@ -169,7 +236,10 @@ pub struct IndexChunk {
     pub token_count: i64,
     /// Ревизия, по которой построен чанк.
     pub rev: i64,
+    /// Поля цели для payload. У записи журнала `node_id` — id записи, `path` пуст.
     pub node: NodePayload,
+    /// Поля записи журнала; `None` — чанк заметки.
+    pub entry: Option<EntryPayload>,
 }
 
 /// Ставит задание `op` для узла, заменяя его активное задание (если есть):
@@ -183,14 +253,28 @@ pub(crate) fn enqueue(
     priority: i64,
     now: &str,
 ) -> Result<(), StoreError> {
+    enqueue_target(c, TargetKind::Node, node, rev, op, priority, now)
+}
+
+/// [`enqueue`] для цели любого вида (узел или запись журнала).
+pub(crate) fn enqueue_target(
+    c: &Connection,
+    kind: TargetKind,
+    id: Id,
+    rev: i64,
+    op: JobOp,
+    priority: i64,
+    now: &str,
+) -> Result<(), StoreError> {
+    let kind = target_kind_sql(kind);
     let queued = c
         .prepare_cached(
             "UPDATE index_jobs
              SET rev = ?2, op = ?3, attempts = 0, last_error = NULL,
                  priority = max(priority, ?4), not_before = ?5, updated_at = ?5
-             WHERE target_kind = 'node' AND target_id = ?1 AND state = 'queued'",
+             WHERE target_kind = ?6 AND target_id = ?1 AND state = 'queued'",
         )?
-        .execute(params![node, rev, op, priority, now])?;
+        .execute(params![id, rev, op, priority, now, kind])?;
     if queued > 0 {
         return Ok(());
     }
@@ -198,18 +282,18 @@ pub(crate) fn enqueue(
         .prepare_cached(
             "UPDATE index_jobs
              SET rev = ?2, op = ?3, dirty = 1, priority = max(priority, ?4), updated_at = ?5
-             WHERE target_kind = 'node' AND target_id = ?1 AND state = 'running'",
+             WHERE target_kind = ?6 AND target_id = ?1 AND state = 'running'",
         )?
-        .execute(params![node, rev, op, priority, now])?;
+        .execute(params![id, rev, op, priority, now, kind])?;
     if running > 0 {
         return Ok(());
     }
     c.prepare_cached(
         "INSERT INTO index_jobs (target_kind, target_id, rev, op, state, attempts,
                                  priority, not_before, enqueued_at, updated_at)
-         VALUES ('node', ?1, ?2, ?3, 'queued', 0, ?4, ?5, ?5, ?5)",
+         VALUES (?6, ?1, ?2, ?3, 'queued', 0, ?4, ?5, ?5, ?5)",
     )?
-    .execute(params![node, rev, op, priority, now])?;
+    .execute(params![id, rev, op, priority, now, kind])?;
     Ok(())
 }
 
@@ -225,7 +309,7 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
         let now = fmt_ts(now);
         let mut jobs: Vec<Job> = {
             let mut st = tx.prepare_cached(
-                "SELECT id, target_id, rev, op, attempts FROM index_jobs
+                "SELECT id, target_id, rev, op, attempts, target_kind FROM index_jobs
                  WHERE state = 'queued' AND not_before <= ?1
                  ORDER BY priority DESC, id
                  LIMIT ?2",
@@ -233,6 +317,7 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
             st.query_map(params![now, limit], |r| {
                 Ok(Job {
                     id: r.get(0)?,
+                    target_kind: parse_target_kind(&r.get::<_, String>(5)?)?,
                     target_id: r.get(1)?,
                     rev: r.get(2)?,
                     op: r.get(3)?,
@@ -255,17 +340,21 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
     .await
 }
 
-/// Строка задания текущей выдачи: `(target_id, rev, op, attempts, dirty)`.
-type ClaimedRow = (Id, i64, JobOp, i64, bool);
+/// Строка задания текущей выдачи: `(цель, rev, op, attempts, dirty)`.
+type ClaimedRow = (TargetRef, i64, JobOp, i64, bool);
 
 /// Строка задания текущей выдачи; `None` — выдача устарела.
 fn claimed(c: &Connection, id: i64, claim_gen: i64) -> Result<Option<ClaimedRow>, StoreError> {
     Ok(c.prepare_cached(
-        "SELECT target_id, rev, op, attempts, dirty FROM index_jobs
+        "SELECT target_id, rev, op, attempts, dirty, target_kind FROM index_jobs
          WHERE id = ?1 AND claim_gen = ?2 AND state = 'running'",
     )?
     .query_row(params![id, claim_gen], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        let target = TargetRef {
+            kind: parse_target_kind(&r.get::<_, String>(5)?)?,
+            id: r.get(0)?,
+        };
+        Ok((target, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
     })
     .optional()?)
 }
@@ -298,8 +387,8 @@ pub async fn complete_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome
             return requeue_dirty(tx, id, &fmt_ts(Timestamp::now()));
         }
         tx.execute("DELETE FROM index_jobs WHERE id = ?1", [id])?;
-        if op == JobOp::Upsert && !has_active_job(tx, node)? {
-            set_state(tx, node, rev, IndexState::Indexed)?;
+        if op == JobOp::Upsert && !has_active_target(tx, node)? {
+            set_target_state(tx, node, rev, IndexState::Indexed)?;
         }
         Ok(JobOutcome::Done)
     })
@@ -308,12 +397,23 @@ pub async fn complete_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome
 
 /// У узла есть задание `queued` или `running`.
 fn has_active_job(c: &Connection, node: Id) -> Result<bool, StoreError> {
+    has_active_target(
+        c,
+        TargetRef {
+            kind: TargetKind::Node,
+            id: node,
+        },
+    )
+}
+
+/// У цели есть задание `queued` или `running`.
+pub(crate) fn has_active_target(c: &Connection, t: TargetRef) -> Result<bool, StoreError> {
     Ok(c.prepare_cached(
         "SELECT EXISTS (SELECT 1 FROM index_jobs
-                        WHERE target_kind = 'node' AND target_id = ?1
+                        WHERE target_kind = ?2 AND target_id = ?1
                           AND state IN ('queued', 'running'))",
     )?
-    .query_row([node], |r| r.get(0))?)
+    .query_row(params![t.id, target_kind_sql(t.kind)], |r| r.get(0))?)
 }
 
 /// Задержка повтора после `attempts`-й неудачи, секунд.
@@ -358,7 +458,7 @@ pub async fn fail_job(
                 params![id, attempts, err, stamp],
             )?;
             if op == JobOp::Upsert {
-                set_state(tx, node, rev, IndexState::Failed)?;
+                set_target_state(tx, node, rev, IndexState::Failed)?;
             }
             return Ok(JobOutcome::Failed);
         }
@@ -393,13 +493,15 @@ pub async fn release_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome,
     .await
 }
 
-/// Число живых заметок с `index_state = 'indexed'`: есть ли что терять, если коллекция
-/// Qdrant создана заново (тогда нужен reindex из `embeddings`).
+/// Число живых заметок и записей журналов с `index_state = 'indexed'`: есть ли что
+/// терять, если коллекция Qdrant создана заново (тогда нужен reindex из `embeddings`).
 pub async fn indexed_count(db: &Db) -> Result<i64, StoreError> {
     db.read(|c| {
         Ok(c.query_row(
-            "SELECT count(*) FROM nodes
-             WHERE kind = 'note' AND index_state = 'indexed' AND deleted_at IS NULL",
+            "SELECT (SELECT count(*) FROM nodes
+                     WHERE kind = 'note' AND index_state = 'indexed' AND deleted_at IS NULL)
+                  + (SELECT count(*) FROM entries
+                     WHERE index_state = 'indexed' AND deleted_at IS NULL)",
             [],
             |r| r.get(0),
         )?)
@@ -422,21 +524,24 @@ pub async fn requeue_running(db: &Db) -> Result<u64, StoreError> {
     .await
 }
 
-/// Перечанковывает живые заметки пространства `space` (`None` — всех) текущим
-/// счётчиком токенов и ставит `upsert` индексируемым (не Human, не `index: false`)
-/// с низким приоритетом. Узел с активным заданием получает одно задание, не два.
+/// Перечанковывает живые заметки и записи журналов пространства `space` (`None` — всех)
+/// текущим счётчиком токенов и ставит `upsert` индексируемым (не Human, не `index: false`)
+/// с низким приоритетом. Цель с активным заданием получает одно задание, не два.
 /// Возвращает число поставленных `upsert`. Идёт пакетами по отдельным транзакциям.
-/// Перечанковка всей базы точным счётчиком снимает отметку «чанки по оценке».
+/// Перечанковка всей базы точным счётчиком снимает отметку «чанки по оценке» и ставит
+/// текущий отпечаток нарезки.
 pub async fn enqueue_reindex(db: &Db, space: Option<Id>) -> Result<u64, StoreError> {
-    let (_, jobs) = crate::nodes::rechunk_notes(db, space, PRIORITY_REINDEX).await?;
+    let (_, mut jobs) = crate::nodes::rechunk_notes(db, space, PRIORITY_REINDEX, false).await?;
+    jobs += crate::entries::rechunk_entries(db, space, PRIORITY_REINDEX, false).await?;
     if space.is_none() {
         crate::user_db::clear_approx_if_exact(db).await?;
+        crate::user_db::mark_chunker_current(db).await?;
     }
     Ok(jobs)
 }
 
 /// Ключ `meta`: незавершённая пересборка индекса базы из кэша (reindex).
-const REINDEX_KEY: &str = "reindex_pending";
+pub(crate) const REINDEX_KEY: &str = "reindex_pending";
 
 /// Отмечает (`Some(spec)`) или снимает (`None`) незавершённую пересборку индекса базы:
 /// отметка ставится до удаления точек области и снимается после её восстановления, так что
@@ -530,7 +635,8 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
     let row = tx
         .prepare_cached(
             "SELECT n.space_id, s.kind, s.solution_guid, n.path, n.frontmatter,
-                    n.updated_at, n.kind, n.index_state, n.deleted_at IS NOT NULL
+                    n.updated_at, n.kind, n.index_state, n.deleted_at IS NOT NULL, n.area,
+                    n.certainty
              FROM nodes n JOIN spaces s ON s.id = n.space_id
              WHERE n.id = ?1",
         )?
@@ -544,7 +650,9 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
                     path: r.get(3)?,
                     path_ancestors: Vec::new(),
                     tags: Vec::new(),
+                    area: r.get(9)?,
                     updated_at: ts_at(r, 5)?,
+                    certainty: r.get(10)?,
                 },
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, String>(6)?,
@@ -565,16 +673,33 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
     }
     payload.path_ancestors = path_ancestors(&payload.path);
     payload.tags = match fm.as_deref() {
-        Some(s) => crate::nodes::frontmatter_tags(s)
-            .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node}: {e}")))?,
+        Some(s) => crate::nodes::mask_tags(
+            crate::nodes::frontmatter_tags(s)
+                .map_err(|e| StoreError::Corrupt(format!("frontmatter узла {node}: {e}")))?,
+        ),
         None => Vec::new(),
     };
-    let mut st = tx.prepare_cached(
+    read_index_chunks(
+        tx,
         "SELECT id, level, heading_path, ordinal, text, context_prefix, text_hash,
                 token_count, rev, embed_key
          FROM chunks WHERE node_id = ?1 ORDER BY ordinal",
-    )?;
-    let rows = st.query_map([node], |r| -> rusqlite::Result<ChunkRowRead> {
+        node,
+        &payload,
+        None,
+    )
+}
+
+/// Чанки цели `id` запросом `sql` (колонки — как в [`index_chunks`]) с полями payload.
+pub(crate) fn read_index_chunks(
+    tx: &Connection,
+    sql: &str,
+    id: Id,
+    payload: &NodePayload,
+    entry: Option<&EntryPayload>,
+) -> Result<Vec<IndexChunk>, StoreError> {
+    let mut st = tx.prepare_cached(sql)?;
+    let rows = st.query_map([id], |r| -> rusqlite::Result<ChunkRowRead> {
         Ok((
             (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
             (
@@ -613,6 +738,7 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
             token_count: tokens,
             rev,
             node: payload.clone(),
+            entry: entry.cloned(),
         });
     }
     Ok(out)
@@ -665,19 +791,24 @@ pub async fn reindex_page(
     .await
 }
 
-/// Число живых индексируемых заметок пространства `space` (`None` — всех).
+/// Запрос [`indexable_count`]: `?1` — пространство или `NULL`. Узлы — по живому частичному
+/// индексу (`nodes_live_children`), корзина не просматривается; план закреплён тестом
+/// `indexable_count_and_folders_skip_trash`.
+fn indexable_count_sql() -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM nodes n JOIN spaces s ON s.id = n.space_id
+                 WHERE {INDEXABLE} AND (?1 IS NULL OR n.space_id = ?1))
+              + (SELECT count(*) FROM entries e
+                 WHERE e.deleted_at IS NULL AND e.index_state <> 'excluded'
+                   AND (?1 IS NULL OR e.space_id = ?1))"
+    )
+}
+
+/// Число живых индексируемых заметок и записей журналов пространства `space`
+/// (`None` — всех).
 pub async fn indexable_count(db: &Db, space: Option<Id>) -> Result<i64, StoreError> {
-    db.read(move |c| {
-        Ok(c.query_row(
-            &format!(
-                "SELECT count(*) FROM nodes n JOIN spaces s ON s.id = n.space_id
-                 WHERE {INDEXABLE} AND (?1 IS NULL OR n.space_id = ?1)"
-            ),
-            [space],
-            |r| r.get(0),
-        )?)
-    })
-    .await
+    db.read(move |c| Ok(c.query_row(&indexable_count_sql(), [space], |r| r.get(0))?))
+        .await
 }
 
 /// Ставит `upsert` (приоритет reindex) живым индексируемым заметкам из `nodes` по их
@@ -736,11 +867,14 @@ pub async fn finish_reindexed(db: &Db, items: Vec<(Id, i64)>) -> Result<(), Stor
 pub struct FailedJob {
     /// Id задания (`index_jobs.id`): у одного узла неудавшихся заданий может быть несколько.
     pub id: i64,
+    /// Вид цели: узел или запись журнала.
+    pub target_kind: TargetKind,
+    /// Id узла или записи.
     pub node_id: Id,
-    /// Пространство и путь узла; `None` — узел уже удалён насовсем.
+    /// Пространство и путь узла; `None` — цель удалена насовсем (у записи пути нет).
     pub space_id: Option<Id>,
     pub path: Option<String>,
-    /// Узел в корзине (удалён мягко); `None` — жив или удалён насовсем.
+    /// Цель удалена мягко; `None` — жива или удалена насовсем.
     pub deleted_at: Option<Timestamp>,
     pub op: JobOp,
     pub attempts: i64,
@@ -755,13 +889,17 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
     db.read(move |c| {
         let mut st = c.prepare_cached(
             "SELECT j.id, j.target_id, j.op, j.attempts, j.last_error, j.updated_at,
-                    n.space_id, n.path, n.deleted_at
-             FROM index_jobs j LEFT JOIN nodes n ON n.id = j.target_id
+                    coalesce(n.space_id, e.space_id), n.path,
+                    coalesce(n.deleted_at, e.deleted_at), j.target_kind
+             FROM index_jobs j
+             LEFT JOIN nodes n ON j.target_kind = 'node' AND n.id = j.target_id
+             LEFT JOIN entries e ON j.target_kind = 'entry' AND e.id = j.target_id
              WHERE j.state = 'failed' ORDER BY j.updated_at DESC, j.id DESC LIMIT ?1",
         )?;
         let rows = st.query_map([limit], |r| {
             Ok(FailedJob {
                 id: r.get(0)?,
+                target_kind: parse_target_kind(&r.get::<_, String>(9)?)?,
                 node_id: r.get(1)?,
                 op: r.get(2)?,
                 attempts: r.get(3)?,
@@ -775,6 +913,19 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
         Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
+}
+
+/// Строка входа эмбеддинга L0 папки до маскировки: `[<пространство>/<путь>] <имя>\n<L0>`.
+pub(crate) fn folder_embed_raw(space: &str, path: &str, name: &str, l0: &str) -> String {
+    format!("[{space}/{path}] {name}\n{l0}")
+}
+
+/// Вход эмбеддинга L0 папки (точка уровня `folder`, §8.3): имя пространства, путь и имя
+/// папки задаёт автор, L0 — свёртка имён и L0 детей, поэтому строка маскируется сканером
+/// секретов целиком (как `context_prefix` чанков, §7.6). Без секретов — строка как есть
+/// (ключ кэша чистых папок не меняется).
+pub fn folder_embed_input(space: &str, path: &str, name: &str, l0: &str) -> String {
+    zam_markdown::mask_text(&folder_embed_raw(space, path, name, l0))
 }
 
 /// Папка с L0 для точки уровня `folder` (пересборка индекса из кэша).
@@ -791,17 +942,22 @@ pub struct IndexFolder {
     pub updated_at: Timestamp,
 }
 
+/// Запрос [`folders_for_index`]: `?1` — пространство или `NULL`. От пространств к их живым
+/// узлам по `nodes_live_children (space_id=?)`: корзина не просматривается (прежний запрос
+/// шёл полным просмотром `nodes` по первичному ключу ради `ORDER BY`); сортируются только
+/// найденные папки. План закреплён тестом `indexable_count_and_folders_skip_trash`.
+const FOLDERS_FOR_INDEX_SQL: &str =
+    "SELECT n.id, n.space_id, s.kind, s.name, s.solution_guid, n.path, n.name, n.l0,
+            n.updated_at
+     FROM spaces s CROSS JOIN nodes n INDEXED BY nodes_live_children
+     WHERE n.space_id = s.id AND n.kind = 'folder' AND n.deleted_at IS NULL
+       AND n.l0 IS NOT NULL AND s.kind <> 'human' AND (?1 IS NULL OR s.id = ?1)
+     ORDER BY n.id";
+
 /// Живые папки с L0 пространства `space` (`None` — всех), кроме Human.
 pub async fn folders_for_index(db: &Db, space: Option<Id>) -> Result<Vec<IndexFolder>, StoreError> {
     db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT n.id, n.space_id, s.kind, s.name, s.solution_guid, n.path, n.name, n.l0,
-                    n.updated_at
-             FROM nodes n JOIN spaces s ON s.id = n.space_id
-             WHERE n.kind = 'folder' AND n.deleted_at IS NULL AND n.l0 IS NOT NULL
-               AND s.kind <> 'human' AND (?1 IS NULL OR n.space_id = ?1)
-             ORDER BY n.id",
-        )?;
+        let mut st = c.prepare_cached(FOLDERS_FOR_INDEX_SQL)?;
         let rows = st.query_map([space], |r| {
             Ok(IndexFolder {
                 node_id: r.get(0)?,
@@ -818,6 +974,19 @@ pub async fn folders_for_index(db: &Db, space: Option<Id>) -> Result<Vec<IndexFo
         Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
+}
+
+/// `index_state` цели (узла или записи), если `rev` — её текущая ревизия и она жива.
+fn set_target_state(
+    c: &Connection,
+    t: TargetRef,
+    rev: i64,
+    state: IndexState,
+) -> Result<(), StoreError> {
+    match t.kind {
+        TargetKind::Node => set_state(c, t.id, rev, state),
+        TargetKind::Entry => crate::entries::set_entry_state(c, t.id, rev, state),
+    }
 }
 
 /// `nodes.index_state` узла, если `rev` — его текущая ревизия и узел жив.
@@ -846,6 +1015,160 @@ pub async fn set_index_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schema() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        c
+    }
+
+    /// Строки `EXPLAIN QUERY PLAN` запроса с `params` параметрами (`NULL`).
+    fn plan(c: &Connection, sql: &str, params: usize) -> Vec<String> {
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args = rusqlite::params_from_iter(vec![None::<String>; params]);
+        st.query_map(args, |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Шагов VM на полный проход `sql` и число строк.
+    fn steps(c: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> (usize, i32) {
+        let mut st = c.prepare(sql).unwrap();
+        let mut rows = st.query(args).unwrap();
+        let mut n = 0;
+        while rows.next().unwrap().is_some() {
+            n += 1;
+        }
+        drop(rows);
+        (n, st.get_status(rusqlite::StatementStatus::VmStep))
+    }
+
+    fn ins(c: &Connection, space: &str, kind: &str, path: &str, deleted: bool) {
+        c.execute(
+            "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, l0, index_state,
+                                created_at, updated_at, deleted_at)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?4, ?5, 'indexed', 't', 't', ?6)",
+            rusqlite::params![
+                Id::new().to_string(),
+                space,
+                kind,
+                path,
+                (kind == "folder").then_some("L0 папки"),
+                deleted.then_some("t")
+            ],
+        )
+        .unwrap();
+    }
+
+    /// База с живыми заметками и папками Knowledge и `trash` удалёнными заметками и папками
+    /// (вставлены раньше живых).
+    fn base(trash: usize) -> Connection {
+        let c = schema();
+        c.execute_batch(
+            "INSERT INTO spaces (id, kind, name, created_at) VALUES ('k', 'knowledge', 'K', 't');
+             INSERT INTO spaces (id, kind, name, created_at) VALUES ('h', 'human', 'H', 't');",
+        )
+        .unwrap();
+        for i in 0..trash {
+            let kind = if i % 4 == 0 { "folder" } else { "note" };
+            ins(&c, "k", kind, &format!("корзина/{i}"), true);
+        }
+        for i in 0..5 {
+            ins(&c, "k", "note", &format!("заметка{i}"), false);
+        }
+        for i in 0..2 {
+            ins(&c, "k", "folder", &format!("папка{i}"), false);
+        }
+        ins(&c, "h", "folder", "личное", false);
+        c
+    }
+
+    /// Шаги VM запросов, которые обходят узлы базы целиком (пересборка индекса, reindex
+    /// пространства): `(имя, строк, шагов)`.
+    fn trash_steps(trash: usize) -> Vec<(&'static str, usize, i32)> {
+        let c = base(trash);
+        let none: Option<String> = None;
+        let k = Some("k".to_string());
+        let mut out = Vec::new();
+        for (name, sql, arg) in [
+            ("indexable_count все", indexable_count_sql(), &none),
+            ("indexable_count k", indexable_count_sql(), &k),
+            (
+                "folders_for_index все",
+                FOLDERS_FOR_INDEX_SQL.to_string(),
+                &none,
+            ),
+            ("folders_for_index k", FOLDERS_FOR_INDEX_SQL.to_string(), &k),
+        ] {
+            let (n, s) = steps(&c, &sql, &[arg]);
+            out.push((name, n, s));
+        }
+        let (n, s) = steps(&c, crate::user_db::SPACE_NOTES_PENDING_SQL, &[&"k"]);
+        out.push(("сброс index_state пространства", n, s));
+        out
+    }
+
+    /// Подсчёт индексируемых, папки для пересборки индекса и сброс `index_state` заметок
+    /// пространства (смена GUID решения) не просматривают корзину (остаток задачи 19b,
+    /// финальная волна M3): работа при 4000 удалённых узлах — как при пустой корзине, а
+    /// узлы читаются по живому частичному индексу.
+    #[test]
+    fn indexable_count_and_folders_skip_trash() {
+        let empty = trash_steps(0);
+        let big = trash_steps(4000);
+        for (b, t) in empty.iter().zip(&big) {
+            eprintln!("{}: шагов VM {} → {} (корзина 0 → 4000)", b.0, b.2, t.2);
+            assert_eq!(b.1, t.1, "{}: строк", b.0);
+            assert!(
+                t.2 <= b.2 + 64,
+                "{}: шагов {} при пустой корзине, {} при 4000",
+                b.0,
+                b.2,
+                t.2
+            );
+        }
+        assert_eq!(
+            empty.iter().map(|x| x.1).collect::<Vec<_>>(),
+            [1, 1, 2, 2, 5]
+        );
+        // планы: узлы — по живому частичному индексу; строки плана о `nodes` без него —
+        // полный просмотр с корзиной
+        let c = schema();
+        for (name, sql, n) in [
+            ("indexable_count", indexable_count_sql(), 1),
+            ("folders_for_index", FOLDERS_FOR_INDEX_SQL.to_string(), 1),
+            (
+                "сброс index_state",
+                crate::user_db::SPACE_NOTES_PENDING_SQL.to_string(),
+                1,
+            ),
+        ] {
+            let p = plan(&c, &sql, n);
+            let on_nodes: Vec<&String> = p
+                .iter()
+                .filter(|l| {
+                    l.starts_with("SCAN n")
+                        || l.starts_with("SEARCH n")
+                        || l.starts_with("SCAN nodes")
+                        || l.starts_with("SEARCH nodes")
+                })
+                .collect();
+            assert!(
+                !on_nodes.is_empty(),
+                "{name}: нет строки плана о nodes: {p:?}"
+            );
+            for l in on_nodes {
+                assert!(
+                    l.contains("USING INDEX nodes_live_children")
+                        || l.contains("USING COVERING INDEX nodes_live_children"),
+                    "{name}: узлы не по живому индексу: {p:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn backoff_grows_and_caps() {

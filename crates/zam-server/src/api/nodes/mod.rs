@@ -18,23 +18,31 @@ use crate::auth::{Client, Principal};
 use crate::error::ApiError;
 
 /// Актор аудита: `admin` (сессия WebUI) или id токена.
-fn actor(p: &Principal) -> String {
+pub(crate) fn actor(p: &Principal) -> String {
     match p {
         Principal::Token(t) => t.token_id.to_string(),
         Principal::Admin { .. } => "admin".into(),
     }
 }
 
-/// Запись аудита операции над узлом; `details` — без текста заметки.
-async fn audit_node(
+/// Запись аудита операции над узлом; `details` — без текста заметки. `user` — кто
+/// действует; узел в базе другого владельца (общее решение) — `details.owner`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn audit_node(
     st: &AppState,
     p: &Principal,
     client: &Client,
     user: Id,
+    owner: Id,
     action: &str,
     node: Id,
-    details: Value,
+    mut details: Value,
 ) -> Result<(), ApiError> {
+    if owner != user
+        && let Value::Object(o) = &mut details
+    {
+        o.insert("owner".into(), json!(owner));
+    }
     st.system
         .audit(
             &actor(p),
@@ -108,7 +116,7 @@ pub(crate) async fn diff_blocking(
 ) -> Result<String, ApiError> {
     tokio::task::spawn_blocking(move || unified_diff(&old, &new, &old_label, &new_label))
         .await
-        .map_err(|e| ApiError::Internal(format!("дифф прерван: {e}")))
+        .map_err(|e| ApiError::aborted("дифф", &e))
 }
 
 fn patch_error(e: PatchError) -> ApiError {

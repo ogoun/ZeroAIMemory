@@ -127,6 +127,38 @@ fn frontmatter_fields() {
 }
 
 #[test]
+fn frontmatter_relations_flow_and_block() {
+    // flow: строки в кавычках, запятые внутри кавычек не делят элемент
+    let src = "---\nrelations: [\"depends_on: [[Сборка]]\", 'fixes: notes/gotchas/crlf.md', \"relates_to: [[A, B]]\"]\n---\n";
+    let fm = parse(src).frontmatter.expect("frontmatter");
+    assert_eq!(
+        fm.relations,
+        vec![
+            "depends_on: [[Сборка]]".to_string(),
+            "fixes: notes/gotchas/crlf.md".to_string(),
+            "relates_to: [[A, B]]".to_string(),
+        ]
+    );
+    // block: элементы с кавычками и без, комментарий и якорь `#` внутри `[[…]]`
+    let src = "---\ntags: [x]\nrelations:\n  - \"part_of: [[Архитектура#Слои]]\"\n  - caused_by: [[Инцидент]] # причина\n  - ~\nindex: true\n---\nтекст\n";
+    let fm = parse(src).frontmatter.expect("frontmatter");
+    assert_eq!(
+        fm.relations,
+        vec![
+            "part_of: [[Архитектура#Слои]]".to_string(),
+            "caused_by: [[Инцидент]]".to_string(),
+        ]
+    );
+    assert_eq!(fm.tags, vec!["x".to_string()]);
+    assert_eq!(fm.index, Some(true));
+    // без ключа — пусто
+    let fm = parse("---\ntags: [a]\n---\n")
+        .frontmatter
+        .expect("frontmatter");
+    assert!(fm.relations.is_empty());
+}
+
+#[test]
 fn slug_matches_comrak_and_keeps_unicode() {
     assert_eq!(slug("Hello, World!"), "hello-world");
     assert_eq!(slug("Установка в Linux"), "установка-в-linux");

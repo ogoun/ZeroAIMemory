@@ -6,6 +6,7 @@
 //! Процесс завершается в `Drop`. Боевой запуск — `zam_index::supervisor` (тесты в `supervisor.rs`);
 //! здесь — облегчённый вариант без лока, pid-файла и перезапусков для тестов адаптера.
 
+use std::collections::HashSet;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -34,13 +35,46 @@ pub fn qdrant_bin() -> PathBuf {
         .join(exe)
 }
 
-/// Свободный TCP-порт на 127.0.0.1 (порт освобождается сразу, гонка допустима для тестов).
+/// Порты, уже выданные [`free_port`] в этом процессе тестов.
+static ISSUED: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+
+/// Свободный TCP-порт на 127.0.0.1, не выдававшийся раньше в этом процессе. Порт
+/// освобождается сразу, и ОС может вернуть его параллельному тесту до запуска Qdrant
+/// (флейк M3: os error 10048) — реестр не выдаёт один порт дважды. Гонку с чужими
+/// процессами реестр не закрывает: её ловит повтор запуска в [`TestQdrant::start`].
 pub fn free_port() -> u16 {
-    TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("свободный порт")
+    let mut issued = ISSUED.lock().unwrap_or_else(|p| p.into_inner());
+    let issued = issued.get_or_insert_with(HashSet::new);
+    loop {
+        let port = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .expect("свободный порт");
+        if issued.insert(port) {
+            return port;
+        }
+    }
 }
+
+/// Попыток запуска Qdrant на новых портах, если адрес оказался занят.
+const START_ATTEMPTS: u32 = 3;
+
+/// Хвост журнала Qdrant говорит о занятом адресе (Windows — 10048, Linux — 98).
+fn addr_in_use(dir: &Path) -> bool {
+    let log = std::fs::read(dir.join("qdrant.log")).unwrap_or_default();
+    let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(8192)..]).to_lowercase();
+    [
+        "os error 10048",
+        "os error 98",
+        "address already in use",
+        "addrinuse",
+    ]
+    .iter()
+    .any(|m| tail.contains(m))
+}
+
+/// Процесс завершился при старте, потому что адрес занят: можно повторить на других портах.
+struct AddrInUse;
 
 /// Предел одновременно запущенных [`TestQdrant`] в процессе теста (по умолчанию 4,
 /// переменная `ZAM_TEST_QDRANT_MAX`). Тесты одного бинарника идут параллельно, и каждый
@@ -96,7 +130,8 @@ pub struct TestQdrant {
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl TestQdrant {
-    /// Запускает Qdrant и ждёт `GET /readyz` (до 60 с: данные проекта на HDD).
+    /// Запускает Qdrant и ждёт `GET /readyz` (до 60 с: данные проекта на HDD). Если процесс
+    /// завершился из-за занятого адреса, запуск повторяется на новых портах (до 3 попыток).
     pub fn start(name: &str) -> TestQdrant {
         let bin = qdrant_bin();
         assert!(
@@ -112,29 +147,39 @@ impl TestQdrant {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("config")).expect("каталог теста");
 
-        let http_port = free_port();
-        let grpc_port = free_port();
         let api_key = uuid::Uuid::now_v7().simple().to_string();
-        // Пути в конфиге — от рабочего каталога процесса (исследование 05 §6.1).
-        let config = format!(
-            "log_level: WARN\n\
-             telemetry_disabled: true\n\
-             storage:\n  storage_path: ./storage\n  snapshots_path: ./snapshots\n  temp_path: ./temp\n  on_disk_payload: true\n\
-             service:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  enable_cors: false\n  enable_static_content: false\n\
-             cluster:\n  enabled: false\n"
-        );
-        std::fs::write(dir.join("config").join("zam.yaml"), config).expect("конфиг Qdrant");
-        let child = spawn(&bin, &dir, &api_key);
-        let mut q = TestQdrant {
-            child,
-            dir,
-            http_port,
-            grpc_port,
-            api_key,
-            _slot: slot,
-        };
-        q.wait_ready(Duration::from_secs(60));
-        q
+        let mut attempt = 1;
+        loop {
+            let http_port = free_port();
+            let grpc_port = free_port();
+            // Пути в конфиге — от рабочего каталога процесса (исследование 05 §6.1).
+            let config = format!(
+                "log_level: WARN\n\
+                 telemetry_disabled: true\n\
+                 storage:\n  storage_path: ./storage\n  snapshots_path: ./snapshots\n  temp_path: ./temp\n  on_disk_payload: true\n\
+                 service:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  enable_cors: false\n  enable_static_content: false\n\
+                 cluster:\n  enabled: false\n"
+            );
+            std::fs::write(dir.join("config").join("zam.yaml"), config).expect("конфиг Qdrant");
+            let mut child = spawn(&bin, &dir, &api_key);
+            match wait_ready(&mut child, &dir, http_port, grpc_port) {
+                Ok(()) => {
+                    return TestQdrant {
+                        child,
+                        dir,
+                        http_port,
+                        grpc_port,
+                        api_key,
+                        _slot: slot,
+                    };
+                }
+                Err(AddrInUse) if attempt < START_ATTEMPTS => attempt += 1,
+                Err(AddrInUse) => panic!(
+                    "Qdrant не запустился за {START_ATTEMPTS} попытки: адрес занят, лог: {}",
+                    dir.join("qdrant.log").display()
+                ),
+            }
+        }
     }
 
     /// Останавливает процесс (данные и порты сохраняются для [`TestQdrant::restart`]).
@@ -147,7 +192,12 @@ impl TestQdrant {
     pub fn restart(&mut self) {
         self.stop();
         self.child = spawn(&qdrant_bin(), &self.dir, &self.api_key);
-        self.wait_ready(Duration::from_secs(60));
+        if wait_ready(&mut self.child, &self.dir, self.http_port, self.grpc_port).is_err() {
+            panic!(
+                "Qdrant не перезапустился: адрес занят, лог: {}",
+                self.dir.join("qdrant.log").display()
+            );
+        }
     }
 
     /// pid процесса.
@@ -159,29 +209,42 @@ impl TestQdrant {
     pub fn grpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.grpc_port)
     }
+}
 
-    fn wait_ready(&mut self, limit: Duration) {
-        let started = Instant::now();
-        loop {
-            if let Ok(Some(st)) = self.child.try_wait() {
-                panic!(
-                    "Qdrant завершился при старте ({st}), лог: {}",
-                    self.dir.join("qdrant.log").display()
-                );
+/// Ждёт `GET /readyz` и открытый gRPC-порт (до 60 с: данные проекта на HDD). Процесс,
+/// завершившийся при старте из-за занятого адреса, — [`AddrInUse`]; иначе — паника.
+fn wait_ready(
+    child: &mut Child,
+    dir: &Path,
+    http_port: u16,
+    grpc_port: u16,
+) -> Result<(), AddrInUse> {
+    let limit = Duration::from_secs(60);
+    let started = Instant::now();
+    loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            if addr_in_use(dir) {
+                return Err(AddrInUse);
             }
-            // gRPC-порт Qdrant открывает отдельно от HTTP и бывает, что позже `/readyz`
-            // (флейк на Linux CI: ConnectionRefused первого `health()`); супервизор по той же
-            // причине ждёт gRPC health.
-            if readyz(self.http_port) && port_open(self.grpc_port) {
-                return;
-            }
-            assert!(
-                started.elapsed() < limit,
-                "Qdrant не готов за {limit:?}, лог: {}",
-                self.dir.join("qdrant.log").display()
+            panic!(
+                "Qdrant завершился при старте ({st}), лог: {}",
+                dir.join("qdrant.log").display()
             );
-            std::thread::sleep(Duration::from_millis(100));
         }
+        // gRPC-порт Qdrant открывает отдельно от HTTP и бывает, что позже `/readyz`
+        // (флейк на Linux CI: ConnectionRefused первого `health()`); супервизор по той же
+        // причине ждёт gRPC health.
+        if readyz(http_port) && port_open(grpc_port) {
+            return Ok(());
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            panic!(
+                "Qdrant не готов за {limit:?}, лог: {}",
+                dir.join("qdrant.log").display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
