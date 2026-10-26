@@ -1349,7 +1349,7 @@ async fn trash_bench_run(trash: usize) -> (f64, f64) {
 /// пространства вместе с корзиной на каждом шаге рекурсии — работа процессора (одно ядро на
 /// стенде). Общее время печатается справочно: на HDD в нём растут checkpoint WAL и ожидание
 /// записи у файла большего размера (fix round 1, M2), а не просмотр корзины. Запуск:
-/// `cargo test --release -p zam-index --test worker -- --ignored bench_index_with_trash --nocapture`.
+/// `cargo test --release -p zam-index --test worker -- --ignored bench_index_with_trash --nocapture --test-threads=1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn bench_index_with_trash() {
