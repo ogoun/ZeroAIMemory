@@ -1,7 +1,9 @@
 //! Смена алгоритма или настроек нарезки (задача 17 M3): база, нарезанная до задачи 17 или
 //! с другими `[index] chunk_*`, разово перенарезается в фоне при открытии; листы, текст и
 //! префикс которых не изменились, сохраняют `embed_key` (вектор берётся из кэша). L0 в
-//! префиксе листов — по `set_prefix_l0`.
+//! префиксе листов — по `set_prefix_l0`. Заметка и запись, нарезка которых не изменилась, не
+//! переписываются и не получают `upsert`; флаг L0 записи журналов не перенарезает (финальная
+//! волна M3).
 //!
 //! Отдельный тестовый бинарник: пороги чанкера и флаг L0 — глобальные на процесс.
 
@@ -11,8 +13,9 @@ use jiff::Timestamp;
 use zam_core::Id;
 use zam_markdown::ChunkParams;
 use zam_store::{
-    Attribution, AuthorKind, DataDir, Db, NewNote, NodePath, SpaceKind, UserDbs, claim_jobs,
-    complete_job, create_note, job_stats, list_spaces, set_chunk_params, set_prefix_l0,
+    Attribution, AuthorKind, DataDir, Db, EntryKind, NewEntry, NewNote, NodePath, SpaceKind,
+    UserDbs, claim_jobs, complete_job, create_entry, create_note, job_stats, list_spaces,
+    set_chunk_params, set_prefix_l0,
 };
 
 /// `(heading_path, context_prefix, embed_key)` листов узла.
@@ -23,6 +26,20 @@ async fn leaves(db: &Db, node: Id) -> Vec<(String, String, String)> {
              WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
         )?;
         let rows = st.query_map([node], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+    .unwrap()
+}
+
+/// `(rowid, embed_key)` чанков владельца (`col` — `node_id` или `entry_id`): переписанные
+/// чанки получают новые `rowid`.
+async fn rows(db: &Db, col: &'static str, id: Id) -> Vec<(i64, String)> {
+    db.read(move |c| {
+        let mut st = c.prepare(&format!(
+            "SELECT rowid, embed_key FROM chunks WHERE {col} = ?1 ORDER BY ordinal"
+        ))?;
+        let rows = st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
@@ -91,6 +108,27 @@ async fn base_rechunked_once_when_chunker_changes() {
     )
     .await;
     let flat = note(&db, k, "плоская", format!("# Плоская\n\n{para}\n")).await;
+    let (entry, _) = create_entry(
+        &db,
+        NewEntry {
+            space_id: k,
+            kind: EntryKind::Insight,
+            title: "Пакеты переноса проверяются".into(),
+            body: "Каждый пакет сверяется по контрольной сумме.".into(),
+            data: serde_json::json!({"kind": "gotcha"}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: None,
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &Attribution::new(AuthorKind::Agent),
+    )
+    .await
+    .unwrap();
+    let entry = entry.id;
     drain(&db).await;
     let deep_now = leaves(&db, deep).await;
     assert!(
@@ -98,6 +136,8 @@ async fn base_rechunked_once_when_chunker_changes() {
         "H4 в пути: {deep_now:?}"
     );
     let flat_now = leaves(&db, flat).await;
+    let flat_rows = rows(&db, "node_id", flat).await;
+    let entry_rows = rows(&db, "entry_id", entry).await;
 
     // 1. База «до задачи 17»: отпечатка нет, путь листов — без H4.
     exec(
@@ -117,9 +157,15 @@ async fn base_rechunked_once_when_chunker_changes() {
         "неизменённые листы — тот же embed_key"
     );
     assert_eq!(
+        rows(&db, "node_id", flat).await,
+        flat_rows,
+        "неизменённая заметка не переписана"
+    );
+    assert_eq!(rows(&db, "entry_id", entry).await, entry_rows);
+    assert_eq!(
         job_stats(&db).await.unwrap().queued,
-        2,
-        "upsert обеих заметок"
+        1,
+        "upsert только изменённой заметки"
     );
     drain(&db).await;
     drop(db);
@@ -136,15 +182,38 @@ async fn base_rechunked_once_when_chunker_changes() {
     });
     set_prefix_l0(true);
     let db = reopen(&dd, user).await;
-    assert_eq!(job_stats(&db).await.unwrap().queued, 2);
+    assert_eq!(
+        job_stats(&db).await.unwrap().queued,
+        2,
+        "обе заметки (префикс с L0), запись не изменилась"
+    );
     for (_, prefix, _) in leaves(&db, flat).await {
         assert!(
             prefix.ends_with(" — Сводка заметки для префикса"),
             "{prefix:?}"
         );
     }
+    assert_eq!(rows(&db, "entry_id", entry).await, entry_rows);
     drain(&db).await;
     drop(db);
     let db = reopen(&dd, user).await;
     assert_eq!(job_stats(&db).await.unwrap().queued, 0);
+
+    // 4. Только флаг L0: записи журналов не перенарезаются (испорченный ключ остаётся).
+    exec(
+        &db,
+        "UPDATE chunks SET embed_key = 'старый' WHERE entry_id IS NOT NULL",
+    )
+    .await;
+    drop(db);
+    set_prefix_l0(false);
+    let db = reopen(&dd, user).await;
+    assert_eq!(job_stats(&db).await.unwrap().queued, 2, "только заметки");
+    assert!(
+        rows(&db, "entry_id", entry)
+            .await
+            .iter()
+            .all(|(_, k)| k == "старый"),
+        "запись не перенарезана"
+    );
 }

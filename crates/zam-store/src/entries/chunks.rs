@@ -20,7 +20,9 @@ use crate::jobs::{
     EntryPayload, IndexChunk, IndexState, JobOp, NodePayload, PRIORITY_WRITE, enqueue_target,
     has_active_target, read_index_chunks,
 };
-use crate::nodes::{chunk_id, context_prefix, note_chunks, token_counter};
+use crate::nodes::{
+    ChunkInsert, chunk_id, context_prefix, note_chunks, replace_chunks, token_counter,
+};
 use crate::time::{fmt_ts, ts_at};
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
@@ -43,11 +45,10 @@ fn entry_doc(title: &str, body: &str) -> String {
     }
 }
 
-/// Пересобирает чанки записи `id` по её текущим полям: старые удаляются (триггеры убирают
-/// их из FTS), новые вставляются. Вызывается в транзакции писателя. Возвращает число чанков.
-pub(crate) fn rebuild_entry_chunks(c: &Connection, id: Id) -> Result<usize, StoreError> {
-    c.prepare_cached("DELETE FROM chunks WHERE entry_id = ?1")?
-        .execute([id])?;
+/// Пересобирает чанки записи `id` по её текущим полям: при отличии от записанных старые
+/// удаляются (триггеры убирают их из FTS), новые вставляются; совпадающая нарезка не
+/// переписывается. Вызывается в транзакции писателя. `true` — чанки переписаны.
+pub(crate) fn rebuild_entry_chunks(c: &Connection, id: Id) -> Result<bool, StoreError> {
     let (space, kind, title, body, tags, rev): (String, EntryKind, String, String, String, i64) = c
         .prepare_cached(
             "SELECT s.name, e.kind, e.title, e.body, e.tags, e.current_rev
@@ -70,32 +71,31 @@ pub(crate) fn rebuild_entry_chunks(c: &Connection, id: Id) -> Result<usize, Stor
     let tc = token_counter();
     let chunks = note_chunks(&src, &doc, &title, tc.as_ref());
     let prefix = context_prefix(&space, kind.as_str(), &title, "", &tags);
-    let mut st = c.prepare_cached(
-        "INSERT INTO chunks (id, entry_id, rev, level, heading_path, ordinal, text,
-                             context_prefix, token_count, text_hash, embed_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-    )?;
-    for (ordinal, ch) in chunks.iter().enumerate() {
-        let ordinal = ordinal as i64;
-        st.execute(params![
-            chunk_id(id, ordinal, &ch.text_hash),
-            id,
-            rev,
-            ch.level.as_str(),
-            ch.heading_path,
-            ordinal,
-            ch.text,
-            prefix,
-            ch.token_count,
-            ch.text_hash,
-            embed_key_of(&prefix, &ch.text),
-        ])?;
-    }
+    let rows: Vec<ChunkInsert> = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, ch)| {
+            let ordinal = ordinal as i64;
+            ChunkInsert {
+                id: chunk_id(id, ordinal, &ch.text_hash),
+                rev,
+                level: ch.level.as_str(),
+                ordinal,
+                embed_key: embed_key_of(&prefix, &ch.text),
+                context_prefix: prefix.clone(),
+                heading_path: ch.heading_path,
+                text: ch.text,
+                token_count: ch.token_count,
+                text_hash: ch.text_hash,
+            }
+        })
+        .collect();
+    let changed = replace_chunks(c, "entry_id", id, &rows)?;
     if !tc.is_exact() {
         c.prepare_cached("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')")?
             .execute([crate::user_db::CHUNKED_APPROX])?;
     }
-    Ok(chunks.len())
+    Ok(changed)
 }
 
 /// Пересборка чанков и задание после записи (создание, правка, смена статуса,
@@ -109,6 +109,18 @@ pub(crate) fn index_entry(
     now: &str,
 ) -> Result<Option<JobOp>, StoreError> {
     rebuild_entry_chunks(c, id)?;
+    enqueue_entry(c, id, prev, priority, now)
+}
+
+/// Задание записи по уже записанным чанкам и `entries.index_state`: индексируемая →
+/// `upsert`, ставшая исключённой → `delete`. Возвращает поставленную операцию.
+fn enqueue_entry(
+    c: &Connection,
+    id: Id,
+    prev: Option<IndexState>,
+    priority: i64,
+    now: &str,
+) -> Result<Option<JobOp>, StoreError> {
     let (state, rev): (IndexState, i64) = c
         .prepare_cached("SELECT index_state, current_rev FROM entries WHERE id = ?1")?
         .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -359,12 +371,14 @@ pub async fn finish_entries_reindexed(db: &Db, items: Vec<(Id, i64)>) -> Result<
 const RECHUNK_BATCH: i64 = 200;
 
 /// Перечанковывает живые записи (`space = None` — всех пространств) текущим счётчиком
-/// токенов и ставит задания с `priority`. Пакетами в отдельных транзакциях. Возвращает
-/// число поставленных `upsert`.
+/// токенов и ставит задания с `priority`. `only_changed` — как у
+/// [`crate::nodes::rechunk_notes`]: проиндексированная запись с неизменной нарезкой задания
+/// не получает. Пакетами в отдельных транзакциях. Возвращает число поставленных `upsert`.
 pub(crate) async fn rechunk_entries(
     db: &Db,
     space: Option<Id>,
     priority: i64,
+    only_changed: bool,
 ) -> Result<u64, StoreError> {
     let mut upserts = 0u64;
     let mut after: Option<Id> = None;
@@ -387,13 +401,17 @@ pub(crate) async fn rechunk_entries(
                 };
                 let mut u = 0u64;
                 for &(id, prev) in &batch {
+                    let changed = rebuild_entry_chunks(tx, id)?;
+                    if only_changed && !changed && prev == IndexState::Indexed {
+                        continue;
+                    }
                     if prev != IndexState::Excluded {
                         tx.prepare_cached(
                             "UPDATE entries SET index_state = 'pending' WHERE id = ?1",
                         )?
                         .execute([id])?;
                     }
-                    let op = index_entry(tx, id, Some(prev), priority, &now)?;
+                    let op = enqueue_entry(tx, id, Some(prev), priority, &now)?;
                     u += u64::from(op == Some(JobOp::Upsert));
                 }
                 Ok((batch.len() as i64, u, batch.last().map(|b| b.0)))

@@ -531,8 +531,8 @@ pub async fn requeue_running(db: &Db) -> Result<u64, StoreError> {
 /// Перечанковка всей базы точным счётчиком снимает отметку «чанки по оценке» и ставит
 /// текущий отпечаток нарезки.
 pub async fn enqueue_reindex(db: &Db, space: Option<Id>) -> Result<u64, StoreError> {
-    let (_, mut jobs) = crate::nodes::rechunk_notes(db, space, PRIORITY_REINDEX).await?;
-    jobs += crate::entries::rechunk_entries(db, space, PRIORITY_REINDEX).await?;
+    let (_, mut jobs) = crate::nodes::rechunk_notes(db, space, PRIORITY_REINDEX, false).await?;
+    jobs += crate::entries::rechunk_entries(db, space, PRIORITY_REINDEX, false).await?;
     if space.is_none() {
         crate::user_db::clear_approx_if_exact(db).await?;
         crate::user_db::mark_chunker_current(db).await?;

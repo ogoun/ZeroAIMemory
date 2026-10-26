@@ -54,6 +54,10 @@ pub trait TokenCounter: Send + Sync {
     fn count(&self, text: &str) -> usize;
     /// `true` — точный подсчёт токенизатором модели, `false` — оценка.
     fn is_exact(&self) -> bool;
+    /// Идентификатор токенизатора для отпечатка нарезки: у счётчиков, считающих одинаково,
+    /// он совпадает, у разных — различается (например, хэш `tokenizer.json`). Смена
+    /// идентификатора при точном счётчике перенарезает базу.
+    fn tokenizer_id(&self) -> String;
 }
 
 /// Оценка без токенизатора: `ceil(символы / 3,5)` (исследование 05 §10).
@@ -68,6 +72,10 @@ impl TokenCounter for ApproxCounter {
 
     fn is_exact(&self) -> bool {
         false
+    }
+
+    fn tokenizer_id(&self) -> String {
+        "approx".into()
     }
 }
 

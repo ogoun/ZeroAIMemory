@@ -117,11 +117,11 @@ async fn interrupted_rechunk_retried_and_entries_rechunked() {
     let keys_now = entry_keys(&db).await;
     assert!(!keys_now.is_empty());
 
-    // 1. База «до задачи 17» (отпечатка нет), чанки записи устарели, а запись чанков
-    // записей падает: перенарезка прерывается на записях — отпечаток не ставится.
+    // 1. База «до задачи 17» (отпечатков заметок и записей нет), чанки записи устарели, а
+    // запись чанков записей падает: перенарезка прерывается на записях — отпечаток не ставится.
     exec(
         &db,
-        "DELETE FROM meta WHERE key = 'chunker';
+        "DELETE FROM meta WHERE key IN ('chunker', 'chunker_entries');
          UPDATE chunks SET embed_key = 'старый' WHERE entry_id IS NOT NULL;
          CREATE TRIGGER fail_entry_chunks BEFORE INSERT ON chunks
          WHEN NEW.entry_id IS NOT NULL

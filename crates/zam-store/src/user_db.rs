@@ -196,11 +196,11 @@ impl UserDbs {
         if pending.is_some() || edges || secrets {
             let bg = db.clone();
             tokio::spawn(async move {
-                if let Some(why) = pending
-                    && let Err(e) = rechunk_all(&bg, why).await
+                if let Some(plan) = pending
+                    && let Err(e) = rechunk_all(&bg, plan).await
                 {
                     // повторится при следующем открытии базы
-                    tracing::warn!(error = %e, reason = why.as_str(), "перечанковка заметок прервана");
+                    tracing::warn!(error = %e, reason = plan.why.as_str(), "перечанковка заметок прервана");
                 }
                 if edges && let Err(e) = crate::graph::backfill_edges(&bg).await {
                     tracing::warn!(error = %e, "дозаполнение рёбер графа прервано");
@@ -426,10 +426,14 @@ const RECHUNK_V4: &str = "rechunk_v4";
 /// всех живых заметок точным счётчиком.
 pub(crate) const CHUNKED_APPROX: &str = "chunked_approx";
 
-/// Ключ `meta`: отпечаток нарезки, которой нарезаны живые заметки и записи базы
+/// Ключ `meta`: отпечаток нарезки, которой нарезаны живые заметки базы
 /// (`crate::nodes::chunker_fingerprint`: версия алгоритма, пороги и флаги `[index]`, L0 в
-/// префиксе). Ставится у пустой базы при открытии и после перенарезки всей базы.
+/// префиксе, токенизатор). Ставится у пустой базы при открытии и после перенарезки всех заметок.
 const CHUNKER_KEY: &str = "chunker";
+
+/// Ключ `meta`: отпечаток нарезки живых записей журналов (`crate::nodes::entry_chunker_fingerprint`,
+/// без L0 в префиксе). Отдельно от заметок: смена `chunk_prefix_l0` записи не перенарезает.
+const ENTRY_CHUNKER_KEY: &str = "chunker_entries";
 
 /// Почему база перечанковывается при открытии.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,44 +466,81 @@ fn has_meta(c: &Connection, key: &str) -> rusqlite::Result<bool> {
     )
 }
 
-/// Нужна ли перечанковка при открытии: флаг R1, чанки по оценке при точном счётчике или
-/// отпечаток нарезки базы не совпадает с текущим.
-async fn rechunk_pending(db: &Db) -> Result<Option<Rechunk>, StoreError> {
+/// Что перенарезать при открытии базы и почему.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RechunkPlan {
+    why: Rechunk,
+    notes: bool,
+    entries: bool,
+}
+
+/// Отпечатки нарезки процесса: `(заметки, записи журналов)`.
+fn fingerprints() -> (String, String) {
+    (
+        crate::nodes::chunker_fingerprint(),
+        crate::nodes::entry_chunker_fingerprint(),
+    )
+}
+
+/// Нужна ли перечанковка при открытии: флаг R1, чанки по оценке при точном счётчике (всё)
+/// или отпечаток нарезки заметок либо записей не совпадает с текущим (только расходящееся;
+/// сравнение — `crate::nodes::same_chunker`).
+async fn rechunk_pending(db: &Db) -> Result<Option<RechunkPlan>, StoreError> {
     let exact = crate::nodes::token_counter_exact();
-    let fingerprint = crate::nodes::chunker_fingerprint();
+    let (notes_fp, entries_fp) = fingerprints();
     db.read(move |c| {
-        let stored: Option<String> = c
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                [CHUNKER_KEY],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let stored = |key: &str| -> rusqlite::Result<Option<String>> {
+            c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+                .optional()
+        };
+        let all = |why| {
+            Some(RechunkPlan {
+                why,
+                notes: true,
+                entries: true,
+            })
+        };
         Ok(if has_meta(c, RECHUNK_V4)? {
-            Some(Rechunk::AfterV4)
+            all(Rechunk::AfterV4)
         } else if exact && has_meta(c, CHUNKED_APPROX)? {
-            Some(Rechunk::ExactCounter)
-        } else if stored.as_deref() != Some(fingerprint.as_str()) {
-            Some(Rechunk::Chunker)
+            all(Rechunk::ExactCounter)
         } else {
-            None
+            let same = |key: &str, fp: &str| -> rusqlite::Result<bool> {
+                Ok(crate::nodes::same_chunker(
+                    stored(key)?.as_deref(),
+                    fp,
+                    exact,
+                ))
+            };
+            let notes = !same(CHUNKER_KEY, &notes_fp)?;
+            let entries = !same(ENTRY_CHUNKER_KEY, &entries_fp)?;
+            (notes || entries).then_some(RechunkPlan {
+                why: Rechunk::Chunker,
+                notes,
+                entries,
+            })
         })
     })
     .await
 }
 
-/// Отпечаток нарезки базы — текущий: вызывается после перечанковки всех живых заметок и
+/// Отпечатки нарезки базы — текущие: вызывается после перечанковки всех живых заметок и
 /// записей (`reindex --full` без области).
 pub(crate) async fn mark_chunker_current(db: &Db) -> Result<(), StoreError> {
-    let fingerprint = crate::nodes::chunker_fingerprint();
-    db.write(move |tx| Ok(put_chunker(tx, &fingerprint)?)).await
+    let (notes_fp, entries_fp) = fingerprints();
+    db.write(move |tx| {
+        put_chunker(tx, CHUNKER_KEY, &notes_fp)?;
+        put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_fp)?;
+        Ok(())
+    })
+    .await
 }
 
-/// Записывает текущий отпечаток нарезки базы.
-fn put_chunker(tx: &Connection, fingerprint: &str) -> rusqlite::Result<()> {
+/// Записывает отпечаток нарезки `key` (заметок или записей) базы.
+fn put_chunker(tx: &Connection, key: &str, fingerprint: &str) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-        params![CHUNKER_KEY, fingerprint],
+        params![key, fingerprint],
     )?;
     Ok(())
 }
@@ -507,7 +548,7 @@ fn put_chunker(tx: &Connection, fingerprint: &str) -> rusqlite::Result<()> {
 /// База без живых заметок и записей (новая или пустая) — флаги перечанковки снимаются сразу,
 /// отпечаток нарезки ставится текущий, без фоновой задачи. `true` — сняты.
 async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
-    let fingerprint = crate::nodes::chunker_fingerprint();
+    let (notes_fp, entries_fp) = fingerprints();
     db.write(move |tx| {
         let any: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)
@@ -520,7 +561,8 @@ async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
                 "DELETE FROM meta WHERE key IN (?1, ?2)",
                 [RECHUNK_V4, CHUNKED_APPROX],
             )?;
-            put_chunker(tx, &fingerprint)?;
+            put_chunker(tx, CHUNKER_KEY, &notes_fp)?;
+            put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_fp)?;
         }
         Ok(!any)
     })
@@ -548,19 +590,36 @@ pub(crate) async fn clear_approx_if_exact(db: &Db) -> Result<(), StoreError> {
 /// открытии базы v4 все живые заметки перечанковываются. То же — при первом открытии с точным
 /// счётчиком базы, чанки которой нарезаны оценкой: иначе листы могут не уложиться в окно
 /// модели (усечение при инференсе) и разойтись с порогами §8.2. И при смене алгоритма или
-/// настроек нарезки (отпечаток `meta.chunker`, задача 17 M3). Кэш эмбеддингов ключуется по
-/// `embed_key`: повторный инференс — только у листов, текст или префикс которых изменился.
+/// настроек нарезки (отпечатки `meta.chunker` и `meta.chunker_entries`, задача 17 и финальная
+/// волна M3) — тогда только той части (заметки, записи), чей отпечаток разошёлся. Кэш
+/// эмбеддингов ключуется по `embed_key`: повторный инференс — только у листов, текст или
+/// префикс которых изменился; цель, нарезка которой не изменилась, не переписывается и не
+/// получает `upsert` (её точки в Qdrant уже совпадают с чанками).
 /// Флаги снимаются, а отпечаток ставится только после успеха: прерванная перечанковка
 /// повторится при следующем открытии (она идемпотентна). В лог идут только счётчики.
-async fn rechunk_all(db: &Db, why: Rechunk) -> Result<(), StoreError> {
+async fn rechunk_all(db: &Db, plan: RechunkPlan) -> Result<(), StoreError> {
+    let why = plan.why;
     tracing::info!(reason = why.as_str(), "перечанковка заметок базы");
     let started = std::time::Instant::now();
-    let fingerprint = crate::nodes::chunker_fingerprint();
-    let (notes, upserts) = crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX).await?;
-    let entries = crate::entries::rechunk_entries(db, None, PRIORITY_REINDEX).await?;
+    let (notes_fp, entries_fp) = fingerprints();
+    let (notes, upserts) = if plan.notes {
+        crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX, true).await?
+    } else {
+        (0, 0)
+    };
+    let entries = if plan.entries {
+        crate::entries::rechunk_entries(db, None, PRIORITY_REINDEX, true).await?
+    } else {
+        0
+    };
     db.write(move |tx| {
         tx.execute("DELETE FROM meta WHERE key = ?1", [RECHUNK_V4])?;
-        put_chunker(tx, &fingerprint)?;
+        if plan.notes {
+            put_chunker(tx, CHUNKER_KEY, &notes_fp)?;
+        }
+        if plan.entries {
+            put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_fp)?;
+        }
         Ok(())
     })
     .await?;

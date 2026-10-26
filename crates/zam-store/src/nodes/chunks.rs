@@ -90,13 +90,11 @@ pub const PREFIX_L0_MAX_TOKENS: usize = 50;
 /// на «:», H4–H6 в пути заголовков, выбор разреза по силе границы).
 const CHUNKER_VERSION: u32 = 2;
 
-/// Отпечаток нарезки процесса: версия алгоритма, пороги и флаги `[index]`, L0 в префиксе.
-/// Хранится в `meta` базы (`chunker`): база, нарезанная с другим отпечатком, перенарезается
-/// при открытии (кэш эмбеддингов по `embed_key` — повторный инференс только изменённых листов).
-pub(crate) fn chunker_fingerprint() -> String {
+/// Общая часть отпечатков нарезки: версия алгоритма, пороги и флаги `[index]`.
+fn chunker_base() -> String {
     let p = chunk_params();
     format!(
-        "v{CHUNKER_VERSION};{}/{}/{}/{}/{};lambda={};cohesion={};h4={};l0={}",
+        "v{CHUNKER_VERSION};{}/{}/{}/{}/{};lambda={};cohesion={};h4={}",
         p.target_min,
         p.target_max,
         p.hard_max,
@@ -105,8 +103,43 @@ pub(crate) fn chunker_fingerprint() -> String {
         p.boundary_lambda,
         u8::from(p.cohesion),
         u8::from(p.heading_path_h4),
-        u8::from(prefix_l0()),
     )
+}
+
+/// Отпечаток нарезки заметок процесса: версия алгоритма, пороги и флаги `[index]`, L0 в
+/// префиксе и идентификатор токенизатора (`;tok=…`, всегда последним — см. [`same_chunker`]).
+/// Хранится в `meta` базы (`chunker`): заметки базы, нарезанные с другим отпечатком,
+/// перенарезаются при открытии (кэш эмбеддингов по `embed_key` — повторный инференс только
+/// изменённых листов).
+pub(crate) fn chunker_fingerprint() -> String {
+    format!(
+        "{};l0={};tok={}",
+        chunker_base(),
+        u8::from(prefix_l0()),
+        token_counter().tokenizer_id()
+    )
+}
+
+/// Отпечаток нарезки записей журналов (`meta.chunker_entries`): как [`chunker_fingerprint`],
+/// но без L0 в префиксе — на записи флаг `chunk_prefix_l0` не влияет.
+pub(crate) fn entry_chunker_fingerprint() -> String {
+    format!("{};tok={}", chunker_base(), token_counter().tokenizer_id())
+}
+
+/// Совпадает ли отпечаток нарезки базы `stored` с текущим `current`. При счётчике-оценке
+/// (`exact == false`: модель не установлена или токенизатор откатился на оценку)
+/// идентификатор токенизатора не сравнивается: перенарезка оценкой базы, нарезанной точным
+/// токенизатором, только ухудшила бы листы (как в M2). Отпечаток без `;tok=` (база до
+/// финальной волны M3) при точном счётчике не совпадает — разовая перенарезка.
+pub(crate) fn same_chunker(stored: Option<&str>, current: &str, exact: bool) -> bool {
+    fn base(s: &str) -> &str {
+        s.rsplit_once(";tok=").map_or(s, |(b, _)| b)
+    }
+    match stored {
+        None => false,
+        Some(s) if exact => s == current,
+        Some(s) => base(s) == base(current),
+    }
 }
 
 /// Текущий счётчик токенов.
@@ -327,6 +360,93 @@ pub(crate) struct ChunkRow {
     pub token_count: i64,
 }
 
+/// Строка `chunks` нарезки заметки или записи журнала: пишется [`replace_chunks`].
+pub(crate) struct ChunkInsert {
+    pub id: String,
+    pub rev: i64,
+    pub level: &'static str,
+    pub heading_path: String,
+    pub ordinal: i64,
+    pub text: String,
+    pub context_prefix: String,
+    pub token_count: i64,
+    pub text_hash: String,
+    pub embed_key: String,
+}
+
+impl ChunkInsert {
+    /// Совпадает ли строка со строкой `chunks`, прочитанной [`replace_chunks`] (все
+    /// записываемые столбцы, кроме владельца).
+    fn same_as(&self, r: &rusqlite::Row<'_>) -> rusqlite::Result<bool> {
+        Ok(r.get_ref(0)?.as_str()? == self.id
+            && r.get::<_, i64>(1)? == self.rev
+            && r.get_ref(2)?.as_str()? == self.level
+            && r.get_ref(3)?.as_str()? == self.heading_path
+            && r.get::<_, i64>(4)? == self.ordinal
+            && r.get_ref(5)?.as_str()? == self.text
+            && r.get_ref(6)?.as_str()? == self.context_prefix
+            && r.get::<_, i64>(7)? == self.token_count
+            && r.get_ref(8)?.as_str()? == self.text_hash
+            && r.get::<_, Option<String>>(9)?.as_deref() == Some(self.embed_key.as_str()))
+    }
+}
+
+/// Заменяет чанки владельца (`col` — `node_id` или `entry_id`) строками `rows`, если нарезка
+/// отличается от записанной (любой столбец, включая текст); совпадающая не переписывается
+/// (FTS и `rowid` не трогаются). `true` — чанки переписаны. В транзакции писателя.
+pub(crate) fn replace_chunks(
+    c: &Connection,
+    col: &'static str,
+    owner: Id,
+    rows: &[ChunkInsert],
+) -> Result<bool, StoreError> {
+    let same = {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT id, rev, level, heading_path, ordinal, text, context_prefix, token_count,
+                    text_hash, embed_key
+             FROM chunks WHERE {col} = ?1 ORDER BY ordinal"
+        ))?;
+        let mut stored = st.query([owner])?;
+        let mut same = true;
+        for want in rows {
+            match stored.next()? {
+                Some(r) if want.same_as(r)? => {}
+                _ => {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        same && stored.next()?.is_none()
+    };
+    if same {
+        return Ok(false);
+    }
+    c.prepare_cached(&format!("DELETE FROM chunks WHERE {col} = ?1"))?
+        .execute([owner])?;
+    let mut st = c.prepare_cached(&format!(
+        "INSERT INTO chunks (id, {col}, rev, level, heading_path, ordinal, text,
+                             context_prefix, token_count, text_hash, embed_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+    ))?;
+    for r in rows {
+        st.execute(params![
+            r.id,
+            owner,
+            r.rev,
+            r.level,
+            r.heading_path,
+            r.ordinal,
+            r.text,
+            r.context_prefix,
+            r.token_count,
+            r.text_hash,
+            r.embed_key,
+        ])?;
+    }
+    Ok(true)
+}
+
 fn text_hash(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex().to_string()
 }
@@ -428,19 +548,18 @@ pub(crate) fn index_state(meta: &NoteMeta, kind: SpaceKind) -> &'static str {
     }
 }
 
-/// Пересобирает чанки заметки `node_id` по ревизии `rev`: старые удаляются
-/// (триггеры убирают их из FTS), новые вставляются всегда (и при `index: false`:
-/// чанки и FTS остаются, исключение — только из векторного индекса, §6.4).
-/// Вызывается внутри транзакции записи. Возвращает число вставленных чанков.
+/// Пересобирает чанки заметки `node_id` по ревизии `rev`: при отличии от записанных старые
+/// удаляются (триггеры убирают их из FTS), новые вставляются (и при `index: false`:
+/// чанки и FTS остаются, исключение — только из векторного индекса, §6.4); совпадающая
+/// нарезка не переписывается ([`replace_chunks`]).
+/// Вызывается внутри транзакции записи. `true` — чанки переписаны.
 pub(crate) fn rebuild_chunks(
     c: &Connection,
     node_id: Id,
     rev: i64,
     content: &str,
     meta: &NoteMeta,
-) -> Result<usize, StoreError> {
-    c.prepare_cached("DELETE FROM chunks WHERE node_id = ?1")?
-        .execute([node_id])?;
+) -> Result<bool, StoreError> {
     // L0 — записанный в узле (агентский, ручной или авто): строка узла обновляется до нарезки,
     // а перенарезка не знает агентского L0 из запроса записи
     let (space, path, name, l0): (String, String, String, Option<String>) = c.query_row(
@@ -455,35 +574,33 @@ pub(crate) fn rebuild_chunks(
         .as_ref()
         .map_or(&[][..], |f| &f.tags[..]);
     let tc = token_counter();
-    let chunks = note_chunks(content, &meta.doc, &name, tc.as_ref());
-    let mut st = c.prepare_cached(
-        "INSERT INTO chunks (id, node_id, rev, level, heading_path, ordinal, text,
-                             context_prefix, token_count, text_hash, embed_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-    )?;
-    for (ordinal, ch) in chunks.iter().enumerate() {
-        let ordinal = ordinal as i64;
-        let prefix = note_prefix(&space, &path, &name, &ch.heading_path, tags, l0.as_deref());
-        st.execute(params![
-            chunk_id(node_id, ordinal, &ch.text_hash),
-            node_id,
-            rev,
-            ch.level.as_str(),
-            ch.heading_path,
-            ordinal,
-            ch.text,
-            prefix,
-            ch.token_count,
-            ch.text_hash,
-            embed_key_of(&prefix, &ch.text),
-        ])?;
-    }
+    let rows: Vec<ChunkInsert> = note_chunks(content, &meta.doc, &name, tc.as_ref())
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, ch)| {
+            let ordinal = ordinal as i64;
+            let prefix = note_prefix(&space, &path, &name, &ch.heading_path, tags, l0.as_deref());
+            ChunkInsert {
+                id: chunk_id(node_id, ordinal, &ch.text_hash),
+                rev,
+                level: ch.level.as_str(),
+                ordinal,
+                embed_key: embed_key_of(&prefix, &ch.text),
+                context_prefix: prefix,
+                heading_path: ch.heading_path,
+                text: ch.text,
+                token_count: ch.token_count,
+                text_hash: ch.text_hash,
+            }
+        })
+        .collect();
+    let changed = replace_chunks(c, "node_id", node_id, &rows)?;
     // после нарезки: счётчик мог откатиться на оценку посреди заметки
     if !tc.is_exact() {
         c.prepare_cached("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')")?
             .execute([crate::user_db::CHUNKED_APPROX])?;
     }
-    Ok(chunks.len())
+    Ok(changed)
 }
 
 /// Строк в одной транзакции дозаполнения `embed_key`.
@@ -770,6 +887,10 @@ const RECHUNK_BATCH: i64 = 200;
 
 /// Перечанковывает живые заметки (`space = None` — всех пространств) текущим
 /// счётчиком токенов, пересчитывает `index_state` и ставит задания с `priority`.
+/// `only_changed` (перенарезка по отпечатку при открытии базы): проиндексированная заметка,
+/// нарезка которой не изменилась, не получает ни задания, ни нового `index_state` — её точки в
+/// Qdrant уже совпадают с чанками; без флага (reindex, пересборка коллекции) `upsert` ставится
+/// каждой индексируемой.
 /// L0 и прочие поля узла не меняются. Пакетами по [`RECHUNK_BATCH`] заметок
 /// в отдельных транзакциях; повторный запуск безопасен. Возвращает
 /// `(заметок, заданий upsert)`. В лог — только счётчики.
@@ -777,6 +898,7 @@ pub(crate) async fn rechunk_notes(
     db: &Db,
     space: Option<Id>,
     priority: i64,
+    only_changed: bool,
 ) -> Result<(u64, u64), StoreError> {
     let (mut notes, mut upserts) = (0u64, 0u64);
     let mut after: Option<Id> = None;
@@ -804,9 +926,13 @@ pub(crate) async fn rechunk_notes(
                 for &(id, rev, ref prev, kind) in &batch {
                     let content = revision_text(tx, id, rev)?;
                     let meta = note_meta(&content, None);
+                    let state = index_state(&meta, kind);
+                    let changed = rebuild_chunks(tx, id, rev, &content, &meta)?;
+                    if only_changed && !changed && prev == "indexed" && state != "excluded" {
+                        continue;
+                    }
                     tx.prepare_cached("UPDATE nodes SET index_state = ?2 WHERE id = ?1")?
-                        .execute(params![id, index_state(&meta, kind)])?;
-                    rebuild_chunks(tx, id, rev, &content, &meta)?;
+                        .execute(params![id, state])?;
                     let op = enqueue_for_note(tx, id, rev, Some(prev), priority, &now)?;
                     upserts += u64::from(op == Some(JobOp::Upsert));
                 }
@@ -873,6 +999,27 @@ b text.
             note_chunks("", &parse(""), "имя", &ApproxCounter)[0].text,
             "имя"
         );
+    }
+
+    #[test]
+    fn same_chunker_ignores_tokenizer_only_for_estimate() {
+        let cur = "v2;a;l0=0;tok=sha256:b";
+        assert!(same_chunker(Some(cur), cur, true));
+        assert!(!same_chunker(None, cur, true));
+        assert!(!same_chunker(None, cur, false));
+        let other_tok = "v2;a;l0=0;tok=sha256:c";
+        assert!(!same_chunker(Some(other_tok), cur, true));
+        assert!(
+            same_chunker(Some(other_tok), cur, false),
+            "оценка: токенизатор не сравнивается"
+        );
+        let legacy = "v2;a;l0=0";
+        assert!(
+            !same_chunker(Some(legacy), cur, true),
+            "база до токенизатора в отпечатке"
+        );
+        assert!(same_chunker(Some(legacy), cur, false));
+        assert!(!same_chunker(Some("v2;a;l0=1;tok=sha256:b"), cur, false));
     }
 
     #[test]
