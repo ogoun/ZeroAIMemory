@@ -1,6 +1,7 @@
 //! Smoke-тест комплекта: распаковка, запуск сервера, проверка API, клиента и Qdrant,
 //! векторный поиск на тестовой модели (M2), устройство модели, завершение Qdrant вместе с
-//! сервером; для Windows — статический CRT наших exe и app-local MSVC runtime библиотек.
+//! сервером; память решения (M3): регистрация решения, insight в выдаче, Vault; для
+//! Windows — статический CRT наших exe и app-local MSVC runtime библиотек.
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
 use std::collections::VecDeque;
@@ -788,6 +789,23 @@ pub fn run(
             )
         }),
     )?;
+    s.run("M3: регистрация решения", register_solution(&base, &token))?;
+    s.run(
+        "M3: insight-гипотеза в top-3 поиска по решению",
+        insight_found(&zam, &dir, &base, &token).map_err(|e| {
+            anyhow!(
+                "{e:#}
+stderr сервера (целиком — {}):
+{}",
+                server_log.display(),
+                srv.log_tail()
+            )
+        }),
+    )?;
+    s.run(
+        "M3: zam vault set → get возвращает то же значение",
+        vault_roundtrip(&zam, &dir, &base, &token),
+    )?;
     s.run(
         "Qdrant запущен сервером (pid-файл, qdrant status --json)",
         qdrant_alive(&env, &root, &data).and_then(|(alive, j)| {
@@ -1129,6 +1147,155 @@ fn vector_search(
         model,
         waited,
     })
+}
+
+// ---- M3: память решения ----
+
+/// GUID решения smoke-теста (`agent_solution_id`).
+const SMOKE_SOLUTION: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e99";
+
+/// Insight smoke-теста: заголовок, текст и запрос (английский — тестовая модель англоязычная).
+const INSIGHT_TITLE: &str = "Shell scripts need LF line endings";
+const INSIGHT_BODY: &str = "Scripts saved with CRLF fail with bad interpreter errors on Linux.";
+const INSIGHT_QUERY: &str = "bad interpreter error in shell scripts";
+
+/// Значение секрета smoke-теста (только stdin `zam vault set`, не аргументы).
+const SMOKE_SECRET: &str = "smoke-vault-value-5f2c9e";
+
+/// Критерий M3: `POST /solutions` регистрирует решение (201).
+fn register_solution(base: &str, token: &str) -> Result<()> {
+    let body = serde_json::json!({ "agent_solution_id": SMOKE_SOLUTION, "name": "smoke" });
+    let (status, v) = api(base, token, "/api/v1/solutions", Some(&body))?;
+    if status != 201 {
+        bail!("POST /api/v1/solutions: HTTP {status}: {v}");
+    }
+    if v["role"] != "owner" || v["kind"] != "solution" {
+        bail!(
+            "решение зарегистрировано не владельцем: role = {}, kind = {}",
+            v["role"],
+            v["kind"]
+        );
+    }
+    Ok(())
+}
+
+/// Критерий M3: `zam log insight --certainty hypothesis` → поиск по решению находит запись
+/// в top-3 с `kind = insight` и `certainty = hypothesis` (ожидание индексации ≤ 60 с).
+fn insight_found(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let home = dir.join("insight-home");
+    fs::create_dir_all(&home)?;
+    zam_ok(
+        zam,
+        &home,
+        base,
+        token,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            INSIGHT_TITLE,
+            "--certainty",
+            "hypothesis",
+            "--solution",
+            SMOKE_SOLUTION,
+        ],
+        Some(INSIGHT_BODY.as_bytes()),
+    )?;
+    let body = serde_json::json!({
+        "query": INSIGHT_QUERY,
+        "scope": { "solution": SMOKE_SOLUTION },
+        "top_k": 3,
+    });
+    let t0 = Instant::now();
+    let found = loop {
+        let (status, v) = api(base, token, "/api/v1/search", Some(&body))?;
+        if status != 200 {
+            bail!("POST /api/v1/search: HTTP {status}");
+        }
+        if v["degraded"] == false && v["pending_count"] == 0 {
+            break v;
+        }
+        if t0.elapsed() > INDEX_WAIT {
+            bail!(
+                "за {} с insight не проиндексирован или поиск деградирован: degraded = {},                  degraded_reason = {}, pending_count = {}",
+                INDEX_WAIT.as_secs(),
+                v["degraded"],
+                v["degraded_reason"],
+                v["pending_count"]
+            );
+        }
+        thread::sleep(Duration::from_millis(500));
+    };
+    let items = found["items"]
+        .as_array()
+        .context("в ответе поиска нет items")?;
+    let hit = items
+        .iter()
+        .take(3)
+        .find(|i| i["title"] == INSIGHT_TITLE)
+        .with_context(|| {
+            format!(
+                "«{INSIGHT_QUERY}» не нашёл insight в top-3: {}",
+                describe_items(&found)
+            )
+        })?;
+    if hit["kind"] != "insight" || hit["certainty"] != "hypothesis" {
+        bail!(
+            "найденная запись: kind = {}, certainty = {} (ожидались insight и hypothesis)",
+            hit["kind"],
+            hit["certainty"]
+        );
+    }
+    Ok(())
+}
+
+/// Критерий M3: `zam vault set` (значение из stdin) → `zam vault get --raw` возвращает то же
+/// значение; в выводе `set` значения нет.
+fn vault_roundtrip(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let home = dir.join("vault-home");
+    fs::create_dir_all(&home)?;
+    let run = |args: &[&str], input: Option<&[u8]>| zam_ok(zam, &home, base, token, args, input);
+    let set = run(
+        &[
+            "vault",
+            "set",
+            "smoke-key",
+            "--type",
+            "token",
+            "--solution",
+            SMOKE_SOLUTION,
+        ],
+        Some(SMOKE_SECRET.as_bytes()),
+    )?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&set.stdout),
+        String::from_utf8_lossy(&set.stderr)
+    );
+    if text.contains(SMOKE_SECRET) {
+        bail!("вывод zam vault set содержит значение");
+    }
+    let got = run(
+        &[
+            "vault",
+            "get",
+            "smoke-key",
+            "--raw",
+            "--solution",
+            SMOKE_SOLUTION,
+        ],
+        None,
+    )?;
+    if got.stdout != SMOKE_SECRET.as_bytes() {
+        bail!(
+            "zam vault get вернул другое значение ({} байт вместо {})",
+            got.stdout.len(),
+            SMOKE_SECRET.len()
+        );
+    }
+    Ok(())
 }
 
 /// `zam-server qdrant status --json` по каталогу данных: pid-файл указывает на живой процесс
