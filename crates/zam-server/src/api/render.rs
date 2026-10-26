@@ -209,7 +209,7 @@ pub async fn render(db: &Db, ctx: Option<RenderCtx>, text: String) -> Result<Ren
     let resolver = MapResolver { links, attachments };
     tokio::task::spawn_blocking(move || render_html(&text, &resolver))
         .await
-        .map_err(|e| ApiError::Internal(format!("рендер прерван: {e}")))
+        .map_err(|e| ApiError::aborted("рендер", &e))
 }
 
 /// Ссылки на вложения документа → URL блобов (неразрешённые отсутствуют).
@@ -345,7 +345,7 @@ pub async fn preview(
             let md = req.md;
             tokio::task::spawn_blocking(move || render_html(&md, &zam_markdown::NoResolve))
                 .await
-                .map_err(|e| ApiError::Internal(format!("рендер прерван: {e}")))?
+                .map_err(|e| ApiError::aborted("рендер", &e))?
         }
     };
     Ok(Json(json!({

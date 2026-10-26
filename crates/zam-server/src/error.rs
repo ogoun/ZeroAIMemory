@@ -67,6 +67,17 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// 500 для прерванной задачи `spawn_blocking`: в журнал — только вид сбоя. Текст паники
+    /// (`JoinError` через `Display`) не выводится: при панике на срезе строки в нём бывает
+    /// до 256 символов незамаскированного исходника заметки.
+    pub fn aborted(what: &str, e: &tokio::task::JoinError) -> ApiError {
+        ApiError::Internal(format!(
+            "{what} прерван (panic = {}, cancelled = {})",
+            e.is_panic(),
+            e.is_cancelled()
+        ))
+    }
+
     /// Конфликт без расширений.
     pub fn conflict(detail: impl Into<String>) -> ApiError {
         ApiError::Conflict {
@@ -222,4 +233,24 @@ impl IntoResponse for ApiError {
 /// Обработчик неизвестных маршрутов.
 pub async fn not_found() -> ApiError {
     ApiError::NotFound
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Текст паники (с фрагментом заметки) не попадает ни в подробности 500, ни в ответ.
+    #[tokio::test]
+    async fn aborted_hides_panic_message() {
+        let e = tokio::task::spawn_blocking(|| panic!("SECRET-MARKER ghp_abc"))
+            .await
+            .unwrap_err();
+        let err = ApiError::aborted("рендер", &e);
+        let ApiError::Internal(d) = &err else {
+            panic!("ожидалась Internal");
+        };
+        assert!(!d.contains("SECRET-MARKER"), "{d}");
+        assert!(d.contains("panic = true"), "{d}");
+        assert!(!err.to_string().contains("SECRET-MARKER"));
+    }
 }

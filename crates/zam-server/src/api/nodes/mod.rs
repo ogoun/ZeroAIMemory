@@ -116,7 +116,7 @@ pub(crate) async fn diff_blocking(
 ) -> Result<String, ApiError> {
     tokio::task::spawn_blocking(move || unified_diff(&old, &new, &old_label, &new_label))
         .await
-        .map_err(|e| ApiError::Internal(format!("дифф прерван: {e}")))
+        .map_err(|e| ApiError::aborted("дифф", &e))
 }
 
 fn patch_error(e: PatchError) -> ApiError {
