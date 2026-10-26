@@ -152,7 +152,8 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Атомарная публикация нового файла ключа **без перезаписи**: `<имя>.tmp` (на Linux сразу
-/// 0600, на Windows — DACL только владельцу, SYSTEM и администраторам), `write_all` +
+/// 0600, на Windows — DACL только владельцу, SYSTEM и администраторам, до записи
+/// содержимого — [`create_private`]), `write_all` +
 /// `sync_all`, затем `hard_link(tmp, path)` — занятое имя даёт `AlreadyExists` (ключ
 /// создаётся один раз), `tmp` удаляется, каталог синхронизируется. Без жёстких ссылок —
 /// `rename` после проверки отсутствия `path` (между проверкой и `rename` окна защищает
@@ -167,20 +168,10 @@ fn publish_key_file(path: &Path, key: &SecretKey) -> std::io::Result<()> {
     let tmp = tmp_path(path);
     let _ = std::fs::remove_file(&tmp);
     let written = (|| {
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600);
-        }
-        let mut f = o.open(&tmp)?;
+        let mut f = create_private(&tmp)?;
         let text = Zeroizing::new(format!("{}\n", STANDARD.encode(key.as_slice())));
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        drop(f);
-        #[cfg(windows)]
-        super::acl::restrict_to_owner(&tmp)?;
         Ok::<_, std::io::Error>(())
     })();
     if let Err(e) = written {
@@ -201,6 +192,74 @@ fn publish_key_file(path: &Path, key: &SecretKey) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&tmp);
     published?;
     sync_dir(&dir)
+}
+
+/// Создаёт новый пустой файл (`create_new`) с правами только владельца **до** записи
+/// содержимого: на Linux — `mode(0o600)` при создании, на Windows — защищённый DACL
+/// ([`super::acl::restrict_to_owner`]) сразу после создания, пока файл пуст (открытый
+/// дескриптор записи DACL не отзывает). Ключ никогда не лежит в файле с унаследованными
+/// правами каталога.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let f = o.open(path)?;
+    #[cfg(windows)]
+    if let Err(e) = super::acl::restrict_to_owner(path) {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(f)
+}
+
+/// Кто, кроме владельца, может прочитать существующий файл ключа: на Linux — права группы
+/// и прочих (`mode & 0o077`), на Windows — SID из DACL ([`super::acl::foreign_readers`]).
+/// `None` — только владелец (и SYSTEM, администраторы на Windows).
+fn key_file_exposure(path: &Path) -> std::io::Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        Ok((mode & 0o077 != 0).then(|| format!("права {mode:03o}")))
+    }
+    #[cfg(windows)]
+    {
+        let readers = super::acl::foreign_readers(path)?;
+        Ok((!readers.is_empty()).then(|| format!("DACL разрешает чтение: {}", readers.join(", "))))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+/// Предупреждение при старте, если файл ключа читают не только владелец (ключ из бэкапа с
+/// правами 0644, файл в каталоге с наследуемым доступом «Пользователи»).
+/// **[решение исполнителя]** предупреждение, а не блокировка Vault: блокировка не отзывает
+/// уже открытый доступ к файлу и к копиям, а лишь отключает секреты до правки прав;
+/// права, выставленные администратором намеренно (например, 0640 для агента бэкапа),
+/// не меняются сами. Права файла, созданного сервером, — всегда только владелец.
+fn warn_if_exposed(path: &Path) {
+    match key_file_exposure(path) {
+        Ok(None) => {}
+        Ok(Some(who)) => tracing::warn!(
+            path = %path.display(),
+            access = %who,
+            "файл мастер-ключа Vault доступен не только владельцу: ограничьте права \
+             (Linux: chmod 600; Windows: только владелец, SYSTEM и администраторы)"
+        ),
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            error = %e.kind(),
+            "не удалось проверить права файла мастер-ключа Vault"
+        ),
+    }
 }
 
 /// Сбой хранилища при проверке ключа: повреждённая настройка — блокировка, прочее — ошибка
@@ -238,6 +297,7 @@ async fn resolve(
     match std::fs::read_to_string(&path) {
         Ok(text) => {
             let text = Zeroizing::new(text);
+            warn_if_exposed(&path);
             Ok(match decode_key(&text) {
                 Some(k) => Ok((k, Source::File)),
                 None => Err(format!(
@@ -466,6 +526,60 @@ mod tests {
 
     async fn user(sys: &SystemStore) -> Id {
         sys.create_user("u", false).await.unwrap().id
+    }
+
+    /// Файл создаётся с правами только владельца **до** записи ключа: новый пустой файл уже
+    /// закрыт (финальная волна M3; на Windows DACL ставился после записи содержимого).
+    #[test]
+    fn private_file_restricted_before_write() {
+        let d = dir("private-before-write");
+        let p = d.join("k.tmp");
+        let f = create_private(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 0, "ещё пуст");
+        assert_eq!(key_file_exposure(&p).unwrap(), None);
+        drop(f);
+        assert_eq!(
+            create_private(&p).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "без перезаписи"
+        );
+    }
+
+    /// Существующий ключ, читаемый не только владельцем, замечается при старте (ключ из
+    /// бэкапа с правами 0644 или унаследованным доступом каталога): Vault работает,
+    /// в журнале — предупреждение.
+    #[tokio::test]
+    async fn exposed_key_file_detected_vault_still_ready() {
+        let (cfg, sys, _dd) = setup("exposed");
+        let path = master_key_path(&cfg);
+        let v = VaultKeys::load_with(&cfg, &sys, None).await.unwrap();
+        assert_eq!(v.state(), &VaultState::Ready);
+        assert_eq!(
+            key_file_exposure(&path).unwrap(),
+            None,
+            "созданный сервером"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                key_file_exposure(&path).unwrap().as_deref(),
+                Some("права 644")
+            );
+        }
+        #[cfg(windows)]
+        {
+            super::super::acl::set_dacl_for_test(&path, "D:P(A;;FA;;;OW)(A;;FR;;;BU)");
+            let who = key_file_exposure(&path).unwrap().unwrap();
+            assert!(who.contains("S-1-5-32-545"), "{who}");
+        }
+        let v = VaultKeys::load_with(&cfg, &sys, None).await.unwrap();
+        assert_eq!(
+            v.state(),
+            &VaultState::Ready,
+            "предупреждение, не блокировка"
+        );
     }
 
     #[tokio::test]
