@@ -319,3 +319,11 @@
   - WebUI: `npm ci`, `npm run check` — 0 ошибок; `npm run test:build` — 4 passed; `npm run build`; `size-limit` — 78,05 КБ gzip из 300; `npm run e2e` — 27 passed;
   - `cargo build --release`, `cargo xtask package` cpu и gpu (`--cuda`): комплекты cpu 57 МиБ, gpu 204 МиБ, `zam-cuda` 976 МиБ; smoke cpu — `SMOKE OK` (20 шагов, из них 3 — M3; device=cpu); `smoke-cuda` — `SMOKE-CUDA OK`; smoke gpu + `zam-cuda` — `SMOKE OK`, device=cuda, первый старт до `/health` 7,8 с (GPU свободен).
 - Не проверено: CI на обеих ОС (после push — контроллер); Linux локально, GPU на Linux; `real_cuda_archives_install` (сеть). **Приёмка M3 условна до зелёного CI на финальном HEAD ветки.**
+
+## 2026-10-26 — Этап M3: финальная волна (документы)
+
+- Основание — финальное ревью ветки `m3-journals` (`ab4255b`: Critical — нет, Important — 2, оба в документах); подробно — журнал решений M3, запись «Финальная волна M3 — документы по финальному ревью».
+- Человеческий токен: ТЗ §11.4, `deploy/README-install.md` и CHANGELOG описывают модель угроз честно — защита `--human` клиентская, агент под той же учётной записью ОС может прочитать `~/.zeroaimemory/config.toml` и поставить `axiom` через REST; рекомендации — `axiom` в WebUI, токен вне досягаемости агента; варианты защиты — вопрос владельцу п. 2.
+- Откат 0.0.4-m3 → 0.0.3-m2 (и на M1): копии `bak-v<N>` — снимки на момент обновления, теряется всё записанное после; перед подкладыванием копии — штатная остановка и удаление `*-wal`/`*-shm` заменяемых баз (режим WAL); экспорта до M7 нет — нужное сохраняется `zam read`.
+- Мастер-ключ Vault: бэкап каталога данных вместе с `master.key` раскрывает Vault — ключ вне `data_dir` (`ZAM_MASTER_KEY`, `[vault] master_key_file`) или исключать из бэкапа (README, `config.example.toml`, ТЗ §7.6).
+- ТЗ v1.11: §12 — `POST /entries/{id}/feedback` и `PATCH /solutions/{guid}` — этап M4, сводка эндпоинтов, которых нет в API на `0.0.4-m3`. Вопросы владельцу 24–26 (отключённый владелец решения, `GET /triggers` против поиска, оракул 403/404 для ожидающего доступа); фикстура базы M2 — в «Итог M3: отложенное».
