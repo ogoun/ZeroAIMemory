@@ -467,8 +467,10 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
         READY,
         async || b.st.index.vector_available().is_ok() && points(&b, Some("keep")).await == pts,
         async || {
-            // qdrant.error и state.reason — причина, по которой канал не включился
-            let s = status(&b).await;
+            // qdrant.error и state.reason — причина, по которой канал не включился; статус —
+            // сессией администратора: после перезапуска первичного токена нет (`initial_token`
+            // выдаётся только при создании администратора), запрос по токену дал бы 401
+            let s = adm_status(&b).await;
             format!(
                 "{}; qdrant = {}; vector = {}; ожидалось точек {pts}",
                 vector_diag(&b),
