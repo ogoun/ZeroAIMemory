@@ -667,7 +667,11 @@ impl SectionTable {
     /// Разбор исходника (CPU, до `note_max_bytes`): вызывать вне async-потока.
     fn build(src: String) -> Self {
         #[cfg(test)]
-        assert!(!src.contains(PANIC_BUILD_MARK), "тестовая паника разбора");
+        assert!(
+            !src.contains(PANIC_BUILD_MARK),
+            "тестовая паника разбора: {}",
+            &src[..src.len().min(256)]
+        );
         let doc = zam_markdown::parse(&src);
         let secs = (0..doc.sections.len())
             .filter_map(|i| {
@@ -789,10 +793,16 @@ struct SectionCache {
     builds: usize,
 }
 
-/// Разбор или поиск секции прерван (паника в `spawn_blocking`): WARN в журнал (без текста) и
-/// одно предупреждение ответа; элемент отдаётся с текстом листа.
+/// Разбор или поиск секции прерван (паника в `spawn_blocking`): WARN в журнал и одно
+/// предупреждение ответа; элемент отдаётся с текстом листа. В журнал — только признаки
+/// `panic`/`cancelled`, без `Display` у `JoinError`: сообщение паники (например, среза строки)
+/// может содержать фрагмент исходника заметки, в том числе незамаскированный секрет.
 fn section_failed(health: &mut Health<'_>, what: &str, e: &tokio::task::JoinError) {
-    tracing::warn!(error = %e, "expand=section: {what} прерван, элемент без секции");
+    tracing::warn!(
+        panic = e.is_panic(),
+        cancelled = e.is_cancelled(),
+        "expand=section: {what} прерван, элемент без секции"
+    );
     if !health
         .warnings
         .iter()
@@ -2165,8 +2175,17 @@ mod tests {
     /// ревью fix round 2 задачи 17).
     #[tokio::test]
     async fn expand_section_panic_degrades_to_leaf() {
+        // журнал теста: текст паники (в нём фрагмент исходника заметки) туда не попадает
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
         let leaf = "Абзац про перенос данных пакетами.".to_string();
-        let content = format!("# Док\n\n## Детали\n\n{leaf}\n\n{PANIC_BUILD_MARK}\n");
+        let secret = "zam-test-note-secret-7f3a";
+        let content = format!("# Док\n\n## Детали\n\n{leaf} {secret}\n\n{PANIC_BUILD_MARK}\n");
         let (t, node) = note_target("search-expand-panic", content).await;
         let targets = vec![t];
         let mut h = Health::new(&targets, Vec::new());
@@ -2179,6 +2198,43 @@ mod tests {
         assert_eq!(out[0].text.as_ref().unwrap().0, leaf, "текст листа");
         assert_eq!(h.warnings, [WARN_SECTION_UNAVAILABLE]);
         assert!(h.alive[0], "цель не исключена");
+        let log = buf.text();
+        assert!(
+            log.contains("элемент без секции") && log.contains("panic=true"),
+            "{log}"
+        );
+        assert!(!log.contains(secret), "текст заметки в журнале: {log}");
+        assert!(
+            !log.contains("тестовая паника"),
+            "сообщение паники в журнале: {log}"
+        );
+    }
+
+    /// Буфер журнала теста (`tracing_subscriber::fmt().with_writer`).
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
     }
 
     /// Ключ кэша секций и слияния — с индексом цели: один и тот же `(узел, ревизия)` в двух
