@@ -180,14 +180,7 @@ impl ServerProc {
             &[],
             Some(&serde_json::json!({"login": "admin", "password": PASSWORD})),
         )
-        .unwrap_or_else(|e| {
-            panic!(
-                "вход администратора: {e}
-stderr:
-{}",
-                self.tail()
-            )
-        });
+        .unwrap_or_else(|e| self.fail("вход администратора", e));
         assert_eq!(code, 200, "вход администратора: {v}");
         let cookie = head
             .lines()
@@ -226,14 +219,7 @@ stderr:
         }
         http_with(self.addr, method, path, &h, body)
             .map(|(code, _, v)| (code, v))
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{method} {path}: {e}
-stderr:
-{}",
-                    self.tail()
-                )
-            })
+            .unwrap_or_else(|e| self.fail(&format!("{method} {path}"), e))
     }
 
     /// Запрос с токеном и дополнительными заголовками (`X-Zam-Session`, `If-Match` …).
@@ -250,14 +236,7 @@ stderr:
         h.extend_from_slice(extra);
         http_with(self.addr, method, path, &h, body)
             .map(|(code, _, v)| (code, v))
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{method} {path}: {e}
-stderr:
-{}",
-                    self.tail()
-                )
-            })
+            .unwrap_or_else(|e| self.fail(&format!("{method} {path}"), e))
     }
 
     /// Запрос с токеном и сырым телом (`multipart/form-data`); ответ — сырые байты.
@@ -271,14 +250,12 @@ stderr:
         let auth = format!("Bearer {token}");
         http_bytes(self.addr, method, path, &[("Authorization", &auth)], body)
             .map(|(code, _, b)| (code, b))
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{method} {path}: {e}
-stderr:
-{}",
-                    self.tail()
-                )
-            })
+            .unwrap_or_else(|e| self.fail(&format!("{method} {path}"), e))
+    }
+
+    /// Паника «что: ошибка» с хвостом stderr сервера.
+    fn fail(&self, what: &str, e: std::io::Error) -> ! {
+        panic!("{what}: {e}\nstderr:\n{}", self.tail())
     }
 
     /// GET в сессии администратора (`session` — из [`ServerProc::admin_session`]).

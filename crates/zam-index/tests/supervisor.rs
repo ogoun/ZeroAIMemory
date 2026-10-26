@@ -108,14 +108,19 @@ fn wait_gone(pid: u32, limit: Duration) -> bool {
 }
 
 const READY_LIMIT: Duration = Duration::from_secs(10);
-/// Предел повторного старта сразу после создания коллекции. Записи идут клиентом без
+/// Предел повторного старта сразу после создания коллекции в
+/// `start_ready_restart_with_collection_and_clean_shutdown`. Коллекция пишется клиентом без
 /// отметки супервизора (`QdrantIndex::connect`, не `connect_index`), поэтому остановка не
-/// ждёт подтверждения WAL, и старт повторяет WAL создания коллекции с 12 payload-индексами
-/// и синхронно сбрасывает сегменты: на HDD 7,5 с в одиночном прогоне и больше 10 с в
-/// полном `cargo test --workspace` (задача 20 M3). Для Windows (`TerminateProcess`) это
-/// сценарий жёсткой остановки после записи, целью §17 (5 с) не покрытый; время старта
-/// мерит `cargo xtask bench --scenario first-start`, здесь проверяется сам перезапуск.
-const RESTART_LIMIT: Duration = Duration::from_secs(30);
+/// ждёт подтверждения WAL, и старт повторяет WAL создания коллекции с синхронным сбросом
+/// сегментов: для Windows (`TerminateProcess`) это сценарий жёсткой остановки после записи,
+/// целью §17 (5 с) не покрытый. Замеры на HDD (задача 20 M3): одиночный прогон бинарника —
+/// 6,5–7,6 с (4 прогона); в задачах 19 и 19b тот же код укладывался в 10 с и в полном
+/// `cargo test --workspace`, в задаче 20 два полных прогона подряд превысили 10 с — стенд
+/// медленнее (бинарник 206–217 с против 168–198 с), причина не установлена. Малый запас
+/// при 10 с, возможно, объясняется 12 payload-индексами против 6 в M2 — гипотеза, не замер.
+/// 20 с — около 2,6× от наблюдаемого максимума: сторож регрессии остаётся (старт M2 после
+/// штатной остановки — 1–2 с), шум HDD тест не роняет. Время печатается (`--nocapture`).
+const RESTART_LIMIT: Duration = Duration::from_secs(20);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_ready_restart_with_collection_and_clean_shutdown() {
@@ -674,7 +679,7 @@ async fn config_renders_flush_interval_and_wal() {
         .await
         .unwrap();
     let mut rx = sup.state();
-    wait_state(&mut rx, RESTART_LIMIT, "Ready (повтор)", is_ready).await;
+    wait_state(&mut rx, READY_LIMIT, "Ready (повтор)", is_ready).await;
     let idx = sup.connect_index().unwrap();
     let meta = idx
         .ensure(common::cases::MODEL, common::cases::DIM)

@@ -794,9 +794,7 @@ pub fn run(
         "M3: insight-гипотеза в top-3 поиска по решению",
         insight_found(&zam, &dir, &base, &token).map_err(|e| {
             anyhow!(
-                "{e:#}
-stderr сервера (целиком — {}):
-{}",
+                "{e:#}\nstderr сервера (целиком — {}):\n{}",
                 server_log.display(),
                 srv.log_tail()
             )
@@ -1219,7 +1217,8 @@ fn insight_found(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> 
         }
         if t0.elapsed() > INDEX_WAIT {
             bail!(
-                "за {} с insight не проиндексирован или поиск деградирован: degraded = {},                  degraded_reason = {}, pending_count = {}",
+                "за {} с insight не проиндексирован или поиск деградирован: degraded = {}, \
+                 degraded_reason = {}, pending_count = {}",
                 INDEX_WAIT.as_secs(),
                 v["degraded"],
                 v["degraded_reason"],

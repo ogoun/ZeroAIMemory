@@ -146,6 +146,20 @@ fn denied((code, j): (u16, Value), state: &str, what: &str) {
     assert_eq!(j["state"], state, "{what}: {j}");
 }
 
+/// 403 записи участника `ro`: отказ именно по режиму доступа к решению, а не по другой
+/// причине (`ApiError::Denied`: `about:blank` с пояснением режима).
+#[track_caller]
+fn ro_denied(code: u16, j: &Value) {
+    assert_eq!(code, 403, "{j}");
+    assert_eq!(j["type"], "about:blank", "{j}");
+    assert!(
+        j["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("доступ участника к решению — ro")),
+        "{j}"
+    );
+}
+
 /// 403 `/problems/certainty` с кодом `axiom-requires-human`.
 #[track_caller]
 fn axiom_denied((code, j): (u16, Value)) {
@@ -454,7 +468,7 @@ fn isolation_human_vault_and_solution_access() {
         &b,
         Some(&note(G_ISO, "взлом", "# x\n")),
     );
-    assert_eq!(code, 403, "{j}");
+    ro_denied(code, &j);
     let (code, j) = srv.call_h(
         "PUT",
         &format!("/api/v1/nodes/{sol_id}"),
@@ -462,14 +476,14 @@ fn isolation_human_vault_and_solution_access() {
         Some(&json!({"content": "# правка\n"})),
         &[("If-Match", "\"1\"")],
     );
-    assert_eq!(code, 403, "{j}");
+    ro_denied(code, &j);
     let (code, j) = srv.call(
         "POST",
         &format!("/api/v1/spaces/{G_ISO}/entries"),
         &b,
         Some(&json!({"kind": "insight", "title": "x", "data": {"kind": "gotcha"}})),
     );
-    assert_eq!(code, 403, "{j}");
+    ro_denied(code, &j);
     // Knowledge, Rules, Human и Vault A — 404 по id; пространства A, кроме решения, — 404
     for p in [
         format!("/api/v1/nodes/{k_id}"),
@@ -539,8 +553,7 @@ fn isolation_human_vault_and_solution_access() {
             "PUT",
             &format!("/api/v1/nodes/{sol_id}"),
             &b,
-            Some(&json!({"content": "# после отзыва
-"})),
+            Some(&json!({"content": "# после отзыва\n"})),
             &[("If-Match", "\"2\"")],
         ),
         "revoked",
