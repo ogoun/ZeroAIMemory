@@ -194,27 +194,26 @@ fn publish_key_file(path: &Path, key: &SecretKey) -> std::io::Result<()> {
     sync_dir(&dir)
 }
 
-/// Создаёт новый пустой файл (`create_new`) с правами только владельца **до** записи
-/// содержимого: на Linux — `mode(0o600)` при создании, на Windows — защищённый DACL
-/// ([`super::acl::restrict_to_owner`]) сразу после создания, пока файл пуст (открытый
-/// дескриптор записи DACL не отзывает). Ключ никогда не лежит в файле с унаследованными
-/// правами каталога.
+/// Создаёт новый пустой файл (`create_new`, без перезаписи) сразу с правами только владельца:
+/// на Linux — `mode(0o600)` при создании, на Windows — защищённый DACL в самом `CreateFileW`
+/// ([`super::acl::create_private_file`]). Файла с унаследованными правами каталога не бывает
+/// ни мгновения — ни содержимого, ни дескриптора, открытого с этими правами.
 fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    let f = o.open(path)?;
     #[cfg(windows)]
-    if let Err(e) = super::acl::restrict_to_owner(path) {
-        drop(f);
-        let _ = std::fs::remove_file(path);
-        return Err(e);
+    {
+        super::acl::create_private_file(path)
     }
-    Ok(f)
+    #[cfg(not(windows))]
+    {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        o.open(path)
+    }
 }
 
 /// Кто, кроме владельца, может прочитать существующий файл ключа: на Linux — права группы

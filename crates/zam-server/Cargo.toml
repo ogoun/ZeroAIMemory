@@ -58,7 +58,7 @@ rand.workspace = true
 
 # Vault: DACL файла мастер-ключа (только владелец, SYSTEM, администраторы)
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [build-dependencies]
 memory-serve.workspace = true
