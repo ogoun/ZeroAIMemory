@@ -2,6 +2,9 @@
 # vcruntime140.dll для Windows здесь не загружается: при упаковке копируется из установленного VC Redist.
 # Версия встраивается при сборке: zam-index/build.rs (ожидаемая версия супервизора, путь qdrant/<ver>/) и
 # zam-server (манифест `zam-server qdrant fetch`); после правки нужна пересборка сервера.
+# При обновлении Qdrant проверить формат (JSON `{ack_index}`) и путь `storage/collections/zam_chunks/0/wal/first-index`
+# (ack_index WAL, `zam_index::supervisor::wal_ack`): по нему штатная остановка ждёт подтверждения WAL
+# и считается `/index/status` → `qdrant.wal_pending_ops`; тесты — supervisor::shutdown_waits_for_flush_bounded.
 name = "qdrant"
 version = "1.19.2"
 

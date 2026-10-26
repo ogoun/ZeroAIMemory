@@ -14,7 +14,8 @@ RestartSec=3
 # Сервер корректно завершается по SIGTERM. Худший случай — 90 с: воркер индексации (обычно < 1 с,
 # недоделанная пачка инференса — до 60 с), перечанковка после миграции (до 10 с), ожидание
 # подтверждения WAL Qdrant (qdrant.shutdown_flush_wait_ms, до 10 с), SIGTERM Qdrant (до 10 с).
-# Обычно после записи — около 10–15 с.
+# Обычно после записи — около 10–15 с. При qdrant.shutdown_flush_wait_ms = 60000 (максимум)
+# поднимите TimeoutStopSec примерно до 140.
 KillSignal=SIGTERM
 TimeoutStopSec=90
 NoNewPrivileges=true

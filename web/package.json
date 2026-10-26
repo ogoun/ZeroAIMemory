@@ -1,8 +1,11 @@
 {
   "name": "zam-web",
   "private": true,
-  "version": "0.0.3-m2",
+  "version": "0.0.4-m3",
   "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
