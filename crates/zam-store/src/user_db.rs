@@ -767,6 +767,14 @@ pub async fn create_solution_with_id(
     .await
 }
 
+/// Сброс `index_state` живых индексируемых заметок пространства `?1` в `pending` (смена GUID
+/// решения): узлы — по живому индексу `nodes_live_children (space_id=?)`, корзина не
+/// просматривается (план закреплён тестом `jobs::tests::indexable_count_and_folders_skip_trash`).
+pub(crate) const SPACE_NOTES_PENDING_SQL: &str = "UPDATE nodes SET index_state = 'pending'
+     WHERE space_id = ?1 AND kind = 'note' AND deleted_at IS NULL
+       AND index_state <> 'excluded'
+     RETURNING id, current_rev";
+
 /// Меняет GUID пространства решения `space_id` (конфликт GUID при регистрации решений
 /// M1–M2). Узлы, ревизии и чанки остаются на месте; живые индексируемые заметки получают
 /// `upsert`, чтобы точки Qdrant получили новый `solution_guid` в payload. Нет такого
@@ -804,12 +812,7 @@ pub async fn rename_solution_guid(
         })?;
         let now = fmt_ts(Timestamp::now());
         let notes: Vec<(Id, i64)> = {
-            let mut st = tx.prepare(
-                "UPDATE nodes SET index_state = 'pending'
-                 WHERE space_id = ?1 AND kind = 'note' AND deleted_at IS NULL
-                   AND index_state <> 'excluded'
-                 RETURNING id, current_rev",
-            )?;
+            let mut st = tx.prepare(SPACE_NOTES_PENDING_SQL)?;
             st.query_map([space_id], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?
         };

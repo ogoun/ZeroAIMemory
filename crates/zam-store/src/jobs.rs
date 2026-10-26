@@ -791,23 +791,24 @@ pub async fn reindex_page(
     .await
 }
 
+/// Запрос [`indexable_count`]: `?1` — пространство или `NULL`. Узлы — по живому частичному
+/// индексу (`nodes_live_children`), корзина не просматривается; план закреплён тестом
+/// `indexable_count_and_folders_skip_trash`.
+fn indexable_count_sql() -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM nodes n JOIN spaces s ON s.id = n.space_id
+                 WHERE {INDEXABLE} AND (?1 IS NULL OR n.space_id = ?1))
+              + (SELECT count(*) FROM entries e
+                 WHERE e.deleted_at IS NULL AND e.index_state <> 'excluded'
+                   AND (?1 IS NULL OR e.space_id = ?1))"
+    )
+}
+
 /// Число живых индексируемых заметок и записей журналов пространства `space`
 /// (`None` — всех).
 pub async fn indexable_count(db: &Db, space: Option<Id>) -> Result<i64, StoreError> {
-    db.read(move |c| {
-        Ok(c.query_row(
-            &format!(
-                "SELECT (SELECT count(*) FROM nodes n JOIN spaces s ON s.id = n.space_id
-                         WHERE {INDEXABLE} AND (?1 IS NULL OR n.space_id = ?1))
-                      + (SELECT count(*) FROM entries e
-                         WHERE e.deleted_at IS NULL AND e.index_state <> 'excluded'
-                           AND (?1 IS NULL OR e.space_id = ?1))"
-            ),
-            [space],
-            |r| r.get(0),
-        )?)
-    })
-    .await
+    db.read(move |c| Ok(c.query_row(&indexable_count_sql(), [space], |r| r.get(0))?))
+        .await
 }
 
 /// Ставит `upsert` (приоритет reindex) живым индексируемым заметкам из `nodes` по их
@@ -941,17 +942,22 @@ pub struct IndexFolder {
     pub updated_at: Timestamp,
 }
 
+/// Запрос [`folders_for_index`]: `?1` — пространство или `NULL`. От пространств к их живым
+/// узлам по `nodes_live_children (space_id=?)`: корзина не просматривается (прежний запрос
+/// шёл полным просмотром `nodes` по первичному ключу ради `ORDER BY`); сортируются только
+/// найденные папки. План закреплён тестом `indexable_count_and_folders_skip_trash`.
+const FOLDERS_FOR_INDEX_SQL: &str =
+    "SELECT n.id, n.space_id, s.kind, s.name, s.solution_guid, n.path, n.name, n.l0,
+            n.updated_at
+     FROM spaces s CROSS JOIN nodes n INDEXED BY nodes_live_children
+     WHERE n.space_id = s.id AND n.kind = 'folder' AND n.deleted_at IS NULL
+       AND n.l0 IS NOT NULL AND s.kind <> 'human' AND (?1 IS NULL OR s.id = ?1)
+     ORDER BY n.id";
+
 /// Живые папки с L0 пространства `space` (`None` — всех), кроме Human.
 pub async fn folders_for_index(db: &Db, space: Option<Id>) -> Result<Vec<IndexFolder>, StoreError> {
     db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT n.id, n.space_id, s.kind, s.name, s.solution_guid, n.path, n.name, n.l0,
-                    n.updated_at
-             FROM nodes n JOIN spaces s ON s.id = n.space_id
-             WHERE n.kind = 'folder' AND n.deleted_at IS NULL AND n.l0 IS NOT NULL
-               AND s.kind <> 'human' AND (?1 IS NULL OR n.space_id = ?1)
-             ORDER BY n.id",
-        )?;
+        let mut st = c.prepare_cached(FOLDERS_FOR_INDEX_SQL)?;
         let rows = st.query_map([space], |r| {
             Ok(IndexFolder {
                 node_id: r.get(0)?,
@@ -1009,6 +1015,160 @@ pub async fn set_index_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schema() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        c
+    }
+
+    /// Строки `EXPLAIN QUERY PLAN` запроса с `params` параметрами (`NULL`).
+    fn plan(c: &Connection, sql: &str, params: usize) -> Vec<String> {
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args = rusqlite::params_from_iter(vec![None::<String>; params]);
+        st.query_map(args, |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Шагов VM на полный проход `sql` и число строк.
+    fn steps(c: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> (usize, i32) {
+        let mut st = c.prepare(sql).unwrap();
+        let mut rows = st.query(args).unwrap();
+        let mut n = 0;
+        while rows.next().unwrap().is_some() {
+            n += 1;
+        }
+        drop(rows);
+        (n, st.get_status(rusqlite::StatementStatus::VmStep))
+    }
+
+    fn ins(c: &Connection, space: &str, kind: &str, path: &str, deleted: bool) {
+        c.execute(
+            "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, l0, index_state,
+                                created_at, updated_at, deleted_at)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?4, ?5, 'indexed', 't', 't', ?6)",
+            rusqlite::params![
+                Id::new().to_string(),
+                space,
+                kind,
+                path,
+                (kind == "folder").then_some("L0 папки"),
+                deleted.then_some("t")
+            ],
+        )
+        .unwrap();
+    }
+
+    /// База с живыми заметками и папками Knowledge и `trash` удалёнными заметками и папками
+    /// (вставлены раньше живых).
+    fn base(trash: usize) -> Connection {
+        let c = schema();
+        c.execute_batch(
+            "INSERT INTO spaces (id, kind, name, created_at) VALUES ('k', 'knowledge', 'K', 't');
+             INSERT INTO spaces (id, kind, name, created_at) VALUES ('h', 'human', 'H', 't');",
+        )
+        .unwrap();
+        for i in 0..trash {
+            let kind = if i % 4 == 0 { "folder" } else { "note" };
+            ins(&c, "k", kind, &format!("корзина/{i}"), true);
+        }
+        for i in 0..5 {
+            ins(&c, "k", "note", &format!("заметка{i}"), false);
+        }
+        for i in 0..2 {
+            ins(&c, "k", "folder", &format!("папка{i}"), false);
+        }
+        ins(&c, "h", "folder", "личное", false);
+        c
+    }
+
+    /// Шаги VM запросов, которые обходят узлы базы целиком (пересборка индекса, reindex
+    /// пространства): `(имя, строк, шагов)`.
+    fn trash_steps(trash: usize) -> Vec<(&'static str, usize, i32)> {
+        let c = base(trash);
+        let none: Option<String> = None;
+        let k = Some("k".to_string());
+        let mut out = Vec::new();
+        for (name, sql, arg) in [
+            ("indexable_count все", indexable_count_sql(), &none),
+            ("indexable_count k", indexable_count_sql(), &k),
+            (
+                "folders_for_index все",
+                FOLDERS_FOR_INDEX_SQL.to_string(),
+                &none,
+            ),
+            ("folders_for_index k", FOLDERS_FOR_INDEX_SQL.to_string(), &k),
+        ] {
+            let (n, s) = steps(&c, &sql, &[arg]);
+            out.push((name, n, s));
+        }
+        let (n, s) = steps(&c, crate::user_db::SPACE_NOTES_PENDING_SQL, &[&"k"]);
+        out.push(("сброс index_state пространства", n, s));
+        out
+    }
+
+    /// Подсчёт индексируемых, папки для пересборки индекса и сброс `index_state` заметок
+    /// пространства (смена GUID решения) не просматривают корзину (остаток задачи 19b,
+    /// финальная волна M3): работа при 4000 удалённых узлах — как при пустой корзине, а
+    /// узлы читаются по живому частичному индексу.
+    #[test]
+    fn indexable_count_and_folders_skip_trash() {
+        let empty = trash_steps(0);
+        let big = trash_steps(4000);
+        for (b, t) in empty.iter().zip(&big) {
+            eprintln!("{}: шагов VM {} → {} (корзина 0 → 4000)", b.0, b.2, t.2);
+            assert_eq!(b.1, t.1, "{}: строк", b.0);
+            assert!(
+                t.2 <= b.2 + 64,
+                "{}: шагов {} при пустой корзине, {} при 4000",
+                b.0,
+                b.2,
+                t.2
+            );
+        }
+        assert_eq!(
+            empty.iter().map(|x| x.1).collect::<Vec<_>>(),
+            [1, 1, 2, 2, 5]
+        );
+        // планы: узлы — по живому частичному индексу; строки плана о `nodes` без него —
+        // полный просмотр с корзиной
+        let c = schema();
+        for (name, sql, n) in [
+            ("indexable_count", indexable_count_sql(), 1),
+            ("folders_for_index", FOLDERS_FOR_INDEX_SQL.to_string(), 1),
+            (
+                "сброс index_state",
+                crate::user_db::SPACE_NOTES_PENDING_SQL.to_string(),
+                1,
+            ),
+        ] {
+            let p = plan(&c, &sql, n);
+            let on_nodes: Vec<&String> = p
+                .iter()
+                .filter(|l| {
+                    l.starts_with("SCAN n")
+                        || l.starts_with("SEARCH n")
+                        || l.starts_with("SCAN nodes")
+                        || l.starts_with("SEARCH nodes")
+                })
+                .collect();
+            assert!(
+                !on_nodes.is_empty(),
+                "{name}: нет строки плана о nodes: {p:?}"
+            );
+            for l in on_nodes {
+                assert!(
+                    l.contains("USING INDEX nodes_live_children")
+                        || l.contains("USING COVERING INDEX nodes_live_children"),
+                    "{name}: узлы не по живому индексу: {p:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn backoff_grows_and_caps() {

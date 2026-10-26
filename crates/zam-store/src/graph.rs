@@ -834,7 +834,10 @@ pub(crate) fn rebuild_derived(
 
 /// Узлы `ids` пространства `space` созданы, перенесены, удалены или восстановлены (в той же
 /// транзакции): выведенные рёбра пространства, указывающие на них или с ключом их старых
-/// (`old` — `(имя, путь)` до переноса) и текущих имени и пути, разрешаются заново.
+/// (`old` — `(имя, путь)` до переноса) и текущих имени и пути, разрешаются заново. Рёбра
+/// удалённых источников пропускаются: их никто не читает (выборки графа — по живым концам), а
+/// восстановление источника пересобирает его рёбра (`index_note` → [`rebuild_derived`]) —
+/// корзина не увеличивает запись при массовых изменениях дерева.
 pub(crate) fn tree_changed(
     c: &Connection,
     space: Id,
@@ -868,10 +871,12 @@ pub(crate) fn tree_changed(
              WHERE e.dst_kind = 'node' AND e.dst_id IN (SELECT value FROM json_each(?2))
                AND e.deleted_at IS NULL AND e.space_id = ?1
                AND e.origin IN ('wikilink', 'frontmatter') AND e.dst_raw IS NOT NULL
+               AND EXISTS (SELECT 1 FROM nodes s WHERE s.id = e.src_id AND s.deleted_at IS NULL)
              UNION
              SELECT e.id, e.dst_raw, e.dst_id FROM edges e
              WHERE e.space_id = ?1 AND e.dst_raw IN (SELECT value FROM json_each(?3))
-               AND e.deleted_at IS NULL AND e.origin IN ('wikilink', 'frontmatter')",
+               AND e.deleted_at IS NULL AND e.origin IN ('wikilink', 'frontmatter')
+               AND EXISTS (SELECT 1 FROM nodes s WHERE s.id = e.src_id AND s.deleted_at IS NULL)",
         )?;
         st.query_map(
             params![

@@ -767,3 +767,33 @@ async fn backfill_existing_notes_on_open() {
     assert_eq!(out(&db, n(a)).await.len(), 2);
     assert_eq!(out(&db, e(new)).await.len(), 1);
 }
+
+/// Выведенные рёбра удалённого источника не перепроверяются при изменениях дерева
+/// (финальная волна M3, остаток задачи 19b): корзина не увеличивает работу и запись
+/// `tree_changed`, а восстановление пересобирает рёбра источника заново.
+#[tokio::test]
+async fn deleted_source_edges_skipped_by_tree_changed() {
+    let (db, k) = setup("deleted-source-skip").await;
+    let a = note(&db, k, "a", "[[Позже]]\n").await;
+    delete_node(&db, a, AuthorKind::Agent).await.unwrap();
+    let raw = move |db: Db| async move {
+        db.read(move |c| {
+            Ok(c.query_row(
+                "SELECT dst_id FROM edges WHERE src_kind = 'node' AND src_id = ?1
+                   AND dst_raw = '[[Позже]]' AND deleted_at IS NULL",
+                [a],
+                |r| r.get::<_, Option<Id>>(0),
+            )?)
+        })
+        .await
+        .unwrap()
+    };
+    let later = note(&db, k, "x/Позже", "текст\n").await;
+    assert_eq!(
+        raw(db.clone()).await,
+        None,
+        "ребро удалённого источника не тронуто"
+    );
+    restore_node(&db, a, AuthorKind::Agent).await.unwrap();
+    assert_eq!(dst_of(&db, n(a), "[[Позже]]").await, Some(n(later)));
+}
