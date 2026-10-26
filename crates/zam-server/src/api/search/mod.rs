@@ -61,10 +61,13 @@
 //!    отбрасывается (узел, найденный только ею, не попадает). Лимит на узел — после замены.
 //! 4. `rerank=on` ([`crate::rerank`]): первые `ml.rerank_top` (20) кандидатов после
 //!    `note_to_leaf` и лимита на узел переставляются по баллу реранкера (пара «запрос —
-//!    заголовок секции и текст чанка», фрагмент до `ml.rerank_tokens` = 256 токенов), хвост
-//!    остаётся в порядке слияния; лимит на узел после перестановки соблюдается (набор тот
-//!    же). Реранкер — по устройству эмбеддера, грузится при первом таком запросе
-//!    (`spawn_blocking`). Нет модели — ответ без реранка и `warnings: ["reranker not
+//!    заголовок секции и текст чанка», фрагмент до `ml.rerank_tokens` = 256 токенов) с
+//!    бустами п. 4 — вид, область, `certainty` ([`zam_search::apply_boosts_to`], та же
+//!    функция, что после слияния; затухание по свежести и канал папок к баллу реранкера не
+//!    применяются; решение владельца 2026-10-26), затем то же деление при переполнении
+//!    ([`zam_search::overflow_divisor`]); хвост остаётся в порядке слияния; лимит на узел
+//!    после перестановки соблюдается (набор тот же). Реранкер — по устройству эмбеддера,
+//!    грузится при первом таком запросе (`spawn_blocking`). Нет модели — ответ без реранка и `warnings: ["reranker not
 //!    installed"]`; ошибка или паника загрузки и инференса — `["reranker failed"]`, не 500.
 //! 5. `top_k` (в `notes` — узлов), `expand` (`graph` — соседи после `top_k`), упаковка в
 //!    `budget_tokens`.
@@ -105,7 +108,8 @@
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
 //! полного текста чанка, `updated_at`, `kind` (`note` или вид записи), `snippet` | `l0`,
-//! `text`, `rerank_score` 0..1 — у переставленных реранком, `via {type, from}` — у соседей
+//! `text`, `rerank_score` 0..1 — сырой балл реранкера у переставленных им (их `score` — он
+//! же с бустами), `via {type, from}` — у соседей
 //! `expand=graph`), `degraded`, `degraded_reason`
 //! и `degraded_text` (или `null`), `warnings` (строки: о реранке, `index rebuilding` — индекс
 //! пересобирается, векторная выдача может быть неполной, `solution access …` и
@@ -157,8 +161,9 @@ use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
     Boosts, ChunkMeta, Cost, Fit, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights,
-    apply_boosts, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed, in_section,
-    note_to_leaf, pack, rescale_overflow, summaries_without_leaf, truncate_to_tokens,
+    apply_boosts, apply_boosts_to, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed,
+    in_section, note_to_leaf, overflow_divisor, pack, rescale_overflow, summaries_without_leaf,
+    truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
@@ -561,7 +566,8 @@ struct Item {
     l0: Option<String>,
     /// Текст для `chunks` (после `expand`) и его размер в токенах.
     text: Option<(String, usize)>,
-    /// Балл реранкера (0..1), если элемент переставлен реранком.
+    /// Сырой балл реранкера (0..1), если элемент переставлен реранком (`score` — он же с
+    /// бустами, §9.2 п. 5).
     rerank_score: Option<f32>,
     /// Сосед `expand=graph`: тип ребра и родитель.
     via: Option<(zam_store::EdgeType, TargetRef)>,
@@ -591,12 +597,13 @@ fn cap_items(items: Vec<Item>, max: usize) -> Vec<Item> {
         .collect()
 }
 
-/// `rerank=on`: первые `ml.rerank_top` элементов — по баллу реранкера (см. модуль).
-/// Сбой — элементы как были и предупреждение.
+/// `rerank=on`: первые `ml.rerank_top` элементов — по баллу реранкера с бустами `boosts`
+/// (см. модуль). Сбой — элементы как были и предупреждение.
 async fn rerank_items(
     st: &AppState,
     query: &str,
     items: Vec<Item>,
+    boosts: &Boosts,
 ) -> (Vec<Item>, Option<&'static str>) {
     let device = st.index.device.as_ref().map(|d| d.device);
     let r = match st.rerank.get(device).await {
@@ -607,18 +614,69 @@ async fn rerank_items(
     let texts: Vec<String> = items[..n].iter().map(|it| rerank_text(&it.hit)).collect();
     match rerank::score(r, query.to_string(), texts, st.cfg.ml.rerank_tokens).await {
         Ok(scores) => {
-            let out: Vec<Item> = rerank::reorder(items, &scores)
-                .into_iter()
-                .map(|(mut it, s)| {
-                    it.rerank_score = s;
-                    it
-                })
-                .collect();
+            let out = boost_reranked(items, &scores, boosts);
             // лимит на узел — и после перестановки
             (cap_items(out, st.cfg.search.max_per_node), None)
         }
         Err(w) => (items, Some(w)),
     }
+}
+
+/// Баллы реранкера `raw` первых элементов `items` с бустами (§9.2 п. 5): `score = rerank_score
+/// × boost_kind × boost_area × boost_certainty`, порядок первых — по нему, затем деление при
+/// переполнении (лучший — 1). `rerank_score` — сырой балл. Хвост (без балла реранкера) остаётся
+/// после них со своими баллами слияния.
+fn boost_reranked(items: Vec<Item>, raw: &[f32], boosts: &Boosts) -> Vec<Item> {
+    let boosted: Vec<f64> = items
+        .iter()
+        .zip(raw)
+        .map(|(it, &s)| match chunk_meta(&it.hit) {
+            Some(m) => apply_boosts_to(f64::from(s), &m, boosts, None),
+            None => f64::from(s),
+        })
+        .collect();
+    let with_raw: Vec<(Item, Option<f32>)> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, it)| (it, raw.get(i).copied()))
+        .collect();
+    let mut out: Vec<Item> = rerank::reorder(with_raw, &boosted)
+        .into_iter()
+        .map(|((mut it, raw), boosted)| {
+            if let (Some(r), Some(b)) = (raw, boosted) {
+                it.rerank_score = Some(r);
+                it.score = b;
+            }
+            it
+        })
+        .collect();
+    let top = overflow_divisor(out.first().map_or(0.0, |it| it.score));
+    for it in out.iter_mut().filter(|it| it.rerank_score.is_some()) {
+        it.score /= top;
+    }
+    out
+}
+
+/// Метаданные бустов чанка выдачи (§9.2 п. 4): цель, уровень, вид инсайта, `certainty`,
+/// область. Неизвестный уровень — `None` (кандидат вне слияния).
+fn chunk_meta(h: &FtsHit) -> Option<ChunkMeta> {
+    Some(ChunkMeta {
+        target: h.target,
+        level: Level::parse(&h.level)?,
+        heading_path: h.heading_path.clone(),
+        updated_at: h.updated_at,
+        // вид инсайта — только у insight (у changelog `data.kind` — вид изменения)
+        insight_kind: h
+            .entry
+            .as_ref()
+            .filter(|e| e.kind == "insight")
+            .and_then(|e| e.insight_kind.clone()),
+        // статус заметки или записи (бусты надёжности, §7.5)
+        certainty: h.certainty.clone(),
+        area: h.area.clone(),
+        space_id: h.space_id,
+        path: h.path.clone(),
+    })
 }
 
 /// `notes`: по одному элементу на узел (лучший чанк), не больше `top_k`.
@@ -1158,7 +1216,8 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> Str
 /// (у записи журнала — [`entry_card`]).
 fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
     let h = &p.item.hit;
-    let score = p.item.rerank_score.map_or(p.item.score, f64::from).min(1.0);
+    // у переставленных реранкером `score` — его балл с бустами (§9.2 п. 5)
+    let score = p.item.score.min(1.0);
     let mut line = match (&h.entry, p.item.folder) {
         // карточка папки: `f:<id> <пространство>/<путь>/  [0.61] · 4 детей`
         (_, Some(children)) => {
@@ -1503,28 +1562,7 @@ pub async fn search(
     // 3. слияние, сводки → листы
     let chunks: HashMap<String, ChunkMeta> = hits
         .iter()
-        .filter_map(|(id, (_, h))| {
-            Some((
-                id.clone(),
-                ChunkMeta {
-                    target: h.target,
-                    level: Level::parse(&h.level)?,
-                    heading_path: h.heading_path.clone(),
-                    updated_at: h.updated_at,
-                    // вид инсайта — только у insight (у changelog `data.kind` — вид изменения)
-                    insight_kind: h
-                        .entry
-                        .as_ref()
-                        .filter(|e| e.kind == "insight")
-                        .and_then(|e| e.insight_kind.clone()),
-                    // статус заметки или записи (бусты надёжности, §7.5)
-                    certainty: h.certainty.clone(),
-                    area: h.area.clone(),
-                    space_id: h.space_id,
-                    path: h.path.clone(),
-                },
-            ))
-        })
+        .filter_map(|(id, (_, h))| Some((id.clone(), chunk_meta(h)?)))
         .collect();
     // чанки, которых векторный канал не видит (Human, узел не проиндексирован): ослабленный
     // bm25 для них не понижается — иначе такая находка проигрывает всем векторным кандидатам
@@ -1682,7 +1720,7 @@ pub async fn search(
     let mut rerank_ms = None;
     let items = if rerank_on && !items.is_empty() {
         let t = Instant::now();
-        let (items, warning) = rerank_items(&st, &req.query, items).await;
+        let (items, warning) = rerank_items(&st, &req.query, items, &boosts).await;
         rerank_ms = Some(ms(t));
         health.warnings.extend(warning.map(String::from));
         items

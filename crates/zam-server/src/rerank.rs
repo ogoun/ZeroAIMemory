@@ -10,6 +10,9 @@
 //! - **Сбой не роняет поиск.** Нет модели — ответ без реранка с предупреждением
 //!   [`WARN_NOT_INSTALLED`]; ошибка или паника загрузки и инференса — [`WARN_FAILED`].
 //!
+//! - **Оценщик** — [`PassageScorer`]: модель zam-ml ([`Reranker`]) или готовый оценщик,
+//!   поставленный [`RerankSlot::install`] (детерминированная заглушка тестов).
+//!
 //! В журнал не попадают тексты запроса и фрагментов — только id модели, число пар и время.
 
 use std::sync::Arc;
@@ -27,9 +30,37 @@ pub const WARN_FAILED: &str = "reranker failed";
 /// Через сколько повторять неудачную загрузку.
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 
+/// Оценщик пар «запрос — фрагмент»: баллы релевантности 0..1 в порядке фрагментов.
+pub trait PassageScorer: Send + Sync {
+    /// Id модели для журнала.
+    fn model_id(&self) -> &str;
+    /// Баллы `passages` запросу `query`; фрагмент — до `passage_tokens` токенов.
+    fn score_capped(
+        &self,
+        query: &str,
+        passages: &[&str],
+        passage_tokens: usize,
+    ) -> Result<Vec<f32>, MlError>;
+}
+
+impl PassageScorer for Reranker {
+    fn model_id(&self) -> &str {
+        Reranker::model_id(self)
+    }
+
+    fn score_capped(
+        &self,
+        query: &str,
+        passages: &[&str],
+        passage_tokens: usize,
+    ) -> Result<Vec<f32>, MlError> {
+        Reranker::score_capped(self, query, passages, passage_tokens)
+    }
+}
+
 enum State {
     Empty,
-    Ready(Arc<Reranker>),
+    Ready(Arc<dyn PassageScorer>),
     Failed { at: Instant, warning: &'static str },
 }
 
@@ -78,13 +109,22 @@ impl RerankSlot {
         }
     }
 
+    /// Ставит готовый оценщик вместо загрузки модели: следующие `rerank=on` идут через него
+    /// (детерминированная заглушка тестов и стендов; модель тогда не грузится).
+    pub async fn install(&self, scorer: Arc<dyn PassageScorer>) {
+        *self.state.lock().await = State::Ready(scorer);
+    }
+
     /// Реранкер (загружает при первом вызове) или предупреждение для ответа.
     ///
     /// Загрузка идёт в отдельной задаче tokio, которая держит мьютекс состояния и сама
     /// записывает итог: отмена запроса (клиент ушёл) не бросает загруженную модель, а
     /// следующий запрос ждёт ту же загрузку, а не начинает вторую (вторая копия — до 1,1 ГБ
     /// памяти или VRAM).
-    pub async fn get(&self, embed_device: Option<Device>) -> Result<Arc<Reranker>, &'static str> {
+    pub async fn get(
+        &self,
+        embed_device: Option<Device>,
+    ) -> Result<Arc<dyn PassageScorer>, &'static str> {
         let mut st = self.state.clone().lock_owned().await;
         match &*st {
             State::Ready(r) => return Ok(r.clone()),
@@ -117,7 +157,7 @@ impl RerankSlot {
             .await;
             let warning = match loaded {
                 Ok(Ok(r)) => {
-                    let r = Arc::new(r);
+                    let r: Arc<dyn PassageScorer> = Arc::new(r);
                     *st = State::Ready(r.clone());
                     return Ok(r);
                 }
@@ -147,7 +187,7 @@ impl RerankSlot {
 
 /// Баллы реранка `texts` (в `spawn_blocking`). Ошибка и паника — [`WARN_FAILED`].
 pub async fn score(
-    r: Arc<Reranker>,
+    r: Arc<dyn PassageScorer>,
     query: String,
     texts: Vec<String>,
     passage_tokens: usize,
@@ -194,8 +234,9 @@ pub(crate) async fn run_scorer(
 }
 
 /// Переставляет первые `scores.len()` элементов по убыванию балла (при равенстве — прежний
-/// порядок) и возвращает балл каждого переставленного; хвост остаётся как был.
-pub fn reorder<T>(items: Vec<T>, scores: &[f32]) -> Vec<(T, Option<f32>)> {
+/// порядок) и возвращает балл каждого переставленного; хвост остаётся как был. Баллы —
+/// реранкера с бустами (§9.2 п. 5).
+pub fn reorder<T>(items: Vec<T>, scores: &[f64]) -> Vec<(T, Option<f64>)> {
     let n = scores.len().min(items.len());
     let mut it = items.into_iter();
     let mut head: Vec<(usize, T)> = it.by_ref().take(n).enumerate().collect();

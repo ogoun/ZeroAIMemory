@@ -66,6 +66,8 @@ memory-serve.workspace = true
 [dev-dependencies]
 # точка остановки воркера перед записью пачки (tests/qdrant_lifecycle.rs)
 zam-index = { path = "../zam-index", features = ["test-hooks"] }
+# задержка фоновой перенарезки при открытии базы (tests/index_rechunk.rs, ход `rechunk`)
+zam-store = { path = "../zam-store", features = ["test-hooks"] }
 zip.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true

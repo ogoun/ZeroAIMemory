@@ -20,6 +20,8 @@ pub mod paths;
 pub mod search;
 pub mod solution_registry;
 pub mod system;
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
 pub mod time;
 pub mod user_db;
 pub mod vault;
@@ -83,9 +85,9 @@ pub use system::{
     WebSession,
 };
 pub use user_db::{
-    Space, SpaceKind, USER_MIGRATIONS, UserDbs, create_solution, create_solution_with_id,
-    get_solution, get_space, list_spaces, rename_solution_guid, rename_solution_space,
-    space_of_kind,
+    RechunkNotice, RechunkProgress, RechunkReason, Space, SpaceKind, USER_MIGRATIONS, UserDbs,
+    create_solution, create_solution_with_id, get_solution, get_space, list_spaces,
+    rename_solution_guid, rename_solution_space, space_of_kind,
 };
 pub use vault::{
     KEY_CHECK_SETTING, VAULT_TITLE_MAX_CHARS, VaultMeta, VaultRevision, VaultScope,

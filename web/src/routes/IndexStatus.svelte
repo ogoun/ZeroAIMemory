@@ -3,7 +3,8 @@
   // (обновление раз в 5 с, пока страница открыта и вкладка видна; при возвращении на
   // вкладку — сразу), причина деградации с действием (тексты — с сервера),
   // повреждённые и исключённые из пересборки базы, неудавшиеся задания и переиндексация
-  // (POST /admin/reindex) с подтверждением.
+  // (POST /admin/reindex) с подтверждением; баннер перенарезки баз после смены настроек
+  // нарезки («Идёт перенарезка: изменились <ключи>, N из M», §8.2).
   import { Dialog } from 'bits-ui';
   import { onMount } from 'svelte';
   import { ApiError, indexStatus, reindex, type IndexStatus, type User } from '../lib/api';
@@ -119,6 +120,11 @@
   }
 
   let busyReindex = $derived(!!st && (st.reindex.running || st.reindex.queued));
+  /** Базы с идущей перенарезкой (старый сервер без `dbs` — нет). */
+  let rechunks = $derived(
+    (st?.dbs ?? []).flatMap((d) => (d.rechunk ? [{ user_id: d.user_id, ...d.rechunk }] : [])),
+  );
+  const changedText = (keys: string[]) => (keys.length ? keys.join(', ') : 'параметры нарезки');
 </script>
 
 <section class="panel index-page">
@@ -188,6 +194,18 @@
         </dd>
       </div>
     </dl>
+
+    {#each rechunks as r (r.user_id)}
+      <div class="alert alert-warn rechunk" role="status">
+        <p class="alert-title">
+          Идёт перенарезка: изменились {changedText(r.changed)}, {num(r.done)} из {num(r.total)}
+        </p>
+        <p>
+          База <b>{userName(r.user_id)}</b> перенарезается в фоне после смены настроек нарезки:
+          поиск и запись работают, векторы пересчитываются только у изменившихся фрагментов.
+        </p>
+      </div>
+    {/each}
 
     {#if st.unavailable_dbs.length}
       <div class="alert">

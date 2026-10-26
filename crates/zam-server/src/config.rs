@@ -347,8 +347,9 @@ pub struct IndexSection {
     pub chunk_overlap_sentences: usize,
     /// Вес силы границы λ при выборе разреза листа (задача 17 M3): 0 — жадная упаковка M2
     /// (с исправлениями висячего заголовка и вводной фразы), больше 0 — динамическое
-    /// программирование по силе границ. По умолчанию 0,5 — по сетке `eval/grid-chunking.toml`
-    /// (задача 17 M3: λ от 0,5 до 2 дают одинаковые разрезы, выбрано наименьшее).
+    /// программирование по силе границ. По умолчанию 0 — решение владельца 2026-10-26 (M4,
+    /// §8.2): собственный эффект λ = 0,5 поверх структурных исправлений M3 от нуля не отличим
+    /// (Δ nDCG@10 +0,003 [−0,003…+0,010]); в M3 умолчание было 0,5.
     pub chunk_boundary_lambda: f64,
     /// Лексическая связность прозы (основы слов) в силе границы при λ > 0.
     pub chunk_cohesion: bool,
@@ -650,7 +651,7 @@ impl Default for ServerConfig {
                 chunk_hard_max: 800,
                 chunk_merge_below: 100,
                 chunk_overlap_sentences: 1,
-                chunk_boundary_lambda: 0.5,
+                chunk_boundary_lambda: 0.0,
                 chunk_cohesion: false,
                 chunk_prefix_l0: false,
                 chunk_heading_path_h4: true,
@@ -1172,6 +1173,23 @@ note_max_bytes = 1000
         assert_eq!(c.qdrant.mode, QdrantMode::External);
     }
 
+    /// Умолчания M4 (решения владельца 2026-10-26, §4.3, §8.2): λ = 0 — жадная упаковка M2
+    /// со структурными исправлениями M3; Qdrant сбрасывает сегменты раз в 3 с и ждёт
+    /// подтверждения WAL при остановке до 14 с — и в супервизоре, и в конфигурации сервера.
+    #[test]
+    fn default_lambda_zero_and_qdrant_defaults() {
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.index.chunk_boundary_lambda, 0.0);
+        assert_eq!(d.index.chunk_params().boundary_lambda, 0.0);
+        assert_eq!(d.qdrant.flush_interval_sec, 3);
+        assert_eq!(d.qdrant.shutdown_flush_wait_ms, 14_000);
+        assert_eq!(zam_index::supervisor::DEFAULT_FLUSH_INTERVAL_SEC, 3);
+        assert_eq!(
+            zam_index::supervisor::DEFAULT_SHUTDOWN_FLUSH_WAIT,
+            std::time::Duration::from_secs(14)
+        );
+    }
+
     /// `[qdrant]` WAL и сброс (задача 19 M3): слои, перенос в супервизор, пределы.
     #[test]
     fn qdrant_wal_options_layer_and_validate() {
@@ -1328,15 +1346,8 @@ yield_ms = 1
         let e = vec![env("ZAM_ML__DEVICE", "directml")];
         assert!(load(None, &e, &Default::default()).is_err());
         // пороги чанкинга: умолчания сервера и чанкера совпадают (одно значение, подобранное
-        // на eval, §18.2), кроме λ: у чанкера 0 — жадная упаковка M2 (golden-фикстуры), у
-        // сервера — по сетке задачи 17 M3; переопределение и проверка согласованности
-        assert_eq!(
-            d.index.chunk_params(),
-            zam_markdown::ChunkParams {
-                boundary_lambda: 0.5,
-                ..zam_markdown::ChunkParams::default()
-            }
-        );
+        // на eval, §18.2), в том числе λ = 0 (M4); переопределение и проверка согласованности
+        assert_eq!(d.index.chunk_params(), zam_markdown::ChunkParams::default());
         let e = vec![
             env("ZAM_INDEX__CHUNK_TARGET_MAX", "700"),
             env("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "2"),
@@ -1390,21 +1401,21 @@ yield_ms = 1
             (192, 192, 192, 100)
         );
         assert_eq!(d.index.chunk_params_for(Some(10)).0.hard_max, 1);
-        // сила границ (задача 17 M3): умолчание λ = 0,5, флаги — в пороги чанкера; L0 в префиксе
-        // уменьшает предел листа на свой бюджет
+        // сила границ (задача 17 M3): флаги — в пороги чанкера; L0 в префиксе уменьшает предел
+        // листа на свой бюджет
         let p = d.index.chunk_params();
-        assert_eq!(
-            (p.boundary_lambda, p.cohesion, p.heading_path_h4),
-            (0.5, false, true)
-        );
+        assert_eq!((p.cohesion, p.heading_path_h4), (false, true));
         assert!(!d.index.chunk_prefix_l0);
         // связность без λ ничего не делает — признак для предупреждения при старте
         assert!(!d.index.cohesion_ignored());
         let mut i = d.index.clone();
         i.chunk_cohesion = true;
+        assert!(
+            i.cohesion_ignored(),
+            "при умолчании λ = 0 связность не действует"
+        );
+        i.chunk_boundary_lambda = 0.5;
         assert!(!i.cohesion_ignored());
-        i.chunk_boundary_lambda = 0.0;
-        assert!(i.cohesion_ignored());
         let c = load(
             None,
             &[

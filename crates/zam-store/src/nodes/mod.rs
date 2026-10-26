@@ -33,9 +33,11 @@ use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
 pub(crate) use chunks::{
-    ChunkInsert, backfill_certainty, backfill_embed_keys, chunk_id, chunker_fingerprint,
-    context_prefix, entry_chunker_fingerprint, frontmatter_tags, mask_tags, note_chunks,
-    rechunk_notes, replace_chunks, rescan_secrets, same_chunker, stored_prefix_hit, token_counter,
+    ChunkInsert, PARAM_ALGORITHM, PARAM_TOKENIZER, backfill_certainty, backfill_embed_keys,
+    changed_params, chunk_id, chunker_fingerprint, chunker_params, context_prefix,
+    entry_chunker_fingerprint, frontmatter_tags, mask_tags, note_chunks, param_order,
+    params_from_fingerprint, rechunk_notes, replace_chunks, rescan_secrets, same_chunker,
+    stored_prefix_hit, token_counter,
 };
 pub use chunks::{
     PREFIX_L0_MAX_TOKENS, chunk_params, count_tokens, prefix_l0, set_chunk_params, set_prefix_l0,

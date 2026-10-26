@@ -7,7 +7,10 @@
 //!   в WAL записи `wal_pending_ops`) и RSS самого
 //!   `zam-server` (`server.rss_bytes`, цели §17) общие для сервера; время воркера
 //!   (`worker`: заданий, инференс, запись в Qdrant — сумма по всем пользователям) — только
-//!   администратору, токену — `null`.
+//!   администратору, токену — `null`. `dbs` — по каждой видимой базе (администратору — все
+//!   или из `X-Zam-User`, токену — своя) `{user_id, rechunk}`: `rechunk` — ход фоновой
+//!   перенарезки после смены настроек нарезки `{reason, changed, total, done}` или `null`
+//!   (§8.2).
 //! - `POST /admin/reindex {user?, space?, full?}` — только администратор, аудит
 //!   `index.reindex`, ответ 202 с `job_count` (заметок области). Без `full` — точки
 //!   области удаляются и пишутся заново из кэша `embeddings` без инференса (промахи кэша —
@@ -29,7 +32,9 @@ use zam_index::supervisor::QdrantState;
 use zam_index::{ReindexOutcome, ReindexRequest, VectorFilter, VectorScope};
 use zam_ml::Device;
 use zam_store::time::fmt_ts;
-use zam_store::{FailedJob, JobStats, failed_jobs, indexable_count, job_stats, list_spaces};
+use zam_store::{
+    FailedJob, JobStats, RechunkProgress, failed_jobs, indexable_count, job_stats, list_spaces,
+};
 
 use crate::app::AppState;
 use crate::auth::{AdminOnly, Client, Principal, USER_HEADER, target_user};
@@ -139,6 +144,8 @@ pub async fn status(
     let mut unavailable: Vec<Value> = Vec::new();
     // области точек: база каждого видимого пользователя со всеми её пространствами
     let mut scopes: Vec<VectorScope> = Vec::new();
+    // перенарезка по базам (§8.2)
+    let mut dbs: Vec<Value> = Vec::new();
     for u in &users {
         let one = async {
             let db = st.users.get(*u).await?;
@@ -159,6 +166,10 @@ pub async fn status(
             user_id: *u,
             space_ids: sp,
         });
+        dbs.push(json!({
+            "user_id": u,
+            "rechunk": st.users.rechunk_progress(*u).await.map(|r| rechunk_json(&r)),
+        }));
         queue.queued += s.queued;
         queue.running += s.running;
         queue.failed += s.failed;
@@ -271,7 +282,18 @@ pub async fn status(
         },
         "rebuild_skipped": skipped,
         "unavailable_dbs": unavailable,
+        "dbs": dbs,
     })))
+}
+
+/// Ход перенарезки базы: причина, изменившиеся параметры, целей всего и обработано.
+fn rechunk_json(r: &RechunkProgress) -> Value {
+    json!({
+        "reason": r.notice.reason,
+        "changed": r.notice.changed,
+        "total": r.notice.targets,
+        "done": r.done,
+    })
 }
 
 #[derive(Deserialize, Default)]

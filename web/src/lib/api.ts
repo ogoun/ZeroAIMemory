@@ -466,6 +466,17 @@ export interface IndexStatus {
   rebuild_skipped: { user_id: string; error: string; attempts: number }[];
   /** Базы пользователей, которые не открылись (повреждены или недоступны). */
   unavailable_dbs: { user_id: string; error: string }[];
+  /** Видимые базы: ход фоновой перенарезки после смены настроек нарезки (`null` — не идёт). */
+  dbs: { user_id: string; rechunk: Rechunk | null }[];
+}
+
+/** Перенарезка базы (§8.2): `reason` — `params` | `algorithm` | `tokenizer` | `unknown`;
+ * `changed` — ключи `[index]`, `algorithm` или `tokenizer`; `done` из `total` записей. */
+export interface Rechunk {
+  reason: string;
+  changed: string[];
+  total: number;
+  done: number;
 }
 
 export const indexStatus = () => call<IndexStatus>('GET', 'index/status');

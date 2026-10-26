@@ -26,6 +26,12 @@ zam-markdown = { path = "../zam-markdown" }
 half.workspace = true
 tracing.workspace = true
 
+[features]
+# Точка остановки фоновой перенарезки при открытии базы — только для тестов (включает
+# dev-зависимость zam-server); в сборке сервера и релизе её нет.
+test-hooks = []
+
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rusqlite.workspace = true
