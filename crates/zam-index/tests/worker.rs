@@ -1215,3 +1215,112 @@ async fn folder_point_fresh_after_stop_mid_rollup() {
     );
     w.shutdown().await;
 }
+
+/// Одна индексация пачки (задача 19b M3): `BATCH` новых заметок в живой папке рядом с
+/// удалёнными, от первой записи до покоя воркера (задания, auto-L0, свёртки L0 папок).
+/// Возвращает секунды.
+async fn trash_bench_run(trash: usize) -> f64 {
+    const BATCH: usize = 300;
+    const PER_FOLDER: usize = 1000;
+    let e = env(&format!("bench-trash-{trash}")).await;
+    let body = |tag: &str| {
+        format!(
+            "# Заметка {tag}
+
+Сборка проекта {tag}: команды, переменные окружения и каталоги              журналов.
+
+## Проверка {tag}
+
+Порядок запуска и проверки результатов {tag}.
+"
+        )
+    };
+    // корзина как у `cargo xtask bench first-start`: пачки в папках `burst/b/g<k>`, папка
+    // пачки удаляется целиком; без воркера, а задания удаления снимаются — точек этих заметок
+    // в Qdrant нет, как после их обработки
+    let setup = Instant::now();
+    for k in 0..trash.div_ceil(PER_FOLDER) {
+        let n = PER_FOLDER.min(trash - k * PER_FOLDER);
+        for i in 0..n {
+            e.note(
+                e.knowledge,
+                &format!("burst/b/g{k}/{i:04}-n"),
+                &body(&format!("g{k}-{i}")),
+            )
+            .await;
+        }
+        let folder = zam_store::get_node_by_path(
+            &e.db,
+            e.knowledge,
+            &NodePath::parse(&format!("burst/b/g{k}")).unwrap(),
+        )
+        .await
+        .unwrap();
+        delete_node(&e.db, folder.id, AuthorKind::Agent)
+            .await
+            .unwrap();
+    }
+    e.db.write(|tx| Ok(tx.execute("DELETE FROM index_jobs", [])?))
+        .await
+        .unwrap();
+    let deleted: i64 =
+        e.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM nodes WHERE deleted_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    // живая папка с одной заметкой: коллекция создана, воркер в покое
+    let w = e.spawn_gc(e.vector.clone(), Duration::from_secs(3600));
+    let first = e
+        .note(e.knowledge, "burst/b/live/0000-n", &body("first"))
+        .await;
+    e.indexed(first).await;
+    e.quiet(&w).await;
+    eprintln!(
+        "T19B-BENCH корзина {deleted} узлов: подготовка {} с",
+        setup.elapsed().as_secs()
+    );
+    let t = Instant::now();
+    for i in 1..=BATCH {
+        e.note(
+            e.knowledge,
+            &format!("burst/b/live/{i:04}-n"),
+            &body(&format!("live-{i}")),
+        )
+        .await;
+    }
+    e.quiet(&w).await;
+    let secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "T19B-BENCH корзина {deleted} узлов: {BATCH} заметок за {secs:.2} с ({:.1} заданий/с)",
+        BATCH as f64 / secs
+    );
+    w.shutdown().await;
+    secs
+}
+
+/// Бенч задачи 19b M3: индексация пачки при пустой корзине и при 50 тыс. удалённых узлов
+/// (`ZAM_BENCH_TRASH`) — время растёт не больше чем в 1,5 раза. До исправления каждая
+/// свёртка L0 папки и обход поддерева просматривали все узлы пространства вместе с
+/// корзиной на каждом шаге рекурсии. Запуск:
+/// `cargo test --release -p zam-index --test worker -- --ignored bench_index_with_trash --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_index_with_trash() {
+    let trash: usize = std::env::var("ZAM_BENCH_TRASH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+    let empty = trash_bench_run(0).await;
+    let full = trash_bench_run(trash).await;
+    let ratio = full / empty;
+    eprintln!("T19B-BENCH рост времени индексации: {ratio:.2}× (предел 1,5×)");
+    assert!(
+        ratio <= 1.5,
+        "индексация с корзиной {full:.2} с против {empty:.2} с"
+    );
+}

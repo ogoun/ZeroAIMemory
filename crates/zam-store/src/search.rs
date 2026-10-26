@@ -1156,7 +1156,9 @@ pub fn text_snippet(text: &str, needles: &[&str]) -> String {
 
 /// Запрос [`pending_count`]: условия совпадают с частичными индексами `nodes_pending`
 /// (миграция 0006) и `entries_pending` (0008), поэтому считаются только цели в очереди.
-const PENDING_COUNT_SQL: &str = "SELECT (SELECT count(*) FROM nodes n
+/// `INDEXED BY` — с миграцией 0012 (задача 19b M3) планировщик без статистики выбирал
+/// `nodes_live_children (space_id=?)`, то есть обход всех живых узлов области.
+const PENDING_COUNT_SQL: &str = "SELECT (SELECT count(*) FROM nodes n INDEXED BY nodes_pending
      WHERE n.kind = 'note' AND n.index_state = 'pending' AND n.deleted_at IS NULL
        AND n.space_id IN (SELECT value FROM json_each(?1))
        AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/'))

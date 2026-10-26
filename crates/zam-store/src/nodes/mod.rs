@@ -289,6 +289,7 @@ mod tests {
 
     use super::NODE_COLS;
     use super::read::children_sql;
+    use super::tree_ops::{DESCENDANTS_SQL, SUBTREE_SQL, SUBTREE_STAMP_SQL};
 
     fn schema() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -313,7 +314,7 @@ mod tests {
         let c = schema();
         let sql = format!("SELECT {NODE_COLS} FROM nodes n WHERE n.id = ?1");
         let p = plan(&c, &sql, 1);
-        assert!(p.contains("nodes_parent"), "{p}");
+        assert!(p.contains("nodes_live_children"), "{p}");
         assert!(!p.contains("nodes_deleted"), "{p}");
     }
 
@@ -321,9 +322,125 @@ mod tests {
     fn children_cte_uses_parent_index() {
         let c = schema();
         let p = plan(&c, &children_sql(), 3);
-        let parent_uses = p.matches("nodes_parent").count();
+        let parent_uses = p.matches("nodes_live_children").count();
         // якорь, шаг рекурсии и has_children
         assert!(parent_uses >= 3, "{p}");
         assert!(!p.contains("nodes_deleted"), "{p}");
+    }
+
+    /// Обходы дерева идут от очереди `t` к детям по полному ключу `(space_id, parent_id)`, а
+    /// итоговая выборка — по `t` к строке узла (задача 19b M3): без полного просмотра узлов
+    /// пространства на каждом шаге рекурсии и без `SCAN` таблицы `nodes`.
+    #[test]
+    fn tree_walks_search_children_by_full_key() {
+        let c = schema();
+        for (name, sql, n) in [
+            ("children", children_sql(), 3),
+            ("subtree", SUBTREE_SQL.to_string(), 2),
+            ("subtree stamp", SUBTREE_STAMP_SQL.to_string(), 3),
+            ("descendants", DESCENDANTS_SQL.to_string(), 2),
+        ] {
+            let p = plan(&c, &sql, n);
+            for line in p.lines() {
+                let l = line.trim();
+                assert!(
+                    !(l.starts_with("SEARCH c") && l.ends_with("(space_id=?)")),
+                    "{name}: шаг рекурсии по одному space_id
+{p}"
+                );
+                assert!(
+                    !(l.starts_with("SCAN n")
+                        || l.starts_with("SCAN c")
+                        || l.starts_with("SCAN nodes")),
+                    "{name}: просмотр nodes
+{p}"
+                );
+            }
+        }
+    }
+
+    fn ins(
+        c: &Connection,
+        space: &str,
+        parent: Option<&str>,
+        kind: &str,
+        path: &str,
+        del: bool,
+    ) -> String {
+        let id = zam_core::Id::new().to_string();
+        let name = path.rsplit('/').next().unwrap();
+        c.execute(
+            "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, index_state,
+                                created_at, updated_at, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 't', 't', ?7)",
+            rusqlite::params![id, space, parent, kind, name, path, del.then_some("t")],
+        )
+        .unwrap();
+        id
+    }
+
+    /// Шагов VM SQLite на полный проход запроса `sql` и число строк.
+    fn steps(c: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> (usize, i32) {
+        let mut st = c.prepare(sql).unwrap();
+        let mut rows = st.query(args).unwrap();
+        let mut n = 0;
+        while rows.next().unwrap().is_some() {
+            n += 1;
+        }
+        drop(rows);
+        (n, st.get_status(rusqlite::StatementStatus::VmStep))
+    }
+
+    /// Работа обходов живого дерева не зависит от размера корзины (задача 19b M3): база
+    /// с `trash` удалёнными заметками — половина в соседнем удалённом поддереве, половина
+    /// прямо среди детей обходимой папки (вставлены раньше живых — так `EXISTS` по
+    /// `nodes_parent` шёл бы через них).
+    fn walk_steps(trash: usize) -> Vec<(&'static str, usize, i32)> {
+        let c = schema();
+        c.execute(
+            "INSERT INTO spaces (id, kind, name, created_at) VALUES ('s', 'knowledge', 'k', 't')",
+            [],
+        )
+        .unwrap();
+        let live = ins(&c, "s", None, "folder", "live", false);
+        let f = ins(&c, "s", Some(&live), "folder", "live/f", false);
+        let gone = ins(&c, "s", None, "folder", "gone", true);
+        for i in 0..trash / 2 {
+            ins(&c, "s", Some(&gone), "note", &format!("gone/n{i}"), true);
+            ins(&c, "s", Some(&f), "note", &format!("live/f/d{i}"), true);
+        }
+        for i in 0..3 {
+            ins(&c, "s", Some(&f), "note", &format!("live/f/n{i}"), false);
+        }
+        let other = ins(&c, "s", None, "folder", "other", false);
+        ins(&c, "s", Some(&other), "note", "other/n", false);
+        let mut out = Vec::new();
+        let (n, s) = steps(&c, &children_sql(), &[&"s", &live, &3]);
+        out.push(("children live", n, s));
+        let (n, s) = steps(&c, &children_sql(), &[&"s", &f, &1]);
+        out.push(("children f", n, s));
+        let (n, s) = steps(&c, SUBTREE_SQL, &[&"s", &live]);
+        out.push(("subtree live", n, s));
+        let (n, s) = steps(&c, DESCENDANTS_SQL, &[&"s", &other]);
+        out.push(("descendants other", n, s));
+        out
+    }
+
+    #[test]
+    fn tree_walks_do_not_grow_with_trash() {
+        let base = walk_steps(0);
+        let big = walk_steps(4000);
+        for (b, t) in base.iter().zip(&big) {
+            eprintln!("{}: шагов VM {} → {} (корзина 0 → 4000)", b.0, b.2, t.2);
+            assert_eq!(b.1, t.1, "{}: строк", b.0);
+            // запас — на разницу глубины B-дерева индекса
+            assert!(
+                t.2 <= b.2 + 64,
+                "{}: шагов {} при пустой корзине, {} при 4000",
+                b.0,
+                b.2,
+                t.2
+            );
+        }
     }
 }

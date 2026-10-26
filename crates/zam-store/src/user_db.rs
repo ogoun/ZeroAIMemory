@@ -61,6 +61,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         version: 11,
         sql: include_str!("../migrations/user/0011_vault.sql"),
     },
+    Migration {
+        version: 12,
+        sql: include_str!("../migrations/user/0012_live_children.sql"),
+    },
 ];
 
 /// Вид пространства.

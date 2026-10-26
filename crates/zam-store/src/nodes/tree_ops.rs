@@ -237,20 +237,51 @@ fn ensure_no_axiom(c: &Connection, ids: &[Id], author: AuthorKind) -> Result<(),
     Ok(())
 }
 
+/// Запрос [`subtree`] по живым потомкам: `?1` — пространство, `?2` — корень.
+/// `CROSS JOIN` — от строки очереди к детям по `(space_id, parent_id)` частичного индекса
+/// `nodes_live_children` (задача 19b M3, см. `children_sql`): при обычном `JOIN` каждый шаг
+/// просматривал все узлы пространства вместе с корзиной.
+pub(crate) const SUBTREE_SQL: &str = "WITH RECURSIVE t (id) AS (
+             SELECT ?2
+             UNION ALL
+             SELECT c.id FROM t CROSS JOIN nodes c
+             ON c.space_id = ?1 AND c.parent_id = t.id AND c.deleted_at IS NULL
+         )
+         SELECT id FROM t";
+
+/// Запрос [`subtree`] по потомкам, удалённым меткой `?3` (восстановление; порядок
+/// соединений — как в [`SUBTREE_SQL`], индекс `nodes_parent`).
+pub(crate) const SUBTREE_STAMP_SQL: &str = "WITH RECURSIVE t (id) AS (
+             SELECT ?2
+             UNION ALL
+             SELECT c.id FROM t CROSS JOIN nodes c
+             ON c.space_id = ?1 AND c.parent_id = t.id AND c.deleted_at = ?3
+         )
+         SELECT id FROM t";
+
+/// Запрос [`all_descendants`]: `?1` — пространство, `?2` — корень (порядок соединений —
+/// как в [`SUBTREE_SQL`]).
+pub(crate) const DESCENDANTS_SQL: &str = "WITH RECURSIVE t (id) AS (
+             SELECT c.id FROM nodes c WHERE c.space_id = ?1 AND c.parent_id = ?2
+             UNION ALL
+             SELECT c.id FROM t CROSS JOIN nodes c ON c.space_id = ?1 AND c.parent_id = t.id
+         )
+         SELECT n.id, n.path FROM t CROSS JOIN nodes n ON n.id = t.id";
+
 /// Сам узел и его потомки по `parent_id`, в порядке обхода в ширину.
 /// `stamp = None` — только живые потомки; `Some(t)` — удалённые меткой `t`.
 fn subtree(c: &Connection, root: &Node, stamp: Option<&str>) -> Result<Vec<Id>, StoreError> {
-    let mut st = c.prepare_cached(
-        "WITH RECURSIVE t (id) AS (
-             SELECT ?2
-             UNION ALL
-             SELECT c.id FROM nodes c JOIN t ON c.parent_id = t.id
-             WHERE c.space_id = ?1 AND c.deleted_at IS ?3
-         )
-         SELECT id FROM t",
-    )?;
-    let rows = st.query_map(params![root.space_id, root.id, stamp], |r| r.get(0))?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let rows: Vec<Id> = match stamp {
+        None => c
+            .prepare_cached(SUBTREE_SQL)?
+            .query_map(params![root.space_id, root.id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?,
+        Some(t) => c
+            .prepare_cached(SUBTREE_STAMP_SQL)?
+            .query_map(params![root.space_id, root.id, t], |r| r.get(0))?
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(rows)
 }
 
 /// Все потомки узла по `parent_id` (живые и удалённые) с их путями.
@@ -259,14 +290,7 @@ fn all_descendants(
     space_id: Id,
     root: Id,
 ) -> Result<Vec<(Id, String)>, StoreError> {
-    let mut st = c.prepare_cached(
-        "WITH RECURSIVE t (id) AS (
-             SELECT c.id FROM nodes c WHERE c.space_id = ?1 AND c.parent_id = ?2
-             UNION ALL
-             SELECT c.id FROM nodes c JOIN t ON c.parent_id = t.id WHERE c.space_id = ?1
-         )
-         SELECT n.id, n.path FROM nodes n JOIN t ON n.id = t.id",
-    )?;
+    let mut st = c.prepare_cached(DESCENDANTS_SQL)?;
     let rows = st.query_map(params![space_id, root], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
