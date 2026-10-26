@@ -103,3 +103,62 @@ async fn solutions_idempotent_and_lookup() {
     assert_eq!(k.kind, SpaceKind::Knowledge);
     assert_eq!(list_spaces(&db).await.unwrap().len(), 4);
 }
+
+/// Переход схемы v11 → v12 на базе с данными (задача 19b M3): копия `bak-v11`, индекс
+/// `nodes_live_children` создан, живые и удалённые дети папки читаются как прежде.
+#[tokio::test]
+async fn migrate_v11_to_v12_with_trash() {
+    const TS: &str = "2026-10-26T00:00:00.000000Z";
+    let dd = datadir("mig-v12");
+    let user = Id::new();
+    let path = dd.user_db(&user);
+    let (space, folder, live) = (Id::new(), Id::new(), Id::new());
+    {
+        let mut c = rusqlite::Connection::open(&path).unwrap();
+        let v =
+            zam_store::migrate::apply(&mut c, &path, &zam_store::USER_MIGRATIONS[..11]).unwrap();
+        assert_eq!(v, 11);
+        c.execute(
+            "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
+             VALUES (?1, 'solution', 'g-19b', 'sol', ?2)",
+            rusqlite::params![space, TS],
+        )
+        .unwrap();
+        let ins = |id: Id, parent: Option<Id>, kind: &str, path: &str, del: Option<&str>| {
+            c.execute(
+                "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, index_state,
+                                    created_at, updated_at, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'excluded', ?7, ?7, ?6)",
+                rusqlite::params![id, space, parent, kind, path, del, TS],
+            )
+            .unwrap();
+        };
+        ins(folder, None, "folder", "f", None);
+        ins(live, Some(folder), "note", "f/live", None);
+        ins(Id::new(), Some(folder), "note", "f/gone", Some(TS));
+    }
+    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    assert!(path.with_file_name(format!("{user}.db.bak-v11")).exists());
+    let (ver, has_index): (u32, bool) = db
+        .read(|c| {
+            Ok((
+                c.query_row("PRAGMA user_version", [], |r| r.get(0))?,
+                c.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                    WHERE type = 'index' AND name = 'nodes_live_children')",
+                    [],
+                    |r| r.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(ver, zam_store::USER_MIGRATIONS.len() as u32);
+    assert!(has_index);
+    let kids = zam_store::list_children(&db, space, Some(folder), 1)
+        .await
+        .unwrap();
+    assert_eq!(kids.iter().map(|n| n.id).collect::<Vec<_>>(), vec![live]);
+    let f = zam_store::get_node(&db, folder).await.unwrap();
+    assert!(f.has_children);
+}

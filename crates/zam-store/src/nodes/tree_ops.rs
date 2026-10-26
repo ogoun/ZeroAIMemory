@@ -4,7 +4,7 @@
 //! Удаление помечает узел и всех его живых потомков одной меткой `deleted_at`:
 //! метка задаёт «пакет удаления». Восстановление возвращает ровно этот пакет;
 //! потомки, удалённые раньше отдельно, остаются в корзине. Поддерево строится по
-//! `parent_id` (индекс `nodes_parent`), а не по префиксу пути: удалённые узлы
+//! `parent_id` (индексы `nodes_live_children` и `nodes_parent`), а не по префиксу пути: удалённые узлы
 //! могут делить путь с живыми. Каждая операция — одна транзакция писателя и ставит
 //! задания outbox (§8.1): удаление — `delete`, восстановление и перенос — `upsert`. В той же
 //! транзакции перепроверяются выведенные рёбра графа пространства (`crate::graph::tree_changed`).
@@ -250,12 +250,19 @@ pub(crate) const SUBTREE_SQL: &str = "WITH RECURSIVE t (id) AS (
          SELECT id FROM t";
 
 /// Запрос [`subtree`] по потомкам, удалённым меткой `?3` (восстановление; порядок
-/// соединений — как в [`SUBTREE_SQL`], индекс `nodes_parent`).
+/// соединений — как в [`SUBTREE_SQL`]). Дети ищутся по `nodes_parent (space_id, parent_id)`,
+/// метка — фильтр: унарный `+` снимает `deleted_at = ?3` с индекса. Без него планировщик
+/// (статистики нет) брал частичный `nodes_deleted (deleted_at=?)` и для каждой строки
+/// очереди перебирал весь пакет удаления — восстановление K узлов стоило K² шагов
+/// (fix round 1 задачи 19b M3). `+`, а не `INDEXED BY nodes_parent`: план остаётся за
+/// планировщиком (подходящих индексов у оставшихся условий нет, кроме `nodes_parent`), а
+/// переименование индекса не превращается в ошибку запроса; план закреплён тестом
+/// `tree_walks_search_children_by_full_key`.
 pub(crate) const SUBTREE_STAMP_SQL: &str = "WITH RECURSIVE t (id) AS (
              SELECT ?2
              UNION ALL
              SELECT c.id FROM t CROSS JOIN nodes c
-             ON c.space_id = ?1 AND c.parent_id = t.id AND c.deleted_at = ?3
+             ON c.space_id = ?1 AND c.parent_id = t.id AND +c.deleted_at = ?3
          )
          SELECT id FROM t";
 

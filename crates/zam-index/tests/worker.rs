@@ -1216,10 +1216,38 @@ async fn folder_point_fresh_after_stop_mid_rollup() {
     w.shutdown().await;
 }
 
+/// Пользовательское процессорное время процесса теста (воркер, писатель SQLite, тестовая
+/// модель; Qdrant — отдельный процесс). Время ядра не входит: в нём ввод-вывод checkpoint.
+fn user_cpu() -> Duration {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let (mut c, mut x, mut k, mut u) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: псевдодескриптор текущего процесса и указатели на локальные FILETIME
+        unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut x, &mut k, &mut u) }.unwrap();
+        let ticks = (u64::from(u.dwHighDateTime) << 32) | u64::from(u.dwLowDateTime);
+        Duration::from_nanos(ticks * 100)
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: getrusage пишет в локальную структуру
+        let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) }, 0);
+        Duration::from_secs(r.ru_utime.tv_sec as u64)
+            + Duration::from_micros(r.ru_utime.tv_usec as u64)
+    }
+}
+
 /// Одна индексация пачки (задача 19b M3): `BATCH` новых заметок в живой папке рядом с
 /// удалёнными, от первой записи до покоя воркера (задания, auto-L0, свёртки L0 папок).
-/// Возвращает секунды.
-async fn trash_bench_run(trash: usize) -> f64 {
+/// Возвращает секунды: общее время и пользовательское процессорное время процесса.
+async fn trash_bench_run(trash: usize) -> (f64, f64) {
     const BATCH: usize = 300;
     const PER_FOLDER: usize = 1000;
     let e = env(&format!("bench-trash-{trash}")).await;
@@ -1273,6 +1301,16 @@ async fn trash_bench_run(trash: usize) -> f64 {
         })
         .await
         .unwrap();
+    // хвост WAL подготовки переносится в базу до замера (fix round 1, M2): иначе фоновый
+    // checkpoint десятков мегабайт кадров на HDD попадал в замер и держал запись
+    {
+        let c = rusqlite::Connection::open(e.users_dir.join(format!("{}.db", e.user))).unwrap();
+        c.busy_timeout(Duration::from_secs(60)).unwrap();
+        let busy: i64 = c
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 0, "checkpoint WAL после подготовки не завершён");
+    }
     // живая папка с одной заметкой: коллекция создана, воркер в покое
     let w = e.spawn_gc(e.vector.clone(), Duration::from_secs(3600));
     let first = e
@@ -1285,6 +1323,7 @@ async fn trash_bench_run(trash: usize) -> f64 {
         setup.elapsed().as_secs()
     );
     let t = Instant::now();
+    let cpu0 = user_cpu();
     for i in 1..=BATCH {
         e.note(
             e.knowledge,
@@ -1295,18 +1334,21 @@ async fn trash_bench_run(trash: usize) -> f64 {
     }
     e.quiet(&w).await;
     let secs = t.elapsed().as_secs_f64();
+    let cpu = (user_cpu() - cpu0).as_secs_f64();
     eprintln!(
-        "T19B-BENCH корзина {deleted} узлов: {BATCH} заметок за {secs:.2} с ({:.1} заданий/с)",
+        "T19B-BENCH корзина {deleted} узлов: {BATCH} заметок за {secs:.2} с ({:.1} заданий/с), процессор (user) {cpu:.2} с",
         BATCH as f64 / secs
     );
     w.shutdown().await;
-    secs
+    (secs, cpu)
 }
 
 /// Бенч задачи 19b M3: индексация пачки при пустой корзине и при 50 тыс. удалённых узлов
-/// (`ZAM_BENCH_TRASH`) — время растёт не больше чем в 1,5 раза. До исправления каждая
-/// свёртка L0 папки и обход поддерева просматривали все узлы пространства вместе с
-/// корзиной на каждом шаге рекурсии. Запуск:
+/// (`ZAM_BENCH_TRASH`) — пользовательское процессорное время растёт не больше чем в 1,5 раза.
+/// До исправления каждая свёртка L0 папки и обход поддерева просматривали все узлы
+/// пространства вместе с корзиной на каждом шаге рекурсии — работа процессора (одно ядро на
+/// стенде). Общее время печатается справочно: на HDD в нём растут checkpoint WAL и ожидание
+/// записи у файла большего размера (fix round 1, M2), а не просмотр корзины. Запуск:
 /// `cargo test --release -p zam-index --test worker -- --ignored bench_index_with_trash --nocapture`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
@@ -1315,12 +1357,15 @@ async fn bench_index_with_trash() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_000);
-    let empty = trash_bench_run(0).await;
-    let full = trash_bench_run(trash).await;
-    let ratio = full / empty;
-    eprintln!("T19B-BENCH рост времени индексации: {ratio:.2}× (предел 1,5×)");
+    let (wall0, cpu0) = trash_bench_run(0).await;
+    let (wall1, cpu1) = trash_bench_run(trash).await;
+    let ratio = cpu1 / cpu0;
+    eprintln!(
+        "T19B-BENCH рост процессорного времени индексации: {ratio:.2}× (предел 1,5×); общего времени — {:.2}× (справочно)",
+        wall1 / wall0
+    );
     assert!(
         ratio <= 1.5,
-        "индексация с корзиной {full:.2} с против {empty:.2} с"
+        "процессор при корзине {cpu1:.2} с против {cpu0:.2} с"
     );
 }

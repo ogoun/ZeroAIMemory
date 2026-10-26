@@ -196,7 +196,8 @@ pub struct NewNote {
 }
 
 /// Колонки узла для [`node_row`]; таблица `nodes` под псевдонимом `n`.
-/// `has_children` ограничен `space_id`, чтобы подзапрос шёл по индексу `nodes_parent`.
+/// `has_children` ограничен `space_id`, чтобы подзапрос шёл по частичному индексу
+/// `nodes_live_children` (миграция 0012).
 pub(crate) const NODE_COLS: &str = "n.id, n.space_id, n.parent_id, n.kind, n.name, n.path,
     n.current_rev, n.content_hash, n.frontmatter, n.l0, n.l0_source,
     n.created_at, n.updated_at, n.deleted_at, n.index_state,
@@ -341,6 +342,15 @@ mod tests {
             ("descendants", DESCENDANTS_SQL.to_string(), 2),
         ] {
             let p = plan(&c, &sql, n);
+            // позитивная проверка: шаг рекурсии ищет детей по полному ключу; если строки
+            // нет (сменился формат плана или индекс), тест падает, а не проходит пусто
+            let step = recursive_step(&c, &sql, n);
+            assert!(
+                step.iter().any(|l| l.starts_with("SEARCH c USING INDEX")
+                    && l.ends_with("(space_id=? AND parent_id=?)")),
+                "{name}: шаг рекурсии не по (space_id, parent_id): {step:?}
+{p}"
+            );
             for line in p.lines() {
                 let l = line.trim();
                 assert!(
@@ -359,6 +369,24 @@ mod tests {
         }
     }
 
+    /// Строки плана шага рекурсии (дети узла `RECURSIVE STEP` по `parent` плана).
+    fn recursive_step(c: &Connection, sql: &str, params: usize) -> Vec<String> {
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args = rusqlite::params_from_iter(vec!["x"; params]);
+        let rows: Vec<(i64, i64, String)> = st
+            .query_map(args, |r| Ok((r.get(0)?, r.get(1)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let Some(step) = rows.iter().find(|r| r.2 == "RECURSIVE STEP").map(|r| r.0) else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter(|r| r.1 == step)
+            .map(|r| r.2)
+            .collect()
+    }
+
     fn ins(
         c: &Connection,
         space: &str,
@@ -367,13 +395,25 @@ mod tests {
         path: &str,
         del: bool,
     ) -> String {
+        ins_at(c, space, parent, kind, path, del.then_some("t"))
+    }
+
+    /// Узел с меткой удаления `deleted_at` (`None` — живой).
+    fn ins_at(
+        c: &Connection,
+        space: &str,
+        parent: Option<&str>,
+        kind: &str,
+        path: &str,
+        deleted_at: Option<&str>,
+    ) -> String {
         let id = zam_core::Id::new().to_string();
         let name = path.rsplit('/').next().unwrap();
         c.execute(
             "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, index_state,
                                 created_at, updated_at, deleted_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 't', 't', ?7)",
-            rusqlite::params![id, space, parent, kind, name, path, del.then_some("t")],
+            rusqlite::params![id, space, parent, kind, name, path, deleted_at],
         )
         .unwrap();
         id
@@ -424,6 +464,58 @@ mod tests {
         let (n, s) = steps(&c, DESCENDANTS_SQL, &[&"s", &other]);
         out.push(("descendants other", n, s));
         out
+    }
+
+    /// Шаги VM обхода восстановления (`SUBTREE_STAMP_SQL`): папка с `pack` заметками,
+    /// удалёнными одной меткой, и `other` удалённых другой меткой вне её.
+    fn restore_steps(pack: usize, other: usize) -> (usize, i32) {
+        let c = schema();
+        c.execute(
+            "INSERT INTO spaces (id, kind, name, created_at) VALUES ('s', 'knowledge', 'k', 't')",
+            [],
+        )
+        .unwrap();
+        let root = ins_at(&c, "s", None, "folder", "pack", Some("p"));
+        let gone = ins_at(&c, "s", None, "folder", "gone", Some("q"));
+        for i in 0..pack {
+            ins_at(
+                &c,
+                "s",
+                Some(&root),
+                "note",
+                &format!("pack/n{i}"),
+                Some("p"),
+            );
+        }
+        for i in 0..other {
+            ins_at(
+                &c,
+                "s",
+                Some(&gone),
+                "note",
+                &format!("gone/n{i}"),
+                Some("q"),
+            );
+        }
+        steps(&c, SUBTREE_STAMP_SQL, &[&"s", &root, &"p"])
+    }
+
+    /// Восстановление пакета линейно по его размеру и не зависит от чужой корзины (fix round 1
+    /// задачи 19b): шаг рекурсии по `nodes_deleted (deleted_at=?)` перебирал для каждой строки
+    /// очереди весь пакет — K².
+    #[test]
+    fn restore_walk_is_linear_in_pack() {
+        let (n1, s1) = restore_steps(1000, 0);
+        let (n4, s4) = restore_steps(4000, 0);
+        let (n0, s0) = restore_steps(100, 0);
+        let (nq, sq) = restore_steps(100, 4000);
+        eprintln!(
+            "restore: шагов VM {s1} (1000), {s4} (4000); {s0} → {sq} (чужая корзина 0 → 4000)"
+        );
+        assert_eq!((n1, n4, n0, nq), (1001, 4001, 101, 101));
+        // линейный рост — 4×, квадратичный — 16×
+        assert!(s4 <= s1 * 5, "пакет 1000 → 4000: шагов {s1} → {s4}");
+        assert!(sq <= s0 + 64, "чужая корзина 0 → 4000: шагов {s0} → {sq}");
     }
 
     #[test]
