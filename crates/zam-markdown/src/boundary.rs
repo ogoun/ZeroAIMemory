@@ -186,6 +186,11 @@ fn similarity(a: &HashSet<&String>, b: &HashSet<&String>) -> f64 {
 /// (`None` — не проза: код, список, заголовок); `eligible[j]` — граница внутри прозы
 /// (между предложениями или абзацами). Бонус в `0..=2`, у прочих границ — 0.
 pub(crate) fn cohesion_bonus(bags: &[Option<HashSet<String>>], eligible: &[bool]) -> Vec<f64> {
+    depth_bonus(&window_similarity(bags, eligible))
+}
+
+/// Сходство окон прозы слева и справа от каждой границы (`NaN` — граница не в прозе).
+fn window_similarity(bags: &[Option<HashSet<String>>], eligible: &[bool]) -> Vec<f64> {
     let n = bags.len();
     let mut sim = vec![f64::NAN; n];
     for (j, slot) in sim.iter_mut().enumerate().skip(1) {
@@ -203,23 +208,45 @@ pub(crate) fn cohesion_bonus(bags: &[Option<HashSet<String>>], eligible: &[bool]
             .collect();
         *slot = similarity(&left, &right);
     }
+    sim
+}
+
+/// Глубина провала сходства у каждой границы: вершины слева и справа — подъём, пока сходство
+/// соседних границ не убывает. Два линейных прохода: подъём из `j` первым шагом переходит в
+/// `j − 1` (при `sim[j − 1] ≥ sim[j]`) и дальше совпадает с подъёмом из `j − 1`, поэтому
+/// вершина слева `top_l[j] = top_l[j − 1]`, иначе `sim[j]` (справа — зеркально). Значения
+/// копируются, а не вычисляются — результат бит в бит как у прямого подъёма из каждой границы
+/// (O(n²) на монотонных участках; тест эквивалентности — `depth_bonus_matches_naive`).
+fn depth_bonus(sim: &[f64]) -> Vec<f64> {
+    let n = sim.len();
+    let mut top_l = vec![f64::NAN; n];
+    for j in 1..n {
+        if sim[j].is_nan() {
+            continue;
+        }
+        top_l[j] = if j > 1 && !sim[j - 1].is_nan() && sim[j - 1] >= sim[j] {
+            top_l[j - 1]
+        } else {
+            sim[j]
+        };
+    }
+    let mut top_r = vec![f64::NAN; n];
+    for j in (1..n).rev() {
+        if sim[j].is_nan() {
+            continue;
+        }
+        top_r[j] = if j + 1 < n && !sim[j + 1].is_nan() && sim[j + 1] >= sim[j] {
+            top_r[j + 1]
+        } else {
+            sim[j]
+        };
+    }
     let mut out = vec![0.0; n];
     for (j, &s) in sim.iter().enumerate().skip(1) {
         if s.is_nan() {
             continue;
         }
-        // вершины слева и справа: подъём, пока сходство соседних границ не убывает
-        let (mut hl, mut k) = (s, j);
-        while k > 1 && !sim[k - 1].is_nan() && sim[k - 1] >= hl {
-            hl = sim[k - 1];
-            k -= 1;
-        }
-        let (mut hr, mut k) = (s, j);
-        while k + 1 < n && !sim[k + 1].is_nan() && sim[k + 1] >= hr {
-            hr = sim[k + 1];
-            k += 1;
-        }
-        out[j] = ((hl - s) + (hr - s)).clamp(0.0, MAX_BONUS);
+        out[j] = ((top_l[j] - s) + (top_r[j] - s)).clamp(0.0, MAX_BONUS);
     }
     out
 }
@@ -227,6 +254,95 @@ pub(crate) fn cohesion_bonus(bags: &[Option<HashSet<String>>], eligible: &[bool]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// Прямой подъём из каждой границы (реализация задачи 17, O(n²)) — эталон для
+    /// [`depth_bonus`].
+    fn depth_bonus_naive(sim: &[f64]) -> Vec<f64> {
+        let n = sim.len();
+        let mut out = vec![0.0; n];
+        for (j, &s) in sim.iter().enumerate().skip(1) {
+            if s.is_nan() {
+                continue;
+            }
+            let (mut hl, mut k) = (s, j);
+            while k > 1 && !sim[k - 1].is_nan() && sim[k - 1] >= hl {
+                hl = sim[k - 1];
+                k -= 1;
+            }
+            let (mut hr, mut k) = (s, j);
+            while k + 1 < n && !sim[k + 1].is_nan() && sim[k + 1] >= hr {
+                hr = sim[k + 1];
+                k += 1;
+            }
+            out[j] = ((hl - s) + (hr - s)).clamp(0.0, MAX_BONUS);
+        }
+        out
+    }
+
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// Сходства из малого набора значений (частые равенства — ветка `>=`) и `NaN`.
+        #[test]
+        fn depth_bonus_matches_naive(
+            sim in prop::collection::vec(
+                prop_oneof![
+                    1 => Just(f64::NAN),
+                    4 => (0u8..6).prop_map(|k| f64::from(k) / 5.0),
+                    2 => 0.0f64..1.0,
+                ],
+                0..60,
+            )
+        ) {
+            prop_assert_eq!(bits(&depth_bonus(&sim)), bits(&depth_bonus_naive(&sim)));
+        }
+
+        /// Весь путь `cohesion_bonus` на случайных мешках из маленького словаря.
+        #[test]
+        fn cohesion_bonus_matches_naive(
+            units in prop::collection::vec(
+                (any::<bool>(), prop::collection::hash_set(0u8..8, 0..5), any::<bool>()),
+                0..40,
+            )
+        ) {
+            let bags: Vec<Option<HashSet<String>>> = units
+                .iter()
+                .map(|(prose, words, _)| {
+                    prose.then(|| words.iter().map(|w| format!("w{w}")).collect())
+                })
+                .collect();
+            let eligible: Vec<bool> = units.iter().map(|u| u.2).collect();
+            let sim = window_similarity(&bags, &eligible);
+            prop_assert_eq!(
+                bits(&cohesion_bonus(&bags, &eligible)),
+                bits(&depth_bonus_naive(&sim))
+            );
+        }
+    }
+
+    #[test]
+    fn depth_bonus_linear_on_long_monotone_run() {
+        // 200 000 границ с неубывающим сходством: прямой подъём — O(n²) (≈ 2·10¹⁰ шагов)
+        let n = 200_000;
+        let sim: Vec<f64> = (0..n)
+            .map(|j| {
+                if j == 0 {
+                    f64::NAN
+                } else {
+                    j as f64 / n as f64
+                }
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let b = depth_bonus(&sim);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(b[1], (sim[n - 1] - sim[1]).clamp(0.0, MAX_BONUS));
+    }
 
     fn cand(tokens: usize, strength: f64) -> Cand {
         Cand {
