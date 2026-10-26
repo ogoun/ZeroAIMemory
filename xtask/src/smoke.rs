@@ -1097,11 +1097,7 @@ fn vector_search(
             )
         })?;
     let sources = item["sources"].to_string();
-    let channels: Vec<&str> = item["sources"]
-        .as_array()
-        .map(|s| s.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    if channels != ["vector"] {
+    if channels(item) != ["vector"] {
         bail!(
             "{VECTOR_TARGET} должен найтись только векторным каналом (у перефраза нет общих \
              с заметкой подстрок для fts и trigram): sources = {sources}"
@@ -1177,8 +1173,18 @@ fn register_solution(base: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Каналы поиска (`sources`) элемента выдачи.
+fn channels(item: &Value) -> Vec<&str> {
+    item["sources"]
+        .as_array()
+        .map(|s| s.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
 /// Критерий M3: `zam log insight --certainty hypothesis` → поиск по решению находит запись
-/// в top-3 с `kind = insight` и `certainty = hypothesis` (ожидание индексации ≤ 60 с).
+/// в top-3 с `kind = insight` и `certainty = hypothesis` (ожидание индексации ≤ 60 с), и
+/// находит её в том числе векторный канал (`sources ∋ vector`): запрос пересекается с
+/// заголовком по словам, одного FTS хватило бы, а шаг проверяет векторизацию записей.
 fn insight_found(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
     let home = dir.join("insight-home");
     fs::create_dir_all(&home)?;
@@ -1245,6 +1251,12 @@ fn insight_found(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> 
             "найденная запись: kind = {}, certainty = {} (ожидались insight и hypothesis)",
             hit["kind"],
             hit["certainty"]
+        );
+    }
+    if !channels(hit).contains(&"vector") {
+        bail!(
+            "insight найден без векторного канала (запись не векторизована?): sources = {}",
+            hit["sources"]
         );
     }
     Ok(())
@@ -1549,6 +1561,14 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn channels_of_item() {
+        let it = serde_json::json!({"sources": ["fts", "vector"]});
+        assert_eq!(channels(&it), ["fts", "vector"]);
+        assert!(channels(&serde_json::json!({})).is_empty());
+        assert!(channels(&serde_json::json!({"sources": "vector"})).is_empty());
     }
 
     #[test]
