@@ -277,6 +277,29 @@ fn name_before_masked_value_idempotent() {
     );
 }
 
+/// Плата за идемпотентность (ревью финальной волны, M-5): имя слева от замаскированного
+/// значения проверяется правилом энтропии в первом же проходе. Типичные длинные имена
+/// (`UPPER_SNAKE_CASE`, CamelCase без цифр) не маскируются — у них нет строчных или цифр, —
+/// а длинное имя со всеми классами символов и высокой энтропией маскируется (раньше это делал
+/// второй проход).
+#[test]
+fn long_name_left_of_masked_value() {
+    for name in [
+        "DATABASE_CONNECTION_POOL_PRIMARY_PASSWORD",
+        "SERVICE_ACCOUNT_2_FOR_REGION_EU_1_PASSWORD",
+        "MyVeryLongServiceAccountConfigurationPassword",
+    ] {
+        let t = format!("{name}=hunter2secret");
+        assert_eq!(mask_text(&t), format!("{name}={SECRET_MARK}"), "{name}");
+    }
+    let random = format!("{}password", rnd(32, 42));
+    assert_eq!(
+        mask_text(&format!("{random}=hunter2secret")),
+        format!("{SECRET_MARK}{SECRET_MARK}"),
+        "имя-случайная строка маскируется вместе с разделителем"
+    );
+}
+
 #[test]
 fn overlapping_rules_merge() {
     // токен ZeroAIMemory в значении `token=`: один хит, значение маскируется целиком
