@@ -1,5 +1,6 @@
 //! `zam solution access list|requests|approve|reject|revoke` — управление доступом к
-//! решению владельцем без WebUI (§11.6).
+//! решению владельцем без WebUI (§11.6); `zam solution rename <имя>` — переименование
+//! (`PATCH /solutions/{guid}`, владелец или администратор).
 //!
 //! Решение — `--solution GUID` или `agent_solution_id` ближайшего `solution.toml`.
 //! Пользователь — по имени (как в списке запросов) или id.
@@ -77,6 +78,30 @@ fn line(m: &Value) -> String {
         m["state"].as_str().unwrap_or("?"),
         m["access"].as_str().unwrap_or("?"),
         m["requested_at"].as_str().unwrap_or("?"),
+    )
+}
+
+/// `zam solution rename <имя> [--solution GUID]`: печатает `<guid>  <новое имя>`.
+pub fn rename(ctx: &Ctx, flag: Option<&str>, name: &str) -> Result<(), CliError> {
+    let guid = solution_guid(ctx, flag)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CliError::input("имя решения не может быть пустым"));
+    }
+    let r = ctx
+        .client
+        .patch_json(&format!("/solutions/{guid}"), &json!({ "name": name }))?;
+    let v = read_json(r)?;
+    if ctx.json {
+        return emit_json(&v);
+    }
+    emit(
+        format!(
+            "{guid}  {}
+",
+            v["name"].as_str().unwrap_or(name)
+        )
+        .as_bytes(),
     )
 }
 

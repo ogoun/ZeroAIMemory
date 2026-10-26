@@ -1065,3 +1065,94 @@ async fn broken_owner_db_skipped_not_500() {
     assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
     a.st.shutdown().await;
 }
+
+/// `PATCH /solutions/{guid} {name}` (§11.6): владелец и администратор переименовывают,
+/// участник и запросивший доступ — 403, посторонний — 404, `ro`-токен — 403; имя 1–200
+/// символов без управляющих; аудит `solution.rename`; GUID и доступ не меняются.
+#[tokio::test]
+async fn patch_solution_rename_owner_ok_participant_403() {
+    let w = world("rename").await;
+    w.shared(None).await;
+    let uri = format!("/api/v1/solutions/{G}");
+    let rename = |name: &str| Some(json!({ "name": name }));
+    // участник
+    let r = w
+        .req(&w.b_tok, Method::PATCH, &uri, rename("Чужое имя"))
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    // посторонний
+    let r = w
+        .req(&w.c_tok, Method::PATCH, &uri, rename("Чужое имя"))
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    // ro-токен владельца
+    let ro = w.a.issue(&w.a_id, "ro").await;
+    let r = w.req(&ro, Method::PATCH, &uri, rename("Нельзя")).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    // владелец
+    let r = w
+        .req(&w.a_tok, Method::PATCH, &uri, rename("  Новое имя  "))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["name"], "Новое имя", "{j}");
+    assert_eq!(j["role"], "owner", "{j}");
+    assert_eq!(j["agent_solution_id"], G, "{j}");
+    // имя видно и участнику, и в списке
+    let j = w.get(&w.b_tok, &uri).await.json();
+    assert_eq!(j["name"], "Новое имя", "{j}");
+    let list = w.get(&w.a_tok, "/api/v1/solutions").await.json();
+    assert_eq!(list[0]["name"], "Новое имя", "{list}");
+    // доступ участника не затронут
+    assert_eq!(
+        w.note(&w.b_tok, G, "n", "# N\n").await.status,
+        StatusCode::CREATED
+    );
+    // администратор
+    let r =
+        w.a.adm(Method::PATCH, &uri, rename("Имя админа"), Some(&w.a_id))
+            .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["role"], "admin");
+    assert_eq!(r.json()["name"], "Имя админа");
+    // проверка имени
+    for bad in [String::new(), "   ".into(), "a\nb".into(), "я".repeat(201)] {
+        let r = w.req(&w.a_tok, Method::PATCH, &uri, rename(&bad)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad:?}: {}", r.text());
+    }
+    let r = w
+        .req(&w.a_tok, Method::PATCH, &uri, rename(&"я".repeat(200)))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = w
+        .req(
+            &w.a_tok,
+            Method::PATCH,
+            &uri,
+            Some(json!({"name": "x", "z": 1})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // неизвестное решение
+    let r = w
+        .req(
+            &w.a_tok,
+            Method::PATCH,
+            "/api/v1/solutions/0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9eaa",
+            rename("x"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    // аудит: три успешных переименования, отказы не записаны
+    let audit = w.audit_actions().await;
+    let renames: Vec<&Value> = audit
+        .iter()
+        .filter(|e| e["action"] == "solution.rename")
+        .collect();
+    assert_eq!(renames.len(), 3, "{audit:?}");
+    assert!(renames.iter().all(|e| e["target"] == G), "{audit:?}");
+    assert!(
+        renames.iter().any(|e| e["details"]["to"] == "Новое имя"),
+        "{audit:?}"
+    );
+}

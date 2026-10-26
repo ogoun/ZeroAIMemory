@@ -1,6 +1,8 @@
 //! `zam vault` (§7.6, §13.2): секреты пользователя.
 //!
-//! - `zam vault list [--q Q] [--global] [--solution GUID]` — метаданные без значений;
+//! - `zam vault list [--q Q] [--global] [--solution GUID]` — метаданные без значений; при
+//!   заблокированном Vault (§7.6) список печатается, а в stderr — строка «Vault заблокирован:
+//!   <причина>» (код выхода 0; `get` и `set` получают 503);
 //! - `zam vault get <имя> [--global] [--raw]` — в stdout только значение (`--raw` — без
 //!   перевода строки в конце); раскрытие пишется в аудит сервера;
 //! - `zam vault set <имя> --type T [--username U] [--link URL] [--description D] [--global]` —
@@ -44,11 +46,27 @@ fn space(ctx: &Ctx, a: &Area) -> Result<String, CliError> {
     }
 }
 
-/// Записи области (метаданные); `q` — подстрока открытых полей.
-fn items(ctx: &Ctx, space: &str, q: Option<&str>) -> Result<Vec<Value>, CliError> {
+/// Ответ списка области: метаданные записей; `q` — подстрока открытых полей.
+fn listing(ctx: &Ctx, space: &str, q: Option<&str>) -> Result<Value, CliError> {
     let query: Vec<(&str, &str)> = q.map(|q| vec![("q", q)]).unwrap_or_default();
-    let v = read_json(ctx.client.get(&format!("/spaces/{space}/vault"), &query)?)?;
-    Ok(v["items"].as_array().cloned().unwrap_or_default())
+    read_json(ctx.client.get(&format!("/spaces/{space}/vault"), &query)?)
+}
+
+/// Записи области (метаданные).
+fn items(ctx: &Ctx, space: &str, q: Option<&str>) -> Result<Vec<Value>, CliError> {
+    Ok(listing(ctx, space, q)?["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Строка о блокировке из ответа списка; `None`, если Vault работает.
+pub fn locked_line(listing: &Value) -> Option<String> {
+    if listing["locked"].as_bool() != Some(true) {
+        return None;
+    }
+    let reason = listing["reason"].as_str().unwrap_or("причина не указана");
+    Some(format!("Vault заблокирован: {reason}"))
 }
 
 /// Запись с именем ровно `name`.
@@ -134,12 +152,18 @@ fn line(i: &Value) -> String {
 /// `zam vault list`.
 pub fn list(ctx: &Ctx, a: &Area, q: Option<&str>) -> Result<(), CliError> {
     let space = space(ctx, a)?;
-    let items = items(ctx, &space, q)?;
+    let listing = listing(ctx, &space, q)?;
     if ctx.json {
-        return emit_json(&json!({ "items": items }));
+        return emit_json(&listing);
     }
+    let items = listing["items"].as_array().cloned().unwrap_or_default();
     let out: String = items.iter().map(line).collect();
-    emit(out.as_bytes())
+    emit(out.as_bytes())?;
+    // stdout остаётся списком для скриптов; предупреждение — в stderr
+    if let Some(l) = locked_line(&listing) {
+        eprintln!("{l}");
+    }
+    Ok(())
 }
 
 /// `zam vault get`: в stdout только значение.
@@ -211,6 +235,17 @@ mod tests {
         assert_eq!(strip_newline("abc\r\n".into()), "abc");
         assert_eq!(strip_newline("abc\n\n".into()), "abc\n");
         assert_eq!(strip_newline("abc".into()), "abc");
+    }
+
+    #[test]
+    fn locked_line_from_listing() {
+        assert_eq!(locked_line(&json!({"items": [], "locked": false})), None);
+        assert_eq!(locked_line(&json!({"items": []})), None);
+        assert_eq!(
+            locked_line(&json!({"items": [], "locked": true, "reason": "нет мастер-ключа"}))
+                .as_deref(),
+            Some("Vault заблокирован: нет мастер-ключа")
+        );
     }
 
     #[test]

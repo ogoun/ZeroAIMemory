@@ -84,7 +84,8 @@ pub use system::{
 };
 pub use user_db::{
     Space, SpaceKind, USER_MIGRATIONS, UserDbs, create_solution, create_solution_with_id,
-    get_solution, get_space, list_spaces, rename_solution_guid, space_of_kind,
+    get_solution, get_space, list_spaces, rename_solution_guid, rename_solution_space,
+    space_of_kind,
 };
 pub use vault::{
     KEY_CHECK_SETTING, VAULT_TITLE_MAX_CHARS, VaultMeta, VaultRevision, VaultScope,

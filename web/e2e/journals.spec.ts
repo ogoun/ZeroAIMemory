@@ -261,17 +261,29 @@ test('журнал по прямому адресу у Rules: понятное �
   await expect(page.getByRole('table', { name: 'Insights' })).toHaveCount(0);
 });
 
-test('Vault: баннер vault-locked (503)', async ({ page }) => {
+test('Vault: заблокирован — список виден, «Показать» неактивна, баннер', async ({ page }) => {
   // ответ сервера без мастер-ключа подменяется: сам сервер E2E с ключом
+  const reason = 'Vault заблокирован: мастер-ключ не подходит к ключам пользователей';
   await page.route(`**/api/v1/spaces/${SOLUTION_GUID}/vault`, (route) =>
     route.fulfill({
-      status: 503,
-      contentType: 'application/problem+json',
+      status: 200,
+      contentType: 'application/json',
       json: {
-        type: '/problems/vault-locked',
-        title: 'Service Unavailable',
-        status: 503,
-        detail: 'Vault заблокирован: мастер-ключ не подходит к ключам пользователей',
+        locked: true,
+        reason,
+        items: [
+          {
+            id: '01HZZZZZZZZZZZZZZZZZZZZZZZ',
+            space: SOLUTION_GUID,
+            agent_solution_id: SOLUTION_GUID,
+            title: 'E2E заблокированный',
+            data: { type: 'token', username: 'deploy-bot' },
+            rev: 1,
+            author: { kind: 'agent' },
+            created_at: '2026-10-26T10:00:00Z',
+            updated_at: '2026-10-26T10:00:00Z',
+          },
+        ],
       },
     }),
   );
@@ -279,7 +291,29 @@ test('Vault: баннер vault-locked (503)', async ({ page }) => {
   const banner = page.locator('.locked');
   await expect(banner).toContainText('Vault заблокирован: мастер-ключ не подходит');
   await expect(banner).toContainText('ZAM_MASTER_KEY');
-  await expect(page.locator('li.item')).toHaveCount(0);
+  const item = page.locator('li.item', { hasText: 'E2E заблокированный' });
+  await expect(item).toContainText('deploy-bot');
+  await expect(item.getByRole('button', { name: 'Показать' })).toBeDisabled();
+});
+
+test('Vault: 503 при раскрытии — баннер vault-locked', async ({ page }) => {
+  await page.route('**/api/v1/vault/*', (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: 'application/problem+json',
+      json: {
+        type: '/problems/vault-locked',
+        title: 'Service Unavailable',
+        status: 503,
+        detail: 'Vault заблокирован: файл мастер-ключа не найден',
+      },
+    }),
+  );
+  await openJournal(page, 'Vault');
+  const item = page.locator('li.item', { hasText: 'E2E токен деплоя' });
+  await item.getByRole('button', { name: 'Показать' }).click();
+  await expect(page.locator('.locked')).toContainText('Vault заблокирован: файл мастер-ключа');
+  await expect(item.getByRole('button', { name: 'Показать' })).toBeDisabled();
 });
 
 test('Связи: обратная ссылка и неразрешённая исходящая', async ({ page }) => {

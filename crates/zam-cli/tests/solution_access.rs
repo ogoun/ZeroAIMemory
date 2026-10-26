@@ -226,3 +226,47 @@ fn solution_access_flow() {
     let o = zam(&url, &a, &root, &["solution", "access", "list"], b"");
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
 }
+
+#[test]
+fn solution_rename_owner_only() {
+    let (url, a, b) = start("rename");
+    let root = tmp("rename-cwd");
+    let r = repo(
+        &root,
+        &format!("agent_solution_id = \"{G}\"\nname = \"Общее\"\n"),
+    );
+    ok(&zam(
+        &url,
+        &a,
+        &r,
+        &["write", "план"],
+        "# План\n".as_bytes(),
+    ));
+    // запросивший доступ (pending) переименовать не может
+    let o = zam(&url, &b, &r, &["write", "заметка-b"], b"# B\n");
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    let o = zam(&url, &b, &r, &["solution", "rename", "Чужое"], b"");
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    // владелец: решение из solution.toml
+    let s = ok(&zam(
+        &url,
+        &a,
+        &r,
+        &["solution", "rename", "Новое имя"],
+        b"",
+    ));
+    assert!(s.contains(G) && s.contains("Новое имя"), "{s}");
+    // и по --solution
+    let s = ok(&zam(
+        &url,
+        &a,
+        &root,
+        &["solution", "rename", "Ещё имя", "--solution", G, "--json"],
+        b"",
+    ));
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(v["name"], "Ещё имя");
+    // пустое имя — ошибка ввода (6)
+    let o = zam(&url, &a, &r, &["solution", "rename", "  "], b"");
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+}

@@ -252,6 +252,12 @@ zam vault get github --global --raw                                  # в stdout
 другие участники общего решения его не видят. Повторный `set` с тем же именем создаёт новую
 ревизию; прежние значения раскрывает только администратор (`GET /vault/{id}/revisions?reveal=1&rev=N`).
 
+При заблокированном Vault список и метаданные отвечают: `GET /spaces/{space}/vault`,
+`GET /vault/{id}` без `reveal` и `GET /vault/{id}/revisions` — 200 с полем `locked: true` и
+`reason` (только открытые поля: имя, вид, привязка, даты), `zam vault list` печатает список и
+в stderr строку «Vault заблокирован: <причина>», WebUI показывает список с баннером и неактивной
+кнопкой «Показать». Значения (`reveal=1`), создание, правка и удаление — 503 `vault-locked`.
+
 Если `ZAM_MASTER_KEY` задан, файл ключа не создаётся и не читается: резервируйте значение
 переменной так же, как файл. Смена ключа (перешифровка) в M3 не поддерживается.
 
@@ -261,7 +267,9 @@ zam vault get github --global --raw                                  # в stdout
 который первым его зарегистрировал, — владельца (§11.6 ТЗ). Другой пользователь, чей агент
 обращается к тому же GUID, получает запрос доступа `pending` и, пока владелец не ответит, —
 403 `/problems/solution-access` (`state: pending`) на чтение и запись решения; поиск исключает
-решение с предупреждением `solution access pending`.
+решение с предупреждением `solution access pending`; `GET /triggers?solution=` при недоступном
+решении (`pending|rejected|revoked`, неизвестный GUID) отвечает 200 с триггерами Knowledge и
+`warnings` вместо отказа.
 
 ```
 zam solution access requests               # владелец: ожидающие запросы текущего решения
@@ -269,6 +277,7 @@ zam solution access approve Борис          # одобрить (rw); --ro �
 zam solution access reject Борис --reason "не наш проект"
 zam solution access revoke Борис           # отзыв — со следующего запроса того же токена
 zam solution access list                   # все запросы и участники
+zam solution rename "Новое имя"            # переименование решения (владелец или администратор)
 ```
 
 То же — `POST /api/v1/solutions/{guid}/access/{user}/approve|reject|revoke` и страница WebUI

@@ -697,8 +697,15 @@ export interface VaultItem {
   updated_at: string;
 }
 
+/** Список метаданных; при заблокированном Vault — `locked: true` и `reason` (значений нет). */
+export interface VaultList {
+  items: VaultItem[];
+  locked?: boolean;
+  reason?: string;
+}
+
 export const listVault = (user: string, space: string) =>
-  call<{ items: VaultItem[] }>('GET', `spaces/${q(space)}/vault`, undefined, user);
+  call<VaultList>('GET', `spaces/${q(space)}/vault`, undefined, user);
 
 /** Значение секрета: ответ `no-store`, раскрытие записывается в аудит. */
 export async function revealVault(user: string, id: string): Promise<string> {

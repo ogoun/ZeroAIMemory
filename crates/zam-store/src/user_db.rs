@@ -788,6 +788,22 @@ pub(crate) const SPACE_NOTES_PENDING_SQL: &str = "UPDATE nodes SET index_state =
        AND index_state <> 'excluded'
      RETURNING id, current_rev";
 
+/// Меняет имя пространства решения `space_id`. Нет такого пространства решения — `NotFound`.
+pub async fn rename_solution_space(db: &Db, space_id: Id, name: &str) -> Result<(), StoreError> {
+    let name = name.to_string();
+    db.write(move |tx| {
+        let n = tx.execute(
+            "UPDATE spaces SET name = ?2 WHERE id = ?1 AND kind = 'solution'",
+            params![space_id, name],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Меняет GUID пространства решения `space_id` (конфликт GUID при регистрации решений
 /// M1–M2). Узлы, ревизии и чанки остаются на месте; живые индексируемые заметки получают
 /// `upsert`, чтобы точки Qdrant получили новый `solution_guid` в payload. Нет такого

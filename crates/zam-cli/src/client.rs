@@ -205,6 +205,15 @@ impl Client {
         self.check(self.prepare(self.agent.delete(&self.url(path))).call())
     }
 
+    /// PATCH JSON без `If-Match`.
+    pub fn patch_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
+        let rb = self.prepare(self.agent.patch(&self.url(path)));
+        self.check(
+            rb.content_type("application/json")
+                .send(body.to_string().as_bytes()),
+        )
+    }
+
     /// PATCH JSON с `If-Match: "<rev>"`.
     pub fn patch_json_if(
         &self,

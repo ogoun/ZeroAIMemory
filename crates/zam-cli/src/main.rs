@@ -468,6 +468,13 @@ enum SolutionCmd {
         #[command(subcommand)]
         cmd: AccessCmd,
     },
+    /// Переименовать решение (владелец или администратор)
+    Rename {
+        /// Новое имя (1-200 символов)
+        name: String,
+        #[command(flatten)]
+        opts: AccessOpts,
+    },
 }
 
 /// Решение и подключение для команд доступа.
@@ -776,6 +783,13 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             )),
         },
         Cmd::Links { target, common } => cmd::link::list(&cmd::connect(&common)?, &target),
+        Cmd::Solution {
+            cmd: SolutionCmd::Rename { name, opts },
+        } => cmd::solution::rename(
+            &cmd::connect(&opts.common)?,
+            opts.solution.as_deref(),
+            &name,
+        ),
         Cmd::Solution {
             cmd: SolutionCmd::Access { cmd },
         } => {

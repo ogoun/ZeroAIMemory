@@ -70,7 +70,10 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
             "/api/v1/solutions",
             get(solutions::list).post(solutions::register),
         )
-        .route("/api/v1/solutions/{guid}", get(solutions::get))
+        .route(
+            "/api/v1/solutions/{guid}",
+            get(solutions::get).patch(solutions::rename),
+        )
         .route(
             "/api/v1/solutions/{guid}/access",
             get(solutions::access_list),
