@@ -245,16 +245,30 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
         }
     }
     for m in ENTROPY_CANDIDATE.find_iter(text) {
-        let mut r = m.range();
-        // `имя=значение`: `=` внутри строки — разделитель, а не base64-дополнение (оно в конце)
-        if let Some(i) = m.as_str().trim_end_matches('=').rfind('=') {
-            r.start += i + 1;
-            if r.len() < 32 {
-                continue;
+        let start = m.start();
+        let mut end = m.end();
+        loop {
+            // `имя=значение`: `=` внутри строки — разделитель, а не base64-дополнение (оно в
+            // конце); проверяется значение
+            let inner = text[start..end].trim_end_matches('=').rfind('=');
+            let r = inner.map_or(start..end, |i| start + i + 1..end);
+            if r.len() >= 32 && is_high_entropy_secret(&text[r.clone()], url_token_around(text, &r))
+            {
+                raw.push((r.clone(), SecretKind::HighEntropy));
             }
-        }
-        if is_high_entropy_secret(&text[r.clone()], url_token_around(text, &r)) {
-            raw.push((r, SecretKind::HighEntropy));
+            // значение замаскировано (этим или другим правилом): повторный проход увидит
+            // `имя=` перед маской отдельным кандидатом — он проверяется сразу, иначе маскировка
+            // не идемпотентна
+            match inner {
+                Some(_)
+                    if raw
+                        .iter()
+                        .any(|(h, _)| h.start <= r.start && r.start < h.end) =>
+                {
+                    end = r.start;
+                }
+                _ => break,
+            }
         }
     }
     raw.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(b.0.end.cmp(&a.0.end)));

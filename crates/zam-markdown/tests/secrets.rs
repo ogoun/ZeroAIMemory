@@ -257,6 +257,26 @@ fn lines_and_order() {
     assert!(scan_secrets(&mask_secrets(&t, &hits)).is_empty());
 }
 
+/// Имя перед замаскированным значением (`<имя>=<значение>`, значение — по правилу
+/// ключ-значение) проверяется в первом же проходе: повторная маскировка ничего не меняет
+/// (находка proptest `mask_is_idempotent`, финальная волна M3).
+#[test]
+fn name_before_masked_value_idempotent() {
+    for t in [
+        "0aaaaA0AabA010B3TC1EFG42HebcfIgDpassword=abcdef123".to_string(),
+        format!("x {}password=abcdef123 y", rnd(40, 41)),
+        "short=1 password=abcdef123".to_string(),
+    ] {
+        let once = mask_text(&t);
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+    // короткое имя не трогается: только значение
+    assert_eq!(
+        mask_text("password=abcdef123"),
+        format!("password={SECRET_MARK}")
+    );
+}
+
 #[test]
 fn overlapping_rules_merge() {
     // токен ZeroAIMemory в значении `token=`: один хит, значение маскируется целиком
