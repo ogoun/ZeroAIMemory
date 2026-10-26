@@ -151,14 +151,19 @@ test('Insights: замена записи и повышение до theorem с 
   await expect(table.locator('tbody tr')).toHaveCount(4);
   await expect(table.locator('tr', { hasText: 'Старый вывод о Qdrant' })).toContainText('заменён');
 
-  // Повышение гипотезы до theorem: причина человеку необязательна, для theorem — доказательство
+  // Повышение гипотезы до theorem: человеку причина и доказательство необязательны (R8)
   await table.getByRole('button', { name: 'Кэш эмбеддингов ускоряет переиндексацию' }).click();
   await expect(page).toHaveURL(new RegExp(`/j/insights/${env('E2E_INSIGHT_HYP')}$`));
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
   const cf = card.getByRole('form', { name: 'Статус надёжности' });
   await cf.getByLabel('theorem').check();
   await cf.getByRole('button', { name: 'Сохранить' }).click();
-  await expect(cf.getByRole('alert')).toContainText('Для theorem заполните доказательство');
+  await expect(card.getByRole('status')).toHaveText('Статус надёжности изменён.');
+  await expect(card.locator('header [data-certainty="theorem"]')).toBeVisible();
+  await expect(card.locator('.evidence')).toHaveCount(0);
+  // доказательство можно дописать позже той же формой
+  await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
+  await expect(cf.getByLabel('theorem')).toBeChecked();
   await cf.getByLabel(/^Причина/).fill('замерено на реальной базе');
   await cf.getByLabel('Проверено').fill('время переиндексации 10 тыс. заметок');
   await cf.getByLabel('Метод').fill('reindex без full и с full');

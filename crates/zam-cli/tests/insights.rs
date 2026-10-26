@@ -291,9 +291,10 @@ fn insight_certify_sends_if_match() {
     );
 }
 
-/// Запись изменилась между чтением и правкой (409 с `rev` текущей) — сообщение и код 1.
+/// Запись изменилась между чтением и правкой (409 с `rev` текущей) — сообщение и код 4
+/// (как у заметок, решение контроллера R7).
 #[test]
-fn insight_certify_conflict_exit_1() {
+fn insight_certify_conflict_exit_4() {
     let (url, _) = fake_entry_server(
         409,
         r#"{"type":"/problems/conflict","title":"Conflict","status":409,"detail":"ревизия записи 5, а не 3","rev":5}"#,
@@ -306,7 +307,7 @@ fn insight_certify_conflict_exit_1() {
         &["insight", "certify", "01E", "hypothesis", "--reason", "r"],
         b"",
     );
-    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(4), "{}", err(&o));
     assert!(
         err(&o).contains("запись изменилась (rev 3 → 5): перечитайте"),
         "{}",

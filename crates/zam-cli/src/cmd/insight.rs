@@ -20,14 +20,14 @@
 //!
 //! `certify`, `append` и `revisit` правят запись с ревизией (§11.3): `rev` — из
 //! `GET /entries/{id}`, запрос — с `If-Match`; запись изменилась между чтением и правкой (409) —
-//! «запись изменилась (rev N → M): перечитайте», код 1.
+//! «запись изменилась (rev N → M): перечитайте», код 4.
 use std::path::Path;
 
 use serde_json::{Value, json};
 
 use super::log::read_text;
 use super::{Ctx, emit, emit_json, solution_guid};
-use crate::client::{CliError, EXIT_CONFLICT, EXIT_STALE_ENTRY, read_json};
+use crate::client::{CliError, EXIT_CONFLICT, read_json};
 use crate::target::Loc;
 
 /// Виды триггеров (`--trigger TYPE:PATTERN`).
@@ -282,7 +282,8 @@ fn rev_of(e: &Value) -> Result<i64, CliError> {
 }
 
 /// 409 с `rev` текущей на правку с ревизией `sent` → «запись изменилась (rev N → M):
-/// перечитайте», код [`EXIT_STALE_ENTRY`]; прочие ошибки — как есть.
+/// перечитайте», код [`EXIT_CONFLICT`] (как у заметок, решение контроллера R7); прочие
+/// ошибки — как есть.
 fn explain_stale(e: CliError, sent: i64) -> CliError {
     let Some(cur) = e
         .problem
@@ -293,7 +294,7 @@ fn explain_stale(e: CliError, sent: i64) -> CliError {
         return e;
     };
     CliError {
-        code: EXIT_STALE_ENTRY,
+        code: EXIT_CONFLICT,
         msg: format!("запись изменилась (rev {sent} → {cur}): перечитайте"),
         problem: e.problem,
     }
@@ -530,7 +531,7 @@ mod tests {
             problem: Some(json!({"type": "/problems/conflict", "status": 409, "rev": 5})),
         };
         let s = explain_stale(e, 3);
-        assert_eq!(s.code, EXIT_STALE_ENTRY);
+        assert_eq!(s.code, EXIT_CONFLICT);
         assert_eq!(s.msg, "запись изменилась (rev 3 → 5): перечитайте");
         // 409 без rev (например, содержимое superseded) — как есть
         let other = CliError {
@@ -538,7 +539,8 @@ mod tests {
             msg: "y".into(),
             problem: Some(json!({"type": "/problems/conflict", "status": 409})),
         };
-        assert_eq!(explain_stale(other, 3).code, EXIT_CONFLICT);
+        let o = explain_stale(other, 3);
+        assert_eq!((o.code, o.msg.as_str()), (EXIT_CONFLICT, "y"));
     }
 
     #[test]

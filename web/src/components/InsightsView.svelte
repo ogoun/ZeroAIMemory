@@ -1,7 +1,7 @@
 <script lang="ts">
   // Insights (§7.5): таблица с фильтрами (вид, статус, надёжность, область, теги) и карточка
-  // записи — замещение, отзыв, пересмотр, смена статуса надёжности (причина необязательна, для
-  // theorem — доказательство), триггеры, цепочка замещения, связи. Сессия WebUI — человек
+  // записи — замещение, отзыв, пересмотр, смена статуса надёжности (причина и доказательство
+  // theorem человеку необязательны), триггеры, цепочка замещения, связи. Сессия WebUI — человек
   // (author_kind = human). Правка идёт с ревизией открытой записи (If-Match, §11.3): запись
   // изменилась — 409, карточка перечитывается.
   import { untrack } from 'svelte';
@@ -316,14 +316,12 @@
     // человеку причина необязательна (§7.5)
     const reason = cReason.trim();
     const to = cTo === '' ? null : cTo;
+    // человеку доказательство для theorem необязательно (§7.5, R8): заполнено — уходит в
+    // data.evidence, пусто — не шлётся
     let data: Record<string, unknown> | undefined;
     if (to === 'theorem') {
       const ev = { checked: evChecked.trim(), method: evMethod.trim(), result: evResult.trim() };
-      if (!ev.checked || !ev.method || !ev.result) {
-        actionError = 'Для theorem заполните доказательство: что проверено, метод и результат.';
-        return;
-      }
-      data = { ...c.data, evidence: ev };
+      if (ev.checked || ev.method || ev.result) data = { ...c.data, evidence: ev };
     }
     act(async () => {
       await patchEntry(user, c.id, c.rev, {
@@ -532,7 +530,7 @@
           </fieldset>
           {#if cTo === 'theorem'}
             <div class="ev">
-              <p class="muted small">Доказательство (data.evidence): что проверено, как и с каким результатом.</p>
+              <p class="muted small">Доказательство (data.evidence) <span class="muted small">(необязательно)</span>: что проверено, как и с каким результатом.</p>
               <label>Проверено <input bind:value={evChecked} /></label>
               <label>Метод <input bind:value={evMethod} /></label>
               <label>Результат <input bind:value={evResult} /></label>

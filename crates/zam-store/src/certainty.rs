@@ -98,7 +98,8 @@ pub enum CertaintyChange {
 pub enum CertaintyError {
     /// 422: `theorem` от агента — только с доказательством `{checked, method, result}`.
     #[error(
-        "theorem от агента требует доказательства: data.evidence {{checked, method, result}}          у записи или непустое evidence: во frontmatter заметки"
+        "theorem от агента требует доказательства: data.evidence {{checked, method, result}} \
+         у записи или непустое evidence: во frontmatter заметки"
     )]
     EvidenceRequired,
     /// 422: смена статуса агентом — только с причиной (`reason` записи, `message` заметки).
@@ -398,6 +399,18 @@ mod tests {
         assert_eq!(check_final_state(System, Some(Theorem), None), Ok(()));
         for c in [None, Some(Hypothesis), Some(Axiom)] {
             assert_eq!(check_final_state(Agent, c, None), Ok(()));
+        }
+    }
+
+    #[test]
+    fn messages_have_no_double_spaces() {
+        for e in [EvidenceRequired, ReasonRequired] {
+            let m = e.to_string();
+            assert!(!m.contains("  "), "{m}");
+            assert!(
+                m.contains("{checked, method, result}") || e == ReasonRequired,
+                "{m}"
+            );
         }
     }
 
