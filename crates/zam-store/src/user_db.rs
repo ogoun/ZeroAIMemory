@@ -318,8 +318,8 @@ const SECRETS_PAYLOAD: &str = "secrets_scanned_v3";
 /// Разовая проверка базы, открытой до маскировки тегов payload и входа эмбеддинга папок: если
 /// у живой заметки или записи вне Human тег содержит секрет, или вход эмбеддинга L0 папки
 /// (пространство, путь, имя, L0) содержит секрет, ставится отметка reindex базы из кэша
-/// (`reindex_pending`, без инференса для известных текстов; уже стоящая отметка не
-/// заменяется): воркер перепишет точки — теги уже замаскированы, у затронутых папок новый вход
+/// (`reindex_pending`, без инференса для известных текстов; уже стоящая отметка прерванного
+/// reindex расширяется до всей базы с её режимом): воркер перепишет точки — теги уже замаскированы, у затронутых папок новый вход
 /// эмбеддинга не найдётся в кэше и их свёртка пересчитается (`missed_folders`), а старые
 /// точки области удаляются пересборкой. L0 папок с секретом маскируется сразу (он виден в
 /// карточках папок). Синхронно, в одной транзакции писателя, до возврата базы: воркер
@@ -390,11 +390,24 @@ async fn rescan_payload_secrets(db: &Db) -> Result<(), StoreError> {
                 }
             }
             if notes + entries + stale_folders > 0 {
+                // уже стоящая отметка (прерванный reindex) расширяется до всей базы с её
+                // режимом: частичная (одно пространство) оставила бы сырые теги в других
+                let prev: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM meta WHERE key = ?1",
+                        [crate::jobs::REINDEX_KEY],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let full = prev
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+                    .and_then(|v| v["full"].as_bool())
+                    .unwrap_or(false);
                 tx.execute(
-                    "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
                     params![
                         crate::jobs::REINDEX_KEY,
-                        serde_json::json!({"full": false, "space": null}).to_string()
+                        serde_json::json!({"full": full, "space": null}).to_string()
                     ],
                 )?;
             }

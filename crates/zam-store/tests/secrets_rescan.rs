@@ -376,3 +376,51 @@ fn folder_embed_input_masks_secrets_and_keeps_clean_text() {
         assert!(input.contains(SECRET_MARK), "{input}");
     }
 }
+
+/// Уже стоящая частичная отметка reindex (прерванный reindex одного пространства) при
+/// дозаполнении v3 расширяется до всей базы с сохранением режима: иначе сырые теги в других
+/// пространствах остались бы в Qdrant (финальная волна M3, ревью задачи 15).
+#[tokio::test]
+async fn payload_rescan_widens_partial_reindex_mark() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("secrets-payload-widen");
+    let _ = std::fs::remove_dir_all(&dir);
+    let dd = DataDir::open(&dir).unwrap();
+    let user = Id::new();
+    let s = secret();
+    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    let k = list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    create_note(
+        &db,
+        NewNote {
+            space_id: k,
+            path: NodePath::parse("теги").unwrap(),
+            content: format!("---\ntags: [{s}]\n---\n# Теги\n\nтекст\n"),
+            l0: None,
+            attrib: Attribution::new(AuthorKind::Agent),
+        },
+    )
+    .await
+    .unwrap();
+    let other = Id::new().to_string();
+    db.write(move |tx| {
+        tx.execute("DELETE FROM meta WHERE key = ?1", [FLAG_V3])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    mark_reindex(&db, Some(json!({"full": true, "space": other}).to_string()))
+        .await
+        .unwrap();
+    drop(db);
+    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    let spec = pending_reindex(&db).await.unwrap().expect("отметка");
+    let v: serde_json::Value = serde_json::from_str(&spec).unwrap();
+    assert!(v["space"].is_null(), "вся база: {spec}");
+    assert_eq!(v["full"], true, "режим прежней отметки: {spec}");
+}
