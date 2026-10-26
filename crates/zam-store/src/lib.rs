@@ -105,6 +105,9 @@ pub enum StoreError {
     NotFound,
     #[error("конфликт: {0}")]
     Conflict(String),
+    /// Ожидаемая ревизия (`If-Match`) записи журнала не совпала с текущей (§11.3).
+    #[error("ревизия записи {current}, а не {expected}")]
+    StaleRevision { expected: i64, current: i64 },
     #[error("некорректные данные: {0}")]
     BadInput(String),
     /// `Idempotency-Key` повторён с другим содержимым запроса.

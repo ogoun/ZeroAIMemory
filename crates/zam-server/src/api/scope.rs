@@ -725,7 +725,6 @@ mod tests {
             token_id: Id::new(),
             user_id: Id::new(),
             access,
-            human: false,
         })
     }
 

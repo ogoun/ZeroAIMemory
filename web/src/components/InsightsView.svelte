@@ -1,8 +1,9 @@
 <script lang="ts">
   // Insights (§7.5): таблица с фильтрами (вид, статус, надёжность, область, теги) и карточка
-  // записи — замещение, отзыв, пересмотр, смена статуса надёжности (причина обязательна, для
-  // theorem — доказательство), триггеры, цепочка замещения, связи. Администратор в WebUI —
-  // человек (author_kind = human): ему доступна axiom.
+  // записи — замещение, отзыв, пересмотр, смена статуса надёжности (причина необязательна, для
+  // theorem — доказательство), триггеры, цепочка замещения, связи. Сессия WebUI — человек
+  // (author_kind = human). Правка идёт с ревизией открытой записи (If-Match, §11.3): запись
+  // изменилась — 409, карточка перечитывается.
   import { untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import Links from './Links.svelte';
@@ -10,6 +11,7 @@
     ApiError,
     errorText,
     getEntry,
+    isStaleEntry,
     listEntries,
     patchEntry,
     retractEntry,
@@ -77,7 +79,8 @@
   let sTitle = $state('');
   let sBody = $state('');
   let sKind = $state('discovery');
-  let sCertainty = $state<Certainty>('hypothesis');
+  // новая запись человека по умолчанию без статуса: аксиому человек ставит явно (§7.5)
+  let sCertainty = $state<Certainty | ''>('');
   let rReason = $state('');
   let cTo = $state<'' | Certainty>('');
   let cReason = $state('');
@@ -229,7 +232,14 @@
       // после select: смена записи сбрасывает уведомление, а это — о только что сделанном
       notice = done;
     } catch (e) {
-      fail(e, (m) => (actionError = m));
+      if (isStaleEntry(e) && cur) {
+        // запись изменилась в другой сессии: перечитать карточку (новая ревизия), объяснить
+        const msg = errorText(e);
+        await open(user, cur.id);
+        actionError = msg;
+      } else {
+        fail(e, (m) => (actionError = m));
+      }
     } finally {
       busy = false;
     }
@@ -240,7 +250,7 @@
     sTitle = cur.title;
     sBody = cur.body;
     sKind = dataStr(cur.data, 'kind') || 'discovery';
-    sCertainty = cur.certainty ?? 'hypothesis';
+    sCertainty = '';
     mode = 'supersede';
   }
 
@@ -256,8 +266,8 @@
         data,
         tags: c.tags,
         area: c.area,
-        certainty: sCertainty,
-      });
+        ...(sCertainty ? { certainty: sCertainty } : {}),
+      }, c.rev);
       return r.entry.id;
     }, 'Запись заменена: прежняя помечена superseded.');
   }
@@ -272,7 +282,7 @@
       return;
     }
     act(async () => {
-      await retractEntry(user, c.id, reason);
+      await retractEntry(user, c.id, reason, c.rev);
     }, 'Запись отозвана.');
   }
 
@@ -282,7 +292,7 @@
     const to = c.status === 'revisit' ? 'active' : 'revisit';
     act(
       async () => {
-        await patchEntry(user, c.id, { status: to });
+        await patchEntry(user, c.id, c.rev, { status: to });
       },
       to === 'revisit' ? 'Запись отправлена на пересмотр.' : 'Запись снова действует.',
     );
@@ -303,11 +313,8 @@
     e.preventDefault();
     const c = cur;
     if (!c) return;
+    // человеку причина необязательна (§7.5)
     const reason = cReason.trim();
-    if (!reason) {
-      actionError = 'Укажите причину смены статуса надёжности.';
-      return;
-    }
     const to = cTo === '' ? null : cTo;
     let data: Record<string, unknown> | undefined;
     if (to === 'theorem') {
@@ -319,7 +326,11 @@
       data = { ...c.data, evidence: ev };
     }
     act(async () => {
-      await patchEntry(user, c.id, { certainty: to, reason, ...(data ? { data } : {}) });
+      await patchEntry(user, c.id, c.rev, {
+        certainty: to,
+        ...(reason ? { reason } : {}),
+        ...(data ? { data } : {}),
+      });
     }, 'Статус надёжности изменён.');
   }
 
@@ -349,7 +360,7 @@
     if (!c) return;
     const triggers = tDraft;
     act(async () => {
-      await patchEntry(user, c.id, { triggers });
+      await patchEntry(user, c.id, c.rev, { triggers });
     }, 'Триггеры сохранены.');
   }
 
@@ -494,6 +505,7 @@
             </label>
             <label class="row">Надёжность
               <select bind:value={sCertainty} aria-label="Надёжность новой записи">
+                <option value="">без статуса</option>
                 {#each CERTAINTIES as x (x)}<option value={x}>{x}</option>{/each}
               </select>
             </label>
@@ -510,7 +522,7 @@
       {:else if mode === 'certainty'}
         <form class="form" onsubmit={submitCertainty} aria-label="Статус надёжности">
           <h3>Статус надёжности</h3>
-          <p class="muted small">Вы действуете как человек: доступны все статусы, в том числе axiom.</p>
+          <p class="muted small">Вы действуете как человек: доступны все статусы, в том числе axiom; причина необязательна.</p>
           <fieldset class="row">
             <legend class="sr">Новый статус</legend>
             {#each CERTAINTIES as x (x)}
@@ -526,7 +538,7 @@
               <label>Результат <input bind:value={evResult} /></label>
             </div>
           {/if}
-          <label>Причина <span class="muted small">(обязательно)</span> <textarea bind:value={cReason} rows="2"></textarea></label>
+          <label>Причина <span class="muted small">(необязательно)</span> <textarea bind:value={cReason} rows="2"></textarea></label>
           {@render formEnd('Сохранить')}
         </form>
       {:else if mode === 'triggers'}

@@ -12,9 +12,8 @@
 //! `e` (`<язык>/zam/…`) пишутся в его пространство, остальные — в Knowledge; insight
 //! `eval/insights.toml` создаются `POST /spaces/{решение}/entries` (`kind: insight`,
 //! `force: true` — дедупликация набора не нужна), замещаются `POST /entries/{id}/supersede` и
-//! отзываются `POST /entries/{id}/retract`. `axiom` создаёт человеческий токен, выпущенный
-//! администратором прогона (`POST /admin/users/{id}/tokens {human: true}`), остальное —
-//! токен прогона (агент; `theorem` — с `data.evidence`). Соответствие id записей и ключей
+//! отзываются `POST /entries/{id}/retract`. Все записи, в том числе `axiom`, создаёт токен
+//! прогона (агент; с M4 человеческих токенов нет, §11.4; `theorem` — с `data.evidence`). Соответствие id записей и ключей
 //! набора сохраняется в каталоге прогона (`entries.json`) — для перезапусков на том же
 //! индексе. Поиск — `scope.solution` набора с Knowledge, без Rules.
 //!

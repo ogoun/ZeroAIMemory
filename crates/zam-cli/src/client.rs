@@ -15,6 +15,9 @@ pub const EXIT_TOKEN: u8 = 3;
 pub const EXIT_CONFLICT: u8 = 4;
 pub const EXIT_NOT_FOUND: u8 = 5;
 pub const EXIT_INPUT: u8 = 6;
+/// Запись журнала изменилась после чтения (`409` с `rev` текущей на правку с `If-Match`,
+/// §11.3): код 1 по ТЗ, совпадает с [`EXIT_CONFIG`].
+pub const EXIT_STALE_ENTRY: u8 = 1;
 
 /// Предел чтения тела ответа в память (JSON заметки до 5 МБ с экранированием, дифф).
 const BODY_MAX: u64 = 64 * 1024 * 1024;
@@ -203,15 +206,6 @@ impl Client {
     /// DELETE `/api/v1{path}`.
     pub fn delete(&self, path: &str) -> Result<Response<Body>, CliError> {
         self.check(self.prepare(self.agent.delete(&self.url(path))).call())
-    }
-
-    /// PATCH JSON.
-    pub fn patch_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
-        let rb = self.prepare(self.agent.patch(&self.url(path)));
-        self.check(
-            rb.content_type("application/json")
-                .send(body.to_string().as_bytes()),
-        )
     }
 
     /// PATCH JSON с `If-Match: "<rev>"`.

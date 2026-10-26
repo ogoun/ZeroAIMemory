@@ -13,18 +13,21 @@
 //!   `show ID` — карточка с текстом и триггерами; `supersede ID --title T [--kind K] …` —
 //!   замещение (вид по умолчанию — у старой записи); `retract ID --reason R`; `revisit ID
 //!   [--reason R]`; `append ID [--body-file F | stdin]` — дописать к телу.
-//! - `zam insight certify ID axiom|theorem|hypothesis|none --reason R [--evidence-file F]
-//!   [--human]` — смена эпистемического статуса (§7.5): `theorem` от агента — с доказательством
-//!   (`--evidence-file` дописывается в `data.evidence`), `axiom` и любая правка `axiom` — только
-//!   с `--human`: адрес и токен — только из `~/.zeroaimemory/config.toml` (`url`,
-//!   `human_token`), только в интерактивном терминале с подтверждением вводом id записи.
+//! - `zam insight certify ID axiom|theorem|hypothesis|none --reason R [--evidence-file F]` —
+//!   смена эпистемического статуса (§7.5) обычным токеном: `theorem` — с доказательством
+//!   (`--evidence-file` дописывается в `data.evidence`); `axiom` агент ставит и меняет только
+//!   по прямому указанию пользователя (§14.2), сервер это не проверяет.
+//!
+//! `certify`, `append` и `revisit` правят запись с ревизией (§11.3): `rev` — из
+//! `GET /entries/{id}`, запрос — с `If-Match`; запись изменилась между чтением и правкой (409) —
+//! «запись изменилась (rev N → M): перечитайте», код 1.
 use std::path::Path;
 
 use serde_json::{Value, json};
 
 use super::log::read_text;
 use super::{Ctx, emit, emit_json, solution_guid};
-use crate::client::{CliError, EXIT_CONFLICT, read_json};
+use crate::client::{CliError, EXIT_CONFLICT, EXIT_STALE_ENTRY, read_json};
 use crate::target::Loc;
 
 /// Виды триггеров (`--trigger TYPE:PATTERN`).
@@ -271,6 +274,40 @@ fn get_entry(ctx: &Ctx, id: &str) -> Result<Value, CliError> {
     read_json(ctx.client.get(&format!("/entries/{id}"), &[])?)
 }
 
+/// Ревизия записи из `GET /entries/{id}`.
+fn rev_of(e: &Value) -> Result<i64, CliError> {
+    e["rev"]
+        .as_i64()
+        .ok_or_else(|| CliError::new(crate::client::EXIT_UNREACHABLE, "в ответе нет rev записи"))
+}
+
+/// 409 с `rev` текущей на правку с ревизией `sent` → «запись изменилась (rev N → M):
+/// перечитайте», код [`EXIT_STALE_ENTRY`]; прочие ошибки — как есть.
+fn explain_stale(e: CliError, sent: i64) -> CliError {
+    let Some(cur) = e
+        .problem
+        .as_ref()
+        .filter(|p| p["status"] == 409)
+        .and_then(|p| p["rev"].as_i64())
+    else {
+        return e;
+    };
+    CliError {
+        code: EXIT_STALE_ENTRY,
+        msg: format!("запись изменилась (rev {sent} → {cur}): перечитайте"),
+        problem: e.problem,
+    }
+}
+
+/// `PATCH /entries/{id}` с `If-Match: <rev>` (§11.3).
+fn patch_entry(ctx: &Ctx, id: &str, rev: i64, body: &Value) -> Result<Value, CliError> {
+    let r = ctx
+        .client
+        .patch_json_if(&format!("/entries/{id}"), body, rev)
+        .map_err(|e| explain_stale(e, rev))?;
+    read_json(r)
+}
+
 /// `zam insight show <id>`.
 pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
     let e = get_entry(ctx, id)?;
@@ -368,8 +405,8 @@ pub fn revisit(ctx: &Ctx, id: &str, reason: Option<&str>) -> Result<(), CliError
     if let Some(r) = reason {
         body["reason"] = json!(r);
     }
-    let r = ctx.client.patch_json(&format!("/entries/{id}"), &body)?;
-    emit_changed(ctx, &read_json(r)?)
+    let rev = rev_of(&get_entry(ctx, id)?)?;
+    emit_changed(ctx, &patch_entry(ctx, id, rev, &body)?)
 }
 
 /// Тело `PATCH` смены статуса: `certainty` (`none` → `null`), причина и — при доказательстве —
@@ -411,13 +448,9 @@ pub fn certify(
         ));
     }
     let evidence = evidence_file.map(read_evidence).transpose()?;
-    let current = match evidence {
-        Some(_) => Some(get_entry(ctx, id)?),
-        None => None,
-    };
-    let body = certify_body(current.as_ref(), certainty, reason, evidence);
-    let r = ctx.client.patch_json(&format!("/entries/{id}"), &body)?;
-    let e = read_json(r)?;
+    let current = get_entry(ctx, id)?;
+    let body = certify_body(Some(&current), certainty, reason, evidence);
+    let e = patch_entry(ctx, id, rev_of(&current)?, &body)?;
     if ctx.json {
         return emit_json(&e);
     }
@@ -440,10 +473,11 @@ pub fn append(ctx: &Ctx, id: &str, body_file: Option<&Path>) -> Result<(), CliEr
             "нечего дописывать: текст из --body-file или stdin",
         ));
     }
-    let r = ctx
-        .client
-        .patch_json(&format!("/entries/{id}"), &json!({ "append_body": text }))?;
-    emit_changed(ctx, &read_json(r)?)
+    let rev = rev_of(&get_entry(ctx, id)?)?;
+    emit_changed(
+        ctx,
+        &patch_entry(ctx, id, rev, &json!({ "append_body": text }))?,
+    )
 }
 
 #[cfg(test)]
@@ -486,6 +520,25 @@ mod tests {
         assert_eq!(b["data"]["kind"], "gotcha");
         assert_eq!(b["data"]["experiment"]["result"], "confirmed");
         assert_eq!(b["data"]["evidence"], ev);
+    }
+
+    #[test]
+    fn stale_revision_explained() {
+        let e = CliError {
+            code: EXIT_CONFLICT,
+            msg: "x".into(),
+            problem: Some(json!({"type": "/problems/conflict", "status": 409, "rev": 5})),
+        };
+        let s = explain_stale(e, 3);
+        assert_eq!(s.code, EXIT_STALE_ENTRY);
+        assert_eq!(s.msg, "запись изменилась (rev 3 → 5): перечитайте");
+        // 409 без rev (например, содержимое superseded) — как есть
+        let other = CliError {
+            code: EXIT_CONFLICT,
+            msg: "y".into(),
+            problem: Some(json!({"type": "/problems/conflict", "status": 409})),
+        };
+        assert_eq!(explain_stale(other, 3).code, EXIT_CONFLICT);
     }
 
     #[test]

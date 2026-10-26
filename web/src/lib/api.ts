@@ -21,8 +21,6 @@ export interface TokenInfo {
   last_used_at: string | null;
   last_ip: string | null;
   revoked_at: string | null;
-  /** Человеческий токен (§7.5): запись по нему — от человека, ставит и меняет axiom. */
-  human: boolean;
 }
 
 export interface IssuedToken {
@@ -132,8 +130,8 @@ export const listTokens = (userId: string) =>
   call<TokenInfo[]>('GET', `admin/users/${userId}/tokens`);
 export const createUser = (name: string) =>
   call<{ user: User; token: IssuedToken }>('POST', 'admin/users', { name });
-export const issueToken = (userId: string, name: string, access: Access, human = false) =>
-  call<IssuedToken>('POST', `admin/users/${userId}/tokens`, { name, access, human });
+export const issueToken = (userId: string, name: string, access: Access) =>
+  call<IssuedToken>('POST', `admin/users/${userId}/tokens`, { name, access });
 export const revokeToken = (id: string) => call<void>('DELETE', `admin/tokens/${id}`);
 
 // ---- пространства и узлы (администратор — от имени пользователя `user`) ----
@@ -217,8 +215,6 @@ export const listSpaces = (user: string) =>
   call<{
     user: { id: string; name: string };
     access: string;
-    /** Запрос пишет как человек (сессия WebUI — всегда). */
-    human: boolean;
     spaces: Space[];
     /** Ожидающие запросы доступа к решениям пользователя. */
     access_requests_pending: number;
@@ -592,8 +588,16 @@ export interface EntryPatch {
   message?: string;
 }
 
-export const patchEntry = (user: string, id: string, patch: EntryPatch) =>
-  call<Entry>('PATCH', `entries/${q(id)}`, patch, user);
+/** `If-Match: "<rev>"` ревизии записи (§11.3). */
+const ifMatch = (rev?: number): Record<string, string> =>
+  rev === undefined ? {} : { 'If-Match': `"${rev}"` };
+
+/** `PATCH /entries/{id}` с `If-Match: <rev>` (обязателен, §11.3): `rev` — ревизия из
+ * `GET /entries/{id}`; запись изменилась — 409 с `rev` текущей. */
+export const patchEntry = async (user: string, id: string, rev: number, patch: EntryPatch) =>
+  (await (
+    await request('PATCH', `entries/${q(id)}`, { body: patch, user, headers: ifMatch(rev) })
+  ).json()) as Entry;
 
 export interface InsightDraft {
   title: string;
@@ -605,12 +609,17 @@ export interface InsightDraft {
   message?: string;
 }
 
-/** Замещение insight: старая запись — `superseded`, ничего не удаляется. */
-export const supersedeEntry = (user: string, id: string, draft: InsightDraft) =>
-  call<{ entry: Entry; superseded: Entry }>('POST', `entries/${q(id)}/supersede`, draft, user);
+/** Замещение insight: старая запись — `superseded`, ничего не удаляется; `rev` старой
+ * (`If-Match`) необязателен, при наличии сервер его проверяет. */
+export const supersedeEntry = async (user: string, id: string, draft: InsightDraft, rev?: number) =>
+  (await (
+    await request('POST', `entries/${q(id)}/supersede`, { body: draft, user, headers: ifMatch(rev) })
+  ).json()) as { entry: Entry; superseded: Entry };
 
-export const retractEntry = (user: string, id: string, reason: string) =>
-  call<Entry>('POST', `entries/${q(id)}/retract`, { reason }, user);
+export const retractEntry = async (user: string, id: string, reason: string, rev?: number) =>
+  (await (
+    await request('POST', `entries/${q(id)}/retract`, { body: { reason }, user, headers: ifMatch(rev) })
+  ).json()) as Entry;
 
 export interface ReleaseCompare {
   from: Entry | null;
@@ -753,11 +762,9 @@ export const setAgentWrite = (on: boolean) =>
 // ---- понятные сообщения об ошибках (RFC 9457) ----
 
 const CERTAINTY_TEXT: Record<string, string> = {
-  'axiom-requires-human': 'Статус axiom ставит, меняет и снимает только человек.',
   'evidence-required':
     'Для theorem нужно доказательство: что проверено, каким методом и с каким результатом.',
   'reason-required': 'Укажите причину смены статуса надёжности.',
-  'invalid-transition': 'Такой переход статуса надёжности недопустим.',
 };
 
 const ACCESS_TEXT: Record<string, string> = {
@@ -781,10 +788,16 @@ export function errorText(e: unknown): string {
   if (type === '/problems/idempotency-mismatch')
     return `Повтор запроса с тем же ключом, но другим содержимым: ${e.message}`;
   if (type === '/problems/possible-duplicate') return `Похоже на уже записанный insight: ${e.message}`;
+  if (e.status === 409 && typeof p?.rev === 'number')
+    return `Запись изменилась (сейчас ревизия ${p.rev}): перечитайте и повторите.`;
   if (e.status === 404) return 'Не найдено: запись удалена или недоступна.';
   if (e.status === 403) return `Недостаточно прав: ${e.message}`;
   return e.message;
 }
+
+/** 409 устаревшей ревизии записи журнала (§11.3): в problem — `rev` текущей. */
+export const isStaleEntry = (e: unknown): boolean =>
+  e instanceof ApiError && e.status === 409 && typeof e.problem?.rev === 'number';
 
 /** 503 `/problems/vault-locked`. */
 export const isVaultLocked = (e: unknown): boolean =>

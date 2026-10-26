@@ -177,7 +177,7 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
 /// Привязывает блоб к живой заметке `node`; возвращает ссылку для Markdown.
 /// Новая пара (узел, sha256, имя) добавляет строку `attachments` и увеличивает
 /// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет. Вложение — изменение
-/// заметки: к заметке `axiom` его добавляет только человек (`author`), иначе `Certainty`.
+/// заметки по матрице `certainty` (`author`; с M4 к `axiom` — любому автору, §7.5).
 pub async fn attach(
     db: &Db,
     node: Id,

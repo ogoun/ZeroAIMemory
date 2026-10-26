@@ -364,13 +364,13 @@ async fn idempotency_key_of_deleted_entry_conflicts() {
     let mut n = changelog(k, "Удаляемая");
     n.idempotency_key = Some("del-1".into());
     let (a, _) = create_entry(&db, n.clone(), &me).await.unwrap();
-    delete_entry(&db, a.id, &me).await.unwrap();
+    delete_entry(&db, a.id, None, &me).await.unwrap();
     assert!(matches!(
         create_entry(&db, n.clone(), &me).await,
         Err(StoreError::Conflict(_))
     ));
     // после восстановления повтор снова возвращает запись
-    restore_entry(&db, a.id, &me).await.unwrap();
+    restore_entry(&db, a.id, None, &me).await.unwrap();
     let (b, created) = create_entry(&db, n, &me).await.unwrap();
     assert!(!created);
     assert_eq!(b.id, a.id);
@@ -458,15 +458,41 @@ async fn patch_creates_revision_with_reason_and_enqueues() {
             .rev,
         3
     );
-    // устаревшая ревизия — конфликт
+    // устаревшая ревизия — конфликт с текущей ревизией (§11.3); так же у удаления, отзыва,
+    // замещения и восстановления
     let p = EntryPatch {
         body: Some("x".into()),
         ..EntryPatch::default()
     };
-    assert!(matches!(
-        update_entry(&db, e.id, Some(1), p, &agent()).await,
-        Err(StoreError::Conflict(_))
-    ));
+    let stale = |r: Result<(), StoreError>| {
+        assert!(
+            matches!(
+                r,
+                Err(StoreError::StaleRevision {
+                    expected: 1,
+                    current: 3
+                })
+            ),
+            "{r:?}"
+        )
+    };
+    stale(
+        update_entry(&db, e.id, Some(1), p, &agent())
+            .await
+            .map(drop),
+    );
+    stale(delete_entry(&db, e.id, Some(1), &agent()).await);
+    stale(restore_entry(&db, e.id, Some(1), &agent()).await.map(drop));
+    stale(
+        retract_entry(&db, e.id, Some(1), "r", &agent())
+            .await
+            .map(drop),
+    );
+    stale(
+        supersede_entry(&db, e.id, Some(1), insight(k, "Замена", ""), &agent())
+            .await
+            .map(drop),
+    );
     // пустая причина, статус не у insight, superseded правкой — BadInput
     let p = EntryPatch {
         body: Some("x".into()),
@@ -574,7 +600,7 @@ async fn supersede_marks_old_links_new_one_tx() {
     );
     new.idempotency_key = Some("sup-1".into());
     let me = agent();
-    let (n, o) = supersede_entry(&db, old.id, new.clone(), &me)
+    let (n, o) = supersede_entry(&db, old.id, None, new.clone(), &me)
         .await
         .unwrap();
     assert_eq!(n.supersedes_id, Some(old.id));
@@ -610,7 +636,7 @@ async fn supersede_marks_old_links_new_one_tx() {
     want.sort();
     assert_eq!(all, want);
     // повтор с тем же ключом — та же пара
-    let (n2, o2) = supersede_entry(&db, old.id, new.clone(), &me)
+    let (n2, o2) = supersede_entry(&db, old.id, None, new.clone(), &me)
         .await
         .unwrap();
     assert_eq!((n2.id, o2.id), (n.id, old.id));
@@ -620,12 +646,12 @@ async fn supersede_marks_old_links_new_one_tx() {
         .await
         .unwrap();
     assert!(matches!(
-        supersede_entry(&db, old.id, insight(k, "третья", ""), &agent()).await,
+        supersede_entry(&db, old.id, None, insight(k, "третья", ""), &agent()).await,
         Err(StoreError::Conflict(_))
     ));
     // ошибка в середине транзакции: новая запись не остаётся (заголовок пустой)
     assert!(matches!(
-        supersede_entry(&db, n.id, insight(k, " ", ""), &agent()).await,
+        supersede_entry(&db, n.id, None, insight(k, " ", ""), &agent()).await,
         Err(StoreError::BadInput(_))
     ));
     let after: i64 = db
@@ -642,7 +668,7 @@ async fn supersede_marks_old_links_new_one_tx() {
         .await
         .unwrap();
     assert!(matches!(
-        supersede_entry(&db, c.id, insight(k, "x", ""), &agent()).await,
+        supersede_entry(&db, c.id, None, insight(k, "x", ""), &agent()).await,
         Err(StoreError::BadInput(_))
     ));
 }
@@ -655,12 +681,12 @@ async fn retract_requires_reason() {
         .unwrap();
     for empty in ["", "   "] {
         assert!(matches!(
-            retract_entry(&db, e.id, empty, &agent()).await,
+            retract_entry(&db, e.id, None, empty, &agent()).await,
             Err(StoreError::BadInput(_))
         ));
     }
     assert_eq!(get_entry(&db, e.id).await.unwrap().rev, 1);
-    let r = retract_entry(&db, e.id, "опровергнуто экспериментом", &agent())
+    let r = retract_entry(&db, e.id, None, "опровергнуто экспериментом", &agent())
         .await
         .unwrap();
     assert_eq!(r.status, Some(EntryStatus::Retracted));
@@ -680,14 +706,14 @@ async fn retract_requires_reason() {
     );
     // повторный отзыв — конфликт; changelog не отзывается
     assert!(matches!(
-        retract_entry(&db, e.id, "ещё раз", &agent()).await,
+        retract_entry(&db, e.id, None, "ещё раз", &agent()).await,
         Err(StoreError::Conflict(_))
     ));
     let (c, _) = create_entry(&db, changelog(k, "ch"), &agent())
         .await
         .unwrap();
     assert!(matches!(
-        retract_entry(&db, c.id, "причина", &agent()).await,
+        retract_entry(&db, c.id, None, "причина", &agent()).await,
         Err(StoreError::BadInput(_))
     ));
 }
@@ -698,7 +724,7 @@ async fn superseded_cannot_return_to_active() {
     let (old, _) = create_entry(&db, insight(k, "старая", "b"), &agent())
         .await
         .unwrap();
-    supersede_entry(&db, old.id, insight(k, "новая", "b"), &agent())
+    supersede_entry(&db, old.id, None, insight(k, "новая", "b"), &agent())
         .await
         .unwrap();
     for s in [EntryStatus::Active, EntryStatus::Revisit] {
@@ -720,7 +746,9 @@ async fn superseded_cannot_return_to_active() {
     let (e, _) = create_entry(&db, insight(k, "x", "b"), &agent())
         .await
         .unwrap();
-    retract_entry(&db, e.id, "неверно", &agent()).await.unwrap();
+    retract_entry(&db, e.id, None, "неверно", &agent())
+        .await
+        .unwrap();
     let p = EntryPatch {
         status: Some(EntryStatus::Active),
         ..EntryPatch::default()
@@ -766,7 +794,7 @@ async fn deleted_entry_not_in_fts_restore_returns() {
         vec![e.id]
     );
 
-    delete_entry(&db, e.id, &agent()).await.unwrap();
+    delete_entry(&db, e.id, None, &agent()).await.unwrap();
     assert!(
         fts(&db, "ZQXW", k, TargetFilter::default())
             .await
@@ -802,7 +830,7 @@ async fn deleted_entry_not_in_fts_restore_returns() {
     };
     assert!(list_entries(&db, feed.clone()).await.unwrap().0.is_empty());
     assert!(matches!(
-        delete_entry(&db, e.id, &agent()).await,
+        delete_entry(&db, e.id, None, &agent()).await,
         Err(StoreError::NotFound)
     ));
     assert!(matches!(
@@ -810,7 +838,7 @@ async fn deleted_entry_not_in_fts_restore_returns() {
         Err(StoreError::NotFound)
     ));
 
-    let r = restore_entry(&db, e.id, &agent()).await.unwrap();
+    let r = restore_entry(&db, e.id, None, &agent()).await.unwrap();
     assert!(r.deleted_at.is_none());
     assert_eq!(r.index_state, IndexState::Pending);
     assert_eq!(
@@ -823,7 +851,7 @@ async fn deleted_entry_not_in_fts_restore_returns() {
     );
     assert_eq!(list_entries(&db, feed).await.unwrap().0.len(), 1);
     assert!(matches!(
-        restore_entry(&db, e.id, &agent()).await,
+        restore_entry(&db, e.id, None, &agent()).await,
         Err(StoreError::BadInput(_))
     ));
 }
@@ -1130,7 +1158,7 @@ async fn supersede_rolls_back_after_partial_write() {
     let mut new = insight(k, "Новый вывод", "Исправленный текст.");
     new.triggers = vec![trig(TriggerKind::Keyword, "вывод")];
     assert!(
-        supersede_entry(&db, old.id, new.clone(), &agent())
+        supersede_entry(&db, old.id, None, new.clone(), &agent())
             .await
             .is_err()
     );
@@ -1145,7 +1173,9 @@ async fn supersede_rolls_back_after_partial_write() {
     })
     .await
     .unwrap();
-    let (n, o) = supersede_entry(&db, old.id, new, &agent()).await.unwrap();
+    let (n, o) = supersede_entry(&db, old.id, None, new, &agent())
+        .await
+        .unwrap();
     assert_eq!(o.status, Some(EntryStatus::Superseded));
     assert_eq!(entry_triggers(&db, n.id).await.unwrap().len(), 1);
 }
@@ -1243,9 +1273,11 @@ async fn triggers_stored_replaced_and_active_only() {
     let mut want = vec![a.id, b.id, c.id, d.id];
     want.sort();
     assert_eq!(ids(active_triggers(&db, &[k]).await.unwrap()), want);
-    retract_entry(&db, c.id, "неверно", &agent()).await.unwrap();
-    delete_entry(&db, d.id, &agent()).await.unwrap();
-    supersede_entry(&db, a.id, insight(k, "Новая", ""), &agent())
+    retract_entry(&db, c.id, None, "неверно", &agent())
+        .await
+        .unwrap();
+    delete_entry(&db, d.id, None, &agent()).await.unwrap();
+    supersede_entry(&db, a.id, None, insight(k, "Новая", ""), &agent())
         .await
         .unwrap();
     assert_eq!(ids(active_triggers(&db, &[k]).await.unwrap()), vec![b.id]);
@@ -1298,7 +1330,9 @@ async fn title_duplicates_same_area_and_active_only() {
     assert_eq!(dups(None).await, 1);
     assert_eq!(dups(Some("api")).await, 0);
     // отозванная — не дубль; заголовок без букв и цифр дублей не имеет
-    retract_entry(&db, a.id, "ошибка", &agent()).await.unwrap();
+    retract_entry(&db, a.id, None, "ошибка", &agent())
+        .await
+        .unwrap();
     assert_eq!(dups(Some("web")).await, 0);
     assert!(
         title_duplicates(&db, k, "—", None)

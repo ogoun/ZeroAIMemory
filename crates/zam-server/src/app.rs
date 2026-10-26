@@ -134,6 +134,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     ml::setup_chunker(&cfg, ml.embedder.as_deref());
     let system = SystemStore::open(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
+    bootstrap::warn_legacy_human_tokens(&system).await;
     let admin_id = system
         .admin_user()
         .await?

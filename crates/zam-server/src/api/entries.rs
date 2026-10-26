@@ -5,8 +5,11 @@
 //!   курсор `cursor`, `limit`) и создание (`Idempotency-Key`: 201, повтор —
 //!   200; ключ действует в границах автора, расхождение запроса → 422
 //!   `/problems/idempotency-mismatch`, ключ удалённой записи → 409);
-//! - `GET/PATCH/DELETE /entries/{id}` (`If-Match: <rev>` необязателен, расхождение → 409),
-//!   `POST /entries/{id}/restore`, `GET /entries/{id}/revisions`.
+//! - `GET/PATCH/DELETE /entries/{id}` — `PATCH` и `DELETE` требуют `If-Match: <rev>` (§11.3,
+//!   решение владельца 2026-10-26): без него 428 `/problems/precondition-required`,
+//!   расхождение — 409 с текущей ревизией `rev`; ревизия проверяется раньше прав;
+//!   `POST /entries/{id}/restore` (`If-Match` необязателен, при наличии проверяется),
+//!   `GET /entries/{id}/revisions`.
 //!
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
 //! уходит в [`super::insights::create`] (дедупликация, `scope`, триггеры, замещение).
@@ -14,7 +17,8 @@
 //! (из `superseded`/`retracted` и в них — 422 **[решение исполнителя]**: замещение и отзыв —
 //! отдельные операции, возврата нет), `triggers` (набор заменяется целиком, ошибка — 422
 //! `triggers[i]: …`) и `certainty` (`null` — снять) с `reason` — по матрице прав §7.5
-//! ([`crate::certainty`]): запись `axiom` агент не меняет и не удаляет (403).
+//! ([`crate::certainty`]): агенту смена статуса — с `reason`, `→ theorem` — ещё и с
+//! доказательством (иначе 422); человеку в WebUI причина необязательна.
 //! Доступ — как у узлов: участник общего решения работает в базе владельца только с
 //! записями пространства решения, автор записи — он сам. В логи и аудит текст записей не
 //! попадает.
@@ -483,7 +487,16 @@ fn check_status_change(e: &Entry, s: EntryStatus) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// `PATCH /entries/{id}` (необязательный `If-Match: <rev>`) → 200 `Entry` / 409 / 413 / 422.
+/// Необязательный `If-Match: <rev>` (supersede, retract, restore — §11.3): есть — проверяется.
+pub(crate) fn optional_if_match(headers: &HeaderMap) -> Result<Option<i64>, ApiError> {
+    headers
+        .contains_key(header::IF_MATCH)
+        .then(|| if_match(headers))
+        .transpose()
+}
+
+/// `PATCH /entries/{id}` с `If-Match: <rev>` → 200 `Entry`; без заголовка — 428; устаревшая
+/// ревизия — 409 с `rev` текущей; 413 / 422.
 pub async fn patch(
     State(st): State<AppState>,
     p: Principal,
@@ -493,11 +506,8 @@ pub async fn patch(
 ) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live_entry(&sc)?;
+    let rev = Some(if_match(&headers)?);
     let req: Patch = json_body(body)?;
-    let rev = headers
-        .contains_key(header::IF_MATCH)
-        .then(|| if_match(&headers))
-        .transpose()?;
     for t in [&req.body, &req.append_body].into_iter().flatten() {
         check_size(&st, t)?;
     }
@@ -564,7 +574,8 @@ pub(crate) fn audit_details(space: zam_core::Id, kind: EntryKind) -> Value {
     json!({ "space": space, "kind": kind.as_str() })
 }
 
-/// `DELETE /entries/{id}` — мягкое удаление → 204; аудит `entry.delete`.
+/// `DELETE /entries/{id}` с `If-Match: <rev>` — мягкое удаление → 204; без заголовка — 428,
+/// устаревшая ревизия — 409; аудит `entry.delete`.
 pub async fn remove(
     State(st): State<AppState>,
     p: Principal,
@@ -574,8 +585,9 @@ pub async fn remove(
 ) -> Result<StatusCode, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live_entry(&sc)?;
+    let rev = if_match(&headers)?;
     let attrib = attribution(&p, &headers, None)?;
-    delete_entry(&sc.db, sc.entry.id, &attrib).await?;
+    delete_entry(&sc.db, sc.entry.id, Some(rev), &attrib).await?;
     st.index.notify();
     audit_node(
         &st,
@@ -600,8 +612,9 @@ pub async fn restore(
     Path(id): Path<String>,
 ) -> Result<Json<Entry>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
+    let rev = optional_if_match(&headers)?;
     let attrib = attribution(&p, &headers, None)?;
-    let e = restore_entry(&sc.db, sc.entry.id, &attrib).await?;
+    let e = restore_entry(&sc.db, sc.entry.id, rev, &attrib).await?;
     st.index.notify();
     audit_node(
         &st,

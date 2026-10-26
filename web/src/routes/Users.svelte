@@ -22,7 +22,6 @@
   let newName = $state('');
   let tokenName = $state('');
   let tokenAccess = $state<Access>('rw');
-  let tokenHuman = $state(false);
   let error = $state('');
   let shown = $state<IssuedToken | null>(null);
   let copied = $state(false);
@@ -65,9 +64,8 @@
   function addToken(e: SubmitEvent, userId: string) {
     e.preventDefault();
     return guard(async () => {
-      show(await issueToken(userId, tokenName, tokenAccess, tokenHuman));
+      show(await issueToken(userId, tokenName, tokenAccess));
       tokenName = '';
-      tokenHuman = false;
       await reload();
     });
   }
@@ -129,7 +127,7 @@
                     <tr>
                       <td>{t.name}</td>
                       <td><code>zam_{t.prefix}…</code></td>
-                      <td>{t.access}{#if t.human} · <strong>человек</strong>{/if}</td>
+                      <td>{t.access}</td>
                       <td>{t.last_used_at ?? '—'}</td>
                       <td>
                         {#if t.revoked_at}
@@ -149,19 +147,8 @@
                     <option value="rw">rw (чтение и запись)</option>
                     <option value="ro">ro (только чтение)</option>
                   </select>
-                  <label class="row" style="gap: 4px;">
-                    <input type="checkbox" bind:checked={tokenHuman} />
-                    для человека
-                  </label>
                   <button class="primary">Выпустить токен</button>
                 </form>
-                {#if tokenHuman}
-                  <p class="warn" role="note">
-                    Человеческий токен пишет от имени человека: ставит и меняет axiom. Не кладите его
-                    в CLAUDE.md или AGENTS.md — только в ~/.zeroaimemory/config.toml (human_token) для
-                    команд с флагом --human.
-                  </p>
-                {/if}
               {/if}
             </td>
           </tr>

@@ -2,8 +2,8 @@
 #
 # Загрузчик (`cargo xtask eval`) создаёт записи в порядке файла: `supersedes` — замещение
 # записи, определённой выше (`POST /entries/{id}/supersede`), `retract_reason` — отзыв после
-# создания всех записей. `certainty = "axiom"` пишет человеческий токен администратора
-# прогона, остальное — токен агента; `theorem` — с `evidence {checked, method, result}`.
+# создания всех записей. Все записи, в том числе `certainty = "axiom"`, пишет токен прогона
+# (агент, M4 §7.5); `theorem` — с `evidence {checked, method, result}`.
 # Без `certainty` запись агента получает `hypothesis`.
 #
 # Группы ключей: c — цепочки замещения, r — отзывы и верные выводы на их месте,

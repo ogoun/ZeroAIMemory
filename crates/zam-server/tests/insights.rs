@@ -120,14 +120,16 @@ impl W {
         self.a.tok(tok, m, uri, body).await
     }
 
+    /// `PATCH /entries/{id}` с `If-Match` текущей ревизии.
     async fn patch(&self, id: &str, body: Value) -> Resp {
-        self.req(
-            &self.a_tok,
-            Method::PATCH,
-            &format!("/api/v1/entries/{id}"),
-            Some(body),
-        )
-        .await
+        self.a
+            .tok_rev(
+                &self.a_tok,
+                Method::PATCH,
+                &format!("/api/v1/entries/{id}"),
+                Some(body),
+            )
+            .await
     }
 
     async fn entry(&self, id: &str) -> Value {

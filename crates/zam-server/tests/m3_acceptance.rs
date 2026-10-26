@@ -10,8 +10,8 @@
 //!   атрибуцией; после отзыва тот же токен — 403 на следующем запросе;
 //! - «Замещение без потери»: insight-гипотеза с триггером замещается теоремой с evidence;
 //!   поиск по умолчанию находит новую, с `include_history` — обе; старая `superseded`,
-//!   ревизии целы, ребро `supersedes`, триггеры старой не выдаются; агент не отзывает
-//!   `axiom`, человеческий токен — отзывает;
+//!   ревизии целы, ребро `supersedes`, триггеры старой не выдаются; `axiom` человека агент
+//!   меняет с причиной и `If-Match` и отзывает (M4, решение владельца 2026-10-26);
 //! - «Секрет через агента»: запись и раскрытие с `X-Zam-Session`/`X-Zam-Machine`, аудит
 //!   `vault.reveal` без значения, значения нет в байтах каталога данных и журнале;
 //!   перезапуск с тем же мастер-ключом раскрывает, с чужим — 503 `vault-locked`.
@@ -160,12 +160,12 @@ fn ro_denied(code: u16, j: &Value) {
     );
 }
 
-/// 403 `/problems/certainty` с кодом `axiom-requires-human`.
+/// 422 `/problems/certainty` с кодом `reason-required`.
 #[track_caller]
-fn axiom_denied((code, j): (u16, Value)) {
-    assert_eq!(code, 403, "{j}");
+fn reason_required((code, j): (u16, Value)) {
+    assert_eq!(code, 422, "{j}");
     assert_eq!(j["type"], "/problems/certainty", "{j}");
-    assert_eq!(j["code"], "axiom-requires-human", "{j}");
+    assert_eq!(j["code"], "reason-required", "{j}");
 }
 
 fn note(space: &str, path: &str, content: &str) -> Value {
@@ -583,9 +583,9 @@ fn isolation_human_vault_and_solution_access() {
 // ---- 2. Замещение без потери ----
 
 /// Гипотеза X с триггером → `supersede` теоремой Y с evidence: поиск, история, ребро,
-/// триггеры; `axiom` отзывает только человек.
+/// триггеры; `axiom` человека агент меняет с причиной и ревизией и отзывает (M4).
 #[test]
-fn supersede_keeps_history_and_axiom_needs_human() {
+fn supersede_keeps_history_and_agent_changes_axiom_with_reason() {
     if !have(MINILM) {
         return;
     }
@@ -701,45 +701,54 @@ fn supersede_keeps_history_and_axiom_needs_human() {
         .collect();
     assert_eq!(pats, ["shared ports"], "{t}");
 
-    // axiom: человек создаёт, агент не отзывает (403), человеческий токен — отзывает
-    let (code, ht) = srv.admin_call(
+    // axiom (решение владельца 2026-10-26): человек создаёт в WebUI; агент по указанию
+    // пользователя меняет статус — только с причиной и ревизией (If-Match), отзывает сам
+    let ax = created(srv.admin_call(
         &web,
         "POST",
-        &format!(
-            "/api/v1/admin/users/{}/tokens",
-            s(&srv.admin_call(&web, "GET", "/api/v1/auth/me", None, None).1["user_id"])
-        ),
-        Some(&json!({"name": "человек", "human": true})),
-        None,
-    );
-    assert_eq!(code, 201, "{ht}");
-    assert_eq!(ht["info"]["human"], true, "{ht}");
-    let human = s(&ht["plaintext"]);
-    let ax = created(srv.call(
-        "POST",
         &entries,
-        &human,
         Some(
             &json!({"kind": "insight", "title": "Release only from main",
-                     "body": "Owner rule.", "data": {"kind": "decision"}}),
+                     "body": "Owner rule.", "data": {"kind": "decision"},
+                     "certainty": "axiom"}),
         ),
+        None,
     ));
     assert_eq!(ax["certainty"], "axiom", "{ax}");
     assert_eq!(ax["author"]["kind"], "human", "{ax}");
     let ax_id = s(&ax["id"]);
-    let retract = format!("/api/v1/entries/{ax_id}/retract");
-    axiom_denied(srv.call(
-        "POST",
-        &retract,
+    let uri = format!("/api/v1/entries/{ax_id}");
+    let (code, j) = srv.call(
+        "PATCH",
+        &uri,
         &agent,
-        Some(&json!({"reason": "агент считает устаревшим"})),
+        Some(&json!({"certainty": "hypothesis"})),
+    );
+    assert_eq!(code, 428, "без If-Match: {j}");
+    reason_required(srv.call_h(
+        "PATCH",
+        &uri,
+        &agent,
+        Some(&json!({"certainty": "hypothesis"})),
+        &[("If-Match", "1")],
     ));
-    let (_, cur) = srv.call("GET", &format!("/api/v1/entries/{ax_id}"), &agent, None);
-    assert_eq!(cur["status"], "active", "{cur}");
+    let (code, j) = srv.call_h(
+        "PATCH",
+        &uri,
+        &agent,
+        Some(&json!({"certainty": "hypothesis", "reason": "пользователь отменил правило"})),
+        &[("If-Match", "1")],
+    );
+    assert_eq!(code, 200, "{j}");
+    assert_eq!(j["certainty"], "hypothesis", "{j}");
+    let (_, revs) = srv.call("GET", &format!("{uri}/revisions"), &agent, None);
+    let last = revs["items"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["reason"], "пользователь отменил правило", "{revs}");
+    assert_eq!(last["author"]["kind"], "agent", "{revs}");
     let (code, j) = srv.call(
         "POST",
-        &retract,
-        &human,
+        &format!("{uri}/retract"),
+        &agent,
         Some(&json!({"reason": "правило отменено владельцем"})),
     );
     assert_eq!(code, 200, "{j}");

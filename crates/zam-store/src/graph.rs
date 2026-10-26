@@ -23,11 +23,11 @@
 //! [`GraphStore::outgoing`]. Участнику общего решения сервер передаёт одно пространство
 //! решения — рёбра в Knowledge, Rules и Human владельца ему не видны.
 //!
-//! **Права `certainty`** ([`crate::certainty`]): явное ребро от источника `axiom` создаёт и
-//! удаляет только человек — ребро входит в утверждение источника; ребро к цели `axiom` агенту
-//! разрешено; выведенные рёбра следуют за текстом, запись которого уже проверена матрицей;
-//! дозаполнение ([`backfill_edges`]) матрицу не проверяет (данные уже записаны)
-//! **[решение исполнителя, ruling R10]**.
+//! **Права `certainty`** ([`crate::certainty`]): явные рёбра от `axiom` и к `axiom` создаёт и
+//! удаляет любой автор — связь не меняет текст аксиомы (**решение владельца 2026-10-26**,
+//! ruling R10 M3 снят); проверка матрицы в транзакции ребра остаётся точкой для её правил.
+//! Выведенные рёбра следуют за текстом, запись которого уже проверена матрицей; дозаполнение
+//! ([`backfill_edges`]) матрицу не проверяет (данные уже записаны).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -241,15 +241,14 @@ pub trait GraphStore: Send + Sync {
         spaces: &[Id],
     ) -> impl Future<Output = Result<Vec<EdgeView>, StoreError>> + Send;
     /// Явное ребро. Концы — живые заметки или записи этой базы (нет → `NotFound`); папка,
-    /// петля или `supersedes` → `BadInput`; такое же живое явное ребро уже есть → `Conflict`;
-    /// источник `axiom`, автор не человек → `Certainty`.
+    /// петля или `supersedes` → `BadInput`; такое же живое явное ребро уже есть → `Conflict`.
     fn add_edge(
         &self,
         e: NewEdge,
         a: &Attribution,
     ) -> impl Future<Output = Result<EdgeView, StoreError>> + Send;
     /// Мягко удаляет явное ребро. Нет или уже удалено → `NotFound`; выведенное или
-    /// системное → `BadInput`; источник `axiom`, автор не человек → `Certainty`.
+    /// системное → `BadInput`.
     fn remove_edge(
         &self,
         id: Id,
@@ -672,7 +671,7 @@ fn add_explicit(c: &Connection, e: NewEdge, a: &Attribution, now: &str) -> Resul
     };
     let src = end(e.src)?;
     let dst = end(e.dst)?;
-    // ребро — часть утверждения источника: от axiom — только человек
+    // ребро по матрице certainty: с M4 от axiom — любому автору (§7.5, §8.5)
     check_certainty(
         a.author_kind,
         src.certainty,

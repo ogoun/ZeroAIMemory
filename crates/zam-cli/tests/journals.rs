@@ -34,11 +34,7 @@ fn start(name: &str) -> (String, String) {
             };
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
-            let (_, t) = st
-                .system
-                .issue_token(u.id, "t", Access::Rw, false)
-                .await
-                .unwrap();
+            let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             tx.send((url, t)).unwrap();

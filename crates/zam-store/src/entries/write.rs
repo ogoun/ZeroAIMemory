@@ -278,7 +278,7 @@ fn insert_entry(
     if e.kind != EntryKind::Insight && e.certainty.is_some() {
         return Err(bad("certainty есть только у insight"));
     }
-    // без явного статуса insight агента — hypothesis, человека — axiom (§7.5)
+    // без явного статуса insight агента — hypothesis, человека и system — без статуса (§7.5)
     let certainty = e
         .certainty
         .or_else(|| default_certainty(a.author_kind, e.kind));
@@ -433,7 +433,7 @@ pub(crate) fn ensure_editable(e: &Entry) -> Result<(), StoreError> {
 }
 
 /// Любое изменение записи (правка, замещение, отзыв, удаление, восстановление, триггеры) —
-/// по матрице `certainty`: запись `axiom` меняет только человек.
+/// по матрице `certainty` (§7.5; с M4 разрешено всем, в том числе у `axiom`).
 fn ensure_may_modify(e: &Entry, author: AuthorKind) -> Result<(), StoreError> {
     Ok(check_certainty(
         author,
@@ -442,6 +442,18 @@ fn ensure_may_modify(e: &Entry, author: AuthorKind) -> Result<(), StoreError> {
         None,
         None,
     )?)
+}
+
+/// Ожидаемая ревизия `if_rev` (`If-Match`, §11.3) против текущей: расхождение →
+/// [`StoreError::StaleRevision`]. Проверяется раньше прав и прочих правил операции.
+fn check_rev(e: &Entry, if_rev: Option<i64>) -> Result<(), StoreError> {
+    match if_rev {
+        Some(expected) if expected != e.rev => Err(StoreError::StaleRevision {
+            expected,
+            current: e.rev,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Живая запись по id: нет или удалена → `NotFound`.
@@ -481,7 +493,7 @@ pub async fn create_entry(
 }
 
 /// Правит запись: новая ревизия с причиной `p.reason`, пересборка чанков и `upsert`.
-/// `if_rev` не совпал с текущей ревизией → `Conflict`; запись удалена или нет → `NotFound`.
+/// `if_rev` не совпал с текущей ревизией → `StaleRevision`; запись удалена или нет → `NotFound`.
 /// `body` вместе с `append_body`, статус или `certainty` не у insight, статус кроме
 /// `active`/`revisit`, пустая причина → `BadInput`; смена статуса у `superseded` или
 /// `retracted` → `Conflict`. Правка без изменений возвращает запись как есть, без ревизии.
@@ -498,16 +510,9 @@ pub async fn update_entry(
     let a = a.clone();
     db.write(move |tx| {
         let cur = live_entry(tx, id)?;
-        // запись axiom агент не меняет никак (проверка по текущему состоянию, до записи)
+        // конфликт ревизии — раньше прав (§7.5, §11.3)
+        check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, a.author_kind)?;
-        if let Some(r) = if_rev
-            && r != cur.rev
-        {
-            return Err(StoreError::Conflict(format!(
-                "ревизия записи {}, а не {r}",
-                cur.rev
-            )));
-        }
         let reason = check_reason(p.reason)?;
         let content = p.title.is_some()
             || p.body.is_some()
@@ -606,12 +611,18 @@ pub async fn update_entry(
 }
 
 /// Мягко удаляет запись: чанки убираются (и из FTS), индексируемой — `delete`. Ревизии
-/// остаются. Нет записи или уже удалена → `NotFound`; запись `axiom`, а автор не человек →
-/// `Certainty`. В строке записи автор удаления не хранится, как и у узлов.
-pub async fn delete_entry(db: &Db, id: Id, a: &Attribution) -> Result<(), StoreError> {
+/// остаются. Нет записи или уже удалена → `NotFound`; `if_rev` не совпал с текущей ревизией →
+/// `StaleRevision`. В строке записи автор удаления не хранится, как и у узлов.
+pub async fn delete_entry(
+    db: &Db,
+    id: Id,
+    if_rev: Option<i64>,
+    a: &Attribution,
+) -> Result<(), StoreError> {
     let author = a.author_kind;
     db.write(move |tx| {
         let cur = live_entry(tx, id)?;
+        check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, author)?;
         let now = fmt_ts(Timestamp::now());
         tx.execute(
@@ -624,11 +635,18 @@ pub async fn delete_entry(db: &Db, id: Id, a: &Attribution) -> Result<(), StoreE
 }
 
 /// Восстанавливает удалённую запись: чанки из текущих полей, `upsert`. Нет → `NotFound`;
-/// не удалена → `BadInput`; запись `axiom`, а автор не человек → `Certainty`.
-pub async fn restore_entry(db: &Db, id: Id, a: &Attribution) -> Result<Entry, StoreError> {
+/// `if_rev` (необязателен) не совпал с текущей ревизией → `StaleRevision`; не удалена →
+/// `BadInput`.
+pub async fn restore_entry(
+    db: &Db,
+    id: Id,
+    if_rev: Option<i64>,
+    a: &Attribution,
+) -> Result<Entry, StoreError> {
     let author = a.author_kind;
     db.write(move |tx| {
         let cur = load_entry(tx, id)?;
+        check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, author)?;
         if cur.deleted_at.is_none() {
             return Err(bad("запись не удалена"));
@@ -654,18 +672,19 @@ pub async fn restore_entry(db: &Db, id: Id, a: &Attribution) -> Result<Entry, St
 /// `supersedes_id = old` и системное ребро графа `supersedes` (новая → старая), старая —
 /// `superseded`, `superseded_by_id` и новую ревизию; обе переиндексируются. Возвращает `(новая, старая)`. Повтор с тем же `idempotency_key`
 /// возвращает ту же пару. Не insight, другое пространство → `BadInput`; старая уже
-/// `superseded`/`retracted` → `Conflict`; нет или удалена → `NotFound`.
+/// `superseded`/`retracted` → `Conflict`; нет или удалена → `NotFound`; `if_rev` (ревизия
+/// старой, необязательна) не совпал с текущей → `StaleRevision` (повтор по ключу ревизию не
+/// сверяет: после первого ответа она уже выросла).
 pub async fn supersede_entry(
     db: &Db,
     old: Id,
+    if_rev: Option<i64>,
     new: NewEntry,
     a: &Attribution,
 ) -> Result<(Entry, Entry), StoreError> {
     let a = a.clone();
     db.write(move |tx| {
         let o = live_entry(tx, old)?;
-        // замещение — изменение старой записи: axiom замещает только человек
-        ensure_may_modify(&o, a.author_kind)?;
         if o.kind != EntryKind::Insight || new.kind != EntryKind::Insight {
             return Err(bad("замещаются только insight"));
         }
@@ -684,6 +703,9 @@ pub async fn supersede_entry(
             let ex = same_request(tx, ex, &new)?;
             return Ok((ex, load_entry(tx, old)?));
         }
+        check_rev(&o, if_rev)?;
+        // замещение — изменение старой записи (матрица certainty)
+        ensure_may_modify(&o, a.author_kind)?;
         if let Some(s @ (EntryStatus::Superseded | EntryStatus::Retracted)) = o.status {
             return Err(StoreError::Conflict(format!(
                 "запись {}: замещение невозможно",
@@ -708,10 +730,12 @@ pub async fn supersede_entry(
 
 /// Отзывает insight с обязательной причиной: статус `retracted`, `retract_reason`, ревизия
 /// с причиной, переиндексация. Пустая причина или не insight → `BadInput`; уже отозвана →
-/// `Conflict`; нет или удалена → `NotFound`.
+/// `Conflict`; нет или удалена → `NotFound`; `if_rev` (необязателен) не совпал с текущей
+/// ревизией → `StaleRevision`.
 pub async fn retract_entry(
     db: &Db,
     id: Id,
+    if_rev: Option<i64>,
     reason: &str,
     a: &Attribution,
 ) -> Result<Entry, StoreError> {
@@ -719,6 +743,7 @@ pub async fn retract_entry(
     let a = a.clone();
     db.write(move |tx| {
         let cur = live_entry(tx, id)?;
+        check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, a.author_kind)?;
         if cur.kind != EntryKind::Insight {
             return Err(bad("отзываются только insight"));

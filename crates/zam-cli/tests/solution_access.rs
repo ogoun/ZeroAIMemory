@@ -36,11 +36,7 @@ fn start(name: &str) -> (String, String, String) {
             let mut tokens = Vec::new();
             for n in ["Анна", "Борис"] {
                 let u = st.system.create_user(n, false).await.unwrap();
-                let (_, t) = st
-                    .system
-                    .issue_token(u.id, "t", Access::Rw, false)
-                    .await
-                    .unwrap();
+                let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
                 tokens.push(t);
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

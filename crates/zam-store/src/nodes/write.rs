@@ -18,7 +18,7 @@ use crate::{Db, StoreError};
 /// — `attrib.area` (`X-Zam-Area`).
 /// Путь занят живым узлом или предок — заметка → `Conflict`; нет пространства → `NotFound`;
 /// неизвестный `certainty:` во frontmatter → `BadInput`; статус против матрицы прав
-/// (`axiom` не от человека, `theorem` агента без `evidence:`) → `Certainty`.
+/// (`theorem` агента без `evidence:`) → `Certainty`.
 pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
     db.write(move |tx| {
         let now = fmt_ts(Timestamp::now());

@@ -373,6 +373,7 @@ async fn default_excludes_superseded_and_retracted_include_history_returns() {
     let (new, _) = supersede_entry(
         &db,
         old.id,
+        None,
         insight(
             k,
             "Zebrafox cache warms itself",
@@ -393,7 +394,7 @@ async fn default_excludes_superseded_and_retracted_include_history_returns() {
     )
     .await
     .unwrap();
-    let gone = retract_entry(&db, gone.id, "refuted by monitoring", &agent())
+    let gone = retract_entry(&db, gone.id, None, "refuted by monitoring", &agent())
         .await
         .unwrap();
     wait_indexed(&a, &db, &[old.id, new.id, gone.id]).await;
@@ -498,7 +499,7 @@ async fn status_change_updates_payload() {
     );
 
     // отзыв — запись уходит из выдачи по умолчанию, точки остаются со статусом retracted
-    retract_entry(&db, e.id, "vacuum is automatic now", &agent())
+    retract_entry(&db, e.id, None, "vacuum is automatic now", &agent())
         .await
         .unwrap();
     wait_indexed(&a, &db, &[e.id]).await;

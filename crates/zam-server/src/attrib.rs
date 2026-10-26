@@ -1,7 +1,7 @@
 //! Атрибуция ревизий (§11.3, §12): кто пишет, с какой машины и в какой сессии.
 //!
-//! - `author_kind`: токен — `agent`, человеческий токен (`human`, §7.5) и администратор
-//!   (cookie WebUI) — `human`;
+//! - `author_kind`: любой токен — `agent`, сессия WebUI — `human` (§7.5, §11.4: человеческие
+//!   токены M3 упразднены решением владельца 2026-10-26, `tokens.human` не читается);
 //! - `token_id` — id токена запроса, `user_id` — его пользователь (автор ревизии в базе
 //!   владельца общего решения, §11.6); у администратора — нет;
 //! - `X-Zam-Session`, `X-Zam-Machine` — до 128 символов UTF-8 без управляющих,
@@ -33,14 +33,7 @@ pub fn attribution(
     message: Option<String>,
 ) -> Result<Attribution, ApiError> {
     let (author_kind, token_id, user_id) = match p {
-        Principal::Token(t) => {
-            let kind = if t.human {
-                AuthorKind::Human
-            } else {
-                AuthorKind::Agent
-            };
-            (kind, Some(t.token_id), Some(t.user_id))
-        }
+        Principal::Token(t) => (AuthorKind::Agent, Some(t.token_id), Some(t.user_id)),
         Principal::Admin { .. } => (AuthorKind::Human, None, None),
     };
     let message = message.filter(|m| !m.trim().is_empty());
@@ -112,22 +105,14 @@ mod tests {
     }
 
     #[test]
-    fn token_author_kind_by_human_flag() {
-        let tok = |human| {
-            Principal::Token(zam_store::AuthToken {
-                token_id: zam_core::Id::new(),
-                user_id: zam_core::Id::new(),
-                access: zam_store::Access::Rw,
-                human,
-            })
-        };
-        let h = HeaderMap::new();
-        assert_eq!(
-            attribution(&tok(false), &h, None).unwrap().author_kind,
-            AuthorKind::Agent
-        );
-        let a = attribution(&tok(true), &h, None).unwrap();
-        assert_eq!(a.author_kind, AuthorKind::Human);
+    fn token_is_always_agent() {
+        let tok = Principal::Token(zam_store::AuthToken {
+            token_id: zam_core::Id::new(),
+            user_id: zam_core::Id::new(),
+            access: zam_store::Access::Rw,
+        });
+        let a = attribution(&tok, &HeaderMap::new(), None).unwrap();
+        assert_eq!(a.author_kind, AuthorKind::Agent);
         assert!(a.token_id.is_some() && a.user_id.is_some());
     }
 

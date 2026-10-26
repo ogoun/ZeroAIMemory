@@ -137,6 +137,8 @@ test('Insights: замена записи и повышение до theorem с 
   await expect(card.getByRole('heading', { name: 'Старый вывод о Qdrant' })).toBeVisible();
   await card.getByRole('button', { name: 'Заменить' }).click();
   const form = card.getByRole('form', { name: 'Замена insight' });
+  // новая запись человека — без статуса по умолчанию (аксиому человек ставит явно)
+  await expect(form.getByLabel('Надёжность новой записи')).toHaveValue('');
   await form.getByLabel('Заголовок').fill('Новый вывод о Qdrant');
   await form.getByRole('button', { name: 'Заменить' }).click();
   await expect(card.getByRole('heading', { name: 'Новый вывод о Qdrant' })).toBeVisible();
@@ -149,17 +151,15 @@ test('Insights: замена записи и повышение до theorem с 
   await expect(table.locator('tbody tr')).toHaveCount(4);
   await expect(table.locator('tr', { hasText: 'Старый вывод о Qdrant' })).toContainText('заменён');
 
-  // Повышение гипотезы до theorem: причина обязательна, для theorem — доказательство
+  // Повышение гипотезы до theorem: причина человеку необязательна, для theorem — доказательство
   await table.getByRole('button', { name: 'Кэш эмбеддингов ускоряет переиндексацию' }).click();
   await expect(page).toHaveURL(new RegExp(`/j/insights/${env('E2E_INSIGHT_HYP')}$`));
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
   const cf = card.getByRole('form', { name: 'Статус надёжности' });
   await cf.getByLabel('theorem').check();
   await cf.getByRole('button', { name: 'Сохранить' }).click();
-  await expect(cf.getByRole('alert')).toHaveText('Укажите причину смены статуса надёжности.');
-  await cf.getByLabel(/^Причина/).fill('замерено на реальной базе');
-  await cf.getByRole('button', { name: 'Сохранить' }).click();
   await expect(cf.getByRole('alert')).toContainText('Для theorem заполните доказательство');
+  await cf.getByLabel(/^Причина/).fill('замерено на реальной базе');
   await cf.getByLabel('Проверено').fill('время переиндексации 10 тыс. заметок');
   await cf.getByLabel('Метод').fill('reindex без full и с full');
   await cf.getByLabel('Результат').fill('в 8 раз быстрее из кэша');
@@ -170,10 +170,9 @@ test('Insights: замена записи и повышение до theorem с 
   await expect(card.locator('.evidence')).toContainText('в 8 раз быстрее из кэша');
   await expect(table.locator('[data-certainty="theorem"]')).toHaveCount(2);
 
-  // Администратор — человек: axiom доступна
+  // Администратор — человек: axiom доступна, причина необязательна
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
   await cf.getByLabel('axiom').check();
-  await cf.getByLabel(/^Причина/).fill('подтверждено владельцем');
   await cf.getByRole('button', { name: 'Сохранить' }).click();
   await expect(card.locator('header [data-certainty="axiom"]')).toBeVisible();
   // доказательство не удаляется, но подписано как прежнее

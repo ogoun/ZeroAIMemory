@@ -41,6 +41,12 @@ function bearer(request: APIRequestContext, token: string) {
     get: (path: string) => request.get(`${base()}api/v1/${path}`, { headers, failOnStatusCode: false }),
     post: (path: string, data: unknown) =>
       request.post(`${base()}api/v1/${path}`, { headers, data, failOnStatusCode: false }),
+    patch: (path: string, data: unknown, extra: Record<string, string> = {}) =>
+      request.patch(`${base()}api/v1/${path}`, {
+        headers: { ...headers, ...extra },
+        data,
+        failOnStatusCode: false,
+      }),
   };
 }
 
@@ -130,39 +136,49 @@ test('Решения: одобрение ro, метки в дереве, отз�
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
-test('Человеческий токен: предупреждение, выпуск, axiom только человеку', async ({ page, playwright }) => {
+test('Токены: человеческих нет, axiom — обычным токеном с причиной', async ({ page, playwright }) => {
   const problems = watch(page);
   await openAdmin(page, 'Пользователи');
   const adminRow = page.getByRole('row').filter({ hasText: '(админ)' }).first();
   await adminRow.getByRole('button', { name: 'Токены' }).click();
-  await page.getByPlaceholder('Имя токена').fill('e2e-human');
-  await expect(page.getByRole('note')).toHaveCount(0);
-  await page.getByLabel('для человека').check();
-  await expect(page.getByRole('note')).toContainText('ставит и меняет axiom');
-  await page.screenshot({ path: `${screens}human-token.png`, fullPage: true });
+  // флажка «для человека» больше нет (§11.4, решение владельца 2026-10-26)
+  await expect(page.getByLabel('для человека')).toHaveCount(0);
+  await page.getByPlaceholder('Имя токена').fill('e2e-agent');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   const dialog = page.getByRole('dialog');
-  const human = await dialog.getByLabel('Токен').inputValue();
-  expect(human).toMatch(/^zam_/);
+  const token = await dialog.getByLabel('Токен').inputValue();
+  expect(token).toMatch(/^zam_/);
   await dialog.getByRole('button', { name: 'Закрыть' }).click();
-  await expect(page.getByRole('row', { name: /^e2e-human / })).toContainText('человек');
+  await expect(page.getByRole('row', { name: /^e2e-agent / })).not.toContainText('человек');
+  await page.screenshot({ path: `${screens}tokens.png`, fullPage: true });
 
   const request = await playwright.request.newContext();
   const axiom = {
     kind: 'insight',
     title: 'Аксиома из e2e',
-    body: 'Принято человеком.',
+    body: 'По указанию пользователя.',
     data: { kind: 'decision' },
     certainty: 'axiom',
     force: true,
   };
-  // агент (обычный токен) не создаёт axiom
-  let r = await bearer(request, env('E2E_ADMIN_TOKEN')).post('spaces/knowledge/entries', axiom);
-  expect(r.status()).toBe(403);
-  expect((await r.json()).code).toBe('axiom-requires-human');
-  r = await bearer(request, human).post('spaces/knowledge/entries', axiom);
+  const agent = bearer(request, token);
+  let r = await agent.post('spaces/knowledge/entries', axiom);
   expect(r.status()).toBe(201);
-  expect((await r.json()).certainty).toBe('axiom');
+  const e = await r.json();
+  expect(e.certainty).toBe('axiom');
+  expect(e.author.kind).toBe('agent');
+  // смена статуса агентом: без If-Match — 428, без причины — 422, с причиной — 200
+  r = await agent.patch(`entries/${e.id}`, { certainty: 'hypothesis' });
+  expect(r.status()).toBe(428);
+  r = await agent.patch(`entries/${e.id}`, { certainty: 'hypothesis' }, { 'If-Match': '1' });
+  expect(r.status()).toBe(422);
+  expect((await r.json()).code).toBe('reason-required');
+  r = await agent.patch(
+    `entries/${e.id}`,
+    { certainty: 'hypothesis', reason: 'пользователь отменил' },
+    { 'If-Match': '1' },
+  );
+  expect(r.status()).toBe(200);
   await request.dispose();
   expect(problems, problems.join('\n')).toEqual([]);
 });

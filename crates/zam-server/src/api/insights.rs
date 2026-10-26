@@ -1,8 +1,8 @@
 //! Insights (§7.5, §10.3, §12): создание с дедупликацией, замещение, отзыв, пересмотр,
 //! триггеры. Правила `certainty` ([`crate::certainty`]) проверяет хранилище в транзакции
-//! каждой операции: без `certainty` insight агента — `hypothesis`, человека — `axiom`;
-//! `axiom` создаёт, замещает и отзывает только человек (403), `theorem` агента — только с
-//! `data.evidence {checked, method, result}` (422).
+//! каждой операции: без `certainty` insight агента — `hypothesis`, человека — без статуса;
+//! `axiom` ставит любой автор (агент — по прямому указанию пользователя, §14.2), `theorem`
+//! агента — только с `data.evidence {checked, method, result}` (422).
 //!
 //! **Создание** — `POST /spaces/{space}/entries` с `kind: "insight"` ([`create`]):
 //! - поля §7.5: `title`, `body`, `data {kind, experiment?, evidence?, …}` (`data.kind` — один
@@ -30,7 +30,8 @@
 //! `superseded` (старая запись).
 //!
 //! **Операции:** `POST /entries/{id}/supersede {новая запись}` → 201 `{entry, superseded}`;
-//! `POST /entries/{id}/retract {reason}` (пустая причина → 422; отзыв `superseded` разрешён:
+//! `POST /entries/{id}/retract {reason}` (у обеих `If-Match: <rev>` необязателен, при наличии
+//! проверяется — 409 с `rev` текущей, §11.3; пустая причина → 422; отзыв `superseded` разрешён:
 //! замещённый вывод тоже может оказаться ошибочным, а отзыв ничего не удаляет); правка
 //! статуса (`active ↔ revisit`) и триггеров — `PATCH /entries/{id}` ([`super::entries`]).
 use std::collections::HashMap;
@@ -52,7 +53,8 @@ use zam_store::{
 };
 
 use super::entries::{
-    audit_details, check_size, check_title, empty_object, idempotency_key, unprocessable,
+    audit_details, check_size, check_title, empty_object, idempotency_key, optional_if_match,
+    unprocessable,
 };
 use super::graph::insight_links;
 use super::json_body;
@@ -431,7 +433,9 @@ pub async fn create(
             ));
         }
         let new = new_entry(req, sc.space.id, key, triggers, links);
-        let (n, o) = supersede_entry(&sc.db, old, new, &attrib).await?;
+        // замещение через supersedes_id: ревизия старой не сверяется (If-Match у POST
+        // коллекции относился бы к новой записи) [решение исполнителя]
+        let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib).await?;
         st.index.notify();
         // аудит — как у POST /entries/{id}/supersede (повтор по ключу — без новой строки)
         if !repeat {
@@ -516,6 +520,7 @@ pub async fn supersede(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live_insight(&sc)?;
+    let rev = optional_if_match(&headers)?;
     let mut req: InsightReq = json_body(body)?;
     if req.scope.is_some() || req.supersedes_id.is_some() {
         return Err(unprocessable(
@@ -537,7 +542,7 @@ pub async fn supersede(
         None => false,
     };
     let new = new_entry(req, sc.space.id, key, triggers, links);
-    let (n, o) = supersede_entry(&sc.db, sc.entry.id, new, &attrib).await?;
+    let (n, o) = supersede_entry(&sc.db, sc.entry.id, rev, new, &attrib).await?;
     st.index.notify();
     if !repeat {
         audit_node(
@@ -589,6 +594,7 @@ pub async fn retract(
 ) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live_insight(&sc)?;
+    let rev = optional_if_match(&headers)?;
     let req: RetractReq = json_body(body)?;
     let reason = req.reason.unwrap_or_default();
     let reason = reason.trim();
@@ -601,7 +607,7 @@ pub async fn retract(
         )));
     }
     let attrib = attribution(&p, &headers, req.message)?;
-    let e = retract_entry(&sc.db, sc.entry.id, reason, &attrib).await?;
+    let e = retract_entry(&sc.db, sc.entry.id, rev, reason, &attrib).await?;
     st.index.notify();
     audit_node(
         &st,

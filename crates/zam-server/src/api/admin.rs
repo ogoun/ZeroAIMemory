@@ -47,7 +47,6 @@ fn token_json(t: &TokenInfo) -> Value {
         "last_used_at": t.last_used_at.map(fmt_ts),
         "last_ip": t.last_ip,
         "revoked_at": t.revoked_at.map(fmt_ts),
-        "human": t.human,
     })
 }
 
@@ -129,7 +128,7 @@ pub async fn create_user(
         .await?;
     let (info, plain) = st
         .system
-        .issue_token(user.id, "default", Access::Rw, false)
+        .issue_token(user.id, "default", Access::Rw)
         .await?;
     audit_token_issue(&st, &info, &plain, &ip).await?;
     Ok((
@@ -244,7 +243,6 @@ async fn audit_token_issue(
                 "token": mask_token(plain),
                 "name": info.name,
                 "access": info.access.as_str(),
-                "human": info.human,
             }),
         )
         .await?;
@@ -266,12 +264,15 @@ pub async fn list_tokens(
 struct IssueToken {
     name: String,
     access: Option<String>,
-    /// Человеческий токен (§7.5): запись по нему — `author_kind = human` (ставит и меняет
-    /// `axiom`). Выпускает только администратор (маршрут `AdminOnly`) **[решение
-    /// исполнителя]**; хранить его в CLAUDE.md/AGENTS.md нельзя — агент станет «человеком».
+    /// Флаг человеческого токена M3: `true` — 400 (упразднён, §11.4); `false` принимается
+    /// для совместимости старых клиентов.
     #[serde(default)]
     human: bool,
 }
+
+/// Отказ в выпуске человеческого токена (§11.4).
+pub(crate) const HUMAN_TOKEN_REMOVED: &str =
+    "человеческие токены упразднены (решение владельца 2026-10-26): подтверждайте в WebUI";
 
 pub async fn issue_token(
     _: AdminOnly,
@@ -282,6 +283,9 @@ pub async fn issue_token(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = parse_id(&id)?;
     let req: IssueToken = parse_body(&body)?;
+    if req.human {
+        return Err(ApiError::BadRequest(HUMAN_TOKEN_REMOVED.into()));
+    }
     let name = valid_name(&req.name)?;
     let access = match req.access.as_deref() {
         None | Some("rw") => Access::Rw,
@@ -294,7 +298,7 @@ pub async fn issue_token(
             "пользователь отключён: токен выпустить нельзя",
         ));
     }
-    let (info, plain) = st.system.issue_token(id, &name, access, req.human).await?;
+    let (info, plain) = st.system.issue_token(id, &name, access).await?;
     audit_token_issue(&st, &info, &plain, &client.ip.to_string()).await?;
     Ok((
         StatusCode::CREATED,

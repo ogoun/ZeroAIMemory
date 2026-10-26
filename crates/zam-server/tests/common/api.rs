@@ -149,6 +149,16 @@ impl Api {
         self.tok_h(token, m, uri, body, &[]).await
     }
 
+    /// Правка записи журнала по токену `token` с `If-Match` её текущей ревизии (§11.3):
+    /// ревизия — из `GET uri` тем же токеном; нет доступа к записи — без заголовка (ответ
+    /// доступа приходит раньше 428).
+    pub async fn tok_rev(&self, token: &str, m: Method, uri: &str, body: Option<Value>) -> Resp {
+        let cur = self.tok(token, Method::GET, uri, None).await;
+        let rev = (cur.status == StatusCode::OK).then(|| cur.json()["rev"].to_string());
+        let extra: Vec<(&str, &str)> = rev.iter().map(|r| ("if-match", r.as_str())).collect();
+        self.tok_h(token, m, uri, body, &extra).await
+    }
+
     /// Запрос по первому токену администратора.
     pub async fn t(&self, m: Method, uri: &str, body: Option<Value>) -> Resp {
         self.tok(&self.token, m, uri, body).await

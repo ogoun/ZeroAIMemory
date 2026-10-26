@@ -85,10 +85,7 @@ async fn register_is_idempotent_and_owner_fixed() {
 #[tokio::test]
 async fn request_access_idempotent_pending() {
     let (_dd, s, owner, member, g) = setup("request").await;
-    let (tok, _) = s
-        .issue_token(member, "laptop", Access::Ro, false)
-        .await
-        .unwrap();
+    let (tok, _) = s.issue_token(member, "laptop", Access::Ro).await.unwrap();
     assert_eq!(
         s.request_access(&g, member, Some(tok.id)).await.unwrap(),
         AccessState::Pending

@@ -19,10 +19,7 @@ fn raw(dd: &DataDir) -> rusqlite::Connection {
 async fn issue_and_verify_token() {
     let (dd, s) = store("issue").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (info, plain) = s
-        .issue_token(u.id, "laptop", Access::Rw, false)
-        .await
-        .unwrap();
+    let (info, plain) = s.issue_token(u.id, "laptop", Access::Rw).await.unwrap();
     let a = s
         .verify_token(&plain, Some("10.0.0.5"))
         .await
@@ -48,7 +45,7 @@ async fn issue_and_verify_token() {
 async fn last_used_throttled_to_once_per_minute() {
     let (dd, s) = store("throttle").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (_, plain) = s.issue_token(u.id, "t", Access::Ro, false).await.unwrap();
+    let (_, plain) = s.issue_token(u.id, "t", Access::Ro).await.unwrap();
     s.verify_token(&plain, Some("1.1.1.1"))
         .await
         .unwrap()
@@ -75,7 +72,7 @@ async fn last_used_throttled_to_once_per_minute() {
 async fn revoked_token_rejected_immediately() {
     let (_dd, s) = store("revoke").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (info, plain) = s.issue_token(u.id, "t", Access::Rw, false).await.unwrap();
+    let (info, plain) = s.issue_token(u.id, "t", Access::Rw).await.unwrap();
     assert!(s.verify_token(&plain, None).await.unwrap().is_some());
     s.revoke_token(info.id).await.unwrap();
     assert!(s.verify_token(&plain, None).await.unwrap().is_none());
@@ -86,7 +83,7 @@ async fn revoked_token_rejected_immediately() {
 async fn disabled_user_token_rejected() {
     let (_dd, s) = store("disabled").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (_, plain) = s.issue_token(u.id, "t", Access::Rw, false).await.unwrap();
+    let (_, plain) = s.issue_token(u.id, "t", Access::Rw).await.unwrap();
     s.set_user_disabled(u.id, true).await.unwrap();
     assert!(s.verify_token(&plain, None).await.unwrap().is_none());
     assert!(
@@ -111,10 +108,7 @@ async fn users_conflict_notfound_and_admin() {
     assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
     assert_eq!(s.list_users().await.unwrap().len(), 2);
     assert_eq!(s.admin_user().await.unwrap().unwrap().id, a.id);
-    let err = s
-        .issue_token(Id::new(), "t", Access::Rw, false)
-        .await
-        .unwrap_err();
+    let err = s.issue_token(Id::new(), "t", Access::Rw).await.unwrap_err();
     assert!(matches!(err, StoreError::NotFound), "{err:?}");
     assert!(s.get_user(Id::new()).await.unwrap().is_none());
 }
@@ -157,7 +151,7 @@ async fn expired_session_not_returned_and_removed() {
 async fn audit_has_no_secrets() {
     let (dd, s) = store("audit").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (info, plain) = s.issue_token(u.id, "t", Access::Rw, false).await.unwrap();
+    let (info, plain) = s.issue_token(u.id, "t", Access::Rw).await.unwrap();
     s.audit(
         &info.id.to_string(),
         Some(u.id),
@@ -290,7 +284,7 @@ async fn rename_user_and_get_token() {
         s.rename_user(Id::new(), "zed").await,
         Err(StoreError::NotFound)
     ));
-    let (info, _) = s.issue_token(b.id, "t", Access::Ro, false).await.unwrap();
+    let (info, _) = s.issue_token(b.id, "t", Access::Ro).await.unwrap();
     let got = s.get_token(info.id).await.unwrap().unwrap();
     assert_eq!(
         (got.id, got.user_id, got.access),

@@ -110,8 +110,6 @@ pub struct TokenInfo {
     pub last_used_at: Option<Timestamp>,
     pub last_ip: Option<String>,
     pub revoked_at: Option<Timestamp>,
-    /// Человеческий токен (§7.5): запись по нему — `author_kind = human`.
-    pub human: bool,
 }
 
 /// Результат успешной проверки токена.
@@ -120,8 +118,6 @@ pub struct AuthToken {
     pub token_id: Id,
     pub user_id: Id,
     pub access: Access,
-    /// Человеческий токен: запись по нему атрибутируется человеку (ставит и меняет `axiom`).
-    pub human: bool,
 }
 
 /// Веб-сессия администратора (идентификатор сессии в ответ не входит).
@@ -175,12 +171,11 @@ fn token_row(r: &Row) -> rusqlite::Result<TokenInfo> {
         last_used_at: ts_opt(r, 6)?,
         last_ip: r.get(7)?,
         revoked_at: ts_opt(r, 8)?,
-        human: r.get(9)?,
     })
 }
 
 const TOKEN_COLS: &str =
-    "id, user_id, name, prefix, access, created_at, last_used_at, last_ip, revoked_at, human";
+    "id, user_id, name, prefix, access, created_at, last_used_at, last_ip, revoked_at";
 
 pub(crate) fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _)
@@ -358,14 +353,13 @@ impl SystemStore {
     // ---- токены ----
 
     /// Выпускает токен; открытый текст возвращается один раз, в БД — только sha256.
-    /// `human` — человеческий токен (§7.5): выпускать его вправе только администратор,
-    /// это проверяет сервер.
+    /// Любой токен — агентский (§11.4): колонка `tokens.human` (M3) получает значение по
+    /// умолчанию 0 и не читается.
     pub async fn issue_token(
         &self,
         user: Id,
         name: &str,
         access: Access,
-        human: bool,
     ) -> Result<(TokenInfo, String), StoreError> {
         let name = name.to_string();
         let nt = generate_token();
@@ -390,12 +384,10 @@ impl SystemStore {
                     last_used_at: None,
                     last_ip: None,
                     revoked_at: None,
-                    human,
                 };
                 tx.execute(
-                    "INSERT INTO tokens (id, user_id, name, prefix, secret_hash, access, created_at,
-                                         human)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO tokens (id, user_id, name, prefix, secret_hash, access, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         info.id,
                         info.user_id,
@@ -403,14 +395,27 @@ impl SystemStore {
                         info.prefix,
                         nt.secret_hash,
                         info.access,
-                        fmt_ts(info.created_at),
-                        info.human
+                        fmt_ts(info.created_at)
                     ],
                 )?;
                 Ok(info)
             })
             .await?;
         Ok((info, plain))
+    }
+
+    /// Префиксы неотозванных токенов, выпущенных человеческими в M3 (`tokens.human = 1`), по
+    /// порядку id: с M4 флаг упразднён и не читается — сервер один раз пишет о них WARN при
+    /// старте (§11.4). Префикс — не секрет (отображается в списке токенов).
+    pub async fn legacy_human_token_prefixes(&self) -> Result<Vec<String>, StoreError> {
+        self.db
+            .read(|c| {
+                let mut st = c.prepare(
+                    "SELECT prefix FROM tokens WHERE human = 1 AND revoked_at IS NULL ORDER BY id",
+                )?;
+                Ok(st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+            })
+            .await
     }
 
     pub async fn get_token(&self, id: Id) -> Result<Option<TokenInfo>, StoreError> {
@@ -465,8 +470,7 @@ impl SystemStore {
             .db
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT t.id, t.user_id, t.access, t.revoked_at, t.last_used_at, u.disabled_at,
-                            t.human
+                    "SELECT t.id, t.user_id, t.access, t.revoked_at, t.last_used_at, u.disabled_at
                      FROM tokens t JOIN users u ON u.id = t.user_id
                      WHERE t.secret_hash = ?1",
                     [&hash],
@@ -475,7 +479,6 @@ impl SystemStore {
                             token_id: r.get(0)?,
                             user_id: r.get(1)?,
                             access: r.get(2)?,
-                            human: r.get(6)?,
                         };
                         let revoked = r.get::<_, Option<String>>(3)?.is_some();
                         let last_used = ts_opt(r, 4).unwrap_or(None);

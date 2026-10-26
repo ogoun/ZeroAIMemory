@@ -131,9 +131,9 @@ pub async fn create(
 
 /// Ревизия из `If-Match`: `3`, `"3"` или `W/"3"`.
 pub(crate) fn if_match(headers: &HeaderMap) -> Result<i64, ApiError> {
-    let v = headers
-        .get(header::IF_MATCH)
-        .ok_or(ApiError::PreconditionRequired)?;
+    let v = headers.get(header::IF_MATCH).ok_or_else(|| {
+        ApiError::PreconditionRequired("передайте If-Match: <rev> текущей ревизии".into())
+    })?;
     let s = v.to_str().unwrap_or("").trim();
     let s = s.strip_prefix("W/").unwrap_or(s);
     s.trim_matches('"')
@@ -327,7 +327,10 @@ mod tests {
     #[test]
     fn if_match_forms() {
         let mut h = HeaderMap::new();
-        assert!(matches!(if_match(&h), Err(ApiError::PreconditionRequired)));
+        assert!(matches!(
+            if_match(&h),
+            Err(ApiError::PreconditionRequired(_))
+        ));
         for (v, want) in [("3", 3), ("\"3\"", 3), ("W/\"12\"", 12), (" 4 ", 4)] {
             h.insert(header::IF_MATCH, HeaderValue::from_static(v));
             assert_eq!(if_match(&h).unwrap(), want, "{v}");

@@ -306,8 +306,8 @@ enum InsightCmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Сменить эпистемический статус: axiom (только --human), theorem (агенту — с
-    /// --evidence-file), hypothesis или none; причина обязательна
+    /// Сменить эпистемический статус (обычный токен): axiom (только по прямому указанию
+    /// пользователя), theorem (с --evidence-file), hypothesis или none; причина обязательна
     Certify {
         id: String,
         #[arg(value_parser = ["axiom", "theorem", "hypothesis", "none"])]
@@ -317,11 +317,6 @@ enum InsightCmd {
         /// JSON-файл доказательства {checked, method, result} → data.evidence
         #[arg(long)]
         evidence_file: Option<PathBuf>,
-        /// Человеческий токен (url и human_token — только из ~/.zeroaimemory/config.toml);
-        /// только в интерактивном терминале с подтверждением вводом id: axiom ставит и меняет
-        /// только человек
-        #[arg(long)]
-        human: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -605,16 +600,14 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
             certainty,
             reason,
             evidence_file,
-            human,
             common,
-        } => {
-            let ctx = if human {
-                cmd::connect_human(&common, &id)?
-            } else {
-                cmd::connect(&common)?
-            };
-            i::certify(&ctx, &id, &certainty, &reason, evidence_file.as_deref())
-        }
+        } => i::certify(
+            &cmd::connect(&common)?,
+            &id,
+            &certainty,
+            &reason,
+            evidence_file.as_deref(),
+        ),
     }
 }
 

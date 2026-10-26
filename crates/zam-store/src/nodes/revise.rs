@@ -183,10 +183,10 @@ async fn write_note(
     .await?
 }
 
-/// Заметку `axiom` меняет только человек: проверка по текущей ревизии до любой записи
-/// ([`commit_text`] — общий шаг `PUT`, `PATCH`, `revert`). Порядок ответов: конфликт ревизии
-/// (`If-Match`/`base_rev` устарел — 409) и ошибки PATCH проверяются раньше; при актуальной
-/// ревизии агент получает 403, ничего не записав.
+/// Изменение заметки по матрице `certainty` (§7.5; с M4 заметку `axiom` правит любой автор):
+/// проверка по текущей ревизии до любой записи ([`commit_text`] — общий шаг `PUT`, `PATCH`,
+/// `revert`). Конфликт ревизии (`If-Match`/`base_rev` устарел — 409) и ошибки PATCH
+/// проверяются раньше.
 fn ensure_may_modify(node: &Node, author: AuthorKind) -> Result<(), StoreError> {
     Ok(check_certainty(
         author,

@@ -449,7 +449,7 @@ async fn admin_selects_user_via_header() {
     // токен пользователя заголовок игнорирует: видит только своё
     let (_, bob_token) = st
         .system
-        .issue_token(bob.id, "t", zam_store::Access::Ro, false)
+        .issue_token(bob.id, "t", zam_store::Access::Ro)
         .await
         .unwrap();
     let admin = st.system.admin_user().await.unwrap().unwrap();

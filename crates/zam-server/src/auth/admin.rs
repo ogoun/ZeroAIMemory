@@ -153,8 +153,8 @@ pub async fn logout(
     Ok(resp)
 }
 
-/// `GET /auth/me` → `{login, user_id, csrf, human}`: по живой cookie-сессии (восстановление
-/// после F5); `human: true` — сессия WebUI действует как человек (§7.5: ставит `axiom`).
+/// `GET /auth/me` → `{login, user_id, csrf}`: по живой cookie-сессии (восстановление после
+/// F5). Сессия WebUI всегда пишет как человек (§7.5, §11.4), отдельный признак не нужен.
 pub async fn me(
     State(st): State<AppState>,
     AdminOnly(sid): AdminOnly,
@@ -168,7 +168,6 @@ pub async fn me(
         "login": st.cfg.admin.login,
         "user_id": st.admin_id,
         "csrf": ws.csrf_token,
-        "human": true,
     })))
 }
 
