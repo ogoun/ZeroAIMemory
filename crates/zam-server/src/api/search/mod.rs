@@ -658,9 +658,16 @@ struct SecRow {
     depth: usize,
 }
 
+/// Тестовая точка отказа: разбор исходника с этой строкой паникует (проверка деградации
+/// `expand=section` при панике в `spawn_blocking`).
+#[cfg(test)]
+const PANIC_BUILD_MARK: &str = "\u{1}zam-test-panic-section-build\u{1}";
+
 impl SectionTable {
     /// Разбор исходника (CPU, до `note_max_bytes`): вызывать вне async-потока.
     fn build(src: String) -> Self {
+        #[cfg(test)]
+        assert!(!src.contains(PANIC_BUILD_MARK), "тестовая паника разбора");
         let doc = zam_markdown::parse(&src);
         let secs = (0..doc.sections.len())
             .filter_map(|i| {
@@ -771,12 +778,28 @@ impl SectionTable {
 }
 
 /// Таблицы секций за один запрос `expand=section`: исходник ревизии читается и разбирается
-/// один раз на `(узел, ревизия)`, сколько бы листов этой заметки ни было в окне.
+/// один раз на `(цель поиска, узел, ревизия)`, сколько бы листов этой заметки ни было в окне.
+/// Индекс цели в ключе: один и тот же `(узел, ревизия)` может оказаться в двух базах (копия
+/// базы под другим пользователем). `None` — разбор прерван паникой, элементы узла — без секции.
 #[derive(Default)]
 struct SectionCache {
-    tables: HashMap<(Id, i64), Arc<SectionTable>>,
-    /// Сколько раз разобран исходник (для тестов).
+    tables: HashMap<(usize, Id, i64), Option<Arc<SectionTable>>>,
+    /// Сколько раз разобран исходник.
+    #[cfg(test)]
     builds: usize,
+}
+
+/// Разбор или поиск секции прерван (паника в `spawn_blocking`): WARN в журнал (без текста) и
+/// одно предупреждение ответа; элемент отдаётся с текстом листа.
+fn section_failed(health: &mut Health<'_>, what: &str, e: &tokio::task::JoinError) {
+    tracing::warn!(error = %e, "expand=section: {what} прерван, элемент без секции");
+    if !health
+        .warnings
+        .iter()
+        .any(|w| w == WARN_SECTION_UNAVAILABLE)
+    {
+        health.warnings.push(WARN_SECTION_UNAVAILABLE.into());
+    }
 }
 
 /// Секция листа по исходнику `src` (разбор на каждый вызов — для тестов).
@@ -800,8 +823,9 @@ enum SectionKey {
 /// (`chunk_ids`), а выдача добирается следующими кандидатами окна. Текст секции и соседи
 /// читаются из базы цели элемента.
 ///
-/// Исходник ревизии читается и разбирается один раз на `(узел, ревизия)` (`cache`), разбор и
-/// поиск секции листа — в `spawn_blocking`.
+/// Исходник ревизии читается и разбирается один раз на `(цель, узел, ревизия)` (`cache`),
+/// разбор и поиск секции листа — в `spawn_blocking`; паника там — элемент без секции и
+/// предупреждение `section unavailable`, а не 500 на весь запрос.
 async fn expand_items(
     health: &mut Health<'_>,
     items: Vec<Item>,
@@ -811,7 +835,7 @@ async fn expand_items(
 ) -> Result<Vec<Item>, ApiError> {
     let targets = health.targets;
     let mut out: Vec<Item> = Vec::with_capacity(top_k);
-    let mut sections: HashMap<(TargetRef, SectionKey), usize> = HashMap::new();
+    let mut sections: HashMap<(usize, TargetRef, SectionKey), usize> = HashMap::new();
     for mut it in items {
         if out.len() >= top_k {
             break;
@@ -830,7 +854,7 @@ async fn expand_items(
         };
         let text = match how {
             Expand::Section => {
-                let ck = (it.hit.target.id, it.hit.rev);
+                let ck = (ti, it.hit.target.id, it.hit.rev);
                 let table = match cache.tables.get(&ck) {
                     Some(t) => t.clone(),
                     None => {
@@ -839,22 +863,38 @@ async fn expand_items(
                             drop_target(&mut out, &mut sections, ti);
                             continue;
                         };
-                        let t = tokio::task::spawn_blocking(move || SectionTable::build(s))
+                        let t = match tokio::task::spawn_blocking(move || SectionTable::build(s))
                             .await
-                            .map_err(|e| {
-                                ApiError::Internal(format!("разбор заметки прерван: {e}"))
-                            })?;
-                        let t = Arc::new(t);
-                        cache.builds += 1;
+                        {
+                            Ok(t) => Some(Arc::new(t)),
+                            Err(e) => {
+                                section_failed(health, "разбор заметки", &e);
+                                None
+                            }
+                        };
+                        #[cfg(test)]
+                        {
+                            cache.builds += 1;
+                        }
                         cache.tables.insert(ck, t.clone());
                         t
                     }
                 };
-                let (t, hp, leaf) = (table.clone(), it.hit.heading_path.clone(), base.clone());
-                let sec = tokio::task::spawn_blocking(move || t.locate(&hp, &leaf))
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("поиск секции прерван: {e}")))?;
+                let sec = match &table {
+                    Some(t) => {
+                        let (t, hp, leaf) = (t.clone(), it.hit.heading_path.clone(), base.clone());
+                        match tokio::task::spawn_blocking(move || t.locate(&hp, &leaf)).await {
+                            Ok(sec) => sec,
+                            Err(e) => {
+                                section_failed(health, "поиск секции", &e);
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 let key = (
+                    ti,
                     it.hit.target,
                     sec.as_ref().map_or_else(
                         || SectionKey::Path(it.hit.heading_path.clone()),
@@ -868,7 +908,7 @@ async fn expand_items(
                 }
                 sections.insert(key, out.len());
                 // склеенные чанкером короткие секции: лист может быть длиннее секции
-                match sec.map(|(_, own)| &table.src[own]) {
+                match sec.zip(table.as_deref()).map(|((_, own), t)| &t.src[own]) {
                     Some(sec) if sec.chars().count() >= base.chars().count() => sec.to_string(),
                     _ => base,
                 }
@@ -897,7 +937,7 @@ async fn expand_items(
 /// Убирает из `out` элементы исключённой цели `t` и переиндексирует секции оставшихся.
 fn drop_target(
     out: &mut Vec<Item>,
-    sections: &mut HashMap<(TargetRef, SectionKey), usize>,
+    sections: &mut HashMap<(usize, TargetRef, SectionKey), usize>,
     t: usize,
 ) {
     let mut kept = 0;
@@ -1165,6 +1205,10 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
     }
     line
 }
+
+/// Предупреждение ответа: текст секции (`expand=section`) не получен — разбор или поиск
+/// секции прерван паникой; элемент отдан с текстом листа.
+const WARN_SECTION_UNAVAILABLE: &str = "section unavailable";
 
 /// Состояние целей запроса: какие ещё в выдаче, и предупреждения ответа.
 struct Health<'a> {
@@ -2116,6 +2160,77 @@ mod tests {
         assert!(!text.contains("## Другое"));
     }
 
+    /// Паника разбора или поиска секции в `spawn_blocking` не роняет запрос 500: элемент
+    /// отдаётся без секции (текст листа), в ответе — предупреждение (финальная волна M3,
+    /// ревью fix round 2 задачи 17).
+    #[tokio::test]
+    async fn expand_section_panic_degrades_to_leaf() {
+        let leaf = "Абзац про перенос данных пакетами.".to_string();
+        let content = format!("# Док\n\n## Детали\n\n{leaf}\n\n{PANIC_BUILD_MARK}\n");
+        let (t, node) = note_target("search-expand-panic", content).await;
+        let targets = vec![t];
+        let mut h = Health::new(&targets, Vec::new());
+        let mut cache = SectionCache::default();
+        let its = section_hits(node, "Док > Детали", std::slice::from_ref(&leaf));
+        let out = expand_items(&mut h, its, Expand::Section, 10, &mut cache)
+            .await
+            .expect("без 500");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text.as_ref().unwrap().0, leaf, "текст листа");
+        assert_eq!(h.warnings, [WARN_SECTION_UNAVAILABLE]);
+        assert!(h.alive[0], "цель не исключена");
+    }
+
+    /// Ключ кэша секций и слияния — с индексом цели: один и тот же `(узел, ревизия)` в двух
+    /// базах (копия базы под другим пользователем) не получает таблицу секций чужого
+    /// исходника и не сливается с чужим элементом (ревью fix round 2 задачи 17, Minor 1).
+    #[tokio::test]
+    async fn expand_section_cache_keyed_by_target() {
+        let a_text = "Текст секции базы А.".to_string();
+        let b_text = "Текст секции базы Б, другой.".to_string();
+        let (ta, node) = note_target(
+            "search-expand-two-a",
+            format!("# Док\n\n## Детали\n\n{a_text}\n"),
+        )
+        .await;
+        let (tb, _) = note_target("search-expand-two-b", "# Другая\n".into()).await;
+        let b_src = format!("# Док\n\n## Детали\n\n{b_text}\n");
+        let space = tb.spaces[0].id;
+        tb.db
+            .write(move |tx| {
+                tx.execute(
+                    "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, current_rev,
+                                        index_state, created_at, updated_at)
+                     VALUES (?1, ?2, NULL, 'note', 'копия', 'копия', 1, 'excluded', ?3, ?3)",
+                    (node, space, "2026-10-26T00:00:00Z"),
+                )?;
+                tx.execute(
+                    "INSERT INTO revisions (node_id, rev, content, content_hash, size,
+                                            author_kind, ts)
+                     VALUES (?1, 1, ?2, 'h', ?3, 'agent', ?4)",
+                    (node, &b_src, b_src.len() as i64, "2026-10-26T00:00:00Z"),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let targets = vec![ta, tb];
+        let mut h = Health::new(&targets, Vec::new());
+        let mut cache = SectionCache::default();
+        let mut its = section_hits(node, "Док > Детали", &[a_text.clone(), b_text.clone()]);
+        its[1].target = 1;
+        let out = expand_items(&mut h, its, Expand::Section, 10, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "разные базы не сливаются");
+        assert!(out[0].text.as_ref().unwrap().0.contains(&a_text));
+        assert!(
+            out[1].text.as_ref().unwrap().0.contains(&b_text),
+            "своя таблица секций"
+        );
+        assert_eq!(cache.builds, 2);
+    }
+
     /// Замер `expand=section` (ревью fix round 1 задачи 17): заметка ~1 МБ без H1–H3,
     /// 300 кандидатов окна из её конца. Запуск:
     /// `cargo test -p zam-server --release --lib bench_expand_section_big_note -- --ignored --nocapture`.
@@ -2201,16 +2316,16 @@ mod tests {
             false,
         );
         out[1].target = 1;
-        let mut sections: HashMap<(TargetRef, SectionKey), usize> = out
+        let mut sections: HashMap<(usize, TargetRef, SectionKey), usize> = out
             .iter()
             .enumerate()
-            .map(|(i, it)| ((it.hit.target, SectionKey::At(i)), i))
+            .map(|(i, it)| ((it.target, it.hit.target, SectionKey::At(i)), i))
             .collect();
         drop_target(&mut out, &mut sections, 1);
         assert_eq!(out.len(), 2);
         assert_eq!(sections.len(), 2);
-        assert_eq!(sections[&(out[0].hit.target, SectionKey::At(0))], 0);
-        assert_eq!(sections[&(out[1].hit.target, SectionKey::At(2))], 1);
+        assert_eq!(sections[&(0, out[0].hit.target, SectionKey::At(0))], 0);
+        assert_eq!(sections[&(0, out[1].hit.target, SectionKey::At(2))], 1);
     }
 
     #[test]
