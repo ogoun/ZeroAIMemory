@@ -51,8 +51,8 @@ pub use entries::{
     title_duplicates, update_entry, validate_trigger,
 };
 pub use graph::{
-    EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, Graph, GraphNode, GraphStore, NewEdge,
-    get_edge, graph_node, graph_nodes,
+    EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,
+    GraphNode, GraphStore, NewEdge, get_edge, graph_node, graph_nodes,
 };
 pub use jobs::{
     EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats,

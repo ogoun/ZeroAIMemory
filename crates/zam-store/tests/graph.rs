@@ -797,3 +797,56 @@ async fn deleted_source_edges_skipped_by_tree_changed() {
     restore_node(&db, a, AuthorKind::Agent).await.unwrap();
     assert_eq!(dst_of(&db, n(a), "[[Позже]]").await, Some(n(later)));
 }
+
+/// Подграф ограничен [`GRAPH_MAX_NODES`] узлами и [`GRAPH_MAX_EDGES`] рёбрами с признаком
+/// `truncated` (финальная волна M3, ревью задачи 10): узел-хаб не отдаёт весь граф.
+#[tokio::test]
+async fn neighbors_capped_with_truncated() {
+    use zam_store::{GRAPH_MAX_EDGES, GRAPH_MAX_NODES};
+    let (db, k) = setup("neighbors-cap").await;
+    let hub = note(&db, k, "хаб", "хаб\n").await;
+    let small = note(&db, k, "малый", "[[хаб]]\n").await;
+    let spaces = all_spaces(&db).await;
+    let g = db.neighbors(&[n(small)], 1, &[], &spaces).await.unwrap();
+    assert_eq!((g.nodes.len(), g.edges.len(), g.truncated), (2, 1, false));
+    // хаб: связи с GRAPH_MAX_NODES + 50 заметками и GRAPH_MAX_EDGES + 50 повторными рёбрами
+    // к первой из них (прямой вставкой: тысячи записей заметок на HDD — минуты)
+    const TS: &str = "2026-10-26T00:00:00Z";
+    let extra = GRAPH_MAX_NODES + 50;
+    let dups = GRAPH_MAX_EDGES + 50;
+    db.write(move |tx| {
+        let mut first = None;
+        for i in 0..extra {
+            let id = Id::new();
+            first.get_or_insert(id);
+            tx.execute(
+                "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, index_state,
+                                    created_at, updated_at)
+                 VALUES (?1, ?2, NULL, 'note', ?3, ?3, 'excluded', ?4, ?4)",
+                rusqlite::params![id, k, format!("лист{i}"), TS],
+            )?;
+            tx.execute(
+                "INSERT INTO edges (id, space_id, src_kind, src_id, dst_kind, dst_id,
+                                    dst_space_id, type, origin, created_at)
+                 VALUES (?1, ?2, 'node', ?3, 'node', ?4, ?2, 'links_to', 'wikilink', ?5)",
+                rusqlite::params![Id::new(), k, hub, id, TS],
+            )?;
+        }
+        for _ in 0..dups {
+            tx.execute(
+                "INSERT INTO edges (id, space_id, src_kind, src_id, dst_kind, dst_id,
+                                    dst_space_id, type, origin, created_at)
+                 VALUES (?1, ?2, 'node', ?3, 'node', ?4, ?2, 'links_to', 'wikilink', ?5)",
+                rusqlite::params![Id::new(), k, hub, first.unwrap(), TS],
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let g = db.neighbors(&[n(hub)], 1, &[], &spaces).await.unwrap();
+    assert!(g.truncated);
+    assert_eq!(g.nodes.len(), GRAPH_MAX_NODES);
+    assert_eq!(g.nodes[0].r, n(hub), "начало обхода — первым");
+    assert_eq!(g.edges.len(), GRAPH_MAX_EDGES);
+}

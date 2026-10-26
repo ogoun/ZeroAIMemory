@@ -305,7 +305,8 @@ fn start_ref(node: Option<&str>, entry: Option<&str>) -> Result<TargetRef, ApiEr
     })
 }
 
-/// `GET /graph?node=|entry=&depth=&types=` → `{nodes, edges}`.
+/// `GET /graph?node=|entry=&depth=&types=` → `{nodes, edges, truncated}` (`truncated` —
+/// подграф обрезан пределами `zam_store::GRAPH_MAX_NODES` / `GRAPH_MAX_EDGES`).
 pub async fn graph(
     State(st): State<AppState>,
     p: Principal,
@@ -324,7 +325,9 @@ pub async fn graph(
     let t = live_target(&st, &p, &headers, start, Mode::Read).await?;
     let spaces = graph_spaces(&p, &t.db, &t.space, t.role).await?;
     let g = t.db.neighbors(&[t.r], depth, &types, &spaces).await?;
-    Ok(Json(json!({ "nodes": g.nodes, "edges": g.edges })))
+    Ok(Json(
+        json!({ "nodes": g.nodes, "edges": g.edges, "truncated": g.truncated }),
+    ))
 }
 
 #[derive(Deserialize)]

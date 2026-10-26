@@ -49,6 +49,14 @@ use crate::{Db, StoreError};
 /// Предел глубины обхода [`GraphStore::neighbors`].
 pub const GRAPH_DEPTH_MAX: u8 = 3;
 
+/// Предел узлов подграфа [`GraphStore::neighbors`] **[решение исполнителя]**: ближние к началу
+/// обхода (по глубине, затем по виду и id) — первыми; сверх предела — `truncated`. 500 узлов —
+/// порядок, который ещё читается в WebUI (раскладка elk) и в `expand=graph`.
+pub const GRAPH_MAX_NODES: usize = 500;
+
+/// Предел рёбер подграфа (по порядку создания) — сверх него `truncated`.
+pub const GRAPH_MAX_EDGES: usize = 2000;
+
 /// Тип связи (§8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -193,6 +201,8 @@ pub struct GraphNode {
 pub struct Graph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<EdgeView>,
+    /// Узлы или рёбра обрезаны пределами [`GRAPH_MAX_NODES`] и [`GRAPH_MAX_EDGES`].
+    pub truncated: bool,
 }
 
 /// Новое явное ребро.
@@ -207,8 +217,9 @@ pub struct NewEdge {
 /// возвращаются (пустая — ничего).
 pub trait GraphStore: Send + Sync {
     /// Связный подграф вокруг `start` на `depth` шагов (1..=3) в обе стороны по рёбрам типов
-    /// `types` (пусто — любые): узлы и все видимые рёбра между ними. Глубина вне 1..=3 —
-    /// `BadInput`.
+    /// `types` (пусто — любые): узлы и все видимые рёбра между ними, не больше
+    /// [`GRAPH_MAX_NODES`] узлов (ближние — первыми) и [`GRAPH_MAX_EDGES`] рёбер, сверх —
+    /// `truncated`. Глубина вне 1..=3 — `BadInput`.
     fn neighbors(
         &self,
         start: &[TargetRef],
@@ -497,11 +508,14 @@ fn neighbors_sync(
              JOIN edges e ON e.dst_kind = w.kind AND e.dst_id = w.id
              WHERE w.d < ?2 AND {tf} AND {vis}
          )
-         SELECT kind, id, min(d) FROM walk GROUP BY kind, id ORDER BY min(d), kind, id"
+         SELECT kind, id, min(d) FROM walk GROUP BY kind, id ORDER BY min(d), kind, id
+         LIMIT ?5"
     );
     let mut st = c.prepare_cached(&sql)?;
-    let found: Vec<(TargetRef, i64)> = st
-        .query_map(params![json_refs(start), depth, sp, ty], |r| {
+    // на один больше предела: так видно, что узлы обрезаны
+    let limit = (GRAPH_MAX_NODES + 1) as i64;
+    let mut found: Vec<(TargetRef, i64)> = st
+        .query_map(params![json_refs(start), depth, sp, ty, limit], |r| {
             let k: String = r.get(0)?;
             Ok((
                 TargetRef {
@@ -512,6 +526,8 @@ fn neighbors_sync(
             ))
         })?
         .collect::<Result<_, _>>()?;
+    let mut truncated = found.len() > GRAPH_MAX_NODES;
+    found.truncate(GRAPH_MAX_NODES);
     let order: HashMap<TargetRef, usize> = found
         .iter()
         .enumerate()
@@ -534,15 +550,22 @@ fn neighbors_sync(
          ORDER BY e.created_at, e.rowid"
     ))?;
     let present_refs: Vec<TargetRef> = nodes.iter().map(|n| n.r).collect();
-    let edges: Vec<EdgeView> = st
+    let mut edges: Vec<EdgeView> = st
         .query_map(params![json_refs(&present_refs), depth, sp, ty], edge_row)?
         .filter_map(|e| match e {
             Ok(e) if e.dst.is_some_and(|d| present.contains(&d)) => Some(Ok(e)),
             Ok(_) => None,
             Err(err) => Some(Err(err)),
         })
+        .take(GRAPH_MAX_EDGES + 1)
         .collect::<Result<_, _>>()?;
-    Ok(Graph { nodes, edges })
+    truncated |= edges.len() > GRAPH_MAX_EDGES;
+    edges.truncate(GRAPH_MAX_EDGES);
+    Ok(Graph {
+        nodes,
+        edges,
+        truncated,
+    })
 }
 
 fn backlinks_sync(
