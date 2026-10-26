@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::search::{FtsQuery, MARK_END, MARK_START, sanitize_fts, search_fts};
 use zam_store::time::fmt_ts;
 use zam_store::{
@@ -784,12 +784,17 @@ async fn neighbors_of_leaf() {
     assert!(leaves.len() >= 3, "{}", leaves.len());
     // пакетный вариант: узел без листов в ответ не входит
     let other = add(&db, k, "short", "# Короткая\n\nтекст\n").await;
-    let many = zam_store::leaves_of_nodes(&db, vec![n, other, Id::new()], true)
+    let node = |id| TargetRef {
+        kind: TargetKind::Node,
+        id,
+    };
+    let (tn, tother) = (node(n), node(other));
+    let many = zam_store::leaves_of_targets(&db, vec![tn, tother, node(Id::new())], true)
         .await
         .unwrap();
     assert_eq!(many.len(), 2);
-    assert_eq!(many[&n], leaves);
-    assert_eq!(many[&other].len(), 1);
+    assert_eq!(many[&tn], leaves);
+    assert_eq!(many[&tother].len(), 1);
     // ключ кэша листа — та же формула, что у воркера
     for l in &leaves {
         assert_eq!(
@@ -798,17 +803,17 @@ async fn neighbors_of_leaf() {
         );
     }
     // без текста — те же листы и ключи, пустые text и context_prefix
-    let bare = zam_store::leaves_of_nodes(&db, vec![n], false)
+    let bare = zam_store::leaves_of_targets(&db, vec![tn], false)
         .await
         .unwrap();
-    assert_eq!(bare[&n].len(), leaves.len());
+    assert_eq!(bare[&tn].len(), leaves.len());
     assert!(
-        bare[&n]
+        bare[&tn]
             .iter()
             .all(|l| l.text.is_empty() && l.context_prefix.is_empty())
     );
     assert!(
-        bare[&n]
+        bare[&tn]
             .iter()
             .zip(&leaves)
             .all(|(b, l)| b.embed_key == l.embed_key)
@@ -816,7 +821,7 @@ async fn neighbors_of_leaf() {
     // совпадения слов запроса по листам — через индекс FTS
     let hits = zam_store::leaf_term_hits(
         &db,
-        vec![n, other],
+        vec![tn, tother],
         vec![
             "второе".into(),
             "третье".into(),
@@ -826,7 +831,7 @@ async fn neighbors_of_leaf() {
     )
     .await
     .unwrap();
-    for l in leaves.iter().chain(&many[&other]) {
+    for l in leaves.iter().chain(&many[&tother]) {
         let want = ["второе", "третье", "текст"]
             .iter()
             .filter(|w| l.text.contains(*w))
@@ -866,4 +871,48 @@ fn needles_identifiers_then_words() {
             "git"
         ]
     );
+}
+
+#[tokio::test]
+async fn entry_leaves_and_term_hits() {
+    // листы записи журнала для замены её сводки (финальная волна M3, задача 6)
+    let (db, k, _) = setup("entry-leaves").await;
+    let filler = "текст ".repeat(400);
+    let (e, _) = zam_store::create_entry(
+        &db,
+        zam_store::NewEntry {
+            space_id: k,
+            kind: zam_store::EntryKind::Insight,
+            title: "Две части".into(),
+            body: format!("## Первая\n\nальфаслово {filler}\n\n## Вторая\n\nбетаслово {filler}\n"),
+            data: serde_json::json!({"kind": "gotcha"}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: None,
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &attrib(),
+    )
+    .await
+    .unwrap();
+    let t = TargetRef {
+        kind: TargetKind::Entry,
+        id: e.id,
+    };
+    let leaves = zam_store::leaves_of_targets(&db, vec![t], true)
+        .await
+        .unwrap()
+        .remove(&t)
+        .unwrap();
+    assert!(leaves.len() >= 2, "{leaves:?}");
+    assert!(leaves.windows(2).all(|w| w[0].ordinal < w[1].ordinal));
+    let hits = zam_store::leaf_term_hits(&db, vec![t], vec!["бетаслово".into()])
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].target, t);
+    assert!(hits[0].heading_path.ends_with("Вторая"), "{hits:?}");
 }

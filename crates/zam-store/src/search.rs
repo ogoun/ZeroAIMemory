@@ -799,7 +799,7 @@ pub async fn live_folders(
     .await
 }
 
-/// Лист заметки для замены сводки (§9.2 п. 6).
+/// Лист заметки или записи журнала для замены сводки (§9.2 п. 6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafChunk {
     pub chunk_id: String,
@@ -813,38 +813,51 @@ pub struct LeafChunk {
 
 /// Листы (`level = 'chunk'`) узла по порядку.
 pub async fn node_leaves(db: &Db, node: Id) -> Result<Vec<LeafChunk>, StoreError> {
-    Ok(leaves_of_nodes(db, vec![node], true)
+    let t = TargetRef {
+        kind: TargetKind::Node,
+        id: node,
+    };
+    Ok(leaves_of_targets(db, vec![t], true)
         .await?
-        .remove(&node)
+        .remove(&t)
         .unwrap_or_default())
 }
 
-/// Листы нескольких узлов одним запросом: `узел → листы по порядку`; узла без листов
-/// в ответе нет (замена сводок листами в поиске — без запроса на каждую сводку).
-/// `with_text = false` — без `text` и `context_prefix` (пустые строки): тексты сотен
-/// листов не читаются, если нужны только пути, порядок и ключи кэша эмбеддингов.
-pub async fn leaves_of_nodes(
+/// Листы нескольких целей (узлов и записей журналов) одним чтением: `цель → листы по
+/// порядку`; цели без листов в ответе нет (замена сводок листами в поиске — без запроса на
+/// каждую сводку). `with_text = false` — без `text` и `context_prefix` (пустые строки):
+/// тексты сотен листов не читаются, если нужны только пути, порядок и ключи кэша эмбеддингов.
+pub async fn leaves_of_targets(
     db: &Db,
-    nodes: Vec<Id>,
+    targets: Vec<TargetRef>,
     with_text: bool,
-) -> Result<HashMap<Id, Vec<LeafChunk>>, StoreError> {
-    if nodes.is_empty() {
+) -> Result<HashMap<TargetRef, Vec<LeafChunk>>, StoreError> {
+    if targets.is_empty() {
         return Ok(HashMap::new());
     }
     db.read(move |c| {
-        // один снимок и один подготовленный запрос по индексу `chunks_node` на узел:
-        // соединение с json_each здесь медленнее (сортировка всех листов)
+        // один снимок и один подготовленный запрос по индексу `chunks_node` (`chunks_entry`)
+        // на цель: соединение с json_each здесь медленнее (сортировка всех листов)
         let tx = c.unchecked_transaction()?;
-        let mut st = tx.prepare_cached(
-            "SELECT id, heading_path, ordinal,
-                    CASE WHEN ?2 THEN text ELSE '' END,
-                    CASE WHEN ?2 THEN context_prefix ELSE '' END,
-                    embed_key
-             FROM chunks WHERE node_id = ?1 AND level = 'chunk' ORDER BY ordinal",
-        )?;
-        let mut out: HashMap<Id, Vec<LeafChunk>> = HashMap::new();
-        for node in nodes {
-            let rows = st.query_map(params![node, with_text], |r| {
+        let sql = |col: &str| {
+            format!(
+                "SELECT id, heading_path, ordinal,
+                        CASE WHEN ?2 THEN text ELSE '' END,
+                        CASE WHEN ?2 THEN context_prefix ELSE '' END,
+                        embed_key
+                 FROM chunks WHERE {col} = ?1 AND {col} IS NOT NULL AND level = 'chunk'
+                 ORDER BY ordinal"
+            )
+        };
+        let mut by_node = tx.prepare_cached(&sql("node_id"))?;
+        let mut by_entry = tx.prepare_cached(&sql("entry_id"))?;
+        let mut out: HashMap<TargetRef, Vec<LeafChunk>> = HashMap::new();
+        for t in targets {
+            let st = match t.kind {
+                TargetKind::Node => &mut by_node,
+                TargetKind::Entry => &mut by_entry,
+            };
+            let rows = st.query_map(params![t.id, with_text], |r| {
                 Ok(LeafChunk {
                     chunk_id: r.get(0)?,
                     heading_path: r.get(1)?,
@@ -857,7 +870,7 @@ pub async fn leaves_of_nodes(
             })?;
             let leaves: Vec<LeafChunk> = rows.collect::<Result<_, _>>()?;
             if !leaves.is_empty() {
-                out.insert(node, leaves);
+                out.insert(t, leaves);
             }
         }
         Ok(out)
@@ -901,10 +914,11 @@ pub async fn first_leaves(
     .await
 }
 
-/// Лист узла с числом найденных в нём слов запроса ([`leaf_term_hits`]).
+/// Лист цели (узла или записи журнала) с числом найденных в нём слов запроса
+/// ([`leaf_term_hits`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafHit {
-    pub node_id: Id,
+    pub target: TargetRef,
     pub chunk_id: String,
     pub heading_path: String,
     pub ordinal: i64,
@@ -912,11 +926,11 @@ pub struct LeafHit {
     pub hits: usize,
 }
 
-/// Листы узлов `nodes`, в которых FTS5 находит слова запроса (`needles`, каждое — как
-/// запрос [`sanitize_fts`]), с числом найденных слов; по узлу и `ordinal`. Листы без
-/// совпадений в ответ не входят. Тексты не читаются; в одной читающей транзакции: листы
-/// узлов (по индексу `chunks_node`) и по одному проходу индекса FTS на слово — только
-/// `rowid` совпадений, пересечение с листами — в памяти.
+/// Листы целей `targets` (узлов и записей журналов), в которых FTS5 находит слова запроса
+/// (`needles`, каждое — как запрос [`sanitize_fts`]), с числом найденных слов; по цели и
+/// `ordinal`. Листы без совпадений в ответ не входят. Тексты не читаются; в одной читающей
+/// транзакции: листы целей (по индексам `chunks_node` и `chunks_entry`) и по одному проходу
+/// индекса FTS на слово — только `rowid` совпадений, пересечение с листами — в памяти.
 ///
 /// Соединение совпадений с `chunks` и фильтр по узлам в SQL (как было) читали строку
 /// `chunks` на каждое совпадение: на 10 тыс. заметок частое слово («и», «the») — 16 тыс.
@@ -925,34 +939,59 @@ pub struct LeafHit {
 /// частое слово (замеры `cargo xtask bench`, задача 15 M2).
 pub async fn leaf_term_hits(
     db: &Db,
-    nodes: Vec<Id>,
+    targets: Vec<TargetRef>,
     needles: Vec<String>,
 ) -> Result<Vec<LeafHit>, StoreError> {
-    if nodes.is_empty() || needles.is_empty() {
+    if targets.is_empty() || needles.is_empty() {
         return Ok(Vec::new());
     }
-    let list =
-        serde_json::Value::from(nodes.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    let list = |kind: TargetKind| {
+        serde_json::Value::from(
+            targets
+                .iter()
+                .filter(|t| t.kind == kind)
+                .map(|t| t.id.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .to_string()
+    };
+    let lists = [
+        (TargetKind::Node, list(TargetKind::Node)),
+        (TargetKind::Entry, list(TargetKind::Entry)),
+    ];
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
-        let mut st = tx.prepare_cached(
-            "SELECT c.seq, c.id, c.node_id, c.heading_path, c.ordinal FROM chunks c
-             WHERE c.level = 'chunk' AND c.node_id IN (SELECT value FROM json_each(?1))",
-        )?;
-        let mut leaves: HashMap<i64, LeafHit> = st
-            .query_map([&list], |r| {
+        let mut leaves: HashMap<i64, LeafHit> = HashMap::new();
+        for (kind, list) in &lists {
+            let col = match kind {
+                TargetKind::Node => "node_id",
+                TargetKind::Entry => "entry_id",
+            };
+            let mut st = tx.prepare_cached(&format!(
+                "SELECT c.seq, c.id, c.{col}, c.heading_path, c.ordinal FROM chunks c
+                 WHERE c.level = 'chunk' AND c.{col} IS NOT NULL
+                   AND c.{col} IN (SELECT value FROM json_each(?1))"
+            ))?;
+            let rows = st.query_map([list], |r| {
                 Ok((
                     r.get(0)?,
                     LeafHit {
                         chunk_id: r.get(1)?,
-                        node_id: r.get(2)?,
+                        target: TargetRef {
+                            kind: *kind,
+                            id: r.get(2)?,
+                        },
                         heading_path: r.get(3)?,
                         ordinal: r.get(4)?,
                         hits: 0,
                     },
                 ))
-            })?
-            .collect::<Result<_, _>>()?;
+            })?;
+            for row in rows {
+                let (seq, hit) = row?;
+                leaves.insert(seq, hit);
+            }
+        }
         if leaves.is_empty() {
             return Ok(Vec::new());
         }
@@ -968,7 +1007,7 @@ pub async fn leaf_term_hits(
             }
         }
         let mut v: Vec<LeafHit> = leaves.into_values().filter(|l| l.hits > 0).collect();
-        v.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(a.ordinal.cmp(&b.ordinal)));
+        v.sort_by(|a, b| a.target.cmp(&b.target).then(a.ordinal.cmp(&b.ordinal)));
         Ok(v)
     })
     .await

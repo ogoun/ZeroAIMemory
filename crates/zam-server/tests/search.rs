@@ -319,6 +319,41 @@ async fn summary_replaced_by_leaf_with_most_query_words() {
 }
 
 #[tokio::test]
+async fn entry_summary_replaced_by_leaf_with_most_query_words() {
+    // то же для записи журнала с несколькими листами (финальная волна M3, задача 6): все три
+    // слова вместе — только в L1 записи (`note`)
+    let a = api("search-entry-summary", |_| {}).await;
+    let filler = "текст ".repeat(80);
+    let body = format!(
+        "## Первая\n\nАльфаслово открывает раздел. {filler}\n\n## Вторая\n\n\
+         Бетаслово и гаммаслово открывают раздел. {filler}\n"
+    );
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(json!({"kind": "insight", "title": "Две части",
+                        "body": body, "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = search(&a, json!({"query": "альфаслово бетаслово гаммаслово"}))
+        .await
+        .json();
+    let items = j["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{j}");
+    assert!(items[0]["entry_id"].is_string(), "{j}");
+    assert_eq!(items[0]["level"], "chunk", "{j}");
+    assert!(
+        items[0]["heading_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("Вторая"),
+        "{j}"
+    );
+}
+
+#[tokio::test]
 async fn md_empty_result_still_reports_degraded() {
     let a = api("search-md-empty", |_| {}).await;
     corpus(&a).await;

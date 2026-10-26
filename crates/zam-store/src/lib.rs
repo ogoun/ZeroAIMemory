@@ -73,7 +73,7 @@ pub use nodes::{
 pub use paths::{NodePath, path_ancestors};
 pub use search::{
     ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END,
-    MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_nodes, live_chunks,
+    MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_targets, live_chunks,
     live_folders, neighbor_leaves, node_leaves, pending_count, query_needles, sanitize_fts,
     search_fts, search_fts_channels, text_snippet,
 };

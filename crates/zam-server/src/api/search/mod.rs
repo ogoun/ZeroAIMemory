@@ -163,7 +163,7 @@ use zam_search::{
 use zam_store::time::fmt_ts;
 use zam_store::{
     ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
-    TargetFilter, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_nodes,
+    TargetFilter, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_targets,
     live_chunks, live_folders, neighbor_leaves, node_content, pending_count, query_needles,
     search_fts_channels, text_snippet,
 };
@@ -457,7 +457,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Лист для каждой сводки из `summaries` (у них нет подходящего листа в выдаче):
 /// `chunk_id сводки → лист`. Кандидаты — листы секции сводки (`section`) или всей
-/// заметки (`note`):
+/// цели (`note` заметки или записи журнала):
 /// - с вектором запроса — ближайший по косинусу среди листов с эмбеддингом в кэше;
 /// - иначе (или без эмбеддингов) — лист, где FTS находит больше всего слов запроса
 ///   ([`query_needles`]), при равенстве — первый; ни одного — сводка остаётся как есть
@@ -465,35 +465,29 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Всё пакетно, без запроса на каждую сводку и без чтения текстов листов: совпадения
 /// слов — по индексу FTS; при векторе — пути и ключи кэша (`chunks.embed_key`) листов
-/// всех узлов одним чтением, эмбеддинги листов-кандидатов — одним `get_embeddings`.
+/// всех целей одним чтением, эмбеддинги листов-кандидатов — одним `get_embeddings`.
 async fn best_leaves(
     db: &Db,
     summaries: &[&Ranked],
     needles: &[String],
     query: Option<(&[f32], &str)>,
 ) -> Result<HashMap<String, LeafRef>, ApiError> {
-    // сводки есть только у узлов
-    let summaries: Vec<&Ranked> = summaries
-        .iter()
-        .copied()
-        .filter(|r| r.target.kind == TargetKind::Node)
-        .collect();
-    let mut nodes: Vec<Id> = summaries.iter().map(|r| r.target.id).collect();
-    nodes.sort();
-    nodes.dedup();
-    if nodes.is_empty() {
+    let mut targets: Vec<TargetRef> = summaries.iter().map(|r| r.target).collect();
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
         return Ok(HashMap::new());
     }
     let fits = |r: &Ranked, hp: &str| r.level == Level::Note || in_section(hp, &r.heading_path);
     let mut out: HashMap<String, LeafRef> = HashMap::new();
     if let Some((q, model)) = query {
         // пути и ключи кэша листов без текстов; эмбеддинги — только листов-кандидатов
-        let leaves = leaves_of_nodes(db, nodes.clone(), false).await?;
+        let leaves = leaves_of_targets(db, targets.clone(), false).await?;
         let mut need: Vec<String> = summaries
             .iter()
             .flat_map(|r| {
                 leaves
-                    .get(&r.target.id)
+                    .get(&r.target)
                     .into_iter()
                     .flatten()
                     .filter(|l| fits(r, &l.heading_path) && !l.embed_key.is_empty())
@@ -503,9 +497,9 @@ async fn best_leaves(
         need.sort();
         need.dedup();
         let embs = get_embeddings(db, model, &need).await?;
-        for r in &summaries {
+        for r in summaries {
             let best = leaves
-                .get(&r.target.id)
+                .get(&r.target)
                 .into_iter()
                 .flatten()
                 .filter(|l| fits(r, &l.heading_path))
@@ -527,16 +521,16 @@ async fn best_leaves(
     }
     // без вектора или без эмбеддингов в кэше — по словам запроса
     if summaries.iter().any(|r| !out.contains_key(&r.chunk_id)) {
-        let hits = leaf_term_hits(db, nodes, needles.to_vec()).await?;
-        for r in &summaries {
+        let hits = leaf_term_hits(db, targets, needles.to_vec()).await?;
+        for r in summaries {
             if out.contains_key(&r.chunk_id) {
                 continue;
             }
-            // по узлу и ordinal: при равном числе совпадений остаётся первый лист
+            // по цели и ordinal: при равном числе совпадений остаётся первый лист
             let mut best: Option<&LeafHit> = None;
             for h in hits
                 .iter()
-                .filter(|h| h.node_id == r.target.id && fits(r, &h.heading_path))
+                .filter(|h| h.target == r.target && fits(r, &h.heading_path))
             {
                 if best.is_none_or(|b| h.hits > b.hits) {
                     best = Some(h);
