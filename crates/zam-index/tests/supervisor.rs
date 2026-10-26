@@ -108,6 +108,14 @@ fn wait_gone(pid: u32, limit: Duration) -> bool {
 }
 
 const READY_LIMIT: Duration = Duration::from_secs(10);
+/// Предел повторного старта сразу после создания коллекции. Записи идут клиентом без
+/// отметки супервизора (`QdrantIndex::connect`, не `connect_index`), поэтому остановка не
+/// ждёт подтверждения WAL, и старт повторяет WAL создания коллекции с 12 payload-индексами
+/// и синхронно сбрасывает сегменты: на HDD 7,5 с в одиночном прогоне и больше 10 с в
+/// полном `cargo test --workspace` (задача 20 M3). Для Windows (`TerminateProcess`) это
+/// сценарий жёсткой остановки после записи, целью §17 (5 с) не покрытый; время старта
+/// мерит `cargo xtask bench --scenario first-start`, здесь проверяется сам перезапуск.
+const RESTART_LIMIT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_ready_restart_with_collection_and_clean_shutdown() {
@@ -180,13 +188,13 @@ async fn start_ready_restart_with_collection_and_clean_shutdown() {
         "{status:?}"
     );
 
-    // Повторный старт с существующей коллекцией: время до Ready (§17 ≤ 5 с).
+    // Повторный старт с существующей коллекцией (время печатается; предел — RESTART_LIMIT).
     let t1 = Instant::now();
     let sup = Supervisor::start(SupervisorConfig::Managed(cfg.clone()), &dir)
         .await
         .unwrap();
     let mut rx = sup.state();
-    wait_state(&mut rx, READY_LIMIT, "Ready (повтор)", is_ready).await;
+    wait_state(&mut rx, RESTART_LIMIT, "Ready (повтор)", is_ready).await;
     let warm = t1.elapsed();
     eprintln!(
         "TIME_TO_READY cold={} ms, with_collection={} ms",
@@ -666,7 +674,7 @@ async fn config_renders_flush_interval_and_wal() {
         .await
         .unwrap();
     let mut rx = sup.state();
-    wait_state(&mut rx, READY_LIMIT, "Ready (повтор)", is_ready).await;
+    wait_state(&mut rx, RESTART_LIMIT, "Ready (повтор)", is_ready).await;
     let idx = sup.connect_index().unwrap();
     let meta = idx
         .ensure(common::cases::MODEL, common::cases::DIM)
