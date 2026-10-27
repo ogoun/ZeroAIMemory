@@ -247,7 +247,8 @@ fn resolve_in_root(root: &Path, path: &Path) -> Result<PathBuf, CliError> {
                         .map(|t| format!(" → {}", t.display()))
                         .unwrap_or_default();
                     return Err(CliError::config(format!(
-                        "{name}: висячая символическая ссылка {}{link} ({e}) — zam init её не                          заменяет; исправьте или удалите ссылку",
+                        "{name}: висячая символическая ссылка {}{link} ({e}) — zam init её не \
+                         заменяет; исправьте или удалите ссылку",
                         rel(root, base)
                     )));
                 }
@@ -260,7 +261,8 @@ fn resolve_in_root(root: &Path, path: &Path) -> Result<PathBuf, CliError> {
     };
     if !target.starts_with(&croot) {
         return Err(CliError::config(format!(
-            "{name}: символическая ссылка ведёт за пределы проекта ({}) — zam init пишет только              внутри корня проекта; замените ссылку обычным файлом или удалите её",
+            "{name}: символическая ссылка ведёт за пределы проекта ({}) — zam init пишет только \
+             внутри корня проекта; замените ссылку обычным файлом или удалите её",
             target.display()
         )));
     }
@@ -387,14 +389,17 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         old.as_deref(),
         merge::gitignore(old.as_deref()),
     ));
-    // временные файлы прерванных запусков (N-4)
+    // временные файлы прерванных запусков (N-4); каталог-симлинк не обходится — он может
+    // вести за пределы проекта (F1)
+    remove_stale_tmp(&root);
     for d in [
-        root.clone(),
         root.join(".zeroaimemory"),
         root.join(".claude"),
         root.join(".codex"),
     ] {
-        remove_stale_tmp(&d);
+        if std::fs::symlink_metadata(&d).is_ok_and(|m| !m.file_type().is_symlink()) {
+            remove_stale_tmp(&d);
+        }
     }
     // токен прежнего блока (v1) того файла, где блок заменяется (I-6); у `both` — из любого
     // из двух, разные — предупреждение, берётся из первого (N-6)
