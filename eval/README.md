@@ -382,7 +382,7 @@ frontmatter), запросы — в `queries.toml` с уникальным `id`.
 **Прогоны M4** (задача 15, 2026-10-27/28, умолчания M4: λ = 0, бусты после реранка) —
 `results/2026-10-28-*-m4-final.*` (FTS, гибрид int8 CPU; `--compare` с `*-m3-final`), гейт на
 точном поиске — `results/2026-10-28-quality-gate.*`, подсказки и токены —
-`results/2026-10-27-bge-m3-int8-{hints,tokens}.*`, контрольный замер Qdrant —
+`results/2026-10-28-bge-m3-int8-{hints,tokens}.*`, контрольный замер Qdrant —
 `results/2026-10-27-m4-bench-first-start-gpu.*`; сводка и выводы —
 `results/2026-10-28-m4-summary.md`.
 
