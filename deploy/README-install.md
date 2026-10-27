@@ -706,7 +706,7 @@ jina — модель с динамическим int8: пары «запрос 
    `data_dir` — от каталога `zam-server.exe`. `service install --print` показывает параметры,
    ничего не регистрируя. Консоли у службы нет: журнал — в `<data_dir>\logs\zam-server.log.*`,
    ошибка до журнала (конфиг не читается) — в `zam-server-service-error.log`, первый токен
-   администратора — в `<data_dir>irst-admin-token.txt` (прочитайте и удалите файл). Пароль
+   администратора — в `<data_dir>/first-admin-token.txt` (прочитайте и удалите файл). Пароль
    администратора службе — только `[admin] password_hash` в конфиге (`ZAM_ADMIN_PASSWORD` из вашей
    консоли служба не видит). `service stop` дожидается штатного выхода сервера, `service
    uninstall` останавливает и удаляет службу. `zam-server service run` вручную не вызывается
