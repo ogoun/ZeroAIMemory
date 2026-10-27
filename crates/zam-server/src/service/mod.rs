@@ -169,7 +169,10 @@ pub fn load_config(
     config: Option<&Path>,
     cli: &CliOverrides,
 ) -> Result<ServerConfig, ServiceError> {
-    let env: Vec<(String, String)> = std::env::vars().collect();
+    // `vars()` паникует на не-Unicode значении: такие переменные пропускаются
+    let env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
     let cfg = crate::config::load(config, &env, cli)
         .map_err(|e| ServiceError::usage(format!("конфигурация: {e}")))?;
     zam_store::check_data_dir_len(&cfg.data_dir).map_err(|e| ServiceError::usage(e.to_string()))?;
@@ -220,7 +223,7 @@ pub fn install(a: InstallArgs) -> Result<(), ServiceError> {
     let exe_dir = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
     let config = resolve_config(a.config.as_deref(), &exe_dir)?;
     let cfg = load_config(Some(&config), &CliOverrides::default())?;
-    warn_env_not_inherited(std::env::vars().map(|(k, _)| k));
+    warn_env_not_inherited(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()));
     let timeout = stop_timeout(cfg.qdrant.shutdown_flush_wait_ms);
     // относительные пути конфига — от рабочего каталога службы (каталог exe)
     let data_dir = absolute_in(&exe_dir, &cfg.data_dir);

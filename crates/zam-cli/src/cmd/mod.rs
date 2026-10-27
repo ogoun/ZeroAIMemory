@@ -109,7 +109,9 @@ pub fn connect(c: &Common) -> Result<Ctx, CliError> {
 fn agent_session(cwd: &std::path::Path) -> Option<String> {
     hook::agent_session_from(
         |k| std::env::var(k).ok(),
-        &std::env::vars().map(|(k, _)| k).collect::<Vec<_>>(),
+        &std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .collect::<Vec<_>>(),
         || hook::cache::current_session(&hook::project_root(cwd, &home_dir())),
     )
 }

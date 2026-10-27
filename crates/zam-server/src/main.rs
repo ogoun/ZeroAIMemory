@@ -206,7 +206,10 @@ fn load(o: Opts) -> anyhow::Result<ServerConfig> {
 /// Конфигурация без проверки длины каталога данных: для команд, которые его не трогают
 /// (`cuda fetch`, `qdrant fetch`, `models` при заданном `ml.models_dir`).
 fn load_config(o: Opts) -> anyhow::Result<ServerConfig> {
-    let env: Vec<(String, String)> = std::env::vars().collect();
+    // `vars()` паникует на не-Unicode значении: такие переменные пропускаются
+    let env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
     let cli = CliOverrides {
         bind: o.bind,
         data_dir: o.data_dir,
