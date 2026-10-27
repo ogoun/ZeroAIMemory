@@ -6265,6 +6265,7 @@ name = "zam-search"
 version = "0.0.4-m3"
 dependencies = [
  "jiff",
+ "regex",
  "zam-core",
 ]
 

@@ -92,16 +92,18 @@ pub use search::{
     search_fts, search_fts_channels, text_snippet,
 };
 pub use sessions::{
-    SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, WHOLE_TARGET, add_memory_write,
-    check_session_id, end_session, gc_sessions, get_session, list_sessions, mark_seen, seen_revs,
-    touch_session,
+    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, WHOLE_TARGET,
+    add_memory_write, check_session_id, end_session, gc_sessions, get_session, list_sessions,
+    mark_seen, seen_revs, touch_session,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,
     WebSession,
 };
-pub use usage::{UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, usage_counts};
+pub use usage::{
+    UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, record_usages, usage_counts,
+};
 pub use user_db::{
     RechunkNotice, RechunkProgress, RechunkReason, Space, SpaceKind, USER_MIGRATIONS, UserDbs,
     create_solution, create_solution_with_id, get_solution, get_space, list_spaces,

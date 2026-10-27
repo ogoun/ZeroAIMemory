@@ -1363,15 +1363,15 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
 const WARN_SECTION_UNAVAILABLE: &str = "section unavailable";
 
 /// Состояние целей запроса: какие ещё в выдаче, и предупреждения ответа.
-struct Health<'a> {
+pub(crate) struct Health<'a> {
     targets: &'a [SearchTarget],
     /// Цель не исключена сбоем чтения своей базы.
-    alive: Vec<bool>,
-    warnings: Vec<String>,
+    pub(crate) alive: Vec<bool>,
+    pub(crate) warnings: Vec<String>,
 }
 
 impl<'a> Health<'a> {
-    fn new(targets: &'a [SearchTarget], warnings: Vec<String>) -> Health<'a> {
+    pub(crate) fn new(targets: &'a [SearchTarget], warnings: Vec<String>) -> Health<'a> {
         Health {
             targets,
             alive: vec![true; targets.len()],
@@ -1379,10 +1379,15 @@ impl<'a> Health<'a> {
         }
     }
 
+    /// Цели запроса.
+    pub(crate) fn targets(&self) -> &'a [SearchTarget] {
+        self.targets
+    }
+
     /// Результат чтения базы цели `i`: сбой в базе чужого решения исключает решение (WARN
     /// в журнал, `solution unavailable`, цель больше не жива) и даёт `None`; сбой личной
     /// базы — ошибка запроса.
-    fn soft<T, E>(&mut self, i: usize, r: Result<T, E>) -> Result<Option<T>, ApiError>
+    pub(crate) fn soft<T, E>(&mut self, i: usize, r: Result<T, E>) -> Result<Option<T>, ApiError>
     where
         E: std::fmt::Display + Into<ApiError>,
     {

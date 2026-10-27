@@ -9,3 +9,5 @@ rust-version.workspace = true
 [dependencies]
 zam-core = { path = "../zam-core" }
 jiff.workspace = true
+# `error_regex` триггеров в `/recall` (§10.3): тот же диалект без обратных ссылок, что в zam-store
+regex.workspace = true

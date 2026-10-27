@@ -10,6 +10,7 @@ pub mod index;
 pub mod insights;
 pub mod nodes;
 pub mod read;
+pub mod recall;
 pub mod releases;
 pub mod render;
 pub mod scope;
@@ -197,6 +198,8 @@ fn service_routes() -> Router<AppState> {
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
         .route("/api/v1/search", post(search::search))
         .route("/api/v1/read", post(read::read))
+        // подсказки пишут только `usage` и `session_seen`, не память (R12)
+        .route("/api/v1/recall", post(recall::recall))
         .route("/api/v1/cache", get(cache::list))
         .route("/api/v1/cache/{id}", get(cache::get))
         .route("/api/v1/triggers", get(triggers::list))

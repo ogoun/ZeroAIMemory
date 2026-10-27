@@ -77,24 +77,37 @@ pub struct UsageCounts {
 
 /// Дописывает событие.
 pub async fn record_usage(db: &Db, u: &UsageEvent) -> Result<(), StoreError> {
-    if let Some(s) = &u.session_id {
-        crate::sessions::check_session_id(s)?;
+    record_usages(db, std::slice::from_ref(u)).await
+}
+
+/// Дописывает события одной транзакцией (показы подсказок `/recall` — пачкой).
+pub async fn record_usages(db: &Db, events: &[UsageEvent]) -> Result<(), StoreError> {
+    if events.is_empty() {
+        return Ok(());
     }
-    let u = u.clone();
+    for u in events {
+        if let Some(s) = &u.session_id {
+            crate::sessions::check_session_id(s)?;
+        }
+    }
+    let events = events.to_vec();
     db.write(move |t| {
-        t.execute(
+        let ts = fmt_ts(Timestamp::now());
+        let mut st = t.prepare_cached(
             "INSERT INTO usage (ts, user_id, session_id, target_kind, target_id, event, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                fmt_ts(Timestamp::now()),
+        )?;
+        for u in &events {
+            st.execute(params![
+                ts,
                 u.user_id,
                 u.session_id,
                 kind_str(u.target.kind),
                 u.target.id,
                 u.event.as_str(),
                 u.source.map(UsageSource::as_str)
-            ],
-        )?;
+            ])?;
+        }
         Ok(())
     })
     .await

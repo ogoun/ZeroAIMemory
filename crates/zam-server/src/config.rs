@@ -37,6 +37,7 @@ pub struct ServerConfig {
     pub insights: InsightsSection,
     pub read: ReadSection,
     pub cache: CacheSection,
+    pub recall: RecallSection,
     pub limits: LimitsSection,
     pub vault: VaultSection,
 }
@@ -653,6 +654,39 @@ impl CacheSection {
     }
 }
 
+/// Секция `[recall]` (§10.3): проактивное вспоминание `POST /recall`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallSection {
+    /// Бюджет дайджеста старта сессии и подсказок по умолчанию, токенов (1..=20000, 1500).
+    pub digest_tokens: usize,
+    /// Наименьший балл поиска подсказки к запросу пользователя (0..=1, 0,6).
+    pub prompt_min_score: f64,
+    /// Бюджет сервера на сбор подсказок, мс (1..=60000, 200): по превышении отдаётся собранное
+    /// и `warnings: ["recall timeout"]`.
+    pub timeout_ms: u64,
+}
+
+impl RecallSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("recall.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=20_000).contains(&self.digest_tokens) {
+            return Err(bad("digest_tokens", "от 1 до 20000"));
+        }
+        if !(self.prompt_min_score.is_finite() && (0.0..=1.0).contains(&self.prompt_min_score)) {
+            return Err(bad("prompt_min_score", "должно быть в 0..=1"));
+        }
+        if !(1..=60_000).contains(&self.timeout_ms) {
+            return Err(bad("timeout_ms", "от 1 до 60000"));
+        }
+        Ok(())
+    }
+}
+
 /// Секция `[vault]` (§7.6): файл мастер-ключа. Сам ключ — только в файле или в
 /// `ZAM_MASTER_KEY` (переменная важнее файла), в конфигурацию он не попадает.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -763,6 +797,11 @@ impl Default for ServerConfig {
                 ttl_days: 30,
                 max_entries: 2000,
                 cross_session: true,
+            },
+            recall: RecallSection {
+                digest_tokens: 1500,
+                prompt_min_score: 0.6,
+                timeout_ms: 200,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -939,6 +978,7 @@ pub fn load(
     cfg.insights.validate()?;
     cfg.read.validate()?;
     cfg.cache.validate()?;
+    cfg.recall.validate()?;
     Ok(cfg)
 }
 
@@ -1670,6 +1710,28 @@ master_key = \"x\"
 ",
         );
         assert!(load(Some(&f), &[], &Default::default()).is_err());
+    }
+
+    #[test]
+    fn recall_section_bounds() {
+        for (k, v) in [
+            ("ZAM_RECALL__DIGEST_TOKENS", "0"),
+            ("ZAM_RECALL__PROMPT_MIN_SCORE", "1.5"),
+            ("ZAM_RECALL__TIMEOUT_MS", "0"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("recall."), "{k}: {e}");
+        }
+        let c = load(
+            None,
+            &[env("ZAM_RECALL__PROMPT_MIN_SCORE", "0.5")],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(c.recall.prompt_min_score, 0.5);
+        assert_eq!(c.recall.digest_tokens, 1500);
     }
 
     #[test]
