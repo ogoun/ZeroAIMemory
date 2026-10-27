@@ -238,6 +238,8 @@ async fn read_budget_truncates_with_marker() {
 
 struct W {
     a: Api,
+    a_tok: String,
+    b_id: String,
     b_tok: String,
     c_tok: String,
 }
@@ -246,7 +248,7 @@ struct W {
 async fn world(name: &str) -> (W, String, String) {
     let a = api(&format!("read-{name}"), |_| {}).await;
     let (_, a_tok) = a.new_user("Анна").await;
-    let (_, b_tok) = a.new_user("Борис").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
     let (_, c_tok) = a.new_user("Вера").await;
     let reg = json!({ "agent_solution_id": G, "name": "Общее" });
     let r = a
@@ -279,7 +281,17 @@ async fn world(name: &str) -> (W, String, String) {
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let entry = id(&r.json());
-    (W { a, b_tok, c_tok }, node, entry)
+    (
+        W {
+            a,
+            a_tok,
+            b_id,
+            b_tok,
+            c_tok,
+        },
+        node,
+        entry,
+    )
 }
 
 /// Ошибки лежат в элементах, ответ — 200: чужой Human, решение без доступа, посторонний,
@@ -582,4 +594,121 @@ async fn read_md_total_tokens_line() {
         total.abs_diff(real) <= 8 + real / 10,
         "total {total} против {real}\n{md}"
     );
+}
+
+/// Принятый участник читает пространство решения, но не Knowledge владельца (по id — `not_found`).
+#[tokio::test]
+async fn read_member_sees_solution_not_owner_knowledge() {
+    let (w, node, entry) = world("member").await;
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{}/approve", w.b_id),
+            Some(json!({"access": "ro"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": "knowledge", "path": "личное", "kind": "note",
+                        "content": "# Личное\n\nтолько владелец\n"}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let private = id(&r.json());
+    let r =
+        w.a.tok(
+            &w.b_tok,
+            Method::POST,
+            READ,
+            Some(
+                json!({"items": [{"id": &node}, {"id": &entry}, {"id": &private},
+                                  {"id": format!("{G}:/Общая")}]}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let it = j["items"].as_array().unwrap();
+    assert_eq!(it[0]["text"], "# Общая\n\nтекст решения\n", "{j}");
+    assert_eq!(it[1]["ref"], format!("i:{entry}"), "{j}");
+    assert_eq!(it[2]["error"], "not_found", "{j}");
+    assert_eq!(it[3]["text"], "# Общая\n\nтекст решения\n", "{j}");
+    assert!(!j.to_string().contains("только владелец"), "{j}");
+}
+
+/// Префиксы `c:` и `r:` читают changelog и release; ссылка в ответе — по виду записи.
+#[tokio::test]
+async fn read_entry_prefixes_c_r() {
+    let (w, _, _) = world("prefixes").await;
+    let uri = format!("/api/v1/spaces/{G}/entries");
+    let post = |body: Value| w.a.tok(&w.a_tok, Method::POST, &uri, Some(body));
+    let c = post(
+        json!({"kind": "changelog", "title": "Экспорт", "body": "Добавлен экспорт.",
+                        "data": {"kind": "feat"}}),
+    )
+    .await;
+    assert_eq!(c.status, StatusCode::CREATED, "{}", c.text());
+    let c = id(&c.json());
+    let r = post(json!({"kind": "release", "title": "Релиз 1.0", "body": "Заметки релиза.",
+                        "data": {"version": "1.0", "commits": [{"sha": "abc123", "subject": "feat: x"}]}}))
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let rel = id(&r.json());
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::POST,
+            READ,
+            Some(
+                json!({"items": [{"id": format!("c:{c}")}, {"id": format!("r:{rel}")}],
+                        "format": "md", "budget_tokens": 3000}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let md = r.text();
+    assert!(
+        md.contains(&format!("### c:{c} changelog/feat «Экспорт»")),
+        "{md}"
+    );
+    assert!(
+        md.contains(&format!("### r:{rel} release «Релиз 1.0»")),
+        "{md}"
+    );
+    assert!(
+        md.contains("Добавлен экспорт.") && md.contains("Заметки релиза."),
+        "{md}"
+    );
+}
+
+/// Путь секции, совпадающий у нескольких секций, — `invalid` в элементе; ответ 200.
+#[tokio::test]
+async fn read_section_ambiguous_invalid() {
+    let a = api("read-ambiguous", |_| {}).await;
+    let nid = id(&a.note("knowledge", "двойной", "# A\nx\n# A\nz\n").await);
+    let j = read_ok(
+        &a,
+        json!({"items": [{"id": &nid, "section": "A"}, {"id": &nid}]}),
+    )
+    .await;
+    assert_eq!(j["items"][0]["error"], "invalid", "{j}");
+    assert!(
+        j["items"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("неоднозначен"),
+        "{j}"
+    );
+    assert_eq!(j["items"][1]["text"], "# A\nx\n# A\nz\n");
+    let r = read(&a, json!({"items": [{"id": &nid, "section": "A"}]})).await;
+    assert_eq!(r.header("x-zam-read-error"), "invalid");
+    let r = read(&a, json!({"items": [{"id": &nid}]})).await;
+    assert!(r.headers.get("x-zam-read-error").is_none());
 }

@@ -31,6 +31,8 @@
 //!   `unchanged`, `(budget)` и ошибки — не отмечаются. Касание сессии и отметка — одна
 //!   транзакция; сбой учёта — WARN (без id сессии и текста), ответ не портится. Некорректный
 //!   id сессии — 400;
+//! - если у какого-то элемента ошибка, в ответе (md и json) заголовок `X-Zam-Read-Error: <код первой>`:
+//!   клиенту не нужно разбирать Markdown, где текст заметки мог бы выглядеть как заголовок ошибки;
 //! - ответ `json` (по умолчанию, как у поиска): `{items: [...], total_tokens}`; `md` —
 //!   заголовок на элемент `### n:<id> <пространство>/<путь> › <секция>  rev<N> · ~<T> tok`
 //!   (у записи — как карточка §9.3: `### i:<id> insight/gotcha «заголовок»  active ·
@@ -436,6 +438,9 @@ fn err_line(raw: &str, fail: &Fail) -> String {
     format!("### {}  error: {}", md_inline(raw), fail.code)
 }
 
+/// Заголовок ответа: `error` первого элемента с ошибкой (нет заголовка — ошибок нет).
+pub const ERROR_HEADER: &str = "x-zam-read-error";
+
 /// Строка вместо текста элемента, не влезшего в бюджет.
 const BUDGET_LINE: &str = "(budget)";
 
@@ -715,17 +720,28 @@ pub async fn read(
         }
     }
 
-    if md {
+    // код `error` первого элемента с ошибкой — для клиентов, которым md не разобрать
+    let first_error = pieces.iter().find_map(|p| match p {
+        Piece::Err { fail, .. } => Some(fail.code),
+        _ => None,
+    });
+    let mut r = if md {
         let mut r = render_md(&pieces, total).into_response();
         r.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/markdown; charset=utf-8"),
         );
-        return Ok(r);
+        r
+    } else {
+        axum::Json(json!({
+            "items": pieces.iter().map(item_json).collect::<Vec<_>>(),
+            "total_tokens": total,
+        }))
+        .into_response()
+    };
+    if let Some(code) = first_error {
+        r.headers_mut()
+            .insert(ERROR_HEADER, HeaderValue::from_static(code));
     }
-    Ok(axum::Json(json!({
-        "items": pieces.iter().map(item_json).collect::<Vec<_>>(),
-        "total_tokens": total,
-    }))
-    .into_response())
+    Ok(r)
 }

@@ -167,13 +167,6 @@ fn error_exit(code: &str) -> u8 {
     }
 }
 
-/// Код `error` первого элемента с ошибкой в Markdown ответа (`### <id>  error: <код>`).
-fn first_error_md(md: &str) -> Option<&str> {
-    md.lines()
-        .filter(|l| l.starts_with("### "))
-        .find_map(|l| l.split_once("  error: ").map(|(_, c)| c.trim()))
-}
-
 /// `id` элемента `/read` для цели: id как есть либо `<пространство>:/<путь>`.
 fn item_id(loc: &Loc) -> String {
     match loc {
@@ -187,6 +180,11 @@ fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
     if o.rev.is_some() {
         return Err(CliError::input(
             "--rev несовместим с пачкой (--batch, --max-tokens, --budget, --if-rev)",
+        ));
+    }
+    if o.if_rev.is_some() && targets.len() > 1 {
+        return Err(CliError::input(
+            "--if-rev задаёт ревизию одной цели: передайте ровно одну цель",
         ));
     }
     let mut items = Vec::with_capacity(targets.len());
@@ -220,9 +218,14 @@ fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
             .flatten()
             .find_map(|i| i["error"].as_str().map(error_exit))
     } else {
-        let text = read_text(resp)?;
-        emit(text.as_bytes())?;
-        first_error_md(&text).map(error_exit)
+        // ошибки — по заголовку ответа, а не по тексту: заметка может содержать строку `### x  error: y`
+        let code = resp
+            .headers()
+            .get("x-zam-read-error")
+            .and_then(|v| v.to_str().ok())
+            .map(error_exit);
+        emit(read_text(resp)?.as_bytes())?;
+        code
     };
     match first {
         Some(code) => Err(CliError::new(code, String::new())),

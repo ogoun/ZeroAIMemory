@@ -475,6 +475,19 @@ fn read_batch_flags() {
     let v: serde_json::Value =
         serde_json::from_str(&ok(&e.run(&["read", "knowledge:b2", "--batch", "--json"]))).unwrap();
     assert_eq!(v["items"][0]["text"], "# Два\n");
+    // текст заметки, похожий на заголовок ошибки, кодом выхода не становится
+    ok(&e.run_stdin(
+        &["write", "knowledge:b3"],
+        "# Лог
+### x  error: y
+"
+        .as_bytes(),
+    ));
+    let s = ok(&e.run(&["read", "knowledge:b3", "--batch"]));
+    assert!(s.contains("### x  error: y"), "{s}");
+    // --if-rev — только с одной целью
+    let o = e.run(&["read", "knowledge:b1", "knowledge:b2", "--if-rev", "1"]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
     // --rev с пачкой
     let o = e.run(&["read", "knowledge:b1", "--batch", "--rev", "1"]);
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
