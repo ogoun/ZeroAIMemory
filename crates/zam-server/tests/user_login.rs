@@ -1128,6 +1128,16 @@ async fn user_hook_settings_rest() {
     )
     .await;
     ok(&r, StatusCode::OK);
+    // значение по умолчанию (`true`) без строки — тоже без записи и аудита (fix round 1, I-2)
+    let r = web(
+        &a,
+        &w,
+        Method::PATCH,
+        "/api/v1/auth/settings",
+        Some(json!({"hooks": {"session_start": true, "checkpoint": true}})),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
     let rows: Vec<_> = audit(&a)
         .await
         .into_iter()
@@ -1148,4 +1158,27 @@ async fn user_hook_settings_rest() {
         .find(|r| r.target.as_deref() == Some(other.as_str()))
         .unwrap();
     assert_eq!(adm.actor, "admin");
+    assert_eq!(
+        adm.details,
+        json!({"key": "hooks.checkpoint", "from": true, "to": false})
+    );
+    // обратно включено: from — прежнее (false), to — новое (true)
+    let r = web(
+        &a,
+        &w,
+        Method::PATCH,
+        "/api/v1/auth/settings",
+        Some(json!({"hooks": {"prompt": true}})),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let last = audit(&a)
+        .await
+        .into_iter()
+        .find(|r| r.action == "user.settings.update")
+        .unwrap();
+    assert_eq!(
+        last.details,
+        json!({"key": "hooks.prompt", "from": false, "to": true})
+    );
 }

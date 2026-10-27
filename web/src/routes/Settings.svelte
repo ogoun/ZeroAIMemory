@@ -3,6 +3,7 @@
   // rw (агентам); «Шаблон инструкции» (§15.5) — правка блока для CLAUDE.md / AGENTS.md с
   // предпросмотром (`POST /admin/agent-setup/preview`), сбросом к умолчанию и номером версии.
   // Изменения записываются в аудит (settings.update).
+  import { untrack } from 'svelte';
   import {
     AGENT_KINDS,
     ApiError,
@@ -64,6 +65,9 @@
   let draft = $state('');
   /** Ключ, текст которого сейчас в поле (смена ключа — новый текст). */
   let draftKey = $state('');
+  /** Несохранённые черновики других шаблонов (в памяти страницы): смена агента или языка их не
+   * теряет. */
+  let drafts: Record<string, string> = {};
   let preview = $state<TemplatePreview | null>(null);
   let previewError = $state('');
   let tplError = $state('');
@@ -77,7 +81,13 @@
     // новый шаблон в поле: при первой загрузке и при смене агента или языка
     const c = current;
     if (c && draftKey !== tplKey) {
-      draft = c.text;
+      const prev = draftKey;
+      untrack(() => {
+        const old = prev ? settings?.agent_setup.templates[prev] : null;
+        if (prev && old && draft !== old.text) drafts[prev] = draft;
+        else if (prev) delete drafts[prev];
+      });
+      draft = drafts[tplKey] ?? c.text;
       draftKey = tplKey;
       tplSaved = '';
       tplError = '';
@@ -115,6 +125,7 @@
       settings = await saveTemplate(tplKey, text);
       const c = settings.agent_setup.templates[tplKey];
       draft = c.text;
+      delete drafts[tplKey];
       const v = settings.agent_setup.version;
       tplSaved =
         v === before

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! GET /agent-setup?agent=claude|agents|codex&solution=<guid|new|auto>&name=&mcp=&hooks=
-//!                  &rules_write=&lang=ru|en&token=
+//!                  &rules_write=&lang=ru|en&token=&token_placeholder=
 //!   → 200 {version, agent, lang, url, block, tokens, tokens_exact, warnings, template_custom,
 //!          solution_toml?, solution?, mcp_json?, claude_settings?, codex_hooks?,
 //!          install: {windows, linux}, init_cmd: {linux, windows}}
@@ -16,9 +16,12 @@
 //!   `PATCH /admin/settings` (400 с причиной), `version_next` — версия после сохранения
 //!   (`version`, если текст совпадает с действующим).
 //!
-//! - Доступ — токен (любой, `ro` тоже) или администратор WebUI. `token=` — только
-//!   администратору: открытый текст только что выпущенного токена для `install` и `init_cmd`;
-//!   в `block` и `mcp_json` токена нет никогда (`Bearer ${ZAM_TOKEN}`).
+//! - Доступ — токен (любой, `ro` тоже) или сессия WebUI (администратор или пользователь).
+//!   `token=` — только сессии WebUI (по токену — 400): открытый текст токена подставляется в
+//!   `install` и `init_cmd`, в `block` и `mcp_json` токена нет никогда (`Bearer ${ZAM_TOKEN}`).
+//!   Параметр — для вызовов API: токен в адресе виден журналам прокси; сам WebUI его не
+//!   передаёт, а подставляет токен вместо заглушки `<токен>` в браузере (задача 13 fix
+//!   round 1, I-1). Ответ — с `Cache-Control: no-store`.
 //! - `url` — `server.public_url`, иначе схема и `Host` запроса плюс `server.base_path`.
 //! - `solution`: `auto` (по умолчанию) — без решения (его создаст `zam init`); `new` — новый
 //!   GUID (v7); GUID — указанное решение. Имя — `name`, иначе имя из реестра (владельцу и
@@ -61,6 +64,8 @@ pub struct SetupQuery {
     rules_write: Option<bool>,
     lang: Option<String>,
     token: Option<String>,
+    /// Без `token=`: в `init_cmd` — `--token '<токен>'` (заглушку подставляет WebUI).
+    token_placeholder: Option<bool>,
 }
 
 fn parse_agent(raw: Option<&str>) -> Result<AgentKind, ApiError> {
@@ -162,7 +167,7 @@ pub async fn setup(
     client: Client,
     headers: HeaderMap,
     q: Result<Query<SetupQuery>, QueryRejection>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let q = query(q)?;
     let agent = parse_agent(q.agent.as_deref())?;
     let lang = parse_lang(q.lang.as_deref())?;
@@ -224,7 +229,10 @@ pub async fn setup(
         "install": agent_setup::install(&url, token.as_deref()),
         "init_cmd": agent_setup::init_cmd(&InitCmd {
             url: &url,
-            token: token.as_deref(),
+            token: token.as_deref().or(q
+                .token_placeholder
+                .unwrap_or(false)
+                .then_some(agent_setup::TOKEN_PLACEHOLDER)),
             agent,
             solution: sol.as_ref(),
             registered,
@@ -247,7 +255,13 @@ pub async fn setup(
             AgentKind::Agents => {}
         }
     }
-    Ok(Json(out))
+    // ответ может нести открытый токен (`token=`) и в любом случае — адрес и решение: в кэши
+    // браузера и прокси не кладётся (задача 13 fix round 1, I-1)
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(out),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]

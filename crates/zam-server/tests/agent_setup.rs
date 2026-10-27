@@ -656,3 +656,33 @@ async fn template_preview_renders_unsaved() {
         .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
 }
+
+/// Ответ `/agent-setup` не кэшируется (`no-store`); `token_placeholder=true` — `--token '<токен>'`
+/// в однострочнике для подстановки в браузере (задача 13 fix round 1, I-1).
+#[tokio::test]
+async fn agent_setup_no_store_and_token_placeholder() {
+    let a = api("agent-setup-no-store", |_| {}).await;
+    let r = a
+        .tok_h(&a.token, Method::GET, "/api/v1/agent-setup", None, &[HOST])
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.header("cache-control"), "no-store");
+    let j = r.json();
+    for k in ["linux", "windows"] {
+        assert!(
+            !j["init_cmd"][k].as_str().unwrap().contains("--token"),
+            "{j}"
+        );
+    }
+    assert!(
+        j["install"]["windows"]
+            .as_str()
+            .unwrap()
+            .contains("'<токен>'")
+    );
+    let j = setup(&a, &a.token, "token_placeholder=true").await;
+    for k in ["linux", "windows"] {
+        let c = j["init_cmd"][k].as_str().unwrap();
+        assert!(c.contains(" --token '<токен>' "), "{c}");
+    }
+}

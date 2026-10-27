@@ -313,6 +313,11 @@ pub fn safe_cli_name(name: &str) -> bool {
             .all(|c| c.is_alphabetic() || c.is_numeric() || matches!(c, ' ' | '.' | '_' | '-'))
 }
 
+/// Заглушка токена в `install` (и в `init_cmd` с `token_placeholder=true`): WebUI заменяет её
+/// в браузере (в кавычках оболочки — `'<токен>'`) открытым текстом нового токена, не передавая
+/// его серверу в адресе (задача 13 fix round 1, I-1).
+pub const TOKEN_PLACEHOLDER: &str = "<токен>";
+
 /// Команды установки `zam` с сервера (`GET /downloads/zam/{os}-{arch}`) (fix round 1, M-1, M-2):
 /// каталог в `Path` пользователя Windows добавляется один раз; на Linux — подсказка, если
 /// `~/.local/bin` нет в `PATH`. Токен `zam` и хуки берут из `~/.zeroaimemory/config.toml`
@@ -320,7 +325,7 @@ pub fn safe_cli_name(name: &str) -> bool {
 /// Windows она задаётся в окружении пользователя (`token` — открытый текст только при выпуске
 /// токена администратором, иначе заглушка).
 pub fn install(url: &str, token: Option<&str>) -> Value {
-    let t = ps_quote(token.unwrap_or("<токен>"));
+    let t = ps_quote(token.unwrap_or(TOKEN_PLACEHOLDER));
     let win_url = ps_quote(&format!("{url}/downloads/zam/windows-x64"));
     let windows = format!(
         "$d = \"$env:LOCALAPPDATA\\Programs\\zam\"; New-Item -ItemType Directory -Force $d | Out-Null\n\

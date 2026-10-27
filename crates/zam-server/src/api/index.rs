@@ -10,7 +10,8 @@
 //!   администратору, токену — `null`. `dbs` — по каждой видимой базе (администратору — все
 //!   или из `X-Zam-User`, токену — своя) `{user_id, rechunk}`: `rechunk` — ход фоновой
 //!   перенарезки после смены настроек нарезки `{reason, changed, total, done}` или `null`
-//!   (§8.2).
+//!   (§8.2). `?only=rechunk` — лёгкий ответ для баннера WebUI: только `{dbs}` (без Qdrant,
+//!   очереди и неудавшихся заданий; базы не открываются, задача 13 fix round 1, M-1).
 //! - `POST /admin/reindex {user?, space?, full?}` — только администратор, аудит
 //!   `index.reindex`, ответ 202 с `job_count` (заметок области). Без `full` — точки
 //!   области удаляются и пишутся заново из кэша `embeddings` без инференса (промахи кэша —
@@ -21,8 +22,8 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
-use axum::extract::rejection::BytesRejection;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use jiff::Timestamp;
 use serde::Deserialize;
@@ -128,13 +129,36 @@ fn reindex_json(o: &ReindexOutcome) -> Value {
     v
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusQuery {
+    /// `rechunk` — только ход перенарезки баз (`dbs`).
+    only: Option<String>,
+}
+
 /// `GET /index/status`.
 pub async fn status(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    q: Result<Query<StatusQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let q = crate::api::query(q)?;
     let (users, all) = status_users(&st, &p, &headers).await?;
+    match q.only.as_deref() {
+        None | Some("") => {}
+        Some("rechunk") => {
+            let mut dbs = Vec::with_capacity(users.len());
+            for u in &users {
+                dbs.push(json!({
+                    "user_id": u,
+                    "rechunk": st.users.rechunk_progress(*u).await.map(|r| rechunk_json(&r)),
+                }));
+            }
+            return Ok(Json(json!({ "dbs": dbs })));
+        }
+        Some(_) => return Err(ApiError::BadRequest("only: rechunk".into())),
+    }
     let rt = &st.index;
     // очередь и неудавшиеся задания видимых пользователей
     let mut queue = JobStats::default();

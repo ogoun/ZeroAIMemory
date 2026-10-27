@@ -117,6 +117,37 @@ async fn index_status_shows_rechunk_progress() {
         let total = if d["user_id"] == bob { 1 } else { 2 };
         check(&d["rechunk"], total);
     }
+    // лёгкий режим баннера (задача 13, M-1): только `dbs`, то же содержимое; иное `only` — 400
+    let r = b
+        .adm(Method::GET, "/api/v1/index/status?only=rechunk", None, None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let light = r.json();
+    assert_eq!(
+        light
+            .as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>()),
+        Some(vec!["dbs".to_string()]),
+        "{light}"
+    );
+    assert_eq!(light["dbs"].as_array().map(Vec::len), Some(2), "{light}");
+    for d in light["dbs"].as_array().unwrap() {
+        let total = if d["user_id"] == bob { 1 } else { 2 };
+        check(&d["rechunk"], total);
+    }
+    let r = b
+        .tok(
+            &bob_token,
+            Method::GET,
+            "/api/v1/index/status?only=rechunk",
+            None,
+        )
+        .await;
+    assert_eq!(r.json()["dbs"].as_array().map(Vec::len), Some(1));
+    let r = b
+        .adm(Method::GET, "/api/v1/index/status?only=queue", None, None)
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
     drop(hold);
     for u in users {
         b.st.users.wait_rechunk(u).await;

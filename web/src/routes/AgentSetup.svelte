@@ -2,7 +2,8 @@
   // «Подключение агента» (§15.5): готовый текст для CLAUDE.md / AGENTS.md и фрагменты
   // настроек по `GET /agent-setup`. Администратор выбирает любого пользователя, пользователь —
   // только себя. Токен можно выпустить тут же: его открытый текст попадает только в команды
-  // установки и `zam init` (в блоке и `.mcp.json` — `${ZAM_TOKEN}`). Страница открывается
+  // установки и `zam init` (в блоке и `.mcp.json` — `${ZAM_TOKEN}`) и только в браузере —
+  // вместо заглушки сервера `'<токен>'`, серверу в адресе он не уходит. Страница открывается
   // сразу после создания пользователя или выпуска токена (lib/agentSetup.ts). Здесь же —
   // типы подсказок хуков пользователя на сервере (`hooks.<тип>`, §10.3, R5).
   import { onMount } from 'svelte';
@@ -29,6 +30,7 @@
     type Me,
     type SolutionItem,
     type User,
+    withToken,
   } from '../lib/api';
   import { takeIssued } from '../lib/agentSetup';
   import { copyText } from '../lib/clipboard';
@@ -114,7 +116,7 @@
           hooks: agent !== 'agents' && hooks,
           rulesWrite: rulesMode === 'server' ? undefined : rulesMode === 'on',
           lang,
-          token: issued?.plaintext,
+          tokenPlaceholder: issued !== null,
         },
         asUser(),
       );
@@ -164,6 +166,7 @@
     // токен другого пользователя к новому не подходит; решения — его собственные
     issued = null;
     existing = '';
+    newGuid = '';
     if (solMode === 'existing') solMode = 'auto';
   }
 
@@ -207,7 +210,7 @@
 
   /** Фрагменты по порядку §15.5. */
   let blocks = $derived.by(() => {
-    const s = setup;
+    const s = setup && issued ? withToken(setup, issued.plaintext) : setup;
     if (!s) return [];
     const out: { key: string; title: string; file?: string; text: string }[] = [
       {
@@ -270,7 +273,7 @@
     <fieldset>
       <legend>Решение</legend>
       <label class="opt"><input type="radio" name="sol" value="auto" bind:group={solMode} /> Агент создаст сам (<code>zam init</code>)</label>
-      <label class="opt"><input type="radio" name="sol" value="new" bind:group={solMode} /> Новое (GUID сгенерирует WebUI)</label>
+      <label class="opt"><input type="radio" name="sol" value="new" bind:group={solMode} /> Новое (GUID выдаст сервер)</label>
       <label class="opt">
         <input type="radio" name="sol" value="existing" bind:group={solMode} disabled={!userSolutions.length} /> Существующее
       </label>

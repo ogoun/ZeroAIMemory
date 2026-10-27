@@ -119,7 +119,8 @@ async fn settings_json(st: &AppState, user: Id) -> Result<Value, ApiError> {
     Ok(json!({ "hooks": hook_flags(&st.system, user).await?.to_json() }))
 }
 
-/// Сохраняет правки и пишет аудит каждого изменения.
+/// Сохраняет правки и пишет аудит каждого изменения. Правка сравнивается с действующим
+/// значением (нет строки — `true`): совпало — ни записи, ни аудита (fix round 1, I-2).
 async fn apply(
     st: &AppState,
     actor: &str,
@@ -128,20 +129,37 @@ async fn apply(
     body: &Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let edits = parse_patch(body)?;
-    let changed = st.system.set_user_settings(user, edits).await?;
-    for (key, old) in changed {
-        // прежнее значение без строки — по умолчанию (`true`)
-        let from = old.and_then(|v| v.as_bool()).unwrap_or(true);
-        st.system
-            .audit(
-                actor,
-                Some(user),
-                "user.settings.update",
-                Some(&user.to_string()),
-                Some(ip),
-                json!({ "key": key, "from": from, "to": !from }),
-            )
-            .await?;
+    let current = hook_flags(&st.system, user).await?;
+    let edits: Vec<(String, Value)> = edits
+        .into_iter()
+        .filter(|(key, v)| {
+            let kind = key.strip_prefix(HOOKS_PREFIX).unwrap_or(key);
+            v.as_bool() != Some(current.enabled(kind))
+        })
+        .collect();
+    if !edits.is_empty() {
+        let changed = st.system.set_user_settings(user, edits.clone()).await?;
+        for (key, _) in changed {
+            let kind = key.strip_prefix(HOOKS_PREFIX).unwrap_or(&key);
+            let to = edits
+                .iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, v)| v.as_bool())
+                .unwrap_or(true);
+            st.system
+                .audit(
+                    actor,
+                    Some(user),
+                    "user.settings.update",
+                    Some(&user.to_string()),
+                    Some(ip),
+                    json!({ "key": key, "from": current.enabled(kind), "to": to }),
+                )
+                .await?;
+        }
+    } else {
+        // пользователь должен существовать и при правке без изменений
+        st.system.get_user(user).await?.ok_or(ApiError::NotFound)?;
     }
     Ok(Json(settings_json(st, user).await?))
 }

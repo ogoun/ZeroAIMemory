@@ -2,11 +2,12 @@
   // Баннер перенарезки баз (§8.2, §15.4): «Идёт перенарезка: изменились <ключи>, N из M».
   // Единственная точка показа: оболочка (у пользователя — его база, R9; у администратора — все
   // базы) и страница «Индекс», которая передаёт уже полученный статус (`dbs`) и сама не
-  // опрашивает сервер дважды. Без `dbs` компонент опрашивает `GET /index/status`: пока
+  // опрашивает сервер дважды. Без `dbs` компонент опрашивает лёгкий
+  // `GET /index/status?only=rechunk` (без Qdrant и очередей): пока
   // перенарезка идёт — раз в 10 с, иначе раз в минуту; скрытая вкладка не опрашивает сервер.
   // Ошибки опроса не показываются (баннер — подсказка, не раздел).
   import { onMount } from 'svelte';
-  import { ApiError, indexStatus, type IndexStatus } from '../lib/api';
+  import { ApiError, rechunkStatus, type IndexStatus } from '../lib/api';
 
   let {
     userId = null,
@@ -36,7 +37,7 @@
 
   async function load() {
     try {
-      polled = (await indexStatus()).dbs ?? [];
+      polled = (await rechunkStatus()).dbs ?? [];
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) onexpired?.();
     }

@@ -511,6 +511,8 @@ export interface Rechunk {
 
 /** Администратору — все базы; пользователю — только своя (`dbs` из одной базы). */
 export const indexStatus = () => call<IndexStatus>('GET', 'index/status');
+/** Лёгкий статус для баннера: только ход перенарезки баз. */
+export const rechunkStatus = () => call<{ dbs: IndexStatus['dbs'] }>('GET', 'index/status?only=rechunk');
 
 /** `POST /admin/reindex`: без `full` — из кэша embeddings, с `full` — перечанковка и инференс. */
 export const reindex = (full: boolean) =>
@@ -846,8 +848,9 @@ export interface AgentSetupQuery {
   /** `undefined` — по настройке сервера `rules.agent_write`. */
   rulesWrite?: boolean;
   lang: Lang;
-  /** Открытый текст только что выпущенного токена (только сессия WebUI). */
-  token?: string;
+  /** `--token '<токен>'` в `init_cmd`: заглушку подставляет браузер (`withToken`). Открытый
+   * текст токена WebUI серверу в адресе не передаёт (журналы прокси). */
+  tokenPlaceholder?: boolean;
 }
 
 export interface AgentSetup {
@@ -880,8 +883,23 @@ export function agentSetup(f: AgentSetupQuery, user?: string) {
   });
   if (f.name) p.set('name', f.name);
   if (f.rulesWrite !== undefined) p.set('rules_write', String(f.rulesWrite));
-  if (f.token) p.set('token', f.token);
+  if (f.tokenPlaceholder) p.set('token_placeholder', 'true');
   return call<AgentSetup>('GET', `agent-setup?${p}`, undefined, user);
+}
+
+/** Заглушка токена сервера в кавычках оболочки (`'<токен>'`, POSIX shell и PowerShell). */
+const TOKEN_SLOT = "'<токен>'";
+
+/** Ответ `/agent-setup` с открытым токеном вместо заглушки — только в командах установки и
+ * `zam init` (в блоке и `.mcp.json` токена нет). Токен — `zam_` и base62: кавычки не нужны. */
+export function withToken(s: AgentSetup, token: string): AgentSetup {
+  if (!/^zam_[0-9A-Za-z]+$/.test(token)) return s;
+  const put = (t: string) => t.split(TOKEN_SLOT).join(`'${token}'`);
+  return {
+    ...s,
+    install: { windows: put(s.install.windows), linux: s.install.linux },
+    init_cmd: { linux: put(s.init_cmd.linux), windows: put(s.init_cmd.windows) },
+  };
 }
 
 // ---- настройки пользователя: типы подсказок хуков (§10.3, R5) ----

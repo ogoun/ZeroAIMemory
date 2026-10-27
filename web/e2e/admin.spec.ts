@@ -70,7 +70,8 @@ test('администратор: вход, пользователь, токен
 
   await dialog.getByRole('button', { name: 'Закрыть' }).click();
   await expect(dialog).toBeHidden();
-  await expect(page.getByLabel('Пользователь')).toHaveValue(/.+/);
+  // выбран именно только что созданный пользователь (fix round 1, M-7)
+  await expect(page.getByLabel('Пользователь').locator('option:checked')).toHaveText(user);
   await page.getByRole('link', { name: 'Администрирование' }).click();
 
   // Выпуск ro-токена

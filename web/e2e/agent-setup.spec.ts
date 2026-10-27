@@ -38,6 +38,15 @@ const GUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
 
 test('Подключение агента: опции меняют фрагменты, копирование, хуки пользователя', async ({ page, context }) => {
   const problems = watch(page);
+  // WebUI не передаёт токен в адресе запроса (fix round 1, I-1); ответ не кэшируется
+  const setupUrls: string[] = [];
+  const cacheControl: string[] = [];
+  page.on('response', (r) => {
+    if (new URL(r.url()).pathname.endsWith('/api/v1/agent-setup')) {
+      setupUrls.push(r.url());
+      cacheControl.push(r.headers()['cache-control'] ?? '');
+    }
+  });
   await page.goto(base());
   await page.getByRole('link', { name: 'Подключение агента' }).click();
   await expect(page).toHaveURL(/#\/agent-setup$/);
@@ -72,7 +81,7 @@ test('Подключение агента: опции меняют фрагме�
   await expect(frag(page, 'Фрагмент .mcp.json')).toBeVisible();
 
   // новое решение: GUID один и тот же при смене опций (его выдал сервер при первом запросе)
-  await page.getByLabel('Новое (GUID сгенерирует WebUI)').check();
+  await page.getByLabel('Новое (GUID выдаст сервер)').check();
   await page.getByLabel('Имя решения').fill('Проект E2E');
   const toml = frag(page, 'solution.toml');
   await expect(toml).toContainText('Проект E2E');
@@ -105,6 +114,9 @@ test('Подключение агента: опции меняют фрагме�
   expect((await probe.evaluate(() => navigator.clipboard.readText())).replace(/\r\n/g, '\n')).toBe(text);
   await probe.close();
 
+  // снимок — до выпуска токена: в артефактах прогона токена нет (fix round 1, I-3)
+  await page.screenshot({ path: `${screens}agent-setup.png`, fullPage: true });
+
   // токен тут же: окно токена, токен — в командах установки и zam init, не в блоке
   await page.getByLabel('Имя токена').fill('e2e-setup');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
@@ -117,7 +129,12 @@ test('Подключение агента: опции меняют фрагме�
   await expect(frag(page, /Установка zam — Windows/)).toContainText(plain);
   await expect(frag(page, /Установка zam — Linux/)).not.toContainText(plain);
   await expect(block).not.toContainText(plain);
-  await page.screenshot({ path: `${screens}agent-setup.png`, fullPage: true });
+  await expect(frag(page, /zam init — Linux/)).toContainText(`--token '${plain}'`);
+  expect(setupUrls.length).toBeGreaterThan(3);
+  expect(setupUrls.filter((u) => /[?&]token=/.test(u))).toEqual([]);
+  expect(setupUrls.some((u) => u.includes('token_placeholder=true'))).toBe(true);
+  expect(setupUrls.every((u) => !u.includes(plain))).toBe(true);
+  expect(new Set(cacheControl)).toEqual(new Set(['no-store']));
 
   // подсказки хуков: настройка пользователя на сервере
   const flags = () => page.getByRole('group', { name: 'Типы подсказок' });
@@ -173,6 +190,13 @@ test('Шаблон инструкции: предпросмотр, сохран�
   await area.fill('Память без адреса');
   await expect(tpl.getByRole('alert')).toContainText('{url}');
   await expect(tpl.getByRole('button', { name: 'Сохранить' })).toBeDisabled();
+
+  // черновик не теряется при смене языка (fix round 1, M-6)
+  await area.fill('## Черновик ru {url}');
+  await tpl.getByLabel('Язык шаблона').selectOption('en');
+  await expect(area).toHaveValue(/ZeroAIMemory memory/);
+  await tpl.getByLabel('Язык шаблона').selectOption('ru');
+  await expect(area).toHaveValue('## Черновик ru {url}');
 
   await area.fill('## Своя память\nАдрес: {url}\nРешение: {solution}. {rules}');
   await expect(tpl.getByTestId('tpl-preview')).toContainText(`<!-- zeroaimemory:begin v${v0 + 1} -->`);
