@@ -221,24 +221,55 @@ fn merge_json(
     Ok(Planned::new(path, old.as_deref(), text))
 }
 
-/// Атомарная запись файла проекта (fix round 1, M-5): временный файл в том же каталоге с
-/// правами прежнего файла и rename.
-fn write_project_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.zam-init.{}.tmp", std::process::id()));
-    let res = (|| {
-        std::fs::write(&tmp, bytes)?;
-        if let Ok(m) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, m.permissions())?;
-        }
-        std::fs::rename(&tmp, path)
-    })();
-    if res.is_err() {
+/// Метка временных файлов `zam init`: `.<имя>.zam-init.<pid>.tmp`.
+const TMP_MARK: &str = ".zam-init.";
+
+/// Запись файла проекта (fix round 1, M-5; fix round 3, N-3): симлинк разрешается
+/// (`canonicalize`) — пишется его целевой файл, а ссылка остаётся ссылкой; временный файл в
+/// каталоге цели с правами прежнего и rename (3 попытки через 50 мс: на Windows файл бывает
+/// занят антивирусом или редактором); не удалось — запись поверх файла.
+fn write_project_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    let fail = |e: std::io::Error| CliError::config(format!("запись {}: {e}", path.display()));
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(fail)?;
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let tmp = dir.join(format!(".{name}{TMP_MARK}{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
+        fail(e)
+    })?;
+    if let Ok(m) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&tmp, m.permissions());
     }
-    res
+    for attempt in 0..3 {
+        if std::fs::rename(&tmp, &target).is_ok() {
+            return Ok(());
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(&target, bytes).map_err(fail)
+}
+
+/// Убирает временные файлы прерванных запусков `zam init` (`.*.zam-init.*.tmp`) в каталоге
+/// (fix round 3, N-4).
+fn remove_stale_tmp(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let n = e.file_name();
+        let Some(n) = n.to_str() else { continue };
+        if n.starts_with('.') && n.contains(TMP_MARK) && n.ends_with(".tmp") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 fn ask(question: &str) -> bool {
@@ -314,18 +345,31 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         old.as_deref(),
         merge::gitignore(old.as_deref()),
     ));
-    // токен прежнего блока (v1) того файла, где блок заменяется (I-6)
+    // временные файлы прерванных запусков (N-4)
+    for d in [
+        root.clone(),
+        root.join(".zeroaimemory"),
+        root.join(".claude"),
+        root.join(".codex"),
+    ] {
+        remove_stale_tmp(&d);
+    }
+    // токен прежнего блока (v1) того файла, где блок заменяется (I-6); у `both` — из любого
+    // из двух, разные — предупреждение, берётся из первого (N-6)
     let mut migrated: Option<(String, &str)> = None;
+    let mut differs: Option<&str> = None;
     for (_, file, v) in &setups {
         let block = v["block"]
             .as_str()
             .ok_or_else(|| CliError::config("в ответе /agent-setup нет block"))?;
         let path = root.join(file);
         let old = read_opt(&path)?;
-        if migrated.is_none()
-            && let Some(t) = old.as_deref().and_then(locate::block_token)
-        {
-            migrated = Some((t, *file));
+        if let Some(t) = old.as_deref().and_then(locate::block_token) {
+            match &migrated {
+                None => migrated = Some((t, *file)),
+                Some((first, _)) if *first != t => differs = Some(*file),
+                Some(_) => {}
+            }
         }
         let text = merge::upsert_block(old.as_deref(), block)
             .map_err(|e| CliError::config(format!("{file}: {e}")))?;
@@ -395,8 +439,7 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         .into_iter()
         .chain(agent_plan.into_iter().filter(|_| agent_ok));
     for p in all {
-        write_project_file(&p.path, p.text.as_bytes())
-            .map_err(|e| CliError::config(format!("{}: {e}", p.path.display())))?;
+        write_project_file(&p.path, p.text.as_bytes())?;
         report.push(format!(
             "{} {}",
             if p.existed {
@@ -439,6 +482,11 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             "предупреждение: в ~/.zeroaimemory/config.toml другой токен — не заменён (заменить: zam init --token <токен>)"
         ),
         locate::HomePlan::Unchanged => {}
+    }
+    if let (Some((_, first)), Some(other)) = (&migrated, differs) {
+        eprintln!(
+            "предупреждение: в блоках {first} и {other} разные токены — перенесён токен из {first}"
+        );
     }
     if let Some((_, file)) = &migrated {
         println!(

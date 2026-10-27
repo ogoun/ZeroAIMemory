@@ -278,25 +278,32 @@ async fn agent_setup_hooks_exec_form() {
         "{install}"
     );
 
-    // имя с подстановками оболочки экранируется для bash и PowerShell (fix round 1, I-3)
-    let evil = "x$(id)`whoami`'\"";
-    let j = setup(&a, &a.token, &format!("solution=new&name={}", enc(evil))).await;
-    let id = j["solution"]["agent_solution_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        j["init_cmd"]["linux"],
-        format!(
-            "zam init --url 'http://memory.lan:7700' --agent claude --id {id} --name 'x$(id)`whoami`'\''\"' --yes"
-        )
-    );
-    assert_eq!(
-        j["init_cmd"]["windows"],
-        format!(
-            "zam init --url 'http://memory.lan:7700' --agent claude --id {id} --name 'x$(id)`whoami`''\"' --yes"
-        )
-    );
+    // имя с подстановками оболочки в однострочник не попадает (fix round 3): zam init возьмёт
+    // имя каталога; адрес и токен — в кавычках своей оболочки (fix round 1, I-3)
+    for evil in ["x$(id)`whoami`'\"", "a'; rm -rf ~; '", "a\u{2019}b"] {
+        let j = setup(&a, &a.token, &format!("solution=new&name={}", enc(evil))).await;
+        let id = j["solution"]["agent_solution_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(j["solution"]["name"], evil);
+        for os in ["linux", "windows"] {
+            assert_eq!(
+                j["init_cmd"][os],
+                format!("zam init --url 'http://memory.lan:7700' --agent claude --id {id} --yes"),
+                "{evil}"
+            );
+        }
+    }
+    // допустимое имя с пробелом и кириллицей — в кавычках
+    let j = setup(
+        &a,
+        &a.token,
+        &format!("solution=new&name={}", enc("Мой проект v2.0")),
+    )
+    .await;
+    let c = j["init_cmd"]["linux"].as_str().unwrap();
+    assert!(c.contains(" --name 'Мой проект v2.0' --yes"), "{c}");
     // решение уже зарегистрировано — только --id
     let r = a
         .t(

@@ -169,7 +169,11 @@ fn read_flags(path: &Path, env: &Env) -> HookFlags {
     }
     let parsed = std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
-        .and_then(|t| toml::from_str::<ConfigFile>(&t).map_err(|e| e.message().to_string()));
+        .and_then(|t| {
+            // BOM в начале файла (fix round 3)
+            toml::from_str::<ConfigFile>(t.strip_prefix('\u{feff}').unwrap_or(&t))
+                .map_err(|e| e.message().to_string())
+        });
     match parsed {
         Ok(c) => c.hooks,
         Err(e) => {

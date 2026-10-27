@@ -805,7 +805,10 @@ fn mcp_proxy_answers_every_request_on_transport_errors() {
     let r = run(&cut, format!("{}\n", req(8)).into_bytes());
     assert!(err_of(&r, json!(8)).contains("чтение ответа"), "{r:?}");
     // сервер недоступен: пачка — ошибка на каждый id; не UTF-8 — −32700, работа продолжается
-    let mut stdin = b"\xff\xfe\n".to_vec();
+    // строка длиннее 4 МиБ — −32600, работа продолжается (fix round 3, N-5)
+    let mut stdin = vec![b'x'; 4 * 1024 * 1024 + 10];
+    stdin.push(b'\n');
+    stdin.extend_from_slice(b"\xff\xfe\n");
     stdin.extend(
         format!(
             "{}\n",
@@ -814,8 +817,63 @@ fn mcp_proxy_answers_every_request_on_transport_errors() {
         .into_bytes(),
     );
     let r = run("http://127.0.0.1:9", stdin);
-    assert_eq!(r.len(), 3, "{r:?}");
-    assert_eq!(r[0]["error"]["code"], -32700, "{r:?}");
+    assert_eq!(r.len(), 4, "{r:?}");
+    assert_eq!(r[0]["error"]["code"], -32600, "{r:?}");
+    assert_eq!(r[1]["error"]["code"], -32700, "{r:?}");
     err_of(&r, json!(1));
     err_of(&r, json!(2));
+}
+
+#[test]
+fn init_both_tokens_differ_and_stale_tmp_removed() {
+    let (url, tok) = start("both-tokens");
+    let p = Proj::new("both-tokens", &url, &tok);
+    let other = "zam_000000000000000000000000000000000000000002";
+    let block = |t: &str| {
+        format!(
+            "<!-- zeroaimemory:begin v1 -->\nZeroAIMemoryUrl={url}\nZeroAIMemoryToken={t}\n<!-- zeroaimemory:end -->\n"
+        )
+    };
+    std::fs::write(p.repo.join("CLAUDE.md"), block(&tok)).unwrap();
+    std::fs::write(p.repo.join("AGENTS.md"), block(other)).unwrap();
+    // временный файл прерванного запуска (fix round 3, N-4)
+    std::fs::create_dir_all(p.repo.join(".claude")).unwrap();
+    let stale = p.repo.join(".claude/.settings.json.zam-init.999.tmp");
+    std::fs::write(&stale, "{").unwrap();
+    let keep = p.repo.join(".claude/.settings.json.mine.tmp");
+    std::fs::write(&keep, "чужой").unwrap();
+    let o = p
+        .cmd()
+        .args(["init", "--agent", "both", "--yes"])
+        .output()
+        .unwrap();
+    ok(&o);
+    assert!(err(&o).contains("разные токены"), "{}", err(&o));
+    let home = std::fs::read_to_string(p.home.join(".zeroaimemory/config.toml")).unwrap();
+    assert!(home.contains(&tok) && !home.contains(other), "{home}");
+    for f in ["CLAUDE.md", "AGENTS.md"] {
+        let t = p.read(f);
+        assert!(!t.contains(&tok) && !t.contains(other), "{f}: {t}");
+    }
+    assert!(!stale.exists(), "временный файл zam init удалён");
+    assert!(keep.exists(), "чужой файл не тронут");
+}
+
+/// Симлинк AGENTS.md → CLAUDE.md остаётся ссылкой, пишется целевой файл (fix round 3, N-3).
+#[cfg(unix)]
+#[test]
+fn init_keeps_symlink_and_writes_target() {
+    let (url, tok) = start("symlink");
+    let p = Proj::new("symlink", &url, &tok);
+    std::fs::write(p.repo.join("CLAUDE.md"), "# свой текст\n").unwrap();
+    std::os::unix::fs::symlink("CLAUDE.md", p.repo.join("AGENTS.md")).unwrap();
+    let o = p.init(&["--agent", "codex", "--yes"], "");
+    ok(&o);
+    let meta = std::fs::symlink_metadata(p.repo.join("AGENTS.md")).unwrap();
+    assert!(meta.file_type().is_symlink(), "ссылка сохранена");
+    let t = p.read("CLAUDE.md");
+    assert!(
+        t.starts_with("# свой текст\n\n<!-- zeroaimemory:begin v2 -->"),
+        "{t}"
+    );
 }

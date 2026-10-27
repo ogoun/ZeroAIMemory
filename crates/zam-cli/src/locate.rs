@@ -236,7 +236,8 @@ pub fn resolve(
             Read::Failed(e) => {
                 return Err(format!("не удалось прочитать {}: {e}", path.display()));
             }
-            Read::Text(t) => toml::from_str(&t)
+            // BOM в начале файла (fix round 3)
+            Read::Text(t) => toml::from_str(t.strip_prefix('\u{feff}').unwrap_or(&t))
                 .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
         };
         if r.url.is_none()

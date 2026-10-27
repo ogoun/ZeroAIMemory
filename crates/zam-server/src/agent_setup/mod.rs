@@ -280,12 +280,35 @@ pub fn solution_toml(s: &SolutionRef) -> String {
 
 /// Аргумент в одинарных кавычках POSIX shell: `'` → `'\''` (fix round 1, I-3).
 pub fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\''"))
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Аргумент в одинарных кавычках PowerShell: `'` → `''` (fix round 1, I-3).
+/// Аргумент в одинарных кавычках PowerShell: каждая одинарная кавычка удваивается — `'` и
+/// типографские U+2018, U+2019, U+201A, U+201B, которые PowerShell тоже считает кавычками
+/// (fix round 1, I-3; fix round 3).
 pub fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// Имя решения годится для `--name` однострочника (fix round 3): 1–128 символов из букв,
+/// цифр, пробела, `.`, `_`, `-` (`^[\p{L}\p{N} ._-]{1,128}$`). Иное имя в однострочник не
+/// попадает — `zam init` возьмёт имя каталога, переименование — `zam solution rename`;
+/// экранирование остаётся второй защитой.
+pub fn safe_cli_name(name: &str) -> bool {
+    let n = name.chars().count();
+    (1..=128).contains(&n)
+        && name
+            .chars()
+            .all(|c| c.is_alphabetic() || c.is_numeric() || matches!(c, ' ' | '.' | '_' | '-'))
 }
 
 /// Команды установки `zam` с сервера (`GET /downloads/zam/{os}-{arch}`) (fix round 1, M-1, M-2):
@@ -341,7 +364,7 @@ fn init_line(c: &InitCmd<'_>, quote: fn(&str) -> String) -> String {
     s.push_str(&format!(" --agent {agent}"));
     if let Some(sol) = c.solution {
         s.push_str(&format!(" --id {}", sol.guid));
-        if !c.registered {
+        if !c.registered && safe_cli_name(&sol.name) {
             s.push_str(&format!(" --name {}", quote(&sol.name)));
         }
     }
@@ -439,15 +462,67 @@ mod tests {
         assert_eq!(
             c["linux"],
             "zam init --url 'http://h:1' --agent codex --id 0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e11 \
-             --name 'Trading \"X\"' --no-hooks --no-mcp --lang en --yes"
+             --no-hooks --no-mcp --lang en --yes",
+            "имя с кавычками в однострочник не попадает"
+        );
+        let s = SolutionRef {
+            name: "Trading X".into(),
+            ..sol()
+        };
+        let c = init_cmd(&InitCmd {
+            url: "http://h:1",
+            token: None,
+            agent: AgentKind::Claude,
+            solution: Some(&s),
+            registered: false,
+            hooks: true,
+            mcp: true,
+            lang: Lang::Ru,
+        });
+        assert!(
+            c["windows"]
+                .as_str()
+                .unwrap()
+                .contains(" --name 'Trading X' --yes"),
+            "{c}"
         );
     }
 
     #[test]
     fn shell_quoting() {
         let n = "x$(id)`whoami`'\"";
-        assert_eq!(sh_quote(n), "'x$(id)`whoami`'\''\"'");
-        assert_eq!(ps_quote(n), "'x$(id)`whoami`''\"'");
+        assert_eq!(sh_quote(n), r#"'x$(id)`whoami`'\''"'"#);
+        assert_eq!(ps_quote(n), r#"'x$(id)`whoami`''"'"#);
+        assert_eq!(
+            ps_quote("a\u{2019}b\u{2018}"),
+            "'a\u{2019}\u{2019}b\u{2018}\u{2018}'"
+        );
+        assert!(safe_cli_name("Платформа v2.0 core_x-1"));
+        for bad in ["", "a'b", "a;b", "x$(id)", "a\"b", "a`b", &"я".repeat(129)] {
+            assert!(!safe_cli_name(bad), "{bad}");
+        }
+    }
+
+    /// Строка в кавычках POSIX shell доходит до команды байт в байт (настоящий `sh`).
+    #[cfg(unix)]
+    #[test]
+    fn sh_quote_roundtrip_real_shell() {
+        for v in [
+            "a'; rm -rf ~; '",
+            "x$(id)`whoami`'\"",
+            "''",
+            "'",
+            "пробел и \\ обратная черта",
+            "$HOME ${PATH} !! *",
+        ] {
+            let o = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", sh_quote(v)))
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{v}");
+            assert_eq!(String::from_utf8(o.stdout).unwrap(), v);
+        }
     }
 
     #[test]

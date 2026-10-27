@@ -33,6 +33,9 @@ struct Session {
 
 /// Предел тела ответа, байт.
 const BODY_MAX: u64 = 64 * 1024 * 1024;
+/// Предел длины строки stdin, байт (fix round 3, N-5): длиннее — ошибка −32600, остаток
+/// строки до `\n` пропускается.
+pub const LINE_MAX: usize = 4 * 1024 * 1024;
 /// Предел одновременных запросов (M-7).
 pub const MAX_INFLIGHT: usize = 16;
 /// Код ошибки JSON-RPC прокси (транспорт).
@@ -240,10 +243,17 @@ pub fn run(ctx: Ctx) -> Result<(), CliError> {
     let mut stdin = std::io::stdin().lock();
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        match stdin.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        match read_line_limited(&mut stdin, &mut buf, LINE_MAX) {
+            Ok(Line::Eof) | Err(_) => break,
+            Ok(Line::TooLong) => {
+                write_line(&rpc_error(
+                    &Value::Null,
+                    -32600,
+                    &format!("сообщение длиннее {LINE_MAX} байт — пропущено"),
+                ));
+                continue;
+            }
+            Ok(Line::Ok) => {}
         }
         let line = match std::str::from_utf8(&buf) {
             Ok(s) => s.trim().to_string(),
@@ -282,6 +292,50 @@ pub fn run(ctx: Ctx) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Итог чтения строки.
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    Ok,
+    /// Длиннее предела: прочитано и отброшено до `\n` включительно.
+    TooLong,
+    Eof,
+}
+
+/// Строка до `\n` в `buf` (без накопления больше `max` байт).
+fn read_line_limited(r: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> std::io::Result<Line> {
+    buf.clear();
+    let mut too_long = false;
+    let mut any = false;
+    loop {
+        let chunk = r.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(match (any, too_long) {
+                (false, _) => Line::Eof,
+                (true, true) => Line::TooLong,
+                (true, false) => Line::Ok,
+            });
+        }
+        any = true;
+        let (part, done) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (&chunk[..=i], true),
+            None => (chunk, false),
+        };
+        let n = part.len();
+        if !too_long {
+            if buf.len() + n > max + 1 {
+                too_long = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(part);
+            }
+        }
+        r.consume(n);
+        if done {
+            return Ok(if too_long { Line::TooLong } else { Line::Ok });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +355,22 @@ mod tests {
             Some("{\"a\":[1,2]}")
         );
         assert_eq!(compact("  "), None);
+    }
+
+    #[test]
+    fn long_line_skipped_to_newline() {
+        let data = format!("{}\nok\n{}", "x".repeat(20), "y".repeat(3));
+        let mut r = std::io::BufReader::with_capacity(4, data.as_bytes());
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line_limited(&mut r, &mut buf, 8).unwrap(),
+            Line::TooLong
+        );
+        assert_eq!(read_line_limited(&mut r, &mut buf, 8).unwrap(), Line::Ok);
+        assert_eq!(buf, b"ok\n");
+        assert_eq!(read_line_limited(&mut r, &mut buf, 8).unwrap(), Line::Ok);
+        assert_eq!(buf, b"yyy");
+        assert_eq!(read_line_limited(&mut r, &mut buf, 8).unwrap(), Line::Eof);
     }
 
     #[test]

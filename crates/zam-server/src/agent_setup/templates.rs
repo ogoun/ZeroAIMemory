@@ -26,7 +26,7 @@ ZeroAIMemoryUrl={url}
 - Ошибка, ловушка → `memory_log insight` (gotcha|failure; scope=global, если не про проект) с триггерами; эксперимент — с результатом.
 - Изменение проекта → `memory_log changelog`; устарело → `memory_update_entry` supersede/retract.
 - Правка записи — с `rev`; на 409/428 перечитай.
-- `axiom` ставь, правь, снимай только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` рядом и скажи пользователю.
+- `axiom` ставь, правь, снимай только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` рядом и скажи пользователю. Смену `certainty` сопровождай `reason`.
 - Секреты → `memory_vault`. Заметке — `l0`. {rules}
 - «ZeroAIMemory:» — накопленные знания. Без хуков: перед новым типом файла и после ошибки — `memory_recall`.
 ";
@@ -48,7 +48,7 @@ Rules:
 - Error, gotcha → `memory_log insight` (gotcha|failure; scope=global if not about the project) with triggers; experiment — with its result.
 - Project change → `memory_log changelog`; outdated → `memory_update_entry` supersede/retract.
 - Edit a record with `rev`; on 409/428 reread.
-- Set, change or remove `axiom` only on the user's direct instruction; if you disagree — add `hypothesis`/`theorem` alongside and tell the user.
+- Set, change or remove `axiom` only on the user's direct instruction; if you disagree — add `hypothesis`/`theorem` alongside and tell the user. Give a `reason` for every `certainty` change.
 - Secrets → `memory_vault`. Give notes an `l0`. {rules}
 - \"ZeroAIMemory:\" lines are accumulated knowledge. Without hooks: before a new file type and after an error — `memory_recall`.
 ";
