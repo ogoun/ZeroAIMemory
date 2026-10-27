@@ -62,11 +62,22 @@ async fn rpc(a: &Api, tok: &str, extra: &[(&str, &str)], method: &str, params: V
     j["result"].clone()
 }
 
-/// Результат инструмента: (текст, isError, structuredContent).
+/// Результат инструмента: текст и isError.
 struct Out {
     text: String,
     is_error: bool,
-    structured: Value,
+}
+
+impl Out {
+    /// JSON ответа `format: "json"` — текст без последней строки `~N tok`.
+    fn json(&self) -> Value {
+        let body = self
+            .text
+            .trim_end()
+            .rsplit_once('\n')
+            .map_or("", |(b, _)| b);
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("не JSON ({e}): {}", self.text))
+    }
 }
 
 async fn tool(a: &Api, tok: &str, extra: &[(&str, &str)], name: &str, args: Value) -> Out {
@@ -84,10 +95,11 @@ async fn tool(a: &Api, tok: &str, extra: &[(&str, &str)], name: &str, args: Valu
         last.starts_with('~') && last.ends_with(" tok"),
         "{name}: последняя строка не ~N tok: {text}"
     );
+    // JSON не дублируется в structuredContent (только текст)
+    assert!(r.get("structuredContent").is_none(), "{r}");
     Out {
         text,
         is_error: r["isError"].as_bool() == Some(true),
-        structured: r["structuredContent"].clone(),
     }
 }
 
@@ -201,7 +213,7 @@ async fn mcp_search_returns_md_cards() {
     assert!(o.text.contains(&format!("n:{id}")), "{}", o.text);
     assert!(o.text.contains("Инструменты/Ripgrep"), "{}", o.text);
     assert!(o.text.contains("rev1"), "{}", o.text);
-    // format=json — JSON ответа REST и structuredContent
+    // format=json — JSON ответа REST в тексте
     let o = ok(
         &a,
         &a.token,
@@ -210,7 +222,7 @@ async fn mcp_search_returns_md_cards() {
         json!({"query": "ripgrep hidden", "format": "json"}),
     )
     .await;
-    assert_eq!(o.structured["items"][0]["node_id"], id, "{}", o.structured);
+    assert_eq!(o.json()["items"][0]["node_id"], id, "{}", o.text);
     // дерево с L0
     let o = ok(&a, &a.token, &[], "memory_tree", json!({"depth": 2})).await;
     assert!(o.text.contains("Инструменты/Ripgrep"), "{}", o.text);
@@ -707,4 +719,225 @@ async fn mcp_vault_get_audited() {
     )
     .await;
     assert!(o.is_error, "{}", o.text);
+}
+
+#[tokio::test]
+async fn mcp_foreign_origin_403() {
+    let a = api("mcp-origin", |_| {}).await;
+    let auth = format!("Bearer {}", a.token);
+    // чужая страница — 403 problem до проверки токена и разбора JSON-RPC
+    for origin in ["http://evil.example", "http://memory.lan:7701", "null"] {
+        let r = rpc_raw(
+            &a,
+            Some(&auth),
+            &[("origin", origin)],
+            "tools/list",
+            json!({}),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{origin}: {}", r.text());
+        assert_eq!(r.header("content-type"), "application/problem+json");
+    }
+    // своя страница (Origin = Host) и запрос без Origin — проходят
+    let r = rpc_raw(
+        &a,
+        Some(&auth),
+        &[("origin", "http://memory.lan:7700")],
+        "tools/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+}
+
+async fn vault_call(a: &Api, tok: &str, extra: &[(&str, &str)], args: Value) -> Out {
+    tool(a, tok, extra, "memory_vault", args).await
+}
+
+/// Регистр имени важен (уникальный индекс его учитывает): `set` — только точное имя, `get` —
+/// точное, иначе единственное без учёта регистра, несколько — ошибка со списком; нет — 404.
+#[tokio::test]
+async fn mcp_vault_name_case() {
+    let a = api("mcp-vault-case", |_| {}).await;
+    let h = sess();
+    let set = |name: &str, value: &str| json!({"action": "set", "name": name, "value": value});
+    let get = |name: &str| json!({"action": "get", "name": name});
+    // сценарий А: DB_PASS и db_pass — два секрета, set не трогает «почти тот же»
+    let o = vault_call(&a, &a.token, &h, set("DB_PASS", "value-upper-1")).await;
+    assert!(!o.is_error && o.text.contains("rev1"), "{}", o.text);
+    let o = vault_call(&a, &a.token, &h, set("db_pass", "value-lower-1")).await;
+    assert!(
+        !o.is_error && o.text.contains("rev1"),
+        "новый секрет, а не ревизия DB_PASS: {}",
+        o.text
+    );
+    let o = vault_call(&a, &a.token, &h, get("DB_PASS")).await;
+    assert!(
+        !o.is_error && o.text.contains("value-upper-1"),
+        "{}",
+        o.text
+    );
+    let o = vault_call(&a, &a.token, &h, get("db_pass")).await;
+    assert!(
+        !o.is_error && o.text.contains("value-lower-1"),
+        "{}",
+        o.text
+    );
+    // сценарий Б: точного нет, без учёта регистра — два кандидата → ошибка со списком
+    let o = vault_call(&a, &a.token, &h, get("Db_Pass")).await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("409"), "{}", o.text);
+    assert!(
+        o.text.contains("DB_PASS") && o.text.contains("db_pass"),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("value-"), "значения в списке: {}", o.text);
+    // единственный без учёта регистра — находится
+    let o = vault_call(&a, &a.token, &h, set("GitHub", "value-gh")).await;
+    assert!(!o.is_error, "{}", o.text);
+    let o = vault_call(&a, &a.token, &h, get("github")).await;
+    assert!(!o.is_error && o.text.contains("value-gh"), "{}", o.text);
+    // нет — 404 с пространствами поиска
+    let o = vault_call(&a, &a.token, &h, get("нет-такого")).await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(
+        o.text.contains("404") && o.text.contains("knowledge"),
+        "{}",
+        o.text
+    );
+}
+
+/// Участник решения через `memory_vault` видит только свои секреты (решения и личные), не
+/// Vault владельца — ни личный, ни решения.
+#[tokio::test]
+async fn mcp_vault_member_isolated() {
+    let a = api("mcp-vault-member", |_| {}).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    assert_eq!(register(&a, &a_tok).await, StatusCode::CREATED);
+    assert_eq!(register(&a, &b_tok).await, StatusCode::ACCEPTED);
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let hdr = [("x-zam-solution", G)];
+    let set = |scope: &str, name: &str, value: &str| json!({"action": "set", "scope": scope, "name": name, "value": value});
+    for (tok, args) in [
+        (
+            &a_tok,
+            set("global", "owner-personal", "val-owner-personal"),
+        ),
+        (
+            &a_tok,
+            set("solution", "owner-solution", "val-owner-solution"),
+        ),
+        (
+            &b_tok,
+            set("solution", "member-solution", "val-member-solution"),
+        ),
+    ] {
+        let o = vault_call(&a, tok, &hdr, args).await;
+        assert!(!o.is_error, "{}", o.text);
+    }
+    // список решения у участника — только его секрет; личный Vault — без секретов владельца
+    let o = vault_call(&a, &b_tok, &hdr, json!({"action": "list"})).await;
+    assert!(
+        !o.is_error && o.text.contains("member-solution"),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("owner-"), "{}", o.text);
+    let o = vault_call(
+        &a,
+        &b_tok,
+        &hdr,
+        json!({"action": "list", "scope": "global"}),
+    )
+    .await;
+    assert!(!o.is_error && !o.text.contains("owner-"), "{}", o.text);
+    // секреты владельца по имени не раскрываются
+    for name in ["owner-personal", "owner-solution"] {
+        let o = vault_call(&a, &b_tok, &hdr, json!({"action": "get", "name": name})).await;
+        assert!(o.is_error, "{name}: {}", o.text);
+        assert!(!o.text.contains("val-owner"), "{}", o.text);
+    }
+    let o = vault_call(
+        &a,
+        &b_tok,
+        &hdr,
+        json!({"action": "get", "name": "member-solution"}),
+    )
+    .await;
+    assert!(
+        !o.is_error && o.text.contains("val-member-solution"),
+        "{}",
+        o.text
+    );
+}
+
+/// Настоящий процесс с `log.level = debug`: значение секрета, прошедшее через `memory_vault`
+/// `set` и `get`, не попадает ни в журнал, ни в stderr (`rmcp` пишет JSON-RPC на debug —
+/// он ограничен `warn`).
+#[test]
+fn mcp_vault_value_not_in_debug_log() {
+    use common::process::ServerProc;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::{Duration, Instant};
+
+    let root = common::tmp("mcp-log");
+    let data = root.join("data");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, common::qdrant::free_port()));
+    let mut c = common::cfg_in(data.clone());
+    c.server.bind = addr;
+    c.log.level = "debug".into();
+    c.log.format = zam_server::config::LogFormat::Text;
+    let conf = root.join("zam.toml");
+    std::fs::write(&conf, toml::to_string(&c).unwrap()).unwrap();
+    let mut srv = ServerProc::start(&conf, addr);
+    let token = srv.initial_token(Duration::from_secs(120));
+    let t = Instant::now();
+    while srv.try_call("GET", "/api/v1/spaces", &token, None).is_err() {
+        srv.assert_running("приём соединений");
+        assert!(
+            t.elapsed() < Duration::from_secs(120),
+            "сервер не слушает порт"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let value = "mcp-log-secret-7f3a91";
+    let accept = [("Accept", "application/json, text/event-stream")];
+    let call = |args: Value| {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "memory_vault", "arguments": args}});
+        let (code, j) = srv.call_h("POST", "/mcp", &token, Some(&body), &accept);
+        assert_eq!(code, 200, "{j}");
+        assert_ne!(j["result"]["isError"].as_bool(), Some(true), "{j}");
+        j["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    call(json!({"action": "set", "name": "github", "value": value}));
+    assert!(call(json!({"action": "get", "name": "github"})).contains(value));
+    srv.kill();
+    let mut log = String::new();
+    for e in std::fs::read_dir(data.join("logs")).unwrap().flatten() {
+        if e.file_name()
+            .to_string_lossy()
+            .starts_with("zam-server.log")
+        {
+            log.push_str(&String::from_utf8_lossy(&std::fs::read(e.path()).unwrap()));
+        }
+    }
+    // журнал содержателен: debug-строки сервера в нём есть
+    assert!(log.contains("DEBUG"), "журнал без debug-строк");
+    assert!(!log.contains(value), "значение Vault в журнале");
+    assert!(!srv.tail().contains(value), "значение Vault в stderr");
 }

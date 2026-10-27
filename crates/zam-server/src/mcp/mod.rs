@@ -20,7 +20,9 @@
 //!   слушает LAN под своим именем (`memory.lan`), а защита от DNS rebinding не нужна —
 //!   без bearer-токена, который браузер сам не подставит, `/mcp` отвечает 401.
 //! - **Логи** — имя инструмента, признак ошибки и длительность (DEBUG); аргументы и ответы
-//!   (тексты заметок, значения Vault, промпты) в журнал не попадают.
+//!   (тексты заметок, значения Vault, промпты) в журнал не попадают; сам `rmcp` пишет JSON-RPC
+//!   на debug/trace — его уровень ограничен `warn` в [`crate::logging`].
+//! - **Origin** — если есть, должен совпадать с `Host` ([`same_origin`]), иначе 403.
 pub mod tools;
 
 use std::net::SocketAddr;
@@ -53,13 +55,18 @@ use crate::error::ApiError;
 /// Путь MCP (под `server.base_path`, как и REST).
 pub const MCP_PATH: &str = "/mcp";
 
-/// Заголовки исходного запроса, которые уходят во внутренние вызовы REST.
-const FORWARDED: [&str; 5] = [
+/// Заголовки исходного запроса, которые уходят во внутренние вызовы REST. Заголовки прокси —
+/// чтобы IP клиента в лимитах и аудите был тем же, что у REST; доверять ли им, решает
+/// `trusted_peer` по `ConnectInfo` (`server.trusted_proxies`), как и для REST.
+const FORWARDED: [&str; 8] = [
     "authorization",
     crate::api::search::SOLUTION_HEADER,
     SESSION_HEADER,
     MACHINE_HEADER,
     AREA_HEADER,
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "forwarded",
 ];
 
 /// Инструкция клиенту в ответе `initialize`.
@@ -88,6 +95,55 @@ pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route_service(MCP_PATH, svc)
         .route_layer(from_fn_with_state(state.clone(), require_bearer))
+        .route_layer(axum::middleware::from_fn(same_origin))
+}
+
+/// `Origin` (если есть) должен совпадать с `Host` — хостом и портом (порт по умолчанию — по
+/// схеме `Origin`); иначе 403 problem. Запрос без `Origin` (агенты, CLI) проходит. Защита от
+/// страниц в браузере, которые шлют запросы на `/mcp` с чужого сайта.
+async fn same_origin(req: Request, next: Next) -> Response {
+    if let Some(origin) = req.headers().get(header::ORIGIN) {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.uri().authority().map(|a| a.to_string()));
+        let ok = origin
+            .to_str()
+            .ok()
+            .zip(host.as_deref())
+            .is_some_and(|(o, h)| origin_matches_host(o, h));
+        if !ok {
+            return ApiError::Denied("Origin не совпадает с Host: запрос с чужой страницы".into())
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// `scheme://host[:port]` против `host[:port]`: хост без учёта регистра, порт — явный или
+/// по умолчанию для схемы `Origin` (http — 80, https — 443).
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let Some((scheme, rest)) = origin.trim().split_once("://") else {
+        return false;
+    };
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return false,
+    };
+    let split = |s: &str| -> Option<(String, u16)> {
+        let a: axum::http::uri::Authority = s.parse().ok()?;
+        Some((
+            a.host().to_ascii_lowercase(),
+            a.port_u16().unwrap_or(default),
+        ))
+    };
+    match (split(rest.trim_end_matches('/')), split(host.trim())) {
+        (Some(o), Some(h)) => o == h,
+        _ => false,
+    }
 }
 
 /// `/mcp` — только с `Authorization: Bearer` действующего токена (тот же [`Principal`], что у
@@ -255,5 +311,30 @@ impl Rest {
             headers,
             body,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_matches_host;
+
+    #[test]
+    fn origin_vs_host() {
+        assert!(origin_matches_host(
+            "http://memory.lan:7700",
+            "memory.lan:7700"
+        ));
+        assert!(origin_matches_host("http://Memory.LAN", "memory.lan:80"));
+        assert!(origin_matches_host("https://memory.lan", "memory.lan"));
+        assert!(!origin_matches_host("https://memory.lan", "memory.lan:80"));
+        assert!(!origin_matches_host(
+            "http://evil.example",
+            "memory.lan:7700"
+        ));
+        assert!(!origin_matches_host(
+            "http://memory.lan:7701",
+            "memory.lan:7700"
+        ));
+        assert!(!origin_matches_host("null", "memory.lan:7700"));
     }
 }

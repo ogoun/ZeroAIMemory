@@ -1,8 +1,8 @@
 //! Инструменты MCP (§13.1): определения (имена, описания до 300 символов, схемы аргументов) и
 //! вызов маршрутов REST через [`Rest`] (решение контроллера R12 — без обхода слоёв).
 //!
-//! - **Ответ** — компактный Markdown; `format: "json"` — JSON ответа REST (и
-//!   `structuredContent`). Последняя строка любого ответа, в том числе ошибки, — `~N tok`
+//! - **Ответ** — компактный Markdown; `format: "json"` — JSON ответа REST в тексте (без
+//!   дубля в `structuredContent`). Последняя строка любого ответа, в том числе ошибки, — `~N tok`
 //!   (счётчик чанкера; у `memory_read` в Markdown — итог самого `/read`).
 //! - **Ошибки сервиса** — результат `isError: true` с текстом problem (`title`, `detail`) и
 //!   подсказкой: 409 — текущая ревизия, дифф (у заметок) и что перечитать; 428 — какую ревизию
@@ -330,19 +330,16 @@ pub fn definitions() -> &'static [Tool] {
 pub struct Output {
     pub text: String,
     pub is_error: bool,
-    structured: Option<Value>,
 }
 
 impl Output {
     pub fn into_result(self) -> CallToolResult {
         let content = vec![ContentBlock::text(self.text)];
-        let mut r = if self.is_error {
+        if self.is_error {
             CallToolResult::error(content)
         } else {
             CallToolResult::success(content)
-        };
-        r.structured_content = self.structured;
-        r
+        }
     }
 }
 
@@ -359,6 +356,9 @@ enum Fail {
         reply: Box<Reply>,
         hint: Option<String>,
     },
+    /// Отказ самого инструмента с семантикой HTTP (секрет не найден — 404, имя
+    /// неоднозначно — 409): тот же вид текста, что у problem REST.
+    Problem { status: StatusCode, detail: String },
     /// Некорректные аргументы.
     Invalid(String),
     /// Сбой внутреннего вызова.
@@ -397,17 +397,14 @@ pub async fn call(tool: ToolName, rest: &Rest, args: JsonObject) -> Output {
         Ok(Done::Md(s)) => Output {
             text: with_tokens(s),
             is_error: false,
-            structured: None,
         },
         Ok(Done::Json(v)) => Output {
             text: with_tokens(v.to_string()),
             is_error: false,
-            structured: v.is_object().then_some(v),
         },
         Err(f) => Output {
             text: with_tokens(fail_text(&f)),
             is_error: true,
-            structured: None,
         },
     }
 }
@@ -434,6 +431,11 @@ fn with_tokens(mut s: String) -> String {
 fn fail_text(f: &Fail) -> String {
     match f {
         Fail::Invalid(m) => format!("Ошибка аргументов: {m}"),
+        Fail::Problem { status, detail } => format!(
+            "Ошибка {} {}: {detail}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Error")
+        ),
         Fail::Internal(m) => format!("Внутренняя ошибка MCP: {m}"),
         Fail::Rest { reply, hint } => {
             let mut s = problem_text(reply);
@@ -1183,39 +1185,79 @@ fn vault_space(rest: &Rest, args: &JsonObject) -> Result<(String, bool), Fail> {
     })
 }
 
-/// Метаданные секрета по имени в пространстве (`GET /spaces/{space}/vault?q=`).
-async fn vault_find(rest: &Rest, space: &str, name: &str) -> Result<Option<Value>, Fail> {
+/// Секреты пространства с именем `name` без учёта регистра (`GET /spaces/{space}/vault?q=`
+/// ищет подстроку без учёта регистра; равенство проверяется здесь).
+async fn vault_named(rest: &Rest, space: &str, name: &str) -> Result<Vec<Value>, Fail> {
     let uri = format!("/api/v1/spaces/{}/vault?q={}", enc(space), enc(name));
     let r = call_rest(rest, Method::GET, &uri, None, &[]).await?;
-    let v = r.json();
-    let items = v["items"].as_array().cloned().unwrap_or_default();
-    Ok(items
-        .iter()
-        .find(|m| m["title"].as_str() == Some(name))
-        .or_else(|| {
-            items.iter().find(|m| {
-                m["title"]
-                    .as_str()
-                    .is_some_and(|t| t.to_lowercase() == name.to_lowercase())
-            })
+    let lower = name.to_lowercase();
+    Ok(r.json()["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|m| {
+                    m["title"]
+                        .as_str()
+                        .is_some_and(|t| t.to_lowercase() == lower)
+                })
+                .cloned()
+                .collect()
         })
-        .cloned())
+        .unwrap_or_default())
 }
 
-/// Секрет по `id` или `name` (без явного `scope` — сначала решение, затем личный Vault).
-async fn vault_locate(rest: &Rest, args: &JsonObject) -> Result<Option<Value>, Fail> {
+/// Секрет с точно таким именем (регистр важен: уникальный индекс имени его учитывает).
+fn exact<'a>(items: &'a [Value], name: &str) -> Option<&'a Value> {
+    items.iter().find(|m| m["title"].as_str() == Some(name))
+}
+
+/// Пространства поиска `get` по имени: явный `scope` — одно; иначе решение из
+/// `X-Zam-Solution` (если есть), затем личный Vault.
+fn vault_candidates(rest: &Rest, args: &JsonObject) -> Result<Vec<String>, Fail> {
+    let (space, explicit) = vault_space(rest, args)?;
+    let mut out = vec![space];
+    if !explicit && out[0] != "knowledge" {
+        out.push("knowledge".into());
+    }
+    Ok(out)
+}
+
+/// Секрет для `get`: по `id`; по `name` — точное совпадение в пространствах по порядку, иначе
+/// единственное совпадение без учёта регистра. Несколько таких — 409 со списком, ни одного —
+/// 404 с пространствами поиска.
+async fn vault_locate(rest: &Rest, args: &JsonObject) -> Result<Value, Fail> {
     if let Some(id) = opt_str(args, "id")? {
-        return Ok(Some(json!({ "id": id.trim() })));
+        return Ok(json!({ "id": id.trim() }));
     }
     let name = req_str(args, "name")?.trim();
-    let (space, explicit) = vault_space(rest, args)?;
-    if let Some(m) = vault_find(rest, &space, name).await? {
-        return Ok(Some(m));
+    let spaces = vault_candidates(rest, args)?;
+    let mut found = Vec::new();
+    for sp in &spaces {
+        found.push(vault_named(rest, sp, name).await?);
     }
-    if !explicit && space != "knowledge" {
-        return vault_find(rest, "knowledge", name).await;
+    if let Some(m) = found.iter().find_map(|items| exact(items, name)) {
+        return Ok(m.clone());
     }
-    Ok(None)
+    let mut loose: Vec<Value> = found.into_iter().flatten().collect();
+    match loose.len() {
+        1 => Ok(loose.remove(0)),
+        0 => Err(Fail::Problem {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("секрет «{name}» не найден (искали: {})", spaces.join(", ")),
+        }),
+        _ => {
+            let list: Vec<String> = loose.iter().map(vault_meta_line).collect();
+            Err(Fail::Problem {
+                status: StatusCode::CONFLICT,
+                detail: format!(
+                    "имени «{name}» без учёта регистра соответствуют несколько секретов —                      укажите точное имя или id:
+{}",
+                    list.join("
+")
+                ),
+            })
+        }
+    }
 }
 
 fn vault_meta_line(m: &Value) -> String {
@@ -1262,9 +1304,7 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
             })
         }
         "get" => {
-            let Some(m) = vault_locate(rest, args).await? else {
-                return Err(Fail::Invalid("секрет не найден".into()));
-            };
+            let m = vault_locate(rest, args).await?;
             let id = m["id"].as_str().unwrap_or("").to_string();
             // раскрытие — `?reveal=1`: аудит `vault.reveal` с сессией и машиной делает REST
             let r = call_rest(
@@ -1295,7 +1335,9 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
                 opt_str(args, "value")?.ok_or_else(|| Fail::Invalid("set: нужен value".into()))?;
             let name = req_str(args, "name")?.trim().to_string();
             let (space, _) = vault_space(rest, args)?;
-            let r = match vault_find(rest, &space, &name).await? {
+            // только точное имя: DB_PASS и db_pass — разные секреты
+            let same = vault_named(rest, &space, &name).await?;
+            let r = match exact(&same, &name) {
                 Some(m) => {
                     let id = m["id"].as_str().unwrap_or("").to_string();
                     let body = json!({ "secret": value });
