@@ -129,8 +129,8 @@ fn reindex_json(o: &ReindexOutcome) -> Value {
     v
 }
 
+/// Лишние параметры запроса игнорируются (как до `only`): строгий разбор сломал бы клиентов.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StatusQuery {
     /// `rechunk` — только ход перенарезки баз (`dbs`).
     only: Option<String>,
