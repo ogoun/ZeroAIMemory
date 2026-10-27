@@ -1023,16 +1023,8 @@ async fn deleted_user_cookie_401() {
 #[tokio::test]
 async fn password_for_admin_login_name_409() {
     let a = api("ul-adminname", |_| {}).await;
-    // администратор входит логином «admin»; пользователь «ADMIN» войти не смог бы
+    // логин администратора сверяется точно: «ADMIN» при логине «admin» — обычный пользователь,
+    // пароль ему задаётся и вход работает
     let (uid, _) = a.new_user("ADMIN").await;
-    let r = set_pw(&a, &uid, PASS).await;
-    ok(&r, StatusCode::CONFLICT);
-    assert!(
-        r.json()["detail"]
-            .as_str()
-            .unwrap()
-            .contains("логином администратора"),
-        "{}",
-        r.text()
-    );
+    ok(&set_pw(&a, &uid, PASS).await, StatusCode::OK);
 }

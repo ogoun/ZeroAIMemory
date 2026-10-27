@@ -1071,6 +1071,20 @@ pub fn hash_password(password: &str) -> Result<String, ConfigError> {
         .map_err(|e| ConfigError::Hash(e.to_string()))
 }
 
+/// Хэш построен тем же алгоритмом и с теми же параметрами, что [`hash_password`]: только тогда
+/// фиктивный хэш неизвестного логина выравнивает время входа с администратором (§11.4).
+pub fn has_default_params(hash: &str) -> bool {
+    let Ok(h) = argon2::PasswordHash::new(hash) else {
+        return false;
+    };
+    let Ok(p) = argon2::Params::try_from(&h) else {
+        return false;
+    };
+    let d = argon2::Params::default();
+    h.algorithm == argon2::Algorithm::Argon2id.ident()
+        && (p.m_cost(), p.t_cost(), p.p_cost()) == (d.m_cost(), d.t_cost(), d.p_cost())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,6 +1677,22 @@ yield_ms = 1
         let c = load(None, &[], &Default::default()).unwrap();
         let AdminSecret::Hash(h) = c.admin_secret(Some("s3cret")).unwrap();
         assert!(h.starts_with("$argon2id$") && !h.contains("s3cret"));
+    }
+
+    #[test]
+    fn default_params_detected() {
+        assert!(has_default_params(
+            &hash_password("пароль-для-теста").unwrap()
+        ));
+        let strong = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(65536, 3, 1, None).unwrap(),
+        );
+        let salt = SaltString::generate(&mut OsRng);
+        let h = strong.hash_password(b"x", &salt).unwrap().to_string();
+        assert!(!has_default_params(&h));
+        assert!(!has_default_params("не хэш"));
     }
 
     #[test]

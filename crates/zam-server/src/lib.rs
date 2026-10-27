@@ -191,6 +191,11 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
             revoke_initial_token(&state.system, t).await;
         }
     }
+    if !crate::config::has_default_params(&state.admin_hash) {
+        tracing::warn!(
+            "хэш пароля администратора с нестандартными параметрами argon2: время ответа входа              выдаёт логин администратора; получите хэш командой `zam-server hash-password`"
+        );
+    }
     tracing::info!(addr = %listener.local_addr()?, version = state.version, "zam-server запущен");
     // действующие веса поиска и пороги чанкинга (секретов нет): по ним eval записывает
     // итоговую конфигурацию прогона
