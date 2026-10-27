@@ -5,8 +5,9 @@
 //! - **Fail-open:** любая ошибка, паника, тайм-аут, выключенный сервер, пустой или битый
 //!   stdin, чужое событие — пустой вывод и код 0. Ошибки — строкой в
 //!   `.zeroaimemory/logs/hooks.log` ([`log`]) без текста промптов, команд и содержимого файлов.
-//! - **Корень** — каталог решения (`.zeroaimemory/solution.toml` вверх от `cwd` из stdin), без
-//!   решения — сам `cwd`; там же `.zeroaimemory/cache/` ([`cache`]) и `.zeroaimemory/logs/`.
+//! - **Корень** — [`project_root`]: каталог с `.zeroaimemory/` вверх от `cwd` из stdin, иначе
+//!   корень git, иначе `cwd`; там `.zeroaimemory/cache/` ([`cache`]) и `.zeroaimemory/logs/`.
+//!   Решение — ближайший `solution.toml` вверх от `cwd`.
 //! - **Бюджеты** (§10.3): тайм-аут HTTP — бюджет минус [`HTTP_RESERVE_MS`] от старта процесса.
 //! - **Переключатели** (решение контроллера R5, [`Settings`]): `[hooks]` в
 //!   `~/.zeroaimemory/config.toml` и `<корень>/.zeroaimemory/config.toml` (проект сильнее
@@ -191,7 +192,8 @@ pub struct Env {
 
 impl Env {
     pub fn new(kind: Kind, agent: Agent, started: Instant, cwd: PathBuf, home: PathBuf) -> Env {
-        let (root, sol_file) = project_root(&cwd);
+        let root = project_root(&cwd, &home);
+        let sol_file = locate::find_solution(&cwd);
         let mut env = Env {
             kind,
             agent,
@@ -303,21 +305,15 @@ impl Env {
     }
 }
 
-/// Корень проекта: каталог решения (`<корень>/.zeroaimemory/solution.toml` или
-/// `<корень>/solution.toml`) вверх от `cwd`, иначе сам `cwd`; второй элемент — файл решения.
-pub fn project_root(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
-    match locate::find_solution(cwd) {
-        Some(p) => {
-            let dir = p.parent().unwrap_or(cwd);
-            let root = if dir.file_name().is_some_and(|n| n == ".zeroaimemory") {
-                dir.parent().unwrap_or(dir)
-            } else {
-                dir
-            };
-            (root.to_path_buf(), Some(p))
-        }
-        None => (cwd.to_path_buf(), None),
-    }
+/// Корень проекта (fix round 1, m-6): ближайший вверх от `cwd` каталог с `.zeroaimemory/`
+/// (кроме домашнего — там `~/.zeroaimemory/config.toml` пользователя), иначе корень git
+/// (каталог с `.git` — каталогом или файлом у worktree), иначе сам `cwd`.
+pub fn project_root(cwd: &Path, home: &Path) -> PathBuf {
+    let marked = cwd
+        .ancestors()
+        .find(|d| *d != home && d.join(".zeroaimemory").is_dir());
+    let git = || cwd.ancestors().find(|d| d.join(".git").exists());
+    marked.or_else(git).unwrap_or(cwd).to_path_buf()
 }
 
 /// Запуск хука: всегда код 0 (fail-open); паника перехватывается и пишется в журнал.
@@ -372,6 +368,56 @@ fn handle(kind: Kind, agent: Agent, started: Instant, raw: &input::Raw) -> Outpu
         Kind::PostTool => post_tool::run(&env, &inp, &settings),
         Kind::Checkpoint => checkpoint::run(&env, &inp, &settings),
     }
+}
+
+/// Переменные, по которым видно, что `zam` запустил Codex (не настройка пользователя вроде
+/// `CODEX_HOME` или `CODEX_API_KEY`): ⚠️ документацией Codex не подтверждены, взяты из его
+/// исходников (песочница команд) — проверить на машине владельца.
+const CODEX_RUNTIME_VARS: [&str; 3] = [
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_THREAD_ID",
+];
+
+/// Команду запустил агент (fix round 1, I-1): `CLAUDECODE=1` (Claude Code ставит её в
+/// подпроцессах инструментов Bash/PowerShell и хуков — документировано), переменные Codex
+/// [`CODEX_RUNTIME_VARS`] или явный `ZAM_AGENT=1`.
+pub fn launched_by_agent(get: &impl Fn(&str) -> Option<String>, names: &[String]) -> bool {
+    let one = |k: &str| get(k).is_some_and(|v| v.trim() == "1");
+    one("CLAUDECODE")
+        || one("ZAM_AGENT")
+        || names
+            .iter()
+            .any(|n| CODEX_RUNTIME_VARS.contains(&n.as_str()))
+}
+
+/// Id сессии из переменной: непустой, до 128 печатных символов.
+fn session_var(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().count() <= 128 && !s.chars().any(char::is_control))
+}
+
+/// Сессия для `X-Zam-Session` команд `zam` (см. `cmd::connect`): `ZAM_SESSION` (`-` — без
+/// сессии), иначе при запуске агентом — `CLAUDE_CODE_SESSION_ID` (⚠️ переменная из журнала
+/// изменений Claude Code 2.1.132, в справочнике не описана) и затем `current` (сессия хуков из
+/// `session.json`); человек — без сессии.
+pub fn agent_session_from(
+    get: impl Fn(&str) -> Option<String>,
+    names: &[String],
+    current: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(v) = get("ZAM_SESSION") {
+        if v.trim() == "-" {
+            return None;
+        }
+        if let Some(s) = session_var(Some(v)) {
+            return Some(s);
+        }
+    }
+    if !launched_by_agent(&get, names) {
+        return None;
+    }
+    session_var(get("CLAUDE_CODE_SESSION_ID")).or_else(current)
 }
 
 /// Процентное кодирование сегмента пути URL (id сессии в `/sessions/{id}`).
@@ -434,6 +480,86 @@ mod tests {
         assert_eq!(encode_segment("a/b c"), "a%2Fb%20c");
         assert_eq!(head_bytes("абв", 3), "а");
         assert_eq!(head_bytes("abc", 10), "abc");
+    }
+
+    #[test]
+    fn project_root_prefers_zeroaimemory_then_git() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp/zam-cli-root");
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let repo = home.join("repo");
+        let sub = repo.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(home.join(".zeroaimemory")).unwrap();
+        // домашний .zeroaimemory — не корень, ближе — git (файл .git у worktree); случай «нет
+        // ничего — cwd» здесь не проверить: каталог тестов лежит внутри git самого проекта
+        std::fs::write(repo.join(".git"), "gitdir: x").unwrap();
+        assert_eq!(project_root(&sub, &home), repo);
+        std::fs::create_dir_all(repo.join("a/.zeroaimemory")).unwrap();
+        assert_eq!(project_root(&sub, &home), repo.join("a"));
+    }
+
+    #[test]
+    fn agent_session_rules() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let names =
+            |pairs: &[(&str, &str)]| pairs.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>();
+        let cur = || Some("hook-s".to_string());
+        // человек: без сессии, даже если файл есть
+        let p: &[(&str, &str)] = &[("CODEX_HOME", "/x")];
+        assert_eq!(
+            agent_session_from(env(&[("CODEX_HOME", "/x")]), &names(p), cur),
+            None
+        );
+        // Claude Code
+        let p: &[(&str, &str)] = &[("CLAUDECODE", "1")];
+        assert_eq!(
+            agent_session_from(env(&[("CLAUDECODE", "1")]), &names(p), cur).as_deref(),
+            Some("hook-s")
+        );
+        let p: &[(&str, &str)] = &[("CLAUDECODE", "1"), ("CLAUDE_CODE_SESSION_ID", "cc")];
+        assert_eq!(
+            agent_session_from(
+                env(&[("CLAUDECODE", "1"), ("CLAUDE_CODE_SESSION_ID", "cc")]),
+                &names(p),
+                cur
+            )
+            .as_deref(),
+            Some("cc")
+        );
+        // Codex и ZAM_AGENT
+        let p: &[(&str, &str)] = &[("CODEX_SANDBOX", "seatbelt")];
+        assert_eq!(
+            agent_session_from(env(&[("CODEX_SANDBOX", "seatbelt")]), &names(p), cur).as_deref(),
+            Some("hook-s")
+        );
+        let p: &[(&str, &str)] = &[("ZAM_AGENT", "1")];
+        assert_eq!(
+            agent_session_from(env(&[("ZAM_AGENT", "1")]), &names(p), cur).as_deref(),
+            Some("hook-s")
+        );
+        // явный ZAM_SESSION сильнее; «-» — без сессии
+        let p: &[(&str, &str)] = &[("ZAM_SESSION", "mine")];
+        assert_eq!(
+            agent_session_from(env(&[("ZAM_SESSION", "mine")]), &names(p), cur).as_deref(),
+            Some("mine")
+        );
+        let p: &[(&str, &str)] = &[("CLAUDECODE", "1"), ("ZAM_SESSION", "-")];
+        assert_eq!(
+            agent_session_from(
+                env(&[("CLAUDECODE", "1"), ("ZAM_SESSION", "-")]),
+                &names(p),
+                cur
+            ),
+            None
+        );
     }
 
     #[test]

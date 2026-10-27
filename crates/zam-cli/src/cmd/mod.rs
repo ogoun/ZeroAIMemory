@@ -98,16 +98,17 @@ pub fn connect(c: &Common) -> Result<Ctx, CliError> {
     })
 }
 
-/// Сессия агента для `X-Zam-Session`: `ZAM_SESSION`, иначе текущая сессия хуков проекта
-/// (`.zeroaimemory/cache/session.json`, не старше 12 ч) — запись в память через `zam`
-/// учитывается в `memory_writes` сессии и `checkpoint` не напоминает зря (R1)
-/// **[решение исполнителя, задача 10 M4]**.
+/// Сессия агента для `X-Zam-Session` (fix round 1, I-1): `ZAM_SESSION` (`-` — без сессии)
+/// сильнее всего; иначе — только если команду запустил агент ([`hook::launched_by_agent`]):
+/// `CLAUDE_CODE_SESSION_ID`, затем текущая сессия хуков проекта (`.zeroaimemory/cache/
+/// session.json`, не старше 12 ч). Человек в обычном терминале пишет без сессии
+/// **[решение контроллера, задача 10 M4]**.
 fn agent_session(cwd: &std::path::Path) -> Option<String> {
-    let env = std::env::var("ZAM_SESSION")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.chars().count() <= 128 && !s.chars().any(char::is_control));
-    env.or_else(|| hook::cache::current_session(&hook::project_root(cwd).0))
+    hook::agent_session_from(
+        |k| std::env::var(k).ok(),
+        &std::env::vars().map(|(k, _)| k).collect::<Vec<_>>(),
+        || hook::cache::current_session(&hook::project_root(cwd, &home_dir())),
+    )
 }
 
 impl Ctx {

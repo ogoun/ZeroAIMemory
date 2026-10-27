@@ -5,14 +5,19 @@
 //!   решения не используется; битый — игнорируется и переписывается при следующем обновлении;
 //! - `hooks.json` — `{fetched_at, server, hooks}`: настройки типов подсказок с сервера из
 //!   ответа `/recall(session_start)` (R5);
-//! - `shown-<сессия>.json` — `{shown, edits, reminded}`: записи, уже показанные `pre-tool`
-//!   в этой сессии, факт правок Write/Edit (для `checkpoint`, R1) и признак напоминания;
-//!   файлы старше [`SHOWN_TTL`] удаляет `session-start`;
+//! - `shown-<сессия>.json` — `{shown, reminded}`: записи, уже показанные `pre-tool` в этой
+//!   сессии, и признак напоминания `checkpoint`;
+//! - `edits-<сессия>` — маркер правок Write/Edit/`apply_patch` (для `checkpoint`, R1): файл есть —
+//!   правки были; создаётся без чтения и перезаписи (fix round 1, m-2);
+//! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
+//!   `shown-*`/`edits-*` старше [`SHOWN_TTL`] и временные `.*.tmp` старше [`TMP_TTL`] удаляет
+//!   `session-start` ([`gc_cache`]);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
 //!   в `memory_writes` сессии хуков **[решение исполнителя]**.
 //!
-//! Запись — временный файл в том же каталоге и rename (атомарно).
+//! Запись — временный файл в том же каталоге и rename (атомарно); на unix файлы кэша — с правами
+//! 0600 (fix round 1, m-8).
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +31,8 @@ use crate::client::{CliError, Client, EXIT_UNREACHABLE, read_json};
 pub const SHOWN_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Срок, в который `session.json` считается текущей сессией (как окно MCP, R13).
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
+/// Срок, после которого брошенный временный файл записи удаляется.
+pub const TMP_TTL: Duration = Duration::from_secs(3600);
 /// Предел файла кэша, байт.
 const CACHE_MAX: u64 = 16 * 1024 * 1024;
 
@@ -97,8 +104,6 @@ struct HooksCache {
 pub struct Shown {
     /// Id записей, показанных `pre-tool` в этой сессии.
     pub shown: Vec<String>,
-    /// В сессии были Write/Edit.
-    pub edits: bool,
     /// `checkpoint` уже напомнил.
     pub reminded: bool,
 }
@@ -120,10 +125,26 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
+    {
+        use std::io::Write;
+        let mut f = private_options().open(&tmp)?;
+        f.write_all(bytes)?;
+    }
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Создание файла кэша: на unix — права 0600 (в кэше — id сессий и заголовки записей).
+fn private_options() -> std::fs::OpenOptions {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
 }
 
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, String> {
@@ -266,10 +287,12 @@ pub fn write_server_hooks(env: &Env, server: &str, hooks: HookFlags) {
     }
 }
 
-/// Имя файла сессии: только `[A-Za-z0-9_-]`, до 128 символов.
+/// Имя файла сессии: очищенный id (`[A-Za-z0-9_-]`, до 64 символов), `-` и 8 hex blake3
+/// исходного id — разные id с одинаковой очисткой не сталкиваются.
 fn session_file_part(id: &str) -> String {
-    id.chars()
-        .take(128)
+    let clean: String = id
+        .chars()
+        .take(64)
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
@@ -277,7 +300,31 @@ fn session_file_part(id: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    let h = blake3::hash(id.as_bytes()).to_hex();
+    format!("{clean}-{}", &h[..8])
+}
+
+pub fn edits_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("edits-{}", session_file_part(session)))
+}
+
+/// Отмечает правки в сессии: маркер создаётся, если его нет (без чтения и перезаписи).
+pub fn mark_edits(env: &Env, session: &str) {
+    let path = edits_path(env, session);
+    if path.exists() {
+        return;
+    }
+    let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| private_options().open(&path));
+    if let Err(e) = r {
+        env.log(&format!("маркер правок сессии: {e}"));
+    }
+}
+
+/// В сессии были правки.
+pub fn had_edits(env: &Env, session: &str) -> bool {
+    edits_path(env, session).is_file()
 }
 
 pub fn shown_path(env: &Env, session: &str) -> PathBuf {
@@ -301,23 +348,28 @@ pub fn write_shown(env: &Env, session: &str, s: &Shown) {
     }
 }
 
-/// Удаляет `shown-*.json` старше [`SHOWN_TTL`].
-pub fn gc_shown(env: &Env) {
+/// Удаляет `shown-*.json` и `edits-*` старше [`SHOWN_TTL`] и временные `.*.tmp` старше
+/// [`TMP_TTL`].
+pub fn gc_cache(env: &Env) {
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
         return;
     };
     for e in rd.flatten() {
         let name = e.file_name();
         let Some(n) = name.to_str() else { continue };
-        if !(n.starts_with("shown-") && n.ends_with(".json")) {
+        let ttl = if (n.starts_with("shown-") && n.ends_with(".json")) || n.starts_with("edits-") {
+            SHOWN_TTL
+        } else if n.starts_with('.') && n.ends_with(".tmp") {
+            TMP_TTL
+        } else {
             continue;
-        }
+        };
         let old = e
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > SHOWN_TTL);
+            .is_some_and(|age| age > ttl);
         if old {
             let _ = std::fs::remove_file(e.path());
         }
@@ -454,7 +506,13 @@ mod tests {
 
     #[test]
     fn session_file_names_are_safe() {
-        assert_eq!(session_file_part("a/b\\c:d"), "a_b_c_d");
-        assert_eq!(session_file_part(&"x".repeat(300)).len(), 128);
+        let a = session_file_part("a/b\\c:d");
+        assert!(
+            a.starts_with("a_b_c_d-") && a.len() == "a_b_c_d-".len() + 8,
+            "{a}"
+        );
+        // одинаковая очистка — разные имена
+        assert_ne!(session_file_part("a/b"), session_file_part("a:b"));
+        assert_eq!(session_file_part(&"x".repeat(300)).len(), 64 + 1 + 8);
     }
 }

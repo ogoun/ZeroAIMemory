@@ -323,7 +323,10 @@ async fn migrate_v12_to_v13() {
 async fn latest_session_by_machine_and_age() {
     let (_dd, db) = db("latest").await;
     let since = || Timestamp::now() - SignedDuration::from_hours(12);
-    assert_eq!(latest_session(&db, None, since()).await.unwrap(), None);
+    assert_eq!(
+        latest_session(&db, None, None, since()).await.unwrap(),
+        None
+    );
     let on = |id: &str, m: &str| SessionTouch {
         id: id.into(),
         machine: Some(m.into()),
@@ -333,21 +336,51 @@ async fn latest_session_by_machine_and_age() {
     touch_session(&db, &on("b", "box-2")).await.unwrap();
     let id = |s: Option<zam_store::Session>| s.map(|s| s.id);
     assert_eq!(
-        id(latest_session(&db, None, since()).await.unwrap()).as_deref(),
+        id(latest_session(&db, None, None, since()).await.unwrap()).as_deref(),
         Some("b")
     );
     assert_eq!(
-        id(latest_session(&db, Some("box-1"), since()).await.unwrap()).as_deref(),
+        id(latest_session(&db, Some("box-1"), None, since())
+            .await
+            .unwrap())
+        .as_deref(),
         Some("a")
     );
     assert_eq!(
-        latest_session(&db, Some("box-3"), since()).await.unwrap(),
+        latest_session(&db, Some("box-3"), None, since())
+            .await
+            .unwrap(),
         None
     );
+    // с решением — только сессии этого решения
+    let g1: zam_core::SolutionGuid = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e71".parse().unwrap();
+    let g2: zam_core::SolutionGuid = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e72".parse().unwrap();
+    touch_session(
+        &db,
+        &SessionTouch {
+            solution_guid: Some(g1.clone()),
+            ..on("a", "box-1")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        id(latest_session(&db, None, Some(&g1), since()).await.unwrap()).as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        latest_session(&db, None, Some(&g2), since()).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        id(latest_session(&db, None, None, since()).await.unwrap()).as_deref(),
+        Some("a")
+    );
+    touch_session(&db, &on("b", "box-2")).await.unwrap();
     // завершённая сессия не подходит
     assert!(end_session(&db, "b", true).await.unwrap());
     assert_eq!(
-        id(latest_session(&db, None, since()).await.unwrap()).as_deref(),
+        id(latest_session(&db, None, None, since()).await.unwrap()).as_deref(),
         Some("a")
     );
     // старше срока — тоже
@@ -361,5 +394,8 @@ async fn latest_session_by_machine_and_age() {
     })
     .await
     .unwrap();
-    assert_eq!(latest_session(&db, None, since()).await.unwrap(), None);
+    assert_eq!(
+        latest_session(&db, None, None, since()).await.unwrap(),
+        None
+    );
 }

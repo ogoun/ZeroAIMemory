@@ -27,7 +27,7 @@
 //!   `session_id` агента, поэтому запрос без `X-Zam-Session` идёт во внутренний REST с
 //!   последней незавершённой сессией пользователя токена, к которой обращались не позже
 //!   [`IMPLICIT_SESSION_HOURS`] ч назад (её создаёт хук `session-start`); с `X-Zam-Machine` —
-//!   только сессией той же машины ([`implicit_session`]). Так запись через MCP попадает в
+//!   только сессией той же машины, с `X-Zam-Solution` — того же решения ([`implicit_session`]). Так запись через MCP попадает в
 //!   `memory_writes` сессии хуков и `checkpoint` не напоминает зря. Подходящей нет — без сессии.
 pub mod tools;
 
@@ -245,16 +245,25 @@ impl ServerHandler for McpServer {
 }
 
 /// Сессия для запроса MCP без `X-Zam-Session` (R13): последняя незавершённая сессия
-/// пользователя токена за [`IMPLICIT_SESSION_HOURS`] ч, с `X-Zam-Machine` — той же машины.
+/// пользователя токена за [`IMPLICIT_SESSION_HOURS`] ч, с `X-Zam-Machine` — той же машины, с
+/// `X-Zam-Solution` — того же решения.
 /// Сбой поиска — без сессии (WARN без id).
 async fn implicit_session(st: &AppState, parts: &Parts) -> Option<String> {
     let p = parts.extensions.get::<Principal>()?;
     let user = crate::auth::target_user_id(st, p, &parts.headers).ok()?;
     // некорректный X-Zam-Machine отклонит сам маршрут REST
     let machine = crate::attrib::header_value(&parts.headers, MACHINE_HEADER).ok()?;
+    // с решением — только сессии этого решения; некорректный X-Zam-Solution — как без него
+    let solution: Option<zam_core::SolutionGuid> =
+        crate::attrib::header_value(&parts.headers, crate::api::search::SOLUTION_HEADER)
+            .ok()
+            .flatten()
+            .and_then(|g| g.trim().parse().ok());
     let since = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(IMPLICIT_SESSION_HOURS);
     let found = match st.users.get(user).await {
-        Ok(db) => zam_store::latest_session(&db, machine.as_deref(), since).await,
+        Ok(db) => {
+            zam_store::latest_session(&db, machine.as_deref(), solution.as_ref(), since).await
+        }
         Err(e) => Err(e),
     };
     match found {

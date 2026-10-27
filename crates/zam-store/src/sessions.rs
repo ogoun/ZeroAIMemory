@@ -231,23 +231,28 @@ pub async fn list_sessions(
 }
 
 /// Последняя незавершённая сессия базы с обращением не раньше `since`; `machine` задана —
-/// только сессии этой машины. Нужна MCP без `X-Zam-Session` (решение контроллера R13, задача 10
-/// M4): `.mcp.json` не знает `session_id` агента, и запись через MCP учитывается в сессии хуков.
+/// только сессии этой машины, `solution` задано — только сессии этого решения. Нужна MCP без
+/// `X-Zam-Session` (решение контроллера R13, задача 10 M4): `.mcp.json` не знает `session_id`
+/// агента, и запись через MCP учитывается в сессии хуков.
 pub async fn latest_session(
     db: &Db,
     machine: Option<&str>,
+    solution: Option<&SolutionGuid>,
     since: Timestamp,
 ) -> Result<Option<Session>, StoreError> {
-    let (machine, since) = (machine.map(str::to_string), fmt_ts(since));
+    let machine = machine.map(str::to_string);
+    let solution = solution.map(|g| g.as_str().to_string());
+    let since = fmt_ts(since);
     db.read(move |c| {
         Ok(c.query_row(
             &format!(
                 "SELECT {SESSION_COLS} FROM sessions
                  WHERE ended_at IS NULL AND last_seen_at >= ?1
                    AND (?2 IS NULL OR machine = ?2)
+                   AND (?3 IS NULL OR solution_guid = ?3)
                  ORDER BY last_seen_at DESC, id DESC LIMIT 1"
             ),
-            params![since, machine],
+            params![since, machine, solution],
             session_row,
         )
         .optional()?)

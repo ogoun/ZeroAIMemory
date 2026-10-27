@@ -368,6 +368,60 @@ async fn mcp_without_session_header_uses_latest_hook_session() {
     assert_eq!((writes("hook-a").await, writes("hook-b").await), (1, 1));
 }
 
+/// R13 + решение: с `X-Zam-Solution` запись засчитывается сессии этого решения, а не просто
+/// последней (fix round 1 задачи 10).
+#[tokio::test]
+async fn mcp_implicit_session_filtered_by_solution() {
+    let a = api("mcp-implicit-solution", |_| {}).await;
+    const G1: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e81";
+    const G2: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e82";
+    for (id, g) in [("sol-1", G1), ("sol-2", G2)] {
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/sessions",
+                Some(json!({"id": id, "agent": "codex", "solution": g})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    let writes = |id: &'static str| {
+        let a = &a;
+        async move {
+            let s = a
+                .t(Method::GET, &format!("/api/v1/sessions/{id}"), None)
+                .await;
+            s.json()["memory_writes"].as_i64().unwrap()
+        }
+    };
+    // «sol-2» свежее, но решение запроса — G1
+    ok(
+        &a,
+        &a.token,
+        &[("x-zam-solution", G1)],
+        "memory_write",
+        json!({"path": "knowledge:/Решение сессии/A", "content": "# A
+
+текст
+"}),
+    )
+    .await;
+    assert_eq!((writes("sol-1").await, writes("sol-2").await), (1, 0));
+    // без решения — последняя сессия пользователя (после записи свежее «sol-1»)
+    ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": "knowledge:/Решение сессии/B", "content": "# B
+
+текст
+"}),
+    )
+    .await;
+    assert_eq!((writes("sol-1").await, writes("sol-2").await), (2, 0));
+}
+
 #[tokio::test]
 async fn mcp_write_conflict_is_tool_error() {
     let a = api("mcp-conflict", |_| {}).await;

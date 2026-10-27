@@ -19,7 +19,16 @@ const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e61";
 const DEAD: &str = "http://127.0.0.1:9";
 /// Запас времени R3: `pre-tool` — ×4 от 50 мс.
 const PRE_TOOL_P95_MAX: Duration = Duration::from_millis(200);
-/// Запас времени R3 для остальных: ×2 от бюджета, но не меньше 1 с.
+/// Предел времени R3 по команде (fix round 1, m-1): ×4 от бюджета §10.3 — `checkpoint`
+/// 400 мс, `session-start` 1200 мс, `prompt` и `post-tool` 1000 мс.
+fn max_for(kind: &str) -> Duration {
+    Duration::from_millis(match kind {
+        "checkpoint" => 400,
+        "session-start" => 1200,
+        _ => 1000,
+    })
+}
+/// Предел для прочих замеров процесса (без сети, огромный ввод).
 const OTHER_MAX: Duration = Duration::from_secs(1);
 
 /// Тесты файла идут по одному: замеры времени (R3) и бюджеты хуков (270 мс у
@@ -138,6 +147,14 @@ impl Proj {
             "all_proxy",
             "no_proxy",
             "ZAM_SESSION",
+            "ZAM_AGENT",
+            // окружение агента, в котором идут сами тесты, не должно утекать в `zam`
+            "CLAUDECODE",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CODEX_SANDBOX",
+            "CODEX_SANDBOX_NETWORK_DISABLED",
+            "CODEX_THREAD_ID",
         ] {
             c.env_remove(k);
         }
@@ -191,6 +208,19 @@ impl Proj {
 
     fn cache(&self) -> PathBuf {
         self.repo.join(".zeroaimemory/cache")
+    }
+
+    /// Файл кэша сессии: `<prefix>-<сессия>-<8 hex>[<suffix>]` (имя с хэшем id, m-9).
+    fn session_file(&self, prefix: &str, session: &str, suffix: &str) -> Option<PathBuf> {
+        let start = format!("{prefix}-{session}-");
+        std::fs::read_dir(self.cache())
+            .ok()?
+            .flatten()
+            .find_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let rest = n.strip_prefix(&start)?.strip_suffix(suffix)?;
+                (rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit())).then(|| e.path())
+            })
     }
 
     fn log(&self) -> String {
@@ -383,11 +413,13 @@ fn pre_tool_once_per_session() {
     assert!(context(&run("a", "x.sh"), "PreToolUse").contains("i:E1"));
     empty(&run("a", "y/z.sh"));
     assert!(context(&run("b", "x.sh"), "PreToolUse").contains("i:E1"));
-    let shown: Value =
-        serde_json::from_str(&std::fs::read_to_string(p.cache().join("shown-a.json")).unwrap())
-            .unwrap();
+    let shown: Value = serde_json::from_str(
+        &std::fs::read_to_string(p.session_file("shown", "a", ".json").unwrap()).unwrap(),
+    )
+    .unwrap();
     assert_eq!(shown["shown"], json!(["E1"]));
-    assert_eq!(shown["edits"], true);
+    // факт правки — отдельный маркер (m-2)
+    assert!(p.session_file("edits", "a", "").is_some());
     // Bash правкой не считается
     let bash = p.ev(
         "PreToolUse",
@@ -395,7 +427,40 @@ fn pre_tool_once_per_session() {
         json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
     );
     p.hook_at(DEAD, "pre-tool", "claude", bash.to_string().as_bytes());
-    assert!(!p.cache().join("shown-c.json").exists());
+    assert!(p.session_file("edits", "c", "").is_none());
+}
+
+/// Codex `apply_patch` (I-3): пути — из заголовков патча, правка отмечается.
+#[test]
+fn pre_tool_codex_apply_patch_paths() {
+    let _g = serial();
+    let p = Proj::new("pre-patch", DEAD, "zam_x");
+    write_cache(&p, DEAD);
+    let patch = "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-a\n+b\n*** Add File: scripts/deploy.sh\n+#!/bin/sh\n*** End Patch\n";
+    let ev = p.ev(
+        "PreToolUse",
+        "px",
+        json!({"tool_name": "apply_patch", "tool_use_id": "c1",
+               "tool_input": {"command": patch}}),
+    );
+    let (o, _) = p.hook_at(DEAD, "pre-tool", "codex", ev.to_string().as_bytes());
+    let c = context(&o, "PreToolUse");
+    assert!(c.contains("для **/*.sh: Скрипты — только LF"), "{c}");
+    // command_regex к тексту патча не применяется
+    assert!(!c.contains("i:E2"), "{c}");
+    assert!(p.session_file("edits", "px", "").is_some());
+    // патч без подходящих файлов — тишина, но правка отмечена
+    let ev = p.ev(
+        "PreToolUse",
+        "py",
+        json!({"tool_name": "apply_patch",
+               "tool_input": {"command": "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch\n"}}),
+    );
+    empty(
+        &p.hook_at(DEAD, "pre-tool", "codex", ev.to_string().as_bytes())
+            .0,
+    );
+    assert!(p.session_file("edits", "py", "").is_some());
 }
 
 /// `session-start`: сессия на сервере, дайджест с ловушкой, кэш триггеров с ETag; повтор —
@@ -602,7 +667,7 @@ fn checkpoint_reminds_once_and_respects_stop_hook_active() {
         "{v}"
     );
     empty(&stop("cp-1", false));
-    // PreCompact другой сессии — контекст; сервер выключен — тишина
+    // PreCompact — всегда тишина (m-3); сервер выключен — тишина
     start_s("cp-2");
     p.hook("pre-tool", &write_ev(&p, "cp-2", "a.txt"));
     let pc = p.ev(
@@ -610,21 +675,79 @@ fn checkpoint_reminds_once_and_respects_stop_hook_active() {
         "cp-2",
         json!({"trigger": "auto", "custom_instructions": ""}),
     );
+    empty(&p.hook("checkpoint", &pc));
+    let st = p.ev("Stop", "cp-2", json!({"stop_hook_active": false}));
     empty(
-        &p.hook_at(DEAD, "checkpoint", "claude", pc.to_string().as_bytes())
+        &p.hook_at(DEAD, "checkpoint", "claude", st.to_string().as_bytes())
             .0,
     );
-    assert!(context(&p.hook("checkpoint", &pc), "PreCompact").contains("ZeroAIMemory:"));
-    // запись через CLI в текущей сессии хуков (session.json) — напоминания нет
+    // напоминание не израсходовано ни PreCompact, ни выключенным сервером
+    assert_eq!(hook_json(&stop("cp-2", false))["decision"], "block");
+    // сессии на сервере нет (404) — без напоминания (m-4)
+    p.hook("pre-tool", &write_ev(&p, "cp-unknown", "a.txt"));
+    empty(&stop("cp-unknown", false));
+    // запись агентом через CLI в текущей сессии хуков (session.json) — напоминания нет
     start_s("cp-3");
     p.hook("pre-tool", &write_ev(&p, "cp-3", "a.txt"));
-    let o = p.zam(
-        &["log", "changelog", "--kind", "fix", "--title", "Итог"],
-        "Сделано.\n".as_bytes(),
-    );
+    let o = p
+        .cmd(&p.url)
+        .env("CLAUDECODE", "1")
+        .args(["log", "changelog", "--kind", "fix", "--title", "Итог"])
+        .write_stdin("Сделано.\n")
+        .output()
+        .unwrap();
     ok(&o);
     assert!(p.session("cp-3")["memory_writes"].as_i64().unwrap() >= 1);
     empty(&stop("cp-3", false));
+}
+
+/// I-1: `zam` подставляет сессию хуков, только если его запустил агент (`CLAUDECODE=1`,
+/// переменные Codex, `ZAM_AGENT=1`); явный `ZAM_SESSION` сильнее файла, `ZAM_SESSION=-` — без
+/// сессии; человек в терминале — без сессии.
+#[test]
+fn cli_session_only_when_launched_by_agent() {
+    let _g = serial();
+    let (url, tok) = start("cli-session");
+    let p = Proj::new("cli-session", &url, &tok);
+    p.hook(
+        "session-start",
+        &p.ev("SessionStart", "hs-1", json!({"source": "startup"})),
+    );
+    let writes = |id: &str| p.session(id)["memory_writes"].as_i64().unwrap_or(0);
+    let log = |envs: &[(&str, &str)], title: &str| {
+        let mut c = p.cmd(&p.url);
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        let o = c
+            .args(["log", "changelog", "--kind", "fix", "--title", title])
+            .write_stdin("x\n")
+            .output()
+            .unwrap();
+        ok(&o);
+    };
+    // человек: сессии нет, хотя session.json свежий
+    log(&[], "человек");
+    assert_eq!(writes("hs-1"), 0);
+    // агенты
+    log(&[("CLAUDECODE", "1")], "claude");
+    let w1 = writes("hs-1");
+    assert!(w1 >= 1, "{w1}");
+    log(&[("CODEX_SANDBOX", "seatbelt")], "codex");
+    let w2 = writes("hs-1");
+    assert!(w2 > w1, "{w2}");
+    log(&[("ZAM_AGENT", "1")], "явно");
+    let w3 = writes("hs-1");
+    assert!(w3 > w2, "{w3}");
+    // ZAM_SESSION сильнее файла; «-» — без сессии
+    log(
+        &[("CLAUDECODE", "1"), ("ZAM_SESSION", "explicit-1")],
+        "своя",
+    );
+    assert!(writes("explicit-1") >= 1);
+    assert_eq!(writes("hs-1"), w3);
+    log(&[("CLAUDECODE", "1"), ("ZAM_SESSION", "-")], "без");
+    assert_eq!(writes("hs-1"), w3);
 }
 
 /// Сервер выключен: пустой вывод, код 0, строка в `hooks.log`, время в пределе.
@@ -661,7 +784,7 @@ fn fail_open_server_down_empty_exit_0() {
     for (k, v) in &cases {
         let (o, d) = p.hook_at(DEAD, k, "claude", v.to_string().as_bytes());
         empty(&o);
-        assert!(d <= OTHER_MAX, "{k}: {d:?}");
+        assert!(d <= max_for(k), "{k}: {d:?}");
     }
     let log = p.log();
     assert!(
@@ -800,7 +923,7 @@ fn output_is_valid_hook_json_with_event_name() {
         assert_eq!(v.as_object().unwrap().len(), 1, "{v}");
         assert_eq!(v["hookSpecificOutput"].as_object().unwrap().len(), 2, "{v}");
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
-        assert!(d <= OTHER_MAX, "{agent}: {d:?}");
+        assert!(d <= max_for("session-start"), "{agent}: {d:?}");
     }
     // prompt: подсказка (повтор в той же сессии сервер гасит — каждый раз новая сессия)
     let mut found = None;
@@ -857,12 +980,12 @@ fn hooks_settings_disable_types() {
     .unwrap();
     empty(&pre("c"));
     // правка при выключенных подсказках всё равно отмечается для checkpoint
-    let sh = std::fs::read_to_string(p.cache().join("shown-c.json")).unwrap();
-    assert!(sh.contains("\"edits\": true"), "{sh}");
+    assert!(p.session_file("edits", "c", "").is_some());
 }
 
-/// R3: время `session-start`, `prompt`, `post-tool`, `checkpoint` с сервером — ≤ 1 с (p95 из
-/// 20 запусков; значения — в журнал этапа).
+/// R3: время `session-start` (≤ 1200 мс), `prompt` и `post-tool` (≤ 1000 мс), `checkpoint`
+/// (≤ 400 мс) с сервером — p95 из 20 запусков, и каждый ответ непустой (значения — в журнал
+/// этапа).
 #[test]
 fn hooks_with_server_within_margin() {
     let _g = serial();
@@ -874,6 +997,16 @@ fn hooks_with_server_within_margin() {
         "global",
         &["error_regex:bad interpreter"],
     );
+    // ловушка — в дайджест старта, «квазары» — подсказки к запросу
+    p.insight("Скрипты — только LF", "gotcha", "global", &[]);
+    for i in 0..3 {
+        p.insight(
+            &format!("Квазар и пульсар, заметка {i}"),
+            "discovery",
+            "global",
+            &[],
+        );
+    }
     let mut report = Vec::new();
     for (k, mk) in [
         (
@@ -892,7 +1025,7 @@ fn hooks_with_server_within_margin() {
                 p.ev(
                     "UserPromptSubmit",
                     &format!("tm{i}"),
-                    json!({"prompt": "почему shebang ломается"}),
+                    json!({"prompt": "почему квазар светит"}),
                 )
             }),
         ),
@@ -923,12 +1056,12 @@ fn hooks_with_server_within_margin() {
                 p.hook("pre-tool", &write_ev(&p, &format!("tm{i}"), "a.txt"));
             }
             let (o, d) = p.hook_at(&url, k, "claude", mk(i).to_string().as_bytes());
-            assert_eq!(o.status.code(), Some(0));
+            assert!(!ok(&o).trim().is_empty(), "{k} #{i}: пустой ответ");
             times.push(d);
         }
         let q = p95(times);
         report.push(format!("{k} p95={q:?}"));
-        assert!(q <= OTHER_MAX, "{k}: p95 {q:?}");
+        assert!(q <= max_for(k), "{k}: p95 {q:?}");
     }
     eprintln!("ZAM_TIMING {}", report.join(", "));
 }

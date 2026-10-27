@@ -4,9 +4,10 @@
 //! с `source` из stdin и `agent_block_version` (R2), `GET /triggers` с `If-None-Match` (кэш
 //! триггеров). Вывод — дайджест `text`; `hooks` ответа запоминаются (R5).
 //!
-//! **[решение исполнителя]** Выключенный в клиенте `session_start` гасит только дайджест
-//! (`/recall` не вызывается): регистрация сессии и кэш триггеров нужны `checkpoint`, MCP (R13)
-//! и `pre-tool`. Выключенный на сервере — дайджест, полученный в том же ответе, не выводится.
+//! Выключенный в клиенте `session_start` гасит только вывод: `/recall` вызывается всё равно —
+//! ради `hooks` сервера (fix round 1, m-5), текст отбрасывается; регистрация сессии и кэш
+//! триггеров нужны `checkpoint`, MCP (R13) и `pre-tool`. Выключенный на сервере — дайджест,
+//! полученный в том же ответе, не выводится.
 //! На `source` `compact` и `clear` (контекст агента потерян) показанное `pre-tool` в сессии
 //! сбрасывается, факт правок остаётся.
 use std::path::Path;
@@ -25,7 +26,7 @@ const MD_MAX: u64 = 1024 * 1024;
 const BEGIN: &str = "<!-- zeroaimemory:begin";
 
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
-    cache::gc_shown(env);
+    cache::gc_cache(env);
     let session = inp.session_id.as_deref();
     let source = inp.str("source");
     if let Some(id) = session {
@@ -41,7 +42,6 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     let Some(client) = env.client() else {
         return Output::Empty;
     };
-    let digest = s.client_on(Kind::SessionStart);
     let solution = env.solution.as_ref().map(|x| x.id.clone());
     let (reg, recall, trig) = std::thread::scope(|sc| {
         let reg = session.map(|id| {
@@ -49,7 +49,7 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             let c = &client;
             sc.spawn(move || c.post_json("/sessions", &body).map(|_| ()))
         });
-        let recall = digest.then(|| {
+        let recall = {
             let mut body = json!({
                 "event": "session_start",
                 "session_id": session,
@@ -61,9 +61,9 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             }
             let c = &client;
             sc.spawn(move || c.post_json("/recall", &body).and_then(read_json))
-        });
+        };
         let trig = sc.spawn(|| cache::refresh_triggers(env, &client, false));
-        (reg.map(|h| h.join()), recall.map(|h| h.join()), trig.join())
+        (reg.map(|h| h.join()), recall.join(), trig.join())
     });
     match reg {
         Some(Ok(Err(e))) => env.log(&format!("регистрация сессии: {e}")),
@@ -80,13 +80,12 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
         Err(_) => env.log("кэш триггеров: паника"),
     }
     let v: Value = match recall {
-        None => return Output::Empty,
-        Some(Ok(Ok(v))) => v,
-        Some(Ok(Err(e))) => {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
             env.log(&format!("recall(session_start): {e}"));
             return Output::Empty;
         }
-        Some(Err(_)) => {
+        Err(_) => {
             env.log("recall(session_start): паника");
             return Output::Empty;
         }

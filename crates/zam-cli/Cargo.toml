@@ -24,6 +24,8 @@ rpassword.workspace = true
 # globset — Unlicense OR MIT, regex — MIT OR Apache-2.0, оба уже в дереве)
 globset.workspace = true
 regex.workspace = true
+# короткий хэш id сессии в именах файлов кэша (CC0-1.0 OR Apache-2.0, уже в дереве)
+blake3.workspace = true
 
 [dev-dependencies]
 zam-server = { path = "../zam-server" }

@@ -5,9 +5,14 @@
 //!   корня решения (`/` как разделитель; вне корня — полный путь); на Windows без учёта
 //!   регистра; `command_regex` — по `tool_input.command`;
 //! - триггер с `tools` — только для этих инструментов (без учёта регистра);
-//! - запись показывается не больше раза за сессию (`shown-<сессия>.json`); туда же — факт
-//!   правок Write/Edit/MultiEdit/NotebookEdit для `checkpoint` (R1). Факт пишется и при
-//!   выключенном `pre_tool`, если включён `checkpoint` **[решение исполнителя]**.
+//! - Codex правит файлы инструментом `apply_patch` (`tool_input.command` — текст патча): пути для
+//!   `file_glob` — из заголовков `*** Add File:`, `*** Update File:`, `*** Delete File:` (и
+//!   `*** Move to:`), `command_regex` к патчу не применяется (fix round 1, I-3; ⚠️ формат
+//!   входа на живом Codex не проверен);
+//! - запись показывается не больше раза за сессию (`shown-<сессия>.json`); правка
+//!   Write/Edit/MultiEdit/NotebookEdit/`apply_patch` — маркер `edits-<сессия>` для `checkpoint`
+//!   (R1). Маркер пишется и при выключенном `pre_tool`, если включён `checkpoint`
+//!   **[решение исполнителя]**.
 //!
 //! Подсказка: `ZeroAIMemory: для <маска>: <title> [<вид>, <certainty>] — i:<id>`, для команды —
 //! без «для …». Показ `pre_tool` в `usage` сервера не пишется: сети здесь нет.
@@ -28,50 +33,92 @@ const COMMAND_SCAN_MAX: usize = 64 * 1024;
 
 /// Инструменты правки файлов (факт правок для `checkpoint`).
 fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
+    matches!(
+        name,
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch"
+    )
+}
+
+/// Пути файлов из текста патча `apply_patch` (Codex): строки `*** Add File: <путь>`,
+/// `*** Update File: <путь>`, `*** Delete File: <путь>`, `*** Move to: <путь>`.
+pub fn patch_files(patch: &str) -> Vec<String> {
+    const HEADS: [&str; 4] = [
+        "*** Add File:",
+        "*** Update File:",
+        "*** Delete File:",
+        "*** Move to:",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let l = line.trim();
+        if let Some(p) = HEADS.iter().find_map(|h| l.strip_prefix(h)) {
+            let p = p.trim();
+            if !p.is_empty() && !out.iter().any(|x| x == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
 }
 
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     let tool = inp.str("tool_name").unwrap_or_default();
-    let edit = is_edit_tool(tool);
     let hints_on = s.on(Kind::PreTool);
-    let track = edit && s.on(Kind::Checkpoint);
-    if !hints_on && !track {
+    let session = inp.session_id.as_deref();
+    if is_edit_tool(tool)
+        && s.on(Kind::Checkpoint)
+        && let Some(id) = session
+    {
+        cache::mark_edits(env, id);
+    }
+    if !hints_on {
         return Output::Empty;
     }
-    let session = inp.session_id.as_deref();
+    let server = env.server_url();
+    let Some(c) = cache::usable_triggers(env, server.as_deref()) else {
+        return Output::Empty;
+    };
+    let command = command_of(inp);
+    let (files, command) = if tool == "apply_patch" {
+        (patch_files(command.as_deref().unwrap_or_default()), None)
+    } else {
+        let f = inp
+            .tool_input("file_path")
+            .or_else(|| inp.tool_input("notebook_path"));
+        (f.map(str::to_string).into_iter().collect(), command)
+    };
+    let found = matches(&c.triggers, tool, &files, command.as_deref(), env);
+    if found.is_empty() {
+        return Output::Empty;
+    }
     let mut shown = session.map(|id| cache::read_shown(env, id));
     let mut dirty = false;
-    if track && let Some(sh) = shown.as_mut().filter(|sh| !sh.edits) {
-        sh.edits = true;
-        dirty = true;
-    }
-    let mut lines = Vec::new();
-    if hints_on {
-        let server = env.server_url();
-        if let Some(c) = cache::usable_triggers(env, server.as_deref()) {
-            let file = inp
-                .tool_input("file_path")
-                .or_else(|| inp.tool_input("notebook_path"));
-            let command = command_of(inp);
-            for (t, lead) in matches(&c.triggers, tool, file, command.as_deref(), env) {
-                if let Some(sh) = shown.as_mut() {
-                    if sh.shown.contains(&t.entry_id) {
-                        continue;
-                    }
-                    sh.shown.push(t.entry_id.clone());
-                    dirty = true;
-                } else if lines.iter().any(|l: &String| l.ends_with(&t.entry_id)) {
-                    continue;
-                }
-                lines.push(t.hint(&lead));
-            }
+    let mut lines: Vec<String> = Vec::new();
+    let mut taken: Vec<&str> = Vec::new();
+    for (t, lead) in found {
+        if taken.contains(&t.entry_id.as_str()) {
+            continue;
         }
+        taken.push(&t.entry_id);
+        if let Some(sh) = shown.as_mut() {
+            if sh.shown.contains(&t.entry_id) {
+                continue;
+            }
+            sh.shown.push(t.entry_id.clone());
+            dirty = true;
+        }
+        lines.push(t.hint(&lead));
     }
     if dirty && let (Some(id), Some(sh)) = (session, shown.as_ref()) {
         cache::write_shown(env, id, sh);
     }
-    Output::context(&inp.event, &lines.join("\n"))
+    Output::context(
+        &inp.event,
+        &lines.join(
+            "
+",
+        ),
+    )
 }
 
 /// `tool_input.command`: строка или массив аргументов (через пробел).
@@ -122,29 +169,34 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 fn matches<'a>(
     triggers: &'a [Trigger],
     tool: &str,
-    file: Option<&str>,
+    files: &[String],
     command: Option<&str>,
     env: &Env,
 ) -> Vec<(&'a Trigger, String)> {
     let tool = (!tool.is_empty()).then_some(tool);
-    let rel = file.map(|f| glob_path(f, &env.cwd, &env.root));
+    let rels: Vec<String> = files
+        .iter()
+        .map(|f| glob_path(f, &env.cwd, &env.root))
+        .collect();
     let command = command.map(|c| super::head_bytes(c, COMMAND_SCAN_MAX));
     let mut out = Vec::new();
     for t in triggers.iter().filter(|t| t.for_tool(tool)) {
-        match (t.kind.as_str(), &rel, command) {
-            ("file_glob", Some(path), _) => {
+        match (t.kind.as_str(), command) {
+            ("file_glob", _) if !rels.is_empty() => {
                 let g = GlobBuilder::new(&t.pattern)
                     .case_insensitive(cfg!(windows))
                     .build();
                 match g {
-                    Ok(g) if g.compile_matcher().is_match(path) => {
-                        out.push((t, format!("для {}: ", t.pattern)));
+                    Ok(g) => {
+                        let m = g.compile_matcher();
+                        if rels.iter().any(|p| m.is_match(p)) {
+                            out.push((t, format!("для {}: ", t.pattern)));
+                        }
                     }
-                    Ok(_) => {}
                     Err(_) => env.log(&format!("триггер {}: неверная маска", t.id)),
                 }
             }
-            ("command_regex", _, Some(cmd)) => {
+            ("command_regex", Some(cmd)) => {
                 let r = RegexBuilder::new(&t.pattern)
                     .size_limit(REGEX_SIZE_LIMIT)
                     .dfa_size_limit(REGEX_SIZE_LIMIT)
@@ -164,6 +216,27 @@ fn matches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patch_headers() {
+        let p = "*** Begin Patch
+*** Add File: scripts/new.sh
++echo
+*** Update File: src/a.rs
+                 @@
+-x
++y
+*** Move to: src/b.rs
+*** Delete File: old.txt
+                 *** Update File: src/a.rs
+*** End Patch
+";
+        assert_eq!(
+            patch_files(p),
+            ["scripts/new.sh", "src/a.rs", "src/b.rs", "old.txt"]
+        );
+        assert!(patch_files("ls -la").is_empty());
+    }
 
     #[test]
     fn glob_paths_relative_to_root() {
