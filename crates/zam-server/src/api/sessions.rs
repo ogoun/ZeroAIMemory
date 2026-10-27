@@ -120,10 +120,7 @@ pub async fn create(
     let blank = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let touch = SessionTouch {
         id: blank(req.id).unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
-        token_id: match &p {
-            Principal::Token(t) => Some(t.token_id),
-            Principal::Admin { .. } => None,
-        },
+        token_id: p.token_id(),
         solution_guid,
         area: blank(req.area),
         machine: header_value(&headers, MACHINE_HEADER)?,

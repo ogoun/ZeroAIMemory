@@ -8,6 +8,8 @@
     label?: string;
     value?: string;
     placeholder?: string;
+    /** Поле пароля: скрытый ввод, значение без обрезки пробелов. */
+    secret?: boolean;
     confirm: string;
     danger?: boolean;
     /** Действие; исключение показывается в окне, окно остаётся открытым. */
@@ -37,7 +39,7 @@
   async function submit(e: SubmitEvent) {
     e.preventDefault();
     if (!ask || busy) return;
-    const v = value.trim();
+    const v = ask.secret ? value : value.trim();
     if (ask.label && !v) return;
     busy = true;
     error = '';
@@ -77,7 +79,11 @@
           {#if ask.label}
             <label class="field">
               {ask.label}
-              <input bind:this={field} bind:value placeholder={ask.placeholder} required />
+              {#if ask.secret}
+                <input bind:this={field} bind:value type="password" autocomplete="new-password" required />
+              {:else}
+                <input bind:this={field} bind:value placeholder={ask.placeholder} required />
+              {/if}
             </label>
           {/if}
           {#if error}<p class="error" role="alert">{error}</p>{/if}

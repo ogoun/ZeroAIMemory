@@ -34,13 +34,15 @@
     /** Пользователи; свой — первым. */
     users: User[];
     ownId: string;
+    /** Заголовок корня: «Пользователи» у администратора, у пользователя — его память. */
+    heading?: string;
     route: Route;
     reveal: Reveal | null;
     onchange: (c: TreeChange) => void;
     onexpired: () => void;
   }
 
-  let { users, ownId, route, reveal, onchange, onexpired }: Props = $props();
+  let { users, ownId, heading = 'Пользователи', route, reveal, onchange, onexpired }: Props = $props();
 
   // Ключи состояния: `u|<user>` — пространства пользователя, `sol|<user>` — группа решений,
   // `s|<user>|<ref>` — корень пространства, `n|<user>|<ref>|<path>` — папка, `t|<user>` — корзина.
@@ -489,7 +491,7 @@
 {/snippet}
 
 <nav class="tree" aria-label="Дерево заметок">
-  <div class="tree-heading">Пользователи</div>
+  <div class="tree-heading">{heading}</div>
   <ul>
     {#each users as u (u.id)}
       {@const k = kUser(u.id)}

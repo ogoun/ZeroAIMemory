@@ -1,6 +1,8 @@
 <script lang="ts">
   // Оболочка после входа: шапка, дерево слева (на узком экране — выдвижная панель),
-  // справа — документ, стартовый экран пользователя или администрирование.
+  // справа — документ, стартовый экран пользователя или администрирование. У пользователя
+  // (не администратора, §15.1) нет разделов «Пользователи», «Администрирование», «Настройки»
+  // и полного «Индекса»: есть «Мои решения», «Аккаунт» и баннер перенарезки своей базы.
   import { onMount, untrack } from 'svelte';
   import DocView from '../components/DocView.svelte';
   import Search from '../components/Search.svelte';
@@ -9,6 +11,8 @@
   import InsightsView from '../components/InsightsView.svelte';
   import ReleasesView from '../components/ReleasesView.svelte';
   import VaultView from '../components/VaultView.svelte';
+  import RechunkBanner from '../components/RechunkBanner.svelte';
+  import Account from './Account.svelte';
   import IndexStatus from './IndexStatus.svelte';
   import Settings from './Settings.svelte';
   import Solutions from './Solutions.svelte';
@@ -16,6 +20,7 @@
   import {
     ApiError,
     errorText,
+    isAdminSession,
     listSpaces,
     listUsers,
     spaceMatches,
@@ -28,6 +33,9 @@
   import { current, go, href, listen, routeUser, type Route } from '../lib/router';
 
   let { me, onlogout, onexpired }: { me: Me; onlogout: () => void; onexpired: () => void } = $props();
+
+  /** Сессия администратора: разделы управления сервисом и все пользователи. */
+  let admin = $derived(isAdminSession(me));
 
   let route = $state<Route>(current());
   let users = $state<User[]>([]);
@@ -44,6 +52,22 @@
 
   async function loadUsers() {
     usersError = '';
+    if (!admin) {
+      // пользователь видит только себя: список пользователей — администраторский маршрут
+      users = [
+        {
+          id: me.user_id,
+          name: me.name,
+          is_admin: false,
+          created_at: '',
+          disabled_at: null,
+          tokens: 0,
+          has_password: true,
+          must_change_password: false,
+        },
+      ];
+      return;
+    }
     try {
       const all = await listUsers();
       // свой пользователь — первым, остальные по имени
@@ -58,8 +82,8 @@
   }
 
   function normalize(r: Route) {
-    // пустой адрес — свой пользователь
-    if (r.name === 'home' && !r.user) {
+    // пустой адрес — свой пользователь; разделы администратора пользователю недоступны
+    if ((r.name === 'home' && !r.user) || (!admin && (isAdmin(r) || r.name === 'index'))) {
       go({ name: 'home', user: me.user_id }, { replace: true });
       return false;
     }
@@ -176,11 +200,18 @@
     <a class="brand" href={href({ name: 'home', user: me.user_id })}>ZeroAIMemory</a>
     <nav class="topnav" aria-label="Разделы">
       <a href={href({ name: 'home', user: me.user_id })} aria-current={routeUser(route) ? 'page' : undefined}>Заметки</a>
-      <a href={href({ name: 'index' })} aria-current={route.name === 'index' ? 'page' : undefined}>Индекс</a>
-      <!-- на узком экране — короткая подпись (имя ссылки для доступности — полное) -->
-      <a href={href({ name: 'admin' })} aria-current={isAdmin(route) ? 'page' : undefined} aria-label="Администрирование"
-        ><span class="long">Администрирование</span><span class="short" aria-hidden="true">Админ</span></a
-      >
+      {#if admin}
+        <a href={href({ name: 'index' })} aria-current={route.name === 'index' ? 'page' : undefined}>Индекс</a>
+        <!-- на узком экране — короткая подпись (имя ссылки для доступности — полное) -->
+        <a href={href({ name: 'admin' })} aria-current={isAdmin(route) ? 'page' : undefined} aria-label="Администрирование"
+          ><span class="long">Администрирование</span><span class="short" aria-hidden="true">Админ</span></a
+        >
+      {:else}
+        <a href={href({ name: 'mysolutions' })} aria-current={route.name === 'mysolutions' ? 'page' : undefined}
+          aria-label="Мои решения"><span class="long">Мои решения</span><span class="short" aria-hidden="true">Решения</span></a
+        >
+        <a href={href({ name: 'account' })} aria-current={route.name === 'account' ? 'page' : undefined}>Аккаунт</a>
+      {/if}
     </nav>
     <button type="button" class="search-btn" onclick={() => (searchOpen = true)} title="Поиск (Ctrl+K)" aria-label="Поиск">
       <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8" /><path d="M13 13l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" /></svg>
@@ -195,14 +226,15 @@
   <aside id="sidebar" class="sidebar" inert={narrow && !drawer}>
     {#if usersError}<p class="error" role="alert">{usersError}</p>{/if}
     {#if users.length}
-      <Tree {users} ownId={me.user_id} {route} {reveal} {onchange} {onexpired} />
+      <Tree {users} ownId={me.user_id} heading={admin ? 'Пользователи' : 'Моя память'} {route} {reveal} {onchange} {onexpired} />
     {/if}
   </aside>
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="scrim" onclick={() => (drawer = false)}></div>
 
   <main class="content">
-    {#if isAdmin(route)}
+    {#if !admin}<RechunkBanner userId={me.user_id} {onexpired} />{/if}
+    {#if isAdmin(route) && admin}
       <div class="admin">
         <nav class="subnav" aria-label="Администрирование">
           <a href={href({ name: 'admin' })} aria-current={route.name === 'admin' ? 'page' : undefined}>Пользователи</a>
@@ -258,9 +290,17 @@
           <VaultView user={r.user} space={r.space} {onexpired} />
         {/if}
       </div>
-    {:else if route.name === 'index'}
+    {:else if route.name === 'index' && admin}
       <div class="admin">
         <IndexStatus {users} {onexpired} />
+      </div>
+    {:else if route.name === 'account'}
+      <div class="admin">
+        <Account {me} {onexpired} />
+      </div>
+    {:else if route.name === 'mysolutions'}
+      <div class="admin">
+        <Solutions mine {onexpired} />
       </div>
     {:else if route.name === 'node'}
       <DocView

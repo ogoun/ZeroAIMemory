@@ -97,7 +97,7 @@ async fn solution_group(
     let Some(info) = st.system.get_solution(guid).await? else {
         return Ok(Err(WARN_UNKNOWN));
     };
-    if !matches!(p, Principal::Admin { .. }) {
+    if !p.is_admin() {
         match st.system.solution_role(&info.guid, user.id).await? {
             Some(SolutionRole::Owner | SolutionRole::Member(_)) => {}
             Some(SolutionRole::Pending) => return Ok(Err("solution access pending")),

@@ -178,7 +178,7 @@ async fn scope_role(
     match scope {
         VaultScope::Knowledge => Ok(match p {
             Principal::Admin { .. } => Role::Admin,
-            Principal::Token(_) => Role::Personal,
+            Principal::Token(_) | Principal::User { .. } => Role::Personal,
         }),
         VaultScope::Solution(g) => {
             let info = st.system.get_solution(g).await?.ok_or(ApiError::NotFound)?;

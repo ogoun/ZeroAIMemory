@@ -37,6 +37,10 @@ pub static SYSTEM_MIGRATIONS: &[Migration] = &[
         version: 5,
         sql: include_str!("../migrations/system/0005_vault_keys.sql"),
     },
+    Migration {
+        version: 6,
+        sql: include_str!("../migrations/system/0006_user_passwords.sql"),
+    },
 ];
 
 /// База пользователя, исключённая из пересборки векторного индекса (`index_skipped`).
@@ -61,6 +65,10 @@ pub struct User {
     pub is_admin: bool,
     pub created_at: Timestamp,
     pub disabled_at: Option<Timestamp>,
+    /// Пароль входа в WebUI задан (§11.4); сам хэш наружу не отдаётся.
+    pub has_password: bool,
+    /// При следующем входе пользователь обязан сменить пароль.
+    pub must_change_password: bool,
 }
 
 /// Режим доступа токена или участника решения.
@@ -120,9 +128,11 @@ pub struct AuthToken {
     pub access: Access,
 }
 
-/// Веб-сессия администратора (идентификатор сессии в ответ не входит).
+/// Веб-сессия WebUI (идентификатор сессии в ответ не входит).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSession {
+    /// Пользователь сессии (§11.4); `None` — сессия администратора.
+    pub user_id: Option<Id>,
     pub csrf_token: String,
     pub created_at: Timestamp,
     pub expires_at: Timestamp,
@@ -155,10 +165,12 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         is_admin: r.get(2)?,
         created_at: ts_at(r, 3)?,
         disabled_at: ts_opt(r, 4)?,
+        has_password: r.get(5)?,
+        must_change_password: r.get(6)?,
     })
 }
 
-const USER_COLS: &str = "id, name, is_admin, created_at, disabled_at";
+const USER_COLS: &str = "id, name, is_admin, created_at, disabled_at,      password_hash IS NOT NULL, must_change_password";
 
 fn token_row(r: &Row) -> rusqlite::Result<TokenInfo> {
     Ok(TokenInfo {
@@ -253,6 +265,8 @@ impl SystemStore {
                     is_admin,
                     created_at: Timestamp::now(),
                     disabled_at: None,
+                    has_password: false,
+                    must_change_password: false,
                 };
                 tx.execute(
                     "INSERT INTO users (id, name, is_admin, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -346,6 +360,71 @@ impl SystemStore {
                     user_row,
                 )
                 .optional()?)
+            })
+            .await
+    }
+
+    // ---- пароли входа в WebUI (§11.4) ----
+
+    /// Кандидаты входа по имени без учёта регистра (Unicode): пользователи с заданным
+    /// паролем и их хэши; точное совпадение имени — первым. Решение о входе — у вызывающего.
+    pub async fn login_candidates(&self, login: &str) -> Result<Vec<(User, String)>, StoreError> {
+        let want = login.trim().to_lowercase();
+        let exact = login.trim().to_string();
+        let mut found: Vec<(User, String)> = self
+            .db
+            .read(|c| {
+                let mut st = c.prepare(&format!(
+                    "SELECT {USER_COLS}, password_hash FROM users
+                     WHERE password_hash IS NOT NULL ORDER BY id"
+                ))?;
+                let rows = st.query_map([], |r| Ok((user_row(r)?, r.get::<_, String>(7)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        found.retain(|(u, _)| u.name.to_lowercase() == want);
+        found.sort_by_key(|(u, _)| u.name != exact);
+        Ok(found)
+    }
+
+    /// Хэш пароля пользователя (`None` — вход закрыт); нет пользователя — `NotFound`.
+    pub async fn password_hash(&self, id: Id) -> Result<Option<String>, StoreError> {
+        self.db
+            .read(move |c| {
+                c.query_row("SELECT password_hash FROM users WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .ok_or(StoreError::NotFound)
+            })
+            .await
+    }
+
+    /// Задаёт (`Some`) или стирает (`None`) хэш пароля и признак обязательной смены; веб-сессии
+    /// пользователя, кроме `keep` (открытый id cookie), закрываются. Нет пользователя —
+    /// `NotFound`.
+    pub async fn set_password(
+        &self,
+        id: Id,
+        hash: Option<String>,
+        must_change: bool,
+        keep: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let keep = keep.map(hash_token);
+        self.db
+            .write(move |tx| {
+                let n = tx.execute(
+                    "UPDATE users SET password_hash = ?2, must_change_password = ?3 WHERE id = ?1",
+                    params![id, hash, must_change && hash.is_some()],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                tx.execute(
+                    "DELETE FROM web_sessions WHERE user_id = ?1 AND (?2 IS NULL OR id <> ?2)",
+                    params![id, keep],
+                )?;
+                Ok(())
             })
             .await
     }
@@ -523,10 +602,28 @@ impl SystemStore {
 
     // ---- веб-сессии ----
 
-    /// Создаёт сессию: `(session_id для cookie, csrf)`. В БД id хранится как sha256.
+    /// Создаёт сессию администратора: `(session_id для cookie, csrf)`. В БД id хранится как
+    /// sha256.
     pub async fn create_web_session(
         &self,
         ip: Option<&str>,
+    ) -> Result<(String, String), StoreError> {
+        self.create_session(ip, None).await
+    }
+
+    /// Создаёт сессию пользователя `user` (§11.4): `(session_id для cookie, csrf)`.
+    pub async fn create_user_session(
+        &self,
+        ip: Option<&str>,
+        user: Id,
+    ) -> Result<(String, String), StoreError> {
+        self.create_session(ip, Some(user)).await
+    }
+
+    async fn create_session(
+        &self,
+        ip: Option<&str>,
+        user: Option<Id>,
     ) -> Result<(String, String), StoreError> {
         let (id, csrf) = (random_b64(), random_b64());
         let (key, csrf_db) = (hash_token(&id), csrf.clone());
@@ -542,9 +639,9 @@ impl SystemStore {
                     [fmt_ts(now)],
                 )?;
                 tx.execute(
-                    "INSERT INTO web_sessions (id, csrf_token, created_at, expires_at, ip)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![key, csrf_db, fmt_ts(now), fmt_ts(exp), ip],
+                    "INSERT INTO web_sessions (id, csrf_token, created_at, expires_at, ip, user_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![key, csrf_db, fmt_ts(now), fmt_ts(exp), ip, user],
                 )?;
                 Ok(())
             })
@@ -560,10 +657,12 @@ impl SystemStore {
             .db
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT csrf_token, created_at, expires_at, ip FROM web_sessions WHERE id = ?1",
+                    "SELECT csrf_token, created_at, expires_at, ip, user_id FROM web_sessions
+                     WHERE id = ?1",
                     [&k],
                     |r| {
                         Ok(WebSession {
+                            user_id: r.get(4)?,
                             csrf_token: r.get(0)?,
                             created_at: ts_at(r, 1)?,
                             expires_at: ts_at(r, 2)?,

@@ -17,7 +17,10 @@
 //!   область графа ([`graph_spaces`]) — участнику только пространство решения.
 //!
 //! **Политика:**
-//! - `Human` по токену → 404 (существование не раскрывается) — для чтения и записи;
+//! - `Human` по токену → 404 (существование не раскрывается) — для чтения и записи; сессии
+//!   WebUI (администратор, пользователь — свой, §11.4) Human доступен;
+//! - сессия пользователя — как его `rw`-токен, но Rules пишет без `rules.agent_write` (это
+//!   настройка записи агентов) **[решение исполнителя, задача 12 M4]**;
 //! - запись по токену `ro` → 403;
 //! - запись в `Rules` по токену при `rules.agent_write = false` → 403;
 //! - участник: доступ только при одобренном запросе (`pending`/`rejected`/`revoked` → 403
@@ -143,14 +146,13 @@ pub fn check_access(
     Ok(())
 }
 
-/// Действующее право записи (§11.6): токен `rw` и роль `Personal | Owner | Member(Rw)`;
-/// администратор — всегда.
+/// Действующее право записи (§11.6): токен `rw` (сессия пользователя — как `rw`-токен) и
+/// роль `Personal | Owner | Member(Rw)`; администратор — всегда.
 pub fn effective_write(p: &Principal, role: Role) -> Result<(), ApiError> {
-    let Principal::Token(t) = p else {
-        return Ok(());
-    };
-    if t.access == Access::Ro {
-        return Err(ApiError::Forbidden);
+    match p {
+        Principal::Admin { .. } => return Ok(()),
+        Principal::Token(t) if t.access == Access::Ro => return Err(ApiError::Forbidden),
+        Principal::Token(_) | Principal::User { .. } => {}
     }
     match role {
         Role::Member(Access::Ro) => Err(ApiError::Denied(
@@ -271,7 +273,7 @@ pub async fn user_db(
 }
 
 fn is_admin(p: &Principal) -> bool {
-    matches!(p, Principal::Admin { .. })
+    p.is_admin()
 }
 
 /// Роль в пространстве личной базы.
@@ -776,6 +778,25 @@ mod tests {
         }
         for r in [Role::Personal, Role::Owner, Role::Member(Access::Rw)] {
             assert!(effective_write(&rw, r).is_ok(), "{r:?}");
+        }
+        // сессия пользователя — как `rw`-токен: режим участника ro запрещает запись
+        let user = Principal::User {
+            session_id: "s".into(),
+            user_id: Id::new(),
+        };
+        for r in [Role::Personal, Role::Owner, Role::Member(Access::Rw)] {
+            assert!(effective_write(&user, r).is_ok(), "{r:?}");
+        }
+        assert!(matches!(
+            effective_write(&user, Role::Member(Access::Ro)),
+            Err(ApiError::Denied(_))
+        ));
+        // свой Human и Rules — человеку доступны
+        let h = space(SpaceKind::Human);
+        let r = space(SpaceKind::Rules);
+        for m in [Mode::Read, Mode::Write] {
+            assert!(check_access(&user, &h, m, false).is_ok());
+            assert!(check_access(&user, &r, m, false).is_ok());
         }
         assert!(matches!(
             effective_write(&rw, Role::Member(Access::Ro)),

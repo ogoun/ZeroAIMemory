@@ -17,6 +17,10 @@ pub enum ApiError {
     /// 403 с пояснением (например, запись участником с режимом `ro`).
     #[error("{0}")]
     Denied(String),
+    /// 403 `/problems/password-change-required` (§11.4): пользователь входит с паролем,
+    /// заданным администратором, и обязан сменить его (`POST /auth/password`).
+    #[error("смените пароль, заданный администратором: POST /auth/password")]
+    PasswordChangeRequired,
     /// Нет доступа к общему решению (§11.6): запрос ждёт, отклонён или отозван.
     #[error("нет доступа к решению {guid}: {}", access_state_text(state))]
     SolutionAccess {
@@ -101,6 +105,11 @@ impl ApiError {
             ApiError::Forbidden | ApiError::Denied(_) => {
                 (StatusCode::FORBIDDEN, "about:blank", "Forbidden")
             }
+            ApiError::PasswordChangeRequired => (
+                StatusCode::FORBIDDEN,
+                "/problems/password-change-required",
+                "Forbidden",
+            ),
             ApiError::SolutionAccess { .. } => (
                 StatusCode::FORBIDDEN,
                 "/problems/solution-access",

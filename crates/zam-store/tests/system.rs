@@ -293,3 +293,54 @@ async fn rename_user_and_get_token() {
     assert_eq!(got.prefix, info.prefix);
     assert!(s.get_token(Id::new()).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn user_password_and_sessions() {
+    let (_dd, s) = store("passwords").await;
+    let u = s.create_user("Ёжик", false).await.unwrap();
+    let other = s.create_user("ёжик-2", false).await.unwrap();
+    assert!(!u.has_password && !u.must_change_password);
+    assert!(s.login_candidates("ёжик").await.unwrap().is_empty());
+    let (admin_sid, _) = s.create_web_session(None).await.unwrap();
+    let (a, _) = s.create_user_session(None, u.id).await.unwrap();
+    let (b, _) = s.create_user_session(None, u.id).await.unwrap();
+    let (c, _) = s.create_user_session(None, other.id).await.unwrap();
+    assert_eq!(
+        s.get_web_session(&a).await.unwrap().unwrap().user_id,
+        Some(u.id)
+    );
+    assert_eq!(
+        s.get_web_session(&admin_sid)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id,
+        None
+    );
+    // задание пароля закрывает сессии пользователя, кроме сохранённой
+    s.set_password(u.id, Some("h1".into()), true, Some(&a))
+        .await
+        .unwrap();
+    assert!(s.get_web_session(&a).await.unwrap().is_some());
+    assert!(s.get_web_session(&b).await.unwrap().is_none());
+    assert!(s.get_web_session(&c).await.unwrap().is_some());
+    assert!(s.get_web_session(&admin_sid).await.unwrap().is_some());
+    let got = s.get_user(u.id).await.unwrap().unwrap();
+    assert!(got.has_password && got.must_change_password);
+    assert_eq!(s.password_hash(u.id).await.unwrap().as_deref(), Some("h1"));
+    // имя без учёта регистра (Unicode), хэш наружу — только здесь
+    let found = s.login_candidates("ЁЖИК").await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].0.id, found[0].1.as_str()), (u.id, "h1"));
+    // стирание: вход закрыт, сессии закрыты, признак смены снят
+    s.set_password(u.id, None, true, None).await.unwrap();
+    assert!(s.get_web_session(&a).await.unwrap().is_none());
+    let got = s.get_user(u.id).await.unwrap().unwrap();
+    assert!(!got.has_password && !got.must_change_password);
+    assert_eq!(s.password_hash(u.id).await.unwrap(), None);
+    let err = s
+        .set_password(Id::new(), None, false, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+}

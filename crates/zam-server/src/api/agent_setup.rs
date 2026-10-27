@@ -133,7 +133,7 @@ async fn solution(
         Some(n) => n,
         None => {
             let user = target_user_id(st, p, headers)?;
-            let admin = matches!(p, Principal::Admin { .. });
+            let admin = p.is_admin();
             match info {
                 Some(i) if admin || i.owner_id == user => i.name,
                 _ => DEFAULT_NAME.into(),
@@ -161,13 +161,14 @@ pub async fn setup(
     let lang = parse_lang(q.lang.as_deref())?;
     let token = match (q.token.as_deref().map(str::trim), &p) {
         (None | Some(""), _) => None,
-        (Some(t), Principal::Admin { .. }) if looks_like_token(t) => Some(t.to_string()),
-        (Some(_), Principal::Admin { .. }) => {
+        // сессия WebUI (администратор или пользователь) подставляет только что выпущенный токен
+        (Some(t), p) if p.is_human() && looks_like_token(t) => Some(t.to_string()),
+        (Some(_), p) if p.is_human() => {
             return Err(ApiError::BadRequest("token: токен вида zam_…".into()));
         }
-        (Some(_), Principal::Token(_)) => {
+        (Some(_), _) => {
             return Err(ApiError::BadRequest(
-                "token= передаёт только администратор при выпуске токена".into(),
+                "token= передаёт только сессия WebUI при выпуске токена".into(),
             ));
         }
     };

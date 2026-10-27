@@ -65,9 +65,10 @@ pub async fn entry(
             Value::Useful => UsageKind::Useful,
             Value::Useless => UsageKind::Useless,
         },
-        source: Some(match p {
-            Principal::Token(_) => UsageSource::Agent,
-            Principal::Admin { .. } => UsageSource::Webui,
+        source: Some(if p.is_human() {
+            UsageSource::Webui
+        } else {
+            UsageSource::Agent
         }),
     };
     record_usage(&sc.db, &event).await?;

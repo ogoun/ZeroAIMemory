@@ -1,9 +1,10 @@
 //! Атрибуция ревизий (§11.3, §12): кто пишет, с какой машины и в какой сессии.
 //!
-//! - `author_kind`: любой токен — `agent`, сессия WebUI — `human` (§7.5, §11.4: человеческие
-//!   токены M3 упразднены решением владельца 2026-10-26, `tokens.human` не читается);
-//! - `token_id` — id токена запроса, `user_id` — его пользователь (автор ревизии в базе
-//!   владельца общего решения, §11.6); у администратора — нет;
+//! - `author_kind`: любой токен — `agent`, сессия WebUI (администратор или пользователь) —
+//!   `human` (§7.5, §11.4: человеческие токены M3 упразднены решением владельца 2026-10-26,
+//!   `tokens.human` не читается);
+//! - `token_id` — id токена запроса, `user_id` — его пользователь или пользователь сессии WebUI
+//!   (автор ревизии в базе владельца общего решения, §11.6); у администратора — нет;
 //! - `X-Zam-Session`, `X-Zam-Machine` — до 128 символов UTF-8 без управляющих,
 //!   иначе 400; пустое значение равно отсутствию заголовка;
 //! - `X-Zam-Area` (§11.2) — область по умолчанию для новых узлов и записей журналов, те же
@@ -37,6 +38,7 @@ pub fn attribution(
 ) -> Result<Attribution, ApiError> {
     let (author_kind, token_id, user_id) = match p {
         Principal::Token(t) => (AuthorKind::Agent, Some(t.token_id), Some(t.user_id)),
+        Principal::User { user_id, .. } => (AuthorKind::Human, None, Some(*user_id)),
         Principal::Admin { .. } => (AuthorKind::Human, None, None),
     };
     let message = message.filter(|m| !m.trim().is_empty());
@@ -74,10 +76,7 @@ pub fn session_touch(
     zam_store::check_session_id(&id)?;
     Ok(Some(SessionTouch {
         id,
-        token_id: match p {
-            Principal::Token(t) => Some(t.token_id),
-            Principal::Admin { .. } => None,
-        },
+        token_id: p.token_id(),
         solution_guid: header_value(headers, crate::api::search::SOLUTION_HEADER)
             .ok()
             .flatten()
@@ -134,6 +133,18 @@ mod tests {
         h.insert(AREA_HEADER, HeaderValue::from_static(" services/parser "));
         let a = attribution(&admin(), &h, None).unwrap();
         assert_eq!(a.area.as_deref(), Some("services/parser"));
+    }
+
+    #[test]
+    fn user_session_is_human_with_user_id() {
+        let uid = zam_core::Id::new();
+        let p = Principal::User {
+            session_id: "s".into(),
+            user_id: uid,
+        };
+        let a = attribution(&p, &HeaderMap::new(), None).unwrap();
+        assert_eq!(a.author_kind, AuthorKind::Human);
+        assert_eq!((a.token_id, a.user_id), (None, Some(uid)));
     }
 
     #[test]

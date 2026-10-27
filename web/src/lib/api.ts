@@ -7,6 +7,10 @@ export interface User {
   created_at: string;
   disabled_at: string | null;
   tokens: number;
+  /** Пароль входа в WebUI задан (§11.4). */
+  has_password: boolean;
+  /** При следующем входе пользователь обязан сменить пароль. */
+  must_change_password: boolean;
 }
 
 export type Access = 'rw' | 'ro';
@@ -107,10 +111,20 @@ export async function logout(): Promise<void> {
 }
 
 export interface Me {
+  /** `admin` — администратор из конфигурации, `user` — пользователь (§11.4). */
+  kind: 'admin' | 'user';
+  /** Чем входили: логин администратора или имя пользователя. */
   login: string;
+  /** Имя пользователя базы. */
+  name: string;
   user_id: string;
+  /** Пароль задал администратор: до смены доступна только смена пароля. */
+  must_change_password: boolean;
   csrf: string;
 }
+
+/** Сессия администратора (разделы «Пользователи», «Настройки», полный «Индекс»). */
+export const isAdminSession = (m: Me): boolean => m.kind !== 'user';
 
 export const me = () => call<Me>('GET', 'auth/me');
 
@@ -133,6 +147,22 @@ export const createUser = (name: string) =>
 export const issueToken = (userId: string, name: string, access: Access) =>
   call<IssuedToken>('POST', `admin/users/${userId}/tokens`, { name, access });
 export const revokeToken = (id: string) => call<void>('DELETE', `admin/tokens/${id}`);
+/** Администратор задаёт пароль входа в WebUI (≥ 10 символов, смена при первом входе). */
+export const setUserPassword = (userId: string, password: string) =>
+  call<User>('POST', `admin/users/${userId}/password`, { password });
+/** Администратор закрывает вход пользователя в WebUI. */
+export const clearUserPassword = (userId: string) =>
+  call<void>('DELETE', `admin/users/${userId}/password`);
+
+// ---- свой аккаунт (сессия пользователя или администратора, §11.4) ----
+
+/** Смена своего пароля: `old` — текущий, `new` — не короче 10 символов. */
+export const changePassword = (old: string, next: string) =>
+  call<void>('POST', 'auth/password', { old, new: next });
+export const listOwnTokens = () => call<TokenInfo[]>('GET', 'auth/tokens');
+export const issueOwnToken = (name: string, access: Access) =>
+  call<IssuedToken>('POST', 'auth/tokens', { name, access });
+export const revokeOwnToken = (id: string) => call<void>('DELETE', `auth/tokens/${q(id)}`);
 
 // ---- пространства и узлы (администратор — от имени пользователя `user`) ----
 
@@ -386,7 +416,7 @@ export interface SearchResult {
   warnings: string[];
 }
 
-/** Гибридный поиск по пространствам пользователя (Human — только администратору). */
+/** Гибридный поиск по пространствам пользователя (Human — только сессии WebUI, своей базы). */
 export const search = (user: string, query: string, spaces: string[]) =>
   call<SearchResult>(
     'POST',
@@ -479,6 +509,7 @@ export interface Rechunk {
   done: number;
 }
 
+/** Администратору — все базы; пользователю — только своя (`dbs` из одной базы). */
 export const indexStatus = () => call<IndexStatus>('GET', 'index/status');
 
 /** `POST /admin/reindex`: без `full` — из кэша embeddings, с `full` — перечанковка и инференс. */

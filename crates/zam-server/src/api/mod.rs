@@ -37,6 +37,7 @@ use zam_core::Id;
 
 use crate::app::AppState;
 use crate::auth::admin as login;
+use crate::auth::user as user_auth;
 use crate::config::LimitsSection;
 use crate::error::ApiError;
 
@@ -145,6 +146,12 @@ fn service_routes() -> Router<AppState> {
         .route("/api/v1/auth/login", post(login::login))
         .route("/api/v1/auth/logout", post(login::logout))
         .route("/api/v1/auth/me", get(login::me))
+        .route("/api/v1/auth/password", post(user_auth::change_password))
+        .route(
+            "/api/v1/auth/tokens",
+            get(user_auth::list_tokens).post(user_auth::issue_token),
+        )
+        .route("/api/v1/auth/tokens/{id}", delete(user_auth::revoke_token))
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
         .route(
@@ -233,6 +240,10 @@ fn service_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{id}/tokens",
             get(admin::list_tokens).post(admin::issue_token),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/password",
+            post(admin::set_password).delete(admin::clear_password),
         )
         .route("/api/v1/admin/tokens/{id}", delete(admin::revoke_token))
         .route("/api/v1/admin/audit", get(admin::list_audit))

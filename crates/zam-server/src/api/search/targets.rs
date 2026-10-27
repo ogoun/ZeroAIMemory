@@ -82,7 +82,7 @@ impl SearchTarget {
 }
 
 fn is_admin(p: &Principal) -> bool {
-    matches!(p, Principal::Admin { .. })
+    p.is_admin()
 }
 
 /// Решение запроса: `scope.solution` (некорректный GUID — 400) или заголовок
@@ -119,7 +119,8 @@ pub async fn resolve_targets(
 ) -> Result<(Vec<SearchTarget>, Vec<String>), ApiError> {
     let user = target_user(st, p, h).await?;
     let db = st.users.get(user.id).await?;
-    let human_ok = is_admin(p) && sc.include_human;
+    // Human — только человеку (сессия WebUI) и только своей базы
+    let human_ok = p.is_human() && sc.include_human;
     let mut personal: Vec<Space> = Vec::new();
     let mut foreign: Vec<Foreign> = Vec::new();
     if let Some(list) = &sc.spaces {

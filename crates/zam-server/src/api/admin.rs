@@ -1,4 +1,5 @@
-//! Админ-API: пользователи, токены, аудит, настройки (§12). Только `AdminOnly`.
+//! Админ-API: пользователи, токены, пароли входа пользователей (§11.4), аудит, настройки
+//! (§12). Только `AdminOnly`.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
@@ -33,11 +34,13 @@ fn user_json(u: &User, tokens: usize) -> Value {
         "created_at": fmt_ts(u.created_at),
         "disabled_at": u.disabled_at.map(fmt_ts),
         "tokens": tokens,
+        "has_password": u.has_password,
+        "must_change_password": u.must_change_password,
     })
 }
 
 /// Без секрета: только префикс.
-fn token_json(t: &TokenInfo) -> Value {
+pub(crate) fn token_json(t: &TokenInfo) -> Value {
     json!({
         "id": t.id,
         "user_id": t.user_id,
@@ -131,7 +134,7 @@ pub async fn create_user(
         .system
         .issue_token(user.id, "default", Access::Rw)
         .await?;
-    audit_token_issue(&st, &info, &plain, &ip).await?;
+    audit_token_issue(&st, ACTOR, &info, &plain, &ip).await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -227,15 +230,17 @@ pub async fn delete_user(
 
 // ---- токены ----
 
-async fn audit_token_issue(
+/// Аудит выпуска токена: `actor` — `admin` или `user` (свой токен в «Аккаунте», §11.4).
+pub(crate) async fn audit_token_issue(
     st: &AppState,
+    actor: &str,
     info: &TokenInfo,
     plain: &str,
     ip: &str,
 ) -> Result<(), ApiError> {
     st.system
         .audit(
-            ACTOR,
+            actor,
             Some(info.user_id),
             "token_issue",
             Some(&info.id.to_string()),
@@ -275,15 +280,9 @@ struct IssueToken {
 pub(crate) const HUMAN_TOKEN_REMOVED: &str =
     "человеческие токены упразднены (решение владельца 2026-10-26): подтверждайте в WebUI";
 
-pub async fn issue_token(
-    _: AdminOnly,
-    State(st): State<AppState>,
-    client: Client,
-    Path(id): Path<String>,
-    body: Bytes,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let id = parse_id(&id)?;
-    let req: IssueToken = parse_body(&body)?;
+/// Тело выпуска токена `{name, access?}` → имя и режим (`human: true` — 400, §11.4).
+pub(crate) fn parse_issue(body: &Bytes) -> Result<(String, Access), ApiError> {
+    let req: IssueToken = parse_body(body)?;
     if req.human {
         return Err(ApiError::BadRequest(HUMAN_TOKEN_REMOVED.into()));
     }
@@ -293,6 +292,18 @@ pub async fn issue_token(
         Some("ro") => Access::Ro,
         Some(_) => return Err(ApiError::BadRequest("access: допустимо rw или ro".into())),
     };
+    Ok((name, access))
+}
+
+pub async fn issue_token(
+    _: AdminOnly,
+    State(st): State<AppState>,
+    client: Client,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = parse_id(&id)?;
+    let (name, access) = parse_issue(&body)?;
     let user = require_user(&st, id).await?;
     if user.disabled_at.is_some() {
         return Err(ApiError::conflict(
@@ -300,7 +311,7 @@ pub async fn issue_token(
         ));
     }
     let (info, plain) = st.system.issue_token(id, &name, access).await?;
-    audit_token_issue(&st, &info, &plain, &client.ip.to_string()).await?;
+    audit_token_issue(&st, ACTOR, &info, &plain, &client.ip.to_string()).await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({ "info": token_json(&info), "plaintext": plain })),
@@ -315,19 +326,103 @@ pub async fn revoke_token(
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
     let info = st.system.get_token(id).await?.ok_or(ApiError::NotFound)?;
-    if info.revoked_at.is_none() {
-        st.system.revoke_token(id).await?;
-        st.system
-            .audit(
-                ACTOR,
-                Some(info.user_id),
-                "token_revoke",
-                Some(&id.to_string()),
-                Some(&client.ip.to_string()),
-                json!({ "token": format!("zam_{}…", info.prefix), "name": info.name }),
-            )
-            .await?;
+    revoke(&st, ACTOR, &info, &client.ip.to_string()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Отзыв токена с аудитом `token_revoke` (повторный отзыв — без записи).
+pub(crate) async fn revoke(
+    st: &AppState,
+    actor: &str,
+    info: &TokenInfo,
+    ip: &str,
+) -> Result<(), ApiError> {
+    if info.revoked_at.is_some() {
+        return Ok(());
     }
+    st.system.revoke_token(info.id).await?;
+    st.system
+        .audit(
+            actor,
+            Some(info.user_id),
+            "token_revoke",
+            Some(&info.id.to_string()),
+            Some(ip),
+            json!({ "token": format!("zam_{}…", info.prefix), "name": info.name }),
+        )
+        .await?;
+    Ok(())
+}
+
+// ---- пароли входа пользователей в WebUI (§11.4) ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetPassword {
+    password: String,
+}
+
+/// Пользователь, которому задаётся пароль: не администратор (его пароль — в конфигурации).
+async fn password_target(st: &AppState, id: &str) -> Result<User, ApiError> {
+    let user = require_user(st, parse_id(id)?).await?;
+    if is_admin(st, &user) {
+        return Err(ApiError::conflict(
+            "пароль администратора задаётся в конфигурации сервера (zam-server hash-password)",
+        ));
+    }
+    Ok(user)
+}
+
+/// `POST /admin/users/{id}/password {password}` → 200 пользователь: задаёт пароль (argon2id,
+/// не короче 10 символов) и обязательную смену при входе; сессии пользователя закрываются.
+/// Аудит `user.password.set` (без пароля).
+pub async fn set_password(
+    _: AdminOnly,
+    State(st): State<AppState>,
+    client: Client,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let user = password_target(&st, &id).await?;
+    let req: SetPassword = parse_body(&body)?;
+    crate::auth::user::check_password(&req.password)?;
+    let h = crate::auth::user::hash(req.password).await?;
+    st.system.set_password(user.id, Some(h), true, None).await?;
+    st.system
+        .audit(
+            ACTOR,
+            Some(user.id),
+            "user.password.set",
+            Some(&user.id.to_string()),
+            Some(&client.ip.to_string()),
+            json!({ "must_change_password": true }),
+        )
+        .await?;
+    let user = require_user(&st, user.id).await?;
+    let n = active_tokens(&st, user.id).await?;
+    Ok(Json(user_json(&user, n)))
+}
+
+/// `DELETE /admin/users/{id}/password` → 204: закрывает вход в WebUI, сессии пользователя
+/// закрываются (токены не затрагиваются). Аудит `user.password.clear`.
+pub async fn clear_password(
+    _: AdminOnly,
+    State(st): State<AppState>,
+    client: Client,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let user = password_target(&st, &id).await?;
+    st.system.set_password(user.id, None, false, None).await?;
+    st.system
+        .audit(
+            ACTOR,
+            Some(user.id),
+            "user.password.clear",
+            Some(&user.id.to_string()),
+            Some(&client.ip.to_string()),
+            json!({}),
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

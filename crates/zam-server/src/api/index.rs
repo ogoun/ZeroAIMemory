@@ -234,7 +234,7 @@ pub async fn status(
                 "rollups_pending": wst.rollups_pending,
             })
         }
-        Principal::Token(_) => Value::Null,
+        Principal::Token(_) | Principal::User { .. } => Value::Null,
     };
     Ok(Json(json!({
         "vector": {

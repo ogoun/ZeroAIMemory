@@ -62,6 +62,8 @@ pub async fn list(
     let pending = st.system.pending_requests_for_owner(user.id).await?;
     let access = match &p {
         Principal::Token(t) => t.access.as_str(),
+        // сессия пользователя — как его `rw`-токен (§11.4)
+        Principal::User { .. } => "rw",
         Principal::Admin { .. } => "admin",
     };
     Ok(Json(json!({

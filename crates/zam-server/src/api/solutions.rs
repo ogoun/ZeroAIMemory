@@ -162,17 +162,14 @@ pub async fn register(
             solution_json(&st, &space, user.id, Role::Owner).await?,
         ));
     }
-    if matches!(p, Principal::Admin { .. }) {
+    if p.is_admin() {
         let (_, space) = solution_space(&st, &info).await?;
         return Ok(reply(
             StatusCode::OK,
             solution_json(&st, &space, info.owner_id, Role::Admin).await?,
         ));
     }
-    let token = match &p {
-        Principal::Token(t) => Some(t.token_id),
-        Principal::Admin { .. } => None,
-    };
+    let token = p.token_id();
     let role = match st.system.solution_role(&guid, user.id).await? {
         None | Some(SolutionRole::Pending) => {
             match st.system.request_access(&guid, user.id, token).await? {
@@ -248,10 +245,7 @@ pub async fn rename(
     let info = managed(&st, &p, &raw, true).await?;
     let req: Rename = json_body(body)?;
     let name = name_up_to(&req.name, RENAME_MAX_CHARS)?;
-    let actor = match &p {
-        Principal::Admin { .. } => "admin".to_string(),
-        Principal::Token(t) => t.token_id.to_string(),
-    };
+    let actor = p.actor();
     // сначала реестр (источник истины имени, аудит), затем пространство в базе владельца;
     // повтор запроса довершает прерванное переименование
     st.system.rename_solution(&info.guid, name, &actor).await?;
@@ -260,7 +254,7 @@ pub async fn rename(
     let space = get_space(&db, info.space_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let role = if matches!(p, Principal::Admin { .. }) {
+    let role = if p.is_admin() {
         Role::Admin
     } else {
         Role::Owner
@@ -291,7 +285,7 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     let user = target_user(&st, &p, &headers).await?;
     let mut out = Vec::new();
-    if matches!(p, Principal::Admin { .. }) {
+    if p.is_admin() {
         for info in st.system.list_solutions().await? {
             let role = if info.owner_id == user.id {
                 Role::Owner
@@ -330,19 +324,20 @@ async fn managed(
         .get_solution(&guid)
         .await?
         .ok_or(ApiError::NotFound)?;
-    match p {
-        Principal::Admin { .. } => Ok(info),
-        Principal::Token(t) if t.user_id == info.owner_id => {
-            if write {
-                require_rw(p)?;
-            }
-            Ok(info)
+    // администратор — любое решение; токен и сессия пользователя — только своё
+    let Some(user) = p.bound_user() else {
+        return Ok(info);
+    };
+    if user == info.owner_id {
+        if write {
+            require_rw(p)?;
         }
-        // участник и запросивший доступ — 403; посторонний — как незарегистрированный GUID
-        Principal::Token(t) => match st.system.solution_role(&info.guid, t.user_id).await? {
-            Some(_) => Err(ApiError::Forbidden),
-            None => Err(ApiError::NotFound),
-        },
+        return Ok(info);
+    }
+    // участник и запросивший доступ — 403; посторонний — как незарегистрированный GUID
+    match st.system.solution_role(&info.guid, user).await? {
+        Some(_) => Err(ApiError::Forbidden),
+        None => Err(ApiError::NotFound),
     }
 }
 
@@ -350,7 +345,7 @@ async fn managed(
 fn decided_by(p: &Principal, info: &SolutionInfo) -> String {
     match p {
         Principal::Admin { .. } => "admin".into(),
-        Principal::Token(_) => info.owner_id.to_string(),
+        Principal::Token(_) | Principal::User { .. } => info.owner_id.to_string(),
     }
 }
 

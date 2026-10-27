@@ -1,4 +1,5 @@
-//! Вход администратора: `/auth/login`, `/auth/logout`, `/auth/me`.
+//! Вход в WebUI: `/auth/login` (администратор из конфигурации, затем пользователь — §11.4,
+//! [`super::user`]), `/auth/logout`, `/auth/me`.
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use axum::Json;
@@ -12,7 +13,7 @@ use serde_json::json;
 use zam_core::generate_token;
 
 use super::rate::retry_after_secs;
-use super::{AdminOnly, Client, SESSION_COOKIE, ct_eq};
+use super::{Client, Principal, SESSION_COOKIE, Session, ct_eq};
 use crate::app::AppState;
 use crate::error::ApiError;
 
@@ -55,7 +56,7 @@ pub(crate) fn make_dummy_hash(real: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-fn verify(hash: &str, password: &str) -> bool {
+pub(crate) fn verify(hash: &str, password: &str) -> bool {
     PasswordHash::new(hash).is_ok_and(|h| {
         Argon2::default()
             .verify_password(password.as_bytes(), &h)
@@ -63,7 +64,21 @@ fn verify(hash: &str, password: &str) -> bool {
     })
 }
 
-/// `POST /auth/login {login, password}` → 200 `{csrf}` + `Set-Cookie`.
+/// Ответ успешного входа: 200 `{csrf}` + `Set-Cookie` сессии, без кэширования.
+pub(crate) fn session_response(st: &AppState, sid: String, csrf: String, https: bool) -> Response {
+    let mut resp = (StatusCode::OK, Json(json!({ "csrf": csrf }))).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::SET_COOKIE,
+        session_cookie(st, sid, SESSION_MAX_AGE_S, https),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+/// `POST /auth/login {login, password}` → 200 `{csrf}` + `Set-Cookie`. Сначала администратор
+/// из конфигурации, затем пользователь по `users.name` без учёта регистра ([`super::user`]).
+/// Лимит — общий: каждая попытка, 5 в минуту на IP.
 pub async fn login(
     State(st): State<AppState>,
     client: Client,
@@ -79,18 +94,17 @@ pub async fn login(
     let req: LoginReq = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("ожидается JSON {login, password}".into()))?;
     let login_ok = ct_eq(req.login.as_bytes(), st.cfg.admin.login.as_bytes());
-    // Неверный логин тоже проходит полную проверку argon2 — время ответа одинаково.
-    let hash = if login_ok {
-        st.admin_hash.to_string()
-    } else {
-        st.auth.dummy_hash.clone()
-    };
+    if !login_ok {
+        // не администратор — пользователь (неизвестный логин проверяется по фиктивному хэшу)
+        return super::user::login(&st, client, &req.login, req.password).await;
+    }
+    let hash = st.admin_hash.to_string();
     let password = req.password;
     let verified = tokio::task::spawn_blocking(move || verify(&hash, &password))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    if !(login_ok && verified) {
+    if !verified {
         tracing::warn!(ip = %ip, "неудачный вход администратора");
         st.system
             .audit(
@@ -117,33 +131,33 @@ pub async fn login(
         )
         .await?;
     tracing::info!(ip = %ip, "вход администратора");
-    let mut resp = (StatusCode::OK, Json(json!({ "csrf": csrf }))).into_response();
-    let h = resp.headers_mut();
-    h.insert(
-        header::SET_COOKIE,
-        session_cookie(&st, sid, SESSION_MAX_AGE_S, client.https),
-    );
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(resp)
+    Ok(session_response(&st, sid, csrf, client.https))
 }
 
-/// `POST /auth/logout` (требует CSRF) → 204, cookie стирается.
+/// Id cookie-сессии принципала сессии WebUI.
+fn session_id(p: &Principal) -> Result<&str, ApiError> {
+    match p {
+        Principal::Admin { session_id } | Principal::User { session_id, .. } => Ok(session_id),
+        Principal::Token(_) => Err(ApiError::Forbidden),
+    }
+}
+
+/// `POST /auth/logout` (требует CSRF) → 204, cookie стирается. Администратор и пользователь
+/// (в том числе до обязательной смены пароля).
 pub async fn logout(
     State(st): State<AppState>,
     client: Client,
-    AdminOnly(sid): AdminOnly,
+    s: Session,
 ) -> Result<Response, ApiError> {
-    st.system.delete_web_session(&sid).await?;
+    let sid = session_id(&s.principal)?;
+    st.system.delete_web_session(sid).await?;
     let ip = client.ip.to_string();
+    let (actor, user, action) = match &s.principal {
+        Principal::User { user_id, .. } => ("user", *user_id, "auth.logout.user"),
+        _ => ("admin", st.admin_id, "admin_logout"),
+    };
     st.system
-        .audit(
-            "admin",
-            Some(st.admin_id),
-            "admin_logout",
-            None,
-            Some(&ip),
-            json!({}),
-        )
+        .audit(actor, Some(user), action, None, Some(&ip), json!({}))
         .await?;
     let mut resp = StatusCode::NO_CONTENT.into_response();
     resp.headers_mut().insert(
@@ -153,20 +167,34 @@ pub async fn logout(
     Ok(resp)
 }
 
-/// `GET /auth/me` → `{login, user_id, csrf}`: по живой cookie-сессии (восстановление после
-/// F5). Сессия WebUI всегда пишет как человек (§7.5, §11.4), отдельный признак не нужен.
+/// `GET /auth/me` → `{kind: "admin"|"user", user_id, name, login, must_change_password,
+/// csrf}` по живой cookie-сессии (восстановление после F5; доступен и до обязательной смены
+/// пароля). `name` — имя пользователя базы, `login` — чем входили (у администратора — логин
+/// из конфигурации). Сессия WebUI всегда пишет как человек (§7.5, §11.4).
 pub async fn me(
     State(st): State<AppState>,
-    AdminOnly(sid): AdminOnly,
+    s: Session,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ws = st
         .system
-        .get_web_session(&sid)
+        .get_web_session(session_id(&s.principal)?)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    let (kind, user_id, login) = match &s.principal {
+        Principal::User { user_id, .. } => ("user", *user_id, None),
+        _ => ("admin", st.admin_id, Some(st.cfg.admin.login.clone())),
+    };
+    let user = st
+        .system
+        .get_user(user_id)
         .await?
         .ok_or(ApiError::Unauthorized)?;
     Ok(Json(json!({
-        "login": st.cfg.admin.login,
-        "user_id": st.admin_id,
+        "kind": kind,
+        "user_id": user_id,
+        "name": user.name,
+        "login": login.unwrap_or_else(|| user.name.clone()),
+        "must_change_password": s.must_change_password,
         "csrf": ws.csrf_token,
     })))
 }
