@@ -47,7 +47,7 @@ enum Format {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tier {
+pub(crate) enum Tier {
     L0,
     L1,
     L2,
@@ -62,7 +62,7 @@ fn parse_format(s: Option<&str>) -> Result<Format, ApiError> {
     }
 }
 
-fn parse_tier(s: Option<&str>) -> Result<Tier, ApiError> {
+pub(crate) fn parse_tier(s: Option<&str>) -> Result<Tier, ApiError> {
     match s.map(str::to_ascii_uppercase).as_deref() {
         None | Some("L2") => Ok(Tier::L2),
         Some("L0") => Ok(Tier::L0),
@@ -224,7 +224,7 @@ fn sha256_hex(b: &[u8]) -> String {
 
 /// Байты секции `path` (весь её диапазон, с заголовком и подсекциями).
 /// Нет секции → 404, путь у нескольких секций → 422.
-fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
+pub(crate) fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
     let want: Vec<&str> = path.split('>').map(str::trim).collect();
     if want.iter().any(|p| p.is_empty()) {
         return Err(ApiError::NotFound);
@@ -245,7 +245,7 @@ fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
 
 /// L1 (§8.3): оглавление и первое предложение каждой секции — тот же `note_l1`, что
 /// чанкер индексирует как сводку заметки, не длиннее [`NOTE_L1_MAX_CHARS`] символов.
-fn l1(text: &str) -> String {
+pub(crate) fn l1(text: &str) -> String {
     note_l1(text, &parse(text), NOTE_L1_MAX_CHARS)
 }
 

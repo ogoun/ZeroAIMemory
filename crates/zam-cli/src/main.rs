@@ -54,6 +54,18 @@ enum Cmd {
         /// Ревизия
         #[arg(long)]
         rev: Option<i64>,
+        /// Пачкой одним запросом `POST /read` (Markdown с заголовками элементов и строкой `~N tok`)
+        #[arg(long)]
+        batch: bool,
+        /// Пачка: не больше токенов на элемент, остальное — «…ещё N токенов»
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        max_tokens: Option<u32>,
+        /// Пачка: бюджет токенов на весь ответ (по умолчанию серверный, 1500)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        budget: Option<u32>,
+        /// Пачка: ревизия, уже известная агенту; совпала — `unchanged` без текста
+        #[arg(long)]
+        if_rev: Option<i64>,
         #[command(flatten)]
         common: Common,
     },
@@ -648,12 +660,20 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             tier,
             section,
             rev,
+            batch,
+            max_tokens,
+            budget,
+            if_rev,
             common,
         } => {
             let o = cmd::read::Opts {
                 tier: tier.as_deref(),
                 section: section.as_deref(),
                 rev,
+                batch,
+                max_tokens,
+                budget,
+                if_rev,
             };
             cmd::read::run(&cmd::connect(&common)?, &targets, &o)
         }

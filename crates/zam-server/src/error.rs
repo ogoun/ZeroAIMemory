@@ -47,6 +47,9 @@ pub enum ApiError {
     PreconditionRequired(String),
     #[error("{0}")]
     Unprocessable(String),
+    /// 422 `/problems/locator-unsupported`: `locator` в `/read` — этап M5.
+    #[error("{0}")]
+    LocatorUnsupported(String),
     /// 422 `/problems/idempotency-mismatch`: ключ повторён с другим запросом.
     #[error("{0}")]
     IdempotencyMismatch(String),
@@ -119,6 +122,11 @@ impl ApiError {
             ApiError::Unprocessable(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/unprocessable",
+                "Unprocessable Content",
+            ),
+            ApiError::LocatorUnsupported(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "/problems/locator-unsupported",
                 "Unprocessable Content",
             ),
             ApiError::IdempotencyMismatch(_) => (

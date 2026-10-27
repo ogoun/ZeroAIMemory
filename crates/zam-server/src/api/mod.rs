@@ -8,6 +8,7 @@ pub mod health;
 pub mod index;
 pub mod insights;
 pub mod nodes;
+pub mod read;
 pub mod releases;
 pub mod render;
 pub mod scope;
@@ -190,6 +191,7 @@ fn service_routes() -> Router<AppState> {
         .route("/api/v1/render/highlight.css", get(render::highlight))
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
         .route("/api/v1/search", post(search::search))
+        .route("/api/v1/read", post(read::read))
         .route("/api/v1/triggers", get(triggers::list))
         .route(
             "/api/v1/sessions",

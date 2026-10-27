@@ -1198,7 +1198,7 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
 }
 
 /// Одна строка: маркеры → `**`, переводы строк → пробелы.
-fn md_inline(s: &str) -> String {
+pub(crate) fn md_inline(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             '\r' | '\n' => ' ',

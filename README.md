@@ -287,7 +287,7 @@ CLAUDE.md, `zam init`, хуки и MCP появятся на этапе M4.
 |---|---|
 | `zam status` | проверка сервера, токена, пользователя и `solution.toml` |
 | `zam tree [цель] [--depth 1..5]` | дерево с краткими сводками L0 |
-| `zam read <цель>… [--tier L0\|L1\|L2] [--section "A > B"] [--rev N]` | чтение Markdown как он сохранён |
+| `zam read <цель>… [--tier L0\|L1\|L2] [--section "A > B"] [--rev N]` | чтение Markdown как он сохранён; `--batch`, `--max-tokens N`, `--budget N`, `--if-rev N` — пачкой через `POST /read` с бюджетом токенов |
 | `zam write <цель> [--file f.md] [-m сообщение] [--base-rev N] [--l0 текст]` | создать или заменить заметку (без `--file` текст читается из stdin) |
 | `zam history <цель> [--diff A..B \| --revert N]` | ревизии, дифф, откат |
 | `zam search <запрос> [--all] [--mode brief\|chunks\|notes] [--top-k N] [--rerank]` | поиск, по умолчанию Markdown-карточки; `--rerank` — серверный реранк |

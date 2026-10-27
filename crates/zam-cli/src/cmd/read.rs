@@ -6,18 +6,40 @@
 //!   при нескольких целях — массив;
 //! - несколько целей: перед каждой строка `--- <цель> ---` (с новой строки). Ошибка
 //!   одной цели печатается в stderr, остальные читаются; код выхода — первой ошибки.
+//!
+//! **Пачка** (`--batch`, а также `--max-tokens`, `--budget`, `--if-rev`; §9.3 шаг 2): одна
+//! `POST /read` на все цели — Markdown сервера как есть (заголовок на элемент, `…ещё N токенов`,
+//! `(budget)`, последняя строка `~N tok`) или с `--json` ответ сервера. Без этих флагов вывод
+//! побайтный, как раньше [решение исполнителя: побайтное чтение M1 не меняется]. Ошибка по
+//! элементу остаётся в выводе; код выхода — первой ошибки (`not_found`, `invalid` — как у 404 и
+//! 422, `forbidden`, `solution_access` — как у 403). `--rev` с пачкой несовместим.
 use std::io::{ErrorKind, Read, Write};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{Ctx, emit, emit_json};
-use crate::client::{CliError, EXIT_UNREACHABLE, into_reader, read_json};
+use crate::client::{
+    CliError, EXIT_INPUT, EXIT_NOT_FOUND, EXIT_TOKEN, EXIT_UNREACHABLE, into_reader, read_json,
+    read_text,
+};
+use crate::target::Loc;
 
 /// Параметры чтения.
 pub struct Opts<'a> {
     pub tier: Option<&'a str>,
     pub section: Option<&'a str>,
     pub rev: Option<i64>,
+    /// Пачкой через `POST /read` (иначе только если задан один из флагов ниже).
+    pub batch: bool,
+    pub max_tokens: Option<u32>,
+    pub budget: Option<u32>,
+    pub if_rev: Option<i64>,
+}
+
+impl Opts<'_> {
+    fn batched(&self) -> bool {
+        self.batch || self.max_tokens.is_some() || self.budget.is_some() || self.if_rev.is_some()
+    }
 }
 
 /// Результат одной цели.
@@ -30,6 +52,9 @@ enum Out {
 }
 
 pub fn run(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
+    if o.batched() {
+        return batch(ctx, targets, o);
+    }
     let many = targets.len() > 1;
     let mut first_err: Option<CliError> = None;
     let mut jsons = Vec::new();
@@ -131,4 +156,76 @@ fn copy_out(r: &mut impl Read) -> Result<Out, CliError> {
     Ok(Out::Printed {
         ends_with_newline: last == b'\n',
     })
+}
+
+/// Код выхода по `error` элемента `/read`.
+fn error_exit(code: &str) -> u8 {
+    match code {
+        "not_found" => EXIT_NOT_FOUND,
+        "forbidden" | "solution_access" => EXIT_TOKEN,
+        _ => EXIT_INPUT,
+    }
+}
+
+/// Код `error` первого элемента с ошибкой в Markdown ответа (`### <id>  error: <код>`).
+fn first_error_md(md: &str) -> Option<&str> {
+    md.lines()
+        .filter(|l| l.starts_with("### "))
+        .find_map(|l| l.split_once("  error: ").map(|(_, c)| c.trim()))
+}
+
+/// `id` элемента `/read` для цели: id как есть либо `<пространство>:/<путь>`.
+fn item_id(loc: &Loc) -> String {
+    match loc {
+        Loc::Node(id) => id.clone(),
+        Loc::Path { space, path, .. } => format!("{space}:/{path}"),
+    }
+}
+
+/// Пачка: одна `POST /read` на все цели.
+fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
+    if o.rev.is_some() {
+        return Err(CliError::input(
+            "--rev несовместим с пачкой (--batch, --max-tokens, --budget, --if-rev)",
+        ));
+    }
+    let mut items = Vec::with_capacity(targets.len());
+    for t in targets {
+        let mut it = json!({ "id": item_id(&ctx.locate(t)?) });
+        if let Some(v) = o.tier {
+            it["tier"] = json!(v.to_ascii_uppercase());
+        }
+        if let Some(v) = o.section {
+            it["section"] = json!(v);
+        }
+        if let Some(v) = o.max_tokens {
+            it["max_tokens"] = json!(v);
+        }
+        if let Some(v) = o.if_rev {
+            it["if_rev"] = json!(v);
+        }
+        items.push(it);
+    }
+    let mut body = json!({ "items": items, "format": if ctx.json { "json" } else { "md" } });
+    if let Some(b) = o.budget {
+        body["budget_tokens"] = json!(b);
+    }
+    let resp = ctx.client.post_json("/read", &body)?;
+    let first = if ctx.json {
+        let v = read_json(resp)?;
+        emit_json(&v)?;
+        v["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|i| i["error"].as_str().map(error_exit))
+    } else {
+        let text = read_text(resp)?;
+        emit(text.as_bytes())?;
+        first_error_md(&text).map(error_exit)
+    };
+    match first {
+        Some(code) => Err(CliError::new(code, String::new())),
+        None => Ok(()),
+    }
 }

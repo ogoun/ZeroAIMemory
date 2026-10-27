@@ -35,6 +35,7 @@ pub struct ServerConfig {
     pub index: IndexSection,
     pub search: SearchSection,
     pub insights: InsightsSection,
+    pub read: ReadSection,
     pub limits: LimitsSection,
     pub vault: VaultSection,
 }
@@ -578,6 +579,33 @@ impl InsightsSection {
     }
 }
 
+/// Секция `[read]` (§9.3 шаг 2): чтение пачкой `POST /read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadSection {
+    /// Не больше элементов в одном запросе (1..=100, по умолчанию 20); больше — 422.
+    pub max_items: usize,
+    /// Бюджет токенов на весь ответ по умолчанию (1..=200000, по умолчанию 1500).
+    pub budget_tokens: usize,
+}
+
+impl ReadSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("read.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=100).contains(&self.max_items) {
+            return Err(bad("max_items", "от 1 до 100"));
+        }
+        if !(1..=200_000).contains(&self.budget_tokens) {
+            return Err(bad("budget_tokens", "от 1 до 200000"));
+        }
+        Ok(())
+    }
+}
+
 /// Секция `[vault]` (§7.6): файл мастер-ключа. Сам ключ — только в файле или в
 /// `ZAM_MASTER_KEY` (переменная важнее файла), в конфигурацию он не попадает.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -676,6 +704,10 @@ impl Default for ServerConfig {
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
+            },
+            read: ReadSection {
+                max_items: 20,
+                budget_tokens: 1500,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -850,6 +882,7 @@ pub fn load(
     cfg.index.validate()?;
     cfg.search.validate()?;
     cfg.insights.validate()?;
+    cfg.read.validate()?;
     Ok(cfg)
 }
 
