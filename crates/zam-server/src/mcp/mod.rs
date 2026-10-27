@@ -23,6 +23,12 @@
 //!   (тексты заметок, значения Vault, промпты) в журнал не попадают; сам `rmcp` пишет JSON-RPC
 //!   на debug/trace — его уровень ограничен `warn` в [`crate::logging`].
 //! - **Origin** — если есть, должен совпадать с `Host` ([`same_origin`]), иначе 403.
+//! - **Сессия без заголовка** (решение контроллера R13, задача 10 M4): `.mcp.json` не знает
+//!   `session_id` агента, поэтому запрос без `X-Zam-Session` идёт во внутренний REST с
+//!   последней незавершённой сессией пользователя токена, к которой обращались не позже
+//!   [`IMPLICIT_SESSION_HOURS`] ч назад (её создаёт хук `session-start`); с `X-Zam-Machine` —
+//!   только сессией той же машины ([`implicit_session`]). Так запись через MCP попадает в
+//!   `memory_writes` сессии хуков и `checkpoint` не напоминает зря. Подходящей нет — без сессии.
 pub mod tools;
 
 use std::net::SocketAddr;
@@ -52,6 +58,9 @@ use crate::attrib::{AREA_HEADER, MACHINE_HEADER, SESSION_HEADER};
 use crate::auth::Principal;
 use crate::error::ApiError;
 
+/// Окно поиска сессии для MCP без `X-Zam-Session`, часов (R13).
+pub const IMPLICIT_SESSION_HOURS: i64 = 12;
+
 /// Путь MCP (под `server.base_path`, как и REST).
 pub const MCP_PATH: &str = "/mcp";
 
@@ -80,6 +89,7 @@ memory_write, memory_log, memory_update_entry; ревизии обязатель
 pub fn router(state: &AppState) -> Router<AppState> {
     let server = McpServer {
         rest: crate::api::router(state).with_state(state.clone()),
+        state: state.clone(),
     };
     let cfg = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
@@ -154,7 +164,11 @@ async fn require_bearer(State(st): State<AppState>, req: Request, next: Next) ->
         return ApiError::Unauthorized.into_response();
     }
     match Principal::from_request_parts(&mut parts, &st).await {
-        Ok(_) => next.run(Request::from_parts(parts, body)).await,
+        Ok(p) => {
+            // принципал — для выбора сессии без заголовка (R13), токен второй раз не проверяется
+            parts.extensions.insert(p);
+            next.run(Request::from_parts(parts, body)).await
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -163,6 +177,7 @@ async fn require_bearer(State(st): State<AppState>, req: Request, next: Next) ->
 #[derive(Clone)]
 pub struct McpServer {
     rest: Router,
+    state: AppState,
 }
 
 impl ServerHandler for McpServer {
@@ -209,7 +224,14 @@ impl ServerHandler for McpServer {
                 None,
             ));
         };
-        let rest = Rest::new(self.rest.clone(), parts);
+        let mut rest = Rest::new(self.rest.clone(), parts);
+        if rest.header(SESSION_HEADER).is_none()
+            && let Some(id) = implicit_session(&self.state, parts).await
+            && let Ok(v) = HeaderValue::from_str(&id)
+        {
+            rest.headers
+                .insert(HeaderName::from_static(SESSION_HEADER), v);
+        }
         let t = Instant::now();
         let out = tools::call(tool, &rest, request.arguments.unwrap_or_default()).await;
         tracing::debug!(
@@ -219,6 +241,28 @@ impl ServerHandler for McpServer {
             "инструмент MCP"
         );
         Ok(out.into_result().into())
+    }
+}
+
+/// Сессия для запроса MCP без `X-Zam-Session` (R13): последняя незавершённая сессия
+/// пользователя токена за [`IMPLICIT_SESSION_HOURS`] ч, с `X-Zam-Machine` — той же машины.
+/// Сбой поиска — без сессии (WARN без id).
+async fn implicit_session(st: &AppState, parts: &Parts) -> Option<String> {
+    let p = parts.extensions.get::<Principal>()?;
+    let user = crate::auth::target_user_id(st, p, &parts.headers).ok()?;
+    // некорректный X-Zam-Machine отклонит сам маршрут REST
+    let machine = crate::attrib::header_value(&parts.headers, MACHINE_HEADER).ok()?;
+    let since = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(IMPLICIT_SESSION_HOURS);
+    let found = match st.users.get(user).await {
+        Ok(db) => zam_store::latest_session(&db, machine.as_deref(), since).await,
+        Err(e) => Err(e),
+    };
+    match found {
+        Ok(s) => s.map(|s| s.id),
+        Err(e) => {
+            tracing::warn!(error = %e, "MCP: сессия пользователя не найдена");
+            None
+        }
     }
 }
 

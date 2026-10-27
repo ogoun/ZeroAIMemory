@@ -172,6 +172,29 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Хук агента (§10.3): JSON события на stdin, подсказки — JSON в stdout; всегда код 0
+    Hook {
+        /// session-start, prompt, pre-tool, post-tool, checkpoint
+        #[arg(value_enum)]
+        kind: cmd::hook::Kind,
+        /// Формат вывода и предел текста
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: cmd::hook::Agent,
+    },
+    /// Локальный кэш триггеров вспоминания (.zeroaimemory/cache/triggers.json)
+    Triggers {
+        #[command(subcommand)]
+        cmd: TriggersCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TriggersCmd {
+    /// Принудительно обновить кэш триггеров решения и Knowledge
+    Sync {
+        #[command(flatten)]
+        common: Common,
+    },
 }
 
 #[derive(Subcommand)]
@@ -661,14 +684,24 @@ impl AccessCmd {
 }
 
 fn main() -> ExitCode {
+    let started = std::time::Instant::now();
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            // --help и --version — успех; ошибка аргументов — неверный ввод (6), не 2
+            // --help и --version — успех; ошибка аргументов — неверный ввод (6), не 2;
+            // у `zam hook …` — всегда 0: хук не блокирует агента (§10.3)
             let _ = e.print();
-            return ExitCode::from(if e.use_stderr() { EXIT_INPUT } else { 0 });
+            let hook = std::env::args().nth(1).as_deref() == Some("hook");
+            return ExitCode::from(if e.use_stderr() && !hook {
+                EXIT_INPUT
+            } else {
+                0
+            });
         }
     };
+    if let Cmd::Hook { kind, agent } = &cli.cmd {
+        return ExitCode::from(cmd::hook::run(*kind, *agent, started));
+    }
     if let Cmd::Status { common } = &cli.cmd {
         let flags = Flags {
             url: common.url.clone(),
@@ -745,7 +778,10 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
 
 fn dispatch(c: Cmd) -> Result<(), CliError> {
     match c {
-        Cmd::Status { .. } => unreachable!("обработан в main"),
+        Cmd::Status { .. } | Cmd::Hook { .. } => unreachable!("обработан в main"),
+        Cmd::Triggers {
+            cmd: TriggersCmd::Sync { common },
+        } => cmd::hook::cache::sync(&cmd::connect(&common)?),
         Cmd::Tree {
             target,
             depth,

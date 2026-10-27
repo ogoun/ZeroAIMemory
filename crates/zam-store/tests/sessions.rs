@@ -6,8 +6,8 @@ use jiff::{SignedDuration, Timestamp};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
     DataDir, SeenItem, SeenKey, SessionTouch, UsageEvent, UsageKind, UsageSource, UserDbs,
-    WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session, list_sessions,
-    mark_seen, record_usage, seen_revs, touch_session, usage_counts,
+    WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session, latest_session,
+    list_sessions, mark_seen, record_usage, seen_revs, touch_session, usage_counts,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -315,4 +315,51 @@ async fn migrate_v12_to_v13() {
     assert!(list_sessions(&db, None, 10).await.unwrap().is_empty());
     touch_session(&db, &touch("после-миграции")).await.unwrap();
     assert_eq!(list_sessions(&db, None, 10).await.unwrap().len(), 1);
+}
+
+/// Последняя незавершённая сессия с обращением не раньше срока; с машиной — только этой
+/// машины (R13: MCP без `X-Zam-Session`, задача 10 M4).
+#[tokio::test]
+async fn latest_session_by_machine_and_age() {
+    let (_dd, db) = db("latest").await;
+    let since = || Timestamp::now() - SignedDuration::from_hours(12);
+    assert_eq!(latest_session(&db, None, since()).await.unwrap(), None);
+    let on = |id: &str, m: &str| SessionTouch {
+        id: id.into(),
+        machine: Some(m.into()),
+        ..SessionTouch::default()
+    };
+    touch_session(&db, &on("a", "box-1")).await.unwrap();
+    touch_session(&db, &on("b", "box-2")).await.unwrap();
+    let id = |s: Option<zam_store::Session>| s.map(|s| s.id);
+    assert_eq!(
+        id(latest_session(&db, None, since()).await.unwrap()).as_deref(),
+        Some("b")
+    );
+    assert_eq!(
+        id(latest_session(&db, Some("box-1"), since()).await.unwrap()).as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        latest_session(&db, Some("box-3"), since()).await.unwrap(),
+        None
+    );
+    // завершённая сессия не подходит
+    assert!(end_session(&db, "b", true).await.unwrap());
+    assert_eq!(
+        id(latest_session(&db, None, since()).await.unwrap()).as_deref(),
+        Some("a")
+    );
+    // старше срока — тоже
+    let old = Timestamp::now() - SignedDuration::from_hours(13);
+    db.write(move |t| {
+        t.execute(
+            "UPDATE sessions SET last_seen_at = ?1 WHERE id = 'a'",
+            [zam_store::time::fmt_ts(old)],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(latest_session(&db, None, since()).await.unwrap(), None);
 }

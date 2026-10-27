@@ -291,6 +291,83 @@ async fn mcp_read_and_cache_put_roundtrip() {
     assert_eq!(s.json()["machine"], MACHINE);
 }
 
+/// R13 (задача 10 M4): `.mcp.json` не знает `session_id` агента — запись через MCP без
+/// `X-Zam-Session` учитывается в последней активной сессии пользователя (хук `session-start`), с
+/// `X-Zam-Machine` — только той же машины; подходящей нет — без сессии.
+#[tokio::test]
+async fn mcp_without_session_header_uses_latest_hook_session() {
+    let a = api("mcp-implicit-session", |_| {}).await;
+    let hook = |id: &'static str, machine: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok_h(
+                    &a.token,
+                    Method::POST,
+                    "/api/v1/sessions",
+                    Some(json!({"id": id, "agent": "claude-code"})),
+                    &[("x-zam-machine", machine)],
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        }
+    };
+    let writes = |id: &'static str| {
+        let a = &a;
+        async move {
+            let s = a
+                .t(Method::GET, &format!("/api/v1/sessions/{id}"), None)
+                .await;
+            assert_eq!(s.status, StatusCode::OK, "{}", s.text());
+            s.json()["memory_writes"].as_i64().unwrap()
+        }
+    };
+    hook("hook-a", MACHINE).await;
+    hook("hook-b", "other-box").await;
+    // с машиной — сессия этой машины, хотя «hook-b» свежее
+    ok(
+        &a,
+        &a.token,
+        &[("x-zam-machine", MACHINE)],
+        "memory_write",
+        json!({"path": "Неявная сессия/A", "content": "# A
+
+текст
+"}),
+    )
+    .await;
+    assert_eq!(writes("hook-a").await, 1);
+    assert_eq!(writes("hook-b").await, 0);
+    // без машины — последняя сессия пользователя (после записи свежее «hook-a»)
+    hook("hook-b", "other-box").await;
+    ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": "Неявная сессия/B", "content": "# B
+
+текст
+"}),
+    )
+    .await;
+    assert_eq!(writes("hook-b").await, 1);
+    assert_eq!(writes("hook-a").await, 1);
+    // машина без сессии — запись без сессии, счётчики не растут
+    ok(
+        &a,
+        &a.token,
+        &[("x-zam-machine", "nobody-box")],
+        "memory_write",
+        json!({"path": "Неявная сессия/C", "content": "# C
+
+текст
+"}),
+    )
+    .await;
+    assert_eq!((writes("hook-a").await, writes("hook-b").await), (1, 1));
+}
+
 #[tokio::test]
 async fn mcp_write_conflict_is_tool_error() {
     let a = api("mcp-conflict", |_| {}).await;

@@ -2,6 +2,7 @@
 pub mod attach;
 pub mod cache;
 pub mod history;
+pub mod hook;
 pub mod insight;
 pub mod link;
 pub mod log;
@@ -84,16 +85,29 @@ pub fn connect(c: &Common) -> Result<Ctx, CliError> {
         Some(p) => Some(target::load_solution(&p)?),
         None => None,
     };
-    let client = Client::new(
+    let mut client = Client::new(
         &url.value,
         &token.value,
         solution.as_ref().map(|s| s.id.clone()),
     );
+    client.set_session(agent_session(&cwd));
     Ok(Ctx {
         client,
         solution,
         json: c.json,
     })
+}
+
+/// Сессия агента для `X-Zam-Session`: `ZAM_SESSION`, иначе текущая сессия хуков проекта
+/// (`.zeroaimemory/cache/session.json`, не старше 12 ч) — запись в память через `zam`
+/// учитывается в `memory_writes` сессии и `checkpoint` не напоминает зря (R1)
+/// **[решение исполнителя, задача 10 M4]**.
+fn agent_session(cwd: &std::path::Path) -> Option<String> {
+    let env = std::env::var("ZAM_SESSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().count() <= 128 && !s.chars().any(char::is_control));
+    env.or_else(|| hook::cache::current_session(&hook::project_root(cwd).0))
 }
 
 impl Ctx {

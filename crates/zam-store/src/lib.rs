@@ -93,8 +93,8 @@ pub use search::{
 };
 pub use sessions::{
     RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, WHOLE_TARGET,
-    add_memory_write, check_session_id, end_session, gc_sessions, get_session, list_sessions,
-    mark_seen, seen_revs, touch_session,
+    add_memory_write, check_session_id, end_session, gc_sessions, get_session, latest_session,
+    list_sessions, mark_seen, seen_revs, touch_session,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{

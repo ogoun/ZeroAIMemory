@@ -6256,6 +6256,8 @@ dependencies = [
  "assert_cmd",
  "axum",
  "clap",
+ "globset",
+ "regex",
  "rpassword",
  "serde",
  "serde_json",

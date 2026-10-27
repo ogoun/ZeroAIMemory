@@ -230,6 +230,31 @@ pub async fn list_sessions(
     .await
 }
 
+/// Последняя незавершённая сессия базы с обращением не раньше `since`; `machine` задана —
+/// только сессии этой машины. Нужна MCP без `X-Zam-Session` (решение контроллера R13, задача 10
+/// M4): `.mcp.json` не знает `session_id` агента, и запись через MCP учитывается в сессии хуков.
+pub async fn latest_session(
+    db: &Db,
+    machine: Option<&str>,
+    since: Timestamp,
+) -> Result<Option<Session>, StoreError> {
+    let (machine, since) = (machine.map(str::to_string), fmt_ts(since));
+    db.read(move |c| {
+        Ok(c.query_row(
+            &format!(
+                "SELECT {SESSION_COLS} FROM sessions
+                 WHERE ended_at IS NULL AND last_seen_at >= ?1
+                   AND (?2 IS NULL OR machine = ?2)
+                 ORDER BY last_seen_at DESC, id DESC LIMIT 1"
+            ),
+            params![since, machine],
+            session_row,
+        )
+        .optional()?)
+    })
+    .await
+}
+
 /// Касание сессии (как [`touch_session`]) и отметка выданного ей — одной транзакцией; у части
 /// цели остаётся большая ревизия.
 pub async fn mark_seen(db: &Db, s: &SessionTouch, items: &[SeenItem]) -> Result<(), StoreError> {

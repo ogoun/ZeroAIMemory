@@ -83,6 +83,9 @@ pub enum Timeouts {
     Probe,
     /// Команды заметок: тело (вложение до 200 МБ) может идти долго, общего предела нет.
     Transfer,
+    /// Хуки агента (§10.3): весь запрос, включая чтение ответа, — не дольше срока
+    /// (бюджет хука минус 30 мс).
+    Deadline(Duration),
 }
 
 pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
@@ -100,6 +103,10 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
             .timeout_send_body(Some(Duration::from_secs(30 * 60)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .timeout_recv_body(Some(Duration::from_secs(5 * 60))),
+        Timeouts::Deadline(d) => b
+            .timeout_resolve(Some(d))
+            .timeout_connect(Some(d))
+            .timeout_global(Some(d)),
     };
     if bypass_proxy(url) {
         b = b.proxy(None);
@@ -125,6 +132,7 @@ pub struct Client {
     token: String,
     machine: Option<String>,
     solution: Option<String>,
+    session: Option<String>,
 }
 
 /// В Debug токен — только маска.
@@ -135,6 +143,7 @@ impl fmt::Debug for Client {
             .field("token", &zam_core::mask_token(&self.token))
             .field("machine", &self.machine)
             .field("solution", &self.solution)
+            .field("session", &self.session)
             .finish()
     }
 }
@@ -142,13 +151,29 @@ impl fmt::Debug for Client {
 impl Client {
     /// `base` — без замыкающего `/`; `solution` — GUID для `X-Zam-Solution`.
     pub fn new(base: &str, token: &str, solution: Option<String>) -> Client {
+        Client::with_timeouts(base, token, solution, Timeouts::Transfer)
+    }
+
+    /// Клиент с профилем таймаутов (`Deadline` — хуки агента).
+    pub fn with_timeouts(base: &str, token: &str, solution: Option<String>, t: Timeouts) -> Client {
         Client {
-            agent: agent(base, Timeouts::Transfer),
+            agent: agent(base, t),
             base: base.to_string(),
             token: token.to_string(),
             machine: machine_from(|k| std::env::var(k).ok()),
             solution,
+            session: None,
         }
+    }
+
+    /// Сессия агента для `X-Zam-Session` (запись в память учитывается в её `memory_writes`).
+    pub fn set_session(&mut self, id: Option<String>) {
+        self.session = id;
+    }
+
+    /// Адрес сервера (без `/api/v1`).
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     fn url(&self, path: &str) -> String {
@@ -163,6 +188,9 @@ impl Client {
         if let Some(s) = &self.solution {
             rb = rb.header("X-Zam-Solution", s.as_str());
         }
+        if let Some(s) = &self.session {
+            rb = rb.header("X-Zam-Session", s.as_str());
+        }
         rb
     }
 
@@ -171,6 +199,23 @@ impl Client {
         let mut rb = self.prepare(self.agent.get(&self.url(path)));
         for (k, v) in query {
             rb = rb.query(*k, *v);
+        }
+        self.check(rb.call())
+    }
+
+    /// GET с дополнительными заголовками (`If-None-Match`): 304 — тоже ответ, а не ошибка.
+    pub fn get_with(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        headers: &[(&str, &str)],
+    ) -> Result<Response<Body>, CliError> {
+        let mut rb = self.prepare(self.agent.get(&self.url(path)));
+        for (k, v) in query {
+            rb = rb.query(*k, *v);
+        }
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
         }
         self.check(rb.call())
     }
@@ -261,7 +306,7 @@ impl Client {
         self.check(rb.send(ureq::SendBody::from_owned_reader(reader)))
     }
 
-    /// 2xx → ответ; иначе ошибка с кодом выхода по статусу.
+    /// 2xx и 304 (ответ на `If-None-Match`) → ответ; иначе ошибка с кодом выхода по статусу.
     fn check(&self, r: Result<Response<Body>, ureq::Error>) -> Result<Response<Body>, CliError> {
         let resp = r.map_err(|e| {
             CliError::new(
@@ -269,7 +314,7 @@ impl Client {
                 format!("сервер {} недоступен: {e}", self.base),
             )
         })?;
-        if resp.status().is_success() {
+        if resp.status().is_success() || resp.status().as_u16() == 304 {
             return Ok(resp);
         }
         Err(problem(resp))
