@@ -60,6 +60,10 @@ pub struct Inputs<'a> {
     pub flavor: Flavor,
     pub server_bin: &'a Path,
     pub cli_bin: &'a Path,
+    /// `zam` другой платформы ([`other_platform`]) для `GET /downloads/zam/{os}-{arch}`
+    /// (§15.5): кладётся в `downloads/<платформа>/zam[.exe]` комплекта сервера. `None` —
+    /// сервер раздаёт только клиент своей ОС.
+    pub other_cli_bin: Option<&'a Path>,
     /// `target/deps/<platform>`
     pub deps_dir: &'a Path,
     /// `deploy/` (qdrant.toml, models.toml, cuda.toml, config.example.toml,
@@ -152,6 +156,15 @@ pub fn crt_files(flavor: Flavor) -> &'static [&'static str] {
     }
 }
 
+/// Вторая поддерживаемая платформа (клиент `zam` которой кладётся в комплект сервера).
+pub fn other_platform(platform: &str) -> &'static str {
+    if is_windows(platform) {
+        "linux-x64"
+    } else {
+        "windows-x64"
+    }
+}
+
 pub fn exe(platform: &str, name: &str) -> String {
     if is_windows(platform) {
         format!("{name}.exe")
@@ -206,6 +219,14 @@ fn server_entries(i: &Inputs) -> Result<Vec<Entry>> {
             exec: true,
         },
     ];
+    if let Some(other) = i.other_cli_bin {
+        let op = other_platform(p);
+        v.push(Entry {
+            path: format!("downloads/{op}/{}", exe(op, "zam")),
+            src: other.to_path_buf(),
+            exec: true,
+        });
+    }
     let (ort_dir, ort) = ort_files(p, i.flavor);
     for n in ort {
         v.push(Entry::file(*n, i.deps_dir.join(ort_dir).join(n)));
@@ -751,6 +772,16 @@ pub(crate) mod tests {
         flavor: Flavor,
         with_crt: bool,
     ) -> Result<Vec<PathBuf>> {
+        run_package_with(w, platform, flavor, with_crt, None)
+    }
+
+    fn run_package_with(
+        w: &Path,
+        platform: &str,
+        flavor: Flavor,
+        with_crt: bool,
+        other_cli_bin: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
         let (deps, deploy, gen_dir, crt, dist) = fixture(w, platform);
         let server_bin = w.join("zam-server.bin");
         let cli_bin = w.join("zam.bin");
@@ -761,6 +792,7 @@ pub(crate) mod tests {
             flavor,
             server_bin: &server_bin,
             cli_bin: &cli_bin,
+            other_cli_bin,
             deps_dir: &deps,
             deploy_dir: &deploy,
             generated_licenses_dir: &gen_dir,
@@ -824,6 +856,40 @@ pub(crate) mod tests {
         "LICENSES/THIRD-PARTY-WEB.json",
         "LICENSES/ZeroAIMemory-LICENSE.txt",
     ];
+
+    #[test]
+    fn package_includes_other_platform_cli_for_downloads() {
+        let w = work("layout-cli-other");
+        let other = w.join("zam-linux.bin");
+        touch(&other);
+        let got = run_package_with(&w, "windows-x64", Flavor::Cpu, true, Some(&other)).unwrap();
+        let names = zip_names(&got[0]);
+        assert!(
+            names.contains(&"zam-server-1.2.3-windows-x64-cpu/downloads/linux-x64/zam".to_string()),
+            "{names:?}"
+        );
+        // архив клиента — только своей платформы
+        assert_eq!(
+            zip_names(&got[1]),
+            sorted("zam-1.2.3-windows-x64", &["LICENSE.txt", "zam.exe"])
+        );
+        let w = work("layout-cli-other-linux");
+        let other = w.join("zam-win.bin");
+        touch(&other);
+        let got = run_package_with(&w, "linux-x64", Flavor::Cpu, false, Some(&other)).unwrap();
+        assert!(
+            tar_entries(&got[0]).contains(&(
+                "zam-server-1.2.3-linux-x64-cpu/downloads/windows-x64/zam.exe".to_string(),
+                0o755
+            )),
+            "{:?}",
+            tar_entries(&got[0])
+        );
+        // нет файла — ошибка упаковки, а не комплект без клиента
+        let w = work("layout-cli-other-missing");
+        let missing = w.join("nope.bin");
+        assert!(run_package_with(&w, "linux-x64", Flavor::Cpu, false, Some(&missing)).is_err());
+    }
 
     #[test]
     fn package_layout_windows_cpu_and_gpu() {

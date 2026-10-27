@@ -1,0 +1,392 @@
+//! Подключение агента (§14, §15.5): блок инструкции для CLAUDE.md / AGENTS.md, фрагменты
+//! `.mcp.json`, `.claude/settings.json`, `.codex/hooks.json`, команды установки `zam`.
+//!
+//! - **Шаблоны** хранятся в `settings` (`agent_setup.template.<agent>.<lang>`, строка; `null` или
+//!   нет ключа — шаблон по умолчанию из [`templates`]); их правит администратор
+//!   (`PATCH /admin/settings`, WebUI — задача 13).
+//! - **Версия блока** — одна на сервер **[решение контроллера T11-a]**:
+//!   `max(AGENT_BLOCK_VERSION, agent_setup.version)`; каждое сохранение шаблона, которое меняет
+//!   его текст, увеличивает её на 1 ([`bump_version`]). Её отдаёт `GET /agent-setup`
+//!   (`version`), с ней сравнивают `/recall(session_start)` и `zam status`.
+//! - Токен не попадает ни в блок, ни в `.mcp.json` (`Bearer ${ZAM_TOKEN}`).
+pub mod templates;
+
+use serde_json::{Value, json};
+use zam_core::AGENT_BLOCK_VERSION;
+use zam_store::SystemStore;
+
+use crate::error::ApiError;
+
+/// Ключ сохранённой версии шаблонов.
+pub const VERSION_KEY: &str = "agent_setup.version";
+/// Префикс ключей шаблонов: `agent_setup.template.<agent>.<lang>`.
+pub const TEMPLATE_PREFIX: &str = "agent_setup.template.";
+/// Предел размера шаблона, байт.
+pub const TEMPLATE_MAX_BYTES: usize = 16 * 1024;
+/// Маркеры блока (§14.1).
+pub const BEGIN: &str = "<!-- zeroaimemory:begin";
+pub const END: &str = "<!-- zeroaimemory:end -->";
+
+/// Для кого блок: Claude Code (CLAUDE.md), AGENTS.md (Codex, Cursor и др.) или Codex
+/// (AGENTS.md и хуки Codex).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentKind {
+    Claude,
+    Agents,
+    Codex,
+}
+
+impl AgentKind {
+    pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Agents, AgentKind::Codex];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Agents => "agents",
+            AgentKind::Codex => "codex",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AgentKind> {
+        AgentKind::ALL.into_iter().find(|a| a.as_str() == s)
+    }
+}
+
+/// Язык инструкции.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    Ru,
+    En,
+}
+
+impl Lang {
+    pub const ALL: [Lang; 2] = [Lang::Ru, Lang::En];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lang::Ru => "ru",
+            Lang::En => "en",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Lang> {
+        Lang::ALL.into_iter().find(|l| l.as_str() == s)
+    }
+}
+
+/// Ключ шаблона в `settings`.
+pub fn template_key(agent: AgentKind, lang: Lang) -> String {
+    format!("{TEMPLATE_PREFIX}{}.{}", agent.as_str(), lang.as_str())
+}
+
+/// Шаблон по умолчанию.
+pub fn default_template(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ru => templates::BLOCK_RU,
+        Lang::En => templates::BLOCK_EN,
+    }
+}
+
+/// Текущая версия блока: `max(AGENT_BLOCK_VERSION, сохранённая)`.
+pub async fn current_version(system: &SystemStore) -> Result<u32, ApiError> {
+    let saved = system.get_setting::<u32>(VERSION_KEY).await?.unwrap_or(0);
+    Ok(saved.max(AGENT_BLOCK_VERSION))
+}
+
+/// Следующая версия после сохранения шаблона (записывается в `settings`).
+pub async fn bump_version(system: &SystemStore) -> Result<u32, ApiError> {
+    let next = current_version(system).await?.saturating_add(1);
+    system.set_setting(VERSION_KEY, &next).await?;
+    Ok(next)
+}
+
+/// Шаблон агента и языка: `(текст, свой ли)`.
+pub async fn template(
+    system: &SystemStore,
+    agent: AgentKind,
+    lang: Lang,
+) -> Result<(String, bool), ApiError> {
+    let saved = system
+        .get_setting::<Option<String>>(&template_key(agent, lang))
+        .await?
+        .flatten();
+    Ok(match saved {
+        Some(t) => (t, true),
+        None => (default_template(lang).to_string(), false),
+    })
+}
+
+/// Проверка шаблона перед сохранением; возвращает нормализованный текст (LF, без
+/// хвостовых пустых строк, с переводом строки в конце).
+pub fn validate_template(raw: &str) -> Result<String, String> {
+    let t = raw.replace("\r\n", "\n");
+    let t = t.trim_end();
+    if t.trim().is_empty() {
+        return Err("шаблон пуст".into());
+    }
+    if t.len() > TEMPLATE_MAX_BYTES {
+        return Err(format!("шаблон больше {TEMPLATE_MAX_BYTES} байт"));
+    }
+    if t.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err("в шаблоне управляющие символы".into());
+    }
+    if t.contains("<!-- zeroaimemory:") {
+        return Err("маркеры блока добавляет сервер: уберите <!-- zeroaimemory:… -->".into());
+    }
+    if !t.contains("{url}") {
+        return Err("в шаблоне нет {url}: без адреса сервера zam и агент не найдут память".into());
+    }
+    Ok(format!("{t}\n"))
+}
+
+/// Решение для блока и фрагментов.
+#[derive(Debug, Clone)]
+pub struct SolutionRef {
+    pub guid: String,
+    pub name: String,
+}
+
+/// Что подставить в шаблон.
+pub struct BlockCtx<'a> {
+    pub url: &'a str,
+    pub solution: Option<&'a SolutionRef>,
+    pub rules_write: bool,
+    pub lang: Lang,
+}
+
+/// Блок с маркерами версии `version`.
+pub fn render_block(template: &str, version: u32, c: &BlockCtx<'_>) -> String {
+    let solution = match (c.solution, c.lang) {
+        (Some(s), Lang::Ru) => format!("«{}» (`{}`)", s.name, s.guid),
+        (Some(s), Lang::En) => format!("\"{}\" (`{}`)", s.name, s.guid),
+        (None, Lang::Ru) => templates::SOLUTION_AUTO_RU.into(),
+        (None, Lang::En) => templates::SOLUTION_AUTO_EN.into(),
+    };
+    let rules = match (c.rules_write, c.lang) {
+        (true, Lang::Ru) => templates::RULES_WRITE_RU,
+        (false, Lang::Ru) => templates::RULES_READONLY_RU,
+        (true, Lang::En) => templates::RULES_WRITE_EN,
+        (false, Lang::En) => templates::RULES_READONLY_EN,
+    };
+    let body = template
+        .replace("{url}", c.url)
+        .replace("{solution}", &solution)
+        .replace("{rules}", rules);
+    // пустая подстановка не оставляет пробелов в конце строк
+    let body: Vec<&str> = body.trim_end().lines().map(str::trim_end).collect();
+    format!("{BEGIN} v{version} -->\n{}\n{END}\n", body.join("\n"))
+}
+
+/// Обработчик хука в exec form Claude Code: `command: "zam"` + `args` (без shell).
+fn claude_hook(kind: &str, timeout: u32) -> Value {
+    json!({"type": "command", "command": "zam", "args": ["hook", kind], "timeout": timeout})
+}
+
+/// Обработчик хука Codex: у Codex нет `args` — команда одной строкой (через shell).
+fn codex_hook(kind: &str, timeout: u32) -> Value {
+    json!({"type": "command", "command": format!("zam hook {kind} --agent codex"), "timeout": timeout})
+}
+
+/// Группа хуков события.
+fn group(matcher: Option<&str>, hook: Value) -> Value {
+    match matcher {
+        Some(m) => json!([{"matcher": m, "hooks": [hook]}]),
+        None => json!([{"hooks": [hook]}]),
+    }
+}
+
+/// Фрагмент `.claude/settings.json` (§15.5): exec form, `timeout` в секундах — 1 у
+/// `pre-tool`, 2 у остальных.
+pub fn claude_settings() -> Value {
+    let h = claude_hook;
+    json!({"hooks": {
+        "SessionStart": group(None, h("session-start", 2)),
+        "UserPromptSubmit": group(None, h("prompt", 2)),
+        "PreToolUse": group(Some("Write|Edit|Bash"), h("pre-tool", 1)),
+        "PostToolUseFailure": group(Some("Bash"), h("post-tool", 2)),
+        "Stop": group(None, h("checkpoint", 2)),
+        "PreCompact": group(None, h("checkpoint", 2)),
+    }})
+}
+
+/// Фрагмент `.codex/hooks.json`: тот же состав с `--agent codex`; `post-tool` — на
+/// `PostToolUse` (у Codex нет `PostToolUseFailure`), правки файлов Codex — инструмент
+/// `apply_patch` (matcher — regex) **[решение контроллера T11-b]**.
+pub fn codex_hooks() -> Value {
+    let h = codex_hook;
+    json!({"hooks": {
+        "SessionStart": group(None, h("session-start", 2)),
+        "UserPromptSubmit": group(None, h("prompt", 2)),
+        "PreToolUse": group(Some("Bash|apply_patch"), h("pre-tool", 1)),
+        "PostToolUse": group(Some("Bash"), h("post-tool", 2)),
+        "Stop": group(None, h("checkpoint", 2)),
+        "PreCompact": group(None, h("checkpoint", 2)),
+    }})
+}
+
+/// Фрагмент `.mcp.json`: токен — из переменной `ZAM_TOKEN`, машина — из `COMPUTERNAME`
+/// (Windows; пусто — сервер берёт последнюю сессию пользователя без учёта машины, R13).
+pub fn mcp_json(url: &str, solution: Option<&SolutionRef>) -> Value {
+    let mut headers = json!({
+        "Authorization": "Bearer ${ZAM_TOKEN}",
+        "X-Zam-Machine": "${COMPUTERNAME:-}",
+    });
+    if let Some(s) = solution {
+        headers["X-Zam-Solution"] = json!(s.guid);
+    }
+    json!({"mcpServers": {"zeroaimemory": {
+        "type": "http",
+        "url": format!("{url}/mcp"),
+        "headers": headers,
+    }}})
+}
+
+/// Строка TOML в кавычках (имя проверено: без управляющих символов).
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// `.zeroaimemory/solution.toml` (§11.1).
+pub fn solution_toml(s: &SolutionRef) -> String {
+    format!(
+        "agent_solution_id = {}\nname = {}\n",
+        toml_str(&s.guid),
+        toml_str(&s.name)
+    )
+}
+
+/// Команды установки `zam` с сервера (`GET /downloads/zam/{os}-{arch}`) и задания `ZAM_TOKEN`.
+/// `token` — открытый текст только при выпуске токена администратором, иначе заглушка.
+pub fn install(url: &str, token: Option<&str>) -> Value {
+    let t = token.unwrap_or("<токен>");
+    let windows = format!(
+        "$d = \"$env:LOCALAPPDATA\\Programs\\zam\"; New-Item -ItemType Directory -Force $d | Out-Null\n\
+         Invoke-WebRequest \"{url}/downloads/zam/windows-x64\" -OutFile \"$d\\zam.exe\"\n\
+         [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + \";$d\", 'User')\n\
+         [Environment]::SetEnvironmentVariable('ZAM_TOKEN', '{t}', 'User')\n"
+    );
+    let linux = format!(
+        "mkdir -p ~/.local/bin && curl -fsSL \"{url}/downloads/zam/linux-x64\" -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam\n\
+         echo 'export ZAM_TOKEN={t}' >> ~/.profile && . ~/.profile\n"
+    );
+    json!({"windows": windows, "linux": linux})
+}
+
+/// Параметры однострочника `zam init`.
+pub struct InitCmd<'a> {
+    pub url: &'a str,
+    pub token: Option<&'a str>,
+    pub agent: AgentKind,
+    pub solution: Option<&'a SolutionRef>,
+    pub hooks: bool,
+    pub mcp: bool,
+    pub lang: Lang,
+}
+
+/// Однострочник `zam init …` (§15.5, п. 6). AGENTS.md без хуков — `--agent codex --no-hooks`.
+pub fn init_cmd(c: &InitCmd<'_>) -> String {
+    let mut s = format!("zam init --url {}", c.url);
+    if let Some(t) = c.token {
+        s.push_str(&format!(" --token {t}"));
+    }
+    let agent = match c.agent {
+        AgentKind::Claude => "claude",
+        AgentKind::Agents | AgentKind::Codex => "codex",
+    };
+    s.push_str(&format!(" --agent {agent}"));
+    if let Some(sol) = c.solution {
+        let name: String = sol.name.chars().filter(|c| *c != '"').collect();
+        s.push_str(&format!(" --id {} --name \"{name}\"", sol.guid));
+    }
+    if !c.hooks || c.agent == AgentKind::Agents {
+        s.push_str(" --no-hooks");
+    }
+    if !c.mcp {
+        s.push_str(" --no-mcp");
+    }
+    if c.lang != Lang::Ru {
+        s.push_str(&format!(" --lang {}", c.lang.as_str()));
+    }
+    s.push_str(" --yes");
+    s
+}
+
+/// Полный протокол (`GET /agent-guide`).
+pub fn guide(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ru => templates::GUIDE_RU,
+        Lang::En => templates::GUIDE_EN,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sol() -> SolutionRef {
+        SolutionRef {
+            guid: "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e11".into(),
+            name: "Trading \"X\"".into(),
+        }
+    }
+
+    #[test]
+    fn block_substitutes_and_wraps_markers() {
+        let s = sol();
+        for lang in Lang::ALL {
+            let b = render_block(
+                default_template(lang),
+                7,
+                &BlockCtx {
+                    url: "http://h:1",
+                    solution: Some(&s),
+                    rules_write: false,
+                    lang,
+                },
+            );
+            assert!(b.starts_with("<!-- zeroaimemory:begin v7 -->\n"), "{b}");
+            assert!(b.ends_with("\n<!-- zeroaimemory:end -->\n"), "{b}");
+            assert!(b.contains("ZeroAIMemoryUrl=http://h:1\n"), "{b}");
+            assert!(b.contains(&s.guid), "{b}");
+            assert!(!b.contains('{'), "подстановки не остались: {b}");
+        }
+    }
+
+    #[test]
+    fn template_validation() {
+        assert!(validate_template("  \n").is_err());
+        assert!(validate_template("без адреса").is_err());
+        assert!(validate_template("{url}\n<!-- zeroaimemory:end -->").is_err());
+        assert!(validate_template("{url}\u{7}").is_err());
+        assert_eq!(
+            validate_template("a {url}\r\nb\r\n\r\n").unwrap(),
+            "a {url}\nb\n"
+        );
+    }
+
+    #[test]
+    fn solution_toml_escapes() {
+        let t = solution_toml(&sol());
+        let v: toml::Table = toml::from_str(&t).unwrap();
+        assert_eq!(v["name"].as_str(), Some("Trading \"X\""));
+    }
+
+    #[test]
+    fn init_cmd_maps_agents_to_codex_without_hooks() {
+        let s = sol();
+        let c = init_cmd(&InitCmd {
+            url: "http://h:1",
+            token: None,
+            agent: AgentKind::Agents,
+            solution: Some(&s),
+            hooks: true,
+            mcp: false,
+            lang: Lang::En,
+        });
+        assert_eq!(
+            c,
+            "zam init --url http://h:1 --agent codex --id 0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e11 \
+             --name \"Trading X\" --no-hooks --no-mcp --lang en --yes"
+        );
+    }
+}

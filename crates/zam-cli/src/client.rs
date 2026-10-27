@@ -306,6 +306,27 @@ impl Client {
         self.check(rb.send(ureq::SendBody::from_owned_reader(reader)))
     }
 
+    /// POST сообщения JSON-RPC на `{base}/mcp` (stdio-прокси `zam mcp`, §13.2): ответ любого
+    /// статуса — разбирает вызывающий; ошибка — только сетевая.
+    pub fn post_mcp(
+        &self,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Response<Body>, CliError> {
+        let mut rb = self
+            .prepare(self.agent.post(&format!("{}/mcp", self.base)))
+            .header("Accept", "application/json, text/event-stream");
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        rb.content_type("application/json").send(body).map_err(|e| {
+            CliError::new(
+                EXIT_UNREACHABLE,
+                format!("сервер {} недоступен: {e}", self.base),
+            )
+        })
+    }
+
     /// 2xx и 304 (ответ на `If-None-Match`) → ответ; иначе ошибка с кодом выхода по статусу.
     fn check(&self, r: Result<Response<Body>, ureq::Error>) -> Result<Response<Body>, CliError> {
         let resp = r.map_err(|e| {

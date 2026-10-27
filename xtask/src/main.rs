@@ -74,6 +74,10 @@ enum Cmd {
         /// Путь к zam (по умолчанию target/release/zam[.exe])
         #[arg(long)]
         cli_bin: Option<PathBuf>,
+        /// zam другой платформы для раздачи сервером (GET /downloads/zam/{os}-{arch}):
+        /// кладётся в downloads/<платформа>/ комплекта сервера
+        #[arg(long)]
+        cli_other: Option<PathBuf>,
         /// Также zam-models-<ver>-<id>.zip — по архиву на модель с bundle = true из
         /// target/models (сначала: cargo xtask fetch-models)
         #[arg(long)]
@@ -271,6 +275,7 @@ struct PackageArgs {
     version: String,
     server_bin: Option<PathBuf>,
     cli_bin: Option<PathBuf>,
+    cli_other: Option<PathBuf>,
     with_models: bool,
     cuda: bool,
     no_kit: bool,
@@ -302,6 +307,13 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
         let cli_bin = a
             .cli_bin
             .unwrap_or_else(|| release.join(package::exe(&platform, "zam")));
+        if a.cli_other.is_none() {
+            eprintln!(
+                "предупреждение: без --cli-other сервер не раздаст zam для {} (GET /downloads/zam/{} — 404)",
+                package::other_platform(&platform),
+                package::other_platform(&platform)
+            );
+        }
         let licenses = target.join("licenses");
         package::generate_licenses(&root, &licenses)?;
         let crt = if platform.starts_with("windows") {
@@ -317,6 +329,7 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
             flavor: a.flavor,
             server_bin: &server_bin,
             cli_bin: &cli_bin,
+            other_cli_bin: a.cli_other.as_deref(),
             deps_dir: &deps,
             deploy_dir: &deploy,
             generated_licenses_dir: &licenses,
@@ -370,6 +383,7 @@ fn main() -> Result<()> {
             version,
             server_bin,
             cli_bin,
+            cli_other,
             with_models,
             cuda,
             no_kit,
@@ -379,6 +393,7 @@ fn main() -> Result<()> {
             version,
             server_bin,
             cli_bin,
+            cli_other,
             with_models,
             cuda,
             no_kit,

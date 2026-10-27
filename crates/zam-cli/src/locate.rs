@@ -247,6 +247,25 @@ pub fn resolve(
     Ok(r)
 }
 
+/// Новое содержимое `~/.zeroaimemory/config.toml` с токеном `token` (`zam init`, §14.1):
+/// остальные ключи сохраняются (комментарии — нет: файл пишет `zam`). Токен уже там — `None`.
+/// Битый файл — ошибка (ничего не пишется).
+pub fn plan_home_token(home: &Path, token: &str) -> Result<Option<(PathBuf, String)>, String> {
+    let path = home.join(".zeroaimemory").join("config.toml");
+    let mut t: toml::Table = match read_limited(&path) {
+        Read::Skip => toml::Table::new(),
+        Read::Failed(e) => return Err(format!("не удалось прочитать {}: {e}", path.display())),
+        Read::Text(s) => toml::from_str(&s)
+            .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
+    };
+    if t.get("token").and_then(toml::Value::as_str) == Some(token) {
+        return Ok(None);
+    }
+    t.insert("token".into(), toml::Value::String(token.to_string()));
+    let text = toml::to_string(&t).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some((path, text)))
+}
+
 /// Ближайший вверх от `start` файл решения: в каждом каталоге сначала
 /// `.zeroaimemory/solution.toml` (§11.1), затем `solution.toml` (совместимость с M0).
 pub fn find_solution(start: &Path) -> Option<PathBuf> {

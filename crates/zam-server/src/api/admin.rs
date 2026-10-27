@@ -10,6 +10,7 @@ use zam_core::{Id, mask_token};
 use zam_store::time::fmt_ts;
 use zam_store::{Access, AuditRow, TokenInfo, User};
 
+use crate::agent_setup::{self, AgentKind, Lang};
 use crate::app::AppState;
 use crate::auth::{AdminOnly, Client};
 use crate::error::ApiError;
@@ -362,14 +363,30 @@ pub async fn list_audit(
 
 // ---- настройки ----
 
-/// `{rules: {agent_write}}`.
+/// `{rules: {agent_write}, agent_setup: {version, templates: {"<agent>.<lang>": {text, custom}}}}`.
 async fn settings_json(st: &AppState) -> Result<Value, ApiError> {
     let agent_write = st
         .system
         .get_setting::<bool>(RULES_AGENT_WRITE)
         .await?
         .unwrap_or(false);
-    Ok(json!({ "rules": { "agent_write": agent_write } }))
+    let mut templates = serde_json::Map::new();
+    for agent in AgentKind::ALL {
+        for lang in Lang::ALL {
+            let (text, custom) = agent_setup::template(&st.system, agent, lang).await?;
+            templates.insert(
+                format!("{}.{}", agent.as_str(), lang.as_str()),
+                json!({ "text": text, "custom": custom }),
+            );
+        }
+    }
+    Ok(json!({
+        "rules": { "agent_write": agent_write },
+        "agent_setup": {
+            "version": agent_setup::current_version(&st.system).await?,
+            "templates": templates,
+        },
+    }))
 }
 
 /// `GET /admin/settings`.
@@ -388,11 +405,51 @@ struct RulesPatch {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SettingsPatch {
-    rules: Option<RulesPatch>,
+struct AgentSetupPatch {
+    /// `"<agent>.<lang>"` → текст шаблона или `null` (сброс к шаблону по умолчанию).
+    #[serde(default)]
+    templates: serde_json::Map<String, Value>,
 }
 
-/// `PATCH /admin/settings {rules: {agent_write}}`; аудит `settings.update` при изменении.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsPatch {
+    rules: Option<RulesPatch>,
+    agent_setup: Option<AgentSetupPatch>,
+}
+
+/// Правки шаблонов: ключ `"<agent>.<lang>"` → (agent, lang, новый текст или `None` — сброс).
+fn template_edits(p: &AgentSetupPatch) -> Result<Vec<(AgentKind, Lang, Option<String>)>, ApiError> {
+    let mut out = Vec::new();
+    for (k, v) in &p.templates {
+        let parsed = k
+            .split_once('.')
+            .and_then(|(a, l)| Some((AgentKind::parse(a)?, Lang::parse(l)?)));
+        let Some((agent, lang)) = parsed else {
+            return Err(ApiError::BadRequest(format!(
+                "agent_setup.templates: ключ «{k}» — <claude|agents|codex>.<ru|en>"
+            )));
+        };
+        let text = match v {
+            Value::Null => None,
+            Value::String(t) => Some(
+                agent_setup::validate_template(t)
+                    .map_err(|e| ApiError::BadRequest(format!("agent_setup.templates.{k}: {e}")))?,
+            ),
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "agent_setup.templates.{k}: строка или null"
+                )));
+            }
+        };
+        out.push((agent, lang, text));
+    }
+    Ok(out)
+}
+
+/// `PATCH /admin/settings {rules?: {agent_write}, agent_setup?: {templates}}`; аудит
+/// `settings.update` на каждое изменение. Сохранение шаблона, которое меняет его текст
+/// (в том числе сброс своего), увеличивает версию блока на 1 — одну на запрос (§15.5).
 pub async fn patch_settings(
     _: AdminOnly,
     State(st): State<AppState>,
@@ -400,26 +457,66 @@ pub async fn patch_settings(
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let req: SettingsPatch = parse_body(&body)?;
-    let Some(to) = req.rules.and_then(|r| r.agent_write) else {
-        return Err(ApiError::BadRequest("нужно поле rules.agent_write".into()));
+    let rules_to = req.rules.as_ref().and_then(|r| r.agent_write);
+    let edits = match &req.agent_setup {
+        Some(p) => template_edits(p)?,
+        None => Vec::new(),
     };
-    let from = st
-        .system
-        .get_setting::<bool>(RULES_AGENT_WRITE)
-        .await?
-        .unwrap_or(false);
-    if from != to {
-        st.system.set_setting(RULES_AGENT_WRITE, &to).await?;
-        st.system
-            .audit(
-                ACTOR,
-                None,
-                "settings.update",
-                Some(RULES_AGENT_WRITE),
-                Some(&client.ip.to_string()),
-                json!({ "key": RULES_AGENT_WRITE, "from": from, "to": to }),
-            )
-            .await?;
+    if rules_to.is_none() && edits.is_empty() {
+        return Err(ApiError::BadRequest(
+            "нужно поле rules.agent_write или agent_setup.templates".into(),
+        ));
+    }
+    let ip = client.ip.to_string();
+    if let Some(to) = rules_to {
+        let from = st
+            .system
+            .get_setting::<bool>(RULES_AGENT_WRITE)
+            .await?
+            .unwrap_or(false);
+        if from != to {
+            st.system.set_setting(RULES_AGENT_WRITE, &to).await?;
+            st.system
+                .audit(
+                    ACTOR,
+                    None,
+                    "settings.update",
+                    Some(RULES_AGENT_WRITE),
+                    Some(&ip),
+                    json!({ "key": RULES_AGENT_WRITE, "from": from, "to": to }),
+                )
+                .await?;
+        }
+    }
+    let mut changed = Vec::new();
+    for (agent, lang, text) in edits {
+        let (cur, custom) = agent_setup::template(&st.system, agent, lang).await?;
+        let same = match &text {
+            Some(t) => custom && *t == cur,
+            None => !custom,
+        };
+        if same {
+            continue;
+        }
+        let key = agent_setup::template_key(agent, lang);
+        st.system.set_setting(&key, &text).await?;
+        changed.push((key, text.is_none()));
+    }
+    if !changed.is_empty() {
+        let version = agent_setup::bump_version(&st.system).await?;
+        for (key, reset) in changed {
+            // текст шаблона в аудит не пишется: только ключ, сброс и новая версия
+            st.system
+                .audit(
+                    ACTOR,
+                    None,
+                    "settings.update",
+                    Some(&key),
+                    Some(&ip),
+                    json!({ "key": key, "reset": reset, "version": version }),
+                )
+                .await?;
+        }
     }
     Ok(Json(settings_json(&st).await?))
 }

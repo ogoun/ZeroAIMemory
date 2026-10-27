@@ -519,6 +519,46 @@ fn status_from_claude_md(zam: &Path, dir: &Path, base: &str, token: &str) -> Res
     Ok(())
 }
 
+/// `GET /downloads/zam/<платформа>` без аутентификации отдаёт клиент своей ОС из каталога
+/// комплекта байт в байт; клиент другой ОС — если он в комплекте (`downloads/<платформа>/`),
+/// иначе 404.
+fn downloads_zam(root: &Path, base: &str, platform: &str) -> Result<()> {
+    let other = crate::package::other_platform(platform);
+    for (p, file) in [
+        (platform, root.join(crate::package::exe(platform, "zam"))),
+        (
+            other,
+            root.join("downloads")
+                .join(other)
+                .join(crate::package::exe(other, "zam")),
+        ),
+    ] {
+        let mut r = agent_with(Duration::from_secs(60))
+            .get(&format!("{base}/downloads/zam/{p}"))
+            .call()?;
+        let code = r.status().as_u16();
+        if !file.is_file() {
+            if code != 404 {
+                bail!("{p}: клиента нет в комплекте, а сервер ответил HTTP {code}");
+            }
+            println!("  {p}: клиента нет в комплекте — 404");
+            continue;
+        }
+        if code != 200 {
+            bail!("{p}: HTTP {code}");
+        }
+        let got = r
+            .body_mut()
+            .with_config()
+            .limit(256 * 1024 * 1024)
+            .read_to_vec()?;
+        if got != fs::read(&file)? {
+            bail!("{p}: отданный файл не совпадает с {}", file.display());
+        }
+    }
+    Ok(())
+}
+
 /// Текст заметки smoke-теста.
 const SMOKE_NOTE: &[u8] = b"# Hello\nsmoke note\n";
 
@@ -773,6 +813,10 @@ pub fn run(
     s.run(
         "zam status из CLAUDE.md без флагов",
         status_from_claude_md(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "раздача zam: GET /downloads/zam/{os}-{arch}",
+        downloads_zam(&root, &base, platform),
     )?;
     s.run(
         "zam write → search → read заметки",

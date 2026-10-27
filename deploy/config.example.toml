@@ -14,6 +14,9 @@ bind = "0.0.0.0:7700"
 base_path = ""
 # Доверенные прокси (CIDR или одиночный IP): только от них принимается X-Forwarded-*.
 trusted_proxies = []
+# Каталог клиентов zam для GET /downloads/zam/{windows-x64|linux-x64}: zam[.exe] своей ОС и
+# downloads/<платформа>/zam[.exe] другой; по умолчанию — каталог исполняемого файла zam-server.
+# downloads_dir = "/opt/zam-server"
 
 [admin]
 # Логин администратора WebUI.

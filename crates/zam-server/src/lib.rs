@@ -1,4 +1,5 @@
 //! Сервер ZeroAIMemory.
+pub mod agent_setup;
 pub mod api;
 pub mod app;
 pub mod attrib;

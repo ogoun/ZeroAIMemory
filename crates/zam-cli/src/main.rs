@@ -172,6 +172,49 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Подключить проект (§14.1): solution.toml, блок в CLAUDE.md/AGENTS.md, хуки, .mcp.json
+    Init {
+        /// Имя нового решения (по умолчанию — имя каталога)
+        #[arg(long)]
+        name: Option<String>,
+        /// GUID решения (по умолчанию — из solution.toml или новый)
+        #[arg(long)]
+        id: Option<String>,
+        /// Адрес сервера
+        #[arg(long)]
+        url: Option<String>,
+        /// Токен (сохраняется в ~/.zeroaimemory/config.toml, не в файлы проекта)
+        #[arg(long)]
+        token: Option<String>,
+        /// Агент: claude (CLAUDE.md), codex (AGENTS.md), both
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: cmd::init::InitAgent,
+        /// Не ставить хуки
+        #[arg(long)]
+        no_hooks: bool,
+        /// Не прописывать MCP-сервер в .mcp.json
+        #[arg(long)]
+        no_mcp: bool,
+        /// Не спрашивать подтверждения
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Язык блока инструкции
+        #[arg(long, default_value = "ru", value_parser = ["ru", "en"])]
+        lang: String,
+    },
+    /// Полный протокол работы агента с памятью (Markdown)
+    Guide {
+        /// Язык
+        #[arg(long, default_value = "ru", value_parser = ["ru", "en"])]
+        lang: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// stdio-прокси MCP: JSON-RPC построчно со stdin → POST /mcp → stdout
+    Mcp {
+        #[command(flatten)]
+        common: Common,
+    },
     /// Хук агента (§10.3): JSON события на stdin, подсказки — JSON в stdout; всегда код 0
     Hook {
         /// session-start, prompt, pre-tool, post-tool, checkpoint
@@ -782,6 +825,29 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Triggers {
             cmd: TriggersCmd::Sync { common },
         } => cmd::hook::cache::sync(&cmd::connect(&common)?),
+        Cmd::Init {
+            name,
+            id,
+            url,
+            token,
+            agent,
+            no_hooks,
+            no_mcp,
+            yes,
+            lang,
+        } => cmd::init::run(cmd::init::Opts {
+            name,
+            id,
+            url,
+            token,
+            agent,
+            no_hooks,
+            no_mcp,
+            yes,
+            lang,
+        }),
+        Cmd::Guide { lang, common } => cmd::guide::run(&cmd::connect(&common)?, &lang),
+        Cmd::Mcp { common } => cmd::mcp::run(cmd::connect(&common)?),
         Cmd::Tree {
             target,
             depth,

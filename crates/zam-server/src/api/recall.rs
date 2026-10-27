@@ -17,7 +17,8 @@
 //!   `tokens` — размер `text` (счётчик чанкера), `timings {collect_ms, record_ms, total_ms}`;
 //! - **`session_start`** — дайджест не больше `budget_tokens` (по умолчанию
 //!   `recall.digest_tokens` = 1500) по приоритету: напоминание об устаревшем блоке инструкции
-//!   (`agent_block_version` < [`AGENT_BLOCK_VERSION`]), ожидающие запросы доступа к решениям
+//!   (`agent_block_version` меньше версии сервера [`crate::agent_setup::current_version`] —
+//!   `max(AGENT_BLOCK_VERSION, версия шаблонов)`), ожидающие запросы доступа к решениям
 //!   пользователя (`access_requests_pending`), Rules (L1 каждой заметки, до
 //!   [`RULES_MAX`] заметок, L1 — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
 //!   пространства решения с L0 (до [`SOLUTION_ROOT_MAX`]), до 5 действующих (`active`)
@@ -349,13 +350,22 @@ async fn digest(
 ) -> Result<(Vec<String>, Vec<(Option<&'static str>, Vec<Cand>)>), ApiError> {
     let targets = health.targets();
     let mut notices: Vec<String> = Vec::new();
-    if let Some(v) = req.agent_block_version
-        && v < AGENT_BLOCK_VERSION
-    {
-        notices.push(format!(
-            "ZeroAIMemory: Блок ZeroAIMemory устарел (v{v} → v{AGENT_BLOCK_VERSION}): обнови \
-             через `zam init` или WebUI"
-        ));
+    if let Some(v) = req.agent_block_version {
+        // версия сервера — та же, что отдаёт `GET /agent-setup` (решение контроллера T11-a);
+        // сбой чтения настроек подсказку не валит — сравнение с версией сборки
+        let current = match crate::agent_setup::current_version(&st.system).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "версия блока инструкции не прочитана");
+                AGENT_BLOCK_VERSION
+            }
+        };
+        if v < current {
+            notices.push(format!(
+                "ZeroAIMemory: Блок ZeroAIMemory устарел (v{v} → v{current}): обнови \
+                 через `zam init` или WebUI"
+            ));
+        }
     }
     let user = target_user_id(st, p, headers)?;
     if let Some(r) = deadline

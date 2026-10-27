@@ -112,7 +112,80 @@ ZeroAIMemoryToken=<токен>
 `~/.zeroaimemory/config.toml` больше не читается, ранее выпущенные человеческие токены работают
 как обычные (агентские) — сервер пишет о них одну строку WARN при старте.
 
-Личный токен удобнее держать в `CLAUDE.local.md` (обычно не коммитится).
+Личный токен удобнее держать в `CLAUDE.local.md` (обычно не коммитится) или в
+`~/.zeroaimemory/config.toml` (так делает `zam init`). Блок v2, который пишет `zam init`, токена не
+содержит.
+
+## Подключение агента (`zam init`)
+
+Клиент `zam` раздаёт сам сервер, без входа: `GET /downloads/zam/windows-x64` и
+`GET /downloads/zam/linux-x64` (комплект сервера содержит `zam` обеих ОС: своей — рядом с
+`zam-server`, другой — в `downloads/<платформа>/`; каталог можно переопределить
+`server.downloads_dir`). Команды установки с адресом сервера выдаёт `GET /api/v1/agent-setup`
+(поле `install`) и страница WebUI «Подключение агента»:
+
+```
+# Windows (PowerShell)
+$d = "$env:LOCALAPPDATA\Programs\zam"; New-Item -ItemType Directory -Force $d | Out-Null
+Invoke-WebRequest "http://<хост>:7700/downloads/zam/windows-x64" -OutFile "$d\zam.exe"
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$d", 'User')
+[Environment]::SetEnvironmentVariable('ZAM_TOKEN', '<токен>', 'User')
+
+# Linux
+mkdir -p ~/.local/bin && curl -fsSL "http://<хост>:7700/downloads/zam/linux-x64" -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam
+echo 'export ZAM_TOKEN=<токен>' >> ~/.profile && . ~/.profile
+```
+
+В корне проекта:
+
+```
+zam init --url http://<хост>:7700 --token <токен> --agent claude   # claude | codex | both
+```
+
+`zam init`:
+- создаёт `.zeroaimemory/solution.toml` (новый GUID и имя каталога; `--id`, `--name` — свои) или
+  читает существующий и регистрирует решение на сервере;
+- вставляет блок инструкции между `<!-- zeroaimemory:begin vN -->` и `<!-- zeroaimemory:end -->` в
+  `CLAUDE.md` (`claude`) и/или `AGENTS.md` (`codex`); текст вне блока не меняется;
+- после подтверждения (`--yes` — без вопроса) добавляет хуки `zam hook …` в
+  `.claude/settings.json` / `.codex/hooks.json` и сервер `zeroaimemory` в `.mcp.json`; чужие хуки
+  и серверы остаются; `--no-hooks`, `--no-mcp` — пропустить;
+- пишет `.zeroaimemory/.gitignore` (`cache/`, `logs/`);
+- сохраняет токен в `~/.zeroaimemory/config.toml` (не в файлы проекта).
+
+Повторный запуск ничего не ломает: так же обновляется устаревший блок (о нём напоминают
+`zam status` и дайджест в начале сессии агента). Битый JSON в `.claude/settings.json` или
+`.mcp.json` `zam init` не перезаписывает — исправьте файл и повторите.
+
+**Токен для MCP.** В `.mcp.json` токена нет — `"Authorization": "Bearer ${ZAM_TOKEN}"`, поэтому
+агент должен видеть переменную `ZAM_TOKEN` (команды выше; перезапустите агента после задания).
+
+**Codex.** Хуки — `.codex/hooks.json` (Codex попросит подтвердить их в `/hooks`). MCP Codex
+читает из `config.toml`, `zam init` его не пишет; пример для `~/.codex/config.toml` или
+`.codex/config.toml` доверенного проекта:
+
+```toml
+[mcp_servers.zeroaimemory]
+url = "http://<хост>:7700/mcp"
+bearer_token_env_var = "ZAM_TOKEN"
+http_headers = { "X-Zam-Solution" = "<agent_solution_id из solution.toml>" }
+```
+
+Без HTTP-транспорта MCP — stdio-прокси `zam mcp` (адрес, токен и решение — как у остальных
+команд `zam`):
+
+```toml
+[mcp_servers.zeroaimemory]
+command = "zam"
+args = ["mcp"]
+```
+
+Полный протокол работы агента с памятью — `zam guide` (`GET /api/v1/agent-guide`).
+
+**Шаблоны блока** правит администратор: `PATCH /api/v1/admin/settings
+{"agent_setup": {"templates": {"claude.ru": "…"}}}` (ключи `<claude|agents|codex>.<ru|en>`,
+`null` — вернуть шаблон по умолчанию; обязательна подстановка `{url}`, ещё есть `{solution}` и
+`{rules}`). Каждое сохранение увеличивает версию блока — агенты получают напоминание обновить его.
 
 ## Работа с заметками из CLI
 

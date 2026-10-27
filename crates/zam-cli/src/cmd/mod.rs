@@ -1,11 +1,14 @@
 //! Команды `zam`. Общее: флаги подключения, разрешение цели, вывод в stdout.
 pub mod attach;
 pub mod cache;
+pub mod guide;
 pub mod history;
 pub mod hook;
+pub mod init;
 pub mod insight;
 pub mod link;
 pub mod log;
+pub mod mcp;
 pub mod read;
 pub mod release;
 pub mod search;

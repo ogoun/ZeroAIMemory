@@ -1,7 +1,9 @@
 //! Маршруты HTTP API.
 pub mod admin;
+pub mod agent_setup;
 pub mod blobs;
 pub mod cache;
+pub mod downloads;
 pub mod entries;
 pub mod feedback;
 pub mod graph;
@@ -214,6 +216,10 @@ fn service_routes() -> Router<AppState> {
             "/api/v1/sessions/{id}",
             get(sessions::get).patch(sessions::patch),
         )
+        .route("/api/v1/agent-setup", get(agent_setup::setup))
+        .route("/api/v1/agent-guide", get(agent_setup::guide))
+        // клиент `zam` для установки — без аутентификации (§15.5)
+        .route("/downloads/zam/{platform}", get(downloads::zam))
         .route("/api/v1/index/status", get(index::status))
         .route("/api/v1/admin/reindex", post(index::reindex))
         .route(

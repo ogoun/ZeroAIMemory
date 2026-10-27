@@ -51,6 +51,9 @@ pub struct ServerSection {
     pub base_path: String,
     #[serde(serialize_with = "ser_nets", deserialize_with = "de_nets")]
     pub trusted_proxies: Vec<IpNet>,
+    /// Каталог клиентов `zam` для `GET /downloads/zam/{os}-{arch}` (§15.5): `zam[.exe]` и
+    /// `downloads/<платформа>/zam[.exe]`; по умолчанию — каталог исполняемого файла сервера.
+    pub downloads_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -712,6 +715,7 @@ impl Default for ServerConfig {
                 public_url: None,
                 base_path: String::new(),
                 trusted_proxies: Vec::new(),
+                downloads_dir: None,
             },
             admin: AdminSection {
                 login: "admin".into(),

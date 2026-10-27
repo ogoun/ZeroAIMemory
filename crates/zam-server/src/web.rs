@@ -76,7 +76,7 @@ pub fn assets_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
 /// Для путей вне `/api` и `/mcp` — index.html (SPA), для остальных — problem+json 404.
 pub async fn fallback(index: Index, method: Method, uri: Uri) -> Response {
     let p = uri.path();
-    let reserved = ["/api", "/mcp"]
+    let reserved = ["/api", "/mcp", "/downloads"]
         .iter()
         .any(|r| p == *r || p.strip_prefix(r).is_some_and(|t| t.starts_with('/')));
     // Путь к файлу (точка в последнем сегменте) — не SPA-маршрут: нет ассета, значит 404.
