@@ -294,6 +294,29 @@ async fn cache_put_section_tail_pins_full_path() {
     .await
     .unwrap();
     assert_eq!(both.sources.len(), 1);
+    // повтор той же цели проверяется целиком (fix round 1): устаревший `rev` у повтора —
+    // ошибка ревизии, а не молчаливый пропуск
+    let stale = SourceSpec {
+        target: node(n),
+        rev: Some(0),
+        section: Some("Тесты".into()),
+    };
+    let r = cache_put(
+        &w.db,
+        &put(&w, "как тестировать 4", vec![sec("Сборка > Тесты"), stale]),
+    )
+    .await;
+    assert!(
+        matches!(
+            r,
+            Err(CacheError::SourceChanged {
+                expected: 0,
+                current_rev: 1,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
     // неоднозначный хвост
     let r = cache_put(&w.db, &put(&w, "шаги", vec![sec("Шаги")])).await;
     assert!(
