@@ -59,8 +59,8 @@ pub fn attribution(
     })
 }
 
-/// Касание сессии агента по запросу: id — `session_id` из тела (`body_id`, сильнее) или
-/// `X-Zam-Session`; `None` — запрос без сессии. Некорректный `X-Zam-Solution` сессии не мешает
+/// Касание сессии агента по запросу: id — `session_id` из тела (`body_id`, сильнее; края
+/// обрезаются, как у заголовка) или `X-Zam-Session`; `None` — запрос без сессии. Некорректный `X-Zam-Solution` сессии не мешает
 /// (решение остаётся прежним).
 pub fn session_touch(
     p: &Principal,
@@ -68,7 +68,7 @@ pub fn session_touch(
     body_id: Option<&str>,
 ) -> Result<Option<SessionTouch>, ApiError> {
     let header_id = header_value(headers, SESSION_HEADER)?;
-    let Some(id) = body_id.map(str::to_string).or(header_id) else {
+    let Some(id) = body_id.map(|s| s.trim().to_string()).or(header_id) else {
         return Ok(None);
     };
     zam_store::check_session_id(&id)?;
@@ -187,7 +187,7 @@ mod tests {
         // id из тела сильнее заголовка; пустой — отказ
         let s = session_touch(&admin(), &h, Some("body")).unwrap().unwrap();
         assert_eq!((s.id.as_str(), s.machine.as_deref()), ("body", Some("box")));
-        let s = session_touch(&admin(), &HeaderMap::new(), Some("b"))
+        let s = session_touch(&admin(), &HeaderMap::new(), Some(" b "))
             .unwrap()
             .unwrap();
         assert_eq!(s.id, "b");

@@ -72,6 +72,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// Маршруты записи в память (и чтения тех же ресурсов): узлы, вложения, записи журналов,
 /// связи, Vault. Изменяющие запросы с `X-Zam-Session` считает
 /// [`sessions::count_memory_writes`]; оценка записи (`/feedback`) — не запись в память.
+/// Любой новый путь записи в память — сюда (решение контроллера R12): `cache_put`/`promote`
+/// задачи 7; MCP задачи 9 вызывает эти маршруты через внутренний `Router`.
 fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
     let note_limit = note_body_limit(limits);
     Router::new()

@@ -83,7 +83,7 @@ pub use search::{
     search_fts, search_fts_channels, text_snippet,
 };
 pub use sessions::{
-    SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, add_memory_write,
+    SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, WHOLE_TARGET, add_memory_write,
     check_session_id, end_session, gc_sessions, get_session, list_sessions, mark_seen, seen_revs,
     touch_session,
 };

@@ -15,7 +15,11 @@
 //!
 //! **Счётчик записей в память** (решение контроллера R1) — одна точка: слой
 //! [`count_memory_writes`] на маршрутах записи в память (узлы, вложения, записи журналов,
-//! связи, Vault; позже — `cache_put`). Изменяющий запрос с `X-Zam-Session`, завершившийся
+//! связи, Vault). Обязательство (решение контроллера R12): **любой** новый путь записи в
+//! память идёт через маршруты `memory_routes` (`api::router`) — `cache_put` и `promote`
+//! задачи 7 добавляются туда же, а MCP (задача 9) вызывает эти REST-маршруты через внутренний
+//! `Router` (`oneshot`) и потому считается тем же слоем; запись в память в обход маршрутов
+//! (прямой вызов `zam_store`) счётчик не увидит. Изменяющий запрос с `X-Zam-Session`, завершившийся
 //! успехом (2xx), увеличивает `memory_writes` этой сессии в базе пользователя запроса; сессии
 //! нет — она создаётся. Неудачная запись и чтение не считаются. Принципал слой получает из
 //! [`PrincipalSlot`], который заполняет извлечение обработчика, — токен не проверяется дважды.
@@ -51,15 +55,15 @@ async fn requester_db(st: &AppState, p: &Principal, headers: &HeaderMap) -> Resu
     Ok(st.users.get(user.id).await?)
 }
 
-/// Сессия запроса и база пользователя запроса, где она лежит.
+/// Сессия запроса (касание по запросу) и база пользователя запроса, где она лежит.
 pub struct RequestSession {
-    pub id: String,
+    pub touch: SessionTouch,
     pub db: Db,
 }
 
-/// Отмечает обращение сессии запроса (поиск, `/read`, `/recall`): сессия создаётся, если её
-/// нет. `session_id` из тела сильнее `X-Zam-Session`; `None` — запрос без сессии.
-pub async fn touch_from_request(
+/// Сессия запроса без записи: `session_id` из тела сильнее `X-Zam-Session`; `None` — запрос
+/// без сессии. Некорректный id — 400.
+pub async fn request_session(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
@@ -69,8 +73,22 @@ pub async fn touch_from_request(
         return Ok(None);
     };
     let db = st.users.get(target_user_id(st, p, headers)?).await?;
-    touch_session(&db, &touch).await?;
-    Ok(Some(RequestSession { id: touch.id, db }))
+    Ok(Some(RequestSession { touch, db }))
+}
+
+/// Отмечает обращение сессии запроса (оценка, `/read`, `/recall`): сессия создаётся, если её
+/// нет ([`request_session`] и `touch_session`).
+pub async fn touch_from_request(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    body_session: Option<&str>,
+) -> Result<Option<RequestSession>, ApiError> {
+    let Some(s) = request_session(st, p, headers, body_session).await? else {
+        return Ok(None);
+    };
+    touch_session(&s.db, &s.touch).await?;
+    Ok(Some(s))
 }
 
 #[derive(Deserialize)]

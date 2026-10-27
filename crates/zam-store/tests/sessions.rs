@@ -6,8 +6,8 @@ use jiff::{SignedDuration, Timestamp};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
     DataDir, SeenItem, SeenKey, SessionTouch, UsageEvent, UsageKind, UsageSource, UserDbs,
-    add_memory_write, end_session, gc_sessions, get_session, list_sessions, mark_seen,
-    record_usage, seen_revs, touch_session, usage_counts,
+    WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session, list_sessions,
+    mark_seen, record_usage, seen_revs, touch_session, usage_counts,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -135,42 +135,63 @@ async fn touch_session_upsert() {
     }
 }
 
-/// `mark_seen` сохраняет большую ревизию цели; сессии изолированы; владельцы баз различаются.
+/// `mark_seen` сохраняет большую ревизию части цели; части (чанк, цель целиком), сессии и
+/// владельцы баз различаются (решение контроллера R11).
 #[tokio::test]
 async fn mark_seen_keeps_latest_rev() {
     let (_dd, db) = db("seen").await;
     let (owner, other_owner, n) = (Id::new(), Id::new(), Id::new());
-    let key = SeenKey {
-        owner_id: owner,
-        target: node(n),
+    let key = |owner_id, target, part: &str| SeenKey {
+        owner_id,
+        target,
+        part: part.into(),
     };
-    // сессии нет — создаётся
-    mark_seen(&db, "a", &[SeenItem { key, rev: 3 }])
-        .await
-        .unwrap();
-    assert!(get_session(&db, "a").await.unwrap().is_some());
-    mark_seen(&db, "a", &[SeenItem { key, rev: 5 }])
-        .await
-        .unwrap();
+    let chunk = key(owner, node(n), "c1");
+    let item = |k: &SeenKey, rev| SeenItem {
+        key: k.clone(),
+        rev,
+    };
+    // сессии нет — создаётся (вместе с полями касания)
+    let s = SessionTouch {
+        id: "a".into(),
+        machine: Some("box".into()),
+        ..SessionTouch::default()
+    };
+    mark_seen(&db, &s, &[item(&chunk, 3)]).await.unwrap();
+    let got = get_session(&db, "a").await.unwrap().unwrap();
+    assert_eq!(got.machine.as_deref(), Some("box"));
+    mark_seen(&db, &s, &[item(&chunk, 5)]).await.unwrap();
     // старая ревизия позже не откатывает отметку
-    mark_seen(&db, "a", &[SeenItem { key, rev: 4 }])
-        .await
-        .unwrap();
-    let foreign = SeenKey {
-        owner_id: other_owner,
-        target: node(n),
-    };
-    let entry = SeenKey {
-        owner_id: owner,
-        target: TargetRef {
+    mark_seen(&db, &s, &[item(&chunk, 4)]).await.unwrap();
+    // пустой список только касается сессии
+    mark_seen(&db, &touch("пустая"), &[]).await.unwrap();
+    assert!(get_session(&db, "пустая").await.unwrap().is_some());
+    let other_chunk = key(owner, node(n), "c2");
+    let whole = key(owner, node(n), WHOLE_TARGET);
+    let foreign = key(other_owner, node(n), "c1");
+    let entry = key(
+        owner,
+        TargetRef {
             kind: TargetKind::Entry,
             id: n,
         },
-    };
-    let got = seen_revs(&db, "a", &[key, foreign, entry]).await.unwrap();
+        "c1",
+    );
+    let all = [
+        chunk.clone(),
+        other_chunk.clone(),
+        whole.clone(),
+        foreign,
+        entry,
+    ];
+    let got = seen_revs(&db, "a", &all).await.unwrap();
     assert_eq!(got.len(), 1);
-    assert_eq!(got[&key], 5);
-    assert!(seen_revs(&db, "b", &[key]).await.unwrap().is_empty());
+    assert_eq!(got[&chunk], 5);
+    // цель целиком — своя часть
+    mark_seen(&db, &s, &[item(&whole, 6)]).await.unwrap();
+    let got = seen_revs(&db, "a", &all).await.unwrap();
+    assert_eq!((got[&chunk], got[&whole], got.len()), (5, 6, 2));
+    assert!(seen_revs(&db, "b", &[chunk]).await.unwrap().is_empty());
     assert!(seen_revs(&db, "a", &[]).await.unwrap().is_empty());
 }
 
@@ -222,10 +243,13 @@ async fn gc_sessions_by_last_seen() {
     let key = SeenKey {
         owner_id: Id::new(),
         target: node(Id::new()),
+        part: WHOLE_TARGET.into(),
     };
-    mark_seen(&db, "old", &[SeenItem { key, rev: 1 }])
-        .await
-        .unwrap();
+    let item = SeenItem {
+        key: key.clone(),
+        rev: 1,
+    };
+    mark_seen(&db, &touch("old"), &[item]).await.unwrap();
     touch_session(&db, &touch("fresh")).await.unwrap();
     let ttl = SignedDuration::from_hours(24 * 30);
     // через 29 дней никто не удаляется

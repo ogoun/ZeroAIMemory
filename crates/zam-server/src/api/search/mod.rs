@@ -16,10 +16,13 @@
 //! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже);
 //! - `session_id` (или `X-Zam-Session`) — сессия агента: первый поиск с ней создаёт сессию
 //!   ([`super::sessions`]); `skip_seen` (по умолчанию `true`) — элемент, уже выданный этой
-//!   сессии в той же ревизии, идёт с `seen: true` без фрагмента и текста (в md — `(seen)`, §9.3);
-//!   текст `mode=chunks`, отданный целиком (не усечённый бюджетом), записывается в
-//!   `session_seen` базы пользователя запроса с владельцем базы цели. Карточки папок не
-//!   отмечаются;
+//!   сессии в той же ревизии, идёт с `seen: true` без фрагмента и текста (в md — `(seen)`, §9.3).
+//!   Выданным считается элемент, у которого в той же ревизии отмечены все его чанки
+//!   (`chunk_ids`) или цель целиком (`part = ''`, полный текст `/read`) — решение
+//!   контроллера R11. Чанки `mode=chunks`, отданные целиком (не усечённые бюджетом),
+//!   записываются в `session_seen` базы пользователя запроса (`part = chunk_id`, владелец —
+//!   владелец базы цели) одной транзакцией с касанием сессии. Карточки папок не отмечаются;
+//!   сбой учёта сессии поиск не валит (WARN, ответ без пометок);
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release` (по умолчанию все
 //!   четыре), `folder` — карточки папок (см. «Папки»), `attachment` принимается, но ничего не
 //!   находит (вложения — M5); `filters.status` — статусы insight (по умолчанию `active`,
@@ -174,9 +177,10 @@ use zam_search::{
 use zam_store::time::fmt_ts;
 use zam_store::{
     ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, SeenItem, SeenKey, Space,
-    SpaceKind, TargetFilter, count_tokens, get_embeddings, get_node, leaf_term_hits,
-    leaves_of_targets, live_chunks, live_folders, mark_seen, neighbor_leaves, node_content,
-    pending_count, query_needles, search_fts_channels, seen_revs, text_snippet,
+    SpaceKind, StoreError, TargetFilter, WHOLE_TARGET, count_tokens, get_embeddings, get_node,
+    leaf_term_hits, leaves_of_targets, live_chunks, live_folders, mark_seen, neighbor_leaves,
+    node_content, pending_count, query_needles, search_fts_channels, seen_revs, text_snippet,
+    touch_session,
 };
 
 use self::merge::merge_channels;
@@ -185,7 +189,7 @@ use self::targets::{
 };
 use super::json_body;
 use super::scope::skip_foreign;
-use super::sessions::{RequestSession, touch_from_request};
+use super::sessions::{RequestSession, request_session};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
@@ -1427,33 +1431,55 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
     }
 }
 
-/// Ключ выданного: владелец базы цели элемента и цель.
-fn seen_key(targets: &[SearchTarget], it: &Item) -> SeenKey {
+/// Ключ выданного: владелец базы цели элемента, цель и часть — `chunk_id` или
+/// [`WHOLE_TARGET`] (решение контроллера R11).
+fn seen_key(targets: &[SearchTarget], it: &Item, part: &str) -> SeenKey {
     SeenKey {
         owner_id: targets[it.target].owner,
         target: it.hit.target,
+        part: part.to_string(),
     }
 }
 
-/// Помечает элементы, уже выданные сессии в той же ревизии (`seen`), и снимает их текст.
+/// Помечает элементы, уже выданные сессии в той же ревизии (`seen`), и снимает их текст:
+/// выдана цель целиком или все чанки элемента (`chunk_ids`).
 async fn mark_seen_items(
     s: &RequestSession,
     targets: &[SearchTarget],
     items: &mut [Item],
-) -> Result<(), ApiError> {
+) -> Result<(), StoreError> {
+    let parts = |it: &Item| -> Vec<SeenKey> {
+        std::iter::once(WHOLE_TARGET)
+            .chain(it.chunk_ids.iter().map(String::as_str))
+            .map(|part| seen_key(targets, it, part))
+            .collect()
+    };
     let keys: Vec<SeenKey> = items
         .iter()
         .filter(|it| it.folder.is_none())
-        .map(|it| seen_key(targets, it))
+        .flat_map(parts)
         .collect();
-    let revs = seen_revs(&s.db, &s.id, &keys).await?;
+    let revs = seen_revs(&s.db, &s.touch.id, &keys).await?;
+    let same = |k: &SeenKey, rev: i64| revs.get(k) == Some(&rev);
     for it in items.iter_mut().filter(|it| it.folder.is_none()) {
-        if revs.get(&seen_key(targets, it)) == Some(&it.hit.rev) {
+        let rev = it.hit.rev;
+        let whole = same(&seen_key(targets, it, WHOLE_TARGET), rev);
+        let chunks = !it.chunk_ids.is_empty()
+            && it
+                .chunk_ids
+                .iter()
+                .all(|c| same(&seen_key(targets, it, c), rev));
+        if whole || chunks {
             it.seen = true;
             it.text = None;
         }
     }
     Ok(())
+}
+
+/// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
+fn session_failed(what: &str, e: &StoreError) {
+    tracing::warn!(error = %e, "поиск: {what} сессии не выполнено, ответ без пометок seen");
 }
 
 /// `POST /search`.
@@ -1483,7 +1509,22 @@ pub async fn search(
     kinds.area = area_filter(req.scope.area.as_deref())?;
     let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
-    let session = touch_from_request(&st, &p, &headers, req.session_id.as_deref()).await?;
+    // сессия: некорректный id — 400; сбой её базы поиск не валит (WARN, без пометок)
+    let session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
+        Ok(s) => s,
+        Err(e @ ApiError::BadRequest(_)) => return Err(e),
+        Err(e) => {
+            tracing::warn!(error = %e, "поиск: база сессии недоступна, ответ без пометок seen");
+            None
+        }
+    };
+    // `mode=chunks` касается сессии вместе с отметкой выданного (одна транзакция)
+    if let Some(s) = &session
+        && mode != SearchMode::Chunks
+        && let Err(e) = touch_session(&s.db, &s.touch).await
+    {
+        session_failed("касание", &e);
+    }
     let mut health = Health::new(&targets, warnings);
     let prefix = req
         .scope
@@ -1852,21 +1893,26 @@ pub async fn search(
     // выданное этой сессии в той же ревизии — без фрагмента и текста (§9.3)
     if let Some(s) = &session
         && req.skip_seen.unwrap_or(true)
+        && let Err(e) = mark_seen_items(s, &targets, &mut items).await
     {
-        mark_seen_items(s, &targets, &mut items).await?;
+        session_failed("чтение выданного", &e);
     }
     let packed = pack_items(items, mode, budget);
-    // текст `mode=chunks`, отданный целиком, — выдан сессии
+    // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
     if let (Some(s), SearchMode::Chunks) = (&session, mode) {
         let given: Vec<SeenItem> = packed
             .iter()
             .filter(|p| matches!(p.text, Some((_, false))) && p.item.folder.is_none())
-            .map(|p| SeenItem {
-                key: seen_key(&targets, &p.item),
-                rev: p.item.hit.rev,
+            .flat_map(|p| {
+                p.item.chunk_ids.iter().map(|c| SeenItem {
+                    key: seen_key(&targets, &p.item, c),
+                    rev: p.item.hit.rev,
+                })
             })
             .collect();
-        mark_seen(&s.db, &s.id, &given).await?;
+        if let Err(e) = mark_seen(&s.db, &s.touch, &given).await {
+            session_failed("отметка выданного", &e);
+        }
     }
     let degraded = available.err().or(vrun.failed);
     let by_id: HashMap<Id, Space> = targets

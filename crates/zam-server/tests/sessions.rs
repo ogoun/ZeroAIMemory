@@ -326,7 +326,7 @@ struct W {
 }
 
 /// A регистрирует решение, B запрашивает доступ; одобрение — `approve`.
-async fn world(name: &str, approve: bool) -> W {
+async fn world(name: &str, approve: Option<&str>) -> W {
     let a = api(&format!("sessions-{name}"), |_| {}).await;
     let (a_id, a_tok) = a.new_user("Анна").await;
     let (b_id, b_tok) = a.new_user("Борис").await;
@@ -340,13 +340,13 @@ async fn world(name: &str, approve: bool) -> W {
         .tok(&b_tok, Method::POST, "/api/v1/solutions", Some(reg))
         .await;
     assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
-    if approve {
+    if let Some(access) = approve {
         let r = a
             .tok(
                 &a_tok,
                 Method::POST,
                 &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
-                Some(json!({"access": "ro"})),
+                Some(json!({ "access": access })),
             )
             .await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.text());
@@ -394,7 +394,7 @@ impl W {
 /// владельца, `GET /entries/{id}` отдаёт счётчики; в базе участника событий нет.
 #[tokio::test]
 async fn feedback_records_usage_in_owner_db() {
-    let w = world("fb-owner", true).await;
+    let w = world("fb-owner", Some("ro")).await;
     let e = w.insight().await;
     let r = w.feedback(&w.b_tok, &e, json!({"value": "useful"})).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
@@ -461,7 +461,7 @@ async fn feedback_records_usage_in_owner_db() {
 /// неверное значение — 400, удалённая запись — 404.
 #[tokio::test]
 async fn feedback_requires_read_access() {
-    let w = world("fb-access", false).await;
+    let w = world("fb-access", None).await;
     let e = w.insight().await;
     let r = w.feedback(&w.c_tok, &e, json!({"value": "useful"})).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
@@ -525,4 +525,222 @@ async fn sessions_gc_after_30_days() {
     for tok in [&a.token, &other] {
         assert_eq!(session(&a, tok, "old").await.status, StatusCode::NOT_FOUND);
     }
+}
+
+/// Заметка из двух листов: секция «Альфа» со словом «квазар», «Бета» — со словом «пульсар».
+async fn two_chunk_note(a: &Api) -> Value {
+    let filler = |m: &str| {
+        (0..150)
+            .map(|i| format!("{m}{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let content = format!(
+        "# Небо\n\n## Альфа\n\nКвазар светит ярко. {}\n\n## Бета\n\nПульсар мигает. {}\n",
+        filler("альфа"),
+        filler("бета")
+    );
+    a.note("knowledge", "Небо", &content).await
+}
+
+async fn find(a: &Api, session: &str, query: &str, mode: &str) -> Value {
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            SEARCH,
+            Some(json!({"query": query, "mode": mode, "top_k": 1, "budget_tokens": 20000})),
+            &sess(session),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"][0].clone()
+}
+
+/// Выданный чанк A не скрывает чанк B того же узла той же ревизии (решение контроллера R11).
+#[tokio::test]
+async fn seen_chunk_does_not_hide_other_chunks() {
+    let a = api("sessions-seen-chunk", |_| {}).await;
+    two_chunk_note(&a).await;
+    let first = find(&a, "s", "квазар", "chunks").await;
+    assert!(
+        first["text"].as_str().unwrap().contains("Квазар"),
+        "{first}"
+    );
+    let other = find(&a, "s", "пульсар", "brief").await;
+    assert_ne!(other["chunk_ids"], first["chunk_ids"], "{other}");
+    assert_eq!(other["seen"], false, "{other}");
+    assert!(
+        other["snippet"].as_str().unwrap().contains("ульсар"),
+        "{other}"
+    );
+    let other = find(&a, "s", "пульсар", "chunks").await;
+    assert!(
+        other["text"].as_str().unwrap().contains("Пульсар"),
+        "{other}"
+    );
+    // оба чанка выданы — оба помечены
+    assert_eq!(find(&a, "s", "квазар", "brief").await["seen"], true);
+    assert_eq!(find(&a, "s", "пульсар", "brief").await["seen"], true);
+}
+
+/// Цель, выданная целиком (`part = ''`, полный текст `/read`), скрывает все её чанки.
+#[tokio::test]
+async fn seen_whole_target_hides_all_chunks() {
+    let a = api("sessions-seen-whole", |_| {}).await;
+    let n = two_chunk_note(&a).await;
+    let owner = a.st.admin_id;
+    let db = a.st.users.get(owner).await.unwrap();
+    let item = zam_store::SeenItem {
+        key: zam_store::SeenKey {
+            owner_id: owner,
+            target: TargetRef {
+                kind: TargetKind::Node,
+                id: id(&n).parse().unwrap(),
+            },
+            part: zam_store::WHOLE_TARGET.into(),
+        },
+        rev: 1,
+    };
+    let touch = zam_store::SessionTouch {
+        id: "s".into(),
+        ..Default::default()
+    };
+    zam_store::mark_seen(&db, &touch, &[item]).await.unwrap();
+    for q in ["квазар", "пульсар"] {
+        let it = find(&a, "s", q, "chunks").await;
+        assert_eq!(it["seen"], true, "{it}");
+        assert!(it.get("text").is_none(), "{it}");
+        // другой сессии — с текстом
+        let it = find(&a, "другая", q, "chunks").await;
+        assert_eq!(it["seen"], false, "{it}");
+    }
+}
+
+/// Участник пишет в решение владельца с `X-Zam-Session`: `memory_writes` растёт в базе
+/// участника (у владельца такой сессии нет); выданное в общем решении несёт `owner_id`
+/// владельца и лежит в базе участника.
+#[tokio::test]
+async fn member_session_lives_in_member_db() {
+    let w = world("member", Some("rw")).await;
+    let r =
+        w.a.tok_h(
+            &w.b_tok,
+            Method::POST,
+            "/api/v1/nodes",
+            Some(json!({"space": G, "path": "Звёзды", "kind": "note",
+                        "content": "# Звёзды\n\nКвазар светит ярко.\n"})),
+            &sess("b-s"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = session(&w.a, &w.b_tok, "b-s").await.json();
+    assert_eq!(j["memory_writes"], 1, "{j}");
+    assert_eq!(
+        session(&w.a, &w.a_tok, "b-s").await.status,
+        StatusCode::NOT_FOUND
+    );
+    let r =
+        w.a.tok_h(
+            &w.b_tok,
+            Method::POST,
+            SEARCH,
+            Some(json!({"query": "квазар", "mode": "chunks", "scope": {"solution": G}})),
+            &sess("b-s"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.json()["items"][0]["text"].is_string(), "{}", r.text());
+    let rows = |user: &str| {
+        let users = w.a.st.users.clone();
+        let user: Id = user.parse().unwrap();
+        async move {
+            let db = users.get(user).await.unwrap();
+            db.read(|c| {
+                let mut st = c.prepare("SELECT session_id, owner_id FROM session_seen")?;
+                let rows =
+                    st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let member = rows(&w.b_id).await;
+    assert!(!member.is_empty());
+    assert!(
+        member.iter().all(|(s, o)| s == "b-s" && *o == w.a_id),
+        "{member:?}"
+    );
+    assert!(rows(&w.a_id).await.is_empty());
+}
+
+/// Счётчик считает и Vault, и вложение, и удаление узла.
+#[tokio::test]
+async fn memory_writes_vault_blob_delete() {
+    let a = api("sessions-writes-kinds", |_| {}).await;
+    let h = sess("w");
+    let n = a.note("knowledge", "Вложения", "# Вложения\n").await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/spaces/knowledge/vault",
+            Some(json!({"title": "токен", "data": {"type": "token"}, "secret": "s3cr3t-value"})),
+            &h,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(session(&a, &a.token, "w").await.json()["memory_writes"], 1);
+    const B: &str = "zam-sessions-boundary-5e2a";
+    let body = format!(
+        "--{B}\r\nContent-Disposition: form-data; name=\"node\"\r\n\r\n{}\r\n\
+         --{B}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\nданные\r\n--{B}--\r\n",
+        id(&n)
+    );
+    let req = axum::http::Request::post("/api/v1/blobs")
+        .header("authorization", format!("Bearer {}", a.token))
+        .header("content-type", format!("multipart/form-data; boundary={B}"))
+        .header("x-zam-session", "w")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let r = a.send(req).await;
+    assert!(r.status.is_success(), "{}", r.text());
+    assert_eq!(session(&a, &a.token, "w").await.json()["memory_writes"], 2);
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::DELETE,
+            &format!("/api/v1/nodes/{}", id(&n)),
+            None,
+            &[("x-zam-session", "w"), ("if-match", "1")],
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    assert_eq!(session(&a, &a.token, "w").await.json()["memory_writes"], 3);
+}
+
+/// Оценка с сессией создаёт или отмечает её в базе пользователя запроса.
+#[tokio::test]
+async fn feedback_touches_session() {
+    let w = world("fb-session", Some("ro")).await;
+    let e = w.insight().await;
+    let r = w
+        .feedback(
+            &w.b_tok,
+            &e,
+            json!({"value": "useful", "session_id": " fb-body "}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let j = session(&w.a, &w.b_tok, "fb-body").await.json();
+    assert_eq!(
+        (j["id"].as_str(), j["memory_writes"].as_i64()),
+        (Some("fb-body"), Some(0))
+    );
+    assert_eq!(
+        session(&w.a, &w.a_tok, "fb-body").await.status,
+        StatusCode::NOT_FOUND
+    );
 }

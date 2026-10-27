@@ -341,8 +341,7 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
     let u = &e["usage"];
     if u.is_object() {
         out.push_str(&format!(
-            "показы: {} · полезно: {} · бесполезно: {}
-",
+            "показы: {} · полезно: {} · бесполезно: {}\n",
             u["shown"], u["useful"], u["useless"]
         ));
     }
@@ -489,13 +488,7 @@ pub fn feedback(ctx: &Ctx, id: &str, value: &str, session: Option<&str>) -> Resu
     if ctx.json {
         return emit_json(&json!({ "id": id, "value": value }));
     }
-    emit(
-        format!(
-            "{id} {value}
-"
-        )
-        .as_bytes(),
-    )
+    emit(format!("{id} {value}\n").as_bytes())
 }
 
 /// `zam insight append <id>` — текст из `--body-file` или stdin; пустой → код 6.

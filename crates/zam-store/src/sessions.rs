@@ -6,8 +6,9 @@
 //!   `memory_writes` (решение контроллера R1: читает хук `checkpoint`). Сессия создаётся
 //!   первым касанием ([`touch_session`], [`add_memory_write`], [`mark_seen`]);
 //! - `session_seen` — что сессии уже выдано: цель в базе владельца `owner_id` (решение может
-//!   быть чужим) и её ревизия. Хранится большая из выданных ревизий: ревизии только растут,
-//!   и повторная выдача старой не откатывает отметку;
+//!   быть чужим), часть цели `part` (решение контроллера R11: `chunk_id` чанка, отданного
+//!   целиком, или [`WHOLE_TARGET`] — полный текст цели) и её ревизия. Хранится большая из
+//!   выданных ревизий: ревизии только растут, и повторная выдача старой не откатывает отметку;
 //! - срок хранения — [`gc_sessions`]: сессии без обращений дольше срока удаляются вместе с
 //!   выданным им (воркер обслуживания сервера, раз в сутки, 30 дней).
 use std::collections::HashMap;
@@ -22,6 +23,8 @@ use crate::{Db, StoreError};
 
 /// Предел длины id сессии и строковых полей сессии, символов (как у заголовков атрибуции).
 pub const SESSION_ID_MAX_CHARS: usize = 128;
+/// `part` выданного: полный текст цели (а не отдельный чанк).
+pub const WHOLE_TARGET: &str = "";
 
 /// Касание сессии: id и то, что о ней известно из запроса (`None` — не менять прежнее).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,15 +58,16 @@ pub struct Session {
     pub memory_writes: i64,
 }
 
-/// Цель, выданная сессии: владелец базы цели и сама цель.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Выданное сессии: владелец базы цели, цель и её часть (`chunk_id` или [`WHOLE_TARGET`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SeenKey {
     pub owner_id: Id,
     pub target: TargetRef,
+    pub part: String,
 }
 
-/// Выданная цель и её ревизия.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Выданная часть цели и ревизия цели.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeenItem {
     pub key: SeenKey,
     pub rev: i64,
@@ -221,32 +225,28 @@ pub async fn list_sessions(
     .await
 }
 
-/// Отмечает выданное сессии (сессия создаётся, если её нет); у цели остаётся большая ревизия.
-pub async fn mark_seen(db: &Db, session: &str, items: &[SeenItem]) -> Result<(), StoreError> {
-    check_session_id(session)?;
-    if items.is_empty() {
-        return Ok(());
-    }
-    let (session, items) = (session.to_string(), items.to_vec());
+/// Касание сессии (как [`touch_session`]) и отметка выданного ей — одной транзакцией; у части
+/// цели остаётся большая ревизия.
+pub async fn mark_seen(db: &Db, s: &SessionTouch, items: &[SeenItem]) -> Result<(), StoreError> {
+    check_touch(s)?;
+    let (s, items) = (s.clone(), items.to_vec());
     db.write(move |t| {
+        upsert(t, &s, 0)?;
         let now = fmt_ts(Timestamp::now());
-        t.execute(
-            "INSERT INTO sessions (id, started_at, last_seen_at) VALUES (?1, ?2, ?2)
-             ON CONFLICT (id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-            params![session, now],
-        )?;
         let mut st = t.prepare_cached(
-            "INSERT INTO session_seen (session_id, owner_id, target_kind, target_id, rev, seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (session_id, owner_id, target_kind, target_id) DO UPDATE SET
+            "INSERT INTO session_seen (session_id, owner_id, target_kind, target_id, part, rev,
+                                       seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (session_id, owner_id, target_kind, target_id, part) DO UPDATE SET
                rev = max(rev, excluded.rev), seen_at = excluded.seen_at",
         )?;
         for it in &items {
             st.execute(params![
-                session,
+                s.id,
                 it.key.owner_id,
                 target_kind_str(it.key.target.kind),
                 it.key.target.id,
+                it.key.part,
                 it.rev,
                 now
             ])?;
@@ -256,7 +256,7 @@ pub async fn mark_seen(db: &Db, session: &str, items: &[SeenItem]) -> Result<(),
     .await
 }
 
-/// Ревизии целей, уже выданных сессии (целей, которых сессия не получала, в ответе нет).
+/// Ревизии частей целей, уже выданных сессии (того, что сессия не получала, в ответе нет).
 pub async fn seen_revs(
     db: &Db,
     session: &str,
@@ -269,7 +269,8 @@ pub async fn seen_revs(
     db.read(move |c| {
         let mut st = c.prepare_cached(
             "SELECT rev FROM session_seen
-             WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = ?3 AND target_id = ?4",
+             WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = ?3 AND target_id = ?4
+               AND part = ?5",
         )?;
         let mut out = HashMap::new();
         for k in targets {
@@ -279,7 +280,8 @@ pub async fn seen_revs(
                         session,
                         k.owner_id,
                         target_kind_str(k.target.kind),
-                        k.target.id
+                        k.target.id,
+                        k.part
                     ],
                     |r| r.get(0),
                 )

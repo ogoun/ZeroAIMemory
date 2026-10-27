@@ -4,7 +4,8 @@
 //! чтения цели (как у `GET /entries/{id}`: посторонний — 404, участник без одобрения — 403
 //! `solution-access`, удалённая запись — 404); участник с доступом `ro` оценивать может.
 //! Событие дописывается в `usage` базы, где лежит запись (у общего решения — база владельца),
-//! с пользователем запроса, сессией (`session_id` из тела или `X-Zam-Session`) и источником:
+//! с пользователем запроса, сессией (`session_id` из тела или `X-Zam-Session`; сессия
+//! создаётся или отмечается в базе пользователя запроса) и источником:
 //! токен — `agent`, WebUI — `webui`. Счётчики отдаёт `GET /entries/{id}` полем `usage`.
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -16,8 +17,8 @@ use zam_store::{UsageEvent, UsageKind, UsageSource, record_usage};
 
 use super::json_body;
 use super::scope::{Mode, entry_scope, live_entry};
+use super::sessions::touch_from_request;
 use crate::app::AppState;
-use crate::attrib::session_touch;
 use crate::auth::Principal;
 use crate::error::ApiError;
 
@@ -45,9 +46,14 @@ pub async fn entry(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<StatusCode, ApiError> {
     let req: FeedbackReq = json_body(body)?;
-    let session = session_touch(&p, &headers, req.session_id.as_deref())?.map(|s| s.id);
+    // проверка id сессии — до доступа (400 раньше 404)
+    crate::attrib::session_touch(&p, &headers, req.session_id.as_deref())?;
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
+    // сессия создаётся или отмечается, как у остальных запросов с ней
+    let session = touch_from_request(&st, &p, &headers, req.session_id.as_deref())
+        .await?
+        .map(|s| s.touch.id);
     let event = UsageEvent {
         user_id: sc.user.id,
         session_id: session,
