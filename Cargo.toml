@@ -97,6 +97,8 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 zeroize = { version = "1", features = ["serde"] }
 # версия та же, что у process-wrap 10.0.1 (тип PROCESS_CREATION_FLAGS)
 windows = "0.62"
+# служба Windows (SCM) — только cfg(windows), MIT OR Apache-2.0 (задача 14 M4)
+windows-service = "=0.8.1"
 # M4, задача 9: MCP-сервер `/mcp` (§13.1) — официальный Rust SDK MCP, Apache-2.0; streamable
 # HTTP без сессий (MCP 2026-07-28, SEP-2567) поверх axum через `nest_service`; только серверная
 # часть: без макросов, клиента, OAuth и reqwest (аудит — журнал M4, задача 9)

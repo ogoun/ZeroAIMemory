@@ -691,22 +691,49 @@ jina — модель с динамическим int8: пары «запрос 
    нужны ONNX Runtime (`msvcp140*.dll`, `vcruntime140*.dll`) и Qdrant (`vcruntime140.dll` рядом с
    `qdrant.exe`), лежат в комплекте app-local: отдельная установка VC++ Redistributable не нужна.
 3. Создайте `config.toml` и запустите `zam-server.exe serve --config config.toml`.
-4. Для работы в фоне зарегистрируйте запуск в Планировщике заданий или через менеджер служб (например, NSSM).
-   Если служба работает под другой учётной записью (NSSM — по умолчанию LocalSystem), а
-   `master.key` создан запуском из шага 3 под вашим пользователем, сервер на каждом старте
-   предупредит, что ключ читает ваш пользователь: передайте файл учётной записи службы
-   (`icacls "<data_dir>\master.key" /setowner <учётная запись службы>`, см. «Vault: секреты и
-   мастер-ключ») или запускайте шаг 3 под той же учётной записью, что и службу.
+4. Для работы в фоне зарегистрируйте службу Windows — из PowerShell или cmd **от имени
+   администратора** (без прав — ошибка и код 3):
 
-Остановка: Ctrl+C в окне сервера; сервер понимает и Ctrl+Break. Штатная остановка сразу после
-записи ждёт подтверждения журнала Qdrant до 14 с (`[qdrant] shutdown_flush_wait_ms`): обычно
-остановка после записи занимает 10–20 с, в худшем случае (недоделанная пачка инференса на CPU) —
-до 94 с. NSSM по умолчанию шлёт Ctrl+C и ждёт лишь 1,5 с, затем снимает процесс — для `zam-server`
-задайте больше: `nssm set <имя службы> AppStopMethodConsole 94000`.
+   ```
+   C:\ZeroAIMemory\zam-server.exe service install --config C:\ZeroAIMemory\config.toml
+   C:\ZeroAIMemory\zam-server.exe service start
+   C:\ZeroAIMemory\zam-server.exe service status
+   ```
+
+   Служба `zam-server` (`--name` — другое имя): автозапуск, учётная запись LocalSystem,
+   `binPath = "<exe>" service run --config <абсолютный путь>`, восстановление — перезапуск через
+   10 с, три раза. Без `--config` берётся `config.toml` рядом с `zam-server.exe`; относительный
+   `data_dir` — от каталога `zam-server.exe`. `service install --print` показывает параметры,
+   ничего не регистрируя. Консоли у службы нет: журнал — в `<data_dir>\logs\zam-server.log.*`,
+   ошибка до журнала (конфиг не читается) — в `zam-server-service-error.log`, первый токен
+   администратора — в `<data_dir>irst-admin-token.txt` (прочитайте и удалите файл). Пароль
+   администратора службе — только `[admin] password_hash` в конфиге (`ZAM_ADMIN_PASSWORD` из вашей
+   консоли служба не видит). `service stop` дожидается штатного выхода сервера, `service
+   uninstall` останавливает и удаляет службу. `zam-server service run` вручную не вызывается
+   (из консоли — ошибка и код 2).
+
+   Служба работает под LocalSystem: если `master.key` создан запуском из шага 3 под вашим
+   пользователем, сервер на каждом старте предупредит, что ключ читает ваш пользователь —
+   передайте файл учётной записи службы (`icacls "<data_dir>\master.key" /setowner SYSTEM`, см.
+   «Vault: секреты и мастер-ключ») или первый запуск делайте сразу службой.
+
+   Альтернатива — NSSM или Планировщик заданий. Если служба NSSM работает под другой учётной
+   записью (по умолчанию LocalSystem), действует то же замечание про `master.key`.
+
+Остановка: Ctrl+C в окне сервера; сервер понимает и Ctrl+Break; служба — `service stop` или
+оснастка «Службы». Все пути ведут в одну штатную остановку: сразу после записи она ждёт
+подтверждения журнала Qdrant до 14 с (`[qdrant] shutdown_flush_wait_ms`): обычно остановка после
+записи занимает 10–20 с, в худшем случае (недоделанная пачка инференса на CPU) — до 94 с.
 Стоп-таймаут — `max(90, ceil(shutdown_flush_wait_ms / 1000) + 80)` с: 80 с запаса (пачка
 инференса, перенарезка, SIGTERM Qdrant) плюс ожидание WAL Qdrant; при умолчании
-`shutdown_flush_wait_ms = 14000` — 94 с, при максимуме 60000 — 140 с (`AppStopMethodConsole 140000`).
-Жёсткое снятие процесса удлиняет следующий старт (см. «Известные ограничения»).
+`shutdown_flush_wait_ms = 14000` — 94 с, при максимуме 60000 — 140 с. `service install` ставит
+его таймаутом `Preshutdown` службы (остановка при выключении Windows), во время остановки служба
+сообщает SCM `StopPending` с ростом `checkpoint` каждые 2 с. После смены
+`shutdown_flush_wait_ms` выполните `service install` повторно — иначе сервер на старте под службой
+предупредит, что таймаут мал. NSSM по умолчанию шлёт Ctrl+C и ждёт лишь 1,5 с, затем снимает
+процесс — для `zam-server` задайте больше: `nssm set <имя службы> AppStopMethodConsole 94000`
+(при 60000 — `140000`). Жёсткое снятие процесса удлиняет следующий старт (см. «Известные
+ограничения»).
 
 ## Linux
 
@@ -734,18 +761,30 @@ jina — модель с динамическим int8: пары «запрос 
 3. Установите юнит systemd и запустите службу:
 
    ```
-   sudo cp /opt/zeroaimemory/systemd/zam-server.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now zam-server
+   sudo /opt/zeroaimemory/zam-server service install --config /etc/zeroaimemory/config.toml
+   sudo systemctl start zam-server          # или: sudo /opt/zeroaimemory/zam-server service start
    sudo journalctl -u zam-server -n 50      # путь к файлу первого токена
    sudo cat /var/lib/zeroaimemory/first-admin-token.txt && sudo rm /var/lib/zeroaimemory/first-admin-token.txt
    ```
 
-   В юните `ReadWritePaths` должен совпадать с `data_dir`; остановка — `SIGTERM`,
-   `TimeoutStopSec=94` — `max(90, ceil(shutdown_flush_wait_ms / 1000) + 80)` с: недоделанная
-   пачка инференса (до 60 с), перечанковка (до 10 с), SIGTERM Qdrant (до 10 с) и ожидание WAL
-   Qdrant `shutdown_flush_wait_ms = 14000` (14 с); обычно после записи — 10–20 с. Если
-   увеличить `shutdown_flush_wait_ms` до максимума 60 с, поставьте `TimeoutStopSec=140`.
+   `service install` пишет `/etc/systemd/system/zam-server.service` из шаблона
+   `systemd/zam-server.service` комплекта (`--name` — другое имя, `--user` — пользователь службы,
+   по умолчанию `zam`; он должен существовать) и выполняет `systemctl daemon-reload` и `enable`;
+   без root — ошибка и код 3. По конфигу подставляются `ExecStart` (`zam-server serve --config …`),
+   `WorkingDirectory` (каталог `zam-server`), `ReadWritePaths` (`data_dir` и каталог
+   `[vault] master_key_file`, если он вне `data_dir`) и `TimeoutStopSec` —
+   `max(90, ceil(shutdown_flush_wait_ms / 1000) + 80)` с (94 с при умолчаниях): недоделанная пачка
+   инференса (до 60 с), перечанковка (до 10 с), SIGTERM Qdrant (до 10 с) и ожидание WAL Qdrant
+   `shutdown_flush_wait_ms = 14000` (14 с); обычно после записи — 10–20 с. Остановка — `SIGTERM`
+   (`KillSignal=SIGTERM`; SIGINT сервер тоже понимает). После смены `shutdown_flush_wait_ms`
+   выполните `service install` повторно: сервер на старте под systemd сверяет `TimeoutStopUSec`
+   юнита и при нехватке пишет WARN. `service install --print` выводит юнит без записи;
+   `service start|stop|status` — обёртки `systemctl` (код выхода — его), `service uninstall` —
+   `systemctl disable --now`, удаление юнита и `daemon-reload`.
+
+   Вручную: `sudo cp /opt/zeroaimemory/systemd/zam-server.service /etc/systemd/system/`, затем
+   `sudo systemctl daemon-reload && sudo systemctl enable --now zam-server`; `ReadWritePaths`
+   должен совпадать с `data_dir`, при `shutdown_flush_wait_ms = 60000` — `TimeoutStopSec=140`.
 4. `zam-server` собран под `x86_64-unknown-linux-gnu` на Ubuntu 22.04 (glibc 2.35 и новее);
    `zam` — статический (musl).
 
@@ -814,8 +853,8 @@ jina — модель с динамическим int8: пары «запрос 
 - Реранкер jina на CPU добавляет к памяти сервера около 0,6 ГиБ при одной сессии и
   0,9 ГиБ при двух (`ml.rerank_sessions`, по умолчанию 0 — авто, до 2): меньше сессий — меньше памяти, но
   медленнее.
-- Команды `zam-server service install`, `doctor` и `backup` — этап M7. На Windows запуск в фоне
-  — Планировщик заданий или NSSM (см. «Windows»), на Linux — юнит systemd из комплекта.
+- Команды `zam-server doctor` и `backup` — этап M7. Режим службы (`zam-server service …`) — с
+  `0.0.5-m4`; NSSM, Планировщик заданий и ручная установка юнита остаются альтернативой.
 - Режим `qdrant.mode = "edge"` — прототип, в сервер не подключён: векторный поиск с ним
   выключен (см. `docs/adr/0001-qdrant-edge.md`).
 - GPU на Linux (драйвер NVIDIA и `zam-cuda`) проверен сборкой и smoke на CPU в CI; ручного

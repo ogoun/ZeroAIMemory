@@ -58,9 +58,12 @@ rand.workspace = true
 # MCP `/mcp` (§13.1): streamable HTTP поверх REST-ядра
 rmcp.workspace = true
 
-# Vault: DACL файла мастер-ключа (только владелец, SYSTEM, администраторы)
+# Vault: DACL файла мастер-ключа (только владелец, SYSTEM, администраторы);
+# служба: таймаут Preshutdown (ChangeServiceConfig2W / QueryServiceConfig2W)
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Services"] }
+# служба Windows (SCM, §13.3): диспетчер, обработчик команд, регистрация
+windows-service.workspace = true
 
 [features]
 # Тестовые точки (заглушка реранкера `RerankSlot::install`) — только интеграционным тестам

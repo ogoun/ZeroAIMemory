@@ -1,3 +1,6 @@
+# Шаблон юнита: `zam-server service install` подставляет User/Group, WorkingDirectory,
+# ExecStart, TimeoutStopSec (по qdrant.shutdown_flush_wait_ms) и ReadWritePaths (по data_dir);
+# `zam-server service install --print` выводит готовый юнит. Можно установить и вручную.
 [Unit]
 Description=ZeroAIMemory server
 After=network-online.target

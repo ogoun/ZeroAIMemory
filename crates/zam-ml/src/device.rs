@@ -92,8 +92,8 @@ fn session(
 ) -> Result<Session, MlError> {
     let mut b = Session::builder(env)?
         .with_optimization_level(GraphOptimizationLevel::All)?
-        // 0 — решение ORT (число физических ядер)
-        .with_intra_threads(threads)?
+        // 0 — решение ORT (число физических ядер); в контейнере с урезанным набором CPU — явно
+        .with_intra_threads(intra_threads(threads))?
         // фоновый сервис: без активного ожидания потоков между вызовами
         .with_intra_op_spinning(false)?
         // перепакованные веса MatMul общие для двух сессий
@@ -105,6 +105,53 @@ fn session(
             .error_on_failure()])?;
     }
     Ok(b.commit_from_file(model)?)
+}
+
+/// Число потоков intra-op для ORT. `0` — решение ORT: по потоку на физическое ядро **с
+/// привязкой** к ядру. В контейнере с урезанным набором CPU (LXC, cpuset) ORT привязывает потоки
+/// и к ядрам, которых процессу не дали, и пишет ERROR `pthread_setaffinity_np failed … error
+/// code: 22` (стенд LXC). При явном числе потоков ORT привязку не ставит (её задаёт только
+/// `session.intra_op_thread_affinities`) — поэтому, если процессу доступно меньше CPU, чем
+/// включено в системе, число задаётся явно: доступные CPU **[решение исполнителя, задача 14
+/// M4]**. Вне контейнера и на Windows — без изменений.
+fn intra_threads(requested: usize) -> usize {
+    if requested != 0 {
+        return requested;
+    }
+    restricted_cpus().unwrap_or(0)
+}
+
+/// Доступных процессу CPU меньше, чем включённых в системе, — их число.
+#[cfg(target_os = "linux")]
+fn restricted_cpus() -> Option<usize> {
+    let online = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+    let total = count_cpu_list(online.trim())?;
+    let avail = std::thread::available_parallelism().ok()?.get();
+    (avail < total).then_some(avail)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn restricted_cpus() -> Option<usize> {
+    None
+}
+
+/// Число CPU в списке ядра Linux: `0-3,8-11,15`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn count_cpu_list(list: &str) -> Option<usize> {
+    let mut n = 0usize;
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        n += match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+                b.checked_sub(a)? + 1
+            }
+            None => {
+                part.parse::<usize>().ok()?;
+                1
+            }
+        };
+    }
+    (n > 0).then_some(n)
 }
 
 fn pair(
@@ -228,4 +275,28 @@ pub(crate) fn build_session_pool(
             .map(|_| session(env, model, threads, &pw, cuda))
             .collect()
     })
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    /// Список CPU ядра Linux (`/sys/devices/system/cpu/online`).
+    #[test]
+    fn cpu_list_counts_ranges() {
+        assert_eq!(count_cpu_list("0-15"), Some(16));
+        assert_eq!(count_cpu_list("0-3,8-11,15"), Some(9));
+        assert_eq!(count_cpu_list("0"), Some(1));
+        assert_eq!(count_cpu_list(""), None);
+        assert_eq!(count_cpu_list("3-1"), None);
+        assert_eq!(count_cpu_list("x"), None);
+    }
+
+    /// Явное число потоков не меняется; `0` остаётся `0` вне урезанного набора CPU.
+    #[test]
+    fn explicit_threads_kept() {
+        assert_eq!(intra_threads(4), 4);
+        let auto = intra_threads(0);
+        assert!(auto == 0 || restricted_cpus() == Some(auto));
+    }
 }

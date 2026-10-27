@@ -18,6 +18,7 @@ pub mod models;
 pub mod qdrant;
 pub mod reindex;
 pub mod rerank;
+pub mod service;
 pub mod vault;
 pub mod web;
 
@@ -26,7 +27,7 @@ mod test_util;
 
 use std::net::SocketAddr;
 
-pub use app::{AppState, BootReport, build};
+pub use app::{AppState, BootReport, ShutdownSignal, StopSource, build};
 use config::ServerConfig;
 
 /// Файл первого токена администратора в каталоге данных (stderr — не терминал).
@@ -168,14 +169,60 @@ fn warn_if_token_file_left(data_root: &std::path::Path) -> bool {
     left
 }
 
+/// Как запущен сервер.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RunMode {
+    /// Консоль, systemd (`serve` с `INVOCATION_ID` — проверка таймаута юнита), NSSM.
+    #[default]
+    Console,
+    /// Служба Windows (SCM) с этим именем: журнал только в файл, проверка таймаута службы.
+    WindowsService { name: String },
+}
+
+/// Параметры запуска [`run_with`].
+#[derive(Default)]
+pub struct RunOptions {
+    pub mode: RunMode,
+    /// Общий сигнал остановки: к нему подключаются сигналы ОС, служба Windows — SCM.
+    pub signal: ShutdownSignal,
+    /// Вызывается, когда сервер принимает запросы (служба: `Running`).
+    pub on_ready: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Запускает сервер до Ctrl+C / SIGTERM.
 pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Result<()> {
+    run_with(cfg, env_password, RunOptions::default()).await
+}
+
+/// Запускает сервер до общего сигнала остановки (§4.3): Ctrl+C, SIGTERM, Ctrl+Break и (служба
+/// Windows) команды SCM ведут в один путь — штатное завершение HTTP и [`AppState::shutdown`].
+pub async fn run_with(
+    cfg: ServerConfig,
+    env_password: Option<String>,
+    opts: RunOptions,
+) -> anyhow::Result<()> {
+    let RunOptions {
+        mode,
+        signal,
+        on_ready,
+    } = opts;
+    let console = mode == RunMode::Console;
     let bind = cfg.server.bind;
     let log_cfg = cfg.log.clone();
     // Порядок: пароль, лок каталога, логи, базы; bind до выпуска токена, печать после.
     let prepared = app::prepare(cfg, env_password.as_deref())?;
     let data_root = prepared.data_dir.root().to_path_buf();
-    let _guard = logging::init(&log_cfg, &prepared.data_dir.logs())?;
+    let _guard = logging::init(&log_cfg, &prepared.data_dir.logs(), console)?;
+    // сигналы ОС — сразу: остановка во время долгого старта ждёт его конца и выходит штатно
+    signal.watch(app::os_stop_signals());
     // bind до выпуска токена: при занятом порту в БД ничего не появляется.
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let (app, state, report) = app::finish(prepared).await?;
@@ -184,8 +231,15 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
     if let Some(t) = &report.initial_token {
         use std::io::IsTerminal;
         let err = std::io::stderr();
-        let tty = err.is_terminal();
+        // служба Windows: консоли нет — только файл
+        let tty = console && err.is_terminal();
         let announced = announce_initial_token(t, &data_root, tty, &mut err.lock());
+        if !console && matches!(announced, Ok(Announced::File)) {
+            tracing::warn!(
+                path = %data_root.join(INITIAL_TOKEN_FILE).display(),
+                "первый токен администратора записан в файл: прочитайте и удалите файл"
+            );
+        }
         // не сообщён (файл не записан или stderr сломан) — токен никому не известен
         if !matches!(announced, Ok(Announced::Frame | Announced::File)) {
             revoke_initial_token(&state.system, t).await;
@@ -193,10 +247,10 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
     }
     if !crate::config::has_default_params(&state.admin_hash) {
         tracing::warn!(
-            "хэш пароля администратора с нестандартными параметрами argon2: время ответа входа \
-             выдаёт логин администратора; получите хэш командой `zam-server hash-password`"
+            "хэш пароля администратора с нестандартными параметрами argon2: время ответа входа              выдаёт логин администратора; получите хэш командой `zam-server hash-password`"
         );
     }
+    service::check_stop_timeout(&mode, state.cfg.qdrant.shutdown_flush_wait_ms).await;
     tracing::info!(addr = %listener.local_addr()?, version = state.version, "zam-server запущен");
     // действующие веса поиска и пороги чанкинга (секретов нет): по ним eval записывает
     // итоговую конфигурацию прогона
@@ -205,11 +259,18 @@ pub async fn run(cfg: ServerConfig, env_password: Option<String>) -> anyhow::Res
         index = %serde_json::to_string(&state.cfg.index).unwrap_or_default(),
         "параметры поиска и индексации"
     );
+    if let Some(f) = on_ready {
+        f();
+    }
+    let stop = signal.clone();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        let source = stop.wait().await;
+        tracing::info!(%source, "остановка zam-server");
+    })
     .await?;
     state.shutdown().await;
     tracing::info!("zam-server остановлен");
@@ -234,36 +295,6 @@ pub async fn migrate(cfg: ServerConfig) -> anyhow::Result<usize> {
         users.wait_rechunk(u.id).await;
     }
     Ok(list.len())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    // Windows: Ctrl+Break — штатная остановка процесса без окна консоли (его группе процессов
-    // шлёт `GenerateConsoleCtrlEvent`: `cargo xtask bench --scenario first-start`, менеджеры
-    // служб); Ctrl+C такой группе не доставляется.
-    #[cfg(windows)]
-    let term = async {
-        match tokio::signal::windows::ctrl_break() {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(any(unix, windows)))]
-    let term = std::future::pending::<()>();
-    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }
 
 #[cfg(test)]

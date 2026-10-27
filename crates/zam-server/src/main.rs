@@ -52,6 +52,55 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CudaCmd,
     },
+    /// Режим службы: служба Windows (SCM) или юнит systemd
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Зарегистрировать службу (Windows) или записать юнит systemd (Linux) с таймаутом
+    /// остановки по конфигу; повторный вызов обновляет параметры
+    Install {
+        /// Имя службы
+        #[arg(long, default_value = zam_server::service::DEFAULT_NAME)]
+        name: String,
+        /// Конфиг (по умолчанию: <каталог exe>\config.toml на Windows,
+        /// /etc/zeroaimemory/config.toml на Linux)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Пользователь службы (Linux; по умолчанию zam)
+        #[arg(long)]
+        user: Option<String>,
+        /// Вывести юнит (Linux) или параметры службы (Windows), ничего не устанавливая
+        #[arg(long)]
+        print: bool,
+    },
+    /// Остановить и удалить службу
+    Uninstall {
+        #[arg(long, default_value = zam_server::service::DEFAULT_NAME)]
+        name: String,
+    },
+    /// Запустить службу
+    Start {
+        #[arg(long, default_value = zam_server::service::DEFAULT_NAME)]
+        name: String,
+    },
+    /// Остановить службу (дожидается штатного выхода сервера)
+    Stop {
+        #[arg(long, default_value = zam_server::service::DEFAULT_NAME)]
+        name: String,
+    },
+    /// Состояние службы
+    Status {
+        #[arg(long, default_value = zam_server::service::DEFAULT_NAME)]
+        name: String,
+    },
+    /// Точка входа менеджера служб Windows (вручную не вызывается)
+    #[command(hide = true)]
+    Run(Opts),
 }
 
 #[derive(Subcommand)]
@@ -186,9 +235,52 @@ fn read_password() -> anyhow::Result<String> {
     Ok(s.lines().next().unwrap_or("").to_string())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    match Cli::parse().cmd {
+fn main() -> anyhow::Result<()> {
+    let cmd = Cli::parse().cmd;
+    // служба — без runtime: диспетчер SCM занимает главный поток, systemctl — синхронно
+    if let Cmd::Service { cmd } = cmd {
+        if let Err(e) = service_cmd(cmd) {
+            eprintln!("ошибка: {e}");
+            std::process::exit(i32::from(e.code));
+        }
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cmd))
+}
+
+fn service_cmd(cmd: ServiceCmd) -> Result<(), zam_server::service::ServiceError> {
+    use zam_server::service::{self, Control};
+    match cmd {
+        ServiceCmd::Install {
+            name,
+            config,
+            user,
+            print,
+        } => service::install(service::InstallArgs {
+            name,
+            config,
+            user,
+            print,
+        }),
+        ServiceCmd::Uninstall { name } => service::control(Control::Uninstall, &name),
+        ServiceCmd::Start { name } => service::control(Control::Start, &name),
+        ServiceCmd::Stop { name } => service::control(Control::Stop, &name),
+        ServiceCmd::Status { name } => service::control(Control::Status, &name),
+        ServiceCmd::Run(o) => service::run(
+            o.config,
+            CliOverrides {
+                bind: o.bind,
+                data_dir: o.data_dir,
+            },
+        ),
+    }
+}
+
+async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
+    match cmd {
         Cmd::Serve(o) => {
             let cfg = load(o)?;
             let pw = std::env::var("ZAM_ADMIN_PASSWORD").ok();
@@ -218,6 +310,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Qdrant { cmd } => qdrant_cmd(cmd).await,
         Cmd::Models { cmd } => models_cmd(cmd).await,
         Cmd::Cuda { cmd } => cuda_cmd(cmd).await,
+        Cmd::Service { .. } => unreachable!("служба обрабатывается до runtime"),
     }
 }
 

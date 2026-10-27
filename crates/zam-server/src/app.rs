@@ -59,6 +59,100 @@ impl AppState {
     }
 }
 
+/// Откуда пришла команда остановки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopSource {
+    /// Ctrl+C, SIGINT, SIGTERM, (Windows) Ctrl+Break — консоль, `systemctl stop`, NSSM.
+    Signal,
+    /// `Stop`/`Shutdown`/`Preshutdown` диспетчера служб Windows.
+    Service,
+}
+
+impl std::fmt::Display for StopSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Signal => "сигнал",
+            Self::Service => "менеджер служб",
+        })
+    }
+}
+
+/// Общий сигнал остановки сервера (§4.3): сигналы ОС и SCM ведут в один и тот же путь —
+/// штатное завершение HTTP, затем [`AppState::shutdown`] (воркер, перечанковка, ожидание WAL
+/// и остановка Qdrant). Срабатывает один раз; источник — первый.
+#[derive(Clone, Default)]
+pub struct ShutdownSignal {
+    token: tokio_util::sync::CancellationToken,
+    source: Arc<std::sync::OnceLock<StopSource>>,
+}
+
+impl ShutdownSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Запросить остановку (повторный вызов ничего не меняет).
+    pub fn trigger(&self, source: StopSource) {
+        let _ = self.source.set(source);
+        self.token.cancel();
+    }
+
+    pub fn is_triggered(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// Дождаться остановки; источник — первый [`Self::trigger`].
+    pub async fn wait(&self) -> StopSource {
+        self.token.cancelled().await;
+        self.source.get().copied().unwrap_or(StopSource::Signal)
+    }
+
+    /// Перевести завершение `os` (сигналы ОС) в этот сигнал.
+    pub fn watch(&self, os: impl std::future::Future<Output = ()> + Send + 'static) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = os => me.trigger(StopSource::Signal),
+                () = me.token.cancelled() => {}
+            }
+        });
+    }
+}
+
+/// Сигналы ОС штатной остановки: Ctrl+C/SIGINT, SIGTERM (unix), Ctrl+Break (Windows). Сбой
+/// подписки на сигнал — не остановка: такой путь просто не срабатывает.
+pub async fn os_stop_signals() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    // Windows: Ctrl+Break — штатная остановка процесса без окна консоли (его группе процессов
+    // шлёт `GenerateConsoleCtrlEvent`: `cargo xtask bench --scenario first-start`, менеджеры
+    // служб); Ctrl+C такой группе не доставляется.
+    #[cfg(windows)]
+    let term = async {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+}
+
 // Вручную: хэш пароля и пути не должны попадать в отладочный вывод.
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -225,4 +319,43 @@ fn compress_predicate() -> impl Predicate {
          _: &axum::http::HeaderMap,
          ext: &axum::http::Extensions| ext.get::<api::blobs::NoCompress>().is_none(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ctrl+C/SIGTERM и SCM ведут в один сигнал: кто первый — тот источник, ожидающие
+    /// просыпаются одинаково, повтор ничего не меняет.
+    #[tokio::test]
+    async fn shutdown_signal_shared_by_ctrl_c_and_service() {
+        // путь SCM
+        let s = ShutdownSignal::new();
+        let waiter = tokio::spawn({
+            let s = s.clone();
+            async move { s.wait().await }
+        });
+        assert!(!s.is_triggered());
+        s.trigger(StopSource::Service);
+        s.trigger(StopSource::Signal);
+        assert_eq!(waiter.await.unwrap(), StopSource::Service);
+        // путь сигнала ОС (вместо Ctrl+C — готовое будущее) через тот же сигнал
+        let s = ShutdownSignal::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        s.watch(async move {
+            let _ = rx.await;
+        });
+        let waiter = tokio::spawn({
+            let s = s.clone();
+            async move { s.wait().await }
+        });
+        tx.send(()).unwrap();
+        assert_eq!(waiter.await.unwrap(), StopSource::Signal);
+        // после SCM сигнал ОС источник не подменяет
+        let s = ShutdownSignal::new();
+        s.trigger(StopSource::Service);
+        s.watch(std::future::ready(()));
+        tokio::task::yield_now().await;
+        assert_eq!(s.wait().await, StopSource::Service);
+    }
 }

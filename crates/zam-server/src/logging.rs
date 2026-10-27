@@ -1,4 +1,5 @@
-//! Журнал: stderr + файл `zam-server.log` с суточной ротацией.
+//! Журнал: stderr + файл `zam-server.log` с суточной ротацией (под службой Windows — только
+//! файл: консоли нет).
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -28,8 +29,11 @@ where
 /// Цели, которые нельзя поднять выше `warn` (§13.1):
 /// - `rmcp` на debug/trace пишет JSON-RPC целиком (тексты заметок, значения Vault, промпты);
 /// - `memory_serve` на info пишет строку на каждый ассет WebUI при старте (~160 строк в
-///   journald, стенд Debian 13) — шум без пользы для эксплуатации.
-const CAPPED: [&str; 2] = ["rmcp", "memory_serve"];
+///   journald, стенд Debian 13) — шум без пользы для эксплуатации;
+/// - `ort` (журнал ONNX Runtime, цель `ort::logging`) на info пишет около 1500 строк за первую
+///   минуту после старта («Reserving memory in BFCArena…», стенд под systemd) **[решение
+///   контроллера, задача 14 M4]**.
+const CAPPED: [&str; 3] = ["rmcp", "memory_serve", "ort"];
 
 /// Цель директивы (`rmcp::service=debug` → `rmcp::service`), если она относится к одной из
 /// [`CAPPED`] или её подцели, — эта цель.
@@ -71,7 +75,8 @@ pub(crate) fn filter(level: &str) -> anyhow::Result<EnvFilter> {
 
 /// Ставит глобальный subscriber. Guard нужно держать до конца процесса.
 /// Повторный вызов (уже есть subscriber) не ошибка — остаётся прежний.
-pub fn init(cfg: &LogSection, logs_dir: &Path) -> anyhow::Result<WorkerGuard> {
+/// `console = false` (служба Windows: stderr некуда писать) — только файл в `logs_dir`.
+pub fn init(cfg: &LogSection, logs_dir: &Path, console: bool) -> anyhow::Result<WorkerGuard> {
     let appender = Builder::new()
         .rotation(Rotation::DAILY)
         .filename_prefix("zam-server.log")
@@ -80,10 +85,10 @@ pub fn init(cfg: &LogSection, logs_dir: &Path) -> anyhow::Result<WorkerGuard> {
     let (file, guard) = tracing_appender::non_blocking(appender);
     let filter = filter(&cfg.level)?;
     let ansi = std::io::stderr().is_terminal();
-    let layers = vec![
-        fmt_layer(cfg.format, std::io::stderr, ansi),
-        fmt_layer(cfg.format, file, false),
-    ];
+    let mut layers = vec![fmt_layer(cfg.format, file, false)];
+    if console {
+        layers.push(fmt_layer(cfg.format, std::io::stderr, ansi));
+    }
     let _ = tracing_subscriber::registry()
         .with(layers)
         .with(filter)
@@ -163,6 +168,9 @@ mod tests {
             super::capped_target("rmcp::service[req]=trace"),
             Some("rmcp")
         );
+        assert_eq!(super::capped_target("ort::logging=info"), Some("ort"));
+        assert_eq!(super::capped_target("ort=debug"), Some("ort"));
+        assert_eq!(super::capped_target("ortho=debug"), None);
         assert_eq!(super::capped_target("memory_server=info"), None);
         assert_eq!(super::capped_target("rmcpx=debug"), None);
         assert_eq!(super::capped_target("info"), None);
@@ -192,6 +200,36 @@ mod tests {
             assert_eq!(
                 out.contains("свой-info"),
                 !level.starts_with("memory_serve::"),
+                "{level}: {out}"
+            );
+        }
+    }
+
+    /// Журнал ONNX Runtime (`ort::logging`) — не выше `warn` (≈1500 строк INFO за минуту после
+    /// старта под systemd); его WARN и ERROR видны, свои цели не задеты.
+    #[test]
+    fn ort_capped_at_warn() {
+        for level in ["info", "debug", "info,ort=info", "ort::logging=trace"] {
+            let buf = Buf::default();
+            let w = buf.clone();
+            let sub = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(move || w.clone()))
+                .with(super::filter(level).unwrap());
+            tracing::subscriber::with_default(sub, || {
+                tracing::info!(target: "ort::logging", "ort-reserving-memory");
+                tracing::debug!(target: "ort", "ort-debug");
+                tracing::warn!(target: "ort::logging", "ort-warn-виден");
+                tracing::info!(target: "zam_ml::embed", "свой-info");
+            });
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                !out.contains("ort-reserving-memory") && !out.contains("ort-debug"),
+                "{level}: {out}"
+            );
+            assert!(out.contains("ort-warn-виден"), "{level}: {out}");
+            assert_eq!(
+                out.contains("свой-info"),
+                !level.starts_with("ort::"),
                 "{level}: {out}"
             );
         }
