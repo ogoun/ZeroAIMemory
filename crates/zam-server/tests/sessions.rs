@@ -419,6 +419,27 @@ async fn feedback_records_usage_in_owner_db() {
             "{j}"
         );
     }
+    // список Insights — те же счётчики у каждой записи (задача 13)
+    let l =
+        w.a.tok(
+            &w.a_tok,
+            Method::GET,
+            &format!("/api/v1/spaces/{G}/entries?kind=insight"),
+            None,
+        )
+        .await
+        .json();
+    let it = l["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == e.as_str())
+        .unwrap();
+    assert_eq!(
+        it["usage"],
+        json!({"shown": 0, "useful": 2, "useless": 1}),
+        "{l}"
+    );
     let target = TargetRef {
         kind: TargetKind::Entry,
         id: e.parse().unwrap(),

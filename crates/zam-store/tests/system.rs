@@ -363,3 +363,58 @@ async fn disabling_user_closes_sessions() {
     s.set_user_disabled(u.id, false).await.unwrap();
     assert!(s.get_web_session(&c).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn user_settings_roundtrip() {
+    use serde_json::json;
+    let (_dd, s) = store("user-settings").await;
+    let u = s.create_user("lida", false).await.unwrap();
+    let other = s.create_user("oleg", false).await.unwrap();
+    assert!(s.user_settings(u.id).await.unwrap().is_empty());
+    let changed = s
+        .set_user_settings(
+            u.id,
+            vec![
+                ("hooks.prompt".into(), json!(false)),
+                ("hooks.checkpoint".into(), json!(true)),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec![
+            ("hooks.prompt".to_string(), None),
+            ("hooks.checkpoint".to_string(), None)
+        ]
+    );
+    // то же значение не пишется и не возвращается; изменённое — с прежним значением
+    let changed = s
+        .set_user_settings(
+            u.id,
+            vec![
+                ("hooks.prompt".into(), json!(true)),
+                ("hooks.checkpoint".into(), json!(true)),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec![("hooks.prompt".to_string(), Some(json!(false)))]
+    );
+    assert_eq!(
+        s.user_settings(u.id).await.unwrap(),
+        vec![
+            ("hooks.checkpoint".to_string(), json!(true)),
+            ("hooks.prompt".to_string(), json!(true))
+        ]
+    );
+    // настройки одного пользователя не видны другому
+    assert!(s.user_settings(other.id).await.unwrap().is_empty());
+    let err = s
+        .set_user_settings(Id::new(), vec![("hooks.prompt".into(), json!(false))])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+}

@@ -4,9 +4,10 @@
   // вкладку — сразу), причина деградации с действием (тексты — с сервера),
   // повреждённые и исключённые из пересборки базы, неудавшиеся задания и переиндексация
   // (POST /admin/reindex) с подтверждением; баннер перенарезки баз после смены настроек
-  // нарезки («Идёт перенарезка: изменились <ключи>, N из M», §8.2).
+  // нарезки («Идёт перенарезка: изменились <ключи>, N из M», §8.2) — общий RechunkBanner.
   import { Dialog } from 'bits-ui';
   import { onMount } from 'svelte';
+  import RechunkBanner from '../components/RechunkBanner.svelte';
   import { ApiError, indexStatus, reindex, type IndexStatus, type User } from '../lib/api';
   import { hintParts, reasonText, transient } from '../lib/indexing';
   import { href } from '../lib/router';
@@ -120,11 +121,8 @@
   }
 
   let busyReindex = $derived(!!st && (st.reindex.running || st.reindex.queued));
-  /** Базы с идущей перенарезкой (старый сервер без `dbs` — нет). */
-  let rechunks = $derived(
-    (st?.dbs ?? []).flatMap((d) => (d.rechunk ? [{ user_id: d.user_id, ...d.rechunk }] : [])),
-  );
-  const changedText = (keys: string[]) => (keys.length ? keys.join(', ') : 'параметры нарезки');
+  /** Имена пользователей для баннера перенарезки (старый сервер без `dbs` — баннера нет). */
+  let userNames = $derived(Object.fromEntries(users.map((u) => [u.id, u.name])));
 </script>
 
 <section class="panel index-page">
@@ -195,17 +193,7 @@
       </div>
     </dl>
 
-    {#each rechunks as r (r.user_id)}
-      <div class="alert alert-warn rechunk" role="status">
-        <p class="alert-title">
-          Идёт перенарезка: изменились {changedText(r.changed)}, {num(r.done)} из {num(r.total)}
-        </p>
-        <p>
-          База <b>{userName(r.user_id)}</b> перенарезается в фоне после смены настроек нарезки:
-          поиск и запись работают, векторы пересчитываются только у изменившихся фрагментов.
-        </p>
-      </div>
-    {/each}
+    <RechunkBanner dbs={st.dbs ?? []} names={userNames} />
 
     {#if st.unavailable_dbs.length}
       <div class="alert">

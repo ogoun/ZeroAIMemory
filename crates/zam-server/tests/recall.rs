@@ -134,7 +134,7 @@ async fn shown(a: &Api, owner: &str, kind: TargetKind, id: &str) -> zam_store::U
 }
 
 /// Дайджест не превышает `recall.digest_tokens` (1500) и `budget_tokens` запроса, даже когда
-/// кандидатов на порядок больше; `hooks` — все типы включены (настроек пользователя ещё нет).
+/// кандидатов на порядок больше; `hooks` — все типы включены (настройки пользователя по умолчанию).
 #[tokio::test]
 async fn session_start_digest_within_budget() {
     let a = server("budget").await;
@@ -1055,4 +1055,79 @@ async fn recall_record_false_skips_accounting() {
     .await;
     assert_eq!(ids(&j), [me.as_str()], "{j}");
     assert_eq!(shown(&a, &u_id, TargetKind::Entry, &e).await.shown, 1);
+}
+
+/// N4 (R5, задача 13): тип выключен в настройках пользователя на сервере — `/recall` этого типа
+/// отвечает пустым `text` и показ не учитывает; у `session_start` в ответе — `hooks`.
+#[tokio::test]
+async fn recall_disabled_hook_kind_is_silent() {
+    let a = server("hooks-off").await;
+    let (u_id, tok) = a.new_user("Лиза").await;
+    let e = insight(
+        &a,
+        &tok,
+        "knowledge",
+        "Пульсар мигает",
+        "Пульсар — нейтронная звезда.",
+        "gotcha",
+    )
+    .await;
+    let me = format!("i:{e}");
+    let set = |hooks: Value| {
+        let uri = format!("/api/v1/admin/users/{u_id}/settings");
+        let a = &a;
+        async move {
+            let r = a
+                .adm(Method::PATCH, &uri, Some(json!({ "hooks": hooks })), None)
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        }
+    };
+    set(json!({"session_start": false, "prompt": false, "post_tool": false})).await;
+    let j = ok(&a, &tok, Some("off-1"), json!({"event": "session_start"})).await;
+    assert_eq!(j["text"], "", "{j}");
+    assert!(ids(&j).is_empty(), "{j}");
+    assert_eq!(
+        j["hooks"],
+        json!({"session_start": false, "prompt": false, "pre_tool": true,
+               "post_tool": false, "checkpoint": true})
+    );
+    let j = ok(
+        &a,
+        &tok,
+        Some("off-1"),
+        json!({"event": "prompt", "prompt": "пульсар"}),
+    )
+    .await;
+    assert_eq!(j["text"], "", "{j}");
+    assert!(j.get("hooks").is_none(), "{j}");
+    let j = ok(
+        &a,
+        &tok,
+        Some("off-1"),
+        json!({"event": "post_tool", "tool": "Bash", "error": "пульсар мигает"}),
+    )
+    .await;
+    assert_eq!(j["text"], "", "{j}");
+    assert_eq!(shown(&a, &u_id, TargetKind::Entry, &e).await.shown, 0);
+    // показ не отмечен — после включения `prompt` той же сессии подсказку выдаёт
+    set(json!({"prompt": true})).await;
+    let j = ok(
+        &a,
+        &tok,
+        Some("off-1"),
+        json!({"event": "prompt", "prompt": "пульсар"}),
+    )
+    .await;
+    assert_eq!(ids(&j), [me.as_str()], "{j}");
+    assert_eq!(shown(&a, &u_id, TargetKind::Entry, &e).await.shown, 1);
+    // настройки одного пользователя не влияют на другого
+    let j = ok(
+        &a,
+        &a.token,
+        Some("other-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    assert_eq!(j["hooks"]["session_start"], true, "{j}");
 }

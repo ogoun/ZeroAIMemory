@@ -3,10 +3,12 @@
 //! Таблица лежит в базе, где лежит цель: владелец решения видит показы и оценки записей своего
 //! решения, в том числе от участников (`user_id` — кто показал или оценил). Хранится бессрочно,
 //! только дописывается.
+use std::collections::HashMap;
+
 use jiff::Timestamp;
 use rusqlite::params;
 use serde::Serialize;
-use zam_core::{Id, TargetRef};
+use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::sessions::target_kind_str as kind_str;
 use crate::time::fmt_ts;
@@ -109,6 +111,47 @@ pub async fn record_usages(db: &Db, events: &[UsageEvent]) -> Result<(), StoreEr
             ])?;
         }
         Ok(())
+    })
+    .await
+}
+
+/// Счётчики событий многих целей одного вида одним запросом (столбец «показы / полезно /
+/// бесполезно» списка Insights WebUI, задача 13); цели без событий в ответе нет.
+pub async fn usage_counts_many(
+    db: &Db,
+    kind: TargetKind,
+    ids: &[Id],
+) -> Result<HashMap<Id, UsageCounts>, StoreError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let list =
+        serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT target_id, event, count(*) FROM usage
+             WHERE target_kind = ?1 AND target_id IN (SELECT value FROM json_each(?2))
+             GROUP BY target_id, event",
+        )?;
+        let rows = st.query_map(params![kind_str(kind), list], |r| {
+            Ok((
+                r.get::<_, Id>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out: HashMap<Id, UsageCounts> = HashMap::new();
+        for row in rows {
+            let (id, event, n) = row?;
+            let u = out.entry(id).or_default();
+            match event.as_str() {
+                "recall_shown" => u.shown = n,
+                "useful" => u.useful = n,
+                "useless" => u.useless = n,
+                _ => {}
+            }
+        }
+        Ok(out)
     })
     .await
 }

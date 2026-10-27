@@ -97,7 +97,7 @@ test('пользователь: вход, обязательная смена п
   await expect(tree).toContainText('Моя память');
   await expect(tree).toContainText(name);
   const nav = page.getByRole('navigation', { name: 'Разделы' });
-  await expect(nav.getByRole('link')).toHaveText(['Заметки', /Мои решения/, 'Аккаунт']);
+  await expect(nav.getByRole('link')).toHaveText(['Заметки', /Мои решения/, 'Аккаунт', /Подключение агента/, /Кэш выжимок/]);
   await expect(page.getByRole('link', { name: 'Администрирование' })).toHaveCount(0);
   await expect(page.getByRole('link', { name: 'Индекс' })).toHaveCount(0);
   // прямой адрес раздела администратора — возврат к своим заметкам
@@ -138,10 +138,14 @@ test('пользователь: вход, обязательная смена п
   await page.getByLabel('Имя токена').fill('e2e-laptop');
   await page.getByLabel('Доступ').selectOption('ro');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
+  // новый токен — сразу «Подключение агента» с окном токена (§15.5)
+  await expect(page).toHaveURL(/#\/agent-setup$/);
   const dialog = page.getByRole('dialog');
   const plain = await dialog.getByLabel('Токен').inputValue();
   expect(plain).toMatch(/^zam_[0-9A-Za-z]{40}$/);
   await dialog.getByRole('button', { name: 'Закрыть' }).click();
+  await expect(page.getByRole('region', { name: /zam init — Linux/ })).toContainText(plain);
+  await nav.getByRole('link', { name: 'Аккаунт' }).click();
   const row = page.locator('tr[data-token="e2e-laptop"]');
   await expect(row).toContainText('ro');
   const ok = await rc.get(`${base()}api/v1/spaces`, { headers: { Authorization: `Bearer ${plain}` } });

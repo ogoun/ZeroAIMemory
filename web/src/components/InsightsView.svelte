@@ -3,12 +3,14 @@
   // записи — замещение, отзыв, пересмотр, смена статуса надёжности (причина и доказательство
   // theorem человеку необязательны), триггеры, цепочка замещения, связи. Сессия WebUI — человек
   // (author_kind = human). Правка идёт с ревизией открытой записи (If-Match, §11.3): запись
-  // изменилась — 409, карточка перечитывается.
+  // изменилась — 409, карточка перечитывается. Столбец «показы / полезно / бесполезно» и
+  // кнопки оценки (`POST /entries/{id}/feedback`, источник `webui`, §10.5).
   import { untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import Links from './Links.svelte';
   import {
     ApiError,
+    entryFeedback,
     errorText,
     getEntry,
     isStaleEntry,
@@ -21,6 +23,7 @@
     type EntryStatus,
     type NewTrigger,
     type TriggerType,
+    type UsageCounts,
   } from '../lib/api';
   import {
     AUTHOR_TEXT,
@@ -207,6 +210,28 @@
     const [before, cb] = await walk(e.supersedes_id, (x) => x.supersedes_id);
     const [after, ca] = await walk(e.superseded_by_id, (x) => x.superseded_by_id);
     return { items: [...before.reverse(), e, ...after], cut: { before: cb, after: ca } };
+  }
+
+  const usageText = (u: UsageCounts | undefined) => (u ? `${u.shown} / ${u.useful} / ${u.useless}` : '—');
+
+  /** Оценка полезности: событие `usage` в базе записи, счётчики — перечитать. */
+  async function rate(value: 'useful' | 'useless') {
+    const c = cur;
+    if (!c || busy) return;
+    busy = true;
+    actionError = '';
+    notice = '';
+    try {
+      await entryFeedback(user, c.id, value);
+      const e = await getEntry(user, c.id);
+      if (cur?.id === c.id) cur = e;
+      items = items.map((x) => (x.id === e.id ? { ...x, usage: e.usage } : x));
+      notice = value === 'useful' ? 'Отмечено: полезно.' : 'Отмечено: бесполезно.';
+    } catch (e) {
+      fail(e, (m) => (actionError = m));
+    } finally {
+      busy = false;
+    }
   }
 
   function select(id: string) {
@@ -402,7 +427,10 @@
   <div class="table-wrap">
     <table aria-label="Insights">
       <thead>
-        <tr><th>Надёжность</th><th>Заголовок</th><th>Вид</th><th>Статус</th><th>Область</th><th>Изменено</th></tr>
+        <tr>
+          <th>Надёжность</th><th>Заголовок</th><th>Вид</th><th>Статус</th><th>Область</th>
+          <th title="Показы подсказками / полезно / бесполезно">Показы / полезно / бесполезно</th><th>Изменено</th>
+        </tr>
       </thead>
       <tbody>
         {#each items as e (e.id)}
@@ -415,6 +443,7 @@
             <td>{dataStr(e.data, 'kind')}</td>
             <td>{e.status ? STATUS_TEXT[e.status] : ''}</td>
             <td>{e.area ?? ''}</td>
+            <td class="usage">{usageText(e.usage)}</td>
             <td class="muted">{fmtTime(e.updated_at)}</td>
           </tr>
         {/each}
@@ -455,6 +484,13 @@
         </dl>
       {/if}
       {#if c.retract_reason}<p class="warn">Отозвано: {c.retract_reason}</p>{/if}
+      <div class="row rate" role="group" aria-label="Оценка полезности">
+        <span class="muted small" data-testid="usage">
+          показы {c.usage?.shown ?? 0} · полезно {c.usage?.useful ?? 0} · бесполезно {c.usage?.useless ?? 0}
+        </span>
+        <button type="button" onclick={() => rate('useful')} disabled={busy}>Полезно</button>
+        <button type="button" onclick={() => rate('useless')} disabled={busy}>Бесполезно</button>
+      </div>
 
       {#if chain.length > 1}
         <div class="chain">
@@ -599,6 +635,16 @@
   }
   .table-wrap {
     overflow-x: auto;
+  }
+  .usage {
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .rate {
+    margin: 8px 0;
+  }
+  .rate button {
+    padding: 2px 10px;
   }
   tr.selected {
     background: var(--selected);

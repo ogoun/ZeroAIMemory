@@ -1028,3 +1028,124 @@ async fn password_for_admin_login_name_409() {
     let (uid, _) = a.new_user("ADMIN").await;
     ok(&set_pw(&a, &uid, PASS).await, StatusCode::OK);
 }
+
+/// Настройки пользователя `hooks.<тип>` (R5, задача 13): свои — сессией, любого — администратор,
+/// по токену — 403; неизвестный тип — 400; аудит изменений.
+#[tokio::test]
+async fn user_hook_settings_rest() {
+    let a = api("ul-settings", |_| {}).await;
+    let (uid, tok, w) = ready_user(&a, "Нина", "10.1.9.1").await;
+    let (other, _) = a.new_user("Олег").await;
+    let all_on = json!({"session_start": true, "prompt": true, "pre_tool": true,
+                        "post_tool": true, "checkpoint": true});
+    let r = web(&a, &w, Method::GET, "/api/v1/auth/settings", None).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["hooks"], all_on);
+    let r = web(
+        &a,
+        &w,
+        Method::PATCH,
+        "/api/v1/auth/settings",
+        Some(json!({"hooks": {"prompt": false}})),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["hooks"]["prompt"], false);
+    assert_eq!(r.json()["hooks"]["checkpoint"], true);
+    // администратор видит и меняет настройки любого пользователя
+    let r = a
+        .adm(
+            Method::GET,
+            &format!("/api/v1/admin/users/{uid}/settings"),
+            None,
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["hooks"]["prompt"], false);
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{other}/settings"),
+            Some(json!({"hooks": {"checkpoint": false}})),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    // у Нины checkpoint не изменился
+    let r = web(&a, &w, Method::GET, "/api/v1/auth/settings", None).await;
+    assert_eq!(r.json()["hooks"]["checkpoint"], true);
+    // пользователь чужие настройки не читает; токен — 403
+    let r = web(
+        &a,
+        &w,
+        Method::GET,
+        &format!("/api/v1/admin/users/{other}/settings"),
+        None,
+    )
+    .await;
+    ok(&r, StatusCode::FORBIDDEN);
+    let r = a
+        .tok(&tok, Method::GET, "/api/v1/auth/settings", None)
+        .await;
+    ok(&r, StatusCode::FORBIDDEN);
+    let r = a
+        .tok(
+            &tok,
+            Method::PATCH,
+            "/api/v1/auth/settings",
+            Some(json!({"hooks": {"prompt": true}})),
+        )
+        .await;
+    ok(&r, StatusCode::FORBIDDEN);
+    // неверные правки — 400
+    for bad in [
+        json!({}),
+        json!({"hooks": {"stop": false}}),
+        json!({"hooks": {"prompt": 1}}),
+        json!({"theme": "dark"}),
+    ] {
+        let r = web(&a, &w, Method::PATCH, "/api/v1/auth/settings", Some(bad)).await;
+        ok(&r, StatusCode::BAD_REQUEST);
+    }
+    // неизвестный пользователь — 404
+    let r = a
+        .adm(
+            Method::GET,
+            &format!("/api/v1/admin/users/{}/settings", zam_core::Id::new()),
+            None,
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::NOT_FOUND);
+    // аудит: изменения с прежним и новым значением; повтор того же значения — без записи
+    let r = web(
+        &a,
+        &w,
+        Method::PATCH,
+        "/api/v1/auth/settings",
+        Some(json!({"hooks": {"prompt": false}})),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let rows: Vec<_> = audit(&a)
+        .await
+        .into_iter()
+        .filter(|r| r.action == "user.settings.update")
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let mine = rows
+        .iter()
+        .find(|r| r.target.as_deref() == Some(uid.as_str()))
+        .unwrap();
+    assert_eq!(mine.actor, "user");
+    assert_eq!(
+        mine.details,
+        json!({"key": "hooks.prompt", "from": true, "to": false})
+    );
+    let adm = rows
+        .iter()
+        .find(|r| r.target.as_deref() == Some(other.as_str()))
+        .unwrap();
+    assert_eq!(adm.actor, "admin");
+}

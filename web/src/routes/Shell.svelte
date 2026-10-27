@@ -3,6 +3,7 @@
   // справа — документ, стартовый экран пользователя или администрирование. У пользователя
   // (не администратора, §15.1) нет разделов «Пользователи», «Администрирование», «Настройки»
   // и полного «Индекса»: есть «Мои решения», «Аккаунт» и баннер перенарезки своей базы.
+  // «Подключение агента» и «Кэш выжимок» — у обоих (страницы грузятся лениво, §15.4).
   import { onMount, untrack } from 'svelte';
   import DocView from '../components/DocView.svelte';
   import Search from '../components/Search.svelte';
@@ -176,6 +177,9 @@
     }
   }
 
+  /** Имена пользователей для баннера перенарезки администратора. */
+  let userNames = $derived(Object.fromEntries(users.map((u) => [u.id, u.name])));
+
   let userName = $derived.by(() => {
     const r = route;
     const u = routeUser(r);
@@ -212,6 +216,12 @@
         >
         <a href={href({ name: 'account' })} aria-current={route.name === 'account' ? 'page' : undefined}>Аккаунт</a>
       {/if}
+      <a href={href({ name: 'agentsetup' })} aria-current={route.name === 'agentsetup' ? 'page' : undefined}
+        aria-label="Подключение агента"><span class="long">Подключение агента</span><span class="short" aria-hidden="true">Агент</span></a
+      >
+      <a href={href({ name: 'cache' })} aria-current={route.name === 'cache' ? 'page' : undefined}
+        aria-label="Кэш выжимок"><span class="long">Кэш выжимок</span><span class="short" aria-hidden="true">Кэш</span></a
+      >
     </nav>
     <button type="button" class="search-btn" onclick={() => (searchOpen = true)} title="Поиск (Ctrl+K)" aria-label="Поиск">
       <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8" /><path d="M13 13l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" /></svg>
@@ -233,7 +243,12 @@
   <div class="scrim" onclick={() => (drawer = false)}></div>
 
   <main class="content">
-    {#if !admin}<RechunkBanner userId={me.user_id} {onexpired} />{/if}
+    <!-- перенарезка: у пользователя — своя база, у администратора — все (на «Индексе» — его статус) -->
+    {#if !admin}
+      <RechunkBanner userId={me.user_id} {onexpired} />
+    {:else if route.name !== 'index'}
+      <RechunkBanner names={userNames} {onexpired} />
+    {/if}
     {#if isAdmin(route) && admin}
       <div class="admin">
         <nav class="subnav" aria-label="Администрирование">
@@ -298,6 +313,26 @@
       <div class="admin">
         <Account {me} {onexpired} />
       </div>
+    {:else if route.name === 'agentsetup'}
+      <div class="admin">
+        {#await import('./AgentSetup.svelte')}
+          <p class="muted">Загрузка…</p>
+        {:then { default: AgentSetup }}
+          <AgentSetup {me} {users} {onexpired} />
+        {:catch e}
+          <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
+        {/await}
+      </div>
+    {:else if route.name === 'cache'}
+      <div class="admin">
+        {#await import('./Cache.svelte')}
+          <p class="muted">Загрузка…</p>
+        {:then { default: Cache }}
+          <Cache {me} {users} {onexpired} />
+        {:catch e}
+          <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
+        {/await}
+      </div>
     {:else if route.name === 'mysolutions'}
       <div class="admin">
         <Solutions mine {onexpired} />
@@ -357,6 +392,13 @@
   .topnav {
     display: flex;
     gap: 4px;
+    /* пунктов больше, чем влезает на узком экране: меню прокручивается само, страница — нет */
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .topnav a {
+    flex: none;
   }
   .topnav a {
     padding: 6px 10px;

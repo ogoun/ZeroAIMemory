@@ -3,7 +3,7 @@
 //! ```text
 //! POST   /cache {query, summary, sources: [{id, rev?, section?}], solution?, scope?, filters?,
 //!                include_history?, promote?: {as: note|insight, path?, kind?}}   → 201
-//! GET    /cache?q=&solution=&session=&state=valid|stale&limit=                → {items}
+//! GET    /cache?q=&solution=&session=&author=&state=valid|stale&limit=        → {items}
 //! GET    /cache/{id}                                                          → выжимка
 //! DELETE /cache/{id}                                                          → 204
 //! POST   /cache/{id}/promote {as: note|insight, path?, kind?}                 → 201
@@ -567,6 +567,8 @@ pub struct ListQuery {
     q: Option<String>,
     solution: Option<String>,
     session: Option<String>,
+    /// id пользователя-автора выжимки.
+    author: Option<String>,
     state: Option<String>,
     limit: Option<usize>,
 }
@@ -598,9 +600,16 @@ pub async fn list(
                 .map_err(|_| ApiError::BadRequest("solution: GUID решения".into()))
         })
         .transpose()?;
+    let author = q
+        .author
+        .as_deref()
+        .filter(|a| !a.trim().is_empty())
+        .map(|a| parse_id(a.trim()))
+        .transpose()?;
     let mut f = CacheFilter {
         q: q.q,
         session_id: q.session,
+        author_user_id: author,
         valid,
         limit,
         ..CacheFilter::default()

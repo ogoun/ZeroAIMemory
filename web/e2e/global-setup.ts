@@ -1,7 +1,7 @@
 // Запуск release zam-server для E2E: bind 0.0.0.0:<порт>, каталог данных в .tmp/e2e,
 // адрес страницы — LAN-IP машины. Возвращает функцию остановки (teardown).
 import { spawn } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -75,19 +75,27 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   });
   const log = createWriteStream(`${tmp}server.log`);
   try {
-    // Журнал сервера без строки с первым токеном; сам токен — для наполнения данными.
+    // Журнал сервера без строки с первым токеном; сам токен — для наполнения данными. stderr
+    // сервера здесь не терминал: токен приходит файлом (строка ZeroAIMemoryTokenFile=<путь>,
+    // стенд Debian 13, L1); строка ZeroAIMemoryToken= — у сборок до этого исправления.
     let rest = '';
     let token = '';
+    let tokenFile = '';
     child.stderr!.on('data', (chunk: Buffer) => {
       const lines = (rest + chunk.toString('utf8')).split('\n');
       rest = lines.pop() ?? '';
       for (const l of lines) {
         if (l.startsWith('ZeroAIMemoryToken=')) token = l.slice('ZeroAIMemoryToken='.length).trim();
+        else if (l.startsWith('ZeroAIMemoryTokenFile=')) tokenFile = l.slice('ZeroAIMemoryTokenFile='.length).trim();
         else log.write(`${l}\n`);
       }
     });
 
     await waitHealth(base, () => child.exitCode === null);
+    if (!token && tokenFile && existsSync(tokenFile)) {
+      token = readFileSync(tokenFile, 'utf8').trim();
+      rmSync(tokenFile, { force: true });
+    }
     if (!token) throw new Error('сервер не напечатал первый токен администратора');
     const ids = await seed(base, token);
     // один вход на весь прогон (см. session.ts)

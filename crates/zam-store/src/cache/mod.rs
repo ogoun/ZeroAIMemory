@@ -204,6 +204,8 @@ pub struct CacheFilter {
     /// Подстрока нормализованного запроса.
     pub q: Option<String>,
     pub session_id: Option<String>,
+    /// Автор выжимки (пользователь; фильтр WebUI «Кэш выжимок», задача 13).
+    pub author_user_id: Option<Id>,
     /// `Some(true)` — только действующие (после проверки источников), `Some(false)` — только
     /// недействительные.
     pub valid: Option<bool>,
@@ -687,9 +689,13 @@ pub async fn cache_list(db: &Db, f: &CacheFilter) -> Result<Vec<CacheHit>, Store
                AND (?1 IS NULL OR a.space_id IN (SELECT value FROM json_each(?1)))
                AND (?2 IS NULL OR instr(a.query_norm, ?2) > 0)
                AND (?3 IS NULL OR a.session_id = ?3)
+               AND (?4 IS NULL OR a.author_user_id = ?4)
              ORDER BY a.last_used_at DESC, a.id"
         ))?;
-        let rows = st.query_map(params![spaces, q, f.session_id], cache_row)?;
+        let rows = st.query_map(
+            params![spaces, q, f.session_id, f.author_user_id],
+            cache_row,
+        )?;
         let entries: Vec<CacheEntry> = rows.collect::<Result<_, _>>()?;
         let mut out = Vec::new();
         for chunk in entries.chunks(100) {

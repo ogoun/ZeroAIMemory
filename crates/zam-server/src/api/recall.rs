@@ -24,8 +24,10 @@
 //!   пространства решения с L0 (до [`SOLUTION_ROOT_MAX`]), до 5 действующих (`active`)
 //!   `gotcha`/`failure` решения и Knowledge (новые первыми), до 5 записей `revisit`, последние
 //!   5 записей changelog решения **[решение исполнителя]**. Ответ несёт `hooks: {session_start,
-//!   prompt, pre_tool, post_tool, checkpoint}` — настройки типов подсказок пользователя (R5;
-//!   хранения пользовательских настроек на сервере пока нет — все `true`, задача 13);
+//!   prompt, pre_tool, post_tool, checkpoint}` — настройки типов подсказок пользователя
+//!   `hooks.<тип>` (R5, [`super::user_settings`], задача 13). Тип запроса выключен у
+//!   пользователя на сервере — пустой `text` без сбора и без учёта показа (`session_seen`,
+//!   `usage`; сессия касается), у `session_start` — с `hooks` (N4);
 //! - **`prompt`** — поиск `mode=brief` (без реранка, без кэша выжимок, `skip_seen: false`) по
 //!   первым 512 символам `prompt` в Knowledge, Rules и решении; из выдачи — только insight и
 //!   заметки Rules с баллом ≥ `recall.prompt_min_score` (0,6), не больше [`PROMPT_MAX`];
@@ -96,6 +98,7 @@ use super::nodes::read::l1;
 use super::search::targets::{ScopeReq, SearchTarget, dedup_keep_order, resolve_targets};
 use super::search::{Health, SOLUTION_HEADER};
 use super::sessions::{RequestSession, request_session};
+use super::user_settings::{HookFlags, hook_flags};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, SESSION_HEADER};
 use crate::auth::{Principal, target_user_id};
@@ -148,6 +151,15 @@ enum Event {
 }
 
 impl Event {
+    /// Тип подсказки в настройках пользователя `hooks.<тип>` (R5).
+    fn hook_kind(self) -> &'static str {
+        match self {
+            Event::SessionStart => "session_start",
+            Event::Prompt => "prompt",
+            Event::PostTool => "post_tool",
+        }
+    }
+
     fn source(self) -> UsageSource {
         match self {
             Event::SessionStart => UsageSource::SessionStart,
@@ -985,6 +997,16 @@ pub async fn recall(
         }
     }
     let user = target_user_id(&st, &p, &headers)?;
+    // R5: переключатели пользователя; сбой чтения — все включены (подсказки не валятся)
+    let hooks = match hook_flags(&st.system, user).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: настройки hooks пользователя не прочитаны");
+            HookFlags::default()
+        }
+    };
+    // N4: тип выключен на сервере — пустой `text`, показ не учитывается (сессия касается)
+    let enabled = hooks.enabled(req.event.hook_kind());
     let mut sh = headers.clone();
     if req.solution.is_some() {
         // решение тела сильнее заголовка
@@ -1011,6 +1033,7 @@ pub async fn recall(
 
     // сбор кандидатов
     let (notices, sections, repeatable) = match req.event {
+        _ if !enabled => (Vec::new(), Vec::new(), true),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
         Event::SessionStart => {
@@ -1113,14 +1136,8 @@ pub async fn recall(
         "warnings": warnings,
     });
     if req.event == Event::SessionStart {
-        // R5: настройки типов подсказок пользователя; хранения на сервере пока нет (задача 13)
-        out["hooks"] = json!({
-            "session_start": true,
-            "prompt": true,
-            "pre_tool": true,
-            "post_tool": true,
-            "checkpoint": true,
-        });
+        // R5: настройки типов подсказок пользователя (`hooks.<тип>`, задача 13)
+        out["hooks"] = hooks.to_json();
     }
     Ok(Json(out))
 }

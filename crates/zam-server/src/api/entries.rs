@@ -10,7 +10,7 @@
 //!   расхождение — 409 с текущей ревизией `rev`; ревизия проверяется раньше прав;
 //!   `POST /entries/{id}/restore` (`If-Match` необязателен, при наличии проверяется),
 //!   `GET /entries/{id}/revisions`; `GET /entries/{id}` отдаёт и `usage: {shown, useful,
-//!   useless}` (§10.5, оценка — [`super::feedback`]).
+//!   useless}` (§10.5, оценка — [`super::feedback`]), список — у каждой insight (задача 13).
 //!
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
 //! уходит в [`super::insights::create`] (дедупликация, `scope`, триггеры, замещение).
@@ -32,6 +32,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
+use zam_core::{Id, TargetKind};
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, NewEntry, SpaceKind,
     create_entry, delete_entry, entry_by_idempotency_key, entry_revisions, list_entries,
@@ -422,7 +423,23 @@ pub async fn list(
         limit: q.limit.unwrap_or(LIST_DEFAULT),
     };
     let (items, next) = list_entries(&sc.db, f).await?;
-    Ok(Json(json!({ "items": items, "next_cursor": next })))
+    // у insight — показы и оценки (столбец списка Insights WebUI, задача 13), одним запросом
+    let ids: Vec<Id> = items
+        .iter()
+        .filter(|e| e.kind == EntryKind::Insight)
+        .map(|e| e.id)
+        .collect();
+    let usage = zam_store::usage_counts_many(&sc.db, TargetKind::Entry, &ids).await?;
+    let mut out = Vec::with_capacity(items.len());
+    for e in &items {
+        let mut v = serde_json::to_value(e)
+            .map_err(|e| ApiError::Internal(format!("запись не сериализуется: {e}")))?;
+        if e.kind == EntryKind::Insight {
+            v["usage"] = json!(usage.get(&e.id).copied().unwrap_or_default());
+        }
+        out.push(v);
+    }
+    Ok(Json(json!({ "items": out, "next_cursor": next })))
 }
 
 /// `GET /entries/{id}` → `Entry` (у insight — с `triggers`).

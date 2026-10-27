@@ -145,10 +145,13 @@ test('Токены: человеческих нет, axiom — обычным т
   await expect(page.getByLabel('для человека')).toHaveCount(0);
   await page.getByPlaceholder('Имя токена').fill('e2e-agent');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
+  await expect(page).toHaveURL(/#\/agent-setup$/);
   const dialog = page.getByRole('dialog');
   const token = await dialog.getByLabel('Токен').inputValue();
   expect(token).toMatch(/^zam_/);
   await dialog.getByRole('button', { name: 'Закрыть' }).click();
+  await openAdmin(page, 'Пользователи');
+  await adminRow.getByRole('button', { name: 'Токены' }).click();
   await expect(page.getByRole('row', { name: /^e2e-agent / })).not.toContainText('человек');
   await page.screenshot({ path: `${screens}tokens.png`, fullPage: true });
 

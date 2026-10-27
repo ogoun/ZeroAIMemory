@@ -395,6 +395,21 @@ async fn cache_shared_in_solution_with_author() {
     .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let borisa = id(&r.json());
+    // фильтр по автору (WebUI «Кэш выжимок», задача 13)
+    let list = |q: String| {
+        let w = &w;
+        async move { w.a.tok(&w.a_tok, Method::GET, &q, None).await }
+    };
+    let all = list(format!("/api/v1/cache?solution={G}")).await.json();
+    assert_eq!(all["items"].as_array().unwrap().len(), 3, "{all}");
+    let by_b = list(format!("/api/v1/cache?solution={G}&author={}", w.b_id))
+        .await
+        .json();
+    let items = by_b["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{by_b}");
+    assert!(items.iter().all(|i| i["author"] == "Борис"), "{by_b}");
+    let r = list(format!("/api/v1/cache?solution={G}&author=мусор")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
     for c in [&own, &borisa] {
         let r =
             w.a.tok(&w.a_tok, Method::GET, &format!("/api/v1/cache/{c}"), None)

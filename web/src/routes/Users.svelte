@@ -1,8 +1,8 @@
 <script lang="ts">
   // Администрирование → «Пользователи»: пользователи, их токены и пароль входа в WebUI
   // (§11.4: пароль задаёт администратор, при первом входе пользователь обязан его сменить).
+  // Новый пользователь или токен — сразу «Подключение агента» (§15.5) с окном токена.
   import Prompt, { type Ask } from '../components/Prompt.svelte';
-  import TokenShown from '../components/TokenShown.svelte';
   import {
     ApiError,
     clearUserPassword,
@@ -13,10 +13,10 @@
     revokeToken,
     setUserPassword,
     type Access,
-    type IssuedToken,
     type TokenInfo,
     type User,
   } from '../lib/api';
+  import { openAgentSetup } from '../lib/agentSetup';
 
   let { onExpired }: { onExpired: () => void } = $props();
 
@@ -28,7 +28,6 @@
   let tokenAccess = $state<Access>('rw');
   let error = $state('');
   let notice = $state('');
-  let shown = $state<IssuedToken | null>(null);
   let ask = $state<Ask | null>(null);
 
   // 401/403 означает потерю сессии, остальные ошибки показываем.
@@ -59,17 +58,16 @@
     return guard(async () => {
       const r = await createUser(newName);
       newName = '';
-      shown = r.token;
-      await reload();
+      openAgentSetup(r.user.id, r.token);
     });
   }
 
   function addToken(e: SubmitEvent, userId: string) {
     e.preventDefault();
     return guard(async () => {
-      shown = await issueToken(userId, tokenName, tokenAccess);
+      const t = await issueToken(userId, tokenName, tokenAccess);
       tokenName = '';
-      await reload();
+      openAgentSetup(userId, t);
     });
   }
 
@@ -198,7 +196,6 @@
   </table>
 </section>
 
-<TokenShown bind:shown />
 <Prompt bind:ask />
 
 <style>

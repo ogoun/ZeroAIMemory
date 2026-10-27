@@ -581,6 +581,8 @@ export interface Entry {
   deleted_at: string | null;
   /** У insight в `GET`/`PATCH`. */
   triggers?: Trigger[];
+  /** У insight в `GET /entries/{id}` и в списке: показы подсказками и оценки (§10.5). */
+  usage?: UsageCounts;
 }
 
 export interface EntryQuery {
@@ -800,13 +802,183 @@ export const revokeAccess = (guid: string, user: string) =>
 
 // ---- настройки сервера (администратор) ----
 
+/** Агент блока инструкции (§15.5): Claude Code, AGENTS.md (Codex, Cursor и др.), Codex с хуками. */
+export type AgentKind = 'claude' | 'agents' | 'codex';
+export type Lang = 'ru' | 'en';
+export const AGENT_KINDS: AgentKind[] = ['claude', 'agents', 'codex'];
+export const LANGS: Lang[] = ['ru', 'en'];
+
 export interface Settings {
   rules: { agent_write: boolean };
+  /** Шаблоны блока инструкции: ключ `<agent>.<lang>`, `custom` — свой (не по умолчанию). */
+  agent_setup: { version: number; templates: Record<string, { text: string; custom: boolean }> };
 }
 
 export const getSettings = () => call<Settings>('GET', 'admin/settings');
 export const setAgentWrite = (on: boolean) =>
   call<Settings>('PATCH', 'admin/settings', { rules: { agent_write: on } });
+/** Сохранить шаблон (`text`) или сбросить к умолчанию (`null`); версия растёт, если текст изменился. */
+export const saveTemplate = (key: string, text: string | null) =>
+  call<Settings>('PATCH', 'admin/settings', { agent_setup: { templates: { [key]: text } } });
+
+export interface TemplatePreview {
+  block: string;
+  tokens: number;
+  warnings: string[];
+  version: number;
+  /** Версия после сохранения (равна `version`, если текст не меняется). */
+  version_next: number;
+}
+
+/** Предпросмотр несохранённого шаблона (с примером решения). */
+export const previewTemplate = (agent: AgentKind, lang: Lang, template: string) =>
+  call<TemplatePreview>('POST', 'admin/agent-setup/preview', { agent, lang, template });
+
+// ---- подключение агента (§15.5) ----
+
+export interface AgentSetupQuery {
+  agent: AgentKind;
+  /** `auto` — агент создаст сам (`zam init`), `new` — новый GUID, иначе GUID решения. */
+  solution: string;
+  name?: string;
+  mcp: boolean;
+  hooks: boolean;
+  /** `undefined` — по настройке сервера `rules.agent_write`. */
+  rulesWrite?: boolean;
+  lang: Lang;
+  /** Открытый текст только что выпущенного токена (только сессия WebUI). */
+  token?: string;
+}
+
+export interface AgentSetup {
+  version: number;
+  agent: AgentKind;
+  lang: Lang;
+  url: string;
+  block: string;
+  tokens: number;
+  tokens_exact: boolean;
+  warnings: string[];
+  template_custom: boolean;
+  solution?: { agent_solution_id: string; name: string };
+  solution_toml?: string;
+  mcp_json?: unknown;
+  claude_settings?: unknown;
+  codex_hooks?: unknown;
+  install: { windows: string; linux: string };
+  init_cmd: { linux: string; windows: string };
+}
+
+/** `GET /agent-setup`; администратор — для пользователя `user` (`X-Zam-User`). */
+export function agentSetup(f: AgentSetupQuery, user?: string) {
+  const p = new URLSearchParams({
+    agent: f.agent,
+    solution: f.solution,
+    mcp: String(f.mcp),
+    hooks: String(f.hooks),
+    lang: f.lang,
+  });
+  if (f.name) p.set('name', f.name);
+  if (f.rulesWrite !== undefined) p.set('rules_write', String(f.rulesWrite));
+  if (f.token) p.set('token', f.token);
+  return call<AgentSetup>('GET', `agent-setup?${p}`, undefined, user);
+}
+
+// ---- настройки пользователя: типы подсказок хуков (§10.3, R5) ----
+
+export type HookKind = 'session_start' | 'prompt' | 'pre_tool' | 'post_tool' | 'checkpoint';
+export const HOOK_KINDS: HookKind[] = ['session_start', 'prompt', 'pre_tool', 'post_tool', 'checkpoint'];
+export type HookFlags = Record<HookKind, boolean>;
+
+/** Свои настройки (`own`) или пользователя `userId` (администратор). */
+const settingsPath = (userId: string | null) =>
+  userId ? `admin/users/${q(userId)}/settings` : 'auth/settings';
+export const getUserSettings = (userId: string | null) =>
+  call<{ hooks: HookFlags }>('GET', settingsPath(userId));
+export const setUserHooks = (userId: string | null, hooks: Partial<HookFlags>) =>
+  call<{ hooks: HookFlags }>('PATCH', settingsPath(userId), { hooks });
+
+// ---- кэш выжимок (§9.4, §15.4) ----
+
+export interface CacheSource {
+  /** `n:<id>` | `e:<id>`. */
+  id: string;
+  rev: number;
+  section: string | null;
+}
+
+export interface CacheStale {
+  target: string;
+  section?: string;
+  /** `changed` | `deleted` | `superseded` | `retracted` | `new_sources`. */
+  reason: string;
+}
+
+export interface CacheItem {
+  id: string;
+  ref: string;
+  query: string;
+  summary: string;
+  tokens: number;
+  state: 'valid' | 'stale';
+  stale: CacheStale[];
+  sources: CacheSource[];
+  author_user_id: string;
+  author: string | null;
+  session_id: string | null;
+  machine: string | null;
+  area: string | null;
+  created_at: string;
+  last_used_at: string;
+  hits: number;
+  promoted_to: string | null;
+  space_id: string;
+  space?: string;
+  agent_solution_id?: string;
+  /** Ответ `promote`: созданная заметка или запись. */
+  promoted?: unknown;
+}
+
+export interface CacheQuery {
+  q?: string;
+  solution?: string;
+  state?: 'valid' | 'stale';
+  author?: string;
+  limit?: number;
+}
+
+/** Выжимки личной базы или решения `solution`; администратор — пользователя `user`. */
+export function listCache(f: CacheQuery, user?: string) {
+  const p = new URLSearchParams();
+  if (f.q) p.set('q', f.q);
+  if (f.solution) p.set('solution', f.solution);
+  if (f.state) p.set('state', f.state);
+  if (f.author) p.set('author', f.author);
+  if (f.limit) p.set('limit', String(f.limit));
+  return call<{ items: CacheItem[] }>('GET', `cache?${p}`, undefined, user);
+}
+export const getCache = (id: string, user?: string) =>
+  call<CacheItem>('GET', `cache/${q(id)}`, undefined, user);
+export const deleteCache = (id: string, user?: string) =>
+  call<void>('DELETE', `cache/${q(id)}`, undefined, user);
+/** «Превратить в заметку» (`path` — по умолчанию `Выжимки/<запрос>`) или в insight. */
+export const promoteCache = (
+  id: string,
+  to: { as: 'note'; path?: string } | { as: 'insight'; kind?: string },
+  user?: string,
+) => call<CacheItem>('POST', `cache/${q(id)}/promote`, to, user);
+
+// ---- оценки и показы записей (§10.5) ----
+
+export interface UsageCounts {
+  shown: number;
+  useful: number;
+  useless: number;
+}
+
+/** Оценка полезности записи; из WebUI сервер пишет источник `webui`. */
+export const entryFeedback = (user: string, id: string, value: 'useful' | 'useless') =>
+  call<void>('POST', `entries/${q(id)}/feedback`, { value }, user);
 
 // ---- понятные сообщения об ошибках (RFC 9457) ----
 

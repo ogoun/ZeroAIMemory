@@ -7,7 +7,14 @@
 //!          solution_toml?, solution?, mcp_json?, claude_settings?, codex_hooks?,
 //!          install: {windows, linux}, init_cmd: {linux, windows}}
 //! GET /agent-guide?lang=ru|en → 200 text/markdown (полный протокол §9.3, §14)
+//! POST /admin/agent-setup/preview {agent, lang, template}
+//!   → 200 {block, tokens, warnings, version, version_next}
 //! ```
+//!
+//! - `preview` (администратор, «Настройки → Шаблон инструкции», задача 13) — блок из
+//!   несохранённого шаблона с подстановками для примера решения: проверка — как у
+//!   `PATCH /admin/settings` (400 с причиной), `version_next` — версия после сохранения
+//!   (`version`, если текст совпадает с действующим).
 //!
 //! - Доступ — токен (любой, `ro` тоже) или администратор WebUI. `token=` — только
 //!   администратору: открытый текст только что выпущенного токена для `install` и `init_cmd`;
@@ -32,7 +39,7 @@ use super::query;
 use super::scope::RULES_AGENT_WRITE;
 use crate::agent_setup::{self, AgentKind, BlockCtx, InitCmd, Lang, SolutionRef};
 use crate::app::AppState;
-use crate::auth::{Client, Principal, target_user_id};
+use crate::auth::{AdminOnly, Client, Principal, target_user_id};
 use crate::error::ApiError;
 
 /// Имя решения без указания.
@@ -241,6 +248,76 @@ pub async fn setup(
         }
     }
     Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewReq {
+    agent: Option<String>,
+    lang: Option<String>,
+    template: String,
+}
+
+/// Решение примера в предпросмотре шаблона.
+const PREVIEW_SOLUTION_GUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// `POST /admin/agent-setup/preview` — блок из несохранённого шаблона.
+pub async fn preview(
+    _: AdminOnly,
+    State(st): State<AppState>,
+    client: Client,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let req: PreviewReq = super::parse_body(&body)?;
+    let agent = parse_agent(req.agent.as_deref())?;
+    let lang = parse_lang(req.lang.as_deref())?;
+    let template = agent_setup::validate_template(&req.template)
+        .map_err(|e| ApiError::BadRequest(format!("template: {e}")))?;
+    let url = public_url(&st, &headers, client)?;
+    let rules_write = st
+        .system
+        .get_setting::<bool>(RULES_AGENT_WRITE)
+        .await?
+        .unwrap_or(false);
+    let version = agent_setup::current_version(&st.system).await?;
+    let (current, _) = agent_setup::template(&st.system, agent, lang).await?;
+    let version_next = if current == template {
+        version
+    } else {
+        version.saturating_add(1)
+    };
+    let example = SolutionRef {
+        guid: PREVIEW_SOLUTION_GUID.into(),
+        name: match lang {
+            Lang::Ru => "Пример".into(),
+            Lang::En => "Example".into(),
+        },
+    };
+    let block = agent_setup::render_block(
+        &template,
+        version_next,
+        &BlockCtx {
+            url: &url,
+            solution: Some(&example),
+            rules_write,
+            lang,
+        },
+    );
+    let tokens = zam_store::count_tokens(&block);
+    let mut warnings = Vec::new();
+    if tokens > BLOCK_TOKENS_MAX {
+        warnings.push(format!(
+            "блок — {tokens} токенов, больше {BLOCK_TOKENS_MAX}: сократите шаблон"
+        ));
+    }
+    Ok(Json(json!({
+        "block": block,
+        "tokens": tokens,
+        "warnings": warnings,
+        "version": version,
+        "version_next": version_next,
+    })))
 }
 
 #[derive(Deserialize)]

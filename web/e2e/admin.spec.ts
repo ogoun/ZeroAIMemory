@@ -47,6 +47,8 @@ test('администратор: вход, пользователь, токен
   const user = `e2e-${Date.now()}`;
   await page.getByPlaceholder('Имя нового пользователя').fill(user);
   await page.getByRole('button', { name: 'Создать' }).click();
+  // новый пользователь — сразу «Подключение агента» с окном токена (§15.5)
+  await expect(page).toHaveURL(/#\/agent-setup$/);
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();
   const field = dialog.getByLabel('Токен');
@@ -68,6 +70,8 @@ test('администратор: вход, пользователь, токен
 
   await dialog.getByRole('button', { name: 'Закрыть' }).click();
   await expect(dialog).toBeHidden();
+  await expect(page.getByLabel('Пользователь')).toHaveValue(/.+/);
+  await page.getByRole('link', { name: 'Администрирование' }).click();
 
   // Выпуск ro-токена
   const row = page.getByRole('row').filter({ hasText: user });
@@ -76,10 +80,13 @@ test('администратор: вход, пользователь, токен
   await page.getByLabel('Доступ').selectOption('ro');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   await expect(dialog).toBeVisible();
+  await expect(page).toHaveURL(/#\/agent-setup$/);
   const ro = await dialog.getByLabel('Токен').inputValue();
   expect(ro).toMatch(/^zam_/);
   expect(ro).not.toBe(plaintext);
   await dialog.getByRole('button', { name: 'Закрыть' }).click();
+  await page.getByRole('link', { name: 'Администрирование' }).click();
+  await row.getByRole('button', { name: 'Токены' }).click();
 
   // Внутренняя строка таблицы токенов (внешняя строка-контейнер тоже содержит этот текст).
   const roRow = page.getByRole('row', { name: /^e2e-ro / });

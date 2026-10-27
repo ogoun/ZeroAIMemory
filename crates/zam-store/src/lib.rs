@@ -103,6 +103,7 @@ pub use system::{
 };
 pub use usage::{
     UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, record_usages, usage_counts,
+    usage_counts_many,
 };
 pub use user_db::{
     RechunkNotice, RechunkProgress, RechunkReason, Space, SpaceKind, USER_MIGRATIONS, UserDbs,

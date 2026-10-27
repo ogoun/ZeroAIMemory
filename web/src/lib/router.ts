@@ -6,6 +6,7 @@
 // - `#/admin/solutions` — реестр решений и запросы доступа; `#/admin/settings` — настройки;
 // - `#/account` — свой аккаунт (смена пароля, свои токены); `#/my/solutions` — «Мои решения»:
 //   доступ к своим решениям (у пользователя, не администратора, §15.1);
+// - `#/agent-setup` — «Подключение агента» (§15.5); `#/cache` — «Кэш выжимок» (§15.4);
 // - `#/u/<user_id>` — пространства пользователя;
 // - `#/u/<user_id>/s/<space_ref>/n/<node_id>[#<якорь>]` — документ, якорь — `id`
 //   элемента в percent-encoding (как в href вики-ссылок сервера: `#/n/<id>#h-<slug>`);
@@ -25,6 +26,8 @@ export type Route =
   | { name: 'settings' }
   | { name: 'account' }
   | { name: 'mysolutions' }
+  | { name: 'agentsetup' }
+  | { name: 'cache' }
   | { name: 'journal'; user: string; space: string; journal: Journal; entry: string | null }
   | { name: 'home'; user: string | null }
   | { name: 'node'; user: string; space: string; node: string; anchor: string | null };
@@ -51,6 +54,8 @@ export function parse(hash: string): Route {
   const parts = h.split('/').filter((p) => p !== '');
   if (parts.length === 1 && parts[0] === 'admin') return { name: 'admin' };
   if (parts.length === 1 && parts[0] === 'account') return { name: 'account' };
+  if (parts.length === 1 && parts[0] === 'agent-setup') return { name: 'agentsetup' };
+  if (parts.length === 1 && parts[0] === 'cache') return { name: 'cache' };
   if (parts.length === 2 && parts[0] === 'my' && parts[1] === 'solutions') return { name: 'mysolutions' };
   if (parts.length === 2 && parts[0] === 'admin') {
     if (parts[1] === 'index') return { name: 'index' };
@@ -93,6 +98,10 @@ export function href(r: Route): string {
       return '#/account';
     case 'mysolutions':
       return '#/my/solutions';
+    case 'agentsetup':
+      return '#/agent-setup';
+    case 'cache':
+      return '#/cache';
     case 'journal':
       return (
         `#/u/${enc(r.user)}/s/${enc(r.space)}/j/${r.journal}` + (r.entry ? `/${enc(r.entry)}` : '')

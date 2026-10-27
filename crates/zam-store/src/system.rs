@@ -41,6 +41,10 @@ pub static SYSTEM_MIGRATIONS: &[Migration] = &[
         version: 6,
         sql: include_str!("../migrations/system/0006_user_passwords.sql"),
     },
+    Migration {
+        version: 7,
+        sql: include_str!("../migrations/system/0007_user_settings.sql"),
+    },
 ];
 
 /// База пользователя, исключённая из пересборки векторного индекса (`index_skipped`).
@@ -895,6 +899,74 @@ impl SystemStore {
                     params![version_key, next.to_string()],
                 )?;
                 Ok(Some((next, changed)))
+            })
+            .await
+    }
+
+    // ---- настройки пользователя (`user_settings`) ----
+
+    /// Сохранённые настройки пользователя: `(ключ, JSON)` по ключу. Отсутствующий ключ —
+    /// значение по умолчанию, его знает вызывающий.
+    pub async fn user_settings(
+        &self,
+        user: Id,
+    ) -> Result<Vec<(String, serde_json::Value)>, StoreError> {
+        let rows: Vec<(String, String)> = self
+            .db
+            .read(move |c| {
+                let mut st = c.prepare(
+                    "SELECT key, value FROM user_settings WHERE user_id = ?1 ORDER BY key",
+                )?;
+                Ok(st
+                    .query_map([user], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?)
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(k, v)| Ok((k, serde_json::from_str(&v).map_err(json_err)?)))
+            .collect()
+    }
+
+    /// Пишет настройки пользователя одной транзакцией; нет пользователя — `NotFound`.
+    /// Возвращает прежние значения изменённых ключей (`None` — не было строки); ключ, значение
+    /// которого не меняется, не пишется и не возвращается.
+    pub async fn set_user_settings(
+        &self,
+        user: Id,
+        edits: Vec<(String, serde_json::Value)>,
+    ) -> Result<Vec<(String, Option<serde_json::Value>)>, StoreError> {
+        self.db
+            .write(move |tx| {
+                let exists: Option<i64> = tx
+                    .query_row("SELECT 1 FROM users WHERE id = ?1", [user], |r| r.get(0))
+                    .optional()?;
+                if exists.is_none() {
+                    return Err(StoreError::NotFound);
+                }
+                let mut changed = Vec::new();
+                for (key, value) in edits {
+                    let old: Option<String> = tx
+                        .query_row(
+                            "SELECT value FROM user_settings WHERE user_id = ?1 AND key = ?2",
+                            params![user, key],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let old = old
+                        .map(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(json_err))
+                        .transpose()?;
+                    if old.as_ref() == Some(&value) {
+                        continue;
+                    }
+                    let json = serde_json::to_string(&value).map_err(json_err)?;
+                    tx.execute(
+                        "INSERT INTO user_settings (user_id, key, value) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+                        params![user, key, json],
+                    )?;
+                    changed.push((key, old));
+                }
+                Ok(changed)
             })
             .await
     }

@@ -1,9 +1,9 @@
 <script lang="ts">
   // «Аккаунт» (§11.4, §15.1): смена своего пароля и свои токены агентов (выпуск и отзыв
   // `rw`/`ro`). В режиме `forced` — только смена пароля, заданного администратором: до неё
-  // прочие разделы закрыты сервером (403 password-change-required).
+  // прочие разделы закрыты сервером (403 password-change-required). Новый токен — сразу
+  // «Подключение агента» (§15.5) с окном токена.
   import { onMount } from 'svelte';
-  import TokenShown from '../components/TokenShown.svelte';
   import {
     ApiError,
     changePassword,
@@ -12,10 +12,10 @@
     listOwnTokens,
     revokeOwnToken,
     type Access,
-    type IssuedToken,
     type Me,
     type TokenInfo,
   } from '../lib/api';
+  import { openAgentSetup } from '../lib/agentSetup';
   import { fmtTime } from '../lib/journals';
 
   let {
@@ -38,7 +38,6 @@
   let tokError = $state('');
   let tokenName = $state('');
   let tokenAccess = $state<Access>('rw');
-  let shown = $state<IssuedToken | null>(null);
 
   /** Ошибка до отправки: короткий пароль, повтор не совпал, тот же пароль. */
   let pwProblem = $derived(
@@ -84,9 +83,9 @@
     e.preventDefault();
     tokError = '';
     try {
-      shown = await issueOwnToken(tokenName, tokenAccess);
+      const t = await issueOwnToken(tokenName, tokenAccess);
       tokenName = '';
-      await loadTokens();
+      openAgentSetup(me.user_id, t);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return onexpired();
       tokError = errorText(err);
@@ -185,7 +184,6 @@
   </section>
 {/if}
 
-<TokenShown bind:shown />
 
 <style>
   .pw {

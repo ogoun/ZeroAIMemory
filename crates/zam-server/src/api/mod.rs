@@ -22,6 +22,7 @@ pub mod sessions;
 pub mod solutions;
 pub mod spaces;
 pub mod triggers;
+pub mod user_settings;
 pub mod vault;
 
 use axum::Router;
@@ -152,6 +153,10 @@ fn service_routes() -> Router<AppState> {
             get(user_auth::list_tokens).post(user_auth::issue_token),
         )
         .route("/api/v1/auth/tokens/{id}", delete(user_auth::revoke_token))
+        .route(
+            "/api/v1/auth/settings",
+            get(user_settings::get_own).patch(user_settings::patch_own),
+        )
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
         .route(
@@ -225,6 +230,10 @@ fn service_routes() -> Router<AppState> {
         )
         .route("/api/v1/agent-setup", get(agent_setup::setup))
         .route("/api/v1/agent-guide", get(agent_setup::guide))
+        .route(
+            "/api/v1/admin/agent-setup/preview",
+            post(agent_setup::preview),
+        )
         // клиент `zam` для установки — без аутентификации (§15.5)
         .route("/downloads/zam/{platform}", get(downloads::zam))
         .route("/api/v1/index/status", get(index::status))
@@ -244,6 +253,10 @@ fn service_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{id}/password",
             post(admin::set_password).delete(admin::clear_password),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/settings",
+            get(user_settings::get_user).patch(user_settings::patch_user),
         )
         .route("/api/v1/admin/tokens/{id}", delete(admin::revoke_token))
         .route("/api/v1/admin/audit", get(admin::list_audit))

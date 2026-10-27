@@ -592,3 +592,67 @@ async fn downloads_zam_serves_binary_or_404() {
     std::fs::remove_file(dir.join("downloads").join(other).join(other_file)).unwrap();
     assert_eq!(a.send(get(other)).await.status, StatusCode::NOT_FOUND);
 }
+
+/// Предпросмотр несохранённого шаблона (задача 13): блок с маркером следующей версии,
+/// проверка как у сохранения, только администратор.
+#[tokio::test]
+async fn template_preview_renders_unsaved() {
+    let a = api("agent-setup-preview", |_| {}).await;
+    let preview = |body: Value| {
+        let a = &a;
+        async move {
+            let b = common::api::req(
+                Method::POST,
+                "/api/v1/admin/agent-setup/preview",
+                Some(&body),
+            )
+            .header("cookie", &a.cookie)
+            .header("x-csrf-token", &a.csrf)
+            .header(HOST.0, HOST.1);
+            a.send(b.body(Body::from(body.to_string())).unwrap()).await
+        }
+    };
+    let r = preview(json!({"agent": "claude", "lang": "ru",
+                           "template": "Память: {url}\nРешение: {solution}.\r\n"}))
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["version"], 2);
+    assert_eq!(j["version_next"], 3);
+    assert_eq!(
+        j["block"],
+        "<!-- zeroaimemory:begin v3 -->\nПамять: http://memory.lan:7700\n\
+         Решение: «Пример» (`00000000-0000-0000-0000-000000000000`).\n\
+         <!-- zeroaimemory:end -->\n"
+    );
+    assert!(j["tokens"].as_u64().unwrap() > 0);
+    // шаблон по умолчанию без изменений — версия та же
+    let s = a
+        .adm(Method::GET, "/api/v1/admin/settings", None, None)
+        .await
+        .json();
+    let def = s["agent_setup"]["templates"]["claude.ru"]["text"].clone();
+    let r = preview(json!({"agent": "claude", "lang": "ru", "template": def})).await;
+    assert_eq!(r.json()["version_next"], 2, "{}", r.text());
+    // проверка — как у сохранения; версия не меняется
+    let r = preview(json!({"agent": "claude", "lang": "ru", "template": "без адреса"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = preview(json!({"agent": "nope", "template": "{url}"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let s = a
+        .adm(Method::GET, "/api/v1/admin/settings", None, None)
+        .await
+        .json();
+    assert_eq!(s["agent_setup"]["version"], 2);
+    // токен — 403
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/admin/agent-setup/preview",
+            Some(json!({"template": "{url}"})),
+            &[HOST],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+}
