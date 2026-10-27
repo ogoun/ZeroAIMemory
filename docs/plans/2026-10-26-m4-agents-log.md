@@ -184,6 +184,12 @@ Spec: [docs/specs/2026-10-17-zeroaimemory-tz.md](../specs/2026-10-17-zeroaimemor
 - **M1 — `zam mcp` отвечает не по порядку** (до 16 запросов параллельно; JSON-RPC это допускает) — только документация: README-install, ТЗ §13.1.
 - **AXIOM — `zam log insight --certainty` без `axiom`.** Добавлен `axiom` (и в `insight supersede`) с обязательной непустой `--reason`; без неё CLI отказывает сам, код 6, до чтения stdin и запросов; причина уходит `message` первой ревизии.
 - **Проверки.** `cargo test -p zam-cli` (unit: `target::entry_refs`, `parse_forms`, `insight::axiom_requires_reason`; `tests/notes.rs` — `solution_toml_scopes_write_and_search` со сценарием стенда, `tests/insights.rs` — `log_axiom_with_reason_and_read_refs`), `zam-server` lib (`logging::*`, `tests::*` первого токена, `section_slice_cases`), `tests/boot.rs` — `non_tty_stderr_puts_initial_token_into_file`; fmt, clippy `-D warnings`.
+- **Fix round 1 (ревью, решения контроллера).**
+  - I-1 — `set_user_disabled(true)` удаляет веб-сессии пользователя в той же транзакции (мягкое удаление — тот же вызов): после отключения и включения старая cookie — 401. Тесты `reenabled_user_old_cookie_401`, `deleted_user_cookie_401`, `disabling_user_closes_sessions` (store).
+  - I-2 — неизвестный логин сверяется с отдельным фиктивным хэшем `user_dummy_hash` (`Argon2::default()`, как пароли пользователей; один раз при старте); фиктивный хэш с параметрами администратора больше не нужен и удалён (`make_dummy_hash`, `AuthState::new()` без аргумента). Unit `user_dummy_hash_has_user_password_params`.
+  - M-1 — неизвестный логин: аудит `auth.login.failed {}`; неверный пароль администратора — по-прежнему `admin_login_failed`. Тесты `auth.rs` поправлены.
+  - M-3 — `POST /admin/users/{id}/password` пользователю с именем, совпадающим (без учёта регистра) с `[admin] login`, — 409 с пояснением. Тест `password_for_admin_login_name_409`.
+  - M-5 — `USER_COLS` без лишних пробелов. M-2 — правило сравнения логина (`to_lowercase`, без case folding и NFC) — в ТЗ §11.4.
 
 ## Решения владельца (M4)
 

@@ -306,9 +306,10 @@ async fn wrong_login_or_password_same_401_and_audited() {
     assert!(r1.headers().get(header::SET_COOKIE).is_none());
     assert_eq!(body_json(r1).await, body_json(r2).await);
     let a = audit_actions(&st).await;
+    // неверный пароль администратора и неизвестный логин (§11.4, fix round 1 задачи 12 M4)
     let failed: Vec<_> = a
         .iter()
-        .filter(|r| r.action == "admin_login_failed")
+        .filter(|r| r.action == "admin_login_failed" || r.action == "auth.login.failed")
         .collect();
     assert_eq!(failed.len(), 2);
     for row in failed {
@@ -480,11 +481,19 @@ async fn failed_login_audit_has_no_entered_login() {
     );
     let failed: Vec<_> = rows
         .iter()
-        .filter(|r| r.action == "admin_login_failed")
-        .map(|r| r.details["login_matches"].as_bool().unwrap())
+        .filter(|r| r.action == "admin_login_failed" || r.action == "auth.login.failed")
+        .map(|r| r.action.as_str())
         .collect();
-    // новые первыми
-    assert_eq!(failed, [true, false]);
+    // новые первыми: неверный пароль администратора, затем неизвестный логин
+    assert_eq!(failed, ["admin_login_failed", "auth.login.failed"]);
+    let unknown = rows
+        .iter()
+        .find(|r| r.action == "auth.login.failed")
+        .unwrap();
+    assert_eq!(
+        (unknown.user_id, &unknown.details),
+        (None, &serde_json::json!({}))
+    );
 }
 
 #[test]

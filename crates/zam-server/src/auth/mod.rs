@@ -33,20 +33,20 @@ pub struct AuthState {
     pub login: RateLimiter,
     /// Только неудачные проверки токена.
     pub bad_token: RateLimiter,
-    /// Фиктивный хэш для неизвестного логина: с параметрами хэша администратора, вычисляется
-    /// при старте (пароли пользователей — параметры по умолчанию, как у `hash-password`).
-    pub(crate) dummy_hash: String,
+    /// Фиктивный хэш для неизвестного логина пользователя: с параметрами паролей пользователей
+    /// (`Argon2::default()`, [`crate::config::hash_password`]), вычисляется при старте.
+    pub(crate) user_dummy_hash: String,
     /// Предупреждение о недоверенном прокси уже выдано.
     proxy_warned: AtomicBool,
 }
 
 impl AuthState {
     /// Блокирующий вызов (argon2): выполнять в `spawn_blocking`.
-    pub fn new(admin_hash: &str) -> Result<AuthState, String> {
+    pub fn new() -> Result<AuthState, String> {
         Ok(AuthState {
             login: RateLimiter::default(),
             bad_token: RateLimiter::default(),
-            dummy_hash: admin::make_dummy_hash(admin_hash)?,
+            user_dummy_hash: user::make_user_dummy_hash()?,
             proxy_warned: AtomicBool::new(false),
         })
     }

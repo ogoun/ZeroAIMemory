@@ -344,3 +344,22 @@ async fn user_password_and_sessions() {
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound), "{err:?}");
 }
+
+#[tokio::test]
+async fn disabling_user_closes_sessions() {
+    let (_dd, s) = store("disable-sessions").await;
+    let u = s.create_user("vera", false).await.unwrap();
+    let other = s.create_user("gleb", false).await.unwrap();
+    let (a, _) = s.create_user_session(None, u.id).await.unwrap();
+    let (b, _) = s.create_user_session(None, other.id).await.unwrap();
+    let (adm, _) = s.create_web_session(None).await.unwrap();
+    s.set_user_disabled(u.id, true).await.unwrap();
+    s.set_user_disabled(u.id, false).await.unwrap();
+    assert!(s.get_web_session(&a).await.unwrap().is_none());
+    assert!(s.get_web_session(&b).await.unwrap().is_some());
+    assert!(s.get_web_session(&adm).await.unwrap().is_some());
+    // включение сессии не закрывает
+    let (c, _) = s.create_user_session(None, u.id).await.unwrap();
+    s.set_user_disabled(u.id, false).await.unwrap();
+    assert!(s.get_web_session(&c).await.unwrap().is_some());
+}

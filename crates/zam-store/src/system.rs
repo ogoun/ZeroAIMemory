@@ -170,7 +170,8 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
     })
 }
 
-const USER_COLS: &str = "id, name, is_admin, created_at, disabled_at,      password_hash IS NOT NULL, must_change_password";
+const USER_COLS: &str =
+    "id, name, is_admin, created_at, disabled_at, password_hash IS NOT NULL, must_change_password";
 
 fn token_row(r: &Row) -> rusqlite::Result<TokenInfo> {
     Ok(TokenInfo {
@@ -317,6 +318,11 @@ impl SystemStore {
                 )?;
                 if n == 0 {
                     return Err(StoreError::NotFound);
+                }
+                // отключение (и мягкое удаление) закрывает веб-сессии пользователя сразу:
+                // повторное включение не оживляет старую cookie
+                if disabled {
+                    tx.execute("DELETE FROM web_sessions WHERE user_id = ?1", [id])?;
                 }
                 Ok(())
             })

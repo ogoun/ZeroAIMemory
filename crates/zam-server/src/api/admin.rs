@@ -370,6 +370,14 @@ async fn password_target(st: &AppState, id: &str) -> Result<User, ApiError> {
             "пароль администратора задаётся в конфигурации сервера (zam-server hash-password)",
         ));
     }
+    // вход проверяет администратора первым: с таким именем пользователь войти не сможет
+    if user.name.to_lowercase() == st.cfg.admin.login.to_lowercase() {
+        return Err(ApiError::conflict(format!(
+            "имя пользователя «{}» совпадает с логином администратора: вход под ним — \
+             администратора; переименуйте пользователя",
+            user.name
+        )));
+    }
     Ok(user)
 }
 

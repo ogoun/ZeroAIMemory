@@ -155,7 +155,7 @@ async fn user_login_and_me() {
         "user.password.set",
         "auth.login.user",
         "auth.login.user_failed",
-        "admin_login_failed",
+        "auth.login.failed",
     ] {
         assert!(acts.contains(&want), "{want}: {acts:?}");
     }
@@ -965,5 +965,74 @@ async fn login_rate_limit_shared_with_admin() {
     ok(
         &login(&a, "nina", PASS, ip).await,
         StatusCode::TOO_MANY_REQUESTS,
+    );
+}
+
+#[tokio::test]
+async fn reenabled_user_old_cookie_401() {
+    let a = api("ul-reenable", |_| {}).await;
+    let (uid, _, w) = ready_user(&a, "olga", "10.14.0.1").await;
+    let patch = |d: bool| json!({ "disabled": d });
+    let uri = format!("/api/v1/admin/users/{uid}");
+    ok(
+        &a.adm(Method::PATCH, &uri, Some(patch(true)), None).await,
+        StatusCode::OK,
+    );
+    ok(
+        &a.adm(Method::PATCH, &uri, Some(patch(false)), None).await,
+        StatusCode::OK,
+    );
+    // сессия закрыта при отключении: включение её не оживляет
+    ok(
+        &web(&a, &w, Method::GET, "/api/v1/spaces", None).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    // новый вход — работает
+    let w2 = login_ok(&a, "olga", NEW_PASS, "10.14.0.2").await;
+    ok(
+        &web(&a, &w2, Method::GET, "/api/v1/spaces", None).await,
+        StatusCode::OK,
+    );
+}
+
+#[tokio::test]
+async fn deleted_user_cookie_401() {
+    let a = api("ul-deleted", |_| {}).await;
+    let (uid, _, w) = ready_user(&a, "pavel", "10.15.0.1").await;
+    let r = a
+        .adm(
+            Method::DELETE,
+            &format!("/api/v1/admin/users/{uid}"),
+            None,
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::NO_CONTENT);
+    ok(
+        &web(&a, &w, Method::GET, "/api/v1/auth/me", None).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    let n =
+        a.st.system
+            .get_web_session(w.cookie.trim_start_matches("zam_session="))
+            .await
+            .unwrap();
+    assert!(n.is_none());
+}
+
+#[tokio::test]
+async fn password_for_admin_login_name_409() {
+    let a = api("ul-adminname", |_| {}).await;
+    // администратор входит логином «admin»; пользователь «ADMIN» войти не смог бы
+    let (uid, _) = a.new_user("ADMIN").await;
+    let r = set_pw(&a, &uid, PASS).await;
+    ok(&r, StatusCode::CONFLICT);
+    assert!(
+        r.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("логином администратора"),
+        "{}",
+        r.text()
     );
 }

@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use zam_core::Id;
+use zam_core::{Id, generate_token};
 use zam_store::User;
 
 use super::rate::retry_after_secs;
@@ -48,6 +48,12 @@ pub fn check_password(pw: &str) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+/// Фиктивный хэш случайного пароля с параметрами паролей пользователей (как у [`hash`]):
+/// неизвестный логин проверяется столько же, сколько известный.
+pub(crate) fn make_user_dummy_hash() -> Result<String, String> {
+    crate::config::hash_password(&generate_token().plaintext).map_err(|e| e.to_string())
 }
 
 /// argon2id пароля (блокирующий расчёт — в `spawn_blocking`).
@@ -93,7 +99,7 @@ pub(crate) async fn login(
     let cand = candidate(st, login).await?;
     let hash_s = match &cand {
         Some((_, h)) => h.clone(),
-        None => st.auth.dummy_hash.clone(),
+        None => st.auth.user_dummy_hash.clone(),
     };
     let verified = verify(hash_s, password).await?;
     let Some((user, _)) = cand else {
@@ -102,10 +108,10 @@ pub(crate) async fn login(
             .audit(
                 "anonymous",
                 None,
-                "admin_login_failed",
+                "auth.login.failed",
                 None,
                 Some(&ip),
-                json!({ "login_matches": false }),
+                json!({}),
             )
             .await?;
         return Err(ApiError::Unauthorized);
@@ -268,6 +274,24 @@ pub async fn revoke_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_dummy_hash_has_user_password_params() {
+        use argon2::password_hash::PasswordHash;
+        let real = crate::config::hash_password("пароль-пользователя").unwrap();
+        let dummy = make_user_dummy_hash().unwrap();
+        let (r, d) = (
+            PasswordHash::new(&real).unwrap(),
+            PasswordHash::new(&dummy).unwrap(),
+        );
+        assert_eq!(r.algorithm, d.algorithm);
+        assert_eq!(r.version, d.version);
+        assert_eq!(
+            argon2::Params::try_from(&r).unwrap(),
+            argon2::Params::try_from(&d).unwrap()
+        );
+        assert!(!super::super::admin::verify(&dummy, "пароль-пользователя"));
+    }
 
     #[test]
     fn password_rules() {

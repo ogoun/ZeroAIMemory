@@ -1,7 +1,7 @@
 //! Вход в WebUI: `/auth/login` (администратор из конфигурации, затем пользователь — §11.4,
 //! [`super::user`]), `/auth/logout`, `/auth/me`.
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -10,7 +10,6 @@ use axum::response::{IntoResponse, Response};
 use cookie::{Cookie, SameSite};
 use serde::Deserialize;
 use serde_json::json;
-use zam_core::generate_token;
 
 use super::rate::retry_after_secs;
 use super::{Client, Principal, SESSION_COOKIE, Session, ct_eq};
@@ -38,22 +37,6 @@ fn session_cookie(st: &AppState, value: String, max_age_s: i64, secure: bool) ->
         .secure(secure)
         .build();
     HeaderValue::from_str(&c.to_string()).expect("cookie из безопасных символов")
-}
-
-/// Хэш случайного пароля с параметрами настоящего: проверка по нему длится столько же.
-pub(crate) fn make_dummy_hash(real: &str) -> Result<String, String> {
-    let parsed = PasswordHash::new(real).map_err(|e| e.to_string())?;
-    let alg = Algorithm::try_from(parsed.algorithm).map_err(|e| e.to_string())?;
-    let ver = parsed
-        .version
-        .map_or(Ok(Version::V0x13), Version::try_from)
-        .map_err(|e| e.to_string())?;
-    let params = Params::try_from(&parsed).map_err(|e| e.to_string())?;
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
-    Argon2::new(alg, ver, params)
-        .hash_password(generate_token().plaintext.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn verify(hash: &str, password: &str) -> bool {
@@ -204,19 +187,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dummy_hash_uses_real_params() {
+    fn verify_checks_password() {
         let real = crate::config::hash_password("x").unwrap();
-        let d = make_dummy_hash(&real).unwrap();
-        let (pr, pd) = (
-            PasswordHash::new(&real).unwrap(),
-            PasswordHash::new(&d).unwrap(),
-        );
-        assert_eq!(pr.algorithm, pd.algorithm);
-        assert_eq!(
-            Params::try_from(&pr).unwrap(),
-            Params::try_from(&pd).unwrap()
-        );
-        assert!(!verify(&d, "x"));
         assert!(verify(&real, "x"));
+        assert!(!verify(&real, "y"));
+        assert!(!verify("не хэш", "x"));
     }
 }
