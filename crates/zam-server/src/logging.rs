@@ -25,13 +25,35 @@ where
     }
 }
 
-/// Директива поверх фильтра из конфигурации: `rmcp` на debug/trace пишет JSON-RPC целиком
-/// (тексты заметок, значения Vault, промпты), поэтому выше `warn` её не поднять (§13.1).
-const FORCED: &str = "rmcp=warn";
+/// Цель, которую нельзя поднять выше `warn`: `rmcp` на debug/trace пишет JSON-RPC целиком
+/// (тексты заметок, значения Vault, промпты) (§13.1).
+const CAPPED: &str = "rmcp";
 
-/// Фильтр журнала: `log.level` и принудительные директивы [`FORCED`].
+/// Директива относится к [`CAPPED`] или её подцели (`rmcp::service=debug`).
+fn is_capped(directive: &str) -> bool {
+    let target = directive.split(['=', '[']).next().unwrap_or("").trim();
+    target == CAPPED || target.starts_with("rmcp::")
+}
+
+/// Фильтр журнала: `log.level` без директив [`CAPPED`] и сверху `rmcp=<уровень>` — `warn`,
+/// а при общем `error`/`off` — он же (принудительная директива не повышает подробность).
 pub(crate) fn filter(level: &str) -> anyhow::Result<EnvFilter> {
-    Ok(EnvFilter::try_new(level)?.add_directive(FORCED.parse()?))
+    let rest: Vec<&str> = level
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !is_capped(d))
+        .collect();
+    let global = rest
+        .iter()
+        .rev()
+        .find(|d| !d.contains('=') && !d.contains('['))
+        .map(|d| d.to_ascii_lowercase());
+    let cap = match global.as_deref() {
+        Some("off") => "off",
+        Some("error") => "error",
+        _ => "warn",
+    };
+    Ok(EnvFilter::try_new(rest.join(","))?.add_directive(format!("{CAPPED}={cap}").parse()?))
 }
 
 /// Ставит глобальный subscriber. Guard нужно держать до конца процесса.
@@ -80,7 +102,14 @@ mod tests {
     /// `rmcp` выше `warn` не поднимается ни общим уровнем, ни своей директивой.
     #[test]
     fn rmcp_capped_at_warn() {
-        for level in ["trace", "debug", "info,rmcp=trace", "rmcp=debug"] {
+        for level in [
+            "trace",
+            "debug",
+            "info,rmcp=trace",
+            "rmcp=debug",
+            "info,rmcp::service=debug,rmcp::transport=trace",
+            "debug,rmcp::service[req]=trace",
+        ] {
             let buf = Buf::default();
             let w = buf.clone();
             let sub = tracing_subscriber::registry()
@@ -100,6 +129,23 @@ mod tests {
                 level.starts_with("trace") || level.starts_with("debug"),
                 "{level}: {out}"
             );
+        }
+    }
+
+    /// При общем `error`/`off` принудительная директива не добавляет warn-событий `rmcp`.
+    #[test]
+    fn rmcp_cap_does_not_raise_quiet_levels() {
+        for level in ["error", "off", "off,rmcp=debug"] {
+            let buf = Buf::default();
+            let w = buf.clone();
+            let sub = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(move || w.clone()))
+                .with(super::filter(level).unwrap());
+            tracing::subscriber::with_default(sub, || {
+                tracing::warn!(target: "rmcp::service", "rmcp-warn");
+            });
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(!out.contains("rmcp-warn"), "{level}: {out}");
         }
     }
 }

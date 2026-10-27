@@ -1250,10 +1250,9 @@ async fn vault_locate(rest: &Rest, args: &JsonObject) -> Result<Value, Fail> {
             Err(Fail::Problem {
                 status: StatusCode::CONFLICT,
                 detail: format!(
-                    "имени «{name}» без учёта регистра соответствуют несколько секретов —                      укажите точное имя или id:
-{}",
-                    list.join("
-")
+                    "имени «{name}» без учёта регистра соответствуют несколько секретов — \
+                     укажите точное имя или id:\n{}",
+                    list.join("\n")
                 ),
             })
         }
