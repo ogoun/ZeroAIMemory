@@ -60,6 +60,11 @@ rand.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
+[features]
+# Тестовые точки (заглушка реранкера `RerankSlot::install`) — только интеграционным тестам
+# пакета через dev-зависимость на себя; в сборке сервера и релизе их нет.
+test-hooks = []
+
 [build-dependencies]
 memory-serve.workspace = true
 
@@ -68,6 +73,8 @@ memory-serve.workspace = true
 zam-index = { path = "../zam-index", features = ["test-hooks"] }
 # задержка фоновой перенарезки при открытии базы (tests/index_rechunk.rs, ход `rechunk`)
 zam-store = { path = "../zam-store", features = ["test-hooks"] }
+# тестовые точки самого сервера (tests/search_rerank_boosts.rs)
+zam-server = { path = ".", features = ["test-hooks"] }
 zip.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true

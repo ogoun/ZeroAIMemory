@@ -6310,6 +6310,7 @@ dependencies = [
  "zam-markdown",
  "zam-ml",
  "zam-search",
+ "zam-server",
  "zam-store",
  "zeroize",
  "zip",

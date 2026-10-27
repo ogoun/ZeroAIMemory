@@ -170,7 +170,7 @@ async fn rechunk_notice_lists_changed_keys() {
         let _g = tracing::subscriber::set_default(sub);
         dbs.get(user).await.unwrap()
     };
-    let notice = dbs.opened_rechunk(user).await.expect("уведомление");
+    let notice = dbs.opened_rechunk(user).await.expect("уведомление").notice;
     assert_eq!(notice.reason, RechunkReason::Params);
     assert_eq!(
         notice.changed,
@@ -198,6 +198,9 @@ async fn rechunk_notice_lists_changed_keys() {
         None,
         "перенарезка закончилась"
     );
+    // `done` считает те же цели, что `total`: все живые заметки и записи
+    let fin = dbs.opened_rechunk(user).await.unwrap();
+    assert_eq!(fin.done, fin.notice.targets);
     // после перенарезки — текущие отпечаток и параметры
     assert_eq!(meta(&reopened, "chunker").await.unwrap(), fp);
     assert_eq!(
@@ -227,12 +230,13 @@ async fn rechunk_notice_for_m3_db_unknown() {
     set_meta(&db, "chunker_entries_params", None).await;
     let dbs = UserDbs::new(dd.users_dir());
     dbs.get(user).await.unwrap();
-    let notice = dbs.opened_rechunk(user).await.expect("уведомление");
+    let notice = dbs.opened_rechunk(user).await.expect("уведомление").notice;
     assert_eq!(notice.reason, RechunkReason::Unknown);
     // ключи восстановлены из отпечатка M3
     assert_eq!(notice.changed, vec!["chunk_boundary_lambda"]);
     assert_eq!(notice.targets, 3);
     dbs.wait_rechunk(user).await;
+    assert_eq!(dbs.opened_rechunk(user).await.unwrap().done, 3);
     let db = dbs.get(user).await.unwrap();
     assert!(
         meta(&db, "chunker_params").await.is_some(),
@@ -244,9 +248,10 @@ async fn rechunk_notice_for_m3_db_unknown() {
     set_meta(&db, "chunker_params", None).await;
     let dbs = UserDbs::new(dd.users_dir());
     dbs.get(user).await.unwrap();
-    let notice = dbs.opened_rechunk(user).await.expect("уведомление");
+    let notice = dbs.opened_rechunk(user).await.expect("уведомление").notice;
     assert_eq!(notice.reason, RechunkReason::Unknown);
     assert!(notice.changed.is_empty(), "{:?}", notice.changed);
     assert_eq!(notice.targets, 2, "перенарезаются только заметки");
     dbs.wait_rechunk(user).await;
+    assert_eq!(dbs.opened_rechunk(user).await.unwrap().done, 2);
 }

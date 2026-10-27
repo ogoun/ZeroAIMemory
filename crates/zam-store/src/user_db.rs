@@ -267,13 +267,14 @@ impl UserDbs {
             let bg = db.clone();
             tokio::spawn(async move {
                 if let (Some(plan), Some(run)) = (pending, run) {
+                    // «идёт» снимается и при панике задачи: баннер не повисает
+                    let _running = RunningGuard(run.clone());
                     #[cfg(feature = "test-hooks")]
                     crate::test_hooks::rechunk_gate().await;
                     if let Err(e) = rechunk_all(&bg, &plan, &run.done).await {
                         // повторится при следующем открытии базы
                         tracing::warn!(error = %e, reason = plan.why.as_str(), "перечанковка заметок прервана");
                     }
-                    run.running.store(false, Ordering::Relaxed);
                 }
                 if edges && let Err(e) = crate::graph::backfill_edges(&bg).await {
                     tracing::warn!(error = %e, "дозаполнение рёбер графа прервано");
@@ -302,12 +303,17 @@ impl UserDbs {
         }
     }
 
-    /// Уведомление о перенарезке при открытии базы `user` этим процессом (§8.2), идёт она
-    /// или уже закончилась: `None` — база не открыта или перенарезка не понадобилась.
-    pub async fn opened_rechunk(&self, user: Id) -> Option<RechunkNotice> {
+    /// Перенарезка при открытии базы `user` этим процессом (§8.2), идёт она или уже
+    /// закончилась: уведомление и сколько целей обработано (`done` без ограничения сверху —
+    /// по окончании равен `notice.targets`, если во время перенарезки цели не добавлялись).
+    /// `None` — база не открыта или перенарезка не понадобилась.
+    pub async fn opened_rechunk(&self, user: Id) -> Option<RechunkProgress> {
         let slot = self.open.lock().await.get(&user).cloned()?;
         let run = slot.lock().await.as_ref()?.rechunk.clone()?;
-        Some(run.notice.clone())
+        Some(RechunkProgress {
+            done: run.done.load(Ordering::Relaxed),
+            notice: run.notice.clone(),
+        })
     }
 
     /// Ход перенарезки базы `user`, начатой при её открытии этим процессом (§8.2): `None` —
@@ -323,6 +329,16 @@ impl UserDbs {
             done: run.done.load(Ordering::Relaxed).min(run.notice.targets),
             notice: run.notice.clone(),
         })
+    }
+}
+
+/// Снимает признак «перенарезка идёт» при выходе из фоновой задачи — в том числе при её
+/// панике или отмене.
+struct RunningGuard(Arc<RechunkRun>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1075,4 +1091,31 @@ pub async fn rename_solution_guid(
         Ok(())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Паника фоновой перенарезки снимает «идёт» (иначе баннер WebUI висел бы до перезапуска).
+    #[tokio::test]
+    async fn running_flag_cleared_on_panic() {
+        let run = Arc::new(RechunkRun {
+            notice: RechunkNotice {
+                reason: RechunkReason::Params,
+                changed: vec!["chunk_boundary_lambda".into()],
+                targets: 3,
+            },
+            done: AtomicU64::new(1),
+            running: AtomicBool::new(true),
+        });
+        let bg = run.clone();
+        let r = tokio::spawn(async move {
+            let _running = RunningGuard(bg);
+            panic!("сбой перенарезки");
+        })
+        .await;
+        assert!(r.is_err_and(|e| e.is_panic()));
+        assert!(!run.running.load(Ordering::Relaxed));
+    }
 }
