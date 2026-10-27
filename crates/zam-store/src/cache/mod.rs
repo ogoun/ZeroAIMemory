@@ -565,8 +565,8 @@ fn visible(h: &CacheHit, spaces: Option<&[Id]>) -> bool {
 
 /// Попадание в кэш (§9.4): выжимки пространства `space_id` с тем же `scope_hash` — точное
 /// совпадение `query_norm` или косинус `query_vec` не ниже порога; сначала текущей сессии
-/// (выжимки других — только при `cross_session`), затем точные, затем по косинусу; не больше
-/// `limit`. Источники выбранных сверяются одним SQL ([`CacheHit::stale`]); у выданных
+/// (выжимки других — только при `cross_session`), затем точные, затем по косинусу, при равенстве —
+/// свежие; не больше `limit`. Источники выбранных сверяются одним SQL ([`CacheHit::stale`]); у выданных
 /// обновляются `last_used_at` и `hits` (LRU).
 pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, StoreError> {
     let q = q.clone();
@@ -604,13 +604,14 @@ pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, Stor
             let mine = |c: &Candidate| {
                 q.session_id.is_some() && c.entry.session_id.as_deref() == q.session_id.as_deref()
             };
-            // §9.4: сначала текущая сессия, затем остальные; внутри — точные, затем свежие
+            // §9.4: сначала текущая сессия, затем остальные; внутри — точные, затем по косинусу,
+            // при равенстве — свежие
             cands.sort_by(|a, b| {
                 mine(b)
                     .cmp(&mine(a))
                     .then(b.exact.cmp(&a.exact))
-                    .then(b.entry.created_at.cmp(&a.entry.created_at))
                     .then(b.sim.total_cmp(&a.sim))
+                    .then(b.entry.created_at.cmp(&a.entry.created_at))
             });
             let mut out = Vec::new();
             // проверка — по кандидатам в порядке выдачи, пока не набрано `limit` видимых
