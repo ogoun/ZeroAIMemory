@@ -24,6 +24,9 @@ use zam_fetch::{MODEL_LICENSE_FILE, MODEL_SPEC_FILE};
 use crate::manifest::{CudaManifest, Manifest, ModelsManifest, PLATFORMS};
 
 const TOKEN_PREFIX: &str = "ZeroAIMemoryToken=";
+/// stderr сервера — канал, не терминал: первый токен лежит в файле, строка — путь к нему
+/// (`zam_server::INITIAL_TOKEN_FILE_LINE`).
+const TOKEN_FILE_PREFIX: &str = "ZeroAIMemoryTokenFile=";
 const WAIT: Duration = Duration::from_secs(10);
 /// Unix: предел выхода сервера по SIGTERM — ожидание подтверждения WAL Qdrant
 /// (`qdrant.shutdown_flush_wait_ms`, до 10 с), SIGTERM Qdrant (до 10 с) и запас 10 с.
@@ -209,6 +212,11 @@ impl Server {
                 if let Some(t) = line.strip_prefix(TOKEN_PREFIX) {
                     let _ = tx.send(t.trim().to_string());
                     continue;
+                }
+                if let Some(path) = line.strip_prefix(TOKEN_FILE_PREFIX)
+                    && let Ok(t) = std::fs::read_to_string(path.trim())
+                {
+                    let _ = tx.send(t.trim().to_string());
                 }
                 let _ = writeln!(file, "{line}");
                 if interesting(&line)
@@ -790,10 +798,10 @@ pub fn run(
         s.run("ожидание /api/v1/health", wait_health(&mut srv, &base))?;
     }
     let token = s.run(
-        "первый токен в stderr",
+        "первый токен (файл в каталоге данных)",
         srv.token_rx.recv_timeout(WAIT).map_err(|_| {
             anyhow!(
-                "строка {TOKEN_PREFIX}… не найдена; stderr:\n{}",
+                "строка {TOKEN_FILE_PREFIX}… (или {TOKEN_PREFIX}…) не найдена; stderr:\n{}",
                 srv.log_tail()
             )
         }),

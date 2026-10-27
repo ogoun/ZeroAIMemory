@@ -263,6 +263,78 @@ fn insight_certify_evidence_and_axiom() {
     );
 }
 
+/// Стенд Debian 13: `log insight --certainty axiom` — только с `--reason` (без неё код 6 до
+/// запроса); `zam read` принимает ссылки выдачи `i:<id>` и `n:<id>`, с пачкой и без (B2).
+#[test]
+fn log_axiom_with_reason_and_read_refs() {
+    let (url, tok) = start("axiom-refs");
+    let r = tmp("axiom-refs-repo");
+    let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
+    let base = [
+        "log",
+        "insight",
+        "--kind",
+        "decision",
+        "--title",
+        "Сборка только под musl",
+        "--scope",
+        "global",
+        "--certainty",
+        "axiom",
+    ];
+    // без --reason — отказ CLI, сервер не вызывается: недоступный адрес не мешает
+    let o = zam(
+        "http://127.0.0.1:9",
+        &tok,
+        &r,
+        &base,
+        "Пользователь: собираем zam только под musl.\n".as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    assert!(err(&o).contains("--reason"), "{}", err(&o));
+    let mut a = base.to_vec();
+    a.extend(["--reason", "пользователь продиктовал"]);
+    let o = z(
+        &a,
+        "Пользователь: собираем zam только под musl.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    assert_eq!(
+        json(&z(&["insight", "show", &id, "--json"], b""))["certainty"],
+        "axiom"
+    );
+
+    // ссылка записи из выдачи поиска: текст тела, с пачкой — карточка с текстом
+    let iref = format!("i:{id}");
+    let s = ok(&z(&["read", &iref], b""));
+    assert_eq!(s, "Пользователь: собираем zam только под musl.\n");
+    let s = ok(&z(&["read", &iref, "--tier", "L0"], b""));
+    assert_eq!(s, "Сборка только под musl\n");
+    let s = ok(&z(&["read", &iref, "--batch"], b""));
+    assert!(s.contains("только под musl.") && s.contains(&iref), "{s}");
+    let v = json(&z(&["read", &iref, "--json"], b""));
+    assert_eq!(v["certainty"], "axiom", "{v}");
+    let o = z(&["read", &iref, "--rev", "1"], b"");
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    let missing = format!("i:{}", zam_core::Id::new());
+    let o = z(&["read", &missing], b"");
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+
+    // ссылка узла n:<id>
+    let o = z(
+        &["write", "knowledge:Сборка"],
+        "# Сборка\nmusl\n".as_bytes(),
+    );
+    let node = id_of(&ok(&o));
+    let nref = format!("n:{node}");
+    assert_eq!(ok(&z(&["read", &nref], b"")), "# Сборка\nmusl\n");
+    let s = ok(&z(&["read", &nref, &iref, "--batch"], b""));
+    assert!(
+        s.contains("musl\n") && s.contains("только под musl."),
+        "{s}"
+    );
+}
+
 /// `certify` берёт `rev` из `GET /entries/{id}` и шлёт `If-Match` с ним.
 #[test]
 fn insight_certify_sends_if_match() {

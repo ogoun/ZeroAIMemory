@@ -2,13 +2,15 @@
 //! revisit|append|certify|feedback`.
 //!
 //! - `zam log insight --kind K --title T [--scope solution|global] [--certainty C]
-//!   [--evidence-file F] [--trigger TYPE:PATTERN]… [--tag X]… [--force] [--supersedes ID]
+//!   [--reason R] [--evidence-file F] [--trigger TYPE:PATTERN]… [--tag X]… [--force] [--supersedes ID]
 //!   [--area A] [--solution GUID] [--key K] [--body-file F | stdin]` — запись insight в решение
 //!   (`solution.toml` или `--solution`) или, при `--scope global`, в Knowledge. `--evidence-file`
 //!   — JSON-объект `{checked, method, result}` → `data.evidence`; `--trigger` —
 //!   `file_glob:**/*.sh`, `command_regex:…`, `error_regex:…`, `keyword:…` (без инструментов:
 //!   любые). Ответ 409 (похожий insight уже есть) печатает кандидатов и подсказки, код 4.
 //!   Успех → `<id>@<rev>`; проверка только по заголовку (нет модели) — пометка в stderr.
+//!   `--certainty axiom` — только по прямому указанию пользователя и только с `--reason`
+//!   (иначе код 6 до запроса); `--reason` уходит сообщением ревизии (`message`) (стенд M4).
 //! - `zam insight list [--status S,…] [--global] [--solution GUID] [--limit N]` — лента insight;
 //!   `show ID` — карточка с текстом и триггерами; `supersede ID --title T [--kind K] …` —
 //!   замещение (вид по умолчанию — у старой записи); `retract ID --reason R`; `revisit ID
@@ -43,6 +45,8 @@ pub struct Fields<'a> {
     pub title: &'a str,
     pub body_file: Option<&'a Path>,
     pub certainty: Option<&'a str>,
+    /// Причина статуса (`message` первой ревизии); для `axiom` обязательна.
+    pub reason: Option<&'a str>,
     pub evidence_file: Option<&'a Path>,
     pub triggers: &'a [String],
     pub tags: &'a [String],
@@ -90,8 +94,22 @@ fn read_evidence(p: &Path) -> Result<Value, CliError> {
     Ok(v)
 }
 
+/// Причина статуса (непустая) и правило аксиомы: `axiom` — только с `--reason`. Проверяется до
+/// чтения stdin и запросов: сервер аксиому агента не проверяет (§7.5, решение владельца
+/// 2026-10-26), правило инструкции агента CLI держит сам.
+fn status_reason<'a>(f: &Fields<'a>) -> Result<Option<&'a str>, CliError> {
+    let reason = f.reason.map(str::trim).filter(|r| !r.is_empty());
+    if f.certainty == Some("axiom") && reason.is_none() {
+        return Err(CliError::input(
+            "--certainty axiom ставится только по прямому указанию пользователя: укажите --reason (что именно сказал пользователь)",
+        ));
+    }
+    Ok(reason)
+}
+
 /// Тело запроса новой записи insight (без `scope`, `force`, `supersedes_id`).
 fn insight_body(f: &Fields, kind: &str) -> Result<Value, CliError> {
+    let reason = status_reason(f)?;
     let mut data = json!({ "kind": kind });
     if let Some(p) = f.evidence_file {
         data["evidence"] = read_evidence(p)?;
@@ -114,6 +132,9 @@ fn insight_body(f: &Fields, kind: &str) -> Result<Value, CliError> {
     }
     if let Some(a) = f.area {
         body["area"] = json!(a);
+    }
+    if let Some(r) = reason {
+        body["message"] = json!(r);
     }
     Ok(body)
 }
@@ -356,6 +377,7 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
 
 /// `zam insight supersede <id>`: новая запись замещает старую (вид — у старой, если не задан).
 pub fn supersede(ctx: &Ctx, id: &str, f: &Fields) -> Result<(), CliError> {
+    status_reason(f)?;
     let kind = match f.kind {
         Some(k) => k.to_string(),
         None => get_entry(ctx, id)?["data"]["kind"]
@@ -528,6 +550,35 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Стенд Debian 13: `--certainty axiom` — только с непустой `--reason`; причина —
+    /// сообщение ревизии.
+    #[test]
+    fn axiom_requires_reason() {
+        let f = |certainty: Option<&'static str>, reason: Option<&'static str>| Fields {
+            kind: Some("decision"),
+            title: "T",
+            body_file: None,
+            certainty,
+            reason,
+            evidence_file: None,
+            triggers: &[],
+            tags: &[],
+            area: None,
+            key: None,
+        };
+        for r in [None, Some(""), Some("  ")] {
+            let e = status_reason(&f(Some("axiom"), r)).unwrap_err();
+            assert_eq!(e.code, crate::client::EXIT_INPUT);
+            assert!(e.msg.contains("--reason"), "{}", e.msg);
+        }
+        assert_eq!(
+            status_reason(&f(Some("axiom"), Some(" сказал пользователь "))).unwrap(),
+            Some("сказал пользователь")
+        );
+        assert_eq!(status_reason(&f(Some("hypothesis"), None)).unwrap(), None);
+        assert_eq!(status_reason(&f(None, Some("R"))).unwrap(), Some("R"));
     }
 
     #[test]

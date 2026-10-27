@@ -5,7 +5,10 @@
 //!   вся строка — путь (`a:b` остаётся путём).
 //! - Без префикса — решение из ближайшего `solution.toml`, иначе `knowledge`.
 //! - `solution:` без `solution.toml` — ошибка конфигурации.
-//! - 26 символов в канонической форме [`zam_core::Id`] — id узла.
+//! - 26 символов в канонической форме [`zam_core::Id`] — id узла; так же `n:<id>` — ссылка
+//!   узла, как её печатают `zam search` и `/read` (стенд Debian 13, B2);
+//! - `i:|c:|e:|r:<id>` — ссылка записи журнала ([`entry_ref`]); её читает `zam read`, прочие
+//!   команды цели-узла такую строку считают путём, как раньше.
 //! - Ведущие и замыкающие `/` пути отбрасываются.
 use std::path::Path;
 
@@ -61,6 +64,13 @@ fn is_node_id(s: &str) -> bool {
             .is_ok_and(|id| id.to_string() == s)
 }
 
+/// Ссылка записи журнала `i:|c:|e:|r:<id>` (как в выдаче `zam search` и `/read`): id записи.
+/// Префикс без канонического id — не ссылка (`i:заметка` остаётся путём).
+pub fn entry_ref(raw: &str) -> Option<&str> {
+    let (p, id) = raw.split_once(':')?;
+    (matches!(p, "i" | "c" | "e" | "r") && is_node_id(id)).then_some(id)
+}
+
 /// Пространство цели до разрешения решения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpaceSel {
@@ -84,6 +94,9 @@ pub enum Target {
 pub fn parse(raw: &str) -> Target {
     if is_node_id(raw) {
         return Target::Node(raw.to_string());
+    }
+    if let Some(id) = raw.strip_prefix("n:").filter(|id| is_node_id(id)) {
+        return Target::Node(id.to_string());
     }
     let (space, rest) = match raw.split_once(':') {
         Some((p, rest)) => match p {
@@ -190,6 +203,22 @@ mod tests {
             parse("abcdefghijklmnopqrstuvwxyz"),
             p(SpaceSel::Default, "abcdefghijklmnopqrstuvwxyz")
         );
+        // ссылка узла из выдачи поиска
+        assert_eq!(parse(&format!("n:{id}")), Target::Node(id.clone()));
+        assert_eq!(parse("n:Сборка"), p(SpaceSel::Default, "n:Сборка"));
+        assert_eq!(parse("Сборка"), p(SpaceSel::Default, "Сборка"));
+    }
+
+    #[test]
+    fn entry_refs() {
+        let id = zam_core::Id::new().to_string();
+        for pfx in ["i", "c", "e", "r"] {
+            assert_eq!(entry_ref(&format!("{pfx}:{id}")), Some(id.as_str()));
+        }
+        assert_eq!(entry_ref(&format!("n:{id}")), None);
+        assert_eq!(entry_ref(&id), None);
+        assert_eq!(entry_ref("i:заметка"), None);
+        assert_eq!(entry_ref(&format!("i:{}", id.to_lowercase())), None);
     }
 
     #[test]

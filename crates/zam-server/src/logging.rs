@@ -25,23 +25,32 @@ where
     }
 }
 
-/// Цель, которую нельзя поднять выше `warn`: `rmcp` на debug/trace пишет JSON-RPC целиком
-/// (тексты заметок, значения Vault, промпты) (§13.1).
-const CAPPED: &str = "rmcp";
+/// Цели, которые нельзя поднять выше `warn` (§13.1):
+/// - `rmcp` на debug/trace пишет JSON-RPC целиком (тексты заметок, значения Vault, промпты);
+/// - `memory_serve` на info пишет строку на каждый ассет WebUI при старте (~160 строк в
+///   journald, стенд Debian 13) — шум без пользы для эксплуатации.
+const CAPPED: [&str; 2] = ["rmcp", "memory_serve"];
 
-/// Директива относится к [`CAPPED`] или её подцели (`rmcp::service=debug`).
-fn is_capped(directive: &str) -> bool {
+/// Цель директивы (`rmcp::service=debug` → `rmcp::service`), если она относится к одной из
+/// [`CAPPED`] или её подцели, — эта цель.
+fn capped_target(directive: &str) -> Option<&'static str> {
     let target = directive.split(['=', '[']).next().unwrap_or("").trim();
-    target == CAPPED || target.starts_with("rmcp::")
+    CAPPED.into_iter().find(|c| {
+        target == *c
+            || target
+                .strip_prefix(c)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
 }
 
-/// Фильтр журнала: `log.level` без директив [`CAPPED`] и сверху `rmcp=<уровень>` — `warn`,
-/// а при общем `error`/`off` — он же (принудительная директива не повышает подробность).
+/// Фильтр журнала: `log.level` без директив целей [`CAPPED`] и сверху `<цель>=<уровень>` для
+/// каждой — `warn`, а при общем `error`/`off` — он же (принудительная директива не повышает
+/// подробность).
 pub(crate) fn filter(level: &str) -> anyhow::Result<EnvFilter> {
     let rest: Vec<&str> = level
         .split(',')
         .map(str::trim)
-        .filter(|d| !d.is_empty() && !is_capped(d))
+        .filter(|d| !d.is_empty() && capped_target(d).is_none())
         .collect();
     let global = rest
         .iter()
@@ -53,7 +62,11 @@ pub(crate) fn filter(level: &str) -> anyhow::Result<EnvFilter> {
         Some("error") => "error",
         _ => "warn",
     };
-    Ok(EnvFilter::try_new(rest.join(","))?.add_directive(format!("{CAPPED}={cap}").parse()?))
+    let mut f = EnvFilter::try_new(rest.join(","))?;
+    for t in CAPPED {
+        f = f.add_directive(format!("{t}={cap}").parse()?);
+    }
+    Ok(f)
 }
 
 /// Ставит глобальный subscriber. Guard нужно держать до конца процесса.
@@ -132,6 +145,58 @@ mod tests {
         }
     }
 
+    /// `memory_serve` (ассеты WebUI) — тоже не выше `warn`; свои цели не задеты. Директива
+    /// пользователя снимается только для самой цели и её подцелей (`memory_server=…` — чужая);
+    /// сам `EnvFilter` сравнивает цели по префиксу строки, поэтому принудительный `warn`
+    /// задел бы и цель `memory_server…` — такой зависимости нет.
+    #[test]
+    fn memory_serve_capped_at_warn() {
+        assert_eq!(
+            super::capped_target("memory_serve=info"),
+            Some("memory_serve")
+        );
+        assert_eq!(
+            super::capped_target("memory_serve::x=debug"),
+            Some("memory_serve")
+        );
+        assert_eq!(
+            super::capped_target("rmcp::service[req]=trace"),
+            Some("rmcp")
+        );
+        assert_eq!(super::capped_target("memory_server=info"), None);
+        assert_eq!(super::capped_target("rmcpx=debug"), None);
+        assert_eq!(super::capped_target("info"), None);
+        for level in [
+            "info",
+            "debug",
+            "info,memory_serve=trace",
+            "memory_serve::assets=info",
+        ] {
+            let buf = Buf::default();
+            let w = buf.clone();
+            let sub = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(move || w.clone()))
+                .with(super::filter(level).unwrap());
+            tracing::subscriber::with_default(sub, || {
+                tracing::info!(target: "memory_serve", "ассет-info");
+                tracing::debug!(target: "memory_serve::assets", "ассет-debug");
+                tracing::warn!(target: "memory_serve", "ассет-warn-виден");
+                tracing::info!(target: "zam_server::web", "свой-info");
+            });
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                !out.contains("ассет-info") && !out.contains("ассет-debug"),
+                "{level}: {out}"
+            );
+            assert!(out.contains("ассет-warn-виден"), "{level}: {out}");
+            assert_eq!(
+                out.contains("свой-info"),
+                !level.starts_with("memory_serve::"),
+                "{level}: {out}"
+            );
+        }
+    }
+
     /// При общем `error`/`off` принудительная директива не добавляет warn-событий `rmcp`.
     #[test]
     fn rmcp_cap_does_not_raise_quiet_levels() {
@@ -143,6 +208,7 @@ mod tests {
                 .with(super::filter(level).unwrap());
             tracing::subscriber::with_default(sub, || {
                 tracing::warn!(target: "rmcp::service", "rmcp-warn");
+                tracing::warn!(target: "memory_serve", "rmcp-warn-ассет");
             });
             let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
             assert!(!out.contains("rmcp-warn"), "{level}: {out}");

@@ -365,6 +365,28 @@ fn solution_toml_scopes_write_and_search() {
     // в knowledge её нет
     let o = e.run_in(&sub, &["read", "knowledge:x"], b"");
     assert_eq!(o.status.code(), Some(5));
+    // стенд Debian 13, B1: один сегмент без префикса читается из решения, как пишется;
+    // 404 на стенде давала секция: `--section Тесты` при пути заголовков `Сборка > Тесты`
+    let note = "# Сборка\nmake\n## Тесты\ncargo test\n";
+    ok(&e.run_in(&sub, &["write", "Сборка"], note.as_bytes()));
+    let o = e.run_in(&sub, &["read", "Сборка"], b"");
+    assert_eq!(o.stdout, note.as_bytes(), "{}", err(&o));
+    let o = e.run_in(&sub, &["read", "Сборка", "--batch"], b"");
+    assert!(ok(&o).contains("make"), "{}", err(&o));
+    for sec in ["Тесты", "Сборка > Тесты"] {
+        let o = e.run_in(&sub, &["read", "Сборка", "--section", sec], b"");
+        assert_eq!(o.stdout, "## Тесты\ncargo test\n".as_bytes(), "{}", err(&o));
+        let o = e.run_in(&sub, &["read", "Сборка", "--section", sec, "--batch"], b"");
+        assert!(ok(&o).contains("cargo test"), "{}", err(&o));
+    }
+    // нет секции: код 5 и подсказка про секцию, а не только «не найдено»
+    let o = e.run_in(&sub, &["read", "Сборка", "--section", "Нет"], b"");
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    assert!(err(&o).contains("секци"), "{}", err(&o));
+    ok(&e.run_in(&sub, &["write", "Деплой/Служба"], "# Служба\n".as_bytes()));
+    let o = e.run_in(&sub, &["read", "Деплой"], b"");
+    // папка без текста — не «нет такого пути»
+    assert_ne!(o.status.code(), Some(5), "{}", err(&o));
 
     // поиск из каталога решения находит, вне его — нет (решение не в области)
     let s = ok(&e.run_in(&sub, &["search", "квазар"], b""));

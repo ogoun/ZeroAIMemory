@@ -301,9 +301,13 @@ struct InsightArgs {
     /// Файл с текстом (иначе stdin)
     #[arg(long)]
     body_file: Option<PathBuf>,
-    /// Эпистемический статус: theorem (с --evidence-file) или hypothesis
-    #[arg(long, value_parser = ["theorem", "hypothesis"])]
+    /// Эпистемический статус: axiom (только по прямому указанию пользователя, с --reason),
+    /// theorem (с --evidence-file) или hypothesis
+    #[arg(long, value_parser = ["axiom", "theorem", "hypothesis"])]
     certainty: Option<String>,
+    /// Причина статуса — сообщение ревизии; для axiom обязательна (что сказал пользователь)
+    #[arg(long)]
+    reason: Option<String>,
     /// JSON-файл доказательства {checked, method, result} → data.evidence
     #[arg(long)]
     evidence_file: Option<PathBuf>,
@@ -329,6 +333,7 @@ impl InsightArgs {
             title: &self.title,
             body_file: self.body_file.as_deref(),
             certainty: self.certainty.as_deref(),
+            reason: self.reason.as_deref(),
             evidence_file: self.evidence_file.as_deref(),
             triggers: &self.triggers,
             tags: &self.tags,
