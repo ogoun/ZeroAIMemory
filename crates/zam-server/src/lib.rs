@@ -247,7 +247,8 @@ pub async fn run_with(
     }
     if !crate::config::has_default_params(&state.admin_hash) {
         tracing::warn!(
-            "хэш пароля администратора с нестандартными параметрами argon2: время ответа входа              выдаёт логин администратора; получите хэш командой `zam-server hash-password`"
+            "хэш пароля администратора с нестандартными параметрами argon2: время ответа входа \
+             выдаёт логин администратора; получите хэш командой `zam-server hash-password`"
         );
     }
     service::check_stop_timeout(&mode, state.cfg.qdrant.shutdown_flush_wait_ms).await;

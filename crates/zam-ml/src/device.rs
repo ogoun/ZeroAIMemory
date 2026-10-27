@@ -92,7 +92,7 @@ fn session(
 ) -> Result<Session, MlError> {
     let mut b = Session::builder(env)?
         .with_optimization_level(GraphOptimizationLevel::All)?
-        // 0 — решение ORT (число физических ядер); в контейнере с урезанным набором CPU — явно
+        // 0 — решение ORT (число физических ядер); маска CPU не {0..n-1} (LXC, cpuset) — явно
         .with_intra_threads(intra_threads(threads))?
         // фоновый сервис: без активного ожидания потоков между вызовами
         .with_intra_op_spinning(false)?
@@ -108,50 +108,62 @@ fn session(
 }
 
 /// Число потоков intra-op для ORT. `0` — решение ORT: по потоку на физическое ядро **с
-/// привязкой** к ядру. В контейнере с урезанным набором CPU (LXC, cpuset) ORT привязывает потоки
-/// и к ядрам, которых процессу не дали, и пишет ERROR `pthread_setaffinity_np failed … error
-/// code: 22` (стенд LXC). При явном числе потоков ORT привязку не ставит (её задаёт только
-/// `session.intra_op_thread_affinities`) — поэтому, если процессу доступно меньше CPU, чем
-/// включено в системе, число задаётся явно: доступные CPU **[решение исполнителя, задача 14
-/// M4]**. Вне контейнера и на Windows — без изменений.
+/// привязкой** к CPU с номерами `0, 1, …`. Если маска процесса — не `{0, 1, …, n−1}`
+/// (cpuset с частью ядер, LXC с «чужими» номерами CPU: стенд Debian 13 — `39,55`), ORT
+/// привязывает потоки к CPU вне маски и пишет ERROR `pthread_setaffinity_np failed … error
+/// code: 22`. При явном числе потоков ORT привязку не ставит (её задаёт только
+/// `session.intra_op_thread_affinities`) — поэтому для такой маски число задаётся явно: число
+/// CPU в маске **[решение контроллера, fix round 1 задачи 14 M4, M-8]**. На обычной машине маска
+/// `{0..n−1}`, на Windows маска не читается — поведение ORT прежнее.
 fn intra_threads(requested: usize) -> usize {
     if requested != 0 {
         return requested;
     }
-    restricted_cpus().unwrap_or(0)
+    own_cpus().map_or(0, |cpus| explicit_threads_for(&cpus))
 }
 
-/// Доступных процессу CPU меньше, чем включённых в системе, — их число.
+/// `0` (решает ORT), если CPU маски — ровно `0..n`; иначе число CPU маски.
+fn explicit_threads_for(cpus: &[usize]) -> usize {
+    let mut v = cpus.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    if v.iter().enumerate().all(|(i, &c)| i == c) {
+        0
+    } else {
+        v.len()
+    }
+}
+
+/// Маска CPU процесса (`Cpus_allowed_list` из `/proc/self/status`, как `sched_getaffinity`).
 #[cfg(target_os = "linux")]
-fn restricted_cpus() -> Option<usize> {
-    let online = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
-    let total = count_cpu_list(online.trim())?;
-    let avail = std::thread::available_parallelism().ok()?.get();
-    (avail < total).then_some(avail)
+fn own_cpus() -> Option<Vec<usize>> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = s.lines().find(|l| l.starts_with("Cpus_allowed_list:"))?;
+    parse_cpu_list(line.split_once(':')?.1.trim())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn restricted_cpus() -> Option<usize> {
+fn own_cpus() -> Option<Vec<usize>> {
     None
 }
 
-/// Число CPU в списке ядра Linux: `0-3,8-11,15`.
+/// Список CPU ядра Linux (`0-3,8-11,15`) → номера CPU.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn count_cpu_list(list: &str) -> Option<usize> {
-    let mut n = 0usize;
+fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let mut v = Vec::new();
     for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        n += match part.split_once('-') {
+        match part.split_once('-') {
             Some((a, b)) => {
                 let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
-                b.checked_sub(a)? + 1
+                if b < a || b - a > 65_536 {
+                    return None;
+                }
+                v.extend(a..=b);
             }
-            None => {
-                part.parse::<usize>().ok()?;
-                1
-            }
-        };
+            None => v.push(part.parse().ok()?),
+        }
     }
-    (n > 0).then_some(n)
+    (!v.is_empty()).then_some(v)
 }
 
 fn pair(
@@ -281,22 +293,32 @@ pub(crate) fn build_session_pool(
 mod affinity_tests {
     use super::*;
 
-    /// Список CPU ядра Linux (`/sys/devices/system/cpu/online`).
+    /// Список CPU ядра Linux (`Cpus_allowed_list`).
     #[test]
-    fn cpu_list_counts_ranges() {
-        assert_eq!(count_cpu_list("0-15"), Some(16));
-        assert_eq!(count_cpu_list("0-3,8-11,15"), Some(9));
-        assert_eq!(count_cpu_list("0"), Some(1));
-        assert_eq!(count_cpu_list(""), None);
-        assert_eq!(count_cpu_list("3-1"), None);
-        assert_eq!(count_cpu_list("x"), None);
+    fn cpu_list_parsed() {
+        assert_eq!(parse_cpu_list("0-3"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(parse_cpu_list("39,55"), Some(vec![39, 55]));
+        assert_eq!(parse_cpu_list("0-1,8,10-11"), Some(vec![0, 1, 8, 10, 11]));
+        assert_eq!(parse_cpu_list(""), None);
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("x"), None);
     }
 
-    /// Явное число потоков не меняется; `0` остаётся `0` вне урезанного набора CPU.
+    /// M-8: маска `{0..n−1}` — решает ORT (`0`), иначе явно число CPU маски.
+    #[test]
+    fn explicit_threads_when_mask_not_prefix() {
+        assert_eq!(explicit_threads_for(&[39, 55]), 2);
+        assert_eq!(explicit_threads_for(&[0, 1]), 0);
+        assert_eq!(explicit_threads_for(&[0, 2]), 2);
+        assert_eq!(explicit_threads_for(&[1, 0, 2, 3]), 0);
+        assert_eq!(explicit_threads_for(&[2, 3]), 2);
+    }
+
+    /// Явное число потоков не меняется.
     #[test]
     fn explicit_threads_kept() {
         assert_eq!(intra_threads(4), 4);
         let auto = intra_threads(0);
-        assert!(auto == 0 || restricted_cpus() == Some(auto));
+        assert_eq!(auto, own_cpus().map_or(0, |c| explicit_threads_for(&c)));
     }
 }

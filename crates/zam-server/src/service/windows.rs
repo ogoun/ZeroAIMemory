@@ -105,6 +105,7 @@ impl InstallPlan {
              запуск: автоматически, учётная запись LocalSystem, тип OwnProcess\n\
              восстановление: перезапуск через {rd} с, {n} раза (счётчик сбоев сбрасывается через сутки)\n\
              таймаут остановки (Preshutdown): {t} с; StopPending: wait_hint {wh} с, checkpoint каждые {cp} с\n\
+             пределы: запуск {sl} с, остановка {t} с — дольше: ERROR и перезапуск службы\n\
              журнал: {logs}\n",
             name = self.name,
             display = display_name(&self.name),
@@ -115,6 +116,7 @@ impl InstallPlan {
             t = self.timeout.as_secs(),
             wh = WAIT_HINT.as_secs(),
             cp = CHECKPOINT_EVERY.as_secs(),
+            sl = START_LIMIT.as_secs(),
             logs = self.logs_dir.display(),
         )
     }
@@ -128,24 +130,9 @@ fn display_name(name: &str) -> String {
     }
 }
 
-/// Таймаут `Preshutdown` службы (мс).
-fn set_preshutdown(service: &Service, timeout: Duration) -> Result<(), ServiceError> {
-    use windows::Win32::System::Services::{
-        ChangeServiceConfig2W, SC_HANDLE, SERVICE_CONFIG_PRESHUTDOWN_INFO, SERVICE_PRESHUTDOWN_INFO,
-    };
-    let info = SERVICE_PRESHUTDOWN_INFO {
-        dwPreshutdownTimeout: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
-    };
-    // SAFETY: дескриптор службы жив, пока жив `service`; структура живёт до конца вызова.
-    unsafe {
-        ChangeServiceConfig2W(
-            SC_HANDLE(service.raw_handle() as _),
-            SERVICE_CONFIG_PRESHUTDOWN_INFO,
-            Some(std::ptr::from_ref(&info).cast()),
-        )
-    }
-    .map_err(|e| ServiceError::failed(format!("таймаут Preshutdown: {e}")))
-}
+/// Предел `StartPending`: загрузка модели с HDD, CUDA, первая перенарезка; дольше — сторожевой
+/// таймер считает старт зависшим (ERROR, `Stopped` с ошибкой, восстановление SCM).
+pub const START_LIMIT: Duration = Duration::from_secs(300);
 
 /// Таймаут `Preshutdown` открытой службы.
 fn query_preshutdown(service: &Service) -> Result<Duration, String> {
@@ -238,7 +225,9 @@ pub fn install(plan: &InstallPlan) -> Result<(), ServiceError> {
     service
         .set_failure_actions_on_non_crash_failures(true)
         .map_err(|e| scm_err(what, &plan.name, e))?;
-    set_preshutdown(&service, plan.timeout)?;
+    service
+        .set_preshutdown_timeout(plan.timeout)
+        .map_err(|e| scm_err(what, &plan.name, e))?;
     println!(
         "{} служба «{}»",
         if updated {
@@ -259,16 +248,16 @@ pub fn install(plan: &InstallPlan) -> Result<(), ServiceError> {
     Ok(())
 }
 
-/// Ждёт состояния `want`, пока служба в `pending`; `None` — истёк `limit`.
+/// Ждёт, пока `pending(состояние, прошло)` истинно; `None` — истёк `limit`.
 fn wait_state(
     s: &Service,
-    pending: ServiceState,
     limit: Duration,
+    pending: impl Fn(ServiceState, Duration) -> bool,
 ) -> Result<Option<ServiceStatus>, windows_service::Error> {
     let t0 = Instant::now();
     loop {
         let st = s.query_status()?;
-        if st.current_state != pending {
+        if !pending(st.current_state, t0.elapsed()) {
             return Ok(Some(st));
         }
         if t0.elapsed() > limit {
@@ -278,10 +267,19 @@ fn wait_state(
     }
 }
 
-/// Предел ожидания остановки из командной строки: наибольший таймаут R4 и запас.
+/// Предел ожидания остановки из командной строки: наибольший таймаут R4 (140 с) и запас.
 const STOP_WAIT_LIMIT: Duration = Duration::from_secs(150);
-/// Предел ожидания запуска (загрузка модели с HDD, CUDA).
-const START_WAIT_LIMIT: Duration = Duration::from_secs(180);
+/// Предел ожидания запуска из командной строки: предел старта службы и запас.
+const START_WAIT_LIMIT: Duration = Duration::from_secs(START_LIMIT.as_secs() + 10);
+/// Окно после `stop()`, в котором `Running` — ещё не принятая остановка, а не отказ: SCM
+/// отвечает на `ControlService` состоянием, которое служба успела сообщить.
+const STOP_ACCEPT_GRACE: Duration = Duration::from_secs(5);
+
+/// Остановка ещё идёт: `StopPending`, а сразу после `stop()` — и `Running`.
+fn stop_in_progress(state: ServiceState, elapsed: Duration) -> bool {
+    state == ServiceState::StopPending
+        || (state == ServiceState::Running && elapsed < STOP_ACCEPT_GRACE)
+}
 
 fn stop_and_wait(s: &Service, name: &str) -> Result<(), ServiceError> {
     let st = s
@@ -294,7 +292,7 @@ fn stop_and_wait(s: &Service, name: &str) -> Result<(), ServiceError> {
         s.stop().map_err(|e| scm_err("остановка службы", name, e))?;
     }
     println!("остановка «{name}»: сервер дожидается записи индекса и останавливает Qdrant…");
-    match wait_state(s, ServiceState::StopPending, STOP_WAIT_LIMIT)
+    match wait_state(s, STOP_WAIT_LIMIT, stop_in_progress)
         .map_err(|e| scm_err("остановка службы", name, e))?
     {
         Some(st) if st.current_state == ServiceState::Stopped => Ok(()),
@@ -338,8 +336,10 @@ pub fn start(name: &str) -> Result<(), ServiceError> {
         return Ok(());
     }
     s.start::<&OsStr>(&[]).map_err(|e| scm_err(what, name, e))?;
-    match wait_state(&s, ServiceState::StartPending, START_WAIT_LIMIT)
-        .map_err(|e| scm_err(what, name, e))?
+    match wait_state(&s, START_WAIT_LIMIT, |st, _| {
+        st == ServiceState::StartPending
+    })
+    .map_err(|e| scm_err(what, name, e))?
     {
         Some(st) if st.current_state == ServiceState::Running => {
             println!(
@@ -432,12 +432,86 @@ pub fn run(args: RunArgs) -> Result<(), ServiceError> {
     })
 }
 
-/// Отчёт о состоянии в SCM: в состояниях ожидания `checkpoint` растёт каждые 2 с (отдельный
-/// поток), пока процесс не выйдет.
+/// Что сообщить SCM на очередном шаге сторожевого таймера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tick {
+    /// Состояние ожидания: сообщить его с этим `checkpoint`.
+    Report(ServiceState, u32),
+    /// `Running`: сообщать нечего.
+    Idle,
+    /// Предел ожидания истёк в этом состоянии: ERROR, `Stopped` с ошибкой, выход процесса.
+    Expired(ServiceState),
+    /// `Stopped`: таймер завершается.
+    Done,
+}
+
+/// Состояние службы для SCM без обращения к SCM (проверяется unit-тестами): переходы,
+/// `checkpoint` и пределы ожидания — `StartPending` не дольше [`START_LIMIT`], `StopPending`
+/// не дольше `stop_timeout(qdrant.shutdown_flush_wait_ms)` (R4).
+#[derive(Debug)]
+struct Progress {
+    state: ServiceState,
+    checkpoint: u32,
+    since: Instant,
+    start_limit: Duration,
+    stop_limit: Duration,
+}
+
+impl Progress {
+    fn new(now: Instant, start_limit: Duration, stop_limit: Duration) -> Self {
+        Self {
+            state: ServiceState::StartPending,
+            checkpoint: 1,
+            since: now,
+            start_limit,
+            stop_limit,
+        }
+    }
+
+    /// Переход; `None` — не допускается (из `Stopped` назад, `StopPending` → `Running`,
+    /// повтор того же состояния).
+    fn transition(&mut self, to: ServiceState, now: Instant) -> Option<(ServiceState, u32)> {
+        let refused = self.state == ServiceState::Stopped
+            || self.state == to
+            || (self.state == ServiceState::StopPending && to == ServiceState::Running);
+        if refused {
+            return None;
+        }
+        self.state = to;
+        self.checkpoint = 1;
+        self.since = now;
+        Some((to, 1))
+    }
+
+    fn tick(&mut self, now: Instant) -> Tick {
+        let limit = match self.state {
+            ServiceState::Stopped => return Tick::Done,
+            ServiceState::StartPending => self.start_limit,
+            ServiceState::StopPending => self.stop_limit,
+            _ => return Tick::Idle,
+        };
+        if now.duration_since(self.since) > limit {
+            let was = self.state;
+            self.state = ServiceState::Stopped;
+            return Tick::Expired(was);
+        }
+        self.checkpoint = self.checkpoint.wrapping_add(1);
+        Tick::Report(self.state, self.checkpoint)
+    }
+}
+
+/// Отчёт о состоянии в SCM и сторожевой таймер: в состояниях ожидания `checkpoint` растёт
+/// каждые 2 с до предела, после предела — ERROR, `Stopped` с кодом ошибки и выход процесса
+/// (SCM запускает восстановление).
 struct Reporter {
     handle: ServiceStatusHandle,
-    state: Mutex<(ServiceState, u32)>,
+    progress: Mutex<Progress>,
+    /// Куда писать ошибку предела (каталог данных, когда конфиг прочитан).
+    data_dir: Mutex<Option<PathBuf>>,
 }
+
+/// Код `ServiceSpecific` при истечении предела ожидания.
+const EXIT_HUNG: u32 = 2;
 
 impl Reporter {
     fn send(&self, state: ServiceState, checkpoint: u32, exit: ServiceExitCode) {
@@ -460,31 +534,54 @@ impl Reporter {
         });
     }
 
-    fn set(&self, state: ServiceState, exit: ServiceExitCode) {
-        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        // из Stopped назад не возвращаемся; StopPending не сменяется на Running
-        if g.0 == ServiceState::Stopped
-            || (g.0 == ServiceState::StopPending && state == ServiceState::Running)
-        {
-            return;
-        }
-        *g = (state, 1);
-        self.send(state, 1, exit);
+    fn lock(&self) -> std::sync::MutexGuard<'_, Progress> {
+        self.progress.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn pump(self: &Arc<Self>) {
+    fn set(&self, state: ServiceState, exit: ServiceExitCode) {
+        let mut g = self.lock();
+        if let Some((st, cp)) = g.transition(state, Instant::now()) {
+            self.send(st, cp, exit);
+        }
+    }
+
+    /// Предел остановки — по конфигу (до его чтения — наибольший, 140 с).
+    fn set_stop_limit(&self, limit: Duration) {
+        self.lock().stop_limit = limit;
+    }
+
+    fn watchdog(self: &Arc<Self>) {
         let me = Arc::clone(self);
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(CHECKPOINT_EVERY);
-                let mut g = me.state.lock().unwrap_or_else(|e| e.into_inner());
-                match g.0 {
-                    ServiceState::Stopped => return,
-                    ServiceState::StartPending | ServiceState::StopPending => {
-                        g.1 = g.1.wrapping_add(1);
-                        me.send(g.0, g.1, ServiceExitCode::NO_ERROR);
+                let mut g = me.lock();
+                match g.tick(Instant::now()) {
+                    Tick::Done => return,
+                    Tick::Idle => {}
+                    Tick::Report(st, cp) => me.send(st, cp, ServiceExitCode::NO_ERROR),
+                    Tick::Expired(was) => {
+                        let (what, limit) = if was == ServiceState::StartPending {
+                            ("запуск", g.start_limit)
+                        } else {
+                            ("остановка", g.stop_limit)
+                        };
+                        let msg = format!(
+                            "{what} службы не завершилась за {} с: служба помечена остановленной \
+                             с ошибкой, процесс завершается (менеджер служб перезапустит её)",
+                            limit.as_secs()
+                        );
+                        tracing::error!("{msg}");
+                        let dir = me.data_dir.lock().ok().and_then(|d| d.clone());
+                        write_start_error(dir.as_deref(), &msg);
+                        me.send(
+                            ServiceState::Stopped,
+                            0,
+                            ServiceExitCode::ServiceSpecific(EXIT_HUNG),
+                        );
+                        drop(g);
+                        std::process::exit(i32::try_from(EXIT_HUNG).unwrap_or(1));
                     }
-                    _ => {}
                 }
             }
         });
@@ -499,8 +596,15 @@ fn service_main(arguments: Vec<OsString>) {
     let args = RUN_ARGS.get().cloned().unwrap_or_default();
     let signal = ShutdownSignal::new();
     let handler_signal = signal.clone();
+    // обработчик регистрируется раньше, чем появляется отчёт (ему нужен дескриптор статуса)
+    let cell: Arc<OnceLock<Arc<Reporter>>> = Arc::new(OnceLock::new());
+    let handler_cell = Arc::clone(&cell);
     let handle = match service_control_handler::register(&name, move |c| match c {
         ServiceControl::Stop | ServiceControl::Shutdown | ServiceControl::Preshutdown => {
+            // StopPending — синхронно, до возврата SCM: `service stop` сразу видит остановку
+            if let Some(r) = handler_cell.get() {
+                r.set(ServiceState::StopPending, ServiceExitCode::NO_ERROR);
+            }
             handler_signal.trigger(StopSource::Service);
             ServiceControlHandlerResult::NoError
         }
@@ -515,10 +619,16 @@ fn service_main(arguments: Vec<OsString>) {
     };
     let reporter = Arc::new(Reporter {
         handle,
-        state: Mutex::new((ServiceState::StartPending, 1)),
+        progress: Mutex::new(Progress::new(
+            Instant::now(),
+            START_LIMIT,
+            super::stop_timeout(60_000),
+        )),
+        data_dir: Mutex::new(None),
     });
+    let _ = cell.set(Arc::clone(&reporter));
     reporter.send(ServiceState::StartPending, 1, ServiceExitCode::NO_ERROR);
-    reporter.pump();
+    reporter.watchdog();
     let code = match serve(&name, args, signal, &reporter) {
         Ok(()) => ServiceExitCode::NO_ERROR,
         Err(()) => ServiceExitCode::ServiceSpecific(1),
@@ -548,6 +658,10 @@ fn serve(
         }
     };
     let data_dir = cfg.data_dir.clone();
+    reporter.set_stop_limit(super::stop_timeout(cfg.qdrant.shutdown_flush_wait_ms));
+    if let Ok(mut d) = reporter.data_dir.lock() {
+        *d = Some(data_dir.clone());
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -560,28 +674,19 @@ fn serve(
     };
     let pw = std::env::var("ZAM_ADMIN_PASSWORD").ok();
     let ready = Arc::clone(reporter);
-    let stopping = Arc::clone(reporter);
-    let res = rt.block_on(async move {
-        let s = signal.clone();
-        tokio::spawn(async move {
-            s.wait().await;
-            stopping.set(ServiceState::StopPending, ServiceExitCode::NO_ERROR);
-        });
-        crate::run_with(
-            cfg,
-            pw,
-            RunOptions {
-                mode: RunMode::WindowsService {
-                    name: name.to_string(),
-                },
-                signal,
-                on_ready: Some(Box::new(move || {
-                    ready.set(ServiceState::Running, ServiceExitCode::NO_ERROR)
-                })),
+    let res = rt.block_on(crate::run_with(
+        cfg,
+        pw,
+        RunOptions {
+            mode: RunMode::WindowsService {
+                name: name.to_string(),
             },
-        )
-        .await
-    });
+            signal,
+            on_ready: Some(Box::new(move || {
+                ready.set(ServiceState::Running, ServiceExitCode::NO_ERROR)
+            })),
+        },
+    ));
     // фоновые задачи после штатной остановки уже завершены; зависшие не держат выход
     rt.shutdown_timeout(Duration::from_secs(5));
     res.map_err(|e| {
@@ -614,6 +719,75 @@ fn write_start_error(data_dir: Option<&Path>, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Сторожевой таймер: `checkpoint` растёт в состояниях ожидания до предела, после — истечение
+    /// и `Stopped`; переходы назад не допускаются (I-3).
+    #[test]
+    fn watchdog_limits_pending_states() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let stop = super::super::stop_timeout(14_000);
+        let mut p = Progress::new(t0, START_LIMIT, stop);
+        assert_eq!(p.tick(s(2)), Tick::Report(ServiceState::StartPending, 2));
+        assert_eq!(p.tick(s(4)), Tick::Report(ServiceState::StartPending, 3));
+        // старт завершён: Running — сообщать нечего
+        assert_eq!(
+            p.transition(ServiceState::Running, s(10)),
+            Some((ServiceState::Running, 1))
+        );
+        assert_eq!(p.tick(s(1000)), Tick::Idle);
+        // остановка: checkpoint растёт не дольше stop_timeout
+        assert_eq!(
+            p.transition(ServiceState::StopPending, s(1000)),
+            Some((ServiceState::StopPending, 1))
+        );
+        // повтор (обработчик SCM и сигнал) — без второго отчёта; назад в Running — нельзя
+        assert_eq!(p.transition(ServiceState::StopPending, s(1001)), None);
+        assert_eq!(p.transition(ServiceState::Running, s(1001)), None);
+        assert_eq!(p.tick(s(1002)), Tick::Report(ServiceState::StopPending, 2));
+        assert_eq!(
+            p.tick(s(1000 + stop.as_secs())),
+            Tick::Report(ServiceState::StopPending, 3)
+        );
+        assert_eq!(
+            p.tick(s(1001 + stop.as_secs())),
+            Tick::Expired(ServiceState::StopPending)
+        );
+        assert_eq!(p.tick(s(2000)), Tick::Done);
+        assert_eq!(p.transition(ServiceState::Running, s(2000)), None);
+
+        // зависший старт — истечение после START_LIMIT
+        let mut p = Progress::new(t0, START_LIMIT, stop);
+        assert!(matches!(p.tick(s(START_LIMIT.as_secs())), Tick::Report(..)));
+        assert_eq!(
+            p.tick(s(START_LIMIT.as_secs() + 1)),
+            Tick::Expired(ServiceState::StartPending)
+        );
+        // штатный выход
+        let mut p = Progress::new(t0, START_LIMIT, stop);
+        p.transition(ServiceState::Running, s(5));
+        p.transition(ServiceState::StopPending, s(6));
+        assert_eq!(
+            p.transition(ServiceState::Stopped, s(20)),
+            Some((ServiceState::Stopped, 1))
+        );
+        assert_eq!(p.tick(s(22)), Tick::Done);
+    }
+
+    /// Сразу после `stop()` служба может ещё числиться `Running` — это ожидание, не отказ (I-2).
+    #[test]
+    fn running_right_after_stop_is_pending() {
+        assert!(stop_in_progress(
+            ServiceState::StopPending,
+            Duration::from_secs(100)
+        ));
+        assert!(stop_in_progress(
+            ServiceState::Running,
+            Duration::from_secs(1)
+        ));
+        assert!(!stop_in_progress(ServiceState::Running, STOP_ACCEPT_GRACE));
+        assert!(!stop_in_progress(ServiceState::Stopped, Duration::ZERO));
+    }
 
     #[test]
     fn plan_describes_registration() {

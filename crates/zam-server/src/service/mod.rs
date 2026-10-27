@@ -79,15 +79,20 @@ pub fn stop_timeout_warning(actual: Duration, shutdown_flush_wait_ms: u64) -> Op
     })
 }
 
+/// Предел проверки таймаута службы при старте.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Проверка таймаута остановки при старте — только под службой (§13.3): под SCM —
 /// `Preshutdown` собственной службы, под systemd (`INVOCATION_ID`) — `TimeoutStopUSec` юнита.
 /// При ручном запуске проверки нет. Не удалось узнать таймаут — DEBUG, без WARN.
 pub async fn check_stop_timeout(mode: &RunMode, shutdown_flush_wait_ms: u64) {
     let mode = mode.clone();
-    let probed = tokio::task::spawn_blocking(move || probe_stop_timeout(&mode))
-        .await
-        .ok()
-        .flatten();
+    // `systemctl show` или SCM не задерживают старт дольше [`PROBE_TIMEOUT`] (M-2)
+    let task = tokio::task::spawn_blocking(move || probe_stop_timeout(&mode));
+    let probed = match tokio::time::timeout(PROBE_TIMEOUT, task).await {
+        Ok(r) => r.ok().flatten(),
+        Err(_) => Some(Err(format!("нет ответа за {} с", PROBE_TIMEOUT.as_secs()))),
+    };
     match probed {
         Some(Ok(actual)) => {
             if let Some(msg) = stop_timeout_warning(actual, shutdown_flush_wait_ms) {
@@ -122,6 +127,7 @@ fn probe_stop_timeout(mode: &RunMode) -> Option<Result<Duration, String>> {
 /// параметры SCM — без пробелов и разделителей пути).
 pub fn validate_name(name: &str) -> Result<(), ServiceError> {
     let ok = !name.is_empty()
+        && !name.starts_with('-')
         && name.len() <= 80
         && name
             .bytes()
@@ -214,6 +220,7 @@ pub fn install(a: InstallArgs) -> Result<(), ServiceError> {
     let exe_dir = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
     let config = resolve_config(a.config.as_deref(), &exe_dir)?;
     let cfg = load_config(Some(&config), &CliOverrides::default())?;
+    warn_env_not_inherited(std::env::vars().map(|(k, _)| k));
     let timeout = stop_timeout(cfg.qdrant.shutdown_flush_wait_ms);
     // относительные пути конфига — от рабочего каталога службы (каталог exe)
     let data_dir = absolute_in(&exe_dir, &cfg.data_dir);
@@ -260,6 +267,29 @@ pub fn install(a: InstallArgs) -> Result<(), ServiceError> {
         {
             Err(ServiceError::usage("режим службы — только Windows и Linux"))
         }
+    }
+}
+
+/// Переменные `ZAM_*` окружения установки (кроме клиентских `ZAM_URL`/`ZAM_TOKEN`).
+pub fn zam_env_names(keys: impl Iterator<Item = String>) -> Vec<String> {
+    let mut v: Vec<String> = keys
+        .filter(|k| k.to_ascii_uppercase().starts_with("ZAM_"))
+        .filter(|k| !matches!(k.to_ascii_uppercase().as_str(), "ZAM_URL" | "ZAM_TOKEN"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// M-7: служба не наследует окружение консоли установки — `ZAM_*` (слой конфигурации,
+/// `ZAM_ADMIN_PASSWORD`, `ZAM_MASTER_KEY`) ей не видны; таймаут посчитан с ними.
+fn warn_env_not_inherited(keys: impl Iterator<Item = String>) {
+    let names = zam_env_names(keys);
+    if !names.is_empty() {
+        eprintln!(
+            "предупреждение: в окружении заданы {}: служба их не увидит — перенесите значения в \
+             конфиг (секреты — [admin] password_hash, [vault] master_key_file)",
+            names.join(", ")
+        );
     }
 }
 
@@ -357,9 +387,35 @@ mod tests {
         for ok in ["zam-server", "zam_server2", "zam@x", "a.b"] {
             assert!(validate_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "zam server", "zam/x", "zam\nx", "з", &"a".repeat(81)] {
+        for bad in [
+            "",
+            "zam server",
+            "zam/x",
+            "zam\nx",
+            "з",
+            "-zam",
+            &"a".repeat(81),
+        ] {
             assert_eq!(validate_name(bad).unwrap_err().code, EXIT_USAGE, "{bad}");
         }
+    }
+
+    /// M-7: `ZAM_*` окружения установки перечисляются (клиентские `ZAM_URL`/`ZAM_TOKEN` — нет).
+    #[test]
+    fn zam_env_listed_for_warning() {
+        let keys = [
+            "PATH",
+            "ZAM_DATA_DIR",
+            "ZAM_URL",
+            "zam_admin_password",
+            "ZAM_TOKEN",
+        ]
+        .into_iter()
+        .map(String::from);
+        assert_eq!(
+            zam_env_names(keys),
+            vec!["ZAM_DATA_DIR".to_string(), "zam_admin_password".to_string()]
+        );
     }
 
     #[test]

@@ -43,10 +43,15 @@ fn path_str(p: &Path) -> Result<String, ServiceError> {
     Ok(s)
 }
 
-/// Слово командной строки systemd: в кавычках при пробелах и кавычках, `%` — `%%`
-/// (спецификаторы systemd).
+/// Значение без разбора на слова (`WorkingDirectory=`): только `%` → `%%` (спецификаторы
+/// systemd); кавычки здесь были бы частью пути.
+fn spec(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
+/// Слово списка (`ReadWritePaths=`): `%` → `%%`, в кавычках при пробелах, кавычках и `\`.
 fn quote(s: &str) -> String {
-    let s = s.replace('%', "%%");
+    let s = spec(s);
     if s.contains(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\') {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
@@ -54,12 +59,27 @@ fn quote(s: &str) -> String {
     }
 }
 
+/// Слово командной строки `ExecStart=`: как [`quote`] и `$` → `$$` (подстановка переменных).
+fn exec_word(s: &str) -> String {
+    quote(&s.replace('$', "$$"))
+}
+
+/// Путь в `/home`, `/root` или `/run/user` — скрыт `ProtectHome=true`.
+fn under_home(x: &str) -> bool {
+    ["/home", "/root", "/run/user"]
+        .iter()
+        .any(|h| x == *h || x.starts_with(&format!("{h}/")))
+}
+
 /// Юнит из шаблона: подставляются `User`/`Group`, `WorkingDirectory`, `ExecStart`,
-/// `TimeoutStopSec`, `ReadWritePaths`; данные в `/home`, `/root` или `/run/user` —
-/// `ProtectHome=read-only` (иначе каталог данных скрыт от службы).
+/// `TimeoutStopSec`, `ReadWritePaths`. Если exe, конфиг, рабочий каталог или каталог данных
+/// лежат в `/home`, `/root` или `/run/user` — `ProtectHome=read-only`: при `true` они скрыты
+/// от службы (exe не запустится), а `read-only` оставляет их читаемыми, запись — только в
+/// `ReadWritePaths` **[решение исполнителя, fix round 1, M-1]**.
 pub fn render_unit(p: &UnitParams) -> Result<String, ServiceError> {
     if let Some(u) = &p.user {
         let ok = !u.is_empty()
+            && !u.starts_with('-')
             && u.len() <= 64
             && u.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
@@ -77,11 +97,10 @@ pub fn render_unit(p: &UnitParams) -> Result<String, ServiceError> {
         .iter()
         .map(|x| path_str(x))
         .collect::<Result<_, _>>()?;
-    let home = rw.iter().any(|x| {
-        ["/home", "/root", "/run/user"]
-            .iter()
-            .any(|h| x == h || x.starts_with(&format!("{h}/")))
-    });
+    let home = [&exe, &workdir, &config]
+        .into_iter()
+        .chain(rw.iter())
+        .any(|x| under_home(x));
     let mut out = String::from(
         "# Создан `zam-server service install` из шаблона deploy/systemd/zam-server.service;\n\
          # после смены qdrant.shutdown_flush_wait_ms выполните install повторно.\n",
@@ -98,11 +117,11 @@ pub fn render_unit(p: &UnitParams) -> Result<String, ServiceError> {
             "Group" if p.user.as_deref().is_some_and(|u| u != super::DEFAULT_USER) => {
                 continue;
             }
-            "WorkingDirectory" => Some(format!("WorkingDirectory={}", quote(&workdir))),
+            "WorkingDirectory" => Some(format!("WorkingDirectory={}", spec(&workdir))),
             "ExecStart" => Some(format!(
                 "ExecStart={} serve --config {}",
-                quote(&exe),
-                quote(&config)
+                exec_word(&exe),
+                exec_word(&config)
             )),
             "TimeoutStopSec" => Some(format!("TimeoutStopSec={}", p.timeout.as_secs())),
             "ReadWritePaths" => Some(format!(
@@ -144,6 +163,34 @@ pub fn parse_timespan(s: &str) -> Option<Duration> {
         any = true;
     }
     any.then_some(total)
+}
+
+/// Код выхода `systemctl` → результат команды `service` **[решение исполнителя, fix round 1,
+/// M-4]**. `systemctl` следует LSB: у `status` 3 — «служба не работает» (не ошибка: состояние
+/// уже напечатано), 4 — нет такого юнита; у остальных действий 4 — недостаточно прав
+/// (код 3 «нет прав»), 5 — юнит не установлен. Прочее — код 1 с кодом `systemctl` в тексте.
+pub fn map_systemctl(args: &[&str], code: Option<i32>) -> Result<(), ServiceError> {
+    let cmd = args.join(" ");
+    let status = args.first() == Some(&"status");
+    match code {
+        Some(0) => Ok(()),
+        Some(3) if status => Ok(()),
+        Some(4) if status => Err(ServiceError::failed(format!(
+            "служба не установлена (systemctl {cmd}: код 4)"
+        ))),
+        Some(4) => Err(ServiceError::denied(format!(
+            "systemctl {cmd}: недостаточно прав — запустите через sudo"
+        ))),
+        Some(5) => Err(ServiceError::failed(format!(
+            "служба не установлена (systemctl {cmd}: код 5)"
+        ))),
+        Some(c) => Err(ServiceError::failed(format!(
+            "systemctl {cmd} завершился с кодом {c}"
+        ))),
+        None => Err(ServiceError::failed(format!(
+            "systemctl {cmd} прерван сигналом"
+        ))),
+    }
 }
 
 /// Имя юнита своего процесса из `/proc/self/cgroup` (`0::/system.slice/<имя>.service`).
@@ -203,21 +250,13 @@ mod ops {
         }
     }
 
-    /// `systemctl <args>`; код выхода — как у systemctl.
+    /// `systemctl <args>`; код выхода — по [`map_systemctl`].
     pub fn systemctl(args: &[&str]) -> Result<(), ServiceError> {
         let st = Command::new("systemctl")
             .args(args)
             .status()
             .map_err(|e| ServiceError::failed(format!("systemctl: {e}")))?;
-        if st.success() {
-            Ok(())
-        } else {
-            let code = st.code().unwrap_or(1);
-            Err(ServiceError {
-                code: u8::try_from(code).unwrap_or(super::super::EXIT_FAILED),
-                message: format!("systemctl {} завершился с кодом {code}", args.join(" ")),
-            })
-        }
+        map_systemctl(args, st.code())
     }
 
     /// Записать юнит, `daemon-reload`, `enable`. Пользователь должен существовать.
@@ -357,6 +396,71 @@ mod tests {
         );
         p.config = PathBuf::from("/etc/x\n/config.toml");
         assert!(render_unit(&p).is_err());
+    }
+
+    /// I-4: `WorkingDirectory` без кавычек (`%` → `%%`), `ExecStart` — `$` → `$$`, пути с
+    /// пробелом — в кавычках; exe в `/home` — `ProtectHome=read-only` (M-1).
+    #[test]
+    fn render_escapes_specifiers_and_dollar() {
+        let mut p = params(None, "/var/lib/zam 50%");
+        p.exe = PathBuf::from("/opt/zam $x 10%/zam-server");
+        p.config = PathBuf::from("/etc/zam/$HOME.toml");
+        let u = render_unit(&p).unwrap();
+        assert!(
+            u.lines().any(|l| l == "WorkingDirectory=/opt/zam $x 10%%"),
+            "{u}"
+        );
+        assert!(
+            u.lines().any(|l| l
+                == "ExecStart=\"/opt/zam $$x 10%%/zam-server\" serve --config /etc/zam/$$HOME.toml"),
+            "{u}"
+        );
+        assert!(
+            u.lines()
+                .any(|l| l == "ReadWritePaths=\"/var/lib/zam 50%%\""),
+            "{u}"
+        );
+        assert!(u.lines().any(|l| l == "ProtectHome=true"), "{u}");
+        // exe, конфиг или рабочий каталог в /home — read-only
+        for (exe, cfg) in [
+            ("/home/a/zam/zam-server", "/etc/zam.toml"),
+            ("/opt/zam/zam-server", "/root/zam.toml"),
+        ] {
+            let mut p = params(None, "/var/lib/zeroaimemory");
+            p.exe = PathBuf::from(exe);
+            p.config = PathBuf::from(cfg);
+            let u = render_unit(&p).unwrap();
+            assert!(u.lines().any(|l| l == "ProtectHome=read-only"), "{u}");
+        }
+        // M-5: пользователь не может начинаться с «-»
+        assert!(render_unit(&params(Some("-x"), "/x")).is_err());
+    }
+
+    /// M-4: коды `systemctl` сопоставляются явно; `3` — не «нет прав».
+    #[test]
+    fn systemctl_codes_mapped() {
+        use super::super::{EXIT_DENIED, EXIT_FAILED};
+        assert!(map_systemctl(&["status", "zam"], Some(0)).is_ok());
+        assert!(map_systemctl(&["status", "zam"], Some(3)).is_ok());
+        let e = map_systemctl(&["status", "zam"], Some(4)).unwrap_err();
+        assert_eq!(e.code, EXIT_FAILED);
+        assert!(e.message.contains("не установлена"), "{}", e.message);
+        assert_eq!(
+            map_systemctl(&["start", "zam"], Some(4)).unwrap_err().code,
+            EXIT_DENIED
+        );
+        assert_eq!(
+            map_systemctl(&["start", "zam"], Some(3)).unwrap_err().code,
+            EXIT_FAILED
+        );
+        assert_eq!(
+            map_systemctl(&["stop", "zam"], Some(5)).unwrap_err().code,
+            EXIT_FAILED
+        );
+        assert_eq!(
+            map_systemctl(&["stop", "zam"], None).unwrap_err().code,
+            EXIT_FAILED
+        );
     }
 
     #[test]
