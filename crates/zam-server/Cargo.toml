@@ -55,6 +55,8 @@ chacha20poly1305.workspace = true
 zeroize.workspace = true
 base64.workspace = true
 rand.workspace = true
+# MCP `/mcp` (§13.1): streamable HTTP поверх REST-ядра
+rmcp.workspace = true
 
 # Vault: DACL файла мастер-ключа (только владелец, SYSTEM, администраторы)
 [target.'cfg(windows)'.dependencies]

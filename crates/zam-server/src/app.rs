@@ -188,6 +188,8 @@ fn router(state: AppState) -> Router {
     let index = web::Index::new(&base);
     let root = index.clone();
     let api = api::router(&state)
+        // MCP (§13.1) — под тем же `base_path`; его внутренний роутер — `api::router` без `/mcp`
+        .merge(crate::mcp::router(&state))
         .merge(web::assets_router())
         .fallback(move |m, u| web::fallback(index.clone(), m, u))
         .with_state(state);

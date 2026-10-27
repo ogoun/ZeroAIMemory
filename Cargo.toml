@@ -97,6 +97,10 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 zeroize = { version = "1", features = ["serde"] }
 # версия та же, что у process-wrap 10.0.1 (тип PROCESS_CREATION_FLAGS)
 windows = "0.62"
+# M4, задача 9: MCP-сервер `/mcp` (§13.1) — официальный Rust SDK MCP, Apache-2.0; streamable
+# HTTP без сессий (MCP 2026-07-28, SEP-2567) поверх axum через `nest_service`; только серверная
+# часть: без макросов, клиента, OAuth и reqwest (аудит — журнал M4, задача 9)
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
 [profile.dev.package.argon2]

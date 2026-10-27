@@ -197,7 +197,7 @@ impl FromRequestParts<AppState> for Client {
 }
 
 /// Токен из `Authorization: Bearer …` (схема без учёта регистра).
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, rest) = v.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())

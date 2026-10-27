@@ -45,11 +45,14 @@ const JSON_OVERHEAD: usize = 64 * 1024;
 /// (`note_max_bytes`); экранирование JSON (`\n`, `\r`, `\"`) может удвоить
 /// размер, поэтому тело — до двух пределов заметки плюс запас.
 fn note_body_limit(l: &LimitsSection) -> DefaultBodyLimit {
-    DefaultBodyLimit::max(
-        l.note_max_bytes
-            .saturating_mul(2)
-            .saturating_add(JSON_OVERHEAD),
-    )
+    DefaultBodyLimit::max(note_body_max(l))
+}
+
+/// Предел тела с текстом заметки, байт: два предела заметки плюс запас (тот же у `/mcp`).
+pub(crate) fn note_body_max(l: &LimitsSection) -> usize {
+    l.note_max_bytes
+        .saturating_mul(2)
+        .saturating_add(JSON_OVERHEAD)
 }
 
 /// Запас на заголовки частей и поле `node` в multipart загрузки вложения, байт.
@@ -61,7 +64,7 @@ fn blob_body_limit(l: &LimitsSection) -> DefaultBodyLimit {
     DefaultBodyLimit::max(l.blob_max_bytes.saturating_add(MULTIPART_OVERHEAD))
 }
 
-/// Маршруты под `/api/v1`.
+/// Маршруты под `/api/v1` (без `/mcp`: его инструменты зовут этот роутер изнутри).
 pub fn router(state: &AppState) -> Router<AppState> {
     memory_routes(&state.cfg.limits)
         // записи в память с `X-Zam-Session` — счётчик сессии (одна точка, R1)
@@ -76,8 +79,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// связи, Vault, кэш выжимок (`POST /cache`, `DELETE /cache/{id}`, `promote`; чтение кэша —
 /// в [`service_routes`]). Изменяющие запросы с `X-Zam-Session` считает
 /// [`sessions::count_memory_writes`]; оценка записи (`/feedback`) — не запись в память.
-/// Любой новый путь записи в память — сюда (решение контроллера R12); MCP задачи 9 вызывает
-/// эти маршруты через внутренний `Router`.
+/// Любой новый путь записи в память — сюда (решение контроллера R12); MCP ([`crate::mcp`])
+/// вызывает эти маршруты через внутренний `Router`.
 fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
     let note_limit = note_body_limit(limits);
     Router::new()

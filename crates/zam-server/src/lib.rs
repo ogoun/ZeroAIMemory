@@ -11,6 +11,7 @@ pub mod error;
 pub mod index_state;
 pub mod logging;
 pub mod maintenance;
+pub mod mcp;
 pub mod ml;
 pub mod models;
 pub mod qdrant;
