@@ -14,6 +14,7 @@ use crate::auth::AuthState;
 use crate::config::{AdminSecret, ServerConfig};
 use crate::error::not_found;
 use crate::index_state::IndexRuntime;
+use crate::maintenance::Maintenance;
 use crate::rerank::RerankSlot;
 use crate::vault::VaultKeys;
 use crate::{api, bootstrap, ml, web};
@@ -45,11 +46,15 @@ pub struct AppState {
     pub rerank: Arc<RerankSlot>,
     /// Ключи Vault (§7.6): мастер-ключ, ключи пользователей, состояние блокировки.
     pub vault: Arc<VaultKeys>,
+    /// Воркер обслуживания (срок хранения сессий); снимается с последней копией состояния.
+    pub maintenance: Arc<Maintenance>,
 }
 
 impl AppState {
-    /// Штатная остановка фоновых частей: воркер индексации, перечанковка R1, Qdrant.
+    /// Штатная остановка фоновых частей: обслуживание, воркер индексации, перечанковка R1,
+    /// Qdrant.
     pub async fn shutdown(&self) {
+        self.maintenance.stop();
         self.index.shutdown(&self.system, &self.users).await;
     }
 }
@@ -152,7 +157,9 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     bootstrap::register_solutions(&system, &users).await;
     let index = Arc::new(IndexRuntime::start(&cfg, ml, early_sup, &system, &users).await);
     let rerank = Arc::new(RerankSlot::new(&cfg));
+    let maintenance = Arc::new(Maintenance::start(system.clone(), users.clone()));
     let state = AppState {
+        maintenance,
         users,
         index,
         rerank,
@@ -176,7 +183,7 @@ fn router(state: AppState) -> Router {
     let base = state.cfg.server.base_path.clone();
     let index = web::Index::new(&base);
     let root = index.clone();
-    let api = api::router(&state.cfg.limits)
+    let api = api::router(&state)
         .merge(web::assets_router())
         .fallback(move |m, u| web::fallback(index.clone(), m, u))
         .with_state(state);

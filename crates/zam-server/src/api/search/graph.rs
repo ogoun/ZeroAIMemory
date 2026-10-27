@@ -165,6 +165,7 @@ pub(super) async fn expand_graph(
                 rerank_score: None,
                 via: Some(c.via),
                 folder: None,
+                seen: false,
             }
         })
         .collect())

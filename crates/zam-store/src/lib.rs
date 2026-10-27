@@ -2,7 +2,8 @@
 //! узлы и ревизии заметок с синхронной индексацией (чанки §8.2, FTS5), outbox векторной
 //! индексации (`index_jobs`), кэш эмбеддингов, полнотекстовый поиск, блобы вложений,
 //! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
-//! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3).
+//! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3), сессии агентов,
+//! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4).
 
 pub mod access;
 pub mod blobs;
@@ -18,11 +19,13 @@ pub mod migrate;
 pub mod nodes;
 pub mod paths;
 pub mod search;
+pub mod sessions;
 pub mod solution_registry;
 pub mod system;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
 pub mod time;
+pub mod usage;
 pub mod user_db;
 pub mod vault;
 
@@ -79,11 +82,17 @@ pub use search::{
     live_folders, neighbor_leaves, node_leaves, pending_count, query_needles, sanitize_fts,
     search_fts, search_fts_channels, text_snippet,
 };
+pub use sessions::{
+    SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, add_memory_write,
+    check_session_id, end_session, gc_sessions, get_session, list_sessions, mark_seen, seen_revs,
+    touch_session,
+};
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,
     WebSession,
 };
+pub use usage::{UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, usage_counts};
 pub use user_db::{
     RechunkNotice, RechunkProgress, RechunkReason, Space, SpaceKind, USER_MIGRATIONS, UserDbs,
     create_solution, create_solution_with_id, get_solution, get_space, list_spaces,

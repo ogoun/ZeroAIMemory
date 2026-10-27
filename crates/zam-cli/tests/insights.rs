@@ -471,3 +471,63 @@ fn insight_log_with_triggers_dedup_and_supersede() {
             .any(|e| e["id"] == g.as_str())
     );
 }
+
+/// `zam insight feedback` (§10.5): оценки попадают в `usage` записи и видны в `insight show`.
+#[test]
+fn insight_feedback_counts() {
+    let (url, tok) = start("feedback");
+    let r = tmp("feedback-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "LF в bash",
+            "--scope",
+            "global",
+        ],
+        "CRLF ломает shebang.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    assert_eq!(
+        ok(&z(&["insight", "feedback", &id, "useful"])).trim(),
+        format!("{id} useful")
+    );
+    ok(&z(&[
+        "insight",
+        "feedback",
+        &id,
+        "useless",
+        "--session",
+        "s-1",
+    ]));
+    ok(&z(&["insight", "feedback", &id, "useful"]));
+    let j = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(
+        j["usage"],
+        serde_json::json!({"shown": 0, "useful": 2, "useless": 1})
+    );
+    let text = ok(&z(&["insight", "show", &id]));
+    assert!(
+        text.contains("показы: 0 · полезно: 2 · бесполезно: 1"),
+        "{text}"
+    );
+    // неизвестная оценка — отказ разбора аргументов, неизвестная запись — ошибка сервера
+    assert_ne!(
+        z(&["insight", "feedback", &id, "meh"]).status.code(),
+        Some(0)
+    );
+    let missing = zam_core::Id::new().to_string();
+    assert_ne!(
+        z(&["insight", "feedback", &missing, "useful"])
+            .status
+            .code(),
+        Some(0)
+    );
+}

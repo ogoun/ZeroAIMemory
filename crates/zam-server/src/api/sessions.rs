@@ -1,0 +1,222 @@
+//! Сессии агентов (§6.3, §10.3, §12; задача 5 M4).
+//!
+//! - `POST /sessions {id?, agent?, solution?, area?}` → 201 `{id}`: без `id` — UUIDv7;
+//!   существующая сессия обновляется (известные поля дописываются, `last_seen_at` — сейчас).
+//!   Машина и токен — из `X-Zam-Machine` и принципала;
+//! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
+//! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, started_at, last_seen_at,
+//!   ended_at, memory_writes}` (решение контроллера R6, читает хук `checkpoint`);
+//! - `GET /sessions?solution=&limit=` → `{items}` — свои, свежие первыми (50, до 500).
+//!
+//! Сессия лежит в базе пользователя запроса (у администратора — `X-Zam-User` или он сам):
+//! чужая сессия — 404. Помимо явного `POST` сессия создаётся первым запросом с
+//! `X-Zam-Session` (поиск, `/read`, `/recall`) и записью в память ([`count_memory_writes`]).
+//! Токен `ro` сессии ведёт: это служебный учёт, а не запись в память.
+//!
+//! **Счётчик записей в память** (решение контроллера R1) — одна точка: слой
+//! [`count_memory_writes`] на маршрутах записи в память (узлы, вложения, записи журналов,
+//! связи, Vault; позже — `cache_put`). Изменяющий запрос с `X-Zam-Session`, завершившийся
+//! успехом (2xx), увеличивает `memory_writes` этой сессии в базе пользователя запроса; сессии
+//! нет — она создаётся. Неудачная запись и чтение не считаются. Принципал слой получает из
+//! [`PrincipalSlot`], который заполняет извлечение обработчика, — токен не проверяется дважды.
+//! Сбой счётчика ответ не портит (WARN без id сессии и текста).
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use zam_core::SolutionGuid;
+use zam_store::{
+    Db, SessionTouch, add_memory_write, end_session, get_session, list_sessions, touch_session,
+};
+
+use super::{json_body, query};
+use crate::app::AppState;
+use crate::attrib::{MACHINE_HEADER, SESSION_HEADER, header_value, session_touch};
+use crate::auth::{Principal, PrincipalSlot, target_user_id};
+use crate::error::ApiError;
+
+/// Сессий в списке по умолчанию.
+const LIST_DEFAULT: usize = 50;
+/// Предел списка сессий.
+const LIST_MAX: usize = 500;
+
+/// База пользователя запроса (без проверки существования: принципал уже проверен).
+async fn requester_db(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<Db, ApiError> {
+    let user = crate::auth::target_user(st, p, headers).await?;
+    Ok(st.users.get(user.id).await?)
+}
+
+/// Сессия запроса и база пользователя запроса, где она лежит.
+pub struct RequestSession {
+    pub id: String,
+    pub db: Db,
+}
+
+/// Отмечает обращение сессии запроса (поиск, `/read`, `/recall`): сессия создаётся, если её
+/// нет. `session_id` из тела сильнее `X-Zam-Session`; `None` — запрос без сессии.
+pub async fn touch_from_request(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    body_session: Option<&str>,
+) -> Result<Option<RequestSession>, ApiError> {
+    let Some(touch) = session_touch(p, headers, body_session)? else {
+        return Ok(None);
+    };
+    let db = st.users.get(target_user_id(st, p, headers)?).await?;
+    touch_session(&db, &touch).await?;
+    Ok(Some(RequestSession { id: touch.id, db }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewSession {
+    id: Option<String>,
+    agent: Option<String>,
+    solution: Option<String>,
+    area: Option<String>,
+}
+
+/// `POST /sessions`.
+pub async fn create(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let req: NewSession = json_body(body)?;
+    let solution_guid = req
+        .solution
+        .as_deref()
+        .map(|g| {
+            g.trim()
+                .parse::<SolutionGuid>()
+                .map_err(|_| ApiError::BadRequest("solution: GUID решения".into()))
+        })
+        .transpose()?;
+    let blank = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let touch = SessionTouch {
+        id: blank(req.id).unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        token_id: match &p {
+            Principal::Token(t) => Some(t.token_id),
+            Principal::Admin { .. } => None,
+        },
+        solution_guid,
+        area: blank(req.area),
+        machine: header_value(&headers, MACHINE_HEADER)?,
+        agent: blank(req.agent),
+    };
+    let db = requester_db(&st, &p, &headers).await?;
+    touch_session(&db, &touch).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "id": touch.id }))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchSession {
+    ended: bool,
+}
+
+/// `PATCH /sessions/{id}`.
+pub async fn patch(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<StatusCode, ApiError> {
+    let req: PatchSession = json_body(body)?;
+    let db = requester_db(&st, &p, &headers).await?;
+    if !end_session(&db, &id, req.ended).await? {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /sessions/{id}`.
+pub async fn get(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<zam_store::Session>, ApiError> {
+    let db = requester_db(&st, &p, &headers).await?;
+    get_session(&db, &id)
+        .await?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListQuery {
+    solution: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /sessions`.
+pub async fn list(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    q: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let q = query(q)?;
+    let limit = q.limit.unwrap_or(LIST_DEFAULT);
+    if !(1..=LIST_MAX).contains(&limit) {
+        return Err(ApiError::BadRequest(format!("limit: от 1 до {LIST_MAX}")));
+    }
+    let solution = q
+        .solution
+        .as_deref()
+        .map(|g| {
+            g.trim()
+                .parse::<SolutionGuid>()
+                .map_err(|_| ApiError::BadRequest("solution: GUID решения".into()))
+        })
+        .transpose()?;
+    let db = requester_db(&st, &p, &headers).await?;
+    let items = list_sessions(&db, solution.as_ref(), limit).await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+/// Слой маршрутов записи в память: успешный изменяющий запрос с `X-Zam-Session` —
+/// `memory_writes + 1` у этой сессии (см. модуль).
+pub async fn count_memory_writes(
+    State(st): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let write = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    // некорректный заголовок отклонит сам обработчик (атрибуция, 400)
+    if !write || !matches!(header_value(req.headers(), SESSION_HEADER), Ok(Some(_))) {
+        return next.run(req).await;
+    }
+    let headers = req.headers().clone();
+    let slot = PrincipalSlot::default();
+    req.extensions_mut().insert(slot.clone());
+    let resp = next.run(req).await;
+    if !resp.status().is_success() {
+        return resp;
+    }
+    if let Some(p) = slot.take()
+        && let Err(e) = count(&st, &p, &headers).await
+    {
+        tracing::warn!(error = %e, "счётчик записей в память сессии не обновлён");
+    }
+    resp
+}
+
+async fn count(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(touch) = session_touch(p, headers, None)? else {
+        return Ok(());
+    };
+    let db = st.users.get(target_user_id(st, p, headers)?).await?;
+    add_memory_write(&db, &touch).await?;
+    Ok(())
+}

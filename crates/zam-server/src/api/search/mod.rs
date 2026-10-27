@@ -14,6 +14,12 @@
 //!   баллом `родитель × search.graph_weight`, `sources: ["graph"]`, `via: {type, from}`);
 //! - `top_k` (10, 1..=100), `budget_tokens` (800), `format`: `json` (по умолчанию) | `md`;
 //! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже);
+//! - `session_id` (или `X-Zam-Session`) — сессия агента: первый поиск с ней создаёт сессию
+//!   ([`super::sessions`]); `skip_seen` (по умолчанию `true`) — элемент, уже выданный этой
+//!   сессии в той же ревизии, идёт с `seen: true` без фрагмента и текста (в md — `(seen)`, §9.3);
+//!   текст `mode=chunks`, отданный целиком (не усечённый бюджетом), записывается в
+//!   `session_seen` базы пользователя запроса с владельцем базы цели. Карточки папок не
+//!   отмечаются;
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release` (по умолчанию все
 //!   четыре), `folder` — карточки папок (см. «Папки»), `attachment` принимается, но ничего не
 //!   находит (вложения — M5); `filters.status` — статусы insight (по умолчанию `active`,
@@ -167,10 +173,10 @@ use zam_search::{
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
-    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
-    TargetFilter, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_targets,
-    live_chunks, live_folders, neighbor_leaves, node_content, pending_count, query_needles,
-    search_fts_channels, text_snippet,
+    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, SeenItem, SeenKey, Space,
+    SpaceKind, TargetFilter, count_tokens, get_embeddings, get_node, leaf_term_hits,
+    leaves_of_targets, live_chunks, live_folders, mark_seen, neighbor_leaves, node_content,
+    pending_count, query_needles, search_fts_channels, seen_revs, text_snippet,
 };
 
 use self::merge::merge_channels;
@@ -179,6 +185,7 @@ use self::targets::{
 };
 use super::json_body;
 use super::scope::skip_foreign;
+use super::sessions::{RequestSession, touch_from_request};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
@@ -367,6 +374,10 @@ struct SearchReq {
     format: Option<OutFormat>,
     expand: Option<Expand>,
     rerank: Option<RerankMode>,
+    /// Не повторять выданное этой сессии (по умолчанию — да, §9.1).
+    skip_seen: Option<bool>,
+    /// Сессия агента; иначе — `X-Zam-Session`.
+    session_id: Option<String>,
 }
 
 impl SearchSection {
@@ -573,6 +584,8 @@ struct Item {
     via: Option<(zam_store::EdgeType, TargetRef)>,
     /// Карточка папки: число живых детей (см. модуль, «Папки»).
     folder: Option<i64>,
+    /// Уже выдан этой сессии в той же ревизии (`skip_seen`, §9.3): без фрагмента и текста.
+    seen: bool,
 }
 
 /// Текст пары реранкера: заголовок секции и текст чанка.
@@ -1039,6 +1052,9 @@ struct Packed {
 
 /// Строка карточки без текста: по ней считается стоимость в токенах.
 fn card_summary(it: &Item, mode: SearchMode) -> &str {
+    if it.seen {
+        return "";
+    }
     match mode {
         SearchMode::Notes => it.l0.as_deref().unwrap_or(""),
         _ => &it.hit.snippet,
@@ -1162,9 +1178,10 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
             o.insert("certainty".into(), json!(h.certainty));
         }
     }
+    o.insert("seen".into(), json!(p.item.seen));
     if mode == SearchMode::Notes {
         o.insert("l0".into(), json!(p.item.l0));
-    } else {
+    } else if !p.item.seen {
         o.insert("snippet".into(), json!(h.snippet));
     }
     if let Some((t, truncated)) = &p.text {
@@ -1254,6 +1271,14 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
             line.pop();
         }
         line.push_str(&format!(" · via {} ← {from}\n", t.as_str()));
+    }
+    // выдан этой сессии в той же ревизии: пометка вместо фрагмента (§9.3)
+    if p.item.seen {
+        if line.ends_with('\n') {
+            line.pop();
+        }
+        line.push_str("   (seen)\n");
+        return line;
     }
     match &p.text {
         Some((t, _)) => {
@@ -1398,7 +1423,37 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
         rerank_score: None,
         via: None,
         folder: Some(f.child_count),
+        seen: false,
     }
+}
+
+/// Ключ выданного: владелец базы цели элемента и цель.
+fn seen_key(targets: &[SearchTarget], it: &Item) -> SeenKey {
+    SeenKey {
+        owner_id: targets[it.target].owner,
+        target: it.hit.target,
+    }
+}
+
+/// Помечает элементы, уже выданные сессии в той же ревизии (`seen`), и снимает их текст.
+async fn mark_seen_items(
+    s: &RequestSession,
+    targets: &[SearchTarget],
+    items: &mut [Item],
+) -> Result<(), ApiError> {
+    let keys: Vec<SeenKey> = items
+        .iter()
+        .filter(|it| it.folder.is_none())
+        .map(|it| seen_key(targets, it))
+        .collect();
+    let revs = seen_revs(&s.db, &s.id, &keys).await?;
+    for it in items.iter_mut().filter(|it| it.folder.is_none()) {
+        if revs.get(&seen_key(targets, it)) == Some(&it.hit.rev) {
+            it.seen = true;
+            it.text = None;
+        }
+    }
+    Ok(())
 }
 
 /// `POST /search`.
@@ -1428,6 +1483,7 @@ pub async fn search(
     kinds.area = area_filter(req.scope.area.as_deref())?;
     let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
+    let session = touch_from_request(&st, &p, &headers, req.session_id.as_deref()).await?;
     let mut health = Health::new(&targets, warnings);
     let prefix = req
         .scope
@@ -1694,6 +1750,7 @@ pub async fn search(
                 rerank_score: None,
                 via: None,
                 folder: None,
+                seen: false,
             })
         })
         .collect();
@@ -1792,7 +1849,25 @@ pub async fn search(
     items.retain(|it| health.alive[it.target]);
     let mut warnings = health.warnings;
     dedup_keep_order(&mut warnings);
+    // выданное этой сессии в той же ревизии — без фрагмента и текста (§9.3)
+    if let Some(s) = &session
+        && req.skip_seen.unwrap_or(true)
+    {
+        mark_seen_items(s, &targets, &mut items).await?;
+    }
     let packed = pack_items(items, mode, budget);
+    // текст `mode=chunks`, отданный целиком, — выдан сессии
+    if let (Some(s), SearchMode::Chunks) = (&session, mode) {
+        let given: Vec<SeenItem> = packed
+            .iter()
+            .filter(|p| matches!(p.text, Some((_, false))) && p.item.folder.is_none())
+            .map(|p| SeenItem {
+                key: seen_key(&targets, &p.item),
+                rev: p.item.hit.rev,
+            })
+            .collect();
+        mark_seen(&s.db, &s.id, &given).await?;
+    }
     let degraded = available.err().or(vrun.failed);
     let by_id: HashMap<Id, Space> = targets
         .into_iter()
@@ -1893,6 +1968,7 @@ mod tests {
                 rerank_score: None,
                 via: None,
                 folder: None,
+                seen: false,
             })
             .collect()
     }

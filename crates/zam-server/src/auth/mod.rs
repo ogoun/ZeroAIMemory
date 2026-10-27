@@ -4,6 +4,7 @@ pub mod rate;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
@@ -59,6 +60,23 @@ impl std::fmt::Debug for AuthState {
 pub enum Principal {
     Token(AuthToken),
     Admin { session_id: String },
+}
+
+/// Ячейка принципала запроса: слой, которому нужен принципал после обработчика (счётчик
+/// записей в память сессии, [`crate::api::sessions::count_memory_writes`]), кладёт её в
+/// расширения запроса, а извлечение [`Principal`] заполняет — без повторной проверки токена.
+#[derive(Clone, Default)]
+pub struct PrincipalSlot(Arc<Mutex<Option<Principal>>>);
+
+impl PrincipalSlot {
+    fn put(&self, p: &Principal) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
+    }
+
+    /// Принципал, если обработчик его извлёк.
+    pub fn take(&self) -> Option<Principal> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 /// Только администратор по cookie-сессии; токены — 403.
@@ -228,29 +246,38 @@ impl FromRequestParts<AppState> for Principal {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        let Ok(client) = Client::from_request_parts(parts, st).await;
-        if let Some(token) = bearer(&parts.headers) {
-            return authenticate_token(st, client.ip, token).await;
+        let p = authenticate(parts, st).await?;
+        if let Some(slot) = parts.extensions.get::<PrincipalSlot>() {
+            slot.put(&p);
         }
-        let Some(sid) = cookie_value(&parts.headers, SESSION_COOKIE) else {
-            return Err(ApiError::Unauthorized);
-        };
-        let Some(ws) = st.system.get_web_session(&sid).await? else {
-            return Err(ApiError::Unauthorized);
-        };
-        if !matches!(parts.method, Method::GET | Method::HEAD) {
-            let sent = parts
-                .headers
-                .get(CSRF_HEADER)
-                .map(|v| v.as_bytes())
-                .unwrap_or_default();
-            if !ct_eq(sent, ws.csrf_token.as_bytes()) {
-                tracing::warn!(ip = %client.ip, "запрос администратора без верного CSRF-токена");
-                return Err(ApiError::Forbidden);
-            }
-        }
-        Ok(Principal::Admin { session_id: sid })
+        Ok(p)
     }
+}
+
+/// Принципал по bearer-токену или cookie администратора (с CSRF на изменяющих запросах).
+async fn authenticate(parts: &mut Parts, st: &AppState) -> Result<Principal, ApiError> {
+    let Ok(client) = Client::from_request_parts(parts, st).await;
+    if let Some(token) = bearer(&parts.headers) {
+        return authenticate_token(st, client.ip, token).await;
+    }
+    let Some(sid) = cookie_value(&parts.headers, SESSION_COOKIE) else {
+        return Err(ApiError::Unauthorized);
+    };
+    let Some(ws) = st.system.get_web_session(&sid).await? else {
+        return Err(ApiError::Unauthorized);
+    };
+    if !matches!(parts.method, Method::GET | Method::HEAD) {
+        let sent = parts
+            .headers
+            .get(CSRF_HEADER)
+            .map(|v| v.as_bytes())
+            .unwrap_or_default();
+        if !ct_eq(sent, ws.csrf_token.as_bytes()) {
+            tracing::warn!(ip = %client.ip, "запрос администратора без верного CSRF-токена");
+            return Err(ApiError::Forbidden);
+        }
+    }
+    Ok(Principal::Admin { session_id: sid })
 }
 
 impl FromRequestParts<AppState> for AdminOnly {
@@ -264,15 +291,11 @@ impl FromRequestParts<AppState> for AdminOnly {
     }
 }
 
-/// Пользователь, от имени которого действует запрос: для токена — его владелец
-/// (`X-Zam-User` игнорируется); для администратора — `X-Zam-User` или он сам.
-/// Несуществующий пользователь — 404 (база для него не создаётся).
-pub async fn target_user(
-    st: &AppState,
-    p: &Principal,
-    headers: &HeaderMap,
-) -> Result<User, ApiError> {
-    let id = match p {
+/// Id пользователя, от имени которого действует запрос, без проверки, что он есть: для
+/// токена — его владелец (`X-Zam-User` игнорируется); для администратора — `X-Zam-User` или
+/// он сам.
+pub fn target_user_id(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<Id, ApiError> {
+    Ok(match p {
         Principal::Token(t) => t.user_id,
         Principal::Admin { .. } => match headers.get(USER_HEADER) {
             Some(v) => v
@@ -282,7 +305,17 @@ pub async fn target_user(
                 .ok_or_else(|| ApiError::BadRequest("некорректный X-Zam-User".into()))?,
             None => st.admin_id,
         },
-    };
+    })
+}
+
+/// Пользователь, от имени которого действует запрос ([`target_user_id`]).
+/// Несуществующий пользователь — 404 (база для него не создаётся).
+pub async fn target_user(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+) -> Result<User, ApiError> {
+    let id = target_user_id(st, p, headers)?;
     st.system.get_user(id).await?.ok_or(ApiError::NotFound)
 }
 

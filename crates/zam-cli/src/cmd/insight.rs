@@ -1,5 +1,5 @@
 //! Insights (§7.5, §13.2): `zam log insight …` и `zam insight list|show|supersede|retract|
-//! revisit|append`.
+//! revisit|append|certify|feedback`.
 //!
 //! - `zam log insight --kind K --title T [--scope solution|global] [--certainty C]
 //!   [--evidence-file F] [--trigger TYPE:PATTERN]… [--tag X]… [--force] [--supersedes ID]
@@ -17,6 +17,10 @@
 //!   смена эпистемического статуса (§7.5) обычным токеном: `theorem` — с доказательством
 //!   (`--evidence-file` дописывается в `data.evidence`); `axiom` агент ставит и меняет только
 //!   по прямому указанию пользователя (§14.2), сервер это не проверяет.
+//!
+//! - `zam insight feedback ID useful|useless [--session S]` — оценка полезности записи (§10.5,
+//!   `POST /entries/{id}/feedback`, источник `agent`); печатает `<id> <оценка>`. Показы и оценки
+//!   (`usage`) — в `insight show`.
 //!
 //! `certify`, `append` и `revisit` правят запись с ревизией (§11.3): `rev` — из
 //! `GET /entries/{id}`, запрос — с `If-Match`; запись изменилась между чтением и правкой (409) —
@@ -334,6 +338,14 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
             t["pattern"].as_str().unwrap_or("")
         ));
     }
+    let u = &e["usage"];
+    if u.is_object() {
+        out.push_str(&format!(
+            "показы: {} · полезно: {} · бесполезно: {}
+",
+            u["shown"], u["useful"], u["useless"]
+        ));
+    }
     let body = e["body"].as_str().unwrap_or("");
     if !body.is_empty() {
         out.push('\n');
@@ -461,6 +473,26 @@ pub fn certify(
             e["id"].as_str().unwrap_or("?"),
             e["rev"],
             e["certainty"].as_str().unwrap_or("none")
+        )
+        .as_bytes(),
+    )
+}
+
+/// `zam insight feedback <id> useful|useless [--session S]`.
+pub fn feedback(ctx: &Ctx, id: &str, value: &str, session: Option<&str>) -> Result<(), CliError> {
+    let mut body = json!({ "value": value });
+    if let Some(s) = session {
+        body["session_id"] = json!(s);
+    }
+    ctx.client
+        .post_json(&format!("/entries/{id}/feedback"), &body)?;
+    if ctx.json {
+        return emit_json(&json!({ "id": id, "value": value }));
+    }
+    emit(
+        format!(
+            "{id} {value}
+"
         )
         .as_bytes(),
     )

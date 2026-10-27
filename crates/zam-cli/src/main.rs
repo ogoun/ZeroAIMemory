@@ -320,6 +320,17 @@ enum InsightCmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Оценить полезность записи: useful или useless (показы и оценки — в `insight show`)
+    Feedback {
+        id: String,
+        #[arg(value_parser = ["useful", "useless"])]
+        value: String,
+        /// Сессия агента (session_id)
+        #[arg(long)]
+        session: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
     /// Дописать к тексту insight (из --body-file или stdin)
     Append {
         id: String,
@@ -602,6 +613,12 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
             body_file,
             common,
         } => i::append(&cmd::connect(&common)?, &id, body_file.as_deref()),
+        InsightCmd::Feedback {
+            id,
+            value,
+            session,
+            common,
+        } => i::feedback(&cmd::connect(&common)?, &id, &value, session.as_deref()),
         InsightCmd::Certify {
             id,
             certainty,

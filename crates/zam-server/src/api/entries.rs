@@ -9,7 +9,8 @@
 //!   решение владельца 2026-10-26): без него 428 `/problems/precondition-required`,
 //!   расхождение — 409 с текущей ревизией `rev`; ревизия проверяется раньше прав;
 //!   `POST /entries/{id}/restore` (`If-Match` необязателен, при наличии проверяется),
-//!   `GET /entries/{id}/revisions`.
+//!   `GET /entries/{id}/revisions`; `GET /entries/{id}` отдаёт и `usage: {shown, useful,
+//!   useless}` (§10.5, оценка — [`super::feedback`]).
 //!
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
 //! уходит в [`super::insights::create`] (дедупликация, `scope`, триггеры, замещение).
@@ -34,7 +35,7 @@ use serde_json::{Value, json};
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, NewEntry, SpaceKind,
     create_entry, delete_entry, entry_by_idempotency_key, entry_revisions, list_entries,
-    restore_entry, update_entry,
+    restore_entry, update_entry, usage_counts,
 };
 
 use super::insights::{entry_json, parse_triggers};
@@ -433,7 +434,14 @@ pub async fn get(
 ) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
-    Ok(Json(entry_json(&sc.db, &sc.entry).await?))
+    let mut v = entry_json(&sc.db, &sc.entry).await?;
+    // показы и оценки — из базы, где лежит запись (§10.5)
+    let target = zam_core::TargetRef {
+        kind: zam_core::TargetKind::Entry,
+        id: sc.entry.id,
+    };
+    v["usage"] = json!(usage_counts(&sc.db, target).await?);
+    Ok(Json(v))
 }
 
 /// `Some(None)` для `null`, `Some(Some(v))` для значения, `None` для отсутствующего поля.
