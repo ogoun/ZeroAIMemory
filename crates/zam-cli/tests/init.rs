@@ -859,21 +859,102 @@ fn init_both_tokens_differ_and_stale_tmp_removed() {
     assert!(keep.exists(), "чужой файл не тронут");
 }
 
-/// Симлинк AGENTS.md → CLAUDE.md остаётся ссылкой, пишется целевой файл (fix round 3, N-3).
-#[cfg(unix)]
+/// Симлинк на файл `link → target`; `false`, если создать нельзя (Windows без режима
+/// разработчика или прав администратора) — тогда тест пропускается.
+fn symlink_file(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let r = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let r = std::os::windows::fs::symlink_file(target, link);
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("симлинк не создан ({e}) — тест пропущен");
+            false
+        }
+    }
+}
+
+/// Симлинк AGENTS.md → CLAUDE.md остаётся ссылкой, пишется целевой файл (fix round 3, N-3;
+/// fix round 4 — и на Windows, если симлинк можно создать).
 #[test]
 fn init_keeps_symlink_and_writes_target() {
     let (url, tok) = start("symlink");
     let p = Proj::new("symlink", &url, &tok);
-    std::fs::write(p.repo.join("CLAUDE.md"), "# свой текст\n").unwrap();
-    std::os::unix::fs::symlink("CLAUDE.md", p.repo.join("AGENTS.md")).unwrap();
+    std::fs::write(
+        p.repo.join("CLAUDE.md"),
+        "# свой текст
+",
+    )
+    .unwrap();
+    if !symlink_file(Path::new("CLAUDE.md"), &p.repo.join("AGENTS.md")) {
+        return;
+    }
     let o = p.init(&["--agent", "codex", "--yes"], "");
     ok(&o);
     let meta = std::fs::symlink_metadata(p.repo.join("AGENTS.md")).unwrap();
     assert!(meta.file_type().is_symlink(), "ссылка сохранена");
     let t = p.read("CLAUDE.md");
     assert!(
-        t.starts_with("# свой текст\n\n<!-- zeroaimemory:begin v2 -->"),
+        t.starts_with(
+            "# свой текст
+
+<!-- zeroaimemory:begin v2 -->"
+        ),
         "{t}"
     );
+}
+
+/// Симлинк AGENTS.md → файл вне проекта (`~/.bashrc`): отказ с кодом 1 даже с `--yes`,
+/// внешний файл и проект не изменились, решение не зарегистрировано (fix round 4, F1).
+#[test]
+fn init_refuses_symlink_outside_project() {
+    let (url, tok) = start("symlink-out");
+    let p = Proj::new("symlink-out", &url, &tok);
+    let bashrc = p.home.join(".bashrc");
+    std::fs::write(
+        &bashrc,
+        "export A=1
+",
+    )
+    .unwrap();
+    if !symlink_file(&bashrc, &p.repo.join("AGENTS.md")) {
+        return;
+    }
+    let before = p.snapshot();
+    let o = p.init(&["--agent", "codex", "--yes"], "");
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    let e = err(&o);
+    assert!(
+        e.contains("AGENTS.md") && e.contains("за пределы проекта") && e.contains(".bashrc"),
+        "{e}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bashrc).unwrap(),
+        "export A=1
+"
+    );
+    assert_eq!(p.snapshot(), before, "ничего не записано");
+    let (_, body) = api_get(&p, "/solutions");
+    assert!(
+        !body.contains("\"repo\""),
+        "решение не зарегистрировано: {body}"
+    );
+}
+
+/// Висячий симлинк AGENTS.md: отказ, ссылка не заменена обычным файлом (fix round 4, F3).
+#[test]
+fn init_refuses_dangling_symlink() {
+    let (url, tok) = start("symlink-dangling");
+    let p = Proj::new("symlink-dangling", &url, &tok);
+    if !symlink_file(Path::new("missing.md"), &p.repo.join("AGENTS.md")) {
+        return;
+    }
+    let o = p.init(&["--agent", "codex", "--yes"], "");
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    let e = err(&o);
+    assert!(e.contains("AGENTS.md") && e.contains("висячая"), "{e}");
+    let meta = std::fs::symlink_metadata(p.repo.join("AGENTS.md")).unwrap();
+    assert!(meta.file_type().is_symlink(), "ссылка осталась ссылкой");
+    assert!(!p.repo.join("missing.md").exists());
 }

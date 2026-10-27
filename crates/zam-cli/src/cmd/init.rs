@@ -224,13 +224,55 @@ fn merge_json(
 /// Метка временных файлов `zam init`: `.<имя>.zam-init.<pid>.tmp`.
 const TMP_MARK: &str = ".zam-init.";
 
-/// Запись файла проекта (fix round 1, M-5; fix round 3, N-3): симлинк разрешается
-/// (`canonicalize`) — пишется его целевой файл, а ссылка остаётся ссылкой; временный файл в
+/// Куда на самом деле пишется файл проекта `path` (fix round 4, F1, F3): путь разрешается
+/// через ближайшего существующего предка (`canonicalize` — сам файл, если он есть; иначе его
+/// каталог) и сверяется с каноническим корнем проекта. Симлинк (файл или каталог по пути)
+/// с целью вне корня — отказ: в чужом репозитории `AGENTS.md → ~/.bashrc` иначе дописал бы
+/// блок в `~/.bashrc`; `--yes` это не подтверждает. Висячий симлинк (`canonicalize` не
+/// срабатывает) — тоже отказ, а не замена ссылки обычным файлом. Ссылки внутри проекта
+/// (`AGENTS.md → CLAUDE.md`) пишут свою цель.
+fn resolve_in_root(root: &Path, path: &Path) -> Result<PathBuf, CliError> {
+    let name = rel(root, path);
+    let croot = std::fs::canonicalize(root)
+        .map_err(|e| CliError::config(format!("корень проекта {}: {e}", root.display())))?;
+    let mut base = path;
+    let target = loop {
+        if std::fs::symlink_metadata(base).is_ok() {
+            let rest = path.strip_prefix(base).unwrap_or(Path::new(""));
+            match std::fs::canonicalize(base) {
+                Ok(c) if rest.as_os_str().is_empty() => break c,
+                Ok(c) => break c.join(rest),
+                Err(e) => {
+                    let link = std::fs::read_link(base)
+                        .map(|t| format!(" → {}", t.display()))
+                        .unwrap_or_default();
+                    return Err(CliError::config(format!(
+                        "{name}: висячая символическая ссылка {}{link} ({e}) — zam init её не                          заменяет; исправьте или удалите ссылку",
+                        rel(root, base)
+                    )));
+                }
+            }
+        }
+        match base.parent() {
+            Some(p) if !p.as_os_str().is_empty() => base = p,
+            _ => return Ok(path.to_path_buf()),
+        }
+    };
+    if !target.starts_with(&croot) {
+        return Err(CliError::config(format!(
+            "{name}: символическая ссылка ведёт за пределы проекта ({}) — zam init пишет только              внутри корня проекта; замените ссылку обычным файлом или удалите её",
+            target.display()
+        )));
+    }
+    Ok(target)
+}
+
+/// Запись файла проекта (fix round 1, M-5; fix round 3, N-3): `target` — уже разрешённый
+/// [`resolve_in_root`] путь, так что ссылка остаётся ссылкой; временный файл в
 /// каталоге цели с правами прежнего и rename (3 попытки через 50 мс: на Windows файл бывает
 /// занят антивирусом или редактором); не удалось — запись поверх файла.
-fn write_project_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    let fail = |e: std::io::Error| CliError::config(format!("запись {}: {e}", path.display()));
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+fn write_project_file(target: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    let fail = |e: std::io::Error| CliError::config(format!("запись {}: {e}", target.display()));
     let dir = target.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(fail)?;
     let name = target
@@ -242,11 +284,11 @@ fn write_project_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
         let _ = std::fs::remove_file(&tmp);
         fail(e)
     })?;
-    if let Ok(m) = std::fs::metadata(&target) {
+    if let Ok(m) = std::fs::metadata(target) {
         let _ = std::fs::set_permissions(&tmp, m.permissions());
     }
     for attempt in 0..3 {
-        if std::fs::rename(&tmp, &target).is_ok() {
+        if std::fs::rename(&tmp, target).is_ok() {
             return Ok(());
         }
         if attempt < 2 {
@@ -254,7 +296,7 @@ fn write_project_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
         }
     }
     let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&target, bytes).map_err(fail)
+    std::fs::write(target, bytes).map_err(fail)
 }
 
 /// Убирает временные файлы прерванных запусков `zam init` (`.*.zam-init.*.tmp`) в каталоге
@@ -414,6 +456,13 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         None => locate::HomePlan::Unchanged,
     };
 
+    // куда пишется каждый файл: симлинк вне корня или висячий — отказ до любой записи и
+    // регистрации, `--yes` его не снимает (fix round 4, F1, F3)
+    let mut targets = std::collections::HashMap::new();
+    for p in plan.iter().chain(agent_plan.iter()) {
+        targets.insert(p.path.clone(), resolve_in_root(&root, &p.path)?);
+    }
+
     // 3. регистрация решения — после проверки всех файлов
     let reg = client
         .post_json(
@@ -439,7 +488,7 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         .into_iter()
         .chain(agent_plan.into_iter().filter(|_| agent_ok));
     for p in all {
-        write_project_file(&p.path, p.text.as_bytes())?;
+        write_project_file(&targets[&p.path], p.text.as_bytes())?;
         report.push(format!(
             "{} {}",
             if p.existed {

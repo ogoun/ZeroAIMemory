@@ -300,12 +300,14 @@ pub fn ps_quote(s: &str) -> String {
 }
 
 /// Имя решения годится для `--name` однострочника (fix round 3): 1–128 символов из букв,
-/// цифр, пробела, `.`, `_`, `-` (`^[\p{L}\p{N} ._-]{1,128}$`). Иное имя в однострочник не
+/// цифр, пробела, `.`, `_`, `-` (`^[\p{L}\p{N} ._-]{1,128}$`), не с `-` (иначе `zam` прочтёт
+/// его как флаг; fix round 4, F5). Иное имя в однострочник не
 /// попадает — `zam init` возьмёт имя каталога, переименование — `zam solution rename`;
 /// экранирование остаётся второй защитой.
 pub fn safe_cli_name(name: &str) -> bool {
     let n = name.chars().count();
     (1..=128).contains(&n)
+        && !name.starts_with('-')
         && name
             .chars()
             .all(|c| c.is_alphabetic() || c.is_numeric() || matches!(c, ' ' | '.' | '_' | '-'))
@@ -498,7 +500,18 @@ mod tests {
             "'a\u{2019}\u{2019}b\u{2018}\u{2018}'"
         );
         assert!(safe_cli_name("Платформа v2.0 core_x-1"));
-        for bad in ["", "a'b", "a;b", "x$(id)", "a\"b", "a`b", &"я".repeat(129)] {
+        for bad in [
+            "",
+            "-",
+            "-x",
+            "--yes",
+            "a'b",
+            "a;b",
+            "x$(id)",
+            "a\"b",
+            "a`b",
+            &"я".repeat(129),
+        ] {
             assert!(!safe_cli_name(bad), "{bad}");
         }
     }

@@ -152,6 +152,12 @@ Spec: [docs/specs/2026-10-17-zeroaimemory-tz.md](../specs/2026-10-17-zeroaimemor
   - N-8 — пункты 1 и 6 «Уточнить у владельца» приведены к текущему поведению.
   - Тесты: unit `shell_quoting` (raw-строки, `safe_cli_name`, типографские кавычки), `sh_quote_roundtrip_real_shell` (unix), `long_line_skipped_to_newline`; интеграционные `init_both_tokens_differ_and_stale_tmp_removed`, `init_keeps_symlink_and_writes_target` (unix), строка 4 МиБ в `mcp_proxy_answers_every_request_on_transport_errors`, опасные имена без `--name` в `agent_setup_hooks_exec_form`.
 - **Fix round 2 (CI на a6aaf16).** `agent_setup_block_under_500_tokens_ru_en` падал в CI (`ZAM_REQUIRE_ML=1`): `fetch-models --test` качал только MiniLM. Теперь `--test` качает ещё `tokenizer.json` модели `bge-m3-int8` (≈ 17 МБ, URL, размер и SHA-256 — из `deploy/models.toml`) в `target/models/tokenizers/bge-m3-int8/` — без весов и `model.toml`, поэтому модель установленной не считается; тест берёт установленную bge-m3, иначе этот токенизатор (проверено с убранными локальными моделями). Кэш CI (`target/models`) — ключ `deps-models-v3-…`: манифест не менялся, со старым ключом восстановленный кэш не пересохранялся бы, и токенизатор качался бы каждый прогон.
+- **Fix round 4 (ревью dac24ee, решения контроллера).**
+  - F1 — `zam init` сверяет разрешённый путь каждого файла проекта (`canonicalize` файла или ближайшего существующего каталога над ним) с каноническим корнем проекта до `POST /solutions` и первой записи: цель вне корня (`AGENTS.md → ~/.bashrc`, каталог `.claude` — ссылка наружу) — отказ с кодом 1, в сообщении имя файла и цель ссылки; `--yes` не подтверждает. Ссылки внутри проекта (`AGENTS.md → CLAUDE.md`) — как раньше.
+  - F3 — висячий симлинк — отказ с сообщением («висячая символическая ссылка … → …»), ссылка не заменяется обычным файлом.
+  - F5 — `safe_cli_name`: имя, начинающееся с `-`, в `--name` однострочника не выводится.
+  - F6 — `release.yml`: ключ кэша моделей `deps-models-v3-…`, как в `ci.yml`; комментарий поправлен.
+  - Тесты: `init_refuses_symlink_outside_project` (внешний файл и проект не изменились, решение не зарегистрировано), `init_refuses_dangling_symlink`, `init_keeps_symlink_and_writes_target` — теперь на unix и на Windows (без права создавать симлинки тест пропускается; на машине разработки симлинки создаются, тесты выполнены); `shell_quoting` — имена `-`, `-x`, `--yes`.
 
 ## Решения владельца (M4)
 
