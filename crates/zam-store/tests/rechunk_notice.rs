@@ -9,7 +9,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use zam_core::Id;
 use zam_store::{
@@ -118,6 +118,21 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
     }
 }
 
+/// Глобальный журнал теста. Подписчик на поток (`set_default`) терял событие на CI:
+/// параллельный тест без подписчика успевал закэшировать для callsite интерес «никогда».
+/// Глобальный подписчик ставится один раз на бинарник, строки отбираются по id базы.
+fn global_log() -> &'static Buf {
+    static LOG: OnceLock<Buf> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let buf = Buf::default();
+        tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .init();
+        buf
+    })
+}
+
 #[tokio::test]
 async fn rechunk_notice_lists_changed_keys() {
     let (dd, user, db) = seeded("rechunk-notice-keys").await;
@@ -160,16 +175,9 @@ async fn rechunk_notice_lists_changed_keys() {
     .await;
     set_meta(&db, "chunker_entries_params", Some(eold.to_string())).await;
 
-    let buf = Buf::default();
-    let sub = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_ansi(false)
-        .finish();
+    let buf = global_log();
     let dbs = UserDbs::new(dd.users_dir());
-    let reopened = {
-        let _g = tracing::subscriber::set_default(sub);
-        dbs.get(user).await.unwrap()
-    };
+    let reopened = dbs.get(user).await.unwrap();
     let notice = dbs.opened_rechunk(user).await.expect("уведомление").notice;
     assert_eq!(notice.reason, RechunkReason::Params);
     assert_eq!(
@@ -179,7 +187,10 @@ async fn rechunk_notice_lists_changed_keys() {
     );
     assert_eq!(notice.targets, 3, "две заметки и запись");
     let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-    let warn: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
+    let warn: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("WARN") && l.contains(&user.to_string()))
+        .collect();
     assert_eq!(warn.len(), 1, "{log}");
     assert!(
         warn[0].contains(&format!(
