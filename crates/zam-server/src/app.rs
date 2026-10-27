@@ -54,7 +54,7 @@ impl AppState {
     /// Штатная остановка фоновых частей: обслуживание, воркер индексации, перечанковка R1,
     /// Qdrant.
     pub async fn shutdown(&self) {
-        self.maintenance.stop();
+        self.maintenance.stop().await;
         self.index.shutdown(&self.system, &self.users).await;
     }
 }

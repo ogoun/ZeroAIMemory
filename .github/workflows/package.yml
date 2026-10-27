@@ -133,7 +133,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: zam-cli-${{ matrix.other }}
-          path: target/cli-other
+          path: cli-other
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -184,7 +184,7 @@ jobs:
       - name: package (cpu)
         env:
           VERSION: ${{ inputs.version }}
-        run: cargo xtask package --platform ${{ matrix.platform }} --flavor cpu --version "${VERSION#v}" ${{ matrix.cli_bin_arg }} --cli-other target/cli-other/${{ matrix.other_exe }}
+        run: cargo xtask package --platform ${{ matrix.platform }} --flavor cpu --version "${VERSION#v}" ${{ matrix.cli_bin_arg }} --cli-other cli-other/${{ matrix.other_exe }}
       - name: smoke (cpu)
         env:
           VERSION: ${{ inputs.version }}
@@ -202,7 +202,7 @@ jobs:
           if [ "${EXTRAS}" = "true" ]; then extra+=(--cuda); fi
           cargo xtask package --platform ${{ matrix.platform }} --flavor gpu \
             --version "${VERSION#v}" ${{ matrix.cli_bin_arg }} \
-            --cli-other target/cli-other/${{ matrix.other_exe }} "${extra[@]}"
+            --cli-other cli-other/${{ matrix.other_exe }} "${extra[@]}"
       - name: smoke-cuda
         if: inputs.extras
         env:

@@ -6,8 +6,9 @@
 //! `usage` хранится бессрочно; срок жизни кэша выжимок (§9.4): выжимки без обращений дольше
 //! `cache.ttl_days` и сверх `cache.max_entries` на базу (LRU) удаляются, превращённые в записи
 //! — нет. Работает и без модели (в отличие от воркера индексации).
-//! Задача держит только `system.db` и кэш баз пользователей; останавливается
-//! [`Maintenance::stop`] или с последней копией состояния приложения.
+//! Задача держит только `system.db` и кэш баз пользователей (открытые соединения SQLite);
+//! останавливается [`Maintenance::stop`] (с ожиданием: после него соединений задачи нет)
+//! или с последней копией состояния приложения.
 use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
@@ -29,7 +30,7 @@ pub const FIRST_RUN: Duration = Duration::from_secs(10 * 60);
 /// Фоновая задача обслуживания; снимается при уничтожении.
 #[derive(Debug)]
 pub struct Maintenance {
-    handle: JoinHandle<()>,
+    handle: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Maintenance {
@@ -45,19 +46,30 @@ impl Maintenance {
                 gc_cache_in(&system, &users, &cache, Timestamp::now()).await;
             }
         });
-        Maintenance { handle }
+        Maintenance {
+            handle: std::sync::Mutex::new(Some(handle)),
+        }
     }
 
-    /// Останавливает задачу (проход, идущий сейчас, прерывается на ближайшем ожидании;
-    /// каждая транзакция удаления атомарна).
-    pub fn stop(&self) {
-        self.handle.abort();
+    /// Останавливает задачу и ждёт её завершения (проход, идущий сейчас, прерывается на
+    /// ближайшем ожидании; каждая транзакция удаления атомарна). `abort` без ожидания
+    /// оставлял копию `UserDbs` живой после остановки: соединения закрывались позже, уже
+    /// после [`crate::AppState::shutdown`].
+    pub async fn stop(&self) {
+        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await;
+        }
     }
 }
 
 impl Drop for Maintenance {
     fn drop(&mut self) {
-        self.handle.abort();
+        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = handle {
+            h.abort();
+        }
     }
 }
 
