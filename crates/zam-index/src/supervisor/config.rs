@@ -41,6 +41,7 @@ impl SupervisorConfig {
         SupervisorConfig::External(ExternalConfig {
             grpc_url: grpc_url.into(),
             api_key,
+            exact_search: false,
         })
     }
 }
@@ -51,6 +52,9 @@ pub struct ExternalConfig {
     /// gRPC-адрес, например `http://127.0.0.1:6334`.
     pub grpc_url: String,
     pub api_key: Option<String>,
+    /// Точный поиск (`qdrant.exact_search`) — параметр запроса, действует и для внешнего
+    /// Qdrant; только для прогонов гейта eval.
+    pub exact_search: bool,
 }
 
 impl std::fmt::Debug for ExternalConfig {
@@ -58,6 +62,7 @@ impl std::fmt::Debug for ExternalConfig {
         f.debug_struct("ExternalConfig")
             .field("grpc_url", &self.grpc_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("exact_search", &self.exact_search)
             .finish()
     }
 }

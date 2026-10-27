@@ -204,10 +204,12 @@ impl QdrantSection {
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return Err(invalid("qdrant.url", "ожидается http:// или https://"));
                 }
-                Ok(Some(SupervisorConfig::external(
-                    url,
-                    self.api_key.clone().filter(|k| !k.is_empty()),
-                )))
+                let mut cfg =
+                    SupervisorConfig::external(url, self.api_key.clone().filter(|k| !k.is_empty()));
+                if let SupervisorConfig::External(x) = &mut cfg {
+                    x.exact_search = self.exact_search;
+                }
+                Ok(Some(cfg))
             }
             QdrantMode::Edge => Ok(None),
         }
@@ -1355,13 +1357,24 @@ note_max_bytes = 1000
             panic!("ожидался managed");
         };
         assert!(!m.exact_search);
-        let env = vec![env("ZAM_QDRANT__EXACT_SEARCH", "true")];
-        let c = load(None, &env, &Default::default()).unwrap();
+        let on = vec![env("ZAM_QDRANT__EXACT_SEARCH", "true")];
+        let c = load(None, &on, &Default::default()).unwrap();
         assert!(c.qdrant.exact_search);
         let Some(SupervisorConfig::Managed(m)) = c.qdrant.supervisor_config(exe).unwrap() else {
             panic!("ожидался managed");
         };
         assert!(m.exact_search);
+        // external: параметр запроса — передаётся и внешнему Qdrant
+        let ext = vec![
+            env("ZAM_QDRANT__EXACT_SEARCH", "true"),
+            env("ZAM_QDRANT__MODE", "external"),
+            env("ZAM_QDRANT__URL", "http://127.0.0.1:6334"),
+        ];
+        let c = load(None, &ext, &Default::default()).unwrap();
+        let Some(SupervisorConfig::External(x)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался external");
+        };
+        assert!(x.exact_search);
     }
 
     /// `[qdrant]` WAL и сброс (задача 19 M3): слои, перенос в супервизор, пределы.

@@ -68,7 +68,8 @@ wal_capacity_mb = 32
 # (TimeoutStopSec=94 в systemd, AppStopMethodConsole 94000 в NSSM); при 60000 (максимум) — 140 с.
 shutdown_flush_wait_ms = 14000
 # Точный поиск без HNSW и квантования (полный перебор точек) — только для прогонов гейта качества
-# eval (cargo xtask eval --quality-gate, с 0.0.5-m4); в работе не включать.
+# eval (cargo xtask eval --quality-gate, с 0.0.5-m4); в работе не включать. Действует в режимах
+# managed и external (параметр запроса), в edge — нет; при включении сервер пишет WARN на старте.
 # exact_search = false
 
 [ml]

@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 
 use super::corpus::{Corpus, EVAL_SOLUTION, INSIGHT_REF, fnv1a};
 use super::hints::refs_in_text;
-use super::metrics::{Estimate, estimate};
+use super::metrics::{Estimate, estimate, ratio_estimate};
 use super::run::{self, RunSpec, Session};
 use super::{Device, EvalArgs, Mode, Paths};
 use crate::smoke::api_text;
@@ -174,6 +174,11 @@ pub struct TokenSummary {
     pub cached_to_naive: Option<f64>,
     /// То же только по сценариям, где оба пути полны.
     pub protocol_to_naive_complete: Option<f64>,
+    /// Отношения `Σ (а) / Σ (в)` и `Σ (б) / Σ (в)` с 95 % интервалом бутстрепа сценариев.
+    pub protocol_to_naive_ci: Option<Estimate>,
+    pub cached_to_naive_ci: Option<Estimate>,
+    /// Сценариев, где путь (а) дешевле наивного.
+    pub protocol_cheaper: usize,
     pub summary_tokens_total: usize,
 }
 
@@ -212,6 +217,30 @@ pub fn summarize(runs: &[ScenarioRun]) -> TokenSummary {
             both.iter().map(|r| r.protocol.tokens).sum(),
             both.iter().map(|r| r.naive.tokens).sum(),
         ),
+        protocol_to_naive_ci: ratio_estimate(
+            &runs
+                .iter()
+                .map(|r| r.protocol.tokens as f64)
+                .collect::<Vec<_>>(),
+            &runs
+                .iter()
+                .map(|r| r.naive.tokens as f64)
+                .collect::<Vec<_>>(),
+        ),
+        cached_to_naive_ci: ratio_estimate(
+            &runs
+                .iter()
+                .map(|r| r.cached.tokens as f64)
+                .collect::<Vec<_>>(),
+            &runs
+                .iter()
+                .map(|r| r.naive.tokens as f64)
+                .collect::<Vec<_>>(),
+        ),
+        protocol_cheaper: runs
+            .iter()
+            .filter(|r| r.protocol.tokens < r.naive.tokens)
+            .count(),
         summary_tokens_total: runs.iter().map(|r| r.summary_tokens).sum(),
         protocol,
         cached,
@@ -551,12 +580,22 @@ pub fn render_md(r: &TokensResult) -> String {
         ));
     }
     let pct = |x: Option<f64>| x.map_or("—".into(), |v| format!("{:.1} %", v * 100.0));
+    let ci = |e: &Option<Estimate>| {
+        e.map_or("—".into(), |e| {
+            format!("{:.1}…{:.1} %", e.lo * 100.0, e.hi * 100.0)
+        })
+    };
     s.push_str(&format!(
-        "\n(а) / (в): {}; по сценариям, где оба пути полны: {}; (б) / (в): {}. Выжимки агента \
+        "\n(а) / (в): {} (95 % бутстреп сценариев: {}); по сценариям, где оба пути полны: {}; \
+         (а) дешевле (в) в {} из {} сценариев; (б) / (в): {} ({}). Выжимки агента \
          (вывод, не ответ сервера): {} токенов всего.\n\n",
         pct(u.protocol_to_naive),
+        ci(&u.protocol_to_naive_ci),
         pct(u.protocol_to_naive_complete),
+        u.protocol_cheaper,
+        r.scenarios.len(),
         pct(u.cached_to_naive),
+        ci(&u.cached_to_naive_ci),
         u.summary_tokens_total
     ));
     s.push_str("| id | (а) токены | полно | (б) | полно | (в) | полно | примечание |\n|---|---|---|---|---|---|---|---|\n");
@@ -666,6 +705,9 @@ mod tests {
         assert!((u.protocol_to_naive_complete.unwrap() - 1240.0 / 3900.0).abs() < 1e-12);
         assert!((u.protocol.complete.unwrap().mean - 0.5).abs() < 1e-12);
         assert_eq!(u.summary_tokens_total, 20);
+        assert_eq!(u.protocol_cheaper, 2);
+        let ci = u.protocol_to_naive_ci.unwrap();
+        assert!((ci.mean - 1540.0 / 7700.0).abs() < 1e-12 && ci.lo <= ci.mean && ci.mean <= ci.hi);
         assert!((u.protocol.tokens_mean.unwrap().mean - 770.0).abs() < 1e-12);
     }
 

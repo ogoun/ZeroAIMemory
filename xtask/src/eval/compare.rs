@@ -159,6 +159,12 @@ fn old_corpus(repo: &Path, v: &Value) -> Option<BTreeSet<String>> {
     Some(set)
 }
 
+/// Выдача без новых целей: только цели прежнего корпуса `old` (заметки и insight), порядок
+/// прежний.
+fn old_targets_only(ranked: Vec<String>, old: &BTreeSet<String>) -> Vec<String> {
+    ranked.into_iter().filter(|t| old.contains(t)).collect()
+}
+
 /// Релевантные цели нового запроса для сравнения: `expect` и, если прежний запрос знает
 /// `also` (поле есть), `also`; `None` — `also` разные (запрос не общий).
 fn relevant_for(q: &QueryRun, o: &Value) -> Option<Vec<String>> {
@@ -213,13 +219,8 @@ pub fn compare(repo: &Path, prev: &Path, r: &RunResult) -> Result<Comparison> {
     let ranked = |q: &QueryRun| q.hits.iter().map(|h| h.path.clone()).collect::<Vec<_>>();
     // новый прогон — по разметке прежнего (см. модуль)
     let new_m = |p: &Pair| score(&ranked(p.0), &p.2);
-    let new_without_new = |p: &Pair, set: &BTreeSet<String>| {
-        let kept: Vec<String> = ranked(p.0)
-            .into_iter()
-            .filter(|t| set.contains(t))
-            .collect();
-        score(&kept, &p.2)
-    };
+    let new_without_new =
+        |p: &Pair, set: &BTreeSet<String>| score(&old_targets_only(ranked(p.0), set), &p.2);
     let old_m = |o: &Value, k: &str| o["metrics"][k].as_f64().unwrap_or(0.0);
     let all: Vec<&Pair> = pairs.iter().collect();
     let no_e: Vec<&Pair> = pairs.iter().filter(|p| !p.0.id.starts_with("e-")).collect();
@@ -310,6 +311,38 @@ mod tests {
         );
         let other = serde_json::json!({"id": "a-01", "also": ["insight:y"]});
         assert_eq!(relevant_for(&r, &other), None);
+    }
+
+    /// Цели прежнего корпуса — заметки `eval/corpus` и insight `eval/insights.toml` его коммита
+    /// (здесь — HEAD: он есть и в неполном клоне CI).
+    #[test]
+    fn old_corpus_has_notes_and_insights_of_commit() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let head = git(repo, &["rev-parse", "--short", "HEAD"]).unwrap();
+        let v = serde_json::json!({"info": {"git": format!("{}+dirty.0", head.trim())}});
+        let set = old_corpus(repo, &v).unwrap();
+        assert!(set.contains("ru/git/revert-vs-reset"));
+        assert!(set.contains("insight:c01-a"));
+        assert!(!set.iter().any(|t| t.ends_with(".md")));
+        // неизвестный коммит — нет корпуса
+        let bad = serde_json::json!({"info": {"git": "0000000"}});
+        assert!(old_corpus(repo, &bad).is_none());
+    }
+
+    /// «Без новых целей» оставляет заметки и insight прежнего корпуса и убирает только новые.
+    #[test]
+    fn without_new_keeps_old_notes_and_insights() {
+        let old: BTreeSet<String> = ["ru/a", "insight:k1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ranked = vec![
+            "insight:new".to_string(),
+            "ru/a".to_string(),
+            "ru/new".to_string(),
+            "insight:k1".to_string(),
+        ];
+        assert_eq!(old_targets_only(ranked, &old), ["ru/a", "insight:k1"]);
     }
 
     #[test]

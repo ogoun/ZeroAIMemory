@@ -112,6 +112,16 @@ impl Supervisor {
     /// Ошибка — только если каталог занят другим супервизором ([`IndexError::Locked`])
     /// или недоступен на запись; отсутствие бинарника и падения отражаются в состоянии.
     pub async fn start(cfg: SupervisorConfig, data_dir: &Path) -> Result<Supervisor, IndexError> {
+        let exact = match &cfg {
+            SupervisorConfig::External(e) => e.exact_search,
+            SupervisorConfig::Managed(m) => m.exact_search,
+        };
+        if exact {
+            // случайно включённый ключ в работе — полный перебор всех точек на каждый поиск
+            tracing::warn!(
+                "qdrant.exact_search = true: точный поиск без HNSW и квантования                  (полный перебор точек) — только для прогонов гейта eval"
+            );
+        }
         let m = match cfg {
             SupervisorConfig::External(e) => {
                 let (tx, rx) = watch::channel(QdrantState::External);
@@ -126,7 +136,7 @@ impl Supervisor {
                     writes: WriteMark::default(),
                     tuning: None,
                     shutdown_flush_wait: Duration::ZERO,
-                    exact_search: false,
+                    exact_search: e.exact_search,
                 });
             }
             SupervisorConfig::Managed(m) => m,

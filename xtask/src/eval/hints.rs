@@ -318,7 +318,8 @@ pub struct HintMetrics {
     pub expected: usize,
     /// Показанные, которые ожидались; `None` — не показано ни одной.
     pub hint_precision: Option<Estimate>,
-    /// Ожидаемые, которые показаны; `None` — релевантных случаев нет.
+    /// Ожидаемые, которые показаны, — относительно `min(|expected|, 3)` (сервер показывает не
+    /// больше трёх подсказок, [`recall_cap`]); `None` — релевантных случаев нет.
     pub hint_recall: Option<Estimate>,
     /// Нерелевантные случаи без подсказок; `None` — нерелевантных нет.
     pub silence_rate: Option<Estimate>,
@@ -326,8 +327,20 @@ pub struct HintMetrics {
     pub case_hit_rate: Option<Estimate>,
 }
 
+/// Знаменатель полноты случая: ожидаемых, но не больше лимита подсказок ответа
+/// (`HINTS_MAX` = 3): случай с пятью релевантными записями при трёх показанных и верных —
+/// полный, полнота мерит отбор, а не лимит сервера **[решение исполнителя, fix round 1]**.
+pub fn recall_cap(o: &Outcome) -> f64 {
+    o.expected.len().min(HINTS_MAX) as f64
+}
+
+/// Попаданий случая для полноты (не больше [`recall_cap`]).
+fn capped_hit(o: &Outcome) -> f64 {
+    (o.shown.iter().filter(|s| o.expected.contains(s)).count() as f64).min(recall_cap(o))
+}
+
 /// Метрики набора: точность считает и подсказки на нерелевантных случаях (они ложные), тишина
-/// — доля нерелевантных случаев без подсказок, полнота — по ожидаемым.
+/// — доля нерелевантных случаев без подсказок, полнота — по ожидаемым (с лимитом подсказок).
 pub fn hint_metrics(outcomes: &[Outcome]) -> HintMetrics {
     let hit = |o: &Outcome| o.shown.iter().filter(|s| o.expected.contains(s)).count() as f64;
     let shown: Vec<f64> = outcomes.iter().map(|o| o.shown.len() as f64).collect();
@@ -345,10 +358,8 @@ pub fn hint_metrics(outcomes: &[Outcome]) -> HintMetrics {
         expected: rel.iter().map(|o| o.expected.len()).sum(),
         hint_precision: ratio_estimate(&good, &shown),
         hint_recall: ratio_estimate(
-            &rel.iter().map(|o| hit(o)).collect::<Vec<_>>(),
-            &rel.iter()
-                .map(|o| o.expected.len() as f64)
-                .collect::<Vec<_>>(),
+            &rel.iter().map(|o| capped_hit(o)).collect::<Vec<_>>(),
+            &rel.iter().map(|o| recall_cap(o)).collect::<Vec<_>>(),
         ),
         silence_rate: opt(irr.iter().map(|o| flag(o.shown.is_empty())).collect()),
         case_hit_rate: opt(rel.iter().map(|o| flag(hit(o) > 0.0)).collect()),
@@ -585,7 +596,8 @@ pub fn deltas(a: &[Outcome], b: &[Outcome]) -> Deltas {
     assert_eq!(a.len(), b.len(), "парное сравнение на одних случаях");
     let hit = |o: &Outcome| o.shown.iter().filter(|s| o.expected.contains(s)).count() as f64;
     let shown = |o: &Outcome| o.shown.len() as f64;
-    let expected = |o: &Outcome| o.expected.len() as f64;
+    let expected = |o: &Outcome| recall_cap(o);
+    let rhit = |o: &Outcome| capped_hit(o);
     let col = |v: &[Outcome], f: &dyn Fn(&Outcome) -> f64| v.iter().map(f).collect::<Vec<_>>();
     let rel = |v: &[Outcome]| -> Vec<Outcome> {
         v.iter()
@@ -609,9 +621,9 @@ pub fn deltas(a: &[Outcome], b: &[Outcome]) -> Deltas {
             &col(b, &shown),
         ),
         hint_recall: paired_ratio_diff(
-            &col(&ra, &hit),
+            &col(&ra, &rhit),
             &col(&ra, &expected),
-            &col(&rb, &hit),
+            &col(&rb, &rhit),
             &col(&rb, &expected),
         ),
         silence_rate: (!sa.is_empty()).then(|| paired_diff(&sa, &sb)),
@@ -776,8 +788,26 @@ impl Hooks {
             .take()
             .context("stdin хука")?
             .write_all(stdin.to_string().as_bytes())?;
-        let out = child.wait_with_output()?;
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // ожидание — в своём потоке: время выхода точное, а зависший процесс убивается по
+        // CALL_TIMEOUT (хук обязан укладываться в свой бюджет и никогда не висеть)
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = child.wait_with_output();
+            let _ = tx.send((out, Instant::now()));
+        });
+        let (out, done) = match rx.recv_timeout(CALL_TIMEOUT) {
+            Ok(r) => r,
+            Err(_) => {
+                kill_pid(pid);
+                bail!(
+                    "zam hook {cmd}: не завершился за {} с — процесс {pid} убит",
+                    CALL_TIMEOUT.as_secs()
+                );
+            }
+        };
+        let out = out?;
+        let ms = done.duration_since(t0).as_secs_f64() * 1000.0;
         if !out.status.success() {
             bail!(
                 "zam hook {cmd}: код {:?} (хук обязан выходить с 0)",
@@ -821,6 +851,25 @@ impl Hooks {
             .skip(before)
             .map(String::from)
             .collect()
+    }
+}
+
+/// Принудительное завершение процесса по pid (зависший хук).
+fn kill_pid(pid: u32) {
+    let st = if cfg!(windows) {
+        Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    } else {
+        Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+    };
+    if !st.is_ok_and(|s| s.success()) {
+        eprintln!("не удалось завершить процесс хука {pid}");
     }
 }
 
@@ -1642,6 +1691,10 @@ mod tests {
         assert!((m.hint_recall.unwrap().mean - 1.0 / 3.0).abs() < 1e-12);
         assert!((m.silence_rate.unwrap().mean - 2.0 / 3.0).abs() < 1e-12);
         assert!((m.case_hit_rate.unwrap().mean - 0.5).abs() < 1e-12);
+        // полнота — относительно min(|expected|, 3): три верных из пяти ожидаемых — полный случай
+        let capped = hint_metrics(&[o(&["a", "b", "c"], &["a", "b", "c", "d", "e"])]);
+        assert_eq!(capped.hint_recall.unwrap().mean, 1.0);
+        assert_eq!(capped.expected, 5);
         // полная тишина: точность не определена, тишина — 1
         let quiet = hint_metrics(&[o(&[], &["a"]), o(&[], &[])]);
         assert!(quiet.hint_precision.is_none());
