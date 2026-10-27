@@ -33,18 +33,24 @@ async fn setup(a: &Api, tok: &str, q: &str) -> Value {
     r.json()
 }
 
-/// Счётчик токенов модели bge-m3 (как у чанкера) из `target/models`; нет модели — `None`
-/// (в CI с `ZAM_REQUIRE_ML` — падение).
+/// Счётчик токенов модели bge-m3 (как у чанкера) из `target/models`: установленная модель или
+/// одиночный токенизатор `tokenizers/bge-m3-int8/` (его качает `cargo xtask fetch-models
+/// --test`, в том числе в CI); нет — `None` (в CI с `ZAM_REQUIRE_ML` — падение).
 fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/models");
-    for id in ["bge-m3-int8", "bge-m3-fp16"] {
-        if let Ok(c) = zam_ml::BgeTokenCounter::load(&dir, id) {
+    let tokenizers = dir.join("tokenizers");
+    for (d, id) in [
+        (&dir, "bge-m3-int8"),
+        (&dir, "bge-m3-fp16"),
+        (&tokenizers, "bge-m3-int8"),
+    ] {
+        if let Ok(c) = zam_ml::BgeTokenCounter::load(d, id) {
             return Some(c);
         }
     }
     assert!(
         std::env::var_os("ZAM_REQUIRE_ML").is_none(),
-        "нет токенизатора bge-m3: cargo xtask fetch-models"
+        "нет токенизатора bge-m3: cargo xtask fetch-models --test"
     );
     eprintln!("пропуск: нет токенизатора bge-m3 в target/models");
     None

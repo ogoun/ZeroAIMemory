@@ -265,6 +265,45 @@ fn fetch_models(ids: Vec<String>, test: bool, accept_nc: bool) -> Result<()> {
             zam_fetch::MODEL_SPEC_FILE
         );
     }
+    if test {
+        fetch_test_tokenizer(&manifest, &models)?;
+    }
+    Ok(())
+}
+
+/// Модель, токенизатор которой нужен тестам бюджета блока инструкции (§14.2: ≤ 500 токенов по
+/// счётчику модели; `zam-server/tests/agent_setup.rs`).
+const TEST_TOKENIZER_MODEL: &str = "bge-m3-int8";
+/// Каталог одиночных токенизаторов в `target/models`: `tokenizers/<id>/tokenizer.json` — без
+/// весов и `model.toml`, поэтому модель не считается установленной.
+const TEST_TOKENIZERS_DIR: &str = "tokenizers";
+
+/// `--test`: ещё `tokenizer.json` модели [`TEST_TOKENIZER_MODEL`] (≈ 17 МБ) из манифеста — с
+/// проверкой размера и SHA-256, повторно не качается.
+fn fetch_test_tokenizer(manifest: &ModelsManifest, models: &Path) -> Result<()> {
+    let m = manifest.get(TEST_TOKENIZER_MODEL)?;
+    let f = m
+        .files
+        .iter()
+        .find(|f| f.path == "tokenizer.json")
+        .with_context(|| format!("{TEST_TOKENIZER_MODEL}: нет tokenizer.json в манифесте"))?;
+    let dest = models
+        .join(TEST_TOKENIZERS_DIR)
+        .join(&m.id)
+        .join("tokenizer.json");
+    let cached = zam_fetch::fetch_file(&f.url, &f.sha256, Some(f.size), &dest)
+        .with_context(|| format!("токенизатор {}", m.id))?;
+    println!(
+        "токенизатор {} ({:.1} МБ): {} — {}",
+        m.id,
+        f.size as f64 / 1e6,
+        dest.display(),
+        if cached {
+            "на месте"
+        } else {
+            "загружен"
+        }
+    );
     Ok(())
 }
 

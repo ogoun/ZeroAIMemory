@@ -88,7 +88,9 @@ jobs:
           path: |
             target/deps
             target/models
-          key: deps-models-v2-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
+          # v3: fetch-models --test качает ещё tokenizers/bge-m3-int8 (задача 11 M4) — новый
+          # ключ, иначе восстановленный кэш без токенизатора не пересохранялся бы
+          key: deps-models-v3-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
       - name: fetch-deps
         run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
       - name: fetch-models
