@@ -2,8 +2,8 @@
 //! процесс; §10.3) — **только локально, без сети**:
 //!
 //! - `file_glob` — по `tool_input.file_path` (у NotebookEdit — `notebook_path`) относительно
-//!   корня решения (`/` как разделитель; вне корня — полный путь); на Windows без учёта
-//!   регистра; `command_regex` — по `tool_input.command`;
+//!   корня (`/` как разделитель, `.` и `..` нормализуются; вне корня — не сопоставляется); на
+//!   Windows без учёта регистра; `command_regex` — по `tool_input.command`;
 //! - триггер с `tools` — только для этих инструментов (без учёта регистра);
 //! - Codex правит файлы инструментом `apply_patch` (`tool_input.command` — текст патча): пути для
 //!   `file_glob` — из заголовков `*** Add File:`, `*** Update File:`, `*** Delete File:` (и
@@ -16,7 +16,7 @@
 //!
 //! Подсказка: `ZeroAIMemory: для <маска>: <title> [<вид>, <certainty>] — i:<id>`, для команды —
 //! без «для …». Показ `pre_tool` в `usage` сервера не пишется: сети здесь нет.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
 use regex::RegexBuilder;
@@ -50,7 +50,8 @@ pub fn patch_files(patch: &str) -> Vec<String> {
     ];
     let mut out: Vec<String> = Vec::new();
     for line in patch.lines() {
-        let l = line.trim();
+        // заголовок — только с начала строки; снимаются `\r` и хвостовые пробелы
+        let l = line.trim_end();
         if let Some(p) = HEADS.iter().find_map(|h| l.strip_prefix(h)) {
             let p = p.trim();
             if !p.is_empty() && !out.iter().any(|x| x == p) {
@@ -131,26 +132,45 @@ fn command_of(inp: &Input) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// Путь файла для масок: относительно корня с `/`, вне корня — полный с `/`.
-pub fn glob_path(file: &str, cwd: &Path, root: &Path) -> String {
+/// Лексическая нормализация пути: `.` убирается, `..` сворачивает предыдущий компонент
+/// (выше корня файловой системы — остаётся корень); файловая система не читается.
+fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Путь файла для масок (fix round 2): нормализованный (`.`, `..`) путь относительно корня с
+/// `/`; путь вне корня (в том числе выше него через `..`) не сопоставляется — `None`.
+pub fn glob_path(file: &str, cwd: &Path, root: &Path) -> Option<String> {
     let p = Path::new(file);
-    let abs = if p.is_absolute() {
+    let abs = normalize(&if p.is_absolute() {
         p.to_path_buf()
     } else {
         cwd.join(p)
-    };
+    });
     let norm = |p: &Path| p.to_string_lossy().replace('\\', "/");
-    let (a, r) = (norm(&abs), norm(root));
+    let (a, r) = (norm(&abs), norm(&normalize(root)));
     let r = r.trim_end_matches('/');
     let rel = if cfg!(windows) {
         strip_prefix_ci(&a, r)
     } else {
         a.strip_prefix(r)
     };
-    match rel.filter(|rest| rest.starts_with('/')) {
-        Some(rest) => rest.trim_start_matches('/').to_string(),
-        None => a,
-    }
+    rel.filter(|rest| rest.starts_with('/'))
+        .map(|rest| rest.trim_start_matches('/').to_string())
+        .filter(|rest| !rest.is_empty())
 }
 
 /// `strip_prefix` без учёта регистра (пути Windows).
@@ -176,7 +196,7 @@ fn matches<'a>(
     let tool = (!tool.is_empty()).then_some(tool);
     let rels: Vec<String> = files
         .iter()
-        .map(|f| glob_path(f, &env.cwd, &env.root))
+        .filter_map(|f| glob_path(f, &env.cwd, &env.root))
         .collect();
     let command = command.map(|c| super::head_bytes(c, COMMAND_SCAN_MAX));
     let mut out = Vec::new();
@@ -219,18 +239,10 @@ mod tests {
 
     #[test]
     fn patch_headers() {
-        let p = "*** Begin Patch
-*** Add File: scripts/new.sh
-+echo
-*** Update File: src/a.rs
-                 @@
--x
-+y
-*** Move to: src/b.rs
-*** Delete File: old.txt
-                 *** Update File: src/a.rs
-*** End Patch
-";
+        let p = "*** Begin Patch\n*** Add File: scripts/new.sh\r\n+echo\n*** Update File: src/a.rs  \n\
+                 @@\n-x\n+y\n*** Move to: src/b.rs\n*** Delete File: old.txt\n\
+                 *** Update File: src/a.rs\n  *** Add File: indented.sh\n+ *** Add File: added-line.sh\n\
+                 *** End Patch\n";
         assert_eq!(
             patch_files(p),
             ["scripts/new.sh", "src/a.rs", "src/b.rs", "old.txt"]
@@ -250,20 +262,34 @@ mod tests {
         } else {
             "/proj/scripts/deploy.sh"
         };
-        assert_eq!(glob_path(f, root, root), "scripts/deploy.sh");
-        assert_eq!(glob_path("a/b.sh", &root.join("x"), root), "x/a/b.sh");
+        let g = |f: &str, cwd: &Path| glob_path(f, cwd, root);
+        assert_eq!(g(f, root).as_deref(), Some("scripts/deploy.sh"));
+        assert_eq!(g("a/b.sh", &root.join("x")).as_deref(), Some("x/a/b.sh"));
+        // нормализация: «.» и «..» внутри корня
+        assert_eq!(g("./a/./b/../c.sh", root).as_deref(), Some("a/c.sh"));
+        assert_eq!(g("../y/z.sh", &root.join("x")).as_deref(), Some("y/z.sh"));
+        // выше корня и вне его — не сопоставляется
+        assert_eq!(g("../a.sh", root), None);
+        assert_eq!(g("x/../../a.sh", root), None);
         let outside = if cfg!(windows) {
             "D:\\o\\a.sh"
         } else {
             "/o/a.sh"
         };
-        assert!(glob_path(outside, root, root).ends_with("o/a.sh"));
+        assert_eq!(g(outside, root), None);
         // префикс имени — не корень
         let sibling = if cfg!(windows) {
             "C:\\proj2\\a.sh"
         } else {
             "/proj2/a.sh"
         };
-        assert!(glob_path(sibling, root, root).contains("proj2"));
+        assert_eq!(g(sibling, root), None);
+        // ..-обход в абсолютном пути
+        let tricky = if cfg!(windows) {
+            "C:\\proj\\..\\etc\\a.sh"
+        } else {
+            "/proj/../etc/a.sh"
+        };
+        assert_eq!(g(tricky, root), None);
     }
 }

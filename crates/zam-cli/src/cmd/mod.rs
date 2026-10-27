@@ -100,8 +100,8 @@ pub fn connect(c: &Common) -> Result<Ctx, CliError> {
 
 /// Сессия агента для `X-Zam-Session` (fix round 1, I-1): `ZAM_SESSION` (`-` — без сессии)
 /// сильнее всего; иначе — только если команду запустил агент ([`hook::launched_by_agent`]):
-/// `CLAUDE_CODE_SESSION_ID`, затем текущая сессия хуков проекта (`.zeroaimemory/cache/
-/// session.json`, не старше 12 ч). Человек в обычном терминале пишет без сессии
+/// текущая сессия хуков проекта (`.zeroaimemory/cache/session.json`, не старше 12 ч), затем
+/// запасной `CLAUDE_CODE_SESSION_ID`. Человек в обычном терминале пишет без сессии
 /// **[решение контроллера, задача 10 M4]**.
 fn agent_session(cwd: &std::path::Path) -> Option<String> {
     hook::agent_session_from(

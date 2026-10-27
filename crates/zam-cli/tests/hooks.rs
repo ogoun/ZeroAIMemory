@@ -430,6 +430,71 @@ fn pre_tool_once_per_session() {
     assert!(p.session_file("edits", "c", "").is_none());
 }
 
+/// Пути `file_path` нормализуются (`.`, `..`); путь выше корня — не сопоставляется (fix round 2).
+#[test]
+fn pre_tool_normalizes_paths() {
+    let _g = serial();
+    let p = Proj::new("pre-norm", DEAD, "zam_x");
+    write_cache(&p, DEAD);
+    let run = |s: &str, f: &str| {
+        p.hook_at(
+            DEAD,
+            "pre-tool",
+            "claude",
+            write_ev(&p, s, f).to_string().as_bytes(),
+        )
+        .0
+    };
+    assert!(context(&run("n1", "a/./b/../deploy.sh"), "PreToolUse").contains("i:E1"));
+    empty(&run("n2", "../outside.sh"));
+    empty(&run("n3", "a/../../outside.sh"));
+}
+
+/// Хук из подкаталога решения с `solution.toml` в монорепо: корень — каталог решения, а не
+/// корень git (fix round 2).
+#[test]
+fn hook_root_is_solution_dir_in_monorepo() {
+    let _g = serial();
+    let p = Proj::new("monorepo", DEAD, "zam_x");
+    // монорепо: .git наверху, решение M0 (`solution.toml`) — в svc/
+    let mono = p.repo.join("mono");
+    let svc = mono.join("svc");
+    let cwd = svc.join("src");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(mono.join(".git"), "gitdir: x").unwrap();
+    std::fs::write(
+        svc.join("solution.toml"),
+        format!("agent_solution_id = \"{G}\"\nname = \"svc\"\n"),
+    )
+    .unwrap();
+    let c = json!({
+        "etag": "e1", "fetched_at": "x", "server": DEAD, "solution": G,
+        "triggers": [{"id": "t9", "entry_id": "E9", "type": "file_glob", "pattern": "scripts/*.sh",
+                      "tools": null, "title": "Скрипты svc", "insight_kind": "gotcha",
+                      "certainty": null, "space": "knowledge"}],
+    });
+    std::fs::create_dir_all(svc.join(".zeroaimemory/cache")).unwrap();
+    std::fs::write(svc.join(".zeroaimemory/cache/triggers.json"), c.to_string()).unwrap();
+    let ev = json!({
+        "session_id": "m1", "cwd": cwd, "hook_event_name": "PreToolUse", "tool_name": "Write",
+        "tool_input": {"file_path": svc.join("scripts/run.sh"), "content": "x"},
+    });
+    let (o, _) = p.hook_at(DEAD, "pre-tool", "claude", ev.to_string().as_bytes());
+    assert!(context(&o, "PreToolUse").contains("для scripts/*.sh: Скрипты svc"));
+    // без .zeroaimemory/ в svc корень находится по solution.toml
+    std::fs::remove_dir_all(svc.join(".zeroaimemory")).unwrap();
+    let ev2 = json!({
+        "session_id": "m2", "cwd": cwd, "hook_event_name": "PreToolUse", "tool_name": "Write",
+        "tool_input": {"file_path": svc.join("a.txt"), "content": "x"},
+    });
+    p.hook_at(DEAD, "pre-tool", "claude", ev2.to_string().as_bytes());
+    let marker = std::fs::read_dir(svc.join(".zeroaimemory/cache"))
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with("edits-m2-"));
+    assert!(marker, "маркер правок — в кэше каталога решения");
+}
+
 /// Codex `apply_patch` (I-3): пути — из заголовков патча, правка отмечается.
 #[test]
 fn pre_tool_codex_apply_patch_paths() {
@@ -683,8 +748,9 @@ fn checkpoint_reminds_once_and_respects_stop_hook_active() {
     );
     // напоминание не израсходовано ни PreCompact, ни выключенным сервером
     assert_eq!(hook_json(&stop("cp-2", false))["decision"], "block");
-    // сессии на сервере нет (404) — без напоминания (m-4)
+    // сессии на сервере нет (404), маркер правок есть — напоминание (fix round 2), одно
     p.hook("pre-tool", &write_ev(&p, "cp-unknown", "a.txt"));
+    assert_eq!(hook_json(&stop("cp-unknown", false))["decision"], "block");
     empty(&stop("cp-unknown", false));
     // запись агентом через CLI в текущей сессии хуков (session.json) — напоминания нет
     start_s("cp-3");

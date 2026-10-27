@@ -1016,3 +1016,43 @@ async fn recall_p95_under_budget() {
         assert!(s95 <= 200.0, "{label}: p95 {s95:.1} мс");
     }
 }
+
+/// `record: false` (задача 10, fix round 2): подсказки выдаются, но без `session_seen` и `usage` —
+/// хук `session-start` с выключенным дайджестом берёт только `hooks`.
+#[tokio::test]
+async fn recall_record_false_skips_accounting() {
+    let a = server("record-false").await;
+    let (u_id, tok) = a.new_user("Вера").await;
+    let e = insight(
+        &a,
+        &tok,
+        "knowledge",
+        "Квазар светит",
+        "Квазар — ядро.",
+        "gotcha",
+    )
+    .await;
+    let me = format!("i:{e}");
+    let j = ok(
+        &a,
+        &tok,
+        Some("nr-1"),
+        json!({"event": "session_start", "record": false}),
+    )
+    .await;
+    assert!(ids(&j).contains(&me), "{j}");
+    assert!(j["hooks"].is_object(), "{j}");
+    assert!(j["timings"]["record_ms"].is_null(), "{j}");
+    assert!(!j["warnings"].to_string().contains("recall timeout"), "{j}");
+    assert_eq!(shown(&a, &u_id, TargetKind::Entry, &e).await.shown, 0);
+    // показ не отмечен — prompt той же сессии подсказку выдаёт
+    let j = ok(
+        &a,
+        &tok,
+        Some("nr-1"),
+        json!({"event": "prompt", "prompt": "квазар"}),
+    )
+    .await;
+    assert_eq!(ids(&j), [me.as_str()], "{j}");
+    assert_eq!(shown(&a, &u_id, TargetKind::Entry, &e).await.shown, 1);
+}

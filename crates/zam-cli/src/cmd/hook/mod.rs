@@ -305,13 +305,14 @@ impl Env {
     }
 }
 
-/// Корень проекта (fix round 1, m-6): ближайший вверх от `cwd` каталог с `.zeroaimemory/`
-/// (кроме домашнего — там `~/.zeroaimemory/config.toml` пользователя), иначе корень git
-/// (каталог с `.git` — каталогом или файлом у worktree), иначе сам `cwd`.
+/// Корень проекта (fix round 1, m-6; fix round 2): ближайший вверх от `cwd` каталог с
+/// `.zeroaimemory/` (кроме домашнего — там `~/.zeroaimemory/config.toml` пользователя) или с
+/// `solution.toml` (как [`locate::find_solution`], решение в подкаталоге монорепо), иначе корень
+/// git (каталог с `.git` — каталогом или файлом у worktree), иначе сам `cwd`.
 pub fn project_root(cwd: &Path, home: &Path) -> PathBuf {
-    let marked = cwd
-        .ancestors()
-        .find(|d| *d != home && d.join(".zeroaimemory").is_dir());
+    let marked = cwd.ancestors().find(|d| {
+        (*d != home && d.join(".zeroaimemory").is_dir()) || d.join("solution.toml").is_file()
+    });
     let git = || cwd.ancestors().find(|d| d.join(".git").exists());
     marked.or_else(git).unwrap_or(cwd).to_path_buf()
 }
@@ -398,9 +399,9 @@ fn session_var(v: Option<String>) -> Option<String> {
 }
 
 /// Сессия для `X-Zam-Session` команд `zam` (см. `cmd::connect`): `ZAM_SESSION` (`-` — без
-/// сессии), иначе при запуске агентом — `CLAUDE_CODE_SESSION_ID` (⚠️ переменная из журнала
-/// изменений Claude Code 2.1.132, в справочнике не описана) и затем `current` (сессия хуков из
-/// `session.json`); человек — без сессии.
+/// сессии), иначе при запуске агентом — `current` (свежий `session.json` сессии хуков, ≤ 12 ч)
+/// и запасной `CLAUDE_CODE_SESSION_ID` (⚠️ переменная из журнала изменений Claude Code 2.1.132,
+/// в справочнике не описана; fix round 2); человек — без сессии.
 pub fn agent_session_from(
     get: impl Fn(&str) -> Option<String>,
     names: &[String],
@@ -417,7 +418,7 @@ pub fn agent_session_from(
     if !launched_by_agent(&get, names) {
         return None;
     }
-    session_var(get("CLAUDE_CODE_SESSION_ID")).or_else(current)
+    current().or_else(|| session_var(get("CLAUDE_CODE_SESSION_ID")))
 }
 
 /// Процентное кодирование сегмента пути URL (id сессии в `/sessions/{id}`).
@@ -497,6 +498,11 @@ mod tests {
         assert_eq!(project_root(&sub, &home), repo);
         std::fs::create_dir_all(repo.join("a/.zeroaimemory")).unwrap();
         assert_eq!(project_root(&sub, &home), repo.join("a"));
+        // решение M0 (`solution.toml` без `.zeroaimemory/`) в подкаталоге монорепо
+        std::fs::write(sub.join("solution.toml"), "").unwrap();
+        let deep = sub.join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(project_root(&deep, &home), sub);
     }
 
     #[test]
@@ -525,11 +531,21 @@ mod tests {
             Some("hook-s")
         );
         let p: &[(&str, &str)] = &[("CLAUDECODE", "1"), ("CLAUDE_CODE_SESSION_ID", "cc")];
+        // session.json сильнее CLAUDE_CODE_SESSION_ID, без файла — запасной вариант
         assert_eq!(
             agent_session_from(
                 env(&[("CLAUDECODE", "1"), ("CLAUDE_CODE_SESSION_ID", "cc")]),
                 &names(p),
                 cur
+            )
+            .as_deref(),
+            Some("hook-s")
+        );
+        assert_eq!(
+            agent_session_from(
+                env(&[("CLAUDECODE", "1"), ("CLAUDE_CODE_SESSION_ID", "cc")]),
+                &names(p),
+                || None
             )
             .as_deref(),
             Some("cc")

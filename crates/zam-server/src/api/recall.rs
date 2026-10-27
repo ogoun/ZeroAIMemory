@@ -56,6 +56,9 @@
 //!   срока: вышел — собранное отдаётся без `session_seen` и `usage` (`timings.record_ms: null`)
 //!   и с тем же предупреждением. Сбой внутреннего поиска `prompt` — тишина и
 //!   `warnings: ["recall search failed"]`;
+//! - `record: false` (по умолчанию `true`) — ответ без учёта: ни `session_seen`, ни `usage`,
+//!   `timings.record_ms: null` (хук `session-start` с выключенным в клиенте дайджестом берёт
+//!   только `hooks`; задача 10, fix round 2);
 //! - неизвестные поля тела игнорируются (клиент хуков может быть новее); `source` хука
 //!   (`startup | resume | clear | compact | fork`) пока только в журнал DEBUG;
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool`
@@ -168,6 +171,9 @@ pub struct RecallReq {
     tool: Option<String>,
     budget_tokens: Option<usize>,
     agent_block_version: Option<u32>,
+    /// Учитывать показ (`session_seen`, `usage`); `false` — хук `session-start` с выключенным в
+    /// клиенте дайджестом зовёт `/recall` только ради `hooks` (задача 10, fix round 2).
+    record: Option<bool>,
 }
 
 /// Кандидат в подсказки.
@@ -1058,7 +1064,9 @@ pub async fn recall(
 
     // учёт показа — если полный срок ещё не вышел; иначе собранное отдаётся без учёта
     let rt = Instant::now();
-    let record_ms = if rt < total_deadline {
+    let record_ms = if req.record == Some(false) {
+        None
+    } else if rt < total_deadline {
         record(session.as_ref(), &targets, user, req.event, &shown_now).await;
         Some(ms(rt))
     } else {

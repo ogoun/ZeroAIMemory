@@ -5,7 +5,8 @@
 //! триггеров). Вывод — дайджест `text`; `hooks` ответа запоминаются (R5).
 //!
 //! Выключенный в клиенте `session_start` гасит только вывод: `/recall` вызывается всё равно —
-//! ради `hooks` сервера (fix round 1, m-5), текст отбрасывается; регистрация сессии и кэш
+//! ради `hooks` сервера (fix round 1, m-5) и с `record: false` (без `session_seen` и `usage`,
+//! fix round 2), текст отбрасывается; регистрация сессии и кэш
 //! триггеров нужны `checkpoint`, MCP (R13) и `pre-tool`. Выключенный на сервере — дайджест,
 //! полученный в том же ответе, не выводится.
 //! На `source` `compact` и `clear` (контекст агента потерян) показанное `pre-tool` в сессии
@@ -56,6 +57,9 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
                 "solution": solution,
                 "source": source,
             });
+            if !s.client_on(Kind::SessionStart) {
+                body["record"] = json!(false);
+            }
             if let Some(v) = block_version(&env.cwd, &env.root, env.agent) {
                 body["agent_block_version"] = json!(v);
             }

@@ -1,7 +1,9 @@
 //! `zam hook checkpoint` (`Stop`, `PreCompact`; бюджет 100 мс; §10.3, R1): одно напоминание
 //! за сессию «запиши итоги в changelog/insights» — только на `Stop`, если в сессии были правки
 //! (маркер `edits-<сессия>`, пишет `pre-tool`) и `GET /sessions/{id}` даёт `memory_writes == 0`.
-//! Сервер недоступен или сессии на сервере нет (404) — не напоминать (fix round 1, m-4).
+//! Сервер недоступен (сеть, тайм-аут) — не напоминать (R1). Сессии на сервере нет (404), а
+//! маркер правок есть — напоминать: ложное напоминание раз за сессию дешевле пропущенного (fix
+//! round 2; отменяет m-4 round 1).
 //! `stop_hook_active == true` — ничего. Вывод — `{"decision": "block", "reason": …}`.
 //! На `PreCompact` — пусто (fix round 1, m-3: ⚠️ поддержку контекста на `PreCompact` у агентов
 //! проверить на машине владельца).
@@ -45,10 +47,7 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
                 return Output::Empty;
             }
         },
-        Err(e) if e.code == EXIT_NOT_FOUND => {
-            env.log("сессии нет на сервере — без напоминания");
-            return Output::Empty;
-        }
+        Err(e) if e.code == EXIT_NOT_FOUND => Some(0),
         Err(e) => {
             env.log(&format!("сессия: {e}"));
             return Output::Empty;
