@@ -31,7 +31,8 @@ pub fn load_solution(path: &Path) -> Result<Solution, CliError> {
         return Err(fail(format!("файл больше {SOLUTION_MAX} байт")));
     }
     let text = std::fs::read_to_string(path).map_err(|e| fail(e.to_string()))?;
-    let s: Solution = toml::from_str(&text).map_err(|e| fail(e.message().to_string()))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let s: Solution = toml::from_str(text).map_err(|e| fail(e.message().to_string()))?;
     if !is_guid(s.id.trim()) {
         return Err(fail("agent_solution_id — UUID с дефисами".into()));
     }

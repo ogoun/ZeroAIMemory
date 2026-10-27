@@ -93,11 +93,20 @@ pub async fn current_version(system: &SystemStore) -> Result<u32, ApiError> {
     Ok(saved.max(AGENT_BLOCK_VERSION))
 }
 
-/// Следующая версия после сохранения шаблона (записывается в `settings`).
-pub async fn bump_version(system: &SystemStore) -> Result<u32, ApiError> {
-    let next = current_version(system).await?.saturating_add(1);
-    system.set_setting(VERSION_KEY, &next).await?;
-    Ok(next)
+/// Сохранение шаблонов (`None` — сброс к шаблону по умолчанию) и рост версии — одной
+/// транзакцией (fix round 1, M-4): версия растёт на 1, только если действующий текст хотя бы
+/// одного шаблона изменился. Возвращает новую версию и изменённые ключи с признаком сброса.
+pub async fn save_templates(
+    system: &SystemStore,
+    edits: Vec<(AgentKind, Lang, Option<String>)>,
+) -> Result<Option<(u32, Vec<(String, bool)>)>, ApiError> {
+    let edits = edits
+        .into_iter()
+        .map(|(a, l, t)| (template_key(a, l), t, default_template(l).to_string()))
+        .collect();
+    Ok(system
+        .set_settings_versioned(edits, VERSION_KEY, AGENT_BLOCK_VERSION)
+        .await?)
 }
 
 /// Шаблон агента и языка: `(текст, свой ли)`.
@@ -154,11 +163,25 @@ pub struct BlockCtx<'a> {
     pub lang: Lang,
 }
 
+/// Предел длины имени решения в блоке, символов (fix round 1, I-2): длиннее — обрезка с «…»;
+/// решение однозначно задаёт GUID рядом.
+pub const BLOCK_NAME_MAX_CHARS: usize = 40;
+
+/// Имя решения для блока: не длиннее [`BLOCK_NAME_MAX_CHARS`] символов.
+pub fn block_name(name: &str) -> String {
+    if name.chars().count() <= BLOCK_NAME_MAX_CHARS {
+        return name.to_string();
+    }
+    let mut s: String = name.chars().take(BLOCK_NAME_MAX_CHARS).collect();
+    s.push('…');
+    s
+}
+
 /// Блок с маркерами версии `version`.
 pub fn render_block(template: &str, version: u32, c: &BlockCtx<'_>) -> String {
     let solution = match (c.solution, c.lang) {
-        (Some(s), Lang::Ru) => format!("«{}» (`{}`)", s.name, s.guid),
-        (Some(s), Lang::En) => format!("\"{}\" (`{}`)", s.name, s.guid),
+        (Some(s), Lang::Ru) => format!("«{}» (`{}`)", block_name(&s.name), s.guid),
+        (Some(s), Lang::En) => format!("\"{}\" (`{}`)", block_name(&s.name), s.guid),
         (None, Lang::Ru) => templates::SOLUTION_AUTO_RU.into(),
         (None, Lang::En) => templates::SOLUTION_AUTO_EN.into(),
     };
@@ -255,19 +278,38 @@ pub fn solution_toml(s: &SolutionRef) -> String {
     )
 }
 
-/// Команды установки `zam` с сервера (`GET /downloads/zam/{os}-{arch}`) и задания `ZAM_TOKEN`.
-/// `token` — открытый текст только при выпуске токена администратором, иначе заглушка.
+/// Аргумент в одинарных кавычках POSIX shell: `'` → `'\''` (fix round 1, I-3).
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\''"))
+}
+
+/// Аргумент в одинарных кавычках PowerShell: `'` → `''` (fix round 1, I-3).
+pub fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Команды установки `zam` с сервера (`GET /downloads/zam/{os}-{arch}`) (fix round 1, M-1, M-2):
+/// каталог в `Path` пользователя Windows добавляется один раз; на Linux — подсказка, если
+/// `~/.local/bin` нет в `PATH`. Токен `zam` и хуки берут из `~/.zeroaimemory/config.toml`
+/// (его пишет `zam init --token`, права 0600); `ZAM_TOKEN` нужна только MCP по HTTP — на
+/// Windows она задаётся в окружении пользователя (`token` — открытый текст только при выпуске
+/// токена администратором, иначе заглушка).
 pub fn install(url: &str, token: Option<&str>) -> Value {
-    let t = token.unwrap_or("<токен>");
+    let t = ps_quote(token.unwrap_or("<токен>"));
+    let win_url = ps_quote(&format!("{url}/downloads/zam/windows-x64"));
     let windows = format!(
         "$d = \"$env:LOCALAPPDATA\\Programs\\zam\"; New-Item -ItemType Directory -Force $d | Out-Null\n\
-         Invoke-WebRequest \"{url}/downloads/zam/windows-x64\" -OutFile \"$d\\zam.exe\"\n\
-         [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + \";$d\", 'User')\n\
-         [Environment]::SetEnvironmentVariable('ZAM_TOKEN', '{t}', 'User')\n"
+         Invoke-WebRequest {win_url} -OutFile \"$d\\zam.exe\"\n\
+         $p = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($p -split ';') -notcontains $d) {{ [Environment]::SetEnvironmentVariable('Path', $(if ($p) {{ \"$p;$d\" }} else {{ $d }}), 'User') }}\n\
+         # MCP по HTTP (.mcp.json) берёт токен из ZAM_TOKEN; zam и хуки — из ~/.zeroaimemory/config.toml (zam init --token)\n\
+         [Environment]::SetEnvironmentVariable('ZAM_TOKEN', {t}, 'User')\n"
     );
+    let lin_url = sh_quote(&format!("{url}/downloads/zam/linux-x64"));
     let linux = format!(
-        "mkdir -p ~/.local/bin && curl -fsSL \"{url}/downloads/zam/linux-x64\" -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam\n\
-         echo 'export ZAM_TOKEN={t}' >> ~/.profile && . ~/.profile\n"
+        "mkdir -p ~/.local/bin && curl -fsSL {lin_url} -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam\n\
+         case \":$PATH:\" in *\":$HOME/.local/bin:\"*) ;; *) echo 'Добавьте ~/.local/bin в PATH' ;; esac\n\
+         # токен: zam init --token сохранит его в ~/.zeroaimemory/config.toml (права 0600); MCP по HTTP\n\
+         # (.mcp.json) берёт его из ZAM_TOKEN — задайте её в окружении агента в файле, доступном только вам\n"
     );
     json!({"windows": windows, "linux": linux})
 }
@@ -278,16 +320,19 @@ pub struct InitCmd<'a> {
     pub token: Option<&'a str>,
     pub agent: AgentKind,
     pub solution: Option<&'a SolutionRef>,
+    /// Решение уже есть в реестре: только `--id` (имя берётся с сервера и из `solution.toml`).
+    pub registered: bool,
     pub hooks: bool,
     pub mcp: bool,
     pub lang: Lang,
 }
 
-/// Однострочник `zam init …` (§15.5, п. 6). AGENTS.md без хуков — `--agent codex --no-hooks`.
-pub fn init_cmd(c: &InitCmd<'_>) -> String {
-    let mut s = format!("zam init --url {}", c.url);
+/// Однострочник `zam init …` (§15.5, п. 6) для оболочки с правилом кавычек `quote`.
+/// AGENTS.md без хуков — `--agent codex --no-hooks`.
+fn init_line(c: &InitCmd<'_>, quote: fn(&str) -> String) -> String {
+    let mut s = format!("zam init --url {}", quote(c.url));
     if let Some(t) = c.token {
-        s.push_str(&format!(" --token {t}"));
+        s.push_str(&format!(" --token {}", quote(t)));
     }
     let agent = match c.agent {
         AgentKind::Claude => "claude",
@@ -295,8 +340,10 @@ pub fn init_cmd(c: &InitCmd<'_>) -> String {
     };
     s.push_str(&format!(" --agent {agent}"));
     if let Some(sol) = c.solution {
-        let name: String = sol.name.chars().filter(|c| *c != '"').collect();
-        s.push_str(&format!(" --id {} --name \"{name}\"", sol.guid));
+        s.push_str(&format!(" --id {}", sol.guid));
+        if !c.registered {
+            s.push_str(&format!(" --name {}", quote(&sol.name)));
+        }
     }
     if !c.hooks || c.agent == AgentKind::Agents {
         s.push_str(" --no-hooks");
@@ -309,6 +356,11 @@ pub fn init_cmd(c: &InitCmd<'_>) -> String {
     }
     s.push_str(" --yes");
     s
+}
+
+/// Однострочники `zam init` для Linux (POSIX shell) и Windows (PowerShell).
+pub fn init_cmd(c: &InitCmd<'_>) -> Value {
+    json!({"linux": init_line(c, sh_quote), "windows": init_line(c, ps_quote)})
 }
 
 /// Полный протокол (`GET /agent-guide`).
@@ -379,14 +431,31 @@ mod tests {
             token: None,
             agent: AgentKind::Agents,
             solution: Some(&s),
+            registered: false,
             hooks: true,
             mcp: false,
             lang: Lang::En,
         });
         assert_eq!(
-            c,
-            "zam init --url http://h:1 --agent codex --id 0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e11 \
-             --name \"Trading X\" --no-hooks --no-mcp --lang en --yes"
+            c["linux"],
+            "zam init --url 'http://h:1' --agent codex --id 0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e11 \
+             --name 'Trading \"X\"' --no-hooks --no-mcp --lang en --yes"
         );
+    }
+
+    #[test]
+    fn shell_quoting() {
+        let n = "x$(id)`whoami`'\"";
+        assert_eq!(sh_quote(n), "'x$(id)`whoami`'\''\"'");
+        assert_eq!(ps_quote(n), "'x$(id)`whoami`''\"'");
+    }
+
+    #[test]
+    fn long_name_truncated() {
+        let n = "я".repeat(128);
+        let b = block_name(&n);
+        assert_eq!(b.chars().count(), BLOCK_NAME_MAX_CHARS + 1);
+        assert!(b.ends_with('…'));
+        assert_eq!(block_name("короткое"), "короткое");
     }
 }

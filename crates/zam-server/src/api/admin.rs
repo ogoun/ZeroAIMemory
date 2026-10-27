@@ -488,22 +488,8 @@ pub async fn patch_settings(
                 .await?;
         }
     }
-    let mut changed = Vec::new();
-    for (agent, lang, text) in edits {
-        let (cur, custom) = agent_setup::template(&st.system, agent, lang).await?;
-        let same = match &text {
-            Some(t) => custom && *t == cur,
-            None => !custom,
-        };
-        if same {
-            continue;
-        }
-        let key = agent_setup::template_key(agent, lang);
-        st.system.set_setting(&key, &text).await?;
-        changed.push((key, text.is_none()));
-    }
-    if !changed.is_empty() {
-        let version = agent_setup::bump_version(&st.system).await?;
+    // шаблоны и версия — одной транзакцией; версия растёт, только если текст изменился (M-4)
+    if let Some((version, changed)) = agent_setup::save_templates(&st.system, edits).await? {
         for (key, reset) in changed {
             // текст шаблона в аудит не пишется: только ключ, сброс и новая версия
             st.system

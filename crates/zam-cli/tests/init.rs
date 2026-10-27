@@ -178,15 +178,24 @@ fn api_get(p: &Proj, path: &str) -> (u16, String) {
 
 /// POST JSON с токеном.
 fn api_post(p: &Proj, path: &str, body: &Value) -> u16 {
+    api_post_h(p, path, body, &[])
+}
+
+/// POST JSON с токеном и заголовками.
+fn api_post_h(p: &Proj, path: &str, body: &Value, headers: &[(&str, &str)]) -> u16 {
     let a = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .proxy(None)
             .http_status_as_error(false)
             .build(),
     );
-    a.post(&format!("{}/api/v1{path}", p.url))
-        .header("Authorization", format!("Bearer {}", p.token))
-        .content_type("application/json")
+    let mut rb = a
+        .post(&format!("{}/api/v1{path}", p.url))
+        .header("Authorization", format!("Bearer {}", p.token));
+    for (k, v) in headers {
+        rb = rb.header(*k, *v);
+    }
+    rb.content_type("application/json")
         .send(body.to_string().as_bytes())
         .unwrap()
         .status()
@@ -249,6 +258,13 @@ fn init_creates_solution_block_hooks_mcp() {
         toml::from_str(&std::fs::read_to_string(p.home.join(".zeroaimemory/config.toml")).unwrap())
             .unwrap();
     assert_eq!(home["token"].as_str(), Some(tok.as_str()));
+    assert_eq!(
+        home["url"].as_str(),
+        Some(url.as_str()),
+        "адрес — вместе с токеном"
+    );
+    assert!(stdout.contains("Токен и адрес сохранены"), "{stdout}");
+    assert!(!stdout.contains(">> ~/.profile"), "{stdout}");
     assert!(stdout.contains("ZAM_TOKEN"), "{stdout}");
     assert!(
         stdout.contains("SetEnvironmentVariable('ZAM_TOKEN'"),
@@ -405,10 +421,7 @@ fn init_is_idempotent_and_preserves_foreign_text_and_hooks() {
 fn init_codex_writes_codex_hooks() {
     let (url, tok) = start("codex");
     let p = Proj::new("codex", &url, &tok);
-    let o = p.init(
-        &["--agent", "codex", "--lang", "en", "--no-mcp", "--yes"],
-        "",
-    );
+    let o = p.init(&["--agent", "codex", "--lang", "en", "--yes"], "");
     ok(&o);
     let md = p.read("AGENTS.md");
     assert!(
@@ -417,7 +430,11 @@ fn init_codex_writes_codex_hooks() {
     );
     assert!(!p.repo.join("CLAUDE.md").exists());
     assert!(!p.repo.join(".claude").exists());
-    assert!(!p.repo.join(".mcp.json").exists(), "--no-mcp");
+    assert!(
+        !p.repo.join(".mcp.json").exists(),
+        "Codex не читает .mcp.json"
+    );
+    assert!(out(&o).contains("~/.codex/config.toml"), "{}", out(&o));
     let h = p.json(".codex/hooks.json");
     let cmd = |ev: &str| {
         h["hooks"][ev][0]["hooks"][0]["command"]
@@ -571,4 +588,234 @@ fn mcp_stdio_proxy_roundtrip() {
         r["error"]["message"].as_str().unwrap().contains("HTTP 401"),
         "{r}"
     );
+}
+
+#[test]
+fn init_bom_files_and_v1_token_without_flag() {
+    let (url, tok) = start("bom");
+    let p = Proj::new("bom", &url, &tok);
+    // блок v1 первой строкой файла с BOM — единственный источник адреса и токена
+    std::fs::write(
+        p.repo.join("CLAUDE.md"),
+        format!(
+            "\u{feff}<!-- zeroaimemory:begin v1 -->\nZeroAIMemoryUrl={url}\nZeroAIMemoryToken={tok}\n<!-- zeroaimemory:end -->\nхвост\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(p.repo.join(".claude")).unwrap();
+    std::fs::write(
+        p.repo.join(".claude/settings.json"),
+        "\u{feff}{\"model\": \"opus\"}\n",
+    )
+    .unwrap();
+    let o = p.cmd().args(["init", "--yes"]).output().unwrap();
+    ok(&o);
+    let stdout = out(&o);
+    let md = p.read("CLAUDE.md");
+    assert!(
+        md.starts_with("\u{feff}<!-- zeroaimemory:begin v2 -->\n"),
+        "{md:?}"
+    );
+    assert!(md.ends_with("<!-- zeroaimemory:end -->\nхвост\n"), "{md:?}");
+    assert_eq!(md.matches("zeroaimemory:begin").count(), 1);
+    assert!(!md.contains(&tok));
+    let s = p.read(".claude/settings.json");
+    assert!(s.starts_with('\u{feff}'), "BOM сохранён: {s:?}");
+    let v: Value = serde_json::from_str(s.trim_start_matches('\u{feff}')).unwrap();
+    assert_eq!(v["model"], "opus");
+    assert!(v["hooks"]["Stop"].is_array(), "{v}");
+    // токен из блока v1 перенесён вместе с адресом; совет сменить токен
+    let home: toml::Table =
+        toml::from_str(&std::fs::read_to_string(p.home.join(".zeroaimemory/config.toml")).unwrap())
+            .unwrap();
+    assert_eq!(home["token"].as_str(), Some(tok.as_str()));
+    assert_eq!(home["url"].as_str(), Some(url.as_str()));
+    assert!(stdout.contains("выпустите новый токен"), "{stdout}");
+    assert!(!stdout.contains(&tok) && !err(&o).contains(&tok));
+    // повтор без флагов: адрес — из блока, токен — из домашнего конфига; ничего не меняется
+    let before = p.snapshot();
+    let o = p.cmd().args(["init", "--yes"]).output().unwrap();
+    ok(&o);
+    assert_eq!(p.snapshot(), before);
+    assert!(!out(&o).contains("выпустите новый токен"));
+
+    // в домашнем конфиге другой токен: перенос из блока его не заменяет
+    let other = "zam_000000000000000000000000000000000000000001";
+    let cfg = p.home.join(".zeroaimemory/config.toml");
+    std::fs::write(&cfg, format!("url = \"{url}\"\ntoken = \"{other}\"\n")).unwrap();
+    std::fs::write(
+        p.repo.join("CLAUDE.md"),
+        format!("<!-- zeroaimemory:begin v1 -->\nZeroAIMemoryUrl={url}\nZeroAIMemoryToken={tok}\n<!-- zeroaimemory:end -->\n"),
+    )
+    .unwrap();
+    let o = p.cmd().args(["init", "--yes"]).output().unwrap();
+    ok(&o);
+    assert!(err(&o).contains("другой токен — не заменён"), "{}", err(&o));
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains(other));
+    assert!(!p.read("CLAUDE.md").contains(&tok));
+    // явный --token заменяет с предупреждением
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    assert!(
+        err(&o).contains("был другой токен — заменён"),
+        "{}",
+        err(&o)
+    );
+    let c = std::fs::read_to_string(&cfg).unwrap();
+    assert!(c.contains(&tok) && !c.contains(other), "{c}");
+}
+
+#[test]
+fn mcp_proxy_lets_server_pick_session() {
+    let (url, tok) = start("mcp-session");
+    let p = Proj::new("mcp-session", &url, &tok);
+    let g = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e92";
+    std::fs::create_dir_all(p.repo.join(".zeroaimemory")).unwrap();
+    std::fs::write(
+        p.repo.join(".zeroaimemory/solution.toml"),
+        format!("agent_solution_id = \"{g}\"\nname = \"Сессии\"\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        api_post(
+            &p,
+            "/solutions",
+            &json!({"agent_solution_id": g, "name": "Сессии"})
+        ),
+        201
+    );
+    // сессия хука этой машины и решения — её и выберет сервер (R13)
+    assert_eq!(
+        api_post_h(
+            &p,
+            "/sessions",
+            &json!({"id": "hook-s", "agent": "claude-code", "solution": g}),
+            &[("X-Zam-Machine", "init-box")]
+        ),
+        201
+    );
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": "memory_write", "arguments": {"path": "s.md", "content": "# S\n"}}});
+    // явная сессия окружения агента прокси не передаётся (fix round 1, I-4)
+    let o = p
+        .cmd()
+        .env("ZAM_URL", &url)
+        .env("ZAM_TOKEN", &tok)
+        .env("ZAM_SESSION", "explicit-s")
+        .env("ZAM_AGENT", "1")
+        .arg("mcp")
+        .write_stdin(format!("{call}\n"))
+        .output()
+        .unwrap();
+    ok(&o);
+    let r: Value = serde_json::from_str(out(&o).trim()).unwrap();
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let (code, body) = api_get(&p, "/sessions/hook-s");
+    assert_eq!(code, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["memory_writes"], 1, "{v}");
+    assert_eq!(api_get(&p, "/sessions/explicit-s").0, 404);
+}
+
+/// Поддельный сервер MCP: на каждое соединение — заранее заданный сырой ответ HTTP.
+fn fake_server(response: &'static [u8]) -> String {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { break };
+            // заголовки и тело запроса (Content-Length)
+            let mut buf = Vec::new();
+            let mut b = [0u8; 4096];
+            let head_end = loop {
+                let n = c.read(&mut b).unwrap_or(0);
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&b[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(i + 4);
+                }
+            };
+            let Some(head_end) = head_end else { continue };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + len {
+                let n = c.read(&mut b).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&b[..n]);
+            }
+            let _ = c.write_all(response);
+            let _ = c.flush();
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn mcp_proxy_answers_every_request_on_transport_errors() {
+    let p = Proj::new(
+        "mcp-errors",
+        "http://127.0.0.1:9",
+        "zam_000000000000000000000000000000000000000000",
+    );
+    let run = |url: &str, stdin: Vec<u8>| -> Vec<Value> {
+        let o = p
+            .cmd()
+            .env("ZAM_URL", url)
+            .env("ZAM_TOKEN", &p.token)
+            .arg("mcp")
+            .write_stdin(stdin)
+            .timeout(std::time::Duration::from_secs(60))
+            .output()
+            .unwrap();
+        ok(&o);
+        out(&o)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+            .collect()
+    };
+    let req = |id: i64| json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"});
+    let err_of = |r: &[Value], id: Value| -> String {
+        let e = r
+            .iter()
+            .find(|v| v["id"] == id)
+            .unwrap_or_else(|| panic!("нет ответа на {id}: {r:?}"));
+        assert_eq!(e["error"]["code"], -32000, "{e}");
+        e["error"]["message"].as_str().unwrap().to_string()
+    };
+    // SSE без ответа на запрос
+    let sse = fake_server(
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n: ping\n\nevent: x\n\n",
+    );
+    let r = run(&sse, format!("{}\n", req(7)).into_bytes());
+    assert!(err_of(&r, json!(7)).contains("без ответа"), "{r:?}");
+    // тело короче Content-Length (обрыв)
+    let cut = fake_server(
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{\"jsonrpc\"",
+    );
+    let r = run(&cut, format!("{}\n", req(8)).into_bytes());
+    assert!(err_of(&r, json!(8)).contains("чтение ответа"), "{r:?}");
+    // сервер недоступен: пачка — ошибка на каждый id; не UTF-8 — −32700, работа продолжается
+    let mut stdin = b"\xff\xfe\n".to_vec();
+    stdin.extend(
+        format!(
+            "{}\n",
+            json!([req(1), {"jsonrpc": "2.0", "method": "n"}, req(2)])
+        )
+        .into_bytes(),
+    );
+    let r = run("http://127.0.0.1:9", stdin);
+    assert_eq!(r.len(), 3, "{r:?}");
+    assert_eq!(r[0]["error"]["code"], -32700, "{r:?}");
+    err_of(&r, json!(1));
+    err_of(&r, json!(2));
 }

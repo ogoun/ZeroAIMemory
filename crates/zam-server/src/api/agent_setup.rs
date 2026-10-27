@@ -3,8 +3,9 @@
 //! ```text
 //! GET /agent-setup?agent=claude|agents|codex&solution=<guid|new|auto>&name=&mcp=&hooks=
 //!                  &rules_write=&lang=ru|en&token=
-//!   → 200 {version, agent, lang, url, block, tokens, tokens_exact, solution_toml?, solution?,
-//!          mcp_json?, claude_settings?, codex_hooks?, install: {windows, linux}, init_cmd}
+//!   → 200 {version, agent, lang, url, block, tokens, tokens_exact, warnings, template_custom,
+//!          solution_toml?, solution?, mcp_json?, claude_settings?, codex_hooks?,
+//!          install: {windows, linux}, init_cmd: {linux, windows}}
 //! GET /agent-guide?lang=ru|en → 200 text/markdown (полный протокол §9.3, §14)
 //! ```
 //!
@@ -38,6 +39,8 @@ use crate::error::ApiError;
 const DEFAULT_NAME: &str = "Solution";
 /// Предел длины имени решения, символов (как у `POST /solutions`).
 const NAME_MAX_CHARS: usize = 128;
+/// Бюджет блока инструкции, токенов (§14.2); больше — `warnings`.
+const BLOCK_TOKENS_MAX: usize = 500;
 /// Предел длины `Host`, байт.
 const HOST_MAX: usize = 255;
 
@@ -109,36 +112,41 @@ fn valid_name(raw: &str) -> Result<String, ApiError> {
     Ok(n.to_string())
 }
 
-/// Решение запроса (`auto` — нет).
+/// Решение запроса (`auto` — нет) и есть ли оно в реестре.
 async fn solution(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
     q: &SetupQuery,
-) -> Result<Option<SolutionRef>, ApiError> {
+) -> Result<(Option<SolutionRef>, bool), ApiError> {
     let name = q.name.as_deref().map(valid_name).transpose()?;
     let guid = match q.solution.as_deref().map(str::trim) {
-        None | Some("auto") => return Ok(None),
+        None | Some("auto") => return Ok((None, false)),
         Some("new") => SolutionGuid::new_v7(),
         Some(g) => g.parse::<SolutionGuid>().map_err(|_| {
             ApiError::BadRequest("solution: GUID решения (UUID с дефисами), new или auto".into())
         })?,
     };
+    let info = st.system.get_solution(&guid).await?;
+    let registered = info.is_some();
     let name = match name {
         Some(n) => n,
         None => {
             let user = target_user_id(st, p, headers)?;
             let admin = matches!(p, Principal::Admin { .. });
-            match st.system.get_solution(&guid).await? {
+            match info {
                 Some(i) if admin || i.owner_id == user => i.name,
                 _ => DEFAULT_NAME.into(),
             }
         }
     };
-    Ok(Some(SolutionRef {
-        guid: guid.to_string(),
-        name,
-    }))
+    Ok((
+        Some(SolutionRef {
+            guid: guid.to_string(),
+            name,
+        }),
+        registered,
+    ))
 }
 
 pub async fn setup(
@@ -164,7 +172,7 @@ pub async fn setup(
         }
     };
     let url = public_url(&st, &headers, client)?;
-    let sol = solution(&st, &p, &headers, &q).await?;
+    let (sol, registered) = solution(&st, &p, &headers, &q).await?;
     let rules_write = match q.rules_write {
         Some(v) => v,
         None => st
@@ -187,12 +195,21 @@ pub async fn setup(
             lang,
         },
     );
+    let tokens = zam_store::count_tokens(&block);
+    // бюджет блока (§14.2): шаблон администратора или длинный адрес могут его превысить
+    let mut warnings = Vec::new();
+    if tokens > BLOCK_TOKENS_MAX {
+        warnings.push(format!(
+            "блок — {tokens} токенов, больше {BLOCK_TOKENS_MAX}: сократите шаблон или адрес"
+        ));
+    }
     let mut out = json!({
         "version": version,
         "agent": agent.as_str(),
         "lang": lang.as_str(),
         "url": url,
-        "tokens": zam_store::count_tokens(&block),
+        "tokens": tokens,
+        "warnings": warnings,
         "tokens_exact": zam_store::token_counter_exact(),
         "template_custom": custom,
         "block": block,
@@ -202,6 +219,7 @@ pub async fn setup(
             token: token.as_deref(),
             agent,
             solution: sol.as_ref(),
+            registered,
             hooks,
             mcp,
             lang,

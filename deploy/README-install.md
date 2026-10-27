@@ -127,14 +127,18 @@ ZeroAIMemoryToken=<токен>
 ```
 # Windows (PowerShell)
 $d = "$env:LOCALAPPDATA\Programs\zam"; New-Item -ItemType Directory -Force $d | Out-Null
-Invoke-WebRequest "http://<хост>:7700/downloads/zam/windows-x64" -OutFile "$d\zam.exe"
-[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$d", 'User')
+Invoke-WebRequest 'http://<хост>:7700/downloads/zam/windows-x64' -OutFile "$d\zam.exe"
+$p = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($p -split ';') -notcontains $d) { [Environment]::SetEnvironmentVariable('Path', $(if ($p) { "$p;$d" } else { $d }), 'User') }
+# MCP по HTTP (.mcp.json) берёт токен из ZAM_TOKEN; zam и хуки — из ~/.zeroaimemory/config.toml
 [Environment]::SetEnvironmentVariable('ZAM_TOKEN', '<токен>', 'User')
 
 # Linux
-mkdir -p ~/.local/bin && curl -fsSL "http://<хост>:7700/downloads/zam/linux-x64" -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam
-echo 'export ZAM_TOKEN=<токен>' >> ~/.profile && . ~/.profile
+mkdir -p ~/.local/bin && curl -fsSL 'http://<хост>:7700/downloads/zam/linux-x64' -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo 'Добавьте ~/.local/bin в PATH' ;; esac
 ```
+
+Токен `zam` и хуки берут из `~/.zeroaimemory/config.toml` (права 0600) — его вместе с адресом
+записывает `zam init --token`. `ZAM_TOKEN` нужна только MCP по HTTP (см. ниже).
 
 В корне проекта:
 
@@ -151,14 +155,24 @@ zam init --url http://<хост>:7700 --token <токен> --agent claude   # cl
   `.claude/settings.json` / `.codex/hooks.json` и сервер `zeroaimemory` в `.mcp.json`; чужие хуки
   и серверы остаются; `--no-hooks`, `--no-mcp` — пропустить;
 - пишет `.zeroaimemory/.gitignore` (`cache/`, `logs/`);
-- сохраняет токен в `~/.zeroaimemory/config.toml` (не в файлы проекта).
+- сохраняет токен и адрес в `~/.zeroaimemory/config.toml` (не в файлы проекта): из `--token` или
+  из прежнего блока v1 (тогда советует выпустить новый токен — старый лежал в файле проекта);
+  другой токен там заменяет только явный `--token`;
+- для `--agent codex` `.mcp.json` не пишет (Codex читает MCP из `config.toml`, см. ниже).
+
+Однострочник `zam init` из `GET /api/v1/agent-setup` (`init_cmd.linux` / `init_cmd.windows`) уже
+экранирован для своей оболочки (одинарные кавычки).
 
 Повторный запуск ничего не ломает: так же обновляется устаревший блок (о нём напоминают
 `zam status` и дайджест в начале сессии агента). Битый JSON в `.claude/settings.json` или
 `.mcp.json` `zam init` не перезаписывает — исправьте файл и повторите.
 
 **Токен для MCP.** В `.mcp.json` токена нет — `"Authorization": "Bearer ${ZAM_TOKEN}"`, поэтому
-агент должен видеть переменную `ZAM_TOKEN` (команды выше; перезапустите агента после задания).
+агент должен видеть переменную `ZAM_TOKEN` (перезапустите агента после задания). Windows — команда
+выше (переменная пользователя). Linux — `export ZAM_TOKEN=<токен>` в файле профиля, доступном
+только вам (`chmod 600`): токен в открытом виде, переменную видят все процессы агента. Без
+переменной можно подключить MCP через stdio-прокси `zam mcp` — он берёт токен из
+`~/.zeroaimemory/config.toml`.
 
 **Codex.** Хуки — `.codex/hooks.json` (Codex попросит подтвердить их в `/hooks`). MCP Codex
 читает из `config.toml`, `zam init` его не пишет; пример для `~/.codex/config.toml` или

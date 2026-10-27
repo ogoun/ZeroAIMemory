@@ -6,6 +6,8 @@ use super::ojson::J;
 
 const BEGIN: &str = "<!-- zeroaimemory:begin";
 const END: &str = "<!-- zeroaimemory:end";
+/// Метка порядка байтов UTF-8 в начале файла (Блокнот Windows и др.).
+pub const BOM: &str = "\u{feff}";
 /// Имя сервера ZeroAIMemory в `.mcp.json`.
 pub const MCP_NAME: &str = "zeroaimemory";
 
@@ -13,6 +15,10 @@ pub const MCP_NAME: &str = "zeroaimemory";
 /// сохраняется байт в байт; у файла с CRLF блок пишется с CRLF. Нет файла — только блок; нет
 /// блока — он дописывается в конец через пустую строку. Начало без конца — ошибка.
 pub fn upsert_block(existing: Option<&str>, block: &str) -> Result<String, String> {
+    // BOM снимается на время правки и возвращается (fix round 1, I-1)
+    if let Some(rest) = existing.and_then(|t| t.strip_prefix(BOM)) {
+        return Ok(format!("{BOM}{}", upsert_block(Some(rest), block)?));
+    }
     let Some(text) = existing.filter(|t| !t.is_empty()) else {
         return Ok(block.to_string());
     };
@@ -143,7 +149,12 @@ pub fn merge_mcp(root: &mut J, fragment: &J) -> Result<(), String> {
 pub fn gitignore(existing: Option<&str>) -> String {
     let mut out = existing.unwrap_or("").to_string();
     for line in ["cache/", "logs/"] {
-        if !out.lines().any(|l| l.trim() == line) {
+        if !out
+            .strip_prefix(BOM)
+            .unwrap_or(&out)
+            .lines()
+            .any(|l| l.trim() == line)
+        {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
@@ -176,6 +187,24 @@ mod tests {
         let out = upsert_block(Some("a\n"), B2).unwrap();
         assert_eq!(out, format!("a\n\n{B2}"));
         assert_eq!(upsert_block(Some(&out), B2).unwrap(), out);
+    }
+
+    #[test]
+    fn block_with_bom_first_line() {
+        let old = "\u{feff}<!-- zeroaimemory:begin v1 -->\nZeroAIMemoryToken=zam_x\n<!-- zeroaimemory:end -->\nхвост\n";
+        let out = upsert_block(Some(old), B2).unwrap();
+        assert_eq!(out, format!("\u{feff}{B2}хвост\n"));
+        assert_eq!(upsert_block(Some(&out), B2).unwrap(), out);
+        let out = upsert_block(Some("\u{feff}текст\n"), B2).unwrap();
+        assert_eq!(out, format!("\u{feff}текст\n\n{B2}"));
+        assert_eq!(
+            upsert_block(Some("\u{feff}"), B2).unwrap(),
+            format!("\u{feff}{B2}")
+        );
+        assert_eq!(
+            gitignore(Some("\u{feff}cache/\n")),
+            "\u{feff}cache/\nlogs/\n"
+        );
     }
 
     #[test]

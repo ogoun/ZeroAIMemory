@@ -149,6 +149,8 @@ fn marker_version(path: &Path) -> Option<u32> {
         return None;
     }
     let text = std::fs::read_to_string(path).ok()?;
+    // BOM в начале файла (fix round 1, I-1)
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     text.lines().find_map(|l| {
         let rest = l.trim().strip_prefix(BEGIN)?;
         let rest = rest.trim_start().strip_prefix('v')?;

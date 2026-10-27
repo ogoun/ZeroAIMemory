@@ -733,6 +733,67 @@ impl SystemStore {
             .transpose()
     }
 
+    /// Пачка строковых настроек со счётчиком версии — одной транзакцией (шаблоны блока
+    /// инструкции, §15.5). `edits` — `(ключ, новое значение или None — сброс, значение по
+    /// умолчанию)`: действующее значение — сохранённое, иначе по умолчанию. Ключ пишется, только
+    /// если действующее значение меняется; тогда `version_key` становится
+    /// `max(сохранённая, floor) + 1`. Возвращает новую версию и изменённые ключи (с признаком
+    /// сброса) или `None`, если ничего не изменилось.
+    pub async fn set_settings_versioned(
+        &self,
+        edits: Vec<(String, Option<String>, String)>,
+        version_key: &str,
+        floor: u32,
+    ) -> Result<Option<(u32, Vec<(String, bool)>)>, StoreError> {
+        let version_key = version_key.to_string();
+        self.db
+            .write(move |tx| {
+                let get = |key: &str| -> Result<Option<String>, StoreError> {
+                    Ok(tx
+                        .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                            r.get(0)
+                        })
+                        .optional()?)
+                };
+                let mut changed = Vec::new();
+                for (key, new, default) in edits {
+                    let stored: Option<String> = match get(&key)? {
+                        Some(raw) => {
+                            serde_json::from_str::<Option<String>>(&raw).map_err(json_err)?
+                        }
+                        None => None,
+                    };
+                    let old_eff = stored.as_deref().unwrap_or(&default);
+                    let new_eff = new.as_deref().unwrap_or(&default);
+                    if old_eff == new_eff {
+                        continue;
+                    }
+                    let json = serde_json::to_string(&new).map_err(json_err)?;
+                    tx.execute(
+                        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![key, json],
+                    )?;
+                    changed.push((key, new.is_none()));
+                }
+                if changed.is_empty() {
+                    return Ok(None);
+                }
+                let saved = match get(&version_key)? {
+                    Some(raw) => serde_json::from_str::<u32>(&raw).map_err(json_err)?,
+                    None => 0,
+                };
+                let next = saved.max(floor).saturating_add(1);
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![version_key, next.to_string()],
+                )?;
+                Ok(Some((next, changed)))
+            })
+            .await
+    }
+
     pub async fn set_setting<T: Serialize + ?Sized>(
         &self,
         key: &str,

@@ -15,10 +15,13 @@
 //!
 //! **Токен** **[решение контроллера, задача 11 M4]**: в CLAUDE.md, AGENTS.md и `.mcp.json` не
 //! пишется. Заданный флагом `--token` или найденный в прежнем блоке (v1 держал
-//! `ZeroAIMemoryToken=`) токен сохраняется в `~/.zeroaimemory/config.toml` (права 0600 на
-//! unix) — там его находят `zam` и хуки ([`locate::resolve`]); MCP-клиент агента берёт его из
-//! `ZAM_TOKEN` — `zam init` печатает, как её задать в Windows и Linux. Повторный запуск
-//! идемпотентен.
+//! `ZeroAIMemoryToken=`) того файла, где блок заменяется, токен сохраняется вместе с адресом в
+//! `~/.zeroaimemory/config.toml` (права 0600 на unix) — там его находят `zam` и хуки
+//! ([`locate::resolve`]). Другой токен там заменяет только `--token` (с предупреждением), без
+//! него — предупреждение; после переноса из блока — совет сменить токен (fix round 1, I-6).
+//! MCP по HTTP (`.mcp.json`, только Claude Code) берёт токен из `ZAM_TOKEN`; для Codex —
+//! подсказка про `~/.codex/config.toml`. Файлы проекта пишутся атомарно, BOM и CRLF
+//! сохраняются. Повторный запуск идемпотентен.
 mod merge;
 mod ojson;
 
@@ -184,34 +187,58 @@ fn agent_setup(c: &Client, agent: &str, s: &Solution, o: &Opts) -> Result<Value,
     )
 }
 
-/// Слияние JSON-файла настроек: битый JSON — ошибка без записи.
+/// Слияние JSON-файла настроек: битый JSON — ошибка без записи. BOM и CRLF файла
+/// сохраняются (fix round 1, I-1).
 fn merge_json(
     root: &Path,
     path: PathBuf,
     f: impl FnOnce(&mut J) -> Result<(), String>,
 ) -> Result<Option<Planned>, CliError> {
     let old = read_opt(&path)?;
-    let mut j = match old.as_deref().filter(|t| !t.trim().is_empty()) {
-        Some(t) => J::parse(t).map_err(|e| {
+    let (bom, body) = match old.as_deref() {
+        Some(t) => match t.strip_prefix(merge::BOM) {
+            Some(rest) => (merge::BOM, rest),
+            None => ("", t),
+        },
+        None => ("", ""),
+    };
+    let mut j = if body.trim().is_empty() {
+        J::Obj(Vec::new())
+    } else {
+        J::parse(body).map_err(|e| {
             CliError::config(format!(
                 "{}: некорректный JSON ({e}) — исправьте файл, zam init его не перезаписывает",
                 rel(root, &path)
             ))
-        })?,
-        None => J::Obj(Vec::new()),
+        })?
     };
     f(&mut j).map_err(|e| CliError::config(format!("{}: {e}", rel(root, &path))))?;
     let mut text = j.pretty();
-    if old.as_deref().is_some_and(|t| t.contains("\r\n")) {
+    if body.contains("\r\n") {
         text = text.replace('\n', "\r\n");
     }
+    let text = format!("{bom}{text}");
     Ok(Planned::new(path, old.as_deref(), text))
 }
 
-/// Токен для `~/.zeroaimemory/config.toml`: заданный флагом или найденный в CLAUDE.md /
-/// AGENTS.md (прежний блок v1 держал его в файле; новый блок его не содержит).
-fn token_to_save(src: &Source) -> bool {
-    matches!(src, Source::Flag | Source::File(_))
+/// Атомарная запись файла проекта (fix round 1, M-5): временный файл в том же каталоге с
+/// правами прежнего файла и rename.
+fn write_project_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = dir.join(format!(".{name}.zam-init.{}.tmp", std::process::id()));
+    let res = (|| {
+        std::fs::write(&tmp, bytes)?;
+        if let Ok(m) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp, m.permissions())?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 fn ask(question: &str) -> bool {
@@ -256,7 +283,7 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     let (sol, sol_path, sol_new) = solution(&root, &o)?;
     let client = Client::new(&url.value, &token.value, Some(sol.id.clone()));
 
-    // 1–2. фрагменты сервера и регистрация решения
+    // 1. фрагменты сервера (только чтение)
     let agents: &[(&str, &str)] = match o.agent {
         InitAgent::Claude => &[("claude", "CLAUDE.md")],
         InitAgent::Codex => &[("codex", "AGENTS.md")],
@@ -266,15 +293,8 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     for (agent, file) in agents {
         setups.push((*agent, *file, agent_setup(&client, agent, &sol, &o)?));
     }
-    let reg = client
-        .post_json(
-            "/solutions",
-            &serde_json::json!({ "agent_solution_id": sol.id, "name": sol.name }),
-        )
-        .map_err(|e| e.context("регистрация решения"))?;
-    let pending = reg.status().as_u16() == 202;
 
-    // план файлов: всё разбирается до первой записи
+    // 2. план файлов: всё разбирается и проверяется до регистрации и первой записи (M-5)
     let mut plan: Vec<Planned> = Vec::new();
     if sol_new {
         plan.extend(Planned::new(
@@ -294,12 +314,19 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         old.as_deref(),
         merge::gitignore(old.as_deref()),
     ));
+    // токен прежнего блока (v1) того файла, где блок заменяется (I-6)
+    let mut migrated: Option<(String, &str)> = None;
     for (_, file, v) in &setups {
         let block = v["block"]
             .as_str()
             .ok_or_else(|| CliError::config("в ответе /agent-setup нет block"))?;
         let path = root.join(file);
         let old = read_opt(&path)?;
+        if migrated.is_none()
+            && let Some(t) = old.as_deref().and_then(locate::block_token)
+        {
+            migrated = Some((t, *file));
+        }
         let text = merge::upsert_block(old.as_deref(), block)
             .map_err(|e| CliError::config(format!("{file}: {e}")))?;
         plan.extend(Planned::new(path, old.as_deref(), text));
@@ -321,20 +348,38 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             agent_plan.extend(merge_json(&root, path, |j| merge::merge_hooks(j, &frag))?);
         }
     }
-    if !o.no_mcp {
+    // `.mcp.json` читает Claude Code; Codex берёт MCP из своего config.toml (M-6)
+    let claude = o.agent != InitAgent::Codex;
+    let codex = o.agent != InitAgent::Claude;
+    if !o.no_mcp && claude {
         let frag = J::from(&setups[0].2["mcp_json"]);
         agent_plan.extend(merge_json(&root, root.join(".mcp.json"), |j| {
             merge::merge_mcp(j, &frag)
         })?);
     }
-    // токен — в домашний конфиг (не в файлы проекта)
-    let home_cfg = if token_to_save(&token.source) {
-        locate::plan_home_token(&home, &token.value).map_err(CliError::config)?
+    // токен — в домашний конфиг вместе с адресом (не в файлы проекта): `--token` заменяет
+    // другой токен с предупреждением, перенесённый из блока v1 — нет
+    let forced = token.source == Source::Flag;
+    let candidate = if forced {
+        Some(token.value.clone())
     } else {
-        None
+        migrated.as_ref().map(|(t, _)| t.clone())
+    };
+    let home_plan = match &candidate {
+        Some(t) => locate::plan_home(&home, &url.value, t, forced).map_err(CliError::config)?,
+        None => locate::HomePlan::Unchanged,
     };
 
-    // 3. подтверждение для файлов агента
+    // 3. регистрация решения — после проверки всех файлов
+    let reg = client
+        .post_json(
+            "/solutions",
+            &serde_json::json!({ "agent_solution_id": sol.id, "name": sol.name }),
+        )
+        .map_err(|e| e.context("регистрация решения"))?;
+    let pending = reg.status().as_u16() == 202;
+
+    // 4. подтверждение для файлов агента
     let agent_ok = agent_plan.is_empty() || o.yes || {
         println!("Будут изменены файлы агента (чужие хуки и серверы сохраняются):");
         for p in &agent_plan {
@@ -350,11 +395,7 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         .into_iter()
         .chain(agent_plan.into_iter().filter(|_| agent_ok));
     for p in all {
-        if let Some(dir) = p.path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| CliError::config(format!("{}: {e}", dir.display())))?;
-        }
-        std::fs::write(&p.path, p.text.as_bytes())
+        write_project_file(&p.path, p.text.as_bytes())
             .map_err(|e| CliError::config(format!("{}: {e}", p.path.display())))?;
         report.push(format!(
             "{} {}",
@@ -366,7 +407,7 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             rel(&root, &p.path)
         ));
     }
-    if let Some((path, text)) = &home_cfg {
+    if let locate::HomePlan::Write { path, text, .. } = &home_plan {
         hook::cache::write_atomic(path, text.as_bytes())
             .map_err(|e| CliError::config(format!("{}: {e}", path.display())))?;
     }
@@ -387,20 +428,44 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     if skipped {
         println!("Хуки и .mcp.json не записаны: повторите с --yes.");
     }
-    if home_cfg.is_some() {
-        println!("Токен сохранён в ~/.zeroaimemory/config.toml (его берут zam и хуки).");
+    match &home_plan {
+        locate::HomePlan::Write { replaced: true, .. } => eprintln!(
+            "предупреждение: в ~/.zeroaimemory/config.toml был другой токен — заменён на заданный --token"
+        ),
+        locate::HomePlan::Write { .. } => {
+            println!("Токен и адрес сохранены в ~/.zeroaimemory/config.toml (их берут zam и хуки).")
+        }
+        locate::HomePlan::Conflict(_) => eprintln!(
+            "предупреждение: в ~/.zeroaimemory/config.toml другой токен — не заменён (заменить: zam init --token <токен>)"
+        ),
+        locate::HomePlan::Unchanged => {}
     }
-    if !o.no_mcp && agent_ok {
+    if let Some((_, file)) = &migrated {
+        println!(
+            "Токен из прежнего блока {file} убран из файла. Он лежал в файле проекта (возможно, в \
+             репозитории): выпустите новый токен в WebUI и отзовите старый."
+        );
+    }
+    if !o.no_mcp && claude && agent_ok {
         let set = std::env::var("ZAM_TOKEN").is_ok_and(|v| !v.trim().is_empty());
         if set {
-            println!("MCP берёт токен из ZAM_TOKEN — переменная задана.");
+            println!("MCP (.mcp.json) берёт токен из ZAM_TOKEN — переменная задана.");
         } else {
             println!(
-                "MCP берёт токен из переменной ZAM_TOKEN (в .mcp.json его нет). Задайте её и перезапустите агента:\n  \
+                "MCP по HTTP (.mcp.json) берёт токен из переменной ZAM_TOKEN; zam и хуки — из \
+                 ~/.zeroaimemory/config.toml (права 0600, его пишет zam init --token).\n\
+                 Задайте ZAM_TOKEN в окружении агента и перезапустите его:\n  \
                  Windows (PowerShell): [Environment]::SetEnvironmentVariable('ZAM_TOKEN', '<токен>', 'User')\n  \
-                 Linux:                echo 'export ZAM_TOKEN=<токен>' >> ~/.profile"
+                 Linux: export ZAM_TOKEN=<токен> — в файле, который читает только ваш пользователь \
+                 (chmod 600): переменную видят все процессы агента"
             );
         }
+    }
+    if !o.no_mcp && codex {
+        println!(
+            "MCP для Codex: [mcp_servers.zeroaimemory] в ~/.codex/config.toml — пример в \
+             deploy/README-install.md («Подключение агента»)."
+        );
     }
     Ok(())
 }

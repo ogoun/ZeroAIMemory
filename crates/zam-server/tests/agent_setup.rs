@@ -5,7 +5,7 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use common::api::{Api, api};
+use common::api::{Api, api, enc};
 use serde_json::{Value, json};
 use zam_markdown::TokenCounter;
 
@@ -15,6 +15,9 @@ const HOST: (&str, &str) = ("host", "memory.lan:7700");
 const LONG_URL: &str = "http://192.168.100.200:7700";
 /// Длинное имя решения.
 const LONG_NAME: &str = "ZeroAIMemory TradingPlatform Core";
+/// Длинный внешний адрес: имя хоста, порт и префикс пути.
+const VERY_LONG_URL: &str =
+    "https://zeroaimemory.engineering-department.example-corp.internal:17700/memory";
 
 async fn setup(a: &Api, tok: &str, q: &str) -> Value {
     let r = a
@@ -49,37 +52,69 @@ fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
 
 #[tokio::test]
 async fn agent_setup_block_under_500_tokens_ru_en() {
-    let a = api("agent-setup-tokens", |c| {
-        c.server.public_url = Some(format!("{LONG_URL}/"));
-    })
-    .await;
     let Some(counter) = bge_counter() else {
         return;
     };
     assert!(counter.is_exact());
-    let name = LONG_NAME.replace(' ', "%20");
-    for lang in ["ru", "en"] {
-        for agent in ["claude", "agents", "codex"] {
-            for rules in ["true", "false"] {
-                let j = setup(
-                    &a,
-                    &a.token,
-                    &format!(
-                        "agent={agent}&lang={lang}&solution=new&name={name}&rules_write={rules}"
-                    ),
-                )
-                .await;
-                let block = j["block"].as_str().unwrap();
-                // подставлены реальные адрес, GUID и имя решения (решение контроллера T11-c)
-                assert!(
-                    block.contains(&format!("ZeroAIMemoryUrl={LONG_URL}\n")),
-                    "{block}"
-                );
-                let guid = j["solution"]["agent_solution_id"].as_str().unwrap();
-                assert!(block.contains(guid) && block.contains(LONG_NAME), "{block}");
-                let n = counter.count(block);
-                eprintln!("{agent}.{lang} rules_write={rules}: {n} токенов bge-m3");
-                assert!(n <= 500, "{agent}.{lang}: {n} токенов > 500:\n{block}");
+    // адрес по IP и имя из 33 символов; длинный адрес с префиксом и кириллическое имя из 128
+    // символов — в блоке обрезается до 40 с «…» (fix round 1, I-2)
+    let long_name: String = "Платформа алгоритмической торговли и риск-менеджмента "
+        .repeat(3)
+        .chars()
+        .take(128)
+        .collect();
+    let shown_long: String = long_name.chars().take(40).collect::<String>() + "…";
+    let cases = [
+        (
+            LONG_URL.to_string(),
+            LONG_NAME.to_string(),
+            LONG_NAME.to_string(),
+        ),
+        (VERY_LONG_URL.to_string(), long_name.clone(), shown_long),
+    ];
+    for (i, (url, name, shown)) in cases.iter().enumerate() {
+        let a = api(&format!("agent-setup-tokens-{i}"), |c| {
+            c.server.public_url = Some(format!("{url}/"));
+        })
+        .await;
+        for lang in ["ru", "en"] {
+            for agent in ["claude", "agents", "codex"] {
+                for rules in ["true", "false"] {
+                    let j = setup(
+                        &a,
+                        &a.token,
+                        &format!(
+                            "agent={agent}&lang={lang}&solution=new&name={}&rules_write={rules}",
+                            enc(name)
+                        ),
+                    )
+                    .await;
+                    let block = j["block"].as_str().unwrap();
+                    // подставлены реальные адрес, GUID и имя решения (решение контроллера T11-c)
+                    assert!(
+                        block.contains(&format!(
+                            "ZeroAIMemoryUrl={url}
+"
+                        )),
+                        "{block}"
+                    );
+                    let guid = j["solution"]["agent_solution_id"].as_str().unwrap();
+                    assert!(block.contains(guid), "{block}");
+                    assert!(block.contains(shown.as_str()), "{block}");
+                    assert_eq!(
+                        j["solution"]["name"],
+                        name.as_str(),
+                        "полное имя — в solution"
+                    );
+                    let n = counter.count(block);
+                    eprintln!("{i}: {agent}.{lang} rules_write={rules}: {n} токенов bge-m3");
+                    assert!(
+                        n <= 500,
+                        "{agent}.{lang}: {n} токенов > 500:
+{block}"
+                    );
+                    assert_eq!(j["warnings"], json!([]), "{j}");
+                }
             }
         }
     }
@@ -208,26 +243,72 @@ async fn agent_setup_hooks_exec_form() {
         j["solution_toml"],
         format!("agent_solution_id = \"{g}\"\nname = \"Demo\"\n")
     );
+    // решения ещё нет в реестре — с именем, в кавычках своей оболочки
     assert_eq!(
-        j["init_cmd"],
+        j["init_cmd"]["linux"],
         format!(
-            "zam init --url http://memory.lan:7700 --agent claude --id {g} --name \"Demo\" --yes"
+            "zam init --url 'http://memory.lan:7700' --agent claude --id {g} --name 'Demo' --yes"
+        )
+    );
+    assert_eq!(
+        j["init_cmd"]["windows"],
+        format!(
+            "zam init --url 'http://memory.lan:7700' --agent claude --id {g} --name 'Demo' --yes"
         )
     );
     let install = &j["install"];
+    let windows = install["windows"].as_str().unwrap();
     assert!(
-        install["windows"]
-            .as_str()
-            .unwrap()
-            .contains("http://memory.lan:7700/downloads/zam/windows-x64"),
+        windows.contains("'http://memory.lan:7700/downloads/zam/windows-x64'")
+            && windows.contains("'ZAM_TOKEN', '<токен>'")
+            && windows.contains("-notcontains $d"),
         "{install}"
     );
     let linux = install["linux"].as_str().unwrap();
     assert!(
-        linux.contains("http://memory.lan:7700/downloads/zam/linux-x64")
-            && linux.contains("ZAM_TOKEN=<токен>"),
+        linux.contains("'http://memory.lan:7700/downloads/zam/linux-x64'")
+            && linux.contains("case \":$PATH:\"")
+            && !linux.contains(">> ~/.profile"),
         "{install}"
     );
+
+    // имя с подстановками оболочки экранируется для bash и PowerShell (fix round 1, I-3)
+    let evil = "x$(id)`whoami`'\"";
+    let j = setup(&a, &a.token, &format!("solution=new&name={}", enc(evil))).await;
+    let id = j["solution"]["agent_solution_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        j["init_cmd"]["linux"],
+        format!(
+            "zam init --url 'http://memory.lan:7700' --agent claude --id {id} --name 'x$(id)`whoami`'\''\"' --yes"
+        )
+    );
+    assert_eq!(
+        j["init_cmd"]["windows"],
+        format!(
+            "zam init --url 'http://memory.lan:7700' --agent claude --id {id} --name 'x$(id)`whoami`''\"' --yes"
+        )
+    );
+    // решение уже зарегистрировано — только --id
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": g, "name": "Demo"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = setup(&a, &a.token, &format!("solution={g}")).await;
+    for os in ["linux", "windows"] {
+        let c = j["init_cmd"][os].as_str().unwrap();
+        assert!(
+            c.contains(&format!("--id {g}")) && !c.contains("--name"),
+            "{c}"
+        );
+    }
+    assert_eq!(j["solution"]["name"], "Demo");
 
     // Codex: команда строкой (у Codex нет `args`), post-tool — на PostToolUse, apply_patch
     let j = setup(&a, &a.token, "agent=codex").await;
@@ -265,7 +346,7 @@ async fn agent_setup_hooks_exec_form() {
         "{j}"
     );
     assert!(
-        j["init_cmd"]
+        j["init_cmd"]["linux"]
             .as_str()
             .unwrap()
             .ends_with("--agent codex --no-hooks --no-mcp --yes"),
@@ -290,13 +371,15 @@ async fn agent_setup_hooks_exec_form() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
-    assert!(
-        j["init_cmd"]
-            .as_str()
-            .unwrap()
-            .contains(&format!("--token {}", a.token))
-    );
-    assert!(j["install"]["linux"].as_str().unwrap().contains(&a.token));
+    for os in ["linux", "windows"] {
+        assert!(
+            j["init_cmd"][os]
+                .as_str()
+                .unwrap()
+                .contains(&format!("--token '{}'", a.token))
+        );
+    }
+    assert!(j["install"]["windows"].as_str().unwrap().contains(&a.token));
     assert!(!j["block"].as_str().unwrap().contains(&a.token));
     assert!(!j["mcp_json"].to_string().contains(&a.token));
 }
@@ -412,6 +495,16 @@ async fn template_edit_bumps_version() {
     )
     .await;
     assert_eq!(s["agent_setup"]["version"], 5);
+    // сохранение текста, совпадающего с действующим (здесь — по умолчанию), версию не меняет
+    // (fix round 1, M-4)
+    let default_en = s["agent_setup"]["templates"]["codex.en"]["text"].clone();
+    let (_, s) = admin_settings(
+        &a,
+        json!({"agent_setup": {"templates": {"codex.en": default_en}}}),
+    )
+    .await;
+    assert_eq!(s["agent_setup"]["version"], 5);
+    assert_eq!(s["agent_setup"]["templates"]["codex.en"]["custom"], false);
 
     // неверные шаблоны и ключи — 400, токен — 403
     for bad in [

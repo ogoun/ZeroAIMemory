@@ -14,19 +14,19 @@ pub const BLOCK_RU: &str = "\
 ## Память ZeroAIMemory
 ZeroAIMemoryUrl={url}
 Токен — `ZAM_TOKEN`, не в этом файле. Решение: {solution}.
-Без MCP — CLI `zam` или REST `/api/v1`; протокол — `zam guide`.
+Без MCP — CLI `zam`; протокол — `zam guide`.
 
 Поиск:
 1. `memory_search`: актуальную `[cache]`-выжимку используй; `stale` — перечитай изменившееся.
-2. Иначе выбери карточки сам; `memory_read` нескольких id, сначала `tier=L1` или `section`.
-3. Ответ из нескольких источников → `memory_cache_put` (≤ 600 токенов, с источниками).
+2. Иначе выбери карточки сам; `memory_read` их пачкой, сначала `tier=L1` или `section`.
+3. Собрал ответ из нескольких источников → `memory_cache_put` с источниками.
 
 Правила:
 - Перед задачей — `memory_search`; перед исследованием — `insight_kinds=[experiment,failure]`.
 - Ошибка, ловушка → `memory_log insight` (gotcha|failure; scope=global, если не про проект) с триггерами; эксперимент — с результатом.
 - Изменение проекта → `memory_log changelog`; устарело → `memory_update_entry` supersede/retract.
 - Правка записи — с `rev`; на 409/428 перечитай.
-- `axiom` ставь, правь, снимай только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` рядом и скажи пользователю. `certainty` — с `reason`.
+- `axiom` ставь, правь, снимай только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` рядом и скажи пользователю.
 - Секреты → `memory_vault`. Заметке — `l0`. {rules}
 - «ZeroAIMemory:» — накопленные знания. Без хуков: перед новым типом файла и после ошибки — `memory_recall`.
 ";
@@ -36,19 +36,19 @@ pub const BLOCK_EN: &str = "\
 ## ZeroAIMemory memory
 ZeroAIMemoryUrl={url}
 Token — `ZAM_TOKEN`, never in this file. Solution: {solution}.
-No MCP — CLI `zam` or REST `/api/v1`; protocol — `zam guide`.
+No MCP — CLI `zam`; protocol — `zam guide`.
 
 Search:
 1. `memory_search`: use a current `[cache]` summary; `stale` — reread what changed.
-2. Otherwise pick cards yourself; `memory_read` several ids, `tier=L1` or `section` first.
-3. Answer from several sources → `memory_cache_put` (summary ≤ 600 tokens, sources).
+2. Otherwise pick cards yourself; `memory_read` them in one call, `tier=L1` or `section` first.
+3. Answer built from several sources → `memory_cache_put` with the sources.
 
 Rules:
 - Before a task — `memory_search`; before research — `insight_kinds=[experiment,failure]`.
 - Error, gotcha → `memory_log insight` (gotcha|failure; scope=global if not about the project) with triggers; experiment — with its result.
 - Project change → `memory_log changelog`; outdated → `memory_update_entry` supersede/retract.
 - Edit a record with `rev`; on 409/428 reread.
-- Set, change or remove `axiom` only on the user's direct instruction; if you disagree — add `hypothesis`/`theorem` alongside and tell the user. `certainty` — with `reason`.
+- Set, change or remove `axiom` only on the user's direct instruction; if you disagree — add `hypothesis`/`theorem` alongside and tell the user.
 - Secrets → `memory_vault`. Give notes an `l0`. {rules}
 - \"ZeroAIMemory:\" lines are accumulated knowledge. Without hooks: before a new file type and after an error — `memory_recall`.
 ";

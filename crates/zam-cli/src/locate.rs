@@ -109,6 +109,21 @@ const END: &str = "<!-- zeroaimemory:end";
 
 /// Значения из одного файла: (url, token); значения внутри блока важнее внешних.
 fn parse_md(text: &str) -> (Option<String>, Option<String>) {
+    let (inside, outside) = parse_md_parts(text);
+    (inside.0.or(outside.0), inside.1.or(outside.1))
+}
+
+/// Токен внутри блока ZeroAIMemory (прежний блок v1 держал `ZeroAIMemoryToken=`): его
+/// переносит `zam init`, заменяя блок (fix round 1, I-6).
+pub fn block_token(text: &str) -> Option<String> {
+    parse_md_parts(text).0.1
+}
+
+type Pair = (Option<String>, Option<String>);
+
+/// (url, token) внутри блока и вне его. BOM в начале файла пропускается (fix round 1, I-1).
+fn parse_md_parts(text: &str) -> (Pair, Pair) {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let (mut in_block, mut inside, mut outside) = (false, (None, None), (None, None));
     for line in text.lines() {
         let l = line.trim();
@@ -135,7 +150,7 @@ fn parse_md(text: &str) -> (Option<String>, Option<String>) {
             _ => {}
         }
     }
-    (inside.0.or(outside.0), inside.1.or(outside.1))
+    (inside, outside)
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -247,23 +262,53 @@ pub fn resolve(
     Ok(r)
 }
 
-/// Новое содержимое `~/.zeroaimemory/config.toml` с токеном `token` (`zam init`, §14.1):
-/// остальные ключи сохраняются (комментарии — нет: файл пишет `zam`). Токен уже там — `None`.
-/// Битый файл — ошибка (ничего не пишется).
-pub fn plan_home_token(home: &Path, token: &str) -> Result<Option<(PathBuf, String)>, String> {
+/// Что `zam init` делает с `~/.zeroaimemory/config.toml` (§14.1; fix round 1, I-6).
+#[derive(Debug, PartialEq, Eq)]
+pub enum HomePlan {
+    /// Там уже этот токен и адрес.
+    Unchanged,
+    /// Записать `text` в `path`; `replaced` — заменяется другой токен.
+    Write {
+        path: PathBuf,
+        text: String,
+        replaced: bool,
+    },
+    /// Там другой токен, а `--token` не задан: не трогать, предупредить.
+    Conflict(PathBuf),
+}
+
+/// План записи токена `token` и адреса `url` в `~/.zeroaimemory/config.toml`: остальные ключи
+/// сохраняются (комментарии — нет: файл пишет `zam`). Другой токен заменяется, только если
+/// `force` (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
+pub fn plan_home(home: &Path, url: &str, token: &str, force: bool) -> Result<HomePlan, String> {
     let path = home.join(".zeroaimemory").join("config.toml");
     let mut t: toml::Table = match read_limited(&path) {
         Read::Skip => toml::Table::new(),
         Read::Failed(e) => return Err(format!("не удалось прочитать {}: {e}", path.display())),
-        Read::Text(s) => toml::from_str(&s)
+        Read::Text(s) => toml::from_str(s.strip_prefix('\u{feff}').unwrap_or(&s))
             .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
     };
-    if t.get("token").and_then(toml::Value::as_str) == Some(token) {
-        return Ok(None);
+    let url = url.trim().trim_end_matches('/');
+    let old_token = t.get("token").and_then(toml::Value::as_str);
+    let old_url = t
+        .get("url")
+        .and_then(toml::Value::as_str)
+        .map(|u| u.trim().trim_end_matches('/'));
+    if old_token == Some(token) && old_url == Some(url) {
+        return Ok(HomePlan::Unchanged);
     }
+    let replaced = old_token.is_some_and(|o| o != token);
+    if replaced && !force {
+        return Ok(HomePlan::Conflict(path));
+    }
+    t.insert("url".into(), toml::Value::String(url.to_string()));
     t.insert("token".into(), toml::Value::String(token.to_string()));
     let text = toml::to_string(&t).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Some((path, text)))
+    Ok(HomePlan::Write {
+        path,
+        text,
+        replaced,
+    })
 }
 
 /// Ближайший вверх от `start` файл решения: в каждом каталоге сначала

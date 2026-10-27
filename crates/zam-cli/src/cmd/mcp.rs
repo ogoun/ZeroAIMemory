@@ -2,17 +2,20 @@
 //!
 //! - Читает stdin построчно: строка — одно сообщение JSON-RPC (запрос, уведомление, ответ или
 //!   пачка). Каждое уходит отдельным `POST /mcp` с `Authorization: Bearer`, `X-Zam-Solution`
-//!   (из `solution.toml`), `X-Zam-Machine` и `X-Zam-Session` (как у остальных команд
-//!   [`super::connect`]); `Origin` не шлётся.
+//!   (из `solution.toml`) и `X-Zam-Machine`; `X-Zam-Session` прокси не шлёт — сессию выбирает
+//!   сервер (R13; fix round 1, I-4); `Origin` не шлётся.
 //! - Ответ `application/json` пишется в stdout одной строкой; `text/event-stream` (SSE)
 //!   разворачивается: каждое событие `data:` — отдельная строка. 202/204 — без вывода.
 //! - После `initialize` прокси шлёт `MCP-Protocol-Version` с согласованной версией, а
 //!   выданный сервером `Mcp-Session-Id` — во всех следующих запросах.
-//! - HTTP-ошибка на запрос с `id` — ответ JSON-RPC `error` (код −32000, текст problem
-//!   сервера); на уведомление — строка в stderr. Неразборчивая строка — `error` −32700.
-//! - Сообщения обрабатываются параллельно (долгий инструмент не держит остальные); stdout
-//!   пишется построчно под блокировкой. Конец stdin — выход с кодом 0 после всех ответов.
-//!   Токен и тексты сообщений никуда, кроме сервера, не пишутся.
+//! - Каждый запрос с `id` получает ответ (fix round 1, I-5): сетевая ошибка, HTTP-ошибка,
+//!   обрыв или тайм-аут тела, превышение предела тела, SSE без ответа на `id` — ответ JSON-RPC
+//!   `error` с кодом −32000 и причиной; у пачки — на каждый `id` без ответа. Уведомление без
+//!   ответа — строка в stderr. Неразборчивая строка (не JSON, не UTF-8) — `error` −32700, работа
+//!   продолжается (M-7).
+//! - Сообщения обрабатываются параллельно, не больше [`MAX_INFLIGHT`] сразу (`initialize` —
+//!   первым); stdout пишется построчно под блокировкой. Конец stdin — выход с кодом 0 после всех
+//!   ответов. Токен и тексты сообщений никуда, кроме сервера, не пишутся.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +33,10 @@ struct Session {
 
 /// Предел тела ответа, байт.
 const BODY_MAX: u64 = 64 * 1024 * 1024;
+/// Предел одновременных запросов (M-7).
+pub const MAX_INFLIGHT: usize = 16;
+/// Код ошибки JSON-RPC прокси (транспорт).
+const PROXY_ERROR: i64 = -32000;
 
 fn write_line(line: &str) {
     let mut out = std::io::stdout().lock();
@@ -55,11 +62,35 @@ fn rpc_error(id: &Value, code: i64, msg: &str) -> String {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}).to_string()
 }
 
-/// События SSE: строки `data:` до пустой строки — одно сообщение.
-fn sse(reader: impl Read, mut emit: impl FnMut(&str)) {
+/// `id` запросов сообщения (у уведомления и ответа клиента их нет); у пачки — всех запросов.
+fn request_ids(msg: &Value) -> Vec<Value> {
+    let one = |m: &Value| {
+        (m.get("method").is_some())
+            .then(|| m.get("id").cloned())
+            .flatten()
+            .filter(|id| !id.is_null())
+    };
+    match msg {
+        Value::Array(a) => a.iter().filter_map(one).collect(),
+        m => one(m).into_iter().collect(),
+    }
+}
+
+/// `id` ответов в сообщении сервера (объект или пачка).
+fn response_ids(text: &str) -> Vec<Value> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Array(a)) => a.iter().filter_map(|m| m.get("id").cloned()).collect(),
+        Ok(m) => m.get("id").cloned().into_iter().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// События SSE: строки `data:` до пустой строки — одно сообщение. Ошибка чтения — `Err`
+/// (обрыв, тайм-аут, предел тела).
+fn sse(reader: impl Read, mut emit: impl FnMut(&str)) -> Result<(), String> {
     let mut data: Vec<String> = Vec::new();
     for line in BufReader::new(reader).lines() {
-        let Ok(line) = line else { break };
+        let line = line.map_err(|e| e.to_string())?;
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
             if !data.is_empty() {
@@ -75,6 +106,7 @@ fn sse(reader: impl Read, mut emit: impl FnMut(&str)) {
     if !data.is_empty() {
         emit(&data.join("\n"));
     }
+    Ok(())
 }
 
 /// Запомнить согласованную версию протокола из ответа `initialize`.
@@ -86,6 +118,17 @@ fn note_protocol(state: &Mutex<Session>, msg: &str, was_initialize: bool) {
         && let Some(p) = v["result"]["protocolVersion"].as_str()
     {
         state.lock().unwrap_or_else(|e| e.into_inner()).protocol = Some(p.to_string());
+    }
+}
+
+/// Ошибка на каждый `id` из `ids`, на который не было ответа; без запросов — в stderr.
+fn fail_unanswered(ids: &[Value], answered: &[Value], reason: &str) {
+    let missing: Vec<&Value> = ids.iter().filter(|id| !answered.contains(id)).collect();
+    if ids.is_empty() {
+        eprintln!("zam mcp: {reason}");
+    }
+    for id in missing {
+        write_line(&rpc_error(id, PROXY_ERROR, reason));
     }
 }
 
@@ -102,11 +145,8 @@ fn forward(client: &Client, state: &Mutex<Session>, line: &str) {
             return;
         }
     };
-    // id запроса (у уведомления и ответа клиента его нет или нет метода)
-    let id = (msg.get("method").is_some())
-        .then(|| msg.get("id").cloned())
-        .flatten();
-    let initialize = msg["method"] == "initialize";
+    let ids = request_ids(&msg);
+    let initialize = msg.get("method").and_then(Value::as_str) == Some("initialize");
     let (protocol, sid) = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         (s.protocol.clone(), s.session_id.clone())
@@ -121,13 +161,7 @@ fn forward(client: &Client, state: &Mutex<Session>, line: &str) {
     let body = msg.to_string();
     let mut resp = match client.post_mcp(body.as_bytes(), &headers) {
         Ok(r) => r,
-        Err(e) => {
-            match &id {
-                Some(id) => write_line(&rpc_error(id, -32000, &e.msg)),
-                None => eprintln!("zam mcp: {}", e.msg),
-            }
-            return;
-        }
+        Err(e) => return fail_unanswered(&ids, &[], &e.msg),
     };
     let status = resp.status().as_u16();
     if let Some(s) = resp
@@ -153,48 +187,87 @@ fn forward(client: &Client, state: &Mutex<Session>, line: &str) {
             .ok()
             .and_then(|v| v["detail"].as_str().map(String::from))
             .unwrap_or_else(|| text.chars().take(200).collect());
-        let m = format!("HTTP {status}: {detail}");
-        match &id {
-            Some(id) => write_line(&rpc_error(id, -32000, &m)),
-            None => eprintln!("zam mcp: {m}"),
-        }
-        return;
+        return fail_unanswered(&ids, &[], &format!("HTTP {status}: {detail}"));
     }
+    let mut answered: Vec<Value> = Vec::new();
     if sse_body {
-        sse(resp.into_body().into_reader(), |data| {
+        let reader = resp.into_body().into_with_config().limit(BODY_MAX).reader();
+        let res = sse(reader, |data| {
             note_protocol(state, data, initialize);
+            answered.extend(response_ids(data));
             if let Some(l) = compact(data) {
                 write_line(&l);
             }
         });
-        return;
+        let reason = match res {
+            Ok(()) => "поток SSE закончился без ответа на запрос".to_string(),
+            Err(e) => format!("обрыв потока SSE: {e}"),
+        };
+        return fail_unanswered_quiet(&ids, &answered, &reason);
     }
-    let text = resp
+    match resp
         .body_mut()
         .with_config()
         .limit(BODY_MAX)
         .read_to_string()
-        .unwrap_or_default();
-    note_protocol(state, &text, initialize);
-    if let Some(l) = compact(&text) {
-        write_line(&l);
+    {
+        Ok(text) => {
+            note_protocol(state, &text, initialize);
+            answered.extend(response_ids(&text));
+            if let Some(l) = compact(&text) {
+                write_line(&l);
+            }
+            fail_unanswered_quiet(&ids, &answered, "сервер не ответил на запрос");
+        }
+        Err(e) => fail_unanswered(&ids, &[], &format!("чтение ответа сервера: {e}")),
+    }
+}
+
+/// Как [`fail_unanswered`], но без строки в stderr, когда запросов не было (уведомление).
+fn fail_unanswered_quiet(ids: &[Value], answered: &[Value], reason: &str) {
+    if !ids.is_empty() {
+        fail_unanswered(ids, answered, reason);
     }
 }
 
 pub fn run(ctx: Ctx) -> Result<(), CliError> {
-    let client = Arc::new(ctx.client);
+    let mut client = ctx.client;
+    // сессию MCP выбирает сервер (R13), а не `session.json` хуков (I-4)
+    client.set_session(None);
+    let client = Arc::new(client);
     let state = Arc::new(Mutex::new(Session::default()));
-    let mut workers = Vec::new();
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        let line = line.trim().to_string();
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut stdin = std::io::stdin().lock();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match stdin.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = match std::str::from_utf8(&buf) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                write_line(&rpc_error(
+                    &Value::Null,
+                    -32700,
+                    &format!("parse error: не UTF-8 ({e})"),
+                ));
+                continue;
+            }
+        };
         if line.is_empty() {
             continue;
         }
         // `initialize` — до остальных: от него зависят версия протокола и сеанс
         let first = serde_json::from_str::<Value>(&line)
             .is_ok_and(|v| v.get("method").and_then(Value::as_str) == Some("initialize"));
+        // не больше MAX_INFLIGHT запросов сразу
+        workers.retain(|w| !w.is_finished());
+        while workers.len() >= MAX_INFLIGHT {
+            let _ = workers.remove(0).join();
+            workers.retain(|w| !w.is_finished());
+        }
         let (c, s) = (client.clone(), state.clone());
         let h = std::thread::spawn(move || forward(&c, &s, &line));
         if first {
@@ -202,7 +275,6 @@ pub fn run(ctx: Ctx) -> Result<(), CliError> {
         } else {
             workers.push(h);
         }
-        workers.retain(|w| !w.is_finished());
     }
     for w in workers {
         let _ = w.join();
@@ -218,7 +290,7 @@ mod tests {
     fn sse_events_become_lines() {
         let body = "event: message\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\n: comment\ndata: {\"b\": 2}\n\ndata: x";
         let mut got = Vec::new();
-        sse(body.as_bytes(), |d| got.push(compact(d).unwrap()));
+        sse(body.as_bytes(), |d| got.push(compact(d).unwrap())).unwrap();
         assert_eq!(got, ["{\"a\":1}", "{\"b\":2}", "x"]);
     }
 
@@ -229,5 +301,20 @@ mod tests {
             Some("{\"a\":[1,2]}")
         );
         assert_eq!(compact("  "), None);
+    }
+
+    #[test]
+    fn ids_of_requests_and_batches() {
+        let m: Value = serde_json::from_str(
+            r#"[{"jsonrpc":"2.0","id":1,"method":"a"},{"jsonrpc":"2.0","method":"n"},
+                {"jsonrpc":"2.0","id":"x","method":"b"},{"jsonrpc":"2.0","id":5,"result":{}}]"#,
+        )
+        .unwrap();
+        assert_eq!(request_ids(&m), [json!(1), json!("x")]);
+        assert!(request_ids(&json!({"jsonrpc":"2.0","method":"n"})).is_empty());
+        assert_eq!(
+            response_ids(r#"[{"id":1,"result":{}},{"id":"x","error":{}}]"#),
+            [json!(1), json!("x")]
+        );
     }
 }
