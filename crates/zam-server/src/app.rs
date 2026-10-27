@@ -157,7 +157,11 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     bootstrap::register_solutions(&system, &users).await;
     let index = Arc::new(IndexRuntime::start(&cfg, ml, early_sup, &system, &users).await);
     let rerank = Arc::new(RerankSlot::new(&cfg));
-    let maintenance = Arc::new(Maintenance::start(system.clone(), users.clone()));
+    let maintenance = Arc::new(Maintenance::start(
+        system.clone(),
+        users.clone(),
+        cfg.cache.clone(),
+    ));
     let state = AppState {
         maintenance,
         users,

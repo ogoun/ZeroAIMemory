@@ -70,6 +70,10 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         version: 13,
         sql: include_str!("../migrations/user/0013_sessions_usage.sql"),
     },
+    Migration {
+        version: 14,
+        sql: include_str!("../migrations/user/0014_answer_cache.sql"),
+    },
 ];
 
 /// Вид пространства.

@@ -11,7 +11,7 @@
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 
 use super::chunks::{
     frontmatter_tags, index_note, index_state, note_meta, note_prefix, space_kind,
@@ -20,6 +20,7 @@ use super::write::{ensure_ancestors, ensure_free};
 use super::{
     AuthorKind, NODE_COLS, Node, NodeKind, live_by_path, load_node, node_row, revision_text,
 };
+use crate::cache::{StaleKind, invalidate_target};
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::embeddings::embed_key_of;
 use crate::entries::Certainty;
@@ -50,6 +51,8 @@ pub async fn delete_node(db: &Db, id: Id, author: AuthorKind) -> Result<u64, Sto
         for &nid in &ids {
             mark.execute(params![nid, now])?;
             drop_chunks.execute([nid])?;
+            // выжимки кэша с этим источником — недействительны (§9.4)
+            invalidate_target(tx, node_ref(nid), StaleKind::Deleted)?;
             let note: Option<(i64, String)> = state
                 .query_row([nid], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
@@ -214,11 +217,20 @@ pub async fn move_node(
         // старые и новые имена и пути пространства — заново
         for &nid in &moved {
             crate::graph::rebuild_moved(tx, nid, &now)?;
+            // путь источника изменился: выжимка могла ссылаться на него (§9.4)
+            invalidate_target(tx, node_ref(nid), StaleKind::Changed)?;
         }
         crate::graph::tree_changed(tx, node.space_id, &moved, &old_keys)?;
         load_node(tx, id)
     })
     .await
+}
+
+fn node_ref(id: Id) -> TargetRef {
+    TargetRef {
+        kind: TargetKind::Node,
+        id,
+    }
 }
 
 /// Операция над узлами `ids` (удаление, восстановление, перенос) — по матрице `certainty`

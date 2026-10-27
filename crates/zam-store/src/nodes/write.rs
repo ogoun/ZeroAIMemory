@@ -20,51 +20,53 @@ use crate::{Db, StoreError};
 /// неизвестный `certainty:` во frontmatter → `BadInput`; статус против матрицы прав
 /// (`theorem` агента без `evidence:`) → `Certainty`.
 pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
-    db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
-        let kind = ensure_space(tx, n.space_id)?;
-        ensure_free(tx, n.space_id, &n.path)?;
-        let parent = ensure_ancestors(tx, n.space_id, &n.path, &now)?;
+    db.write(move |tx| insert_note(tx, &n)).await
+}
 
-        let meta = note_meta(&n.content, n.l0.as_deref());
-        let certainty = meta.certainty()?;
-        check_certainty(
-            n.attrib.author_kind,
-            None,
-            &CertaintyChange::Create(certainty),
-            meta.evidence.as_ref(),
-            None,
-        )?;
-        let id = Id::new();
-        let hash = sha256_hex(n.content.as_bytes());
-        tx.execute(
-            "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, current_rev,
-                                content_hash, frontmatter, l0, l0_source, index_state,
-                                created_at, updated_at, area, certainty)
-             VALUES (?1, ?2, ?3, 'note', ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12, ?13)",
-            params![
-                id,
-                n.space_id,
-                parent,
-                n.path.name(),
-                n.path.as_str(),
-                hash,
-                meta.frontmatter.as_ref().map(|v| v.to_string()),
-                meta.l0,
-                meta.l0_source,
-                index_state(&meta, kind),
-                now,
-                // область по умолчанию — из `X-Zam-Area` запроса создания
-                n.attrib.area,
-                certainty,
-            ],
-        )?;
-        store_revision(tx, id, 1, &n.content, &hash, &meta, &n.attrib, None, &now)?;
-        // ожидавшие эту заметку ссылки пространства разрешаются
-        crate::graph::tree_changed(tx, n.space_id, &[id], &[])?;
-        load_node(tx, id)
-    })
-    .await
+/// [`create_note`] внутри транзакции писателя (превращение выжимки кэша в заметку, §9.4).
+pub(crate) fn insert_note(tx: &Connection, n: &NewNote) -> Result<Node, StoreError> {
+    let now = fmt_ts(Timestamp::now());
+    let kind = ensure_space(tx, n.space_id)?;
+    ensure_free(tx, n.space_id, &n.path)?;
+    let parent = ensure_ancestors(tx, n.space_id, &n.path, &now)?;
+
+    let meta = note_meta(&n.content, n.l0.as_deref());
+    let certainty = meta.certainty()?;
+    check_certainty(
+        n.attrib.author_kind,
+        None,
+        &CertaintyChange::Create(certainty),
+        meta.evidence.as_ref(),
+        None,
+    )?;
+    let id = Id::new();
+    let hash = sha256_hex(n.content.as_bytes());
+    tx.execute(
+        "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, current_rev,
+                            content_hash, frontmatter, l0, l0_source, index_state,
+                            created_at, updated_at, area, certainty)
+         VALUES (?1, ?2, ?3, 'note', ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12, ?13)",
+        params![
+            id,
+            n.space_id,
+            parent,
+            n.path.name(),
+            n.path.as_str(),
+            hash,
+            meta.frontmatter.as_ref().map(|v| v.to_string()),
+            meta.l0,
+            meta.l0_source,
+            index_state(&meta, kind),
+            now,
+            // область по умолчанию — из `X-Zam-Area` запроса создания
+            n.attrib.area,
+            certainty,
+        ],
+    )?;
+    store_revision(tx, id, 1, &n.content, &hash, &meta, &n.attrib, None, &now)?;
+    // ожидавшие эту заметку ссылки пространства разрешаются
+    crate::graph::tree_changed(tx, n.space_id, &[id], &[])?;
+    load_node(tx, id)
 }
 
 /// Создаёт папку и недостающих предков. Путь занят живым узлом → `Conflict`.

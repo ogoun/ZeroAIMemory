@@ -48,6 +48,7 @@ pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
 pub use revise::{WriteError, patch_note, patch_note_within, revert_note, update_note};
 pub use tree_ops::{delete_node, list_trash, move_node, restore_node};
+pub(crate) use write::insert_note;
 pub use write::{create_folder, create_note};
 
 /// Вид узла.

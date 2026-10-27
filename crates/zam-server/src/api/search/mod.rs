@@ -44,6 +44,13 @@
 //! `solution access pending|rejected|revoked`. Human ищется только каналом FTS: в Qdrant его
 //! нет, и сервер не передаёт его в фильтр векторного запроса.
 //!
+//! **Шаг 0 — кэш выжимок** (§9.3, §9.4; [`cache_step`]): без `no_cache: true` поиск после
+//! каналов (нужен dense-вектор запроса) ищет действующую выжимку того же `scope_hash` и
+//! похожего запроса; не больше двух выжимок идут первыми элементами `kind: "cache"` (md —
+//! `[cache] «запрос» — выжимка <дата>, <N> источников, все актуальны (id: c_…)` и текст;
+//! недействительная — `[cache, stale: <источники>]` без текста), их текст — из
+//! `budget_tokens`; `timings.cache_ms`.
+//!
 //! **Алгоритм** (§9.2):
 //! 1. Параллельно: каналы FTS по каждой цели в пределах её пространств (базы — параллельно,
 //!    затем [`merge::merge_channels`] по сырому баллу FTS5) и — если векторный канал доступен
@@ -147,6 +154,7 @@
 //! хитов, листы сводок, `expand`, L0, `pending_count` — исключает решение целиком ([`Health`]):
 //! WARN в журнал, `warnings: ["solution unavailable"]`, элементы этой цели убираются из
 //! выдачи, ответ строится по остальным целям. Сбой личной базы — ошибка запроса, как в M2.
+mod cache_step;
 pub mod graph;
 pub mod merge;
 pub mod targets;
@@ -165,7 +173,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use zam_core::{Id, TargetKind, TargetRef};
+use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
@@ -245,7 +253,7 @@ enum Expand {
 
 /// `filters` запроса (§9.1); остальные поля пока игнорируются.
 #[derive(Deserialize, Default)]
-struct Filters {
+pub(crate) struct Filters {
     kinds: Option<Vec<String>>,
     status: Option<Vec<String>>,
     /// `axiom | theorem | hypothesis` (§7.5); пусто — любые, в том числе без статуса.
@@ -350,6 +358,49 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
     })
 }
 
+/// Путь-префикс области: без `/` в конце, пустой — `None`.
+fn path_prefix(sc: &ScopeReq) -> Option<String> {
+    sc.path_prefix
+        .as_deref()
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
+/// `scope_hash` кэша выжимок (§9.4) для области запроса: решение, флаги Knowledge и Rules (по
+/// умолчанию — да), префикс пути, область и фильтры после умолчаний (списки упорядочены) —
+/// одинаковая для `POST /search` и `POST /cache`.
+pub(crate) fn cache_scope_hash(
+    sc: &ScopeReq,
+    f: &Filters,
+    include_history: bool,
+    solution: Option<&SolutionGuid>,
+) -> Result<String, ApiError> {
+    let mut t = target_filter(f, include_history)?;
+    t.area = area_filter(sc.area.as_deref())?;
+    Ok(scope_key(sc, &t, solution))
+}
+
+fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -> String {
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    zam_store::scope_hash(&json!({
+        "solution": solution.map(SolutionGuid::as_str),
+        "include_knowledge": sc.include_knowledge.unwrap_or(true),
+        "include_rules": sc.include_rules.unwrap_or(true),
+        "path_prefix": path_prefix(sc),
+        "area": t.area,
+        "filters": {
+            "kinds": sorted(&t.kinds),
+            "status": sorted(&t.statuses),
+            "certainty": sorted(&t.certainty),
+        },
+    }))
+}
+
 /// Статусы, которые векторный фильтр исключает (`must_not`): точки без статуса (узлы,
 /// changelog, release, точки M2) проходят.
 fn excluded_statuses(t: &TargetFilter) -> Vec<String> {
@@ -382,6 +433,9 @@ struct SearchReq {
     skip_seen: Option<bool>,
     /// Сессия агента; иначе — `X-Zam-Session`.
     session_id: Option<String>,
+    /// Пропустить шаг 0 — кэш выжимок (§9.3).
+    #[serde(default)]
+    no_cache: bool,
 }
 
 impl SearchSection {
@@ -1526,13 +1580,7 @@ pub async fn search(
         session_failed("касание", &e);
     }
     let mut health = Health::new(&targets, warnings);
-    let prefix = req
-        .scope
-        .path_prefix
-        .as_deref()
-        .map(|p| p.trim_end_matches('/'))
-        .filter(|p| !p.is_empty())
-        .map(str::to_string);
+    let prefix = path_prefix(&req.scope);
     // Human в Qdrant нет никогда: векторный запрос — по областям целей без него; цель без
     // других пространств в фильтр не входит (область без пространств ничего не пропускает)
     let scopes: Vec<VectorScope> = targets
@@ -1586,6 +1634,24 @@ pub async fn search(
         vector_channel(&st.index, filter, req.query.clone()).await
     };
     let ((runs, fts_ms), vrun) = tokio::join!(fts, vector);
+    // 0. кэш выжимок (§9.3): действующие выжимки — первыми элементами
+    let cache_t = Instant::now();
+    let cache_items = if req.no_cache {
+        Vec::new()
+    } else {
+        cache_step::lookup(
+            &st,
+            &p,
+            &headers,
+            &req.scope,
+            &kinds,
+            &req.query,
+            session.as_ref().map(|s| s.touch.id.as_str()),
+            vrun.dense.as_deref(),
+        )
+        .await
+    };
+    let cache_ms = (!req.no_cache).then(|| ms(cache_t));
     // цель, чья база не прочиталась (чужое решение), исключается из выдачи целиком
     let mut per_db = Vec::with_capacity(targets.len());
     for (i, r) in runs.into_iter().enumerate() {
@@ -1897,7 +1963,9 @@ pub async fn search(
     {
         session_failed("чтение выданного", &e);
     }
-    let packed = pack_items(items, mode, budget);
+    // выжимки шага 0 — из того же бюджета
+    let cache_tokens: usize = cache_items.iter().map(cache_step::CacheItem::tokens).sum();
+    let packed = pack_items(items, mode, budget.saturating_sub(cache_tokens).max(1));
     // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
     if let (Some(s), SearchMode::Chunks) = (&session, mode) {
         let given: Vec<SeenItem> = packed
@@ -1923,7 +1991,11 @@ pub async fn search(
 
     Ok(match format {
         OutFormat::Json => {
-            let items: Vec<Value> = packed.iter().map(|p| item_json(p, mode, &by_id)).collect();
+            let items: Vec<Value> = cache_items
+                .iter()
+                .map(cache_step::item_json)
+                .chain(packed.iter().map(|p| item_json(p, mode, &by_id)))
+                .collect();
             Json(json!({
                 "items": items,
                 "degraded": degraded.is_some(),
@@ -1932,6 +2004,7 @@ pub async fn search(
                 "warnings": warnings,
                 "pending_count": pending,
                 "timings": {
+                    "cache_ms": cache_ms,
                     "fts_ms": fts_ms,
                     "embed_ms": vrun.embed_ms,
                     "vector_ms": vrun.vector_ms,
@@ -1946,11 +2019,13 @@ pub async fn search(
             .into_response()
         }
         OutFormat::Md => {
-            let mut body: String = packed
-                .iter()
-                .enumerate()
-                .map(|(i, p)| item_md(i + 1, p, mode, &by_id))
-                .collect();
+            let mut body: String = cache_items.iter().map(cache_step::item_md).collect();
+            body.extend(
+                packed
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| item_md(i + 1, p, mode, &by_id)),
+            );
             if let Some(r) = degraded {
                 body.push_str(&format!(
                     "> degraded: {} — {} (только FTS)\n",

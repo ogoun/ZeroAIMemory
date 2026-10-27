@@ -85,6 +85,25 @@ fn is_admin(p: &Principal) -> bool {
     matches!(p, Principal::Admin { .. })
 }
 
+/// Решение запроса: `scope.solution` (некорректный GUID — 400) или заголовок
+/// `X-Zam-Solution` (некорректное значение игнорируется).
+pub fn request_solution(
+    solution: Option<&str>,
+    h: &HeaderMap,
+) -> Result<Option<SolutionGuid>, ApiError> {
+    Ok(match solution {
+        Some(g) => Some(
+            g.trim()
+                .parse::<SolutionGuid>()
+                .map_err(|_| ApiError::BadRequest("scope.solution: GUID решения".into()))?,
+        ),
+        None => h
+            .get(SOLUTION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<SolutionGuid>().ok()),
+    })
+}
+
 /// Чужое решение до проверки роли.
 enum Foreign {
     Guid(SolutionGuid),
@@ -131,19 +150,7 @@ pub async fn resolve_targets(
             }
         }
     } else {
-        let solution = match &sc.solution {
-            Some(g) => Some(
-                g.trim()
-                    .parse::<SolutionGuid>()
-                    .map_err(|_| ApiError::BadRequest("scope.solution: GUID решения".into()))?,
-            ),
-            // заголовок агента: некорректное значение игнорируется
-            None => h
-                .get(SOLUTION_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<SolutionGuid>().ok()),
-        };
-        if let Some(g) = solution {
+        if let Some(g) = request_solution(sc.solution.as_deref(), h)? {
             match get_solution(&db, g.as_str()).await? {
                 Some(s) => personal.push(s),
                 None => foreign.push(Foreign::Guid(g)),

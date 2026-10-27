@@ -72,6 +72,8 @@ globset = { version = "0.4", default-features = false }
 rust-stemmers = "=1.2.0"
 # M2: границы предложений UAX #29 (L0, перекрытие чанков §8.2)
 unicode-segmentation = "1.13"
+# M4, задача 7: NFKC ключа кэша выжимок (§9.4) — MIT OR Apache-2.0, уже в дереве (через caseless)
+unicode-normalization = "0.1"
 # M2: ONNX Runtime только load-dynamic (dylib рядом с exe), без ndarray (исследование 05 §1.3)
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "load-dynamic", "api-31", "cuda", "half", "tracing"] }
 # без regex-фичи tokenizers не собирается; fancy-regex — чистый Rust (исследование 05 §2.2)

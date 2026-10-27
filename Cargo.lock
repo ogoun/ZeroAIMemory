@@ -6337,6 +6337,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "zam-core",
  "zam-markdown",
 ]

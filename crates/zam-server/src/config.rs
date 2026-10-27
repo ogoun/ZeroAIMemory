@@ -36,6 +36,7 @@ pub struct ServerConfig {
     pub search: SearchSection,
     pub insights: InsightsSection,
     pub read: ReadSection,
+    pub cache: CacheSection,
     pub limits: LimitsSection,
     pub vault: VaultSection,
 }
@@ -606,6 +607,52 @@ impl ReadSection {
     }
 }
 
+/// Секция `[cache]` (§9.4): кэш выжимок агентов.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheSection {
+    /// Предел выжимки в токенах (1..=10000, по умолчанию 600); больше — 413.
+    pub summary_tokens: usize,
+    /// Порог косинуса семантического попадания (0..=1, по умолчанию 0,92).
+    pub semantic_threshold: f32,
+    /// Порог косинуса нового релевантного источника (0..=1, по умолчанию 0,80).
+    pub new_sources_threshold: f32,
+    /// Срок жизни выжимки без обращений, дней (1..=3650, по умолчанию 30).
+    pub ttl_days: u32,
+    /// Предел выжимок на базу, LRU по последнему обращению (1..=1000000, по умолчанию 2000).
+    pub max_entries: usize,
+    /// Поиск выдаёт выжимки других сессий той же области (по умолчанию да).
+    pub cross_session: bool,
+}
+
+impl CacheSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("cache.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=10_000).contains(&self.summary_tokens) {
+            return Err(bad("summary_tokens", "от 1 до 10000"));
+        }
+        for (k, v) in [
+            ("semantic_threshold", self.semantic_threshold),
+            ("new_sources_threshold", self.new_sources_threshold),
+        ] {
+            if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                return Err(bad(k, "должно быть в 0..=1"));
+            }
+        }
+        if !(1..=3650).contains(&self.ttl_days) {
+            return Err(bad("ttl_days", "от 1 до 3650"));
+        }
+        if !(1..=1_000_000).contains(&self.max_entries) {
+            return Err(bad("max_entries", "от 1 до 1000000"));
+        }
+        Ok(())
+    }
+}
+
 /// Секция `[vault]` (§7.6): файл мастер-ключа. Сам ключ — только в файле или в
 /// `ZAM_MASTER_KEY` (переменная важнее файла), в конфигурацию он не попадает.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -708,6 +755,14 @@ impl Default for ServerConfig {
             read: ReadSection {
                 max_items: 20,
                 budget_tokens: 1500,
+            },
+            cache: CacheSection {
+                summary_tokens: 600,
+                semantic_threshold: 0.92,
+                new_sources_threshold: 0.80,
+                ttl_days: 30,
+                max_entries: 2000,
+                cross_session: true,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -883,6 +938,7 @@ pub fn load(
     cfg.search.validate()?;
     cfg.insights.validate()?;
     cfg.read.validate()?;
+    cfg.cache.validate()?;
     Ok(cfg)
 }
 

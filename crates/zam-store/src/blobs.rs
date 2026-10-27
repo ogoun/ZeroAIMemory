@@ -22,7 +22,7 @@ use jiff::Timestamp;
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::entries::Certainty;
@@ -223,6 +223,15 @@ pub async fn attach(
             t.execute(
                 "UPDATE blobs SET refcount = refcount + 1 WHERE sha256 = ?1",
                 [&sha],
+            )?;
+            // новое вложение источника — выжимки кэша по нему недействительны (§9.4)
+            crate::cache::invalidate_target(
+                t,
+                TargetRef {
+                    kind: TargetKind::Node,
+                    id: node,
+                },
+                crate::cache::StaleKind::Changed,
             )?;
         }
         Ok(())

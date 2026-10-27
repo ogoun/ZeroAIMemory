@@ -4,7 +4,7 @@
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 
 use super::chunks::{entry_index_state, index_entry_now, unindex_entry};
 use super::{
@@ -12,6 +12,7 @@ use super::{
     REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, check_triggers, load_entry,
     normalize_title, replace_triggers, same_triggers,
 };
+use crate::cache::StaleKind;
 use crate::certainty::{
     CertaintyChange, Evidence, check_certainty, check_final_state, default_certainty,
 };
@@ -261,7 +262,7 @@ fn new_status(kind: EntryKind, s: Option<EntryStatus>) -> Result<Option<EntrySta
 }
 
 /// Вставляет новую запись с ревизией 1, чанками и заданием. Возвращает её id.
-fn insert_entry(
+pub(crate) fn insert_entry(
     c: &Connection,
     e: NewEntry,
     key: Option<String>,
@@ -415,7 +416,22 @@ fn save(
         now,
     ])?;
     insert_revision(c, cur.id, rev, f, reason, a, now)?;
+    // выжимки кэша с этим источником (§9.4): замещение и отзыв — по статусу, правка —
+    // `changed` (тело или секция с прежним текстом остаются действующими)
+    let stale = match (cur.status, f.status) {
+        (old, Some(EntryStatus::Superseded)) if old != f.status => StaleKind::Superseded,
+        (old, Some(EntryStatus::Retracted)) if old != f.status => StaleKind::Retracted,
+        _ => StaleKind::Changed,
+    };
+    crate::cache::invalidate_revised(c, entry_ref(cur.id), rev, &f.body, stale)?;
     index_entry_now(c, cur.id, Some(cur.index_state), now)
+}
+
+fn entry_ref(id: Id) -> TargetRef {
+    TargetRef {
+        kind: TargetKind::Entry,
+        id,
+    }
 }
 
 /// Содержимое insight `superseded`/`retracted` не переписывается (история только дописывается:
@@ -629,6 +645,7 @@ pub async fn delete_entry(
             "UPDATE entries SET deleted_at = ?2 WHERE id = ?1",
             params![id, now],
         )?;
+        crate::cache::invalidate_target(tx, entry_ref(id), StaleKind::Deleted)?;
         unindex_entry(tx, id, cur.rev, cur.index_state, &now)
     })
     .await

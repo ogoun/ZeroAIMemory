@@ -649,7 +649,12 @@ fn insert_edge(
 }
 
 /// Явное ребро от записи или узла: проверки концов и прав (см. [`GraphStore::add_edge`]).
-fn add_explicit(c: &Connection, e: NewEdge, a: &Attribution, now: &str) -> Result<Id, StoreError> {
+pub(crate) fn add_explicit(
+    c: &Connection,
+    e: NewEdge,
+    a: &Attribution,
+    now: &str,
+) -> Result<Id, StoreError> {
     if e.kind == EdgeType::Supersedes {
         return Err(StoreError::BadInput(
             "supersedes ставится замещением insight, а не явной связью".into(),

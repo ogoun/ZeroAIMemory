@@ -140,6 +140,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ReleaseCmd,
     },
+    /// Кэш выжимок: сохранить выжимку с источниками, список, карточка, удаление
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
     /// Vault: секреты (значение — только из stdin или скрытого ввода)
     Vault {
         #[command(subcommand)]
@@ -413,6 +418,97 @@ impl VaultOpts {
             global: self.global,
             solution: self.solution.as_deref(),
         }
+    }
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// Сохранить выжимку (текст — из --file или stdin); печатает c_<id>
+    Put {
+        /// Запрос, на который отвечает выжимка
+        #[arg(long)]
+        query: String,
+        /// Источники через запятую: ID[#СЕКЦИЯ][@REV] (n:/i:/c:/r:, голый id или space:/путь)
+        #[arg(long, required = true)]
+        sources: Vec<String>,
+        /// Сразу превратить: note:<путь> или insight:<вид>
+        #[arg(long)]
+        promote: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml, без него — Knowledge)
+        #[arg(long)]
+        solution: Option<String>,
+        /// Файл с выжимкой (иначе stdin)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Выжимки: c_<id>, состояние, дата, запрос
+    List {
+        /// Подстрока запроса
+        #[arg(long)]
+        q: Option<String>,
+        #[arg(long, value_parser = ["valid", "stale"])]
+        state: Option<String>,
+        /// GUID решения: выжимки решения (общие)
+        #[arg(long)]
+        solution: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit: Option<u32>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Карточка выжимки: источники (изменившиеся — с причиной) и текст
+    Show {
+        id: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Удалить выжимку (мягко)
+    Rm {
+        id: String,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn cache(c: CacheCmd) -> Result<(), CliError> {
+    use cmd::cache as k;
+    match c {
+        CacheCmd::Put {
+            query,
+            sources,
+            promote,
+            solution,
+            file,
+            common,
+        } => k::put(
+            &cmd::connect(&common)?,
+            &k::PutOpts {
+                query: &query,
+                sources: &sources,
+                promote: promote.as_deref(),
+                solution: solution.as_deref(),
+                file: file.as_deref(),
+            },
+        ),
+        CacheCmd::List {
+            q,
+            state,
+            solution,
+            limit,
+            common,
+        } => k::list(
+            &cmd::connect(&common)?,
+            &k::ListOpts {
+                q: q.as_deref(),
+                state: state.as_deref(),
+                solution: solution.as_deref(),
+                limit,
+            },
+        ),
+        CacheCmd::Show { id, common } => k::show(&cmd::connect(&common)?, &id),
+        CacheCmd::Rm { id, common } => k::remove(&cmd::connect(&common)?, &id),
     }
 }
 
@@ -773,6 +869,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             cmd::insight::log(&cmd::connect(&common)?, &o)
         }
         Cmd::Insight { cmd } => insight(cmd),
+        Cmd::Cache { cmd } => cache(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {
             cmd:

@@ -273,6 +273,7 @@ impl IndexRuntime {
             batch_tokens: cfg.index.batch_tokens,
             yield_ms: cfg.index.yield_ms,
             rollup_debounce: Duration::from_millis(cfg.index.rollup_debounce_ms),
+            cache_new_sources_threshold: cfg.cache.new_sources_threshold,
             ..WorkerConfig::default()
         };
         rt.worker = WorkerHandle::spawn(

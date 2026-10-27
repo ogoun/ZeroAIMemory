@@ -309,7 +309,7 @@ async fn migrate_v12_to_v13() {
         })
         .await
         .unwrap();
-    assert_eq!(ver, 13);
+    assert_eq!(ver, zam_store::USER_MIGRATIONS.len() as u32);
     assert_eq!(tables, 3);
     assert!(zam_store::get_space(&db, space).await.unwrap().is_some());
     assert!(list_sessions(&db, None, 10).await.unwrap().is_empty());

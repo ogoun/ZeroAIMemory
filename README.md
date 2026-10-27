@@ -292,6 +292,7 @@ CLAUDE.md, `zam init`, хуки и MCP появятся на этапе M4.
 | `zam history <цель> [--diff A..B \| --revert N]` | ревизии, дифф, откат |
 | `zam search <запрос> [--all] [--mode brief\|chunks\|notes] [--top-k N] [--rerank]` | поиск, по умолчанию Markdown-карточки; `--rerank` — серверный реранк |
 | `zam attach <цель> <файл>` | загрузить вложение и напечатать ссылку `_attachments/…` |
+| `zam cache put --query Q --sources ID[#секция][@rev],… [--promote note:<путь>\|insight:<вид>] < выжимка.md` | сохранить выжимку с источниками (печатает `c_<id>`); `zam cache list\|show\|rm` — список, карточка с изменившимися источниками, удаление |
 
 ```
 echo "# Bash-скрипты" | zam write "knowledge:Инструменты/Bash" -m "первая версия"

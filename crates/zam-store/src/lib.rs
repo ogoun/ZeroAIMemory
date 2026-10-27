@@ -3,10 +3,12 @@
 //! индексации (`index_jobs`), кэш эмбеддингов, полнотекстовый поиск, блобы вложений,
 //! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
 //! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3), сессии агентов,
-//! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4).
+//! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4), кэш выжимок
+//! (`answer_cache`, `cache_deps`; M4).
 
 pub mod access;
 pub mod blobs;
+pub mod cache;
 pub mod certainty;
 pub mod datadir;
 pub mod db;
@@ -33,6 +35,13 @@ pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, Solutio
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_in_space,
     resolve_attachment,
+};
+pub use cache::{
+    CACHE_LOOKUP_MAX, CACHE_QUERY_MAX_CHARS, CACHE_SOURCES_MAX, CacheDep, CacheEntry, CacheError,
+    CacheFilter, CacheGc, CacheHit, CachePut, CacheQuery, PromoteAs, SourceSpec, StaleKind,
+    StaleSource, cache_count, cache_delete, cache_get, cache_list, cache_lookup, cache_promote,
+    cache_put, gc_cache, invalidate_target, mark_new_sources, normalize_query, scope_hash,
+    section_text,
 };
 pub use certainty::{
     CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,

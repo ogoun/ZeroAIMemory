@@ -1,6 +1,7 @@
 //! Маршруты HTTP API.
 pub mod admin;
 pub mod blobs;
+pub mod cache;
 pub mod entries;
 pub mod feedback;
 pub mod graph;
@@ -71,10 +72,11 @@ pub fn router(state: &AppState) -> Router<AppState> {
 }
 
 /// Маршруты записи в память (и чтения тех же ресурсов): узлы, вложения, записи журналов,
-/// связи, Vault. Изменяющие запросы с `X-Zam-Session` считает
+/// связи, Vault, кэш выжимок (`POST /cache`, `DELETE /cache/{id}`, `promote`; чтение кэша —
+/// в [`service_routes`]). Изменяющие запросы с `X-Zam-Session` считает
 /// [`sessions::count_memory_writes`]; оценка записи (`/feedback`) — не запись в память.
-/// Любой новый путь записи в память — сюда (решение контроллера R12): `cache_put`/`promote`
-/// задачи 7; MCP задачи 9 вызывает эти маршруты через внутренний `Router`.
+/// Любой новый путь записи в память — сюда (решение контроллера R12); MCP задачи 9 вызывает
+/// эти маршруты через внутренний `Router`.
 fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
     let note_limit = note_body_limit(limits);
     Router::new()
@@ -124,6 +126,9 @@ fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
             "/api/v1/blobs",
             post(blobs::upload).layer(blob_body_limit(limits)),
         )
+        .route("/api/v1/cache", post(cache::put))
+        .route("/api/v1/cache/{id}", delete(cache::remove))
+        .route("/api/v1/cache/{id}/promote", post(cache::promote))
 }
 
 /// Остальные маршруты: служебные, чтение, поиск, сессии, администрирование.
@@ -192,6 +197,8 @@ fn service_routes() -> Router<AppState> {
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
         .route("/api/v1/search", post(search::search))
         .route("/api/v1/read", post(read::read))
+        .route("/api/v1/cache", get(cache::list))
+        .route("/api/v1/cache/{id}", get(cache::get))
         .route("/api/v1/triggers", get(triggers::list))
         .route(
             "/api/v1/sessions",

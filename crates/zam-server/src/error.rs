@@ -50,6 +50,10 @@ pub enum ApiError {
     /// 422 `/problems/locator-unsupported`: `locator` в `/read` — этап M5.
     #[error("{0}")]
     LocatorUnsupported(String),
+    /// 422 источника выжимки кэша (§9.4): `kind` — тип problem `/problems/cache-cross-db`,
+    /// `/problems/cache-forbidden-source` или `/problems/cache-source-not-found`.
+    #[error("{detail}")]
+    CacheSource { kind: &'static str, detail: String },
     /// 422 `/problems/idempotency-mismatch`: ключ повторён с другим запросом.
     #[error("{0}")]
     IdempotencyMismatch(String),
@@ -127,6 +131,11 @@ impl ApiError {
             ApiError::LocatorUnsupported(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/locator-unsupported",
+                "Unprocessable Content",
+            ),
+            ApiError::CacheSource { kind, .. } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                kind,
                 "Unprocessable Content",
             ),
             ApiError::IdempotencyMismatch(_) => (
