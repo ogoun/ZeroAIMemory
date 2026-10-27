@@ -15,11 +15,14 @@
 //!   решения — Knowledge пользователя запроса. Ключ выжимки — `scope_hash` области поиска
 //!   (`scope`, `filters`, `include_history` — как в `POST /search`; по умолчанию — область
 //!   поиска по умолчанию с этим решением) и нормализованный запрос **[решение исполнителя]**:
-//!   так поиск с той же областью находит выжимку точным совпадением;
+//!   так поиск с той же областью находит выжимку точным совпадением; `scope.spaces` и
+//!   `all_solutions` ключ не описывает — 400. Новая выжимка заменяет прежнюю того же ключа
+//!   только того же автора (агент или человек, пользователь) и той же сессии (fix round 1);
 //! - **источники** (`id` — как в `POST /read`: `n:`, `i:|c:|r:|e:`, голый id, путь
 //!   `<пространство>:/<путь>`): должны лежать в базе пространства кэша (иначе 422
 //!   `/problems/cache-cross-db`); Human и Vault — 422 `/problems/cache-forbidden-source`;
 //!   нет источника, он удалён, папка или нет секции — 422 `/problems/cache-source-not-found`;
+//!   insight `superseded` или `retracted` — 422 `/problems/cache-source-inactive`;
 //!   `rev` не совпал с текущей — 409 с `rev` (выжимка основана на устаревшем тексте).
 //!   Участник решения ссылается только на пространство решения (остальное владельца ему не
 //!   существует). Сервер закрепляет ревизии и хэши (`zam_store::cache_put`);
@@ -30,7 +33,9 @@
 //! - `DELETE` — автор, владелец пространства (владелец базы) или администратор, мягко;
 //! - `promote` — заметка (`path`, по умолчанию `Выжимки/<запрос>`) или insight (`kind`, по
 //!   умолчанию `discovery`; заголовок — запрос) в пространстве кэша со связями `derived_from`
-//!   на источники, у выжимки — `promoted_to`.
+//!   на источники, у выжимки — `promoted_to`; `POST /cache` с `promote` сохраняет и
+//!   превращает одной транзакцией (409 на занятом пути — выжимки нет);
+//! - `query_vec` хранится с `model_id` текущей модели: вектор другой модели не сравнивается.
 //!
 //! Изменяющие маршруты (`POST /cache`, `DELETE`, `promote`) — в `memory_routes` (решение
 //! контроллера R12: счётчик `memory_writes` сессии), чтение — служебное.
@@ -44,8 +49,8 @@ use serde_json::{Map, Value, json};
 use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
 use zam_store::{
     CacheError, CacheFilter, CacheHit, CachePut, Db, PromoteAs, SourceSpec, Space, SpaceKind,
-    StoreError, TITLE_MAX_CHARS, cache_delete, cache_get, cache_list, cache_promote, cache_put,
-    count_tokens, get_entry, get_node, get_space, vault_get_any,
+    StoreError, TITLE_MAX_CHARS, cache_delete, cache_get, cache_list, cache_promote,
+    cache_put_with, count_tokens, get_entry, get_node, get_space, vault_get_any,
 };
 
 use super::scope::{MemScope, Mode, Role, foreign_solutions, owner_db, space_scope, user_db};
@@ -119,6 +124,10 @@ fn cache_error(e: CacheError) -> ApiError {
         },
         e @ CacheError::SourceNotFound { .. } => ApiError::CacheSource {
             kind: "/problems/cache-source-not-found",
+            detail: e.to_string(),
+        },
+        e @ CacheError::SourceInactive { .. } => ApiError::CacheSource {
+            kind: "/problems/cache-source-inactive",
             detail: e.to_string(),
         },
         e @ CacheError::SourceChanged { current_rev, .. } => {
@@ -487,6 +496,14 @@ pub async fn put(
             zam_store::CACHE_SOURCES_MAX
         )));
     }
+    // ключ кэша не описывает явный список пространств и «все решения» (§9.4)
+    if req.scope.spaces.is_some() || req.scope.all_solutions {
+        return Err(ApiError::BadRequest(
+            "scope.spaces и scope.all_solutions для выжимки не поддерживаются: \
+             кэш — по решению или Knowledge"
+                .into(),
+        ));
+    }
     if req.solution.is_some() {
         req.scope.solution = req.solution.clone();
     }
@@ -508,31 +525,39 @@ pub async fn put(
         });
     }
     let promote = match &req.promote {
-        Some(pr) => Some(promote_as(pr, &q).map(|_| pr)?),
+        Some(pr) => Some((promote_as(pr, &q)?, attribution(&p, &headers, None)?)),
         None => None,
+    };
+    let author_kind = attribution(&p, &headers, None)?.author_kind;
+    let (query_vec, model_id) = match query_vec(&st, &q).await {
+        Some(v) => (Some(v), st.index.model_id().map(str::to_string)),
+        None => (None, None),
     };
     let put = CachePut {
         space_id: sc.space.id,
         area: header_value(&headers, AREA_HEADER)?
             .or_else(|| zam_store::normalize_area(req.scope.area.as_deref())),
         author_user_id: sc.user.id,
+        author_kind,
         session_id: header_value(&headers, SESSION_HEADER)?,
         machine: header_value(&headers, MACHINE_HEADER)?,
         scope_hash,
-        query_vec: query_vec(&st, &q).await,
+        query_vec,
+        model_id,
         query: q.clone(),
         summary: req.summary.clone(),
         tokens: tokens as i64,
         sources,
     };
-    let e = cache_put(&sc.db, &put).await.map_err(cache_error)?;
-    let v = match promote {
-        Some(pr) => do_promote(&st, &p, &headers, &sc, e.id, pr, &q).await?,
-        None => {
-            let h = cache_get(&sc.db, e.id).await?.ok_or(ApiError::NotFound)?;
-            cache_json(&st, &h, Some(&sc.space)).await
-        }
-    };
+    // сохранение и превращение — одна транзакция: сбой превращения не оставляет выжимку
+    let (e, made) = cache_put_with(&sc.db, &put, promote)
+        .await
+        .map_err(cache_error)?;
+    let h = cache_get(&sc.db, e.id).await?.ok_or(ApiError::NotFound)?;
+    let mut v = cache_json(&st, &h, Some(&sc.space)).await;
+    if let (Some(t), Value::Object(m)) = (made, &mut v) {
+        m.insert("promoted".into(), json!(t));
+    }
     Ok((StatusCode::CREATED, Json(v)))
 }
 

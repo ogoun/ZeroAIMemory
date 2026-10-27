@@ -97,27 +97,35 @@ fn updated_at(c: &Connection, t: TargetRef) -> Result<Option<Timestamp>, StoreEr
 }
 
 /// Новые источники (§9.4): воркер индексации после upsert чанков сравнивает их dense-векторы
-/// (`vecs`: цель → вектор чанка; у цели может быть несколько) с `query_vec` действующих
-/// выжимок той же области — пространство `space` (выжимка в нём или с источником в нём) и
+/// модели `model_id` (`vecs`: цель → вектор чанка; у цели может быть несколько) с `query_vec`
+/// действующих выжимок той же модели и той же области — пространство `space` (выжимка в нём или с источником в нём) и
 /// область `area` (у выжимки и цели обе заданы — должны совпасть). Цель считается новой для
 /// выжимки, если она не среди её источников и изменена после сохранения выжимки (иначе
-/// переиндексация без изменений портила бы кэш). Косинус ≥ `threshold` → `stale:
-/// new_sources` с этой целью. Число выжимок, получивших новую причину.
+/// переиндексация без изменений портила бы кэш), и не заметка или insight, в которые
+/// превращена какая-либо выжимка (`promoted_to`: выжимка не инвалидирует сама себя, а
+/// пересказ выжимки — не новое знание). Косинус ≥ `threshold` → `stale: new_sources` с этой
+/// целью. Число выжимок, получивших новую причину.
 pub async fn mark_new_sources(
     db: &Db,
     space: Id,
     area: Option<&str>,
+    model_id: &str,
     vecs: &[(TargetRef, Vec<f32>)],
     threshold: f32,
 ) -> Result<u32, StoreError> {
     if vecs.is_empty() {
         return Ok(0);
     }
-    let (area, vecs) = (area.map(str::to_string), vecs.to_vec());
+    let (area, model, vecs) = (
+        area.map(str::to_string),
+        model_id.to_string(),
+        vecs.to_vec(),
+    );
     db.write(move |tx| {
         let mut st = tx.prepare_cached(
             "SELECT a.id, a.query_vec, a.created_at FROM answer_cache a
              WHERE a.deleted_at IS NULL AND a.state = 'valid' AND a.query_vec IS NOT NULL
+               AND a.model_id = ?3
                AND (?2 IS NULL OR a.area IS NULL OR a.area = ?2)
                AND (a.space_id = ?1 OR EXISTS (
                      SELECT 1 FROM cache_deps d
@@ -126,13 +134,24 @@ pub async fn mark_new_sources(
                      WHERE d.cache_id = a.id AND coalesce(n.space_id, e.space_id) = ?1))",
         )?;
         let caches: Vec<(Id, Vec<u8>, String)> = st
-            .query_map(params![space, area], |r| {
+            .query_map(params![space, area, model], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?
             .collect::<Result<_, _>>()?;
         if caches.is_empty() {
             return Ok(0);
         }
+        // цели, в которые превращены выжимки, — не новые источники
+        let mut promoted =
+            tx.prepare_cached("SELECT EXISTS (SELECT 1 FROM answer_cache WHERE promoted_to = ?1)")?;
+        let mut vecs_kept = Vec::with_capacity(vecs.len());
+        for (t, v) in vecs {
+            let p: bool = promoted.query_row([t.to_string()], |r| r.get(0))?;
+            if !p {
+                vecs_kept.push((t, v));
+            }
+        }
+        let vecs = vecs_kept;
         let mut changed: HashMap<TargetRef, Option<Timestamp>> = HashMap::new();
         let mut is_dep = tx.prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM cache_deps

@@ -41,7 +41,7 @@ pub use self::invalidate::{invalidate_target, mark_new_sources};
 use crate::embeddings::{decode_dense, encode_dense};
 use crate::entries::{EntryKind, NewEntry};
 use crate::graph::{EdgeType, NewEdge};
-use crate::nodes::{Attribution, NewNote};
+use crate::nodes::{Attribution, AuthorKind, NewNote};
 use crate::paths::NodePath;
 use crate::time::{fmt_ts, ser_ts, ser_ts_opt, ts_at, ts_opt};
 use crate::{Db, StoreError};
@@ -111,12 +111,17 @@ pub struct CachePut {
     pub space_id: Id,
     pub area: Option<String>,
     pub author_user_id: Id,
+    /// Агент (токен) или человек (WebUI): вместе с `author_user_id` и сессией — кто заменяет
+    /// свою прежнюю выжимку того же ключа.
+    pub author_kind: AuthorKind,
     pub session_id: Option<String>,
     pub machine: Option<String>,
     pub scope_hash: String,
     pub query: String,
     /// Dense-вектор запроса (нормированный); `None` — без модели: только точное попадание.
     pub query_vec: Option<Vec<f32>>,
+    /// Модель `query_vec` (`model_id` эмбеддера); вектор другой модели не сравнивается.
+    pub model_id: Option<String>,
     pub summary: String,
     pub tokens: i64,
     pub sources: Vec<SourceSpec>,
@@ -176,6 +181,8 @@ pub struct CacheQuery {
     pub scope_hash: String,
     pub query_norm: String,
     pub query_vec: Option<Vec<f32>>,
+    /// Модель `query_vec`: семантическое попадание — только по выжимкам этой модели.
+    pub model_id: Option<String>,
     /// Текущая сессия: её выжимки — первыми.
     pub session_id: Option<String>,
     /// Выжимки других сессий (`cache.cross_session`).
@@ -224,6 +231,9 @@ pub enum CacheError {
     /// Источника нет, он удалён, это папка или нет секции.
     #[error("источник {target}: {detail}")]
     SourceNotFound { target: String, detail: String },
+    /// Источник — insight `superseded` или `retracted`: 422 `cache-source-inactive`.
+    #[error("источник {target}: запись {status} — выжимка на ней сразу недействительна")]
+    SourceInactive { target: String, status: String },
     /// Ревизия источника в запросе не совпала с текущей: выжимка уже устарела.
     #[error("источник {target}: ревизия {current_rev}, а не {expected}")]
     SourceChanged {
@@ -374,11 +384,23 @@ fn load_deps(c: &Connection, id: Id) -> Result<Vec<CacheDep>, StoreError> {
 }
 
 /// Сохраняет выжимку: источники проверяются и закрепляются (ревизия и хэш текста или секции)
-/// в той же транзакции. Прежние выжимки того же ключа `(scope_hash, query_norm)` в этом
-/// пространстве, не превращённые в записи, мягко удаляются — действует новая
-/// **[решение исполнителя]**. Нет пространства → `Store(NotFound)`; пустой список или больше
-/// [`CACHE_SOURCES_MAX`] источников → `Store(BadInput)`.
+/// в той же транзакции. Прежняя выжимка того же ключа `(scope_hash, query_norm)` в этом
+/// пространстве **того же автора** (`author_kind`, `author_user_id`) **и той же сессии**, не
+/// превращённая в запись, мягко удаляется — действует новая; выжимки других авторов и
+/// сессий остаются **[решение исполнителя, fix round 1]**. Нет пространства →
+/// `Store(NotFound)`; пустой список или больше [`CACHE_SOURCES_MAX`] источников →
+/// `Store(BadInput)`.
 pub async fn cache_put(db: &Db, p: &CachePut) -> Result<CacheEntry, CacheError> {
+    Ok(cache_put_with(db, p, None).await?.0)
+}
+
+/// [`cache_put`] и сразу [`cache_promote`] — одной транзакцией писателя: если превращение не
+/// удалось (путь занят — `Conflict`), выжимка не сохраняется.
+pub async fn cache_put_with(
+    db: &Db,
+    p: &CachePut,
+    promote: Option<(PromoteAs, Attribution)>,
+) -> Result<(CacheEntry, Option<TargetRef>), CacheError> {
     if p.sources.is_empty() {
         return Err(StoreError::BadInput("sources: хотя бы один источник".into()).into());
     }
@@ -389,10 +411,18 @@ pub async fn cache_put(db: &Db, p: &CachePut) -> Result<CacheEntry, CacheError> 
         .into());
     }
     let p = p.clone();
-    db.write(move |tx| match put_tx(tx, &p) {
-        Ok(e) => Ok(Ok(e)),
-        Err(CacheError::Store(e)) => Err(e),
-        Err(e) => Ok(Err(e)),
+    db.write(move |tx| {
+        let e = match put_tx(tx, &p) {
+            Ok(e) => e,
+            Err(CacheError::Store(e)) => return Err(e),
+            // ошибки источников — до любой записи: фиксация ничего не меняет
+            Err(e) => return Ok(Err(e)),
+        };
+        match promote {
+            None => Ok(Ok((e, None))),
+            // сбой превращения откатывает и сохранение
+            Some((to, a)) => promote_tx(tx, e.id, to, &a).map(|(e, t)| Ok((e, Some(t)))),
+        }
     })
     .await?
 }
@@ -425,16 +455,26 @@ fn put_tx(tx: &Connection, p: &CachePut) -> Result<CacheEntry, CacheError> {
     tx.execute(
         "UPDATE answer_cache SET deleted_at = ?4
          WHERE space_id = ?1 AND scope_hash = ?2 AND query_norm = ?3
+           AND author_user_id = ?5 AND author_kind = ?6 AND session_id IS ?7
            AND deleted_at IS NULL AND promoted_to IS NULL",
-        params![p.space_id, p.scope_hash, query_norm, now],
+        params![
+            p.space_id,
+            p.scope_hash,
+            query_norm,
+            now,
+            p.author_user_id,
+            p.author_kind.as_str(),
+            p.session_id
+        ],
     )
     .map_err(StoreError::from)?;
     let id = Id::new();
     tx.execute(
         "INSERT INTO answer_cache (id, space_id, area, author_user_id, session_id, machine,
                                    scope_hash, query, query_norm, query_vec, summary, tokens,
-                                   state, created_at, last_used_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'valid', ?13, ?13)",
+                                   state, created_at, last_used_at, author_kind, model_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'valid', ?13, ?13, ?14,
+                 ?15)",
         params![
             id,
             p.space_id,
@@ -449,6 +489,8 @@ fn put_tx(tx: &Connection, p: &CachePut) -> Result<CacheEntry, CacheError> {
             p.summary,
             p.tokens,
             now,
+            p.author_kind.as_str(),
+            p.query_vec.as_ref().and(p.model_id.as_deref()),
         ],
     )
     .map_err(StoreError::from)?;
@@ -531,7 +573,7 @@ pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, Stor
     let hits = db
         .read(move |c| {
             let mut st = c.prepare_cached(&format!(
-                "SELECT {CACHE_COLS}, a.query_norm, a.query_vec FROM answer_cache a
+                "SELECT {CACHE_COLS}, a.query_norm, a.query_vec, a.model_id FROM answer_cache a
                  WHERE a.space_id = ?1 AND a.scope_hash = ?2 AND a.deleted_at IS NULL
                    AND (?3 OR a.session_id IS ?4)"
             ))?;
@@ -541,15 +583,18 @@ pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, Stor
                     let e = cache_row(r)?;
                     let norm: String = r.get(17)?;
                     let vec: Option<Vec<u8>> = r.get(18)?;
-                    Ok((e, norm, vec))
+                    let model: Option<String> = r.get(19)?;
+                    Ok((e, norm, vec, model))
                 },
             )?;
             let mut cands: Vec<Candidate> = Vec::new();
             for row in rows {
-                let (entry, norm, vec) = row?;
+                let (entry, norm, vec, model) = row?;
                 let exact = norm == q.query_norm;
+                // вектор другой модели (или без модели) не сравнивается
+                let same_model = model.is_some() && model == q.model_id;
                 let sim = match (&q.query_vec, vec) {
-                    (Some(qv), Some(b)) => cos(qv, &decode_dense(&b)?).unwrap_or(0.0),
+                    (Some(qv), Some(b)) if same_model => cos(qv, &decode_dense(&b)?).unwrap_or(0.0),
                     _ => 0.0,
                 };
                 if exact || sim >= q.semantic_threshold {
@@ -559,12 +604,13 @@ pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, Stor
             let mine = |c: &Candidate| {
                 q.session_id.is_some() && c.entry.session_id.as_deref() == q.session_id.as_deref()
             };
+            // §9.4: сначала текущая сессия, затем остальные; внутри — точные, затем свежие
             cands.sort_by(|a, b| {
                 mine(b)
                     .cmp(&mine(a))
                     .then(b.exact.cmp(&a.exact))
+                    .then(b.entry.created_at.cmp(&a.entry.created_at))
                     .then(b.sim.total_cmp(&a.sim))
-                    .then(b.entry.last_used_at.cmp(&a.entry.last_used_at))
             });
             let mut out = Vec::new();
             // проверка — по кандидатам в порядке выдачи, пока не набрано `limit` видимых
@@ -584,7 +630,10 @@ pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, Stor
         .await?;
     if !hits.is_empty() {
         let ids: Vec<Id> = hits.iter().map(|h| h.entry.id).collect();
-        touch_used(db, ids).await?;
+        // учёт обращения (LRU) — не повод терять найденное
+        if let Err(e) = touch_used(db, ids).await {
+            tracing::warn!(error = %e, "кэш выжимок: обращение не отмечено");
+        }
     }
     Ok(hits)
 }
@@ -682,84 +731,91 @@ pub async fn cache_promote(
     a: &Attribution,
 ) -> Result<(CacheEntry, TargetRef), StoreError> {
     let a = a.clone();
-    db.write(move |tx| {
-        let e = load_cache(tx, id)?.ok_or(StoreError::NotFound)?;
-        if e.deleted_at.is_some() {
-            return Err(StoreError::NotFound);
+    db.write(move |tx| promote_tx(tx, id, to, &a)).await
+}
+
+/// [`cache_promote`] внутри транзакции писателя.
+fn promote_tx(
+    tx: &Connection,
+    id: Id,
+    to: PromoteAs,
+    a: &Attribution,
+) -> Result<(CacheEntry, TargetRef), StoreError> {
+    let e = load_cache(tx, id)?.ok_or(StoreError::NotFound)?;
+    if e.deleted_at.is_some() {
+        return Err(StoreError::NotFound);
+    }
+    if let Some(p) = &e.promoted_to {
+        return Err(StoreError::Conflict(format!(
+            "выжимка уже превращена в {p}"
+        )));
+    }
+    let now = fmt_ts(Timestamp::now());
+    let mut targets: Vec<TargetRef> = Vec::new();
+    for d in &e.sources {
+        if !targets.contains(&d.target) && deps::is_live(tx, d.target)? {
+            targets.push(d.target);
         }
-        if let Some(p) = &e.promoted_to {
-            return Err(StoreError::Conflict(format!(
-                "выжимка уже превращена в {p}"
-            )));
-        }
-        let now = fmt_ts(Timestamp::now());
-        let mut targets: Vec<TargetRef> = Vec::new();
-        for d in &e.sources {
-            if !targets.contains(&d.target) && deps::is_live(tx, d.target)? {
-                targets.push(d.target);
-            }
-        }
-        let mut attrib = a.clone();
-        attrib.area = attrib.area.or_else(|| e.area.clone());
-        let created = match to {
-            PromoteAs::Note { path } => {
-                let n = crate::nodes::insert_note(
-                    tx,
-                    &NewNote {
-                        space_id: e.space_id,
-                        path,
-                        content: e.summary.clone(),
-                        l0: None,
-                        attrib: attrib.clone(),
-                    },
-                )?;
-                let src = TargetRef {
-                    kind: TargetKind::Node,
-                    id: n.id,
-                };
-                for &dst in &targets {
-                    let edge = NewEdge {
-                        src,
-                        dst,
-                        kind: EdgeType::DerivedFrom,
-                    };
-                    crate::graph::add_explicit(tx, edge, &attrib, &now)?;
-                }
-                src
-            }
-            PromoteAs::Insight { kind, title } => {
-                let entry = NewEntry {
+    }
+    let mut attrib = a.clone();
+    attrib.area = attrib.area.or_else(|| e.area.clone());
+    let created = match to {
+        PromoteAs::Note { path } => {
+            let n = crate::nodes::insert_note(
+                tx,
+                &NewNote {
                     space_id: e.space_id,
-                    kind: EntryKind::Insight,
-                    title,
-                    body: e.summary.clone(),
-                    data: serde_json::json!({ "kind": kind }),
-                    area: e.area.clone(),
-                    tags: Vec::new(),
-                    status: None,
-                    certainty: None,
-                    idempotency_key: None,
-                    triggers: Vec::new(),
-                    links: targets
-                        .iter()
-                        .map(|t| (EdgeType::DerivedFrom, *t))
-                        .collect(),
+                    path,
+                    content: e.summary.clone(),
+                    l0: None,
+                    attrib: attrib.clone(),
+                },
+            )?;
+            let src = TargetRef {
+                kind: TargetKind::Node,
+                id: n.id,
+            };
+            for &dst in &targets {
+                let edge = NewEdge {
+                    src,
+                    dst,
+                    kind: EdgeType::DerivedFrom,
                 };
-                let eid = crate::entries::insert_entry(tx, entry, None, &attrib, None, &now)?;
-                TargetRef {
-                    kind: TargetKind::Entry,
-                    id: eid,
-                }
+                crate::graph::add_explicit(tx, edge, &attrib, &now)?;
             }
-        };
-        tx.execute(
-            "UPDATE answer_cache SET promoted_to = ?2 WHERE id = ?1",
-            params![id, created.to_string()],
-        )?;
-        let e = load_cache(tx, id)?.ok_or(StoreError::NotFound)?;
-        Ok((e, created))
-    })
-    .await
+            src
+        }
+        PromoteAs::Insight { kind, title } => {
+            let entry = NewEntry {
+                space_id: e.space_id,
+                kind: EntryKind::Insight,
+                title,
+                body: e.summary.clone(),
+                data: serde_json::json!({ "kind": kind }),
+                area: e.area.clone(),
+                tags: Vec::new(),
+                status: None,
+                certainty: None,
+                idempotency_key: None,
+                triggers: Vec::new(),
+                links: targets
+                    .iter()
+                    .map(|t| (EdgeType::DerivedFrom, *t))
+                    .collect(),
+            };
+            let eid = crate::entries::insert_entry(tx, entry, None, &attrib, None, &now)?;
+            TargetRef {
+                kind: TargetKind::Entry,
+                id: eid,
+            }
+        }
+    };
+    tx.execute(
+        "UPDATE answer_cache SET promoted_to = ?2 WHERE id = ?1",
+        params![id, created.to_string()],
+    )?;
+    let e = load_cache(tx, id)?.ok_or(StoreError::NotFound)?;
+    Ok((e, created))
 }
 
 /// Итог чистки кэша базы.

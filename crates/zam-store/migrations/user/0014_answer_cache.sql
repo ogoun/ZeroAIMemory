@@ -5,11 +5,17 @@
 -- секции `section`, если она указана): по ним выжимка проверяется при чтении, по обратному
 -- индексу `cache_deps_target` инвалидируется в транзакции писателя источника. `section` —
 -- путь заголовков или '' (цель целиком): NULL в первичном ключе SQLite не уникален.
--- `query_vec` — dense-вектор запроса (f16 LE, как `embeddings.dense`), NULL без модели.
+-- `query_vec` — dense-вектор запроса (f16 LE, как `embeddings.dense`), NULL без модели;
+-- `model_id` — модель вектора: с другой текущей моделью вектор не сравнивается (ни
+-- семантическое попадание, ни новые источники). `author_kind` — `agent` (токен) или
+-- `human` (WebUI): выжимку заменяет только новая выжимка того же автора и той же сессии.
 CREATE TABLE answer_cache (
   id TEXT PRIMARY KEY, space_id TEXT NOT NULL REFERENCES spaces(id), area TEXT,
-  author_user_id TEXT NOT NULL, session_id TEXT, machine TEXT,
+  author_user_id TEXT NOT NULL,
+  author_kind TEXT NOT NULL DEFAULT 'agent' CHECK (author_kind IN ('agent','human','system')),
+  session_id TEXT, machine TEXT,
   scope_hash TEXT NOT NULL, query TEXT NOT NULL, query_norm TEXT NOT NULL, query_vec BLOB,
+  model_id TEXT,
   summary TEXT NOT NULL, tokens INTEGER NOT NULL,
   state TEXT NOT NULL DEFAULT 'valid' CHECK (state IN ('valid','stale')),
   stale_reason TEXT,                  -- JSON: [{target, section?, reason: changed|deleted|superseded|retracted|new_sources}]

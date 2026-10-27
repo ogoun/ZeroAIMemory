@@ -73,7 +73,11 @@ pub(super) async fn lookup(
         space_id: sc.space.id,
         scope_hash: scope_key(scope, filter, solution.as_ref()),
         query_norm,
-        query_vec: dense.map(<[f32]>::to_vec),
+        // вектор — текущей модели; без модели семантического попадания нет
+        query_vec: dense
+            .filter(|_| st.index.model_id().is_some())
+            .map(<[f32]>::to_vec),
+        model_id: st.index.model_id().map(str::to_string),
         session_id: session.map(str::to_string),
         cross_session: st.cfg.cache.cross_session,
         semantic_threshold: st.cfg.cache.semantic_threshold,

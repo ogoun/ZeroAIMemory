@@ -368,8 +368,10 @@ usage(id INTEGER PK, ts, user_id, session_id NULL, target_kind, target_id,
       -- INDEX usage_target(target_kind, target_id, event)
 
 -- Кэш выжимок (M4, миграция 0014_answer_cache; §9.4)
-answer_cache(id TEXT PK, space_id FK spaces, area NULL, author_user_id, session_id NULL, machine NULL,
-             scope_hash, query, query_norm, query_vec BLOB NULL, summary /*markdown от агента*/, tokens,
+answer_cache(id TEXT PK, space_id FK spaces, area NULL, author_user_id,
+             author_kind DEFAULT 'agent' /*agent|human|system [fix round 1 задачи 7 M4]*/, session_id NULL, machine NULL,
+             scope_hash, query, query_norm, query_vec BLOB NULL, model_id NULL /*модель query_vec*/,
+             summary /*markdown от агента*/, tokens,
              state DEFAULT 'valid' CHECK(state IN('valid','stale')),
              stale_reason NULL /*JSON [{target, reason: changed|deleted|superseded|retracted|new_sources}]*/,
              created_at, last_used_at, hits DEFAULT 0,
@@ -788,7 +790,12 @@ POST /api/v1/search
 - **WebUI.** Кэш доступен на просмотр (§15.4): выжимка, источники, автор, статус. Записи можно удалять и превращать в заметки.
 - Уточнения **[решение исполнителя, задача 7 M4]**:
   - `scope_hash` кэша считается по области запроса после умолчаний (`include_knowledge`/`include_rules` — `true`, `filters` — виды, статусы и `certainty` по умолчанию, упорядоченные списки; решение — `scope.solution` или `X-Zam-Solution`); `POST /cache` принимает `scope`, `filters`, `include_history` той же формы, что `POST /search` (по умолчанию — область поиска по умолчанию с этим решением), — так повтор поиска с той же областью находит выжимку точным совпадением. Поиск с `scope.spaces` или `all_solutions` шага 0 не делает (ключ этих полей не содержит). Семантическое попадание — тот же `scope_hash` и косинус ≥ 0,92;
-  - повторный `POST /cache` с тем же ключом в том же пространстве мягко удаляет прежнюю выжимку (не превращённую в запись) — действует новая;
+  - повторный `POST /cache` с тем же ключом в том же пространстве мягко удаляет прежнюю выжимку (не превращённую в запись) **того же автора** (`author_kind` агент/человек и пользователь) **и той же сессии** — действует новая; выжимки других авторов (участников решения) и других сессий остаются, поиск выдаёт сначала выжимку текущей сессии, затем остальные (точные, затем свежие по `created_at`), при `cache.cross_session = false` — только свою (fix round 1);
+  - `POST /cache` со `scope.spaces` или `all_solutions` — 400: ключ этих полей не описывает (fix round 1);
+  - `POST /cache` с `promote` сохраняет и превращает одной транзакцией писателя: превращение не удалось (путь занят — 409) — выжимка не сохраняется (fix round 1);
+  - источник — insight `superseded` или `retracted` — 422 `/problems/cache-source-inactive` (fix round 1);
+  - `query_vec` хранится с `model_id` модели, которой он посчитан; при другой текущей модели вектор не сравнивается — нет ни семантического попадания, ни отметки новых источников по вектору; точное совпадение `(scope_hash, query_norm)` работает (fix round 1);
+  - цель, в которую превращена выжимка (`promoted_to`), не считается новым источником ни для неё, ни для других выжимок; сбой отметки обращения (`last_used_at`, `hits`) — WARN, найденные выжимки выдаются (fix round 1);
   - хэш текста источника — sha256: заметки целиком — `content_hash`, записи журнала — тела, секции — её байт (заголовок с подсекциями); правка, не изменившая текст секции (или тела записи), переносит источник на новую ревизию без инвалидации; перенос узла — `changed` (путь мог упоминаться в выжимке), новое вложение заметки — `changed`; смена статуса записи без смены тела — не инвалидирует, кроме замещения и отзыва;
   - `rev` источника в запросе, не совпавший с текущей, — 409 с `rev` текущей (выжимка основана на устаревшем тексте); нет источника, удалён, папка, нет секции — 422 `/problems/cache-source-not-found`; Human и Vault — 422 `/problems/cache-forbidden-source` (существование Human раскрывается только владельцу базы); участник решения ссылается только на пространство решения;
   - выжимка решения, у которой есть источник вне пространства решения (владелец сослался на свой Knowledge), участнику не выдаётся ни в поиске, ни в списке, ни по id;

@@ -35,6 +35,8 @@ struct Target {
     folder: bool,
     /// Хэш целиком (`content_hash` узла) — без чтения текста.
     whole_hash: Option<String>,
+    /// Статус insight (`superseded`, `retracted`, …); у узла — `None`.
+    status: Option<String>,
 }
 
 fn load_target(c: &Connection, t: TargetRef) -> Result<Option<Target>, StoreError> {
@@ -52,12 +54,13 @@ fn load_target(c: &Connection, t: TargetRef) -> Result<Option<Target>, StoreErro
                     deleted: r.get(2)?,
                     folder: r.get(3)?,
                     whole_hash: r.get(4)?,
+                    status: None,
                 })
             })
             .optional()?,
         TargetKind::Entry => c
             .prepare_cached(
-                "SELECT s.kind, e.current_rev, e.deleted_at IS NOT NULL
+                "SELECT s.kind, e.current_rev, e.deleted_at IS NOT NULL, e.status
                  FROM entries e JOIN spaces s ON s.id = e.space_id WHERE e.id = ?1",
             )?
             .query_row([t.id], |r| {
@@ -67,6 +70,7 @@ fn load_target(c: &Connection, t: TargetRef) -> Result<Option<Target>, StoreErro
                     deleted: r.get(2)?,
                     folder: false,
                     whole_hash: None,
+                    status: r.get(3)?,
                 })
             })
             .optional()?,
@@ -105,6 +109,13 @@ pub(crate) fn pin(
     }
     if cur.folder {
         return Err(missing("папка — не источник: у неё нет текста"));
+    }
+    // замещённый или отозванный insight — выжимка на нём была бы недействительна сразу
+    if let Some(s @ ("superseded" | "retracted")) = cur.status.as_deref() {
+        return Err(CacheError::SourceInactive {
+            target: t.to_string(),
+            status: s.to_string(),
+        });
     }
     if let Some(expected) = rev
         && expected != cur.rev

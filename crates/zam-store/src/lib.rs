@@ -40,8 +40,8 @@ pub use cache::{
     CACHE_LOOKUP_MAX, CACHE_QUERY_MAX_CHARS, CACHE_SOURCES_MAX, CacheDep, CacheEntry, CacheError,
     CacheFilter, CacheGc, CacheHit, CachePut, CacheQuery, PromoteAs, SourceSpec, StaleKind,
     StaleSource, cache_count, cache_delete, cache_get, cache_list, cache_lookup, cache_promote,
-    cache_put, gc_cache, invalidate_target, mark_new_sources, normalize_query, scope_hash,
-    section_text,
+    cache_put, cache_put_with, gc_cache, invalidate_target, mark_new_sources, normalize_query,
+    scope_hash, section_text,
 };
 pub use certainty::{
     CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,

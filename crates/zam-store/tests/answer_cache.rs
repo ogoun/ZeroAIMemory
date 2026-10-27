@@ -9,10 +9,13 @@ use zam_store::{
     Attribution, AuthorKind, CacheError, CachePut, CacheQuery, Certainty, DataDir, Db, EntryKind,
     EntryPatch, NewEntry, NewNote, NodePath, PromoteAs, SourceSpec, SpaceKind, StaleKind,
     StaleSource, UserDbs, cache_count, cache_get, cache_lookup, cache_promote, cache_put,
-    create_entry, create_folder, create_note, delete_entry, delete_node, gc_cache, list_spaces,
-    mark_new_sources, move_node, normalize_query, patch_note, retract_entry, scope_hash,
-    supersede_entry, update_entry, update_note,
+    cache_put_with, create_entry, create_folder, create_note, delete_entry, delete_node, gc_cache,
+    list_spaces, mark_new_sources, move_node, normalize_query, patch_note, retract_entry,
+    scope_hash, supersede_entry, update_entry, update_note,
 };
+
+/// Модель векторов запросов в тестах.
+const MODEL: &str = "fake/test@00000001";
 
 fn datadir(name: &str) -> DataDir {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("answer-cache-{name}"));
@@ -122,11 +125,13 @@ fn put(w: &W, query: &str, sources: Vec<SourceSpec>) -> CachePut {
         space_id: w.knowledge,
         area: None,
         author_user_id: w.user,
+        author_kind: AuthorKind::Agent,
         session_id: Some("s1".into()),
         machine: Some("box".into()),
         scope_hash: scope(),
         query: query.into(),
         query_vec: None,
+        model_id: Some(MODEL.into()),
         summary: "Выжимка: используйте LF.".into(),
         tokens: 6,
         sources,
@@ -139,6 +144,7 @@ fn query(w: &W, q: &str) -> CacheQuery {
         scope_hash: scope(),
         query_norm: normalize_query(q),
         query_vec: None,
+        model_id: Some(MODEL.into()),
         session_id: Some("s1".into()),
         cross_session: true,
         semantic_threshold: 0.92,
@@ -475,26 +481,28 @@ async fn new_sources_marks_stale() {
     // свой источник (даже похожий) и далёкий вектор — не новые
     let vecs = vec![(node(n), vec![1.0, 0.0]), (node(far), vec![0.0, 1.0])];
     assert_eq!(
-        mark_new_sources(&w.db, k, None, &vecs, 0.80).await.unwrap(),
+        mark_new_sources(&w.db, k, None, MODEL, &vecs, 0.80)
+            .await
+            .unwrap(),
         0
     );
     // другая область — мимо
     let vecs = vec![(node(fresh), vec![0.9, 0.1])];
     assert_eq!(
-        mark_new_sources(&w.db, k, Some("api"), &vecs, 0.80)
+        mark_new_sources(&w.db, k, Some("api"), MODEL, &vecs, 0.80)
             .await
             .unwrap(),
         0
     );
     // другое пространство — мимо
     assert_eq!(
-        mark_new_sources(&w.db, w.human, None, &vecs, 0.80)
+        mark_new_sources(&w.db, w.human, None, MODEL, &vecs, 0.80)
             .await
             .unwrap(),
         0
     );
     assert_eq!(
-        mark_new_sources(&w.db, k, Some("web"), &vecs, 0.80)
+        mark_new_sources(&w.db, k, Some("web"), MODEL, &vecs, 0.80)
             .await
             .unwrap(),
         1
@@ -507,7 +515,9 @@ async fn new_sources_marks_stale() {
     );
     // повтор не дублирует причину
     assert_eq!(
-        mark_new_sources(&w.db, k, None, &vecs, 0.80).await.unwrap(),
+        mark_new_sources(&w.db, k, None, MODEL, &vecs, 0.80)
+            .await
+            .unwrap(),
         0
     );
 }
@@ -671,11 +681,13 @@ async fn migrate_v13_to_v14() {
         space_id: space,
         area: None,
         author_user_id: user,
+        author_kind: AuthorKind::Agent,
         session_id: None,
         machine: None,
         scope_hash: scope(),
         query: "x".into(),
         query_vec: None,
+        model_id: None,
         summary: "s".into(),
         tokens: 1,
         sources: vec![src(node(n.id))],
@@ -683,4 +695,165 @@ async fn migrate_v13_to_v14() {
     p.query = "после миграции".into();
     cache_put(&db, &p).await.unwrap();
     assert_eq!(cache_count(&db).await.unwrap(), 1);
+}
+
+/// Fix round 1 (I1): прежнюю выжимку того же ключа заменяет только тот же автор в той же
+/// сессии; другая сессия и другой автор (участник решения) её не стирают.
+#[tokio::test]
+async fn put_replaces_only_same_author_and_session() {
+    let w = world("replace").await;
+    let n = note(&w, w.knowledge, "Bash", "# Bash\nLF.\n").await;
+    let a = cache_put(&w.db, &put(&w, "bash", vec![src(node(n))]))
+        .await
+        .unwrap();
+    // другая сессия того же автора
+    let mut p = put(&w, "bash", vec![src(node(n))]);
+    p.session_id = Some("s2".into());
+    let b = cache_put(&w.db, &p).await.unwrap();
+    // другой автор (участник) в той же сессии
+    let mut p = put(&w, "bash", vec![src(node(n))]);
+    p.author_user_id = Id::new();
+    let c = cache_put(&w.db, &p).await.unwrap();
+    // человек (WebUI) тем же пользователем
+    let mut p = put(&w, "bash", vec![src(node(n))]);
+    p.author_kind = AuthorKind::Human;
+    let d = cache_put(&w.db, &p).await.unwrap();
+    for id in [a.id, b.id, c.id, d.id] {
+        assert!(cache_get(&w.db, id).await.unwrap().is_some());
+    }
+    // тот же автор и та же сессия — замена
+    let a2 = cache_put(&w.db, &put(&w, "bash", vec![src(node(n))]))
+        .await
+        .unwrap();
+    assert!(cache_get(&w.db, a.id).await.unwrap().is_none());
+    assert_eq!(cache_count(&w.db).await.unwrap(), 4);
+    // поиск: своя сессия первой, затем остальные — свежие первыми
+    let mut q = query(&w, "bash");
+    q.session_id = Some("s2".into());
+    let ids: Vec<Id> = cache_lookup(&w.db, &q)
+        .await
+        .unwrap()
+        .iter()
+        .map(|h| h.entry.id)
+        .collect();
+    assert_eq!(ids, vec![b.id, a2.id]);
+    // без чужих сессий — только своя
+    q.cross_session = false;
+    let hits = cache_lookup(&w.db, &q).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].entry.id, b.id);
+    assert!(d.id != a2.id && c.id != a2.id);
+}
+
+/// Fix round 1 (I2): заметка и insight, в которые превращена выжимка, — не новые источники
+/// (ни для неё самой, ни для других выжимок).
+#[tokio::test]
+async fn promoted_target_is_not_new_source() {
+    let w = world("promoted-src").await;
+    let n = note(&w, w.knowledge, "Источник", "# И\n").await;
+    let mut p = put(&w, "bash", vec![src(node(n))]);
+    p.query_vec = Some(vec![1.0, 0.0]);
+    let c = cache_put(&w.db, &p).await.unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let (_, made) = cache_promote(
+        &w.db,
+        c.id,
+        PromoteAs::Note {
+            path: NodePath::parse("Выжимки/bash").unwrap(),
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let vecs = vec![(made, vec![1.0, 0.0])];
+    assert_eq!(
+        mark_new_sources(&w.db, w.knowledge, None, MODEL, &vecs, 0.80)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(cache_get(&w.db, c.id).await.unwrap().unwrap().is_valid());
+}
+
+/// Fix round 1 (M4): замещённый или отозванный insight источником быть не может.
+#[tokio::test]
+async fn inactive_insight_source_rejected() {
+    let w = world("inactive").await;
+    let i = insight(&w, "Отозванный").await;
+    retract_entry(&w.db, i, None, "неверно", &agent())
+        .await
+        .unwrap();
+    let err = cache_put(&w.db, &put(&w, "q", vec![src(entry(i))]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, CacheError::SourceInactive { status, .. } if status == "retracted"),
+        "{err:?}"
+    );
+    assert_eq!(cache_count(&w.db).await.unwrap(), 0);
+}
+
+/// Fix round 1 (M6): вектор другой модели не сравнивается — ни семантическое попадание, ни
+/// новые источники; точное совпадение работает.
+#[tokio::test]
+async fn other_model_vectors_ignored() {
+    let w = world("model").await;
+    let n = note(&w, w.knowledge, "Bash", "# Bash\n").await;
+    let mut p = put(&w, "bash скрипты", vec![src(node(n))]);
+    p.query_vec = Some(vec![1.0, 0.0]);
+    p.model_id = Some("old/model@1".into());
+    let c = cache_put(&w.db, &p).await.unwrap();
+    let mut q = query(&w, "как писать bash");
+    q.query_vec = Some(vec![1.0, 0.0]);
+    assert!(cache_lookup(&w.db, &q).await.unwrap().is_empty());
+    q.model_id = Some("old/model@1".into());
+    assert_eq!(cache_lookup(&w.db, &q).await.unwrap().len(), 1);
+    // точное — при любой модели
+    let mut q = query(&w, "bash скрипты");
+    q.model_id = None;
+    assert_eq!(cache_lookup(&w.db, &q).await.unwrap().len(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let fresh = note(&w, w.knowledge, "Новый", "# Новый\n").await;
+    let vecs = vec![(node(fresh), vec![1.0, 0.0])];
+    assert_eq!(
+        mark_new_sources(&w.db, w.knowledge, None, MODEL, &vecs, 0.80)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(cache_get(&w.db, c.id).await.unwrap().unwrap().is_valid());
+}
+
+/// Fix round 1 (M3): сохранение с превращением — одна транзакция: путь занят — `Conflict`,
+/// выжимки нет.
+#[tokio::test]
+async fn put_with_promote_is_atomic() {
+    let w = world("atomic").await;
+    let n = note(&w, w.knowledge, "Занято", "# З\n").await;
+    let to = PromoteAs::Note {
+        path: NodePath::parse("Занято").unwrap(),
+    };
+    let err = cache_put_with(
+        &w.db,
+        &put(&w, "q", vec![src(node(n))]),
+        Some((to, agent())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, CacheError::Store(zam_store::StoreError::Conflict(_))),
+        "{err:?}"
+    );
+    assert_eq!(cache_count(&w.db).await.unwrap(), 0);
+    let to = PromoteAs::Note {
+        path: NodePath::parse("Выжимки/q").unwrap(),
+    };
+    let (e, made) = cache_put_with(
+        &w.db,
+        &put(&w, "q", vec![src(node(n))]),
+        Some((to, agent())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(e.promoted_to, made.map(|t| t.to_string()));
 }

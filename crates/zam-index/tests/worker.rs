@@ -1417,11 +1417,13 @@ async fn new_source_marks_cache_stale() {
             space_id: e.knowledge,
             area: None,
             author_user_id: e.user,
+            author_kind: AuthorKind::Agent,
             session_id: None,
             machine: None,
             scope_hash: "s".into(),
             query: "как собрать проект".into(),
             query_vec: Some(qv),
+            model_id: Some(MODEL.into()),
             summary: "cargo build".into(),
             tokens: 2,
             sources: vec![zam_store::SourceSpec {
@@ -1455,5 +1457,85 @@ async fn new_source_marks_cache_stale() {
             reason: zam_store::StaleKind::NewSources,
         }]
     );
+    w.shutdown().await;
+}
+
+/// Fix round 1 (I2): заметка, в которую превращена выжимка, после индексации не делает
+/// выжимку `stale: new_sources` — даже если её вектор совпадает с вектором запроса.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promoted_note_does_not_stale_its_cache() {
+    use zam_core::{TargetKind, TargetRef};
+    const SUMMARY: &str = "# Сборка\n\nСобираем проект командой cargo build в корне.\n";
+    let e = env("cache-promoted").await;
+    let src = e.note(e.knowledge, "docs/src", NOTE).await;
+    // вектор будущего чанка заметки-выжимки: та же заметка в отдельной базе
+    let scratch = e.users.get(Id::new()).await.unwrap();
+    let sk = list_spaces(&scratch)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    let probe = create_note(
+        &scratch,
+        NewNote {
+            space_id: sk,
+            path: NodePath::parse("Выжимки/сборка").unwrap(),
+            content: SUMMARY.into(),
+            l0: None,
+            attrib: Attribution::new(AuthorKind::Agent),
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    let input = embed_input(&chunks_for_index(&scratch, probe).await.unwrap()[0]);
+    let qv = e.fake.embed_passages(&[&input]).unwrap().remove(0).dense;
+    let c = zam_store::cache_put(
+        &e.db,
+        &zam_store::CachePut {
+            space_id: e.knowledge,
+            area: None,
+            author_user_id: e.user,
+            author_kind: AuthorKind::Agent,
+            session_id: None,
+            machine: None,
+            scope_hash: "s".into(),
+            query: "как собрать проект".into(),
+            query_vec: Some(qv),
+            model_id: Some(MODEL.into()),
+            summary: SUMMARY.into(),
+            tokens: 8,
+            sources: vec![zam_store::SourceSpec {
+                target: TargetRef {
+                    kind: TargetKind::Node,
+                    id: src,
+                },
+                rev: None,
+                section: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let (_, made) = zam_store::cache_promote(
+        &e.db,
+        c.id,
+        zam_store::PromoteAs::Note {
+            path: NodePath::parse("Выжимки/сборка").unwrap(),
+        },
+        &Attribution::new(AuthorKind::Agent),
+    )
+    .await
+    .unwrap();
+    let w = e.spawn();
+    e.indexed(src).await;
+    e.indexed(made.id).await;
+    e.quiet(&w).await;
+    let hit = zam_store::cache_get(&e.db, c.id).await.unwrap().unwrap();
+    assert!(hit.is_valid(), "{:?}", hit.stale);
+    assert_eq!(hit.entry.state, "valid");
     w.shutdown().await;
 }

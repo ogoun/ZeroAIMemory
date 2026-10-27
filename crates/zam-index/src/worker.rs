@@ -1459,11 +1459,14 @@ impl Worker {
                     .push((j.target(), e.dense.clone()));
             }
         }
+        // векторы — текущей модели: выжимки с вектором другой модели не сравниваются
+        let model = self.model();
         for ((space, area), vecs) in groups {
             let r = zam_store::mark_new_sources(
                 db,
                 space,
                 area.as_deref(),
+                &model,
                 &vecs,
                 self.cfg.cache_new_sources_threshold,
             )

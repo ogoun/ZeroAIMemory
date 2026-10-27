@@ -384,6 +384,23 @@ async fn cache_shared_in_solution_with_author() {
     .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let own = id(&r.json());
+    // fix round 1 (I1): участник сохраняет тот же запрос — выжимка владельца остаётся
+    let r = put(
+        &w.a,
+        &w.b_tok,
+        json!({"query": "другой", "summary": "версия Бориса", "solution": G,
+               "sources": [{"id": &n}]}),
+        &[("x-zam-session", "sb")],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let borisa = id(&r.json());
+    for c in [&own, &borisa] {
+        let r =
+            w.a.tok(&w.a_tok, Method::GET, &format!("/api/v1/cache/{c}"), None)
+                .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    }
     let r =
         w.a.tok(
             &w.b_tok,
@@ -588,6 +605,49 @@ async fn cache_rejects_human_and_vault_sources() {
     )
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // fix round 1 (M4): отозванный insight — 422 cache-source-inactive
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(json!({"kind": "insight", "title": "Неверное", "body": "x",
+                        "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let ins = id(&r.json());
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/entries/{ins}/retract"),
+            Some(json!({"reason": "опровергнуто"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = put(
+        &a,
+        &a.token,
+        json!({"query": "q", "summary": "s", "sources": [{"id": format!("i:{ins}")}]}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert_eq!(r.json()["type"], "/problems/cache-source-inactive");
+    // fix round 1 (M1): scope.spaces и all_solutions — 400
+    let n = id(&a.note("knowledge", "Есть", "# Есть\n").await);
+    for scope in [
+        json!({"spaces": ["knowledge"]}),
+        json!({"all_solutions": true}),
+    ] {
+        let r = put(
+            &a,
+            &a.token,
+            json!({"query": "q", "summary": "s", "scope": scope, "sources": [{"id": &n}]}),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{scope}: {}", r.text());
+    }
 }
 
 /// Источник из другой базы — 422 `cache-cross-db`: участник цитирует свой Knowledge в кэше
@@ -694,6 +754,34 @@ async fn promote_creates_note_with_derived_from() {
         )
         .await;
     assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    // fix round 1 (M3): превращение при сохранении на занятый путь — 409, выжимки нет
+    let before = a.t(Method::GET, "/api/v1/cache", None).await.json()["items"]
+        .as_array()
+        .unwrap()
+        .len();
+    let r = put(
+        &a,
+        &a.token,
+        json!({"query": "занято", "summary": "s", "sources": [{"id": &n1}],
+               "promote": {"as": "note", "path": "Деплой"}}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let l = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/cache?q={}", common::api::enc("занято")),
+            None,
+        )
+        .await
+        .json();
+    assert!(l["items"].as_array().unwrap().is_empty(), "{l}");
+    let after = a.t(Method::GET, "/api/v1/cache", None).await.json()["items"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(before, after);
     // сразу при сохранении — insight
     let r = put(
         &a,
