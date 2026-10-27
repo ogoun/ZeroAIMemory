@@ -23,6 +23,25 @@ fn managed(name: &str) -> (Arc<dyn VectorIndex>, TestQdrant) {
 
 vector_index_cases!(managed);
 
+/// Точный поиск (`QdrantIndex::with_exact_search`, `qdrant.exact_search` — прогоны гейта eval,
+/// задача 15 M4): Qdrant принимает `exact` и `quantization.ignore` во всех prefetch (листы dense и
+/// sparse, сводки, папки) и в поиске ближайших, находки — те же, что в контракте HNSW.
+mod exact {
+    use super::*;
+
+    fn managed_exact(name: &str) -> (Arc<dyn VectorIndex>, TestQdrant) {
+        let q = TestQdrant::start(name);
+        (Arc::new(connect(&q).with_exact_search(true)), q)
+    }
+
+    vector_index_cases!(@each managed_exact;
+        upsert_200_and_search_finds_itself_first,
+        levels_filter_and_note_prefetch,
+        folders_prefetch_on_request,
+        nearest_dense_returns_cosine,
+    );
+}
+
 #[test]
 fn point_id_is_deterministic_uuid_v5() {
     let a = point_id("chunk-1");

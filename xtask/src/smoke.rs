@@ -137,7 +137,7 @@ fn zam_vars_except<I: IntoIterator<Item = OsString>>(vars: I, keep: &[&str]) -> 
 
 /// Убирает из окружения дочернего процесса все `ZAM_*` текущего, кроме `keep`:
 /// сборочные переменные CI (`ZAM_GIT_SHA` и т. п.) и настройки разработчика не должны влиять на проверку.
-fn scrub_zam_env<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
+pub(crate) fn scrub_zam_env<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
     for k in zam_vars_except(std::env::vars_os().map(|(k, _)| k), keep) {
         cmd.env_remove(k);
     }
@@ -1053,6 +1053,42 @@ pub(crate) fn api_timeout(
     let v = serde_json::from_str(&text)
         .with_context(|| format!("{path}: HTTP {status}, ответ не JSON"))?;
     Ok((status, v))
+}
+
+/// Запрос к API с токеном и своими заголовками; возвращает статус и тело как текст (ответы
+/// `format: md`, подсчёт токенов ответа — eval M4).
+pub(crate) fn api_text(
+    base: &str,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<(u16, String)> {
+    let a = agent_with(timeout);
+    let url = format!("{base}{path}");
+    let auth = format!("Bearer {token}");
+    let mut r = match body {
+        Some(b) => {
+            let mut req = a
+                .post(&url)
+                .header("Authorization", &auth)
+                .content_type("application/json");
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.send(b.to_string())?
+        }
+        None => {
+            let mut req = a.get(&url).header("Authorization", &auth);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.call()?
+        }
+    };
+    let status = r.status().as_u16();
+    Ok((status, r.body_mut().read_to_string()?))
 }
 
 /// Пути и каналы выдачи (без текстов заметок).

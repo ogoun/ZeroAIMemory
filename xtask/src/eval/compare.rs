@@ -5,12 +5,16 @@
 //! котором воспроизводится отпечаток запросов прежнего прогона ([`old_texts`]); не нашёлся —
 //! сравнение по `id`, виду и `expect`, и это видно в отчёте (`text_checked = false`).
 //!
-//! **Метрики нового прогона пересчитываются по `expect`**: `also` (дополнительно релевантные
-//! цели M3) в сравнении не участвует — разметка прежнего прогона их не знала.
+//! **Метрики нового прогона пересчитываются по разметке прежнего**: если у запроса прежнего
+//! прогона нет поля `also` (прогоны M2 — разметка их не знала), новый считается по одному
+//! `expect`; если есть (прогоны M3 и новее: метрики там уже с `also`), запрос общий только при
+//! том же `also`, и новый считается по `expect` и `also` — иначе сравнение M3 → M4 занижало бы
+//! новый прогон на запросах с `also` **[решение исполнителя, задача 15 M4]**.
 //!
 //! **Без новых целей** — та же разность, но из выдачи нового прогона убраны цели, которых не было
-//! в корпусе прежнего (insight и заметки вне `git ls-tree <коммит> eval/corpus`): так видно,
-//! изменился ли порядок прежних заметок между собой или разность дали новые дистракторы.
+//! в корпусе прежнего (заметки вне `git ls-tree <коммит> eval/corpus` и insight вне
+//! `eval/insights.toml` того коммита): так видно, изменился ли порядок прежних целей между собой
+//! или разность дали новые дистракторы.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -124,19 +128,50 @@ fn old_fingerprint(v: &Value, texts: &HashMap<String, String>) -> Option<String>
     Some(super::corpus::fnv1a(s.into_bytes()))
 }
 
-/// Пути заметок прежнего корпуса (`git ls-tree` коммита прежнего прогона).
+/// Цели прежнего корпуса: пути заметок (`git ls-tree` коммита прежнего прогона) и
+/// `insight:<key>` его `eval/insights.toml` (нет файла — без insight, как в M2).
 fn old_corpus(repo: &Path, v: &Value) -> Option<BTreeSet<String>> {
     let commit = commit_of(v["info"]["git"].as_str()?);
     let out = git(
         repo,
         &["ls-tree", "-r", "--name-only", commit, "--", "eval/corpus"],
     )?;
-    let set: BTreeSet<String> = out
+    let mut set: BTreeSet<String> = out
         .lines()
         .filter_map(|l| l.strip_prefix("eval/corpus/")?.strip_suffix(".md"))
         .map(String::from)
         .collect();
-    (!set.is_empty()).then_some(set)
+    if set.is_empty() {
+        return None;
+    }
+    if let Some(t) = git(repo, &["show", &format!("{commit}:eval/insights.toml")])
+        && let Ok(t) = toml::from_str::<toml::Value>(&t)
+    {
+        set.extend(
+            t.get("insight")
+                .and_then(|a| a.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|i| i.get("key")?.as_str())
+                .map(|k| format!("{INSIGHT_REF}{k}")),
+        );
+    }
+    Some(set)
+}
+
+/// Релевантные цели нового запроса для сравнения: `expect` и, если прежний запрос знает
+/// `also` (поле есть), `also`; `None` — `also` разные (запрос не общий).
+fn relevant_for(q: &QueryRun, o: &Value) -> Option<Vec<String>> {
+    match o.get("also").and_then(Value::as_array) {
+        None => Some(q.expect.clone()),
+        Some(a) => {
+            let old: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+            old.iter()
+                .copied()
+                .eq(q.also.iter().map(String::as_str))
+                .then(|| q.expect.iter().chain(&q.also).cloned().collect())
+        }
+    }
 }
 
 /// Сравнение `r` с прежним результатом `prev` (JSON `eval/results/…`); `repo` — для текстов и
@@ -153,7 +188,7 @@ pub fn compare(repo: &Path, prev: &Path, r: &RunResult) -> Result<Comparison> {
         .collect();
     let texts = old_texts(repo, &v, &r.queries);
     let corpus = old_corpus(repo, &v);
-    let mut pairs: Vec<(&QueryRun, &Value)> = Vec::new();
+    let mut pairs: Vec<(&QueryRun, &Value, Vec<String>)> = Vec::new();
     for q in &r.queries {
         let Some(o) = old.get(q.id.as_str()) else {
             continue;
@@ -166,29 +201,31 @@ pub fn compare(repo: &Path, prev: &Path, r: &RunResult) -> Result<Comparison> {
         let same_text = texts
             .as_ref()
             .is_none_or(|t| t.get(&q.id).is_some_and(|t| *t == q.text));
-        if same_expect && same_text && o["kind"] == q.kind.as_str() {
-            pairs.push((q, o));
+        if same_expect
+            && same_text
+            && o["kind"] == q.kind.as_str()
+            && let Some(rel) = relevant_for(q, o)
+        {
+            pairs.push((q, o, rel));
         }
     }
+    type Pair<'a> = (&'a QueryRun, &'a Value, Vec<String>);
     let ranked = |q: &QueryRun| q.hits.iter().map(|h| h.path.clone()).collect::<Vec<_>>();
-    // новый прогон — по `expect`, без `also`
-    let new_m = |q: &QueryRun| score(&ranked(q), &q.expect);
-    let new_without_new = |q: &QueryRun, set: &BTreeSet<String>| {
-        let kept: Vec<String> = ranked(q)
+    // новый прогон — по разметке прежнего (см. модуль)
+    let new_m = |p: &Pair| score(&ranked(p.0), &p.2);
+    let new_without_new = |p: &Pair, set: &BTreeSet<String>| {
+        let kept: Vec<String> = ranked(p.0)
             .into_iter()
-            .filter(|p| !p.starts_with(INSIGHT_REF) && set.contains(p))
+            .filter(|t| set.contains(t))
             .collect();
-        score(&kept, &q.expect)
+        score(&kept, &p.2)
     };
     let old_m = |o: &Value, k: &str| o["metrics"][k].as_f64().unwrap_or(0.0);
-    let all: Vec<&(&QueryRun, &Value)> = pairs.iter().collect();
-    let no_e: Vec<&(&QueryRun, &Value)> = pairs
-        .iter()
-        .filter(|(q, _)| !q.id.starts_with("e-"))
-        .collect();
-    let diff = |sel: &[&(&QueryRun, &Value)], k: &str, f: &dyn Fn(&QueryRun) -> f64| {
-        let a: Vec<f64> = sel.iter().map(|(_, o)| old_m(o, k)).collect();
-        let b: Vec<f64> = sel.iter().map(|(q, _)| f(q)).collect();
+    let all: Vec<&Pair> = pairs.iter().collect();
+    let no_e: Vec<&Pair> = pairs.iter().filter(|p| !p.0.id.starts_with("e-")).collect();
+    let diff = |sel: &[&Pair], k: &str, f: &dyn Fn(&Pair) -> f64| {
+        let a: Vec<f64> = sel.iter().map(|p| old_m(p.1, k)).collect();
+        let b: Vec<f64> = sel.iter().map(|p| f(p)).collect();
         paired_diff(&a, &b)
     };
     let d_ndcg10 = diff(&all, "ndcg10", &|q| new_m(q).ndcg10);
@@ -235,6 +272,44 @@ mod tests {
         assert_eq!(old_fingerprint(&v, &good), Some(fp.clone()));
         assert_ne!(old_fingerprint(&v, &bad), Some(fp));
         assert_eq!(old_fingerprint(&v, &HashMap::new()), None);
+    }
+
+    /// Прежний запрос без поля `also` (M2) — сравнение по `expect`; с полем (M3+) — общий только
+    /// при том же `also`, и считается по `expect` и `also`.
+    #[test]
+    fn relevant_for_follows_old_labels() {
+        let mut q = crate::eval::corpus::tests_query("a-01", "ru/a");
+        let m2 = serde_json::json!({"id": "a-01"});
+        q.also = vec!["insight:x".into()];
+        let run = |q: &crate::eval::corpus::Query| QueryRun {
+            id: q.id.clone(),
+            text: q.text.clone(),
+            kind: q.kind,
+            lang: q.lang,
+            disjoint: false,
+            expect: q.expect.clone(),
+            also: q.also.clone(),
+            forbid: Vec::new(),
+            weaker: Vec::new(),
+            long: false,
+            fts_only: false,
+            metrics: Default::default(),
+            cancelled5_history: None,
+            reliable_first_no_boost: None,
+            leaves: Vec::new(),
+            hits: Vec::new(),
+            ms: 0.0,
+            server_ms: Value::Null,
+        };
+        let r = run(&q);
+        assert_eq!(relevant_for(&r, &m2), Some(vec!["ru/a".to_string()]));
+        let m3 = serde_json::json!({"id": "a-01", "also": ["insight:x"]});
+        assert_eq!(
+            relevant_for(&r, &m3),
+            Some(vec!["ru/a".to_string(), "insight:x".to_string()])
+        );
+        let other = serde_json::json!({"id": "a-01", "also": ["insight:y"]});
+        assert_eq!(relevant_for(&r, &other), None);
     }
 
     #[test]

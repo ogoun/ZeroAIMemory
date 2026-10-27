@@ -89,6 +89,9 @@ pub struct ManagedConfig {
     /// Предел ожидания сброса WAL при штатной остановке после записи (вариант A задачи 19);
     /// ноль — не ждать. См. [`flush_wait`].
     pub shutdown_flush_wait: Duration,
+    /// Точный поиск без HNSW и квантования (`qdrant.exact_search`): только для прогонов
+    /// гейта качества eval (задача 15 M4), в продакшне выключен.
+    pub exact_search: bool,
 }
 
 impl ManagedConfig {
@@ -107,6 +110,7 @@ impl ManagedConfig {
             flush_interval_sec: DEFAULT_FLUSH_INTERVAL_SEC,
             wal_capacity_mb: DEFAULT_WAL_CAPACITY_MB,
             shutdown_flush_wait: DEFAULT_SHUTDOWN_FLUSH_WAIT,
+            exact_search: false,
         }
     }
 

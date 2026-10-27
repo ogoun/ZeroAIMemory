@@ -23,6 +23,12 @@ rusqlite.workspace = true
 half.workspace = true
 # проверка набора eval: стемминг Snowball ru/en
 rust-stemmers.workspace = true
+# eval M4 (задача 15): модель отбора подсказок post_tool — те же функции, что у сервера
+# (нормализация ошибки, покрытие слов, error_regex); свой крейт workspace (MIT)
+zam-search = { path = "../crates/zam-search" }
+# eval M4: токены ответов сервера считаются токенизатором модели (bge-m3, tokenizer.json);
+# крейт уже в workspace (zam-ml, zam-index; Apache-2.0)
+tokenizers.workspace = true
 
 # Windows: штатная остановка сервера в bench --scenario first-start (Ctrl+Break группе
 # процессов, GenerateConsoleCtrlEvent) и Job Object xtask, завершающий дочерние процессы при

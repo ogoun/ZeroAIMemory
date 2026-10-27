@@ -22,6 +22,12 @@
 //! существующей обновляет `flush_interval_sec` (размер блока WAL Qdrant 1.19 у существующей
 //! коллекции не меняет: в `UpdateCollection` нет `wal_config`) и отмечает время каждой
 //! записи в [`WriteMark`] — по нему супервизор ждёт сброса WAL перед остановкой.
+//!
+//! **Точный поиск** ([`QdrantIndex::with_exact_search`], `qdrant.exact_search`, задача 15
+//! M4): `SearchParams.exact = true` и `quantization.ignore = true` — полный перебор по
+//! оригиналам вместо HNSW и int8. Только для прогонов гейта качества `cargo xtask eval`
+//! (решение владельца 2026-10-26, §18.2): порог гейта мерит квантование модели, а не шум
+//! HNSW-индекса. В продакшне выключен.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -172,6 +178,8 @@ pub struct QdrantIndex {
     /// Параметры коллекции; `None` — умолчания Qdrant (внешний Qdrant, тесты).
     tuning: Option<CollectionTuning>,
     writes: WriteMark,
+    /// Точный поиск (см. модуль): только eval.
+    exact: bool,
 }
 
 impl std::fmt::Debug for QdrantIndex {
@@ -197,7 +205,27 @@ impl QdrantIndex {
             client,
             tuning: None,
             writes: WriteMark::default(),
+            exact: false,
         })
+    }
+
+    /// Точный поиск без HNSW и квантования (см. модуль) — только для eval.
+    pub fn with_exact_search(mut self, exact: bool) -> Self {
+        self.exact = exact;
+        self
+    }
+
+    /// Параметры поиска dense: int8 с rescoring по оригиналам; при точном поиске — полный
+    /// перебор по оригиналам.
+    fn dense_params(&self) -> SearchParamsBuilder {
+        if self.exact {
+            SearchParamsBuilder::default()
+                .exact(true)
+                .quantization(QuantizationSearchParamsBuilder::default().ignore(true))
+        } else {
+            SearchParamsBuilder::default()
+                .quantization(QuantizationSearchParamsBuilder::default().rescore(true))
+        }
     }
 
     /// Создавать коллекцию с `t` и обновлять у существующей `flush_interval_sec`.
@@ -519,19 +547,21 @@ impl QdrantIndex {
                     .query(Query::new_nearest(q_dense.to_vec()))
                     .using(DENSE)
                     .filter(leaf_filter.clone())
-                    .params(rescore())
+                    .params(self.dense_params())
                     .limit(LEAF_PREFETCH),
             );
             prefetches += 1;
         }
         if !leaf_levels.is_empty() && !q_sparse.is_empty() {
-            q = q.add_prefetch(
-                PrefetchQueryBuilder::default()
-                    .query(Query::new_nearest(VectorInput::from(q_sparse)))
-                    .using(SPARSE)
-                    .filter(leaf_filter)
-                    .limit(LEAF_PREFETCH),
-            );
+            let mut sparse = PrefetchQueryBuilder::default()
+                .query(Query::new_nearest(VectorInput::from(q_sparse)))
+                .using(SPARSE)
+                .filter(leaf_filter)
+                .limit(LEAF_PREFETCH);
+            if self.exact {
+                sparse = sparse.params(SearchParamsBuilder::default().exact(true));
+            }
+            q = q.add_prefetch(sparse);
             prefetches += 1;
         }
         if !note_levels.is_empty() && !q_dense.is_empty() {
@@ -540,7 +570,7 @@ impl QdrantIndex {
                     .query(Query::new_nearest(q_dense.to_vec()))
                     .using(DENSE)
                     .filter(note_filter)
-                    .params(rescore())
+                    .params(self.dense_params())
                     .limit(NOTE_PREFETCH),
             );
             prefetches += 1;
@@ -558,7 +588,7 @@ impl QdrantIndex {
                     .query(Query::new_nearest(q_dense.to_vec()))
                     .using(DENSE)
                     .filter(folder_filter)
-                    .params(rescore())
+                    .params(self.dense_params())
                     .limit(FOLDER_PREFETCH),
             );
             prefetches += 1;
@@ -595,7 +625,7 @@ impl QdrantIndex {
             .query(Query::new_nearest(v.to_vec()))
             .using(DENSE)
             .filter(filter)
-            .params(rescore())
+            .params(self.dense_params())
             .limit(limit as u64)
             .with_payload(hit_payload());
         let resp = self
@@ -852,12 +882,6 @@ fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
             .push(kw_any("status", f.exclude_statuses.clone()));
     }
     Some(filter)
-}
-
-/// Поиск по int8 с rescoring по оригиналам.
-fn rescore() -> SearchParamsBuilder {
-    SearchParamsBuilder::default()
-        .quantization(QuantizationSearchParamsBuilder::default().rescore(true))
 }
 
 /// Поля payload для выдачи.

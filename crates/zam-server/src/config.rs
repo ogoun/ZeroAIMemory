@@ -113,6 +113,9 @@ pub struct QdrantSection {
     /// Предел ожидания сброса WAL при штатной остановке после записи, мс (0..=60000;
     /// 0 — не ждать).
     pub shutdown_flush_wait_ms: u64,
+    /// Точный поиск без HNSW и квантования (`SearchParams.exact`): только для прогонов гейта
+    /// качества `cargo xtask eval` (задача 15 M4, §18.2), в продакшне — `false` (HNSW).
+    pub exact_search: bool,
 }
 
 // Вручную: ключ внешнего Qdrant не должен попадать в отладочный вывод.
@@ -130,6 +133,7 @@ impl std::fmt::Debug for QdrantSection {
             .field("flush_interval_sec", &self.flush_interval_sec)
             .field("wal_capacity_mb", &self.wal_capacity_mb)
             .field("shutdown_flush_wait_ms", &self.shutdown_flush_wait_ms)
+            .field("exact_search", &self.exact_search)
             .finish()
     }
 }
@@ -182,6 +186,7 @@ impl QdrantSection {
                 m.wal_capacity_mb = self.wal_capacity_mb;
                 m.shutdown_flush_wait =
                     std::time::Duration::from_millis(self.shutdown_flush_wait_ms);
+                m.exact_search = self.exact_search;
                 Ok(Some(SupervisorConfig::Managed(m)))
             }
             QdrantMode::External => {
@@ -740,6 +745,7 @@ impl Default for ServerConfig {
                 wal_capacity_mb: zam_index::supervisor::DEFAULT_WAL_CAPACITY_MB,
                 shutdown_flush_wait_ms: zam_index::supervisor::DEFAULT_SHUTDOWN_FLUSH_WAIT
                     .as_millis() as u64,
+                exact_search: false,
             },
             ml: MlSection {
                 device: MlDevice::Auto,
@@ -1335,6 +1341,27 @@ note_max_bytes = 1000
             zam_index::supervisor::DEFAULT_SHUTDOWN_FLUSH_WAIT,
             std::time::Duration::from_secs(14)
         );
+    }
+
+    /// `qdrant.exact_search` (задача 15 M4): по умолчанию выключен (HNSW), `ZAM_*` его
+    /// включает (прогоны гейта eval), значение доходит до супервизора.
+    #[test]
+    fn qdrant_exact_search_off_by_default_and_layers() {
+        use zam_index::supervisor::SupervisorConfig;
+        let exe = std::path::Path::new("inst");
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert!(!d.qdrant.exact_search);
+        let Some(SupervisorConfig::Managed(m)) = d.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался managed");
+        };
+        assert!(!m.exact_search);
+        let env = vec![env("ZAM_QDRANT__EXACT_SEARCH", "true")];
+        let c = load(None, &env, &Default::default()).unwrap();
+        assert!(c.qdrant.exact_search);
+        let Some(SupervisorConfig::Managed(m)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался managed");
+        };
+        assert!(m.exact_search);
     }
 
     /// `[qdrant]` WAL и сброс (задача 19 M3): слои, перенос в супервизор, пределы.

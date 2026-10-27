@@ -158,26 +158,53 @@ pub fn server_dir(a: &EvalArgs, p: &Paths) -> Result<PathBuf> {
     build_server(&p.repo, a.server_bin.as_deref())
 }
 
+/// Каталог сборки cargo: `CARGO_TARGET_DIR` (относительный — от корня репозитория) или
+/// `<repo>/target`. Модели и зависимости прогонов лежат в `<repo>/target` всегда.
+fn cargo_target_dir(repo: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR").filter(|d| !d.is_empty()) {
+        Some(d) => {
+            let d = PathBuf::from(d);
+            if d.is_absolute() { d } else { repo.join(d) }
+        }
+        None => repo.join("target"),
+    }
+}
+
+/// `cargo build --release -p <package>`; путь к исполняемому файлу `<bin>` сборки.
+fn build_release(repo: &Path, package: &str, bin: &str) -> Result<PathBuf> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    println!("сборка {bin} (cargo build --release -p {package})…");
+    let st = Command::new(cargo)
+        .args(["build", "--release", "-p", package])
+        .current_dir(repo)
+        .status()
+        .context("запуск cargo build")?;
+    if !st.success() {
+        bail!("cargo build --release -p {package}: {st}");
+    }
+    Ok(cargo_target_dir(repo)
+        .join("release")
+        .join(crate::package::exe(platform(), bin)))
+}
+
+/// `zam` для хуков (`eval --hints`): `cli_bin` или собранный `cargo build --release -p zam-cli`.
+pub fn build_cli(repo: &Path, cli_bin: Option<&Path>) -> Result<PathBuf> {
+    let exe = match cli_bin {
+        Some(b) => b.to_path_buf(),
+        None => build_release(repo, "zam-cli", "zam")?,
+    };
+    if !exe.is_file() {
+        bail!("нет {}", exe.display());
+    }
+    Ok(exe)
+}
+
 /// `server_bin` или собранный `cargo build --release -p zam-server`; возвращает каталог
 /// исполняемого файла (общий для `eval` и `bench`).
 pub fn build_server(repo: &Path, server_bin: Option<&Path>) -> Result<PathBuf> {
     let exe = match server_bin {
         Some(b) => b.to_path_buf(),
-        None => {
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            println!("сборка zam-server (cargo build --release -p zam-server)…");
-            let st = Command::new(cargo)
-                .args(["build", "--release", "-p", "zam-server"])
-                .current_dir(repo)
-                .status()
-                .context("запуск cargo build")?;
-            if !st.success() {
-                bail!("cargo build --release -p zam-server: {st}");
-            }
-            repo.join("target")
-                .join("release")
-                .join(crate::package::exe(platform(), "zam-server"))
-        }
+        None => build_release(repo, "zam-server", "zam-server")?,
     };
     if !exe.is_file() {
         bail!("нет {}", exe.display());
@@ -207,6 +234,8 @@ pub struct Session {
     loaded_at: Option<Instant>,
     /// id записи журнала → ключ insight набора.
     entry_keys: BTreeMap<String, String>,
+    /// id узла → путь заметки корпуса (ссылки `n:<id>` ответов `format: md`, eval M4).
+    node_paths: BTreeMap<String, String>,
 }
 
 /// Сообщение журнала сервера с действующими `[search]` и `[index]`.
@@ -301,6 +330,8 @@ fn server_env(p: &Paths, spec: &RunSpec, dir: &Path) -> Result<SmokeEnv> {
 const TOKEN_FILE: &str = "token.txt";
 /// Соответствие id записей и ключей insight набора (для перезапусков на том же каталоге).
 const ENTRIES_FILE: &str = "entries.json";
+/// Соответствие id узлов и путей заметок корпуса.
+const NODES_FILE: &str = "nodes.json";
 /// Бусты `certainty` выключены — второй проход `reliable_first`.
 pub const NO_CERTAINTY_BOOSTS: [(&str, &str); 3] = [
     ("search.boost_axiom", "1.0"),
@@ -349,14 +380,17 @@ impl Session {
                     })?,
             },
         };
-        let entry_keys = if fresh {
-            BTreeMap::new()
-        } else {
-            fs::read_to_string(dir.join(ENTRIES_FILE))
+        let saved_map = |file: &str| -> BTreeMap<String, String> {
+            if fresh {
+                return BTreeMap::new();
+            }
+            fs::read_to_string(dir.join(file))
                 .ok()
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default()
         };
+        let entry_keys = saved_map(ENTRIES_FILE);
+        let node_paths = saved_map(NODES_FILE);
         Ok(Session {
             srv,
             base,
@@ -368,6 +402,7 @@ impl Session {
             server_config,
             loaded_at: None,
             entry_keys,
+            node_paths,
         })
     }
 
@@ -378,6 +413,31 @@ impl Session {
     /// Токен прогона (для своих клиентов `bench`).
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// id записи журнала → ключ insight набора.
+    pub fn entry_keys(&self) -> &BTreeMap<String, String> {
+        &self.entry_keys
+    }
+
+    /// id узла → путь заметки (корпус и узлы, добавленные [`Session::note_node`]).
+    pub fn node_paths(&self) -> &BTreeMap<String, String> {
+        &self.node_paths
+    }
+
+    /// Запомнить узел `id` с меткой `path` (сохраняется в каталоге прогона).
+    pub fn note_node(&mut self, id: &str, path: &str) -> Result<()> {
+        self.node_paths.insert(id.to_string(), path.to_string());
+        self.save_nodes()
+    }
+
+    fn save_nodes(&self) -> Result<()> {
+        let dir = self.data.parent().context("каталог прогона")?;
+        fs::write(
+            dir.join(NODES_FILE),
+            serde_json::to_string(&self.node_paths)?,
+        )?;
+        Ok(())
     }
 
     /// pid процесса `zam-server`.
@@ -423,7 +483,11 @@ impl Session {
             if st != 201 {
                 bail!("POST /nodes {}: HTTP {st}: {v}", n.path);
             }
+            if let Some(id) = v["id"].as_str() {
+                self.node_paths.insert(id.to_string(), n.path.clone());
+            }
         }
+        self.save_nodes()?;
         self.load_insights(&corpus.insights)
     }
 
@@ -888,6 +952,8 @@ const MEASURED_PATHS: &[&str] = &[
     "eval/grid-relaxed.toml",
     "eval/grid-m3.toml",
     "eval/grid-m3-kind.toml",
+    "eval/hints.toml",
+    "eval/scenarios.toml",
 ];
 
 /// `git <args> -- <MEASURED_PATHS>`.

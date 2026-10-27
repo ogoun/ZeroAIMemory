@@ -93,6 +93,8 @@ pub struct Supervisor {
     /// managed: параметры коллекции и ожидание сброса WAL при остановке (задача 19 M3).
     tuning: Option<CollectionTuning>,
     shutdown_flush_wait: Duration,
+    /// Точный поиск клиентов [`Self::connect_index`] (`ManagedConfig::exact_search`).
+    exact_search: bool,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -124,6 +126,7 @@ impl Supervisor {
                     writes: WriteMark::default(),
                     tuning: None,
                     shutdown_flush_wait: Duration::ZERO,
+                    exact_search: false,
                 });
             }
             SupervisorConfig::Managed(m) => m,
@@ -170,6 +173,7 @@ impl Supervisor {
         let (stop_tx, stop_rx) = watch::channel(false);
         let tuning = Some(m.tuning());
         let shutdown_flush_wait = m.shutdown_flush_wait;
+        let exact_search = m.exact_search;
         let ctx = Ctx {
             cfg: m,
             shared: shared.clone(),
@@ -193,6 +197,7 @@ impl Supervisor {
             writes: WriteMark::default(),
             tuning,
             shutdown_flush_wait,
+            exact_search,
         })
     }
 
@@ -200,7 +205,8 @@ impl Supervisor {
     /// записей, по которой [`Self::shutdown`] ждёт сброса WAL.
     pub fn connect_index(&self) -> Result<QdrantIndex, IndexError> {
         let idx = QdrantIndex::connect(&self.grpc_url, self.api_key.as_deref())?
-            .with_write_mark(self.writes.clone());
+            .with_write_mark(self.writes.clone())
+            .with_exact_search(self.exact_search);
         Ok(match self.tuning {
             Some(t) => idx.with_tuning(t),
             None => idx,

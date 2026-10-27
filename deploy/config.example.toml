@@ -67,6 +67,9 @@ wal_capacity_mb = 32
 # Стоп-таймаут менеджера служб — max(90, ceil(shutdown_flush_wait_ms / 1000) + 80) с: при 14000 — 94 с
 # (TimeoutStopSec=94 в systemd, AppStopMethodConsole 94000 в NSSM); при 60000 (максимум) — 140 с.
 shutdown_flush_wait_ms = 14000
+# Точный поиск без HNSW и квантования (полный перебор точек) — только для прогонов гейта качества
+# eval (cargo xtask eval --quality-gate, с 0.0.5-m4); в работе не включать.
+# exact_search = false
 
 [ml]
 # Устройство инференса: "auto" (CUDA, если доступна, иначе CPU), "cpu" или "cuda".

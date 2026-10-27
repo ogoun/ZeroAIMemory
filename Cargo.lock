@@ -6230,10 +6230,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "tokenizers",
  "toml",
  "ureq",
  "windows",
  "zam-fetch",
+ "zam-search",
  "zip",
 ]
 
