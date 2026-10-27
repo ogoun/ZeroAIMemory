@@ -405,7 +405,25 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let r = run(Cli::parse().cmd);
+    // В GitHub Actions — ещё и аннотация: журналы шагов без прав администратора не читаются
+    if let Err(e) = &r
+        && std::env::var_os("GITHUB_ACTIONS").is_some()
+    {
+        println!("::error title=xtask::{}", gha_escape(&format!("{e:#}")));
+    }
+    r
+}
+
+/// Экранирование сообщения команды `::error::` GitHub Actions (`%`, переводы строк).
+fn gha_escape(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::FetchDeps {
             platform,
             print_hashes,
@@ -459,6 +477,11 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gha_escape_encodes_newlines_and_percent() {
+        assert_eq!(gha_escape("50% a\r\nb"), "50%25 a%0D%0Ab");
+    }
 
     #[test]
     fn flavor_fetches_only_its_runtime() {

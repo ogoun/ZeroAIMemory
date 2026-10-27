@@ -33,7 +33,8 @@ fn config(d: &Path, wait_ms: u64) -> PathBuf {
 }
 
 fn unit_for(cfg_path: &Path) -> String {
-    let cfg = service::load_config(Some(cfg_path), &CliOverrides::default()).unwrap();
+    // без окружения теста: в CI задана `ZAM_REQUIRE_ML`, а `ZAM_*` — ключи конфигурации
+    let cfg = zam_server::config::load(Some(cfg_path), &[], &CliOverrides::default()).unwrap();
     systemd::render_unit(&systemd::UnitParams {
         exe: PathBuf::from("/opt/zeroaimemory/zam-server"),
         config: PathBuf::from("/etc/zeroaimemory/config.toml"),
@@ -45,12 +46,15 @@ fn unit_for(cfg_path: &Path) -> String {
 }
 
 fn zam(args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .args(args)
-        // ZAM_* окружения разработчика не меняют вывод
-        .env_remove("ZAM_DATA_DIR")
-        .output()
-        .unwrap()
+    let mut cmd = Command::new(BIN);
+    cmd.args(args);
+    // ZAM_* окружения (разработчика, `ZAM_REQUIRE_ML` в CI) — ключи конфигурации сервера
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("ZAM_") {
+            cmd.env_remove(k);
+        }
+    }
+    cmd.output().unwrap()
 }
 
 /// `TimeoutStopSec` — по `qdrant.shutdown_flush_wait_ms` конфига (R4): 94 с при 14 000,
