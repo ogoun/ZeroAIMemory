@@ -445,10 +445,11 @@ fn put_tx(tx: &Connection, p: &CachePut) -> Result<CacheEntry, CacheError> {
             .as_deref()
             .map(str::trim)
             .filter(|x| !x.is_empty());
-        if !seen.insert((s.target, section.map(str::to_string))) {
-            continue;
+        // повтор — по полному пути после разрешения: хвост и полный путь — одна секция
+        let dep = deps::pin(tx, s.target, s.rev, section)?;
+        if seen.insert((dep.target, dep.section.clone())) {
+            deps.push(dep);
         }
-        deps.push(deps::pin(tx, s.target, s.rev, section)?);
     }
     let now = fmt_ts(Timestamp::now());
     let query_norm = normalize_query(&p.query);

@@ -251,6 +251,57 @@ async fn cache_put_pins_revisions() {
     assert!(cache_get(&w.db, e2.id).await.unwrap().is_some());
 }
 
+/// Стенд Debian 13 (доработка): секция источника разрешается, как чтение — по однозначному
+/// хвосту пути; закрепляется полный путь, хвост и полный путь — один источник; несколько
+/// совпадений хвоста — `SourceNotFound` (422), как у `/read`.
+#[tokio::test]
+async fn cache_put_section_tail_pins_full_path() {
+    let w = world("pin-tail").await;
+    let n = note(
+        &w,
+        w.knowledge,
+        "Сборка",
+        "# Сборка\nmake\n## Тесты\ncargo test\n# Деплой\n## Шаги\n1\n# Откат\n## Шаги\n2\n",
+    )
+    .await;
+    let sec = |s: &str| SourceSpec {
+        target: node(n),
+        rev: None,
+        section: Some(s.into()),
+    };
+    let e = cache_put(&w.db, &put(&w, "как тестировать", vec![sec("Тесты")]))
+        .await
+        .unwrap();
+    assert_eq!(e.sources.len(), 1);
+    assert_eq!(e.sources[0].section.as_deref(), Some("Сборка > Тесты"));
+    let full = cache_put(
+        &w.db,
+        &put(&w, "как тестировать 2", vec![sec("Сборка > Тесты")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(e.sources[0].text_hash, full.sources[0].text_hash);
+    assert!(stale_of(&w, e.id).await.is_empty());
+    // хвост и полный путь в одной выжимке — один источник
+    let both = cache_put(
+        &w.db,
+        &put(
+            &w,
+            "как тестировать 3",
+            vec![sec("Тесты"), sec("Сборка > Тесты")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(both.sources.len(), 1);
+    // неоднозначный хвост
+    let r = cache_put(&w.db, &put(&w, "шаги", vec![sec("Шаги")])).await;
+    assert!(
+        matches!(&r, Err(CacheError::SourceNotFound { detail, .. }) if detail.contains("неоднозначен")),
+        "{r:?}"
+    );
+}
+
 /// Точное попадание по `(scope_hash, query_norm)`, семантическое — по косинусу ≥ порога;
 /// не больше двух, своя сессия первой; чужие — только при `cross_session`; `hits` растёт.
 #[tokio::test]

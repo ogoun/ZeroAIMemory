@@ -118,8 +118,9 @@ pub(crate) async fn diff_blocking(
 
 fn patch_error(e: PatchError) -> ApiError {
     match e {
-        PatchError::SectionNotFound(_) | PatchError::Ambiguous(_) | PatchError::Broken(_) => {
-            ApiError::Unprocessable(e.to_string())
-        }
+        PatchError::SectionNotFound(_)
+        | PatchError::SectionNotFoundTail { .. }
+        | PatchError::Ambiguous(_)
+        | PatchError::Broken(_) => ApiError::Unprocessable(e.to_string()),
     }
 }

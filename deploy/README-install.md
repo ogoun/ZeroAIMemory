@@ -258,7 +258,7 @@ zam write "knowledge:Инструменты/Bash скрипты" --file note.md 
 # чтение: Markdown как сохранён (байты, переводы строк не меняются)
 zam read "knowledge:Инструменты/Bash скрипты"
 zam read "knowledge:Инструменты/Bash скрипты" --section "Установка > Linux"
-zam read "knowledge:Инструменты/Bash скрипты" --section "Linux"   # однозначный хвост пути заголовков
+zam read "knowledge:Инструменты/Bash скрипты" --section "Linux"   # однозначный хвост пути заголовков (правка PATCH — только полный путь)
 zam read n:<id> i:<id> --batch                   # ссылки из выдачи zam search, одной пачкой
 zam read <id> --tier L1                          # L0 — сводка, L1 — оглавление
 zam read <id> --rev 2                            # конкретная ревизия

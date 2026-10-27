@@ -814,3 +814,48 @@ async fn promote_creates_note_with_derived_from() {
         "{back}"
     );
 }
+
+/// Стенд Debian 13 (доработка): `POST /cache` с секцией-хвостом (`Тесты`) — как `/read`; в
+/// источнике — полный путь (`Сборка > Тесты`); неоднозначный хвост — 422.
+#[tokio::test]
+async fn cache_put_section_tail_stores_full_path() {
+    let a = api("cache-tail", |_| {}).await;
+    let n = id(&a
+        .note(
+            "knowledge",
+            "Сборка",
+            "# Сборка\n\nmake.\n\n## Тесты\n\ncargo test.\n\n# A\n\n## Шаги\n\n1.\n\n# B\n\n## Шаги\n\n2.\n",
+        )
+        .await);
+    let c = put(
+        &a,
+        &a.token,
+        json!({"query": "как тестировать сборку", "summary": "cargo test.",
+               "sources": [{"id": &n, "section": "Тесты"}]}),
+        &[],
+    )
+    .await;
+    assert_eq!(c.status, StatusCode::CREATED, "{}", c.text());
+    let v = c.json();
+    assert_eq!(v["sources"][0]["section"], "Сборка > Тесты", "{v}");
+    // чтение по тому же хвосту — та же секция
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/read",
+            Some(json!({"items": [{"id": &n, "section": "Тесты"}]})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["items"][0]["text"], "## Тесты\n\ncargo test.\n\n");
+    let c = put(
+        &a,
+        &a.token,
+        json!({"query": "шаги", "summary": "шаги.",
+               "sources": [{"id": &n, "section": "Шаги"}]}),
+        &[],
+    )
+    .await;
+    assert_eq!(c.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", c.text());
+    assert!(c.text().contains("неоднозначен"), "{}", c.text());
+}

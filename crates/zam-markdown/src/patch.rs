@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::doc::{Section, parse, sections_by_path};
+use crate::doc::{Section, SectionLookup, parse, resolve_section, sections_by_path};
 
 const BOM: &str = "\u{FEFF}";
 
@@ -49,6 +49,10 @@ pub struct Applied {
 pub enum PatchError {
     #[error("секция не найдена: {0}")]
     SectionNotFound(String),
+    /// Полного пути нет, но он однозначный хвост пути секции `full`: при чтении она нашлась бы
+    /// ([`crate::resolve_section`]), правка требует полного пути — подсказка с ним.
+    #[error("секция не найдена: {section}; правка — по полному пути заголовков: «{full}»")]
+    SectionNotFoundTail { section: String, full: String },
     #[error("путь секции неоднозначен: {0}")]
     Ambiguous(String),
     /// После splice повторный разбор не находит затронутую секцию ровно один раз
@@ -124,7 +128,13 @@ fn unique_section<'a>(doc: &'a crate::Doc, path: &str) -> Result<&'a Section, Pa
     let mut found = sections_by_path(doc, path);
     let s = found
         .next()
-        .ok_or_else(|| PatchError::SectionNotFound(path.to_string()))?;
+        .ok_or_else(|| match resolve_section(doc, path) {
+            SectionLookup::Found(s) => PatchError::SectionNotFoundTail {
+                section: path.to_string(),
+                full: s.path.join(" > "),
+            },
+            _ => PatchError::SectionNotFound(path.to_string()),
+        })?;
     if found.next().is_some() {
         return Err(PatchError::Ambiguous(path.to_string()));
     }

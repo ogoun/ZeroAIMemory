@@ -19,7 +19,10 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use zam_markdown::{NOTE_L1_MAX_CHARS, OutlineItem, note_l1, outline as doc_outline, parse};
+use zam_markdown::{
+    NOTE_L1_MAX_CHARS, OutlineItem, SectionLookup, note_l1, outline as doc_outline, parse,
+    resolve_section,
+};
 use zam_store::{NodeKind, NodePath, get_node_by_path, node_content};
 
 use crate::api::query;
@@ -229,32 +232,10 @@ fn sha256_hex(b: &[u8]) -> String {
 /// кончается `path` (агент обычно знает только свой заголовок: `Тесты` вместо
 /// `Сборка > Тесты`). Нет секции → 404, путь у нескольких секций → 422.
 pub(crate) fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
-    let want: Vec<&str> = path.split('>').map(str::trim).collect();
-    if want.iter().any(|p| p.is_empty()) {
-        return Err(ApiError::NotFound);
-    }
-    let doc = parse(text);
-    let headed = || doc.sections.iter().filter(|s| s.level > 0);
-    let exact: Vec<_> = headed()
-        .filter(|s| s.path.iter().map(String::as_str).eq(want.iter().copied()))
-        .collect();
-    let found = if exact.is_empty() {
-        headed()
-            .filter(|s| {
-                s.path.len() > want.len()
-                    && s.path[s.path.len() - want.len()..]
-                        .iter()
-                        .map(String::as_str)
-                        .eq(want.iter().copied())
-            })
-            .collect()
-    } else {
-        exact
-    };
-    match found.as_slice() {
-        [] => Err(ApiError::NotFound),
-        [s] => text.get(s.range.clone()).ok_or(ApiError::NotFound),
-        _ => Err(ApiError::Unprocessable(format!(
+    match resolve_section(&parse(text), path) {
+        SectionLookup::Found(s) => text.get(s.range.clone()).ok_or(ApiError::NotFound),
+        SectionLookup::NotFound => Err(ApiError::NotFound),
+        SectionLookup::Ambiguous => Err(ApiError::Unprocessable(format!(
             "путь секции неоднозначен: {path}"
         ))),
     }

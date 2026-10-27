@@ -22,8 +22,8 @@ mod sentences;
 
 pub use chunk::{ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, TokenCounter, chunk_note};
 pub use doc::{
-    Doc, Frontmatter, Heading, Link, LinkKind, OutlineItem, Section, first_paragraph, outline,
-    parse, section_by_path, slug,
+    Doc, Frontmatter, Heading, Link, LinkKind, OutlineItem, Section, SectionLookup,
+    first_paragraph, outline, parse, resolve_section, section_by_path, slug,
 };
 pub use frontmatter::unrecognized_certainty_keys;
 pub use highlight::highlight_css;

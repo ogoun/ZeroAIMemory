@@ -3,7 +3,10 @@
 //!
 //! Хэш текста — sha256 hex: у заметки целиком — `nodes.content_hash` текущей ревизии, у
 //! записи журнала — тела (`body`, полный текст L2 `/read`), у секции — байт секции
-//! ([`section_text`]: заголовок с подсекциями, путь однозначен).
+//! ([`section_text`]: заголовок с подсекциями, путь однозначен). Секцию источника [`pin`]
+//! разрешает, как чтение (`zam_markdown::resolve_section`: полный путь или однозначный хвост), и
+//! закрепляет её **полный** путь — с ним выжимка проверяется и показывается дальше
+//! (проверка на стенде Debian 13, доработка по решению контроллера).
 use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -126,18 +129,27 @@ pub(crate) fn pin(
             current_rev: cur.rev,
         });
     }
-    let text_hash = match (section, &cur.whole_hash) {
-        (None, Some(h)) => h.clone(),
-        _ => {
+    let (text_hash, section) = match (section, &cur.whole_hash) {
+        (None, Some(h)) => (h.clone(), None),
+        (None, None) => (sha256_hex(current_text(c, t, cur.rev)?.as_bytes()), None),
+        (Some(path), _) => {
             let text = current_text(c, t, cur.rev)?;
-            text_hash(&text, section).ok_or_else(|| missing("секция не найдена"))?
+            let full = match zam_markdown::resolve_section(&zam_markdown::parse(&text), path) {
+                zam_markdown::SectionLookup::Found(s) => s.path.join(" > "),
+                zam_markdown::SectionLookup::NotFound => return Err(missing("секция не найдена")),
+                zam_markdown::SectionLookup::Ambiguous => {
+                    return Err(missing(&format!("путь секции неоднозначен: {path}")));
+                }
+            };
+            let hash = text_hash(&text, Some(&full)).ok_or_else(|| missing("секция не найдена"))?;
+            (hash, Some(full))
         }
     };
     Ok(CacheDep {
         target: t,
         rev: cur.rev,
         text_hash,
-        section: section.map(str::to_string),
+        section,
     })
 }
 
