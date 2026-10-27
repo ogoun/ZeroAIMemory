@@ -6,6 +6,9 @@
 //!
 //! Сервер собирает кандидатов (SQLite, поиск), здесь — только то, что от данных не зависит.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 /// Предел нормализованной ошибки, символов (§10.3).
 pub const ERROR_MAX_CHARS: usize = 512;
 /// Начало каждой подсказки (§10.3, «Пометка»).
@@ -55,10 +58,32 @@ fn is_hex(core: &str) -> bool {
         && hex.iter().any(char::is_ascii_digit)
 }
 
+/// Числовые хвосты позиции (`:12:5`, `:12:5:`) с конца токена; хвоста нет — токен как есть.
+fn strip_numeric_tails(tok: &str) -> &str {
+    let mut t = tok;
+    let mut stripped = false;
+    loop {
+        let base = t.trim_end_matches(':');
+        match base.rfind(':') {
+            Some(i)
+                if i > 0
+                    && base.len() > i + 1
+                    && base[i + 1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                t = &base[..i];
+                stripped = true;
+            }
+            _ => break,
+        }
+    }
+    if stripped { t } else { tok }
+}
+
 /// Нормализованная ошибка инструмента (§10.3) для FTS по insight: убраны пути и URL, UUID,
-/// хэши и длинные шестнадцатеричные числа, затем все цифры; токены, где не осталось ни буквы,
-/// ни цифры, отбрасываются; пробелы схлопнуты, переводы строк — пробелы. Не длиннее
-/// [`ERROR_MAX_CHARS`] символов.
+/// хэши и длинные шестнадцатеричные числа (`0x…`), числа (токены без единой буквы) и числовые
+/// хвосты позиции (`a.rs:12:5` → `a.rs`); токены с буквой остаются целиком (`E0425`,
+/// `LNK1181`, `TS2307`, `sha256`, `x86_64` — по ним и ищется ошибка); пробелы схлопнуты,
+/// переводы строк — пробелы. Не длиннее [`ERROR_MAX_CHARS`] символов.
 pub fn normalize_error(s: &str) -> String {
     let mut out = String::new();
     let mut chars = 0usize;
@@ -67,10 +92,10 @@ pub fn normalize_error(s: &str) -> String {
         if is_path(core) || is_uuid(core) || is_hex(core) {
             continue;
         }
-        let kept: String = tok.chars().filter(|c| !c.is_ascii_digit()).collect();
-        if !kept.chars().any(char::is_alphanumeric) {
+        if !core.chars().any(char::is_alphabetic) {
             continue;
         }
+        let kept = strip_numeric_tails(tok);
         let n = kept.chars().count();
         let sep = usize::from(!out.is_empty());
         if chars + sep + n > ERROR_MAX_CHARS {
@@ -86,20 +111,46 @@ pub fn normalize_error(s: &str) -> String {
         if sep == 1 {
             out.push(' ');
         }
-        out.push_str(&kept);
+        out.push_str(kept);
         chars += sep + n;
     }
     out
 }
 
+/// Предел кэша скомпилированных `error_regex`; при переполнении кэш сбрасывается целиком.
+const REGEX_CACHE_MAX: usize = 1024;
+
+/// Кэш скомпилированных `error_regex` по тексту шаблона (`None` — шаблон не компилируется).
+fn regex_cache() -> &'static Mutex<HashMap<String, Option<regex::Regex>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<regex::Regex>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// `error_regex` триггера совпал с текстом ошибки. Шаблон компилируется с тем же пределом
-/// размера, что при проверке триггера; некорректный шаблон не совпадает ни с чем.
+/// размера, что при проверке триггера, один раз на процесс (кэш по тексту шаблона, до
+/// [`REGEX_CACHE_MAX`]); некорректный шаблон не совпадает ни с чем.
 pub fn error_regex_matches(pattern: &str, text: &str) -> bool {
-    regex::RegexBuilder::new(pattern)
-        .size_limit(REGEX_SIZE_LIMIT)
-        .dfa_size_limit(REGEX_SIZE_LIMIT)
-        .build()
-        .is_ok_and(|r| r.is_match(text))
+    let re = {
+        let mut cache = regex_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(r) = cache.get(pattern) {
+            r.clone()
+        } else {
+            let r = regex::RegexBuilder::new(pattern)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .dfa_size_limit(REGEX_SIZE_LIMIT)
+                .build()
+                .ok();
+            if cache.len() >= REGEX_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(pattern.to_string(), r.clone());
+            r
+        }
+    };
+    // сопоставление — вне блокировки (`Regex` дешево клонируется)
+    re.is_some_and(|r| r.is_match(text))
 }
 
 /// Слова нормализованной ошибки для покрытия: буквенно-цифровые от [`MIN_TERM_CHARS`]
@@ -121,21 +172,33 @@ pub fn error_terms(normalized: &str) -> Vec<String> {
     out
 }
 
-/// Сколько слов `terms` встречается в `text` (без учёта регистра, как префикс слова FTS —
-/// подстрокой).
+/// Сколько слов `terms` встречается в `text` по границе слова (без учёта регистра): слово
+/// текста начинается с терма — как префиксный терм FTS (`file` находит `files`, но не
+/// `profile`).
 pub fn term_coverage(terms: &[String], text: &str) -> usize {
     let text = text.to_lowercase();
-    terms.iter().filter(|t| text.contains(t.as_str())).count()
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    terms
+        .iter()
+        .filter(|t| words.iter().any(|w| w.starts_with(t.as_str())))
+        .count()
 }
 
+/// Наибольший порог покрытия: длинная ошибка (stack trace) не должна требовать от короткой
+/// записи десятков совпадений.
+const COVERAGE_CAP: usize = 4;
+
 /// Покрытие достаточно для подсказки по ослабленному FTS (любое слово): не меньше
-/// `max(2, ⌈total / 3⌉)` слов, но не больше `total` **[решение исполнителя, задача 8 M4]** —
-/// иначе общие слова ошибки («file», «error») поднимали бы случайные записи.
+/// `min(max(2, ⌈total / 3⌉), 4)` слов и не больше `total` **[решение исполнителя, задача 8
+/// M4]** — иначе общие слова ошибки («file», «error») поднимали бы случайные записи.
 pub fn coverage_enough(matched: usize, total: usize) -> bool {
     if total == 0 {
         return false;
     }
-    let need = total.div_ceil(3).max(2).min(total);
+    let need = total.div_ceil(3).clamp(2, COVERAGE_CAP).min(total);
     matched >= need
 }
 
@@ -249,7 +312,12 @@ mod tests {
         }
         // слова без цифр и обычные слова-«hex» (deadbeef без цифр) остаются
         assert_eq!(normalize_error("cafe added"), "cafe added");
-        assert_eq!(normalize_error("E0425 unresolved"), "E unresolved");
+        // токены с буквой — целиком, числа и хвосты позиции — прочь
+        assert_eq!(normalize_error("E0425 unresolved"), "E0425 unresolved");
+        assert_eq!(
+            normalize_error("error[E0425]: at main.rs:12:5: LNK1181 TS2307 sha256 x86_64 42 1.5"),
+            "error[E0425]: at main.rs LNK1181 TS2307 sha256 x86_64"
+        );
         assert_eq!(normalize_error("  \n 123 456 \t"), "");
         // предел 512 символов, по границе символа
         let long = "ошибка ".repeat(200);
@@ -270,12 +338,22 @@ mod tests {
         let t = error_terms("Bad interpreter: No such file or directory, bad");
         assert_eq!(t, ["bad", "interpreter", "such", "file", "directory"]);
         assert_eq!(term_coverage(&t, "BAD interpreter и CRLF"), 2);
+        // по границе слова: `file` — в `files`, но не в `profile`
+        let f = vec!["file".to_string()];
+        assert_eq!(term_coverage(&f, "no files here"), 1);
+        assert_eq!(term_coverage(&f, "profile"), 0);
         assert!(coverage_enough(2, 5));
         assert!(!coverage_enough(1, 5));
         assert!(coverage_enough(1, 1));
         assert!(!coverage_enough(0, 0));
         assert!(!coverage_enough(3, 10));
         assert!(coverage_enough(4, 10));
+        // длинная ошибка: порог не выше 4
+        assert!(coverage_enough(4, 32));
+        assert!(!coverage_enough(3, 32));
+        // кэш шаблонов: повтор и некорректный шаблон
+        assert!(error_regex_matches(r"bad interpreter", "bad interpreter"));
+        assert!(!error_regex_matches(r"(", "("));
     }
 
     #[test]

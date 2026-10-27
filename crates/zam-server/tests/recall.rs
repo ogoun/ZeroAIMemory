@@ -550,9 +550,12 @@ async fn recall_no_repeat_in_session_except_post_tool() {
     let start = json!({"event": "session_start"});
     let j = ok(&a, &a.token, Some("s1"), start.clone()).await;
     assert!(ids(&j).contains(&me), "{j}");
-    let j = ok(&a, &a.token, Some("s1"), start.clone()).await;
-    assert!(!ids(&j).contains(&me), "{j}");
-    // и запрос в той же сессии её не повторяет
+    // дайджест повторяется (после `/compact` и `resume` — тот же session_id)
+    let mut again = start.clone();
+    again["source"] = json!("compact");
+    let j = ok(&a, &a.token, Some("s1"), again).await;
+    assert!(ids(&j).contains(&me), "{j}");
+    // а запрос в той же сессии показанное дайджестом не повторяет
     let prompt = json!({"event": "prompt", "prompt": "квазар"});
     let j = ok(&a, &a.token, Some("s1"), prompt.clone()).await;
     assert!(!ids(&j).contains(&me), "{j}");
@@ -775,16 +778,19 @@ async fn recall_excludes_revoked_solution_with_warning() {
     );
 }
 
-/// Срок сбора `recall.timeout_ms` вышел — собранное и `warnings: ["recall timeout"]`, не ошибка.
+/// Срок сбора (`recall.timeout_ms` минус резерв на учёт) вышел посреди Rules — отдаётся
+/// собранное (часть правил) и `warnings: ["recall timeout"]`, не ошибка. Чтение правил
+/// задерживается тестовой меткой (фича `test-hooks`).
 #[tokio::test]
 async fn recall_timeout_returns_partial_with_warning() {
-    let a = api("recall-timeout", |c| c.recall.timeout_ms = 1).await;
+    let a = api("recall-timeout", |c| c.recall.timeout_ms = 600).await;
     allow_rules(&a).await;
+    let mark = zam_server::api::recall::TEST_SLOW_RULE_MARK;
     for i in 0..30 {
         a.note(
             "rules",
-            &format!("r{i}"),
-            &format!("# Правило {i}\n\nТекст.\n"),
+            &format!("r{i:02}"),
+            &format!("# Правило {i}\n\nТекст {mark}.\n"),
         )
         .await;
     }
@@ -796,7 +802,97 @@ async fn recall_timeout_returns_partial_with_warning() {
             .contains(&json!("recall timeout")),
         "{j}"
     );
-    assert!(j["items"].as_array().unwrap().len() < 30, "{j}");
+    // часть правил собрана (20 медленных по 40 мс в 560 мс не укладываются)
+    let n = j["items"].as_array().unwrap().len();
+    assert!((1..20).contains(&n), "{n}: {j}");
+    assert!(j["text"].as_str().unwrap().contains("### Правила"), "{j}");
+}
+
+/// `post_tool` участника общего решения не цепляет `error_regex` и FTS из Knowledge владельца —
+/// только из решения и своего Knowledge.
+#[tokio::test]
+async fn post_tool_member_ignores_owner_knowledge() {
+    let a = server("post-tool-member").await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    assert_eq!(register(&a, &a_tok).await.status, StatusCode::CREATED);
+    assert_eq!(register(&a, &b_tok).await.status, StatusCode::ACCEPTED);
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let trig = |title: &str| {
+        json!({"kind": "insight", "title": title, "body": "quasar overflow разобран",
+               "data": {"kind": "gotcha"},
+               "triggers": [{"type": "error_regex", "pattern": "quasar overflow"}]})
+    };
+    let owner_k = entry(&a, &a_tok, "knowledge", trig("Квазар Анны")).await;
+    let sol = entry(&a, &a_tok, G, trig("Квазар решения")).await;
+    let j = ok(
+        &a,
+        &b_tok,
+        Some("m1"),
+        json!({"event": "post_tool", "solution": G, "error": "fatal: quasar overflow"}),
+    )
+    .await;
+    let got = ids(&j);
+    assert!(got.contains(&format!("i:{sol}")), "{j}");
+    assert!(!got.contains(&format!("i:{owner_k}")), "{j}");
+    // владельцу — оба
+    let j = ok(
+        &a,
+        &a_tok,
+        None,
+        json!({"event": "post_tool", "solution": G, "error": "fatal: quasar overflow"}),
+    )
+    .await;
+    let got = ids(&j);
+    assert!(
+        got.contains(&format!("i:{sol}")) && got.contains(&format!("i:{owner_k}")),
+        "{j}"
+    );
+}
+
+/// Длинный stack trace (30+ слов) находит короткий insight по FTS: порог покрытия не выше 4
+/// слов, совпадение — по границе слова.
+#[tokio::test]
+async fn post_tool_long_trace_finds_short_insight() {
+    let a = server("post-tool-trace").await;
+    let short = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Пул соединений исчерпан",
+        "connection pool exhausted: timeout waiting for idle connection — подними max_size",
+        "failure",
+    )
+    .await;
+    let decoy = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Профили",
+        "profile settings",
+        "pattern",
+    )
+    .await;
+    let trace = "thread main panicked at called Result unwrap on an Err value:         connection pool exhausted timeout waiting for idle connection after 30s         stack backtrace: core panicking panic_fmt core result unwrap_failed app db         acquire app handlers orders list tokio runtime task harness poll future         hyper server conn file profile";
+    assert!(trace.split_whitespace().count() > 30);
+    let j = ok(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "post_tool", "error": trace}),
+    )
+    .await;
+    let got = ids(&j);
+    assert!(got.contains(&format!("i:{short}")), "{j}");
+    assert!(!got.contains(&format!("i:{decoy}")), "{j}");
 }
 
 // ---- замер бюджета (§10.3, §17) ----

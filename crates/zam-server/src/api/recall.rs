@@ -35,9 +35,11 @@
 //!   ослабленный (любое слово) — если запись покрывает достаточно слов ошибки
 //!   ([`coverage_enough`]). Не больше [`POST_TOOL_MAX`]; строка — «ZeroAIMemory: эта ошибка уже
 //!   разбиралась: …»;
-//! - **без повторов**: подсказка `session_start` и `prompt` показывается не больше раза за
-//!   сессию — по `session_seen` с частью [`RECALL_PART`] (любая ревизия); `post_tool` выдаёт
-//!   подсказку при каждой ошибке. Показанное отмечается в `session_seen` базы пользователя
+//! - **без повторов**: подсказка `prompt` показывается не больше раза за сессию — по
+//!   `session_seen` с частью [`RECALL_PART`] (любая ревизия). Дайджест `session_start` не
+//!   фильтруется (после `/compact` и `resume` Claude Code шлёт тот же `session_id`, а контекст
+//!   агента потерян), `post_tool` выдаёт подсказку при каждой ошибке; их показы тоже
+//!   отмечаются — `prompt` их уже не повторит. Показанное отмечается в `session_seen` базы пользователя
 //!   запроса (касание сессии и отметка — одна транзакция), каждый показ — `usage(recall_shown,
 //!   <событие>)` в базе цели (у общего решения — владельца). Сессия — `session_id` или
 //!   `X-Zam-Session`; без неё подсказки выдаются без учёта повторов и без `session_seen`
@@ -48,8 +50,14 @@
 //!   и чужой Knowledge не подмешиваются никогда; решение без доступа исключается с
 //!   `warnings: ["solution access pending|rejected|revoked"]`, недоступная база владельца —
 //!   `solution unavailable`. Решение — `solution` тела (не GUID — 400) или `X-Zam-Solution`;
-//! - **бюджет сервера** `recall.timeout_ms` (200): шаги сбора идут до срока, по превышении
-//!   отдаётся собранное и `warnings: ["recall timeout"]`; учёт показов — после сбора;
+//! - **бюджет сервера** `recall.timeout_ms` (200): шаги сбора идут до `timeout_ms −`
+//!   [`ACCOUNTING_RESERVE_MS`] (40 мс, не больше половины срока), по превышении отдаётся
+//!   собранное и `warnings: ["recall timeout"]`; учёт показов — после сбора и только до полного
+//!   срока: вышел — собранное отдаётся без `session_seen` и `usage` (`timings.record_ms: null`)
+//!   и с тем же предупреждением. Сбой внутреннего поиска `prompt` — тишина и
+//!   `warnings: ["recall search failed"]`;
+//! - неизвестные поля тела игнорируются (клиент хуков может быть новее); `source` хука
+//!   (`startup | resume | clear | compact | fork`) пока только в журнал DEBUG;
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool`
 //!   (иначе 400; `pre_tool` — только локально в хуке, §10.3).
 //!
@@ -75,7 +83,7 @@ use zam_search::truncate_to_tokens;
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, NodeKind, RECALL_PART,
     SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TriggerKind, UsageEvent, UsageKind,
-    UsageSource, active_triggers, count_tokens, get_entry, list_children, list_entries, mark_seen,
+    UsageSource, active_triggers, count_tokens, list_children, list_entries, mark_seen,
     node_content, record_usages, search_fts_channels, seen_revs, touch_session,
 };
 
@@ -91,6 +99,17 @@ use crate::error::ApiError;
 
 /// Предупреждение: сбор подсказок не уложился в `recall.timeout_ms`.
 pub const WARN_RECALL_TIMEOUT: &str = "recall timeout";
+/// Предупреждение: внутренний поиск подсказок к запросу не удался (ответ — тишина).
+pub const WARN_PROMPT_SEARCH_FAILED: &str = "recall search failed";
+/// Резерв срока на учёт показа (`session_seen`, `usage`), мс: сбор идёт до
+/// `timeout_ms − резерв` (не больше половины `timeout_ms`).
+pub const ACCOUNTING_RESERVE_MS: u64 = 40;
+/// Тестовая метка заметки Rules: её чтение задерживается на [`TEST_SLOW_RULE_MS`] (фича
+/// `test-hooks`, проверка частичного ответа по тайм-ауту).
+#[cfg(feature = "test-hooks")]
+pub const TEST_SLOW_RULE_MARK: &str = "zam-test-slow-rule";
+#[cfg(feature = "test-hooks")]
+const TEST_SLOW_RULE_MS: u64 = 40;
 /// Заметок Rules в дайджесте.
 pub const RULES_MAX: usize = 20;
 /// Предел L1 одной заметки Rules в дайджесте, токенов.
@@ -134,10 +153,13 @@ impl Event {
     }
 }
 
+/// Тело запроса. Неизвестные поля игнорируются: клиент хуков может быть новее сервера.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RecallReq {
     event: Event,
+    /// Источник `SessionStart` хука (`startup | resume | clear | compact | fork`) — пока только
+    /// в журнал (DEBUG); задача 10 его передаёт.
+    source: Option<String>,
     session_id: Option<String>,
     solution: Option<String>,
     area: Option<String>,
@@ -364,6 +386,16 @@ async fn digest(
                     Err(StoreError::NotFound) => continue,
                     Err(e) => return Err(e.into()),
                 };
+                // тестовая задержка (частичный ответ по тайм-ауту): только с фичей test-hooks
+                #[cfg(feature = "test-hooks")]
+                if text.contains(TEST_SLOW_RULE_MARK)
+                    && deadline
+                        .step(tokio::time::sleep(Duration::from_millis(TEST_SLOW_RULE_MS)))
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
                 let certainty = certainty_str(n.certainty);
                 let reference = format!("n:{}", n.id);
                 let mut block = hint_line(
@@ -372,7 +404,8 @@ async fn digest(
                     &[certainty.as_deref().unwrap_or_default()],
                     &reference,
                 );
-                let summary = l1(&text);
+                // секреты в тексте правила маскируются, как в чанках и L0 (§7.6)
+                let summary = zam_markdown::mask_text(&l1(&text));
                 let summary = truncate_to_tokens(&summary, RULE_L1_TOKENS, &count_tokens);
                 for line in summary.lines().filter(|l| !l.trim().is_empty()) {
                     block.push_str("\n  ");
@@ -546,16 +579,28 @@ async fn prompt_hints(
     let Some(r) = deadline.step(search).await else {
         return Ok(Vec::new());
     };
-    let resp = r?;
+    // сбой поиска подсказки не валит: тишина и предупреждение
+    let failed = |health: &mut Health<'_>, what: &dyn std::fmt::Display| {
+        tracing::warn!(error = %what, "recall: поиск подсказок к запросу не удался");
+        health.warnings.push(WARN_PROMPT_SEARCH_FAILED.into());
+        Ok(Vec::new())
+    };
+    let resp = match r {
+        Ok(resp) => resp,
+        Err(e) => return failed(health, &e),
+    };
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .map_err(|e| ApiError::Internal(format!("ответ поиска: {e}")))?;
     if status != StatusCode::OK {
-        return Err(ApiError::Internal(format!("поиск подсказок: {status}")));
+        return failed(health, &status);
     }
-    let v: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| ApiError::Internal(format!("ответ поиска: {e}")))?;
+    let bytes = match axum::body::to_bytes(resp.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return failed(health, &e),
+    };
+    let v: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => return failed(health, &e),
+    };
     if let Some(ws) = v["warnings"].as_array() {
         health
             .warnings
@@ -700,23 +745,35 @@ async fn error_hints(
             if !error_regex_matches(&row.pattern, scan) {
                 continue;
             }
-            let Some(r) = deadline.step(get_entry(&t.db, row.entry_id)).await else {
-                break;
-            };
-            let e = match r {
-                Ok(e) if e.deleted_at.is_none() => e,
-                Ok(_) | Err(StoreError::NotFound) => continue,
-                // сбой базы чужого решения исключает его, личной — ошибка запроса
-                Err(e) => {
-                    health.soft(i, Err::<(), _>(e))?;
-                    break;
-                }
-            };
-            taken.insert(TargetRef {
+            // поля подсказки — из строки триггера (живой insight `active`/`revisit`); ревизия
+            // отметке `recall` не нужна (повторы считаются без ревизии) — 0
+            let tref = TargetRef {
                 kind: TargetKind::Entry,
-                id: e.id,
+                id: row.entry_id,
+            };
+            taken.insert(tref);
+            let reference = format!("i:{}", row.entry_id);
+            let certainty = certainty_str(row.certainty);
+            let block = hint_line(
+                lead,
+                &row.title,
+                &[
+                    row.insight_kind.as_str(),
+                    certainty.as_deref().unwrap_or_default(),
+                ],
+                &reference,
+            );
+            out.push(Cand {
+                target: i,
+                tref,
+                rev: 0,
+                reference,
+                kind: "insight",
+                title: row.title.clone(),
+                certainty,
+                reason: "error_regex",
+                block,
             });
-            out.push(entry_cand(i, &e, "error_regex", lead));
         }
     }
 
@@ -925,16 +982,24 @@ pub async fn recall(
     };
     let (targets, warnings) = resolve_targets(&st, &p, &sh, &scope).await?;
     let mut health = Health::new(&targets, warnings);
+    if let Some(src) = req.source.as_deref() {
+        tracing::debug!(event = ?req.event, source = %src, "recall");
+    }
+    // сбор — до срока минус резерв на учёт показа; учёт — только до полного срока
+    let timeout = st.cfg.recall.timeout_ms;
+    let total_deadline = t0 + Duration::from_millis(timeout);
     let mut deadline = Deadline {
-        at: t0 + Duration::from_millis(st.cfg.recall.timeout_ms),
+        at: t0 + Duration::from_millis(timeout - ACCOUNTING_RESERVE_MS.min(timeout / 2)),
         expired: false,
     };
 
     // сбор кандидатов
     let (notices, sections, repeatable) = match req.event {
+        // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
+        // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
         Event::SessionStart => {
             let (n, s) = digest(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
-            (n, s, false)
+            (n, s, true)
         }
         Event::Prompt => {
             let c = prompt_hints(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
@@ -991,10 +1056,15 @@ pub async fn recall(
         .collect();
     let collect_ms = ms(t0);
 
-    // учёт показа
+    // учёт показа — если полный срок ещё не вышел; иначе собранное отдаётся без учёта
     let rt = Instant::now();
-    record(session.as_ref(), &targets, user, req.event, &shown_now).await;
-    let record_ms = ms(rt);
+    let record_ms = if rt < total_deadline {
+        record(session.as_ref(), &targets, user, req.event, &shown_now).await;
+        Some(ms(rt))
+    } else {
+        deadline.expired = true;
+        None
+    };
 
     let mut warnings = std::mem::take(&mut health.warnings);
     if deadline.expired {
