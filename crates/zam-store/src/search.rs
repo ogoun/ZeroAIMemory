@@ -93,7 +93,7 @@ pub struct TargetFilter {
     /// Непустой список пропускает только заметки и записи с этими статусами.
     pub certainty: Vec<String>,
     /// `human` | `agent` (`filters.decided_by`, M4.5): только решения (`insight` с
-    /// `data.kind = decision`) с таким `data.decision.decided_by`; без поля — `human`.
+    /// `data.kind = decision`) с таким `data.decision.decided_by`; без поля — по автору записи.
     /// `None` — без фильтра.
     pub decided_by: Option<String>,
 }
@@ -485,7 +485,8 @@ fn scope_sql(n_spaces: usize) -> String {
                          THEN json_extract(e.data, '$.kind') END = 'decision'
                 AND CASE WHEN json_type(e.data, '$.decision.decided_by') = 'text'
                          THEN json_extract(e.data, '$.decision.decided_by')
-                         ELSE 'human' END = ?{by}))))"
+                         ELSE CASE WHEN e.author_kind = 'agent' THEN 'agent'
+                                  ELSE 'human' END END = ?{by}))))"
     )
 }
 

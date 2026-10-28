@@ -74,7 +74,8 @@ pub async fn list_entries(
                     AND json_extract(e.data, '$.kind') = 'decision'
                     AND CASE WHEN json_type(e.data, '$.decision.decided_by') = 'text'
                              THEN json_extract(e.data, '$.decision.decided_by')
-                             ELSE 'human' END = ?13))
+                             ELSE CASE WHEN e.author_kind = 'agent' THEN 'agent'
+                                  ELSE 'human' END END = ?13))
              ORDER BY e.created_at DESC, e.id DESC
              LIMIT ?11"
         ))?;

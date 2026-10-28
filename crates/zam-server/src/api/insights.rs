@@ -313,7 +313,8 @@ impl DedupMode {
 
 /// Кандидаты в дубли нового insight в пространстве `space` базы `db` (владелец `owner`)
 /// области `area` и режим проверки (см. модуль). Сбой эмбеддинга или индекса — WARN
-/// (без текста записи) и `Degraded`, а не ошибка.
+/// (без текста записи) и `Degraded`, а не ошибка. Третье значение — dense-вектор запроса
+/// (при `Full`), его повторно использует проверка близких аксиом.
 pub async fn dedup(
     st: &AppState,
     db: &Db,
@@ -322,7 +323,7 @@ pub async fn dedup(
     title: &str,
     body: &str,
     area: Option<&str>,
-) -> Result<(Vec<DedupCandidate>, DedupMode), ApiError> {
+) -> Result<(Vec<DedupCandidate>, DedupMode, Option<Vec<f32>>), ApiError> {
     let area = normalize_area(area);
     let mut out = title_duplicates(db, space, title, area.as_deref()).await?;
     let (Ok(()), Some(emb), Some(vector)) = (
@@ -330,21 +331,21 @@ pub async fn dedup(
         st.index.embedder.clone(),
         st.index.vector.clone(),
     ) else {
-        return Ok((out, DedupMode::Degraded));
+        return Ok((out, DedupMode::Degraded, None));
     };
     let text = format!("{}\n{body}", title.trim());
     let e = match tokio::task::spawn_blocking(move || emb.embed_query(&text)).await {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "эмбеддинг insight для дедупликации не удался: только заголовок");
-            return Ok((out, DedupMode::Degraded));
+            return Ok((out, DedupMode::Degraded, None));
         }
         Err(j) => {
             tracing::error!(
                 panic = j.is_panic(),
                 "эмбеддинг insight для дедупликации аварийно завершился"
             );
-            return Ok((out, DedupMode::Degraded));
+            return Ok((out, DedupMode::Degraded, None));
         }
     };
     let filter = VectorFilter {
@@ -361,7 +362,7 @@ pub async fn dedup(
         Ok(h) => h,
         Err(err) => {
             tracing::warn!(error = %err, "векторный поиск дублей insight не удался: только заголовок");
-            return Ok((out, DedupMode::Degraded));
+            return Ok((out, DedupMode::Degraded, None));
         }
     };
     let threshold = st.cfg.insights.dedup_threshold;
@@ -407,7 +408,7 @@ pub async fn dedup(
         });
     }
     out.truncate(DEDUP_CANDIDATES_MAX);
-    Ok((out, DedupMode::Full))
+    Ok((out, DedupMode::Full, Some(e.dense)))
 }
 
 /// База, пространство и владелец, где ищутся близкие аксиомы.
@@ -445,6 +446,7 @@ async fn decision_warnings(
     title: &str,
     body: &str,
     area: Option<&str>,
+    dense: Option<Vec<f32>>,
 ) -> Vec<String> {
     if p.is_human() {
         return Vec::new();
@@ -490,7 +492,7 @@ async fn decision_warnings(
             }
         }
     }
-    match decision_vector(st, &scopes, title, body, area.as_deref()).await {
+    match decision_vector(st, &scopes, title, body, area.as_deref(), dense).await {
         Some(hits) => {
             let threshold = st.cfg.insights.decision_conflict_threshold;
             // лучшая оценка на запись (у записи несколько чанков)
@@ -538,6 +540,7 @@ async fn attach_decision_warnings(
     headers: &HeaderMap,
     base: (&Db, Id, Id),
     e: &Entry,
+    dense: Option<Vec<f32>>,
     v: &mut Value,
 ) {
     if e.data.get("kind").and_then(Value::as_str) != Some("decision") {
@@ -552,6 +555,7 @@ async fn attach_decision_warnings(
         &e.title,
         &e.body,
         e.area.as_deref(),
+        dense,
     )
     .await;
     attach_warnings(v, w);
@@ -565,22 +569,29 @@ async fn decision_vector(
     title: &str,
     body: &str,
     area: Option<&str>,
+    dense: Option<Vec<f32>>,
 ) -> Option<Vec<(Id, f32)>> {
     st.index.vector_available().ok()?;
     let (emb, vector) = (st.index.embedder.clone()?, st.index.vector.clone()?);
-    let text = format!("{}\n{body}", title.trim());
-    let e = match tokio::task::spawn_blocking(move || emb.embed_query(&text)).await {
-        Ok(Ok(e)) => e,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "эмбеддинг решения для проверки аксиом не удался");
-            return None;
-        }
-        Err(j) => {
-            tracing::error!(
-                panic = j.is_panic(),
-                "эмбеддинг решения для проверки аксиом аварийно завершился"
-            );
-            return None;
+    // вектор дедупликации (тот же текст) берётся повторно: один `embed_query` на запись
+    let dense = match dense {
+        Some(d) => d,
+        None => {
+            let text = format!("{}\n{body}", title.trim());
+            match tokio::task::spawn_blocking(move || emb.embed_query(&text)).await {
+                Ok(Ok(e)) => e.dense,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "эмбеддинг решения для проверки аксиом не удался");
+                    return None;
+                }
+                Err(j) => {
+                    tracing::error!(
+                        panic = j.is_panic(),
+                        "эмбеддинг решения для проверки аксиом аварийно завершился"
+                    );
+                    return None;
+                }
+            }
         }
     };
     let filter = VectorFilter {
@@ -598,7 +609,7 @@ async fn decision_vector(
         area: area.map(str::to_string),
         ..VectorFilter::default()
     };
-    match vector.nearest_dense(&e.dense, &filter, DEDUP_NEAREST).await {
+    match vector.nearest_dense(&dense, &filter, DEDUP_NEAREST).await {
         Ok(hits) => Some(
             hits.into_iter()
                 .filter(|h| h.target.kind == TargetKind::Entry)
@@ -796,8 +807,16 @@ pub async fn create(
             v["dedup"] = json!(DedupMode::Skipped.as_str());
             let w = alias_warnings(st, &sc.db, sc.space.id, &n.title, &n.body).await?;
             attach_warnings(&mut v, w);
-            attach_decision_warnings(st, p, headers, (&sc.db, sc.owner, sc.space.id), &n, &mut v)
-                .await;
+            attach_decision_warnings(
+                st,
+                p,
+                headers,
+                (&sc.db, sc.owner, sc.space.id),
+                &n,
+                None,
+                &mut v,
+            )
+            .await;
         }
         let status = if repeat {
             StatusCode::OK
@@ -807,11 +826,12 @@ pub async fn create(
         return Ok((status, Json(v)));
     }
     // термины — без дедупликации: уникальность имён проверяет хранилище в транзакции записи
+    let mut dense: Option<Vec<f32>> = None;
     let mode = if req.force || repeat || kind == EntryKind::Term {
         DedupMode::Skipped
     } else {
         let area = req.area.clone().or_else(|| attrib.area.clone());
-        let (cands, mode) = dedup(
+        let (cands, mode, vec) = dedup(
             st,
             &sc.db,
             sc.owner,
@@ -824,6 +844,7 @@ pub async fn create(
         if !cands.is_empty() {
             return Err(duplicate(cands, mode));
         }
+        dense = vec;
         mode
     };
     let new = new_entry(kind, req, sc.space.id, key, triggers, links);
@@ -838,8 +859,16 @@ pub async fn create(
         let w = alias_warnings(st, &sc.db, sc.space.id, &e.title, &e.body).await?;
         attach_warnings(&mut v, w);
         if created {
-            attach_decision_warnings(st, p, headers, (&sc.db, sc.owner, sc.space.id), &e, &mut v)
-                .await;
+            attach_decision_warnings(
+                st,
+                p,
+                headers,
+                (&sc.db, sc.owner, sc.space.id),
+                &e,
+                dense,
+                &mut v,
+            )
+            .await;
         }
     }
     let status = if created {
@@ -927,6 +956,7 @@ pub async fn supersede(
                 &headers,
                 (&sc.db, sc.owner, sc.space.id),
                 &n,
+                None,
                 &mut entry,
             )
             .await;

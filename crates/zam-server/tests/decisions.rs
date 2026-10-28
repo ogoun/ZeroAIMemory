@@ -157,7 +157,7 @@ async fn decision_adr_fields_validated() {
 async fn decided_by_filter() {
     let a = api("decisions-by", |_| {}).await;
     let adr = |by: &str| Some(json!({"decided_by": by}));
-    // человек без поля, человек с полем, агент с полем, агент без поля (по ТЗ — human)
+    // человек без поля, человек с полем, агент с полем, агент без поля (по автору записи — agent)
     let h1 = created(
         post_human(
             &a,
@@ -178,6 +178,14 @@ async fn decided_by_filter() {
         post(
             &a,
             decision("Решение кэша третье", "кэш сборки", adr("agent"), json!({})),
+        )
+        .await,
+    )
+    .await;
+    let a2 = created(
+        post(
+            &a,
+            decision("Решение кэша четвёртое", "кэш сборки", None, json!({})),
         )
         .await,
     )
@@ -219,9 +227,9 @@ async fn decided_by_filter() {
             r.json()
         }
     };
-    assert_eq!(ids(&search(Some("agent")).await), sorted(&[&a1]));
+    assert_eq!(ids(&search(Some("agent")).await), sorted(&[&a1, &a2]));
     assert_eq!(ids(&search(Some("human")).await), sorted(&[&h1, &h2]));
-    assert_eq!(ids(&search(None).await).len(), 4);
+    assert_eq!(ids(&search(None).await).len(), 5);
     let r = a
         .t(
             Method::POST,
@@ -241,9 +249,9 @@ async fn decided_by_filter() {
             r.json()
         }
     };
-    assert_eq!(ids(&feed("decided_by=agent").await), sorted(&[&a1]));
+    assert_eq!(ids(&feed("decided_by=agent").await), sorted(&[&a1, &a2]));
     assert_eq!(ids(&feed("decided_by=human").await), sorted(&[&h1, &h2]));
-    assert_eq!(ids(&feed("kind=insight").await).len(), 4);
+    assert_eq!(ids(&feed("kind=insight").await).len(), 5);
     let r = a
         .t(Method::GET, &format!("{KN}?decided_by=robot"), None)
         .await;

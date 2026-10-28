@@ -274,7 +274,7 @@ pub(crate) struct Filters {
     /// `axiom | theorem | hypothesis` (§7.5); пусто — любые, в том числе без статуса.
     certainty: Option<Vec<String>>,
     /// `human | agent` (M4.5, §5.1): только решения с таким `data.decision.decided_by`
-    /// (без поля — `human`); остальные записи и заметки отсеиваются.
+    /// (без поля — по автору записи); остальные записи и заметки отсеиваются.
     decided_by: Option<String>,
 }
 
@@ -402,6 +402,37 @@ impl SearchSection {
             .collect(),
             area: area.map(|a| (a, self.boost_area)),
         }
+    }
+}
+
+/// Фильтр векторного канала. При `decided_by` точки сужаются до решений (`kind = insight`,
+/// `insight_kinds = [decision]`): иначе другие записи вытесняют из окна выдачи редкие решения
+/// агента. Деление `human`/`agent` внутри Qdrant неполное — его делает SQLite при `live_chunks`.
+fn vector_filter(
+    scopes: Vec<VectorScope>,
+    path_prefix: Option<String>,
+    t: &TargetFilter,
+    folders: bool,
+) -> VectorFilter {
+    let by = t.decided_by.is_some();
+    VectorFilter {
+        scopes,
+        path_prefix,
+        kinds: if by {
+            vec!["insight".into()]
+        } else {
+            t.kinds.clone()
+        },
+        insight_kinds: if by {
+            vec!["decision".into()]
+        } else {
+            Vec::new()
+        },
+        exclude_statuses: excluded_statuses(t),
+        area: t.area.clone(),
+        certainty: t.certainty.clone(),
+        folders,
+        ..VectorFilter::default()
     }
 }
 
@@ -1732,16 +1763,12 @@ pub async fn search(
         if !run_vector {
             return VectorRun::default();
         }
-        let filter = VectorFilter {
-            scopes: scopes.clone(),
-            path_prefix: prefix.clone(),
-            kinds: kinds.kinds.clone(),
-            exclude_statuses: excluded_statuses(&kinds),
-            area: kinds.area.clone(),
-            certainty: kinds.certainty.clone(),
-            folders: want_folders || folder_channel,
-            ..VectorFilter::default()
-        };
+        let filter = vector_filter(
+            scopes.clone(),
+            prefix.clone(),
+            &kinds,
+            want_folders || folder_channel,
+        );
         vector_channel(&st.index, filter, req.query.clone()).await
     };
     let ((runs, fts_ms), vrun) = tokio::join!(fts, vector);
@@ -2015,8 +2042,12 @@ pub async fn search(
     };
     // порядок по `contradicts` — после реранка и бустов (M4.5, §5.2)
     let mut items = items;
-    if st.cfg.search.contradicts_order && items.len() > 1 {
-        graph::order_by_contradicts(&mut health, &mut items).await?;
+    // только первые `top_k` элементов («обе в выдаче»): аксиома из хвоста окна в выдачу не поднимается
+    if st.cfg.search.contradicts_order && top_k > 1 && items.len() > 1 {
+        let tail = items.split_off(top_k.min(items.len()));
+        let r = graph::order_by_contradicts(&mut health, &mut items).await;
+        items.extend(tail);
+        r?;
     }
 
     // 5. top_k, режим, expand, упаковка
@@ -2873,6 +2904,24 @@ mod tests {
         )
         .unwrap();
         assert!(f.statuses.is_empty() && excluded_statuses(&f).is_empty());
+        // decided_by сужает векторный фильтр до решений
+        let by = target_filter(
+            &Filters {
+                decided_by: Some("agent".into()),
+                ..Filters::default()
+            },
+            false,
+        )
+        .unwrap();
+        let vf = vector_filter(Vec::new(), None, &by, false);
+        assert_eq!(vf.kinds, ["insight"]);
+        assert_eq!(vf.insight_kinds, ["decision"]);
+        let plain = target_filter(&Filters::default(), false).unwrap();
+        assert!(
+            vector_filter(Vec::new(), None, &plain, false)
+                .insight_kinds
+                .is_empty()
+        );
         let f = target_filter(
             &Filters {
                 kinds: Some(vec!["insight".into()]),
