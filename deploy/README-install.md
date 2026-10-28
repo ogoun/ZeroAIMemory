@@ -160,10 +160,13 @@ Invoke-WebRequest 'http://<хост>:7700/downloads/zam/windows-x64' -OutFile "$
 $p = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($p -split ';') -notcontains $d) { [Environment]::SetEnvironmentVariable('Path', $(if ($p) { "$p;$d" } else { $d }), 'User') }
 # MCP по HTTP (.mcp.json) берёт токен из ZAM_TOKEN; zam и хуки — из ~/.zeroaimemory/config.toml
 [Environment]::SetEnvironmentVariable('ZAM_TOKEN', '<токен>', 'User')
+# имя машины для X-Zam-Machine — одно для zam, хуков и .mcp.json
+[Environment]::SetEnvironmentVariable('ZAM_MACHINE', $env:COMPUTERNAME, 'User')
 
 # Linux
 mkdir -p ~/.local/bin && curl -fsSL 'http://<хост>:7700/downloads/zam/linux-x64' -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo 'Добавьте ~/.local/bin в PATH' ;; esac
+[ -n "$ZAM_MACHINE" ] || echo "Добавьте в профиль оболочки: export ZAM_MACHINE=$(uname -n)"
 ```
 
 Токен `zam` и хуки берут из `~/.zeroaimemory/config.toml` (права 0600) — его вместе с адресом
@@ -294,8 +297,10 @@ zam attach "knowledge:Инструменты/Bash скрипты" ./схема.p
 (`--base-rev` или текущая). Если заметку успели изменить с другой машины, команда
 печатает в stderr дифф от вашей базовой ревизии к текущей и завершается с кодом 4.
 Перед первой записью в решение оно регистрируется на сервере по `solution.toml`.
-Имя машины (`COMPUTERNAME` в Windows, `HOSTNAME` в Linux, если переменная экспортирована)
-попадает в историю ревизий.
+Имя машины попадает в историю ревизий: `ZAM_MACHINE`, иначе `COMPUTERNAME` (Windows),
+`HOSTNAME` или `/etc/hostname` (Linux). `ZAM_MACHINE` задаёт команда установки `zam` — её же
+берёт MCP (`.mcp.json`: `"X-Zam-Machine": "${ZAM_MACHINE:-}"`), поэтому хуки и MCP одной машины
+относятся к одной сессии.
 
 Коды выхода команд: 0 — успех, 1 — конфигурация (нет адреса, битый `solution.toml`),
 2 — сервер недоступен, 3 — нет токена или он отклонён (в том числе нет прав на запись),
@@ -892,6 +897,11 @@ jina — модель с динамическим int8: пары «запрос 
   гипотезы: бусты `certainty` применяются к баллу реранкера, но реранкер иногда оценивает гипотезу
   на порядок выше (`reliable_first` 0,786 на наборе eval, без реранка — 1,000). Для вопросов, где
   важно «чему верить», ищите без реранка или смотрите `certainty` в карточке.
+- Имя машины MCP (`.mcp.json`) — только из `ZAM_MACHINE`: если переменная не задана (`zam` установлен
+  не командой со страницы «Подключение агента»), запись через MCP засчитывается последней
+  сессии пользователя без учёта машины — при двух одновременно активных машинах возможна чужая
+  сессия (лишнее или пропущенное напоминание `checkpoint`). Задайте `ZAM_MACHINE` (см.
+  «Подключение агента») и перезапустите агента.
 - Служба Windows проверена тестами и сборкой; регистрация в SCM на машине разработки не
   выполнялась — при первой установке сверьте `sc qc zam-server` и журнал остановки.
 - Во время reindex и пересборки индекса векторная выдача неполна: `/search` добавляет
