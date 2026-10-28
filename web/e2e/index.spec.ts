@@ -143,7 +143,7 @@ test('индекс: неудавшиеся задания одного узла,
   const knowledge = spaces.find((s) => s.kind === 'knowledge')!.id;
   // настоящий ответ сервера, дополненный тем, что на сервере e2e не воспроизвести:
   // два неудавшихся задания одного узла (разные id, второе — заметка уже в корзине),
-  // повреждённая и исключённая базы
+  // повреждённая и исключённая базы, перенарезка базы после смены настроек нарезки
   let calls = 0;
   await page.route('**/api/v1/index/status', async (route) => {
     calls++;
@@ -164,6 +164,13 @@ test('индекс: неудавшиеся задания одного узла,
     body.failed_items = [failed(7, null), failed(3, new Date().toISOString())];
     body.unavailable_dbs = [{ user_id: 'u-broken', error: 'file is not a database' }];
     body.rebuild_skipped = [{ user_id: 'u-skip', error: 'database is locked', attempts: 5 }];
+    body.dbs = [
+      ...body.dbs,
+      {
+        user_id: 'u-rechunk',
+        rechunk: { reason: 'params', changed: ['chunk_boundary_lambda'], total: 1200, done: 300 },
+      },
+    ];
     await route.fulfill({ response: r, json: body });
   });
   await page.goto(`${base()}#/admin/index`);
@@ -179,6 +186,9 @@ test('индекс: неудавшиеся задания одного узла,
   await expect(page.getByText('Базы пользователей не открываются: 1')).toBeVisible();
   await expect(page.getByText('file is not a database')).toBeVisible();
   await expect(page.getByText('Исключены из пересборки индекса: 1')).toBeVisible();
+  await expect(page.getByRole('status').filter({ hasText: 'Идёт перенарезка' })).toContainText(
+    /Идёт перенарезка: изменились chunk_boundary_lambda, 300 из 1\s?200/,
+  );
   await page.screenshot({ path: `${screens}index-failed.png`, fullPage: true });
 
   // вкладка скрыта — опрос на паузе; вернулась — статус сразу обновляется

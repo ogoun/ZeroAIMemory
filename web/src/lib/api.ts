@@ -7,6 +7,10 @@ export interface User {
   created_at: string;
   disabled_at: string | null;
   tokens: number;
+  /** Пароль входа в WebUI задан (§11.4). */
+  has_password: boolean;
+  /** При следующем входе пользователь обязан сменить пароль. */
+  must_change_password: boolean;
 }
 
 export type Access = 'rw' | 'ro';
@@ -21,8 +25,6 @@ export interface TokenInfo {
   last_used_at: string | null;
   last_ip: string | null;
   revoked_at: string | null;
-  /** Человеческий токен (§7.5): запись по нему — от человека, ставит и меняет axiom. */
-  human: boolean;
 }
 
 export interface IssuedToken {
@@ -109,10 +111,20 @@ export async function logout(): Promise<void> {
 }
 
 export interface Me {
+  /** `admin` — администратор из конфигурации, `user` — пользователь (§11.4). */
+  kind: 'admin' | 'user';
+  /** Чем входили: логин администратора или имя пользователя. */
   login: string;
+  /** Имя пользователя базы. */
+  name: string;
   user_id: string;
+  /** Пароль задал администратор: до смены доступна только смена пароля. */
+  must_change_password: boolean;
   csrf: string;
 }
+
+/** Сессия администратора (разделы «Пользователи», «Настройки», полный «Индекс»). */
+export const isAdminSession = (m: Me): boolean => m.kind !== 'user';
 
 export const me = () => call<Me>('GET', 'auth/me');
 
@@ -132,9 +144,25 @@ export const listTokens = (userId: string) =>
   call<TokenInfo[]>('GET', `admin/users/${userId}/tokens`);
 export const createUser = (name: string) =>
   call<{ user: User; token: IssuedToken }>('POST', 'admin/users', { name });
-export const issueToken = (userId: string, name: string, access: Access, human = false) =>
-  call<IssuedToken>('POST', `admin/users/${userId}/tokens`, { name, access, human });
+export const issueToken = (userId: string, name: string, access: Access) =>
+  call<IssuedToken>('POST', `admin/users/${userId}/tokens`, { name, access });
 export const revokeToken = (id: string) => call<void>('DELETE', `admin/tokens/${id}`);
+/** Администратор задаёт пароль входа в WebUI (≥ 10 символов, смена при первом входе). */
+export const setUserPassword = (userId: string, password: string) =>
+  call<User>('POST', `admin/users/${userId}/password`, { password });
+/** Администратор закрывает вход пользователя в WebUI. */
+export const clearUserPassword = (userId: string) =>
+  call<void>('DELETE', `admin/users/${userId}/password`);
+
+// ---- свой аккаунт (сессия пользователя или администратора, §11.4) ----
+
+/** Смена своего пароля: `old` — текущий, `new` — не короче 10 символов. */
+export const changePassword = (old: string, next: string) =>
+  call<void>('POST', 'auth/password', { old, new: next });
+export const listOwnTokens = () => call<TokenInfo[]>('GET', 'auth/tokens');
+export const issueOwnToken = (name: string, access: Access) =>
+  call<IssuedToken>('POST', 'auth/tokens', { name, access });
+export const revokeOwnToken = (id: string) => call<void>('DELETE', `auth/tokens/${q(id)}`);
 
 // ---- пространства и узлы (администратор — от имени пользователя `user`) ----
 
@@ -217,8 +245,6 @@ export const listSpaces = (user: string) =>
   call<{
     user: { id: string; name: string };
     access: string;
-    /** Запрос пишет как человек (сессия WebUI — всегда). */
-    human: boolean;
     spaces: Space[];
     /** Ожидающие запросы доступа к решениям пользователя. */
     access_requests_pending: number;
@@ -390,7 +416,7 @@ export interface SearchResult {
   warnings: string[];
 }
 
-/** Гибридный поиск по пространствам пользователя (Human — только администратору). */
+/** Гибридный поиск по пространствам пользователя (Human — только сессии WebUI, своей базы). */
 export const search = (user: string, query: string, spaces: string[]) =>
   call<SearchResult>(
     'POST',
@@ -470,9 +496,23 @@ export interface IndexStatus {
   rebuild_skipped: { user_id: string; error: string; attempts: number }[];
   /** Базы пользователей, которые не открылись (повреждены или недоступны). */
   unavailable_dbs: { user_id: string; error: string }[];
+  /** Видимые базы: ход фоновой перенарезки после смены настроек нарезки (`null` — не идёт). */
+  dbs: { user_id: string; rechunk: Rechunk | null }[];
 }
 
+/** Перенарезка базы (§8.2): `reason` — `params` | `algorithm` | `tokenizer` | `unknown`;
+ * `changed` — ключи `[index]`, `algorithm` или `tokenizer`; `done` из `total` записей. */
+export interface Rechunk {
+  reason: string;
+  changed: string[];
+  total: number;
+  done: number;
+}
+
+/** Администратору — все базы; пользователю — только своя (`dbs` из одной базы). */
 export const indexStatus = () => call<IndexStatus>('GET', 'index/status');
+/** Лёгкий статус для баннера: только ход перенарезки баз. */
+export const rechunkStatus = () => call<{ dbs: IndexStatus['dbs'] }>('GET', 'index/status?only=rechunk');
 
 /** `POST /admin/reindex`: без `full` — из кэша embeddings, с `full` — перечанковка и инференс. */
 export const reindex = (full: boolean) =>
@@ -543,6 +583,8 @@ export interface Entry {
   deleted_at: string | null;
   /** У insight в `GET`/`PATCH`. */
   triggers?: Trigger[];
+  /** У insight в `GET /entries/{id}` и в списке: показы подсказками и оценки (§10.5). */
+  usage?: UsageCounts;
 }
 
 export interface EntryQuery {
@@ -592,8 +634,16 @@ export interface EntryPatch {
   message?: string;
 }
 
-export const patchEntry = (user: string, id: string, patch: EntryPatch) =>
-  call<Entry>('PATCH', `entries/${q(id)}`, patch, user);
+/** `If-Match: "<rev>"` ревизии записи (§11.3). */
+const ifMatch = (rev?: number): Record<string, string> =>
+  rev === undefined ? {} : { 'If-Match': `"${rev}"` };
+
+/** `PATCH /entries/{id}` с `If-Match: <rev>` (обязателен, §11.3): `rev` — ревизия из
+ * `GET /entries/{id}`; запись изменилась — 409 с `rev` текущей. */
+export const patchEntry = async (user: string, id: string, rev: number, patch: EntryPatch) =>
+  (await (
+    await request('PATCH', `entries/${q(id)}`, { body: patch, user, headers: ifMatch(rev) })
+  ).json()) as Entry;
 
 export interface InsightDraft {
   title: string;
@@ -605,12 +655,17 @@ export interface InsightDraft {
   message?: string;
 }
 
-/** Замещение insight: старая запись — `superseded`, ничего не удаляется. */
-export const supersedeEntry = (user: string, id: string, draft: InsightDraft) =>
-  call<{ entry: Entry; superseded: Entry }>('POST', `entries/${q(id)}/supersede`, draft, user);
+/** Замещение insight: старая запись — `superseded`, ничего не удаляется; `rev` старой
+ * (`If-Match`) необязателен, при наличии сервер его проверяет. */
+export const supersedeEntry = async (user: string, id: string, draft: InsightDraft, rev?: number) =>
+  (await (
+    await request('POST', `entries/${q(id)}/supersede`, { body: draft, user, headers: ifMatch(rev) })
+  ).json()) as { entry: Entry; superseded: Entry };
 
-export const retractEntry = (user: string, id: string, reason: string) =>
-  call<Entry>('POST', `entries/${q(id)}/retract`, { reason }, user);
+export const retractEntry = async (user: string, id: string, reason: string, rev?: number) =>
+  (await (
+    await request('POST', `entries/${q(id)}/retract`, { body: { reason }, user, headers: ifMatch(rev) })
+  ).json()) as Entry;
 
 export interface ReleaseCompare {
   from: Entry | null;
@@ -688,8 +743,15 @@ export interface VaultItem {
   updated_at: string;
 }
 
+/** Список метаданных; при заблокированном Vault — `locked: true` и `reason` (значений нет). */
+export interface VaultList {
+  items: VaultItem[];
+  locked?: boolean;
+  reason?: string;
+}
+
 export const listVault = (user: string, space: string) =>
-  call<{ items: VaultItem[] }>('GET', `spaces/${q(space)}/vault`, undefined, user);
+  call<VaultList>('GET', `spaces/${q(space)}/vault`, undefined, user);
 
 /** Значение секрета: ответ `no-store`, раскрытие записывается в аудит. */
 export async function revealVault(user: string, id: string): Promise<string> {
@@ -742,22 +804,206 @@ export const revokeAccess = (guid: string, user: string) =>
 
 // ---- настройки сервера (администратор) ----
 
+/** Агент блока инструкции (§15.5): Claude Code, AGENTS.md (Codex, Cursor и др.), Codex с хуками. */
+export type AgentKind = 'claude' | 'agents' | 'codex';
+export type Lang = 'ru' | 'en';
+export const AGENT_KINDS: AgentKind[] = ['claude', 'agents', 'codex'];
+export const LANGS: Lang[] = ['ru', 'en'];
+
 export interface Settings {
   rules: { agent_write: boolean };
+  /** Шаблоны блока инструкции: ключ `<agent>.<lang>`, `custom` — свой (не по умолчанию). */
+  agent_setup: { version: number; templates: Record<string, { text: string; custom: boolean }> };
 }
 
 export const getSettings = () => call<Settings>('GET', 'admin/settings');
 export const setAgentWrite = (on: boolean) =>
   call<Settings>('PATCH', 'admin/settings', { rules: { agent_write: on } });
+/** Сохранить шаблон (`text`) или сбросить к умолчанию (`null`); версия растёт, если текст изменился. */
+export const saveTemplate = (key: string, text: string | null) =>
+  call<Settings>('PATCH', 'admin/settings', { agent_setup: { templates: { [key]: text } } });
+
+export interface TemplatePreview {
+  block: string;
+  tokens: number;
+  warnings: string[];
+  version: number;
+  /** Версия после сохранения (равна `version`, если текст не меняется). */
+  version_next: number;
+}
+
+/** Предпросмотр несохранённого шаблона (с примером решения). */
+export const previewTemplate = (agent: AgentKind, lang: Lang, template: string) =>
+  call<TemplatePreview>('POST', 'admin/agent-setup/preview', { agent, lang, template });
+
+// ---- подключение агента (§15.5) ----
+
+export interface AgentSetupQuery {
+  agent: AgentKind;
+  /** `auto` — агент создаст сам (`zam init`), `new` — новый GUID, иначе GUID решения. */
+  solution: string;
+  name?: string;
+  mcp: boolean;
+  hooks: boolean;
+  /** `undefined` — по настройке сервера `rules.agent_write`. */
+  rulesWrite?: boolean;
+  lang: Lang;
+  /** `--token '<токен>'` в `init_cmd`: заглушку подставляет браузер (`withToken`). Открытый
+   * текст токена WebUI серверу в адресе не передаёт (журналы прокси). */
+  tokenPlaceholder?: boolean;
+}
+
+export interface AgentSetup {
+  version: number;
+  agent: AgentKind;
+  lang: Lang;
+  url: string;
+  block: string;
+  tokens: number;
+  tokens_exact: boolean;
+  warnings: string[];
+  template_custom: boolean;
+  solution?: { agent_solution_id: string; name: string };
+  solution_toml?: string;
+  mcp_json?: unknown;
+  claude_settings?: unknown;
+  codex_hooks?: unknown;
+  install: { windows: string; linux: string };
+  init_cmd: { linux: string; windows: string };
+}
+
+/** `GET /agent-setup`; администратор — для пользователя `user` (`X-Zam-User`). */
+export function agentSetup(f: AgentSetupQuery, user?: string) {
+  const p = new URLSearchParams({
+    agent: f.agent,
+    solution: f.solution,
+    mcp: String(f.mcp),
+    hooks: String(f.hooks),
+    lang: f.lang,
+  });
+  if (f.name) p.set('name', f.name);
+  if (f.rulesWrite !== undefined) p.set('rules_write', String(f.rulesWrite));
+  if (f.tokenPlaceholder) p.set('token_placeholder', 'true');
+  return call<AgentSetup>('GET', `agent-setup?${p}`, undefined, user);
+}
+
+/** Заглушка токена сервера в кавычках оболочки (`'<токен>'`, POSIX shell и PowerShell). */
+const TOKEN_SLOT = "'<токен>'";
+
+/** Ответ `/agent-setup` с открытым токеном вместо заглушки — только в командах установки и
+ * `zam init` (в блоке и `.mcp.json` токена нет). Токен — `zam_` и base62: кавычки не нужны. */
+export function withToken(s: AgentSetup, token: string): AgentSetup {
+  if (!/^zam_[0-9A-Za-z]+$/.test(token)) return s;
+  const put = (t: string) => t.split(TOKEN_SLOT).join(`'${token}'`);
+  return {
+    ...s,
+    install: { windows: put(s.install.windows), linux: s.install.linux },
+    init_cmd: { linux: put(s.init_cmd.linux), windows: put(s.init_cmd.windows) },
+  };
+}
+
+// ---- настройки пользователя: типы подсказок хуков (§10.3, R5) ----
+
+export type HookKind = 'session_start' | 'prompt' | 'pre_tool' | 'post_tool' | 'checkpoint';
+export const HOOK_KINDS: HookKind[] = ['session_start', 'prompt', 'pre_tool', 'post_tool', 'checkpoint'];
+export type HookFlags = Record<HookKind, boolean>;
+
+/** Свои настройки (`own`) или пользователя `userId` (администратор). */
+const settingsPath = (userId: string | null) =>
+  userId ? `admin/users/${q(userId)}/settings` : 'auth/settings';
+export const getUserSettings = (userId: string | null) =>
+  call<{ hooks: HookFlags }>('GET', settingsPath(userId));
+export const setUserHooks = (userId: string | null, hooks: Partial<HookFlags>) =>
+  call<{ hooks: HookFlags }>('PATCH', settingsPath(userId), { hooks });
+
+// ---- кэш выжимок (§9.4, §15.4) ----
+
+export interface CacheSource {
+  /** `n:<id>` | `e:<id>`. */
+  id: string;
+  rev: number;
+  section: string | null;
+}
+
+export interface CacheStale {
+  target: string;
+  section?: string;
+  /** `changed` | `deleted` | `superseded` | `retracted` | `new_sources`. */
+  reason: string;
+}
+
+export interface CacheItem {
+  id: string;
+  ref: string;
+  query: string;
+  summary: string;
+  tokens: number;
+  state: 'valid' | 'stale';
+  stale: CacheStale[];
+  sources: CacheSource[];
+  author_user_id: string;
+  author: string | null;
+  session_id: string | null;
+  machine: string | null;
+  area: string | null;
+  created_at: string;
+  last_used_at: string;
+  hits: number;
+  promoted_to: string | null;
+  space_id: string;
+  space?: string;
+  agent_solution_id?: string;
+  /** Ответ `promote`: созданная заметка или запись. */
+  promoted?: unknown;
+}
+
+export interface CacheQuery {
+  q?: string;
+  solution?: string;
+  state?: 'valid' | 'stale';
+  author?: string;
+  limit?: number;
+}
+
+/** Выжимки личной базы или решения `solution`; администратор — пользователя `user`. */
+export function listCache(f: CacheQuery, user?: string) {
+  const p = new URLSearchParams();
+  if (f.q) p.set('q', f.q);
+  if (f.solution) p.set('solution', f.solution);
+  if (f.state) p.set('state', f.state);
+  if (f.author) p.set('author', f.author);
+  if (f.limit) p.set('limit', String(f.limit));
+  return call<{ items: CacheItem[] }>('GET', `cache?${p}`, undefined, user);
+}
+export const getCache = (id: string, user?: string) =>
+  call<CacheItem>('GET', `cache/${q(id)}`, undefined, user);
+export const deleteCache = (id: string, user?: string) =>
+  call<void>('DELETE', `cache/${q(id)}`, undefined, user);
+/** «Превратить в заметку» (`path` — по умолчанию `Выжимки/<запрос>`) или в insight. */
+export const promoteCache = (
+  id: string,
+  to: { as: 'note'; path?: string } | { as: 'insight'; kind?: string },
+  user?: string,
+) => call<CacheItem>('POST', `cache/${q(id)}/promote`, to, user);
+
+// ---- оценки и показы записей (§10.5) ----
+
+export interface UsageCounts {
+  shown: number;
+  useful: number;
+  useless: number;
+}
+
+/** Оценка полезности записи; из WebUI сервер пишет источник `webui`. */
+export const entryFeedback = (user: string, id: string, value: 'useful' | 'useless') =>
+  call<void>('POST', `entries/${q(id)}/feedback`, { value }, user);
 
 // ---- понятные сообщения об ошибках (RFC 9457) ----
 
 const CERTAINTY_TEXT: Record<string, string> = {
-  'axiom-requires-human': 'Статус axiom ставит, меняет и снимает только человек.',
   'evidence-required':
     'Для theorem нужно доказательство: что проверено, каким методом и с каким результатом.',
   'reason-required': 'Укажите причину смены статуса надёжности.',
-  'invalid-transition': 'Такой переход статуса надёжности недопустим.',
 };
 
 const ACCESS_TEXT: Record<string, string> = {
@@ -781,10 +1027,16 @@ export function errorText(e: unknown): string {
   if (type === '/problems/idempotency-mismatch')
     return `Повтор запроса с тем же ключом, но другим содержимым: ${e.message}`;
   if (type === '/problems/possible-duplicate') return `Похоже на уже записанный insight: ${e.message}`;
+  if (e.status === 409 && typeof p?.rev === 'number')
+    return `Запись изменилась (сейчас ревизия ${p.rev}): перечитайте и повторите.`;
   if (e.status === 404) return 'Не найдено: запись удалена или недоступна.';
   if (e.status === 403) return `Недостаточно прав: ${e.message}`;
   return e.message;
 }
+
+/** 409 устаревшей ревизии записи журнала (§11.3): в problem — `rev` текущей. */
+export const isStaleEntry = (e: unknown): boolean =>
+  e instanceof ApiError && e.status === 409 && typeof e.problem?.rev === 'number';
 
 /** 503 `/problems/vault-locked`. */
 export const isVaultLocked = (e: unknown): boolean =>

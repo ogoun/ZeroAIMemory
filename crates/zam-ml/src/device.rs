@@ -92,8 +92,8 @@ fn session(
 ) -> Result<Session, MlError> {
     let mut b = Session::builder(env)?
         .with_optimization_level(GraphOptimizationLevel::All)?
-        // 0 — решение ORT (число физических ядер)
-        .with_intra_threads(threads)?
+        // 0 — решение ORT (число физических ядер); маска CPU не {0..n-1} (LXC, cpuset) — явно
+        .with_intra_threads(intra_threads(threads))?
         // фоновый сервис: без активного ожидания потоков между вызовами
         .with_intra_op_spinning(false)?
         // перепакованные веса MatMul общие для двух сессий
@@ -105,6 +105,65 @@ fn session(
             .error_on_failure()])?;
     }
     Ok(b.commit_from_file(model)?)
+}
+
+/// Число потоков intra-op для ORT. `0` — решение ORT: по потоку на физическое ядро **с
+/// привязкой** к CPU с номерами `0, 1, …`. Если маска процесса — не `{0, 1, …, n−1}`
+/// (cpuset с частью ядер, LXC с «чужими» номерами CPU: стенд Debian 13 — `39,55`), ORT
+/// привязывает потоки к CPU вне маски и пишет ERROR `pthread_setaffinity_np failed … error
+/// code: 22`. При явном числе потоков ORT привязку не ставит (её задаёт только
+/// `session.intra_op_thread_affinities`) — поэтому для такой маски число задаётся явно: число
+/// CPU в маске **[решение контроллера, fix round 1 задачи 14 M4, M-8]**. На обычной машине маска
+/// `{0..n−1}`, на Windows маска не читается — поведение ORT прежнее.
+fn intra_threads(requested: usize) -> usize {
+    if requested != 0 {
+        return requested;
+    }
+    own_cpus().map_or(0, |cpus| explicit_threads_for(&cpus))
+}
+
+/// `0` (решает ORT), если CPU маски — ровно `0..n`; иначе число CPU маски.
+fn explicit_threads_for(cpus: &[usize]) -> usize {
+    let mut v = cpus.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    if v.iter().enumerate().all(|(i, &c)| i == c) {
+        0
+    } else {
+        v.len()
+    }
+}
+
+/// Маска CPU процесса (`Cpus_allowed_list` из `/proc/self/status`, как `sched_getaffinity`).
+#[cfg(target_os = "linux")]
+fn own_cpus() -> Option<Vec<usize>> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = s.lines().find(|l| l.starts_with("Cpus_allowed_list:"))?;
+    parse_cpu_list(line.split_once(':')?.1.trim())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn own_cpus() -> Option<Vec<usize>> {
+    None
+}
+
+/// Список CPU ядра Linux (`0-3,8-11,15`) → номера CPU.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let mut v = Vec::new();
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+                if b < a || b - a > 65_536 {
+                    return None;
+                }
+                v.extend(a..=b);
+            }
+            None => v.push(part.parse().ok()?),
+        }
+    }
+    (!v.is_empty()).then_some(v)
 }
 
 fn pair(
@@ -228,4 +287,38 @@ pub(crate) fn build_session_pool(
             .map(|_| session(env, model, threads, &pw, cuda))
             .collect()
     })
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    /// Список CPU ядра Linux (`Cpus_allowed_list`).
+    #[test]
+    fn cpu_list_parsed() {
+        assert_eq!(parse_cpu_list("0-3"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(parse_cpu_list("39,55"), Some(vec![39, 55]));
+        assert_eq!(parse_cpu_list("0-1,8,10-11"), Some(vec![0, 1, 8, 10, 11]));
+        assert_eq!(parse_cpu_list(""), None);
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("x"), None);
+    }
+
+    /// M-8: маска `{0..n−1}` — решает ORT (`0`), иначе явно число CPU маски.
+    #[test]
+    fn explicit_threads_when_mask_not_prefix() {
+        assert_eq!(explicit_threads_for(&[39, 55]), 2);
+        assert_eq!(explicit_threads_for(&[0, 1]), 0);
+        assert_eq!(explicit_threads_for(&[0, 2]), 2);
+        assert_eq!(explicit_threads_for(&[1, 0, 2, 3]), 0);
+        assert_eq!(explicit_threads_for(&[2, 3]), 2);
+    }
+
+    /// Явное число потоков не меняется.
+    #[test]
+    fn explicit_threads_kept() {
+        assert_eq!(intra_threads(4), 4);
+        let auto = intra_threads(0);
+        assert_eq!(auto, own_cpus().map_or(0, |c| explicit_threads_for(&c)));
+    }
 }

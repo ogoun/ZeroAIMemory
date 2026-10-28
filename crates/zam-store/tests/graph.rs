@@ -423,40 +423,40 @@ async fn rewrite_replaces_derived_keeps_explicit() {
 }
 
 #[tokio::test]
-async fn explicit_edge_axiom_source_requires_human() {
+async fn explicit_edge_axiom_source_allowed_to_agent() {
     let (db, k) = setup("axiom-edge").await;
     let ax = note_by(
         &db,
         k,
         "ax",
-        "---\ncertainty: axiom\n---\nистина\n",
+        "---
+certainty: axiom
+---
+истина
+",
         human(),
     )
     .await;
-    let plain = note(&db, k, "plain", "текст\n").await;
+    let plain = note(
+        &db,
+        k,
+        "plain",
+        "текст
+",
+    )
+    .await;
     let to = |src, dst| NewEdge {
         src: n(src),
         dst: n(dst),
         kind: EdgeType::DependsOn,
     };
-    // ребро от аксиомы — часть её утверждения: только человек
-    let r = db.add_edge(to(ax, plain), &agent()).await;
-    assert!(
-        matches!(
-            r,
-            Err(StoreError::Certainty(
-                zam_store::CertaintyError::AxiomRequiresHuman
-            ))
-        ),
-        "{r:?}"
-    );
-    // ссылаться на аксиому агент может
+    // с M4 ребро от аксиомы и к ней агент создаёт и удаляет сам (§8.5, решение владельца
+    // 2026-10-26: ruling R10 снят)
+    let from_ax = db.add_edge(to(ax, plain), &agent()).await.unwrap();
     db.add_edge(to(plain, ax), &agent()).await.unwrap();
+    db.remove_edge(from_ax.id, &agent()).await.unwrap();
     let by_human = db.add_edge(to(ax, plain), &human()).await.unwrap();
-    // и удалить ребро от аксиомы агент не может
-    let r = db.remove_edge(by_human.id, &agent()).await;
-    assert!(matches!(r, Err(StoreError::Certainty(_))), "{r:?}");
-    db.remove_edge(by_human.id, &human()).await.unwrap();
+    db.remove_edge(by_human.id, &agent()).await.unwrap();
     // supersedes явным не бывает; несуществующая цель — NotFound; петля — BadInput
     let r = db
         .add_edge(
@@ -613,7 +613,7 @@ async fn supersede_creates_system_edge() {
         .await
         .unwrap()
         .0;
-    let (new, _) = supersede_entry(&db, old.id, insight(k, "новый вывод", None), &agent())
+    let (new, _) = supersede_entry(&db, old.id, None, insight(k, "новый вывод", None), &agent())
         .await
         .unwrap();
     let edges = out(&db, e(new.id)).await;

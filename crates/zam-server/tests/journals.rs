@@ -203,9 +203,13 @@ async fn changelog_crud_idempotency_and_revisions() {
         )
         .await;
     assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
-    // без If-Match правка допустима
+    // без If-Match — 428 (§11.3, M4), с ревизией из GET — правка
     let r =
-        w.a.tok(
+        w.a.tok(&w.a_tok, Method::PATCH, &uri, Some(json!({"tags": ["x"]})))
+            .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_REQUIRED, "{}", r.text());
+    let r =
+        w.a.tok_rev(
             &w.a_tok,
             Method::PATCH,
             &uri,
@@ -217,7 +221,7 @@ async fn changelog_crud_idempotency_and_revisions() {
     assert!(r.json()["area"].is_null());
     // неверный data при правке — 422
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.a_tok,
             Method::PATCH,
             &uri,
@@ -234,7 +238,7 @@ async fn changelog_crud_idempotency_and_revisions() {
     assert_eq!(revs[2]["tags"], json!(["export", "v2"]));
 
     // удаление: запись не читается, повтор создания по ключу — 409, восстановление возвращает
-    let r = w.a.tok(&w.a_tok, Method::DELETE, &uri, None).await;
+    let r = w.a.tok_rev(&w.a_tok, Method::DELETE, &uri, None).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     assert_eq!(w.get(&w.a_tok, &uri).await.status, StatusCode::NOT_FOUND);
     let r = w.post(&w.a_tok, body.clone(), Some("k-1")).await;
@@ -464,7 +468,7 @@ async fn release_version_unique_409() {
     let r2 = w.release("3.0.0", "").await;
     let uri = format!("/api/v1/entries/{}", id_of(&r2));
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.a_tok,
             Method::PATCH,
             &uri,
@@ -473,7 +477,7 @@ async fn release_version_unique_409() {
         .await;
     assert_eq!(r.status, StatusCode::CONFLICT);
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.a_tok,
             Method::PATCH,
             &uri,
@@ -483,7 +487,7 @@ async fn release_version_unique_409() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     // удалённый релиз освобождает версию
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.a_tok,
             Method::DELETE,
             &format!("/api/v1/entries/{}", id_of(&r1)),
@@ -554,10 +558,10 @@ async fn ro_member_cannot_log_403() {
     // править и удалять — нельзя
     let uri = format!("/api/v1/entries/{}", id_of(&e));
     let r =
-        w.a.tok(&w.b_tok, Method::PATCH, &uri, Some(json!({"title": "z"})))
+        w.a.tok_rev(&w.b_tok, Method::PATCH, &uri, Some(json!({"title": "z"})))
             .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
-    let r = w.a.tok(&w.b_tok, Method::DELETE, &uri, None).await;
+    let r = w.a.tok_rev(&w.b_tok, Method::DELETE, &uri, None).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     // токен ro владельца
     let ro = w.a.issue(&w.a_id, "ro").await;
@@ -596,7 +600,7 @@ async fn member_entry_written_to_owner_db_attributed_to_member() {
     let uri = format!("/api/v1/entries/{}", id_of(&e));
     assert_eq!(w.get(&w.a_tok, &uri).await.status, StatusCode::OK);
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.b_tok,
             Method::PATCH,
             &uri,
@@ -660,11 +664,13 @@ async fn member_cannot_read_owner_knowledge_entry_404() {
         StatusCode::NOT_FOUND
     );
     let r =
-        w.a.tok(&w.b_tok, Method::PATCH, &uri, Some(json!({"title": "z"})))
+        w.a.tok_rev(&w.b_tok, Method::PATCH, &uri, Some(json!({"title": "z"})))
             .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
     assert_eq!(
-        w.a.tok(&w.b_tok, Method::DELETE, &uri, None).await.status,
+        w.a.tok_rev(&w.b_tok, Method::DELETE, &uri, None)
+            .await
+            .status,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
@@ -685,7 +691,7 @@ async fn restore_release_with_taken_version_409() {
     let w = world("restore-ver", None).await;
     let r1 = w.release("1.0.0", "старый").await;
     let uri = format!("/api/v1/entries/{}", id_of(&r1));
-    let r = w.a.tok(&w.a_tok, Method::DELETE, &uri, None).await;
+    let r = w.a.tok_rev(&w.a_tok, Method::DELETE, &uri, None).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     let r2 = w.release("1.0.0", "новый").await;
     let r =
@@ -696,7 +702,7 @@ async fn restore_release_with_taken_version_409() {
     assert_eq!(w.get(&w.a_tok, &uri).await.status, StatusCode::NOT_FOUND);
     // освободили версию — восстановление проходит
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.a_tok,
             Method::DELETE,
             &format!("/api/v1/entries/{}", id_of(&r2)),
@@ -722,7 +728,7 @@ async fn release_patch_merges_data_and_retry_without_date_is_idempotent() {
     let uri = format!("/api/v1/entries/{}", id_of(&e));
     // PATCH меняет только версию: date, git_tag и commits сохраняются
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.a_tok,
             Method::PATCH,
             &uri,
@@ -737,7 +743,7 @@ async fn release_patch_merges_data_and_retry_without_date_is_idempotent() {
     assert_eq!(d["commits"][0]["sha"], "a");
     // смена даты правкой не мешает повтору исходного запроса (как после полуночи UTC)
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.a_tok,
             Method::PATCH,
             &uri,
@@ -765,7 +771,7 @@ async fn empty_title_is_422_and_compare_not_truncated() {
     }
     let e = w.changelog("fix", "ok").await;
     let r =
-        w.a.tok(
+        w.a.tok_rev(
             &w.a_tok,
             Method::PATCH,
             &format!("/api/v1/entries/{}", id_of(&e)),

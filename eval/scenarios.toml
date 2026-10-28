@@ -1,0 +1,117 @@
+# Сценарии расхода токенов eval M4 (ТЗ §9.3, §18.2; задача 15 M4): вопрос агента → источники,
+# которые агент должен прочитать, чтобы ответить. Формат и правила — eval/README.md, раздел
+# «Расход токенов».
+#
+# Прогон `cargo xtask eval --tokens` на корпусе eval/corpus и insight eval/insights.toml для каждого
+# сценария меряет три пути (у каждого — своя сессия `X-Zam-Session`):
+# - (а) протокол §9.3: `POST /search` `mode=brief` (md, бюджет по умолчанию 800) → агент выбирает
+#   из карточек ожидаемые источники → `POST /read` выбранных (md, L2, бюджет 4000 — как у пути
+#   (в)) → `POST /cache` выжимки;
+# - (б) повтор того же вопроса другой сессией: `POST /search` `mode=brief` — выжимка кэша первым
+#   элементом;
+# - (в) «наивный» путь: `POST /search` `mode=chunks`, `budget_tokens = 4000`, без кэша.
+# Метрика — токены ответов сервера (токенизатор bge-m3) и полнота: все ожидаемые источники
+# прочитаны (а), выжимка действительна и основана на них (б), есть в выдаче (в).
+#
+# `expect` — пути заметок корпуса или `insight:<key>`; вопросы — своими словами агента, не текст
+# запросов queries.toml.
+
+[[scenario]]
+id = "s-01"
+question = "почему bash-скрипт из репозитория падает в Linux, а на Windows всё нормально, и как настроить git"
+expect = ["ru/windows/crlf-bash-scripts", "ru/windows/git-autocrlf-gitattributes"]
+
+[[scenario]]
+id = "s-02"
+question = "в консоли Windows русские буквы выводятся кракозябрами, как исправить"
+expect = ["ru/windows/powershell-encoding", "ru/windows/cmd-chcp-65001"]
+
+[[scenario]]
+id = "s-03"
+question = "how do I safely rewrite history of my branch and push it"
+expect = ["en/git/interactive-rebase-autosquash", "en/git/merge-vs-rebase", "en/git/force-with-lease"]
+
+[[scenario]]
+id = "s-04"
+question = "нужно выбросить локальные изменения и лишние файлы из рабочей копии"
+expect = ["ru/git/revert-vs-reset", "ru/git/clean-fdx"]
+
+[[scenario]]
+id = "s-05"
+question = "container got killed with exit code 137, was it the container limit or the host OOM killer"
+expect = ["en/linux/oom-killer-dmesg", "en/docker/exit-code-137-container-oom"]
+
+[[scenario]]
+id = "s-06"
+question = "как забэкапить данные контейнера и не дать его логам заполнить диск"
+expect = ["ru/docker/named-volume-backup", "ru/docker/container-log-rotation"]
+
+[[scenario]]
+id = "s-07"
+question = "speed up our Docker image builds and produce images for arm64 too"
+expect = ["en/docker/multistage-build-layer-cache", "en/docker/buildx-multi-arch"]
+
+[[scenario]]
+id = "s-08"
+question = "выбираю между Mutex и RwLock для общего состояния, и у нас был дедлок"
+expect = ["ru/rust/arc-mutex-deadlock", "ru/rust/rwlock-vs-mutex"]
+
+[[scenario]]
+id = "s-09"
+question = "set up cargo features, shared workspace dependencies and a build script that does not rerun every time"
+expect = ["en/rust/cargo-feature-unification-resolver", "en/rust/workspace-dependencies-and-profiles", "en/rust/build-rs-rerun-if-changed"]
+
+[[scenario]]
+id = "s-10"
+question = "как агенту экономить контекст при чтении памяти ZeroAIMemory"
+expect = ["ru/zam/l0-l1-levels", "ru/zam/hybrid-search-rrf"]
+
+[[scenario]]
+id = "s-11"
+question = "как сервер управляет процессом Qdrant и восстанавливает векторный индекс"
+expect = ["ru/zam/qdrant-managed-process", "ru/zam/index-jobs-outbox", "ru/zam/reindex-from-embeddings"]
+
+[[scenario]]
+id = "s-12"
+question = "what are the alternatives to single-vector dense retrieval: late interaction and learned sparse"
+expect = ["en/research/colbert-late-interaction", "en/research/learned-sparse-splade"]
+
+[[scenario]]
+id = "s-13"
+question = "как считать метрики качества поиска и доверительные интервалы к ним"
+expect = ["ru/research/metriki-ir", "ru/research/butstrep-intervaly"]
+
+[[scenario]]
+id = "s-14"
+question = "как в проекте на Python держать зависимости и виртуальные окружения"
+expect = ["ru/devtools/python-venv", "ru/devtools/uv-package-manager", "ru/devtools/pyproject-editable-install"]
+
+[[scenario]]
+id = "s-15"
+question = "review our GitHub Actions setup: matrix builds, concurrency, caches and secrets in PR workflows"
+expect = ["en/devtools/gha-matrix-strategy", "en/devtools/gha-workflow-concurrency", "en/devtools/gha-cache-keys", "en/devtools/gha-pull-request-target-secrets"]
+
+[[scenario]]
+id = "s-16"
+question = "внешний сервис отвечает медленно: какие таймауты и повторы ставить"
+expect = ["ru/ops/timeouts", "ru/ops/retries-backoff-jitter"]
+
+[[scenario]]
+id = "s-17"
+question = "postgres is slow and runs out of connections under load"
+expect = ["en/db/postgres-explain-analyze", "en/db/connection-pool-exhaustion"]
+
+[[scenario]]
+id = "s-18"
+question = "настрой SQLite под конкурентную запись и чтобы файл базы не разрастался"
+expect = ["ru/db/sqlite-wal", "ru/db/sqlite-busy-timeout", "ru/db/sqlite-vacuum"]
+
+[[scenario]]
+id = "s-19"
+question = "robocopy в скрипте вернул ненулевой код — это ошибка?"
+expect = ["insight:p09-t"]
+
+[[scenario]]
+id = "s-20"
+question = "можно ли включать Docker для запуска Qdrant в разработке"
+expect = ["insight:p12-a", "insight:p02-t"]

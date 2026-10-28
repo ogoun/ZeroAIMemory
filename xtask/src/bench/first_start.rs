@@ -48,8 +48,9 @@ use crate::eval::run::Session;
 const SETTLE_LIMIT: Duration = Duration::from_secs(180);
 /// Предел штатной остановки сервера.
 const STOP_LIMIT: Duration = Duration::from_secs(120);
-/// Умолчание `qdrant.flush_interval_sec` сервера (если вариант его не задаёт).
-const DEFAULT_FLUSH_SEC: u64 = 5;
+/// Умолчание `qdrant.flush_interval_sec` сервера (если вариант его не задаёт): 3 с с M4
+/// (`zam_index::supervisor::DEFAULT_FLUSH_INTERVAL_SEC`, решение владельца 2026-10-26).
+const DEFAULT_FLUSH_SEC: u64 = 3;
 
 /// Параметры сценария (из `BenchArgs`).
 #[derive(Debug, Clone)]
@@ -855,7 +856,8 @@ mod tests {
 
     #[test]
     fn settle_from_flush_interval() {
-        assert_eq!(settle(&[]), Duration::from_secs(18));
+        // умолчание M4 — 3 с: 2 × 3 + 8
+        assert_eq!(settle(&[]), Duration::from_secs(14));
         let sets = vec![("qdrant.flush_interval_sec".to_string(), "1".to_string())];
         assert_eq!(settle(&sets), Duration::from_secs(10));
     }

@@ -2,7 +2,8 @@
   // Vault (§7.6): секреты пользователя в области пространства — метаданные и маска; «Показать»
   // запрашивает значение (`?reveal=1`, ответ no-store, раскрытие записывается в аудит).
   // Значение живёт в состоянии только пока показано (не дольше REVEAL_MS), в консоль и
-  // хранилища браузера не попадает. Без мастер-ключа — баннер vault-locked.
+  // хранилища браузера не попадает. Без мастер-ключа список виден (`locked: true` в ответе),
+  // «Показать» неактивна, над списком — баннер vault-locked (§7.6).
   import { onDestroy, untrack } from 'svelte';
   import {
     ApiError,
@@ -87,7 +88,10 @@
     locked = null;
     try {
       const r = await listVault(u, s);
-      if (my === seq) items = r.items;
+      if (my === seq) {
+        items = r.items;
+        if (r.locked) locked = r.reason || 'Vault заблокирован';
+      }
     } catch (e) {
       if (my !== seq) return;
       items = [];

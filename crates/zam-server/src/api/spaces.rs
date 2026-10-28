@@ -1,8 +1,7 @@
 //! `GET /spaces` — пространства пользователя запроса (§6.3, §11.6; токену — без Human):
 //! личные (свои решения — `role: owner`, `shared`: есть одобренные участники) и
 //! пространства чужих решений из баз владельцев (`role: member`, `access`, `owner`);
-//! `access_requests_pending` — ожидающие запросы к решениям пользователя; `human` — запрос
-//! пишет как человек (сессия WebUI или человеческий токен, §7.5).
+//! `access_requests_pending` — ожидающие запросы к решениям пользователя.
 //! `GET /spaces/{space}/tree` — дерево узлов пространства.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
@@ -61,15 +60,15 @@ pub async fn list(
         }
     }
     let pending = st.system.pending_requests_for_owner(user.id).await?;
-    let (access, human) = match &p {
-        Principal::Token(t) => (t.access.as_str(), t.human),
-        Principal::Admin { .. } => ("admin", true),
+    let access = match &p {
+        Principal::Token(t) => t.access.as_str(),
+        // сессия пользователя — как его `rw`-токен (§11.4)
+        Principal::User { .. } => "rw",
+        Principal::Admin { .. } => "admin",
     };
     Ok(Json(json!({
         "user": { "id": user.id, "name": user.name },
         "access": access,
-        // запись как человек (§7.5): сессия WebUI или человеческий токен
-        "human": human,
         "spaces": spaces,
         "access_requests_pending": pending,
     })))

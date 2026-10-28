@@ -8,6 +8,8 @@
 //!   замена сводки заметки или секции лучшим листом ([`note_to_leaf`], §9.2 п. 6), затем не
 //!   больше `max_per_node` элементов с узла ([`cap_per_node`]).
 //! - [`pack`] — упаковка в `budget_tokens` по числу токенов элементов.
+//! - [`recall`] — проактивное вспоминание `/recall` (§10.3): нормализация ошибки, `error_regex`,
+//!   строки подсказок, упаковка дайджеста в бюджет.
 //!
 //! Сервер готовит входы (каналы — списки `chunk_id` по убыванию релевантности, метаданные
 //! чанков из SQLite) и превращает результат в ответ. Векторный хит без метаданных
@@ -17,10 +19,12 @@
 pub mod adjust;
 pub mod hybrid;
 pub mod pack;
+pub mod recall;
 
 pub use adjust::{
-    Boosts, LeafRef, RECENCY_FLOOR, apply_boosts, cap_per_node, drop_unresolved_tail, in_section,
-    note_to_leaf, recency_factor, rescale_overflow, summaries_without_leaf,
+    Boosts, LeafRef, RECENCY_FLOOR, apply_boosts, apply_boosts_to, cap_per_node,
+    drop_unresolved_tail, in_section, note_to_leaf, overflow_divisor, recency_factor,
+    rescale_overflow, summaries_without_leaf,
 };
 pub use hybrid::{
     Channel, ChunkMeta, FolderHit, Level, Ranked, SearchInputs, Weights, folder_score, fuse,

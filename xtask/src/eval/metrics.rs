@@ -195,6 +195,97 @@ pub fn estimate_with(values: &[f64], samples: usize) -> Estimate {
     }
 }
 
+/// Отношение сумм `Σ num / Σ den` по случаям с 95 % интервалом бутстрепа случаев (то же зерно,
+/// [`BOOTSTRAP`] выборок; выборка с нулевым знаменателем пропускается). `None` — знаменатель
+/// пуст (например, точность подсказок, когда не показано ни одной).
+pub fn ratio_estimate(num: &[f64], den: &[f64]) -> Option<Estimate> {
+    assert_eq!(
+        num.len(),
+        den.len(),
+        "числитель и знаменатель по одним случаям"
+    );
+    let total: f64 = den.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let m = num.iter().sum::<f64>() / total;
+    if num.len() < 2 {
+        return Some(Estimate {
+            mean: m,
+            lo: m,
+            hi: m,
+        });
+    }
+    let mut rng = Rng(SEED);
+    let mut ratios: Vec<f64> = Vec::with_capacity(BOOTSTRAP);
+    for _ in 0..BOOTSTRAP {
+        let (mut n, mut d) = (0.0, 0.0);
+        for _ in 0..num.len() {
+            let i = rng.below(num.len());
+            n += num[i];
+            d += den[i];
+        }
+        if d > 0.0 {
+            ratios.push(n / d);
+        }
+    }
+    ratios.sort_by(f64::total_cmp);
+    Some(Estimate {
+        mean: m,
+        lo: percentile(&ratios, 0.025),
+        hi: percentile(&ratios, 0.975),
+    })
+}
+
+/// Парная разность отношений сумм `b − a` по одним случаям (`Σ num / Σ den` у каждого) с 95 %
+/// интервалом бутстрепа случаев (выборка случаев общая для обоих; выборка с нулевым знаменателем
+/// у одного из них пропускается). `None` — знаменатель одного из отношений пуст.
+pub fn paired_ratio_diff(
+    a_num: &[f64],
+    a_den: &[f64],
+    b_num: &[f64],
+    b_den: &[f64],
+) -> Option<Estimate> {
+    let n = a_num.len();
+    assert!(
+        a_den.len() == n && b_num.len() == n && b_den.len() == n,
+        "парное сравнение на одних случаях"
+    );
+    let sum = |v: &[f64]| v.iter().sum::<f64>();
+    if sum(a_den) <= 0.0 || sum(b_den) <= 0.0 {
+        return None;
+    }
+    let m = sum(b_num) / sum(b_den) - sum(a_num) / sum(a_den);
+    if n < 2 {
+        return Some(Estimate {
+            mean: m,
+            lo: m,
+            hi: m,
+        });
+    }
+    let mut rng = Rng(SEED);
+    let mut d: Vec<f64> = Vec::with_capacity(BOOTSTRAP);
+    for _ in 0..BOOTSTRAP {
+        let (mut an, mut ad, mut bn, mut bd) = (0.0, 0.0, 0.0, 0.0);
+        for _ in 0..n {
+            let i = rng.below(n);
+            an += a_num[i];
+            ad += a_den[i];
+            bn += b_num[i];
+            bd += b_den[i];
+        }
+        if ad > 0.0 && bd > 0.0 {
+            d.push(bn / bd - an / ad);
+        }
+    }
+    d.sort_by(f64::total_cmp);
+    Some(Estimate {
+        mean: m,
+        lo: percentile(&d, 0.025),
+        hi: percentile(&d, 0.975),
+    })
+}
+
 /// Доля: `true` — 1, `false` — 0.
 fn flag(b: Option<bool>) -> Option<f64> {
     b.map(|b| if b { 1.0 } else { 0.0 })

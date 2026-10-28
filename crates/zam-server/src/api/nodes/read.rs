@@ -7,7 +7,9 @@
 //! - `tier=L0` → `{l0, rev}` (сводка текущей ревизии);
 //! - `tier=L1` → `{l1, rev}`: `note_l1` (§8.3) — оглавление и первое предложение каждой
 //!   секции строками `<отступ><заголовок> — <предложение>`, ≤ 1200 символов; `L2` — полный текст;
-//! - `section="A > B"` → только байты секции (нет — 404, неоднозначно — 422);
+//! - `section="A > B"` → только байты секции (нет — 404, неоднозначно — 422). Путь — заголовки
+//!   от верхнего; если такого полного пути нет, подходит **хвост** пути (`Тесты` для
+//!   `Сборка > Тесты`), когда он однозначен **[решение исполнителя, проверка на стенде M4]**;
 //! - `rev=N` → старая ревизия.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
@@ -17,7 +19,10 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use zam_markdown::{NOTE_L1_MAX_CHARS, OutlineItem, note_l1, outline as doc_outline, parse};
+use zam_markdown::{
+    NOTE_L1_MAX_CHARS, OutlineItem, SectionLookup, note_l1, outline as doc_outline, parse,
+    resolve_section,
+};
 use zam_store::{NodeKind, NodePath, get_node_by_path, node_content};
 
 use crate::api::query;
@@ -47,7 +52,7 @@ enum Format {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tier {
+pub(crate) enum Tier {
     L0,
     L1,
     L2,
@@ -62,7 +67,7 @@ fn parse_format(s: Option<&str>) -> Result<Format, ApiError> {
     }
 }
 
-fn parse_tier(s: Option<&str>) -> Result<Tier, ApiError> {
+pub(crate) fn parse_tier(s: Option<&str>) -> Result<Tier, ApiError> {
     match s.map(str::to_ascii_uppercase).as_deref() {
         None | Some("L2") => Ok(Tier::L2),
         Some("L0") => Ok(Tier::L0),
@@ -223,29 +228,22 @@ fn sha256_hex(b: &[u8]) -> String {
 }
 
 /// Байты секции `path` (весь её диапазон, с заголовком и подсекциями).
-/// Нет секции → 404, путь у нескольких секций → 422.
-fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
-    let want: Vec<&str> = path.split('>').map(str::trim).collect();
-    if want.iter().any(|p| p.is_empty()) {
-        return Err(ApiError::NotFound);
-    }
-    let doc = parse(text);
-    let mut found = doc
-        .sections
-        .iter()
-        .filter(|s| s.level > 0 && s.path.iter().map(String::as_str).eq(want.iter().copied()));
-    let s = found.next().ok_or(ApiError::NotFound)?;
-    if found.next().is_some() {
-        return Err(ApiError::Unprocessable(format!(
+/// Сначала — полный путь заголовков от верхнего; если такого нет — секции, чей путь
+/// кончается `path` (агент обычно знает только свой заголовок: `Тесты` вместо
+/// `Сборка > Тесты`). Нет секции → 404, путь у нескольких секций → 422.
+pub(crate) fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
+    match resolve_section(&parse(text), path) {
+        SectionLookup::Found(s) => text.get(s.range.clone()).ok_or(ApiError::NotFound),
+        SectionLookup::NotFound => Err(ApiError::NotFound),
+        SectionLookup::Ambiguous => Err(ApiError::Unprocessable(format!(
             "путь секции неоднозначен: {path}"
-        )));
+        ))),
     }
-    text.get(s.range.clone()).ok_or(ApiError::NotFound)
 }
 
 /// L1 (§8.3): оглавление и первое предложение каждой секции — тот же `note_l1`, что
 /// чанкер индексирует как сводку заметки, не длиннее [`NOTE_L1_MAX_CHARS`] символов.
-fn l1(text: &str) -> String {
+pub(crate) fn l1(text: &str) -> String {
     note_l1(text, &parse(text), NOTE_L1_MAX_CHARS)
 }
 
@@ -319,5 +317,26 @@ C"
         ));
         assert!(matches!(section_slice(t, "Q"), Err(ApiError::NotFound)));
         assert!(matches!(section_slice(t, "A >"), Err(ApiError::NotFound)));
+        // стенд Debian 13: хвост пути заголовков, если полного нет и он однозначен
+        let t = "# Сборка\nx\n## Тесты\ny\n### Unit\nu\n";
+        assert_eq!(
+            section_slice(t, "Тесты").unwrap(),
+            "## Тесты\ny\n### Unit\nu\n"
+        );
+        assert_eq!(section_slice(t, "Тесты > Unit").unwrap(), "### Unit\nu\n");
+        assert_eq!(section_slice(t, "Unit").unwrap(), "### Unit\nu\n");
+        assert!(matches!(
+            section_slice(t, "Сборка > Unit"),
+            Err(ApiError::NotFound)
+        ));
+        let t = "# A\n## Тесты\n1\n# B\n## Тесты\n2\n";
+        assert!(matches!(
+            section_slice(t, "Тесты"),
+            Err(ApiError::Unprocessable(_))
+        ));
+        assert_eq!(section_slice(t, "B > Тесты").unwrap(), "## Тесты\n2\n");
+        // полный путь сильнее хвоста: верхний «Тесты» не спорит с «A > Тесты»
+        let t = "# Тесты\n0\n# A\n## Тесты\n1\n";
+        assert_eq!(section_slice(t, "Тесты").unwrap(), "# Тесты\n0\n");
     }
 }

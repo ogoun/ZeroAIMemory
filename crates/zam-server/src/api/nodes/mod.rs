@@ -17,12 +17,9 @@ use crate::app::AppState;
 use crate::auth::{Client, Principal};
 use crate::error::ApiError;
 
-/// Актор аудита: `admin` (сессия WebUI) или id токена.
+/// Актор аудита: `admin`, `user` (сессия WebUI пользователя) или id токена.
 pub(crate) fn actor(p: &Principal) -> String {
-    match p {
-        Principal::Token(t) => t.token_id.to_string(),
-        Principal::Admin { .. } => "admin".into(),
-    }
+    p.actor()
 }
 
 /// Запись аудита операции над узлом; `details` — без текста заметки. `user` — кто
@@ -121,8 +118,9 @@ pub(crate) async fn diff_blocking(
 
 fn patch_error(e: PatchError) -> ApiError {
     match e {
-        PatchError::SectionNotFound(_) | PatchError::Ambiguous(_) | PatchError::Broken(_) => {
-            ApiError::Unprocessable(e.to_string())
-        }
+        PatchError::SectionNotFound(_)
+        | PatchError::SectionNotFoundTail { .. }
+        | PatchError::Ambiguous(_)
+        | PatchError::Broken(_) => ApiError::Unprocessable(e.to_string()),
     }
 }

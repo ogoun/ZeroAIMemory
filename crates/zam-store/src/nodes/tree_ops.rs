@@ -11,7 +11,7 @@
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 
 use super::chunks::{
     frontmatter_tags, index_note, index_state, note_meta, note_prefix, space_kind,
@@ -20,6 +20,7 @@ use super::write::{ensure_ancestors, ensure_free};
 use super::{
     AuthorKind, NODE_COLS, Node, NodeKind, live_by_path, load_node, node_row, revision_text,
 };
+use crate::cache::{StaleKind, invalidate_target};
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::embeddings::embed_key_of;
 use crate::entries::Certainty;
@@ -31,8 +32,8 @@ use crate::{Db, StoreError};
 /// Мягко удаляет узел и всех его живых потомков одной меткой времени; их чанки
 /// удаляются (триггеры убирают их из FTS), заметкам, которые могли попасть в векторный
 /// индекс (не `excluded`), ставится `delete`. Возвращает число помеченных узлов.
-/// Нет узла или он уже удалён → `NotFound`; в поддереве есть заметка `axiom`, а `author` не
-/// человек → `Certainty` (ничего не удалено).
+/// Нет узла или он уже удалён → `NotFound`; права `certainty` поддерева — по матрице (§7.5;
+/// с M4 заметки `axiom` удаляет любой автор).
 pub async fn delete_node(db: &Db, id: Id, author: AuthorKind) -> Result<u64, StoreError> {
     db.write(move |tx| {
         let node = load_node(tx, id)?;
@@ -41,7 +42,7 @@ pub async fn delete_node(db: &Db, id: Id, author: AuthorKind) -> Result<u64, Sto
         }
         let now = fmt_ts(Timestamp::now());
         let ids = subtree(tx, &node, None)?;
-        ensure_no_axiom(tx, &ids, author)?;
+        ensure_may_modify_all(tx, &ids, author)?;
         let mut mark = tx.prepare_cached("UPDATE nodes SET deleted_at = ?2 WHERE id = ?1")?;
         let mut drop_chunks = tx.prepare_cached("DELETE FROM chunks WHERE node_id = ?1")?;
         let mut state = tx.prepare_cached(
@@ -50,6 +51,8 @@ pub async fn delete_node(db: &Db, id: Id, author: AuthorKind) -> Result<u64, Sto
         for &nid in &ids {
             mark.execute(params![nid, now])?;
             drop_chunks.execute([nid])?;
+            // выжимки кэша с этим источником — недействительны (§9.4)
+            invalidate_target(tx, node_ref(nid), StaleKind::Deleted)?;
             let note: Option<(i64, String)> = state
                 .query_row([nid], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
@@ -72,8 +75,7 @@ pub async fn delete_node(db: &Db, id: Id, author: AuthorKind) -> Result<u64, Sto
 /// Путь любого восстанавливаемого узла занят живым → `Conflict`, ничего не меняется.
 /// Чанки заметок пересобираются из текущей ревизии, `index_state` пересчитывается,
 /// индексируемым ставится `upsert` (заменяя `delete` от удаления).
-/// Нет узла → `NotFound`; узел жив → `BadInput`; среди восстанавливаемых есть заметка `axiom`,
-/// а `author` не человек → `Certainty`.
+/// Нет узла → `NotFound`; узел жив → `BadInput`; права `certainty` — по матрице (§7.5).
 pub async fn restore_node(db: &Db, id: Id, author: AuthorKind) -> Result<Node, StoreError> {
     db.write(move |tx| {
         let node = load_node(tx, id)?;
@@ -92,7 +94,7 @@ pub async fn restore_node(db: &Db, id: Id, author: AuthorKind) -> Result<Node, S
             restored.push(n);
         }
         let restored_ids: Vec<Id> = restored.iter().map(|n| n.id).collect();
-        ensure_no_axiom(tx, &restored_ids, author)?;
+        ensure_may_modify_all(tx, &restored_ids, author)?;
         let mut unmark = tx.prepare_cached("UPDATE nodes SET deleted_at = NULL WHERE id = ?1")?;
         for n in &restored {
             unmark.execute([n.id])?;
@@ -144,8 +146,7 @@ pub async fn list_trash(db: &Db, space_id: Option<Id>) -> Result<Vec<Node>, Stor
 /// заметкам поддерева ставится `upsert` (в payload точек меняются путь и префикс).
 /// Тот же путь → узел без изменений; перенос в собственное поддерево → `BadInput`;
 /// путь занят или предок назначения — заметка → `Conflict`; нет узла или удалён → `NotFound`;
-/// в поддереве (в том числе среди удалённых потомков) есть заметка `axiom`, а `author` не
-/// человек → `Certainty`.
+/// права `certainty` поддерева (в том числе удалённых потомков) — по матрице (§7.5).
 pub async fn move_node(
     db: &Db,
     id: Id,
@@ -175,7 +176,7 @@ pub async fn move_node(
         let moved: Vec<Id> = std::iter::once(id)
             .chain(descendants.iter().map(|d| d.0))
             .collect();
-        ensure_no_axiom(tx, &moved, author)?;
+        ensure_may_modify_all(tx, &moved, author)?;
         ensure_free(tx, node.space_id, &new_path)?;
         // прежние имена и пути: ссылки на них разрешаются заново
         let old_keys: Vec<(String, String)> =
@@ -216,6 +217,8 @@ pub async fn move_node(
         // старые и новые имена и пути пространства — заново
         for &nid in &moved {
             crate::graph::rebuild_moved(tx, nid, &now)?;
+            // путь источника изменился: выжимка могла ссылаться на него (§9.4)
+            invalidate_target(tx, node_ref(nid), StaleKind::Changed)?;
         }
         crate::graph::tree_changed(tx, node.space_id, &moved, &old_keys)?;
         load_node(tx, id)
@@ -223,9 +226,16 @@ pub async fn move_node(
     .await
 }
 
-/// Операция над узлами `ids` (удаление, восстановление, перенос) — по матрице `certainty`:
-/// заметку `axiom` меняет только человек.
-fn ensure_no_axiom(c: &Connection, ids: &[Id], author: AuthorKind) -> Result<(), StoreError> {
+fn node_ref(id: Id) -> TargetRef {
+    TargetRef {
+        kind: TargetKind::Node,
+        id,
+    }
+}
+
+/// Операция над узлами `ids` (удаление, восстановление, перенос) — по матрице `certainty`
+/// (§7.5; с M4 разрешена всем, в том числе у `axiom`).
+fn ensure_may_modify_all(c: &Connection, ids: &[Id], author: AuthorKind) -> Result<(), StoreError> {
     if author == AuthorKind::Human {
         return Ok(());
     }

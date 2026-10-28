@@ -22,7 +22,7 @@ use jiff::Timestamp;
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::entries::Certainty;
@@ -177,7 +177,7 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
 /// Привязывает блоб к живой заметке `node`; возвращает ссылку для Markdown.
 /// Новая пара (узел, sha256, имя) добавляет строку `attachments` и увеличивает
 /// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет. Вложение — изменение
-/// заметки: к заметке `axiom` его добавляет только человек (`author`), иначе `Certainty`.
+/// заметки по матрице `certainty` (`author`; с M4 к `axiom` — любому автору, §7.5).
 pub async fn attach(
     db: &Db,
     node: Id,
@@ -223,6 +223,15 @@ pub async fn attach(
             t.execute(
                 "UPDATE blobs SET refcount = refcount + 1 WHERE sha256 = ?1",
                 [&sha],
+            )?;
+            // новое вложение источника — выжимки кэша по нему недействительны (§9.4)
+            crate::cache::invalidate_target(
+                t,
+                TargetRef {
+                    kind: TargetKind::Node,
+                    id: node,
+                },
+                crate::cache::StaleKind::Changed,
             )?;
         }
         Ok(())

@@ -2,7 +2,8 @@
   import { login } from '../lib/api';
 
   let { onLogin }: { onLogin: () => void } = $props();
-  let name = $state('admin');
+  // вход общий: администратор (логин из конфигурации) или пользователь (имя, §11.4)
+  let name = $state('');
   let password = $state('');
   let error = $state('');
   let busy = $state(false);

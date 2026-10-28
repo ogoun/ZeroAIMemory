@@ -913,3 +913,28 @@ async fn access_matrix_ro_rules_human() {
         .await;
     assert_eq!(r.json()["rev"], 2);
 }
+
+/// Стенд Debian 13 (доработка): PATCH секции — только полный путь; если задан однозначный
+/// хвост, 422 подсказывает полный путь, а текст не меняется.
+#[tokio::test]
+async fn patch_section_tail_hints_full_path() {
+    let a = api("patch-tail", |_| {}).await;
+    let n = a
+        .note(
+            "knowledge",
+            "Сборка",
+            "# Сборка\nmake\n## Тесты\ncargo test\n",
+        )
+        .await;
+    let uri = format!("/api/v1/nodes/{}", id(&n));
+    let patch = |section: &str| json!({"base_rev": 1, "ops": [{"op": "replace_section", "section": section, "content": "x\n"}]});
+    let r = a.t(Method::PATCH, &uri, Some(patch("Тесты"))).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert!(r.text().contains("«Сборка > Тесты»"), "{}", r.text());
+    let md = get(&a, &format!("{uri}?format=md")).await.text();
+    assert_eq!(md, "# Сборка\nmake\n## Тесты\ncargo test\n");
+    let r = a
+        .t(Method::PATCH, &uri, Some(patch("Сборка > Тесты")))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}

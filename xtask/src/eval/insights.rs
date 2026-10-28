@@ -41,7 +41,7 @@ pub struct Insight {
     pub scope: String,
     #[serde(default)]
     pub area: Option<String>,
-    /// `axiom` (создаёт человеческий токен) | `theorem` (с `evidence`) | `hypothesis`; без
+    /// `axiom` | `theorem` (с `evidence`) | `hypothesis`; без
     /// поля — статус по умолчанию агента (`hypothesis`).
     #[serde(default)]
     pub certainty: Option<String>,

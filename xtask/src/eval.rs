@@ -13,17 +13,24 @@
 //!
 //! `--quality-gate` сравнивает int8 (и fp16, если есть CUDA) с fp32-эталоном BAAI
 //! ([`gate`]); `--grid` подбирает веса `[search]` и пороги чанкинга ([`grid`]); `--check`
-//! только проверяет корпус и запросы ([`corpus::validate`]).
+//! только проверяет корпус и запросы ([`corpus::validate`]), а у полного набора — ещё подсказки
+//! и сценарии M4.
+//!
+//! Eval M4 (задача 15): `--hints` — точность подсказок хуков `eval/hints.toml`, калибровка
+//! порогов и задержки `/recall` и хуков ([`hints`]); `--tokens` — расход токенов агента по
+//! сценариям `eval/scenarios.toml` ([`tokens`]).
 
 pub mod compare;
 pub mod corpus;
 pub mod gate;
 pub mod grid;
+pub mod hints;
 pub mod insights;
 pub mod leaves;
 pub mod metrics;
 pub mod report;
 pub mod run;
+pub mod tokens;
 
 use std::path::{Path, PathBuf};
 
@@ -97,9 +104,22 @@ pub struct EvalArgs {
     /// Реранкер вместо выбранного сервером по устройству (ml.rerank_model_cpu|gpu)
     #[arg(long)]
     pub reranker: Option<String>,
-    /// Гейт качества: int8 (и fp16 при доступной CUDA) против fp32-эталона BAAI
-    #[arg(long, conflicts_with_all = ["grid", "check"])]
+    /// Гейт качества: int8 (и fp16 при доступной CUDA) против fp32-эталона BAAI (точный
+    /// поиск Qdrant, `qdrant.exact_search = true`)
+    #[arg(long, conflicts_with_all = ["grid", "check", "hints", "tokens"])]
     pub quality_gate: bool,
+    /// Точность подсказок хуков (eval/hints.toml), калибровка порогов, задержки /recall и хуков
+    #[arg(long, conflicts_with_all = ["grid", "check", "tokens"])]
+    pub hints: bool,
+    /// Расход токенов агента по сценариям eval/scenarios.toml (протокол §9.3, кэш, chunks)
+    #[arg(long, conflicts_with_all = ["grid", "check"])]
+    pub tokens: bool,
+    /// Гейт без справочного прогона fp16 на CUDA (GPU занят): вердикт — по int8 и fp32 на CPU
+    #[arg(long, requires = "quality_gate")]
+    pub skip_cuda: bool,
+    /// zam для хуков в --hints (по умолчанию собирается `cargo build --release -p zam-cli`)
+    #[arg(long)]
+    pub cli_bin: Option<PathBuf>,
     /// Подбор весов [search] и порогов чанкинга по сетке из файла (eval/grid.toml)
     #[arg(long, value_name = "FILE", conflicts_with = "check")]
     pub grid: Option<PathBuf>,
@@ -151,6 +171,10 @@ pub struct Paths {
     pub queries: PathBuf,
     /// `eval/insights.toml` — insight набора M3.
     pub insights: PathBuf,
+    /// `eval/hints.toml` — подсказки хуков (M4).
+    pub hints: PathBuf,
+    /// `eval/scenarios.toml` — сценарии расхода токенов (M4).
+    pub scenarios: PathBuf,
     pub results: PathBuf,
     /// `target/eval` — каталоги данных прогонов.
     pub work: PathBuf,
@@ -170,6 +194,8 @@ impl Paths {
                 .insights
                 .clone()
                 .unwrap_or_else(|| eval.join("insights.toml")),
+            hints: eval.join("hints.toml"),
+            scenarios: eval.join("scenarios.toml"),
             results: a.out.clone().unwrap_or_else(|| eval.join("results")),
             work: repo.join("target").join("eval"),
         }
@@ -230,8 +256,21 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     let p = Paths::new(repo, &a);
     if a.check {
         // фрагмент (--queries) проверяется без требований к полному набору
-        let (_, _, s) = load_set(&p, full_set(&a))?;
+        let (corpus, _, s) = load_set(&p, full_set(&a))?;
         print_summary(&s);
+        if full_set(&a) {
+            let (set, _) = hints::load_hints(&p.hints)?;
+            let h = hints::validate_hints(&set, &corpus)?;
+            let (sc, _) = tokens::load_scenarios(&p.scenarios)?;
+            tokens::validate_scenarios(&sc, &corpus)?;
+            println!(
+                "набор M4: подсказок {} (релевантных {}, нерелевантных {}), сценариев расхода токенов {}",
+                h.cases,
+                h.relevant,
+                h.irrelevant,
+                sc.len()
+            );
+        }
         println!("EVAL-CHECK OK");
         return Ok(());
     }
@@ -239,6 +278,12 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     print_summary(&s);
     if a.quality_gate {
         return gate::run(&a, &p, &corpus, &queries);
+    }
+    if a.hints {
+        return hints::run(&a, &p, &corpus, &queries);
+    }
+    if a.tokens {
+        return tokens::run(&a, &p, &corpus);
     }
     if let Some(g) = &a.grid {
         return grid::run(&a, &p, &corpus, &queries, g);

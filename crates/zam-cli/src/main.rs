@@ -54,6 +54,18 @@ enum Cmd {
         /// Ревизия
         #[arg(long)]
         rev: Option<i64>,
+        /// Пачкой одним запросом `POST /read` (Markdown с заголовками элементов и строкой `~N tok`)
+        #[arg(long)]
+        batch: bool,
+        /// Пачка: не больше токенов на элемент, остальное — «…ещё N токенов»
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        max_tokens: Option<u32>,
+        /// Пачка: бюджет токенов на весь ответ (по умолчанию серверный, 1500)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        budget: Option<u32>,
+        /// Пачка: ревизия, уже известная агенту; совпала — `unchanged` без текста
+        #[arg(long)]
+        if_rev: Option<i64>,
         #[command(flatten)]
         common: Common,
     },
@@ -128,6 +140,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ReleaseCmd,
     },
+    /// Кэш выжимок: сохранить выжимку с источниками, список, карточка, удаление
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
     /// Vault: секреты (значение — только из stdin или скрытого ввода)
     Vault {
         #[command(subcommand)]
@@ -152,6 +169,72 @@ enum Cmd {
     Links {
         /// n:<id>, e:<id> (i:/c:/r:) или [space:]path
         target: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Подключить проект (§14.1): solution.toml, блок в CLAUDE.md/AGENTS.md, хуки, .mcp.json
+    Init {
+        /// Имя нового решения (по умолчанию — имя каталога)
+        #[arg(long)]
+        name: Option<String>,
+        /// GUID решения (по умолчанию — из solution.toml или новый)
+        #[arg(long)]
+        id: Option<String>,
+        /// Адрес сервера
+        #[arg(long)]
+        url: Option<String>,
+        /// Токен (сохраняется в ~/.zeroaimemory/config.toml, не в файлы проекта)
+        #[arg(long)]
+        token: Option<String>,
+        /// Агент: claude (CLAUDE.md), codex (AGENTS.md), both
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: cmd::init::InitAgent,
+        /// Не ставить хуки
+        #[arg(long)]
+        no_hooks: bool,
+        /// Не прописывать MCP-сервер в .mcp.json
+        #[arg(long)]
+        no_mcp: bool,
+        /// Не спрашивать подтверждения
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Язык блока инструкции
+        #[arg(long, default_value = "ru", value_parser = ["ru", "en"])]
+        lang: String,
+    },
+    /// Полный протокол работы агента с памятью (Markdown)
+    Guide {
+        /// Язык
+        #[arg(long, default_value = "ru", value_parser = ["ru", "en"])]
+        lang: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// stdio-прокси MCP: JSON-RPC построчно со stdin → POST /mcp → stdout
+    Mcp {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Хук агента (§10.3): JSON события на stdin, подсказки — JSON в stdout; всегда код 0
+    Hook {
+        /// session-start, prompt, pre-tool, post-tool, checkpoint
+        #[arg(value_enum)]
+        kind: cmd::hook::Kind,
+        /// Формат вывода и предел текста
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: cmd::hook::Agent,
+    },
+    /// Локальный кэш триггеров вспоминания (.zeroaimemory/cache/triggers.json)
+    Triggers {
+        #[command(subcommand)]
+        cmd: TriggersCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TriggersCmd {
+    /// Принудительно обновить кэш триггеров решения и Knowledge
+    Sync {
         #[command(flatten)]
         common: Common,
     },
@@ -218,9 +301,13 @@ struct InsightArgs {
     /// Файл с текстом (иначе stdin)
     #[arg(long)]
     body_file: Option<PathBuf>,
-    /// Эпистемический статус: theorem (с --evidence-file) или hypothesis
-    #[arg(long, value_parser = ["theorem", "hypothesis"])]
+    /// Эпистемический статус: axiom (только по прямому указанию пользователя, с --reason),
+    /// theorem (с --evidence-file) или hypothesis
+    #[arg(long, value_parser = ["axiom", "theorem", "hypothesis"])]
     certainty: Option<String>,
+    /// Причина статуса — сообщение ревизии; для axiom обязательна (что сказал пользователь)
+    #[arg(long)]
+    reason: Option<String>,
     /// JSON-файл доказательства {checked, method, result} → data.evidence
     #[arg(long)]
     evidence_file: Option<PathBuf>,
@@ -246,6 +333,7 @@ impl InsightArgs {
             title: &self.title,
             body_file: self.body_file.as_deref(),
             certainty: self.certainty.as_deref(),
+            reason: self.reason.as_deref(),
             evidence_file: self.evidence_file.as_deref(),
             triggers: &self.triggers,
             tags: &self.tags,
@@ -306,8 +394,8 @@ enum InsightCmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Сменить эпистемический статус: axiom (только --human), theorem (агенту — с
-    /// --evidence-file), hypothesis или none; причина обязательна
+    /// Сменить эпистемический статус (обычный токен): axiom (только по прямому указанию
+    /// пользователя), theorem (с --evidence-file), hypothesis или none; причина обязательна
     Certify {
         id: String,
         #[arg(value_parser = ["axiom", "theorem", "hypothesis", "none"])]
@@ -317,11 +405,17 @@ enum InsightCmd {
         /// JSON-файл доказательства {checked, method, result} → data.evidence
         #[arg(long)]
         evidence_file: Option<PathBuf>,
-        /// Человеческий токен (url и human_token — только из ~/.zeroaimemory/config.toml);
-        /// только в интерактивном терминале с подтверждением вводом id: axiom ставит и меняет
-        /// только человек
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Оценить полезность записи: useful или useless (показы и оценки — в `insight show`)
+    Feedback {
+        id: String,
+        #[arg(value_parser = ["useful", "useless"])]
+        value: String,
+        /// Сессия агента (session_id)
         #[arg(long)]
-        human: bool,
+        session: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -395,6 +489,97 @@ impl VaultOpts {
             global: self.global,
             solution: self.solution.as_deref(),
         }
+    }
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// Сохранить выжимку (текст — из --file или stdin); печатает c_<id>
+    Put {
+        /// Запрос, на который отвечает выжимка
+        #[arg(long)]
+        query: String,
+        /// Источники через запятую: ID[#СЕКЦИЯ][@REV] (n:/i:/c:/r:, голый id или space:/путь)
+        #[arg(long, required = true)]
+        sources: Vec<String>,
+        /// Сразу превратить: note:<путь> или insight:<вид>
+        #[arg(long)]
+        promote: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml, без него — Knowledge)
+        #[arg(long)]
+        solution: Option<String>,
+        /// Файл с выжимкой (иначе stdin)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Выжимки: c_<id>, состояние, дата, запрос
+    List {
+        /// Подстрока запроса
+        #[arg(long)]
+        q: Option<String>,
+        #[arg(long, value_parser = ["valid", "stale"])]
+        state: Option<String>,
+        /// GUID решения: выжимки решения (общие)
+        #[arg(long)]
+        solution: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit: Option<u32>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Карточка выжимки: источники (изменившиеся — с причиной) и текст
+    Show {
+        id: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Удалить выжимку (мягко)
+    Rm {
+        id: String,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn cache(c: CacheCmd) -> Result<(), CliError> {
+    use cmd::cache as k;
+    match c {
+        CacheCmd::Put {
+            query,
+            sources,
+            promote,
+            solution,
+            file,
+            common,
+        } => k::put(
+            &cmd::connect(&common)?,
+            &k::PutOpts {
+                query: &query,
+                sources: &sources,
+                promote: promote.as_deref(),
+                solution: solution.as_deref(),
+                file: file.as_deref(),
+            },
+        ),
+        CacheCmd::List {
+            q,
+            state,
+            solution,
+            limit,
+            common,
+        } => k::list(
+            &cmd::connect(&common)?,
+            &k::ListOpts {
+                q: q.as_deref(),
+                state: state.as_deref(),
+                solution: solution.as_deref(),
+                limit,
+            },
+        ),
+        CacheCmd::Show { id, common } => k::show(&cmd::connect(&common)?, &id),
+        CacheCmd::Rm { id, common } => k::remove(&cmd::connect(&common)?, &id),
     }
 }
 
@@ -473,6 +658,13 @@ enum SolutionCmd {
         #[command(subcommand)]
         cmd: AccessCmd,
     },
+    /// Переименовать решение (владелец или администратор)
+    Rename {
+        /// Новое имя (1-128 символов)
+        name: String,
+        #[command(flatten)]
+        opts: AccessOpts,
+    },
 }
 
 /// Решение и подключение для команд доступа.
@@ -540,14 +732,24 @@ impl AccessCmd {
 }
 
 fn main() -> ExitCode {
+    let started = std::time::Instant::now();
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            // --help и --version — успех; ошибка аргументов — неверный ввод (6), не 2
+            // --help и --version — успех; ошибка аргументов — неверный ввод (6), не 2;
+            // у `zam hook …` — всегда 0: хук не блокирует агента (§10.3)
             let _ = e.print();
-            return ExitCode::from(if e.use_stderr() { EXIT_INPUT } else { 0 });
+            let hook = std::env::args().nth(1).as_deref() == Some("hook");
+            return ExitCode::from(if e.use_stderr() && !hook {
+                EXIT_INPUT
+            } else {
+                0
+            });
         }
     };
+    if let Cmd::Hook { kind, agent } = &cli.cmd {
+        return ExitCode::from(cmd::hook::run(*kind, *agent, started));
+    }
     if let Cmd::Status { common } = &cli.cmd {
         let flags = Flags {
             url: common.url.clone(),
@@ -600,27 +802,57 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
             body_file,
             common,
         } => i::append(&cmd::connect(&common)?, &id, body_file.as_deref()),
+        InsightCmd::Feedback {
+            id,
+            value,
+            session,
+            common,
+        } => i::feedback(&cmd::connect(&common)?, &id, &value, session.as_deref()),
         InsightCmd::Certify {
             id,
             certainty,
             reason,
             evidence_file,
-            human,
             common,
-        } => {
-            let ctx = if human {
-                cmd::connect_human(&common, &id)?
-            } else {
-                cmd::connect(&common)?
-            };
-            i::certify(&ctx, &id, &certainty, &reason, evidence_file.as_deref())
-        }
+        } => i::certify(
+            &cmd::connect(&common)?,
+            &id,
+            &certainty,
+            &reason,
+            evidence_file.as_deref(),
+        ),
     }
 }
 
 fn dispatch(c: Cmd) -> Result<(), CliError> {
     match c {
-        Cmd::Status { .. } => unreachable!("обработан в main"),
+        Cmd::Status { .. } | Cmd::Hook { .. } => unreachable!("обработан в main"),
+        Cmd::Triggers {
+            cmd: TriggersCmd::Sync { common },
+        } => cmd::hook::cache::sync(&cmd::connect(&common)?),
+        Cmd::Init {
+            name,
+            id,
+            url,
+            token,
+            agent,
+            no_hooks,
+            no_mcp,
+            yes,
+            lang,
+        } => cmd::init::run(cmd::init::Opts {
+            name,
+            id,
+            url,
+            token,
+            agent,
+            no_hooks,
+            no_mcp,
+            yes,
+            lang,
+        }),
+        Cmd::Guide { lang, common } => cmd::guide::run(&cmd::connect(&common)?, &lang),
+        Cmd::Mcp { common } => cmd::mcp::run(cmd::connect(&common)?),
         Cmd::Tree {
             target,
             depth,
@@ -631,12 +863,20 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             tier,
             section,
             rev,
+            batch,
+            max_tokens,
+            budget,
+            if_rev,
             common,
         } => {
             let o = cmd::read::Opts {
                 tier: tier.as_deref(),
                 section: section.as_deref(),
                 rev,
+                batch,
+                max_tokens,
+                budget,
+                if_rev,
             };
             cmd::read::run(&cmd::connect(&common)?, &targets, &o)
         }
@@ -736,6 +976,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             cmd::insight::log(&cmd::connect(&common)?, &o)
         }
         Cmd::Insight { cmd } => insight(cmd),
+        Cmd::Cache { cmd } => cache(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {
             cmd:
@@ -783,6 +1024,13 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             )),
         },
         Cmd::Links { target, common } => cmd::link::list(&cmd::connect(&common)?, &target),
+        Cmd::Solution {
+            cmd: SolutionCmd::Rename { name, opts },
+        } => cmd::solution::rename(
+            &cmd::connect(&opts.common)?,
+            opts.solution.as_deref(),
+            &name,
+        ),
         Cmd::Solution {
             cmd: SolutionCmd::Access { cmd },
         } => {

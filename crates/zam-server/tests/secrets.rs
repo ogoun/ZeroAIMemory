@@ -182,7 +182,8 @@ async fn entry_body_secret_masked() {
     assert!(count(&search(&a, "логах").await) >= 1);
     // PATCH записи: предупреждение по итоговому тексту
     let r = a
-        .t(
+        .tok_rev(
+            &a.token,
             Method::PATCH,
             &format!("/api/v1/entries/{id}"),
             Some(json!({"append_body": "\npassword: another-secret-1"})),

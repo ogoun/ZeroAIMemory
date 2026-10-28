@@ -13,6 +13,10 @@
 //!   Регистрирует токен `rw` или администратор.
 //! - `GET /solutions` — доступные решения с ролью (администратору — все);
 //! - `GET /solutions/{guid}` — пространство решения, `owner`, `role`, `access`;
+//! - `PATCH /solutions/{guid} {name}` — переименование (M4): `rw`-токен владельца или
+//!   администратор; участник и запросивший доступ — 403, посторонний — 404; имя 1–128
+//!   символов без управляющих; аудит `solution.rename` `{from, to}`. Имя меняется в реестре
+//!   и в пространстве решения базы владельца; GUID, роли и доступ не затрагиваются;
 //! - `GET /solutions/{guid}/access` — владелец любым своим токеном или администратор;
 //! - `POST /solutions/{guid}/access/{user}/approve {access?}` (по умолчанию `rw`
 //!   **[решение исполнителя]**), `…/reject {reason?}`, `…/revoke` — `rw`-токен владельца
@@ -30,7 +34,7 @@ use serde_json::{Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
     Access, AccessDecision, AccessState, SolutionInfo, SolutionRole, Space,
-    create_solution_with_id, get_solution, get_space,
+    create_solution_with_id, get_solution, get_space, rename_solution_space,
 };
 
 use super::scope::{Mode, Role, require_rw, solution_space, space_scope};
@@ -39,8 +43,8 @@ use crate::app::AppState;
 use crate::auth::{Principal, target_user};
 use crate::error::ApiError;
 
-/// Предел длины имени решения, символов.
-const NAME_MAX_CHARS: usize = 128;
+/// Предел длины имени решения, символов — один на регистрацию и переименование (§11.6).
+const NAME_MAX_CHARS: usize = zam_core::SOLUTION_NAME_MAX_CHARS;
 /// Предел длины причины отклонения, символов.
 const REASON_MAX_CHARS: usize = 500;
 
@@ -155,17 +159,14 @@ pub async fn register(
             solution_json(&st, &space, user.id, Role::Owner).await?,
         ));
     }
-    if matches!(p, Principal::Admin { .. }) {
+    if p.is_admin() {
         let (_, space) = solution_space(&st, &info).await?;
         return Ok(reply(
             StatusCode::OK,
             solution_json(&st, &space, info.owner_id, Role::Admin).await?,
         ));
     }
-    let token = match &p {
-        Principal::Token(t) => Some(t.token_id),
-        Principal::Admin { .. } => None,
-    };
+    let token = p.token_id();
     let role = match st.system.solution_role(&guid, user.id).await? {
         None | Some(SolutionRole::Pending) => {
             match st.system.request_access(&guid, user.id, token).await? {
@@ -225,6 +226,40 @@ pub async fn get(
     ))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rename {
+    name: String,
+}
+
+/// `PATCH /solutions/{guid} {name}` → 200 решение с новым именем (как `GET /solutions/{guid}`).
+pub async fn rename(
+    State(st): State<AppState>,
+    p: Principal,
+    Path(raw): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let info = managed(&st, &p, &raw, true).await?;
+    let req: Rename = json_body(body)?;
+    let name = valid_name(&req.name)?;
+    let actor = p.actor();
+    // сначала реестр (источник истины имени, аудит), затем пространство в базе владельца;
+    // повтор запроса довершает прерванное переименование
+    st.system.rename_solution(&info.guid, name, &actor).await?;
+    let db = st.users.get(info.owner_id).await?;
+    rename_solution_space(&db, info.space_id, name).await?;
+    let space = get_space(&db, info.space_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let role = if p.is_admin() {
+        Role::Admin
+    } else {
+        Role::Owner
+    };
+    tracing::info!(guid = %info.guid, "решение переименовано");
+    Ok(Json(solution_json(&st, &space, info.owner_id, role).await?))
+}
+
 /// Элемент `GET /solutions`.
 async fn list_item(st: &AppState, info: &SolutionInfo, role: Role) -> Result<Value, ApiError> {
     Ok(json!({
@@ -247,7 +282,7 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     let user = target_user(&st, &p, &headers).await?;
     let mut out = Vec::new();
-    if matches!(p, Principal::Admin { .. }) {
+    if p.is_admin() {
         for info in st.system.list_solutions().await? {
             let role = if info.owner_id == user.id {
                 Role::Owner
@@ -286,19 +321,20 @@ async fn managed(
         .get_solution(&guid)
         .await?
         .ok_or(ApiError::NotFound)?;
-    match p {
-        Principal::Admin { .. } => Ok(info),
-        Principal::Token(t) if t.user_id == info.owner_id => {
-            if write {
-                require_rw(p)?;
-            }
-            Ok(info)
+    // администратор — любое решение; токен и сессия пользователя — только своё
+    let Some(user) = p.bound_user() else {
+        return Ok(info);
+    };
+    if user == info.owner_id {
+        if write {
+            require_rw(p)?;
         }
-        // участник и запросивший доступ — 403; посторонний — как незарегистрированный GUID
-        Principal::Token(t) => match st.system.solution_role(&info.guid, t.user_id).await? {
-            Some(_) => Err(ApiError::Forbidden),
-            None => Err(ApiError::NotFound),
-        },
+        return Ok(info);
+    }
+    // участник и запросивший доступ — 403; посторонний — как незарегистрированный GUID
+    match st.system.solution_role(&info.guid, user).await? {
+        Some(_) => Err(ApiError::Forbidden),
+        None => Err(ApiError::NotFound),
     }
 }
 
@@ -306,7 +342,7 @@ async fn managed(
 fn decided_by(p: &Principal, info: &SolutionInfo) -> String {
     match p {
         Principal::Admin { .. } => "admin".into(),
-        Principal::Token(_) => info.owner_id.to_string(),
+        Principal::Token(_) | Principal::User { .. } => info.owner_id.to_string(),
     }
 }
 

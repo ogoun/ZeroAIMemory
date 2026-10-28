@@ -198,7 +198,7 @@ fn publish_key_file(path: &Path, key: &SecretKey) -> std::io::Result<()> {
 /// на Linux — `mode(0o600)` при создании, на Windows — защищённый DACL в самом `CreateFileW`
 /// ([`super::acl::create_private_file`]). Файла с унаследованными правами каталога не бывает
 /// ни мгновения — ни содержимого, ни дескриптора, открытого с этими правами.
-fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
     {
         super::acl::create_private_file(path)
@@ -219,7 +219,7 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 /// Кто, кроме владельца, может прочитать существующий файл ключа: на Linux — права группы
 /// и прочих (`mode & 0o077`), на Windows — SID из DACL ([`super::acl::foreign_readers`]).
 /// `None` — только владелец (и SYSTEM, администраторы на Windows).
-fn key_file_exposure(path: &Path) -> std::io::Result<Option<String>> {
+pub(crate) fn key_file_exposure(path: &Path) -> std::io::Result<Option<String>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

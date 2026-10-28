@@ -71,7 +71,7 @@ pub enum Viewer {
     Token,
     /// Токен участника общего решения: только вложения пространства решения.
     Member,
-    /// Администратор в своей базе.
+    /// Человек (сессия WebUI) в своей базе: администратор или пользователь (§11.4).
     Admin,
     /// Администратор от имени другого пользователя: URL блобов с `?user=<id>`.
     AdminFor(Id),
@@ -85,6 +85,9 @@ impl Viewer {
             Principal::Token(_) => Viewer::Token,
             Principal::Admin { .. } if owner == st.admin_id => Viewer::Admin,
             Principal::Admin { .. } => Viewer::AdminFor(owner),
+            // пользователь видит только свою базу и пространства чужих решений
+            Principal::User { .. } if matches!(role, Role::Member(_)) => Viewer::Member,
+            Principal::User { .. } => Viewer::Admin,
         }
     }
 }

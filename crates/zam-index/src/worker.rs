@@ -105,6 +105,8 @@ pub struct WorkerConfig {
     pub retry_max: Duration,
     /// Период сборки мусора кэша `embeddings` на базу (в простое).
     pub gc_interval: Duration,
+    /// Порог косинуса нового источника для кэша выжимок (§9.4, `cache.new_sources_threshold`).
+    pub cache_new_sources_threshold: f32,
 }
 
 impl Default for WorkerConfig {
@@ -117,6 +119,7 @@ impl Default for WorkerConfig {
             idle_poll: Duration::from_secs(2),
             retry_max: Duration::from_secs(10),
             gc_interval: Duration::from_secs(3600),
+            cache_new_sources_threshold: 0.80,
         }
     }
 }
@@ -1404,6 +1407,9 @@ impl Worker {
                 ready = keep;
             }
         }
+        // новые источники для кэша выжимок (§9.4): векторы записанных чанков против
+        // `query_vec` действующих выжимок той же области
+        self.new_sources(db, &ready, &embs).await;
         // завершение заданий: только после подтверждённой записи
         for (j, plan) in ready {
             // свёртка предков и auto-L0 — до закрытия задания: покой воркера — пустая
@@ -1431,6 +1437,46 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// Новые источники кэша выжимок: dense-векторы чанков целей пачки, по пространству и
+    /// области цели, — в [`zam_store::mark_new_sources`]. Сбой — WARN, задания не страдают.
+    async fn new_sources(&self, db: &Db, ready: &[(Job, Plan)], embs: &HashMap<String, Embedding>) {
+        // (пространство, область) → векторы чанков целей
+        type Group = Vec<(TargetRef, Vec<f32>)>;
+        let mut groups: HashMap<(Id, Option<String>), Group> = HashMap::new();
+        for (j, plan) in ready {
+            let Plan::Upsert(chunks) = plan else {
+                continue;
+            };
+            for c in chunks {
+                let Some(e) = embs.get(&c.embed_key) else {
+                    continue;
+                };
+                groups
+                    .entry((c.node.space_id, c.node.area.clone()))
+                    .or_default()
+                    .push((j.target(), e.dense.clone()));
+            }
+        }
+        // векторы — текущей модели: выжимки с вектором другой модели не сравниваются
+        let model = self.model();
+        for ((space, area), vecs) in groups {
+            let r = zam_store::mark_new_sources(
+                db,
+                space,
+                area.as_deref(),
+                &model,
+                &vecs,
+                self.cfg.cache_new_sources_threshold,
+            )
+            .await;
+            match r {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(stale = n, "кэш выжимок: новые источники"),
+                Err(e) => tracing::warn!(error = %e, "кэш выжимок: новые источники не отмечены"),
+            }
+        }
     }
 
     /// Точки целей в Qdrant: удалить старые точки `targets`, записать `pts` (`wait=true`).

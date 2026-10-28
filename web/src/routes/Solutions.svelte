@@ -1,7 +1,8 @@
 <script lang="ts">
   // Администрирование → «Решения» (§11.6): реестр решений с владельцами, участники и запросы
   // доступа — одобрить (rw или ro), отклонить с причиной, отозвать. Решения о доступе
-  // действуют на следующем же запросе участника (кэша нет).
+  // действуют на следующем же запросе участника (кэша нет). `mine` — «Мои решения»
+  // пользователя (§15.1): только свои решения, те же REST, что у CLI.
   import Prompt, { type Ask } from '../components/Prompt.svelte';
   import {
     ApiError,
@@ -17,7 +18,7 @@
   } from '../lib/api';
   import { fmtTime } from '../lib/journals';
 
-  let { onexpired }: { onexpired: () => void } = $props();
+  let { onexpired, mine = false }: { onexpired: () => void; mine?: boolean } = $props();
 
   const STATE_TEXT: Record<string, string> = {
     pending: 'ждёт решения',
@@ -44,7 +45,9 @@
     loading = true;
     error = '';
     try {
-      solutions = (await listSolutions()).sort((a, b) => a.name.localeCompare(b.name));
+      solutions = (await listSolutions())
+        .filter((s) => !mine || s.role === 'owner')
+        .sort((a, b) => a.name.localeCompare(b.name));
       // запросы всех решений сразу: число ожидающих — в строке реестра; сбой одного
       // решения — ошибка его строки, остальные показываются
       const lists = await Promise.allSettled(
@@ -116,10 +119,15 @@
 </script>
 
 <section class="panel">
-  <h2>Решения</h2>
+  <h2>{mine ? 'Мои решения' : 'Решения'}</h2>
   <p class="muted small">
-    Реестр решений (agent_solution_id), владельцы и участники. Участник работает в базе владельца
-    только с пространством решения; одобрение, отклонение и отзыв действуют сразу.
+    {#if mine}
+      Ваши решения (agent_solution_id), участники и запросы доступа. Участник работает в вашей базе
+      только с пространством решения; одобрение, отклонение и отзыв действуют сразу.
+    {:else}
+      Реестр решений (agent_solution_id), владельцы и участники. Участник работает в базе владельца
+      только с пространством решения; одобрение, отклонение и отзыв действуют сразу.
+    {/if}
   </p>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}

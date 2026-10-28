@@ -33,9 +33,11 @@ use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
 pub(crate) use chunks::{
-    ChunkInsert, backfill_certainty, backfill_embed_keys, chunk_id, chunker_fingerprint,
-    context_prefix, entry_chunker_fingerprint, frontmatter_tags, mask_tags, note_chunks,
-    rechunk_notes, replace_chunks, rescan_secrets, same_chunker, stored_prefix_hit, token_counter,
+    ChunkInsert, PARAM_ALGORITHM, PARAM_TOKENIZER, backfill_certainty, backfill_embed_keys,
+    changed_params, chunk_id, chunker_fingerprint, chunker_params, context_prefix,
+    entry_chunker_fingerprint, frontmatter_tags, mask_tags, note_chunks, param_order,
+    params_from_fingerprint, rechunk_notes, replace_chunks, rescan_secrets, same_chunker,
+    stored_prefix_hit, token_counter,
 };
 pub use chunks::{
     PREFIX_L0_MAX_TOKENS, chunk_params, count_tokens, prefix_l0, set_chunk_params, set_prefix_l0,
@@ -46,6 +48,7 @@ pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
 pub use revise::{WriteError, patch_note, patch_note_within, revert_note, update_note};
 pub use tree_ops::{delete_node, list_trash, move_node, restore_node};
+pub(crate) use write::insert_note;
 pub use write::{create_folder, create_note};
 
 /// Вид узла.

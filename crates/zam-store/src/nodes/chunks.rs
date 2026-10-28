@@ -142,6 +142,131 @@ pub(crate) fn same_chunker(stored: Option<&str>, current: &str, exact: bool) -> 
     }
 }
 
+/// Ключ версии алгоритма в JSON параметров нарезки ([`chunker_params`]).
+pub(crate) const PARAM_ALGORITHM: &str = "algorithm";
+/// Ключ идентификатора токенизатора в JSON параметров нарезки.
+pub(crate) const PARAM_TOKENIZER: &str = "tokenizer";
+
+/// Ключи JSON параметров нарезки в порядке перечисления в уведомлении о перенарезке: версия
+/// алгоритма, ключи `[index]` (как в конфигурации сервера), токенизатор.
+const PARAM_KEYS: [&str; 11] = [
+    PARAM_ALGORITHM,
+    "chunk_target_min",
+    "chunk_target_max",
+    "chunk_hard_max",
+    "chunk_merge_below",
+    "chunk_overlap_sentences",
+    "chunk_boundary_lambda",
+    "chunk_cohesion",
+    "chunk_heading_path_h4",
+    "chunk_prefix_l0",
+    PARAM_TOKENIZER,
+];
+
+/// Параметры нарезки процесса — JSON рядом с отпечатком в `meta` (`chunker_params`,
+/// `chunker_entries_params`; уведомление о перенарезке, §8.2): версия алгоритма, ключи
+/// `[index]` и токенизатор — то же, что входит в отпечаток, но с именами ключей, чтобы
+/// при расхождении назвать изменившиеся. `notes == false` — записи журналов (без L0 в префиксе).
+pub(crate) fn chunker_params(notes: bool) -> serde_json::Value {
+    let p = chunk_params();
+    let mut v = serde_json::json!({
+        PARAM_ALGORITHM: CHUNKER_VERSION,
+        "chunk_target_min": p.target_min,
+        "chunk_target_max": p.target_max,
+        "chunk_hard_max": p.hard_max,
+        "chunk_merge_below": p.merge_below,
+        "chunk_overlap_sentences": p.overlap_sentences,
+        "chunk_boundary_lambda": p.boundary_lambda,
+        "chunk_cohesion": p.cohesion,
+        "chunk_heading_path_h4": p.heading_path_h4,
+        PARAM_TOKENIZER: token_counter().tokenizer_id(),
+    });
+    if notes {
+        v["chunk_prefix_l0"] = serde_json::json!(prefix_l0());
+    }
+    v
+}
+
+/// Параметры нарезки из отпечатка базы M3 (без сохранённого JSON параметров), формат
+/// [`chunker_fingerprint`]: `v<N>;<min>/<max>/<hard>/<merge>/<overlap>;lambda=…;cohesion=…;
+/// h4=…[;l0=…][;tok=…]`. Отпечаток другого вида (до задачи 17 M3) — `None`.
+pub(crate) fn params_from_fingerprint(fp: &str) -> Option<serde_json::Value> {
+    let mut parts = fp.split(';');
+    let version: u32 = parts.next()?.strip_prefix('v')?.parse().ok()?;
+    let sizes: Vec<usize> = parts
+        .next()?
+        .split('/')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [min, max, hard, merge, overlap] = sizes[..] else {
+        return None;
+    };
+    let mut v = serde_json::json!({
+        PARAM_ALGORITHM: version,
+        "chunk_target_min": min,
+        "chunk_target_max": max,
+        "chunk_hard_max": hard,
+        "chunk_merge_below": merge,
+        "chunk_overlap_sentences": overlap,
+    });
+    let flag = |s: &str| match s {
+        "0" => Some(serde_json::Value::Bool(false)),
+        "1" => Some(serde_json::Value::Bool(true)),
+        _ => None,
+    };
+    for part in parts {
+        let (k, val) = part.split_once('=')?;
+        let (key, value) = match k {
+            "lambda" => (
+                "chunk_boundary_lambda",
+                serde_json::json!(val.parse::<f64>().ok()?),
+            ),
+            "cohesion" => ("chunk_cohesion", flag(val)?),
+            "h4" => ("chunk_heading_path_h4", flag(val)?),
+            "l0" => ("chunk_prefix_l0", flag(val)?),
+            "tok" => (PARAM_TOKENIZER, serde_json::json!(val)),
+            _ => return None,
+        };
+        v[key] = value;
+    }
+    Some(v)
+}
+
+/// Место ключа параметров нарезки в перечислении уведомления (неизвестный — в конце).
+pub(crate) fn param_order(key: &str) -> usize {
+    PARAM_KEYS
+        .iter()
+        .position(|k| *k == key)
+        .unwrap_or(PARAM_KEYS.len())
+}
+
+/// Изменившиеся параметры нарезки: ключи `stored` и `current`, значения которых различаются
+/// (ключ, которого нет с одной стороны, тоже), в порядке [`PARAM_KEYS`]. При счётчике-оценке
+/// (`exact == false`) токенизатор не сравнивается — как в [`same_chunker`].
+pub(crate) fn changed_params(
+    stored: &serde_json::Value,
+    current: &serde_json::Value,
+    exact: bool,
+) -> Vec<String> {
+    PARAM_KEYS
+        .iter()
+        .filter(|k| exact || **k != PARAM_TOKENIZER)
+        .filter(|k| {
+            let (a, b) = (stored.get(**k), current.get(**k));
+            match (
+                a.and_then(serde_json::Value::as_f64),
+                b.and_then(serde_json::Value::as_f64),
+            ) {
+                // числа сравниваются по значению: 0 и 0.0 — одно и то же
+                (Some(x), Some(y)) => x != y,
+                _ => a != b,
+            }
+        })
+        .map(|k| (*k).to_string())
+        .collect()
+}
+
 /// Текущий счётчик токенов.
 pub(crate) fn token_counter() -> Arc<dyn TokenCounter> {
     counter_cell()
@@ -648,11 +773,13 @@ pub(crate) const CERTAINTY_BACKFILL: &str = "certainty_backfill";
 /// ревизию, восстановление его не пересчитывает) — из frontmatter текущей ревизии (миграция
 /// 0009 добавила столбец пустым: разбор Markdown SQL не посчитает).
 ///
-/// `axiom` ставит только человек: до задачи 9 агент мог записать `certainty: axiom` в
-/// frontmatter, поэтому `axiom` сохраняется, только если текущая ревизия записана с
-/// `author_kind = 'human'`, иначе статус понижается до `hypothesis` (счётчик понижений — в лог)
-/// **[решение исполнителя]**. Текст заметки не меняется: агент, правящий такую заметку, должен
-/// убрать `axiom` из frontmatter (перевод в `axiom` — 403).
+/// До задачи 9 M3 статус ничего не значил, и агент мог записать `certainty: axiom` в
+/// frontmatter без указания пользователя, поэтому `axiom` сохраняется, только если текущая
+/// ревизия записана с `author_kind = 'human'`, иначе статус понижается до `hypothesis`
+/// (счётчик понижений — в лог) **[решение исполнителя]**. Это перенос данных до M3, а не
+/// матрица прав: с M4 агент ставит `axiom` сам по указанию пользователя (§7.5). Текст заметки
+/// не меняется: правка агентом с `axiom` во frontmatter — переход `hypothesis → axiom`
+/// (с причиной в сообщении ревизии).
 ///
 /// Живым индексируемым заметкам со статусом ставится `upsert` с приоритетом reindex (статус
 /// попадает в payload Qdrant). Пакетами по [`BACKFILL_BATCH`] заметок; флаг
@@ -893,12 +1020,14 @@ const RECHUNK_BATCH: i64 = 200;
 /// каждой индексируемой.
 /// L0 и прочие поля узла не меняются. Пакетами по [`RECHUNK_BATCH`] заметок
 /// в отдельных транзакциях; повторный запуск безопасен. Возвращает
-/// `(заметок, заданий upsert)`. В лог — только счётчики.
+/// `(заметок, заданий upsert)`. `progress` — счётчик обработанных заметок (ход перенарезки
+/// в `GET /index/status`), растёт после каждого пакета. В лог — только счётчики.
 pub(crate) async fn rechunk_notes(
     db: &Db,
     space: Option<Id>,
     priority: i64,
     only_changed: bool,
+    progress: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<(u64, u64), StoreError> {
     let (mut notes, mut upserts) = (0u64, 0u64);
     let mut after: Option<Id> = None;
@@ -942,6 +1071,9 @@ pub(crate) async fn rechunk_notes(
             .await?;
         notes += n;
         upserts += u;
+        if let Some(p) = progress {
+            p.fetch_add(n, Ordering::Relaxed);
+        }
         if n > 0 {
             tracing::debug!(notes, upserts, "перечанковка: обработан пакет заметок");
         }
@@ -999,6 +1131,38 @@ b text.
             note_chunks("", &parse(""), "имя", &ApproxCounter)[0].text,
             "имя"
         );
+    }
+
+    /// Разбор отпечатка (база M3 без JSON параметров) согласован с форматом отпечатка и
+    /// JSON параметров: текущий отпечаток разбирается в текущие параметры.
+    #[test]
+    fn fingerprint_parses_to_current_params() {
+        for (fp, notes) in [
+            (chunker_fingerprint(), true),
+            (entry_chunker_fingerprint(), false),
+        ] {
+            let parsed = params_from_fingerprint(&fp).expect("отпечаток разбирается");
+            assert_eq!(
+                changed_params(&parsed, &chunker_params(notes), true),
+                Vec::<String>::new(),
+                "{fp}"
+            );
+        }
+        let old = params_from_fingerprint("v2;300/600/800/100/1;lambda=0.5;cohesion=0;h4=1;l0=0")
+            .unwrap();
+        // без `;tok=` (база до финальной волны M3): токенизатор считается изменившимся только
+        // при точном счётчике
+        assert_eq!(
+            changed_params(&old, &chunker_params(true), true),
+            vec!["chunk_target_max", "chunk_boundary_lambda", "tokenizer"]
+        );
+        assert_eq!(
+            changed_params(&old, &chunker_params(true), false),
+            vec!["chunk_target_max", "chunk_boundary_lambda"]
+        );
+        assert_eq!(params_from_fingerprint("секции M1"), None);
+        assert_eq!(params_from_fingerprint("v2;300/500;lambda=0"), None);
+        assert_eq!(param_order("tokenizer"), PARAM_KEYS.len() - 1);
     }
 
     #[test]

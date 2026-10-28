@@ -155,8 +155,8 @@ pub async fn upload(
             "вложение привязывается только к заметке".into(),
         ));
     }
-    // вложение — изменение заметки: к заметке axiom его добавляет только человек (§7.5);
-    // проверка до приёма файла (окончательная — в транзакции привязки)
+    // вложение — изменение заметки по матрице certainty (§7.5; с M4 к axiom — любому
+    // автору): проверка до приёма файла, окончательная — в транзакции привязки
     let author = crate::attrib::attribution(&p, &headers, None)?.author_kind;
     zam_store::check_certainty(
         author,
@@ -287,9 +287,10 @@ async fn locate_blob(
     sha: &str,
     filename: &str,
 ) -> Result<(Id, String), ApiError> {
-    let admin = matches!(p, Principal::Admin { .. });
+    // Human своей базы — человеку (сессия WebUI), токену — нет
+    let human = p.is_human();
     let (user, db) = user_db(st, p, headers).await?;
-    if let Some((mime, _)) = blob_meta(&db, sha, filename, admin).await? {
+    if let Some((mime, _)) = blob_meta(&db, sha, filename, human).await? {
         return Ok((user.id, mime));
     }
     for (info, role) in foreign_solutions(st, p, &user).await? {
@@ -323,8 +324,9 @@ pub async fn download(
             "sha256: 64 символа hex в нижнем регистре".into(),
         ));
     }
-    let admin = matches!(p, Principal::Admin { .. });
-    if admin && let Some(u) = q.user.as_deref() {
+    if p.is_admin()
+        && let Some(u) = q.user.as_deref()
+    {
         let v = HeaderValue::from_str(u)
             .map_err(|_| ApiError::BadRequest("некорректный user".into()))?;
         headers.insert(USER_HEADER, v);

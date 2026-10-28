@@ -37,6 +37,14 @@ pub static SYSTEM_MIGRATIONS: &[Migration] = &[
         version: 5,
         sql: include_str!("../migrations/system/0005_vault_keys.sql"),
     },
+    Migration {
+        version: 6,
+        sql: include_str!("../migrations/system/0006_user_passwords.sql"),
+    },
+    Migration {
+        version: 7,
+        sql: include_str!("../migrations/system/0007_user_settings.sql"),
+    },
 ];
 
 /// База пользователя, исключённая из пересборки векторного индекса (`index_skipped`).
@@ -61,6 +69,10 @@ pub struct User {
     pub is_admin: bool,
     pub created_at: Timestamp,
     pub disabled_at: Option<Timestamp>,
+    /// Пароль входа в WebUI задан (§11.4); сам хэш наружу не отдаётся.
+    pub has_password: bool,
+    /// При следующем входе пользователь обязан сменить пароль.
+    pub must_change_password: bool,
 }
 
 /// Режим доступа токена или участника решения.
@@ -110,8 +122,6 @@ pub struct TokenInfo {
     pub last_used_at: Option<Timestamp>,
     pub last_ip: Option<String>,
     pub revoked_at: Option<Timestamp>,
-    /// Человеческий токен (§7.5): запись по нему — `author_kind = human`.
-    pub human: bool,
 }
 
 /// Результат успешной проверки токена.
@@ -120,13 +130,13 @@ pub struct AuthToken {
     pub token_id: Id,
     pub user_id: Id,
     pub access: Access,
-    /// Человеческий токен: запись по нему атрибутируется человеку (ставит и меняет `axiom`).
-    pub human: bool,
 }
 
-/// Веб-сессия администратора (идентификатор сессии в ответ не входит).
+/// Веб-сессия WebUI (идентификатор сессии в ответ не входит).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSession {
+    /// Пользователь сессии (§11.4); `None` — сессия администратора.
+    pub user_id: Option<Id>,
     pub csrf_token: String,
     pub created_at: Timestamp,
     pub expires_at: Timestamp,
@@ -159,10 +169,13 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         is_admin: r.get(2)?,
         created_at: ts_at(r, 3)?,
         disabled_at: ts_opt(r, 4)?,
+        has_password: r.get(5)?,
+        must_change_password: r.get(6)?,
     })
 }
 
-const USER_COLS: &str = "id, name, is_admin, created_at, disabled_at";
+const USER_COLS: &str =
+    "id, name, is_admin, created_at, disabled_at, password_hash IS NOT NULL, must_change_password";
 
 fn token_row(r: &Row) -> rusqlite::Result<TokenInfo> {
     Ok(TokenInfo {
@@ -175,12 +188,11 @@ fn token_row(r: &Row) -> rusqlite::Result<TokenInfo> {
         last_used_at: ts_opt(r, 6)?,
         last_ip: r.get(7)?,
         revoked_at: ts_opt(r, 8)?,
-        human: r.get(9)?,
     })
 }
 
 const TOKEN_COLS: &str =
-    "id, user_id, name, prefix, access, created_at, last_used_at, last_ip, revoked_at, human";
+    "id, user_id, name, prefix, access, created_at, last_used_at, last_ip, revoked_at";
 
 pub(crate) fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _)
@@ -258,6 +270,8 @@ impl SystemStore {
                     is_admin,
                     created_at: Timestamp::now(),
                     disabled_at: None,
+                    has_password: false,
+                    must_change_password: false,
                 };
                 tx.execute(
                     "INSERT INTO users (id, name, is_admin, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -309,6 +323,11 @@ impl SystemStore {
                 if n == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // отключение (и мягкое удаление) закрывает веб-сессии пользователя сразу:
+                // повторное включение не оживляет старую cookie
+                if disabled {
+                    tx.execute("DELETE FROM web_sessions WHERE user_id = ?1", [id])?;
+                }
                 Ok(())
             })
             .await
@@ -355,17 +374,81 @@ impl SystemStore {
             .await
     }
 
+    // ---- пароли входа в WebUI (§11.4) ----
+
+    /// Кандидаты входа по имени без учёта регистра (Unicode): пользователи с заданным
+    /// паролем и их хэши; точное совпадение имени — первым. Решение о входе — у вызывающего.
+    pub async fn login_candidates(&self, login: &str) -> Result<Vec<(User, String)>, StoreError> {
+        let want = login.trim().to_lowercase();
+        let exact = login.trim().to_string();
+        let mut found: Vec<(User, String)> = self
+            .db
+            .read(|c| {
+                let mut st = c.prepare(&format!(
+                    "SELECT {USER_COLS}, password_hash FROM users
+                     WHERE password_hash IS NOT NULL ORDER BY id"
+                ))?;
+                let rows = st.query_map([], |r| Ok((user_row(r)?, r.get::<_, String>(7)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        found.retain(|(u, _)| u.name.to_lowercase() == want);
+        found.sort_by_key(|(u, _)| u.name != exact);
+        Ok(found)
+    }
+
+    /// Хэш пароля пользователя (`None` — вход закрыт); нет пользователя — `NotFound`.
+    pub async fn password_hash(&self, id: Id) -> Result<Option<String>, StoreError> {
+        self.db
+            .read(move |c| {
+                c.query_row("SELECT password_hash FROM users WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .ok_or(StoreError::NotFound)
+            })
+            .await
+    }
+
+    /// Задаёт (`Some`) или стирает (`None`) хэш пароля и признак обязательной смены; веб-сессии
+    /// пользователя, кроме `keep` (открытый id cookie), закрываются. Нет пользователя —
+    /// `NotFound`.
+    pub async fn set_password(
+        &self,
+        id: Id,
+        hash: Option<String>,
+        must_change: bool,
+        keep: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let keep = keep.map(hash_token);
+        self.db
+            .write(move |tx| {
+                let n = tx.execute(
+                    "UPDATE users SET password_hash = ?2, must_change_password = ?3 WHERE id = ?1",
+                    params![id, hash, must_change && hash.is_some()],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                tx.execute(
+                    "DELETE FROM web_sessions WHERE user_id = ?1 AND (?2 IS NULL OR id <> ?2)",
+                    params![id, keep],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
     // ---- токены ----
 
     /// Выпускает токен; открытый текст возвращается один раз, в БД — только sha256.
-    /// `human` — человеческий токен (§7.5): выпускать его вправе только администратор,
-    /// это проверяет сервер.
+    /// Любой токен — агентский (§11.4): колонка `tokens.human` (M3) получает значение по
+    /// умолчанию 0 и не читается.
     pub async fn issue_token(
         &self,
         user: Id,
         name: &str,
         access: Access,
-        human: bool,
     ) -> Result<(TokenInfo, String), StoreError> {
         let name = name.to_string();
         let nt = generate_token();
@@ -390,12 +473,10 @@ impl SystemStore {
                     last_used_at: None,
                     last_ip: None,
                     revoked_at: None,
-                    human,
                 };
                 tx.execute(
-                    "INSERT INTO tokens (id, user_id, name, prefix, secret_hash, access, created_at,
-                                         human)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO tokens (id, user_id, name, prefix, secret_hash, access, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         info.id,
                         info.user_id,
@@ -403,14 +484,27 @@ impl SystemStore {
                         info.prefix,
                         nt.secret_hash,
                         info.access,
-                        fmt_ts(info.created_at),
-                        info.human
+                        fmt_ts(info.created_at)
                     ],
                 )?;
                 Ok(info)
             })
             .await?;
         Ok((info, plain))
+    }
+
+    /// Префиксы неотозванных токенов, выпущенных человеческими в M3 (`tokens.human = 1`), по
+    /// порядку id: с M4 флаг упразднён и не читается — сервер один раз пишет о них WARN при
+    /// старте (§11.4). Префикс — не секрет (отображается в списке токенов).
+    pub async fn legacy_human_token_prefixes(&self) -> Result<Vec<String>, StoreError> {
+        self.db
+            .read(|c| {
+                let mut st = c.prepare(
+                    "SELECT prefix FROM tokens WHERE human = 1 AND revoked_at IS NULL ORDER BY id",
+                )?;
+                Ok(st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+            })
+            .await
     }
 
     pub async fn get_token(&self, id: Id) -> Result<Option<TokenInfo>, StoreError> {
@@ -465,8 +559,7 @@ impl SystemStore {
             .db
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT t.id, t.user_id, t.access, t.revoked_at, t.last_used_at, u.disabled_at,
-                            t.human
+                    "SELECT t.id, t.user_id, t.access, t.revoked_at, t.last_used_at, u.disabled_at
                      FROM tokens t JOIN users u ON u.id = t.user_id
                      WHERE t.secret_hash = ?1",
                     [&hash],
@@ -475,7 +568,6 @@ impl SystemStore {
                             token_id: r.get(0)?,
                             user_id: r.get(1)?,
                             access: r.get(2)?,
-                            human: r.get(6)?,
                         };
                         let revoked = r.get::<_, Option<String>>(3)?.is_some();
                         let last_used = ts_opt(r, 4).unwrap_or(None);
@@ -520,10 +612,28 @@ impl SystemStore {
 
     // ---- веб-сессии ----
 
-    /// Создаёт сессию: `(session_id для cookie, csrf)`. В БД id хранится как sha256.
+    /// Создаёт сессию администратора: `(session_id для cookie, csrf)`. В БД id хранится как
+    /// sha256.
     pub async fn create_web_session(
         &self,
         ip: Option<&str>,
+    ) -> Result<(String, String), StoreError> {
+        self.create_session(ip, None).await
+    }
+
+    /// Создаёт сессию пользователя `user` (§11.4): `(session_id для cookie, csrf)`.
+    pub async fn create_user_session(
+        &self,
+        ip: Option<&str>,
+        user: Id,
+    ) -> Result<(String, String), StoreError> {
+        self.create_session(ip, Some(user)).await
+    }
+
+    async fn create_session(
+        &self,
+        ip: Option<&str>,
+        user: Option<Id>,
     ) -> Result<(String, String), StoreError> {
         let (id, csrf) = (random_b64(), random_b64());
         let (key, csrf_db) = (hash_token(&id), csrf.clone());
@@ -539,9 +649,9 @@ impl SystemStore {
                     [fmt_ts(now)],
                 )?;
                 tx.execute(
-                    "INSERT INTO web_sessions (id, csrf_token, created_at, expires_at, ip)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![key, csrf_db, fmt_ts(now), fmt_ts(exp), ip],
+                    "INSERT INTO web_sessions (id, csrf_token, created_at, expires_at, ip, user_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![key, csrf_db, fmt_ts(now), fmt_ts(exp), ip, user],
                 )?;
                 Ok(())
             })
@@ -557,10 +667,12 @@ impl SystemStore {
             .db
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT csrf_token, created_at, expires_at, ip FROM web_sessions WHERE id = ?1",
+                    "SELECT csrf_token, created_at, expires_at, ip, user_id FROM web_sessions
+                     WHERE id = ?1",
                     [&k],
                     |r| {
                         Ok(WebSession {
+                            user_id: r.get(4)?,
                             csrf_token: r.get(0)?,
                             created_at: ts_at(r, 1)?,
                             expires_at: ts_at(r, 2)?,
@@ -728,6 +840,135 @@ impl SystemStore {
             .await?;
         raw.map(|s| serde_json::from_str(&s).map_err(json_err))
             .transpose()
+    }
+
+    /// Пачка строковых настроек со счётчиком версии — одной транзакцией (шаблоны блока
+    /// инструкции, §15.5). `edits` — `(ключ, новое значение или None — сброс, значение по
+    /// умолчанию)`: действующее значение — сохранённое, иначе по умолчанию. Ключ пишется, только
+    /// если действующее значение меняется; тогда `version_key` становится
+    /// `max(сохранённая, floor) + 1`. Возвращает новую версию и изменённые ключи (с признаком
+    /// сброса) или `None`, если ничего не изменилось.
+    pub async fn set_settings_versioned(
+        &self,
+        edits: Vec<(String, Option<String>, String)>,
+        version_key: &str,
+        floor: u32,
+    ) -> Result<Option<(u32, Vec<(String, bool)>)>, StoreError> {
+        let version_key = version_key.to_string();
+        self.db
+            .write(move |tx| {
+                let get = |key: &str| -> Result<Option<String>, StoreError> {
+                    Ok(tx
+                        .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                            r.get(0)
+                        })
+                        .optional()?)
+                };
+                let mut changed = Vec::new();
+                for (key, new, default) in edits {
+                    let stored: Option<String> = match get(&key)? {
+                        Some(raw) => {
+                            serde_json::from_str::<Option<String>>(&raw).map_err(json_err)?
+                        }
+                        None => None,
+                    };
+                    let old_eff = stored.as_deref().unwrap_or(&default);
+                    let new_eff = new.as_deref().unwrap_or(&default);
+                    if old_eff == new_eff {
+                        continue;
+                    }
+                    let json = serde_json::to_string(&new).map_err(json_err)?;
+                    tx.execute(
+                        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![key, json],
+                    )?;
+                    changed.push((key, new.is_none()));
+                }
+                if changed.is_empty() {
+                    return Ok(None);
+                }
+                let saved = match get(&version_key)? {
+                    Some(raw) => serde_json::from_str::<u32>(&raw).map_err(json_err)?,
+                    None => 0,
+                };
+                let next = saved.max(floor).saturating_add(1);
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![version_key, next.to_string()],
+                )?;
+                Ok(Some((next, changed)))
+            })
+            .await
+    }
+
+    // ---- настройки пользователя (`user_settings`) ----
+
+    /// Сохранённые настройки пользователя: `(ключ, JSON)` по ключу. Отсутствующий ключ —
+    /// значение по умолчанию, его знает вызывающий.
+    pub async fn user_settings(
+        &self,
+        user: Id,
+    ) -> Result<Vec<(String, serde_json::Value)>, StoreError> {
+        let rows: Vec<(String, String)> = self
+            .db
+            .read(move |c| {
+                let mut st = c.prepare(
+                    "SELECT key, value FROM user_settings WHERE user_id = ?1 ORDER BY key",
+                )?;
+                Ok(st
+                    .query_map([user], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?)
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(k, v)| Ok((k, serde_json::from_str(&v).map_err(json_err)?)))
+            .collect()
+    }
+
+    /// Пишет настройки пользователя одной транзакцией; нет пользователя — `NotFound`.
+    /// Возвращает прежние значения изменённых ключей (`None` — не было строки); ключ, значение
+    /// которого не меняется, не пишется и не возвращается.
+    pub async fn set_user_settings(
+        &self,
+        user: Id,
+        edits: Vec<(String, serde_json::Value)>,
+    ) -> Result<Vec<(String, Option<serde_json::Value>)>, StoreError> {
+        self.db
+            .write(move |tx| {
+                let exists: Option<i64> = tx
+                    .query_row("SELECT 1 FROM users WHERE id = ?1", [user], |r| r.get(0))
+                    .optional()?;
+                if exists.is_none() {
+                    return Err(StoreError::NotFound);
+                }
+                let mut changed = Vec::new();
+                for (key, value) in edits {
+                    let old: Option<String> = tx
+                        .query_row(
+                            "SELECT value FROM user_settings WHERE user_id = ?1 AND key = ?2",
+                            params![user, key],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let old = old
+                        .map(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(json_err))
+                        .transpose()?;
+                    if old.as_ref() == Some(&value) {
+                        continue;
+                    }
+                    let json = serde_json::to_string(&value).map_err(json_err)?;
+                    tx.execute(
+                        "INSERT INTO user_settings (user_id, key, value) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+                        params![user, key, json],
+                    )?;
+                    changed.push((key, old));
+                }
+                Ok(changed)
+            })
+            .await
     }
 
     pub async fn set_setting<T: Serialize + ?Sized>(

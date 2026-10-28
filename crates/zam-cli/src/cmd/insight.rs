@@ -1,23 +1,32 @@
 //! Insights (§7.5, §13.2): `zam log insight …` и `zam insight list|show|supersede|retract|
-//! revisit|append`.
+//! revisit|append|certify|feedback`.
 //!
 //! - `zam log insight --kind K --title T [--scope solution|global] [--certainty C]
-//!   [--evidence-file F] [--trigger TYPE:PATTERN]… [--tag X]… [--force] [--supersedes ID]
+//!   [--reason R] [--evidence-file F] [--trigger TYPE:PATTERN]… [--tag X]… [--force] [--supersedes ID]
 //!   [--area A] [--solution GUID] [--key K] [--body-file F | stdin]` — запись insight в решение
 //!   (`solution.toml` или `--solution`) или, при `--scope global`, в Knowledge. `--evidence-file`
 //!   — JSON-объект `{checked, method, result}` → `data.evidence`; `--trigger` —
 //!   `file_glob:**/*.sh`, `command_regex:…`, `error_regex:…`, `keyword:…` (без инструментов:
 //!   любые). Ответ 409 (похожий insight уже есть) печатает кандидатов и подсказки, код 4.
 //!   Успех → `<id>@<rev>`; проверка только по заголовку (нет модели) — пометка в stderr.
+//!   `--certainty axiom` — только по прямому указанию пользователя и только с `--reason`
+//!   (иначе код 6 до запроса); `--reason` уходит сообщением ревизии (`message`) (стенд M4).
 //! - `zam insight list [--status S,…] [--global] [--solution GUID] [--limit N]` — лента insight;
 //!   `show ID` — карточка с текстом и триггерами; `supersede ID --title T [--kind K] …` —
 //!   замещение (вид по умолчанию — у старой записи); `retract ID --reason R`; `revisit ID
 //!   [--reason R]`; `append ID [--body-file F | stdin]` — дописать к телу.
-//! - `zam insight certify ID axiom|theorem|hypothesis|none --reason R [--evidence-file F]
-//!   [--human]` — смена эпистемического статуса (§7.5): `theorem` от агента — с доказательством
-//!   (`--evidence-file` дописывается в `data.evidence`), `axiom` и любая правка `axiom` — только
-//!   с `--human`: адрес и токен — только из `~/.zeroaimemory/config.toml` (`url`,
-//!   `human_token`), только в интерактивном терминале с подтверждением вводом id записи.
+//! - `zam insight certify ID axiom|theorem|hypothesis|none --reason R [--evidence-file F]` —
+//!   смена эпистемического статуса (§7.5) обычным токеном: `theorem` — с доказательством
+//!   (`--evidence-file` дописывается в `data.evidence`); `axiom` агент ставит и меняет только
+//!   по прямому указанию пользователя (§14.2), сервер это не проверяет.
+//!
+//! - `zam insight feedback ID useful|useless [--session S]` — оценка полезности записи (§10.5,
+//!   `POST /entries/{id}/feedback`, источник `agent`); печатает `<id> <оценка>`. Показы и оценки
+//!   (`usage`) — в `insight show`.
+//!
+//! `certify`, `append` и `revisit` правят запись с ревизией (§11.3): `rev` — из
+//! `GET /entries/{id}`, запрос — с `If-Match`; запись изменилась между чтением и правкой (409) —
+//! «запись изменилась (rev N → M): перечитайте», код 4.
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -36,6 +45,8 @@ pub struct Fields<'a> {
     pub title: &'a str,
     pub body_file: Option<&'a Path>,
     pub certainty: Option<&'a str>,
+    /// Причина статуса (`message` первой ревизии); для `axiom` обязательна.
+    pub reason: Option<&'a str>,
     pub evidence_file: Option<&'a Path>,
     pub triggers: &'a [String],
     pub tags: &'a [String],
@@ -83,8 +94,22 @@ fn read_evidence(p: &Path) -> Result<Value, CliError> {
     Ok(v)
 }
 
+/// Причина статуса (непустая) и правило аксиомы: `axiom` — только с `--reason`. Проверяется до
+/// чтения stdin и запросов: сервер аксиому агента не проверяет (§7.5, решение владельца
+/// 2026-10-26), правило инструкции агента CLI держит сам.
+fn status_reason<'a>(f: &Fields<'a>) -> Result<Option<&'a str>, CliError> {
+    let reason = f.reason.map(str::trim).filter(|r| !r.is_empty());
+    if f.certainty == Some("axiom") && reason.is_none() {
+        return Err(CliError::input(
+            "--certainty axiom ставится только по прямому указанию пользователя: укажите --reason (что именно сказал пользователь)",
+        ));
+    }
+    Ok(reason)
+}
+
 /// Тело запроса новой записи insight (без `scope`, `force`, `supersedes_id`).
 fn insight_body(f: &Fields, kind: &str) -> Result<Value, CliError> {
+    let reason = status_reason(f)?;
     let mut data = json!({ "kind": kind });
     if let Some(p) = f.evidence_file {
         data["evidence"] = read_evidence(p)?;
@@ -107,6 +132,9 @@ fn insight_body(f: &Fields, kind: &str) -> Result<Value, CliError> {
     }
     if let Some(a) = f.area {
         body["area"] = json!(a);
+    }
+    if let Some(r) = reason {
+        body["message"] = json!(r);
     }
     Ok(body)
 }
@@ -271,6 +299,41 @@ fn get_entry(ctx: &Ctx, id: &str) -> Result<Value, CliError> {
     read_json(ctx.client.get(&format!("/entries/{id}"), &[])?)
 }
 
+/// Ревизия записи из `GET /entries/{id}`.
+fn rev_of(e: &Value) -> Result<i64, CliError> {
+    e["rev"]
+        .as_i64()
+        .ok_or_else(|| CliError::new(crate::client::EXIT_UNREACHABLE, "в ответе нет rev записи"))
+}
+
+/// 409 с `rev` текущей на правку с ревизией `sent` → «запись изменилась (rev N → M):
+/// перечитайте», код [`EXIT_CONFLICT`] (как у заметок, решение контроллера R7); прочие
+/// ошибки — как есть.
+fn explain_stale(e: CliError, sent: i64) -> CliError {
+    let Some(cur) = e
+        .problem
+        .as_ref()
+        .filter(|p| p["status"] == 409)
+        .and_then(|p| p["rev"].as_i64())
+    else {
+        return e;
+    };
+    CliError {
+        code: EXIT_CONFLICT,
+        msg: format!("запись изменилась (rev {sent} → {cur}): перечитайте"),
+        problem: e.problem,
+    }
+}
+
+/// `PATCH /entries/{id}` с `If-Match: <rev>` (§11.3).
+fn patch_entry(ctx: &Ctx, id: &str, rev: i64, body: &Value) -> Result<Value, CliError> {
+    let r = ctx
+        .client
+        .patch_json_if(&format!("/entries/{id}"), body, rev)
+        .map_err(|e| explain_stale(e, rev))?;
+    read_json(r)
+}
+
 /// `zam insight show <id>`.
 pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
     let e = get_entry(ctx, id)?;
@@ -296,6 +359,13 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
             t["pattern"].as_str().unwrap_or("")
         ));
     }
+    let u = &e["usage"];
+    if u.is_object() {
+        out.push_str(&format!(
+            "показы: {} · полезно: {} · бесполезно: {}\n",
+            u["shown"], u["useful"], u["useless"]
+        ));
+    }
     let body = e["body"].as_str().unwrap_or("");
     if !body.is_empty() {
         out.push('\n');
@@ -307,6 +377,7 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
 
 /// `zam insight supersede <id>`: новая запись замещает старую (вид — у старой, если не задан).
 pub fn supersede(ctx: &Ctx, id: &str, f: &Fields) -> Result<(), CliError> {
+    status_reason(f)?;
     let kind = match f.kind {
         Some(k) => k.to_string(),
         None => get_entry(ctx, id)?["data"]["kind"]
@@ -368,8 +439,8 @@ pub fn revisit(ctx: &Ctx, id: &str, reason: Option<&str>) -> Result<(), CliError
     if let Some(r) = reason {
         body["reason"] = json!(r);
     }
-    let r = ctx.client.patch_json(&format!("/entries/{id}"), &body)?;
-    emit_changed(ctx, &read_json(r)?)
+    let rev = rev_of(&get_entry(ctx, id)?)?;
+    emit_changed(ctx, &patch_entry(ctx, id, rev, &body)?)
 }
 
 /// Тело `PATCH` смены статуса: `certainty` (`none` → `null`), причина и — при доказательстве —
@@ -411,13 +482,9 @@ pub fn certify(
         ));
     }
     let evidence = evidence_file.map(read_evidence).transpose()?;
-    let current = match evidence {
-        Some(_) => Some(get_entry(ctx, id)?),
-        None => None,
-    };
-    let body = certify_body(current.as_ref(), certainty, reason, evidence);
-    let r = ctx.client.patch_json(&format!("/entries/{id}"), &body)?;
-    let e = read_json(r)?;
+    let current = get_entry(ctx, id)?;
+    let body = certify_body(Some(&current), certainty, reason, evidence);
+    let e = patch_entry(ctx, id, rev_of(&current)?, &body)?;
     if ctx.json {
         return emit_json(&e);
     }
@@ -432,6 +499,20 @@ pub fn certify(
     )
 }
 
+/// `zam insight feedback <id> useful|useless [--session S]`.
+pub fn feedback(ctx: &Ctx, id: &str, value: &str, session: Option<&str>) -> Result<(), CliError> {
+    let mut body = json!({ "value": value });
+    if let Some(s) = session {
+        body["session_id"] = json!(s);
+    }
+    ctx.client
+        .post_json(&format!("/entries/{id}/feedback"), &body)?;
+    if ctx.json {
+        return emit_json(&json!({ "id": id, "value": value }));
+    }
+    emit(format!("{id} {value}\n").as_bytes())
+}
+
 /// `zam insight append <id>` — текст из `--body-file` или stdin; пустой → код 6.
 pub fn append(ctx: &Ctx, id: &str, body_file: Option<&Path>) -> Result<(), CliError> {
     let text = read_text(body_file)?;
@@ -440,10 +521,11 @@ pub fn append(ctx: &Ctx, id: &str, body_file: Option<&Path>) -> Result<(), CliEr
             "нечего дописывать: текст из --body-file или stdin",
         ));
     }
-    let r = ctx
-        .client
-        .patch_json(&format!("/entries/{id}"), &json!({ "append_body": text }))?;
-    emit_changed(ctx, &read_json(r)?)
+    let rev = rev_of(&get_entry(ctx, id)?)?;
+    emit_changed(
+        ctx,
+        &patch_entry(ctx, id, rev, &json!({ "append_body": text }))?,
+    )
 }
 
 #[cfg(test)]
@@ -470,6 +552,35 @@ mod tests {
         }
     }
 
+    /// Стенд Debian 13: `--certainty axiom` — только с непустой `--reason`; причина —
+    /// сообщение ревизии.
+    #[test]
+    fn axiom_requires_reason() {
+        let f = |certainty: Option<&'static str>, reason: Option<&'static str>| Fields {
+            kind: Some("decision"),
+            title: "T",
+            body_file: None,
+            certainty,
+            reason,
+            evidence_file: None,
+            triggers: &[],
+            tags: &[],
+            area: None,
+            key: None,
+        };
+        for r in [None, Some(""), Some("  ")] {
+            let e = status_reason(&f(Some("axiom"), r)).unwrap_err();
+            assert_eq!(e.code, crate::client::EXIT_INPUT);
+            assert!(e.msg.contains("--reason"), "{}", e.msg);
+        }
+        assert_eq!(
+            status_reason(&f(Some("axiom"), Some(" сказал пользователь "))).unwrap(),
+            Some("сказал пользователь")
+        );
+        assert_eq!(status_reason(&f(Some("hypothesis"), None)).unwrap(), None);
+        assert_eq!(status_reason(&f(None, Some("R"))).unwrap(), Some("R"));
+    }
+
     #[test]
     fn certify_body_forms() {
         assert_eq!(
@@ -486,6 +597,26 @@ mod tests {
         assert_eq!(b["data"]["kind"], "gotcha");
         assert_eq!(b["data"]["experiment"]["result"], "confirmed");
         assert_eq!(b["data"]["evidence"], ev);
+    }
+
+    #[test]
+    fn stale_revision_explained() {
+        let e = CliError {
+            code: EXIT_CONFLICT,
+            msg: "x".into(),
+            problem: Some(json!({"type": "/problems/conflict", "status": 409, "rev": 5})),
+        };
+        let s = explain_stale(e, 3);
+        assert_eq!(s.code, EXIT_CONFLICT);
+        assert_eq!(s.msg, "запись изменилась (rev 3 → 5): перечитайте");
+        // 409 без rev (например, содержимое superseded) — как есть
+        let other = CliError {
+            code: EXIT_CONFLICT,
+            msg: "y".into(),
+            problem: Some(json!({"type": "/problems/conflict", "status": 409})),
+        };
+        let o = explain_stale(other, 3);
+        assert_eq!((o.code, o.msg.as_str()), (EXIT_CONFLICT, "y"));
     }
 
     #[test]

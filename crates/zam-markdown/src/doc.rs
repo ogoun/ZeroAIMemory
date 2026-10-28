@@ -327,6 +327,46 @@ pub(crate) fn sections_by_path<'a>(doc: &'a Doc, path: &str) -> impl Iterator<It
     })
 }
 
+/// Итог поиска секции для чтения ([`resolve_section`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionLookup<'a> {
+    /// Ровно одна секция; её полный путь — `Section::path`.
+    Found(&'a Section),
+    NotFound,
+    /// Путь (полный или хвост) — у нескольких секций.
+    Ambiguous,
+}
+
+/// Секция для **чтения** по пути `"A > B"`: сначала полный путь заголовков от верхнего; если
+/// такого нет — секции, чей путь **кончается** заданным (`Тесты` для `Сборка > Тесты`).
+/// Одна — [`SectionLookup::Found`], несколько — [`SectionLookup::Ambiguous`]. Агент обычно
+/// знает свой заголовок, а не путь от корня (проверка на стенде Debian 13, M4). Запись
+/// (`apply_patch`) хвост не принимает: там нужна строгость.
+pub fn resolve_section<'a>(doc: &'a Doc, path: &str) -> SectionLookup<'a> {
+    let want: Vec<&str> = path.split('>').map(str::trim).collect();
+    if want.iter().any(|p| p.is_empty()) {
+        return SectionLookup::NotFound;
+    }
+    let headed = || doc.sections.iter().filter(|s| s.level > 0);
+    let pick = |mut it: Box<dyn Iterator<Item = &'a Section> + '_>| match (it.next(), it.next()) {
+        (None, _) => None,
+        (Some(s), None) => Some(SectionLookup::Found(s)),
+        (Some(_), Some(_)) => Some(SectionLookup::Ambiguous),
+    };
+    let exact = headed().filter(|s| s.path.iter().map(String::as_str).eq(want.iter().copied()));
+    if let Some(r) = pick(Box::new(exact)) {
+        return r;
+    }
+    let tail = headed().filter(|s| {
+        s.path.len() > want.len()
+            && s.path[s.path.len() - want.len()..]
+                .iter()
+                .map(String::as_str)
+                .eq(want.iter().copied())
+    });
+    pick(Box::new(tail)).unwrap_or(SectionLookup::NotFound)
+}
+
 /// Якорь заголовка по алгоритму comrak (`header_id`), без префикса и суффикса уникальности.
 /// Буквы любых алфавитов сохраняются.
 pub fn slug(text: &str) -> String {

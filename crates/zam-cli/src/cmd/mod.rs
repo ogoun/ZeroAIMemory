@@ -1,9 +1,14 @@
 //! Команды `zam`. Общее: флаги подключения, разрешение цели, вывод в stdout.
 pub mod attach;
+pub mod cache;
+pub mod guide;
 pub mod history;
+pub mod hook;
+pub mod init;
 pub mod insight;
 pub mod link;
 pub mod log;
+pub mod mcp;
 pub mod read;
 pub mod release;
 pub mod search;
@@ -59,90 +64,6 @@ pub struct Ctx {
     pub json: bool,
 }
 
-/// Отказ `--human` без интерактивного терминала.
-pub const HUMAN_TTY_REQUIRED: &str = "подтверждение аксиом — только человеком: WebUI или интерактивный терминал \
-     (--human требует, чтобы stdin и stderr были терминалом)";
-
-/// Шлюз `--human` (ruling контроллера, §11.4): только при интерактивном терминале (`tty` —
-/// stdin и stderr — терминал), и человек подтверждает действие, введя `expected` (id записи).
-/// Агент, вызывающий CLI без терминала, получает отказ (код токена) без запроса к серверу.
-pub fn human_gate(
-    tty: bool,
-    expected: &str,
-    input: &mut dyn std::io::BufRead,
-    prompt: &mut dyn std::io::Write,
-) -> Result<(), CliError> {
-    if !tty {
-        return Err(CliError::new(EXIT_TOKEN, HUMAN_TTY_REQUIRED));
-    }
-    let _ = write!(
-        prompt,
-        "Действие от имени человека (человеческий токен). Для подтверждения введите id записи {expected}: "
-    );
-    let _ = prompt.flush();
-    let mut line = String::new();
-    input
-        .read_line(&mut line)
-        .map_err(|e| CliError::new(EXIT_TOKEN, format!("чтение подтверждения: {e}")))?;
-    if line.trim() != expected {
-        return Err(CliError::new(
-            EXIT_TOKEN,
-            "подтверждение не совпало с id записи: действие отменено",
-        ));
-    }
-    Ok(())
-}
-
-/// Подключение с человеческим токеном (`--human`, §7.5, §11.4) для действия над `confirm_id`:
-/// 1. только интерактивный терминал и подтверждение вводом id ([`human_gate`]);
-/// 2. адрес и токен — только из `~/.zeroaimemory/config.toml` (`url`, `human_token`,
-///    [`locate::human_target`]); адрес из флага, `ZAM_URL` или файлов проекта игнорируется, при
-///    расхождении — предупреждение в stderr.
-pub fn connect_human(c: &Common, confirm_id: &str) -> Result<Ctx, CliError> {
-    use std::io::IsTerminal;
-    let tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    human_gate(
-        tty,
-        confirm_id,
-        &mut std::io::stdin().lock(),
-        &mut std::io::stderr(),
-    )?;
-    let (url, token) = locate::human_target(&home_dir())
-        .map_err(CliError::config)?
-        .ok_or_else(|| {
-            CliError::new(
-                EXIT_TOKEN,
-                "--human: нет human_token в ~/.zeroaimemory/config.toml (человеческий токен \
-                 выпускает администратор в WebUI; не кладите его в CLAUDE.md/AGENTS.md)",
-            )
-        })?;
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let flags = Flags {
-        url: c.url.clone(),
-        token: None,
-    };
-    // другие источники адреса — только для предупреждения
-    if let Ok(r) = locate::resolve(&flags, &zam_env(), &cwd, &home_dir())
-        && let Some(w) = locate::human_url_warning(&url.value, r.url.as_ref())
-    {
-        eprintln!("{w}");
-    }
-    let solution = match locate::find_solution(&cwd) {
-        Some(p) => Some(target::load_solution(&p)?),
-        None => None,
-    };
-    let client = Client::new(
-        &url.value,
-        &token.value,
-        solution.as_ref().map(|s| s.id.clone()),
-    );
-    Ok(Ctx {
-        client,
-        solution,
-        json: c.json,
-    })
-}
-
 /// URL и токен (`locate` M0), `solution.toml` — и клиент API.
 pub fn connect(c: &Common) -> Result<Ctx, CliError> {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -167,16 +88,32 @@ pub fn connect(c: &Common) -> Result<Ctx, CliError> {
         Some(p) => Some(target::load_solution(&p)?),
         None => None,
     };
-    let client = Client::new(
+    let mut client = Client::new(
         &url.value,
         &token.value,
         solution.as_ref().map(|s| s.id.clone()),
     );
+    client.set_session(agent_session(&cwd));
     Ok(Ctx {
         client,
         solution,
         json: c.json,
     })
+}
+
+/// Сессия агента для `X-Zam-Session` (fix round 1, I-1): `ZAM_SESSION` (`-` — без сессии)
+/// сильнее всего; иначе — только если команду запустил агент ([`hook::launched_by_agent`]):
+/// текущая сессия хуков проекта (`.zeroaimemory/cache/session.json`, не старше 12 ч), затем
+/// запасной `CLAUDE_CODE_SESSION_ID`. Человек в обычном терминале пишет без сессии
+/// **[решение контроллера, задача 10 M4]**.
+fn agent_session(cwd: &std::path::Path) -> Option<String> {
+    hook::agent_session_from(
+        |k| std::env::var(k).ok(),
+        &std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .collect::<Vec<_>>(),
+        || hook::cache::current_session(&hook::project_root(cwd, &home_dir())),
+    )
 }
 
 impl Ctx {
@@ -323,23 +260,4 @@ pub fn post_entry(
         return emit_json(&json!({ "entry": e, "created": created }));
     }
     emit(format!("{}@{}\n", e["id"].as_str().unwrap_or("?"), e["rev"]).as_bytes())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn human_gate_requires_tty_and_confirmation() {
-        let mut out = Vec::new();
-        let e = human_gate(false, "01ID", &mut "01ID\n".as_bytes(), &mut out).unwrap_err();
-        assert_eq!(e.code, EXIT_TOKEN);
-        assert!(e.msg.contains("интерактивный терминал"), "{}", e.msg);
-        assert!(out.is_empty(), "без терминала ничего не спрашивается");
-        let e = human_gate(true, "01ID", &mut "01IX\n".as_bytes(), &mut out).unwrap_err();
-        assert_eq!(e.code, EXIT_TOKEN);
-        assert!(String::from_utf8_lossy(&out).contains("01ID"));
-        assert!(human_gate(true, "01ID", &mut " 01ID \n".as_bytes(), &mut Vec::new()).is_ok());
-        assert!(human_gate(true, "01ID", &mut "".as_bytes(), &mut Vec::new()).is_err());
-    }
 }

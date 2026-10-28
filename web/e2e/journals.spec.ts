@@ -137,6 +137,8 @@ test('Insights: замена записи и повышение до theorem с 
   await expect(card.getByRole('heading', { name: 'Старый вывод о Qdrant' })).toBeVisible();
   await card.getByRole('button', { name: 'Заменить' }).click();
   const form = card.getByRole('form', { name: 'Замена insight' });
+  // новая запись человека — без статуса по умолчанию (аксиому человек ставит явно)
+  await expect(form.getByLabel('Надёжность новой записи')).toHaveValue('');
   await form.getByLabel('Заголовок').fill('Новый вывод о Qdrant');
   await form.getByRole('button', { name: 'Заменить' }).click();
   await expect(card.getByRole('heading', { name: 'Новый вывод о Qdrant' })).toBeVisible();
@@ -149,17 +151,20 @@ test('Insights: замена записи и повышение до theorem с 
   await expect(table.locator('tbody tr')).toHaveCount(4);
   await expect(table.locator('tr', { hasText: 'Старый вывод о Qdrant' })).toContainText('заменён');
 
-  // Повышение гипотезы до theorem: причина обязательна, для theorem — доказательство
+  // Повышение гипотезы до theorem: человеку причина и доказательство необязательны (R8)
   await table.getByRole('button', { name: 'Кэш эмбеддингов ускоряет переиндексацию' }).click();
   await expect(page).toHaveURL(new RegExp(`/j/insights/${env('E2E_INSIGHT_HYP')}$`));
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
   const cf = card.getByRole('form', { name: 'Статус надёжности' });
   await cf.getByLabel('theorem').check();
   await cf.getByRole('button', { name: 'Сохранить' }).click();
-  await expect(cf.getByRole('alert')).toHaveText('Укажите причину смены статуса надёжности.');
+  await expect(card.getByRole('status')).toHaveText('Статус надёжности изменён.');
+  await expect(card.locator('header [data-certainty="theorem"]')).toBeVisible();
+  await expect(card.locator('.evidence')).toHaveCount(0);
+  // доказательство можно дописать позже той же формой
+  await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
+  await expect(cf.getByLabel('theorem')).toBeChecked();
   await cf.getByLabel(/^Причина/).fill('замерено на реальной базе');
-  await cf.getByRole('button', { name: 'Сохранить' }).click();
-  await expect(cf.getByRole('alert')).toContainText('Для theorem заполните доказательство');
   await cf.getByLabel('Проверено').fill('время переиндексации 10 тыс. заметок');
   await cf.getByLabel('Метод').fill('reindex без full и с full');
   await cf.getByLabel('Результат').fill('в 8 раз быстрее из кэша');
@@ -170,10 +175,9 @@ test('Insights: замена записи и повышение до theorem с 
   await expect(card.locator('.evidence')).toContainText('в 8 раз быстрее из кэша');
   await expect(table.locator('[data-certainty="theorem"]')).toHaveCount(2);
 
-  // Администратор — человек: axiom доступна
+  // Администратор — человек: axiom доступна, причина необязательна
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
   await cf.getByLabel('axiom').check();
-  await cf.getByLabel(/^Причина/).fill('подтверждено владельцем');
   await cf.getByRole('button', { name: 'Сохранить' }).click();
   await expect(card.locator('header [data-certainty="axiom"]')).toBeVisible();
   // доказательство не удаляется, но подписано как прежнее
@@ -257,17 +261,29 @@ test('журнал по прямому адресу у Rules: понятное �
   await expect(page.getByRole('table', { name: 'Insights' })).toHaveCount(0);
 });
 
-test('Vault: баннер vault-locked (503)', async ({ page }) => {
+test('Vault: заблокирован — список виден, «Показать» неактивна, баннер', async ({ page }) => {
   // ответ сервера без мастер-ключа подменяется: сам сервер E2E с ключом
+  const reason = 'Vault заблокирован: мастер-ключ не подходит к ключам пользователей';
   await page.route(`**/api/v1/spaces/${SOLUTION_GUID}/vault`, (route) =>
     route.fulfill({
-      status: 503,
-      contentType: 'application/problem+json',
+      status: 200,
+      contentType: 'application/json',
       json: {
-        type: '/problems/vault-locked',
-        title: 'Service Unavailable',
-        status: 503,
-        detail: 'Vault заблокирован: мастер-ключ не подходит к ключам пользователей',
+        locked: true,
+        reason,
+        items: [
+          {
+            id: '01HZZZZZZZZZZZZZZZZZZZZZZZ',
+            space: SOLUTION_GUID,
+            agent_solution_id: SOLUTION_GUID,
+            title: 'E2E заблокированный',
+            data: { type: 'token', username: 'deploy-bot' },
+            rev: 1,
+            author: { kind: 'agent' },
+            created_at: '2026-10-26T10:00:00Z',
+            updated_at: '2026-10-26T10:00:00Z',
+          },
+        ],
       },
     }),
   );
@@ -275,7 +291,29 @@ test('Vault: баннер vault-locked (503)', async ({ page }) => {
   const banner = page.locator('.locked');
   await expect(banner).toContainText('Vault заблокирован: мастер-ключ не подходит');
   await expect(banner).toContainText('ZAM_MASTER_KEY');
-  await expect(page.locator('li.item')).toHaveCount(0);
+  const item = page.locator('li.item', { hasText: 'E2E заблокированный' });
+  await expect(item).toContainText('deploy-bot');
+  await expect(item.getByRole('button', { name: 'Показать' })).toBeDisabled();
+});
+
+test('Vault: 503 при раскрытии — баннер vault-locked', async ({ page }) => {
+  await page.route('**/api/v1/vault/*', (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: 'application/problem+json',
+      json: {
+        type: '/problems/vault-locked',
+        title: 'Service Unavailable',
+        status: 503,
+        detail: 'Vault заблокирован: файл мастер-ключа не найден',
+      },
+    }),
+  );
+  await openJournal(page, 'Vault');
+  const item = page.locator('li.item', { hasText: 'E2E токен деплоя' });
+  await item.getByRole('button', { name: 'Показать' }).click();
+  await expect(page.locator('.locked')).toContainText('Vault заблокирован: файл мастер-ключа');
+  await expect(item.getByRole('button', { name: 'Показать' })).toBeDisabled();
 });
 
 test('Связи: обратная ссылка и неразрешённая исходящая', async ({ page }) => {

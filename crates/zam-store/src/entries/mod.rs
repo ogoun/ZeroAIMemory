@@ -46,6 +46,7 @@ pub use triggers::{
     TriggerKind, TriggerRow, active_triggers, entry_triggers, set_triggers, validate_trigger,
 };
 pub(crate) use triggers::{check_triggers, replace_triggers, same_triggers};
+pub(crate) use write::insert_entry;
 pub use write::{
     create_entry, delete_entry, entry_by_idempotency_key, restore_entry, retract_entry,
     supersede_entry, update_entry,

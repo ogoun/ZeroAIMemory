@@ -120,14 +120,16 @@ impl W {
         self.a.tok(tok, m, uri, body).await
     }
 
+    /// `PATCH /entries/{id}` с `If-Match` текущей ревизии.
     async fn patch(&self, id: &str, body: Value) -> Resp {
-        self.req(
-            &self.a_tok,
-            Method::PATCH,
-            &format!("/api/v1/entries/{id}"),
-            Some(body),
-        )
-        .await
+        self.a
+            .tok_rev(
+                &self.a_tok,
+                Method::PATCH,
+                &format!("/api/v1/entries/{id}"),
+                Some(body),
+            )
+            .await
     }
 
     async fn entry(&self, id: &str) -> Value {
@@ -883,7 +885,8 @@ async fn triggers_etag_304_and_changes_after_edit() {
     w.patch(&id_of(&e), json!({"title": "LF в bash"})).await;
     let j3 = w.triggers(&w.a_tok, &q, None).await.json();
     assert_ne!(j3["etag"].as_str().unwrap(), etag2);
-    // без решения — только Knowledge; не GUID — 400; неизвестное решение — 404
+    // без решения — только Knowledge; не GUID — 400; неизвестное решение — 200 с
+    // предупреждением (как поиск, решение владельца 2026-10-26)
     let r = w.triggers(&w.a_tok, "", None).await;
     assert_eq!(patterns(&r.json()), vec!["bad interpreter"]);
     let r = w.triggers(&w.a_tok, "?solution=knowledge", None).await;
@@ -895,7 +898,9 @@ async fn triggers_etag_304_and_changes_after_edit() {
             None,
         )
         .await;
-    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["warnings"], json!(["solution unknown"]));
+    assert_eq!(patterns(&r.json()), vec!["bad interpreter"]);
 }
 
 #[tokio::test]
@@ -982,7 +987,8 @@ async fn member_triggers_only_solution_and_own_knowledge() {
     // владелец видит свои
     let j = w.triggers(&w.a_tok, &q, None).await.json();
     assert_eq!(patterns(&j), vec!["solution", "anna-knowledge"]);
-    // отзыв доступа — 403 со следующего запроса; без решения — только свой Knowledge
+    // отзыв доступа — со следующего запроса решение исключается с предупреждением;
+    // без решения — только свой Knowledge
     let r =
         w.a.tok(
             &w.a_tok,
@@ -993,8 +999,9 @@ async fn member_triggers_only_solution_and_own_knowledge() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let r = w.triggers(&w.b_tok, &q, None).await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
-    assert_eq!(r.json()["state"], "revoked");
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["warnings"], json!(["solution access revoked"]));
+    assert_eq!(patterns(&r.json()), vec!["boris-knowledge"]);
     let j = w.triggers(&w.b_tok, "", None).await.json();
     assert_eq!(patterns(&j), vec!["boris-knowledge"]);
 }

@@ -17,8 +17,10 @@ use serde_json::Value;
 
 /// Пароль администратора первого старта (`ZAM_ADMIN_PASSWORD`).
 const PASSWORD: &str = "pw";
-/// Строка stderr с первым токеном (`zam_server::print_initial_token`).
+/// Строка stderr с первым токеном, когда stderr — терминал (в тестах не бывает).
 const TOKEN_PREFIX: &str = "ZeroAIMemoryToken=";
+/// Строка stderr с путём к файлу первого токена (stderr — канал, как у службы).
+const TOKEN_FILE_PREFIX: &str = zam_server::INITIAL_TOKEN_FILE_LINE;
 /// Сколько последних строк stderr хранить для сообщения об ошибке.
 const TAIL: usize = 60;
 
@@ -69,11 +71,22 @@ impl ServerProc {
                     let _ = tx.send(tok.trim().to_string());
                     continue;
                 }
-                let mut l = t.lock().unwrap_or_else(|p| p.into_inner());
-                if l.len() == TAIL {
-                    l.pop_front();
+                // файл записан до строки с путём; токена в stderr нет. Строка попадает в хвост
+                // до отправки токена: тест, получивший токен, сразу видит путь в `tail()`
+                // (гонка на Linux CI, финальное ревью M4)
+                let token = line
+                    .strip_prefix(TOKEN_FILE_PREFIX)
+                    .and_then(|path| std::fs::read_to_string(path.trim()).ok());
+                {
+                    let mut l = t.lock().unwrap_or_else(|p| p.into_inner());
+                    if l.len() == TAIL {
+                        l.pop_front();
+                    }
+                    l.push_back(line);
                 }
-                l.push_back(line);
+                if let Some(tok) = token {
+                    let _ = tx.send(tok.trim().to_string());
+                }
             }
         });
         ServerProc {

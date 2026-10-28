@@ -1,5 +1,7 @@
-//! `zam status`: сервер, токен, пользователь, solution.toml, роль в решении и число
-//! ожидающих запросов доступа к решениям пользователя (M0, холодный старт ≤ 20 мс).
+//! `zam status`: сервер, токен, пользователь, solution.toml, роль в решении, число
+//! ожидающих запросов доступа к решениям пользователя (M0, холодный старт ≤ 20 мс) и версия
+//! блока инструкции в CLAUDE.md/AGENTS.md против версии сервера (`GET /agent-setup`, §15.5):
+//! устарел — одно напоминание.
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -75,6 +77,7 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
         solution,
         role: None,
         pending: None,
+        block: None,
     };
 
     // 2. токен: /spaces
@@ -103,6 +106,7 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
                     &s.id,
                 ));
             }
+            rep.block = block_versions(&agent, &rep.url.value, &token.value, &cwd);
             rep.print(as_json, None);
             0
         }
@@ -159,6 +163,23 @@ fn solution_role(
     }
 }
 
+/// Версия блока ближайшего CLAUDE.md/AGENTS.md (как у хука `session-start`) и версия
+/// сервера; сервер без `/agent-setup` (старый) — `None`.
+fn block_versions(
+    agent: &ureq::Agent,
+    url: &str,
+    token: &str,
+    cwd: &Path,
+) -> Option<(Option<u32>, u32)> {
+    let (200, body) = get(agent, &format!("{url}/api/v1/agent-setup"), Some(token)).ok()? else {
+        return None;
+    };
+    let server = serde_json::from_str::<Value>(&body).ok()?["version"].as_u64()? as u32;
+    let root = super::hook::project_root(cwd, &home_dir());
+    let local = super::hook::session_start::block_version(cwd, &root, super::hook::Agent::Claude);
+    Some((local, server))
+}
+
 fn str_of(v: &Value) -> String {
     v.as_str().unwrap_or("?").to_string()
 }
@@ -175,6 +196,8 @@ struct Report {
     role: Option<String>,
     /// Ожидающие запросы доступа к решениям пользователя.
     pending: Option<u64>,
+    /// Версия блока инструкции: (в файле, на сервере).
+    block: Option<(Option<u32>, u32)>,
 }
 
 impl Report {
@@ -194,6 +217,11 @@ impl Report {
                 "solution": sol.map(|d| d.to_string()),
                 "solution_role": self.role,
                 "access_requests_pending": self.pending,
+                "agent_block": self.block.map(|(local, server)| json!({
+                    "version": local,
+                    "current": server,
+                    "outdated": local.is_some_and(|l| l < server),
+                })),
                 "error": problem,
             });
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -228,6 +256,14 @@ impl Report {
         }
         if let Some(n) = self.pending.filter(|n| *n > 0) {
             println!("Ожидают подтверждения доступа: {n} (zam solution access requests)");
+        }
+        match self.block {
+            Some((Some(l), s)) if l < s => println!(
+                "Блок ZeroAIMemory устарел (v{l} → v{s}): обнови через `zam init` или WebUI"
+            ),
+            Some((Some(l), _)) => println!("Блок инструкции: v{l} (актуален)"),
+            Some((None, _)) => println!("Блок инструкции: не найден (zam init)"),
+            None => {}
         }
         if let Some(p) = problem {
             eprintln!("{p}");

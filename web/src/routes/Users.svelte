@@ -1,18 +1,22 @@
 <script lang="ts">
-  import { Dialog } from 'bits-ui';
+  // Администрирование → «Пользователи»: пользователи, их токены и пароль входа в WebUI
+  // (§11.4: пароль задаёт администратор, при первом входе пользователь обязан его сменить).
+  // Новый пользователь или токен — сразу «Подключение агента» (§15.5) с окном токена.
+  import Prompt, { type Ask } from '../components/Prompt.svelte';
   import {
     ApiError,
+    clearUserPassword,
     createUser,
     issueToken,
     listTokens,
     listUsers,
     revokeToken,
+    setUserPassword,
     type Access,
-    type IssuedToken,
     type TokenInfo,
     type User,
   } from '../lib/api';
-  import { copyText } from '../lib/clipboard';
+  import { openAgentSetup } from '../lib/agentSetup';
 
   let { onExpired }: { onExpired: () => void } = $props();
 
@@ -22,12 +26,9 @@
   let newName = $state('');
   let tokenName = $state('');
   let tokenAccess = $state<Access>('rw');
-  let tokenHuman = $state(false);
   let error = $state('');
-  let shown = $state<IssuedToken | null>(null);
-  let copied = $state(false);
-  let copyHint = $state('');
-  let tokenField = $state<HTMLInputElement | null>(null);
+  let notice = $state('');
+  let ask = $state<Ask | null>(null);
 
   // 401/403 означает потерю сессии, остальные ошибки показываем.
   async function guard(fn: () => Promise<void>) {
@@ -57,18 +58,16 @@
     return guard(async () => {
       const r = await createUser(newName);
       newName = '';
-      show(r.token);
-      await reload();
+      openAgentSetup(r.user.id, r.token);
     });
   }
 
   function addToken(e: SubmitEvent, userId: string) {
     e.preventDefault();
     return guard(async () => {
-      show(await issueToken(userId, tokenName, tokenAccess, tokenHuman));
+      const t = await issueToken(userId, tokenName, tokenAccess);
       tokenName = '';
-      tokenHuman = false;
-      await reload();
+      openAgentSetup(userId, t);
     });
   }
 
@@ -78,25 +77,52 @@
       await reload();
     });
 
-  function show(t: IssuedToken) {
-    copied = false;
-    copyHint = '';
-    shown = t;
+  /** Пароль входа: задать (с обязательной сменой при входе) или закрыть вход. */
+  function setPassword(u: User) {
+    notice = '';
+    ask = {
+      title: `Пароль пользователя «${u.name}»`,
+      message:
+        'Не короче 10 символов. Передайте пароль пользователю: при первом входе он обязан его сменить. ' +
+        'Открытые сессии пользователя закрываются.',
+      label: 'Пароль',
+      secret: true,
+      confirm: 'Задать пароль',
+      run: async (pw) => {
+        try {
+          await setUserPassword(u.id, pw);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 401) onExpired();
+          throw e;
+        }
+        notice = `Пароль пользователя «${u.name}» задан: при входе потребуется смена.`;
+        await reload();
+      },
+    };
   }
 
-  // copyText: Clipboard API в secure context, по HTTP в LAN — execCommand('copy');
-  // не вышло — токен выделяется в поле с подсказкой скопировать вручную.
-  async function copy() {
-    if (!shown) return;
-    copyHint = '';
-    if (await copyText(shown.plaintext)) {
-      copied = true;
-      return;
-    }
-    tokenField?.focus();
-    tokenField?.select();
-    copyHint = 'Не удалось скопировать автоматически: токен выделен, скопируйте его вручную (Ctrl+C).';
+  function clearPassword(u: User) {
+    notice = '';
+    ask = {
+      title: `Закрыть вход «${u.name}» в WebUI`,
+      message: 'Пароль стирается, сессии пользователя закрываются. Токены агентов продолжают работать.',
+      confirm: 'Закрыть вход',
+      danger: true,
+      run: async () => {
+        try {
+          await clearUserPassword(u.id);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 401) onExpired();
+          throw e;
+        }
+        notice = `Вход пользователя «${u.name}» в WebUI закрыт.`;
+        await reload();
+      },
+    };
   }
+
+  const passwordText = (u: User) =>
+    u.is_admin ? 'из конфигурации' : !u.has_password ? 'вход закрыт' : u.must_change_password ? 'задан, смена при входе' : 'задан';
 
   reload();
 </script>
@@ -108,20 +134,30 @@
     <button class="primary">Создать</button>
   </form>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
+  {#if notice}<p class="muted" role="status">{notice}</p>{/if}
 
-  <table style="margin-top: 12px;">
-    <thead><tr><th>Имя</th><th>Токенов</th><th>Статус</th><th></th></tr></thead>
+  <table style="margin-top: 12px;" aria-label="Пользователи">
+    <thead><tr><th>Имя</th><th>Токенов</th><th>Статус</th><th>Вход в WebUI</th><th></th></tr></thead>
     <tbody>
       {#each users as u (u.id)}
-        <tr>
+        <tr data-user={u.name}>
           <td>{u.name}{#if u.is_admin} <span class="muted">(админ)</span>{/if}</td>
           <td>{u.tokens}</td>
           <td>{u.disabled_at ? 'отключён' : 'активен'}</td>
-          <td><button onclick={() => toggle(u.id)}>{open === u.id ? 'Скрыть' : 'Токены'}</button></td>
+          <td class="muted">{passwordText(u)}</td>
+          <td class="row acts">
+            <button onclick={() => toggle(u.id)}>{open === u.id ? 'Скрыть' : 'Токены'}</button>
+            {#if !u.is_admin}
+              <button onclick={() => setPassword(u)}>{u.has_password ? 'Сменить пароль' : 'Задать пароль'}</button>
+              {#if u.has_password}
+                <button class="danger" onclick={() => clearPassword(u)}>Закрыть вход</button>
+              {/if}
+            {/if}
+          </td>
         </tr>
         {#if open === u.id}
           <tr>
-            <td colspan="4">
+            <td colspan="5">
               <table>
                 <thead><tr><th>Имя</th><th>Префикс</th><th>Доступ</th><th>Использован</th><th></th></tr></thead>
                 <tbody>
@@ -129,7 +165,7 @@
                     <tr>
                       <td>{t.name}</td>
                       <td><code>zam_{t.prefix}…</code></td>
-                      <td>{t.access}{#if t.human} · <strong>человек</strong>{/if}</td>
+                      <td>{t.access}</td>
                       <td>{t.last_used_at ?? '—'}</td>
                       <td>
                         {#if t.revoked_at}
@@ -149,19 +185,8 @@
                     <option value="rw">rw (чтение и запись)</option>
                     <option value="ro">ro (только чтение)</option>
                   </select>
-                  <label class="row" style="gap: 4px;">
-                    <input type="checkbox" bind:checked={tokenHuman} />
-                    для человека
-                  </label>
                   <button class="primary">Выпустить токен</button>
                 </form>
-                {#if tokenHuman}
-                  <p class="warn" role="note">
-                    Человеческий токен пишет от имени человека: ставит и меняет axiom. Не кладите его
-                    в CLAUDE.md или AGENTS.md — только в ~/.zeroaimemory/config.toml (human_token) для
-                    команд с флагом --human.
-                  </p>
-                {/if}
               {/if}
             </td>
           </tr>
@@ -171,33 +196,13 @@
   </table>
 </section>
 
-<Dialog.Root
-  open={shown !== null}
-  onOpenChange={(o) => {
-    if (!o) shown = null;
-  }}
->
-  <Dialog.Portal>
-    <Dialog.Overlay class="overlay" />
-    <Dialog.Content class="panel dialog">
-      <Dialog.Title>Новый токен</Dialog.Title>
-      <Dialog.Description class="warn">
-        Токен показан один раз и больше не будет показан. Сохраните его сейчас.
-      </Dialog.Description>
-      <input
-        class="token-field"
-        readonly
-        aria-label="Токен"
-        value={shown?.plaintext ?? ''}
-        bind:this={tokenField}
-        onfocus={(e) => e.currentTarget.select()}
-      />
-      <div class="row" style="margin-top: 8px;">
-        <button class="primary" onclick={copy}>{copied ? 'Скопировано' : 'Копировать'}</button>
-        <Dialog.Close>Закрыть</Dialog.Close>
-      </div>
-      {#if copied}<p class="muted" role="status">Токен скопирован в буфер обмена.</p>{/if}
-      {#if copyHint}<p class="error" role="alert">{copyHint}</p>{/if}
-    </Dialog.Content>
-  </Dialog.Portal>
-</Dialog.Root>
+<Prompt bind:ask />
+
+<style>
+  .acts {
+    gap: 4px;
+  }
+  .acts button {
+    padding: 2px 10px;
+  }
+</style>

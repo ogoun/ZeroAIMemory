@@ -3256,7 +3256,7 @@ dependencies = [
  "bytemuck",
  "num-traits",
  "rand 0.8.8",
- "schemars",
+ "schemars 0.8.22",
  "serde",
 ]
 
@@ -3835,7 +3835,7 @@ dependencies = [
  "rmp-serde",
  "roaring",
  "rustix 1.1.5",
- "schemars",
+ "schemars 0.8.22",
  "self_cell",
  "semver",
  "serde",
@@ -4102,6 +4102,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4149,6 +4169,37 @@ name = "rle-decode-fast"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
+
+[[package]]
+name = "rmcp"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "indexmap 2.14.2",
+ "pastey",
+ "pin-project-lite",
+ "rand 0.10.3",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "sse-stream",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower-service",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "rmp"
@@ -4398,11 +4449,25 @@ dependencies = [
  "dyn-clone",
  "indexmap 1.9.3",
  "indexmap 2.14.2",
- "schemars_derive",
+ "schemars_derive 0.8.22",
  "serde",
  "serde_json",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "schemars"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
+dependencies = [
+ "chrono",
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive 1.2.3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4413,8 +4478,20 @@ checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
 dependencies = [
  "proc-macro2",
  "quote",
- "serde_derive_internals",
+ "serde_derive_internals 0.29.1",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals 0.30.0",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4543,6 +4620,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4776,6 +4864,19 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -5818,6 +5919,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5938,6 +6045,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "windows-service"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
+dependencies = [
+ "bitflags 2.13.2",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6100,7 +6218,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "anyhow",
  "clap",
@@ -6112,10 +6230,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "tokenizers",
  "toml",
  "ureq",
  "windows",
+ "zam-core",
  "zam-fetch",
+ "zam-search",
  "zip",
 ]
 
@@ -6150,11 +6271,14 @@ dependencies = [
 
 [[package]]
 name = "zam-cli"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "assert_cmd",
  "axum",
+ "blake3",
  "clap",
+ "globset",
+ "regex",
  "rpassword",
  "serde",
  "serde_json",
@@ -6168,7 +6292,7 @@ dependencies = [
 
 [[package]]
 name = "zam-core"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "rand 0.9.5",
  "rusqlite",
@@ -6180,7 +6304,7 @@ dependencies = [
 
 [[package]]
 name = "zam-fetch"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "flate2",
  "lzma-rust2",
@@ -6195,7 +6319,7 @@ dependencies = [
 
 [[package]]
 name = "zam-index"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "blake3",
  "fs4",
@@ -6224,7 +6348,7 @@ dependencies = [
 
 [[package]]
 name = "zam-markdown"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "ammonia",
  "comrak",
@@ -6243,7 +6367,7 @@ dependencies = [
 
 [[package]]
 name = "zam-ml"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "half 2.7.1",
  "lru",
@@ -6262,15 +6386,16 @@ dependencies = [
 
 [[package]]
 name = "zam-search"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "jiff",
+ "regex",
  "zam-core",
 ]
 
 [[package]]
 name = "zam-server"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6288,6 +6413,7 @@ dependencies = [
  "memory-serve",
  "mime_guess",
  "rand 0.9.5",
+ "rmcp",
  "rpassword",
  "serde",
  "serde_json",
@@ -6304,12 +6430,14 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows",
+ "windows-service",
  "zam-core",
  "zam-fetch",
  "zam-index",
  "zam-markdown",
  "zam-ml",
  "zam-search",
+ "zam-server",
  "zam-store",
  "zeroize",
  "zip",
@@ -6317,7 +6445,7 @@ dependencies = [
 
 [[package]]
 name = "zam-store"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -6335,6 +6463,8 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
  "zam-core",
  "zam-markdown",
 ]

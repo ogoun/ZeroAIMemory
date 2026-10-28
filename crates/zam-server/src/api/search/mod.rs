@@ -14,6 +14,15 @@
 //!   баллом `родитель × search.graph_weight`, `sources: ["graph"]`, `via: {type, from}`);
 //! - `top_k` (10, 1..=100), `budget_tokens` (800), `format`: `json` (по умолчанию) | `md`;
 //! - `rerank`: `off` (по умолчанию) | `on` — серверный реранк (см. ниже);
+//! - `session_id` (или `X-Zam-Session`) — сессия агента: первый поиск с ней создаёт сессию
+//!   ([`super::sessions`]); `skip_seen` (по умолчанию `true`) — элемент, уже выданный этой
+//!   сессии в той же ревизии, идёт с `seen: true` без фрагмента и текста (в md — `(seen)`, §9.3).
+//!   Выданным считается элемент, у которого в той же ревизии отмечены все его чанки
+//!   (`chunk_ids`) или цель целиком (`part = ''`, полный текст `/read`) — решение
+//!   контроллера R11. Чанки `mode=chunks`, отданные целиком (не усечённые бюджетом),
+//!   записываются в `session_seen` базы пользователя запроса (`part = chunk_id`, владелец —
+//!   владелец базы цели) одной транзакцией с касанием сессии. Карточки папок не отмечаются;
+//!   сбой учёта сессии поиск не валит (WARN, ответ без пометок);
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release` (по умолчанию все
 //!   четыре), `folder` — карточки папок (см. «Папки»), `attachment` принимается, но ничего не
 //!   находит (вложения — M5); `filters.status` — статусы insight (по умолчанию `active`,
@@ -34,6 +43,13 @@
 //! пустой); чужое решение без одобренного доступа исключается с предупреждением
 //! `solution access pending|rejected|revoked`. Human ищется только каналом FTS: в Qdrant его
 //! нет, и сервер не передаёт его в фильтр векторного запроса.
+//!
+//! **Шаг 0 — кэш выжимок** (§9.3, §9.4; [`cache_step`]): без `no_cache: true` поиск после
+//! каналов (нужен dense-вектор запроса) ищет действующую выжимку того же `scope_hash` и
+//! похожего запроса; не больше двух выжимок идут первыми элементами `kind: "cache"` (md —
+//! `[cache] «запрос» — выжимка <дата>, <N> источников, все актуальны (id: c_…)` и текст;
+//! недействительная — `[cache, stale: <источники>]` без текста), их текст — из
+//! `budget_tokens`; `timings.cache_ms`.
 //!
 //! **Алгоритм** (§9.2):
 //! 1. Параллельно: каналы FTS по каждой цели в пределах её пространств (базы — параллельно,
@@ -61,10 +77,13 @@
 //!    отбрасывается (узел, найденный только ею, не попадает). Лимит на узел — после замены.
 //! 4. `rerank=on` ([`crate::rerank`]): первые `ml.rerank_top` (20) кандидатов после
 //!    `note_to_leaf` и лимита на узел переставляются по баллу реранкера (пара «запрос —
-//!    заголовок секции и текст чанка», фрагмент до `ml.rerank_tokens` = 256 токенов), хвост
-//!    остаётся в порядке слияния; лимит на узел после перестановки соблюдается (набор тот
-//!    же). Реранкер — по устройству эмбеддера, грузится при первом таком запросе
-//!    (`spawn_blocking`). Нет модели — ответ без реранка и `warnings: ["reranker not
+//!    заголовок секции и текст чанка», фрагмент до `ml.rerank_tokens` = 256 токенов) с
+//!    бустами п. 4 — вид, область, `certainty` ([`zam_search::apply_boosts_to`], та же
+//!    функция, что после слияния; затухание по свежести и канал папок к баллу реранкера не
+//!    применяются; решение владельца 2026-10-26), затем то же деление при переполнении
+//!    ([`zam_search::overflow_divisor`]); хвост остаётся в порядке слияния; лимит на узел
+//!    после перестановки соблюдается (набор тот же). Реранкер — по устройству эмбеддера,
+//!    грузится при первом таком запросе (`spawn_blocking`). Нет модели — ответ без реранка и `warnings: ["reranker not
 //!    installed"]`; ошибка или паника загрузки и инференса — `["reranker failed"]`, не 500.
 //! 5. `top_k` (в `notes` — узлов), `expand` (`graph` — соседи после `top_k`), упаковка в
 //!    `budget_tokens`.
@@ -105,7 +124,8 @@
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
 //! полного текста чанка, `updated_at`, `kind` (`note` или вид записи), `snippet` | `l0`,
-//! `text`, `rerank_score` 0..1 — у переставленных реранком, `via {type, from}` — у соседей
+//! `text`, `rerank_score` 0..1 — сырой балл реранкера у переставленных им (их `score` — он
+//! же с бустами), `via {type, from}` — у соседей
 //! `expand=graph`), `degraded`, `degraded_reason`
 //! и `degraded_text` (или `null`), `warnings` (строки: о реранке, `index rebuilding` — индекс
 //! пересобирается, векторная выдача может быть неполной, `solution access …` и
@@ -134,6 +154,7 @@
 //! хитов, листы сводок, `expand`, L0, `pending_count` — исключает решение целиком ([`Health`]):
 //! WARN в журнал, `warnings: ["solution unavailable"]`, элементы этой цели убираются из
 //! выдачи, ответ строится по остальным целям. Сбой личной базы — ошибка запроса, как в M2.
+mod cache_step;
 pub mod graph;
 pub mod merge;
 pub mod targets;
@@ -152,20 +173,22 @@ use axum::response::{IntoResponse, Response};
 use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use zam_core::{Id, TargetKind, TargetRef};
+use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
     Boosts, ChunkMeta, Cost, Fit, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights,
-    apply_boosts, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed, in_section,
-    note_to_leaf, pack, rescale_overflow, summaries_without_leaf, truncate_to_tokens,
+    apply_boosts, apply_boosts_to, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed,
+    in_section, note_to_leaf, overflow_divisor, pack, rescale_overflow, summaries_without_leaf,
+    truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
-    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, Space, SpaceKind,
-    TargetFilter, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_targets,
-    live_chunks, live_folders, neighbor_leaves, node_content, pending_count, query_needles,
-    search_fts_channels, text_snippet,
+    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, SeenItem, SeenKey, Space,
+    SpaceKind, StoreError, TargetFilter, WHOLE_TARGET, count_tokens, get_embeddings, get_node,
+    leaf_term_hits, leaves_of_targets, live_chunks, live_folders, mark_seen, neighbor_leaves,
+    node_content, pending_count, query_needles, search_fts_channels, seen_revs, text_snippet,
+    touch_session,
 };
 
 use self::merge::merge_channels;
@@ -174,6 +197,7 @@ use self::targets::{
 };
 use super::json_body;
 use super::scope::skip_foreign;
+use super::sessions::{RequestSession, request_session};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
@@ -229,7 +253,7 @@ enum Expand {
 
 /// `filters` запроса (§9.1); остальные поля пока игнорируются.
 #[derive(Deserialize, Default)]
-struct Filters {
+pub(crate) struct Filters {
     kinds: Option<Vec<String>>,
     status: Option<Vec<String>>,
     /// `axiom | theorem | hypothesis` (§7.5); пусто — любые, в том числе без статуса.
@@ -334,6 +358,49 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
     })
 }
 
+/// Путь-префикс области: без `/` в конце, пустой — `None`.
+fn path_prefix(sc: &ScopeReq) -> Option<String> {
+    sc.path_prefix
+        .as_deref()
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
+/// `scope_hash` кэша выжимок (§9.4) для области запроса: решение, флаги Knowledge и Rules (по
+/// умолчанию — да), префикс пути, область и фильтры после умолчаний (списки упорядочены) —
+/// одинаковая для `POST /search` и `POST /cache`.
+pub(crate) fn cache_scope_hash(
+    sc: &ScopeReq,
+    f: &Filters,
+    include_history: bool,
+    solution: Option<&SolutionGuid>,
+) -> Result<String, ApiError> {
+    let mut t = target_filter(f, include_history)?;
+    t.area = area_filter(sc.area.as_deref())?;
+    Ok(scope_key(sc, &t, solution))
+}
+
+fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -> String {
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    zam_store::scope_hash(&json!({
+        "solution": solution.map(SolutionGuid::as_str),
+        "include_knowledge": sc.include_knowledge.unwrap_or(true),
+        "include_rules": sc.include_rules.unwrap_or(true),
+        "path_prefix": path_prefix(sc),
+        "area": t.area,
+        "filters": {
+            "kinds": sorted(&t.kinds),
+            "status": sorted(&t.statuses),
+            "certainty": sorted(&t.certainty),
+        },
+    }))
+}
+
 /// Статусы, которые векторный фильтр исключает (`must_not`): точки без статуса (узлы,
 /// changelog, release, точки M2) проходят.
 fn excluded_statuses(t: &TargetFilter) -> Vec<String> {
@@ -362,6 +429,13 @@ struct SearchReq {
     format: Option<OutFormat>,
     expand: Option<Expand>,
     rerank: Option<RerankMode>,
+    /// Не повторять выданное этой сессии (по умолчанию — да, §9.1).
+    skip_seen: Option<bool>,
+    /// Сессия агента; иначе — `X-Zam-Session`.
+    session_id: Option<String>,
+    /// Пропустить шаг 0 — кэш выжимок (§9.3).
+    #[serde(default)]
+    no_cache: bool,
 }
 
 impl SearchSection {
@@ -561,12 +635,15 @@ struct Item {
     l0: Option<String>,
     /// Текст для `chunks` (после `expand`) и его размер в токенах.
     text: Option<(String, usize)>,
-    /// Балл реранкера (0..1), если элемент переставлен реранком.
+    /// Сырой балл реранкера (0..1), если элемент переставлен реранком (`score` — он же с
+    /// бустами, §9.2 п. 5).
     rerank_score: Option<f32>,
     /// Сосед `expand=graph`: тип ребра и родитель.
     via: Option<(zam_store::EdgeType, TargetRef)>,
     /// Карточка папки: число живых детей (см. модуль, «Папки»).
     folder: Option<i64>,
+    /// Уже выдан этой сессии в той же ревизии (`skip_seen`, §9.3): без фрагмента и текста.
+    seen: bool,
 }
 
 /// Текст пары реранкера: заголовок секции и текст чанка.
@@ -591,12 +668,13 @@ fn cap_items(items: Vec<Item>, max: usize) -> Vec<Item> {
         .collect()
 }
 
-/// `rerank=on`: первые `ml.rerank_top` элементов — по баллу реранкера (см. модуль).
-/// Сбой — элементы как были и предупреждение.
+/// `rerank=on`: первые `ml.rerank_top` элементов — по баллу реранкера с бустами `boosts`
+/// (см. модуль). Сбой — элементы как были и предупреждение.
 async fn rerank_items(
     st: &AppState,
     query: &str,
     items: Vec<Item>,
+    boosts: &Boosts,
 ) -> (Vec<Item>, Option<&'static str>) {
     let device = st.index.device.as_ref().map(|d| d.device);
     let r = match st.rerank.get(device).await {
@@ -607,18 +685,69 @@ async fn rerank_items(
     let texts: Vec<String> = items[..n].iter().map(|it| rerank_text(&it.hit)).collect();
     match rerank::score(r, query.to_string(), texts, st.cfg.ml.rerank_tokens).await {
         Ok(scores) => {
-            let out: Vec<Item> = rerank::reorder(items, &scores)
-                .into_iter()
-                .map(|(mut it, s)| {
-                    it.rerank_score = s;
-                    it
-                })
-                .collect();
+            let out = boost_reranked(items, &scores, boosts);
             // лимит на узел — и после перестановки
             (cap_items(out, st.cfg.search.max_per_node), None)
         }
         Err(w) => (items, Some(w)),
     }
+}
+
+/// Баллы реранкера `raw` первых элементов `items` с бустами (§9.2 п. 5): `score = rerank_score
+/// × boost_kind × boost_area × boost_certainty`, порядок первых — по нему, затем деление при
+/// переполнении (лучший — 1). `rerank_score` — сырой балл. Хвост (без балла реранкера) остаётся
+/// после них со своими баллами слияния.
+fn boost_reranked(items: Vec<Item>, raw: &[f32], boosts: &Boosts) -> Vec<Item> {
+    let boosted: Vec<f64> = items
+        .iter()
+        .zip(raw)
+        .map(|(it, &s)| match chunk_meta(&it.hit) {
+            Some(m) => apply_boosts_to(f64::from(s), &m, boosts, None),
+            None => f64::from(s),
+        })
+        .collect();
+    let with_raw: Vec<(Item, Option<f32>)> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, it)| (it, raw.get(i).copied()))
+        .collect();
+    let mut out: Vec<Item> = rerank::reorder(with_raw, &boosted)
+        .into_iter()
+        .map(|((mut it, raw), boosted)| {
+            if let (Some(r), Some(b)) = (raw, boosted) {
+                it.rerank_score = Some(r);
+                it.score = b;
+            }
+            it
+        })
+        .collect();
+    let top = overflow_divisor(out.first().map_or(0.0, |it| it.score));
+    for it in out.iter_mut().filter(|it| it.rerank_score.is_some()) {
+        it.score /= top;
+    }
+    out
+}
+
+/// Метаданные бустов чанка выдачи (§9.2 п. 4): цель, уровень, вид инсайта, `certainty`,
+/// область. Неизвестный уровень — `None` (кандидат вне слияния).
+fn chunk_meta(h: &FtsHit) -> Option<ChunkMeta> {
+    Some(ChunkMeta {
+        target: h.target,
+        level: Level::parse(&h.level)?,
+        heading_path: h.heading_path.clone(),
+        updated_at: h.updated_at,
+        // вид инсайта — только у insight (у changelog `data.kind` — вид изменения)
+        insight_kind: h
+            .entry
+            .as_ref()
+            .filter(|e| e.kind == "insight")
+            .and_then(|e| e.insight_kind.clone()),
+        // статус заметки или записи (бусты надёжности, §7.5)
+        certainty: h.certainty.clone(),
+        area: h.area.clone(),
+        space_id: h.space_id,
+        path: h.path.clone(),
+    })
 }
 
 /// `notes`: по одному элементу на узел (лучший чанк), не больше `top_k`.
@@ -981,6 +1110,9 @@ struct Packed {
 
 /// Строка карточки без текста: по ней считается стоимость в токенах.
 fn card_summary(it: &Item, mode: SearchMode) -> &str {
+    if it.seen {
+        return "";
+    }
     match mode {
         SearchMode::Notes => it.l0.as_deref().unwrap_or(""),
         _ => &it.hit.snippet,
@@ -1104,9 +1236,10 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
             o.insert("certainty".into(), json!(h.certainty));
         }
     }
+    o.insert("seen".into(), json!(p.item.seen));
     if mode == SearchMode::Notes {
         o.insert("l0".into(), json!(p.item.l0));
-    } else {
+    } else if !p.item.seen {
         o.insert("snippet".into(), json!(h.snippet));
     }
     if let Some((t, truncated)) = &p.text {
@@ -1119,7 +1252,7 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
 }
 
 /// Одна строка: маркеры → `**`, переводы строк → пробелы.
-fn md_inline(s: &str) -> String {
+pub(crate) fn md_inline(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             '\r' | '\n' => ' ',
@@ -1158,7 +1291,8 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> Str
 /// (у записи журнала — [`entry_card`]).
 fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
     let h = &p.item.hit;
-    let score = p.item.rerank_score.map_or(p.item.score, f64::from).min(1.0);
+    // у переставленных реранкером `score` — его балл с бустами (§9.2 п. 5)
+    let score = p.item.score.min(1.0);
     let mut line = match (&h.entry, p.item.folder) {
         // карточка папки: `f:<id> <пространство>/<путь>/  [0.61] · 4 детей`
         (_, Some(children)) => {
@@ -1196,6 +1330,14 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
         }
         line.push_str(&format!(" · via {} ← {from}\n", t.as_str()));
     }
+    // выдан этой сессии в той же ревизии: пометка вместо фрагмента (§9.3)
+    if p.item.seen {
+        if line.ends_with('\n') {
+            line.pop();
+        }
+        line.push_str("   (seen)\n");
+        return line;
+    }
     match &p.text {
         Some((t, _)) => {
             for l in t.lines() {
@@ -1221,15 +1363,15 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
 const WARN_SECTION_UNAVAILABLE: &str = "section unavailable";
 
 /// Состояние целей запроса: какие ещё в выдаче, и предупреждения ответа.
-struct Health<'a> {
+pub(crate) struct Health<'a> {
     targets: &'a [SearchTarget],
     /// Цель не исключена сбоем чтения своей базы.
-    alive: Vec<bool>,
-    warnings: Vec<String>,
+    pub(crate) alive: Vec<bool>,
+    pub(crate) warnings: Vec<String>,
 }
 
 impl<'a> Health<'a> {
-    fn new(targets: &'a [SearchTarget], warnings: Vec<String>) -> Health<'a> {
+    pub(crate) fn new(targets: &'a [SearchTarget], warnings: Vec<String>) -> Health<'a> {
         Health {
             targets,
             alive: vec![true; targets.len()],
@@ -1237,10 +1379,15 @@ impl<'a> Health<'a> {
         }
     }
 
+    /// Цели запроса.
+    pub(crate) fn targets(&self) -> &'a [SearchTarget] {
+        self.targets
+    }
+
     /// Результат чтения базы цели `i`: сбой в базе чужого решения исключает решение (WARN
     /// в журнал, `solution unavailable`, цель больше не жива) и даёт `None`; сбой личной
     /// базы — ошибка запроса.
-    fn soft<T, E>(&mut self, i: usize, r: Result<T, E>) -> Result<Option<T>, ApiError>
+    pub(crate) fn soft<T, E>(&mut self, i: usize, r: Result<T, E>) -> Result<Option<T>, ApiError>
     where
         E: std::fmt::Display + Into<ApiError>,
     {
@@ -1339,7 +1486,59 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
         rerank_score: None,
         via: None,
         folder: Some(f.child_count),
+        seen: false,
     }
+}
+
+/// Ключ выданного: владелец базы цели элемента, цель и часть — `chunk_id` или
+/// [`WHOLE_TARGET`] (решение контроллера R11).
+fn seen_key(targets: &[SearchTarget], it: &Item, part: &str) -> SeenKey {
+    SeenKey {
+        owner_id: targets[it.target].owner,
+        target: it.hit.target,
+        part: part.to_string(),
+    }
+}
+
+/// Помечает элементы, уже выданные сессии в той же ревизии (`seen`), и снимает их текст:
+/// выдана цель целиком или все чанки элемента (`chunk_ids`).
+async fn mark_seen_items(
+    s: &RequestSession,
+    targets: &[SearchTarget],
+    items: &mut [Item],
+) -> Result<(), StoreError> {
+    let parts = |it: &Item| -> Vec<SeenKey> {
+        std::iter::once(WHOLE_TARGET)
+            .chain(it.chunk_ids.iter().map(String::as_str))
+            .map(|part| seen_key(targets, it, part))
+            .collect()
+    };
+    let keys: Vec<SeenKey> = items
+        .iter()
+        .filter(|it| it.folder.is_none())
+        .flat_map(parts)
+        .collect();
+    let revs = seen_revs(&s.db, &s.touch.id, &keys).await?;
+    let same = |k: &SeenKey, rev: i64| revs.get(k) == Some(&rev);
+    for it in items.iter_mut().filter(|it| it.folder.is_none()) {
+        let rev = it.hit.rev;
+        let whole = same(&seen_key(targets, it, WHOLE_TARGET), rev);
+        let chunks = !it.chunk_ids.is_empty()
+            && it
+                .chunk_ids
+                .iter()
+                .all(|c| same(&seen_key(targets, it, c), rev));
+        if whole || chunks {
+            it.seen = true;
+            it.text = None;
+        }
+    }
+    Ok(())
+}
+
+/// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
+fn session_failed(what: &str, e: &StoreError) {
+    tracing::warn!(error = %e, "поиск: {what} сессии не выполнено, ответ без пометок seen");
 }
 
 /// `POST /search`.
@@ -1369,14 +1568,25 @@ pub async fn search(
     kinds.area = area_filter(req.scope.area.as_deref())?;
     let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
+    // сессия: некорректный id — 400; сбой её базы поиск не валит (WARN, без пометок)
+    let session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
+        Ok(s) => s,
+        // некорректный id — 400, несуществующий пользователь (`X-Zam-User`) — 404
+        Err(e @ (ApiError::BadRequest(_) | ApiError::NotFound)) => return Err(e),
+        Err(e) => {
+            tracing::warn!(error = %e, "поиск: база сессии недоступна, ответ без пометок seen");
+            None
+        }
+    };
+    // `mode=chunks` касается сессии вместе с отметкой выданного (одна транзакция)
+    if let Some(s) = &session
+        && mode != SearchMode::Chunks
+        && let Err(e) = touch_session(&s.db, &s.touch).await
+    {
+        session_failed("касание", &e);
+    }
     let mut health = Health::new(&targets, warnings);
-    let prefix = req
-        .scope
-        .path_prefix
-        .as_deref()
-        .map(|p| p.trim_end_matches('/'))
-        .filter(|p| !p.is_empty())
-        .map(str::to_string);
+    let prefix = path_prefix(&req.scope);
     // Human в Qdrant нет никогда: векторный запрос — по областям целей без него; цель без
     // других пространств в фильтр не входит (область без пространств ничего не пропускает)
     let scopes: Vec<VectorScope> = targets
@@ -1430,6 +1640,24 @@ pub async fn search(
         vector_channel(&st.index, filter, req.query.clone()).await
     };
     let ((runs, fts_ms), vrun) = tokio::join!(fts, vector);
+    // 0. кэш выжимок (§9.3): действующие выжимки — первыми элементами
+    let cache_t = Instant::now();
+    let cache_items = if req.no_cache {
+        Vec::new()
+    } else {
+        cache_step::lookup(
+            &st,
+            &p,
+            &headers,
+            &req.scope,
+            &kinds,
+            &req.query,
+            session.as_ref().map(|s| s.touch.id.as_str()),
+            vrun.dense.as_deref(),
+        )
+        .await
+    };
+    let cache_ms = (!req.no_cache).then(|| ms(cache_t));
     // цель, чья база не прочиталась (чужое решение), исключается из выдачи целиком
     let mut per_db = Vec::with_capacity(targets.len());
     for (i, r) in runs.into_iter().enumerate() {
@@ -1503,28 +1731,7 @@ pub async fn search(
     // 3. слияние, сводки → листы
     let chunks: HashMap<String, ChunkMeta> = hits
         .iter()
-        .filter_map(|(id, (_, h))| {
-            Some((
-                id.clone(),
-                ChunkMeta {
-                    target: h.target,
-                    level: Level::parse(&h.level)?,
-                    heading_path: h.heading_path.clone(),
-                    updated_at: h.updated_at,
-                    // вид инсайта — только у insight (у changelog `data.kind` — вид изменения)
-                    insight_kind: h
-                        .entry
-                        .as_ref()
-                        .filter(|e| e.kind == "insight")
-                        .and_then(|e| e.insight_kind.clone()),
-                    // статус заметки или записи (бусты надёжности, §7.5)
-                    certainty: h.certainty.clone(),
-                    area: h.area.clone(),
-                    space_id: h.space_id,
-                    path: h.path.clone(),
-                },
-            ))
-        })
+        .filter_map(|(id, (_, h))| Some((id.clone(), chunk_meta(h)?)))
         .collect();
     // чанки, которых векторный канал не видит (Human, узел не проиндексирован): ослабленный
     // bm25 для них не понижается — иначе такая находка проигрывает всем векторным кандидатам
@@ -1656,6 +1863,7 @@ pub async fn search(
                 rerank_score: None,
                 via: None,
                 folder: None,
+                seen: false,
             })
         })
         .collect();
@@ -1682,7 +1890,7 @@ pub async fn search(
     let mut rerank_ms = None;
     let items = if rerank_on && !items.is_empty() {
         let t = Instant::now();
-        let (items, warning) = rerank_items(&st, &req.query, items).await;
+        let (items, warning) = rerank_items(&st, &req.query, items, &boosts).await;
         rerank_ms = Some(ms(t));
         health.warnings.extend(warning.map(String::from));
         items
@@ -1754,7 +1962,32 @@ pub async fn search(
     items.retain(|it| health.alive[it.target]);
     let mut warnings = health.warnings;
     dedup_keep_order(&mut warnings);
-    let packed = pack_items(items, mode, budget);
+    // выданное этой сессии в той же ревизии — без фрагмента и текста (§9.3)
+    if let Some(s) = &session
+        && req.skip_seen.unwrap_or(true)
+        && let Err(e) = mark_seen_items(s, &targets, &mut items).await
+    {
+        session_failed("чтение выданного", &e);
+    }
+    // выжимки шага 0 — из того же бюджета
+    let cache_tokens: usize = cache_items.iter().map(cache_step::CacheItem::tokens).sum();
+    let packed = pack_items(items, mode, budget.saturating_sub(cache_tokens).max(1));
+    // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
+    if let (Some(s), SearchMode::Chunks) = (&session, mode) {
+        let given: Vec<SeenItem> = packed
+            .iter()
+            .filter(|p| matches!(p.text, Some((_, false))) && p.item.folder.is_none())
+            .flat_map(|p| {
+                p.item.chunk_ids.iter().map(|c| SeenItem {
+                    key: seen_key(&targets, &p.item, c),
+                    rev: p.item.hit.rev,
+                })
+            })
+            .collect();
+        if let Err(e) = mark_seen(&s.db, &s.touch, &given).await {
+            session_failed("отметка выданного", &e);
+        }
+    }
     let degraded = available.err().or(vrun.failed);
     let by_id: HashMap<Id, Space> = targets
         .into_iter()
@@ -1764,7 +1997,11 @@ pub async fn search(
 
     Ok(match format {
         OutFormat::Json => {
-            let items: Vec<Value> = packed.iter().map(|p| item_json(p, mode, &by_id)).collect();
+            let items: Vec<Value> = cache_items
+                .iter()
+                .map(cache_step::item_json)
+                .chain(packed.iter().map(|p| item_json(p, mode, &by_id)))
+                .collect();
             Json(json!({
                 "items": items,
                 "degraded": degraded.is_some(),
@@ -1773,6 +2010,7 @@ pub async fn search(
                 "warnings": warnings,
                 "pending_count": pending,
                 "timings": {
+                    "cache_ms": cache_ms,
                     "fts_ms": fts_ms,
                     "embed_ms": vrun.embed_ms,
                     "vector_ms": vrun.vector_ms,
@@ -1787,11 +2025,13 @@ pub async fn search(
             .into_response()
         }
         OutFormat::Md => {
-            let mut body: String = packed
-                .iter()
-                .enumerate()
-                .map(|(i, p)| item_md(i + 1, p, mode, &by_id))
-                .collect();
+            let mut body: String = cache_items.iter().map(cache_step::item_md).collect();
+            body.extend(
+                packed
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| item_md(i + 1, p, mode, &by_id)),
+            );
             if let Some(r) = degraded {
                 body.push_str(&format!(
                     "> degraded: {} — {} (только FTS)\n",
@@ -1855,6 +2095,7 @@ mod tests {
                 rerank_score: None,
                 via: None,
                 folder: None,
+                seen: false,
             })
             .collect()
     }

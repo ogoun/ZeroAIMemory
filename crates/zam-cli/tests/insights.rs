@@ -21,12 +21,6 @@ fn tmp(name: &str) -> PathBuf {
 
 /// Сервер в фоновом потоке: адрес и токен `rw` пользователя «Анна».
 fn start(name: &str) -> (String, String) {
-    let (url, tok, _) = start_human(name);
-    (url, tok)
-}
-
-/// [`start`] и человеческий токен «Анны» (§7.5).
-fn start_human(name: &str) -> (String, String, String) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -41,19 +35,10 @@ fn start_human(name: &str) -> (String, String, String) {
             };
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
-            let (_, t) = st
-                .system
-                .issue_token(u.id, "t", Access::Rw, false)
-                .await
-                .unwrap();
-            let (_, h) = st
-                .system
-                .issue_token(u.id, "h", Access::Rw, true)
-                .await
-                .unwrap();
+            let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            tx.send((url, t, h)).unwrap();
+            tx.send((url, t)).unwrap();
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -63,6 +48,74 @@ fn start_human(name: &str) -> (String, String, String) {
         });
     });
     rx.recv().unwrap()
+}
+
+/// Запрос к поддельному серверу: метод, путь, `If-Match`.
+type Seen = (String, String, Option<String>);
+
+/// Поддельный HTTP-сервер для проверки заголовков правки: `GET` отдаёт запись с `rev: 3`,
+/// `PATCH` — `patch_status` с телом `patch_body`. Возвращает адрес и журнал запросов.
+fn fake_entry_server(
+    patch_status: u16,
+    patch_body: &'static str,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for conn in l.incoming() {
+            let Ok(mut c) = conn else { continue };
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut line = String::new();
+            if r.read_line(&mut line).is_err() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let (m, path) = (
+                parts.next().unwrap_or("").to_string(),
+                parts.next().unwrap_or("").to_string(),
+            );
+            let (mut len, mut if_match) = (0usize, None);
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = h.split_once(':') {
+                    match k.trim().to_ascii_lowercase().as_str() {
+                        "content-length" => len = v.trim().parse().unwrap_or(0),
+                        "if-match" => if_match = Some(v.trim().to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = r.read_exact(&mut body);
+            log.lock().unwrap().push((m.clone(), path, if_match));
+            let (status, text) = if m == "GET" {
+                (
+                    200,
+                    r#"{"id":"01E","rev":3,"certainty":"hypothesis","data":{"kind":"gotcha"}}"#,
+                )
+            } else {
+                (patch_status, patch_body)
+            };
+            let ctype = if status < 300 {
+                "application/json"
+            } else {
+                "application/problem+json"
+            };
+            let _ = write!(
+                c,
+                "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{text}",
+                text.len()
+            );
+        }
+    });
+    (url, seen)
 }
 
 fn zam(url: &str, token: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
@@ -118,12 +171,11 @@ fn id_of(s: &str) -> String {
     s.trim().split('@').next().unwrap().to_string()
 }
 
-/// `zam insight certify`: агент повышает до theorem с доказательством (без него — 422, код 6),
-/// axiom без `--human` — 403 (код 3); `--human` без интерактивного терминала — отказ (код 3)
-/// до запроса к серверу. Путь подтверждения в терминале — юнит-тест `human_gate`.
+/// `zam insight certify` обычным токеном: theorem — с доказательством (без него — 422, код 6),
+/// axiom (по указанию пользователя) — с причиной; правка идёт с ревизией из `GET` (§11.3).
 #[test]
-fn insight_certify_evidence_and_human_token() {
-    let (url, tok, human) = start_human("certify");
+fn insight_certify_evidence_and_axiom() {
+    let (url, tok) = start("certify");
     let r = tmp("certify-repo");
     let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
     let o = zam(
@@ -179,35 +231,181 @@ fn insight_certify_evidence_and_human_token() {
     assert_eq!(e["certainty"], "theorem");
     assert_eq!(e["data"]["kind"], "experiment", "data сохранена: {e}");
     assert_eq!(e["data"]["evidence"]["method"], "повторный прогон");
-    // axiom агентским токеном — 403
-    let o = z(&["insight", "certify", &id, "axiom", "--reason", "уверен"]);
-    assert_eq!(o.status.code(), Some(3), "{}", out(&o));
-    assert!(err(&o).contains("axiom"), "{}", err(&o));
-    // --human без терминала (агент вызывает CLI неинтерактивно) — отказ до любого запроса,
-    // даже при настроенном human_token (ruling контроллера, §11.4)
-    std::fs::create_dir_all(r.join(".zeroaimemory")).unwrap();
-    std::fs::write(
-        r.join(".zeroaimemory").join("config.toml"),
-        format!("url = \"{url}\"\nhuman_token = \"{human}\"\n"),
-    )
-    .unwrap();
+    // axiom обычным токеном — по указанию пользователя, с причиной
     let o = z(&[
         "insight",
         "certify",
         &id,
         "axiom",
         "--reason",
-        "утверждено",
-        "--human",
+        "пользователь утвердил",
     ]);
-    assert_eq!(o.status.code(), Some(3), "{}", out(&o));
+    assert!(ok(&o).trim().ends_with("axiom"), "{}", out(&o));
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(
+        (&e["certainty"], &e["rev"]),
+        (&serde_json::json!("axiom"), &serde_json::json!(3))
+    );
+    // append и revisit — тоже с ревизией
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &["insight", "append", &id],
+        "ещё\n".as_bytes(),
+    );
+    ok(&o);
+    ok(&z(&["insight", "revisit", &id, "--reason", "новые данные"]));
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(
+        (&e["status"], &e["rev"]),
+        (&serde_json::json!("revisit"), &serde_json::json!(5))
+    );
+}
+
+/// Стенд Debian 13: `log insight --certainty axiom` — только с `--reason` (без неё код 6 до
+/// запроса); `zam read` принимает ссылки выдачи `i:<id>` и `n:<id>`, с пачкой и без (B2).
+#[test]
+fn log_axiom_with_reason_and_read_refs() {
+    let (url, tok) = start("axiom-refs");
+    let r = tmp("axiom-refs-repo");
+    let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
+    let base = [
+        "log",
+        "insight",
+        "--kind",
+        "decision",
+        "--title",
+        "Сборка только под musl",
+        "--scope",
+        "global",
+        "--certainty",
+        "axiom",
+    ];
+    // без --reason — отказ CLI, сервер не вызывается: недоступный адрес не мешает
+    let o = zam(
+        "http://127.0.0.1:9",
+        &tok,
+        &r,
+        &base,
+        "Пользователь: собираем zam только под musl.\n".as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    assert!(err(&o).contains("--reason"), "{}", err(&o));
+    let mut a = base.to_vec();
+    a.extend(["--reason", "пользователь продиктовал"]);
+    let o = z(
+        &a,
+        "Пользователь: собираем zam только под musl.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    assert_eq!(
+        json(&z(&["insight", "show", &id, "--json"], b""))["certainty"],
+        "axiom"
+    );
+
+    // ссылка записи из выдачи поиска: текст тела, с пачкой — карточка с текстом
+    let iref = format!("i:{id}");
+    let s = ok(&z(&["read", &iref], b""));
+    assert_eq!(s, "Пользователь: собираем zam только под musl.\n");
+    let s = ok(&z(&["read", &iref, "--tier", "L0"], b""));
+    assert_eq!(s, "Сборка только под musl\n");
+    let s = ok(&z(&["read", &iref, "--batch"], b""));
+    assert!(s.contains("только под musl.") && s.contains(&iref), "{s}");
+    let v = json(&z(&["read", &iref, "--json"], b""));
+    assert_eq!(v["certainty"], "axiom", "{v}");
+    let o = z(&["read", &iref, "--rev", "1"], b"");
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    let missing = format!("i:{}", zam_core::Id::new());
+    let o = z(&["read", &missing], b"");
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+
+    // ссылка узла n:<id>
+    let o = z(
+        &["write", "knowledge:Сборка"],
+        "# Сборка\nmusl\n".as_bytes(),
+    );
+    let node = id_of(&ok(&o));
+    let nref = format!("n:{node}");
+    assert_eq!(ok(&z(&["read", &nref], b"")), "# Сборка\nmusl\n");
+    let s = ok(&z(&["read", &nref, &iref, "--batch"], b""));
     assert!(
-        err(&o).contains("подтверждение аксиом — только человеком"),
+        s.contains("musl\n") && s.contains("только под musl."),
+        "{s}"
+    );
+}
+
+/// `certify` берёт `rev` из `GET /entries/{id}` и шлёт `If-Match` с ним.
+#[test]
+fn insight_certify_sends_if_match() {
+    let (url, seen) = fake_entry_server(
+        200,
+        r#"{"id":"01E","rev":4,"certainty":"axiom","status":"active"}"#,
+    );
+    let r = tmp("certify-if-match");
+    let o = zam(
+        &url,
+        "t",
+        &r,
+        &["insight", "certify", "01E", "axiom", "--reason", "указание"],
+        b"",
+    );
+    assert!(ok(&o).trim().ends_with("axiom"), "{}", out(&o));
+    let seen = seen.lock().unwrap().clone();
+    let patch: Vec<&Seen> = seen.iter().filter(|s| s.0 == "PATCH").collect();
+    assert_eq!(patch.len(), 1, "{seen:?}");
+    assert_eq!(patch[0].1, "/api/v1/entries/01E");
+    assert_eq!(patch[0].2.as_deref(), Some("\"3\""), "{seen:?}");
+    assert!(
+        seen.iter()
+            .any(|s| s.0 == "GET" && s.1 == "/api/v1/entries/01E"),
+        "{seen:?}"
+    );
+}
+
+/// Запись изменилась между чтением и правкой (409 с `rev` текущей) — сообщение и код 4
+/// (как у заметок, решение контроллера R7).
+#[test]
+fn insight_certify_conflict_exit_4() {
+    let (url, _) = fake_entry_server(
+        409,
+        r#"{"type":"/problems/conflict","title":"Conflict","status":409,"detail":"ревизия записи 5, а не 3","rev":5}"#,
+    );
+    let r = tmp("certify-conflict");
+    let o = zam(
+        &url,
+        "t",
+        &r,
+        &["insight", "certify", "01E", "hypothesis", "--reason", "r"],
+        b"",
+    );
+    assert_eq!(o.status.code(), Some(4), "{}", err(&o));
+    assert!(
+        err(&o).contains("запись изменилась (rev 3 → 5): перечитайте"),
         "{}",
         err(&o)
     );
-    let e = json(&z(&["insight", "show", &id, "--json"]));
-    assert_eq!(e["certainty"], "theorem", "запись не изменилась: {e}");
+}
+
+/// Флаг `--human` упразднён (§11.4): clap отвергает неизвестный аргумент до запроса (код 6).
+#[test]
+fn human_flag_removed() {
+    let r = tmp("human-flag");
+    let o = zam(
+        "http://127.0.0.1:9",
+        "t",
+        &r,
+        &[
+            "insight", "certify", "01E", "axiom", "--reason", "r", "--human",
+        ],
+        b"",
+    );
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    assert!(
+        err(&o).contains("unexpected argument '--human'"),
+        "{}",
+        err(&o)
+    );
 }
 
 #[test]
@@ -343,5 +541,65 @@ fn insight_log_with_triggers_dedup_and_supersede() {
             .unwrap()
             .iter()
             .any(|e| e["id"] == g.as_str())
+    );
+}
+
+/// `zam insight feedback` (§10.5): оценки попадают в `usage` записи и видны в `insight show`.
+#[test]
+fn insight_feedback_counts() {
+    let (url, tok) = start("feedback");
+    let r = tmp("feedback-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "LF в bash",
+            "--scope",
+            "global",
+        ],
+        "CRLF ломает shebang.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    assert_eq!(
+        ok(&z(&["insight", "feedback", &id, "useful"])).trim(),
+        format!("{id} useful")
+    );
+    ok(&z(&[
+        "insight",
+        "feedback",
+        &id,
+        "useless",
+        "--session",
+        "s-1",
+    ]));
+    ok(&z(&["insight", "feedback", &id, "useful"]));
+    let j = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(
+        j["usage"],
+        serde_json::json!({"shown": 0, "useful": 2, "useless": 1})
+    );
+    let text = ok(&z(&["insight", "show", &id]));
+    assert!(
+        text.contains("показы: 0 · полезно: 2 · бесполезно: 1"),
+        "{text}"
+    );
+    // неизвестная оценка — отказ разбора аргументов, неизвестная запись — ошибка сервера
+    assert_ne!(
+        z(&["insight", "feedback", &id, "meh"]).status.code(),
+        Some(0)
+    );
+    let missing = zam_core::Id::new().to_string();
+    assert_ne!(
+        z(&["insight", "feedback", &missing, "useful"])
+            .status
+            .code(),
+        Some(0)
     );
 }

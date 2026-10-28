@@ -17,6 +17,10 @@ pub enum ApiError {
     /// 403 с пояснением (например, запись участником с режимом `ro`).
     #[error("{0}")]
     Denied(String),
+    /// 403 `/problems/password-change-required` (§11.4): пользователь входит с паролем,
+    /// заданным администратором, и обязан сменить его (`POST /auth/password`).
+    #[error("смените пароль, заданный администратором: POST /auth/password")]
+    PasswordChangeRequired,
     /// Нет доступа к общему решению (§11.6): запрос ждёт, отклонён или отозван.
     #[error("нет доступа к решению {guid}: {}", access_state_text(state))]
     SolutionAccess {
@@ -41,16 +45,24 @@ pub enum ApiError {
     },
     #[error("{0}")]
     PayloadTooLarge(String),
-    #[error("требуется заголовок If-Match с ревизией")]
-    PreconditionRequired,
+    /// 428 `/problems/precondition-required` (§11.3): правка без `If-Match`; в `detail` —
+    /// что передать.
+    #[error("{0}")]
+    PreconditionRequired(String),
     #[error("{0}")]
     Unprocessable(String),
+    /// 422 `/problems/locator-unsupported`: `locator` в `/read` — этап M5.
+    #[error("{0}")]
+    LocatorUnsupported(String),
+    /// 422 источника выжимки кэша (§9.4): `kind` — тип problem `/problems/cache-cross-db`,
+    /// `/problems/cache-forbidden-source` или `/problems/cache-source-not-found`.
+    #[error("{detail}")]
+    CacheSource { kind: &'static str, detail: String },
     /// 422 `/problems/idempotency-mismatch`: ключ повторён с другим запросом.
     #[error("{0}")]
     IdempotencyMismatch(String),
-    /// `/problems/certainty` (§7.5): нарушение матрицы прав `certainty` — 403 (`axiom` не от
-    /// человека) или 422 (нет доказательства или причины, недопустимый переход); `code` —
-    /// машинный код ([`zam_store::CertaintyError::code`]).
+    /// 422 `/problems/certainty` (§7.5): нарушение матрицы прав `certainty` — нет
+    /// доказательства или причины; `code` — машинный код ([`zam_store::CertaintyError::code`]).
     #[error("{0}")]
     Certainty(zam_store::CertaintyError),
     #[error("слишком много запросов")]
@@ -93,6 +105,11 @@ impl ApiError {
             ApiError::Forbidden | ApiError::Denied(_) => {
                 (StatusCode::FORBIDDEN, "about:blank", "Forbidden")
             }
+            ApiError::PasswordChangeRequired => (
+                StatusCode::FORBIDDEN,
+                "/problems/password-change-required",
+                "Forbidden",
+            ),
             ApiError::SolutionAccess { .. } => (
                 StatusCode::FORBIDDEN,
                 "/problems/solution-access",
@@ -110,9 +127,9 @@ impl ApiError {
                 "/problems/too-large",
                 "Payload Too Large",
             ),
-            ApiError::PreconditionRequired => (
+            ApiError::PreconditionRequired(_) => (
                 StatusCode::PRECONDITION_REQUIRED,
-                "about:blank",
+                "/problems/precondition-required",
                 "Precondition Required",
             ),
             ApiError::Unprocessable(_) => (
@@ -120,20 +137,26 @@ impl ApiError {
                 "/problems/unprocessable",
                 "Unprocessable Content",
             ),
+            ApiError::LocatorUnsupported(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "/problems/locator-unsupported",
+                "Unprocessable Content",
+            ),
+            ApiError::CacheSource { kind, .. } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                kind,
+                "Unprocessable Content",
+            ),
             ApiError::IdempotencyMismatch(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/idempotency-mismatch",
                 "Unprocessable Content",
             ),
-            ApiError::Certainty(e) => {
-                let status = crate::certainty::status_of(*e);
-                let title = if status == StatusCode::FORBIDDEN {
-                    "Forbidden"
-                } else {
-                    "Unprocessable Content"
-                };
-                (status, "/problems/certainty", title)
-            }
+            ApiError::Certainty(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "/problems/certainty",
+                "Unprocessable Content",
+            ),
             ApiError::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "/problems/rate-limited",
@@ -173,6 +196,15 @@ impl From<StoreError> for ApiError {
         match e {
             StoreError::NotFound => ApiError::NotFound,
             StoreError::Conflict(m) => ApiError::conflict(m),
+            // устаревшая ревизия записи журнала (§11.3): 409 с текущей ревизией `rev`
+            e @ StoreError::StaleRevision { current, .. } => {
+                let mut extra = Map::new();
+                extra.insert("rev".into(), json!(current));
+                ApiError::Conflict {
+                    detail: e.to_string(),
+                    extra,
+                }
+            }
             StoreError::BadInput(m) => ApiError::BadRequest(m),
             StoreError::IdempotencyMismatch(m) => ApiError::IdempotencyMismatch(m),
             StoreError::Certainty(c) => ApiError::Certainty(c),

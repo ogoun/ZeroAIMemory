@@ -4,7 +4,8 @@
 //! - бусты ([`apply_boosts`]): вид инсайта (`gotcha`, `failure`), надёжность (`certainty`
 //!   заметки или записи: `search.boost_axiom` > `boost_theorem` > `boost_hypothesis`, §7.5) и
 //!   текущая область (`X-Zam-Area`) — множители слитого балла; балл выше 1 после них —
-//!   деление всех баллов на лучший ([`rescale_overflow`]);
+//!   деление всех баллов на лучший ([`rescale_overflow`]); те же бусты — множители балла
+//!   серверного реранкера (§9.2 п. 5, [`apply_boosts_to`] — одна функция на оба пути);
 //! - замена сводки листом и лимит на цель.
 //!
 //! `superseded`/`retracted` исключает фильтр статусов поиска (сервер), а не поправка.
@@ -30,7 +31,8 @@ pub struct Boosts {
 
 impl Boosts {
     /// Итоговый множитель чанка: произведение подходящих бустов (нет подходящих — 1).
-    fn factor(&self, m: &ChunkMeta) -> f64 {
+    /// `area` — область кандидата (`None` — из `m.area`).
+    fn factor(&self, m: &ChunkMeta, area: Option<&str>) -> f64 {
         let kind = m
             .insight_kind
             .as_ref()
@@ -43,12 +45,22 @@ impl Boosts {
             .and_then(|c| self.certainty.get(c))
             .copied()
             .unwrap_or(1.0);
-        let area = match (&self.area, &m.area) {
+        let area = match (&self.area, area.or(m.area.as_deref())) {
             (Some((want, f)), Some(a)) if a == want => *f,
             _ => 1.0,
         };
         kind * certainty * area
     }
+}
+
+/// Балл `score` с бустами кандидата (§9.2 пп. 4–5): `score × boost_kind × boost_area ×
+/// boost_certainty` — одна функция для слитого балла ([`apply_boosts`]) и балла реранкера
+/// (решение владельца 2026-10-26: без бустов реранк отменял `reliable_first`). `area` —
+/// область кандидата, если известна вызывающему иначе, чем из `meta.area` (`None` — из
+/// `meta`). Затухание по свежести и канал папок сюда не входят: они — часть слияния.
+/// Результат может быть больше 1 — шкалу приводит [`rescale_overflow`] ([`overflow_divisor`]).
+pub fn apply_boosts_to(score: f64, meta: &ChunkMeta, b: &Boosts, area: Option<&str>) -> f64 {
+    score * b.factor(meta, area)
 }
 
 /// Умножает балл каждого кандидата на его бусты ([`Boosts`]) и пересортировывает по
@@ -58,7 +70,7 @@ impl Boosts {
 pub fn apply_boosts(r: &mut [Ranked], meta: &HashMap<String, ChunkMeta>, b: &Boosts) {
     for x in r.iter_mut() {
         if let Some(m) = meta.get(&x.chunk_id) {
-            x.score *= b.factor(m);
+            x.score = apply_boosts_to(x.score, m, b, None);
         }
     }
     r.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -70,14 +82,23 @@ pub fn apply_boosts(r: &mut [Ranked], meta: &HashMap<String, ChunkMeta>, b: &Boo
 /// Без переполнения шкала прежняя (1,0 — первое место во всех каналах слияния). Возвращает
 /// делитель (1 — без изменений): им же масштабируются баллы вне списка (карточки папок).
 pub fn rescale_overflow(r: &mut [Ranked]) -> f64 {
-    let top = r.first().map_or(0.0, |x| x.score);
-    if !(top > 1.0 && top.is_finite()) {
-        return 1.0;
-    }
-    for x in r.iter_mut() {
-        x.score /= top;
+    let top = overflow_divisor(r.first().map_or(0.0, |x| x.score));
+    if top != 1.0 {
+        for x in r.iter_mut() {
+            x.score /= top;
+        }
     }
     top
+}
+
+/// Делитель шкалы при лучшем балле `top` ([`rescale_overflow`]): `top`, если он больше 1 и
+/// конечен, иначе 1. Для списков не из [`Ranked`] (баллы реранкера с бустами).
+pub fn overflow_divisor(top: f64) -> f64 {
+    if top > 1.0 && top.is_finite() {
+        top
+    } else {
+        1.0
+    }
 }
 
 /// Нижняя граница множителя свежести **[решение исполнителя]**: память хранит и давние
@@ -341,6 +362,28 @@ mod tests {
         let ids: Vec<&str> = list.iter().map(|x| x.chunk_id.as_str()).collect();
         assert_eq!(ids, vec!["ax", "thm", "hyp", "plain"]);
         assert!((list[0].score - 0.6).abs() < 1e-12);
+    }
+
+    /// Одна функция бустов на оба пути (§9.2 п. 5): произведение вида, области и `certainty`;
+    /// область кандидата — из аргумента или из метаданных.
+    #[test]
+    fn apply_boosts_to_multiplies_kind_area_certainty() {
+        let mut b = boosts();
+        b.certainty = [("theorem".to_string(), 1.10)].into_iter().collect();
+        b.area = Some(("api".to_string(), 1.2));
+        let m = ChunkMeta {
+            certainty: Some("theorem".into()),
+            ..meta(Some("gotcha"), Some("api"))
+        };
+        let got = apply_boosts_to(0.5, &m, &b, None);
+        assert!((got - 0.5 * 1.15 * 1.2 * 1.10).abs() < 1e-12, "{got}");
+        // область из аргумента вместо метаданных
+        let got = apply_boosts_to(0.5, &m, &b, Some("web"));
+        assert!((got - 0.5 * 1.15 * 1.10).abs() < 1e-12, "{got}");
+        assert_eq!(apply_boosts_to(0.5, &meta(None, None), &b, None), 0.5);
+        assert_eq!(overflow_divisor(0.9), 1.0);
+        assert_eq!(overflow_divisor(f64::INFINITY), 1.0);
+        assert_eq!(overflow_divisor(1.25), 1.25);
     }
 
     #[test]

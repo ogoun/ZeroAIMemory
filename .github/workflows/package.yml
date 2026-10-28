@@ -6,7 +6,8 @@
 # flavor (cpu и gpu) и прогоняются оба smoke. Отдельные задачи на flavor вдвое удлиняли бы
 # сборку (самая долгая часть), а передача бинарников артефактом добавила бы задачу и
 # загрузку/выгрузку ради одного exe; место на диске раннера это не экономит, потому что
-# распакованные smoke-каталоги удаляются сразу после проверки.
+# распакованные smoke-каталоги удаляются сразу после проверки. Исключение — клиент zam другой
+# ОС для раздачи сервером (/downloads/zam/…): его собирает задача cli и передаёт артефактом.
 #
 # С extras (релиз и пробный прогон release-dry-run) gpu-упаковка собирает ещё zam-cuda своей
 # платформы (библиотеки NVIDIA по deploy/cuda.toml, ~1,9 ГБ архивов на Windows и ~2,2 ГБ на
@@ -36,8 +37,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # zam обеих платформ для раздачи сервером (GET /downloads/zam/{os}-{arch}, §15.5): комплект
+  # сервера несёт клиент другой ОС в downloads/<платформа>/. Клиент собирается здесь на своей
+  # ОС и передаётся артефактом — кросс-сборка Windows ↔ Linux на раннерах не нужна.
+  cli:
+    name: cli (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+            bin: target/release/zam.exe
+          - platform: linux-x64
+            os: ubuntu-22.04
+            bin: target/x86_64-unknown-linux-musl/release/zam
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - name: musl-tools
+        if: matrix.platform == 'linux-x64'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli
+      - name: build
+        env:
+          ZAM_GIT_SHA: ${{ github.sha }}
+        run: |
+          if [ "${{ matrix.platform }}" = "linux-x64" ]; then
+            cargo build --release -p zam-cli --target x86_64-unknown-linux-musl
+          else
+            cargo build --release -p zam-cli
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zam-cli-${{ matrix.platform }}
+          path: ${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 1
+
   package:
     name: package (${{ matrix.platform }})
+    needs: cli
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -48,10 +100,15 @@ jobs:
             os: windows-latest
             ext: zip
             cli_bin_arg: ""
+            # zam другой ОС для downloads/ комплекта сервера (задача cli)
+            other: linux-x64
+            other_exe: zam
           - platform: linux-x64
             os: ubuntu-22.04
             ext: tar.gz
             cli_bin_arg: "--cli-bin target/x86_64-unknown-linux-musl/release/zam"
+            other: windows-x64
+            other_exe: zam.exe
     defaults:
       run:
         shell: bash
@@ -73,6 +130,10 @@ jobs:
         with:
           name: web-dist
           path: web/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: zam-cli-${{ matrix.other }}
+          path: cli-other
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -123,7 +184,7 @@ jobs:
       - name: package (cpu)
         env:
           VERSION: ${{ inputs.version }}
-        run: cargo xtask package --platform ${{ matrix.platform }} --flavor cpu --version "${VERSION#v}" ${{ matrix.cli_bin_arg }}
+        run: cargo xtask package --platform ${{ matrix.platform }} --flavor cpu --version "${VERSION#v}" ${{ matrix.cli_bin_arg }} --cli-other cli-other/${{ matrix.other_exe }}
       - name: smoke (cpu)
         env:
           VERSION: ${{ inputs.version }}
@@ -140,7 +201,8 @@ jobs:
           extra=()
           if [ "${EXTRAS}" = "true" ]; then extra+=(--cuda); fi
           cargo xtask package --platform ${{ matrix.platform }} --flavor gpu \
-            --version "${VERSION#v}" ${{ matrix.cli_bin_arg }} "${extra[@]}"
+            --version "${VERSION#v}" ${{ matrix.cli_bin_arg }} \
+            --cli-other cli-other/${{ matrix.other_exe }} "${extra[@]}"
       - name: smoke-cuda
         if: inputs.extras
         env:

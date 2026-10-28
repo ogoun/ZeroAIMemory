@@ -1,67 +1,26 @@
-//! Загрузчик insight набора M3 (см. модуль [`super`]): человеческий токен администратора
-//! прогона для `axiom`, создание, замещение и отзыв записей.
+//! Загрузчик insight набора M3 (см. модуль [`super`]): создание, замещение и отзыв записей
+//! токеном прогона (с M4 `axiom` ставит и агент, §7.5).
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::{ENTRIES_FILE, Session};
 use crate::eval::corpus::{EVAL_SOLUTION, Insight};
 use crate::smoke::api;
 
 impl Session {
-    /// Человеческий токен администратора прогона (`axiom` пишет только человек): вход
-    /// администратора WebUI (пароль обвязки smoke), `POST /admin/users/{id}/tokens
-    /// {human: true}` с cookie сессии и CSRF.
-    pub(super) fn human_token(&self) -> Result<String> {
-        let s = crate::smoke::admin_login(&self.base)?;
-        let a = crate::smoke::agent_with(Duration::from_secs(10));
-        let mut r = a
-            .get(&format!("{}/api/v1/auth/me", self.base))
-            .header("Cookie", &s.cookie)
-            .call()?;
-        let me: Value = serde_json::from_str(&r.body_mut().read_to_string()?)?;
-        let id = me["user_id"]
-            .as_str()
-            .context("в /auth/me нет user_id")?
-            .to_string();
-        let mut r = a
-            .post(&format!("{}/api/v1/admin/users/{id}/tokens", self.base))
-            .header("Cookie", &s.cookie)
-            .header("X-CSRF-Token", &s.csrf)
-            .content_type("application/json")
-            .send(r#"{"name":"eval-human","human":true}"#)?;
-        let status = r.status().as_u16();
-        let v: Value = serde_json::from_str(&r.body_mut().read_to_string()?)?;
-        if status != 201 || v["info"]["human"] != true {
-            bail!("выпуск человеческого токена: HTTP {status}");
-        }
-        v["plaintext"]
-            .as_str()
-            .map(String::from)
-            .context("нет plaintext в ответе выпуска токена")
-    }
-
     /// Создаёт, замещает и отзывает insight набора (порядок файла: замещаемая запись
     /// определена раньше); проверяет итоговый `certainty`.
     pub(super) fn load_insights(&mut self, insights: &[Insight]) -> Result<()> {
         if insights.is_empty() {
             return Ok(());
         }
-        let human = insights
-            .iter()
-            .any(|i| i.certainty.as_deref() == Some("axiom"))
-            .then(|| self.human_token())
-            .transpose()?;
+        let token = self.token.clone();
         let mut ids: BTreeMap<&str, String> = BTreeMap::new();
         for i in insights {
-            let token = match (i.certainty.as_deref(), &human) {
-                (Some("axiom"), Some(h)) => h.as_str(),
-                _ => self.token.as_str(),
-            };
             let mut data = json!({ "kind": i.kind });
             if let Some(e) = &i.evidence {
                 data["evidence"] = json!(e);
@@ -92,7 +51,7 @@ impl Session {
                     (format!("/api/v1/spaces/{EVAL_SOLUTION}/entries"), "")
                 }
             };
-            let (st, v) = api(&self.base, token, &path, Some(&body))?;
+            let (st, v) = api(&self.base, &token, &path, Some(&body))?;
             if st != 201 {
                 bail!("insight {}: POST {path}: HTTP {st}: {v}", i.key);
             }

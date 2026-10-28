@@ -41,6 +41,7 @@ impl SupervisorConfig {
         SupervisorConfig::External(ExternalConfig {
             grpc_url: grpc_url.into(),
             api_key,
+            exact_search: false,
         })
     }
 }
@@ -51,6 +52,9 @@ pub struct ExternalConfig {
     /// gRPC-адрес, например `http://127.0.0.1:6334`.
     pub grpc_url: String,
     pub api_key: Option<String>,
+    /// Точный поиск (`qdrant.exact_search`) — параметр запроса, действует и для внешнего
+    /// Qdrant; только для прогонов гейта eval.
+    pub exact_search: bool,
 }
 
 impl std::fmt::Debug for ExternalConfig {
@@ -58,6 +62,7 @@ impl std::fmt::Debug for ExternalConfig {
         f.debug_struct("ExternalConfig")
             .field("grpc_url", &self.grpc_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("exact_search", &self.exact_search)
             .finish()
     }
 }
@@ -89,6 +94,9 @@ pub struct ManagedConfig {
     /// Предел ожидания сброса WAL при штатной остановке после записи (вариант A задачи 19);
     /// ноль — не ждать. См. [`flush_wait`].
     pub shutdown_flush_wait: Duration,
+    /// Точный поиск без HNSW и квантования (`qdrant.exact_search`): только для прогонов
+    /// гейта качества eval (задача 15 M4), в продакшне выключен.
+    pub exact_search: bool,
 }
 
 impl ManagedConfig {
@@ -107,6 +115,7 @@ impl ManagedConfig {
             flush_interval_sec: DEFAULT_FLUSH_INTERVAL_SEC,
             wal_capacity_mb: DEFAULT_WAL_CAPACITY_MB,
             shutdown_flush_wait: DEFAULT_SHUTDOWN_FLUSH_WAIT,
+            exact_search: false,
         }
     }
 
@@ -119,14 +128,18 @@ impl ManagedConfig {
     }
 }
 
-/// Умолчание `qdrant.flush_interval_sec` (Qdrant — 5 с; выбор — задача 19 M3).
-pub const DEFAULT_FLUSH_INTERVAL_SEC: u64 = 5;
+/// Умолчание `qdrant.flush_interval_sec` (Qdrant — 5 с): 3 с — решение владельца 2026-10-26
+/// (M4, §4.3, §17): подтверждение WAL после пачки приходит за 4,4–8,7 с вместо 7,4–10,0 с при
+/// 5 с, цена индексации −1,5…−5,2 %.
+pub const DEFAULT_FLUSH_INTERVAL_SEC: u64 = 3;
 /// Умолчание `qdrant.wal_capacity_mb` (Qdrant — 32 МБ).
 pub const DEFAULT_WAL_CAPACITY_MB: u64 = 32;
 /// Умолчание `qdrant.shutdown_flush_wait_ms`.
-/// 10 с: на HDD подтверждение после пачки приходило за 6,0–8,4 с (задача 19, ожидание до
-/// 15 с, 4 из 4), при пределе 6 с — 1 раз из 4; ожидание кончается с подтверждением.
-pub const DEFAULT_SHUTDOWN_FLUSH_WAIT: Duration = Duration::from_millis(10_000);
+/// 14 с — решение владельца 2026-10-26 (M4): на 40 % больше прежних 10 с (задача 19 M3:
+/// подтверждение при 5 с приходило за 7,4–10,0 с, запас 0–2,6 с); при `flush_interval_sec = 3`
+/// оно приходит за 4,4–8,7 с, ожидание кончается с подтверждением. Таймаут остановки службы —
+/// `max(90, ceil(shutdown_flush_wait_ms / 1000) + 80)` с (R4, §4.3).
+pub const DEFAULT_SHUTDOWN_FLUSH_WAIT: Duration = Duration::from_millis(14_000);
 
 /// Сколько ждать перед остановкой Qdrant, если последняя запись была `since_write` назад.
 ///
@@ -286,7 +299,7 @@ mod tests {
             "    max_search_threads: 2",
             "    optimizer_cpu_budget: 2",
             "  wal:\n    wal_capacity_mb: 32\n",
-            "  optimizers:\n    flush_interval_sec: 5\n",
+            "  optimizers:\n    flush_interval_sec: 3\n",
             "  host: 127.0.0.1",
             "  http_port: 7333",
             "  grpc_port: 7334",

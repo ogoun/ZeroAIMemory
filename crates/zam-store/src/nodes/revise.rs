@@ -8,12 +8,13 @@
 
 use jiff::Timestamp;
 use rusqlite::{Connection, params};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::{PatchError, PatchOp, apply_patch, section_bytes};
 
 use super::chunks::{index_state, note_meta, space_kind};
 use super::write::store_revision;
 use super::{Attribution, AuthorKind, Node, NodeKind, load_node, revision_text, sha256_hex};
+use crate::cache::StaleKind;
 use crate::certainty::{CertaintyChange, check_certainty, check_final_state};
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
@@ -183,10 +184,10 @@ async fn write_note(
     .await?
 }
 
-/// Заметку `axiom` меняет только человек: проверка по текущей ревизии до любой записи
-/// ([`commit_text`] — общий шаг `PUT`, `PATCH`, `revert`). Порядок ответов: конфликт ревизии
-/// (`If-Match`/`base_rev` устарел — 409) и ошибки PATCH проверяются раньше; при актуальной
-/// ревизии агент получает 403, ничего не записав.
+/// Изменение заметки по матрице `certainty` (§7.5; с M4 заметку `axiom` правит любой автор):
+/// проверка по текущей ревизии до любой записи ([`commit_text`] — общий шаг `PUT`, `PATCH`,
+/// `revert`). Конфликт ревизии (`If-Match`/`base_rev` устарел — 409) и ошибки PATCH
+/// проверяются раньше.
 fn ensure_may_modify(node: &Node, author: AuthorKind) -> Result<(), StoreError> {
     Ok(check_certainty(
         author,
@@ -285,6 +286,17 @@ fn commit_text(
         a,
         Some(&node.index_state),
         &now,
+    )?;
+    // выжимки кэша с этим источником (§9.4): секция с прежним текстом остаётся действующей
+    crate::cache::invalidate_revised(
+        tx,
+        TargetRef {
+            kind: TargetKind::Node,
+            id: node.id,
+        },
+        rev,
+        content,
+        StaleKind::Changed,
     )?;
     load_node(tx, node.id)
 }

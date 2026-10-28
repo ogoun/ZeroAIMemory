@@ -507,22 +507,12 @@ async fn wrong_master_key_locks_vault_server_works() {
     // чужой ключ: 32 байта в base64
     std::fs::write(&key_file, "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\n").unwrap();
     let b = api_with(c.clone()).await;
-    for (m, uri) in [
-        (Method::GET, "/api/v1/spaces/knowledge/vault".to_string()),
-        (Method::GET, format!("/api/v1/vault/{id}?reveal=1")),
-        (Method::GET, format!("/api/v1/vault/{id}")),
-    ] {
-        let r = b.tok(&token, m, &uri, None).await;
-        assert_eq!(
-            r.status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{uri}: {}",
-            r.text()
-        );
-        let j = r.json();
-        assert_eq!(j["type"], "/problems/vault-locked", "{j}");
-        assert!(j["detail"].as_str().unwrap().contains("мастер-ключ"), "{j}");
-    }
+    // значение — 503 с причиной; метаданные — 200 (см. vault_list_when_locked_returns_metadata)
+    let r = reveal(&b, &token, &id).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["type"], "/problems/vault-locked", "{j}");
+    assert!(j["detail"].as_str().unwrap().contains("мастер-ключ"), "{j}");
     let r = set(&b, &token, "knowledge", "new", "x").await;
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
     // остальной сервер работает
@@ -545,6 +535,149 @@ async fn wrong_master_key_locks_vault_server_works() {
     std::fs::write(&key_file, &original).unwrap();
     let c2 = api_with(c).await;
     assert_eq!(reveal(&c2, &token, &id).await.json()["secret"], value("wk"));
+}
+
+/// Сервер с подменённым мастер-ключом после записи секрета: `(Api, токен, id записи,
+/// каталог данных)`; прежний ключ — `master.key.orig` рядом.
+async fn locked_world(name: &str, secret: &str) -> (Api, String, String, PathBuf) {
+    let dir = common::tmp(name);
+    let c = common::cfg_in(dir.clone());
+    let a = api_with(c.clone()).await;
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", secret).await);
+    let token = a.token.clone();
+    a.st.shutdown().await;
+    drop(a);
+    let key_file = dir.join("master.key");
+    std::fs::copy(&key_file, dir.join("master.key.orig")).unwrap();
+    std::fs::write(
+        &key_file,
+        "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+",
+    )
+    .unwrap();
+    (api_with(c).await, token, id, dir)
+}
+
+/// Заблокированный Vault: список, метаданные и ревизии — 200 с `locked: true` и `reason`,
+/// только открытые поля (ни значения, ни шифротекста); при работающем Vault `locked: false`.
+#[tokio::test]
+async fn vault_list_when_locked_returns_metadata() {
+    // работающий Vault: locked=false, reason нет
+    let ok = api("vault-meta-ok", |_| {}).await;
+    let sec = value("lk");
+    let id = id_of(&set(&ok, &ok.token, "knowledge", "github", &sec).await);
+    let tok = ok.token.clone();
+    let r = ok
+        .tok(&tok, Method::GET, "/api/v1/spaces/knowledge/vault", None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["locked"], false);
+    assert!(r.json().get("reason").is_none());
+    let r = ok
+        .tok(&tok, Method::GET, &format!("/api/v1/vault/{id}"), None)
+        .await;
+    assert_eq!(r.json()["locked"], false, "{}", r.text());
+
+    let (b, token, id, _dir) = locked_world("vault-meta-locked", &sec).await;
+    let uris = [
+        "/api/v1/spaces/knowledge/vault".to_string(),
+        "/api/v1/spaces/knowledge/vault?q=git".to_string(),
+        format!("/api/v1/vault/{id}"),
+        format!("/api/v1/vault/{id}/revisions"),
+    ];
+    for uri in &uris {
+        let r = b.tok(&token, Method::GET, uri, None).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        let j = r.json();
+        assert_eq!(j["locked"], true, "{uri}: {j}");
+        assert!(
+            j["reason"].as_str().unwrap().contains("мастер-ключ"),
+            "{uri}: {j}"
+        );
+        let text = r.text();
+        assert!(!text.contains(&sec), "{uri}: значение в ответе");
+        assert!(!text.contains("\"secret\""), "{uri}: {text}");
+    }
+    // метаданные те же, что при работающем Vault
+    let j = b
+        .tok(&token, Method::GET, "/api/v1/spaces/knowledge/vault", None)
+        .await
+        .json();
+    assert_eq!(j["items"][0]["title"], "github", "{j}");
+    assert_eq!(j["items"][0]["data"]["type"], "token", "{j}");
+    assert_eq!(j["items"][0]["id"], id.as_str(), "{j}");
+    let j = b
+        .tok(&token, Method::GET, &format!("/api/v1/vault/{id}"), None)
+        .await
+        .json();
+    assert_eq!(j["title"], "github", "{j}");
+    assert_eq!(j["rev"], 1, "{j}");
+    let j = b
+        .tok(
+            &token,
+            Method::GET,
+            &format!("/api/v1/vault/{id}/revisions"),
+            None,
+        )
+        .await
+        .json();
+    assert_eq!(j["items"].as_array().unwrap().len(), 1, "{j}");
+    // чужая область и несуществующая запись — прежние ошибки
+    let r = b
+        .tok(&token, Method::GET, "/api/v1/spaces/rules/vault", None)
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = b
+        .tok(
+            &token,
+            Method::GET,
+            &format!("/api/v1/vault/{}", zam_core::Id::new()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}
+
+/// Заблокированный Vault: значения, создание, правка, удаление и раскрытие ревизий — 503.
+#[tokio::test]
+async fn vault_reveal_and_write_when_locked_503() {
+    let (b, token, id, _dir) = locked_world("vault-write-locked", &value("w")).await;
+    let cases = [
+        (Method::GET, format!("/api/v1/vault/{id}?reveal=1"), None),
+        (
+            Method::GET,
+            format!("/api/v1/vault/{id}/revisions?reveal=1&rev=1"),
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/spaces/knowledge/vault".to_string(),
+            Some(json!({"title": "n", "data": {"type": "note"}, "secret": "x"})),
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/vault/{id}"),
+            Some(json!({"title": "z"})),
+        ),
+        (Method::DELETE, format!("/api/v1/vault/{id}"), None),
+    ];
+    for (m, uri, body) in cases {
+        let r = b.tok(&token, m.clone(), &uri, body).await;
+        assert_eq!(
+            r.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{m} {uri}: {}",
+            r.text()
+        );
+        assert_eq!(r.json()["type"], "/problems/vault-locked", "{uri}");
+    }
+    // запись не удалена и не изменена
+    let j = b
+        .tok(&token, Method::GET, &format!("/api/v1/vault/{id}"), None)
+        .await
+        .json();
+    assert_eq!(j["title"], "github", "{j}");
+    assert_eq!(j["rev"], 1, "{j}");
 }
 
 #[tokio::test]

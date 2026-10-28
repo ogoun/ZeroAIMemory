@@ -160,7 +160,7 @@ pub const INSIGHT_REF: &str = "insight:";
 
 /// Корпус: заметки по пути (порядок путей стабилен — загрузка детерминирована) и insight
 /// набора M3 в порядке файла (замещаемая запись определена раньше замещающей).
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Corpus {
     pub notes: BTreeMap<String, Note>,
     pub insights: Vec<Insight>,

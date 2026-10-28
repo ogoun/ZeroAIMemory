@@ -1,0 +1,734 @@
+# Набор точности подсказок хуков eval M4 (ТЗ §10.3, §18.2; задача 15 M4). Формат и правила —
+# eval/README.md, раздел «Подсказки хуков».
+#
+# Прогон `cargo xtask eval --hints` поднимает сервер с корпусом eval/corpus и insight
+# eval/insights.toml, добавляет записи этого файла (`[[insight]]` — с триггерами, `[[rule]]` —
+# заметки Rules) и проверяет случаи `[[case]]`:
+# - `prompt` — `POST /recall {event: prompt}` (поиск по insight и Rules, балл ≥
+#   `recall.prompt_min_score`, до 3 подсказок);
+# - `post_tool` — `POST /recall {event: post_tool, tool: "Bash"}` (`error_regex`, затем FTS по
+#   insight с порогом покрытия слов ошибки);
+# - `pre_tool` — процесс `zam hook pre-tool` (только локально: `file_glob` по пути файла
+#   `Write`/`Edit`, `command_regex` по команде `Bash`; кэш триггеров — от `zam hook session-start`).
+#
+# `expected` — подсказки, которые должны быть показаны (`insight:<key>` — запись eval/insights.toml
+# или этого файла, `rule:<key>` — заметка Rules этого файла); пусто — ожидается тишина.
+# Релевантными считаются и обе записи пары «надёжное — гипотеза» одной темы: подсказка показывает
+# `certainty`, агент видит, какой записи верить.
+#
+# Записи этого файла в прогоны поиска (`cargo xtask eval --mode …`) не входят: отпечаток корпуса
+# M3 не меняется.
+
+# ======================= insight с триггерами (pre_tool, post_tool) =======================
+
+[[insight]]
+key = "h01-sh-lf"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+title = "Bash-скрипты в репозитории хранятся с LF"
+body = "Скрипт .sh с переводами строк CRLF падает в Linux и Git Bash с ошибкой «$'\\r': command not found». В .gitattributes для *.sh задано eol=lf; редактор на Windows должен сохранять такие файлы с LF."
+triggers = [{ type = "file_glob", pattern = "**/*.sh", tools = ["Write", "Edit"] }]
+
+[[insight]]
+key = "h02-ps1-bom"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+title = "Скрипты PowerShell с кириллицей сохраняются в UTF-8 с BOM"
+body = "Windows PowerShell 5.1 читает .ps1 без BOM в кодировке ANSI, и кириллица в строках превращается в мусор. Скрипты PowerShell проекта сохраняются в UTF-8 с BOM."
+triggers = [{ type = "file_glob", pattern = "**/*.ps1", tools = ["Write", "Edit"] }]
+
+[[insight]]
+key = "h03-migrations"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+certainty = "axiom"
+title = "Выпущенные миграции SQLite не правятся — только новая миграция"
+body = "Миграция, попавшая в релиз, уже применена у пользователей: её правка расходится с их базами. Изменение схемы — новый файл миграции со следующим номером и копия базы перед применением."
+triggers = [{ type = "file_glob", pattern = "crates/zam-store/migrations/**", tools = ["Write", "Edit"] }]
+
+[[insight]]
+key = "h04-gha-secrets"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+title = "Workflows must not expose secrets to pull_request_target jobs"
+body = "A pull_request_target workflow runs with repository secrets on code from a fork. Check out the pull request head only in jobs without secrets and keep the default read-only token permissions."
+triggers = [{ type = "file_glob", pattern = ".github/workflows/*.yml", tools = ["Write", "Edit"] }]
+
+[[insight]]
+key = "h05-force-push"
+lang = "en"
+kind = "decision"
+scope = "solution"
+certainty = "axiom"
+title = "Never force-push shared branches"
+body = "Force-pushing rewrites history other machines already have. Undo published commits with git revert; rebase only local branches that nobody else pulled."
+triggers = [{ type = "command_regex", pattern = "git\\s+push\\b.*(--force\\b|--force-with-lease|\\s-f\\b)" }]
+
+[[insight]]
+key = "h06-git-clean"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+title = "git clean -x удаляет .env и локальные конфиги"
+body = "Флаг -x у git clean удаляет и игнорируемые файлы: .env, локальные конфиги, кэш моделей в target. Сначала git clean -n, затем точечное удаление."
+triggers = [{ type = "command_regex", pattern = "git\\s+clean\\s+-[a-wyz]*x" }]
+
+[[insight]]
+key = "h07-no-docker"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+certainty = "axiom"
+title = "Docker в проекте не используется для запуска зависимостей"
+body = "Qdrant, ONNX Runtime и модели ставятся нативными бинарниками из манифестов deploy/ (cargo xtask fetch-deps); контейнеры для разработки и тестов не нужны."
+triggers = [{ type = "command_regex", pattern = "\\bdocker\\b" }]
+
+[[insight]]
+key = "h08-lnk1181"
+lang = "ru"
+kind = "failure"
+scope = "solution"
+title = "LNK1181: компоновщик не находит onnxruntime.lib"
+body = "Сборка с динамической загрузкой ONNX Runtime не должна линковаться с onnxruntime.lib. Ошибка LNK1181 значит, что включена фича статической линковки ort; нужна фича load-dynamic и путь ml.ort_dylib."
+triggers = [{ type = "error_regex", pattern = "LNK1181", tools = ["Bash"] }]
+
+[[insight]]
+key = "h09-sqlite-busy"
+lang = "en"
+kind = "failure"
+scope = "global"
+title = "database is locked (SQLITE_BUSY): a second writer without busy_timeout"
+body = "SQLITE_BUSY with the message database is locked means another connection holds the write lock. Route all writes through one writer and set busy_timeout on every connection."
+triggers = [{ type = "error_regex", pattern = "database is locked|SQLITE_BUSY" }]
+
+[[insight]]
+key = "h10-port-in-use"
+lang = "en"
+kind = "failure"
+scope = "solution"
+title = "Address already in use: an old server instance still holds the port"
+body = "os error 10048 on Windows and EADDRINUSE on Linux mean the port is taken, usually by a previous zam-server or its Qdrant. Stop the old process or pick a free port."
+triggers = [{ type = "error_regex", pattern = "os error 10048|Address already in use|EADDRINUSE" }]
+
+[[insight]]
+key = "h11-crlf-bash"
+lang = "ru"
+kind = "failure"
+scope = "solution"
+title = "Ошибка $'\\r': command not found — скрипт сохранён с CRLF"
+body = "Bash видит символ возврата каретки в конце каждой строки скрипта с переводами CRLF. Перевести файл в LF (dos2unix или настройка редактора) и закрепить eol=lf в .gitattributes."
+triggers = [{ type = "error_regex", pattern = "\\$'\\\\r': command not found" }]
+
+# ---- без триггеров: подсказку post_tool даёт FTS по нормализованной ошибке ----
+
+[[insight]]
+key = "h12-npm-eresolve"
+lang = "en"
+kind = "failure"
+scope = "solution"
+title = "npm ERESOLVE unable to resolve dependency tree after a peer upgrade"
+body = "npm ERR! code ERESOLVE appears when a peer dependency range no longer matches. Upgrade the plugin together with its peer instead of passing --legacy-peer-deps."
+
+[[insight]]
+key = "h13-cuda-dll"
+lang = "en"
+kind = "failure"
+scope = "solution"
+title = "LoadLibrary failed with error 126 for onnxruntime_providers_cuda.dll"
+body = "Error 126 when loading onnxruntime_providers_cuda.dll means a dependent NVIDIA library such as cudnn or cublas is missing next to it. Run zam-server cuda fetch instead of installing the CUDA Toolkit."
+
+[[insight]]
+key = "h14-exec-policy"
+lang = "en"
+kind = "gotcha"
+scope = "global"
+title = "Running scripts is disabled on this system: PowerShell execution policy"
+body = "The script cannot be loaded because running scripts is disabled on this system. Set the execution policy to RemoteSigned for the current user once."
+
+[[insight]]
+key = "h15-git-nonff"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+title = "Push rejected as non-fast-forward: pull with rebase first"
+body = "The remote has commits you do not have: failed to push some refs, rejected, non-fast-forward. Run git pull --rebase and push again instead of forcing."
+
+[[insight]]
+key = "h16-cargo-lock"
+lang = "en"
+kind = "gotcha"
+scope = "global"
+title = "Blocking waiting for file lock on build directory"
+body = "Another cargo process, often the editor's language server, holds the lock on the target build directory. Wait for it or give the second build its own CARGO_TARGET_DIR."
+
+[[insight]]
+key = "h17-lnk1104"
+lang = "en"
+kind = "failure"
+scope = "solution"
+title = "LNK1104 cannot open file in target: antivirus holds freshly built files"
+body = "fatal error LNK1104: cannot open file under target\\debug appears when real-time antivirus scanning locks the file the linker just wrote. Exclude the target directory and the cargo cache from scanning."
+
+# ======================= заметки Rules (prompt, дайджест session_start) =======================
+
+[[rule]]
+key = "commits"
+path = "commits"
+text = """
+# Коммиты
+
+Сообщения коммитов — Conventional Commits на русском: `feat(scope): что сделано`. В конце —
+трейлер Co-Authored-By исполнителя. Коммит содержит только свои пути, без посторонних файлов.
+"""
+
+[[rule]]
+key = "tmp-files"
+path = "temporary-files"
+text = """
+# Временные файлы
+
+Временные файлы, логи прогонов и снимки — только в каталоге .tmp/ проекта или в target/.
+Системный temp, /tmp и %TEMP% не используются.
+"""
+
+[[rule]]
+key = "deps"
+path = "dependencies"
+text = """
+# Dependencies
+
+A new crate or npm package is added only after a license audit (MIT, Apache-2.0 or compatible)
+and a note in the task journal. Prefer crates already in the workspace.
+"""
+
+# ======================= случаи: prompt =======================
+
+[[case]]
+id = "p-01"
+event = "prompt"
+input = "сделай коммит с этими правками"
+expected = ["rule:commits"]
+note = "правило Rules"
+
+[[case]]
+id = "p-02"
+event = "prompt"
+input = "add the serde_yaml crate as a new dependency"
+expected = ["rule:deps"]
+note = "правило Rules, английский"
+
+[[case]]
+id = "p-03"
+event = "prompt"
+input = "сохрани промежуточные результаты прогона во временный каталог"
+expected = ["rule:tmp-files", "insight:p13-a", "insight:p13-h"]
+note = "правило и пара axiom/hypothesis, кросс-язык"
+
+[[case]]
+id = "p-04"
+event = "prompt"
+input = "скопируй каталог через robocopy и проверь код возврата в скрипте"
+expected = ["insight:p09-t", "insight:p09-h"]
+note = "пара theorem/hypothesis"
+
+[[case]]
+id = "p-05"
+event = "prompt"
+input = "запиши файл в UTF-8 без BOM из Windows PowerShell 5.1"
+expected = ["insight:p01-t", "insight:p01-h", "insight:h02-ps1-bom"]
+note = "пара и запись о BOM скриптов"
+
+[[case]]
+id = "p-06"
+event = "prompt"
+input = "подними Qdrant на Windows для локальной разработки"
+expected = ["insight:p02-t", "insight:p02-h", "insight:p12-a", "insight:p12-h", "insight:h07-no-docker"]
+note = "две пары и решение без Docker"
+
+[[case]]
+id = "p-07"
+event = "prompt"
+input = "force push my rebased branch to main"
+expected = ["insight:p11-a", "insight:p11-h", "insight:h05-force-push"]
+note = "axiom и гипотеза"
+
+[[case]]
+id = "p-08"
+event = "prompt"
+input = "почему ONNX Runtime с CUDA не видит видеокарту без CUDA Toolkit"
+expected = ["insight:p03-t", "insight:p03-h", "insight:h13-cuda-dll"]
+note = "пара theorem/hypothesis"
+
+[[case]]
+id = "p-09"
+event = "prompt"
+input = "настрой ротацию журналов шлюза"
+expected = ["insight:c07-b"]
+note = "действующая запись цепочки замещения"
+
+[[case]]
+id = "p-10"
+event = "prompt"
+input = "какой срок жизни поставить кешу тарифов доставки"
+expected = ["insight:c01-b"]
+note = "действующая запись цепочки"
+
+[[case]]
+id = "p-11"
+event = "prompt"
+input = "which Node.js version should the frontend build use"
+expected = ["insight:c05-c"]
+note = "цепочка из трёх, кросс-язык"
+
+[[case]]
+id = "p-12"
+event = "prompt"
+input = "how many search candidates should the reranker rescore"
+expected = ["insight:c06-c"]
+note = "цепочка из трёх"
+
+[[case]]
+id = "p-13"
+event = "prompt"
+input = "настрой алерт на заполнение диска"
+expected = ["insight:c09-c"]
+note = "цепочка из трёх"
+
+[[case]]
+id = "p-14"
+event = "prompt"
+input = "issue a TLS certificate for the new internal service"
+expected = ["insight:c14-c"]
+note = "цепочка из трёх"
+
+[[case]]
+id = "p-15"
+event = "prompt"
+input = "тесты сервиса уведомлений опять нестабильно падают"
+expected = ["insight:r01-fix"]
+note = "верный вывод на месте отозванного"
+
+[[case]]
+id = "p-16"
+event = "prompt"
+input = "переименуй функцию parse_args в parse_cli_args во всём модуле"
+expected = []
+note = "рутинная правка"
+
+[[case]]
+id = "p-17"
+event = "prompt"
+input = "write a unit test for the date formatting helper"
+expected = []
+note = "рутинная правка"
+
+[[case]]
+id = "p-18"
+event = "prompt"
+input = "объясни, что делает регулярное выражение ^\\d{3}-\\d{2}$"
+expected = []
+note = "вопрос без памяти"
+
+[[case]]
+id = "p-19"
+event = "prompt"
+input = "add a dark mode toggle to the settings page"
+expected = []
+note = "UI"
+
+[[case]]
+id = "p-20"
+event = "prompt"
+input = "сгенерируй README для нового пакета утилит"
+expected = []
+note = "документация"
+
+[[case]]
+id = "p-21"
+event = "prompt"
+input = "сколько будет 17 умножить на 23"
+expected = []
+note = "вопрос без памяти"
+
+[[case]]
+id = "p-22"
+event = "prompt"
+input = "translate the user-facing error messages to German"
+expected = []
+note = "локализация"
+
+[[case]]
+id = "p-23"
+event = "prompt"
+input = "нарисуй диаграмму классов модуля оплаты"
+expected = []
+note = "вопрос без памяти"
+
+[[case]]
+id = "p-24"
+event = "prompt"
+input = "fix the typo in the changelog heading"
+expected = []
+note = "трудный: слово changelog"
+
+[[case]]
+id = "p-25"
+event = "prompt"
+input = "добавь кеш для списка пользователей в админке"
+expected = []
+note = "трудный: «кеш», но не тарифы доставки"
+
+[[case]]
+id = "p-26"
+event = "prompt"
+input = "configure the logger to print timestamps in UTC"
+expected = []
+note = "трудный: журналы, но не ротация шлюза"
+
+[[case]]
+id = "p-27"
+event = "prompt"
+input = "посмотри, почему линтер ругается на импорты во фронтенде"
+expected = []
+note = "трудный: фронтенд, но не версия Node.js"
+
+[[case]]
+id = "p-28"
+event = "prompt"
+input = "отправляй уведомление в чат, когда деплой завершён"
+expected = []
+note = "трудный: уведомления и алерты"
+
+[[case]]
+id = "p-29"
+event = "prompt"
+input = "sort the search results table by date in the admin UI"
+expected = []
+note = "трудный: search"
+
+[[case]]
+id = "p-30"
+event = "prompt"
+input = "выведи список файлов, изменённых в последнем коммите"
+expected = []
+note = "трудный: коммит, но не оформление"
+
+# ======================= случаи: post_tool =======================
+
+[[case]]
+id = "e-01"
+event = "post_tool"
+input = "LINK : fatal error LNK1181: cannot open input file 'onnxruntime.lib'"
+expected = ["insight:h08-lnk1181"]
+note = "error_regex"
+
+[[case]]
+id = "e-02"
+event = "post_tool"
+input = "Error: database is locked (code 5 SQLITE_BUSY)"
+expected = ["insight:h09-sqlite-busy"]
+note = "error_regex"
+
+[[case]]
+id = "e-03"
+event = "post_tool"
+input = "thread 'main' panicked at src/main.rs:41:10: bind 127.0.0.1:8080: Address already in use (os error 10048)"
+expected = ["insight:h10-port-in-use"]
+note = "error_regex"
+
+[[case]]
+id = "e-04"
+event = "post_tool"
+input = "./deploy.sh: line 3: $'\\r': command not found"
+expected = ["insight:h11-crlf-bash", "insight:h01-sh-lf"]
+note = "error_regex и запись о LF"
+
+[[case]]
+id = "e-05"
+event = "post_tool"
+input = "npm ERR! code ERESOLVE\nnpm ERR! ERESOLVE unable to resolve dependency tree\nnpm ERR! While resolving: web@0.1.0"
+expected = ["insight:h12-npm-eresolve"]
+note = "FTS"
+
+[[case]]
+id = "e-06"
+event = "post_tool"
+input = "LoadLibrary failed with error 126 \"\" when trying to load \"C:\\zam\\onnxruntime_providers_cuda.dll\""
+expected = ["insight:h13-cuda-dll", "insight:p03-t"]
+note = "FTS; theorem о CUDA — на русском"
+
+[[case]]
+id = "e-07"
+event = "post_tool"
+input = "File C:\\work\\build.ps1 cannot be loaded because running scripts is disabled on this system."
+expected = ["insight:h14-exec-policy"]
+note = "FTS"
+
+[[case]]
+id = "e-08"
+event = "post_tool"
+input = " ! [rejected]        main -> main (non-fast-forward)\nerror: failed to push some refs to 'origin'"
+expected = ["insight:h15-git-nonff", "insight:p11-a"]
+note = "FTS; правило про force-push"
+
+[[case]]
+id = "e-09"
+event = "post_tool"
+input = "    Blocking waiting for file lock on build directory"
+expected = ["insight:h16-cargo-lock"]
+note = "FTS, строгий запрос"
+
+[[case]]
+id = "e-10"
+event = "post_tool"
+input = "robocopy exited with code 3"
+expected = ["insight:p09-t", "insight:p09-h"]
+note = "FTS, короткая ошибка: одно общее слово"
+
+[[case]]
+id = "e-11"
+event = "post_tool"
+input = "LINK : fatal error LNK1104: cannot open file 'target\\debug\\deps\\zam-a1b2c3.exe'"
+expected = ["insight:h17-lnk1104", "insight:c02-b"]
+note = "FTS; та же проблема на русском — c02-b"
+
+[[case]]
+id = "e-12"
+event = "post_tool"
+input = "sqlite3.OperationalError: database is locked"
+expected = ["insight:h09-sqlite-busy"]
+note = "error_regex, другой клиент"
+
+[[case]]
+id = "e-13"
+event = "post_tool"
+input = "error: could not find `Cargo.toml` in `C:\\work` or any parent directory"
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-14"
+event = "post_tool"
+input = "fatal: not a git repository (or any of the parent directories): .git"
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-15"
+event = "post_tool"
+input = "ModuleNotFoundError: No module named 'requests'"
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-16"
+event = "post_tool"
+input = "TypeError: Cannot read properties of undefined (reading 'map')"
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-17"
+event = "post_tool"
+input = "src/app.ts(3,21): error TS2307: Cannot find module './utils' or its corresponding type declarations."
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-18"
+event = "post_tool"
+input = "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository."
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-19"
+event = "post_tool"
+input = "curl: (6) Could not resolve host: artifacts.internal"
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-20"
+event = "post_tool"
+input = "Segmentation fault (core dumped)"
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-21"
+event = "post_tool"
+input = "thread 'main' panicked at src/main.rs:10:5:\nindex out of bounds: the len is 3 but the index is 5"
+expected = []
+note = "посторонняя ошибка"
+
+[[case]]
+id = "e-22"
+event = "post_tool"
+input = "error: linker `cc` not found\n  = note: No such file or directory (os error 2)"
+expected = []
+note = "трудный: linker, os error"
+
+[[case]]
+id = "e-23"
+event = "post_tool"
+input = "Error: database disk image is malformed"
+expected = []
+note = "трудный: database"
+
+[[case]]
+id = "e-24"
+event = "post_tool"
+input = "npm ERR! code ENOENT\nnpm ERR! syscall open\nnpm ERR! path C:\\work\\package.json"
+expected = []
+note = "трудный: npm ERR! code"
+
+# ======================= случаи: pre_tool =======================
+
+[[case]]
+id = "t-01"
+event = "pre_tool"
+tool = "Write"
+input = "scripts/deploy.sh"
+expected = ["insight:h01-sh-lf"]
+note = "file_glob"
+
+[[case]]
+id = "t-02"
+event = "pre_tool"
+tool = "Edit"
+input = "tools/release/build.sh"
+expected = ["insight:h01-sh-lf"]
+note = "file_glob, вложенный каталог"
+
+[[case]]
+id = "t-03"
+event = "pre_tool"
+tool = "Write"
+input = "scripts/dev-env.ps1"
+expected = ["insight:h02-ps1-bom"]
+note = "file_glob"
+
+[[case]]
+id = "t-04"
+event = "pre_tool"
+tool = "Edit"
+input = "crates/zam-store/migrations/0012_entries.sql"
+expected = ["insight:h03-migrations"]
+note = "file_glob по каталогу"
+
+[[case]]
+id = "t-05"
+event = "pre_tool"
+tool = "Write"
+input = ".github/workflows/ci.yml"
+expected = ["insight:h04-gha-secrets"]
+note = "file_glob"
+
+[[case]]
+id = "t-06"
+event = "pre_tool"
+tool = "Bash"
+input = "git push --force origin main"
+expected = ["insight:h05-force-push"]
+note = "command_regex"
+
+[[case]]
+id = "t-07"
+event = "pre_tool"
+tool = "Bash"
+input = "git push -f"
+expected = ["insight:h05-force-push"]
+note = "command_regex, короткий флаг"
+
+[[case]]
+id = "t-08"
+event = "pre_tool"
+tool = "Bash"
+input = "git clean -fdx"
+expected = ["insight:h06-git-clean"]
+note = "command_regex"
+
+[[case]]
+id = "t-09"
+event = "pre_tool"
+tool = "Bash"
+input = "docker compose up -d qdrant"
+expected = ["insight:h07-no-docker"]
+note = "command_regex"
+
+[[case]]
+id = "t-10"
+event = "pre_tool"
+tool = "Write"
+input = "src/main.rs"
+expected = []
+note = "посторонний файл"
+
+[[case]]
+id = "t-11"
+event = "pre_tool"
+tool = "Edit"
+input = "README.md"
+expected = []
+note = "посторонний файл"
+
+[[case]]
+id = "t-12"
+event = "pre_tool"
+tool = "Write"
+input = "docs/deploy.sh.md"
+expected = []
+note = "трудный: .sh не в конце имени"
+
+[[case]]
+id = "t-13"
+event = "pre_tool"
+tool = "Edit"
+input = "crates/zam-store/src/migrate.rs"
+expected = []
+note = "трудный: рядом с каталогом миграций"
+
+[[case]]
+id = "t-14"
+event = "pre_tool"
+tool = "Bash"
+input = "git push origin feature/hints"
+expected = []
+note = "трудный: push без force"
+
+[[case]]
+id = "t-15"
+event = "pre_tool"
+tool = "Bash"
+input = "git clean -n"
+expected = []
+note = "трудный: git clean без -x"
+
+[[case]]
+id = "t-16"
+event = "pre_tool"
+tool = "Bash"
+input = "cargo build --release"
+expected = []
+note = "посторонняя команда"
+
+[[case]]
+id = "t-17"
+event = "pre_tool"
+tool = "Bash"
+input = "ls -la target"
+expected = []
+note = "посторонняя команда"
+
+[[case]]
+id = "t-18"
+event = "pre_tool"
+tool = "Bash"
+input = "grep -rn dockerfile docs"
+expected = []
+note = "трудный: dockerfile — не слово docker"

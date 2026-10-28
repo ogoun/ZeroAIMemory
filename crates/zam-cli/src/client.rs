@@ -18,8 +18,6 @@ pub const EXIT_INPUT: u8 = 6;
 
 /// Предел чтения тела ответа в память (JSON заметки до 5 МБ с экранированием, дифф).
 const BODY_MAX: u64 = 64 * 1024 * 1024;
-/// Предел длины `X-Zam-Machine`, символов (как на сервере).
-const MACHINE_MAX_CHARS: usize = 128;
 
 /// Ошибка команды: текст для stderr и код выхода; `problem` — тело problem+json сервера.
 #[derive(Debug)]
@@ -83,6 +81,9 @@ pub enum Timeouts {
     Probe,
     /// Команды заметок: тело (вложение до 200 МБ) может идти долго, общего предела нет.
     Transfer,
+    /// Хуки агента (§10.3): весь запрос, включая чтение ответа, — не дольше срока
+    /// (бюджет хука минус 30 мс).
+    Deadline(Duration),
 }
 
 pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
@@ -100,6 +101,10 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
             .timeout_send_body(Some(Duration::from_secs(30 * 60)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .timeout_recv_body(Some(Duration::from_secs(5 * 60))),
+        Timeouts::Deadline(d) => b
+            .timeout_resolve(Some(d))
+            .timeout_connect(Some(d))
+            .timeout_global(Some(d)),
     };
     if bypass_proxy(url) {
         b = b.proxy(None);
@@ -107,15 +112,26 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
     ureq::Agent::new_with_config(b.build())
 }
 
-/// Имя машины для `X-Zam-Machine`: `COMPUTERNAME` (Windows) или `HOSTNAME`; без
-/// внешних вызовов. Пустое, длинное или с управляющими символами — не отправляется.
+/// Имя машины для `X-Zam-Machine` (финальное ревью M4, M-4): [`zam_core::machine_name`]
+/// (`ZAM_MACHINE`, `COMPUTERNAME`, `HOSTNAME`), на Linux без них — `/etc/hostname` (файл, не
+/// внешний вызов). Тот же порядок, что у `.mcp.json` (`${ZAM_MACHINE:-}`), когда `ZAM_MACHINE`
+/// задана, — команда установки `zam` её задаёт.
 pub fn machine_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
-    ["COMPUTERNAME", "HOSTNAME"]
-        .iter()
-        .filter_map(|k| get(k))
-        .map(|v| v.trim().to_string())
-        .find(|v| !v.is_empty())
-        .filter(|v| v.chars().count() <= MACHINE_MAX_CHARS && !v.chars().any(char::is_control))
+    zam_core::machine_name(get).or_else(os_hostname)
+}
+
+/// Имя машины из ОС без переменных окружения: на Linux — `/etc/hostname`.
+#[cfg(unix)]
+fn os_hostname() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .and_then(|s| s.lines().next().map(str::to_string))
+        .and_then(zam_core::valid_machine)
+}
+
+#[cfg(not(unix))]
+fn os_hostname() -> Option<String> {
+    None
 }
 
 /// Клиент API одного сервера.
@@ -125,6 +141,7 @@ pub struct Client {
     token: String,
     machine: Option<String>,
     solution: Option<String>,
+    session: Option<String>,
 }
 
 /// В Debug токен — только маска.
@@ -135,6 +152,7 @@ impl fmt::Debug for Client {
             .field("token", &zam_core::mask_token(&self.token))
             .field("machine", &self.machine)
             .field("solution", &self.solution)
+            .field("session", &self.session)
             .finish()
     }
 }
@@ -142,13 +160,29 @@ impl fmt::Debug for Client {
 impl Client {
     /// `base` — без замыкающего `/`; `solution` — GUID для `X-Zam-Solution`.
     pub fn new(base: &str, token: &str, solution: Option<String>) -> Client {
+        Client::with_timeouts(base, token, solution, Timeouts::Transfer)
+    }
+
+    /// Клиент с профилем таймаутов (`Deadline` — хуки агента).
+    pub fn with_timeouts(base: &str, token: &str, solution: Option<String>, t: Timeouts) -> Client {
         Client {
-            agent: agent(base, Timeouts::Transfer),
+            agent: agent(base, t),
             base: base.to_string(),
             token: token.to_string(),
             machine: machine_from(|k| std::env::var(k).ok()),
             solution,
+            session: None,
         }
+    }
+
+    /// Сессия агента для `X-Zam-Session` (запись в память учитывается в её `memory_writes`).
+    pub fn set_session(&mut self, id: Option<String>) {
+        self.session = id;
+    }
+
+    /// Адрес сервера (без `/api/v1`).
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     fn url(&self, path: &str) -> String {
@@ -163,6 +197,9 @@ impl Client {
         if let Some(s) = &self.solution {
             rb = rb.header("X-Zam-Solution", s.as_str());
         }
+        if let Some(s) = &self.session {
+            rb = rb.header("X-Zam-Session", s.as_str());
+        }
         rb
     }
 
@@ -171,6 +208,23 @@ impl Client {
         let mut rb = self.prepare(self.agent.get(&self.url(path)));
         for (k, v) in query {
             rb = rb.query(*k, *v);
+        }
+        self.check(rb.call())
+    }
+
+    /// GET с дополнительными заголовками (`If-None-Match`): 304 — тоже ответ, а не ошибка.
+    pub fn get_with(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        headers: &[(&str, &str)],
+    ) -> Result<Response<Body>, CliError> {
+        let mut rb = self.prepare(self.agent.get(&self.url(path)));
+        for (k, v) in query {
+            rb = rb.query(*k, *v);
+        }
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
         }
         self.check(rb.call())
     }
@@ -205,7 +259,7 @@ impl Client {
         self.check(self.prepare(self.agent.delete(&self.url(path))).call())
     }
 
-    /// PATCH JSON.
+    /// PATCH JSON без `If-Match`.
     pub fn patch_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
         let rb = self.prepare(self.agent.patch(&self.url(path)));
         self.check(
@@ -261,7 +315,28 @@ impl Client {
         self.check(rb.send(ureq::SendBody::from_owned_reader(reader)))
     }
 
-    /// 2xx → ответ; иначе ошибка с кодом выхода по статусу.
+    /// POST сообщения JSON-RPC на `{base}/mcp` (stdio-прокси `zam mcp`, §13.2): ответ любого
+    /// статуса — разбирает вызывающий; ошибка — только сетевая.
+    pub fn post_mcp(
+        &self,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Response<Body>, CliError> {
+        let mut rb = self
+            .prepare(self.agent.post(&format!("{}/mcp", self.base)))
+            .header("Accept", "application/json, text/event-stream");
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        rb.content_type("application/json").send(body).map_err(|e| {
+            CliError::new(
+                EXIT_UNREACHABLE,
+                format!("сервер {} недоступен: {e}", self.base),
+            )
+        })
+    }
+
+    /// 2xx и 304 (ответ на `If-None-Match`) → ответ; иначе ошибка с кодом выхода по статусу.
     fn check(&self, r: Result<Response<Body>, ureq::Error>) -> Result<Response<Body>, CliError> {
         let resp = r.map_err(|e| {
             CliError::new(
@@ -269,7 +344,7 @@ impl Client {
                 format!("сервер {} недоступен: {e}", self.base),
             )
         })?;
-        if resp.status().is_success() {
+        if resp.status().is_success() || resp.status().as_u16() == 304 {
             return Ok(resp);
         }
         Err(problem(resp))
@@ -361,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_name_rules() {
+    fn machine_name_prefers_env() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| {
                 pairs
@@ -371,15 +446,15 @@ mod tests {
             }
         };
         assert_eq!(
+            machine_from(env(&[("ZAM_MACHINE", "m"), ("COMPUTERNAME", "WIN")])).as_deref(),
+            Some("m")
+        );
+        assert_eq!(
             machine_from(env(&[("COMPUTERNAME", "WIN"), ("HOSTNAME", "lin")])).as_deref(),
             Some("WIN")
         );
-        assert_eq!(
-            machine_from(env(&[("COMPUTERNAME", " "), ("HOSTNAME", "lin")])).as_deref(),
-            Some("lin")
-        );
-        assert_eq!(machine_from(env(&[])), None);
-        assert_eq!(machine_from(env(&[("HOSTNAME", "a\tb")])), None);
+        // без переменных — имя из ОС (Linux) или ничего (Windows без COMPUTERNAME)
+        assert_eq!(machine_from(env(&[])), os_hostname());
     }
 
     #[test]

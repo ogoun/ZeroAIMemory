@@ -74,6 +74,10 @@ enum Cmd {
         /// Путь к zam (по умолчанию target/release/zam[.exe])
         #[arg(long)]
         cli_bin: Option<PathBuf>,
+        /// zam другой платформы для раздачи сервером (GET /downloads/zam/{os}-{arch}):
+        /// кладётся в downloads/<платформа>/ комплекта сервера
+        #[arg(long)]
+        cli_other: Option<PathBuf>,
         /// Также zam-models-<ver>-<id>.zip — по архиву на модель с bundle = true из
         /// target/models (сначала: cargo xtask fetch-models)
         #[arg(long)]
@@ -261,6 +265,45 @@ fn fetch_models(ids: Vec<String>, test: bool, accept_nc: bool) -> Result<()> {
             zam_fetch::MODEL_SPEC_FILE
         );
     }
+    if test {
+        fetch_test_tokenizer(&manifest, &models)?;
+    }
+    Ok(())
+}
+
+/// Модель, токенизатор которой нужен тестам бюджета блока инструкции (§14.2: ≤ 500 токенов по
+/// счётчику модели; `zam-server/tests/agent_setup.rs`).
+const TEST_TOKENIZER_MODEL: &str = "bge-m3-int8";
+/// Каталог одиночных токенизаторов в `target/models`: `tokenizers/<id>/tokenizer.json` — без
+/// весов и `model.toml`, поэтому модель не считается установленной.
+const TEST_TOKENIZERS_DIR: &str = "tokenizers";
+
+/// `--test`: ещё `tokenizer.json` модели [`TEST_TOKENIZER_MODEL`] (≈ 17 МБ) из манифеста — с
+/// проверкой размера и SHA-256, повторно не качается.
+fn fetch_test_tokenizer(manifest: &ModelsManifest, models: &Path) -> Result<()> {
+    let m = manifest.get(TEST_TOKENIZER_MODEL)?;
+    let f = m
+        .files
+        .iter()
+        .find(|f| f.path == "tokenizer.json")
+        .with_context(|| format!("{TEST_TOKENIZER_MODEL}: нет tokenizer.json в манифесте"))?;
+    let dest = models
+        .join(TEST_TOKENIZERS_DIR)
+        .join(&m.id)
+        .join("tokenizer.json");
+    let cached = zam_fetch::fetch_file(&f.url, &f.sha256, Some(f.size), &dest)
+        .with_context(|| format!("токенизатор {}", m.id))?;
+    println!(
+        "токенизатор {} ({:.1} МБ): {} — {}",
+        m.id,
+        f.size as f64 / 1e6,
+        dest.display(),
+        if cached {
+            "на месте"
+        } else {
+            "загружен"
+        }
+    );
     Ok(())
 }
 
@@ -271,6 +314,7 @@ struct PackageArgs {
     version: String,
     server_bin: Option<PathBuf>,
     cli_bin: Option<PathBuf>,
+    cli_other: Option<PathBuf>,
     with_models: bool,
     cuda: bool,
     no_kit: bool,
@@ -302,6 +346,13 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
         let cli_bin = a
             .cli_bin
             .unwrap_or_else(|| release.join(package::exe(&platform, "zam")));
+        if a.cli_other.is_none() {
+            eprintln!(
+                "предупреждение: без --cli-other сервер не раздаст zam для {} (GET /downloads/zam/{} — 404)",
+                package::other_platform(&platform),
+                package::other_platform(&platform)
+            );
+        }
         let licenses = target.join("licenses");
         package::generate_licenses(&root, &licenses)?;
         let crt = if platform.starts_with("windows") {
@@ -317,6 +368,7 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
             flavor: a.flavor,
             server_bin: &server_bin,
             cli_bin: &cli_bin,
+            other_cli_bin: a.cli_other.as_deref(),
             deps_dir: &deps,
             deploy_dir: &deploy,
             generated_licenses_dir: &licenses,
@@ -353,7 +405,25 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let r = run(Cli::parse().cmd);
+    // В GitHub Actions — ещё и аннотация: журналы шагов без прав администратора не читаются
+    if let Err(e) = &r
+        && std::env::var_os("GITHUB_ACTIONS").is_some()
+    {
+        println!("::error title=xtask::{}", gha_escape(&format!("{e:#}")));
+    }
+    r
+}
+
+/// Экранирование сообщения команды `::error::` GitHub Actions (`%`, переводы строк).
+fn gha_escape(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::FetchDeps {
             platform,
             print_hashes,
@@ -370,6 +440,7 @@ fn main() -> Result<()> {
             version,
             server_bin,
             cli_bin,
+            cli_other,
             with_models,
             cuda,
             no_kit,
@@ -379,6 +450,7 @@ fn main() -> Result<()> {
             version,
             server_bin,
             cli_bin,
+            cli_other,
             with_models,
             cuda,
             no_kit,
@@ -405,6 +477,11 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gha_escape_encodes_newlines_and_percent() {
+        assert_eq!(gha_escape("50% a\r\nb"), "50%25 a%0D%0Ab");
+    }
 
     #[test]
     fn flavor_fetches_only_its_runtime() {

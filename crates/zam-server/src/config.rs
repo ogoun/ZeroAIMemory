@@ -10,8 +10,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml::{Table, Value};
 
 /// Переменные `ZAM_*`, которые не являются слоем конфигурации:
-/// секреты и адрес клиента, а также сборочные (build.rs, xtask), попадающие в окружение CI.
-const RESERVED_ENV: [&str; 9] = [
+/// секреты и адрес клиента, переменные клиента `zam` (сессия, признак агента, имя машины —
+/// `zam_core::CLIENT_ENV_VARS`: без этого `ZAM_MACHINE` в окружении пользователя ломала бы
+/// ручной запуск сервера), а также сборочные (build.rs, xtask), попадающие в окружение CI.
+const RESERVED_ENV: [&str; 12] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
@@ -21,6 +23,9 @@ const RESERVED_ENV: [&str; 9] = [
     "ZAM_WEB_INDEX",
     "ZAM_VCRUNTIME_DLL",
     "ZAM_VC_CRT_DIR",
+    zam_core::CLIENT_ENV_VARS[0],
+    zam_core::CLIENT_ENV_VARS[1],
+    zam_core::CLIENT_ENV_VARS[2],
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +40,9 @@ pub struct ServerConfig {
     pub index: IndexSection,
     pub search: SearchSection,
     pub insights: InsightsSection,
+    pub read: ReadSection,
+    pub cache: CacheSection,
+    pub recall: RecallSection,
     pub limits: LimitsSection,
     pub vault: VaultSection,
 }
@@ -48,6 +56,9 @@ pub struct ServerSection {
     pub base_path: String,
     #[serde(serialize_with = "ser_nets", deserialize_with = "de_nets")]
     pub trusted_proxies: Vec<IpNet>,
+    /// Каталог клиентов `zam` для `GET /downloads/zam/{os}-{arch}` (§15.5): `zam[.exe]` и
+    /// `downloads/<платформа>/zam[.exe]`; по умолчанию — каталог исполняемого файла сервера.
+    pub downloads_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,6 +118,9 @@ pub struct QdrantSection {
     /// Предел ожидания сброса WAL при штатной остановке после записи, мс (0..=60000;
     /// 0 — не ждать).
     pub shutdown_flush_wait_ms: u64,
+    /// Точный поиск без HNSW и квантования (`SearchParams.exact`): только для прогонов гейта
+    /// качества `cargo xtask eval` (задача 15 M4, §18.2), в продакшне — `false` (HNSW).
+    pub exact_search: bool,
 }
 
 // Вручную: ключ внешнего Qdrant не должен попадать в отладочный вывод.
@@ -124,6 +138,7 @@ impl std::fmt::Debug for QdrantSection {
             .field("flush_interval_sec", &self.flush_interval_sec)
             .field("wal_capacity_mb", &self.wal_capacity_mb)
             .field("shutdown_flush_wait_ms", &self.shutdown_flush_wait_ms)
+            .field("exact_search", &self.exact_search)
             .finish()
     }
 }
@@ -176,6 +191,7 @@ impl QdrantSection {
                 m.wal_capacity_mb = self.wal_capacity_mb;
                 m.shutdown_flush_wait =
                     std::time::Duration::from_millis(self.shutdown_flush_wait_ms);
+                m.exact_search = self.exact_search;
                 Ok(Some(SupervisorConfig::Managed(m)))
             }
             QdrantMode::External => {
@@ -193,10 +209,12 @@ impl QdrantSection {
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return Err(invalid("qdrant.url", "ожидается http:// или https://"));
                 }
-                Ok(Some(SupervisorConfig::external(
-                    url,
-                    self.api_key.clone().filter(|k| !k.is_empty()),
-                )))
+                let mut cfg =
+                    SupervisorConfig::external(url, self.api_key.clone().filter(|k| !k.is_empty()));
+                if let SupervisorConfig::External(x) = &mut cfg {
+                    x.exact_search = self.exact_search;
+                }
+                Ok(Some(cfg))
             }
             QdrantMode::Edge => Ok(None),
         }
@@ -347,8 +365,9 @@ pub struct IndexSection {
     pub chunk_overlap_sentences: usize,
     /// Вес силы границы λ при выборе разреза листа (задача 17 M3): 0 — жадная упаковка M2
     /// (с исправлениями висячего заголовка и вводной фразы), больше 0 — динамическое
-    /// программирование по силе границ. По умолчанию 0,5 — по сетке `eval/grid-chunking.toml`
-    /// (задача 17 M3: λ от 0,5 до 2 дают одинаковые разрезы, выбрано наименьшее).
+    /// программирование по силе границ. По умолчанию 0 — решение владельца 2026-10-26 (M4,
+    /// §8.2): собственный эффект λ = 0,5 поверх структурных исправлений M3 от нуля не отличим
+    /// (Δ nDCG@10 +0,003 [−0,003…+0,010]); в M3 умолчание было 0,5.
     pub chunk_boundary_lambda: f64,
     /// Лексическая связность прозы (основы слов) в силе границы при λ > 0.
     pub chunk_cohesion: bool,
@@ -577,6 +596,112 @@ impl InsightsSection {
     }
 }
 
+/// Секция `[read]` (§9.3 шаг 2): чтение пачкой `POST /read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadSection {
+    /// Не больше элементов в одном запросе (1..=100, по умолчанию 20); больше — 422.
+    pub max_items: usize,
+    /// Бюджет токенов на весь ответ по умолчанию (1..=200000, по умолчанию 1500).
+    pub budget_tokens: usize,
+}
+
+impl ReadSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("read.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=100).contains(&self.max_items) {
+            return Err(bad("max_items", "от 1 до 100"));
+        }
+        if !(1..=200_000).contains(&self.budget_tokens) {
+            return Err(bad("budget_tokens", "от 1 до 200000"));
+        }
+        Ok(())
+    }
+}
+
+/// Секция `[cache]` (§9.4): кэш выжимок агентов.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheSection {
+    /// Предел выжимки в токенах (1..=10000, по умолчанию 600); больше — 413.
+    pub summary_tokens: usize,
+    /// Порог косинуса семантического попадания (0..=1, по умолчанию 0,92).
+    pub semantic_threshold: f32,
+    /// Порог косинуса нового релевантного источника (0..=1, по умолчанию 0,80).
+    pub new_sources_threshold: f32,
+    /// Срок жизни выжимки без обращений, дней (1..=3650, по умолчанию 30).
+    pub ttl_days: u32,
+    /// Предел выжимок на базу, LRU по последнему обращению (1..=1000000, по умолчанию 2000).
+    pub max_entries: usize,
+    /// Поиск выдаёт выжимки других сессий той же области (по умолчанию да).
+    pub cross_session: bool,
+}
+
+impl CacheSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("cache.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=10_000).contains(&self.summary_tokens) {
+            return Err(bad("summary_tokens", "от 1 до 10000"));
+        }
+        for (k, v) in [
+            ("semantic_threshold", self.semantic_threshold),
+            ("new_sources_threshold", self.new_sources_threshold),
+        ] {
+            if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                return Err(bad(k, "должно быть в 0..=1"));
+            }
+        }
+        if !(1..=3650).contains(&self.ttl_days) {
+            return Err(bad("ttl_days", "от 1 до 3650"));
+        }
+        if !(1..=1_000_000).contains(&self.max_entries) {
+            return Err(bad("max_entries", "от 1 до 1000000"));
+        }
+        Ok(())
+    }
+}
+
+/// Секция `[recall]` (§10.3): проактивное вспоминание `POST /recall`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallSection {
+    /// Бюджет дайджеста старта сессии и подсказок по умолчанию, токенов (1..=20000, 1500).
+    pub digest_tokens: usize,
+    /// Наименьший балл поиска подсказки к запросу пользователя (0..=1, 0,6).
+    pub prompt_min_score: f64,
+    /// Бюджет сервера на сбор подсказок, мс (1..=60000, 200): по превышении отдаётся собранное
+    /// и `warnings: ["recall timeout"]`.
+    pub timeout_ms: u64,
+}
+
+impl RecallSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("recall.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=20_000).contains(&self.digest_tokens) {
+            return Err(bad("digest_tokens", "от 1 до 20000"));
+        }
+        if !(self.prompt_min_score.is_finite() && (0.0..=1.0).contains(&self.prompt_min_score)) {
+            return Err(bad("prompt_min_score", "должно быть в 0..=1"));
+        }
+        if !(1..=60_000).contains(&self.timeout_ms) {
+            return Err(bad("timeout_ms", "от 1 до 60000"));
+        }
+        Ok(())
+    }
+}
+
 /// Секция `[vault]` (§7.6): файл мастер-ключа. Сам ключ — только в файле или в
 /// `ZAM_MASTER_KEY` (переменная важнее файла), в конфигурацию он не попадает.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -602,6 +727,7 @@ impl Default for ServerConfig {
                 public_url: None,
                 base_path: String::new(),
                 trusted_proxies: Vec::new(),
+                downloads_dir: None,
             },
             admin: AdminSection {
                 login: "admin".into(),
@@ -626,6 +752,7 @@ impl Default for ServerConfig {
                 wal_capacity_mb: zam_index::supervisor::DEFAULT_WAL_CAPACITY_MB,
                 shutdown_flush_wait_ms: zam_index::supervisor::DEFAULT_SHUTDOWN_FLUSH_WAIT
                     .as_millis() as u64,
+                exact_search: false,
             },
             ml: MlSection {
                 device: MlDevice::Auto,
@@ -650,7 +777,7 @@ impl Default for ServerConfig {
                 chunk_hard_max: 800,
                 chunk_merge_below: 100,
                 chunk_overlap_sentences: 1,
-                chunk_boundary_lambda: 0.5,
+                chunk_boundary_lambda: 0.0,
                 chunk_cohesion: false,
                 chunk_prefix_l0: false,
                 chunk_heading_path_h4: true,
@@ -675,6 +802,23 @@ impl Default for ServerConfig {
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
+            },
+            read: ReadSection {
+                max_items: 20,
+                budget_tokens: 1500,
+            },
+            cache: CacheSection {
+                summary_tokens: 600,
+                semantic_threshold: 0.92,
+                new_sources_threshold: 0.80,
+                ttl_days: 30,
+                max_entries: 2000,
+                cross_session: true,
+            },
+            recall: RecallSection {
+                digest_tokens: 1500,
+                prompt_min_score: 0.6,
+                timeout_ms: 200,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -849,6 +993,9 @@ pub fn load(
     cfg.index.validate()?;
     cfg.search.validate()?;
     cfg.insights.validate()?;
+    cfg.read.validate()?;
+    cfg.cache.validate()?;
+    cfg.recall.validate()?;
     Ok(cfg)
 }
 
@@ -935,6 +1082,20 @@ pub fn hash_password(password: &str) -> Result<String, ConfigError> {
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| ConfigError::Hash(e.to_string()))
+}
+
+/// Хэш построен тем же алгоритмом и с теми же параметрами, что [`hash_password`]: только тогда
+/// фиктивный хэш неизвестного логина выравнивает время входа с администратором (§11.4).
+pub fn has_default_params(hash: &str) -> bool {
+    let Ok(h) = argon2::PasswordHash::new(hash) else {
+        return false;
+    };
+    let Ok(p) = argon2::Params::try_from(&h) else {
+        return false;
+    };
+    let d = argon2::Params::default();
+    h.algorithm == argon2::Algorithm::Argon2id.ident()
+        && (p.m_cost(), p.t_cost(), p.p_cost()) == (d.m_cost(), d.t_cost(), d.p_cost())
 }
 
 #[cfg(test)]
@@ -1080,6 +1241,9 @@ note_max_bytes = 1000
             env("ZAM_URL", "x"),
             env("ZAM_TOKEN", "x"),
             env("ZAM_MASTER_KEY", "x"),
+            env("ZAM_SESSION", "s"),
+            env("ZAM_AGENT", "1"),
+            env("ZAM_MACHINE", "box"),
         ];
         assert!(load(None, &env, &Default::default()).is_ok());
     }
@@ -1170,6 +1334,55 @@ note_max_bytes = 1000
         let c = load(None, &env, &Default::default()).unwrap();
         assert_eq!(c.log.format, LogFormat::Text);
         assert_eq!(c.qdrant.mode, QdrantMode::External);
+    }
+
+    /// Умолчания M4 (решения владельца 2026-10-26, §4.3, §8.2): λ = 0 — жадная упаковка M2
+    /// со структурными исправлениями M3; Qdrant сбрасывает сегменты раз в 3 с и ждёт
+    /// подтверждения WAL при остановке до 14 с — и в супервизоре, и в конфигурации сервера.
+    #[test]
+    fn default_lambda_zero_and_qdrant_defaults() {
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.index.chunk_boundary_lambda, 0.0);
+        assert_eq!(d.index.chunk_params().boundary_lambda, 0.0);
+        assert_eq!(d.qdrant.flush_interval_sec, 3);
+        assert_eq!(d.qdrant.shutdown_flush_wait_ms, 14_000);
+        assert_eq!(zam_index::supervisor::DEFAULT_FLUSH_INTERVAL_SEC, 3);
+        assert_eq!(
+            zam_index::supervisor::DEFAULT_SHUTDOWN_FLUSH_WAIT,
+            std::time::Duration::from_secs(14)
+        );
+    }
+
+    /// `qdrant.exact_search` (задача 15 M4): по умолчанию выключен (HNSW), `ZAM_*` его
+    /// включает (прогоны гейта eval), значение доходит до супервизора.
+    #[test]
+    fn qdrant_exact_search_off_by_default_and_layers() {
+        use zam_index::supervisor::SupervisorConfig;
+        let exe = std::path::Path::new("inst");
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert!(!d.qdrant.exact_search);
+        let Some(SupervisorConfig::Managed(m)) = d.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался managed");
+        };
+        assert!(!m.exact_search);
+        let on = vec![env("ZAM_QDRANT__EXACT_SEARCH", "true")];
+        let c = load(None, &on, &Default::default()).unwrap();
+        assert!(c.qdrant.exact_search);
+        let Some(SupervisorConfig::Managed(m)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался managed");
+        };
+        assert!(m.exact_search);
+        // external: параметр запроса — передаётся и внешнему Qdrant
+        let ext = vec![
+            env("ZAM_QDRANT__EXACT_SEARCH", "true"),
+            env("ZAM_QDRANT__MODE", "external"),
+            env("ZAM_QDRANT__URL", "http://127.0.0.1:6334"),
+        ];
+        let c = load(None, &ext, &Default::default()).unwrap();
+        let Some(SupervisorConfig::External(x)) = c.qdrant.supervisor_config(exe).unwrap() else {
+            panic!("ожидался external");
+        };
+        assert!(x.exact_search);
     }
 
     /// `[qdrant]` WAL и сброс (задача 19 M3): слои, перенос в супервизор, пределы.
@@ -1328,15 +1541,8 @@ yield_ms = 1
         let e = vec![env("ZAM_ML__DEVICE", "directml")];
         assert!(load(None, &e, &Default::default()).is_err());
         // пороги чанкинга: умолчания сервера и чанкера совпадают (одно значение, подобранное
-        // на eval, §18.2), кроме λ: у чанкера 0 — жадная упаковка M2 (golden-фикстуры), у
-        // сервера — по сетке задачи 17 M3; переопределение и проверка согласованности
-        assert_eq!(
-            d.index.chunk_params(),
-            zam_markdown::ChunkParams {
-                boundary_lambda: 0.5,
-                ..zam_markdown::ChunkParams::default()
-            }
-        );
+        // на eval, §18.2), в том числе λ = 0 (M4); переопределение и проверка согласованности
+        assert_eq!(d.index.chunk_params(), zam_markdown::ChunkParams::default());
         let e = vec![
             env("ZAM_INDEX__CHUNK_TARGET_MAX", "700"),
             env("ZAM_INDEX__CHUNK_OVERLAP_SENTENCES", "2"),
@@ -1390,21 +1596,21 @@ yield_ms = 1
             (192, 192, 192, 100)
         );
         assert_eq!(d.index.chunk_params_for(Some(10)).0.hard_max, 1);
-        // сила границ (задача 17 M3): умолчание λ = 0,5, флаги — в пороги чанкера; L0 в префиксе
-        // уменьшает предел листа на свой бюджет
+        // сила границ (задача 17 M3): флаги — в пороги чанкера; L0 в префиксе уменьшает предел
+        // листа на свой бюджет
         let p = d.index.chunk_params();
-        assert_eq!(
-            (p.boundary_lambda, p.cohesion, p.heading_path_h4),
-            (0.5, false, true)
-        );
+        assert_eq!((p.cohesion, p.heading_path_h4), (false, true));
         assert!(!d.index.chunk_prefix_l0);
         // связность без λ ничего не делает — признак для предупреждения при старте
         assert!(!d.index.cohesion_ignored());
         let mut i = d.index.clone();
         i.chunk_cohesion = true;
+        assert!(
+            i.cohesion_ignored(),
+            "при умолчании λ = 0 связность не действует"
+        );
+        i.chunk_boundary_lambda = 0.5;
         assert!(!i.cohesion_ignored());
-        i.chunk_boundary_lambda = 0.0;
-        assert!(i.cohesion_ignored());
         let c = load(
             None,
             &[
@@ -1522,6 +1728,22 @@ yield_ms = 1
     }
 
     #[test]
+    fn default_params_detected() {
+        assert!(has_default_params(
+            &hash_password("пароль-для-теста").unwrap()
+        ));
+        let strong = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(65536, 3, 1, None).unwrap(),
+        );
+        let salt = SaltString::generate(&mut OsRng);
+        let h = strong.hash_password(b"x", &salt).unwrap().to_string();
+        assert!(!has_default_params(&h));
+        assert!(!has_default_params("не хэш"));
+    }
+
+    #[test]
     fn admin_hash_from_config_wins() {
         let AdminSecret::Hash(h) = load(None, &[], &Default::default())
             .unwrap()
@@ -1570,6 +1792,28 @@ master_key = \"x\"
 ",
         );
         assert!(load(Some(&f), &[], &Default::default()).is_err());
+    }
+
+    #[test]
+    fn recall_section_bounds() {
+        for (k, v) in [
+            ("ZAM_RECALL__DIGEST_TOKENS", "0"),
+            ("ZAM_RECALL__PROMPT_MIN_SCORE", "1.5"),
+            ("ZAM_RECALL__TIMEOUT_MS", "0"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("recall."), "{k}: {e}");
+        }
+        let c = load(
+            None,
+            &[env("ZAM_RECALL__PROMPT_MIN_SCORE", "0.5")],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(c.recall.prompt_min_score, 0.5);
+        assert_eq!(c.recall.digest_tokens, 1500);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! Повторный запрос после `rejected`/`revoked` состояние не меняет **[решение исполнителя]**:
 //! снова открыть доступ может только владелец или администратор. Каждое изменение пишет
 //! аудит в той же транзакции: `solution.register`, `solution.access.request|approve|reject|
-//! revoke|mode`, `solution.guid_conflict`.
+//! revoke|mode`, `solution.guid_conflict`, `solution.rename` ([`SystemStore::rename_solution`]).
 
 use jiff::Timestamp;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
@@ -278,6 +278,38 @@ impl SystemStore {
         let (guid, name) = (guid.clone(), name.to_string());
         self.db
             .write(move |tx| register_in(tx, &guid, owner, space_id, &name))
+            .await
+    }
+
+    /// Переименовывает решение в реестре (`solutions.name`) и пишет аудит `solution.rename`
+    /// `{from, to}` в той же транзакции; `actor` — `admin` или id токена. Возвращает запись
+    /// после переименования. Нет решения — `NotFound`. Имя в базе владельца
+    /// (`user_db::rename_solution_space`) меняет вызывающий.
+    pub async fn rename_solution(
+        &self,
+        guid: &SolutionGuid,
+        name: &str,
+        actor: &str,
+    ) -> Result<SolutionInfo, StoreError> {
+        let (guid, name, actor) = (guid.clone(), name.to_string(), actor.to_string());
+        self.db
+            .write(move |tx| {
+                let sol = solution_in(tx, &guid)?.ok_or(StoreError::NotFound)?;
+                tx.execute(
+                    "UPDATE solutions SET name = ?2 WHERE guid = ?1",
+                    params![guid, name],
+                )?;
+                audit_tx(
+                    tx,
+                    &actor,
+                    Some(sol.owner_id),
+                    "solution.rename",
+                    Some(guid.as_str()),
+                    None,
+                    &json!({ "from": sol.name, "to": name }),
+                )?;
+                Ok(SolutionInfo { name, ..sol })
+            })
             .await
     }
 

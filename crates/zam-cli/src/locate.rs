@@ -109,6 +109,21 @@ const END: &str = "<!-- zeroaimemory:end";
 
 /// Значения из одного файла: (url, token); значения внутри блока важнее внешних.
 fn parse_md(text: &str) -> (Option<String>, Option<String>) {
+    let (inside, outside) = parse_md_parts(text);
+    (inside.0.or(outside.0), inside.1.or(outside.1))
+}
+
+/// Токен внутри блока ZeroAIMemory (прежний блок v1 держал `ZeroAIMemoryToken=`): его
+/// переносит `zam init`, заменяя блок (fix round 1, I-6).
+pub fn block_token(text: &str) -> Option<String> {
+    parse_md_parts(text).0.1
+}
+
+type Pair = (Option<String>, Option<String>);
+
+/// (url, token) внутри блока и вне его. BOM в начале файла пропускается (fix round 1, I-1).
+fn parse_md_parts(text: &str) -> (Pair, Pair) {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let (mut in_block, mut inside, mut outside) = (false, (None, None), (None, None));
     for line in text.lines() {
         let l = line.trim();
@@ -135,70 +150,13 @@ fn parse_md(text: &str) -> (Option<String>, Option<String>) {
             _ => {}
         }
     }
-    (inside.0.or(outside.0), inside.1.or(outside.1))
+    (inside, outside)
 }
 
 #[derive(serde::Deserialize, Default)]
 struct HomeConfig {
     url: Option<String>,
     token: Option<String>,
-    /// Человеческий токен (§7.5): только для команд с флагом `--human`.
-    human_token: Option<String>,
-}
-
-/// Адрес и человеческий токен для команд с флагом `--human` (например,
-/// `zam insight certify ID axiom --reason R --human`): **оба — только из
-/// `~/.zeroaimemory/config.toml`** (ключи `url` и `human_token`). Флаги, окружение и
-/// CLAUDE.md/AGENTS.md проекта не читаются: их видит и меняет агент, а запрос с этим токеном
-/// атрибутируется человеку — подменённый адрес отдал бы токен чужому серверу
-/// **[решение исполнителя]**. Нет файла или `human_token` — `Ok(None)`; токен есть, а `url` нет
-/// или он не http(s) — ошибка.
-pub fn human_target(home: &Path) -> Result<Option<(Found, Found)>, String> {
-    let path = home.join(".zeroaimemory").join("config.toml");
-    let cfg: HomeConfig = match read_limited(&path) {
-        Read::Skip => return Ok(None),
-        Read::Failed(e) => return Err(format!("не удалось прочитать {}: {e}", path.display())),
-        Read::Text(t) => toml::from_str(&t)
-            .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
-    };
-    let Some(token) = nonempty(cfg.human_token.as_deref()) else {
-        return Ok(None);
-    };
-    let url = nonempty(cfg.url.as_deref()).ok_or_else(|| {
-        format!(
-            "--human: в {} нужен url сервера рядом с human_token (адрес из флагов, окружения и \
-             CLAUDE.md/AGENTS.md для человеческого токена не используется)",
-            path.display()
-        )
-    })?;
-    check_url(&url)?;
-    let src = Source::Home(path);
-    Ok(Some((
-        Found {
-            value: norm_url(url),
-            source: src.clone(),
-        },
-        Found {
-            value: token,
-            source: src,
-        },
-    )))
-}
-
-/// Предупреждение для `--human`: адрес из флага, окружения или файлов проекта расходится с
-/// адресом `~/.zeroaimemory/config.toml` (используется последний). Совпадает или задан только
-/// в домашнем файле — `None`.
-pub fn human_url_warning(home_url: &str, other: Option<&Found>) -> Option<String> {
-    let o = other?;
-    if matches!(o.source, Source::Home(_)) || norm_url(o.value.clone()) == home_url {
-        return None;
-    }
-    Some(format!(
-        "предупреждение: --human игнорирует адрес {} ({}) и использует {home_url} из \
-         ~/.zeroaimemory/config.toml",
-        o.value,
-        o.source.describe()
-    ))
 }
 
 fn nonempty(v: Option<&str>) -> Option<String> {
@@ -278,7 +236,8 @@ pub fn resolve(
             Read::Failed(e) => {
                 return Err(format!("не удалось прочитать {}: {e}", path.display()));
             }
-            Read::Text(t) => toml::from_str(&t)
+            // BOM в начале файла (fix round 3)
+            Read::Text(t) => toml::from_str(t.strip_prefix('\u{feff}').unwrap_or(&t))
                 .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
         };
         if r.url.is_none()
@@ -302,6 +261,55 @@ pub fn resolve(
         u.value = norm_url(std::mem::take(&mut u.value));
     }
     Ok(r)
+}
+
+/// Что `zam init` делает с `~/.zeroaimemory/config.toml` (§14.1; fix round 1, I-6).
+#[derive(Debug, PartialEq, Eq)]
+pub enum HomePlan {
+    /// Там уже этот токен и адрес.
+    Unchanged,
+    /// Записать `text` в `path`; `replaced` — заменяется другой токен.
+    Write {
+        path: PathBuf,
+        text: String,
+        replaced: bool,
+    },
+    /// Там другой токен, а `--token` не задан: не трогать, предупредить.
+    Conflict(PathBuf),
+}
+
+/// План записи токена `token` и адреса `url` в `~/.zeroaimemory/config.toml`: остальные ключи
+/// сохраняются (комментарии — нет: файл пишет `zam`). Другой токен заменяется, только если
+/// `force` (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
+pub fn plan_home(home: &Path, url: &str, token: &str, force: bool) -> Result<HomePlan, String> {
+    let path = home.join(".zeroaimemory").join("config.toml");
+    let mut t: toml::Table = match read_limited(&path) {
+        Read::Skip => toml::Table::new(),
+        Read::Failed(e) => return Err(format!("не удалось прочитать {}: {e}", path.display())),
+        Read::Text(s) => toml::from_str(s.strip_prefix('\u{feff}').unwrap_or(&s))
+            .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
+    };
+    let url = url.trim().trim_end_matches('/');
+    let old_token = t.get("token").and_then(toml::Value::as_str);
+    let old_url = t
+        .get("url")
+        .and_then(toml::Value::as_str)
+        .map(|u| u.trim().trim_end_matches('/'));
+    if old_token == Some(token) && old_url == Some(url) {
+        return Ok(HomePlan::Unchanged);
+    }
+    let replaced = old_token.is_some_and(|o| o != token);
+    if replaced && !force {
+        return Ok(HomePlan::Conflict(path));
+    }
+    t.insert("url".into(), toml::Value::String(url.to_string()));
+    t.insert("token".into(), toml::Value::String(token.to_string()));
+    let text = toml::to_string(&t).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(HomePlan::Write {
+        path,
+        text,
+        replaced,
+    })
 }
 
 /// Ближайший вверх от `start` файл решения: в каждом каталоге сначала
@@ -348,70 +356,6 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
-    }
-
-    #[test]
-    fn human_target_only_from_home_config() {
-        let root = tmp("human");
-        let home = root.join("home");
-        assert_eq!(human_target(&home).unwrap(), None);
-        std::fs::create_dir_all(home.join(".zeroaimemory")).unwrap();
-        let cfg = home.join(".zeroaimemory/config.toml");
-        std::fs::write(&cfg, "url = \"http://h:1\"\ntoken = \"agent-token\"\n").unwrap();
-        assert_eq!(human_target(&home).unwrap(), None);
-        // токен без url — ошибка: адрес из других источников не берётся
-        std::fs::write(&cfg, "human_token = \"h\"\n").unwrap();
-        assert!(human_target(&home).unwrap_err().contains("url"));
-        std::fs::write(&cfg, "url = \"ftp://h\"\nhuman_token = \"h\"\n").unwrap();
-        assert!(human_target(&home).is_err());
-        std::fs::write(
-            &cfg,
-            "url = \"http://home:1/\"\ntoken = \"a\"\nhuman_token = \" human-token \"\n",
-        )
-        .unwrap();
-        let (u, t) = human_target(&home).unwrap().unwrap();
-        assert_eq!(
-            (u.value.as_str(), t.value.as_str()),
-            ("http://home:1", "human-token")
-        );
-        assert_eq!(t.source, Source::Home(cfg.clone()));
-        // обычный поиск токена его не берёт
-        let r = res(&Flags::default(), &[], &root, &home);
-        assert_eq!(r.token.unwrap().value, "a");
-        std::fs::write(&cfg, "human_token = [1]\n").unwrap();
-        assert!(human_target(&home).is_err());
-    }
-
-    #[test]
-    fn human_url_warning_on_mismatch() {
-        let f = |v: &str, source: Source| Found {
-            value: v.into(),
-            source,
-        };
-        assert_eq!(human_url_warning("http://h:1", None), None);
-        assert_eq!(
-            human_url_warning("http://h:1", Some(&f("http://h:1/", Source::Flag))),
-            None
-        );
-        assert_eq!(
-            human_url_warning(
-                "http://h:1",
-                Some(&f("http://x", Source::Home(PathBuf::from("c"))))
-            ),
-            None
-        );
-        let w = human_url_warning(
-            "http://h:1",
-            Some(&f(
-                "http://evil:9",
-                Source::File(PathBuf::from("CLAUDE.md")),
-            )),
-        )
-        .unwrap();
-        assert!(w.contains("http://evil:9") && w.contains("CLAUDE.md") && w.contains("http://h:1"));
-        assert!(
-            human_url_warning("http://h:1", Some(&f("http://e", Source::Env("ZAM_URL")))).is_some()
-        );
     }
 
     #[test]

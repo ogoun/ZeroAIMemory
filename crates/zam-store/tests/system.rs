@@ -19,10 +19,7 @@ fn raw(dd: &DataDir) -> rusqlite::Connection {
 async fn issue_and_verify_token() {
     let (dd, s) = store("issue").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (info, plain) = s
-        .issue_token(u.id, "laptop", Access::Rw, false)
-        .await
-        .unwrap();
+    let (info, plain) = s.issue_token(u.id, "laptop", Access::Rw).await.unwrap();
     let a = s
         .verify_token(&plain, Some("10.0.0.5"))
         .await
@@ -48,7 +45,7 @@ async fn issue_and_verify_token() {
 async fn last_used_throttled_to_once_per_minute() {
     let (dd, s) = store("throttle").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (_, plain) = s.issue_token(u.id, "t", Access::Ro, false).await.unwrap();
+    let (_, plain) = s.issue_token(u.id, "t", Access::Ro).await.unwrap();
     s.verify_token(&plain, Some("1.1.1.1"))
         .await
         .unwrap()
@@ -75,7 +72,7 @@ async fn last_used_throttled_to_once_per_minute() {
 async fn revoked_token_rejected_immediately() {
     let (_dd, s) = store("revoke").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (info, plain) = s.issue_token(u.id, "t", Access::Rw, false).await.unwrap();
+    let (info, plain) = s.issue_token(u.id, "t", Access::Rw).await.unwrap();
     assert!(s.verify_token(&plain, None).await.unwrap().is_some());
     s.revoke_token(info.id).await.unwrap();
     assert!(s.verify_token(&plain, None).await.unwrap().is_none());
@@ -86,7 +83,7 @@ async fn revoked_token_rejected_immediately() {
 async fn disabled_user_token_rejected() {
     let (_dd, s) = store("disabled").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (_, plain) = s.issue_token(u.id, "t", Access::Rw, false).await.unwrap();
+    let (_, plain) = s.issue_token(u.id, "t", Access::Rw).await.unwrap();
     s.set_user_disabled(u.id, true).await.unwrap();
     assert!(s.verify_token(&plain, None).await.unwrap().is_none());
     assert!(
@@ -111,10 +108,7 @@ async fn users_conflict_notfound_and_admin() {
     assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
     assert_eq!(s.list_users().await.unwrap().len(), 2);
     assert_eq!(s.admin_user().await.unwrap().unwrap().id, a.id);
-    let err = s
-        .issue_token(Id::new(), "t", Access::Rw, false)
-        .await
-        .unwrap_err();
+    let err = s.issue_token(Id::new(), "t", Access::Rw).await.unwrap_err();
     assert!(matches!(err, StoreError::NotFound), "{err:?}");
     assert!(s.get_user(Id::new()).await.unwrap().is_none());
 }
@@ -157,7 +151,7 @@ async fn expired_session_not_returned_and_removed() {
 async fn audit_has_no_secrets() {
     let (dd, s) = store("audit").await;
     let u = s.create_user("ivan", false).await.unwrap();
-    let (info, plain) = s.issue_token(u.id, "t", Access::Rw, false).await.unwrap();
+    let (info, plain) = s.issue_token(u.id, "t", Access::Rw).await.unwrap();
     s.audit(
         &info.id.to_string(),
         Some(u.id),
@@ -290,7 +284,7 @@ async fn rename_user_and_get_token() {
         s.rename_user(Id::new(), "zed").await,
         Err(StoreError::NotFound)
     ));
-    let (info, _) = s.issue_token(b.id, "t", Access::Ro, false).await.unwrap();
+    let (info, _) = s.issue_token(b.id, "t", Access::Ro).await.unwrap();
     let got = s.get_token(info.id).await.unwrap().unwrap();
     assert_eq!(
         (got.id, got.user_id, got.access),
@@ -298,4 +292,129 @@ async fn rename_user_and_get_token() {
     );
     assert_eq!(got.prefix, info.prefix);
     assert!(s.get_token(Id::new()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn user_password_and_sessions() {
+    let (_dd, s) = store("passwords").await;
+    let u = s.create_user("Ёжик", false).await.unwrap();
+    let other = s.create_user("ёжик-2", false).await.unwrap();
+    assert!(!u.has_password && !u.must_change_password);
+    assert!(s.login_candidates("ёжик").await.unwrap().is_empty());
+    let (admin_sid, _) = s.create_web_session(None).await.unwrap();
+    let (a, _) = s.create_user_session(None, u.id).await.unwrap();
+    let (b, _) = s.create_user_session(None, u.id).await.unwrap();
+    let (c, _) = s.create_user_session(None, other.id).await.unwrap();
+    assert_eq!(
+        s.get_web_session(&a).await.unwrap().unwrap().user_id,
+        Some(u.id)
+    );
+    assert_eq!(
+        s.get_web_session(&admin_sid)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id,
+        None
+    );
+    // задание пароля закрывает сессии пользователя, кроме сохранённой
+    s.set_password(u.id, Some("h1".into()), true, Some(&a))
+        .await
+        .unwrap();
+    assert!(s.get_web_session(&a).await.unwrap().is_some());
+    assert!(s.get_web_session(&b).await.unwrap().is_none());
+    assert!(s.get_web_session(&c).await.unwrap().is_some());
+    assert!(s.get_web_session(&admin_sid).await.unwrap().is_some());
+    let got = s.get_user(u.id).await.unwrap().unwrap();
+    assert!(got.has_password && got.must_change_password);
+    assert_eq!(s.password_hash(u.id).await.unwrap().as_deref(), Some("h1"));
+    // имя без учёта регистра (Unicode), хэш наружу — только здесь
+    let found = s.login_candidates("ЁЖИК").await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].0.id, found[0].1.as_str()), (u.id, "h1"));
+    // стирание: вход закрыт, сессии закрыты, признак смены снят
+    s.set_password(u.id, None, true, None).await.unwrap();
+    assert!(s.get_web_session(&a).await.unwrap().is_none());
+    let got = s.get_user(u.id).await.unwrap().unwrap();
+    assert!(!got.has_password && !got.must_change_password);
+    assert_eq!(s.password_hash(u.id).await.unwrap(), None);
+    let err = s
+        .set_password(Id::new(), None, false, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+}
+
+#[tokio::test]
+async fn disabling_user_closes_sessions() {
+    let (_dd, s) = store("disable-sessions").await;
+    let u = s.create_user("vera", false).await.unwrap();
+    let other = s.create_user("gleb", false).await.unwrap();
+    let (a, _) = s.create_user_session(None, u.id).await.unwrap();
+    let (b, _) = s.create_user_session(None, other.id).await.unwrap();
+    let (adm, _) = s.create_web_session(None).await.unwrap();
+    s.set_user_disabled(u.id, true).await.unwrap();
+    s.set_user_disabled(u.id, false).await.unwrap();
+    assert!(s.get_web_session(&a).await.unwrap().is_none());
+    assert!(s.get_web_session(&b).await.unwrap().is_some());
+    assert!(s.get_web_session(&adm).await.unwrap().is_some());
+    // включение сессии не закрывает
+    let (c, _) = s.create_user_session(None, u.id).await.unwrap();
+    s.set_user_disabled(u.id, false).await.unwrap();
+    assert!(s.get_web_session(&c).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn user_settings_roundtrip() {
+    use serde_json::json;
+    let (_dd, s) = store("user-settings").await;
+    let u = s.create_user("lida", false).await.unwrap();
+    let other = s.create_user("oleg", false).await.unwrap();
+    assert!(s.user_settings(u.id).await.unwrap().is_empty());
+    let changed = s
+        .set_user_settings(
+            u.id,
+            vec![
+                ("hooks.prompt".into(), json!(false)),
+                ("hooks.checkpoint".into(), json!(true)),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec![
+            ("hooks.prompt".to_string(), None),
+            ("hooks.checkpoint".to_string(), None)
+        ]
+    );
+    // то же значение не пишется и не возвращается; изменённое — с прежним значением
+    let changed = s
+        .set_user_settings(
+            u.id,
+            vec![
+                ("hooks.prompt".into(), json!(true)),
+                ("hooks.checkpoint".into(), json!(true)),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec![("hooks.prompt".to_string(), Some(json!(false)))]
+    );
+    assert_eq!(
+        s.user_settings(u.id).await.unwrap(),
+        vec![
+            ("hooks.checkpoint".to_string(), json!(true)),
+            ("hooks.prompt".to_string(), json!(true))
+        ]
+    );
+    // настройки одного пользователя не видны другому
+    assert!(s.user_settings(other.id).await.unwrap().is_empty());
+    let err = s
+        .set_user_settings(Id::new(), vec![("hooks.prompt".into(), json!(false))])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
 }

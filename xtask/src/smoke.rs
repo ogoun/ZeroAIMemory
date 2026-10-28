@@ -1,6 +1,7 @@
 //! Smoke-тест комплекта: распаковка, запуск сервера, проверка API, клиента и Qdrant,
 //! векторный поиск на тестовой модели (M2), устройство модели, завершение Qdrant вместе с
-//! сервером; память решения (M3): регистрация решения, insight в выдаче, Vault; для
+//! сервером; память решения (M3): регистрация решения, insight в выдаче, Vault; агенты (M4):
+//! MCP `tools/list`, `/recall` по ошибке, кэш триггеров и подсказка `zam hook pre-tool`; для
 //! Windows — статический CRT наших exe и app-local MSVC runtime библиотек.
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
@@ -24,6 +25,9 @@ use zam_fetch::{MODEL_LICENSE_FILE, MODEL_SPEC_FILE};
 use crate::manifest::{CudaManifest, Manifest, ModelsManifest, PLATFORMS};
 
 const TOKEN_PREFIX: &str = "ZeroAIMemoryToken=";
+/// stderr сервера — канал, не терминал: первый токен лежит в файле, строка — путь к нему
+/// (`zam_server::INITIAL_TOKEN_FILE_LINE`).
+const TOKEN_FILE_PREFIX: &str = "ZeroAIMemoryTokenFile=";
 const WAIT: Duration = Duration::from_secs(10);
 /// Unix: предел выхода сервера по SIGTERM — ожидание подтверждения WAL Qdrant
 /// (`qdrant.shutdown_flush_wait_ms`, до 10 с), SIGTERM Qdrant (до 10 с) и запас 10 с.
@@ -134,7 +138,7 @@ fn zam_vars_except<I: IntoIterator<Item = OsString>>(vars: I, keep: &[&str]) -> 
 
 /// Убирает из окружения дочернего процесса все `ZAM_*` текущего, кроме `keep`:
 /// сборочные переменные CI (`ZAM_GIT_SHA` и т. п.) и настройки разработчика не должны влиять на проверку.
-fn scrub_zam_env<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
+pub(crate) fn scrub_zam_env<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
     for k in zam_vars_except(std::env::vars_os().map(|(k, _)| k), keep) {
         cmd.env_remove(k);
     }
@@ -209,6 +213,11 @@ impl Server {
                 if let Some(t) = line.strip_prefix(TOKEN_PREFIX) {
                     let _ = tx.send(t.trim().to_string());
                     continue;
+                }
+                if let Some(path) = line.strip_prefix(TOKEN_FILE_PREFIX)
+                    && let Ok(t) = std::fs::read_to_string(path.trim())
+                {
+                    let _ = tx.send(t.trim().to_string());
                 }
                 let _ = writeln!(file, "{line}");
                 if interesting(&line)
@@ -519,6 +528,46 @@ fn status_from_claude_md(zam: &Path, dir: &Path, base: &str, token: &str) -> Res
     Ok(())
 }
 
+/// `GET /downloads/zam/<платформа>` без аутентификации отдаёт клиент своей ОС из каталога
+/// комплекта байт в байт; клиент другой ОС — если он в комплекте (`downloads/<платформа>/`),
+/// иначе 404.
+fn downloads_zam(root: &Path, base: &str, platform: &str) -> Result<()> {
+    let other = crate::package::other_platform(platform);
+    for (p, file) in [
+        (platform, root.join(crate::package::exe(platform, "zam"))),
+        (
+            other,
+            root.join("downloads")
+                .join(other)
+                .join(crate::package::exe(other, "zam")),
+        ),
+    ] {
+        let mut r = agent_with(Duration::from_secs(60))
+            .get(&format!("{base}/downloads/zam/{p}"))
+            .call()?;
+        let code = r.status().as_u16();
+        if !file.is_file() {
+            if code != 404 {
+                bail!("{p}: клиента нет в комплекте, а сервер ответил HTTP {code}");
+            }
+            println!("  {p}: клиента нет в комплекте — 404");
+            continue;
+        }
+        if code != 200 {
+            bail!("{p}: HTTP {code}");
+        }
+        let got = r
+            .body_mut()
+            .with_config()
+            .limit(256 * 1024 * 1024)
+            .read_to_vec()?;
+        if got != fs::read(&file)? {
+            bail!("{p}: отданный файл не совпадает с {}", file.display());
+        }
+    }
+    Ok(())
+}
+
 /// Текст заметки smoke-теста.
 const SMOKE_NOTE: &[u8] = b"# Hello\nsmoke note\n";
 
@@ -750,10 +799,10 @@ pub fn run(
         s.run("ожидание /api/v1/health", wait_health(&mut srv, &base))?;
     }
     let token = s.run(
-        "первый токен в stderr",
+        "первый токен (файл в каталоге данных)",
         srv.token_rx.recv_timeout(WAIT).map_err(|_| {
             anyhow!(
-                "строка {TOKEN_PREFIX}… не найдена; stderr:\n{}",
+                "строка {TOKEN_FILE_PREFIX}… (или {TOKEN_PREFIX}…) не найдена; stderr:\n{}",
                 srv.log_tail()
             )
         }),
@@ -773,6 +822,10 @@ pub fn run(
     s.run(
         "zam status из CLAUDE.md без флагов",
         status_from_claude_md(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "раздача zam: GET /downloads/zam/{os}-{arch}",
+        downloads_zam(&root, &base, platform),
     )?;
     s.run(
         "zam write → search → read заметки",
@@ -803,6 +856,18 @@ pub fn run(
     s.run(
         "M3: zam vault set → get возвращает то же значение",
         vault_roundtrip(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M4: MCP tools/list — 10 инструментов",
+        mcp_tools_list(&base, &token),
+    )?;
+    let hook_id = s.run(
+        "M4: insight с триггерами и /recall(post_tool) по error_regex",
+        recall_post_tool(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M4: zam hook session-start → кэш триггеров, zam hook pre-tool → подсказка",
+        hook_pre_tool(&zam, &dir, &base, &token, &hook_id),
     )?;
     s.run(
         "Qdrant запущен сервером (pid-файл, qdrant status --json)",
@@ -1001,6 +1066,42 @@ pub(crate) fn api_timeout(
     let v = serde_json::from_str(&text)
         .with_context(|| format!("{path}: HTTP {status}, ответ не JSON"))?;
     Ok((status, v))
+}
+
+/// Запрос к API с токеном и своими заголовками; возвращает статус и тело как текст (ответы
+/// `format: md`, подсчёт токенов ответа — eval M4).
+pub(crate) fn api_text(
+    base: &str,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<(u16, String)> {
+    let a = agent_with(timeout);
+    let url = format!("{base}{path}");
+    let auth = format!("Bearer {token}");
+    let mut r = match body {
+        Some(b) => {
+            let mut req = a
+                .post(&url)
+                .header("Authorization", &auth)
+                .content_type("application/json");
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.send(b.to_string())?
+        }
+        None => {
+            let mut req = a.get(&url).header("Authorization", &auth);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.call()?
+        }
+    };
+    let status = r.status().as_u16();
+    Ok((status, r.body_mut().read_to_string()?))
 }
 
 /// Пути и каналы выдачи (без текстов заметок).
@@ -1254,8 +1355,13 @@ fn insight_found(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> 
         );
     }
     if !channels(hit).contains(&"vector") {
+        // состояние очереди — отличить сбой задания записи (failed) от гонки выдачи
+        let index = api(base, token, "/api/v1/index/status", None)
+            .map(|(_, st)| st.to_string())
+            .unwrap_or_else(|e| format!("недоступен: {e}"));
         bail!(
-            "insight найден без векторного канала (запись не векторизована?): sources = {}",
+            "insight найден без векторного канала (запись не векторизована?): sources = {}; \
+             /index/status = {index}",
             hit["sources"]
         );
     }
@@ -1305,6 +1411,231 @@ fn vault_roundtrip(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()
             got.stdout.len(),
             SMOKE_SECRET.len()
         );
+    }
+    Ok(())
+}
+
+// ---- M4: агенты ----
+
+/// Инструменты MCP сервера (§13.1).
+const MCP_TOOLS: [&str; 10] = [
+    "memory_search",
+    "memory_read",
+    "memory_cache_put",
+    "memory_tree",
+    "memory_write",
+    "memory_log",
+    "memory_update_entry",
+    "memory_link",
+    "memory_recall",
+    "memory_vault",
+];
+
+/// Insight с триггерами smoke-теста M4: заголовок и текст (не похожи на insight M3 — без 409).
+const HOOK_TITLE: &str = "Deploy scripts under scripts/ must be saved with LF";
+const HOOK_BODY: &str = "A CRLF shebang breaks the deploy run on Linux runners.";
+/// Ошибка инструмента для `/recall(post_tool)`.
+const HOOK_ERROR: &str = "/bin/bash^M: bad interpreter: No such file or directory";
+
+/// Критерий M4: `POST /mcp` `tools/list` по токену — все 10 инструментов (§13.1).
+fn mcp_tools_list(base: &str, token: &str) -> Result<()> {
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    let mut r = agent()
+        .post(&format!("{base}/mcp"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .content_type("application/json")
+        .send(body.to_string())?;
+    let status = r.status().as_u16();
+    let text = r.body_mut().read_to_string()?;
+    if status != 200 {
+        bail!("POST /mcp tools/list: HTTP {status}: {text}");
+    }
+    let v: Value = serde_json::from_str(&text).context("ответ /mcp не JSON")?;
+    let names: Vec<&str> = v["result"]["tools"]
+        .as_array()
+        .with_context(|| format!("в ответе tools/list нет result.tools: {v}"))?
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    let missing: Vec<&str> = MCP_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| !names.contains(t))
+        .collect();
+    if !missing.is_empty() || names.len() != MCP_TOOLS.len() {
+        bail!("tools/list: {names:?}, нет {missing:?}");
+    }
+    Ok(())
+}
+
+/// Критерий M4: `zam log insight` с триггерами `file_glob` и `error_regex` → `POST /recall`
+/// `{event: post_tool}` с ошибкой «bad interpreter» выдаёт эту запись (`reason = error_regex`).
+/// Возвращает id записи.
+fn recall_post_tool(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<String> {
+    let home = dir.join("hooks-home");
+    fs::create_dir_all(&home)?;
+    let out = zam_ok(
+        zam,
+        &home,
+        base,
+        token,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            HOOK_TITLE,
+            "--trigger",
+            "file_glob:scripts/**/*.sh",
+            "--trigger",
+            "error_regex:bad interpreter",
+            "--solution",
+            SMOKE_SOLUTION,
+            "--force",
+        ],
+        Some(HOOK_BODY.as_bytes()),
+    )?;
+    let id = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if id.is_empty() {
+        bail!("zam log insight не напечатал id записи");
+    }
+    let body = serde_json::json!({
+        "event": "post_tool", "error": HOOK_ERROR, "tool": "Bash", "solution": SMOKE_SOLUTION,
+    });
+    let (status, v) = api(base, token, "/api/v1/recall", Some(&body))?;
+    if status != 200 {
+        bail!("POST /api/v1/recall: HTTP {status}: {v}");
+    }
+    let want = format!("i:{id}");
+    let hit = v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|i| i["id"] == want.as_str() && i["reason"] == "error_regex");
+    if !hit {
+        bail!(
+            "/recall(post_tool) не выдал {want} по error_regex: items = {}",
+            v["items"]
+        );
+    }
+    if !v["text"]
+        .as_str()
+        .is_some_and(|t| t.contains("эта ошибка уже разбиралась"))
+    {
+        bail!("/recall(post_tool): нет строки «эта ошибка уже разбиралась»");
+    }
+    Ok(id)
+}
+
+/// `zam hook <kind>` в каталоге проекта `project` со входом `input`: stdout (код выхода — 0).
+fn run_hook(
+    zam: &Path,
+    home: &Path,
+    project: &Path,
+    conn: (&str, &str),
+    kind: &str,
+    input: &Value,
+) -> Result<String> {
+    let (base, token) = conn;
+    let mut cmd = zam_cmd(zam, home, base, token);
+    // окружение агента (сам smoke может идти внутри Claude Code или Codex) — не в хук
+    for k in zam_core::AGENT_ENV_VARS {
+        cmd.env_remove(k);
+    }
+    cmd.args(["hook", kind]).current_dir(project);
+    let out = output_with_stdin(&mut cmd, Some(input.to_string().as_bytes()), CMD_TIMEOUT)?;
+    if out.status.code() != Some(0) {
+        bail!(
+            "zam hook {kind}: код {:?} (хук обязан выходить с 0)",
+            out.status.code()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Критерий M4: проект с `.zeroaimemory/solution.toml` → `zam hook session-start` пишет кэш
+/// триггеров с записью `id` (до 5 попыток: хук укладывается в бюджет 300 мс или молчит) →
+/// `zam hook pre-tool` на Write `scripts/deploy.sh` выдаёт подсказку `i:<id>` в
+/// `hookSpecificOutput.additionalContext`.
+fn hook_pre_tool(zam: &Path, dir: &Path, base: &str, token: &str, id: &str) -> Result<()> {
+    let home = dir.join("hooks-home");
+    let project = dir.join("hooks-project");
+    fs::create_dir_all(project.join(".zeroaimemory"))?;
+    fs::create_dir_all(&home)?;
+    fs::write(
+        project.join(".zeroaimemory").join("solution.toml"),
+        format!("agent_solution_id = \"{SMOKE_SOLUTION}\"\nname = \"smoke\"\n"),
+    )?;
+    let ev = |event: &str, extra: Value| {
+        let mut v = serde_json::json!({
+            "session_id": "smoke-hooks", "cwd": project, "hook_event_name": event,
+        });
+        for (k, x) in extra.as_object().into_iter().flatten() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    let zeroai = project.join(".zeroaimemory");
+    let cache = zeroai.join("cache").join("triggers.json");
+    let cached = || -> bool {
+        fs::read_to_string(&cache)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|v| {
+                v["triggers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|t| t["entry_id"] == id)
+            })
+    };
+    for _ in 0..5 {
+        run_hook(
+            zam,
+            &home,
+            &project,
+            (base, token),
+            "session-start",
+            &ev("SessionStart", serde_json::json!({"source": "startup"})),
+        )?;
+        if cached() {
+            break;
+        }
+    }
+    if !cached() {
+        let log = fs::read_to_string(zeroai.join("logs").join("hooks.log")).unwrap_or_default();
+        bail!("zam hook session-start не записал триггер i:{id} в кэш; hooks.log:\n{log}");
+    }
+    let file = project.join("scripts").join("deploy.sh");
+    let out = run_hook(
+        zam,
+        &home,
+        &project,
+        (base, token),
+        "pre-tool",
+        &ev(
+            "PreToolUse",
+            serde_json::json!({"tool_name": "Write",
+                               "tool_input": {"file_path": file, "content": "#!/bin/sh\n"}}),
+        ),
+    )?;
+    let v: Value = serde_json::from_str(out.trim())
+        .with_context(|| format!("вывод zam hook pre-tool не JSON: {out:?}"))?;
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    if v["hookSpecificOutput"]["hookEventName"] != "PreToolUse"
+        || !ctx.contains(&format!("i:{id}"))
+        || !ctx.starts_with("ZeroAIMemory: для scripts/**/*.sh:")
+    {
+        bail!("zam hook pre-tool: нет подсказки i:{id}: {v}");
     }
     Ok(())
 }

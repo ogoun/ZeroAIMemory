@@ -20,8 +20,12 @@
 //! 403 `/problems/solution-access`. Запись — токен `rw` и режим участника `rw`
 //! ([`super::scope::effective_write`]).
 //!
-//! **Блокировка.** Vault без действующего мастер-ключа отвечает 503
-//! `/problems/vault-locked` на все эндпоинты.
+//! **Блокировка** (решение владельца 2026-10-26; в M3 — 503 на всех эндпоинтах). Без
+//! действующего мастер-ключа метаданные отвечают 200 с полем верхнего уровня `locked`
+//! (`true` и `reason` при блокировке, иначе `false`): список, `GET /vault/{id}` без `reveal`,
+//! `GET /vault/{id}/revisions` без `reveal`; в них только открытые поля и даты, без значений
+//! и шифротекста. Значения (`reveal=1`), создание, правка и удаление — 503
+//! `/problems/vault-locked`.
 //!
 //! Значения не попадают в логи, аудит, FTS и Qdrant: тело запроса не логируется, ошибки
 //! разбора тела — без цитаты значения, у Vault нет чанков и заданий индексации.
@@ -48,6 +52,7 @@ use crate::app::AppState;
 use crate::attrib::{MACHINE_HEADER, SESSION_HEADER, attribution, header_value};
 use crate::auth::{Client, Principal, target_user};
 use crate::error::ApiError;
+use crate::vault::VaultState;
 
 /// Допустимые `data.type`.
 pub const VAULT_TYPES: [&str; 7] = [
@@ -173,11 +178,24 @@ async fn scope_role(
     match scope {
         VaultScope::Knowledge => Ok(match p {
             Principal::Admin { .. } => Role::Admin,
-            Principal::Token(_) => Role::Personal,
+            Principal::Token(_) | Principal::User { .. } => Role::Personal,
         }),
         VaultScope::Solution(g) => {
             let info = st.system.get_solution(g).await?.ok_or(ApiError::NotFound)?;
             solution_role(st, p, user, &info).await
+        }
+    }
+}
+
+/// Поля блокировки в ответе метаданных: `locked` и при блокировке `reason`.
+fn put_lock(st: &AppState, o: &mut Map<String, Value>) {
+    match st.vault.state() {
+        VaultState::Ready => {
+            o.insert("locked".into(), json!(false));
+        }
+        VaultState::Locked { reason } => {
+            o.insert("locked".into(), json!(true));
+            o.insert("reason".into(), json!(reason));
         }
     }
 }
@@ -195,7 +213,10 @@ async fn area(
     scope: &VaultScope,
     write: bool,
 ) -> Result<Area, ApiError> {
-    st.vault.ready()?;
+    // метаданные отвечают и при блокировке, запись требует мастер-ключ
+    if write {
+        st.vault.ready()?;
+    }
     let user = target_user(st, p, headers).await?;
     let role = scope_role(st, p, &user, scope).await?;
     if write {
@@ -205,15 +226,19 @@ async fn area(
     Ok(Area { user, db })
 }
 
-/// Живая запись пользователя запроса по id с проверкой доступа к её области.
+/// Живая запись пользователя запроса по id с проверкой доступа к её области. `keys` —
+/// операция требует мастер-ключ (запись, значение): заблокированный Vault → 503.
 async fn item(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
     raw_id: &str,
     write: bool,
+    keys: bool,
 ) -> Result<(Area, VaultMeta, Vec<u8>), ApiError> {
-    st.vault.ready()?;
+    if keys || write {
+        st.vault.ready()?;
+    }
     let id = parse_id(raw_id)?;
     let user = target_user(st, p, headers).await?;
     let db = st.users.get(user.id).await?;
@@ -233,12 +258,15 @@ async fn history_item(
     p: &Principal,
     headers: &HeaderMap,
     raw_id: &str,
+    keys: bool,
 ) -> Result<(Area, VaultMeta), ApiError> {
     if !matches!(p, Principal::Admin { .. }) {
-        let (a, m, _) = item(st, p, headers, raw_id, false).await?;
+        let (a, m, _) = item(st, p, headers, raw_id, false, keys).await?;
         return Ok((a, m));
     }
-    st.vault.ready()?;
+    if keys {
+        st.vault.ready()?;
+    }
     let id = parse_id(raw_id)?;
     let user = target_user(st, p, headers).await?;
     let db = st.users.get(user.id).await?;
@@ -334,9 +362,11 @@ pub async fn list(
     let scope = parse_scope(&space)?;
     let a = area(&st, &p, &headers, &scope, false).await?;
     let items = vault_list(&a.db, &scope, q.q.as_deref()).await?;
-    Ok(Json(
-        json!({ "items": items.iter().map(meta_json).collect::<Vec<_>>() }),
-    ))
+    let mut v = json!({ "items": items.iter().map(meta_json).collect::<Vec<_>>() });
+    if let Value::Object(o) = &mut v {
+        put_lock(&st, o);
+    }
+    Ok(Json(v))
 }
 
 #[derive(Deserialize)]
@@ -387,9 +417,12 @@ pub async fn get(
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
     let reveal = flag(q.reveal.as_deref())?;
-    let (a, m, blob) = item(&st, &p, &headers, &id, false).await?;
+    let (a, m, blob) = item(&st, &p, &headers, &id, false, reveal).await?;
     let mut v = meta_json(&m);
     if !reveal {
+        if let Value::Object(o) = &mut v {
+            put_lock(&st, o);
+        }
         return Ok(Json(v).into_response());
     }
     let plain = st.vault.decrypt(a.user.id, m.id, m.rev, &blob).await?;
@@ -430,7 +463,7 @@ pub async fn patch(
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let (a, m, blob) = item(&st, &p, &headers, &id, true).await?;
+    let (a, m, blob) = item(&st, &p, &headers, &id, true, true).await?;
     let req: Patch = vault_body(body)?;
     let expected = if headers.contains_key(header::IF_MATCH) {
         if_match(&headers)?
@@ -472,7 +505,7 @@ pub async fn remove(
     client: Client,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let (a, m, _) = item(&st, &p, &headers, &id, true).await?;
+    let (a, m, _) = item(&st, &p, &headers, &id, true, true).await?;
     let attrib = attribution(&p, &headers, None)?;
     vault_delete(&a.db, m.id, &attrib).await?;
     audit(
@@ -507,10 +540,14 @@ pub async fn revisions(
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
     let reveal = flag(q.reveal.as_deref())?;
-    let (a, m) = history_item(&st, &p, &headers, &id).await?;
+    let (a, m) = history_item(&st, &p, &headers, &id, reveal).await?;
     let items = vault_revisions(&a.db, m.id).await?;
     if !reveal {
-        return Ok(Json(json!({ "items": items })).into_response());
+        let mut v = json!({ "items": items });
+        if let Value::Object(o) = &mut v {
+            put_lock(&st, o);
+        }
+        return Ok(Json(v).into_response());
     }
     if !matches!(p, Principal::Admin { .. }) {
         return Err(ApiError::Denied(

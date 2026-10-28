@@ -1,20 +1,28 @@
 //! Маршруты HTTP API.
 pub mod admin;
+pub mod agent_setup;
 pub mod blobs;
+pub mod cache;
+pub mod downloads;
 pub mod entries;
+pub mod feedback;
 pub mod graph;
 pub mod health;
 pub mod index;
 pub mod insights;
 pub mod nodes;
+pub mod read;
+pub mod recall;
 pub mod releases;
 pub mod render;
 pub mod scope;
 pub mod search;
 pub mod secrets;
+pub mod sessions;
 pub mod solutions;
 pub mod spaces;
 pub mod triggers;
+pub mod user_settings;
 pub mod vault;
 
 use axum::Router;
@@ -23,12 +31,14 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::Query;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::http::StatusCode;
+use axum::middleware::from_fn_with_state;
 use axum::routing::{delete, get, patch, post};
 use serde::de::DeserializeOwned;
 use zam_core::Id;
 
 use crate::app::AppState;
 use crate::auth::admin as login;
+use crate::auth::user as user_auth;
 use crate::config::LimitsSection;
 use crate::error::ApiError;
 
@@ -39,11 +49,14 @@ const JSON_OVERHEAD: usize = 64 * 1024;
 /// (`note_max_bytes`); экранирование JSON (`\n`, `\r`, `\"`) может удвоить
 /// размер, поэтому тело — до двух пределов заметки плюс запас.
 fn note_body_limit(l: &LimitsSection) -> DefaultBodyLimit {
-    DefaultBodyLimit::max(
-        l.note_max_bytes
-            .saturating_mul(2)
-            .saturating_add(JSON_OVERHEAD),
-    )
+    DefaultBodyLimit::max(note_body_max(l))
+}
+
+/// Предел тела с текстом заметки, байт: два предела заметки плюс запас (тот же у `/mcp`).
+pub(crate) fn note_body_max(l: &LimitsSection) -> usize {
+    l.note_max_bytes
+        .saturating_mul(2)
+        .saturating_add(JSON_OVERHEAD)
 }
 
 /// Запас на заголовки частей и поле `node` в multipart загрузки вложения, байт.
@@ -55,43 +68,30 @@ fn blob_body_limit(l: &LimitsSection) -> DefaultBodyLimit {
     DefaultBodyLimit::max(l.blob_max_bytes.saturating_add(MULTIPART_OVERHEAD))
 }
 
-/// Маршруты под `/api/v1`.
-pub fn router(limits: &LimitsSection) -> Router<AppState> {
+/// Маршруты под `/api/v1` (без `/mcp`: его инструменты зовут этот роутер изнутри).
+pub fn router(state: &AppState) -> Router<AppState> {
+    memory_routes(&state.cfg.limits)
+        // записи в память с `X-Zam-Session` — счётчик сессии (одна точка, R1)
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            sessions::count_memory_writes,
+        ))
+        .merge(service_routes())
+}
+
+/// Маршруты записи в память (и чтения тех же ресурсов): узлы, вложения, записи журналов,
+/// связи, Vault, кэш выжимок (`POST /cache`, `DELETE /cache/{id}`, `promote`; чтение кэша —
+/// в [`service_routes`]). Изменяющие запросы с `X-Zam-Session` считает
+/// [`sessions::count_memory_writes`]; оценка записи (`/feedback`) — не запись в память.
+/// Любой новый путь записи в память — сюда (решение контроллера R12); MCP ([`crate::mcp`])
+/// вызывает эти маршруты через внутренний `Router`.
+fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
     let note_limit = note_body_limit(limits);
     Router::new()
-        .route("/api/v1/health", get(health::health))
-        .route("/api/v1/ready", get(health::ready))
-        .route("/api/v1/auth/login", post(login::login))
-        .route("/api/v1/auth/logout", post(login::logout))
-        .route("/api/v1/auth/me", get(login::me))
-        .route("/api/v1/spaces", get(spaces::list))
-        .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
-        .route(
-            "/api/v1/solutions",
-            get(solutions::list).post(solutions::register),
-        )
-        .route("/api/v1/solutions/{guid}", get(solutions::get))
-        .route(
-            "/api/v1/solutions/{guid}/access",
-            get(solutions::access_list),
-        )
-        .route(
-            "/api/v1/solutions/{guid}/access/{user}/approve",
-            post(solutions::approve),
-        )
-        .route(
-            "/api/v1/solutions/{guid}/access/{user}/reject",
-            post(solutions::reject),
-        )
-        .route(
-            "/api/v1/solutions/{guid}/access/{user}/revoke",
-            post(solutions::revoke),
-        )
         .route(
             "/api/v1/nodes",
             post(nodes::write::create).layer(note_limit),
         )
-        .route("/api/v1/nodes/by-path", get(nodes::read::by_path))
         .route(
             "/api/v1/nodes/{id}",
             get(nodes::read::by_id)
@@ -100,22 +100,9 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
                 .delete(nodes::write::remove)
                 .layer(note_limit),
         )
-        .route("/api/v1/nodes/{id}/outline", get(nodes::read::outline))
         .route("/api/v1/nodes/{id}/move", post(nodes::write::move_to))
         .route("/api/v1/nodes/{id}/restore", post(nodes::write::restore))
-        .route(
-            "/api/v1/nodes/{id}/revisions",
-            get(nodes::history::revisions),
-        )
-        .route(
-            "/api/v1/nodes/{id}/revisions/{rev}",
-            get(nodes::history::revision),
-        )
-        .route("/api/v1/nodes/{id}/diff", get(nodes::history::diff))
-        .route("/api/v1/nodes/{id}/backlinks", get(graph::node_backlinks))
-        .route("/api/v1/nodes/{id}/links", get(graph::node_links))
         .route("/api/v1/nodes/{id}/revert", post(nodes::history::revert))
-        .route("/api/v1/trash", get(nodes::write::trash))
         .route(
             "/api/v1/spaces/{space}/entries",
             get(entries::list).post(entries::create).layer(note_limit),
@@ -133,12 +120,6 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
             post(insights::supersede).layer(note_limit),
         )
         .route("/api/v1/entries/{id}/retract", post(insights::retract))
-        .route("/api/v1/entries/{id}/revisions", get(entries::revisions))
-        .route(
-            "/api/v1/entries/{id}/backlinks",
-            get(graph::entry_backlinks),
-        )
-        .route("/api/v1/entries/{id}/links", get(graph::entry_links))
         .route(
             "/api/v1/spaces/{space}/vault",
             get(vault::list).post(vault::create),
@@ -147,23 +128,114 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
             "/api/v1/vault/{id}",
             get(vault::get).patch(vault::patch).delete(vault::remove),
         )
-        .route("/api/v1/vault/{id}/revisions", get(vault::revisions))
-        .route("/api/v1/graph", get(graph::graph))
         .route("/api/v1/edges", post(graph::create))
         .route("/api/v1/edges/{id}", delete(graph::remove))
+        .route(
+            "/api/v1/blobs",
+            post(blobs::upload).layer(blob_body_limit(limits)),
+        )
+        .route("/api/v1/cache", post(cache::put))
+        .route("/api/v1/cache/{id}", delete(cache::remove))
+        .route("/api/v1/cache/{id}/promote", post(cache::promote))
+}
+
+/// Остальные маршруты: служебные, чтение, поиск, сессии, администрирование.
+fn service_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/health", get(health::health))
+        .route("/api/v1/ready", get(health::ready))
+        .route("/api/v1/auth/login", post(login::login))
+        .route("/api/v1/auth/logout", post(login::logout))
+        .route("/api/v1/auth/me", get(login::me))
+        .route("/api/v1/auth/password", post(user_auth::change_password))
+        .route(
+            "/api/v1/auth/tokens",
+            get(user_auth::list_tokens).post(user_auth::issue_token),
+        )
+        .route("/api/v1/auth/tokens/{id}", delete(user_auth::revoke_token))
+        .route(
+            "/api/v1/auth/settings",
+            get(user_settings::get_own).patch(user_settings::patch_own),
+        )
+        .route("/api/v1/spaces", get(spaces::list))
+        .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
+        .route(
+            "/api/v1/solutions",
+            get(solutions::list).post(solutions::register),
+        )
+        .route(
+            "/api/v1/solutions/{guid}",
+            get(solutions::get).patch(solutions::rename),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access",
+            get(solutions::access_list),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/approve",
+            post(solutions::approve),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/reject",
+            post(solutions::reject),
+        )
+        .route(
+            "/api/v1/solutions/{guid}/access/{user}/revoke",
+            post(solutions::revoke),
+        )
+        .route("/api/v1/nodes/by-path", get(nodes::read::by_path))
+        .route("/api/v1/nodes/{id}/outline", get(nodes::read::outline))
+        .route(
+            "/api/v1/nodes/{id}/revisions",
+            get(nodes::history::revisions),
+        )
+        .route(
+            "/api/v1/nodes/{id}/revisions/{rev}",
+            get(nodes::history::revision),
+        )
+        .route("/api/v1/nodes/{id}/diff", get(nodes::history::diff))
+        .route("/api/v1/nodes/{id}/backlinks", get(graph::node_backlinks))
+        .route("/api/v1/nodes/{id}/links", get(graph::node_links))
+        .route("/api/v1/trash", get(nodes::write::trash))
+        .route("/api/v1/entries/{id}/feedback", post(feedback::entry))
+        .route("/api/v1/entries/{id}/revisions", get(entries::revisions))
+        .route(
+            "/api/v1/entries/{id}/backlinks",
+            get(graph::entry_backlinks),
+        )
+        .route("/api/v1/entries/{id}/links", get(graph::entry_links))
+        .route("/api/v1/vault/{id}/revisions", get(vault::revisions))
+        .route("/api/v1/graph", get(graph::graph))
         .route("/api/v1/releases/{id}/compare", get(releases::compare))
         .route(
             "/api/v1/render",
             post(render::preview).layer(DefaultBodyLimit::max(render::RENDER_BODY_MAX)),
         )
         .route("/api/v1/render/highlight.css", get(render::highlight))
-        .route(
-            "/api/v1/blobs",
-            post(blobs::upload).layer(blob_body_limit(limits)),
-        )
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
         .route("/api/v1/search", post(search::search))
+        .route("/api/v1/read", post(read::read))
+        // подсказки пишут только `usage` и `session_seen`, не память (R12)
+        .route("/api/v1/recall", post(recall::recall))
+        .route("/api/v1/cache", get(cache::list))
+        .route("/api/v1/cache/{id}", get(cache::get))
         .route("/api/v1/triggers", get(triggers::list))
+        .route(
+            "/api/v1/sessions",
+            get(sessions::list).post(sessions::create),
+        )
+        .route(
+            "/api/v1/sessions/{id}",
+            get(sessions::get).patch(sessions::patch),
+        )
+        .route("/api/v1/agent-setup", get(agent_setup::setup))
+        .route("/api/v1/agent-guide", get(agent_setup::guide))
+        .route(
+            "/api/v1/admin/agent-setup/preview",
+            post(agent_setup::preview),
+        )
+        // клиент `zam` для установки — без аутентификации (§15.5)
+        .route("/downloads/zam/{platform}", get(downloads::zam))
         .route("/api/v1/index/status", get(index::status))
         .route("/api/v1/admin/reindex", post(index::reindex))
         .route(
@@ -177,6 +249,14 @@ pub fn router(limits: &LimitsSection) -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{id}/tokens",
             get(admin::list_tokens).post(admin::issue_token),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/password",
+            post(admin::set_password).delete(admin::clear_password),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/settings",
+            get(user_settings::get_user).patch(user_settings::patch_user),
         )
         .route("/api/v1/admin/tokens/{id}", delete(admin::revoke_token))
         .route("/api/v1/admin/audit", get(admin::list_audit))

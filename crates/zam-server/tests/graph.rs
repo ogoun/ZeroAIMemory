@@ -403,7 +403,8 @@ async fn explicit_edge_crud_system_protected() {
         .await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
 
-    // axiom: ребро от неё агенту — 403, к ней — можно; человеку (cookie) — можно
+    // axiom: рёбра от неё и к ней агент создаёт и удаляет сам (§8.5, решение владельца
+    // 2026-10-26: ruling R10 снят); человеку (cookie) — тоже
     let r = a
         .adm(
             Method::POST,
@@ -418,8 +419,12 @@ async fn explicit_edge_crud_system_protected() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let ax = id(&r.json());
     let r = edge(&a, &tok, &format!("n:{ax}"), "relates_to", &src).await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
-    assert_eq!(r.json()["code"], "axiom-requires-human");
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let by_agent = id(&r.json());
+    let r = a
+        .t(Method::DELETE, &format!("/api/v1/edges/{by_agent}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     let r = edge(&a, &tok, &src, "relates_to", &format!("n:{ax}")).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let r = a
@@ -435,7 +440,7 @@ async fn explicit_edge_crud_system_protected() {
     let r = a
         .t(Method::DELETE, &format!("/api/v1/edges/{from_ax}"), None)
         .await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
 
     // links insight → явные рёбра; supersedes в links — 422, цель не найдена — 422
     let mut body = insight("вывод со связями", "три");

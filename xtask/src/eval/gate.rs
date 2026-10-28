@@ -11,6 +11,12 @@
 //! 95 % интервала парного бутстрепа (10 000 выборок, фиксированное зерно) разности
 //! кандидат − fp32 не ниже −0,01 и для nDCG@10, и для recall@5.
 //!
+//! **Точный поиск** (решение владельца 2026-10-26, §18.2; задача 15 M4): прогоны гейта ищут с
+//! `qdrant.exact_search = true` ([`EXACT_SEARCH`]) — `SearchParams.exact` и без квантования
+//! Qdrant, полный перебор по оригиналам. Так разность int8 − fp32 мерит квантование модели, а не
+//! шум HNSW-индекса (в M3 прогоны одного кода на разных индексах давали разный вердикт). В
+//! продакшне поиск — HNSW, как прежде.
+//!
 //! **Справочно** (в отчёте, на вердикт не влияют — пороги M2):
 //! - косинус dense: средний ≥ 0,99, минимальный ≥ 0,97;
 //! - корреляция Спирмена весов sparse (объединение токенов, отсутствующий = 0): средняя ≥ 0,95.
@@ -46,6 +52,8 @@ const SPARSE_MEAN_MIN: f64 = 0.95;
 const METRIC_DROP_MAX: f64 = 0.01;
 /// Выборок парного бутстрепа разности метрик гейта (решение владельца 2026-10-21).
 const GATE_BOOTSTRAP: usize = 10_000;
+/// Точный поиск Qdrant в прогонах гейта (см. модуль); `--set` прогона его не отменяет.
+pub const EXACT_SEARCH: (&str, &str) = ("qdrant.exact_search", "true");
 
 /// Эмбеддинг из базы прогона.
 struct Vecs {
@@ -357,12 +365,15 @@ fn eval_model(
         corpus,
         queries,
     } = *c;
+    let mut sets = run::parse_sets(&a.sets)?;
+    sets.retain(|(k, _)| k != EXACT_SEARCH.0);
+    sets.push((EXACT_SEARCH.0.into(), EXACT_SEARCH.1.into()));
     let spec = RunSpec {
         name: format!("gate-{model}"),
         model: Some(model.into()),
         device,
         reranker: None,
-        sets: run::parse_sets(&a.sets)?,
+        sets,
         keep_cuda_path: a.keep_cuda_path,
         ctrl_break: false,
     };
@@ -433,7 +444,12 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) -> Resul
     runs.insert(cand.clone(), summary(&r8, &f8_file));
     // fp16 на CUDA — справочно
     let (mut fp16_checks, mut fp16_note) = (Vec::new(), None);
-    match eval_model(&ctx, FP16, Device::Cuda, a.reuse) {
+    let fp16 = if a.skip_cuda {
+        Err(anyhow::anyhow!("--skip-cuda"))
+    } else {
+        eval_model(&ctx, FP16, Device::Cuda, a.reuse)
+    };
+    match fp16 {
         Ok((r16, v16, f16_file)) => {
             let c16 = compare(FP16, &v16, FP32, &v32)?;
             fp16_checks = checks(&c16, &r16, &r32);

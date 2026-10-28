@@ -197,3 +197,41 @@ async fn unavailable_is_503_problem_json() {
     );
     assert_eq!(json(r).await["status"], 503);
 }
+
+/// Стенд Debian 13, L1: stderr процесса — канал (как у службы под systemd → journald):
+/// первый токен лежит в `<data>/first-admin-token.txt`, а в stderr и в журнале сервера его нет —
+/// только путь к файлу.
+#[test]
+fn non_tty_stderr_puts_initial_token_into_file() {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+    let root = tmp("b-token-file");
+    let data = root.join("data");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, common::qdrant::free_port()));
+    let mut c = cfg_in(data.clone());
+    c.server.bind = addr;
+    let conf = root.join("zam.toml");
+    std::fs::write(&conf, toml::to_string(&c).unwrap()).unwrap();
+    let mut srv = common::process::ServerProc::start(&conf, addr);
+    let token = srv.initial_token(Duration::from_secs(60));
+    assert!(token.starts_with("zam_"), "{token}");
+    srv.assert_running("первый старт");
+    let file = data.join(zam_server::INITIAL_TOKEN_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("{token}\n")
+    );
+    let tail = srv.tail();
+    assert!(!tail.contains(&token), "токен в stderr:\n{tail}");
+    assert!(
+        tail.contains(zam_server::INITIAL_TOKEN_FILE_LINE),
+        "нет пути к файлу:\n{tail}"
+    );
+    // и не в журнале сервера, и не строкой рамки
+    assert!(!tail.contains("ZeroAIMemoryToken="), "{tail}");
+    srv.kill();
+    for e in std::fs::read_dir(data.join("logs")).unwrap().flatten() {
+        let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+        assert!(!text.contains(&token), "токен в {}", e.path().display());
+    }
+}

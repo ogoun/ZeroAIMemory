@@ -1,16 +1,20 @@
 //! Атрибуция ревизий (§11.3, §12): кто пишет, с какой машины и в какой сессии.
 //!
-//! - `author_kind`: токен — `agent`, человеческий токен (`human`, §7.5) и администратор
-//!   (cookie WebUI) — `human`;
-//! - `token_id` — id токена запроса, `user_id` — его пользователь (автор ревизии в базе
-//!   владельца общего решения, §11.6); у администратора — нет;
+//! - `author_kind`: любой токен — `agent`, сессия WebUI (администратор или пользователь) —
+//!   `human` (§7.5, §11.4: человеческие токены M3 упразднены решением владельца 2026-10-26,
+//!   `tokens.human` не читается);
+//! - `token_id` — id токена запроса, `user_id` — его пользователь или пользователь сессии WebUI
+//!   (автор ревизии в базе владельца общего решения, §11.6); у администратора — нет;
 //! - `X-Zam-Session`, `X-Zam-Machine` — до 128 символов UTF-8 без управляющих,
 //!   иначе 400; пустое значение равно отсутствию заголовка;
 //! - `X-Zam-Area` (§11.2) — область по умолчанию для новых узлов и записей журналов, те же
 //!   правила;
 //! - `message` — из тела запроса.
+//!
+//! Те же заголовки описывают сессию агента ([`session_touch`], §6.3): `X-Zam-Session` — её id,
+//! `X-Zam-Machine`, `X-Zam-Area` и `X-Zam-Solution` — её машина, область и решение.
 use axum::http::HeaderMap;
-use zam_store::{Attribution, AuthorKind};
+use zam_store::{Attribution, AuthorKind, SessionTouch};
 
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -33,14 +37,8 @@ pub fn attribution(
     message: Option<String>,
 ) -> Result<Attribution, ApiError> {
     let (author_kind, token_id, user_id) = match p {
-        Principal::Token(t) => {
-            let kind = if t.human {
-                AuthorKind::Human
-            } else {
-                AuthorKind::Agent
-            };
-            (kind, Some(t.token_id), Some(t.user_id))
-        }
+        Principal::Token(t) => (AuthorKind::Agent, Some(t.token_id), Some(t.user_id)),
+        Principal::User { user_id, .. } => (AuthorKind::Human, None, Some(*user_id)),
         Principal::Admin { .. } => (AuthorKind::Human, None, None),
     };
     let message = message.filter(|m| !m.trim().is_empty());
@@ -61,6 +59,32 @@ pub fn attribution(
         user_id,
         area: header_value(headers, AREA_HEADER)?,
     })
+}
+
+/// Касание сессии агента по запросу: id — `session_id` из тела (`body_id`, сильнее; края
+/// обрезаются, как у заголовка) или `X-Zam-Session`; `None` — запрос без сессии. Некорректный `X-Zam-Solution` сессии не мешает
+/// (решение остаётся прежним).
+pub fn session_touch(
+    p: &Principal,
+    headers: &HeaderMap,
+    body_id: Option<&str>,
+) -> Result<Option<SessionTouch>, ApiError> {
+    let header_id = header_value(headers, SESSION_HEADER)?;
+    let Some(id) = body_id.map(|s| s.trim().to_string()).or(header_id) else {
+        return Ok(None);
+    };
+    zam_store::check_session_id(&id)?;
+    Ok(Some(SessionTouch {
+        id,
+        token_id: p.token_id(),
+        solution_guid: header_value(headers, crate::api::search::SOLUTION_HEADER)
+            .ok()
+            .flatten()
+            .and_then(|g| g.parse().ok()),
+        area: header_value(headers, AREA_HEADER)?,
+        machine: header_value(headers, MACHINE_HEADER)?,
+        agent: None,
+    }))
 }
 
 /// Значение заголовка атрибуции: UTF-8, ≤ 128 символов, только печатные.
@@ -112,23 +136,73 @@ mod tests {
     }
 
     #[test]
-    fn token_author_kind_by_human_flag() {
-        let tok = |human| {
-            Principal::Token(zam_store::AuthToken {
-                token_id: zam_core::Id::new(),
-                user_id: zam_core::Id::new(),
-                access: zam_store::Access::Rw,
-                human,
-            })
+    fn user_session_is_human_with_user_id() {
+        let uid = zam_core::Id::new();
+        let p = Principal::User {
+            session_id: "s".into(),
+            user_id: uid,
         };
-        let h = HeaderMap::new();
-        assert_eq!(
-            attribution(&tok(false), &h, None).unwrap().author_kind,
-            AuthorKind::Agent
-        );
-        let a = attribution(&tok(true), &h, None).unwrap();
+        let a = attribution(&p, &HeaderMap::new(), None).unwrap();
         assert_eq!(a.author_kind, AuthorKind::Human);
+        assert_eq!((a.token_id, a.user_id), (None, Some(uid)));
+    }
+
+    #[test]
+    fn token_is_always_agent() {
+        let tok = Principal::Token(zam_store::AuthToken {
+            token_id: zam_core::Id::new(),
+            user_id: zam_core::Id::new(),
+            access: zam_store::Access::Rw,
+        });
+        let a = attribution(&tok, &HeaderMap::new(), None).unwrap();
+        assert_eq!(a.author_kind, AuthorKind::Agent);
         assert!(a.token_id.is_some() && a.user_id.is_some());
+    }
+
+    #[test]
+    fn session_touch_from_headers() {
+        assert_eq!(
+            session_touch(&admin(), &HeaderMap::new(), None).unwrap(),
+            None
+        );
+        let mut h = HeaderMap::new();
+        h.insert(SESSION_HEADER, HeaderValue::from_static(" s-1 "));
+        h.insert(MACHINE_HEADER, HeaderValue::from_static("box"));
+        h.insert(AREA_HEADER, HeaderValue::from_static("svc"));
+        h.insert(
+            crate::api::search::SOLUTION_HEADER,
+            HeaderValue::from_static("0192F1C4-7A1E-7C3B-9A55-2B1F6F0D9E11"),
+        );
+        let s = session_touch(&admin(), &h, None).unwrap().unwrap();
+        assert_eq!(s.id, "s-1");
+        assert_eq!(s.token_id, None);
+        assert_eq!(
+            s.solution_guid.as_ref().map(|g| g.as_str()),
+            Some("0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e11")
+        );
+        assert_eq!(
+            (s.machine.as_deref(), s.area.as_deref()),
+            (Some("box"), Some("svc"))
+        );
+        h.insert(
+            crate::api::search::SOLUTION_HEADER,
+            HeaderValue::from_static("not-a-guid"),
+        );
+        assert_eq!(
+            session_touch(&admin(), &h, None)
+                .unwrap()
+                .unwrap()
+                .solution_guid,
+            None
+        );
+        // id из тела сильнее заголовка; пустой — отказ
+        let s = session_touch(&admin(), &h, Some("body")).unwrap().unwrap();
+        assert_eq!((s.id.as_str(), s.machine.as_deref()), ("body", Some("box")));
+        let s = session_touch(&admin(), &HeaderMap::new(), Some(" b "))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.id, "b");
+        assert!(session_touch(&admin(), &HeaderMap::new(), Some("")).is_err());
     }
 
     #[test]

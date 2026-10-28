@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use jiff::Timestamp;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
@@ -64,6 +65,14 @@ pub static USER_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 12,
         sql: include_str!("../migrations/user/0012_live_children.sql"),
+    },
+    Migration {
+        version: 13,
+        sql: include_str!("../migrations/user/0013_sessions_usage.sql"),
+    },
+    Migration {
+        version: 14,
+        sql: include_str!("../migrations/user/0014_answer_cache.sql"),
     },
 ];
 
@@ -145,6 +154,59 @@ struct OpenDb {
     db: Db,
     /// `true` — фоновые задачи не нужны или уже завершились (успешно или с ошибкой).
     rechunked: watch::Receiver<bool>,
+    /// Перенарезка при открытии и её ход (`None` — не понадобилась).
+    rechunk: Option<Arc<RechunkRun>>,
+}
+
+/// Почему база перенарезается при открытии (уведомление о перенарезке, §8.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RechunkReason {
+    /// Изменились ключи `[index]` (пороги и флаги нарезки, L0 в префиксе).
+    Params,
+    /// Другая версия алгоритма нарезки (в том числе база M1 до чанков §8.2).
+    Algorithm,
+    /// Другой токенизатор (или чанки по оценке, а счётчик теперь точный).
+    Tokenizer,
+    /// База M3 без сохранённых параметров нарезки: причину по отпечатку не установить.
+    Unknown,
+}
+
+impl RechunkReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RechunkReason::Params => "params",
+            RechunkReason::Algorithm => "algorithm",
+            RechunkReason::Tokenizer => "tokenizer",
+            RechunkReason::Unknown => "unknown",
+        }
+    }
+}
+
+/// Уведомление о перенарезке базы при открытии (§8.2): причина, изменившиеся параметры —
+/// имена ключей `[index]` (`chunk_boundary_lambda`, …), `algorithm` или `tokenizer` — и число
+/// целей (живых заметок и записей журналов той части базы, что перенарезается).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RechunkNotice {
+    pub reason: RechunkReason,
+    pub changed: Vec<String>,
+    pub targets: u64,
+}
+
+/// Ход идущей перенарезки базы: уведомление и сколько целей уже обработано (`done` не
+/// больше `notice.targets`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RechunkProgress {
+    pub notice: RechunkNotice,
+    pub done: u64,
+}
+
+/// Перенарезка при открытии: уведомление, счётчик обработанных целей и признак «идёт».
+#[derive(Debug)]
+struct RechunkRun {
+    notice: RechunkNotice,
+    done: AtomicU64,
+    running: AtomicBool,
 }
 
 impl UserDbs {
@@ -182,6 +244,21 @@ impl UserDbs {
             Some(why) if !clear_rechunk_if_empty(&db).await? => Some(why),
             _ => None,
         };
+        let run = pending.as_ref().map(|plan| {
+            let n = &plan.notice;
+            // одна строка на базу, без текста заметок (§8.2)
+            tracing::warn!(
+                reason = n.reason.as_str(),
+                "перенарезка базы {user}: изменились {} — {} записей",
+                changed_text(&n.changed),
+                n.targets
+            );
+            Arc::new(RechunkRun {
+                notice: n.clone(),
+                done: AtomicU64::new(0),
+                running: AtomicBool::new(true),
+            })
+        });
         let edges = crate::graph::backfill_pending(&db).await?;
         let secrets = secrets_scan_pending(&db).await?;
         // теги payload и вход эмбеддинга папок (v3): до возврата базы — воркер проверяет
@@ -191,16 +268,21 @@ impl UserDbs {
         *cell = Some(OpenDb {
             db: db.clone(),
             rechunked,
+            rechunk: run.clone(),
         });
         drop(cell);
         if pending.is_some() || edges || secrets {
             let bg = db.clone();
             tokio::spawn(async move {
-                if let Some(plan) = pending
-                    && let Err(e) = rechunk_all(&bg, plan).await
-                {
-                    // повторится при следующем открытии базы
-                    tracing::warn!(error = %e, reason = plan.why.as_str(), "перечанковка заметок прервана");
+                if let (Some(plan), Some(run)) = (pending, run) {
+                    // «идёт» снимается и при панике задачи: баннер не повисает
+                    let _running = RunningGuard(run.clone());
+                    #[cfg(feature = "test-hooks")]
+                    crate::test_hooks::rechunk_gate().await;
+                    if let Err(e) = rechunk_all(&bg, &plan, &run.done).await {
+                        // повторится при следующем открытии базы
+                        tracing::warn!(error = %e, reason = plan.why.as_str(), "перечанковка заметок прервана");
+                    }
                 }
                 if edges && let Err(e) = crate::graph::backfill_edges(&bg).await {
                     tracing::warn!(error = %e, "дозаполнение рёбер графа прервано");
@@ -227,6 +309,53 @@ impl UserDbs {
             // ошибка — отправитель закрыт без `true` (задача прервана): ждать нечего
             let _ = rx.wait_for(|done| *done).await;
         }
+    }
+
+    /// Перенарезка при открытии базы `user` этим процессом (§8.2), идёт она или уже
+    /// закончилась: уведомление и сколько целей обработано (`done` без ограничения сверху —
+    /// по окончании равен `notice.targets`, если во время перенарезки цели не добавлялись).
+    /// `None` — база не открыта или перенарезка не понадобилась.
+    pub async fn opened_rechunk(&self, user: Id) -> Option<RechunkProgress> {
+        let slot = self.open.lock().await.get(&user).cloned()?;
+        let run = slot.lock().await.as_ref()?.rechunk.clone()?;
+        Some(RechunkProgress {
+            done: run.done.load(Ordering::Relaxed),
+            notice: run.notice.clone(),
+        })
+    }
+
+    /// Ход перенарезки базы `user`, начатой при её открытии этим процессом (§8.2): `None` —
+    /// база не открыта, перенарезка не понадобилась или уже закончилась (успешно или с
+    /// ошибкой). Базу не открывает.
+    pub async fn rechunk_progress(&self, user: Id) -> Option<RechunkProgress> {
+        let slot = self.open.lock().await.get(&user).cloned()?;
+        let run = slot.lock().await.as_ref()?.rechunk.clone()?;
+        if !run.running.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(RechunkProgress {
+            done: run.done.load(Ordering::Relaxed).min(run.notice.targets),
+            notice: run.notice.clone(),
+        })
+    }
+}
+
+/// Снимает признак «перенарезка идёт» при выходе из фоновой задачи — в том числе при её
+/// панике или отмене.
+struct RunningGuard(Arc<RechunkRun>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Изменившиеся параметры для строки WARN: через запятую; не установлены — «параметры нарезки».
+fn changed_text(changed: &[String]) -> String {
+    if changed.is_empty() {
+        "параметры нарезки".into()
+    } else {
+        changed.join(", ")
     }
 }
 
@@ -448,6 +577,13 @@ const CHUNKER_KEY: &str = "chunker";
 /// без L0 в префиксе). Отдельно от заметок: смена `chunk_prefix_l0` записи не перенарезает.
 const ENTRY_CHUNKER_KEY: &str = "chunker_entries";
 
+/// Ключ `meta` с JSON параметров нарезки рядом с отпечатком `key` (`chunker_params`,
+/// `chunker_entries_params`; `crate::nodes::chunker_params`): по нему уведомление о
+/// перенарезке называет изменившиеся ключи (§8.2). У базы M3 его нет.
+fn params_key(key: &str) -> String {
+    format!("{key}_params")
+}
+
 /// Почему база перечанковывается при открытии.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rechunk {
@@ -479,60 +615,170 @@ fn has_meta(c: &Connection, key: &str) -> rusqlite::Result<bool> {
     )
 }
 
-/// Что перенарезать при открытии базы и почему.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Что перенарезать при открытии базы, почему и уведомление о перенарезке.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RechunkPlan {
     why: Rechunk,
     notes: bool,
     entries: bool,
+    notice: RechunkNotice,
 }
 
-/// Отпечатки нарезки процесса: `(заметки, записи журналов)`.
-fn fingerprints() -> (String, String) {
+/// Нарезка процесса для одной части базы: отпечаток и JSON параметров.
+#[derive(Debug, Clone)]
+struct Chunker {
+    fingerprint: String,
+    params: serde_json::Value,
+}
+
+/// Нарезка процесса: `(заметки, записи журналов)`.
+fn fingerprints() -> (Chunker, Chunker) {
     (
-        crate::nodes::chunker_fingerprint(),
-        crate::nodes::entry_chunker_fingerprint(),
+        Chunker {
+            fingerprint: crate::nodes::chunker_fingerprint(),
+            params: crate::nodes::chunker_params(true),
+        },
+        Chunker {
+            fingerprint: crate::nodes::entry_chunker_fingerprint(),
+            params: crate::nodes::chunker_params(false),
+        },
     )
+}
+
+/// Причина и изменившиеся параметры части базы, отпечаток которой разошёлся с текущим: по
+/// сохранённому JSON параметров, а у базы M3 без него — `unknown` с параметрами,
+/// восстановленными из отпечатка, если он разбирается (иначе список пуст)
+/// **[решение исполнителя, M4]**: при обновлении с M3 администратор видит, что изменилась
+/// `chunk_boundary_lambda`, хотя причина формально не установлена.
+fn diagnose(
+    stored_fp: Option<&str>,
+    stored_params: Option<&str>,
+    current: &Chunker,
+    exact: bool,
+) -> (RechunkReason, Vec<String>) {
+    use crate::nodes::{PARAM_ALGORITHM, PARAM_TOKENIZER, changed_params};
+    let stored = stored_params.and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok());
+    let Some(stored) = stored else {
+        let changed = stored_fp
+            .and_then(crate::nodes::params_from_fingerprint)
+            .map(|old| changed_params(&old, &current.params, exact))
+            .unwrap_or_default();
+        return (RechunkReason::Unknown, changed);
+    };
+    let changed = changed_params(&stored, &current.params, exact);
+    let reason = if changed.iter().any(|k| k == PARAM_ALGORITHM) {
+        RechunkReason::Algorithm
+    } else if changed.iter().any(|k| k != PARAM_TOKENIZER) {
+        RechunkReason::Params
+    } else if changed.is_empty() {
+        // отпечаток разошёлся, а параметры совпали (JSON записан другой версией сервера)
+        RechunkReason::Unknown
+    } else {
+        RechunkReason::Tokenizer
+    };
+    (reason, changed)
+}
+
+/// Общая причина двух частей базы — первая по важности: алгоритм, параметры, токенизатор,
+/// неизвестно.
+fn first_reason(a: RechunkReason, b: RechunkReason) -> RechunkReason {
+    let rank = |r| match r {
+        RechunkReason::Algorithm => 0,
+        RechunkReason::Params => 1,
+        RechunkReason::Tokenizer => 2,
+        RechunkReason::Unknown => 3,
+    };
+    if rank(b) < rank(a) { b } else { a }
 }
 
 /// Нужна ли перечанковка при открытии: флаг R1, чанки по оценке при точном счётчике (всё)
 /// или отпечаток нарезки заметок либо записей не совпадает с текущим (только расходящееся;
-/// сравнение — `crate::nodes::same_chunker`).
+/// сравнение — `crate::nodes::same_chunker`). В плане — уведомление: причина, изменившиеся
+/// параметры и число целей (живых заметок и записей перенарезаемых частей).
 async fn rechunk_pending(db: &Db) -> Result<Option<RechunkPlan>, StoreError> {
     let exact = crate::nodes::token_counter_exact();
-    let (notes_fp, entries_fp) = fingerprints();
+    let (notes_cur, entries_cur) = fingerprints();
     db.read(move |c| {
         let stored = |key: &str| -> rusqlite::Result<Option<String>> {
             c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
                 .optional()
         };
-        let all = |why| {
-            Some(RechunkPlan {
+        let count = |sql: &str| -> rusqlite::Result<u64> {
+            Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))?.max(0) as u64)
+        };
+        let targets = |notes: bool, entries: bool| -> rusqlite::Result<u64> {
+            let n = if notes {
+                count("SELECT count(*) FROM nodes WHERE kind = 'note' AND deleted_at IS NULL")?
+            } else {
+                0
+            };
+            let e = if entries {
+                count("SELECT count(*) FROM entries WHERE deleted_at IS NULL")?
+            } else {
+                0
+            };
+            Ok(n + e)
+        };
+        let all = |why, reason, changed: &str| -> rusqlite::Result<Option<RechunkPlan>> {
+            Ok(Some(RechunkPlan {
                 why,
                 notes: true,
                 entries: true,
-            })
+                notice: RechunkNotice {
+                    reason,
+                    changed: vec![changed.to_string()],
+                    targets: targets(true, true)?,
+                },
+            }))
         };
-        Ok(if has_meta(c, RECHUNK_V4)? {
-            all(Rechunk::AfterV4)
-        } else if exact && has_meta(c, CHUNKED_APPROX)? {
-            all(Rechunk::ExactCounter)
-        } else {
-            let same = |key: &str, fp: &str| -> rusqlite::Result<bool> {
-                Ok(crate::nodes::same_chunker(
-                    stored(key)?.as_deref(),
-                    fp,
-                    exact,
-                ))
+        if has_meta(c, RECHUNK_V4)? {
+            return all(
+                Rechunk::AfterV4,
+                RechunkReason::Algorithm,
+                crate::nodes::PARAM_ALGORITHM,
+            )
+            .map_err(Into::into);
+        }
+        if exact && has_meta(c, CHUNKED_APPROX)? {
+            return all(
+                Rechunk::ExactCounter,
+                RechunkReason::Tokenizer,
+                crate::nodes::PARAM_TOKENIZER,
+            )
+            .map_err(Into::into);
+        }
+        // расхождение части базы с текущей нарезкой; `None` — отпечаток совпал
+        let part =
+            |key: &str, cur: &Chunker| -> rusqlite::Result<Option<(RechunkReason, Vec<String>)>> {
+                let fp = stored(key)?;
+                if crate::nodes::same_chunker(fp.as_deref(), &cur.fingerprint, exact) {
+                    return Ok(None);
+                }
+                let params = stored(&params_key(key))?;
+                Ok(Some(diagnose(fp.as_deref(), params.as_deref(), cur, exact)))
             };
-            let notes = !same(CHUNKER_KEY, &notes_fp)?;
-            let entries = !same(ENTRY_CHUNKER_KEY, &entries_fp)?;
-            (notes || entries).then_some(RechunkPlan {
-                why: Rechunk::Chunker,
-                notes,
-                entries,
-            })
-        })
+        let notes = part(CHUNKER_KEY, &notes_cur)?;
+        let entries = part(ENTRY_CHUNKER_KEY, &entries_cur)?;
+        let (reason, changed) = match (&notes, &entries) {
+            (None, None) => return Ok(None),
+            (Some(d), None) | (None, Some(d)) => d.clone(),
+            (Some((rn, cn)), Some((re, ce))) => {
+                let mut changed = cn.clone();
+                changed.extend(ce.iter().filter(|k| !cn.contains(k)).cloned());
+                changed.sort_by_key(|k| crate::nodes::param_order(k));
+                (first_reason(*rn, *re), changed)
+            }
+        };
+        Ok(Some(RechunkPlan {
+            why: Rechunk::Chunker,
+            notes: notes.is_some(),
+            entries: entries.is_some(),
+            notice: RechunkNotice {
+                reason,
+                changed,
+                targets: targets(notes.is_some(), entries.is_some())?,
+            },
+        }))
     })
     .await
 }
@@ -540,28 +786,28 @@ async fn rechunk_pending(db: &Db) -> Result<Option<RechunkPlan>, StoreError> {
 /// Отпечатки нарезки базы — текущие: вызывается после перечанковки всех живых заметок и
 /// записей (`reindex --full` без области).
 pub(crate) async fn mark_chunker_current(db: &Db) -> Result<(), StoreError> {
-    let (notes_fp, entries_fp) = fingerprints();
+    let (notes_cur, entries_cur) = fingerprints();
     db.write(move |tx| {
-        put_chunker(tx, CHUNKER_KEY, &notes_fp)?;
-        put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_fp)?;
+        put_chunker(tx, CHUNKER_KEY, &notes_cur)?;
+        put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_cur)?;
         Ok(())
     })
     .await
 }
 
-/// Записывает отпечаток нарезки `key` (заметок или записей) базы.
-fn put_chunker(tx: &Connection, key: &str, fingerprint: &str) -> rusqlite::Result<()> {
-    tx.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-        params![key, fingerprint],
-    )?;
+/// Записывает отпечаток нарезки `key` (заметок или записей) базы и рядом — JSON её
+/// параметров (`<key>_params`).
+fn put_chunker(tx: &Connection, key: &str, cur: &Chunker) -> rusqlite::Result<()> {
+    let mut st = tx.prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")?;
+    st.execute(params![key, cur.fingerprint])?;
+    st.execute(params![params_key(key), cur.params.to_string()])?;
     Ok(())
 }
 
 /// База без живых заметок и записей (новая или пустая) — флаги перечанковки снимаются сразу,
 /// отпечаток нарезки ставится текущий, без фоновой задачи. `true` — сняты.
 async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
-    let (notes_fp, entries_fp) = fingerprints();
+    let (notes_cur, entries_cur) = fingerprints();
     db.write(move |tx| {
         let any: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)
@@ -574,8 +820,8 @@ async fn clear_rechunk_if_empty(db: &Db) -> Result<bool, StoreError> {
                 "DELETE FROM meta WHERE key IN (?1, ?2)",
                 [RECHUNK_V4, CHUNKED_APPROX],
             )?;
-            put_chunker(tx, CHUNKER_KEY, &notes_fp)?;
-            put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_fp)?;
+            put_chunker(tx, CHUNKER_KEY, &notes_cur)?;
+            put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_cur)?;
         }
         Ok(!any)
     })
@@ -609,29 +855,31 @@ pub(crate) async fn clear_approx_if_exact(db: &Db) -> Result<(), StoreError> {
 /// префикс которых изменился; цель, нарезка которой не изменилась, не переписывается и не
 /// получает `upsert` (её точки в Qdrant уже совпадают с чанками).
 /// Флаги снимаются, а отпечаток ставится только после успеха: прерванная перечанковка
-/// повторится при следующем открытии (она идемпотентна). В лог идут только счётчики.
-async fn rechunk_all(db: &Db, plan: RechunkPlan) -> Result<(), StoreError> {
+/// повторится при следующем открытии (она идемпотентна). `done` — счётчик обработанных целей
+/// (ход перенарезки в `GET /index/status`). В лог идут только счётчики.
+async fn rechunk_all(db: &Db, plan: &RechunkPlan, done: &AtomicU64) -> Result<(), StoreError> {
     let why = plan.why;
+    let (part_notes, part_entries) = (plan.notes, plan.entries);
     tracing::info!(reason = why.as_str(), "перечанковка заметок базы");
     let started = std::time::Instant::now();
-    let (notes_fp, entries_fp) = fingerprints();
-    let (notes, upserts) = if plan.notes {
-        crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX, true).await?
+    let (notes_cur, entries_cur) = fingerprints();
+    let (notes, upserts) = if part_notes {
+        crate::nodes::rechunk_notes(db, None, PRIORITY_REINDEX, true, Some(done)).await?
     } else {
         (0, 0)
     };
-    let entries = if plan.entries {
-        crate::entries::rechunk_entries(db, None, PRIORITY_REINDEX, true).await?
+    let entries = if part_entries {
+        crate::entries::rechunk_entries(db, None, PRIORITY_REINDEX, true, Some(done)).await?
     } else {
         0
     };
     db.write(move |tx| {
         tx.execute("DELETE FROM meta WHERE key = ?1", [RECHUNK_V4])?;
-        if plan.notes {
-            put_chunker(tx, CHUNKER_KEY, &notes_fp)?;
+        if part_notes {
+            put_chunker(tx, CHUNKER_KEY, &notes_cur)?;
         }
-        if plan.entries {
-            put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_fp)?;
+        if part_entries {
+            put_chunker(tx, ENTRY_CHUNKER_KEY, &entries_cur)?;
         }
         Ok(())
     })
@@ -788,6 +1036,22 @@ pub(crate) const SPACE_NOTES_PENDING_SQL: &str = "UPDATE nodes SET index_state =
        AND index_state <> 'excluded'
      RETURNING id, current_rev";
 
+/// Меняет имя пространства решения `space_id`. Нет такого пространства решения — `NotFound`.
+pub async fn rename_solution_space(db: &Db, space_id: Id, name: &str) -> Result<(), StoreError> {
+    let name = name.to_string();
+    db.write(move |tx| {
+        let n = tx.execute(
+            "UPDATE spaces SET name = ?2 WHERE id = ?1 AND kind = 'solution'",
+            params![space_id, name],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Меняет GUID пространства решения `space_id` (конфликт GUID при регистрации решений
 /// M1–M2). Узлы, ревизии и чанки остаются на месте; живые индексируемые заметки получают
 /// `upsert`, чтобы точки Qdrant получили новый `solution_guid` в payload. Нет такого
@@ -835,4 +1099,31 @@ pub async fn rename_solution_guid(
         Ok(())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Паника фоновой перенарезки снимает «идёт» (иначе баннер WebUI висел бы до перезапуска).
+    #[tokio::test]
+    async fn running_flag_cleared_on_panic() {
+        let run = Arc::new(RechunkRun {
+            notice: RechunkNotice {
+                reason: RechunkReason::Params,
+                changed: vec!["chunk_boundary_lambda".into()],
+                targets: 3,
+            },
+            done: AtomicU64::new(1),
+            running: AtomicBool::new(true),
+        });
+        let bg = run.clone();
+        let r = tokio::spawn(async move {
+            let _running = RunningGuard(bg);
+            panic!("сбой перенарезки");
+        })
+        .await;
+        assert!(r.is_err_and(|e| e.is_panic()));
+        assert!(!run.running.load(Ordering::Relaxed));
+    }
 }

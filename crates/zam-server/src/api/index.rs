@@ -7,7 +7,11 @@
 //!   в WAL записи `wal_pending_ops`) и RSS самого
 //!   `zam-server` (`server.rss_bytes`, цели §17) общие для сервера; время воркера
 //!   (`worker`: заданий, инференс, запись в Qdrant — сумма по всем пользователям) — только
-//!   администратору, токену — `null`.
+//!   администратору, токену — `null`. `dbs` — по каждой видимой базе (администратору — все
+//!   или из `X-Zam-User`, токену — своя) `{user_id, rechunk}`: `rechunk` — ход фоновой
+//!   перенарезки после смены настроек нарезки `{reason, changed, total, done}` или `null`
+//!   (§8.2). `?only=rechunk` — лёгкий ответ для баннера WebUI: только `{dbs}` (без Qdrant,
+//!   очереди и неудавшихся заданий; базы не открываются, задача 13 fix round 1, M-1).
 //! - `POST /admin/reindex {user?, space?, full?}` — только администратор, аудит
 //!   `index.reindex`, ответ 202 с `job_count` (заметок области). Без `full` — точки
 //!   области удаляются и пишутся заново из кэша `embeddings` без инференса (промахи кэша —
@@ -18,8 +22,8 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
-use axum::extract::rejection::BytesRejection;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use jiff::Timestamp;
 use serde::Deserialize;
@@ -29,7 +33,9 @@ use zam_index::supervisor::QdrantState;
 use zam_index::{ReindexOutcome, ReindexRequest, VectorFilter, VectorScope};
 use zam_ml::Device;
 use zam_store::time::fmt_ts;
-use zam_store::{FailedJob, JobStats, failed_jobs, indexable_count, job_stats, list_spaces};
+use zam_store::{
+    FailedJob, JobStats, RechunkProgress, failed_jobs, indexable_count, job_stats, list_spaces,
+};
 
 use crate::app::AppState;
 use crate::auth::{AdminOnly, Client, Principal, USER_HEADER, target_user};
@@ -123,13 +129,36 @@ fn reindex_json(o: &ReindexOutcome) -> Value {
     v
 }
 
+/// Лишние параметры запроса игнорируются (как до `only`): строгий разбор сломал бы клиентов.
+#[derive(Deserialize)]
+pub struct StatusQuery {
+    /// `rechunk` — только ход перенарезки баз (`dbs`).
+    only: Option<String>,
+}
+
 /// `GET /index/status`.
 pub async fn status(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    q: Result<Query<StatusQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let q = crate::api::query(q)?;
     let (users, all) = status_users(&st, &p, &headers).await?;
+    match q.only.as_deref() {
+        None | Some("") => {}
+        Some("rechunk") => {
+            let mut dbs = Vec::with_capacity(users.len());
+            for u in &users {
+                dbs.push(json!({
+                    "user_id": u,
+                    "rechunk": st.users.rechunk_progress(*u).await.map(|r| rechunk_json(&r)),
+                }));
+            }
+            return Ok(Json(json!({ "dbs": dbs })));
+        }
+        Some(_) => return Err(ApiError::BadRequest("only: rechunk".into())),
+    }
     let rt = &st.index;
     // очередь и неудавшиеся задания видимых пользователей
     let mut queue = JobStats::default();
@@ -139,6 +168,8 @@ pub async fn status(
     let mut unavailable: Vec<Value> = Vec::new();
     // области точек: база каждого видимого пользователя со всеми её пространствами
     let mut scopes: Vec<VectorScope> = Vec::new();
+    // перенарезка по базам (§8.2)
+    let mut dbs: Vec<Value> = Vec::new();
     for u in &users {
         let one = async {
             let db = st.users.get(*u).await?;
@@ -159,6 +190,10 @@ pub async fn status(
             user_id: *u,
             space_ids: sp,
         });
+        dbs.push(json!({
+            "user_id": u,
+            "rechunk": st.users.rechunk_progress(*u).await.map(|r| rechunk_json(&r)),
+        }));
         queue.queued += s.queued;
         queue.running += s.running;
         queue.failed += s.failed;
@@ -223,7 +258,7 @@ pub async fn status(
                 "rollups_pending": wst.rollups_pending,
             })
         }
-        Principal::Token(_) => Value::Null,
+        Principal::Token(_) | Principal::User { .. } => Value::Null,
     };
     Ok(Json(json!({
         "vector": {
@@ -271,7 +306,18 @@ pub async fn status(
         },
         "rebuild_skipped": skipped,
         "unavailable_dbs": unavailable,
+        "dbs": dbs,
     })))
+}
+
+/// Ход перенарезки базы: причина, изменившиеся параметры, целей всего и обработано.
+fn rechunk_json(r: &RechunkProgress) -> Value {
+    json!({
+        "reason": r.notice.reason,
+        "changed": r.notice.changed,
+        "total": r.notice.targets,
+        "done": r.done,
+    })
 }
 
 #[derive(Deserialize, Default)]

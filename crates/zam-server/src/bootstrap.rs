@@ -48,6 +48,31 @@ pub async fn register_solutions(system: &SystemStore, users: &UserDbs) -> Regist
     total
 }
 
+/// Строка предупреждения о неотозванных токенах, выпущенных человеческими в M3
+/// (`tokens.human = 1`): с M4 флаг не читается, запись по ним — агентская (§11.4, решение
+/// владельца 2026-10-26). Нет таких — `None`.
+pub fn legacy_human_tokens_warning(prefixes: &[String]) -> Option<String> {
+    (!prefixes.is_empty()).then(|| {
+        format!(
+            "токены {} были человеческими, теперь агентские",
+            prefixes.join(", ")
+        )
+    })
+}
+
+/// Аудит при старте: одна строка WARN, если есть неотозванные человеческие токены M3
+/// ([`legacy_human_tokens_warning`]). Ошибка чтения — тоже WARN, старт не прерывается.
+pub async fn warn_legacy_human_tokens(system: &SystemStore) {
+    match system.legacy_human_token_prefixes().await {
+        Ok(p) => {
+            if let Some(w) = legacy_human_tokens_warning(&p) {
+                tracing::warn!("{w}");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "человеческие токены M3 не проверены"),
+    }
+}
+
 /// Если администратора нет, создаёт `login` (is_admin) и токен `initial` (rw).
 /// Если администратор есть, но у него нет ни одного токена, даже отозванного
 /// (сбой между созданием и выпуском), выпускает новый `initial`. Отозванные
@@ -75,9 +100,7 @@ pub async fn ensure_admin_user(
             (system.create_user(login, true).await?, "bootstrap")
         }
     };
-    let (_, plain) = system
-        .issue_token(user.id, "initial", Access::Rw, false)
-        .await?;
+    let (_, plain) = system.issue_token(user.id, "initial", Access::Rw).await?;
     system
         .audit(
             "system",
@@ -89,4 +112,18 @@ pub async fn ensure_admin_user(
         )
         .await?;
     Ok(Some(plain))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_human_tokens_one_line() {
+        assert_eq!(legacy_human_tokens_warning(&[]), None);
+        assert_eq!(
+            legacy_human_tokens_warning(&["zam_ab12".into(), "zam_cd34".into()]).as_deref(),
+            Some("токены zam_ab12, zam_cd34 были человеческими, теперь агентские")
+        );
+    }
 }

@@ -2,10 +2,13 @@
 //! узлы и ревизии заметок с синхронной индексацией (чанки §8.2, FTS5), outbox векторной
 //! индексации (`index_jobs`), кэш эмбеддингов, полнотекстовый поиск, блобы вложений,
 //! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
-//! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3).
+//! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3), сессии агентов,
+//! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4), кэш выжимок
+//! (`answer_cache`, `cache_deps`; M4).
 
 pub mod access;
 pub mod blobs;
+pub mod cache;
 pub mod certainty;
 pub mod datadir;
 pub mod db;
@@ -18,9 +21,13 @@ pub mod migrate;
 pub mod nodes;
 pub mod paths;
 pub mod search;
+pub mod sessions;
 pub mod solution_registry;
 pub mod system;
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
 pub mod time;
+pub mod usage;
 pub mod user_db;
 pub mod vault;
 
@@ -28,6 +35,13 @@ pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, Solutio
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_in_space,
     resolve_attachment,
+};
+pub use cache::{
+    CACHE_LOOKUP_MAX, CACHE_QUERY_MAX_CHARS, CACHE_SOURCES_MAX, CacheDep, CacheEntry, CacheError,
+    CacheFilter, CacheGc, CacheHit, CachePut, CacheQuery, PromoteAs, SourceSpec, StaleKind,
+    StaleSource, cache_count, cache_delete, cache_get, cache_list, cache_lookup, cache_promote,
+    cache_put, cache_put_with, gc_cache, invalidate_target, mark_new_sources, normalize_query,
+    scope_hash, section_text,
 };
 pub use certainty::{
     CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,
@@ -77,14 +91,24 @@ pub use search::{
     live_folders, neighbor_leaves, node_leaves, pending_count, query_needles, sanitize_fts,
     search_fts, search_fts_channels, text_snippet,
 };
+pub use sessions::{
+    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, WHOLE_TARGET,
+    add_memory_write, check_session_id, end_session, gc_sessions, get_session, latest_session,
+    list_sessions, mark_seen, seen_revs, touch_session,
+};
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,
     WebSession,
 };
+pub use usage::{
+    UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, record_usages, usage_counts,
+    usage_counts_many,
+};
 pub use user_db::{
-    Space, SpaceKind, USER_MIGRATIONS, UserDbs, create_solution, create_solution_with_id,
-    get_solution, get_space, list_spaces, rename_solution_guid, space_of_kind,
+    RechunkNotice, RechunkProgress, RechunkReason, Space, SpaceKind, USER_MIGRATIONS, UserDbs,
+    create_solution, create_solution_with_id, get_solution, get_space, list_spaces,
+    rename_solution_guid, rename_solution_space, space_of_kind,
 };
 pub use vault::{
     KEY_CHECK_SETTING, VAULT_TITLE_MAX_CHARS, VaultMeta, VaultRevision, VaultScope,
@@ -105,6 +129,9 @@ pub enum StoreError {
     NotFound,
     #[error("конфликт: {0}")]
     Conflict(String),
+    /// Ожидаемая ревизия (`If-Match`) записи журнала не совпала с текущей (§11.3).
+    #[error("ревизия записи {current}, а не {expected}")]
+    StaleRevision { expected: i64, current: i64 },
     #[error("некорректные данные: {0}")]
     BadInput(String),
     /// `Idempotency-Key` повторён с другим содержимым запроса.

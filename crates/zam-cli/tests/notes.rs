@@ -365,6 +365,28 @@ fn solution_toml_scopes_write_and_search() {
     // в knowledge её нет
     let o = e.run_in(&sub, &["read", "knowledge:x"], b"");
     assert_eq!(o.status.code(), Some(5));
+    // стенд Debian 13, B1: один сегмент без префикса читается из решения, как пишется;
+    // 404 на стенде давала секция: `--section Тесты` при пути заголовков `Сборка > Тесты`
+    let note = "# Сборка\nmake\n## Тесты\ncargo test\n";
+    ok(&e.run_in(&sub, &["write", "Сборка"], note.as_bytes()));
+    let o = e.run_in(&sub, &["read", "Сборка"], b"");
+    assert_eq!(o.stdout, note.as_bytes(), "{}", err(&o));
+    let o = e.run_in(&sub, &["read", "Сборка", "--batch"], b"");
+    assert!(ok(&o).contains("make"), "{}", err(&o));
+    for sec in ["Тесты", "Сборка > Тесты"] {
+        let o = e.run_in(&sub, &["read", "Сборка", "--section", sec], b"");
+        assert_eq!(o.stdout, "## Тесты\ncargo test\n".as_bytes(), "{}", err(&o));
+        let o = e.run_in(&sub, &["read", "Сборка", "--section", sec, "--batch"], b"");
+        assert!(ok(&o).contains("cargo test"), "{}", err(&o));
+    }
+    // нет секции: код 5 и подсказка про секцию, а не только «не найдено»
+    let o = e.run_in(&sub, &["read", "Сборка", "--section", "Нет"], b"");
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    assert!(err(&o).contains("секци"), "{}", err(&o));
+    ok(&e.run_in(&sub, &["write", "Деплой/Служба"], "# Служба\n".as_bytes()));
+    let o = e.run_in(&sub, &["read", "Деплой"], b"");
+    // папка без текста — не «нет такого пути»
+    assert_ne!(o.status.code(), Some(5), "{}", err(&o));
 
     // поиск из каталога решения находит, вне его — нет (решение не в области)
     let s = ok(&e.run_in(&sub, &["search", "квазар"], b""));
@@ -433,4 +455,62 @@ fn solution_toml_scopes_write_and_search() {
     std::fs::write(repo.join(".zeroaimemory").join("solution.toml"), "id = [").unwrap();
     let o = e.run_in(&sub, &["tree"], b"");
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+}
+
+/// Пачка (`POST /read`): заголовки элементов, `--max-tokens`, `--if-rev`, ошибка по элементу
+/// не обрывает остальные (код 5), `--json` и несовместимость с `--rev`.
+#[test]
+fn read_batch_flags() {
+    let e = Env::new("batch");
+    let text = "# A\nПервое. Второе.\n## B\nТекст B.\n";
+    ok(&e.run_stdin(&["write", "knowledge:b1"], text.as_bytes()));
+    ok(&e.run_stdin(&["write", "knowledge:b2"], "# Два\n".as_bytes()));
+    let s = ok(&e.run(&["read", "knowledge:b1", "knowledge:b2", "--batch"]));
+    assert!(s.contains("Knowledge/b1  rev1 · ~"), "{s}");
+    assert!(s.contains("Knowledge/b2  rev1 · ~"), "{s}");
+    assert!(s.contains("Текст B."), "{s}");
+    assert!(
+        s.trim_end().lines().last().unwrap().ends_with(" tok"),
+        "{s}"
+    );
+    // L1 и секция относятся ко всем целям
+    let s = ok(&e.run(&["read", "knowledge:b1", "--tier", "l1", "--batch"]));
+    assert!(s.contains("A — Первое."), "{s}");
+    // если ревизия не изменилась — без текста
+    let s = ok(&e.run(&["read", "knowledge:b1", "--if-rev", "1"]));
+    assert!(
+        s.contains("rev1 · unchanged") && !s.contains("Текст B."),
+        "{s}"
+    );
+    // обрезка по токенам
+    let s = ok(&e.run(&["read", "knowledge:b1", "--max-tokens", "3"]));
+    assert!(s.contains("…ещё "), "{s}");
+    // нет заметки: остальные читаются, код 5
+    let o = e.run(&["read", "knowledge:нет", "knowledge:b2", "--batch"]);
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("error: not_found") && out.contains("# Два"),
+        "{out}"
+    );
+    // json — ответ сервера
+    let v: serde_json::Value =
+        serde_json::from_str(&ok(&e.run(&["read", "knowledge:b2", "--batch", "--json"]))).unwrap();
+    assert_eq!(v["items"][0]["text"], "# Два\n");
+    // текст заметки, похожий на заголовок ошибки, кодом выхода не становится
+    ok(&e.run_stdin(
+        &["write", "knowledge:b3"],
+        "# Лог
+### x  error: y
+"
+        .as_bytes(),
+    ));
+    let s = ok(&e.run(&["read", "knowledge:b3", "--batch"]));
+    assert!(s.contains("### x  error: y"), "{s}");
+    // --if-rev — только с одной целью
+    let o = e.run(&["read", "knowledge:b1", "knowledge:b2", "--if-rev", "1"]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    // --rev с пачкой
+    let o = e.run(&["read", "knowledge:b1", "--batch", "--rev", "1"]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
 }

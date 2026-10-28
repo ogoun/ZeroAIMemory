@@ -374,11 +374,13 @@ const RECHUNK_BATCH: i64 = 200;
 /// токенов и ставит задания с `priority`. `only_changed` — как у
 /// [`crate::nodes::rechunk_notes`]: проиндексированная запись с неизменной нарезкой задания
 /// не получает. Пакетами в отдельных транзакциях. Возвращает число поставленных `upsert`.
+/// `progress` — счётчик обработанных записей (ход перенарезки), растёт после каждого пакета.
 pub(crate) async fn rechunk_entries(
     db: &Db,
     space: Option<Id>,
     priority: i64,
     only_changed: bool,
+    progress: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<u64, StoreError> {
     let mut upserts = 0u64;
     let mut after: Option<Id> = None;
@@ -418,6 +420,9 @@ pub(crate) async fn rechunk_entries(
             })
             .await?;
         upserts += u;
+        if let Some(p) = progress {
+            p.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         match last {
             Some(l) if n == RECHUNK_BATCH => after = Some(l),
             _ => break,

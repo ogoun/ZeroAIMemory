@@ -286,6 +286,23 @@ fn missing_and_ambiguous_sections() {
         Err(PatchError::SectionNotFound(_))
     ));
     assert_eq!(section_bytes(src, "H > A"), None);
+    // стенд Debian 13: хвост пути правка не принимает, но подсказывает полный путь
+    let src = "# Сборка\nx\n## Тесты\ny\n";
+    let e = apply_patch(src, &replace("Тесты", "t")).unwrap_err();
+    assert_eq!(
+        e,
+        PatchError::SectionNotFoundTail {
+            section: "Тесты".into(),
+            full: "Сборка > Тесты".into()
+        }
+    );
+    assert!(e.to_string().contains("«Сборка > Тесты»"), "{e}");
+    // неоднозначный хвост — без подсказки
+    let src = "# A\n## T\n# B\n## T\n";
+    assert!(matches!(
+        apply_patch(src, &replace("T", "t")),
+        Err(PatchError::SectionNotFound(_))
+    ));
     assert_eq!(
         PatchError::SectionNotFound("X".into()).to_string(),
         "секция не найдена: X"

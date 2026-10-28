@@ -1,9 +1,12 @@
-//! Аутентификация: bearer-токены, cookie-сессия администратора с CSRF, учёт прокси.
+//! Аутентификация: bearer-токены, cookie-сессии WebUI (администратор и пользователи, §11.4)
+//! с CSRF, учёт прокси.
 pub mod admin;
 pub mod rate;
+pub mod user;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
@@ -17,32 +20,33 @@ use crate::app::AppState;
 use crate::error::ApiError;
 use rate::{RateLimiter, retry_after_secs};
 
-/// Имя cookie веб-сессии администратора.
+/// Имя cookie веб-сессии WebUI (администратор и пользователи).
 pub const SESSION_COOKIE: &str = "zam_session";
 /// Заголовок CSRF для изменяющих запросов по cookie.
 pub const CSRF_HEADER: &str = "x-csrf-token";
 /// Заголовок выбора пользователя администратором.
 pub const USER_HEADER: &str = "x-zam-user";
 
-/// Состояние аутентификации процесса (лимиты, фиктивный хэш).
+/// Состояние аутентификации процесса (лимиты, фиктивные хэши).
 pub struct AuthState {
-    /// Каждая попытка входа администратора.
+    /// Каждая попытка входа в WebUI — администратора и пользователей (общий лимит, §11.5).
     pub login: RateLimiter,
     /// Только неудачные проверки токена.
     pub bad_token: RateLimiter,
-    /// Фиктивный хэш для неверного логина: с параметрами настоящего, вычисляется при старте.
-    pub(crate) dummy_hash: String,
+    /// Фиктивный хэш для неизвестного логина пользователя: с параметрами паролей пользователей
+    /// (`Argon2::default()`, [`crate::config::hash_password`]), вычисляется при старте.
+    pub(crate) user_dummy_hash: String,
     /// Предупреждение о недоверенном прокси уже выдано.
     proxy_warned: AtomicBool,
 }
 
 impl AuthState {
     /// Блокирующий вызов (argon2): выполнять в `spawn_blocking`.
-    pub fn new(admin_hash: &str) -> Result<AuthState, String> {
+    pub fn new() -> Result<AuthState, String> {
         Ok(AuthState {
             login: RateLimiter::default(),
             bad_token: RateLimiter::default(),
-            dummy_hash: admin::make_dummy_hash(admin_hash)?,
+            user_dummy_hash: user::make_user_dummy_hash()?,
             proxy_warned: AtomicBool::new(false),
         })
     }
@@ -58,7 +62,73 @@ impl std::fmt::Debug for AuthState {
 #[derive(Clone)]
 pub enum Principal {
     Token(AuthToken),
-    Admin { session_id: String },
+    Admin {
+        session_id: String,
+    },
+    /// Пользователь в WebUI (§11.4): доступ как у `rw`-токена этого пользователя, плюс свой
+    /// Human; пишет как человек (`author_kind = human`); `X-Zam-User` другого — 403,
+    /// администраторские маршруты — 403.
+    User {
+        session_id: String,
+        user_id: Id,
+    },
+}
+
+impl Principal {
+    /// Администратор (cookie-сессия из конфига): управляет сервисом, видит все базы.
+    pub fn is_admin(&self) -> bool {
+        matches!(self, Principal::Admin { .. })
+    }
+
+    /// Человек — сессия WebUI (администратор или пользователь); токен — всегда агент.
+    pub fn is_human(&self) -> bool {
+        !matches!(self, Principal::Token(_))
+    }
+
+    /// Id токена запроса (у сессий WebUI — нет).
+    pub fn token_id(&self) -> Option<Id> {
+        match self {
+            Principal::Token(t) => Some(t.token_id),
+            _ => None,
+        }
+    }
+
+    /// Пользователь, к которому привязан принципал: владелец токена или пользователь
+    /// сессии; у администратора — нет (он выбирает пользователя `X-Zam-User`).
+    pub fn bound_user(&self) -> Option<Id> {
+        match self {
+            Principal::Token(t) => Some(t.user_id),
+            Principal::User { user_id, .. } => Some(*user_id),
+            Principal::Admin { .. } => None,
+        }
+    }
+
+    /// Актор аудита: `admin`, `user` (сессия пользователя; кто — в `audit.user_id`) или id
+    /// токена.
+    pub fn actor(&self) -> String {
+        match self {
+            Principal::Token(t) => t.token_id.to_string(),
+            Principal::Admin { .. } => "admin".into(),
+            Principal::User { .. } => "user".into(),
+        }
+    }
+}
+
+/// Ячейка принципала запроса: слой, которому нужен принципал после обработчика (счётчик
+/// записей в память сессии, [`crate::api::sessions::count_memory_writes`]), кладёт её в
+/// расширения запроса, а извлечение [`Principal`] заполняет — без повторной проверки токена.
+#[derive(Clone, Default)]
+pub struct PrincipalSlot(Arc<Mutex<Option<Principal>>>);
+
+impl PrincipalSlot {
+    fn put(&self, p: &Principal) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
+    }
+
+    /// Принципал, если обработчик его извлёк.
+    pub fn take(&self) -> Option<Principal> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 /// Только администратор по cookie-сессии; токены — 403.
@@ -77,6 +147,14 @@ impl std::fmt::Debug for Principal {
             Principal::Admin { session_id } => f
                 .debug_struct("Admin")
                 .field("session_id", &mask_sid(session_id))
+                .finish(),
+            Principal::User {
+                session_id,
+                user_id,
+            } => f
+                .debug_struct("User")
+                .field("session_id", &mask_sid(session_id))
+                .field("user_id", user_id)
                 .finish(),
         }
     }
@@ -179,7 +257,7 @@ impl FromRequestParts<AppState> for Client {
 }
 
 /// Токен из `Authorization: Bearer …` (схема без учёта регистра).
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, rest) = v.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
@@ -227,30 +305,99 @@ async fn authenticate_token(st: &AppState, ip: IpAddr, token: &str) -> Result<Pr
 impl FromRequestParts<AppState> for Principal {
     type Rejection = ApiError;
 
+    /// Сессия пользователя с обязательной сменой пароля — 403 `password-change-required`
+    /// (до смены доступны только [`Session`]-маршруты: `/auth/me`, `/auth/logout`,
+    /// `/auth/password`).
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        let Ok(client) = Client::from_request_parts(parts, st).await;
-        if let Some(token) = bearer(&parts.headers) {
-            return authenticate_token(st, client.ip, token).await;
+        let a = authenticate(parts, st).await?;
+        if a.must_change_password {
+            return Err(ApiError::PasswordChangeRequired);
         }
-        let Some(sid) = cookie_value(&parts.headers, SESSION_COOKIE) else {
-            return Err(ApiError::Unauthorized);
-        };
-        let Some(ws) = st.system.get_web_session(&sid).await? else {
-            return Err(ApiError::Unauthorized);
-        };
-        if !matches!(parts.method, Method::GET | Method::HEAD) {
-            let sent = parts
-                .headers
-                .get(CSRF_HEADER)
-                .map(|v| v.as_bytes())
-                .unwrap_or_default();
-            if !ct_eq(sent, ws.csrf_token.as_bytes()) {
-                tracing::warn!(ip = %client.ip, "запрос администратора без верного CSRF-токена");
-                return Err(ApiError::Forbidden);
-            }
+        if let Some(slot) = parts.extensions.get::<PrincipalSlot>() {
+            slot.put(&a.principal);
         }
-        Ok(Principal::Admin { session_id: sid })
+        Ok(a.principal)
     }
+}
+
+/// Любая cookie-сессия WebUI (администратор или пользователь), в том числе с обязательной
+/// сменой пароля; токен — 403. Для `/auth/me`, `/auth/logout`, `/auth/password`.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub principal: Principal,
+    pub must_change_password: bool,
+}
+
+impl FromRequestParts<AppState> for Session {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
+        let a = authenticate(parts, st).await?;
+        if !a.principal.is_human() {
+            return Err(ApiError::Forbidden);
+        }
+        Ok(Session {
+            principal: a.principal,
+            must_change_password: a.must_change_password,
+        })
+    }
+}
+
+/// Итог аутентификации запроса.
+struct Authed {
+    principal: Principal,
+    /// Сессия пользователя, которому администратор задал пароль: до смены — только
+    /// [`Session`]-маршруты.
+    must_change_password: bool,
+}
+
+/// Принципал по bearer-токену или cookie-сессии (с CSRF на изменяющих запросах). Сессия
+/// пользователя проверяется на каждом запросе: отключённый пользователь или закрытый вход
+/// (пароль стёрт) — 401.
+async fn authenticate(parts: &mut Parts, st: &AppState) -> Result<Authed, ApiError> {
+    let Ok(client) = Client::from_request_parts(parts, st).await;
+    if let Some(token) = bearer(&parts.headers) {
+        return Ok(Authed {
+            principal: authenticate_token(st, client.ip, token).await?,
+            must_change_password: false,
+        });
+    }
+    let Some(sid) = cookie_value(&parts.headers, SESSION_COOKIE) else {
+        return Err(ApiError::Unauthorized);
+    };
+    let Some(ws) = st.system.get_web_session(&sid).await? else {
+        return Err(ApiError::Unauthorized);
+    };
+    if !matches!(parts.method, Method::GET | Method::HEAD) {
+        let sent = parts
+            .headers
+            .get(CSRF_HEADER)
+            .map(|v| v.as_bytes())
+            .unwrap_or_default();
+        if !ct_eq(sent, ws.csrf_token.as_bytes()) {
+            tracing::warn!(ip = %client.ip, "запрос по cookie-сессии без верного CSRF-токена");
+            return Err(ApiError::Forbidden);
+        }
+    }
+    let Some(user_id) = ws.user_id else {
+        return Ok(Authed {
+            principal: Principal::Admin { session_id: sid },
+            must_change_password: false,
+        });
+    };
+    let user = st.system.get_user(user_id).await?;
+    let Some(user) = user.filter(|u| u.disabled_at.is_none() && u.has_password) else {
+        // пользователь отключён или вход закрыт после создания сессии
+        st.system.delete_web_session(&sid).await?;
+        return Err(ApiError::Unauthorized);
+    };
+    Ok(Authed {
+        principal: Principal::User {
+            session_id: sid,
+            user_id,
+        },
+        must_change_password: user.must_change_password,
+    })
 }
 
 impl FromRequestParts<AppState> for AdminOnly {
@@ -259,30 +406,46 @@ impl FromRequestParts<AppState> for AdminOnly {
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
         match Principal::from_request_parts(parts, st).await? {
             Principal::Admin { session_id } => Ok(AdminOnly(session_id)),
-            Principal::Token(_) => Err(ApiError::Forbidden),
+            Principal::Token(_) | Principal::User { .. } => Err(ApiError::Forbidden),
         }
     }
 }
 
-/// Пользователь, от имени которого действует запрос: для токена — его владелец
-/// (`X-Zam-User` игнорируется); для администратора — `X-Zam-User` или он сам.
+/// Id пользователя, от имени которого действует запрос, без проверки, что он есть: для
+/// токена — его владелец (`X-Zam-User` игнорируется); для сессии пользователя — он сам
+/// (`X-Zam-User` другого пользователя — 403); для администратора — `X-Zam-User` или он сам.
+pub fn target_user_id(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<Id, ApiError> {
+    let header = || -> Result<Option<Id>, ApiError> {
+        headers
+            .get(USER_HEADER)
+            .map(|v| {
+                v.to_str()
+                    .ok()
+                    .and_then(|s| s.trim().parse::<Id>().ok())
+                    .ok_or_else(|| ApiError::BadRequest("некорректный X-Zam-User".into()))
+            })
+            .transpose()
+    };
+    Ok(match p {
+        Principal::Token(t) => t.user_id,
+        Principal::User { user_id, .. } => match header() {
+            Ok(None) => *user_id,
+            Ok(Some(u)) if u == *user_id => *user_id,
+            // чужой или нечитаемый X-Zam-User: сессия пользователя действует только за себя
+            _ => return Err(ApiError::Forbidden),
+        },
+        Principal::Admin { .. } => header()?.unwrap_or(st.admin_id),
+    })
+}
+
+/// Пользователь, от имени которого действует запрос ([`target_user_id`]).
 /// Несуществующий пользователь — 404 (база для него не создаётся).
 pub async fn target_user(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
 ) -> Result<User, ApiError> {
-    let id = match p {
-        Principal::Token(t) => t.user_id,
-        Principal::Admin { .. } => match headers.get(USER_HEADER) {
-            Some(v) => v
-                .to_str()
-                .ok()
-                .and_then(|s| s.trim().parse::<Id>().ok())
-                .ok_or_else(|| ApiError::BadRequest("некорректный X-Zam-User".into()))?,
-            None => st.admin_id,
-        },
-    };
+    let id = target_user_id(st, p, headers)?;
     st.system.get_user(id).await?.ok_or(ApiError::NotFound)
 }
 
