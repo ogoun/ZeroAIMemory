@@ -1355,8 +1355,13 @@ fn insight_found(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> 
         );
     }
     if !channels(hit).contains(&"vector") {
+        // состояние очереди — отличить сбой задания записи (failed) от гонки выдачи
+        let index = api(base, token, "/api/v1/index/status", None)
+            .map(|(_, st)| st.to_string())
+            .unwrap_or_else(|e| format!("недоступен: {e}"));
         bail!(
-            "insight найден без векторного канала (запись не векторизована?): sources = {}",
+            "insight найден без векторного канала (запись не векторизована?): sources = {}; \
+             /index/status = {index}",
             hit["sources"]
         );
     }

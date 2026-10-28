@@ -1065,7 +1065,11 @@ async fn migration_v7_to_v8_keeps_data() {
         .await
         .unwrap();
     }
-    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    let dbs = UserDbs::new(dd.users_dir());
+    let db = dbs.get(user).await.unwrap();
+    // фоновые задачи открытия (рёбра v10, перенарезка с секретами) заново ставят задание узла
+    // с not_before = своё «сейчас»: без ожидания claim_jobs с более ранним now его не видит
+    dbs.wait_rechunk(user).await;
     assert!(path.with_file_name(format!("{user}.db.bak-v7")).exists());
     let ver: u32 = db
         .read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
