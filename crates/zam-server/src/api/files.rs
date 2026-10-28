@@ -9,8 +9,9 @@
 //!   пропускаются с предупреждением `invalid_ref: <путь>`).
 //! - `POST /files/changed {solution, files: [{path, hash}]}` (до 500) → `{stale: N}`:
 //!   сообщение клиента `zam` об изменении файлов (тела файлов не передаются); ссылки решения на
-//!   эти пути становятся `stale` (хэш другой или ссылка без хэша записана раньше) или `ok`
-//!   (хэш совпал). `N` — сколько ссылок этих путей после этого `stale`.
+//!   эти пути становятся `stale` (хэш другой) или `ok` (хэш совпал); у ссылки без хэша
+//!   присланный хэш становится ориентиром (`ok`). `N` — сколько ссылок этих путей после
+//!   этого `stale`.
 //! - `POST /files/verified {solution, files: [{path, hash?}]}` → `{verified: N}`: «проверено,
 //!   знание актуально» — ссылки решения на пути снова `ok` с новым хэшем.
 //!
@@ -180,12 +181,19 @@ fn parse_files(
     Ok(out)
 }
 
-/// Базы, ссылки которых меняет сообщение: база владельца решения и, если это другой
-/// пользователь, личная база пользователя запроса (его Knowledge со ссылками на решение).
-async fn report_dbs(st: &AppState, sc: &MemScope) -> Result<Vec<Db>, ApiError> {
-    let mut dbs = vec![sc.db.clone()];
+/// Базы и пространства, ссылки которых меняет сообщение: в базе владельца решения — видимые
+/// запросу (участнику — только пространство решения), у участника — ещё его Knowledge.
+async fn report_dbs(
+    st: &AppState,
+    p: &Principal,
+    sc: &MemScope,
+) -> Result<Vec<(Db, Vec<Id>)>, ApiError> {
+    let spaces = graph_spaces(p, &sc.db, &sc.space, sc.role).await?;
+    let mut dbs = vec![(sc.db.clone(), spaces)];
     if sc.owner != sc.user.id {
-        dbs.push(st.users.get(sc.user.id).await?);
+        let own = st.users.get(sc.user.id).await?;
+        let k = space_of_kind(&own, SpaceKind::Knowledge).await?;
+        dbs.push((own, vec![k.id]));
     }
     Ok(dbs)
 }
@@ -217,8 +225,8 @@ pub async fn changed(
         .collect();
     let now = Timestamp::now();
     let mut stale = 0;
-    for db in report_dbs(&st, &sc).await? {
-        stale += files_changed(&db, guid.as_str(), &files, now).await?;
+    for (db, spaces) in report_dbs(&st, &p, &sc).await? {
+        stale += files_changed(&db, guid.as_str(), &spaces, &files, now).await?;
     }
     Ok(Json(json!({ "stale": stale })))
 }
@@ -235,8 +243,8 @@ pub async fn verified(
     let files = parse_files(&req.files, false)?;
     let now = Timestamp::now();
     let mut verified = 0;
-    for db in report_dbs(&st, &sc).await? {
-        verified += files_verified(&db, guid.as_str(), &files, now).await?;
+    for (db, spaces) in report_dbs(&st, &p, &sc).await? {
+        verified += files_verified(&db, guid.as_str(), &spaces, &files, now).await?;
     }
     Ok(Json(json!({ "verified": verified })))
 }

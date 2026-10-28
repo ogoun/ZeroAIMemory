@@ -84,7 +84,7 @@ async fn insight(w: &W, title: &str) -> Id {
     create_entry(
         &w.db,
         NewEntry {
-            refs: Vec::new(),
+            refs: None,
             space_id: w.knowledge,
             kind: EntryKind::Insight,
             title: title.into(),
@@ -488,7 +488,7 @@ async fn invalidate_on_entry_supersede_retract() {
         .await
         .unwrap();
     let mut new = NewEntry {
-        refs: Vec::new(),
+        refs: None,
         space_id: w.knowledge,
         kind: EntryKind::Insight,
         title: "A2".into(),

@@ -7,12 +7,14 @@
 //!   новые хэш, коммит, `recorded_at` и `ok`, прочие удаляются. До [`REFS_MAX`] ссылок.
 //! - **Путь** — относительно корня решения, `/`, лексически нормализован
 //!   ([`normalize_ref_path`]): абсолютный, выше корня, пустой, длиннее [`PATH_MAX_CHARS`]
-//!   символов, с управляющими символами — ошибка.
+//!   символов, с управляющими или невидимыми (bidi, нулевой ширины) символами, с сегментом
+//!   `C:` в любом месте — ошибка.
 //! - **Решение** ссылки — GUID пространства решения владельца, иначе `X-Zam-Solution` запроса
 //!   ([`crate::Attribution::solution`]), иначе NULL (ссылка справочная). У Human — всегда NULL.
 //! - **Устарелость** ([`files_changed`]): хэш сообщения ≠ записанного → `stale`
-//!   (`stale_reason = source_changed`), совпал → `ok`; хэша нет — `stale`, если сообщение
-//!   позже `recorded_at`. [`files_verified`] возвращает ссылки пути в `ok`.
+//!   (`stale_reason = source_changed`), совпал → `ok`; у ссылки без хэша первый присланный
+//!   хэш становится ориентиром, она остаётся `ok`. [`files_verified`] возвращает ссылки
+//!   пути в `ok`. Обе операции касаются только владельцев из переданных пространств.
 //! - Ссылки удалённых владельцев остаются (восстановление их возвращает), но в индекс,
 //!   фильтр поиска и граф не попадают; в индекс не попадают и замещённые/отозванные записи.
 use std::collections::{HashMap, HashSet};
@@ -109,7 +111,7 @@ pub enum PathError {
     Empty,
     #[error("путь длиннее {PATH_MAX_CHARS} символов")]
     TooLong,
-    #[error("управляющие символы в пути")]
+    #[error("управляющие или невидимые символы в пути")]
     Control,
     #[error("абсолютный путь: нужен путь относительно корня решения")]
     Absolute,
@@ -129,12 +131,11 @@ pub fn normalize_ref_path(p: &str) -> Result<String, PathError> {
     if p.chars().count() > PATH_MAX_CHARS {
         return Err(PathError::TooLong);
     }
-    if p.chars().any(char::is_control) {
+    if p.chars().any(|c| c.is_control() || is_invisible(c)) {
         return Err(PathError::Control);
     }
     let p = p.replace('\\', "/");
-    let b = p.as_bytes();
-    if p.starts_with('/') || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') {
+    if p.starts_with('/') {
         return Err(PathError::Absolute);
     }
     let mut out: Vec<&str> = Vec::new();
@@ -146,13 +147,42 @@ pub fn normalize_ref_path(p: &str) -> Result<String, PathError> {
                     return Err(PathError::AboveRoot);
                 }
             }
+            // `C:` в любом сегменте: после сворачивания `..` он стал бы началом пути
+            s if is_drive(s) => return Err(PathError::Absolute),
             s => out.push(s),
         }
     }
     if out.is_empty() {
         return Err(PathError::Empty);
     }
-    Ok(out.join("/"))
+    let norm = out.join("/");
+    if norm.starts_with('/') || is_drive(&norm) {
+        return Err(PathError::Absolute);
+    }
+    Ok(norm)
+}
+
+/// Сегмент начинается с буквы диска: `C:`, `c:x`.
+fn is_drive(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// Невидимые символы форматирования (Unicode `Cf`, `Zl`, `Zp`): bidi-управляющие и нулевой
+/// ширины — путь с ними выглядит как другой.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
 }
 
 /// Хэш содержимого: 64 шестнадцатеричных символа (регистр приводится к нижнему).
@@ -237,6 +267,22 @@ pub fn set_refs(
         ])?;
     }
     Ok(())
+}
+
+/// Ссылки владельца (путь, хэш, коммит) по алфавиту пути.
+pub(crate) fn owner_refs(tx: &Connection, owner: TargetRef) -> Result<Vec<FileRef>, StoreError> {
+    let mut st = tx.prepare_cached(
+        "SELECT path, content_hash, git_commit FROM file_refs
+         WHERE owner_kind = ?1 AND owner_id = ?2 ORDER BY path",
+    )?;
+    let rows = st.query_map(params![owner_kind(owner.kind), owner.id], |r| {
+        Ok(FileRef {
+            path: r.get(0)?,
+            hash: r.get(1)?,
+            commit: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// Дописывает ссылки без хэша на пути, которых у владельца ещё нет (до [`REFS_MAX`] всего).
@@ -431,36 +477,41 @@ pub(crate) fn sync_note(
     set_refs(tx, owner, solution.as_deref(), &set, now)
 }
 
-/// `verified_at` и `verified_at_commit` (до [`COMMIT_MAX_CHARS`] символов) из frontmatter.
+/// `verified_at` и `verified_at_commit` (sha по [`check_commit`], иначе нет) из frontmatter.
 fn verified_of(fm: Option<&zam_markdown::Frontmatter>) -> (Option<String>, Option<String>) {
     let Some(f) = fm else {
         return (None, None);
     };
-    let commit = f
-        .verified_at_commit
-        .clone()
-        .filter(|c| c.chars().count() <= COMMIT_MAX_CHARS);
+    let commit = f.verified_at_commit.as_deref().and_then(check_commit);
     (f.verified_at.clone(), commit)
 }
 
+/// Ссылки решения `?1` на путь `?2` у владельцев из пространств `?3` (JSON-массив), в том
+/// числе удалённых: участнику не видны ссылки базы владельца вне пространства решения.
+const REFS_IN_SPACES: &str = "SELECT f.id, f.content_hash, f.state FROM file_refs f
+     LEFT JOIN nodes n ON f.owner_kind = 'node' AND n.id = f.owner_id
+     LEFT JOIN entries e ON f.owner_kind = 'entry' AND e.id = f.owner_id
+     WHERE f.solution_guid = ?1 AND f.path = ?2
+       AND coalesce(n.space_id, e.space_id) IN (SELECT value FROM json_each(?3))";
+
 /// Сообщение об изменении файлов решения `solution` (`(путь, хэш)`, пути нормализованы
-/// вызывающим): обновляет состояние ссылок этих путей (см. модуль) и возвращает, сколько
-/// из них после этого `stale`.
+/// вызывающим) для ссылок владельцев из `spaces`: хэш другой — `stale`, совпал — `ok`;
+/// у ссылки без хэша присланный хэш становится ориентиром, ссылка остаётся `ok` (решение
+/// контроллера, раунд 1 задачи 7). Возвращает, сколько ссылок этих путей после этого `stale`.
 pub async fn files_changed(
     db: &Db,
     solution: &str,
+    spaces: &[Id],
     files: &[(String, String)],
     now: Timestamp,
 ) -> Result<u32, StoreError> {
     let solution = solution.to_string();
+    let spaces = ids_json(spaces);
     let files = files.to_vec();
     db.write(move |tx| {
         let now = fmt_ts(now);
         let mut stale = 0u32;
-        let mut sel = tx.prepare_cached(
-            "SELECT id, content_hash, recorded_at, state FROM file_refs
-             WHERE solution_guid = ?1 AND path = ?2",
-        )?;
+        let mut sel = tx.prepare_cached(REFS_IN_SPACES)?;
         let mut to_stale = tx.prepare_cached(
             "UPDATE file_refs SET state = 'stale', stale_reason = ?2,
                     stale_at = CASE WHEN state = 'stale' THEN stale_at ELSE ?3 END
@@ -470,29 +521,32 @@ pub async fn files_changed(
             "UPDATE file_refs SET state = 'ok', stale_at = NULL, stale_reason = NULL
              WHERE id = ?1",
         )?;
+        let mut adopt = tx.prepare_cached(
+            "UPDATE file_refs SET content_hash = ?2, state = 'ok', stale_at = NULL,
+                    stale_reason = NULL
+             WHERE id = ?1",
+        )?;
         for (path, hash) in &files {
-            let rows: Vec<(i64, Option<String>, String, RefState)> = sel
-                .query_map(params![solution, path], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            let rows: Vec<(i64, Option<String>, RefState)> = sel
+                .query_map(params![solution, path, spaces], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })?
                 .collect::<Result<_, _>>()?;
-            for (id, recorded, at, state) in rows {
-                let next = match recorded.as_deref() {
-                    Some(h) if h == hash => RefState::Ok,
-                    Some(_) => RefState::Stale,
-                    // без хэша: изменение после записи ссылки
-                    None if at.as_str() < now.as_str() => RefState::Stale,
-                    None => state,
-                };
-                match next {
-                    RefState::Stale => {
+            for (id, recorded, state) in rows {
+                match recorded.as_deref() {
+                    Some(h) if h == hash => {
+                        if state == RefState::Stale {
+                            to_ok.execute([id])?;
+                        }
+                    }
+                    Some(_) => {
                         to_stale.execute(params![id, SOURCE_CHANGED, now])?;
                         stale += 1;
                     }
-                    RefState::Ok if state == RefState::Stale => {
-                        to_ok.execute([id])?;
+                    // без хэша: первый присланный хэш — ориентир
+                    None => {
+                        adopt.execute(params![id, hash])?;
                     }
-                    RefState::Ok => {}
                 }
             }
         }
@@ -501,26 +555,35 @@ pub async fn files_changed(
     .await
 }
 
-/// «Проверено, знание актуально»: ссылки решения на эти пути — `ok`, `recorded_at` — сейчас,
-/// хэш — присланный (без него — NULL). Возвращает число обновлённых ссылок.
+/// «Проверено, знание актуально»: ссылки решения на эти пути у владельцев из `spaces` —
+/// `ok`, `recorded_at` — сейчас, хэш — присланный (без него — NULL: ориентиром станет хэш
+/// следующего сообщения). Возвращает число обновлённых ссылок.
 pub async fn files_verified(
     db: &Db,
     solution: &str,
+    spaces: &[Id],
     files: &[(String, Option<String>)],
     now: Timestamp,
 ) -> Result<u32, StoreError> {
     let solution = solution.to_string();
+    let spaces = ids_json(spaces);
     let files = files.to_vec();
     db.write(move |tx| {
         let now = fmt_ts(now);
+        let mut sel = tx.prepare_cached(REFS_IN_SPACES)?;
         let mut st = tx.prepare_cached(
             "UPDATE file_refs SET state = 'ok', stale_at = NULL, stale_reason = NULL,
-                    recorded_at = ?3, content_hash = ?4
-             WHERE solution_guid = ?1 AND path = ?2",
+                    recorded_at = ?2, content_hash = ?3
+             WHERE id = ?1",
         )?;
         let mut n = 0u32;
         for (path, hash) in &files {
-            n += st.execute(params![solution, path, now, hash])? as u32;
+            let ids: Vec<i64> = sel
+                .query_map(params![solution, path, spaces], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            for id in ids {
+                n += st.execute(params![id, now, hash])? as u32;
+            }
         }
         Ok(n)
     })
@@ -710,8 +773,8 @@ pub async fn stale_refs_of(
     .await
 }
 
-/// Дозаполняет после миграции 0016 `verified_at`, `verified_at_commit` и ссылки живых
-/// заметок из frontmatter текущей ревизии, затем ссылки changelog из `data.refs.files`
+/// Дозаполняет после миграции 0016 `verified_at`, `verified_at_commit` и ссылки заметок
+/// (и удалённых: восстановление их не пересчитывает) из frontmatter текущей ревизии, затем ссылки changelog из `data.refs.files`
 /// (без хэша; решение — пространство решения, у Knowledge — NULL). Пакетами по
 /// [`BACKFILL_BATCH`]; флаг `meta.refs_backfill` снимается в конце, прерванное
 /// дозаполнение повторится при следующем открытии (оно идемпотентно). Возвращает число
@@ -745,8 +808,7 @@ pub(crate) async fn backfill_refs(db: &Db) -> Result<u64, StoreError> {
                     .prepare_cached(
                         "SELECT n.id, r.content FROM nodes n
                          JOIN revisions r ON r.node_id = n.id AND r.rev = n.current_rev
-                         WHERE n.kind = 'note' AND n.deleted_at IS NULL
-                           AND (?1 IS NULL OR n.id > ?1)
+                         WHERE n.kind = 'note' AND (?1 IS NULL OR n.id > ?1)
                          ORDER BY n.id LIMIT ?2",
                     )?
                     .query_map(params![cursor, BACKFILL_BATCH], |r| {
@@ -843,6 +905,23 @@ mod tests {
         assert_eq!(err("C:\\x"), PathError::Absolute);
         assert_eq!(err("c:x"), PathError::Absolute);
         assert_eq!(err("\\\\server\\share\\f"), PathError::Absolute);
+        // буква диска после сворачивания `.` и `..` — тоже абсолютный
+        assert_eq!(err("./C:/x"), PathError::Absolute);
+        assert_eq!(err("a/../C:/x"), PathError::Absolute);
+        assert_eq!(err("a/../c:x"), PathError::Absolute);
+        assert_eq!(err("a\\..\\D:\\x"), PathError::Absolute);
+        assert_eq!(err("src/c:x"), PathError::Absolute);
+        // bidi и нулевой ширины
+        for c in [
+            '\u{202E}', '\u{200B}', '\u{200F}', '\u{2066}', '\u{FEFF}', '\u{2028}', '\u{2029}',
+        ] {
+            assert_eq!(
+                err(&format!("a{c}b.rs")),
+                PathError::Control,
+                "{:04X}",
+                c as u32
+            );
+        }
         assert_eq!(err("../x"), PathError::AboveRoot);
         assert_eq!(err("a/../../x"), PathError::AboveRoot);
         assert_eq!(err(""), PathError::Empty);

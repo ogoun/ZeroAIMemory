@@ -883,7 +883,7 @@ async fn entry_leaves_and_term_hits() {
     let (e, _) = zam_store::create_entry(
         &db,
         zam_store::NewEntry {
-            refs: Vec::new(),
+            refs: None,
             space_id: k,
             kind: zam_store::EntryKind::Insight,
             title: "Две части".into(),

@@ -111,7 +111,7 @@ async fn base_rechunked_once_when_chunker_changes() {
     let (entry, _) = create_entry(
         &db,
         NewEntry {
-            refs: Vec::new(),
+            refs: None,
             space_id: k,
             kind: EntryKind::Insight,
             title: "Пакеты переноса проверяются".into(),

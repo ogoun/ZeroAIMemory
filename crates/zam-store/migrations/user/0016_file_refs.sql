@@ -4,8 +4,8 @@
 -- решения, лексически нормализован (`zam_store::file_refs::normalize_ref_path`).
 -- `solution_guid` — решение ссылки (пространство решения владельца или `X-Zam-Solution`);
 -- NULL — ссылка только справочная, устарелость не отслеживается. `content_hash` — blake3
--- содержимого файла (64 hex) при записи, NULL — хэша нет (MCP-клиент): тогда ссылка
--- устаревает по любому сообщению об изменении после `recorded_at`.
+-- содержимого файла (64 hex) при записи, NULL — хэша нет (MCP-клиент): тогда первый хэш
+-- сообщения об изменении становится ориентиром.
 CREATE TABLE file_refs (
   id INTEGER PRIMARY KEY,
   owner_kind TEXT NOT NULL CHECK (owner_kind IN ('node','entry')),
@@ -25,6 +25,6 @@ CREATE INDEX file_refs_path ON file_refs(solution_guid, path);
 -- проверенные команды (§7): `verified_at:` (YYYY-MM-DD) и `verified_at_commit:` текущей ревизии
 ALTER TABLE nodes ADD COLUMN verified_at TEXT;
 ALTER TABLE nodes ADD COLUMN verified_at_commit TEXT;
--- дозаполнение из frontmatter живых заметок и `data.refs.files` changelog — в Rust при открытии
+-- дозаполнение из frontmatter заметок и `data.refs.files` changelog — в Rust при открытии
 -- базы (разбор Markdown SQL не посчитает)
 INSERT INTO meta (key, value) VALUES ('refs_backfill', 'pending');

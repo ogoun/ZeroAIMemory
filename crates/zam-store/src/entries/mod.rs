@@ -257,8 +257,9 @@ pub struct NewEntry {
     /// `BadInput`). Область видимости цели проверяет сервер.
     pub links: Vec<(crate::graph::EdgeType, zam_core::TargetRef)>,
     /// Ссылки на файлы (поле запроса `refs`, M4.5 §6.1), до 64; у changelog к ним добавляются
-    /// строки `data.refs.files` без хэша. Пишутся в той же транзакции.
-    pub refs: Vec<crate::file_refs::FileRef>,
+    /// строки `data.refs.files` без хэша. Пишутся в той же транзакции. `None` при замещении —
+    /// набор замещаемой записи.
+    pub refs: Option<Vec<crate::file_refs::FileRef>>,
 }
 
 /// Запись журнала.

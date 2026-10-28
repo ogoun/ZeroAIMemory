@@ -314,7 +314,7 @@ pub async fn create(
         ));
     }
     check_title(&req.title)?;
-    let refs = super::files::refs_field(req.refs.as_ref())?.unwrap_or_default();
+    let refs = super::files::refs_field(req.refs.as_ref())?;
     let mut data = check_data(req.kind, &req.data)?;
     check_size(&st, &req.body)?;
     let attrib = attribution(&p, &headers, req.message)?;

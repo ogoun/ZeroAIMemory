@@ -463,7 +463,7 @@ async fn open_question_only_with_explicit_kinds() {
     let (q, _) = zam_store::create_entry(
         &db,
         zam_store::NewEntry {
-            refs: Vec::new(),
+            refs: None,
             space_id: kn,
             kind: zam_store::EntryKind::Question,
             title: "Кэшевание выжимок".into(),

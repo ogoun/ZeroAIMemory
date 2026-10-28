@@ -132,6 +132,11 @@ async fn file_refs_path_normalization() {
         "C:\\x",
         "c:/x",
         "\\\\server\\share\\f",
+        "./C:/x",
+        "a/../C:/x",
+        "a/../c:x",
+        "a\u{202E}b.rs",
+        "a\u{200B}b.rs",
         "",
         "   ",
         "./",
@@ -291,24 +296,30 @@ async fn note_frontmatter_refs_and_verified_at() {
             &a.token,
             Method::PUT,
             &format!("/api/v1/nodes/{nid}"),
-            Some(json!({"content": "---\nverified_at: вчера\n---\n# Сборка\n"})),
+            Some(json!({"content":
+                "---\nverified_at: вчера\nverified_at_commit: не-sha\n---\n# Сборка\n"})),
             &[("if-match", &n["current_rev"].to_string())],
         )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.text().contains("verified_at_invalid"), "{}", r.text());
+    assert!(
+        r.text().contains("verified_at_commit_invalid"),
+        "{}",
+        r.text()
+    );
     assert!(path_of(&index(&a).await, "src/a.rs").is_null());
-    let at: Option<String> = db
+    let (at, commit): (Option<String>, Option<String>) = db
         .read(move |c| {
-            Ok(
-                c.query_row("SELECT verified_at FROM nodes WHERE id = ?1", [nid], |r| {
-                    r.get(0)
-                })?,
-            )
+            Ok(c.query_row(
+                "SELECT verified_at, verified_at_commit FROM nodes WHERE id = ?1",
+                [nid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
         })
         .await
         .unwrap();
-    assert_eq!(at, None);
+    assert_eq!((at, commit), (None, None));
 }
 
 #[tokio::test]
@@ -373,30 +384,49 @@ async fn files_changed_same_hash_ok() {
     assert_eq!(state(&index(&a).await, "src/pool.rs", &rf), "ok");
 }
 
+/// Ссылка без хэша (MCP): первое сообщение даёт ориентир и оставляет `ok`, следующее с другим
+/// хэшем — `stale` (решение контроллера, раунд 1 задачи 7; прежнее правило «сообщение позже
+/// `recorded_at` → `stale`» отменено).
 #[tokio::test]
-async fn ref_without_hash_stale_on_change_after_record() {
+async fn ref_without_hash_adopts_first_hash_then_stale() {
     let a = setup("refs-nohash").await;
     let i = insight(&a, "Без хэша", json!({"files": [{"path": "src/x.rs"}]})).await;
-    let r = changed(&a, json!([{"path": "src/x.rs", "hash": h('9')}])).await;
-    assert_eq!(r.json()["stale"], 1, "{}", r.text());
-    assert_eq!(
-        state(&index(&a).await, "src/x.rs", &format!("i:{i}")),
-        "stale"
-    );
-    // сообщение не позже записи ссылки устарелости не даёт
-    let db = a.st.users.get(a.st.admin_id).await.unwrap();
-    db.write(|tx| {
-        tx.execute(
-            "UPDATE file_refs SET state = 'ok', stale_at = NULL, stale_reason = NULL,
-                    recorded_at = '2999-01-01T00:00:00.000000Z'",
-            [],
-        )?;
-        Ok(())
-    })
-    .await
-    .unwrap();
+    let rf = format!("i:{i}");
     let r = changed(&a, json!([{"path": "src/x.rs", "hash": h('9')}])).await;
     assert_eq!(r.json()["stale"], 0, "{}", r.text());
+    let idx = index(&a).await;
+    assert_eq!(state(&idx, "src/x.rs", &rf), "ok");
+    assert_eq!(path_of(&idx, "src/x.rs")["hash"], h('9'));
+    // тот же хэш — ok, другой — stale
+    assert_eq!(
+        changed(&a, json!([{"path": "src/x.rs", "hash": h('9')}]))
+            .await
+            .json()["stale"],
+        0
+    );
+    assert_eq!(
+        changed(&a, json!([{"path": "src/x.rs", "hash": h('8')}]))
+            .await
+            .json()["stale"],
+        1
+    );
+    assert_eq!(state(&index(&a).await, "src/x.rs", &rf), "stale");
+    // verified без хэша снимает ориентир: следующий хэш снова принимается
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/files/verified",
+            Some(json!({"solution": G, "files": [{"path": "src/x.rs"}]})),
+        )
+        .await;
+    assert_eq!(r.json()["verified"], 1, "{}", r.text());
+    assert_eq!(
+        changed(&a, json!([{"path": "src/x.rs", "hash": h('7')}]))
+            .await
+            .json()["stale"],
+        0
+    );
+    assert_eq!(state(&index(&a).await, "src/x.rs", &rf), "ok");
 }
 
 #[tokio::test]
@@ -429,7 +459,10 @@ async fn rewrite_with_new_hash_resets_ok() {
         .note(G, "Пул", "---\nrefs: [src/pool.rs]\n---\nтекст\n")
         .await;
     let nf = format!("n:{}", id(&n));
+    // у ссылки заметки хэша нет: первое сообщение — ориентир, второе с другим хэшем — stale
     changed(&a, json!([{"path": "src/pool.rs", "hash": h('3')}])).await;
+    assert_eq!(state(&index(&a).await, "src/pool.rs", &nf), "ok");
+    changed(&a, json!([{"path": "src/pool.rs", "hash": h('4')}])).await;
     assert_eq!(state(&index(&a).await, "src/pool.rs", &nf), "stale");
     let r = a
         .tok_h(
@@ -889,4 +922,199 @@ async fn refs_backfill_on_open() {
         .unwrap();
     assert_eq!(at.as_deref(), Some("2026-10-01"));
     assert!(!flag, "флаг дозаполнения снят");
+}
+
+/// Замещение без `refs` наследует ссылки замещаемой записи, с `refs` — берёт переданный набор.
+#[tokio::test]
+async fn supersede_inherits_refs() {
+    let a = setup("refs-supersede").await;
+    let old = insight(
+        &a,
+        "Пул v1",
+        json!({"files": [{"path": "src/pool.rs", "hash": h('1')}]}),
+    )
+    .await;
+    let supersede = |id: String, body: Value| {
+        let a = &a;
+        async move {
+            let r = a
+                .t(
+                    Method::POST,
+                    &format!("/api/v1/entries/{id}/supersede"),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+            id_of_entry(&r.json())
+        }
+    };
+    let v2 = supersede(
+        old.clone(),
+        json!({"title": "Пул v2", "body": "уточнено", "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let idx = index(&a).await;
+    let items = path_of(&idx, "src/pool.rs")["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(items.len(), 1, "замещённая в индекс не входит: {idx}");
+    assert_eq!(items[0]["id"], format!("i:{v2}"));
+    assert_eq!(
+        path_of(&idx, "src/pool.rs")["hash"],
+        h('1'),
+        "хэш унаследован"
+    );
+    let v3 = supersede(
+        v2,
+        json!({"title": "Пул v3", "body": "иначе", "data": {"kind": "gotcha"},
+                "refs": {"files": [{"path": "src/conn.rs"}]}}),
+    )
+    .await;
+    let idx = index(&a).await;
+    assert!(path_of(&idx, "src/pool.rs").is_null(), "{idx}");
+    assert_eq!(state(&idx, "src/conn.rs", &format!("i:{v3}")), "ok");
+}
+
+fn id_of_entry(v: &Value) -> String {
+    id(&v["entry"])
+}
+
+/// Участник общего решения: сообщения о файлах и индекс не касаются Knowledge владельца, даже
+/// если её ссылки записаны с `X-Zam-Solution` этого решения; поиск с `filters.file` её не отдаёт.
+#[tokio::test]
+async fn participant_does_not_touch_owner_knowledge_refs() {
+    let a = api("refs-isolation", |_| {}).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    for (tok, code) in [
+        (&a_tok, StatusCode::CREATED),
+        (&b_tok, StatusCode::ACCEPTED),
+    ] {
+        let r = a
+            .tok(
+                tok,
+                Method::POST,
+                "/api/v1/solutions",
+                Some(json!({"agent_solution_id": G, "name": "Общее"})),
+            )
+            .await;
+        assert_eq!(r.status, code, "{}", r.text());
+    }
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            Some(json!({"access": "rw"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let body = |title: &str| {
+        json!({"kind": "insight", "title": title, "body": format!("{title}: пул соединений"),
+               "data": {"kind": "gotcha"}, "force": true,
+               "refs": {"files": [{"path": "src/pool.rs", "hash": h('1')}]}})
+    };
+    // Knowledge владельца со ссылкой на решение G и запись в самом решении
+    let r = a
+        .tok_h(
+            &a_tok,
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(body("Личное о пуле")),
+            &[("x-zam-solution", G)],
+        )
+        .await;
+    let kn = id(&created(r).await);
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &sol_entries(),
+            Some(body("Общее о пуле")),
+        )
+        .await;
+    let sol = id(&created(r).await);
+    let report = |tok: &str, uri: &'static str, hash: char| {
+        let (a, tok) = (&a, tok.to_string());
+        async move {
+            let r = a
+                .tok(
+                    &tok,
+                    Method::POST,
+                    uri,
+                    Some(
+                        json!({"solution": G, "files": [{"path": "src/pool.rs", "hash": h(hash)}]}),
+                    ),
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            r.json()
+        }
+    };
+    // владелец видит обе ссылки: обе устаревают
+    assert_eq!(
+        report(&a_tok, "/api/v1/files/changed", '2').await["stale"],
+        2
+    );
+    // участник подтверждает — только ссылку решения
+    assert_eq!(
+        report(&b_tok, "/api/v1/files/verified", '2').await["verified"],
+        1
+    );
+    let owner_idx = a
+        .tok(
+            &a_tok,
+            Method::GET,
+            &format!("/api/v1/file-refs?solution={G}"),
+            None,
+        )
+        .await
+        .json();
+    assert_eq!(
+        state(&owner_idx, "src/pool.rs", &format!("i:{kn}")),
+        "stale"
+    );
+    assert_eq!(state(&owner_idx, "src/pool.rs", &format!("i:{sol}")), "ok");
+    // участник сообщает изменение: Knowledge владельца не считается и не трогается
+    assert_eq!(
+        report(&b_tok, "/api/v1/files/changed", '3').await["stale"],
+        1
+    );
+    // индекс участника — без Knowledge владельца
+    let b_idx = a
+        .tok(
+            &b_tok,
+            Method::GET,
+            &format!("/api/v1/file-refs?solution={G}"),
+            None,
+        )
+        .await
+        .json();
+    let ids: Vec<&str> = path_of(&b_idx, "src/pool.rs")["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [format!("i:{sol}")], "{b_idx}");
+    // поиск участника с filters.file — тоже
+    let r = a
+        .tok(
+            &b_tok,
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "пул", "scope": {"solution": G},
+                        "filters": {"file": "src/pool.rs"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let found: Vec<String> = r.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["entry_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(found.contains(&sol), "{found:?}");
+    assert!(!found.contains(&kn), "{found:?}");
 }

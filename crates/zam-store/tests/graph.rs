@@ -146,7 +146,7 @@ async fn rev(db: &Db, id: Id) -> i64 {
 
 fn insight(space: Id, title: &str, certainty: Option<Certainty>) -> NewEntry {
     NewEntry {
-        refs: Vec::new(),
+        refs: None,
         space_id: space,
         kind: EntryKind::Insight,
         title: title.into(),

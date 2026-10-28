@@ -95,7 +95,7 @@ async fn interrupted_rechunk_retried_and_entries_rechunked() {
     create_entry(
         &db,
         NewEntry {
-            refs: Vec::new(),
+            refs: None,
             space_id: k,
             kind: EntryKind::Insight,
             title: "Пакеты".into(),

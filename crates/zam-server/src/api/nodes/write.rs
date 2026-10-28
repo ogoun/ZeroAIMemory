@@ -9,8 +9,9 @@
 //! заметки псевдоним термина словаря вместо имени (M4.5 §2.2, до 5); `secrets_detected` (+
 //! `secrets_detected: [{kind, line}]`) — в тексте найдены секреты, в индекс они уходят
 //! замаскированными (§7.6, [`crate::api::secrets`]); `verified_at_invalid` — `verified_at:`
-//! не дата `YYYY-MM-DD`; `invalid_ref: <путь> (<причина>)` — путь `refs:` не стал ссылкой на
-//! файл; `refs_truncated` — ссылок больше 64 (M4.5 §6.1, §7).
+//! не дата `YYYY-MM-DD`; `verified_at_commit_invalid` — `verified_at_commit:` не sha коммита
+//! (4–64 hex); `invalid_ref: <путь> (<причина>)` — путь `refs:` не стал ссылкой на файл;
+//! `refs_truncated` — ссылок больше 64 (M4.5 §6.1, §7).
 //!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
@@ -57,6 +58,9 @@ pub struct Create {
 /// Предупреждение: ключ `certainty`/`evidence` во frontmatter написан так, что не распознан.
 pub const CERTAINTY_NOT_RECOGNIZED: &str = "certainty_not_recognized";
 
+/// Предупреждение: `verified_at_commit:` во frontmatter — не sha коммита (4–64 hex).
+pub const VERIFIED_AT_COMMIT_INVALID: &str = "verified_at_commit_invalid";
+
 /// Предупреждения записи заметки по её тексту.
 fn note_warnings(content: &str) -> Vec<String> {
     let doc = zam_markdown::parse(content);
@@ -67,6 +71,12 @@ fn note_warnings(content: &str) -> Vec<String> {
         }
         // `verified_at_invalid` и ссылки на файлы, которые не стали ссылками (M4.5 §6.1, §7)
         out.extend(f.warnings.iter().cloned());
+        if f.verified_at_commit
+            .as_deref()
+            .is_some_and(|c| zam_store::check_commit(c).is_none())
+        {
+            out.push(VERIFIED_AT_COMMIT_INVALID.to_string());
+        }
         let mut valid = 0;
         for r in &f.refs {
             match zam_store::normalize_ref_path(r) {

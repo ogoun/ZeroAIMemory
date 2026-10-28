@@ -678,7 +678,7 @@ fn new_entry(
     triggers: Vec<NewTrigger>,
     links: Vec<(EdgeType, TargetRef)>,
 ) -> Result<NewEntry, ApiError> {
-    let refs = super::files::refs_field(req.refs.as_ref())?.unwrap_or_default();
+    let refs = super::files::refs_field(req.refs.as_ref())?;
     Ok(NewEntry {
         refs,
         space_id: space,

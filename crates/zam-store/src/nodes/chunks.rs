@@ -349,8 +349,12 @@ pub(crate) fn note_meta(content: &str, agent_l0: Option<&str>) -> NoteMeta {
         if let Some(v) = &f.verified_at {
             m.insert("verified_at".into(), v.clone().into());
         }
-        if let Some(c) = &f.verified_at_commit {
-            m.insert("verified_at_commit".into(), c.clone().into());
+        if let Some(c) = f
+            .verified_at_commit
+            .as_deref()
+            .and_then(crate::check_commit)
+        {
+            m.insert("verified_at_commit".into(), c.into());
         }
         serde_json::Value::Object(m)
     });

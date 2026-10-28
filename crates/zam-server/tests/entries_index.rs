@@ -32,7 +32,7 @@ fn agent() -> Attribution {
 
 fn insight(space: Id, title: &str, body: &str) -> NewEntry {
     NewEntry {
-        refs: Vec::new(),
+        refs: None,
         space_id: space,
         kind: EntryKind::Insight,
         title: title.into(),
@@ -253,7 +253,7 @@ async fn search_returns_entry_items_with_kind_status() {
     let (ch, _) = create_entry(
         &db,
         NewEntry {
-            refs: Vec::new(),
+            refs: None,
             space_id: k,
             kind: EntryKind::Changelog,
             title: "Converted deploy scripts to LF".into(),

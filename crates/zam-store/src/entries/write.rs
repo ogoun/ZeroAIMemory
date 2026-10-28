@@ -320,7 +320,7 @@ pub(crate) fn insert_entry(
     }
     let triggers = check_triggers(e.triggers)?;
     let links = e.links;
-    let refs = e.refs;
+    let refs = e.refs.unwrap_or_default();
     let f = Fields {
         title: check_title(&e.title)?,
         body: e.body,
@@ -852,7 +852,7 @@ pub async fn supersede_entry(
     db: &Db,
     old: Id,
     if_rev: Option<i64>,
-    new: NewEntry,
+    mut new: NewEntry,
     a: &Attribution,
 ) -> Result<(Entry, Entry), StoreError> {
     let a = a.clone();
@@ -888,6 +888,10 @@ pub async fn supersede_entry(
             )));
         }
         let now = fmt_ts(Timestamp::now());
+        // без `refs` новая запись наследует ссылки на файлы замещаемой (M4.5 §6.1)
+        if new.refs.is_none() {
+            new.refs = Some(crate::file_refs::owner_refs(tx, entry_ref(old))?);
+        }
         let nid = insert_entry(tx, new, key, &a, Some(old), &now)?;
         // системная связь графа: новая → старая (§8.5)
         crate::graph::insert_supersedes(tx, nid, old, o.space_id, Some(&a), &now)?;

@@ -169,7 +169,7 @@ fn agent() -> Attribution {
 
 fn new_entry(space: Id, kind: EntryKind, title: String, data: serde_json::Value) -> NewEntry {
     NewEntry {
-        refs: Vec::new(),
+        refs: None,
         space_id: space,
         kind,
         title,
@@ -326,12 +326,14 @@ async fn fill_m4(db: &Db) -> Id {
     }
     // замещения: системные рёбра `supersedes`, самоссылки `supersedes_id`/`superseded_by_id`
     for old in insights.iter().skip(40).take(5) {
-        let e = new_entry(
+        let mut e = new_entry(
             knowledge,
             EntryKind::Insight,
             format!("Замена {old}"),
             json!({"kind": "gotcha"}),
         );
+        // база v14: таблицы `file_refs` ещё нет — ссылки не наследуются (пустой набор явно)
+        e.refs = Some(Vec::new());
         supersede_entry(db, *old, None, e, &a).await.unwrap();
     }
     // мягко удалённая запись (частичные индексы `deleted_at IS NULL`)

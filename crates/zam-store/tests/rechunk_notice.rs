@@ -77,7 +77,7 @@ async fn seeded(name: &str) -> (DataDir, Id, Db) {
     create_entry(
         &db,
         NewEntry {
-            refs: Vec::new(),
+            refs: None,
             space_id: k,
             kind: EntryKind::Insight,
             title: "Запись журнала".into(),
