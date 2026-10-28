@@ -96,6 +96,15 @@ pub fn apply(
 fn apply_rebuild(conn: &mut Connection, m: &Migration) -> Result<(), StoreError> {
     let fk_was_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
     conn.pragma_update(None, "foreign_keys", false)?;
+    // внутри открытой транзакции PRAGMA молча не действует: без проверки пересборка шла бы
+    // с включёнными внешними ключами и падала бы на DROP или теряла бы дочерние строки
+    let still_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    if still_on {
+        return Err(StoreError::InvalidMigrations(format!(
+            "миграция {}: нельзя выключить foreign_keys: открыта транзакция",
+            m.version
+        )));
+    }
     let res = rebuild_tx(conn, m);
     let restore = conn.pragma_update(None, "foreign_keys", fk_was_on);
     res?;
@@ -131,4 +140,40 @@ fn rebuild_tx(conn: &mut Connection, m: &Migration) -> Result<(), StoreError> {
     tx.pragma_update(None, "user_version", m.version)?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Пересборка при открытой транзакции отклоняется до выполнения SQL миграции.
+    #[test]
+    fn rebuild_rejected_inside_transaction() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.pragma_update(None, "foreign_keys", true).unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        let m = Migration {
+            version: 1,
+            sql: "CREATE TABLE t (id INTEGER)",
+            rebuild: true,
+        };
+        match apply_rebuild(&mut c, &m) {
+            Err(StoreError::InvalidMigrations(msg)) => {
+                assert!(
+                    msg.contains("нельзя выключить foreign_keys: открыта транзакция"),
+                    "{msg}"
+                );
+            }
+            other => panic!("ожидалась InvalidMigrations: {other:?}"),
+        }
+        // SQL миграции не выполнялся
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
 }

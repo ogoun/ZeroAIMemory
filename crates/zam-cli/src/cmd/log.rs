@@ -3,6 +3,12 @@
 //!
 //! `--ref`: `commit:SHA`, `file:PATH`, `note:ID`, `issue:X` → `data.refs`. Текст — из
 //! `--body-file` или stdin (если stdin не терминал). Успех → `<id>@<rev>`.
+//!
+//! `zam log term --title T --definition D [--alias A]… [--code C]… [--not-to-confuse N]…
+//! [--area A] [--solution GUID] [--key K] [--body-file F | stdin]` — термин словаря
+//! (M4.5 §2): имя, определение (до 300 символов), псевдонимы, идентификаторы кода, «не путать
+//! с», подробности — в теле. Занятое имя или псевдоним — 409 `term-conflict`: список
+//! пересечений в stderr, код 4.
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 
@@ -10,6 +16,18 @@ use serde_json::{Map, Value, json};
 
 use super::{Ctx, post_entry, solution_guid};
 use crate::client::CliError;
+
+pub struct Term<'a> {
+    pub title: &'a str,
+    pub definition: &'a str,
+    pub aliases: &'a [String],
+    pub code: &'a [String],
+    pub not_to_confuse: &'a [String],
+    pub body_file: Option<&'a Path>,
+    pub area: Option<&'a str>,
+    pub solution: Option<&'a str>,
+    pub key: Option<&'a str>,
+}
 
 pub struct Changelog<'a> {
     pub kind: &'a str,
@@ -93,9 +111,110 @@ pub fn changelog(ctx: &Ctx, o: &Changelog) -> Result<(), CliError> {
     post_entry(ctx, &guid, &req, o.key, o.area)
 }
 
+/// Тело запроса термина (`POST /spaces/{guid}/entries`, `kind: term`).
+pub fn term_body(o: &Term, body: &str) -> Value {
+    json!({
+        "kind": "term",
+        "title": o.title,
+        "body": body,
+        "data": {
+            "definition": o.definition,
+            "aliases": o.aliases,
+            "code": o.code,
+            "not_to_confuse": o.not_to_confuse,
+        },
+    })
+}
+
+/// 409 `term-conflict` → пересечения построчно, код 4; прочие ошибки — как есть.
+fn explain_term_conflict(e: CliError) -> CliError {
+    let Some(p) = e
+        .problem
+        .as_ref()
+        .filter(|p| p["type"] == "/problems/term-conflict")
+    else {
+        return e;
+    };
+    let mut msg = String::from("имя или псевдоним уже занят действующим термином:\n");
+    for c in p["conflicts"].as_array().into_iter().flatten() {
+        msg.push_str(&format!(
+            "  «{}» — термин «{}» ({})\n",
+            c["matched"].as_str().unwrap_or(""),
+            c["title"].as_str().unwrap_or(""),
+            c["id"].as_str().unwrap_or("?"),
+        ));
+    }
+    msg.push_str(
+        "что дальше: выберите другое имя или псевдоним либо замените существующий термин \
+         (zam glossary <имя> покажет карточку)",
+    );
+    CliError {
+        code: crate::client::EXIT_CONFLICT,
+        msg,
+        problem: e.problem,
+    }
+}
+
+/// `zam log term`.
+pub fn term(ctx: &Ctx, o: &Term) -> Result<(), CliError> {
+    let guid = solution_guid(ctx, o.solution)?;
+    let body = read_text(o.body_file)?;
+    let req = term_body(o, &body);
+    post_entry(ctx, &guid, &req, o.key, o.area).map_err(explain_term_conflict)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn term_request_body() {
+        let aliases = vec!["summary".to_string()];
+        let o = Term {
+            title: "Выжимка",
+            definition: "Короткая сводка записи",
+            aliases: &aliases,
+            code: &[],
+            not_to_confuse: &[],
+            body_file: None,
+            area: None,
+            solution: None,
+            key: None,
+        };
+        let b = term_body(&o, "подробности");
+        assert_eq!(b["kind"], "term");
+        assert_eq!(b["title"], "Выжимка");
+        assert_eq!(b["body"], "подробности");
+        assert_eq!(b["data"]["definition"], "Короткая сводка записи");
+        assert_eq!(b["data"]["aliases"], json!(["summary"]));
+        assert_eq!(b["data"]["code"], json!([]));
+    }
+
+    #[test]
+    fn term_conflict_explained() {
+        let e = CliError {
+            code: 4,
+            msg: "x".into(),
+            problem: Some(json!({
+                "type": "/problems/term-conflict",
+                "conflicts": [{"id": "i1", "title": "Выжимка", "matched": "summary"}],
+            })),
+        };
+        let r = explain_term_conflict(e);
+        assert_eq!(r.code, crate::client::EXIT_CONFLICT);
+        assert!(
+            r.msg.contains("«summary» — термин «Выжимка» (i1)"),
+            "{}",
+            r.msg
+        );
+        // чужая ошибка не меняется
+        let other = CliError {
+            code: 4,
+            msg: "иное".into(),
+            problem: None,
+        };
+        assert_eq!(explain_term_conflict(other).msg, "иное");
+    }
 
     #[test]
     fn refs_grouped() {

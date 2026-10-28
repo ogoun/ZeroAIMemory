@@ -6,6 +6,7 @@ pub mod cache;
 pub mod downloads;
 pub mod entries;
 pub mod feedback;
+pub mod glossary;
 pub mod graph;
 pub mod health;
 pub mod index;
@@ -114,6 +115,7 @@ fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
                 .delete(entries::remove)
                 .layer(note_limit),
         )
+        .route("/api/v1/spaces/{space}/glossary", get(glossary::get))
         .route("/api/v1/entries/{id}/restore", post(entries::restore))
         .route(
             "/api/v1/entries/{id}/supersede",

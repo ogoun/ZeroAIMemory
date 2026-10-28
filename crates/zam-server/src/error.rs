@@ -43,6 +43,10 @@ pub enum ApiError {
         detail: String,
         extra: Map<String, Value>,
     },
+    /// 409 `/problems/term-conflict` (M4.5 §2.1): имя или псевдоним термина занят действующим
+    /// термином пространства; тело несёт `conflicts: [{id, title, matched}]`.
+    #[error("имя или псевдоним термина уже занят: {}", term_conflict_names(.0))]
+    TermConflict(Vec<zam_store::TermConflict>),
     #[error("{0}")]
     PayloadTooLarge(String),
     /// 428 `/problems/precondition-required` (§11.3): правка без `If-Match`; в `detail` —
@@ -122,6 +126,9 @@ impl ApiError {
                 "/problems/possible-duplicate",
                 "Conflict",
             ),
+            ApiError::TermConflict(_) => {
+                (StatusCode::CONFLICT, "/problems/term-conflict", "Conflict")
+            }
             ApiError::PayloadTooLarge(_) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "/problems/too-large",
@@ -181,6 +188,19 @@ impl ApiError {
     }
 }
 
+/// Занятые имена для `detail` (до 5, как заданы в запросе).
+fn term_conflict_names(c: &[zam_store::TermConflict]) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for x in c {
+        let n = format!("«{}» (термин «{}»)", x.matched, x.title);
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    names.truncate(5);
+    names.join(", ")
+}
+
 /// Пояснение состояния запроса доступа для `detail`.
 fn access_state_text(state: &str) -> &'static str {
     match state {
@@ -206,6 +226,7 @@ impl From<StoreError> for ApiError {
                 }
             }
             StoreError::BadInput(m) => ApiError::BadRequest(m),
+            StoreError::TermConflict(c) => ApiError::TermConflict(c),
             StoreError::IdempotencyMismatch(m) => ApiError::IdempotencyMismatch(m),
             StoreError::Certainty(c) => ApiError::Certainty(c),
             other => ApiError::Internal(other.to_string()),
@@ -234,6 +255,9 @@ impl IntoResponse for ApiError {
                 // стандартные поля problem не перекрываются
                 o.entry(k.clone()).or_insert_with(|| v.clone());
             }
+        }
+        if let (ApiError::TermConflict(c), Value::Object(o)) = (&self, &mut body) {
+            o.insert("conflicts".into(), json!(c));
         }
         if let (ApiError::Certainty(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("code".into(), json!(c.code()));

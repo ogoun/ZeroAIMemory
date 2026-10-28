@@ -1,5 +1,8 @@
 //! Insights (§7.5, §10.3, §12): создание с дедупликацией, замещение, отзыв, пересмотр,
-//! триггеры. Правила `certainty` ([`crate::certainty`]) проверяет хранилище в транзакции
+//! триггеры. С M4.5 тем же путём идут термины словаря (`kind: "term"`, §2): `data` по
+//! правилам [`zam_store::TermData`], без дедупликации и триггеров, статус только `active`,
+//! конфликт имени или псевдонима — 409 `/problems/term-conflict`; замещение и отзыв — те же
+//! операции ([`supersede`], [`retract`]). Правила `certainty` ([`crate::certainty`]) проверяет хранилище в транзакции
 //! каждой операции: без `certainty` insight агента — `hypothesis`, человека — без статуса;
 //! `axiom` ставит любой автор (агент — по прямому указанию пользователя, §14.2), `theorem`
 //! агента — только с `data.evidence {checked, method, result}` (422).
@@ -47,7 +50,7 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_index::{VectorFilter, VectorScope};
 use zam_store::{
     Certainty, DEDUP_CANDIDATES_MAX, Db, DedupCandidate, EdgeType, Entry, EntryKind, EntryStatus,
-    NewEntry, NewTrigger, REASON_MAX_CHARS, SpaceKind, TRIGGERS_MAX, create_entry,
+    NewEntry, NewTrigger, REASON_MAX_CHARS, SpaceKind, TRIGGERS_MAX, check_term, create_entry,
     entry_by_idempotency_key, entry_triggers, get_entry, normalize_area, retract_entry,
     supersede_entry, title_duplicates, validate_trigger,
 };
@@ -56,6 +59,7 @@ use super::entries::{
     audit_details, check_size, check_title, empty_object, idempotency_key, optional_if_match,
     unprocessable,
 };
+use super::glossary::{alias_warnings, attach_warnings};
 use super::graph::insight_links;
 use super::json_body;
 use super::nodes::audit_node;
@@ -84,7 +88,7 @@ const DEDUP_NEAREST: usize = 20;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InsightReq {
-    /// В `POST /spaces/{space}/entries` — `insight`; в `/supersede` необязателен.
+    /// В `POST /spaces/{space}/entries` — `insight` или `term`; в `/supersede` необязателен.
     #[serde(default)]
     kind: Option<EntryKind>,
     title: String,
@@ -162,12 +166,18 @@ pub fn parse_triggers(raw: Vec<Value>) -> Result<Vec<NewTrigger>, ApiError> {
         .collect()
 }
 
-/// Статус новой записи: только `active` или `revisit`.
-fn check_new_status(s: Option<EntryStatus>) -> Result<(), ApiError> {
-    match s {
-        None | Some(EntryStatus::Active | EntryStatus::Revisit) => Ok(()),
-        Some(s) => Err(unprocessable(format!(
-            "status: новая запись — active или revisit, не {} (замещение и отзыв — отдельные операции)",
+/// Статус новой записи: insight — `active` или `revisit`, term — только `active`.
+fn check_new_status(kind: EntryKind, s: Option<EntryStatus>) -> Result<(), ApiError> {
+    match (kind, s) {
+        (_, None) | (_, Some(EntryStatus::Active)) => Ok(()),
+        (EntryKind::Insight, Some(EntryStatus::Revisit)) => Ok(()),
+        (_, Some(s)) => Err(unprocessable(format!(
+            "status: новая запись — {}, не {} (замещение и отзыв — отдельные операции)",
+            if kind == EntryKind::Term {
+                "active"
+            } else {
+                "active или revisit"
+            },
             s.as_str()
         ))),
     }
@@ -338,6 +348,7 @@ async fn target_scope(
 
 /// Новая запись insight из тела запроса (проверенного [`check_request`]).
 fn new_entry(
+    kind: EntryKind,
     req: InsightReq,
     space: Id,
     key: Option<String>,
@@ -346,7 +357,7 @@ fn new_entry(
 ) -> NewEntry {
     NewEntry {
         space_id: space,
-        kind: EntryKind::Insight,
+        kind,
         title: req.title,
         body: req.body,
         data: req.data,
@@ -360,16 +371,30 @@ fn new_entry(
     }
 }
 
-/// Проверка полей insight (общая для создания и замещения): заголовок, `data`, размер тела,
-/// статус, триггеры.
-fn check_request(st: &AppState, req: &mut InsightReq) -> Result<Vec<NewTrigger>, ApiError> {
-    if req.kind.is_some_and(|k| k != EntryKind::Insight) {
-        return Err(unprocessable("kind: insight"));
+/// Проверка полей insight или term (общая для создания и замещения): заголовок, `data`,
+/// размер тела, статус, триггеры. У term `data` и заголовок нормализуются
+/// ([`zam_store::check_term`]), триггеров нет.
+fn check_request(
+    st: &AppState,
+    req: &mut InsightReq,
+    kind: EntryKind,
+) -> Result<Vec<NewTrigger>, ApiError> {
+    if req.kind.is_some_and(|k| k != kind) {
+        return Err(unprocessable(format!("kind: {}", kind.as_str())));
     }
-    check_title(&req.title)?;
-    check_insight_data(&req.data)?;
+    if kind == EntryKind::Term {
+        let (title, td) = check_term(&req.title, &req.data).map_err(unprocessable)?;
+        req.title = title;
+        req.data = td.to_value();
+        if req.triggers.as_ref().is_some_and(|t| !t.is_empty()) {
+            return Err(unprocessable("triggers есть только у insight"));
+        }
+    } else {
+        check_title(&req.title)?;
+        check_insight_data(&req.data)?;
+    }
     check_size(st, &req.body)?;
-    check_new_status(req.status)?;
+    check_new_status(kind, req.status)?;
     parse_triggers(req.triggers.take().unwrap_or_default())
 }
 
@@ -388,8 +413,8 @@ fn duplicate(candidates: Vec<DedupCandidate>, mode: DedupMode) -> ApiError {
     }
 }
 
-/// `POST /spaces/{space}/entries` с `kind: insight` (тело уже прочитано как JSON):
-/// 201 / 200 (повтор по ключу) / 409 possible-duplicate / 422.
+/// `POST /spaces/{space}/entries` с `kind: insight` или `term` (тело уже прочитано как
+/// JSON): 201 / 200 (повтор по ключу) / 409 possible-duplicate или term-conflict / 422.
 pub async fn create(
     st: &AppState,
     p: &Principal,
@@ -400,8 +425,9 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let mut req: InsightReq = serde_json::from_value(body)
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
+    let kind = req.kind.unwrap_or(EntryKind::Insight);
     let sc = target_scope(st, p, headers, space, req.scope.as_deref()).await?;
-    let triggers = check_request(st, &mut req)?;
+    let triggers = check_request(st, &mut req, kind)?;
     let raw_links = req.links.take().unwrap_or_default();
     let links = insight_links(
         st, p, headers, &sc.db, sc.owner, &sc.space, sc.role, raw_links,
@@ -427,12 +453,13 @@ pub async fn create(
         if o.space_id != sc.space.id && sc.owner != sc.user.id {
             return Err(ApiError::NotFound);
         }
-        if o.space_id != sc.space.id || o.kind != EntryKind::Insight {
-            return Err(unprocessable(
-                "supersedes_id: insight того же пространства, что и новая запись",
-            ));
+        if o.space_id != sc.space.id || o.kind != kind {
+            return Err(unprocessable(format!(
+                "supersedes_id: {} того же пространства, что и новая запись",
+                kind.as_str()
+            )));
         }
-        let new = new_entry(req, sc.space.id, key, triggers, links);
+        let new = new_entry(kind, req, sc.space.id, key, triggers, links);
         // замещение через supersedes_id: ревизия старой не сверяется (If-Match у POST
         // коллекции относился бы к новой записи) [решение исполнителя]
         let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib).await?;
@@ -447,7 +474,7 @@ pub async fn create(
                 sc.owner,
                 "entry.supersede",
                 old,
-                audit_details(sc.space.id, EntryKind::Insight),
+                audit_details(sc.space.id, kind),
             )
             .await?;
         }
@@ -455,7 +482,11 @@ pub async fn create(
         super::secrets::attach_entry(&mut v, &n);
         v["superseded"] =
             serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
-        v["dedup"] = json!(DedupMode::Skipped.as_str());
+        if kind == EntryKind::Insight {
+            v["dedup"] = json!(DedupMode::Skipped.as_str());
+            let w = alias_warnings(&sc.db, sc.space.id, &n.title, &n.body).await?;
+            attach_warnings(&mut v, w);
+        }
         let status = if repeat {
             StatusCode::OK
         } else {
@@ -463,7 +494,8 @@ pub async fn create(
         };
         return Ok((status, Json(v)));
     }
-    let mode = if req.force || repeat {
+    // термины — без дедупликации: уникальность имён проверяет хранилище в транзакции записи
+    let mode = if req.force || repeat || kind == EntryKind::Term {
         DedupMode::Skipped
     } else {
         let area = req.area.clone().or_else(|| attrib.area.clone());
@@ -482,14 +514,18 @@ pub async fn create(
         }
         mode
     };
-    let new = new_entry(req, sc.space.id, key, triggers, links);
+    let new = new_entry(kind, req, sc.space.id, key, triggers, links);
     let (e, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {
         st.index.notify();
     }
     let mut v = entry_json(&sc.db, &e).await?;
     super::secrets::attach_entry(&mut v, &e);
-    v["dedup"] = json!(mode.as_str());
+    if kind == EntryKind::Insight {
+        v["dedup"] = json!(mode.as_str());
+        let w = alias_warnings(&sc.db, sc.space.id, &e.title, &e.body).await?;
+        attach_warnings(&mut v, w);
+    }
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -498,11 +534,11 @@ pub async fn create(
     Ok((status, Json(v)))
 }
 
-/// Запись по id — живой insight (иначе 404 / 422).
+/// Запись по id — живой insight или term (иначе 404 / 422).
 fn live_insight(sc: &EntryScope) -> Result<(), ApiError> {
     live_entry(sc)?;
-    if sc.entry.kind != EntryKind::Insight {
-        return Err(unprocessable("операция только для insight"));
+    if !matches!(sc.entry.kind, EntryKind::Insight | EntryKind::Term) {
+        return Err(unprocessable("операция только для insight и term"));
     }
     Ok(())
 }
@@ -527,7 +563,8 @@ pub async fn supersede(
             "scope и supersedes_id задаются замещаемой записью, а не телом",
         ));
     }
-    let triggers = check_request(&st, &mut req)?;
+    let kind = sc.entry.kind;
+    let triggers = check_request(&st, &mut req, kind)?;
     let raw_links = req.links.take().unwrap_or_default();
     let links = insight_links(
         &st, &p, &headers, &sc.db, sc.owner, &sc.space, sc.role, raw_links,
@@ -541,7 +578,7 @@ pub async fn supersede(
             .is_some(),
         None => false,
     };
-    let new = new_entry(req, sc.space.id, key, triggers, links);
+    let new = new_entry(kind, req, sc.space.id, key, triggers, links);
     let (n, o) = supersede_entry(&sc.db, sc.entry.id, rev, new, &attrib).await?;
     st.index.notify();
     if !repeat {
@@ -564,6 +601,10 @@ pub async fn supersede(
     };
     let mut entry = entry_json(&sc.db, &n).await?;
     super::secrets::attach_entry(&mut entry, &n);
+    if kind == EntryKind::Insight {
+        let w = alias_warnings(&sc.db, sc.space.id, &n.title, &n.body).await?;
+        attach_warnings(&mut entry, w);
+    }
     Ok((
         status,
         Json(json!({

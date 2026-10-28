@@ -125,7 +125,7 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Журналы решения: запись в Changelog или Insights
+    /// Журналы решения: запись в Changelog, Insights или словарь (term)
     Log {
         #[command(subcommand)]
         cmd: LogCmd,
@@ -134,6 +134,16 @@ enum Cmd {
     Insight {
         #[command(subcommand)]
         cmd: InsightCmd,
+    },
+    /// Словарь домена: список терминов «имя — определение» или карточка по имени или псевдониму
+    Glossary {
+        /// Имя или псевдоним термина (без него — весь список)
+        term: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
     },
     /// Релизы решения: добавить, сравнить
     Release {
@@ -262,6 +272,38 @@ enum LogCmd {
         #[arg(long)]
         solution: Option<String>,
         /// Ключ идемпотентности: повтор с тем же ключом не создаёт вторую запись
+        #[arg(long)]
+        key: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Термин словаря: имя, определение, псевдонимы (подробности — из --body-file или stdin);
+    /// занятое имя или псевдоним — код 4 со списком пересечений
+    Term {
+        #[arg(long)]
+        title: String,
+        /// Определение (до 300 символов)
+        #[arg(long)]
+        definition: String,
+        /// Псевдоним (можно повторять)
+        #[arg(long = "alias")]
+        aliases: Vec<String>,
+        /// Идентификатор в коде (можно повторять)
+        #[arg(long)]
+        code: Vec<String>,
+        /// С чем термин не путать (можно повторять)
+        #[arg(long = "not-to-confuse")]
+        not_to_confuse: Vec<String>,
+        /// Файл с подробностями (иначе stdin)
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Область (монорепозиторий)
+        #[arg(long)]
+        area: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        /// Ключ идемпотентности
         #[arg(long)]
         key: Option<String>,
         #[command(flatten)]
@@ -954,6 +996,43 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             };
             cmd::log::changelog(&cmd::connect(&common)?, &o)
         }
+        Cmd::Log {
+            cmd:
+                LogCmd::Term {
+                    title,
+                    definition,
+                    aliases,
+                    code,
+                    not_to_confuse,
+                    body_file,
+                    area,
+                    solution,
+                    key,
+                    common,
+                },
+        } => {
+            let o = cmd::log::Term {
+                title: &title,
+                definition: &definition,
+                aliases: &aliases,
+                code: &code,
+                not_to_confuse: &not_to_confuse,
+                body_file: body_file.as_deref(),
+                area: area.as_deref(),
+                solution: solution.as_deref(),
+                key: key.as_deref(),
+            };
+            cmd::log::term(&cmd::connect(&common)?, &o)
+        }
+        Cmd::Glossary {
+            term,
+            solution,
+            common,
+        } => cmd::glossary::run(
+            &cmd::connect(&common)?,
+            term.as_deref(),
+            solution.as_deref(),
+        ),
         Cmd::Log {
             cmd:
                 LogCmd::Insight {

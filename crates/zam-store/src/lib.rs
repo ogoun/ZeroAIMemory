@@ -14,6 +14,7 @@ pub mod datadir;
 pub mod db;
 pub mod embeddings;
 pub mod entries;
+pub mod glossary;
 pub mod graph;
 pub mod jobs;
 pub mod links;
@@ -64,6 +65,10 @@ pub use entries::{
     initial_status, is_entry_ref_letter, list_entries, normalize_area, normalize_title,
     reindex_entries_page, restore_entry, retract_entry, set_triggers, supersede_entry,
     title_duplicates, update_entry, validate_trigger,
+};
+pub use glossary::{
+    ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,
+    check_term, find_alias_uses, find_term, glossary_version,
 };
 pub use graph::{
     EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,
@@ -135,6 +140,10 @@ pub enum StoreError {
     StaleRevision { expected: i64, current: i64 },
     #[error("некорректные данные: {0}")]
     BadInput(String),
+    /// Имя или псевдоним термина пересекается с действующим термином пространства
+    /// ([`glossary::TermConflict`], спецификация M4.5 §2.1).
+    #[error("имя или псевдоним термина уже занят действующим термином")]
+    TermConflict(Vec<glossary::TermConflict>),
     /// `Idempotency-Key` повторён с другим содержимым запроса.
     #[error("{0}")]
     IdempotencyMismatch(String),

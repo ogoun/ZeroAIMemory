@@ -16,11 +16,15 @@
 //!   `find_by_name` и рендер до M3);
 //! - путь — точное совпадение, затем без суффикса `.md` (ссылки в стиле Obsidian/GitHub).
 //!
+//! **Термины словаря** (M4.5 §2.2): `[[Имя]]` без заметки с таким именем разрешается в
+//! действующий термин того же пространства по имени или псевдониму ([`resolve_target`]) —
+//! ребро графа ведёт к записи (`dst_kind = entry`). Заметка всегда приоритетнее термина.
+//!
 //! Рендер (`zam-server::api::render`) разрешает вики-ссылки этим же кодом: граф и HTML не
 //! расходятся.
 
 use rusqlite::{Connection, OptionalExtension, params};
-use zam_core::Id;
+use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::{Doc, Link, LinkKind, attachment_ref};
 
 use crate::graph::EdgeType;
@@ -121,6 +125,30 @@ pub fn resolve_key(c: &Connection, space: Id, key: &str) -> rusqlite::Result<Opt
     match key.strip_suffix(".md") {
         Some(p) if !p.is_empty() && !p.ends_with('/') => note_by_path(c, space, p),
         _ => Ok(None),
+    }
+}
+
+/// Цель ключа ссылки для графа: заметка ([`resolve_key`]), иначе — для `[[Имя]]` без `/` —
+/// действующий термин пространства по имени или псевдониму.
+pub fn resolve_target(c: &Connection, space: Id, key: &str) -> rusqlite::Result<Option<TargetRef>> {
+    if let Some(id) = resolve_key(c, space, key)? {
+        return Ok(Some(TargetRef {
+            kind: TargetKind::Node,
+            id,
+        }));
+    }
+    let name = key
+        .strip_prefix("[[")
+        .and_then(|k| k.strip_suffix("]]"))
+        .filter(|n| !n.contains('/'));
+    match name {
+        Some(n) => Ok(
+            crate::glossary::term_by_name(c, space, n)?.map(|id| TargetRef {
+                kind: TargetKind::Entry,
+                id,
+            }),
+        ),
+        None => Ok(None),
     }
 }
 

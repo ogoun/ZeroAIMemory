@@ -200,17 +200,22 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
         EntryKind::Insight => Err(unprocessable(
             "insight создаётся отдельным API инсайтов, а не через /entries",
         )),
-        EntryKind::Term | EntryKind::Task | EntryKind::Question => Err(kind_pending(kind)),
+        EntryKind::Term => Err(unprocessable(
+            "term пишется через POST /spaces/{space}/entries с kind: term",
+        )),
+        EntryKind::Task | EntryKind::Question => Err(kind_pending(kind)),
     }
 }
 
 /// 422 для видов M4.5, чьи правила записи ещё не реализованы (спецификация M4.5 §1.3):
-/// хранилище их уже принимает, REST — со своей задачей плана. Временная заглушка задачи 1.
+/// хранилище их уже принимает, REST — со своей задачей плана. Временная заглушка задач 4 и 5.
 fn kind_pending(kind: EntryKind) -> ApiError {
     let task = match kind {
-        EntryKind::Term => 2,
         EntryKind::Task => 4,
-        _ => 5,
+        EntryKind::Question => 5,
+        EntryKind::Changelog | EntryKind::Release | EntryKind::Insight | EntryKind::Term => {
+            unreachable!("вид {} уже пишется", kind.as_str())
+        }
     };
     unprocessable(format!(
         "вид {} появится в задаче {task} этапа M4.5",
@@ -272,7 +277,7 @@ pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, Api
 }
 
 /// `POST /spaces/{space}/entries` → 201 `Entry`; повтор с тем же `Idempotency-Key` — 200.
-/// `kind: insight` — [`super::insights::create`].
+/// `kind: insight` и `kind: term` — [`super::insights::create`].
 pub async fn create(
     State(st): State<AppState>,
     p: Principal,
@@ -282,19 +287,21 @@ pub async fn create(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let raw: Value = json_body(body)?;
-    if raw.get("kind").and_then(Value::as_str) == Some(EntryKind::Insight.as_str()) {
+    if matches!(
+        raw.get("kind")
+            .and_then(Value::as_str)
+            .and_then(EntryKind::parse),
+        Some(EntryKind::Insight | EntryKind::Term)
+    ) {
         return super::insights::create(&st, &p, &headers, &client, &space, raw).await;
-    }
-    if let Some(k @ (EntryKind::Term | EntryKind::Task | EntryKind::Question)) = raw
-        .get("kind")
-        .and_then(Value::as_str)
-        .and_then(EntryKind::parse)
-    {
-        return Err(kind_pending(k));
     }
     let req: Create = serde_json::from_value(raw)
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
     let sc = space_scope(&st, &p, &headers, &space, Mode::Write).await?;
+    // вид без правил записи — после проверки доступа: без прав 403/404, а не 422
+    if matches!(req.kind, EntryKind::Task | EntryKind::Question) {
+        return Err(kind_pending(req.kind));
+    }
     if sc.space.kind != SpaceKind::Solution {
         return Err(unprocessable(
             "changelog и release ведутся только в пространстве решения",
@@ -341,6 +348,10 @@ pub async fn create(
     };
     let mut v = json!(entry);
     super::secrets::attach_entry(&mut v, &entry);
+    super::glossary::attach_warnings(
+        &mut v,
+        super::glossary::alias_warnings(&sc.db, sc.space.id, &entry.title, &entry.body).await?,
+    );
     Ok((status, Json(v)))
 }
 
@@ -564,8 +575,8 @@ pub async fn patch(
     if let Some(s) = req.status {
         check_status_change(&sc.entry, s)?;
     }
-    if req.certainty.is_some() && sc.entry.kind != EntryKind::Insight {
-        return Err(unprocessable("certainty есть только у insight"));
+    if req.certainty.is_some() && !zam_store::has_certainty(sc.entry.kind) {
+        return Err(unprocessable("certainty есть только у insight и term"));
     }
     let triggers = match req.triggers {
         Some(_) if sc.entry.kind != EntryKind::Insight => {
@@ -577,6 +588,13 @@ pub async fn patch(
     // release: поля, не указанные в PATCH, сохраняются (слияние на верхнем уровне);
     // changelog: data заменяется целиком
     let data = match (&req.data, sc.entry.kind) {
+        // term: имя и data проверяются вместе (422 `title: …` / `data.<поле>: …`)
+        (_, EntryKind::Term) if req.title.is_some() || req.data.is_some() => {
+            let title = req.title.as_deref().unwrap_or(&sc.entry.title);
+            let data = req.data.as_ref().unwrap_or(&sc.entry.data);
+            let (_, td) = zam_store::check_term(title, data).map_err(unprocessable)?;
+            req.data.as_ref().map(|_| td.to_value())
+        }
         (Some(Value::Object(new)), EntryKind::Release) => {
             let mut merged = sc.entry.data.clone();
             if let Some(m) = merged.as_object_mut() {
@@ -613,6 +631,12 @@ pub async fn patch(
     }
     let mut v = entry_json(&sc.db, &e).await?;
     super::secrets::attach_entry(&mut v, &e);
+    if e.kind != EntryKind::Term {
+        super::glossary::attach_warnings(
+            &mut v,
+            super::glossary::alias_warnings(&sc.db, sc.space.id, &e.title, &e.body).await?,
+        );
+    }
     Ok(Json(v))
 }
 

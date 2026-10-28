@@ -49,9 +49,10 @@ fn entry_doc(title: &str, body: &str) -> String {
 /// удаляются (триггеры убирают их из FTS), новые вставляются; совпадающая нарезка не
 /// переписывается. Вызывается в транзакции писателя. `true` — чанки переписаны.
 pub(crate) fn rebuild_entry_chunks(c: &Connection, id: Id) -> Result<bool, StoreError> {
-    let (space, kind, title, body, tags, rev): (String, EntryKind, String, String, String, i64) = c
+    type Row = (String, EntryKind, String, String, String, i64, String);
+    let (space, kind, title, body, tags, rev, data): Row = c
         .prepare_cached(
-            "SELECT s.name, e.kind, e.title, e.body, e.tags, e.current_rev
+            "SELECT s.name, e.kind, e.title, e.body, e.tags, e.current_rev, e.data
              FROM entries e JOIN spaces s ON s.id = e.space_id WHERE e.id = ?1",
         )?
         .query_row([id], |r| {
@@ -62,11 +63,21 @@ pub(crate) fn rebuild_entry_chunks(c: &Connection, id: Id) -> Result<bool, Store
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
             ))
         })?;
-    let tags: Vec<String> = serde_json::from_str(&tags)
+    let mut tags: Vec<String> = serde_json::from_str(&tags)
         .map_err(|e| StoreError::Corrupt(format!("теги записи {id}: {e}")))?;
-    let src = entry_doc(&title, &body);
+    // нарезка меняется только у term (отпечаток нарезки остальных записей не трогается):
+    // имя, псевдонимы, определение, тело; псевдонимы и код — в префикс контекста
+    let src = if kind == EntryKind::Term {
+        let data: serde_json::Value = serde_json::from_str(&data)
+            .map_err(|e| StoreError::Corrupt(format!("data термина {id}: {e}")))?;
+        tags.extend(crate::glossary::prefix_terms(&data));
+        crate::glossary::chunk_source(&title, &data, &body)
+    } else {
+        entry_doc(&title, &body)
+    };
     let doc = parse(&src);
     let tc = token_counter();
     let chunks = note_chunks(&src, &doc, &title, tc.as_ref());

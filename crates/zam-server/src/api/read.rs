@@ -11,8 +11,8 @@
 //!   `locator-unsupported` (этап M5). Некорректный `tier`, нулевые `max_tokens` и
 //!   `budget_tokens` — 400. Всё это проверяется до чтения;
 //! - `tier` — `L0` | `L1` | `L2` (по умолчанию). Узел: сводка, оглавление с первым предложением
-//!   секций, текст. Запись журнала **[решение исполнителя]**: L0 — заголовок, L1 — `note_l1`
-//!   тела (нет — заголовок), L2 — тело. `section` — путь заголовков (как в `GET /nodes`);
+//!   секций, текст. Запись журнала **[решение исполнителя]**: L0 — заголовок (у term —
+//!   определение), L1 — `note_l1` тела (нет — L0), L2 — тело. `section` — путь заголовков (как в `GET /nodes`);
 //! - `if_rev` равен текущей ревизии → элемент `unchanged` без текста (и без учёта показа);
 //! - **бюджет**: `budget_tokens` (по умолчанию `read.budget_tokens` = 1500) на весь ответ,
 //!   заголовки и текст. Элемент, не влезший целиком (или длиннее своего `max_tokens`),
@@ -331,6 +331,21 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
     })
 }
 
+/// Сводка записи (L0): у термина — определение (`data.definition`, M4.5 §2.1), у прочих —
+/// заголовок.
+fn summary_of(e: &zam_store::Entry) -> String {
+    if e.kind == EntryKind::Term
+        && let Some(d) = e
+            .data
+            .get("definition")
+            .and_then(Value::as_str)
+            .filter(|d| !d.trim().is_empty())
+    {
+        return d.to_string();
+    }
+    e.title.clone()
+}
+
 async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetched, Failure> {
     live_entry(&sc)?;
     let e = &sc.entry;
@@ -346,7 +361,7 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
         Content::Unchanged
     } else if tier == Tier::L0 {
         Content::Text {
-            text: e.title.clone(),
+            text: summary_of(e),
             whole: false,
         }
     } else {
@@ -359,7 +374,7 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
                 let t = l1(&text);
                 Content::Text {
                     text: if t.trim().is_empty() {
-                        e.title.clone()
+                        summary_of(e)
                     } else {
                         t
                     },

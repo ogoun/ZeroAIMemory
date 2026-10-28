@@ -102,9 +102,10 @@ impl ToolName {
                  ошибка 409 с диффом: перечитать и повторить."
             }
             ToolName::Log => {
-                "Новая запись журнала: kind changelog|release (только в решении) или insight \
-                 (data.kind, triggers, links, scope solution|global, certainty). Похожий insight — \
-                 ошибка 409 с кандидатами: append, supersede или force."
+                "Новая запись журнала: kind changelog|release (только в решении), insight \
+                 (data.kind, triggers, links, scope, certainty) или term (data.definition, \
+                 aliases). Похожий insight — 409 с кандидатами: append, supersede или force; \
+                 занятое имя термина — 409 term-conflict."
             }
             ToolName::UpdateEntry => {
                 "Изменить запись журнала: action supersede|retract|revisit|certify|append|feedback; \
@@ -232,7 +233,7 @@ impl ToolName {
                     "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "question"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "data": {"type": "object", "description": "insight: kind, experiment, evidence"},
+                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "certainty": {"type": "string", "enum": ["axiom", "theorem", "hypothesis"]},
                     "triggers": {"type": "array", "items": {"type": "object"}},

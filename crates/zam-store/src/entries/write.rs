@@ -16,6 +16,7 @@ use crate::cache::StaleKind;
 use crate::certainty::{
     CertaintyChange, Evidence, check_certainty, check_final_state, default_certainty,
 };
+use crate::glossary::{check_term, ensure_names_free, terms_written};
 use crate::nodes::{Attribution, AuthorKind};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
@@ -273,7 +274,7 @@ fn new_status(kind: EntryKind, s: Option<EntryStatus>) -> Result<Option<EntrySta
 /// Вставляет новую запись с ревизией 1, чанками и заданием. Возвращает её id.
 pub(crate) fn insert_entry(
     c: &Connection,
-    e: NewEntry,
+    mut e: NewEntry,
     key: Option<String>,
     a: &Attribution,
     supersedes: Option<Id>,
@@ -283,6 +284,13 @@ pub(crate) fn insert_entry(
     check_data(&e.data)?;
     if e.kind == EntryKind::Release {
         ensure_release_version_free(c, e.space_id, &e.data, None)?;
+    }
+    if e.kind == EntryKind::Term {
+        // замещаемый термин при проверке имён не учитывается: он станет `superseded`
+        // в той же транзакции
+        let (title, td) = check_term(&e.title, &e.data).map_err(bad)?;
+        ensure_names_free(c, e.space_id, &title, &td, supersedes)?;
+        e.data = td.to_value();
     }
     let status = new_status(e.kind, e.status)?;
     if !has_certainty(e.kind) && e.certainty.is_some() {
@@ -348,6 +356,9 @@ pub(crate) fn insert_entry(
     replace_triggers(c, id, &triggers, now)?;
     index_entry_now(c, id, None, now)?;
     crate::graph::insert_entry_links(c, id, &links, a, now)?;
+    if e.kind == EntryKind::Term {
+        terms_written(c, e.space_id)?;
+    }
     Ok(id)
 }
 
@@ -433,7 +444,11 @@ fn save(
         _ => StaleKind::Changed,
     };
     crate::cache::invalidate_revised(c, entry_ref(cur.id), rev, &f.body, stale)?;
-    index_entry_now(c, cur.id, Some(cur.index_state), now)
+    index_entry_now(c, cur.id, Some(cur.index_state), now)?;
+    if cur.kind == EntryKind::Term {
+        terms_written(c, cur.space_id)?;
+    }
+    Ok(())
 }
 
 fn entry_ref(id: Id) -> TargetRef {
@@ -546,6 +561,7 @@ pub async fn update_entry(
             || p.tags.is_some()
             || p.area.is_some()
             || p.triggers.is_some();
+        let term_edit = cur.kind == EntryKind::Term && (p.title.is_some() || p.data.is_some());
         if content {
             ensure_editable(&cur)?;
         }
@@ -568,6 +584,14 @@ pub async fn update_entry(
                 ensure_release_version_free(tx, cur.space_id, &d, Some(cur.id))?;
             }
             f.data = d;
+        }
+        if term_edit {
+            let (title, td) = check_term(&f.title, &f.data).map_err(bad)?;
+            if cur.status == Some(EntryStatus::Active) {
+                ensure_names_free(tx, cur.space_id, &title, &td, Some(cur.id))?;
+            }
+            f.title = title;
+            f.data = td.to_value();
         }
         if let Some(t) = p.tags {
             f.tags = check_tags(t)?;
@@ -659,7 +683,11 @@ pub async fn delete_entry(
             params![id, now],
         )?;
         crate::cache::invalidate_target(tx, entry_ref(id), StaleKind::Deleted)?;
-        unindex_entry(tx, id, cur.rev, cur.index_state, &now)
+        unindex_entry(tx, id, cur.rev, cur.index_state, &now)?;
+        if cur.kind == EntryKind::Term {
+            terms_written(tx, cur.space_id)?;
+        }
+        Ok(())
     })
     .await
 }
@@ -684,6 +712,11 @@ pub async fn restore_entry(
         if cur.kind == EntryKind::Release {
             ensure_release_version_free(tx, cur.space_id, &cur.data, Some(cur.id))?;
         }
+        if cur.kind == EntryKind::Term && cur.status == Some(EntryStatus::Active) {
+            // имя могли занять, пока термин лежал в корзине
+            let (title, td) = check_term(&cur.title, &cur.data).map_err(bad)?;
+            ensure_names_free(tx, cur.space_id, &title, &td, Some(cur.id))?;
+        }
         let now = fmt_ts(Timestamp::now());
         tx.execute(
             "UPDATE entries SET deleted_at = NULL,
@@ -693,12 +726,15 @@ pub async fn restore_entry(
             [id],
         )?;
         index_entry_now(tx, id, Some(cur.index_state), &now)?;
+        if cur.kind == EntryKind::Term {
+            terms_written(tx, cur.space_id)?;
+        }
         load_entry(tx, id)
     })
     .await
 }
 
-/// Замещает insight `old` новой записью одной транзакцией: новая получает
+/// Замещает insight или term `old` новой записью того же вида одной транзакцией: новая получает
 /// `supersedes_id = old` и системное ребро графа `supersedes` (новая → старая), старая —
 /// `superseded`, `superseded_by_id` и новую ревизию; обе переиндексируются. Возвращает `(новая, старая)`. Повтор с тем же `idempotency_key`
 /// возвращает ту же пару. Не insight, другое пространство → `BadInput`; старая уже
@@ -715,8 +751,10 @@ pub async fn supersede_entry(
     let a = a.clone();
     db.write(move |tx| {
         let o = live_entry(tx, old)?;
-        if o.kind != EntryKind::Insight || new.kind != EntryKind::Insight {
-            return Err(bad("замещаются только insight"));
+        if !matches!(o.kind, EntryKind::Insight | EntryKind::Term) || new.kind != o.kind {
+            return Err(bad(
+                "замещаются только insight и term, записью того же вида",
+            ));
         }
         if new.space_id != o.space_id {
             return Err(bad("новая запись — в пространстве замещаемой"));
@@ -758,7 +796,7 @@ pub async fn supersede_entry(
     .await
 }
 
-/// Отзывает insight с обязательной причиной: статус `retracted`, `retract_reason`, ревизия
+/// Отзывает insight или term с обязательной причиной: статус `retracted`, `retract_reason`, ревизия
 /// с причиной, переиндексация. Пустая причина или не insight → `BadInput`; уже отозвана →
 /// `Conflict`; нет или удалена → `NotFound`; `if_rev` (необязателен) не совпал с текущей
 /// ревизией → `StaleRevision`.
@@ -775,8 +813,8 @@ pub async fn retract_entry(
         let cur = live_entry(tx, id)?;
         check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, a.author_kind)?;
-        if cur.kind != EntryKind::Insight {
-            return Err(bad("отзываются только insight"));
+        if !matches!(cur.kind, EntryKind::Insight | EntryKind::Term) {
+            return Err(bad("отзываются только insight и term"));
         }
         if cur.status == Some(EntryStatus::Retracted) {
             return Err(StoreError::Conflict("запись уже отозвана".into()));
