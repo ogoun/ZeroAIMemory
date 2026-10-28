@@ -497,6 +497,9 @@ pub struct SearchSection {
     /// Вес `bm25`, когда сработал только ослабленный запрос (любое слово): совпадения по
     /// одному слову — слабый сигнал (по умолчанию 0,25 — подобран на eval, §18.2).
     pub w_fts_relaxed: f64,
+    /// Вес канала `alias` (M4.5): FTS по запросу, расширенному именами и псевдонимами терминов
+    /// словаря; 0..=1 (по умолчанию 0,5 — ниже исходного канала), 0 выключает канал.
+    pub w_fts_alias: f64,
     /// Вес канала FTS5 `trigram` (идентификаторы и код).
     pub w_trigram: f64,
     /// Полупериод затухания по свежести, дней; 0 — без затухания.
@@ -551,6 +554,9 @@ impl SearchSection {
             if !(v.is_finite() && v >= 0.0) {
                 return Err(bad(k, "должно быть конечным и не меньше 0"));
             }
+        }
+        if !(self.w_fts_alias.is_finite() && (0.0..=1.0).contains(&self.w_fts_alias)) {
+            return Err(bad("w_fts_alias", "должно быть в 0..=1"));
         }
         if self.max_per_node == 0 {
             return Err(bad("max_per_node", "должно быть больше 0"));
@@ -787,6 +793,7 @@ impl Default for ServerConfig {
                 w_vector: 1.0,
                 w_fts: 1.0,
                 w_fts_relaxed: 0.25,
+                w_fts_alias: 0.5,
                 w_trigram: 0.7,
                 recency_half_life_days: 180.0,
                 max_per_node: 3,
@@ -1677,6 +1684,9 @@ yield_ms = 1
         assert_eq!((d.recency_half_life_days, d.max_per_node), (180.0, 3));
         // ослабленный bm25 — вес по eval (§18.2)
         assert_eq!(d.w_fts_relaxed, 0.25);
+        assert_eq!(d.w_fts_alias, 0.5);
+        let bad = vec![env("ZAM_SEARCH__W_FTS_ALIAS", "1.5")];
+        assert!(load(None, &bad, &Default::default()).is_err());
         let e = vec![
             env("ZAM_SEARCH__RRF_K", "30"),
             env("ZAM_SEARCH__W_VECTOR", "1.5"),

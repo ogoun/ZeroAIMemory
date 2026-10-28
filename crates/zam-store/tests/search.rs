@@ -58,6 +58,7 @@ async fn add(db: &Db, space: Id, path: &str, content: &str) -> Id {
 
 fn q(text: &str, spaces: &[Id]) -> FtsQuery {
     FtsQuery {
+        alias_groups: Vec::new(),
         text: text.into(),
         space_ids: spaces.to_vec(),
         path_prefix: None,

@@ -263,6 +263,7 @@ async fn hybrid_paraphrase_identifier_expand_budget() {
         zam_store::search_fts(
             &db,
             zam_store::FtsQuery {
+                alias_groups: Vec::new(),
                 text: PARAPHRASE.into(),
                 space_ids: vec![k],
                 path_prefix: None,

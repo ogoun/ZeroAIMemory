@@ -51,6 +51,20 @@
 //! недействительная — `[cache, stale: <источники>]` без текста), их текст — из
 //! `budget_tokens`; `timings.cache_ms`.
 //!
+//! **Словарь домена** (M4.5, спецификация §2.2 п. 1; [`crate::glossary`]): слова запроса
+//! сопоставляются (без регистра, многословные имена — по подряд идущим словам, не больше
+//! [`crate::glossary::MAX_GROUPS`] мест) с именами и псевдонимами действующих терминов
+//! пространств каждой цели; по ним строится дополнительный FTS-запрос — канал `alias` (источник
+//! `alias` в `sources`), где совпавшее слово заменено группой `("слово"* OR "имя"* OR …)`;
+//! псевдоним короче 3 символов ищется точным словом. Вес — `search.w_fts_alias` (0,5; 0 выключает
+//! канал и расширение), ослабленный `alias` при векторном канале — не выше `w_fts_relaxed`.
+//! Векторный канал, trigram, ключ кэша выжимок (`scope_hash` + `query_norm`) не меняются;
+//! `QUERY_MAX_CHARS` проверяется по исходному тексту. Ответ несёт `expanded: [{term, word,
+//! with}]`. Умолчания видов: к `note`, `insight`, `changelog`, `release` добавлены `term` и
+//! `question` (статус `answered`); открытые вопросы и задачи — только явным `filters.kinds`
+//! ([`default_statuses`]: фильтр статусов общий для FTS и `must_not` Qdrant, поэтому согласован
+//! в обоих каналах); `include_history` снимает фильтр статусов у всех видов.
+//!
 //! **Алгоритм** (§9.2):
 //! 1. Параллельно: каналы FTS по каждой цели в пределах её пространств (базы — параллельно,
 //!    затем [`merge::merge_channels`] по сырому баллу FTS5) и — если векторный канал доступен
@@ -203,6 +217,7 @@ use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
 use crate::config::SearchSection;
 use crate::error::ApiError;
+use crate::glossary::{Expansion, alias_groups};
 use crate::index_state::{DegradedReason, IndexRuntime};
 use crate::rerank;
 
@@ -273,11 +288,17 @@ const KINDS: [&str; 9] = [
     "folder",
     "attachment",
 ];
-/// Виды по умолчанию (§9.1).
-const DEFAULT_KINDS: [&str; 4] = ["note", "insight", "changelog", "release"];
+/// Виды по умолчанию (§9.1; с M4.5 — `term` и `question`, спецификация M4.5 §1.3).
+const DEFAULT_KINDS: [&str; 6] = [
+    "note",
+    "insight",
+    "changelog",
+    "release",
+    "term",
+    "question",
+];
 /// Статусы записей `filters.status`: insight и term, с M4.5 — task и question (спецификация
-/// M4.5 §1.3). Умолчания по виду (`task` — только явным `kinds`, `question` — `answered`) —
-/// задачи M4.5 3–5.
+/// M4.5 §1.3). Умолчания по виду — [`default_statuses`].
 const STATUSES: [&str; 11] = [
     "active",
     "revisit",
@@ -293,6 +314,33 @@ const STATUSES: [&str; 11] = [
 ];
 /// Статусы по умолчанию (§7.5): действующие.
 const DEFAULT_STATUSES: [&str; 2] = ["active", "revisit"];
+
+/// Статусы по умолчанию для видов `kinds` (`explicit` — виды заданы запросом). Фильтр статусов
+/// общий для всех видов (FTS и `must_not` Qdrant), поэтому умолчания складываются:
+/// - `insight` и `term` — действующие (`active`, `revisit`);
+/// - `question`: в умолчании видов — только `answered`, при явном `kinds` — ещё `open`;
+/// - `task` (только явным `kinds`): `open`, `in_progress`, `blocked` — выполненные и
+///   отброшенные только явным `filters.status`.
+///
+/// Значения `answered` и `open` в других видах не встречаются, поэтому слияние безопасно.
+fn default_statuses(kinds: &[String], explicit: bool) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = DEFAULT_STATUSES.to_vec();
+    let has = |k: &str| kinds.iter().any(|x| x == k);
+    if has("question") {
+        v.push("answered");
+        if explicit {
+            v.push("open");
+        }
+    }
+    if has("task") {
+        for s in ["open", "in_progress", "blocked"] {
+            if !v.contains(&s) {
+                v.push(s);
+            }
+        }
+    }
+    v
+}
 /// Эпистемические статусы `filters.certainty` (§7.5).
 const CERTAINTIES: [&str; 3] = ["axiom", "theorem", "hypothesis"];
 
@@ -357,11 +405,12 @@ impl SearchSection {
 /// Фильтр целей запроса: виды и статусы (`include_history` — любые статусы).
 fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, ApiError> {
     let kinds = filter_list("filters.kinds", f.kinds.as_ref(), &KINDS, &DEFAULT_KINDS)?;
+    let explicit = f.kinds.as_ref().is_some_and(|k| !k.is_empty());
     let statuses = filter_list(
         "filters.status",
         f.status.as_ref(),
         &STATUSES,
-        &DEFAULT_STATUSES,
+        &default_statuses(&kinds, explicit),
     )?;
     let certainty = filter_list("filters.certainty", f.certainty.as_ref(), &CERTAINTIES, &[])?;
     Ok(TargetFilter {
@@ -464,6 +513,7 @@ impl SearchSection {
             w_vector: self.w_vector,
             w_fts: self.w_fts,
             w_fts_relaxed: self.w_fts_relaxed,
+            w_fts_alias: self.w_fts_alias,
             w_trigram: self.w_trigram,
             w_folder: self.w_folder,
             recency_half_life_days: self.recency_half_life_days,
@@ -1554,6 +1604,18 @@ fn session_failed(what: &str, e: &StoreError) {
     tracing::warn!(error = %e, "поиск: {what} сессии не выполнено, ответ без пометок seen");
 }
 
+/// Расширения запроса словарём для цели `tg`; сбой чтения словаря поиск не валит (WARN без
+/// текста запроса, расширения нет).
+async fn alias_expansion(st: &AppState, tg: &SearchTarget, qterms: &[&str]) -> Vec<Expansion> {
+    match st.glossary.index(&tg.db).await {
+        Ok(idx) => idx.expand(qterms, &tg.space_ids()),
+        Err(e) => {
+            tracing::warn!(error = %e, "поиск: словарь не прочитан, запрос без расширения");
+            Vec::new()
+        }
+    }
+}
+
 /// `POST /search`.
 pub async fn search(
     State(st): State<AppState>,
@@ -1619,10 +1681,19 @@ pub async fn search(
     let folder_channel = st.cfg.search.w_folder > 0.0;
 
     // 1. каналы FTS (по базе на цель, параллельно) и векторный (один запрос) — параллельно
+    // расширение запроса словарём (канал `alias`, M4.5): слова запроса — по именам и
+    // псевдонимам терминов пространств каждой цели; `w_fts_alias = 0` выключает канал
+    let qterms = zam_store::query_terms(&req.query);
+    let alias_on = st.cfg.search.w_fts_alias > 0.0 && !qterms.is_empty();
     let fts = async {
         let t = Instant::now();
-        let runs = join_all(targets.iter().map(|tg| {
-            search_fts_channels(
+        let runs = join_all(targets.iter().map(|tg| async {
+            let exp = if alias_on {
+                alias_expansion(&st, tg, &qterms).await
+            } else {
+                Vec::new()
+            };
+            let r = search_fts_channels(
                 &tg.db,
                 FtsQuery {
                     text: req.query.clone(),
@@ -1630,8 +1701,11 @@ pub async fn search(
                     path_prefix: prefix.clone(),
                     top_k: TOP_K_MAX,
                     targets: kinds.clone(),
+                    alias_groups: alias_groups(&exp),
                 },
             )
+            .await;
+            (r, exp)
         }))
         .await;
         (runs, ms(t))
@@ -1673,9 +1747,18 @@ pub async fn search(
     let cache_ms = (!req.no_cache).then(|| ms(cache_t));
     // цель, чья база не прочиталась (чужое решение), исключается из выдачи целиком
     let mut per_db = Vec::with_capacity(targets.len());
-    for (i, r) in runs.into_iter().enumerate() {
+    let mut expanded: Vec<Expansion> = Vec::new();
+    for (i, (r, exp)) in runs.into_iter().enumerate() {
         if let Some(ch) = health.soft(i, r)? {
             per_db.push((i, ch));
+            for e in exp {
+                if !expanded
+                    .iter()
+                    .any(|x| x.term == e.term && x.word == e.word)
+                {
+                    expanded.push(e);
+                }
+            }
         }
     }
     let fts = merge_channels(per_db, FTS_BM25_TOP, FTS_TRIGRAM_TOP);
@@ -1683,7 +1766,7 @@ pub async fn search(
     // 2. векторные хиты — в базу своего владельца, только живые чанки пространств цели
     let fuse_t = Instant::now();
     let mut hits: HashMap<String, (usize, FtsHit)> = HashMap::new();
-    for (t, h) in fts.bm25.iter().chain(&fts.trigram) {
+    for (t, h) in fts.bm25.iter().chain(&fts.alias).chain(&fts.trigram) {
         hits.entry(h.chunk_id.clone())
             .or_insert_with(|| (*t, h.clone()));
     }
@@ -1766,6 +1849,8 @@ pub async fn search(
             .iter()
             .map(|(_, h)| h.chunk_id.clone())
             .collect(),
+        alias: fts.alias.iter().map(|(_, h)| h.chunk_id.clone()).collect(),
+        alias_relaxed: fts.alias_relaxed,
         vector: vector_ids,
         chunks,
         // ослабленный bm25 (ни один чанк не содержит всех слов запроса) — свой вес
@@ -2021,6 +2106,7 @@ pub async fn search(
                 "degraded_reason": degraded.map(DegradedReason::as_str),
                 "degraded_text": degraded.map(DegradedReason::text),
                 "warnings": warnings,
+                "expanded": expanded,
                 "pending_count": pending,
                 "timings": {
                     "cache_ms": cache_ms,
@@ -2713,7 +2799,29 @@ mod tests {
     fn filters_defaults_and_validation() {
         let f = target_filter(&Filters::default(), false).unwrap();
         assert_eq!(f.kinds, DEFAULT_KINDS.map(String::from).to_vec());
-        assert_eq!(f.statuses, DEFAULT_STATUSES.map(String::from).to_vec());
+        // умолчание видов включает term и question: статусы — действующие и `answered`
+        assert_eq!(f.statuses, ["active", "revisit", "answered"]);
+        let def = |kinds: &[&str]| {
+            target_filter(
+                &Filters {
+                    kinds: Some(kinds.iter().map(|s| s.to_string()).collect()),
+                    ..Filters::default()
+                },
+                false,
+            )
+            .unwrap()
+            .statuses
+        };
+        // явный `kinds`: открытые вопросы и текущие задачи; выполненные и отброшенные — по статусу
+        assert_eq!(
+            def(&["question"]),
+            ["active", "revisit", "answered", "open"]
+        );
+        assert_eq!(
+            def(&["task"]),
+            ["active", "revisit", "open", "in_progress", "blocked"]
+        );
+        assert_eq!(def(&["insight", "term"]), ["active", "revisit"]);
         // исключаются все статусы, кроме выбранных (с M4.5 — и статусы task/question)
         let rest = |keep: &[&str]| -> Vec<String> {
             STATUSES
@@ -2722,7 +2830,10 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect()
         };
-        assert_eq!(excluded_statuses(&f), rest(&DEFAULT_STATUSES));
+        assert_eq!(
+            excluded_statuses(&f),
+            rest(&["active", "revisit", "answered"])
+        );
         assert!(excluded_statuses(&f).starts_with(&["superseded".into(), "retracted".into()]));
         // include_history снимает фильтр статуса
         let f = target_filter(&Filters::default(), true).unwrap();

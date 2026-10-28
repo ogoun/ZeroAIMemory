@@ -18,7 +18,9 @@ use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::Id;
-use zam_store::{Db, active_terms, find_alias_uses, find_term, get_entry, glossary_version};
+use zam_store::{
+    Db, GlossaryEntry, active_terms, find_alias_uses, find_term, get_entry, glossary_version,
+};
 
 use super::insights::entry_json;
 use super::query;
@@ -28,19 +30,24 @@ use crate::auth::Principal;
 use crate::error::ApiError;
 
 /// Предупреждения `term_alias: «<псевдоним>» → «<имя>»` для текста (`title` + `body`) записи
-/// в пространстве `space` базы `db` (до 5). Пустой словарь — без запроса текста.
+/// в пространстве `space` базы `db` (до 5). Словарь — из кэша `st.glossary`; пустой — без
+/// разбора текста.
 pub async fn alias_warnings(
+    st: &AppState,
     db: &Db,
     space: Id,
     title: &str,
     body: &str,
 ) -> Result<Vec<String>, ApiError> {
-    let terms = active_terms(db, &[space]).await?;
+    // словарь — из кэша процесса (по версии `meta.glossary_version`), как у канала `alias`
+    let index = st.glossary.index(db).await?;
+    let spaces = [space];
+    let terms: Vec<&GlossaryEntry> = index.terms_in(&spaces).collect();
     if terms.is_empty() {
         return Ok(Vec::new());
     }
     let text = format!("{title}\n{body}");
-    Ok(find_alias_uses(&text, &terms)
+    Ok(find_alias_uses(&text, terms)
         .into_iter()
         .map(|(alias, title)| format!("term_alias: «{alias}» → «{title}»"))
         .collect())

@@ -708,6 +708,7 @@ async fn migrate_from_v3_rechunks_once() {
     let found = zam_store::search_fts(
         &db,
         zam_store::FtsQuery {
+            alias_groups: Vec::new(),
             text: "cargo build".into(),
             space_ids: vec![k],
             path_prefix: None,
@@ -748,6 +749,7 @@ async fn bench_write_until_fts_1000_notes() {
         let found = zam_store::search_fts(
             &db,
             zam_store::FtsQuery {
+                alias_groups: Vec::new(),
                 text: format!("метка{i}"),
                 space_ids: vec![k],
                 path_prefix: None,

@@ -48,6 +48,8 @@ pub struct AppState {
     pub vault: Arc<VaultKeys>,
     /// Воркер обслуживания (срок хранения сессий); снимается с последней копией состояния.
     pub maintenance: Arc<Maintenance>,
+    /// Кэш словаря доменных терминов по базам (M4.5, [`crate::glossary`]).
+    pub glossary: Arc<crate::glossary::GlossaryCache>,
 }
 
 impl AppState {
@@ -268,6 +270,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     ));
     let state = AppState {
         maintenance,
+        glossary: Arc::default(),
         users,
         index,
         rerank,

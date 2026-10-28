@@ -106,6 +106,7 @@ async fn chunks_of(db: &Db, id: Id) -> Vec<(String, String, i64)> {
 
 fn query(text: &str, space: Id, targets: TargetFilter) -> FtsQuery {
     FtsQuery {
+        alias_groups: Vec::new(),
         text: text.into(),
         space_ids: vec![space],
         path_prefix: None,
@@ -1506,6 +1507,45 @@ async fn term_chunks_carry_aliases_and_definition() {
         };
         let hits = fts(&db, q, k, only_terms).await;
         assert!(!hits.is_empty(), "{q}");
+    }
+}
+
+/// Принудительная переиндексация (`enqueue_reindex` -> `rechunk_entries`) нарезает `term` той же
+/// веткой `rebuild_entry_chunks`, что и создание: после потери чанков псевдонимы и код снова в
+/// префиксе контекста, FTS находит термин по псевдониму и коду (замечание ревью задачи 2).
+#[tokio::test]
+async fn reindex_rebuilds_term_chunks_with_aliases() {
+    let (db, k, _) = setup("term-reindex").await;
+    let (t, _) = create_entry(&db, term(k, "Выжимка", &["quokka", "digest"]), &agent())
+        .await
+        .unwrap();
+    let before = entry_chunks_for_index(&db, t.id).await.unwrap();
+    assert!(!before.is_empty());
+    let id = t.id;
+    db.write(move |tx| {
+        tx.execute("DELETE FROM chunks WHERE entry_id = ?1", [id])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let only_terms = || TargetFilter {
+        kinds: vec!["term".into()],
+        ..TargetFilter::default()
+    };
+    assert!(fts(&db, "quokka", k, only_terms()).await.is_empty());
+
+    assert!(zam_store::enqueue_reindex(&db, None).await.unwrap() >= 1);
+    let after = entry_chunks_for_index(&db, t.id).await.unwrap();
+    assert_eq!(
+        after.iter().map(|c| &c.text).collect::<Vec<_>>(),
+        before.iter().map(|c| &c.text).collect::<Vec<_>>()
+    );
+    for c in &after {
+        assert!(c.context_prefix.contains("quokka"), "{}", c.context_prefix);
+        assert!(c.context_prefix.contains("answer_cache_entry"));
+    }
+    for q in ["quokka", "digest", "answer_cache_entry"] {
+        assert_eq!(fts(&db, q, k, only_terms()).await, vec![t.id], "{q}");
     }
 }
 

@@ -9,6 +9,7 @@ pub mod certainty;
 pub mod config;
 pub mod cuda;
 pub mod error;
+pub mod glossary;
 pub mod index_state;
 pub mod logging;
 pub mod maintenance;

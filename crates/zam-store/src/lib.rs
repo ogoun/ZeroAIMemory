@@ -68,7 +68,7 @@ pub use entries::{
 };
 pub use glossary::{
     ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,
-    check_term, find_alias_uses, find_term, glossary_version,
+    all_active_terms, check_term, find_alias_uses, find_term, glossary_version,
 };
 pub use graph::{
     EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,
@@ -92,10 +92,10 @@ pub use nodes::{
 };
 pub use paths::{NodePath, path_ancestors};
 pub use search::{
-    ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END,
-    MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_targets, live_chunks,
-    live_folders, neighbor_leaves, node_leaves, pending_count, query_needles, sanitize_fts,
-    search_fts, search_fts_channels, text_snippet,
+    AliasGroup, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit,
+    MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_targets,
+    live_chunks, live_folders, neighbor_leaves, node_leaves, pending_count, query_needles,
+    query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use sessions::{
     RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, WHOLE_TARGET,

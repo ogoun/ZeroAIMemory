@@ -426,6 +426,7 @@ async fn rebuild_migration_preserves_m4_db() {
     let hits = search_fts(
         &db,
         FtsQuery {
+            alias_groups: Vec::new(),
             text: "квазиуникальный".into(),
             space_ids: zam_store::list_spaces(&db)
                 .await

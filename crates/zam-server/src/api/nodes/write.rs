@@ -6,7 +6,8 @@
 //! написании (в кавычках, с заглавными буквами): такой ключ статус не задаёт (§7.5);
 //! `unknown relation type: <тип>` и `invalid relation: <строка>` — строка `relations:`, не
 //! давшая ребра графа (§8.5); `term_alias: «<псевдоним>» → «<имя>»` — в имени или тексте
-//! заметки псевдоним термина словаря вместо имени (M4.5 §2.2, до 5); `secrets_detected` (+ `secrets_detected: [{kind, line}]`) — в тексте
+//! заметки псевдоним термина словаря вместо имени (M4.5 §2.2, до 5); `secrets_detected` (+
+//! `secrets_detected: [{kind, line}]`) — в тексте
 //! найдены секреты, в индекс они уходят замаскированными (§7.6, [`crate::api::secrets`]).
 //!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
@@ -68,8 +69,9 @@ fn note_warnings(content: &str) -> Vec<String> {
 }
 
 /// `Node` как JSON с `warnings` (только непустые); `db` и `space` — база и пространство
-/// заметки для предупреждений о псевдонимах словаря.
+/// заметки для предупреждений о псевдонимах словаря (кэш словаря — в `st`).
 async fn node_reply(
+    st: &AppState,
     db: &zam_store::Db,
     space: zam_core::Id,
     node: &Node,
@@ -78,7 +80,7 @@ async fn node_reply(
     let mut v = serde_json::to_value(node).map_err(|e| ApiError::Internal(e.to_string()))?;
     let mut w = note_warnings(content);
     if !content.is_empty() {
-        w.extend(crate::api::glossary::alias_warnings(db, space, &node.name, content).await?);
+        w.extend(crate::api::glossary::alias_warnings(st, db, space, &node.name, content).await?);
     }
     if !w.is_empty()
         && let Value::Object(o) = &mut v
@@ -138,7 +140,7 @@ pub async fn create(
     st.index.notify();
     Ok((
         StatusCode::CREATED,
-        Json(node_reply(&sc.db, sc.space.id, &node, &content).await?),
+        Json(node_reply(&st, &sc.db, sc.space.id, &node, &content).await?),
     ))
 }
 
@@ -180,7 +182,9 @@ pub async fn replace(
     match update_note(&sc.db, sc.node.id, base, req.content, req.l0, attrib).await {
         Ok(n) => {
             st.index.notify();
-            Ok(Json(node_reply(&sc.db, sc.space.id, &n, &content).await?))
+            Ok(Json(
+                node_reply(&st, &sc.db, sc.space.id, &n, &content).await?,
+            ))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, base, e).await),
     }
@@ -210,7 +214,7 @@ pub async fn patch(
         Ok(n) => {
             st.index.notify();
             let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
-            Ok(Json(node_reply(&sc.db, sc.space.id, &n, &text).await?))
+            Ok(Json(node_reply(&st, &sc.db, sc.space.id, &n, &text).await?))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, req.base_rev, e).await),
     }

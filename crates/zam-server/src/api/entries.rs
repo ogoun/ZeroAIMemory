@@ -350,7 +350,8 @@ pub async fn create(
     super::secrets::attach_entry(&mut v, &entry);
     super::glossary::attach_warnings(
         &mut v,
-        super::glossary::alias_warnings(&sc.db, sc.space.id, &entry.title, &entry.body).await?,
+        super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &entry.title, &entry.body)
+            .await?,
     );
     Ok((status, Json(v)))
 }
@@ -634,7 +635,7 @@ pub async fn patch(
     if e.kind != EntryKind::Term {
         super::glossary::attach_warnings(
             &mut v,
-            super::glossary::alias_warnings(&sc.db, sc.space.id, &e.title, &e.body).await?,
+            super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &e.title, &e.body).await?,
         );
     }
     Ok(Json(v))

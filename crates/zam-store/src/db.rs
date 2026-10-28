@@ -256,6 +256,11 @@ fn set_common_pragmas(conn: &Connection) -> Result<(), StoreError> {
 }
 
 impl Db {
+    /// Путь файла базы: стабильный ключ кэшей процесса (словарь M4.5).
+    pub fn path(&self) -> &Path {
+        &self.inner.readers.path
+    }
+
     /// Открывает (создаёт) БД, применяет PRAGMA и миграции, запускает писателя,
     /// читателей и фоновый checkpoint с параметрами по умолчанию.
     pub fn open(path: &Path, migrations: &'static [Migration]) -> Result<Db, StoreError> {

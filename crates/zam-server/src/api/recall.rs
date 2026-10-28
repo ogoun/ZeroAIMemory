@@ -23,7 +23,8 @@
 //!   [`RULES_MAX`] заметок, L1 — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
 //!   пространства решения с L0 (до [`SOLUTION_ROOT_MAX`]), до 5 действующих (`active`)
 //!   `gotcha`/`failure` решения и Knowledge (новые первыми), до 5 записей `revisit`, последние
-//!   5 записей changelog решения **[решение исполнителя]**. Ответ несёт `hooks: {session_start,
+//!   5 записей changelog решения **[решение исполнителя]**; сразу после правил — строка
+//!   `Словарь: N терминов — memory_search kinds=[term]` (N > 0, термины решения и Knowledge). Ответ несёт `hooks: {session_start,
 //!   prompt, pre_tool, post_tool, checkpoint}` — настройки типов подсказок пользователя
 //!   `hooks.<тип>` (R5, [`super::user_settings`], задача 13). Тип запроса выключен у
 //!   пользователя на сервере — пустой `text` без сбора и без учёта показа (`session_seen`,
@@ -31,6 +32,10 @@
 //! - **`prompt`** — поиск `mode=brief` (без реранка, без кэша выжимок, `skip_seen: false`) по
 //!   первым 512 символам `prompt` в Knowledge, Rules и решении; из выдачи — только insight и
 //!   заметки Rules с баллом ≥ `recall.prompt_min_score` (0,6), не больше [`PROMPT_MAX`];
+//!   перед ними — до [`TERM_HINTS_MAX`] строк словаря (M4.5): имя или псевдоним действующего
+//!   термина решения и Knowledge в первых 512 символах `prompt` —
+//!   `ZeroAIMemory: термин «<имя>» — <определение> — t:<id>`, `reason: glossary`, каждый термин
+//!   раз за сессию (`session_seen`); словарь — из кэша [`crate::glossary::GlossaryCache`];
 //! - **`post_tool`** — ошибка инструмента: совпадения `error_regex` действующих триггеров
 //!   insight решения и Knowledge (по первым [`ERROR_SCAN_MAX`] байтам `error`; триггер с
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
@@ -127,6 +132,10 @@ pub const SOLUTION_ROOT_MAX: usize = 10;
 pub const DIGEST_ENTRIES_MAX: usize = 5;
 /// Подсказок к запросу пользователя.
 pub const PROMPT_MAX: usize = 3;
+/// Строк словаря в подсказке к запросу пользователя (M4.5, спецификация §2.2 п. 2).
+pub const TERM_HINTS_MAX: usize = 2;
+/// `reason` подсказки термина словаря.
+const REASON_GLOSSARY: &str = "glossary";
 /// Подсказок к ошибке инструмента.
 pub const POST_TOOL_MAX: usize = 3;
 /// Байт ошибки, по которым сопоставляется `error_regex`.
@@ -354,7 +363,7 @@ async fn digest(
     req: &RecallReq,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
-) -> Result<(Vec<String>, Vec<(Option<&'static str>, Vec<Cand>)>), ApiError> {
+) -> Result<Digest, ApiError> {
     let targets = health.targets();
     let mut notices: Vec<String> = Vec::new();
     if let Some(v) = req.agent_block_version {
@@ -547,7 +556,107 @@ async fn digest(
     .map(|(i, e)| entry_cand(*i, e, "changelog", ""))
     .collect();
     sections.push((Some("### Последние изменения"), changes));
-    Ok((notices, sections))
+    let glossary = glossary_line(st, health, deadline).await;
+    Ok((notices, sections, glossary))
+}
+
+/// Дайджест `session_start`: уведомления, разделы-кандидаты и строка словаря.
+type Digest = (
+    Vec<String>,
+    Vec<(Option<&'static str>, Vec<Cand>)>,
+    Option<String>,
+);
+
+/// Строка `Словарь: N терминов — memory_search kinds=[term]` (N — действующие термины решения
+/// и Knowledge области); `None` — терминов нет или срок вышел.
+async fn glossary_line(
+    st: &AppState,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Option<String> {
+    let mut n = 0;
+    for i in 0..health.targets().len() {
+        if !health.alive[i] {
+            continue;
+        }
+        let (db, spaces) = {
+            let t = &health.targets()[i];
+            (t.db.clone(), entry_spaces(t))
+        };
+        if spaces.is_empty() {
+            continue;
+        }
+        match deadline.step(st.glossary.index(&db)).await? {
+            Ok(idx) => n += idx.count_in(&spaces),
+            Err(e) => tracing::warn!(error = %e, "recall: словарь не прочитан"),
+        }
+    }
+    (n > 0).then(|| format!("Словарь: {n} терминов — memory_search kinds=[term]"))
+}
+
+/// Строки словаря к `prompt`: термины решения и Knowledge, чьё имя или псевдоним встречается
+/// в первых 512 символах (см. модуль). Сбой чтения словаря — без подсказок.
+async fn term_hints(
+    st: &AppState,
+    req: &RecallReq,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Vec<Cand> {
+    let prompt = req.prompt.as_deref().unwrap_or_default();
+    let mut out: Vec<Cand> = Vec::new();
+    if prompt.trim().is_empty() {
+        return out;
+    }
+    for i in 0..health.targets().len() {
+        if !health.alive[i] {
+            continue;
+        }
+        let (db, spaces) = {
+            let t = &health.targets()[i];
+            (t.db.clone(), entry_spaces(t))
+        };
+        if spaces.is_empty() {
+            continue;
+        }
+        let Some(r) = deadline.step(st.glossary.index(&db)).await else {
+            break;
+        };
+        let idx = match r {
+            Ok(idx) => idx,
+            Err(e) => {
+                tracing::warn!(error = %e, "recall: словарь не прочитан, без подсказок терминов");
+                continue;
+            }
+        };
+        for t in idx.find_in_text(prompt, &spaces) {
+            if out.iter().any(|c| c.tref.id == t.id) {
+                continue;
+            }
+            let reference = format!("t:{}", t.id);
+            let def = zam_markdown::mask_text(&one_line(&t.definition));
+            let block = hint_line(
+                "термин ",
+                &format!("«{}» — {def}", t.title),
+                &[],
+                &reference,
+            );
+            out.push(Cand {
+                target: i,
+                tref: TargetRef {
+                    kind: TargetKind::Entry,
+                    id: t.id,
+                },
+                rev: t.rev,
+                reference,
+                kind: "term",
+                title: t.title.clone(),
+                certainty: None,
+                reason: REASON_GLOSSARY,
+                block,
+            });
+        }
+    }
+    out
 }
 
 /// `prompt`: внутренний `POST /search` (см. модуль) и отбор insight и заметок Rules.
@@ -811,6 +920,7 @@ async fn error_hints(
                 continue;
             }
             let q = FtsQuery {
+                alias_groups: Vec::new(),
                 text: normalized.clone(),
                 space_ids: spaces,
                 path_prefix: None,
@@ -1028,21 +1138,23 @@ pub async fn recall(
     };
 
     // сбор кандидатов
-    let (notices, sections, repeatable) = match req.event {
-        _ if !enabled => (Vec::new(), Vec::new(), true),
+    let (notices, sections, repeatable, glossary) = match req.event {
+        _ if !enabled => (Vec::new(), Vec::new(), true, None),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
         Event::SessionStart => {
-            let (n, s) = digest(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
-            (n, s, true)
+            let (n, s, g) = digest(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
+            (n, s, true, g)
         }
         Event::Prompt => {
+            // строки словаря — перед подсказками insight; у каждого свой предел
+            let terms = term_hints(&st, &req, &mut health, &mut deadline).await;
             let c = prompt_hints(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
-            (Vec::new(), vec![(None, c)], false)
+            (Vec::new(), vec![(None, terms), (None, c)], false, None)
         }
         Event::PostTool => {
             let c = error_hints(&req, &mut health, &mut deadline).await?;
-            (Vec::new(), vec![(None, c)], true)
+            (Vec::new(), vec![(None, c)], true, None)
         }
     };
     // без повторов: показанное сессии, повторы между разделами, исключённые цели
@@ -1068,6 +1180,7 @@ pub async fn recall(
             Some("### Правила") => RULES_MAX,
             Some("### Решение") => SOLUTION_ROOT_MAX,
             Some(_) => DIGEST_ENTRIES_MAX,
+            None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,
             None => limit,
         };
         let chosen: Vec<&Cand> = cands
@@ -1082,12 +1195,23 @@ pub async fn recall(
             blocks: chosen.iter().map(|c| c.block.clone()).collect(),
         });
         picked.push(chosen);
+        // строка словаря — сразу после правил; в `picked` у неё пустой список (не подсказка
+        // записи: ни `session_seen`, ни `usage`)
+        if *title == Some("### Правила")
+            && let Some(line) = &glossary
+        {
+            packed.push(Section {
+                title: None,
+                blocks: vec![line.clone()],
+            });
+            picked.push(Vec::new());
+        }
     }
     let (text, taken) = pack_sections(&packed, budget, &count_tokens);
     let shown_now: Vec<&Cand> = taken
         .iter()
         .filter(|(si, _)| *si > 0)
-        .map(|&(si, bi)| picked[si][bi])
+        .filter_map(|&(si, bi)| picked[si].get(bi).copied())
         .collect();
     let collect_ms = ms(t0);
 

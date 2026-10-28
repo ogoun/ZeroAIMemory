@@ -276,16 +276,28 @@ pub struct GlossaryEntry {
     pub title: String,
     pub aliases: Vec<String>,
     pub definition: String,
+    /// Ревизия записи (учёт показа подсказки в `session_seen`).
+    pub rev: i64,
 }
 
 /// Действующие (`active`, не удалённые) термины пространств `spaces` по имени.
 pub async fn active_terms(db: &Db, spaces: &[Id]) -> Result<Vec<GlossaryEntry>, StoreError> {
     let spaces = serde_json::to_string(spaces).expect("сериализация списка id");
+    read_terms(db, Some(spaces)).await
+}
+
+/// Действующие термины всех пространств базы по имени: источник кэша словаря сервера (область
+/// запроса отбирается при чтении кэша по `space_id`).
+pub async fn all_active_terms(db: &Db) -> Result<Vec<GlossaryEntry>, StoreError> {
+    read_terms(db, None).await
+}
+
+async fn read_terms(db: &Db, spaces: Option<String>) -> Result<Vec<GlossaryEntry>, StoreError> {
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT id, space_id, title, data FROM entries
+            "SELECT id, space_id, title, data, current_rev FROM entries
              WHERE kind = 'term' AND status = 'active' AND deleted_at IS NULL
-               AND space_id IN (SELECT value FROM json_each(?1))
+               AND (?1 IS NULL OR space_id IN (SELECT value FROM json_each(?1)))
              ORDER BY title_norm, id",
         )?;
         let rows = st.query_map([spaces], |r| {
@@ -294,11 +306,12 @@ pub async fn active_terms(db: &Db, spaces: &[Id]) -> Result<Vec<GlossaryEntry>, 
                 r.get::<_, Id>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, space_id, title, data) = row?;
+            let (id, space_id, title, data, rev) = row?;
             let d: Value = serde_json::from_str(&data)
                 .map_err(|e| StoreError::Corrupt(format!("data термина {id}: {e}")))?;
             out.push(GlossaryEntry {
@@ -311,6 +324,7 @@ pub async fn active_terms(db: &Db, spaces: &[Id]) -> Result<Vec<GlossaryEntry>, 
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                rev,
             });
         }
         Ok(out)
@@ -398,7 +412,10 @@ fn has_word(lower_text: &str, alias: &str) -> bool {
 /// Псевдонимы терминов `terms`, встреченные в `text` вместо имени: пары `(псевдоним, имя)`,
 /// по границе слова, без учёта регистра, не больше [`ALIAS_USES_MAX`] (порядок — терминов, затем
 /// псевдонимов).
-pub fn find_alias_uses(text: &str, terms: &[GlossaryEntry]) -> Vec<(String, String)> {
+pub fn find_alias_uses<'a>(
+    text: &str,
+    terms: impl IntoIterator<Item = &'a GlossaryEntry>,
+) -> Vec<(String, String)> {
     let lower = text.to_lowercase();
     let mut out: Vec<(String, String)> = Vec::new();
     'terms: for t in terms {
@@ -455,6 +472,7 @@ mod tests {
             title: title.into(),
             aliases: aliases.iter().map(|s| s.to_string()).collect(),
             definition: "определение".into(),
+            rev: 1,
         }
     }
 

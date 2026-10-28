@@ -10,6 +10,8 @@
 //!   слово) других баз отбрасываются: в одной общей базе ослабленный запрос не выполнился бы
 //!   вовсе, а баллы запросов `AND` и `OR` несравнимы. `relaxed` — все непустые выдачи `bm25`
 //!   ослабленные.
+//! - Канал `alias` (словарь, M4.5) сливается так же, как `bm25`, со своим признаком `alias_relaxed`
+//!   и пределом `bm25_top`.
 //! - Канал `trigram` берётся из всех баз (в том числе фраза при пустом `bm25` своей базы).
 //!
 //! Баллы `bm25` разных баз считаются по статистике своей базы (IDF): сравнение приближённое,
@@ -22,8 +24,12 @@ use zam_store::{FtsChannels, FtsHit};
 pub struct MergedChannels {
     pub bm25: Vec<(usize, FtsHit)>,
     pub trigram: Vec<(usize, FtsHit)>,
+    /// Канал `alias` (словарь): пуст без расширений запроса.
+    pub alias: Vec<(usize, FtsHit)>,
     /// `bm25` получен ослабленным запросом (см. модуль).
     pub relaxed: bool,
+    /// `alias` получен ослабленным запросом.
+    pub alias_relaxed: bool,
 }
 
 /// Слияние каналов баз `per_db` (`(индекс цели, каналы её базы)`, в порядке целей).
@@ -33,18 +39,27 @@ pub fn merge_channels(
     trigram_top: usize,
 ) -> MergedChannels {
     let strict = per_db.iter().any(|(_, c)| !c.relaxed && !c.bm25.is_empty());
+    let strict_alias = per_db
+        .iter()
+        .any(|(_, c)| !c.alias_relaxed && !c.alias.is_empty());
     let mut bm25 = Vec::new();
     let mut trigram = Vec::new();
+    let mut alias = Vec::new();
     for (t, ch) in per_db {
         if !(strict && ch.relaxed) {
             bm25.extend(ch.bm25.into_iter().map(|h| (t, h)));
+        }
+        if !(strict_alias && ch.alias_relaxed) {
+            alias.extend(ch.alias.into_iter().map(|h| (t, h)));
         }
         trigram.extend(ch.trigram.into_iter().map(|h| (t, h)));
     }
     MergedChannels {
         relaxed: !strict && !bm25.is_empty(),
+        alias_relaxed: !strict_alias && !alias.is_empty(),
         bm25: rank(bm25, bm25_top),
         trigram: rank(trigram, trigram_top),
+        alias: rank(alias, bm25_top),
     }
 }
 
@@ -94,6 +109,7 @@ mod tests {
             bm25: mk(bm25),
             trigram: mk(trigram),
             relaxed,
+            ..Default::default()
         }
     }
 
@@ -158,6 +174,26 @@ mod tests {
         assert!(m.bm25.iter().all(|(_, h)| h.raw_score <= -5.0));
         let m = merge_channels(vec![(0, ch(&r(&a), &[], false))], 3, 3);
         assert_eq!(ids(&m.bm25), vec![(0, "a29"), (0, "a28"), (0, "a27")]);
+    }
+
+    #[test]
+    fn alias_channel_merges_like_bm25() {
+        let mut a = ch(&[], &[], false);
+        a.alias = vec![hit("a1", -3.0), hit("a2", -1.0)];
+        a.alias_relaxed = true;
+        let mut b = ch(&[], &[], false);
+        b.alias = vec![hit("b1", -2.0)];
+        // строгий alias одной базы вытесняет ослабленный другой
+        let m = merge_channels(vec![(0, a), (1, b)], 50, 20);
+        assert_eq!(ids(&m.alias), vec![(1, "b1")]);
+        assert!(!m.alias_relaxed);
+        let mut only = ch(&[], &[], false);
+        only.alias = vec![hit("x", -1.0)];
+        only.alias_relaxed = true;
+        let m = merge_channels(vec![(0, only)], 50, 20);
+        assert_eq!(ids(&m.alias), vec![(0, "x")]);
+        assert!(m.alias_relaxed);
+        assert!(m.bm25.is_empty() && !m.relaxed);
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! триггеры. С M4.5 тем же путём идут термины словаря (`kind: "term"`, §2): `data` по
 //! правилам [`zam_store::TermData`], без дедупликации и триггеров, статус только `active`,
 //! конфликт имени или псевдонима — 409 `/problems/term-conflict`; замещение и отзыв — те же
-//! операции ([`supersede`], [`retract`]). Правила `certainty` ([`crate::certainty`]) проверяет хранилище в транзакции
+//! операции ([`supersede`], [`retract`]). Правила `certainty` ([`crate::certainty`]) проверяет
+//! хранилище в транзакции
 //! каждой операции: без `certainty` insight агента — `hypothesis`, человека — без статуса;
 //! `axiom` ставит любой автор (агент — по прямому указанию пользователя, §14.2), `theorem`
 //! агента — только с `data.evidence {checked, method, result}` (422).
@@ -484,7 +485,7 @@ pub async fn create(
             serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
         if kind == EntryKind::Insight {
             v["dedup"] = json!(DedupMode::Skipped.as_str());
-            let w = alias_warnings(&sc.db, sc.space.id, &n.title, &n.body).await?;
+            let w = alias_warnings(st, &sc.db, sc.space.id, &n.title, &n.body).await?;
             attach_warnings(&mut v, w);
         }
         let status = if repeat {
@@ -523,7 +524,7 @@ pub async fn create(
     super::secrets::attach_entry(&mut v, &e);
     if kind == EntryKind::Insight {
         v["dedup"] = json!(mode.as_str());
-        let w = alias_warnings(&sc.db, sc.space.id, &e.title, &e.body).await?;
+        let w = alias_warnings(st, &sc.db, sc.space.id, &e.title, &e.body).await?;
         attach_warnings(&mut v, w);
     }
     let status = if created {
@@ -602,7 +603,7 @@ pub async fn supersede(
     let mut entry = entry_json(&sc.db, &n).await?;
     super::secrets::attach_entry(&mut entry, &n);
     if kind == EntryKind::Insight {
-        let w = alias_warnings(&sc.db, sc.space.id, &n.title, &n.body).await?;
+        let w = alias_warnings(&st, &sc.db, sc.space.id, &n.title, &n.body).await?;
         attach_warnings(&mut entry, w);
     }
     Ok((
