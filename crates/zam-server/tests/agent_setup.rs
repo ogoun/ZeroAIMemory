@@ -485,7 +485,7 @@ async fn template_edit_bumps_version() {
     assert_eq!(s["agent_setup"]["version"], 3);
     let (_, s) = admin_settings(
         &a,
-        json!({"agent_setup": {"templates": {"claude.ru": "{url} v4", "agents.en": "{url} en"}}}),
+        json!({"agent_setup": {"templates": {"claude.ru": "{url} шаблон-v4-маркер", "agents.en": "{url} en"}}}),
     )
     .await;
     assert_eq!(s["agent_setup"]["version"], 4, "один запрос — одна версия");
@@ -550,7 +550,10 @@ async fn template_edit_bumps_version() {
         .filter(|e| e["target"] == "agent_setup.template.claude.ru")
         .collect();
     assert_eq!(e.len(), 3, "{items:?}");
-    assert!(!r.text().contains("v4"), "текст шаблона в аудите");
+    assert!(
+        !r.text().contains("шаблон-v4-маркер"),
+        "текст шаблона в аудите"
+    );
     assert_eq!(e[0]["details"]["reset"], true);
     assert_eq!(e[0]["details"]["version"], 5);
 }
