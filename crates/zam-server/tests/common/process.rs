@@ -71,17 +71,22 @@ impl ServerProc {
                     let _ = tx.send(tok.trim().to_string());
                     continue;
                 }
-                // файл записан до строки с путём; токена в stderr нет
-                if let Some(path) = line.strip_prefix(TOKEN_FILE_PREFIX)
-                    && let Ok(tok) = std::fs::read_to_string(path.trim())
+                // файл записан до строки с путём; токена в stderr нет. Строка попадает в хвост
+                // до отправки токена: тест, получивший токен, сразу видит путь в `tail()`
+                // (гонка на Linux CI, финальное ревью M4)
+                let token = line
+                    .strip_prefix(TOKEN_FILE_PREFIX)
+                    .and_then(|path| std::fs::read_to_string(path.trim()).ok());
                 {
+                    let mut l = t.lock().unwrap_or_else(|p| p.into_inner());
+                    if l.len() == TAIL {
+                        l.pop_front();
+                    }
+                    l.push_back(line);
+                }
+                if let Some(tok) = token {
                     let _ = tx.send(tok.trim().to_string());
                 }
-                let mut l = t.lock().unwrap_or_else(|p| p.into_inner());
-                if l.len() == TAIL {
-                    l.pop_front();
-                }
-                l.push_back(line);
             }
         });
         ServerProc {
