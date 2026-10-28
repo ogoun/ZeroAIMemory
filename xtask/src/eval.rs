@@ -264,7 +264,7 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
             let (sc, _) = tokens::load_scenarios(&p.scenarios)?;
             tokens::validate_scenarios(&sc, &corpus)?;
             println!(
-                "набор M4: подсказок {} (релевантных {}, нерелевантных {}), сценариев расхода                  токенов {}",
+                "набор M4: подсказок {} (релевантных {}, нерелевантных {}), сценариев расхода токенов {}",
                 h.cases,
                 h.relevant,
                 h.irrelevant,
