@@ -55,12 +55,13 @@ pub use embeddings::{
 };
 pub use entries::{
     AREA_MAX_CHARS, AuthorView, CHANGELOG_BETWEEN_MAX, Certainty, DEDUP_CANDIDATES_MAX,
-    DedupCandidate, Entry, EntryFilter, EntryKind, EntryPatch, EntryRevision, EntryStatus,
-    KEYWORD_MAX_CHARS, NewEntry, NewTrigger, PATTERN_MAX_CHARS, REASON_MAX_CHARS, ReindexEntry,
-    TITLE_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger, TriggerKind, TriggerRow, active_triggers,
-    changelog_between, create_entry, delete_entry, enqueue_entry_upserts, entry_by_idempotency_key,
-    entry_chunks_for_index, entry_revisions, entry_triggers, find_release_by_version,
-    finish_entries_reindexed, get_entry, list_entries, normalize_area, normalize_title,
+    DedupCandidate, ENTRY_REF_LETTERS, Entry, EntryFilter, EntryKind, EntryPatch, EntryRevision,
+    EntryStatus, KEYWORD_MAX_CHARS, NewEntry, NewTrigger, PATTERN_MAX_CHARS, REASON_MAX_CHARS,
+    ReindexEntry, TITLE_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger, TriggerKind, TriggerRow,
+    active_triggers, allowed_statuses, changelog_between, create_entry, delete_entry,
+    enqueue_entry_upserts, entry_by_idempotency_key, entry_chunks_for_index, entry_revisions,
+    entry_triggers, find_release_by_version, finish_entries_reindexed, get_entry, has_certainty,
+    initial_status, is_entry_ref_letter, list_entries, normalize_area, normalize_title,
     reindex_entries_page, restore_entry, retract_entry, set_triggers, supersede_entry,
     title_duplicates, update_entry, validate_trigger,
 };

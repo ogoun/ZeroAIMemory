@@ -184,11 +184,11 @@ use zam_search::{
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
-    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, SeenItem, SeenKey, Space,
-    SpaceKind, StoreError, TargetFilter, WHOLE_TARGET, count_tokens, get_embeddings, get_node,
-    leaf_term_hits, leaves_of_targets, live_chunks, live_folders, mark_seen, neighbor_leaves,
-    node_content, pending_count, query_needles, search_fts_channels, seen_revs, text_snippet,
-    touch_session,
+    ChunkScope, Db, EntryKind, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, SeenItem, SeenKey,
+    Space, SpaceKind, StoreError, TargetFilter, WHOLE_TARGET, count_tokens, get_embeddings,
+    get_node, leaf_term_hits, leaves_of_targets, live_chunks, live_folders, mark_seen,
+    neighbor_leaves, node_content, pending_count, query_needles, search_fts_channels, seen_revs,
+    text_snippet, touch_session,
 };
 
 use self::merge::merge_channels;
@@ -260,19 +260,37 @@ pub(crate) struct Filters {
     certainty: Option<Vec<String>>,
 }
 
-/// Допустимые виды целей `filters.kinds`.
-const KINDS: [&str; 6] = [
+/// Допустимые виды целей `filters.kinds` (с M4.5 — `term`, `task`, `question`, спецификация
+/// M4.5 §1.3).
+const KINDS: [&str; 9] = [
     "note",
     "insight",
     "changelog",
     "release",
+    "term",
+    "task",
+    "question",
     "folder",
     "attachment",
 ];
 /// Виды по умолчанию (§9.1).
 const DEFAULT_KINDS: [&str; 4] = ["note", "insight", "changelog", "release"];
-/// Статусы insight.
-const STATUSES: [&str; 4] = ["active", "revisit", "superseded", "retracted"];
+/// Статусы записей `filters.status`: insight и term, с M4.5 — task и question (спецификация
+/// M4.5 §1.3). Умолчания по виду (`task` — только явным `kinds`, `question` — `answered`) —
+/// задачи M4.5 3–5.
+const STATUSES: [&str; 11] = [
+    "active",
+    "revisit",
+    "superseded",
+    "retracted",
+    "open",
+    "in_progress",
+    "blocked",
+    "done",
+    "dropped",
+    "answered",
+    "obsolete",
+];
 /// Статусы по умолчанию (§7.5): действующие.
 const DEFAULT_STATUSES: [&str; 2] = ["active", "revisit"];
 /// Эпистемические статусы `filters.certainty` (§7.5).
@@ -1265,12 +1283,7 @@ pub(crate) fn md_inline(s: &str) -> String {
 /// Заголовок карточки записи журнала (§9.3):
 /// `i:<id> insight/<вид> «<заголовок>»  [0.77] active · hypothesis · ~120 tok`.
 fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> String {
-    let letter = match e.kind.as_str() {
-        "insight" => "i",
-        "changelog" => "c",
-        "release" => "r",
-        _ => "e",
-    };
+    let letter = EntryKind::parse(&e.kind).map_or("e", EntryKind::ref_letter);
     let mut line = format!("{letter}:{id} {}", e.kind);
     if let Some(k) = &e.insight_kind {
         line.push('/');
@@ -2701,7 +2714,16 @@ mod tests {
         let f = target_filter(&Filters::default(), false).unwrap();
         assert_eq!(f.kinds, DEFAULT_KINDS.map(String::from).to_vec());
         assert_eq!(f.statuses, DEFAULT_STATUSES.map(String::from).to_vec());
-        assert_eq!(excluded_statuses(&f), vec!["superseded", "retracted"]);
+        // исключаются все статусы, кроме выбранных (с M4.5 — и статусы task/question)
+        let rest = |keep: &[&str]| -> Vec<String> {
+            STATUSES
+                .iter()
+                .filter(|s| !keep.contains(s))
+                .map(|s| s.to_string())
+                .collect()
+        };
+        assert_eq!(excluded_statuses(&f), rest(&DEFAULT_STATUSES));
+        assert!(excluded_statuses(&f).starts_with(&["superseded".into(), "retracted".into()]));
         // include_history снимает фильтр статуса
         let f = target_filter(&Filters::default(), true).unwrap();
         assert!(f.statuses.is_empty() && excluded_statuses(&f).is_empty());
@@ -2723,10 +2745,7 @@ mod tests {
                 .certainty
                 .is_empty()
         );
-        assert_eq!(
-            excluded_statuses(&f),
-            vec!["active", "revisit", "superseded"]
-        );
+        assert_eq!(excluded_statuses(&f), rest(&["retracted"]));
         for bad in [
             Filters {
                 kinds: Some(vec!["nope".into()]),

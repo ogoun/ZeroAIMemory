@@ -200,7 +200,22 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
         EntryKind::Insight => Err(unprocessable(
             "insight создаётся отдельным API инсайтов, а не через /entries",
         )),
+        EntryKind::Term | EntryKind::Task | EntryKind::Question => Err(kind_pending(kind)),
     }
+}
+
+/// 422 для видов M4.5, чьи правила записи ещё не реализованы (спецификация M4.5 §1.3):
+/// хранилище их уже принимает, REST — со своей задачей плана. Временная заглушка задачи 1.
+fn kind_pending(kind: EntryKind) -> ApiError {
+    let task = match kind {
+        EntryKind::Term => 2,
+        EntryKind::Task => 4,
+        _ => 5,
+    };
+    unprocessable(format!(
+        "вид {} появится в задаче {task} этапа M4.5",
+        kind.as_str()
+    ))
 }
 
 pub(crate) fn check_size(st: &AppState, body: &str) -> Result<(), ApiError> {
@@ -269,6 +284,13 @@ pub async fn create(
     let raw: Value = json_body(body)?;
     if raw.get("kind").and_then(Value::as_str) == Some(EntryKind::Insight.as_str()) {
         return super::insights::create(&st, &p, &headers, &client, &space, raw).await;
+    }
+    if let Some(k @ (EntryKind::Term | EntryKind::Task | EntryKind::Question)) = raw
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(EntryKind::parse)
+    {
+        return Err(kind_pending(k));
     }
     let req: Create = serde_json::from_value(raw)
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;

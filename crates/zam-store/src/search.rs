@@ -89,8 +89,15 @@ pub struct TargetFilter {
     pub certainty: Vec<String>,
 }
 
-/// Виды записей журналов.
-const ENTRY_KINDS: [&str; 3] = ["changelog", "release", "insight"];
+/// Виды записей журналов (с M4.5 — `term`, `task`, `question`).
+const ENTRY_KINDS: [&str; 6] = [
+    "changelog",
+    "release",
+    "insight",
+    "term",
+    "task",
+    "question",
+];
 
 /// Параметры SQL фильтра целей.
 struct TargetArgs {

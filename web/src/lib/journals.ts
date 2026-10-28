@@ -30,6 +30,7 @@ export const CERTAINTY_TEXT: Record<Certainty, string> = {
   hypothesis: 'гипотеза — не проверено',
 };
 
+/** Статусы insight (фильтр списка Insights). */
 export const STATUSES: EntryStatus[] = ['active', 'revisit', 'superseded', 'retracted'];
 
 export const STATUS_TEXT: Record<EntryStatus, string> = {
@@ -37,6 +38,13 @@ export const STATUS_TEXT: Record<EntryStatus, string> = {
   revisit: 'на пересмотре',
   superseded: 'заменён',
   retracted: 'отозван',
+  open: 'открыт',
+  in_progress: 'в работе',
+  blocked: 'заблокирован',
+  done: 'выполнен',
+  dropped: 'снят',
+  answered: 'отвечен',
+  obsolete: 'неактуален',
 };
 
 export const TRIGGER_TYPES: TriggerType[] = ['file_glob', 'command_regex', 'error_regex', 'keyword'];

@@ -9,8 +9,8 @@ use zam_core::{Id, TargetKind, TargetRef};
 use super::chunks::{entry_index_state, index_entry_now, unindex_entry};
 use super::{
     AREA_MAX_CHARS, Certainty, Entry, EntryKind, EntryPatch, EntryStatus, KEY_MAX_CHARS, NewEntry,
-    REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, check_triggers, load_entry,
-    normalize_title, replace_triggers, same_triggers,
+    REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, allowed_statuses, check_triggers,
+    has_certainty, initial_status, load_entry, normalize_title, replace_triggers, same_triggers,
 };
 use crate::cache::StaleKind;
 use crate::certainty::{
@@ -246,18 +246,27 @@ fn ensure_release_version_free(
     Ok(())
 }
 
-/// Статус новой записи: у insight — `active` по умолчанию, `active` или `revisit`; у
-/// остальных видов статуса нет.
+/// Статус новой записи: без явного — [`initial_status`] вида. У insight — `active` или
+/// `revisit`; у term, task и question — только начальный (замещение, отзыв и переходы
+/// статуса — отдельные операции, задачи M4.5 2, 4, 5) **[решение исполнителя]**; у
+/// changelog и release статуса нет.
 fn new_status(kind: EntryKind, s: Option<EntryStatus>) -> Result<Option<EntryStatus>, StoreError> {
+    let initial = initial_status(kind);
     match (kind, s) {
-        (EntryKind::Insight, None) => Ok(Some(EntryStatus::Active)),
+        (_, None) => Ok(initial),
+        (_, Some(_)) if initial.is_none() => Err(bad(format!("у {} статуса нет", kind.as_str()))),
         (EntryKind::Insight, Some(s @ (EntryStatus::Active | EntryStatus::Revisit))) => Ok(Some(s)),
-        (EntryKind::Insight, Some(s)) => Err(bad(format!(
-            "новая запись не может быть {}: замещение и отзыв — отдельные операции",
+        (_, Some(s)) if Some(s) == initial => Ok(Some(s)),
+        (_, Some(s)) if allowed_statuses(kind).contains(&s) => Err(bad(format!(
+            "новая запись {} не может быть {}: замещение, отзыв и смена статуса — отдельные операции",
+            kind.as_str(),
             s.as_str()
         ))),
-        (_, Some(_)) => Err(bad("статус есть только у insight")),
-        (_, None) => Ok(None),
+        (_, Some(s)) => Err(bad(format!(
+            "статус {} недопустим для {}",
+            s.as_str(),
+            kind.as_str()
+        ))),
     }
 }
 
@@ -276,8 +285,8 @@ pub(crate) fn insert_entry(
         ensure_release_version_free(c, e.space_id, &e.data, None)?;
     }
     let status = new_status(e.kind, e.status)?;
-    if e.kind != EntryKind::Insight && e.certainty.is_some() {
-        return Err(bad("certainty есть только у insight"));
+    if !has_certainty(e.kind) && e.certainty.is_some() {
+        return Err(bad("certainty есть только у insight и term"));
     }
     // без явного статуса insight агента — hypothesis, человека и system — без статуса (§7.5)
     let certainty = e
@@ -567,8 +576,12 @@ pub async fn update_entry(
             f.area = check_area(ar)?;
         }
         if let Some(s) = p.status {
+            // переходы статусов term, task и question — задачи M4.5 2, 4, 5
             if cur.kind != EntryKind::Insight {
-                return Err(bad("статус есть только у insight"));
+                return Err(bad(format!(
+                    "статус {} правкой не меняется",
+                    cur.kind.as_str()
+                )));
             }
             if !matches!(s, EntryStatus::Active | EntryStatus::Revisit) {
                 return Err(bad(
@@ -586,8 +599,8 @@ pub async fn update_entry(
             f.status = Some(s);
         }
         if let Some(c) = p.certainty {
-            if cur.kind != EntryKind::Insight {
-                return Err(bad("certainty есть только у insight"));
+            if !has_certainty(cur.kind) {
+                return Err(bad("certainty есть только у insight и term"));
             }
             f.certainty = c;
         }

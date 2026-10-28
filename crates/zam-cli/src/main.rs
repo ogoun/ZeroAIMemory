@@ -156,10 +156,10 @@ enum Cmd {
         cmd: SolutionCmd,
     },
     /// Связь графа: `SRC TYPE DST` — создать (TYPE: links_to, relates_to, depends_on,
-    /// part_of, caused_by, fixes, derived_from, mentions; DST — ещё и [[Имя]]); `rm EDGE-ID`
-    /// — удалить явную связь
+    /// part_of, caused_by, fixes, derived_from, mentions, contradicts; DST — ещё и [[Имя]]);
+    /// `rm EDGE-ID` — удалить явную связь
     Link {
-        /// SRC TYPE DST или rm EDGE-ID; SRC и DST — n:<id>, e:<id> (i:/c:/r:) или [space:]path
+        /// SRC TYPE DST или rm EDGE-ID; SRC и DST — n:<id>, e:<id> (i:/c:/r:/t:/k:/q:) или [space:]path
         #[arg(required = true, num_args = 2..=3, value_names = ["SRC|rm", "TYPE|EDGE-ID", "DST"])]
         args: Vec<String>,
         #[command(flatten)]
@@ -167,7 +167,7 @@ enum Cmd {
     },
     /// Связи узла или записи: исходящие (→) и обратные (←)
     Links {
-        /// n:<id>, e:<id> (i:/c:/r:) или [space:]path
+        /// n:<id>, e:<id> (i:/c:/r:/t:/k:/q:) или [space:]path
         target: String,
         #[command(flatten)]
         common: Common,
@@ -499,7 +499,7 @@ enum CacheCmd {
         /// Запрос, на который отвечает выжимка
         #[arg(long)]
         query: String,
-        /// Источники через запятую: ID[#СЕКЦИЯ][@REV] (n:/i:/c:/r:, голый id или space:/путь)
+        /// Источники через запятую: ID[#СЕКЦИЯ][@REV] (n:/i:/c:/r:/t:/k:/q:, голый id или space:/путь)
         #[arg(long, required = true)]
         sources: Vec<String>,
         /// Сразу превратить: note:<путь> или insight:<вид>

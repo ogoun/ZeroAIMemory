@@ -5,7 +5,7 @@
 //!             session_id?, format?: "json"|"md", budget_tokens?}
 //! ```
 //!
-//! - `id`: `n:<id>` (узел), `i:|c:|r:<id>` (запись журнала; `e:` тоже), голый id (узел, иначе
+//! - `id`: `n:<id>` (узел), `i:|c:|r:|t:|k:|q:<id>` (запись журнала; `e:` тоже), голый id (узел, иначе
 //!   запись) или путь `<пространство>:/<путь>` (`knowledge:/Инструменты/Bash`). Не больше
 //!   `read.max_items` (20) элементов, пусто или больше — 422; `locator` — 422
 //!   `locator-unsupported` (этап M5). Некорректный `tier`, нулевые `max_tokens` и
@@ -147,9 +147,9 @@ enum Content {
 struct Fetched {
     /// `id` как в запросе.
     raw: String,
-    /// Каноническая ссылка `n:<id>` | `i:|c:|r:<id>`.
+    /// Каноническая ссылка `n:<id>` | `i:|c:|r:|t:|k:|q:<id>`.
     reference: String,
-    /// `node` | `insight` | `changelog` | `release`.
+    /// `node` или вид записи (`insight`, `changelog`, `release`, `term`, `task`, `question`).
     kind: &'static str,
     /// Начало заголовка: ссылка и путь узла либо вид и заголовок записи.
     head: String,
@@ -207,6 +207,15 @@ fn miss() -> Failure {
     Failure::Item(Fail::new("not_found", None))
 }
 
+/// Префикс ссылки элемента: `n` (узел) или буква записи (`i|c|r|t|k|q|e`) и остаток; без
+/// известного префикса — `(None, raw)`.
+fn split_ref(raw: &str) -> (Option<&str>, &str) {
+    match raw.split_once(':') {
+        Some((k, rest)) if k == "n" || zam_store::is_entry_ref_letter(k) => (Some(k), rest),
+        _ => (None, raw),
+    }
+}
+
 /// Находит узел или запись по `id` элемента с проверкой доступа (Human по токену и чужая база
 /// вне решения — `not_found`).
 async fn resolve(
@@ -231,10 +240,7 @@ async fn resolve(
             role: sc.role,
         }));
     }
-    let (prefix, rest) = match raw.split_once(':') {
-        Some((k @ ("n" | "i" | "c" | "r" | "e"), rest)) => (Some(k), rest),
-        _ => (None, raw),
-    };
+    let (prefix, rest) = split_ref(raw);
     rest.parse::<Id>().map_err(|_| miss())?;
     match prefix {
         Some("n") => Ok(Located::Node(
@@ -363,11 +369,7 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
             _ => Content::Text { text, whole },
         }
     };
-    let (letter, kind) = match e.kind {
-        EntryKind::Insight => ("i", "insight"),
-        EntryKind::Changelog => ("c", "changelog"),
-        EntryKind::Release => ("r", "release"),
-    };
+    let (letter, kind) = (e.kind.ref_letter(), e.kind.as_str());
     let reference = format!("{letter}:{}", e.id);
     let sub = match e.kind {
         EntryKind::Release => None,
@@ -745,4 +747,28 @@ pub async fn read(
             .insert(ERROR_HEADER, HeaderValue::from_static(code));
     }
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Буквы ссылок записи в `id` элемента: `i|c|r|e` и с M4.5 `t` (term), `k` (task),
+    /// `q` (question); неизвестный префикс — путь или голый id.
+    #[test]
+    fn entry_ref_letters() {
+        for p in ["n", "i", "c", "r", "e", "t", "k", "q"] {
+            let raw = format!("{p}:01ABC");
+            assert_eq!(split_ref(&raw), (Some(p), "01ABC"), "{p}");
+        }
+        assert_eq!(split_ref("x:01ABC"), (None, "x:01ABC"));
+        assert_eq!(split_ref("01ABC"), (None, "01ABC"));
+        for k in EntryKind::ALL {
+            assert!(zam_store::is_entry_ref_letter(k.ref_letter()));
+            assert_eq!(EntryKind::from_ref_letter(k.ref_letter()), Some(k));
+        }
+        assert_eq!(EntryKind::Term.ref_letter(), "t");
+        assert_eq!(EntryKind::Task.ref_letter(), "k");
+        assert_eq!(EntryKind::Question.ref_letter(), "q");
+    }
 }

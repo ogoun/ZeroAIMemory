@@ -20,30 +20,37 @@ pub static SYSTEM_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         sql: include_str!("../migrations/system/0001_init.sql"),
+        rebuild: false,
     },
     Migration {
         version: 2,
         sql: include_str!("../migrations/system/0002_index_skipped.sql"),
+        rebuild: false,
     },
     Migration {
         version: 3,
         sql: include_str!("../migrations/system/0003_solutions.sql"),
+        rebuild: false,
     },
     Migration {
         version: 4,
         sql: include_str!("../migrations/system/0004_human_tokens.sql"),
+        rebuild: false,
     },
     Migration {
         version: 5,
         sql: include_str!("../migrations/system/0005_vault_keys.sql"),
+        rebuild: false,
     },
     Migration {
         version: 6,
         sql: include_str!("../migrations/system/0006_user_passwords.sql"),
+        rebuild: false,
     },
     Migration {
         version: 7,
         sql: include_str!("../migrations/system/0007_user_settings.sql"),
+        rebuild: false,
     },
 ];
 

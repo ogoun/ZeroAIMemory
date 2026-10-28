@@ -1345,3 +1345,100 @@ async fn title_duplicates_same_area_and_active_only() {
             .is_empty()
     );
 }
+
+/// Таблица статусов по виду (спецификация M4.5 §1.3) и начальные статусы.
+#[test]
+fn allowed_statuses_per_kind() {
+    use EntryStatus::*;
+    let table: [(EntryKind, &[EntryStatus], Option<EntryStatus>); 6] = [
+        (EntryKind::Changelog, &[], None),
+        (EntryKind::Release, &[], None),
+        (
+            EntryKind::Insight,
+            &[Active, Revisit, Superseded, Retracted],
+            Some(Active),
+        ),
+        (
+            EntryKind::Term,
+            &[Active, Superseded, Retracted],
+            Some(Active),
+        ),
+        (
+            EntryKind::Task,
+            &[Open, InProgress, Blocked, Done, Dropped],
+            Some(Open),
+        ),
+        (EntryKind::Question, &[Open, Answered, Obsolete], Some(Open)),
+    ];
+    assert_eq!(table.len(), EntryKind::ALL.len());
+    for (kind, statuses, initial) in table {
+        assert_eq!(zam_store::allowed_statuses(kind), statuses, "{kind:?}");
+        assert_eq!(zam_store::initial_status(kind), initial, "{kind:?}");
+        if let Some(s) = initial {
+            assert!(statuses.contains(&s));
+        }
+    }
+    // строки статусов task — snake_case, как в CHECK миграции 0015
+    let names: Vec<&str> = zam_store::allowed_statuses(EntryKind::Task)
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    assert_eq!(names, ["open", "in_progress", "blocked", "done", "dropped"]);
+    assert_eq!(
+        serde_json::to_value(EntryKind::Question).unwrap(),
+        json!("question")
+    );
+}
+
+/// Новые виды M4.5 хранилище принимает через `create_entry`: начальный статус по виду,
+/// другой статус при создании и `certainty` не у insight/term — `BadInput`.
+#[tokio::test]
+async fn new_kinds_via_create_entry() {
+    let (db, k, _) = setup("new-kinds").await;
+    let mk = |kind: EntryKind, title: &str| NewEntry {
+        kind,
+        data: json!({}),
+        certainty: None,
+        ..insight(k, title, "Тело.")
+    };
+    for (kind, status) in [
+        (EntryKind::Term, EntryStatus::Active),
+        (EntryKind::Task, EntryStatus::Open),
+        (EntryKind::Question, EntryStatus::Open),
+    ] {
+        let (e, created) = create_entry(&db, mk(kind, kind.as_str()), &agent())
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!((e.kind, e.status), (kind, Some(status)));
+        assert_eq!(get_entry(&db, e.id).await.unwrap().status, Some(status));
+    }
+    let mut task = mk(EntryKind::Task, "задача в работе");
+    task.status = Some(EntryStatus::InProgress);
+    assert!(matches!(
+        create_entry(&db, task, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+    let mut term = mk(EntryKind::Term, "термин на пересмотре");
+    term.status = Some(EntryStatus::Revisit);
+    assert!(matches!(
+        create_entry(&db, term, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+    let mut term = mk(EntryKind::Term, "термин-гипотеза");
+    term.certainty = Some(Certainty::Hypothesis);
+    let (e, _) = create_entry(&db, term, &agent()).await.unwrap();
+    assert_eq!(e.certainty, Some(Certainty::Hypothesis));
+    let mut task = mk(EntryKind::Task, "задача с certainty");
+    task.certainty = Some(Certainty::Hypothesis);
+    assert!(matches!(
+        create_entry(&db, task, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+    let mut ch = changelog(k, "changelog со статусом");
+    ch.status = Some(EntryStatus::Open);
+    assert!(matches!(
+        create_entry(&db, ch, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+}

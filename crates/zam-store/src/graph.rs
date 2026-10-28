@@ -71,11 +71,14 @@ pub enum EdgeType {
     Supersedes,
     DerivedFrom,
     Mentions,
+    /// Несогласие с записью (спецификация M4.5 §5.2): явный тип — `POST /edges`, `links`
+    /// записи, `relations:` заметки.
+    Contradicts,
 }
 
 impl EdgeType {
-    /// Все типы в порядке §8.5.
-    pub const ALL: [EdgeType; 9] = [
+    /// Все типы в порядке §8.5 (с M4.5 — и `contradicts`).
+    pub const ALL: [EdgeType; 10] = [
         EdgeType::LinksTo,
         EdgeType::RelatesTo,
         EdgeType::DependsOn,
@@ -85,6 +88,7 @@ impl EdgeType {
         EdgeType::Supersedes,
         EdgeType::DerivedFrom,
         EdgeType::Mentions,
+        EdgeType::Contradicts,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -98,6 +102,7 @@ impl EdgeType {
             EdgeType::Supersedes => "supersedes",
             EdgeType::DerivedFrom => "derived_from",
             EdgeType::Mentions => "mentions",
+            EdgeType::Contradicts => "contradicts",
         }
     }
 
@@ -1143,6 +1148,12 @@ mod tests {
                 format!("\"{}\"", t.as_str())
             );
         }
+        assert_eq!(EdgeType::ALL.len(), 10);
+        assert_eq!(EdgeType::parse("contradicts"), Some(EdgeType::Contradicts));
+        assert_eq!(
+            serde_json::to_string(&EdgeType::Contradicts).unwrap(),
+            "\"contradicts\""
+        );
         assert_eq!(EdgeType::parse("LinksTo"), None);
         assert_eq!(EdgeOrigin::parse("system"), Some(EdgeOrigin::System));
     }

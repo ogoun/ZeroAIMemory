@@ -1,7 +1,7 @@
 //! Граф связей (§8.5, §13): `zam link <src> <type> <dst>`, `zam link rm <edge-id>`,
 //! `zam links <id>`.
 //!
-//! Цель — `n:<id>` (узел), `e:<id>` / `i:<id>` / `c:<id>` / `r:<id>` (запись журнала, как в
+//! Цель — `n:<id>` (узел), `e:<id>` / `i:|c:|r:|t:|k:|q:<id>` (запись журнала, как в
 //! карточках поиска), `[space:]path` заметки; у `dst` ещё `[[Имя]]` (заметка в пространстве
 //! источника). Тип — из §8.5 (`supersedes` ставит только замещение insight).
 //!
@@ -35,12 +35,13 @@ pub fn target_ref(ctx: &Ctx, raw: &str, wiki: bool) -> Result<String, CliError> 
     Ok(format!("n:{}", ctx.node_id(&loc)?))
 }
 
-/// `n:`/`node:` → `n:<id>`; `e:`/`entry:`/`i:`/`c:`/`r:` → `e:<id>`; иначе `None`.
+/// `n:`/`node:` → `n:<id>`; `e:`/`entry:`/`i:|c:|r:|t:|k:|q:` → `e:<id>`; иначе `None`.
 fn short_ref(t: &str) -> Option<String> {
     let (k, id) = t.split_once(':')?;
     let kind = match k {
         "n" | "node" => "n",
-        "e" | "entry" | "i" | "c" | "r" => "e",
+        "entry" => "e",
+        k if crate::target::ENTRY_REF_LETTERS.contains(&k) => "e",
         _ => return None,
     };
     // id — 26 символов base32 (или UUID); проверку формата делает сервер

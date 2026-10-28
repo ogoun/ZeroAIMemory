@@ -1,5 +1,5 @@
-//! Записи журналов решения (§7.2–7.5 ТЗ): Changelog, Releases и Insights в таблице
-//! `entries`, их ревизии (`entry_revisions`, только дописываются) и синхронная индексация.
+//! Записи журналов решения (§7.2–7.5 ТЗ): Changelog, Releases и Insights, с M4.5 — термины
+//! словаря, задачи и вопросы (спецификация M4.5 §1.3) в таблице `entries`, их ревизии (`entry_revisions`, только дописываются) и синхронная индексация.
 //!
 //! Структура модуля:
 //! - `mod.rs` — типы и отображение строк `entries`;
@@ -10,8 +10,9 @@
 //! - [`chunks`] — чанки записи (документ `# <title>\n\n<body>` → `chunk_note`), FTS и задания
 //!   индексации (`target_kind = 'entry'`) в той же транзакции; данные для воркера и reindex.
 //!
-//! Хранилище проверяет только целостность: статус есть только у insight; переходы
-//! `active ↔ revisit` — правкой, `→ superseded` — замещением, `→ retracted` — отзывом с
+//! Хранилище проверяет только целостность: статуса нет только у changelog и release, у
+//! остальных видов он из множества [`allowed_statuses`]; новая запись получает
+//! [`initial_status`]. Переходы insight `active ↔ revisit` — правкой, `→ superseded` — замещением, `→ retracted` — отзывом с
 //! непустой причиной; из `superseded` и `retracted` обратно не возвращаются. Права на
 //! `certainty` (кто и когда может ставить `axiom`/`theorem`) — [`crate::certainty`]: каждая
 //! операция записи проверяет их в своей транзакции.
@@ -57,7 +58,7 @@ macro_rules! text_enum {
     ($(#[$m:meta])* $name:ident { $($var:ident => $s:literal),+ $(,)? }) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(rename_all = "lowercase")]
+        #[serde(rename_all = "snake_case")]
         pub enum $name {
             $($var),+
         }
@@ -99,23 +100,104 @@ macro_rules! text_enum {
 }
 
 text_enum!(
-    /// Вид записи журнала.
+    /// Вид записи журнала (спецификация M4.5 §1.3): журналы решения, словарь (`term`),
+    /// журнал задач (`task`) и вопросы к человеку (`question`).
     EntryKind {
         Changelog => "changelog",
         Release => "release",
         Insight => "insight",
+        Term => "term",
+        Task => "task",
+        Question => "question",
     }
 );
 
+impl EntryKind {
+    /// Все виды записей в порядке объявления.
+    pub const ALL: [EntryKind; 6] = [
+        EntryKind::Changelog,
+        EntryKind::Release,
+        EntryKind::Insight,
+        EntryKind::Term,
+        EntryKind::Task,
+        EntryKind::Question,
+    ];
+
+    /// Буква ссылки записи в выдаче (`i:<id>`, §9.3 ТЗ; спецификация M4.5 §1.3): `i` —
+    /// insight, `c` — changelog, `r` — release, `t` — term, `k` — task, `q` — question.
+    /// Общая ссылка записи любого вида — `e:<id>`.
+    pub fn ref_letter(self) -> &'static str {
+        match self {
+            EntryKind::Insight => "i",
+            EntryKind::Changelog => "c",
+            EntryKind::Release => "r",
+            EntryKind::Term => "t",
+            EntryKind::Task => "k",
+            EntryKind::Question => "q",
+        }
+    }
+
+    /// Вид по букве ссылки ([`EntryKind::ref_letter`]); `e` и прочие — `None`.
+    pub fn from_ref_letter(s: &str) -> Option<EntryKind> {
+        EntryKind::ALL.into_iter().find(|k| k.ref_letter() == s)
+    }
+}
+
+/// Буквы ссылок записи: по виду ([`EntryKind::ref_letter`]) и общая `e`.
+pub const ENTRY_REF_LETTERS: [&str; 7] = ["i", "c", "r", "t", "k", "q", "e"];
+
+/// Буква — ссылка записи журнала (`i|c|r|t|k|q|e`).
+pub fn is_entry_ref_letter(s: &str) -> bool {
+    ENTRY_REF_LETTERS.contains(&s)
+}
+
 text_enum!(
-    /// Статус insight (§7.5): жизненный цикл записи.
+    /// Статус записи по виду (§7.5 ТЗ, спецификация M4.5 §1.3): у insight и term — жизненный
+    /// цикл знания, у task — ход работы, у question — ответ. Допустимые множества —
+    /// [`allowed_statuses`]; `open` общий у task и question.
     EntryStatus {
         Active => "active",
         Revisit => "revisit",
         Superseded => "superseded",
         Retracted => "retracted",
+        Open => "open",
+        InProgress => "in_progress",
+        Blocked => "blocked",
+        Done => "done",
+        Dropped => "dropped",
+        Answered => "answered",
+        Obsolete => "obsolete",
     }
 );
+
+/// Допустимые статусы вида (спецификация M4.5 §1.3; та же таблица — CHECK миграции 0015).
+/// У changelog и release статуса нет — пусто.
+pub fn allowed_statuses(kind: EntryKind) -> &'static [EntryStatus] {
+    use EntryStatus::*;
+    match kind {
+        EntryKind::Changelog | EntryKind::Release => &[],
+        EntryKind::Insight => &[Active, Revisit, Superseded, Retracted],
+        EntryKind::Term => &[Active, Superseded, Retracted],
+        EntryKind::Task => &[Open, InProgress, Blocked, Done, Dropped],
+        EntryKind::Question => &[Open, Answered, Obsolete],
+    }
+}
+
+/// Начальный статус новой записи вида: insight и term — `active`, task и question — `open`,
+/// у changelog и release статуса нет.
+pub fn initial_status(kind: EntryKind) -> Option<EntryStatus> {
+    match kind {
+        EntryKind::Changelog | EntryKind::Release => None,
+        EntryKind::Insight | EntryKind::Term => Some(EntryStatus::Active),
+        EntryKind::Task | EntryKind::Question => Some(EntryStatus::Open),
+    }
+}
+
+/// Есть ли у вида эпистемический статус `certainty` (спецификация M4.5 §1.3: insight и term;
+/// у решения из ответа на вопрос — это insight).
+pub fn has_certainty(kind: EntryKind) -> bool {
+    matches!(kind, EntryKind::Insight | EntryKind::Term)
+}
 
 text_enum!(
     /// Эпистемический статус (§7.5): насколько записи можно доверять. Правила —
@@ -379,7 +461,7 @@ mod tests {
 
     #[test]
     fn enums_round_trip() {
-        for k in [EntryKind::Changelog, EntryKind::Release, EntryKind::Insight] {
+        for k in EntryKind::ALL {
             assert_eq!(EntryKind::parse(k.as_str()), Some(k));
             assert_eq!(
                 serde_json::to_string(&k).unwrap(),
@@ -388,6 +470,14 @@ mod tests {
         }
         assert_eq!(Certainty::parse("axiom"), Some(Certainty::Axiom));
         assert_eq!(EntryStatus::parse("Active"), None);
+        assert_eq!(
+            serde_json::to_string(&EntryStatus::InProgress).unwrap(),
+            "\"in_progress\""
+        );
+        assert_eq!(
+            EntryStatus::parse("in_progress"),
+            Some(EntryStatus::InProgress)
+        );
         assert_eq!(
             serde_json::from_str::<Certainty>("\"hypothesis\"").unwrap(),
             Certainty::Hypothesis

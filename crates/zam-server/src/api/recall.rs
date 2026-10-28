@@ -246,12 +246,7 @@ fn data_kind(e: &Entry) -> String {
 }
 
 fn entry_ref(e: &Entry) -> String {
-    let letter = match e.kind {
-        EntryKind::Insight => "i",
-        EntryKind::Changelog => "c",
-        EntryKind::Release => "r",
-    };
-    format!("{letter}:{}", e.id)
+    format!("{}:{}", e.kind.ref_letter(), e.id)
 }
 
 /// Подсказка-запись журнала.

@@ -18,7 +18,7 @@
 //!   так поиск с той же областью находит выжимку точным совпадением; `scope.spaces` и
 //!   `all_solutions` ключ не описывает — 400. Новая выжимка заменяет прежнюю того же ключа
 //!   только того же автора (агент или человек, пользователь) и той же сессии (fix round 1);
-//! - **источники** (`id` — как в `POST /read`: `n:`, `i:|c:|r:|e:`, голый id, путь
+//! - **источники** (`id` — как в `POST /read`: `n:`, `i:|c:|r:|t:|k:|q:|e:`, голый id, путь
 //!   `<пространство>:/<путь>`): должны лежать в базе пространства кэша (иначе 422
 //!   `/problems/cache-cross-db`); Human и Vault — 422 `/problems/cache-forbidden-source`;
 //!   нет источника, он удалён, папка или нет секции — 422 `/problems/cache-source-not-found`;
@@ -254,14 +254,16 @@ async fn resolve_source(
         });
     }
     let (prefix, rest) = match raw.split_once(':') {
-        Some((k @ ("n" | "i" | "c" | "r" | "e" | "v"), rest)) => (Some(k), rest),
+        Some((k, rest)) if k == "n" || k == "v" || zam_store::is_entry_ref_letter(k) => {
+            (Some(k), rest)
+        }
         _ => (None, raw),
     };
     let Ok(id) = rest.parse::<Id>() else {
         return Err(not_found(raw));
     };
     let prefix = match prefix {
-        Some("i" | "c" | "r" | "e") => Some("e"),
+        Some(k) if zam_store::is_entry_ref_letter(k) => Some("e"),
         other => other,
     };
     // база кэша — целиком, кроме участника: ему видно только пространство решения

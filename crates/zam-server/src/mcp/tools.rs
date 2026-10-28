@@ -12,7 +12,7 @@
 //! - **Пространство по умолчанию** (`memory_tree`, `memory_write`, `memory_log`,
 //!   `memory_vault`) **[решение исполнителя]** — решение из `X-Zam-Solution`, без него —
 //!   `knowledge`.
-//! - **Ссылки** `i:|c:|r:|e:<id>` (как в карточках поиска) принимаются везде, где REST ждёт id
+//! - **Ссылки** `i:|c:|r:|t:|k:|q:|e:<id>` (как в карточках поиска) принимаются везде, где REST ждёт id
 //!   записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`.
 use std::sync::{Arc, LazyLock};
 
@@ -82,7 +82,7 @@ impl ToolName {
                  Дальше — memory_read нужного."
             }
             ToolName::Read => {
-                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:<id> или путь <пространство>:/<путь>. \
+                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id> или путь <пространство>:/<путь>. \
                  tier L0|L1|L2, section, max_tokens; if_rev равна текущей — unchanged без текста. \
                  Ошибка по элементу — в самом элементе."
             }
@@ -229,7 +229,7 @@ impl ToolName {
             ),
             ToolName::Log => (
                 json!({
-                    "kind": {"type": "string", "enum": ["changelog", "insight", "release"]},
+                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "question"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
                     "data": {"type": "object", "description": "insight: kind, experiment, evidence"},
@@ -597,21 +597,21 @@ fn default_space(rest: &Rest) -> String {
         .to_string()
 }
 
-/// Id записи журнала без префикса ссылки `i:|c:|r:|e:`.
+/// Id записи журнала без префикса ссылки `i:|c:|r:|t:|k:|q:|e:` (или `entry:`).
 fn entry_id(raw: &str) -> &str {
     let t = raw.trim();
-    ["i:", "c:", "r:", "e:", "entry:"]
-        .iter()
-        .find_map(|p| t.strip_prefix(p))
-        .unwrap_or(t)
+    match t.split_once(':') {
+        Some((p, id)) if p == "entry" || zam_store::is_entry_ref_letter(p) => id,
+        _ => t,
+    }
 }
 
-/// Ссылка графа: `i:|c:|r:<id>` → `e:<id>`, остальное — как есть.
+/// Ссылка графа: `i:|c:|r:|t:|k:|q:<id>` → `e:<id>`, остальное — как есть.
 fn graph_ref(raw: &str) -> String {
     let t = raw.trim();
-    match ["i:", "c:", "r:"].iter().find_map(|p| t.strip_prefix(p)) {
-        Some(id) => format!("e:{id}"),
-        None => t.to_string(),
+    match t.split_once(':') {
+        Some((p, id)) if zam_store::EntryKind::from_ref_letter(p).is_some() => format!("e:{id}"),
+        _ => t.to_string(),
     }
 }
 
@@ -927,12 +927,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
 /// Строка записи журнала: `i:<id> insight/<вид> «заголовок» rev<N> · status · certainty`.
 fn entry_line(e: &Value) -> String {
     let kind = e["kind"].as_str().unwrap_or("entry");
-    let prefix = match kind {
-        "insight" => "i",
-        "changelog" => "c",
-        "release" => "r",
-        _ => "e",
-    };
+    let prefix = zam_store::EntryKind::parse(kind).map_or("e", zam_store::EntryKind::ref_letter);
     let mut s = format!("{prefix}:{} {kind}", e["id"].as_str().unwrap_or("?"));
     if let Some(k) = e["data"]["kind"].as_str() {
         s.push_str(&format!("/{k}"));
@@ -953,8 +948,10 @@ fn entry_line(e: &Value) -> String {
 async fn log(rest: &Rest, args: &JsonObject) -> Res {
     let f = fmt(args)?;
     let kind = req_str(args, "kind")?;
-    if !["changelog", "insight", "release"].contains(&kind) {
-        return Err(Fail::Invalid("kind: changelog, insight или release".into()));
+    if zam_store::EntryKind::parse(kind).is_none() {
+        return Err(Fail::Invalid(
+            "kind: changelog, insight, release, term, task или question".into(),
+        ));
     }
     req_str(args, "title")?;
     let space = opt_str(args, "space")?
@@ -1398,6 +1395,33 @@ mod tests {
         let s = with_tokens("Ничего не найдено.".into());
         let last = s.rsplit('\n').next().unwrap();
         assert!(last.starts_with('~') && last.ends_with(" tok"), "{s}");
+    }
+
+    /// Буквы ссылок M4.5 (`t:` term, `k:` task, `q:` question) — как `i:|c:|r:|e:`
+    /// (спецификация M4.5 §1.3); строка записи печатает букву своего вида.
+    #[test]
+    fn entry_ref_letters() {
+        for p in ["i", "c", "r", "t", "k", "q", "e", "entry"] {
+            assert_eq!(entry_id(&format!("{p}:01ABC")), "01ABC", "{p}");
+        }
+        for p in ["i", "c", "r", "t", "k", "q"] {
+            assert_eq!(graph_ref(&format!("{p}:01ABC")), "e:01ABC", "{p}");
+        }
+        assert_eq!(graph_ref("e:01ABC"), "e:01ABC");
+        assert_eq!(graph_ref("knowledge:/a"), "knowledge:/a");
+        for (kind, letter) in [
+            ("term", "t"),
+            ("task", "k"),
+            ("question", "q"),
+            ("insight", "i"),
+        ] {
+            let line = entry_line(&json!({"id": "01ABC", "kind": kind, "title": "x", "rev": 1}));
+            assert!(
+                line.starts_with(&format!("{letter}:01ABC {kind}")),
+                "{line}"
+            );
+        }
+        assert!(entry_line(&json!({"id": "01ABC", "kind": "?", "rev": 1})).starts_with("e:01ABC"));
     }
 
     #[test]

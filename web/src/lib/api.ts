@@ -526,8 +526,22 @@ export const reindex = (full: boolean) =>
 
 /** Эпистемический статус (§7.5): `axiom` ставит и меняет только человек. */
 export type Certainty = 'axiom' | 'theorem' | 'hypothesis';
-export type EntryKind = 'changelog' | 'release' | 'insight';
-export type EntryStatus = 'active' | 'revisit' | 'superseded' | 'retracted';
+/** Вид записи (спецификация M4.5 §1.3): с M4.5 — термин словаря, задача, вопрос. */
+export type EntryKind = 'changelog' | 'release' | 'insight' | 'term' | 'task' | 'question';
+/** Статус по виду: insight/term — `active…retracted` (у term без `revisit`), task —
+ * `open…dropped`, question — `open`, `answered`, `obsolete`. */
+export type EntryStatus =
+  | 'active'
+  | 'revisit'
+  | 'superseded'
+  | 'retracted'
+  | 'open'
+  | 'in_progress'
+  | 'blocked'
+  | 'done'
+  | 'dropped'
+  | 'answered'
+  | 'obsolete';
 export type TriggerType = 'file_glob' | 'command_regex' | 'error_regex' | 'keyword';
 
 export interface AuthorView {

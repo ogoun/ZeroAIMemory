@@ -21,58 +21,77 @@ pub static USER_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         sql: include_str!("../migrations/user/0001_init.sql"),
+        rebuild: false,
     },
     Migration {
         version: 2,
         sql: include_str!("../migrations/user/0002_notes.sql"),
+        rebuild: false,
     },
     Migration {
         version: 3,
         sql: include_str!("../migrations/user/0003_revisions_append_only.sql"),
+        rebuild: false,
     },
     Migration {
         version: 4,
         sql: include_str!("../migrations/user/0004_index.sql"),
+        rebuild: false,
     },
     Migration {
         version: 5,
         sql: include_str!("../migrations/user/0005_embed_key.sql"),
+        rebuild: false,
     },
     Migration {
         version: 6,
         sql: include_str!("../migrations/user/0006_pending_index.sql"),
+        rebuild: false,
     },
     Migration {
         version: 7,
         sql: include_str!("../migrations/user/0007_attribution.sql"),
+        rebuild: false,
     },
     Migration {
         version: 8,
         sql: include_str!("../migrations/user/0008_entries.sql"),
+        rebuild: false,
     },
     Migration {
         version: 9,
         sql: include_str!("../migrations/user/0009_node_certainty.sql"),
+        rebuild: false,
     },
     Migration {
         version: 10,
         sql: include_str!("../migrations/user/0010_edges.sql"),
+        rebuild: false,
     },
     Migration {
         version: 11,
         sql: include_str!("../migrations/user/0011_vault.sql"),
+        rebuild: false,
     },
     Migration {
         version: 12,
         sql: include_str!("../migrations/user/0012_live_children.sql"),
+        rebuild: false,
     },
     Migration {
         version: 13,
         sql: include_str!("../migrations/user/0013_sessions_usage.sql"),
+        rebuild: false,
     },
     Migration {
         version: 14,
         sql: include_str!("../migrations/user/0014_answer_cache.sql"),
+        rebuild: false,
+    },
+    Migration {
+        version: 15,
+        sql: include_str!("../migrations/user/0015_entries_kinds.sql"),
+        rebuild: true,
     },
 ];
 
