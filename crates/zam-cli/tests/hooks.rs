@@ -766,6 +766,102 @@ fn checkpoint_reminds_once_and_respects_stop_hook_active() {
     empty(&stop("cp-3", false));
 }
 
+/// Задача журнала (M4.5 §3): `in_progress`, захваченная сессией, и правки — единственное
+/// напоминание просит обновить `next_step`, даже если в память уже писали (захват — запись).
+/// Задача `open` напоминания не вызывает. Заодно — `zam task new|claim|status|show|list`.
+#[test]
+fn checkpoint_reminds_next_step_for_claimed_task() {
+    let _g = serial();
+    let (url, tok) = start("checkpoint-task");
+    let p = Proj::new("checkpoint-task", &url, &tok);
+    let start_s = |s: &str| {
+        p.hook(
+            "session-start",
+            &p.ev("SessionStart", s, json!({"source": "startup"})),
+        )
+    };
+    let stop = |s: &str| {
+        p.hook(
+            "checkpoint",
+            &p.ev("Stop", s, json!({"stop_hook_active": false})),
+        )
+    };
+    let task = |envs: bool, args: &[&str]| {
+        let mut c = p.cmd(&p.url);
+        if envs {
+            c.env("CLAUDECODE", "1");
+        }
+        c.args(["task"])
+            .args(args)
+            .write_stdin(
+                "План.
+",
+            )
+            .output()
+            .unwrap()
+    };
+    let new_task = |title: &str| {
+        id_of(&ok(&task(
+            false,
+            &["new", "--global", "--title", title, "--next", "первый шаг"],
+        )))
+    };
+    // сессия с задачей в работе
+    start_s("cp-t1");
+    let t1 = new_task("Рефакторинг");
+    let k1 = format!("k:{t1}");
+    ok(&task(true, &["claim", &k1, "--ttl", "30"]));
+    ok(&task(
+        true,
+        &["status", &k1, "in_progress", "--next", "второй шаг"],
+    ));
+    let card = ok(&task(false, &["show", &k1]));
+    assert!(card.contains("[in_progress] «Рефакторинг»"), "{card}");
+    assert!(card.contains("захвачена: сессия cp-t1"), "{card}");
+    assert!(card.contains("далее: второй шаг"), "{card}");
+    assert!(ok(&task(false, &["list", "--global"])).contains(&t1));
+    let j = p.session("cp-t1");
+    assert_eq!(j["claimed_tasks"][0]["id"], t1.as_str(), "{j}");
+    assert!(j["memory_writes"].as_i64().unwrap() >= 2, "{j}");
+    // без правок — тишина; с правками — напоминание о next_step, один раз
+    empty(&stop("cp-t1"));
+    p.hook("pre-tool", &write_ev(&p, "cp-t1", "a.txt"));
+    let v = hook_json(&stop("cp-t1"));
+    assert_eq!(v["decision"], "block", "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("обнови next_step задачи {k1} («Рефакторинг»)")),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("zam log changelog"),
+        "в память уже писали: {reason}"
+    );
+    empty(&stop("cp-t1"));
+    // захваченная, но не in_progress — напоминания нет
+    start_s("cp-t2");
+    let t2 = new_task("Только открыта");
+    // без агентского окружения сессии нет — захват невозможен (400), задача свободна
+    let o = task(false, &["claim", &format!("k:{t2}")]);
+    assert_ne!(o.status.code(), Some(0));
+    ok(&task(true, &["claim", &format!("k:{t2}")]));
+    p.hook("pre-tool", &write_ev(&p, "cp-t2", "a.txt"));
+    empty(&stop("cp-t2"));
+    // чужая сессия: захваченная в cp-t1 задача занята — код 4
+    let o = {
+        let mut c = p.cmd(&p.url);
+        c.env("CLAUDECODE", "1").env("ZAM_SESSION", "cp-t3");
+        c.args(["task", "claim", &k1]).output().unwrap()
+    };
+    assert_eq!(
+        o.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains("cp-t1"));
+}
+
 /// I-1: `zam` подставляет сессию хуков, только если его запустил агент (`CLAUDECODE=1`,
 /// переменные Codex, `ZAM_AGENT=1`); явный `ZAM_SESSION` сильнее файла, `ZAM_SESSION=-` — без
 /// сессии; человек в терминале — без сессии.

@@ -135,6 +135,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: InsightCmd,
     },
+    /// Журнал задач: список, карточка, создание, смена статуса, захват и снятие захвата
+    Task {
+        #[command(subcommand)]
+        cmd: TaskCmd,
+    },
     /// Словарь домена: список терминов «имя — определение» или карточка по имени или псевдониму
     Glossary {
         /// Имя или псевдоним термина (без него — весь список)
@@ -383,6 +388,91 @@ impl InsightArgs {
             key: self.key.as_deref(),
         }
     }
+}
+
+#[derive(Subcommand)]
+enum TaskCmd {
+    /// Лента задач (по умолчанию open, in_progress, blocked)
+    List {
+        /// Статусы через запятую: open, in_progress, blocked, done, dropped
+        #[arg(long)]
+        status: Option<String>,
+        /// Knowledge вместо решения
+        #[arg(long)]
+        global: bool,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Карточка задачи: статус, шаги, захват, времена, план
+    Show {
+        /// k:<id>
+        id: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Новая задача (план — из --body-file или stdin)
+    New {
+        #[arg(long)]
+        title: String,
+        /// Следующий шаг
+        #[arg(long)]
+        next: Option<String>,
+        /// Файл с планом (иначе stdin)
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Область (монорепозиторий)
+        #[arg(long)]
+        area: Option<String>,
+        /// Knowledge вместо решения
+        #[arg(long)]
+        global: bool,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        /// Ключ идемпотентности
+        #[arg(long)]
+        key: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Сменить статус (переоткрытие done/dropped в open — с --reason)
+    Status {
+        /// k:<id>
+        id: String,
+        #[arg(value_parser = ["open", "in_progress", "blocked", "done", "dropped"])]
+        status: String,
+        /// Следующий шаг
+        #[arg(long)]
+        next: Option<String>,
+        /// Что блокирует
+        #[arg(long)]
+        blocked_by: Option<String>,
+        /// Причина (обязательна при переоткрытии)
+        #[arg(long)]
+        reason: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Захватить задачу сессией агента; занята — код 4
+    Claim {
+        /// k:<id>
+        id: String,
+        /// Срок захвата, минут
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=1440))]
+        ttl: u32,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Снять захват (чужой — только человек в WebUI)
+    Release {
+        /// k:<id>
+        id: String,
+        #[command(flatten)]
+        common: Common,
+    },
 }
 
 #[derive(Subcommand)]
@@ -810,6 +900,62 @@ fn main() -> ExitCode {
     }
 }
 
+fn task(c: TaskCmd) -> Result<(), CliError> {
+    use cmd::task as t;
+    match c {
+        TaskCmd::List {
+            status,
+            global,
+            solution,
+            common,
+        } => t::list(
+            &cmd::connect(&common)?,
+            status.as_deref(),
+            global,
+            solution.as_deref(),
+        ),
+        TaskCmd::Show { id, common } => t::show(&cmd::connect(&common)?, &id),
+        TaskCmd::New {
+            title,
+            next,
+            body_file,
+            area,
+            global,
+            solution,
+            key,
+            common,
+        } => t::new(
+            &cmd::connect(&common)?,
+            &t::New {
+                title: &title,
+                next: next.as_deref(),
+                body_file: body_file.as_deref(),
+                area: area.as_deref(),
+                global,
+                solution: solution.as_deref(),
+                key: key.as_deref(),
+            },
+        ),
+        TaskCmd::Status {
+            id,
+            status,
+            next,
+            blocked_by,
+            reason,
+            common,
+        } => t::status(
+            &cmd::connect(&common)?,
+            &id,
+            &status,
+            next.as_deref(),
+            blocked_by.as_deref(),
+            reason.as_deref(),
+        ),
+        TaskCmd::Claim { id, ttl, common } => t::claim(&cmd::connect(&common)?, &id, ttl),
+        TaskCmd::Release { id, common } => t::release(&cmd::connect(&common)?, &id),
+    }
+}
+
 fn insight(c: InsightCmd) -> Result<(), CliError> {
     use cmd::insight as i;
     match c {
@@ -1055,6 +1201,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             cmd::insight::log(&cmd::connect(&common)?, &o)
         }
         Cmd::Insight { cmd } => insight(cmd),
+        Cmd::Task { cmd } => task(cmd),
         Cmd::Cache { cmd } => cache(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {

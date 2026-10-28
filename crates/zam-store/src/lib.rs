@@ -25,6 +25,7 @@ pub mod search;
 pub mod sessions;
 pub mod solution_registry;
 pub mod system;
+pub mod tasks;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
 pub mod time;
@@ -106,6 +107,10 @@ pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,
     WebSession,
+};
+pub use tasks::{
+    CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Claim, ClaimedTask, Owner, TaskData, TaskError,
+    check_task, check_task_transition, claim_task, claimed_tasks, release_task,
 };
 pub use usage::{
     UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, record_usages, usage_counts,

@@ -18,6 +18,7 @@ use crate::certainty::{
 };
 use crate::glossary::{check_term, ensure_names_free, terms_written};
 use crate::nodes::{Attribution, AuthorKind};
+use crate::tasks::{TaskData, check_task, check_task_transition};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
@@ -292,6 +293,9 @@ pub(crate) fn insert_entry(
         ensure_names_free(c, e.space_id, &title, &td, supersedes)?;
         e.data = td.to_value();
     }
+    if e.kind == EntryKind::Task {
+        e.data = check_task(&e.data).map_err(bad)?.to_value();
+    }
     let status = new_status(e.kind, e.status)?;
     if !has_certainty(e.kind) && e.certainty.is_some() {
         return Err(bad("certainty есть только у insight и term"));
@@ -549,6 +553,7 @@ pub async fn update_entry(
 ) -> Result<Entry, StoreError> {
     let a = a.clone();
     db.write(move |tx| {
+        let now_ts = Timestamp::now();
         let cur = live_entry(tx, id)?;
         // конфликт ревизии — раньше прав (§7.5, §11.3)
         check_rev(&cur, if_rev)?;
@@ -569,6 +574,10 @@ pub async fn update_entry(
             return Err(bad("body и append_body вместе"));
         }
         let mut f = Fields::of(&cur);
+        // task: `data` — слияние полей клиента поверх прежней, поля сервера сохраняются
+        let task = (cur.kind == EntryKind::Task).then(|| TaskData::from_stored(&cur.data));
+        let mut task_patch: Option<serde_json::Value> = None;
+        let mut task_status: Option<EntryStatus> = None;
         if let Some(t) = p.title {
             f.title = check_title(&t)?;
         }
@@ -583,7 +592,11 @@ pub async fn update_entry(
             if cur.kind == EntryKind::Release {
                 ensure_release_version_free(tx, cur.space_id, &d, Some(cur.id))?;
             }
-            f.data = d;
+            if task.is_some() {
+                task_patch = Some(d);
+            } else {
+                f.data = d;
+            }
         }
         if term_edit {
             let (title, td) = check_term(&f.title, &f.data).map_err(bad)?;
@@ -600,14 +613,23 @@ pub async fn update_entry(
             f.area = check_area(ar)?;
         }
         if let Some(s) = p.status {
-            // переходы статусов term, task и question — задачи M4.5 2, 4, 5
-            if cur.kind != EntryKind::Insight {
+            // переходы статусов term и question — задача M4.5 5
+            if cur.kind == EntryKind::Task {
+                let from = cur.status.unwrap_or(EntryStatus::Open);
+                check_task_transition(from, s, reason.as_deref()).map_err(|code| {
+                    bad(format!(
+                        "{code}: {} → {} не разрешён (переоткрытие — в open и с причиной)",
+                        from.as_str(),
+                        s.as_str()
+                    ))
+                })?;
+                task_status = Some(s);
+            } else if cur.kind != EntryKind::Insight {
                 return Err(bad(format!(
                     "статус {} правкой не меняется",
                     cur.kind.as_str()
                 )));
-            }
-            if !matches!(s, EntryStatus::Active | EntryStatus::Revisit) {
+            } else if !matches!(s, EntryStatus::Active | EntryStatus::Revisit) {
                 return Err(bad(
                     "superseded и retracted ставятся замещением и отзывом, а не правкой",
                 ));
@@ -621,6 +643,16 @@ pub async fn update_entry(
                 )));
             }
             f.status = Some(s);
+        }
+        if let Some(mut t) = task {
+            // следы смены статуса, затем явные поля клиента (они сильнее)
+            if let Some(s) = task_status {
+                t.on_transition(cur.status, s, now_ts);
+            }
+            if let Some(d) = &task_patch {
+                t.apply_patch(d).map_err(bad)?;
+            }
+            f.data = t.to_value();
         }
         if let Some(c) = p.certainty {
             if !has_certainty(cur.kind) {
@@ -641,7 +673,7 @@ pub async fn update_entry(
                 reason.as_deref(),
             )?;
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(now_ts);
         if let Some(ts) = p.triggers {
             if cur.kind != EntryKind::Insight {
                 return Err(bad("триггеры есть только у insight"));

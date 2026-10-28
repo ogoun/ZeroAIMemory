@@ -19,7 +19,10 @@
 //!   `recall.digest_tokens` = 1500) по приоритету: напоминание об устаревшем блоке инструкции
 //!   (`agent_block_version` меньше версии сервера [`crate::agent_setup::current_version`] —
 //!   `max(AGENT_BLOCK_VERSION, версия шаблонов)`), ожидающие запросы доступа к решениям
-//!   пользователя (`access_requests_pending`), Rules (L1 каждой заметки, до
+//!   пользователя (`access_requests_pending`), `### Задачи` (M4.5 §3: задачи `in_progress` и
+//!   `blocked` решения и Knowledge, до 5, захваченные сессией запроса — первыми, затем недавно
+//!   менявшиеся; строка `[<статус>] <заголовок> — далее: … — k:<id>`, у `blocked` — ещё
+//!   ` — блокер: …`; `reason: task`), Rules (L1 каждой заметки, до
 //!   [`RULES_MAX`] заметок, L1 — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
 //!   пространства решения с L0 (до [`SOLUTION_ROOT_MAX`]), до 5 действующих (`active`)
 //!   `gotcha`/`failure` решения и Knowledge (новые первыми), до 5 записей `revisit`, последние
@@ -355,6 +358,69 @@ fn entry_filter(space: Id, kind: EntryKind) -> EntryFilter {
     }
 }
 
+/// Предел `next_step` и `blocker` в строке задачи дайджеста, символов.
+const TASK_LINE_TEXT_CHARS: usize = 200;
+
+/// Обрезка текста до `max` символов с многоточием.
+fn clip(s: &str, max: usize) -> String {
+    let s = one_line(s);
+    if s.chars().count() <= max {
+        return s;
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// Строка задачи дайджеста: `ZeroAIMemory: [<статус>] <заголовок> — далее: <next_step> —
+/// k:<id>`, у `blocked` после ссылки — ` — блокер: <blocked_by>`.
+fn task_block(e: &Entry) -> String {
+    let t = zam_store::TaskData::from_stored(&e.data);
+    let status = e.status.map_or("open", EntryStatus::as_str);
+    let mut s = format!("ZeroAIMemory: [{status}] {}", one_line(&e.title));
+    if let Some(n) = &t.next_step {
+        s.push_str(&format!(" — далее: {}", clip(n, TASK_LINE_TEXT_CHARS)));
+    }
+    s.push_str(&format!(" — {}", entry_ref(e)));
+    if e.status == Some(EntryStatus::Blocked)
+        && let Some(b) = &t.blocked_by
+    {
+        s.push_str(&format!(" — блокер: {}", clip(b, TASK_LINE_TEXT_CHARS)));
+    }
+    s
+}
+
+/// Задачи `in_progress` и `blocked` пространств `spaces`: захваченные сессией запроса —
+/// первыми, затем недавно менявшиеся.
+async fn task_cands(
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+    spaces: &[(usize, Id)],
+    session: Option<&str>,
+) -> Result<Vec<Cand>, ApiError> {
+    let mut rows = entries_of(health, deadline, spaces, |s| EntryFilter {
+        statuses: vec![EntryStatus::InProgress, EntryStatus::Blocked],
+        ..entry_filter(s, EntryKind::Task)
+    })
+    .await?;
+    let now = jiff::Timestamp::now();
+    let mine = |e: &Entry| {
+        session.is_some_and(|sid| {
+            zam_store::TaskData::from_stored(&e.data)
+                .claimed_by
+                .is_some_and(|c| c.session == sid && c.live(now))
+        })
+    };
+    rows.sort_by_key(|(_, e)| (!mine(e), std::cmp::Reverse((e.updated_at, e.id))));
+    Ok(rows
+        .iter()
+        .map(|(i, e)| {
+            let mut c = entry_cand(*i, e, "task", "");
+            c.block = task_block(e);
+            c
+        })
+        .collect())
+}
+
 /// Разделы дайджеста `session_start` (см. модуль); каждый — кандидаты по приоритету.
 async fn digest(
     st: &AppState,
@@ -397,6 +463,18 @@ async fn digest(
         }
     }
     let mut sections: Vec<(Option<&'static str>, Vec<Cand>)> = Vec::new();
+
+    // задачи в работе — первыми после уведомлений (M4.5 §3): их ждёт агент, начавший сессию
+    let sol = solution_space(targets);
+    let mut insight_spaces: Vec<(usize, Id)> = sol.into_iter().collect();
+    insight_spaces.extend(personal_space(targets, SpaceKind::Knowledge));
+    let session = req.session_id.clone().or_else(|| {
+        crate::attrib::header_value(headers, SESSION_HEADER)
+            .ok()
+            .flatten()
+    });
+    let tasks = task_cands(health, deadline, &insight_spaces, session.as_deref()).await?;
+    sections.push((Some("### Задачи"), tasks));
 
     // Rules — L1 каждой заметки
     let mut rules: Vec<Cand> = Vec::new();
@@ -463,7 +541,6 @@ async fn digest(
     sections.push((Some("### Правила"), rules));
 
     // L1 решения — корневые узлы пространства решения с L0
-    let sol = solution_space(targets);
     let mut overview: Vec<Cand> = Vec::new();
     if let Some((i, space)) = sol
         && health.alive[i]
@@ -510,8 +587,6 @@ async fn digest(
     sections.push((Some("### Решение"), overview));
 
     // действующие gotcha/failure, revisit — решение и Knowledge; changelog — решение
-    let mut insight_spaces: Vec<(usize, Id)> = sol.into_iter().collect();
-    insight_spaces.extend(personal_space(targets, SpaceKind::Knowledge));
     let mut traps: Vec<(usize, Entry)> = Vec::new();
     for kind in ["gotcha", "failure"] {
         traps.extend(

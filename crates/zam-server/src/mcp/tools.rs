@@ -103,14 +103,15 @@ impl ToolName {
             }
             ToolName::Log => {
                 "Новая запись журнала: kind changelog|release (только в решении), insight \
-                 (data.kind, triggers, links, scope, certainty) или term (data.definition, \
-                 aliases). Похожий insight — 409 с кандидатами: append, supersede или force; \
-                 занятое имя термина — 409 term-conflict."
+                 (data.kind, triggers, links, scope, certainty), term (data.definition, \
+                 aliases) или task (body — план, data.next_step). Похожий insight — 409 с \
+                 кандидатами: append, supersede или force."
             }
             ToolName::UpdateEntry => {
-                "Изменить запись журнала: action supersede|retract|revisit|certify|append|feedback; \
-                 rev — текущая ревизия (кроме feedback). certify — certainty и reason (axiom — \
-                 только по указанию пользователя); feedback — value useful|useless."
+                "Изменить запись журнала: action supersede|retract|revisit|certify|append|feedback|\
+                 status|claim|release; rev — текущая ревизия (кроме feedback, claim, release). \
+                 certify — certainty, reason; feedback — value; задача: status (+next_step, \
+                 blocked_by, reason), claim (ttl_min), release."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
@@ -252,7 +253,12 @@ impl ToolName {
                     "id": {"type": "string"},
                     "rev": {"type": "integer"},
                     "action": {"type": "string", "enum": ["supersede", "retract", "revisit",
-                        "certify", "append", "feedback"]},
+                        "certify", "append", "feedback", "status", "claim", "release"]},
+                    "status": {"type": "string", "description": "задача: open, in_progress, blocked, done, dropped"},
+                    "next_step": {"type": ["string", "null"]},
+                    "blocked_by": {"type": ["string", "null"]},
+                    "ttl_min": {"type": "integer", "minimum": 1, "maximum": 1440},
+                    "agent": {"type": "string"},
                     "title": {"type": "string"},
                     "body": {"type": "string", "description": "supersede — тело; append — дописать"},
                     "data": {"type": "object"},
@@ -1058,6 +1064,24 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             b.insert("append_body".into(), json!(text));
             (Method::PATCH, entry, b)
         }
+        "status" => {
+            let status = req_str(args, "status")?;
+            let mut b = pick(args, &["reason", "message"]);
+            b.insert("status".into(), json!(status));
+            // null снимает поле, поэтому — по наличию ключа, а не через pick
+            for k in ["next_step", "blocked_by"] {
+                if let Some(v) = args.get(k) {
+                    b.insert(k.into(), v.clone());
+                }
+            }
+            (Method::PATCH, entry, b)
+        }
+        "claim" => (
+            Method::POST,
+            format!("{entry}/claim"),
+            pick(args, &["ttl_min", "agent"]),
+        ),
+        "release" => (Method::POST, format!("{entry}/release"), Map::new()),
         "feedback" => {
             let value = req_str(args, "value")?;
             let body = json!({ "value": value });
@@ -1076,7 +1100,9 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         }
         _ => {
             return Err(Fail::Invalid(
-                "action: supersede, retract, revisit, certify, append или feedback".into(),
+                "action: supersede, retract, revisit, certify, append, feedback, status, claim \
+                 или release"
+                    .into(),
             ));
         }
     };

@@ -311,6 +311,7 @@ pub async fn entry_json(db: &Db, e: &Entry) -> Result<Value, ApiError> {
     {
         o.insert("triggers".into(), json!(entry_triggers(db, e.id).await?));
     }
+    super::tasks::attach_task(&mut v, e);
     Ok(v)
 }
 

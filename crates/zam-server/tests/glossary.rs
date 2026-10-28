@@ -210,8 +210,8 @@ async fn term_definition_required_422() {
     let mut t = term("Третий", &[]);
     t["status"] = json!("revisit");
     assert_eq!(post(&a, t).await.status, StatusCode::UNPROCESSABLE_ENTITY);
-    // task и question пока не пишутся, но проверка доступа идёт раньше проверки вида
-    let r = post(&a, json!({"kind": "task", "title": "T"})).await;
+    // question пока не пишется, но проверка доступа идёт раньше проверки вида
+    let r = post(&a, json!({"kind": "question", "title": "T"})).await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
 }
 

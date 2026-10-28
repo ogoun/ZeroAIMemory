@@ -22,6 +22,7 @@ pub mod secrets;
 pub mod sessions;
 pub mod solutions;
 pub mod spaces;
+pub mod tasks;
 pub mod triggers;
 pub mod user_settings;
 pub mod vault;
@@ -117,6 +118,8 @@ fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
         )
         .route("/api/v1/spaces/{space}/glossary", get(glossary::get))
         .route("/api/v1/entries/{id}/restore", post(entries::restore))
+        .route("/api/v1/entries/{id}/claim", post(tasks::claim))
+        .route("/api/v1/entries/{id}/release", post(tasks::release))
         .route(
             "/api/v1/entries/{id}/supersede",
             post(insights::supersede).layer(note_limit),

@@ -47,6 +47,13 @@ pub enum ApiError {
     /// термином пространства; тело несёт `conflicts: [{id, title, matched}]`.
     #[error("имя или псевдоним термина уже занят: {}", term_conflict_names(.0))]
     TermConflict(Vec<zam_store::TermConflict>),
+    /// 409 `/problems/task-claimed` (M4.5 §3): задача захвачена другой сессией; тело несёт
+    /// `claimed_by {session, agent, until}`.
+    #[error("задача уже захвачена другой сессией")]
+    TaskClaimed(zam_store::Claim),
+    /// 422 `/problems/reason-required` (M4.5 §3): переоткрытие задачи без причины.
+    #[error("{0}")]
+    ReasonRequired(String),
     #[error("{0}")]
     PayloadTooLarge(String),
     /// 428 `/problems/precondition-required` (§11.3): правка без `If-Match`; в `detail` —
@@ -129,6 +136,14 @@ impl ApiError {
             ApiError::TermConflict(_) => {
                 (StatusCode::CONFLICT, "/problems/term-conflict", "Conflict")
             }
+            ApiError::TaskClaimed(_) => {
+                (StatusCode::CONFLICT, "/problems/task-claimed", "Conflict")
+            }
+            ApiError::ReasonRequired(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "/problems/reason-required",
+                "Unprocessable Content",
+            ),
             ApiError::PayloadTooLarge(_) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "/problems/too-large",
@@ -258,6 +273,9 @@ impl IntoResponse for ApiError {
         }
         if let (ApiError::TermConflict(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("conflicts".into(), json!(c));
+        }
+        if let (ApiError::TaskClaimed(c), Value::Object(o)) = (&self, &mut body) {
+            o.insert("claimed_by".into(), json!(c));
         }
         if let (ApiError::Certainty(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("code".into(), json!(c.code()));

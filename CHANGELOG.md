@@ -11,6 +11,8 @@
 - Предупреждения `term_alias: «псевдоним» → «имя»` в ответе записи заметки и записи журнала.
 - Вики-ссылка `[[Имя]]`, не нашедшая заметку, разрешается в термин пространства по имени или псевдониму.
 
+- Журнал задач (M4.5, задача 4): записи `kind: task` (план в теле, `data`: `next_step`, `blocked_by`, `owner`, `links`, `estimate_min`; поля сервера `started_at`, `done_at`, `claimed_by`), статусы `open`/`in_progress`/`blocked`/`done`/`dropped` с проверкой переходов (переоткрытие — только в `open` и с `reason`: `422 /problems/reason-required`), `duration_min` у `done`; захват `POST /entries/{id}/claim` и `…/release` (сессия, срок 1–1440 мин, `409 /problems/task-claimed` с `claimed_by`, ревизию не создаёт, пишется в аудит `entry.claim`/`entry.release`); раздел `### Задачи` дайджеста; `claimed_tasks` в `GET /sessions/{id}`; напоминание `checkpoint` «обнови next_step задачи k:<id>»; `memory_update_entry action=status|claim|release`; `zam task list|show|new|status|claim|release`.
+
 ### Changed
 - Выжимки кэша, записанные до M4.5 поиском с умолчаниями видов, при таком поиске не находятся (умолчания видов и статусов входят в `scope_hash`) и пересоздаются.
 

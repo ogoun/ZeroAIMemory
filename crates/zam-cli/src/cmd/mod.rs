@@ -15,6 +15,7 @@ pub mod release;
 pub mod search;
 pub mod solution;
 pub mod status;
+pub mod task;
 pub mod tree;
 pub mod vault;
 pub mod write;
