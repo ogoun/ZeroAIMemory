@@ -116,6 +116,8 @@ pub struct InsightReq {
     supersedes_id: Option<String>,
     /// Явные связи графа `[{type, target}]`.
     links: Option<Vec<Value>>,
+    /// Ссылки на файлы `{files: [{path, hash?, commit?}]}` (M4.5 §6.1, [`super::files`]).
+    refs: Option<Value>,
 }
 
 /// `data` insight: `kind` из [`INSIGHT_KINDS`]; `experiment` и `evidence`, если заданы, —
@@ -667,7 +669,7 @@ async fn target_scope(
     }
 }
 
-/// Новая запись insight из тела запроса (проверенного [`check_request`]).
+/// Новая запись insight из тела запроса (проверенного [`check_request`]); `refs` — 422.
 fn new_entry(
     kind: EntryKind,
     req: InsightReq,
@@ -675,8 +677,10 @@ fn new_entry(
     key: Option<String>,
     triggers: Vec<NewTrigger>,
     links: Vec<(EdgeType, TargetRef)>,
-) -> NewEntry {
-    NewEntry {
+) -> Result<NewEntry, ApiError> {
+    let refs = super::files::refs_field(req.refs.as_ref())?.unwrap_or_default();
+    Ok(NewEntry {
+        refs,
         space_id: space,
         kind,
         title: req.title,
@@ -689,7 +693,7 @@ fn new_entry(
         idempotency_key: key,
         triggers,
         links,
-    }
+    })
 }
 
 /// Проверка полей insight или term (общая для создания и замещения): заголовок, `data`,
@@ -780,7 +784,7 @@ pub async fn create(
                 kind.as_str()
             )));
         }
-        let new = new_entry(kind, req, sc.space.id, key, triggers, links);
+        let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
         // замещение через supersedes_id: ревизия старой не сверяется (If-Match у POST
         // коллекции относился бы к новой записи) [решение исполнителя]
         let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib).await?;
@@ -847,7 +851,7 @@ pub async fn create(
         dense = vec;
         mode
     };
-    let new = new_entry(kind, req, sc.space.id, key, triggers, links);
+    let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
     let (e, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {
         st.index.notify();
@@ -923,7 +927,7 @@ pub async fn supersede(
             .is_some(),
         None => false,
     };
-    let new = new_entry(kind, req, sc.space.id, key, triggers, links);
+    let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
     let (n, o) = supersede_entry(&sc.db, sc.entry.id, rev, new, &attrib).await?;
     st.index.notify();
     if !repeat {

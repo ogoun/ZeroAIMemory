@@ -4,7 +4,7 @@
 //! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
 //! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3), сессии агентов,
 //! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4), кэш выжимок
-//! (`answer_cache`, `cache_deps`; M4).
+//! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5).
 
 pub mod access;
 pub mod blobs;
@@ -14,6 +14,7 @@ pub mod datadir;
 pub mod db;
 pub mod embeddings;
 pub mod entries;
+pub mod file_refs;
 pub mod glossary;
 pub mod graph;
 pub mod jobs;
@@ -67,6 +68,10 @@ pub use entries::{
     initial_status, is_entry_ref_letter, list_entries, normalize_area, normalize_title,
     reindex_entries_page, restore_entry, retract_entry, set_triggers, supersede_entry,
     title_duplicates, update_entry, validate_trigger,
+};
+pub use file_refs::{
+    FileRef, PathError, PathRefs, RefItem, RefState, check_commit, check_hash, files_changed,
+    files_verified, normalize_ref_path, refs_index, refs_to_path, stale_refs_of,
 };
 pub use glossary::{
     ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,

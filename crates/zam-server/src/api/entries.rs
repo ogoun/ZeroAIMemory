@@ -259,6 +259,8 @@ pub struct Create {
     /// Только question: записать, даже если такой вопрос уже есть.
     #[serde(default)]
     force: bool,
+    /// Ссылки на файлы `{files: [{path, hash?, commit?}]}` (M4.5 §6.1, [`super::files`]).
+    refs: Option<Value>,
 }
 
 pub(crate) fn empty_object() -> Value {
@@ -312,6 +314,7 @@ pub async fn create(
         ));
     }
     check_title(&req.title)?;
+    let refs = super::files::refs_field(req.refs.as_ref())?.unwrap_or_default();
     let mut data = check_data(req.kind, &req.data)?;
     check_size(&st, &req.body)?;
     let attrib = attribution(&p, &headers, req.message)?;
@@ -355,6 +358,7 @@ pub async fn create(
         idempotency_key: key.clone(),
         triggers: Vec::new(),
         links: Vec::new(),
+        refs,
     };
     let (entry, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {
@@ -563,6 +567,8 @@ pub struct Patch {
     #[serde(default, deserialize_with = "double_option")]
     blocked_by: Option<Option<String>>,
     message: Option<String>,
+    /// Новый набор ссылок на файлы `{files: [...]}` целиком (M4.5 §6.1); ревизии не создаёт.
+    refs: Option<Value>,
 }
 
 /// Смена статуса task: переходы §3 M4.5; переоткрытие без `reason` — 422 `reason-required`.
@@ -698,6 +704,7 @@ pub async fn patch(
         return Err(unprocessable("certainty есть только у insight и term"));
     }
     let task_patch = task_data_patch(&sc.entry, &req)?;
+    let refs = super::files::refs_field(req.refs.as_ref())?;
     let triggers = match req.triggers {
         Some(_) if sc.entry.kind != EntryKind::Insight => {
             return Err(unprocessable("triggers есть только у insight"));
@@ -750,6 +757,7 @@ pub async fn patch(
         certainty: req.certainty,
         reason: req.reason,
         triggers,
+        refs,
     };
     let before = sc.entry.rev;
     let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;

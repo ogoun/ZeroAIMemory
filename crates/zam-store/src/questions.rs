@@ -444,6 +444,7 @@ pub async fn answer_question(
             .is_some_and(|k| qd.options.iter().any(|o| o.key == k));
         let brief = answer.brief(&qd.options);
         let decision = NewEntry {
+            refs: Vec::new(),
             space_id: q.space_id,
             kind: EntryKind::Insight,
             title: decision_title(&q.title, &brief, from_option),

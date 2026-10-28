@@ -96,6 +96,9 @@ pub struct TargetFilter {
     /// `data.kind = decision`) с таким `data.decision.decided_by`; без поля — по автору записи.
     /// `None` — без фильтра.
     pub decided_by: Option<String>,
+    /// Нормализованный путь файла (`filters.file`, M4.5 §6.3): только заметки и записи со
+    /// ссылкой на него (`file_refs`, точное совпадение). `None` — без фильтра.
+    pub file: Option<String>,
 }
 
 /// Виды записей журналов (с M4.5 — `term`, `task`, `question`).
@@ -122,6 +125,8 @@ struct TargetArgs {
     certainty: Option<String>,
     /// `human` / `agent` или `None` (любые).
     decided_by: Option<String>,
+    /// Путь ссылки на файл или `None` (любые).
+    file: Option<String>,
 }
 
 impl TargetFilter {
@@ -140,6 +145,7 @@ impl TargetFilter {
             certainty: (!self.certainty.is_empty())
                 .then(|| serde_json::Value::from(self.certainty.clone()).to_string()),
             decided_by: self.decided_by.clone(),
+            file: self.file.clone(),
         }
     }
 }
@@ -466,13 +472,15 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
 fn scope_sql(n_spaces: usize) -> String {
     let sp = placeholders(3, n_spaces);
     let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
-    let (cert, by) = (7 + n_spaces, 8 + n_spaces);
+    let (cert, by, file) = (7 + n_spaces, 8 + n_spaces, 9 + n_spaces);
     format!(
         "((c.node_id IS NOT NULL AND ?{notes} AND ?{by} IS NULL AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
            AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
            AND (?{area} IS NULL OR n.area = ?{area})
-           AND (?{cert} IS NULL OR n.certainty IN (SELECT value FROM json_each(?{cert}))))
+           AND (?{cert} IS NULL OR n.certainty IN (SELECT value FROM json_each(?{cert})))
+           AND (?{file} IS NULL OR EXISTS (SELECT 1 FROM file_refs fr WHERE fr.owner_kind = 'node'
+                AND fr.owner_id = n.id AND fr.path = ?{file})))
           OR (c.entry_id IS NOT NULL AND ?2 IS NULL AND e.deleted_at IS NULL
            AND e.space_id IN ({sp})
            AND e.kind IN (SELECT value FROM json_each(?{kinds}))
@@ -480,6 +488,8 @@ fn scope_sql(n_spaces: usize) -> String {
                 OR e.status IN (SELECT value FROM json_each(?{statuses})))
            AND (?{area} IS NULL OR e.area = ?{area})
            AND (?{cert} IS NULL OR e.certainty IN (SELECT value FROM json_each(?{cert})))
+           AND (?{file} IS NULL OR EXISTS (SELECT 1 FROM file_refs fr WHERE fr.owner_kind = 'entry'
+                AND fr.owner_id = e.id AND fr.path = ?{file}))
            AND (?{by} IS NULL OR (e.kind = 'insight'
                 AND CASE WHEN json_type(e.data, '$.kind') = 'text'
                          THEN json_extract(e.data, '$.kind') END = 'decision'
@@ -505,6 +515,7 @@ fn scope_args<'a>(
     args.push(&t.area);
     args.push(&t.certainty);
     args.push(&t.decided_by);
+    args.push(&t.file);
     args
 }
 

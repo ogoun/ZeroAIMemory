@@ -99,7 +99,8 @@ impl ToolName {
             ToolName::Write => {
                 "Запись заметки по пути [<пространство>:/]<путь>: без base_rev — создать (content); \
                  с base_rev — заменить content или применить ops к секциям. Ревизия устарела — \
-                 ошибка 409 с диффом: перечитать и повторить."
+                 ошибка 409 с диффом: перечитать и повторить. Ссылки на файлы — refs: [пути] во \
+                 frontmatter."
             }
             ToolName::Log => {
                 "Новая запись журнала: kind changelog|release (только в решении), insight \
@@ -148,7 +149,7 @@ impl ToolName {
                     "mode": {"type": "string", "enum": ["brief", "chunks", "notes"]},
                     "scope": {"type": "object", "description":
                         "solution, include_knowledge, include_rules, all_solutions, path_prefix, area"},
-                    "filters": {"type": "object", "description": "kinds, status, certainty"},
+                    "filters": {"type": "object", "description": "kinds, status, certainty, decided_by, file (путь файла)"},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 100},
                     "budget_tokens": {"type": "integer", "minimum": 1},
                     "expand": {"type": "string", "enum": ["none", "section", "neighbors", "graph"]},
@@ -239,6 +240,7 @@ impl ToolName {
                     "certainty": {"type": "string", "enum": ["axiom", "theorem", "hypothesis"]},
                     "triggers": {"type": "array", "items": {"type": "object"}},
                     "links": {"type": "array", "items": {"type": "object"}},
+                    "refs": {"type": "object", "description": "ссылки на файлы {files: [{path, hash?, commit?}]}, path от корня решения"},
                     "scope": {"type": "string", "enum": ["solution", "global"]},
                     "space": {"type": "string"},
                     "force": {"type": "boolean"},
@@ -271,6 +273,7 @@ impl ToolName {
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "triggers": {"type": "array", "items": {"type": "object"}},
                     "links": {"type": "array", "items": {"type": "object"}},
+                    "refs": {"type": "object", "description": "supersede и append: новый набор ссылок на файлы {files: [...]}"},
                     "certainty": {"type": ["string", "null"],
                         "enum": ["axiom", "theorem", "hypothesis", null]},
                     "reason": {"type": "string"},
@@ -984,6 +987,7 @@ async fn log(rest: &Rest, args: &JsonObject) -> Res {
             "status",
             "triggers",
             "links",
+            "refs",
             "scope",
             "force",
             "supersedes_id",
@@ -1038,6 +1042,7 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
                     "certainty",
                     "triggers",
                     "links",
+                    "refs",
                     "scope",
                 ],
             ),
@@ -1066,7 +1071,7 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             let text = opt_str(args, "body")?.ok_or_else(|| {
                 Fail::Invalid("append: нужен body — текст для дописывания".into())
             })?;
-            let mut b = pick(args, &["message"]);
+            let mut b = pick(args, &["message", "refs"]);
             b.insert("append_body".into(), json!(text));
             (Method::PATCH, entry, b)
         }

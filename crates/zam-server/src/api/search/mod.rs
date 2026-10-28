@@ -276,6 +276,9 @@ pub(crate) struct Filters {
     /// `human | agent` (M4.5, §5.1): только решения с таким `data.decision.decided_by`
     /// (без поля — по автору записи); остальные записи и заметки отсеиваются.
     decided_by: Option<String>,
+    /// Путь файла (M4.5 §6.3): только заметки и записи со ссылкой на него (точное совпадение
+    /// после нормализации, некорректный путь — 400).
+    file: Option<String>,
 }
 
 /// Допустимые виды целей `filters.kinds` (с M4.5 — `term`, `task`, `question`, спецификация
@@ -466,6 +469,15 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
             f.decided_by.as_deref(),
             "filters.decided_by",
         )?,
+        file: f
+            .file
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| {
+                zam_store::normalize_ref_path(p)
+                    .map_err(|e| ApiError::BadRequest(format!("filters.file: {e}")))
+            })
+            .transpose()?,
     })
 }
 
@@ -506,6 +518,9 @@ fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -
     // ключ только при заданном фильтре: хэши прежних кэшей не меняются
     if let Some(by) = &t.decided_by {
         filters["decided_by"] = json!(by);
+    }
+    if let Some(f) = &t.file {
+        filters["file"] = json!(f);
     }
     zam_store::scope_hash(&json!({
         "solution": solution.map(SolutionGuid::as_str),
@@ -761,6 +776,8 @@ struct Item {
     folder: Option<i64>,
     /// Уже выдан этой сессии в той же ревизии (`skip_seen`, §9.3): без фрагмента и текста.
     seen: bool,
+    /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
+    stale_refs: Vec<String>,
 }
 
 /// Текст пары реранкера: заголовок секции и текст чанка.
@@ -1354,6 +1371,9 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
         }
     }
     o.insert("seen".into(), json!(p.item.seen));
+    if !p.item.stale_refs.is_empty() {
+        o.insert("stale_refs".into(), json!(p.item.stale_refs));
+    }
     if mode == SearchMode::Notes {
         o.insert("l0".into(), json!(p.item.l0));
     } else if !p.item.seen {
@@ -1366,6 +1386,21 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
         }
     }
     Value::Object(o)
+}
+
+/// Пометка Markdown об устаревших ссылках (M4.5 §6.2):
+/// `возможно устарело: изменился <путь>[, <путь>…]`; пусто — `None`.
+pub(crate) fn stale_line(paths: &[String]) -> Option<String> {
+    (!paths.is_empty()).then(|| {
+        format!(
+            "возможно устарело: изменился {}",
+            paths
+                .iter()
+                .map(|p| md_inline(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 /// Одна строка: маркеры → `**`, переводы строк → пробелы.
@@ -1448,6 +1483,14 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
             line.pop();
         }
         line.push_str("   (seen)\n");
+    }
+    // устаревшие ссылки на файлы — строкой под заголовком карточки (M4.5 §6.2)
+    if let Some(s) = stale_line(&p.item.stale_refs) {
+        line.push_str("   ");
+        line.push_str(&s);
+        line.push('\n');
+    }
+    if p.item.seen {
         return line;
     }
     match &p.text {
@@ -1468,6 +1511,31 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
         }
     }
     line
+}
+
+/// `stale_refs` элементов выдачи: один запрос на базу цели. Сбой чтения — WARN без текста,
+/// элементы остаются без пометки.
+async fn attach_stale_refs(targets: &[SearchTarget], items: &mut [Item]) {
+    for (i, t) in targets.iter().enumerate() {
+        let owners: Vec<TargetRef> = items
+            .iter()
+            .filter(|it| it.target == i && it.folder.is_none())
+            .map(|it| it.hit.target)
+            .collect();
+        if owners.is_empty() {
+            continue;
+        }
+        match zam_store::stale_refs_of(&t.db, &owners).await {
+            Ok(by) => {
+                for it in items.iter_mut().filter(|it| it.target == i) {
+                    if let Some(p) = by.get(&it.hit.target) {
+                        it.stale_refs = p.clone();
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "чтение устаревших ссылок на файлы"),
+        }
+    }
 }
 
 /// Предупреждение ответа: текст секции (`expand=section`) не получен — разбор или поиск
@@ -1599,6 +1667,7 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
         via: None,
         folder: Some(f.child_count),
         seen: false,
+        stale_refs: Vec::new(),
     }
 }
 
@@ -2007,6 +2076,7 @@ pub async fn search(
                 via: None,
                 folder: None,
                 seen: false,
+                stale_refs: Vec::new(),
             })
         })
         .collect();
@@ -2121,6 +2191,8 @@ pub async fn search(
     {
         session_failed("чтение выданного", &e);
     }
+    // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется
+    attach_stale_refs(&targets, &mut items).await;
     // выжимки шага 0 — из того же бюджета
     let cache_tokens: usize = cache_items.iter().map(cache_step::CacheItem::tokens).sum();
     let packed = pack_items(items, mode, budget.saturating_sub(cache_tokens).max(1));
@@ -2249,6 +2321,7 @@ mod tests {
                 via: None,
                 folder: None,
                 seen: false,
+                stale_refs: Vec::new(),
             })
             .collect()
     }
@@ -2853,6 +2926,22 @@ mod tests {
     fn filters_defaults_and_validation() {
         let f = target_filter(&Filters::default(), false).unwrap();
         assert_eq!(f.kinds, DEFAULT_KINDS.map(String::from).to_vec());
+        assert_eq!(f.file, None);
+        // filters.file нормализуется; путь выше корня — 400
+        let file = |p: &str| {
+            target_filter(
+                &Filters {
+                    file: Some(p.into()),
+                    ..Filters::default()
+                },
+                false,
+            )
+        };
+        assert_eq!(
+            file(".\\src\\a.rs").unwrap().file.as_deref(),
+            Some("src/a.rs")
+        );
+        assert!(matches!(file("../x"), Err(ApiError::BadRequest(_))));
         // умолчание видов включает term и question: статусы — действующие и `answered`
         assert_eq!(f.statuses, ["active", "revisit", "answered"]);
         let def = |kinds: &[&str]| {
@@ -2928,6 +3017,7 @@ mod tests {
                 status: Some(vec!["retracted".into()]),
                 certainty: Some(vec!["axiom".into(), "theorem".into()]),
                 decided_by: None,
+                file: None,
             },
             false,
         )

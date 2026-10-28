@@ -39,11 +39,13 @@ fn agent() -> Attribution {
         message: None,
         user_id: Some(Id::new()),
         area: None,
+        solution: None,
     }
 }
 
 fn insight(space: Id, title: &str, body: &str) -> NewEntry {
     NewEntry {
+        refs: Vec::new(),
         space_id: space,
         kind: EntryKind::Insight,
         title: title.into(),
@@ -61,6 +63,7 @@ fn insight(space: Id, title: &str, body: &str) -> NewEntry {
 
 fn changelog(space: Id, title: &str) -> NewEntry {
     NewEntry {
+        refs: Vec::new(),
         space_id: space,
         kind: EntryKind::Changelog,
         title: title.into(),
@@ -1260,6 +1263,7 @@ async fn triggers_stored_replaced_and_active_only() {
     assert_eq!(entry_triggers(&db, a.id).await.unwrap()[0].pattern, "lf");
     // revisit остаётся в выдаче, superseded, retracted и удалённые — нет
     let with = |title: &str, kw: &str, status: Option<EntryStatus>| NewEntry {
+        refs: Vec::new(),
         status,
         triggers: vec![trig(TriggerKind::Keyword, kw)],
         ..insight(k, title, "")
@@ -1401,6 +1405,7 @@ fn allowed_statuses_per_kind() {
 async fn new_kinds_via_create_entry() {
     let (db, k, _) = setup("new-kinds").await;
     let mk = |kind: EntryKind, title: &str| NewEntry {
+        refs: Vec::new(),
         kind,
         // у термина определение обязательно (M4.5 §2.1)
         data: if kind == EntryKind::Term {
@@ -1455,6 +1460,7 @@ async fn new_kinds_via_create_entry() {
 
 fn term(space: Id, title: &str, aliases: &[&str]) -> NewEntry {
     NewEntry {
+        refs: Vec::new(),
         kind: EntryKind::Term,
         data: json!({"definition": format!("Определение {title}"), "aliases": aliases,
                      "code": ["answer_cache_entry"]}),

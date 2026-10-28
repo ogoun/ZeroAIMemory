@@ -43,6 +43,20 @@ pub struct Frontmatter {
     /// Связи графа (§8.5): строки `"<тип>: <цель>"` из списка `relations:` (flow или block)
     /// как в исходнике; тип и цель разбирает хранилище (`zam_store::links`).
     pub relations: Vec<String>,
+    /// Ссылки на файлы решения (M4.5 §6.1): пути из списка `refs:` как в исходнике;
+    /// нормализует и проверяет хранилище (`zam_store::file_refs`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+    /// Дата проверки заметки (`verified_at:`, `YYYY-MM-DD`, M4.5 §7); не дата — `None` и
+    /// предупреждение в [`Frontmatter::warnings`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
+    /// Коммит, на котором заметка проверена (`verified_at_commit:`), как в исходнике.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_at_commit: Option<String>,
+    /// Предупреждения разбора: `verified_at_invalid` — значение `verified_at:` не дата.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Заголовок верхнего уровня.

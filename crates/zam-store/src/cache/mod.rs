@@ -795,6 +795,7 @@ fn promote_tx(
         }
         PromoteAs::Insight { kind, title } => {
             let entry = NewEntry {
+                refs: Vec::new(),
                 space_id: e.space_id,
                 kind: EntryKind::Insight,
                 title,

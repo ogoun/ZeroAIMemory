@@ -320,6 +320,7 @@ pub(crate) fn insert_entry(
     }
     let triggers = check_triggers(e.triggers)?;
     let links = e.links;
+    let refs = e.refs;
     let f = Fields {
         title: check_title(&e.title)?,
         body: e.body,
@@ -364,6 +365,7 @@ pub(crate) fn insert_entry(
     replace_triggers(c, id, &triggers, now)?;
     index_entry_now(c, id, None, now)?;
     crate::graph::insert_entry_links(c, id, &links, a, now)?;
+    crate::file_refs::sync_new_entry(c, id, e.space_id, e.kind, &refs, &f.data, a, now)?;
     if e.kind == EntryKind::Term {
         terms_written(c, e.space_id)?;
     }
@@ -629,6 +631,7 @@ pub async fn update_entry(
         if let Some(more) = p.append_body {
             f.body = appended(&f.body, &more);
         }
+        let data_given = p.data.is_some();
         if let Some(d) = p.data {
             check_data(&d)?;
             if cur.kind == EntryKind::Release {
@@ -736,6 +739,18 @@ pub async fn update_entry(
             }
             replace_triggers(tx, id, &check_triggers(ts)?, &now)?;
         }
+        // ссылки на файлы — без ревизии, как триггеры (M4.5 §6.1)
+        crate::file_refs::sync_patched_entry(
+            tx,
+            id,
+            cur.space_id,
+            cur.kind,
+            p.refs.as_deref(),
+            &f.data,
+            data_given,
+            &a,
+            &now,
+        )?;
         let mut now_f = f.clone();
         let mut was_f = Fields::of(&cur);
         now_f.data = content_data(cur.kind, &now_f.data);

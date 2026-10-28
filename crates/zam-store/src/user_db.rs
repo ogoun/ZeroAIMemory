@@ -93,6 +93,11 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0015_entries_kinds.sql"),
         rebuild: true,
     },
+    Migration {
+        version: 16,
+        sql: include_str!("../migrations/user/0016_file_refs.sql"),
+        rebuild: false,
+    },
 ];
 
 /// Вид пространства.
@@ -259,6 +264,8 @@ impl UserDbs {
         crate::nodes::backfill_embed_keys(&db).await?;
         // статус заметок из frontmatter (v9) — до первой записи: права certainty читают столбец
         crate::nodes::backfill_certainty(&db).await?;
+        // ссылки на файлы и `verified_at` из frontmatter (v16) — до первой записи
+        crate::file_refs::backfill_refs(&db).await?;
         let pending = match rechunk_pending(&db).await? {
             Some(why) if !clear_rechunk_if_empty(&db).await? => Some(why),
             _ => None,

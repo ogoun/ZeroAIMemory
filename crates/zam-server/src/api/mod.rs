@@ -6,6 +6,7 @@ pub mod cache;
 pub mod downloads;
 pub mod entries;
 pub mod feedback;
+pub mod files;
 pub mod glossary;
 pub mod graph;
 pub mod health;
@@ -227,6 +228,10 @@ fn service_routes() -> Router<AppState> {
         .route("/api/v1/cache", get(cache::list))
         .route("/api/v1/cache/{id}", get(cache::get))
         .route("/api/v1/triggers", get(triggers::list))
+        // ссылки на файлы (M4.5 §6): состояние ссылок, не текст памяти — вне `memory_routes`
+        .route("/api/v1/file-refs", get(files::index))
+        .route("/api/v1/files/changed", post(files::changed))
+        .route("/api/v1/files/verified", post(files::verified))
         .route(
             "/api/v1/sessions",
             get(sessions::list).post(sessions::create),

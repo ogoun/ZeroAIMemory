@@ -1,7 +1,8 @@
 //! Разбор полей frontmatter.
 //!
-//! Нужны только плоские ключи верхнего уровня (`tags`, `description`, `l0`,
-//! `index`, `certainty`, `evidence`, `relations`), поэтому вместо YAML-библиотеки — узкое подмножество YAML:
+//! Нужны только плоские ключи верхнего уровня (`tags`, `description`, `l0`, `index`,
+//! `certainty`, `evidence`, `relations`, `refs`, `verified_at`, `verified_at_commit`), поэтому
+//! вместо YAML-библиотеки — узкое подмножество YAML:
 //! скаляры (простые, `"…"`, `'…'`, в том числе многострочные), блочные
 //! скаляры `|` и `>` с модификаторами `-`/`+` и цифрой отступа, `~`/`null`,
 //! булевы значения, списки `[a, b]` и блочные списки `- a`.
@@ -22,6 +23,10 @@ pub(crate) fn parse(block: &str, delimiter: &str) -> Frontmatter {
         certainty: None,
         evidence: None,
         relations: Vec::new(),
+        refs: Vec::new(),
+        verified_at: None,
+        verified_at_commit: None,
+        warnings: Vec::new(),
     };
     let lines: Vec<&str> = raw.lines().collect();
     let mut i = 0;
@@ -45,10 +50,54 @@ pub(crate) fn parse(block: &str, delimiter: &str) -> Frontmatter {
                 fm.certainty = string_value(value, &lines, &mut i).map(|c| c.trim().to_string())
             }
             "evidence" => fm.evidence = string_value(value, &lines, &mut i),
+            "refs" => fm.refs = string_list(value, &lines, &mut i),
+            "verified_at" => {
+                let v = string_value(value, &lines, &mut i).map(|v| v.trim().to_string());
+                match v {
+                    Some(d) if is_date(&d) => fm.verified_at = Some(d),
+                    Some(_) => fm.warnings.push(VERIFIED_AT_INVALID.to_string()),
+                    None => {}
+                }
+            }
+            "verified_at_commit" => {
+                fm.verified_at_commit = string_value(value, &lines, &mut i)
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            }
             _ => {}
         }
     }
     fm
+}
+
+/// Предупреждение разбора: `verified_at:` задан, но это не дата `YYYY-MM-DD`.
+pub const VERIFIED_AT_INVALID: &str = "verified_at_invalid";
+
+/// Календарная дата `YYYY-MM-DD` (год 0001–9999, день с учётом месяца и високосного года).
+fn is_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<u32> {
+        let part = &s[r];
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else {
+        return false;
+    };
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    y >= 1 && (1..=days).contains(&d)
 }
 
 /// Ключи `certainty`/`evidence` верхнего уровня в нераспознаваемом написании (в кавычках,
@@ -504,6 +553,42 @@ evidence:
         assert!(unrecognized_certainty_keys("meta:\n  Certainty: x\n- certainty\n").is_empty());
         // распознанный ключ действительно задаёт поле, нераспознанный — нет
         assert_eq!(fm("'certainty': axiom\n").certainty, None);
+    }
+
+    #[test]
+    fn frontmatter_refs_list_and_dates() {
+        let f = fm(
+            "refs: [src/a.rs, \"docs/b c.md\"]\nverified_at: 2026-10-28\n\
+                    verified_at_commit: abc123\n",
+        );
+        assert_eq!(f.refs, ["src/a.rs", "docs/b c.md"]);
+        assert_eq!(f.verified_at.as_deref(), Some("2026-10-28"));
+        assert_eq!(f.verified_at_commit.as_deref(), Some("abc123"));
+        assert!(f.warnings.is_empty());
+        let f = fm("refs:\n  - crates/x.rs # коммент\n  - ~\n  - b.toml\ntags: [t]\n");
+        assert_eq!(f.refs, ["crates/x.rs", "b.toml"]);
+        assert_eq!(f.tags, ["t"]);
+        // не дата — поле пропущено, есть предупреждение
+        for bad in [
+            "вчера",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-2-1",
+            "2026-10-28T10:00",
+        ] {
+            let f = fm(&format!("verified_at: {bad}\n"));
+            assert_eq!(f.verified_at, None, "{bad}");
+            assert_eq!(f.warnings, [VERIFIED_AT_INVALID], "{bad}");
+        }
+        // високосный год и null
+        assert_eq!(
+            fm("verified_at: '2024-02-29'\n").verified_at.as_deref(),
+            Some("2024-02-29")
+        );
+        assert_eq!(fm("verified_at: 2023-02-29\n").verified_at, None);
+        let f = fm("verified_at: ~\nverified_at_commit:\n");
+        assert_eq!((f.verified_at, f.verified_at_commit), (None, None));
+        assert!(f.warnings.is_empty());
     }
 
     #[test]

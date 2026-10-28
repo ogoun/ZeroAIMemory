@@ -9,6 +9,8 @@
 //!   иначе 400; пустое значение равно отсутствию заголовка;
 //! - `X-Zam-Area` (§11.2) — область по умолчанию для новых узлов и записей журналов, те же
 //!   правила;
+//! - `X-Zam-Solution` — решение ссылок на файлы вне пространства решения (M4.5 §6.1);
+//!   некорректный GUID игнорируется;
 //! - `message` — из тела запроса.
 //!
 //! Те же заголовки описывают сессию агента ([`session_touch`], §6.3): `X-Zam-Session` — её id,
@@ -58,6 +60,12 @@ pub fn attribution(
         message,
         user_id,
         area: header_value(headers, AREA_HEADER)?,
+        // решение ссылок на файлы вне пространства решения (M4.5 §6.1); не GUID — нет
+        solution: header_value(headers, crate::api::search::SOLUTION_HEADER)
+            .ok()
+            .flatten()
+            .and_then(|g| g.parse::<zam_core::SolutionGuid>().ok())
+            .map(|g| g.as_str().to_string()),
     })
 }
 

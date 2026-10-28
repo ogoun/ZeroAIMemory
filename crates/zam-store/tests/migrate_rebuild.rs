@@ -163,11 +163,13 @@ fn agent() -> Attribution {
         message: None,
         user_id: Some(Id::new()),
         area: None,
+        solution: None,
     }
 }
 
 fn new_entry(space: Id, kind: EntryKind, title: String, data: serde_json::Value) -> NewEntry {
     NewEntry {
+        refs: Vec::new(),
         space_id: space,
         kind,
         title,

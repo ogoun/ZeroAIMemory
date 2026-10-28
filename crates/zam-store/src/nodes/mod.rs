@@ -138,6 +138,9 @@ pub struct Attribution {
     pub user_id: Option<Id>,
     /// Область по умолчанию (`X-Zam-Area`, §11.2) для новых узлов и записей журналов.
     pub area: Option<String>,
+    /// GUID решения запроса (`X-Zam-Solution`): решение ссылок на файлы заметок и записей вне
+    /// пространства решения (M4.5 §6.1); `None` — ссылки справочные.
+    pub solution: Option<String>,
 }
 
 impl Attribution {
@@ -151,6 +154,7 @@ impl Attribution {
             message: None,
             user_id: None,
             area: None,
+            solution: None,
         }
     }
 }

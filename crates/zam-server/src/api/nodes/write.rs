@@ -8,7 +8,9 @@
 //! давшая ребра графа (§8.5); `term_alias: «<псевдоним>» → «<имя>»` — в имени или тексте
 //! заметки псевдоним термина словаря вместо имени (M4.5 §2.2, до 5); `secrets_detected` (+
 //! `secrets_detected: [{kind, line}]`) — в тексте найдены секреты, в индекс они уходят
-//! замаскированными (§7.6, [`crate::api::secrets`]).
+//! замаскированными (§7.6, [`crate::api::secrets`]); `verified_at_invalid` — `verified_at:`
+//! не дата `YYYY-MM-DD`; `invalid_ref: <путь> (<причина>)` — путь `refs:` не стал ссылкой на
+//! файл; `refs_truncated` — ссылок больше 64 (M4.5 §6.1, §7).
 //!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
@@ -59,10 +61,25 @@ pub const CERTAINTY_NOT_RECOGNIZED: &str = "certainty_not_recognized";
 fn note_warnings(content: &str) -> Vec<String> {
     let doc = zam_markdown::parse(content);
     let mut out = Vec::new();
-    if let Some(f) = &doc.frontmatter
-        && !zam_markdown::unrecognized_certainty_keys(&f.raw).is_empty()
-    {
-        out.push(CERTAINTY_NOT_RECOGNIZED.to_string());
+    if let Some(f) = &doc.frontmatter {
+        if !zam_markdown::unrecognized_certainty_keys(&f.raw).is_empty() {
+            out.push(CERTAINTY_NOT_RECOGNIZED.to_string());
+        }
+        // `verified_at_invalid` и ссылки на файлы, которые не стали ссылками (M4.5 §6.1, §7)
+        out.extend(f.warnings.iter().cloned());
+        let mut valid = 0;
+        for r in &f.refs {
+            match zam_store::normalize_ref_path(r) {
+                Ok(_) => valid += 1,
+                Err(e) => out.push(format!("invalid_ref: {r} ({e})")),
+            }
+        }
+        if valid > zam_store::file_refs::REFS_MAX {
+            out.push(format!(
+                "refs_truncated: учтены первые {}",
+                zam_store::file_refs::REFS_MAX
+            ));
+        }
     }
     out.extend(zam_store::links::relation_warnings(&doc));
     out

@@ -166,6 +166,8 @@ struct Fetched {
     max_tokens: Option<usize>,
     seen: SeenKey,
     content: Content,
+    /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
+    stale_refs: Vec<String>,
 }
 
 /// Результат по элементу после упаковки.
@@ -307,6 +309,7 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
         }
     };
     let reference = format!("n:{}", node.id);
+    let stale_refs = stale_of(&sc.db, TargetKind::Node, node.id).await?;
     Ok(Fetched {
         raw: it.id.clone(),
         head: format!("{reference} {}/{}", sc.space.name, node.path),
@@ -330,6 +333,7 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
             part: WHOLE_TARGET.to_string(),
         },
         content,
+        stale_refs,
     })
 }
 
@@ -388,6 +392,7 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
     };
     let (letter, kind) = (e.kind.ref_letter(), e.kind.as_str());
     let reference = format!("{letter}:{}", e.id);
+    let stale_refs = stale_of(&sc.db, TargetKind::Entry, e.id).await?;
     let sub = match e.kind {
         EntryKind::Release => None,
         _ => e.data.get("kind").and_then(Value::as_str),
@@ -419,7 +424,17 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
             part: WHOLE_TARGET.to_string(),
         },
         content,
+        stale_refs,
     })
+}
+
+/// Пути устаревших ссылок цели на файлы.
+async fn stale_of(db: &zam_store::Db, kind: TargetKind, id: Id) -> Result<Vec<String>, Failure> {
+    let r = TargetRef { kind, id };
+    Ok(zam_store::stale_refs_of(db, &[r])
+        .await?
+        .remove(&r)
+        .unwrap_or_default())
 }
 
 async fn fetch(
@@ -580,6 +595,9 @@ fn item_json(piece: &Piece) -> Value {
         }
         o.insert("tier".into(), json!(tier_str(f.tier)));
         o.insert("rev".into(), json!(f.rev));
+        if !f.stale_refs.is_empty() {
+            o.insert("stale_refs".into(), json!(f.stale_refs));
+        }
     };
     match piece {
         Piece::Err { raw, fail } => {
@@ -627,6 +645,13 @@ fn push_block(out: &mut String, line: &str) {
     }
 }
 
+/// Строка `(возможно устарело: изменился <путь>)` под заголовком элемента (M4.5 §6.2).
+fn push_stale(out: &mut String, f: &Fetched) {
+    if let Some(s) = super::search::stale_line(&f.stale_refs) {
+        push_block(out, &format!("({s})"));
+    }
+}
+
 fn render_md(pieces: &[Piece], total: usize) -> String {
     let mut out = String::new();
     for piece in pieces {
@@ -637,9 +662,13 @@ fn render_md(pieces: &[Piece], total: usize) -> String {
                     push_block(&mut out, &format!("({})", md_inline(d)));
                 }
             }
-            Piece::Unchanged(f) => push_block(&mut out, &header(f, "unchanged")),
+            Piece::Unchanged(f) => {
+                push_block(&mut out, &header(f, "unchanged"));
+                push_stale(&mut out, f);
+            }
             Piece::Budget { f, full } => {
                 push_block(&mut out, &header(f, &format!("~{full} tok")));
+                push_stale(&mut out, f);
                 push_block(&mut out, BUDGET_LINE);
             }
             Piece::Text {
@@ -650,6 +679,7 @@ fn render_md(pieces: &[Piece], total: usize) -> String {
                 ..
             } => {
                 push_block(&mut out, &header(f, &format!("~{full} tok")));
+                push_stale(&mut out, f);
                 if !text.is_empty() {
                     push_block(&mut out, text);
                 }
