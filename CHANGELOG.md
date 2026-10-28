@@ -67,6 +67,7 @@ Qdrant на новых умолчаниях (3 с / 14 000, GPU, свободн�
 - `PATCH /solutions/{guid} {name}` — переименование решения (§11.6): `rw`-токен владельца или администратор, участник — 403, имя 1–128 символов (тот же предел, что у регистрации) без управляющих, аудит `solution.rename`; CLI `zam solution rename <имя> [--solution GUID]`.
 
 ### Fixed
+- `zam-index`: разрыв соединения с Qdrant посреди запроса (процесс убит, сброс HTTP/2) — статус gRPC `Unknown` с текстом ошибки транспорта (`transport error`, `h2 protocol error`, `error trying to connect`) — теперь `IndexError::Unavailable`, а не `Other`: воркер возвращает пачку в очередь, а не тратит попытку. Найдено флейком CI `qdrant::killed_mid_work_is_unavailable_then_recovers` на ubuntu-22.04.
 - Администратор с `X-Zam-User` несуществующего пользователя и сессией (`X-Zam-Session`, `session_id`) больше не создаёт пустую базу `users/<id>.db`: `/search`, `/read`, `/recall` и счётчик записей отвечают 404, как `POST /sessions`.
 - Имя решения — один предел 1–128 символов и у переименования (было 200 при 128 у регистрации и `/agent-setup`).
 - Строка stderr об отзыве первого токена (файл не записан) печатается после попытки отзыва и по её результату.

@@ -943,6 +943,11 @@ fn map_err(op: &'static str, e: QdrantError) -> IndexError {
                 Code::Internal if msg.starts_with("Failed to connect") => {
                     IndexError::Unavailable(format!("{op}: {msg}"))
                 }
+                // Разрыв соединения посреди запроса (процесс Qdrant убит, сброс HTTP/2) tonic
+                // отдаёт как Unknown с текстом ошибки транспорта.
+                Code::Unknown if is_transport_failure(&msg) => {
+                    IndexError::Unavailable(format!("{op}: {msg}"))
+                }
                 Code::DataLoss => IndexError::Corrupt(format!("{op}: {msg}")),
                 code => IndexError::Other(format!("{op}: {code:?}: {msg}")),
             }
@@ -957,6 +962,16 @@ fn map_err(op: &'static str, e: QdrantError) -> IndexError {
         QdrantError::InvalidUri(_) => IndexError::Other(format!("{op}: неверный адрес Qdrant")),
         other => IndexError::Other(format!("{op}: {}", truncate(&other.to_string()))),
     }
+}
+
+fn is_transport_failure(msg: &str) -> bool {
+    [
+        "transport error",
+        "h2 protocol error",
+        "error trying to connect",
+    ]
+    .iter()
+    .any(|p| msg.starts_with(p))
 }
 
 fn truncate(s: &str) -> String {
@@ -1020,6 +1035,18 @@ mod tests {
             map_err("t", st(Code::InvalidArgument)),
             IndexError::Other(_)
         ));
+        let unknown = |m: &str| QdrantError::ResponseError {
+            status: tonic::Status::new(Code::Unknown, m),
+        };
+        assert!(matches!(
+            map_err("t", unknown("transport error")),
+            IndexError::Unavailable(_)
+        ));
+        assert!(matches!(
+            map_err("t", unknown("h2 protocol error: connection reset")),
+            IndexError::Unavailable(_)
+        ));
+        assert!(matches!(map_err("t", unknown("m")), IndexError::Other(_)));
     }
 
     #[test]
