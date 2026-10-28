@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+## [0.0.5-m4] - 2026-10-28
+
+Этап M4: агенты. MCP-сервер `/mcp` и stdio-прокси `zam mcp`, хуки Claude Code и Codex
+(`zam hook …`) с локальным кэшем триггеров, проактивное вспоминание `/recall`, сессии и
+`session_seen`, чтение пачкой `POST /read`, кэш выжимок агентов с инвалидацией по источникам и
+`promote`, показы и оценки полезности, `zam init` и страница «Подключение агента» с шаблонами
+блока инструкции v2, раздача `zam`; по ответам владельца M3 — права `certainty`, обязательный
+`If-Match` у записей журналов, Vault при блокировке, `GET /triggers` как поиск,
+`PATCH /solutions`, λ = 0, бусты после реранка, Qdrant 3 с / 14 с, гейт int8 на точном поиске;
+из M7 — вход пользователей в WebUI и режим службы (Windows SCM, systemd). Приёмка — e2e CRLF,
+бюджеты хуков, «изменение источника → `stale`», fail-open хуков, общий кэш и подсказки общего
+решения с отзывом доступа (`crates/zam-cli/tests/m4_acceptance.rs`). Eval M4 на CPU int8
+(`eval/results/2026-10-28-m4-summary.md`): гибрид — recall@5 0,857, nDCG@10 0,826 (Δ к M3 в шуме),
+гейт int8 на точном поиске пройден; подсказки хуков — точность 0,737, полнота 0,808, тишина
+0,806; хуки на CPU int8 — p95 `session-start` 37 мс (бюджет 300), `prompt` 101 (250),
+`post-tool` 30 (250), `pre-tool` 17 (50).
+
 ### Changed
 - Журнал ONNX Runtime (цель `ort`) не выше `warn`, как `rmcp` и `memory_serve`: под systemd он писал около 1500 строк INFO за минуту после старта.
 - Если маска CPU процесса — не `{0, 1, …, n−1}` (LXC с «чужими» номерами CPU, cpuset), при `ml.index_threads = 0` число потоков ORT задаётся явно — число CPU маски: без этого ORT привязывал потоки к CPU вне маски и писал ERROR `pthread_setaffinity_np failed … error code: 22`. На обычной машине и на Windows — без изменений.
@@ -19,6 +36,7 @@
 - `rerank=on` (§9.2 п. 5, решение владельца 2026-10-26): бусты вида, области и `certainty` применяются и к баллу реранкера (`score = rerank_score × boost_kind × boost_area × boost_certainty`, затем деление при переполнении; затухание и канал папок — нет); одна функция бустов `zam_search::apply_boosts_to` на оба пути. `rerank_score` — сырой балл реранкера, `score` (и балл карточки `md`) — с бустами.
 
 ### Added
+- Приёмка M4 (§19, задача 16) — `crates/zam-cli/tests/m4_acceptance.rs`: e2e CRLF (агент через MCP пишет `gotcha` с `file_glob` и `error_regex` в проекте A на одной машине, на другой машине в проекте B `zam hook session-start` обновляет кэш, сервер останавливается, `pre-tool` и `post-tool` подсказывают без сети), бюджеты хуков на корпусе eval (p95 ≤ бюджета §10.3 ×2 в CI, не больше 5 % тайм-аутов), «изменение источника → `stale`» через MCP, fail-open всех пяти хуков при выключенном и зависшем сервере, общий кэш и подсказки общего решения участнику с отзывом доступа. Smoke комплекта дополнен шагами M4: MCP `tools/list` (10 инструментов), `zam log insight` с триггерами → `/recall(post_tool)` по `error_regex`, `zam hook session-start` → кэш триггеров → подсказка `zam hook pre-tool`.
 - Eval M4 (§18.2, задача 15): `cargo xtask eval --hints` — точность подсказок хуков на наборе `eval/hints.toml` (72 случая `prompt`/`post_tool`/`pre_tool`, половина «нерелевантно»: `hint_precision`, `hint_recall`, `silence_rate`), калибровка `recall.prompt_min_score` и порога покрытия FTS у `post_tool`, задержки `/recall` и процессов `zam hook …`; `cargo xtask eval --tokens` — расход токенов агента по 20 сценариям `eval/scenarios.toml` (протокол §9.3, повтор через кэш выжимок, «наивный» `mode=chunks` с бюджетом 4000; токены — токенизатором bge-m3), базовая линия для цели M6.
 - `[qdrant] exact_search` (по умолчанию `false`): точный поиск Qdrant (`SearchParams.exact`, без квантования) — только для прогонов гейта качества (`cargo xtask eval --quality-gate` ставит его сам; решение владельца 2026-10-26, §18.2); `--skip-cuda` — гейт без справочного fp16.
 - Режим службы (§13.3, §16.2; перенесено из M7): `zam-server service install [--name] [--config] [--user] [--print]`, `uninstall|start|stop|status`. Windows — служба SCM (`windows-service`): автозапуск, LocalSystem, `binPath = "<exe>" service run --config <путь>`, восстановление — перезапуск через 10 с × 3, таймаут `Preshutdown` по конфигу, `StopPending` с `checkpoint` каждые 2 с; журнал — в файл `data_dir/logs/`. Linux — юнит `/etc/systemd/system/<имя>.service` из шаблона комплекта (`TimeoutStopSec`, `ReadWritePaths`, `User=`), `daemon-reload` и `enable`; `start|stop|status` — `systemctl`. Таймаут остановки — `max(90, ceil(shutdown_flush_wait_ms / 1000) + 80)` с (R4, 94 с при умолчаниях); под службой сервер сверяет таймаут службы при старте и при нехватке пишет WARN. Без прав администратора/root — код 3, `service run` из консоли — код 2. Ctrl+C, SIGTERM, SIGINT, Ctrl+Break и команды SCM ведут в один путь штатной остановки. NSSM остаётся альтернативой.
@@ -52,6 +70,14 @@
 
 ### Removed
 - Человеческие токены (§11.4): `human: true` при выпуске — 400, поле `human` убрано из токенов, `/auth/me`, `GET /spaces` и аудита; колонка `tokens.human` не читается (старые такие токены — агентские, при старте сервер пишет о них WARN). CLI: флаг `--human` и ключ `human_token` в `~/.zeroaimemory/config.toml`; WebUI: флажок «для человека».
+
+### Known limitations
+- Прогоны eval на GPU (гибрид fp16 CUDA, `rerank=on` с бустами, справочный fp16 в гейте, подсказки и токены на CUDA) на `0.0.5-m4` не сделаны — GPU машины владельца был занят; итог eval M4 — на CPU int8.
+- Режим службы на Windows проверен тестами и сборкой, но регистрация в SCM на машине разработки не выполнялась — ручной чек-лист в журнале этапа (`docs/plans/2026-10-26-m4-agents-log.md`, «Уточнить у владельца»); systemd проверен на стенде Debian 13.
+- Расход токенов: протокол §9.3 с чтением заметок целиком на первом обращении в среднем дороже наивного `mode=chunks` (120,6 % [100,4…143,3 %]), экономию даёт повтор через кэш выжимок (33,0 %); снижение первого обращения — цель M6.
+- Показы `pre-tool` (локально, без сети) сервер не видит — `usage` их не учитывает; `PreCompact` — без напоминания (только `Stop`); Codex: переменные окружения для сессии CLI и `apply_patch` на живом агенте не проверены.
+- Хуки на HDD под нагрузкой: если запуск процесса `zam` или запись сервера дольше бюджета (массовая запись, сборка на том же диске), хук молчит (fail-open) — в отладочном FTS-прогоне во время сборки так замолкало 2,5–3 % вызовов `prompt`/`session-start`.
+- Извлечение текста DOCX/XLSX/PDF/PPTX и `locator` в `/read` — M5; настройка бюджетов по замерам и полный `promote` — M6; `doctor`, бэкап и `rollback` — M7.
 
 ## [0.0.4-m3] - 2026-10-26
 

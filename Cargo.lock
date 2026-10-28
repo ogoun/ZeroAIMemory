@@ -6218,7 +6218,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "anyhow",
  "clap",
@@ -6270,7 +6270,7 @@ dependencies = [
 
 [[package]]
 name = "zam-cli"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -6291,7 +6291,7 @@ dependencies = [
 
 [[package]]
 name = "zam-core"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "rand 0.9.5",
  "rusqlite",
@@ -6303,7 +6303,7 @@ dependencies = [
 
 [[package]]
 name = "zam-fetch"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "flate2",
  "lzma-rust2",
@@ -6318,7 +6318,7 @@ dependencies = [
 
 [[package]]
 name = "zam-index"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "blake3",
  "fs4",
@@ -6347,7 +6347,7 @@ dependencies = [
 
 [[package]]
 name = "zam-markdown"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "ammonia",
  "comrak",
@@ -6366,7 +6366,7 @@ dependencies = [
 
 [[package]]
 name = "zam-ml"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "half 2.7.1",
  "lru",
@@ -6385,7 +6385,7 @@ dependencies = [
 
 [[package]]
 name = "zam-search"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "jiff",
  "regex",
@@ -6394,7 +6394,7 @@ dependencies = [
 
 [[package]]
 name = "zam-server"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6444,7 +6444,7 @@ dependencies = [
 
 [[package]]
 name = "zam-store"
-version = "0.0.4-m3"
+version = "0.0.5-m4"
 dependencies = [
  "base64 0.22.1",
  "blake3",
