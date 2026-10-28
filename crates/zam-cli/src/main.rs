@@ -140,6 +140,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// Вопросы к человеку: список, постановка и ответ (ответ становится решением)
+    Question {
+        #[command(subcommand)]
+        cmd: QuestionCmd,
+    },
     /// Словарь домена: список терминов «имя — определение» или карточка по имени или псевдониму
     Glossary {
         /// Имя или псевдоним термина (без него — весь список)
@@ -470,6 +475,71 @@ enum TaskCmd {
     Release {
         /// k:<id>
         id: String,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuestionCmd {
+    /// Лента вопросов (по умолчанию open)
+    List {
+        /// Статусы через запятую: open, answered, obsolete
+        #[arg(long)]
+        status: Option<String>,
+        /// Knowledge вместо решения
+        #[arg(long)]
+        global: bool,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Задать вопрос (контекст — из --body-file или stdin); такой вопрос уже есть — код 4
+    Ask {
+        #[arg(long)]
+        title: String,
+        /// Вариант ответа key=текст (до 8, повторяемый)
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// Рекомендуемый вариант (ключ из --option)
+        #[arg(long)]
+        recommend: Option<String>,
+        /// Файл с контекстом (иначе stdin)
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Область (монорепозиторий)
+        #[arg(long)]
+        area: Option<String>,
+        /// Knowledge вместо решения
+        #[arg(long)]
+        global: bool,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        /// Ключ идемпотентности
+        #[arg(long)]
+        key: Option<String>,
+        /// Записать, даже если такой вопрос уже есть
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Ответить словами человека: вопрос становится answered, ответ — решением (axiom)
+    Answer {
+        /// q:<id>
+        id: String,
+        /// Ключ выбранного варианта
+        #[arg(long)]
+        option: Option<String>,
+        /// Свободный текст ответа
+        #[arg(long)]
+        text: Option<String>,
+        /// Где человек ответил
+        #[arg(long, default_value = "cli", value_parser = ["chat", "cli"])]
+        channel: String,
         #[command(flatten)]
         common: Common,
     },
@@ -956,6 +1026,61 @@ fn task(c: TaskCmd) -> Result<(), CliError> {
     }
 }
 
+fn question(c: QuestionCmd) -> Result<(), CliError> {
+    use cmd::question as q;
+    match c {
+        QuestionCmd::List {
+            status,
+            global,
+            solution,
+            common,
+        } => q::list(
+            &cmd::connect(&common)?,
+            status.as_deref(),
+            global,
+            solution.as_deref(),
+        ),
+        QuestionCmd::Ask {
+            title,
+            options,
+            recommend,
+            body_file,
+            area,
+            global,
+            solution,
+            key,
+            force,
+            common,
+        } => q::ask(
+            &cmd::connect(&common)?,
+            &q::Ask {
+                title: &title,
+                options: &options,
+                recommend: recommend.as_deref(),
+                body_file: body_file.as_deref(),
+                area: area.as_deref(),
+                global,
+                solution: solution.as_deref(),
+                key: key.as_deref(),
+                force,
+            },
+        ),
+        QuestionCmd::Answer {
+            id,
+            option,
+            text,
+            channel,
+            common,
+        } => q::answer(
+            &cmd::connect(&common)?,
+            &id,
+            option.as_deref(),
+            text.as_deref(),
+            &channel,
+        ),
+    }
+}
+
 fn insight(c: InsightCmd) -> Result<(), CliError> {
     use cmd::insight as i;
     match c {
@@ -1202,6 +1327,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         }
         Cmd::Insight { cmd } => insight(cmd),
         Cmd::Task { cmd } => task(cmd),
+        Cmd::Question { cmd } => question(cmd),
         Cmd::Cache { cmd } => cache(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {

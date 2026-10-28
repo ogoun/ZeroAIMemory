@@ -806,3 +806,45 @@ async fn mcp_update_entry_status_claim() {
     .await;
     assert!(err && t.contains("claim"), "{t}");
 }
+
+/// Захват — оперативное состояние: в снимки ревизий (`GET …/revisions`) не попадает, а правка,
+/// отличающаяся только захватом, ревизии не создаёт.
+#[tokio::test]
+async fn claimed_by_not_in_revision_snapshots() {
+    let a = api("tasks-claim-revisions", |_| {}).await;
+    let tid = id(&new_task(&a, "Снимки", json!({"next_step": "шаг"})).await);
+    let r = claim(&a, &tid, Some("s1"), json!({"ttl_min": 30})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // смена статуса при действующем захвате: захват в записи остаётся, в снимке его нет
+    let j = status(&a, &tid, "in_progress").await;
+    assert_eq!(j["data"]["claimed_by"]["session"], "s1", "{j}");
+    let j = patch(&a, &tid, json!({"next_step": "новый шаг"}))
+        .await
+        .json();
+    assert_eq!(j["data"]["claimed_by"]["session"], "s1");
+    let revs = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/entries/{tid}/revisions"),
+            None,
+        )
+        .await
+        .json();
+    let items = revs["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "{revs}");
+    for r in items {
+        assert!(r["data"].get("claimed_by").is_none(), "{r}");
+    }
+    assert_eq!(items[2]["data"]["next_step"], "новый шаг");
+    // повторная правка без изменений содержимого — без новой ревизии
+    let j = patch(&a, &tid, json!({"next_step": "новый шаг"}))
+        .await
+        .json();
+    assert_eq!(j["rev"], 3);
+    // done → done не сдвигает done_at
+    let d1 = status(&a, &tid, "done").await;
+    let done = d1["data"]["done_at"].clone();
+    let d2 = status(&a, &tid, "done").await;
+    assert_eq!(d2["data"]["done_at"], done);
+    assert_eq!(d2["rev"], d1["rev"], "done → done без изменений");
+}

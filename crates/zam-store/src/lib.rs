@@ -21,6 +21,7 @@ pub mod links;
 pub mod migrate;
 pub mod nodes;
 pub mod paths;
+pub mod questions;
 pub mod search;
 pub mod sessions;
 pub mod solution_registry;
@@ -92,6 +93,12 @@ pub use nodes::{
     unified_diff, update_note,
 };
 pub use paths::{NodePath, path_ancestors};
+pub use questions::{
+    ANSWER_TEXT_MAX_CHARS, Answer, AnswerBy, Channel, NewAnswer, OPTION_KEY_MAX_CHARS,
+    OPTION_TEXT_MAX_CHARS, OPTIONS_MAX, QOption, QUESTION_DUPLICATES_MAX, QuestionCandidate,
+    QuestionData, QuestionError, answer_question, check_question, check_question_transition,
+    days_ago, open_questions, question_duplicates, recent_answered,
+};
 pub use search::{
     AliasGroup, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit,
     MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_targets,

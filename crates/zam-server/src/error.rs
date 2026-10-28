@@ -51,6 +51,10 @@ pub enum ApiError {
     /// `claimed_by {session, agent, until}`.
     #[error("задача уже захвачена другой сессией")]
     TaskClaimed(zam_store::Claim),
+    /// 409 `/problems/already-answered` (M4.5 §4): вопрос уже отвечен; тело несёт `decision_id`
+    /// решения из первого ответа.
+    #[error("вопрос уже отвечен")]
+    AlreadyAnswered { decision_id: Option<zam_core::Id> },
     /// 422 `/problems/reason-required` (M4.5 §3): переоткрытие задачи без причины.
     #[error("{0}")]
     ReasonRequired(String),
@@ -139,6 +143,11 @@ impl ApiError {
             ApiError::TaskClaimed(_) => {
                 (StatusCode::CONFLICT, "/problems/task-claimed", "Conflict")
             }
+            ApiError::AlreadyAnswered { .. } => (
+                StatusCode::CONFLICT,
+                "/problems/already-answered",
+                "Conflict",
+            ),
             ApiError::ReasonRequired(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/reason-required",
@@ -273,6 +282,9 @@ impl IntoResponse for ApiError {
         }
         if let (ApiError::TermConflict(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("conflicts".into(), json!(c));
+        }
+        if let (ApiError::AlreadyAnswered { decision_id }, Value::Object(o)) = (&self, &mut body) {
+            o.insert("decision_id".into(), json!(decision_id));
         }
         if let (ApiError::TaskClaimed(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("claimed_by".into(), json!(c));

@@ -12,6 +12,7 @@ pub mod health;
 pub mod index;
 pub mod insights;
 pub mod nodes;
+pub mod questions;
 pub mod read;
 pub mod recall;
 pub mod releases;
@@ -118,6 +119,7 @@ fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
         )
         .route("/api/v1/spaces/{space}/glossary", get(glossary::get))
         .route("/api/v1/entries/{id}/restore", post(entries::restore))
+        .route("/api/v1/entries/{id}/answer", post(questions::answer))
         .route("/api/v1/entries/{id}/claim", post(tasks::claim))
         .route("/api/v1/entries/{id}/release", post(tasks::release))
         .route(

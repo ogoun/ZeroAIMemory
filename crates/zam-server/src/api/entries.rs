@@ -16,6 +16,10 @@
 //! по [`zam_store::TaskData`]; `PATCH` меняет `status` (с `next_step`, `blocked_by`, `reason`;
 //! переоткрытие `done`/`dropped` → `open` — только с `reason`, иначе 422 `reason-required`) и
 //! поля задачи слиянием; у `done` в ответах — `duration_min`.
+//! `kind: question` — вопрос к человеку (M4.5 §4, [`super::questions`]): в решении и Knowledge,
+//! `data` по [`zam_store::QuestionData`] (`options`, `recommendation`); совпавший заголовок
+//! `open`/`answered` вопроса — 409 `possible-duplicate` (`force` пишет всё равно); `PATCH` —
+//! `data` пока `open` и `status: obsolete` с `reason`; ответ — `POST /entries/{id}/answer`.
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
 //! уходит в [`super::insights::create`] (дедупликация, `scope`, триггеры, замещение).
 //! У insight `GET`/`PATCH` отдают и `triggers`; `PATCH` принимает `status: active | revisit`
@@ -210,27 +214,10 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
         EntryKind::Task => zam_store::check_task(data)
             .map(|t| t.to_value())
             .map_err(unprocessable),
-        EntryKind::Question => Err(kind_pending(kind)),
+        EntryKind::Question => zam_store::check_question(data)
+            .map(|q| q.to_value())
+            .map_err(unprocessable),
     }
-}
-
-/// 422 для вида M4.5, чьи правила записи ещё не реализованы (спецификация M4.5 §1.3):
-/// хранилище его уже принимает, REST — со своей задачей плана. Временная заглушка задачи 5.
-fn kind_pending(kind: EntryKind) -> ApiError {
-    let task = match kind {
-        EntryKind::Question => 5,
-        EntryKind::Changelog
-        | EntryKind::Release
-        | EntryKind::Insight
-        | EntryKind::Term
-        | EntryKind::Task => {
-            unreachable!("вид {} уже пишется", kind.as_str())
-        }
-    };
-    unprocessable(format!(
-        "вид {} появится в задаче {task} этапа M4.5",
-        kind.as_str()
-    ))
 }
 
 pub(crate) fn check_size(st: &AppState, body: &str) -> Result<(), ApiError> {
@@ -269,6 +256,9 @@ pub struct Create {
     tags: Vec<String>,
     area: Option<String>,
     message: Option<String>,
+    /// Только question: записать, даже если такой вопрос уже есть.
+    #[serde(default)]
+    force: bool,
 }
 
 pub(crate) fn empty_object() -> Value {
@@ -308,15 +298,12 @@ pub async fn create(
     let req: Create = serde_json::from_value(raw)
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
     let sc = space_scope(&st, &p, &headers, &space, Mode::Write).await?;
-    // вид без правил записи — после проверки доступа: без прав 403/404, а не 422
-    if req.kind == EntryKind::Question {
-        return Err(kind_pending(req.kind));
-    }
-    if req.kind == EntryKind::Task {
-        // задачи ведутся в решении и Knowledge (Rules и Human журналов не имеют)
+    // вид проверяется после доступа к пространству: без прав 403/404, а не 422
+    if matches!(req.kind, EntryKind::Task | EntryKind::Question) {
+        // задачи и вопросы ведутся в решении и Knowledge (Rules и Human журналов не имеют)
         if !matches!(sc.space.kind, SpaceKind::Solution | SpaceKind::Knowledge) {
             return Err(unprocessable(
-                "задачи ведутся только в пространстве решения или Knowledge",
+                "задачи и вопросы ведутся только в пространстве решения или Knowledge",
             ));
         }
     } else if sc.space.kind != SpaceKind::Solution {
@@ -329,6 +316,21 @@ pub async fn create(
     check_size(&st, &req.body)?;
     let attrib = attribution(&p, &headers, req.message)?;
     let key = idempotency_key(&headers)?;
+    if req.kind == EntryKind::Question && !req.force {
+        // повтор по ключу дубликатом не считается (иначе запись нашла бы саму себя)
+        let repeat = match &key {
+            Some(k) => entry_by_idempotency_key(&sc.db, &attrib, k)
+                .await?
+                .is_some(),
+            None => false,
+        };
+        if !repeat
+            && let Some(dup) =
+                super::questions::question_duplicate(&sc.db, sc.space.id, &req.title).await?
+        {
+            return Err(dup);
+        }
+    }
     // повтор без даты после смены суток: отпечаток снимается с исходного запроса, поэтому
     // подставленная при первом создании дата берётся у уже созданной записи
     if req.kind == EntryKind::Release
@@ -567,13 +569,36 @@ fn check_task_status(e: &Entry, s: EntryStatus, reason: Option<&str>) -> Result<
     })
 }
 
+/// Смена статуса question правкой: только `obsolete` с `reason`; `answered` — ответом.
+fn check_question_status(e: &Entry, s: EntryStatus, reason: Option<&str>) -> Result<(), ApiError> {
+    let from = e.status.unwrap_or(EntryStatus::Open);
+    zam_store::check_question_transition(from, s, reason).map_err(|code| match code {
+        "reason-required" => {
+            ApiError::ReasonRequired("устаревание вопроса (obsolete) требует reason".into())
+        }
+        "answer-only" => unprocessable("answered ставится только ответом: POST …/answer"),
+        "not-a-question-status" => unprocessable("status вопроса: open, answered или obsolete"),
+        _ => unprocessable(format!(
+            "переход {} → {} не разрешён: из obsolete статус не меняется, answered в open не \
+             возвращается",
+            from.as_str(),
+            s.as_str()
+        )),
+    })
+}
+
 /// Смена статуса insight правкой: только `active ↔ revisit` — иначе 422.
 fn check_status_change(e: &Entry, s: EntryStatus, reason: Option<&str>) -> Result<(), ApiError> {
     if e.kind == EntryKind::Task {
         return check_task_status(e, s, reason);
     }
+    if e.kind == EntryKind::Question {
+        return check_question_status(e, s, reason);
+    }
     if e.kind != EntryKind::Insight {
-        return Err(unprocessable("status есть только у insight и task"));
+        return Err(unprocessable(
+            "status есть только у insight, task и question",
+        ));
     }
     if !matches!(s, EntryStatus::Active | EntryStatus::Revisit) {
         return Err(unprocessable(
@@ -688,6 +713,12 @@ pub async fn patch(
         }
         (Some(d), EntryKind::Insight) => {
             super::insights::check_insight_data(d)?;
+            Some(d.clone())
+        }
+        (Some(d), EntryKind::Question) => {
+            zam_store::QuestionData::from_stored(&sc.entry.data)
+                .apply_patch(d)
+                .map_err(unprocessable)?;
             Some(d.clone())
         }
         (Some(d), kind) => Some(check_data(kind, d)?),

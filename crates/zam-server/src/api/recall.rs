@@ -22,7 +22,11 @@
 //!   пользователя (`access_requests_pending`), `### Задачи` (M4.5 §3: задачи `in_progress` и
 //!   `blocked` решения и Knowledge, до 5, захваченные сессией запроса — первыми, затем недавно
 //!   менявшиеся; строка `[<статус>] <заголовок> — далее: … — k:<id>`, у `blocked` — ещё
-//!   ` — блокер: …`; `reason: task`), Rules (L1 каждой заметки, до
+//!   ` — блокер: …`; `reason: task`), `### Ответы человека` (M4.5 §4: вопросы, отвеченные за
+//!   [`ANSWERS_DAYS`] дней и ещё не показанные этой сессии — `session_seen`, до 5; строка
+//!   `ZeroAIMemory: ответ на «<вопрос>»: <ответ> — q:<id> → i:<решение>`, `reason: answer`) и
+//!   `### Открытые вопросы` (`N открытых: «…», «…», «…»`, до [`OPEN_QUESTIONS_TITLES`]
+//!   заголовков, не подсказка записи), Rules (L1 каждой заметки, до
 //!   [`RULES_MAX`] заметок, L1 — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
 //!   пространства решения с L0 (до [`SOLUTION_ROOT_MAX`]), до 5 действующих (`active`)
 //!   `gotcha`/`failure` решения и Knowledge (новые первыми), до 5 записей `revisit`, последние
@@ -360,6 +364,16 @@ fn entry_filter(space: Id, kind: EntryKind) -> EntryFilter {
 
 /// Предел `next_step` и `blocker` в строке задачи дайджеста, символов.
 const TASK_LINE_TEXT_CHARS: usize = 200;
+/// Давность ответа на вопрос для `### Ответы человека`, дней (M4.5 §4).
+pub const ANSWERS_DAYS: i64 = 14;
+/// Заголовков открытых вопросов в дайджесте.
+pub const OPEN_QUESTIONS_TITLES: usize = 3;
+/// `reason` подсказки с ответом на вопрос: показывается сессии один раз.
+const REASON_ANSWER: &str = "answer";
+/// Заголовок раздела дайджеста с ответами.
+const SECTION_ANSWERS: &str = "### Ответы человека";
+/// Заголовок раздела дайджеста с открытыми вопросами.
+const SECTION_OPEN_QUESTIONS: &str = "### Открытые вопросы";
 
 /// Обрезка текста до `max` символов с многоточием.
 fn clip(s: &str, max: usize) -> String {
@@ -421,6 +435,87 @@ async fn task_cands(
         .collect())
 }
 
+/// Строка ответа на вопрос: `ZeroAIMemory: ответ на «<вопрос>»: <ответ> — q:<id> → i:<решение>`.
+fn answer_block(e: &Entry, qd: &zam_store::QuestionData, a: &zam_store::Answer) -> String {
+    let q = zam_markdown::mask_text(&clip(&e.title, TASK_LINE_TEXT_CHARS));
+    let ans = zam_markdown::mask_text(&clip(&a.brief(&qd.options), TASK_LINE_TEXT_CHARS));
+    format!(
+        "ZeroAIMemory: ответ на «{q}»: {ans} — {} → i:{}",
+        entry_ref(e),
+        a.decision_id
+    )
+}
+
+/// Ответы человека за [`ANSWERS_DAYS`] дней (до сеанса показа — по `session_seen`) и строка
+/// открытых вопросов `N открытых: «…», «…», «…»` (до [`OPEN_QUESTIONS_TITLES`]).
+async fn question_cands(
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+    spaces: &[(usize, Id)],
+) -> Result<(Vec<Cand>, Option<String>), ApiError> {
+    let since = zam_store::days_ago(jiff::Timestamp::now(), ANSWERS_DAYS);
+    let mut answered: Vec<(usize, Entry, zam_store::Answer)> = Vec::new();
+    let (mut open_n, mut titles) = (0usize, Vec::<String>::new());
+    for i in 0..health.targets().len() {
+        let ids: Vec<Id> = spaces
+            .iter()
+            .filter(|(t, _)| *t == i)
+            .map(|(_, s)| *s)
+            .collect();
+        if ids.is_empty() || !health.alive[i] {
+            continue;
+        }
+        let db = health.targets()[i].db.clone();
+        let Some(r) = deadline
+            .step(zam_store::recent_answered(&db, &ids, since, ENTRY_FETCH))
+            .await
+        else {
+            break;
+        };
+        if let Some(rows) = health.soft(i, r)? {
+            for e in rows {
+                if let Some(a) = zam_store::QuestionData::from_stored(&e.data).answer {
+                    answered.push((i, e, a));
+                }
+            }
+        }
+        let Some(r) = deadline
+            .step(zam_store::open_questions(&db, &ids, OPEN_QUESTIONS_TITLES))
+            .await
+        else {
+            break;
+        };
+        if let Some((n, t)) = health.soft(i, r)? {
+            open_n += n;
+            titles.extend(t);
+        }
+    }
+    answered.sort_by_key(|(_, e, a)| std::cmp::Reverse((a.answered_at, e.id)));
+    let cands = answered
+        .iter()
+        .map(|(i, e, a)| {
+            let qd = zam_store::QuestionData::from_stored(&e.data);
+            let mut c = entry_cand(*i, e, REASON_ANSWER, "");
+            c.block = answer_block(e, &qd, a);
+            c
+        })
+        .collect();
+    let line = (open_n > 0).then(|| {
+        let list: Vec<String> = titles
+            .iter()
+            .take(OPEN_QUESTIONS_TITLES)
+            .map(|t| {
+                format!(
+                    "«{}»",
+                    zam_markdown::mask_text(&clip(t, TASK_LINE_TEXT_CHARS))
+                )
+            })
+            .collect();
+        format!("{open_n} открытых: {}", list.join(", "))
+    });
+    Ok((cands, line))
+}
+
 /// Разделы дайджеста `session_start` (см. модуль); каждый — кандидаты по приоритету.
 async fn digest(
     st: &AppState,
@@ -475,6 +570,9 @@ async fn digest(
     });
     let tasks = task_cands(health, deadline, &insight_spaces, session.as_deref()).await?;
     sections.push((Some("### Задачи"), tasks));
+    // ответы человека и открытые вопросы — сразу после задач (M4.5 §4)
+    let (answers, open_line) = question_cands(health, deadline, &insight_spaces).await?;
+    sections.push((Some(SECTION_ANSWERS), answers));
 
     // Rules — L1 каждой заметки
     let mut rules: Vec<Cand> = Vec::new();
@@ -632,13 +730,15 @@ async fn digest(
     .collect();
     sections.push((Some("### Последние изменения"), changes));
     let glossary = glossary_line(st, health, deadline).await;
-    Ok((notices, sections, glossary))
+    Ok((notices, sections, glossary, open_line))
 }
 
-/// Дайджест `session_start`: уведомления, разделы-кандидаты и строка словаря.
+/// Дайджест `session_start`: уведомления, разделы-кандидаты, строка словаря и строка открытых
+/// вопросов.
 type Digest = (
     Vec<String>,
     Vec<(Option<&'static str>, Vec<Cand>)>,
+    Option<String>,
     Option<String>,
 );
 
@@ -1213,29 +1313,41 @@ pub async fn recall(
     };
 
     // сбор кандидатов
-    let (notices, sections, repeatable, glossary) = match req.event {
-        _ if !enabled => (Vec::new(), Vec::new(), true, None),
+    let (notices, sections, repeatable, glossary, open_line) = match req.event {
+        _ if !enabled => (Vec::new(), Vec::new(), true, None, None),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
         Event::SessionStart => {
-            let (n, s, g) = digest(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
-            (n, s, true, g)
+            let (n, s, g, o) = digest(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
+            (n, s, true, g, o)
         }
         Event::Prompt => {
             // строки словаря — перед подсказками insight; у каждого свой предел
             let terms = term_hints(&st, &req, &mut health, &mut deadline).await;
             let c = prompt_hints(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
-            (Vec::new(), vec![(None, terms), (None, c)], false, None)
+            (
+                Vec::new(),
+                vec![(None, terms), (None, c)],
+                false,
+                None,
+                None,
+            )
         }
         Event::PostTool => {
             let c = error_hints(&req, &mut health, &mut deadline).await?;
-            (Vec::new(), vec![(None, c)], true, None)
+            (Vec::new(), vec![(None, c)], true, None, None)
         }
     };
-    // без повторов: показанное сессии, повторы между разделами, исключённые цели
+    // без повторов: показанное сессии, повторы между разделами, исключённые цели; ответ на
+    // вопрос показывается сессии один раз и в повторяемом дайджесте
     let all: Vec<&Cand> = sections.iter().flat_map(|(_, c)| c).collect();
     let seen = if repeatable {
-        HashSet::new()
+        let once: Vec<&Cand> = all
+            .iter()
+            .copied()
+            .filter(|c| c.reason == REASON_ANSWER)
+            .collect();
+        shown(session.as_ref(), &targets, &once).await
     } else {
         shown(session.as_ref(), &targets, &all).await
     };
@@ -1270,6 +1382,16 @@ pub async fn recall(
             blocks: chosen.iter().map(|c| c.block.clone()).collect(),
         });
         picked.push(chosen);
+        // открытые вопросы — сразу после ответов; как и строка словаря, не подсказка записи
+        if *title == Some(SECTION_ANSWERS)
+            && let Some(line) = &open_line
+        {
+            packed.push(Section {
+                title: Some(SECTION_OPEN_QUESTIONS.to_string()),
+                blocks: vec![line.clone()],
+            });
+            picked.push(Vec::new());
+        }
         // строка словаря — сразу после правил; в `picked` у неё пустой список (не подсказка
         // записи: ни `session_seen`, ни `usage`)
         if *title == Some("### Правила")

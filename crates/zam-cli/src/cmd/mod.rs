@@ -10,6 +10,7 @@ pub mod insight;
 pub mod link;
 pub mod log;
 pub mod mcp;
+pub mod question;
 pub mod read;
 pub mod release;
 pub mod search;

@@ -104,14 +104,14 @@ impl ToolName {
             ToolName::Log => {
                 "Новая запись журнала: kind changelog|release (только в решении), insight \
                  (data.kind, triggers, links, scope, certainty), term (data.definition, \
-                 aliases) или task (body — план, data.next_step). Похожий insight — 409 с \
-                 кандидатами: append, supersede или force."
+                 aliases), task (body — план) или question (data.options, recommendation). Дубль \
+                 insight или вопроса — 409 с кандидатами: force."
             }
             ToolName::UpdateEntry => {
-                "Изменить запись журнала: action supersede|retract|revisit|certify|append|feedback|\
-                 status|claim|release; rev — текущая ревизия (кроме feedback, claim, release). \
-                 certify — certainty, reason; feedback — value; задача: status (+next_step, \
-                 blocked_by, reason), claim (ttl_min), release."
+                "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
+                 claim|release|answer; rev — ревизия (кроме feedback, claim, release, answer). \
+                 certify — certainty, reason; feedback — value; задача: status, claim, release; \
+                 вопрос: answer (option, text, by) или status obsolete + reason."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
@@ -234,7 +234,7 @@ impl ToolName {
                     "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "question"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code"},
+                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "certainty": {"type": "string", "enum": ["axiom", "theorem", "hypothesis"]},
                     "triggers": {"type": "array", "items": {"type": "object"}},
@@ -253,12 +253,18 @@ impl ToolName {
                     "id": {"type": "string"},
                     "rev": {"type": "integer"},
                     "action": {"type": "string", "enum": ["supersede", "retract", "revisit",
-                        "certify", "append", "feedback", "status", "claim", "release"]},
+                        "certify", "append", "feedback", "status", "claim", "release", "answer"]},
                     "status": {"type": "string", "description": "задача: open, in_progress, blocked, done, dropped"},
                     "next_step": {"type": ["string", "null"]},
                     "blocked_by": {"type": ["string", "null"]},
                     "ttl_min": {"type": "integer", "minimum": 1, "maximum": 1440},
                     "agent": {"type": "string"},
+                    "option": {"type": "string", "description": "answer: ключ варианта вопроса"},
+                    "text": {"type": "string", "description": "answer: текст ответа"},
+                    "channel": {"type": "string", "enum": ["chat", "cli"],
+                        "description": "answer: где человек ответил (по умолчанию chat)"},
+                    "by": {"type": "string", "enum": ["human", "agent"],
+                        "description": "answer: human (по умолчанию) — слова человека; agent — решение агента"},
                     "title": {"type": "string"},
                     "body": {"type": "string", "description": "supersede — тело; append — дописать"},
                     "data": {"type": "object"},
@@ -1076,6 +1082,26 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             }
             (Method::PATCH, entry, b)
         }
+        "answer" => {
+            // ответ человека, записанный агентом по его словам: channel chat, by human
+            let mut b = pick(args, &["text", "option", "channel", "by", "message"]);
+            b.entry("channel").or_insert_with(|| json!("chat"));
+            let r = call_rest(
+                rest,
+                Method::POST,
+                &format!("{entry}/answer"),
+                Some(&Value::Object(b)),
+                &[],
+            )
+            .await?;
+            return done(f, &r, |v| {
+                format!(
+                    "Ответ записан {}\nРешение {}",
+                    entry_line(&v["entry"]),
+                    entry_line(&v["decision"])
+                )
+            });
+        }
         "claim" => (
             Method::POST,
             format!("{entry}/claim"),
@@ -1100,8 +1126,8 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         }
         _ => {
             return Err(Fail::Invalid(
-                "action: supersede, retract, revisit, certify, append, feedback, status, claim \
-                 или release"
+                "action: supersede, retract, revisit, certify, append, feedback, status, claim, \
+                 release или answer"
                     .into(),
             ));
         }

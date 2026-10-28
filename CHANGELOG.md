@@ -13,7 +13,10 @@
 
 - Журнал задач (M4.5, задача 4): записи `kind: task` (план в теле, `data`: `next_step`, `blocked_by`, `owner`, `links`, `estimate_min`; поля сервера `started_at`, `done_at`, `claimed_by`), статусы `open`/`in_progress`/`blocked`/`done`/`dropped` с проверкой переходов (переоткрытие — только в `open` и с `reason`: `422 /problems/reason-required`), `duration_min` у `done`; захват `POST /entries/{id}/claim` и `…/release` (сессия, срок 1–1440 мин, `409 /problems/task-claimed` с `claimed_by`, ревизию не создаёт, пишется в аудит `entry.claim`/`entry.release`); раздел `### Задачи` дайджеста; `claimed_tasks` в `GET /sessions/{id}`; напоминание `checkpoint` «обнови next_step задачи k:<id>»; `memory_update_entry action=status|claim|release`; `zam task list|show|new|status|claim|release`.
 
+- Вопросы к человеку (M4.5, задача 5): записи `kind: question` (вопрос в заголовке, контекст в теле, `data`: `options` до 8 `{key, text}`, `recommendation`; ответ `data.answer` ведёт сервер), дубликат по заголовку среди `open` и `answered` — 409 `possible-duplicate` с ответом отвеченного, `force` пишет всё равно; `POST /entries/{id}/answer {text?, option?, channel?, by?}` одной транзакцией переводит вопрос в `answered` и создаёт insight `decision` (`axiom` при `by: human` — по умолчанию у WebUI и у токена с `channel: chat|cli`, иначе `hypothesis`; `data.decision.decided_by`) с ребром `derived_from` решение -> вопрос; повторный ответ — 409 `/problems/already-answered` с `decision_id`; `obsolete` — с `reason`; аудит `entry.answer`. Дайджест: `### Ответы человека` (за 14 дней, раз за сессию, до 5) и `### Открытые вопросы` (`N открытых: …`) сразу после задач. MCP `memory_update_entry action=answer`, CLI `zam question list|ask|answer`. Ответ участника общего решения пишется в базу владельца.
+
 ### Changed
+- Задачи: `claimed_by` не входит в снимки ревизий и в сравнение «правка без изменений»; повторный `done` не сдвигает `done_at`.
 - Выжимки кэша, записанные до M4.5 поиском с умолчаниями видов, при таком поиске не находятся (умолчания видов и статусов входят в `scope_hash`) и пересоздаются.
 
 ### Fixed

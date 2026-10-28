@@ -234,7 +234,10 @@ impl TaskData {
         match to {
             EntryStatus::InProgress if self.started_at.is_none() => self.started_at = Some(now),
             EntryStatus::Done => {
-                self.done_at = Some(now);
+                // повторный done → done момент завершения не сдвигает
+                if self.done_at.is_none() {
+                    self.done_at = Some(now);
+                }
                 self.claimed_by = None;
             }
             EntryStatus::Dropped => self.claimed_by = None,
@@ -537,6 +540,12 @@ mod tests {
         t.on_transition(Some(InProgress), Done, t1);
         assert_eq!(t.done_at, Some(t1));
         assert_eq!(t.claimed_by, None);
+        // done → done и dropped → dropped не перезаписывают done_at
+        let t2: Timestamp = "2026-10-28T12:00:00Z".parse().unwrap();
+        t.on_transition(Some(Done), Done, t2);
+        assert_eq!(t.done_at, Some(t1));
+        t.on_transition(Some(Dropped), Dropped, t2);
+        assert_eq!(t.done_at, Some(t1));
         assert_eq!(t.duration_min(), Some(90));
         t.on_transition(Some(Done), Open, t1);
         assert_eq!(t.done_at, None);

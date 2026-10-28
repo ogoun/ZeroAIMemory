@@ -18,6 +18,7 @@ use crate::certainty::{
 };
 use crate::glossary::{check_term, ensure_names_free, terms_written};
 use crate::nodes::{Attribution, AuthorKind};
+use crate::questions::{QuestionData, check_question, check_question_transition};
 use crate::tasks::{TaskData, check_task, check_task_transition};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
@@ -296,6 +297,9 @@ pub(crate) fn insert_entry(
     if e.kind == EntryKind::Task {
         e.data = check_task(&e.data).map_err(bad)?.to_value();
     }
+    if e.kind == EntryKind::Question {
+        e.data = check_question(&e.data).map_err(bad)?.to_value();
+    }
     let status = new_status(e.kind, e.status)?;
     if !has_certainty(e.kind) && e.certainty.is_some() {
         return Err(bad("certainty есть только у insight и term"));
@@ -356,7 +360,7 @@ pub(crate) fn insert_entry(
         entry_index_state(space_kind).as_str(),
         now,
     ])?;
-    insert_revision(c, id, 1, &f, None, a, now)?;
+    insert_revision(c, id, 1, e.kind, &f, None, a, now)?;
     replace_triggers(c, id, &triggers, now)?;
     index_entry_now(c, id, None, now)?;
     crate::graph::insert_entry_links(c, id, &links, a, now)?;
@@ -370,11 +374,25 @@ fn tags_json(tags: &[String]) -> String {
     serde_json::to_string(tags).expect("сериализация списка строк")
 }
 
+/// `data` для ревизии и сравнения «правка без изменений»: у task без `claimed_by` — захват
+/// это оперативное состояние, а не содержимое записи (решение контроллера, M4.5 задача 5).
+fn content_data(kind: EntryKind, data: &serde_json::Value) -> serde_json::Value {
+    let mut d = data.clone();
+    if kind == EntryKind::Task
+        && let Some(o) = d.as_object_mut()
+    {
+        o.remove("claimed_by");
+    }
+    d
+}
+
 /// Дописывает ревизию (ревизии только дописываются).
+#[allow(clippy::too_many_arguments)]
 fn insert_revision(
     c: &Connection,
     id: Id,
     rev: i64,
+    kind: EntryKind,
     f: &Fields,
     reason: Option<&str>,
     a: &Attribution,
@@ -391,7 +409,7 @@ fn insert_revision(
         rev,
         f.title,
         f.body,
-        f.data.to_string(),
+        content_data(kind, &f.data).to_string(),
         tags_json(&f.tags),
         f.area,
         f.status,
@@ -439,7 +457,7 @@ fn save(
         rev,
         now,
     ])?;
-    insert_revision(c, cur.id, rev, f, reason, a, now)?;
+    insert_revision(c, cur.id, rev, cur.kind, f, reason, a, now)?;
     // выжимки кэша с этим источником (§9.4): замещение и отзыв — по статусу, правка —
     // `changed` (тело или секция с прежним текстом остаются действующими)
     let stale = match (cur.status, f.status) {
@@ -498,6 +516,21 @@ fn check_rev(e: &Entry, if_rev: Option<i64>) -> Result<(), StoreError> {
         }),
         _ => Ok(()),
     }
+}
+
+/// Служебная правка без проверок вида: статус и `data` одной новой ревизией (ответ на вопрос).
+pub(crate) fn revise(
+    c: &Connection,
+    cur: &Entry,
+    status: Option<EntryStatus>,
+    data: serde_json::Value,
+    a: &Attribution,
+    now: &str,
+) -> Result<(), StoreError> {
+    let mut f = Fields::of(cur);
+    f.status = status;
+    f.data = data;
+    save(c, cur, &f, None, a, now)
 }
 
 /// Живая запись по id: нет или удалена → `NotFound`.
@@ -570,6 +603,11 @@ pub async fn update_entry(
         if content {
             ensure_editable(&cur)?;
         }
+        if content && cur.kind == EntryKind::Question && cur.status != Some(EntryStatus::Open) {
+            return Err(StoreError::Conflict(
+                "вопрос уже не открыт: содержимое не меняется — задайте новый вопрос".into(),
+            ));
+        }
         if p.body.is_some() && p.append_body.is_some() {
             return Err(bad("body и append_body вместе"));
         }
@@ -578,6 +616,10 @@ pub async fn update_entry(
         let task = (cur.kind == EntryKind::Task).then(|| TaskData::from_stored(&cur.data));
         let mut task_patch: Option<serde_json::Value> = None;
         let mut task_status: Option<EntryStatus> = None;
+        // question: `data` — слияние полей спросившего поверх прежней, `answer` сохраняется
+        let question =
+            (cur.kind == EntryKind::Question).then(|| QuestionData::from_stored(&cur.data));
+        let mut question_patch: Option<serde_json::Value> = None;
         if let Some(t) = p.title {
             f.title = check_title(&t)?;
         }
@@ -594,6 +636,8 @@ pub async fn update_entry(
             }
             if task.is_some() {
                 task_patch = Some(d);
+            } else if question.is_some() {
+                question_patch = Some(d);
             } else {
                 f.data = d;
             }
@@ -613,7 +657,6 @@ pub async fn update_entry(
             f.area = check_area(ar)?;
         }
         if let Some(s) = p.status {
-            // переходы статусов term и question — задача M4.5 5
             if cur.kind == EntryKind::Task {
                 let from = cur.status.unwrap_or(EntryStatus::Open);
                 check_task_transition(from, s, reason.as_deref()).map_err(|code| {
@@ -624,6 +667,15 @@ pub async fn update_entry(
                     ))
                 })?;
                 task_status = Some(s);
+            } else if cur.kind == EntryKind::Question {
+                let from = cur.status.unwrap_or(EntryStatus::Open);
+                check_question_transition(from, s, reason.as_deref()).map_err(|code| {
+                    bad(format!(
+                        "{code}: {} → {} не разрешён (устаревание — с причиной, ответ — answer)",
+                        from.as_str(),
+                        s.as_str()
+                    ))
+                })?;
             } else if cur.kind != EntryKind::Insight {
                 return Err(bad(format!(
                     "статус {} правкой не меняется",
@@ -654,6 +706,10 @@ pub async fn update_entry(
             }
             f.data = t.to_value();
         }
+        if let (Some(mut qd), Some(d)) = (question, &question_patch) {
+            qd.apply_patch(d).map_err(bad)?;
+            f.data = qd.to_value();
+        }
         if let Some(c) = p.certainty {
             if !has_certainty(cur.kind) {
                 return Err(bad("certainty есть только у insight и term"));
@@ -680,7 +736,11 @@ pub async fn update_entry(
             }
             replace_triggers(tx, id, &check_triggers(ts)?, &now)?;
         }
-        if f == Fields::of(&cur) {
+        let mut now_f = f.clone();
+        let mut was_f = Fields::of(&cur);
+        now_f.data = content_data(cur.kind, &now_f.data);
+        was_f.data = content_data(cur.kind, &was_f.data);
+        if now_f == was_f {
             return Ok(cur);
         }
         // theorem агента — с полным доказательством и после правки

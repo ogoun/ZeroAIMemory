@@ -1,3 +1,5 @@
+//! Вопросы к человеку — `zam question` ([`super::question`]).
+//!
 //! `zam log changelog --kind K --title T [--body-file F | stdin] [--ref KIND:VALUE]…
 //! [--area A] [--solution GUID]` — запись в журнал изменений решения (§7.3).
 //!
