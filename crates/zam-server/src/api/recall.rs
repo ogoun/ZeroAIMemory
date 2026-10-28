@@ -355,6 +355,7 @@ fn entry_filter(space: Id, kind: EntryKind) -> EntryFilter {
         area: None,
         tag: None,
         data_kind: None,
+        decided_by: None,
         since: None,
         until: None,
         cursor: None,
@@ -455,7 +456,8 @@ async fn question_cands(
 ) -> Result<(Vec<Cand>, Option<String>), ApiError> {
     let since = zam_store::days_ago(jiff::Timestamp::now(), ANSWERS_DAYS);
     let mut answered: Vec<(usize, Entry, zam_store::Answer)> = Vec::new();
-    let (mut open_n, mut titles) = (0usize, Vec::<String>::new());
+    // заголовки открытых вопросов всех баз с временем создания: берутся новейшие по общей сортировке
+    let (mut open_n, mut titles) = (0usize, Vec::<(jiff::Timestamp, String)>::new());
     for i in 0..health.targets().len() {
         let ids: Vec<Id> = spaces
             .iter()
@@ -500,11 +502,12 @@ async fn question_cands(
             c
         })
         .collect();
+    titles.sort_by(|a, b| b.cmp(a));
     let line = (open_n > 0).then(|| {
         let list: Vec<String> = titles
             .iter()
             .take(OPEN_QUESTIONS_TITLES)
-            .map(|t| {
+            .map(|(_, t)| {
                 format!(
                     "«{}»",
                     zam_markdown::mask_text(&clip(t, TASK_LINE_TEXT_CHARS))
@@ -691,6 +694,7 @@ async fn digest(
             entries_of(health, deadline, &insight_spaces, |s| EntryFilter {
                 statuses: vec![EntryStatus::Active],
                 data_kind: Some(kind.to_string()),
+                decided_by: None,
                 ..entry_filter(s, EntryKind::Insight)
             })
             .await?,
@@ -1105,6 +1109,7 @@ async fn error_hints(
                     statuses: vec!["active".into(), "revisit".into()],
                     area: None,
                     certainty: Vec::new(),
+                    decided_by: None,
                 },
             };
             let Some(r) = deadline.step(search_fts_channels(&t.db, q)).await else {

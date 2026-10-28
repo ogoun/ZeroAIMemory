@@ -531,6 +531,10 @@ pub struct SearchSection {
     pub w_folder: f64,
     /// Не больше карточек папок в выдаче при `filters.kinds ∋ folder` (по умолчанию 2).
     pub max_folders: usize,
+    /// Порядок по связи `contradicts` (M4.5, §5.2): после реранка и бустов запись, у которой
+    /// есть исходящее `contradicts` к действующей аксиоме, не стоит выше неё, если обе в
+    /// выдаче. `false` — порядок реранкера без поправки (по умолчанию `true`).
+    pub contradicts_order: bool,
 }
 
 impl SearchSection {
@@ -587,16 +591,28 @@ pub struct InsightsSection {
     /// Порог dense-косинуса, с которого действующий insight той же области — кандидат в
     /// дубли (0..=1, по умолчанию 0,90).
     pub dedup_threshold: f32,
+    /// Порог dense-косинуса, с которого действующая аксиома-`decision` той же области —
+    /// «близкая» к новому решению агента (`warnings: decision_near_axiom`; M4.5, §5.1);
+    /// 0..=1, по умолчанию 0,80.
+    pub decision_conflict_threshold: f32,
 }
 
 impl InsightsSection {
     fn validate(&self) -> Result<(), ConfigError> {
-        if !(self.dedup_threshold.is_finite() && (0.0..=1.0).contains(&self.dedup_threshold)) {
-            return Err(ConfigError::Invalid {
-                key: "insights.dedup_threshold".into(),
-                source_name: "итог".into(),
-                message: "должно быть в 0..=1".into(),
-            });
+        for (k, v) in [
+            ("dedup_threshold", self.dedup_threshold),
+            (
+                "decision_conflict_threshold",
+                self.decision_conflict_threshold,
+            ),
+        ] {
+            if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                return Err(ConfigError::Invalid {
+                    key: format!("insights.{k}"),
+                    source_name: "итог".into(),
+                    message: "должно быть в 0..=1".into(),
+                });
+            }
         }
         Ok(())
     }
@@ -806,9 +822,11 @@ impl Default for ServerConfig {
                 graph_weight: 0.5,
                 w_folder: 0.0,
                 max_folders: 2,
+                contradicts_order: true,
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
+                decision_conflict_threshold: 0.80,
             },
             read: ReadSection {
                 max_items: 20,
@@ -1154,6 +1172,9 @@ mod tests {
         // канал папок выключен по сетке задачи 18 M3, карточек папок — не больше двух
         assert_eq!((c.search.w_folder, c.search.max_folders), (0.0, 2));
         assert_eq!(c.insights.dedup_threshold, 0.90);
+        // M4.5: близкие аксиомы решений и порядок по `contradicts`
+        assert_eq!(c.insights.decision_conflict_threshold, 0.80);
+        assert!(c.search.contradicts_order);
     }
 
     #[test]
@@ -1161,8 +1182,12 @@ mod tests {
         let ok = vec![
             env("ZAM_SEARCH__BOOST_AREA", "1.0"),
             env("ZAM_INSIGHTS__DEDUP_THRESHOLD", "0.85"),
+            env("ZAM_INSIGHTS__DECISION_CONFLICT_THRESHOLD", "0.7"),
+            env("ZAM_SEARCH__CONTRADICTS_ORDER", "false"),
         ];
         let c = load(None, &ok, &Default::default()).unwrap();
+        assert_eq!(c.insights.decision_conflict_threshold, 0.7);
+        assert!(!c.search.contradicts_order);
         assert_eq!(
             (c.search.boost_area, c.insights.dedup_threshold),
             (1.0, 0.85)
@@ -1175,6 +1200,7 @@ mod tests {
             ("ZAM_SEARCH__BOOST_HYPOTHESIS", "-1"),
             ("ZAM_SEARCH__GRAPH_WEIGHT", "1.5"),
             ("ZAM_INSIGHTS__DEDUP_THRESHOLD", "1.5"),
+            ("ZAM_INSIGHTS__DECISION_CONFLICT_THRESHOLD", "-0.1"),
         ] {
             let e = load(None, &[env(k, v)], &Default::default());
             assert!(e.is_err(), "{k}={v}");

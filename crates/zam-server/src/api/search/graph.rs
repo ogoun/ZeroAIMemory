@@ -14,10 +14,11 @@
 //! - Сбой чтения базы чужого решения исключает решение ([`Health::soft`]).
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use zam_core::{TargetKind, TargetRef};
+use zam_core::{Id, TargetKind, TargetRef};
+use zam_search::order_contradicted;
 use zam_store::{
-    ChunkScope, EdgeType, FtsHit, GraphStore, TargetFilter, count_tokens, first_leaves,
-    live_chunks, text_snippet,
+    Certainty, ChunkScope, EdgeType, EntryStatus, FtsHit, GraphStore, TargetFilter, count_tokens,
+    first_leaves, live_chunks, text_snippet,
 };
 
 use super::{Health, Item};
@@ -169,6 +170,78 @@ pub(super) async fn expand_graph(
             }
         })
         .collect())
+}
+
+/// Порядок по `contradicts` (M4.5, §5.2): записи выдачи с исходящим `contradicts` к действующей
+/// аксиоме той же выдачи не стоят выше неё ([`zam_search::order_contradicted`]); сдвинутой
+/// аксиоме балл поднимается до балла следующего элемента, чтобы баллы не шли вразрез с порядком.
+/// Сбой чтения графа чужого решения исключает решение ([`Health::soft`]).
+pub(super) async fn order_by_contradicts(
+    health: &mut Health<'_>,
+    items: &mut Vec<Item>,
+) -> Result<(), ApiError> {
+    let targets = health.targets;
+    let mut by_db: BTreeMap<usize, Vec<TargetRef>> = BTreeMap::new();
+    for it in items.iter() {
+        if it.folder.is_none() && health.alive[it.target] {
+            let refs = by_db.entry(it.target).or_default();
+            if !refs.contains(&it.hit.target) {
+                refs.push(it.hit.target);
+            }
+        }
+    }
+    let mut pairs: Vec<(Id, Id)> = Vec::new();
+    for (ti, refs) in by_db {
+        if refs.len() < 2 {
+            continue;
+        }
+        let t = &targets[ti];
+        let r =
+            t.db.neighbors(&refs, 1, &[EdgeType::Contradicts], &t.space_ids())
+                .await;
+        let Some(g) = health.soft(ti, r)? else {
+            continue;
+        };
+        let axioms: HashSet<Id> = g
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.certainty == Some(Certainty::Axiom)
+                    && !n.deleted
+                    // у заметки статуса нет; у записи — только действующая
+                    && matches!(
+                        n.status,
+                        None | Some(EntryStatus::Active | EntryStatus::Revisit)
+                    )
+            })
+            .map(|n| n.r.id)
+            .collect();
+        for e in &g.edges {
+            if e.kind != EdgeType::Contradicts {
+                continue;
+            }
+            if let Some(d) = e.dst
+                && axioms.contains(&d.id)
+                && refs.contains(&e.src)
+                && refs.contains(&d)
+            {
+                pairs.push((e.src.id, d.id));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    if order_contradicted(items, |it| it.hit.target.id, &pairs) > 0 {
+        let moved: HashSet<Id> = pairs.iter().map(|p| p.1).collect();
+        for i in (0..items.len().saturating_sub(1)).rev() {
+            let next = items[i + 1].score;
+            if moved.contains(&items[i].hit.target.id) && items[i].score < next {
+                items[i].score = next;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

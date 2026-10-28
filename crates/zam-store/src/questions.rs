@@ -572,12 +572,13 @@ pub async fn recent_answered(
     .await
 }
 
-/// Открытые вопросы пространств `spaces`: их число и заголовки `titles` новейших.
+/// Открытые вопросы пространств `spaces`: их число и `(created_at, заголовок)` до `titles`
+/// новейших (новые первыми). Вызывающий, объединяющий несколько баз, сортирует пары сам.
 pub async fn open_questions(
     db: &Db,
     spaces: &[Id],
     titles: usize,
-) -> Result<(usize, Vec<String>), StoreError> {
+) -> Result<(usize, Vec<(Timestamp, String)>), StoreError> {
     if spaces.is_empty() {
         return Ok((0, Vec::new()));
     }
@@ -594,14 +595,16 @@ pub async fn open_questions(
             ))?
             .query_row(params_from_iter(args.clone()), |r| r.get(0))?;
         let mut st = c.prepare(&format!(
-            "SELECT title FROM entries
+            "SELECT created_at, title FROM entries
              WHERE kind = 'question' AND status = 'open' AND deleted_at IS NULL
                AND space_id IN ({})
              ORDER BY created_at DESC, id DESC LIMIT {titles}",
             in_list(n)
         ))?;
         let t = st
-            .query_map(params_from_iter(args), |r| r.get::<_, String>(0))?
+            .query_map(params_from_iter(args), |r| {
+                Ok((crate::time::ts_at(r, 0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok((usize::try_from(count).unwrap_or(0), t))
     })

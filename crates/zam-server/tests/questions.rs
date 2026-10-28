@@ -800,3 +800,66 @@ async fn participant_answers_in_shared_solution() {
         .json();
     assert!(own["items"].as_array().unwrap().is_empty(), "{own}");
 }
+
+/// Заголовки открытых вопросов берутся по общей сортировке «новые первыми» всех баз: личная
+/// база участника (Knowledge) и база владельца (общее решение) — две цели дайджеста.
+#[tokio::test]
+async fn digest_open_questions_newest_across_targets() {
+    let a = api("questions-digest-targets", roomy).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    for (tok, code) in [
+        (&a_tok, StatusCode::CREATED),
+        (&b_tok, StatusCode::ACCEPTED),
+    ] {
+        let r = a
+            .tok(
+                tok,
+                Method::POST,
+                "/api/v1/solutions",
+                Some(json!({"agent_solution_id": G, "name": "Общее"})),
+            )
+            .await;
+        assert_eq!(r.status, code, "{}", r.text());
+    }
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            Some(json!({"access": "rw"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    // вопросы чередуются между Knowledge участника и решением: самые новые — в обеих базах
+    let sol = format!("/api/v1/spaces/{G}/entries");
+    for i in 1..=6 {
+        let uri = if i % 2 == 0 { sol.as_str() } else { KN };
+        let r = a
+            .tok(
+                &b_tok,
+                Method::POST,
+                uri,
+                Some(json!({"kind": "question", "title": format!("Вопрос {i}")})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let r = a
+        .tok_h(
+            &b_tok,
+            Method::POST,
+            RECALL,
+            Some(json!({"event": "session_start", "agent_block_version": 1})),
+            &[("x-zam-session", "s1"), ("x-zam-solution", G)],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let text = r.json()["text"].as_str().unwrap().to_string();
+    assert!(
+        text.contains("6 открытых: «Вопрос 6», «Вопрос 5», «Вопрос 4»"),
+        "{text}"
+    );
+}

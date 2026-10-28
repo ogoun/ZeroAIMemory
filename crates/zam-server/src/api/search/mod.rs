@@ -273,6 +273,9 @@ pub(crate) struct Filters {
     status: Option<Vec<String>>,
     /// `axiom | theorem | hypothesis` (§7.5); пусто — любые, в том числе без статуса.
     certainty: Option<Vec<String>>,
+    /// `human | agent` (M4.5, §5.1): только решения с таким `data.decision.decided_by`
+    /// (без поля — `human`); остальные записи и заметки отсеиваются.
+    decided_by: Option<String>,
 }
 
 /// Допустимые виды целей `filters.kinds` (с M4.5 — `term`, `task`, `question`, спецификация
@@ -428,6 +431,10 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
         },
         area: None,
         certainty,
+        decided_by: super::entries::parse_decided_by(
+            f.decided_by.as_deref(),
+            "filters.decided_by",
+        )?,
     })
 }
 
@@ -460,17 +467,22 @@ fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -
         v.sort();
         v
     };
+    let mut filters = json!({
+        "kinds": sorted(&t.kinds),
+        "status": sorted(&t.statuses),
+        "certainty": sorted(&t.certainty),
+    });
+    // ключ только при заданном фильтре: хэши прежних кэшей не меняются
+    if let Some(by) = &t.decided_by {
+        filters["decided_by"] = json!(by);
+    }
     zam_store::scope_hash(&json!({
         "solution": solution.map(SolutionGuid::as_str),
         "include_knowledge": sc.include_knowledge.unwrap_or(true),
         "include_rules": sc.include_rules.unwrap_or(true),
         "path_prefix": path_prefix(sc),
         "area": t.area,
-        "filters": {
-            "kinds": sorted(&t.kinds),
-            "status": sorted(&t.statuses),
-            "certainty": sorted(&t.certainty),
-        },
+        "filters": filters,
     }))
 }
 
@@ -2001,6 +2013,11 @@ pub async fn search(
     } else {
         items
     };
+    // порядок по `contradicts` — после реранка и бустов (M4.5, §5.2)
+    let mut items = items;
+    if st.cfg.search.contradicts_order && items.len() > 1 {
+        graph::order_by_contradicts(&mut health, &mut items).await?;
+    }
 
     // 5. top_k, режим, expand, упаковка
     let expand_t = Instant::now();
@@ -2861,6 +2878,7 @@ mod tests {
                 kinds: Some(vec!["insight".into()]),
                 status: Some(vec!["retracted".into()]),
                 certainty: Some(vec!["axiom".into(), "theorem".into()]),
+                decided_by: None,
             },
             false,
         )

@@ -824,6 +824,7 @@ async fn deleted_entry_not_in_fts_restore_returns() {
         area: None,
         tag: None,
         data_kind: None,
+        decided_by: None,
         since: None,
         until: None,
         cursor: None,
@@ -894,6 +895,7 @@ async fn list_entries_cursor_and_filters() {
         area: None,
         tag: None,
         data_kind: None,
+        decided_by: None,
         since: None,
         until: None,
         cursor: None,
@@ -966,6 +968,7 @@ async fn list_entries_cursor_and_filters() {
     // data.kind: фильтр в SQL до LIMIT — курсор переходит границу страницы без потерь
     let mut f = EntryFilter {
         data_kind: Some("feat".into()),
+        decided_by: None,
         limit: 2,
         ..base.clone()
     };
@@ -980,6 +983,7 @@ async fn list_entries_cursor_and_filters() {
     assert!(next.is_none());
     let f = EntryFilter {
         data_kind: Some("gotcha".into()),
+        decided_by: None,
         limit: 200,
         ..base.clone()
     };

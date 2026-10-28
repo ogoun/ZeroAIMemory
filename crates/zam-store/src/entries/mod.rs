@@ -340,6 +340,9 @@ pub struct EntryFilter {
     pub tag: Option<String>,
     /// `data.kind` записи (вид changelog или insight); `None` — любой.
     pub data_kind: Option<String>,
+    /// `human` | `agent`: только решения с таким `data.decision.decided_by` (без поля —
+    /// `human`); `None` — любые.
+    pub decided_by: Option<String>,
     /// `created_at >= since`.
     pub since: Option<Timestamp>,
     /// `created_at < until`.

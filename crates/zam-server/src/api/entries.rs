@@ -388,6 +388,8 @@ pub struct ListQuery {
     /// `data.kind`: вид changelog ([`CHANGELOG_KINDS`]) или insight
     /// ([`super::insights::INSIGHT_KINDS`]).
     data_kind: Option<String>,
+    /// `human` | `agent`: решения по `data.decision.decided_by` (M4.5, спецификация §5.1).
+    decided_by: Option<String>,
     since: Option<String>,
     until: Option<String>,
     cursor: Option<String>,
@@ -406,6 +408,17 @@ fn parse_data_kind(raw: Option<String>) -> Result<Option<String>, ApiError> {
         Err(ApiError::BadRequest(format!(
             "data_kind: неизвестное значение «{k}»"
         )))
+    }
+}
+
+/// `decided_by`: пусто — без фильтра, иначе `human` или `agent` (400); `what` — имя поля в тексте.
+pub(crate) fn parse_decided_by(raw: Option<&str>, what: &str) -> Result<Option<String>, ApiError> {
+    match raw.map(str::trim).filter(|k| !k.is_empty()) {
+        None => Ok(None),
+        Some(k @ ("human" | "agent")) => Ok(Some(k.to_string())),
+        Some(k) => Err(ApiError::BadRequest(format!(
+            "{what}: неизвестное значение «{k}»; допустимы human, agent"
+        ))),
     }
 }
 
@@ -463,6 +476,7 @@ pub async fn list(
         area: q.area.filter(|a| !a.is_empty()),
         tag: q.tag.filter(|a| !a.is_empty()),
         data_kind: parse_data_kind(q.data_kind)?,
+        decided_by: parse_decided_by(q.decided_by.as_deref(), "decided_by")?,
         since: q
             .since
             .as_deref()

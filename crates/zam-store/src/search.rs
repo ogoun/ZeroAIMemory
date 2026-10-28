@@ -92,6 +92,10 @@ pub struct TargetFilter {
     /// Разрешённые `certainty` (`filters.certainty`, §7.5); пусто — любые (и без статуса).
     /// Непустой список пропускает только заметки и записи с этими статусами.
     pub certainty: Vec<String>,
+    /// `human` | `agent` (`filters.decided_by`, M4.5): только решения (`insight` с
+    /// `data.kind = decision`) с таким `data.decision.decided_by`; без поля — `human`.
+    /// `None` — без фильтра.
+    pub decided_by: Option<String>,
 }
 
 /// Виды записей журналов (с M4.5 — `term`, `task`, `question`).
@@ -116,6 +120,8 @@ struct TargetArgs {
     area: Option<String>,
     /// JSON-массив разрешённых `certainty` или `None` (любые).
     certainty: Option<String>,
+    /// `human` / `agent` или `None` (любые).
+    decided_by: Option<String>,
 }
 
 impl TargetFilter {
@@ -133,6 +139,7 @@ impl TargetFilter {
             area: self.area.clone(),
             certainty: (!self.certainty.is_empty())
                 .then(|| serde_json::Value::from(self.certainty.clone()).to_string()),
+            decided_by: self.decided_by.clone(),
         }
     }
 }
@@ -459,9 +466,9 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
 fn scope_sql(n_spaces: usize) -> String {
     let sp = placeholders(3, n_spaces);
     let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
-    let cert = 7 + n_spaces;
+    let (cert, by) = (7 + n_spaces, 8 + n_spaces);
     format!(
-        "((c.node_id IS NOT NULL AND ?{notes} AND n.deleted_at IS NULL
+        "((c.node_id IS NOT NULL AND ?{notes} AND ?{by} IS NULL AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
            AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
            AND (?{area} IS NULL OR n.area = ?{area})
@@ -472,7 +479,13 @@ fn scope_sql(n_spaces: usize) -> String {
            AND (e.status IS NULL OR ?{statuses} IS NULL
                 OR e.status IN (SELECT value FROM json_each(?{statuses})))
            AND (?{area} IS NULL OR e.area = ?{area})
-           AND (?{cert} IS NULL OR e.certainty IN (SELECT value FROM json_each(?{cert})))))"
+           AND (?{cert} IS NULL OR e.certainty IN (SELECT value FROM json_each(?{cert})))
+           AND (?{by} IS NULL OR (e.kind = 'insight'
+                AND CASE WHEN json_type(e.data, '$.kind') = 'text'
+                         THEN json_extract(e.data, '$.kind') END = 'decision'
+                AND CASE WHEN json_type(e.data, '$.decision.decided_by') = 'text'
+                         THEN json_extract(e.data, '$.decision.decided_by')
+                         ELSE 'human' END = ?{by}))))"
     )
 }
 
@@ -490,6 +503,7 @@ fn scope_args<'a>(
     args.push(&t.statuses);
     args.push(&t.area);
     args.push(&t.certainty);
+    args.push(&t.decided_by);
     args
 }
 

@@ -90,6 +90,7 @@ pub async fn compare(
                 area: None,
                 tag: None,
                 data_kind: None,
+                decided_by: None,
                 since: None,
                 until: Some(to.created_at),
                 cursor: None,
