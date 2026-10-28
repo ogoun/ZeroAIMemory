@@ -767,7 +767,7 @@ impl Hooks {
     fn run(&self, cmd: &str, stdin: &Value) -> Result<(String, f64)> {
         let mut c = Command::new(&self.zam);
         scrub_zam_env(&mut c, &[]);
-        for k in ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"] {
+        for k in zam_core::AGENT_ENV_VARS {
             c.env_remove(k);
         }
         c.args(["hook", cmd])

@@ -33,8 +33,14 @@ use zam_store::Access;
 const GA: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9ea1";
 /// Решение проекта B.
 const GB: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9ea2";
-/// Адрес, где заведомо никто не слушает (порт discard).
-const DEAD: &str = "http://127.0.0.1:9";
+/// Адрес, где никто не слушает: эфемерный порт занимается и сразу освобождается (fix round 1,
+/// M-3 — порт 9 мог бы кто-то слушать).
+fn dead_url() -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    drop(l);
+    url
+}
 /// Пароль администратора первого старта.
 const PW: &str = "pw";
 /// Хуки — по одному: замеры бюджетов не должны зависеть от соседних тестов.
@@ -410,14 +416,12 @@ impl Proj {
             "https_proxy",
             "all_proxy",
             "no_proxy",
-            // окружение агента, в котором идут сами тесты, не должно утекать в `zam`
-            "CLAUDECODE",
-            "CLAUDE_CODE_SESSION_ID",
-            "CLAUDE_CODE_CHILD_SESSION",
-            "CODEX_SANDBOX",
-            "CODEX_SANDBOX_NETWORK_DISABLED",
-            "CODEX_THREAD_ID",
         ] {
+            c.env_remove(k);
+        }
+        // окружение агента, в котором идут сами тесты, не должно утекать в `zam` (тот же список,
+        // что у smoke комплекта и eval хуков)
+        for k in zam_core::AGENT_ENV_VARS {
             c.env_remove(k);
         }
         c.env("ZAM_URL", url)
@@ -562,6 +566,12 @@ fn empty(o: &Output) {
     assert_eq!(ok(o).trim(), "", "ожидалась тишина");
 }
 
+/// Строка `hooks.log` о хуке, замолчавшем по сроку: внутренний тайм-аут HTTP или
+/// `recall timeout` сервера.
+fn is_timeout(line: &str) -> bool {
+    line.contains("timeout") || line.contains("бюджет исчерпан")
+}
+
 fn p95(mut v: Vec<Duration>) -> Duration {
     v.sort();
     v[(v.len() * 95).div_ceil(100) - 1]
@@ -601,6 +611,15 @@ fn crlf_scenario() {
         }),
     );
     let id = ref_in(&text, "i:");
+    // атрибуция записи A (fix round 1, M-4): машина A, сессия A, а сессия — в решении A
+    let (code, e) = srv.call(0, "GET", &format!("/api/v1/entries/{id}"), None, &[]);
+    assert_eq!(code, 200, "{e}");
+    assert_eq!(e["author"]["machine"], "machine-a", "{e}");
+    assert_eq!(e["author"]["session_id"], "crlf-a", "{e}");
+    let (code, s) = srv.call(0, "GET", "/api/v1/sessions/crlf-a", None, &[]);
+    assert_eq!(code, 200, "{s}");
+    assert_eq!(s["machine"], "machine-a", "{s}");
+    assert_eq!(s["solution"], GA, "{s}");
 
     // машина B, проект B: старт сессии обновляет кэш триггеров
     let b = Proj::new("crlf-b", &srv.url, &srv.users[0].token, GB, "machine-b");
@@ -760,45 +779,18 @@ fn load_eval(srv: &Srv) -> toml::Table {
         "ZAM_TIMING корпус: {n} заметок, {m} insight, {} правил",
         rules.len()
     );
-    // покой воркера 5 с — дольше `index.rollup_debounce_ms` (2 с): без паузы после массовой
-    // записи 1–2 из 40 `session-start` упирались в бюджет (запись сессии ждала диск, занятый
-    // фоновой записью — вероятно, отложенным сбросом кэша ОС на HDD); бюджеты относятся к
-    // рабочему серверу, а не к догоняющему загрузку
-    let t = Instant::now();
-    let mut idle_since: Option<Instant> = None;
-    loop {
-        let (code, st) = rest(
-            &srv.url,
-            &[("Cookie", &cookie)],
-            "GET",
-            "/api/v1/index/status",
-            None,
-        );
-        assert_eq!(code, 200, "{st}");
-        let w = &st["worker"];
-        let idle = w["rollups_pending"] == 0 && w["batch_running"] == false;
-        idle_since = if idle {
-            idle_since.or(Some(Instant::now()))
-        } else {
-            None
-        };
-        if idle_since.is_some_and(|i| i.elapsed() >= Duration::from_secs(5)) {
-            break;
-        }
-        assert!(
-            t.elapsed() < Duration::from_secs(120),
-            "воркер не успокоился за 120 с: {w}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    eprintln!("ZAM_TIMING покой воркера через {:?}", t.elapsed());
     hints
 }
 
-/// Критерий M4 «бюджеты хуков» (§10.3): каждый хук — процесс `zam hook …` на корпусе eval,
-/// p95 времени процесса ≤ бюджета ×2 (общие раннеры CI, отладочная сборка) и не больше 5 %
-/// вызовов, замолчавших по тайм-ауту. Цифры машины владельца (release, bge-m3 int8 на CPU) —
-/// в журнале этапа.
+/// Критерий M4 «бюджеты хуков» (§10.3): каждый хук — процесс `zam hook …` на корпусе eval.
+/// Главный критерий — не больше 5 % вызовов, замолчавших по внутреннему сроку хука (1× бюджета:
+/// HTTP обрывается на «бюджет − 30 мс» от старта процесса); p95 времени процесса ≤ бюджета ×2
+/// (общие раннеры CI, отладочная сборка) содержателен для локального `pre-tool`, у сетевых хуков
+/// время и так ограничено сроком. Хук должен сделать работу: в окне вызова в `hooks.log` нет
+/// других строк (401/403/5xx, разбор, конфигурация), ответ есть там, где он ожидается
+/// (дайджест, `decision: block`, подсказки `pre-tool` и `error_regex` по разметке
+/// `eval/hints.toml`), иначе быстрый отказ прошёл бы замер. Цифры машины владельца (release,
+/// bge-m3 int8 на CPU) — в журнале этапа.
 #[test]
 fn hook_budgets() {
     let _g = serial();
@@ -807,6 +799,34 @@ fn hook_budgets() {
     let p = Proj::new("budgets", &srv.url, &srv.users[0].token, GA, "bench-box");
     // кэш триггеров — до pre-tool
     p.session_start_until("bud-warm", |c| !c.is_empty());
+    // прогрев (fix round 1, M-2): после массовой загрузки корпуса отдельные `session-start`
+    // упирались в бюджет (запись сессии ждала диск, занятый фоновой записью на HDD, — выбросы
+    // шли и через 5–10 с после загрузки) — замер начинается, когда 20 вызовов подряд проходят
+    // без тайм-аута и быстрее половины бюджета; предел ожидания — 120 с
+    let t = Instant::now();
+    let half = Duration::from_millis(budget_ms("session-start") / 2);
+    let (mut streak, mut warm) = (0, 0);
+    while streak < 20 {
+        assert!(
+            t.elapsed() < Duration::from_secs(120),
+            "сервер не прогрелся за 120 с ({warm} вызовов); hooks.log:
+{}",
+            p.log()
+        );
+        let before = p.log().lines().count();
+        let (_, d) = p.hook_at(
+            &p.url,
+            "session-start",
+            &p.start_ev(&format!("bud-warm-{warm}")),
+        );
+        warm += 1;
+        let late = d > half || p.log().lines().skip(before).any(is_timeout);
+        streak = if late { 0 } else { streak + 1 };
+    }
+    eprintln!(
+        "ZAM_TIMING прогрев: {warm} session-start за {:?}",
+        t.elapsed()
+    );
     let cases = hints["case"].as_array().unwrap();
     let inputs = |event: &str| -> Vec<&toml::Value> {
         cases
@@ -814,11 +834,30 @@ fn hook_budgets() {
             .filter(|c| c["event"].as_str() == Some(event))
             .collect()
     };
-    let mut runs: Vec<(&str, Vec<Value>)> = Vec::new();
+    // (вход, ожидание ответа): `Some(true)` — должен ответить, `Some(false)` — молчать,
+    // `None` — по качеству поиска (FTS-only), не проверяется по отдельному вызову
+    let expect = |c: &toml::Value| -> Option<bool> {
+        let has = c["expected"].as_array().is_some_and(|e| !e.is_empty());
+        match c["event"].as_str() {
+            // pre-tool детерминирован (маски и regex по кэшу): точно по разметке
+            Some("pre_tool") => Some(has),
+            // error_regex — детерминированное совпадение
+            Some("post_tool")
+                if c.get("note")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n.contains("error_regex")) =>
+            {
+                Some(true)
+            }
+            _ => None,
+        }
+    };
+    type Run<'a> = (&'a str, Vec<(Value, Option<bool>)>);
+    let mut runs: Vec<Run> = Vec::new();
     runs.push((
         "session-start",
         (0..40)
-            .map(|i| p.start_ev(&format!("bud-ss-{i}")))
+            .map(|i| (p.start_ev(&format!("bud-ss-{i}")), Some(true)))
             .collect(),
     ));
     runs.push((
@@ -827,11 +866,12 @@ fn hook_budgets() {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                p.ev(
+                let ev = p.ev(
                     "UserPromptSubmit",
                     &format!("bud-pr-{i}"),
                     json!({"prompt": c["input"].as_str().unwrap()}),
-                )
+                );
+                (ev, expect(c))
             })
             .collect(),
     ));
@@ -840,7 +880,10 @@ fn hook_budgets() {
         inputs("post_tool")
             .iter()
             .enumerate()
-            .map(|(i, c)| p.fail_ev(&format!("bud-pt-{i}"), c["input"].as_str().unwrap()))
+            .map(|(i, c)| {
+                let ev = p.fail_ev(&format!("bud-pt-{i}"), c["input"].as_str().unwrap());
+                (ev, expect(c))
+            })
             .collect(),
     ));
     runs.push((
@@ -856,11 +899,12 @@ fn hook_budgets() {
                 } else {
                     json!({"file_path": p.repo.join(input), "content": "x"})
                 };
-                p.ev(
+                let ev = p.ev(
                     "PreToolUse",
                     &format!("bud-pre-{i}"),
                     json!({"tool_name": tool, "tool_input": ti}),
-                )
+                );
+                (ev, expect(c))
             })
             .collect(),
     ));
@@ -868,11 +912,13 @@ fn hook_budgets() {
         "checkpoint",
         (0..40)
             .map(|i| {
-                p.ev(
+                let ev = p.ev(
                     "Stop",
                     &format!("bud-cp-{i}"),
                     json!({"stop_hook_active": false}),
-                )
+                );
+                // правка в сессии и ни одной записи в память — напоминание обязательно
+                (ev, Some(true))
             })
             .collect(),
     ));
@@ -887,24 +933,38 @@ fn hook_budgets() {
         }
         // прогрев вида (не в замер): после загрузки корпуса первые запросы отладочного сервера
         // читают холодные страницы SQLite с HDD — бюджет относится к рабочему серверу
-        for ev in evs.iter().take(3) {
+        for (ev, _) in evs.iter().take(3) {
             let mut w = ev.clone();
             w["session_id"] = json!(format!("warm-{}", ev["session_id"].as_str().unwrap()));
             p.hook_at(&p.url, kind, &w);
         }
         let mut times = Vec::new();
         let (mut timeouts, mut spoke) = (0, 0);
-        for ev in evs {
+        for (ev, want) in evs {
             let before = p.log().lines().count();
             let (o, d) = p.hook_at(&p.url, kind, ev);
-            spoke += usize::from(!ok(&o).trim().is_empty());
+            let said = !ok(&o).trim().is_empty();
+            spoke += usize::from(said);
             times.push(d);
-            timeouts += usize::from(
-                p.log()
-                    .lines()
-                    .skip(before)
-                    .any(|l| l.contains("timeout") || l.contains("бюджет исчерпан")),
-            );
+            let lines: Vec<String> = p.log().lines().skip(before).map(String::from).collect();
+            let late = lines.iter().any(|l| is_timeout(l));
+            timeouts += usize::from(late);
+            // любая другая строка журнала — отказ, а не замер (I-1)
+            for l in lines.iter().filter(|l| !is_timeout(l)) {
+                fails.push(format!("{kind} {}: ошибка хука: {l}", ev["session_id"]));
+            }
+            // ответ, где он ожидается; вызов, замолчавший по сроку, учтён в тайм-аутах
+            if let Some(w) = want
+                && !late
+                && said != *w
+            {
+                fails.push(format!(
+                    "{kind} {}: ожидался {}, вывод «{}»",
+                    ev["session_id"],
+                    if *w { "ответ" } else { "тишина" },
+                    out(&o).trim()
+                ));
+            }
         }
         let n = times.len();
         let max = *times.iter().max().unwrap();
@@ -923,6 +983,9 @@ fn hook_budgets() {
         }
         if timeouts * 20 > n {
             fails.push(format!("{kind}: тайм-аутов {timeouts} из {n} (> 5 %)"));
+        }
+        if spoke == 0 {
+            fails.push(format!("{kind}: ни одного ответа из {n}"));
         }
     }
     eprintln!("ZAM_TIMING m4 hook_budgets: {}", report.join("; "));
@@ -1027,7 +1090,8 @@ fn hanging_server() -> String {
 fn fail_open_when_server_down() {
     let _g = serial();
     let hang = hanging_server();
-    for (label, url) in [("down", DEAD), ("hang", hang.as_str())] {
+    let dead = dead_url();
+    for (label, url) in [("down", dead.as_str()), ("hang", hang.as_str())] {
         let p = Proj::new(&format!("fail-{label}"), url, "zam_x", GA, "box");
         let s = format!("fo-{label}");
         // правка в сессии: checkpoint идёт на сервер (GET /sessions), а не молчит сразу

@@ -1541,7 +1541,7 @@ fn run_hook(
     let (base, token) = conn;
     let mut cmd = zam_cmd(zam, home, base, token);
     // окружение агента (сам smoke может идти внутри Claude Code или Codex) — не в хук
-    for k in ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"] {
+    for k in zam_core::AGENT_ENV_VARS {
         cmd.env_remove(k);
     }
     cmd.args(["hook", kind]).current_dir(project);

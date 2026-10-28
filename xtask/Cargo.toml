@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 zam-fetch = { path = "../crates/zam-fetch" }
+# переменные окружения агента (`AGENT_ENV_VARS`) — общий список для smoke и eval хуков
+zam-core = { path = "../crates/zam-core" }
 anyhow.workspace = true
 clap.workspace = true
 zip.workspace = true
