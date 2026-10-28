@@ -68,7 +68,7 @@ fn announce_initial_token(
     if let Err(e) = write_token_file(&path, token) {
         writeln!(
             out,
-            "предупреждение: не удалось записать {}: {e}; первый токен отозван и не показан. Войдите в WebUI паролем администратора и выпустите токен (Аккаунт/Пользователи)",
+            "предупреждение: не удалось записать {}: {e}; первый токен не показан. Войдите в WebUI паролем администратора и выпустите токен (Аккаунт/Пользователи)",
             path.display()
         )?;
         return Ok(Announced::NotWritten);
@@ -123,21 +123,23 @@ fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> 
 
 /// Отзывает первый токен, который не удалось сообщить (файл не записан): действующий токен
 /// без владельца не остаётся. Аудит `initial_token_revoked` — с маской токена. Сбой — WARN
-/// без токена (сервер продолжает работу: токен никому не известен).
-async fn revoke_initial_token(system: &zam_store::SystemStore, token: &str) {
+/// без токена (сервер продолжает работу: токен никому не известен). `true` — токен больше не
+/// действует (отозван сейчас или уже не найден); по результату вызывающий пишет в stderr
+/// ([`revoke_notice`]).
+async fn revoke_initial_token(system: &zam_store::SystemStore, token: &str) -> bool {
     let found = match system.verify_token(token, None).await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "первый токен не отозван: проверка не удалась");
-            return;
+            return false;
         }
     };
     let Some(auth) = found else {
-        return;
+        return true;
     };
     if let Err(e) = system.revoke_token(auth.token_id).await {
         tracing::warn!(error = %e, "первый токен не отозван");
-        return;
+        return false;
     }
     let _ = system
         .audit(
@@ -153,6 +155,17 @@ async fn revoke_initial_token(system: &zam_store::SystemStore, token: &str) {
         )
         .await;
     tracing::warn!("первый токен администратора отозван: файл не записан; выпустите токен в WebUI");
+    true
+}
+
+/// Строка stderr после [`revoke_initial_token`] — по её результату (финальное ревью M4, M-8:
+/// раньше «отозван» печаталось до попытки отзыва).
+fn revoke_notice(revoked: bool) -> &'static str {
+    if revoked {
+        "первый токен администратора отозван"
+    } else {
+        "предупреждение: первый токен администратора отозвать не удалось (см. журнал) — отзовите          его в WebUI: «Пользователи» → администратор → токены"
+    }
 }
 
 /// Файл первого токена остался с прошлого старта — WARN при каждом старте (без содержимого),
@@ -242,7 +255,9 @@ pub async fn run_with(
         }
         // не сообщён (файл не записан или stderr сломан) — токен никому не известен
         if !matches!(announced, Ok(Announced::Frame | Announced::File)) {
-            revoke_initial_token(&state.system, t).await;
+            let revoked = revoke_initial_token(&state.system, t).await;
+            use std::io::Write;
+            let _ = writeln!(err.lock(), "{}", revoke_notice(revoked));
         }
     }
     if !crate::config::has_default_params(&state.admin_hash) {
@@ -384,7 +399,9 @@ mod tests {
             "{out}"
         );
         assert!(!missing.join(INITIAL_TOKEN_FILE).exists());
-        revoke_initial_token(&st.system, &token).await;
+        assert!(revoke_initial_token(&st.system, &token).await);
+        assert!(revoke_notice(true).contains("отозван"));
+        assert!(revoke_notice(false).contains("не удалось"));
         assert!(
             st.system
                 .verify_token(&token, None)

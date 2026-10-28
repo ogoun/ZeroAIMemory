@@ -241,7 +241,7 @@ async fn agent_setup_hooks_exec_form() {
             "headers": {
                 "Authorization": "Bearer ${ZAM_TOKEN}",
                 "X-Zam-Solution": g,
-                "X-Zam-Machine": "${COMPUTERNAME:-}",
+                "X-Zam-Machine": "${ZAM_MACHINE:-}",
             },
         }}})
     );
@@ -267,14 +267,16 @@ async fn agent_setup_hooks_exec_form() {
     assert!(
         windows.contains("'http://memory.lan:7700/downloads/zam/windows-x64'")
             && windows.contains("'ZAM_TOKEN', '<токен>'")
-            && windows.contains("-notcontains $d"),
+            && windows.contains("-notcontains $d")
+            && windows.contains("'ZAM_MACHINE', $env:COMPUTERNAME"),
         "{install}"
     );
     let linux = install["linux"].as_str().unwrap();
     assert!(
         linux.contains("'http://memory.lan:7700/downloads/zam/linux-x64'")
             && linux.contains("case \":$PATH:\"")
-            && !linux.contains(">> ~/.profile"),
+            && !linux.contains(">> ~/.profile")
+            && linux.contains("export ZAM_MACHINE=$(uname -n)"),
         "{install}"
     );
 

@@ -765,3 +765,38 @@ async fn feedback_touches_session() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// Финальное ревью M4, M-3: администратор с `X-Zam-User` несуществующего пользователя и
+/// `X-Zam-Session` — 404 на маршрутах сессии, а база `users/<id>.db` не создаётся (раньше
+/// учёт сессии в `/search`, `/read`, `/recall` и счётчике записей открывал пустую базу).
+#[tokio::test]
+async fn admin_unknown_user_with_session_creates_no_db() {
+    let a = api("sessions-ghost-user", |_| {}).await;
+    let ghost = Id::new().to_string();
+    let db = a.st.cfg.data_dir.join("users").join(format!("{ghost}.db"));
+    let h = [("x-zam-user", ghost.as_str()), ("x-zam-session", "ghost-1")];
+    for (m, uri, body) in [
+        (Method::POST, SEARCH, json!({"query": "что угодно"})),
+        (
+            Method::POST,
+            "/api/v1/read",
+            json!({"items": [{"id": "knowledge:/x"}]}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/recall",
+            json!({"event": "session_start"}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/nodes",
+            json!({"space": "knowledge", "path": "x", "kind": "note", "content": "# x
+"}),
+        ),
+        (Method::POST, "/api/v1/sessions", json!({"id": "ghost-1"})),
+    ] {
+        let r = a.adm_h(m.clone(), uri, Some(body), &h).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{m} {uri}: {}", r.text());
+        assert!(!db.exists(), "{m} {uri}: создана база {}", db.display());
+    }
+}

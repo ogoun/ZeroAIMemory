@@ -41,7 +41,7 @@ use zam_store::{
 use super::{json_body, query};
 use crate::app::AppState;
 use crate::attrib::{MACHINE_HEADER, SESSION_HEADER, header_value, session_touch};
-use crate::auth::{Principal, PrincipalSlot, target_user_id};
+use crate::auth::{Principal, PrincipalSlot};
 use crate::error::ApiError;
 
 /// Сессий в списке по умолчанию.
@@ -72,7 +72,10 @@ pub async fn request_session(
     let Some(touch) = session_touch(p, headers, body_session)? else {
         return Ok(None);
     };
-    let db = st.users.get(target_user_id(st, p, headers)?).await?;
+    // несуществующий пользователь (`X-Zam-User` администратора) — 404, а не новая пустая база
+    // `users/<id>.db` (финальное ревью M4, M-3)
+    let user = crate::auth::target_user(st, p, headers).await?;
+    let db = st.users.get(user.id).await?;
     Ok(Some(RequestSession { touch, db }))
 }
 
@@ -231,7 +234,8 @@ async fn count(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<(), 
     let Some(touch) = session_touch(p, headers, None)? else {
         return Ok(());
     };
-    let db = st.users.get(target_user_id(st, p, headers)?).await?;
+    let user = crate::auth::target_user(st, p, headers).await?;
+    let db = st.users.get(user.id).await?;
     add_memory_write(&db, &touch).await?;
     Ok(())
 }

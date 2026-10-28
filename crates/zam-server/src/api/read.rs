@@ -683,7 +683,8 @@ pub async fn read(
     // сессия: некорректный id — 400; сбой её базы чтение не валит (WARN)
     let session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
         Ok(s) => s,
-        Err(e @ ApiError::BadRequest(_)) => return Err(e),
+        // некорректный id — 400, несуществующий пользователь (`X-Zam-User`) — 404
+        Err(e @ (ApiError::BadRequest(_) | ApiError::NotFound)) => return Err(e),
         Err(e) => {
             tracing::warn!(error = %e, "чтение: база сессии недоступна, показ не записан");
             None

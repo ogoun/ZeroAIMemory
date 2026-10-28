@@ -88,15 +88,15 @@ impl Proj {
             "no_proxy",
             "ZAM_URL",
             "ZAM_TOKEN",
-            "ZAM_SESSION",
-            "ZAM_AGENT",
-            "CLAUDECODE",
-            "CLAUDE_CODE_SESSION_ID",
-            "CLAUDE_CODE_CHILD_SESSION",
-            "CODEX_SANDBOX",
-            "CODEX_SANDBOX_NETWORK_DISABLED",
-            "CODEX_THREAD_ID",
         ] {
+            c.env_remove(k);
+        }
+        // окружение агента и клиентские переменные `zam` (`ZAM_SESSION`, `ZAM_AGENT`,
+        // `ZAM_MACHINE`), в котором идут сами тесты, не должны утекать в `zam` — общий список
+        for k in zam_core::AGENT_ENV_VARS
+            .iter()
+            .chain(&zam_core::CLIENT_ENV_VARS)
+        {
             c.env_remove(k);
         }
         c.env("HOME", &self.home)
@@ -271,6 +271,8 @@ fn init_creates_solution_block_hooks_mcp() {
         "{stdout}"
     );
     assert!(stdout.contains("export ZAM_TOKEN="), "{stdout}");
+    // ZAM_MACHINE в окружении теста нет — подсказка для MCP (финальное ревью M4, M-4)
+    assert!(stdout.contains("ZAM_MACHINE"), "{stdout}");
     assert!(
         !stdout.contains(&tok) && !err(&o).contains(&tok),
         "токен в выводе"

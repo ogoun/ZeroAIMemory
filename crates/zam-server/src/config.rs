@@ -10,8 +10,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml::{Table, Value};
 
 /// Переменные `ZAM_*`, которые не являются слоем конфигурации:
-/// секреты и адрес клиента, а также сборочные (build.rs, xtask), попадающие в окружение CI.
-const RESERVED_ENV: [&str; 9] = [
+/// секреты и адрес клиента, переменные клиента `zam` (сессия, признак агента, имя машины —
+/// `zam_core::CLIENT_ENV_VARS`: без этого `ZAM_MACHINE` в окружении пользователя ломала бы
+/// ручной запуск сервера), а также сборочные (build.rs, xtask), попадающие в окружение CI.
+const RESERVED_ENV: [&str; 12] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
@@ -21,6 +23,9 @@ const RESERVED_ENV: [&str; 9] = [
     "ZAM_WEB_INDEX",
     "ZAM_VCRUNTIME_DLL",
     "ZAM_VC_CRT_DIR",
+    zam_core::CLIENT_ENV_VARS[0],
+    zam_core::CLIENT_ENV_VARS[1],
+    zam_core::CLIENT_ENV_VARS[2],
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1236,6 +1241,9 @@ note_max_bytes = 1000
             env("ZAM_URL", "x"),
             env("ZAM_TOKEN", "x"),
             env("ZAM_MASTER_KEY", "x"),
+            env("ZAM_SESSION", "s"),
+            env("ZAM_AGENT", "1"),
+            env("ZAM_MACHINE", "box"),
         ];
         assert!(load(None, &env, &Default::default()).is_ok());
     }

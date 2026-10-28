@@ -125,9 +125,13 @@ fn solution(root: &Path, o: &Opts) -> Result<(Solution, PathBuf, bool), CliError
         .filter(|n| !n.is_empty())
         .map(String::from);
     if let Some(n) = &name
-        && (n.chars().count() > 128 || n.chars().any(char::is_control))
+        && (n.chars().count() > zam_core::SOLUTION_NAME_MAX_CHARS
+            || n.chars().any(char::is_control))
     {
-        return Err(CliError::input("--name: до 128 символов, без управляющих"));
+        return Err(CliError::input(format!(
+            "--name: до {} символов, без управляющих",
+            zam_core::SOLUTION_NAME_MAX_CHARS
+        )));
     }
     let existing = [
         root.join(".zeroaimemory").join("solution.toml"),
@@ -560,6 +564,18 @@ pub fn run(o: Opts) -> Result<(), CliError> {
                  Windows (PowerShell): [Environment]::SetEnvironmentVariable('ZAM_TOKEN', '<токен>', 'User')\n  \
                  Linux: export ZAM_TOKEN=<токен> — в файле, который читает только ваш пользователь \
                  (chmod 600): переменную видят все процессы агента"
+            );
+        }
+    }
+    if !o.no_mcp && claude && agent_ok {
+        let machine = std::env::var(zam_core::MACHINE_ENV).is_ok_and(|v| !v.trim().is_empty());
+        if !machine {
+            println!(
+                "Имя машины для MCP (.mcp.json) — переменная ZAM_MACHINE (zam и хуки берут её же \
+                 первой). Задайте её и перезапустите агента:\n  \
+                 Windows (PowerShell): [Environment]::SetEnvironmentVariable('ZAM_MACHINE', \
+                 $env:COMPUTERNAME, 'User')\n  \
+                 Linux: export ZAM_MACHINE=$(uname -n) — в файле профиля оболочки"
             );
         }
     }

@@ -247,12 +247,15 @@ pub fn codex_hooks() -> Value {
     }})
 }
 
-/// Фрагмент `.mcp.json`: токен — из переменной `ZAM_TOKEN`, машина — из `COMPUTERNAME`
-/// (Windows; пусто — сервер берёт последнюю сессию пользователя без учёта машины, R13).
+/// Фрагмент `.mcp.json`: токен — из переменной `ZAM_TOKEN`, машина — из `ZAM_MACHINE`
+/// (`zam_core::MACHINE_ENV`; её задаёт команда установки `zam`, CLI и хуки берут ту же
+/// переменную первой — финальное ревью M4, M-4; пусто — сервер берёт последнюю сессию
+/// пользователя без учёта машины, R13). Имя самой машины в файл не пишется: `.mcp.json`
+/// бывает общим для машин в репозитории.
 pub fn mcp_json(url: &str, solution: Option<&SolutionRef>) -> Value {
     let mut headers = json!({
         "Authorization": "Bearer ${ZAM_TOKEN}",
-        "X-Zam-Machine": "${COMPUTERNAME:-}",
+        "X-Zam-Machine": "${ZAM_MACHINE:-}",
     });
     if let Some(s) = solution {
         headers["X-Zam-Solution"] = json!(s.guid);
@@ -306,7 +309,7 @@ pub fn ps_quote(s: &str) -> String {
 /// экранирование остаётся второй защитой.
 pub fn safe_cli_name(name: &str) -> bool {
     let n = name.chars().count();
-    (1..=128).contains(&n)
+    (1..=zam_core::SOLUTION_NAME_MAX_CHARS).contains(&n)
         && !name.starts_with('-')
         && name
             .chars()
@@ -332,14 +335,18 @@ pub fn install(url: &str, token: Option<&str>) -> Value {
          Invoke-WebRequest {win_url} -OutFile \"$d\\zam.exe\"\n\
          $p = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($p -split ';') -notcontains $d) {{ [Environment]::SetEnvironmentVariable('Path', $(if ($p) {{ \"$p;$d\" }} else {{ $d }}), 'User') }}\n\
          # MCP по HTTP (.mcp.json) берёт токен из ZAM_TOKEN; zam и хуки — из ~/.zeroaimemory/config.toml (zam init --token)\n\
-         [Environment]::SetEnvironmentVariable('ZAM_TOKEN', {t}, 'User')\n"
+         [Environment]::SetEnvironmentVariable('ZAM_TOKEN', {t}, 'User')\n\
+         # имя машины для X-Zam-Machine — одно для zam, хуков и .mcp.json\n\
+         [Environment]::SetEnvironmentVariable('ZAM_MACHINE', $env:COMPUTERNAME, 'User')\n"
     );
     let lin_url = sh_quote(&format!("{url}/downloads/zam/linux-x64"));
     let linux = format!(
         "mkdir -p ~/.local/bin && curl -fsSL {lin_url} -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam\n\
          case \":$PATH:\" in *\":$HOME/.local/bin:\"*) ;; *) echo 'Добавьте ~/.local/bin в PATH' ;; esac\n\
          # токен: zam init --token сохранит его в ~/.zeroaimemory/config.toml (права 0600); MCP по HTTP\n\
-         # (.mcp.json) берёт его из ZAM_TOKEN — задайте её в окружении агента в файле, доступном только вам\n"
+         # (.mcp.json) берёт его из ZAM_TOKEN — задайте её в окружении агента в файле, доступном только вам\n\
+         # имя машины для X-Zam-Machine — одно для zam, хуков и .mcp.json\n\
+         [ -n \"$ZAM_MACHINE\" ] || echo \"Добавьте в профиль оболочки: export ZAM_MACHINE=$(uname -n)\"\n"
     );
     json!({"windows": windows, "linux": linux})
 }

@@ -47,8 +47,8 @@ use crate::error::ApiError;
 
 /// Имя решения без указания.
 const DEFAULT_NAME: &str = "Solution";
-/// Предел длины имени решения, символов (как у `POST /solutions`).
-const NAME_MAX_CHARS: usize = 128;
+/// Предел длины имени решения, символов (как у `POST /solutions`, §11.6).
+const NAME_MAX_CHARS: usize = zam_core::SOLUTION_NAME_MAX_CHARS;
 /// Бюджет блока инструкции, токенов (§14.2); больше — `warnings`.
 const BLOCK_TOKENS_MAX: usize = 500;
 /// Предел длины `Host`, байт.

@@ -375,25 +375,20 @@ fn handle(kind: Kind, agent: Agent, started: Instant, raw: &input::Raw) -> Outpu
     }
 }
 
-/// Переменные, по которым видно, что `zam` запустил Codex (не настройка пользователя вроде
-/// `CODEX_HOME` или `CODEX_API_KEY`): ⚠️ документацией Codex не подтверждены, взяты из его
-/// исходников (песочница команд) — проверить на машине владельца.
-const CODEX_RUNTIME_VARS: [&str; 3] = [
-    "CODEX_SANDBOX",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-    "CODEX_THREAD_ID",
-];
+/// Переменная, по которой видно, что `zam` запустил Codex (не настройка пользователя вроде
+/// `CODEX_HOME` или `CODEX_API_KEY`): переменные Codex из [`zam_core::AGENT_ENV_VARS`] — один
+/// список с тестами и smoke (финальное ревью M4, M-7). ⚠️ документацией Codex не подтверждены,
+/// взяты из его исходников (песочница команд) — проверить на машине владельца.
+fn codex_runtime_var(name: &str) -> bool {
+    name.starts_with("CODEX_") && zam_core::AGENT_ENV_VARS.contains(&name)
+}
 
 /// Команду запустил агент (fix round 1, I-1): `CLAUDECODE=1` (Claude Code ставит её в
 /// подпроцессах инструментов Bash/PowerShell и хуков — документировано), переменные Codex
-/// [`CODEX_RUNTIME_VARS`] или явный `ZAM_AGENT=1`.
+/// ([`codex_runtime_var`]) или явный `ZAM_AGENT=1`.
 pub fn launched_by_agent(get: &impl Fn(&str) -> Option<String>, names: &[String]) -> bool {
     let one = |k: &str| get(k).is_some_and(|v| v.trim() == "1");
-    one("CLAUDECODE")
-        || one("ZAM_AGENT")
-        || names
-            .iter()
-            .any(|n| CODEX_RUNTIME_VARS.contains(&n.as_str()))
+    one("CLAUDECODE") || one("ZAM_AGENT") || names.iter().any(|n| codex_runtime_var(n))
 }
 
 /// Id сессии из переменной: непустой, до 128 печатных символов.

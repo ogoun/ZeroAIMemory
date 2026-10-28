@@ -18,8 +18,6 @@ pub const EXIT_INPUT: u8 = 6;
 
 /// Предел чтения тела ответа в память (JSON заметки до 5 МБ с экранированием, дифф).
 const BODY_MAX: u64 = 64 * 1024 * 1024;
-/// Предел длины `X-Zam-Machine`, символов (как на сервере).
-const MACHINE_MAX_CHARS: usize = 128;
 
 /// Ошибка команды: текст для stderr и код выхода; `problem` — тело problem+json сервера.
 #[derive(Debug)]
@@ -114,15 +112,26 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
     ureq::Agent::new_with_config(b.build())
 }
 
-/// Имя машины для `X-Zam-Machine`: `COMPUTERNAME` (Windows) или `HOSTNAME`; без
-/// внешних вызовов. Пустое, длинное или с управляющими символами — не отправляется.
+/// Имя машины для `X-Zam-Machine` (финальное ревью M4, M-4): [`zam_core::machine_name`]
+/// (`ZAM_MACHINE`, `COMPUTERNAME`, `HOSTNAME`), на Linux без них — `/etc/hostname` (файл, не
+/// внешний вызов). Тот же порядок, что у `.mcp.json` (`${ZAM_MACHINE:-}`), когда `ZAM_MACHINE`
+/// задана, — команда установки `zam` её задаёт.
 pub fn machine_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
-    ["COMPUTERNAME", "HOSTNAME"]
-        .iter()
-        .filter_map(|k| get(k))
-        .map(|v| v.trim().to_string())
-        .find(|v| !v.is_empty())
-        .filter(|v| v.chars().count() <= MACHINE_MAX_CHARS && !v.chars().any(char::is_control))
+    zam_core::machine_name(get).or_else(os_hostname)
+}
+
+/// Имя машины из ОС без переменных окружения: на Linux — `/etc/hostname`.
+#[cfg(unix)]
+fn os_hostname() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .and_then(|s| s.lines().next().map(str::to_string))
+        .and_then(zam_core::valid_machine)
+}
+
+#[cfg(not(unix))]
+fn os_hostname() -> Option<String> {
+    None
 }
 
 /// Клиент API одного сервера.
@@ -427,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_name_rules() {
+    fn machine_name_prefers_env() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| {
                 pairs
@@ -437,15 +446,15 @@ mod tests {
             }
         };
         assert_eq!(
+            machine_from(env(&[("ZAM_MACHINE", "m"), ("COMPUTERNAME", "WIN")])).as_deref(),
+            Some("m")
+        );
+        assert_eq!(
             machine_from(env(&[("COMPUTERNAME", "WIN"), ("HOSTNAME", "lin")])).as_deref(),
             Some("WIN")
         );
-        assert_eq!(
-            machine_from(env(&[("COMPUTERNAME", " "), ("HOSTNAME", "lin")])).as_deref(),
-            Some("lin")
-        );
-        assert_eq!(machine_from(env(&[])), None);
-        assert_eq!(machine_from(env(&[("HOSTNAME", "a\tb")])), None);
+        // без переменных — имя из ОС (Linux) или ничего (Windows без COMPUTERNAME)
+        assert_eq!(machine_from(env(&[])), os_hostname());
     }
 
     #[test]

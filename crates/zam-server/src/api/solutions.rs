@@ -14,7 +14,7 @@
 //! - `GET /solutions` — доступные решения с ролью (администратору — все);
 //! - `GET /solutions/{guid}` — пространство решения, `owner`, `role`, `access`;
 //! - `PATCH /solutions/{guid} {name}` — переименование (M4): `rw`-токен владельца или
-//!   администратор; участник и запросивший доступ — 403, посторонний — 404; имя 1–200
+//!   администратор; участник и запросивший доступ — 403, посторонний — 404; имя 1–128
 //!   символов без управляющих; аудит `solution.rename` `{from, to}`. Имя меняется в реестре
 //!   и в пространстве решения базы владельца; GUID, роли и доступ не затрагиваются;
 //! - `GET /solutions/{guid}/access` — владелец любым своим токеном или администратор;
@@ -43,10 +43,8 @@ use crate::app::AppState;
 use crate::auth::{Principal, target_user};
 use crate::error::ApiError;
 
-/// Предел длины имени решения, символов.
-const NAME_MAX_CHARS: usize = 128;
-/// Предел длины нового имени решения при переименовании, символов (§11.6).
-const RENAME_MAX_CHARS: usize = 200;
+/// Предел длины имени решения, символов — один на регистрацию и переименование (§11.6).
+const NAME_MAX_CHARS: usize = zam_core::SOLUTION_NAME_MAX_CHARS;
 /// Предел длины причины отклонения, символов.
 const REASON_MAX_CHARS: usize = 500;
 
@@ -65,14 +63,13 @@ fn parse_guid(raw: &str) -> Result<SolutionGuid, ApiError> {
 }
 
 fn valid_name(raw: &str) -> Result<&str, ApiError> {
-    name_up_to(raw, NAME_MAX_CHARS)
-}
-
-fn name_up_to(raw: &str, max: usize) -> Result<&str, ApiError> {
     let name = raw.trim();
-    if name.is_empty() || name.chars().count() > max || name.chars().any(char::is_control) {
+    if name.is_empty()
+        || name.chars().count() > NAME_MAX_CHARS
+        || name.chars().any(char::is_control)
+    {
         return Err(ApiError::BadRequest(format!(
-            "имя решения: непустое, до {max} символов, без управляющих"
+            "имя решения: непустое, до {NAME_MAX_CHARS} символов, без управляющих"
         )));
     }
     Ok(name)
@@ -244,7 +241,7 @@ pub async fn rename(
 ) -> Result<Json<Value>, ApiError> {
     let info = managed(&st, &p, &raw, true).await?;
     let req: Rename = json_body(body)?;
-    let name = name_up_to(&req.name, RENAME_MAX_CHARS)?;
+    let name = valid_name(&req.name)?;
     let actor = p.actor();
     // сначала реестр (источник истины имени, аудит), затем пространство в базе владельца;
     // повтор запроса довершает прерванное переименование

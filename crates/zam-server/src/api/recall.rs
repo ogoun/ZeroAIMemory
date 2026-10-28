@@ -981,7 +981,8 @@ pub async fn recall(
     // сессия: некорректный id — 400; сбой её базы подсказки не валит (без учёта повторов)
     let mut session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
         Ok(s) => s,
-        Err(e @ ApiError::BadRequest(_)) => return Err(e),
+        // некорректный id — 400, несуществующий пользователь (`X-Zam-User`) — 404
+        Err(e @ (ApiError::BadRequest(_) | ApiError::NotFound)) => return Err(e),
         Err(e) => {
             tracing::warn!(error = %e, "recall: база сессии недоступна, без учёта повторов");
             None

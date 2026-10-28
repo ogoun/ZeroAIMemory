@@ -660,7 +660,7 @@ enum SolutionCmd {
     },
     /// Переименовать решение (владелец или администратор)
     Rename {
-        /// Новое имя (1-200 символов)
+        /// Новое имя (1-128 символов)
         name: String,
         #[command(flatten)]
         opts: AccessOpts,

@@ -146,16 +146,15 @@ impl Proj {
             "https_proxy",
             "all_proxy",
             "no_proxy",
-            "ZAM_SESSION",
-            "ZAM_AGENT",
-            // окружение агента, в котором идут сами тесты, не должно утекать в `zam`
-            "CLAUDECODE",
-            "CLAUDE_CODE_SESSION_ID",
-            "CLAUDE_CODE_CHILD_SESSION",
-            "CODEX_SANDBOX",
-            "CODEX_SANDBOX_NETWORK_DISABLED",
-            "CODEX_THREAD_ID",
         ] {
+            c.env_remove(k);
+        }
+        // окружение агента и клиентские переменные `zam` (`ZAM_SESSION`, `ZAM_AGENT`,
+        // `ZAM_MACHINE`), в котором идут сами тесты, не должны утекать в `zam` — общий список
+        for k in zam_core::AGENT_ENV_VARS
+            .iter()
+            .chain(&zam_core::CLIENT_ENV_VARS)
+        {
             c.env_remove(k);
         }
         c.env("ZAM_URL", url)

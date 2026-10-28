@@ -1116,12 +1116,22 @@ async fn patch_solution_rename_owner_ok_participant_403() {
     assert_eq!(r.json()["role"], "admin");
     assert_eq!(r.json()["name"], "Имя админа");
     // проверка имени
-    for bad in [String::new(), "   ".into(), "a\nb".into(), "я".repeat(201)] {
+    for bad in [
+        String::new(),
+        "   ".into(),
+        "a\nb".into(),
+        "я".repeat(zam_core::SOLUTION_NAME_MAX_CHARS + 1),
+    ] {
         let r = w.req(&w.a_tok, Method::PATCH, &uri, rename(&bad)).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad:?}: {}", r.text());
     }
     let r = w
-        .req(&w.a_tok, Method::PATCH, &uri, rename(&"я".repeat(200)))
+        .req(
+            &w.a_tok,
+            Method::PATCH,
+            &uri,
+            rename(&"я".repeat(zam_core::SOLUTION_NAME_MAX_CHARS)),
+        )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let r = w

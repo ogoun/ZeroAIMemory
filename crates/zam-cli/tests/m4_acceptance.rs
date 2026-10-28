@@ -421,7 +421,10 @@ impl Proj {
         }
         // окружение агента, в котором идут сами тесты, не должно утекать в `zam` (тот же список,
         // что у smoke комплекта и eval хуков)
-        for k in zam_core::AGENT_ENV_VARS {
+        for k in zam_core::AGENT_ENV_VARS
+            .iter()
+            .chain(&zam_core::CLIENT_ENV_VARS)
+        {
             c.env_remove(k);
         }
         c.env("ZAM_URL", url)

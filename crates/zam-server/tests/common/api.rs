@@ -175,6 +175,24 @@ impl Api {
         self.send(b.body(body_of(body.as_ref())).unwrap()).await
     }
 
+    /// Запрос администратора по cookie с дополнительными заголовками (`X-Zam-User`,
+    /// `X-Zam-Session` …).
+    pub async fn adm_h(
+        &self,
+        m: Method,
+        uri: &str,
+        body: Option<Value>,
+        extra: &[(&str, &str)],
+    ) -> Resp {
+        let mut b = req(m, uri, body.as_ref())
+            .header(header::COOKIE, &self.cookie)
+            .header("x-csrf-token", &self.csrf);
+        for (k, v) in extra {
+            b = b.header(*k, *v);
+        }
+        self.send(b.body(body_of(body.as_ref())).unwrap()).await
+    }
+
     /// Новый пользователь: (id, токен `rw`).
     pub async fn new_user(&self, name: &str) -> (String, String) {
         let r = self
