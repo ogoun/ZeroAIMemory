@@ -446,3 +446,70 @@ async fn glossary_cache_invalidates_on_term_write() {
     let j = search(&a, json!({"query": "cache"})).await;
     assert_eq!(j["expanded"], json!([]), "{j}");
 }
+
+/// Открытый вопрос не попадает в выдачу без явного `kinds` ни по умолчанию, ни через
+/// `include_history`; явный `kinds: [question]` его находит.
+#[tokio::test]
+async fn open_question_only_with_explicit_kinds() {
+    let a = api("gs-open-question", |_| {}).await;
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let kn = zam_store::list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == zam_store::SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    let (q, _) = zam_store::create_entry(
+        &db,
+        zam_store::NewEntry {
+            space_id: kn,
+            kind: zam_store::EntryKind::Question,
+            title: "Кэшевание выжимок".into(),
+            body: "Нужно ли кэшевание выжимок для общих решений.".into(),
+            data: json!({}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: None,
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &zam_store::Attribution {
+            author_kind: zam_store::AuthorKind::System,
+            token_id: None,
+            session_id: None,
+            machine: None,
+            message: None,
+            user_id: None,
+            area: None,
+        },
+    )
+    .await
+    .unwrap();
+    let qid = q.id.to_string();
+    let has = |j: &Value| {
+        j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["entry_id"] == qid.as_str())
+    };
+    let j = search(&a, json!({"query": "кэшевание"})).await;
+    assert!(!has(&j), "по умолчанию: {j}");
+    let j = search(&a, json!({"query": "кэшевание", "include_history": true})).await;
+    assert!(!has(&j), "include_history без kinds: {j}");
+    let j = search(
+        &a,
+        json!({"query": "кэшевание", "filters": {"kinds": ["question"]}}),
+    )
+    .await;
+    assert!(has(&j), "явный kinds: {j}");
+    let j = search(
+        &a,
+        json!({"query": "кэшевание", "include_history": true, "filters": {"kinds": ["question"]}}),
+    )
+    .await;
+    assert!(has(&j), "include_history с kinds: {j}");
+}

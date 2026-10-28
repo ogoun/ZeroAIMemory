@@ -415,10 +415,16 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
     let certainty = filter_list("filters.certainty", f.certainty.as_ref(), &CERTAINTIES, &[])?;
     Ok(TargetFilter {
         kinds,
-        statuses: if include_history {
-            Vec::new()
-        } else {
-            statuses
+        // include_history снимает фильтр статусов; без явного `kinds` открытые вопросы и задачи
+        // (`open`) в историю не входят - они только по явному `kinds`
+        statuses: match (include_history, explicit) {
+            (false, _) => statuses,
+            (true, true) => Vec::new(),
+            (true, false) => STATUSES
+                .iter()
+                .filter(|s| **s != "open")
+                .map(|s| s.to_string())
+                .collect(),
         },
         area: None,
         certainty,
@@ -2835,8 +2841,20 @@ mod tests {
             rest(&["active", "revisit", "answered"])
         );
         assert!(excluded_statuses(&f).starts_with(&["superseded".into(), "retracted".into()]));
-        // include_history снимает фильтр статуса
+        // include_history без `kinds`: все статусы, кроме `open` (открытые вопросы и задачи - только
+        // по явному `kinds`); с явным `kinds` фильтр статусов снят
         let f = target_filter(&Filters::default(), true).unwrap();
+        assert!(!f.statuses.contains(&"open".to_string()));
+        assert!(f.statuses.contains(&"superseded".to_string()));
+        assert_eq!(excluded_statuses(&f), ["open"]);
+        let f = target_filter(
+            &Filters {
+                kinds: Some(vec!["question".into()]),
+                ..Filters::default()
+            },
+            true,
+        )
+        .unwrap();
         assert!(f.statuses.is_empty() && excluded_statuses(&f).is_empty());
         let f = target_filter(
             &Filters {

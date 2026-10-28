@@ -88,7 +88,9 @@ impl GlossaryIndex {
             let mut seen: Vec<Vec<String>> = Vec::new();
             for raw in std::iter::once(&t.title).chain(&t.aliases) {
                 let words = lower_words(raw);
-                if words.is_empty() || seen.contains(&words) {
+                // имя из одних односимвольных слов («C++» -> «c», «C#» -> «c») совпало бы с любой
+                // буквой запроса: в расширение и подсказки не входит
+                if words.iter().all(|w| w.chars().count() < 2) || seen.contains(&words) {
                     continue;
                 }
                 seen.push(words.clone());
@@ -325,6 +327,23 @@ mod tests {
         // другое пространство и чужое слово
         assert!(idx.expand(&words("summary"), &[Id::new()]).is_empty());
         assert!(idx.expand(&words("summaries"), &[sp]).is_empty());
+    }
+
+    #[test]
+    fn single_letter_names_are_not_indexed() {
+        let sp = Id::new();
+        let idx = GlossaryIndex::build(vec![
+            entry(sp, "Си", &["C++", "C#", "c"]),
+            entry(sp, "План", &["Plan B"]),
+        ]);
+        // «C++» и «C#» дают только слово «c»: ложные срабатывания на любую букву «c»
+        assert!(idx.expand(&words("версия c тут"), &[sp]).is_empty());
+        assert!(idx.find_in_text("пишем на C++ и C#", &[sp]).is_empty());
+        // многословное имя с односимвольным словом остаётся
+        let e = idx.expand(&words("нужен plan b"), &[sp]);
+        assert_eq!((e.len(), e[0].term.as_str(), e[0].len), (1, "План", 2));
+        // сам термин находится по имени
+        assert_eq!(idx.expand(&words("си"), &[sp]).len(), 1);
     }
 
     #[test]

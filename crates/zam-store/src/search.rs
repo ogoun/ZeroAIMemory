@@ -347,24 +347,23 @@ fn join_terms(query: &str, sep: &str) -> Option<String> {
     Some(t.into_iter().map(quote_term).collect::<Vec<_>>().join(sep))
 }
 
-/// Имя или псевдоним термина как терм FTS5: слова фразой, от [`MIN_PREFIX_CHARS`] символов —
-/// с префиксом на последнем слове, короче — точное слово. `None` — в строке нет слов.
+/// Имя или псевдоним термина как терм FTS5: слова фразой; префикс (`*`) — только если последнее
+/// слово не короче [`MIN_PREFIX_CHARS`] символов, иначе точная фраза. `None` — в строке нет слов.
 fn phrase_term(s: &str) -> Option<String> {
     let w = terms(s);
     if w.is_empty() {
         return None;
     }
-    let joined = w.join(" ");
-    let q = quote(&joined);
-    Some(if joined.chars().count() >= MIN_PREFIX_CHARS {
-        q + "*"
-    } else {
-        q
-    })
+    let q = quote(&w.join(" "));
+    // префикс - только на последнем слове фразы и только от 3 символов: «Plan B» не должна
+    // раскрываться в префикс из одной буквы
+    let last = w.last().map_or(0, |l| l.chars().count());
+    Some(if last >= MIN_PREFIX_CHARS { q + "*" } else { q })
 }
 
 /// Запрос канала `alias`: слова запроса, группы вместо совпавших слов; `sep` — `" AND "` (все
-/// слова; неявное «И» FTS5 перед скобкой не разбирает) или `" OR "` (любое). `None` — в запросе нет слов.
+/// слова; неявное «И» FTS5 перед скобкой не разбирает) или `" OR "` (любое). `None` — в запросе
+/// нет слов.
 fn alias_fts(query: &str, groups: &[AliasGroup], sep: &str) -> Option<String> {
     let t = terms(query);
     if t.is_empty() {
@@ -1512,5 +1511,11 @@ mod tests {
             Some(r#"("слово"*)"#)
         );
         assert_eq!(alias_fts("—", &groups, " AND "), None);
+        // префикс - по последнему слову фразы, а не по длине всей фразы
+        let groups = [g(0, 1, &["Plan B", "Q&A", "db", "Plan Bar"])];
+        assert_eq!(
+            alias_fts("x", &groups, " AND ").as_deref(),
+            Some(r#"("x" OR "Plan B" OR "Q A" OR "db" OR "Plan Bar"*)"#)
+        );
     }
 }
