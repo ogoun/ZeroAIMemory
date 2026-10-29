@@ -5,7 +5,8 @@
 //!   триггеры `file_glob` и `error_regex`) на одной машине в проекте A; на другой машине в проекте B
 //!   `zam hook session-start` обновляет кэш триггеров, сервер останавливается, и `pre-tool`
 //!   (Write `deploy.sh`) и `post-tool` («bad interpreter») выдают подсказки без сети;
-//! - `hook_budgets` — p95 каждого хука на корпусе eval в пределах бюджетов §10.3 с запасом ×2;
+//! - `hook_budgets` — p95 каждого хука на корпусе eval в пределах бюджетов §10.3 с запасом ×2
+//!   (M4.5: и `post-tool` успеха — 50 мс без сети, и `subagent-start` — 300 мс);
 //! - `source_change_marks_cache_stale` — изменение источника выжимки → `stale` (критерий §19);
 //! - `fail_open_when_server_down` — все пять хуков при выключенном и при зависшем сервере;
 //! - `shared_solution_cache_and_recall` — участник общего решения видит общий кэш и подсказки
@@ -53,9 +54,10 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// Бюджет хука по ТЗ §10.3, мс.
 fn budget_ms(kind: &str) -> u64 {
     match kind {
-        "session-start" => 300,
+        "session-start" | "subagent-start" => 300,
         "prompt" | "post-tool" => 250,
-        "pre-tool" => 50,
+        // M4.5: `post-tool` успеха — весь процесс без сети (план M4.5, Global Constraints)
+        "pre-tool" | "post-tool-ok" => 50,
         "checkpoint" => 100,
         other => panic!("неизвестный хук {other}"),
     }
@@ -778,8 +780,29 @@ fn hook_budgets() {
     let srv = Srv::start("budgets", &["Анна"], |_| {});
     let hints = load_eval(&srv);
     let p = Proj::new("budgets", &srv.url, &srv.users[0].token, GA, "bench-box");
+    // M4.5: запись со ссылкой на файл — знание о файле для `post-tool` успеха (`Read`)
+    let (code, v) = srv.call(
+        0,
+        "POST",
+        &format!("/api/v1/spaces/{GA}/entries"),
+        Some(
+            &json!({"kind": "insight", "title": "Пул соединений течёт при панике",
+                     "body": "Соединение не возвращается в пул, если обработчик паникует.",
+                     "data": {"kind": "gotcha"}, "force": true,
+                     "refs": {"files": [{"path": "src/pool.rs"}]}}),
+        ),
+        &[],
+    );
+    assert_eq!(code, 201, "{v}");
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), "pub fn pool() {}\n").unwrap();
     // кэш триггеров — до pre-tool
     p.session_start_until("bud-warm", |c| !c.is_empty());
+    assert!(
+        p.repo.join(".zeroaimemory/cache/file-refs.json").is_file(),
+        "session-start не записал file-refs.json; hooks.log:\n{}",
+        p.log()
+    );
     // прогрев (fix round 1, M-2): после массовой загрузки корпуса отдельные `session-start`
     // упирались в бюджет (запись сессии ждала диск, занятый фоновой записью на HDD, — выбросы
     // шли и через 5–10 с после загрузки) — замер начинается, когда 20 вызовов подряд проходят
@@ -903,6 +926,49 @@ fn hook_budgets() {
             })
             .collect(),
     ));
+    // M4.5: `post-tool` успеха — чтение файла со знанием (своя сессия: строка о файле — раз за
+    // сессию) и без него, правка, команда; детерминирован (локальный кэш, без сети)
+    runs.push((
+        "post-tool-ok",
+        (0..40)
+            .map(|i| {
+                let s = format!("bud-ok-{i}");
+                let (tool, input, want) = match i % 4 {
+                    0 => ("Read", json!({"file_path": p.repo.join("src/pool.rs")}), true),
+                    1 => ("Read", json!({"file_path": p.repo.join("README.md")}), false),
+                    2 => (
+                        "Edit",
+                        json!({"file_path": p.repo.join("a.txt"), "old_string": "a", "new_string": "b"}),
+                        false,
+                    ),
+                    _ => ("Bash", json!({"command": "cargo build"}), false),
+                };
+                let ev = p.ev(
+                    "PostToolUse",
+                    &s,
+                    json!({"tool_name": tool, "tool_use_id": format!("u{i}"), "tool_input": input,
+                           "tool_response": {"success": true}}),
+                );
+                (ev, Some(want))
+            })
+            .collect(),
+    ));
+    // M4.5: `subagent-start` — пакет под задачу после `pre-tool` на `Agent` (очередь запусков);
+    // задание — текст запроса prompt набора подсказок, ответ — по качеству поиска (FTS-only)
+    let prompts = inputs("prompt");
+    runs.push((
+        "subagent-start",
+        (0..20)
+            .map(|i| {
+                let ev = p.ev(
+                    "SubagentStart",
+                    &format!("bud-sub-{i}"),
+                    json!({"agent_id": format!("a{i}"), "agent_type": "Explore"}),
+                );
+                (ev, None)
+            })
+            .collect(),
+    ));
     let mut report = Vec::new();
     let mut fails = Vec::new();
     for (kind, evs) in &runs {
@@ -912,18 +978,38 @@ fn hook_budgets() {
                 p.hook("pre-tool", &p.write_ev(&format!("bud-cp-{i}"), "a.txt"));
             }
         }
+        if *kind == "subagent-start" {
+            // запуск субагента в очереди сессии — до замера
+            for (i, (ev, _)) in evs.iter().enumerate() {
+                let task = prompts[i % prompts.len()]["input"].as_str().unwrap();
+                let spawn = p.ev(
+                    "PreToolUse",
+                    ev["session_id"].as_str().unwrap(),
+                    json!({"tool_name": "Agent", "tool_use_id": "u1",
+                           "tool_input": {"description": "d", "prompt": task,
+                                          "subagent_type": "Explore"}}),
+                );
+                p.hook("pre-tool", &spawn);
+            }
+        }
+        // команда хука: `post-tool-ok` — тот же `post-tool` с событием успеха
+        let cmd = if *kind == "post-tool-ok" {
+            "post-tool"
+        } else {
+            kind
+        };
         // прогрев вида (не в замер): после загрузки корпуса первые запросы отладочного сервера
         // читают холодные страницы SQLite с HDD — бюджет относится к рабочему серверу
         for (ev, _) in evs.iter().take(3) {
             let mut w = ev.clone();
             w["session_id"] = json!(format!("warm-{}", ev["session_id"].as_str().unwrap()));
-            p.hook_at(&p.url, kind, &w);
+            p.hook_at(&p.url, cmd, &w);
         }
         let mut times = Vec::new();
         let (mut timeouts, mut spoke) = (0, 0);
         for (ev, want) in evs {
             let before = p.log().lines().count();
-            let (o, d) = p.hook_at(&p.url, kind, ev);
+            let (o, d) = p.hook_at(&p.url, cmd, ev);
             let said = !ok(&o).trim().is_empty();
             spoke += usize::from(said);
             times.push(d);

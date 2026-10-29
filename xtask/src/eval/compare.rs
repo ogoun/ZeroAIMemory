@@ -18,16 +18,44 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::Mode;
 use super::corpus::INSIGHT_REF;
 use super::metrics::{Estimate, paired_diff, score};
 use super::run::{QueryRun, RunResult};
+
+/// Файл `--compare` для прогона режима `mode`: один файл — для любого режима (как до M4.5);
+/// несколько — тот, у которого `info.mode` равен режиму (нет такого — без сравнения; два
+/// файла одного режима — ошибка).
+pub fn compare_file(files: &[PathBuf], mode: Mode) -> Result<Option<PathBuf>> {
+    if files.len() <= 1 {
+        return Ok(files.first().cloned());
+    }
+    let mut found: Option<PathBuf> = None;
+    for f in files {
+        let text = fs::read_to_string(f).with_context(|| format!("чтение {}", f.display()))?;
+        let v: Value =
+            serde_json::from_str(&text).with_context(|| format!("разбор {}", f.display()))?;
+        if v["info"]["mode"] == mode.as_str() {
+            if let Some(prev) = &found {
+                bail!(
+                    "--compare: два файла режима {}: {} и {}",
+                    mode.as_str(),
+                    prev.display(),
+                    f.display()
+                );
+            }
+            found = Some(f.clone());
+        }
+    }
+    Ok(found)
+}
 
 /// Парная разность с прежним прогоном по общим запросам.
 #[derive(Debug, Clone, Serialize)]

@@ -173,9 +173,23 @@ pub(super) async fn expand_graph(
         .collect())
 }
 
-/// Порядок по `contradicts` (M4.5, §5.2): записи выдачи с исходящим `contradicts` к действующей
-/// аксиоме той же выдачи не стоят выше неё ([`zam_search::order_contradicted`]); сдвинутой
-/// аксиоме балл поднимается до балла следующего элемента, чтобы баллы не шли вразрез с порядком.
+/// Надёжность для порядка по `contradicts`: `axiom` 3, `theorem` 2, `hypothesis` 1, без
+/// `certainty` (заметка) 0.
+fn reliability(c: Option<Certainty>) -> u8 {
+    match c {
+        Some(Certainty::Axiom) => 3,
+        Some(Certainty::Theorem) => 2,
+        Some(Certainty::Hypothesis) => 1,
+        None => 0,
+    }
+}
+
+/// Порядок по `contradicts` (M4.5, §5.2): элемент выдачи с исходящим `contradicts` к действующей
+/// записи той же выдачи, которая надёжнее его (`axiom` — любого элемента, кроме другой
+/// аксиомы; `theorem` — гипотезы или заметки), не стоит выше неё
+/// ([`zam_search::order_contradicted`]); задача 15: запрос `r-08` набора eval — гипотеза против
+/// `theorem`. Сдвинутой записи балл поднимается до балла следующего элемента, чтобы баллы не шли
+/// вразрез с порядком.
 /// Сбой чтения графа чужого решения исключает решение ([`Health::soft`]).
 pub(super) async fn order_by_contradicts(
     health: &mut Health<'_>,
@@ -203,26 +217,29 @@ pub(super) async fn order_by_contradicts(
         let Some(g) = health.soft(ti, r)? else {
             continue;
         };
-        let axioms: HashSet<Id> = g
+        // надёжность записей подграфа; цель связи — только действующая
+        let rel: HashMap<Id, (u8, bool)> = g
             .nodes
             .iter()
-            .filter(|n| {
-                n.certainty == Some(Certainty::Axiom)
-                    && !n.deleted
+            .map(|n| {
+                let live = !n.deleted
                     // у заметки статуса нет; у записи — только действующая
                     && matches!(
                         n.status,
                         None | Some(EntryStatus::Active | EntryStatus::Revisit)
-                    )
+                    );
+                (n.r.id, (reliability(n.certainty), live))
             })
-            .map(|n| n.r.id)
             .collect();
         for e in &g.edges {
             if e.kind != EdgeType::Contradicts {
                 continue;
             }
+            let src = rel.get(&e.src.id).map_or(0, |r| r.0);
             if let Some(d) = e.dst
-                && axioms.contains(&d.id)
+                && let Some(&(dst, true)) = rel.get(&d.id)
+                && dst >= reliability(Some(Certainty::Theorem))
+                && dst > src
                 && refs.contains(&e.src)
                 && refs.contains(&d)
             {

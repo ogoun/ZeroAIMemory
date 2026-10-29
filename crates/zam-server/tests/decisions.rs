@@ -670,6 +670,56 @@ async fn contradicting_hypothesis_not_above_axiom_rerank() {
     assert_eq!(ids, [hyp, ax]);
 }
 
+/// Задача 15 (eval `r-08`): гипотеза с `contradicts` к действующей `theorem` не стоит выше неё;
+/// связь теоремы к гипотезе (менее надёжной) порядка не меняет.
+#[tokio::test]
+async fn contradicting_hypothesis_not_above_theorem_rerank() {
+    let world = |name: &'static str| async move {
+        let a = api(name, |_| {}).await;
+        a.st.rerank
+            .install(Arc::new(Stub(vec![
+                ("маркергипотезы", 0.90),
+                ("маркертеоремы", 0.50),
+            ])))
+            .await;
+        let th = created(
+            post(
+                &a,
+                json!({"kind": "insight", "title": "Сборка кэша: теорема",
+                       "body": "Сборка кэша идёт без прогрева, маркертеоремы.",
+                       "certainty": "theorem",
+                       "data": {"kind": "discovery", "evidence": {
+                           "checked": "сборка", "method": "замер", "result": "без прогрева"}}}),
+            )
+            .await,
+        )
+        .await;
+        let hyp = created(
+            post(
+                &a,
+                decision(
+                    "Сборка кэша: гипотеза",
+                    "Сборка кэша ускоряется прогревом, маркергипотезы.",
+                    None,
+                    json!({"certainty": "hypothesis"}),
+                ),
+            )
+            .await,
+        )
+        .await;
+        (a, id(&hyp), id(&th))
+    };
+    let (a, hyp, th) = world("decisions-rerank-theorem").await;
+    assert_eq!(rerank_order(&a).await.0, [hyp.clone(), th.clone()]);
+    contradict(&a, &hyp, &th).await;
+    let (ids, scores) = rerank_order(&a).await;
+    assert_eq!(ids, [th, hyp]);
+    assert!(scores[0] >= scores[1], "{scores:?}");
+    let (a, hyp, th) = world("decisions-rerank-theorem-back").await;
+    contradict(&a, &th, &hyp).await;
+    assert_eq!(rerank_order(&a).await.0, [hyp, th]);
+}
+
 #[tokio::test]
 async fn contradicts_order_off_keeps_order() {
     let (a, hyp, ax) = rerank_world("decisions-rerank-off", |c| {

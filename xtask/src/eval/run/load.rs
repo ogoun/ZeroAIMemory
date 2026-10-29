@@ -87,6 +87,23 @@ impl Session {
                 }
             }
         }
+        // связи `contradicts` (M4.5) — после всех созданий: цель может стоять ниже по файлу
+        for i in insights {
+            for t in &i.contradicts {
+                let dst = ids
+                    .get(t.as_str())
+                    .with_context(|| format!("insight {}: contradicts {t} не создан", i.key))?;
+                let body = json!({
+                    "src": format!("entry:{}", ids[i.key.as_str()]),
+                    "type": "contradicts",
+                    "dst": format!("entry:{dst}"),
+                });
+                let (st, v) = self.api("/api/v1/edges", Some(&body))?;
+                if st != 201 {
+                    bail!("insight {}: contradicts {t}: HTTP {st}: {v}", i.key);
+                }
+            }
+        }
         let dir = self.data.parent().context("каталог прогона")?;
         fs::write(
             dir.join(ENTRIES_FILE),

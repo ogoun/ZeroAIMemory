@@ -159,7 +159,11 @@ fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<()> {
 
 /// Пишет `<stem>.json` и `<stem>.md`.
 pub fn write_run(dir: &Path, r: &RunResult) -> Result<(PathBuf, PathBuf)> {
-    let stem = file_stem(r);
+    write_run_as(dir, &file_stem(r), r)
+}
+
+/// Пишет `<stem>.json` и `<stem>.md` с заданным именем (итоговые прогоны M4.5).
+pub fn write_run_as(dir: &Path, stem: &str, r: &RunResult) -> Result<(PathBuf, PathBuf)> {
     let json = dir.join(format!("{stem}.json"));
     let md = dir.join(format!("{stem}.md"));
     write_json(&json, r)?;

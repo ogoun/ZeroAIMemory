@@ -570,6 +570,7 @@ lang = "en"
 kind = "gotcha"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p08-t"]
 title = "SQLite FTS5 trigram tokenizer does not match Cyrillic text"
 body = "The trigram tokenizer only works for ASCII, so substring search over Russian notes cannot use it."
 
@@ -654,6 +655,7 @@ lang = "ru"
 kind = "pattern"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p12-a"]
 title = "Qdrant для разработки проще поднимать в Docker"
 body = "Для локальной разработки Qdrant удобнее всего запускать контейнером Docker с томом под данные."
 
@@ -674,6 +676,7 @@ lang = "en"
 kind = "pattern"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p13-a"]
 title = "Tests may put scratch files into the system temp directory"
 body = "Using std::env::temp_dir for scratch files in tests is harmless, since the operating system cleans the temp directory."
 

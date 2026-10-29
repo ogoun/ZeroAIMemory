@@ -2532,7 +2532,13 @@ fn subagent_start_budget_300ms() {
         }
         times.push(d);
     }
-    assert!(answered >= 15, "с пакетом только {answered} из 20");
+    // ревью задачи 10: release-сборка обязана ответить пакетом на все 20 вызовов, послабление
+    // 15 из 20 — только для отладочной сборки
+    let need = if cfg!(debug_assertions) { 15 } else { 20 };
+    assert!(
+        answered >= need,
+        "с пакетом только {answered} из 20 (нужно {need})"
+    );
     let q = p95(times);
     eprintln!("ZAM_TIMING subagent-start p95={q:?}");
     assert!(q <= max_for("session-start"), "p95 {q:?}");

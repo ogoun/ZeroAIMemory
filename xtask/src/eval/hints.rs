@@ -77,6 +77,10 @@ const LATENCY_POST_API_REPS: usize = 5;
 const LATENCY_POST_HOOK_REPS: usize = 3;
 const LATENCY_PRE_HOOK_REPS: usize = 3;
 const LATENCY_SESSION_START: usize = 40;
+/// `post-tool` успеха (M4.5, без сети): вызовов.
+const LATENCY_POST_OK: usize = 100;
+/// `subagent-start` (M4.5, пакет `brief` после `pre-tool` на `Agent`): вызовов.
+const LATENCY_SUBAGENT: usize = 40;
 /// Предел одного вызова `/recall` и процесса хука (хук сам укладывается в бюджет §10.3).
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Попыток `zam hook session-start` для кэша триггеров перед случаями `pre_tool`.
@@ -721,8 +725,8 @@ pub struct HintsResult {
 /// Бюджеты §10.3 (хуки, с процессом) и §17 (`recall` с сетью LAN), мс.
 fn hook_budget(cmd: &str) -> f64 {
     match cmd {
-        "session-start" => 300.0,
-        "pre-tool" => 50.0,
+        "session-start" | "subagent-start" => 300.0,
+        "pre-tool" | "post-tool-ok" => 50.0,
         _ => 250.0,
     }
 }
@@ -1278,28 +1282,37 @@ fn measure_latency(
     }
     api.insert("session_start".to_string(), latency(&ms, &srv, to, ne, rb));
 
-    // хуки: session-start (новая сессия), prompt (остальные тексты), post-tool, pre-tool
-    let mut hook = |cmd: &str, inputs: Vec<Value>| -> Result<()> {
-        let mut ms = Vec::new();
-        let mut ne = 0;
-        let mut timeouts = 0;
-        for inp in &inputs {
-            let before = h.log_lines();
-            let (o, m) = h.run(cmd, inp)?;
-            ms.push(m);
-            ne += usize::from(!hook_context(&o).is_empty() || o.contains("\"decision\""));
-            // хук молчит по тайм-ауту (fail-open) и пишет причину в hooks.log
-            timeouts += usize::from(
-                h.new_log(before)
-                    .iter()
-                    .any(|l| l.contains("timeout") || l.contains("бюджет исчерпан")),
+    // хуки: session-start (новая сессия), prompt (остальные тексты), post-tool, pre-tool;
+    // M4.5 — post-tool успеха (`post-tool-ok`, без сети) и subagent-start (до каждого вызова —
+    // не замеряемый pre-tool на `Agent`: запись очереди запусков)
+    let mut hook_as =
+        |name: &str, cmd: &str, inputs: Vec<(Option<(String, Value)>, Value)>| -> Result<()> {
+            let mut ms = Vec::new();
+            let mut ne = 0;
+            let mut timeouts = 0;
+            for (pre, inp) in &inputs {
+                if let Some((pc, pv)) = pre {
+                    h.run(pc, pv)?;
+                }
+                let before = h.log_lines();
+                let (o, m) = h.run(cmd, inp)?;
+                ms.push(m);
+                ne += usize::from(!hook_context(&o).is_empty() || o.contains("\"decision\""));
+                // хук молчит по тайм-ауту (fail-open) и пишет причину в hooks.log
+                timeouts += usize::from(
+                    h.new_log(before)
+                        .iter()
+                        .any(|l| l.contains("timeout") || l.contains("бюджет исчерпан")),
+                );
+            }
+            hooks.insert(
+                name.to_string(),
+                latency(&ms, &[], timeouts, ne, hook_budget(name)),
             );
-        }
-        hooks.insert(
-            cmd.to_string(),
-            latency(&ms, &[], timeouts, ne, hook_budget(cmd)),
-        );
-        Ok(())
+            Ok(())
+        };
+    let mut hook = |cmd: &str, inputs: Vec<Value>| -> Result<()> {
+        hook_as(cmd, cmd, inputs.into_iter().map(|v| (None, v)).collect())
     };
     hook(
         "session-start",
@@ -1359,6 +1372,51 @@ fn measure_latency(
             })
             .collect(),
     )?;
+    // post-tool успеха: чтение, правка и команда по очереди (журнал сессии, знание о файле
+    // из кэша — без сети)
+    let ok_inputs = (0..LATENCY_POST_OK)
+        .map(|i| {
+            let (tool, input) = match i % 3 {
+                0 => ("Read", json!({"file_path": h.project.join(format!("src/m{i}.rs"))})),
+                1 => (
+                    "Edit",
+                    json!({"file_path": h.project.join("src/lib.rs"), "old_string": "a", "new_string": "b"}),
+                ),
+                _ => ("Bash", json!({"command": format!("cargo test -p m{i}")})),
+            };
+            let ev = h.input(
+                "PostToolUse",
+                &format!("lat-{tag}-ok-{}", i / 10),
+                json!({"tool_name": tool, "tool_use_id": format!("u{i}"), "tool_input": input,
+                       "tool_response": {"success": true}}),
+            );
+            (None, ev)
+        })
+        .collect();
+    hook_as("post-tool-ok", "post-tool", ok_inputs)?;
+    // subagent-start: пакет под задачу по тексту запроса набора
+    let sub_inputs = hook_texts
+        .iter()
+        .rev()
+        .take(LATENCY_SUBAGENT)
+        .enumerate()
+        .map(|(i, t)| {
+            let session = format!("lat-{tag}-sub-{i}");
+            let pre = h.input(
+                "PreToolUse",
+                &session,
+                json!({"tool_name": "Agent", "tool_use_id": "u1",
+                       "tool_input": {"description": "d", "prompt": t, "subagent_type": "Explore"}}),
+            );
+            let ev = h.input(
+                "SubagentStart",
+                &session,
+                json!({"agent_id": format!("a{i}"), "agent_type": "Explore"}),
+            );
+            (Some(("pre-tool".to_string(), pre)), ev)
+        })
+        .collect();
+    hook_as("subagent-start", "subagent-start", sub_inputs)?;
     Ok((api, hooks))
 }
 

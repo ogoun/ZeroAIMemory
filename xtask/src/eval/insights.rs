@@ -58,6 +58,11 @@ pub struct Insight {
     /// Отзыв после создания (`POST /entries/{id}/retract`).
     #[serde(default)]
     pub retract_reason: Option<String>,
+    /// Ключи insight, которым эта запись противоречит (M4.5, связь `contradicts`, `POST
+    /// /edges` после создания всех записей); цель надёжнее записи. Пусто — поля нет в
+    /// сериализации: отпечаток корпуса у записей без связи не меняется.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contradicts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -180,6 +185,31 @@ pub(super) fn validate_insights(corpus: &Corpus, errs: &mut Vec<String>) {
             }
             if let Some(prev) = successor.insert(old, &i.key) {
                 bad(format!("{old} уже замещён записью {prev}"));
+            }
+        }
+    }
+    // связи `contradicts` (M4.5): цель существует, действует и надёжнее записи
+    let rank = |c: Option<&str>| match c.unwrap_or("hypothesis") {
+        "axiom" => 3,
+        "theorem" => 2,
+        _ => 1,
+    };
+    for i in &corpus.insights {
+        for t in &i.contradicts {
+            let bad = |m: String| format!("insight {}: contradicts {t}: {m}", i.key);
+            match corpus.insight(t) {
+                None => errs.push(bad("нет insight с таким ключом".into())),
+                Some(o) => {
+                    if !corpus.insight_active(t) {
+                        errs.push(bad("цель замещена или отозвана".into()));
+                    }
+                    if rank(o.certainty.as_deref()) <= rank(i.certainty.as_deref()) {
+                        errs.push(bad(
+                            "цель должна быть надёжнее записи (axiom > theorem > hypothesis)"
+                                .into(),
+                        ));
+                    }
+                }
             }
         }
     }

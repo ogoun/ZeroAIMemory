@@ -41,7 +41,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::compare::{Comparison, compare};
+use super::compare::{Comparison, compare, compare_file};
 use super::corpus::{
     Corpus, EVAL_SOLUTION, INSIGHT_REF, Kind, Lang, Note, Query, in_solution, is_long_path,
 };
@@ -406,7 +406,7 @@ impl Session {
         })
     }
 
-    fn api(&self, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
+    pub(super) fn api(&self, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
         api(&self.base, &self.token, path, body)
     }
 
@@ -954,6 +954,7 @@ const MEASURED_PATHS: &[&str] = &[
     "eval/grid-m3-kind.toml",
     "eval/hints.toml",
     "eval/scenarios.toml",
+    "eval/glossary.toml",
 ];
 
 /// `git <args> -- <MEASURED_PATHS>`.
@@ -1204,8 +1205,8 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
     }
     let mut failed = Vec::new();
     for mut r in results {
-        if let Some(prev) = &a.compare {
-            r.compare = Some(compare(&p.repo, prev, &r)?);
+        if let Some(prev) = compare_file(&a.compare, r.info.mode)? {
+            r.compare = Some(compare(&p.repo, &prev, &r)?);
         }
         let (json, md) = report::write_run(&p.results, &r)?;
         report::print_run(&r);
