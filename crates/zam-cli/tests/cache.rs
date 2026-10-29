@@ -1,19 +1,16 @@
 //! `zam cache` против настоящего zam-server в том же процессе тестов (§9.4, §13.2; задача 7
 //! M4): выжимка из stdin с источниками, список, карточка, превращение, удаление.
+mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use assert_cmd::Command;
 use zam_server::build;
 use zam_server::config::ServerConfig;
 use zam_store::Access;
 
 fn tmp(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-cache-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    common::sandbox("cli-cache", name)
 }
 
 /// Сервер в фоновом потоке: адрес и токен `rw` пользователя.
@@ -48,19 +45,7 @@ fn start(name: &str) -> (String, String) {
 }
 
 fn zam(url: &str, token: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
-    let mut c = Command::cargo_bin("zam").unwrap();
-    for k in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    ] {
-        c.env_remove(k);
-    }
+    let mut c = common::zam_cmd();
     c.env("ZAM_URL", url)
         .env("ZAM_TOKEN", token)
         .env("HOME", cwd)

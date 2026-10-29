@@ -428,66 +428,100 @@ fn queue_files(env: &Env, session: Option<&str>) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Отправка очереди изменённых файлов `POST /files/changed` одним запросом до 500 путей на
-/// очередь (повтор пути — последний хэш). Очередь забирается rename во временный файл —
-/// строки, дописанные во время отправки, не теряются; успех — забранное удаляется, ошибка или
-/// остаток сверх 500 — дописывается обратно. Без решения — ничего.
+/// Запас бюджета на `POST /files/changed`: меньше — очередь не отправляется (останется на
+/// следующий хук).
+pub const FLUSH_MIN_LEFT: Duration = Duration::from_millis(15);
+
+/// Отправка очередей изменённых файлов (fix round 1, I-2): все очереди (`session` задан —
+/// только его) забираются rename во временные файлы и уходят **одним** `POST /files/changed` до
+/// 500 путей (повтор пути — последний хэш); перед запросом проверяется остаток бюджета хука
+/// ([`FLUSH_MIN_LEFT`]). Успех — забранное удаляется, сверх 500 — возвращается в свою очередь до
+/// следующего раза; ошибка сети, 401, 408, 429 и 5xx — всё возвращается; прочие 4xx (запрос
+/// не примет никогда) — очередь отбрасывается со строкой в `hooks.log` (fix round 1, M-6).
+/// Строки, дописанные во время отправки, не теряются: они в новой очереди. Без решения — ничего.
 pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     let Some(sol) = env.solution.as_ref().map(|s| s.id.clone()) else {
         return;
     };
-    for q in queue_files(env, session) {
+    if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+        return;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // (очередь, забранный файл)
+    let mut taken: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (i, q) in queue_files(env, session).into_iter().enumerate() {
         let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("changed");
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let taken = q.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
-        if std::fs::rename(&q, &taken).is_err() {
-            continue;
+        let t = q.with_file_name(format!(".{name}.{}.{nanos}.{i}.tmp", std::process::id()));
+        if std::fs::rename(&q, &t).is_ok() {
+            taken.push((q, t));
         }
-        let bytes = std::fs::read(&taken).unwrap_or_default();
-        let mut files: Vec<Changed> = Vec::new();
+    }
+    if taken.is_empty() {
+        return;
+    }
+    // (путь, хэш, номер очереди) — повтор пути: последний хэш
+    let mut files: Vec<(Changed, usize)> = Vec::new();
+    for (qi, (_, t)) in taken.iter().enumerate() {
+        let bytes = std::fs::read(t).unwrap_or_default();
         for l in bytes.split(|b| *b == b'\n') {
             let Ok(c) = serde_json::from_slice::<Changed>(l) else {
                 continue;
             };
-            files.retain(|f| !crate::cmd::refs::same_path(&f.path, &c.path));
-            files.push(c);
+            files.retain(|(f, _)| !crate::cmd::refs::same_path(&f.path, &c.path));
+            files.push((c, qi));
         }
-        let n = files.len().min(crate::cmd::refs::FILES_MAX);
-        let (send, rest) = files.split_at(n);
-        let pairs: Vec<(String, String)> = send
-            .iter()
-            .map(|c| (c.path.clone(), c.hash.clone()))
-            .collect();
-        let back: Vec<Changed> = if pairs.is_empty() {
-            Vec::new()
-        } else {
-            match crate::cmd::refs::post_changed(client, &sol, &pairs) {
-                Ok(_) => rest.to_vec(),
-                Err(e) => {
-                    env.log(&format!("files/changed: {e}"));
-                    files.clone()
-                }
-            }
-        };
-        if !back.is_empty() {
-            let mut out = Vec::new();
-            for c in &back {
-                out.extend(serde_json::to_vec(c).unwrap_or_default());
-                out.push(b'\n');
-            }
-            use std::io::Write;
-            if let Err(e) = append_options()
-                .open(&q)
-                .and_then(|mut f| f.write_all(&out))
-            {
-                env.log(&format!("возврат очереди изменённых файлов: {e}"));
-            }
-        }
-        let _ = std::fs::remove_file(&taken);
     }
+    let n = files.len().min(crate::cmd::refs::FILES_MAX);
+    let back: Vec<(Changed, usize)> = if n == 0 {
+        Vec::new()
+    } else if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+        files.clone()
+    } else {
+        let pairs: Vec<(String, String)> = files[..n]
+            .iter()
+            .map(|(c, _)| (c.path.clone(), c.hash.clone()))
+            .collect();
+        match crate::cmd::refs::post_changed(client, &sol, &pairs) {
+            Ok(_) => files[n..].to_vec(),
+            Err(e) if permanent(&e) => {
+                env.log(&format!(
+                    "files/changed: очередь ({} путей) отброшена: {e}",
+                    files.len()
+                ));
+                Vec::new()
+            }
+            Err(e) => {
+                env.log(&format!("files/changed: {e}"));
+                files.clone()
+            }
+        }
+    };
+    for (qi, (q, _)) in taken.iter().enumerate() {
+        let mut out = Vec::new();
+        for (c, _) in back.iter().filter(|(_, i)| *i == qi) {
+            out.extend(serde_json::to_vec(c).unwrap_or_default());
+            out.push(b'\n');
+        }
+        if out.is_empty() {
+            continue;
+        }
+        use std::io::Write;
+        if let Err(e) = append_options().open(q).and_then(|mut f| f.write_all(&out)) {
+            env.log(&format!("возврат очереди изменённых файлов: {e}"));
+        }
+    }
+    for (_, t) in &taken {
+        let _ = std::fs::remove_file(t);
+    }
+}
+
+/// Ответ, который повтор не исправит: 4xx, кроме 401, 408 и 429.
+fn permanent(e: &CliError) -> bool {
+    e.http_status()
+        .is_some_and(|s| (400..500).contains(&s) && !matches!(s, 401 | 408 | 429))
 }
 
 /// Массив строк JSON (остальное пропускается).
@@ -602,7 +636,9 @@ pub fn gc_cache(env: &Env) {
             || (n.starts_with("changed-") && n.ends_with(".jsonl"));
         let ttl = if session_file {
             SHOWN_TTL
-        } else if n.starts_with('.') && n.ends_with(".tmp") {
+        } else if n.starts_with('.')
+            && (n.ends_with(".tmp") || n.ends_with(".lock") || n.ends_with(".trimfail"))
+        {
             TMP_TTL
         } else {
             continue;

@@ -504,6 +504,9 @@ pub fn check(ctx: &Ctx, since: Option<&str>, solution: Option<&str>) -> Result<(
     }
     let mut send: Vec<(String, String)> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
+    // путь, который правила Windows отклоняют (устройство, поток), не открывается и не
+    // считается удалённым (fix round 1, M-5)
+    paths.retain(|(p, _)| local_rules(p, cfg!(windows)).is_ok_and(|l| l == *p));
     for (p, known) in &paths {
         let now = hash_rel(&root, p).unwrap_or_else(|| MISSING_HASH.to_string());
         match known {
@@ -613,11 +616,25 @@ pub fn add_frontmatter_refs(content: &str, paths: &[String]) -> Result<String, C
     let value = value.split(" #").next().unwrap_or("").trim();
     let mut have: Vec<String> = Vec::new();
     let mut last = k;
+    if value.starts_with(['|', '>']) {
+        return Err(CliError::input(
+            "refs: во frontmatter блочный скаляр (| или >), а нужен список путей — исправьте \
+             его вручную (refs:\n  - путь)",
+        ));
+    }
     if value.is_empty() {
+        // отступ новых пунктов — как у существующих (`- `, `  - `, `    -   `)
+        let mut lead: Option<String> = None;
         for (i, l) in lines.iter().enumerate().take(close).skip(k + 1) {
             let t = l.trim();
             if l.starts_with([' ', '\t', '-']) || t.is_empty() {
                 if let Some(v) = t.strip_prefix('-') {
+                    if lead.is_none() {
+                        let dash = l.find('-').unwrap_or(0);
+                        let after = l[dash + 1..].len() - l[dash + 1..].trim_start().len();
+                        let after = after.max(1).min(l.len() - dash - 1);
+                        lead = Some(l[..dash + 1 + after].trim_end_matches(['\r', '\n']).into());
+                    }
                     have.push(unquote(v.split(" #").next().unwrap_or("").trim()));
                     last = i;
                 }
@@ -625,9 +642,18 @@ pub fn add_frontmatter_refs(content: &str, paths: &[String]) -> Result<String, C
             }
             break;
         }
+        let lead = lead.unwrap_or_else(|| "  - ".into());
+        let lead = if lead.ends_with([' ', '\t']) {
+            lead
+        } else {
+            format!("{lead} ")
+        };
         let mut add = String::new();
         for p in paths.iter().filter(|p| !contains_path(&have, p)) {
-            add.push_str(&item(p));
+            add.push_str(&format!(
+                "{lead}{}",
+                serde_json::to_string(p).unwrap_or_default()
+            ));
             add.push_str(nl);
         }
         if !add.is_empty() {
@@ -645,8 +671,8 @@ pub fn add_frontmatter_refs(content: &str, paths: &[String]) -> Result<String, C
             ));
         };
         have.extend(
-            inner
-                .split(',')
+            split_flow(inner)
+                .iter()
                 .map(|s| unquote(s.trim()))
                 .filter(|s| !s.is_empty()),
         );
@@ -664,6 +690,41 @@ pub fn add_frontmatter_refs(content: &str, paths: &[String]) -> Result<String, C
     }
     out[k] = block;
     Ok(format!("{bom}{}", out.concat()))
+}
+
+/// Элементы flow-списка YAML `a, "b, c", 'd'` — запятая внутри кавычек не разделяет.
+fn split_flow(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some('"'), '\\') => {
+                cur.push(c);
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            // `''` внутри одинарных кавычек — сама кавычка
+            (Some('\''), '\'') if chars.peek() == Some(&'\'') => {
+                cur.push(c);
+                cur.push(chars.next().unwrap_or('\''));
+            }
+            (Some(q), c) if c == q => {
+                cur.push(c);
+                quote = None;
+            }
+            (None, '"' | '\'') => {
+                cur.push(c);
+                quote = Some(c);
+            }
+            (None, ',') => out.push(std::mem::take(&mut cur)),
+            (_, c) => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
 }
 
 fn contains_path(have: &[String], p: &str) -> bool {
@@ -803,5 +864,26 @@ mod tests {
         let s = add_frontmatter_refs("\u{feff}---\nl0: x\n---\nт\n", &p).unwrap();
         assert!(s.starts_with('\u{feff}'));
         assert!(add_frontmatter_refs("---\nrefs: [a,\n  b]\n---\n", &p).is_err());
+        // fix round 1, M-10: запятая в кавычках, отступ существующих пунктов, блочный скаляр
+        let s = add_frontmatter_refs("---\nrefs: [\"a, b.rs\", 'c''d.rs']\n---\nт\n", &p).unwrap();
+        assert_eq!(
+            fm_refs(&s),
+            ["a, b.rs", "c'd.rs", "src/a.rs", "docs/b c.md"]
+        );
+        let s = add_frontmatter_refs("---\nrefs:\n- x.rs\n---\nт\n", &p).unwrap();
+        assert!(
+            s.contains("\n- x.rs\n- \"src/a.rs\"\n- \"docs/b c.md\"\n"),
+            "{s}"
+        );
+        assert_eq!(fm_refs(&s), ["x.rs", "src/a.rs", "docs/b c.md"]);
+        let s = add_frontmatter_refs("---\nrefs:\n    -   x.rs\n---\nт\n", &p).unwrap();
+        assert!(s.contains("\n    -   \"src/a.rs\"\n"), "{s}");
+        for bad in [
+            "---\nrefs: |\n  a.rs\n---\n",
+            "---\nrefs: >-\n  a.rs\n---\n",
+        ] {
+            let e = add_frontmatter_refs(bad, &p).unwrap_err();
+            assert!(e.msg.contains("блочный скаляр"), "{}", e.msg);
+        }
     }
 }

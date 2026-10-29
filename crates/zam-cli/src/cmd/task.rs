@@ -237,6 +237,7 @@ pub fn status(
             }
         })?;
     let e = read_json(r)?;
+    ctx.note_write("task");
     if ctx.json {
         return emit_json(&e);
     }

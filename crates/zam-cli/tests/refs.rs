@@ -3,13 +3,12 @@
 //! `zam refs verify`, нормализация путей (Windows: регистр и `\`). Сервер — настоящий
 //! zam-server в процессе тестов (без моделей), кроме проверки тела запроса — там заглушка
 //! HTTP. Каталоги — в `CARGO_TARGET_TMPDIR`.
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener};
+mod common;
+
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::{Arc, Mutex};
 
-use assert_cmd::Command;
 use serde_json::{Value, json};
 use zam_server::build;
 use zam_server::config::ServerConfig;
@@ -64,53 +63,9 @@ fn start(name: &str) -> (String, String) {
     rx.recv().unwrap()
 }
 
-/// Запрос, принятый заглушкой: метод, путь, тело.
-type Seen = Arc<Mutex<Vec<(String, String, Value)>>>;
-
-/// Заглушка HTTP: на любой запрос — `201 {"id": "01X", "rev": 1}`; запросы — в `Seen`.
-fn stub() -> (String, Seen) {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
-    let seen: Seen = Arc::default();
-    let s2 = seen.clone();
-    std::thread::spawn(move || {
-        for conn in l.incoming().flatten() {
-            let mut r = BufReader::new(conn.try_clone().unwrap());
-            let mut line = String::new();
-            if r.read_line(&mut line).is_err() {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            let (m, p) = (
-                parts.next().unwrap_or("").to_string(),
-                parts.next().unwrap_or("").to_string(),
-            );
-            let mut len = 0usize;
-            loop {
-                let mut h = String::new();
-                if r.read_line(&mut h).is_err() || h.trim().is_empty() {
-                    break;
-                }
-                if let Some((k, v)) = h.split_once(':')
-                    && k.eq_ignore_ascii_case("content-length")
-                {
-                    len = v.trim().parse().unwrap_or(0);
-                }
-            }
-            let mut body = vec![0u8; len];
-            let _ = r.read_exact(&mut body);
-            let v = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            s2.lock().unwrap().push((m, p, v));
-            let resp = r#"{"id":"01X","rev":1}"#;
-            let mut c = conn;
-            let _ = write!(
-                c,
-                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
-                resp.len()
-            );
-        }
-    });
-    (url, seen)
+/// Заглушка HTTP: на любой запрос — `201 {"id": "01X", "rev": 1}`.
+fn stub() -> (String, common::Seen) {
+    common::stub(201, r#"{"id":"01X","rev":1}"#, std::time::Duration::ZERO)
 }
 
 struct Proj {
@@ -148,25 +103,7 @@ impl Proj {
 
     /// `zam <args>` с stdin в каталоге `cwd` (относительно корня проекта).
     fn zam_in(&self, cwd: &str, args: &[&str], stdin: &[u8]) -> Output {
-        let mut c = Command::cargo_bin("zam").unwrap();
-        for k in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
-            c.env_remove(k);
-        }
-        for k in zam_core::AGENT_ENV_VARS
-            .iter()
-            .chain(&zam_core::CLIENT_ENV_VARS)
-        {
-            c.env_remove(k);
-        }
+        let mut c = common::zam_cmd();
         c.env("ZAM_URL", &self.url)
             .env("ZAM_TOKEN", &self.token)
             .env("HOME", &self.home)

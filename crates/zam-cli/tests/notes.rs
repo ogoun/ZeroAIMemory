@@ -1,6 +1,7 @@
 //! Команды заметок `zam` (tree, read, write, history, search, attach) против настоящего
 //! zam-server в том же процессе тестов. Сервер крутится в отдельном потоке со своим
 //! рантаймом tokio, поэтому сами тесты синхронные.
+mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -10,10 +11,7 @@ use zam_server::build;
 use zam_server::config::ServerConfig;
 
 fn tmp(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-notes-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    common::sandbox("cli-notes", name)
 }
 
 /// Сервер на 127.0.0.1:0 в фоновом потоке; адрес и первый токен администратора.
@@ -64,19 +62,7 @@ impl Env {
 
     /// `zam` с чистым окружением: без прокси и ZAM_*, HOME и cwd — во временном каталоге.
     fn zam(&self) -> Command {
-        let mut c = Command::cargo_bin("zam").unwrap();
-        for k in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
-            c.env_remove(k);
-        }
+        let mut c = common::zam_cmd();
         c.env("ZAM_URL", &self.url)
             .env("ZAM_TOKEN", &self.token)
             .env("HOME", &self.cwd)
@@ -321,8 +307,7 @@ fn unreachable_server_exit_2() {
         l.local_addr().unwrap().port()
     };
     let cwd = tmp("down-cwd");
-    let o = Command::cargo_bin("zam")
-        .unwrap()
+    let o = common::zam_cmd()
         .env_remove("ZAM_URL")
         .env_remove("ZAM_TOKEN")
         .env("HOME", &cwd)

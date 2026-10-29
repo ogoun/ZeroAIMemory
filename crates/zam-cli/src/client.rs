@@ -44,6 +44,15 @@ impl CliError {
         CliError::new(EXIT_INPUT, msg)
     }
 
+    /// HTTP-статус ответа сервера с ошибкой (`problem.status`); сеть, разбор — `None`.
+    pub fn http_status(&self) -> Option<u16> {
+        self.problem
+            .as_ref()?
+            .get("status")?
+            .as_u64()
+            .and_then(|s| u16::try_from(s).ok())
+    }
+
     /// Уточнение: «<ctx>: <текст>».
     pub fn context(mut self, ctx: impl fmt::Display) -> CliError {
         self.msg = format!("{ctx}: {}", self.msg);
@@ -360,7 +369,7 @@ fn problem(mut resp: Response<Body>) -> CliError {
         .limit(BODY_MAX)
         .read_to_string()
         .unwrap_or_default();
-    let v: Option<Value> = serde_json::from_str(&text).ok();
+    let mut v: Option<Value> = serde_json::from_str(&text).ok();
     let detail = v
         .as_ref()
         .and_then(|v| v.get("detail"))
@@ -378,6 +387,13 @@ fn problem(mut resp: Response<Body>) -> CliError {
         401 => "токен отклонён сервером".to_string(),
         _ => format!("{detail} (HTTP {status})"),
     };
+    // статус — всегда в `problem` ([`CliError::http_status`]): у тела не problem+json тоже
+    match v.as_mut() {
+        Some(Value::Object(o)) => {
+            o.entry("status").or_insert(Value::from(status));
+        }
+        _ => v = Some(serde_json::json!({ "status": status })),
+    }
     CliError {
         code,
         msg,

@@ -3,6 +3,7 @@
 //! напоминание `checkpoint` (R1), переключатели (R5), fail-open и время (R3: `pre-tool` ≤ 200 мс
 //! p95, остальные ≤ 1 с). Сервер без моделей (поиск — FTS). Каталоги проекта и «домашний» — во
 //! временном каталоге целей сборки (`CARGO_TARGET_TMPDIR`), не в профиле пользователя.
+mod common;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Output;
@@ -136,27 +137,7 @@ impl Proj {
     }
 
     fn cmd(&self, url: &str) -> Command {
-        let mut c = Command::cargo_bin("zam").unwrap();
-        for k in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
-            c.env_remove(k);
-        }
-        // окружение агента и клиентские переменные `zam` (`ZAM_SESSION`, `ZAM_AGENT`,
-        // `ZAM_MACHINE`), в котором идут сами тесты, не должны утекать в `zam` — общий список
-        for k in zam_core::AGENT_ENV_VARS
-            .iter()
-            .chain(&zam_core::CLIENT_ENV_VARS)
-        {
-            c.env_remove(k);
-        }
+        let mut c = common::zam_cmd();
         c.env("ZAM_URL", url)
             .env("ZAM_TOKEN", &self.token)
             .env("HOME", &self.home)
@@ -1812,4 +1793,173 @@ fn cli_memory_write_only_into_existing_journal() {
     let ev = events(&p, "mw1");
     assert_eq!(ev.last().unwrap()["ev"], "memory_write", "{ev:?}");
     assert_eq!(ev.last().unwrap()["kind"], "changelog");
+}
+
+// ---------- fix round 1 задачи 8 ----------
+
+/// I-1: успешный Bash у Claude Code со stderr (предупреждения, прогресс) — успех: `cmd {ok:
+/// true}`, ни `error`, ни запроса к серверу.
+#[test]
+fn claude_bash_stderr_on_success_is_not_error() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, "{}", Duration::ZERO);
+    let p = Proj::new("claude-stderr", &url, "zam_x");
+    let ev = p.ev(
+        "PostToolUse",
+        "cs",
+        json!({"tool_name": "Bash", "tool_input": {"command": "cargo build"},
+               "tool_response": {"stdout": "", "stderr": "warning: unused variable",
+                                 "interrupted": false}}),
+    );
+    empty(
+        &p.hook_at(&url, "post-tool", "claude", ev.to_string().as_bytes())
+            .0,
+    );
+    let ev = events(&p, "cs");
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(
+        (ev[0]["ev"].as_str(), ev[0]["ok"].as_bool()),
+        (Some("cmd"), Some(true))
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+    // Codex с кодом выхода 0 — тоже успех
+    let cx = p.ev(
+        "PostToolUse",
+        "cs",
+        json!({"tool_name": "Bash", "tool_input": {"command": "make"},
+               "tool_response": {"stdout": "", "stderr": "make: progress", "exit_code": 0}}),
+    );
+    empty(
+        &p.hook_at(&url, "post-tool", "codex", cx.to_string().as_bytes())
+            .0,
+    );
+    assert_eq!(events(&p, "cs").last().unwrap()["ok"], true);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// Очередь `changed-<сессия>.jsonl` вручную (имя — как у хуков: очищенный id и 8 hex blake3).
+fn put_queue(p: &Proj, session: &str, files: &[(String, char)]) {
+    std::fs::create_dir_all(p.cache()).unwrap();
+    let mut s = String::new();
+    for (path, h) in files {
+        s.push_str(&json!({"path": path, "hash": h.to_string().repeat(64)}).to_string());
+        s.push('\n');
+    }
+    let part = format!("{session}-{}", &blake(session.as_bytes())[..8]);
+    std::fs::write(p.cache().join(format!("changed-{part}.jsonl")), s).unwrap();
+}
+
+/// I-2: пять очередей — один `POST /files/changed` (повтор пути — последний хэш), очереди
+/// очищены; медленный сервер — `session-start` укладывается в бюджет, очереди целы.
+#[test]
+fn session_start_flushes_all_queues_in_one_request() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"stale":0,"text":""}"#, Duration::ZERO);
+    let p = Proj::new("flush-one", &url, "zam_x");
+    let hashes = ['a', 'b', 'c', 'd', 'e'];
+    for (i, h) in hashes.iter().enumerate() {
+        put_queue(
+            &p,
+            &format!("q{i}"),
+            &[("src/common.rs".into(), *h), (format!("src/f{i}.rs"), 'f')],
+        );
+    }
+    let ss = p.ev("SessionStart", "q-new", json!({"source": "startup"}));
+    let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+    let s = seen.lock().unwrap().clone();
+    let posts: Vec<&Value> = s
+        .iter()
+        .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+        .map(|(_, _, b)| b)
+        .collect();
+    assert_eq!(posts.len(), 1, "{s:?}");
+    let files = posts[0]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 6, "{files:?}");
+    assert_eq!(
+        files
+            .iter()
+            .filter(|f| f["path"] == "src/common.rs")
+            .count(),
+        1
+    );
+    for i in 0..5 {
+        assert!(
+            queue(&p, &format!("q{i}")).is_empty(),
+            "очередь q{i} отправлена"
+        );
+    }
+    // медленный сервер: в бюджете, очереди возвращены
+    let (slow, slow_seen) = common::stub(200, r#"{"stale":0}"#, Duration::from_secs(3));
+    let p = Proj::new("flush-slow", &slow, "zam_x");
+    for i in 0..5 {
+        put_queue(&p, &format!("s{i}"), &[(format!("src/f{i}.rs"), 'b')]);
+    }
+    let ss = p.ev("SessionStart", "s-new", json!({"source": "startup"}));
+    let (_, d) = p.hook_at(&slow, "session-start", "claude", ss.to_string().as_bytes());
+    assert!(d <= max_for("session-start"), "session-start {d:?}");
+    let posts = slow_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, path, _)| path == "/api/v1/files/changed")
+        .count();
+    assert!(posts <= 1, "не больше одного запроса: {posts}");
+    let left: usize = (0..5).map(|i| queue(&p, &format!("s{i}")).len()).sum();
+    assert_eq!(left, 5, "тайм-аут — очереди целы");
+}
+
+/// M-6: постоянная ошибка 4xx — очередь отбрасывается со строкой в `hooks.log`; 429 — остаётся.
+#[test]
+fn changed_queue_dropped_on_permanent_4xx() {
+    let _g = serial();
+    let (url, _) = common::stub(
+        422,
+        r#"{"type":"/problems/unprocessable","status":422,"detail":"files[0]: путь"}"#,
+        Duration::ZERO,
+    );
+    let p = Proj::new("flush-422", &url, "zam_x");
+    put_queue(&p, "d1", &[("src/a.rs".into(), 'a')]);
+    let pr = p.ev("UserPromptSubmit", "d1", json!({"prompt": "x"}));
+    let _ = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
+    assert!(queue(&p, "d1").is_empty());
+    assert!(p.log().contains("отброшена"), "{}", p.log());
+    let (url, _) = common::stub(
+        429,
+        r#"{"status":429,"detail":"медленнее"}"#,
+        Duration::ZERO,
+    );
+    let p = Proj::new("flush-429", &url, "zam_x");
+    put_queue(&p, "d2", &[("src/a.rs".into(), 'a')]);
+    let pr = p.ev("UserPromptSubmit", "d2", json!({"prompt": "x"}));
+    let _ = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
+    assert_eq!(queue(&p, "d2").len(), 1, "429 — повтор позже");
+}
+
+/// M-8: отказ `apply_patch` (Codex, stderr) ставит пути патча в очередь — патч мог
+/// примениться частично.
+#[test]
+fn failed_apply_patch_still_queues_paths() {
+    let _g = serial();
+    let p = Proj::new("patch-fail", DEAD, "zam_x");
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/a.rs"), b"half\n").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-a\n+b\n\
+                 *** Update File: src/b.rs\n*** End Patch\n";
+    let ev = p.ev(
+        "PostToolUse",
+        "pf",
+        json!({"tool_name": "apply_patch", "tool_input": {"command": patch},
+               "tool_response": {"stdout": "", "stderr": "error: hunk failed", "exit_code": 1}}),
+    );
+    let _ = p.hook_at(DEAD, "post-tool", "codex", ev.to_string().as_bytes());
+    let q = queue(&p, "pf");
+    assert_eq!(q.len(), 2, "{q:?}");
+    assert_eq!(q[0], json!({"path": "src/a.rs", "hash": blake(b"half\n")}));
+    assert_eq!(q[1]["hash"], "0".repeat(64));
+    let ev = events(&p, "pf");
+    assert_eq!(ev[0]["ev"], "error", "{ev:?}");
 }

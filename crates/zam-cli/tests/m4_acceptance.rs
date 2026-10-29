@@ -17,6 +17,7 @@
 //!
 //! Сервер — без моделей (поиск FTS-only): цифры с bge-m3 на CPU сняты `cargo xtask eval --hints`
 //! (задача 15) и записаны в журнал этапа. Каталоги — в `CARGO_TARGET_TMPDIR`.
+mod common;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -403,30 +404,7 @@ impl Proj {
     }
 
     fn cmd(&self, url: &str) -> Command {
-        let mut c = Command::cargo_bin("zam").unwrap();
-        for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("ZAM_")) {
-            c.env_remove(k);
-        }
-        for k in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
-            c.env_remove(k);
-        }
-        // окружение агента, в котором идут сами тесты, не должно утекать в `zam` (тот же список,
-        // что у smoke комплекта и eval хуков)
-        for k in zam_core::AGENT_ENV_VARS
-            .iter()
-            .chain(&zam_core::CLIENT_ENV_VARS)
-        {
-            c.env_remove(k);
-        }
+        let mut c = common::zam_cmd();
         c.env("ZAM_URL", url)
             .env("ZAM_TOKEN", &self.token)
             .env("HOME", &self.home)

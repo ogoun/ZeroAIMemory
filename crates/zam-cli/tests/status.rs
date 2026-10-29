@@ -1,4 +1,5 @@
 //! `zam status` против настоящего zam-server в том же процессе тестов.
+mod common;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -7,10 +8,7 @@ use zam_server::build;
 use zam_server::config::ServerConfig;
 
 fn tmp(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    common::sandbox("cli", name)
 }
 
 /// Поднимает сервер на 127.0.0.1:0; возвращает адрес и первый токен администратора.
@@ -36,19 +34,7 @@ async fn start(name: &str) -> (String, String) {
 /// `zam` с чистым окружением: без ZAM_*, HOME и cwd — во временном каталоге.
 fn zam(name: &str) -> Command {
     let dir = tmp(&format!("{name}-cwd"));
-    let mut c = Command::cargo_bin("zam").unwrap();
-    for k in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    ] {
-        c.env_remove(k);
-    }
+    let mut c = common::zam_cmd();
     c.env_remove("ZAM_URL")
         .env_remove("ZAM_TOKEN")
         .env("HOME", &dir)

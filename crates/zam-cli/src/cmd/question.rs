@@ -251,6 +251,7 @@ pub fn answer(
         )
         .map_err(explain_answered)?;
     let v = read_json(r)?;
+    ctx.note_write("question");
     if ctx.json {
         return emit_json(&v);
     }

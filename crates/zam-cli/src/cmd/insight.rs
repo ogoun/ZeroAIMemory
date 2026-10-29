@@ -341,7 +341,9 @@ fn patch_entry(ctx: &Ctx, id: &str, rev: i64, body: &Value) -> Result<Value, Cli
         .client
         .patch_json_if(&format!("/entries/{id}"), body, rev)
         .map_err(|e| explain_stale(e, rev))?;
-    read_json(r)
+    let v = read_json(r)?;
+    ctx.note_write("insight");
+    Ok(v)
 }
 
 /// `zam insight show <id>`.
@@ -403,6 +405,7 @@ pub fn supersede(ctx: &Ctx, id: &str, f: &Fields) -> Result<(), CliError> {
     )?;
     let created = r.status().as_u16() == 201;
     let v = read_json(r)?;
+    ctx.note_write("insight");
     if ctx.json {
         return emit_json(
             &json!({ "entry": v["entry"], "superseded": v["superseded"], "created": created }),
@@ -440,7 +443,9 @@ pub fn retract(ctx: &Ctx, id: &str, reason: &str) -> Result<(), CliError> {
         &format!("/entries/{id}/retract"),
         &json!({ "reason": reason }),
     )?;
-    emit_changed(ctx, &read_json(r)?)
+    let e = read_json(r)?;
+    ctx.note_write("insight");
+    emit_changed(ctx, &e)
 }
 
 /// `zam insight revisit <id> [--reason R]`.

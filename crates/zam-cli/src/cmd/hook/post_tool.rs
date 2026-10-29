@@ -29,7 +29,7 @@ use super::input::Input;
 use super::journal::{self, Ev};
 use super::output::Output;
 use super::pre_tool::{is_edit_tool, patch_files};
-use super::{Env, Flag, Kind, Settings, head_bytes};
+use super::{Agent, Env, Flag, Kind, Settings, head_bytes};
 use crate::client::read_json;
 use crate::cmd::refs::{self, MISSING_HASH};
 
@@ -46,12 +46,15 @@ const REGEX_SIZE_LIMIT: usize = 1 << 20;
 /// Начало строки подсказки об ошибке (как у сервера).
 const LEAD: &str = "эта ошибка уже разбиралась: ";
 
-/// Текст ошибки из stdin: `error` у `PostToolUseFailure`, `tool_response.stderr` у
-/// `PostToolUse` (у Codex `tool_response` бывает строкой JSON — она разбирается).
-pub fn error_text(inp: &Input) -> Option<String> {
+/// Текст ошибки из stdin (fix round 1, I-1): у Claude Code — только `PostToolUseFailure.error`
+/// (успешный Bash со stderr — успех: предупреждения компиляторов и прогресс идут в stderr); у
+/// Codex — непустой `PostToolUse.tool_response.stderr` (`tool_response` бывает строкой JSON — она
+/// разбирается), а если в ответе есть код выхода (`exit_code`, `exitCode`, `metadata.exit_code`),
+/// — только при ненулевом.
+pub fn error_text(inp: &Input, agent: Agent) -> Option<String> {
     let s = if inp.event == "PostToolUseFailure" {
         inp.str("error").map(str::to_string)
-    } else {
+    } else if agent == Agent::Codex {
         let tr = inp.v.get("tool_response")?;
         let parsed;
         let obj = match tr {
@@ -61,15 +64,23 @@ pub fn error_text(inp: &Input) -> Option<String> {
             }
             v => v,
         };
+        let code = ["/exit_code", "/exitCode", "/metadata/exit_code"]
+            .iter()
+            .find_map(|p| obj.pointer(p).and_then(Value::as_i64));
+        if code == Some(0) {
+            return None;
+        }
         obj.get("stderr")
             .and_then(Value::as_str)
             .map(str::to_string)
+    } else {
+        None
     };
     s.filter(|e| !e.trim().is_empty())
 }
 
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
-    match error_text(inp) {
+    match error_text(inp, env.agent) {
         Some(error) => failure(env, inp, s, &error),
         None if inp.event == "PostToolUse" => success(env, inp, s),
         None => Output::Empty,
@@ -90,10 +101,15 @@ fn command_of(inp: &Input) -> Option<String> {
 fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
     let error = head_bytes(error, ERROR_SCAN_MAX);
     let tool = inp.str("tool_name").filter(|t| !t.is_empty());
+    if let (Some(t), Some(id)) = (tool, inp.session_id.as_deref())
+        && is_edit_tool(t)
+    {
+        record_edits(env, s, inp, t, id, false);
+    }
     if let Some(session) = inp.session_id.as_deref()
         && s.flag_on(Flag::SessionJournal)
     {
-        let norm = journal::normalize_error(error);
+        let norm = journal::mask_secrets(&journal::normalize_error(error));
         let fp = journal::err_fingerprint(&norm);
         journal::note(
             env,
@@ -213,28 +229,9 @@ fn success(env: &Env, inp: &Input, s: &Settings) -> Output {
             Output::context(&inp.event, &lines.join("\n"))
         }
         t if is_edit_tool(t) => {
-            let Some(id) = session else {
-                return Output::Empty;
-            };
-            if s.on(Kind::Checkpoint) {
-                cache::mark_edits(env, id);
+            if let Some(id) = session {
+                record_edits(env, s, inp, tool, id, journal_on);
             }
-            let rels = rels();
-            let mut queue = Vec::new();
-            for p in &rels {
-                if journal_on {
-                    journal::note(env, id, &Ev::Edit { path: p.clone() });
-                }
-                if env.solution.is_some()
-                    && let Some(hash) = edited_hash(env, p)
-                {
-                    queue.push(cache::Changed {
-                        path: p.clone(),
-                        hash,
-                    });
-                }
-            }
-            cache::queue_changed(env, id, &queue);
             Output::Empty
         }
         "Bash" => {
@@ -255,6 +252,34 @@ fn success(env: &Env, inp: &Input, s: &Settings) -> Output {
         }
         _ => Output::Empty,
     }
+}
+
+/// Правка файлов инструментом `tool`: маркер правок, `Ev::Edit` по каждому пути (`journal_on`)
+/// и очередь `{path, hash}` (при решении). Вызывается и на отказ правки (fix round 1, M-8):
+/// патч мог примениться частично.
+fn record_edits(env: &Env, s: &Settings, inp: &Input, tool: &str, id: &str, journal_on: bool) {
+    if s.on(Kind::Checkpoint) {
+        cache::mark_edits(env, id);
+    }
+    let rels: Vec<String> = tool_files(inp, tool)
+        .iter()
+        .filter_map(|f| refs::ref_path(f, &env.cwd, &env.root).ok())
+        .collect();
+    let mut queue = Vec::new();
+    for p in &rels {
+        if journal_on {
+            journal::note(env, id, &Ev::Edit { path: p.clone() });
+        }
+        if env.solution.is_some()
+            && let Some(hash) = edited_hash(env, p)
+        {
+            queue.push(cache::Changed {
+                path: p.clone(),
+                hash,
+            });
+        }
+    }
+    cache::queue_changed(env, id, &queue);
 }
 
 /// Хэш правленого файла для очереди: нет файла — [`MISSING_HASH`], больше [`HASH_MAX`] или
@@ -402,15 +427,27 @@ mod tests {
 
     #[test]
     fn error_from_failure_and_stderr() {
+        let (cl, cx) = (Agent::Claude, Agent::Codex);
         let f = inp(r#"{"hook_event_name":"PostToolUseFailure","error":"Exit code 1\nbad"}"#);
-        assert_eq!(error_text(&f).as_deref(), Some("Exit code 1\nbad"));
+        assert_eq!(error_text(&f, cl).as_deref(), Some("Exit code 1\nbad"));
         let c = inp(
             r#"{"hook_event_name":"PostToolUse","tool_response":{"stdout":"","stderr":"boom"}}"#,
         );
-        assert_eq!(error_text(&c).as_deref(), Some("boom"));
+        assert_eq!(error_text(&c, cx).as_deref(), Some("boom"));
+        // у Claude Code stderr успешной команды — не ошибка
+        assert_eq!(error_text(&c, cl), None);
         let st = inp(r#"{"hook_event_name":"PostToolUse","tool_response":"{\"stderr\":\"x\"}"}"#);
-        assert_eq!(error_text(&st).as_deref(), Some("x"));
+        assert_eq!(error_text(&st, cx).as_deref(), Some("x"));
         let ok = inp(r#"{"hook_event_name":"PostToolUse","tool_response":{"stderr":"  "}}"#);
-        assert_eq!(error_text(&ok), None);
+        assert_eq!(error_text(&ok, cx), None);
+        // код выхода 0 — успех и со stderr, ненулевой — ошибка
+        let z = inp(
+            r#"{"hook_event_name":"PostToolUse","tool_response":{"stderr":"warn","exit_code":0}}"#,
+        );
+        assert_eq!(error_text(&z, cx), None);
+        let n = inp(
+            r#"{"hook_event_name":"PostToolUse","tool_response":{"stderr":"e","metadata":{"exit_code":2}}}"#,
+        );
+        assert_eq!(error_text(&n, cx).as_deref(), Some("e"));
     }
 }

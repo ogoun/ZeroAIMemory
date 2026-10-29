@@ -28,6 +28,8 @@ pub const TRIM_TO: u64 = 512 * 1024;
 pub const ERROR_TEXT_MAX: usize = 200;
 /// Брошенный замок усечения старше — снимается.
 pub const LOCK_TTL: Duration = Duration::from_secs(10);
+/// После неудачного усечения следующая попытка — не раньше.
+pub const TRIM_RETRY: Duration = Duration::from_secs(60);
 /// Предел чтения журнала, байт (файл не должен быть больше; лишнее с головы не читается).
 #[allow(dead_code)]
 const READ_MAX: u64 = 2 * FILE_MAX;
@@ -189,51 +191,74 @@ pub fn note(env: &super::Env, session: &str, ev: &Ev) {
     }
 }
 
-/// Усечение головы до ≤ [`TRIM_TO`] по границе строки: временный файл и rename под замком.
+/// Усечение головы до ≤ [`TRIM_TO`] по границе строки: временный файл и rename под замком
+/// (0600 на unix). Читается только хвост — последние [`TRIM_TO`] байт, не весь растущий файл
+/// (fix round 1, M-11). Неудачный rename (файл держит другой процесс) оставляет метку
+/// `.events-….trimfail`: следующие [`TRIM_RETRY`] попытки не делаются, `append` не перечитывает
+/// файл на каждой строке. Окно потери: строка, дописанная другим процессом между чтением хвоста и
+/// rename, теряется — принятая цена записи без блокировки на горячем пути (журнал этапа).
 fn trim(p: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("events");
     let dir = p.parent().unwrap_or(Path::new("."));
+    let fail = dir.join(format!(".{name}.trimfail"));
+    if age(&fail).is_some_and(|a| a < TRIM_RETRY) {
+        return Ok(());
+    }
     let lock = dir.join(format!(".{name}.lock"));
-    let stale = std::fs::metadata(&lock)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age > LOCK_TTL);
-    if stale {
+    if age(&lock).is_some_and(|a| a > LOCK_TTL) {
         let _ = std::fs::remove_file(&lock);
     }
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-        .is_err()
-    {
+    if lock_options().open(&lock).is_err() {
         // усекает другой процесс
         return Ok(());
     }
     let r = (|| {
-        let bytes = std::fs::read(p)?;
-        if (bytes.len() as u64) <= FILE_MAX {
+        let mut f = std::fs::File::open(p)?;
+        let len = f.metadata()?.len();
+        if len <= FILE_MAX {
             return Ok(());
         }
-        let start = bytes.len() - TRIM_TO as usize;
+        f.seek(SeekFrom::Start(len - TRIM_TO))?;
+        let mut tail = Vec::with_capacity(TRIM_TO as usize);
+        f.take(TRIM_TO).read_to_end(&mut tail)?;
         // первая целая строка после точки отреза
-        let cut = bytes[start..]
+        let cut = tail
             .iter()
             .position(|b| *b == b'\n')
-            .map_or(bytes.len(), |i| start + i + 1);
-        let keep = &bytes[cut..];
+            .map_or(tail.len(), |i| i + 1);
         let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
         {
-            let mut f = super::cache::private_options().open(&tmp)?;
-            f.write_all(keep)?;
+            let mut t = super::cache::private_options().open(&tmp)?;
+            t.write_all(&tail[cut..])?;
         }
         std::fs::rename(&tmp, p).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
+            let _ = super::cache::private_options().open(&fail);
         })
     })();
     let _ = std::fs::remove_file(&lock);
+    if r.is_ok() {
+        let _ = std::fs::remove_file(&fail);
+    }
     r
+}
+
+/// Возраст файла по времени изменения; нет файла — `None`.
+fn age(p: &Path) -> Option<Duration> {
+    std::fs::metadata(p).ok()?.modified().ok()?.elapsed().ok()
+}
+
+/// Создание файла замка: только новый, на unix — 0600.
+fn lock_options() -> std::fs::OpenOptions {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
 }
 
 /// События журнала по порядку записи; битые строки пропускаются. Читатели — восстановление
@@ -329,16 +354,165 @@ pub fn error_text(normalized: &str) -> String {
     normalized.chars().take(ERROR_TEXT_MAX).collect()
 }
 
-/// Первое слово команды без аргументов и пути (`FOO=1 /usr/bin/git push` → `git`), до 64
-/// символов; пусто — `None`.
+/// Слова команды с учётом кавычек `"…"` и `'…'` (и `\\` вне одинарных) — грубый разбор
+/// shell, достаточный для первого слова.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            // в двойных кавычках `\` экранирует только `"`, `\`, `$` и `` ` `` (POSIX):
+            // `"C:\Tools\zam.exe"` остаётся путём Windows
+            (Some('"'), '\\') => match chars.clone().next() {
+                Some(n @ ('"' | '\\' | '$' | '`')) => {
+                    chars.next();
+                    cur.push(n);
+                }
+                _ => cur.push('\\'),
+            },
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
+/// Присваивание окружения перед командой: `ИМЯ=…` (имя — `[A-Za-z_][A-Za-z0-9_]*`).
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut cs = name.chars();
+    cs.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Первое слово команды без аргументов и пути (`FOO="a b" /usr/bin/git push` → `git`), до 64
+/// символов; пусто — `None`. Слова — с учётом кавычек (fix round 1, M-3).
 pub fn exe_of(command: &str) -> Option<String> {
-    let word = command
-        .split_whitespace()
-        .find(|w| !(w.contains('=') && !w.starts_with(['"', '\''])))?;
-    let word = word.trim_matches(['"', '\'']);
+    let words = shell_words(command);
+    let word = words.iter().find(|w| !is_assignment(w))?;
     let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
     let base: String = base.chars().take(64).collect();
     (!base.is_empty()).then_some(base)
+}
+
+/// Замена секрета в тексте ошибки события.
+pub const SECRET: &str = "‹secret›";
+
+/// Ключ похож на секрет: содержит `token`, `secret`, `password`, `passwd`, `api_key`/`apikey`
+/// или равен `authorization` (без учёта регистра, `-` как `_`).
+fn secret_key(k: &str) -> bool {
+    let k = k
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .to_lowercase()
+        .replace('-', "_");
+    !k.is_empty()
+        && (["token", "secret", "password", "passwd", "api_key", "apikey"]
+            .iter()
+            .any(|w| k.contains(w))
+            || k == "authorization")
+}
+
+/// Длинный (≥ 32) высокоэнтропийный токен: символы base64/hex/`-_.`, буквы и цифры вперемешку,
+/// энтропия Шеннона ≥ 3,5 бита на символ.
+fn high_entropy(t: &str) -> bool {
+    let t = t.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | '(' | '[' | ']'));
+    if t.chars().count() < 32
+        || !t
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_' | '.'))
+        || !t.chars().any(|c| c.is_ascii_digit())
+        || !t.chars().any(|c| c.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    let mut freq = std::collections::HashMap::new();
+    for c in t.chars() {
+        *freq.entry(c).or_insert(0usize) += 1;
+    }
+    let n = t.chars().count() as f64;
+    let h: f64 = freq
+        .values()
+        .map(|&k| {
+            let p = k as f64 / n;
+            -p * p.log2()
+        })
+        .sum();
+    h >= 3.5
+}
+
+/// Маскирует секреты в тексте ошибки перед записью в журнал (fix round 1, M-4; в `zam-cli` нет
+/// сканера секретов `zam-markdown` — простая функция): `ключ=значение` и `ключ: значение` для
+/// ключей [`secret_key`], `Bearer <…>`/`Basic <…>` и длинные высокоэнтропийные токены →
+/// [`SECRET`].
+pub fn mask_secrets(text: &str) -> String {
+    let words: Vec<&str> = text.split(' ').collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut mask_next = false;
+    for w in words {
+        if mask_next && !w.is_empty() {
+            // `Authorization: Bearer <…>` — схема остаётся, маскируется значение
+            if matches!(w.to_ascii_lowercase().as_str(), "bearer" | "basic") {
+                out.push(w.to_string());
+            } else {
+                out.push(SECRET.to_string());
+                mask_next = false;
+            }
+            continue;
+        }
+        if let Some((k, v)) = w.split_once(['=', ':'])
+            && secret_key(k)
+        {
+            if v.is_empty() {
+                // `password: x`, `token= x`
+                out.push(w.to_string());
+                mask_next = true;
+            } else {
+                let sep = &w[k.len()..k.len() + 1];
+                out.push(format!("{k}{sep}{SECRET}"));
+            }
+            continue;
+        }
+        let lw = w.to_ascii_lowercase();
+        if lw == "bearer" || lw == "basic" {
+            out.push(w.to_string());
+            mask_next = true;
+            continue;
+        }
+        if secret_key(w) && w.ends_with(':') {
+            out.push(w.to_string());
+            mask_next = true;
+            continue;
+        }
+        if high_entropy(w) {
+            out.push(SECRET.to_string());
+            continue;
+        }
+        out.push(w.to_string());
+    }
+    out.join(" ")
 }
 
 #[cfg(test)]
@@ -553,6 +727,47 @@ mod tests {
             assert!(!text.contains(leak), "{leak}: {text}");
         }
         assert!(text.contains("\"exe\":\"curl\""), "{text}");
+    }
+
+    #[test]
+    fn exe_of_quoted_assignments() {
+        assert_eq!(exe_of("API_KEY=\"sk live\" make").as_deref(), Some("make"));
+        assert_eq!(
+            exe_of("GIT_AUTHOR_NAME=\"John Doe\" git commit -m 'x y'").as_deref(),
+            Some("git")
+        );
+        assert_eq!(
+            exe_of("A='1 2' B=3 ./run.sh --x").as_deref(),
+            Some("run.sh")
+        );
+        assert_eq!(
+            exe_of("\"/opt/my tools/bin/cargo\" test").as_deref(),
+            Some("cargo")
+        );
+        // `=` не в имени переменной — команда
+        assert_eq!(exe_of("--x=1 foo").as_deref(), Some("--x=1"));
+        assert_eq!(exe_of("A=1"), None);
+    }
+
+    #[test]
+    fn secrets_masked_in_error_text() {
+        let m = mask_secrets(
+            "fail token=abc123 api_key: sk-live-1 password=hunter2 Authorization: Bearer eyJhbGciOiJIUzI1 x",
+        );
+        for leak in ["abc123", "sk-live-1", "hunter2", "eyJhbGciOiJIUzI1"] {
+            assert!(!m.contains(leak), "{leak}: {m}");
+        }
+        assert!(m.contains("token=‹secret›"), "{m}");
+        assert!(m.starts_with("fail ") && m.ends_with(" x"), "{m}");
+        let k = mask_secrets("key AKIAIOSFODNN7EXAMPLEwJalrXUtnFEMIK7MDENGbPxRfiCY rejected");
+        assert_eq!(k, "key ‹secret› rejected");
+        // обычные слова и пути не трогаются
+        let plain = "error: <path> line <n> at <hex> cannot find module_resolution_strategy";
+        assert_eq!(mask_secrets(plain), plain);
+        assert_eq!(
+            mask_secrets("MY_SECRET_TOKEN=x1"),
+            "MY_SECRET_TOKEN=‹secret›"
+        );
     }
 
     #[test]

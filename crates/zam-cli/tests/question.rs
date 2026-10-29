@@ -1,11 +1,11 @@
 //! `zam question` против настоящего zam-server в том же процессе тестов (M4.5 §4): постановка с
 //! вариантами, дубликат (код 4, ответ отвеченного), лента, ответ (`--option`, `--text`,
 //! `--channel`), повторный ответ (код 4), `--json`. Сервер без моделей.
+mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use assert_cmd::Command;
 use zam_server::build;
 use zam_server::config::ServerConfig;
 use zam_store::Access;
@@ -13,10 +13,7 @@ use zam_store::Access;
 const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e51";
 
 fn tmp(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-question-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    common::sandbox("cli-question", name)
 }
 
 /// Сервер в фоновом потоке: адрес и токен `rw` пользователя «Анна».
@@ -51,19 +48,7 @@ fn start(name: &str) -> (String, String) {
 }
 
 fn zam(url: &str, token: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
-    let mut c = Command::cargo_bin("zam").unwrap();
-    for k in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    ] {
-        c.env_remove(k);
-    }
+    let mut c = common::zam_cmd();
     c.env("ZAM_URL", url)
         .env("ZAM_TOKEN", token)
         .env("HOME", cwd)

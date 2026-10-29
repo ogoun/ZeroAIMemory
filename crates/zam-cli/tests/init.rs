@@ -3,6 +3,7 @@
 //! временном каталоге целей сборки (`CARGO_TARGET_TMPDIR`); в проекте есть `.git`, чтобы корень
 //! не поднялся до репозитория ZeroAIMemory. Реальные CLAUDE.md, `.claude` и профиль
 //! пользователя не трогаются.
+mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -76,29 +77,7 @@ impl Proj {
 
     /// `zam` в проекте с чистым окружением (без ZAM_* и переменных агента).
     fn cmd(&self) -> Command {
-        let mut c = Command::cargo_bin("zam").unwrap();
-        for k in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-            "ZAM_URL",
-            "ZAM_TOKEN",
-        ] {
-            c.env_remove(k);
-        }
-        // окружение агента и клиентские переменные `zam` (`ZAM_SESSION`, `ZAM_AGENT`,
-        // `ZAM_MACHINE`), в котором идут сами тесты, не должны утекать в `zam` — общий список
-        for k in zam_core::AGENT_ENV_VARS
-            .iter()
-            .chain(&zam_core::CLIENT_ENV_VARS)
-        {
-            c.env_remove(k);
-        }
+        let mut c = common::zam_cmd();
         c.env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("COMPUTERNAME", "init-box")
