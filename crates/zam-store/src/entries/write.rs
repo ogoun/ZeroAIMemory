@@ -9,14 +9,17 @@ use zam_core::{Id, TargetKind, TargetRef};
 use super::chunks::{entry_index_state, index_entry_now, unindex_entry};
 use super::{
     AREA_MAX_CHARS, Certainty, Entry, EntryKind, EntryPatch, EntryStatus, KEY_MAX_CHARS, NewEntry,
-    REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, check_triggers, load_entry,
-    normalize_title, replace_triggers, same_triggers,
+    REASON_MAX_CHARS, TAG_MAX_CHARS, TAGS_MAX, TITLE_MAX_CHARS, allowed_statuses, check_triggers,
+    has_certainty, initial_status, load_entry, normalize_title, replace_triggers, same_triggers,
 };
 use crate::cache::StaleKind;
 use crate::certainty::{
     CertaintyChange, Evidence, check_certainty, check_final_state, default_certainty,
 };
+use crate::glossary::{check_term, ensure_names_free, terms_written};
 use crate::nodes::{Attribution, AuthorKind};
+use crate::questions::{QuestionData, check_question, check_question_transition};
+use crate::tasks::{TaskData, check_task, check_task_transition};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
@@ -246,25 +249,34 @@ fn ensure_release_version_free(
     Ok(())
 }
 
-/// Статус новой записи: у insight — `active` по умолчанию, `active` или `revisit`; у
-/// остальных видов статуса нет.
+/// Статус новой записи: без явного — [`initial_status`] вида. У insight — `active` или
+/// `revisit`; у term, task и question — только начальный (замещение, отзыв и переходы
+/// статуса — отдельные операции, задачи M4.5 2, 4, 5) **[решение исполнителя]**; у
+/// changelog и release статуса нет.
 fn new_status(kind: EntryKind, s: Option<EntryStatus>) -> Result<Option<EntryStatus>, StoreError> {
+    let initial = initial_status(kind);
     match (kind, s) {
-        (EntryKind::Insight, None) => Ok(Some(EntryStatus::Active)),
+        (_, None) => Ok(initial),
+        (_, Some(_)) if initial.is_none() => Err(bad(format!("у {} статуса нет", kind.as_str()))),
         (EntryKind::Insight, Some(s @ (EntryStatus::Active | EntryStatus::Revisit))) => Ok(Some(s)),
-        (EntryKind::Insight, Some(s)) => Err(bad(format!(
-            "новая запись не может быть {}: замещение и отзыв — отдельные операции",
+        (_, Some(s)) if Some(s) == initial => Ok(Some(s)),
+        (_, Some(s)) if allowed_statuses(kind).contains(&s) => Err(bad(format!(
+            "новая запись {} не может быть {}: замещение, отзыв и смена статуса — отдельные операции",
+            kind.as_str(),
             s.as_str()
         ))),
-        (_, Some(_)) => Err(bad("статус есть только у insight")),
-        (_, None) => Ok(None),
+        (_, Some(s)) => Err(bad(format!(
+            "статус {} недопустим для {}",
+            s.as_str(),
+            kind.as_str()
+        ))),
     }
 }
 
 /// Вставляет новую запись с ревизией 1, чанками и заданием. Возвращает её id.
 pub(crate) fn insert_entry(
     c: &Connection,
-    e: NewEntry,
+    mut e: NewEntry,
     key: Option<String>,
     a: &Attribution,
     supersedes: Option<Id>,
@@ -275,9 +287,22 @@ pub(crate) fn insert_entry(
     if e.kind == EntryKind::Release {
         ensure_release_version_free(c, e.space_id, &e.data, None)?;
     }
+    if e.kind == EntryKind::Term {
+        // замещаемый термин при проверке имён не учитывается: он станет `superseded`
+        // в той же транзакции
+        let (title, td) = check_term(&e.title, &e.data).map_err(bad)?;
+        ensure_names_free(c, e.space_id, &title, &td, supersedes)?;
+        e.data = td.to_value();
+    }
+    if e.kind == EntryKind::Task {
+        e.data = check_task(&e.data).map_err(bad)?.to_value();
+    }
+    if e.kind == EntryKind::Question {
+        e.data = check_question(&e.data).map_err(bad)?.to_value();
+    }
     let status = new_status(e.kind, e.status)?;
-    if e.kind != EntryKind::Insight && e.certainty.is_some() {
-        return Err(bad("certainty есть только у insight"));
+    if !has_certainty(e.kind) && e.certainty.is_some() {
+        return Err(bad("certainty есть только у insight и term"));
     }
     // без явного статуса insight агента — hypothesis, человека и system — без статуса (§7.5)
     let certainty = e
@@ -295,6 +320,7 @@ pub(crate) fn insert_entry(
     }
     let triggers = check_triggers(e.triggers)?;
     let links = e.links;
+    let refs = e.refs.unwrap_or_default();
     let f = Fields {
         title: check_title(&e.title)?,
         body: e.body,
@@ -335,10 +361,14 @@ pub(crate) fn insert_entry(
         entry_index_state(space_kind).as_str(),
         now,
     ])?;
-    insert_revision(c, id, 1, &f, None, a, now)?;
+    insert_revision(c, id, 1, e.kind, &f, None, a, now)?;
     replace_triggers(c, id, &triggers, now)?;
     index_entry_now(c, id, None, now)?;
     crate::graph::insert_entry_links(c, id, &links, a, now)?;
+    crate::file_refs::sync_new_entry(c, id, e.space_id, e.kind, &refs, &f.data, a, now)?;
+    if e.kind == EntryKind::Term {
+        terms_written(c, e.space_id)?;
+    }
     Ok(id)
 }
 
@@ -346,11 +376,25 @@ fn tags_json(tags: &[String]) -> String {
     serde_json::to_string(tags).expect("сериализация списка строк")
 }
 
+/// `data` для ревизии и сравнения «правка без изменений»: у task без `claimed_by` — захват
+/// это оперативное состояние, а не содержимое записи (решение контроллера, M4.5 задача 5).
+fn content_data(kind: EntryKind, data: &serde_json::Value) -> serde_json::Value {
+    let mut d = data.clone();
+    if kind == EntryKind::Task
+        && let Some(o) = d.as_object_mut()
+    {
+        o.remove("claimed_by");
+    }
+    d
+}
+
 /// Дописывает ревизию (ревизии только дописываются).
+#[allow(clippy::too_many_arguments)]
 fn insert_revision(
     c: &Connection,
     id: Id,
     rev: i64,
+    kind: EntryKind,
     f: &Fields,
     reason: Option<&str>,
     a: &Attribution,
@@ -367,7 +411,7 @@ fn insert_revision(
         rev,
         f.title,
         f.body,
-        f.data.to_string(),
+        content_data(kind, &f.data).to_string(),
         tags_json(&f.tags),
         f.area,
         f.status,
@@ -415,7 +459,7 @@ fn save(
         rev,
         now,
     ])?;
-    insert_revision(c, cur.id, rev, f, reason, a, now)?;
+    insert_revision(c, cur.id, rev, cur.kind, f, reason, a, now)?;
     // выжимки кэша с этим источником (§9.4): замещение и отзыв — по статусу, правка —
     // `changed` (тело или секция с прежним текстом остаются действующими)
     let stale = match (cur.status, f.status) {
@@ -424,7 +468,11 @@ fn save(
         _ => StaleKind::Changed,
     };
     crate::cache::invalidate_revised(c, entry_ref(cur.id), rev, &f.body, stale)?;
-    index_entry_now(c, cur.id, Some(cur.index_state), now)
+    index_entry_now(c, cur.id, Some(cur.index_state), now)?;
+    if cur.kind == EntryKind::Term {
+        terms_written(c, cur.space_id)?;
+    }
+    Ok(())
 }
 
 fn entry_ref(id: Id) -> TargetRef {
@@ -470,6 +518,21 @@ fn check_rev(e: &Entry, if_rev: Option<i64>) -> Result<(), StoreError> {
         }),
         _ => Ok(()),
     }
+}
+
+/// Служебная правка без проверок вида: статус и `data` одной новой ревизией (ответ на вопрос).
+pub(crate) fn revise(
+    c: &Connection,
+    cur: &Entry,
+    status: Option<EntryStatus>,
+    data: serde_json::Value,
+    a: &Attribution,
+    now: &str,
+) -> Result<(), StoreError> {
+    let mut f = Fields::of(cur);
+    f.status = status;
+    f.data = data;
+    save(c, cur, &f, None, a, now)
 }
 
 /// Живая запись по id: нет или удалена → `NotFound`.
@@ -525,6 +588,7 @@ pub async fn update_entry(
 ) -> Result<Entry, StoreError> {
     let a = a.clone();
     db.write(move |tx| {
+        let now_ts = Timestamp::now();
         let cur = live_entry(tx, id)?;
         // конфликт ревизии — раньше прав (§7.5, §11.3)
         check_rev(&cur, if_rev)?;
@@ -537,13 +601,27 @@ pub async fn update_entry(
             || p.tags.is_some()
             || p.area.is_some()
             || p.triggers.is_some();
+        let term_edit = cur.kind == EntryKind::Term && (p.title.is_some() || p.data.is_some());
         if content {
             ensure_editable(&cur)?;
+        }
+        if content && cur.kind == EntryKind::Question && cur.status != Some(EntryStatus::Open) {
+            return Err(StoreError::Conflict(
+                "вопрос уже не открыт: содержимое не меняется — задайте новый вопрос".into(),
+            ));
         }
         if p.body.is_some() && p.append_body.is_some() {
             return Err(bad("body и append_body вместе"));
         }
         let mut f = Fields::of(&cur);
+        // task: `data` — слияние полей клиента поверх прежней, поля сервера сохраняются
+        let task = (cur.kind == EntryKind::Task).then(|| TaskData::from_stored(&cur.data));
+        let mut task_patch: Option<serde_json::Value> = None;
+        let mut task_status: Option<EntryStatus> = None;
+        // question: `data` — слияние полей спросившего поверх прежней, `answer` сохраняется
+        let question =
+            (cur.kind == EntryKind::Question).then(|| QuestionData::from_stored(&cur.data));
+        let mut question_patch: Option<serde_json::Value> = None;
         if let Some(t) = p.title {
             f.title = check_title(&t)?;
         }
@@ -553,12 +631,27 @@ pub async fn update_entry(
         if let Some(more) = p.append_body {
             f.body = appended(&f.body, &more);
         }
+        let data_given = p.data.is_some();
         if let Some(d) = p.data {
             check_data(&d)?;
             if cur.kind == EntryKind::Release {
                 ensure_release_version_free(tx, cur.space_id, &d, Some(cur.id))?;
             }
-            f.data = d;
+            if task.is_some() {
+                task_patch = Some(d);
+            } else if question.is_some() {
+                question_patch = Some(d);
+            } else {
+                f.data = d;
+            }
+        }
+        if term_edit {
+            let (title, td) = check_term(&f.title, &f.data).map_err(bad)?;
+            if cur.status == Some(EntryStatus::Active) {
+                ensure_names_free(tx, cur.space_id, &title, &td, Some(cur.id))?;
+            }
+            f.title = title;
+            f.data = td.to_value();
         }
         if let Some(t) = p.tags {
             f.tags = check_tags(t)?;
@@ -567,10 +660,31 @@ pub async fn update_entry(
             f.area = check_area(ar)?;
         }
         if let Some(s) = p.status {
-            if cur.kind != EntryKind::Insight {
-                return Err(bad("статус есть только у insight"));
-            }
-            if !matches!(s, EntryStatus::Active | EntryStatus::Revisit) {
+            if cur.kind == EntryKind::Task {
+                let from = cur.status.unwrap_or(EntryStatus::Open);
+                check_task_transition(from, s, reason.as_deref()).map_err(|code| {
+                    bad(format!(
+                        "{code}: {} → {} не разрешён (переоткрытие — в open и с причиной)",
+                        from.as_str(),
+                        s.as_str()
+                    ))
+                })?;
+                task_status = Some(s);
+            } else if cur.kind == EntryKind::Question {
+                let from = cur.status.unwrap_or(EntryStatus::Open);
+                check_question_transition(from, s, reason.as_deref()).map_err(|code| {
+                    bad(format!(
+                        "{code}: {} → {} не разрешён (устаревание — с причиной, ответ — answer)",
+                        from.as_str(),
+                        s.as_str()
+                    ))
+                })?;
+            } else if cur.kind != EntryKind::Insight {
+                return Err(bad(format!(
+                    "статус {} правкой не меняется",
+                    cur.kind.as_str()
+                )));
+            } else if !matches!(s, EntryStatus::Active | EntryStatus::Revisit) {
                 return Err(bad(
                     "superseded и retracted ставятся замещением и отзывом, а не правкой",
                 ));
@@ -585,9 +699,23 @@ pub async fn update_entry(
             }
             f.status = Some(s);
         }
+        if let Some(mut t) = task {
+            // следы смены статуса, затем явные поля клиента (они сильнее)
+            if let Some(s) = task_status {
+                t.on_transition(cur.status, s, now_ts);
+            }
+            if let Some(d) = &task_patch {
+                t.apply_patch(d).map_err(bad)?;
+            }
+            f.data = t.to_value();
+        }
+        if let (Some(mut qd), Some(d)) = (question, &question_patch) {
+            qd.apply_patch(d).map_err(bad)?;
+            f.data = qd.to_value();
+        }
         if let Some(c) = p.certainty {
-            if cur.kind != EntryKind::Insight {
-                return Err(bad("certainty есть только у insight"));
+            if !has_certainty(cur.kind) {
+                return Err(bad("certainty есть только у insight и term"));
             }
             f.certainty = c;
         }
@@ -604,14 +732,30 @@ pub async fn update_entry(
                 reason.as_deref(),
             )?;
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(now_ts);
         if let Some(ts) = p.triggers {
             if cur.kind != EntryKind::Insight {
                 return Err(bad("триггеры есть только у insight"));
             }
             replace_triggers(tx, id, &check_triggers(ts)?, &now)?;
         }
-        if f == Fields::of(&cur) {
+        // ссылки на файлы — без ревизии, как триггеры (M4.5 §6.1)
+        crate::file_refs::sync_patched_entry(
+            tx,
+            id,
+            cur.space_id,
+            cur.kind,
+            p.refs.as_deref(),
+            &f.data,
+            data_given,
+            &a,
+            &now,
+        )?;
+        let mut now_f = f.clone();
+        let mut was_f = Fields::of(&cur);
+        now_f.data = content_data(cur.kind, &now_f.data);
+        was_f.data = content_data(cur.kind, &was_f.data);
+        if now_f == was_f {
             return Ok(cur);
         }
         // theorem агента — с полным доказательством и после правки
@@ -646,7 +790,11 @@ pub async fn delete_entry(
             params![id, now],
         )?;
         crate::cache::invalidate_target(tx, entry_ref(id), StaleKind::Deleted)?;
-        unindex_entry(tx, id, cur.rev, cur.index_state, &now)
+        unindex_entry(tx, id, cur.rev, cur.index_state, &now)?;
+        if cur.kind == EntryKind::Term {
+            terms_written(tx, cur.space_id)?;
+        }
+        Ok(())
     })
     .await
 }
@@ -671,6 +819,11 @@ pub async fn restore_entry(
         if cur.kind == EntryKind::Release {
             ensure_release_version_free(tx, cur.space_id, &cur.data, Some(cur.id))?;
         }
+        if cur.kind == EntryKind::Term && cur.status == Some(EntryStatus::Active) {
+            // имя могли занять, пока термин лежал в корзине
+            let (title, td) = check_term(&cur.title, &cur.data).map_err(bad)?;
+            ensure_names_free(tx, cur.space_id, &title, &td, Some(cur.id))?;
+        }
         let now = fmt_ts(Timestamp::now());
         tx.execute(
             "UPDATE entries SET deleted_at = NULL,
@@ -680,12 +833,15 @@ pub async fn restore_entry(
             [id],
         )?;
         index_entry_now(tx, id, Some(cur.index_state), &now)?;
+        if cur.kind == EntryKind::Term {
+            terms_written(tx, cur.space_id)?;
+        }
         load_entry(tx, id)
     })
     .await
 }
 
-/// Замещает insight `old` новой записью одной транзакцией: новая получает
+/// Замещает insight или term `old` новой записью того же вида одной транзакцией: новая получает
 /// `supersedes_id = old` и системное ребро графа `supersedes` (новая → старая), старая —
 /// `superseded`, `superseded_by_id` и новую ревизию; обе переиндексируются. Возвращает `(новая, старая)`. Повтор с тем же `idempotency_key`
 /// возвращает ту же пару. Не insight, другое пространство → `BadInput`; старая уже
@@ -696,14 +852,16 @@ pub async fn supersede_entry(
     db: &Db,
     old: Id,
     if_rev: Option<i64>,
-    new: NewEntry,
+    mut new: NewEntry,
     a: &Attribution,
 ) -> Result<(Entry, Entry), StoreError> {
     let a = a.clone();
     db.write(move |tx| {
         let o = live_entry(tx, old)?;
-        if o.kind != EntryKind::Insight || new.kind != EntryKind::Insight {
-            return Err(bad("замещаются только insight"));
+        if !matches!(o.kind, EntryKind::Insight | EntryKind::Term) || new.kind != o.kind {
+            return Err(bad(
+                "замещаются только insight и term, записью того же вида",
+            ));
         }
         if new.space_id != o.space_id {
             return Err(bad("новая запись — в пространстве замещаемой"));
@@ -730,7 +888,16 @@ pub async fn supersede_entry(
             )));
         }
         let now = fmt_ts(Timestamp::now());
+        // без `refs` новая запись наследует ссылки на файлы замещаемой (M4.5 §6.1) — вместе с
+        // решением и состоянием ссылок
+        let inherit = new.refs.is_none();
+        if inherit {
+            new.refs = Some(crate::file_refs::owner_refs(tx, entry_ref(old))?);
+        }
         let nid = insert_entry(tx, new, key, &a, Some(old), &now)?;
+        if inherit {
+            crate::file_refs::inherit_ref_state(tx, old, nid)?;
+        }
         // системная связь графа: новая → старая (§8.5)
         crate::graph::insert_supersedes(tx, nid, old, o.space_id, Some(&a), &now)?;
         tx.execute(
@@ -745,7 +912,7 @@ pub async fn supersede_entry(
     .await
 }
 
-/// Отзывает insight с обязательной причиной: статус `retracted`, `retract_reason`, ревизия
+/// Отзывает insight или term с обязательной причиной: статус `retracted`, `retract_reason`, ревизия
 /// с причиной, переиндексация. Пустая причина или не insight → `BadInput`; уже отозвана →
 /// `Conflict`; нет или удалена → `NotFound`; `if_rev` (необязателен) не совпал с текущей
 /// ревизией → `StaleRevision`.
@@ -762,8 +929,8 @@ pub async fn retract_entry(
         let cur = live_entry(tx, id)?;
         check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, a.author_kind)?;
-        if cur.kind != EntryKind::Insight {
-            return Err(bad("отзываются только insight"));
+        if !matches!(cur.kind, EntryKind::Insight | EntryKind::Term) {
+            return Err(bad("отзываются только insight и term"));
         }
         if cur.status == Some(EntryStatus::Retracted) {
             return Err(StoreError::Conflict("запись уже отозвана".into()));

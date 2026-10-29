@@ -4,7 +4,7 @@
 //! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
 //! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3), сессии агентов,
 //! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4), кэш выжимок
-//! (`answer_cache`, `cache_deps`; M4).
+//! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5).
 
 pub mod access;
 pub mod blobs;
@@ -14,16 +14,20 @@ pub mod datadir;
 pub mod db;
 pub mod embeddings;
 pub mod entries;
+pub mod file_refs;
+pub mod glossary;
 pub mod graph;
 pub mod jobs;
 pub mod links;
 pub mod migrate;
 pub mod nodes;
 pub mod paths;
+pub mod questions;
 pub mod search;
 pub mod sessions;
 pub mod solution_registry;
 pub mod system;
+pub mod tasks;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
 pub mod time;
@@ -55,14 +59,24 @@ pub use embeddings::{
 };
 pub use entries::{
     AREA_MAX_CHARS, AuthorView, CHANGELOG_BETWEEN_MAX, Certainty, DEDUP_CANDIDATES_MAX,
-    DedupCandidate, Entry, EntryFilter, EntryKind, EntryPatch, EntryRevision, EntryStatus,
-    KEYWORD_MAX_CHARS, NewEntry, NewTrigger, PATTERN_MAX_CHARS, REASON_MAX_CHARS, ReindexEntry,
-    TITLE_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger, TriggerKind, TriggerRow, active_triggers,
-    changelog_between, create_entry, delete_entry, enqueue_entry_upserts, entry_by_idempotency_key,
-    entry_chunks_for_index, entry_revisions, entry_triggers, find_release_by_version,
-    finish_entries_reindexed, get_entry, list_entries, normalize_area, normalize_title,
+    DedupCandidate, ENTRY_REF_LETTERS, Entry, EntryFilter, EntryKind, EntryPatch, EntryRevision,
+    EntryStatus, KEYWORD_MAX_CHARS, NewEntry, NewTrigger, PATTERN_MAX_CHARS, REASON_MAX_CHARS,
+    ReindexEntry, TITLE_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger, TriggerKind, TriggerRow,
+    active_triggers, allowed_statuses, changelog_between, create_entry, delete_entry,
+    enqueue_entry_upserts, entry_by_idempotency_key, entry_chunks_for_index, entry_revisions,
+    entry_triggers, find_release_by_version, finish_entries_reindexed, get_entry, has_certainty,
+    initial_status, is_entry_ref_letter, list_entries, normalize_area, normalize_title,
     reindex_entries_page, restore_entry, retract_entry, set_triggers, supersede_entry,
     title_duplicates, update_entry, validate_trigger,
+};
+pub use file_refs::{
+    FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit, check_hash,
+    files_changed, files_verified, normalize_ref_path, refs_index, refs_to_path, stale_refs_of,
+    verified_notes,
+};
+pub use glossary::{
+    ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,
+    all_active_terms, check_term, find_alias_uses, find_term, glossary_version,
 };
 pub use graph::{
     EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,
@@ -78,28 +92,39 @@ pub use jobs::{
 pub use migrate::Migration;
 pub use nodes::{
     Attribution, AuthorKind, NewNote, Node, NodeKind, PREFIX_L0_MAX_TOKENS, RevisionInfo,
-    WriteError, chunk_params, count_tokens, create_folder, create_note, delete_node, find_by_name,
-    get_node, get_node_by_path, list_children, list_revisions, list_trash, move_node, node_content,
-    patch_note, patch_note_within, prefix_l0, restore_node, revert_note, set_auto_l0,
-    set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter, token_counter_exact,
-    unified_diff, update_note,
+    WriteError, chunk_params, count_tokens, create_folder, create_note, delete_node,
+    entry_snapshot_text, find_by_name, get_node, get_node_by_path, list_children, list_revisions,
+    list_trash, move_node, node_content, patch_note, patch_note_within, prefix_l0, restore_node,
+    revert_note, set_auto_l0, set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter,
+    token_counter_exact, unified_diff, update_note,
 };
 pub use paths::{NodePath, path_ancestors};
+pub use questions::{
+    ANSWER_TEXT_MAX_CHARS, Answer, AnswerBy, Channel, NewAnswer, OPTION_KEY_MAX_CHARS,
+    OPTION_TEXT_MAX_CHARS, OPTIONS_MAX, QOption, QUESTION_DUPLICATES_MAX, QuestionCandidate,
+    QuestionData, QuestionError, answer_question, check_question, check_question_transition,
+    days_ago, open_questions, question_duplicates, recent_answered,
+};
 pub use search::{
-    ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit, MARK_END,
-    MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_targets, live_chunks,
-    live_folders, neighbor_leaves, node_leaves, pending_count, query_needles, sanitize_fts,
-    search_fts, search_fts_channels, text_snippet,
+    AliasGroup, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit,
+    MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_targets,
+    live_chunks, live_folders, neighbor_leaves, node_leaves, pending_count, query_needles,
+    query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use sessions::{
-    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, WHOLE_TARGET,
-    add_memory_write, check_session_id, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, seen_revs, touch_session,
+    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch,
+    TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
+    add_tokens, check_session_id, end_session, gc_sessions, get_session, latest_session,
+    list_sessions, mark_seen, mark_seen_with_tokens, seen_revs, session_tokens, touch_session,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,
     WebSession,
+};
+pub use tasks::{
+    CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Claim, ClaimedTask, Owner, TaskData, TaskError,
+    check_task, check_task_transition, claim_task, claimed_tasks, release_task,
 };
 pub use usage::{
     UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, record_usages, usage_counts,
@@ -111,9 +136,9 @@ pub use user_db::{
     rename_solution_guid, rename_solution_space, space_of_kind,
 };
 pub use vault::{
-    KEY_CHECK_SETTING, VAULT_TITLE_MAX_CHARS, VaultMeta, VaultRevision, VaultScope,
-    check_vault_title, vault_delete, vault_get, vault_get_any, vault_list, vault_put,
-    vault_revision_secret, vault_revisions, vault_update,
+    KEY_CHECK_SETTING, VAULT_ENV_TYPES, VAULT_OPEN_FIELDS, VAULT_TITLE_MAX_CHARS, VaultMeta,
+    VaultRevision, VaultScope, check_vault_title, vault_delete, vault_environment, vault_get,
+    vault_get_any, vault_list, vault_put, vault_revision_secret, vault_revisions, vault_update,
 };
 
 /// Ошибки слоя хранения.
@@ -134,6 +159,10 @@ pub enum StoreError {
     StaleRevision { expected: i64, current: i64 },
     #[error("некорректные данные: {0}")]
     BadInput(String),
+    /// Имя или псевдоним термина пересекается с действующим термином пространства
+    /// ([`glossary::TermConflict`], спецификация M4.5 §2.1).
+    #[error("имя или псевдоним термина уже занят действующим термином")]
+    TermConflict(Vec<glossary::TermConflict>),
     /// `Idempotency-Key` повторён с другим содержимым запроса.
     #[error("{0}")]
     IdempotencyMismatch(String),

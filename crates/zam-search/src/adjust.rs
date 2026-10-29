@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use jiff::Timestamp;
-use zam_core::TargetRef;
+use zam_core::{Id, TargetRef};
 
 use crate::hybrid::{ChunkMeta, Level, Ranked};
 
@@ -99,6 +99,41 @@ pub fn overflow_divisor(top: f64) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Порядок по связи `contradicts` (M4.5, §5.2, вариант (2)): `contradicts` — пары
+/// `(источник, цель)`, где цель — действующая более надёжная запись (`theorem`/`axiom`; пары
+/// отбирает вызывающий: `zam-server` `api/search/graph.rs::contradicts_applies`); если обе
+/// записи в `items` и источник стоит выше цели, цель переставляется на позицию сразу перед
+/// источником. Остальной порядок не меняется. Запись опознаётся по `id_of` (при нескольких
+/// элементах одной записи берётся первый). Возвращает число перестановок; сдвинутые цели
+/// вызывающий приводит к шкале баллов сам.
+pub fn order_contradicted<T>(
+    items: &mut Vec<T>,
+    id_of: impl Fn(&T) -> Id,
+    contradicts: &[(Id, Id)],
+) -> usize {
+    let mut moved = 0;
+    // каждая перестановка поднимает аксиому выше; цикл `a ⊥ b`, `b ⊥ a` ограничен проходами
+    for _ in 0..=contradicts.len() {
+        let mut changed = false;
+        for &(src, axiom) in contradicts {
+            let pos = |id: Id, items: &[T]| items.iter().position(|x| id_of(x) == id);
+            let (Some(s), Some(a)) = (pos(src, items), pos(axiom, items)) else {
+                continue;
+            };
+            if s < a && src != axiom {
+                let x = items.remove(a);
+                items.insert(s, x);
+                moved += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    moved
 }
 
 /// Нижняя граница множителя свежести **[решение исполнителя]**: память хранит и давние
@@ -446,6 +481,33 @@ mod tests {
                 ("unknown", 0.5),
             ]
         );
+    }
+
+    #[test]
+    fn contradicted_axiom_moves_before_source() {
+        let (h, x, a, y) = (Id::new(), Id::new(), Id::new(), Id::new());
+        let id = |v: &Id| *v;
+        // гипотеза h выше аксиомы a: a встаёт сразу перед ней, остальные не сдвигаются
+        let mut v = vec![h, x, a, y];
+        assert_eq!(order_contradicted(&mut v, id, &[(h, a)]), 1);
+        assert_eq!(v, vec![a, h, x, y]);
+        // аксиома уже выше — порядок прежний; нет одной из записей — тоже
+        assert_eq!(order_contradicted(&mut v, id, &[(h, a)]), 0);
+        assert_eq!(
+            order_contradicted(&mut v, id, &[(Id::new(), a), (h, Id::new())]),
+            0
+        );
+        // несколько источников: аксиома — над самым верхним
+        let h2 = Id::new();
+        let mut v = vec![h, h2, a];
+        order_contradicted(&mut v, id, &[(h2, a), (h, a)]);
+        assert_eq!(v, vec![a, h, h2]);
+        // взаимный цикл завершается
+        let mut v = vec![h, a];
+        order_contradicted(&mut v, id, &[(h, a), (a, h)]);
+        assert_eq!(v.len(), 2);
+        let mut v: Vec<Id> = Vec::new();
+        assert_eq!(order_contradicted(&mut v, id, &[(h, a)]), 0);
     }
 
     fn leaf(id: &str, hp: &str) -> Option<LeafRef> {

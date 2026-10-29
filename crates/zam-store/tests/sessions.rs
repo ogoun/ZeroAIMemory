@@ -399,3 +399,106 @@ async fn latest_session_by_machine_and_age() {
         None
     );
 }
+
+/// Сессия субагента (M4.5 §9.4, миграция 0017): `parent_id` и `agent_type` пишутся, повторное
+/// касание без них их не стирает; длинный или с управляющими символами тип — ошибка ввода.
+/// `session_tokens` удаляется вместе с сессией сроком хранения.
+#[tokio::test]
+async fn subagent_session_fields_and_tokens_gc() {
+    let (_dd, db) = db("subagent").await;
+    let sub = SessionTouch {
+        id: "s1:a7".into(),
+        parent_id: Some("s1".into()),
+        agent_type: Some("Explore".into()),
+        ..SessionTouch::default()
+    };
+    touch_session(&db, &sub).await.unwrap();
+    touch_session(&db, &touch("s1:a7")).await.unwrap();
+    let s = get_session(&db, "s1:a7").await.unwrap().unwrap();
+    assert_eq!(s.parent_id.as_deref(), Some("s1"));
+    assert_eq!(s.agent_type.as_deref(), Some("Explore"));
+    let s = serde_json::to_value(&s).unwrap();
+    assert_eq!(s["parent_id"], "s1");
+    assert_eq!(s["agent_type"], "Explore");
+    for bad in ["x".repeat(129), "a\u{7}b".to_string()] {
+        let t = SessionTouch {
+            agent_type: Some(bad),
+            ..touch("s2")
+        };
+        assert!(touch_session(&db, &t).await.is_err());
+    }
+    db.write(|t| {
+        t.execute(
+            "INSERT INTO session_tokens (session_id, event, calls, tokens)
+             VALUES ('s1:a7', 'brief', 1, 120)",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let later = Timestamp::now() + SignedDuration::from_hours(1);
+    assert_eq!(gc_sessions(&db, later).await.unwrap(), 1);
+    let n: i64 = db
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM session_tokens", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+/// Учёт выданного (M4.5 §9.5): `add_tokens` — одна выдача, `add_token_counts` — пачка, оба
+/// прибавляются к прежнему и создают сессию; `mark_seen_with_tokens` пишет показ и учёт одной
+/// транзакцией; некорректное имя события — ошибка ввода, ничего не записано.
+#[tokio::test]
+async fn session_tokens_accumulate() {
+    let (_dd, db) = db("tokens").await;
+    let s = touch("s-t");
+    zam_store::add_tokens(&db, &s, "prompt", 30).await.unwrap();
+    zam_store::add_tokens(&db, &s, "prompt", 12).await.unwrap();
+    let c = |e: &str, calls, tokens| zam_store::TokenCount {
+        event: e.into(),
+        calls,
+        tokens,
+    };
+    zam_store::add_token_counts(&db, &s, &[c("pre_tool", 4, 50), c("brief", 0, 0)])
+        .await
+        .unwrap();
+    let item = SeenItem {
+        key: SeenKey {
+            owner_id: Id::new(),
+            target: node(Id::new()),
+            part: WHOLE_TARGET.into(),
+        },
+        rev: 1,
+    };
+    zam_store::mark_seen_with_tokens(&db, &s, &[item], &[c("session_start", 1, 900)])
+        .await
+        .unwrap();
+    for bad in ["", "Prompt", "a-b", &"x".repeat(33)] {
+        assert!(
+            zam_store::add_tokens(&db, &s, bad, 1).await.is_err(),
+            "{bad}"
+        );
+    }
+    let t = zam_store::session_tokens(&db, "s-t").await.unwrap();
+    let got: Vec<(&str, i64, i64)> = t
+        .iter()
+        .map(|(e, v)| (e.as_str(), v.calls, v.tokens))
+        .collect();
+    // пустая прибавка (`brief` 0/0) строки не заводит
+    assert_eq!(
+        got,
+        [
+            ("pre_tool", 4, 50),
+            ("prompt", 2, 42),
+            ("session_start", 1, 900)
+        ]
+    );
+    assert!(get_session(&db, "s-t").await.unwrap().is_some());
+    assert!(
+        zam_store::session_tokens(&db, "нет")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

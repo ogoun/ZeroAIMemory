@@ -84,6 +84,7 @@ async fn insight(w: &W, title: &str) -> Id {
     create_entry(
         &w.db,
         NewEntry {
+            refs: None,
             space_id: w.knowledge,
             kind: EntryKind::Insight,
             title: title.into(),
@@ -487,6 +488,7 @@ async fn invalidate_on_entry_supersede_retract() {
         .await
         .unwrap();
     let mut new = NewEntry {
+        refs: None,
         space_id: w.knowledge,
         kind: EntryKind::Insight,
         title: "A2".into(),
@@ -736,7 +738,8 @@ async fn migrate_v13_to_v14() {
         })
         .await
         .unwrap();
-    assert_eq!(ver, 14);
+    assert_eq!(ver, zam_store::USER_MIGRATIONS.len() as u32);
+    assert!(ver >= 14);
     assert_eq!((tables, sessions), (2, 1));
     assert_eq!(cache_count(&db).await.unwrap(), 0);
     let n = create_note(

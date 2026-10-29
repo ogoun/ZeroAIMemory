@@ -1,11 +1,20 @@
 //! Сессии агентов (§6.3, §10.3, §12; задача 5 M4).
 //!
-//! - `POST /sessions {id?, agent?, solution?, area?}` → 201 `{id}`: без `id` — UUIDv7;
-//!   существующая сессия обновляется (известные поля дописываются, `last_seen_at` — сейчас).
-//!   Машина и токен — из `X-Zam-Machine` и принципала;
+//! - `POST /sessions {id?, agent?, solution?, area?, parent_id?, agent_type?, tokens?}` → 201
+//!   `{id}`: без `id` — UUIDv7; существующая сессия обновляется (известные поля дописываются,
+//!   `last_seen_at` — сейчас). Машина и токен — из `X-Zam-Machine` и принципала. `parent_id` и
+//!   `agent_type` (до 128 печатных символов) — сессия субагента (M4.5 §9.4): её создаёт хук
+//!   `subagent-start` с id `<session>:<agent_id>`. `tokens: {pre_tool, post_tool_local,
+//!   subagent_local}` (M4.5 §9.5) — прибавка выданного хуками с локальным выводом: число
+//!   (токены, одна выдача) или `{calls, tokens}` (пачка, которую хук копил до сетевого
+//!   вызова); прочие ключи и значения вне `0..=`[`TOKENS_MAX`] — 400 (события `/recall`
+//!   сервер считает сам);
 //! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
-//! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, started_at, last_seen_at,
-//!   ended_at, memory_writes}` (решение контроллера R6, читает хук `checkpoint`);
+//! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, parent_id, agent_type,
+//!   started_at, last_seen_at, ended_at, memory_writes, claimed_tasks: [{id, title, status}],
+//!   tokens: {<событие>: {calls, tokens}}}` (решение контроллера R6, читает хук `checkpoint`;
+//!   `claimed_tasks` — задачи журнала, захваченные сессией, M4.5; `tokens` — выданное сессии
+//!   по событию, §9.5);
 //! - `GET /sessions?solution=&limit=` → `{items}` — свои, свежие первыми (50, до 500).
 //!
 //! Сессия лежит в базе пользователя запроса (у администратора — `X-Zam-User` или он сам):
@@ -33,11 +42,13 @@ use axum::middleware::Next;
 use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use zam_core::SolutionGuid;
+use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Db, SessionTouch, add_memory_write, end_session, get_session, list_sessions, touch_session,
+    Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, claimed_tasks,
+    end_session, get_session, list_sessions, list_spaces, session_tokens, touch_session,
 };
 
+use super::search::targets::{ScopeReq, resolve_targets};
 use super::{json_body, query};
 use crate::app::AppState;
 use crate::attrib::{MACHINE_HEADER, SESSION_HEADER, header_value, session_touch};
@@ -48,6 +59,10 @@ use crate::error::ApiError;
 const LIST_DEFAULT: usize = 50;
 /// Предел списка сессий.
 const LIST_MAX: usize = 500;
+/// События `tokens` в `POST /sessions`: хуки с локальным выводом (M4.5 §9.5).
+pub const LOCAL_TOKEN_EVENTS: [&str; 3] = ["pre_tool", "post_tool_local", "subagent_local"];
+/// Предел `tokens` и `calls` одной прибавки.
+pub const TOKENS_MAX: u64 = 1_000_000_000;
 
 /// База пользователя запроса (без проверки существования: принципал уже проверен).
 async fn requester_db(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<Db, ApiError> {
@@ -101,6 +116,47 @@ pub struct NewSession {
     agent: Option<String>,
     solution: Option<String>,
     area: Option<String>,
+    parent_id: Option<String>,
+    agent_type: Option<String>,
+    tokens: Option<serde_json::Map<String, Value>>,
+}
+
+/// Прибавки `tokens` тела `POST /sessions` (см. модуль).
+fn local_tokens(m: &serde_json::Map<String, Value>) -> Result<Vec<TokenCount>, ApiError> {
+    let bad = |k: &str| {
+        ApiError::BadRequest(format!(
+            "tokens.{k}: число 0..={TOKENS_MAX} или {{calls, tokens}}"
+        ))
+    };
+    let num = |v: &Value| v.as_u64().filter(|n| *n <= TOKENS_MAX);
+    let mut out = Vec::with_capacity(m.len());
+    for (k, v) in m {
+        if !LOCAL_TOKEN_EVENTS.contains(&k.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "tokens.{k}: неизвестное событие (ожидается {})",
+                LOCAL_TOKEN_EVENTS.join(", ")
+            )));
+        }
+        let (calls, tokens) = match v {
+            Value::Object(o) => {
+                if o.keys().any(|x| x != "calls" && x != "tokens") {
+                    return Err(bad(k));
+                }
+                let get = |f: &str| o.get(f).map_or(Some(0), num);
+                (
+                    get("calls").ok_or_else(|| bad(k))?,
+                    get("tokens").ok_or_else(|| bad(k))?,
+                )
+            }
+            _ => (1, num(v).ok_or_else(|| bad(k))?),
+        };
+        out.push(TokenCount {
+            event: k.clone(),
+            calls,
+            tokens,
+        });
+    }
+    Ok(out)
 }
 
 /// `POST /sessions`.
@@ -120,6 +176,7 @@ pub async fn create(
                 .map_err(|_| ApiError::BadRequest("solution: GUID решения".into()))
         })
         .transpose()?;
+    let tokens = req.tokens.as_ref().map(local_tokens).transpose()?;
     let blank = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let touch = SessionTouch {
         id: blank(req.id).unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
@@ -128,9 +185,14 @@ pub async fn create(
         area: blank(req.area),
         machine: header_value(&headers, MACHINE_HEADER)?,
         agent: blank(req.agent),
+        parent_id: blank(req.parent_id),
+        agent_type: blank(req.agent_type),
     };
     let db = requester_db(&st, &p, &headers).await?;
-    touch_session(&db, &touch).await?;
+    match tokens.filter(|t| !t.is_empty()) {
+        Some(t) => add_token_counts(&db, &touch, &t).await?,
+        None => touch_session(&db, &touch).await?,
+    }
     Ok((StatusCode::CREATED, Json(json!({ "id": touch.id }))))
 }
 
@@ -156,18 +218,74 @@ pub async fn patch(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /sessions/{id}`.
+/// `GET /sessions/{id}` — сессия и `claimed_tasks: [{id, title, status}]` (задачи, захваченные
+/// сессией: в её базе и в пространстве решения сессии, M4.5 §3). Сбой чтения задач — пустой список
+/// (WARN без текста): сессию он не портит.
 pub async fn get(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<zam_store::Session>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let db = requester_db(&st, &p, &headers).await?;
-    get_session(&db, &id)
-        .await?
-        .map(Json)
-        .ok_or(ApiError::NotFound)
+    let s = get_session(&db, &id).await?.ok_or(ApiError::NotFound)?;
+    let tasks = claimed_tasks_of(&st, &p, &headers, &db, &s).await;
+    let tokens = session_tokens(&db, &s.id).await?;
+    let mut v = serde_json::to_value(&s).map_err(|e| ApiError::Internal(e.to_string()))?;
+    v["claimed_tasks"] = json!(tasks);
+    v["tokens"] = json!(tokens);
+    Ok(Json(v))
+}
+
+/// Задачи, захваченные сессией `s`, в области пользователя запроса: личная база — Knowledge и
+/// свои решения; база владельца решения сессии (если доступ действует) — только пространство
+/// этого решения (финальное ревью M4.5, M-1: Knowledge владельца участнику не виден, даже если
+/// id сессий совпали).
+async fn claimed_tasks_of(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    own: &Db,
+    s: &zam_store::Session,
+) -> Vec<zam_store::ClaimedTask> {
+    let now = jiff::Timestamp::now();
+    let mut dbs: Vec<(Db, Vec<Id>)> = Vec::new();
+    match list_spaces(own).await {
+        Ok(spaces) => dbs.push((
+            own.clone(),
+            spaces
+                .iter()
+                .filter(|sp| matches!(sp.kind, SpaceKind::Knowledge | SpaceKind::Solution))
+                .map(|sp| sp.id)
+                .collect(),
+        )),
+        Err(e) => tracing::warn!(error = %e, "сессия: пространства личной базы не прочитаны"),
+    }
+    if let Some(g) = &s.solution_guid {
+        let scope = ScopeReq {
+            solution: Some(g.clone()),
+            ..ScopeReq::default()
+        };
+        match resolve_targets(st, p, headers, &scope).await {
+            Ok((targets, _)) => {
+                for t in targets {
+                    if t.solution.is_some() {
+                        let ids = t.space_ids();
+                        dbs.push((t.db, ids));
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "сессия: база решения для задач недоступна"),
+        }
+    }
+    let mut out = Vec::new();
+    for (db, spaces) in &dbs {
+        match claimed_tasks(db, spaces, &s.id, now).await {
+            Ok(v) => out.extend(v),
+            Err(e) => tracing::warn!(error = %e, "сессия: захваченные задачи не прочитаны"),
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]

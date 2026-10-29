@@ -550,3 +550,99 @@ async fn expand_section_for_leaves_under_h4() {
         "{j}"
     );
 }
+
+/// `filters.insight_kinds` (§9.1, задача 13 раунд 1): insight чужих видов отсеиваются, заметки
+/// и записи других видов остаются, если их включает `kinds`; неизвестный вид — 400.
+#[tokio::test]
+async fn insight_kinds_filter() {
+    let a = api("search-insight-kinds", |_| {}).await;
+    let post = |body: Value| {
+        let a = &a;
+        async move {
+            let r = a
+                .t(Method::POST, "/api/v1/spaces/knowledge/entries", Some(body))
+                .await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+            r.json()["id"].as_str().unwrap().to_string()
+        }
+    };
+    let ins = |title: &str, kind: &str| {
+        json!({"kind": "insight", "title": title, "body": "квазар профилирование сборки",
+               "data": {"kind": kind}, "force": true})
+    };
+    let gotcha = post(ins("Квазар: ловушка", "gotcha")).await;
+    let failure = post(ins("Квазар: провал", "failure")).await;
+    let experiment = post(ins("Квазар: эксперимент", "experiment")).await;
+    let term = post(json!({"kind": "term", "title": "Квазар",
+                           "data": {"definition": "квазар профилирование сборки"}}))
+    .await;
+    a.note(
+        "knowledge",
+        "Заметки/Квазар",
+        "# Квазар\n\nквазар профилирование сборки\n",
+    )
+    .await;
+    let found = |filters: Value| {
+        let a = &a;
+        async move {
+            let r = search(
+                a,
+                json!({"query": "квазар профилирование", "top_k": 20, "filters": filters}),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            let j = r.json();
+            let ids: Vec<String> = j["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    i["entry_id"]
+                        .as_str()
+                        .or(i["node_id"].as_str())
+                        .or(i["id"].as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+            let notes = j["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["kind"] == "note")
+                .count();
+            (ids, notes)
+        }
+    };
+    let ik = json!(["experiment", "failure"]);
+    // виды по умолчанию: gotcha отсеян, заметка и термин остались
+    let (ids, notes) = found(json!({"insight_kinds": ik})).await;
+    assert!(!ids.contains(&gotcha), "{ids:?}");
+    assert!(
+        ids.contains(&failure) && ids.contains(&experiment),
+        "{ids:?}"
+    );
+    assert!(
+        ids.contains(&term),
+        "термин не insight — фильтр его не трогает: {ids:?}"
+    );
+    assert_eq!(notes, 1, "{ids:?}");
+    // только insight — только нужные виды
+    let (ids, notes) = found(json!({"kinds": ["insight"], "insight_kinds": ik})).await;
+    let mut want = vec![failure.clone(), experiment.clone()];
+    want.sort();
+    let mut got = ids.clone();
+    got.sort();
+    assert_eq!(got, want);
+    assert_eq!(notes, 0);
+    // без фильтра — все три insight
+    let (ids, _) = found(json!({"kinds": ["insight"]})).await;
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    // неизвестный вид — 400
+    let r = search(
+        &a,
+        json!({"query": "квазар", "filters": {"insight_kinds": ["nope"]}}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}

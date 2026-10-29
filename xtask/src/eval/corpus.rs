@@ -1399,6 +1399,7 @@ mod tests {
             triggers: Vec::new(),
             supersedes: supersedes.map(String::from),
             retract_reason: None,
+            contradicts: Vec::new(),
         }
     }
 

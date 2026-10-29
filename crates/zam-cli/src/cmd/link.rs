@@ -1,7 +1,7 @@
 //! Граф связей (§8.5, §13): `zam link <src> <type> <dst>`, `zam link rm <edge-id>`,
 //! `zam links <id>`.
 //!
-//! Цель — `n:<id>` (узел), `e:<id>` / `i:<id>` / `c:<id>` / `r:<id>` (запись журнала, как в
+//! Цель — `n:<id>` (узел), `e:<id>` / `i:|c:|r:|t:|k:|q:<id>` (запись журнала, как в
 //! карточках поиска), `[space:]path` заметки; у `dst` ещё `[[Имя]]` (заметка в пространстве
 //! источника). Тип — из §8.5 (`supersedes` ставит только замещение insight).
 //!
@@ -9,7 +9,8 @@
 //! - `link rm` — ничего (код 0), выведенные из текста и системные связи не удаляются (код 6);
 //! - `links` — строки `<→|←><TAB>type<TAB>ref<TAB>путь или заголовок<TAB>origin<TAB>edge-id`:
 //!   `→` — исходящие (у неразрешённой ссылки вместо ref — `-`, вместо пути — ключ ссылки),
-//!   `←` — обратные ссылки (`--json` — `{links, backlinks}`).
+//!   `←` — обратные ссылки (`--json` — `{links, backlinks}`);
+//! - `links file:<path>` — что память знает о файле проекта (M4.5 §6.3): `<ref><TAB>заголовок`.
 use serde_json::{Value, json};
 
 use super::{Ctx, emit, emit_json};
@@ -35,12 +36,13 @@ pub fn target_ref(ctx: &Ctx, raw: &str, wiki: bool) -> Result<String, CliError> 
     Ok(format!("n:{}", ctx.node_id(&loc)?))
 }
 
-/// `n:`/`node:` → `n:<id>`; `e:`/`entry:`/`i:`/`c:`/`r:` → `e:<id>`; иначе `None`.
+/// `n:`/`node:` → `n:<id>`; `e:`/`entry:`/`i:|c:|r:|t:|k:|q:` → `e:<id>`; иначе `None`.
 fn short_ref(t: &str) -> Option<String> {
     let (k, id) = t.split_once(':')?;
     let kind = match k {
         "n" | "node" => "n",
-        "e" | "entry" | "i" | "c" | "r" => "e",
+        "entry" => "e",
+        k if crate::target::ENTRY_REF_LETTERS.contains(&k) => "e",
         _ => return None,
     };
     // id — 26 символов base32 (или UUID); проверку формата делает сервер
@@ -72,6 +74,9 @@ pub fn remove(ctx: &Ctx, id: &str) -> Result<(), CliError> {
 
 /// `zam links <id>`: исходящие и обратные связи узла или записи.
 pub fn list(ctx: &Ctx, raw: &str) -> Result<(), CliError> {
+    if let Some(file) = raw.strip_prefix("file:") {
+        return file_links(ctx, file);
+    }
     let r = target_ref(ctx, raw, false)?;
     let (kind, id) = r.split_once(':').expect("ссылка n:/e:");
     let (out, back) = if kind == "n" {
@@ -99,6 +104,30 @@ pub fn list(ctx: &Ctx, raw: &str) -> Result<(), CliError> {
     }
     let mut s = render(&out, "→", "dst");
     s.push_str(&render(&back, "←", "src"));
+    emit(s.as_bytes())
+}
+
+/// `zam links file:<path>` (M4.5 §6.3): что память знает о файле — `GET /graph?file=`
+/// (путь нормализуется как у ссылок; решение — из `solution.toml`). Строка на владельца:
+/// `<ref>\t<путь заметки или заголовок записи>`.
+fn file_links(ctx: &Ctx, file: &str) -> Result<(), CliError> {
+    let (cwd, root) = super::refs::cli_root();
+    let path = super::refs::ref_path(file, &cwd, &root)
+        .map_err(|e| CliError::input(format!("file:{file}: {e}")))?;
+    let mut q = vec![("file", path.as_str())];
+    let sol = ctx.solution.as_ref().map(|s| s.id.clone());
+    if let Some(s) = &sol {
+        q.push(("solution", s.as_str()));
+    }
+    let g = read_json(ctx.client.get("/graph", &q)?)?;
+    if ctx.json {
+        return emit_json(&json!({ "file": path, "nodes": g["nodes"] }));
+    }
+    let mut s = String::new();
+    for n in g["nodes"].as_array().into_iter().flatten() {
+        let r = n["ref"].as_str().unwrap_or("?");
+        s.push_str(&format!("{r}\t{}\n", label(&g["nodes"], r)));
+    }
     emit(s.as_bytes())
 }
 

@@ -9,6 +9,8 @@
 //!   `file_glob` — из заголовков `*** Add File:`, `*** Update File:`, `*** Delete File:` (и
 //!   `*** Move to:`), `command_regex` к патчу не применяется (fix round 1, I-3; ⚠️ формат
 //!   входа на живом Codex не проверен);
+//! - знание о файле (M4.5 §6.3, ключ `file_context`) у правки — первыми строками, до
+//!   триггеров `file_glob`: те же строки, что у `post-tool` на `Read`, раз за сессию на файл;
 //! - запись показывается не больше раза за сессию (`shown-<сессия>.json`); правка
 //!   Write/Edit/MultiEdit/NotebookEdit/`apply_patch` — маркер `edits-<сессия>` для `checkpoint`
 //!   (R1). Маркер пишется и при выключенном `pre_tool`, если включён `checkpoint`
@@ -16,6 +18,10 @@
 //!
 //! Подсказка: `ZeroAIMemory: для <маска>: <title> [<вид>, <certainty>] — i:<id>`, для команды —
 //! без «для …». Показ `pre_tool` в `usage` сервера не пишется: сети здесь нет.
+//!
+//! M4.5 §9.4: запуск субагента (инструмент `Agent`/`Task`, matcher `Agent|Task` регистрирует
+//! `zam init`) — запись `{at, agent_type, task}` в очередь `spawn-<сессия>.json`; её берёт
+//! `subagent-start`. Пишется по ключу `subagent_start`, независимо от `pre_tool`.
 use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
@@ -24,7 +30,7 @@ use regex::RegexBuilder;
 use super::cache::{self, Trigger};
 use super::input::Input;
 use super::output::Output;
-use super::{Env, Kind, Settings};
+use super::{Env, Flag, Kind, Settings};
 
 /// Предел размера скомпилированного regex — как у проверки триггеров на сервере.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
@@ -32,7 +38,7 @@ const REGEX_SIZE_LIMIT: usize = 1 << 20;
 const COMMAND_SCAN_MAX: usize = 64 * 1024;
 
 /// Инструменты правки файлов (факт правок для `checkpoint`).
-fn is_edit_tool(name: &str) -> bool {
+pub fn is_edit_tool(name: &str) -> bool {
     matches!(
         name,
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch"
@@ -62,10 +68,50 @@ pub fn patch_files(patch: &str) -> Vec<String> {
     out
 }
 
+/// Инструмент запуска субагента у Claude Code (`Agent`; прежнее имя — `Task`).
+pub fn is_spawn_tool(name: &str) -> bool {
+    matches!(name, "Agent" | "Task")
+}
+
+/// Тип субагента, если `subagent_type` не задан (так делает сам Claude Code).
+pub const DEFAULT_AGENT_TYPE: &str = "general-purpose";
+
+/// Запуск субагента — в очередь `spawn-<сессия>.json` (§9.4): тип и первые 2000 символов
+/// `tool_input.prompt`. Ключ `subagent_start` выключен или нет сессии — ничего.
+fn queue_spawn(env: &Env, inp: &Input, s: &Settings, session: Option<&str>) {
+    let Some(id) = session else { return };
+    if !s.on(Kind::SubagentStart) {
+        return;
+    }
+    let agent_type = inp
+        .tool_input("subagent_type")
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(DEFAULT_AGENT_TYPE);
+    let task: String = inp
+        .tool_input("prompt")
+        .unwrap_or_default()
+        .chars()
+        .take(super::input::PROMPT_SALVAGE_CHARS)
+        .collect();
+    cache::push_spawn(
+        env,
+        id,
+        cache::Spawn {
+            at: super::journal::Timestamp::now(),
+            agent_type: agent_type.chars().take(128).collect(),
+            task,
+        },
+    );
+}
+
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     let tool = inp.str("tool_name").unwrap_or_default();
     let hints_on = s.on(Kind::PreTool);
     let session = inp.session_id.as_deref();
+    if is_spawn_tool(tool) {
+        queue_spawn(env, inp, s, session);
+    }
     if is_edit_tool(tool)
         && s.on(Kind::Checkpoint)
         && let Some(id) = session
@@ -75,10 +121,6 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     if !hints_on {
         return Output::Empty;
     }
-    let server = env.server_url();
-    let Some(c) = cache::usable_triggers(env, server.as_deref()) else {
-        return Output::Empty;
-    };
     let command = command_of(inp);
     let (files, command) = if tool == "apply_patch" {
         (patch_files(command.as_deref().unwrap_or_default()), None)
@@ -88,38 +130,51 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             .or_else(|| inp.tool_input("notebook_path"));
         (f.map(str::to_string).into_iter().collect(), command)
     };
-    let found = matches(&c.triggers, tool, &files, command.as_deref(), env);
-    if found.is_empty() {
-        return Output::Empty;
-    }
     let mut shown = session.map(|id| cache::read_shown(env, id));
     let mut dirty = false;
     let mut lines: Vec<String> = Vec::new();
-    let mut taken: Vec<&str> = Vec::new();
-    for (t, lead) in found {
-        if taken.contains(&t.entry_id.as_str()) {
-            continue;
-        }
-        taken.push(&t.entry_id);
-        if let Some(sh) = shown.as_mut() {
-            if sh.shown.contains(&t.entry_id) {
+    // знание о файле (M4.5 §6.3) — перед триггерами `file_glob`, в общем пределе текста
+    if is_edit_tool(tool) && s.flag_on(Flag::FileContext) {
+        let rels: Vec<String> = files
+            .iter()
+            .filter_map(|f| crate::cmd::refs::ref_path(f, &env.cwd, &env.root).ok())
+            .collect();
+        let before = shown.as_ref().map_or(0, |sh| sh.shown.len());
+        lines.extend(super::post_tool::file_context_lines(
+            env,
+            shown.as_mut(),
+            &rels,
+        ));
+        dirty |= shown.as_ref().map_or(0, |sh| sh.shown.len()) != before;
+    }
+    let server = env.server_url();
+    if let Some(c) = cache::usable_triggers(env, server.as_deref()) {
+        let found = matches(&c.triggers, tool, &files, command.as_deref(), env);
+        let mut taken: Vec<&str> = Vec::new();
+        for (t, lead) in found {
+            if taken.contains(&t.entry_id.as_str()) {
                 continue;
             }
-            sh.shown.push(t.entry_id.clone());
-            dirty = true;
+            taken.push(&t.entry_id);
+            if let Some(sh) = shown.as_mut() {
+                if sh.shown.contains(&t.entry_id) {
+                    continue;
+                }
+                sh.shown.push(t.entry_id.clone());
+                dirty = true;
+            }
+            lines.push(t.hint(&lead));
         }
-        lines.push(t.hint(&lead));
     }
     if dirty && let (Some(id), Some(sh)) = (session, shown.as_ref()) {
         cache::write_shown(env, id, sh);
     }
-    Output::context(
-        &inp.event,
-        &lines.join(
-            "
-",
-        ),
-    )
+    let text = lines.join("\n");
+    // выданное без сети — в очередь учёта, уйдёт со следующим сетевым хуком (M4.5 §9.5)
+    if let Some(id) = session {
+        cache::note_tokens(env, id, cache::TOKENS_PRE_TOOL, &text);
+    }
+    Output::context(&inp.event, &text)
 }
 
 /// `tool_input.command`: строка или массив аргументов (через пробел).

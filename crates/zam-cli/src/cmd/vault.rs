@@ -5,11 +5,14 @@
 //!   <причина>» (код выхода 0; `get` и `set` получают 503);
 //! - `zam vault get <имя> [--global] [--raw]` — в stdout только значение (`--raw` — без
 //!   перевода строки в конце); раскрытие пишется в аудит сервера;
-//! - `zam vault set <имя> --type T [--username U] [--link URL] [--description D] [--global]` —
-//!   значение **только** из stdin (один завершающий перевод строки отбрасывается) или
-//!   скрытого ввода с терминала, никогда из аргументов. Есть запись с этим именем — новая
-//!   ревизия (`If-Match`), открытые поля, не указанные флагами, сохраняются. Адрес ресурса —
-//!   `--link` (`data.url`): `--url` у всех команд — адрес сервера **[решение исполнителя]**.
+//! - `zam vault set|add <имя|--title Т> --type T [--username U] [--link URL] [--description D]
+//!   [--purpose P] [--address A] [--limits L] [--notes N] [--secret-stdin] [--global]` —
+//!   у `host`/`environment` (окружение, M4.5 §8) значение необязательно: читается из stdin
+//!   только с `--secret-stdin`. Значение **только** из stdin (один завершающий перевод строки
+//!   отбрасывается) или скрытого ввода с терминала, никогда из аргументов. Есть запись с этим
+//!   именем — новая ревизия (`If-Match`), открытые поля, не указанные флагами, сохраняются. Адрес
+//!   ресурса — `--link` (`data.url`): `--url` у всех команд — адрес сервера **[решение
+//!   исполнителя]**.
 //!
 //! Область: `--global` — личный Vault (`knowledge`), иначе Vault решения из `solution.toml`
 //! (или `--solution`). Vault решения лежит в базе пользователя токена и другим участникам не
@@ -35,6 +38,19 @@ pub struct Set<'a> {
     pub username: Option<&'a str>,
     pub url: Option<&'a str>,
     pub description: Option<&'a str>,
+    pub purpose: Option<&'a str>,
+    pub address: Option<&'a str>,
+    pub limits: Option<&'a str>,
+    pub notes: Option<&'a str>,
+    /// Читать значение из stdin даже у типов, где оно необязательно.
+    pub secret_stdin: bool,
+}
+
+impl Set<'_> {
+    /// Читается ли значение: у типов окружения — только с `--secret-stdin`.
+    fn wants_secret(&self) -> bool {
+        self.secret_stdin || !matches!(self.kind, "host" | "environment")
+    }
 }
 
 /// `{space}` Vault: `knowledge` или GUID решения.
@@ -125,6 +141,10 @@ pub fn merge_data(old: Option<&Value>, s: &Set) -> Value {
         ("username", s.username),
         ("url", s.url),
         ("description", s.description),
+        ("purpose", s.purpose),
+        ("address", s.address),
+        ("limits", s.limits),
+        ("notes", s.notes),
     ] {
         if let Some(v) = v {
             d.insert(k.into(), json!(v));
@@ -139,6 +159,7 @@ fn line(i: &Value) -> String {
     let hint = d["username"]
         .as_str()
         .or_else(|| d["url"].as_str())
+        .or_else(|| d["address"].as_str())
         .unwrap_or("-");
     format!(
         "{}\t{}\t{}\t{}\n",
@@ -178,6 +199,11 @@ pub fn get(ctx: &Ctx, a: &Area, name: &str, raw: bool) -> Result<(), CliError> {
     if ctx.json {
         return emit_json(&v);
     }
+    // запись окружения без значения: `secret: null`
+    if v["secret"].is_null() && v.get("secret").is_some() {
+        eprintln!("у записи нет значения");
+        return Ok(());
+    }
     let secret = v["secret"]
         .as_str()
         .ok_or_else(|| CliError::new(crate::client::EXIT_UNREACHABLE, "в ответе нет secret"))?;
@@ -201,11 +227,17 @@ pub fn set(ctx: &Ctx, a: &Area, s: &Set) -> Result<(), CliError> {
         })?;
     }
     let existing = find(ctx, &space, s.name)?;
-    let secret = read_secret(s.name.trim())?;
+    let secret = s
+        .wants_secret()
+        .then(|| read_secret(s.name.trim()))
+        .transpose()?;
     let r = match &existing {
         Some(item) => {
             let id = item["id"].as_str().unwrap_or_default();
-            let body = json!({ "data": merge_data(Some(&item["data"]), s), "secret": secret });
+            let mut body = json!({ "data": merge_data(Some(&item["data"]), s) });
+            if let Some(x) = &secret {
+                body["secret"] = json!(x);
+            }
             ctx.client.patch_json_if(
                 &format!("/vault/{id}"),
                 &body,
@@ -213,7 +245,10 @@ pub fn set(ctx: &Ctx, a: &Area, s: &Set) -> Result<(), CliError> {
             )?
         }
         None => {
-            let body = json!({ "title": s.name, "data": merge_data(None, s), "secret": secret });
+            let mut body = json!({ "title": s.name, "data": merge_data(None, s) });
+            if let Some(x) = &secret {
+                body["secret"] = json!(x);
+            }
             ctx.client
                 .post_json(&format!("/spaces/{space}/vault"), &body)?
         }
@@ -256,15 +291,30 @@ mod tests {
             username: None,
             url: Some("https://x"),
             description: None,
+            purpose: Some("стенд"),
+            address: None,
+            limits: None,
+            notes: None,
+            secret_stdin: false,
         };
         let old = json!({"type": "password", "username": "u", "url": "https://old"});
         assert_eq!(
             merge_data(Some(&old), &s),
-            json!({"type": "token", "username": "u", "url": "https://x"})
+            json!({"type": "token", "username": "u", "url": "https://x", "purpose": "стенд"})
         );
         assert_eq!(
             merge_data(None, &s),
-            json!({"type": "token", "url": "https://x"})
+            json!({"type": "token", "url": "https://x", "purpose": "стенд"})
+        );
+        assert!(s.wants_secret());
+        let h = Set { kind: "host", ..s };
+        assert!(!h.wants_secret());
+        assert!(
+            Set {
+                secret_stdin: true,
+                ..h
+            }
+            .wants_secret()
         );
     }
 }

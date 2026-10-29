@@ -1,4 +1,5 @@
-//! История ревизий заметки и унифицированный дифф между текстами.
+//! История ревизий заметки, унифицированный дифф между текстами и текст снимка записи журнала
+//! для чтения изменений (`POST /read` `since_rev`, M4.5 §7).
 
 use jiff::Timestamp;
 use rusqlite::OptionalExtension;
@@ -61,6 +62,33 @@ pub async fn list_revisions(db: &Db, id: Id) -> Result<Vec<RevisionInfo>, StoreE
         Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
+}
+
+/// Текст снимка ревизии записи журнала для построчного диффа (M4.5 §7): `title: <заголовок>`,
+/// пустая строка, тело, пустая строка и `data: ` каноническим JSON (ключи по алфавиту на всех
+/// уровнях, по полю на строку) — правка одного поля `data` даёт одну изменённую строку.
+pub fn entry_snapshot_text(title: &str, body: &str, data: &serde_json::Value) -> String {
+    let data = serde_json::to_string_pretty(&sorted_json(data)).unwrap_or_default();
+    let body = body.trim_end_matches(['\r', '\n']);
+    format!("title: {title}\n\n{body}\n\ndata: {data}\n")
+}
+
+/// Копия JSON с ключами объектов по алфавиту (не зависит от `preserve_order` у serde_json).
+fn sorted_json(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|k| (k.clone(), sorted_json(&m[k])))
+                    .collect(),
+            )
+        }
+        Value::Array(a) => Value::Array(a.iter().map(sorted_json).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Унифицированный дифф по строкам (контекст 3) с заголовками

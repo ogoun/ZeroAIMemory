@@ -19,10 +19,14 @@
 //! Eval M4 (задача 15): `--hints` — точность подсказок хуков `eval/hints.toml`, калибровка
 //! порогов и задержки `/recall` и хуков ([`hints`]); `--tokens` — расход токенов агента по
 //! сценариям `eval/scenarios.toml` ([`tokens`]).
+//!
+//! Eval M4.5 (задача 15): `--glossary` — словарь RU↔EN `eval/glossary.toml`, канал `alias` и
+//! его вес, основной набор со словарём и связями `contradicts` ([`glossary`]).
 
 pub mod compare;
 pub mod corpus;
 pub mod gate;
+pub mod glossary;
 pub mod grid;
 pub mod hints;
 pub mod insights;
@@ -157,10 +161,20 @@ pub struct EvalArgs {
     /// корпусе (target/eval/<прогон>), например с другими весами --set
     #[arg(long)]
     pub reuse: bool,
+    /// Префикс имени результата после даты (`--hints` и прогоны `--mode`):
+    /// `<дата>-<префикс>-<модель|fts>-…`, например `m45` — итоги этапа под общим префиксом без
+    /// ручного переименования (у `--glossary` имена свои)
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["glossary", "grid", "quality_gate", "tokens"])]
+    pub prefix: Option<String>,
     /// Прежний результат (JSON eval/results/…): парная разность recall@5 и nDCG@10 по общим
-    /// запросам (тот же id, вид и expect) — в отчёт прогона
+    /// запросам (тот же id, вид и expect) — в отчёт прогона; можно повторять: прогон режима
+    /// сравнивается с файлом того же режима (`info.mode`), один файл — со всеми режимами
     #[arg(long, value_name = "FILE")]
-    pub compare: Option<PathBuf>,
+    pub compare: Vec<PathBuf>,
+    /// Eval словаря M4.5 (eval/glossary.toml): запросы на псевдонимах и основной набор без
+    /// словаря, со словарём и с весами канала `alias` 0 / 0,25 / 0,5 / 0,75
+    #[arg(long, conflicts_with_all = ["grid", "check", "hints", "tokens", "quality_gate", "reuse"])]
+    pub glossary: bool,
 }
 
 /// Каталоги и файлы набора.
@@ -175,6 +189,8 @@ pub struct Paths {
     pub hints: PathBuf,
     /// `eval/scenarios.toml` — сценарии расхода токенов (M4).
     pub scenarios: PathBuf,
+    /// `eval/glossary.toml` — словарь и запросы на псевдонимах (M4.5).
+    pub glossary: PathBuf,
     pub results: PathBuf,
     /// `target/eval` — каталоги данных прогонов.
     pub work: PathBuf,
@@ -196,6 +212,7 @@ impl Paths {
                 .unwrap_or_else(|| eval.join("insights.toml")),
             hints: eval.join("hints.toml"),
             scenarios: eval.join("scenarios.toml"),
+            glossary: eval.join("glossary.toml"),
             results: a.out.clone().unwrap_or_else(|| eval.join("results")),
             work: repo.join("target").join("eval"),
         }
@@ -270,6 +287,13 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
                 h.irrelevant,
                 sc.len()
             );
+            let (g, _) = glossary::load_glossary(&p.glossary)?;
+            glossary::validate_glossary(&g, &corpus, true)?;
+            println!(
+                "набор M4.5: терминов словаря {}, запросов на псевдонимах {}",
+                g.term.len(),
+                g.query.len()
+            );
         }
         println!("EVAL-CHECK OK");
         return Ok(());
@@ -284,6 +308,9 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     }
     if a.tokens {
         return tokens::run(&a, &p, &corpus);
+    }
+    if a.glossary {
+        return glossary::run(&a, &p, &corpus, &queries);
     }
     if let Some(g) = &a.grid {
         return grid::run(&a, &p, &corpus, &queries, g);

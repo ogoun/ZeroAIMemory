@@ -1,9 +1,12 @@
 //! Vault (§7.6, §12): секреты пользователя.
 //!
-//! - `GET /spaces/{space}/vault?q=` — метаданные (без значений), `q` — подстрока имени,
-//!   `data.url`, `data.description`;
-//! - `POST /spaces/{space}/vault {title, data: {type, username?, url?, description?}, secret}`
-//!   → 201 (имя занято в области → 409);
+//! - `GET /spaces/{space}/vault?q=` — метаданные (без значений), `q` — поиск `vault_fts` по
+//!   имени и открытым полям (слова от 3 символов — префиксом, порядок `bm25`); запасной путь
+//!   для `q` короче 3 символов — подстрока имени, `data.url`, `data.description`;
+//! - `POST /spaces/{space}/vault {title, data: {type, username?, url?, description?, purpose?,
+//!   address?, limits?, notes?}, secret?}` → 201 (имя занято в области → 409). `secret`
+//!   обязателен, кроме типов `host` и `environment` (окружение, M4.5 §8): у них без значения
+//!   в базе пустой блоб, раскрытие отдаёт `secret: null`;
 //! - `GET /vault/{id}` — метаданные; `?reveal=1` — и значение (`Cache-Control: no-store`,
 //!   аудит `vault.reveal` с `{item, session, machine}`, `actor` — id токена);
 //! - `PATCH /vault/{id} {title?, data?, secret?}` (`If-Match: <rev>` необязателен) — новая
@@ -55,7 +58,7 @@ use crate::error::ApiError;
 use crate::vault::VaultState;
 
 /// Допустимые `data.type`.
-pub const VAULT_TYPES: [&str; 7] = [
+pub const VAULT_TYPES: [&str; 9] = [
     "password",
     "token",
     "ssh_key",
@@ -63,6 +66,8 @@ pub const VAULT_TYPES: [&str; 7] = [
     "url",
     "repo",
     "note",
+    "host",
+    "environment",
 ];
 /// Предел значения секрета, байт UTF-8. [решение исполнителя]
 pub const SECRET_MAX_BYTES: usize = 64 * 1024;
@@ -70,6 +75,10 @@ pub const SECRET_MAX_BYTES: usize = 64 * 1024;
 const USERNAME_MAX_CHARS: usize = 200;
 const URL_MAX_CHARS: usize = 2000;
 const DESCRIPTION_MAX_CHARS: usize = 2000;
+const PURPOSE_MAX_CHARS: usize = 500;
+const ADDRESS_MAX_CHARS: usize = 500;
+const LIMITS_MAX_CHARS: usize = 1000;
+const NOTES_MAX_CHARS: usize = 2000;
 
 fn unprocessable(m: impl Into<String>) -> ApiError {
     ApiError::Unprocessable(m.into())
@@ -96,7 +105,8 @@ fn vault_body<T: DeserializeOwned>(b: Result<Bytes, BytesRejection>) -> Result<T
     })
 }
 
-/// `data` записи: объект `{type, username?, url?, description?}`; `null` — поле не задано.
+/// `data` записи: объект `{type, username?, url?, description?, purpose?, address?, limits?,
+/// notes?}`; `null` — поле не задано.
 fn check_data(d: &Value) -> Result<Value, ApiError> {
     let o = d
         .as_object()
@@ -118,6 +128,10 @@ fn check_data(d: &Value) -> Result<Value, ApiError> {
             "username" => USERNAME_MAX_CHARS,
             "url" => URL_MAX_CHARS,
             "description" => DESCRIPTION_MAX_CHARS,
+            "purpose" => PURPOSE_MAX_CHARS,
+            "address" => ADDRESS_MAX_CHARS,
+            "limits" => LIMITS_MAX_CHARS,
+            "notes" => NOTES_MAX_CHARS,
             _ => return Err(unprocessable(format!("data.{k}: неизвестное поле"))),
         };
         match v {
@@ -137,6 +151,17 @@ fn check_data(d: &Value) -> Result<Value, ApiError> {
         )));
     }
     Ok(Value::Object(out))
+}
+
+/// Тип записи окружения: значение необязательно.
+fn env_type(data: &Value) -> bool {
+    data.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| zam_store::VAULT_ENV_TYPES.contains(&t))
+}
+
+fn secret_required() -> ApiError {
+    unprocessable("secret обязателен (необязателен только у типов host и environment)")
 }
 
 /// Значение: непустое, до [`SECRET_MAX_BYTES`].
@@ -336,6 +361,21 @@ fn secret_text(plain: &[u8]) -> Result<String, ApiError> {
         .map_err(|_| ApiError::Internal("значение Vault — не UTF-8".into()))
 }
 
+/// Раскрытое значение: строка, у записи окружения без значения (пустой блоб) — `null`.
+async fn secret_of(
+    st: &AppState,
+    user: Id,
+    item: Id,
+    rev: i64,
+    blob: &[u8],
+) -> Result<Value, ApiError> {
+    if blob.is_empty() {
+        return Ok(Value::Null);
+    }
+    let plain = st.vault.decrypt(user, item, rev, blob).await?;
+    Ok(Value::String(secret_text(&plain)?))
+}
+
 /// Флаг `reveal`: `1`/`true` — да, `0`/`false`/нет — нет.
 fn flag(v: Option<&str>) -> Result<bool, ApiError> {
     match v {
@@ -374,7 +414,7 @@ pub async fn list(
 pub struct Create {
     title: String,
     data: Value,
-    secret: Zeroizing<String>,
+    secret: Option<Zeroizing<String>>,
 }
 
 /// `POST /spaces/{space}/vault` → 201 метаданные.
@@ -390,13 +430,17 @@ pub async fn create(
     let req: Create = vault_body(body)?;
     let title = check_title(&req.title)?;
     let data = check_data(&req.data)?;
-    check_secret(&req.secret)?;
     let attrib = attribution(&p, &headers, None)?;
     let id = Id::new();
-    let blob = st
-        .vault
-        .encrypt(a.user.id, id, 1, req.secret.as_bytes())
-        .await?;
+    let blob = match &req.secret {
+        Some(s) => {
+            check_secret(s)?;
+            st.vault.encrypt(a.user.id, id, 1, s.as_bytes()).await?
+        }
+        // окружение без значения: пустой блоб, шифровать нечего
+        None if env_type(&data) => Vec::new(),
+        None => return Err(secret_required()),
+    };
     let m = vault_put(&a.db, id, &scope, &title, data, blob, &attrib).await?;
     Ok((StatusCode::CREATED, Json(meta_json(&m))))
 }
@@ -425,8 +469,7 @@ pub async fn get(
         }
         return Ok(Json(v).into_response());
     }
-    let plain = st.vault.decrypt(a.user.id, m.id, m.rev, &blob).await?;
-    let secret = secret_text(&plain)?;
+    let secret = secret_of(&st, a.user.id, m.id, m.rev, &blob).await?;
     // аудит до выдачи: не записан — значение не выдаётся
     audit(
         &st,
@@ -440,7 +483,7 @@ pub async fn get(
     )
     .await?;
     if let Value::Object(o) = &mut v {
-        o.insert("secret".into(), Value::String(secret));
+        o.insert("secret".into(), secret);
     }
     Ok(revealed(v))
 }
@@ -485,14 +528,27 @@ pub async fn patch(
         return Ok(Json(meta_json(&m)));
     }
     let attrib = attribution(&p, &headers, None)?;
-    let plain = match &req.secret {
-        Some(s) => Zeroizing::new(s.as_bytes().to_vec()),
-        None => st.vault.decrypt(a.user.id, m.id, m.rev, &blob).await?,
+    // тип после правки без значения — только окружение (пустой блоб у прежнего типа не в счёт)
+    let after_env = data.as_ref().map_or_else(|| env_type(&m.data), env_type);
+    let new_blob = match &req.secret {
+        Some(s) => {
+            st.vault
+                .encrypt(a.user.id, m.id, expected + 1, s.as_bytes())
+                .await?
+        }
+        None if blob.is_empty() => {
+            if !after_env {
+                return Err(secret_required());
+            }
+            Vec::new()
+        }
+        None => {
+            let plain = st.vault.decrypt(a.user.id, m.id, m.rev, &blob).await?;
+            st.vault
+                .encrypt(a.user.id, m.id, expected + 1, &plain)
+                .await?
+        }
     };
-    let new_blob = st
-        .vault
-        .encrypt(a.user.id, m.id, expected + 1, &plain)
-        .await?;
     let m = vault_update(&a.db, m.id, expected, title, data, new_blob, &attrib).await?;
     Ok(Json(meta_json(&m)))
 }
@@ -562,8 +618,7 @@ pub async fn revisions(
         .find(|r| r.rev == rev)
         .ok_or(ApiError::NotFound)?;
     let blob = vault_revision_secret(&a.db, m.id, rev).await?;
-    let plain = st.vault.decrypt(a.user.id, m.id, rev, &blob).await?;
-    let secret = secret_text(&plain)?;
+    let secret = secret_of(&st, a.user.id, m.id, rev, &blob).await?;
     audit(
         &st,
         &p,
@@ -578,7 +633,7 @@ pub async fn revisions(
     let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
     if let Value::Object(o) = &mut v {
         o.insert("id".into(), json!(m.id));
-        o.insert("secret".into(), Value::String(secret));
+        o.insert("secret".into(), secret);
     }
     Ok(revealed(v))
 }
@@ -595,6 +650,10 @@ mod tests {
         for t in VAULT_TYPES {
             assert!(check_data(&json!({ "type": t })).is_ok(), "{t}");
         }
+        let full = json!({"type": "host", "purpose": "p".repeat(500), "address": "a".repeat(500),
+            "limits": "l".repeat(1000), "notes": "n".repeat(2000)});
+        assert!(check_data(&full).is_ok());
+        assert!(env_type(&full) && !env_type(&json!({"type": "note"})));
         for bad in [
             json!([]),
             json!({}),
@@ -603,6 +662,10 @@ mod tests {
             json!({"type": "note", "extra": "x"}),
             json!({"type": "note", "url": 5}),
             json!({"type": "note", "username": "u".repeat(201)}),
+            json!({"type": "host", "purpose": "p".repeat(501)}),
+            json!({"type": "host", "address": "a".repeat(501)}),
+            json!({"type": "host", "limits": "l".repeat(1001)}),
+            json!({"type": "host", "notes": "n".repeat(2001)}),
         ] {
             assert!(
                 matches!(check_data(&bad), Err(ApiError::Unprocessable(_))),

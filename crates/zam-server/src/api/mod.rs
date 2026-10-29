@@ -6,11 +6,14 @@ pub mod cache;
 pub mod downloads;
 pub mod entries;
 pub mod feedback;
+pub mod files;
+pub mod glossary;
 pub mod graph;
 pub mod health;
 pub mod index;
 pub mod insights;
 pub mod nodes;
+pub mod questions;
 pub mod read;
 pub mod recall;
 pub mod releases;
@@ -21,6 +24,7 @@ pub mod secrets;
 pub mod sessions;
 pub mod solutions;
 pub mod spaces;
+pub mod tasks;
 pub mod triggers;
 pub mod user_settings;
 pub mod vault;
@@ -114,7 +118,11 @@ fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
                 .delete(entries::remove)
                 .layer(note_limit),
         )
+        .route("/api/v1/spaces/{space}/glossary", get(glossary::get))
         .route("/api/v1/entries/{id}/restore", post(entries::restore))
+        .route("/api/v1/entries/{id}/answer", post(questions::answer))
+        .route("/api/v1/entries/{id}/claim", post(tasks::claim))
+        .route("/api/v1/entries/{id}/release", post(tasks::release))
         .route(
             "/api/v1/entries/{id}/supersede",
             post(insights::supersede).layer(note_limit),
@@ -220,6 +228,10 @@ fn service_routes() -> Router<AppState> {
         .route("/api/v1/cache", get(cache::list))
         .route("/api/v1/cache/{id}", get(cache::get))
         .route("/api/v1/triggers", get(triggers::list))
+        // ссылки на файлы (M4.5 §6): состояние ссылок, не текст памяти — вне `memory_routes`
+        .route("/api/v1/file-refs", get(files::index))
+        .route("/api/v1/files/changed", post(files::changed))
+        .route("/api/v1/files/verified", post(files::verified))
         .route(
             "/api/v1/sessions",
             get(sessions::list).post(sessions::create),

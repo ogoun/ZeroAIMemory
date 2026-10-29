@@ -1,8 +1,10 @@
 //! Smoke-тест комплекта: распаковка, запуск сервера, проверка API, клиента и Qdrant,
 //! векторный поиск на тестовой модели (M2), устройство модели, завершение Qdrant вместе с
 //! сервером; память решения (M3): регистрация решения, insight в выдаче, Vault; агенты (M4):
-//! MCP `tools/list`, `/recall` по ошибке, кэш триггеров и подсказка `zam hook pre-tool`; для
-//! Windows — статический CRT наших exe и app-local MSVC runtime библиотек.
+//! MCP `tools/list`, `/recall` по ошибке, кэш триггеров и подсказка `zam hook pre-tool`;
+//! рабочая память (M4.5): термин и поиск по псевдониму, захват задачи, вопрос и ответ,
+//! `zam refs check`; для Windows — статический CRT наших exe и app-local MSVC runtime
+//! библиотек.
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
 use std::collections::VecDeque;
@@ -592,11 +594,35 @@ fn zam_ok(
     args: &[&str],
     input: Option<&[u8]>,
 ) -> Result<Output> {
-    let out = output_with_stdin(
-        zam_cmd(zam, home, base, token).args(args),
-        input,
-        CMD_TIMEOUT,
-    )?;
+    let out = zam_run(zam, (home, home), (base, token), args, input, &[])?;
+    if out.status.code() != Some(0) {
+        bail!(
+            "zam {}: код {:?}\n{}{}",
+            args.join(" "),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(out)
+}
+
+/// `zam <args>` в каталоге `cwd` («домашний» каталог — `home`) с переменными `envs`; код
+/// выхода не проверяется, токен в выводе целиком — ошибка.
+fn zam_run(
+    zam: &Path,
+    (home, cwd): (&Path, &Path),
+    (base, token): (&str, &str),
+    args: &[&str],
+    input: Option<&[u8]>,
+    envs: &[(&str, &str)],
+) -> Result<Output> {
+    let mut cmd = zam_cmd(zam, home, base, token);
+    cmd.current_dir(cwd).args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = output_with_stdin(&mut cmd, input, CMD_TIMEOUT)?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -604,13 +630,6 @@ fn zam_ok(
     );
     if text.contains(token) {
         bail!("вывод zam {} содержит токен целиком", args.join(" "));
-    }
-    if out.status.code() != Some(0) {
-        bail!(
-            "zam {}: код {:?}\n{text}",
-            args.join(" "),
-            out.status.code()
-        );
     }
     Ok(out)
 }
@@ -868,6 +887,22 @@ pub fn run(
     s.run(
         "M4: zam hook session-start → кэш триггеров, zam hook pre-tool → подсказка",
         hook_pre_tool(&zam, &dir, &base, &token, &hook_id),
+    )?;
+    s.run(
+        "M4.5: zam log term → поиск по псевдониму (канал alias), zam glossary",
+        glossary_alias(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M4.5: zam task new → claim сессией агента, чужая сессия — код 4",
+        task_claim(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M4.5: zam question ask → answer --channel chat → решение axiom в дайджесте",
+        question_answer(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M4.5: zam log insight --ref → правка файла → zam refs check → stale",
+        refs_check(&zam, &dir, &base, &token),
     )?;
     s.run(
         "Qdrant запущен сервером (pid-файл, qdrant status --json)",
@@ -1636,6 +1671,292 @@ fn hook_pre_tool(zam: &Path, dir: &Path, base: &str, token: &str, id: &str) -> R
         || !ctx.starts_with("ZeroAIMemory: для scripts/**/*.sh:")
     {
         bail!("zam hook pre-tool: нет подсказки i:{id}: {v}");
+    }
+    Ok(())
+}
+
+// ---- M4.5: рабочая память ----
+
+/// Термин словаря smoke-теста M4.5: имя, псевдоним другого языка и определение (слова не
+/// встречаются в других шагах smoke).
+const TERM_NAME: &str = "Квазивыжимка";
+const TERM_ALIAS: &str = "quasisummary";
+const TERM_DEFINITION: &str = "Краткое изложение заметки для агента";
+/// Заметка решения со словом-именем термина (без псевдонима).
+const TERM_NOTE: &str = "smoke/wm-term";
+/// Сессия агента шагов M4.5 (`ZAM_SESSION`).
+const WM_SESSION: &str = "smoke-wm";
+
+/// Проект M4.5: каталог с `.zeroaimemory/solution.toml` решения smoke-теста (корень ссылок на
+/// файлы) и «домашний» каталог; создаются при первом вызове.
+fn wm_project(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let home = dir.join("wm-home");
+    let project = dir.join("wm-project");
+    fs::create_dir_all(project.join(".zeroaimemory"))?;
+    fs::create_dir_all(&home)?;
+    fs::write(
+        project.join(".zeroaimemory").join("solution.toml"),
+        format!("agent_solution_id = \"{SMOKE_SOLUTION}\"\nname = \"smoke\"\n"),
+    )?;
+    Ok((home, project))
+}
+
+/// `zam <args>` в проекте M4.5 с кодом 0; `envs` — переменные окружения.
+fn wm_zam(
+    zam: &Path,
+    dir: &Path,
+    conn: (&str, &str),
+    args: &[&str],
+    input: Option<&[u8]>,
+    envs: &[(&str, &str)],
+) -> Result<String> {
+    let (home, project) = wm_project(dir)?;
+    let out = zam_run(zam, (&home, &project), conn, args, input, envs)?;
+    if out.status.code() != Some(0) {
+        bail!(
+            "zam {}: код {:?}\n{}{}",
+            args.join(" "),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Id из вывода `zam log|task new|question ask` (`<id>@<rev>`).
+fn printed_id(out: &str, what: &str) -> Result<String> {
+    let id = out.trim().split('@').next().unwrap_or_default().to_string();
+    if id.is_empty() {
+        bail!("{what} не напечатал id записи");
+    }
+    Ok(id)
+}
+
+/// Критерий M4.5 «словарь» (§2): `zam log term` с псевдонимом → заметка решения со словом-
+/// именем находится поиском по псевдониму каналом `alias` (`expanded` — этот термин;
+/// ожидание индексации заметки ≤ 60 с) → `zam glossary <псевдоним>` печатает карточку.
+fn glossary_alias(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    wm_zam(
+        zam,
+        dir,
+        conn,
+        &[
+            "log",
+            "term",
+            "--title",
+            TERM_NAME,
+            "--definition",
+            TERM_DEFINITION,
+            "--alias",
+            TERM_ALIAS,
+        ],
+        None,
+        &[],
+    )?;
+    let note = serde_json::json!({
+        "space": SMOKE_SOLUTION, "path": TERM_NOTE, "kind": "note",
+        "content": format!("# {TERM_NAME} заметки\n\n{TERM_NAME} хранится отдельно от текста.\n"),
+    });
+    let (status, v) = api(base, token, "/api/v1/nodes", Some(&note))?;
+    if status != 201 {
+        bail!("POST /api/v1/nodes: HTTP {status}: {v}");
+    }
+    let body = serde_json::json!({
+        "query": TERM_ALIAS, "scope": {"solution": SMOKE_SOLUTION},
+        "filters": {"kinds": ["note"]}, "top_k": 5,
+    });
+    let t0 = Instant::now();
+    loop {
+        let (status, v) = api(base, token, "/api/v1/search", Some(&body))?;
+        if status != 200 {
+            bail!("POST /api/v1/search: HTTP {status}: {v}");
+        }
+        let hit = v["items"].as_array().into_iter().flatten().find(|i| {
+            i["path"]
+                .as_str()
+                .is_some_and(|p| p.trim_start_matches('/') == TERM_NOTE)
+        });
+        if let Some(hit) = hit {
+            if !channels(hit).contains(&"alias") || v["expanded"][0]["term"] != TERM_NAME {
+                bail!(
+                    "заметка найдена не каналом alias: sources = {}, expanded = {}",
+                    hit["sources"],
+                    v["expanded"]
+                );
+            }
+            break;
+        }
+        if t0.elapsed() > INDEX_WAIT {
+            bail!(
+                "за {} с поиск «{TERM_ALIAS}» не нашёл {TERM_NOTE}: {}; expanded = {}",
+                INDEX_WAIT.as_secs(),
+                describe_items(&v),
+                v["expanded"]
+            );
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let card = wm_zam(zam, dir, conn, &["glossary", TERM_ALIAS], None, &[])?;
+    if !card.contains(TERM_NAME) || !card.contains(TERM_DEFINITION) {
+        bail!("zam glossary {TERM_ALIAS}: нет карточки термина:\n{card}");
+    }
+    Ok(())
+}
+
+/// Критерий M4.5 «задачи» (§3): `zam task new` → `zam task claim` сессией агента — захват в
+/// записи (`claimed_by.session`); захват той же задачи другой сессией — код 4.
+fn task_claim(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let out = wm_zam(
+        zam,
+        dir,
+        conn,
+        &[
+            "task",
+            "new",
+            "--title",
+            "Smoke: проверить захват задачи",
+            "--next",
+            "захватить",
+        ],
+        Some("План smoke.\n".as_bytes()),
+        &[],
+    )?;
+    let id = printed_id(&out, "zam task new")?;
+    let k = format!("k:{id}");
+    let session = [("ZAM_SESSION", WM_SESSION)];
+    wm_zam(zam, dir, conn, &["task", "claim", &k], None, &session)?;
+    let (status, e) = api(base, token, &format!("/api/v1/entries/{id}"), None)?;
+    if status != 200 || e["data"]["claimed_by"]["session"] != WM_SESSION {
+        bail!("GET /api/v1/entries/{id}: HTTP {status}, захват не записан: {e}");
+    }
+    let (home, project) = wm_project(dir)?;
+    let other = zam_run(
+        zam,
+        (&home, &project),
+        conn,
+        &["task", "claim", &k],
+        None,
+        &[("ZAM_SESSION", "smoke-wm-other")],
+    )?;
+    if other.status.code() != Some(4) {
+        bail!(
+            "захват занятой задачи другой сессией: код {:?} (ожидался 4)",
+            other.status.code()
+        );
+    }
+    Ok(())
+}
+
+/// Критерий M4.5 «вопросы» (§4): `zam question ask` с вариантами → `zam question answer
+/// --channel chat` (слова человека) — решение `decision` с `certainty: axiom`; дайджест новой
+/// сессии (`/recall session_start`) показывает ответ `q:<id> → i:<решение>`.
+fn question_answer(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let out = wm_zam(
+        zam,
+        dir,
+        conn,
+        &[
+            "question",
+            "ask",
+            "--title",
+            "Smoke: какой формат журнала выбрать?",
+            "--option",
+            "a=JSON",
+            "--option",
+            "b=текст",
+            "--recommend",
+            "a",
+        ],
+        Some("Журнал читают люди и скрипты.\n".as_bytes()),
+        &[],
+    )?;
+    let qid = printed_id(&out, "zam question ask")?;
+    let out = wm_zam(
+        zam,
+        dir,
+        conn,
+        &[
+            "question",
+            "answer",
+            &format!("q:{qid}"),
+            "--option",
+            "a",
+            "--by",
+            "human",
+            "--channel",
+            "chat",
+        ],
+        None,
+        &[],
+    )?;
+    let did = out
+        .trim()
+        .rsplit_once("i:")
+        .map(|(_, d)| d.trim().to_string())
+        .with_context(|| format!("zam question answer не напечатал решение: {out}"))?;
+    let (status, d) = api(base, token, &format!("/api/v1/entries/{did}"), None)?;
+    if status != 200 || d["certainty"] != "axiom" || d["data"]["kind"] != "decision" {
+        bail!("решение i:{did}: HTTP {status}, ожидался decision с axiom: {d}");
+    }
+    let body = serde_json::json!({
+        "event": "session_start", "session_id": "smoke-wm-q", "solution": SMOKE_SOLUTION,
+    });
+    let (status, v) = api(base, token, "/api/v1/recall", Some(&body))?;
+    let want = format!("q:{qid} → i:{did}");
+    if status != 200 || !v["text"].as_str().is_some_and(|t| t.contains(&want)) {
+        bail!(
+            "/recall(session_start): HTTP {status}, нет ответа «{want}»: {}",
+            v["text"]
+        );
+    }
+    Ok(())
+}
+
+/// Критерий M4.5 «ссылки на файлы» (§6): `zam log insight --ref src/wm.rs` (хэш ставит `zam`) →
+/// файл изменён → `zam refs check` находит изменение → ссылка в `GET /file-refs` — `stale`.
+fn refs_check(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let (_, project) = wm_project(dir)?;
+    let file = project.join("src").join("wm.rs");
+    fs::create_dir_all(project.join("src"))?;
+    fs::write(&file, "pub fn wm() {}\n")?;
+    wm_zam(
+        zam,
+        dir,
+        conn,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "Smoke: функция wm без проверки входа",
+            "--ref",
+            "src/wm.rs",
+            "--force",
+        ],
+        Some("Пустой вход не проверяется.\n".as_bytes()),
+        &[],
+    )?;
+    fs::write(&file, "pub fn wm() { todo!() }\n")?;
+    let out = wm_zam(zam, dir, conn, &["refs", "check"], None, &[])?;
+    if !out.contains("изменилось 1") || !out.contains("src/wm.rs") {
+        bail!("zam refs check не нашёл изменение src/wm.rs:\n{out}");
+    }
+    let path = format!("/api/v1/file-refs?solution={SMOKE_SOLUTION}");
+    let (status, idx) = api(base, token, &path, None)?;
+    let state = idx["refs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["path"] == "src/wm.rs")
+        .map(|r| r["items"][0]["state"].clone());
+    if status != 200 || state != Some(Value::from("stale")) {
+        bail!("GET /file-refs: HTTP {status}, ссылка src/wm.rs не stale: {idx}");
     }
     Ok(())
 }

@@ -1,6 +1,7 @@
 //! Команды заметок `zam` (tree, read, write, history, search, attach) против настоящего
 //! zam-server в том же процессе тестов. Сервер крутится в отдельном потоке со своим
 //! рантаймом tokio, поэтому сами тесты синхронные.
+mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -10,10 +11,7 @@ use zam_server::build;
 use zam_server::config::ServerConfig;
 
 fn tmp(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-notes-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    common::sandbox("cli-notes", name)
 }
 
 /// Сервер на 127.0.0.1:0 в фоновом потоке; адрес и первый токен администратора.
@@ -64,19 +62,7 @@ impl Env {
 
     /// `zam` с чистым окружением: без прокси и ZAM_*, HOME и cwd — во временном каталоге.
     fn zam(&self) -> Command {
-        let mut c = Command::cargo_bin("zam").unwrap();
-        for k in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
-            c.env_remove(k);
-        }
+        let mut c = common::zam_cmd();
         c.env("ZAM_URL", &self.url)
             .env("ZAM_TOKEN", &self.token)
             .env("HOME", &self.cwd)
@@ -321,8 +307,7 @@ fn unreachable_server_exit_2() {
         l.local_addr().unwrap().port()
     };
     let cwd = tmp("down-cwd");
-    let o = Command::cargo_bin("zam")
-        .unwrap()
+    let o = common::zam_cmd()
         .env_remove("ZAM_URL")
         .env_remove("ZAM_TOKEN")
         .env("HOME", &cwd)
@@ -512,5 +497,40 @@ fn read_batch_flags() {
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
     // --rev с пачкой
     let o = e.run(&["read", "knowledge:b1", "--batch", "--rev", "1"]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+}
+
+/// `zam read --since-rev N` (M4.5 §7): дифф с ревизии, `--json` — элемент сервера, равная
+/// текущей — `unchanged`, несколько целей — код 6.
+#[test]
+fn read_since_rev_cli() {
+    let e = Env::new("since-rev");
+    let v1: String = (0..20).map(|i| format!("Строка {i}.\n")).collect();
+    ok(&e.run_stdin(&["write", "knowledge:s1"], v1.as_bytes()));
+    let v2 = v1.replace("Строка 9.", "Строка девять.");
+    ok(&e.run_stdin(&["write", "knowledge:s1"], v2.as_bytes()));
+    let s = ok(&e.run(&["read", "knowledge:s1", "--since-rev", "1"]));
+    assert!(s.contains("rev2 · ~"), "{s}");
+    assert!(s.contains("(изменения с rev1, дифф)"), "{s}");
+    assert!(s.contains("-Строка 9.\n+Строка девять.\n"), "{s}");
+    assert!(!s.contains("Строка 2."), "{s}");
+    let v: serde_json::Value = serde_json::from_str(&ok(&e.run(&[
+        "read",
+        "knowledge:s1",
+        "--since-rev",
+        "1",
+        "--json",
+    ])))
+    .unwrap();
+    assert!(
+        v["items"][0]["diff"]
+            .as_str()
+            .unwrap()
+            .starts_with("--- rev 1\n"),
+        "{v}"
+    );
+    let s = ok(&e.run(&["read", "knowledge:s1", "--since-rev", "2"]));
+    assert!(s.contains("rev2 · unchanged"), "{s}");
+    let o = e.run(&["read", "knowledge:s1", "knowledge:s1", "--since-rev", "1"]);
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
 }

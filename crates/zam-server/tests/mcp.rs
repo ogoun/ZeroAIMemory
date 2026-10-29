@@ -852,6 +852,47 @@ async fn mcp_vault_get_audited() {
     assert!(o.is_error, "{}", o.text);
 }
 
+/// Запись окружения без значения: `memory_vault get id=v:<id>` (ссылка дайджеста) отдаёт
+/// открытые поля без строки `value`, поиск `list name=` идёт по открытым полям.
+#[tokio::test]
+async fn mcp_vault_env_get_by_digest_ref() {
+    let a = api("mcp-vault-env", |_| {}).await;
+    let h = sess();
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/vault",
+            Some(json!({"title": "stage", "data": {"type": "host",
+                "purpose": "приёмочный стенд", "address": "10.0.0.5:22"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_vault",
+        json!({"action": "get", "id": format!("v:{id}")}),
+    )
+    .await;
+    assert!(
+        o.text.contains("address: 10.0.0.5:22") && o.text.contains("purpose: приёмочный стенд"),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("value:"), "{}", o.text);
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_vault",
+        json!({"action": "list", "name": "приёмочный"}),
+    )
+    .await;
+    assert!(o.text.contains("stage"), "{}", o.text);
+}
+
 #[tokio::test]
 async fn mcp_foreign_origin_403() {
     let a = api("mcp-origin", |_| {}).await;
@@ -1071,4 +1112,259 @@ fn mcp_vault_value_not_in_debug_log() {
     assert!(log.contains("DEBUG"), "журнал без debug-строк");
     assert!(!log.contains(value), "значение Vault в журнале");
     assert!(!srv.tail().contains(value), "значение Vault в stderr");
+}
+
+/// M4.5 (принцип 0.2): новые виды и действия идут через прежние инструменты — их по-прежнему
+/// 10; инструкция `initialize` называет рабочую память.
+#[tokio::test]
+async fn mcp_tool_count_still_10() {
+    let a = api("mcp-count-m45", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    assert_eq!(list["tools"].as_array().unwrap().len(), 10, "{list}");
+    let init = rpc(
+        &a,
+        &a.token,
+        &[],
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "test", "version": "1"}}),
+    )
+    .await;
+    let s = init["instructions"].as_str().unwrap_or_default();
+    for want in ["kind=task|question|term", "event=recovery", "event=brief"] {
+        assert!(s.contains(want), "{want}: {s}");
+    }
+}
+
+/// Описания инструментов — до 300 символов и перечисляют новые виды и действия M4.5.
+#[tokio::test]
+async fn mcp_descriptions_under_300() {
+    let a = api("mcp-desc-m45", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let desc = |name: &str| {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .and_then(|t| t["description"].as_str())
+            .unwrap_or_else(|| panic!("{name}"))
+            .to_string()
+    };
+    for t in TOOLS {
+        let d = desc(t);
+        assert!(
+            d.chars().count() <= 300,
+            "{t}: {} символов",
+            d.chars().count()
+        );
+    }
+    let need: [(&str, &[&str]); 6] = [
+        ("memory_log", &["term", "task", "question", "refs.files"]),
+        (
+            "memory_update_entry",
+            &["status", "claim", "release", "answer"],
+        ),
+        ("memory_recall", &["recovery", "brief"]),
+        (
+            "memory_search",
+            &["term", "task", "question", "file", "decided_by"],
+        ),
+        ("memory_link", &["contradicts"]),
+        ("memory_vault", &["host", "environment"]),
+    ];
+    for (tool, words) in need {
+        let d = desc(tool);
+        for w in words {
+            assert!(d.contains(w), "{tool}: нет «{w}» в «{d}»");
+        }
+    }
+    let read = desc("memory_read");
+    assert!(read.contains("since_rev"), "{read}");
+}
+
+/// Окружение через MCP (задача 13, раунд 1): `set` записи `host` без значения с открытыми
+/// полями; `get` и `list` их видят; обновление `limits` сохраняет прежние поля и значение;
+/// без значения у прочих типов — ошибка.
+#[tokio::test]
+async fn mcp_vault_set_environment_fields() {
+    let a = api("mcp-vault-env-set", |_| {}).await;
+    let h = sess();
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "stage-box", "type": "host",
+               "purpose": "приёмочный стенд", "address": "10.0.0.7:22"}),
+    )
+    .await;
+    assert!(!o.is_error && o.text.contains("host"), "{}", o.text);
+    let get = json!({"action": "get", "name": "stage-box"});
+    let o = vault_call(&a, &a.token, &h, get.clone()).await;
+    assert!(
+        o.text.contains("purpose: приёмочный стенд") && o.text.contains("address: 10.0.0.7:22"),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("value:"), "{}", o.text);
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "list", "name": "приёмочный"}),
+    )
+    .await;
+    assert!(o.text.contains("stage-box"), "{}", o.text);
+    // обновление одного поля: прежние сохраняются
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "stage-box", "limits": "2 ядра, 2 ГБ"}),
+    )
+    .await;
+    assert!(!o.is_error && o.text.contains("rev2"), "{}", o.text);
+    let o = vault_call(&a, &a.token, &h, get.clone()).await;
+    for want in [
+        "purpose: приёмочный стенд",
+        "address: 10.0.0.7:22",
+        "limits: 2 ядра, 2 ГБ",
+    ] {
+        assert!(o.text.contains(want), "{want}: {}", o.text);
+    }
+    // значение позже — поля остаются, значение раскрывается
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "stage-box", "value": "ssh-pass-1"}),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.text);
+    let o = vault_call(&a, &a.token, &h, get).await;
+    assert!(
+        o.text.contains("value: ssh-pass-1") && o.text.contains("limits: 2 ядра, 2 ГБ"),
+        "{}",
+        o.text
+    );
+    // пароль без значения — ошибка инструмента; пустая правка — тоже
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "db-pass", "type": "password"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "stage-box"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+}
+
+/// Параллельные `set` разных полей одной записи не теряют правки молча (задача 14, ревью
+/// задачи 13): PATCH уходит с `If-Match` прочитанной ревизии. Каждый успешный `set` оставляет
+/// своё поле, проигравший получает понятную ошибку «Запись изменилась».
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_vault_set_concurrent_no_lost_update() {
+    let a = api("mcp-vault-set-race", |_| {}).await;
+    let h = sess();
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "race-box", "type": "host", "purpose": "начало"}),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.text);
+    let fields = ["address", "limits", "notes", "purpose"];
+    let call = |k: &'static str| {
+        let (a, h) = (&a, &h);
+        async move {
+            let o = vault_call(
+                a,
+                &a.token,
+                h,
+                json!({"action": "set", "name": "race-box", k: format!("значение-{k}")}),
+            )
+            .await;
+            (k, o)
+        }
+    };
+    let (r0, r1, r2, r3) = tokio::join!(
+        call(fields[0]),
+        call(fields[1]),
+        call(fields[2]),
+        call(fields[3])
+    );
+    let results = [r0, r1, r2, r3];
+    let get = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "get", "name": "race-box"}),
+    )
+    .await;
+    for (k, o) in &results {
+        if o.is_error {
+            assert!(o.text.contains("Запись изменилась"), "{k}: {}", o.text);
+        } else {
+            assert!(
+                get.text.contains(&format!("{k}: значение-{k}")),
+                "успешный set {k} потерян: {}",
+                get.text
+            );
+        }
+    }
+    assert!(results.iter().any(|(_, o)| !o.is_error));
+}
+
+/// `memory_update_entry action=answer` без `by` — ошибка инструмента с подсказкой, вопрос не
+/// тронут; с `by: agent` — решение `hypothesis` (финальное ревью M4.5, I-2).
+#[tokio::test]
+async fn mcp_answer_requires_by() {
+    let a = api("mcp-answer-by", |_| {}).await;
+    let q = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "question", "title": "Чей выбор?", "space": "knowledge", "format": "json"}),
+    )
+    .await
+    .json();
+    let qid = q["id"].as_str().unwrap().to_string();
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("q:{qid}"), "action": "answer", "text": "так"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(
+        o.text.contains("by: human") && o.text.contains("by: agent"),
+        "{}",
+        o.text
+    );
+    let r = a
+        .t(Method::GET, &format!("/api/v1/entries/{qid}"), None)
+        .await;
+    assert_eq!(r.json()["status"], "open");
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("q:{qid}"), "action": "answer", "text": "так", "by": "agent",
+               "format": "json"}),
+    )
+    .await
+    .json();
+    assert_eq!(o["decision"]["certainty"], "hypothesis", "{o}");
 }

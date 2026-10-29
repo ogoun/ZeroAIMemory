@@ -12,6 +12,14 @@
 //!   `GET /entries/{id}/revisions`; `GET /entries/{id}` отдаёт и `usage: {shown, useful,
 //!   useless}` (§10.5, оценка — [`super::feedback`]), список — у каждой insight (задача 13).
 //!
+//! `kind: task` — журнал задач (M4.5 §3, [`super::tasks`]): в решении и Knowledge, `data`
+//! по [`zam_store::TaskData`]; `PATCH` меняет `status` (с `next_step`, `blocked_by`, `reason`;
+//! переоткрытие `done`/`dropped` → `open` — только с `reason`, иначе 422 `reason-required`) и
+//! поля задачи слиянием; у `done` в ответах — `duration_min`.
+//! `kind: question` — вопрос к человеку (M4.5 §4, [`super::questions`]): в решении и Knowledge,
+//! `data` по [`zam_store::QuestionData`] (`options`, `recommendation`); совпавший заголовок
+//! `open`/`answered` вопроса — 409 `possible-duplicate` (`force` пишет всё равно); `PATCH` —
+//! `data` пока `open` и `status: obsolete` с `reason`; ответ — `POST /entries/{id}/answer`.
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
 //! уходит в [`super::insights::create`] (дедупликация, `scope`, триггеры, замещение).
 //! У insight `GET`/`PATCH` отдают и `triggers`; `PATCH` принимает `status: active | revisit`
@@ -200,6 +208,15 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
         EntryKind::Insight => Err(unprocessable(
             "insight создаётся отдельным API инсайтов, а не через /entries",
         )),
+        EntryKind::Term => Err(unprocessable(
+            "term пишется через POST /spaces/{space}/entries с kind: term",
+        )),
+        EntryKind::Task => zam_store::check_task(data)
+            .map(|t| t.to_value())
+            .map_err(unprocessable),
+        EntryKind::Question => zam_store::check_question(data)
+            .map(|q| q.to_value())
+            .map_err(unprocessable),
     }
 }
 
@@ -239,6 +256,11 @@ pub struct Create {
     tags: Vec<String>,
     area: Option<String>,
     message: Option<String>,
+    /// Только question: записать, даже если такой вопрос уже есть.
+    #[serde(default)]
+    force: bool,
+    /// Ссылки на файлы `{files: [{path, hash?, commit?}]}` (M4.5 §6.1, [`super::files`]).
+    refs: Option<Value>,
 }
 
 pub(crate) fn empty_object() -> Value {
@@ -257,7 +279,7 @@ pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, Api
 }
 
 /// `POST /spaces/{space}/entries` → 201 `Entry`; повтор с тем же `Idempotency-Key` — 200.
-/// `kind: insight` — [`super::insights::create`].
+/// `kind: insight` и `kind: term` — [`super::insights::create`].
 pub async fn create(
     State(st): State<AppState>,
     p: Principal,
@@ -267,22 +289,51 @@ pub async fn create(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let raw: Value = json_body(body)?;
-    if raw.get("kind").and_then(Value::as_str) == Some(EntryKind::Insight.as_str()) {
+    if matches!(
+        raw.get("kind")
+            .and_then(Value::as_str)
+            .and_then(EntryKind::parse),
+        Some(EntryKind::Insight | EntryKind::Term)
+    ) {
         return super::insights::create(&st, &p, &headers, &client, &space, raw).await;
     }
     let req: Create = serde_json::from_value(raw)
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
     let sc = space_scope(&st, &p, &headers, &space, Mode::Write).await?;
-    if sc.space.kind != SpaceKind::Solution {
+    // вид проверяется после доступа к пространству: без прав 403/404, а не 422
+    if matches!(req.kind, EntryKind::Task | EntryKind::Question) {
+        // задачи и вопросы ведутся в решении и Knowledge (Rules и Human журналов не имеют)
+        if !matches!(sc.space.kind, SpaceKind::Solution | SpaceKind::Knowledge) {
+            return Err(unprocessable(
+                "задачи и вопросы ведутся только в пространстве решения или Knowledge",
+            ));
+        }
+    } else if sc.space.kind != SpaceKind::Solution {
         return Err(unprocessable(
             "changelog и release ведутся только в пространстве решения",
         ));
     }
     check_title(&req.title)?;
+    let refs = super::files::refs_field(req.refs.as_ref())?;
     let mut data = check_data(req.kind, &req.data)?;
     check_size(&st, &req.body)?;
     let attrib = attribution(&p, &headers, req.message)?;
     let key = idempotency_key(&headers)?;
+    if req.kind == EntryKind::Question && !req.force {
+        // повтор по ключу дубликатом не считается (иначе запись нашла бы саму себя)
+        let repeat = match &key {
+            Some(k) => entry_by_idempotency_key(&sc.db, &attrib, k)
+                .await?
+                .is_some(),
+            None => false,
+        };
+        if !repeat
+            && let Some(dup) =
+                super::questions::question_duplicate(&sc.db, sc.space.id, &req.title).await?
+        {
+            return Err(dup);
+        }
+    }
     // повтор без даты после смены суток: отпечаток снимается с исходного запроса, поэтому
     // подставленная при первом создании дата берётся у уже созданной записи
     if req.kind == EntryKind::Release
@@ -307,6 +358,7 @@ pub async fn create(
         idempotency_key: key.clone(),
         triggers: Vec::new(),
         links: Vec::new(),
+        refs,
     };
     let (entry, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {
@@ -319,6 +371,12 @@ pub async fn create(
     };
     let mut v = json!(entry);
     super::secrets::attach_entry(&mut v, &entry);
+    super::tasks::attach_task(&mut v, &entry);
+    super::glossary::attach_warnings(
+        &mut v,
+        super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &entry.title, &entry.body)
+            .await?,
+    );
     Ok((status, Json(v)))
 }
 
@@ -334,6 +392,8 @@ pub struct ListQuery {
     /// `data.kind`: вид changelog ([`CHANGELOG_KINDS`]) или insight
     /// ([`super::insights::INSIGHT_KINDS`]).
     data_kind: Option<String>,
+    /// `human` | `agent`: решения по `data.decision.decided_by` (M4.5, спецификация §5.1).
+    decided_by: Option<String>,
     since: Option<String>,
     until: Option<String>,
     cursor: Option<String>,
@@ -352,6 +412,17 @@ fn parse_data_kind(raw: Option<String>) -> Result<Option<String>, ApiError> {
         Err(ApiError::BadRequest(format!(
             "data_kind: неизвестное значение «{k}»"
         )))
+    }
+}
+
+/// `decided_by`: пусто — без фильтра, иначе `human` или `agent` (400); `what` — имя поля в тексте.
+pub(crate) fn parse_decided_by(raw: Option<&str>, what: &str) -> Result<Option<String>, ApiError> {
+    match raw.map(str::trim).filter(|k| !k.is_empty()) {
+        None => Ok(None),
+        Some(k @ ("human" | "agent")) => Ok(Some(k.to_string())),
+        Some(k) => Err(ApiError::BadRequest(format!(
+            "{what}: неизвестное значение «{k}»; допустимы human, agent"
+        ))),
     }
 }
 
@@ -409,6 +480,7 @@ pub async fn list(
         area: q.area.filter(|a| !a.is_empty()),
         tag: q.tag.filter(|a| !a.is_empty()),
         data_kind: parse_data_kind(q.data_kind)?,
+        decided_by: parse_decided_by(q.decided_by.as_deref(), "decided_by")?,
         since: q
             .since
             .as_deref()
@@ -437,6 +509,7 @@ pub async fn list(
         if e.kind == EntryKind::Insight {
             v["usage"] = json!(usage.get(&e.id).copied().unwrap_or_default());
         }
+        super::tasks::attach_task(&mut v, e);
         out.push(v);
     }
     Ok(Json(json!({ "items": out, "next_cursor": next })))
@@ -487,13 +560,65 @@ pub struct Patch {
     #[serde(default, deserialize_with = "double_option")]
     certainty: Option<Option<Certainty>>,
     reason: Option<String>,
+    /// Только task: следующий шаг (`null` — снять), то же, что `data.next_step`.
+    #[serde(default, deserialize_with = "double_option")]
+    next_step: Option<Option<String>>,
+    /// Только task: блокер (`null` — снять), то же, что `data.blocked_by`.
+    #[serde(default, deserialize_with = "double_option")]
+    blocked_by: Option<Option<String>>,
     message: Option<String>,
+    /// Новый набор ссылок на файлы `{files: [...]}` целиком (M4.5 §6.1); ревизии не создаёт.
+    refs: Option<Value>,
+}
+
+/// Смена статуса task: переходы §3 M4.5; переоткрытие без `reason` — 422 `reason-required`.
+fn check_task_status(e: &Entry, s: EntryStatus, reason: Option<&str>) -> Result<(), ApiError> {
+    let from = e.status.unwrap_or(EntryStatus::Open);
+    zam_store::check_task_transition(from, s, reason).map_err(|code| match code {
+        "reason-required" => ApiError::ReasonRequired(
+            "переоткрытие задачи (done/dropped → open) требует reason".into(),
+        ),
+        "not-a-task-status" => {
+            unprocessable("status задачи: open, in_progress, blocked, done или dropped")
+        }
+        _ => unprocessable(format!(
+            "переход {} → {} не разрешён: из done/dropped — только в open с reason",
+            from.as_str(),
+            s.as_str()
+        )),
+    })
+}
+
+/// Смена статуса question правкой: только `obsolete` с `reason`; `answered` — ответом.
+fn check_question_status(e: &Entry, s: EntryStatus, reason: Option<&str>) -> Result<(), ApiError> {
+    let from = e.status.unwrap_or(EntryStatus::Open);
+    zam_store::check_question_transition(from, s, reason).map_err(|code| match code {
+        "reason-required" => {
+            ApiError::ReasonRequired("устаревание вопроса (obsolete) требует reason".into())
+        }
+        "answer-only" => unprocessable("answered ставится только ответом: POST …/answer"),
+        "not-a-question-status" => unprocessable("status вопроса: open, answered или obsolete"),
+        _ => unprocessable(format!(
+            "переход {} → {} не разрешён: из obsolete статус не меняется, answered в open не \
+             возвращается",
+            from.as_str(),
+            s.as_str()
+        )),
+    })
 }
 
 /// Смена статуса insight правкой: только `active ↔ revisit` — иначе 422.
-fn check_status_change(e: &Entry, s: EntryStatus) -> Result<(), ApiError> {
+fn check_status_change(e: &Entry, s: EntryStatus, reason: Option<&str>) -> Result<(), ApiError> {
+    if e.kind == EntryKind::Task {
+        return check_task_status(e, s, reason);
+    }
+    if e.kind == EntryKind::Question {
+        return check_question_status(e, s, reason);
+    }
     if e.kind != EntryKind::Insight {
-        return Err(unprocessable("status есть только у insight"));
+        return Err(unprocessable(
+            "status есть только у insight, task и question",
+        ));
     }
     if !matches!(s, EntryStatus::Active | EntryStatus::Revisit) {
         return Err(unprocessable(
@@ -510,6 +635,39 @@ fn check_status_change(e: &Entry, s: EntryStatus) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+/// Патч `data` задачи из `data`, `next_step` и `blocked_by` тела (верхнего уровня — сильнее);
+/// проверяется на копии прежней `data`, в хранилище уходит как слияние. У прочих видов
+/// `next_step` и `blocked_by` — 422.
+fn task_data_patch(e: &Entry, req: &Patch) -> Result<Option<Value>, ApiError> {
+    if e.kind != EntryKind::Task {
+        if req.next_step.is_some() || req.blocked_by.is_some() {
+            return Err(unprocessable("next_step и blocked_by есть только у task"));
+        }
+        return Ok(None);
+    }
+    let mut patch = match &req.data {
+        Some(Value::Object(o)) => o.clone(),
+        Some(_) => return Err(unprocessable("data должно быть JSON-объектом")),
+        None => serde_json::Map::new(),
+    };
+    for (k, v) in [
+        ("next_step", &req.next_step),
+        ("blocked_by", &req.blocked_by),
+    ] {
+        if let Some(v) = v {
+            patch.insert(k.into(), json!(v));
+        }
+    }
+    if patch.is_empty() {
+        return Ok(None);
+    }
+    let patch = Value::Object(patch);
+    zam_store::TaskData::from_stored(&e.data)
+        .apply_patch(&patch)
+        .map_err(unprocessable)?;
+    Ok(Some(patch))
 }
 
 /// Необязательный `If-Match: <rev>` (supersede, retract, restore — §11.3): есть — проверяется.
@@ -540,11 +698,13 @@ pub async fn patch(
         check_title(t)?;
     }
     if let Some(s) = req.status {
-        check_status_change(&sc.entry, s)?;
+        check_status_change(&sc.entry, s, req.reason.as_deref())?;
     }
-    if req.certainty.is_some() && sc.entry.kind != EntryKind::Insight {
-        return Err(unprocessable("certainty есть только у insight"));
+    if req.certainty.is_some() && !zam_store::has_certainty(sc.entry.kind) {
+        return Err(unprocessable("certainty есть только у insight и term"));
     }
+    let task_patch = task_data_patch(&sc.entry, &req)?;
+    let refs = super::files::refs_field(req.refs.as_ref())?;
     let triggers = match req.triggers {
         Some(_) if sc.entry.kind != EntryKind::Insight => {
             return Err(unprocessable("triggers есть только у insight"));
@@ -555,6 +715,14 @@ pub async fn patch(
     // release: поля, не указанные в PATCH, сохраняются (слияние на верхнем уровне);
     // changelog: data заменяется целиком
     let data = match (&req.data, sc.entry.kind) {
+        (_, EntryKind::Task) => task_patch,
+        // term: имя и data проверяются вместе (422 `title: …` / `data.<поле>: …`)
+        (_, EntryKind::Term) if req.title.is_some() || req.data.is_some() => {
+            let title = req.title.as_deref().unwrap_or(&sc.entry.title);
+            let data = req.data.as_ref().unwrap_or(&sc.entry.data);
+            let (_, td) = zam_store::check_term(title, data).map_err(unprocessable)?;
+            req.data.as_ref().map(|_| td.to_value())
+        }
         (Some(Value::Object(new)), EntryKind::Release) => {
             let mut merged = sc.entry.data.clone();
             if let Some(m) = merged.as_object_mut() {
@@ -566,6 +734,12 @@ pub async fn patch(
         }
         (Some(d), EntryKind::Insight) => {
             super::insights::check_insight_data(d)?;
+            Some(d.clone())
+        }
+        (Some(d), EntryKind::Question) => {
+            zam_store::QuestionData::from_stored(&sc.entry.data)
+                .apply_patch(d)
+                .map_err(unprocessable)?;
             Some(d.clone())
         }
         (Some(d), kind) => Some(check_data(kind, d)?),
@@ -583,6 +757,7 @@ pub async fn patch(
         certainty: req.certainty,
         reason: req.reason,
         triggers,
+        refs,
     };
     let before = sc.entry.rev;
     let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;
@@ -591,6 +766,12 @@ pub async fn patch(
     }
     let mut v = entry_json(&sc.db, &e).await?;
     super::secrets::attach_entry(&mut v, &e);
+    if e.kind != EntryKind::Term {
+        super::glossary::attach_warnings(
+            &mut v,
+            super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &e.title, &e.body).await?,
+        );
+    }
     Ok(Json(v))
 }
 

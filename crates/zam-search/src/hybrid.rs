@@ -34,6 +34,8 @@ pub enum Channel {
     Fts,
     /// FTS5 `trigram`: идентификаторы и код.
     Trigram,
+    /// FTS5 `bm25` по запросу, расширенному именами и псевдонимами терминов словаря (M4.5).
+    Alias,
     /// Подъём потомков найденной папки (см. модуль).
     Folder,
 }
@@ -45,6 +47,7 @@ impl Channel {
             Channel::Vector => "vector",
             Channel::Fts => "fts",
             Channel::Trigram => "trigram",
+            Channel::Alias => "alias",
             Channel::Folder => "folder",
         }
     }
@@ -136,12 +139,16 @@ impl FolderHit {
 pub struct SearchInputs {
     pub fts: Vec<String>,
     pub trigram: Vec<String>,
+    /// Канал `alias` (словарь, M4.5); пустой — расширения не было или оно ничего не нашло.
+    pub alias: Vec<String>,
     /// `None` — векторный канал выключен (деградация) или не запускался.
     pub vector: Option<Vec<String>>,
     /// Метаданные всех кандидатов. Кандидат без метаданных отбрасывается.
     pub chunks: HashMap<String, ChunkMeta>,
     /// `fts` получен ослабленным запросом (любое слово): строгий ничего не нашёл.
     pub fts_relaxed: bool,
+    /// `alias` получен ослабленным запросом: вес — не выше `w_fts_relaxed` (при векторном канале).
+    pub alias_relaxed: bool,
     /// Чанки, которых векторный канал не видит в принципе (Human, узел не проиндексирован):
     /// им ослабленный bm25 не понижается — соревноваться с векторными кандидатами им нечем.
     pub vector_blind: HashSet<String>,
@@ -162,6 +169,8 @@ pub struct Weights {
     /// при работающем векторном канале и только для чанков, которые он видит
     /// (не из `vector_blind`); иначе действует `w_fts`.
     pub w_fts_relaxed: f64,
+    /// Вес канала `alias` (0 — канал выключен); ослабленный `alias` — не выше `w_fts_relaxed`.
+    pub w_fts_alias: f64,
     pub w_trigram: f64,
     /// Вес канала папок (см. модуль); 0 — канал выключен (выдача M2).
     pub w_folder: f64,
@@ -178,6 +187,7 @@ impl Default for Weights {
             w_vector: 1.0,
             w_fts: 1.0,
             w_fts_relaxed: 1.0,
+            w_fts_alias: 0.5,
             w_trigram: 0.7,
             w_folder: 0.0,
             recency_half_life_days: 180.0,
@@ -196,7 +206,7 @@ pub struct Ranked {
     pub heading_path: String,
     /// Нормированный балл, 0..=1.
     pub score: f64,
-    /// Каналы, нашедшие чанк, в порядке `vector`, `fts`, `trigram`, `folder`.
+    /// Каналы, нашедшие чанк, в порядке `vector`, `fts`, `alias`, `trigram`, `folder`.
     pub sources: Vec<&'static str>,
 }
 
@@ -216,6 +226,7 @@ pub fn fuse_normed(inp: &SearchInputs, w: &Weights, now: Timestamp) -> (Vec<Rank
             inp.vector.as_ref().unwrap_or(&empty),
         ),
         (Channel::Fts, w.w_fts, &inp.fts),
+        (Channel::Alias, w.w_fts_alias, &inp.alias),
         (Channel::Trigram, w.w_trigram, &inp.trigram),
     ];
     // ослабленный bm25 понижается, только если есть с кем соревноваться: векторный канал
@@ -239,6 +250,12 @@ pub fn fuse_normed(inp: &SearchInputs, w: &Weights, now: Timestamp) -> (Vec<Rank
             rank += 1;
             let weight = if ch == Channel::Fts && relaxed && !inp.vector_blind.contains(id) {
                 w.w_fts_relaxed
+            } else if ch == Channel::Alias
+                && inp.alias_relaxed
+                && inp.vector.is_some()
+                && !inp.vector_blind.contains(id)
+            {
+                weight.min(w.w_fts_relaxed)
             } else {
                 weight
             };
@@ -399,6 +416,43 @@ mod tests {
             a.iter().map(|x| x.score).collect::<Vec<_>>(),
             b.iter().map(|x| x.score).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn alias_channel_weight_and_relaxed_cap() {
+        let (a, b, c) = (Id::new(), Id::new(), Id::new());
+        let mk = |alias: &[&str], w_alias: f64, relaxed: bool, vector: bool| {
+            let inp = SearchInputs {
+                fts: list(&["a"]),
+                alias: list(alias),
+                alias_relaxed: relaxed,
+                vector: vector.then(|| list(&["c"])),
+                chunks: meta(&[("a", a), ("b", b), ("c", c)]),
+                ..Default::default()
+            };
+            let w = Weights {
+                w_fts_alias: w_alias,
+                w_fts_relaxed: 0.25,
+                ..Weights::default()
+            };
+            fuse(&inp, &w, now())
+        };
+        // «a» найден двумя каналами и первый; «b» — только alias (в sources виден канал)
+        let r = mk(&["b", "a"], 0.5, false, false);
+        assert_eq!(ids(&r), vec!["a", "b"]);
+        assert_eq!(r[0].sources, vec!["fts", "alias"]);
+        assert_eq!(r[1].sources, vec!["alias"]);
+        // вес alias против базового канала: ниже — «a» первым, выше — «b»
+        assert_eq!(ids(&mk(&["b"], 0.5, false, false)), vec!["a", "b"]);
+        assert_eq!(ids(&mk(&["b"], 5.0, false, false)), vec!["b", "a"]);
+        // ослабленный alias с векторным каналом не выше `w_fts_relaxed`; без него — как есть
+        let strong = mk(&["b"], 0.5, false, true);
+        let capped = mk(&["b"], 0.5, true, true);
+        let score = |r: &[Ranked], id: &str| r.iter().find(|x| x.chunk_id == id).unwrap().score;
+        assert!(score(&capped, "b") < score(&strong, "b"));
+        let (x, y) = (mk(&["b"], 0.5, true, false), mk(&["b"], 0.5, false, false));
+        assert_eq!(score(&x, "b"), score(&y, "b"));
+        assert!(strong.iter().chain(&capped).all(|x| x.score <= 1.0));
     }
 
     #[test]

@@ -497,6 +497,9 @@ pub struct SearchSection {
     /// Вес `bm25`, когда сработал только ослабленный запрос (любое слово): совпадения по
     /// одному слову — слабый сигнал (по умолчанию 0,25 — подобран на eval, §18.2).
     pub w_fts_relaxed: f64,
+    /// Вес канала `alias` (M4.5): FTS по запросу, расширенному именами и псевдонимами терминов
+    /// словаря; 0..=1 (по умолчанию 0,5 — ниже исходного канала), 0 выключает канал.
+    pub w_fts_alias: f64,
     /// Вес канала FTS5 `trigram` (идентификаторы и код).
     pub w_trigram: f64,
     /// Полупериод затухания по свежести, дней; 0 — без затухания.
@@ -528,6 +531,11 @@ pub struct SearchSection {
     pub w_folder: f64,
     /// Не больше карточек папок в выдаче при `filters.kinds ∋ folder` (по умолчанию 2).
     pub max_folders: usize,
+    /// Порядок по связи `contradicts` (M4.5, §5.2): после реранка и бустов запись не стоит выше
+    /// действующей более надёжной записи (`theorem`/`axiom`), которой противоречит, если обе в
+    /// выдаче (axiom → axiom и theorem → theorem не переставляются). `false` — порядок
+    /// реранкера без поправки (по умолчанию `true`).
+    pub contradicts_order: bool,
 }
 
 impl SearchSection {
@@ -551,6 +559,9 @@ impl SearchSection {
             if !(v.is_finite() && v >= 0.0) {
                 return Err(bad(k, "должно быть конечным и не меньше 0"));
             }
+        }
+        if !(self.w_fts_alias.is_finite() && (0.0..=1.0).contains(&self.w_fts_alias)) {
+            return Err(bad("w_fts_alias", "должно быть в 0..=1"));
         }
         if self.max_per_node == 0 {
             return Err(bad("max_per_node", "должно быть больше 0"));
@@ -581,16 +592,28 @@ pub struct InsightsSection {
     /// Порог dense-косинуса, с которого действующий insight той же области — кандидат в
     /// дубли (0..=1, по умолчанию 0,90).
     pub dedup_threshold: f32,
+    /// Порог dense-косинуса, с которого действующая аксиома-`decision` той же области —
+    /// «близкая» к новому решению агента (`warnings: decision_near_axiom`; M4.5, §5.1);
+    /// 0..=1, по умолчанию 0,80.
+    pub decision_conflict_threshold: f32,
 }
 
 impl InsightsSection {
     fn validate(&self) -> Result<(), ConfigError> {
-        if !(self.dedup_threshold.is_finite() && (0.0..=1.0).contains(&self.dedup_threshold)) {
-            return Err(ConfigError::Invalid {
-                key: "insights.dedup_threshold".into(),
-                source_name: "итог".into(),
-                message: "должно быть в 0..=1".into(),
-            });
+        for (k, v) in [
+            ("dedup_threshold", self.dedup_threshold),
+            (
+                "decision_conflict_threshold",
+                self.decision_conflict_threshold,
+            ),
+        ] {
+            if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                return Err(ConfigError::Invalid {
+                    key: format!("insights.{k}"),
+                    source_name: "итог".into(),
+                    message: "должно быть в 0..=1".into(),
+                });
+            }
         }
         Ok(())
     }
@@ -675,6 +698,12 @@ impl CacheSection {
 pub struct RecallSection {
     /// Бюджет дайджеста старта сессии и подсказок по умолчанию, токенов (1..=20000, 1500).
     pub digest_tokens: usize,
+    /// Бюджет пакета восстановления после сжатия контекста и `resume`, токенов (1..=20000,
+    /// 2000; M4.5 §9.2): `/recall` `event: recovery` или `session_start` после `compact|resume`.
+    pub recovery_tokens: usize,
+    /// Бюджет пакета под задачу, токенов (1..=20000, 800; M4.5 §9.4): `/recall` `event: brief`
+    /// (хук `subagent-start`, MCP `memory_recall` при составлении задания субагенту).
+    pub brief_tokens: usize,
     /// Наименьший балл поиска подсказки к запросу пользователя (0..=1, 0,6).
     pub prompt_min_score: f64,
     /// Бюджет сервера на сбор подсказок, мс (1..=60000, 200): по превышении отдаётся собранное
@@ -691,6 +720,12 @@ impl RecallSection {
         };
         if !(1..=20_000).contains(&self.digest_tokens) {
             return Err(bad("digest_tokens", "от 1 до 20000"));
+        }
+        if !(1..=20_000).contains(&self.recovery_tokens) {
+            return Err(bad("recovery_tokens", "от 1 до 20000"));
+        }
+        if !(1..=20_000).contains(&self.brief_tokens) {
+            return Err(bad("brief_tokens", "от 1 до 20000"));
         }
         if !(self.prompt_min_score.is_finite() && (0.0..=1.0).contains(&self.prompt_min_score)) {
             return Err(bad("prompt_min_score", "должно быть в 0..=1"));
@@ -787,6 +822,7 @@ impl Default for ServerConfig {
                 w_vector: 1.0,
                 w_fts: 1.0,
                 w_fts_relaxed: 0.25,
+                w_fts_alias: 0.5,
                 w_trigram: 0.7,
                 recency_half_life_days: 180.0,
                 max_per_node: 3,
@@ -799,9 +835,11 @@ impl Default for ServerConfig {
                 graph_weight: 0.5,
                 w_folder: 0.0,
                 max_folders: 2,
+                contradicts_order: true,
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
+                decision_conflict_threshold: 0.80,
             },
             read: ReadSection {
                 max_items: 20,
@@ -817,6 +855,8 @@ impl Default for ServerConfig {
             },
             recall: RecallSection {
                 digest_tokens: 1500,
+                recovery_tokens: 2000,
+                brief_tokens: 800,
                 prompt_min_score: 0.6,
                 timeout_ms: 200,
             },
@@ -1147,6 +1187,9 @@ mod tests {
         // канал папок выключен по сетке задачи 18 M3, карточек папок — не больше двух
         assert_eq!((c.search.w_folder, c.search.max_folders), (0.0, 2));
         assert_eq!(c.insights.dedup_threshold, 0.90);
+        // M4.5: близкие аксиомы решений и порядок по `contradicts`
+        assert_eq!(c.insights.decision_conflict_threshold, 0.80);
+        assert!(c.search.contradicts_order);
     }
 
     #[test]
@@ -1154,8 +1197,12 @@ mod tests {
         let ok = vec![
             env("ZAM_SEARCH__BOOST_AREA", "1.0"),
             env("ZAM_INSIGHTS__DEDUP_THRESHOLD", "0.85"),
+            env("ZAM_INSIGHTS__DECISION_CONFLICT_THRESHOLD", "0.7"),
+            env("ZAM_SEARCH__CONTRADICTS_ORDER", "false"),
         ];
         let c = load(None, &ok, &Default::default()).unwrap();
+        assert_eq!(c.insights.decision_conflict_threshold, 0.7);
+        assert!(!c.search.contradicts_order);
         assert_eq!(
             (c.search.boost_area, c.insights.dedup_threshold),
             (1.0, 0.85)
@@ -1168,6 +1215,7 @@ mod tests {
             ("ZAM_SEARCH__BOOST_HYPOTHESIS", "-1"),
             ("ZAM_SEARCH__GRAPH_WEIGHT", "1.5"),
             ("ZAM_INSIGHTS__DEDUP_THRESHOLD", "1.5"),
+            ("ZAM_INSIGHTS__DECISION_CONFLICT_THRESHOLD", "-0.1"),
         ] {
             let e = load(None, &[env(k, v)], &Default::default());
             assert!(e.is_err(), "{k}={v}");
@@ -1677,6 +1725,9 @@ yield_ms = 1
         assert_eq!((d.recency_half_life_days, d.max_per_node), (180.0, 3));
         // ослабленный bm25 — вес по eval (§18.2)
         assert_eq!(d.w_fts_relaxed, 0.25);
+        assert_eq!(d.w_fts_alias, 0.5);
+        let bad = vec![env("ZAM_SEARCH__W_FTS_ALIAS", "1.5")];
+        assert!(load(None, &bad, &Default::default()).is_err());
         let e = vec![
             env("ZAM_SEARCH__RRF_K", "30"),
             env("ZAM_SEARCH__W_VECTOR", "1.5"),
@@ -1798,6 +1849,10 @@ master_key = \"x\"
     fn recall_section_bounds() {
         for (k, v) in [
             ("ZAM_RECALL__DIGEST_TOKENS", "0"),
+            ("ZAM_RECALL__RECOVERY_TOKENS", "0"),
+            ("ZAM_RECALL__RECOVERY_TOKENS", "20001"),
+            ("ZAM_RECALL__BRIEF_TOKENS", "0"),
+            ("ZAM_RECALL__BRIEF_TOKENS", "20001"),
             ("ZAM_RECALL__PROMPT_MIN_SCORE", "1.5"),
             ("ZAM_RECALL__TIMEOUT_MS", "0"),
         ] {
@@ -1814,6 +1869,8 @@ master_key = \"x\"
         .unwrap();
         assert_eq!(c.recall.prompt_min_score, 0.5);
         assert_eq!(c.recall.digest_tokens, 1500);
+        assert_eq!(c.recall.recovery_tokens, 2000);
+        assert_eq!(c.recall.brief_tokens, 800);
     }
 
     #[test]

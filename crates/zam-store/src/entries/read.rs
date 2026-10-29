@@ -70,6 +70,12 @@ pub async fn list_entries(
                AND (?8 IS NULL OR e.created_at < ?8)
                AND (?9 IS NULL OR e.created_at < ?9 OR (e.created_at = ?9 AND e.id < ?10))
                AND (?12 IS NULL OR json_extract(e.data, '$.kind') = ?12)
+               AND (?13 IS NULL OR (e.kind = 'insight'
+                    AND json_extract(e.data, '$.kind') = 'decision'
+                    AND CASE WHEN json_type(e.data, '$.decision.decided_by') = 'text'
+                             THEN json_extract(e.data, '$.decision.decided_by')
+                             ELSE CASE WHEN e.author_kind = 'agent' THEN 'agent'
+                                  ELSE 'human' END END = ?13))
              ORDER BY e.created_at DESC, e.id DESC
              LIMIT ?11"
         ))?;
@@ -87,6 +93,7 @@ pub async fn list_entries(
                 c_id,
                 (limit + 1) as i64,
                 f.data_kind,
+                f.decided_by,
             ],
             entry_row,
         )?;

@@ -39,11 +39,13 @@ fn agent() -> Attribution {
         message: None,
         user_id: Some(Id::new()),
         area: None,
+        solution: None,
     }
 }
 
 fn insight(space: Id, title: &str, body: &str) -> NewEntry {
     NewEntry {
+        refs: None,
         space_id: space,
         kind: EntryKind::Insight,
         title: title.into(),
@@ -61,6 +63,7 @@ fn insight(space: Id, title: &str, body: &str) -> NewEntry {
 
 fn changelog(space: Id, title: &str) -> NewEntry {
     NewEntry {
+        refs: None,
         space_id: space,
         kind: EntryKind::Changelog,
         title: title.into(),
@@ -106,6 +109,7 @@ async fn chunks_of(db: &Db, id: Id) -> Vec<(String, String, i64)> {
 
 fn query(text: &str, space: Id, targets: TargetFilter) -> FtsQuery {
     FtsQuery {
+        alias_groups: Vec::new(),
         text: text.into(),
         space_ids: vec![space],
         path_prefix: None,
@@ -823,6 +827,7 @@ async fn deleted_entry_not_in_fts_restore_returns() {
         area: None,
         tag: None,
         data_kind: None,
+        decided_by: None,
         since: None,
         until: None,
         cursor: None,
@@ -893,6 +898,7 @@ async fn list_entries_cursor_and_filters() {
         area: None,
         tag: None,
         data_kind: None,
+        decided_by: None,
         since: None,
         until: None,
         cursor: None,
@@ -965,6 +971,7 @@ async fn list_entries_cursor_and_filters() {
     // data.kind: фильтр в SQL до LIMIT — курсор переходит границу страницы без потерь
     let mut f = EntryFilter {
         data_kind: Some("feat".into()),
+        decided_by: None,
         limit: 2,
         ..base.clone()
     };
@@ -979,6 +986,7 @@ async fn list_entries_cursor_and_filters() {
     assert!(next.is_none());
     let f = EntryFilter {
         data_kind: Some("gotcha".into()),
+        decided_by: None,
         limit: 200,
         ..base.clone()
     };
@@ -1255,6 +1263,7 @@ async fn triggers_stored_replaced_and_active_only() {
     assert_eq!(entry_triggers(&db, a.id).await.unwrap()[0].pattern, "lf");
     // revisit остаётся в выдаче, superseded, retracted и удалённые — нет
     let with = |title: &str, kw: &str, status: Option<EntryStatus>| NewEntry {
+        refs: None,
         status,
         triggers: vec![trig(TriggerKind::Keyword, kw)],
         ..insight(k, title, "")
@@ -1344,4 +1353,265 @@ async fn title_duplicates_same_area_and_active_only() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Таблица статусов по виду (спецификация M4.5 §1.3) и начальные статусы.
+#[test]
+fn allowed_statuses_per_kind() {
+    use EntryStatus::*;
+    let table: [(EntryKind, &[EntryStatus], Option<EntryStatus>); 6] = [
+        (EntryKind::Changelog, &[], None),
+        (EntryKind::Release, &[], None),
+        (
+            EntryKind::Insight,
+            &[Active, Revisit, Superseded, Retracted],
+            Some(Active),
+        ),
+        (
+            EntryKind::Term,
+            &[Active, Superseded, Retracted],
+            Some(Active),
+        ),
+        (
+            EntryKind::Task,
+            &[Open, InProgress, Blocked, Done, Dropped],
+            Some(Open),
+        ),
+        (EntryKind::Question, &[Open, Answered, Obsolete], Some(Open)),
+    ];
+    assert_eq!(table.len(), EntryKind::ALL.len());
+    for (kind, statuses, initial) in table {
+        assert_eq!(zam_store::allowed_statuses(kind), statuses, "{kind:?}");
+        assert_eq!(zam_store::initial_status(kind), initial, "{kind:?}");
+        if let Some(s) = initial {
+            assert!(statuses.contains(&s));
+        }
+    }
+    // строки статусов task — snake_case, как в CHECK миграции 0015
+    let names: Vec<&str> = zam_store::allowed_statuses(EntryKind::Task)
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    assert_eq!(names, ["open", "in_progress", "blocked", "done", "dropped"]);
+    assert_eq!(
+        serde_json::to_value(EntryKind::Question).unwrap(),
+        json!("question")
+    );
+}
+
+/// Новые виды M4.5 хранилище принимает через `create_entry`: начальный статус по виду,
+/// другой статус при создании и `certainty` не у insight/term — `BadInput`.
+#[tokio::test]
+async fn new_kinds_via_create_entry() {
+    let (db, k, _) = setup("new-kinds").await;
+    let mk = |kind: EntryKind, title: &str| NewEntry {
+        refs: None,
+        kind,
+        // у термина определение обязательно (M4.5 §2.1)
+        data: if kind == EntryKind::Term {
+            json!({"definition": "Определение."})
+        } else {
+            json!({})
+        },
+        certainty: None,
+        ..insight(k, title, "Тело.")
+    };
+    for (kind, status) in [
+        (EntryKind::Term, EntryStatus::Active),
+        (EntryKind::Task, EntryStatus::Open),
+        (EntryKind::Question, EntryStatus::Open),
+    ] {
+        let (e, created) = create_entry(&db, mk(kind, kind.as_str()), &agent())
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!((e.kind, e.status), (kind, Some(status)));
+        assert_eq!(get_entry(&db, e.id).await.unwrap().status, Some(status));
+    }
+    let mut task = mk(EntryKind::Task, "задача в работе");
+    task.status = Some(EntryStatus::InProgress);
+    assert!(matches!(
+        create_entry(&db, task, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+    let mut term = mk(EntryKind::Term, "термин на пересмотре");
+    term.status = Some(EntryStatus::Revisit);
+    assert!(matches!(
+        create_entry(&db, term, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+    let mut term = mk(EntryKind::Term, "термин-гипотеза");
+    term.certainty = Some(Certainty::Hypothesis);
+    let (e, _) = create_entry(&db, term, &agent()).await.unwrap();
+    assert_eq!(e.certainty, Some(Certainty::Hypothesis));
+    let mut task = mk(EntryKind::Task, "задача с certainty");
+    task.certainty = Some(Certainty::Hypothesis);
+    assert!(matches!(
+        create_entry(&db, task, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+    let mut ch = changelog(k, "changelog со статусом");
+    ch.status = Some(EntryStatus::Open);
+    assert!(matches!(
+        create_entry(&db, ch, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+}
+
+fn term(space: Id, title: &str, aliases: &[&str]) -> NewEntry {
+    NewEntry {
+        refs: None,
+        kind: EntryKind::Term,
+        data: json!({"definition": format!("Определение {title}"), "aliases": aliases,
+                     "code": ["answer_cache_entry"]}),
+        certainty: None,
+        tags: Vec::new(),
+        ..insight(space, title, "Подробности термина.")
+    }
+}
+
+/// Нарезка термина: имя, строка «Псевдонимы», определение, тело; псевдонимы и код — в
+/// префиксе контекста чанка (FTS находит термин по ним), остальные виды нарезаются как раньше.
+#[tokio::test]
+async fn term_chunks_carry_aliases_and_definition() {
+    let (db, k, _) = setup("term-chunks").await;
+    let (t, _) = create_entry(&db, term(k, "Выжимка", &["quokka", "digest"]), &agent())
+        .await
+        .unwrap();
+    let chunks = entry_chunks_for_index(&db, t.id).await.unwrap();
+    assert!(!chunks.is_empty());
+    let text: String = chunks
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for want in [
+        "Выжимка",
+        "Псевдонимы: quokka, digest",
+        "Определение Выжимка",
+        "Подробности термина.",
+    ] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    for c in &chunks {
+        assert!(c.context_prefix.contains("quokka"), "{}", c.context_prefix);
+        assert!(
+            c.context_prefix.contains("answer_cache_entry"),
+            "{}",
+            c.context_prefix
+        );
+    }
+    // insight с тем же телом нарезается без псевдонимов и определения
+    let (i, _) = create_entry(&db, insight(k, "Выжимка", "Подробности термина."), &agent())
+        .await
+        .unwrap();
+    for c in entry_chunks_for_index(&db, i.id).await.unwrap() {
+        assert!(!c.text.contains("Псевдонимы"), "{}", c.text);
+        assert!(!c.context_prefix.contains("quokka"));
+    }
+    // FTS по псевдониму и по коду
+    for q in ["quokka", "answer_cache_entry"] {
+        let only_terms = TargetFilter {
+            kinds: vec!["term".into()],
+            ..TargetFilter::default()
+        };
+        let hits = fts(&db, q, k, only_terms).await;
+        assert!(!hits.is_empty(), "{q}");
+    }
+}
+
+/// Принудительная переиндексация (`enqueue_reindex` -> `rechunk_entries`) нарезает `term` той же
+/// веткой `rebuild_entry_chunks`, что и создание: после потери чанков псевдонимы и код снова в
+/// префиксе контекста, FTS находит термин по псевдониму и коду (замечание ревью задачи 2).
+#[tokio::test]
+async fn reindex_rebuilds_term_chunks_with_aliases() {
+    let (db, k, _) = setup("term-reindex").await;
+    let (t, _) = create_entry(&db, term(k, "Выжимка", &["quokka", "digest"]), &agent())
+        .await
+        .unwrap();
+    let before = entry_chunks_for_index(&db, t.id).await.unwrap();
+    assert!(!before.is_empty());
+    let id = t.id;
+    db.write(move |tx| {
+        tx.execute("DELETE FROM chunks WHERE entry_id = ?1", [id])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let only_terms = || TargetFilter {
+        kinds: vec!["term".into()],
+        ..TargetFilter::default()
+    };
+    assert!(fts(&db, "quokka", k, only_terms()).await.is_empty());
+
+    assert!(zam_store::enqueue_reindex(&db, None).await.unwrap() >= 1);
+    let after = entry_chunks_for_index(&db, t.id).await.unwrap();
+    assert_eq!(
+        after.iter().map(|c| &c.text).collect::<Vec<_>>(),
+        before.iter().map(|c| &c.text).collect::<Vec<_>>()
+    );
+    for c in &after {
+        assert!(c.context_prefix.contains("quokka"), "{}", c.context_prefix);
+        assert!(c.context_prefix.contains("answer_cache_entry"));
+    }
+    for q in ["quokka", "digest", "answer_cache_entry"] {
+        assert_eq!(fts(&db, q, k, only_terms()).await, vec![t.id], "{q}");
+    }
+}
+
+/// Уникальность имён термина — в транзакции записи: `TermConflict` со всеми пересечениями,
+/// замещаемый и правимый термины исключаются, версия словаря растёт только при успешной записи.
+#[tokio::test]
+async fn term_names_unique_in_transaction() {
+    let (db, k, h) = setup("term-unique").await;
+    assert_eq!(zam_store::glossary_version(&db).await.unwrap(), 0);
+    let (a, _) = create_entry(&db, term(k, "Выжимка", &["summary"]), &agent())
+        .await
+        .unwrap();
+    let v1 = zam_store::glossary_version(&db).await.unwrap();
+    assert!(v1 > 0);
+    match create_entry(&db, term(k, "Дайджест", &["SUMMARY", "выжимка"]), &agent()).await
+    {
+        Err(StoreError::TermConflict(c)) => {
+            assert_eq!(c.len(), 2, "{c:?}");
+            assert!(c.iter().all(|x| x.id == a.id && x.title == "Выжимка"));
+            let mut m: Vec<&str> = c.iter().map(|x| x.matched.as_str()).collect();
+            m.sort_unstable();
+            assert_eq!(m, ["SUMMARY", "выжимка"]);
+        }
+        other => panic!("ожидался TermConflict: {:?}", other.map(|_| ())),
+    }
+    assert_eq!(zam_store::glossary_version(&db).await.unwrap(), v1);
+    // то же имя в другом пространстве — не конфликт (Human — отдельное пространство)
+    create_entry(&db, term(h, "Выжимка", &["summary"]), &agent())
+        .await
+        .unwrap();
+    // замещение тем же именем: замещаемый исключён
+    let (n, o) = supersede_entry(&db, a.id, None, term(k, "Выжимка", &["summary"]), &agent())
+        .await
+        .unwrap();
+    assert_eq!(o.status, Some(EntryStatus::Superseded));
+    assert_eq!(n.supersedes_id, Some(a.id));
+    // правка собственных имён не конфликтует сама с собой
+    let patch = EntryPatch {
+        data: Some(json!({"definition": "Новое", "aliases": ["summary", "digest"]})),
+        ..EntryPatch::default()
+    };
+    let e = update_entry(&db, n.id, None, patch, &agent())
+        .await
+        .unwrap();
+    assert_eq!(e.data["aliases"], json!(["summary", "digest"]));
+    // отзыв освобождает имена
+    retract_entry(&db, n.id, None, "устарел", &agent())
+        .await
+        .unwrap();
+    create_entry(&db, term(k, "Дайджест", &["summary"]), &agent())
+        .await
+        .unwrap();
+    // действующие термины пространства: только живой
+    let terms = zam_store::active_terms(&db, &[k]).await.unwrap();
+    assert_eq!(terms.len(), 1);
+    assert_eq!(terms[0].title, "Дайджест");
+    assert_eq!(terms[0].aliases, ["summary"]);
+    assert_eq!(terms[0].definition, "Определение Дайджест");
 }

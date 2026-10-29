@@ -1,0 +1,322 @@
+# Eval M4.5: словарь домена RU↔EN (задача 15, спецификация §2.2, §13).
+#
+# [[term]] — термин словаря: key (идентификатор набора, `term:<key>` в выдаче), title —
+# каноническое имя (так слово пишется в заметках корпуса), definition (≤ 300 символов),
+# aliases — псевдонимы: русский сленг и транслитерация, сокращения, английские слова.
+# Термины создаются в пространстве решения набора (`POST /spaces/{решение}/entries`,
+# `kind: term`).
+#
+# [[query]] — запрос на псевдониме: text содержит псевдоним термина `term` и не содержит его
+# имени; expect — заметки корпуса, где встречается каноническое имя (начало слова, без учёта
+# регистра) и нет псевдонима запроса — найти их по этому слову может только канал `alias`
+# (или векторный канал по смыслу). Проверка — `cargo xtask eval --check`, тест
+# `glossary_set_is_valid`.
+
+[[term]]
+key = "kubernetes"
+title = "Kubernetes"
+definition = "Оркестратор контейнеров: кластер из control plane и узлов, на которых запускаются поды."
+aliases = ["k8s", "кубер", "кубернетес"]
+
+[[term]]
+key = "redis"
+title = "Redis"
+definition = "Хранилище ключ–значение в памяти: кэш, очереди, кластер с шардированием по слотам."
+aliases = ["редис"]
+
+[[term]]
+key = "postgres"
+title = "Postgres"
+definition = "PostgreSQL — реляционная СУБД проекта и сервисов: миграции схемы, обновления версий, индексы."
+aliases = ["постгрес", "постгре"]
+
+[[term]]
+key = "docker"
+title = "Docker"
+definition = "Контейнерная среда: образы, сборка из Dockerfile, контейнеры, тома."
+aliases = ["докер"]
+
+[[term]]
+key = "nginx"
+title = "nginx"
+definition = "Веб-сервер и обратный прокси: TLS, заголовки X-Forwarded-*, тайм-ауты upstream."
+aliases = ["энджинкс", "нджинкс"]
+
+[[term]]
+key = "qdrant"
+title = "Qdrant"
+definition = "Векторная база ZeroAIMemory: сервер запускает её как управляемый процесс."
+aliases = ["кудрант", "кдрант"]
+
+[[term]]
+key = "sqlite"
+title = "SQLite"
+definition = "Встраиваемая СУБД в одном файле: WAL, busy_timeout, FTS5, VACUUM."
+aliases = ["скулайт"]
+
+[[term]]
+key = "powershell"
+title = "PowerShell"
+definition = "Оболочка Windows: конвейер объектов, кодировка вывода, политика выполнения."
+aliases = ["pwsh", "повершелл", "пауэршелл"]
+
+[[term]]
+key = "rebase"
+title = "rebase"
+definition = "Перенос коммитов ветки на новую базу в git с переписыванием истории."
+aliases = ["ребейз", "перебазирование"]
+
+[[term]]
+key = "robocopy"
+title = "robocopy"
+definition = "Утилита Windows для копирования и зеркалирования каталогов с повторами."
+aliases = ["робокопи"]
+
+[[term]]
+key = "cron"
+title = "cron"
+definition = "Планировщик заданий Unix: crontab, расписание из пяти полей, урезанное окружение."
+aliases = ["крон"]
+
+[[term]]
+key = "playwright"
+title = "Playwright"
+definition = "Фреймворк end-to-end тестов в браузере: ожидания, повторы, трассы."
+aliases = ["плейрайт"]
+
+[[term]]
+key = "webhook"
+title = "webhook"
+definition = "HTTP-обратный вызов: внешняя система присылает событие на адрес сервиса."
+aliases = ["вебхук"]
+
+[[term]]
+key = "deadlock"
+title = "взаимоблокировка"
+definition = "Потоки ждут блокировки друг друга по кругу и не продвигаются."
+aliases = ["дедлок"]
+
+[[term]]
+key = "quantization"
+title = "квантование"
+definition = "Перевод весов и активаций модели в низкую разрядность (int8) ради скорости и размера."
+aliases = ["квантизация", "quantization"]
+
+[[term]]
+key = "timeout"
+title = "таймаут"
+definition = "Предельное время ожидания операции, после которого она прерывается с ошибкой."
+aliases = ["timeout", "тайм-аут"]
+
+[[query]]
+id = "g-01"
+text = "как обновить кластер кубер без простоя"
+lang = "ru"
+term = "kubernetes"
+expect = ["en/long/kubernetes-upgrade-log"]
+
+[[query]]
+id = "g-02"
+text = "k8s upgrade drain nodes before control plane"
+lang = "en"
+term = "kubernetes"
+expect = ["en/long/kubernetes-upgrade-log"]
+
+[[query]]
+id = "g-03"
+text = "миграция кластера редис без потери ключей"
+lang = "ru"
+term = "redis"
+expect = ["en/long/redis-cluster-migration"]
+
+[[query]]
+id = "g-04"
+text = "постгрес миграция схемы без простоя"
+lang = "ru"
+term = "postgres"
+expect = ["ru/db/postgres-zero-downtime-migrations"]
+
+[[query]]
+id = "g-05"
+text = "обновление мажорной версии постгрес"
+lang = "ru"
+term = "postgres"
+expect = ["ru/long/postgres-major-upgrade-runbook"]
+
+[[query]]
+id = "g-06"
+text = "как запускать контейнеры докер без прав root"
+lang = "ru"
+term = "docker"
+expect = ["ru/docker/rootless-podman"]
+
+[[query]]
+id = "g-07"
+text = "что попадает в контекст сборки образа докер"
+lang = "ru"
+term = "docker"
+expect = ["ru/docker/dockerignore-build-context"]
+
+[[query]]
+id = "g-08"
+text = "энджинкс заголовки обратного прокси и адрес клиента"
+lang = "ru"
+term = "nginx"
+expect = ["ru/ops/nginx-reverse-proxy-headers"]
+
+[[query]]
+id = "g-09"
+text = "нджинкс отдаёт неполную цепочку сертификатов"
+lang = "ru"
+term = "nginx"
+expect = ["ru/ops/tls-incomplete-chain"]
+
+[[query]]
+id = "g-10"
+text = "кудрант как управляемый процесс сервера"
+lang = "ru"
+term = "qdrant"
+expect = ["ru/zam/qdrant-managed-process"]
+
+[[query]]
+id = "g-11"
+text = "кудрант недоступен и поиск работает в деградированном режиме"
+lang = "ru"
+term = "qdrant"
+expect = ["ru/zam/degraded-search-mode"]
+
+[[query]]
+id = "g-12"
+text = "скулайт ошибка database is locked при параллельной записи"
+lang = "ru"
+term = "sqlite"
+expect = ["ru/db/sqlite-busy-timeout"]
+
+[[query]]
+id = "g-13"
+text = "журнал WAL в скулайт и контрольные точки"
+lang = "ru"
+term = "sqlite"
+expect = ["ru/db/sqlite-wal"]
+
+[[query]]
+id = "g-14"
+text = "повершелл портит кириллицу при выводе в файл"
+lang = "ru"
+term = "powershell"
+expect = ["ru/windows/powershell-encoding"]
+
+[[query]]
+id = "g-15"
+text = "pwsh pipeline passes objects instead of text"
+lang = "en"
+term = "powershell"
+expect = ["en/windows/powershell-pipeline-objects"]
+
+[[query]]
+id = "g-16"
+text = "интерактивный ребейз с autosquash и fixup коммитами"
+lang = "ru"
+term = "rebase"
+expect = ["en/git/interactive-rebase-autosquash"]
+
+[[query]]
+id = "g-17"
+text = "робокопи зеркалирование каталога по расписанию"
+lang = "ru"
+term = "robocopy"
+expect = ["ru/windows/services-schtasks-robocopy"]
+
+[[query]]
+id = "g-18"
+text = "почему задание крон не видит переменные окружения"
+lang = "ru"
+term = "cron"
+expect = ["ru/linux/crontab-gotchas"]
+
+[[query]]
+id = "g-19"
+text = "крон или таймеры systemd что выбрать"
+lang = "ru"
+term = "cron"
+expect = ["en/linux/systemd-timers-vs-cron"]
+
+[[query]]
+id = "g-20"
+text = "плейрайт нестабильные e2e тесты"
+lang = "ru"
+term = "playwright"
+expect = ["en/devtools/playwright-flaky-e2e"]
+
+[[query]]
+id = "g-21"
+text = "вебхук платежей повторная доставка и идемпотентность"
+lang = "ru"
+term = "webhook"
+expect = ["en/long/payment-webhooks-reliability"]
+
+[[query]]
+id = "g-22"
+text = "дедлок при двух Mutex внутри Arc"
+lang = "ru"
+term = "deadlock"
+expect = ["ru/rust/arc-mutex-deadlock"]
+
+[[query]]
+id = "g-23"
+text = "квантизация модели в int8 и потеря качества"
+lang = "ru"
+term = "quantization"
+expect = ["ru/research/kvantovanie-int8"]
+
+[[query]]
+id = "g-24"
+text = "какой тайм-аут ставить на исходящие запросы к сервисам"
+lang = "ru"
+term = "timeout"
+expect = ["ru/ops/timeouts"]
+
+# Fix round 1 задачи 15: направление EN→RU (английский запрос, каноническое имя — русское) и
+# псевдонимы, не встречавшиеся в запросах выше.
+
+[[query]]
+id = "g-25"
+text = "quantization of the cross-encoder reranker to int8"
+lang = "en"
+term = "quantization"
+expect = ["ru/research/kross-enkodery-rerank"]
+
+[[query]]
+id = "g-26"
+text = "retry with exponential backoff and a timeout for every attempt"
+lang = "en"
+term = "timeout"
+expect = ["ru/ops/retries-backoff-jitter"]
+
+[[query]]
+id = "g-27"
+text = "кубернетес обновление узлов и drain"
+lang = "ru"
+term = "kubernetes"
+expect = ["en/long/kubernetes-upgrade-log"]
+
+[[query]]
+id = "g-28"
+text = "кдрант запускается сервером как дочерний процесс"
+lang = "ru"
+term = "qdrant"
+expect = ["ru/zam/qdrant-managed-process"]
+
+[[query]]
+id = "g-29"
+text = "пауэршелл и stderr нативных команд"
+lang = "ru"
+term = "powershell"
+expect = ["en/windows/powershell-native-stderr"]
+
+[[query]]
+id = "g-30"
+text = "перебазирование ветки или слияние через merge"
+lang = "ru"
+term = "rebase"
+expect = ["en/git/merge-vs-rebase"]

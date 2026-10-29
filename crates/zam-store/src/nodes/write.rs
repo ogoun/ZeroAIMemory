@@ -141,7 +141,7 @@ fn insert_folder(
 }
 
 /// Общая часть создания и правки заметки: дописывает ревизию `rev`, пересобирает
-/// чанки и FTS по её тексту и ставит задание индексации. Строка `nodes` к этому
+/// чанки и FTS по её тексту, ссылки на файлы и ставит задание индексации. Строка `nodes` к этому
 /// моменту уже указывает на `rev` и новый `index_state`; `prev_state` — прежний
 /// `index_state` (`None` у новой заметки).
 #[allow(clippy::too_many_arguments)]
@@ -158,6 +158,8 @@ pub(crate) fn store_revision(
 ) -> Result<(), StoreError> {
     insert_revision(c, node_id, rev, content, hash, a, now)?;
     index_note(c, node_id, rev, content, meta, prev_state, now)?;
+    // ссылки на файлы и `verified_at` из frontmatter ревизии (M4.5 §6.1, §7)
+    crate::file_refs::sync_note(c, node_id, meta.doc.frontmatter.as_ref(), a, now)?;
     Ok(())
 }
 

@@ -5,8 +5,13 @@
 //! `certainty_not_recognized` — во frontmatter ключ `certainty`/`evidence` в нераспознаваемом
 //! написании (в кавычках, с заглавными буквами): такой ключ статус не задаёт (§7.5);
 //! `unknown relation type: <тип>` и `invalid relation: <строка>` — строка `relations:`, не
-//! давшая ребра графа (§8.5); `secrets_detected` (+ `secrets_detected: [{kind, line}]`) — в тексте
-//! найдены секреты, в индекс они уходят замаскированными (§7.6, [`crate::api::secrets`]).
+//! давшая ребра графа (§8.5); `term_alias: «<псевдоним>» → «<имя>»` — в имени или тексте
+//! заметки псевдоним термина словаря вместо имени (M4.5 §2.2, до 5); `secrets_detected` (+
+//! `secrets_detected: [{kind, line}]`) — в тексте найдены секреты, в индекс они уходят
+//! замаскированными (§7.6, [`crate::api::secrets`]); `verified_at_invalid` — `verified_at:`
+//! не дата `YYYY-MM-DD`; `verified_at_commit_invalid` — `verified_at_commit:` не sha коммита
+//! (4–64 hex); `invalid_ref: <путь> (<причина>)` — путь `refs:` не стал ссылкой на файл;
+//! `refs_truncated` — ссылок больше 64 (M4.5 §6.1, §7).
 //!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
@@ -53,23 +58,57 @@ pub struct Create {
 /// Предупреждение: ключ `certainty`/`evidence` во frontmatter написан так, что не распознан.
 pub const CERTAINTY_NOT_RECOGNIZED: &str = "certainty_not_recognized";
 
+/// Предупреждение: `verified_at_commit:` во frontmatter — не sha коммита (4–64 hex).
+pub const VERIFIED_AT_COMMIT_INVALID: &str = "verified_at_commit_invalid";
+
 /// Предупреждения записи заметки по её тексту.
 fn note_warnings(content: &str) -> Vec<String> {
     let doc = zam_markdown::parse(content);
     let mut out = Vec::new();
-    if let Some(f) = &doc.frontmatter
-        && !zam_markdown::unrecognized_certainty_keys(&f.raw).is_empty()
-    {
-        out.push(CERTAINTY_NOT_RECOGNIZED.to_string());
+    if let Some(f) = &doc.frontmatter {
+        if !zam_markdown::unrecognized_certainty_keys(&f.raw).is_empty() {
+            out.push(CERTAINTY_NOT_RECOGNIZED.to_string());
+        }
+        // `verified_at_invalid` и ссылки на файлы, которые не стали ссылками (M4.5 §6.1, §7)
+        out.extend(f.warnings.iter().cloned());
+        if f.verified_at_commit
+            .as_deref()
+            .is_some_and(|c| zam_store::check_commit(c).is_none())
+        {
+            out.push(VERIFIED_AT_COMMIT_INVALID.to_string());
+        }
+        let mut valid = 0;
+        for r in &f.refs {
+            match zam_store::normalize_ref_path(r) {
+                Ok(_) => valid += 1,
+                Err(e) => out.push(format!("invalid_ref: {r} ({e})")),
+            }
+        }
+        if valid > zam_store::file_refs::REFS_MAX {
+            out.push(format!(
+                "refs_truncated: учтены первые {}",
+                zam_store::file_refs::REFS_MAX
+            ));
+        }
     }
     out.extend(zam_store::links::relation_warnings(&doc));
     out
 }
 
-/// `Node` как JSON с `warnings` (только непустые).
-fn node_reply(node: &Node, content: &str) -> Result<Value, ApiError> {
+/// `Node` как JSON с `warnings` (только непустые); `db` и `space` — база и пространство
+/// заметки для предупреждений о псевдонимах словаря (кэш словаря — в `st`).
+async fn node_reply(
+    st: &AppState,
+    db: &zam_store::Db,
+    space: zam_core::Id,
+    node: &Node,
+    content: &str,
+) -> Result<Value, ApiError> {
     let mut v = serde_json::to_value(node).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let w = note_warnings(content);
+    let mut w = note_warnings(content);
+    if !content.is_empty() {
+        w.extend(crate::api::glossary::alias_warnings(st, db, space, &node.name, content).await?);
+    }
     if !w.is_empty()
         && let Value::Object(o) = &mut v
     {
@@ -126,7 +165,10 @@ pub async fn create(
     };
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
-    Ok((StatusCode::CREATED, Json(node_reply(&node, &content)?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(node_reply(&st, &sc.db, sc.space.id, &node, &content).await?),
+    ))
 }
 
 /// Ревизия из `If-Match`: `3`, `"3"` или `W/"3"`.
@@ -167,7 +209,9 @@ pub async fn replace(
     match update_note(&sc.db, sc.node.id, base, req.content, req.l0, attrib).await {
         Ok(n) => {
             st.index.notify();
-            Ok(Json(node_reply(&n, &content)?))
+            Ok(Json(
+                node_reply(&st, &sc.db, sc.space.id, &n, &content).await?,
+            ))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, base, e).await),
     }
@@ -197,7 +241,7 @@ pub async fn patch(
         Ok(n) => {
             st.index.notify();
             let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
-            Ok(Json(node_reply(&n, &text)?))
+            Ok(Json(node_reply(&st, &sc.db, sc.space.id, &n, &text).await?))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, req.base_rev, e).await),
     }

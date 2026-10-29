@@ -7,17 +7,23 @@
 //! - несколько целей: перед каждой строка `--- <цель> ---` (с новой строки). Ошибка
 //!   одной цели печатается в stderr, остальные читаются; код выхода — первой ошибки.
 //!
-//! **Пачка** (`--batch`, а также `--max-tokens`, `--budget`, `--if-rev`; §9.3 шаг 2): одна
+//! **Пачка** (`--batch`, а также `--max-tokens`, `--budget`, `--if-rev`, `--since-rev`; §9.3
+//! шаг 2): одна
 //! `POST /read` на все цели — Markdown сервера как есть (заголовок на элемент, `…ещё N токенов`,
 //! `(budget)`, последняя строка `~N tok`) или с `--json` ответ сервера. Без этих флагов вывод
 //! побайтный, как раньше [решение исполнителя: побайтное чтение M1 не меняется]. Ошибка по
 //! элементу остаётся в выводе; код выхода — первой ошибки (`not_found`, `invalid` — как у 404 и
 //! 422, `forbidden`, `solution_access` — как у 403). `--rev` с пачкой несовместим.
 //!
-//! **Ссылки выдачи** (стенд Debian 13, B2): `n:<id>` — узел, `i:|c:|e:|r:<id>` — запись журнала,
-//! как их печатают `zam search` и `/read`. Запись журнала и без пачки читается через
-//! `POST /read` (одна цель, без бюджета): печатается текст уровня (`L2` — тело), с `--json` —
-//! элемент ответа сервера **[решение исполнителя]**. `--rev` к записи неприменим.
+//! **Изменения** (`--since-rev N`, M4.5 §7): пачка из одной цели с `since_rev` — сервер отдаёт
+//! унифицированный дифф с ревизии `N` (`(изменения с revN, дифф)`), полный текст, если дифф
+//! длиннее (`(дифф длиннее текста — полный текст)`), или `unchanged`; с `--json` — элемент
+//! `{rev, diff}` | `{rev, content, diff_skipped: true}` | `{unchanged: true}`.
+//!
+//! **Ссылки выдачи** (стенд Debian 13, B2): `n:<id>` — узел, `i:|c:|e:|r:|t:|k:|q:<id>` — запись
+//! журнала, как их печатают `zam search` и `/read`. Запись журнала и без пачки читается через `POST
+//! /read` (одна цель, без бюджета): печатается текст уровня (`L2` — тело), с `--json` — элемент
+//! ответа сервера **[решение исполнителя]**. `--rev` к записи неприменим.
 //!
 //! Нет секции `--section` — код 5 с подсказкой: путь секции — заголовки от верхнего или
 //! однозначный хвост пути.
@@ -42,11 +48,17 @@ pub struct Opts<'a> {
     pub max_tokens: Option<u32>,
     pub budget: Option<u32>,
     pub if_rev: Option<i64>,
+    /// Изменения с ревизии (M4.5 §7).
+    pub since_rev: Option<i64>,
 }
 
 impl Opts<'_> {
     fn batched(&self) -> bool {
-        self.batch || self.max_tokens.is_some() || self.budget.is_some() || self.if_rev.is_some()
+        self.batch
+            || self.max_tokens.is_some()
+            || self.budget.is_some()
+            || self.if_rev.is_some()
+            || self.since_rev.is_some()
     }
 }
 
@@ -111,7 +123,7 @@ fn one(ctx: &Ctx, raw: &str, o: &Opts) -> Result<Out, CliError> {
     })
 }
 
-/// Запись журнала `i:|c:|e:|r:<id>`: одна цель `POST /read` без бюджета.
+/// Запись журнала `i:|c:|e:|r:|t:|k:|q:<id>`: одна цель `POST /read` без бюджета.
 fn one_entry(ctx: &Ctx, raw: &str, o: &Opts) -> Result<Out, CliError> {
     if o.rev.is_some() {
         return Err(CliError::input("--rev неприменим к записи журнала"));
@@ -225,8 +237,8 @@ fn error_exit(code: &str) -> u8 {
     }
 }
 
-/// `id` элемента `/read` для цели: ссылка записи `i:|c:|e:|r:<id>` как есть, id узла — голый
-/// (сервер ищет узел, затем запись), путь — `<пространство>:/<путь>`.
+/// `id` элемента `/read` для цели: ссылка записи `i:|c:|e:|r:|t:|k:|q:<id>` как есть, id
+/// узла — голый (сервер ищет узел, затем запись), путь — `<пространство>:/<путь>`.
 fn item_id(ctx: &Ctx, raw: &str) -> Result<String, CliError> {
     if entry_ref(raw).is_some() {
         return Ok(raw.to_string());
@@ -241,12 +253,12 @@ fn item_id(ctx: &Ctx, raw: &str) -> Result<String, CliError> {
 fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
     if o.rev.is_some() {
         return Err(CliError::input(
-            "--rev несовместим с пачкой (--batch, --max-tokens, --budget, --if-rev)",
+            "--rev несовместим с пачкой (--batch, --max-tokens, --budget, --if-rev, --since-rev)",
         ));
     }
-    if o.if_rev.is_some() && targets.len() > 1 {
+    if (o.if_rev.is_some() || o.since_rev.is_some()) && targets.len() > 1 {
         return Err(CliError::input(
-            "--if-rev задаёт ревизию одной цели: передайте ровно одну цель",
+            "--if-rev и --since-rev задают ревизию одной цели: передайте ровно одну цель",
         ));
     }
     let mut items = Vec::with_capacity(targets.len());
@@ -263,6 +275,9 @@ fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
         }
         if let Some(v) = o.if_rev {
             it["if_rev"] = json!(v);
+        }
+        if let Some(v) = o.since_rev {
+            it["since_rev"] = json!(v);
         }
         items.push(it);
     }

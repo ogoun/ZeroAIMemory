@@ -5,15 +5,24 @@
 //!             session_id?, format?: "json"|"md", budget_tokens?}
 //! ```
 //!
-//! - `id`: `n:<id>` (узел), `i:|c:|r:<id>` (запись журнала; `e:` тоже), голый id (узел, иначе
-//!   запись) или путь `<пространство>:/<путь>` (`knowledge:/Инструменты/Bash`). Не больше
+//! - `id`: `n:<id>` (узел), `i:|c:|r:|t:|k:|q:<id>` (запись журнала; `e:` тоже), голый id (узел,
+//!   иначе запись) или путь `<пространство>:/<путь>` (`knowledge:/Инструменты/Bash`). Не больше
 //!   `read.max_items` (20) элементов, пусто или больше — 422; `locator` — 422
 //!   `locator-unsupported` (этап M5). Некорректный `tier`, нулевые `max_tokens` и
 //!   `budget_tokens` — 400. Всё это проверяется до чтения;
 //! - `tier` — `L0` | `L1` | `L2` (по умолчанию). Узел: сводка, оглавление с первым предложением
-//!   секций, текст. Запись журнала **[решение исполнителя]**: L0 — заголовок, L1 — `note_l1`
-//!   тела (нет — заголовок), L2 — тело. `section` — путь заголовков (как в `GET /nodes`);
+//!   секций, текст. Запись журнала **[решение исполнителя]**: L0 — заголовок (у term —
+//!   определение), L1 — `note_l1` тела (нет — L0), L2 — тело. `section` — путь заголовков (как в
+//!   `GET /nodes`);
 //! - `if_rev` равен текущей ревизии → элемент `unchanged` без текста (и без учёта показа);
+//! - **`since_rev: N`** (M4.5 §7) — изменения с ревизии `N`: `N` равна текущей — `unchanged`
+//!   (как `if_rev`); меньше — `diff` (унифицированный, контекст 3, как `GET /nodes/{id}/diff`,
+//!   заголовки `rev N` / `rev M`) и `rev`; дифф длиннее полного текста (в токенах) или ревизии
+//!   `N` уже нет — полный текст `content` с `diff_skipped: true`. У записи журнала дифф —
+//!   построчно по тексту снимков ревизий (`entry_revisions`): `title`, тело и `data`
+//!   каноническим JSON ([`zam_store::entry_snapshot_text`]), полный текст — тот же снимок.
+//!   `N` < 1, больше текущей, вместе с `if_rev`, с `tier` кроме L2 или с `section` — 400.
+//!   Отданный целиком дифф или полный текст отмечает цель выданной сессии (как полный L2);
 //! - **бюджет**: `budget_tokens` (по умолчанию `read.budget_tokens` = 1500) на весь ответ,
 //!   заголовки и текст. Элемент, не влезший целиком (или длиннее своего `max_tokens`),
 //!   обрезается с пометкой `…ещё N токенов`; обрезается и первый элемент (хоть что-то
@@ -31,7 +40,8 @@
 //!   `unchanged`, `(budget)` и ошибки — не отмечаются. Касание сессии и отметка — одна
 //!   транзакция; сбой учёта — WARN (без id сессии и текста), ответ не портится. Некорректный
 //!   id сессии — 400;
-//! - если у какого-то элемента ошибка, в ответе (md и json) заголовок `X-Zam-Read-Error: <код первой>`:
+//! - если у какого-то элемента ошибка, в ответе (md и json) заголовок
+//!   `X-Zam-Read-Error: <код первой>`:
 //!   клиенту не нужно разбирать Markdown, где текст заметки мог бы выглядеть как заголовок ошибки;
 //! - ответ `json` (по умолчанию, как у поиска): `{items: [...], total_tokens}`; `md` —
 //!   заголовок на элемент `### n:<id> <пространство>/<путь> › <секция>  rev<N> · ~<T> tok`
@@ -51,10 +61,11 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_search::truncate_to_tokens;
 use zam_store::{
     EntryKind, NodeKind, NodePath, SeenItem, SeenKey, StoreError, WHOLE_TARGET, count_tokens,
-    get_node_by_path, mark_seen, node_content,
+    entry_revisions, entry_snapshot_text, get_node_by_path, mark_seen, node_content,
 };
 
 use super::json_body;
+use super::nodes::diff_blocking;
 use super::nodes::read::{Tier, l1, parse_tier, section_slice};
 use super::scope::{
     EntryScope, Mode, NodeScope, entry_scope, live, live_entry, node_scope, space_scope,
@@ -84,6 +95,8 @@ pub struct ReadItem {
     locator: Option<Value>,
     max_tokens: Option<usize>,
     if_rev: Option<i64>,
+    /// Изменения с этой ревизии (M4.5 §7).
+    since_rev: Option<i64>,
 }
 
 /// Ошибка элемента: код, пояснение и дополнительные поля.
@@ -137,19 +150,46 @@ impl From<StoreError> for Failure {
 
 /// Что получено по элементу.
 enum Content {
-    /// `if_rev` совпал: текста нет.
+    /// `if_rev` (или `since_rev`) совпал: текста нет.
     Unchanged,
-    /// Текст выбранного уровня; `whole` — полный текст L2 без секции.
-    Text { text: String, whole: bool },
+    /// Текст выбранного уровня; `whole` — полный текст L2 без секции (или изменения с
+    /// `since_rev`: дифф и полный текст тоже дают агенту всю текущую ревизию).
+    Text {
+        text: String,
+        whole: bool,
+        form: Form,
+    },
+}
+
+/// Вид текста элемента.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// Текст уровня (`text`).
+    Plain,
+    /// Дифф с `since_rev` (`diff`).
+    Diff { since: i64 },
+    /// Дифф длиннее текста или ревизии `since_rev` нет: полный текст (`content`,
+    /// `diff_skipped: true`).
+    Full,
+}
+
+impl Content {
+    fn plain(text: String, whole: bool) -> Content {
+        Content::Text {
+            text,
+            whole,
+            form: Form::Plain,
+        }
+    }
 }
 
 /// Прочитанный элемент (до упаковки в бюджет).
 struct Fetched {
     /// `id` как в запросе.
     raw: String,
-    /// Каноническая ссылка `n:<id>` | `i:|c:|r:<id>`.
+    /// Каноническая ссылка `n:<id>` | `i:|c:|r:|t:|k:|q:<id>`.
     reference: String,
-    /// `node` | `insight` | `changelog` | `release`.
+    /// `node` или вид записи (`insight`, `changelog`, `release`, `term`, `task`, `question`).
     kind: &'static str,
     /// Начало заголовка: ссылка и путь узла либо вид и заголовок записи.
     head: String,
@@ -164,6 +204,8 @@ struct Fetched {
     max_tokens: Option<usize>,
     seen: SeenKey,
     content: Content,
+    /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
+    stale_refs: Vec<String>,
 }
 
 /// Результат по элементу после упаковки.
@@ -186,6 +228,7 @@ enum Piece {
         more: usize,
         /// Отдан полный текст L2 без секции — цель выдана целиком.
         given_whole: bool,
+        form: Form,
     },
 }
 
@@ -205,6 +248,15 @@ enum Located {
 
 fn miss() -> Failure {
     Failure::Item(Fail::new("not_found", None))
+}
+
+/// Префикс ссылки элемента: `n` (узел) или буква записи (`i|c|r|t|k|q|e`) и остаток; без
+/// известного префикса — `(None, raw)`.
+fn split_ref(raw: &str) -> (Option<&str>, &str) {
+    match raw.split_once(':') {
+        Some((k, rest)) if k == "n" || zam_store::is_entry_ref_letter(k) => (Some(k), rest),
+        _ => (None, raw),
+    }
 }
 
 /// Находит узел или запись по `id` элемента с проверкой доступа (Human по токену и чужая база
@@ -231,10 +283,7 @@ async fn resolve(
             role: sc.role,
         }));
     }
-    let (prefix, rest) = match raw.split_once(':') {
-        Some((k @ ("n" | "i" | "c" | "r" | "e"), rest)) => (Some(k), rest),
-        _ => (None, raw),
-    };
+    let (prefix, rest) = split_ref(raw);
     rest.parse::<Id>().map_err(|_| miss())?;
     match prefix {
         Some("n") => Ok(Located::Node(
@@ -274,15 +323,22 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
                 .filter(|s| !s.is_empty())
         })
         .flatten();
-    let content = if it.if_rev == Some(node.current_rev) {
+    let content = if it.if_rev == Some(node.current_rev) || it.since_rev == Some(node.current_rev) {
         Content::Unchanged
     } else if tier == Tier::L0 {
-        Content::Text {
-            text: node.l0.clone().unwrap_or_default(),
-            whole: false,
-        }
+        Content::plain(node.l0.clone().unwrap_or_default(), false)
     } else if node.kind == NodeKind::Folder {
         return Err(ApiError::BadRequest("узел — папка: текста нет".into()).into());
+    } else if let Some(since) = it.since_rev {
+        check_since(since, node.current_rev)?;
+        let (_, new) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
+        let old = match node_content(&sc.db, node.id, Some(since)).await {
+            Ok((_, t)) => Some(t),
+            // ревизии `since` нет (снята сроком хранения) — полный текст
+            Err(StoreError::NotFound) => None,
+            Err(e) => return Err(e.into()),
+        };
+        changes(old, new, since, node.current_rev).await?
     } else {
         // ровно та ревизия, что в снимке узла
         let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
@@ -291,14 +347,12 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
             None => (text, true),
         };
         match tier {
-            Tier::L1 => Content::Text {
-                text: l1(&text),
-                whole: false,
-            },
-            _ => Content::Text { text, whole },
+            Tier::L1 => Content::plain(l1(&text), false),
+            _ => Content::plain(text, whole),
         }
     };
     let reference = format!("n:{}", node.id);
+    let stale_refs = stale_of(&sc.db, TargetKind::Node, node.id).await?;
     Ok(Fetched {
         raw: it.id.clone(),
         head: format!("{reference} {}/{}", sc.space.name, node.path),
@@ -322,7 +376,23 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
             part: WHOLE_TARGET.to_string(),
         },
         content,
+        stale_refs,
     })
+}
+
+/// Сводка записи (L0): у термина — определение (`data.definition`, M4.5 §2.1), у прочих —
+/// заголовок.
+fn summary_of(e: &zam_store::Entry) -> String {
+    if e.kind == EntryKind::Term
+        && let Some(d) = e
+            .data
+            .get("definition")
+            .and_then(Value::as_str)
+            .filter(|d| !d.trim().is_empty())
+    {
+        return d.to_string();
+    }
+    e.title.clone()
 }
 
 async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetched, Failure> {
@@ -336,13 +406,21 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
                 .filter(|s| !s.is_empty())
         })
         .flatten();
-    let content = if it.if_rev == Some(e.rev) {
+    let content = if it.if_rev == Some(e.rev) || it.since_rev == Some(e.rev) {
         Content::Unchanged
     } else if tier == Tier::L0 {
-        Content::Text {
-            text: e.title.clone(),
-            whole: false,
-        }
+        Content::plain(summary_of(e), false)
+    } else if let Some(since) = it.since_rev {
+        check_since(since, e.rev)?;
+        let revs = entry_revisions(&sc.db, e.id).await?;
+        let snap = |rev: i64| {
+            revs.iter()
+                .find(|r| r.rev == rev)
+                .map(|r| entry_snapshot_text(&r.title, &r.body, &r.data))
+        };
+        // снимка текущей ревизии нет (запись до M3) — по самой записи
+        let new = snap(e.rev).unwrap_or_else(|| entry_snapshot_text(&e.title, &e.body, &e.data));
+        changes(snap(since), new, since, e.rev).await?
     } else {
         let (text, whole) = match section {
             Some(s) => (slice(&e.body, s)?.to_string(), false),
@@ -351,24 +429,19 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
         match tier {
             Tier::L1 => {
                 let t = l1(&text);
-                Content::Text {
-                    text: if t.trim().is_empty() {
-                        e.title.clone()
-                    } else {
-                        t
-                    },
-                    whole: false,
-                }
+                let t = if t.trim().is_empty() {
+                    summary_of(e)
+                } else {
+                    t
+                };
+                Content::plain(t, false)
             }
-            _ => Content::Text { text, whole },
+            _ => Content::plain(text, whole),
         }
     };
-    let (letter, kind) = match e.kind {
-        EntryKind::Insight => ("i", "insight"),
-        EntryKind::Changelog => ("c", "changelog"),
-        EntryKind::Release => ("r", "release"),
-    };
+    let (letter, kind) = (e.kind.ref_letter(), e.kind.as_str());
     let reference = format!("{letter}:{}", e.id);
+    let stale_refs = stale_of(&sc.db, TargetKind::Entry, e.id).await?;
     let sub = match e.kind {
         EntryKind::Release => None,
         _ => e.data.get("kind").and_then(Value::as_str),
@@ -400,7 +473,65 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
             part: WHOLE_TARGET.to_string(),
         },
         content,
+        stale_refs,
     })
+}
+
+/// `since_rev` больше текущей ревизии — 400 запроса (а не ошибка элемента): клиент прислал
+/// ревизию, которой не было.
+fn check_since(since: i64, current: i64) -> Result<(), Failure> {
+    if since > current {
+        return Err(Failure::Fatal(ApiError::BadRequest(format!(
+            "since_rev: {since} больше текущей ревизии {current}"
+        ))));
+    }
+    Ok(())
+}
+
+/// Изменения с ревизии `since` до `current`: дифф или (дифф длиннее текста, старой ревизии
+/// нет) полный текст.
+async fn changes(
+    old: Option<String>,
+    new: String,
+    since: i64,
+    current: i64,
+) -> Result<Content, Failure> {
+    let Some(old) = old else {
+        return Ok(Content::Text {
+            text: new,
+            whole: true,
+            form: Form::Full,
+        });
+    };
+    let diff = diff_blocking(
+        old,
+        new.clone(),
+        format!("rev {since}"),
+        format!("rev {current}"),
+    )
+    .await?;
+    Ok(if count_tokens(&diff) > count_tokens(&new) {
+        Content::Text {
+            text: new,
+            whole: true,
+            form: Form::Full,
+        }
+    } else {
+        Content::Text {
+            text: diff,
+            whole: true,
+            form: Form::Diff { since },
+        }
+    })
+}
+
+/// Пути устаревших ссылок цели на файлы.
+async fn stale_of(db: &zam_store::Db, kind: TargetKind, id: Id) -> Result<Vec<String>, Failure> {
+    let r = TargetRef { kind, id };
+    Ok(zam_store::stale_refs_of(db, &[r])
+        .await?
+        .remove(&r)
+        .unwrap_or_default())
 }
 
 async fn fetch(
@@ -486,13 +617,13 @@ fn pack(fetched: Vec<Result<Fetched, (String, Fail)>>, budget: usize) -> (Vec<Pi
             }
             Ok(f) => f,
         };
-        let text = match &f.content {
+        let (text, form) = match &f.content {
             Content::Unchanged => {
                 total += count_tokens(&header(&f, "unchanged"));
                 out.push(Piece::Unchanged(f));
                 continue;
             }
-            Content::Text { text, .. } => text.clone(),
+            Content::Text { text, form, .. } => (text.clone(), *form),
         };
         let whole = matches!(f.content, Content::Text { whole: true, .. });
         let full = count_tokens(&text);
@@ -531,6 +662,7 @@ fn pack(fetched: Vec<Result<Fetched, (String, Fail)>>, budget: usize) -> (Vec<Pi
             full,
             more,
             given_whole: whole && !cut,
+            form,
             f,
         });
     }
@@ -561,6 +693,9 @@ fn item_json(piece: &Piece) -> Value {
         }
         o.insert("tier".into(), json!(tier_str(f.tier)));
         o.insert("rev".into(), json!(f.rev));
+        if !f.stale_refs.is_empty() {
+            o.insert("stale_refs".into(), json!(f.stale_refs));
+        }
     };
     match piece {
         Piece::Err { raw, fail } => {
@@ -587,11 +722,24 @@ fn item_json(piece: &Piece) -> Value {
             text,
             full,
             more,
+            form,
             ..
         } => {
             base(f, &mut o);
             o.insert("tokens".into(), json!(full));
-            o.insert("text".into(), json!(text));
+            match form {
+                Form::Plain => {
+                    o.insert("text".into(), json!(text));
+                }
+                Form::Diff { since } => {
+                    o.insert("since_rev".into(), json!(since));
+                    o.insert("diff".into(), json!(text));
+                }
+                Form::Full => {
+                    o.insert("content".into(), json!(text));
+                    o.insert("diff_skipped".into(), json!(true));
+                }
+            }
             if *more > 0 {
                 o.insert("truncated".into(), json!(true));
                 o.insert("more_tokens".into(), json!(more));
@@ -608,6 +756,13 @@ fn push_block(out: &mut String, line: &str) {
     }
 }
 
+/// Строка `(возможно устарело: изменился <путь>)` под заголовком элемента (M4.5 §6.2).
+fn push_stale(out: &mut String, f: &Fetched) {
+    if let Some(s) = super::search::stale_line(&f.stale_refs) {
+        push_block(out, &format!("({s})"));
+    }
+}
+
 fn render_md(pieces: &[Piece], total: usize) -> String {
     let mut out = String::new();
     for piece in pieces {
@@ -618,9 +773,13 @@ fn render_md(pieces: &[Piece], total: usize) -> String {
                     push_block(&mut out, &format!("({})", md_inline(d)));
                 }
             }
-            Piece::Unchanged(f) => push_block(&mut out, &header(f, "unchanged")),
+            Piece::Unchanged(f) => {
+                push_block(&mut out, &header(f, "unchanged"));
+                push_stale(&mut out, f);
+            }
             Piece::Budget { f, full } => {
                 push_block(&mut out, &header(f, &format!("~{full} tok")));
+                push_stale(&mut out, f);
                 push_block(&mut out, BUDGET_LINE);
             }
             Piece::Text {
@@ -628,9 +787,18 @@ fn render_md(pieces: &[Piece], total: usize) -> String {
                 text,
                 full,
                 more,
+                form,
                 ..
             } => {
                 push_block(&mut out, &header(f, &format!("~{full} tok")));
+                push_stale(&mut out, f);
+                match form {
+                    Form::Plain => {}
+                    Form::Diff { since } => {
+                        push_block(&mut out, &format!("(изменения с rev{since}, дифф)"));
+                    }
+                    Form::Full => push_block(&mut out, "(дифф длиннее текста — полный текст)"),
+                }
                 if !text.is_empty() {
                     push_block(&mut out, text);
                 }
@@ -678,7 +846,19 @@ pub async fn read(
         if it.max_tokens == Some(0) {
             return Err(ApiError::BadRequest("max_tokens: больше 0".into()));
         }
-        tiers.push(parse_tier(it.tier.as_deref())?);
+        let tier = parse_tier(it.tier.as_deref())?;
+        if let Some(since) = it.since_rev {
+            if since < 1 {
+                return Err(ApiError::BadRequest("since_rev: от 1".into()));
+            }
+            let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
+            if it.if_rev.is_some() || tier != Tier::L2 || section {
+                return Err(ApiError::BadRequest(
+                    "since_rev: только полный текст L2, без if_rev и section".into(),
+                ));
+            }
+        }
+        tiers.push(tier);
     }
     // сессия: некорректный id — 400; сбой её базы чтение не валит (WARN)
     let session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
@@ -745,4 +925,28 @@ pub async fn read(
             .insert(ERROR_HEADER, HeaderValue::from_static(code));
     }
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Буквы ссылок записи в `id` элемента: `i|c|r|e` и с M4.5 `t` (term), `k` (task),
+    /// `q` (question); неизвестный префикс — путь или голый id.
+    #[test]
+    fn entry_ref_letters() {
+        for p in ["n", "i", "c", "r", "e", "t", "k", "q"] {
+            let raw = format!("{p}:01ABC");
+            assert_eq!(split_ref(&raw), (Some(p), "01ABC"), "{p}");
+        }
+        assert_eq!(split_ref("x:01ABC"), (None, "x:01ABC"));
+        assert_eq!(split_ref("01ABC"), (None, "01ABC"));
+        for k in EntryKind::ALL {
+            assert!(zam_store::is_entry_ref_letter(k.ref_letter()));
+            assert_eq!(EntryKind::from_ref_letter(k.ref_letter()), Some(k));
+        }
+        assert_eq!(EntryKind::Term.ref_letter(), "t");
+        assert_eq!(EntryKind::Task.ref_letter(), "k");
+        assert_eq!(EntryKind::Question.ref_letter(), "q");
+    }
 }

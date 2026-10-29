@@ -637,6 +637,7 @@ async fn member_cannot_read_owner_knowledge_entry_404() {
     let (secret, _) = create_entry(
         &odb,
         NewEntry {
+            refs: None,
             space_id: knowledge,
             kind: EntryKind::Changelog,
             title: "Личная запись владельца".into(),

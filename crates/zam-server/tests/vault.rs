@@ -893,3 +893,536 @@ fn vault_values_not_in_fts_qdrant_logs() {
         "заметка в очереди и чанках"
     );
 }
+
+// ---- окружение (M4.5 §8, задача 11): host/environment, vault_fts, дайджест ----
+
+async fn post_env(
+    a: &Api,
+    title: &str,
+    ty: &str,
+    extra: serde_json::Value,
+    secret: Option<&str>,
+) -> Resp {
+    let mut data = json!({"type": ty});
+    for (k, v) in extra.as_object().unwrap() {
+        data[k] = v.clone();
+    }
+    let mut body = json!({"title": title, "data": data});
+    if let Some(s) = secret {
+        body["secret"] = json!(s);
+    }
+    a.t(Method::POST, "/api/v1/spaces/knowledge/vault", Some(body))
+        .await
+}
+
+fn titles(r: &Resp) -> Vec<String> {
+    r.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn list_q(a: &Api, q: &str) -> Resp {
+    let r = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/spaces/knowledge/vault?q={}", common::api::enc(q)),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r
+}
+
+#[tokio::test]
+async fn vault_host_without_secret() {
+    let a = api("vault-host-nosecret", |_| {}).await;
+    let extra = json!({"purpose": "стенд интеграционных тестов", "address": "10.0.0.5:22",
+        "limits": "только ночью", "notes": "ключи ротируются раз в месяц"});
+    for ty in ["host", "environment"] {
+        let r = post_env(&a, &format!("{ty}-1"), ty, extra.clone(), None).await;
+        let id = id_of(&r);
+        assert_eq!(r.json()["data"]["address"], "10.0.0.5:22");
+        // раскрытие записи без значения: secret = null, не ошибка
+        let r = reveal(&a, &a.token, &id).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert!(r.json()["secret"].is_null(), "{}", r.text());
+        // правка открытых полей без значения — новая ревизия, значения по-прежнему нет
+        let r = a
+            .t(
+                Method::PATCH,
+                &format!("/api/v1/vault/{id}"),
+                Some(json!({"data": {"type": ty, "purpose": "новое"}})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json()["rev"], 2);
+        assert!(reveal(&a, &a.token, &id).await.json()["secret"].is_null());
+        // значение можно добавить позже
+        let sec = value(ty);
+        let r = a
+            .t(
+                Method::PATCH,
+                &format!("/api/v1/vault/{id}"),
+                Some(json!({"secret": sec})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(reveal(&a, &a.token, &id).await.json()["secret"], sec);
+    }
+    // пределы открытых полей
+    for (k, n) in [
+        ("purpose", 501),
+        ("address", 501),
+        ("limits", 1001),
+        ("notes", 2001),
+    ] {
+        let r = post_env(&a, "big", "host", json!({ k: "x".repeat(n) }), None).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{k}");
+    }
+    let max = json!({"notes": "x".repeat(2000), "limits": "y".repeat(1000)});
+    let r = post_env(&a, "ok", "host", max, None).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+}
+
+#[tokio::test]
+async fn vault_password_still_requires_secret() {
+    let a = api("vault-pw-secret", |_| {}).await;
+    for ty in [
+        "password",
+        "token",
+        "ssh_key",
+        "connection_string",
+        "url",
+        "repo",
+        "note",
+    ] {
+        let r = post_env(&a, ty, ty, json!({}), None).await;
+        assert_eq!(
+            r.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{ty}: {}",
+            r.text()
+        );
+    }
+    // host без значения нельзя превратить в password без значения
+    let id = id_of(&post_env(&a, "h", "host", json!({}), None).await);
+    let r = a
+        .t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{id}"),
+            Some(json!({"data": {"type": "password"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let r = a
+        .t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{id}"),
+            Some(json!({"data": {"type": "password"}, "secret": value("pw")})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // пустое значение по-прежнему 422, даже у host
+    let r = post_env(&a, "h2", "host", json!({}), Some("")).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn vault_fts_open_fields() {
+    let a = api("vault-fts-open", |_| {}).await;
+    let h = id_of(
+        &post_env(
+            &a,
+            "стенд-приёмки",
+            "environment",
+            json!({"purpose": "интеграционные тесты биллинга", "address": "stage.example.com:8443",
+                "limits": "только ночью", "notes": "ротация ключей ежемесячно",
+                "username": "deployer"}),
+            None,
+        )
+        .await,
+    );
+    id_of(&set(&a, &a.token, "knowledge", "github", &value("g")).await);
+    // title, purpose (префикс), address, limits, notes, username, url, description
+    for (q, want) in [
+        ("приёмки", "стенд-приёмки"),
+        ("интегр", "стенд-приёмки"),
+        ("stage.example", "стенд-приёмки"),
+        ("ночью", "стенд-приёмки"),
+        ("ротация", "стенд-приёмки"),
+        ("deployer", "стенд-приёмки"),
+        ("git.example.com", "github"),
+        ("деплой", "github"),
+    ] {
+        assert_eq!(titles(&list_q(&a, q).await), [want], "q={q}");
+    }
+    // все слова запроса (AND)
+    assert_eq!(
+        titles(&list_q(&a, "интеграционные биллинга").await),
+        ["стенд-приёмки"]
+    );
+    assert!(titles(&list_q(&a, "интеграционные деплой").await).is_empty());
+    // общее слово: оба
+    assert_eq!(titles(&list_q(&a, "example").await).len(), 2);
+    // спецсинтаксис FTS во входе не действует и не ломает запрос
+    assert_eq!(list_q(&a, "\"интегр\" OR *").await.status, StatusCode::OK);
+    // правка меняет индекс, удаление убирает запись
+    let r = a
+        .t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{h}"),
+            Some(json!({"data": {"type": "environment", "purpose": "нагрузочные испытания"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(titles(&list_q(&a, "интегр").await).is_empty());
+    assert_eq!(titles(&list_q(&a, "нагрузочные").await), ["стенд-приёмки"]);
+    // короткий запрос (2 символа): запасной путь — подстрока имени
+    assert_eq!(titles(&list_q(&a, "gi").await), ["github"]);
+    let r = a
+        .t(Method::DELETE, &format!("/api/v1/vault/{h}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert!(titles(&list_q(&a, "нагрузочные").await).is_empty());
+}
+
+/// Значение и шифротекст не попадают в `vault_fts`: ни поиском, ни прямым чтением таблицы.
+#[tokio::test]
+async fn vault_fts_never_indexes_secret() {
+    use base64::Engine;
+    let a = api("vault-fts-secret", |_| {}).await;
+    let sec = "zebra-correct-horse-battery";
+    id_of(&set(&a, &a.token, "knowledge", "github", sec).await);
+    let h = id_of(&post_env(&a, "стенд", "host", json!({"purpose": "тесты"}), Some(sec)).await);
+    // правка значения тоже не индексируется
+    let r = a
+        .t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{h}"),
+            Some(json!({"secret": "okapi-secret"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for q in [
+        "zebra",
+        "correct",
+        "horse",
+        "okapi",
+        "zebra-correct-horse-battery",
+    ] {
+        assert!(titles(&list_q(&a, q).await).is_empty(), "q={q}");
+    }
+    assert_eq!(titles(&list_q(&a, "тесты").await), ["стенд"]);
+    // прямой SQL по vault_fts: только title и открытый текст
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let rows: Vec<(String, String, String)> = db
+        .read(|c| {
+            let mut st = c.prepare("SELECT item_id, title, open_text FROM vault_fts")?;
+            Ok(st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let dump = format!("{rows:?}");
+    for bad in ["zebra", "okapi", "horse"] {
+        assert!(!dump.contains(bad), "{bad} в vault_fts: {dump}");
+    }
+    let blobs: Vec<Vec<u8>> = db
+        .read(|c| {
+            let mut st = c.prepare("SELECT secret FROM vault_items")?;
+            Ok(st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(blobs.len(), 2);
+    for b in &blobs {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b);
+        assert!(!dump.contains(&b64), "шифротекст в vault_fts");
+    }
+    // прямой MATCH по значению ничего не находит
+    let n: i64 = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM vault_fts WHERE vault_fts MATCH 'zebra OR okapi'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+async fn recall_digest(a: &Api, tok: &str, body: serde_json::Value) -> serde_json::Value {
+    let r = a
+        .tok_h(
+            tok,
+            Method::POST,
+            "/api/v1/recall",
+            Some(body),
+            &[("x-zam-session", "sess-env")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+#[tokio::test]
+async fn digest_environment_section_no_secret() {
+    let a = api("vault-digest-env", |c| c.recall.timeout_ms = 30_000).await;
+    let sec = "zebra-digest-secret-99";
+    let h = id_of(
+        &post_env(
+            &a,
+            "stage",
+            "host",
+            json!({"purpose": "приёмочный стенд", "address": "stage.example.com:8443",
+                "limits": "только ночью", "notes": "служебная заметка не для дайджеста"}),
+            Some(sec),
+        )
+        .await,
+    );
+    // запись без открытых полей: только имя и ссылка; без значения
+    let bare = id_of(&post_env(&a, "bare", "environment", json!({}), None).await);
+    // пароль в дайджест не попадает
+    set(&a, &a.token, "knowledge", "pg-password", sec).await;
+    let j = recall_digest(&a, &a.token, json!({"event": "session_start"})).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.contains("### Окружение"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "stage — приёмочный стенд; stage.example.com:8443; ограничения: только ночью — v:{h}"
+        )),
+        "{text}"
+    );
+    assert!(text.contains(&format!("bare — v:{bare}")), "{text}");
+    assert!(
+        !text.contains(sec) && !text.contains("служебная заметка"),
+        "{text}"
+    );
+    assert!(!text.contains("pg-password"), "{text}");
+    assert!(!j.to_string().contains(sec));
+    // повтор в той же сессии: дайджест повторяемый, окружение остаётся
+    let j2 = recall_digest(&a, &a.token, json!({"event": "session_start"})).await;
+    assert!(j2["text"].as_str().unwrap().contains("### Окружение"));
+    // пакет восстановления окружения не содержит (его состав фиксирован, §9.2)
+    let j3 = recall_digest(&a, &a.token, json!({"event": "recovery"})).await;
+    assert!(!j3["text"].as_str().unwrap().contains("### Окружение"));
+    // учёта показа окружения нет: ни session_seen, ни usage
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let n: i64 = db
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT (SELECT count(*) FROM usage WHERE target_id IN (?1, ?2))
+                      + (SELECT count(*) FROM session_seen WHERE target_id IN (?1, ?2))",
+                [&h, &bare],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    // не более 5 записей
+    for i in 0..6 {
+        let n = format!("extra-{i}");
+        id_of(&post_env(&a, &n, "host", json!({"purpose": "p"}), None).await);
+    }
+    let j = recall_digest(&a, &a.token, json!({"event": "session_start"})).await;
+    let text = j["text"].as_str().unwrap();
+    let env = text.split("### Окружение").nth(1).unwrap();
+    let env = env.split("###").next().unwrap();
+    assert_eq!(env.matches("v:").count(), 5, "{text}");
+}
+
+/// Vault решения: в дайджесте — личное окружение и окружение запрошенного решения.
+#[tokio::test]
+async fn digest_environment_solution_scope() {
+    let a = api("vault-digest-sol", |c| c.recall.timeout_ms = 30_000).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Своё"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let body = json!({"title": "sol-host", "data": {"type": "host", "purpose": "решение"}});
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/spaces/{G}/vault"),
+            Some(body),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    id_of(
+        &post_env(
+            &a,
+            "personal-host",
+            "host",
+            json!({"purpose": "личное"}),
+            None,
+        )
+        .await,
+    );
+    let with = recall_digest(
+        &a,
+        &a.token,
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let t = with["text"].as_str().unwrap();
+    assert!(t.contains("sol-host") && t.contains("personal-host"), "{t}");
+    let without = recall_digest(&a, &a.token, json!({"event": "session_start"})).await;
+    let t = without["text"].as_str().unwrap();
+    assert!(
+        !t.contains("sol-host") && t.contains("personal-host"),
+        "{t}"
+    );
+}
+
+/// Окружение решения — только при действующем доступе (I-1 финального ревью M4.5): участник
+/// видит открытые поля своей записи Vault решения, после отзыва — только личный Vault.
+#[tokio::test]
+async fn digest_environment_excluded_after_revoke() {
+    let a = api("vault-digest-revoked", |c| c.recall.timeout_ms = 30_000).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    let reg = json!({"agent_solution_id": G, "name": "Общее"});
+    let r = a
+        .tok(&a_tok, Method::POST, "/api/v1/solutions", Some(reg.clone()))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = a
+        .tok(&b_tok, Method::POST, "/api/v1/solutions", Some(reg))
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for (space, title, purpose) in [
+        (G, "member-sol-host", "стенд решения"),
+        ("knowledge", "member-own-host", "личный стенд"),
+    ] {
+        let body = json!({"title": title, "data": {"type": "host", "purpose": purpose}});
+        let r = a
+            .tok(
+                &b_tok,
+                Method::POST,
+                &format!("/api/v1/spaces/{space}/vault"),
+                Some(body),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    let body = json!({"event": "session_start", "solution": G});
+    let j = recall_digest(&a, &b_tok, body.clone()).await;
+    let t = j["text"].as_str().unwrap();
+    assert!(
+        t.contains("member-sol-host — стенд решения") && t.contains("member-own-host"),
+        "{t}"
+    );
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/revoke"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = recall_digest(&a, &b_tok, body).await;
+    let t = j["text"].as_str().unwrap();
+    assert!(
+        !t.contains("member-sol-host") && !t.contains("стенд решения"),
+        "{t}"
+    );
+    assert!(t.contains("member-own-host"), "{t}");
+    assert!(
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w == "solution access revoked"),
+        "{j}"
+    );
+    // неизвестный GUID — только личное окружение
+    let other = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9eff";
+    let j = recall_digest(
+        &a,
+        &b_tok,
+        json!({"event": "session_start", "solution": other}),
+    )
+    .await;
+    let t = j["text"].as_str().unwrap();
+    assert!(
+        !t.contains("member-sol-host") && t.contains("member-own-host"),
+        "{t}"
+    );
+}
+
+/// Заблокированный Vault (нет мастер-ключа): поиск и дайджест отдают открытые поля,
+/// значение — 503.
+#[tokio::test]
+async fn vault_locked_digest_still_lists_open_fields() {
+    let dir = common::tmp("vault-locked-digest");
+    let mut c = common::cfg_in(dir.clone());
+    c.recall.timeout_ms = 30_000;
+    let a = api_with(c.clone()).await;
+    let sec = "zebra-locked-secret";
+    let h = id_of(
+        &post_env(
+            &a,
+            "stage",
+            "host",
+            json!({"purpose": "приёмочный стенд", "address": "10.1.2.3"}),
+            Some(sec),
+        )
+        .await,
+    );
+    let token = a.token.clone();
+    a.st.shutdown().await;
+    drop(a);
+    std::fs::write(
+        dir.join("master.key"),
+        "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\n",
+    )
+    .unwrap();
+    let b = api_with(c).await;
+    let j = recall_digest(&b, &token, json!({"event": "session_start"})).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!("stage — приёмочный стенд; 10.1.2.3 — v:{h}")),
+        "{text}"
+    );
+    assert!(!text.contains(sec));
+    // поиск по открытым полям при блокировке работает; значение — 503
+    let uri = format!(
+        "/api/v1/spaces/knowledge/vault?q={}",
+        common::api::enc("приёмочный")
+    );
+    let r = b.tok(&token, Method::GET, &uri, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["locked"], true);
+    assert_eq!(r.json()["items"].as_array().unwrap().len(), 1);
+    let r = b
+        .tok(
+            &token,
+            Method::GET,
+            &format!("/api/v1/vault/{h}?reveal=1"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+}

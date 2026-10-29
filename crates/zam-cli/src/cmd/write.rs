@@ -4,6 +4,13 @@
 //! Узла нет → `POST /nodes`; есть → `PUT` с `If-Match` (`--base-rev` или текущая
 //! ревизия). 409 → дифф `base → текущая` в stderr, код 4. Успех → `<id>@<rev>`.
 //! Перед записью в решение из `solution.toml` оно регистрируется (идемпотентно).
+//!
+//! `--ref <путь>` (повторяемый; M4.5 §6.1): путь файла проекта нормализуется
+//! ([`super::refs::ref_path`]) и дописывается в список `refs:` frontmatter
+//! ([`super::refs::add_frontmatter_refs`]) — ссылки заметки сервер берёт оттуда, без хэша.
+//! После записи — `POST /files/verified` с хэшами этих файлов (решение задачи 7: ориентир
+//! ставится по фактическому содержимому). Коммит у заметки не хранится (полей нет). Сбой
+//! подтверждения — предупреждение в stderr, заметка уже записана.
 use std::io::Read;
 use std::path::Path;
 
@@ -18,6 +25,7 @@ pub struct Opts<'a> {
     pub message: Option<&'a str>,
     pub base_rev: Option<i64>,
     pub l0: Option<&'a str>,
+    pub refs: &'a [String],
 }
 
 /// Текст заметки из файла или stdin; не UTF-8 → код 6.
@@ -50,7 +58,16 @@ pub fn run(ctx: &Ctx, raw: &str, o: &Opts) -> Result<(), CliError> {
     {
         return Err(CliError::input("не задан путь заметки"));
     }
-    let text = content(o.file)?;
+    let mut text = content(o.file)?;
+    let local = if o.refs.is_empty() {
+        Vec::new()
+    } else {
+        let (cwd, root) = super::refs::cli_root();
+        let local = super::refs::local_refs(o.refs, &cwd, &root)?;
+        let paths: Vec<String> = local.iter().map(|r| r.path.clone()).collect();
+        text = super::refs::add_frontmatter_refs(&text, &paths)?;
+        local
+    };
     ctx.ensure_solution(&loc)?;
 
     // существующий узел?
@@ -81,6 +98,7 @@ pub fn run(ctx: &Ctx, raw: &str, o: &Opts) -> Result<(), CliError> {
         body["path"] = json!(path);
         body["kind"] = json!("note");
         let node = read_json(ctx.client.post_json("/nodes", &body)?)?;
+        after_write(ctx, &local);
         return emit_written(ctx, &node, true);
     };
 
@@ -94,9 +112,29 @@ pub fn run(ctx: &Ctx, raw: &str, o: &Opts) -> Result<(), CliError> {
         .or_else(|| node["current_rev"].as_i64())
         .unwrap_or(0);
     match ctx.client.put_json(&format!("/nodes/{id}"), &body, base) {
-        Ok(r) => emit_written(ctx, &read_json(r)?, false),
+        Ok(r) => {
+            let node = read_json(r)?;
+            after_write(ctx, &local);
+            emit_written(ctx, &node, false)
+        }
         Err(e) if e.code == EXIT_CONFLICT => Err(conflict(e)),
         Err(e) => Err(e),
+    }
+}
+
+/// После записи: событие журнала сессии и подтверждение хэшей файлов `--ref` (решение — из
+/// `solution.toml`; без него ссылки справочные).
+fn after_write(ctx: &Ctx, local: &[super::refs::LocalRef]) {
+    ctx.note_write("note");
+    if local.is_empty() {
+        return;
+    }
+    let Some(guid) = ctx.solution.as_ref().map(|s| s.id.clone()) else {
+        eprintln!("--ref: решение не задано (solution.toml) — хэши файлов не подтверждены");
+        return;
+    };
+    if let Err(e) = super::refs::post_verified(ctx, &guid, local) {
+        eprintln!("--ref: хэши файлов не подтверждены: {e}");
     }
 }
 

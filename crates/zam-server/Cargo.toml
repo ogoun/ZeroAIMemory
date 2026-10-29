@@ -66,9 +66,10 @@ windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", 
 windows-service.workspace = true
 
 [features]
-# Тестовые точки (заглушка реранкера `RerankSlot::install`) — только интеграционным тестам
-# пакета через dev-зависимость на себя; в сборке сервера и релизе их нет.
-test-hooks = []
+# Тестовые точки (заглушка реранкера `RerankSlot::install`, точка остановки поиска после
+# каналов `AppState::search_hold` на `zam_index::test_hooks::Hold`) — только интеграционным
+# тестам пакета через dev-зависимость на себя; в сборке сервера и релизе их нет.
+test-hooks = ["zam-index/test-hooks"]
 
 [build-dependencies]
 memory-serve.workspace = true

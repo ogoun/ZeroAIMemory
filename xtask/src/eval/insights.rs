@@ -58,6 +58,11 @@ pub struct Insight {
     /// Отзыв после создания (`POST /entries/{id}/retract`).
     #[serde(default)]
     pub retract_reason: Option<String>,
+    /// Ключи insight, которым эта запись противоречит (M4.5, связь `contradicts`, `POST
+    /// /edges` после создания всех записей); цель надёжнее записи. Пусто — поля нет в
+    /// сериализации: отпечаток корпуса у записей без связи не меняется.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contradicts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +82,17 @@ const INSIGHT_KINDS: [&str; 6] = [
     "pattern",
 ];
 const CERTAINTIES: [&str; 3] = ["axiom", "theorem", "hypothesis"];
+
+/// Надёжность для связи `contradicts` — шкала сервера (`api/search/graph.rs::reliability`):
+/// `axiom` 3, `theorem` 2, `hypothesis` 1, без `certainty` 0.
+pub fn reliability(c: Option<&str>) -> u8 {
+    match c {
+        Some("axiom") => 3,
+        Some("theorem") => 2,
+        Some("hypothesis") => 1,
+        _ => 0,
+    }
+}
 
 impl Corpus {
     /// Insight по ключу.
@@ -180,6 +196,31 @@ pub(super) fn validate_insights(corpus: &Corpus, errs: &mut Vec<String>) {
             }
             if let Some(prev) = successor.insert(old, &i.key) {
                 bad(format!("{old} уже замещён записью {prev}"));
+            }
+        }
+    }
+    // связи `contradicts` (M4.5): цель существует, действует, это theorem/axiom и она строго
+    // надёжнее записи — правило сервера (`api/search/graph.rs::contradicts_applies`), та же
+    // шкала [`reliability`]; у insight набора без поля `certainty` итоговый статус —
+    // `hypothesis` (умолчание агента), поэтому берётся итоговый статус
+    let rank = |k: &str| reliability(corpus.insight_certainty(k));
+    for i in &corpus.insights {
+        for t in &i.contradicts {
+            let bad = |m: String| format!("insight {}: contradicts {t}: {m}", i.key);
+            match corpus.insight(t) {
+                None => errs.push(bad("нет insight с таким ключом".into())),
+                Some(o) => {
+                    if !corpus.insight_active(t) {
+                        errs.push(bad("цель замещена или отозвана".into()));
+                    }
+                    let (src, dst) = (rank(&i.key), rank(&o.key));
+                    if dst < reliability(Some("theorem")) || dst <= src {
+                        errs.push(bad(
+                            "цель — theorem/axiom, надёжнее записи (axiom > theorem > hypothesis > без certainty)"
+                                .into(),
+                        ));
+                    }
+                }
             }
         }
     }

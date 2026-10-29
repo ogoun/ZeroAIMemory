@@ -3,6 +3,7 @@
 //! временном каталоге целей сборки (`CARGO_TARGET_TMPDIR`); в проекте есть `.git`, чтобы корень
 //! не поднялся до репозитория ZeroAIMemory. Реальные CLAUDE.md, `.claude` и профиль
 //! пользователя не трогаются.
+mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -76,29 +77,7 @@ impl Proj {
 
     /// `zam` в проекте с чистым окружением (без ZAM_* и переменных агента).
     fn cmd(&self) -> Command {
-        let mut c = Command::cargo_bin("zam").unwrap();
-        for k in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-            "ZAM_URL",
-            "ZAM_TOKEN",
-        ] {
-            c.env_remove(k);
-        }
-        // окружение агента и клиентские переменные `zam` (`ZAM_SESSION`, `ZAM_AGENT`,
-        // `ZAM_MACHINE`), в котором идут сами тесты, не должны утекать в `zam` — общий список
-        for k in zam_core::AGENT_ENV_VARS
-            .iter()
-            .chain(&zam_core::CLIENT_ENV_VARS)
-        {
-            c.env_remove(k);
-        }
+        let mut c = common::zam_cmd();
         c.env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("COMPUTERNAME", "init-box")
@@ -219,16 +198,19 @@ fn init_creates_solution_block_hooks_mcp() {
     let (code, body) = api_get(&p, &format!("/solutions/{guid}"));
     assert_eq!(code, 200, "{body}");
     assert!(body.contains("\"role\":\"owner\""), "{body}");
-    // блок v2 с адресом и решением, без токена
+    // блок v3 с адресом и решением, без токена
     let md = p.read("CLAUDE.md");
-    assert!(md.starts_with("<!-- zeroaimemory:begin v2 -->\n"), "{md}");
+    assert!(md.starts_with("<!-- zeroaimemory:begin v3 -->\n"), "{md}");
     assert!(md.contains(&format!("ZeroAIMemoryUrl={url}\n")), "{md}");
     assert!(md.contains(&guid) && md.contains("«Демо»"), "{md}");
     assert!(!md.contains(&tok), "токен в CLAUDE.md");
     assert!(!p.repo.join("AGENTS.md").exists());
     // хуки Claude Code — exec form
     let s = p.json(".claude/settings.json");
-    assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "Write|Edit|Bash");
+    assert_eq!(
+        s["hooks"]["PreToolUse"][0]["matcher"],
+        "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task"
+    );
     assert_eq!(
         s["hooks"]["PreToolUse"][0]["hooks"][0],
         json!({"type": "command", "command": "zam", "args": ["hook", "pre-tool"], "timeout": 1})
@@ -285,7 +267,7 @@ fn init_creates_solution_block_hooks_mcp() {
     let o = p.cmd().arg("status").output().unwrap();
     ok(&o);
     assert!(
-        out(&o).contains("Блок инструкции: v2 (актуален)"),
+        out(&o).contains("Блок инструкции: v3 (актуален)"),
         "{}",
         out(&o)
     );
@@ -352,7 +334,7 @@ fn init_is_idempotent_and_preserves_foreign_text_and_hooks() {
     assert!(md.starts_with(head), "{md:?}");
     assert!(md.ends_with(tail), "{md:?}");
     assert!(
-        md.contains("<!-- zeroaimemory:begin v2 -->\r\n"),
+        md.contains("<!-- zeroaimemory:begin v3 -->\r\n"),
         "CRLF файла: {md:?}"
     );
     assert!(!md.contains(&tok), "прежний токен убран из блока");
@@ -427,7 +409,7 @@ fn init_codex_writes_codex_hooks() {
     ok(&o);
     let md = p.read("AGENTS.md");
     assert!(
-        md.starts_with("<!-- zeroaimemory:begin v2 -->\n## ZeroAIMemory memory\n"),
+        md.starts_with("<!-- zeroaimemory:begin v3 -->\n## ZeroAIMemory memory\n"),
         "{md}"
     );
     assert!(!p.repo.join("CLAUDE.md").exists());
@@ -480,7 +462,7 @@ fn status_warns_outdated_block() {
     ok(&o);
     let s = out(&o);
     assert_eq!(
-        s.matches("Блок ZeroAIMemory устарел (v1 → v2): обнови через `zam init` или WebUI")
+        s.matches("Блок ZeroAIMemory устарел (v1 → v3): обнови через `zam init` или WebUI")
             .count(),
         1,
         "{s}"
@@ -490,7 +472,7 @@ fn status_warns_outdated_block() {
     let j: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(
         j["agent_block"],
-        json!({"version": 1, "current": 2, "outdated": true})
+        json!({"version": 1, "current": 3, "outdated": true})
     );
 }
 
@@ -615,7 +597,7 @@ fn init_bom_files_and_v1_token_without_flag() {
     let stdout = out(&o);
     let md = p.read("CLAUDE.md");
     assert!(
-        md.starts_with("\u{feff}<!-- zeroaimemory:begin v2 -->\n"),
+        md.starts_with("\u{feff}<!-- zeroaimemory:begin v3 -->\n"),
         "{md:?}"
     );
     assert!(md.ends_with("<!-- zeroaimemory:end -->\nхвост\n"), "{md:?}");
@@ -901,7 +883,7 @@ fn init_keeps_symlink_and_writes_target() {
         t.starts_with(
             "# свой текст
 
-<!-- zeroaimemory:begin v2 -->"
+<!-- zeroaimemory:begin v3 -->"
         ),
         "{t}"
     );
@@ -959,4 +941,217 @@ fn init_refuses_dangling_symlink() {
     let meta = std::fs::symlink_metadata(p.repo.join("AGENTS.md")).unwrap();
     assert!(meta.file_type().is_symlink(), "ссылка осталась ссылкой");
     assert!(!p.repo.join("missing.md").exists());
+}
+
+/// Наши обработчики события в настройках: `(matcher, вид хука)`.
+fn ours_in(s: &Value, ev: &str) -> Vec<(String, String)> {
+    s["hooks"][ev]
+        .as_array()
+        .map(|g| {
+            g.iter()
+                .flat_map(|g| {
+                    let m = g["matcher"].as_str().unwrap_or("").to_string();
+                    g["hooks"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(move |h| {
+                            let cmd = h["command"].as_str()?;
+                            let kind = if cmd == "zam" {
+                                h["args"][1].as_str()?.to_string()
+                            } else {
+                                cmd.strip_prefix("zam hook ")?
+                                    .split_whitespace()
+                                    .next()?
+                                    .to_string()
+                            };
+                            Some((m.clone(), kind))
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// M4.5 §11: `zam init` пишет новые события (Claude — `PostToolUse` успеха, `SubagentStart`,
+/// `pre-tool` на `Agent|Task`; Codex — `PostToolUse` `Bash|apply_patch`, `SubagentStart`);
+/// повторный запуск ничего не меняет.
+#[test]
+fn init_merges_new_events_idempotent() {
+    let (url, tok) = start("m45-events");
+    let p = Proj::new("m45-events", &url, &tok);
+    let o = p.init(&["--agent", "both", "--yes"], "");
+    ok(&o);
+    let s = p.json(".claude/settings.json");
+    assert_eq!(
+        ours_in(&s, "PostToolUse"),
+        [(
+            "Read|Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__zeroaimemory__memory_log".to_string(),
+            "post-tool".to_string()
+        )]
+    );
+    assert_eq!(s["hooks"]["PostToolUse"][0]["hooks"][0]["timeout"], 1);
+    assert_eq!(
+        ours_in(&s, "SubagentStart"),
+        [(String::new(), "subagent-start".to_string())]
+    );
+    assert_eq!(
+        ours_in(&s, "PreToolUse"),
+        [(
+            "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task".to_string(),
+            "pre-tool".to_string()
+        )]
+    );
+    assert_eq!(
+        ours_in(&s, "PreCompact"),
+        [(String::new(), "checkpoint".to_string())]
+    );
+    let h = p.json(".codex/hooks.json");
+    assert_eq!(
+        ours_in(&h, "PostToolUse"),
+        [("Bash|apply_patch".to_string(), "post-tool".to_string())]
+    );
+    assert_eq!(
+        ours_in(&h, "SubagentStart"),
+        [(String::new(), "subagent-start".to_string())]
+    );
+    assert_eq!(
+        h["hooks"]["SubagentStart"][0]["hooks"][0]["command"],
+        "zam hook subagent-start --agent codex"
+    );
+    // повторный запуск — те же файлы байт в байт
+    let before = p.snapshot();
+    let o = p.init(&["--agent", "both", "--yes"], "");
+    ok(&o);
+    assert!(out(&o).contains("Файлы проекта актуальны"), "{}", out(&o));
+    assert_eq!(p.snapshot(), before);
+}
+
+/// Matcher `PreToolUse` прежней сборки M4.5 (`Write|Edit|Bash|Agent|Task`, без `MultiEdit` и
+/// `NotebookEdit`; финальное ревью M4.5, M-3) заменяется новым, а не дублируется; повторный
+/// запуск ничего не меняет.
+#[test]
+fn init_updates_pre_tool_matcher() {
+    let (url, tok) = start("m45-matcher");
+    let p = Proj::new("m45-matcher", &url, &tok);
+    ok(&p.init(&["--agent", "claude", "--yes"], ""));
+    let path = p.repo.join(".claude/settings.json");
+    let mut s = p.json(".claude/settings.json");
+    s["hooks"]["PreToolUse"][0]["matcher"] = json!("Write|Edit|Bash|Agent|Task");
+    std::fs::write(&path, s.to_string()).unwrap();
+    ok(&p.init(&["--agent", "claude", "--yes"], ""));
+    let s = p.json(".claude/settings.json");
+    assert_eq!(
+        ours_in(&s, "PreToolUse"),
+        [(
+            "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task".to_string(),
+            "pre-tool".to_string()
+        )],
+        "{s}"
+    );
+    let before = p.snapshot();
+    let o = p.init(&["--agent", "claude", "--yes"], "");
+    ok(&o);
+    assert!(out(&o).contains("Файлы проекта актуальны"), "{}", out(&o));
+    assert_eq!(p.snapshot(), before);
+}
+
+/// Хуки и блок M4 (v2) заменяются набором v3: прежние обработчики `zam hook` удаляются, а не
+/// дублируются; чужие обработчики остаются на местах.
+#[test]
+fn init_replaces_v2_handlers() {
+    let (url, tok) = start("m45-v2");
+    let p = Proj::new("m45-v2", &url, &tok);
+    std::fs::write(
+        p.repo.join("CLAUDE.md"),
+        format!("# Проект\n\n<!-- zeroaimemory:begin v2 -->\nZeroAIMemoryUrl={url}\nстарые правила\n<!-- zeroaimemory:end -->\n"),
+    )
+    .unwrap();
+    let z = |kind: &str, t: u32| json!({"type": "command", "command": "zam", "args": ["hook", kind], "timeout": t});
+    // набор M4 (v2) и чужие обработчики рядом
+    let v2 = json!({"hooks": {
+        "SessionStart": [{"hooks": [z("session-start", 2)]}],
+        "UserPromptSubmit": [{"hooks": [z("prompt", 2)]}],
+        "PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "my-lint"}]},
+            {"matcher": "Write|Edit|Bash", "hooks": [z("pre-tool", 1)]}
+        ],
+        "PostToolUse": [{"matcher": "Edit", "hooks": [{"type": "command", "command": "fmt"}, z("post-tool", 2)]}],
+        "PostToolUseFailure": [{"matcher": "Bash", "hooks": [z("post-tool", 2)]}],
+        "Stop": [{"hooks": [z("checkpoint", 2)]}],
+        "PreCompact": [{"hooks": [z("checkpoint", 2)]}]
+    }});
+    std::fs::create_dir_all(p.repo.join(".claude")).unwrap();
+    std::fs::write(p.repo.join(".claude/settings.json"), v2.to_string()).unwrap();
+    std::fs::create_dir_all(p.repo.join(".codex")).unwrap();
+    std::fs::write(
+        p.repo.join(".codex/hooks.json"),
+        json!({"hooks": {
+            "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "zam hook post-tool --agent codex", "timeout": 2}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "zam hook checkpoint --agent codex", "timeout": 2}]}]
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let o = p.init(&["--agent", "both", "--yes"], "");
+    ok(&o);
+    let md = p.read("CLAUDE.md");
+    assert!(
+        md.starts_with("# Проект\n\n<!-- zeroaimemory:begin v3 -->\n"),
+        "{md}"
+    );
+    assert!(!md.contains("старые правила"), "{md}");
+    let s = p.json(".claude/settings.json");
+    for (ev, want) in [
+        ("SessionStart", vec![(String::new(), "session-start")]),
+        ("UserPromptSubmit", vec![(String::new(), "prompt")]),
+        (
+            "PreToolUse",
+            vec![(
+                "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task".to_string(),
+                "pre-tool",
+            )],
+        ),
+        (
+            "PostToolUse",
+            vec![(
+                "Read|Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__zeroaimemory__memory_log"
+                    .to_string(),
+                "post-tool",
+            )],
+        ),
+        (
+            "PostToolUseFailure",
+            vec![("Bash".to_string(), "post-tool")],
+        ),
+        ("SubagentStart", vec![(String::new(), "subagent-start")]),
+        ("Stop", vec![(String::new(), "checkpoint")]),
+        ("PreCompact", vec![(String::new(), "checkpoint")]),
+    ] {
+        let want: Vec<(String, String)> =
+            want.into_iter().map(|(m, k)| (m, k.to_string())).collect();
+        assert_eq!(ours_in(&s, ev), want, "{ev}: {s}");
+    }
+    // чужие обработчики — на своих местах
+    let pre = s["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre[0]["hooks"][0]["command"], "my-lint", "{s}");
+    let post = s["hooks"]["PostToolUse"].as_array().unwrap();
+    assert_eq!(post[0]["matcher"], "Edit", "{s}");
+    assert_eq!(post[0]["hooks"].as_array().unwrap().len(), 1, "{s}");
+    assert_eq!(post[0]["hooks"][0]["command"], "fmt", "{s}");
+    let h = p.json(".codex/hooks.json");
+    assert_eq!(
+        ours_in(&h, "PostToolUse"),
+        [("Bash|apply_patch".to_string(), "post-tool".to_string())]
+    );
+    assert_eq!(h["hooks"]["Stop"].as_array().unwrap().len(), 1, "{h}");
+    assert_eq!(
+        ours_in(&h, "SubagentStart"),
+        [(String::new(), "subagent-start".to_string())]
+    );
+    // повторный запуск идемпотентен
+    let before = p.snapshot();
+    ok(&p.init(&["--agent", "both", "--yes"], ""));
+    assert_eq!(p.snapshot(), before);
 }

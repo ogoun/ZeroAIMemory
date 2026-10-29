@@ -10,6 +10,11 @@
 //!   целиком, или [`WHOLE_TARGET`] — полный текст цели; [`RECALL_PART`] — подсказка `/recall`)
 //!   и её ревизия. Хранится большая из выданных ревизий: ревизии только растут, и повторная
 //!   выдача старой не откатывает отметку;
+//! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
+//!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя;
+//! - `session_tokens` — выданное сессии по событию (§9.5): число выдач `calls` и оценка размера в
+//!   токенах `tokens`; `/recall` прибавляет свои события ([`mark_seen_with_tokens`]), хуки с
+//!   локальным выводом — пачкой через `POST /sessions` ([`add_token_counts`]);
 //! - срок хранения — [`gc_sessions`]: сессии без обращений дольше срока удаляются вместе с
 //!   выданным им (воркер обслуживания сервера, раз в сутки, 30 дней).
 use std::collections::HashMap;
@@ -40,6 +45,10 @@ pub struct SessionTouch {
     pub area: Option<String>,
     pub machine: Option<String>,
     pub agent: Option<String>,
+    /// Id сессии родителя (сессия субагента).
+    pub parent_id: Option<String>,
+    /// Тип субагента (`Explore`, `Plan`, свои).
+    pub agent_type: Option<String>,
 }
 
 /// Сессия агента.
@@ -54,6 +63,8 @@ pub struct Session {
     pub area: Option<String>,
     pub machine: Option<String>,
     pub agent: Option<String>,
+    pub parent_id: Option<String>,
+    pub agent_type: Option<String>,
     #[serde(serialize_with = "ser_ts")]
     pub started_at: Timestamp,
     #[serde(serialize_with = "ser_ts")]
@@ -61,6 +72,26 @@ pub struct Session {
     #[serde(serialize_with = "ser_ts_opt")]
     pub ended_at: Option<Timestamp>,
     pub memory_writes: i64,
+}
+
+/// Предел имени события `session_tokens`, символов.
+pub const TOKEN_EVENT_MAX_CHARS: usize = 32;
+
+/// Прибавка к учёту выданного сессии по событию.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenCount {
+    /// Событие: `session_start`, `recovery`, `prompt`, `post_tool`, `brief` (`/recall`) или
+    /// `pre_tool`, `post_tool_local`, `subagent_local` (хуки с локальным выводом).
+    pub event: String,
+    pub calls: u64,
+    pub tokens: u64,
+}
+
+/// Выданное сессии по одному событию.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TokenStat {
+    pub calls: i64,
+    pub tokens: i64,
 }
 
 /// Выданное сессии: владелец базы цели, цель и её часть (`chunk_id` или [`WHOLE_TARGET`]).
@@ -110,6 +141,8 @@ fn check_touch(s: &SessionTouch) -> Result<(), StoreError> {
         ("area", &s.area),
         ("machine", &s.machine),
         ("agent", &s.agent),
+        ("parent_id", &s.parent_id),
+        ("agent_type", &s.agent_type),
     ] {
         if let Some(v) = v {
             check_field(what, v)?;
@@ -124,14 +157,16 @@ fn upsert(t: &rusqlite::Transaction, s: &SessionTouch, writes: i64) -> Result<()
     let now = fmt_ts(Timestamp::now());
     t.execute(
         "INSERT INTO sessions (id, token_id, solution_guid, area, machine, agent,
-                               started_at, last_seen_at, memory_writes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
+                               started_at, last_seen_at, memory_writes, parent_id, agent_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10)
          ON CONFLICT (id) DO UPDATE SET
            token_id = coalesce(excluded.token_id, token_id),
            solution_guid = coalesce(excluded.solution_guid, solution_guid),
            area = coalesce(excluded.area, area),
            machine = coalesce(excluded.machine, machine),
            agent = coalesce(excluded.agent, agent),
+           parent_id = coalesce(excluded.parent_id, parent_id),
+           agent_type = coalesce(excluded.agent_type, agent_type),
            last_seen_at = excluded.last_seen_at,
            memory_writes = memory_writes + excluded.memory_writes",
         params![
@@ -142,7 +177,9 @@ fn upsert(t: &rusqlite::Transaction, s: &SessionTouch, writes: i64) -> Result<()
             s.machine,
             s.agent,
             now,
-            writes
+            writes,
+            s.parent_id,
+            s.agent_type
         ],
     )?;
     Ok(())
@@ -179,7 +216,7 @@ pub async fn end_session(db: &Db, id: &str, ended: bool) -> Result<bool, StoreEr
 }
 
 const SESSION_COLS: &str = "id, token_id, solution_guid, area, machine, agent, started_at, \
-                            last_seen_at, ended_at, memory_writes";
+                            last_seen_at, ended_at, memory_writes, parent_id, agent_type";
 
 fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -193,6 +230,8 @@ fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_seen_at: ts_at(r, 7)?,
         ended_at: ts_opt(r, 8)?,
         memory_writes: r.get(9)?,
+        parent_id: r.get(10)?,
+        agent_type: r.get(11)?,
     })
 }
 
@@ -263,10 +302,106 @@ pub async fn latest_session(
 /// Касание сессии (как [`touch_session`]) и отметка выданного ей — одной транзакцией; у части
 /// цели остаётся большая ревизия.
 pub async fn mark_seen(db: &Db, s: &SessionTouch, items: &[SeenItem]) -> Result<(), StoreError> {
+    mark_seen_with_tokens(db, s, items, &[]).await
+}
+
+/// Имя события учёта: 1..=[`TOKEN_EVENT_MAX_CHARS`] символов `[a-z0-9_]`.
+fn check_event(e: &str) -> Result<(), StoreError> {
+    let ok = !e.is_empty()
+        && e.chars().count() <= TOKEN_EVENT_MAX_CHARS
+        && e.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !ok {
+        return Err(StoreError::BadInput(format!(
+            "событие учёта токенов: до {TOKEN_EVENT_MAX_CHARS} символов [a-z0-9_]"
+        )));
+    }
+    Ok(())
+}
+
+/// Прибавки учёта в транзакции записи (сессия уже есть: внешний ключ `session_tokens`).
+fn add_tokens_tx(
+    t: &rusqlite::Transaction,
+    session: &str,
+    counts: &[TokenCount],
+) -> Result<(), StoreError> {
+    let mut st = t.prepare_cached(
+        "INSERT INTO session_tokens (session_id, event, calls, tokens) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (session_id, event) DO UPDATE SET
+           calls = calls + excluded.calls, tokens = tokens + excluded.tokens",
+    )?;
+    for c in counts.iter().filter(|c| c.calls > 0 || c.tokens > 0) {
+        let calls = i64::try_from(c.calls).unwrap_or(i64::MAX);
+        let tokens = i64::try_from(c.tokens).unwrap_or(i64::MAX);
+        st.execute(params![session, c.event, calls, tokens])?;
+    }
+    Ok(())
+}
+
+/// Одна выдача события `event` размером `tokens` сессии `s` (сессия создаётся, если её нет).
+pub async fn add_tokens(
+    db: &Db,
+    s: &SessionTouch,
+    event: &str,
+    tokens: u64,
+) -> Result<(), StoreError> {
+    let c = TokenCount {
+        event: event.to_string(),
+        calls: 1,
+        tokens,
+    };
+    add_token_counts(db, s, &[c]).await
+}
+
+/// Прибавки учёта выданного сессии `s` пачкой (с касанием сессии, одной транзакцией).
+pub async fn add_token_counts(
+    db: &Db,
+    s: &SessionTouch,
+    counts: &[TokenCount],
+) -> Result<(), StoreError> {
+    mark_seen_with_tokens(db, s, &[], counts).await
+}
+
+/// Выданное сессии по событиям (событий без выдач в ответе нет).
+pub async fn session_tokens(
+    db: &Db,
+    session: &str,
+) -> Result<std::collections::BTreeMap<String, TokenStat>, StoreError> {
+    let session = session.to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT event, calls, tokens FROM session_tokens WHERE session_id = ?1",
+        )?;
+        let rows = st.query_map([session], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                TokenStat {
+                    calls: r.get(1)?,
+                    tokens: r.get(2)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// [`mark_seen`] и прибавки учёта выданного (`/recall`: показ и его размер) — одной
+/// транзакцией, без лишней синхронизации диска на горячем пути.
+pub async fn mark_seen_with_tokens(
+    db: &Db,
+    s: &SessionTouch,
+    items: &[SeenItem],
+    counts: &[TokenCount],
+) -> Result<(), StoreError> {
     check_touch(s)?;
-    let (s, items) = (s.clone(), items.to_vec());
+    for c in counts {
+        check_event(&c.event)?;
+    }
+    let (s, items, counts) = (s.clone(), items.to_vec(), counts.to_vec());
     db.write(move |t| {
         upsert(t, &s, 0)?;
+        add_tokens_tx(t, &s.id, &counts)?;
         let now = fmt_ts(Timestamp::now());
         let mut st = t.prepare_cached(
             "INSERT INTO session_seen (session_id, owner_id, target_kind, target_id, part, rev,
@@ -335,11 +470,15 @@ pub async fn seen_revs(
 pub async fn gc_sessions(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError> {
     let cutoff = fmt_ts(cutoff);
     db.write(move |t| {
-        t.execute(
-            "DELETE FROM session_seen WHERE session_id IN
-               (SELECT id FROM sessions WHERE last_seen_at < ?1)",
-            [&cutoff],
-        )?;
+        for table in ["session_seen", "session_tokens"] {
+            t.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE session_id IN
+                       (SELECT id FROM sessions WHERE last_seen_at < ?1)"
+                ),
+                [&cutoff],
+            )?;
+        }
         let n = t.execute("DELETE FROM sessions WHERE last_seen_at < ?1", [&cutoff])?;
         Ok(n as u64)
     })

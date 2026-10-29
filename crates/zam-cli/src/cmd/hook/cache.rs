@@ -9,9 +9,24 @@
 //!   сессии, и признак напоминания `checkpoint`;
 //! - `edits-<сессия>` — маркер правок Write/Edit/`apply_patch` (для `checkpoint`, R1): файл есть —
 //!   правки были; создаётся без чтения и перезаписи (fix round 1, m-2);
+//! - `file-refs.json` — `{etag, fetched_at, server, solution, refs}` из `GET /file-refs`
+//!   (M4.5 §6.3; как `triggers.json`): знание о файле для `post-tool` и `pre-tool` без сети;
+//! - `changed-<сессия>.jsonl` — очередь `{path, hash}` правленых файлов (M4.5 §6.2): пишет
+//!   `post-tool`, отправляют `POST /files/changed` `prompt`, `session-start` и `checkpoint`
+//!   ([`flush_changed`]);
+//! - `events-<сессия>.jsonl` — журнал событий сессии ([`super::journal`]);
+//! - `tokens-<сессия>.jsonl` — выданное хуками с локальным выводом (M4.5 §9.5): строка
+//!   `{e, t}` (событие `pre_tool` | `post_tool_local` | `subagent_local`, оценка токенов) на
+//!   каждый непустой вывод `pre-tool` и успешного `post-tool`; уходит пачкой
+//!   `POST /sessions {id, tokens}` при следующем сетевом вызове хука ([`flush_tokens`]);
+//! - `spawn-<сессия>.json` — очередь запусков субагентов `[{at, agent_type, task}]` (M4.5
+//!   §9.4): пополняет `pre-tool` на `Agent`/`Task`, берёт `subagent-start` ([`take_spawn`]);
+//!   до [`SPAWN_MAX`] записей, каждая живёт [`SPAWN_TTL`]; правка — под замком `.spawn-….lock`;
+//!   просроченные записи снимает и `session-start` ([`prune_spawns`]), файл без изменений
+//!   дольше [`SPAWN_FILE_TTL`] удаляет [`gc_cache`];
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
-//!   `shown-*`/`edits-*` старше [`SHOWN_TTL`] и временные `.*.tmp` старше [`TMP_TTL`] удаляет
-//!   `session-start` ([`gc_cache`]);
+//!   `shown-*`/`edits-*`/`events-*`/`changed-*`/`tokens-*` старше [`SHOWN_TTL`] и `.*.tmp`
+//!   старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
 //!   в `memory_writes` сессии хуков **[решение исполнителя]**.
@@ -136,7 +151,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Создание файла кэша: на unix — права 0600 (в кэше — id сессий и заголовки записей).
-fn private_options() -> std::fs::OpenOptions {
+pub fn private_options() -> std::fs::OpenOptions {
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -251,6 +266,392 @@ pub fn refresh_triggers(
     Ok((Refresh::Updated(c.triggers.len()), warnings))
 }
 
+/// Запись индекса `GET /file-refs`: ссылка (`n:`/`i:`/…), вид, заголовок, состояние.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RefItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub state: String,
+}
+
+/// Путь индекса `GET /file-refs`: последний записанный хэш и до 5 записей.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PathRefs {
+    pub path: String,
+    pub hash: Option<String>,
+    pub items: Vec<RefItem>,
+}
+
+/// `file-refs.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileRefsCache {
+    pub etag: String,
+    pub fetched_at: String,
+    pub server: String,
+    pub solution: Option<String>,
+    pub refs: Vec<PathRefs>,
+}
+
+impl FileRefsCache {
+    /// Путь индекса (на Windows — без учёта регистра).
+    pub fn find(&self, path: &str) -> Option<&PathRefs> {
+        self.refs
+            .iter()
+            .find(|r| crate::cmd::refs::same_path(&r.path, path))
+    }
+}
+
+pub fn file_refs_path(root: &Path) -> PathBuf {
+    root.join(".zeroaimemory")
+        .join("cache")
+        .join("file-refs.json")
+}
+
+/// Индекс ссылок для сервера `server` (если известен) и решения проекта; битый — `None` и
+/// строка в журнал.
+pub fn usable_file_refs(env: &Env, server: Option<&str>) -> Option<FileRefsCache> {
+    let c: FileRefsCache = match read_json_file(&file_refs_path(&env.root)) {
+        Ok(c) => c?,
+        Err(e) => {
+            env.log(&format!("кэш file-refs битый, пропущен: {e}"));
+            return None;
+        }
+    };
+    let sol = env.solution.as_ref().map(|s| s.id.as_str());
+    if sol.is_none() || c.solution.as_deref() != sol || server.is_some_and(|s| s != c.server) {
+        return None;
+    }
+    Some(c)
+}
+
+/// `GET /file-refs?solution=` с `If-None-Match` и запись `file-refs.json` (304 — кэш остаётся,
+/// обновляется `fetched_at`). Без решения — `None` без запроса.
+pub fn refresh_file_refs(env: &Env, client: &Client) -> Result<Option<Refresh>, CliError> {
+    let Some(sol) = env.solution.as_ref().map(|s| s.id.clone()) else {
+        return Ok(None);
+    };
+    let path = file_refs_path(&env.root);
+    let old = read_json_file::<FileRefsCache>(&path)
+        .ok()
+        .flatten()
+        .filter(|c| {
+            c.server == client.base() && c.solution.as_deref() == Some(&sol) && !c.etag.is_empty()
+        });
+    let inm = old.as_ref().map(|c| format!("\"{}\"", c.etag));
+    let mut headers = Vec::new();
+    if let Some(v) = &inm {
+        headers.push(("If-None-Match", v.as_str()));
+    }
+    let r = client.get_with("/file-refs", &[("solution", sol.as_str())], &headers)?;
+    let write = |c: &FileRefsCache| {
+        write_json_file(&path, c)
+            .map_err(|e| CliError::new(EXIT_UNREACHABLE, format!("запись {}: {e}", path.display())))
+    };
+    if r.status().as_u16() == 304
+        && let Some(mut c) = old
+    {
+        c.fetched_at = now_rfc3339();
+        write(&c)?;
+        return Ok(Some(Refresh::NotModified(c.refs.len())));
+    }
+    let v = read_json(r)?;
+    let refs: Vec<PathRefs> = serde_json::from_value(v["refs"].clone())
+        .map_err(|e| CliError::new(EXIT_UNREACHABLE, format!("ответ /file-refs: {e}")))?;
+    let c = FileRefsCache {
+        etag: v["etag"].as_str().unwrap_or_default().to_string(),
+        fetched_at: now_rfc3339(),
+        server: client.base().to_string(),
+        solution: Some(sol),
+        refs,
+    };
+    write(&c)?;
+    Ok(Some(Refresh::Updated(c.refs.len())))
+}
+
+/// Строка очереди `changed-<сессия>.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Changed {
+    pub path: String,
+    pub hash: String,
+}
+
+pub fn changed_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("changed-{}.jsonl", session_file_part(session)))
+}
+
+/// Открытие файла очереди на дописывание (на unix — 0600).
+fn append_options() -> std::fs::OpenOptions {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
+/// Дописывает файлы в очередь изменённых: строка на файл, все одним `write` с append.
+pub fn queue_changed(env: &Env, session: &str, files: &[Changed]) {
+    if files.is_empty() {
+        return;
+    }
+    let mut buf = Vec::new();
+    for c in files {
+        buf.extend(serde_json::to_vec(c).unwrap_or_default());
+        buf.push(b'\n');
+    }
+    let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| {
+        use std::io::Write;
+        append_options()
+            .open(changed_path(env, session))?
+            .write_all(&buf)
+    });
+    if let Err(e) = r {
+        env.log(&format!("очередь изменённых файлов: {e}"));
+    }
+}
+
+/// Файлы очередей: текущей сессии или (`session = None`) всех сессий проекта.
+fn queue_files(env: &Env, session: Option<&str>) -> Vec<PathBuf> {
+    if let Some(s) = session {
+        let p = changed_path(env, s);
+        return if p.is_file() { vec![p] } else { Vec::new() };
+    }
+    std::fs::read_dir(env.cache_dir())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("changed-") && n.ends_with(".jsonl"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Запас бюджета на `POST /files/changed`: меньше — очередь не отправляется (останется на
+/// следующий хук).
+pub const FLUSH_MIN_LEFT: Duration = Duration::from_millis(15);
+
+/// Отправка очередей изменённых файлов (fix round 1, I-2): все очереди (`session` задан —
+/// только его) забираются rename во временные файлы и уходят **одним** `POST /files/changed` до
+/// 500 путей (повтор пути — последний хэш); перед запросом проверяется остаток бюджета хука
+/// ([`FLUSH_MIN_LEFT`]). Успех — забранное удаляется, сверх 500 — возвращается в свою очередь до
+/// следующего раза; 400, 413 и 422 (запрос не примут никогда) — очередь отбрасывается со
+/// строкой в `hooks.log` (fix round 1, M-6; задача 9); прочее (сеть, 5xx, 401, 403, 404, 408,
+/// 410, 429: решение ещё не открыто для доступа, старый сервер) — всё возвращается.
+/// Строки, дописанные во время отправки, не теряются: они в новой очереди. Без решения — ничего.
+pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
+    let Some(sol) = env.solution.as_ref().map(|s| s.id.clone()) else {
+        return;
+    };
+    if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+        return;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // (очередь, забранный файл)
+    let mut taken: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (i, q) in queue_files(env, session).into_iter().enumerate() {
+        let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("changed");
+        let t = q.with_file_name(format!(".{name}.{}.{nanos}.{i}.tmp", std::process::id()));
+        if std::fs::rename(&q, &t).is_ok() {
+            taken.push((q, t));
+        }
+    }
+    if taken.is_empty() {
+        return;
+    }
+    // (путь, хэш, номер очереди) — повтор пути: последний хэш
+    let mut files: Vec<(Changed, usize)> = Vec::new();
+    for (qi, (_, t)) in taken.iter().enumerate() {
+        let bytes = std::fs::read(t).unwrap_or_default();
+        for l in bytes.split(|b| *b == b'\n') {
+            let Ok(c) = serde_json::from_slice::<Changed>(l) else {
+                continue;
+            };
+            files.retain(|(f, _)| !crate::cmd::refs::same_path(&f.path, &c.path));
+            files.push((c, qi));
+        }
+    }
+    let n = files.len().min(crate::cmd::refs::FILES_MAX);
+    let back: Vec<(Changed, usize)> = if n == 0 {
+        Vec::new()
+    } else if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+        files.clone()
+    } else {
+        let pairs: Vec<(String, String)> = files[..n]
+            .iter()
+            .map(|(c, _)| (c.path.clone(), c.hash.clone()))
+            .collect();
+        match crate::cmd::refs::post_changed(client, &sol, &pairs) {
+            Ok(_) => files[n..].to_vec(),
+            Err(e) if permanent(&e) => {
+                env.log(&format!(
+                    "files/changed: очередь ({} путей) отброшена: {e}",
+                    files.len()
+                ));
+                Vec::new()
+            }
+            Err(e) => {
+                env.log(&format!("files/changed: {e}"));
+                files.clone()
+            }
+        }
+    };
+    for (qi, (q, _)) in taken.iter().enumerate() {
+        let mut out = Vec::new();
+        for (c, _) in back.iter().filter(|(_, i)| *i == qi) {
+            out.extend(serde_json::to_vec(c).unwrap_or_default());
+            out.push(b'\n');
+        }
+        if out.is_empty() {
+            continue;
+        }
+        use std::io::Write;
+        if let Err(e) = append_options().open(q).and_then(|mut f| f.write_all(&out)) {
+            env.log(&format!("возврат очереди изменённых файлов: {e}"));
+        }
+    }
+    for (_, t) in &taken {
+        let _ = std::fs::remove_file(t);
+    }
+}
+
+/// Строка очереди `tokens-<сессия>.jsonl`: событие и оценка токенов одного вывода.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenLine {
+    pub e: String,
+    pub t: u64,
+}
+
+/// Жёсткий предел очереди `tokens-<сессия>.jsonl`, байт (ревью задачи 12): сверх него строка не
+/// дописывается, а в `hooks.log` пишется причина (около 2000 выводов между сетевыми хуками).
+pub const TOKENS_QUEUE_MAX: u64 = 64 * 1024;
+
+/// Событие учёта: вывод `pre-tool`.
+pub const TOKENS_PRE_TOOL: &str = "pre_tool";
+/// Событие учёта: вывод `post-tool` в режиме успеха (без сети).
+pub const TOKENS_POST_TOOL_LOCAL: &str = "post_tool_local";
+
+pub fn tokens_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("tokens-{}.jsonl", session_file_part(session)))
+}
+
+/// Оценка токенов текста без токенизатора — та же, что у сервера без модели
+/// (`zam_markdown::ApproxCounter`): ⌈символы / 3,5⌉.
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64 * 2).div_ceil(7)
+}
+
+/// Отмечает локальный вывод хука в очереди учёта (пустой текст — ничего): одна строка одним
+/// `write` с append, без замка (параллельные хуки строк не смешивают).
+pub fn note_tokens(env: &Env, session: &str, event: &str, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let line = TokenLine {
+        e: event.to_string(),
+        t: estimate_tokens(text.trim_end()),
+    };
+    let mut buf = serde_json::to_vec(&line).unwrap_or_default();
+    buf.push(b'\n');
+    let path = tokens_path(env, session);
+    // жёсткий предел очереди: сервер долго недоступен — учёт теряется, а не растёт файл
+    let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+    if len + buf.len() as u64 > TOKENS_QUEUE_MAX {
+        env.log(&format!(
+            "очередь учёта токенов полна ({} КиБ): вывод {event} не учтён",
+            TOKENS_QUEUE_MAX / 1024
+        ));
+        return;
+    }
+    let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| {
+        use std::io::Write;
+        append_options().open(&path)?.write_all(&buf)
+    });
+    if let Err(e) = r {
+        env.log(&format!("очередь учёта токенов: {e}"));
+    }
+}
+
+/// Очередь учёта токенов сессии есть.
+pub fn tokens_queued(env: &Env, session: Option<&str>) -> bool {
+    session.is_some_and(|id| tokens_path(env, id).is_file())
+}
+
+/// Отправка очереди учёта токенов сессии (M4.5 §9.5): файл забирается rename, строки
+/// складываются по событию в `{calls, tokens}` и уходят одним `POST /sessions {id, tokens}`.
+/// Успех — забранное удаляется; 400, 413, 422 — отбрасывается со строкой в `hooks.log`; прочее
+/// (сеть, 5xx, старый сервер) — возвращается в очередь. Остаток бюджета меньше
+/// [`FLUSH_MIN_LEFT`] — очередь ждёт следующего хука.
+pub fn flush_tokens(env: &Env, client: &Client, session: &str) {
+    if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+        return;
+    }
+    let q = tokens_path(env, session);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("tokens");
+    let t = q.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    if std::fs::rename(&q, &t).is_err() {
+        return;
+    }
+    let bytes = std::fs::read(&t).unwrap_or_default();
+    let mut sums: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for l in bytes.split(|b| *b == b'\n') {
+        if let Ok(x) = serde_json::from_slice::<TokenLine>(l) {
+            let s = sums.entry(x.e).or_default();
+            s.0 += 1;
+            s.1 = s.1.saturating_add(x.t);
+        }
+    }
+    if !sums.is_empty() {
+        let tokens: serde_json::Map<String, Value> = sums
+            .iter()
+            .map(|(e, (c, t))| (e.clone(), serde_json::json!({"calls": c, "tokens": t})))
+            .collect();
+        let body = serde_json::json!({"id": session, "tokens": tokens});
+        match client.post_json("/sessions", &body) {
+            Ok(_) => {}
+            Err(e) if permanent(&e) => {
+                env.log(&format!("sessions(tokens): очередь учёта отброшена: {e}"));
+            }
+            Err(e) => {
+                env.log(&format!("sessions(tokens): {e}"));
+                use std::io::Write;
+                if let Err(e) = append_options()
+                    .open(&q)
+                    .and_then(|mut f| f.write_all(&bytes))
+                {
+                    env.log(&format!("возврат очереди учёта токенов: {e}"));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&t);
+}
+
+/// Ответ, который повтор не исправит: 400, 413, 422 (задача 9: 403, 404 и 410 бывают временными
+/// — доступ к решению ещё не одобрен, сервер старше маршрута).
+fn permanent(e: &CliError) -> bool {
+    e.http_status()
+        .is_some_and(|s| matches!(s, 400 | 413 | 422))
+}
+
 /// Массив строк JSON (остальное пропускается).
 pub fn strings(v: &Value) -> Vec<String> {
     v.as_array()
@@ -289,7 +690,7 @@ pub fn write_server_hooks(env: &Env, server: &str, hooks: HookFlags) {
 
 /// Имя файла сессии: очищенный id (`[A-Za-z0-9_-]`, до 64 символов), `-` и 8 hex blake3
 /// исходного id — разные id с одинаковой очисткой не сталкиваются.
-fn session_file_part(id: &str) -> String {
+pub fn session_file_part(id: &str) -> String {
     let clean: String = id
         .chars()
         .take(64)
@@ -348,8 +749,142 @@ pub fn write_shown(env: &Env, session: &str, s: &Shown) {
     }
 }
 
-/// Удаляет `shown-*.json` и `edits-*` старше [`SHOWN_TTL`] и временные `.*.tmp` старше
-/// [`TMP_TTL`].
+/// Срок записи очереди запусков субагентов (§9.4).
+pub const SPAWN_TTL: Duration = Duration::from_secs(10 * 60);
+/// Записей в очереди запусков субагентов: больше — старейшие отбрасываются.
+pub const SPAWN_MAX: usize = 8;
+/// Замок очереди запусков старше этого — брошен (процесс хука живёт ≤ 300 мс).
+const SPAWN_LOCK_TTL: Duration = Duration::from_secs(5);
+/// Ожидание замка очереди запусков у `subagent-start` (бюджет 300 мс): дольше — работа без
+/// замка (fail-open).
+const SPAWN_LOCK_WAIT: Duration = Duration::from_millis(20);
+/// Ожидание замка очереди запусков у `pre-tool` (бюджет 50 мс).
+const SPAWN_PUSH_WAIT: Duration = Duration::from_millis(5);
+/// Файл очереди без изменений дольше этого удаляет [`gc_cache`]: все его записи заведомо
+/// просрочены ([`SPAWN_TTL`] с запасом).
+pub const SPAWN_FILE_TTL: Duration = Duration::from_secs(3600);
+
+/// Запуск субагента, замеченный `pre-tool` (Claude: инструмент `Agent`/`Task`): тип и начало
+/// задачи (`tool_input.prompt`, до 2000 символов); `at` — миллисекунды Unix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spawn {
+    pub at: super::journal::Timestamp,
+    pub agent_type: String,
+    pub task: String,
+}
+
+pub fn spawn_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("spawn-{}.json", session_file_part(session)))
+}
+
+/// Замок очереди запусков: файл `.spawn-….lock` (создаётся только новым); брошенный старше
+/// [`SPAWN_LOCK_TTL`] снимается; не взят за `wait` — `None` (без замка).
+fn spawn_lock(path: &Path, wait: Duration) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let lock = path.with_file_name(format!(".{name}.lock"));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    let t0 = std::time::Instant::now();
+    loop {
+        if o.open(&lock).is_ok() {
+            return Some(lock);
+        }
+        let stale = std::fs::metadata(&lock)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|a| a > SPAWN_LOCK_TTL);
+        if stale {
+            let _ = std::fs::remove_file(&lock);
+            continue;
+        }
+        if t0.elapsed() >= wait {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Очередь запусков под замком: живые записи (моложе [`SPAWN_TTL`], старейшие первыми)
+/// передаются `f`, итог пишется обратно (пусто — файл удаляется). Результат `f`; `wait` —
+/// ожидание замка.
+fn with_spawns<T>(
+    env: &Env,
+    session: &str,
+    wait: Duration,
+    f: impl FnOnce(&mut Vec<Spawn>) -> T,
+) -> T {
+    let path = spawn_path(env, session);
+    let _ = std::fs::create_dir_all(env.cache_dir());
+    let lock = spawn_lock(&path, wait);
+    let mut q: Vec<Spawn> = match read_json_file::<Vec<Spawn>>(&path) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => {
+            env.log(&format!(
+                "очередь запусков субагентов битая, начата заново: {e}"
+            ));
+            Vec::new()
+        }
+    };
+    let before = q.clone();
+    let now = super::journal::Timestamp::now().0;
+    let ttl = SPAWN_TTL.as_millis() as u64;
+    q.retain(|s| now.saturating_sub(s.at.0) <= ttl);
+    q.sort_by_key(|s| s.at);
+    let out = f(&mut q);
+    if q != before || (q.is_empty() && path.exists()) {
+        let r = if q.is_empty() {
+            std::fs::remove_file(&path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+        } else {
+            write_json_file(&path, &q)
+        };
+        if let Err(e) = r {
+            env.log(&format!("запись очереди запусков субагентов: {e}"));
+        }
+    }
+    if let Some(l) = lock {
+        let _ = std::fs::remove_file(l);
+    }
+    out
+}
+
+/// Добавляет запуск в очередь сессии (до [`SPAWN_MAX`], старейшие отбрасываются).
+pub fn push_spawn(env: &Env, session: &str, s: Spawn) {
+    with_spawns(env, session, SPAWN_PUSH_WAIT, |q| {
+        q.push(s);
+        let extra = q.len().saturating_sub(SPAWN_MAX);
+        q.drain(..extra);
+    });
+}
+
+/// Берёт из очереди сессии старейший живой запуск с типом `agent_type` (без учёта регистра
+/// ASCII); нет такого — `None`, очередь не меняется (кроме отброса просроченных).
+pub fn take_spawn(env: &Env, session: &str, agent_type: &str) -> Option<Spawn> {
+    with_spawns(env, session, SPAWN_LOCK_WAIT, |q| {
+        let i = q
+            .iter()
+            .position(|s| s.agent_type.eq_ignore_ascii_case(agent_type))?;
+        Some(q.remove(i))
+    })
+}
+
+/// Снимает просроченные записи очереди запусков сессии (`session-start`); нет файла — ничего.
+pub fn prune_spawns(env: &Env, session: &str) {
+    if spawn_path(env, session).is_file() {
+        with_spawns(env, session, SPAWN_LOCK_WAIT, |_| ());
+    }
+}
+
+/// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`,
+/// `tokens-*.jsonl`) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
+/// временные `.*.tmp` и замки старше [`TMP_TTL`].
 pub fn gc_cache(env: &Env) {
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
         return;
@@ -357,9 +892,18 @@ pub fn gc_cache(env: &Env) {
     for e in rd.flatten() {
         let name = e.file_name();
         let Some(n) = name.to_str() else { continue };
-        let ttl = if (n.starts_with("shown-") && n.ends_with(".json")) || n.starts_with("edits-") {
+        let session_file = (n.starts_with("shown-") && n.ends_with(".json"))
+            || n.starts_with("edits-")
+            || (n.starts_with("events-") && n.ends_with(".jsonl"))
+            || (n.starts_with("changed-") && n.ends_with(".jsonl"))
+            || (n.starts_with("tokens-") && n.ends_with(".jsonl"));
+        let ttl = if session_file {
             SHOWN_TTL
-        } else if n.starts_with('.') && n.ends_with(".tmp") {
+        } else if n.starts_with("spawn-") && n.ends_with(".json") {
+            SPAWN_FILE_TTL
+        } else if n.starts_with('.')
+            && (n.ends_with(".tmp") || n.ends_with(".lock") || n.ends_with(".trimfail"))
+        {
             TMP_TTL
         } else {
             continue;

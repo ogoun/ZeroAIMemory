@@ -1,10 +1,10 @@
 //! `zam log changelog` и `zam release add|compare` против настоящего zam-server в том же
 //! процессе тестов; git-репозиторий — в `CARGO_TARGET_TMPDIR` (§7.3, §7.4).
+mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use assert_cmd::Command;
 use zam_server::build;
 use zam_server::config::ServerConfig;
 use zam_store::Access;
@@ -12,10 +12,7 @@ use zam_store::Access;
 const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e13";
 
 fn tmp(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-journals-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    common::sandbox("cli-journals", name)
 }
 
 /// Сервер в фоновом потоке: адрес и токен `rw` пользователя «Анна».
@@ -50,19 +47,7 @@ fn start(name: &str) -> (String, String) {
 }
 
 fn zam(url: &str, token: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
-    let mut c = Command::cargo_bin("zam").unwrap();
-    for k in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    ] {
-        c.env_remove(k);
-    }
+    let mut c = common::zam_cmd();
     c.env("ZAM_URL", url)
         .env("ZAM_TOKEN", token)
         .env("HOME", cwd)
@@ -247,10 +232,11 @@ fn release_from_git_collects_commits() {
             "--title",
             "x",
             "--ref",
-            "oops",
+            "url:oops",
         ],
         b"",
     );
+    // неизвестный вид ссылки — 6 (путь без вида с M4.5 — файл)
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
     let o = z(&["release", "compare", "9.9.9"], b"");
     assert_eq!(o.status.code(), Some(5), "{}", err(&o));

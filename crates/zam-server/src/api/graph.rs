@@ -4,6 +4,9 @@
 //! - `GET /graph?node=<id>|entry=<id>&depth=1..3&types=a,b` → `{nodes, edges}`: подграф на
 //!   `depth` шагов (по умолчанию 1) в обе стороны по рёбрам типов `types` (по умолчанию все);
 //!   ровно один из `node`/`entry`, иначе 400; неизвестный тип или глубина вне 1..=3 — 400;
+//!   `GET /graph?file=<path>[&solution=<guid>]` (M4.5 §6.3) → `{nodes, edges: []}`: живые
+//!   заметки и записи со ссылкой на файл (путь нормализуется, ошибка — 422) в решении
+//!   (`solution` или `X-Zam-Solution`) либо в личной базе — то же, что `filters.file` поиска;
 //! - `POST /edges {src, type, dst}` → 201 ребро `explicit`: `src` — `n:<id>` | `e:<id>` (или
 //!   `node:<id>` | `entry:<id>`), `dst` — то же или `[[Имя]]` (в пространстве источника);
 //!   `type` вне §8.5 или `supersedes` (его ставит замещение) — 422; такая связь уже есть —
@@ -271,6 +274,10 @@ pub struct GraphQuery {
     entry: Option<String>,
     depth: Option<u8>,
     types: Option<String>,
+    /// Путь файла (M4.5 §6.3): вместо подграфа — заметки и записи со ссылкой на файл.
+    file: Option<String>,
+    /// Решение для `file` (иначе `X-Zam-Solution`, иначе личная база).
+    solution: Option<String>,
 }
 
 /// `types=a,b` → типы (пусто — все); неизвестный — 400.
@@ -306,7 +313,8 @@ fn start_ref(node: Option<&str>, entry: Option<&str>) -> Result<TargetRef, ApiEr
 }
 
 /// `GET /graph?node=|entry=&depth=&types=` → `{nodes, edges, truncated}` (`truncated` —
-/// подграф обрезан пределами `zam_store::GRAPH_MAX_NODES` / `GRAPH_MAX_EDGES`).
+/// подграф обрезан пределами `zam_store::GRAPH_MAX_NODES` / `GRAPH_MAX_EDGES`);
+/// `GET /graph?file=<path>[&solution=]` → `{nodes, edges: []}` — владельцы ссылок на файл.
 pub async fn graph(
     State(st): State<AppState>,
     p: Principal,
@@ -314,6 +322,19 @@ pub async fn graph(
     q: Result<Query<GraphQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let q = query(q)?;
+    if let Some(file) = q.file.as_deref() {
+        if q.node.is_some() || q.entry.is_some() {
+            return Err(ApiError::BadRequest(
+                "file задаётся без node и entry".into(),
+            ));
+        }
+        let solution = super::files::query_solution(q.solution.as_deref(), &headers)?;
+        let (db, owners) = super::files::file_owners(&st, &p, &headers, file, solution).await?;
+        let nodes = graph_nodes(&db, owners).await?;
+        return Ok(Json(
+            json!({ "nodes": nodes, "edges": [], "truncated": false }),
+        ));
+    }
     let start = start_ref(q.node.as_deref(), q.entry.as_deref())?;
     let depth = q.depth.unwrap_or(1);
     if !(1..=GRAPH_DEPTH_MAX).contains(&depth) {

@@ -6,10 +6,12 @@ static MIGS: &[Migration] = &[
     Migration {
         version: 1,
         sql: "CREATE TABLE t(n INTEGER);",
+        rebuild: false,
     },
     Migration {
         version: 2,
         sql: "INSERT INTO t VALUES(0);",
+        rebuild: false,
     },
 ];
 
@@ -240,20 +242,24 @@ fn invalid_migration_lists_are_rejected() {
         Migration {
             version: 1,
             sql: "CREATE TABLE a(x);",
+            rebuild: false,
         },
         Migration {
             version: 1,
             sql: "CREATE TABLE b(x);",
+            rebuild: false,
         },
     ];
     static GAP: &[Migration] = &[
         Migration {
             version: 1,
             sql: "CREATE TABLE a(x);",
+            rebuild: false,
         },
         Migration {
             version: 3,
             sql: "CREATE TABLE b(x);",
+            rebuild: false,
         },
     ];
     for (n, m) in [("dup", DUP), ("gap", GAP)] {
@@ -321,6 +327,7 @@ fn wal_seq(p: &std::path::Path) -> u32 {
 static BLOB_MIGS: &[Migration] = &[Migration {
     version: 1,
     sql: "CREATE TABLE b(x BLOB);",
+    rebuild: false,
 }];
 
 async fn write_blobs(db: &Db, n: usize, size: usize) {

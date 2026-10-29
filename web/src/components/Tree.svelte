@@ -367,6 +367,12 @@
       <path d="M2.5 8.2L8 2.5h5.5V8L8 13.5z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /><circle cx="10.6" cy="5.4" r="1" fill="currentColor" />
     {:else if kind === 'j-insights'}
       <path d="M8 1.8a4.2 4.2 0 0 0-2.4 7.6V11h4.8V9.4A4.2 4.2 0 0 0 8 1.8z M6 13.3h4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" />
+    {:else if kind === 'j-glossary'}
+      <path d="M3.5 2.5h8a1 1 0 0 1 1 1v9.5h-8a1 1 0 0 1-1-1z M5.5 5.5h4 M5.5 8h4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" />
+    {:else if kind === 'j-tasks'}
+      <path d="M2.5 4l1.4 1.4L6 3.3 M2.5 9l1.4 1.4L6 8.3 M8 4.5h5.5 M8 9.5h5.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+    {:else if kind === 'j-questions'}
+      <path d="M5.8 5.6a2.3 2.3 0 1 1 3.2 2.1c-.7.3-1 .8-1 1.5 M8 12.2v.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
     {:else if kind === 'j-vault'}
       <path d="M3.5 7h9v6.5h-9z M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
     {:else if kind === 'rules'}

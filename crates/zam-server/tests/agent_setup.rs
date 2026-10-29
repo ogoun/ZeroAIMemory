@@ -1,4 +1,4 @@
-//! Подключение агента (§14, §15.5; задача 11 M4): `GET /agent-setup` (блок инструкции v2,
+//! Подключение агента (§14, §15.5; задача 11 M4, задача 13 M4.5): `GET /agent-setup` (блок v3,
 //! фрагменты `.mcp.json` и хуков, установка `zam`), шаблоны в `settings` с версией,
 //! `GET /agent-guide`, `GET /downloads/zam/{os}-{arch}`.
 mod common;
@@ -57,7 +57,7 @@ fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
 }
 
 #[tokio::test]
-async fn agent_setup_block_under_500_tokens_ru_en() {
+async fn agent_setup_block_v3_under_500_tokens_ru_en() {
     let Some(counter) = bge_counter() else {
         return;
     };
@@ -96,6 +96,10 @@ async fn agent_setup_block_under_500_tokens_ru_en() {
                     )
                     .await;
                     let block = j["block"].as_str().unwrap();
+                    assert!(
+                        block.starts_with("<!-- zeroaimemory:begin v3 -->\n"),
+                        "{block}"
+                    );
                     // подставлены реальные адрес, GUID и имя решения (решение контроллера T11-c)
                     assert!(
                         block.contains(&format!(
@@ -130,37 +134,48 @@ async fn agent_setup_block_under_500_tokens_ru_en() {
 async fn agent_setup_contains_axiom_rule_and_rev_rule() {
     let a = api("agent-setup-rules", |_| {}).await;
     let ru = setup(&a, &a.token, "agent=claude").await;
-    assert_eq!(ru["version"], 2);
+    assert_eq!(ru["version"], 3);
     assert_eq!(ru["lang"], "ru");
     let b = ru["block"].as_str().unwrap();
-    assert!(b.starts_with("<!-- zeroaimemory:begin v2 -->\n"), "{b}");
+    assert!(b.starts_with("<!-- zeroaimemory:begin v3 -->\n"), "{b}");
     assert!(b.ends_with("<!-- zeroaimemory:end -->\n"), "{b}");
     assert!(
         b.contains("ZeroAIMemoryUrl=http://memory.lan:7700\n"),
         "{b}"
     );
     for want in [
-        "`axiom` ставь, правь, снимай только по прямому указанию пользователя",
-        "`hypothesis`/`theorem`",
-        "скажи пользователю",
-        "Правка записи — с `rev`; на 409/428 перечитай",
+        "`axiom` — только по прямому указанию пользователя",
+        "`hypothesis`/`theorem` с `contradicts`",
+        "`certainty` меняй с `reason`",
+        "`memory_update_entry` с `rev` правит (409 — перечитай)",
         "`memory_search`",
         "`memory_cache_put`",
         "`memory_vault`",
         "`memory_recall`",
+        // правила v3 (M4.5 §11)
+        "Задача → `task`: claim перед работой, `status` с `next_step`",
+        "Вопрос человеку → `question`; его ответ в чате → `answer`",
+        "новое понятие → `term`, пиши каноническими терминами",
+        "Код — с `refs.files`",
+        "после сжатия — `recovery`; субагенту — `brief`",
         // без решения — его создаст `zam init`; Rules — по настройке сервера (закрыты)
         "(создаёт `zam init`)",
-        "Секреты → `memory_vault`. Заметке — `l0`.\n",
+        "Секреты, хосты → `memory_vault`; заметке — `l0`.\n",
     ] {
         assert!(b.contains(want), "{want}: {b}");
     }
     let en = setup(&a, &a.token, "agent=codex&lang=en&rules_write=true").await;
     let b = en["block"].as_str().unwrap();
     for want in [
-        "<!-- zeroaimemory:begin v2 -->",
-        "`axiom` only on the user's direct instruction",
-        "`hypothesis`/`theorem`",
-        "Edit a record with `rev`; on 409/428 reread",
+        "<!-- zeroaimemory:begin v3 -->",
+        "`axiom` — only on the user's direct instruction",
+        "`hypothesis`/`theorem` with `contradicts`",
+        "`memory_update_entry` with `rev` edits (409 — reread)",
+        "Task → `task`: claim before work, `status` with `next_step`",
+        "their answer in chat → `answer`",
+        "new concept → `term`",
+        "Code — with `refs.files`",
+        "after compaction — `recovery`; for a subagent — `brief`",
         "Shared rules go to Rules.",
     ] {
         assert!(b.contains(want), "{want}: {b}");
@@ -206,10 +221,39 @@ async fn agent_setup_contains_axiom_rule_and_rev_rule() {
     assert!(r.header("content-type").starts_with("text/markdown"));
     let g = r.text();
     assert!(g.contains("memory_cache_put") && g.contains("axiom"), "{g}");
+    // протокол рабочей памяти (M4.5 §11)
+    for section in [
+        "## Задачи и передача работы",
+        "## Вопросы человеку",
+        "## Словарь",
+        "## Решения и противоречия",
+        "## Ссылки на файлы",
+        "## После сжатия и для субагентов (без хуков)",
+        "## Окружение в Vault",
+    ] {
+        assert!(g.contains(section), "{section}");
+    }
+    assert!(g.contains("`by: human` — только если человек действительно ответил"));
+    assert!(
+        g.contains("verified_at") && g.contains("contradicts"),
+        "{g}"
+    );
     let r = a
         .tok(&a.token, Method::GET, "/api/v1/agent-guide?lang=en", None)
         .await;
-    assert!(r.text().contains("direct instruction"), "{}", r.text());
+    let g = r.text();
+    assert!(g.contains("direct instruction"), "{g}");
+    for section in [
+        "## Tasks and handing work over",
+        "## Questions for the human",
+        "## Glossary",
+        "## Decisions and contradictions",
+        "## File references",
+        "## After compaction and for subagents (without hooks)",
+        "## Environment in Vault",
+    ] {
+        assert!(g.contains(section), "{section}");
+    }
 }
 
 #[tokio::test]
@@ -226,8 +270,10 @@ async fn agent_setup_hooks_exec_form() {
     let want = json!({"hooks": {
         "SessionStart": cmd("session-start", 2),
         "UserPromptSubmit": cmd("prompt", 2),
-        "PreToolUse": [{"matcher": "Write|Edit|Bash", "hooks": [{"type": "command", "command": "zam", "args": ["hook", "pre-tool"], "timeout": 1}]}],
+        "PreToolUse": [{"matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task", "hooks": [{"type": "command", "command": "zam", "args": ["hook", "pre-tool"], "timeout": 1}]}],
+        "PostToolUse": [{"matcher": "Read|Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__zeroaimemory__memory_log", "hooks": [{"type": "command", "command": "zam", "args": ["hook", "post-tool"], "timeout": 1}]}],
         "PostToolUseFailure": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "zam", "args": ["hook", "post-tool"], "timeout": 2}]}],
+        "SubagentStart": cmd("subagent-start", 2),
         "Stop": cmd("checkpoint", 2),
         "PreCompact": cmd("checkpoint", 2),
     }});
@@ -342,7 +388,7 @@ async fn agent_setup_hooks_exec_form() {
     assert_eq!(line("Stop"), "zam hook checkpoint --agent codex");
     assert_eq!(line("PreCompact"), "zam hook checkpoint --agent codex");
     assert_eq!(h["PreToolUse"][0]["matcher"], "Bash|apply_patch");
-    assert_eq!(h["PostToolUse"][0]["matcher"], "Bash");
+    assert_eq!(h["PostToolUse"][0]["matcher"], "Bash|apply_patch");
     assert_eq!(h["PreToolUse"][0]["hooks"][0]["timeout"], 1);
     assert_eq!(h["Stop"][0]["hooks"][0]["timeout"], 2);
     assert!(h.get("PostToolUseFailure").is_none(), "{h}");
@@ -434,7 +480,7 @@ async fn template_edit_bumps_version() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let s = r.json();
-    assert_eq!(s["agent_setup"]["version"], 2);
+    assert_eq!(s["agent_setup"]["version"], 3);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], false);
     assert!(
         s["agent_setup"]["templates"]["codex.en"]["text"]
@@ -442,9 +488,9 @@ async fn template_edit_bumps_version() {
             .unwrap()
             .contains("{url}")
     );
-    assert!(!reminder(&a, 2).await.contains("устарел"));
+    assert!(!reminder(&a, 3).await.contains("устарел"));
 
-    // свой шаблон: версия 3, блок — свой текст с маркером v3
+    // свой шаблон: версия 4, блок — свой текст с маркером v4
     let tpl = "## Память\nZeroAIMemoryUrl={url}\nРешение: {solution}. {rules}\r\n";
     let (st, s) = admin_settings(
         &a,
@@ -452,29 +498,29 @@ async fn template_edit_bumps_version() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{s}");
-    assert_eq!(s["agent_setup"]["version"], 3);
+    assert_eq!(s["agent_setup"]["version"], 4);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], true);
     let j = setup(&a, &a.token, "agent=claude").await;
-    assert_eq!(j["version"], 3);
+    assert_eq!(j["version"], 4);
     assert_eq!(j["template_custom"], true);
     assert_eq!(
         j["block"],
-        "<!-- zeroaimemory:begin v3 -->\n## Память\nZeroAIMemoryUrl=http://memory.lan:7700\n\
+        "<!-- zeroaimemory:begin v4 -->\n## Память\nZeroAIMemoryUrl=http://memory.lan:7700\n\
          Решение: `.zeroaimemory/solution.toml` (создаёт `zam init`).\n\
          <!-- zeroaimemory:end -->\n"
     );
     // версия одна на сервер: и у других агентов и языков
     assert_eq!(
         setup(&a, &a.token, "agent=codex&lang=en").await["version"],
-        3
+        4
     );
     // /recall(session_start) сравнивает с той же версией
-    let t = reminder(&a, 2).await;
+    let t = reminder(&a, 3).await;
     assert!(
-        t.contains("Блок ZeroAIMemory устарел (v2 → v3): обнови через `zam init` или WebUI"),
+        t.contains("Блок ZeroAIMemory устарел (v3 → v4): обнови через `zam init` или WebUI"),
         "{t}"
     );
-    assert!(!reminder(&a, 3).await.contains("устарел"));
+    assert!(!reminder(&a, 4).await.contains("устарел"));
 
     // тот же текст повторно — версия не меняется; другой — растёт; сброс — тоже растёт
     let (_, s) = admin_settings(
@@ -482,26 +528,26 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"claude.ru": tpl}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 3);
+    assert_eq!(s["agent_setup"]["version"], 4);
     let (_, s) = admin_settings(
         &a,
         json!({"agent_setup": {"templates": {"claude.ru": "{url} шаблон-v4-маркер", "agents.en": "{url} en"}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 4, "один запрос — одна версия");
+    assert_eq!(s["agent_setup"]["version"], 5, "один запрос — одна версия");
     let (_, s) = admin_settings(
         &a,
         json!({"agent_setup": {"templates": {"claude.ru": null}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 5);
+    assert_eq!(s["agent_setup"]["version"], 6);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], false);
     let j = setup(&a, &a.token, "agent=claude").await;
     assert!(
         j["block"]
             .as_str()
             .unwrap()
-            .starts_with("<!-- zeroaimemory:begin v5 -->\n## Память ZeroAIMemory\n")
+            .starts_with("<!-- zeroaimemory:begin v6 -->\n## Память ZeroAIMemory\n")
     );
     // сброс шаблона по умолчанию — без изменения версии
     let (_, s) = admin_settings(
@@ -509,7 +555,7 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"codex.ru": null}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 5);
+    assert_eq!(s["agent_setup"]["version"], 6);
     // сохранение текста, совпадающего с действующим (здесь — по умолчанию), версию не меняет
     // (fix round 1, M-4)
     let default_en = s["agent_setup"]["templates"]["codex.en"]["text"].clone();
@@ -518,7 +564,7 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"codex.en": default_en}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 5);
+    assert_eq!(s["agent_setup"]["version"], 6);
     assert_eq!(s["agent_setup"]["templates"]["codex.en"]["custom"], false);
 
     // неверные шаблоны и ключи — 400, токен — 403
@@ -555,7 +601,7 @@ async fn template_edit_bumps_version() {
         "текст шаблона в аудите"
     );
     assert_eq!(e[0]["details"]["reset"], true);
-    assert_eq!(e[0]["details"]["version"], 5);
+    assert_eq!(e[0]["details"]["version"], 6);
 }
 
 #[tokio::test]
@@ -622,11 +668,11 @@ async fn template_preview_renders_unsaved() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
-    assert_eq!(j["version"], 2);
-    assert_eq!(j["version_next"], 3);
+    assert_eq!(j["version"], 3);
+    assert_eq!(j["version_next"], 4);
     assert_eq!(
         j["block"],
-        "<!-- zeroaimemory:begin v3 -->\nПамять: http://memory.lan:7700\n\
+        "<!-- zeroaimemory:begin v4 -->\nПамять: http://memory.lan:7700\n\
          Решение: «Пример» (`00000000-0000-0000-0000-000000000000`).\n\
          <!-- zeroaimemory:end -->\n"
     );
@@ -638,7 +684,7 @@ async fn template_preview_renders_unsaved() {
         .json();
     let def = s["agent_setup"]["templates"]["claude.ru"]["text"].clone();
     let r = preview(json!({"agent": "claude", "lang": "ru", "template": def})).await;
-    assert_eq!(r.json()["version_next"], 2, "{}", r.text());
+    assert_eq!(r.json()["version_next"], 3, "{}", r.text());
     // проверка — как у сохранения; версия не меняется
     let r = preview(json!({"agent": "claude", "lang": "ru", "template": "без адреса"})).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
@@ -648,7 +694,7 @@ async fn template_preview_renders_unsaved() {
         .adm(Method::GET, "/api/v1/admin/settings", None, None)
         .await
         .json();
-    assert_eq!(s["agent_setup"]["version"], 2);
+    assert_eq!(s["agent_setup"]["version"], 3);
     // токен — 403
     let r = a
         .tok_h(
@@ -690,4 +736,94 @@ async fn agent_setup_no_store_and_token_placeholder() {
         let c = j["init_cmd"][k].as_str().unwrap();
         assert!(c.contains(" --token '<токен>' "), "{c}");
     }
+}
+
+/// Claude Code (M4.5 §11): `PostToolUse` успеха (чтение, правки, команды, `memory_log` MCP),
+/// `pre-tool` и на запуске субагента, `SubagentStart`; прежние события — без изменений.
+#[tokio::test]
+async fn agent_setup_claude_settings_new_events() {
+    let a = api("agent-setup-claude-events", |_| {}).await;
+    let j = setup(&a, &a.token, "agent=claude").await;
+    let h = &j["claude_settings"]["hooks"];
+    let one = |ev: &str| {
+        let g = h[ev].as_array().unwrap_or_else(|| panic!("{ev}: {h}"));
+        assert_eq!(g.len(), 1, "{ev}: {h}");
+        g[0].clone()
+    };
+    let pre = one("PreToolUse");
+    assert_eq!(
+        pre["matcher"],
+        "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task"
+    );
+    assert_eq!(pre["hooks"][0]["args"], json!(["hook", "pre-tool"]));
+    assert_eq!(pre["hooks"][0]["timeout"], 1);
+    let post = one("PostToolUse");
+    let m = post["matcher"].as_str().unwrap();
+    for tool in [
+        "Read",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "Bash",
+        "mcp__zeroaimemory__memory_log",
+    ] {
+        assert!(m.split('|').any(|x| x == tool), "{tool}: {m}");
+    }
+    assert_eq!(post["hooks"][0]["args"], json!(["hook", "post-tool"]));
+    assert_eq!(post["hooks"][0]["timeout"], 1);
+    let sub = one("SubagentStart");
+    assert!(sub.get("matcher").is_none(), "{sub}");
+    assert_eq!(sub["hooks"][0]["args"], json!(["hook", "subagent-start"]));
+    assert_eq!(sub["hooks"][0]["timeout"], 2);
+    // прежние события — без изменений
+    assert_eq!(one("PostToolUseFailure")["matcher"], "Bash");
+    for (ev, kind) in [
+        ("SessionStart", "session-start"),
+        ("UserPromptSubmit", "prompt"),
+        ("PostToolUseFailure", "post-tool"),
+        ("Stop", "checkpoint"),
+        ("PreCompact", "checkpoint"),
+    ] {
+        let g = one(ev);
+        assert_eq!(g["hooks"][0]["args"], json!(["hook", kind]), "{ev}");
+        assert_eq!(g["hooks"][0]["timeout"], 2, "{ev}");
+    }
+    assert_eq!(h.as_object().unwrap().len(), 8, "{h}");
+}
+
+/// Codex (M4.5 §11): `PostToolUse` на `Bash|apply_patch` (ошибка и успех — одна команда),
+/// `SubagentStart` с `--agent codex`.
+#[tokio::test]
+async fn agent_setup_codex_hooks_new_events() {
+    let a = api("agent-setup-codex-events", |_| {}).await;
+    let j = setup(&a, &a.token, "agent=codex").await;
+    let h = &j["codex_hooks"]["hooks"];
+    assert_eq!(h["PostToolUse"][0]["matcher"], "Bash|apply_patch");
+    assert_eq!(
+        h["PostToolUse"][0]["hooks"][0]["command"],
+        "zam hook post-tool --agent codex"
+    );
+    assert_eq!(
+        h["SubagentStart"][0]["hooks"][0]["command"],
+        "zam hook subagent-start --agent codex"
+    );
+    assert_eq!(h["SubagentStart"][0]["hooks"][0]["timeout"], 2);
+    assert!(h["SubagentStart"][0].get("matcher").is_none(), "{h}");
+    assert_eq!(h["PreToolUse"][0]["matcher"], "Bash|apply_patch");
+    assert!(h.get("PostToolUseFailure").is_none(), "{h}");
+    assert_eq!(h.as_object().unwrap().len(), 7, "{h}");
+}
+
+/// Блок v2 из M4 устарел: `/recall(session_start)` напоминает обновить его до v3.
+#[tokio::test]
+async fn block_version_reminder_v2_to_v3() {
+    let a = api("agent-setup-v2-v3", |_| {}).await;
+    let t = reminder(&a, 2).await;
+    assert!(
+        t.contains("Блок ZeroAIMemory устарел (v2 → v3): обнови через `zam init` или WebUI"),
+        "{t}"
+    );
+    assert!(!reminder(&a, 3).await.contains("устарел"));
+    assert_eq!(setup(&a, &a.token, "agent=claude").await["version"], 3);
 }

@@ -43,7 +43,7 @@ pub use chunks::{
     PREFIX_L0_MAX_TOKENS, chunk_params, count_tokens, prefix_l0, set_chunk_params, set_prefix_l0,
     set_token_counter, token_counter_exact,
 };
-pub use history::{RevisionInfo, list_revisions, unified_diff};
+pub use history::{RevisionInfo, entry_snapshot_text, list_revisions, unified_diff};
 pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
 pub use revise::{WriteError, patch_note, patch_note_within, revert_note, update_note};
@@ -138,6 +138,9 @@ pub struct Attribution {
     pub user_id: Option<Id>,
     /// Область по умолчанию (`X-Zam-Area`, §11.2) для новых узлов и записей журналов.
     pub area: Option<String>,
+    /// GUID решения запроса (`X-Zam-Solution`): решение ссылок на файлы заметок и записей вне
+    /// пространства решения (M4.5 §6.1); `None` — ссылки справочные.
+    pub solution: Option<String>,
 }
 
 impl Attribution {
@@ -151,6 +154,7 @@ impl Attribution {
             message: None,
             user_id: None,
             area: None,
+            solution: None,
         }
     }
 }
@@ -185,6 +189,9 @@ pub struct Node {
     pub has_children: bool,
     /// Эпистемический статус заметки (`certainty:` во frontmatter текущей ревизии, §7.5).
     pub certainty: Option<crate::entries::Certainty>,
+    /// `verified_at:` frontmatter текущей ревизии (проверенная команда, M4.5 §7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
 }
 
 /// Новая заметка.
@@ -206,7 +213,7 @@ pub(crate) const NODE_COLS: &str = "n.id, n.space_id, n.parent_id, n.kind, n.nam
     n.created_at, n.updated_at, n.deleted_at, n.index_state,
     EXISTS (SELECT 1 FROM nodes c
             WHERE c.space_id = n.space_id AND c.parent_id = n.id AND c.deleted_at IS NULL),
-    n.certainty";
+    n.certainty, n.verified_at";
 
 pub(crate) fn node_row(r: &Row) -> rusqlite::Result<Node> {
     let frontmatter = r
@@ -231,6 +238,7 @@ pub(crate) fn node_row(r: &Row) -> rusqlite::Result<Node> {
         index_state: r.get(14)?,
         has_children: r.get(15)?,
         certainty: r.get(16)?,
+        verified_at: r.get(17)?,
     })
 }
 

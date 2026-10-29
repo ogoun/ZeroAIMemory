@@ -32,6 +32,7 @@ fn agent() -> Attribution {
 
 fn insight(space: Id, title: &str, body: &str) -> NewEntry {
     NewEntry {
+        refs: None,
         space_id: space,
         kind: EntryKind::Insight,
         title: title.into(),
@@ -252,6 +253,7 @@ async fn search_returns_entry_items_with_kind_status() {
     let (ch, _) = create_entry(
         &db,
         NewEntry {
+            refs: None,
             space_id: k,
             kind: EntryKind::Changelog,
             title: "Converted deploy scripts to LF".into(),
@@ -317,7 +319,7 @@ async fn search_returns_entry_items_with_kind_status() {
         )),
         "{t}"
     );
-    assert!(t.contains("] active · hypothesis · ~"), "{t}");
+    assert!(t.contains("] active · hypothesis · сегодня · ~"), "{t}");
     assert!(
         t.contains(&format!(
             "c:{} changelog/fix «Converted deploy scripts to LF»  [",

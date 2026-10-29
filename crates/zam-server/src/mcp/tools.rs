@@ -12,8 +12,8 @@
 //! - **Пространство по умолчанию** (`memory_tree`, `memory_write`, `memory_log`,
 //!   `memory_vault`) **[решение исполнителя]** — решение из `X-Zam-Solution`, без него —
 //!   `knowledge`.
-//! - **Ссылки** `i:|c:|r:|e:<id>` (как в карточках поиска) принимаются везде, где REST ждёт id
-//!   записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`.
+//! - **Ссылки** `i:|c:|r:|t:|k:|q:|e:<id>` (как в карточках поиска) принимаются везде, где REST
+//!   ждёт id записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`.
 use std::sync::{Arc, LazyLock};
 
 use axum::http::{HeaderName, Method, StatusCode, header};
@@ -78,13 +78,14 @@ impl ToolName {
         match self {
             ToolName::Search => {
                 "Поиск в памяти (Knowledge, Rules, текущее решение). Сначала готовые выжимки кэша, \
-                 затем карточки: id, путь, ревизия, ~токены; выданное в этой сессии помечено seen. \
-                 Дальше — memory_read нужного."
+                 затем карточки: id, путь, ревизия, возраст, ~токены; выданное в этой сессии \
+                 помечено seen. filters: kinds (и term, task, question), insight_kinds, file — \
+                 знание о файле, decided_by. Дальше — memory_read нужного."
             }
             ToolName::Read => {
-                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:<id> или путь <пространство>:/<путь>. \
-                 tier L0|L1|L2, section, max_tokens; if_rev равна текущей — unchanged без текста. \
-                 Ошибка по элементу — в самом элементе."
+                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id> или путь <пространство>:/<путь>. \
+                 tier L0|L1|L2, section, max_tokens; if_rev равна текущей — unchanged без текста; \
+                 since_rev — дифф изменений с ревизии. Ошибка по элементу — в самом элементе."
             }
             ToolName::CachePut => {
                 "Сохранить выжимку ответа на запрос (до 600 токенов) с источниками [{id, rev?, \
@@ -99,31 +100,37 @@ impl ToolName {
             ToolName::Write => {
                 "Запись заметки по пути [<пространство>:/]<путь>: без base_rev — создать (content); \
                  с base_rev — заменить content или применить ops к секциям. Ревизия устарела — \
-                 ошибка 409 с диффом: перечитать и повторить."
+                 ошибка 409 с диффом: перечитать и повторить. Ссылки на файлы — refs: [пути] во \
+                 frontmatter."
             }
             ToolName::Log => {
-                "Новая запись журнала: kind changelog|release (только в решении) или insight \
-                 (data.kind, triggers, links, scope solution|global, certainty). Похожий insight — \
-                 ошибка 409 с кандидатами: append, supersede или force."
+                "Новая запись журнала: kind changelog|release (только в решении), insight \
+                 (data.kind, triggers, links, scope, certainty), term (data.definition, \
+                 aliases), task (body — план) или question (data.options, recommendation); \
+                 refs.files — файлы. Дубль insight или вопроса — 409 с кандидатами: force."
             }
             ToolName::UpdateEntry => {
-                "Изменить запись журнала: action supersede|retract|revisit|certify|append|feedback; \
-                 rev — текущая ревизия (кроме feedback). certify — certainty и reason (axiom — \
-                 только по указанию пользователя); feedback — value useful|useless."
+                "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
+                 claim|release|answer; rev — ревизия (кроме feedback, claim, release, answer). \
+                 certify — certainty, reason; feedback — value; задача: status, claim, release; \
+                 вопрос: answer (option, text, by обязателен), status obsolete."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
-                 связь; remove: <edge_id> — удалить её."
+                 связь; type contradicts — запись возражает axiom/theorem dst; remove: <edge_id> — \
+                 удалить связь."
             }
             ToolName::Recall => {
-                "Подсказки памяти к событию: session_start — дайджест (Rules, решение, gotcha, \
-                 revisit, changelog), prompt — к запросу пользователя, post_tool — к ошибке \
-                 инструмента (error, tool). Повторы в сессии отсекаются."
+                "Подсказки памяти к событию: session_start — дайджест, prompt — к запросу \
+                 пользователя, post_tool — к ошибке инструмента (error, tool), recovery — после \
+                 сжатия контекста, brief — пакет под задачу task (задание субагенту, первый \
+                 вызов субагента). Повторы в сессии отсекаются, кроме brief и recovery."
             }
             ToolName::Vault => {
-                "Vault: list — секреты без значений, get — значение по name (раскрытие пишется в \
-                 аудит), set — создать или обновить name = value. scope: global (личный) или \
-                 solution (решение из X-Zam-Solution)."
+                "Vault: list — записи без значений (name — поиск), get — по name или id (v:<id> из \
+                 дайджеста; раскрытие пишется в аудит), set — создать или обновить name = value. \
+                 Типы host и environment — окружение: purpose, address, limits. scope: global \
+                 (личный) или solution (из X-Zam-Solution)."
             }
         }
     }
@@ -146,7 +153,7 @@ impl ToolName {
                     "mode": {"type": "string", "enum": ["brief", "chunks", "notes"]},
                     "scope": {"type": "object", "description":
                         "solution, include_knowledge, include_rules, all_solutions, path_prefix, area"},
-                    "filters": {"type": "object", "description": "kinds, status, certainty"},
+                    "filters": {"type": "object", "description": "kinds, status, certainty, insight_kinds (виды insight: gotcha, failure, experiment…), decided_by, file (путь файла)"},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 100},
                     "budget_tokens": {"type": "integer", "minimum": 1},
                     "expand": {"type": "string", "enum": ["none", "section", "neighbors", "graph"]},
@@ -165,6 +172,8 @@ impl ToolName {
                             "section": {"type": "string", "description": "путь заголовков «A > B»"},
                             "max_tokens": {"type": "integer", "minimum": 1},
                             "if_rev": {"type": "integer"},
+                            "since_rev": {"type": "integer", "minimum": 1,
+                                          "description": "дифф с этой ревизии"},
                         },
                         "required": ["id"],
                     }},
@@ -229,14 +238,15 @@ impl ToolName {
             ),
             ToolName::Log => (
                 json!({
-                    "kind": {"type": "string", "enum": ["changelog", "insight", "release"]},
+                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "question"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "data": {"type": "object", "description": "insight: kind, experiment, evidence"},
+                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "certainty": {"type": "string", "enum": ["axiom", "theorem", "hypothesis"]},
                     "triggers": {"type": "array", "items": {"type": "object"}},
                     "links": {"type": "array", "items": {"type": "object"}},
+                    "refs": {"type": "object", "description": "ссылки на файлы {files: [{path, hash?, commit?}]}, path от корня решения"},
                     "scope": {"type": "string", "enum": ["solution", "global"]},
                     "space": {"type": "string"},
                     "force": {"type": "boolean"},
@@ -251,13 +261,25 @@ impl ToolName {
                     "id": {"type": "string"},
                     "rev": {"type": "integer"},
                     "action": {"type": "string", "enum": ["supersede", "retract", "revisit",
-                        "certify", "append", "feedback"]},
+                        "certify", "append", "feedback", "status", "claim", "release", "answer"]},
+                    "status": {"type": "string", "description": "задача: open, in_progress, blocked, done, dropped"},
+                    "next_step": {"type": ["string", "null"]},
+                    "blocked_by": {"type": ["string", "null"]},
+                    "ttl_min": {"type": "integer", "minimum": 1, "maximum": 1440},
+                    "agent": {"type": "string"},
+                    "option": {"type": "string", "description": "answer: ключ варианта вопроса"},
+                    "text": {"type": "string", "description": "answer: текст ответа"},
+                    "channel": {"type": "string", "enum": ["chat", "cli"],
+                        "description": "answer: где человек ответил (по умолчанию chat)"},
+                    "by": {"type": "string", "enum": ["human", "agent"],
+                        "description": "answer: обязателен — human: ответ человека (axiom), agent: решение агента (hypothesis)"},
                     "title": {"type": "string"},
                     "body": {"type": "string", "description": "supersede — тело; append — дописать"},
                     "data": {"type": "object"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "triggers": {"type": "array", "items": {"type": "object"}},
                     "links": {"type": "array", "items": {"type": "object"}},
+                    "refs": {"type": "object", "description": "supersede и append: новый набор ссылок на файлы {files: [...]}"},
                     "certainty": {"type": ["string", "null"],
                         "enum": ["axiom", "theorem", "hypothesis", null]},
                     "reason": {"type": "string"},
@@ -270,7 +292,8 @@ impl ToolName {
             ToolName::Link => (
                 json!({
                     "src": {"type": "string"},
-                    "type": {"type": "string"},
+                    "type": {"type": "string", "description": "links_to, relates_to, depends_on, \
+                        part_of, caused_by, fixes, derived_from, mentions, contradicts"},
                     "dst": {"type": "string"},
                     "remove": {"type": "string", "description": "id связи"},
                     "format": fmt,
@@ -279,8 +302,10 @@ impl ToolName {
             ),
             ToolName::Recall => (
                 json!({
-                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool"]},
+                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery", "brief"]},
                     "prompt": {"type": "string"},
+                    "task": {"type": "string",
+                        "description": "brief: задача субагента, до 2000 символов"},
                     "error": {"type": "string"},
                     "tool": {"type": "string"},
                     "session_id": {"type": "string",
@@ -297,7 +322,12 @@ impl ToolName {
                     "id": {"type": "string"},
                     "value": {"type": "string"},
                     "type": {"type": "string", "description":
-                        "set: тип нового секрета (password по умолчанию)"},
+                        "set: тип записи (password по умолчанию; host, environment — окружение, \
+                         value необязателен)"},
+                    "purpose": {"type": "string", "description": "set: назначение, до 500"},
+                    "address": {"type": "string", "description": "set: адрес, до 500"},
+                    "limits": {"type": "string", "description": "set: ограничения, до 1000"},
+                    "notes": {"type": "string", "description": "set: заметки, до 2000"},
                     "scope": {"type": "string", "description":
                         "global, solution или GUID решения"},
                     "format": fmt,
@@ -597,21 +627,21 @@ fn default_space(rest: &Rest) -> String {
         .to_string()
 }
 
-/// Id записи журнала без префикса ссылки `i:|c:|r:|e:`.
+/// Id записи журнала без префикса ссылки `i:|c:|r:|t:|k:|q:|e:` (или `entry:`).
 fn entry_id(raw: &str) -> &str {
     let t = raw.trim();
-    ["i:", "c:", "r:", "e:", "entry:"]
-        .iter()
-        .find_map(|p| t.strip_prefix(p))
-        .unwrap_or(t)
+    match t.split_once(':') {
+        Some((p, id)) if p == "entry" || zam_store::is_entry_ref_letter(p) => id,
+        _ => t,
+    }
 }
 
-/// Ссылка графа: `i:|c:|r:<id>` → `e:<id>`, остальное — как есть.
+/// Ссылка графа: `i:|c:|r:|t:|k:|q:<id>` → `e:<id>`, остальное — как есть.
 fn graph_ref(raw: &str) -> String {
     let t = raw.trim();
-    match ["i:", "c:", "r:"].iter().find_map(|p| t.strip_prefix(p)) {
-        Some(id) => format!("e:{id}"),
-        None => t.to_string(),
+    match t.split_once(':') {
+        Some((p, id)) if zam_store::EntryKind::from_ref_letter(p).is_some() => format!("e:{id}"),
+        _ => t.to_string(),
     }
 }
 
@@ -927,12 +957,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
 /// Строка записи журнала: `i:<id> insight/<вид> «заголовок» rev<N> · status · certainty`.
 fn entry_line(e: &Value) -> String {
     let kind = e["kind"].as_str().unwrap_or("entry");
-    let prefix = match kind {
-        "insight" => "i",
-        "changelog" => "c",
-        "release" => "r",
-        _ => "e",
-    };
+    let prefix = zam_store::EntryKind::parse(kind).map_or("e", zam_store::EntryKind::ref_letter);
     let mut s = format!("{prefix}:{} {kind}", e["id"].as_str().unwrap_or("?"));
     if let Some(k) = e["data"]["kind"].as_str() {
         s.push_str(&format!("/{k}"));
@@ -953,8 +978,10 @@ fn entry_line(e: &Value) -> String {
 async fn log(rest: &Rest, args: &JsonObject) -> Res {
     let f = fmt(args)?;
     let kind = req_str(args, "kind")?;
-    if !["changelog", "insight", "release"].contains(&kind) {
-        return Err(Fail::Invalid("kind: changelog, insight или release".into()));
+    if zam_store::EntryKind::parse(kind).is_none() {
+        return Err(Fail::Invalid(
+            "kind: changelog, insight, release, term, task или question".into(),
+        ));
     }
     req_str(args, "title")?;
     let space = opt_str(args, "space")?
@@ -974,6 +1001,7 @@ async fn log(rest: &Rest, args: &JsonObject) -> Res {
             "status",
             "triggers",
             "links",
+            "refs",
             "scope",
             "force",
             "supersedes_id",
@@ -1028,6 +1056,7 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
                     "certainty",
                     "triggers",
                     "links",
+                    "refs",
                     "scope",
                 ],
             ),
@@ -1056,10 +1085,53 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             let text = opt_str(args, "body")?.ok_or_else(|| {
                 Fail::Invalid("append: нужен body — текст для дописывания".into())
             })?;
-            let mut b = pick(args, &["message"]);
+            let mut b = pick(args, &["message", "refs"]);
             b.insert("append_body".into(), json!(text));
             (Method::PATCH, entry, b)
         }
+        "status" => {
+            let status = req_str(args, "status")?;
+            let mut b = pick(args, &["reason", "message"]);
+            b.insert("status".into(), json!(status));
+            // null снимает поле, поэтому — по наличию ключа, а не через pick
+            for k in ["next_step", "blocked_by"] {
+                if let Some(v) = args.get(k) {
+                    b.insert(k.into(), v.clone());
+                }
+            }
+            (Method::PATCH, entry, b)
+        }
+        "answer" => {
+            // `by` обязателен (финальное ревью M4.5, I-2): умолчания нет — чей ответ, знает агент
+            if !args.get("by").is_some_and(Value::is_string) {
+                return Err(Fail::Invalid(
+                    "answer: укажите by: human — ответ человека, by: agent — решение агента".into(),
+                ));
+            }
+            let mut b = pick(args, &["text", "option", "channel", "by", "message"]);
+            b.entry("channel").or_insert_with(|| json!("chat"));
+            let r = call_rest(
+                rest,
+                Method::POST,
+                &format!("{entry}/answer"),
+                Some(&Value::Object(b)),
+                &[],
+            )
+            .await?;
+            return done(f, &r, |v| {
+                format!(
+                    "Ответ записан {}\nРешение {}",
+                    entry_line(&v["entry"]),
+                    entry_line(&v["decision"])
+                )
+            });
+        }
+        "claim" => (
+            Method::POST,
+            format!("{entry}/claim"),
+            pick(args, &["ttl_min", "agent"]),
+        ),
+        "release" => (Method::POST, format!("{entry}/release"), Map::new()),
         "feedback" => {
             let value = req_str(args, "value")?;
             let body = json!({ "value": value });
@@ -1078,7 +1150,9 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         }
         _ => {
             return Err(Fail::Invalid(
-                "action: supersede, retract, revisit, certify, append или feedback".into(),
+                "action: supersede, retract, revisit, certify, append, feedback, status, claim, \
+                 release или answer"
+                    .into(),
             ));
         }
     };
@@ -1139,6 +1213,7 @@ async fn recall(rest: &Rest, args: &JsonObject) -> Res {
         &[
             "event",
             "prompt",
+            "task",
             "error",
             "tool",
             "session_id",
@@ -1227,7 +1302,9 @@ fn vault_candidates(rest: &Rest, args: &JsonObject) -> Result<Vec<String>, Fail>
 /// 404 с пространствами поиска.
 async fn vault_locate(rest: &Rest, args: &JsonObject) -> Result<Value, Fail> {
     if let Some(id) = opt_str(args, "id")? {
-        return Ok(json!({ "id": id.trim() }));
+        // ссылка дайджеста `v:<id>` (раздел «Окружение») — как голый id
+        let id = id.trim();
+        return Ok(json!({ "id": id.strip_prefix("v:").unwrap_or(id) }));
     }
     let name = req_str(args, "name")?.trim();
     let spaces = vault_candidates(rest, args)?;
@@ -1258,6 +1335,21 @@ async fn vault_locate(rest: &Rest, args: &JsonObject) -> Result<Value, Fail> {
         }
     }
 }
+
+/// Открытые поля окружения из аргументов `set` (`purpose`, `address`, `limits`, `notes`):
+/// только заданные; пределы проверяет REST.
+fn vault_env_fields(args: &JsonObject) -> Result<serde_json::Map<String, Value>, Fail> {
+    let mut out = serde_json::Map::new();
+    for k in VAULT_ENV_FIELDS {
+        if let Some(v) = opt_str(args, k)? {
+            out.insert(k.into(), json!(v));
+        }
+    }
+    Ok(out)
+}
+
+/// Открытые поля окружения, которые принимает `memory_vault set`.
+const VAULT_ENV_FIELDS: [&str; 4] = ["purpose", "address", "limits", "notes"];
 
 fn vault_meta_line(m: &Value) -> String {
     format!(
@@ -1320,38 +1412,82 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
                     v["title"].as_str().unwrap_or(""),
                     v["data"]["type"].as_str().unwrap_or("?")
                 );
-                for k in ["username", "url"] {
+                for k in zam_store::VAULT_OPEN_FIELDS {
                     if let Some(x) = v["data"][k].as_str() {
                         s.push_str(&format!("\n{k}: {x}"));
                     }
                 }
-                s.push_str(&format!("\nvalue: {}", v["secret"].as_str().unwrap_or("")));
+                // у записей окружения значение необязательно: нет — строки `value` нет
+                if let Some(x) = v["secret"].as_str() {
+                    s.push_str(&format!("\nvalue: {x}"));
+                }
                 s
             })
         }
         "set" => {
-            let value =
-                opt_str(args, "value")?.ok_or_else(|| Fail::Invalid("set: нужен value".into()))?;
+            let value = opt_str(args, "value")?;
             let name = req_str(args, "name")?.trim().to_string();
+            let kind = opt_str(args, "type")?;
+            let fields = vault_env_fields(args)?;
             let (space, _) = vault_space(rest, args)?;
             // только точное имя: DB_PASS и db_pass — разные секреты
             let same = vault_named(rest, &space, &name).await?;
             let r = match exact(&same, &name) {
                 Some(m) => {
                     let id = m["id"].as_str().unwrap_or("").to_string();
-                    let body = json!({ "secret": value });
+                    let mut body = json!({});
+                    if let Some(v) = value {
+                        body["secret"] = json!(v);
+                    }
+                    // PATCH заменяет `data` целиком: заданные поля сливаются с прежними
+                    if kind.is_some() || !fields.is_empty() {
+                        let mut data = m["data"].as_object().cloned().unwrap_or_default();
+                        if let Some(k) = kind {
+                            data.insert("type".into(), json!(k));
+                        }
+                        data.extend(fields);
+                        body["data"] = Value::Object(data);
+                    }
+                    if body.as_object().is_some_and(|o| o.is_empty()) {
+                        return Err(Fail::Invalid(
+                            "set: нечего менять — нужен value или открытые поля".into(),
+                        ));
+                    }
+                    // `data` слита с прочитанной ревизией: правка с `If-Match`, иначе чужая
+                    // правка между чтением и записью молча потерялась бы
+                    let guard: Vec<(HeaderName, String)> =
+                        m["rev"].as_i64().map(if_match).into_iter().collect();
                     call_rest(
                         rest,
                         Method::PATCH,
                         &format!("/api/v1/vault/{}", enc(&id)),
                         Some(&body),
-                        &[],
+                        &guard,
                     )
-                    .await?
+                    .await
+                    .map_err(|e| match e {
+                        Fail::Rest { ref reply, .. } if reply.status == StatusCode::CONFLICT => e
+                            .hint(
+                                "Запись изменилась, пока шла правка: повторите memory_vault set.",
+                            ),
+                        e => e,
+                    })?
                 }
                 None => {
-                    let kind = opt_str(args, "type")?.unwrap_or("password");
-                    let body = json!({ "title": name, "data": { "type": kind }, "secret": value });
+                    let kind = kind.unwrap_or("password");
+                    if value.is_none() && !zam_store::VAULT_ENV_TYPES.contains(&kind) {
+                        return Err(Fail::Invalid(
+                            "set: нужен value (без значения — только type host или environment)"
+                                .into(),
+                        ));
+                    }
+                    let mut data = serde_json::Map::new();
+                    data.insert("type".into(), json!(kind));
+                    data.extend(fields);
+                    let mut body = json!({ "title": name, "data": data });
+                    if let Some(v) = value {
+                        body["secret"] = json!(v);
+                    }
                     call_rest(
                         rest,
                         Method::POST,
@@ -1398,6 +1534,33 @@ mod tests {
         let s = with_tokens("Ничего не найдено.".into());
         let last = s.rsplit('\n').next().unwrap();
         assert!(last.starts_with('~') && last.ends_with(" tok"), "{s}");
+    }
+
+    /// Буквы ссылок M4.5 (`t:` term, `k:` task, `q:` question) — как `i:|c:|r:|e:`
+    /// (спецификация M4.5 §1.3); строка записи печатает букву своего вида.
+    #[test]
+    fn entry_ref_letters() {
+        for p in ["i", "c", "r", "t", "k", "q", "e", "entry"] {
+            assert_eq!(entry_id(&format!("{p}:01ABC")), "01ABC", "{p}");
+        }
+        for p in ["i", "c", "r", "t", "k", "q"] {
+            assert_eq!(graph_ref(&format!("{p}:01ABC")), "e:01ABC", "{p}");
+        }
+        assert_eq!(graph_ref("e:01ABC"), "e:01ABC");
+        assert_eq!(graph_ref("knowledge:/a"), "knowledge:/a");
+        for (kind, letter) in [
+            ("term", "t"),
+            ("task", "k"),
+            ("question", "q"),
+            ("insight", "i"),
+        ] {
+            let line = entry_line(&json!({"id": "01ABC", "kind": kind, "title": "x", "rev": 1}));
+            assert!(
+                line.starts_with(&format!("{letter}:01ABC {kind}")),
+                "{line}"
+            );
+        }
+        assert!(entry_line(&json!({"id": "01ABC", "kind": "?", "rev": 1})).starts_with("e:01ABC"));
     }
 
     #[test]

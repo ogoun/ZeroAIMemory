@@ -1,8 +1,11 @@
 //! Insights (§7.5, §10.3, §12): создание с дедупликацией, замещение, отзыв, пересмотр,
-//! триггеры. Правила `certainty` ([`crate::certainty`]) проверяет хранилище в транзакции
-//! каждой операции: без `certainty` insight агента — `hypothesis`, человека — без статуса;
-//! `axiom` ставит любой автор (агент — по прямому указанию пользователя, §14.2), `theorem`
-//! агента — только с `data.evidence {checked, method, result}` (422).
+//! триггеры. С M4.5 тем же путём идут термины словаря (`kind: "term"`, §2): `data` по
+//! правилам [`zam_store::TermData`], без дедупликации и триггеров, статус только `active`,
+//! конфликт имени или псевдонима — 409 `/problems/term-conflict`; замещение и отзыв — те же
+//! операции ([`supersede`], [`retract`]). Правила `certainty` ([`crate::certainty`]) проверяет
+//! хранилище в транзакции каждой операции: без `certainty` insight агента — `hypothesis`, человека
+//! — без статуса; `axiom` ставит любой автор (агент — по прямому указанию пользователя, §14.2),
+//! `theorem` агента — только с `data.evidence {checked, method, result}` (422).
 //!
 //! **Создание** — `POST /spaces/{space}/entries` с `kind: "insight"` ([`create`]):
 //! - поля §7.5: `title`, `body`, `data {kind, experiment?, evidence?, …}` (`data.kind` — один
@@ -25,6 +28,11 @@
 //!   саму себя) — хранилище вернёт ту же запись (200) или 422 при другом содержимом;
 //! - `supersedes_id` — замещение этой записи ([`zam_store::supersede_entry`]).
 //!
+//! - решение `decision` (M4.5, §5.1): `data.decision` (ADR-поля, [`DecisionData`]) проверяется,
+//!   неизвестный ключ — 422; запись агента (токен: создание, замещение) сверяется с действующими
+//!   аксиомами-решениями той же области (пространство записи и Knowledge) —
+//!   `warnings: ["decision_near_axiom: i:<id> «…»"]` ([`decision_warnings`]), без отказа записи;
+//!
 //! Ответ — запись, её `triggers` и `dedup` (`full` | `degraded` | `skipped` при `force`,
 //! `supersedes_id` и повторе по ключу) **[решение исполнителя]**; при замещении — ещё
 //! `superseded` (старая запись).
@@ -46,16 +54,17 @@ use serde_json::{Map, Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_index::{VectorFilter, VectorScope};
 use zam_store::{
-    Certainty, DEDUP_CANDIDATES_MAX, Db, DedupCandidate, EdgeType, Entry, EntryKind, EntryStatus,
-    NewEntry, NewTrigger, REASON_MAX_CHARS, SpaceKind, TRIGGERS_MAX, create_entry,
-    entry_by_idempotency_key, entry_triggers, get_entry, normalize_area, retract_entry,
-    supersede_entry, title_duplicates, validate_trigger,
+    AnswerBy, Certainty, DEDUP_CANDIDATES_MAX, Db, DedupCandidate, EdgeType, Entry, EntryKind,
+    EntryStatus, NewEntry, NewTrigger, REASON_MAX_CHARS, SpaceKind, TRIGGERS_MAX, check_term,
+    create_entry, entry_by_idempotency_key, entry_triggers, get_entry, normalize_area,
+    retract_entry, supersede_entry, title_duplicates, validate_trigger,
 };
 
 use super::entries::{
     audit_details, check_size, check_title, empty_object, idempotency_key, optional_if_match,
     unprocessable,
 };
+use super::glossary::{alias_warnings, attach_warnings};
 use super::graph::insight_links;
 use super::json_body;
 use super::nodes::audit_node;
@@ -84,7 +93,7 @@ const DEDUP_NEAREST: usize = 20;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InsightReq {
-    /// В `POST /spaces/{space}/entries` — `insight`; в `/supersede` необязателен.
+    /// В `POST /spaces/{space}/entries` — `insight` или `term`; в `/supersede` необязателен.
     #[serde(default)]
     kind: Option<EntryKind>,
     title: String,
@@ -107,10 +116,13 @@ pub struct InsightReq {
     supersedes_id: Option<String>,
     /// Явные связи графа `[{type, target}]`.
     links: Option<Vec<Value>>,
+    /// Ссылки на файлы `{files: [{path, hash?, commit?}]}` (M4.5 §6.1, [`super::files`]).
+    refs: Option<Value>,
 }
 
 /// `data` insight: `kind` из [`INSIGHT_KINDS`]; `experiment` и `evidence`, если заданы, —
-/// объекты; `experiment.result` — `confirmed | refuted | inconclusive`.
+/// объекты; `experiment.result` — `confirmed | refuted | inconclusive`; у `decision` —
+/// `decision` по правилам [`DecisionData`].
 pub fn check_insight_data(data: &Value) -> Result<(), ApiError> {
     let o = data
         .as_object()
@@ -138,7 +150,108 @@ pub fn check_insight_data(data: &Value) -> Result<(), ApiError> {
             EXPERIMENT_RESULTS.join(", ")
         )));
     }
+    // ADR-поля — только у решений
+    if kind == Some("decision")
+        && let Some(d) = o.get("decision").filter(|d| !d.is_null())
+    {
+        DecisionData::parse(d)?;
+    }
     Ok(())
+}
+
+/// Предел длины строк `data.decision` (символов).
+const DECISION_TEXT_MAX: usize = 2000;
+/// Вариантов в `data.decision.options`.
+const DECISION_OPTIONS_MAX: usize = 8;
+/// Ключи `data.decision` (ADR, спецификация M4.5 §5.1).
+const DECISION_KEYS: [&str; 7] = [
+    "context",
+    "options",
+    "chosen",
+    "rationale",
+    "consequences",
+    "decided_by",
+    "revisit_if",
+];
+/// Близких аксиом в `warnings` (спецификация M4.5 §5.1).
+const NEAR_AXIOMS_MAX: usize = 3;
+
+/// ADR-поля решения (`data.decision` у insight `decision`, спецификация M4.5 §5.1); все
+/// необязательны, строки — до [`DECISION_TEXT_MAX`] символов, вариантов — до 8.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionData {
+    pub context: Option<String>,
+    pub options: Vec<String>,
+    pub chosen: Option<String>,
+    pub rationale: Option<String>,
+    pub consequences: Option<String>,
+    pub decided_by: Option<AnswerBy>,
+    pub revisit_if: Option<String>,
+}
+
+impl DecisionData {
+    /// Разбор и проверка `data.decision`; ошибка — 422 `data.decision.<ключ>: …`.
+    pub fn parse(v: &Value) -> Result<DecisionData, ApiError> {
+        let o = v
+            .as_object()
+            .ok_or_else(|| unprocessable("data.decision: ожидается объект"))?;
+        if let Some(k) = o.keys().find(|k| !DECISION_KEYS.contains(&k.as_str())) {
+            return Err(unprocessable(format!(
+                "data.decision.{k}: неизвестное поле"
+            )));
+        }
+        let text = |k: &str, v: &Value| -> Result<String, ApiError> {
+            let s = v
+                .as_str()
+                .ok_or_else(|| unprocessable(format!("data.decision.{k}: ожидается строка")))?;
+            if s.chars().count() > DECISION_TEXT_MAX {
+                return Err(unprocessable(format!(
+                    "data.decision.{k}: не длиннее {DECISION_TEXT_MAX} символов"
+                )));
+            }
+            Ok(s.to_string())
+        };
+        let opt = |k: &str| -> Result<Option<String>, ApiError> {
+            o.get(k)
+                .filter(|v| !v.is_null())
+                .map(|v| text(k, v))
+                .transpose()
+        };
+        let options = match o.get("options").filter(|v| !v.is_null()) {
+            None => Vec::new(),
+            Some(Value::Array(a)) => {
+                if a.len() > DECISION_OPTIONS_MAX {
+                    return Err(unprocessable(format!(
+                        "data.decision.options: не больше {DECISION_OPTIONS_MAX} вариантов"
+                    )));
+                }
+                a.iter()
+                    .map(|v| text("options", v))
+                    .collect::<Result<_, _>>()?
+            }
+            Some(_) => {
+                return Err(unprocessable(
+                    "data.decision.options: ожидается массив строк",
+                ));
+            }
+        };
+        let decided_by = match o.get("decided_by").filter(|v| !v.is_null()) {
+            None => None,
+            Some(v) => Some(
+                serde_json::from_value::<AnswerBy>(v.clone())
+                    .map_err(|_| unprocessable("data.decision.decided_by: human или agent"))?,
+            ),
+        };
+        Ok(DecisionData {
+            context: opt("context")?,
+            options,
+            chosen: opt("chosen")?,
+            rationale: opt("rationale")?,
+            consequences: opt("consequences")?,
+            decided_by,
+            revisit_if: opt("revisit_if")?,
+        })
+    }
 }
 
 /// Сырые триггеры → проверенные: не больше [`TRIGGERS_MAX`]; ошибка — 422 `triggers[i]: …`.
@@ -162,12 +275,18 @@ pub fn parse_triggers(raw: Vec<Value>) -> Result<Vec<NewTrigger>, ApiError> {
         .collect()
 }
 
-/// Статус новой записи: только `active` или `revisit`.
-fn check_new_status(s: Option<EntryStatus>) -> Result<(), ApiError> {
-    match s {
-        None | Some(EntryStatus::Active | EntryStatus::Revisit) => Ok(()),
-        Some(s) => Err(unprocessable(format!(
-            "status: новая запись — active или revisit, не {} (замещение и отзыв — отдельные операции)",
+/// Статус новой записи: insight — `active` или `revisit`, term — только `active`.
+fn check_new_status(kind: EntryKind, s: Option<EntryStatus>) -> Result<(), ApiError> {
+    match (kind, s) {
+        (_, None) | (_, Some(EntryStatus::Active)) => Ok(()),
+        (EntryKind::Insight, Some(EntryStatus::Revisit)) => Ok(()),
+        (_, Some(s)) => Err(unprocessable(format!(
+            "status: новая запись — {}, не {} (замещение и отзыв — отдельные операции)",
+            if kind == EntryKind::Term {
+                "active"
+            } else {
+                "active или revisit"
+            },
             s.as_str()
         ))),
     }
@@ -196,7 +315,8 @@ impl DedupMode {
 
 /// Кандидаты в дубли нового insight в пространстве `space` базы `db` (владелец `owner`)
 /// области `area` и режим проверки (см. модуль). Сбой эмбеддинга или индекса — WARN
-/// (без текста записи) и `Degraded`, а не ошибка.
+/// (без текста записи) и `Degraded`, а не ошибка. Третье значение — dense-вектор запроса
+/// (при `Full`), его повторно использует проверка близких аксиом.
 pub async fn dedup(
     st: &AppState,
     db: &Db,
@@ -205,7 +325,7 @@ pub async fn dedup(
     title: &str,
     body: &str,
     area: Option<&str>,
-) -> Result<(Vec<DedupCandidate>, DedupMode), ApiError> {
+) -> Result<(Vec<DedupCandidate>, DedupMode, Option<Vec<f32>>), ApiError> {
     let area = normalize_area(area);
     let mut out = title_duplicates(db, space, title, area.as_deref()).await?;
     let (Ok(()), Some(emb), Some(vector)) = (
@@ -213,21 +333,21 @@ pub async fn dedup(
         st.index.embedder.clone(),
         st.index.vector.clone(),
     ) else {
-        return Ok((out, DedupMode::Degraded));
+        return Ok((out, DedupMode::Degraded, None));
     };
     let text = format!("{}\n{body}", title.trim());
     let e = match tokio::task::spawn_blocking(move || emb.embed_query(&text)).await {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "эмбеддинг insight для дедупликации не удался: только заголовок");
-            return Ok((out, DedupMode::Degraded));
+            return Ok((out, DedupMode::Degraded, None));
         }
         Err(j) => {
             tracing::error!(
                 panic = j.is_panic(),
                 "эмбеддинг insight для дедупликации аварийно завершился"
             );
-            return Ok((out, DedupMode::Degraded));
+            return Ok((out, DedupMode::Degraded, None));
         }
     };
     let filter = VectorFilter {
@@ -244,7 +364,7 @@ pub async fn dedup(
         Ok(h) => h,
         Err(err) => {
             tracing::warn!(error = %err, "векторный поиск дублей insight не удался: только заголовок");
-            return Ok((out, DedupMode::Degraded));
+            return Ok((out, DedupMode::Degraded, None));
         }
     };
     let threshold = st.cfg.insights.dedup_threshold;
@@ -290,7 +410,219 @@ pub async fn dedup(
         });
     }
     out.truncate(DEDUP_CANDIDATES_MAX);
-    Ok((out, DedupMode::Full))
+    Ok((out, DedupMode::Full, Some(e.dense)))
+}
+
+/// База, пространство и владелец, где ищутся близкие аксиомы.
+struct AxiomScope<'a> {
+    db: &'a Db,
+    owner: Id,
+    space: Id,
+}
+
+/// Запись — действующая аксиома-решение области `area` (не `skip`)?
+fn is_live_axiom_decision(e: &Entry, area: &Option<String>, skip: Id) -> bool {
+    e.id != skip
+        && e.deleted_at.is_none()
+        && e.kind == EntryKind::Insight
+        && e.certainty == Some(Certainty::Axiom)
+        && matches!(e.status, Some(EntryStatus::Active | EntryStatus::Revisit))
+        && e.data.get("kind").and_then(Value::as_str) == Some("decision")
+        && &e.area == area
+}
+
+/// Близкие аксиомы нового решения агента (спецификация M4.5 §5.1): действующие `decision` с
+/// `certainty: axiom` той же области в пространстве записи и в Knowledge, до
+/// [`NEAR_AXIOMS_MAX`]: dense-косинус не ниже `insights.decision_conflict_threshold` или тот же
+/// нормализованный заголовок. Ответ — `warnings`; без модели или при сбое векторного канала —
+/// только заголовок и `decision_check: degraded`. Запись не отклоняется и сбоем проверки не
+/// падает (WARN без текста). Не агент (человек в WebUI) проверки не проходит. `new_id` —
+/// только что записанное решение, самого себя оно не находит.
+#[allow(clippy::too_many_arguments)]
+async fn decision_warnings(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    base: (&Db, Id, Id),
+    new_id: Id,
+    title: &str,
+    body: &str,
+    area: Option<&str>,
+    dense: Option<Vec<f32>>,
+) -> Vec<String> {
+    if p.is_human() {
+        return Vec::new();
+    }
+    let knowledge = space_scope(st, p, headers, "knowledge", Mode::Read)
+        .await
+        .ok();
+    let mut scopes = vec![AxiomScope {
+        db: base.0,
+        owner: base.1,
+        space: base.2,
+    }];
+    if let Some(k) = &knowledge
+        && k.space.id != base.2
+    {
+        scopes.push(AxiomScope {
+            db: &k.db,
+            owner: k.owner,
+            space: k.space.id,
+        });
+    }
+    let area = normalize_area(area);
+    // кандидаты: id → (заголовок, оценка); совпадение заголовка — оценка 1
+    let mut found: HashMap<Id, (String, f32)> = HashMap::new();
+    let mut degraded = false;
+    for s in &scopes {
+        match title_duplicates(s.db, s.space, title, area.as_deref()).await {
+            Ok(c) => {
+                for c in c
+                    .into_iter()
+                    .filter(|c| c.certainty == Some(Certainty::Axiom))
+                {
+                    if let Ok(e) = get_entry(s.db, c.id).await
+                        && is_live_axiom_decision(&e, &area, new_id)
+                    {
+                        found.insert(e.id, (e.title, 1.0));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "проверка близких аксиом: заголовки не прочитаны");
+                degraded = true;
+            }
+        }
+    }
+    match decision_vector(st, &scopes, title, body, area.as_deref(), dense).await {
+        Some(hits) => {
+            let threshold = st.cfg.insights.decision_conflict_threshold;
+            // лучшая оценка на запись (у записи несколько чанков)
+            let mut best: HashMap<Id, f32> = HashMap::new();
+            for (id, score) in hits.into_iter().filter(|h| h.1 >= threshold) {
+                let s = best.entry(id).or_insert(score);
+                *s = s.max(score);
+            }
+            for (id, score) in best {
+                if found.contains_key(&id) {
+                    continue;
+                }
+                // источник истины — SQLite: точка могла пережить правку или удаление
+                for s in &scopes {
+                    if let Ok(e) = get_entry(s.db, id).await
+                        && e.space_id == s.space
+                        && is_live_axiom_decision(&e, &area, new_id)
+                    {
+                        found.insert(e.id, (e.title, score));
+                        break;
+                    }
+                }
+            }
+        }
+        None => degraded = true,
+    }
+    let mut ranked: Vec<(Id, String, f32)> =
+        found.into_iter().map(|(id, (t, s))| (id, t, s)).collect();
+    ranked.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+    let mut out: Vec<String> = ranked
+        .into_iter()
+        .take(NEAR_AXIOMS_MAX)
+        .map(|(id, t, _)| format!("decision_near_axiom: i:{id} «{t}»"))
+        .collect();
+    if degraded {
+        out.push("decision_check: degraded".into());
+    }
+    out
+}
+
+/// Дописывает в `warnings` ответа `v` близкие аксиомы, если `e` — решение (`data.kind`).
+async fn attach_decision_warnings(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    base: (&Db, Id, Id),
+    e: &Entry,
+    dense: Option<Vec<f32>>,
+    v: &mut Value,
+) {
+    if e.data.get("kind").and_then(Value::as_str) != Some("decision") {
+        return;
+    }
+    let w = decision_warnings(
+        st,
+        p,
+        headers,
+        base,
+        e.id,
+        &e.title,
+        &e.body,
+        e.area.as_deref(),
+        dense,
+    )
+    .await;
+    attach_warnings(v, w);
+}
+
+/// Ближайшие аксиомы-решения по dense-косинусу: `(id записи, оценка)`; `None` — векторный канал
+/// недоступен или не удался (WARN без текста записи).
+async fn decision_vector(
+    st: &AppState,
+    scopes: &[AxiomScope<'_>],
+    title: &str,
+    body: &str,
+    area: Option<&str>,
+    dense: Option<Vec<f32>>,
+) -> Option<Vec<(Id, f32)>> {
+    st.index.vector_available().ok()?;
+    let (emb, vector) = (st.index.embedder.clone()?, st.index.vector.clone()?);
+    // вектор дедупликации (тот же текст) берётся повторно: один `embed_query` на запись
+    let dense = match dense {
+        Some(d) => d,
+        None => {
+            let text = format!("{}\n{body}", title.trim());
+            match tokio::task::spawn_blocking(move || emb.embed_query(&text)).await {
+                Ok(Ok(e)) => e.dense,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "эмбеддинг решения для проверки аксиом не удался");
+                    return None;
+                }
+                Err(j) => {
+                    tracing::error!(
+                        panic = j.is_panic(),
+                        "эмбеддинг решения для проверки аксиом аварийно завершился"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+    let filter = VectorFilter {
+        scopes: scopes
+            .iter()
+            .map(|s| VectorScope {
+                user_id: s.owner,
+                space_ids: vec![s.space],
+            })
+            .collect(),
+        kinds: vec!["insight".into()],
+        exclude_statuses: vec!["superseded".into(), "retracted".into()],
+        insight_kinds: vec!["decision".into()],
+        certainty: vec!["axiom".into()],
+        area: area.map(str::to_string),
+        ..VectorFilter::default()
+    };
+    match vector.nearest_dense(&dense, &filter, DEDUP_NEAREST).await {
+        Ok(hits) => Some(
+            hits.into_iter()
+                .filter(|h| h.target.kind == TargetKind::Entry)
+                .map(|h| (h.target.id, h.score))
+                .collect(),
+        ),
+        Err(err) => {
+            tracing::warn!(error = %err, "векторный поиск близких аксиом не удался");
+            None
+        }
+    }
 }
 
 /// Запись insight с её триггерами как JSON (`triggers` — массив, у не-insight — нет поля).
@@ -301,6 +633,7 @@ pub async fn entry_json(db: &Db, e: &Entry) -> Result<Value, ApiError> {
     {
         o.insert("triggers".into(), json!(entry_triggers(db, e.id).await?));
     }
+    super::tasks::attach_task(&mut v, e);
     Ok(v)
 }
 
@@ -336,17 +669,20 @@ async fn target_scope(
     }
 }
 
-/// Новая запись insight из тела запроса (проверенного [`check_request`]).
+/// Новая запись insight из тела запроса (проверенного [`check_request`]); `refs` — 422.
 fn new_entry(
+    kind: EntryKind,
     req: InsightReq,
     space: Id,
     key: Option<String>,
     triggers: Vec<NewTrigger>,
     links: Vec<(EdgeType, TargetRef)>,
-) -> NewEntry {
-    NewEntry {
+) -> Result<NewEntry, ApiError> {
+    let refs = super::files::refs_field(req.refs.as_ref())?;
+    Ok(NewEntry {
+        refs,
         space_id: space,
-        kind: EntryKind::Insight,
+        kind,
         title: req.title,
         body: req.body,
         data: req.data,
@@ -357,19 +693,33 @@ fn new_entry(
         idempotency_key: key,
         triggers,
         links,
-    }
+    })
 }
 
-/// Проверка полей insight (общая для создания и замещения): заголовок, `data`, размер тела,
-/// статус, триггеры.
-fn check_request(st: &AppState, req: &mut InsightReq) -> Result<Vec<NewTrigger>, ApiError> {
-    if req.kind.is_some_and(|k| k != EntryKind::Insight) {
-        return Err(unprocessable("kind: insight"));
+/// Проверка полей insight или term (общая для создания и замещения): заголовок, `data`,
+/// размер тела, статус, триггеры. У term `data` и заголовок нормализуются
+/// ([`zam_store::check_term`]), триггеров нет.
+fn check_request(
+    st: &AppState,
+    req: &mut InsightReq,
+    kind: EntryKind,
+) -> Result<Vec<NewTrigger>, ApiError> {
+    if req.kind.is_some_and(|k| k != kind) {
+        return Err(unprocessable(format!("kind: {}", kind.as_str())));
     }
-    check_title(&req.title)?;
-    check_insight_data(&req.data)?;
+    if kind == EntryKind::Term {
+        let (title, td) = check_term(&req.title, &req.data).map_err(unprocessable)?;
+        req.title = title;
+        req.data = td.to_value();
+        if req.triggers.as_ref().is_some_and(|t| !t.is_empty()) {
+            return Err(unprocessable("triggers есть только у insight"));
+        }
+    } else {
+        check_title(&req.title)?;
+        check_insight_data(&req.data)?;
+    }
     check_size(st, &req.body)?;
-    check_new_status(req.status)?;
+    check_new_status(kind, req.status)?;
     parse_triggers(req.triggers.take().unwrap_or_default())
 }
 
@@ -388,8 +738,8 @@ fn duplicate(candidates: Vec<DedupCandidate>, mode: DedupMode) -> ApiError {
     }
 }
 
-/// `POST /spaces/{space}/entries` с `kind: insight` (тело уже прочитано как JSON):
-/// 201 / 200 (повтор по ключу) / 409 possible-duplicate / 422.
+/// `POST /spaces/{space}/entries` с `kind: insight` или `term` (тело уже прочитано как
+/// JSON): 201 / 200 (повтор по ключу) / 409 possible-duplicate или term-conflict / 422.
 pub async fn create(
     st: &AppState,
     p: &Principal,
@@ -400,8 +750,9 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let mut req: InsightReq = serde_json::from_value(body)
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
+    let kind = req.kind.unwrap_or(EntryKind::Insight);
     let sc = target_scope(st, p, headers, space, req.scope.as_deref()).await?;
-    let triggers = check_request(st, &mut req)?;
+    let triggers = check_request(st, &mut req, kind)?;
     let raw_links = req.links.take().unwrap_or_default();
     let links = insight_links(
         st, p, headers, &sc.db, sc.owner, &sc.space, sc.role, raw_links,
@@ -427,12 +778,13 @@ pub async fn create(
         if o.space_id != sc.space.id && sc.owner != sc.user.id {
             return Err(ApiError::NotFound);
         }
-        if o.space_id != sc.space.id || o.kind != EntryKind::Insight {
-            return Err(unprocessable(
-                "supersedes_id: insight того же пространства, что и новая запись",
-            ));
+        if o.space_id != sc.space.id || o.kind != kind {
+            return Err(unprocessable(format!(
+                "supersedes_id: {} того же пространства, что и новая запись",
+                kind.as_str()
+            )));
         }
-        let new = new_entry(req, sc.space.id, key, triggers, links);
+        let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
         // замещение через supersedes_id: ревизия старой не сверяется (If-Match у POST
         // коллекции относился бы к новой записи) [решение исполнителя]
         let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib).await?;
@@ -447,7 +799,7 @@ pub async fn create(
                 sc.owner,
                 "entry.supersede",
                 old,
-                audit_details(sc.space.id, EntryKind::Insight),
+                audit_details(sc.space.id, kind),
             )
             .await?;
         }
@@ -455,7 +807,21 @@ pub async fn create(
         super::secrets::attach_entry(&mut v, &n);
         v["superseded"] =
             serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
-        v["dedup"] = json!(DedupMode::Skipped.as_str());
+        if kind == EntryKind::Insight {
+            v["dedup"] = json!(DedupMode::Skipped.as_str());
+            let w = alias_warnings(st, &sc.db, sc.space.id, &n.title, &n.body).await?;
+            attach_warnings(&mut v, w);
+            attach_decision_warnings(
+                st,
+                p,
+                headers,
+                (&sc.db, sc.owner, sc.space.id),
+                &n,
+                None,
+                &mut v,
+            )
+            .await;
+        }
         let status = if repeat {
             StatusCode::OK
         } else {
@@ -463,11 +829,13 @@ pub async fn create(
         };
         return Ok((status, Json(v)));
     }
-    let mode = if req.force || repeat {
+    // термины — без дедупликации: уникальность имён проверяет хранилище в транзакции записи
+    let mut dense: Option<Vec<f32>> = None;
+    let mode = if req.force || repeat || kind == EntryKind::Term {
         DedupMode::Skipped
     } else {
         let area = req.area.clone().or_else(|| attrib.area.clone());
-        let (cands, mode) = dedup(
+        let (cands, mode, vec) = dedup(
             st,
             &sc.db,
             sc.owner,
@@ -480,16 +848,33 @@ pub async fn create(
         if !cands.is_empty() {
             return Err(duplicate(cands, mode));
         }
+        dense = vec;
         mode
     };
-    let new = new_entry(req, sc.space.id, key, triggers, links);
+    let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
     let (e, created) = create_entry(&sc.db, new, &attrib).await?;
     if created {
         st.index.notify();
     }
     let mut v = entry_json(&sc.db, &e).await?;
     super::secrets::attach_entry(&mut v, &e);
-    v["dedup"] = json!(mode.as_str());
+    if kind == EntryKind::Insight {
+        v["dedup"] = json!(mode.as_str());
+        let w = alias_warnings(st, &sc.db, sc.space.id, &e.title, &e.body).await?;
+        attach_warnings(&mut v, w);
+        if created {
+            attach_decision_warnings(
+                st,
+                p,
+                headers,
+                (&sc.db, sc.owner, sc.space.id),
+                &e,
+                dense,
+                &mut v,
+            )
+            .await;
+        }
+    }
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -498,11 +883,11 @@ pub async fn create(
     Ok((status, Json(v)))
 }
 
-/// Запись по id — живой insight (иначе 404 / 422).
+/// Запись по id — живой insight или term (иначе 404 / 422).
 fn live_insight(sc: &EntryScope) -> Result<(), ApiError> {
     live_entry(sc)?;
-    if sc.entry.kind != EntryKind::Insight {
-        return Err(unprocessable("операция только для insight"));
+    if !matches!(sc.entry.kind, EntryKind::Insight | EntryKind::Term) {
+        return Err(unprocessable("операция только для insight и term"));
     }
     Ok(())
 }
@@ -527,7 +912,8 @@ pub async fn supersede(
             "scope и supersedes_id задаются замещаемой записью, а не телом",
         ));
     }
-    let triggers = check_request(&st, &mut req)?;
+    let kind = sc.entry.kind;
+    let triggers = check_request(&st, &mut req, kind)?;
     let raw_links = req.links.take().unwrap_or_default();
     let links = insight_links(
         &st, &p, &headers, &sc.db, sc.owner, &sc.space, sc.role, raw_links,
@@ -541,7 +927,7 @@ pub async fn supersede(
             .is_some(),
         None => false,
     };
-    let new = new_entry(req, sc.space.id, key, triggers, links);
+    let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
     let (n, o) = supersede_entry(&sc.db, sc.entry.id, rev, new, &attrib).await?;
     st.index.notify();
     if !repeat {
@@ -564,6 +950,22 @@ pub async fn supersede(
     };
     let mut entry = entry_json(&sc.db, &n).await?;
     super::secrets::attach_entry(&mut entry, &n);
+    if kind == EntryKind::Insight {
+        let w = alias_warnings(&st, &sc.db, sc.space.id, &n.title, &n.body).await?;
+        attach_warnings(&mut entry, w);
+        if !repeat {
+            attach_decision_warnings(
+                &st,
+                &p,
+                &headers,
+                (&sc.db, sc.owner, sc.space.id),
+                &n,
+                None,
+                &mut entry,
+            )
+            .await;
+        }
+    }
     Ok((
         status,
         Json(json!({

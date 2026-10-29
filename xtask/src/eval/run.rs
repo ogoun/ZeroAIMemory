@@ -41,7 +41,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::compare::{Comparison, compare};
+use super::compare::{Comparison, compare, compare_file};
 use super::corpus::{
     Corpus, EVAL_SOLUTION, INSIGHT_REF, Kind, Lang, Note, Query, in_solution, is_long_path,
 };
@@ -406,7 +406,7 @@ impl Session {
         })
     }
 
-    fn api(&self, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
+    pub(super) fn api(&self, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
         api(&self.base, &self.token, path, body)
     }
 
@@ -917,6 +917,9 @@ pub struct RunInfo {
     pub index_secs: f64,
     pub query_ms_p50: f64,
     pub query_ms_p95: f64,
+    /// Префикс имени файла после даты (`--prefix`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 /// Результат прогона режима.
@@ -954,6 +957,7 @@ const MEASURED_PATHS: &[&str] = &[
     "eval/grid-m3-kind.toml",
     "eval/hints.toml",
     "eval/scenarios.toml",
+    "eval/glossary.toml",
 ];
 
 /// `git <args> -- <MEASURED_PATHS>`.
@@ -1101,6 +1105,7 @@ pub fn result(
             index_secs: s.index_secs,
             query_ms_p50: quantile(&ms, 0.5),
             query_ms_p95: quantile(&ms, 0.95),
+            prefix: None,
         },
         metrics: breakdown(&runs),
         compare: None,
@@ -1175,6 +1180,7 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
         let runs = s.run_queries(queries, mode)?;
         let mut r = result(&s, p, corpus, queries, mode, label.as_deref(), runs);
         r.split = split.clone();
+        r.info.prefix = a.prefix.clone();
         results.push(r);
     }
     s.stop()?;
@@ -1204,8 +1210,8 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
     }
     let mut failed = Vec::new();
     for mut r in results {
-        if let Some(prev) = &a.compare {
-            r.compare = Some(compare(&p.repo, prev, &r)?);
+        if let Some(prev) = compare_file(&a.compare, r.info.mode)? {
+            r.compare = Some(compare(&p.repo, &prev, &r)?);
         }
         let (json, md) = report::write_run(&p.results, &r)?;
         report::print_run(&r);
@@ -1307,12 +1313,20 @@ mod tests {
                 index_secs: 0.0,
                 query_ms_p50: 0.0,
                 query_ms_p95: 0.0,
+                prefix: None,
             },
             metrics: breakdown(&[]),
             compare: None,
             split: None,
             queries: Vec::new(),
         };
+        // имя файла: префикс `--prefix` — сразу после даты (fix round 1 задачи 15 M4.5)
+        r.info.date = "2026-10-29".into();
+        r.info.model = Some("bge-m3-fp16".into());
+        r.info.label = Some("x".into());
+        assert_eq!(report::file_stem(&r), "2026-10-29-bge-m3-fp16-hybrid-x");
+        r.info.prefix = Some("m45".into());
+        assert_eq!(report::file_stem(&r), "2026-10-29-m45-bge-m3-fp16-hybrid-x");
         // нет запросов superseded — контроля нет
         assert!(history_control(&r).is_none());
         r.metrics.cancelled5_history = Some(est(0.0));

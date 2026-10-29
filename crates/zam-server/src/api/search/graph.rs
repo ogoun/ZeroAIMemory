@@ -14,10 +14,11 @@
 //! - Сбой чтения базы чужого решения исключает решение ([`Health::soft`]).
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use zam_core::{TargetKind, TargetRef};
+use zam_core::{Id, TargetKind, TargetRef};
+use zam_search::order_contradicted;
 use zam_store::{
-    ChunkScope, EdgeType, FtsHit, GraphStore, TargetFilter, count_tokens, first_leaves,
-    live_chunks, text_snippet,
+    Certainty, ChunkScope, EdgeType, EntryStatus, FtsHit, GraphStore, TargetFilter, count_tokens,
+    first_leaves, live_chunks, text_snippet,
 };
 
 use super::{Health, Item};
@@ -166,14 +167,153 @@ pub(super) async fn expand_graph(
                 via: Some(c.via),
                 folder: None,
                 seen: false,
+                stale_refs: Vec::new(),
             }
         })
         .collect())
 }
 
+/// Надёжность для порядка по `contradicts`: `axiom` 3, `theorem` 2, `hypothesis` 1, без
+/// `certainty` (заметка, term, task…) 0 — ниже гипотезы. Та же шкала — в проверке набора eval
+/// (`xtask/src/eval/insights.rs::reliability`).
+fn reliability(c: Option<Certainty>) -> u8 {
+    match c {
+        Some(Certainty::Axiom) => 3,
+        Some(Certainty::Theorem) => 2,
+        Some(Certainty::Hypothesis) => 1,
+        None => 0,
+    }
+}
+
+/// Пара `contradicts` переставляется: цель действует, это `theorem` или `axiom` и она строго
+/// надёжнее источника ([`reliability`]): hypothesis → theorem, hypothesis → axiom, theorem →
+/// axiom, заметка → theorem/axiom — да; axiom → axiom, theorem → theorem — нет (до задачи 15
+/// M4.5 пара «аксиома → аксиома» переставлялась).
+pub(super) fn contradicts_applies(src_rel: u8, dst_rel: u8, dst_live: bool) -> bool {
+    dst_live && dst_rel >= reliability(Some(Certainty::Theorem)) && dst_rel > src_rel
+}
+
+/// Порядок по `contradicts` (M4.5, §5.2): элемент выдачи с исходящим `contradicts` к действующей
+/// записи той же выдачи, которая надёжнее его (`axiom` — любого элемента, кроме другой
+/// аксиомы; `theorem` — гипотезы или заметки), не стоит выше неё
+/// ([`zam_search::order_contradicted`]); задача 15: запрос `r-08` набора eval — гипотеза против
+/// `theorem`. Сдвинутой записи балл поднимается до балла следующего элемента, чтобы баллы не шли
+/// вразрез с порядком.
+/// Сбой чтения графа чужого решения исключает решение ([`Health::soft`]).
+pub(super) async fn order_by_contradicts(
+    health: &mut Health<'_>,
+    items: &mut Vec<Item>,
+) -> Result<(), ApiError> {
+    let targets = health.targets;
+    let mut by_db: BTreeMap<usize, Vec<TargetRef>> = BTreeMap::new();
+    for it in items.iter() {
+        if it.folder.is_none() && health.alive[it.target] {
+            let refs = by_db.entry(it.target).or_default();
+            if !refs.contains(&it.hit.target) {
+                refs.push(it.hit.target);
+            }
+        }
+    }
+    let mut pairs: Vec<(Id, Id)> = Vec::new();
+    for (ti, refs) in by_db {
+        if refs.len() < 2 {
+            continue;
+        }
+        let t = &targets[ti];
+        let r =
+            t.db.neighbors(&refs, 1, &[EdgeType::Contradicts], &t.space_ids())
+                .await;
+        let Some(g) = health.soft(ti, r)? else {
+            continue;
+        };
+        // надёжность записей подграфа; цель связи — только действующая
+        let rel: HashMap<Id, (u8, bool)> = g
+            .nodes
+            .iter()
+            .map(|n| {
+                let live = !n.deleted
+                    // у заметки статуса нет; у записи — только действующая
+                    && matches!(
+                        n.status,
+                        None | Some(EntryStatus::Active | EntryStatus::Revisit)
+                    );
+                (n.r.id, (reliability(n.certainty), live))
+            })
+            .collect();
+        for e in &g.edges {
+            if e.kind != EdgeType::Contradicts {
+                continue;
+            }
+            let src = rel.get(&e.src.id).map_or(0, |r| r.0);
+            if let Some(d) = e.dst
+                && let Some(&(dst, live)) = rel.get(&d.id)
+                && contradicts_applies(src, dst, live)
+                && refs.contains(&e.src)
+                && refs.contains(&d)
+            {
+                pairs.push((e.src.id, d.id));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    if order_contradicted(items, |it| it.hit.target.id, &pairs) > 0 {
+        let moved: HashSet<Id> = pairs.iter().map(|p| p.1).collect();
+        for i in (0..items.len().saturating_sub(1)).rev() {
+            let next = items[i + 1].score;
+            if moved.contains(&items[i].hit.target.id) && items[i].score < next {
+                items[i].score = next;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contradicts_rule_table() {
+        let r = |c: Option<Certainty>| reliability(c);
+        let (h, t, a) = (
+            r(Some(Certainty::Hypothesis)),
+            r(Some(Certainty::Theorem)),
+            r(Some(Certainty::Axiom)),
+        );
+        let note = r(None);
+        // (источник, цель, цель действует, переставляется)
+        let cases = [
+            ("hypothesis → theorem", h, t, true, true),
+            ("hypothesis → axiom", h, a, true, true),
+            ("theorem → axiom", t, a, true, true),
+            ("заметка → theorem", note, t, true, true),
+            ("заметка → axiom", note, a, true, true),
+            ("axiom → axiom", a, a, true, false),
+            ("theorem → theorem", t, t, true, false),
+            ("axiom → theorem", a, t, true, false),
+            ("theorem → hypothesis", t, h, true, false),
+            ("заметка → hypothesis", note, h, true, false),
+            (
+                "hypothesis → замещённая/отозванная axiom",
+                h,
+                a,
+                false,
+                false,
+            ),
+            (
+                "hypothesis → замещённая/отозванная theorem",
+                h,
+                t,
+                false,
+                false,
+            ),
+        ];
+        for (name, src, dst, live, want) in cases {
+            assert_eq!(contradicts_applies(src, dst, live), want, "{name}");
+        }
+    }
 
     #[test]
     fn certainty_order() {

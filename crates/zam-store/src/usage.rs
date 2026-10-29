@@ -41,6 +41,8 @@ pub enum UsageSource {
     Prompt,
     PreTool,
     PostTool,
+    /// Пакет под задачу `/recall` `event: brief` (M4.5 §9.4; в `usage.source` нет CHECK).
+    Brief,
     Agent,
     Webui,
 }
@@ -52,6 +54,7 @@ impl UsageSource {
             UsageSource::Prompt => "prompt",
             UsageSource::PreTool => "pre_tool",
             UsageSource::PostTool => "post_tool",
+            UsageSource::Brief => "brief",
             UsageSource::Agent => "agent",
             UsageSource::Webui => "webui",
         }

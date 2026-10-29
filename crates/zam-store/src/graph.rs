@@ -17,6 +17,11 @@
 //! нескольких заметках с одним именем побеждает первая по пути — как в рендере. Относительные
 //! Markdown-ссылки перенесённой заметки пересчитываются от её нового места.
 //!
+//! **Термины словаря** (M4.5 §2.2): `[[Имя]]` без заметки с таким именем разрешается в
+//! действующий термин пространства по имени или псевдониму — ребро ведёт к записи
+//! (`dst_kind = entry`, [`crate::links::resolve_target`]). Любая запись `term` перепроверяет
+//! такие рёбра пространства ([`terms_changed`]).
+//!
 //! **Видимость** (`spaces` в чтениях): ребро видно, если пространство источника и цели входят в
 //! область, а оба конца живы (узел или запись не удалены); удалённый источник прячет свои рёбра
 //! (и обратные ссылки), восстановление возвращает их. Неразрешённые ссылки отдаёт только
@@ -41,7 +46,7 @@ use zam_markdown::{Doc, LinkKind};
 
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::entries::{Certainty, EntryStatus};
-use crate::links::{self, keys_of, link_key, parse_relation, resolve_key};
+use crate::links::{self, keys_of, link_key, parse_relation, resolve_target};
 use crate::nodes::{Attribution, AuthorKind};
 use crate::time::{fmt_ts, ts_at};
 use crate::{Db, StoreError};
@@ -71,11 +76,14 @@ pub enum EdgeType {
     Supersedes,
     DerivedFrom,
     Mentions,
+    /// Несогласие с записью (спецификация M4.5 §5.2): явный тип — `POST /edges`, `links`
+    /// записи, `relations:` заметки.
+    Contradicts,
 }
 
 impl EdgeType {
-    /// Все типы в порядке §8.5.
-    pub const ALL: [EdgeType; 9] = [
+    /// Все типы в порядке §8.5 (с M4.5 — и `contradicts`).
+    pub const ALL: [EdgeType; 10] = [
         EdgeType::LinksTo,
         EdgeType::RelatesTo,
         EdgeType::DependsOn,
@@ -85,6 +93,7 @@ impl EdgeType {
         EdgeType::Supersedes,
         EdgeType::DerivedFrom,
         EdgeType::Mentions,
+        EdgeType::Contradicts,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -98,6 +107,7 @@ impl EdgeType {
             EdgeType::Supersedes => "supersedes",
             EdgeType::DerivedFrom => "derived_from",
             EdgeType::Mentions => "mentions",
+            EdgeType::Contradicts => "contradicts",
         }
     }
 
@@ -835,15 +845,7 @@ pub(crate) fn rebuild_derived(
         id: node_id,
     };
     for (kind, origin, key, anchor) in derived_links(&path, doc) {
-        let dst = resolve_key(c, space, &key)?.map(|id| {
-            (
-                TargetRef {
-                    kind: TargetKind::Node,
-                    id,
-                },
-                space,
-            )
-        });
+        let dst = resolve_target(c, space, &key)?.map(|t| (t, space));
         insert_edge(
             c,
             src,
@@ -916,19 +918,53 @@ pub(crate) fn tree_changed(
         )?
         .collect::<Result<_, _>>()?
     };
+    re_resolve(c, space, cands)
+}
+
+/// Пересчитывает цели выведенных рёбер `(id ребра, ключ, текущая цель)` пространства `space`:
+/// заметка или, для `[[Имя]]`, термин словаря ([`resolve_target`]).
+fn re_resolve(
+    c: &Connection,
+    space: Id,
+    cands: Vec<(Id, String, Option<Id>)>,
+) -> Result<(), StoreError> {
     let mut upd = c.prepare_cached(
-        "UPDATE edges SET dst_kind = CASE WHEN ?2 IS NULL THEN NULL ELSE 'node' END,
-                          dst_id = ?2,
-                          dst_space_id = CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END
+        "UPDATE edges SET dst_kind = ?2, dst_id = ?3,
+                          dst_space_id = CASE WHEN ?3 IS NULL THEN NULL ELSE ?4 END
          WHERE id = ?1",
     )?;
     for (id, raw, cur) in cands {
-        let new = resolve_key(c, space, &raw)?;
-        if new != cur {
-            upd.execute(params![id, new, space])?;
+        let new = resolve_target(c, space, &raw)?;
+        if new.map(|t| t.id) != cur {
+            upd.execute(params![
+                id,
+                new.map(|t| kind_str(t.kind)),
+                new.map(|t| t.id),
+                space
+            ])?;
         }
     }
     Ok(())
+}
+
+/// Термин пространства `space` записан, изменён, замещён, отозван, удалён или восстановлен
+/// (в той же транзакции): `[[Имя]]` выведенных рёбер заметок пространства, не нашедшие
+/// заметку, разрешаются заново — ожидающая ссылка находит термин, ссылка на выбывший термин
+/// становится неразрешённой или переходит к его преемнику. Рёбра удалённых источников
+/// пропускаются (как в [`tree_changed`]).
+pub(crate) fn terms_changed(c: &Connection, space: Id) -> Result<(), StoreError> {
+    let cands: Vec<(Id, String, Option<Id>)> = {
+        let mut st = c.prepare_cached(
+            "SELECT e.id, e.dst_raw, e.dst_id FROM edges e
+             WHERE e.space_id = ?1 AND e.deleted_at IS NULL AND e.origin IN ('wikilink', 'frontmatter')
+               AND e.dst_raw LIKE '[[%' AND (e.dst_id IS NULL OR e.dst_kind = 'entry')
+               AND e.src_kind = 'node'
+               AND EXISTS (SELECT 1 FROM nodes s WHERE s.id = e.src_id AND s.deleted_at IS NULL)",
+        )?;
+        st.query_map([space], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    re_resolve(c, space, cands)
 }
 
 /// Перенесённая живая заметка с относительными Markdown-ссылками (ключ — путь, а не `[[…]]`):
@@ -1143,6 +1179,12 @@ mod tests {
                 format!("\"{}\"", t.as_str())
             );
         }
+        assert_eq!(EdgeType::ALL.len(), 10);
+        assert_eq!(EdgeType::parse("contradicts"), Some(EdgeType::Contradicts));
+        assert_eq!(
+            serde_json::to_string(&EdgeType::Contradicts).unwrap(),
+            "\"contradicts\""
+        );
         assert_eq!(EdgeType::parse("LinksTo"), None);
         assert_eq!(EdgeOrigin::parse("system"), Some(EdgeOrigin::System));
     }

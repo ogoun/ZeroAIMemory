@@ -10,6 +10,9 @@
   import Tree, { type Reveal, type TreeChange } from '../components/Tree.svelte';
   import ChangelogView from '../components/ChangelogView.svelte';
   import InsightsView from '../components/InsightsView.svelte';
+  import GlossaryView from '../components/GlossaryView.svelte';
+  import TasksView from '../components/TasksView.svelte';
+  import QuestionsView from '../components/QuestionsView.svelte';
   import ReleasesView from '../components/ReleasesView.svelte';
   import VaultView from '../components/VaultView.svelte';
   import RechunkBanner from '../components/RechunkBanner.svelte';
@@ -293,7 +296,8 @@
         {:else if !journalsOf(journalSpace.kind).includes(r.journal)}
           <p class="warn" role="alert">
             У пространства «{journalSpace.name}» нет журнала {JOURNAL_TITLE[r.journal]}: журналы ведутся в
-            решениях (Changelog, Releases, Insights, Vault) и в Knowledge (Insights, Vault).
+            решениях (Changelog, Releases, Insights, Словарь, Задачи, Вопросы, Vault) и в Knowledge
+            (Insights, Словарь, Задачи, Вопросы, Vault).
           </p>
         {:else if r.journal === 'changelog'}
           <ChangelogView user={r.user} space={r.space} entry={r.entry} {onexpired} />
@@ -301,6 +305,12 @@
           <ReleasesView user={r.user} space={r.space} entry={r.entry} {onexpired} />
         {:else if r.journal === 'insights'}
           <InsightsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+        {:else if r.journal === 'glossary'}
+          <GlossaryView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+        {:else if r.journal === 'tasks'}
+          <TasksView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+        {:else if r.journal === 'questions'}
+          <QuestionsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
         {:else}
           <VaultView user={r.user} space={r.space} {onexpired} />
         {/if}

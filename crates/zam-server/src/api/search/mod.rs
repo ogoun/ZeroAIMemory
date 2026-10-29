@@ -51,6 +51,20 @@
 //! недействительная — `[cache, stale: <источники>]` без текста), их текст — из
 //! `budget_tokens`; `timings.cache_ms`.
 //!
+//! **Словарь домена** (M4.5, спецификация §2.2 п. 1; [`crate::glossary`]): слова запроса
+//! сопоставляются (без регистра, многословные имена — по подряд идущим словам, не больше
+//! [`crate::glossary::MAX_GROUPS`] мест) с именами и псевдонимами действующих терминов
+//! пространств каждой цели; по ним строится дополнительный FTS-запрос — канал `alias` (источник
+//! `alias` в `sources`), где совпавшее слово заменено группой `("слово"* OR "имя"* OR …)`;
+//! псевдоним короче 3 символов ищется точным словом. Вес — `search.w_fts_alias` (0,5; 0 выключает
+//! канал и расширение), ослабленный `alias` при векторном канале — не выше `w_fts_relaxed`.
+//! Векторный канал, trigram, ключ кэша выжимок (`scope_hash` + `query_norm`) не меняются;
+//! `QUERY_MAX_CHARS` проверяется по исходному тексту. Ответ несёт `expanded: [{term, word,
+//! with}]`. Умолчания видов: к `note`, `insight`, `changelog`, `release` добавлены `term` и
+//! `question` (статус `answered`); открытые вопросы и задачи — только явным `filters.kinds`
+//! ([`default_statuses`]: фильтр статусов общий для FTS и `must_not` Qdrant, поэтому согласован
+//! в обоих каналах); `include_history` снимает фильтр статусов у всех видов.
+//!
 //! **Алгоритм** (§9.2):
 //! 1. Параллельно: каналы FTS по каждой цели в пределах её пространств (базы — параллельно,
 //!    затем [`merge::merge_channels`] по сырому баллу FTS5) и — если векторный канал доступен
@@ -83,8 +97,9 @@
 //!    применяются; решение владельца 2026-10-26), затем то же деление при переполнении
 //!    ([`zam_search::overflow_divisor`]); хвост остаётся в порядке слияния; лимит на узел
 //!    после перестановки соблюдается (набор тот же). Реранкер — по устройству эмбеддера,
-//!    грузится при первом таком запросе (`spawn_blocking`). Нет модели — ответ без реранка и `warnings: ["reranker not
-//!    installed"]`; ошибка или паника загрузки и инференса — `["reranker failed"]`, не 500.
+//!    грузится при первом таком запросе (`spawn_blocking`). Нет модели — ответ без реранка и
+//!    `warnings: ["reranker not installed"]`; ошибка или паника загрузки и инференса — `["reranker
+//!    failed"]`, не 500.
 //! 5. `top_k` (в `notes` — узлов), `expand` (`graph` — соседи после `top_k`), упаковка в
 //!    `budget_tokens`.
 //!
@@ -123,14 +138,19 @@
 //! решения (своего или чужого), `path`, `heading_path`,
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
-//! полного текста чанка, `updated_at`, `kind` (`note` или вид записи), `snippet` | `l0`,
+//! полного текста чанка, `updated_at`, `age_days` (M4.5 §7: целые сутки от `updated_at`, у
+//! заметки с `verified_at` — от более позднего), `kind` (`note` или вид записи), `snippet` | `l0`,
 //! `text`, `rerank_score` 0..1 — сырой балл реранкера у переставленных им (их `score` — он
 //! же с бустами), `via {type, from}` — у соседей
 //! `expand=graph`), `degraded`, `degraded_reason`
 //! и `degraded_text` (или `null`), `warnings` (строки: о реранке, `index rebuilding` — индекс
 //! пересобирается, векторная выдача может быть неполной, `solution access …` и
 //! `solution unavailable` — решение исключено из области), `pending_count` — живые
-//! заметки области всех целей, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms,
+//! заметки и записи области, ждущие векторной индексации (сумма по целям, не исключённым к
+//! концу ответа). Это снимок **до** векторного запроса: воркер ставит `indexed` после
+//! подтверждённой записи точек, поэтому `pending_count == 0` гарантирует, что подтверждённые
+//! upsert видны вектору; цель, проиндексированная между снимком и запросом, лишь завышает
+//! счётчик. `timings {fts_ms, embed_ms, vector_ms,
 //! fuse_ms, rerank_ms, expand_ms, pending_ms, total_ms}` (`null` — этап не выполнялся;
 //! `total_ms` — весь обработчик без сериализации ответа). Маркеры совпадений в JSON —
 //! U+E000/U+E001.
@@ -141,10 +161,11 @@
 //! `expand` и L0 к записям не применяются.
 //!
 //! **Формат `md`** — карточки §9.3, по одной на элемент:
-//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N>[ · <certainty>] · <дата> · ~<N> tok`;
-//! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> · ~<N>
-//! tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются; у соседа
-//! `expand=graph` — ` · via <тип> ← <родитель>`),
+//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N>[ · <certainty>] · <дата> ·
+//! <возраст> · ~<N> tok` (возраст — `N дн. назад` или `сегодня`, его же получает MCP);
+//! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> ·
+//! <возраст> · ~<N> tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются; у
+//! соседа `expand=graph` — ` · via <тип> ← <родитель>`),
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
 //! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
 //! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
@@ -171,6 +192,7 @@ use axum::extract::rejection::BytesRejection;
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::join_all;
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
@@ -184,11 +206,11 @@ use zam_search::{
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
-    ChunkScope, Db, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, SeenItem, SeenKey, Space,
-    SpaceKind, StoreError, TargetFilter, WHOLE_TARGET, count_tokens, get_embeddings, get_node,
-    leaf_term_hits, leaves_of_targets, live_chunks, live_folders, mark_seen, neighbor_leaves,
-    node_content, pending_count, query_needles, search_fts_channels, seen_revs, text_snippet,
-    touch_session,
+    ChunkScope, Db, EntryKind, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, SeenItem, SeenKey,
+    Space, SpaceKind, StoreError, TargetFilter, WHOLE_TARGET, count_tokens, get_embeddings,
+    get_node, leaf_term_hits, leaves_of_targets, live_chunks, live_folders, mark_seen,
+    neighbor_leaves, node_content, pending_count, query_needles, search_fts_channels, seen_revs,
+    text_snippet, touch_session,
 };
 
 use self::merge::merge_channels;
@@ -203,6 +225,7 @@ use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
 use crate::config::SearchSection;
 use crate::error::ApiError;
+use crate::glossary::{Expansion, alias_groups};
 use crate::index_state::{DegradedReason, IndexRuntime};
 use crate::rerank;
 
@@ -258,23 +281,87 @@ pub(crate) struct Filters {
     status: Option<Vec<String>>,
     /// `axiom | theorem | hypothesis` (§7.5); пусто — любые, в том числе без статуса.
     certainty: Option<Vec<String>>,
+    /// `human | agent` (M4.5, §5.1): только решения с таким `data.decision.decided_by`
+    /// (без поля — по автору записи); остальные записи и заметки отсеиваются.
+    decided_by: Option<String>,
+    /// Путь файла (M4.5 §6.3): только заметки и записи со ссылкой на него (точное совпадение
+    /// после нормализации, некорректный путь — 400).
+    file: Option<String>,
+    /// Виды insight (`data.kind`, §9.1): insight проходят, только если их вид из списка;
+    /// заметки и записи других видов фильтр не трогает (их отбирает `kinds`).
+    insight_kinds: Option<Vec<String>>,
 }
 
-/// Допустимые виды целей `filters.kinds`.
-const KINDS: [&str; 6] = [
+/// Вид insight, которого не бывает: векторный фильтр с пустым пересечением видов
+/// (`decided_by` + `insight_kinds` без `decision`) не пропускает ни одной точки.
+const NO_INSIGHT_KIND: &str = "-";
+
+/// Допустимые виды целей `filters.kinds` (с M4.5 — `term`, `task`, `question`, спецификация
+/// M4.5 §1.3).
+const KINDS: [&str; 9] = [
     "note",
     "insight",
     "changelog",
     "release",
+    "term",
+    "task",
+    "question",
     "folder",
     "attachment",
 ];
-/// Виды по умолчанию (§9.1).
-const DEFAULT_KINDS: [&str; 4] = ["note", "insight", "changelog", "release"];
-/// Статусы insight.
-const STATUSES: [&str; 4] = ["active", "revisit", "superseded", "retracted"];
+/// Виды по умолчанию (§9.1; с M4.5 — `term` и `question`, спецификация M4.5 §1.3).
+const DEFAULT_KINDS: [&str; 6] = [
+    "note",
+    "insight",
+    "changelog",
+    "release",
+    "term",
+    "question",
+];
+/// Статусы записей `filters.status`: insight и term, с M4.5 — task и question (спецификация
+/// M4.5 §1.3). Умолчания по виду — [`default_statuses`].
+const STATUSES: [&str; 11] = [
+    "active",
+    "revisit",
+    "superseded",
+    "retracted",
+    "open",
+    "in_progress",
+    "blocked",
+    "done",
+    "dropped",
+    "answered",
+    "obsolete",
+];
 /// Статусы по умолчанию (§7.5): действующие.
 const DEFAULT_STATUSES: [&str; 2] = ["active", "revisit"];
+
+/// Статусы по умолчанию для видов `kinds` (`explicit` — виды заданы запросом). Фильтр статусов
+/// общий для всех видов (FTS и `must_not` Qdrant), поэтому умолчания складываются:
+/// - `insight` и `term` — действующие (`active`, `revisit`);
+/// - `question`: в умолчании видов — только `answered`, при явном `kinds` — ещё `open`;
+/// - `task` (только явным `kinds`): `open`, `in_progress`, `blocked` — выполненные и
+///   отброшенные только явным `filters.status`.
+///
+/// Значения `answered` и `open` в других видах не встречаются, поэтому слияние безопасно.
+fn default_statuses(kinds: &[String], explicit: bool) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = DEFAULT_STATUSES.to_vec();
+    let has = |k: &str| kinds.iter().any(|x| x == k);
+    if has("question") {
+        v.push("answered");
+        if explicit {
+            v.push("open");
+        }
+    }
+    if has("task") {
+        for s in ["open", "in_progress", "blocked"] {
+            if !v.contains(&s) {
+                v.push(s);
+            }
+        }
+    }
+    v
+}
 /// Эпистемические статусы `filters.certainty` (§7.5).
 const CERTAINTIES: [&str; 3] = ["axiom", "theorem", "hypothesis"];
 
@@ -336,25 +423,94 @@ impl SearchSection {
     }
 }
 
+/// Фильтр векторного канала. При `decided_by` точки сужаются до решений (`kind = insight`,
+/// `insight_kinds = [decision]`): иначе другие записи вытесняют из окна выдачи редкие решения
+/// агента. Деление `human`/`agent` внутри Qdrant неполное — его делает SQLite при `live_chunks`.
+/// `insight_kinds` сужает точки, только когда виды целей — одни insight: условие Qdrant
+/// `insight_kind` отсекло бы заметки и записи без вида; иначе виды insight отсеивает SQLite
+/// (`live_chunks`). С `decided_by` — пересечение с `decision` (пустое — ни одной точки).
+fn vector_filter(
+    scopes: Vec<VectorScope>,
+    path_prefix: Option<String>,
+    t: &TargetFilter,
+    folders: bool,
+) -> VectorFilter {
+    let by = t.decided_by.is_some();
+    let only_insight = by || (t.kinds.len() == 1 && t.kinds[0] == "insight");
+    let insight_kinds = match (by, t.insight_kinds.is_empty()) {
+        (true, true) => vec!["decision".to_string()],
+        (true, false) if t.insight_kinds.iter().any(|k| k == "decision") => {
+            vec!["decision".to_string()]
+        }
+        (true, false) => vec![NO_INSIGHT_KIND.to_string()],
+        (false, _) if only_insight => t.insight_kinds.clone(),
+        (false, _) => Vec::new(),
+    };
+    VectorFilter {
+        scopes,
+        path_prefix,
+        kinds: if by {
+            vec!["insight".into()]
+        } else {
+            t.kinds.clone()
+        },
+        insight_kinds,
+        exclude_statuses: excluded_statuses(t),
+        area: t.area.clone(),
+        certainty: t.certainty.clone(),
+        folders,
+        ..VectorFilter::default()
+    }
+}
+
 /// Фильтр целей запроса: виды и статусы (`include_history` — любые статусы).
 fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, ApiError> {
     let kinds = filter_list("filters.kinds", f.kinds.as_ref(), &KINDS, &DEFAULT_KINDS)?;
+    let explicit = f.kinds.as_ref().is_some_and(|k| !k.is_empty());
     let statuses = filter_list(
         "filters.status",
         f.status.as_ref(),
         &STATUSES,
-        &DEFAULT_STATUSES,
+        &default_statuses(&kinds, explicit),
     )?;
     let certainty = filter_list("filters.certainty", f.certainty.as_ref(), &CERTAINTIES, &[])?;
+    let mut insight_kinds = filter_list(
+        "filters.insight_kinds",
+        f.insight_kinds.as_ref(),
+        &super::insights::INSIGHT_KINDS,
+        &[],
+    )?;
+    insight_kinds.sort();
+    insight_kinds.dedup();
     Ok(TargetFilter {
         kinds,
-        statuses: if include_history {
-            Vec::new()
-        } else {
-            statuses
+        // include_history снимает фильтр статусов; без явного `kinds` открытые вопросы и задачи
+        // (`open`) в историю не входят - они только по явному `kinds`
+        statuses: match (include_history, explicit) {
+            (false, _) => statuses,
+            (true, true) => Vec::new(),
+            (true, false) => STATUSES
+                .iter()
+                .filter(|s| **s != "open")
+                .map(|s| s.to_string())
+                .collect(),
         },
         area: None,
         certainty,
+        decided_by: super::entries::parse_decided_by(
+            f.decided_by.as_deref(),
+            "filters.decided_by",
+        )?,
+        file: f
+            .file
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| {
+                zam_store::normalize_ref_path(p)
+                    .map_err(|e| ApiError::BadRequest(format!("filters.file: {e}")))
+            })
+            .transpose()?,
+        insight_kinds,
     })
 }
 
@@ -387,17 +543,28 @@ fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -
         v.sort();
         v
     };
+    let mut filters = json!({
+        "kinds": sorted(&t.kinds),
+        "status": sorted(&t.statuses),
+        "certainty": sorted(&t.certainty),
+    });
+    // ключ только при заданном фильтре: хэши прежних кэшей не меняются
+    if let Some(by) = &t.decided_by {
+        filters["decided_by"] = json!(by);
+    }
+    if let Some(f) = &t.file {
+        filters["file"] = json!(f);
+    }
+    if !t.insight_kinds.is_empty() {
+        filters["insight_kinds"] = json!(sorted(&t.insight_kinds));
+    }
     zam_store::scope_hash(&json!({
         "solution": solution.map(SolutionGuid::as_str),
         "include_knowledge": sc.include_knowledge.unwrap_or(true),
         "include_rules": sc.include_rules.unwrap_or(true),
         "path_prefix": path_prefix(sc),
         "area": t.area,
-        "filters": {
-            "kinds": sorted(&t.kinds),
-            "status": sorted(&t.statuses),
-            "certainty": sorted(&t.certainty),
-        },
+        "filters": filters,
     }))
 }
 
@@ -446,6 +613,7 @@ impl SearchSection {
             w_vector: self.w_vector,
             w_fts: self.w_fts,
             w_fts_relaxed: self.w_fts_relaxed,
+            w_fts_alias: self.w_fts_alias,
             w_trigram: self.w_trigram,
             w_folder: self.w_folder,
             recency_half_life_days: self.recency_half_life_days,
@@ -644,6 +812,8 @@ struct Item {
     folder: Option<i64>,
     /// Уже выдан этой сессии в той же ревизии (`skip_seen`, §9.3): без фрагмента и текста.
     seen: bool,
+    /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
+    stale_refs: Vec<String>,
 }
 
 /// Текст пары реранкера: заголовок секции и текст чанка.
@@ -1192,7 +1362,7 @@ fn folder_json(p: &Packed, children: i64, mode: SearchMode, spaces: &HashMap<Id,
     Value::Object(o)
 }
 
-fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value {
+fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Timestamp) -> Value {
     if let Some(children) = p.item.folder {
         return folder_json(p, children, mode, spaces);
     }
@@ -1223,6 +1393,7 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
     o.insert("sources".into(), json!(p.item.sources));
     o.insert("tokens".into(), json!(p.tokens));
     o.insert("updated_at".into(), json!(fmt_ts(h.updated_at)));
+    o.insert("age_days".into(), json!(hit_age(h, now)));
     match &h.entry {
         Some(e) => {
             o.insert("kind".into(), json!(e.kind));
@@ -1237,6 +1408,9 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
         }
     }
     o.insert("seen".into(), json!(p.item.seen));
+    if !p.item.stale_refs.is_empty() {
+        o.insert("stale_refs".into(), json!(p.item.stale_refs));
+    }
     if mode == SearchMode::Notes {
         o.insert("l0".into(), json!(p.item.l0));
     } else if !p.item.seen {
@@ -1251,6 +1425,36 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
     Value::Object(o)
 }
 
+/// Возраст элемента в днях (M4.5 §7): от `updated_at`, у заметки с `verified_at` — от более
+/// позднего из двух.
+fn hit_age(h: &FtsHit, now: Timestamp) -> u32 {
+    zam_store::time::age_days(now, h.updated_at, h.verified_at.as_deref())
+}
+
+/// Возраст в Markdown (M4.5 §7): `сегодня` или `N дн. назад`.
+pub(crate) fn age_text(days: u32) -> String {
+    if days == 0 {
+        "сегодня".into()
+    } else {
+        format!("{days} дн. назад")
+    }
+}
+
+/// Пометка Markdown об устаревших ссылках (M4.5 §6.2):
+/// `возможно устарело: изменился <путь>[, <путь>…]`; пусто — `None`.
+pub(crate) fn stale_line(paths: &[String]) -> Option<String> {
+    (!paths.is_empty()).then(|| {
+        format!(
+            "возможно устарело: изменился {}",
+            paths
+                .iter()
+                .map(|p| md_inline(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 /// Одна строка: маркеры → `**`, переводы строк → пробелы.
 pub(crate) fn md_inline(s: &str) -> String {
     s.chars()
@@ -1263,14 +1467,9 @@ pub(crate) fn md_inline(s: &str) -> String {
 }
 
 /// Заголовок карточки записи журнала (§9.3):
-/// `i:<id> insight/<вид> «<заголовок>»  [0.77] active · hypothesis · ~120 tok`.
-fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> String {
-    let letter = match e.kind.as_str() {
-        "insight" => "i",
-        "changelog" => "c",
-        "release" => "r",
-        _ => "e",
-    };
+/// `i:<id> insight/<вид> «<заголовок>»  [0.77] active · hypothesis · 3 дн. назад · ~120 tok`.
+fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, age: u32, tokens: usize) -> String {
+    let letter = EntryKind::parse(&e.kind).map_or("e", EntryKind::ref_letter);
     let mut line = format!("{letter}:{id} {}", e.kind);
     if let Some(k) = &e.insight_kind {
         line.push('/');
@@ -1282,15 +1481,23 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> Str
         .flatten()
         .cloned()
         .collect();
+    parts.push(age_text(age));
     parts.push(format!("~{tokens} tok"));
     line.push_str(&format!("  [{score:.2}] {}\n", parts.join(" · ")));
     line
 }
 
-/// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · ~340 tok`
-/// (у записи журнала — [`entry_card`]).
-fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
+/// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · 3 дн. назад
+/// · ~340 tok` (у записи журнала — [`entry_card`]).
+fn item_md(
+    n: usize,
+    p: &Packed,
+    mode: SearchMode,
+    spaces: &HashMap<Id, Space>,
+    now: Timestamp,
+) -> String {
     let h = &p.item.hit;
+    let age = hit_age(h, now);
     // у переставленных реранкером `score` — его балл с бустами (§9.2 п. 5)
     let score = p.item.score.min(1.0);
     let mut line = match (&h.entry, p.item.folder) {
@@ -1302,7 +1509,7 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
                 h.target.id, h.path
             )
         }
-        (Some(e), None) => format!("{n}. {}", entry_card(e, h.target.id, score, p.tokens)),
+        (Some(e), None) => format!("{n}. {}", entry_card(e, h.target.id, score, age, p.tokens)),
         (None, None) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             let mut line = format!("{n}. {} {space}/{}", h.target, h.path);
@@ -1316,9 +1523,10 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
                 .map(|c| format!(" · {c}"))
                 .unwrap_or_default();
             line.push_str(&format!(
-                "  [{score:.2}] rev{}{certainty} · {} · ~{} tok\n",
+                "  [{score:.2}] rev{}{certainty} · {} · {} · ~{} tok\n",
                 h.rev,
                 h.updated_at.strftime("%Y-%m-%d"),
+                age_text(age),
                 p.tokens
             ));
             line
@@ -1336,6 +1544,14 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
             line.pop();
         }
         line.push_str("   (seen)\n");
+    }
+    // устаревшие ссылки на файлы — строкой под заголовком карточки (M4.5 §6.2)
+    if let Some(s) = stale_line(&p.item.stale_refs) {
+        line.push_str("   ");
+        line.push_str(&s);
+        line.push('\n');
+    }
+    if p.item.seen {
         return line;
     }
     match &p.text {
@@ -1356,6 +1572,31 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
         }
     }
     line
+}
+
+/// `stale_refs` элементов выдачи: один запрос на базу цели. Сбой чтения — WARN без текста,
+/// элементы остаются без пометки.
+async fn attach_stale_refs(targets: &[SearchTarget], items: &mut [Item]) {
+    for (i, t) in targets.iter().enumerate() {
+        let owners: Vec<TargetRef> = items
+            .iter()
+            .filter(|it| it.target == i && it.folder.is_none())
+            .map(|it| it.hit.target)
+            .collect();
+        if owners.is_empty() {
+            continue;
+        }
+        match zam_store::stale_refs_of(&t.db, &owners).await {
+            Ok(by) => {
+                for it in items.iter_mut().filter(|it| it.target == i) {
+                    if let Some(p) = by.get(&it.hit.target) {
+                        it.stale_refs = p.clone();
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "чтение устаревших ссылок на файлы"),
+        }
+    }
 }
 
 /// Предупреждение ответа: текст секции (`expand=section`) не получен — разбор или поиск
@@ -1477,6 +1718,7 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
             entry: None,
             area: None,
             certainty: None,
+            verified_at: None,
         },
         score,
         sources: vec![zam_search::Channel::Folder.as_str()],
@@ -1487,6 +1729,7 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
         via: None,
         folder: Some(f.child_count),
         seen: false,
+        stale_refs: Vec::new(),
     }
 }
 
@@ -1539,6 +1782,18 @@ async fn mark_seen_items(
 /// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
 fn session_failed(what: &str, e: &StoreError) {
     tracing::warn!(error = %e, "поиск: {what} сессии не выполнено, ответ без пометок seen");
+}
+
+/// Расширения запроса словарём для цели `tg`; сбой чтения словаря поиск не валит (WARN без
+/// текста запроса, расширения нет).
+async fn alias_expansion(st: &AppState, tg: &SearchTarget, qterms: &[&str]) -> Vec<Expansion> {
+    match st.glossary.index(&tg.db).await {
+        Ok(idx) => idx.expand(qterms, &tg.space_ids()),
+        Err(e) => {
+            tracing::warn!(error = %e, "поиск: словарь не прочитан, запрос без расширения");
+            Vec::new()
+        }
+    }
 }
 
 /// `POST /search`.
@@ -1606,10 +1861,19 @@ pub async fn search(
     let folder_channel = st.cfg.search.w_folder > 0.0;
 
     // 1. каналы FTS (по базе на цель, параллельно) и векторный (один запрос) — параллельно
+    // расширение запроса словарём (канал `alias`, M4.5): слова запроса — по именам и
+    // псевдонимам терминов пространств каждой цели; `w_fts_alias = 0` выключает канал
+    let qterms = zam_store::query_terms(&req.query);
+    let alias_on = st.cfg.search.w_fts_alias > 0.0 && !qterms.is_empty();
     let fts = async {
         let t = Instant::now();
-        let runs = join_all(targets.iter().map(|tg| {
-            search_fts_channels(
+        let runs = join_all(targets.iter().map(|tg| async {
+            let exp = if alias_on {
+                alias_expansion(&st, tg, &qterms).await
+            } else {
+                Vec::new()
+            };
+            let r = search_fts_channels(
                 &tg.db,
                 FtsQuery {
                     text: req.query.clone(),
@@ -1617,8 +1881,11 @@ pub async fn search(
                     path_prefix: prefix.clone(),
                     top_k: TOP_K_MAX,
                     targets: kinds.clone(),
+                    alias_groups: alias_groups(&exp),
                 },
             )
+            .await;
+            (r, exp)
         }))
         .await;
         (runs, ms(t))
@@ -1627,19 +1894,37 @@ pub async fn search(
         if !run_vector {
             return VectorRun::default();
         }
-        let filter = VectorFilter {
-            scopes: scopes.clone(),
-            path_prefix: prefix.clone(),
-            kinds: kinds.kinds.clone(),
-            exclude_statuses: excluded_statuses(&kinds),
-            area: kinds.area.clone(),
-            certainty: kinds.certainty.clone(),
-            folders: want_folders || folder_channel,
-            ..VectorFilter::default()
-        };
+        let filter = vector_filter(
+            scopes.clone(),
+            prefix.clone(),
+            &kinds,
+            want_folders || folder_channel,
+        );
         vector_channel(&st.index, filter, req.query.clone()).await
     };
+    // заметки области всех целей, ещё не прошедшие векторную индексацию (без `index: false`
+    // и Human), — снимок ДО векторного запроса: воркер отмечает `indexed` только после
+    // подтверждённой записи точек в Qdrant, поэтому `pending_count == 0` гарантирует, что
+    // вектор их видит (флейк шага 17 smoke: счёт после запроса давал 0 при FTS-only выдаче).
+    // Сумма — по целям, живым к концу обработчика
+    let pending_t = Instant::now();
+    let pending_runs = join_all(
+        targets
+            .iter()
+            .map(|t| pending_count(&t.db, t.space_ids(), prefix.clone())),
+    )
+    .await;
+    let mut pending_by = vec![0; targets.len()];
+    for (i, r) in pending_runs.into_iter().enumerate() {
+        if health.alive[i] {
+            pending_by[i] = health.soft(i, r)?.unwrap_or(0);
+        }
+    }
+    let pending_ms = ms(pending_t);
     let ((runs, fts_ms), vrun) = tokio::join!(fts, vector);
+    // тест задаёт порядок «вектор прочитан → воркер проиндексировал → ответ»
+    #[cfg(feature = "test-hooks")]
+    st.search_hold.park().await;
     // 0. кэш выжимок (§9.3): действующие выжимки — первыми элементами
     let cache_t = Instant::now();
     let cache_items = if req.no_cache {
@@ -1660,9 +1945,22 @@ pub async fn search(
     let cache_ms = (!req.no_cache).then(|| ms(cache_t));
     // цель, чья база не прочиталась (чужое решение), исключается из выдачи целиком
     let mut per_db = Vec::with_capacity(targets.len());
-    for (i, r) in runs.into_iter().enumerate() {
+    let mut expanded: Vec<Expansion> = Vec::new();
+    for (i, (r, exp)) in runs.into_iter().enumerate() {
+        // цель уже исключена сбоем подсчёта `pending_count`
+        if !health.alive[i] {
+            continue;
+        }
         if let Some(ch) = health.soft(i, r)? {
             per_db.push((i, ch));
+            for e in exp {
+                if !expanded
+                    .iter()
+                    .any(|x| x.term == e.term && x.word == e.word)
+                {
+                    expanded.push(e);
+                }
+            }
         }
     }
     let fts = merge_channels(per_db, FTS_BM25_TOP, FTS_TRIGRAM_TOP);
@@ -1670,7 +1968,7 @@ pub async fn search(
     // 2. векторные хиты — в базу своего владельца, только живые чанки пространств цели
     let fuse_t = Instant::now();
     let mut hits: HashMap<String, (usize, FtsHit)> = HashMap::new();
-    for (t, h) in fts.bm25.iter().chain(&fts.trigram) {
+    for (t, h) in fts.bm25.iter().chain(&fts.alias).chain(&fts.trigram) {
         hits.entry(h.chunk_id.clone())
             .or_insert_with(|| (*t, h.clone()));
     }
@@ -1753,6 +2051,8 @@ pub async fn search(
             .iter()
             .map(|(_, h)| h.chunk_id.clone())
             .collect(),
+        alias: fts.alias.iter().map(|(_, h)| h.chunk_id.clone()).collect(),
+        alias_relaxed: fts.alias_relaxed,
         vector: vector_ids,
         chunks,
         // ослабленный bm25 (ни один чанк не содержит всех слов запроса) — свой вес
@@ -1864,6 +2164,7 @@ pub async fn search(
                 via: None,
                 folder: None,
                 seen: false,
+                stale_refs: Vec::new(),
             })
         })
         .collect();
@@ -1897,6 +2198,15 @@ pub async fn search(
     } else {
         items
     };
+    // порядок по `contradicts` — после реранка и бустов (M4.5, §5.2)
+    let mut items = items;
+    // только первые `top_k` элементов («обе в выдаче»): аксиома из хвоста окна в выдачу не поднимается
+    if st.cfg.search.contradicts_order && top_k > 1 && items.len() > 1 {
+        let tail = items.split_off(top_k.min(items.len()));
+        let r = graph::order_by_contradicts(&mut health, &mut items).await;
+        items.extend(tail);
+        r?;
+    }
 
     // 5. top_k, режим, expand, упаковка
     let expand_t = Instant::now();
@@ -1946,20 +2256,13 @@ pub async fn search(
     // элементы целей, исключённых на этих шагах, — прочь
     items.retain(|it| health.alive[it.target]);
     let expand_ms = ms(expand_t);
-    // заметки области всех целей, ещё не прошедшие векторную индексацию (без `index: false`
-    // и Human)
-    let pending_t = Instant::now();
-    let mut pending = 0;
-    for (i, t) in targets.iter().enumerate() {
-        if !health.alive[i] {
-            continue;
-        }
-        let r = pending_count(&t.db, t.space_ids(), prefix.clone()).await;
-        pending += health.soft(i, r)?.unwrap_or(0);
-    }
-    let pending_ms = ms(pending_t);
-    // pending_count цели, исключённой на этом шаге, уже не прибавлен; её элементы — прочь
-    items.retain(|it| health.alive[it.target]);
+    // снимок `pending_count` (до векторного запроса) — только живых к этому моменту целей
+    let pending: i64 = pending_by
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| health.alive[*i])
+        .map(|(_, n)| n)
+        .sum();
     let mut warnings = health.warnings;
     dedup_keep_order(&mut warnings);
     // выданное этой сессии в той же ревизии — без фрагмента и текста (§9.3)
@@ -1969,6 +2272,8 @@ pub async fn search(
     {
         session_failed("чтение выданного", &e);
     }
+    // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется
+    attach_stale_refs(&targets, &mut items).await;
     // выжимки шага 0 — из того же бюджета
     let cache_tokens: usize = cache_items.iter().map(cache_step::CacheItem::tokens).sum();
     let packed = pack_items(items, mode, budget.saturating_sub(cache_tokens).max(1));
@@ -1989,6 +2294,7 @@ pub async fn search(
         }
     }
     let degraded = available.err().or(vrun.failed);
+    let now = Timestamp::now();
     let by_id: HashMap<Id, Space> = targets
         .into_iter()
         .flat_map(|t| t.spaces)
@@ -2000,7 +2306,7 @@ pub async fn search(
             let items: Vec<Value> = cache_items
                 .iter()
                 .map(cache_step::item_json)
-                .chain(packed.iter().map(|p| item_json(p, mode, &by_id)))
+                .chain(packed.iter().map(|p| item_json(p, mode, &by_id, now)))
                 .collect();
             Json(json!({
                 "items": items,
@@ -2008,6 +2314,7 @@ pub async fn search(
                 "degraded_reason": degraded.map(DegradedReason::as_str),
                 "degraded_text": degraded.map(DegradedReason::text),
                 "warnings": warnings,
+                "expanded": expanded,
                 "pending_count": pending,
                 "timings": {
                     "cache_ms": cache_ms,
@@ -2030,7 +2337,7 @@ pub async fn search(
                 packed
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| item_md(i + 1, p, mode, &by_id)),
+                    .map(|(i, p)| item_md(i + 1, p, mode, &by_id, now)),
             );
             if let Some(r) = degraded {
                 body.push_str(&format!(
@@ -2079,6 +2386,7 @@ mod tests {
             entry: None,
             area: None,
             certainty: None,
+            verified_at: None,
         }
     }
 
@@ -2096,6 +2404,7 @@ mod tests {
                 via: None,
                 folder: None,
                 seen: false,
+                stale_refs: Vec::new(),
             })
             .collect()
     }
@@ -2530,7 +2839,8 @@ mod tests {
 
     /// Замер `expand=section` (ревью fix round 1 задачи 17): заметка ~1 МБ без H1–H3,
     /// 300 кандидатов окна из её конца. Запуск:
-    /// `cargo test -p zam-server --release --lib bench_expand_section_big_note -- --ignored --nocapture`.
+    /// `cargo test -p zam-server --release --lib bench_expand_section_big_note`
+    /// `-- --ignored --nocapture`.
     #[tokio::test]
     #[ignore = "замер"]
     async fn bench_expand_section_big_note() {
@@ -2635,9 +2945,10 @@ mod tests {
             text: None,
             tokens: 7,
         };
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
+        let now = "2026-10-13T09:00:00Z".parse().unwrap();
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
         let want = format!(
-            "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · ~7 tok\n   **s**\n",
+            "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · 3 дн. назад · ~7 tok\n   **s**\n",
             p.item.hit.target.id
         );
         assert_eq!(s, want);
@@ -2663,12 +2974,13 @@ mod tests {
             text: None,
             tokens: 120,
         };
-        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new());
+        let now = p.item.hit.updated_at;
+        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new(), now);
         assert_eq!(
             s,
             format!(
                 "2. i:{id} insight/gotcha «Bash-скрипты должны иметь LF»  [0.50] active · \
-                 hypothesis · ~120 tok\n   **s**\n"
+                 hypothesis · сегодня · ~120 tok\n   **s**\n"
             )
         );
         // changelog без статуса и certainty
@@ -2680,15 +2992,16 @@ mod tests {
             title: "Исправлен CRLF".into(),
         });
         p.tokens = 9;
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
         assert!(
             s.starts_with(&format!(
-                "1. c:{id} changelog/fix «Исправлен CRLF»  [0.50] ~9 tok\n"
+                "1. c:{id} changelog/fix «Исправлен CRLF»  [0.50] сегодня · ~9 tok\n"
             )),
             "{s}"
         );
-        let j = item_json(&p, SearchMode::Brief, &HashMap::new());
+        let j = item_json(&p, SearchMode::Brief, &HashMap::new(), now);
         assert_eq!(j["entry_id"], json!(id));
+        assert_eq!(j["age_days"], 0);
         assert!(j.get("node_id").is_none());
         assert_eq!(j["kind"], "changelog");
         assert_eq!(j["insight_kind"], "fix");
@@ -2700,16 +3013,99 @@ mod tests {
     fn filters_defaults_and_validation() {
         let f = target_filter(&Filters::default(), false).unwrap();
         assert_eq!(f.kinds, DEFAULT_KINDS.map(String::from).to_vec());
-        assert_eq!(f.statuses, DEFAULT_STATUSES.map(String::from).to_vec());
-        assert_eq!(excluded_statuses(&f), vec!["superseded", "retracted"]);
-        // include_history снимает фильтр статуса
+        assert_eq!(f.file, None);
+        // filters.file нормализуется; путь выше корня — 400
+        let file = |p: &str| {
+            target_filter(
+                &Filters {
+                    file: Some(p.into()),
+                    ..Filters::default()
+                },
+                false,
+            )
+        };
+        assert_eq!(
+            file(".\\src\\a.rs").unwrap().file.as_deref(),
+            Some("src/a.rs")
+        );
+        assert!(matches!(file("../x"), Err(ApiError::BadRequest(_))));
+        // умолчание видов включает term и question: статусы — действующие и `answered`
+        assert_eq!(f.statuses, ["active", "revisit", "answered"]);
+        let def = |kinds: &[&str]| {
+            target_filter(
+                &Filters {
+                    kinds: Some(kinds.iter().map(|s| s.to_string()).collect()),
+                    ..Filters::default()
+                },
+                false,
+            )
+            .unwrap()
+            .statuses
+        };
+        // явный `kinds`: открытые вопросы и текущие задачи; выполненные и отброшенные — по статусу
+        assert_eq!(
+            def(&["question"]),
+            ["active", "revisit", "answered", "open"]
+        );
+        assert_eq!(
+            def(&["task"]),
+            ["active", "revisit", "open", "in_progress", "blocked"]
+        );
+        assert_eq!(def(&["insight", "term"]), ["active", "revisit"]);
+        // исключаются все статусы, кроме выбранных (с M4.5 — и статусы task/question)
+        let rest = |keep: &[&str]| -> Vec<String> {
+            STATUSES
+                .iter()
+                .filter(|s| !keep.contains(s))
+                .map(|s| s.to_string())
+                .collect()
+        };
+        assert_eq!(
+            excluded_statuses(&f),
+            rest(&["active", "revisit", "answered"])
+        );
+        assert!(excluded_statuses(&f).starts_with(&["superseded".into(), "retracted".into()]));
+        // include_history без `kinds`: все статусы, кроме `open` (открытые вопросы и задачи - только
+        // по явному `kinds`); с явным `kinds` фильтр статусов снят
         let f = target_filter(&Filters::default(), true).unwrap();
+        assert!(!f.statuses.contains(&"open".to_string()));
+        assert!(f.statuses.contains(&"superseded".to_string()));
+        assert_eq!(excluded_statuses(&f), ["open"]);
+        let f = target_filter(
+            &Filters {
+                kinds: Some(vec!["question".into()]),
+                ..Filters::default()
+            },
+            true,
+        )
+        .unwrap();
         assert!(f.statuses.is_empty() && excluded_statuses(&f).is_empty());
+        // decided_by сужает векторный фильтр до решений
+        let by = target_filter(
+            &Filters {
+                decided_by: Some("agent".into()),
+                ..Filters::default()
+            },
+            false,
+        )
+        .unwrap();
+        let vf = vector_filter(Vec::new(), None, &by, false);
+        assert_eq!(vf.kinds, ["insight"]);
+        assert_eq!(vf.insight_kinds, ["decision"]);
+        let plain = target_filter(&Filters::default(), false).unwrap();
+        assert!(
+            vector_filter(Vec::new(), None, &plain, false)
+                .insight_kinds
+                .is_empty()
+        );
         let f = target_filter(
             &Filters {
                 kinds: Some(vec!["insight".into()]),
                 status: Some(vec!["retracted".into()]),
                 certainty: Some(vec!["axiom".into(), "theorem".into()]),
+                decided_by: None,
+                file: None,
+                insight_kinds: None,
             },
             false,
         )
@@ -2723,10 +3119,7 @@ mod tests {
                 .certainty
                 .is_empty()
         );
-        assert_eq!(
-            excluded_statuses(&f),
-            vec!["active", "revisit", "superseded"]
-        );
+        assert_eq!(excluded_statuses(&f), rest(&["retracted"]));
         for bad in [
             Filters {
                 kinds: Some(vec!["nope".into()]),
@@ -2740,8 +3133,82 @@ mod tests {
                 certainty: Some(vec!["certain".into()]),
                 ..Filters::default()
             },
+            Filters {
+                insight_kinds: Some(vec!["Gotcha".into()]),
+                ..Filters::default()
+            },
         ] {
             assert!(target_filter(&bad, false).is_err());
         }
+    }
+
+    /// `filters.insight_kinds` (§9.1): векторный канал сужается только при одних insight,
+    /// с `decided_by` — пересечение с `decision`; ключ кэша — только при заданном фильтре.
+    #[test]
+    fn insight_kinds_vector_filter_and_cache_key() {
+        let tf = |f: Filters| target_filter(&f, false).unwrap();
+        let ik = || Some(vec!["failure".to_string(), "experiment".to_string()]);
+        // виды по умолчанию (заметки и записи) — векторный фильтр не сужается
+        let any = tf(Filters {
+            insight_kinds: ik(),
+            ..Filters::default()
+        });
+        assert_eq!(any.insight_kinds, ["experiment", "failure"]);
+        assert!(
+            vector_filter(Vec::new(), None, &any, false)
+                .insight_kinds
+                .is_empty()
+        );
+        // одни insight — сужается
+        let only = tf(Filters {
+            kinds: Some(vec!["insight".into()]),
+            insight_kinds: ik(),
+            ..Filters::default()
+        });
+        assert_eq!(
+            vector_filter(Vec::new(), None, &only, false).insight_kinds,
+            ["experiment", "failure"]
+        );
+        // decided_by: пересечение с decision; пустое — ни одной точки
+        let by = |kinds: Vec<String>| {
+            vector_filter(
+                Vec::new(),
+                None,
+                &tf(Filters {
+                    decided_by: Some("human".into()),
+                    insight_kinds: Some(kinds),
+                    ..Filters::default()
+                }),
+                false,
+            )
+            .insight_kinds
+        };
+        assert_eq!(by(vec!["decision".into(), "gotcha".into()]), ["decision"]);
+        assert_eq!(by(vec!["gotcha".into()]), [NO_INSIGHT_KIND]);
+        // ключ кэша выжимок меняется только при заданном фильтре
+        let sc = ScopeReq::default();
+        let key = |f: &Filters| cache_scope_hash(&sc, f, false, None).unwrap();
+        let base = key(&Filters::default());
+        assert_eq!(
+            base,
+            key(&Filters {
+                insight_kinds: Some(Vec::new()),
+                ..Filters::default()
+            })
+        );
+        let a = key(&Filters {
+            insight_kinds: ik(),
+            ..Filters::default()
+        });
+        let b = key(&Filters {
+            insight_kinds: Some(vec![
+                "experiment".into(),
+                "failure".into(),
+                "failure".into(),
+            ]),
+            ..Filters::default()
+        });
+        assert_ne!(base, a);
+        assert_eq!(a, b, "порядок и повторы не меняют ключ");
     }
 }

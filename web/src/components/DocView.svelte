@@ -9,6 +9,8 @@
   import IndexBadge from './IndexBadge.svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import Links from './Links.svelte';
+  import FileRefs from './FileRefs.svelte';
+  import { loadRefs, staleOf, staleText, type RefState } from '../lib/fileRefs';
   import { stateShort, stateText } from '../lib/indexing';
   import Lightbox from './Lightbox.svelte';
   import {
@@ -17,6 +19,7 @@
     getNodeHtml,
     listSpaces,
     spaceMatches,
+    spaceRef,
     type Certainty,
     type NodeInfo,
     type RenderedNode,
@@ -47,6 +50,8 @@
   let info = $state<NodeInfo | null>(null);
   let rendered = $state<RenderedNode | null>(null);
   let spaceName = $state('');
+  /** GUID решения, если заметка в пространстве решения (у прочих пространств индекса ссылок нет). */
+  let solutionGuid = $state('');
   let error = $state('');
   let notice = $state('');
   let loading = $state(false);
@@ -91,7 +96,9 @@
     if (my !== seq) return;
     loading = false;
     if (sp.status === 'fulfilled') {
-      spaceName = sp.value.spaces.find((x) => spaceMatches(x, s))?.name ?? s;
+      const found = sp.value.spaces.find((x) => spaceMatches(x, s));
+      spaceName = found?.name ?? s;
+      solutionGuid = found?.kind === 'solution' ? spaceRef(found) : '';
     }
     if (j.status === 'rejected') return failed(j.reason);
     info = j.value.node;
@@ -210,6 +217,35 @@
     const c = info?.frontmatter?.certainty;
     return typeof c === 'string' && (CERTAINTIES as string[]).includes(c) ? (c as Certainty) : null;
   });
+  /** `verified_at:` во frontmatter (дата последней проверки знания, M4.5 §7). */
+  let verifiedAt = $derived.by(() => {
+    const v = info?.frontmatter?.verified_at;
+    return typeof v === 'string' ? v : '';
+  });
+  /** Ссылки заметки на файлы: состояние — из индекса решения, иначе пути из `refs:` без состояния. */
+  let fileRefs = $state<RefState[]>([]);
+  $effect(() => {
+    const i = info;
+    const u = user;
+    const s = solutionGuid;
+    if (!i || i.kind !== 'note') {
+      fileRefs = [];
+      return;
+    }
+    const front = Array.isArray(i.frontmatter?.refs)
+      ? (i.frontmatter.refs as unknown[]).filter((x): x is string => typeof x === 'string')
+      : [];
+    untrack(() => {
+      fileRefs = front.map((path) => ({ path, state: 'ok' }));
+      if (!s) return;
+      loadRefs(u, s).then((idx) => {
+        if (info?.id !== i.id) return;
+        const got = idx.get(`n:${i.id}`);
+        if (got?.length) fileRefs = got;
+      });
+    });
+  });
+  let stalePaths = $derived(staleOf(fileRefs));
   let description = $derived.by(() => {
     const d = info?.frontmatter?.description;
     return typeof d === 'string' ? d : '';
@@ -236,12 +272,18 @@
           · <span class="istate" title={stateText(info.index_state)}><IndexBadge state={info.index_state} decorative />{stateShort(info.index_state)}</span>
         {/if}
       </div>
+      {#if stalePaths.length}
+        <p class="warn" role="status" data-testid="stale-note">{staleText(stalePaths)}</p>
+      {/if}
       {#if tags.length || description}
         <div class="front">
           {#if description}<p class="desc">{description}</p>{/if}
           {#each tags as t (t)}<span class="chip">#{t}</span>{/each}
         </div>
       {/if}
+    {/if}
+    {#if info && info.kind === 'note' && (fileRefs.length || verifiedAt)}
+      <FileRefs refs={fileRefs} {verifiedAt} />
     {/if}
     <div class="tabs" role="tablist" aria-label="Разделы заметки">
       <button type="button" role="tab" aria-selected={tab === 'doc'} onclick={() => (tab = 'doc')}>Документ</button>

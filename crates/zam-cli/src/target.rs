@@ -7,8 +7,8 @@
 //! - `solution:` без `solution.toml` — ошибка конфигурации.
 //! - 26 символов в канонической форме [`zam_core::Id`] — id узла; так же `n:<id>` — ссылка
 //!   узла, как её печатают `zam search` и `/read` (стенд Debian 13, B2);
-//! - `i:|c:|e:|r:<id>` — ссылка записи журнала ([`entry_ref`]); её читает `zam read`, прочие
-//!   команды цели-узла такую строку считают путём, как раньше.
+//! - `i:|c:|e:|r:|t:|k:|q:<id>` — ссылка записи журнала ([`entry_ref`]); её читает `zam read`,
+//!   прочие команды цели-узла такую строку считают путём, как раньше.
 //! - Ведущие и замыкающие `/` пути отбрасываются.
 use std::path::Path;
 
@@ -64,11 +64,31 @@ fn is_node_id(s: &str) -> bool {
             .is_ok_and(|id| id.to_string() == s)
 }
 
-/// Ссылка записи журнала `i:|c:|e:|r:<id>` (как в выдаче `zam search` и `/read`): id записи.
-/// Префикс без канонического id — не ссылка (`i:заметка` остаётся путём).
+/// Буквы ссылок записи журнала — как `zam_store::ENTRY_REF_LETTERS` (клиент без SQLite не
+/// зависит от `zam-store`; совпадение проверяет тест `entry_ref_letters_match_store`).
+pub const ENTRY_REF_LETTERS: [&str; 7] = ["i", "c", "r", "t", "k", "q", "e"];
+
+/// Буква `p` — буква ссылки записи журнала ([`ENTRY_REF_LETTERS`]).
+pub fn is_entry_ref_letter(p: &str) -> bool {
+    ENTRY_REF_LETTERS.contains(&p)
+}
+
+/// Голый id записи из `<буква>:<id>` с буквой записи журнала или из голого id (команды
+/// `zam task`, `zam question`); прочие префиксы не снимаются. В отличие от [`entry_ref`]
+/// канонический вид id не проверяется: его проверит сервер.
+pub fn bare_entry_id(raw: &str) -> &str {
+    let t = raw.trim();
+    match t.split_once(':') {
+        Some((p, id)) if is_entry_ref_letter(p) => id,
+        _ => t,
+    }
+}
+
+/// Ссылка записи журнала `i:|c:|e:|r:|t:|k:|q:<id>` (как в выдаче `zam search` и `/read`): id
+/// записи. Префикс без канонического id — не ссылка (`i:заметка` остаётся путём).
 pub fn entry_ref(raw: &str) -> Option<&str> {
     let (p, id) = raw.split_once(':')?;
-    (matches!(p, "i" | "c" | "e" | "r") && is_node_id(id)).then_some(id)
+    (is_entry_ref_letter(p) && is_node_id(id)).then_some(id)
 }
 
 /// Пространство цели до разрешения решения.
@@ -210,9 +230,14 @@ mod tests {
     }
 
     #[test]
+    fn entry_ref_letters_match_store() {
+        assert_eq!(ENTRY_REF_LETTERS, zam_store::ENTRY_REF_LETTERS);
+    }
+
+    #[test]
     fn entry_refs() {
         let id = zam_core::Id::new().to_string();
-        for pfx in ["i", "c", "e", "r"] {
+        for pfx in ["i", "c", "e", "r", "t", "k", "q"] {
             assert_eq!(entry_ref(&format!("{pfx}:{id}")), Some(id.as_str()));
         }
         assert_eq!(entry_ref(&format!("n:{id}")), None);

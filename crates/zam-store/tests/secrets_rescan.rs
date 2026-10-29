@@ -83,6 +83,7 @@ async fn old_db_with_secrets_is_rescanned_once() {
     create_entry(
         &db,
         NewEntry {
+            refs: None,
             space_id: k,
             kind: EntryKind::Insight,
             title: "Утечка".into(),
@@ -224,6 +225,7 @@ async fn payload_tags_and_folder_input_masked_old_db_reindexed_once() {
     let (entry, _) = create_entry(
         &db,
         NewEntry {
+            refs: None,
             space_id: k,
             kind: EntryKind::Insight,
             title: "Теги записи".into(),

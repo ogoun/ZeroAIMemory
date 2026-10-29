@@ -263,6 +263,7 @@ async fn hybrid_paraphrase_identifier_expand_budget() {
         zam_store::search_fts(
             &db,
             zam_store::FtsQuery {
+                alias_groups: Vec::new(),
                 text: PARAPHRASE.into(),
                 space_ids: vec![k],
                 path_prefix: None,
@@ -665,4 +666,207 @@ async fn rerank_on_reorders_fts_results() {
     );
     assert!(j2.text().starts_with("1. "), "{}", j2.text());
     assert!(!j2.text().contains("> warning"), "{}", j2.text());
+}
+
+/// Снимает тестовые точки остановки, если тест упал на полпути: иначе воркер и поиск стояли бы
+/// до конца тестового бинарника.
+struct ReleaseHolds(zam_server::AppState);
+
+impl Drop for ReleaseHolds {
+    fn drop(&mut self) {
+        self.0.index.worker.release_write();
+        self.0.search_hold.release();
+    }
+}
+
+/// Флейк шага 17 smoke (`insight_found`): `pending_count` — снимок **до** векторного запроса.
+/// Порядок событий задают точки остановки (фича `test-hooks`), а не тайминг:
+/// 1. воркер стоит перед записью точек insight (`hold_next_write`), запись в FTS уже видна;
+/// 2. поиск прочитал оба канала и стоит после них (`search_hold`): вектор insight не видел;
+/// 3. воркер отпущен и отметил insight `indexed`; поиск отпущен.
+///
+/// Ответ должен честно сказать «индексация не догнала» (`pending_count = 1`), а не 0 при выдаче
+/// только из FTS; повторный поиск находит insight и вектором.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_count_snapshot_precedes_vector_query() {
+    if !have(MINILM) {
+        eprintln!("пропуск pending_count_snapshot_precedes_vector_query: нужна модель {MINILM}");
+        return;
+    }
+    let q = TestQdrant::start("hyb-pending-snap");
+    let a = api("hyb-pending-snap", |c| {
+        ml(c, MINILM);
+        external(c, &q);
+    })
+    .await;
+    vector_ready(&a).await;
+    let _guard = ReleaseHolds(a.st.clone());
+    let w = &a.st.index.worker;
+    let limit = Duration::from_secs(240);
+
+    // 1. insight записан, воркер стоит перед записью его точек
+    w.hold_next_write();
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(json!({
+                "kind": "insight",
+                "title": "Shell scripts need LF line endings",
+                "body": "A shell script saved with Windows CRLF line endings fails on Linux \
+                         with bad interpreter. Convert the file to LF before running it.",
+                "data": {"kind": "gotcha"},
+            })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let id: Id = r.json()["id"].as_str().unwrap().parse().unwrap();
+    w.notify();
+    assert!(
+        w.wait_write_held(limit).await,
+        "воркер не дошёл до записи пачки: {:?}",
+        w.status()
+    );
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let state = async || zam_store::get_entry(&db, id).await.unwrap().index_state;
+    assert_eq!(state().await, zam_store::IndexState::Pending);
+
+    // 2–3. поиск стоит после каналов, пока воркер пишет точки и отмечает `indexed`
+    a.st.search_hold.arm();
+    let body = json!({"query": "shell script line endings", "top_k": 5});
+    let (first, ()) = tokio::join!(search(&a, body.clone()), async {
+        assert!(
+            a.st.search_hold.wait_parked(limit).await,
+            "поиск не дошёл до точки после каналов"
+        );
+        w.release_write();
+        until(
+            "insight проиндексирован",
+            limit,
+            async || state().await == zam_store::IndexState::Indexed,
+        )
+        .await;
+        a.st.search_hold.release();
+    });
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    let j = first.json();
+    assert_eq!(j["degraded"], false, "{j}");
+    let hit = |j: &Value| -> Value {
+        j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["entry_id"] == json!(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("insight не найден: {j}"))
+    };
+    // вектор запрошен до записи точек: insight только из FTS, и ответ это признаёт
+    assert!(
+        !hit(&j)["sources"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("vector")),
+        "{j}"
+    );
+    assert_eq!(j["pending_count"], 1, "{j}");
+
+    // повторный поиск: индексация догнала, insight виден вектору
+    let j = search(&a, body).await.json();
+    assert_eq!(j["pending_count"], 0, "{j}");
+    assert!(
+        hit(&j)["sources"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("vector")),
+        "{j}"
+    );
+    a.st.shutdown().await;
+}
+
+/// `filters.insight_kinds` в векторном канале (задача 13, раунд 1): при `kinds = [insight]`
+/// фильтр уходит в Qdrant (`insight_kind`), при видах по умолчанию insight чужих видов
+/// отсеивает перепроверка SQLite; находки вектора нужных видов остаются, `gotcha` — нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insight_kinds_filter_in_vector_channel() {
+    if !have(MINILM) {
+        eprintln!("пропуск insight_kinds_filter_in_vector_channel: нужна модель {MINILM}");
+        return;
+    }
+    let q = TestQdrant::start("hyb-insight-kinds");
+    let a = api("hyb-insight-kinds", |c| {
+        ml(c, MINILM);
+        external(c, &q);
+    })
+    .await;
+    vector_ready(&a).await;
+    let mut ids = Vec::new();
+    for (kind, title) in [
+        ("gotcha", "Shell scripts need LF line endings"),
+        ("failure", "Shell script with CRLF failed on Linux"),
+        (
+            "experiment",
+            "Converting shell scripts to LF fixed bad interpreter",
+        ),
+    ] {
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/spaces/knowledge/entries",
+                Some(json!({
+                    "kind": "insight",
+                    "title": title,
+                    "body": "A shell script saved with Windows CRLF line endings fails on \
+                             Linux with bad interpreter. Convert the file to LF.",
+                    "data": {"kind": kind},
+                    "force": true,
+                })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        ids.push(r.json()["id"].as_str().unwrap().to_string());
+    }
+    let limit = Duration::from_secs(240);
+    let query = "Windows line endings break the shell script interpreter";
+    until(
+        "insight проиндексированы",
+        limit,
+        async || {
+            let j = search(
+                &a,
+                json!({"query": query, "top_k": 10, "filters": {"kinds": ["insight"]}}),
+            )
+            .await
+            .json();
+            j["pending_count"] == 0 && j["items"].as_array().is_some_and(|i| i.len() == 3)
+        },
+    )
+    .await;
+    for filters in [
+        json!({"kinds": ["insight"], "insight_kinds": ["failure", "experiment"]}),
+        json!({"insight_kinds": ["failure", "experiment"]}),
+    ] {
+        let r = search(&a, json!({"query": query, "top_k": 10, "filters": filters})).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let j = r.json();
+        let items = j["items"].as_array().unwrap();
+        let got: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i["entry_id"].as_str())
+            .collect();
+        assert!(!got.contains(&ids[0].as_str()), "gotcha отсеян: {j}");
+        for want in &ids[1..] {
+            let hit = items
+                .iter()
+                .find(|i| i["entry_id"] == json!(want))
+                .unwrap_or_else(|| panic!("{want} не найден: {j}"));
+            assert!(
+                hit["sources"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("vector")),
+                "{j}"
+            );
+        }
+    }
+    a.st.shutdown().await;
 }

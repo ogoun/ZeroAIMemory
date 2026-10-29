@@ -168,7 +168,8 @@ async fn session_start_digest_within_budget() {
     assert_eq!(
         j["hooks"],
         json!({"session_start": true, "prompt": true, "pre_tool": true, "post_tool": true,
-               "checkpoint": true})
+               "checkpoint": true, "subagent_start": true, "file_context": true,
+               "session_journal": true, "recovery": true})
     );
     for k in ["collect_ms", "record_ms", "total_ms"] {
         assert!(j["timings"][k].is_number(), "{k}: {j}");
@@ -286,7 +287,7 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
     );
     assert!(
         text.contains(
-            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v2): обнови через `zam init` или WebUI"
+            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v3): обнови через `zam init` или WebUI"
         ),
         "{text}"
     );
@@ -320,7 +321,7 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
         &a,
         &a_tok,
         Some("d2"),
-        json!({"event": "session_start", "agent_block_version": 2}),
+        json!({"event": "session_start", "agent_block_version": zam_core::AGENT_BLOCK_VERSION}),
     )
     .await;
     let text = j["text"].as_str().unwrap();
@@ -1090,7 +1091,8 @@ async fn recall_disabled_hook_kind_is_silent() {
     assert_eq!(
         j["hooks"],
         json!({"session_start": false, "prompt": false, "pre_tool": true,
-               "post_tool": false, "checkpoint": true})
+               "post_tool": false, "checkpoint": true, "subagent_start": true,
+               "file_context": true, "session_journal": true, "recovery": true})
     );
     let j = ok(
         &a,
