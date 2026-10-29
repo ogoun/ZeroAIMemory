@@ -18,6 +18,10 @@
 //!
 //! Подсказка: `ZeroAIMemory: для <маска>: <title> [<вид>, <certainty>] — i:<id>`, для команды —
 //! без «для …». Показ `pre_tool` в `usage` сервера не пишется: сети здесь нет.
+//!
+//! M4.5 §9.4: запуск субагента (инструмент `Agent`/`Task`, matcher `Agent|Task` регистрирует
+//! `zam init`) — запись `{at, agent_type, task}` в очередь `spawn-<сессия>.json`; её берёт
+//! `subagent-start`. Пишется по ключу `subagent_start`, независимо от `pre_tool`.
 use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
@@ -64,10 +68,50 @@ pub fn patch_files(patch: &str) -> Vec<String> {
     out
 }
 
+/// Инструмент запуска субагента у Claude Code (`Agent`; прежнее имя — `Task`).
+pub fn is_spawn_tool(name: &str) -> bool {
+    matches!(name, "Agent" | "Task")
+}
+
+/// Тип субагента, если `subagent_type` не задан (так делает сам Claude Code).
+pub const DEFAULT_AGENT_TYPE: &str = "general-purpose";
+
+/// Запуск субагента — в очередь `spawn-<сессия>.json` (§9.4): тип и первые 2000 символов
+/// `tool_input.prompt`. Ключ `subagent_start` выключен или нет сессии — ничего.
+fn queue_spawn(env: &Env, inp: &Input, s: &Settings, session: Option<&str>) {
+    let Some(id) = session else { return };
+    if !s.on(Kind::SubagentStart) {
+        return;
+    }
+    let agent_type = inp
+        .tool_input("subagent_type")
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(DEFAULT_AGENT_TYPE);
+    let task: String = inp
+        .tool_input("prompt")
+        .unwrap_or_default()
+        .chars()
+        .take(super::input::PROMPT_SALVAGE_CHARS)
+        .collect();
+    cache::push_spawn(
+        env,
+        id,
+        cache::Spawn {
+            at: super::journal::Timestamp::now(),
+            agent_type: agent_type.chars().take(128).collect(),
+            task,
+        },
+    );
+}
+
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     let tool = inp.str("tool_name").unwrap_or_default();
     let hints_on = s.on(Kind::PreTool);
     let session = inp.session_id.as_deref();
+    if is_spawn_tool(tool) {
+        queue_spawn(env, inp, s, session);
+    }
     if is_edit_tool(tool)
         && s.on(Kind::Checkpoint)
         && let Some(id) = session

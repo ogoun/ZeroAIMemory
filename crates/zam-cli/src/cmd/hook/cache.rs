@@ -15,6 +15,9 @@
 //!   `post-tool`, отправляют `POST /files/changed` `prompt`, `session-start` и `checkpoint`
 //!   ([`flush_changed`]);
 //! - `events-<сессия>.jsonl` — журнал событий сессии ([`super::journal`]);
+//! - `spawn-<сессия>.json` — очередь запусков субагентов `[{at, agent_type, task}]` (M4.5
+//!   §9.4): пополняет `pre-tool` на `Agent`/`Task`, берёт `subagent-start` ([`take_spawn`]);
+//!   до [`SPAWN_MAX`] записей, каждая живёт [`SPAWN_TTL`]; правка — под замком `.spawn-….lock`;
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
 //!   `shown-*`/`edits-*`/`events-*`/`changed-*` старше [`SHOWN_TTL`] и временные `.*.tmp`
 //!   старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
@@ -623,8 +626,122 @@ pub fn write_shown(env: &Env, session: &str, s: &Shown) {
     }
 }
 
-/// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`)
-/// старше [`SHOWN_TTL`] и временные `.*.tmp` старше [`TMP_TTL`].
+/// Срок записи очереди запусков субагентов (§9.4).
+pub const SPAWN_TTL: Duration = Duration::from_secs(10 * 60);
+/// Записей в очереди запусков субагентов: больше — старейшие отбрасываются.
+pub const SPAWN_MAX: usize = 8;
+/// Замок очереди запусков старше этого — брошен (процесс хука живёт ≤ 300 мс).
+const SPAWN_LOCK_TTL: Duration = Duration::from_secs(5);
+/// Ожидание замка очереди запусков: дольше — работа без замка (fail-open).
+const SPAWN_LOCK_WAIT: Duration = Duration::from_millis(20);
+
+/// Запуск субагента, замеченный `pre-tool` (Claude: инструмент `Agent`/`Task`): тип и начало
+/// задачи (`tool_input.prompt`, до 2000 символов); `at` — миллисекунды Unix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spawn {
+    pub at: super::journal::Timestamp,
+    pub agent_type: String,
+    pub task: String,
+}
+
+pub fn spawn_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("spawn-{}.json", session_file_part(session)))
+}
+
+/// Замок очереди запусков: файл `.spawn-….lock` (создаётся только новым); брошенный старше
+/// [`SPAWN_LOCK_TTL`] снимается; не взят за [`SPAWN_LOCK_WAIT`] — `None` (без замка).
+fn spawn_lock(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let lock = path.with_file_name(format!(".{name}.lock"));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    let t0 = std::time::Instant::now();
+    loop {
+        if o.open(&lock).is_ok() {
+            return Some(lock);
+        }
+        let stale = std::fs::metadata(&lock)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|a| a > SPAWN_LOCK_TTL);
+        if stale {
+            let _ = std::fs::remove_file(&lock);
+            continue;
+        }
+        if t0.elapsed() >= SPAWN_LOCK_WAIT {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Очередь запусков под замком: живые записи (моложе [`SPAWN_TTL`], старейшие первыми)
+/// передаются `f`, итог пишется обратно (пусто — файл удаляется). Результат `f`.
+fn with_spawns<T>(env: &Env, session: &str, f: impl FnOnce(&mut Vec<Spawn>) -> T) -> T {
+    let path = spawn_path(env, session);
+    let _ = std::fs::create_dir_all(env.cache_dir());
+    let lock = spawn_lock(&path);
+    let mut q: Vec<Spawn> = match read_json_file::<Vec<Spawn>>(&path) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => {
+            env.log(&format!(
+                "очередь запусков субагентов битая, начата заново: {e}"
+            ));
+            Vec::new()
+        }
+    };
+    let before = q.clone();
+    let now = super::journal::Timestamp::now().0;
+    let ttl = SPAWN_TTL.as_millis() as u64;
+    q.retain(|s| now.saturating_sub(s.at.0) <= ttl);
+    q.sort_by_key(|s| s.at);
+    let out = f(&mut q);
+    if q != before || (q.is_empty() && path.exists()) {
+        let r = if q.is_empty() {
+            std::fs::remove_file(&path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+        } else {
+            write_json_file(&path, &q)
+        };
+        if let Err(e) = r {
+            env.log(&format!("запись очереди запусков субагентов: {e}"));
+        }
+    }
+    if let Some(l) = lock {
+        let _ = std::fs::remove_file(l);
+    }
+    out
+}
+
+/// Добавляет запуск в очередь сессии (до [`SPAWN_MAX`], старейшие отбрасываются).
+pub fn push_spawn(env: &Env, session: &str, s: Spawn) {
+    with_spawns(env, session, |q| {
+        q.push(s);
+        let extra = q.len().saturating_sub(SPAWN_MAX);
+        q.drain(..extra);
+    });
+}
+
+/// Берёт из очереди сессии старейший живой запуск с типом `agent_type` (без учёта регистра
+/// ASCII); нет такого — `None`, очередь не меняется (кроме отброса просроченных).
+pub fn take_spawn(env: &Env, session: &str, agent_type: &str) -> Option<Spawn> {
+    with_spawns(env, session, |q| {
+        let i = q
+            .iter()
+            .position(|s| s.agent_type.eq_ignore_ascii_case(agent_type))?;
+        Some(q.remove(i))
+    })
+}
+
+/// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`,
+/// `spawn-*.json`) старше [`SHOWN_TTL`] и временные `.*.tmp` и замки старше [`TMP_TTL`].
 pub fn gc_cache(env: &Env) {
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
         return;
@@ -635,7 +752,8 @@ pub fn gc_cache(env: &Env) {
         let session_file = (n.starts_with("shown-") && n.ends_with(".json"))
             || n.starts_with("edits-")
             || (n.starts_with("events-") && n.ends_with(".jsonl"))
-            || (n.starts_with("changed-") && n.ends_with(".jsonl"));
+            || (n.starts_with("changed-") && n.ends_with(".jsonl"))
+            || (n.starts_with("spawn-") && n.ends_with(".json"));
         let ttl = if session_file {
             SHOWN_TTL
         } else if n.starts_with('.')

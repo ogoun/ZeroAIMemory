@@ -2280,3 +2280,271 @@ fn post_tool_loop_third_time_hint() {
     // другая сессия — счёт заново
     assert!(!run("lp2", "Error: boom at a.js:1:1").contains(LOOP));
 }
+
+// ---------- M4.5, задача 10: очередь запусков субагентов, `subagent-start` ----------
+
+/// `PreToolUse` запуска субагента (Claude: `Agent`/`Task`).
+fn spawn_ev(p: &Proj, session: &str, tool: &str, agent_type: Option<&str>, prompt: &str) -> Value {
+    let mut ti = json!({"description": "d", "prompt": prompt});
+    if let Some(t) = agent_type {
+        ti["subagent_type"] = json!(t);
+    }
+    p.ev(
+        "PreToolUse",
+        session,
+        json!({"tool_name": tool, "tool_use_id": "u1", "tool_input": ti}),
+    )
+}
+
+fn sub_ev(p: &Proj, session: &str, agent_id: &str, agent_type: &str) -> Value {
+    p.ev(
+        "SubagentStart",
+        session,
+        json!({"agent_id": agent_id, "agent_type": agent_type}),
+    )
+}
+
+/// Очередь запусков сессии (`spawn-<сессия>.json`); нет файла — пусто.
+fn spawns(p: &Proj, session: &str) -> Vec<Value> {
+    let Some(f) = p.session_file("spawn", session, ".json") else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<Value>>(&std::fs::read_to_string(f).unwrap()).unwrap()
+}
+
+/// `pre-tool` без сети на сервере `DEAD`.
+fn pre_dead(p: &Proj, ev: &Value) -> Output {
+    p.hook_at(DEAD, "pre-tool", "claude", ev.to_string().as_bytes())
+        .0
+}
+
+/// `pre-tool` на `Agent`/`Task` пишет запуск в очередь: тип (нет — `general-purpose`) и первые
+/// 2000 символов задачи; вывода нет. Выключенный `pre_tool` очередь не гасит, выключенный
+/// `subagent_start` — гасит.
+#[test]
+fn pre_tool_agent_queues_spawn() {
+    let _g = serial();
+    let p = Proj::new("spawn-queue", DEAD, "zam_x");
+    let long = format!("Найди кэш {}", "я".repeat(3000));
+    empty(&pre_dead(
+        &p,
+        &spawn_ev(&p, "sq", "Agent", Some("Explore"), &long),
+    ));
+    empty(&pre_dead(&p, &spawn_ev(&p, "sq", "Task", None, "вторая")));
+    let q = spawns(&p, "sq");
+    assert_eq!(q.len(), 2, "{q:?}");
+    assert_eq!(q[0]["agent_type"], "Explore");
+    let task = q[0]["task"].as_str().unwrap();
+    assert_eq!(task.chars().count(), 2000);
+    assert!(task.starts_with("Найди кэш я"), "{task}");
+    assert!(q[0]["at"].as_u64().unwrap() > 0);
+    assert_eq!(q[1]["agent_type"], "general-purpose");
+    assert_eq!(q[1]["task"], "вторая");
+    // другой инструмент — не запуск
+    empty(&pre_dead(&p, &spawn_ev(&p, "sq", "Bash", Some("x"), "y")));
+    assert_eq!(spawns(&p, "sq").len(), 2);
+    let cfg = p.repo.join(".zeroaimemory/config.toml");
+    std::fs::write(&cfg, "[hooks]\npre_tool = false\n").unwrap();
+    pre_dead(&p, &spawn_ev(&p, "sq", "Agent", Some("Plan"), "третья"));
+    assert_eq!(spawns(&p, "sq").len(), 3);
+    std::fs::write(&cfg, "[hooks]\nsubagent_start = false\n").unwrap();
+    pre_dead(&p, &spawn_ev(&p, "sq", "Agent", Some("Plan"), "четвёртая"));
+    assert_eq!(spawns(&p, "sq").len(), 3);
+}
+
+/// До 8 записей (старейшие отбрасываются); запись старше 10 минут не выдаётся и удаляется;
+/// выданная запись уходит из очереди (тип — без учёта регистра).
+#[test]
+fn spawn_queue_ttl_and_cap() {
+    let _g = serial();
+    let p = Proj::new("spawn-ttl", DEAD, "zam_x");
+    for i in 0..10 {
+        pre_dead(
+            &p,
+            &spawn_ev(&p, "st", "Agent", Some("Explore"), &format!("t{i}")),
+        );
+    }
+    let q = spawns(&p, "st");
+    let tasks: Vec<&str> = q.iter().map(|s| s["task"].as_str().unwrap()).collect();
+    assert_eq!(tasks, ["t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9"]);
+    // просроченная запись: время первой — 11 минут назад
+    let f = p.session_file("spawn", "st", ".json").unwrap();
+    let mut q = q.clone();
+    let now = q[7]["at"].as_u64().unwrap();
+    q[0]["at"] = json!(now - 11 * 60 * 1000);
+    q[0]["agent_type"] = json!("Plan");
+    std::fs::write(&f, serde_json::to_string(&q).unwrap()).unwrap();
+    // сервер выключен: вывода нет, но очередь обработана
+    let sub = |id: &str, t: &str| {
+        p.hook_at(
+            DEAD,
+            "subagent-start",
+            "claude",
+            sub_ev(&p, "st", id, t).to_string().as_bytes(),
+        )
+        .0
+    };
+    empty(&sub("a1", "Plan"));
+    let tasks: Vec<String> = spawns(&p, "st")
+        .iter()
+        .map(|s| s["task"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tasks, ["t3", "t4", "t5", "t6", "t7", "t8", "t9"]);
+    // старейшая подходящая уходит
+    empty(&sub("a2", "explore"));
+    let q = spawns(&p, "st");
+    assert_eq!(q.len(), 6);
+    assert_eq!(q[0]["task"], "t4");
+}
+
+/// Сервер с ловушками в Knowledge: запуск субагента `Plan` с задачей про пульсар — пакет под
+/// задачу (только найденное), сессия `<session>:<agent_id>` с `parent_id` и `agent_type`,
+/// событие `subagent` в журнале родителя; запись `Explore` остаётся в очереди.
+#[test]
+fn subagent_start_uses_matching_spawn() {
+    let _g = serial();
+    let (url, tok) = start("subagent-match");
+    let p = Proj::new("subagent-match", &url, &tok);
+    let pulsar = p.insight("Пульсар мигает по таймеру", "gotcha", "global", &[]);
+    let quasar = p.insight("Квазар светит ярко", "gotcha", "global", &[]);
+    for (t, task) in [("Explore", "квазар светит"), ("Plan", "пульсар мигает")]
+    {
+        p.hook("pre-tool", &spawn_ev(&p, "sm", "Agent", Some(t), task));
+    }
+    let c = context(
+        &p.hook("subagent-start", &sub_ev(&p, "sm", "ag-1", "Plan")),
+        "SubagentStart",
+    );
+    assert!(c.contains("### Ловушки"), "{c}");
+    assert!(c.contains(&format!("i:{pulsar}")), "{c}");
+    assert!(!c.contains(&format!("i:{quasar}")), "{c}");
+    let q = spawns(&p, "sm");
+    assert_eq!(q.len(), 1, "{q:?}");
+    assert_eq!(q[0]["agent_type"], "Explore");
+    let s = p.session("sm:ag-1");
+    assert_eq!(s["parent_id"], "sm", "{s}");
+    assert_eq!(s["agent_type"], "Plan", "{s}");
+    assert_eq!(s["agent"], "claude-code", "{s}");
+    assert_eq!(s["solution"], G, "{s}");
+    let ev = events(&p, "sm");
+    assert!(
+        ev.iter()
+            .any(|e| e["ev"] == "subagent" && e["agent_type"] == "Plan" && e["agent_id"] == "ag-1"),
+        "{ev:?}"
+    );
+    // Codex: тот же формат вывода
+    p.hook(
+        "pre-tool",
+        &spawn_ev(&p, "sm", "Agent", Some("Plan"), "пульсар мигает"),
+    );
+    let (o, _) = p.hook_at(
+        &url,
+        "subagent-start",
+        "codex",
+        sub_ev(&p, "sm", "ag-2", "Plan").to_string().as_bytes(),
+    );
+    assert!(context(&o, "SubagentStart").contains(&format!("i:{pulsar}")));
+    // выключенный subagent_start — тишина
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]\nsubagent_start = false\n",
+    )
+    .unwrap();
+    empty(&p.hook("subagent-start", &sub_ev(&p, "sm", "ag-3", "Explore")));
+}
+
+/// Нет подходящей записи в очереди — общий мини-дайджест (ловушки, без разделов пакета под
+/// задачу); очередь другого типа не трогается; без `agent_id` — пакет в сессии родителя.
+#[test]
+fn subagent_start_without_spawn_generic() {
+    let _g = serial();
+    let (url, tok) = start("subagent-generic");
+    let p = Proj::new("subagent-generic", &url, &tok);
+    let pulsar = p.insight("Пульсар мигает по таймеру", "gotcha", "global", &[]);
+    let quasar = p.insight("Квазар светит ярко", "gotcha", "global", &[]);
+    p.hook(
+        "pre-tool",
+        &spawn_ev(&p, "sg", "Agent", Some("Explore"), "квазар"),
+    );
+    let c = context(
+        &p.hook("subagent-start", &sub_ev(&p, "sg", "ag-1", "Plan")),
+        "SubagentStart",
+    );
+    assert!(c.contains("### Ловушки"), "{c}");
+    assert!(c.contains(&format!("i:{pulsar}")), "{c}");
+    assert!(c.contains(&format!("i:{quasar}")), "{c}");
+    for s in ["### Решения", "### Термины", "### Файлы"] {
+        assert!(!c.contains(s), "{s}: {c}");
+    }
+    assert_eq!(spawns(&p, "sg").len(), 1);
+    let ev = p.ev("SubagentStart", "sg2", json!({"agent_type": "Plan"}));
+    let c = context(&p.hook("subagent-start", &ev), "SubagentStart");
+    assert!(c.contains("### Ловушки"), "{c}");
+    assert_eq!(p.session("sg2")["id"], "sg2");
+}
+
+/// Сервер недоступен — тишина и код 0; событие `subagent` в журнале есть, запись очереди взята.
+#[test]
+fn subagent_start_server_down_silent() {
+    let _g = serial();
+    let p = Proj::new("subagent-down", DEAD, "zam_x");
+    pre_dead(&p, &spawn_ev(&p, "sd", "Agent", Some("Plan"), "пульсар"));
+    assert_eq!(spawns(&p, "sd").len(), 1);
+    let (o, d) = p.hook_at(
+        DEAD,
+        "subagent-start",
+        "claude",
+        sub_ev(&p, "sd", "a1", "Plan").to_string().as_bytes(),
+    );
+    empty(&o);
+    assert!(d <= OTHER_MAX, "{d:?}");
+    assert!(spawns(&p, "sd").is_empty());
+    let ev = events(&p, "sd");
+    assert!(ev.iter().any(|e| e["ev"] == "subagent"), "{ev:?}");
+}
+
+/// Бюджет 300 мс: с живым сервером p95 ≤ 1200 мс (×4, как `session-start`); сервер, который
+/// принимает соединение и молчит, — тишина не дольше 1 с.
+#[test]
+fn subagent_start_budget_300ms() {
+    let _g = serial();
+    let (url, tok) = start("subagent-budget");
+    let p = Proj::new("subagent-budget", &url, &tok);
+    p.insight("Пульсар мигает по таймеру", "gotcha", "global", &[]);
+    let mut times = Vec::new();
+    for i in 0..20 {
+        let s = format!("sb{i}");
+        p.hook(
+            "pre-tool",
+            &spawn_ev(&p, &s, "Agent", Some("Plan"), "пульсар мигает"),
+        );
+        let (o, d) = p.hook_at(
+            &url,
+            "subagent-start",
+            "claude",
+            sub_ev(&p, &s, "a1", "Plan").to_string().as_bytes(),
+        );
+        assert!(!ok(&o).trim().is_empty(), "#{i}: пустой ответ");
+        times.push(d);
+    }
+    let q = p95(times);
+    eprintln!("ZAM_TIMING subagent-start p95={q:?}");
+    assert!(q <= max_for("session-start"), "p95 {q:?}");
+    // «чёрная дыра»: соединение принято, ответа нет
+    let hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("http://{}", hole.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut keep = Vec::new();
+        for s in hole.incoming().flatten() {
+            keep.push(s);
+        }
+    });
+    let (o, d) = p.hook_at(
+        &addr,
+        "subagent-start",
+        "claude",
+        sub_ev(&p, "sb-hole", "a1", "Plan").to_string().as_bytes(),
+    );
+    empty(&o);
+    assert!(d <= OTHER_MAX, "{d:?}");
+}

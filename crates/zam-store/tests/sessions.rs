@@ -399,3 +399,49 @@ async fn latest_session_by_machine_and_age() {
         None
     );
 }
+
+/// Сессия субагента (M4.5 §9.4, миграция 0017): `parent_id` и `agent_type` пишутся, повторное
+/// касание без них их не стирает; длинный или с управляющими символами тип — ошибка ввода.
+/// `session_tokens` удаляется вместе с сессией сроком хранения.
+#[tokio::test]
+async fn subagent_session_fields_and_tokens_gc() {
+    let (_dd, db) = db("subagent").await;
+    let sub = SessionTouch {
+        id: "s1:a7".into(),
+        parent_id: Some("s1".into()),
+        agent_type: Some("Explore".into()),
+        ..SessionTouch::default()
+    };
+    touch_session(&db, &sub).await.unwrap();
+    touch_session(&db, &touch("s1:a7")).await.unwrap();
+    let s = get_session(&db, "s1:a7").await.unwrap().unwrap();
+    assert_eq!(s.parent_id.as_deref(), Some("s1"));
+    assert_eq!(s.agent_type.as_deref(), Some("Explore"));
+    let s = serde_json::to_value(&s).unwrap();
+    assert_eq!(s["parent_id"], "s1");
+    assert_eq!(s["agent_type"], "Explore");
+    for bad in ["x".repeat(129), "a\u{7}b".to_string()] {
+        let t = SessionTouch {
+            agent_type: Some(bad),
+            ..touch("s2")
+        };
+        assert!(touch_session(&db, &t).await.is_err());
+    }
+    db.write(|t| {
+        t.execute(
+            "INSERT INTO session_tokens (session_id, event, calls, tokens)
+             VALUES ('s1:a7', 'brief', 1, 120)",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let later = Timestamp::now() + SignedDuration::from_hours(1);
+    assert_eq!(gc_sessions(&db, later).await.unwrap(), 1);
+    let n: i64 = db
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM session_tokens", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}

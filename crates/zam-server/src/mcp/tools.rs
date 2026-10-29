@@ -119,10 +119,10 @@ impl ToolName {
                  связь; remove: <edge_id> — удалить её."
             }
             ToolName::Recall => {
-                "Подсказки памяти к событию: session_start — дайджест (Rules, решение, gotcha, \
-                 revisit, changelog), prompt — к запросу пользователя, post_tool — к ошибке \
-                 инструмента (error, tool), recovery — после сжатия контекста (задачи, ответы, \
-                 решения). Повторы в сессии отсекаются."
+                "Подсказки памяти к событию: session_start — дайджест, prompt — к запросу \
+                 пользователя, post_tool — к ошибке инструмента (error, tool), recovery — после \
+                 сжатия контекста, brief — пакет под задачу task (для задания субагенту и первым \
+                 вызовом субагента). Повторы в сессии отсекаются."
             }
             ToolName::Vault => {
                 "Vault: list — секреты без значений, get — значение по name (раскрытие пишется в \
@@ -296,8 +296,10 @@ impl ToolName {
             ),
             ToolName::Recall => (
                 json!({
-                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery"]},
+                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery", "brief"]},
                     "prompt": {"type": "string"},
+                    "task": {"type": "string",
+                        "description": "brief: задача субагента, до 2000 символов"},
                     "error": {"type": "string"},
                     "tool": {"type": "string"},
                     "session_id": {"type": "string",
@@ -1195,6 +1197,7 @@ async fn recall(rest: &Rest, args: &JsonObject) -> Res {
         &[
             "event",
             "prompt",
+            "task",
             "error",
             "tool",
             "session_id",

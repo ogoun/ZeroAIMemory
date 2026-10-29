@@ -92,6 +92,8 @@ pub fn session_touch(
         area: header_value(headers, AREA_HEADER)?,
         machine: header_value(headers, MACHINE_HEADER)?,
         agent: None,
+        parent_id: None,
+        agent_type: None,
     }))
 }
 

@@ -1,12 +1,15 @@
 //! Сессии агентов (§6.3, §10.3, §12; задача 5 M4).
 //!
-//! - `POST /sessions {id?, agent?, solution?, area?}` → 201 `{id}`: без `id` — UUIDv7;
-//!   существующая сессия обновляется (известные поля дописываются, `last_seen_at` — сейчас).
-//!   Машина и токен — из `X-Zam-Machine` и принципала;
+//! - `POST /sessions {id?, agent?, solution?, area?, parent_id?, agent_type?}` → 201 `{id}`:
+//!   без `id` — UUIDv7; существующая сессия обновляется (известные поля дописываются,
+//!   `last_seen_at` — сейчас). Машина и токен — из `X-Zam-Machine` и принципала. `parent_id` и
+//!   `agent_type` (до 128 печатных символов) — сессия субагента (M4.5 §9.4): её создаёт хук
+//!   `subagent-start` с id `<session>:<agent_id>`;
 //! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
-//! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, started_at, last_seen_at,
-//!   ended_at, memory_writes, claimed_tasks: [{id, title, status}]}` (решение контроллера R6,
-//!   читает хук `checkpoint`; `claimed_tasks` — задачи журнала, захваченные сессией, M4.5);
+//! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, parent_id, agent_type,
+//!   started_at, last_seen_at, ended_at, memory_writes, claimed_tasks: [{id, title, status}]}`
+//!   (решение контроллера R6, читает хук `checkpoint`; `claimed_tasks` — задачи журнала,
+//!   захваченные сессией, M4.5);
 //! - `GET /sessions?solution=&limit=` → `{items}` — свои, свежие первыми (50, до 500).
 //!
 //! Сессия лежит в базе пользователя запроса (у администратора — `X-Zam-User` или он сам):
@@ -104,6 +107,8 @@ pub struct NewSession {
     agent: Option<String>,
     solution: Option<String>,
     area: Option<String>,
+    parent_id: Option<String>,
+    agent_type: Option<String>,
 }
 
 /// `POST /sessions`.
@@ -131,6 +136,8 @@ pub async fn create(
         area: blank(req.area),
         machine: header_value(&headers, MACHINE_HEADER)?,
         agent: blank(req.agent),
+        parent_id: blank(req.parent_id),
+        agent_type: blank(req.agent_type),
     };
     let db = requester_db(&st, &p, &headers).await?;
     touch_session(&db, &touch).await?;

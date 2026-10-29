@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! POST /recall {event, session_id?, solution?, area?, prompt?, error?, tool?, budget_tokens?,
-//!               agent_block_version?}
+//!               agent_block_version?, task?, parent_id?}
 //!   → 200 {text, items: [{id, kind, title, certainty, reason}], tokens, timings, warnings,
 //!          hooks?}
 //! ```
@@ -84,10 +84,21 @@
 //!   дайджест в остатке бюджета (уведомления, открытые вопросы, правила, словарь, …).
 //!   Ключ пользователя `hooks.recovery` выключен — обычный дайджест; `hooks.session_start`
 //!   выключен — тишина и для `recovery`. `hooks` в ответе — только у `session_start`;
+//! - **пакет под задачу `brief`** (M4.5 §9.4) — `task` (первые [`BRIEF_TASK_MAX_CHARS`]
+//!   символов, длиннее — обрезка и `warnings: ["task truncated"]`), бюджет по умолчанию
+//!   `recall.brief_tokens` (800); разделы: `### Правила` (L0 заметок Rules), `### Решения`
+//!   (действующие `decision` с `axiom`/`theorem` по поиску `task`, до 3), `### Термины`
+//!   (термины словаря в `task`, до 5, с определением), `### Ловушки` (действующие
+//!   `gotcha`/`failure` по поиску `task`, до 3), `### Файлы` (записи со ссылками на пути из
+//!   `task` — индекс `file_refs` решения, до 3). Без `task` — мини-дайджест: правила L0,
+//!   ловушки решения и Knowledge, `### Задачи` (захваченные `parent_id` или сессией — первыми).
+//!   Поиск — `mode=brief`, балл ≥ `recall.prompt_min_score`. Повторы не отсекаются (у субагента
+//!   свой контекст); показ учитывается (`usage.source = brief`). Гасит ключ пользователя
+//!   `hooks.subagent_start`;
 //! - неизвестные поля тела игнорируются (клиент хуков может быть новее); прочие `source` хука
 //!   (`startup | clear | fork`) — обычный дайджест, `source` пишется в журнал DEBUG;
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
-//!   recovery` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
+//!   recovery | brief` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
 //!
 //! Маршрут — служебный, рядом с `/search` и `/read`: `/recall` пишет только `usage` и
 //! `session_seen`, а не память, поэтому `memory_writes` не растёт (решение контроллера R12).
@@ -176,30 +187,53 @@ enum Event {
     PostTool,
     /// Пакет восстановления (M4.5 §9.2) для агентов без `SessionStart compact`.
     Recovery,
+    /// Пакет под задачу (M4.5 §9.4): хук `subagent-start` и MCP.
+    Brief,
 }
 
 impl Event {
     /// Тип подсказки в настройках пользователя `hooks.<тип>` (R5). Пакет восстановления —
     /// разновидность дайджеста: его гасит `session_start`, а ключ `recovery` лишь выбирает
-    /// пакет вместо обычного дайджеста.
+    /// пакет вместо обычного дайджеста. Пакет под задачу гасит `subagent_start`.
     fn hook_kind(self) -> &'static str {
         match self {
             Event::SessionStart | Event::Recovery => "session_start",
             Event::Prompt => "prompt",
             Event::PostTool => "post_tool",
+            Event::Brief => "subagent_start",
         }
     }
 
-    /// Источник показа в `usage`: у пакета восстановления — `session_start` (новое значение
-    /// `source` потребовало бы миграции).
+    /// Источник показа в `usage`: у пакета восстановления — `session_start` (так с задачи 9),
+    /// у пакета под задачу — `brief` (в `usage.source` нет CHECK, миграция не нужна).
     fn source(self) -> UsageSource {
         match self {
             Event::SessionStart | Event::Recovery => UsageSource::SessionStart,
             Event::Prompt => UsageSource::Prompt,
             Event::PostTool => UsageSource::PostTool,
+            Event::Brief => UsageSource::Brief,
         }
     }
 }
+
+/// Предел `task` пакета под задачу, символов (§9.4): длиннее — обрезка.
+pub const BRIEF_TASK_MAX_CHARS: usize = 2000;
+/// Предупреждение: `task` длиннее [`BRIEF_TASK_MAX_CHARS`] и обрезан.
+pub const WARN_TASK_TRUNCATED: &str = "task truncated";
+/// Решений, ловушек, файлов и задач в пакете под задачу — каждого.
+pub const BRIEF_ENTRIES_MAX: usize = 3;
+/// Терминов в пакете под задачу.
+pub const BRIEF_TERMS_MAX: usize = 5;
+/// Кандидатов поиска пакета под задачу до отбора видов и балла.
+const BRIEF_SEARCH_TOP_K: usize = 30;
+/// Путей из `task`, проверяемых по индексу ссылок.
+const BRIEF_PATHS_MAX: usize = 32;
+/// Заголовки разделов (общие для дайджеста и пакетов).
+const SECTION_RULES: &str = "### Правила";
+const SECTION_TASKS: &str = "### Задачи";
+const SECTION_TERMS: &str = "### Термины";
+const SECTION_TRAPS: &str = "### Ловушки";
+const SECTION_FILES: &str = "### Файлы";
 
 /// `source` хука `SessionStart`, после которого строится пакет восстановления.
 const RECOVERY_SOURCES: [&str; 2] = ["compact", "resume"];
@@ -228,6 +262,10 @@ pub struct RecallReq {
     /// Учитывать показ (`session_seen`, `usage`); `false` — хук `session-start` с выключенным в
     /// клиенте дайджестом зовёт `/recall` только ради `hooks` (задача 10, fix round 2).
     record: Option<bool>,
+    /// Задача пакета `brief` (§9.4); нет или пусто — мини-дайджест.
+    task: Option<String>,
+    /// Сессия родителя (`brief` субагента): её захваченные задачи — первыми в мини-дайджесте.
+    parent_id: Option<String>,
 }
 
 /// Кандидат в подсказки.
@@ -599,7 +637,7 @@ async fn digest(
             .flatten()
     });
     let tasks = task_cands(health, deadline, &insight_spaces, session.as_deref()).await?;
-    sections.push((Some("### Задачи"), tasks));
+    sections.push((Some(SECTION_TASKS), tasks));
     // ответы человека и открытые вопросы — сразу после задач (M4.5 §4)
     let (answers, open_line) = question_cands(health, deadline, &insight_spaces).await?;
     sections.push((Some(SECTION_ANSWERS), answers));
@@ -670,7 +708,7 @@ async fn digest(
             }
         }
     }
-    sections.push((Some("### Правила"), rules));
+    sections.push((Some(SECTION_RULES), rules));
 
     // L1 решения — корневые узлы пространства решения с L0
     let mut overview: Vec<Cand> = Vec::new();
@@ -719,30 +757,7 @@ async fn digest(
     sections.push((Some("### Решение"), overview));
 
     // действующие gotcha/failure, revisit — решение и Knowledge; changelog — решение
-    let mut traps: Vec<(usize, Entry)> = Vec::new();
-    for kind in ["gotcha", "failure"] {
-        traps.extend(
-            entries_of(health, deadline, &insight_spaces, |s| EntryFilter {
-                statuses: vec![EntryStatus::Active],
-                data_kind: Some(kind.to_string()),
-                decided_by: None,
-                ..entry_filter(s, EntryKind::Insight)
-            })
-            .await?,
-        );
-    }
-    traps.sort_by_key(|e| std::cmp::Reverse((e.1.created_at, e.1.id)));
-    let traps = traps
-        .iter()
-        .map(|(i, e)| {
-            let reason = if data_kind(e) == "failure" {
-                "failure"
-            } else {
-                "gotcha"
-            };
-            entry_cand(*i, e, reason, "")
-        })
-        .collect();
+    let traps = trap_cands(health, deadline, &insight_spaces).await?;
     sections.push((Some("### Ловушки и сбои"), traps));
     let revisit = entries_of(health, deadline, &insight_spaces, |s| EntryFilter {
         statuses: vec![EntryStatus::Revisit],
@@ -766,6 +781,368 @@ async fn digest(
     sections.push((Some("### Последние изменения"), changes));
     let glossary = glossary_line(st, health, deadline).await;
     Ok((notices, sections, glossary, open_line))
+}
+
+/// Действующие `gotcha`/`failure` пространств `spaces`, новые первыми.
+async fn trap_cands(
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+    spaces: &[(usize, Id)],
+) -> Result<Vec<Cand>, ApiError> {
+    let mut traps: Vec<(usize, Entry)> = Vec::new();
+    for kind in ["gotcha", "failure"] {
+        traps.extend(
+            entries_of(health, deadline, spaces, |s| EntryFilter {
+                statuses: vec![EntryStatus::Active],
+                data_kind: Some(kind.to_string()),
+                decided_by: None,
+                ..entry_filter(s, EntryKind::Insight)
+            })
+            .await?,
+        );
+    }
+    traps.sort_by_key(|e| std::cmp::Reverse((e.1.created_at, e.1.id)));
+    Ok(traps
+        .iter()
+        .map(|(i, e)| {
+            let reason = if data_kind(e) == "failure" {
+                "failure"
+            } else {
+                "gotcha"
+            };
+            entry_cand(*i, e, reason, "")
+        })
+        .collect())
+}
+
+/// L0 заметок Rules (пакет под задачу): `ZeroAIMemory: правило <путь> — <L0> — n:<id>`.
+async fn rules_l0(health: &mut Health<'_>, deadline: &mut Deadline) -> Result<Vec<Cand>, ApiError> {
+    let targets = health.targets();
+    let Some((i, space)) = personal_space(targets, SpaceKind::Rules) else {
+        return Ok(Vec::new());
+    };
+    let db = targets[i].db.clone();
+    let Some(r) = deadline.step(list_children(&db, space, None, 16)).await else {
+        return Ok(Vec::new());
+    };
+    Ok(r?
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Note)
+        .take(RULES_MAX)
+        .map(|n| {
+            let mut title = n.path.clone();
+            if let Some(l0) = n.l0.as_deref().map(one_line).filter(|s| !s.is_empty()) {
+                title.push_str(" — ");
+                title.push_str(&zam_markdown::mask_text(&l0));
+            }
+            let certainty = certainty_str(n.certainty);
+            let reference = format!("n:{}", n.id);
+            let block = hint_line(
+                "правило ",
+                &title,
+                &[certainty.as_deref().unwrap_or_default()],
+                &reference,
+            );
+            Cand {
+                target: i,
+                tref: TargetRef {
+                    kind: TargetKind::Node,
+                    id: n.id,
+                },
+                rev: n.current_rev,
+                reference,
+                kind: "note",
+                title: n.path.clone(),
+                certainty,
+                reason: "rules",
+                block,
+            }
+        })
+        .collect())
+}
+
+/// Разделы пакета под задачу `brief` (см. модуль); `task` нет — мини-дайджест.
+async fn brief(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    req: &RecallReq,
+    task: Option<&str>,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Result<Vec<(Option<&'static str>, Vec<Cand>)>, ApiError> {
+    let targets = health.targets();
+    // участнику — только пространство решения (его цель другой базы иных пространств не несёт)
+    let mut insight_spaces: Vec<(usize, Id)> = solution_space(targets).into_iter().collect();
+    insight_spaces.extend(personal_space(targets, SpaceKind::Knowledge));
+    let mut sections: Vec<(Option<&'static str>, Vec<Cand>)> = Vec::new();
+    sections.push((Some(SECTION_RULES), rules_l0(health, deadline).await?));
+    let Some(task) = task else {
+        let traps = trap_cands(health, deadline, &insight_spaces).await?;
+        sections.push((Some(SECTION_TRAPS), traps));
+        let session = req
+            .parent_id
+            .clone()
+            .or_else(|| req.session_id.clone())
+            .or_else(|| {
+                crate::attrib::header_value(headers, SESSION_HEADER)
+                    .ok()
+                    .flatten()
+            });
+        let tasks = task_cands(health, deadline, &insight_spaces, session.as_deref()).await?;
+        sections.push((Some(SECTION_TASKS), tasks));
+        return Ok(sections);
+    };
+    let (decisions, traps) = brief_search(st, p, headers, req, task, health, deadline).await?;
+    sections.push((Some(SECTION_DECISIONS), decisions));
+    let terms = term_cands(st, task, BRIEF_TASK_MAX_CHARS, health, deadline).await;
+    sections.push((Some(SECTION_TERMS), terms));
+    sections.push((Some(SECTION_TRAPS), traps));
+    let files = file_cands(req, headers, task, health, deadline).await;
+    sections.push((Some(SECTION_FILES), files));
+    Ok(sections)
+}
+
+/// Поиск пакета под задачу: действующие insight по `task` (`mode=brief`, балл ≥
+/// `recall.prompt_min_score`) → `(решения axiom/theorem, ловушки gotcha/failure)`.
+async fn brief_search(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    req: &RecallReq,
+    task: &str,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Result<(Vec<Cand>, Vec<Cand>), ApiError> {
+    let query: String = task
+        .chars()
+        .take(zam_store::search::QUERY_MAX_CHARS)
+        .collect();
+    let (mut decisions, mut traps) = (Vec::new(), Vec::new());
+    if query.trim().is_empty() {
+        return Ok((decisions, traps));
+    }
+    let body = json!({
+        "query": query,
+        "scope": {"solution": req.solution, "include_knowledge": true, "include_rules": false},
+        "filters": {"kinds": ["insight"], "status": ["active"]},
+        "mode": "brief",
+        "top_k": BRIEF_SEARCH_TOP_K,
+        "budget_tokens": PROMPT_SEARCH_BUDGET,
+        "rerank": "off",
+        "skip_seen": false,
+        "no_cache": true,
+        "format": "json",
+    });
+    let area = req.area.as_deref();
+    let Some(v) = inner_search(st, p, headers, area, body, health, deadline).await? else {
+        return Ok((decisions, traps));
+    };
+    let min = st.cfg.recall.prompt_min_score;
+    let targets = health.targets();
+    for it in v["items"].as_array().into_iter().flatten() {
+        if it["score"].as_f64().unwrap_or(0.0) < min || it["kind"] != "insight" {
+            continue;
+        }
+        let certainty = it["certainty"].as_str().map(str::to_string);
+        let reason: &'static str = match it["insight_kind"].as_str().unwrap_or_default() {
+            "decision" if matches!(certainty.as_deref(), Some("axiom" | "theorem")) => {
+                REASON_DECISION
+            }
+            "gotcha" => "gotcha",
+            "failure" => "failure",
+            _ => continue,
+        };
+        let Some(id) = it["entry_id"].as_str().and_then(|s| s.parse::<Id>().ok()) else {
+            continue;
+        };
+        let Some(space) = it["space"]["id"]
+            .as_str()
+            .and_then(|s| s.parse::<Id>().ok())
+        else {
+            continue;
+        };
+        let Some(target) = targets
+            .iter()
+            .position(|t| t.spaces.iter().any(|s| s.id == space))
+        else {
+            continue;
+        };
+        let title = it["title"].as_str().unwrap_or_default().to_string();
+        let reference = format!("i:{id}");
+        let ik = it["insight_kind"].as_str().unwrap_or_default();
+        let block = hint_line(
+            "",
+            &title,
+            &[ik, certainty.as_deref().unwrap_or_default()],
+            &reference,
+        );
+        let c = Cand {
+            target,
+            tref: TargetRef {
+                kind: TargetKind::Entry,
+                id,
+            },
+            rev: it["rev"].as_i64().unwrap_or(0),
+            reference,
+            kind: "insight",
+            title,
+            certainty,
+            reason,
+            block,
+        };
+        if reason == REASON_DECISION {
+            decisions.push(c);
+        } else {
+            traps.push(c);
+        }
+    }
+    Ok((decisions, traps))
+}
+
+/// Пути файлов, упомянутые в `task`: слова с `/`, `\` или `.`, без кавычек, скобок,
+/// знаков препинания по краям и суффикса `:<строка>[:<столбец>]`, нормализованные
+/// ([`zam_store::file_refs::normalize_ref_path`]); до [`BRIEF_PATHS_MAX`], без повторов.
+fn task_paths(task: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let words = task.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | '«'
+                    | '»'
+            )
+    });
+    for w in words {
+        let mut w = w.trim_end_matches(['.', ':', '!', '?']);
+        for _ in 0..2 {
+            if let Some((a, b)) = w.rsplit_once(':')
+                && !b.is_empty()
+                && b.chars().all(|c| c.is_ascii_digit())
+            {
+                w = a;
+            }
+        }
+        if !w.contains(['/', '\\', '.']) {
+            continue;
+        }
+        let Ok(p) = zam_store::file_refs::normalize_ref_path(&w.replace('\\', "/")) else {
+            continue;
+        };
+        if !out.contains(&p) {
+            out.push(p);
+        }
+        if out.len() >= BRIEF_PATHS_MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// Записи со ссылками на файлы из `task` (индекс `file_refs` решения запроса): путь совпадает
+/// точно или оканчивается на `/<путь из task>`. Без решения — пусто; сбой чтения — WARN.
+async fn file_cands(
+    req: &RecallReq,
+    headers: &HeaderMap,
+    task: &str,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Vec<Cand> {
+    let mut out: Vec<Cand> = Vec::new();
+    let Ok(Some(guid)) = super::files::query_solution(req.solution.as_deref(), headers) else {
+        return out;
+    };
+    let paths = task_paths(task);
+    if paths.is_empty() {
+        return out;
+    }
+    for i in 0..health.targets().len() {
+        if !health.alive[i] {
+            continue;
+        }
+        let (db, spaces) = {
+            let t = &health.targets()[i];
+            (t.db.clone(), entry_spaces(t))
+        };
+        if spaces.is_empty() {
+            continue;
+        }
+        let Some(r) = deadline
+            .step(zam_store::file_refs::refs_index(
+                &db,
+                guid.as_str(),
+                &spaces,
+            ))
+            .await
+        else {
+            break;
+        };
+        let index = match r {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "recall: индекс ссылок на файлы не прочитан");
+                continue;
+            }
+        };
+        for want in &paths {
+            let suffix = format!("/{want}");
+            for pr in index
+                .iter()
+                .filter(|pr| pr.path == *want || pr.path.ends_with(&suffix))
+            {
+                for it in &pr.items {
+                    let Some((letter, raw)) = it.id.split_once(':') else {
+                        continue;
+                    };
+                    let Ok(id) = raw.parse::<Id>() else {
+                        continue;
+                    };
+                    let (tkind, kind) = match letter {
+                        "n" => (TargetKind::Node, "note"),
+                        _ => (
+                            TargetKind::Entry,
+                            EntryKind::parse(&it.kind).map_or("entry", EntryKind::as_str),
+                        ),
+                    };
+                    let stale = if it.state == zam_store::RefState::Stale {
+                        "возможно устарело"
+                    } else {
+                        ""
+                    };
+                    let block = hint_line(
+                        &format!("файл {}: ", pr.path),
+                        &it.title,
+                        &[kind, stale],
+                        &it.id,
+                    );
+                    out.push(Cand {
+                        target: i,
+                        tref: TargetRef { kind: tkind, id },
+                        rev: 0,
+                        reference: it.id.clone(),
+                        kind,
+                        title: it.title.clone(),
+                        certainty: None,
+                        reason: "file",
+                        block,
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Действующие решения (`decision`) пространства решения за [`RECOVERY_DECISIONS_DAYS`] дней,
@@ -825,15 +1202,16 @@ async fn glossary_line(
     (n > 0).then(|| format!("Словарь: {n} терминов — memory_search kinds=[term]"))
 }
 
-/// Строки словаря к `prompt`: термины решения и Knowledge, чьё имя или псевдоним встречается
-/// в первых 512 символах (см. модуль). Сбой чтения словаря — без подсказок.
-async fn term_hints(
+/// Строки словаря к тексту (`prompt` — первые 512 символов, `task` пакета — 2000): термины
+/// решения и Knowledge, чьё имя или псевдоним встречается в первых `chars` символах `prompt`
+/// (см. модуль). Сбой чтения словаря — без подсказок.
+async fn term_cands(
     st: &AppState,
-    req: &RecallReq,
+    prompt: &str,
+    chars: usize,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Vec<Cand> {
-    let prompt = req.prompt.as_deref().unwrap_or_default();
     let mut out: Vec<Cand> = Vec::new();
     if prompt.trim().is_empty() {
         return out;
@@ -859,7 +1237,7 @@ async fn term_hints(
                 continue;
             }
         };
-        for t in idx.find_in_text(prompt, &spaces) {
+        for t in idx.find_in_head(prompt, &spaces, chars) {
             if out.iter().any(|c| c.tref.id == t.id) {
                 continue;
             }
@@ -921,54 +1299,10 @@ async fn prompt_hints(
         "no_cache": true,
         "format": "json",
     });
-    // показанное учитывает сам `/recall`: поиск идёт без сессии
-    let mut h = headers.clone();
-    h.remove(SESSION_HEADER);
-    if let Some(a) = zam_store::normalize_area(req.area.as_deref())
-        && !h.contains_key(AREA_HEADER)
-    {
-        h.insert(
-            AREA_HEADER,
-            HeaderValue::from_str(&a)
-                .map_err(|_| ApiError::BadRequest("area: печатные символы".into()))?,
-        );
-    }
-    let search = super::search::search(
-        State(st.clone()),
-        p.clone(),
-        h,
-        Ok(Bytes::from(body.to_string())),
-    );
-    let Some(r) = deadline.step(search).await else {
+    let area = req.area.as_deref();
+    let Some(v) = inner_search(st, p, headers, area, body, health, deadline).await? else {
         return Ok(Vec::new());
     };
-    // сбой поиска подсказки не валит: тишина и предупреждение
-    let failed = |health: &mut Health<'_>, what: &dyn std::fmt::Display| {
-        tracing::warn!(error = %what, "recall: поиск подсказок к запросу не удался");
-        health.warnings.push(WARN_PROMPT_SEARCH_FAILED.into());
-        Ok(Vec::new())
-    };
-    let resp = match r {
-        Ok(resp) => resp,
-        Err(e) => return failed(health, &e),
-    };
-    let status = resp.status();
-    if status != StatusCode::OK {
-        return failed(health, &status);
-    }
-    let bytes = match axum::body::to_bytes(resp.into_body(), usize::MAX).await {
-        Ok(b) => b,
-        Err(e) => return failed(health, &e),
-    };
-    let v: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(e) => return failed(health, &e),
-    };
-    if let Some(ws) = v["warnings"].as_array() {
-        health
-            .warnings
-            .extend(ws.iter().filter_map(Value::as_str).map(str::to_string));
-    }
     let min = st.cfg.recall.prompt_min_score;
     let targets = health.targets();
     let mut out: Vec<Cand> = Vec::new();
@@ -1056,6 +1390,68 @@ async fn prompt_hints(
         });
     }
     Ok(out)
+}
+
+/// Внутренний `POST /search` подсказок (тело `body`): без сессии (показанное учитывает сам
+/// `/recall`), `area` — в `X-Zam-Area`, если его нет. Срок вышел — `None`; сбой поиска —
+/// `None` и `warnings: ["recall search failed"]`; предупреждения поиска переходят в ответ.
+async fn inner_search(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    area: Option<&str>,
+    body: Value,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Result<Option<Value>, ApiError> {
+    let mut h = headers.clone();
+    h.remove(SESSION_HEADER);
+    if let Some(a) = zam_store::normalize_area(area)
+        && !h.contains_key(AREA_HEADER)
+    {
+        h.insert(
+            AREA_HEADER,
+            HeaderValue::from_str(&a)
+                .map_err(|_| ApiError::BadRequest("area: печатные символы".into()))?,
+        );
+    }
+    let search = super::search::search(
+        State(st.clone()),
+        p.clone(),
+        h,
+        Ok(Bytes::from(body.to_string())),
+    );
+    let Some(r) = deadline.step(search).await else {
+        return Ok(None);
+    };
+    // сбой поиска подсказки не валит: тишина и предупреждение
+    let failed = |health: &mut Health<'_>, what: &dyn std::fmt::Display| {
+        tracing::warn!(error = %what, "recall: поиск подсказок не удался");
+        health.warnings.push(WARN_PROMPT_SEARCH_FAILED.into());
+        Ok(None)
+    };
+    let resp = match r {
+        Ok(resp) => resp,
+        Err(e) => return failed(health, &e),
+    };
+    let status = resp.status();
+    if status != StatusCode::OK {
+        return failed(health, &status);
+    }
+    let bytes = match axum::body::to_bytes(resp.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return failed(health, &e),
+    };
+    let v: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => return failed(health, &e),
+    };
+    if let Some(ws) = v["warnings"].as_array() {
+        health
+            .warnings
+            .extend(ws.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    Ok(Some(v))
 }
 
 /// `post_tool`: `error_regex`, затем FTS по insight (см. модуль).
@@ -1287,6 +1683,103 @@ async fn record(
     }
 }
 
+/// Предел подсказок раздела `title`: у пакета под задачу — свои (§9.4), у дайджеста — по
+/// разделу, у разделов без заголовка — строки словаря или общий предел события `limit`.
+fn section_limit(event: Event, title: Option<&str>, cands: &[Cand], limit: usize) -> usize {
+    if event == Event::Brief {
+        return match title {
+            Some(SECTION_RULES) => RULES_MAX,
+            Some(SECTION_TERMS) => BRIEF_TERMS_MAX,
+            _ => BRIEF_ENTRIES_MAX,
+        };
+    }
+    match title {
+        Some(SECTION_RULES) => RULES_MAX,
+        Some("### Решение") => SOLUTION_ROOT_MAX,
+        Some(_) => DIGEST_ENTRIES_MAX,
+        None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,
+        None => limit,
+    }
+}
+
+/// Раскладка отобранных разделов в разделы упаковки и подсказки каждого (у строк, что не
+/// подсказки записей — уведомления, словарь, открытые вопросы, — пустой список: ни
+/// `session_seen`, ни `usage`). Уведомления — первыми; в пакете восстановления — после задач,
+/// ответов и решений (§9.2), а если других разделов нет — в конце. Открытые вопросы — после
+/// ответов (в пакете — вместе с уведомлениями), строка словаря — после правил.
+fn arrange<'c>(
+    recovery: bool,
+    notices: Vec<String>,
+    open_line: Option<String>,
+    glossary: Option<&str>,
+    chosen: Vec<(Option<&'static str>, Vec<&'c Cand>)>,
+) -> (Vec<Section>, Vec<Vec<&'c Cand>>) {
+    let mut out = Arranged::default();
+    let mut notices = Some(notices);
+    let mut open_line = open_line;
+    if !recovery {
+        out.line(None, notices.take().unwrap_or_default());
+    }
+    for (title, cands) in chosen {
+        if recovery
+            && notices.is_some()
+            && !matches!(
+                title,
+                Some(SECTION_TASKS | SECTION_ANSWERS | SECTION_DECISIONS)
+            )
+        {
+            out.notices(&mut notices, &mut open_line);
+        }
+        out.packed.push(Section {
+            title: title.map(str::to_string),
+            blocks: cands.iter().map(|c| c.block.clone()).collect(),
+        });
+        out.picked.push(cands);
+        if title == Some(SECTION_ANSWERS)
+            && !recovery
+            && let Some(line) = open_line.take()
+        {
+            out.line(Some(SECTION_OPEN_QUESTIONS), vec![line]);
+        }
+        if title == Some(SECTION_RULES)
+            && let Some(line) = glossary
+        {
+            out.line(None, vec![line.to_string()]);
+        }
+    }
+    // пакет восстановления без раздела после трёх первых: уведомления и вопросы не теряются
+    out.notices(&mut notices, &mut open_line);
+    (out.packed, out.picked)
+}
+
+/// Накопитель [`arrange`].
+#[derive(Default)]
+struct Arranged<'c> {
+    packed: Vec<Section>,
+    picked: Vec<Vec<&'c Cand>>,
+}
+
+impl Arranged<'_> {
+    /// Раздел строк, что не подсказки записей.
+    fn line(&mut self, title: Option<&str>, blocks: Vec<String>) {
+        self.packed.push(Section {
+            title: title.map(str::to_string),
+            blocks,
+        });
+        self.picked.push(Vec::new());
+    }
+
+    /// Уведомления и строка открытых вопросов, если ещё не выведены.
+    fn notices(&mut self, notices: &mut Option<Vec<String>>, open_line: &mut Option<String>) {
+        if let Some(n) = notices.take() {
+            self.line(None, n);
+        }
+        if let Some(l) = open_line.take() {
+            self.line(Some(SECTION_OPEN_QUESTIONS), vec![l]);
+        }
+    }
+}
+
 /// `POST /recall`.
 pub async fn recall(
     State(st): State<AppState>,
@@ -1357,11 +1850,26 @@ pub async fn recall(
                     .source
                     .as_deref()
                     .is_some_and(|s| RECOVERY_SOURCES.contains(&s.trim()))));
+    let brief_event = req.event == Event::Brief;
     let budget = req.budget_tokens.unwrap_or(if recovery {
         st.cfg.recall.recovery_tokens
+    } else if brief_event {
+        st.cfg.recall.brief_tokens
     } else {
         st.cfg.recall.digest_tokens
     });
+    // задача пакета `brief`: первые 2000 символов, длиннее — обрезка с предупреждением
+    let task: Option<String> = req
+        .task
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| brief_event && !t.is_empty())
+        .map(|t| t.chars().take(BRIEF_TASK_MAX_CHARS).collect());
+    let task_truncated = brief_event
+        && req
+            .task
+            .as_deref()
+            .is_some_and(|t| t.trim().chars().count() > BRIEF_TASK_MAX_CHARS);
     let mut sh = headers.clone();
     if req.solution.is_some() {
         // решение тела сильнее заголовка
@@ -1375,6 +1883,9 @@ pub async fn recall(
     };
     let (targets, warnings) = resolve_targets(&st, &p, &sh, &scope).await?;
     let mut health = Health::new(&targets, warnings);
+    if task_truncated {
+        health.warnings.push(WARN_TASK_TRUNCATED.into());
+    }
     if let Some(src) = req.source.as_deref() {
         tracing::debug!(event = ?req.event, source = %src, recovery, "recall");
     }
@@ -1398,7 +1909,9 @@ pub async fn recall(
         }
         Event::Prompt => {
             // строки словаря — перед подсказками insight; у каждого свой предел
-            let terms = term_hints(&st, &req, &mut health, &mut deadline).await;
+            let prompt = req.prompt.as_deref().unwrap_or_default();
+            let chars = crate::glossary::HINT_TEXT_CHARS;
+            let terms = term_cands(&st, prompt, chars, &mut health, &mut deadline).await;
             let c = prompt_hints(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
             (
                 Vec::new(),
@@ -1412,12 +1925,18 @@ pub async fn recall(
             let c = error_hints(&req, &mut health, &mut deadline).await?;
             (Vec::new(), vec![(None, c)], true, None, None)
         }
+        // у субагента свой контекст: пакет повторяется (показ отмечается)
+        Event::Brief => {
+            let t = task.as_deref();
+            let s = brief(&st, &p, &sh, &req, t, &mut health, &mut deadline).await?;
+            (Vec::new(), s, true, None, None)
+        }
     };
     // без повторов: показанное сессии, повторы между разделами, исключённые цели; ответ на
     // вопрос показывается сессии один раз и в повторяемом дайджесте, а в пакете восстановления —
     // снова (контекст потерян, §9.2)
     let all: Vec<&Cand> = sections.iter().flat_map(|(_, c)| c).collect();
-    let seen = if recovery {
+    let seen = if recovery || brief_event {
         HashSet::new()
     } else if repeatable {
         let once: Vec<&Cand> = all
@@ -1430,88 +1949,26 @@ pub async fn recall(
         shown(session.as_ref(), &targets, &all).await
     };
     let limit = match req.event {
-        Event::SessionStart | Event::Recovery => usize::MAX,
+        Event::SessionStart | Event::Recovery | Event::Brief => usize::MAX,
         Event::Prompt => PROMPT_MAX,
         Event::PostTool => POST_TOOL_MAX,
     };
     let mut dup: HashSet<TargetRef> = HashSet::new();
-    let mut packed: Vec<Section> = Vec::new();
-    // у строк, что не подсказки записей (уведомления, словарь, открытые вопросы), в `picked` —
-    // пустой список: ни `session_seen`, ни `usage`
-    let mut picked: Vec<Vec<&Cand>> = Vec::new();
-    // уведомления — первыми в дайджесте; в пакете восстановления — после задач, ответов и
-    // решений, вместе с обычным дайджестом (§9.2)
-    let mut notices = Some(notices);
-    let mut open_line = open_line;
-    if !recovery {
-        packed.push(Section {
-            title: None,
-            blocks: notices.take().unwrap_or_default(),
-        });
-        picked.push(Vec::new());
-    }
-    for (title, cands) in &sections {
-        if recovery
-            && notices.is_some()
-            && !matches!(
-                *title,
-                Some("### Задачи" | SECTION_ANSWERS | SECTION_DECISIONS)
-            )
-        {
-            packed.push(Section {
-                title: None,
-                blocks: notices.take().unwrap_or_default(),
-            });
-            picked.push(Vec::new());
-            if let Some(line) = open_line.take() {
-                packed.push(Section {
-                    title: Some(SECTION_OPEN_QUESTIONS.to_string()),
-                    blocks: vec![line],
-                });
-                picked.push(Vec::new());
-            }
-        }
-        let per = match title {
-            Some("### Правила") => RULES_MAX,
-            Some("### Решение") => SOLUTION_ROOT_MAX,
-            Some(_) => DIGEST_ENTRIES_MAX,
-            None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,
-            None => limit,
-        };
-        let chosen: Vec<&Cand> = cands
-            .iter()
-            .filter(|c| health.alive[c.target])
-            .filter(|c| !seen.contains(&seen_key(&targets, c)))
-            .filter(|c| dup.insert(c.tref))
-            .take(per)
-            .collect();
-        packed.push(Section {
-            title: title.map(str::to_string),
-            blocks: chosen.iter().map(|c| c.block.clone()).collect(),
-        });
-        picked.push(chosen);
-        // открытые вопросы — сразу после ответов; как и строка словаря, не подсказка записи
-        if *title == Some(SECTION_ANSWERS)
-            && !recovery
-            && let Some(line) = open_line.take()
-        {
-            packed.push(Section {
-                title: Some(SECTION_OPEN_QUESTIONS.to_string()),
-                blocks: vec![line],
-            });
-            picked.push(Vec::new());
-        }
-        // строка словаря — сразу после правил
-        if *title == Some("### Правила")
-            && let Some(line) = &glossary
-        {
-            packed.push(Section {
-                title: None,
-                blocks: vec![line.clone()],
-            });
-            picked.push(Vec::new());
-        }
-    }
+    let chosen: Vec<(Option<&'static str>, Vec<&Cand>)> = sections
+        .iter()
+        .map(|(title, cands)| {
+            let per = section_limit(req.event, *title, cands, limit);
+            let chosen: Vec<&Cand> = cands
+                .iter()
+                .filter(|c| health.alive[c.target])
+                .filter(|c| !seen.contains(&seen_key(&targets, c)))
+                .filter(|c| dup.insert(c.tref))
+                .take(per)
+                .collect();
+            (*title, chosen)
+        })
+        .collect();
+    let (packed, picked) = arrange(recovery, notices, open_line, glossary.as_deref(), chosen);
     let (text, taken) = pack_sections(&packed, budget, &count_tokens);
     let shown_now: Vec<&Cand> = taken
         .iter()
@@ -1564,4 +2021,79 @@ pub async fn recall(
         out["hooks"] = hooks.to_json();
     }
     Ok(Json(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(title: &str) -> Cand {
+        Cand {
+            target: 0,
+            tref: TargetRef {
+                kind: TargetKind::Entry,
+                id: Id::new(),
+            },
+            rev: 1,
+            reference: "k:x".into(),
+            kind: "task",
+            title: title.into(),
+            certainty: None,
+            reason: "task",
+            block: format!("ZeroAIMemory: {title}"),
+        }
+    }
+
+    /// Ревью задачи 9: в пакете восстановления без раздела после трёх первых уведомления и
+    /// открытые вопросы выводятся в конце, а не теряются.
+    #[test]
+    fn recovery_notices_kept_without_later_section() {
+        let t = cand("задача");
+        let chosen = vec![
+            (Some(SECTION_TASKS), vec![&t]),
+            (Some(SECTION_ANSWERS), Vec::new()),
+        ];
+        let notices = vec!["ZeroAIMemory: уведомление".to_string()];
+        let (packed, picked) = arrange(true, notices, Some("1 открытых: «в»".into()), None, chosen);
+        assert_eq!(packed.len(), picked.len());
+        let titles: Vec<Option<&str>> = packed.iter().map(|s| s.title.as_deref()).collect();
+        assert_eq!(
+            titles,
+            [
+                Some(SECTION_TASKS),
+                Some(SECTION_ANSWERS),
+                None,
+                Some(SECTION_OPEN_QUESTIONS)
+            ]
+        );
+        assert_eq!(packed[2].blocks, ["ZeroAIMemory: уведомление"]);
+        assert!(picked[2].is_empty() && picked[3].is_empty());
+        // обычный дайджест: уведомления первыми, вопросы — после ответов
+        let chosen = vec![
+            (Some(SECTION_TASKS), vec![&t]),
+            (Some(SECTION_ANSWERS), Vec::new()),
+            (Some(SECTION_RULES), Vec::new()),
+        ];
+        let (packed, _) = arrange(
+            false,
+            vec!["n".into()],
+            Some("q".into()),
+            Some("Словарь"),
+            chosen,
+        );
+        let blocks: Vec<&str> = packed
+            .iter()
+            .flat_map(|s| s.blocks.iter().map(String::as_str))
+            .collect();
+        assert_eq!(blocks, ["n", "ZeroAIMemory: задача", "q", "Словарь"]);
+    }
+
+    #[test]
+    fn task_paths_extracted_and_normalized() {
+        let p = task_paths(
+            "Поправь `crates/zam-cli/src/main.rs:42:7`, затем (src\\lib.rs) и ./docs/a.md. \
+             Не путь: слово, C:\\abs\\x.rs",
+        );
+        assert_eq!(p, ["crates/zam-cli/src/main.rs", "src/lib.rs", "docs/a.md"]);
+    }
 }

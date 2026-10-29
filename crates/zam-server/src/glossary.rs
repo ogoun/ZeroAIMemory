@@ -210,10 +210,16 @@ impl GlossaryIndex {
     /// Термины пространств `spaces`, чьё имя или псевдоним встречается в первых
     /// [`HINT_TEXT_CHARS`] символах `text`, в порядке первого вхождения.
     pub fn find_in_text(&self, text: &str, spaces: &[Id]) -> Vec<&GlossaryEntry> {
+        self.find_in_head(text, spaces, HINT_TEXT_CHARS)
+    }
+
+    /// Как [`GlossaryIndex::find_in_text`], но по первым `chars` символам `text` (пакет под
+    /// задачу `brief` — до 2000 символов).
+    pub fn find_in_head(&self, text: &str, spaces: &[Id], chars: usize) -> Vec<&GlossaryEntry> {
         if self.is_empty() {
             return Vec::new();
         }
-        let head: String = text.chars().take(HINT_TEXT_CHARS).collect();
+        let head: String = text.chars().take(chars).collect();
         let words = lower_words(&head);
         let mut out: Vec<&GlossaryEntry> = Vec::new();
         for h in self.hits(&words, spaces, usize::MAX) {

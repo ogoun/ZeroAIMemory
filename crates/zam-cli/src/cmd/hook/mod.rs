@@ -18,6 +18,8 @@
 //!   — `true` (старый `hooks.json` и старый сервер новое не выключают).
 //! - **`post-tool`** — два режима: ошибка (как M4: `/recall(post_tool)`, бюджет 250 мс) и
 //!   успех (M4.5: журнал, знание о файле, очередь изменённых — без сети, 50 мс).
+//! - **`subagent-start`** (M4.5 §9.4, событие `SubagentStart` Claude и Codex, 300 мс) —
+//!   сессия субагента и пакет под задачу ([`subagent_start`]).
 pub mod cache;
 pub mod checkpoint;
 pub mod input;
@@ -27,6 +29,7 @@ pub mod post_tool;
 pub mod pre_tool;
 pub mod prompt;
 pub mod session_start;
+pub mod subagent_start;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -72,6 +75,7 @@ pub enum Kind {
     PreTool,
     PostTool,
     Checkpoint,
+    SubagentStart,
 }
 
 impl Kind {
@@ -82,6 +86,7 @@ impl Kind {
             Kind::PreTool => "pre-tool",
             Kind::PostTool => "post-tool",
             Kind::Checkpoint => "checkpoint",
+            Kind::SubagentStart => "subagent-start",
         }
     }
 
@@ -89,7 +94,7 @@ impl Kind {
     /// на весь процесс, M4.5 §9.1).
     pub fn budget_ms(self) -> u64 {
         match self {
-            Kind::SessionStart => 300,
+            Kind::SessionStart | Kind::SubagentStart => 300,
             Kind::Prompt | Kind::PostTool => 250,
             Kind::PreTool => 50,
             Kind::Checkpoint => 100,
@@ -104,6 +109,7 @@ impl Kind {
             Kind::PreTool => event == "PreToolUse",
             Kind::PostTool => matches!(event, "PostToolUseFailure" | "PostToolUse"),
             Kind::Checkpoint => matches!(event, "Stop" | "PreCompact"),
+            Kind::SubagentStart => event == "SubagentStart",
         }
     }
 }
@@ -117,13 +123,12 @@ impl Kind {
             Kind::PreTool => Flag::PreTool,
             Kind::PostTool => Flag::PostTool,
             Kind::Checkpoint => Flag::Checkpoint,
+            Kind::SubagentStart => Flag::SubagentStart,
         }
     }
 }
 
-/// Ключ настройки подсказок `hooks.<ключ>` (R5; M4.5 §9.6). `SubagentStart` читает хук
-/// задачи 10 этапа.
-#[allow(dead_code)]
+/// Ключ настройки подсказок `hooks.<ключ>` (R5; M4.5 §9.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flag {
     SessionStart,
@@ -438,6 +443,7 @@ fn handle(kind: Kind, agent: Agent, started: Instant, raw: &input::Raw) -> Outpu
         Kind::PreTool => pre_tool::run(&env, &inp, &settings),
         Kind::PostTool => post_tool::run(&env, &inp, &settings),
         Kind::Checkpoint => checkpoint::run(&env, &inp, &settings),
+        Kind::SubagentStart => subagent_start::run(&env, &inp, &settings),
     }
 }
 
@@ -650,5 +656,8 @@ mod tests {
         assert!(!Kind::PreTool.accepts("PostToolUse"));
         assert!(Kind::Checkpoint.accepts("PreCompact"));
         assert!(!Kind::Checkpoint.accepts("SubagentStop"));
+        assert!(Kind::SubagentStart.accepts("SubagentStart"));
+        assert!(!Kind::SubagentStart.accepts("SubagentStop"));
+        assert_eq!(Kind::SubagentStart.budget_ms(), 300);
     }
 }

@@ -10,6 +10,9 @@
 //!   целиком, или [`WHOLE_TARGET`] — полный текст цели; [`RECALL_PART`] — подсказка `/recall`)
 //!   и её ревизия. Хранится большая из выданных ревизий: ревизии только растут, и повторная
 //!   выдача старой не откатывает отметку;
+//! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
+//!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя;
+//! - `session_tokens` — выданное сессии по событию (§9.5; заполняет задача 12);
 //! - срок хранения — [`gc_sessions`]: сессии без обращений дольше срока удаляются вместе с
 //!   выданным им (воркер обслуживания сервера, раз в сутки, 30 дней).
 use std::collections::HashMap;
@@ -40,6 +43,10 @@ pub struct SessionTouch {
     pub area: Option<String>,
     pub machine: Option<String>,
     pub agent: Option<String>,
+    /// Id сессии родителя (сессия субагента).
+    pub parent_id: Option<String>,
+    /// Тип субагента (`Explore`, `Plan`, свои).
+    pub agent_type: Option<String>,
 }
 
 /// Сессия агента.
@@ -54,6 +61,8 @@ pub struct Session {
     pub area: Option<String>,
     pub machine: Option<String>,
     pub agent: Option<String>,
+    pub parent_id: Option<String>,
+    pub agent_type: Option<String>,
     #[serde(serialize_with = "ser_ts")]
     pub started_at: Timestamp,
     #[serde(serialize_with = "ser_ts")]
@@ -110,6 +119,8 @@ fn check_touch(s: &SessionTouch) -> Result<(), StoreError> {
         ("area", &s.area),
         ("machine", &s.machine),
         ("agent", &s.agent),
+        ("parent_id", &s.parent_id),
+        ("agent_type", &s.agent_type),
     ] {
         if let Some(v) = v {
             check_field(what, v)?;
@@ -124,14 +135,16 @@ fn upsert(t: &rusqlite::Transaction, s: &SessionTouch, writes: i64) -> Result<()
     let now = fmt_ts(Timestamp::now());
     t.execute(
         "INSERT INTO sessions (id, token_id, solution_guid, area, machine, agent,
-                               started_at, last_seen_at, memory_writes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
+                               started_at, last_seen_at, memory_writes, parent_id, agent_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10)
          ON CONFLICT (id) DO UPDATE SET
            token_id = coalesce(excluded.token_id, token_id),
            solution_guid = coalesce(excluded.solution_guid, solution_guid),
            area = coalesce(excluded.area, area),
            machine = coalesce(excluded.machine, machine),
            agent = coalesce(excluded.agent, agent),
+           parent_id = coalesce(excluded.parent_id, parent_id),
+           agent_type = coalesce(excluded.agent_type, agent_type),
            last_seen_at = excluded.last_seen_at,
            memory_writes = memory_writes + excluded.memory_writes",
         params![
@@ -142,7 +155,9 @@ fn upsert(t: &rusqlite::Transaction, s: &SessionTouch, writes: i64) -> Result<()
             s.machine,
             s.agent,
             now,
-            writes
+            writes,
+            s.parent_id,
+            s.agent_type
         ],
     )?;
     Ok(())
@@ -179,7 +194,7 @@ pub async fn end_session(db: &Db, id: &str, ended: bool) -> Result<bool, StoreEr
 }
 
 const SESSION_COLS: &str = "id, token_id, solution_guid, area, machine, agent, started_at, \
-                            last_seen_at, ended_at, memory_writes";
+                            last_seen_at, ended_at, memory_writes, parent_id, agent_type";
 
 fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -193,6 +208,8 @@ fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_seen_at: ts_at(r, 7)?,
         ended_at: ts_opt(r, 8)?,
         memory_writes: r.get(9)?,
+        parent_id: r.get(10)?,
+        agent_type: r.get(11)?,
     })
 }
 
@@ -335,11 +352,15 @@ pub async fn seen_revs(
 pub async fn gc_sessions(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError> {
     let cutoff = fmt_ts(cutoff);
     db.write(move |t| {
-        t.execute(
-            "DELETE FROM session_seen WHERE session_id IN
-               (SELECT id FROM sessions WHERE last_seen_at < ?1)",
-            [&cutoff],
-        )?;
+        for table in ["session_seen", "session_tokens"] {
+            t.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE session_id IN
+                       (SELECT id FROM sessions WHERE last_seen_at < ?1)"
+                ),
+                [&cutoff],
+            )?;
+        }
         let n = t.execute("DELETE FROM sessions WHERE last_seen_at < ?1", [&cutoff])?;
         Ok(n as u64)
     })

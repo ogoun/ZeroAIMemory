@@ -800,3 +800,68 @@ async fn admin_unknown_user_with_session_creates_no_db() {
         assert!(!db.exists(), "{m} {uri}: создана база {}", db.display());
     }
 }
+
+/// Сессия субагента (M4.5 §9.4): `POST /sessions` принимает `parent_id` и `agent_type`
+/// (до 128 печатных символов), `GET /sessions/{id}` их отдаёт; повторный `POST` без полей их
+/// не стирает; у обычной сессии — `null`.
+#[tokio::test]
+async fn session_parent_and_agent_type() {
+    let a = api("sessions-subagent", |_| {}).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(
+                json!({"id": "s1:ag-7", "parent_id": "s1", "agent_type": "Explore",
+                        "agent": "claude"}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = session(&a, &a.token, "s1:ag-7").await.json();
+    assert_eq!(j["parent_id"], "s1", "{j}");
+    assert_eq!(j["agent_type"], "Explore", "{j}");
+    assert_eq!(j["agent"], "claude", "{j}");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "s1:ag-7"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = session(&a, &a.token, "s1:ag-7").await.json();
+    assert_eq!(j["parent_id"], "s1", "{j}");
+    assert_eq!(j["agent_type"], "Explore", "{j}");
+    let r = a
+        .t(Method::POST, "/api/v1/sessions", Some(json!({"id": "s1"})))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = session(&a, &a.token, "s1").await.json();
+    assert!(j["parent_id"].is_null() && j["agent_type"].is_null(), "{j}");
+    for bad in [
+        json!({"id": "x", "agent_type": "a".repeat(129)}),
+        json!({"id": "x", "agent_type": "Exp\u{7}lore"}),
+        json!({"id": "x", "parent_id": "p".repeat(129)}),
+    ] {
+        let r = a
+            .t(Method::POST, "/api/v1/sessions", Some(bad.clone()))
+            .await;
+        assert!(
+            r.status.is_client_error(),
+            "{bad}: {} {}",
+            r.status,
+            r.text()
+        );
+    }
+    // в списке — те же поля
+    let r = a.t(Method::GET, "/api/v1/sessions", None).await.json();
+    let it = r["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "s1:ag-7")
+        .cloned()
+        .unwrap();
+    assert_eq!(it["agent_type"], "Explore", "{r}");
+}

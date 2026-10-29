@@ -98,6 +98,11 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0016_file_refs.sql"),
         rebuild: false,
     },
+    Migration {
+        version: 17,
+        sql: include_str!("../migrations/user/0017_sessions_subagents.sql"),
+        rebuild: false,
+    },
 ];
 
 /// Вид пространства.
