@@ -83,6 +83,17 @@ const INSIGHT_KINDS: [&str; 6] = [
 ];
 const CERTAINTIES: [&str; 3] = ["axiom", "theorem", "hypothesis"];
 
+/// Надёжность для связи `contradicts` — шкала сервера (`api/search/graph.rs::reliability`):
+/// `axiom` 3, `theorem` 2, `hypothesis` 1, без `certainty` 0.
+pub fn reliability(c: Option<&str>) -> u8 {
+    match c {
+        Some("axiom") => 3,
+        Some("theorem") => 2,
+        Some("hypothesis") => 1,
+        _ => 0,
+    }
+}
+
 impl Corpus {
     /// Insight по ключу.
     pub fn insight(&self, key: &str) -> Option<&Insight> {
@@ -188,12 +199,11 @@ pub(super) fn validate_insights(corpus: &Corpus, errs: &mut Vec<String>) {
             }
         }
     }
-    // связи `contradicts` (M4.5): цель существует, действует и надёжнее записи
-    let rank = |c: Option<&str>| match c.unwrap_or("hypothesis") {
-        "axiom" => 3,
-        "theorem" => 2,
-        _ => 1,
-    };
+    // связи `contradicts` (M4.5): цель существует, действует, это theorem/axiom и она строго
+    // надёжнее записи — правило сервера (`api/search/graph.rs::contradicts_applies`), та же
+    // шкала [`reliability`]; у insight набора без поля `certainty` итоговый статус —
+    // `hypothesis` (умолчание агента), поэтому берётся итоговый статус
+    let rank = |k: &str| reliability(corpus.insight_certainty(k));
     for i in &corpus.insights {
         for t in &i.contradicts {
             let bad = |m: String| format!("insight {}: contradicts {t}: {m}", i.key);
@@ -203,9 +213,10 @@ pub(super) fn validate_insights(corpus: &Corpus, errs: &mut Vec<String>) {
                     if !corpus.insight_active(t) {
                         errs.push(bad("цель замещена или отозвана".into()));
                     }
-                    if rank(o.certainty.as_deref()) <= rank(i.certainty.as_deref()) {
+                    let (src, dst) = (rank(&i.key), rank(&o.key));
+                    if dst < reliability(Some("theorem")) || dst <= src {
                         errs.push(bad(
-                            "цель должна быть надёжнее записи (axiom > theorem > hypothesis)"
+                            "цель — theorem/axiom, надёжнее записи (axiom > theorem > hypothesis > без certainty)"
                                 .into(),
                         ));
                     }

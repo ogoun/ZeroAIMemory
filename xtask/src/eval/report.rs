@@ -133,12 +133,16 @@ pub fn channels_line(m: &Breakdown) -> String {
     }
 }
 
-/// Имя файла результата: `<дата>-<модель|fts>-<режим>[-<метка>]`.
+/// Имя файла результата: `<дата>[-<префикс>]-<модель|fts>-<режим>[-<метка>]`.
 pub fn file_stem(r: &RunResult) -> String {
-    // FTS-only без модели: `<дата>-fts`
+    // FTS-only без модели: `<дата>-fts`; `--prefix` — сразу после даты
+    let date = match &r.info.prefix {
+        Some(p) => format!("{}-{p}", r.info.date),
+        None => r.info.date.clone(),
+    };
     let mut s = match &r.info.model {
-        Some(m) => format!("{}-{m}-{}", r.info.date, r.info.mode.file_tag()),
-        None => format!("{}-fts", r.info.date),
+        Some(m) => format!("{date}-{m}-{}", r.info.mode.file_tag()),
+        None => format!("{date}-fts"),
     };
     if let Some(l) = &r.info.label {
         s.push('-');

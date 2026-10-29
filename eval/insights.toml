@@ -423,6 +423,7 @@ lang = "ru"
 kind = "gotcha"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p01-t"]
 title = "В Windows PowerShell 5.1 нельзя записать файл в UTF-8 без BOM"
 body = "Out-File и Set-Content с кодировкой utf8 в Windows PowerShell 5.1 всегда добавляют BOM, поэтому записать UTF-8 без BOM из 5.1 невозможно — нужен PowerShell 7."
 
@@ -444,6 +445,7 @@ lang = "en"
 kind = "gotcha"
 scope = "global"
 certainty = "hypothesis"
+contradicts = ["p02-t"]
 title = "Qdrant cannot run on Windows without Docker"
 body = "Qdrant is a Linux service and on Windows it only runs inside a Docker container or WSL."
 
@@ -465,6 +467,7 @@ lang = "ru"
 kind = "gotcha"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p03-t"]
 title = "ONNX Runtime с CUDA не работает без установленного CUDA Toolkit"
 body = "Для CUDA-провайдера ONNX Runtime пользователь должен установить CUDA Toolkit и cuDNN системно, иначе провайдер не загрузится."
 
@@ -486,6 +489,7 @@ lang = "en"
 kind = "gotcha"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p04-t"]
 title = "Git cannot check out symlinks on Windows"
 body = "On Windows, git always checks out symbolic links as small text files containing the link target."
 
@@ -507,6 +511,7 @@ lang = "ru"
 kind = "experiment"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p05-t"]
 title = "Квантованная bge-m3 int8 заметно хуже fp32 в поиске"
 body = "Квантование bge-m3 в int8 должно сильно портить эмбеддинги, поэтому поиск на int8 будет заметно хуже, чем на fp32."
 
@@ -528,6 +533,7 @@ lang = "en"
 kind = "discovery"
 scope = "global"
 certainty = "hypothesis"
+contradicts = ["p06-t"]
 title = "cargo build is slow mostly because of the linker"
 body = "Most of the release build time of the server is spent linking, so switching linkers is the main way to speed it up."
 
@@ -542,6 +548,8 @@ body = "Build timings show that codegen of a few large crates takes most of the 
 evidence = { checked = "release build of zam-server on the dev machine", method = "cargo build --release --timings", result = "codegen of the heaviest crates took most of the wall time; the link step took under ten seconds" }
 
 # ---- p07: перекрытие чанков и recall ----
+# Без contradicts (задача 15 M4.5): теорема о наборе eval M2 («на нём пользы не видно»), а
+# гипотеза — общее утверждение; явного противоречия по смыслу нет.
 
 [[insight]]
 key = "p07-h"
@@ -592,6 +600,7 @@ lang = "ru"
 kind = "gotcha"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p09-t"]
 title = "robocopy возвращает ненулевой код только при ошибке"
 body = "Если robocopy вернул не ноль, копирование не удалось, и задание планировщика нужно считать проваленным."
 triggers = [{ type = "keyword", pattern = "robocopy" }]
@@ -615,6 +624,7 @@ lang = "ru"
 kind = "discovery"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p10-a"]
 title = "Заметки Human находятся векторным поиском с include_human"
 body = "Если администратор ищет с include_human, заметки пространства Human попадают в выдачу и векторного канала."
 
@@ -635,6 +645,7 @@ lang = "en"
 kind = "pattern"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p11-a"]
 title = "Force-pushing to main is fine with --force-with-lease"
 body = "--force-with-lease refuses to overwrite commits you have not seen, so it is safe enough to rewrite history on main when cleaning up."
 
@@ -697,6 +708,7 @@ lang = "ru"
 kind = "discovery"
 scope = "solution"
 certainty = "hypothesis"
+contradicts = ["p14-a"]
 title = "Значения Vault индексируются FTS для поиска по секретам"
 body = "Чтобы агент мог найти нужный секрет по описанию, значения записей Vault попадают в полнотекстовый индекс."
 

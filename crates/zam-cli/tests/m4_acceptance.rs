@@ -954,7 +954,8 @@ fn hook_budgets() {
             .collect(),
     ));
     // M4.5: `subagent-start` — пакет под задачу после `pre-tool` на `Agent` (очередь запусков);
-    // задание — текст запроса prompt набора подсказок, ответ — по качеству поиска (FTS-only)
+    // задание — текст запроса prompt набора подсказок, ответ обязателен (пакет или мини-дайджест;
+    // замолчавшие по сроку из этой проверки исключены, они считаются в тайм-аутах)
     let prompts = inputs("prompt");
     runs.push((
         "subagent-start",
@@ -965,7 +966,7 @@ fn hook_budgets() {
                     &format!("bud-sub-{i}"),
                     json!({"agent_id": format!("a{i}"), "agent_type": "Explore"}),
                 );
-                (ev, None)
+                (ev, Some(true))
             })
             .collect(),
     ));

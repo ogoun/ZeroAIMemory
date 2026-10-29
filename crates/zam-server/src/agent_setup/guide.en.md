@@ -67,7 +67,7 @@ A term (`term`) is the canonical name of a project or domain concept.
 
 - **A decision (ADR)** — `memory_log {kind: "insight", data: {kind: "decision", decision: {context?, options?, chosen?, rationale?, consequences?, decided_by?: human|agent, revisit_if?}}}`. The human's decisions — `filters.decided_by: human`.
 - **Certainty** `certainty`: `axiom` — accepted truth, `theorem` — proven or verified, `hypothesis` — an assumption. Changed with a `reason`.
-- Set, change or remove `axiom` **only on the user's direct instruction**. If your own conclusion differs, record a `hypothesis` or `theorem` with the objection and evidence, link it to the axiom with `contradicts` (the record's `links` or `memory_link {src: <your record>, type: "contradicts", dst: <axiom>}`) and tell the user. Results never rank such a record above the axiom.
+- Set, change or remove `axiom` **only on the user's direct instruction**. If your own conclusion differs, record a `hypothesis` or `theorem` with the objection and evidence, link it to the axiom with `contradicts` (the record's `links` or `memory_link {src: <your record>, type: "contradicts", dst: <axiom>}`) and tell the user. Object to a `theorem` the same way: a `hypothesis` with `contradicts` to it. Results never rank a record above an active, more reliable record (`theorem`/`axiom`) it contradicts.
 - `warnings: ["decision_near_axiom: i:<id> …"]` on a decision write — an axiom on the same topic exists: check that you do not contradict it.
 
 ## File references

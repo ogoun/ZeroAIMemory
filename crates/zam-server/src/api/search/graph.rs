@@ -174,7 +174,8 @@ pub(super) async fn expand_graph(
 }
 
 /// Надёжность для порядка по `contradicts`: `axiom` 3, `theorem` 2, `hypothesis` 1, без
-/// `certainty` (заметка) 0.
+/// `certainty` (заметка, term, task…) 0 — ниже гипотезы. Та же шкала — в проверке набора eval
+/// (`xtask/src/eval/insights.rs::reliability`).
 fn reliability(c: Option<Certainty>) -> u8 {
     match c {
         Some(Certainty::Axiom) => 3,
@@ -182,6 +183,14 @@ fn reliability(c: Option<Certainty>) -> u8 {
         Some(Certainty::Hypothesis) => 1,
         None => 0,
     }
+}
+
+/// Пара `contradicts` переставляется: цель действует, это `theorem` или `axiom` и она строго
+/// надёжнее источника ([`reliability`]): hypothesis → theorem, hypothesis → axiom, theorem →
+/// axiom, заметка → theorem/axiom — да; axiom → axiom, theorem → theorem — нет (до задачи 15
+/// M4.5 пара «аксиома → аксиома» переставлялась).
+pub(super) fn contradicts_applies(src_rel: u8, dst_rel: u8, dst_live: bool) -> bool {
+    dst_live && dst_rel >= reliability(Some(Certainty::Theorem)) && dst_rel > src_rel
 }
 
 /// Порядок по `contradicts` (M4.5, §5.2): элемент выдачи с исходящим `contradicts` к действующей
@@ -237,9 +246,8 @@ pub(super) async fn order_by_contradicts(
             }
             let src = rel.get(&e.src.id).map_or(0, |r| r.0);
             if let Some(d) = e.dst
-                && let Some(&(dst, true)) = rel.get(&d.id)
-                && dst >= reliability(Some(Certainty::Theorem))
-                && dst > src
+                && let Some(&(dst, live)) = rel.get(&d.id)
+                && contradicts_applies(src, dst, live)
                 && refs.contains(&e.src)
                 && refs.contains(&d)
             {
@@ -265,6 +273,47 @@ pub(super) async fn order_by_contradicts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contradicts_rule_table() {
+        let r = |c: Option<Certainty>| reliability(c);
+        let (h, t, a) = (
+            r(Some(Certainty::Hypothesis)),
+            r(Some(Certainty::Theorem)),
+            r(Some(Certainty::Axiom)),
+        );
+        let note = r(None);
+        // (источник, цель, цель действует, переставляется)
+        let cases = [
+            ("hypothesis → theorem", h, t, true, true),
+            ("hypothesis → axiom", h, a, true, true),
+            ("theorem → axiom", t, a, true, true),
+            ("заметка → theorem", note, t, true, true),
+            ("заметка → axiom", note, a, true, true),
+            ("axiom → axiom", a, a, true, false),
+            ("theorem → theorem", t, t, true, false),
+            ("axiom → theorem", a, t, true, false),
+            ("theorem → hypothesis", t, h, true, false),
+            ("заметка → hypothesis", note, h, true, false),
+            (
+                "hypothesis → замещённая/отозванная axiom",
+                h,
+                a,
+                false,
+                false,
+            ),
+            (
+                "hypothesis → замещённая/отозванная theorem",
+                h,
+                t,
+                false,
+                false,
+            ),
+        ];
+        for (name, src, dst, live, want) in cases {
+            assert_eq!(contradicts_applies(src, dst, live), want, "{name}");
+        }
+    }
 
     #[test]
     fn certainty_order() {

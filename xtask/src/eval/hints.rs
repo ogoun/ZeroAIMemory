@@ -697,6 +697,9 @@ pub struct HintsInfo {
     pub date: String,
     pub git: String,
     pub label: Option<String>,
+    /// Префикс имени результата после даты (`--prefix`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
     pub model: Option<String>,
     pub model_id: Option<String>,
     pub device: Option<String>,
@@ -1519,6 +1522,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) -> Resul
             date: run::today(),
             git: run::git_rev(&p.repo),
             label: a.label.clone(),
+            prefix: a.prefix.clone(),
             model: model.clone(),
             model_id: model
                 .as_ref()
@@ -1702,17 +1706,26 @@ pub fn render_md(r: &HintsResult) -> String {
     s
 }
 
-/// `eval/results/<дата>-<модель|fts>-hints[-метка].{json,md}`.
+/// `eval/results/<дата>[-<префикс>]-<модель|fts>-hints[-метка].{json,md}`.
 fn write(dir: &Path, r: &HintsResult) -> Result<(PathBuf, PathBuf)> {
-    let mut stem = format!(
-        "{}-{}-hints",
-        r.info.date,
-        r.info.model.as_deref().unwrap_or("fts")
-    );
+    let mut stem = hints_stem(r);
     if let Some(l) = &r.info.label {
         stem.push('-');
         stem.push_str(l);
     }
+    write_as(dir, &stem, r)
+}
+
+/// `<дата>[-<префикс>]-<модель|fts>-hints`.
+fn hints_stem(r: &HintsResult) -> String {
+    let model = r.info.model.as_deref().unwrap_or("fts");
+    match &r.info.prefix {
+        Some(p) => format!("{}-{p}-{model}-hints", r.info.date),
+        None => format!("{}-{model}-hints", r.info.date),
+    }
+}
+
+fn write_as(dir: &Path, stem: &str, r: &HintsResult) -> Result<(PathBuf, PathBuf)> {
     fs::create_dir_all(dir)?;
     let json_path = dir.join(format!("{stem}.json"));
     let md_path = dir.join(format!("{stem}.md"));

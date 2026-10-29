@@ -54,6 +54,14 @@ pub fn compare_file(files: &[PathBuf], mode: Mode) -> Result<Option<PathBuf>> {
             found = Some(f.clone());
         }
     }
+    if found.is_none() {
+        // явное предупреждение: прогон режима без сравнения не должен пройти незаметно
+        eprintln!(
+            "предупреждение: --compare: среди {} файлов нет прогона режима {} — без сравнения",
+            files.len(),
+            mode.as_str()
+        );
+    }
     Ok(found)
 }
 

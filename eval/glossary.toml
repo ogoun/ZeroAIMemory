@@ -275,3 +275,48 @@ text = "какой тайм-аут ставить на исходящие зап
 lang = "ru"
 term = "timeout"
 expect = ["ru/ops/timeouts"]
+
+# Fix round 1 задачи 15: направление EN→RU (английский запрос, каноническое имя — русское) и
+# псевдонимы, не встречавшиеся в запросах выше.
+
+[[query]]
+id = "g-25"
+text = "quantization of the cross-encoder reranker to int8"
+lang = "en"
+term = "quantization"
+expect = ["ru/research/kross-enkodery-rerank"]
+
+[[query]]
+id = "g-26"
+text = "retry with exponential backoff and a timeout for every attempt"
+lang = "en"
+term = "timeout"
+expect = ["ru/ops/retries-backoff-jitter"]
+
+[[query]]
+id = "g-27"
+text = "кубернетес обновление узлов и drain"
+lang = "ru"
+term = "kubernetes"
+expect = ["en/long/kubernetes-upgrade-log"]
+
+[[query]]
+id = "g-28"
+text = "кдрант запускается сервером как дочерний процесс"
+lang = "ru"
+term = "qdrant"
+expect = ["ru/zam/qdrant-managed-process"]
+
+[[query]]
+id = "g-29"
+text = "пауэршелл и stderr нативных команд"
+lang = "ru"
+term = "powershell"
+expect = ["en/windows/powershell-native-stderr"]
+
+[[query]]
+id = "g-30"
+text = "перебазирование ветки или слияние через merge"
+lang = "ru"
+term = "rebase"
+expect = ["en/git/merge-vs-rebase"]

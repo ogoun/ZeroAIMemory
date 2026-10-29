@@ -117,7 +117,7 @@ impl ToolName {
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
-                 связь; type contradicts — запись возражает аксиоме dst; remove: <edge_id> — \
+                 связь; type contradicts — запись возражает axiom/theorem dst; remove: <edge_id> — \
                  удалить связь."
             }
             ToolName::Recall => {

@@ -54,9 +54,13 @@ M2 «FTS-only находки»).
 **Insight** (`insights.toml`, `[[insight]]`): `key`, `lang`, `kind` (`data.kind`), `scope`
 (`solution` | `global`), `area?`, `certainty?`, `evidence? {checked, method, result}`, `title`,
 `body`, `triggers?`, `supersedes = "<key>"?`, `retract_reason?`, `contradicts = ["<key>"]?`
-(M4.5: связь `contradicts` к более надёжной действующей записи, `POST /edges` после создания
-всех записей; размечены гипотезы запросов `r-08`, `r-12`, `r-13` — решение владельца
-2026-10-28, спецификация M4.5 §5.2). Загрузчик создаёт записи в
+(M4.5: связь `contradicts` к действующей более надёжной записи `theorem`/`axiom`, `POST /edges`
+после создания всех записей; спецификация M4.5 §5.2). Размечены 13 из 14 пар противоречий
+p01–p14 (решение владельца 2026-10-28 — `r-08`, `r-12`, `r-13`; fix round 1 задачи 15 — все пары с
+противоречием по смыслу); у p07 связи нет: теорема — о наборе eval M2, гипотеза — общее
+утверждение. С `search.contradicts_order = true` порядок такой пары вынужден, если обе записи в
+выдаче: `reliable_first` проверяет механизм, а не бусты и реранкер; без механизма — прогон с
+`--set search.contradicts_order=false`. Загрузчик создаёт записи в
 порядке файла (`POST /spaces/{решение}/entries`, `force: true`), замещает (`POST
 /entries/{id}/supersede`) и после всех созданий отзывает (`POST /entries/{id}/retract`);
 все записи, в том числе `axiom`, пишет токен прогона (агент: с M4 человеческих токенов нет,
@@ -179,6 +183,8 @@ cargo xtask eval --glossary --mode fts --compare <fts M4>  # словарь и �
 cargo xtask eval --glossary --device cuda --mode hybrid --mode hybrid+rerank   --compare <гибрид M4> --compare <rerank M4>              # то же на fp16 CUDA, по файлу на режим
 ```
 
+`--prefix <имя>` (`--hints` и прогоны `--mode`) ставит префикс в имя результата сразу после даты:
+`<дата>-m45-<модель>-<режим>` — итоги этапа воспроизводятся одной командой.
 `--compare` можно повторять: прогон режима сравнивается с файлом того же режима (`info.mode`),
 единственный файл — со всеми режимами.
 
@@ -433,8 +439,9 @@ frontmatter), запросы — в `queries.toml` с уникальным `id`.
 `results/2026-10-29-m45-glossary-{fts,bge-m3-int8,bge-m3-fp16}.*`, итоговые прогоны основного
 набора со словарём и связями `contradicts` — `results/2026-10-29-m45-{fts,bge-m3-int8-hybrid,
 bge-m3-fp16-hybrid,bge-m3-fp16-hybrid-rerank}.*` (`--compare` с `*-m4-final`), задержки хуков
-FTS-only — `results/2026-10-29-m45-fts-hints.*` (файл `eval --hints --label m45`, переименован под
-общий префикс); сводка — `results/2026-10-29-m45-summary.md`.
+FTS-only — `results/2026-10-29-m45-fts-hints.*` (`eval --hints --mode fts --prefix m45`), `rerank=on`
+без порядка по связи — `results/2026-10-29-m45-bge-m3-fp16-hybrid-rerank-no-contradicts-order.*`;
+сводка — `results/2026-10-29-m45-summary.md`.
 
 Заметка корпуса `ru/zam/hybrid-search-rrf` описывает алгоритм поиска до подбора весов (без
 `w_fts_relaxed` и без правила «невидимых векторному каналу» узлов) и намеренно не обновляется:
