@@ -12,8 +12,8 @@
 //! - **Пространство по умолчанию** (`memory_tree`, `memory_write`, `memory_log`,
 //!   `memory_vault`) **[решение исполнителя]** — решение из `X-Zam-Solution`, без него —
 //!   `knowledge`.
-//! - **Ссылки** `i:|c:|r:|t:|k:|q:|e:<id>` (как в карточках поиска) принимаются везде, где REST ждёт id
-//!   записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`.
+//! - **Ссылки** `i:|c:|r:|t:|k:|q:|e:<id>` (как в карточках поиска) принимаются везде, где REST
+//!   ждёт id записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`.
 use std::sync::{Arc, LazyLock};
 
 use axum::http::{HeaderName, Method, StatusCode, header};

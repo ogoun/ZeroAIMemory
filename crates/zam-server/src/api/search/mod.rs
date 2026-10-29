@@ -97,8 +97,9 @@
 //!    применяются; решение владельца 2026-10-26), затем то же деление при переполнении
 //!    ([`zam_search::overflow_divisor`]); хвост остаётся в порядке слияния; лимит на узел
 //!    после перестановки соблюдается (набор тот же). Реранкер — по устройству эмбеддера,
-//!    грузится при первом таком запросе (`spawn_blocking`). Нет модели — ответ без реранка и `warnings: ["reranker not
-//!    installed"]`; ошибка или паника загрузки и инференса — `["reranker failed"]`, не 500.
+//!    грузится при первом таком запросе (`spawn_blocking`). Нет модели — ответ без реранка и
+//!    `warnings: ["reranker not installed"]`; ошибка или паника загрузки и инференса — `["reranker
+//!    failed"]`, не 500.
 //! 5. `top_k` (в `notes` — узлов), `expand` (`graph` — соседи после `top_k`), упаковка в
 //!    `budget_tokens`.
 //!
@@ -2838,7 +2839,8 @@ mod tests {
 
     /// Замер `expand=section` (ревью fix round 1 задачи 17): заметка ~1 МБ без H1–H3,
     /// 300 кандидатов окна из её конца. Запуск:
-    /// `cargo test -p zam-server --release --lib bench_expand_section_big_note -- --ignored --nocapture`.
+    /// `cargo test -p zam-server --release --lib bench_expand_section_big_note`
+    /// `-- --ignored --nocapture`.
     #[tokio::test]
     #[ignore = "замер"]
     async fn bench_expand_section_big_note() {

@@ -3,9 +3,9 @@
 //! правилам [`zam_store::TermData`], без дедупликации и триггеров, статус только `active`,
 //! конфликт имени или псевдонима — 409 `/problems/term-conflict`; замещение и отзыв — те же
 //! операции ([`supersede`], [`retract`]). Правила `certainty` ([`crate::certainty`]) проверяет
-//! хранилище в транзакции каждой операции: без `certainty` insight агента — `hypothesis`, человека — без статуса;
-//! `axiom` ставит любой автор (агент — по прямому указанию пользователя, §14.2), `theorem`
-//! агента — только с `data.evidence {checked, method, result}` (422).
+//! хранилище в транзакции каждой операции: без `certainty` insight агента — `hypothesis`, человека
+//! — без статуса; `axiom` ставит любой автор (агент — по прямому указанию пользователя, §14.2),
+//! `theorem` агента — только с `data.evidence {checked, method, result}` (422).
 //!
 //! **Создание** — `POST /spaces/{space}/entries` с `kind: "insight"` ([`create`]):
 //! - поля §7.5: `title`, `body`, `data {kind, experiment?, evidence?, …}` (`data.kind` — один
