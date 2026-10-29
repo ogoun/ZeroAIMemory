@@ -7,6 +7,7 @@
   // кнопки оценки (`POST /entries/{id}/feedback`, источник `webui`, §10.5).
   import { untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
+  import FileRefs from './FileRefs.svelte';
   import Links from './Links.svelte';
   import {
     ApiError,
@@ -25,17 +26,25 @@
     type TriggerType,
     type UsageCounts,
   } from '../lib/api';
+  import { loadRefs, staleOf, staleText, type RefsByTarget } from '../lib/fileRefs';
   import {
+    ADR_TEXT,
     AUTHOR_TEXT,
     CERTAINTIES,
     CERTAINTY_TEXT,
+    DECIDED_BY_TEXT,
     INSIGHT_KINDS,
     STATUSES,
     STATUS_TEXT,
     TRIGGER_TEXT,
     TRIGGER_TYPES,
+    adrIsEmpty,
+    adrOf,
+    adrToData,
     dataStr,
+    entryRef,
     fmtTime,
+    type Adr,
   } from '../lib/journals';
   import { go } from '../lib/router';
 
@@ -63,6 +72,9 @@
   let fCertainty = $state<'' | Certainty>('');
   let fArea = $state('');
   let fTag = $state('');
+  /** Только решения человека (`decided_by=human`, M4.5 §5). */
+  let fHuman = $state(false);
+  let refs = $state<RefsByTarget>(new Map());
   let seq = 0;
 
   // ---- карточка ----
@@ -71,7 +83,7 @@
   let chain = $state<Entry[]>([]);
   /** Цепочка оборвалась (запись недоступна или предел шагов): до и после. */
   let chainCut = $state({ before: false, after: false });
-  type Mode = 'none' | 'supersede' | 'retract' | 'certainty' | 'triggers';
+  type Mode = 'none' | 'supersede' | 'retract' | 'certainty' | 'triggers' | 'adr';
   let mode = $state<Mode>('none');
   let busy = $state(false);
   let actionError = $state('');
@@ -85,6 +97,9 @@
   // новая запись человека по умолчанию без статуса: аксиому человек ставит явно (§7.5)
   let sCertainty = $state<Certainty | ''>('');
   let rReason = $state('');
+  /** Поля ADR формы (`data.decision`); варианты — по одному в строке. */
+  let adr = $state<Adr>(emptyAdr());
+  let adrOptions = $state('');
   let cTo = $state<'' | Certainty>('');
   let cReason = $state('');
   let evChecked = $state('');
@@ -94,6 +109,23 @@
   let tType = $state<TriggerType>('keyword');
   let tPattern = $state('');
   let tTools = $state('');
+
+  function emptyAdr(): Adr {
+    return { context: '', options: [], chosen: '', rationale: '', consequences: '', decided_by: 'human', revisit_if: '' };
+  }
+
+  /** Форма ADR из `data.decision` записи; у нового решения «кто решил» — человек. */
+  function loadAdr(data: Record<string, unknown>) {
+    const a = adrOf(data);
+    adr = { ...a, decided_by: a.decided_by || 'human' };
+    adrOptions = a.options.join('\n');
+  }
+
+  /** `data.decision` формы; пустой ADR (одно лишь «кто решил») не отправляется. */
+  function adrPayload(): Record<string, unknown> | null {
+    const a = { ...adr, options: adrOptions.split('\n') };
+    return adrIsEmpty({ ...a, decided_by: '' }) ? null : adrToData(a);
+  }
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
@@ -109,7 +141,11 @@
       fCertainty = '';
       fArea = '';
       fTag = '';
+      fHuman = false;
       load(u, s, true);
+      loadRefs(u, s).then((r) => {
+        if (u === user && s === space) refs = r;
+      });
     });
   });
 
@@ -130,7 +166,8 @@
         certainty: fCertainty ? [fCertainty] : undefined,
         area: fArea.trim() || undefined,
         tag: fTag.trim() || undefined,
-        dataKind: fKind || undefined,
+        dataKind: fKind || (fHuman ? 'decision' : undefined),
+        decidedBy: fHuman ? 'human' : undefined,
         cursor: reset ? null : next,
         limit: PAGE,
       });
@@ -276,7 +313,28 @@
     sBody = cur.body;
     sKind = dataStr(cur.data, 'kind') || 'discovery';
     sCertainty = '';
+    loadAdr(cur.data);
     mode = 'supersede';
+  }
+
+  function startAdr() {
+    if (!cur) return;
+    loadAdr(cur.data);
+    mode = 'adr';
+  }
+
+  function submitAdr(e: SubmitEvent) {
+    e.preventDefault();
+    const c = cur;
+    if (!c) return;
+    const decision = adrPayload();
+    // `data` insight заменяется целиком: прочие поля сохраняются, ADR — как в форме
+    const data: Record<string, unknown> = { ...c.data };
+    if (decision) data.decision = decision;
+    else delete data.decision;
+    act(async () => {
+      await patchEntry(user, c.id, c.rev, { data });
+    }, 'Поля ADR сохранены.');
   }
 
   function submitSupersede(e: SubmitEvent) {
@@ -285,6 +343,9 @@
     if (!c) return;
     act(async () => {
       const data: Record<string, unknown> = { ...c.data, kind: sKind };
+      const decision = sKind === 'decision' ? adrPayload() : null;
+      if (decision) data.decision = decision;
+      else delete data.decision;
       const r = await supersedeEntry(user, c.id, {
         title: sTitle.trim(),
         body: sBody,
@@ -419,6 +480,9 @@
     </label>
     <input bind:value={fArea} placeholder="область" aria-label="Область" />
     <input bind:value={fTag} placeholder="тег" aria-label="Тег" />
+    <label class="row">
+      <input type="checkbox" bind:checked={fHuman} onchange={reloadList} aria-label="Решения человека" /> Решения человека
+    </label>
     <button type="submit">Применить</button>
   </form>
 
@@ -439,6 +503,9 @@
             <td>
               <button type="button" class="link" onclick={() => select(e.id)}>{e.title}</button>
               {#each e.tags as t (t)}<span class="chip">#{t}</span>{/each}
+              {#if staleOf(refs.get(entryRef('insight', e.id))).length}
+                <span class="chip stale" title={staleText(staleOf(refs.get(entryRef('insight', e.id))))}>возможно устарело</span>
+              {/if}
             </td>
             <td>{dataStr(e.data, 'kind')}</td>
             <td>{e.status ? STATUS_TEXT[e.status] : ''}</td>
@@ -483,6 +550,25 @@
           <dt>Результат</dt><dd>{String(ev.result ?? '')}</dd>
         </dl>
       {/if}
+      {#if dataStr(c.data, 'kind') === 'decision' && !adrIsEmpty({ ...adrOf(c.data), decided_by: '' })}
+        {@const a = adrOf(c.data)}
+        <dl class="adr" aria-label="Поля ADR">
+          {#if a.context}<dt>{ADR_TEXT.context}</dt><dd>{a.context}</dd>{/if}
+          {#if a.options.length}
+            <dt>{ADR_TEXT.options}</dt>
+            <dd><ul>{#each a.options as o (o)}<li>{o}</li>{/each}</ul></dd>
+          {/if}
+          {#if a.chosen}<dt>{ADR_TEXT.chosen}</dt><dd>{a.chosen}</dd>{/if}
+          {#if a.rationale}<dt>{ADR_TEXT.rationale}</dt><dd>{a.rationale}</dd>{/if}
+          {#if a.consequences}<dt>{ADR_TEXT.consequences}</dt><dd>{a.consequences}</dd>{/if}
+          {#if a.decided_by}<dt>{ADR_TEXT.decided_by}</dt><dd>{DECIDED_BY_TEXT[a.decided_by]}</dd>{/if}
+          {#if a.revisit_if}<dt>{ADR_TEXT.revisit_if}</dt><dd>{a.revisit_if}</dd>{/if}
+        </dl>
+      {/if}
+      {#if staleOf(refs.get(entryRef('insight', c.id))).length}
+        <p class="warn" data-testid="stale-note">{staleText(staleOf(refs.get(entryRef('insight', c.id))))}</p>
+      {/if}
+      <FileRefs refs={refs.get(entryRef('insight', c.id)) ?? []} />
       {#if c.retract_reason}<p class="warn">Отозвано: {c.retract_reason}</p>{/if}
       <div class="row rate" role="group" aria-label="Оценка полезности">
         <span class="muted small" data-testid="usage">
@@ -520,6 +606,9 @@
           </button>
           <button type="button" onclick={startCertainty}>Сменить статус надёжности</button>
           <button type="button" onclick={startTriggers}>Триггеры</button>
+          {#if dataStr(c.data, 'kind') === 'decision'}
+            <button type="button" onclick={startAdr}>Править ADR</button>
+          {/if}
         {/if}
         {#if c.status !== 'retracted'}
           <button type="button" class="danger" onclick={() => ((rReason = ''), (mode = 'retract'))}>Отозвать</button>
@@ -544,7 +633,15 @@
               </select>
             </label>
           </div>
+          {#if sKind === 'decision'}{@render adrFields()}{/if}
           {@render formEnd('Заменить')}
+        </form>
+      {:else if mode === 'adr'}
+        <form class="form" onsubmit={submitAdr} aria-label="Поля ADR">
+          <h3>Поля ADR</h3>
+          <p class="muted small">Контекст, варианты, выбор, обоснование, последствия: запись правится на месте, новой ревизией.</p>
+          {@render adrFields()}
+          {@render formEnd('Сохранить')}
         </form>
       {:else if mode === 'retract'}
         <form class="form" onsubmit={submitRetract} aria-label="Отзыв insight">
@@ -614,6 +711,24 @@
     </article>
   {/if}
 </section>
+
+{#snippet adrFields()}
+  <fieldset class="adr-form">
+    <legend class="muted small">Решение (ADR)</legend>
+    <label>{ADR_TEXT.context} <textarea bind:value={adr.context} rows="2"></textarea></label>
+    <label>{ADR_TEXT.options} <span class="muted small">(по одному в строке)</span> <textarea bind:value={adrOptions} rows="3"></textarea></label>
+    <label>{ADR_TEXT.chosen} <input bind:value={adr.chosen} /></label>
+    <label>{ADR_TEXT.rationale} <textarea bind:value={adr.rationale} rows="2"></textarea></label>
+    <label>{ADR_TEXT.consequences} <textarea bind:value={adr.consequences} rows="2"></textarea></label>
+    <label>{ADR_TEXT.decided_by}
+      <select bind:value={adr.decided_by}>
+        <option value="human">человек</option>
+        <option value="agent">агент</option>
+      </select>
+    </label>
+    <label>{ADR_TEXT.revisit_if} <input bind:value={adr.revisit_if} /></label>
+  </fieldset>
+{/snippet}
 
 {#snippet formEnd(label: string)}
   {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
@@ -687,6 +802,48 @@
     gap: 2px 12px;
     margin: 8px 0;
     font-size: 14px;
+  }
+  .adr {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 12px;
+    margin: 8px 0;
+    font-size: 14px;
+  }
+  .adr dt {
+    color: var(--muted);
+  }
+  .adr dd {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .adr ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .adr-form {
+    display: grid;
+    gap: 8px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .adr-form label {
+    display: grid;
+    gap: 4px;
+  }
+  .adr-form textarea {
+    font: inherit;
+    padding: 6px 10px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .chip.stale {
+    background: var(--warn-bg);
+    color: var(--warn-text);
   }
   .evidence.old {
     opacity: 0.75;

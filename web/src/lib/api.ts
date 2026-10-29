@@ -397,6 +397,8 @@ export interface SearchItem {
   path: string;
   heading_path: string;
   rev: number;
+  /** Пути файлов, чьи ссылки записи устарели (M4.5 §6): «возможно устарело». */
+  stale_refs?: string[];
   /** Совпадения обрамлены U+E000 … U+E001. */
   snippet: string;
   score: number;
@@ -599,6 +601,8 @@ export interface Entry {
   triggers?: Trigger[];
   /** У insight в `GET /entries/{id}` и в списке: показы подсказками и оценки (§10.5). */
   usage?: UsageCounts;
+  /** У задачи `done`: минуты от `started_at` до `done_at` (`null` — старта не было). */
+  duration_min?: number | null;
 }
 
 export interface EntryQuery {
@@ -609,6 +613,8 @@ export interface EntryQuery {
   tag?: string;
   /** `data.kind`: вид changelog или insight (фильтр на сервере, курсор его учитывает). */
   dataKind?: string;
+  /** Решения по `data.decision.decided_by` (M4.5 §5). */
+  decidedBy?: 'human' | 'agent';
   cursor?: string | null;
   limit?: number;
 }
@@ -622,6 +628,7 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
   if (f.area) p.set('area', f.area);
   if (f.tag) p.set('tag', f.tag);
   if (f.dataKind) p.set('data_kind', f.dataKind);
+  if (f.decidedBy) p.set('decided_by', f.decidedBy);
   if (f.cursor) p.set('cursor', f.cursor);
   if (f.limit) p.set('limit', String(f.limit));
   return call<{ items: Entry[]; next_cursor: string | null }>(
@@ -640,7 +647,11 @@ export interface EntryPatch {
   body?: string;
   data?: Record<string, unknown>;
   tags?: string[];
-  status?: 'active' | 'revisit';
+  status?: EntryStatus;
+  /** Задача: что делать дальше; пустая строка снимает. */
+  next_step?: string;
+  /** Задача: что мешает; пустая строка снимает. */
+  blocked_by?: string;
   triggers?: NewTrigger[];
   /** `null` — снять статус. */
   certainty?: Certainty | null;
@@ -658,6 +669,64 @@ export const patchEntry = async (user: string, id: string, rev: number, patch: E
   (await (
     await request('PATCH', `entries/${q(id)}`, { body: patch, user, headers: ifMatch(rev) })
   ).json()) as Entry;
+
+/** Новая запись журнала (`kind`: term, task, question, …); сервер добавляет `warnings`/`dedup`. */
+export const createEntry = async (user: string, space: string, body: Record<string, unknown>) =>
+  (await (
+    await request('POST', `spaces/${q(space)}/entries`, { body, user })
+  ).json()) as Entry & { warnings?: string[] };
+
+// ---- словарь, задачи, вопросы (M4.5 §2–4) ----
+
+export interface GlossaryItem {
+  id: string;
+  title: string;
+  aliases: string[];
+  definition: string;
+}
+
+/** Действующие термины пространства (по имени). */
+export const getGlossary = (user: string, space: string) =>
+  call<{ version: number; items: GlossaryItem[] }>('GET', `spaces/${q(space)}/glossary`, undefined, user);
+
+/** Занятые имена из 409 `/problems/term-conflict`. */
+export function termConflicts(e: unknown): { id: string; title: string; matched: string }[] {
+  if (!(e instanceof ApiError) || e.status !== 409 || e.problem?.type !== '/problems/term-conflict') return [];
+  const c = e.problem.conflicts;
+  return Array.isArray(c) ? (c as { id: string; title: string; matched: string }[]) : [];
+}
+
+/** Снять захват задачи (человек в WebUI снимает и чужой, M4.5 §3). */
+export const releaseTask = (user: string, id: string) =>
+  call<Entry>('POST', `entries/${q(id)}/release`, undefined, user);
+
+/** Ответ человека на вопрос; из WebUI — всегда `channel: webui`. Создаёт решение (`decision_id`). */
+export const answerQuestion = (user: string, id: string, a: { text?: string; option?: string }) =>
+  call<{ entry: Entry; decision: Entry; decision_id: string }>(
+    'POST',
+    `entries/${q(id)}/answer`,
+    { ...a, channel: 'webui' },
+    user,
+  );
+
+/** 409 «вопрос уже отвечен» с `decision_id` первого ответа. */
+export const answeredDecision = (e: unknown): string | null =>
+  e instanceof ApiError && e.status === 409 && e.problem?.type === '/problems/already-answered'
+    ? typeof e.problem.decision_id === 'string'
+      ? e.problem.decision_id
+      : ''
+    : null;
+
+// ---- ссылки знаний на файлы (M4.5 §6) ----
+
+export interface FileRefPath {
+  path: string;
+  items: { id: string; kind: string; title: string; state: string }[];
+}
+
+/** Индекс ссылок на файлы решения `solution` (GUID): до 5 записей на путь. */
+export const fileRefIndex = (user: string, solution: string) =>
+  call<{ refs: FileRefPath[] }>('GET', `file-refs?solution=${q(solution)}`, undefined, user);
 
 export interface InsightDraft {
   title: string;
@@ -750,7 +819,17 @@ export interface VaultItem {
   space: string;
   agent_solution_id: string | null;
   title: string;
-  data: { type: string; username?: string; url?: string; description?: string };
+  data: {
+    type: string;
+    username?: string;
+    url?: string;
+    description?: string;
+    /** Окружение (`host`, `environment`, M4.5 §8): открытые поля. */
+    purpose?: string;
+    address?: string;
+    limits?: string;
+    notes?: string;
+  };
   rev: number;
   author: AuthorView;
   created_at: string;
@@ -768,8 +847,10 @@ export const listVault = (user: string, space: string) =>
   call<VaultList>('GET', `spaces/${q(space)}/vault`, undefined, user);
 
 /** Значение секрета: ответ `no-store`, раскрытие записывается в аудит. */
-export async function revealVault(user: string, id: string): Promise<string> {
+export async function revealVault(user: string, id: string): Promise<string | null> {
   const r = await call<{ secret?: unknown }>('GET', `vault/${q(id)}?reveal=1`, undefined, user);
+  // у записей окружения значение необязательно: `secret: null` — значения нет
+  if (r.secret === null) return null;
   if (typeof r.secret !== 'string') throw new ApiError(500, 'сервер не вернул значение');
   return r.secret;
 }
@@ -918,8 +999,27 @@ export function withToken(s: AgentSetup, token: string): AgentSetup {
 
 // ---- настройки пользователя: типы подсказок хуков (§10.3, R5) ----
 
-export type HookKind = 'session_start' | 'prompt' | 'pre_tool' | 'post_tool' | 'checkpoint';
-export const HOOK_KINDS: HookKind[] = ['session_start', 'prompt', 'pre_tool', 'post_tool', 'checkpoint'];
+export type HookKind =
+  | 'session_start'
+  | 'prompt'
+  | 'pre_tool'
+  | 'post_tool'
+  | 'checkpoint'
+  | 'subagent_start'
+  | 'file_context'
+  | 'session_journal'
+  | 'recovery';
+export const HOOK_KINDS: HookKind[] = [
+  'session_start',
+  'prompt',
+  'pre_tool',
+  'post_tool',
+  'checkpoint',
+  'subagent_start',
+  'file_context',
+  'session_journal',
+  'recovery',
+];
 export type HookFlags = Record<HookKind, boolean>;
 
 /** Свои настройки (`own`) или пользователя `userId` (администратор). */
@@ -1038,6 +1138,9 @@ export function errorText(e: unknown): string {
     return `Нет доступа: ${ACCESS_TEXT[st] ?? 'доступа к решению нет'}.`;
   }
   if (type === '/problems/vault-locked') return e.message;
+  if (type === '/problems/term-conflict') return e.message;
+  if (type === '/problems/task-claimed') return 'Задача захвачена другой сессией.';
+  if (type === '/problems/already-answered') return 'Вопрос уже отвечен.';
   if (type === '/problems/idempotency-mismatch')
     return `Повтор запроса с тем же ключом, но другим содержимым: ${e.message}`;
   if (type === '/problems/possible-duplicate') return `Похоже на уже записанный insight: ${e.message}`;

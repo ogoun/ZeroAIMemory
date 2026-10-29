@@ -47,7 +47,7 @@ async function openJournal(page: Page, journal: string) {
   await sol.click();
   // журналы — над деревом заметок решения
   const journals = t.getByRole('list', { name: `Журналы: ${SOLUTION_NAME}` });
-  await expect(journals.getByRole('link')).toHaveText(['Changelog', 'Releases', 'Insights', 'Vault']);
+  await expect(journals.getByRole('link')).toHaveText(['Changelog', 'Releases', 'Insights', 'Словарь', 'Задачи', 'Вопросы', 'Vault']);
   await journals.getByRole('link', { name: journal, exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/s/${SOLUTION_GUID}/j/${journal.toLowerCase()}`));
   await expect(page.getByRole('heading', { level: 1, name: journal })).toBeVisible();
@@ -76,11 +76,14 @@ test('Changelog: лента и фильтры по виду и области', 
   await expect(cards).toHaveCount(2);
   await expect(feed).not.toContainText('Исправлен CRLF');
 
-  // Knowledge: только Insights и Vault
+  // Knowledge: без Changelog и Releases
   const t = tree(page);
   await t.getByRole('button', { name: 'Knowledge', exact: true }).click();
   await expect(t.getByRole('list', { name: 'Журналы: Knowledge' }).getByRole('link')).toHaveText([
     'Insights',
+    'Словарь',
+    'Задачи',
+    'Вопросы',
     'Vault',
   ]);
   expect(problems, problems.join('\n')).toEqual([]);

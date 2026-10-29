@@ -9,8 +9,9 @@
   import CertaintyBadge from './CertaintyBadge.svelte';
   import { ApiError, getOutline, listSpaces, search, spaceRef, type SearchItem } from '../lib/api';
   import { reasonText, warningText } from '../lib/indexing';
-  import { STATUS_TEXT } from '../lib/journals';
-  import { go, type Journal } from '../lib/router';
+  import { JOURNAL_OF_KIND, STATUS_TEXT } from '../lib/journals';
+  import { staleText } from '../lib/fileRefs';
+  import { go } from '../lib/router';
 
   let {
     open = $bindable(),
@@ -134,13 +135,6 @@
     return out;
   }
 
-  /** Журнал записи по её виду. */
-  const JOURNAL_OF: Record<string, Journal> = {
-    insight: 'insights',
-    changelog: 'changelog',
-    release: 'releases',
-  };
-
   /** Якорь раздела по `heading_path` (оглавление сервера: точный путь, иначе последний заголовок). */
   async function anchorFor(it: SearchItem): Promise<string | null> {
     if (!it.heading_path || !it.node_id) return null;
@@ -162,7 +156,7 @@
     const space = spaceRef(it.space);
     if (it.entry_id) {
       open = false;
-      go({ name: 'journal', user, space, journal: JOURNAL_OF[it.kind ?? ''] ?? 'insights', entry: it.entry_id });
+      go({ name: 'journal', user, space, journal: JOURNAL_OF_KIND[it.kind ?? ''] ?? 'insights', entry: it.entry_id });
       return;
     }
     if (!it.node_id) return;
@@ -250,12 +244,14 @@
                   <span class="etitle">{it.title ?? ''}</span>
                   {#if it.status}<span class="estatus">{STATUS_TEXT[it.status] ?? it.status}</span>{/if}
                   <CertaintyBadge value={it.certainty} />
+                  {#if it.stale_refs?.length}<span class="stale" title={staleText(it.stale_refs)}>{staleText(it.stale_refs)}</span>{/if}
                   {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}
                 </div>
               {:else}
                 <div class="where">
                   <span class="space">{it.space?.name ?? '?'}</span>{` / ${it.path}`}{#if it.heading_path}<span class="section">{` › ${it.heading_path}`}</span>{/if}
                   <CertaintyBadge value={it.certainty} />
+                  {#if it.stale_refs?.length}<span class="stale" title={staleText(it.stale_refs)}>{staleText(it.stale_refs)}</span>{/if}
                   {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}
                 </div>
               {/if}
@@ -363,6 +359,13 @@
     background: var(--chip);
     color: var(--muted);
     vertical-align: 1px;
+  }
+  .stale {
+    padding: 0 6px;
+    border-radius: 8px;
+    background: var(--warn-bg);
+    color: var(--warn-text);
+    font-size: 12px;
   }
   .empty {
     margin: 12px 4px 4px;

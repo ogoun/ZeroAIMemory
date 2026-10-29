@@ -11,12 +11,28 @@
 // - `#/u/<user_id>/s/<space_ref>/n/<node_id>[#<якорь>]` — документ, якорь — `id`
 //   элемента в percent-encoding (как в href вики-ссылок сервера: `#/n/<id>#h-<slug>`);
 // - `#/u/<user_id>/s/<space_ref>/j/<журнал>[/<entry_id>]` — журнал пространства
-//   (`changelog`, `releases`, `insights`, `vault`), необязательно — открытая запись.
+//   (`changelog`, `releases`, `insights`, `glossary`, `tasks`, `questions`, `vault`),
+//   необязательно — открытая запись.
 // Пустой или неизвестный адрес — `home` без пользователя (Shell выбирает своего).
 
-/** Журналы пространства: у решения — все четыре, у Knowledge — Insights и Vault. */
-export type Journal = 'changelog' | 'releases' | 'insights' | 'vault';
-export const JOURNALS: Journal[] = ['changelog', 'releases', 'insights', 'vault'];
+/** Журналы пространства: у решения — все, у Knowledge — без Changelog и Releases. */
+export type Journal =
+  | 'changelog'
+  | 'releases'
+  | 'insights'
+  | 'glossary'
+  | 'tasks'
+  | 'questions'
+  | 'vault';
+export const JOURNALS: Journal[] = [
+  'changelog',
+  'releases',
+  'insights',
+  'glossary',
+  'tasks',
+  'questions',
+  'vault',
+];
 const isJournal = (s: string): s is Journal => (JOURNALS as string[]).includes(s);
 
 export type Route =

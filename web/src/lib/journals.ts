@@ -6,15 +6,96 @@ export const JOURNAL_TITLE: Record<Journal, string> = {
   changelog: 'Changelog',
   releases: 'Releases',
   insights: 'Insights',
+  glossary: 'Словарь',
+  tasks: 'Задачи',
+  questions: 'Вопросы',
   vault: 'Vault',
 };
 
-/** Журналы пространства: у решения — все, у Knowledge — Insights и Vault, иначе — нет. */
+/** Журналы пространства: у решения — все, у Knowledge — без Changelog и Releases, иначе — нет. */
 export function journalsOf(kind: string): Journal[] {
-  if (kind === 'solution') return ['changelog', 'releases', 'insights', 'vault'];
-  if (kind === 'knowledge') return ['insights', 'vault'];
+  if (kind === 'solution') return ['changelog', 'releases', 'insights', 'glossary', 'tasks', 'questions', 'vault'];
+  if (kind === 'knowledge') return ['insights', 'glossary', 'tasks', 'questions', 'vault'];
   return [];
 }
+
+/** Вид записи журнала → журнал (переход из поиска). */
+export const JOURNAL_OF_KIND: Record<string, Journal> = {
+  insight: 'insights',
+  changelog: 'changelog',
+  release: 'releases',
+  term: 'glossary',
+  task: 'tasks',
+  question: 'questions',
+};
+
+/** Буква ссылки записи по виду (`i:`, `t:`, … — как в `/read` и индексе ссылок на файлы). */
+const REF_LETTER: Record<string, string> = {
+  insight: 'i',
+  changelog: 'c',
+  release: 'r',
+  term: 't',
+  task: 'k',
+  question: 'q',
+};
+export const entryRef = (kind: string, id: string): string => `${REF_LETTER[kind] ?? 'e'}:${id}`;
+
+/** Колонки доски задач (M4.5 §3) и подписи. */
+export const TASK_COLUMNS: EntryStatus[] = ['open', 'in_progress', 'blocked', 'done', 'dropped'];
+
+/** `data.decision` (ADR, M4.5 §5.1) insight `decision`: поля формы. */
+export interface Adr {
+  context: string;
+  options: string[];
+  chosen: string;
+  rationale: string;
+  consequences: string;
+  decided_by: '' | 'human' | 'agent';
+  revisit_if: string;
+}
+
+export const ADR_TEXT: Record<'context' | 'options' | 'chosen' | 'rationale' | 'consequences' | 'decided_by' | 'revisit_if', string> = {
+  context: 'Контекст',
+  options: 'Варианты',
+  chosen: 'Выбрано',
+  rationale: 'Обоснование',
+  consequences: 'Последствия',
+  decided_by: 'Кто решил',
+  revisit_if: 'Пересмотреть, если',
+};
+
+export const DECIDED_BY_TEXT: Record<string, string> = { human: 'человек', agent: 'агент' };
+
+/** ADR из `data.decision` записи (пустые поля — пустые строки). */
+export function adrOf(data: Record<string, unknown>): Adr {
+  const d = data.decision && typeof data.decision === 'object' ? (data.decision as Record<string, unknown>) : {};
+  const s = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : '');
+  const by = s('decided_by');
+  return {
+    context: s('context'),
+    options: Array.isArray(d.options) ? d.options.filter((x): x is string => typeof x === 'string') : [],
+    chosen: s('chosen'),
+    rationale: s('rationale'),
+    consequences: s('consequences'),
+    decided_by: by === 'human' || by === 'agent' ? by : '',
+    revisit_if: s('revisit_if'),
+  };
+}
+
+/** `data.decision` для запроса: пустые поля не отправляются. */
+export function adrToData(a: Adr): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of ['context', 'chosen', 'rationale', 'consequences', 'revisit_if'] as const) {
+    const v = a[k].trim();
+    if (v) out[k] = v;
+  }
+  const opts = a.options.map((x) => x.trim()).filter(Boolean);
+  if (opts.length) out.options = opts;
+  if (a.decided_by) out.decided_by = a.decided_by;
+  return out;
+}
+
+export const adrIsEmpty = (a: Adr): boolean => Object.keys(adrToData(a)).length === 0;
 
 /** `data.kind` записи changelog (crates/zam-server/src/api/entries.rs, CHANGELOG_KINDS). */
 export const CHANGELOG_KINDS = ['feat', 'fix', 'refactor', 'docs', 'research', 'ops', 'other'];

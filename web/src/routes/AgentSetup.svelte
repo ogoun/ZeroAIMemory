@@ -51,6 +51,10 @@
     pre_tool: 'Подсказки перед правкой файла и командой (PreToolUse)',
     post_tool: 'Подсказки к ошибке инструмента (PostToolUseFailure)',
     checkpoint: 'Напоминание записать итоги (Stop, PreCompact)',
+    subagent_start: 'Бриф субагенту при его запуске (SubagentStart)',
+    file_context: 'Знание о файле перед правкой и после чтения (PreToolUse, PostToolUse)',
+    session_journal: 'Журнал сессии и подсказки по нему (PostToolUse)',
+    recovery: 'Восстановление после сжатия контекста и возобновления (SessionStart)',
   };
 
   /** Выбранный пользователь; пусто — свой. */

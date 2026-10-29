@@ -3,7 +3,9 @@
   // запрашивает значение (`?reveal=1`, ответ no-store, раскрытие записывается в аудит).
   // Значение живёт в состоянии только пока показано (не дольше REVEAL_MS), в консоль и
   // хранилища браузера не попадает. Без мастер-ключа список виден (`locked: true` в ответе),
-  // «Показать» неактивна, над списком — баннер vault-locked (§7.6).
+  // «Показать» неактивна, над списком — баннер vault-locked (§7.6). Записи окружения (`host`,
+  // `environment`, M4.5 §8) несут открытые поля (назначение, адрес, ограничения, заметки) и
+  // могут не иметь значения: тогда «Показать» сообщает, что значения нет.
   import { onDestroy, untrack } from 'svelte';
   import {
     ApiError,
@@ -47,6 +49,8 @@
   /** Показанное значение: одно за раз. */
   let shown = $state<{ id: string; value: string } | null>(null);
   let copied = $state('');
+  /** Запись, у которой «Показать» ответила «значения нет» (окружение без секрета). */
+  let empty = $state('');
   let timer: ReturnType<typeof setTimeout> | undefined;
   let seq = 0;
   /** Поколение раскрытия: смена области, «Скрыть», уход — поздний ответ отбрасывается. */
@@ -58,7 +62,17 @@
     clearTimeout(timer);
     shown = null;
     copied = '';
+    empty = '';
   }
+
+  /** Открытые поля окружения, которые есть у записи. */
+  const OPEN_FIELDS: [keyof VaultItem['data'], string][] = [
+    ['purpose', 'Назначение'],
+    ['address', 'Адрес'],
+    ['limits', 'Ограничения'],
+    ['notes', 'Заметки'],
+  ];
+  const openFields = (it: VaultItem) => OPEN_FIELDS.filter(([k]) => it.data[k]);
 
   onDestroy(() => {
     destroyed = true;
@@ -111,6 +125,10 @@
       const value = await revealVault(user, it.id);
       // за время запроса ушли со страницы, сменили область или нажали «Скрыть»
       if (destroyed || my !== rseq) return;
+      if (value === null) {
+        empty = it.id;
+        return;
+      }
       shown = { id: it.id, value };
       timer = setTimeout(hide, REVEAL_MS);
     } catch (e) {
@@ -159,6 +177,13 @@
             {#if it.data.description}· {it.data.description}{/if}
           </div>
         {/if}
+        {#if openFields(it).length}
+          <dl class="open" aria-label="Открытые поля {it.title}">
+            {#each openFields(it) as [k, label] (k)}
+              <dt>{label}</dt><dd>{it.data[k]}</dd>
+            {/each}
+          </dl>
+        {/if}
         <div class="row value">
           {#if shown?.id === it.id}
             <input class="secret" readonly aria-label="Значение {it.title}" value={shown.value}
@@ -166,6 +191,8 @@
             <button type="button" onclick={copy}>Копировать</button>
             <button type="button" onclick={hide}>Скрыть</button>
             {#if copied}<span class="muted small" role="status">{copied}</span>{/if}
+          {:else if empty === it.id}
+            <span class="muted" role="status">Значение не задано: у записи окружения оно необязательно.</span>
           {:else}
             <code class="mask" aria-label="Значение скрыто">{MASK}</code>
             <button type="button" onclick={() => reveal(it)} disabled={locked !== null}
@@ -211,6 +238,21 @@
   }
   .value {
     margin-top: 6px;
+  }
+  .open {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 12px;
+    margin: 6px 0 0;
+    font-size: 14px;
+  }
+  .open dt {
+    color: var(--muted);
+  }
+  .open dd {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   .mask {
     letter-spacing: 2px;
