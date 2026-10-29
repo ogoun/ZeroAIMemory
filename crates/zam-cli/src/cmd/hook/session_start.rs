@@ -42,6 +42,8 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     let source = inp.str("source");
     if let Some(id) = session {
         cache::write_current_session(env, id);
+        // просроченные запуски субагентов (§9.4) не ждут следующего `subagent-start`
+        cache::prune_spawns(env, id);
         if matches!(source, Some("compact" | "clear")) {
             let mut sh = cache::read_shown(env, id);
             if !sh.shown.is_empty() {

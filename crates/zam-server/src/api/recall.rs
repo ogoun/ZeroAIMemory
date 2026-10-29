@@ -36,7 +36,8 @@
 //!   subagent_start, file_context, session_journal, recovery}` — настройки типов подсказок
 //!   пользователя `hooks.<тип>` (R5, [`super::user_settings`], задача 13). Тип запроса выключен у
 //!   пользователя на сервере — пустой `text` без сбора и без учёта показа (`session_seen`,
-//!   `usage`; сессия касается), у `session_start` — с `hooks` (N4);
+//!   `usage`; сессия касается), у `session_start` — с `hooks` (N4); у `recovery` и `brief` гейта
+//!   нет;
 //! - **`prompt`** — поиск `mode=brief` (без реранка, без кэша выжимок, `skip_seen: false`) по
 //!   первым 512 символам `prompt` в Knowledge, Rules и решении; из выдачи — только insight и
 //!   заметки Rules с баллом ≥ `recall.prompt_min_score` (0,6), не больше [`PROMPT_MAX`];
@@ -82,8 +83,9 @@
 //!   потерян; показ всё равно отмечается), `### Решения` (действующие `decision` пространства
 //!   решения за [`RECOVERY_DECISIONS_DAYS`] дней, до 5, `reason: decision`), затем обычный
 //!   дайджест в остатке бюджета (уведомления, открытые вопросы, правила, словарь, …).
-//!   Ключ пользователя `hooks.recovery` выключен — обычный дайджест; `hooks.session_start`
-//!   выключен — тишина и для `recovery`. `hooks` в ответе — только у `session_start`;
+//!   У `session_start` ключ пользователя `hooks.recovery` выключен — обычный дайджест,
+//!   `hooks.session_start` выключен — тишина. `event: recovery` (MCP) от настроек подсказок
+//!   хуков не зависит (§0, §10). `hooks` в ответе — только у `session_start`;
 //! - **пакет под задачу `brief`** (M4.5 §9.4) — `task` (первые [`BRIEF_TASK_MAX_CHARS`]
 //!   символов, длиннее — обрезка и `warnings: ["task truncated"]`), бюджет по умолчанию
 //!   `recall.brief_tokens` (800); разделы: `### Правила` (L0 заметок Rules), `### Решения`
@@ -93,8 +95,9 @@
 //!   `task` — индекс `file_refs` решения, до 3). Без `task` — мини-дайджест: правила L0,
 //!   ловушки решения и Knowledge, `### Задачи` (захваченные `parent_id` или сессией — первыми).
 //!   Поиск — `mode=brief`, балл ≥ `recall.prompt_min_score`. Повторы не отсекаются (у субагента
-//!   свой контекст); показ учитывается (`usage.source = brief`). Гасит ключ пользователя
-//!   `hooks.subagent_start`;
+//!   свой контекст); показ учитывается (`usage.source = brief`), кроме записей раздела
+//!   «Файлы» (ревизия неизвестна — `session_seen` не отмечается). От настроек подсказок хуков
+//!   не зависит: хук `subagent-start` гейтится на клиенте;
 //! - неизвестные поля тела игнорируются (клиент хуков может быть новее); прочие `source` хука
 //!   (`startup | clear | fork`) — обычный дайджест, `source` пишется в журнал DEBUG;
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
@@ -164,6 +167,9 @@ pub const PROMPT_MAX: usize = 3;
 pub const TERM_HINTS_MAX: usize = 2;
 /// `reason` подсказки термина словаря.
 const REASON_GLOSSARY: &str = "glossary";
+/// `reason` записи о файле пакета под задачу: ревизия неизвестна (индекс ссылок её не несёт),
+/// поэтому показ в `session_seen` не отмечается — иначе он гасил бы подсказки `prompt`.
+const REASON_FILE: &str = "file";
 /// Подсказок к ошибке инструмента.
 pub const POST_TOOL_MAX: usize = 3;
 /// Байт ошибки, по которым сопоставляется `error_regex`.
@@ -192,15 +198,16 @@ enum Event {
 }
 
 impl Event {
-    /// Тип подсказки в настройках пользователя `hooks.<тип>` (R5). Пакет восстановления —
-    /// разновидность дайджеста: его гасит `session_start`, а ключ `recovery` лишь выбирает
-    /// пакет вместо обычного дайджеста. Пакет под задачу гасит `subagent_start`.
-    fn hook_kind(self) -> &'static str {
+    /// Тип подсказки в настройках пользователя `hooks.<тип>` (R5); `None` — без гейта.
+    /// `recovery` и `brief` — явные вызовы (MCP, агенты без хуков; §0, §10): настройки
+    /// подсказок хуков их не гасят. Хук `subagent-start` гейтится на клиенте, а пакет после
+    /// `compact | resume` — ключами `session_start` и `recovery` события `session_start`.
+    fn hook_kind(self) -> Option<&'static str> {
         match self {
-            Event::SessionStart | Event::Recovery => "session_start",
-            Event::Prompt => "prompt",
-            Event::PostTool => "post_tool",
-            Event::Brief => "subagent_start",
+            Event::SessionStart => Some("session_start"),
+            Event::Prompt => Some("prompt"),
+            Event::PostTool => Some("post_tool"),
+            Event::Recovery | Event::Brief => None,
         }
     }
 
@@ -1061,6 +1068,8 @@ async fn file_cands(
     deadline: &mut Deadline,
 ) -> Vec<Cand> {
     let mut out: Vec<Cand> = Vec::new();
+    // совпадения по хвосту — после точных всех баз
+    let mut tail_out: Vec<Cand> = Vec::new();
     let Ok(Some(guid)) = super::files::query_solution(req.solution.as_deref(), headers) else {
         return out;
     };
@@ -1096,11 +1105,12 @@ async fn file_cands(
                 continue;
             }
         };
-        for want in &paths {
-            let suffix = format!("/{want}");
-            for pr in index
-                .iter()
-                .filter(|pr| pr.path == *want || pr.path.ends_with(&suffix))
+        let (exact, tail) = matched_paths(&index, &paths);
+        for (pr, is_exact) in exact
+            .into_iter()
+            .map(|p| (p, true))
+            .chain(tail.into_iter().map(|p| (p, false)))
+        {
             {
                 for it in &pr.items {
                     let Some((letter, raw)) = it.id.split_once(':') else {
@@ -1127,7 +1137,7 @@ async fn file_cands(
                         &[kind, stale],
                         &it.id,
                     );
-                    out.push(Cand {
+                    let c = Cand {
                         target: i,
                         tref: TargetRef { kind: tkind, id },
                         rev: 0,
@@ -1135,14 +1145,43 @@ async fn file_cands(
                         kind,
                         title: it.title.clone(),
                         certainty: None,
-                        reason: "file",
+                        reason: REASON_FILE,
                         block,
-                    });
+                    };
+                    if is_exact {
+                        out.push(c);
+                    } else {
+                        tail_out.push(c);
+                    }
                 }
             }
         }
     }
+    out.extend(tail_out);
     out
+}
+
+/// Пути индекса, упомянутые в `task`: `(точные совпадения, совпадения по хвосту /<путь>)` —
+/// каждая группа в порядке путей `paths`, путь индекса — не больше одного раза.
+fn matched_paths<'a>(
+    index: &'a [zam_store::PathRefs],
+    paths: &[String],
+) -> (Vec<&'a zam_store::PathRefs>, Vec<&'a zam_store::PathRefs>) {
+    let mut exact: Vec<&zam_store::PathRefs> = Vec::new();
+    for want in paths {
+        exact.extend(index.iter().filter(|pr| pr.path == *want));
+    }
+    let mut tail: Vec<&zam_store::PathRefs> = Vec::new();
+    for want in paths {
+        let suffix = format!("/{want}");
+        for pr in index.iter().filter(|pr| pr.path.ends_with(&suffix)) {
+            if !exact.iter().chain(&tail).any(|p| std::ptr::eq(*p, pr)) {
+                tail.push(pr);
+            }
+        }
+    }
+    exact.dedup_by(|a, b| std::ptr::eq(*a, *b));
+    (exact, tail)
 }
 
 /// Действующие решения (`decision`) пространства решения за [`RECOVERY_DECISIONS_DAYS`] дней,
@@ -1652,6 +1691,7 @@ async fn record(
     if let Some(s) = s {
         let items: Vec<SeenItem> = shown
             .iter()
+            .filter(|c| c.reason != REASON_FILE)
             .map(|c| SeenItem {
                 key: seen_key(targets, c),
                 rev: c.rev,
@@ -1840,16 +1880,16 @@ pub async fn recall(
         }
     };
     // N4: тип выключен на сервере — пустой `text`, показ не учитывается (сессия касается)
-    let enabled = hooks.enabled(req.event.hook_kind());
-    // пакет восстановления (§9.2): `event: recovery` или `session_start` после `compact` и
-    // `resume`; выключенный `recovery` — обычный дайджест
-    let recovery = hooks.enabled("recovery")
-        && (req.event == Event::Recovery
-            || (req.event == Event::SessionStart
-                && req
-                    .source
-                    .as_deref()
-                    .is_some_and(|s| RECOVERY_SOURCES.contains(&s.trim()))));
+    let enabled = req.event.hook_kind().is_none_or(|k| hooks.enabled(k));
+    // пакет восстановления (§9.2): `event: recovery` (без гейта) или `session_start` после
+    // `compact` и `resume`; у хука выключенный `recovery` — обычный дайджест
+    let recovery = req.event == Event::Recovery
+        || (req.event == Event::SessionStart
+            && hooks.enabled("recovery")
+            && req
+                .source
+                .as_deref()
+                .is_some_and(|s| RECOVERY_SOURCES.contains(&s.trim())));
     let brief_event = req.event == Event::Brief;
     let budget = req.budget_tokens.unwrap_or(if recovery {
         st.cfg.recall.recovery_tokens
@@ -2095,5 +2135,24 @@ mod tests {
              Не путь: слово, C:\\abs\\x.rs",
         );
         assert_eq!(p, ["crates/zam-cli/src/main.rs", "src/lib.rs", "docs/a.md"]);
+    }
+
+    /// Ревью задачи 10 (M-1): точные совпадения пути — раньше совпадений по хвосту.
+    #[test]
+    fn matched_paths_exact_first() {
+        let pr = |p: &str| zam_store::PathRefs {
+            path: p.into(),
+            hash: None,
+            items: Vec::new(),
+        };
+        // индекс — по алфавиту: хвостовые совпадения «mod.rs» идут раньше точного
+        let index = vec![pr("a/mod.rs"), pr("b/mod.rs"), pr("mod.rs"), pr("x/y.rs")];
+        let paths = vec!["mod.rs".to_string(), "x/y.rs".to_string()];
+        let (exact, tail) = matched_paths(&index, &paths);
+        let names = |v: &[&zam_store::PathRefs]| -> Vec<String> {
+            v.iter().map(|p| p.path.clone()).collect()
+        };
+        assert_eq!(names(&exact), ["mod.rs", "x/y.rs"]);
+        assert_eq!(names(&tail), ["a/mod.rs", "b/mod.rs"]);
     }
 }

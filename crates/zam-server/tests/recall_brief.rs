@@ -243,6 +243,25 @@ async fn brief_sections_and_budget() {
         "{t}"
     );
     assert!(!files.contains(&w.gotcha), "{t}");
+    // запись о файле (ревизия неизвестна) в session_seen не отмечается, решение — отмечается
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let seen = |id: String| {
+        let db = db.clone();
+        async move {
+            db.read(move |c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM session_seen WHERE session_id = 'p1:ag1'
+                     AND target_id = ?1",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(seen(w.file_note.clone()).await, 0);
+    assert_eq!(seen(w.axiom.clone()).await, 1);
     assert!(!t.contains("### Задачи"), "{t}");
     assert!(!t.contains(&w.task), "{t}");
     assert!(j.get("hooks").is_none(), "{j}");
@@ -324,7 +343,8 @@ async fn brief_sections_and_budget() {
 }
 
 /// Без `task` — мини-дайджест: правила L0, ловушки, задачи (захваченная родителем — первой);
-/// без разделов решений, терминов и файлов. `hooks.subagent_start: false` — тишина.
+/// без разделов решений, терминов и файлов. `hooks.subagent_start: false` пакет не гасит:
+/// гейт хука — на клиенте (ревью задачи 10, I-1).
 #[tokio::test]
 async fn brief_without_task_minidigest() {
     let w = world("mini").await;
@@ -360,7 +380,7 @@ async fn brief_without_task_minidigest() {
         json!({"event": "brief", "solution": G, "task": TASK}),
     )
     .await;
-    assert_eq!(j["text"], "", "{j}");
+    assert!(text(&j).contains("### Решения"), "{j}");
 }
 
 /// `task` длиннее 2000 символов обрезается (не 400): термин после предела не находится,
@@ -480,11 +500,8 @@ async fn brief_participant_scope() {
     assert!(t.contains(&format!("t:{private_term}")), "{t}");
 }
 
-/// MCP `memory_recall {event: "brief", task}` — тот же пакет.
-#[tokio::test]
-async fn mcp_recall_brief() {
-    let w = world("mcp").await;
-    let a = &w.a;
+/// MCP `memory_recall` (сессия `m1`, решение `G`); текст результата.
+async fn mcp_recall(a: &Api, args: Value) -> String {
     let b = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/mcp")
@@ -495,14 +512,41 @@ async fn mcp_recall_brief() {
         .header("x-zam-session", "m1")
         .header("x-zam-solution", G);
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                      "params": {"name": "memory_recall",
-                                 "arguments": {"event": "brief", "task": TASK}}});
+                      "params": {"name": "memory_recall", "arguments": args}});
     let r = a.send(b.body(Body::from(body.to_string())).unwrap()).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
     assert_ne!(j["result"]["isError"], true, "{j}");
-    let t = j["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(pos(t, "### Решения") < pos(t, "### Термины"), "{t}");
+    j["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// MCP `memory_recall {event: "brief", task}` — тот же пакет. Выключенные у пользователя
+/// `hooks.subagent_start` и `hooks.session_start` не гасят ни `brief`, ни `recovery`:
+/// MCP-вызов от настроек подсказок хуков не зависит (§0, §10; ревью задачи 10, I-1).
+#[tokio::test]
+async fn mcp_recall_brief() {
+    let w = world("mcp").await;
+    let a = &w.a;
+    let t = mcp_recall(a, json!({"event": "brief", "task": TASK})).await;
+    assert!(pos(&t, "### Решения") < pos(&t, "### Термины"), "{t}");
     assert!(t.contains(&format!("i:{}", w.axiom)), "{t}");
     assert!(t.contains(&format!("i:{}", w.file_note)), "{t}");
+    let uri = format!("/api/v1/admin/users/{}/settings", a.admin_id());
+    let r = a
+        .adm(
+            Method::PATCH,
+            &uri,
+            Some(json!({"hooks": {"subagent_start": false, "session_start": false}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let t = mcp_recall(a, json!({"event": "brief", "task": TASK})).await;
+    assert!(t.contains(&format!("i:{}", w.axiom)), "{t}");
+    let t = mcp_recall(a, json!({"event": "recovery"})).await;
+    assert!(t.contains("### Задачи"), "{t}");
+    assert!(t.contains(&format!("k:{}", w.task)), "{t}");
 }

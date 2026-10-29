@@ -272,8 +272,8 @@ async fn recovery_answers_ignore_seen() {
     assert!(text(&j).contains(&format!("q:{q}")), "{j}");
 }
 
-/// `hooks.recovery: false` у пользователя — `compact` и `event: recovery` дают обычный
-/// дайджест; `hooks.session_start: false` — тишина и для `recovery`.
+/// `hooks.recovery: false` у пользователя — `session_start` после `compact` даёт обычный
+/// дайджест, `hooks.session_start: false` — тишину; явный `event: recovery` не гасится ничем.
 #[tokio::test]
 async fn recovery_disabled_falls_back() {
     let (a, _, _, _) = seeded("off").await;
@@ -288,20 +288,21 @@ async fn recovery_disabled_falls_back() {
         }
     };
     set(json!({"recovery": false})).await;
-    for body in [
-        json!({"event": "session_start", "solution": G, "source": "compact",
-               "agent_block_version": 1}),
-        json!({"event": "recovery", "solution": G, "agent_block_version": 1}),
-    ] {
-        let j = recall(&a, "s4", body.clone()).await;
-        let t = text(&j);
-        assert!(!t.contains("### Решения"), "{body}: {t}");
-        assert!(pos(t, "устарел") < pos(t, "### Задачи"), "{body}: {t}");
-        assert!(t.contains("### Правила"), "{t}");
-    }
-    set(json!({"recovery": true, "session_start": false})).await;
+    let body = json!({"event": "session_start", "solution": G, "source": "compact",
+                      "agent_block_version": 1});
+    let j = recall(&a, "s4", body.clone()).await;
+    let t = text(&j);
+    assert!(!t.contains("### Решения"), "{body}: {t}");
+    assert!(pos(t, "устарел") < pos(t, "### Задачи"), "{body}: {t}");
+    assert!(t.contains("### Правила"), "{t}");
+    // явный `event: recovery` (MCP) настройки подсказок хуков не гасят (ревью задачи 10, I-1)
     let j = recall(&a, "s4", json!({"event": "recovery", "solution": G})).await;
-    assert_eq!(j["text"], "", "{j}");
+    assert!(text(&j).contains("### Решения"), "{j}");
+    set(json!({"recovery": true, "session_start": false})).await;
+    let body = json!({"event": "session_start", "solution": G, "source": "compact"});
+    assert_eq!(recall(&a, "s4", body).await["text"], "");
+    let j = recall(&a, "s4", json!({"event": "recovery", "solution": G})).await;
+    assert!(text(&j).contains("### Решения"), "{j}");
 }
 
 /// MCP `memory_recall {event: "recovery"}` — тот же пакет (сессия — `X-Zam-Session`).
