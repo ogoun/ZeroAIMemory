@@ -435,7 +435,7 @@ frontmatter), запросы — в `queries.toml` с уникальным `id`.
 `results/2026-10-27-m4-bench-first-start-gpu.*`; сводка и выводы —
 `results/2026-10-28-m4-summary.md`.
 
-**Прогоны M4.5** (задача 15, 2026-10-29, коммит `580a910`): eval словаря —
+**Прогоны M4.5** (задача 15, 2026-10-29, коммит `4e8101f`, fix round 1): eval словаря —
 `results/2026-10-29-m45-glossary-{fts,bge-m3-int8,bge-m3-fp16}.*`, итоговые прогоны основного
 набора со словарём и связями `contradicts` — `results/2026-10-29-m45-{fts,bge-m3-int8-hybrid,
 bge-m3-fp16-hybrid,bge-m3-fp16-hybrid-rerank}.*` (`--compare` с `*-m4-final`), задержки хуков
