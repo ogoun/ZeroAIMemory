@@ -128,7 +128,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
-use zam_core::{AGENT_BLOCK_VERSION, Id, TargetKind, TargetRef};
+use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
     Section, coverage_enough, error_regex_matches, error_terms, hint_line, normalize_error,
     one_line, pack_sections, term_coverage,
@@ -425,6 +425,29 @@ fn solution_space(targets: &[SearchTarget]) -> Option<(usize, Id)> {
     })
 }
 
+/// GUID решения запроса (`solution` тела или `X-Zam-Solution`) — только если решение в
+/// области [`resolve_targets`]: своё (пространство решения личной цели) или чужое с действующим
+/// доступом (отдельная цель). Ожидание, отказ, отзыв доступа и неизвестный GUID — `None`:
+/// разделы по GUID (окружение Vault, файлы `brief`) исключают решение так же, как поиск.
+fn scoped_solution(
+    targets: &[SearchTarget],
+    req: &RecallReq,
+    headers: &HeaderMap,
+) -> Option<SolutionGuid> {
+    let guid = super::files::query_solution(req.solution.as_deref(), headers)
+        .ok()
+        .flatten()?;
+    targets
+        .iter()
+        .any(|t| match &t.solution {
+            Some(info) => info.guid == guid,
+            None => t.spaces.iter().any(|s| {
+                s.kind == SpaceKind::Solution && s.solution_guid.as_deref() == Some(guid.as_str())
+            }),
+        })
+        .then_some(guid)
+}
+
 /// Пространство вида `kind` личной базы (цель без чужого решения).
 fn personal_space(targets: &[SearchTarget], kind: SpaceKind) -> Option<(usize, Id)> {
     targets.iter().enumerate().find_map(|(i, t)| {
@@ -507,19 +530,23 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// Строка задачи дайджеста: `ZeroAIMemory: [<статус>] <заголовок> — далее: <next_step> —
-/// k:<id>`, у `blocked` после ссылки — ` — блокер: <blocked_by>`.
+/// k:<id>`, у `blocked` после ссылки — ` — блокер: <blocked_by>`. `next_step` и `blocked_by` —
+/// свободный текст до 1000 символов (туда попадают команды с ключами): секреты маскируются, как
+/// в L1 правил и ответах (финальное ревью M4.5, M-2).
 fn task_block(e: &Entry) -> String {
     let t = zam_store::TaskData::from_stored(&e.data);
     let status = e.status.map_or("open", EntryStatus::as_str);
     let mut s = format!("ZeroAIMemory: [{status}] {}", one_line(&e.title));
     if let Some(n) = &t.next_step {
-        s.push_str(&format!(" — далее: {}", clip(n, TASK_LINE_TEXT_CHARS)));
+        let n = clip(&zam_markdown::mask_text(n), TASK_LINE_TEXT_CHARS);
+        s.push_str(&format!(" — далее: {n}"));
     }
     s.push_str(&format!(" — {}", entry_ref(e)));
     if e.status == Some(EntryStatus::Blocked)
         && let Some(b) = &t.blocked_by
     {
-        s.push_str(&format!(" — блокер: {}", clip(b, TASK_LINE_TEXT_CHARS)));
+        let b = clip(&zam_markdown::mask_text(b), TASK_LINE_TEXT_CHARS);
+        s.push_str(&format!(" — блокер: {b}"));
     }
     s
 }
@@ -661,8 +688,9 @@ fn environment_block(m: &zam_store::VaultMeta) -> String {
     s
 }
 
-/// Записи `host`/`environment` Vault пользователя запроса: личного и решения запроса (Vault
-/// участника лежит в его базе, чужой не виден). Читает метаданные без мастер-ключа, так что
+/// Записи `host`/`environment` Vault пользователя запроса: личного и решения запроса, если оно
+/// в области ([`scoped_solution`]; Vault участника лежит в его базе, чужой не виден, после
+/// отзыва доступа — только личный). Читает метаданные без мастер-ключа, так что
 /// заблокированный Vault раздел не прячет. Строки — не подсказки журнала: учёта показа нет.
 async fn environment_cands(
     health: &mut Health<'_>,
@@ -677,9 +705,8 @@ async fn environment_cands(
     if !health.alive[i] {
         return Ok(Vec::new());
     }
-    let guid = super::files::query_solution(req.solution.as_deref(), headers)
-        .ok()
-        .flatten();
+    // решение без доступа (отзыв, ожидание, отказ, неизвестный GUID) — только личный Vault
+    let guid = scoped_solution(health.targets(), req, headers);
     let db = health.targets()[i].db.clone();
     let Some(r) = deadline
         .step(zam_store::vault_environment(
@@ -1199,7 +1226,8 @@ fn task_paths(task: &str) -> Vec<String> {
 }
 
 /// Записи со ссылками на файлы из `task` (индекс `file_refs` решения запроса): путь совпадает
-/// точно или оканчивается на `/<путь из task>`. Без решения — пусто; сбой чтения — WARN.
+/// точно или оканчивается на `/<путь из task>`. Без решения или решение вне области
+/// ([`scoped_solution`]) — пусто; сбой чтения — WARN.
 async fn file_cands(
     req: &RecallReq,
     headers: &HeaderMap,
@@ -1210,7 +1238,8 @@ async fn file_cands(
     let mut out: Vec<Cand> = Vec::new();
     // совпадения по хвосту — после точных всех баз
     let mut tail_out: Vec<Cand> = Vec::new();
-    let Ok(Some(guid)) = super::files::query_solution(req.solution.as_deref(), headers) else {
+    // решение без доступа исключено, как в поиске
+    let Some(guid) = scoped_solution(health.targets(), req, headers) else {
         return out;
     };
     let paths = task_paths(task);

@@ -17,22 +17,11 @@ use serde_json::{Value, json};
 use super::log::read_text;
 use super::{Ctx, emit, emit_json, post_entry, solution_guid};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
+// `k:<id>` / `e:<id>` / `t:<id>` … → голый id (буквы — общий источник `target`)
+use crate::target::bare_entry_id as bare_id;
 
 /// Статусы ленты по умолчанию.
 const ACTIVE: &str = "open,in_progress,blocked";
-
-/// `k:<id>` / `e:<id>` / `t:<id>` … → голый id.
-fn bare_id(raw: &str) -> &str {
-    let t = raw.trim();
-    match t.split_once(':') {
-        Some((p, id)) if zam_ref_letter(p) => id,
-        _ => t,
-    }
-}
-
-fn zam_ref_letter(p: &str) -> bool {
-    ["i", "c", "r", "t", "k", "q", "e"].contains(&p)
-}
 
 /// Строка ленты: `<id> [статус] «заголовок»`, далее — шаг, блокер, длительность.
 fn line(e: &Value) -> String {

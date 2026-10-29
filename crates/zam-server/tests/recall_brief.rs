@@ -500,6 +500,62 @@ async fn brief_participant_scope() {
     assert!(t.contains(&format!("t:{private_term}")), "{t}");
 }
 
+/// Файлы `brief` — только решения в области (I-1 финального ревью M4.5): участник с действующим
+/// доступом видит свою запись Knowledge со ссылкой на файл решения, после отзыва — нет.
+#[tokio::test]
+async fn brief_files_excluded_after_revoke() {
+    let a = api("brief-revoked", roomy).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    assert_eq!(register(&a, &a_tok).await.status, StatusCode::CREATED);
+    assert_eq!(register(&a, &b_tok).await.status, StatusCode::ACCEPTED);
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let own = entry(
+        &a,
+        &b_tok,
+        "/api/v1/spaces/knowledge/entries",
+        json!({"kind": "insight", "title": "Разбор модуля Бориса", "body": "разбор",
+               "data": {"kind": "pattern"}, "refs": {"files": [{"path": "src/boris.rs"}]},
+               "force": true}),
+    )
+    .await;
+    let body = json!({"event": "brief", "solution": G, "task": "правка src/boris.rs"});
+    let j = brief(&a, &b_tok, "b1", body.clone()).await;
+    let t = text(&j);
+    assert!(
+        t[pos(t, "### Файлы")..].contains(&format!("i:{own}")),
+        "{t}"
+    );
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/revoke"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = brief(&a, &b_tok, "b2", body).await;
+    let t = text(&j);
+    assert!(!t.contains("### Файлы") && !t.contains(&own), "{t}");
+    assert!(
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w == "solution access revoked"),
+        "{j}"
+    );
+}
+
 /// MCP `memory_recall` (сессия `m1`, решение `G`); текст результата.
 async fn mcp_recall(a: &Api, args: Value) -> String {
     let b = axum::http::Request::builder()

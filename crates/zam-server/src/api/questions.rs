@@ -7,10 +7,12 @@
 //!   `option` (ключ варианта) или оба. Повторный ответ — 409 `/problems/already-answered` с
 //!   `decision_id`; устаревший вопрос — 409; неизвестный вариант и пустой ответ — 422. Аудит
 //!   `entry.answer` в `system.db` (без текста ответа);
-//! - `by` по умолчанию `human`: у сессии WebUI и у токена с `channel: chat | cli` (агент
-//!   записывает слова человека — правило блока инструкции, как `axiom` по прямому указанию,
-//!   §7.5 ТЗ); `agent` — только явно (решение — `hypothesis`). `channel` по умолчанию: `webui`
-//!   у сессии WebUI, `chat` у токена; токен с `webui` — 422;
+//! - `by`: у токена — обязателен (нет — 400 `/problems/by-required`, решение контроллера по
+//!   финальному ревью M4.5, I-2: умолчание `human` молча делало ответ агента самому себе
+//!   аксиомой); `human` — агент записывает слова человека (решение `axiom`, как по прямому
+//!   указанию, §7.5 ТЗ), `agent` — решил сам (`hypothesis`). У сессии WebUI по умолчанию
+//!   `human`. `channel` по умолчанию: `webui` у сессии WebUI, `chat` у токена; токен с
+//!   `webui` — 422;
 //! - вопрос задаётся общим путём `POST /spaces/{space}/entries` (`kind: question`,
 //!   [`super::entries::create`]); дубликат по нормализованному заголовку среди `open` и
 //!   `answered` — 409 `/problems/possible-duplicate` с `candidates` (`status`, у `answered` —
@@ -97,7 +99,12 @@ pub async fn answer(
             "channel: webui — ответ из WebUI; агент отвечает с channel chat или cli",
         ));
     }
-    let by = req.by.unwrap_or(AnswerBy::Human);
+    // токену умолчания нет: чей ответ — знает только агент (финальное ревью M4.5, I-2)
+    let by = match req.by {
+        Some(b) => b,
+        None if session => AnswerBy::Human,
+        None => return Err(ApiError::ByRequired),
+    };
     let attrib = attribution(&p, &headers, req.message)?;
     let (q, d) = answer_question(
         &sc.db,

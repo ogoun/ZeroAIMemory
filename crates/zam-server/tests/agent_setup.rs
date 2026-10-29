@@ -270,7 +270,7 @@ async fn agent_setup_hooks_exec_form() {
     let want = json!({"hooks": {
         "SessionStart": cmd("session-start", 2),
         "UserPromptSubmit": cmd("prompt", 2),
-        "PreToolUse": [{"matcher": "Write|Edit|Bash|Agent|Task", "hooks": [{"type": "command", "command": "zam", "args": ["hook", "pre-tool"], "timeout": 1}]}],
+        "PreToolUse": [{"matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task", "hooks": [{"type": "command", "command": "zam", "args": ["hook", "pre-tool"], "timeout": 1}]}],
         "PostToolUse": [{"matcher": "Read|Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__zeroaimemory__memory_log", "hooks": [{"type": "command", "command": "zam", "args": ["hook", "post-tool"], "timeout": 1}]}],
         "PostToolUseFailure": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "zam", "args": ["hook", "post-tool"], "timeout": 2}]}],
         "SubagentStart": cmd("subagent-start", 2),
@@ -751,7 +751,10 @@ async fn agent_setup_claude_settings_new_events() {
         g[0].clone()
     };
     let pre = one("PreToolUse");
-    assert_eq!(pre["matcher"], "Write|Edit|Bash|Agent|Task");
+    assert_eq!(
+        pre["matcher"],
+        "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task"
+    );
     assert_eq!(pre["hooks"][0]["args"], json!(["hook", "pre-tool"]));
     assert_eq!(pre["hooks"][0]["timeout"], 1);
     let post = one("PostToolUse");

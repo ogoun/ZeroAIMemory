@@ -113,7 +113,7 @@ impl ToolName {
                 "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
                  claim|release|answer; rev — ревизия (кроме feedback, claim, release, answer). \
                  certify — certainty, reason; feedback — value; задача: status, claim, release; \
-                 вопрос: answer (option, text, by) или status obsolete + reason."
+                 вопрос: answer (option, text, by обязателен), status obsolete."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
@@ -272,7 +272,7 @@ impl ToolName {
                     "channel": {"type": "string", "enum": ["chat", "cli"],
                         "description": "answer: где человек ответил (по умолчанию chat)"},
                     "by": {"type": "string", "enum": ["human", "agent"],
-                        "description": "answer: human (по умолчанию) — слова человека; agent — решение агента"},
+                        "description": "answer: обязателен — human: ответ человека (axiom), agent: решение агента (hypothesis)"},
                     "title": {"type": "string"},
                     "body": {"type": "string", "description": "supersede — тело; append — дописать"},
                     "data": {"type": "object"},
@@ -1102,7 +1102,12 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             (Method::PATCH, entry, b)
         }
         "answer" => {
-            // ответ человека, записанный агентом по его словам: channel chat, by human
+            // `by` обязателен (финальное ревью M4.5, I-2): умолчания нет — чей ответ, знает агент
+            if !args.get("by").is_some_and(Value::is_string) {
+                return Err(Fail::Invalid(
+                    "answer: укажите by: human — ответ человека, by: agent — решение агента".into(),
+                ));
+            }
             let mut b = pick(args, &["text", "option", "channel", "by", "message"]);
             b.entry("channel").or_insert_with(|| json!("chat"));
             let r = call_rest(

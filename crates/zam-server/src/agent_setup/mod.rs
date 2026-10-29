@@ -220,7 +220,7 @@ fn group(matcher: Option<&str>, hook: Value) -> Value {
 
 /// Matcher `PreToolUse` Claude Code: правки и команды (триггеры, знание о файле) и запуск
 /// субагента `Agent`/`Task` (очередь заданий для `subagent-start`, M4.5 §9.4).
-pub const CLAUDE_PRE_TOOL: &str = "Write|Edit|Bash|Agent|Task";
+pub const CLAUDE_PRE_TOOL: &str = "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task";
 /// Matcher `PostToolUse` Claude Code (режим успеха `post-tool`, M4.5 §9.1, §6.3): чтение и
 /// правки файлов, команды и запись в память через MCP (`memory_write` журнала сессии).
 pub const CLAUDE_POST_TOOL: &str =

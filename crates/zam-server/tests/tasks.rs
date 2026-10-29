@@ -692,6 +692,132 @@ async fn session_reports_claimed_tasks() {
     assert_eq!(j["claimed_tasks"], json!([]));
 }
 
+/// `claimed_tasks` участника — только пространство решения сессии (финальное ревью M4.5, M-1):
+/// задача Knowledge владельца, захваченная сессией с тем же id, участнику не видна; задача
+/// решения — видна, пока доступ действует.
+#[tokio::test]
+async fn session_claimed_tasks_scoped_to_solution() {
+    const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e33";
+    let a = api("tasks-session-scope", |_| {}).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    let reg = json!({"agent_solution_id": G, "name": "Общее"});
+    let r = a
+        .tok(&a_tok, Method::POST, "/api/v1/solutions", Some(reg.clone()))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = a
+        .tok(&b_tok, Method::POST, "/api/v1/solutions", Some(reg))
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let mut ids = Vec::new();
+    for (space, title) in [(G, "Задача решения"), ("knowledge", "Личная задача Анны")]
+    {
+        let r = a
+            .tok(
+                &a_tok,
+                Method::POST,
+                &format!("/api/v1/spaces/{space}/entries"),
+                Some(json!({"kind": "task", "title": title, "body": "план"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        let tid = id(&r.json());
+        let r = a
+            .tok_h(
+                &a_tok,
+                Method::POST,
+                &format!("/api/v1/entries/{tid}/claim"),
+                Some(json!({})),
+                &sess("same"),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        ids.push(tid);
+    }
+    // сессия участника с тем же id и решением G
+    let h = [("x-zam-session", "same"), ("x-zam-solution", G)];
+    let r = a
+        .tok_h(
+            &b_tok,
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "ничего"})),
+            &h,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = a
+        .tok(&b_tok, Method::GET, "/api/v1/sessions/same", None)
+        .await
+        .json();
+    let got: Vec<&str> = j["claimed_tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, [ids[0].as_str()], "{j}");
+    // у владельца — обе
+    let j = a
+        .tok(&a_tok, Method::GET, "/api/v1/sessions/same", None)
+        .await
+        .json();
+    assert_eq!(j["claimed_tasks"].as_array().unwrap().len(), 2, "{j}");
+}
+
+/// `next_step` и `blocked_by` в дайджесте и пакете восстановления маскируются (финальное ревью
+/// M4.5, M-2): ключ из команды в шаге не уходит агенту.
+#[tokio::test]
+async fn digest_masks_task_texts() {
+    let a = api("tasks-mask", roomy).await;
+    // «ключ» собирается из частей: в исходниках нет строки, похожей на настоящий
+    let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let t1 = id(&new_task(
+        &a,
+        "Деплой",
+        json!({"next_step": format!("запустить GITHUB_TOKEN={key} ./deploy.sh")}),
+    )
+    .await);
+    status(&a, &t1, "in_progress").await;
+    let t2 = id(&new_task(&a, "Выпуск", json!({})).await);
+    let r = patch(
+        &a,
+        &t2,
+        json!({"status": "blocked", "blocked_by": format!("нет доступа: token={key}")}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for event in ["session_start", "recovery"] {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                RECALL,
+                Some(json!({"event": event})),
+                &sess("mask"),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let text = r.json()["text"].as_str().unwrap().to_string();
+        assert!(
+            text.contains(&format!("k:{t1}")) && text.contains(&format!("k:{t2}")),
+            "{text}"
+        );
+        assert!(!text.contains(&key), "{event}: {text}");
+        assert!(text.contains("‹secret›"), "{event}: {text}");
+    }
+}
+
 fn mcp_text(r: &Value) -> String {
     r["content"][0]["text"].as_str().unwrap_or("").to_string()
 }

@@ -209,7 +209,7 @@ fn init_creates_solution_block_hooks_mcp() {
     let s = p.json(".claude/settings.json");
     assert_eq!(
         s["hooks"]["PreToolUse"][0]["matcher"],
-        "Write|Edit|Bash|Agent|Task"
+        "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task"
     );
     assert_eq!(
         s["hooks"]["PreToolUse"][0]["hooks"][0],
@@ -999,7 +999,7 @@ fn init_merges_new_events_idempotent() {
     assert_eq!(
         ours_in(&s, "PreToolUse"),
         [(
-            "Write|Edit|Bash|Agent|Task".to_string(),
+            "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task".to_string(),
             "pre-tool".to_string()
         )]
     );
@@ -1023,6 +1023,35 @@ fn init_merges_new_events_idempotent() {
     // повторный запуск — те же файлы байт в байт
     let before = p.snapshot();
     let o = p.init(&["--agent", "both", "--yes"], "");
+    ok(&o);
+    assert!(out(&o).contains("Файлы проекта актуальны"), "{}", out(&o));
+    assert_eq!(p.snapshot(), before);
+}
+
+/// Matcher `PreToolUse` прежней сборки M4.5 (`Write|Edit|Bash|Agent|Task`, без `MultiEdit` и
+/// `NotebookEdit`; финальное ревью M4.5, M-3) заменяется новым, а не дублируется; повторный
+/// запуск ничего не меняет.
+#[test]
+fn init_updates_pre_tool_matcher() {
+    let (url, tok) = start("m45-matcher");
+    let p = Proj::new("m45-matcher", &url, &tok);
+    ok(&p.init(&["--agent", "claude", "--yes"], ""));
+    let path = p.repo.join(".claude/settings.json");
+    let mut s = p.json(".claude/settings.json");
+    s["hooks"]["PreToolUse"][0]["matcher"] = json!("Write|Edit|Bash|Agent|Task");
+    std::fs::write(&path, s.to_string()).unwrap();
+    ok(&p.init(&["--agent", "claude", "--yes"], ""));
+    let s = p.json(".claude/settings.json");
+    assert_eq!(
+        ours_in(&s, "PreToolUse"),
+        [(
+            "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task".to_string(),
+            "pre-tool".to_string()
+        )],
+        "{s}"
+    );
+    let before = p.snapshot();
+    let o = p.init(&["--agent", "claude", "--yes"], "");
     ok(&o);
     assert!(out(&o).contains("Файлы проекта актуальны"), "{}", out(&o));
     assert_eq!(p.snapshot(), before);
@@ -1079,7 +1108,10 @@ fn init_replaces_v2_handlers() {
         ("UserPromptSubmit", vec![(String::new(), "prompt")]),
         (
             "PreToolUse",
-            vec![("Write|Edit|Bash|Agent|Task".to_string(), "pre-tool")],
+            vec![(
+                "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task".to_string(),
+                "pre-tool",
+            )],
         ),
         (
             "PostToolUse",

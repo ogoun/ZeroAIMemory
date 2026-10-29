@@ -42,10 +42,10 @@ use axum::middleware::Next;
 use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use zam_core::SolutionGuid;
+use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Db, SessionTouch, TokenCount, add_memory_write, add_token_counts, claimed_tasks, end_session,
-    get_session, list_sessions, session_tokens, touch_session,
+    Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, claimed_tasks,
+    end_session, get_session, list_sessions, list_spaces, session_tokens, touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -219,7 +219,7 @@ pub async fn patch(
 }
 
 /// `GET /sessions/{id}` — сессия и `claimed_tasks: [{id, title, status}]` (задачи, захваченные
-/// сессией: в её базе и в базе решения сессии, M4.5 §3). Сбой чтения задач — пустой список
+/// сессией: в её базе и в пространстве решения сессии, M4.5 §3). Сбой чтения задач — пустой список
 /// (WARN без текста): сессию он не портит.
 pub async fn get(
     State(st): State<AppState>,
@@ -237,7 +237,10 @@ pub async fn get(
     Ok(Json(v))
 }
 
-/// Задачи, захваченные сессией `s`: личная база и база решения сессии (если оно доступно).
+/// Задачи, захваченные сессией `s`, в области пользователя запроса: личная база — Knowledge и
+/// свои решения; база владельца решения сессии (если доступ действует) — только пространство
+/// этого решения (финальное ревью M4.5, M-1: Knowledge владельца участнику не виден, даже если
+/// id сессий совпали).
 async fn claimed_tasks_of(
     st: &AppState,
     p: &Principal,
@@ -246,7 +249,18 @@ async fn claimed_tasks_of(
     s: &zam_store::Session,
 ) -> Vec<zam_store::ClaimedTask> {
     let now = jiff::Timestamp::now();
-    let mut dbs: Vec<Db> = vec![own.clone()];
+    let mut dbs: Vec<(Db, Vec<Id>)> = Vec::new();
+    match list_spaces(own).await {
+        Ok(spaces) => dbs.push((
+            own.clone(),
+            spaces
+                .iter()
+                .filter(|sp| matches!(sp.kind, SpaceKind::Knowledge | SpaceKind::Solution))
+                .map(|sp| sp.id)
+                .collect(),
+        )),
+        Err(e) => tracing::warn!(error = %e, "сессия: пространства личной базы не прочитаны"),
+    }
     if let Some(g) = &s.solution_guid {
         let scope = ScopeReq {
             solution: Some(g.clone()),
@@ -256,7 +270,8 @@ async fn claimed_tasks_of(
             Ok((targets, _)) => {
                 for t in targets {
                     if t.solution.is_some() {
-                        dbs.push(t.db);
+                        let ids = t.space_ids();
+                        dbs.push((t.db, ids));
                     }
                 }
             }
@@ -264,8 +279,8 @@ async fn claimed_tasks_of(
         }
     }
     let mut out = Vec::new();
-    for db in &dbs {
-        match claimed_tasks(db, &s.id, now).await {
+    for (db, spaces) in &dbs {
+        match claimed_tasks(db, spaces, &s.id, now).await {
             Ok(v) => out.extend(v),
             Err(e) => tracing::warn!(error = %e, "сессия: захваченные задачи не прочитаны"),
         }

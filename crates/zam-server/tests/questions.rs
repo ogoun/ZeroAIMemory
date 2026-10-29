@@ -55,8 +55,17 @@ async fn get(a: &Api, id: &str) -> Value {
     r.json()
 }
 
-/// Ответ токеном администратора (агент).
-async fn answer_tok(a: &Api, qid: &str, body: Value) -> Resp {
+/// Ответ токеном администратора (агент); без `by` в теле — `by: human` (токену `by`
+/// обязателен, финальное ревью M4.5 I-2; запрос без `by` — [`answer_tok_raw`]).
+async fn answer_tok(a: &Api, qid: &str, mut body: Value) -> Resp {
+    if body.get("by").is_none() {
+        body["by"] = json!("human");
+    }
+    answer_tok_raw(a, qid, body).await
+}
+
+/// Ответ токеном администратора как есть.
+async fn answer_tok_raw(a: &Api, qid: &str, body: Value) -> Resp {
     a.t(
         Method::POST,
         &format!("/api/v1/entries/{qid}/answer"),
@@ -214,6 +223,34 @@ async fn answer_from_chat_by_agent_token_is_human_axiom() {
     assert_eq!(r.json()["entry"]["data"]["answer"]["channel"], "cli");
 }
 
+/// Токен без `by` — 400 `/problems/by-required` с подсказкой, вопрос не тронут; WebUI без `by` —
+/// `human` (финальное ревью M4.5, I-2).
+#[tokio::test]
+async fn answer_token_requires_by() {
+    let a = api("questions-by-required", |_| {}).await;
+    let qid = new_q(&a, "Чей ответ?", options()).await;
+    let r = answer_tok_raw(&a, &qid, json!({"option": "a", "channel": "chat"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.header("content-type"), "application/problem+json");
+    let j = r.json();
+    assert_eq!(j["type"], "/problems/by-required");
+    assert_eq!(
+        j["detail"],
+        "укажите by: human — ответ человека, by: agent — решение агента"
+    );
+    assert_eq!(get(&a, &qid).await["status"], "open");
+    // by: human — axiom
+    let r = answer_tok_raw(&a, &qid, json!({"option": "a", "by": "human"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["decision"]["certainty"], "axiom");
+    // WebUI без by — human
+    let q2 = new_q(&a, "Ответ из WebUI?", options()).await;
+    let r = answer_webui(&a, &q2, json!({"option": "b"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["entry"]["data"]["answer"]["by"], "human");
+    assert_eq!(r.json()["decision"]["certainty"], "axiom");
+}
+
 #[tokio::test]
 async fn answer_by_agent_hypothesis() {
     let a = api("questions-agent", |_| {}).await;
@@ -264,7 +301,7 @@ async fn parallel_answer_one_decision() {
         let token = a.token.clone();
         let uri = format!("/api/v1/entries/{qid}/answer");
         hs.push(tokio::spawn(async move {
-            let body = json!({"text": format!("ответ {i}"), "channel": "chat"});
+            let body = json!({"text": format!("ответ {i}"), "channel": "chat", "by": "human"});
             let r = req(Method::POST, &uri, Some(&body))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::from(body.to_string()))
@@ -769,7 +806,7 @@ async fn participant_answers_in_shared_solution() {
             &b_tok,
             Method::POST,
             &format!("/api/v1/entries/{qid}/answer"),
-            Some(json!({"option": "a", "channel": "chat"})),
+            Some(json!({"option": "a", "channel": "chat", "by": "human"})),
         )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());

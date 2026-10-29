@@ -15,7 +15,7 @@
 //!   `checkpoint`).
 
 use jiff::{SignedDuration, Timestamp};
-use rusqlite::params;
+use rusqlite::{params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use zam_core::Id;
@@ -414,25 +414,27 @@ pub struct ClaimedTask {
     pub status: EntryStatus,
 }
 
-/// Живые задачи (`open`, `in_progress`, `blocked`) с действующим захватом сессии `session`,
-/// новые первыми.
+/// Живые задачи (`open`, `in_progress`, `blocked`) пространств `spaces` с действующим захватом
+/// сессии `session`, новые первыми. Пространства — область пользователя запроса (у базы
+/// владельца чужого решения — только пространство решения; финальное ревью M4.5, M-1); отбор
+/// идёт по индексу `entries_feed (space_id, kind, …)`, а не проходом по всем записям базы —
+/// запрос звучит на каждом `Stop` хука `checkpoint`. Пустой список — пусто без запроса.
 pub async fn claimed_tasks(
     db: &Db,
+    spaces: &[Id],
     session: &str,
     now: Timestamp,
 ) -> Result<Vec<ClaimedTask>, StoreError> {
-    let session = session.to_string();
-    let now = fmt_ts(now);
+    if spaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+    let n = args.len();
+    args.push(session.to_string());
+    args.push(fmt_ts(now));
     db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT id, title, status FROM entries
-             WHERE kind = 'task' AND deleted_at IS NULL
-               AND status IN ('open', 'in_progress', 'blocked')
-               AND json_extract(data, '$.claimed_by.session') = ?1
-               AND json_extract(data, '$.claimed_by.until') > ?2
-             ORDER BY updated_at DESC, id DESC",
-        )?;
-        let rows = st.query_map(params![session, now], |r| {
+        let mut st = c.prepare(&claimed_sql(n))?;
+        let rows = st.query_map(params_from_iter(args), |r| {
             Ok(ClaimedTask {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -442,6 +444,21 @@ pub async fn claimed_tasks(
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     })
     .await
+}
+
+/// SQL [`claimed_tasks`] для `n` пространств: `?1..?n` — пространства, затем сессия и момент.
+fn claimed_sql(n: usize) -> String {
+    format!(
+        "SELECT id, title, status FROM entries INDEXED BY entries_feed
+         WHERE space_id IN ({}) AND kind = 'task' AND deleted_at IS NULL
+           AND status IN ('open', 'in_progress', 'blocked')
+           AND json_extract(data, '$.claimed_by.session') = ?{}
+           AND json_extract(data, '$.claimed_by.until') > ?{}
+         ORDER BY updated_at DESC, id DESC",
+        crate::questions::in_list(n),
+        n + 1,
+        n + 2
+    )
 }
 
 #[cfg(test)]

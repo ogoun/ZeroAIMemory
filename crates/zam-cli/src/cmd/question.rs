@@ -5,8 +5,11 @@
 //! - `ask --title T [--option key=text]… [--recommend key] [--body-file F | stdin] [--force]` —
 //!   новый вопрос (`<id>@<rev>`); тот же заголовок у `open` или `answered` — код 4 со списком
 //!   кандидатов (у отвеченного — его ответ); `--force` записывает всё равно;
-//! - `answer <q:id> (--option key | --text …) [--channel chat|cli]` — ответ человека, записанный
-//!   по его словам (`by: human`); становится решением `i:<id>`. Уже отвечен — код 4.
+//! - `answer <q:id> (--option key | --text …) [--by human|agent] [--channel chat|cli]` — ответ;
+//!   становится решением `i:<id>` (`human` — слова человека, `axiom`; `agent` — решение агента,
+//!   `hypothesis`). Запустил агент ([`super::hook::launched_by_agent`]) — `--by` обязателен,
+//!   иначе код 2 с подсказкой (финальное ревью M4.5, I-2); человек в терминале — `human` по
+//!   умолчанию. Уже отвечен — код 4.
 //!
 //! Ссылка — `q:<id>`, `e:<id>` или голый id.
 use std::path::Path;
@@ -16,18 +19,14 @@ use serde_json::{Value, json};
 use super::log::read_text;
 use super::{Ctx, emit, emit_json, post_entry, solution_guid};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
+// `q:<id>` / `e:<id>` … → голый id (буквы — общий источник `target`)
+use crate::target::bare_entry_id as bare_id;
+
+/// Код выхода без обязательного `--by` у агента — как ошибка использования clap.
+pub const EXIT_USAGE: u8 = 2;
 
 /// Статусы ленты по умолчанию.
 const OPEN: &str = "open";
-
-/// `q:<id>` / `e:<id>` … → голый id.
-fn bare_id(raw: &str) -> &str {
-    let t = raw.trim();
-    match t.split_once(':') {
-        Some((p, id)) if ["i", "c", "r", "t", "k", "q", "e"].contains(&p) => id,
-        _ => t,
-    }
-}
 
 /// Ответ кратко: текст варианта, иначе свободный текст, иначе ключ.
 fn answer_brief(e: &Value) -> String {
@@ -202,9 +201,29 @@ pub fn ask(ctx: &Ctx, o: &Ask) -> Result<(), CliError> {
     post_entry(ctx, &space, &req, o.key, o.area).map_err(explain_duplicate)
 }
 
+/// `by` ответа: явный `--by`; без него у агента — код 2 с подсказкой, у человека — `human`.
+pub fn resolve_by(by: Option<&str>, agent: bool) -> Result<&str, CliError> {
+    match by {
+        Some(b) => Ok(b),
+        None if agent => Err(CliError::new(
+            EXIT_USAGE,
+            "укажите --by human — ответ человека, --by agent — решение агента",
+        )),
+        None => Ok("human"),
+    }
+}
+
+/// Команду запустил агент (переменные окружения процесса, [`super::hook::launched_by_agent`]).
+fn agent_env() -> bool {
+    let names: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
+    super::hook::launched_by_agent(&|k: &str| std::env::var(k).ok(), &names)
+}
+
 /// Тело `POST /entries/{id}/answer`.
-pub fn answer_body(option: Option<&str>, text: Option<&str>, channel: &str) -> Value {
-    let mut b = json!({ "channel": channel });
+pub fn answer_body(option: Option<&str>, text: Option<&str>, channel: &str, by: &str) -> Value {
+    let mut b = json!({ "channel": channel, "by": by });
     if let Some(o) = option {
         b["option"] = json!(o);
     }
@@ -231,6 +250,11 @@ fn explain_answered(e: CliError) -> CliError {
     }
 }
 
+/// `by` до подключения к серверу: без `--by` у агента команда не отправляется.
+pub fn answer_by(by: Option<&str>) -> Result<&str, CliError> {
+    resolve_by(by, agent_env())
+}
+
 /// `zam question answer`.
 pub fn answer(
     ctx: &Ctx,
@@ -238,6 +262,7 @@ pub fn answer(
     option: Option<&str>,
     text: Option<&str>,
     channel: &str,
+    by: &str,
 ) -> Result<(), CliError> {
     if option.is_none() && text.is_none() {
         return Err(CliError::input("нужен --option или --text"));
@@ -247,7 +272,7 @@ pub fn answer(
         .client
         .post_json(
             &format!("/entries/{id}/answer"),
-            &answer_body(option, text, channel),
+            &answer_body(option, text, channel, by),
         )
         .map_err(explain_answered)?;
     let v = read_json(r)?;
@@ -306,12 +331,26 @@ mod tests {
         assert_eq!(b["data"]["recommendation"], "a");
         assert_eq!(b["force"], true);
         assert_eq!(
-            answer_body(Some("a"), None, "chat"),
-            json!({"channel": "chat", "option": "a"})
+            answer_body(Some("a"), None, "chat", "human"),
+            json!({"channel": "chat", "option": "a", "by": "human"})
         );
         assert_eq!(
-            answer_body(None, Some("т"), "cli"),
-            json!({"channel": "cli", "text": "т"})
+            answer_body(None, Some("т"), "cli", "agent"),
+            json!({"channel": "cli", "text": "т", "by": "agent"})
+        );
+    }
+
+    #[test]
+    fn by_required_for_agent() {
+        assert_eq!(resolve_by(None, false).unwrap(), "human");
+        assert_eq!(resolve_by(Some("agent"), true).unwrap(), "agent");
+        assert_eq!(resolve_by(Some("human"), true).unwrap(), "human");
+        let e = resolve_by(None, true).unwrap_err();
+        assert_eq!(e.code, EXIT_USAGE);
+        assert!(
+            e.msg.contains("--by human") && e.msg.contains("--by agent"),
+            "{}",
+            e.msg
         );
     }
 

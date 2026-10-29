@@ -1322,3 +1322,49 @@ async fn mcp_vault_set_concurrent_no_lost_update() {
     }
     assert!(results.iter().any(|(_, o)| !o.is_error));
 }
+
+/// `memory_update_entry action=answer` без `by` — ошибка инструмента с подсказкой, вопрос не
+/// тронут; с `by: agent` — решение `hypothesis` (финальное ревью M4.5, I-2).
+#[tokio::test]
+async fn mcp_answer_requires_by() {
+    let a = api("mcp-answer-by", |_| {}).await;
+    let q = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "question", "title": "Чей выбор?", "space": "knowledge", "format": "json"}),
+    )
+    .await
+    .json();
+    let qid = q["id"].as_str().unwrap().to_string();
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("q:{qid}"), "action": "answer", "text": "так"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(
+        o.text.contains("by: human") && o.text.contains("by: agent"),
+        "{}",
+        o.text
+    );
+    let r = a
+        .t(Method::GET, &format!("/api/v1/entries/{qid}"), None)
+        .await;
+    assert_eq!(r.json()["status"], "open");
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("q:{qid}"), "action": "answer", "text": "так", "by": "agent",
+               "format": "json"}),
+    )
+    .await
+    .json();
+    assert_eq!(o["decision"]["certainty"], "hypothesis", "{o}");
+}

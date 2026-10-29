@@ -775,7 +775,7 @@ fn question_two_sides() {
         &h,
         "memory_update_entry",
         json!({"id": format!("q:{q2}"), "action": "answer", "option": "no",
-               "text": "Хуки обязаны укладываться в бюджет", "channel": "chat"}),
+               "text": "Хуки обязаны укладываться в бюджет", "channel": "chat", "by": "human"}),
     );
     let q = srv.get(0, &format!("/api/v1/entries/{q2}"));
     assert_eq!(q["status"], "answered", "{q}");

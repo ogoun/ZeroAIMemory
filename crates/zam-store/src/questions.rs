@@ -533,7 +533,8 @@ pub async fn question_duplicates(
     .await
 }
 
-fn in_list(n: usize) -> String {
+/// Плейсхолдеры `?1, ?2, …, ?n` списка `IN (…)`.
+pub(crate) fn in_list(n: usize) -> String {
     (1..=n)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()

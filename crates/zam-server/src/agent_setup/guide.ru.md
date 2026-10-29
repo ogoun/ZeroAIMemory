@@ -50,7 +50,7 @@
 
 - **Задать** — `memory_log {kind: "question", title: вопрос, body: контекст, data: {options: [{key, text}] до 8, recommendation?: key}}` → `q:<id>`. Тот же вопрос уже открыт или отвечен — 409 `possible-duplicate` с кандидатами: прочитай ответ, не задавай заново. Открытые вопросы видны в дайджесте.
 - **Ответ из WebUI** (страница «Вопросы») человек даёт сам; ответы за 14 дней приходят в дайджест разделом «Ответы человека».
-- **Ответ в чате.** Человек ответил тебе в диалоге — запиши: `memory_update_entry {id: "q:<id>", action: "answer", option? | text?, channel: "chat"}` (вопроса ещё нет — сначала задай его). По умолчанию `by: human`, и решение получает `certainty: axiom`.
+- **Ответ в чате.** Человек ответил тебе в диалоге — запиши: `memory_update_entry {id: "q:<id>", action: "answer", option? | text?, by: "human", channel: "chat"}` (вопроса ещё нет — сначала задай его). `by` обязателен: без него — 400 `by-required`. `by: human` — решение получает `certainty: axiom`. CLI: `zam question answer q:<id> --option … --by human|agent`.
 - **`by: human` — только если человек действительно ответил.** Решил сам (человек не ответил, поручил выбрать тебе, ответ — твой вывод) — `by: agent`: решение получит `hypothesis`. Не приписывай человеку свой выбор.
 - Сервер в одной операции: вопрос → `answered`, новый insight `decision` («вопрос → ответ») со связью `derived_from`; `decision_id` — в ответе.
 - **Неактуален** — `memory_update_entry {id, rev, action: "status", status: "obsolete", reason}`.

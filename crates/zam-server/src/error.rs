@@ -58,6 +58,10 @@ pub enum ApiError {
     /// 422 `/problems/reason-required` (M4.5 §3): переоткрытие задачи без причины.
     #[error("{0}")]
     ReasonRequired(String),
+    /// 400 `/problems/by-required` (M4.5 §4, финальное ревью I-2): ответ на вопрос токеном
+    /// без явного `by` — чей это ответ, решает агент, а не умолчание.
+    #[error("укажите by: human — ответ человека, by: agent — решение агента")]
+    ByRequired,
     #[error("{0}")]
     PayloadTooLarge(String),
     /// 428 `/problems/precondition-required` (§11.3): правка без `If-Match`; в `detail` —
@@ -152,6 +156,11 @@ impl ApiError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/reason-required",
                 "Unprocessable Content",
+            ),
+            ApiError::ByRequired => (
+                StatusCode::BAD_REQUEST,
+                "/problems/by-required",
+                "Bad Request",
             ),
             ApiError::PayloadTooLarge(_) => (
                 StatusCode::PAYLOAD_TOO_LARGE,

@@ -1885,6 +1885,8 @@ fn question_answer(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()
             &format!("q:{qid}"),
             "--option",
             "a",
+            "--by",
+            "human",
             "--channel",
             "chat",
         ],

@@ -571,7 +571,7 @@ enum QuestionCmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Ответить словами человека: вопрос становится answered, ответ — решением (axiom)
+    /// Ответить: вопрос становится answered, ответ — решением (human — axiom, agent — hypothesis)
     Answer {
         /// q:<id>
         id: String,
@@ -581,6 +581,9 @@ enum QuestionCmd {
         /// Свободный текст ответа
         #[arg(long)]
         text: Option<String>,
+        /// Чей ответ: human — слова человека, agent — решение агента (агенту обязателен)
+        #[arg(long, value_parser = ["human", "agent"])]
+        by: Option<String>,
         /// Где человек ответил
         #[arg(long, default_value = "cli", value_parser = ["chat", "cli"])]
         channel: String,
@@ -1150,15 +1153,21 @@ fn question(c: QuestionCmd) -> Result<(), CliError> {
             id,
             option,
             text,
+            by,
             channel,
             common,
-        } => q::answer(
-            &cmd::connect(&common)?,
-            &id,
-            option.as_deref(),
-            text.as_deref(),
-            &channel,
-        ),
+        } => {
+            // без `--by` у агента — код 2 до подключения к серверу
+            let by = q::answer_by(by.as_deref())?;
+            q::answer(
+                &cmd::connect(&common)?,
+                &id,
+                option.as_deref(),
+                text.as_deref(),
+                &channel,
+                by,
+            )
+        }
     }
 }
 

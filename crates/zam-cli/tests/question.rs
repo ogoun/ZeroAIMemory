@@ -1,6 +1,7 @@
 //! `zam question` против настоящего zam-server в том же процессе тестов (M4.5 §4): постановка с
 //! вариантами, дубликат (код 4, ответ отвеченного), лента, ответ (`--option`, `--text`,
-//! `--channel`), повторный ответ (код 4), `--json`. Сервер без моделей.
+//! `--channel`, `--by`; агенту без `--by` — код 2), повторный ответ (код 4), `--json`. Сервер без
+//! моделей.
 mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -209,5 +210,53 @@ fn ask_list_answer_cycle() {
     .unwrap();
     assert_eq!(j["entry"]["data"]["answer"]["channel"], "chat");
     assert_eq!(j["entry"]["data"]["answer"]["by"], "human");
+    assert_eq!(j["decision"]["certainty"], "axiom");
+}
+
+/// `--by` (финальное ревью M4.5, I-2): `zam` агента без `--by` — код 2 с подсказкой и без
+/// обращения к серверу; `--by agent` — решение `hypothesis`, `--by human` — `axiom`.
+#[test]
+fn answer_by_required_for_agent() {
+    let (url, tok) = start("by");
+    let r = repo("by-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let ask = |title: &str| {
+        let q = ok(&z(&["question", "ask", "--title", title]));
+        q.trim().split_once('@').unwrap().0.to_string()
+    };
+    let agent = |args: &[&str]| {
+        let mut c = common::zam_cmd();
+        c.env("ZAM_URL", &url)
+            .env("ZAM_TOKEN", &tok)
+            .env("HOME", &r)
+            .env("USERPROFILE", &r)
+            .env("ZAM_AGENT", "1")
+            .env("ZAM_SESSION", "-")
+            .current_dir(&r)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let q1 = ask("Брать ли кэш?");
+    let o = agent(&["question", "answer", &q1, "--option", "a"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(
+        err(&o).contains("--by human") && err(&o).contains("--by agent"),
+        "{}",
+        err(&o)
+    );
+    // вопрос не тронут
+    assert!(ok(&z(&["question", "list"])).contains(&q1));
+    let j: serde_json::Value = serde_json::from_str(&ok(&agent(&[
+        "question", "answer", &q1, "--text", "беру", "--by", "agent", "--json",
+    ])))
+    .unwrap();
+    assert_eq!(j["entry"]["data"]["answer"]["by"], "agent");
+    assert_eq!(j["decision"]["certainty"], "hypothesis");
+    let q2 = ask("Нужен ли индекс?");
+    let j: serde_json::Value = serde_json::from_str(&ok(&agent(&[
+        "question", "answer", &q2, "--text", "да", "--by", "human", "--json",
+    ])))
+    .unwrap();
     assert_eq!(j["decision"]["certainty"], "axiom");
 }

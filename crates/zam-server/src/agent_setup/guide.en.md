@@ -50,7 +50,7 @@ A question (`question`) is something only the human decides. The answer becomes 
 
 - **Ask** — `memory_log {kind: "question", title: question, body: context, data: {options: [{key, text}] up to 8, recommendation?: key}}` → `q:<id>`. The same question is already open or answered — 409 `possible-duplicate` with candidates: read the answer, do not ask again. Open questions are listed in the digest.
 - **Answer in WebUI** (the "Questions" page) is given by the human; answers of the last 14 days reach the digest as "Human answers".
-- **Answer in chat.** The human answered you in the conversation — record it: `memory_update_entry {id: "q:<id>", action: "answer", option? | text?, channel: "chat"}` (no question yet — ask it first). The default is `by: human`, and the decision gets `certainty: axiom`.
+- **Answer in chat.** The human answered you in the conversation — record it: `memory_update_entry {id: "q:<id>", action: "answer", option? | text?, by: "human", channel: "chat"}` (no question yet — ask it first). `by` is required: without it — 400 `by-required`. With `by: human` the decision gets `certainty: axiom`. CLI: `zam question answer q:<id> --option … --by human|agent`.
 - **`by: human` only if the human really answered.** You decided yourself (no answer, the human asked you to choose, the answer is your conclusion) — `by: agent`: the decision gets `hypothesis`. Never attribute your own choice to the human.
 - In one operation the server sets the question to `answered` and creates an insight `decision` ("question → answer") linked by `derived_from`; `decision_id` is in the response.
 - **No longer relevant** — `memory_update_entry {id, rev, action: "status", status: "obsolete", reason}`.

@@ -1286,6 +1286,92 @@ async fn digest_environment_solution_scope() {
     );
 }
 
+/// Окружение решения — только при действующем доступе (I-1 финального ревью M4.5): участник
+/// видит открытые поля своей записи Vault решения, после отзыва — только личный Vault.
+#[tokio::test]
+async fn digest_environment_excluded_after_revoke() {
+    let a = api("vault-digest-revoked", |c| c.recall.timeout_ms = 30_000).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    let reg = json!({"agent_solution_id": G, "name": "Общее"});
+    let r = a
+        .tok(&a_tok, Method::POST, "/api/v1/solutions", Some(reg.clone()))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = a
+        .tok(&b_tok, Method::POST, "/api/v1/solutions", Some(reg))
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for (space, title, purpose) in [
+        (G, "member-sol-host", "стенд решения"),
+        ("knowledge", "member-own-host", "личный стенд"),
+    ] {
+        let body = json!({"title": title, "data": {"type": "host", "purpose": purpose}});
+        let r = a
+            .tok(
+                &b_tok,
+                Method::POST,
+                &format!("/api/v1/spaces/{space}/vault"),
+                Some(body),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    let body = json!({"event": "session_start", "solution": G});
+    let j = recall_digest(&a, &b_tok, body.clone()).await;
+    let t = j["text"].as_str().unwrap();
+    assert!(
+        t.contains("member-sol-host — стенд решения") && t.contains("member-own-host"),
+        "{t}"
+    );
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/revoke"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = recall_digest(&a, &b_tok, body).await;
+    let t = j["text"].as_str().unwrap();
+    assert!(
+        !t.contains("member-sol-host") && !t.contains("стенд решения"),
+        "{t}"
+    );
+    assert!(t.contains("member-own-host"), "{t}");
+    assert!(
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w == "solution access revoked"),
+        "{j}"
+    );
+    // неизвестный GUID — только личное окружение
+    let other = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9eff";
+    let j = recall_digest(
+        &a,
+        &b_tok,
+        json!({"event": "session_start", "solution": other}),
+    )
+    .await;
+    let t = j["text"].as_str().unwrap();
+    assert!(
+        !t.contains("member-sol-host") && t.contains("member-own-host"),
+        "{t}"
+    );
+}
+
 /// Заблокированный Vault (нет мастер-ключа): поиск и дайджест отдают открытые поля,
 /// значение — 503.
 #[tokio::test]
