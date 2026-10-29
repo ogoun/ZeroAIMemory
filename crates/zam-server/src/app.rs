@@ -50,6 +50,11 @@ pub struct AppState {
     pub maintenance: Arc<Maintenance>,
     /// Кэш словаря доменных терминов по базам (M4.5, [`crate::glossary`]).
     pub glossary: Arc<crate::glossary::GlossaryCache>,
+    /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
+    /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub search_hold: Arc<zam_index::test_hooks::Hold>,
 }
 
 impl AppState {
@@ -285,6 +290,8 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         render_cache: api::render::new_cache(),
         render_gen: Arc::default(),
         cfg: Arc::new(cfg),
+        #[cfg(feature = "test-hooks")]
+        search_hold: Arc::default(),
     };
     let router = router(state.clone());
     Ok((router, state, BootReport { initial_token }))

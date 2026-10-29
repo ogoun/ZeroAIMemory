@@ -144,7 +144,11 @@
 //! и `degraded_text` (или `null`), `warnings` (строки: о реранке, `index rebuilding` — индекс
 //! пересобирается, векторная выдача может быть неполной, `solution access …` и
 //! `solution unavailable` — решение исключено из области), `pending_count` — живые
-//! заметки области всех целей, ждущие векторной индексации, `timings {fts_ms, embed_ms, vector_ms,
+//! заметки и записи области, ждущие векторной индексации (сумма по целям, не исключённым к
+//! концу ответа). Это снимок **до** векторного запроса: воркер ставит `indexed` после
+//! подтверждённой записи точек, поэтому `pending_count == 0` гарантирует, что подтверждённые
+//! upsert видны вектору; цель, проиндексированная между снимком и запросом, лишь завышает
+//! счётчик. `timings {fts_ms, embed_ms, vector_ms,
 //! fuse_ms, rerank_ms, expand_ms, pending_ms, total_ms}` (`null` — этап не выполнялся;
 //! `total_ms` — весь обработчик без сериализации ответа). Маркеры совпадений в JSON —
 //! U+E000/U+E001.
@@ -1840,7 +1844,29 @@ pub async fn search(
         );
         vector_channel(&st.index, filter, req.query.clone()).await
     };
+    // заметки области всех целей, ещё не прошедшие векторную индексацию (без `index: false`
+    // и Human), — снимок ДО векторного запроса: воркер отмечает `indexed` только после
+    // подтверждённой записи точек в Qdrant, поэтому `pending_count == 0` гарантирует, что
+    // вектор их видит (флейк шага 17 smoke: счёт после запроса давал 0 при FTS-only выдаче).
+    // Сумма — по целям, живым к концу обработчика
+    let pending_t = Instant::now();
+    let pending_runs = join_all(
+        targets
+            .iter()
+            .map(|t| pending_count(&t.db, t.space_ids(), prefix.clone())),
+    )
+    .await;
+    let mut pending_by = vec![0; targets.len()];
+    for (i, r) in pending_runs.into_iter().enumerate() {
+        if health.alive[i] {
+            pending_by[i] = health.soft(i, r)?.unwrap_or(0);
+        }
+    }
+    let pending_ms = ms(pending_t);
     let ((runs, fts_ms), vrun) = tokio::join!(fts, vector);
+    // тест задаёт порядок «вектор прочитан → воркер проиндексировал → ответ»
+    #[cfg(feature = "test-hooks")]
+    st.search_hold.park().await;
     // 0. кэш выжимок (§9.3): действующие выжимки — первыми элементами
     let cache_t = Instant::now();
     let cache_items = if req.no_cache {
@@ -1863,6 +1889,10 @@ pub async fn search(
     let mut per_db = Vec::with_capacity(targets.len());
     let mut expanded: Vec<Expansion> = Vec::new();
     for (i, (r, exp)) in runs.into_iter().enumerate() {
+        // цель уже исключена сбоем подсчёта `pending_count`
+        if !health.alive[i] {
+            continue;
+        }
         if let Some(ch) = health.soft(i, r)? {
             per_db.push((i, ch));
             for e in exp {
@@ -2168,20 +2198,13 @@ pub async fn search(
     // элементы целей, исключённых на этих шагах, — прочь
     items.retain(|it| health.alive[it.target]);
     let expand_ms = ms(expand_t);
-    // заметки области всех целей, ещё не прошедшие векторную индексацию (без `index: false`
-    // и Human)
-    let pending_t = Instant::now();
-    let mut pending = 0;
-    for (i, t) in targets.iter().enumerate() {
-        if !health.alive[i] {
-            continue;
-        }
-        let r = pending_count(&t.db, t.space_ids(), prefix.clone()).await;
-        pending += health.soft(i, r)?.unwrap_or(0);
-    }
-    let pending_ms = ms(pending_t);
-    // pending_count цели, исключённой на этом шаге, уже не прибавлен; её элементы — прочь
-    items.retain(|it| health.alive[it.target]);
+    // снимок `pending_count` (до векторного запроса) — только живых к этому моменту целей
+    let pending: i64 = pending_by
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| health.alive[*i])
+        .map(|(_, n)| n)
+        .sum();
     let mut warnings = health.warnings;
     dedup_keep_order(&mut warnings);
     // выданное этой сессии в той же ревизии — без фрагмента и текста (§9.3)
