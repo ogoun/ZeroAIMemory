@@ -287,7 +287,7 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
     );
     assert!(
         text.contains(
-            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v2): обнови через `zam init` или WebUI"
+            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v3): обнови через `zam init` или WebUI"
         ),
         "{text}"
     );
@@ -321,7 +321,7 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
         &a,
         &a_tok,
         Some("d2"),
-        json!({"event": "session_start", "agent_block_version": 2}),
+        json!({"event": "session_start", "agent_block_version": zam_core::AGENT_BLOCK_VERSION}),
     )
     .await;
     let text = j["text"].as_str().unwrap();

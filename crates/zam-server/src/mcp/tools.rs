@@ -78,8 +78,9 @@ impl ToolName {
         match self {
             ToolName::Search => {
                 "Поиск в памяти (Knowledge, Rules, текущее решение). Сначала готовые выжимки кэша, \
-                 затем карточки: id, путь, ревизия, ~токены; выданное в этой сессии помечено seen. \
-                 Дальше — memory_read нужного."
+                 затем карточки: id, путь, ревизия, возраст, ~токены; выданное в этой сессии \
+                 помечено seen. filters: kinds (в том числе term, task, question), file — знание \
+                 о файле, decided_by. Дальше — memory_read нужного."
             }
             ToolName::Read => {
                 "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id> или путь <пространство>:/<путь>. \
@@ -105,8 +106,8 @@ impl ToolName {
             ToolName::Log => {
                 "Новая запись журнала: kind changelog|release (только в решении), insight \
                  (data.kind, triggers, links, scope, certainty), term (data.definition, \
-                 aliases), task (body — план) или question (data.options, recommendation). Дубль \
-                 insight или вопроса — 409 с кандидатами: force."
+                 aliases), task (body — план) или question (data.options, recommendation); \
+                 refs.files — файлы. Дубль insight или вопроса — 409 с кандидатами: force."
             }
             ToolName::UpdateEntry => {
                 "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
@@ -116,7 +117,8 @@ impl ToolName {
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
-                 связь; remove: <edge_id> — удалить её."
+                 связь; type contradicts — запись возражает аксиоме dst; remove: <edge_id> — \
+                 удалить связь."
             }
             ToolName::Recall => {
                 "Подсказки памяти к событию: session_start — дайджест, prompt — к запросу \
@@ -127,7 +129,8 @@ impl ToolName {
             ToolName::Vault => {
                 "Vault: list — записи без значений (name — поиск), get — по name или id (v:<id> из \
                  дайджеста; раскрытие пишется в аудит), set — создать или обновить name = value. \
-                 scope: global (личный) или solution (из X-Zam-Solution)."
+                 Типы host и environment — окружение: purpose, address, limits. scope: global \
+                 (личный) или solution (из X-Zam-Solution)."
             }
         }
     }
@@ -289,7 +292,8 @@ impl ToolName {
             ToolName::Link => (
                 json!({
                     "src": {"type": "string"},
-                    "type": {"type": "string"},
+                    "type": {"type": "string", "description": "links_to, relates_to, depends_on, \
+                        part_of, caused_by, fixes, derived_from, mentions, contradicts"},
                     "dst": {"type": "string"},
                     "remove": {"type": "string", "description": "id связи"},
                     "format": fmt,

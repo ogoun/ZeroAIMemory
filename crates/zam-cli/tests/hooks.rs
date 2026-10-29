@@ -539,7 +539,7 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
         "{c}"
     );
     // R2: блок v1 устарел — сервер напоминает
-    assert!(c.contains("устарел (v1 → v2)"), "{c}");
+    assert!(c.contains("устарел (v1 → v3)"), "{c}");
     let s = p.session("ss-1");
     assert_eq!(s["agent"], "claude-code", "{s}");
     assert_eq!(s["solution"], G, "{s}");
@@ -2665,5 +2665,47 @@ fn local_tokens_flushed_by_hook() {
         s["tokens"]["pre_tool"],
         json!({"calls": 2, "tokens": want}),
         "{s}"
+    );
+}
+
+/// Ревью задачи 12: очередь учёта токенов — жёсткий предел 64 КиБ. Полная очередь не растёт,
+/// выдача хука не меняется, причина — строка в `hooks.log`.
+#[test]
+fn token_queue_capped_at_64k() {
+    let _g = serial();
+    let p = Proj::new("tokens-cap", DEAD, "zam_x");
+    write_cache(&p, DEAD);
+    let ev = write_ev(&p, "tc", "scripts/deploy.sh").to_string();
+    let (o, _) = p.hook_at(DEAD, "pre-tool", "claude", ev.as_bytes());
+    let first = context(&o, "PreToolUse");
+    assert!(!first.is_empty(), "{o:?}");
+    assert_eq!(token_queue(&p, "tc").len(), 1);
+    let f = p.session_file("tokens", "tc", ".jsonl").unwrap();
+    // почти полная очередь: следующая строка уже не помещается в 64 КиБ
+    let line = "{\"e\":\"pre_tool\",\"t\":1}\n";
+    let have = std::fs::metadata(&f).unwrap().len() as usize;
+    let pad = line.repeat((64 * 1024 - have) / line.len());
+    let mut text = std::fs::read_to_string(&f).unwrap();
+    text.push_str(&pad);
+    std::fs::write(&f, &text).unwrap();
+    let before = std::fs::metadata(&f).unwrap().len();
+    assert!(before <= 64 * 1024 && before + 30 > 64 * 1024, "{before}");
+    // другой триггер — выдача есть, но в очередь уже не попадает
+    let push = p.ev(
+        "PreToolUse",
+        "tc",
+        json!({"tool_name": "Bash", "tool_input": {"command": "git push --force"}}),
+    );
+    let (o, _) = p.hook_at(DEAD, "pre-tool", "claude", push.to_string().as_bytes());
+    assert!(!context(&o, "PreToolUse").is_empty(), "{o:?}");
+    assert_eq!(
+        std::fs::metadata(&f).unwrap().len(),
+        before,
+        "сверх предела не дописано"
+    );
+    assert!(
+        p.log().contains("очередь учёта токенов полна (64 КиБ)"),
+        "{}",
+        p.log()
     );
 }

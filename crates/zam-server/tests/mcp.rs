@@ -1113,3 +1113,72 @@ fn mcp_vault_value_not_in_debug_log() {
     assert!(!log.contains(value), "значение Vault в журнале");
     assert!(!srv.tail().contains(value), "значение Vault в stderr");
 }
+
+/// M4.5 (принцип 0.2): новые виды и действия идут через прежние инструменты — их по-прежнему
+/// 10; инструкция `initialize` называет рабочую память.
+#[tokio::test]
+async fn mcp_tool_count_still_10() {
+    let a = api("mcp-count-m45", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    assert_eq!(list["tools"].as_array().unwrap().len(), 10, "{list}");
+    let init = rpc(
+        &a,
+        &a.token,
+        &[],
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "test", "version": "1"}}),
+    )
+    .await;
+    let s = init["instructions"].as_str().unwrap_or_default();
+    for want in ["kind=task|question|term", "event=recovery", "event=brief"] {
+        assert!(s.contains(want), "{want}: {s}");
+    }
+}
+
+/// Описания инструментов — до 300 символов и перечисляют новые виды и действия M4.5.
+#[tokio::test]
+async fn mcp_descriptions_under_300() {
+    let a = api("mcp-desc-m45", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let desc = |name: &str| {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .and_then(|t| t["description"].as_str())
+            .unwrap_or_else(|| panic!("{name}"))
+            .to_string()
+    };
+    for t in TOOLS {
+        let d = desc(t);
+        assert!(
+            d.chars().count() <= 300,
+            "{t}: {} символов",
+            d.chars().count()
+        );
+    }
+    let need: [(&str, &[&str]); 6] = [
+        ("memory_log", &["term", "task", "question", "refs.files"]),
+        (
+            "memory_update_entry",
+            &["status", "claim", "release", "answer"],
+        ),
+        ("memory_recall", &["recovery", "brief"]),
+        (
+            "memory_search",
+            &["term", "task", "question", "file", "decided_by"],
+        ),
+        ("memory_link", &["contradicts"]),
+        ("memory_vault", &["host", "environment"]),
+    ];
+    for (tool, words) in need {
+        let d = desc(tool);
+        for w in words {
+            assert!(d.contains(w), "{tool}: нет «{w}» в «{d}»");
+        }
+    }
+    let read = desc("memory_read");
+    assert!(read.contains("since_rev"), "{read}");
+}

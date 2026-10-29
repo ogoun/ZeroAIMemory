@@ -218,30 +218,45 @@ fn group(matcher: Option<&str>, hook: Value) -> Value {
     }
 }
 
-/// Фрагмент `.claude/settings.json` (§15.5): exec form, `timeout` в секундах — 1 у
-/// `pre-tool`, 2 у остальных.
+/// Matcher `PreToolUse` Claude Code: правки и команды (триггеры, знание о файле) и запуск
+/// субагента `Agent`/`Task` (очередь заданий для `subagent-start`, M4.5 §9.4).
+pub const CLAUDE_PRE_TOOL: &str = "Write|Edit|Bash|Agent|Task";
+/// Matcher `PostToolUse` Claude Code (режим успеха `post-tool`, M4.5 §9.1, §6.3): чтение и
+/// правки файлов, команды и запись в память через MCP (`memory_write` журнала сессии).
+pub const CLAUDE_POST_TOOL: &str =
+    "Read|Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__zeroaimemory__memory_log";
+/// Matcher `PreToolUse` и `PostToolUse` Codex: команды и правки (`apply_patch`).
+pub const CODEX_TOOLS: &str = "Bash|apply_patch";
+
+/// Фрагмент `.claude/settings.json` (§15.5, M4.5 §11): exec form, `timeout` в секундах — 1 у
+/// `pre-tool` и `post-tool` успеха (бюджет 50 мс, без сети), 2 у остальных. Ошибка инструмента
+/// — `PostToolUseFailure`, успех — `PostToolUse`; обе — одна команда `post-tool`.
 pub fn claude_settings() -> Value {
     let h = claude_hook;
     json!({"hooks": {
         "SessionStart": group(None, h("session-start", 2)),
         "UserPromptSubmit": group(None, h("prompt", 2)),
-        "PreToolUse": group(Some("Write|Edit|Bash"), h("pre-tool", 1)),
+        "PreToolUse": group(Some(CLAUDE_PRE_TOOL), h("pre-tool", 1)),
+        "PostToolUse": group(Some(CLAUDE_POST_TOOL), h("post-tool", 1)),
         "PostToolUseFailure": group(Some("Bash"), h("post-tool", 2)),
+        "SubagentStart": group(None, h("subagent-start", 2)),
         "Stop": group(None, h("checkpoint", 2)),
         "PreCompact": group(None, h("checkpoint", 2)),
     }})
 }
 
 /// Фрагмент `.codex/hooks.json`: тот же состав с `--agent codex`; `post-tool` — на
-/// `PostToolUse` (у Codex нет `PostToolUseFailure`), правки файлов Codex — инструмент
-/// `apply_patch` (matcher — regex) **[решение контроллера T11-b]**.
+/// `PostToolUse` (у Codex нет `PostToolUseFailure`: ошибка и успех различаются по
+/// `tool_response`), правки файлов Codex — инструмент `apply_patch` (matcher — regex)
+/// **[решение контроллера T11-b]**; `SubagentStart` — пакет под задачу (M4.5 §9.4).
 pub fn codex_hooks() -> Value {
     let h = codex_hook;
     json!({"hooks": {
         "SessionStart": group(None, h("session-start", 2)),
         "UserPromptSubmit": group(None, h("prompt", 2)),
-        "PreToolUse": group(Some("Bash|apply_patch"), h("pre-tool", 1)),
-        "PostToolUse": group(Some("Bash"), h("post-tool", 2)),
+        "PreToolUse": group(Some(CODEX_TOOLS), h("pre-tool", 1)),
+        "PostToolUse": group(Some(CODEX_TOOLS), h("post-tool", 2)),
+        "SubagentStart": group(None, h("subagent-start", 2)),
         "Stop": group(None, h("checkpoint", 2)),
         "PreCompact": group(None, h("checkpoint", 2)),
     }})

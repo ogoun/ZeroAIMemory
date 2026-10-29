@@ -82,7 +82,9 @@ const FORWARDED: [&str; 8] = [
 const INSTRUCTIONS: &str = "ZeroAIMemory — долговременная память агента. Порядок: memory_search \
 (карточки, шаг 0 — кэш выжимок) → memory_read нужного → memory_cache_put выжимки. Запись — \
 memory_write, memory_log, memory_update_entry; ревизии обязательны при правке (409/428 — \
-перечитать). Ответы — Markdown, последняя строка ~N tok.";
+перечитать). Задачи, вопросы человеку, словарь — memory_log kind=task|question|term; после \
+сжатия контекста — memory_recall event=recovery, задание субагенту — event=brief. Протокол — \
+zam guide (GET /api/v1/agent-guide). Ответы — Markdown, последняя строка ~N tok.";
 
 /// Маршрут `/mcp` с проверкой bearer-токена. Внутренний роутер инструментов собирается
 /// здесь же из [`crate::api::router`] — без `/mcp`.

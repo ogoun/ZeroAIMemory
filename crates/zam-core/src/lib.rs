@@ -10,11 +10,12 @@ pub use solution::SolutionGuid;
 pub use target::{TargetKind, TargetRef};
 pub use token::{NewToken, generate_token, hash_token, looks_like_token, mask_token};
 
-/// Текущая версия блока инструкции агента ZeroAIMemory в CLAUDE.md/AGENTS.md (§14.2, §15.5):
+/// Текущая версия блока инструкции агента ZeroAIMemory в CLAUDE.md/AGENTS.md (§14.2, §15.5;
+/// v3 — M4.5 §11):
 /// маркер `<!-- zeroaimemory:begin vN -->`. Нижняя граница версии сервера: действующая версия —
 /// `max(AGENT_BLOCK_VERSION, версия шаблонов в settings)` (`zam_server::agent_setup`), с ней
 /// сравнивают `/recall(session_start)` и `zam status`, её пишет в маркер `GET /agent-setup`.
-pub const AGENT_BLOCK_VERSION: u32 = 2;
+pub const AGENT_BLOCK_VERSION: u32 = 3;
 
 /// Предел длины имени решения, символов (§11.6): регистрация (`POST /solutions`), переименование
 /// (`PATCH /solutions/{guid}`), `GET /agent-setup?name=`, однострочник `zam init` и `zam init

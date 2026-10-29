@@ -374,7 +374,9 @@
   <p class="muted small">
     Какие подсказки хуки показывают агенту. Настройка хранится на сервере и приходит хукам при старте
     сессии; выключить тип можно и в <code>[hooks]</code> файла <code>config.toml</code> клиента — тип
-    выключен, если выключен хотя бы где-то.
+    выключен, если выключен хотя бы где-то. Выключатели касаются только хуков: явный вызов MCP
+    <code>memory_recall</code> с <code>event=recovery</code> или <code>event=brief</code> они не гасят
+    (<code>hooks.recovery</code> не действует на <code>memory_recall event=recovery</code>).
   </p>
   {#if flagsError}<p class="error" role="alert">{flagsError}</p>{/if}
   {#if flags}

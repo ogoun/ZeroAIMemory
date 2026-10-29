@@ -535,6 +535,10 @@ pub struct TokenLine {
     pub t: u64,
 }
 
+/// Жёсткий предел очереди `tokens-<сессия>.jsonl`, байт (ревью задачи 12): сверх него строка не
+/// дописывается, а в `hooks.log` пишется причина (около 2000 выводов между сетевыми хуками).
+pub const TOKENS_QUEUE_MAX: u64 = 64 * 1024;
+
 /// Событие учёта: вывод `pre-tool`.
 pub const TOKENS_PRE_TOOL: &str = "pre_tool";
 /// Событие учёта: вывод `post-tool` в режиме успеха (без сети).
@@ -563,11 +567,19 @@ pub fn note_tokens(env: &Env, session: &str, event: &str, text: &str) {
     };
     let mut buf = serde_json::to_vec(&line).unwrap_or_default();
     buf.push(b'\n');
+    let path = tokens_path(env, session);
+    // жёсткий предел очереди: сервер долго недоступен — учёт теряется, а не растёт файл
+    let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+    if len + buf.len() as u64 > TOKENS_QUEUE_MAX {
+        env.log(&format!(
+            "очередь учёта токенов полна ({} КиБ): вывод {event} не учтён",
+            TOKENS_QUEUE_MAX / 1024
+        ));
+        return;
+    }
     let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| {
         use std::io::Write;
-        append_options()
-            .open(tokens_path(env, session))?
-            .write_all(&buf)
+        append_options().open(&path)?.write_all(&buf)
     });
     if let Err(e) = r {
         env.log(&format!("очередь учёта токенов: {e}"));

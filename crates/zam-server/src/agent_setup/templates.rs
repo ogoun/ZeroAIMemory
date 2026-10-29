@@ -1,5 +1,8 @@
 //! Шаблоны по умолчанию блока инструкции агента (§14.2) и полный протокол `GET /agent-guide`.
 //!
+//! Блок v3 (M4.5 §11): правило — одна строка, не больше 500 токенов bge-m3 в худшем случае
+//! теста (ru и en); пояснения — в протоколе (`guide.{ru,en}.md`), а не в блоке.
+//!
 //! Шаблон — текст между маркерами `<!-- zeroaimemory:begin vN -->` и `<!-- zeroaimemory:end -->`
 //! (маркеры добавляет [`super::render_block`]). Подстановки:
 //! - `{url}` — внешний адрес сервера (`server.public_url` или адрес запроса);
@@ -13,44 +16,36 @@
 pub const BLOCK_RU: &str = "\
 ## Память ZeroAIMemory
 ZeroAIMemoryUrl={url}
-Токен — `ZAM_TOKEN`, не в этом файле. Решение: {solution}.
-Без MCP — CLI `zam`; протокол — `zam guide`.
+Токен — `ZAM_TOKEN`. Решение: {solution}.
+Без MCP — `zam`; протокол — `zam guide`.
 
-Поиск:
-1. `memory_search`: актуальную `[cache]`-выжимку используй; `stale` — перечитай изменившееся.
-2. Иначе выбери карточки сам; `memory_read` их пачкой, сначала `tier=L1` или `section`.
-3. Собрал ответ из нескольких источников → `memory_cache_put` с источниками.
-
-Правила:
-- Перед задачей — `memory_search`; перед исследованием — `insight_kinds=[experiment,failure]`.
-- Ошибка, ловушка → `memory_log insight` (gotcha|failure; scope=global, если не про проект) с триггерами; эксперимент — с результатом.
-- Изменение проекта → `memory_log changelog`; устарело → `memory_update_entry` supersede/retract.
-- Правка записи — с `rev`; на 409/428 перечитай.
-- `axiom` ставь, правь, снимай только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` рядом и скажи пользователю. Смену `certainty` сопровождай `reason`.
-- Секреты → `memory_vault`. Заметке — `l0`. {rules}
-- «ZeroAIMemory:» — накопленные знания. Без хуков: перед новым типом файла и после ошибки — `memory_recall`.
+- Перед задачей — `memory_search` (исследование — `insight_kinds=[experiment,failure]`) → `[cache]` или `memory_read` пачкой (`tier=L1`/`section`) → сводку в `memory_cache_put`.
+- `memory_log <kind>` пишет, `memory_update_entry` с `rev` правит (409 — перечитай).
+- Ловушка, сбой → `insight` gotcha|failure с триггерами (не про проект — scope=global); изменение → `changelog`; устарело → supersede/retract.
+- Задача → `task`: claim перед работой, `status` с `next_step`.
+- Вопрос человеку → `question`; его ответ в чате → `answer`.
+- Код — с `refs.files`; новое понятие → `term`, пиши каноническими терминами.
+- `axiom` — только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` с `contradicts` и скажи ему; `certainty` меняй с `reason`.
+- Секреты, хосты → `memory_vault`; заметке — `l0`. {rules}
+- Без хуков `memory_recall`: новый тип файла, ошибка; после сжатия — `recovery`; субагенту — `brief`.
 ";
 
 /// Шаблон по умолчанию, английский.
 pub const BLOCK_EN: &str = "\
 ## ZeroAIMemory memory
 ZeroAIMemoryUrl={url}
-Token — `ZAM_TOKEN`, never in this file. Solution: {solution}.
-No MCP — CLI `zam`; protocol — `zam guide`.
+Token — `ZAM_TOKEN`. Solution: {solution}.
+No MCP — `zam`; protocol — `zam guide`.
 
-Search:
-1. `memory_search`: use a current `[cache]` summary; `stale` — reread what changed.
-2. Otherwise pick cards yourself; `memory_read` them in one call, `tier=L1` or `section` first.
-3. Answer built from several sources → `memory_cache_put` with the sources.
-
-Rules:
-- Before a task — `memory_search`; before research — `insight_kinds=[experiment,failure]`.
-- Error, gotcha → `memory_log insight` (gotcha|failure; scope=global if not about the project) with triggers; experiment — with its result.
-- Project change → `memory_log changelog`; outdated → `memory_update_entry` supersede/retract.
-- Edit a record with `rev`; on 409/428 reread.
-- Set, change or remove `axiom` only on the user's direct instruction; if you disagree — add `hypothesis`/`theorem` alongside and tell the user. Give a `reason` for every `certainty` change.
-- Secrets → `memory_vault`. Give notes an `l0`. {rules}
-- \"ZeroAIMemory:\" lines are accumulated knowledge. Without hooks: before a new file type and after an error — `memory_recall`.
+- Before a task — `memory_search` (research — `insight_kinds=[experiment,failure]`) → `[cache]` or `memory_read` in one call (`tier=L1`/`section`) → summary into `memory_cache_put`.
+- `memory_log <kind>` writes, `memory_update_entry` with `rev` edits (409 — reread).
+- Gotcha, failure → `insight` gotcha|failure with triggers (not about the project — scope=global); change → `changelog`; outdated → supersede/retract.
+- Task → `task`: claim before work, `status` with `next_step`.
+- Question for the human → `question`; their answer in chat → `answer`.
+- Code — with `refs.files`; new concept → `term`, write with canonical terms.
+- `axiom` — only on the user's direct instruction; if you disagree — `hypothesis`/`theorem` with `contradicts` and tell the user; change `certainty` with a `reason`.
+- Secrets, hosts → `memory_vault`; give notes an `l0`. {rules}
+- Without hooks `memory_recall`: new file type, error; after compaction — `recovery`; for a subagent — `brief`.
 ";
 
 /// `{solution}` без выбранного решения.

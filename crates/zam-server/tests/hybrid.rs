@@ -690,6 +690,7 @@ impl Drop for ReleaseHolds {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pending_count_snapshot_precedes_vector_query() {
     if !have(MINILM) {
+        eprintln!("пропуск pending_count_snapshot_precedes_vector_query: нужна модель {MINILM}");
         return;
     }
     let q = TestQdrant::start("hyb-pending-snap");
