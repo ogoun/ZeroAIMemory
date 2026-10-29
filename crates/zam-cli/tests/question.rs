@@ -1,6 +1,6 @@
 //! `zam question` против настоящего zam-server в том же процессе тестов (M4.5 §4): постановка с
 //! вариантами, дубликат (код 4, ответ отвеченного), лента, ответ (`--option`, `--text`,
-//! `--channel`, `--by`; агенту без `--by` — код 2), повторный ответ (код 4), `--json`. Сервер без
+//! `--channel`, `--by`; агенту без `--by` — код 6), повторный ответ (код 4), `--json`. Сервер без
 //! моделей.
 mod common;
 use std::net::SocketAddr;
@@ -213,7 +213,7 @@ fn ask_list_answer_cycle() {
     assert_eq!(j["decision"]["certainty"], "axiom");
 }
 
-/// `--by` (финальное ревью M4.5, I-2): `zam` агента без `--by` — код 2 с подсказкой и без
+/// `--by` (финальное ревью M4.5, I-2): `zam` агента без `--by` — код 6 с подсказкой и без
 /// обращения к серверу; `--by agent` — решение `hypothesis`, `--by human` — `axiom`.
 #[test]
 fn answer_by_required_for_agent() {
@@ -239,7 +239,7 @@ fn answer_by_required_for_agent() {
     };
     let q1 = ask("Брать ли кэш?");
     let o = agent(&["question", "answer", &q1, "--option", "a"]);
-    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
     assert!(
         err(&o).contains("--by human") && err(&o).contains("--by agent"),
         "{}",

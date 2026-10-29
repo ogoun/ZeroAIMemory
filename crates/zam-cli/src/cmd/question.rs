@@ -8,7 +8,7 @@
 //! - `answer <q:id> (--option key | --text …) [--by human|agent] [--channel chat|cli]` — ответ;
 //!   становится решением `i:<id>` (`human` — слова человека, `axiom`; `agent` — решение агента,
 //!   `hypothesis`). Запустил агент ([`super::hook::launched_by_agent`]) — `--by` обязателен,
-//!   иначе код 2 с подсказкой (финальное ревью M4.5, I-2); человек в терминале — `human` по
+//!   иначе код 6 с подсказкой (финальное ревью M4.5, I-2); человек в терминале — `human` по
 //!   умолчанию. Уже отвечен — код 4.
 //!
 //! Ссылка — `q:<id>`, `e:<id>` или голый id.
@@ -21,9 +21,6 @@ use super::{Ctx, emit, emit_json, post_entry, solution_guid};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
 // `q:<id>` / `e:<id>` … → голый id (буквы — общий источник `target`)
 use crate::target::bare_entry_id as bare_id;
-
-/// Код выхода без обязательного `--by` у агента — как ошибка использования clap.
-pub const EXIT_USAGE: u8 = 2;
 
 /// Статусы ленты по умолчанию.
 const OPEN: &str = "open";
@@ -201,12 +198,11 @@ pub fn ask(ctx: &Ctx, o: &Ask) -> Result<(), CliError> {
     post_entry(ctx, &space, &req, o.key, o.area).map_err(explain_duplicate)
 }
 
-/// `by` ответа: явный `--by`; без него у агента — код 2 с подсказкой, у человека — `human`.
+/// `by` ответа: явный `--by`; без него у агента — код 6 (ошибка ввода) с подсказкой, у человека — `human`.
 pub fn resolve_by(by: Option<&str>, agent: bool) -> Result<&str, CliError> {
     match by {
         Some(b) => Ok(b),
-        None if agent => Err(CliError::new(
-            EXIT_USAGE,
+        None if agent => Err(CliError::input(
             "укажите --by human — ответ человека, --by agent — решение агента",
         )),
         None => Ok("human"),
@@ -346,7 +342,7 @@ mod tests {
         assert_eq!(resolve_by(Some("agent"), true).unwrap(), "agent");
         assert_eq!(resolve_by(Some("human"), true).unwrap(), "human");
         let e = resolve_by(None, true).unwrap_err();
-        assert_eq!(e.code, EXIT_USAGE);
+        assert_eq!(e.code, crate::client::EXIT_INPUT);
         assert!(
             e.msg.contains("--by human") && e.msg.contains("--by agent"),
             "{}",

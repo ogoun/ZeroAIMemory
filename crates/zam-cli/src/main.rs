@@ -1157,7 +1157,7 @@ fn question(c: QuestionCmd) -> Result<(), CliError> {
             channel,
             common,
         } => {
-            // без `--by` у агента — код 2 до подключения к серверу
+            // без `--by` у агента — код 6 до подключения к серверу
             let by = q::answer_by(by.as_deref())?;
             q::answer(
                 &cmd::connect(&common)?,
