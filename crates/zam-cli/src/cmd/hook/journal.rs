@@ -31,7 +31,6 @@ pub const LOCK_TTL: Duration = Duration::from_secs(10);
 /// После неудачного усечения следующая попытка — не раньше.
 pub const TRIM_RETRY: Duration = Duration::from_secs(60);
 /// Предел чтения журнала, байт (файл не должен быть больше; лишнее с головы не читается).
-#[allow(dead_code)]
 const READ_MAX: u64 = 2 * FILE_MAX;
 
 /// Момент события: миллисекунды Unix.
@@ -261,9 +260,8 @@ fn lock_options() -> std::fs::OpenOptions {
     o
 }
 
-/// События журнала по порядку записи; битые строки пропускаются. Читатели — восстановление
-/// и «ошибка → исправление» (задача 9 этапа).
-#[allow(dead_code)]
+/// События журнала по порядку записи; битые строки пропускаются. Читатели — сводка
+/// восстановления ([`summarize`]), пары «ошибка → исправление» ([`fixes`]) и петли повторов.
 pub fn read(root: &Path, session: &str) -> Vec<(Timestamp, Ev)> {
     let p = path(root, session);
     let Ok(meta) = std::fs::metadata(&p) else {
@@ -278,6 +276,181 @@ pub fn read(root: &Path, session: &str) -> Vec<(Timestamp, Ev)> {
         .filter_map(|l| serde_json::from_slice::<Line>(l).ok())
         .map(|l| (l.ts, l.ev))
         .collect()
+}
+
+/// Файлов в сводке журнала.
+pub const SUMMARY_FILES_MAX: usize = 10;
+/// Предел текста сводки журнала, символов (§9.2).
+pub const SUMMARY_MAX_CHARS: usize = 1500;
+/// Файлов в паре «ошибка → исправление».
+pub const FIX_FILES_MAX: usize = 5;
+/// Пар в сводке журнала (последние).
+const SUMMARY_FIXES_MAX: usize = 3;
+/// Предел текста ошибки в строках сводки и напоминания, символов.
+const FIX_ERROR_CHARS: usize = 120;
+
+/// Пара «ошибка → исправление» (§9.3): ошибка команды и файлы, правленые до успеха той же
+/// команды.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fix {
+    /// Нормализованный текст ошибки (или её отпечаток, если текста в журнале нет).
+    pub error: String,
+    /// Правленые файлы (до [`FIX_FILES_MAX`], по порядку первой правки).
+    pub files: Vec<String>,
+}
+
+/// Сводка журнала сессии для пакета восстановления (§9.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// Правленые файлы, до [`SUMMARY_FILES_MAX`], по порядку первой правки.
+    pub edited: Vec<String>,
+    /// Ошибок инструментов (`Ev::Error`).
+    pub errors: u32,
+    /// Текст последней ошибки.
+    pub last_error: Option<String>,
+    /// Пары «ошибка → исправление».
+    pub fixes: Vec<Fix>,
+    /// Типы субагентов без повторов.
+    pub subagents: Vec<String>,
+    /// Записей в память (`Ev::MemoryWrite`).
+    pub memory_writes: u32,
+}
+
+/// Сводка событий журнала (весь журнал сессии — до сжатия).
+pub fn summarize(events: &[(Timestamp, Ev)]) -> Summary {
+    let mut s = Summary {
+        fixes: fixes(events),
+        ..Summary::default()
+    };
+    for (_, e) in events {
+        match e {
+            Ev::Edit { path } => {
+                if s.edited.len() < SUMMARY_FILES_MAX && !s.edited.contains(path) {
+                    s.edited.push(path.clone());
+                }
+            }
+            Ev::Error { text, err_fp, .. } => {
+                s.errors += 1;
+                s.last_error = Some(if text.is_empty() {
+                    err_fp.clone()
+                } else {
+                    text.clone()
+                });
+            }
+            Ev::Subagent { agent_type, .. } => {
+                if !agent_type.is_empty() && !s.subagents.contains(agent_type) {
+                    s.subagents.push(agent_type.clone());
+                }
+            }
+            Ev::MemoryWrite { .. } => s.memory_writes += 1,
+            _ => {}
+        }
+    }
+    s
+}
+
+/// Пары «ошибка → исправление» (§9.3) с моментом успеха, закрывшего пару.
+pub fn fixes_at(events: &[(Timestamp, Ev)]) -> Vec<(Timestamp, Fix)> {
+    // открытые ошибки по `exe`: (ошибка, правленые после неё файлы)
+    let mut open: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut texts: Vec<(&str, &str)> = Vec::new();
+    let mut out = Vec::new();
+    for (ts, e) in events {
+        match e {
+            Ev::Error { err_fp, text, .. } => texts.push((err_fp.as_str(), text.as_str())),
+            Ev::Cmd {
+                exe,
+                ok: false,
+                err_fp,
+            } => {
+                let fp = err_fp.clone().unwrap_or_default();
+                let error = texts
+                    .iter()
+                    .rev()
+                    .find(|(f, t)| *f == fp && !t.is_empty())
+                    .map_or(fp.clone(), |(_, t)| t.to_string());
+                // повтор той же команды с ошибкой — последняя ошибка, правки копятся дальше
+                match open.iter_mut().find(|(x, _, _)| x == exe) {
+                    Some(o) => o.1 = error,
+                    None => open.push((exe.clone(), error, Vec::new())),
+                }
+            }
+            Ev::Edit { path } => {
+                for (_, _, files) in &mut open {
+                    if files.len() < FIX_FILES_MAX && !files.contains(path) {
+                        files.push(path.clone());
+                    }
+                }
+            }
+            Ev::Cmd { exe, ok: true, .. } => {
+                if let Some(i) = open.iter().position(|(x, _, _)| x == exe) {
+                    let (_, error, files) = open.remove(i);
+                    // успех без правок — не исправление (ошибка была временной)
+                    if !files.is_empty() && !error.is_empty() {
+                        out.push((*ts, Fix { error, files }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Пары «ошибка → исправление» (§9.3): `Cmd {ok: false, err_fp}` → правки (`Edit`) → `Cmd`
+/// того же `exe` с `ok: true`. Успех без правок пару не даёт.
+pub fn fixes(events: &[(Timestamp, Ev)]) -> Vec<Fix> {
+    fixes_at(events).into_iter().map(|(_, f)| f).collect()
+}
+
+/// Ошибка пары для строк сводки и напоминания: до [`FIX_ERROR_CHARS`] символов.
+pub fn fix_error(f: &Fix) -> String {
+    clip(&f.error, FIX_ERROR_CHARS)
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// Текст сводки (§9.2), не длиннее [`SUMMARY_MAX_CHARS`] символов: «До сжатия в этой сессии:
+/// правились …; ошибки: N (последняя: …); исправлены: …; субагенты: …; записей в память: N».
+/// Пустые части опускаются; в журнале нет ничего из перечисленного — пусто.
+pub fn render_summary(s: &Summary) -> String {
+    if s.edited.is_empty() && s.errors == 0 && s.subagents.is_empty() && s.memory_writes == 0 {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !s.edited.is_empty() {
+        parts.push(format!("правились {}", s.edited.join(", ")));
+    }
+    if s.errors > 0 {
+        let mut p = format!("ошибки: {}", s.errors);
+        if let Some(e) = &s.last_error {
+            p.push_str(&format!(" (последняя: {})", clip(e, FIX_ERROR_CHARS)));
+        }
+        parts.push(p);
+    }
+    if !s.fixes.is_empty() {
+        let skip = s.fixes.len().saturating_sub(SUMMARY_FIXES_MAX);
+        let pairs: Vec<String> = s.fixes[skip..]
+            .iter()
+            .map(|f| format!("{} → {}", fix_error(f), f.files.join(", ")))
+            .collect();
+        parts.push(format!("исправлены: {}", pairs.join("; ")));
+    }
+    if !s.subagents.is_empty() {
+        parts.push(format!("субагенты: {}", s.subagents.join(", ")));
+    }
+    parts.push(format!("записей в память: {}", s.memory_writes));
+    let text = format!(
+        "ZeroAIMemory: До сжатия в этой сессии: {}",
+        parts.join("; ")
+    );
+    clip(&text, SUMMARY_MAX_CHARS)
 }
 
 /// Отпечаток нормализованной ошибки: первые 16 hex blake3.
@@ -768,6 +941,148 @@ mod tests {
             mask_secrets("MY_SECRET_TOKEN=x1"),
             "MY_SECRET_TOKEN=‹secret›"
         );
+    }
+
+    fn evs(list: Vec<Ev>) -> Vec<(Timestamp, Ev)> {
+        list.into_iter()
+            .enumerate()
+            .map(|(i, e)| (Timestamp(i as u64 + 1), e))
+            .collect()
+    }
+
+    fn fail(exe: &str, fp: &str, text: &str) -> Vec<Ev> {
+        vec![
+            Ev::Error {
+                tool: "Bash".into(),
+                err_fp: fp.into(),
+                text: text.into(),
+            },
+            Ev::Cmd {
+                exe: exe.into(),
+                ok: false,
+                err_fp: Some(fp.into()),
+            },
+        ]
+    }
+
+    fn ok(exe: &str) -> Ev {
+        Ev::Cmd {
+            exe: exe.into(),
+            ok: true,
+            err_fp: None,
+        }
+    }
+
+    fn edit(p: &str) -> Ev {
+        Ev::Edit { path: p.into() }
+    }
+
+    #[test]
+    fn summarize_events() {
+        let mut l = vec![Ev::Prompt { len: 3 }];
+        for i in 0..12 {
+            l.push(edit(&format!("f{i}.rs")));
+        }
+        l.push(edit("f0.rs"));
+        l.extend(fail("cargo", "aa", "error E0425 first"));
+        l.push(edit("a.rs"));
+        l.push(ok("cargo"));
+        l.extend(fail("npm", "bb", "npm ERR last"));
+        for t in ["Explore", "Plan", "Explore"] {
+            l.push(Ev::Subagent {
+                agent_type: t.into(),
+                agent_id: "x".into(),
+            });
+        }
+        for k in ["insight", "changelog"] {
+            l.push(Ev::MemoryWrite { kind: k.into() });
+        }
+        let s = summarize(&evs(l));
+        assert_eq!(s.edited.len(), SUMMARY_FILES_MAX);
+        assert_eq!(s.edited[0], "f0.rs");
+        assert_eq!(s.errors, 2);
+        assert_eq!(s.last_error.as_deref(), Some("npm ERR last"));
+        assert_eq!(s.subagents, ["Explore", "Plan"]);
+        assert_eq!(s.memory_writes, 2);
+        // a.rs — 14-я правка: в список «правились» не входит, но в пару — да
+        assert_eq!(
+            s.fixes,
+            [Fix {
+                error: "error E0425 first".into(),
+                files: vec!["a.rs".into()]
+            }]
+        );
+        let t = render_summary(&s);
+        assert!(
+            t.starts_with("ZeroAIMemory: До сжатия в этой сессии: правились f0.rs, f1.rs"),
+            "{t}"
+        );
+        assert!(
+            t.contains("; ошибки: 2 (последняя: npm ERR last); исправлены: error E0425 first → a.rs; субагенты: Explore, Plan; записей в память: 2"),
+            "{t}"
+        );
+        assert!(t.chars().count() <= SUMMARY_MAX_CHARS);
+        // пустой журнал — без сводки; только записи — одна часть
+        assert_eq!(render_summary(&summarize(&[])), "");
+        let w = summarize(&evs(vec![Ev::MemoryWrite {
+            kind: "task".into(),
+        }]));
+        assert_eq!(
+            render_summary(&w),
+            "ZeroAIMemory: До сжатия в этой сессии: записей в память: 1"
+        );
+        // длинная сводка обрезается
+        let long = Summary {
+            edited: vec!["я".repeat(400); 10],
+            ..Summary::default()
+        };
+        let t = render_summary(&long);
+        assert!(t.chars().count() <= SUMMARY_MAX_CHARS);
+        assert!(t.chars().count() > SUMMARY_MAX_CHARS - 3 && t.ends_with('…'));
+    }
+
+    #[test]
+    fn fixes_pairs_detected() {
+        let mut l = fail("cargo", "aa", "error[E0425]: cannot find value");
+        l.extend([edit("a.rs"), edit("b.rs"), edit("a.rs"), ok("cargo")]);
+        let f = fixes(&evs(l.clone()));
+        assert_eq!(
+            f,
+            [Fix {
+                error: "error[E0425]: cannot find value".into(),
+                files: vec!["a.rs".into(), "b.rs".into()]
+            }]
+        );
+        let at = fixes_at(&evs(l));
+        assert_eq!(at[0].0, Timestamp(6), "момент — успех, закрывший пару");
+        // успех без правок — не пара; повтор ошибки — последняя ошибка
+        let mut l = fail("cargo", "aa", "first");
+        l.push(ok("cargo"));
+        l.extend(fail("cargo", "bb", "second"));
+        l.extend(fail("cargo", "cc", "third"));
+        l.extend([edit("c.rs"), ok("cargo")]);
+        let f = fixes(&evs(l));
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].error, "third");
+        assert_eq!(f[0].files, ["c.rs"]);
+    }
+
+    #[test]
+    fn fix_not_detected_other_exe() {
+        let mut l = fail("cargo", "aa", "error E0425");
+        l.extend([edit("a.rs"), ok("npm"), ok("git")]);
+        assert!(fixes(&evs(l.clone())).is_empty());
+        // ошибка инструмента без команды (Edit) пару не открывает
+        let l = vec![
+            Ev::Error {
+                tool: "Edit".into(),
+                err_fp: "dd".into(),
+                text: "old_string not found".into(),
+            },
+            edit("a.rs"),
+            ok("cargo"),
+        ];
+        assert!(fixes(&evs(l)).is_empty());
     }
 
     #[test]

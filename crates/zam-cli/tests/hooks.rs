@@ -1937,6 +1937,26 @@ fn changed_queue_dropped_on_permanent_4xx() {
     let pr = p.ev("UserPromptSubmit", "d2", json!({"prompt": "x"}));
     let _ = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
     assert_eq!(queue(&p, "d2").len(), 1, "429 — повтор позже");
+    // задача 9: 403, 404, 410 бывают временными (доступ не одобрен, старый сервер) — очередь
+    // остаётся; 400 и 413 — отбрасывается
+    for (code, keep) in [
+        (403, true),
+        (404, true),
+        (410, true),
+        (400, false),
+        (413, false),
+    ] {
+        let (url, _) = common::stub(
+            code,
+            Box::leak(format!(r#"{{"status":{code},"detail":"x"}}"#).into_boxed_str()),
+            Duration::ZERO,
+        );
+        let p = Proj::new(&format!("flush-{code}"), &url, "zam_x");
+        put_queue(&p, "d3", &[("src/a.rs".into(), 'a')]);
+        let pr = p.ev("UserPromptSubmit", "d3", json!({"prompt": "x"}));
+        let _ = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
+        assert_eq!(queue(&p, "d3").len(), usize::from(keep), "{code}");
+    }
 }
 
 /// M-8: отказ `apply_patch` (Codex, stderr) ставит пути патча в очередь — патч мог
@@ -1962,4 +1982,301 @@ fn failed_apply_patch_still_queues_paths() {
     assert_eq!(q[1]["hash"], "0".repeat(64));
     let ev = events(&p, "pf");
     assert_eq!(ev[0]["ev"], "error", "{ev:?}");
+}
+
+/// Ошибка Bash (`PostToolUseFailure`) командой `command` с текстом `error`.
+fn bash_fail(p: &Proj, session: &str, command: &str, error: &str) -> Value {
+    p.ev(
+        "PostToolUseFailure",
+        session,
+        json!({"tool_name": "Bash", "tool_input": {"command": command}, "error": error}),
+    )
+}
+
+/// Пара «ошибка → исправление» в журнале сессии: `cargo build` с ошибкой, правка `src/a.rs`,
+/// `cargo build` без ошибки (сеть хукам не нужна — `DEAD`).
+fn fix_pair(p: &Proj, session: &str) {
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/a.rs"), b"fn main() {}\n").unwrap();
+    let steps = [
+        bash_fail(
+            p,
+            session,
+            "cargo build",
+            "error[E0425]: cannot find value `x` in this scope",
+        ),
+        post_ok(
+            p,
+            session,
+            "Edit",
+            json!({"file_path": p.repo.join("src/a.rs")}),
+        ),
+        post_ok(p, session, "Bash", json!({"command": "cargo build"})),
+    ];
+    for s in steps {
+        let _ = p.hook_at(DEAD, "post-tool", "claude", s.to_string().as_bytes());
+    }
+}
+
+/// §9.2: `session-start` после `compact` (и `resume`) дописывает сводку журнала после текста
+/// сервера; `startup` — без сводки; сервер недоступен — только сводка; журнала нет — только
+/// сервер. Ключ `recovery` выключен в клиенте — без сводки.
+#[test]
+fn session_start_compact_appends_summary() {
+    let _g = serial();
+    let (url, tok) = start("compact-summary");
+    let p = Proj::new("compact-summary", &url, &tok);
+    p.insight("Пул соединений течёт", "gotcha", "global", &[]);
+    let ss = |s: &str, src: &str| p.ev("SessionStart", s, json!({"source": src}));
+    let _ = p.hook("session-start", &ss("cs", "startup"));
+    fix_pair(&p, "cs");
+    let c = context(
+        &p.hook("session-start", &ss("cs", "compact")),
+        "SessionStart",
+    );
+    let at = c
+        .find("ZeroAIMemory: До сжатия в этой сессии: правились src/a.rs; ошибки: 1 (последняя: ")
+        .unwrap_or_else(|| panic!("нет сводки: {c}"));
+    assert!(
+        c[..at].contains("Пул соединений течёт"),
+        "сервер — первым: {c}"
+    );
+    assert!(
+        c[at..].contains("исправлены: ")
+            && c[at..].contains("cannot find value")
+            && c[at..].contains("→ src/a.rs; записей в память: 0"),
+        "{c}"
+    );
+    assert!(c.ends_with("записей в память: 0"), "{c}");
+    let c = context(
+        &p.hook("session-start", &ss("cs", "resume")),
+        "SessionStart",
+    );
+    assert!(c.contains("До сжатия в этой сессии"), "{c}");
+    let c = context(
+        &p.hook("session-start", &ss("cs", "startup")),
+        "SessionStart",
+    );
+    assert!(!c.contains("До сжатия"), "{c}");
+    // сервер недоступен — только сводка
+    let (o, _) = p.hook_at(
+        DEAD,
+        "session-start",
+        "claude",
+        ss("cs", "compact").to_string().as_bytes(),
+    );
+    let c = context(&o, "SessionStart");
+    assert!(
+        c.starts_with("ZeroAIMemory: До сжатия в этой сессии"),
+        "{c}"
+    );
+    // журнала нет — только сервер
+    let c = context(
+        &p.hook("session-start", &ss("cs-new", "compact")),
+        "SessionStart",
+    );
+    assert!(
+        c.contains("Пул соединений") && !c.contains("До сжатия"),
+        "{c}"
+    );
+    // `recovery` выключен в клиенте
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]\nrecovery = false\n",
+    )
+    .unwrap();
+    let c = context(
+        &p.hook("session-start", &ss("cs", "compact")),
+        "SessionStart",
+    );
+    assert!(!c.contains("До сжатия"), "{c}");
+}
+
+/// Задача 9 (замечание ревью задачи 8): очереди изменённых файлов уходят до `GET /file-refs` —
+/// индекс `file-refs.json` после `session-start` уже несёт устарелость по отправленным хэшам.
+#[test]
+fn session_start_flushes_before_file_refs() {
+    let _g = serial();
+    let (url, tok) = start("flush-order");
+    let p = Proj::new("flush-order", &url, &tok);
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), b"v1\n").unwrap();
+    let o = p.zam(
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "Пул течёт",
+            "--ref",
+            "src/pool.rs",
+        ],
+        "Разобрано.\n".as_bytes(),
+    );
+    ok(&o);
+    std::fs::write(p.repo.join("src/pool.rs"), b"v2\n").unwrap();
+    let edit = post_ok(
+        &p,
+        "fo",
+        "Edit",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    let _ = p.hook_at(DEAD, "post-tool", "claude", edit.to_string().as_bytes());
+    assert_eq!(queue(&p, "fo").len(), 1);
+    let ss = p.ev("SessionStart", "fo", json!({"source": "startup"}));
+    let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+    assert!(queue(&p, "fo").is_empty(), "{}", p.log());
+    let cache: Value =
+        serde_json::from_str(&std::fs::read_to_string(p.cache().join("file-refs.json")).unwrap())
+            .unwrap();
+    assert_eq!(cache["refs"][0]["items"][0]["state"], "stale", "{cache}");
+}
+
+/// §9.3: пара «ошибка → исправление» и правки — единственное напоминание `Stop` содержит
+/// «запиши gotcha/failure с error_regex: …», второго нет.
+#[test]
+fn checkpoint_reminds_fix_once() {
+    let _g = serial();
+    let (url, tok) = start("checkpoint-fix");
+    let p = Proj::new("checkpoint-fix", &url, &tok);
+    let _ = p.hook(
+        "session-start",
+        &p.ev("SessionStart", "fx", json!({"source": "startup"})),
+    );
+    fix_pair(&p, "fx");
+    let stop = p.ev("Stop", "fx", json!({"stop_hook_active": false}));
+    let v = hook_json(&p.hook("checkpoint", &stop));
+    assert_eq!(v["decision"], "block", "{v}");
+    let r = v["reason"].as_str().unwrap();
+    assert!(r.contains("zam log changelog"), "{r}");
+    let line = r
+        .lines()
+        .find(|l| l.starts_with("ZeroAIMemory: запиши gotcha/failure с error_regex: "))
+        .unwrap_or_else(|| panic!("нет строки пары: {r}"));
+    assert!(
+        line.contains("cannot find value") && line.contains("(правки: src/a.rs)"),
+        "{line}"
+    );
+    empty(&p.hook("checkpoint", &stop));
+}
+
+/// §9.3: после пары записан insight — CLI агента (`zam log insight`) или MCP `memory_log`
+/// (`post-tool`) — строки пары в напоминании нет.
+#[test]
+fn checkpoint_no_fix_reminder_after_insight_write() {
+    let _g = serial();
+    let (url, tok) = start("checkpoint-nofix");
+    let p = Proj::new("checkpoint-nofix", &url, &tok);
+    let stop = |s: &str| {
+        p.hook(
+            "checkpoint",
+            &p.ev("Stop", s, json!({"stop_hook_active": false})),
+        )
+    };
+    // CLI в сессии хуков (session.json): запись insight — в журнал и `memory_writes`
+    let _ = p.hook(
+        "session-start",
+        &p.ev("SessionStart", "nf-1", json!({"source": "startup"})),
+    );
+    fix_pair(&p, "nf-1");
+    let o = p
+        .cmd(&p.url)
+        .env("CLAUDECODE", "1")
+        .args([
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "E0425 после переименования",
+        ])
+        .write_stdin("Разбор.\n")
+        .output()
+        .unwrap();
+    ok(&o);
+    assert!(
+        events(&p, "nf-1")
+            .iter()
+            .any(|e| e["ev"] == "memory_write" && e["kind"] == "insight")
+    );
+    empty(&stop("nf-1"));
+    // MCP memory_log (успешный PostToolUse) — `memory_write` в журнал; сервер счётчик MCP здесь
+    // не видит, поэтому общее напоминание остаётся, а строки пары нет
+    let _ = p.hook(
+        "session-start",
+        &p.ev("SessionStart", "nf-2", json!({"source": "startup"})),
+    );
+    fix_pair(&p, "nf-2");
+    let failed = p.ev(
+        "PostToolUse",
+        "nf-2",
+        json!({"tool_name": "mcp__zeroaimemory__memory_log",
+               "tool_input": {"kind": "insight", "title": "x"},
+               "tool_response": {"isError": true}}),
+    );
+    let _ = p.hook_at(DEAD, "post-tool", "claude", failed.to_string().as_bytes());
+    assert!(!events(&p, "nf-2").iter().any(|e| e["ev"] == "memory_write"));
+    let mcp = post_ok(
+        &p,
+        "nf-2",
+        "mcp__zeroaimemory__memory_log",
+        json!({"kind": "insight", "title": "E0425"}),
+    );
+    empty(
+        &p.hook_at(DEAD, "post-tool", "claude", mcp.to_string().as_bytes())
+            .0,
+    );
+    assert!(
+        events(&p, "nf-2")
+            .iter()
+            .any(|e| e["ev"] == "memory_write" && e["kind"] == "insight")
+    );
+    let v = hook_json(&stop("nf-2"));
+    let r = v["reason"].as_str().unwrap_or_default();
+    assert!(!r.contains("error_regex"), "{v}");
+}
+
+/// §9.3: тот же отпечаток ошибки третий раз за сессию — строка о повторе, раз на отпечаток;
+/// другая ошибка считается отдельно; `post_tool` выключен — строка всё равно есть.
+#[test]
+fn post_tool_loop_third_time_hint() {
+    let _g = serial();
+    let p = Proj::new("loop", DEAD, "zam_x");
+    let run = |s: &str, err: &str| {
+        let ev = bash_fail(&p, s, "npm test", err);
+        let (o, _) = p.hook_at(DEAD, "post-tool", "claude", ev.to_string().as_bytes());
+        ok(&o)
+    };
+    const LOOP: &str = "ZeroAIMemory: эта ошибка повторяется";
+    // номер строки в тексте ошибки не меняет отпечаток
+    assert!(!run("lp", "Error: boom at a.js:10:5").contains(LOOP));
+    assert!(!run("lp", "Error: boom at a.js:11:2").contains(LOOP));
+    let third = run("lp", "Error: boom at a.js:12:1");
+    let v: Value = serde_json::from_str(third.trim()).unwrap();
+    let c = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        c.contains(
+            "ZeroAIMemory: эта ошибка повторяется 3-й раз в сессии — проверь память \
+             (memory_search) или запиши разбор"
+        ),
+        "{c}"
+    );
+    assert!(
+        !run("lp", "Error: boom at a.js:13:1").contains(LOOP),
+        "раз на отпечаток"
+    );
+    for _ in 0..2 {
+        assert!(!run("lp", "TypeError: other").contains(LOOP));
+    }
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]\npost_tool = false\n",
+    )
+    .unwrap();
+    assert!(run("lp", "TypeError: other").contains("повторяется 3-й раз"));
+    // другая сессия — счёт заново
+    assert!(!run("lp2", "Error: boom at a.js:1:1").contains(LOOP));
 }

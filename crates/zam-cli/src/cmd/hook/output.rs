@@ -75,10 +75,37 @@ fn size(s: &str, agent: Agent) -> usize {
 
 /// Текст в пределе агента: целые строки и пометка обрезки.
 pub fn limit(text: &str, agent: Agent) -> String {
-    let max = match agent {
+    limit_to(text, max_of(agent), agent)
+}
+
+/// Предел текста агента в его единицах.
+fn max_of(agent: Agent) -> usize {
+    match agent {
         Agent::Claude => CLAUDE_MAX_CHARS,
         Agent::Codex => CODEX_MAX_BYTES,
-    };
+    }
+}
+
+/// Текст `head`, пустая строка и `tail` в общем пределе агента: обрезается `head` (целые строки
+/// и пометка), `tail` остаётся целым (M4.5 §9.2: сводка журнала после текста сервера). Пустой
+/// `head` — только `tail`, пустой `tail` — как [`limit`].
+pub fn with_tail(head: &str, tail: &str, agent: Agent) -> String {
+    let (head, tail) = (head.trim_end(), tail.trim());
+    if tail.is_empty() {
+        return limit(head, agent);
+    }
+    if head.trim().is_empty() {
+        return limit(tail, agent);
+    }
+    let room = max_of(agent).saturating_sub(size(tail, agent) + 2);
+    if room <= size(CUT_MARK, agent) {
+        return limit(tail, agent);
+    }
+    format!("{}\n\n{tail}", limit_to(head, room, agent))
+}
+
+/// Текст в `max` единиц агента: целые строки и пометка обрезки.
+fn limit_to(text: &str, max: usize, agent: Agent) -> String {
     if size(text, agent) <= max {
         return text.to_string();
     }
@@ -136,5 +163,24 @@ mod tests {
         assert!(x.len() <= CODEX_MAX_BYTES);
         assert!(x.len() > CODEX_MAX_BYTES - line.len() * 2);
         assert_eq!(limit("коротко", Agent::Codex), "коротко");
+    }
+
+    #[test]
+    fn tail_survives_limit() {
+        let line = "ZeroAIMemory: строка подсказки — i:01J\n";
+        let long = line.repeat(1000);
+        let tail = "ZeroAIMemory: До сжатия в этой сессии: записей в память: 1";
+        for agent in [Agent::Claude, Agent::Codex] {
+            let t = with_tail(&long, tail, agent);
+            assert!(size(&t, agent) <= max_of(agent), "{agent:?}");
+            assert!(t.ends_with(&format!("{CUT_MARK}\n\n{tail}")), "{agent:?}");
+            assert_eq!(limit(&t, agent), t, "повторный предел ничего не режет");
+        }
+        assert_eq!(
+            with_tail("сервер", tail, Agent::Claude),
+            format!("сервер\n\n{tail}")
+        );
+        assert_eq!(with_tail("  ", tail, Agent::Claude), tail);
+        assert_eq!(with_tail("сервер\n", "", Agent::Claude), "сервер");
     }
 }

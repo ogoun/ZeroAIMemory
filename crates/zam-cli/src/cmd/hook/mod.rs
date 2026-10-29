@@ -121,8 +121,8 @@ impl Kind {
     }
 }
 
-/// Ключ настройки подсказок `hooks.<ключ>` (R5; M4.5 §9.6). `SubagentStart` и `Recovery`
-/// читают хуки задач 9 и 10 этапа.
+/// Ключ настройки подсказок `hooks.<ключ>` (R5; M4.5 §9.6). `SubagentStart` читает хук
+/// задачи 10 этапа.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flag {

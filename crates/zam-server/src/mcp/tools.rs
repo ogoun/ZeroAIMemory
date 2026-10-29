@@ -121,7 +121,8 @@ impl ToolName {
             ToolName::Recall => {
                 "Подсказки памяти к событию: session_start — дайджест (Rules, решение, gotcha, \
                  revisit, changelog), prompt — к запросу пользователя, post_tool — к ошибке \
-                 инструмента (error, tool). Повторы в сессии отсекаются."
+                 инструмента (error, tool), recovery — после сжатия контекста (задачи, ответы, \
+                 решения). Повторы в сессии отсекаются."
             }
             ToolName::Vault => {
                 "Vault: list — секреты без значений, get — значение по name (раскрытие пишется в \
@@ -295,7 +296,7 @@ impl ToolName {
             ),
             ToolName::Recall => (
                 json!({
-                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool"]},
+                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery"]},
                     "prompt": {"type": "string"},
                     "error": {"type": "string"},
                     "tool": {"type": "string"},

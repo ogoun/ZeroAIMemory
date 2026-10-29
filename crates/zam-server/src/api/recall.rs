@@ -75,10 +75,19 @@
 //! - `record: false` (по умолчанию `true`) — ответ без учёта: ни `session_seen`, ни `usage`,
 //!   `timings.record_ms: null` (хук `session-start` с выключенным в клиенте дайджестом берёт
 //!   только `hooks`; задача 10, fix round 2);
-//! - неизвестные поля тела игнорируются (клиент хуков может быть новее); `source` хука
-//!   (`startup | resume | clear | compact | fork`) пока только в журнал DEBUG;
-//! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool`
-//!   (иначе 400; `pre_tool` — только локально в хуке, §10.3).
+//! - **пакет восстановления** (M4.5 §9.2) — `event: recovery` (MCP, агенты без
+//!   `SessionStart compact`) или `session_start` с `source` `compact | resume`: бюджет по
+//!   умолчанию `recall.recovery_tokens` (2000), разделы по порядку — `### Задачи` (захваченные
+//!   сессией первыми), `### Ответы человека` **без** фильтра `session_seen` (контекст агента
+//!   потерян; показ всё равно отмечается), `### Решения` (действующие `decision` пространства
+//!   решения за [`RECOVERY_DECISIONS_DAYS`] дней, до 5, `reason: decision`), затем обычный
+//!   дайджест в остатке бюджета (уведомления, открытые вопросы, правила, словарь, …).
+//!   Ключ пользователя `hooks.recovery` выключен — обычный дайджест; `hooks.session_start`
+//!   выключен — тишина и для `recovery`. `hooks` в ответе — только у `session_start`;
+//! - неизвестные поля тела игнорируются (клиент хуков может быть новее); прочие `source` хука
+//!   (`startup | clear | fork`) — обычный дайджест, `source` пишется в журнал DEBUG;
+//! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
+//!   recovery` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
 //!
 //! Маршрут — служебный, рядом с `/search` и `/read`: `/recall` пишет только `usage` и
 //! `session_seen`, а не память, поэтому `memory_writes` не растёт (решение контроллера R12).
@@ -165,33 +174,48 @@ enum Event {
     SessionStart,
     Prompt,
     PostTool,
+    /// Пакет восстановления (M4.5 §9.2) для агентов без `SessionStart compact`.
+    Recovery,
 }
 
 impl Event {
-    /// Тип подсказки в настройках пользователя `hooks.<тип>` (R5).
+    /// Тип подсказки в настройках пользователя `hooks.<тип>` (R5). Пакет восстановления —
+    /// разновидность дайджеста: его гасит `session_start`, а ключ `recovery` лишь выбирает
+    /// пакет вместо обычного дайджеста.
     fn hook_kind(self) -> &'static str {
         match self {
-            Event::SessionStart => "session_start",
+            Event::SessionStart | Event::Recovery => "session_start",
             Event::Prompt => "prompt",
             Event::PostTool => "post_tool",
         }
     }
 
+    /// Источник показа в `usage`: у пакета восстановления — `session_start` (новое значение
+    /// `source` потребовало бы миграции).
     fn source(self) -> UsageSource {
         match self {
-            Event::SessionStart => UsageSource::SessionStart,
+            Event::SessionStart | Event::Recovery => UsageSource::SessionStart,
             Event::Prompt => UsageSource::Prompt,
             Event::PostTool => UsageSource::PostTool,
         }
     }
 }
 
+/// `source` хука `SessionStart`, после которого строится пакет восстановления.
+const RECOVERY_SOURCES: [&str; 2] = ["compact", "resume"];
+/// Давность решений (`decision`) в пакете восстановления, дней (§9.2).
+pub const RECOVERY_DECISIONS_DAYS: i64 = 7;
+/// Заголовок раздела решений пакета восстановления.
+const SECTION_DECISIONS: &str = "### Решения";
+/// `reason` подсказки-решения пакета восстановления.
+const REASON_DECISION: &str = "decision";
+
 /// Тело запроса. Неизвестные поля игнорируются: клиент хуков может быть новее сервера.
 #[derive(Deserialize)]
 pub struct RecallReq {
     event: Event,
-    /// Источник `SessionStart` хука (`startup | resume | clear | compact | fork`) — пока только
-    /// в журнал (DEBUG); задача 10 его передаёт.
+    /// Источник `SessionStart` хука (`startup | resume | clear | compact | fork`): `compact` и
+    /// `resume` — пакет восстановления (M4.5 §9.2), прочие — обычный дайджест.
     source: Option<String>,
     session_id: Option<String>,
     solution: Option<String>,
@@ -521,11 +545,13 @@ async fn question_cands(
 }
 
 /// Разделы дайджеста `session_start` (см. модуль); каждый — кандидаты по приоритету.
+/// `recovery` — пакет восстановления: после ответов — раздел решений ([`decision_cands`]).
 async fn digest(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
     req: &RecallReq,
+    recovery: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Digest, ApiError> {
@@ -577,6 +603,10 @@ async fn digest(
     // ответы человека и открытые вопросы — сразу после задач (M4.5 §4)
     let (answers, open_line) = question_cands(health, deadline, &insight_spaces).await?;
     sections.push((Some(SECTION_ANSWERS), answers));
+    if recovery {
+        let decisions = decision_cands(health, deadline, sol).await?;
+        sections.push((Some(SECTION_DECISIONS), decisions));
+    }
 
     // Rules — L1 каждой заметки
     let mut rules: Vec<Cand> = Vec::new();
@@ -736,6 +766,27 @@ async fn digest(
     sections.push((Some("### Последние изменения"), changes));
     let glossary = glossary_line(st, health, deadline).await;
     Ok((notices, sections, glossary, open_line))
+}
+
+/// Действующие решения (`decision`) пространства решения за [`RECOVERY_DECISIONS_DAYS`] дней,
+/// новые первыми (пакет восстановления, §9.2). Без решения в области — пусто.
+async fn decision_cands(
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+    sol: Option<(usize, Id)>,
+) -> Result<Vec<Cand>, ApiError> {
+    let since = zam_store::days_ago(jiff::Timestamp::now(), RECOVERY_DECISIONS_DAYS);
+    let spaces: Vec<(usize, Id)> = sol.into_iter().collect();
+    Ok(entries_of(health, deadline, &spaces, |s| EntryFilter {
+        statuses: vec![EntryStatus::Active],
+        data_kind: Some("decision".to_string()),
+        since: Some(since),
+        ..entry_filter(s, EntryKind::Insight)
+    })
+    .await?
+    .iter()
+    .map(|(i, e)| entry_cand(*i, e, REASON_DECISION, ""))
+    .collect())
 }
 
 /// Дайджест `session_start`: уведомления, разделы-кандидаты, строка словаря и строка открытых
@@ -1245,8 +1296,10 @@ pub async fn recall(
 ) -> Result<Json<Value>, ApiError> {
     let t0 = Instant::now();
     let req: RecallReq = json_body(body)?;
-    let budget = req.budget_tokens.unwrap_or(st.cfg.recall.digest_tokens);
-    if !(1..=BUDGET_MAX).contains(&budget) {
+    if req
+        .budget_tokens
+        .is_some_and(|b| !(1..=BUDGET_MAX).contains(&b))
+    {
         return Err(ApiError::BadRequest(format!(
             "budget_tokens: от 1 до {BUDGET_MAX}"
         )));
@@ -1295,6 +1348,20 @@ pub async fn recall(
     };
     // N4: тип выключен на сервере — пустой `text`, показ не учитывается (сессия касается)
     let enabled = hooks.enabled(req.event.hook_kind());
+    // пакет восстановления (§9.2): `event: recovery` или `session_start` после `compact` и
+    // `resume`; выключенный `recovery` — обычный дайджест
+    let recovery = hooks.enabled("recovery")
+        && (req.event == Event::Recovery
+            || (req.event == Event::SessionStart
+                && req
+                    .source
+                    .as_deref()
+                    .is_some_and(|s| RECOVERY_SOURCES.contains(&s.trim()))));
+    let budget = req.budget_tokens.unwrap_or(if recovery {
+        st.cfg.recall.recovery_tokens
+    } else {
+        st.cfg.recall.digest_tokens
+    });
     let mut sh = headers.clone();
     if req.solution.is_some() {
         // решение тела сильнее заголовка
@@ -1309,7 +1376,7 @@ pub async fn recall(
     let (targets, warnings) = resolve_targets(&st, &p, &sh, &scope).await?;
     let mut health = Health::new(&targets, warnings);
     if let Some(src) = req.source.as_deref() {
-        tracing::debug!(event = ?req.event, source = %src, "recall");
+        tracing::debug!(event = ?req.event, source = %src, recovery, "recall");
     }
     // сбор — до срока минус резерв на учёт показа; учёт — только до полного срока
     let timeout = st.cfg.recall.timeout_ms;
@@ -1324,8 +1391,9 @@ pub async fn recall(
         _ if !enabled => (Vec::new(), Vec::new(), true, None, None),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
-        Event::SessionStart => {
-            let (n, s, g, o) = digest(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
+        Event::SessionStart | Event::Recovery => {
+            let (n, s, g, o) =
+                digest(&st, &p, &sh, &req, recovery, &mut health, &mut deadline).await?;
             (n, s, true, g, o)
         }
         Event::Prompt => {
@@ -1346,9 +1414,12 @@ pub async fn recall(
         }
     };
     // без повторов: показанное сессии, повторы между разделами, исключённые цели; ответ на
-    // вопрос показывается сессии один раз и в повторяемом дайджесте
+    // вопрос показывается сессии один раз и в повторяемом дайджесте, а в пакете восстановления —
+    // снова (контекст потерян, §9.2)
     let all: Vec<&Cand> = sections.iter().flat_map(|(_, c)| c).collect();
-    let seen = if repeatable {
+    let seen = if recovery {
+        HashSet::new()
+    } else if repeatable {
         let once: Vec<&Cand> = all
             .iter()
             .copied()
@@ -1359,17 +1430,47 @@ pub async fn recall(
         shown(session.as_ref(), &targets, &all).await
     };
     let limit = match req.event {
-        Event::SessionStart => usize::MAX,
+        Event::SessionStart | Event::Recovery => usize::MAX,
         Event::Prompt => PROMPT_MAX,
         Event::PostTool => POST_TOOL_MAX,
     };
     let mut dup: HashSet<TargetRef> = HashSet::new();
-    let mut packed: Vec<Section> = vec![Section {
-        title: None,
-        blocks: notices,
-    }];
-    let mut picked: Vec<Vec<&Cand>> = vec![Vec::new()];
+    let mut packed: Vec<Section> = Vec::new();
+    // у строк, что не подсказки записей (уведомления, словарь, открытые вопросы), в `picked` —
+    // пустой список: ни `session_seen`, ни `usage`
+    let mut picked: Vec<Vec<&Cand>> = Vec::new();
+    // уведомления — первыми в дайджесте; в пакете восстановления — после задач, ответов и
+    // решений, вместе с обычным дайджестом (§9.2)
+    let mut notices = Some(notices);
+    let mut open_line = open_line;
+    if !recovery {
+        packed.push(Section {
+            title: None,
+            blocks: notices.take().unwrap_or_default(),
+        });
+        picked.push(Vec::new());
+    }
     for (title, cands) in &sections {
+        if recovery
+            && notices.is_some()
+            && !matches!(
+                *title,
+                Some("### Задачи" | SECTION_ANSWERS | SECTION_DECISIONS)
+            )
+        {
+            packed.push(Section {
+                title: None,
+                blocks: notices.take().unwrap_or_default(),
+            });
+            picked.push(Vec::new());
+            if let Some(line) = open_line.take() {
+                packed.push(Section {
+                    title: Some(SECTION_OPEN_QUESTIONS.to_string()),
+                    blocks: vec![line],
+                });
+                picked.push(Vec::new());
+            }
+        }
         let per = match title {
             Some("### Правила") => RULES_MAX,
             Some("### Решение") => SOLUTION_ROOT_MAX,
@@ -1391,16 +1492,16 @@ pub async fn recall(
         picked.push(chosen);
         // открытые вопросы — сразу после ответов; как и строка словаря, не подсказка записи
         if *title == Some(SECTION_ANSWERS)
-            && let Some(line) = &open_line
+            && !recovery
+            && let Some(line) = open_line.take()
         {
             packed.push(Section {
                 title: Some(SECTION_OPEN_QUESTIONS.to_string()),
-                blocks: vec![line.clone()],
+                blocks: vec![line],
             });
             picked.push(Vec::new());
         }
-        // строка словаря — сразу после правил; в `picked` у неё пустой список (не подсказка
-        // записи: ни `session_seen`, ни `usage`)
+        // строка словаря — сразу после правил
         if *title == Some("### Правила")
             && let Some(line) = &glossary
         {
@@ -1414,7 +1515,6 @@ pub async fn recall(
     let (text, taken) = pack_sections(&packed, budget, &count_tokens);
     let shown_now: Vec<&Cand> = taken
         .iter()
-        .filter(|(si, _)| *si > 0)
         .filter_map(|&(si, bi)| picked[si].get(bi).copied())
         .collect();
     let collect_ms = ms(t0);

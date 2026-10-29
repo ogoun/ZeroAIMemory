@@ -7,7 +7,9 @@
 //! для записей, которых нет в его `items`; сервер недоступен — остаются локальные. Повторы не
 //! гасятся: подсказка об ошибке выдаётся при каждой ошибке (§10.3). Подсказки — по ключу
 //! `post_tool`; в журнал сессии (ключ `session_journal`) — `Ev::Error` и, если известна
-//! команда, `Ev::Cmd {ok: false, err_fp}`.
+//! команда, `Ev::Cmd {ok: false, err_fp}`. Петля (§9.3, ключ `session_journal`, и при
+//! выключенном `post_tool`): тот же `err_fp` в журнале [`LOOP_AT`]-й раз — строка «эта ошибка
+//! повторяется N-й раз в сессии…», раз на отпечаток ([`repeat_hint`]).
 //!
 //! **Успех** (M4.5 §6.3, §9.1; `PostToolUse` без ошибки; без сети, бюджет 50 мс):
 //! - `Read` — `Ev::Read` и знание о файле по `file-refs.json` ([`file_context_lines`], ключ
@@ -17,7 +19,9 @@
 //!   `{path, hash}` в очередь `changed-<сессия>.jsonl` (при решении; файл больше
 //!   [`HASH_MAX`] не хэшируется — его поймает `zam refs check`, удалённый — хэш
 //!   [`MISSING_HASH`]);
-//! - `Bash` — `Ev::Cmd {exe, ok: true}` (первое слово команды).
+//! - `Bash` — `Ev::Cmd {exe, ok: true}` (первое слово команды);
+//! - MCP [`MCP_MEMORY_LOG`] — `Ev::MemoryWrite {kind}` из `tool_input.kind` (§9.3: запись
+//!   insight через MCP гасит напоминание о паре «ошибка → исправление»).
 //!
 //! Путь — относительно корня проекта по правилам ссылок ([`crate::cmd::refs::ref_path`]);
 //! файл вне корня в журнал и очередь не попадает.
@@ -106,6 +110,7 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
     {
         record_edits(env, s, inp, t, id, false);
     }
+    let mut loop_line = None;
     if let Some(session) = inp.session_id.as_deref()
         && s.flag_on(Flag::SessionJournal)
     {
@@ -120,6 +125,7 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
                 text: journal::error_text(&norm),
             },
         );
+        loop_line = repeat_hint(env, session, &fp);
         if tool != Some("apply_patch")
             && let Some(exe) = command_of(inp).as_deref().and_then(journal::exe_of)
         {
@@ -135,7 +141,7 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
         }
     }
     if !s.on(Kind::PostTool) {
-        return Output::Empty;
+        return Output::context(&inp.event, loop_line.as_deref().unwrap_or_default());
     }
     let server = env.server_url();
     let cached = cache::usable_triggers(env, server.as_deref());
@@ -184,7 +190,60 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
             lines.push(t.hint(LEAD));
         }
     }
+    lines.extend(loop_line);
     Output::context(&inp.event, &lines.join("\n"))
+}
+
+/// Повтор ошибки, с которого `post-tool` советует остановиться (§9.3).
+pub const LOOP_AT: usize = 3;
+
+/// Петля (§9.3): ошибка с отпечатком `fp` в журнале сессии [`LOOP_AT`]-й раз и больше — строка
+/// «эта ошибка повторяется N-й раз…», раз на отпечаток (`shown`, ключ `loop:<fp>`).
+fn repeat_hint(env: &Env, session: &str, fp: &str) -> Option<String> {
+    let n = journal::read(&env.root, session)
+        .iter()
+        .filter(|(_, e)| matches!(e, Ev::Error { err_fp, .. } if err_fp == fp))
+        .count();
+    if n < LOOP_AT {
+        return None;
+    }
+    let key = format!("loop:{fp}");
+    let mut sh = cache::read_shown(env, session);
+    if sh.shown.contains(&key) {
+        return None;
+    }
+    sh.shown.push(key);
+    cache::write_shown(env, session, &sh);
+    Some(format!(
+        "ZeroAIMemory: эта ошибка повторяется {n}-й раз в сессии — проверь память \
+         (memory_search) или запиши разбор"
+    ))
+}
+
+/// Имя MCP-инструмента записи в память (Claude Code: `mcp__<сервер>__<инструмент>`).
+pub const MCP_MEMORY_LOG: &str = "mcp__zeroaimemory__memory_log";
+
+/// Успешный ответ MCP `memory_log` (§9.1): `Ev::MemoryWrite {kind}` из `tool_input.kind`
+/// (до 32 символов; нет — `entry`). Ответ с `isError: true` — не запись.
+fn mcp_memory_write(env: &Env, inp: &Input, session: &str) {
+    let failed = inp
+        .v
+        .get("tool_response")
+        .and_then(|r| r.get("isError"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if failed {
+        return;
+    }
+    let kind: String = inp
+        .tool_input("kind")
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .unwrap_or("entry")
+        .chars()
+        .take(32)
+        .collect();
+    journal::note(env, session, &Ev::MemoryWrite { kind });
 }
 
 /// Пути файлов инструмента: `file_path`/`notebook_path`, у `apply_patch` — заголовки патча.
@@ -247,6 +306,12 @@ fn success(env: &Env, inp: &Input, s: &Settings) -> Output {
                         err_fp: None,
                     },
                 );
+            }
+            Output::Empty
+        }
+        t if t.eq_ignore_ascii_case(MCP_MEMORY_LOG) => {
+            if let (Some(id), true) = (session, journal_on) {
+                mcp_memory_write(env, inp, id);
             }
             Output::Empty
         }

@@ -7,6 +7,10 @@
 //! Задачи журнала (M4.5 §3): `GET /sessions/{id}` несёт `claimed_tasks`; есть задача `in_progress`,
 //! захваченная сессией, и маркер правок — единственное напоминание содержит «обнови next_step
 //! задачи k:<id>» и приходит, даже если в память уже писали (сам захват — запись в память).
+//! Пары «ошибка → исправление» (M4.5 §9.3, ключ `session_journal`): в журнале сессии есть пара
+//! ([`journal::fixes_at`]), а после последней не было записи insight — то же напоминание
+//! содержит «запиши gotcha/failure с error_regex: <ошибка> (правки: <файлы>)» ([`fix_line`]) и
+//! приходит, даже если в память уже писали другое.
 //! `stop_hook_active == true` — ничего. Вывод — `{"decision": "block", "reason": …}`.
 //! На `PreCompact` — пусто (fix round 1, m-3: ⚠️ поддержку контекста на `PreCompact` у агентов
 //! проверить на машине владельца).
@@ -76,7 +80,13 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     std::thread::scope(|sc| {
         let flush = queued.then(|| sc.spawn(|| cache::flush_changed(env, &client, session)));
         let out = match remind {
-            Some((id, sh)) => reminder(env, &client, id, sh),
+            Some((id, sh)) => {
+                let fix = s
+                    .flag_on(Flag::SessionJournal)
+                    .then(|| fix_line(&journal::read(&env.root, id)))
+                    .flatten();
+                reminder(env, &client, id, sh, fix)
+            }
             None => Output::Empty,
         };
         if let Some(h) = flush
@@ -105,8 +115,34 @@ fn needs_reminder<'a>(env: &Env, inp: &'a Input, s: &Settings) -> Option<(&'a st
     (!sh.reminded).then_some((session, sh))
 }
 
-/// `GET /sessions/{id}` и решение о напоминании (R1, M4.5 §3).
-fn reminder(env: &Env, client: &Client, session: &str, mut sh: cache::Shown) -> Output {
+/// Строка о последней паре «ошибка → исправление» (§9.3), если после неё в сессии не было
+/// записи insight (`Ev::MemoryWrite {kind: insight}`); пусто — пар нет или уже записано.
+pub fn fix_line(events: &[(journal::Timestamp, Ev)]) -> Option<String> {
+    let last_write = events
+        .iter()
+        .filter(|(_, e)| matches!(e, Ev::MemoryWrite { kind } if kind == "insight"))
+        .map(|(t, _)| *t)
+        .max();
+    let (at, fix) = journal::fixes_at(events).pop()?;
+    if last_write.is_some_and(|w| w >= at) {
+        return None;
+    }
+    Some(format!(
+        "ZeroAIMemory: запиши gotcha/failure с error_regex: {} (правки: {}) — `zam log insight` \
+         (MCP: memory_log).",
+        journal::fix_error(&fix),
+        fix.files.join(", ")
+    ))
+}
+
+/// `GET /sessions/{id}` и решение о напоминании (R1, M4.5 §3, §9.3).
+fn reminder(
+    env: &Env,
+    client: &Client,
+    session: &str,
+    mut sh: cache::Shown,
+    fix: Option<String>,
+) -> Output {
     let (writes, tasks) = match client.get(&format!("/sessions/{}", encode_segment(session)), &[]) {
         Ok(r) => match read_json(r) {
             Ok(v) => (v["memory_writes"].as_i64(), task_line(&v)),
@@ -121,12 +157,16 @@ fn reminder(env: &Env, client: &Client, session: &str, mut sh: cache::Shown) -> 
             return Output::Empty;
         }
     };
-    let reason = match (writes == Some(0), tasks) {
-        (true, None) => REMINDER.to_string(),
-        (true, Some(t)) => format!("{REMINDER}\n{t}"),
-        (false, Some(t)) => t,
-        (false, None) => return Output::Empty,
-    };
+    let lines: Vec<String> = (writes == Some(0))
+        .then(|| REMINDER.to_string())
+        .into_iter()
+        .chain(tasks)
+        .chain(fix)
+        .collect();
+    if lines.is_empty() {
+        return Output::Empty;
+    }
+    let reason = lines.join("\n");
     sh.reminded = true;
     cache::write_shown(env, session, &sh);
     Output::Block { reason }

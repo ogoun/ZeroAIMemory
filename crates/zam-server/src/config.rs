@@ -697,6 +697,9 @@ impl CacheSection {
 pub struct RecallSection {
     /// Бюджет дайджеста старта сессии и подсказок по умолчанию, токенов (1..=20000, 1500).
     pub digest_tokens: usize,
+    /// Бюджет пакета восстановления после сжатия контекста и `resume`, токенов (1..=20000,
+    /// 2000; M4.5 §9.2): `/recall` `event: recovery` или `session_start` после `compact|resume`.
+    pub recovery_tokens: usize,
     /// Наименьший балл поиска подсказки к запросу пользователя (0..=1, 0,6).
     pub prompt_min_score: f64,
     /// Бюджет сервера на сбор подсказок, мс (1..=60000, 200): по превышении отдаётся собранное
@@ -713,6 +716,9 @@ impl RecallSection {
         };
         if !(1..=20_000).contains(&self.digest_tokens) {
             return Err(bad("digest_tokens", "от 1 до 20000"));
+        }
+        if !(1..=20_000).contains(&self.recovery_tokens) {
+            return Err(bad("recovery_tokens", "от 1 до 20000"));
         }
         if !(self.prompt_min_score.is_finite() && (0.0..=1.0).contains(&self.prompt_min_score)) {
             return Err(bad("prompt_min_score", "должно быть в 0..=1"));
@@ -842,6 +848,7 @@ impl Default for ServerConfig {
             },
             recall: RecallSection {
                 digest_tokens: 1500,
+                recovery_tokens: 2000,
                 prompt_min_score: 0.6,
                 timeout_ms: 200,
             },
@@ -1834,6 +1841,8 @@ master_key = \"x\"
     fn recall_section_bounds() {
         for (k, v) in [
             ("ZAM_RECALL__DIGEST_TOKENS", "0"),
+            ("ZAM_RECALL__RECOVERY_TOKENS", "0"),
+            ("ZAM_RECALL__RECOVERY_TOKENS", "20001"),
             ("ZAM_RECALL__PROMPT_MIN_SCORE", "1.5"),
             ("ZAM_RECALL__TIMEOUT_MS", "0"),
         ] {
@@ -1850,6 +1859,7 @@ master_key = \"x\"
         .unwrap();
         assert_eq!(c.recall.prompt_min_score, 0.5);
         assert_eq!(c.recall.digest_tokens, 1500);
+        assert_eq!(c.recall.recovery_tokens, 2000);
     }
 
     #[test]
