@@ -51,9 +51,45 @@ pub(crate) fn ts_opt(r: &Row, i: usize) -> rusqlite::Result<Option<Timestamp>> {
         .transpose()
 }
 
+/// Момент `verified_at:` заметки (M4.5 §7): дата `YYYY-MM-DD` — полночь UTC, полная метка
+/// RFC 3339 — как есть; иное — `None` (поле во frontmatter свободное).
+pub fn parse_verified_at(s: &str) -> Option<Timestamp> {
+    let s = s.trim();
+    if let Ok(t) = s.parse::<Timestamp>() {
+        return Some(t);
+    }
+    let d: jiff::civil::Date = s.parse().ok()?;
+    d.to_zoned(jiff::tz::TimeZone::UTC)
+        .ok()
+        .map(|z| z.timestamp())
+}
+
+/// Возраст записи в днях (M4.5 §7): `floor((now − max(updated_at, verified_at)) / 86400)`;
+/// будущее время — 0.
+pub fn age_days(now: Timestamp, updated_at: Timestamp, verified_at: Option<&str>) -> u32 {
+    let base = verified_at
+        .and_then(parse_verified_at)
+        .map_or(updated_at, |v| v.max(updated_at));
+    let secs = now.as_second() - base.as_second();
+    u32::try_from(secs.max(0) / 86_400).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn age_days_from_updated_or_verified() {
+        let now: Timestamp = "2026-10-29T12:00:00Z".parse().unwrap();
+        let upd: Timestamp = "2026-10-19T13:00:00Z".parse().unwrap();
+        assert_eq!(age_days(now, upd, None), 9);
+        assert_eq!(age_days(now, upd, Some("2026-10-27")), 2);
+        // проверка раньше правки — от правки
+        assert_eq!(age_days(now, upd, Some("2026-01-01")), 9);
+        assert_eq!(age_days(now, upd, Some("2026-10-29T11:00:00Z")), 0);
+        assert_eq!(age_days(now, upd, Some("мусор")), 9);
+        assert_eq!(age_days(upd, now, None), 0);
+    }
 
     #[test]
     fn fixed_width_and_roundtrip() {

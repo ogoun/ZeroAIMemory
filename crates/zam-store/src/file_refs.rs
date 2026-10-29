@@ -741,6 +741,41 @@ pub async fn refs_to_path(
     .await
 }
 
+/// Заметка с `verified_at:` (проверенная команда, M4.5 §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedNote {
+    pub id: Id,
+    pub path: String,
+    pub verified_at: String,
+}
+
+/// Живые заметки пространства `space_id` с `verified_at`, новые проверки первыми (затем —
+/// свежие правки); не больше `limit`.
+pub async fn verified_notes(
+    db: &Db,
+    space_id: Id,
+    limit: usize,
+) -> Result<Vec<VerifiedNote>, StoreError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT id, path, verified_at FROM nodes
+             WHERE space_id = ?1 AND kind = 'note' AND deleted_at IS NULL
+               AND verified_at IS NOT NULL AND trim(verified_at) <> ''
+             ORDER BY verified_at DESC, updated_at DESC, id LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![space_id, limit], |r| {
+            Ok(VerifiedNote {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                verified_at: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
 /// Пути ссылок `stale` у владельцев `owners` (по алфавиту); владельцы без них в ответ не входят.
 pub async fn stale_refs_of(
     db: &Db,

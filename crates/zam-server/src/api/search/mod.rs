@@ -137,7 +137,8 @@
 //! решения (своего или чужого), `path`, `heading_path`,
 //! `level`, `rev`, `chunk_ids`, `score` 0..1, `sources` — каналы `vector`/`fts`/`trigram`,
 //! `tokens` — размер отданного текста в `chunks` (после `expand` и усечения), иначе
-//! полного текста чанка, `updated_at`, `kind` (`note` или вид записи), `snippet` | `l0`,
+//! полного текста чанка, `updated_at`, `age_days` (M4.5 §7: целые сутки от `updated_at`, у
+//! заметки с `verified_at` — от более позднего), `kind` (`note` или вид записи), `snippet` | `l0`,
 //! `text`, `rerank_score` 0..1 — сырой балл реранкера у переставленных им (их `score` — он
 //! же с бустами), `via {type, from}` — у соседей
 //! `expand=graph`), `degraded`, `degraded_reason`
@@ -159,10 +160,11 @@
 //! `expand` и L0 к записям не применяются.
 //!
 //! **Формат `md`** — карточки §9.3, по одной на элемент:
-//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N>[ · <certainty>] · <дата> · ~<N> tok`;
-//! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> · ~<N>
-//! tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются; у соседа
-//! `expand=graph` — ` · via <тип> ← <родитель>`),
+//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N>[ · <certainty>] · <дата> ·
+//! <возраст> · ~<N> tok` (возраст — `N дн. назад` или `сегодня`, его же получает MCP);
+//! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> ·
+//! <возраст> · ~<N> tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются; у
+//! соседа `expand=graph` — ` · via <тип> ← <родитель>`),
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
 //! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
 //! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
@@ -189,6 +191,7 @@ use axum::extract::rejection::BytesRejection;
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::join_all;
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
@@ -1330,7 +1333,7 @@ fn folder_json(p: &Packed, children: i64, mode: SearchMode, spaces: &HashMap<Id,
     Value::Object(o)
 }
 
-fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value {
+fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Timestamp) -> Value {
     if let Some(children) = p.item.folder {
         return folder_json(p, children, mode, spaces);
     }
@@ -1361,6 +1364,7 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
     o.insert("sources".into(), json!(p.item.sources));
     o.insert("tokens".into(), json!(p.tokens));
     o.insert("updated_at".into(), json!(fmt_ts(h.updated_at)));
+    o.insert("age_days".into(), json!(hit_age(h, now)));
     match &h.entry {
         Some(e) => {
             o.insert("kind".into(), json!(e.kind));
@@ -1392,6 +1396,21 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> Value
     Value::Object(o)
 }
 
+/// Возраст элемента в днях (M4.5 §7): от `updated_at`, у заметки с `verified_at` — от более
+/// позднего из двух.
+fn hit_age(h: &FtsHit, now: Timestamp) -> u32 {
+    zam_store::time::age_days(now, h.updated_at, h.verified_at.as_deref())
+}
+
+/// Возраст в Markdown (M4.5 §7): `сегодня` или `N дн. назад`.
+pub(crate) fn age_text(days: u32) -> String {
+    if days == 0 {
+        "сегодня".into()
+    } else {
+        format!("{days} дн. назад")
+    }
+}
+
 /// Пометка Markdown об устаревших ссылках (M4.5 §6.2):
 /// `возможно устарело: изменился <путь>[, <путь>…]`; пусто — `None`.
 pub(crate) fn stale_line(paths: &[String]) -> Option<String> {
@@ -1419,8 +1438,8 @@ pub(crate) fn md_inline(s: &str) -> String {
 }
 
 /// Заголовок карточки записи журнала (§9.3):
-/// `i:<id> insight/<вид> «<заголовок>»  [0.77] active · hypothesis · ~120 tok`.
-fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> String {
+/// `i:<id> insight/<вид> «<заголовок>»  [0.77] active · hypothesis · 3 дн. назад · ~120 tok`.
+fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, age: u32, tokens: usize) -> String {
     let letter = EntryKind::parse(&e.kind).map_or("e", EntryKind::ref_letter);
     let mut line = format!("{letter}:{id} {}", e.kind);
     if let Some(k) = &e.insight_kind {
@@ -1433,15 +1452,23 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, tokens: usize) -> Str
         .flatten()
         .cloned()
         .collect();
+    parts.push(age_text(age));
     parts.push(format!("~{tokens} tok"));
     line.push_str(&format!("  [{score:.2}] {}\n", parts.join(" · ")));
     line
 }
 
-/// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · ~340 tok`
-/// (у записи журнала — [`entry_card`]).
-fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
+/// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · 3 дн. назад
+/// · ~340 tok` (у записи журнала — [`entry_card`]).
+fn item_md(
+    n: usize,
+    p: &Packed,
+    mode: SearchMode,
+    spaces: &HashMap<Id, Space>,
+    now: Timestamp,
+) -> String {
     let h = &p.item.hit;
+    let age = hit_age(h, now);
     // у переставленных реранкером `score` — его балл с бустами (§9.2 п. 5)
     let score = p.item.score.min(1.0);
     let mut line = match (&h.entry, p.item.folder) {
@@ -1453,7 +1480,7 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
                 h.target.id, h.path
             )
         }
-        (Some(e), None) => format!("{n}. {}", entry_card(e, h.target.id, score, p.tokens)),
+        (Some(e), None) => format!("{n}. {}", entry_card(e, h.target.id, score, age, p.tokens)),
         (None, None) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             let mut line = format!("{n}. {} {space}/{}", h.target, h.path);
@@ -1467,9 +1494,10 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
                 .map(|c| format!(" · {c}"))
                 .unwrap_or_default();
             line.push_str(&format!(
-                "  [{score:.2}] rev{}{certainty} · {} · ~{} tok\n",
+                "  [{score:.2}] rev{}{certainty} · {} · {} · ~{} tok\n",
                 h.rev,
                 h.updated_at.strftime("%Y-%m-%d"),
+                age_text(age),
                 p.tokens
             ));
             line
@@ -1661,6 +1689,7 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
             entry: None,
             area: None,
             certainty: None,
+            verified_at: None,
         },
         score,
         sources: vec![zam_search::Channel::Folder.as_str()],
@@ -2236,6 +2265,7 @@ pub async fn search(
         }
     }
     let degraded = available.err().or(vrun.failed);
+    let now = Timestamp::now();
     let by_id: HashMap<Id, Space> = targets
         .into_iter()
         .flat_map(|t| t.spaces)
@@ -2247,7 +2277,7 @@ pub async fn search(
             let items: Vec<Value> = cache_items
                 .iter()
                 .map(cache_step::item_json)
-                .chain(packed.iter().map(|p| item_json(p, mode, &by_id)))
+                .chain(packed.iter().map(|p| item_json(p, mode, &by_id, now)))
                 .collect();
             Json(json!({
                 "items": items,
@@ -2278,7 +2308,7 @@ pub async fn search(
                 packed
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| item_md(i + 1, p, mode, &by_id)),
+                    .map(|(i, p)| item_md(i + 1, p, mode, &by_id, now)),
             );
             if let Some(r) = degraded {
                 body.push_str(&format!(
@@ -2327,6 +2357,7 @@ mod tests {
             entry: None,
             area: None,
             certainty: None,
+            verified_at: None,
         }
     }
 
@@ -2884,9 +2915,10 @@ mod tests {
             text: None,
             tokens: 7,
         };
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
+        let now = "2026-10-13T09:00:00Z".parse().unwrap();
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
         let want = format!(
-            "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · ~7 tok\n   **s**\n",
+            "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · 3 дн. назад · ~7 tok\n   **s**\n",
             p.item.hit.target.id
         );
         assert_eq!(s, want);
@@ -2912,12 +2944,13 @@ mod tests {
             text: None,
             tokens: 120,
         };
-        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new());
+        let now = p.item.hit.updated_at;
+        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new(), now);
         assert_eq!(
             s,
             format!(
                 "2. i:{id} insight/gotcha «Bash-скрипты должны иметь LF»  [0.50] active · \
-                 hypothesis · ~120 tok\n   **s**\n"
+                 hypothesis · сегодня · ~120 tok\n   **s**\n"
             )
         );
         // changelog без статуса и certainty
@@ -2929,15 +2962,16 @@ mod tests {
             title: "Исправлен CRLF".into(),
         });
         p.tokens = 9;
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
         assert!(
             s.starts_with(&format!(
-                "1. c:{id} changelog/fix «Исправлен CRLF»  [0.50] ~9 tok\n"
+                "1. c:{id} changelog/fix «Исправлен CRLF»  [0.50] сегодня · ~9 tok\n"
             )),
             "{s}"
         );
-        let j = item_json(&p, SearchMode::Brief, &HashMap::new());
+        let j = item_json(&p, SearchMode::Brief, &HashMap::new(), now);
         assert_eq!(j["entry_id"], json!(id));
+        assert_eq!(j["age_days"], 0);
         assert!(j.get("node_id").is_none());
         assert_eq!(j["kind"], "changelog");
         assert_eq!(j["insight_kind"], "fix");

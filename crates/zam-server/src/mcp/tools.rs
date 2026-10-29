@@ -83,8 +83,8 @@ impl ToolName {
             }
             ToolName::Read => {
                 "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id> или путь <пространство>:/<путь>. \
-                 tier L0|L1|L2, section, max_tokens; if_rev равна текущей — unchanged без текста. \
-                 Ошибка по элементу — в самом элементе."
+                 tier L0|L1|L2, section, max_tokens; if_rev равна текущей — unchanged без текста; \
+                 since_rev — дифф изменений с ревизии. Ошибка по элементу — в самом элементе."
             }
             ToolName::CachePut => {
                 "Сохранить выжимку ответа на запрос (до 600 токенов) с источниками [{id, rev?, \
@@ -169,6 +169,8 @@ impl ToolName {
                             "section": {"type": "string", "description": "путь заголовков «A > B»"},
                             "max_tokens": {"type": "integer", "minimum": 1},
                             "if_rev": {"type": "integer"},
+                            "since_rev": {"type": "integer", "minimum": 1,
+                                          "description": "дифф с этой ревизии"},
                         },
                         "required": ["id"],
                     }},

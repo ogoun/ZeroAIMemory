@@ -169,7 +169,12 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     if dirty && let (Some(id), Some(sh)) = (session, shown.as_ref()) {
         cache::write_shown(env, id, sh);
     }
-    Output::context(&inp.event, &lines.join("\n"))
+    let text = lines.join("\n");
+    // выданное без сети — в очередь учёта, уйдёт со следующим сетевым хуком (M4.5 §9.5)
+    if let Some(id) = session {
+        cache::note_tokens(env, id, cache::TOKENS_PRE_TOOL, &text);
+    }
+    Output::context(&inp.event, &text)
 }
 
 /// `tool_input.command`: строка или массив аргументов (через пробел).

@@ -15,13 +15,17 @@
 //!   `post-tool`, отправляют `POST /files/changed` `prompt`, `session-start` и `checkpoint`
 //!   ([`flush_changed`]);
 //! - `events-<сессия>.jsonl` — журнал событий сессии ([`super::journal`]);
+//! - `tokens-<сессия>.jsonl` — выданное хуками с локальным выводом (M4.5 §9.5): строка
+//!   `{e, t}` (событие `pre_tool` | `post_tool_local` | `subagent_local`, оценка токенов) на
+//!   каждый непустой вывод `pre-tool` и успешного `post-tool`; уходит пачкой
+//!   `POST /sessions {id, tokens}` при следующем сетевом вызове хука ([`flush_tokens`]);
 //! - `spawn-<сессия>.json` — очередь запусков субагентов `[{at, agent_type, task}]` (M4.5
 //!   §9.4): пополняет `pre-tool` на `Agent`/`Task`, берёт `subagent-start` ([`take_spawn`]);
 //!   до [`SPAWN_MAX`] записей, каждая живёт [`SPAWN_TTL`]; правка — под замком `.spawn-….lock`;
 //!   просроченные записи снимает и `session-start` ([`prune_spawns`]), файл без изменений
 //!   дольше [`SPAWN_FILE_TTL`] удаляет [`gc_cache`];
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
-//!   `shown-*`/`edits-*`/`events-*`/`changed-*` старше [`SHOWN_TTL`] и временные `.*.tmp`
+//!   `shown-*`/`edits-*`/`events-*`/`changed-*`/`tokens-*` старше [`SHOWN_TTL`] и `.*.tmp`
 //!   старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
@@ -524,6 +528,111 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     }
 }
 
+/// Строка очереди `tokens-<сессия>.jsonl`: событие и оценка токенов одного вывода.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenLine {
+    pub e: String,
+    pub t: u64,
+}
+
+/// Событие учёта: вывод `pre-tool`.
+pub const TOKENS_PRE_TOOL: &str = "pre_tool";
+/// Событие учёта: вывод `post-tool` в режиме успеха (без сети).
+pub const TOKENS_POST_TOOL_LOCAL: &str = "post_tool_local";
+
+pub fn tokens_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("tokens-{}.jsonl", session_file_part(session)))
+}
+
+/// Оценка токенов текста без токенизатора — та же, что у сервера без модели
+/// (`zam_markdown::ApproxCounter`): ⌈символы / 3,5⌉.
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64 * 2).div_ceil(7)
+}
+
+/// Отмечает локальный вывод хука в очереди учёта (пустой текст — ничего): одна строка одним
+/// `write` с append, без замка (параллельные хуки строк не смешивают).
+pub fn note_tokens(env: &Env, session: &str, event: &str, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let line = TokenLine {
+        e: event.to_string(),
+        t: estimate_tokens(text.trim_end()),
+    };
+    let mut buf = serde_json::to_vec(&line).unwrap_or_default();
+    buf.push(b'\n');
+    let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| {
+        use std::io::Write;
+        append_options()
+            .open(tokens_path(env, session))?
+            .write_all(&buf)
+    });
+    if let Err(e) = r {
+        env.log(&format!("очередь учёта токенов: {e}"));
+    }
+}
+
+/// Очередь учёта токенов сессии есть.
+pub fn tokens_queued(env: &Env, session: Option<&str>) -> bool {
+    session.is_some_and(|id| tokens_path(env, id).is_file())
+}
+
+/// Отправка очереди учёта токенов сессии (M4.5 §9.5): файл забирается rename, строки
+/// складываются по событию в `{calls, tokens}` и уходят одним `POST /sessions {id, tokens}`.
+/// Успех — забранное удаляется; 400, 413, 422 — отбрасывается со строкой в `hooks.log`; прочее
+/// (сеть, 5xx, старый сервер) — возвращается в очередь. Остаток бюджета меньше
+/// [`FLUSH_MIN_LEFT`] — очередь ждёт следующего хука.
+pub fn flush_tokens(env: &Env, client: &Client, session: &str) {
+    if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+        return;
+    }
+    let q = tokens_path(env, session);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("tokens");
+    let t = q.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    if std::fs::rename(&q, &t).is_err() {
+        return;
+    }
+    let bytes = std::fs::read(&t).unwrap_or_default();
+    let mut sums: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for l in bytes.split(|b| *b == b'\n') {
+        if let Ok(x) = serde_json::from_slice::<TokenLine>(l) {
+            let s = sums.entry(x.e).or_default();
+            s.0 += 1;
+            s.1 = s.1.saturating_add(x.t);
+        }
+    }
+    if !sums.is_empty() {
+        let tokens: serde_json::Map<String, Value> = sums
+            .iter()
+            .map(|(e, (c, t))| (e.clone(), serde_json::json!({"calls": c, "tokens": t})))
+            .collect();
+        let body = serde_json::json!({"id": session, "tokens": tokens});
+        match client.post_json("/sessions", &body) {
+            Ok(_) => {}
+            Err(e) if permanent(&e) => {
+                env.log(&format!("sessions(tokens): очередь учёта отброшена: {e}"));
+            }
+            Err(e) => {
+                env.log(&format!("sessions(tokens): {e}"));
+                use std::io::Write;
+                if let Err(e) = append_options()
+                    .open(&q)
+                    .and_then(|mut f| f.write_all(&bytes))
+                {
+                    env.log(&format!("возврат очереди учёта токенов: {e}"));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&t);
+}
+
 /// Ответ, который повтор не исправит: 400, 413, 422 (задача 9: 403, 404 и 410 бывают временными
 /// — доступ к решению ещё не одобрен, сервер старше маршрута).
 fn permanent(e: &CliError) -> bool {
@@ -761,9 +870,9 @@ pub fn prune_spawns(env: &Env, session: &str) {
     }
 }
 
-/// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`)
-/// старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и временные `.*.tmp`
-/// и замки старше [`TMP_TTL`].
+/// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`,
+/// `tokens-*.jsonl`) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
+/// временные `.*.tmp` и замки старше [`TMP_TTL`].
 pub fn gc_cache(env: &Env) {
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
         return;
@@ -774,7 +883,8 @@ pub fn gc_cache(env: &Env) {
         let session_file = (n.starts_with("shown-") && n.ends_with(".json"))
             || n.starts_with("edits-")
             || (n.starts_with("events-") && n.ends_with(".jsonl"))
-            || (n.starts_with("changed-") && n.ends_with(".jsonl"));
+            || (n.starts_with("changed-") && n.ends_with(".jsonl"))
+            || (n.starts_with("tokens-") && n.ends_with(".jsonl"));
         let ttl = if session_file {
             SHOWN_TTL
         } else if n.starts_with("spawn-") && n.ends_with(".json") {

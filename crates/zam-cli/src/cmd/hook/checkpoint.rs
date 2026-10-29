@@ -70,8 +70,9 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     }
     let queued =
         env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
+    let tokens = cache::tokens_queued(env, session);
     let remind = needs_reminder(env, inp, s);
-    if remind.is_none() && !queued {
+    if remind.is_none() && !queued && !tokens {
         return Output::Empty;
     }
     let Some(client) = env.client() else {
@@ -79,6 +80,10 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     };
     std::thread::scope(|sc| {
         let flush = queued.then(|| sc.spawn(|| cache::flush_changed(env, &client, session)));
+        // очередь учёта локального вывода (M4.5 §9.5)
+        let flush_tokens = session
+            .filter(|_| tokens)
+            .map(|id| sc.spawn(|| cache::flush_tokens(env, &client, id)));
         let out = match remind {
             Some((id, sh)) => {
                 let fix = s
@@ -93,6 +98,11 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             && h.join().is_err()
         {
             env.log("files/changed: паника");
+        }
+        if let Some(h) = flush_tokens
+            && h.join().is_err()
+        {
+            env.log("sessions(tokens): паника");
         }
         out
     })

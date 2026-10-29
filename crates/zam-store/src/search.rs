@@ -217,6 +217,8 @@ pub struct FtsHit {
     pub area: Option<String>,
     /// `certainty` узла или записи (`nodes.certainty` / `entries.certainty`, §7.5).
     pub certainty: Option<String>,
+    /// `nodes.verified_at` заметки (M4.5 §7); у записи — `None`.
+    pub verified_at: Option<String>,
 }
 
 /// Поля записи журнала в хите поиска.
@@ -260,7 +262,8 @@ const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.spac
     coalesce(n.path, ''), c.heading_path, c.rev, coalesce(n.updated_at, e.updated_at), c.text,
     c.level, c.token_count, coalesce(n.index_state, e.index_state), e.kind, e.status,
     CASE WHEN json_type(e.data, '$.kind') = 'text' THEN json_extract(e.data, '$.kind') END,
-    e.certainty, e.title, coalesce(n.area, e.area), coalesce(n.certainty, e.certainty)";
+    e.certainty, e.title, coalesce(n.area, e.area), coalesce(n.certainty, e.certainty),
+    n.verified_at";
 
 /// Хит по колонкам [`HIT_COLS`], начиная с колонки `o`.
 fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
@@ -293,6 +296,7 @@ fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
         entry,
         area: r.get(o + 17)?,
         certainty: r.get(o + 18)?,
+        verified_at: r.get(o + 19)?,
     })
 }
 

@@ -499,3 +499,38 @@ fn read_batch_flags() {
     let o = e.run(&["read", "knowledge:b1", "--batch", "--rev", "1"]);
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
 }
+
+/// `zam read --since-rev N` (M4.5 §7): дифф с ревизии, `--json` — элемент сервера, равная
+/// текущей — `unchanged`, несколько целей — код 6.
+#[test]
+fn read_since_rev_cli() {
+    let e = Env::new("since-rev");
+    let v1: String = (0..20).map(|i| format!("Строка {i}.\n")).collect();
+    ok(&e.run_stdin(&["write", "knowledge:s1"], v1.as_bytes()));
+    let v2 = v1.replace("Строка 9.", "Строка девять.");
+    ok(&e.run_stdin(&["write", "knowledge:s1"], v2.as_bytes()));
+    let s = ok(&e.run(&["read", "knowledge:s1", "--since-rev", "1"]));
+    assert!(s.contains("rev2 · ~"), "{s}");
+    assert!(s.contains("(изменения с rev1, дифф)"), "{s}");
+    assert!(s.contains("-Строка 9.\n+Строка девять.\n"), "{s}");
+    assert!(!s.contains("Строка 2."), "{s}");
+    let v: serde_json::Value = serde_json::from_str(&ok(&e.run(&[
+        "read",
+        "knowledge:s1",
+        "--since-rev",
+        "1",
+        "--json",
+    ])))
+    .unwrap();
+    assert!(
+        v["items"][0]["diff"]
+            .as_str()
+            .unwrap()
+            .starts_with("--- rev 1\n"),
+        "{v}"
+    );
+    let s = ok(&e.run(&["read", "knowledge:s1", "--since-rev", "2"]));
+    assert!(s.contains("rev2 · unchanged"), "{s}");
+    let o = e.run(&["read", "knowledge:s1", "knowledge:s1", "--since-rev", "1"]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+}

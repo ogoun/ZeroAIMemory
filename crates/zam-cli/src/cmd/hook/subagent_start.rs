@@ -90,6 +90,13 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
         });
         let c = &client;
         let recall = sc.spawn(move || c.post_json("/recall", &body).and_then(read_json));
+        // очередь учёта локального вывода сессии родителя (M4.5 §9.5)
+        if cache::tokens_queued(env, Some(session)) {
+            let flushed = sc.spawn(|| cache::flush_tokens(env, &client, session));
+            if flushed.join().is_err() {
+                env.log("sessions(tokens): паника");
+            }
+        }
         (reg.map(|h| h.join()), recall.join())
     });
     match reg {

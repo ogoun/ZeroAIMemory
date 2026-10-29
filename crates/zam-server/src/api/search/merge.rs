@@ -100,6 +100,7 @@ mod tests {
             entry: None,
             area: None,
             certainty: None,
+            verified_at: None,
         }
     }
 

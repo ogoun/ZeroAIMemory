@@ -20,6 +20,11 @@
 //!   успех (M4.5: журнал, знание о файле, очередь изменённых — без сети, 50 мс).
 //! - **`subagent-start`** (M4.5 §9.4, событие `SubagentStart` Claude и Codex, 300 мс) —
 //!   сессия субагента и пакет под задачу ([`subagent_start`]).
+//! - **Учёт выданного** (M4.5 §9.5): непустой вывод без сети (`pre-tool`, успешный
+//!   `post-tool`) — строка в очереди `cache/tokens-<сессия>.jsonl` (оценка токенов
+//!   [`cache::estimate_tokens`]); сетевые хуки (`session-start`, `prompt`, `post-tool` ошибки,
+//!   `checkpoint`, `subagent-start` — для сессии родителя) отправляют её параллельно со своим
+//!   запросом ([`cache::flush_tokens`]). Вывод сетевых хуков сервер считает сам (`/recall`).
 pub mod cache;
 pub mod checkpoint;
 pub mod input;

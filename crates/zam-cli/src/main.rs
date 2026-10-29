@@ -66,6 +66,10 @@ enum Cmd {
         /// Пачка: ревизия, уже известная агенту; совпала — `unchanged` без текста
         #[arg(long)]
         if_rev: Option<i64>,
+        /// Пачка: изменения с ревизии N — дифф (длиннее текста — полный текст), равна текущей —
+        /// `unchanged`
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..), conflicts_with = "if_rev")]
+        since_rev: Option<i64>,
         #[command(flatten)]
         common: Common,
     },
@@ -1275,6 +1279,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             max_tokens,
             budget,
             if_rev,
+            since_rev,
             common,
         } => {
             let o = cmd::read::Opts {
@@ -1285,6 +1290,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 max_tokens,
                 budget,
                 if_rev,
+                since_rev,
             };
             cmd::read::run(&cmd::connect(&common)?, &targets, &o)
         }

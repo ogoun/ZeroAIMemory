@@ -104,6 +104,10 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             sc.spawn(move || c.post_json("/recall", &body).and_then(read_json))
         };
         let trig = sc.spawn(|| cache::refresh_triggers(env, &client, false));
+        // очередь учёта локального вывода прошлой сессии хуков (M4.5 §9.5)
+        let tokens = session
+            .filter(|_| cache::tokens_queued(env, session))
+            .map(|id| sc.spawn(|| cache::flush_tokens(env, &client, id)));
         // сначала очереди изменённых файлов, затем индекс ссылок в остатке бюджета: иначе
         // индекс может прийти без устарелости, которую выставит эта же отправка
         let want_refs = s.flag_on(Flag::FileContext) && env.solution.is_some();
@@ -116,6 +120,11 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             Ok(Some(Err(e))) => env.log(&format!("кэш file-refs не обновлён: {e}")),
             Err(_) => env.log("files/changed, file-refs: паника"),
             _ => {}
+        }
+        if let Some(h) = tokens
+            && h.join().is_err()
+        {
+            env.log("sessions(tokens): паника");
         }
         (reg.map(|h| h.join()), recall.join(), trig.join())
     });

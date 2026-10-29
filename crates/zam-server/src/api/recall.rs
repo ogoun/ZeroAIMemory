@@ -4,8 +4,8 @@
 //! ```text
 //! POST /recall {event, session_id?, solution?, area?, prompt?, error?, tool?, budget_tokens?,
 //!               agent_block_version?, task?, parent_id?}
-//!   → 200 {text, items: [{id, kind, title, certainty, reason}], tokens, timings, warnings,
-//!          hooks?}
+//!   → 200 {text, items: [{id, kind, title, certainty, reason, age_days?}], tokens, timings,
+//!          warnings, hooks?}
 //! ```
 //!
 //! - `text` — готовый Markdown для `additionalContext`; пусто — тишина. Каждая подсказка — строка
@@ -13,8 +13,15 @@
 //!   changelog — `c:<id>`), под ней с отступом может идти пояснение (L1 правила, фрагмент).
 //!   `items` — показанные подсказки по порядку: `id` — та же ссылка, `kind` — `insight`,
 //!   `changelog`, `note` или `folder`, `reason` — откуда подсказка (`rules`, `solution`,
-//!   `gotcha`, `failure`, `revisit`, `changelog`, `search`, `error_regex`, `error_fts`);
-//!   `tokens` — размер `text` (счётчик чанкера), `timings {collect_ms, record_ms, total_ms}`;
+//!   `gotcha`, `failure`, `revisit`, `changelog`, `search`, `error_regex`, `error_fts`),
+//!   `age_days` — возраст записи в сутках (M4.5 §7; нет у строк окружения, файлов, терминов и
+//!   триггеров `error_regex`: время там неизвестно); `tokens` — размер `text` (счётчик
+//!   чанкера), `timings {collect_ms, record_ms, total_ms}`;
+//! - **учёт выданного** (M4.5 §9.5): непустой `text` прибавляется к `session_tokens` сессии —
+//!   событие `session_start`, `recovery` (и `session_start` после `compact | resume`),
+//!   `prompt`, `post_tool` или `brief`, `calls + 1`, `tokens + tokens` ответа — в той же
+//!   транзакции, что `session_seen` (без лишней синхронизации диска); `record: false`, нет
+//!   сессии или вышел срок учёта — без прибавки;
 //! - **`session_start`** — дайджест не больше `budget_tokens` (по умолчанию
 //!   `recall.digest_tokens` = 1500) по приоритету: напоминание об устаревшем блоке инструкции
 //!   (`agent_block_version` меньше версии сервера [`crate::agent_setup::current_version`] —
@@ -33,7 +40,10 @@
 //!   пространства решения с L0 (до [`SOLUTION_ROOT_MAX`]), до 5 действующих (`active`)
 //!   `gotcha`/`failure` решения и Knowledge (новые первыми), до 5 записей `revisit`, последние
 //!   5 записей changelog решения **[решение исполнителя]**; сразу после правил — строка
-//!   `Словарь: N терминов — memory_search kinds=[term]` (N > 0, термины решения и Knowledge).
+//!   `Словарь: N терминов — memory_search kinds=[term]` (N > 0, термины решения и Knowledge) и
+//!   строка `Проверенные команды: <путь> (проверено <verified_at>)[; …]` — до
+//!   [`VERIFIED_COMMANDS_MAX`] заметок пространства решения с `verified_at`, новые проверки
+//!   первыми (M4.5 §7, решение владельца 2026-10-28).
 //!   Ответ несёт `hooks: {session_start, prompt, pre_tool, post_tool, checkpoint,
 //!   subagent_start, file_context, session_journal, recovery}` — настройки типов подсказок
 //!   пользователя `hooks.<тип>` (R5, [`super::user_settings`], задача 13). Тип запроса выключен у
@@ -126,9 +136,10 @@ use zam_search::recall::{
 use zam_search::truncate_to_tokens;
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, NodeKind, RECALL_PART,
-    SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TriggerKind, UsageEvent, UsageKind,
-    UsageSource, active_triggers, count_tokens, list_children, list_entries, mark_seen,
-    node_content, record_usages, search_fts_channels, seen_revs, touch_session,
+    SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind, UsageEvent,
+    UsageKind, UsageSource, active_triggers, count_tokens, list_children, list_entries,
+    mark_seen_with_tokens, node_content, record_usages, search_fts_channels, seen_revs,
+    touch_session,
 };
 
 use super::json_body;
@@ -225,6 +236,18 @@ impl Event {
     }
 }
 
+/// Событие учёта выданных токенов (`session_tokens`, M4.5 §9.5): пакет восстановления — и по
+/// `event: recovery`, и по `session_start` после `compact | resume`.
+fn token_event(event: Event, recovery: bool) -> &'static str {
+    match event {
+        _ if recovery => "recovery",
+        Event::SessionStart | Event::Recovery => "session_start",
+        Event::Prompt => "prompt",
+        Event::PostTool => "post_tool",
+        Event::Brief => "brief",
+    }
+}
+
 /// Предел `task` пакета под задачу, символов (§9.4): длиннее — обрезка.
 pub const BRIEF_TASK_MAX_CHARS: usize = 2000;
 /// Предупреждение: `task` длиннее [`BRIEF_TASK_MAX_CHARS`] и обрезан.
@@ -291,6 +314,24 @@ struct Cand {
     reason: &'static str,
     /// Markdown подсказки (строка и, возможно, строки с отступом).
     block: String,
+    /// Возраст записи в днях (M4.5 §7); `None` — не запись памяти или время неизвестно.
+    age_days: Option<u32>,
+}
+
+/// Возраст подсказки (M4.5 §7): от `updated_at`, у заметки с `verified_at` — от более позднего.
+fn age_of(updated_at: jiff::Timestamp, verified_at: Option<&str>) -> Option<u32> {
+    Some(zam_store::time::age_days(
+        jiff::Timestamp::now(),
+        updated_at,
+        verified_at,
+    ))
+}
+
+/// Возраст элемента внутреннего поиска (`age_days` его JSON).
+fn item_age(it: &Value) -> Option<u32> {
+    it["age_days"]
+        .as_u64()
+        .map(|d| u32::try_from(d).unwrap_or(u32::MAX))
 }
 
 /// Срок сбора подсказок (`recall.timeout_ms`).
@@ -361,6 +402,7 @@ fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Can
         certainty,
         reason,
         block,
+        age_days: age_of(e.updated_at, None),
     }
 }
 
@@ -667,6 +709,7 @@ async fn environment_cands(
             certainty: None,
             reason: REASON_ENVIRONMENT,
             block: environment_block(m),
+            age_days: None,
         })
         .collect())
 }
@@ -799,6 +842,7 @@ async fn digest(
                     certainty,
                     reason: "rules",
                     block,
+                    age_days: age_of(n.updated_at, n.verified_at.as_deref()),
                 });
             }
         }
@@ -845,6 +889,7 @@ async fn digest(
                     certainty,
                     reason: "solution",
                     block,
+                    age_days: age_of(n.updated_at, n.verified_at.as_deref()),
                 });
             }
         }
@@ -874,8 +919,13 @@ async fn digest(
     .map(|(i, e)| entry_cand(*i, e, "changelog", ""))
     .collect();
     sections.push((Some("### Последние изменения"), changes));
-    let glossary = glossary_line(st, health, deadline).await;
-    Ok((notices, sections, glossary, open_line))
+    // строки после правил: словарь и проверенные команды решения (M4.5 §7)
+    let mut after_rules: Vec<String> = glossary_line(st, health, deadline)
+        .await
+        .into_iter()
+        .collect();
+    after_rules.extend(verified_line(health, deadline, sol).await);
+    Ok((notices, sections, after_rules, open_line))
 }
 
 /// Действующие `gotcha`/`failure` пространств `spaces`, новые первыми.
@@ -951,6 +1001,7 @@ async fn rules_l0(health: &mut Health<'_>, deadline: &mut Deadline) -> Result<Ve
                 certainty,
                 reason: "rules",
                 block,
+                age_days: age_of(n.updated_at, n.verified_at.as_deref()),
             }
         })
         .collect())
@@ -1085,6 +1136,7 @@ async fn brief_search(
             certainty,
             reason,
             block,
+            age_days: item_age(it),
         };
         if reason == REASON_DECISION {
             decisions.push(c);
@@ -1235,6 +1287,7 @@ async fn file_cands(
                         certainty: None,
                         reason: REASON_FILE,
                         block,
+                        age_days: None,
                     };
                     if is_exact {
                         out.push(c);
@@ -1298,9 +1351,50 @@ async fn decision_cands(
 type Digest = (
     Vec<String>,
     Vec<(Option<&'static str>, Vec<Cand>)>,
-    Option<String>,
+    Vec<String>,
     Option<String>,
 );
+
+/// Проверенных команд в строке дайджеста (M4.5 §7).
+pub const VERIFIED_COMMANDS_MAX: usize = 3;
+
+/// Строка `Проверенные команды: <path> (проверено <verified_at>)[; …]` — до
+/// [`VERIFIED_COMMANDS_MAX`] заметок пространства решения с `verified_at`, новые проверки первыми
+/// (решение владельца 2026-10-28: проверенные команды — заметки с `verified_at`); `None` — таких
+/// нет, решения нет или срок вышел. Сбой чтения базы чужого решения исключает его (как всюду).
+async fn verified_line(
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+    sol: Option<(usize, Id)>,
+) -> Option<String> {
+    let (i, space) = sol?;
+    if !health.alive[i] {
+        return None;
+    }
+    let db = health.targets()[i].db.clone();
+    let r = deadline
+        .step(zam_store::verified_notes(&db, space, VERIFIED_COMMANDS_MAX))
+        .await?;
+    let notes = match health.soft(i, r) {
+        Ok(Some(n)) => n,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: проверенные команды не прочитаны");
+            return None;
+        }
+    };
+    let parts: Vec<String> = notes
+        .iter()
+        .map(|n| {
+            format!(
+                "{} (проверено {})",
+                one_line(&n.path),
+                one_line(n.verified_at.trim())
+            )
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("Проверенные команды: {}", parts.join("; ")))
+}
 
 /// Строка `Словарь: N терминов — memory_search kinds=[term]` (N — действующие термины решения
 /// и Knowledge области); `None` — терминов нет или срок вышел.
@@ -1389,6 +1483,7 @@ async fn term_cands(
                 certainty: None,
                 reason: REASON_GLOSSARY,
                 block,
+                age_days: None,
             });
         }
     }
@@ -1514,6 +1609,7 @@ async fn prompt_hints(
             certainty,
             reason,
             block,
+            age_days: item_age(it),
         });
     }
     Ok(out)
@@ -1659,6 +1755,7 @@ async fn error_hints(
                 certainty,
                 reason: "error_regex",
                 block,
+                age_days: None,
             });
         }
     }
@@ -1734,6 +1831,7 @@ async fn error_hints(
                 certainty: e.certainty.clone(),
                 reason: "error_fts",
                 block,
+                age_days: age_of(h.updated_at, h.verified_at.as_deref()),
             });
         }
     }
@@ -1768,13 +1866,15 @@ async fn shown(
     }
 }
 
-/// Учёт показа: `session_seen` (с касанием сессии) и `usage` в базах целей. Сбой — WARN.
+/// Учёт показа: `session_seen` (с касанием сессии) и выданные токены `session_tokens`
+/// (M4.5 §9.5) одной транзакцией базы сессии, `usage` в базах целей. Сбой — WARN.
 async fn record(
     s: Option<&RequestSession>,
     targets: &[SearchTarget],
     user: Id,
     event: Event,
     shown: &[&Cand],
+    tokens: &[TokenCount],
 ) {
     if let Some(s) = s {
         let items: Vec<SeenItem> = shown
@@ -1785,10 +1885,10 @@ async fn record(
                 rev: c.rev,
             })
             .collect();
-        let r = if items.is_empty() {
+        let r = if items.is_empty() && tokens.is_empty() {
             touch_session(&s.db, &s.touch).await
         } else {
-            mark_seen(&s.db, &s.touch, &items).await
+            mark_seen_with_tokens(&s.db, &s.touch, &items, tokens).await
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "recall: учёт сессии не выполнен");
@@ -1835,12 +1935,13 @@ fn section_limit(event: Event, title: Option<&str>, cands: &[Cand], limit: usize
 /// подсказки записей — уведомления, словарь, открытые вопросы, — пустой список: ни
 /// `session_seen`, ни `usage`). Уведомления — первыми; в пакете восстановления — после задач,
 /// ответов и решений (§9.2), а если других разделов нет — в конце. Открытые вопросы — после
-/// ответов (в пакете — вместе с уведомлениями), строка словаря — после правил.
+/// ответов (в пакете — вместе с уведомлениями), строки словаря и проверенных команд — после
+/// правил.
 fn arrange<'c>(
     recovery: bool,
     notices: Vec<String>,
     open_line: Option<String>,
-    glossary: Option<&str>,
+    after_rules: &[String],
     chosen: Vec<(Option<&'static str>, Vec<&'c Cand>)>,
 ) -> (Vec<Section>, Vec<Vec<&'c Cand>>) {
     let mut out = Arranged::default();
@@ -1870,10 +1971,8 @@ fn arrange<'c>(
         {
             out.line(Some(SECTION_OPEN_QUESTIONS), vec![line]);
         }
-        if title == Some(SECTION_RULES)
-            && let Some(line) = glossary
-        {
-            out.line(None, vec![line.to_string()]);
+        if title == Some(SECTION_RULES) && !after_rules.is_empty() {
+            out.line(None, after_rules.to_vec());
         }
     }
     // пакет восстановления без раздела после трёх первых: уведомления и вопросы не теряются
@@ -2027,8 +2126,8 @@ pub async fn recall(
     };
 
     // сбор кандидатов
-    let (notices, sections, repeatable, glossary, open_line) = match req.event {
-        _ if !enabled => (Vec::new(), Vec::new(), true, None, None),
+    let (notices, sections, repeatable, after_rules, open_line) = match req.event {
+        _ if !enabled => (Vec::new(), Vec::new(), true, Vec::new(), None),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
         Event::SessionStart | Event::Recovery => {
@@ -2046,19 +2145,19 @@ pub async fn recall(
                 Vec::new(),
                 vec![(None, terms), (None, c)],
                 false,
-                None,
+                Vec::new(),
                 None,
             )
         }
         Event::PostTool => {
             let c = error_hints(&req, &mut health, &mut deadline).await?;
-            (Vec::new(), vec![(None, c)], true, None, None)
+            (Vec::new(), vec![(None, c)], true, Vec::new(), None)
         }
         // у субагента свой контекст: пакет повторяется (показ отмечается)
         Event::Brief => {
             let t = task.as_deref();
             let s = brief(&st, &p, &sh, &req, t, &mut health, &mut deadline).await?;
-            (Vec::new(), s, true, None, None)
+            (Vec::new(), s, true, Vec::new(), None)
         }
     };
     // без повторов: показанное сессии, повторы между разделами, исключённые цели; ответ на
@@ -2097,7 +2196,7 @@ pub async fn recall(
             (*title, chosen)
         })
         .collect();
-    let (packed, picked) = arrange(recovery, notices, open_line, glossary.as_deref(), chosen);
+    let (packed, picked) = arrange(recovery, notices, open_line, &after_rules, chosen);
     let (text, taken) = pack_sections(&packed, budget, &count_tokens);
     let shown_now: Vec<&Cand> = taken
         .iter()
@@ -2110,7 +2209,24 @@ pub async fn recall(
     let record_ms = if req.record == Some(false) {
         None
     } else if rt < total_deadline {
-        record(session.as_ref(), &targets, user, req.event, &shown_now).await;
+        // выданное сессии по событию (§9.5): пустой ответ — не выдача
+        let tokens: Vec<TokenCount> = (!text.is_empty())
+            .then(|| TokenCount {
+                event: token_event(req.event, recovery).into(),
+                calls: 1,
+                tokens: count_tokens(&text) as u64,
+            })
+            .into_iter()
+            .collect();
+        record(
+            session.as_ref(),
+            &targets,
+            user,
+            req.event,
+            &shown_now,
+            &tokens,
+        )
+        .await;
         Some(ms(rt))
     } else {
         deadline.expired = true;
@@ -2125,13 +2241,17 @@ pub async fn recall(
     let items: Vec<Value> = shown_now
         .iter()
         .map(|c| {
-            json!({
+            let mut o = json!({
                 "id": c.reference,
                 "kind": c.kind,
                 "title": c.title,
                 "certainty": c.certainty,
                 "reason": c.reason,
-            })
+            });
+            if let Some(d) = c.age_days {
+                o["age_days"] = json!(d);
+            }
+            o
         })
         .collect();
     let mut out = json!({
@@ -2170,6 +2290,7 @@ mod tests {
             certainty: None,
             reason: "task",
             block: format!("ZeroAIMemory: {title}"),
+            age_days: None,
         }
     }
 
@@ -2183,7 +2304,7 @@ mod tests {
             (Some(SECTION_ANSWERS), Vec::new()),
         ];
         let notices = vec!["ZeroAIMemory: уведомление".to_string()];
-        let (packed, picked) = arrange(true, notices, Some("1 открытых: «в»".into()), None, chosen);
+        let (packed, picked) = arrange(true, notices, Some("1 открытых: «в»".into()), &[], chosen);
         assert_eq!(packed.len(), picked.len());
         let titles: Vec<Option<&str>> = packed.iter().map(|s| s.title.as_deref()).collect();
         assert_eq!(
@@ -2207,14 +2328,26 @@ mod tests {
             false,
             vec!["n".into()],
             Some("q".into()),
-            Some("Словарь"),
+            &[
+                "Словарь".to_string(),
+                "Проверенные команды: a (проверено 2026-10-28)".into(),
+            ],
             chosen,
         );
         let blocks: Vec<&str> = packed
             .iter()
             .flat_map(|s| s.blocks.iter().map(String::as_str))
             .collect();
-        assert_eq!(blocks, ["n", "ZeroAIMemory: задача", "q", "Словарь"]);
+        assert_eq!(
+            blocks,
+            [
+                "n",
+                "ZeroAIMemory: задача",
+                "q",
+                "Словарь",
+                "Проверенные команды: a (проверено 2026-10-28)"
+            ]
+        );
     }
 
     #[test]

@@ -70,8 +70,9 @@ pub use entries::{
     title_duplicates, update_entry, validate_trigger,
 };
 pub use file_refs::{
-    FileRef, PathError, PathRefs, RefItem, RefState, check_commit, check_hash, files_changed,
-    files_verified, normalize_ref_path, refs_index, refs_to_path, stale_refs_of,
+    FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit, check_hash,
+    files_changed, files_verified, normalize_ref_path, refs_index, refs_to_path, stale_refs_of,
+    verified_notes,
 };
 pub use glossary::{
     ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,
@@ -91,11 +92,11 @@ pub use jobs::{
 pub use migrate::Migration;
 pub use nodes::{
     Attribution, AuthorKind, NewNote, Node, NodeKind, PREFIX_L0_MAX_TOKENS, RevisionInfo,
-    WriteError, chunk_params, count_tokens, create_folder, create_note, delete_node, find_by_name,
-    get_node, get_node_by_path, list_children, list_revisions, list_trash, move_node, node_content,
-    patch_note, patch_note_within, prefix_l0, restore_node, revert_note, set_auto_l0,
-    set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter, token_counter_exact,
-    unified_diff, update_note,
+    WriteError, chunk_params, count_tokens, create_folder, create_note, delete_node,
+    entry_snapshot_text, find_by_name, get_node, get_node_by_path, list_children, list_revisions,
+    list_trash, move_node, node_content, patch_note, patch_note_within, prefix_l0, restore_node,
+    revert_note, set_auto_l0, set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter,
+    token_counter_exact, unified_diff, update_note,
 };
 pub use paths::{NodePath, path_ancestors};
 pub use questions::{
@@ -111,9 +112,10 @@ pub use search::{
     query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use sessions::{
-    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch, WHOLE_TARGET,
-    add_memory_write, check_session_id, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, seen_revs, touch_session,
+    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch,
+    TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
+    add_tokens, check_session_id, end_session, gc_sessions, get_session, latest_session,
+    list_sessions, mark_seen, mark_seen_with_tokens, seen_revs, session_tokens, touch_session,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{

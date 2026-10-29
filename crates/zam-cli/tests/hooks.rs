@@ -2595,3 +2595,75 @@ fn spawn_queue_pruned_on_session_start_and_gc() {
     assert_eq!(tasks, ["sp-2"]);
     assert!(!old.exists(), "файл очереди старше часа не удалён");
 }
+
+/// Очередь учёта токенов сессии (`tokens-<сессия>.jsonl`), строки JSON.
+fn token_queue(p: &Proj, session: &str) -> Vec<Value> {
+    let Some(f) = p.session_file("tokens", session, ".jsonl") else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(f)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// Оценка токенов клиента (как `zam_markdown::ApproxCounter`): ⌈символы / 3,5⌉.
+fn approx_tokens(s: &str) -> u64 {
+    (s.chars().count() as u64 * 2).div_ceil(7)
+}
+
+/// Хуки с локальным выводом (M4.5 §9.5): `pre-tool` копит выданное в очереди учёта без сети;
+/// сервер недоступен — очередь цела; следующий сетевой хук (`prompt`) отправляет её пачкой
+/// `POST /sessions {tokens}` и удаляет; `GET /sessions/{id}` отдаёт `pre_tool: {calls, tokens}`.
+#[test]
+fn local_tokens_flushed_by_hook() {
+    let _g = serial();
+    let (url, tok) = start("tokens");
+    let p = Proj::new("tokens", &url, &tok);
+    write_cache(&p, &url);
+    let mut want = 0;
+    let (o, _) = p.hook_at(
+        &url,
+        "pre-tool",
+        "claude",
+        write_ev(&p, "tk", "scripts/deploy.sh")
+            .to_string()
+            .as_bytes(),
+    );
+    want += approx_tokens(&context(&o, "PreToolUse"));
+    let push = p.ev(
+        "PreToolUse",
+        "tk",
+        json!({"tool_name": "Bash", "tool_input": {"command": "git push --force"}}),
+    );
+    let (o, _) = p.hook_at(&url, "pre-tool", "claude", push.to_string().as_bytes());
+    want += approx_tokens(&context(&o, "PreToolUse"));
+    // тишина — не выдача
+    let quiet = p.ev(
+        "PreToolUse",
+        "tk",
+        json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+    );
+    let (o, _) = p.hook_at(&url, "pre-tool", "claude", quiet.to_string().as_bytes());
+    empty(&o);
+    let q = token_queue(&p, "tk");
+    assert_eq!(q.len(), 2, "{q:?}");
+    assert!(q.iter().all(|l| l["e"] == "pre_tool"), "{q:?}");
+    assert_eq!(
+        q.iter().map(|l| l["t"].as_u64().unwrap()).sum::<u64>(),
+        want
+    );
+    // сервер недоступен — очередь остаётся до следующего сетевого хука
+    let pr = p.ev("UserPromptSubmit", "tk", json!({"prompt": "zzqx"}));
+    let _ = p.hook_at(DEAD, "prompt", "claude", pr.to_string().as_bytes());
+    assert_eq!(token_queue(&p, "tk").len(), 2, "ошибка — очередь цела");
+    let _ = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
+    assert!(token_queue(&p, "tk").is_empty(), "очередь отправлена");
+    let s = p.session("tk");
+    assert_eq!(
+        s["tokens"]["pre_tool"],
+        json!({"calls": 2, "tokens": want}),
+        "{s}"
+    );
+}

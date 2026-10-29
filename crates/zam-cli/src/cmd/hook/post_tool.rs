@@ -157,13 +157,26 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
             "error": error,
             "tool": tool,
         });
-        match client.post_json("/recall", &body).and_then(read_json) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                env.log(&format!("recall(post_tool): {e}"));
-                None
+        let session = inp.session_id.as_deref();
+        std::thread::scope(|sc| {
+            // очередь учёта локального вывода — параллельно, в том же бюджете (M4.5 §9.5)
+            let flush = session
+                .filter(|_| cache::tokens_queued(env, session))
+                .map(|id| sc.spawn(|| cache::flush_tokens(env, &client, id)));
+            let r = match client.post_json("/recall", &body).and_then(read_json) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    env.log(&format!("recall(post_tool): {e}"));
+                    None
+                }
+            };
+            if let Some(h) = flush
+                && h.join().is_err()
+            {
+                env.log("sessions(tokens): паника");
             }
-        }
+            r
+        })
     });
     let mut lines: Vec<String> = Vec::new();
     let mut known: Vec<String> = Vec::new();
@@ -285,7 +298,12 @@ fn success(env: &Env, inp: &Input, s: &Settings) -> Output {
             if let (Some(id), Some(sh), false) = (session, shown.as_ref(), lines.is_empty()) {
                 cache::write_shown(env, id, sh);
             }
-            Output::context(&inp.event, &lines.join("\n"))
+            let text = lines.join("\n");
+            // вывод без сети — в очередь учёта (M4.5 §9.5)
+            if let Some(id) = session {
+                cache::note_tokens(env, id, cache::TOKENS_POST_TOOL_LOCAL, &text);
+            }
+            Output::context(&inp.event, &text)
         }
         t if is_edit_tool(t) => {
             if let Some(id) = session {

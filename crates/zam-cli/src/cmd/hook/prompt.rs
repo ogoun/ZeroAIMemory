@@ -4,7 +4,8 @@
 //!
 //! M4.5: в журнал сессии (ключ `session_journal`) — `Ev::Prompt {len}` (только длина, §9.1);
 //! очередь изменённых файлов сессии уходит `POST /files/changed` параллельно с `/recall` в
-//! том же бюджете ([`cache::flush_changed`]).
+//! том же бюджете ([`cache::flush_changed`]), очередь учёта выданных токенов — так же
+//! ([`cache::flush_tokens`], §9.5).
 use serde_json::json;
 
 use super::cache;
@@ -30,7 +31,8 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     let prompt = Some(raw.trim()).filter(|p| !p.is_empty() && s.on(Kind::Prompt));
     let queued =
         env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
-    if prompt.is_none() && !queued {
+    let tokens = cache::tokens_queued(env, session);
+    if prompt.is_none() && !queued && !tokens {
         return Output::Empty;
     }
     let Some(client) = env.client() else {
@@ -38,11 +40,20 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     };
     std::thread::scope(|sc| {
         let flush = queued.then(|| sc.spawn(|| cache::flush_changed(env, &client, session)));
+        // очередь учёта локального вывода (M4.5 §9.5) — тем же сетевым вызовом хука
+        let flush_tokens = session
+            .filter(|_| tokens)
+            .map(|id| sc.spawn(|| cache::flush_tokens(env, &client, id)));
         let out = prompt.map_or(Output::Empty, |p| recall(env, inp, &client, p));
         if let Some(h) = flush
             && h.join().is_err()
         {
             env.log("files/changed: паника");
+        }
+        if let Some(h) = flush_tokens
+            && h.join().is_err()
+        {
+            env.log("sessions(tokens): паника");
         }
         out
     })
