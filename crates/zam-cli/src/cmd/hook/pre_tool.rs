@@ -9,6 +9,8 @@
 //!   `file_glob` — из заголовков `*** Add File:`, `*** Update File:`, `*** Delete File:` (и
 //!   `*** Move to:`), `command_regex` к патчу не применяется (fix round 1, I-3; ⚠️ формат
 //!   входа на живом Codex не проверен);
+//! - знание о файле (M4.5 §6.3, ключ `file_context`) у правки — первыми строками, до
+//!   триггеров `file_glob`: те же строки, что у `post-tool` на `Read`, раз за сессию на файл;
 //! - запись показывается не больше раза за сессию (`shown-<сессия>.json`); правка
 //!   Write/Edit/MultiEdit/NotebookEdit/`apply_patch` — маркер `edits-<сессия>` для `checkpoint`
 //!   (R1). Маркер пишется и при выключенном `pre_tool`, если включён `checkpoint`
@@ -24,7 +26,7 @@ use regex::RegexBuilder;
 use super::cache::{self, Trigger};
 use super::input::Input;
 use super::output::Output;
-use super::{Env, Kind, Settings};
+use super::{Env, Flag, Kind, Settings};
 
 /// Предел размера скомпилированного regex — как у проверки триггеров на сервере.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
@@ -32,7 +34,7 @@ const REGEX_SIZE_LIMIT: usize = 1 << 20;
 const COMMAND_SCAN_MAX: usize = 64 * 1024;
 
 /// Инструменты правки файлов (факт правок для `checkpoint`).
-fn is_edit_tool(name: &str) -> bool {
+pub fn is_edit_tool(name: &str) -> bool {
     matches!(
         name,
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch"
@@ -75,10 +77,6 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     if !hints_on {
         return Output::Empty;
     }
-    let server = env.server_url();
-    let Some(c) = cache::usable_triggers(env, server.as_deref()) else {
-        return Output::Empty;
-    };
     let command = command_of(inp);
     let (files, command) = if tool == "apply_patch" {
         (patch_files(command.as_deref().unwrap_or_default()), None)
@@ -88,38 +86,46 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             .or_else(|| inp.tool_input("notebook_path"));
         (f.map(str::to_string).into_iter().collect(), command)
     };
-    let found = matches(&c.triggers, tool, &files, command.as_deref(), env);
-    if found.is_empty() {
-        return Output::Empty;
-    }
     let mut shown = session.map(|id| cache::read_shown(env, id));
     let mut dirty = false;
     let mut lines: Vec<String> = Vec::new();
-    let mut taken: Vec<&str> = Vec::new();
-    for (t, lead) in found {
-        if taken.contains(&t.entry_id.as_str()) {
-            continue;
-        }
-        taken.push(&t.entry_id);
-        if let Some(sh) = shown.as_mut() {
-            if sh.shown.contains(&t.entry_id) {
+    // знание о файле (M4.5 §6.3) — перед триггерами `file_glob`, в общем пределе текста
+    if is_edit_tool(tool) && s.flag_on(Flag::FileContext) {
+        let rels: Vec<String> = files
+            .iter()
+            .filter_map(|f| crate::cmd::refs::ref_path(f, &env.cwd, &env.root).ok())
+            .collect();
+        let before = shown.as_ref().map_or(0, |sh| sh.shown.len());
+        lines.extend(super::post_tool::file_context_lines(
+            env,
+            shown.as_mut(),
+            &rels,
+        ));
+        dirty |= shown.as_ref().map_or(0, |sh| sh.shown.len()) != before;
+    }
+    let server = env.server_url();
+    if let Some(c) = cache::usable_triggers(env, server.as_deref()) {
+        let found = matches(&c.triggers, tool, &files, command.as_deref(), env);
+        let mut taken: Vec<&str> = Vec::new();
+        for (t, lead) in found {
+            if taken.contains(&t.entry_id.as_str()) {
                 continue;
             }
-            sh.shown.push(t.entry_id.clone());
-            dirty = true;
+            taken.push(&t.entry_id);
+            if let Some(sh) = shown.as_mut() {
+                if sh.shown.contains(&t.entry_id) {
+                    continue;
+                }
+                sh.shown.push(t.entry_id.clone());
+                dirty = true;
+            }
+            lines.push(t.hint(&lead));
         }
-        lines.push(t.hint(&lead));
     }
     if dirty && let (Some(id), Some(sh)) = (session, shown.as_ref()) {
         cache::write_shown(env, id, sh);
     }
-    Output::context(
-        &inp.event,
-        &lines.join(
-            "
-",
-        ),
-    )
+    Output::context(&inp.event, &lines.join("\n"))
 }
 
 /// `tool_input.command`: строка или массив аргументов (через пробел).

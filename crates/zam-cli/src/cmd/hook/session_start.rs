@@ -11,6 +11,9 @@
 //! полученный в том же ответе, не выводится.
 //! На `source` `compact` и `clear` (контекст агента потерян) показанное `pre-tool` в сессии
 //! сбрасывается, факт правок остаётся.
+//! M4.5: в том же параллельном наборе — `GET /file-refs` с `If-None-Match` (кэш знания о файле
+//! `file-refs.json`; ключ `file_context` выключен — не запрашивается) и отправка очередей
+//! изменённых файлов всех сессий проекта (`POST /files/changed`, [`cache::flush_changed`]).
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -18,7 +21,7 @@ use serde_json::{Value, json};
 use super::cache;
 use super::input::Input;
 use super::output::Output;
-use super::{Env, HookFlags, Kind, Settings};
+use super::{Env, Flag, HookFlags, Kind, Settings};
 use crate::client::read_json;
 
 /// Предел файла инструкции при поиске маркера блока, байт.
@@ -67,6 +70,17 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             sc.spawn(move || c.post_json("/recall", &body).and_then(read_json))
         };
         let trig = sc.spawn(|| cache::refresh_triggers(env, &client, false));
+        let refs = (s.flag_on(Flag::FileContext) && env.solution.is_some())
+            .then(|| sc.spawn(|| cache::refresh_file_refs(env, &client)));
+        let flush = sc.spawn(|| cache::flush_changed(env, &client, None));
+        match refs.map(|h| h.join()) {
+            Some(Ok(Err(e))) => env.log(&format!("кэш file-refs не обновлён: {e}")),
+            Some(Err(_)) => env.log("кэш file-refs: паника"),
+            _ => {}
+        }
+        if flush.join().is_err() {
+            env.log("files/changed: паника");
+        }
         (reg.map(|h| h.join()), recall.join(), trig.join())
     });
     match reg {

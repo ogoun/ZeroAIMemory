@@ -30,6 +30,8 @@ blake3.workspace = true
 [dev-dependencies]
 zam-server = { path = "../zam-server" }
 zam-store = { path = "../zam-store" }
+# тесты: разбор frontmatter `refs:` тем же парсером, что у сервера (zam write --ref)
+zam-markdown = { path = "../zam-markdown" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 axum.workspace = true
 assert_cmd.workspace = true

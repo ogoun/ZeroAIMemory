@@ -1037,7 +1037,8 @@ async fn user_hook_settings_rest() {
     let (uid, tok, w) = ready_user(&a, "Нина", "10.1.9.1").await;
     let (other, _) = a.new_user("Олег").await;
     let all_on = json!({"session_start": true, "prompt": true, "pre_tool": true,
-                        "post_tool": true, "checkpoint": true});
+                        "post_tool": true, "checkpoint": true, "subagent_start": true,
+                        "file_context": true, "session_journal": true, "recovery": true});
     let r = web(&a, &w, Method::GET, "/api/v1/auth/settings", None).await;
     ok(&r, StatusCode::OK);
     assert_eq!(r.json()["hooks"], all_on);
@@ -1181,4 +1182,53 @@ async fn user_hook_settings_rest() {
         last.details,
         json!({"key": "hooks.prompt", "from": false, "to": true})
     );
+}
+
+/// M4.5 §9.6: ключи `subagent_start`, `file_context`, `session_journal`, `recovery` — без строки
+/// включены, правка принимается и приходит в `/recall(session_start)`; неизвестный ключ — 400.
+#[tokio::test]
+async fn user_settings_new_hook_keys() {
+    let a = api("ul-settings-m45", |_| {}).await;
+    let (_, tok, w) = ready_user(&a, "Вера", "10.1.9.2").await;
+    let r = web(&a, &w, Method::GET, "/api/v1/auth/settings", None).await;
+    ok(&r, StatusCode::OK);
+    for k in [
+        "subagent_start",
+        "file_context",
+        "session_journal",
+        "recovery",
+    ] {
+        assert_eq!(r.json()["hooks"][k], true, "{k}: {}", r.text());
+    }
+    let r = web(
+        &a,
+        &w,
+        Method::PATCH,
+        "/api/v1/auth/settings",
+        Some(json!({"hooks": {"file_context": false}})),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["hooks"]["file_context"], false);
+    assert_eq!(r.json()["hooks"]["session_journal"], true);
+    let r = web(
+        &a,
+        &w,
+        Method::PATCH,
+        "/api/v1/auth/settings",
+        Some(json!({"hooks": {"file_contexts": false}})),
+    )
+    .await;
+    ok(&r, StatusCode::BAD_REQUEST);
+    let r = a
+        .tok(
+            &tok,
+            Method::POST,
+            "/api/v1/recall",
+            Some(json!({"event": "session_start", "session_id": "m45-keys"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["hooks"]["file_context"], false, "{}", r.text());
+    assert_eq!(r.json()["hooks"]["recovery"], true, "{}", r.text());
 }

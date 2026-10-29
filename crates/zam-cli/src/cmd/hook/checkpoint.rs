@@ -10,11 +10,15 @@
 //! `stop_hook_active == true` — ничего. Вывод — `{"decision": "block", "reason": …}`.
 //! На `PreCompact` — пусто (fix round 1, m-3: ⚠️ поддержку контекста на `PreCompact` у агентов
 //! проверить на машине владельца).
+//! M4.5: `PreCompact` пишет в журнал сессии `Ev::Compact {trigger}` (ключ `session_journal`);
+//! на `Stop` и `PreCompact` очередь изменённых файлов сессии уходит `POST /files/changed`
+//! параллельно с `GET /sessions/{id}` в том же бюджете ([`cache::flush_changed`]).
 use super::cache;
 use super::input::Input;
+use super::journal::{self, Ev};
 use super::output::Output;
-use super::{Env, Kind, Settings, encode_segment};
-use crate::client::{EXIT_NOT_FOUND, read_json};
+use super::{Env, Flag, Kind, Settings, encode_segment};
+use crate::client::{Client, EXIT_NOT_FOUND, read_json};
 
 /// Текст напоминания.
 pub const REMINDER: &str = "ZeroAIMemory: в этой сессии были правки файлов, а в память ничего не \
@@ -47,25 +51,62 @@ pub fn task_line(v: &serde_json::Value) -> Option<String> {
 }
 
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
-    if inp.event != "Stop"
-        || !s.on(Kind::Checkpoint)
-        || inp.v["stop_hook_active"].as_bool() == Some(true)
+    let session = inp.session_id.as_deref();
+    if inp.event == "PreCompact"
+        && let Some(id) = session
+        && s.flag_on(Flag::SessionJournal)
     {
-        return Output::Empty;
+        let trigger = inp
+            .str("trigger")
+            .unwrap_or("auto")
+            .chars()
+            .take(32)
+            .collect();
+        journal::note(env, id, &Ev::Compact { trigger });
     }
-    let Some(session) = inp.session_id.as_deref() else {
-        return Output::Empty;
-    };
-    if !cache::had_edits(env, session) {
-        return Output::Empty;
-    }
-    let mut sh = cache::read_shown(env, session);
-    if sh.reminded {
+    let queued =
+        env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
+    let remind = needs_reminder(env, inp, s);
+    if remind.is_none() && !queued {
         return Output::Empty;
     }
     let Some(client) = env.client() else {
         return Output::Empty;
     };
+    std::thread::scope(|sc| {
+        let flush = queued.then(|| sc.spawn(|| cache::flush_changed(env, &client, session)));
+        let out = match remind {
+            Some((id, sh)) => reminder(env, &client, id, sh),
+            None => Output::Empty,
+        };
+        if let Some(h) = flush
+            && h.join().is_err()
+        {
+            env.log("files/changed: паника");
+        }
+        out
+    })
+}
+
+/// Напоминание возможно (`Stop`, включено, правки были, ещё не напоминали): сессия и
+/// `shown`-файл; иначе `None`.
+fn needs_reminder<'a>(env: &Env, inp: &'a Input, s: &Settings) -> Option<(&'a str, cache::Shown)> {
+    if inp.event != "Stop"
+        || !s.on(Kind::Checkpoint)
+        || inp.v["stop_hook_active"].as_bool() == Some(true)
+    {
+        return None;
+    }
+    let session = inp.session_id.as_deref()?;
+    if !cache::had_edits(env, session) {
+        return None;
+    }
+    let sh = cache::read_shown(env, session);
+    (!sh.reminded).then_some((session, sh))
+}
+
+/// `GET /sessions/{id}` и решение о напоминании (R1, M4.5 §3).
+fn reminder(env: &Env, client: &Client, session: &str, mut sh: cache::Shown) -> Output {
     let (writes, tasks) = match client.get(&format!("/sessions/{}", encode_segment(session)), &[]) {
         Ok(r) => match read_json(r) {
             Ok(v) => (v["memory_writes"].as_i64(), task_line(&v)),
@@ -82,10 +123,7 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     };
     let reason = match (writes == Some(0), tasks) {
         (true, None) => REMINDER.to_string(),
-        (true, Some(t)) => format!(
-            "{REMINDER}
-{t}"
-        ),
+        (true, Some(t)) => format!("{REMINDER}\n{t}"),
         (false, Some(t)) => t,
         (false, None) => return Output::Empty,
     };

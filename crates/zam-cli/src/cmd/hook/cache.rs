@@ -9,9 +9,15 @@
 //!   сессии, и признак напоминания `checkpoint`;
 //! - `edits-<сессия>` — маркер правок Write/Edit/`apply_patch` (для `checkpoint`, R1): файл есть —
 //!   правки были; создаётся без чтения и перезаписи (fix round 1, m-2);
+//! - `file-refs.json` — `{etag, fetched_at, server, solution, refs}` из `GET /file-refs`
+//!   (M4.5 §6.3; как `triggers.json`): знание о файле для `post-tool` и `pre-tool` без сети;
+//! - `changed-<сессия>.jsonl` — очередь `{path, hash}` правленых файлов (M4.5 §6.2): пишет
+//!   `post-tool`, отправляют `POST /files/changed` `prompt`, `session-start` и `checkpoint`
+//!   ([`flush_changed`]);
+//! - `events-<сессия>.jsonl` — журнал событий сессии ([`super::journal`]);
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
-//!   `shown-*`/`edits-*` старше [`SHOWN_TTL`] и временные `.*.tmp` старше [`TMP_TTL`] удаляет
-//!   `session-start` ([`gc_cache`]);
+//!   `shown-*`/`edits-*`/`events-*`/`changed-*` старше [`SHOWN_TTL`] и временные `.*.tmp`
+//!   старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
 //!   в `memory_writes` сессии хуков **[решение исполнителя]**.
@@ -136,7 +142,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Создание файла кэша: на unix — права 0600 (в кэше — id сессий и заголовки записей).
-fn private_options() -> std::fs::OpenOptions {
+pub fn private_options() -> std::fs::OpenOptions {
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -251,6 +257,239 @@ pub fn refresh_triggers(
     Ok((Refresh::Updated(c.triggers.len()), warnings))
 }
 
+/// Запись индекса `GET /file-refs`: ссылка (`n:`/`i:`/…), вид, заголовок, состояние.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RefItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub state: String,
+}
+
+/// Путь индекса `GET /file-refs`: последний записанный хэш и до 5 записей.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PathRefs {
+    pub path: String,
+    pub hash: Option<String>,
+    pub items: Vec<RefItem>,
+}
+
+/// `file-refs.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileRefsCache {
+    pub etag: String,
+    pub fetched_at: String,
+    pub server: String,
+    pub solution: Option<String>,
+    pub refs: Vec<PathRefs>,
+}
+
+impl FileRefsCache {
+    /// Путь индекса (на Windows — без учёта регистра).
+    pub fn find(&self, path: &str) -> Option<&PathRefs> {
+        self.refs
+            .iter()
+            .find(|r| crate::cmd::refs::same_path(&r.path, path))
+    }
+}
+
+pub fn file_refs_path(root: &Path) -> PathBuf {
+    root.join(".zeroaimemory")
+        .join("cache")
+        .join("file-refs.json")
+}
+
+/// Индекс ссылок для сервера `server` (если известен) и решения проекта; битый — `None` и
+/// строка в журнал.
+pub fn usable_file_refs(env: &Env, server: Option<&str>) -> Option<FileRefsCache> {
+    let c: FileRefsCache = match read_json_file(&file_refs_path(&env.root)) {
+        Ok(c) => c?,
+        Err(e) => {
+            env.log(&format!("кэш file-refs битый, пропущен: {e}"));
+            return None;
+        }
+    };
+    let sol = env.solution.as_ref().map(|s| s.id.as_str());
+    if sol.is_none() || c.solution.as_deref() != sol || server.is_some_and(|s| s != c.server) {
+        return None;
+    }
+    Some(c)
+}
+
+/// `GET /file-refs?solution=` с `If-None-Match` и запись `file-refs.json` (304 — кэш остаётся,
+/// обновляется `fetched_at`). Без решения — `None` без запроса.
+pub fn refresh_file_refs(env: &Env, client: &Client) -> Result<Option<Refresh>, CliError> {
+    let Some(sol) = env.solution.as_ref().map(|s| s.id.clone()) else {
+        return Ok(None);
+    };
+    let path = file_refs_path(&env.root);
+    let old = read_json_file::<FileRefsCache>(&path)
+        .ok()
+        .flatten()
+        .filter(|c| {
+            c.server == client.base() && c.solution.as_deref() == Some(&sol) && !c.etag.is_empty()
+        });
+    let inm = old.as_ref().map(|c| format!("\"{}\"", c.etag));
+    let mut headers = Vec::new();
+    if let Some(v) = &inm {
+        headers.push(("If-None-Match", v.as_str()));
+    }
+    let r = client.get_with("/file-refs", &[("solution", sol.as_str())], &headers)?;
+    let write = |c: &FileRefsCache| {
+        write_json_file(&path, c)
+            .map_err(|e| CliError::new(EXIT_UNREACHABLE, format!("запись {}: {e}", path.display())))
+    };
+    if r.status().as_u16() == 304
+        && let Some(mut c) = old
+    {
+        c.fetched_at = now_rfc3339();
+        write(&c)?;
+        return Ok(Some(Refresh::NotModified(c.refs.len())));
+    }
+    let v = read_json(r)?;
+    let refs: Vec<PathRefs> = serde_json::from_value(v["refs"].clone())
+        .map_err(|e| CliError::new(EXIT_UNREACHABLE, format!("ответ /file-refs: {e}")))?;
+    let c = FileRefsCache {
+        etag: v["etag"].as_str().unwrap_or_default().to_string(),
+        fetched_at: now_rfc3339(),
+        server: client.base().to_string(),
+        solution: Some(sol),
+        refs,
+    };
+    write(&c)?;
+    Ok(Some(Refresh::Updated(c.refs.len())))
+}
+
+/// Строка очереди `changed-<сессия>.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Changed {
+    pub path: String,
+    pub hash: String,
+}
+
+pub fn changed_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("changed-{}.jsonl", session_file_part(session)))
+}
+
+/// Открытие файла очереди на дописывание (на unix — 0600).
+fn append_options() -> std::fs::OpenOptions {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
+/// Дописывает файлы в очередь изменённых: строка на файл, все одним `write` с append.
+pub fn queue_changed(env: &Env, session: &str, files: &[Changed]) {
+    if files.is_empty() {
+        return;
+    }
+    let mut buf = Vec::new();
+    for c in files {
+        buf.extend(serde_json::to_vec(c).unwrap_or_default());
+        buf.push(b'\n');
+    }
+    let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| {
+        use std::io::Write;
+        append_options()
+            .open(changed_path(env, session))?
+            .write_all(&buf)
+    });
+    if let Err(e) = r {
+        env.log(&format!("очередь изменённых файлов: {e}"));
+    }
+}
+
+/// Файлы очередей: текущей сессии или (`session = None`) всех сессий проекта.
+fn queue_files(env: &Env, session: Option<&str>) -> Vec<PathBuf> {
+    if let Some(s) = session {
+        let p = changed_path(env, s);
+        return if p.is_file() { vec![p] } else { Vec::new() };
+    }
+    std::fs::read_dir(env.cache_dir())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("changed-") && n.ends_with(".jsonl"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Отправка очереди изменённых файлов `POST /files/changed` одним запросом до 500 путей на
+/// очередь (повтор пути — последний хэш). Очередь забирается rename во временный файл —
+/// строки, дописанные во время отправки, не теряются; успех — забранное удаляется, ошибка или
+/// остаток сверх 500 — дописывается обратно. Без решения — ничего.
+pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
+    let Some(sol) = env.solution.as_ref().map(|s| s.id.clone()) else {
+        return;
+    };
+    for q in queue_files(env, session) {
+        let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("changed");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let taken = q.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+        if std::fs::rename(&q, &taken).is_err() {
+            continue;
+        }
+        let bytes = std::fs::read(&taken).unwrap_or_default();
+        let mut files: Vec<Changed> = Vec::new();
+        for l in bytes.split(|b| *b == b'\n') {
+            let Ok(c) = serde_json::from_slice::<Changed>(l) else {
+                continue;
+            };
+            files.retain(|f| !crate::cmd::refs::same_path(&f.path, &c.path));
+            files.push(c);
+        }
+        let n = files.len().min(crate::cmd::refs::FILES_MAX);
+        let (send, rest) = files.split_at(n);
+        let pairs: Vec<(String, String)> = send
+            .iter()
+            .map(|c| (c.path.clone(), c.hash.clone()))
+            .collect();
+        let back: Vec<Changed> = if pairs.is_empty() {
+            Vec::new()
+        } else {
+            match crate::cmd::refs::post_changed(client, &sol, &pairs) {
+                Ok(_) => rest.to_vec(),
+                Err(e) => {
+                    env.log(&format!("files/changed: {e}"));
+                    files.clone()
+                }
+            }
+        };
+        if !back.is_empty() {
+            let mut out = Vec::new();
+            for c in &back {
+                out.extend(serde_json::to_vec(c).unwrap_or_default());
+                out.push(b'\n');
+            }
+            use std::io::Write;
+            if let Err(e) = append_options()
+                .open(&q)
+                .and_then(|mut f| f.write_all(&out))
+            {
+                env.log(&format!("возврат очереди изменённых файлов: {e}"));
+            }
+        }
+        let _ = std::fs::remove_file(&taken);
+    }
+}
+
 /// Массив строк JSON (остальное пропускается).
 pub fn strings(v: &Value) -> Vec<String> {
     v.as_array()
@@ -289,7 +528,7 @@ pub fn write_server_hooks(env: &Env, server: &str, hooks: HookFlags) {
 
 /// Имя файла сессии: очищенный id (`[A-Za-z0-9_-]`, до 64 символов), `-` и 8 hex blake3
 /// исходного id — разные id с одинаковой очисткой не сталкиваются.
-fn session_file_part(id: &str) -> String {
+pub fn session_file_part(id: &str) -> String {
     let clean: String = id
         .chars()
         .take(64)
@@ -348,8 +587,8 @@ pub fn write_shown(env: &Env, session: &str, s: &Shown) {
     }
 }
 
-/// Удаляет `shown-*.json` и `edits-*` старше [`SHOWN_TTL`] и временные `.*.tmp` старше
-/// [`TMP_TTL`].
+/// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`)
+/// старше [`SHOWN_TTL`] и временные `.*.tmp` старше [`TMP_TTL`].
 pub fn gc_cache(env: &Env) {
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
         return;
@@ -357,7 +596,11 @@ pub fn gc_cache(env: &Env) {
     for e in rd.flatten() {
         let name = e.file_name();
         let Some(n) = name.to_str() else { continue };
-        let ttl = if (n.starts_with("shown-") && n.ends_with(".json")) || n.starts_with("edits-") {
+        let session_file = (n.starts_with("shown-") && n.ends_with(".json"))
+            || n.starts_with("edits-")
+            || (n.starts_with("events-") && n.ends_with(".jsonl"))
+            || (n.starts_with("changed-") && n.ends_with(".jsonl"));
+        let ttl = if session_file {
             SHOWN_TTL
         } else if n.starts_with('.') && n.ends_with(".tmp") {
             TMP_TTL

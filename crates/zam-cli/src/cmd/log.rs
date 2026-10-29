@@ -3,8 +3,11 @@
 //! `zam log changelog --kind K --title T [--body-file F | stdin] [--ref KIND:VALUE]…
 //! [--area A] [--solution GUID]` — запись в журнал изменений решения (§7.3).
 //!
-//! `--ref`: `commit:SHA`, `file:PATH`, `note:ID`, `issue:X` → `data.refs`. Текст — из
-//! `--body-file` или stdin (если stdin не терминал). Успех → `<id>@<rev>`.
+//! `--ref`: `commit:SHA`, `file:PATH` (или просто путь), `note:ID`, `issue:X` → `data.refs`.
+//! Файлы (M4.5 §6.1) ещё и ссылками `refs.files` с `{path, hash, commit}`: путь — относительно
+//! корня проекта (абсолютный внутри корня тоже), нормализованный по правилам сервера
+//! ([`super::refs::ref_path`]), в `data.refs.files` — тот же путь. Текст — из `--body-file`
+//! или stdin (если stdin не терминал). Успех → `<id>@<rev>`.
 //!
 //! `zam log term --title T --definition D [--alias A]… [--code C]… [--not-to-confuse N]…
 //! [--area A] [--solution GUID] [--key K] [--body-file F | stdin]` — термин словаря
@@ -41,14 +44,25 @@ pub struct Changelog<'a> {
     pub key: Option<&'a str>,
 }
 
-/// `commit:SHA` → (`commits`, `SHA`); неизвестный вид → код 6.
+/// `commit:SHA` → (`commits`, `SHA`); путь без вида (`src/a.rs`, `C:\p\a.rs`) — файл;
+/// неизвестный вид → код 6.
 pub fn parse_ref(raw: &str) -> Result<(&'static str, String), CliError> {
     let bad = || {
         CliError::input(format!(
-            "--ref «{raw}»: формат commit:SHA, file:PATH, note:ID или issue:X"
+            "--ref «{raw}»: формат commit:SHA, file:PATH (или путь), note:ID или issue:X"
         ))
     };
-    let (k, v) = raw.split_once(':').ok_or_else(bad)?;
+    let Some((k, v)) = raw.split_once(':') else {
+        return if raw.trim().is_empty() {
+            Err(bad())
+        } else {
+            Ok(("files", raw.to_string()))
+        };
+    };
+    // буква диска или путь с двоеточием в имени (`a/b:c`) — файл
+    if k.len() == 1 && k.bytes().all(|b| b.is_ascii_alphabetic()) || k.contains(['/', '\\']) {
+        return Ok(("files", raw.to_string()));
+    }
     let key = match k {
         "commit" => "commits",
         "file" => "files",
@@ -106,10 +120,34 @@ pub fn changelog_data(kind: &str, refs: &[String]) -> Result<Value, CliError> {
 }
 
 pub fn changelog(ctx: &Ctx, o: &Changelog) -> Result<(), CliError> {
-    let data = changelog_data(o.kind, o.refs)?;
+    let mut data = changelog_data(o.kind, o.refs)?;
+    let files: Vec<String> = data
+        .pointer("/refs/files")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let refs = super::refs::request_refs(&files)?;
+    if let Some(r) = &refs {
+        // в `data.refs.files` — нормализованные пути (те же, что у ссылок)
+        data["refs"]["files"] = Value::Array(
+            r["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|f| f["path"].clone())
+                .collect(),
+        );
+    }
     let guid = solution_guid(ctx, o.solution)?;
     let body = read_text(o.body_file)?;
-    let req = json!({ "kind": "changelog", "title": o.title, "body": body, "data": data });
+    let mut req = json!({ "kind": "changelog", "title": o.title, "body": body, "data": data });
+    if let Some(r) = refs {
+        req["refs"] = r;
+    }
     post_entry(ctx, &guid, &req, o.key, o.area)
 }
 
@@ -240,7 +278,7 @@ mod tests {
 
     #[test]
     fn bad_refs() {
-        for r in ["abc", "url:x", "commit:", ":x"] {
+        for r in ["url:x", "commit:", ":x", "", "file:"] {
             assert_eq!(
                 parse_ref(r).unwrap_err().code,
                 crate::client::EXIT_INPUT,
@@ -249,5 +287,13 @@ mod tests {
         }
         // двоеточие внутри значения сохраняется
         assert_eq!(parse_ref("file:C:/a").unwrap(), ("files", "C:/a".into()));
+        // путь без вида — файл (в том числе с буквой диска и с `\`)
+        assert_eq!(parse_ref("src/a.rs").unwrap(), ("files", "src/a.rs".into()));
+        assert_eq!(
+            parse_ref("C:\\p\\a.rs").unwrap(),
+            ("files", "C:\\p\\a.rs".into())
+        );
+        assert_eq!(parse_ref("abc").unwrap(), ("files", "abc".into()));
+        assert_eq!(parse_ref("dir/a:b").unwrap(), ("files", "dir/a:b".into()));
     }
 }

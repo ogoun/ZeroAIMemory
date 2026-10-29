@@ -12,6 +12,7 @@ pub mod log;
 pub mod mcp;
 pub mod question;
 pub mod read;
+pub mod refs;
 pub mod release;
 pub mod search;
 pub mod solution;
@@ -65,6 +66,8 @@ pub struct Ctx {
     pub client: Client,
     pub solution: Option<Solution>,
     pub json: bool,
+    /// Сессия агента (`X-Zam-Session`): запись в память попадает в журнал этой сессии.
+    pub session: Option<String>,
 }
 
 /// URL и токен (`locate` M0), `solution.toml` — и клиент API.
@@ -96,11 +99,13 @@ pub fn connect(c: &Common) -> Result<Ctx, CliError> {
         &token.value,
         solution.as_ref().map(|s| s.id.clone()),
     );
-    client.set_session(agent_session(&cwd));
+    let session = agent_session(&cwd);
+    client.set_session(session.clone());
     Ok(Ctx {
         client,
         solution,
         json: c.json,
+        session,
     })
 }
 
@@ -120,6 +125,36 @@ fn agent_session(cwd: &std::path::Path) -> Option<String> {
 }
 
 impl Ctx {
+    /// Запись в память командой `zam` агента → `Ev::MemoryWrite {kind}` в журнал его сессии
+    /// (M4.5 §9.1: из ответов MCP этого не видно, пишет только CLI); без сессии, без журнала
+    /// сессии в корне проекта (его заводят хуки) или при выключенном `session_journal` —
+    /// ничего. Сбой журнала команду не валит.
+    pub fn note_write(&self, kind: &str) {
+        let Some(session) = self.session.as_deref() else {
+            return;
+        };
+        let cwd = std::env::current_dir().unwrap_or_default();
+        // только дописывание в уже начатый хуками журнал: команда не создаёт `.zeroaimemory/`
+        // (корень без разметки — корень git, иначе журнал появился бы в чужом репозитории)
+        let root = hook::project_root(&cwd, &home_dir());
+        if !hook::journal::path(&root, session).is_file() {
+            return;
+        }
+        let env = hook::Env::new(
+            hook::Kind::Prompt,
+            hook::Agent::Claude,
+            std::time::Instant::now(),
+            cwd,
+            home_dir(),
+        );
+        if env.settings().flag_on(hook::Flag::SessionJournal) {
+            let ev = hook::journal::Ev::MemoryWrite {
+                kind: kind.chars().take(32).collect(),
+            };
+            let _ = hook::journal::append(&env.root, session, &ev);
+        }
+    }
+
     pub fn locate(&self, raw: &str) -> Result<Loc, CliError> {
         target::parse(raw).resolve(self.solution.as_ref())
     }
@@ -259,6 +294,9 @@ pub fn post_entry(
         .post_json_with(&format!("/spaces/{guid}/entries"), body, &headers)?;
     let created = r.status().as_u16() == 201;
     let e = read_json(r)?;
+    if created {
+        ctx.note_write(body["kind"].as_str().unwrap_or("entry"));
+    }
     if ctx.json {
         return emit_json(&json!({ "entry": e, "created": created }));
     }

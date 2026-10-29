@@ -9,7 +9,8 @@
 //! - `link rm` — ничего (код 0), выведенные из текста и системные связи не удаляются (код 6);
 //! - `links` — строки `<→|←><TAB>type<TAB>ref<TAB>путь или заголовок<TAB>origin<TAB>edge-id`:
 //!   `→` — исходящие (у неразрешённой ссылки вместо ref — `-`, вместо пути — ключ ссылки),
-//!   `←` — обратные ссылки (`--json` — `{links, backlinks}`).
+//!   `←` — обратные ссылки (`--json` — `{links, backlinks}`);
+//! - `links file:<path>` — что память знает о файле проекта (M4.5 §6.3): `<ref><TAB>заголовок`.
 use serde_json::{Value, json};
 
 use super::{Ctx, emit, emit_json};
@@ -73,6 +74,9 @@ pub fn remove(ctx: &Ctx, id: &str) -> Result<(), CliError> {
 
 /// `zam links <id>`: исходящие и обратные связи узла или записи.
 pub fn list(ctx: &Ctx, raw: &str) -> Result<(), CliError> {
+    if let Some(file) = raw.strip_prefix("file:") {
+        return file_links(ctx, file);
+    }
     let r = target_ref(ctx, raw, false)?;
     let (kind, id) = r.split_once(':').expect("ссылка n:/e:");
     let (out, back) = if kind == "n" {
@@ -100,6 +104,30 @@ pub fn list(ctx: &Ctx, raw: &str) -> Result<(), CliError> {
     }
     let mut s = render(&out, "→", "dst");
     s.push_str(&render(&back, "←", "src"));
+    emit(s.as_bytes())
+}
+
+/// `zam links file:<path>` (M4.5 §6.3): что память знает о файле — `GET /graph?file=`
+/// (путь нормализуется как у ссылок; решение — из `solution.toml`). Строка на владельца:
+/// `<ref>\t<путь заметки или заголовок записи>`.
+fn file_links(ctx: &Ctx, file: &str) -> Result<(), CliError> {
+    let (cwd, root) = super::refs::cli_root();
+    let path = super::refs::ref_path(file, &cwd, &root)
+        .map_err(|e| CliError::input(format!("file:{file}: {e}")))?;
+    let mut q = vec![("file", path.as_str())];
+    let sol = ctx.solution.as_ref().map(|s| s.id.clone());
+    if let Some(s) = &sol {
+        q.push(("solution", s.as_str()));
+    }
+    let g = read_json(ctx.client.get("/graph", &q)?)?;
+    if ctx.json {
+        return emit_json(&json!({ "file": path, "nodes": g["nodes"] }));
+    }
+    let mut s = String::new();
+    for n in g["nodes"].as_array().into_iter().flatten() {
+        let r = n["ref"].as_str().unwrap_or("?");
+        s.push_str(&format!("{r}\t{}\n", label(&g["nodes"], r)));
+    }
     emit(s.as_bytes())
 }
 

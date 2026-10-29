@@ -6286,6 +6286,7 @@ dependencies = [
  "toml",
  "ureq",
  "zam-core",
+ "zam-markdown",
  "zam-server",
  "zam-store",
 ]

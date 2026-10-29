@@ -285,6 +285,22 @@ pub(crate) fn owner_refs(tx: &Connection, owner: TargetRef) -> Result<Vec<FileRe
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Замещение без `refs` (раунд 2 задачи 7, ревью): ссылки новой записи `new` на те же пути
+/// получают от замещаемой `old` решение, `recorded_at` и состояние (`state`, `stale_at`,
+/// `stale_reason`) — иначе ссылка Knowledge теряла бы `X-Zam-Solution` исходного запроса, а
+/// `stale` молча становилась бы `ok`.
+pub(crate) fn inherit_ref_state(tx: &Connection, old: Id, new: Id) -> Result<(), StoreError> {
+    tx.prepare_cached(
+        "UPDATE file_refs AS n SET solution_guid = o.solution_guid, recorded_at = o.recorded_at,
+                state = o.state, stale_at = o.stale_at, stale_reason = o.stale_reason
+         FROM file_refs AS o
+         WHERE n.owner_kind = 'entry' AND n.owner_id = ?2
+           AND o.owner_kind = 'entry' AND o.owner_id = ?1 AND o.path = n.path",
+    )?
+    .execute(params![old, new])?;
+    Ok(())
+}
+
 /// Дописывает ссылки без хэша на пути, которых у владельца ещё нет (до [`REFS_MAX`] всего).
 fn add_paths(
     tx: &Connection,

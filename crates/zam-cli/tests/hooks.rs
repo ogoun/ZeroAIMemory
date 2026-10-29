@@ -1226,3 +1226,590 @@ fn hooks_with_server_within_margin() {
     }
     eprintln!("ZAM_TIMING {}", report.join(", "));
 }
+
+// ---------- M4.5, задача 8: журнал сессии, знание о файле, очередь изменённых файлов ----------
+
+/// Индекс `file-refs.json` вручную: `src/pool.rs` — ловушка (`ok`) и заметка (`stale`).
+fn write_file_refs(p: &Proj, server: &str) {
+    let c = json!({
+        "etag": "f1", "fetched_at": "2026-10-29T00:00:00Z", "server": server, "solution": G,
+        "refs": [
+            {"path": "src/pool.rs", "hash": "a".repeat(64), "items": [
+                {"id": "i:E7", "kind": "gotcha", "title": "Пул соединений течёт", "state": "ok"},
+                {"id": "n:N1", "kind": "note", "title": "Архитектура пула", "state": "stale"},
+            ]},
+            {"path": "scripts/deploy.sh", "items": [
+                {"id": "c:C1", "kind": "changelog", "title": "Деплой через systemd", "state": "ok"},
+            ]},
+        ],
+    });
+    std::fs::create_dir_all(p.cache()).unwrap();
+    std::fs::write(p.cache().join("file-refs.json"), c.to_string()).unwrap();
+}
+
+/// Строка знания о `src/pool.rs` из [`write_file_refs`].
+const POOL_LINE: &str = "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] \
+— i:E7; Архитектура пула [note, возможно устарело] — n:N1";
+
+/// Claude `PostToolUse` (успех) инструмента `tool` с `tool_input`.
+fn post_ok(p: &Proj, session: &str, tool: &str, input: Value) -> Value {
+    p.ev(
+        "PostToolUse",
+        session,
+        json!({"tool_name": tool, "tool_use_id": "u9", "tool_input": input,
+               "tool_response": {"success": true}}),
+    )
+}
+
+/// События журнала сессии (`events-<сессия>.jsonl`), строки JSON.
+fn events(p: &Proj, session: &str) -> Vec<Value> {
+    let Some(f) = p.session_file("events", session, ".jsonl") else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(f)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// Очередь изменённых файлов сессии (`changed-<сессия>.jsonl`).
+fn queue(p: &Proj, session: &str) -> Vec<Value> {
+    let Some(f) = p.session_file("changed", session, ".jsonl") else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(f)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn blake(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+#[test]
+fn post_tool_read_shows_file_knowledge_offline() {
+    let _g = serial();
+    let p = Proj::new("post-read", DEAD, "zam_x");
+    write_file_refs(&p, DEAD);
+    let read = post_ok(
+        &p,
+        "r1",
+        "Read",
+        json!({"file_path": p.repo.join("src").join("pool.rs")}),
+    );
+    let (o, _) = p.hook_at(DEAD, "post-tool", "claude", read.to_string().as_bytes());
+    assert_eq!(context(&o, "PostToolUse"), POOL_LINE);
+    // путь относительно cwd и с `./` — тот же файл (другая сессия)
+    let rel = post_ok(
+        &p,
+        "r2",
+        "Read",
+        json!({"file_path": "./src/../src/pool.rs"}),
+    );
+    let (o, _) = p.hook_at(DEAD, "post-tool", "claude", rel.to_string().as_bytes());
+    assert_eq!(context(&o, "PostToolUse"), POOL_LINE);
+    // файл, о котором память ничего не знает, — тишина; чтение записано в журнал
+    let other = post_ok(
+        &p,
+        "r1",
+        "Read",
+        json!({"file_path": p.repo.join("README.md")}),
+    );
+    empty(
+        &p.hook_at(DEAD, "post-tool", "claude", other.to_string().as_bytes())
+            .0,
+    );
+    let ev = events(&p, "r1");
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert_eq!(ev[0]["ev"], "read");
+    assert_eq!(ev[0]["path"], "src/pool.rs");
+    assert_eq!(ev[1]["path"], "README.md");
+    assert!(ev[0]["ts"].as_u64().is_some());
+    // кэш другого сервера не используется
+    let s2 = post_ok(&p, "r3", "Read", json!({"file_path": "src/pool.rs"}));
+    empty(
+        &p.hook_at(
+            "http://127.0.0.1:10",
+            "post-tool",
+            "claude",
+            s2.to_string().as_bytes(),
+        )
+        .0,
+    );
+    // ошибки хука в журнале нет
+    assert_eq!(p.log(), "", "hooks.log");
+}
+
+#[test]
+fn post_tool_read_once_per_file() {
+    let _g = serial();
+    let p = Proj::new("post-read-once", DEAD, "zam_x");
+    write_file_refs(&p, DEAD);
+    let read = |s: &str, f: &str| {
+        let v = post_ok(&p, s, "Read", json!({"file_path": p.repo.join(f)}));
+        p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes())
+            .0
+    };
+    assert_eq!(
+        context(&read("o1", "src/pool.rs"), "PostToolUse"),
+        POOL_LINE
+    );
+    empty(&read("o1", "src/pool.rs"));
+    // другой файл в той же сессии — показывается; правка уже показанного — без строки о файле
+    assert!(context(&read("o1", "scripts/deploy.sh"), "PostToolUse").contains("c:C1"));
+    let pre = p.ev(
+        "PreToolUse",
+        "o1",
+        json!({"tool_name": "Edit", "tool_input": {"file_path": p.repo.join("src/pool.rs")}}),
+    );
+    empty(
+        &p.hook_at(DEAD, "pre-tool", "claude", pre.to_string().as_bytes())
+            .0,
+    );
+    // новая сессия — снова; pre-tool на правку показывает знание раньше триггеров file_glob
+    assert_eq!(
+        context(&read("o2", "src/pool.rs"), "PostToolUse"),
+        POOL_LINE
+    );
+    write_cache(&p, DEAD);
+    let pre = p.ev(
+        "PreToolUse",
+        "o3",
+        json!({"tool_name": "Write",
+               "tool_input": {"file_path": p.repo.join("scripts/deploy.sh"), "content": "x"}}),
+    );
+    let c = context(
+        &p.hook_at(DEAD, "pre-tool", "claude", pre.to_string().as_bytes())
+            .0,
+        "PreToolUse",
+    );
+    let lines: Vec<&str> = c.lines().collect();
+    assert_eq!(lines.len(), 2, "{c}");
+    assert!(lines[0].starts_with("ZeroAIMemory: о файле scripts/deploy.sh в памяти: Деплой через systemd [changelog] — c:C1"), "{c}");
+    assert!(lines[1].contains("для **/*.sh"), "{c}");
+    // показанное — ключом file:<путь> в shown-файле сессии
+    let shown = std::fs::read_to_string(p.session_file("shown", "o1", ".json").unwrap()).unwrap();
+    assert!(shown.contains("file:src/pool.rs"), "{shown}");
+}
+
+#[test]
+fn post_tool_edit_queues_hash() {
+    let _g = serial();
+    let p = Proj::new("post-edit", DEAD, "zam_x");
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/a.rs"), b"fn a() {}\n").unwrap();
+    std::fs::write(p.repo.join("src/b.rs"), b"fn b() {}\n").unwrap();
+    for (tool, input) in [
+        (
+            "Edit",
+            json!({"file_path": p.repo.join("src/a.rs"), "old_string": "a", "new_string": "b"}),
+        ),
+        (
+            "Write",
+            json!({"file_path": p.repo.join("src/b.rs"), "content": "fn b() {}\n"}),
+        ),
+        (
+            "MultiEdit",
+            json!({"file_path": p.repo.join("src/a.rs"), "edits": []}),
+        ),
+        (
+            "NotebookEdit",
+            json!({"notebook_path": p.repo.join("gone.ipynb")}),
+        ),
+    ] {
+        let v = post_ok(&p, "e1", tool, input);
+        empty(
+            &p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes())
+                .0,
+        );
+    }
+    let q = queue(&p, "e1");
+    assert_eq!(
+        q,
+        vec![
+            json!({"path": "src/a.rs", "hash": blake(b"fn a() {}\n")}),
+            json!({"path": "src/b.rs", "hash": blake(b"fn b() {}\n")}),
+            json!({"path": "src/a.rs", "hash": blake(b"fn a() {}\n")}),
+            // удалённый файл — «хэш» нулей
+            json!({"path": "gone.ipynb", "hash": "0".repeat(64)}),
+        ]
+    );
+    let ev = events(&p, "e1");
+    let edits: Vec<&str> = ev
+        .iter()
+        .filter(|e| e["ev"] == "edit")
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(edits, ["src/a.rs", "src/b.rs", "src/a.rs", "gone.ipynb"]);
+    // правка отмечена для checkpoint; Bash — событие cmd без аргументов
+    assert!(p.session_file("edits", "e1", "").is_some());
+    let bash = post_ok(
+        &p,
+        "e1",
+        "Bash",
+        json!({"command": "cargo test --secret-flag"}),
+    );
+    empty(
+        &p.hook_at(DEAD, "post-tool", "claude", bash.to_string().as_bytes())
+            .0,
+    );
+    let last = events(&p, "e1").pop().unwrap();
+    assert_eq!(last["ev"], "cmd");
+    assert_eq!(last["exe"], "cargo");
+    assert_eq!(last["ok"], true);
+    // файл вне корня — ни события, ни очереди
+    let out = post_ok(
+        &p,
+        "e2",
+        "Edit",
+        json!({"file_path": p.repo.parent().unwrap().join("x.rs")}),
+    );
+    empty(
+        &p.hook_at(DEAD, "post-tool", "claude", out.to_string().as_bytes())
+            .0,
+    );
+    assert!(queue(&p, "e2").is_empty());
+    assert!(events(&p, "e2").is_empty());
+    // ошибка инструмента — error и cmd {ok: false} с отпечатком
+    let fail = p.ev(
+        "PostToolUseFailure",
+        "e3",
+        json!({"tool_name": "Bash", "tool_input": {"command": "./build.sh --token abc"},
+               "error": "/bin/bash^M: bad interpreter at line 12"}),
+    );
+    let _ = p.hook_at(DEAD, "post-tool", "claude", fail.to_string().as_bytes());
+    let ev = events(&p, "e3");
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert_eq!(ev[0]["ev"], "error");
+    assert_eq!(ev[0]["tool"], "Bash");
+    assert_eq!(ev[1]["ev"], "cmd");
+    assert_eq!(ev[1]["exe"], "build.sh");
+    assert_eq!(ev[1]["ok"], false);
+    assert_eq!(ev[0]["err_fp"], ev[1]["err_fp"]);
+    assert_eq!(ev[0]["err_fp"].as_str().unwrap().len(), 16);
+    assert!(!ev[0]["text"].as_str().unwrap().contains("12"), "{ev:?}");
+    let raw = std::fs::read_to_string(p.session_file("events", "e3", ".jsonl").unwrap()).unwrap();
+    assert!(
+        !raw.contains("abc"),
+        "аргументы команды не в журнале: {raw}"
+    );
+}
+
+/// Codex: `PostToolUse` `apply_patch` без stderr — успех: правка каждого файла патча в журнал
+/// и очередь; со stderr — режим ошибки.
+#[test]
+fn codex_apply_patch_edit_events() {
+    let _g = serial();
+    let p = Proj::new("codex-patch-post", DEAD, "zam_x");
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/main.rs"), b"fn main() {}\n").unwrap();
+    std::fs::write(p.repo.join("new.txt"), b"new\n").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-a\n+b\n*** Add File: new.txt\n+new\n*** Delete File: old.txt\n*** End Patch\n";
+    let ev = p.ev(
+        "PostToolUse",
+        "cx",
+        json!({"tool_name": "apply_patch", "tool_input": {"command": patch},
+               "tool_response": "{\"stdout\":\"Success. Updated the following files\"}"}),
+    );
+    empty(
+        &p.hook_at(DEAD, "post-tool", "codex", ev.to_string().as_bytes())
+            .0,
+    );
+    let edits: Vec<String> = events(&p, "cx")
+        .iter()
+        .filter(|e| e["ev"] == "edit")
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(edits, ["src/main.rs", "new.txt", "old.txt"]);
+    let q = queue(&p, "cx");
+    assert_eq!(q.len(), 3);
+    assert_eq!(q[0]["hash"], blake(b"fn main() {}\n"));
+    assert_eq!(q[2]["hash"], "0".repeat(64));
+    // Bash Codex со stderr — ошибка, без строки в очереди
+    let bad = p.ev(
+        "PostToolUse",
+        "cx",
+        json!({"tool_name": "Bash", "tool_input": {"command": "make"},
+               "tool_response": {"stdout": "", "stderr": "make: *** No rule"}}),
+    );
+    let _ = p.hook_at(DEAD, "post-tool", "codex", bad.to_string().as_bytes());
+    let last = events(&p, "cx").pop().unwrap();
+    assert_eq!(
+        (last["ev"].as_str(), last["ok"].as_bool()),
+        (Some("cmd"), Some(false))
+    );
+    assert_eq!(queue(&p, "cx").len(), 3);
+}
+
+/// Успешный `post-tool` без сети — 100 запусков (чтение со знанием о файле и журналом):
+/// p95 ≤ 200 мс (×4 от бюджета 50 мс, как `pre_tool_under_50ms`); значения — в журнал этапа.
+#[test]
+fn post_tool_success_under_50ms() {
+    let _g = serial();
+    let p = Proj::new("post-timing", DEAD, "zam_x");
+    write_file_refs(&p, DEAD);
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), "x".repeat(64 * 1024)).unwrap();
+    let mut times = Vec::new();
+    for i in 0..100 {
+        let (tool, input) = if i % 2 == 0 {
+            ("Read", json!({"file_path": p.repo.join("src/pool.rs")}))
+        } else {
+            (
+                "Edit",
+                json!({"file_path": p.repo.join("src/pool.rs"), "old_string": "x"}),
+            )
+        };
+        let v = post_ok(&p, &format!("pt{i}"), tool, input);
+        let (o, d) = p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes());
+        if tool == "Read" {
+            assert_eq!(context(&o, "PostToolUse"), POOL_LINE);
+        } else {
+            empty(&o);
+        }
+        times.push(d);
+    }
+    let q = p95(times.clone());
+    let min = times.iter().min().unwrap();
+    eprintln!("ZAM_TIMING post-tool (успех) p95={q:?} min={min:?} (100 запусков)");
+    assert!(q <= PRE_TOOL_P95_MAX, "post-tool p95 {q:?}");
+    assert_eq!(p.log(), "", "hooks.log");
+}
+
+/// Выключенный `file_context` (клиент или сервер) — без строк о файле; журнал и очередь
+/// остаются; выключенный `session_journal` — журнала нет.
+#[test]
+fn file_context_disabled_silent() {
+    let _g = serial();
+    let p = Proj::new("file-ctx-off", DEAD, "zam_x");
+    write_file_refs(&p, DEAD);
+    write_cache(&p, DEAD);
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]\nfile_context = false\n",
+    )
+    .unwrap();
+    let read = post_ok(
+        &p,
+        "f1",
+        "Read",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    empty(
+        &p.hook_at(DEAD, "post-tool", "claude", read.to_string().as_bytes())
+            .0,
+    );
+    assert_eq!(events(&p, "f1").len(), 1, "журнал ведётся");
+    // pre-tool: знания о файле нет, триггер file_glob — есть
+    let pre = p.ev(
+        "PreToolUse",
+        "f1",
+        json!({"tool_name": "Write",
+               "tool_input": {"file_path": p.repo.join("scripts/deploy.sh"), "content": "x"}}),
+    );
+    let c = context(
+        &p.hook_at(DEAD, "pre-tool", "claude", pre.to_string().as_bytes())
+            .0,
+        "PreToolUse",
+    );
+    assert!(!c.contains("о файле"), "{c}");
+    assert!(c.contains("i:E1"), "{c}");
+    // выключено на сервере (hooks.json), в клиенте включено
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]\nfile_context = true\nsession_journal = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.cache().join("hooks.json"),
+        json!({"fetched_at": "x", "server": DEAD, "hooks": {"file_context": false}}).to_string(),
+    )
+    .unwrap();
+    let read = post_ok(
+        &p,
+        "f2",
+        "Read",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    empty(
+        &p.hook_at(DEAD, "post-tool", "claude", read.to_string().as_bytes())
+            .0,
+    );
+    assert!(events(&p, "f2").is_empty(), "session_journal = false");
+    let prompt = p.ev("UserPromptSubmit", "f2", json!({"prompt": "секрет"}));
+    empty(
+        &p.hook_at(DEAD, "prompt", "claude", prompt.to_string().as_bytes())
+            .0,
+    );
+    assert!(events(&p, "f2").is_empty());
+}
+
+/// `hooks.json` старого сервера (пять ключей M4) и `config.toml` без новых ключей — новые
+/// типы включены.
+#[test]
+fn old_hooks_json_without_new_keys_enables() {
+    let _g = serial();
+    let p = Proj::new("old-hooks-json", DEAD, "zam_x");
+    write_file_refs(&p, DEAD);
+    std::fs::write(
+        p.cache().join("hooks.json"),
+        json!({"fetched_at": "2026-10-27T00:00:00Z", "server": DEAD,
+               "hooks": {"session_start": true, "prompt": true, "pre_tool": true,
+                         "post_tool": true, "checkpoint": true}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]\nprompt = true\n",
+    )
+    .unwrap();
+    let read = post_ok(
+        &p,
+        "h1",
+        "Read",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    let (o, _) = p.hook_at(DEAD, "post-tool", "claude", read.to_string().as_bytes());
+    assert_eq!(context(&o, "PostToolUse"), POOL_LINE);
+    let prompt = p.ev(
+        "UserPromptSubmit",
+        "h1",
+        json!({"prompt": "почему пул течёт"}),
+    );
+    let _ = p.hook_at(DEAD, "prompt", "claude", prompt.to_string().as_bytes());
+    let ev = events(&p, "h1");
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert_eq!(ev[1], json!({"ts": ev[1]["ts"], "ev": "prompt", "len": 16}));
+}
+
+/// `GET /file-refs` с решением: записи со ссылками (`zam log … --ref`).
+fn file_refs_index(p: &Proj) -> Value {
+    let r = http()
+        .get(&format!("{}/api/v1/file-refs?solution={G}", p.url))
+        .header("Authorization", format!("Bearer {}", p.token))
+        .call()
+        .unwrap();
+    serde_json::from_str(&r.into_body().read_to_string().unwrap()).unwrap()
+}
+
+fn ref_state(idx: &Value, path: &str) -> Vec<String> {
+    idx["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"] == path)
+        .map(|r| {
+            r["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["state"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Правка файла уходит очередью `POST /files/changed` из `prompt`: ссылка `stale`, очередь
+/// пуста; `session-start` кэширует индекс `file-refs.json` (ETag), `Read` показывает знание.
+#[test]
+fn prompt_flushes_changed_queue() {
+    let _g = serial();
+    let (url, tok) = start("flush");
+    let p = Proj::new("flush", &url, &tok);
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), b"v1\n").unwrap();
+    let o = p.zam(
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "Пул соединений течёт",
+            "--ref",
+            "src/pool.rs",
+        ],
+        "Разобрано.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    assert_eq!(ref_state(&file_refs_index(&p), "src/pool.rs"), ["ok"]);
+    // session-start: индекс в кэш
+    let ss = p.ev("SessionStart", "fl", json!({"source": "startup"}));
+    let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+    let cache: Value =
+        serde_json::from_str(&std::fs::read_to_string(p.cache().join("file-refs.json")).unwrap())
+            .unwrap();
+    assert_eq!(cache["solution"], G);
+    assert!(!cache["etag"].as_str().unwrap().is_empty());
+    assert_eq!(cache["refs"][0]["items"][0]["id"], format!("i:{id}"));
+    let read = post_ok(
+        &p,
+        "fl",
+        "Read",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    let (o, _) = p.hook_at(&url, "post-tool", "claude", read.to_string().as_bytes());
+    assert!(
+        context(&o, "PostToolUse").contains(&format!("Пул соединений течёт [insight] — i:{id}"))
+    );
+    // правка → очередь → prompt отправляет
+    std::fs::write(p.repo.join("src/pool.rs"), b"v2\n").unwrap();
+    let edit = post_ok(
+        &p,
+        "fl",
+        "Edit",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    let _ = p.hook_at(&url, "post-tool", "claude", edit.to_string().as_bytes());
+    assert_eq!(queue(&p, "fl").len(), 1);
+    let pr = p.ev("UserPromptSubmit", "fl", json!({"prompt": "что с пулом"}));
+    let _ = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
+    assert!(queue(&p, "fl").is_empty(), "очередь отправлена");
+    assert_eq!(ref_state(&file_refs_index(&p), "src/pool.rs"), ["stale"]);
+    // сервер недоступен — очередь остаётся до следующего раза
+    std::fs::write(p.repo.join("src/pool.rs"), b"v1\n").unwrap();
+    let _ = p.hook_at(&url, "post-tool", "claude", edit.to_string().as_bytes());
+    let _ = p.hook_at(DEAD, "prompt", "claude", pr.to_string().as_bytes());
+    assert_eq!(queue(&p, "fl").len(), 1, "ошибка — очередь цела");
+    let stop = p.ev("Stop", "fl", json!({"stop_hook_active": false}));
+    let _ = p.hook_at(&url, "checkpoint", "claude", stop.to_string().as_bytes());
+    assert!(queue(&p, "fl").is_empty(), "checkpoint отправил");
+    assert_eq!(
+        ref_state(&file_refs_index(&p), "src/pool.rs"),
+        ["ok"],
+        "хэш вернулся"
+    );
+    let ev = events(&p, "fl");
+    assert!(ev.iter().any(|e| e["ev"] == "prompt"), "{ev:?}");
+}
+
+/// `memory_write` из `zam` агента — только в журнал, который уже завели хуки этой сессии;
+/// без журнала команда ничего не создаёт.
+#[test]
+fn cli_memory_write_only_into_existing_journal() {
+    let _g = serial();
+    let (url, tok) = start("memwrite");
+    let p = Proj::new("memwrite", &url, &tok);
+    let log = |session: &str| {
+        let o = p
+            .cmd(&url)
+            .env("ZAM_SESSION", session)
+            .args(["log", "changelog", "--kind", "fix", "--title", "Правка"])
+            .write_stdin(b"x\n".to_vec())
+            .output()
+            .unwrap();
+        ok(&o);
+    };
+    log("mw-none");
+    assert!(p.session_file("events", "mw-none", ".jsonl").is_none());
+    let pr = p.ev("UserPromptSubmit", "mw1", json!({"prompt": "п"}));
+    let _ = p.hook_at(DEAD, "prompt", "claude", pr.to_string().as_bytes());
+    log("mw1");
+    let ev = events(&p, "mw1");
+    assert_eq!(ev.last().unwrap()["ev"], "memory_write", "{ev:?}");
+    assert_eq!(ev.last().unwrap()["kind"], "changelog");
+}

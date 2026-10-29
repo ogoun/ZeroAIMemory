@@ -7,7 +7,8 @@
 //!   (`solution.toml` или `--solution`) или, при `--scope global`, в Knowledge. `--evidence-file`
 //!   — JSON-объект `{checked, method, result}` → `data.evidence`; `--trigger` —
 //!   `file_glob:**/*.sh`, `command_regex:…`, `error_regex:…`, `keyword:…` (без инструментов:
-//!   любые). Ответ 409 (похожий insight уже есть) печатает кандидатов и подсказки, код 4.
+//!   любые); `--ref <путь>` (повторяемый) — ссылки на файлы с хэшем и коммитом (M4.5 §6.1).
+//!   Ответ 409 (похожий insight уже есть) печатает кандидатов и подсказки, код 4.
 //!   Успех → `<id>@<rev>`; проверка только по заголовку (нет модели) — пометка в stderr.
 //!   `--certainty axiom` — только по прямому указанию пользователя и только с `--reason`
 //!   (иначе код 6 до запроса); `--reason` уходит сообщением ревизии (`message`) (стенд M4).
@@ -50,6 +51,9 @@ pub struct Fields<'a> {
     pub evidence_file: Option<&'a Path>,
     pub triggers: &'a [String],
     pub tags: &'a [String],
+    /// Файлы `--ref` (M4.5 §6.1): ссылки `{path, hash, commit}`; у замещения без `--ref`
+    /// сервер наследует ссылки старой записи.
+    pub refs: &'a [String],
     pub area: Option<&'a str>,
     pub key: Option<&'a str>,
 }
@@ -135,6 +139,9 @@ fn insight_body(f: &Fields, kind: &str) -> Result<Value, CliError> {
     }
     if let Some(r) = reason {
         body["message"] = json!(r);
+    }
+    if let Some(r) = super::refs::request_refs(f.refs)? {
+        body["refs"] = r;
     }
     Ok(body)
 }
@@ -237,6 +244,9 @@ pub fn log(ctx: &Ctx, o: &Log) -> Result<(), CliError> {
         )
         .map_err(explain_duplicate)?;
     let created = r.status().as_u16() == 201;
+    if created {
+        ctx.note_write("insight");
+    }
     emit_entry(ctx, &read_json(r)?, created)
 }
 
@@ -565,6 +575,7 @@ mod tests {
             evidence_file: None,
             triggers: &[],
             tags: &[],
+            refs: &[],
             area: None,
             key: None,
         };

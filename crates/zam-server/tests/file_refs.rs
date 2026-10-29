@@ -1118,3 +1118,51 @@ async fn participant_does_not_touch_owner_knowledge_refs() {
     assert!(found.contains(&sol), "{found:?}");
     assert!(!found.contains(&kn), "{found:?}");
 }
+
+/// Замещение без `refs` (ревью задачи 7, раунд 2): ссылка Knowledge сохраняет решение
+/// исходного запроса (`X-Zam-Solution`), хотя замещение идёт без заголовка, а `stale`
+/// остаётся `stale`.
+#[tokio::test]
+async fn supersede_inherits_ref_solution_and_state() {
+    let a = setup("refs-supersede-state").await;
+    let tok = a.token.clone();
+    let r = a
+        .tok_h(
+            &tok,
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(
+                json!({"kind": "insight", "title": "Пул в Knowledge", "body": "пул: подробности",
+                        "data": {"kind": "gotcha"}, "force": true,
+                        "refs": {"files": [{"path": "src/pool.rs", "hash": h('1')}]}}),
+            ),
+            &[("x-zam-solution", G)],
+        )
+        .await;
+    let old = id(&created(r).await);
+    let r = changed(&a, json!([{"path": "src/pool.rs", "hash": h('2')}])).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["stale"], 1, "{}", r.text());
+    // замещение без заголовка решения и без `refs`
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/entries/{old}/supersede"),
+            Some(json!({"title": "Пул в Knowledge v2", "body": "уточнено",
+                        "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let v2 = id_of_entry(&r.json());
+    let idx = index(&a).await;
+    assert_eq!(
+        state(&idx, "src/pool.rs", &format!("i:{v2}")),
+        "stale",
+        "решение и состояние унаследованы: {idx}"
+    );
+    // тот же хэш, что записан, снова делает ссылку `ok`: хэш тоже унаследован
+    let r = changed(&a, json!([{"path": "src/pool.rs", "hash": h('1')}])).await;
+    assert_eq!(r.json()["stale"], 0, "{}", r.text());
+    let idx = index(&a).await;
+    assert_eq!(state(&idx, "src/pool.rs", &format!("i:{v2}")), "ok");
+}

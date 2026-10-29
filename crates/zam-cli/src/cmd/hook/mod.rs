@@ -12,10 +12,16 @@
 //! - **Переключатели** (решение контроллера R5, [`Settings`]): `[hooks]` в
 //!   `~/.zeroaimemory/config.toml` и `<корень>/.zeroaimemory/config.toml` (проект сильнее
 //!   домашнего), затем настройка сервера из ответа `/recall(session_start)` (кэш
-//!   `cache/hooks.json`): тип выключен, если выключен в клиенте или на сервере.
+//!   `cache/hooks.json`): тип выключен, если выключен в клиенте или на сервере. С M4.5 (§9.6)
+//!   ключей девять ([`Flag`]): к типам команд добавлены `subagent_start`, `file_context`
+//!   (знание о файле), `session_journal` (журнал сессии [`journal`]) и `recovery`; нет ключа
+//!   — `true` (старый `hooks.json` и старый сервер новое не выключают).
+//! - **`post-tool`** — два режима: ошибка (как M4: `/recall(post_tool)`, бюджет 250 мс) и
+//!   успех (M4.5: журнал, знание о файле, очередь изменённых — без сети, 50 мс).
 pub mod cache;
 pub mod checkpoint;
 pub mod input;
+pub mod journal;
 pub mod output;
 pub mod post_tool;
 pub mod pre_tool;
@@ -79,7 +85,8 @@ impl Kind {
         }
     }
 
-    /// Бюджет команды (§10.3), мс.
+    /// Бюджет команды (§10.3), мс; у `post-tool` — режима ошибки (успех — без сети, 50 мс
+    /// на весь процесс, M4.5 §9.1).
     pub fn budget_ms(self) -> u64 {
         match self {
             Kind::SessionStart => 300,
@@ -101,24 +108,74 @@ impl Kind {
     }
 }
 
-/// Включённость типов подсказок (R5).
+impl Kind {
+    /// Ключ настройки типа подсказок команды.
+    pub fn flag(self) -> Flag {
+        match self {
+            Kind::SessionStart => Flag::SessionStart,
+            Kind::Prompt => Flag::Prompt,
+            Kind::PreTool => Flag::PreTool,
+            Kind::PostTool => Flag::PostTool,
+            Kind::Checkpoint => Flag::Checkpoint,
+        }
+    }
+}
+
+/// Ключ настройки подсказок `hooks.<ключ>` (R5; M4.5 §9.6). `SubagentStart` и `Recovery`
+/// читают хуки задач 9 и 10 этапа.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flag {
+    SessionStart,
+    Prompt,
+    PreTool,
+    PostTool,
+    Checkpoint,
+    SubagentStart,
+    /// Знание о файле при чтении и правке (§6.3).
+    FileContext,
+    /// Журнал событий сессии (§9.1) и подсказки по нему (§9.3).
+    SessionJournal,
+    /// Пакет восстановления после сжатия и `resume` (§9.2).
+    Recovery,
+}
+
+/// Включённость типов подсказок (R5): именованные ключи, нет ключа — `None` (включён).
+/// Неизвестные ключи (клиент старше сервера) пропускаются.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
 pub struct HookFlags {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_tool: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_tool: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_context: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_journal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<bool>,
 }
 
 impl HookFlags {
-    pub fn get(&self, k: Kind) -> Option<bool> {
-        match k {
-            Kind::SessionStart => self.session_start,
-            Kind::Prompt => self.prompt,
-            Kind::PreTool => self.pre_tool,
-            Kind::PostTool => self.post_tool,
-            Kind::Checkpoint => self.checkpoint,
+    pub fn get(&self, f: Flag) -> Option<bool> {
+        match f {
+            Flag::SessionStart => self.session_start,
+            Flag::Prompt => self.prompt,
+            Flag::PreTool => self.pre_tool,
+            Flag::PostTool => self.post_tool,
+            Flag::Checkpoint => self.checkpoint,
+            Flag::SubagentStart => self.subagent_start,
+            Flag::FileContext => self.file_context,
+            Flag::SessionJournal => self.session_journal,
+            Flag::Recovery => self.recovery,
         }
     }
 
@@ -130,6 +187,10 @@ impl HookFlags {
             pre_tool: self.pre_tool.or(base.pre_tool),
             post_tool: self.post_tool.or(base.post_tool),
             checkpoint: self.checkpoint.or(base.checkpoint),
+            subagent_start: self.subagent_start.or(base.subagent_start),
+            file_context: self.file_context.or(base.file_context),
+            session_journal: self.session_journal.or(base.session_journal),
+            recovery: self.recovery.or(base.recovery),
         }
     }
 }
@@ -150,12 +211,17 @@ pub struct Settings {
 impl Settings {
     /// Тип включён в клиенте (без учёта сервера).
     pub fn client_on(&self, k: Kind) -> bool {
-        self.client.get(k).unwrap_or(true)
+        self.client.get(k.flag()).unwrap_or(true)
     }
 
     /// Тип включён: не выключен ни в клиенте, ни на сервере.
     pub fn on(&self, k: Kind) -> bool {
-        self.client_on(k) && self.server.get(k).unwrap_or(true)
+        self.flag_on(k.flag())
+    }
+
+    /// Ключ включён: не выключен ни в клиенте, ни на сервере (нет ключа — включён).
+    pub fn flag_on(&self, f: Flag) -> bool {
+        self.client.get(f).unwrap_or(true) && self.server.get(f).unwrap_or(true)
     }
 }
 

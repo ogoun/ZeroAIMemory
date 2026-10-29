@@ -888,11 +888,16 @@ pub async fn supersede_entry(
             )));
         }
         let now = fmt_ts(Timestamp::now());
-        // без `refs` новая запись наследует ссылки на файлы замещаемой (M4.5 §6.1)
-        if new.refs.is_none() {
+        // без `refs` новая запись наследует ссылки на файлы замещаемой (M4.5 §6.1) — вместе с
+        // решением и состоянием ссылок
+        let inherit = new.refs.is_none();
+        if inherit {
             new.refs = Some(crate::file_refs::owner_refs(tx, entry_ref(old))?);
         }
         let nid = insert_entry(tx, new, key, &a, Some(old), &now)?;
+        if inherit {
+            crate::file_refs::inherit_ref_state(tx, old, nid)?;
+        }
         // системная связь графа: новая → старая (§8.5)
         crate::graph::insert_supersedes(tx, nid, old, o.space_id, Some(&a), &now)?;
         tx.execute(

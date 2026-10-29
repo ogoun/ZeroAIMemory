@@ -5,7 +5,9 @@
 //!   записи, как пароль и токены, а не память; читается без открытия базы пользователя
 //!   **[решение исполнителя, задача 13 M4]**.
 //! - Ключи — `hooks.session_start | hooks.prompt | hooks.pre_tool | hooks.post_tool |
-//!   hooks.checkpoint`, значение — `bool`; нет строки — `true`.
+//!   hooks.checkpoint` и с M4.5 (§9.6) `hooks.subagent_start | hooks.file_context |
+//!   hooks.session_journal | hooks.recovery`, значение — `bool`; нет строки — `true` (новые
+//!   ключи у старых пользователей включены).
 //! - `GET/PATCH /auth/settings` — свои (сессия пользователя; администратор — своего
 //!   пользователя); по токену — 403: агент свои подсказки не выключает.
 //!   `GET/PATCH /admin/users/{id}/settings` — администратор, любой пользователь.
@@ -29,13 +31,17 @@ use crate::error::ApiError;
 
 use super::{parse_body, parse_id};
 
-/// Типы подсказок хуков (порядок — порядок в ответе).
-pub const HOOK_KINDS: [&str; 5] = [
+/// Типы подсказок хуков (порядок — порядок в ответе; M4.5 §9.6 добавил последние четыре).
+pub const HOOK_KINDS: [&str; 9] = [
     "session_start",
     "prompt",
     "pre_tool",
     "post_tool",
     "checkpoint",
+    "subagent_start",
+    "file_context",
+    "session_journal",
+    "recovery",
 ];
 
 /// Префикс ключей переключателей в `user_settings`.
@@ -43,11 +49,11 @@ const HOOKS_PREFIX: &str = "hooks.";
 
 /// Переключатели типов подсказок пользователя (по умолчанию все включены).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HookFlags([bool; 5]);
+pub struct HookFlags([bool; HOOK_KINDS.len()]);
 
 impl Default for HookFlags {
     fn default() -> Self {
-        HookFlags([true; 5])
+        HookFlags([true; HOOK_KINDS.len()])
     }
 }
 
@@ -95,9 +101,10 @@ fn parse_patch(body: &Bytes) -> Result<Vec<(String, Value)>, ApiError> {
     let req: SettingsPatch = parse_body(body)?;
     let hooks = req.hooks.unwrap_or_default();
     if hooks.is_empty() {
-        return Err(ApiError::BadRequest(
-            "нужно поле hooks: {session_start|prompt|pre_tool|post_tool|checkpoint: bool}".into(),
-        ));
+        return Err(ApiError::BadRequest(format!(
+            "нужно поле hooks: {{{}: bool}}",
+            HOOK_KINDS.join("|")
+        )));
     }
     let mut out = Vec::with_capacity(hooks.len());
     for (k, v) in hooks {
@@ -230,7 +237,8 @@ mod tests {
         assert_eq!(
             f.to_json(),
             json!({"session_start": true, "prompt": true, "pre_tool": true,
-                   "post_tool": true, "checkpoint": true})
+                   "post_tool": true, "checkpoint": true, "subagent_start": true,
+                   "file_context": true, "session_journal": true, "recovery": true})
         );
     }
 
@@ -238,6 +246,11 @@ mod tests {
     fn patch_validation() {
         let ok = parse_patch(&Bytes::from_static(br#"{"hooks":{"prompt":false}}"#)).unwrap();
         assert_eq!(ok, vec![("hooks.prompt".to_string(), Value::Bool(false))]);
+        let ok = parse_patch(&Bytes::from_static(br#"{"hooks":{"file_context":false}}"#)).unwrap();
+        assert_eq!(
+            ok,
+            vec![("hooks.file_context".to_string(), Value::Bool(false))]
+        );
         for bad in [
             r#"{}"#,
             r#"{"hooks":{}}"#,

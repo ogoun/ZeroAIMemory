@@ -247,10 +247,11 @@ fn release_from_git_collects_commits() {
             "--title",
             "x",
             "--ref",
-            "oops",
+            "url:oops",
         ],
         b"",
     );
+    // неизвестный вид ссылки — 6 (путь без вида с M4.5 — файл)
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
     let o = z(&["release", "compare", "9.9.9"], b"");
     assert_eq!(o.status.code(), Some(5), "{}", err(&o));

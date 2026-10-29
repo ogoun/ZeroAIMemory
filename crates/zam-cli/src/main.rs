@@ -84,6 +84,10 @@ enum Cmd {
         /// Сводка L0
         #[arg(long)]
         l0: Option<String>,
+        /// Файл, о котором заметка (путь в проекте; можно повторять): в `refs:` frontmatter и
+        /// подтверждение хэша (`POST /files/verified`)
+        #[arg(long = "ref", value_name = "PATH")]
+        refs: Vec<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -185,9 +189,9 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Связи узла или записи: исходящие (→) и обратные (←)
+    /// Связи узла или записи: исходящие (→) и обратные (←); file:<путь> — что известно о файле
     Links {
-        /// n:<id>, e:<id> (i:/c:/r:/t:/k:/q:) или [space:]path
+        /// n:<id>, e:<id> (i:/c:/r:/t:/k:/q:), [space:]path или file:<путь>
         target: String,
         #[command(flatten)]
         common: Common,
@@ -249,6 +253,36 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TriggersCmd,
     },
+    /// Ссылки знаний на файлы проекта: проверка устарелости и подтверждение
+    Refs {
+        #[command(subcommand)]
+        cmd: RefsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RefsCmd {
+    /// Сверить файлы ссылок решения с рабочей копией и сообщить изменившиеся серверу
+    Check {
+        /// Только файлы, изменённые после коммита (git diff C..HEAD и git status)
+        #[arg(long)]
+        since: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Подтвердить, что знание о файлах актуально (новый хэш, состояние ok)
+    Verify {
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
 }
 
 #[derive(Subcommand)]
@@ -272,7 +306,8 @@ enum LogCmd {
         /// Файл с текстом (иначе stdin)
         #[arg(long)]
         body_file: Option<PathBuf>,
-        /// Ссылка: commit:SHA | file:PATH | note:ID | issue:X (можно повторять)
+        /// Ссылка: commit:SHA | file:PATH (или путь) | note:ID | issue:X (можно повторять);
+        /// файлы — с хэшем содержимого и коммитом
         #[arg(long = "ref")]
         refs: Vec<String>,
         /// Область (монорепозиторий)
@@ -370,6 +405,9 @@ struct InsightArgs {
     /// Тег (можно повторять)
     #[arg(long = "tag")]
     tags: Vec<String>,
+    /// Файл, о котором запись (путь в проекте; можно повторять): ссылка с хэшем и коммитом
+    #[arg(long = "ref", value_name = "PATH")]
+    refs: Vec<String>,
     /// Область (монорепозиторий)
     #[arg(long)]
     area: Option<String>,
@@ -389,6 +427,7 @@ impl InsightArgs {
             evidence_file: self.evidence_file.as_deref(),
             triggers: &self.triggers,
             tags: &self.tags,
+            refs: &self.refs,
             area: self.area.as_deref(),
             key: self.key.as_deref(),
         }
@@ -1143,6 +1182,26 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Triggers {
             cmd: TriggersCmd::Sync { common },
         } => cmd::hook::cache::sync(&cmd::connect(&common)?),
+        Cmd::Refs {
+            cmd:
+                RefsCmd::Check {
+                    since,
+                    solution,
+                    common,
+                },
+        } => cmd::refs::check(
+            &cmd::connect(&common)?,
+            since.as_deref(),
+            solution.as_deref(),
+        ),
+        Cmd::Refs {
+            cmd:
+                RefsCmd::Verify {
+                    paths,
+                    solution,
+                    common,
+                },
+        } => cmd::refs::verify(&cmd::connect(&common)?, &paths, solution.as_deref()),
         Cmd::Init {
             name,
             id,
@@ -1199,6 +1258,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             message,
             base_rev,
             l0,
+            refs,
             common,
         } => {
             let o = cmd::write::Opts {
@@ -1206,6 +1266,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 message: message.as_deref(),
                 base_rev,
                 l0: l0.as_deref(),
+                refs: &refs,
             };
             cmd::write::run(&cmd::connect(&common)?, &target, &o)
         }

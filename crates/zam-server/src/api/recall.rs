@@ -32,8 +32,9 @@
 //!   `gotcha`/`failure` решения и Knowledge (новые первыми), до 5 записей `revisit`, последние
 //!   5 записей changelog решения **[решение исполнителя]**; сразу после правил — строка
 //!   `Словарь: N терминов — memory_search kinds=[term]` (N > 0, термины решения и Knowledge).
-//!   Ответ несёт `hooks: {session_start, prompt, pre_tool, post_tool, checkpoint}` — настройки типов подсказок пользователя
-//!   `hooks.<тип>` (R5, [`super::user_settings`], задача 13). Тип запроса выключен у
+//!   Ответ несёт `hooks: {session_start, prompt, pre_tool, post_tool, checkpoint,
+//!   subagent_start, file_context, session_journal, recovery}` — настройки типов подсказок
+//!   пользователя `hooks.<тип>` (R5, [`super::user_settings`], задача 13). Тип запроса выключен у
 //!   пользователя на сервере — пустой `text` без сбора и без учёта показа (`session_seen`,
 //!   `usage`; сессия касается), у `session_start` — с `hooks` (N4);
 //! - **`prompt`** — поиск `mode=brief` (без реранка, без кэша выжимок, `skip_seen: false`) по
