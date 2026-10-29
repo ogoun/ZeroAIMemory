@@ -5,7 +5,7 @@ members = ["crates/*", "xtask"]
 exclude = ["crates/zam-markdown/fuzz"]
 
 [workspace.package]
-version = "0.0.5-m4"
+version = "0.0.6-m4.5"
 edition = "2024"
 license = "MIT"
 rust-version = "1.92"
