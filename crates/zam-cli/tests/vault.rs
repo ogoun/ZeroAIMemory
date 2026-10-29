@@ -186,3 +186,68 @@ fn vault_set_from_stdin_get_raw() {
         v2
     );
 }
+
+/// Окружение (M4.5 §8): `vault add --type host --title …` без значения; `--secret-stdin`
+/// сохраняет значение; поиск `--q` идёт по открытым полям.
+#[test]
+fn vault_add_host_without_secret() {
+    let (url, tok) = start("host");
+    let r = tmp("repo-host");
+    let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
+    let s = ok(&z(
+        &[
+            "vault",
+            "add",
+            "--title",
+            "stage",
+            "--type",
+            "host",
+            "--purpose",
+            "приёмочный стенд",
+            "--address",
+            "10.0.0.5:22",
+            "--limits",
+            "только ночью",
+            "--notes",
+            "ключи ротируются",
+            "--global",
+        ],
+        b"",
+    ));
+    assert!(s.trim().ends_with("@1"), "{s}");
+    let l = ok(&z(&["vault", "list", "--global", "--q", "приёмочный"], b""));
+    assert!(
+        l.contains("stage") && l.contains("host") && l.contains("10.0.0.5:22"),
+        "{l}"
+    );
+    // значения нет: get не падает и ничего не печатает
+    let o = z(&["vault", "get", "stage", "--global"], b"");
+    assert_eq!(ok(&o), "");
+    // --secret-stdin добавляет значение, открытые поля сохраняются
+    let s = ok(&z(
+        &[
+            "vault",
+            "add",
+            "stage",
+            "--type",
+            "host",
+            "--secret-stdin",
+            "--global",
+        ],
+        b"s3cr3t-pass\n",
+    ));
+    assert!(s.trim().ends_with("@2"), "{s}");
+    assert_eq!(
+        ok(&z(&["vault", "get", "stage", "--global", "--raw"], b"")),
+        "s3cr3t-pass"
+    );
+    let j: serde_json::Value =
+        serde_json::from_str(&ok(&z(&["vault", "list", "--global", "--json"], b""))).unwrap();
+    assert_eq!(j["items"][0]["data"]["purpose"], "приёмочный стенд", "{j}");
+    // пароль без значения по-прежнему ошибка (пустой stdin)
+    let o = z(
+        &["vault", "set", "pw", "--type", "password", "--global"],
+        b"",
+    );
+    assert_ne!(o.status.code(), Some(0));
+}

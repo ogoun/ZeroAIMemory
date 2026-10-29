@@ -36,6 +36,8 @@
     url: 'адрес',
     repo: 'репозиторий',
     note: 'заметка',
+    host: 'хост',
+    environment: 'окружение',
   };
 
   let items = $state<VaultItem[]>([]);

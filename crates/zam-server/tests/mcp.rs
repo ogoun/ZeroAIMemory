@@ -852,6 +852,47 @@ async fn mcp_vault_get_audited() {
     assert!(o.is_error, "{}", o.text);
 }
 
+/// Запись окружения без значения: `memory_vault get id=v:<id>` (ссылка дайджеста) отдаёт
+/// открытые поля без строки `value`, поиск `list name=` идёт по открытым полям.
+#[tokio::test]
+async fn mcp_vault_env_get_by_digest_ref() {
+    let a = api("mcp-vault-env", |_| {}).await;
+    let h = sess();
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/vault",
+            Some(json!({"title": "stage", "data": {"type": "host",
+                "purpose": "приёмочный стенд", "address": "10.0.0.5:22"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_vault",
+        json!({"action": "get", "id": format!("v:{id}")}),
+    )
+    .await;
+    assert!(
+        o.text.contains("address: 10.0.0.5:22") && o.text.contains("purpose: приёмочный стенд"),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("value:"), "{}", o.text);
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_vault",
+        json!({"action": "list", "name": "приёмочный"}),
+    )
+    .await;
+    assert!(o.text.contains("stage"), "{}", o.text);
+}
+
 #[tokio::test]
 async fn mcp_foreign_origin_403() {
     let a = api("mcp-origin", |_| {}).await;

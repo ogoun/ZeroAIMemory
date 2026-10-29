@@ -824,7 +824,9 @@ fn cache(c: CacheCmd) -> Result<(), CliError> {
     }
 }
 
+/// Команда разбирается один раз за запуск: размер варианта `Set` не важен.
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum VaultCmd {
     /// Записи без значений: имя, тип, пользователь или адрес, id
     List {
@@ -844,11 +846,31 @@ enum VaultCmd {
         opts: VaultOpts,
     },
     /// Записать значение из stdin или скрытого ввода с терминала (не из аргументов)
+    #[command(alias = "add")]
     Set {
-        name: String,
-        /// Тип: password, token, ssh_key, connection_string, url, repo, note
-        #[arg(long = "type", value_parser = ["password", "token", "ssh_key", "connection_string", "url", "repo", "note"])]
+        /// Имя записи (или `--title`)
+        name: Option<String>,
+        /// Имя записи (вместо позиционного)
+        #[arg(long)]
+        title: Option<String>,
+        /// Тип: password, token, ssh_key, connection_string, url, repo, note, host, environment
+        #[arg(long = "type", value_parser = ["password", "token", "ssh_key", "connection_string", "url", "repo", "note", "host", "environment"])]
         kind: String,
+        /// Назначение (data.purpose, до 500 символов)
+        #[arg(long)]
+        purpose: Option<String>,
+        /// Адрес (data.address, до 500 символов)
+        #[arg(long)]
+        address: Option<String>,
+        /// Ограничения (data.limits, до 1000 символов)
+        #[arg(long)]
+        limits: Option<String>,
+        /// Заметки (data.notes, до 2000 символов)
+        #[arg(long)]
+        notes: Option<String>,
+        /// Значение из stdin; у host и environment без флага значение не читается
+        #[arg(long)]
+        secret_stdin: bool,
         /// Имя пользователя (data.username)
         #[arg(long)]
         username: Option<String>,
@@ -874,18 +896,32 @@ fn vault(c: VaultCmd) -> Result<(), CliError> {
         }
         VaultCmd::Set {
             name,
+            title,
             kind,
+            purpose,
+            address,
+            limits,
+            notes,
+            secret_stdin,
             username,
             link,
             description,
             opts,
         } => {
+            let name = title
+                .or(name)
+                .ok_or_else(|| CliError::input("укажите имя записи: позиционно или `--title`"))?;
             let s = v::Set {
                 name: &name,
                 kind: &kind,
                 username: username.as_deref(),
                 url: link.as_deref(),
                 description: description.as_deref(),
+                purpose: purpose.as_deref(),
+                address: address.as_deref(),
+                limits: limits.as_deref(),
+                notes: notes.as_deref(),
+                secret_stdin,
             };
             v::set(&cmd::connect(&opts.common)?, &opts.area(), &s)
         }

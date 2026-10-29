@@ -125,9 +125,9 @@ impl ToolName {
                  вызов субагента). Повторы в сессии отсекаются, кроме brief и recovery."
             }
             ToolName::Vault => {
-                "Vault: list — секреты без значений, get — значение по name (раскрытие пишется в \
-                 аудит), set — создать или обновить name = value. scope: global (личный) или \
-                 solution (решение из X-Zam-Solution)."
+                "Vault: list — записи без значений (name — поиск), get — по name или id (v:<id> из \
+                 дайджеста; раскрытие пишется в аудит), set — создать или обновить name = value. \
+                 scope: global (личный) или solution (из X-Zam-Solution)."
             }
         }
     }
@@ -1286,7 +1286,9 @@ fn vault_candidates(rest: &Rest, args: &JsonObject) -> Result<Vec<String>, Fail>
 /// 404 с пространствами поиска.
 async fn vault_locate(rest: &Rest, args: &JsonObject) -> Result<Value, Fail> {
     if let Some(id) = opt_str(args, "id")? {
-        return Ok(json!({ "id": id.trim() }));
+        // ссылка дайджеста `v:<id>` (раздел «Окружение») — как голый id
+        let id = id.trim();
+        return Ok(json!({ "id": id.strip_prefix("v:").unwrap_or(id) }));
     }
     let name = req_str(args, "name")?.trim();
     let spaces = vault_candidates(rest, args)?;
@@ -1379,12 +1381,15 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
                     v["title"].as_str().unwrap_or(""),
                     v["data"]["type"].as_str().unwrap_or("?")
                 );
-                for k in ["username", "url"] {
+                for k in zam_store::VAULT_OPEN_FIELDS {
                     if let Some(x) = v["data"][k].as_str() {
                         s.push_str(&format!("\n{k}: {x}"));
                     }
                 }
-                s.push_str(&format!("\nvalue: {}", v["secret"].as_str().unwrap_or("")));
+                // у записей окружения значение необязательно: нет — строки `value` нет
+                if let Some(x) = v["secret"].as_str() {
+                    s.push_str(&format!("\nvalue: {x}"));
+                }
                 s
             })
         }

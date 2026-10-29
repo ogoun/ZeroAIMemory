@@ -103,6 +103,11 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0017_sessions_subagents.sql"),
         rebuild: false,
     },
+    Migration {
+        version: 18,
+        sql: include_str!("../migrations/user/0018_vault_fts.sql"),
+        rebuild: false,
+    },
 ];
 
 /// Вид пространства.

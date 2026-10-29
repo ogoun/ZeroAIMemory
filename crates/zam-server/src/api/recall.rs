@@ -26,7 +26,9 @@
 //!   [`ANSWERS_DAYS`] дней и ещё не показанные этой сессии — `session_seen`, до 5; строка
 //!   `ZeroAIMemory: ответ на «<вопрос>»: <ответ> — q:<id> → i:<решение>`, `reason: answer`) и
 //!   `### Открытые вопросы` (`N открытых: «…», «…», «…»`, до [`OPEN_QUESTIONS_TITLES`]
-//!   заголовков, не подсказка записи), Rules (L1 каждой заметки, до
+//!   заголовков, не подсказка записи), `### Окружение` (M4.5 §8: до [`ENVIRONMENT_MAX`] записей
+//!   Vault `host`/`environment`, `<имя> — <purpose>; <address>; ограничения: … — v:<id>`; без
+//!   учёта показа; в `recovery` и `brief` нет), Rules (L1 каждой заметки, до
 //!   [`RULES_MAX`] заметок, L1 — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
 //!   пространства решения с L0 (до [`SOLUTION_ROOT_MAX`]), до 5 действующих (`active`)
 //!   `gotcha`/`failure` решения и Knowledge (новые первыми), до 5 записей `revisit`, последние
@@ -443,6 +445,12 @@ pub const OPEN_QUESTIONS_TITLES: usize = 3;
 const REASON_ANSWER: &str = "answer";
 /// Заголовок раздела дайджеста с ответами.
 const SECTION_ANSWERS: &str = "### Ответы человека";
+/// Заголовок раздела окружения дайджеста (Vault `host`/`environment`, M4.5 §8).
+const SECTION_ENVIRONMENT: &str = "### Окружение";
+/// Записей окружения в дайджесте.
+pub const ENVIRONMENT_MAX: usize = 5;
+/// `reason` строки окружения: не запись журнала — ни `session_seen`, ни `usage`.
+const REASON_ENVIRONMENT: &str = "environment";
 /// Заголовок раздела дайджеста с открытыми вопросами.
 const SECTION_OPEN_QUESTIONS: &str = "### Открытые вопросы";
 
@@ -589,6 +597,80 @@ async fn question_cands(
     Ok((cands, line))
 }
 
+/// Строка окружения: `ZeroAIMemory: <имя> — <purpose>; <address>; ограничения: <limits> —
+/// v:<id>`; пустые поля опускаются. Берёт только открытые поля: секрета и шифротекста здесь нет.
+fn environment_block(m: &zam_store::VaultMeta) -> String {
+    let field = |k: &str| {
+        m.data
+            .get(k)
+            .and_then(Value::as_str)
+            .map(|v| zam_markdown::mask_text(&clip(v, TASK_LINE_TEXT_CHARS)))
+            .filter(|v| !v.is_empty())
+    };
+    let mut parts: Vec<String> = Vec::new();
+    parts.extend(field("purpose"));
+    parts.extend(field("address"));
+    parts.extend(field("limits").map(|l| format!("ограничения: {l}")));
+    let mut s = format!("ZeroAIMemory: {}", one_line(&m.title));
+    if !parts.is_empty() {
+        s.push_str(&format!(" — {}", parts.join("; ")));
+    }
+    s.push_str(&format!(" — v:{}", m.id));
+    s
+}
+
+/// Записи `host`/`environment` Vault пользователя запроса: личного и решения запроса (Vault
+/// участника лежит в его базе, чужой не виден). Читает метаданные без мастер-ключа, так что
+/// заблокированный Vault раздел не прячет. Строки — не подсказки журнала: учёта показа нет.
+async fn environment_cands(
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+    req: &RecallReq,
+    headers: &HeaderMap,
+) -> Result<Vec<Cand>, ApiError> {
+    // база пользователя запроса — цель без чужого решения
+    let Some(i) = health.targets().iter().position(|t| t.solution.is_none()) else {
+        return Ok(Vec::new());
+    };
+    if !health.alive[i] {
+        return Ok(Vec::new());
+    }
+    let guid = super::files::query_solution(req.solution.as_deref(), headers)
+        .ok()
+        .flatten();
+    let db = health.targets()[i].db.clone();
+    let Some(r) = deadline
+        .step(zam_store::vault_environment(
+            &db,
+            guid.as_ref(),
+            ENVIRONMENT_MAX,
+        ))
+        .await
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = health.soft(i, r)? else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .map(|m| Cand {
+            target: i,
+            tref: TargetRef {
+                kind: TargetKind::Entry,
+                id: m.id,
+            },
+            rev: m.rev,
+            reference: format!("v:{}", m.id),
+            kind: "vault",
+            title: m.title.clone(),
+            certainty: None,
+            reason: REASON_ENVIRONMENT,
+            block: environment_block(m),
+        })
+        .collect())
+}
+
 /// Разделы дайджеста `session_start` (см. модуль); каждый — кандидаты по приоритету.
 /// `recovery` — пакет восстановления: после ответов — раздел решений ([`decision_cands`]).
 async fn digest(
@@ -648,6 +730,12 @@ async fn digest(
     // ответы человека и открытые вопросы — сразу после задач (M4.5 §4)
     let (answers, open_line) = question_cands(health, deadline, &insight_spaces).await?;
     sections.push((Some(SECTION_ANSWERS), answers));
+    // окружение из Vault — после задач и ответов; в пакет восстановления не входит (§9.2: его
+    // состав фиксирован, окружение агент находит `vault?q=`/`memory_vault`)
+    if !recovery {
+        let env = environment_cands(health, deadline, req, headers).await?;
+        sections.push((Some(SECTION_ENVIRONMENT), env));
+    }
     if recovery {
         let decisions = decision_cands(health, deadline, sol).await?;
         sections.push((Some(SECTION_DECISIONS), decisions));
@@ -1691,7 +1779,7 @@ async fn record(
     if let Some(s) = s {
         let items: Vec<SeenItem> = shown
             .iter()
-            .filter(|c| c.reason != REASON_FILE)
+            .filter(|c| c.reason != REASON_FILE && c.reason != REASON_ENVIRONMENT)
             .map(|c| SeenItem {
                 key: seen_key(targets, c),
                 rev: c.rev,
@@ -1707,7 +1795,7 @@ async fn record(
         }
     }
     let mut by_target: HashMap<usize, Vec<UsageEvent>> = HashMap::new();
-    for c in shown {
+    for c in shown.iter().filter(|c| c.reason != REASON_ENVIRONMENT) {
         by_target.entry(c.target).or_default().push(UsageEvent {
             user_id: user,
             session_id: s.map(|s| s.touch.id.clone()),
@@ -1735,6 +1823,7 @@ fn section_limit(event: Event, title: Option<&str>, cands: &[Cand], limit: usize
     }
     match title {
         Some(SECTION_RULES) => RULES_MAX,
+        Some(SECTION_ENVIRONMENT) => ENVIRONMENT_MAX,
         Some("### Решение") => SOLUTION_ROOT_MAX,
         Some(_) => DIGEST_ENTRIES_MAX,
         None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,

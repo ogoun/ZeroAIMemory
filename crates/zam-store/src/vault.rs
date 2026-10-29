@@ -9,8 +9,10 @@
 //! [`vault_update`] обязателен).
 //!
 //! Открытые поля — `title` (имя, уникально среди живых записей одной области) и `data`
-//! (`{type, username?, url?, description?}`, проверяет сервер). Значения нигде не
-//! индексируются: у Vault нет чанков, FTS и заданий индексации.
+//! (`{type, username?, url?, description?, purpose?, address?, limits?, notes?}`, проверяет
+//! сервер). Поиск — `vault_fts` (миграция 0018) только по `title` и открытым полям `data`;
+//! значения и шифротекст нигде не индексируются: у Vault нет чанков, векторов и заданий.
+//! У `host`/`environment` значение необязательно: без него в `secret` лежит пустой блоб.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -21,12 +23,25 @@ use zam_core::{Id, SolutionGuid};
 
 use crate::entries::{AuthorView, json_col};
 use crate::nodes::Attribution;
+use crate::search::sanitize_fts;
 use crate::system::{is_unique_violation, json_err};
 use crate::time::{fmt_ts, ts_at};
 use crate::{Db, StoreError, SystemStore};
 
 /// Ключ настройки с проверочным шифротекстом мастер-ключа (base64 в JSON-строке).
 pub const KEY_CHECK_SETTING: &str = "vault.key_check";
+/// Открытые поля `data`, что попадают в `vault_fts.open_text` (порядок — как в миграции 0018).
+pub const VAULT_OPEN_FIELDS: [&str; 7] = [
+    "description",
+    "url",
+    "username",
+    "purpose",
+    "address",
+    "limits",
+    "notes",
+];
+/// Типы записей окружения (`data.type`).
+pub const VAULT_ENV_TYPES: [&str; 2] = ["host", "environment"];
 /// Предел длины имени записи, символов. [решение исполнителя]
 pub const VAULT_TITLE_MAX_CHARS: usize = 200;
 
@@ -157,6 +172,30 @@ fn check_data(d: &serde_json::Value) -> Result<String, StoreError> {
     serde_json::to_string(d).map_err(json_err)
 }
 
+/// Открытый текст `data` для индекса: поля [`VAULT_OPEN_FIELDS`] через перевод строки.
+fn open_text(data: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(data).unwrap_or_default();
+    VAULT_OPEN_FIELDS
+        .iter()
+        .map(|k| v.get(k).and_then(serde_json::Value::as_str).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Строка `vault_fts` записи заменяется (в транзакции записи): только `title` и открытый текст.
+fn fts_put(c: &Connection, id: Id, title: &str, data: &str) -> Result<(), StoreError> {
+    fts_del(c, id)?;
+    c.prepare_cached("INSERT INTO vault_fts (item_id, title, open_text) VALUES (?1, ?2, ?3)")?
+        .execute(params![id, title, open_text(data)])?;
+    Ok(())
+}
+
+fn fts_del(c: &Connection, id: Id) -> Result<(), StoreError> {
+    c.prepare_cached("DELETE FROM vault_fts WHERE item_id = ?1")?
+        .execute([id])?;
+    Ok(())
+}
+
 fn busy_title(title: &str) -> StoreError {
     StoreError::Conflict(format!("запись Vault с именем «{title}» уже есть"))
 }
@@ -214,32 +253,64 @@ fn insert_revision(
     Ok(())
 }
 
-/// Живые записи области по имени; `q` — подстрока (без учёта регистра) имени, `data.url`
-/// или `data.description`.
+/// Живые записи области. Без `q` — по имени. С `q` — поиск `vault_fts` по `title` и открытым
+/// полям (слова от 3 символов — префиксом), порядок по `bm25`. Запасной путь — подстрока
+/// (без учёта регистра) имени, `url`, `description`: когда FTS пуст, а `q` короче 3 символов
+/// или без слов.
 pub async fn vault_list(
     db: &Db,
     scope: &VaultScope,
     q: Option<&str>,
 ) -> Result<Vec<VaultMeta>, StoreError> {
     let (kind, guid) = (scope.as_str(), scope.guid().map(str::to_string));
-    let items = db
-        .read(move |c| {
-            let mut st = c.prepare_cached(&format!(
-                "SELECT {ITEM_COLS} FROM vault_items
-                 WHERE scope = ?1 AND coalesce(agent_solution_id, '') = coalesce(?2, '')
-                   AND deleted_at IS NULL
-                 ORDER BY title, id"
-            ))?;
-            let rows = st.query_map(params![kind, guid], meta_row)?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        })
-        .await?;
-    let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) else {
-        return Ok(items);
+    let q = q
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_string);
+    let fts = q.as_deref().and_then(sanitize_fts);
+    let (kind2, guid2, fts2) = (kind, guid.clone(), fts.clone());
+    let found = match fts2 {
+        Some(m) => {
+            db.read(move |c| {
+                let mut ids = c.prepare_cached(
+                    "SELECT item_id FROM vault_fts WHERE vault_fts MATCH ?1
+                     ORDER BY bm25(vault_fts, 0.0, 3.0, 1.0), rowid",
+                )?;
+                let ids = ids
+                    .query_map([m], |r| r.get::<_, Id>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut one = c.prepare_cached(&format!(
+                    "SELECT {ITEM_COLS} FROM vault_items
+                     WHERE id = ?1 AND scope = ?2
+                       AND coalesce(agent_solution_id, '') = coalesce(?3, '')
+                       AND deleted_at IS NULL"
+                ))?;
+                let mut out = Vec::new();
+                for id in ids {
+                    if let Some(m) = one
+                        .query_row(params![id, kind2, guid2], meta_row)
+                        .optional()?
+                    {
+                        out.push(m);
+                    }
+                }
+                Ok(out)
+            })
+            .await?
+        }
+        None => Vec::new(),
     };
+    let Some(q) = q else {
+        return all_live(db, kind, guid).await;
+    };
+    let short = q.chars().count() < 3;
+    if !found.is_empty() || (fts.is_some() && !short) {
+        return Ok(found);
+    }
     let needle = q.to_lowercase();
     let hit = |s: Option<&str>| s.is_some_and(|s| s.to_lowercase().contains(&needle));
-    Ok(items
+    Ok(all_live(db, kind, guid)
+        .await?
         .into_iter()
         .filter(|m| {
             hit(Some(&m.title))
@@ -250,6 +321,45 @@ pub async fn vault_list(
                     .and_then(serde_json::Value::as_str))
         })
         .collect())
+}
+
+async fn all_live(
+    db: &Db,
+    kind: &'static str,
+    guid: Option<String>,
+) -> Result<Vec<VaultMeta>, StoreError> {
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {ITEM_COLS} FROM vault_items
+             WHERE scope = ?1 AND coalesce(agent_solution_id, '') = coalesce(?2, '')
+               AND deleted_at IS NULL
+             ORDER BY title, id"
+        ))?;
+        let rows = st.query_map(params![kind, guid], meta_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
+}
+
+/// Живые записи окружения (`host`/`environment`) личного Vault и, если задан, Vault решения
+/// `solution`: новые первыми, до `limit`. Читает только открытые поля; шифротекст — нет.
+pub async fn vault_environment(
+    db: &Db,
+    solution: Option<&SolutionGuid>,
+    limit: usize,
+) -> Result<Vec<VaultMeta>, StoreError> {
+    let guid = solution.map(|g| g.as_str().to_string());
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {ITEM_COLS} FROM vault_items
+             WHERE deleted_at IS NULL AND json_extract(data, '$.type') IN ('host', 'environment')
+               AND (scope = 'knowledge' OR agent_solution_id = ?1)
+             ORDER BY updated_at DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = st.query_map(params![guid, limit as i64], meta_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
 }
 
 /// Живая запись и шифротекст текущей ревизии; удалённой или нет — `NotFound`.
@@ -304,6 +414,7 @@ pub async fn vault_put(
             Err(e) => return Err(e.into()),
         }
         insert_revision(tx, id, 1, &title, &data, &secret_blob, &now, &a)?;
+        fts_put(tx, id, &title, &data)?;
         Ok(load_live(tx, id)?.0)
     })
     .await
@@ -355,6 +466,7 @@ pub async fn vault_update(
             Err(e) => return Err(e.into()),
         }
         insert_revision(tx, id, rev, &title, &data, &secret, &now, &a)?;
+        fts_put(tx, id, &title, &data)?;
         Ok(load_live(tx, id)?.0)
     })
     .await
@@ -373,6 +485,7 @@ pub async fn vault_delete(db: &Db, id: Id, _a: &Attribution) -> Result<(), Store
         if n == 0 {
             return Err(StoreError::NotFound);
         }
+        fts_del(tx, id)?;
         Ok(())
     })
     .await

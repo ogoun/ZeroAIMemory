@@ -384,7 +384,8 @@ icacls "<data_dir>\master.key" /inheritance:r /grant:r "*S-1-3-4:F" "*S-1-5-18:F
 # значение — только из stdin или скрытого ввода с терминала, никогда из аргументов
 printf '%s' "$GITHUB_TOKEN" | zam vault set github --type token --link https://github.com --global
 zam vault set postgres --type connection_string --username app      # Vault текущего решения; ввод скрыт
-zam vault list --global --q git                                      # без значений
+zam vault list --global --q git                                      # без значений; поиск по открытым полям
+zam vault add stage --type host --purpose 'приёмочный стенд' --address 10.0.0.5:22 --limits 'только ночью' --global  # окружение: значение необязательно (--secret-stdin)
 zam vault get github --global --raw                                  # в stdout только значение
 ```
 
