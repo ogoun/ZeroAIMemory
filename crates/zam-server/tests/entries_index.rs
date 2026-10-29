@@ -319,7 +319,7 @@ async fn search_returns_entry_items_with_kind_status() {
         )),
         "{t}"
     );
-    assert!(t.contains("] active · hypothesis · ~"), "{t}");
+    assert!(t.contains("] active · hypothesis · сегодня · ~"), "{t}");
     assert!(
         t.contains(&format!(
             "c:{} changelog/fix «Converted deploy scripts to LF»  [",

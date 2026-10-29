@@ -18,7 +18,7 @@ Go to the next step only when the previous one was not enough. Before a task —
 2. **Targeted read** — `memory_read` several ids in one call (up to 20). Per id: `tier=L0|L1|L2`, `section` (heading path `A > B`), `max_tokens`, `if_rev` (unchanged revision — `unchanged` without text), `since_rev` (you know revision N — get only the diff since it). L1 or a section first, full text only when needed. Default response budget — 1500 tokens.
 3. **Summary** — `memory_cache_put {query, summary, sources}`: Markdown up to 600 tokens with links; `sources` — ids (and sections) the summary is really based on. The server pins source revisions and invalidates the summary when they change. Long-lived value — `promote` it into a note or an insight.
 
-Every response ends with a `~N tok` line — your spend. Check the cache before a new search on the same topic. Search filters: `kinds` (tasks — only with an explicit `kinds: [task]`), `status`, `certainty`, `decided_by`, `file`.
+Every response ends with a `~N tok` line — your spend. Check the cache before a new search on the same topic. Search filters: `kinds` (tasks — only with an explicit `kinds: [task]`), `status`, `certainty`, `insight_kinds`, `decided_by`, `file`.
 
 ## Writing
 
@@ -89,7 +89,7 @@ With Claude Code and Codex hooks this happens by itself: `SessionStart` with `so
 ## Environment in Vault
 
 - Hosts, stands, environments — Vault records of types `host` and `environment` with open fields `purpose`, `address`, `limits`, `notes` (a secret value is optional). The session digest lists them in the "Environment" section (without secrets).
-- Find — `memory_vault {action: "list", name: "<word>"}`; open fields and the value (if any) — `memory_vault {action: "get", id: "v:<id>"}` — the reveal is audited. Create — CLI `zam vault add <name> --type host --purpose … --address … --limits …` (a value only with `--secret-stdin`) or WebUI.
+- Find — `memory_vault {action: "list", name: "<word>"}`; open fields and the value (if any) — `memory_vault {action: "get", id: "v:<id>"}` — the reveal is audited. Create or extend — `memory_vault {action: "set", name, type: "host", purpose?, address?, limits?, notes?, value?}` (the value is optional; an update changes only the fields you pass), CLI `zam vault add <name> --type host --purpose … --address … --limits …` (a value only with `--secret-stdin`) or WebUI.
 - Learned something important about the environment (an address, stand limits) — record it in Vault, not in a note; passwords and keys — only as the record value.
 
 ## Proactive recall

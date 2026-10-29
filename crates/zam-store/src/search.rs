@@ -99,6 +99,9 @@ pub struct TargetFilter {
     /// Нормализованный путь файла (`filters.file`, M4.5 §6.3): только заметки и записи со
     /// ссылкой на него (`file_refs`, точное совпадение). `None` — без фильтра.
     pub file: Option<String>,
+    /// Виды insight (`filters.insight_kinds`, §9.1): insight проходят, только если `data.kind`
+    /// из списка; записи других видов и заметки фильтр не трогает. Пусто — любые.
+    pub insight_kinds: Vec<String>,
 }
 
 /// Виды записей журналов (с M4.5 — `term`, `task`, `question`).
@@ -127,6 +130,8 @@ struct TargetArgs {
     decided_by: Option<String>,
     /// Путь ссылки на файл или `None` (любые).
     file: Option<String>,
+    /// JSON-массив видов insight или `None` (любые).
+    insight_kinds: Option<String>,
 }
 
 impl TargetFilter {
@@ -146,6 +151,8 @@ impl TargetFilter {
                 .then(|| serde_json::Value::from(self.certainty.clone()).to_string()),
             decided_by: self.decided_by.clone(),
             file: self.file.clone(),
+            insight_kinds: (!self.insight_kinds.is_empty())
+                .then(|| serde_json::Value::from(self.insight_kinds.clone()).to_string()),
         }
     }
 }
@@ -476,7 +483,7 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
 fn scope_sql(n_spaces: usize) -> String {
     let sp = placeholders(3, n_spaces);
     let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
-    let (cert, by, file) = (7 + n_spaces, 8 + n_spaces, 9 + n_spaces);
+    let (cert, by, file, ik) = (7 + n_spaces, 8 + n_spaces, 9 + n_spaces, 10 + n_spaces);
     format!(
         "((c.node_id IS NOT NULL AND ?{notes} AND ?{by} IS NULL AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
@@ -494,6 +501,9 @@ fn scope_sql(n_spaces: usize) -> String {
            AND (?{cert} IS NULL OR e.certainty IN (SELECT value FROM json_each(?{cert})))
            AND (?{file} IS NULL OR EXISTS (SELECT 1 FROM file_refs fr WHERE fr.owner_kind = 'entry'
                 AND fr.owner_id = e.id AND fr.path = ?{file}))
+           AND (?{ik} IS NULL OR e.kind <> 'insight'
+                OR (json_type(e.data, '$.kind') = 'text'
+                    AND json_extract(e.data, '$.kind') IN (SELECT value FROM json_each(?{ik}))))
            AND (?{by} IS NULL OR (e.kind = 'insight'
                 AND CASE WHEN json_type(e.data, '$.kind') = 'text'
                          THEN json_extract(e.data, '$.kind') END = 'decision'
@@ -520,6 +530,7 @@ fn scope_args<'a>(
     args.push(&t.certainty);
     args.push(&t.decided_by);
     args.push(&t.file);
+    args.push(&t.insight_kinds);
     args
 }
 

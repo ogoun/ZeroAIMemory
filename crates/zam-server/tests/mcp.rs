@@ -1182,3 +1182,86 @@ async fn mcp_descriptions_under_300() {
     let read = desc("memory_read");
     assert!(read.contains("since_rev"), "{read}");
 }
+
+/// Окружение через MCP (задача 13, раунд 1): `set` записи `host` без значения с открытыми
+/// полями; `get` и `list` их видят; обновление `limits` сохраняет прежние поля и значение;
+/// без значения у прочих типов — ошибка.
+#[tokio::test]
+async fn mcp_vault_set_environment_fields() {
+    let a = api("mcp-vault-env-set", |_| {}).await;
+    let h = sess();
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "stage-box", "type": "host",
+               "purpose": "приёмочный стенд", "address": "10.0.0.7:22"}),
+    )
+    .await;
+    assert!(!o.is_error && o.text.contains("host"), "{}", o.text);
+    let get = json!({"action": "get", "name": "stage-box"});
+    let o = vault_call(&a, &a.token, &h, get.clone()).await;
+    assert!(
+        o.text.contains("purpose: приёмочный стенд") && o.text.contains("address: 10.0.0.7:22"),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("value:"), "{}", o.text);
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "list", "name": "приёмочный"}),
+    )
+    .await;
+    assert!(o.text.contains("stage-box"), "{}", o.text);
+    // обновление одного поля: прежние сохраняются
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "stage-box", "limits": "2 ядра, 2 ГБ"}),
+    )
+    .await;
+    assert!(!o.is_error && o.text.contains("rev2"), "{}", o.text);
+    let o = vault_call(&a, &a.token, &h, get.clone()).await;
+    for want in [
+        "purpose: приёмочный стенд",
+        "address: 10.0.0.7:22",
+        "limits: 2 ядра, 2 ГБ",
+    ] {
+        assert!(o.text.contains(want), "{want}: {}", o.text);
+    }
+    // значение позже — поля остаются, значение раскрывается
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "stage-box", "value": "ssh-pass-1"}),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.text);
+    let o = vault_call(&a, &a.token, &h, get).await;
+    assert!(
+        o.text.contains("value: ssh-pass-1") && o.text.contains("limits: 2 ядра, 2 ГБ"),
+        "{}",
+        o.text
+    );
+    // пароль без значения — ошибка инструмента; пустая правка — тоже
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "db-pass", "type": "password"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "stage-box"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+}

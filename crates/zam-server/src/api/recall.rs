@@ -1783,6 +1783,7 @@ async fn error_hints(
                     certainty: Vec::new(),
                     decided_by: None,
                     file: None,
+                    insight_kinds: Vec::new(),
                 },
             };
             let Some(r) = deadline.step(search_fts_channels(&t.db, q)).await else {

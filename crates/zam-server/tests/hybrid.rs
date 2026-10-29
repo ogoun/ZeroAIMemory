@@ -782,3 +782,91 @@ async fn pending_count_snapshot_precedes_vector_query() {
     );
     a.st.shutdown().await;
 }
+
+/// `filters.insight_kinds` в векторном канале (задача 13, раунд 1): при `kinds = [insight]`
+/// фильтр уходит в Qdrant (`insight_kind`), при видах по умолчанию insight чужих видов
+/// отсеивает перепроверка SQLite; находки вектора нужных видов остаются, `gotcha` — нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insight_kinds_filter_in_vector_channel() {
+    if !have(MINILM) {
+        eprintln!("пропуск insight_kinds_filter_in_vector_channel: нужна модель {MINILM}");
+        return;
+    }
+    let q = TestQdrant::start("hyb-insight-kinds");
+    let a = api("hyb-insight-kinds", |c| {
+        ml(c, MINILM);
+        external(c, &q);
+    })
+    .await;
+    vector_ready(&a).await;
+    let mut ids = Vec::new();
+    for (kind, title) in [
+        ("gotcha", "Shell scripts need LF line endings"),
+        ("failure", "Shell script with CRLF failed on Linux"),
+        (
+            "experiment",
+            "Converting shell scripts to LF fixed bad interpreter",
+        ),
+    ] {
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/spaces/knowledge/entries",
+                Some(json!({
+                    "kind": "insight",
+                    "title": title,
+                    "body": "A shell script saved with Windows CRLF line endings fails on \
+                             Linux with bad interpreter. Convert the file to LF.",
+                    "data": {"kind": kind},
+                    "force": true,
+                })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        ids.push(r.json()["id"].as_str().unwrap().to_string());
+    }
+    let limit = Duration::from_secs(240);
+    let query = "Windows line endings break the shell script interpreter";
+    until(
+        "insight проиндексированы",
+        limit,
+        async || {
+            let j = search(
+                &a,
+                json!({"query": query, "top_k": 10, "filters": {"kinds": ["insight"]}}),
+            )
+            .await
+            .json();
+            j["pending_count"] == 0 && j["items"].as_array().is_some_and(|i| i.len() == 3)
+        },
+    )
+    .await;
+    for filters in [
+        json!({"kinds": ["insight"], "insight_kinds": ["failure", "experiment"]}),
+        json!({"insight_kinds": ["failure", "experiment"]}),
+    ] {
+        let r = search(&a, json!({"query": query, "top_k": 10, "filters": filters})).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let j = r.json();
+        let items = j["items"].as_array().unwrap();
+        let got: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i["entry_id"].as_str())
+            .collect();
+        assert!(!got.contains(&ids[0].as_str()), "gotcha отсеян: {j}");
+        for want in &ids[1..] {
+            let hit = items
+                .iter()
+                .find(|i| i["entry_id"] == json!(want))
+                .unwrap_or_else(|| panic!("{want} не найден: {j}"));
+            assert!(
+                hit["sources"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("vector")),
+                "{j}"
+            );
+        }
+    }
+    a.st.shutdown().await;
+}

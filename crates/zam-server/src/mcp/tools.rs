@@ -79,8 +79,8 @@ impl ToolName {
             ToolName::Search => {
                 "Поиск в памяти (Knowledge, Rules, текущее решение). Сначала готовые выжимки кэша, \
                  затем карточки: id, путь, ревизия, возраст, ~токены; выданное в этой сессии \
-                 помечено seen. filters: kinds (в том числе term, task, question), file — знание \
-                 о файле, decided_by. Дальше — memory_read нужного."
+                 помечено seen. filters: kinds (и term, task, question), insight_kinds, file — \
+                 знание о файле, decided_by. Дальше — memory_read нужного."
             }
             ToolName::Read => {
                 "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id> или путь <пространство>:/<путь>. \
@@ -153,7 +153,7 @@ impl ToolName {
                     "mode": {"type": "string", "enum": ["brief", "chunks", "notes"]},
                     "scope": {"type": "object", "description":
                         "solution, include_knowledge, include_rules, all_solutions, path_prefix, area"},
-                    "filters": {"type": "object", "description": "kinds, status, certainty, decided_by, file (путь файла)"},
+                    "filters": {"type": "object", "description": "kinds, status, certainty, insight_kinds (виды insight: gotcha, failure, experiment…), decided_by, file (путь файла)"},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 100},
                     "budget_tokens": {"type": "integer", "minimum": 1},
                     "expand": {"type": "string", "enum": ["none", "section", "neighbors", "graph"]},
@@ -322,7 +322,12 @@ impl ToolName {
                     "id": {"type": "string"},
                     "value": {"type": "string"},
                     "type": {"type": "string", "description":
-                        "set: тип нового секрета (password по умолчанию)"},
+                        "set: тип записи (password по умолчанию; host, environment — окружение, \
+                         value необязателен)"},
+                    "purpose": {"type": "string", "description": "set: назначение, до 500"},
+                    "address": {"type": "string", "description": "set: адрес, до 500"},
+                    "limits": {"type": "string", "description": "set: ограничения, до 1000"},
+                    "notes": {"type": "string", "description": "set: заметки, до 2000"},
                     "scope": {"type": "string", "description":
                         "global, solution или GUID решения"},
                     "format": fmt,
@@ -1326,6 +1331,21 @@ async fn vault_locate(rest: &Rest, args: &JsonObject) -> Result<Value, Fail> {
     }
 }
 
+/// Открытые поля окружения из аргументов `set` (`purpose`, `address`, `limits`, `notes`):
+/// только заданные; пределы проверяет REST.
+fn vault_env_fields(args: &JsonObject) -> Result<serde_json::Map<String, Value>, Fail> {
+    let mut out = serde_json::Map::new();
+    for k in VAULT_ENV_FIELDS {
+        if let Some(v) = opt_str(args, k)? {
+            out.insert(k.into(), json!(v));
+        }
+    }
+    Ok(out)
+}
+
+/// Открытые поля окружения, которые принимает `memory_vault set`.
+const VAULT_ENV_FIELDS: [&str; 4] = ["purpose", "address", "limits", "notes"];
+
 fn vault_meta_line(m: &Value) -> String {
     format!(
         "- {} «{}» · {} · {} · rev{}",
@@ -1400,16 +1420,34 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
             })
         }
         "set" => {
-            let value =
-                opt_str(args, "value")?.ok_or_else(|| Fail::Invalid("set: нужен value".into()))?;
+            let value = opt_str(args, "value")?;
             let name = req_str(args, "name")?.trim().to_string();
+            let kind = opt_str(args, "type")?;
+            let fields = vault_env_fields(args)?;
             let (space, _) = vault_space(rest, args)?;
             // только точное имя: DB_PASS и db_pass — разные секреты
             let same = vault_named(rest, &space, &name).await?;
             let r = match exact(&same, &name) {
                 Some(m) => {
                     let id = m["id"].as_str().unwrap_or("").to_string();
-                    let body = json!({ "secret": value });
+                    let mut body = json!({});
+                    if let Some(v) = value {
+                        body["secret"] = json!(v);
+                    }
+                    // PATCH заменяет `data` целиком: заданные поля сливаются с прежними
+                    if kind.is_some() || !fields.is_empty() {
+                        let mut data = m["data"].as_object().cloned().unwrap_or_default();
+                        if let Some(k) = kind {
+                            data.insert("type".into(), json!(k));
+                        }
+                        data.extend(fields);
+                        body["data"] = Value::Object(data);
+                    }
+                    if body.as_object().is_some_and(|o| o.is_empty()) {
+                        return Err(Fail::Invalid(
+                            "set: нечего менять — нужен value или открытые поля".into(),
+                        ));
+                    }
                     call_rest(
                         rest,
                         Method::PATCH,
@@ -1420,8 +1458,20 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
                     .await?
                 }
                 None => {
-                    let kind = opt_str(args, "type")?.unwrap_or("password");
-                    let body = json!({ "title": name, "data": { "type": kind }, "secret": value });
+                    let kind = kind.unwrap_or("password");
+                    if value.is_none() && !zam_store::VAULT_ENV_TYPES.contains(&kind) {
+                        return Err(Fail::Invalid(
+                            "set: нужен value (без значения — только type host или environment)"
+                                .into(),
+                        ));
+                    }
+                    let mut data = serde_json::Map::new();
+                    data.insert("type".into(), json!(kind));
+                    data.extend(fields);
+                    let mut body = json!({ "title": name, "data": data });
+                    if let Some(v) = value {
+                        body["secret"] = json!(v);
+                    }
                     call_rest(
                         rest,
                         Method::POST,

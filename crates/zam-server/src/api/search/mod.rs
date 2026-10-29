@@ -286,7 +286,14 @@ pub(crate) struct Filters {
     /// Путь файла (M4.5 §6.3): только заметки и записи со ссылкой на него (точное совпадение
     /// после нормализации, некорректный путь — 400).
     file: Option<String>,
+    /// Виды insight (`data.kind`, §9.1): insight проходят, только если их вид из списка;
+    /// заметки и записи других видов фильтр не трогает (их отбирает `kinds`).
+    insight_kinds: Option<Vec<String>>,
 }
+
+/// Вид insight, которого не бывает: векторный фильтр с пустым пересечением видов
+/// (`decided_by` + `insight_kinds` без `decision`) не пропускает ни одной точки.
+const NO_INSIGHT_KIND: &str = "-";
 
 /// Допустимые виды целей `filters.kinds` (с M4.5 — `term`, `task`, `question`, спецификация
 /// M4.5 §1.3).
@@ -418,6 +425,9 @@ impl SearchSection {
 /// Фильтр векторного канала. При `decided_by` точки сужаются до решений (`kind = insight`,
 /// `insight_kinds = [decision]`): иначе другие записи вытесняют из окна выдачи редкие решения
 /// агента. Деление `human`/`agent` внутри Qdrant неполное — его делает SQLite при `live_chunks`.
+/// `insight_kinds` сужает точки, только когда виды целей — одни insight: условие Qdrant
+/// `insight_kind` отсекло бы заметки и записи без вида; иначе виды insight отсеивает SQLite
+/// (`live_chunks`). С `decided_by` — пересечение с `decision` (пустое — ни одной точки).
 fn vector_filter(
     scopes: Vec<VectorScope>,
     path_prefix: Option<String>,
@@ -425,6 +435,16 @@ fn vector_filter(
     folders: bool,
 ) -> VectorFilter {
     let by = t.decided_by.is_some();
+    let only_insight = by || (t.kinds.len() == 1 && t.kinds[0] == "insight");
+    let insight_kinds = match (by, t.insight_kinds.is_empty()) {
+        (true, true) => vec!["decision".to_string()],
+        (true, false) if t.insight_kinds.iter().any(|k| k == "decision") => {
+            vec!["decision".to_string()]
+        }
+        (true, false) => vec![NO_INSIGHT_KIND.to_string()],
+        (false, _) if only_insight => t.insight_kinds.clone(),
+        (false, _) => Vec::new(),
+    };
     VectorFilter {
         scopes,
         path_prefix,
@@ -433,11 +453,7 @@ fn vector_filter(
         } else {
             t.kinds.clone()
         },
-        insight_kinds: if by {
-            vec!["decision".into()]
-        } else {
-            Vec::new()
-        },
+        insight_kinds,
         exclude_statuses: excluded_statuses(t),
         area: t.area.clone(),
         certainty: t.certainty.clone(),
@@ -457,6 +473,14 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
         &default_statuses(&kinds, explicit),
     )?;
     let certainty = filter_list("filters.certainty", f.certainty.as_ref(), &CERTAINTIES, &[])?;
+    let mut insight_kinds = filter_list(
+        "filters.insight_kinds",
+        f.insight_kinds.as_ref(),
+        &super::insights::INSIGHT_KINDS,
+        &[],
+    )?;
+    insight_kinds.sort();
+    insight_kinds.dedup();
     Ok(TargetFilter {
         kinds,
         // include_history снимает фильтр статусов; без явного `kinds` открытые вопросы и задачи
@@ -485,6 +509,7 @@ fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, Api
                     .map_err(|e| ApiError::BadRequest(format!("filters.file: {e}")))
             })
             .transpose()?,
+        insight_kinds,
     })
 }
 
@@ -528,6 +553,9 @@ fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -
     }
     if let Some(f) = &t.file {
         filters["file"] = json!(f);
+    }
+    if !t.insight_kinds.is_empty() {
+        filters["insight_kinds"] = json!(sorted(&t.insight_kinds));
     }
     zam_store::scope_hash(&json!({
         "solution": solution.map(SolutionGuid::as_str),
@@ -3075,6 +3103,7 @@ mod tests {
                 certainty: Some(vec!["axiom".into(), "theorem".into()]),
                 decided_by: None,
                 file: None,
+                insight_kinds: None,
             },
             false,
         )
@@ -3102,8 +3131,82 @@ mod tests {
                 certainty: Some(vec!["certain".into()]),
                 ..Filters::default()
             },
+            Filters {
+                insight_kinds: Some(vec!["Gotcha".into()]),
+                ..Filters::default()
+            },
         ] {
             assert!(target_filter(&bad, false).is_err());
         }
+    }
+
+    /// `filters.insight_kinds` (§9.1): векторный канал сужается только при одних insight,
+    /// с `decided_by` — пересечение с `decision`; ключ кэша — только при заданном фильтре.
+    #[test]
+    fn insight_kinds_vector_filter_and_cache_key() {
+        let tf = |f: Filters| target_filter(&f, false).unwrap();
+        let ik = || Some(vec!["failure".to_string(), "experiment".to_string()]);
+        // виды по умолчанию (заметки и записи) — векторный фильтр не сужается
+        let any = tf(Filters {
+            insight_kinds: ik(),
+            ..Filters::default()
+        });
+        assert_eq!(any.insight_kinds, ["experiment", "failure"]);
+        assert!(
+            vector_filter(Vec::new(), None, &any, false)
+                .insight_kinds
+                .is_empty()
+        );
+        // одни insight — сужается
+        let only = tf(Filters {
+            kinds: Some(vec!["insight".into()]),
+            insight_kinds: ik(),
+            ..Filters::default()
+        });
+        assert_eq!(
+            vector_filter(Vec::new(), None, &only, false).insight_kinds,
+            ["experiment", "failure"]
+        );
+        // decided_by: пересечение с decision; пустое — ни одной точки
+        let by = |kinds: Vec<String>| {
+            vector_filter(
+                Vec::new(),
+                None,
+                &tf(Filters {
+                    decided_by: Some("human".into()),
+                    insight_kinds: Some(kinds),
+                    ..Filters::default()
+                }),
+                false,
+            )
+            .insight_kinds
+        };
+        assert_eq!(by(vec!["decision".into(), "gotcha".into()]), ["decision"]);
+        assert_eq!(by(vec!["gotcha".into()]), [NO_INSIGHT_KIND]);
+        // ключ кэша выжимок меняется только при заданном фильтре
+        let sc = ScopeReq::default();
+        let key = |f: &Filters| cache_scope_hash(&sc, f, false, None).unwrap();
+        let base = key(&Filters::default());
+        assert_eq!(
+            base,
+            key(&Filters {
+                insight_kinds: Some(Vec::new()),
+                ..Filters::default()
+            })
+        );
+        let a = key(&Filters {
+            insight_kinds: ik(),
+            ..Filters::default()
+        });
+        let b = key(&Filters {
+            insight_kinds: Some(vec![
+                "experiment".into(),
+                "failure".into(),
+                "failure".into(),
+            ]),
+            ..Filters::default()
+        });
+        assert_ne!(base, a);
+        assert_eq!(a, b, "порядок и повторы не меняют ключ");
     }
 }
