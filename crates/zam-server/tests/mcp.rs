@@ -1265,3 +1265,60 @@ async fn mcp_vault_set_environment_fields() {
     .await;
     assert!(o.is_error, "{}", o.text);
 }
+
+/// Параллельные `set` разных полей одной записи не теряют правки молча (задача 14, ревью
+/// задачи 13): PATCH уходит с `If-Match` прочитанной ревизии. Каждый успешный `set` оставляет
+/// своё поле, проигравший получает понятную ошибку «Запись изменилась».
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_vault_set_concurrent_no_lost_update() {
+    let a = api("mcp-vault-set-race", |_| {}).await;
+    let h = sess();
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "race-box", "type": "host", "purpose": "начало"}),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.text);
+    let fields = ["address", "limits", "notes", "purpose"];
+    let call = |k: &'static str| {
+        let (a, h) = (&a, &h);
+        async move {
+            let o = vault_call(
+                a,
+                &a.token,
+                h,
+                json!({"action": "set", "name": "race-box", k: format!("значение-{k}")}),
+            )
+            .await;
+            (k, o)
+        }
+    };
+    let (r0, r1, r2, r3) = tokio::join!(
+        call(fields[0]),
+        call(fields[1]),
+        call(fields[2]),
+        call(fields[3])
+    );
+    let results = [r0, r1, r2, r3];
+    let get = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "get", "name": "race-box"}),
+    )
+    .await;
+    for (k, o) in &results {
+        if o.is_error {
+            assert!(o.text.contains("Запись изменилась"), "{k}: {}", o.text);
+        } else {
+            assert!(
+                get.text.contains(&format!("{k}: значение-{k}")),
+                "успешный set {k} потерян: {}",
+                get.text
+            );
+        }
+    }
+    assert!(results.iter().any(|(_, o)| !o.is_error));
+}

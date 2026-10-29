@@ -1448,14 +1448,25 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
                             "set: нечего менять — нужен value или открытые поля".into(),
                         ));
                     }
+                    // `data` слита с прочитанной ревизией: правка с `If-Match`, иначе чужая
+                    // правка между чтением и записью молча потерялась бы
+                    let guard: Vec<(HeaderName, String)> =
+                        m["rev"].as_i64().map(if_match).into_iter().collect();
                     call_rest(
                         rest,
                         Method::PATCH,
                         &format!("/api/v1/vault/{}", enc(&id)),
                         Some(&body),
-                        &[],
+                        &guard,
                     )
-                    .await?
+                    .await
+                    .map_err(|e| match e {
+                        Fail::Rest { ref reply, .. } if reply.status == StatusCode::CONFLICT => e
+                            .hint(
+                                "Запись изменилась, пока шла правка: повторите memory_vault set.",
+                            ),
+                        e => e,
+                    })?
                 }
                 None => {
                     let kind = kind.unwrap_or("password");
