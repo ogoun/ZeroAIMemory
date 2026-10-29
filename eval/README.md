@@ -429,6 +429,13 @@ frontmatter), запросы — в `queries.toml` с уникальным `id`.
 `results/2026-10-27-m4-bench-first-start-gpu.*`; сводка и выводы —
 `results/2026-10-28-m4-summary.md`.
 
+**Прогоны M4.5** (задача 15, 2026-10-29, коммит `580a910`): eval словаря —
+`results/2026-10-29-m45-glossary-{fts,bge-m3-int8,bge-m3-fp16}.*`, итоговые прогоны основного
+набора со словарём и связями `contradicts` — `results/2026-10-29-m45-{fts,bge-m3-int8-hybrid,
+bge-m3-fp16-hybrid,bge-m3-fp16-hybrid-rerank}.*` (`--compare` с `*-m4-final`), задержки хуков
+FTS-only — `results/2026-10-29-m45-fts-hints.*` (файл `eval --hints --label m45`, переименован под
+общий префикс); сводка — `results/2026-10-29-m45-summary.md`.
+
 Заметка корпуса `ru/zam/hybrid-search-rrf` описывает алгоритм поиска до подбора весов (без
 `w_fts_relaxed` и без правила «невидимых векторному каналу» узлов) и намеренно не обновляется:
 правка корпуса меняет его отпечаток и делает прогоны несравнимыми. Как поиск работает сейчас —
