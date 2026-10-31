@@ -1,13 +1,18 @@
 //! Общий разбор Office Open XML: записи zip с лимитами, потоковый XML, отношения частей.
 //!
 //! Защита (исследование M5 §3): записи читаются только в память через `take(лимит + 1)` с
-//! подсчётом фактических байт (заявленным размерам не верим); суммарный объём — `max_unpacked`
-//! (ловит и перекрывающиеся записи), степень сжатия записи больше 1 МиБ — `max_ratio`, число
-//! записей — `max_entries` до разбора центрального каталога. XML: `<!DOCTYPE>` — ошибка, своих
-//! сущностей нет (только пять предопределённых и числовые), глубина — `max_xml_depth`.
+//! подсчётом фактических байт (заявленным размерам не верим); суммарный объём — `max_unpacked`;
+//! степень сжатия записи больше 1 МиБ — `max_ratio` по фактически прочитанным сжатым байтам
+//! (счётчик под zip), а не по заголовку; перекрывающиеся записи (бомба Фифилда) и повторы имён
+//! (в том числе без учёта регистра) — отказ; число записей — `max_entries` до разбора
+//! центрального каталога. XML: `<!DOCTYPE>` — ошибка, своих сущностей нет (только пять
+//! предопределённых и числовые), глубина — `max_xml_depth`.
 
 use std::borrow::Cow;
-use std::io::{Cursor, Read};
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -20,10 +25,36 @@ use crate::ctx::Ctx;
 const RATIO_FROM: u64 = 1024 * 1024;
 /// Шаг чтения записи.
 const READ_STEP: usize = 64 * 1024;
+/// Начальная ёмкость буфера записи: заявленному размеру не верим, дальше — рост до `left`.
+const INITIAL_CAP: usize = 4 * 1024 * 1024;
+
+/// Читатель архива со счётчиком фактически прочитанных (сжатых) байт.
+struct Counting<'a> {
+    inner: Cursor<&'a [u8]>,
+    n: Rc<Cell<u64>>,
+}
+
+impl Read for Counting<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let k = self.inner.read(buf)?;
+        self.n.set(self.n.get() + k as u64);
+        Ok(k)
+    }
+}
+
+impl Seek for Counting<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
 
 /// Пакет OOXML (zip) с учётом распакованного объёма.
 pub(crate) struct Package<'a> {
-    zip: ZipArchive<Cursor<&'a [u8]>>,
+    zip: ZipArchive<Counting<'a>>,
+    /// Имя части в нижнем регистре → имя записи (OPC сравнивает имена без учёта регистра).
+    names: HashMap<String, String>,
+    read_bytes: Rc<Cell<u64>>,
+    len: u64,
     unpacked: u64,
 }
 
@@ -39,29 +70,50 @@ impl<'a> Package<'a> {
     /// Открывает zip. `Ok(None)` — записей больше `max_entries` (предупреждение уже записано).
     pub fn open(bytes: &'a [u8], ctx: &mut Ctx) -> Result<Option<Self>, DocError> {
         let max = u64::from(ctx.limits.max_entries);
-        if declared_entries(bytes).is_some_and(|n| n > max) {
+        let declared = declared_entries(bytes);
+        if declared.is_some_and(|n| n > max) {
             ctx.stop("max_entries");
             return Ok(None);
         }
-        let zip = ZipArchive::new(Cursor::new(bytes))
-            .map_err(|e| DocError::Malformed(format!("zip: {e}")))?;
+        let read_bytes = Rc::new(Cell::new(0));
+        let reader = Counting {
+            inner: Cursor::new(bytes),
+            n: read_bytes.clone(),
+        };
+        let mut zip =
+            ZipArchive::new(reader).map_err(|e| DocError::Malformed(format!("zip: {e}")))?;
         if zip.len() as u64 > max {
             ctx.stop("max_entries");
             return Ok(None);
         }
-        Ok(Some(Package { zip, unpacked: 0 }))
+        // `zip` складывает записи с одинаковым именем в одну: их число меньше заявленного
+        if declared.is_some_and(|n| n != 0xFFFF && n > zip.len() as u64) {
+            return Err(DocError::Malformed("zip: повтор имён записей".into()));
+        }
+        let mut names = HashMap::with_capacity(zip.len());
+        for n in zip.file_names() {
+            let n = n.map_err(|e| DocError::Malformed(format!("zip: {e}")))?;
+            if names.insert(n.to_lowercase(), n.to_string()).is_some() {
+                return Err(DocError::Malformed("zip: повтор имён записей".into()));
+            }
+        }
+        match zip.has_overlapping_entries() {
+            Ok(false) => {}
+            Ok(true) => return Err(DocError::Malformed("zip: overlapping entries".into())),
+            Err(e) => return Err(DocError::Malformed(format!("zip: {e}"))),
+        }
+        Ok(Some(Package {
+            zip,
+            names,
+            read_bytes,
+            len: bytes.len() as u64,
+            unpacked: 0,
+        }))
     }
 
-    /// Имя записи с учётом регистра (OPC сравнивает имена частей без учёта регистра).
-    fn entry_name(&self, name: &str) -> Option<String> {
-        if self.zip.index_for_name(name).is_some() {
-            return Some(name.to_string());
-        }
-        self.zip
-            .file_names()
-            .filter_map(Result::ok)
-            .find(|n| n.eq_ignore_ascii_case(name))
-            .map(Cow::into_owned)
+    /// Имя записи части без учёта регистра.
+    fn entry_name(&self, name: &str) -> Option<&str> {
+        self.names.get(&name.to_lowercase()).map(String::as_str)
     }
 
     /// Есть ли часть.
@@ -75,7 +127,7 @@ impl<'a> Package<'a> {
         if ctx.stopped() {
             return Ok(None);
         }
-        let Some(real) = self.entry_name(name) else {
+        let Some(real) = self.entry_name(name).map(str::to_string) else {
             return Ok(None);
         };
         let left = ctx.limits.max_unpacked.saturating_sub(self.unpacked);
@@ -104,10 +156,17 @@ impl<'a> Package<'a> {
             ctx.warn(format!("skipped: {real}"));
             return Ok(None);
         }
-        let compressed = file.compressed_size().max(1);
-        let ratio_cap = compressed.saturating_mul(u64::from(ctx.limits.max_ratio));
+        // сжатых байт не больше, чем осталось в файле после начала данных
+        let tail = self
+            .len
+            .saturating_sub(file.data_start().unwrap_or(file.header_start()));
+        let effective = file.compressed_size().min(tail).max(1);
+        let ratio = u64::from(ctx.limits.max_ratio);
+        let n0 = self.read_bytes.get();
+        let declared = file.size();
+        let cap = left.min(declared).min(usize::MAX as u64) as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap.min(INITIAL_CAP));
         let mut reader = (&mut file).take(left.saturating_add(1));
-        let mut buf = Vec::new();
         let mut chunk = vec![0u8; READ_STEP];
         let mut truncated = false;
         loop {
@@ -120,20 +179,27 @@ impl<'a> Package<'a> {
                 Ok(n) => n,
                 Err(e) => return Err(DocError::Malformed(format!("zip {real}: {e}"))),
             };
-            buf.extend_from_slice(&chunk[..n]);
-            let total = buf.len() as u64;
+            let total = (buf.len() + n) as u64;
             if total > left {
-                buf.truncate(left as usize);
+                let keep = (left as usize).saturating_sub(buf.len());
+                grow(&mut buf, keep, left);
+                buf.extend_from_slice(&chunk[..keep]);
                 ctx.stop("max_unpacked");
                 truncated = true;
                 break;
             }
-            if total > RATIO_FROM && total > ratio_cap {
+            grow(&mut buf, n, left);
+            buf.extend_from_slice(&chunk[..n]);
+            let packed = self.read_bytes.get().saturating_sub(n0).max(1);
+            if total > RATIO_FROM
+                && (total > packed.saturating_mul(ratio) || total > effective.saturating_mul(ratio))
+            {
                 ctx.truncated("max_ratio");
                 truncated = true;
                 break;
             }
         }
+        drop(file);
         self.unpacked += buf.len() as u64;
         Ok(Some(Part {
             name: real,
@@ -232,7 +298,7 @@ pub(crate) fn declared_entries(b: &[u8]) -> Option<u64> {
 }
 
 /// Байты части → строка: BOM UTF-8/UTF-16 снимаются, неверные последовательности заменяются.
-fn decode(buf: Vec<u8>) -> String {
+fn decode(mut buf: Vec<u8>) -> String {
     let utf16 = |b: &[u8], le: bool| {
         let units = b.as_chunks::<2>().0.iter().map(|&c| {
             if le {
@@ -246,12 +312,30 @@ fn decode(buf: Vec<u8>) -> String {
             .collect()
     };
     match buf.as_slice() {
-        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
-        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
-        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
-        _ => String::from_utf8(buf)
-            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        [0xFF, 0xFE, rest @ ..] => return utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => return utf16(rest, false),
+        // BOM UTF-8 снимается сдвигом в том же буфере, без копии
+        [0xEF, 0xBB, 0xBF, ..] => drop(buf.drain(..3)),
+        _ => {}
     }
+    String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Рост буфера записи без удвоения сверх лимита: ёмкость не больше `left` + шаг чтения.
+fn grow(buf: &mut Vec<u8>, add: usize, left: u64) {
+    let need = buf.len() + add;
+    if need <= buf.capacity() {
+        return;
+    }
+    let cap_max = usize::try_from(left)
+        .unwrap_or(usize::MAX)
+        .saturating_add(READ_STEP);
+    let want = buf
+        .capacity()
+        .saturating_mul(2)
+        .max(need)
+        .min(cap_max.max(need));
+    buf.reserve_exact(want - buf.len());
 }
 
 /// Событие XML для разборщиков форматов.
@@ -439,9 +523,16 @@ impl Table {
     }
 
     pub fn end_cell(&mut self) {
-        let c = std::mem::take(&mut self.cell)
-            .replace('\n', " ")
-            .replace('|', "\\|");
+        // один проход: перевод строки → пробел, `|` → `\|`
+        let cell = std::mem::take(&mut self.cell);
+        let mut c = String::with_capacity(cell.len());
+        for ch in cell.chars() {
+            match ch {
+                '\n' => c.push(' '),
+                '|' => c.push_str("\\|"),
+                ch => c.push(ch),
+            }
+        }
         self.row.push(c);
     }
 

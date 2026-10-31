@@ -2,26 +2,16 @@
 //!
 //! Фикстуры собираются в тесте через `zip` (бинарных файлов в репозитории нет).
 
-use std::io::Write;
+mod common;
+
 use std::time::{Duration, Instant};
 
+use common::{W, drop_central, dup_central, forge_compressed, zip_of, zip_with};
 use proptest::prelude::*;
 use zam_docs::{DocError, DocKind, Extracted, Limits, Locator, Unit, extract, sniff};
-use zip::write::SimpleFileOptions;
 
-const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
 const P: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main""#;
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-
-fn zip_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let o = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    for (name, data) in entries {
-        z.start_file(*name, o).unwrap();
-        z.write_all(data).unwrap();
-    }
-    z.finish().unwrap().into_inner()
-}
 
 fn rels(items: &[(&str, &str, &str)]) -> Vec<u8> {
     let mut s = format!(
@@ -362,6 +352,12 @@ fn sniff_by_signature_not_extension() {
     assert_eq!(sniff("a;b\n1;2\n".as_bytes(), "t.CSV"), Some(DocKind::Csv));
     assert_eq!(sniff("# Заметка\n".as_bytes(), "n.md"), Some(DocKind::Text));
     assert_eq!(sniff(b"\x00\x01\x02binary", "n.txt"), None);
+    // текст о PDF — текст; у текстового расширения `%PDF-` считается только в начале
+    assert_eq!(
+        sniff(b"see header %PDF-1.7 here", "n.md"),
+        Some(DocKind::Text)
+    );
+    assert_eq!(sniff(b"\n  %PDF-1.7\n", "n.txt"), Some(DocKind::Pdf));
     assert_eq!(sniff(b"\x89PNG\r\n\x1a\n....", "a.docx"), None);
     assert_eq!(sniff(b"PK\x03\x04garbage", "a.docx"), None);
     assert_eq!(sniff(b"", "a.docx"), None);
@@ -640,6 +636,154 @@ fn text_paragraphs() {
     assert_eq!(x.units.len(), 1);
     assert_eq!(x.units[0].locator, Locator::Para(1));
     assert_eq!(x.units[0].text, "Первый абзац\nего строка\n\nВторой");
+}
+
+/// DOCX-бомба: абзац «Начало» и `mib` МиБ пустых абзацев (сжатие ~1000:1) + запись `pad.bin`
+/// без сжатия размером `pad` байт сразу после документа.
+fn bomb_with_pad(mib: usize, pad: usize) -> Vec<u8> {
+    let mut doc = format!(r#"<w:document {W}><w:body>{}"#, p("Начало"));
+    doc.push_str(&"<w:p/>".repeat(mib * 1024 * 1024 / 6));
+    doc.push_str("</w:body></w:document>");
+    zip_with(
+        &[
+            ("word/document.xml", doc.into_bytes()),
+            ("pad.bin", vec![7u8; pad]),
+        ],
+        &["pad.bin"],
+    )
+}
+
+#[test]
+fn zip_forged_compressed_size_truncates() {
+    // заявленный compressed_size документа раздут на 3 МиБ (локальный и центральный
+    // заголовки) и покрывает «дыру» — данные записи, убранной из каталога, — без перекрытия
+    let pad = 3 * 1024 * 1024;
+    let mut b = drop_central(&bomb_with_pad(8, pad), "pad.bin");
+    forge_compressed(&mut b, "word/document.xml", pad as u32);
+    let x = run(DocKind::Docx, &b);
+    assert!(
+        x.warnings.contains(&"truncated: max_ratio".to_string()),
+        "степень сжатия — по фактически прочитанным байтам: {:?}",
+        x.warnings
+    );
+    assert_eq!(x.units.len(), 1);
+    assert_eq!(x.units[0].text, "Начало");
+}
+
+#[test]
+fn zip_overlapping_entries_rejected() {
+    let bad = |b: &[u8]| match extract(DocKind::Docx, b, &Limits::default(), far()) {
+        Err(DocError::Malformed(m)) => m,
+        other => panic!("{other:?}"),
+    };
+    // раздутый compressed_size накрывает следующую запись
+    let pad = 64 * 1024;
+    let mut b = bomb_with_pad(1, pad);
+    forge_compressed(&mut b, "word/document.xml", pad as u32);
+    assert!(bad(&b).contains("overlapping"));
+    // две записи каталога на одни данные (бомба Фифилда)
+    let d = docx(&p("текст"));
+    let fifield = dup_central(&d, "word/document.xml", "word/documenX.xml");
+    assert!(bad(&fifield).contains("overlapping"));
+    // повтор имени — точный и без учёта регистра (обход проверок по имени части)
+    let same = dup_central(&d, "word/document.xml", "word/document.xml");
+    assert!(bad(&same).contains("повтор"), "{}", bad(&same));
+    let case = zip_of(&[
+        ("word/document.xml", b"<w:document/>".to_vec()),
+        ("WORD/document.xml", b"<w:document/>".to_vec()),
+    ]);
+    assert!(bad(&case).contains("повтор"));
+}
+
+#[test]
+fn max_chars_bounds_single_huge_paragraph() {
+    // один абзац на 3 млн символов при max_chars = 1000: накопление обрезается сразу
+    let body = format!(
+        "{}<w:p><w:r><w:t>{}</w:t></w:r></w:p>{}",
+        p("до"),
+        "я".repeat(3_000_000),
+        p("после")
+    );
+    // повторы сжимаются сильнее max_ratio: степень сжатия здесь не проверяется
+    let limits = Limits {
+        max_chars: 1000,
+        max_ratio: u32::MAX,
+        ..Limits::default()
+    };
+    let x = extract(DocKind::Docx, &docx(&body), &limits, far()).unwrap();
+    assert_eq!(x.warnings, ["truncated: max_chars"]);
+    let all = all_text(&x);
+    assert!(all.starts_with("до\n\nяяя"), "{}", &all[..20]);
+    assert!(!all.contains("после"));
+    let n: usize = all.chars().filter(|c| !c.is_whitespace()).count();
+    assert!(n <= 1000, "{n}");
+    // то же в ячейке таблицы и в PPTX
+    let cell = format!(
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:tc></w:tr></w:tbl>{}",
+        "я".repeat(3_000_000),
+        p("после")
+    );
+    let x = extract(DocKind::Docx, &docx(&cell), &limits, far()).unwrap();
+    assert_eq!(x.warnings, ["truncated: max_chars"]);
+    assert!(
+        x.units
+            .iter()
+            .map(|u| u.text.chars().count())
+            .sum::<usize>()
+            < 1100
+    );
+}
+
+#[test]
+fn table_in_textbox_is_paragraph_text() {
+    let body = format!(
+        r#"<w:p><w:r><w:t>Перед</w:t></w:r><w:r><w:pict><w:txbxContent><w:tbl><w:tr><w:tc><w:p><w:r><w:t>в надписи</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:txbxContent></w:pict></w:r></w:p>{}"#,
+        p("Второй")
+    );
+    let x = run(DocKind::Docx, &docx(&body));
+    let all = all_text(&x);
+    assert!(all.contains("Перед в надписи"), "{all}");
+    assert!(!all.contains('|'), "таблица надписи — не структура: {all}");
+    assert_eq!(x.units[0].locator, Locator::Para(1));
+    assert!(x.units[0].text.ends_with("Второй"));
+}
+
+#[test]
+fn pptx_many_slide_ids_bounded() {
+    // 60 000 sldId × 60 000 отношений без совпадений: без квадратичного поиска
+    let n = 60_000;
+    let mut pres = format!("<p:presentation {P}><p:sldIdLst>");
+    for i in 0..n {
+        pres.push_str(&format!(r#"<p:sldId r:id="x{i}"/>"#));
+    }
+    pres.push_str("</p:sldIdLst></p:presentation>");
+    let items: Vec<(String, String)> = (0..n)
+        .map(|i| (format!("y{i}"), format!("slides/s{i}.xml")))
+        .collect();
+    let refs: Vec<(&str, &str, &str)> = items
+        .iter()
+        .map(|(id, t)| (id.as_str(), "slide", t.as_str()))
+        .collect();
+    let b = zip_of(&[
+        ("ppt/presentation.xml", pres.into_bytes()),
+        ("ppt/_rels/presentation.xml.rels", rels(&refs)),
+    ]);
+    let t = Instant::now();
+    let x = extract(
+        DocKind::Pptx,
+        &b,
+        &Limits::default(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert!(x.units.is_empty());
+    assert!(
+        x.warnings.is_empty() || x.warnings == ["truncated: timeout_ms"],
+        "{:?}",
+        x.warnings
+    );
 }
 
 // --- proptest: разбор не паникует на любых байтах и на случайных zip с XML ---

@@ -1,6 +1,8 @@
 //! PPTX: слайды по порядку `p:sldIdLst` из `ppt/presentation.xml`, текст фигур и таблиц;
 //! заметки докладчика — отдельная единица слайда с путём `[заголовок, «Заметки докладчика»]`.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::ctx::{Ctx, Units};
 use crate::ooxml::{Ev, Package, Table, Xml, attr, attr_ns, local};
 use crate::{DocError, Locator, Unit};
@@ -25,7 +27,10 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
     let slides = slide_order(&mut pkg, &main, ctx)?;
     let mut units = Units::default();
     for (i, slide) in slides.iter().enumerate() {
-        if ctx.stopped() {
+        if ctx.chars_full() {
+            ctx.stop("max_chars");
+        }
+        if !ctx.tick() {
             break;
         }
         let n = u32::try_from(i + 1).unwrap_or(u32::MAX);
@@ -53,32 +58,34 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
 /// Части слайдов в порядке показа; без `presentation.xml` — `ppt/slides/slideN.xml` по N.
 fn slide_order(pkg: &mut Package, main: &str, ctx: &mut Ctx) -> Result<Vec<String>, DocError> {
     let rels = pkg.rels(main, ctx)?;
-    let mut ids = Vec::new();
+    let slides: HashMap<&str, &str> = rels
+        .iter()
+        .filter(|r| r.kind == "slide")
+        .map(|r| (r.id.as_str(), r.target.as_str()))
+        .collect();
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     if let Some(part) = pkg.read(main, ctx)? {
         let mut xml = Xml::new(&part, ctx);
         while let Some(ev) = xml.next(ctx)? {
             if let Ev::Start(e) | Ev::Empty(e) = ev
                 && local(&e) == "sldId"
                 && let Some(id) = attr_ns(&e, "id")
+                && let Some(target) = slides.get(id.as_str())
+                && seen.insert((*target).to_string())
             {
-                ids.push(id);
+                out.push((*target).to_string());
             }
         }
     }
-    let mut out: Vec<String> = ids
-        .iter()
-        .filter_map(|id| rels.iter().find(|r| &r.id == id && r.kind == "slide"))
-        .map(|r| r.target.clone())
-        .collect();
-    if out.is_empty() {
+    if out.is_empty() && !ctx.stopped() {
         out = rels
             .iter()
-            .filter(|r| r.kind == "slide")
+            .filter(|r| r.kind == "slide" && seen.insert(r.target.clone()))
             .map(|r| r.target.clone())
             .collect();
         out.sort_by_key(|t| slide_number(t));
     }
-    out.dedup();
     Ok(out)
 }
 
@@ -118,6 +125,7 @@ fn shapes(
     let (mut para, mut in_p, mut in_t) = (String::new(), false, false);
     let mut tbl_depth = 0u32;
     let mut table = Table::default();
+    let mut pending = 0u64;
     while let Some(ev) = xml.next(ctx)? {
         match ev {
             Ev::Start(e) => match local(&e) {
@@ -188,9 +196,13 @@ fn shapes(
             },
             Ev::Text(t) => {
                 if in_p && in_t {
-                    para.push_str(&t);
+                    ctx.append(&mut para, &t, &mut pending);
                 }
             }
+        }
+        // остаток `max_chars` исчерпан: собранное выдаётся, остальное не разбирается
+        if ctx.chars_full() && !in_p && tbl_depth == 0 && shape.is_none() {
+            break;
         }
     }
     Ok(Some(SlideText {

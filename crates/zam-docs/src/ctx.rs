@@ -20,6 +20,8 @@ pub(crate) struct Ctx<'l> {
     chars: u64,
     /// Лимит документа исчерпан: разбор останавливается, собранное возвращается.
     stopped: bool,
+    /// Текст обрезан по `max_chars` при накоплении (см. [`Ctx::append`]).
+    chars_full: bool,
     ticks: u64,
 }
 
@@ -31,6 +33,7 @@ impl<'l> Ctx<'l> {
             warnings: Vec::new(),
             chars: 0,
             stopped: false,
+            chars_full: false,
             ticks: 0,
         }
     }
@@ -84,6 +87,38 @@ impl<'l> Ctx<'l> {
         text.truncate(cut);
         self.chars += left;
         self.stop("max_chars");
+    }
+
+    /// Дописывает текст события XML в буфер абзаца или ячейки не сверх остатка `max_chars`
+    /// (с учётом `pending` — уже накопленного, но ещё не выданного текста). Обрезка ставит
+    /// [`Ctx::chars_full`]: разборщик выдаёт текущий блок и останавливается.
+    pub fn append(&mut self, dst: &mut String, s: &str, pending: &mut u64) {
+        let left = self
+            .limits
+            .max_chars
+            .saturating_sub(self.chars.saturating_add(*pending));
+        // байтов не меньше, чем символов: короткая строка заведомо помещается
+        let n = if s.len() as u64 <= left {
+            s.chars().count() as u64
+        } else {
+            match s.char_indices().nth(left as usize) {
+                Some((cut, _)) => {
+                    dst.push_str(&s[..cut]);
+                    *pending += left;
+                    self.chars_full = true;
+                    self.truncated("max_chars");
+                    return;
+                }
+                None => s.chars().count() as u64,
+            }
+        };
+        dst.push_str(s);
+        *pending += n;
+    }
+
+    /// Остаток `max_chars` исчерпан накопленным текстом.
+    pub fn chars_full(&self) -> bool {
+        self.chars_full
     }
 
     pub fn into_warnings(self) -> Vec<String> {

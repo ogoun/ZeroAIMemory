@@ -33,19 +33,24 @@ pub fn sniff(bytes: &[u8], name: &str) -> Option<DocKind> {
             _ => Some(DocKind::Xls),
         };
     }
-    let head = &bytes[..bytes.len().min(PDF_WINDOW)];
-    if head.windows(5).any(|w| w == b"%PDF-") {
-        return Some(DocKind::Pdf);
-    }
-    if !looks_text(bytes) {
-        return None;
-    }
-    match ext.as_str() {
+    let text_kind = match ext.as_str() {
         "csv" | "tsv" => Some(DocKind::Csv),
         "txt" | "text" | "md" | "markdown" | "log" | "json" | "jsonl" | "yaml" | "yml" | "toml"
         | "ini" | "cfg" | "conf" | "xml" | "html" | "htm" | "rst" | "adoc" => Some(DocKind::Text),
         _ => None,
+    };
+    let is_text = looks_text(bytes);
+    // текстовый файл с упоминанием `%PDF-` (заметка о PDF) — текст; PDF — только с начала
+    let pdf = if text_kind.is_some() && is_text {
+        bytes.trim_ascii_start().starts_with(b"%PDF-")
+    } else {
+        let head = &bytes[..bytes.len().min(PDF_WINDOW)];
+        head.windows(5).any(|w| w == b"%PDF-")
+    };
+    if pdf {
+        return Some(DocKind::Pdf);
     }
+    if is_text { text_kind } else { None }
 }
 
 /// Текст: UTF-8 (с BOM или без) без нулевых байтов в начале файла.

@@ -1,11 +1,24 @@
 //! DOCX: тело `word/document.xml` со стилями заголовков, таблицы, сноски и колонтитулы.
 //!
 //! Единица — блок абзацев под одним путём заголовков (до мягкого предела), `Locator::Para(n)` —
-//! номер первого абзаца блока: порядковый номер `w:p` тела с 1, включая абзацы ячеек таблиц
-//! (абзацы надписей входят в абзац, где стоит надпись). Сноски, концевые сноски и колонтитулы —
-//! отдельные единицы в конце.
+//! номер первого абзаца блока. Сноски, концевые сноски и колонтитулы — отдельные единицы в конце.
+//!
+//! # Нумерация `para:n` (её же должен повторять просмотрщик DOCX)
+//!
+//! Номер получает каждый элемент `w:p` части `word/document.xml`, у которого нет предка `w:p`,
+//! по порядку документа, с 1:
+//! - считаются пустые абзацы (`<w:p/>`), абзацы ячеек таблиц (в том числе вложенных), абзацы
+//!   внутри `w:sdt`, `w:customXml`, `w:smartTag`, `w:ins`, `w:moveTo` — эти обёртки прозрачны;
+//! - не считаются абзацы внутри `w:del`, `w:moveFrom` и `mc:Fallback` (поддерево пропускается
+//!   целиком; ветка `mc:Choice` считается);
+//! - абзац надписи (`w:txbxContent` внутри прогона) номера не получает: его текст входит в
+//!   абзац, где стоит надпись; таблица внутри надписи тоже идёт текстом этого абзаца;
+//! - сноски, концевые сноски, колонтитулы своих номеров не имеют: `locator` сноски — номер абзаца
+//!   тела с первой ссылкой на неё (иначе `para:1`), колонтитулов — `para:1`.
+//!
+//! `locator` таблицы — номер её первого абзаца.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ctx::{Ctx, UNIT_SOFT_CHARS, Units};
 use crate::ooxml::{Ev, Package, Table, Xml, attr_ns, local, on};
@@ -69,12 +82,11 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
             push_grouped(&mut units, lines, title, ctx);
         }
     }
-    let mut seen = Vec::new();
+    let mut seen = HashSet::new();
     let mut hf = Vec::new();
     for t in target("header").into_iter().chain(target("footer")) {
         for (_, text) in containers(&mut pkg, &t, &[], ctx)? {
-            if !seen.contains(&text) {
-                seen.push(text.clone());
+            if seen.insert(text.clone()) {
                 hf.push((1, text));
             }
         }
@@ -221,8 +233,12 @@ struct Body<'s> {
     in_t: bool,
     hidden: bool,
     tbl_depth: u32,
+    /// Таблицы внутри надписи (внутри `w:p`): идут текстом абзаца, не структурой.
+    boxed_tbl: u32,
     table: Table,
     table_at: u32,
+    /// Символы, накопленные в абзаце и таблице, но ещё не выданные (учёт `max_chars`).
+    pending: u64,
     /// Первый абзац со ссылкой на сноску: (`footnotes`|`endnotes`, id) → номер абзаца.
     note_refs: HashMap<(&'static str, String), u32>,
 }
@@ -243,8 +259,10 @@ impl<'s> Body<'s> {
             in_t: false,
             hidden: false,
             tbl_depth: 0,
+            boxed_tbl: 0,
             table: Table::default(),
             table_at: 0,
+            pending: 0,
             note_refs: HashMap::new(),
         }
     }
@@ -260,6 +278,7 @@ impl<'s> Body<'s> {
                     "rPr" => self.in_rpr = true,
                     "r" => self.hidden = false,
                     "t" => self.in_t = true,
+                    "tbl" if self.in_p > 0 || self.boxed_tbl > 0 => self.boxed_tbl += 1,
                     "tbl" => {
                         self.tbl_depth += 1;
                         if self.tbl_depth == 1 {
@@ -283,22 +302,28 @@ impl<'s> Body<'s> {
                     "pPr" => self.in_ppr = false,
                     "rPr" => self.in_rpr = false,
                     "t" => self.in_t = false,
-                    "tc" if self.tbl_depth == 1 => self.table.end_cell(),
-                    "tr" if self.tbl_depth == 1 => self.table.end_row(),
+                    "tc" if self.tbl_depth == 1 && self.boxed_tbl == 0 => self.table.end_cell(),
+                    "tr" if self.tbl_depth == 1 && self.boxed_tbl == 0 => self.table.end_row(),
+                    "tbl" if self.boxed_tbl > 0 => self.boxed_tbl -= 1,
                     "tbl" => {
                         self.tbl_depth = self.tbl_depth.saturating_sub(1);
                         if self.tbl_depth == 0 {
                             let t = std::mem::take(&mut self.table).render();
                             self.units.block(&t, Locator::Para(self.table_at), ctx);
+                            self.pending = 0;
                         }
                     }
                     _ => {}
                 },
                 Ev::Text(t) => {
                     if self.in_t && self.in_p > 0 && !self.hidden {
-                        self.text.push_str(&t);
+                        ctx.append(&mut self.text, &t, &mut self.pending);
                     }
                 }
+            }
+            // остаток `max_chars` исчерпан: текущий блок уже выдан — дальше не разбираем
+            if ctx.chars_full() && self.in_p == 0 && self.tbl_depth == 0 {
+                ctx.stop("max_chars");
             }
             if ctx.stopped() {
                 break;
@@ -358,6 +383,7 @@ impl<'s> Body<'s> {
             self.table.text(&text);
             return;
         }
+        self.pending = 0;
         let at = Locator::Para(self.para_no);
         let level = outline_level(self.outline).or_else(|| {
             self.style
@@ -388,6 +414,7 @@ fn containers(
     let mut cur: Option<(Option<String>, Vec<String>)> =
         boxes.is_empty().then(|| (None, Vec::new()));
     let (mut para, mut in_t, mut in_ppr, mut in_p) = (String::new(), false, false, 0u32);
+    let mut pending = 0u64;
     let mut xml = Xml::new(&part, ctx);
     let close = |cur: &mut Option<(Option<String>, Vec<String>)>, out: &mut Vec<_>| {
         if let Some((id, paras)) = cur.take() {
@@ -440,9 +467,12 @@ fn containers(
             },
             Ev::Text(t) => {
                 if in_t && in_p > 0 {
-                    para.push_str(&t);
+                    ctx.append(&mut para, &t, &mut pending);
                 }
             }
+        }
+        if ctx.chars_full() && in_p == 0 {
+            break;
         }
     }
     close(&mut cur, &mut out);
