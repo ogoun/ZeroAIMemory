@@ -51,7 +51,7 @@ impl Seek for Counting<'_> {
 /// Пакет OOXML (zip) с учётом распакованного объёма.
 pub(crate) struct Package<'a> {
     zip: ZipArchive<Counting<'a>>,
-    /// Имя части в нижнем регистре → имя записи (OPC сравнивает имена без учёта регистра).
+    /// Имя части с ASCII в нижнем регистре → имя записи (OPC: без учёта регистра ASCII).
     names: HashMap<String, String>,
     read_bytes: Rc<Cell<u64>>,
     len: u64,
@@ -93,7 +93,10 @@ impl<'a> Package<'a> {
         let mut names = HashMap::with_capacity(zip.len());
         for n in zip.file_names() {
             let n = n.map_err(|e| DocError::Malformed(format!("zip: {e}")))?;
-            if names.insert(n.to_lowercase(), n.to_string()).is_some() {
+            if names
+                .insert(n.to_ascii_lowercase(), n.to_string())
+                .is_some()
+            {
                 return Err(DocError::Malformed("zip: повтор имён записей".into()));
             }
         }
@@ -111,9 +114,11 @@ impl<'a> Package<'a> {
         }))
     }
 
-    /// Имя записи части без учёта регистра.
+    /// Имя записи части без учёта регистра ASCII.
     fn entry_name(&self, name: &str) -> Option<&str> {
-        self.names.get(&name.to_lowercase()).map(String::as_str)
+        self.names
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
     }
 
     /// Есть ли часть.
@@ -168,6 +173,8 @@ impl<'a> Package<'a> {
         let mut buf: Vec<u8> = Vec::with_capacity(cap.min(INITIAL_CAP));
         let mut reader = (&mut file).take(left.saturating_add(1));
         let mut chunk = vec![0u8; READ_STEP];
+        let mut sink = Sink::default();
+        let mut raw = 0u64;
         let mut truncated = false;
         loop {
             if !ctx.tick() {
@@ -179,20 +186,19 @@ impl<'a> Package<'a> {
                 Ok(n) => n,
                 Err(e) => return Err(DocError::Malformed(format!("zip {real}: {e}"))),
             };
-            let total = (buf.len() + n) as u64;
-            if total > left {
-                let keep = (left as usize).saturating_sub(buf.len());
-                grow(&mut buf, keep, left);
-                buf.extend_from_slice(&chunk[..keep]);
-                ctx.stop("max_unpacked");
+            raw += n as u64;
+            // выход UTF-8 (UTF-16 раскодируется по ходу) и вход ограничены одним `left`
+            sink.feed(&chunk[..n], &mut buf, left);
+            if raw > left || buf.len() as u64 > left {
+                buf.truncate(left as usize);
+                // эта часть разбирается частично, следующие уже не читаются (`left == 0`)
+                ctx.truncated("max_unpacked");
                 truncated = true;
                 break;
             }
-            grow(&mut buf, n, left);
-            buf.extend_from_slice(&chunk[..n]);
             let packed = self.read_bytes.get().saturating_sub(n0).max(1);
-            if total > RATIO_FROM
-                && (total > packed.saturating_mul(ratio) || total > effective.saturating_mul(ratio))
+            if raw > RATIO_FROM
+                && (raw > packed.saturating_mul(ratio) || raw > effective.saturating_mul(ratio))
             {
                 ctx.truncated("max_ratio");
                 truncated = true;
@@ -200,10 +206,15 @@ impl<'a> Package<'a> {
             }
         }
         drop(file);
-        self.unpacked += buf.len() as u64;
+        sink.finish(&mut buf, left);
+        if sink.bad_utf16 && !truncated {
+            return Err(DocError::Malformed(format!("invalid utf-16 in {real}")));
+        }
+        self.unpacked += raw.max(buf.len() as u64);
+        let text = decode(buf, &real, truncated)?;
         Ok(Some(Part {
             name: real,
-            text: decode(buf),
+            text,
             truncated,
         }))
     }
@@ -297,28 +308,151 @@ pub(crate) fn declared_entries(b: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(rec[32..40].try_into().ok()?))
 }
 
-/// Байты части → строка: BOM UTF-8/UTF-16 снимаются, неверные последовательности заменяются.
-fn decode(mut buf: Vec<u8>) -> String {
-    let utf16 = |b: &[u8], le: bool| {
-        let units = b.as_chunks::<2>().0.iter().map(|&c| {
-            if le {
-                u16::from_le_bytes(c)
-            } else {
-                u16::from_be_bytes(c)
+/// Приёмник байтов записи: UTF-8 копится как есть, UTF-16 (по BOM) раскодируется в UTF-8 по
+/// ходу чтения — в памяти одна копия текста, и её объём учитывается в `max_unpacked`.
+#[derive(Default)]
+struct Sink {
+    /// Первые байты до решения о кодировке (BOM — 2 байта).
+    head: Vec<u8>,
+    /// `Some(le)` — UTF-16; `None` после решения — UTF-8.
+    utf16: Option<bool>,
+    decided: bool,
+    carry: Option<u8>,
+    high: Option<u16>,
+    /// Непарный суррогат UTF-16.
+    bad_utf16: bool,
+}
+
+impl Sink {
+    fn feed(&mut self, mut data: &[u8], out: &mut Vec<u8>, left: u64) {
+        if !self.decided {
+            let need = 2usize.saturating_sub(self.head.len()).min(data.len());
+            self.head.extend_from_slice(&data[..need]);
+            data = &data[need..];
+            if self.head.len() < 2 {
+                return;
             }
-        });
-        char::decode_utf16(units)
-            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-            .collect()
-    };
-    match buf.as_slice() {
-        [0xFF, 0xFE, rest @ ..] => return utf16(rest, true),
-        [0xFE, 0xFF, rest @ ..] => return utf16(rest, false),
-        // BOM UTF-8 снимается сдвигом в том же буфере, без копии
-        [0xEF, 0xBB, 0xBF, ..] => drop(buf.drain(..3)),
-        _ => {}
+            self.decided = true;
+            let head = std::mem::take(&mut self.head);
+            match head.as_slice() {
+                [0xFF, 0xFE] => self.utf16 = Some(true),
+                [0xFE, 0xFF] => self.utf16 = Some(false),
+                _ => {
+                    grow(out, head.len(), left);
+                    out.extend_from_slice(&head);
+                }
+            }
+        }
+        let Some(le) = self.utf16 else {
+            grow(out, data.len(), left);
+            out.extend_from_slice(data);
+            return;
+        };
+        // UTF-16 → UTF-8: до 3 байт на кодовую единицу
+        grow(out, data.len() / 2 * 3 + 4, left);
+        let mut i = 0;
+        if let Some(c) = self.carry.take() {
+            match data.first() {
+                Some(&d) => {
+                    self.unit([c, d], le, out);
+                    i = 1;
+                }
+                None => {
+                    self.carry = Some(c);
+                    return;
+                }
+            }
+        }
+        let rest = &data[i..];
+        let (pairs, tail) = rest.as_chunks::<2>();
+        for &p in pairs {
+            self.unit(p, le, out);
+        }
+        self.carry = tail.first().copied();
     }
-    String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+
+    fn unit(&mut self, b: [u8; 2], le: bool, out: &mut Vec<u8>) {
+        let u = if le {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        };
+        let c = match (self.high.take(), u) {
+            (None, 0xD800..=0xDBFF) => {
+                self.high = Some(u);
+                return;
+            }
+            (Some(h), 0xDC00..=0xDFFF) => {
+                let v = 0x10000 + ((u32::from(h) - 0xD800) << 10) + (u32::from(u) - 0xDC00);
+                char::from_u32(v)
+            }
+            (Some(_), _) | (None, 0xDC00..=0xDFFF) => None,
+            (None, u) => char::from_u32(u32::from(u)),
+        };
+        match c {
+            Some(c) => {
+                let mut tmp = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+            }
+            None => self.bad_utf16 = true,
+        }
+    }
+
+    /// Конец записи: недочитанный BOM-кандидат — это UTF-8; хвост UTF-16 без пары — ошибка.
+    fn finish(&mut self, out: &mut Vec<u8>, left: u64) {
+        if !self.decided {
+            let head = std::mem::take(&mut self.head);
+            grow(out, head.len(), left);
+            out.extend_from_slice(&head);
+            self.decided = true;
+        }
+        if self.utf16.is_some() && (self.carry.is_some() || self.high.is_some()) {
+            self.bad_utf16 = true;
+        }
+    }
+}
+
+/// Байты части (UTF-8) → строка: BOM снимается, концы строк `\r\n` и `\r` → `\n` на месте
+/// (как в разборщике XML 1.0, но без копии больших текстовых узлов); неверный UTF-8 — ошибка
+/// `Malformed`, кроме неполного символа в конце обрезанной лимитом части.
+fn decode(mut buf: Vec<u8>, part: &str, truncated: bool) -> Result<String, DocError> {
+    if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        buf.drain(..3);
+    }
+    normalize_eol(&mut buf);
+    match String::from_utf8(buf) {
+        Ok(s) => Ok(s),
+        Err(e) if truncated && e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut b = e.into_bytes();
+            b.truncate(valid);
+            String::from_utf8(b)
+                .map_err(|_| DocError::Malformed(format!("invalid utf-8 in {part}")))
+        }
+        Err(_) => Err(DocError::Malformed(format!("invalid utf-8 in {part}"))),
+    }
+}
+
+/// Нормализация концов строк XML 1.0 (§2.11) сдвигом в том же буфере.
+fn normalize_eol(b: &mut Vec<u8>) {
+    let Some(first) = b.iter().position(|&c| c == b'\r') else {
+        return;
+    };
+    let (mut w, mut r) = (first, first);
+    while r < b.len() {
+        let c = b[r];
+        r += 1;
+        if c == b'\r' {
+            b[w] = b'\n';
+            if b.get(r) == Some(&b'\n') {
+                r += 1;
+            }
+        } else {
+            b[w] = c;
+        }
+        w += 1;
+    }
+    b.truncate(w);
 }
 
 /// Рост буфера записи без удвоения сверх лимита: ёмкость не больше `left` + шаг чтения.

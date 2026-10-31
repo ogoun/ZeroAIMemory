@@ -113,12 +113,12 @@ fn push_grouped(
                 continue;
             }
             let (a, buf) = (*a, std::mem::take(buf));
-            units.push(Locator::Para(a), vec![title.to_string()], &buf, ctx);
+            units.push(Locator::Para(a), vec![title.to_string()], buf, ctx);
         }
         cur = Some((at, line, n));
     }
     if let Some((a, buf, _)) = cur {
-        units.push(Locator::Para(a), vec![title.to_string()], &buf, ctx);
+        units.push(Locator::Para(a), vec![title.to_string()], buf, ctx);
     }
 }
 
@@ -273,7 +273,7 @@ impl<'s> Body<'s> {
                 Ev::Start(e) => match local(&e) {
                     // удалённые правки и запасные ветви `mc:AlternateContent` (дубли надписей)
                     "del" | "moveFrom" | "Fallback" => xml.skip(ctx)?,
-                    "p" => self.start_p(),
+                    "p" => self.start_p(ctx),
                     "pPr" => self.in_ppr = true,
                     "rPr" => self.in_rpr = true,
                     "r" => self.hidden = false,
@@ -286,15 +286,15 @@ impl<'s> Body<'s> {
                             self.table_at = self.para_no + 1;
                         }
                     }
-                    other => self.prop(other, &e),
+                    other => self.prop(other, &e, ctx),
                 },
                 Ev::Empty(e) => {
                     let name = local(&e);
                     if name == "p" {
-                        self.start_p();
+                        self.start_p(ctx);
                         self.end_p(ctx);
                     } else {
-                        self.prop(name, &e);
+                        self.prop(name, &e, ctx);
                     }
                 }
                 Ev::End(n) => match n.as_str() {
@@ -309,7 +309,7 @@ impl<'s> Body<'s> {
                         self.tbl_depth = self.tbl_depth.saturating_sub(1);
                         if self.tbl_depth == 0 {
                             let t = std::mem::take(&mut self.table).render();
-                            self.units.block(&t, Locator::Para(self.table_at), ctx);
+                            self.units.block(t, Locator::Para(self.table_at), ctx);
                             self.pending = 0;
                         }
                     }
@@ -329,11 +329,16 @@ impl<'s> Body<'s> {
                 break;
             }
         }
+        // часть оборвана лимитом посреди абзаца: собранный текст абзаца не теряется
+        if self.in_p > 0 && self.tbl_depth == 0 && !self.text.is_empty() {
+            self.in_p = 1;
+            self.end_p(ctx);
+        }
         Ok(())
     }
 
     /// Свойства и пустые элементы: стиль, уровень, список, скрытый текст, табуляции, переносы.
-    fn prop(&mut self, name: &str, e: &quick_xml::events::BytesStart) {
+    fn prop(&mut self, name: &str, e: &quick_xml::events::BytesStart, ctx: &mut Ctx) {
         let top = self.in_p == 1;
         match name {
             "pStyle" if self.in_ppr && top => self.style = attr_ns(e, "val"),
@@ -342,9 +347,15 @@ impl<'s> Body<'s> {
             }
             "numPr" if self.in_ppr && top => self.list = true,
             "vanish" if self.in_rpr && !self.in_ppr => self.hidden = on(e),
-            "tab" if !self.in_ppr && self.in_p > 0 && !self.hidden => self.text.push('\t'),
-            "br" | "cr" if self.in_p > 0 && !self.hidden => self.text.push('\n'),
-            "noBreakHyphen" if self.in_p > 0 && !self.hidden => self.text.push('-'),
+            "tab" if !self.in_ppr && self.in_p > 0 && !self.hidden => {
+                ctx.append(&mut self.text, "\t", &mut self.pending);
+            }
+            "br" | "cr" if self.in_p > 0 && !self.hidden => {
+                ctx.append(&mut self.text, "\n", &mut self.pending);
+            }
+            "noBreakHyphen" if self.in_p > 0 && !self.hidden => {
+                ctx.append(&mut self.text, "-", &mut self.pending);
+            }
             "footnoteReference" | "endnoteReference" => {
                 let kind = if name == "footnoteReference" {
                     "footnotes"
@@ -360,7 +371,7 @@ impl<'s> Body<'s> {
         }
     }
 
-    fn start_p(&mut self) {
+    fn start_p(&mut self, ctx: &mut Ctx) {
         if self.in_p == 0 {
             self.para_no += 1;
             self.text.clear();
@@ -368,7 +379,7 @@ impl<'s> Body<'s> {
             self.outline = None;
             self.list = false;
         } else if !self.text.is_empty() {
-            self.text.push(' ');
+            ctx.append(&mut self.text, " ", &mut self.pending);
         }
         self.in_p += 1;
     }
@@ -393,8 +404,8 @@ impl<'s> Body<'s> {
         let one_line = || text.split_whitespace().collect::<Vec<_>>().join(" ");
         match level {
             Some(l) if !one_line().is_empty() => self.units.heading(l, &one_line(), at, ctx),
-            _ if self.list => self.units.block(&format!("- {}", text.trim()), at, ctx),
-            _ => self.units.block(&text, at, ctx),
+            _ if self.list => self.units.block(format!("- {}", text.trim()), at, ctx),
+            _ => self.units.block(text, at, ctx),
         }
     }
 }
@@ -435,7 +446,7 @@ fn containers(
                 "p" => {
                     in_p += 1;
                     if in_p > 1 {
-                        para.push(' ');
+                        ctx.append(&mut para, " ", &mut pending);
                     }
                 }
                 "pPr" => in_ppr = true,
@@ -443,8 +454,8 @@ fn containers(
                 _ => {}
             },
             Ev::Empty(e) => match local(&e) {
-                "tab" if !in_ppr && in_p > 0 => para.push('\t'),
-                "br" | "cr" if in_p > 0 => para.push(' '),
+                "tab" if !in_ppr && in_p > 0 => ctx.append(&mut para, "\t", &mut pending),
+                "br" | "cr" if in_p > 0 => ctx.append(&mut para, " ", &mut pending),
                 _ => {}
             },
             Ev::End(n) => match n.as_str() {

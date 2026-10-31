@@ -13,7 +13,7 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Vec<Unit> {
     let flush = |para: &mut String, n: &mut u32, units: &mut Units, ctx: &mut Ctx| {
         if !para.trim().is_empty() {
             *n += 1;
-            units.block(para, Locator::Para(*n), ctx);
+            units.block(std::mem::take(para), Locator::Para(*n), ctx);
         }
         para.clear();
     };

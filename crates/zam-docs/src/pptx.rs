@@ -38,7 +38,7 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
             continue;
         };
         let title: Vec<String> = text.title.into_iter().collect();
-        units.push(Locator::Slide(n), title.clone(), &text.body, ctx);
+        units.push(Locator::Slide(n), title.clone(), text.body, ctx);
         let notes = pkg
             .rels(slide, ctx)?
             .into_iter()
@@ -49,7 +49,7 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
         {
             let mut path = title;
             path.push(NOTES.to_string());
-            units.push(Locator::Slide(n), path, &t.body, ctx);
+            units.push(Locator::Slide(n), path, t.body, ctx);
         }
     }
     Ok(units.finish())
@@ -147,7 +147,7 @@ fn shapes(
             },
             Ev::Empty(e) => match local(&e) {
                 "ph" => placeholder(&e, &mut shape, skip),
-                "br" if in_p => para.push('\n'),
+                "br" if in_p => ctx.append(&mut para, "\n", &mut pending),
                 _ => {}
             },
             Ev::End(n) => match n.as_str() {
@@ -204,6 +204,17 @@ fn shapes(
         if ctx.chars_full() && !in_p && tbl_depth == 0 && shape.is_none() {
             break;
         }
+    }
+    // часть оборвана лимитом посреди фигуры: собранные строки не теряются
+    if let Some((mut sl, _, false)) = shape.take() {
+        if in_p && !para.trim().is_empty() {
+            sl.push(para.trim().to_string());
+        }
+        if !sl.is_empty() {
+            lines.push(sl.join("\n"));
+        }
+    } else if in_p && tbl_depth == 0 && !para.trim().is_empty() {
+        lines.push(para.trim().to_string());
     }
     Ok(Some(SlideText {
         title,

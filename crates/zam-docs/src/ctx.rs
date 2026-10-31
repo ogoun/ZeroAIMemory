@@ -143,19 +143,19 @@ impl Units {
             self.path.pop();
         }
         self.path.push((level, text.to_string()));
-        self.block(text, at, ctx);
+        self.block(text.to_string(), at, ctx);
     }
 
-    /// Блок текста (абзац, таблица); пустые пропускаются.
-    pub fn block(&mut self, text: &str, at: Locator, ctx: &mut Ctx) {
+    /// Блок текста (абзац, таблица); пустые пропускаются. Текст принимается во владение и
+    /// обрезается на месте — без копии большого абзаца.
+    pub fn block(&mut self, mut text: String, at: Locator, ctx: &mut Ctx) {
         if ctx.stopped() {
             return;
         }
-        let text = text.trim_matches(|c: char| c.is_whitespace());
+        trim_in_place(&mut text);
         if text.is_empty() {
             return;
         }
-        let mut text = text.to_string();
         ctx.take_chars(&mut text);
         if text.is_empty() {
             return;
@@ -188,12 +188,19 @@ impl Units {
     }
 
     /// Отдельная единица с заданным путём (сноски, колонтитулы, заметки докладчика).
-    pub fn push(&mut self, locator: Locator, heading_path: Vec<String>, text: &str, ctx: &mut Ctx) {
+    pub fn push(
+        &mut self,
+        locator: Locator,
+        heading_path: Vec<String>,
+        text: String,
+        ctx: &mut Ctx,
+    ) {
         self.flush();
         if ctx.stopped() {
             return;
         }
-        let mut text = text.trim().to_string();
+        let mut text = text;
+        trim_in_place(&mut text);
         if text.is_empty() {
             return;
         }
@@ -210,5 +217,15 @@ impl Units {
     pub fn finish(mut self) -> Vec<Unit> {
         self.flush();
         self.units
+    }
+}
+
+/// Обрезка пробельных символов по краям без новой строки.
+fn trim_in_place(s: &mut String) {
+    let end = s.trim_end().len();
+    s.truncate(end);
+    let start = s.len() - s.trim_start().len();
+    if start > 0 {
+        s.drain(..start);
     }
 }
