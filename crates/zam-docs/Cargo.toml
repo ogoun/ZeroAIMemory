@@ -1,0 +1,15 @@
+[package]
+name = "zam-docs"
+description = "Документы ZeroAIMemory: извлечение структуры DOCX/PPTX/XLSX/CSV/PDF без сети и записи на диск, с лимитами"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quick-xml.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

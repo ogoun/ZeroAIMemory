@@ -557,6 +557,7 @@ crates/
   zam-core/        # идентификаторы (UUIDv7, Crockford base32), токены
   zam-store/       # SQLite: миграции, узлы, ревизии, FTS5, вложения, эмбеддинги, очередь индексации
   zam-markdown/    # comrak: разбор с позициями, секции, PATCH-splice, рендер HTML, чанкер, предложения, L0/L1
+  zam-docs/        # документы: sniff, извлечение DOCX/PPTX/текста с лимитами (zip, quick-xml), locator
   zam-ml/          # ONNX Runtime: устройство CPU/CUDA, токенизатор, эмбеддер bge-m3, реранкер
   zam-index/       # VectorIndex и адаптер Qdrant, супервизор процесса Qdrant, воркер, reindex
   zam-search/      # гибридное слияние RRF, поправки, упаковка в бюджет токенов
