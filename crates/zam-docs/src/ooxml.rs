@@ -636,15 +636,20 @@ pub(crate) fn on(e: &BytesStart<'_>) -> bool {
 }
 
 /// Таблица: строки ячеек → строки `| a | b |` с разделителем шапки после первой строки.
+///
+/// Каждая законченная строка сразу дописывается в итоговый текст, а ячейка экранируется при
+/// записи: в памяти одна копия таблицы плюс текущая строка.
 #[derive(Default)]
 pub(crate) struct Table {
-    rows: Vec<Vec<String>>,
+    out: String,
+    rows: usize,
     row: Vec<String>,
     cell: String,
 }
 
 impl Table {
-    /// Текст в текущую ячейку (абзацы ячейки — через пробел).
+    /// Текст в текущую ячейку (абзацы ячейки — через пробел): перевод строки → пробел,
+    /// `|` → `\|`.
     pub fn text(&mut self, s: &str) {
         let s = s.trim();
         if s.is_empty() {
@@ -653,50 +658,54 @@ impl Table {
         if !self.cell.is_empty() {
             self.cell.push(' ');
         }
-        self.cell.push_str(s);
+        self.cell.reserve(s.len());
+        for ch in s.chars() {
+            match ch {
+                '\n' => self.cell.push(' '),
+                '|' => self.cell.push_str("\\|"),
+                ch => self.cell.push(ch),
+            }
+        }
     }
 
     pub fn end_cell(&mut self) {
-        // один проход: перевод строки → пробел, `|` → `\|`
         let cell = std::mem::take(&mut self.cell);
-        let mut c = String::with_capacity(cell.len());
-        for ch in cell.chars() {
-            match ch {
-                '\n' => c.push(' '),
-                '|' => c.push_str("\\|"),
-                ch => c.push(ch),
-            }
-        }
-        self.row.push(c);
+        self.row.push(cell);
     }
 
     pub fn end_row(&mut self) {
         let row = std::mem::take(&mut self.row);
-        if row.iter().any(|c| !c.is_empty()) {
-            self.rows.push(row);
+        if !row.iter().any(|c| !c.is_empty()) {
+            return;
         }
+        if self.rows > 0 {
+            self.out.push('\n');
+        }
+        self.out.push('|');
+        for c in &row {
+            self.out.push(' ');
+            self.out.push_str(c);
+            self.out.push_str(" |");
+        }
+        if self.rows == 0 {
+            self.out.push_str("\n|");
+            for _ in &row {
+                self.out.push_str(" --- |");
+            }
+        }
+        self.rows += 1;
     }
 
     pub fn render(self) -> String {
-        let mut out = String::new();
-        for (i, row) in self.rows.iter().enumerate() {
-            if i > 0 {
-                out.push('\n');
-            }
-            out.push('|');
-            for c in row {
-                out.push(' ');
-                out.push_str(c);
-                out.push_str(" |");
-            }
-            if i == 0 {
-                out.push('\n');
-                out.push('|');
-                for _ in row {
-                    out.push_str(" --- |");
-                }
-            }
+        self.out
+    }
+
+    /// Таблица, оборванная концом части: открытые ячейка и строка закрываются.
+    pub fn render_partial(mut self) -> String {
+        if !self.cell.is_empty() {
+            self.end_cell();
         }
-        out
+        self.end_row();
+        self.out
     }
 }

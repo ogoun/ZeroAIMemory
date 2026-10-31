@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ctx::{Ctx, Units};
+use crate::ctx::{Ctx, Units, path_label, trim_in_place};
 use crate::ooxml::{Ev, Package, Table, Xml, attr, attr_ns, local};
 use crate::{DocError, Locator, Unit};
 
@@ -52,7 +52,7 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
             units.push(Locator::Slide(n), path, t.body, ctx);
         }
     }
-    Ok(units.finish())
+    Ok(units.finish(ctx))
 }
 
 /// Части слайдов в порядке показа; без `presentation.xml` — `ppt/slides/slideN.xml` по N.
@@ -118,7 +118,14 @@ fn shapes(
         return Ok(None);
     };
     let mut xml = Xml::new(&part, ctx);
-    let mut lines: Vec<String> = Vec::new();
+    // текст слайда собирается сразу в одну строку (без промежуточного списка и `join`)
+    let mut body = String::new();
+    let add = |body: &mut String, line: &str| {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(line);
+    };
     let mut title: Option<String> = None;
     // текущая фигура: строки, заголовок ли, пропускается ли
     let mut shape: Option<(Vec<String>, bool, bool)> = None;
@@ -154,15 +161,15 @@ fn shapes(
                 "t" => in_t = false,
                 "p" if in_p => {
                     in_p = false;
-                    let line = std::mem::take(&mut para);
-                    let line = line.trim();
+                    let mut line = std::mem::take(&mut para);
+                    trim_in_place(&mut line);
                     if line.is_empty() {
                     } else if tbl_depth > 0 {
-                        table.text(line);
+                        table.text(&line);
                     } else if let Some((sl, _, _)) = &mut shape {
-                        sl.push(line.to_string());
+                        sl.push(line);
                     } else {
-                        lines.push(line.to_string());
+                        add(&mut body, &line);
                     }
                 }
                 "tc" if tbl_depth == 1 => table.end_cell(),
@@ -172,7 +179,7 @@ fn shapes(
                     if tbl_depth == 0 {
                         let t = std::mem::take(&mut table).render();
                         if !t.is_empty() {
-                            lines.push(t);
+                            add(&mut body, &t);
                         }
                     }
                 }
@@ -182,14 +189,11 @@ fn shapes(
                         && !sl.is_empty()
                     {
                         if is_title && title.is_none() {
-                            title = Some(
-                                sl.join(" ")
-                                    .split_whitespace()
-                                    .collect::<Vec<_>>()
-                                    .join(" "),
-                            );
+                            title = Some(path_label(sl.iter().map(String::as_str)));
                         }
-                        lines.push(sl.join("\n"));
+                        for l in sl {
+                            add(&mut body, &l);
+                        }
                     }
                 }
                 _ => {}
@@ -205,21 +209,27 @@ fn shapes(
             break;
         }
     }
-    // часть оборвана лимитом посреди фигуры: собранные строки не теряются
-    if let Some((mut sl, _, false)) = shape.take() {
-        if in_p && !para.trim().is_empty() {
-            sl.push(para.trim().to_string());
+    // часть оборвана лимитом посреди фигуры или таблицы: собранное не теряется
+    trim_in_place(&mut para);
+    if tbl_depth > 0 {
+        if in_p && !para.is_empty() {
+            table.text(&para);
         }
-        if !sl.is_empty() {
-            lines.push(sl.join("\n"));
+        let t = table.render_partial();
+        if !t.is_empty() {
+            add(&mut body, &t);
         }
-    } else if in_p && tbl_depth == 0 && !para.trim().is_empty() {
-        lines.push(para.trim().to_string());
+    } else if let Some((sl, _, false)) = shape.take() {
+        for l in sl {
+            add(&mut body, &l);
+        }
+        if in_p && !para.is_empty() {
+            add(&mut body, &para);
+        }
+    } else if in_p && !para.is_empty() {
+        add(&mut body, &para);
     }
-    Ok(Some(SlideText {
-        title,
-        body: lines.join("\n"),
-    }))
+    Ok(Some(SlideText { title, body }))
 }
 
 /// Заполнитель фигуры: заголовок слайда или пропускаемый тип.

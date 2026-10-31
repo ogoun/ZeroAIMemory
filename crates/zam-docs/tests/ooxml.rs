@@ -735,6 +735,62 @@ fn max_chars_bounds_single_huge_paragraph() {
 }
 
 #[test]
+fn part_cut_inside_table_keeps_rows() {
+    // max_unpacked обрывает document.xml посреди таблицы: собранные строки выдаются
+    let rows: String = (0..400)
+        .map(|i| format!("<w:tr><w:tc><w:p><w:r><w:t>r{i}</w:t></w:r></w:p></w:tc></w:tr>"))
+        .collect();
+    let doc = format!(
+        r#"<w:document {W}><w:body>{}<w:tbl>{rows}</w:tbl>{}</w:body></w:document>"#,
+        p("до"),
+        p("после")
+    );
+    let bytes = zip_of(&[("word/document.xml", doc.into_bytes())]);
+    let limits = Limits {
+        max_unpacked: 4096,
+        ..Limits::default()
+    };
+    let x = extract(DocKind::Docx, &bytes, &limits, far()).unwrap();
+    assert!(
+        x.warnings.contains(&"truncated: max_unpacked".to_string()),
+        "{:?}",
+        x.warnings
+    );
+    let all = all_text(&x);
+    assert!(all.starts_with("до\n\n| r0 |\n| --- |\n| r1 |"), "{all}");
+    assert!(!all.contains("r399") && !all.contains("после"), "{all}");
+    assert_eq!(
+        find(&x, "| r0 |").locator,
+        Locator::Para(1),
+        "единица начата абзацем «до»"
+    );
+}
+
+#[test]
+fn long_heading_path_is_capped() {
+    let long = "Заголовок ".repeat(300); // 3000 символов
+    let body = format!(
+        "{}{}{}",
+        ps("Heading1", &long),
+        p(&"а".repeat(1400)),
+        p(&"б".repeat(1400))
+    );
+    let x = run(
+        DocKind::Docx,
+        &docx_with(&body, &style("Heading1", "heading 1", None), None, None),
+    );
+    assert!(x.units.len() >= 2);
+    for u in &x.units {
+        assert_eq!(u.heading_path.len(), 1);
+        let h = &u.heading_path[0];
+        assert_eq!(h.chars().count(), zam_docs::HEADING_PATH_MAX_CHARS + 1);
+        assert!(h.ends_with('…') && h.starts_with("Заголовок Заголовок"));
+    }
+    // полный текст заголовка — в тексте его единицы
+    assert!(x.units[0].text.starts_with(long.trim_end()));
+}
+
+#[test]
 fn table_in_textbox_is_paragraph_text() {
     let body = format!(
         r#"<w:p><w:r><w:t>Перед</w:t></w:r><w:r><w:pict><w:txbxContent><w:tbl><w:tr><w:tc><w:p><w:r><w:t>в надписи</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:txbxContent></w:pict></w:r></w:p>{}"#,

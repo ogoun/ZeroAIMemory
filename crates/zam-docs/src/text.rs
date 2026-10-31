@@ -34,5 +34,5 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Vec<Unit> {
         }
     }
     flush(&mut para, &mut n, &mut units, ctx);
-    units.finish()
+    units.finish(ctx)
 }

@@ -17,6 +17,7 @@ mod text;
 
 use std::time::Instant;
 
+pub use ctx::HEADING_PATH_MAX_CHARS;
 pub use locator::Locator;
 pub use sniff::sniff;
 

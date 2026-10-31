@@ -1,5 +1,6 @@
 //! Состояние одного разбора: лимиты, срок, счётчик символов, предупреждения.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{Limits, Locator, Unit};
@@ -126,24 +127,93 @@ impl<'l> Ctx<'l> {
     }
 }
 
+/// Предел текста заголовка в `heading_path`, символов: длинный заголовок копировался бы в путь
+/// каждой следующей единицы. Полный текст заголовка — в тексте его единицы.
+pub const HEADING_PATH_MAX_CHARS: usize = 512;
+
+/// Служебный вес единицы в `max_chars`: тысячи пустых заголовков дали бы тысячи единиц, каждая
+/// со своими выделениями памяти (`Unit`, `Vec` пути) при почти нулевом тексте.
+pub(crate) const UNIT_OVERHEAD_CHARS: u64 = 64;
+
+impl Ctx<'_> {
+    /// Учитывает в `max_chars` уже выданное сверх текста (путь заголовков, вес единицы).
+    fn charge(&mut self, n: u64) {
+        self.chars = self.chars.saturating_add(n);
+        if self.chars > self.limits.max_chars {
+            self.stop("max_chars");
+        }
+    }
+}
+
+/// Подпись для `heading_path`: пробельные символы схлопнуты, не длиннее
+/// [`HEADING_PATH_MAX_CHARS`] (обрезка — с «…»). Части склеиваются через пробел.
+pub(crate) fn path_label<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    let mut n = 0usize;
+    for word in parts.into_iter().flat_map(str::split_whitespace) {
+        if n > 0 {
+            out.push(' ');
+            n += 1;
+        }
+        for c in word.chars() {
+            if n >= HEADING_PATH_MAX_CHARS {
+                out.push('…');
+                return out;
+            }
+            out.push(c);
+            n += 1;
+        }
+    }
+    out
+}
+
+/// Пробельные символы ASCII схлопываются в один пробел и обрезаются по краям — на месте, без
+/// копии (байты не-ASCII не меняются, поэтому UTF-8 остаётся верным).
+pub(crate) fn collapse_ascii_ws(s: &mut String) {
+    let mut b = std::mem::take(s).into_bytes();
+    let (mut w, mut space) = (0usize, false);
+    for r in 0..b.len() {
+        let c = b[r];
+        if c.is_ascii_whitespace() {
+            space = w > 0;
+            continue;
+        }
+        if space {
+            b[w] = b' ';
+            w += 1;
+            space = false;
+        }
+        b[w] = c;
+        w += 1;
+    }
+    b.truncate(w);
+    *s = String::from_utf8(b).unwrap_or_default();
+}
+
 /// Сборщик единиц: блоки текста под одним путём заголовков до [`UNIT_SOFT_CHARS`].
+///
+/// Путь хранится разделяемо (`Arc<str>`); в `max_chars` учитываются текст, путь каждой
+/// выданной единицы и её служебный вес — поэтому всё выданное ограничено одним лимитом.
 #[derive(Default)]
 pub(crate) struct Units {
     pub units: Vec<Unit>,
-    path: Vec<(u8, String)>,
+    path: Vec<(u8, Arc<str>, u64)>,
     /// Текущая единица: адрес, текст, число символов.
     cur: Option<(Locator, String, usize)>,
 }
 
 impl Units {
-    /// Заголовок уровня `level` (0 — `Title`) закрывает текущую единицу и меняет путь.
-    pub fn heading(&mut self, level: u8, text: &str, at: Locator, ctx: &mut Ctx) {
-        self.flush();
-        while self.path.last().is_some_and(|(l, _)| *l >= level) {
+    /// Заголовок уровня `level` (0 — `Title`) закрывает текущую единицу и меняет путь;
+    /// текст заголовка (уже схлопнутый) становится первым блоком новой единицы.
+    pub fn heading(&mut self, level: u8, text: String, at: Locator, ctx: &mut Ctx) {
+        self.flush(ctx);
+        while self.path.last().is_some_and(|(l, _, _)| *l >= level) {
             self.path.pop();
         }
-        self.path.push((level, text.to_string()));
-        self.block(text.to_string(), at, ctx);
+        let label = path_label([text.as_str()]);
+        let n = label.chars().count() as u64;
+        self.path.push((level, Arc::from(label), n));
+        self.block(text, at, ctx);
     }
 
     /// Блок текста (абзац, таблица); пустые пропускаются. Текст принимается во владение и
@@ -164,7 +234,7 @@ impl Units {
         if let Some((_, _, len)) = &self.cur
             && *len + n > UNIT_SOFT_CHARS
         {
-            self.flush();
+            self.flush(ctx);
         }
         match &mut self.cur {
             Some((_, buf, len)) => {
@@ -177,17 +247,20 @@ impl Units {
     }
 
     /// Закрывает текущую единицу.
-    pub fn flush(&mut self) {
+    pub fn flush(&mut self, ctx: &mut Ctx) {
         if let Some((locator, text, _)) = self.cur.take() {
+            let path_chars: u64 = self.path.iter().map(|(_, _, n)| n).sum();
+            ctx.charge(path_chars + UNIT_OVERHEAD_CHARS);
             self.units.push(Unit {
                 locator,
-                heading_path: self.path.iter().map(|(_, h)| h.clone()).collect(),
+                heading_path: self.path.iter().map(|(_, h, _)| h.to_string()).collect(),
                 text,
             });
         }
     }
 
-    /// Отдельная единица с заданным путём (сноски, колонтитулы, заметки докладчика).
+    /// Отдельная единица с заданным путём (сноски, колонтитулы, заметки докладчика); элементы
+    /// пути — короткие подписи ([`path_label`] или постоянные строки).
     pub fn push(
         &mut self,
         locator: Locator,
@@ -195,7 +268,7 @@ impl Units {
         text: String,
         ctx: &mut Ctx,
     ) {
-        self.flush();
+        self.flush(ctx);
         if ctx.stopped() {
             return;
         }
@@ -206,6 +279,8 @@ impl Units {
         }
         ctx.take_chars(&mut text);
         if !text.is_empty() {
+            let path_chars: u64 = heading_path.iter().map(|h| h.chars().count() as u64).sum();
+            ctx.charge(path_chars + UNIT_OVERHEAD_CHARS);
             self.units.push(Unit {
                 locator,
                 heading_path,
@@ -214,14 +289,14 @@ impl Units {
         }
     }
 
-    pub fn finish(mut self) -> Vec<Unit> {
-        self.flush();
+    pub fn finish(mut self, ctx: &mut Ctx) -> Vec<Unit> {
+        self.flush(ctx);
         self.units
     }
 }
 
 /// Обрезка пробельных символов по краям без новой строки.
-fn trim_in_place(s: &mut String) {
+pub(crate) fn trim_in_place(s: &mut String) {
     let end = s.trim_end().len();
     s.truncate(end);
     let start = s.len() - s.trim_start().len();

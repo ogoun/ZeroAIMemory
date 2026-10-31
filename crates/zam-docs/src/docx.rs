@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ctx::{Ctx, UNIT_SOFT_CHARS, Units};
+use crate::ctx::{Ctx, UNIT_SOFT_CHARS, Units, collapse_ascii_ws, trim_in_place};
 use crate::ooxml::{Ev, Package, Table, Xml, attr_ns, local, on};
 use crate::{DocError, Locator, Unit};
 
@@ -62,7 +62,7 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
         note_refs,
         ..
     } = body;
-    units.flush();
+    units.flush(ctx);
 
     for (kind, title) in [("footnotes", "Сноски"), ("endnotes", "Концевые сноски")]
     {
@@ -92,7 +92,7 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
         }
     }
     push_grouped(&mut units, hf.into_iter(), "Колонтитулы", ctx);
-    Ok(units.finish())
+    Ok(units.finish(ctx))
 }
 
 /// Строки (абзац, текст) в единицы с путём `[title]` до мягкого предела.
@@ -329,10 +329,16 @@ impl<'s> Body<'s> {
                 break;
             }
         }
-        // часть оборвана лимитом посреди абзаца: собранный текст абзаца не теряется
-        if self.in_p > 0 && self.tbl_depth == 0 && !self.text.is_empty() {
+        // часть оборвана лимитом посреди абзаца или таблицы: собранное не теряется
+        if self.in_p > 0 {
             self.in_p = 1;
             self.end_p(ctx);
+        }
+        if self.tbl_depth > 0 {
+            self.tbl_depth = 0;
+            self.boxed_tbl = 0;
+            let t = std::mem::take(&mut self.table).render_partial();
+            self.units.block(t, Locator::Para(self.table_at), ctx);
         }
         Ok(())
     }
@@ -389,7 +395,7 @@ impl<'s> Body<'s> {
         if self.in_p > 0 {
             return;
         }
-        let text = std::mem::take(&mut self.text);
+        let mut text = std::mem::take(&mut self.text);
         if self.tbl_depth > 0 {
             self.table.text(&text);
             return;
@@ -401,11 +407,21 @@ impl<'s> Body<'s> {
                 .as_deref()
                 .and_then(|s| self.styles.get(s).copied())
         });
-        let one_line = || text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // всё на месте, без копий абзаца: заголовок схлопывается в одну строку, к пункту списка
+        // дописывается маркер
         match level {
-            Some(l) if !one_line().is_empty() => self.units.heading(l, &one_line(), at, ctx),
-            _ if self.list => self.units.block(format!("- {}", text.trim()), at, ctx),
-            _ => self.units.block(text, at, ctx),
+            Some(l) => {
+                collapse_ascii_ws(&mut text);
+                if !text.is_empty() {
+                    self.units.heading(l, text, at, ctx);
+                }
+            }
+            None if self.list => {
+                trim_in_place(&mut text);
+                text.insert_str(0, "- ");
+                self.units.block(text, at, ctx);
+            }
+            None => self.units.block(text, at, ctx),
         }
     }
 }

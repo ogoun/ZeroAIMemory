@@ -1,12 +1,14 @@
-//! Пик памяти разбора на враждебных zip (ревью задачи 1 M5, C-1 и раунд 2): счётчик аллокаций —
+//! Пик памяти разбора на враждебных zip (ревью задачи 1 M5, раунды 1–3): счётчик аллокаций —
 //! глобальный аллокатор этого тестового бинарника; замеры идут последовательно в одном тесте.
 //!
-//! Граница: сверх буфера части (≤ `max_unpacked`) в памяти один абзац (≤ `max_chars` символов,
-//! ≤ 4 байт на символ), шаг чтения и рост буфера (по 64 КиБ). Основной тест — уменьшенные
-//! лимиты (`max_unpacked` 32 МиБ, `max_chars` 1 млн) и фикстуры ~40 МиБ: константа 16 МиБ ≥
-//! 4 МиБ абзаца + 128 КиБ буферов с запасом на временные строки разбора. Вариант на 480 МиБ с
-//! умолчаниями — `#[ignore]`: `cargo test -p zam-docs --release --test memory_peak -- --ignored
-//! --nocapture`.
+//! Граница: `max_unpacked` (буфер части) + 2 × 4 × `max_chars` байт + 1 МиБ. Всё выданное —
+//! текст единиц, их пути и служебный вес единицы (64 символа ≥ памяти `Unit` с выделениями) — и
+//! ещё не выданный абзац учитываются в одном `max_chars` (≤ 4 байт на символ); второй множитель —
+//! временные копии: сноски (абзацы → строка `[id] текст` → единица), строки фигур PPTX и
+//! текущая строка таблицы. 1 МиБ — буферы чтения (2 × 64 КиБ), подпись пути (≤ 512 символов),
+//! рост `Vec`. Основной тест — `max_unpacked` 32 МиБ, `max_chars` 1 млн, фикстуры ~40 МиБ:
+//! константа 16 МиБ ≥ 9 МиБ. Вариант на 480 МиБ с умолчаниями (граница 661 МиБ) — `#[ignore]`:
+//! `cargo test -p zam-docs --release --test memory_peak -- --ignored --nocapture`.
 
 mod common;
 
@@ -15,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use common::{W, drop_central, forge_compressed, zip_of, zip_with};
-use zam_docs::{DocError, DocKind, Extracted, Limits, extract};
+use zam_docs::{DocError, DocKind, Extracted, HEADING_PATH_MAX_CHARS, Limits, extract};
 
 struct Counter;
 static CUR: AtomicUsize = AtomicUsize::new(0);
@@ -123,11 +125,35 @@ fn scenarios(size: usize) -> Vec<(&'static str, Vec<u8>)> {
     );
     let mut d = drop_central(&z, "pad.bin");
     forge_compressed(&mut d, "word/document.xml", pad as u32);
+    // E (зонд D раунда 3): заголовок 500 тыс. символов и 1000 абзацев по 1000 символов —
+    // путь заголовков каждой единицы не должен копировать заголовок целиком
+    let mut e = format!(
+        r#"<w:document {W}><w:body><w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t>"#
+    )
+    .into_bytes();
+    e.extend(noisy(500_000, b"h", letters, 300, 4));
+    e.extend_from_slice(b"</w:t></w:r></w:p>");
+    let para = noisy(1000, b"p", letters, 50, 4);
+    for _ in 0..1000 {
+        e.extend_from_slice(b"<w:p><w:r><w:t>");
+        e.extend_from_slice(&para);
+        e.extend_from_slice(b"</w:t></w:r></w:p>");
+    }
+    e.extend_from_slice(b"</w:body></w:document>");
+    // F: множество заголовков из одной буквы — единица на каждый (служебный вес в max_chars)
+    let one = br#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#;
+    let mut f = format!("<w:document {W}><w:body>").into_bytes();
+    for _ in 0..size / one.len() {
+        f.extend_from_slice(one);
+    }
+    f.extend_from_slice(b"</w:body></w:document>");
     vec![
         ("A text node with CR", doc_zip(a)),
         ("B invalid UTF-8", doc_zip(b)),
         ("C UTF-16 CJK", doc_zip(c)),
         ("D forged size, one letter", d),
+        ("E long heading x 1000 units", doc_zip(e)),
+        ("F tiny headings", doc_zip(f)),
     ]
 }
 
@@ -157,6 +183,15 @@ fn check(limits: &Limits, size: usize, bound: usize) {
                 matches!(&r, Err(DocError::Malformed(m)) if m.contains("invalid utf-8")),
                 "{r:?}"
             ),
+            Some('E' | 'F') => {
+                let x = r.unwrap();
+                assert!(x.units.len() > 1, "{name}");
+                for u in &x.units {
+                    for h in &u.heading_path {
+                        assert!(h.chars().count() <= HEADING_PATH_MAX_CHARS + 1, "{name}");
+                    }
+                }
+            }
             _ => {
                 let x = r.unwrap();
                 assert!(
@@ -188,6 +223,6 @@ fn peak_480mib_defaults() {
         max_ratio: u32::MAX,
         ..Limits::default()
     };
-    let bound = limits.max_unpacked as usize + 4 * limits.max_chars as usize + MIB;
+    let bound = limits.max_unpacked as usize + 2 * 4 * limits.max_chars as usize + MIB;
     check(&limits, 480 * MIB, bound);
 }
