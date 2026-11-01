@@ -74,23 +74,26 @@ impl<'a> Package<'a> {
     /// ([`zip_directory`]) — `Malformed`.
     pub fn open(bytes: &'a [u8], ctx: &mut Ctx) -> Result<Option<Self>, DocError> {
         let max = u64::from(ctx.limits.max_entries);
-        // строгая проверка конца каталога — до `ZipArchive`: подделка не прячет настоящий каталог
-        let dir = zip_directory_of(bytes).map_err(|e| DocError::Malformed(format!("zip: {e}")))?;
-        if dir.entries > max {
-            ctx.stop("max_entries");
-            return Ok(None);
-        }
-        if dir.cd_size > ctx.limits.max_central_dir {
-            ctx.stop("max_central_dir");
-            return Ok(None);
-        }
+        // строгая проверка каталога — до `ZipArchive` (подделки, откат `zip` к ранней EOCD)
+        let dir = match zip_directory_of(bytes, ctx.limits)
+            .map_err(|e| DocError::Malformed(format!("zip: {e}")))?
+        {
+            ZipCheck::Fits(d) => d,
+            ZipCheck::TooManyEntries => {
+                ctx.stop("max_entries");
+                return Ok(None);
+            }
+            ZipCheck::DirTooLarge => {
+                ctx.stop("max_central_dir");
+                return Ok(None);
+            }
+        };
         let read_bytes = Rc::new(Cell::new(0));
         let reader = Counting {
             inner: Cursor::new(bytes),
             n: read_bytes.clone(),
         };
-        let mut zip =
-            ZipArchive::new(reader).map_err(|e| DocError::Malformed(format!("zip: {e}")))?;
+        let mut zip = open_archive(reader).map_err(|e| DocError::Malformed(format!("zip: {e}")))?;
         if zip.len() as u64 > max {
             ctx.stop("max_entries");
             return Ok(None);
@@ -304,7 +307,7 @@ fn resolve(dir: &str, target: &str) -> String {
 /// Центральный каталог zip по концу архива ([`zip_directory`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ZipDir {
-    /// Число записей каталога (из EOCD64 у zip64).
+    /// Число записей каталога.
     pub entries: u64,
     /// Смещение каталога от начала файла.
     pub cd_offset: u64,
@@ -312,10 +315,28 @@ pub(crate) struct ZipDir {
     pub cd_size: u64,
 }
 
+/// Итог [`zip_directory`] для согласованного конца каталога.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZipCheck {
+    /// Каталог в пределах лимитов и пройден запись за записью: его можно отдать `zip`.
+    Fits(ZipDir),
+    /// Записей больше `max_entries` (каталог не читался).
+    TooManyEntries,
+    /// Каталог больше `max_central_dir` (не читался).
+    DirTooLarge,
+}
+
 /// Наименьшая запись центрального каталога: сигнатура и 42 байта полей, без имени.
 const CDFH_MIN: u64 = 46;
 /// Запись EOCD64 без расширяемых данных: 12 байт (сигнатура и размер) + 44.
 const EOCD64_LEN: u64 = 56;
+/// Окно поиска EOCD у `zip` 9.0.5 (`get_metadata`: 64 КиБ комментария + EOCD) с запасом.
+pub(crate) const EOCD_WINDOW: u64 = 65_536 + 128;
+
+const EOCD: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+const LOC64: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
+const EOCD64: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
+const CDFH: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
 
 fn le16(b: &[u8], at: usize) -> u64 {
     u64::from(u16::from_le_bytes([b[at], b[at + 1]]))
@@ -331,36 +352,114 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-/// Строгая проверка конца центрального каталога (раунд правок 2 задачи 4 M5): `zip` перебирает
-/// кандидатов EOCD от конца файла и молча пропускает несогласованные, поэтому поддельная EOCD в
-/// хвосте (или в комментарии) прятала от проверки `max_entries` настоящую zip64 на миллионы
-/// записей. Здесь берётся **последняя** полная сигнатура EOCD, и она должна быть согласованной
-/// целиком — тогда `zip` выберет её же (его проверки слабее этих):
-/// - EOCD с комментарием кончается ровно на конце файла;
-/// - один диск; записей на диске столько же, сколько всего;
-/// - zip64 (поле — `0xFFFF…`, а за 20 байт до EOCD — локатор): локатор указывает на EOCD64 без
-///   расширяемых данных, кончающуюся ровно перед локатором; поля каталога — из EOCD64;
-/// - каталог кончается ровно там, где начинается EOCD (EOCD64): `cd_offset + cd_size`;
-/// - `entries × 46 ≤ cd_size`; у непустого каталога по `cd_offset` — сигнатура записи каталога.
+/// Чтение по абсолютному смещению файла: ровно `len` байт или `None`.
+type ReadAt<'a> = dyn FnMut(u64, usize) -> Option<Vec<u8>> + 'a;
+
+fn read_exact_at(read_at: &mut ReadAt<'_>, off: u64, len: usize) -> Option<Vec<u8>> {
+    read_at(off, len).filter(|b| b.len() == len)
+}
+
+/// Поля EOCD64: `(позиция, записей на диске, записей, размер каталога, смещение каталога)`.
+type Eocd64 = (u64, u64, u64, u64, u64);
+
+/// EOCD64 по локатору перед EOCD в позиции `pos`: `(позиция EOCD64, записей на диске, записей,
+/// размер, смещение каталога)`. `Ok(None)` — локатора нет; `Err` — локатор есть, а EOCD64 не та
+/// (не ровно перед локатором, с расширяемыми данными, многотомная).
+fn eocd64_at(read_at: &mut ReadAt<'_>, pos: u64) -> Result<Option<Eocd64>, &'static str> {
+    let Some(loc_pos) = pos.checked_sub(20) else {
+        return Ok(None);
+    };
+    let Some(l) = read_exact_at(read_at, loc_pos, 20).filter(|l| l[..4] == LOC64) else {
+        return Ok(None);
+    };
+    if le32(&l, 4) != 0 || le32(&l, 16) > 1 {
+        return Err("многотомный архив zip64");
+    }
+    let at = le64(&l, 8);
+    if at.checked_add(EOCD64_LEN) != Some(loc_pos) {
+        return Err("EOCD64 не перед локатором");
+    }
+    let r = read_exact_at(read_at, at, EOCD64_LEN as usize).ok_or("нет EOCD64")?;
+    if r[..4] != EOCD64 || le64(&r, 4) != EOCD64_LEN - 12 {
+        return Err("неверная EOCD64");
+    }
+    if le32(&r, 16) != 0 || le32(&r, 20) != 0 {
+        return Err("многотомный архив zip64");
+    }
+    Ok(Some((
+        at,
+        le64(&r, 24),
+        le64(&r, 32),
+        le64(&r, 40),
+        le64(&r, 48),
+    )))
+}
+
+/// Строгая проверка центрального каталога zip до `ZipArchive` (раунды правок 2–3 задачи 4 M5).
 ///
-/// Архивы с префиксом (самораспаковывающиеся: смещения от начала архива, а не файла) не проходят
-/// равенство и отвергаются. `tail` — конец файла длиной `file_len`, начинающийся со смещения
-/// `tail_start` (весь файл — `0`); `read_at(off, len)` — байты по абсолютному смещению.
-/// `Err` — причина без содержимого файла.
+/// `zip` 9.0.5 перебирает кандидатов EOCD в окне от конца файла и молча пропускает
+/// несогласованные, а если не разобрался каталог выбранной EOCD — откатывается к более ранней.
+/// Поэтому здесь три слоя:
+/// 1. **Последняя** полная сигнатура EOCD (её `zip` пробует первой) должна быть согласованной
+///    целиком: кончается с комментарием ровно на конце файла; один диск; записей на диске =
+///    всего; при локаторе за 20 байт до EOCD — EOCD64 без расширяемых данных ровно перед
+///    локатором, поля каталога из неё, а поля EOCD, кроме `0xFFFF…`, совпадают с ней (так пишет
+///    и Python `zipfile` с принудительным zip64-концом при реальных полях EOCD); каталог
+///    кончается ровно у EOCD (EOCD64): `cd_offset + cd_size`; `entries × 46 ≤ cd_size`.
+/// 2. **Каждый другой кандидат** окна, который `zip` счёл бы годным (комментарий в пределах
+///    файла, по смещению каталога — сигнатура записи или EOCD64 по локатору), не должен быть
+///    сверх `max_entries`/`max_central_dir`: откат `zip` к нему не раздует память.
+/// 3. **Каталог пройден запись за записью** (только если в пределах лимитов): сигнатура
+///    каждой записи, имя, extra и комментарий внутри каталога, смещение локального заголовка до
+///    каталога; сумма длин записей — ровно `cd_size`, записей — ровно `entries`. Тогда `zip` не
+///    провалится на этом каталоге и не откатится.
+///
+/// Открывать архив — только [`open_archive`] (`ArchiveOffset::Known(0)`: без сканирования файла
+/// в поисках сигнатур). Архивы с префиксом (самораспаковывающиеся) не проходят слой 1.
+/// `tail` — конец файла длиной `file_len` со смещения `tail_start`; `read_at` — байты по
+/// абсолютному смещению. `Err` — причина без содержимого файла.
 pub(crate) fn zip_directory(
     tail: &[u8],
     tail_start: u64,
     file_len: u64,
-    read_at: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>,
-) -> Result<ZipDir, &'static str> {
-    const EOCD: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
-    const LOC64: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
-    const EOCD64: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
-    const CDFH: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
-    let rel = (0..tail.len().saturating_sub(21))
+    limits: &crate::Limits,
+    read_at: &mut ReadAt<'_>,
+) -> Result<ZipCheck, &'static str> {
+    let max_entries = u64::from(limits.max_entries);
+    let max_dir = limits.max_central_dir;
+    let window = file_len.saturating_sub(EOCD_WINDOW);
+    let lo = usize::try_from(window.saturating_sub(tail_start)).unwrap_or(usize::MAX);
+    let mut cands = (lo.min(tail.len())..tail.len().saturating_sub(21))
         .rev()
-        .find(|&i| tail[i..i + 4] == EOCD)
-        .ok_or("нет конца центрального каталога")?;
+        .filter(|&i| tail[i..i + 4] == EOCD);
+    let rel = cands.next().ok_or("нет конца центрального каталога")?;
+    // слой 2: прочие кандидаты окна, годные для `zip`, — в пределах лимитов
+    for i in cands {
+        let e = &tail[i..i + 22];
+        let p = tail_start + i as u64;
+        if p + 22 + le16(e, 20) > file_len {
+            continue;
+        }
+        let (n, size, off) = (le16(e, 10), le32(e, 12), le32(e, 16));
+        let may64 = n == 0xFFFF || size == 0xFFFF_FFFF || off == 0xFFFF_FFFF;
+        let (n, size) = match eocd64_at(read_at, p) {
+            Ok(Some((_, _, n64, size64, _))) if may64 => (n64, size64),
+            // локатор с негодной EOCD64: `zip` с `Known(0)` этого кандидата не примет
+            Err(_) if may64 => continue,
+            _ => {
+                let cd_ok =
+                    off < p && read_exact_at(read_at, off, 4).is_some_and(|s| s[..] == CDFH);
+                if !(cd_ok || n == 0) {
+                    continue;
+                }
+                (n, size)
+            }
+        };
+        if n > max_entries || size > max_dir {
+            return Err("кандидат конца каталога в окне сверх лимитов");
+        }
+    }
+    // слой 1: последняя EOCD согласована целиком
     let e = &tail[rel..rel + 22];
     let pos = tail_start + rel as u64;
     if pos + 22 + le16(e, 20) != file_len {
@@ -370,33 +469,19 @@ pub(crate) fn zip_directory(
         return Err("многотомный архив");
     }
     let (n_disk, n, size, off) = (le16(e, 8), le16(e, 10), le32(e, 12), le32(e, 16));
-    let may64 = n == 0xFFFF || size == 0xFFFF_FFFF || off == 0xFFFF_FFFF;
-    let loc = if may64 && pos >= 20 {
-        read_at(pos - 20, 20).filter(|l| l.len() == 20 && l[..4] == LOC64)
-    } else {
-        None
-    };
-    let (entries, entries_disk, cd_size, cd_offset, end) = match loc {
+    let (entries, entries_disk, cd_size, cd_offset, end) = match eocd64_at(read_at, pos)? {
         None => (n, n_disk, size, off, pos),
-        Some(l) => {
-            let loc_pos = pos - 20;
-            if le32(&l, 4) != 0 || le32(&l, 16) > 1 {
-                return Err("многотомный архив zip64");
+        Some((at, n64_disk, n64, size64, off64)) => {
+            // поля EOCD, кроме «смотри zip64», совпадают с EOCD64
+            let agree = |v32: u64, sentinel: u64, v64: u64| v32 == sentinel || v32 == v64;
+            if !(agree(n_disk, 0xFFFF, n64_disk)
+                && agree(n, 0xFFFF, n64)
+                && agree(size, 0xFFFF_FFFF, size64)
+                && agree(off, 0xFFFF_FFFF, off64))
+            {
+                return Err("поля EOCD и EOCD64 расходятся");
             }
-            let at = le64(&l, 8);
-            if at.checked_add(EOCD64_LEN) != Some(loc_pos) {
-                return Err("EOCD64 не перед локатором");
-            }
-            let r = read_at(at, EOCD64_LEN as usize)
-                .filter(|r| r.len() == EOCD64_LEN as usize)
-                .ok_or("нет EOCD64")?;
-            if r[..4] != EOCD64 || le64(&r, 4) != EOCD64_LEN - 12 {
-                return Err("неверная EOCD64");
-            }
-            if le32(&r, 16) != 0 || le32(&r, 20) != 0 {
-                return Err("многотомный архив zip64");
-            }
-            (le64(&r, 32), le64(&r, 24), le64(&r, 40), le64(&r, 48), at)
+            (n64, n64_disk, size64, off64, at)
         }
     };
     if entries_disk != entries {
@@ -408,26 +493,58 @@ pub(crate) fn zip_directory(
     if entries.checked_mul(CDFH_MIN).is_none_or(|m| m > cd_size) {
         return Err("записей больше, чем вмещает каталог");
     }
-    if entries > 0 {
-        let sig = read_at(cd_offset, 4).ok_or("нет записи каталога")?;
-        if sig[..] != CDFH {
-            return Err("нет записи каталога по смещению");
-        }
+    if entries > max_entries {
+        return Ok(ZipCheck::TooManyEntries);
     }
-    Ok(ZipDir {
+    if cd_size > max_dir {
+        return Ok(ZipCheck::DirTooLarge);
+    }
+    // слой 3: запись за записью
+    let mut at = cd_offset;
+    for _ in 0..entries {
+        let h = read_exact_at(read_at, at, CDFH_MIN as usize).ok_or("запись каталога обрезана")?;
+        if h[..4] != CDFH {
+            return Err("нет сигнатуры записи каталога");
+        }
+        let next = at + CDFH_MIN + le16(&h, 28) + le16(&h, 30) + le16(&h, 32);
+        if next > end {
+            return Err("запись каталога выходит за каталог");
+        }
+        let lfh = le32(&h, 42);
+        if lfh != 0xFFFF_FFFF && lfh >= cd_offset {
+            return Err("локальный заголовок не перед каталогом");
+        }
+        at = next;
+    }
+    if at != end {
+        return Err("записи каталога не заполняют его ровно");
+    }
+    Ok(ZipCheck::Fits(ZipDir {
         entries,
         cd_offset,
         cd_size,
-    })
+    }))
 }
 
 /// [`zip_directory`] архива в памяти.
-pub(crate) fn zip_directory_of(b: &[u8]) -> Result<ZipDir, &'static str> {
+pub(crate) fn zip_directory_of(b: &[u8], limits: &crate::Limits) -> Result<ZipCheck, &'static str> {
     let mut read_at = |off: u64, len: usize| {
         let off = usize::try_from(off).ok()?;
         b.get(off..off.checked_add(len)?).map(<[u8]>::to_vec)
     };
-    zip_directory(b, 0, b.len() as u64, &mut read_at)
+    zip_directory(b, 0, b.len() as u64, limits, &mut read_at)
+}
+
+/// Единственный способ открыть недоверенный zip в `zam-docs` — после [`zip_directory`]:
+/// `ArchiveOffset::Known(0)`, без режима `Detect` (он сканирует весь файл и хранит позицию каждой
+/// сигнатуры записи каталога: 80 МБ наполнителя давали пик 256 МиБ).
+pub(crate) fn open_archive<R: Read + Seek>(r: R) -> zip::result::ZipResult<ZipArchive<R>> {
+    ZipArchive::with_config(
+        zip::read::Config {
+            archive_offset: zip::read::ArchiveOffset::Known(0),
+        },
+        r,
+    )
 }
 
 /// Приёмник байтов записи: UTF-8 копится как есть, UTF-16 (по BOM) раскодируется в UTF-8 по

@@ -4,6 +4,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use zip::ZipArchive;
 
+use crate::ooxml::ZipCheck;
 use crate::{DocKind, Limits};
 
 /// Сигнатура составного документа OLE (CFB): XLS, а также DOC/PPT (не поддерживаются).
@@ -16,7 +17,7 @@ const SNIFF_READ: u64 = 256 * 1024;
 /// обрезанный посреди символа хвост окна тогда не считается ошибкой UTF-8.
 const FILE_HEAD: u64 = 64 * 1024 + 16;
 /// Хвост файла с концом центрального каталога zip (EOCD с комментарием до 64 КиБ).
-const EOCD_TAIL: u64 = 22 + 65_535;
+const EOCD_TAIL: u64 = crate::ooxml::EOCD_WINDOW;
 
 /// Вид документа по сигнатуре (zip с `[Content_Types].xml` или `mimetype` ODS, `%PDF-`, OLE),
 /// затем по расширению имени (CSV, текст). `None` — вид не поддерживается.
@@ -100,28 +101,24 @@ pub fn sniff_file<R: Read + Seek>(
         r.read_exact(&mut b).ok()?;
         Some(b)
     };
-    let dir = crate::ooxml::zip_directory(&tail, start, len, &mut read_at);
-    if !dir.is_ok_and(|d| within(&d, limits)) {
+    let dir = crate::ooxml::zip_directory(&tail, start, len, limits, &mut read_at);
+    // сверх `max_entries`/`max_central_dir` или несогласованный — не документ (`unsupported`)
+    if !matches!(dir, Ok(ZipCheck::Fits(_))) {
         return Ok(None);
     }
     r.seek(SeekFrom::Start(0))?;
-    Ok(ZipArchive::new(r)
+    Ok(crate::ooxml::open_archive(r)
         .ok()
         .and_then(|mut zip| sniff_archive(&mut zip)))
 }
 
-/// Каталог в пределах `max_entries` и `max_central_dir`.
-fn within(d: &crate::ooxml::ZipDir, limits: &Limits) -> bool {
-    d.entries <= u64::from(limits.max_entries) && d.cd_size <= limits.max_central_dir
-}
-
 fn sniff_zip(bytes: &[u8]) -> Option<DocKind> {
     // та же строгая проверка конца каталога и его размера, что и при извлечении
-    let dir = crate::ooxml::zip_directory_of(bytes);
-    if !dir.is_ok_and(|d| within(&d, &Limits::default())) {
+    let dir = crate::ooxml::zip_directory_of(bytes, &Limits::default());
+    if !matches!(dir, Ok(ZipCheck::Fits(_))) {
         return None;
     }
-    let mut zip = ZipArchive::new(Cursor::new(bytes)).ok()?;
+    let mut zip = crate::ooxml::open_archive(Cursor::new(bytes)).ok()?;
     sniff_archive(&mut zip)
 }
 

@@ -442,3 +442,211 @@ fn reviewer_probe_peak_is_small() {
         }
     }
 }
+
+/// Проба ревьюера раунда 2: за каталогом `probe` — маленький каталог из одной записи (`bad`:
+/// `name` — длина имени 0xFFFF за концом файла, `lfh` — локальный заголовок за концом, `ok` —
+/// согласованная запись) и последняя EOCD на него. До правки `zip` не разбирал каталог последней
+/// EOCD и откатывался к ранней (zip64 на 2 млн записей): пик 670 МиБ.
+fn fallback(n: u64, zip64: bool, bad: &str) -> Vec<u8> {
+    let mut v = probe(n, 1, zip64, false);
+    let small = v.len() as u64;
+    u32le(&mut v, 0x0201_4b50);
+    u16le(&mut v, 20);
+    u16le(&mut v, 20);
+    for _ in 0..4 {
+        u16le(&mut v, 0);
+    }
+    for _ in 0..3 {
+        u32le(&mut v, 0);
+    }
+    u16le(&mut v, if bad == "name" { 0xFFFF } else { 0 });
+    for _ in 0..4 {
+        u16le(&mut v, 0);
+    }
+    u32le(&mut v, 0);
+    u32le(&mut v, if bad == "lfh" { 0xFFFF_FF00 } else { 0 });
+    u32le(&mut v, 0x0605_4b50);
+    u16le(&mut v, 0);
+    u16le(&mut v, 0);
+    u16le(&mut v, 1);
+    u16le(&mut v, 1);
+    u32le(&mut v, 46);
+    u32le(&mut v, small as u32);
+    u16le(&mut v, 0);
+    v
+}
+
+/// `sniff_file` и разбор: оба отказывают, пик — меньше 2 МиБ.
+fn assert_rejected_small(label: &str, b: &[u8]) {
+    let l = Limits::default();
+    let t = Instant::now();
+    let (r, sp) = peak(|| sniff_file(Cursor::new(b), "x.xlsx", &l).unwrap());
+    let st = t.elapsed();
+    let t = Instant::now();
+    let (x, ep) = peak(|| extract(DocKind::Xlsx, b, &l, deadline()));
+    let et = t.elapsed();
+    eprintln!(
+        "{label}: файл {} МиБ, sniff_file {r:?} пик {:.2} МиБ за {st:?}; extract {} пик {:.2} МиБ \
+         за {et:?}",
+        b.len() / MIB,
+        sp as f64 / MIB as f64,
+        match &x {
+            Ok(x) => format!("units={} {:?}", x.units.len(), x.warnings),
+            Err(e) => format!("{e}"),
+        },
+        ep as f64 / MIB as f64,
+    );
+    assert_eq!(r, None, "{label}");
+    assert!(sp < 2 * MIB, "{label}: sniff_file пик {sp}");
+    assert!(ep < 2 * MIB, "{label}: extract пик {ep}");
+    if let Ok(x) = x {
+        assert!(x.units.is_empty(), "{label}");
+    }
+}
+
+/// Откат `zip` к ранней EOCD (раунд правок 3, п. 1): каталог последней EOCD пройден до
+/// `ZipArchive` (слой 3), ранний кандидат в окне сверх лимитов — отказ (слой 2).
+#[test]
+fn fallback_to_earlier_eocd_rejected() {
+    let _g = serial();
+    for bad in ["name", "lfh", "ok"] {
+        assert_rejected_small(
+            &format!("откат zip64 2M [{bad}]"),
+            &fallback(2_000_000, true, bad),
+        );
+    }
+}
+
+/// Кандидат сверх лимита в окне поиска `zip` (zip32 на 20 000 записей перед честным маленьким
+/// каталогом) — отказ, хотя последняя EOCD и её каталог согласованы.
+#[test]
+fn over_limit_candidate_in_window_rejected() {
+    let _g = serial();
+    assert_rejected_small("кандидат 20 000 в окне", &fallback(20_000, false, "ok"));
+    // ранний кандидат в пределах лимитов, а каталог последней EOCD битый — отказ слоем 3
+    for bad in ["name", "lfh"] {
+        let b = fallback(10, false, bad);
+        assert_eq!(file(&b, "a.docx", &Limits::default()), None, "{bad}");
+        assert!(
+            matches!(
+                docx_text(&b, &Limits::default()),
+                Err(DocError::Malformed(_))
+            ),
+            "{bad}"
+        );
+    }
+    // кандидат в пределах лимитов не мешает: последний каталог согласован, а разбор его — свой
+    let b = fallback(10, false, "ok");
+    let l = Limits::default();
+    let x = extract(DocKind::Docx, &b, &l, deadline());
+    assert!(
+        !matches!(&x, Err(DocError::Malformed(m)) if m.contains("сверх лимитов")),
+        "{x:?}"
+    );
+}
+
+/// Наполнитель из сигнатур записи каталога перед честным маленьким каталогом (п. 2): `zip`
+/// открывается с `ArchiveOffset::Known(0)` и файл не сканирует.
+#[test]
+fn cdfh_signature_flood_does_not_scan() {
+    let _g = serial();
+    let mut v = probe(0, 1, false, false);
+    v.truncate(v.len() - 22);
+    for _ in 0..20_000_000usize {
+        v.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+    }
+    let cd = v.len() as u64;
+    let name = b"[Content_Types].xml";
+    u32le(&mut v, 0x0201_4b50);
+    u16le(&mut v, 20);
+    u16le(&mut v, 20);
+    for _ in 0..4 {
+        u16le(&mut v, 0);
+    }
+    for _ in 0..3 {
+        u32le(&mut v, 0);
+    }
+    u16le(&mut v, name.len() as u16);
+    for _ in 0..4 {
+        u16le(&mut v, 0);
+    }
+    u32le(&mut v, 0);
+    u32le(&mut v, 0);
+    v.extend_from_slice(name);
+    let size = v.len() as u64 - cd;
+    u32le(&mut v, 0x0605_4b50);
+    u16le(&mut v, 0);
+    u16le(&mut v, 0);
+    u16le(&mut v, 1);
+    u16le(&mut v, 1);
+    u32le(&mut v, size as u32);
+    u32le(&mut v, cd as u32);
+    u16le(&mut v, 0);
+    // пустой `[Content_Types].xml` — не документ; важен пик
+    assert_rejected_small("наполнитель 80 МБ", &v);
+}
+
+/// EOCD64 и локатор при реальных полях EOCD (п. 3): так пишет Python `zipfile` с
+/// принудительным zip64-концом; конец каталога — EOCD64, поля EOCD сверяются с ней.
+fn eocd64_real_fields(b: &[u8]) -> Vec<u8> {
+    let p = eocd_at(b);
+    let real = b[p..].to_vec();
+    let z = to_zip64(b, 0, 0x0606_4b50);
+    let mut v = z[..z.len() - 22].to_vec();
+    v.extend_from_slice(&real);
+    v
+}
+
+/// Архив потоком (дескрипторы данных, бит 3) — второй вариант Python ревьюера.
+fn streamed_docx() -> Vec<u8> {
+    use std::io::Write;
+    let mut z = zip::ZipWriter::new_stream(Vec::new());
+    for (name, data) in [
+        (
+            "[Content_Types].xml",
+            content_types(
+                "/word/document.xml",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            ),
+        ),
+        (
+            "word/document.xml",
+            format!(r#"<w:document {W}><w:body><w:p><w:r><w:t>Привет из DOCX</w:t></w:r></w:p></w:body></w:document>"#)
+                .into_bytes(),
+        ),
+    ] {
+        z.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        z.write_all(&data).unwrap();
+    }
+    z.finish().unwrap().into_inner()
+}
+
+#[test]
+fn eocd64_with_real_eocd_fields_accepted() {
+    let _g = serial();
+    let l = Limits::default();
+    for (label, b) in [
+        ("принудительный zip64-конец", eocd64_real_fields(&docx())),
+        ("поток + zip64-конец", eocd64_real_fields(&streamed_docx())),
+        ("поток", streamed_docx()),
+    ] {
+        assert!(
+            zip::ZipArchive::new(Cursor::new(&b[..])).is_ok(),
+            "{label}: zip не открывает"
+        );
+        let (r, sp) = peak(|| file(&b, "a.docx", &l));
+        assert_eq!(r, Some(DocKind::Docx), "{label}");
+        assert_eq!(sniff(&b, "a.docx"), Some(DocKind::Docx), "{label}");
+        assert_eq!(docx_text(&b, &l).unwrap(), "Привет из DOCX", "{label}");
+        assert!(sp < 2 * MIB, "{label}: пик {sp}");
+    }
+    // поля EOCD расходятся с EOCD64 — отказ
+    let mut bad = eocd64_real_fields(&docx());
+    let p = bad.len() - 22;
+    let n = rd16(&bad, p + 10) + 1;
+    bad[p + 10..p + 12].copy_from_slice(&n.to_le_bytes());
+    bad[p + 8..p + 10].copy_from_slice(&n.to_le_bytes());
+    assert_eq!(file(&bad, "a.docx", &l), None);
+    assert!(matches!(docx_text(&bad, &l), Err(DocError::Malformed(_))));
+}

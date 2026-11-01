@@ -671,6 +671,51 @@
   ignored), `-p zam-server --test blobs` 10, `--lib -- config docs` 41, `--test doc_worker` 10 (1
   ignored); clippy `-D warnings` по workspace и `fmt --check` — чисто.
 
+#### Задача 4 — раунд правок 3 (2026-11-01): каталог zip до `ZipArchive`
+
+Ревью нашло ещё три пути через поведение `zip` 9.0.5; закрыты тремя слоями `ooxml::zip_directory`
+(общая для `sniff`, `sniff_file`, `Package::open`) и одной функцией открытия:
+
+- **(I-1) Откат к ранней EOCD.** `get_metadata` при ошибке разбора каталога выбранной EOCD делает
+  `continue` и берёт следующего кандидата в окне 64 КиБ + 26 байт (zip64 на 2 млн записей за
+  маленьким каталогом с битой записью: пик 670 МиБ). Слой 3: каталог последней EOCD проходится
+  до `ZipArchive` запись за записью (`read_at`, без буфера на весь каталог): сигнатура записи,
+  имя/extra/комментарий внутри каталога, смещение локального заголовка до каталога, сумма длин —
+  ровно `cd_size`, записей — ровно `entries`. Слой 2: **каждый** кандидат окна (`EOCD_WINDOW` =
+  64 КиБ + 128 байт), годный для `zip` (комментарий в пределах файла; EOCD64 по локатору у
+  `0xFFFF…`; иначе сигнатура записи каталога по смещению или пустой каталог), не превышает
+  `max_entries`/`max_central_dir` — иначе отказ: даже если `zip` откатится (например, на разборе
+  extra-полей, которые слой 3 не проверяет), память ограничена лимитами.
+- **(I-2) `ArchiveOffset::Detect`** сканирует `[0, eocd)` и хранит позицию каждой `PK\x01\x02`
+  (80 МБ наполнителя — 256 МиБ). Теперь недоверенный zip в `zam-docs` открывается только
+  `ooxml::open_archive` — `ZipArchive::with_config(Config { archive_offset: Known(0) })`; вызовы
+  `ZipArchive::new` в `ooxml.rs` и `sniff.rs` переведены на неё. Остальные `ZipArchive::new` в
+  workspace (`zam-fetch/download.rs`, `zam-ml/sparse.rs`, `xtask` bundles/package/smoke) читают
+  свои архивы, сверенные по SHA-256 манифеста, — не недоверенный ввод, не тронуты.
+- **(I-3) Ложный отказ: EOCD64 и локатор при реальных полях EOCD** (Python `zipfile` с
+  принудительным zip64-концом; `zip` открывает их по zip32-полям). Локатор теперь ищется всегда:
+  есть локатор с корректной EOCD64 (`size = 44`, ровно перед локатором) — конец каталога —
+  позиция EOCD64, поля EOCD, кроме `0xFFFF…`, должны совпадать с EOCD64.
+- **Определение вида: zip сверх `max_entries` (и `max_central_dir`) — `unsupported`** (`sniff`
+  даёт `None`; при разборе — `truncated: max_entries`).
+- **Замеры** (`zip_eocd.rs`, счётчик аллокаций, debug): откат zip64 2 млн (`name`/`lfh`/`ok`,
+  89 МиБ) — `sniff_file` `None`, пик 0,13 МиБ, ≤ 0,2 мс; разбор — `Malformed` («кандидат в окне
+  сверх лимитов»), пик < 0,01 МиБ; наполнитель 80 МБ — `sniff_file` пик 0,13 МиБ за 1,5 мс,
+  разбор пик < 0,01 МиБ за 1,1 мс; кандидат на 20 000 записей в окне — отказ, пик 0,13 МиБ;
+  прежние пробы раунда 2 — без изменений. Было: 670 МиБ и 256 МиБ.
+- **Реальные файлы ревьюера** (`.tmp/review-m5-task4/real/`, Python `zipfile`): `comment`,
+  `datadesc_stream`, `deflated`, `eocd64_forced`, `eocd64_stream`, `force64_entries`,
+  `many_9000`, `stored` — `sniff`, `sniff_file` `Docx`, разбор — 1 единица; `many_70000` —
+  `None` и `truncated: max_entries`.
+- Тесты `zip_eocd.rs` (+4, всего 9): `fallback_to_earlier_eocd_rejected`,
+  `over_limit_candidate_in_window_rejected` (и битый последний каталог при раннем кандидате в
+  пределах лимитов — слой 3), `cdfh_signature_flood_does_not_scan`,
+  `eocd64_with_real_eocd_fields_accepted` (принудительный zip64-конец, поток с дескрипторами +
+  zip64-конец, поток; расхождение полей EOCD и EOCD64 — отказ).
+- Проверки: `cargo test -p zam-docs` 68 passed (2 ignored), `-p zam-store` 304 (4 ignored),
+  `-p zam-server --test blobs` 10, `--test doc_worker` 10 (1 ignored); clippy `-D warnings` по
+  workspace и `fmt --check` — чисто.
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
