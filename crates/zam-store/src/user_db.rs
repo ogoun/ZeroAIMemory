@@ -113,6 +113,11 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0019_attachments_index.sql"),
         rebuild: false,
     },
+    Migration {
+        version: 20,
+        sql: include_str!("../migrations/user/0020_attachment_pending_index.sql"),
+        rebuild: false,
+    },
 ];
 
 /// Вид пространства.

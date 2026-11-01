@@ -1494,13 +1494,14 @@ const PENDING_COUNT_SQL: &str = "SELECT (SELECT count(*) FROM nodes n INDEXED BY
      + (SELECT count(*) FROM attachment_docs ad
         JOIN nodes n ON n.id = ad.node_id
         JOIN spaces s ON s.id = n.space_id
-        WHERE ad.deleted_at IS NULL AND n.deleted_at IS NULL AND s.kind <> 'human'
+        WHERE ad.id IN (SELECT id FROM attachment_docs INDEXED BY attachment_docs_pending
+                        WHERE extract_state = 'pending' AND deleted_at IS NULL
+                        UNION SELECT target_id FROM index_jobs INDEXED BY index_jobs_active
+                        WHERE target_kind = 'attachment' AND state IN ('queued', 'running'))
+          AND ad.deleted_at IS NULL AND n.deleted_at IS NULL AND s.kind <> 'human'
           AND n.index_state <> 'excluded'
           AND n.space_id IN (SELECT value FROM json_each(?1))
-          AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
-          AND (ad.extract_state = 'pending'
-               OR EXISTS (SELECT 1 FROM index_jobs j WHERE j.target_kind = 'attachment'
-                          AND j.target_id = ad.id AND j.state IN ('queued', 'running'))))";
+          AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/'))";
 
 /// Сколько живых заметок и записей журналов в `space_ids` (и под `path_prefix`, если задан;
 /// у записей пути нет — при префиксе они не считаются) ждут векторной индексации
@@ -1548,6 +1549,104 @@ mod tests {
         let plan = plan.join("; ");
         assert!(plan.contains("nodes_pending"), "{plan}");
         assert!(plan.contains("entries_pending"), "{plan}");
+        // вложения (задача 10 M5): документы в очереди — по частичному индексу и активным
+        // заданиям, а не обходом всех документов области
+        assert!(plan.contains("attachment_docs_pending"), "{plan}");
+        assert!(plan.contains("index_jobs_active"), "{plan}");
+        assert!(!plan.contains("SCAN ad"), "{plan}");
+    }
+
+    /// Проверка «есть ли чанки вложений в области» (prefetch вложений поиска) идёт от заметок
+    /// области (`nodes_live_path`), а не обходом всех чанков вложений базы (задача 10 M5).
+    #[test]
+    fn has_attachment_chunks_walks_space_nodes() {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        let sql = crate::attachments::HAS_ATTACHMENT_CHUNKS_SQL;
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = st
+            .query_map(params!["[\"x\"]"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("; ");
+        assert!(plan.contains("nodes_live_path"), "{plan}");
+        assert!(
+            plan.contains("chunks_attachment (attachment_id=?)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN c"), "{plan}");
+    }
+
+    /// Замер задачи 10 M5 (журнал этапа): `pending_count` и проверка «есть ли чанки вложений в
+    /// области» (`has_attachment_chunks`, prefetch вложений поиска) на базе с `docs` документами
+    /// вложений по 10 чанков в пространстве A и без них в пространстве B. Печатает время запроса
+    /// (медиана 9 повторов). `cargo test -p zam-store --release -- --ignored --nocapture
+    /// attachment_queries_scale`.
+    #[test]
+    #[ignore = "замер, вручную"]
+    fn attachment_queries_scale() {
+        use std::time::Instant;
+        for docs in [1_000u32, 10_000, 100_000] {
+            let c = Connection::open_in_memory().unwrap();
+            for m in crate::USER_MIGRATIONS {
+                c.execute_batch(m.sql).unwrap();
+            }
+            let t = "2026-11-02T00:00:00.000000Z";
+            c.execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO spaces (id, kind, name, created_at) VALUES ('A', 'knowledge', 'A', '{t}'),
+                   ('B', 'solution', 'B', '{t}'), ('C', 'solution', 'C', '{t}');
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {docs})
+                 INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at, updated_at)
+                   SELECT 'cn' || i, 'C', 'note', 'cn' || i, 'c/n' || i, 'indexed', '{t}', '{t}'
+                   FROM s;
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {docs})
+                 INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at, updated_at)
+                   SELECT 'n' || i, CASE WHEN i % 100 = 0 THEN 'B' ELSE 'A' END, 'note', 'n' || i,
+                          'p/n' || i, 'indexed', '{t}', '{t}' FROM s;
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {docs})
+                 INSERT INTO blobs (sha256, size, created_at) SELECT 'b' || i, 1, '{t}' FROM s;
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {docs})
+                 INSERT INTO attachment_docs (id, node_id, blob_sha256, filename, extract_state,
+                                              created_at)
+                   SELECT 'd' || i, 'n' || (CASE WHEN i % 100 = 0 THEN i + 1 ELSE i END), 'b' || i,
+                          'f.pdf', 'done', '{t}' FROM s;
+                 WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < {docs} * 10 - 1)
+                 INSERT INTO chunks (id, node_id, rev, level, ordinal, text, context_prefix,
+                                     token_count, text_hash, attachment_id, locator)
+                   SELECT 'c' || i, 'n' || (i / 10 + 1 + CASE WHEN (i / 10 + 1) % 100 = 0 THEN 1 ELSE 0 END),
+                          1, 'attachment', i % 10, 'x', '', 1, 'h', 'd' || (i / 10 + 1), 'page:1'
+                   FROM s;"
+            ))
+            .unwrap();
+            let time = |sql: &str, p: &[&dyn rusqlite::ToSql]| {
+                let mut ms: Vec<f64> = (0..9)
+                    .map(|_| {
+                        let t0 = Instant::now();
+                        let _: i64 = c.query_row(sql, p, |r| r.get(0)).unwrap();
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    })
+                    .collect();
+                ms.sort_by(f64::total_cmp);
+                ms[4]
+            };
+            let none: Option<String> = None;
+            let sp = |x: &str| format!("[\"{x}\"]");
+            let (a, b, cc) = (sp("A"), sp("B"), sp("C"));
+            let has = crate::attachments::HAS_ATTACHMENT_CHUNKS_SQL;
+            println!(
+                "docs {docs}: pending_count A {:.2} мс, B {:.2} мс, C {:.2} мс; has_attachment_chunks A {:.3} мс, B {:.2} мс, C {:.2} мс",
+                time(PENDING_COUNT_SQL, &[&a, &none]),
+                time(PENDING_COUNT_SQL, &[&b, &none]),
+                time(PENDING_COUNT_SQL, &[&cc, &none]),
+                time(has, &[&a]),
+                time(has, &[&b]),
+                time(has, &[&cc]),
+            );
+        }
     }
 
     #[test]

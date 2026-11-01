@@ -79,19 +79,21 @@ pub async fn has_attachment_chunks(db: &Db, spaces: Vec<Id>) -> Result<bool, Sto
     }
     let list =
         serde_json::Value::from(spaces.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
-    db.read(move |c| {
-        Ok(c.query_row(
-            "SELECT EXISTS (SELECT 1 FROM chunks c INDEXED BY chunks_attachment
-             JOIN attachment_docs ad ON ad.id = c.attachment_id
-             JOIN nodes n ON n.id = c.node_id
-             WHERE c.attachment_id IS NOT NULL AND ad.deleted_at IS NULL AND n.deleted_at IS NULL
-               AND n.space_id IN (SELECT value FROM json_each(?1)))",
-            [list],
-            |r| r.get(0),
-        )?)
-    })
-    .await
+    db.read(move |c| Ok(c.query_row(HAS_ATTACHMENT_CHUNKS_SQL, [list], |r| r.get(0))?))
+        .await
 }
+
+/// [`has_attachment_chunks`]: `?1` — JSON-массив id пространств. Обход — от живых заметок
+/// области (`nodes_live_path`) к их документам и первому чанку: прежний обход всех чанков
+/// вложений базы (`chunks_attachment`) в области без вложений стоил 48 мс на 100 тыс. и 0,9 с на
+/// 1 млн чанков на каждый поиск (замер `attachment_queries_scale`, задача 10 M5).
+pub(crate) const HAS_ATTACHMENT_CHUNKS_SQL: &str =
+    "SELECT EXISTS (SELECT 1 FROM nodes n INDEXED BY nodes_live_path
+     CROSS JOIN attachment_docs ad ON ad.node_id = n.id
+     WHERE n.space_id IN (SELECT value FROM json_each(?1)) AND n.deleted_at IS NULL
+       AND ad.deleted_at IS NULL
+       AND EXISTS (SELECT 1 FROM chunks c INDEXED BY chunks_attachment
+                   WHERE c.attachment_id = ad.id))";
 
 /// Узел-владелец фрагмента вложения `chunk_id` живого документа (`attachment_docs.deleted_at IS
 /// NULL`) живой заметки; `space` — только в этом пространстве (участник общего решения видит
