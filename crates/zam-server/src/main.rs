@@ -57,6 +57,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
+    /// Рабочий процесс разбора документов (запускает сервер; вручную не вызывается)
+    #[command(hide = true)]
+    DocWorker {
+        /// Библиотека pdfium
+        #[arg(long)]
+        pdfium: PathBuf,
+        /// Предел кадра запроса, байт
+        #[arg(long)]
+        max_frame: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -248,6 +258,10 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // рабочий процесс документов — тоже без runtime: свой журнал в stderr, кадры stdin/stdout
+    if let Cmd::DocWorker { pdfium, max_frame } = cmd {
+        std::process::exit(zam_server::docs::worker::run(pdfium, max_frame));
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -314,6 +328,7 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Models { cmd } => models_cmd(cmd).await,
         Cmd::Cuda { cmd } => cuda_cmd(cmd).await,
         Cmd::Service { .. } => unreachable!("служба обрабатывается до runtime"),
+        Cmd::DocWorker { .. } => unreachable!("рабочий процесс обрабатывается до runtime"),
     }
 }
 

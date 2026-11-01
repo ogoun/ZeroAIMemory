@@ -856,6 +856,50 @@ fn pptx_many_slide_ids_bounded() {
     );
 }
 
+#[test]
+fn docx_external_relationships_not_counted_in_max_entries() {
+    // ревью задачи 2: больше `max_entries` гиперссылок (внешние отношения) перед сносками и
+    // колонтитулом — их отношения не теряются молча
+    let mut s = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{}">"#,
+        "http://schemas.openxmlformats.org/package/2006/relationships"
+    );
+    for i in 0..10_050 {
+        s.push_str(&format!(
+            r#"<Relationship Id="h{i}" Type="{REL}/hyperlink" Target="https://example.org/{i}" TargetMode="External"/>"#
+        ));
+    }
+    s.push_str(&format!(
+        r#"<Relationship Id="rId2" Type="{REL}/footnotes" Target="footnotes.xml"/><Relationship Id="rId3" Type="{REL}/header" Target="header1.xml"/></Relationships>"#
+    ));
+    let body =
+        r#"<w:p><w:r><w:t>Текст</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+    let b = zip_of(&[
+        ("[Content_Types].xml", content_types("/word/document.xml", DOCX_CT)),
+        ("_rels/.rels", rels(&[("rId1", "officeDocument", "word/document.xml")])),
+        (
+            "word/document.xml",
+            format!(r#"<w:document {W}><w:body>{body}</w:body></w:document>"#).into_bytes(),
+        ),
+        (
+            "word/footnotes.xml",
+            format!(
+                r#"<w:footnotes {W}><w:footnote w:id="1"><w:p><w:r><w:t>Сноска</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+            )
+            .into_bytes(),
+        ),
+        (
+            "word/header1.xml",
+            format!(r#"<w:hdr {W}><w:p><w:r><w:t>Шапка</w:t></w:r></w:p></w:hdr>"#).into_bytes(),
+        ),
+        ("word/_rels/document.xml.rels", s.into_bytes()),
+    ]);
+    let x = run(DocKind::Docx, &b);
+    assert!(x.warnings.is_empty(), "{:?}", x.warnings);
+    assert_eq!(find(&x, "Сноска").heading_path, ["Сноски"]);
+    assert_eq!(find(&x, "Шапка").heading_path, ["Колонтитулы"]);
+}
+
 // --- proptest: разбор не паникует на любых байтах и на случайных zip с XML ---
 
 const NAMES: &[&str] = &[

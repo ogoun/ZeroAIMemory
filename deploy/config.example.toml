@@ -250,3 +250,27 @@ blob_max_bytes = 209715200
 # Бэкап каталога данных вместе с master.key раскрывает Vault: держите ключ вне data_dir (этот путь
 # или ZAM_MASTER_KEY) либо исключайте master.key из бэкапа.
 # master_key_file = "/srv/zam/secrets/master.key"
+
+[docs]
+# Разбор вложений (M5). Библиотека pdfium: по умолчанию рядом с zam-server (pdfium.dll /
+# libpdfium.so; относительный путь — от каталога zam-server). Без неё PDF не индексируются
+# (причина — в /index/status), остальные форматы работают.
+# pdfium_dylib = "/opt/zam/libpdfium.so"
+# PDF разбирается в рабочих процессах `zam-server doc-worker` (тот же бинарник): их число,
+# заданий на процесс до перезапуска, лимит памяти процесса (МиБ; Windows — Job Object,
+# Linux — RLIMIT_AS) и срок разбора файла (мс; по истечении процесс убивается, вложение —
+# failed с причиной parse_timeout; падение — parse_crash, нехватка памяти — parse_oom).
+workers = 2
+worker_jobs = 200
+worker_memory_mb = 2048
+timeout_ms = 60000
+# Лимиты разбора всех форматов. Размер файла больше max_bytes — отказ; остальные дают частичный
+# результат с предупреждением "truncated: <лимит>".
+max_bytes = 104857600        # 100 МиБ
+max_unpacked = 524288000     # распаковано из zip, 500 МиБ
+max_ratio = 100              # степень сжатия записи zip (записи больше 1 МиБ)
+max_entries = 10000          # записей zip
+max_xml_depth = 256
+max_cells = 2000000          # непустых ячеек листа
+max_chars = 20000000         # объём выдачи: текст, пути заголовков и 64 символа на единицу
+max_pages = 5000             # страниц PDF

@@ -45,6 +45,7 @@ pub struct ServerConfig {
     pub recall: RecallSection,
     pub limits: LimitsSection,
     pub vault: VaultSection,
+    pub docs: DocsSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -737,6 +738,116 @@ impl RecallSection {
     }
 }
 
+/// Секция `[docs]` (M5 §1–2): лимиты разбора документов и рабочие процессы PDF
+/// (`zam-server doc-worker`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocsSection {
+    /// Библиотека pdfium; по умолчанию рядом с исполняемым файлом (`pdfium.dll` /
+    /// `libpdfium.so`), относительный путь — от каталога исполняемого файла.
+    pub pdfium_dylib: Option<PathBuf>,
+    /// Рабочих процессов разбора PDF (1..=16, 2).
+    pub workers: usize,
+    /// Заданий на процесс до перезапуска (1..=100000, 200).
+    pub worker_jobs: u32,
+    /// Лимит памяти процесса, МиБ (128..=65536, 2048): Job Object / `RLIMIT_AS`.
+    pub worker_memory_mb: u64,
+    /// Срок разбора файла, мс (100..=3600000, 60000); по истечении процесс убивается.
+    pub timeout_ms: u64,
+    /// Размер файла, байт (100 МиБ); больше — отказ.
+    pub max_bytes: u64,
+    /// Распакованный объём zip, байт (500 МиБ).
+    pub max_unpacked: u64,
+    /// Степень сжатия записи zip (100).
+    pub max_ratio: u32,
+    /// Записей zip (10000).
+    pub max_entries: u32,
+    /// Глубина XML (256).
+    pub max_xml_depth: u32,
+    /// Непустых ячеек листа (2 млн).
+    pub max_cells: u64,
+    /// Объём выдачи, символов (20 млн): текст, пути заголовков и служебный вес единиц.
+    pub max_chars: u64,
+    /// Страниц PDF (5000).
+    pub max_pages: u32,
+}
+
+impl Default for DocsSection {
+    fn default() -> Self {
+        let l = zam_docs::Limits::default();
+        DocsSection {
+            pdfium_dylib: None,
+            workers: 2,
+            worker_jobs: 200,
+            worker_memory_mb: 2048,
+            timeout_ms: 60_000,
+            max_bytes: l.max_bytes,
+            max_unpacked: l.max_unpacked,
+            max_ratio: l.max_ratio,
+            max_entries: l.max_entries,
+            max_xml_depth: l.max_xml_depth,
+            max_cells: l.max_cells,
+            max_chars: l.max_chars,
+            max_pages: l.max_pages,
+        }
+    }
+}
+
+impl DocsSection {
+    /// Лимиты разбора `zam-docs`.
+    pub fn limits(&self) -> zam_docs::Limits {
+        zam_docs::Limits {
+            max_bytes: self.max_bytes,
+            max_unpacked: self.max_unpacked,
+            max_ratio: self.max_ratio,
+            max_entries: self.max_entries,
+            max_xml_depth: self.max_xml_depth,
+            max_cells: self.max_cells,
+            max_chars: self.max_chars,
+            max_pages: self.max_pages,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("docs.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=16).contains(&self.workers) {
+            return Err(bad("workers", "от 1 до 16"));
+        }
+        if !(1..=100_000).contains(&self.worker_jobs) {
+            return Err(bad("worker_jobs", "от 1 до 100000"));
+        }
+        if !(128..=65_536).contains(&self.worker_memory_mb) {
+            return Err(bad("worker_memory_mb", "от 128 до 65536"));
+        }
+        if !(100..=3_600_000).contains(&self.timeout_ms) {
+            return Err(bad("timeout_ms", "от 100 до 3600000"));
+        }
+        for (k, v) in [
+            ("max_bytes", self.max_bytes),
+            ("max_unpacked", self.max_unpacked),
+            ("max_ratio", u64::from(self.max_ratio)),
+            ("max_entries", u64::from(self.max_entries)),
+            ("max_xml_depth", u64::from(self.max_xml_depth)),
+            ("max_cells", self.max_cells),
+            ("max_chars", self.max_chars),
+            ("max_pages", u64::from(self.max_pages)),
+        ] {
+            if v == 0 {
+                return Err(bad(k, "должно быть больше 0"));
+            }
+        }
+        // файл целиком в кадре base64 рабочего процесса: кадр — u32
+        if self.max_bytes > 1 << 30 {
+            return Err(bad("max_bytes", "не больше 1 ГиБ"));
+        }
+        Ok(())
+    }
+}
+
 /// Секция `[vault]` (§7.6): файл мастер-ключа. Сам ключ — только в файле или в
 /// `ZAM_MASTER_KEY` (переменная важнее файла), в конфигурацию он не попадает.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -865,6 +976,7 @@ impl Default for ServerConfig {
                 blob_max_bytes: 209_715_200,
             },
             vault: VaultSection::default(),
+            docs: DocsSection::default(),
         }
     }
 }
@@ -1036,6 +1148,7 @@ pub fn load(
     cfg.read.validate()?;
     cfg.cache.validate()?;
     cfg.recall.validate()?;
+    cfg.docs.validate()?;
     Ok(cfg)
 }
 

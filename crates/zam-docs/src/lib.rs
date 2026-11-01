@@ -6,7 +6,8 @@
 //!
 //! Модули: [`sniff`] — вид по сигнатуре, затем по расширению; `ooxml` — общий разбор zip и XML
 //! с лимитами; `docx`, `pptx` — форматы Office Open XML; `text` — простой текст; `sheet` —
-//! таблицы (`xlsx`, `ods` на `ooxml`, `xls` на `cfb`, `csv`) и превью листа [`sheet_page`].
+//! таблицы (`xlsx`, `ods` на `ooxml`, `xls` на `cfb`, `csv`) и превью листа [`sheet_page`];
+//! `pdf` (фича `pdfium`) — PDF и миниатюры страниц, только в рабочем процессе `doc-worker`.
 
 mod cfb;
 mod csv;
@@ -15,9 +16,18 @@ mod docx;
 mod locator;
 mod ods;
 mod ooxml;
+#[cfg(feature = "pdfium")]
+pub mod pdf;
+#[cfg(feature = "pdfium")]
+mod pdf_layout;
+#[cfg(feature = "pdfium")]
+mod png;
 mod pptx;
 mod sheet;
 mod sniff;
+#[cfg(feature = "test-pdf")]
+#[doc(hidden)]
+pub mod test_pdf;
 mod text;
 mod xls;
 mod xlsx;

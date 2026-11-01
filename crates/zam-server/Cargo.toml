@@ -26,11 +26,13 @@ zam-index = { path = "../zam-index" }
 zam-ml = { path = "../zam-ml" }
 zam-fetch = { path = "../zam-fetch" }
 zam-search = { path = "../zam-search" }
+# M5: извлечение документов; PDF (pdfium) — только в рабочем процессе `doc-worker`
+zam-docs = { path = "../zam-docs", features = ["pdfium"] }
 jiff.workspace = true
 serde_json.workspace = true
 # ETag кэша триггеров (§10.3)
 blake3.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 axum = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true, features = ["fs"] }
 tracing.workspace = true
@@ -82,5 +84,7 @@ zam-store = { path = "../zam-store", features = ["test-hooks"] }
 # тестовые точки самого сервера (tests/search_rerank_boosts.rs)
 zam-server = { path = ".", features = ["test-hooks"] }
 zip.workspace = true
+# PDF-фикстуры тестов рабочего процесса (tests/doc_worker.rs)
+zam-docs = { path = "../zam-docs", features = ["pdfium", "test-pdf"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true

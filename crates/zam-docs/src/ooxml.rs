@@ -249,7 +249,9 @@ impl<'a> Package<'a> {
                 if [&id, &ty, &target].iter().any(|a| a.len() > REL_ATTR_MAX) {
                     continue;
                 }
-                // отношений не больше записей архива: больше частей не бывает
+                // отношений к частям не больше записей архива: больше частей не бывает;
+                // внешние (гиперссылки) пропущены выше и в потолок не входят — их бывает
+                // больше `max_entries`, а память держит обрезка атрибутов `REL_ATTR_MAX`
                 if out.len() as u64 >= u64::from(ctx.limits.max_entries) {
                     ctx.truncated("max_entries");
                     break;

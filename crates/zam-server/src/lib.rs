@@ -8,6 +8,7 @@ pub mod bootstrap;
 pub mod certainty;
 pub mod config;
 pub mod cuda;
+pub mod docs;
 pub mod error;
 pub mod glossary;
 pub mod index_state;

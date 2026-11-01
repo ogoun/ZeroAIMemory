@@ -48,6 +48,10 @@ quick-xml = { version = "=0.42.0", default-features = false }
 # M5: кодировки CSV (UTF-16, Windows-1251) и кодовые страницы XLS BIFF5 (zam-docs) — уже в
 # графе транзитивно; (Apache-2.0 OR MIT) AND BSD-3-Clause; 0.8.42 выпущена 2026-09-24
 encoding_rs = "=0.8.42"
+# M5: PDF через pdfium (zam-docs, фича `pdfium`; только рабочий процесс doc-worker) — MIT OR
+# Apache-2.0; 0.9.4 выпущена 2026-09-06 (исправлены два double-free обёртки); привязка к
+# библиотеке — только динамическая (libloading), без `static`/`bindings`, без `image`
+pdfium-render = { version = "=0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 # M2: tar.xz redist-архивов NVIDIA для Linux (`zam-server cuda fetch`): чистый Rust, без C liblzma;

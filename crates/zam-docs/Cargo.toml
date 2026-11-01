@@ -11,6 +11,18 @@ encoding_rs.workspace = true
 quick-xml.workspace = true
 thiserror.workspace = true
 zip.workspace = true
+# PDF (спецификация §1–2): только в рабочем процессе `zam-server doc-worker`
+pdfium-render = { workspace = true, optional = true }
+# PNG миниатюр страниц PDF: свой минимальный кодер на deflate (уже в дереве)
+flate2 = { workspace = true, optional = true }
+
+[features]
+# Разбор PDF и миниатюры страниц через pdfium (динамическая библиотека)
+pdfium = ["dep:pdfium-render", "dep:flate2"]
+# Простой писатель PDF для тестов (`test_pdf`) — только dev-зависимостям, в сервере его нет
+test-pdf = []
 
 [dev-dependencies]
 proptest.workspace = true
+# тесты PDF (`tests/pdf.rs`, `memory_peak`) — всегда с фичей `pdfium`
+zam-docs = { path = ".", features = ["pdfium", "test-pdf"] }

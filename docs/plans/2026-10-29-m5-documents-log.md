@@ -337,6 +337,123 @@
   - `cargo test -p zam-docs`: debug и release — 41 passed, 2 ignored. clippy `-D warnings` и fmt
     чистые.
 
+### Задача 3 — PDF в рабочем процессе `zam-server doc-worker` (2026-11-01)
+
+- **Аудит зависимости.** `pdfium-render` `=0.9.4` — MIT OR Apache-2.0; выпущена **2026-09-06**
+  (crates.io API, проверено 2026-11-01), последняя версия на дату проверки (0.9.3 — 07-14), не
+  отозвана; правило «не новее 2 недель» соблюдено. В 0.9.4 исправлены два double-free обёртки
+  (исследование §1.4). Фичи: `default-features = false`, `pdfium_latest` (API 7881; библиотека —
+  `chromium/8100` из `deploy/pdfium.toml`), `thread_safe`; без `image`, `static`, `bindings`.
+  Привязка только динамическая (`libloading`, явный путь `docs.pdfium_dylib`, по умолчанию рядом
+  с исполняемым файлом, как ORT). Новые транзитивные крейты: `utf16string` 0.2.0 (MIT),
+  `maybe-owned` 0.3.4 (MIT/Apache-2.0), `vecmath` 1.0.0 и `piston-float` 1.0.1 (MIT); `chrono`,
+  `itertools` 0.15, `bytemuck`, `libloading`, `log` уже были в графе. PNG миниатюр — свой кодер на
+  `flate2` (уже в workspace; CRC — `flate2::Crc`), без `png`/`image`.
+- **pdfium-binaries без PartitionAlloc и V8.** В `libpdfium.so`/`pdfium.dll` нет символов
+  `partition_alloc`: `RLIMIT_AS` не ломает резервирование адресного пространства (PartitionAlloc
+  резервирует гигабайты), OOM pdfium — `FX_OutOfMemoryTerminate` (Windows — исключение
+  `0xE0000008`, Linux — `abort()`). JavaScript: форма инициализируется `pdfium-render` без
+  обработчиков, `FORM_Do*Action` не вызываются, V8 в сборке нет; вложения PDF не читаются.
+- **`zam_docs::pdf`** (фича `pdfium`): `bind`, `extract_pdf`, `render_thumb`; раскладка —
+  `pdf_layout` (чистый Rust).
+  - Символы страницы — `FPDFText_GetUnicode` + плотный прямоугольник (`tight_bounds`) в порядке
+    потока. Фрагмент строки — символы с перекрытием по высоте и разрывом не больше высоты
+    фрагмента. Пробел — только из потока (pdfium сам вставляет «сгенерированные» пробелы):
+    разрывы плотных прямоугольников узких букв (`i`, `l`) давали ложные пробелы.
+  - XY-cut: вертикальные просветы шире 0,8 медианной высоты — столбцы (разрез сразу по всем,
+    слева направо). Иначе — горизонтальные полосы: если ни в одной нет столбцов, полосы и есть
+    строки; иначе разрез по самому широкому просвету (при равных — по верхнему) и разбор половин
+    заново — заголовок во всю ширину над колонками отделяется до разреза колонок. Стек вместо
+    рекурсии; срок сверяется в циклах, по истечении остаток выдаётся полосами.
+  - Колонтитулы: строки целиком в верхних/нижних 8 % высоты `MediaBox`; ключ — пробелы
+    схлопнуты, цифры заменены (`Page 3 of 5` = `Page 4 of 5`); выбрасываются ключи на ≥ 60 %
+    страниц (от числа разобранных страниц, не меньше двух). Кандидатов на страницу ≤ 32 (ближайшие
+    к краю), хранятся диапазонами в тексте страницы.
+  - `ocr_needed`: страница без видимых символов с объектом-изображением (и во вложенных формах
+    XObject до глубины 4; объектов просматривается ≤ 100 000).
+  - Лимиты: `max_bytes` — отказ; `max_pages` — первые страницы и `truncated: max_pages`; текст
+    страниц копится через `Ctx::append` под одним остатком `max_chars`, выдача — `Units::push`
+    (путь и 64 служебных символа на единицу); символов одной страницы ≤ `PAGE_GLYPHS_MAX` =
+    262 144 (`truncated: page_chars` — новое имя предупреждения, не поле конфигурации); срок —
+    `truncated: timeout_ms`.
+  - Единица — страница (`Locator::Page(n)`, `heading_path` пуст); строки через перевод строки,
+    абзац и переход в следующую колонку — пустая строка. Закладки PDF как заголовки не берутся.
+  - Миниатюра: `PdfRenderConfig` с наибольшей стороной `max_px` (1..=2048), RGBA → PNG.
+- **Писатель PDF для тестов** — `zam_docs::test_pdf` за фичей `test-pdf` (только dev-зависимости
+  `zam-docs` и `zam-server`, `#[doc(hidden)]`): Helvetica (WinAnsi), строки и картинка 2×2,
+  таблица xref. Кириллица и CJK — байты UTF-8: pdfium не падает, текст неверный (встроенных
+  шрифтов нет); качество — задача 10.
+- **`zam_index::child`** (новый `pub` модуль): `SECRET_ENV`/`is_secret_env`, `pre_exec_hook`
+  (PDEATHSIG + сверка `getppid` + необязательный `RLIMIT_AS`), `vm_peak_bytes`, `KillJob` (свой Job
+  Object: `KILL_ON_JOB_CLOSE`, `JOB_OBJECT_LIMIT_PROCESS_MEMORY`, `PeakProcessMemoryUsed`,
+  `TerminateJobObject`), `parse_json_line`/`LogLine`. Супервизор Qdrant берёт их отсюда без
+  изменения поведения (те же вычищаемые переменные, тот же `pre_exec`, `process-wrap` остался);
+  у `windows` в `zam-index` добавлена фича `Win32_System_JobObjects`.
+- **Рабочий процесс** — скрытая подкоманда `doc-worker --pdfium <путь> --max-frame <байт>` в
+  `main.rs` до создания tokio (как служба); журнал свой — JSON в stderr, INFO, без содержимого
+  документов. pdfium грузится лениво (первый PDF, миниатюра или `Ping`). Паника разбора — ответ
+  `internal` и выход процесса (код 4): состоянию pdfium после неё не верим.
+- **Протокол кадров (решение исполнителя).** Кадр — длина тела `u32` BE + JSON (`serde_json`).
+  Запрос: `extract {kind, limits, soft_ms, bytes}` | `thumb {page, max_px, bytes}` | `ping`
+  (+ `crash`/`sleep`/`alloc` с `test-hooks`). Ответ: `extracted {kind, units[{locator,
+  heading_path, text}], warnings, ocr_needed}` | `thumb {png}` | `pong {pdfium: null|причина}` |
+  `error {kind, message}` | `done`. Файл — base64 в JSON, как в брифе; `bytes` — последнее поле,
+  родитель дописывает base64 прямо в тело кадра (`request_body`), процесс читает строку без копии
+  (`Cow` + `serde(borrow)`). Пределы кадра: запрос `4/3 × max_bytes + 64 КиБ` (у процесса —
+  `--max-frame`), ответ `6 × max_chars + 64 МиБ`; `docs.max_bytes ≤ 1 ГиБ` (кадр — `u32`). Срок
+  внутри процесса (`soft_ms`) — 90 % `timeout_ms`: обычно процесс отдаёт частичный результат
+  сам, убийство по сроку — для зависшего pdfium.
+- **Пул `DocPool`.** `docs.workers` долгоживущих потоков-слотов (`doc-worker-<n>`); слот запускает
+  свой процесс при первом задании (PDEATHSIG привязан к потоку слота, поток живёт с пулом),
+  задания — из общей очереди, ответ — `tokio::sync::oneshot`; сериализация и base64 — в потоке
+  слота, не в исполнителе tokio. Процесс, умерший между заданиями, заменяется до отправки; после
+  `worker_jobs` заданий — закрыть stdin, 2 с на выход, затем убить. Windows: Job Object на каждый
+  процесс (пик памяти — именно этого процесса), `CREATE_NO_WINDOW`; Linux: `process_group(0)` +
+  `pre_exec_hook(.., Some(worker_memory_mb))`. stderr — построчно (≤ 16 КиБ) в журнал сервера,
+  `component = "doc-worker"`, `pid`; уровень — из JSON, прочее — WARN.
+- **Причины сбоев.** `Timeout` — срок истёк, процесс убит. Процесс закрыл stdout посреди задания:
+  ждём выхода (5 с), дочитываем stderr; `Oom`, если в stderr сообщение аллокатора Rust (`memory
+  allocation of N bytes failed`) или C++ (`bad_alloc`, «out of memory»), либо на Windows код
+  `0xE0000008` или `PeakProcessMemoryUsed` ≥ 95 % лимита, либо на Linux `VmPeak` (замер каждые
+  100 мс ожидания) ≥ 95 % лимита или `SIGKILL` не от пула (OOM killer); иначе `Crash`.
+  Неверный кадр ответа — `Doc(Internal)`, процесс убит. Ошибка документа — `ParseFailure::Doc`,
+  причина `parse_error` (сверх брифа: три причины брифа — для сбоев процесса).
+- **pdfium недоступен.** Процесс отвечает `error {kind: unsupported, message: причина}` (`pdfium не
+  найден: <путь>` или ошибка загрузки); пул отдаёт `Doc(Unsupported)` и хранит причину —
+  `DocPool::pdfium_error()` (успешный PDF или `ping` её обновляет). Вывод в `/index/status` —
+  задача 5 (конвейер индексации и `failed_items`); здесь — источник причины.
+- **Отступления от брифа.** `DocPool::new(&DocsSection)`: секция названа по образцу `config.rs`
+  (`*Section`; в брифе — `DocsConfig`). Сверх брифа: `DocPool::with_program` (тесты запускают
+  бинарник пакета), `ping`, `pdfium_error`, `spawned`, `worker_pids`, `test_op` (`test-hooks`).
+  Пул проверяет `max_bytes` до процесса. Срок записи запроса в stdin не ограничен (процесс читает
+  кадр сразу) — известное ограничение.
+- **`[docs]`** (`DocsSection`, `deny_unknown_fields`): `pdfium_dylib`, `workers` 1..=16 (2),
+  `worker_jobs` 1..=100000 (200), `worker_memory_mb` 128..=65536 (2048), `timeout_ms`
+  100..=3600000 (60000), лимиты `Limits` (> 0; `max_bytes` ≤ 1 ГиБ); `limits()` →
+  `zam_docs::Limits`. `deploy/config.example.toml` дополнен (тест `example_config_parses_to_defaults`).
+- **Попутно из ревью задачи 2 (`ooxml::rels`).** Внешние отношения (`TargetMode="External"`,
+  гиперссылки) уже пропускались **до** проверки потолка `max_entries` и в него не входили —
+  поведение верное; добавлены тест `docx_external_relationships_not_counted_in_max_entries`
+  (10 050 внешних отношений перед сносками и колонтитулом — оба на месте, предупреждений нет) и
+  комментарий в коде.
+- **Тесты.** `zam-docs`: `tests/pdf.rs` — `pdf_pages_text`, `pdf_two_columns_order` (поток через обе
+  колонки построчно, заголовок во всю ширину), `pdf_headers_footers_removed` (шапка на 40 %
+  страниц остаётся), `pdf_scan_ocr_needed`, `pdf_limits_pages_chars_size_deadline`,
+  `pdf_cyrillic_and_cjk_do_not_crash`, `pdf_thumb_png`; юнит-тесты `pdf_layout`, `png`;
+  `memory_peak::pdf_peak_within_bound`. `zam-server`: `tests/doc_worker.rs` —
+  `worker_roundtrip_extract`, `worker_crash_is_parse_crash_and_restarts`, `worker_timeout_killed`,
+  `worker_memory_limit_oom` (512 МиБ: на Linux `RLIMIT_AS` включает отображение бинарника),
+  `worker_recycled_after_worker_jobs`, `missing_pdfium_unsupported`,
+  `too_large_rejected_before_worker`, `worker_dies_with_server` (копия тестового бинарника —
+  «сервер» с пулом; `kill` → рабочий процесс исчезает ≤ 10 с; Windows прогнан, Linux — CI);
+  юнит-тесты `protocol`, `pool`. `zam-index`: `child::tests` (Job Object убивает процесс при
+  закрытии). Без pdfium тесты PDF пропускаются с сообщением в stderr.
+- **Замеры (Windows, release, `memory_peak`, `max_chars` 1 млн).** 400 страниц × 45 строк
+  (~3500 символов на страницу): 287 страниц до `max_chars`, 0,54 с (≈ 1,9 мс на страницу), пик
+  памяти Rust 1,5 МиБ (граница 21,6 МиБ); плотная страница 12 × 700 строк кеглем 1: 256 тыс.
+  символов (`truncated: page_chars`), 0,32 с, пик 7,8 МиБ. Выделения pdfium (C++) счётчик не
+  видит — их держит лимит процесса. `tests/doc_worker.rs` (debug) — 2 с.
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
@@ -446,6 +563,17 @@
   текстовый токен — срез входа без копии, накопление ограничено `max_chars`; остаётся время
   разбора тега с сотнями тысяч атрибутов (ограничено сроком). Сделать вместе с корпусом
   враждебных файлов (задача 10).
+
+Из задачи 3 M5 (2026-11-01), пока не сделано:
+
+- **`/index/status` — причина недоступности pdfium** (`DocPool::pdfium_error()`) и `failed_items`
+  с `parse_crash|parse_timeout|parse_oom` — задача 5 (конвейер индексации).
+- **OOM pdfium на Linux без признаков** (единичное большое выделение далеко от `RLIMIT_AS`) даёт
+  `parse_crash`; уточнить на враждебных PDF (задача 10).
+- **Повёрнутые страницы (`/Rotate`)** в поиске колонтитулов не учитываются (берутся границы
+  `MediaBox` по y); закладки PDF как `heading_path` — по корпусу `eval/docs/`.
+- **Таблицы в PDF** XY-cut читает по столбцам (просвет между столбцами таблицы похож на просвет
+  между колонками) — проверить на `eval/docs/` (задача 10).
 
 Из задачи 2 M5 (2026-11-01), пока не сделано:
 

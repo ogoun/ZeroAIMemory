@@ -534,3 +534,76 @@ fn peak_480mib_defaults() {
     let bound = limits.max_unpacked as usize + 2 * 4 * limits.max_chars as usize + MIB;
     check(&limits, 480 * MIB, bound);
 }
+
+/// PDF (задача 3; в сервере — только рабочий процесс с лимитом памяти ОС): память Rust
+/// разбора — накопленный текст страниц и выдача (2 × 4 × `max_chars`) плюс прямоугольники
+/// символов одной страницы и фрагменты XY-cut (≤ 2 × 20 × `PAGE_GLYPHS_MAX`) и 4 МиБ. Выделения
+/// самого pdfium (C++) этим счётчиком не видны — их держит лимит процесса.
+#[test]
+fn pdf_peak_within_bound() {
+    use zam_docs::pdf::{PAGE_GLYPHS_MAX, bind, extract_pdf};
+    use zam_docs::test_pdf::{Page, build, pdfium_path};
+    let Some(path) = pdfium_path(env!("CARGO_MANIFEST_DIR")) else {
+        eprintln!("pdfium не найден (cargo xtask fetch-deps) — тест PDF пропущен");
+        return;
+    };
+    let _serial = serial();
+    let lib = bind(&path).unwrap();
+    let line = "lorem ipsum dolor sit amet consectetur ".repeat(2);
+    // A: много страниц плотного текста сверх max_chars
+    let many: Vec<Page> = (0..400)
+        .map(|_| {
+            (0..45).fold(Page::default(), |p, k| {
+                p.line(20.0, 760.0 - 16.0 * k as f32, &line)
+            })
+        })
+        .collect();
+    // B: одна страница с числом символов больше PAGE_GLYPHS_MAX (строки за краем страницы)
+    // кегль 1: 12 колонок × 700 строк × ~80 символов, текст строк разный (pdfium убирает
+    // повторы одного текста в одном месте)
+    let mut dense = Page::default();
+    for col in 0..12 {
+        for row in 0..700 {
+            dense.lines.push(zam_docs::test_pdf::Line {
+                x: 10.0 + 49.0 * col as f32,
+                y: 780.0 - 1.1 * row as f32,
+                size: 1.0,
+                text: format!("{col}x{row} {line}"),
+            });
+        }
+    }
+    let dense = vec![dense];
+    let limits = Limits {
+        max_chars: 1_000_000,
+        ..Limits::default()
+    };
+    let bound = 2 * 4 * limits.max_chars as usize + 2 * 20 * PAGE_GLYPHS_MAX + 4 * MIB;
+    for (name, pages) in [("A: 400 страниц", many), ("B: плотная страница", dense)]
+    {
+        let pdf = build(&pages);
+        drop(pages);
+        let base = CUR.load(Relaxed);
+        PEAK.store(base, Relaxed);
+        let t = Instant::now();
+        let x = extract_pdf(
+            &lib,
+            &pdf,
+            &limits,
+            Instant::now() + Duration::from_secs(600),
+        )
+        .unwrap();
+        let peak = PEAK.load(Relaxed).saturating_sub(base);
+        eprintln!(
+            "{name}: пик {:.1} МиБ (граница {:.1}), {:?}, единиц {}, символов {}, {:?}",
+            peak as f64 / MIB as f64,
+            bound as f64 / MIB as f64,
+            t.elapsed(),
+            x.units.len(),
+            x.units.iter().map(|u| u.text.len()).sum::<usize>(),
+            x.warnings
+        );
+        assert!(peak <= bound, "{name}: пик {peak} > {bound}");
+        let out: usize = x.units.iter().map(|u| u.text.chars().count() + 64).sum();
+        assert!(out as u64 <= limits.max_chars, "{name}: выдача {out}");
+    }
+}
