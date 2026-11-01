@@ -72,11 +72,27 @@ pub fn col(mut c: u32) -> String {
 
 /// XLSX из листов (имя, XML листа) и необязательных общих строк.
 pub fn xlsx(sheets: &[(&str, Vec<u8>)], shared: Option<Vec<u8>>) -> Vec<u8> {
+    xlsx_styled(sheets, shared, None, "")
+}
+
+/// XLSX со стилями `xl/styles.xml` (`styles`) и атрибутами `<workbookPr>` книги (`pr`, пусто —
+/// без элемента): даты и форматы чисел.
+pub fn xlsx_styled(
+    sheets: &[(&str, Vec<u8>)],
+    shared: Option<Vec<u8>>,
+    styles: Option<Vec<u8>>,
+    pr: &str,
+) -> Vec<u8> {
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut ct = String::from(
         r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>"#,
     );
-    let mut wb = format!(r#"<workbook xmlns="{SML}" xmlns:r="{REL}"><sheets>"#);
+    let pr = if pr.is_empty() {
+        String::new()
+    } else {
+        format!("<workbookPr {pr}/>")
+    };
+    let mut wb = format!(r#"<workbook xmlns="{SML}" xmlns:r="{REL}">{pr}<sheets>"#);
     let mut rels = String::from(
         r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
     );
@@ -99,6 +115,12 @@ pub fn xlsx(sheets: &[(&str, Vec<u8>)], shared: Option<Vec<u8>>) -> Vec<u8> {
             r#"<Relationship Id="rIdS" Type="{REL}/sharedStrings" Target="sharedStrings.xml"/>"#
         ));
         entries.push(("xl/sharedStrings.xml".into(), s));
+    }
+    if let Some(s) = styles {
+        rels.push_str(&format!(
+            r#"<Relationship Id="rIdT" Type="{REL}/styles" Target="styles.xml"/>"#
+        ));
+        entries.push(("xl/styles.xml".into(), s));
     }
     wb.push_str("</sheets></workbook>");
     rels.push_str("</Relationships>");

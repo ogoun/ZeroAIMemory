@@ -15,6 +15,7 @@ mod csv;
 mod ctx;
 mod docx;
 mod locator;
+mod numfmt;
 mod ods;
 mod ooxml;
 #[cfg(feature = "pdfium")]
@@ -46,7 +47,9 @@ pub use sniff::{ImageKind, is_text, sniff, sniff_file, sniff_image};
 /// 2 — `locator` листа с именем вида `#12` пишется в кавычках (`sheet:'#12'!A1`), иначе он
 /// читался бы как номер листа `sheet:#N` (задача 7 M5, раунд правок 2): кэш `blob_extract` хранит
 /// отрисованный `locator` и переизвлекается.
-pub const EXTRACTOR_VERSION: u32 = 2;
+/// 3 — даты и время XLSX по формату числа стиля ячейки — ISO 8601 вместо серийного номера
+/// (задача 10 M5, `numfmt`): текст листов меняется, кэш переизвлекается.
+pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// Вид документа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

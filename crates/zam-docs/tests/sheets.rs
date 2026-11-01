@@ -6,7 +6,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::sheets::{XCell, cfb, grid, ods, sheet_xml, sst_xml, xls, xlsx};
+use common::sheets::{SML, XCell, cfb, grid, ods, sheet_xml, sst_xml, xls, xlsx, xlsx_styled};
 use proptest::prelude::*;
 use zam_docs::{
     DocError, DocKind, Extracted, Limits, Locator, extract, sheet_page, sheet_page_no, sniff,
@@ -96,6 +96,78 @@ fn xlsx_sheets_blocks_with_header() {
     );
     assert_eq!(last.text, "| Код | Итог |\n| --- | --- |\n| 1 | TRUE |");
     assert_eq!(sniff(&xlsx(&[], None), "x.bin"), Some(DocKind::Xlsx));
+}
+
+/// Даты по стилю ячейки (задача 10 M5): свой `numFmt` и встроенные 14 и 22 — ISO 8601, время —
+/// `ЧЧ:ММ`, длительность `[h]:mm`, валюта и проценты — число как есть; ошибка 1900-02-29 Excel и
+/// система 1904; превью листа (`sheet_page`) — тот же текст. Без стилей — число, как раньше.
+#[test]
+fn xlsx_dates_by_number_format() {
+    let styles = format!(
+        r##"<styleSheet xmlns="{SML}"><numFmts count="4"><numFmt numFmtId="164" formatCode="dd\.mm\.yyyy"/><numFmt numFmtId="165" formatCode="[$-419]d mmmm yyyy"/><numFmt numFmtId="166" formatCode="#,##0.00&quot; руб.&quot;"/><numFmt numFmtId="167" formatCode="[h]:mm"/></numFmts><cellStyleXfs count="1"><xf numFmtId="14"/></cellStyleXfs><cellXfs count="9"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="14"/><xf numFmtId="22"/><xf numFmtId="166"/><xf numFmtId="20"/><xf numFmtId="167"/><xf numFmtId="10"/><xf numFmtId="165"/></cellXfs></styleSheet>"##
+    );
+    let cells = [
+        ("45231", 1, "01.11.2023"),
+        ("45231", 2, "2023-11-01"),
+        ("45231.5", 3, "2023-11-01 12:00"),
+        ("1234.5", 4, "1234.5"),
+        ("0.75", 5, "18:00"),
+        ("1.5", 6, "1.5"),
+        ("0.25", 7, "0.25"),
+        ("60", 2, "1900-02-29"),
+        ("59", 2, "1900-02-28"),
+        ("45231", 0, "45231"),
+        ("44270", 8, "2021-03-15"),
+        ("-5", 2, "-5"),
+    ];
+    let mut rows =
+        String::from(r#"<row r="1"><c r="A1" t="inlineStr"><is><t>Значение</t></is></c></row>"#);
+    for (i, (v, s, _)) in cells.iter().enumerate() {
+        let r = i + 2;
+        rows.push_str(&format!(
+            r#"<row r="{r}"><c r="A{r}" s="{s}"><v>{v}</v></c></row>"#
+        ));
+    }
+    let book = |pr: &str| {
+        xlsx_styled(
+            &[("Даты", sheet_xml(None, &rows))],
+            None,
+            Some(styles.clone().into_bytes()),
+            pr,
+        )
+    };
+    let x = run(DocKind::Xlsx, &book(""), &Limits::default());
+    let text = all_text(&x);
+    for (v, s, want) in cells {
+        assert!(
+            text.contains(&format!("| {want} |")),
+            "{v} (стиль {s}) → {want}: {text}"
+        );
+    }
+    assert!(!text.contains("44270"), "{text}");
+    let page = sheet_page(
+        DocKind::Xlsx,
+        &book(""),
+        "",
+        2,
+        20,
+        &Limits::default(),
+        far(),
+    )
+    .unwrap();
+    let col: Vec<&str> = page.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(col[0], "01.11.2023");
+    assert_eq!(col[10], "2021-03-15");
+    // система 1904: тот же номер — на 1462 дня позже
+    let x = run(DocKind::Xlsx, &book(r#"date1904="1""#), &Limits::default());
+    assert!(
+        all_text(&x).contains("2027-11-02"),
+        "45231 в системе 1904: {}",
+        all_text(&x)
+    );
+    // книга без стилей — число
+    let plain = xlsx(&[("Даты", sheet_xml(None, &rows))], None);
+    assert!(all_text(&run(DocKind::Xlsx, &plain, &Limits::default())).contains("| 45231 |"));
 }
 
 #[test]
