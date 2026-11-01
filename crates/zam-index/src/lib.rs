@@ -45,8 +45,9 @@ pub use qdrant::{
 };
 pub use reindex::{ReindexCtx, ReindexReport, ReindexRequest, reindex};
 pub use vector::{
-    IndexFuture, IndexMeta, IndexPoint, LEVEL_ATTACHMENT, LEVEL_FOLDER, NAMESPACE_ZAM,
-    PointPayload, VectorFilter, VectorHit, VectorIndex, VectorScope, point_id,
+    ATTACH_PREFETCH, IndexFuture, IndexMeta, IndexPoint, LEVEL_ATTACHMENT, LEVEL_FOLDER,
+    NAMESPACE_ZAM, PointPayload, VectorFilter, VectorHit, VectorIndex, VectorScope,
+    attachment_window, point_id,
 };
 pub use worker::{
     PassageEmbedder, ReindexOutcome, SkippedDb, WorkerConfig, WorkerDeps, WorkerHandle,

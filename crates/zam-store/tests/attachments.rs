@@ -1277,3 +1277,62 @@ async fn search_channels_hide_hidden_attachment_docs() {
             .is_empty()
     );
 }
+
+/// Раунд 1 задачи 6 M5 (M-4): `index_state` хита вложения — документа (а не заметки-владельца):
+/// `pending`, пока ждёт извлечения или задания точек, `indexed` — без заданий в очереди;
+/// `pending_count` учитывает документы, ждущие извлечения или точек (Human — нет).
+#[tokio::test]
+async fn attachment_index_state_and_pending_count() {
+    use zam_store::{TargetFilter, pending_count, search_fts_channels};
+    let env = setup("index-state").await;
+    let n = note(&env.db, env.k, "p/x", "# X\n\nТекст.\n").await;
+    drop_jobs(&env.db).await;
+    // заметка без заданий — indexed (имитация воркера)
+    env.db
+        .write(move |t| {
+            t.execute(
+                "UPDATE nodes SET index_state = 'indexed' WHERE id = ?1",
+                [n],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(pending_count(&env.db, vec![env.k], None).await.unwrap(), 0);
+    put_attach(&env, n, b"doc", "doc.txt", Some(DocKind::Text)).await;
+    // документ ждёт извлечения
+    assert_eq!(pending_count(&env.db, vec![env.k], None).await.unwrap(), 1);
+    let d = doc_of(&list_attachments(&env.db, n).await.unwrap(), "doc.txt");
+    set_extract_state(&env.db, d.id, ExtractState::Done, None)
+        .await
+        .unwrap();
+    replace_attachment_chunks(&env.db, d.id, &units(&[("", "иттербий")]))
+        .await
+        .unwrap();
+    let state = || async {
+        let q = FtsQuery {
+            targets: TargetFilter::default(),
+            ..fts("иттербий", &[env.k])
+        };
+        let ch = search_fts_channels(&env.db, q).await.unwrap();
+        ch.bm25[0].index_state.clone()
+    };
+    // извлечён, задание точек в очереди — ещё не виден вектору
+    assert_eq!(
+        active_job(&env.db, "attachment", d.id).await.as_deref(),
+        Some("upsert")
+    );
+    assert_eq!(state().await, "pending");
+    assert_eq!(pending_count(&env.db, vec![env.k], None).await.unwrap(), 1);
+    drop_jobs(&env.db).await;
+    assert_eq!(state().await, "indexed");
+    assert_eq!(pending_count(&env.db, vec![env.k], None).await.unwrap(), 0);
+    // Human-вложение в Qdrant не попадает — в pending_count его нет
+    let h = note(&env.db, env.h, "h/y", "# Y\n").await;
+    let before = pending_count(&env.db, vec![env.h], None).await.unwrap();
+    put_attach(&env, h, b"hdoc", "h.txt", Some(DocKind::Text)).await;
+    assert_eq!(
+        pending_count(&env.db, vec![env.h], None).await.unwrap(),
+        before
+    );
+}

@@ -66,6 +66,23 @@ pub const CHUNK_REF_LETTER: &str = "a";
 pub fn chunk_ref(chunk_id: &str) -> String {
     format!("{CHUNK_REF_LETTER}:{chunk_id}")
 }
+
+/// Узел-владелец фрагмента вложения `chunk_id` живого документа (`attachment_docs.deleted_at IS
+/// NULL`); `None` — нет такого чанка вложения или документ скрыт. Права и живость узла проверяет
+/// вызывающий (источник выжимки `a:<chunk>` — заметка-владелец, задача 6 M5).
+pub async fn attachment_chunk_owner(db: &Db, chunk_id: String) -> Result<Option<Id>, StoreError> {
+    db.read(move |c| {
+        use rusqlite::OptionalExtension;
+        Ok(c.query_row(
+            "SELECT c.node_id FROM chunks c JOIN attachment_docs ad ON ad.id = c.attachment_id
+             WHERE c.id = ?1 AND ad.deleted_at IS NULL",
+            [chunk_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+    })
+    .await
+}
 /// Ревизия заданий и чанков вложения: у документа ревизий нет (содержимое блоба неизменно).
 const DOC_REV: i64 = 0;
 /// Уровень сжатия zstd `blob_extract.units`: быстрый, текст сжимается в 3–5 раз.

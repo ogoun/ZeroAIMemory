@@ -564,6 +564,7 @@ fn isolation_human_vault_and_solution_access() {
     assert!(hits(&j, "node_id").is_empty(), "{j}");
 
     // журнал и байты: Human и значение Vault — нет в logs/, значение — нигде на диске
+    common::process::wait_server_log(&data, "", Duration::from_secs(5));
     srv.kill();
     has_server_log(&data);
     for needle in [&human_word, &vault_value] {
@@ -816,6 +817,7 @@ fn secret_through_agent_audited_and_bound_to_master_key() {
     idle(&mut srv, &web);
 
     // байты каталога данных (базы с WAL, журнал) и хранилища Qdrant — без значения
+    common::process::wait_server_log(&data, "", Duration::from_secs(5));
     srv.kill();
     has_server_log(&data);
     let hits = files_containing(&data, value.as_bytes());

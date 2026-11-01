@@ -1098,6 +1098,8 @@ fn mcp_vault_value_not_in_debug_log() {
     };
     call(json!({"action": "set", "name": "github", "value": value}));
     assert!(call(json!({"action": "get", "name": "github"})).contains(value));
+    // журнал пишется фоновым потоком: kill без штатной остановки — сначала дождаться записи
+    common::process::wait_server_log(&data, "DEBUG", Duration::from_secs(5));
     srv.kill();
     let mut log = String::new();
     for e in std::fs::read_dir(data.join("logs")).unwrap().flatten() {

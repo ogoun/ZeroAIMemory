@@ -1388,13 +1388,20 @@ fn folder_json(p: &Packed, children: i64, mode: SearchMode, spaces: &HashMap<Id,
     Value::Object(o)
 }
 
-/// Подпись `locator` фрагмента вложения (`стр. 12`, `лист «Итоги» A1:F40`, …); `None` — без
-/// `locator` или он не разбирается.
+/// Подпись `locator` фрагмента вложения (`стр. 12`, `лист «Итоги» A1:F40`, …) со сканером
+/// секретов (имя листа — текст документа, как путь заголовков); `None` — без `locator` или он не
+/// разбирается.
 fn locator_text(a: &AttachmentHit) -> Option<String> {
     a.locator
         .as_deref()
         .and_then(|l| zam_docs::Locator::parse(l).ok())
-        .map(|l| l.label())
+        .map(|l| zam_markdown::mask_text(&l.label()))
+}
+
+/// `locator` фрагмента для карточки — со сканером секретов (имя листа). Сырой `locator` наружу не
+/// нужен: `/read a:<chunk>` (задача 7) берёт его из чанка по `chunk_id`.
+fn shown_locator(a: &AttachmentHit) -> Option<String> {
+    a.locator.as_deref().map(zam_markdown::mask_text)
 }
 
 fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Timestamp) -> Value {
@@ -1412,7 +1419,7 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Tim
             o.insert("attachment_id".into(), json!(a.id));
             o.insert("file".into(), json!(a.filename));
             o.insert("blob_sha256".into(), json!(a.blob_sha256));
-            o.insert("locator".into(), json!(a.locator));
+            o.insert("locator".into(), json!(shown_locator(a)));
             o.insert("locator_text".into(), json!(locator_text(a)));
         }
         (TargetKind::Node, _) => {
@@ -2613,6 +2620,16 @@ mod tests {
         assert_eq!(j["locator_text"], "стр. 12");
         assert_eq!(j["level"], "attachment");
         assert!(j.get("entry_id").is_none());
+        // секрет в имени листа маскируется и в `locator`, и в подписи (имя файла — как есть)
+        let mut s = h.clone();
+        s.attachment.as_mut().unwrap().locator = Some("sheet:AKIAIOSFODNN7EXAMPLE!A1:B2".into());
+        let p = card(s);
+        let j = item_json(&p, SearchMode::Brief, &HashMap::new(), now);
+        let md = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        for t in [j["locator"].to_string(), j["locator_text"].to_string(), md] {
+            assert!(!t.contains("AKIAIOSFODNN7EXAMPLE"), "{t}");
+        }
+        assert!(j["locator"].as_str().unwrap().ends_with("!A1:B2"), "{j}");
         // лист с диапазоном, слайд, абзац; без locator — без подписи
         for (loc, text) in [
             ("sheet:Итоги!A1:F40", "лист «Итоги» A1:F40"),

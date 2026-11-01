@@ -349,6 +349,27 @@ pub const LEVEL_FOLDER: &str = "folder";
 /// Уровень и вид точки чанка документа вложения (M5).
 pub const LEVEL_ATTACHMENT: &str = "attachment";
 
+/// Окно prefetch фрагментов вложений гибридного поиска (dense и sparse, M5, задача 6, раунд 1):
+/// свой prefetch, а не общий с листами — длинный документ (PDF на 100+ страниц) иначе занимал
+/// всё окно листов, и листы заметок выпадали из выдачи. Итоговый лимит слияния растёт на окно.
+pub const ATTACH_PREFETCH: usize = 30;
+
+/// Окно prefetch вложений для фильтра `f`: 0 — виды без `attachment` (или уровни без него); при
+/// `area`/`certainty` — вдвое (Qdrant эти условия у точек вложений не проверяет, часть окна
+/// отбросит SQLite по заметке-владельцу).
+pub fn attachment_window(f: &VectorFilter) -> usize {
+    let kind_ok = f.kinds.is_empty() || f.kinds.iter().any(|k| k == LEVEL_ATTACHMENT);
+    let level_ok = f.levels.is_empty() || f.levels.iter().any(|l| l == LEVEL_ATTACHMENT);
+    if !(kind_ok && level_ok) {
+        return 0;
+    }
+    if f.area.is_some() || !f.certainty.is_empty() {
+        2 * ATTACH_PREFETCH
+    } else {
+        ATTACH_PREFETCH
+    }
+}
+
 /// Поля payload, которые читает выдача поиска.
 pub(crate) const HIT_FIELDS: [&str; 6] = [
     "chunk_id",

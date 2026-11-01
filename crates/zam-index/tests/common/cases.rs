@@ -730,6 +730,143 @@ pub async fn upsert_requires_exactly_one_target(idx: &dyn VectorIndex) {
     assert_eq!(idx.ensure(MODEL, DIM).await.unwrap().points, 0);
 }
 
+/// Единичный вектор рядом с `vec_for(q)`: шум `eps` по `vec_for(seed)`.
+fn near(q: u64, seed: u64, eps: f32) -> Vec<f32> {
+    let (q, r) = (vec_for(q), vec_for(seed));
+    let v: Vec<f32> = q.iter().zip(&r).map(|(a, b)| a + eps * b).collect();
+    let n = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+    v.into_iter().map(|a| a / n).collect()
+}
+
+/// Точка фрагмента документа вложения `doc` узла `owner` (M5): `kind = level = attachment`,
+/// `area` — на момент извлечения, без `certainty`.
+fn attachment_point(ctx: &Ctx, owner: Id, doc: Id, chunk_id: &str, dense: Vec<f32>) -> IndexPoint {
+    let mut p = point(ctx, owner, chunk_id, 1, "docs/x", "attachment");
+    p.dense = dense;
+    p.sparse = vec![(1, 0.9), (1001, 0.3)];
+    p.payload.kind = "attachment".into();
+    p.payload.attachment_id = Some(doc);
+    p.payload.area = Some("b".into());
+    p
+}
+
+/// `(листов заметок, фрагментов вложений)` выдачи гибридного поиска по запросу `vec_for(1)`.
+async fn leaves_and_fragments(idx: &dyn VectorIndex, f: &VectorFilter) -> (usize, usize) {
+    let h = idx
+        .search(&vec_for(1), &[(1, 0.9), (1001, 0.3)], f)
+        .await
+        .unwrap();
+    let n = |p: &str| h.iter().filter(|x| x.chunk_id.starts_with(p)).count();
+    (n("leaf-"), n("att-"))
+}
+
+/// Длинный документ (200 фрагментов ближе к запросу, чем листы) не вытесняет листы заметок:
+/// у фрагментов вложений свой prefetch (задача 6 M5, раунд 1) — все 10 листов в выдаче, без
+/// фильтра и с `area`/`certainty` листов.
+pub async fn attachment_document_does_not_crowd_out_leaves(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let (owner, doc) = (Id::new(), Id::new());
+    let mut pts: Vec<IndexPoint> = (0..200)
+        .map(|i| {
+            attachment_point(
+                &ctx,
+                owner,
+                doc,
+                &format!("att-{i}"),
+                near(1, 1000 + i, 0.05),
+            )
+        })
+        .collect();
+    for i in 0..10 {
+        let mut p = point(&ctx, Id::new(), &format!("leaf-{i}"), 1, "notes/y", "chunk");
+        p.dense = near(1, 5000 + i, 0.6);
+        p.sparse = vec![(1, 0.5), (1001, 0.2)];
+        p.payload.area = Some("a".into());
+        p.payload.certainty = Some("axiom".into());
+        pts.push(p);
+    }
+    idx.upsert(pts).await.unwrap();
+    let base = filter(&ctx);
+    let (leaves, frags) = leaves_and_fragments(idx, &base).await;
+    eprintln!("CASE N=200: без фильтра — листов {leaves}/10, фрагментов {frags}");
+    assert_eq!(leaves, 10);
+    assert!(
+        frags > 0 && frags <= 2 * zam_index::ATTACH_PREFETCH,
+        "{frags}"
+    );
+    for f in [
+        VectorFilter {
+            area: Some("a".into()),
+            ..filter(&ctx)
+        },
+        VectorFilter {
+            certainty: vec!["axiom".into()],
+            ..filter(&ctx)
+        },
+    ] {
+        let (leaves, frags) = leaves_and_fragments(idx, &f).await;
+        eprintln!("CASE N=200: area/certainty — листов {leaves}/10, фрагментов {frags}");
+        assert_eq!(leaves, 10);
+        assert!(
+            frags > 0,
+            "фрагменты проходят условия владельца (их проверяет SQLite)"
+        );
+    }
+}
+
+/// Условия `area` и `certainty` в гибридном поиске для точек `attachment` не проверяются (они —
+/// заметки-владельца, проверяет SQLite), для листов — проверяются; `nearest_dense` и `count` —
+/// точные; виды и уровни без `attachment` фрагментов не дают.
+pub async fn attachment_prefetch_relaxes_owner_conditions(idx: &dyn VectorIndex) {
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let (owner, doc) = (Id::new(), Id::new());
+    let att = attachment_point(&ctx, owner, doc, "att-0", near(1, 7, 0.1));
+    let mut in_area = point(&ctx, Id::new(), "leaf-a", 1, "n/a", "chunk");
+    in_area.payload.area = Some("a".into());
+    in_area.payload.certainty = Some("axiom".into());
+    let mut out_area = point(&ctx, Id::new(), "leaf-b", 1, "n/b", "chunk");
+    out_area.payload.area = Some("b".into());
+    idx.upsert(vec![att, in_area, out_area]).await.unwrap();
+    let ids = |f: VectorFilter| async move { search_ids(idx, 1, &f).await };
+    assert_eq!(ids(filter(&ctx)).await, ["att-0", "leaf-a", "leaf-b"]);
+    let area = VectorFilter {
+        area: Some("a".into()),
+        ..filter(&ctx)
+    };
+    assert_eq!(ids(area.clone()).await, ["att-0", "leaf-a"]);
+    assert_eq!(nearest_ids(idx, 1, &area).await, ["leaf-a"]);
+    assert_eq!(idx.count(&area).await.unwrap(), 1);
+    let cert = VectorFilter {
+        certainty: vec!["axiom".into()],
+        ..filter(&ctx)
+    };
+    assert_eq!(ids(cert.clone()).await, ["att-0", "leaf-a"]);
+    assert_eq!(idx.count(&cert).await.unwrap(), 1);
+    let notes = VectorFilter {
+        kinds: vec!["note".into()],
+        ..filter(&ctx)
+    };
+    assert_eq!(ids(notes).await, ["leaf-a", "leaf-b"]);
+    let chunk = VectorFilter {
+        levels: vec!["chunk".into()],
+        ..filter(&ctx)
+    };
+    assert_eq!(ids(chunk).await, ["leaf-a", "leaf-b"]);
+    let only = VectorFilter {
+        kinds: vec!["attachment".into()],
+        ..filter(&ctx)
+    };
+    assert_eq!(ids(only).await, ["att-0"]);
+}
+
 /// Тест на каждый общий случай: `$make(короткое имя)` возвращает свежий индекс и охрану его
 /// окружения (процесс Qdrant или каталог Edge), которая живёт до конца теста.
 #[macro_export]
@@ -754,6 +891,8 @@ macro_rules! vector_index_cases {
             delete_targets_by_node_and_entry,
             nearest_dense_returns_cosine,
             upsert_requires_exactly_one_target,
+            attachment_document_does_not_crowd_out_leaves,
+            attachment_prefetch_relaxes_owner_conditions,
         );
     };
     (@each $make:path; $($name:ident,)*) => {

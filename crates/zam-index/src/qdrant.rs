@@ -14,9 +14,11 @@
 //! - точки документов вложений (M5): `kind = level = attachment`, `node_id` узла-владельца,
 //!   `attachment_id`, `blob_sha256`, `locator`. Удаление точек узла — по `node_id` при пустом
 //!   `attachment_id` (точки его вложений не задеваются), документа — по `attachment_id`.
-//!   Гибридный поиск берёт их листовым prefetch вместе с `chunk` (M5, задача 6); `certainty` и
-//!   `area` у вложения — заметки-владельца на момент поиска (проверяет SQLite), поэтому точки
-//!   уровня `attachment` эти условия фильтра проходят ([`owner_conditions`]);
+//!   Гибридный поиск берёт их своим prefetch dense и sparse (окно
+//!   [`crate::vector::attachment_window`], итоговый лимит растёт на него), листы — прежним
+//!   prefetch уровня `chunk` с точным фильтром: длинный документ не вытесняет листы заметок
+//!   (задача 6, раунд 1). `certainty` и `area` у вложения — заметки-владельца на момент поиска
+//!   (проверяет SQLite), поэтому prefetch вложений эти условия не проверяет ([`owner_conditions`]);
 //! - фильтр — дизъюнкция областей `(user_id, space_id ∈ …)` (`should`) и общие условия
 //!   (`must`, статусы — `must_not`), один для prefetch чанков и сводок;
 //! - с `VectorFilter::folders` (M3, канал папок §8.3) — ещё prefetch dense top-10 по точкам
@@ -61,7 +63,8 @@ use zam_core::{Id, TargetRef};
 use crate::IndexError;
 use crate::vector::{
     HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_ATTACHMENT, LEVEL_FOLDER, VectorFilter,
-    VectorHit, VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
+    VectorHit, VectorIndex, VectorScope, attachment_window, check_points, hit_target, point_id,
+    split_targets,
 };
 
 /// Имя коллекции (§6.4).
@@ -545,18 +548,47 @@ impl QdrantIndex {
         q_sparse: &[(u32, f32)],
         f: &VectorFilter,
     ) -> Result<Vec<VectorHit>, IndexError> {
-        // листы заметок и записей и фрагменты вложений — одним prefetch (M5, задача 6)
-        let leaf_levels = allowed_levels(&[LEVEL_CHUNK, LEVEL_ATTACHMENT], &f.levels);
+        let leaf_levels = allowed_levels(&[LEVEL_CHUNK], &f.levels);
         let note_levels = allowed_levels(&LEVELS_NOTE, &f.levels);
-        let (Some(leaf_filter), Some(note_filter)) = (
-            search_filter(f, &leaf_levels, true),
-            point_filter(f, &note_levels),
-        ) else {
+        let (Some(leaf_filter), Some(note_filter)) =
+            (point_filter(f, &leaf_levels), point_filter(f, &note_levels))
+        else {
             return Ok(Vec::new());
         };
 
         let mut q = QueryPointsBuilder::new(COLLECTION);
         let mut prefetches = 0;
+        let mut limit = QUERY_LIMIT;
+        // фрагменты вложений — своим prefetch dense и sparse (см. модуль)
+        let window = attachment_window(f) as u64;
+        if window > 0
+            && let Some(att_filter) = search_filter(f, &[LEVEL_ATTACHMENT.into()], true)
+        {
+            if !q_dense.is_empty() {
+                q = q.add_prefetch(
+                    PrefetchQueryBuilder::default()
+                        .query(Query::new_nearest(q_dense.to_vec()))
+                        .using(DENSE)
+                        .filter(att_filter.clone())
+                        .params(self.dense_params())
+                        .limit(window),
+                );
+                prefetches += 1;
+            }
+            if !q_sparse.is_empty() {
+                let mut sparse = PrefetchQueryBuilder::default()
+                    .query(Query::new_nearest(VectorInput::from(q_sparse)))
+                    .using(SPARSE)
+                    .filter(att_filter)
+                    .limit(window);
+                if self.exact {
+                    sparse = sparse.params(SearchParamsBuilder::default().exact(true));
+                }
+                q = q.add_prefetch(sparse);
+                prefetches += 1;
+            }
+            limit += window;
+        }
         if !leaf_levels.is_empty() && !q_dense.is_empty() {
             q = q.add_prefetch(
                 PrefetchQueryBuilder::default()
@@ -594,7 +626,6 @@ impl QdrantIndex {
         // точки папок — своим prefetch; лимит слияния растёт на его размер: папки не
         // занимают места чанков (каждая точка — только в одном prefetch, RRF не меняет
         // взаимный порядок остальных)
-        let mut limit = QUERY_LIMIT;
         if f.folders
             && !q_dense.is_empty()
             && let Some(folder_filter) = point_filter(&f.folder_filter(), &[LEVEL_FOLDER.into()])

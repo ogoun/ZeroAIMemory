@@ -46,7 +46,8 @@ use crate::IndexError;
 use crate::qdrant::{COLLECTION, DENSE, SCHEMA_VERSION, SPARSE};
 use crate::vector::{
     HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_ATTACHMENT, LEVEL_FOLDER, VectorFilter,
-    VectorHit, VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
+    VectorHit, VectorIndex, VectorScope, attachment_window, check_points, hit_target, point_id,
+    split_targets,
 };
 
 /// Файл метаданных шарда (аналог `metadata` коллекции Qdrant).
@@ -277,16 +278,33 @@ impl EdgeIndex {
         q_sparse: &[(u32, f32)],
         f: &VectorFilter,
     ) -> Result<Vec<VectorHit>, IndexError> {
-        // листы заметок и записей и фрагменты вложений — одним prefetch (как у managed)
-        let leaf_levels = allowed_levels(&[LEVEL_CHUNK, LEVEL_ATTACHMENT], &f.levels);
+        let leaf_levels = allowed_levels(&[LEVEL_CHUNK], &f.levels);
         let note_levels = allowed_levels(&LEVELS_NOTE, &f.levels);
-        let (Some(leaf_filter), Some(note_filter)) = (
-            search_filter(f, &leaf_levels, true),
-            point_filter(f, &note_levels),
-        ) else {
+        let (Some(leaf_filter), Some(note_filter)) =
+            (point_filter(f, &leaf_levels), point_filter(f, &note_levels))
+        else {
             return Ok(Vec::new());
         };
         let mut prefetches = Vec::new();
+        let mut limit = QUERY_LIMIT;
+        // фрагменты вложений — своим prefetch dense и sparse, лимит растёт на окно (как у managed)
+        let window = attachment_window(f);
+        if window > 0
+            && let Some(att_filter) = search_filter(f, &[LEVEL_ATTACHMENT.into()], true)
+        {
+            if !q_dense.is_empty() {
+                prefetches.push(prefetch(
+                    dense_query(q_dense),
+                    att_filter.clone(),
+                    Some(rescore()),
+                    window,
+                ));
+            }
+            if !q_sparse.is_empty() {
+                prefetches.push(prefetch(sparse_query(q_sparse)?, att_filter, None, window));
+            }
+            limit += window;
+        }
         if !leaf_levels.is_empty() && !q_dense.is_empty() {
             prefetches.push(prefetch(
                 dense_query(q_dense),
@@ -312,7 +330,6 @@ impl EdgeIndex {
             ));
         }
         // точки папок — своим prefetch, лимит растёт на его размер (как у managed)
-        let mut limit = QUERY_LIMIT;
         if f.folders
             && !q_dense.is_empty()
             && let Some(folder_filter) = point_filter(&f.folder_filter(), &[LEVEL_FOLDER.into()])

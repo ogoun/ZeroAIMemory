@@ -826,6 +826,7 @@ fn vault_values_not_in_fts_qdrant_logs() {
         Some(&json!({"title": "github", "data": {"type": "token"}, "secret": v})),
     );
     assert_eq!(code, 409);
+    common::process::wait_server_log(&data, "", Duration::from_secs(5));
     srv.kill();
     let logs = data.join("logs");
     assert!(

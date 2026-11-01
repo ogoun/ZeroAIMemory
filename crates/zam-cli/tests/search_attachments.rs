@@ -52,7 +52,16 @@ fn err(o: &Output) -> String {
 fn search_shows_attachment_cards() {
     let worker = assert_cmd::cargo::cargo_bin("zam-server");
     if !worker.is_file() {
-        eprintln!("нет {} — тест пропущен", worker.display());
+        // как `common::ml::have` у zam-server: в CI и с ZAM_REQUIRE_ML пропуск недопустим
+        assert!(
+            std::env::var_os("ZAM_REQUIRE_ML").is_none() && std::env::var_os("CI").is_none(),
+            "нет {}: соберите cargo build -p zam-server (или cargo test --workspace)",
+            worker.display()
+        );
+        eprintln!(
+            "SKIP search_shows_attachment_cards: нет {}",
+            worker.display()
+        );
         return;
     }
     let data = common::sandbox("cli-search-att", "data");

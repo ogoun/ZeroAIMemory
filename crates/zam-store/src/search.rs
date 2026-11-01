@@ -304,10 +304,23 @@ const TARGET_JOIN: &str = "LEFT JOIN nodes n ON n.id = c.node_id
 
 /// Колонки хита для [`hit_row`] (после [`TARGET_JOIN`]). У вложения время — привязки документа
 /// (`attachment_docs.created_at`: правка заметки текст файла не меняет), без `verified_at`.
+/// `index_state` вложения — документа (своего столбца нет): `indexed` — извлечён и заданий точек
+/// в очереди нет, `pending` — ждёт извлечения или точек, `failed` — задание неудачно, `excluded` —
+/// заметка `index: false`. Иначе фрагмент без точек понижался бы ослабленным bm25 как видимый
+/// вектору (задача 6 M5, раунд 1).
 const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.space_id),
     coalesce(n.path, ''), c.heading_path, c.rev,
     coalesce(ad.created_at, n.updated_at, e.updated_at), c.text,
-    c.level, c.token_count, coalesce(n.index_state, e.index_state), e.kind, e.status,
+    c.level, c.token_count,
+    CASE WHEN c.attachment_id IS NULL THEN coalesce(n.index_state, e.index_state)
+         WHEN n.index_state = 'excluded' THEN 'excluded'
+         WHEN EXISTS (SELECT 1 FROM index_jobs j WHERE j.target_kind = 'attachment'
+                      AND j.target_id = ad.id AND j.state = 'failed') THEN 'failed'
+         WHEN ad.extract_state = 'done' AND NOT EXISTS (SELECT 1 FROM index_jobs j
+                      WHERE j.target_kind = 'attachment' AND j.target_id = ad.id
+                        AND j.state IN ('queued', 'running')) THEN 'indexed'
+         ELSE 'pending' END,
+    e.kind, e.status,
     CASE WHEN json_type(e.data, '$.kind') = 'text' THEN json_extract(e.data, '$.kind') END,
     e.certainty, e.title, coalesce(n.area, e.area), coalesce(n.certainty, e.certainty),
     CASE WHEN c.attachment_id IS NULL THEN n.verified_at END,
@@ -1473,12 +1486,23 @@ const PENDING_COUNT_SQL: &str = "SELECT (SELECT count(*) FROM nodes n INDEXED BY
        AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/'))
      + (SELECT count(*) FROM entries e
         WHERE e.index_state = 'pending' AND e.deleted_at IS NULL AND ?2 IS NULL
-          AND e.space_id IN (SELECT value FROM json_each(?1)))";
+          AND e.space_id IN (SELECT value FROM json_each(?1)))
+     + (SELECT count(*) FROM attachment_docs ad
+        JOIN nodes n ON n.id = ad.node_id
+        JOIN spaces s ON s.id = n.space_id
+        WHERE ad.deleted_at IS NULL AND n.deleted_at IS NULL AND s.kind <> 'human'
+          AND n.index_state <> 'excluded'
+          AND n.space_id IN (SELECT value FROM json_each(?1))
+          AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
+          AND (ad.extract_state = 'pending'
+               OR EXISTS (SELECT 1 FROM index_jobs j WHERE j.target_kind = 'attachment'
+                          AND j.target_id = ad.id AND j.state IN ('queued', 'running'))))";
 
 /// Сколько живых заметок и записей журналов в `space_ids` (и под `path_prefix`, если задан;
 /// у записей пути нет — при префиксе они не считаются) ждут векторной индексации
 /// (`index_state = 'pending'`) — `pending_count` выдачи поиска. Заметки с `index: false`
-/// (`excluded`) не считаются.
+/// (`excluded`) не считаются. С M5 — и живые документы вложений живых заметок (кроме Human),
+/// ждущие извлечения или задания точек.
 pub async fn pending_count(
     db: &Db,
     space_ids: Vec<Id>,

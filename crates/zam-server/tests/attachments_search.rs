@@ -625,3 +625,52 @@ async fn participant_sees_only_solution_attachments() {
     assert!(!sources(hit).contains(&"vector"), "{hit}");
     a.st.shutdown().await;
 }
+
+/// Раунд 1 (M-3): источник выжимки `a:<chunk>` из карточки вложения — заметка-владелец
+/// (`n:<узел>`, `rev` карточки вложения отбрасывается); несуществующий фрагмент — 422
+/// `cache-source-not-found`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_source_attachment_maps_to_owner_note() {
+    let w = world("att-cache-src", false).await;
+    let a = &w.a;
+    let user = a.st.admin_id;
+    let node = note(
+        a,
+        &a.token,
+        "knowledge",
+        "c/заметка",
+        "# Заметка\n\nТекст.\n",
+        None,
+    )
+    .await;
+    upload(
+        a,
+        &a.token,
+        &node,
+        "лантан.docx",
+        &docx(&["Лантановый отчёт о печах."]),
+    )
+    .await;
+    wait_done(a, user, &node, "лантан.docx").await;
+    let j = search(a, &a.token, json!({"query": "лантановый"})).await;
+    let id = atts(&j)[0]["id"].as_str().unwrap().to_string();
+    let put = |sources: Value| {
+        let body = json!({"query": "лантан печи", "summary": "Отчёт о печах.", "sources": sources});
+        async move {
+            a.tok(&a.token, Method::POST, "/api/v1/cache", Some(body))
+                .await
+        }
+    };
+    let r = put(json!([{"id": id, "rev": 0}])).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(
+        r.json()["sources"][0]["id"],
+        format!("n:{node}"),
+        "{}",
+        r.text()
+    );
+    let r = put(json!([{"id": "a:00000000000000000000000000000000"}])).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert_eq!(r.json()["type"], "/problems/cache-source-not-found");
+    a.st.shutdown().await;
+}
