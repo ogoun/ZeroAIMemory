@@ -927,6 +927,10 @@ H: заполнился до 5 ГБ: `target/debug` вырос до 290 ГБ, и
   (лимит 2 ГиБ против пика ≈ 650 МиБ) и `PDEATHSIG` при остановке сервера во время разбора.
 - Проверки: полный прогон `cargo test --workspace --no-fail-fast` (Windows, с MiniLM, Qdrant и pdfium) — 1694 passed, 23 ignored, 1 failed: `blobs::attachments_list_and_detach` ждал `pending` у `.txt`, а конвейер теперь успевает его извлечь — ожидание исправлено на `pending | done`; после правки `-p zam-server --lib --test blobs --test attachments_index --test doc_worker` — 193 + 10 + 9 + 10 passed; `cargo clippy --workspace --all-targets -D warnings` (и `-p zam-index --features edge`), `cargo fmt --check` — чисто.
 
+### Обслуживание: профиль dev (2026-11-01)
+
+`target/debug` снова вырос на ~130 ГБ за 6 часов. В `Cargo.toml` профиль dev: `debug = "line-tables-only"` для своих крейтов, `debug = false` для зависимостей. Трассировки паник с файлом и строкой сохраняются; отладчику доступны только строки. Один полный пересбор.
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.

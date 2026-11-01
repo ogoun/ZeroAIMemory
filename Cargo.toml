@@ -118,6 +118,14 @@ windows-service = "=0.8.1"
 rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
+# Отладочная информация: у своих крейтов — только таблицы строк (трассировки паник с файлом и
+# строкой), у зависимостей — нет. Полная debuginfo раздувала target/debug до ~300 ГБ за двое
+# суток (десятки тестовых бинарников по сотне МБ на каждый хеш) и замедляла линковку.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = false
+
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]
