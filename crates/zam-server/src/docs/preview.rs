@@ -74,8 +74,24 @@ impl PreviewKey {
     }
 }
 
-/// Сколько помнится неудача построения превью (повтор не поднимает процесс заново).
+/// Сколько помнится неудача построения превью, свойство файла (`parse_error`, `too_large`,
+/// `unsupported`, не тот вид): повтор не поднимает процесс заново.
 pub const FAILURE_TTL: Duration = Duration::from_secs(300);
+/// Сколько помнится сбой процесса (`parse_timeout`, `parse_crash`, `parse_oom`): он может быть
+/// следствием нагрузки или остановки сервера, а не файла (ревью задачи 8 M5, раунд 2).
+pub const TRANSIENT_FAILURE_TTL: Duration = Duration::from_secs(45);
+
+/// Срок памяти неудачи по пояснению ответа 422.
+pub fn failure_ttl(detail: &str) -> Duration {
+    if ["parse_timeout", "parse_crash", "parse_oom"]
+        .iter()
+        .any(|c| detail.contains(c))
+    {
+        TRANSIENT_FAILURE_TTL
+    } else {
+        FAILURE_TTL
+    }
+}
 /// Записей в памяти неудач — не больше.
 const FAILURES_MAX: usize = 4096;
 
@@ -139,8 +155,8 @@ impl Previews {
         }
     }
 
-    /// Запоминает неудачу построения на [`FAILURE_TTL`]: сбой, срок и нехватка памяти процесса,
-    /// повреждённый файл — повтор того же запроса отвечает сразу, без нового процесса.
+    /// Запоминает неудачу построения на [`failure_ttl`] (свойство файла — 5 мин, сбой процесса —
+    /// 45 с): повтор того же запроса отвечает сразу, без нового процесса.
     pub fn remember_failure(&self, owner: Id, sha: &str, name: &str, detail: String) {
         let mut f = lock(&self.failures);
         let now = Instant::now();
@@ -150,9 +166,10 @@ impl Previews {
                 f.clear();
             }
         }
+        let ttl = failure_ttl(&detail);
         f.insert(
             (owner, sha.to_string(), name.to_string()),
-            (now + FAILURE_TTL, detail),
+            (now + ttl, detail),
         );
     }
 
@@ -412,6 +429,25 @@ mod tests {
             assert!(c.path(owner, &sha, bad).is_none(), "{bad}");
         }
         assert!(c.path(owner, "../..", "text.json").is_none());
+    }
+
+    #[test]
+    fn failure_ttl_by_reason() {
+        for d in [
+            "превью не построено: parse_timeout",
+            "превью не построено: parse_crash",
+            "превью не построено: parse_oom",
+        ] {
+            assert_eq!(failure_ttl(d), TRANSIENT_FAILURE_TTL, "{d}");
+        }
+        for d in [
+            "превью не построено: parse_error: xml (word/document.xml)",
+            "превью не построено: too_large",
+            "превью не построено: unsupported",
+            "превью листа недоступно для этого файла",
+        ] {
+            assert_eq!(failure_ttl(d), FAILURE_TTL, "{d}");
+        }
     }
 
     #[test]

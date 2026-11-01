@@ -2,8 +2,8 @@
 //! вики-ссылки, вложения, CSS подсветки и сверка `id` заголовков с comrak.
 
 use zam_markdown::{
-    LinkKind, LinkResolution, NoResolve, RENDER_VERSION, Rendered, Resolver, comrak_options,
-    highlight_css, outline, parse, render_html,
+    HIGHLIGHT_HTML_BUDGET_BYTES, HIGHLIGHT_LINE_MAX, LinkKind, LinkResolution, NoResolve,
+    RENDER_VERSION, Rendered, Resolver, comrak_options, highlight_css, outline, parse, render_html,
 };
 
 const SHA: &str = "0123456789abcdef";
@@ -41,8 +41,8 @@ fn html(src: &str) -> String {
 // ---------- Шаг 1: рендер ----------
 
 #[test]
-fn render_version_is_three() {
-    assert_eq!(RENDER_VERSION, 3);
+fn render_version_is_four() {
+    assert_eq!(RENDER_VERSION, 4);
 }
 
 #[test]
@@ -526,11 +526,12 @@ fn block_is_highlighted_only_if_it_fits_remaining_budget() {
     assert_eq!(h.matches("<pre class=\"hl-skipped\"").count(), 1);
     assert_eq!(h.matches("<pre class=\"hl-code\"").count(), 1);
 
-    // 200 КБ + 60 КБ: второй не помещается в остаток, третий (малый) помещается
+    // 150 КБ + 120 КБ: второй не помещается в остаток, третий (малый) помещается (150 КБ
+    // плотного кода — ~3,3 МБ HTML, в пределах бюджета HTML 4 МиБ; 200 КБ — уже нет)
     let src = format!(
         "{}{}```rust\nfn main() {{}}\n```\n",
-        rust_block(200 * 1024),
-        rust_block(60 * 1024)
+        rust_block(150 * 1024),
+        rust_block(120 * 1024)
     );
     let h = html(&src);
     assert_eq!(h.matches("<pre class=\"hl-code\"").count(), 2);
@@ -567,6 +568,48 @@ fn megabyte_note_with_large_code_blocks_renders_bounded() {
     if !cfg!(debug_assertions) {
         assert!(took < std::time::Duration::from_secs(1), "{took:?}");
     }
+}
+
+/// Бюджет HTML подсветки на документ (ревью задачи 8 M5, раунд 2): 1000 блоков JSON из `[`
+/// по 250 Б давали 25 МБ HTML и 16 с; теперь подсвеченного HTML не больше 4 МиБ, остальные
+/// блоки — экранированный текст `hl-skipped`.
+#[test]
+fn many_small_blowup_blocks_capped_by_html_budget() {
+    let block = format!("```json\n{}\n```\n\n", "[".repeat(250));
+    let src = block.repeat(1000);
+    let t = std::time::Instant::now();
+    let h = html(&src);
+    let took = t.elapsed();
+    let lit = h.matches("<pre class=\"hl-code\"").count();
+    let skipped = h.matches("<pre class=\"hl-skipped\"").count();
+    eprintln!(
+        "1000 блоков `[`: HTML {} байт, подсвечено {lit}, пропущено {skipped}, {took:?}",
+        h.len()
+    );
+    assert_eq!(lit + skipped, 1000);
+    assert!(lit > 0 && skipped > 0, "{lit} / {skipped}");
+    // подсвеченная часть ≤ бюджета, остальное — экранированный текст и обёртки
+    assert!(
+        h.len() <= HIGHLIGHT_HTML_BUDGET_BYTES + 2 * src.len() + 64 * skipped,
+        "HTML {} байт",
+        h.len()
+    );
+    if !cfg!(debug_assertions) {
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+}
+
+/// Строка длиннее `HIGHLIGHT_LINE_MAX` не подсвечивается: блок — экранированный текст.
+#[test]
+fn long_line_block_not_highlighted() {
+    let src = format!(
+        "```json\n{}\n```\n\n```rust\nfn main() {{}}\n```\n",
+        "[".repeat(HIGHLIGHT_LINE_MAX + 1)
+    );
+    let h = html(&src);
+    assert_eq!(h.matches("<pre class=\"hl-skipped\"").count(), 1);
+    assert_eq!(h.matches("<pre class=\"hl-code\"").count(), 1);
+    assert!(h.len() < 3 * src.len(), "{}", h.len());
 }
 
 #[test]

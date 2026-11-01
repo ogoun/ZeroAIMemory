@@ -26,6 +26,13 @@ const DARK_THEME: &str = "base16-ocean.dark";
 
 /// Сколько байт исходного кода подсвечивается на документ суммарно.
 pub const HIGHLIGHT_BUDGET_BYTES: usize = 256 * 1024;
+/// Сколько байт HTML подсветки строится на документ суммарно (ревью задачи 8 M5, раунд 2): без
+/// него надбавка «+64 КиБ» на каждый блок давала 1000 блокам `[` по 250 Б 25 МБ HTML и 16 с.
+/// Блок, разметка которого не помещается в остаток, — экранированный текст (`hl-skipped`).
+pub const HIGHLIGHT_HTML_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+/// Строка длиннее не подсвечивается (блок целиком — экранированный текст): предел проверяется
+/// после строки, и одна длинная строка временно раздувала бы разметку до десятков МБ.
+pub const HIGHLIGHT_LINE_MAX: usize = 16 * 1024;
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
@@ -42,23 +49,43 @@ pub(crate) enum Highlighted {
     Plain,
 }
 
-/// Подсвечивает `code` для языка `lang` (первое слово info-строки), списывая
-/// размер блока с `budget` (остаток бюджета документа).
-pub(crate) fn highlight(lang: &str, code: &str, budget: &mut usize) -> Highlighted {
+/// Остаток бюджетов подсветки документа: байт исходника и байт HTML.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Budget {
+    pub source: usize,
+    pub html: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget {
+            source: HIGHLIGHT_BUDGET_BYTES,
+            html: HIGHLIGHT_HTML_BUDGET_BYTES,
+        }
+    }
+}
+
+/// Подсвечивает `code` для языка `lang` (первое слово info-строки), списывая размер блока с
+/// бюджета исходника и фактический HTML — с бюджета HTML документа. Предел HTML блока —
+/// `min(40 × исходник + 64 КиБ, остаток бюджета HTML)`.
+pub(crate) fn highlight(lang: &str, code: &str, budget: &mut Budget) -> Highlighted {
     let Some(syntax) = syntax_for(lang) else {
         return Highlighted::Plain;
     };
-    if code.len() > *budget {
+    if code.len() > budget.source {
         return Highlighted::Skipped;
     }
-    *budget -= code.len();
-    // заметка: только отношение (исходник уже ограничен бюджетом документа)
+    budget.source -= code.len();
     let max = code
         .len()
         .saturating_mul(HIGHLIGHT_RATIO_MAX)
-        .saturating_add(64 * 1024);
+        .saturating_add(64 * 1024)
+        .min(budget.html);
     match highlight_with(syntax, code, max) {
-        Ok(html) => Highlighted::Html(html),
+        Ok(html) => {
+            budget.html -= html.len();
+            Highlighted::Html(html)
+        }
         // разметка раздулась сверх предела — как блок вне бюджета
         Err(Fail::TooLarge) => Highlighted::Skipped,
         Err(Fail::Syntect) => Highlighted::Plain,
@@ -102,6 +129,9 @@ enum Fail {
 /// строки — сверх `max` байт разбор прекращается сразу.
 fn highlight_with(syntax: &SyntaxReference, code: &str, max: usize) -> Result<String, Fail> {
     let ss = &*SYNTAXES;
+    if code.split('\n').any(|l| l.len() > HIGHLIGHT_LINE_MAX) {
+        return Err(Fail::TooLarge);
+    }
     let mut state = ParseState::new(syntax);
     let mut stack = ScopeStack::new();
     let mut open: usize = 0;
