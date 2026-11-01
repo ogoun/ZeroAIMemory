@@ -126,6 +126,10 @@ pub struct VectorFilter {
     /// (`level = kind = folder`, канал папок §8.3): фильтр точек папок — [`Self::folder_filter`].
     /// Остальные методы поле не читают.
     pub folders: bool,
+    /// Гибридный поиск: в области нет ни одного извлечённого документа вложения — prefetch
+    /// вложений не запускается ([`attachment_window`] = 0; вызывающий проверил SQLite: +1,8 мс к
+    /// p95 без пользы, замер ревью задачи 6 M5). Остальные методы поле не читают.
+    pub no_attachments: bool,
 }
 
 impl VectorFilter {
@@ -354,13 +358,14 @@ pub const LEVEL_ATTACHMENT: &str = "attachment";
 /// всё окно листов, и листы заметок выпадали из выдачи. Итоговый лимит слияния растёт на окно.
 pub const ATTACH_PREFETCH: usize = 30;
 
-/// Окно prefetch вложений для фильтра `f`: 0 — виды без `attachment` (или уровни без него); при
+/// Окно prefetch вложений для фильтра `f`: 0 — виды без `attachment` (или уровни без него) или
+/// в области нет извлечённых документов ([`VectorFilter::no_attachments`]); при
 /// `area`/`certainty` — вдвое (Qdrant эти условия у точек вложений не проверяет, часть окна
 /// отбросит SQLite по заметке-владельцу).
 pub fn attachment_window(f: &VectorFilter) -> usize {
     let kind_ok = f.kinds.is_empty() || f.kinds.iter().any(|k| k == LEVEL_ATTACHMENT);
     let level_ok = f.levels.is_empty() || f.levels.iter().any(|l| l == LEVEL_ATTACHMENT);
-    if !(kind_ok && level_ok) {
+    if f.no_attachments || !(kind_ok && level_ok) {
         return 0;
     }
     if f.area.is_some() || !f.certainty.is_empty() {
@@ -383,6 +388,35 @@ pub(crate) const HIT_FIELDS: [&str; 6] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Окно prefetch вложений: виды и уровни с `attachment` (пустые — все), вдвое при условиях
+    /// владельца, 0 — без документов в области (`no_attachments`, раунд правок 2 задачи 6 M5).
+    #[test]
+    fn attachment_window_rules() {
+        let f = VectorFilter::default();
+        assert_eq!(attachment_window(&f), ATTACH_PREFETCH);
+        let only_notes = VectorFilter {
+            kinds: vec!["note".into()],
+            ..VectorFilter::default()
+        };
+        assert_eq!(attachment_window(&only_notes), 0);
+        let chunk = VectorFilter {
+            levels: vec!["chunk".into()],
+            ..VectorFilter::default()
+        };
+        assert_eq!(attachment_window(&chunk), 0);
+        let area = VectorFilter {
+            area: Some("a".into()),
+            kinds: vec!["note".into(), "attachment".into()],
+            ..VectorFilter::default()
+        };
+        assert_eq!(attachment_window(&area), 2 * ATTACH_PREFETCH);
+        let none = VectorFilter {
+            no_attachments: true,
+            ..area
+        };
+        assert_eq!(attachment_window(&none), 0);
+    }
 
     #[test]
     fn namespace_is_documented_value() {

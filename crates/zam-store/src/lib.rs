@@ -44,9 +44,9 @@ pub use attachments::{
     TOO_LARGE, attachment_chunk_owner, attachment_chunker_fingerprint, attachment_chunks_for_index,
     attachment_pieces, cached_extract, chunk_ref, detach, enqueue_attachment_upserts,
     ensure_extract_jobs, error_code, extract_cached, extract_target, finish_extract,
-    has_failed_with, list_attachments, put_extract, put_extract_failure, rechunk_docs_if_stale,
-    reindex_attachments_page, reindex_docs, replace_attachment_chunks, requeue_failed_with,
-    set_extract_state,
+    has_extracted_attachments, has_failed_with, list_attachments, put_extract, put_extract_failure,
+    rechunk_docs_if_stale, reindex_attachments_page, reindex_docs, replace_attachment_chunks,
+    requeue_failed_with, set_extract_state,
 };
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_in_space,

@@ -1172,6 +1172,33 @@ BASE 52f6b8a. Поиск находит фрагменты DOCX/PDF/XLSX/PPTX (�
   `vault` 19, `m3_acceptance` 3, `search_multi` 9; `-p zam-cli`: `search_attachments` 1 (без SKIP),
   `repo_clean` 1.
 
+#### Задача 6 — раунд правок 2 (2026-11-01)
+
+Повторное ревью подтвердило I-1, M-2, M-4, M-5 и флейк; два новых замечания. Поверх 4d97bbe.
+
+- **Утечка id заметки-владельца в M-3.** `attachment_source` подставлял `n:<узел>` и передавал
+  отказы `resolve_source` как есть: участник, указав `a:<чанк Knowledge-документа владельца>`,
+  получал 422 «источник n:01M6…: не найден» — id скрытой заметки, а на несуществующий чанк —
+  другой ответ (оракул). Правка: `zam_store::attachment_chunk_owner(db, chunk, space)` — участнику
+  чанк ищется только в пространстве решения (и только живой заметки живого документа); любой отказ
+  по подставленной ссылке (кроме сбоя хранилища) — `cache-source-not-found` с исходной `a:<chunk>`.
+  Тест `cache_source_attachment_no_owner_id_leak`: ответ на чужой фрагмент совпадает с ответом на
+  несуществующий (с точностью до ссылки), `n:` и id заметки в теле нет; фрагмент пространства
+  решения принимается (`n:<узел решения>`).
+- **Латентность prefetch вложений (замер ревьюера: p95 по умолчанию 4,2 → 6,0 мс, +1,8 мс; с
+  `area` — +3,0 мс).** Поиск до запроса к Qdrant проверяет `zam_store::has_extracted_attachments`
+  (EXISTS: живой документ `done` живой заметки в векторных пространствах цели, без Human — по базе
+  на цель, до первого «да»); нет — `VectorFilter.no_attachments = true`, `attachment_window` = 0,
+  prefetch вложений не строится и лимит слияния не растёт. Сбой проверки — prefetch остаётся
+  (WARN). Кэш не вводился: проверка — проход по `attachment_docs` до первого совпадения (индекса по
+  `extract_state` нет — частичный индекс при больших базах, задача 10), а кэш потребовал бы инвалидации на загрузку, удаление, перенос и смену `extract_state`. Тесты:
+  unit `attachment_window_rules` (`zam-index`), store `has_extracted_attachments_by_space`.
+  Повторный замер латентности — на корпусе задачи 10.
+- Проверки (Windows, MiniLM + Qdrant + pdfium): `cargo fmt --check`, `cargo clippy --workspace
+  --all-targets -D warnings`, `clippy -p zam-index --features edge` — чисто; `-p zam-index`: lib 39
+  (+1), `qdrant` 30, `edge` 24 (1 ignored); `-p zam-store`: `attachments` 17 (+1), `search` 23;
+  `-p zam-server`: `attachments_search` 8 (+1), `cache_api` 8, `search` 13, `hybrid` 7.
+
 ### Ошибка контроллера: коммит 5c9cabf (2026-11-01)
 
 Коммит `5c9cabf docs(m5.5): права участника на отчёты` сделан контроллером через `git commit -am`

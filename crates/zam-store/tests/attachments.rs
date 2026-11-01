@@ -1336,3 +1336,51 @@ async fn attachment_index_state_and_pending_count() {
         before
     );
 }
+
+/// Раунд правок 2 задачи 6 M5: `has_extracted_attachments` — есть ли в пространствах извлечённый
+/// живой документ живой заметки (иначе поиск не запускает prefetch вложений в Qdrant).
+#[tokio::test]
+async fn has_extracted_attachments_by_space() {
+    use zam_store::has_extracted_attachments;
+    let env = setup("has-extracted").await;
+    assert!(
+        !has_extracted_attachments(&env.db, vec![env.k])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !has_extracted_attachments(&env.db, Vec::new())
+            .await
+            .unwrap()
+    );
+    let n = note(&env.db, env.k, "p/z", "# Z\n").await;
+    put_attach(&env, n, b"doc", "doc.txt", Some(DocKind::Text)).await;
+    // ещё не извлечён
+    assert!(
+        !has_extracted_attachments(&env.db, vec![env.k])
+            .await
+            .unwrap()
+    );
+    let d = doc_of(&list_attachments(&env.db, n).await.unwrap(), "doc.txt");
+    set_extract_state(&env.db, d.id, ExtractState::Done, None)
+        .await
+        .unwrap();
+    assert!(
+        has_extracted_attachments(&env.db, vec![env.k])
+            .await
+            .unwrap()
+    );
+    // другое пространство — нет
+    assert!(
+        !has_extracted_attachments(&env.db, vec![env.h])
+            .await
+            .unwrap()
+    );
+    // узел удалён — документ скрыт
+    delete_node(&env.db, n, AuthorKind::Human).await.unwrap();
+    assert!(
+        !has_extracted_attachments(&env.db, vec![env.k])
+            .await
+            .unwrap()
+    );
+}

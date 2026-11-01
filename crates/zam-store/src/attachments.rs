@@ -67,16 +67,45 @@ pub fn chunk_ref(chunk_id: &str) -> String {
     format!("{CHUNK_REF_LETTER}:{chunk_id}")
 }
 
+/// Есть ли в пространствах `spaces` хоть один извлечённый (`done`) живой документ вложения живой
+/// заметки — кандидат точек Qdrant. Поиск по ней решает, запускать ли prefetch вложений (раунд
+/// правок 2 задачи 6 M5). Human вызывающий в `spaces` не передаёт. Пустой список — `false`.
+pub async fn has_extracted_attachments(db: &Db, spaces: Vec<Id>) -> Result<bool, StoreError> {
+    if spaces.is_empty() {
+        return Ok(false);
+    }
+    let list =
+        serde_json::Value::from(spaces.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        Ok(c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM attachment_docs ad JOIN nodes n ON n.id = ad.node_id
+             WHERE ad.extract_state = 'done' AND ad.deleted_at IS NULL AND n.deleted_at IS NULL
+               AND n.space_id IN (SELECT value FROM json_each(?1)))",
+            [list],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+}
+
 /// Узел-владелец фрагмента вложения `chunk_id` живого документа (`attachment_docs.deleted_at IS
-/// NULL`); `None` — нет такого чанка вложения или документ скрыт. Права и живость узла проверяет
-/// вызывающий (источник выжимки `a:<chunk>` — заметка-владелец, задача 6 M5).
-pub async fn attachment_chunk_owner(db: &Db, chunk_id: String) -> Result<Option<Id>, StoreError> {
+/// NULL`) живой заметки; `space` — только в этом пространстве (участник общего решения видит
+/// лишь пространство решения). `None` — нет такого чанка, документ или заметка скрыты, другое
+/// пространство. Права проверяет вызывающий (источник выжимки `a:<chunk>`, задача 6 M5).
+pub async fn attachment_chunk_owner(
+    db: &Db,
+    chunk_id: String,
+    space: Option<Id>,
+) -> Result<Option<Id>, StoreError> {
     db.read(move |c| {
         use rusqlite::OptionalExtension;
         Ok(c.query_row(
-            "SELECT c.node_id FROM chunks c JOIN attachment_docs ad ON ad.id = c.attachment_id
-             WHERE c.id = ?1 AND ad.deleted_at IS NULL",
-            [chunk_id],
+            "SELECT c.node_id FROM chunks c
+             JOIN attachment_docs ad ON ad.id = c.attachment_id
+             JOIN nodes n ON n.id = c.node_id
+             WHERE c.id = ?1 AND ad.deleted_at IS NULL AND n.deleted_at IS NULL
+               AND (?2 IS NULL OR n.space_id = ?2)",
+            rusqlite::params![chunk_id, space],
             |r| r.get(0),
         )
         .optional()?)

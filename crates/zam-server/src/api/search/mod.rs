@@ -1906,6 +1906,22 @@ fn session_failed(what: &str, e: &StoreError) {
     tracing::warn!(error = %e, "поиск: {what} сессии не выполнено, ответ без пометок seen");
 }
 
+/// Есть ли в векторных пространствах (без Human) целей извлечённый документ вложения. Сбой
+/// чтения — `true` (prefetch вложений остаётся; WARN без текста).
+async fn any_attachments(targets: &[SearchTarget]) -> bool {
+    for t in targets {
+        match zam_store::has_extracted_attachments(&t.db, t.vector_space_ids()).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "поиск: проверка вложений не удалась, prefetch остаётся");
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Расширения запроса словарём для цели `tg`; сбой чтения словаря поиск не валит (WARN без
 /// текста запроса, расширения нет).
 async fn alias_expansion(st: &AppState, tg: &SearchTarget, qterms: &[&str]) -> Vec<Expansion> {
@@ -2016,12 +2032,17 @@ pub async fn search(
         if !run_vector {
             return VectorRun::default();
         }
-        let filter = vector_filter(
+        let mut filter = vector_filter(
             scopes.clone(),
             prefix.clone(),
             &kinds,
             want_folders || folder_channel,
         );
+        // prefetch вложений — только если в области есть извлечённые документы (одна проверка
+        // EXISTS по базе цели: +1,8 мс к p95 без пользы, раунд правок 2 задачи 6)
+        if zam_index::attachment_window(&filter) > 0 {
+            filter.no_attachments = !any_attachments(&targets).await;
+        }
         vector_channel(&st.index, filter, req.query.clone()).await
     };
     // заметки области всех целей, ещё не прошедшие векторную индексацию (без `index: false`

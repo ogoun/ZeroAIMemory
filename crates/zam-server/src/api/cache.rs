@@ -318,7 +318,10 @@ async fn resolve_source(
 }
 
 /// Источник `a:<chunk>` (фрагмент вложения) → заметка-владелец (см. модуль): узел ищется в базе
-/// кэша, затем в своей; дальше — проверки `n:<узел>` ([`resolve_source`]). `None` — не `a:`.
+/// кэша (участнику — только в пространстве решения), затем в своей; дальше — проверки
+/// `n:<узел>` ([`resolve_source`]). `None` — не `a:`. Любой отказ — `cache-source-not-found` с
+/// исходной ссылкой `a:<chunk>`: id заметки-владельца в ответ не попадает, а существующий, но
+/// недоступный фрагмент неотличим от несуществующего (раунд правок 2 задачи 6).
 async fn attachment_source(
     st: &AppState,
     p: &Principal,
@@ -333,12 +336,21 @@ async fn attachment_source(
     else {
         return Ok(None);
     };
-    let (_, own) = user_db(st, p, headers).await?;
-    for db in [&sc.db, &own] {
-        if let Some(node) = zam_store::attachment_chunk_owner(db, chunk.to_string()).await? {
-            return resolve_source(st, p, headers, sc, &format!("n:{node}"))
-                .await
-                .map(Some);
+    let (me, own) = user_db(st, p, headers).await?;
+    let member = matches!(sc.role, Role::Member(_));
+    let mut dbs: Vec<(&Db, Option<Id>)> = vec![(&sc.db, member.then_some(sc.space.id))];
+    if me.id != sc.owner {
+        dbs.push((&own, None));
+    }
+    for (db, space) in dbs {
+        if let Some(node) = zam_store::attachment_chunk_owner(db, chunk.to_string(), space).await? {
+            return match resolve_source(st, p, headers, sc, &format!("n:{node}")).await {
+                Ok(t) => Ok(Some(t)),
+                // любой отказ по подставленной ссылке (нет, удалён, другая база, Human, нет
+                // доступа) — как «нет фрагмента», без id узла; сбой хранилища — как есть
+                Err(e @ (ApiError::Internal(_) | ApiError::Unavailable(_))) => Err(e),
+                Err(_) => Err(not_found(raw)),
+            };
         }
     }
     Err(not_found(raw))

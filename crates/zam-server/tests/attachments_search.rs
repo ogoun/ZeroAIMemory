@@ -674,3 +674,95 @@ async fn cache_source_attachment_maps_to_owner_note() {
     assert_eq!(r.json()["type"], "/problems/cache-source-not-found");
     a.st.shutdown().await;
 }
+
+/// Раунд 2 (утечка id в M-3): участник общего решения, передав источником выжимки решения
+/// фрагмент Knowledge-документа владельца, получает тот же 422, что и на несуществующий
+/// фрагмент, — без `n:<id>` заметки владельца; фрагмент пространства решения принимается.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_source_attachment_no_owner_id_leak() {
+    let w = world("att-cache-leak", false).await;
+    let a = &w.a;
+    let owner = a.st.admin_id;
+    const G2: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e78";
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    let reg = json!({"agent_solution_id": G2, "name": "Общее"});
+    let r = a
+        .tok(
+            &a.token,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(reg.clone()),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = a
+        .tok(&b_tok, Method::POST, "/api/v1/solutions", Some(reg))
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let uri = format!("/api/v1/solutions/{G2}/access/{b_id}/approve");
+    let r = a.tok(&a.token, Method::POST, &uri, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let k = note(
+        a,
+        &a.token,
+        "knowledge",
+        "p/скрытая",
+        "# Скрытая\n\nК.\n",
+        None,
+    )
+    .await;
+    let s = note(a, &a.token, G2, "p/общая", "# Общая\n\nР.\n", None).await;
+    upload(
+        a,
+        &a.token,
+        &k,
+        "k.docx",
+        &docx(&["Скандиевый секрет владельца."]),
+    )
+    .await;
+    upload(
+        a,
+        &a.token,
+        &s,
+        "s.docx",
+        &docx(&["Скандиевый отчёт решения."]),
+    )
+    .await;
+    let dk = wait_done(a, owner, &k, "k.docx").await;
+    let ds = wait_done(a, owner, &s, "s.docx").await;
+    let ck = format!("a:{}", chunk_locators(a, owner, dk.id).await[0].0);
+    let cs = format!("a:{}", chunk_locators(a, owner, ds.id).await[0].0);
+    let b_tok = b_tok.as_str();
+    let put = |id: String| {
+        let body = json!({"query": "скандий", "summary": "Скандий.", "solution": G2,
+                          "sources": [{"id": id}]});
+        async move {
+            a.tok(b_tok, Method::POST, "/api/v1/cache", Some(body))
+                .await
+        }
+    };
+    let hidden = put(ck.clone()).await;
+    let fake = "a:0123456789abcdef0123456789abcdef";
+    let missing = put(fake.into()).await;
+    assert_eq!(
+        hidden.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        hidden.text()
+    );
+    assert_eq!(missing.status, hidden.status);
+    assert!(
+        !hidden.text().contains("n:") && !hidden.text().contains(&k),
+        "{}",
+        hidden.text()
+    );
+    // ответы неотличимы: тело то же с точностью до ссылки
+    assert_eq!(
+        hidden.text().replace(&ck, "REF"),
+        missing.text().replace(fake, "REF")
+    );
+    let ok = put(cs).await;
+    assert_eq!(ok.status, StatusCode::CREATED, "{}", ok.text());
+    assert_eq!(ok.json()["sources"][0]["id"], format!("n:{s}"));
+    a.st.shutdown().await;
+}
