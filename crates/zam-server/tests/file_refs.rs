@@ -1166,3 +1166,33 @@ async fn supersede_inherits_ref_solution_and_state() {
     let idx = index(&a).await;
     assert_eq!(state(&idx, "src/pool.rs", &format!("i:{v2}")), "ok");
 }
+
+/// Раунд правок 1 задачи 7 M5 (M-2): цель, повторённая в пачке `/read` (два уровня одной записи),
+/// получает устаревшие пути в каждом элементе, а не только в первом.
+#[tokio::test]
+async fn read_repeated_target_keeps_stale_refs() {
+    let a = setup("refs-read-repeat").await;
+    let i = insight(
+        &a,
+        "Кэш парсера портится",
+        json!({"files": [{"path": "src/parse.rs", "hash": h('1')}]}),
+    )
+    .await;
+    changed(&a, json!([{"path": "src/parse.rs", "hash": h('2')}])).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/read",
+            Some(
+                json!({"items": [{"id": format!("i:{i}")}, {"id": format!("i:{i}"), "tier": "L1"},
+                                  {"id": format!("i:{i}"), "tier": "L0"}]}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let items = r.json()["items"].as_array().unwrap().clone();
+    assert_eq!(items.len(), 3);
+    for it in &items {
+        assert_eq!(it["stale_refs"], json!(["src/parse.rs"]), "{it}");
+    }
+}

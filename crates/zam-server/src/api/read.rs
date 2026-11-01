@@ -225,6 +225,9 @@ struct Fetched {
     /// Ключи выданного сессии (у вложения — `locator` каждой выданной единицы).
     seen: Vec<SeenKey>,
     content: Content,
+    /// Токены текста, не прочитанные из базы (за пределом бюджета, M-4): входят в размер
+    /// элемента, текст считается обрезанным.
+    omitted: usize,
     /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
     stale_refs: Vec<String>,
     /// Цель, чьи устаревшие ссылки нужны: база и ссылка (собираются одним запросом на базу).
@@ -472,6 +475,7 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
             part: WHOLE_TARGET.to_string(),
         }],
         content,
+        omitted: 0,
         stale_refs: Vec::new(),
         stale_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
@@ -572,6 +576,7 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
             part: WHOLE_TARGET.to_string(),
         }],
         content,
+        omitted: 0,
         stale_refs: Vec::new(),
         stale_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
@@ -648,7 +653,8 @@ async fn fill_stale_refs(fetched: &mut [Result<Fetched, (String, Fail)>]) -> Res
     }
     for f in fetched.iter_mut().flatten() {
         if let Some((owner, _, r)) = f.stale_key.take() {
-            f.stale_refs = stale.remove(&(owner, r)).unwrap_or_default();
+            // цель может повторяться в пачке (две секции одной заметки) — путь у каждого элемента
+            f.stale_refs = stale.get(&(owner, r)).cloned().unwrap_or_default();
         }
     }
     Ok(())
@@ -676,34 +682,81 @@ fn parse_locator(v: Option<&Value>) -> Result<Option<Locator>, ApiError> {
     }
 }
 
-/// Адрес из `locator` чанка: сырой и (если сканер секретов его меняет) замаскированный — лист
-/// из оглавления, где имя замаскировано, тоже находится.
-fn chunk_locators(raw: &str) -> Vec<Locator> {
-    let mut out: Vec<Locator> = Locator::parse(raw).into_iter().collect();
-    let masked = mask_text(raw);
-    if masked != raw
-        && let Ok(l) = Locator::parse(&masked)
-    {
-        out.push(l);
-    }
-    out
+/// Листы документа в порядке их первых единиц: номер листа с 1 (`sheet:#N`). Номер в чанках не
+/// хранится — выводится из порядка единиц (листы идут по порядку книги, блоки листа — подряд);
+/// лист без единиц (пустой) номера не получает (раунд правок 1 задачи 7 M5).
+struct Sheets {
+    /// Имена листов по номеру (`names[N - 1]`).
+    names: Vec<String>,
 }
 
-/// Чанки документа, относящиеся к `want`: пересечение адресов ([`Locator::overlaps`]); абзац
-/// внутри блока DOCX (номера нет среди начал блоков) — блок с ближайшим меньшим началом.
+impl Sheets {
+    fn of(heads: &[zam_store::DocChunkHead]) -> Sheets {
+        let mut names: Vec<String> = Vec::new();
+        for h in heads {
+            if let Some(Locator::Sheet { name, .. }) =
+                h.locator.as_deref().and_then(|r| Locator::parse(r).ok())
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        Sheets { names }
+    }
+
+    fn no(&self, name: &str) -> Option<u32> {
+        let i = self.names.iter().position(|n| n == name)?;
+        u32::try_from(i + 1).ok()
+    }
+
+    /// Адрес запроса в сырой форме чанков: `sheet:#N` — лист N по имени; номер вне документа —
+    /// `None` (части нет).
+    fn resolve(&self, l: &Locator) -> Option<Locator> {
+        match l {
+            Locator::SheetNo { no, range } => {
+                let name = self.names.get(usize::try_from(*no).ok()?.checked_sub(1)?)?;
+                Some(Locator::Sheet {
+                    name: name.clone(),
+                    range: range.clone(),
+                })
+            }
+            other => Some(other.clone()),
+        }
+    }
+
+    /// Показ адреса и подпись: лист, имя которого сканер секретов меняет, — по номеру
+    /// (`sheet:#2!A1:F40`, «лист №2 «‹маска›» A1:F40»): у двух листов с секретами одинаковая
+    /// маска, номер их различает. Прочие — как есть (через сканер секретов).
+    fn shown(&self, l: &Locator) -> (String, String) {
+        if let Locator::Sheet { name, range } = l {
+            let masked = mask_text(name);
+            if masked != *name
+                && let Some(no) = self.no(name)
+            {
+                return (
+                    format!("sheet:#{no}!{range}"),
+                    format!("лист №{no} «{masked}» {range}"),
+                );
+            }
+        }
+        (mask_text(&l.render()), mask_text(&l.label()))
+    }
+}
+
+/// Чанки документа, относящиеся к `want` (сырой адрес, [`Sheets::resolve`]): пересечение
+/// адресов ([`Locator::overlaps`]) — по сырым `locator` чанков, не по маске; абзац внутри блока
+/// DOCX (номера нет среди начал блоков) — блок с ближайшим меньшим началом.
 fn select(heads: &[zam_store::DocChunkHead], want: &Locator) -> Vec<i64> {
-    let parsed: Vec<(i64, Vec<Locator>)> = heads
+    let parsed: Vec<(i64, Option<Locator>)> = heads
         .iter()
         .map(|h| {
-            (
-                h.ordinal,
-                h.locator.as_deref().map(chunk_locators).unwrap_or_default(),
-            )
+            let l = h.locator.as_deref().and_then(|r| Locator::parse(r).ok());
+            (h.ordinal, l)
         })
         .collect();
     let hit: Vec<i64> = parsed
         .iter()
-        .filter(|(_, ls)| ls.iter().any(|l| l.overlaps(want)))
+        .filter(|(_, l)| l.as_ref().is_some_and(|l| l.overlaps(want)))
         .map(|(o, _)| *o)
         .collect();
     if !hit.is_empty() {
@@ -714,19 +767,18 @@ fn select(heads: &[zam_store::DocChunkHead], want: &Locator) -> Vec<i64> {
     };
     let start = parsed
         .iter()
-        .flat_map(|(_, ls)| ls.iter())
-        .filter_map(|l| match l {
-            Locator::Para(s) if s <= n => Some(*s),
+        .filter_map(|(_, l)| match l {
+            Some(Locator::Para(s)) if s <= n => Some(*s),
             _ => None,
         })
         .max();
     let Some(start) = start else {
         return hit;
     };
-    let block = Locator::Para(start);
+    let block = Some(Locator::Para(start));
     parsed
         .iter()
-        .filter(|(_, ls)| ls.contains(&block))
+        .filter(|(_, l)| *l == block)
         .map(|(o, _)| *o)
         .collect()
 }
@@ -772,12 +824,13 @@ fn first_line(t: &str) -> String {
 }
 
 /// Оглавление документа: части по порядку (страница, слайд, абзац-начало блока; лист — одной
-/// строкой с объединённым диапазоном блоков), первая строка части, подсказка `locator`. Не больше
-/// [`TOC_MAX_ENTRIES`] частей.
+/// строкой с объединённым диапазоном блоков, с секретом в имени — по номеру), первая строка части,
+/// подсказка `locator`. Не больше [`TOC_MAX_ENTRIES`] частей.
 async fn toc(
     db: &zam_store::Db,
     att: Id,
     heads: &[zam_store::DocChunkHead],
+    sheets: &Sheets,
 ) -> Result<String, Failure> {
     // (адрес, первый чанк, путь заголовков)
     let mut parts: Vec<(Locator, i64, &str)> = Vec::new();
@@ -818,7 +871,7 @@ async fn toc(
         } else {
             format!("[{}] ", first_line(heading))
         };
-        out.push_str(&format!("- {} — {head}{line}\n", mask_text(&l.render())));
+        out.push_str(&format!("- {} — {head}{line}\n", sheets.shown(l).0));
     }
     if parts.len() > shown {
         out.push_str(&format!("…ещё {} частей\n", parts.len() - shown));
@@ -826,19 +879,48 @@ async fn toc(
     if let Some((l, _, _)) = parts.first() {
         out.push_str(&format!(
             "Часть документа: тот же id и locator из списка (например, \"{}\").\n",
-            mask_text(&l.render())
+            sheets.shown(l).0
         ));
     }
     Ok(out)
 }
 
-/// Вложение: текст по `locator` (явному или фрагмента `a:`) либо оглавление.
+/// Начало выбранных чанков, которое читается из базы: накопленный `token_count` до `limit`
+/// (первый чанк — всегда, чанк, переходящий предел, — тоже: упаковка обрежет его по токенам) и
+/// сколько токенов не прочитано (раунд правок 1 задачи 7 M5, M-4: лист на 60 000 строк не
+/// поднимается в память целиком ради бюджета в 1500 токенов).
+fn within_budget(
+    heads: &[zam_store::DocChunkHead],
+    ordinals: &[i64],
+    limit: usize,
+) -> (Vec<i64>, usize) {
+    let tokens: HashMap<i64, usize> = heads
+        .iter()
+        .map(|h| (h.ordinal, usize::try_from(h.token_count).unwrap_or(0)))
+        .collect();
+    let mut taken = Vec::new();
+    let (mut sum, mut omitted) = (0usize, 0usize);
+    for o in ordinals {
+        let t = tokens.get(o).copied().unwrap_or(0);
+        if taken.is_empty() || sum < limit {
+            taken.push(*o);
+            sum += t;
+        } else {
+            omitted += t;
+        }
+    }
+    (taken, omitted)
+}
+
+/// Вложение: текст по `locator` (явному или фрагмента `a:`) либо оглавление; текст читается не
+/// дальше `limit` токенов ([`within_budget`]).
 async fn fetch_attachment(
     sc: AttachmentScope,
     reference: String,
     it: &ReadItem,
     tier: Tier,
     locator: Option<Locator>,
+    limit: usize,
 ) -> Result<Fetched, Failure> {
     let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
     if section || it.since_rev.is_some() {
@@ -859,6 +941,8 @@ async fn fetch_attachment(
             .flatten()
     });
     let mut parts: Vec<String> = Vec::new();
+    let mut omitted = 0usize;
+    let mut shown: Option<(String, String)> = None;
     let content = if it.if_rev == Some(DOC_REV) {
         Content::Unchanged
     } else {
@@ -872,19 +956,28 @@ async fn fetch_attachment(
                 )),
             )));
         }
+        let sheets = Sheets::of(&heads);
         match &want {
-            None => Content::plain(toc(&sc.db, doc.id, &heads).await?, false),
+            None => Content::plain(toc(&sc.db, doc.id, &heads, &sheets).await?, false),
             Some(w) => {
-                let ordinals = select(&heads, w);
+                let raw = sheets.resolve(w);
+                let ordinals = raw.as_ref().map(|r| select(&heads, r)).unwrap_or_default();
+                let show = match &raw {
+                    Some(r) => sheets.shown(r),
+                    None => (mask_text(&w.render()), mask_text(&w.label())),
+                };
                 if ordinals.is_empty() {
                     return Err(Failure::Item(Fail::new(
                         "not_found",
                         Some(format!(
                             "в документе нет части {}: оглавление — без locator",
-                            mask_text(&w.render())
+                            show.0
                         )),
                     )));
                 }
+                shown = Some(show);
+                let (ordinals, rest) = within_budget(&heads, &ordinals, limit);
+                omitted = rest;
                 // выдаются единицы целиком: в сессии — `locator` каждой (как у карточек поиска)
                 let chosen: HashSet<i64> = ordinals.iter().copied().collect();
                 let mut uniq: HashSet<&str> = HashSet::new();
@@ -900,6 +993,11 @@ async fn fetch_attachment(
             }
         }
     };
+    // `unchanged` (текста нет) — адрес как в запросе
+    let shown = shown.or_else(|| {
+        want.as_ref()
+            .map(|w| (mask_text(&w.render()), mask_text(&w.label())))
+    });
     let mut warnings = Vec::new();
     if sc.others > 0 {
         warnings.push(format!(
@@ -938,6 +1036,7 @@ async fn fetch_attachment(
             })
             .collect(),
         content,
+        omitted,
         stale_refs: Vec::new(),
         stale_key: None,
         att: Some(AttMeta {
@@ -945,8 +1044,8 @@ async fn fetch_attachment(
             attachment_id: doc.id,
             node_id: doc.node_id,
             blob_sha256: doc.blob_sha256.clone(),
-            locator: want.as_ref().map(|l| mask_text(&l.render())),
-            locator_text: want.as_ref().map(|l| mask_text(&l.label())),
+            locator: shown.as_ref().map(|s| s.0.clone()),
+            locator_text: shown.map(|s| s.1),
         }),
         warnings,
     })
@@ -959,12 +1058,15 @@ async fn fetch(
     it: &ReadItem,
     tier: Tier,
     locator: Option<Locator>,
+    budget: usize,
 ) -> Result<Fetched, Failure> {
     match resolve(st, p, headers, &it.id).await? {
         Located::Node(sc) => fetch_node(sc, it, tier).await,
         Located::Entry(sc) => fetch_entry(sc, it, tier).await,
         Located::Attachment(sc, reference) => {
-            fetch_attachment(*sc, reference, it, tier, locator).await
+            // больше бюджета пачки (и `max_tokens` элемента) выдано не будет — дальше не читается
+            let limit = it.max_tokens.unwrap_or(budget).min(budget);
+            fetch_attachment(*sc, reference, it, tier, locator, limit).await
         }
     }
 }
@@ -1015,7 +1117,7 @@ fn floor_cost(r: &Result<Fetched, (String, Fail)>) -> usize {
         Ok(f) => match &f.content {
             Content::Unchanged => count_tokens(&header(f, "unchanged")),
             Content::Text { text, .. } => {
-                let full = count_tokens(text);
+                let full = count_tokens(text) + f.omitted;
                 count_tokens(&header(f, &format!("~{full} tok"))) + count_tokens(BUDGET_LINE)
             }
         },
@@ -1055,7 +1157,7 @@ fn pack(fetched: Vec<Result<Fetched, (String, Fail)>>, budget: usize) -> (Vec<Pi
             Content::Text { text, form, .. } => (text.clone(), *form),
         };
         let whole = matches!(f.content, Content::Text { whole: true, .. });
-        let full = count_tokens(&text);
+        let full = count_tokens(&text) + f.omitted;
         let hc = count_tokens(&header(&f, &format!("~{full} tok")));
         if exhausted {
             total += hc + count_tokens(BUDGET_LINE);
@@ -1063,7 +1165,8 @@ fn pack(fetched: Vec<Result<Fetched, (String, Fail)>>, budget: usize) -> (Vec<Pi
             continue;
         }
         let mut kept: &str = &text;
-        let mut cut = false;
+        // часть текста не прочитана (бюджет) — элемент уже обрезан
+        let mut cut = f.omitted > 0;
         if let Some(m) = f.max_tokens
             && full > m
         {
@@ -1327,11 +1430,13 @@ pub async fn read(
 
     let mut fetched = Vec::with_capacity(req.items.len());
     for ((it, tier), locator) in req.items.iter().zip(tiers).zip(locators) {
-        fetched.push(match fetch(&st, &p, &headers, it, tier, locator).await {
-            Ok(f) => Ok(f),
-            Err(Failure::Item(fail)) => Err((it.id.clone(), fail)),
-            Err(Failure::Fatal(e)) => return Err(e),
-        });
+        fetched.push(
+            match fetch(&st, &p, &headers, it, tier, locator, budget).await {
+                Ok(f) => Ok(f),
+                Err(Failure::Item(fail)) => Err((it.id.clone(), fail)),
+                Err(Failure::Fatal(e)) => return Err(e),
+            },
+        );
     }
     fill_stale_refs(&mut fetched).await?;
     let (pieces, total) = pack(fetched, budget);

@@ -649,3 +649,106 @@ async fn read_attachment_access_like_missing() {
     }
     a.st.shutdown().await;
 }
+
+/// Раунд правок 1 (Important 1): два листа с секретами в именах (одна маска) — в оглавлении по
+/// номеру `sheet:#N`, строки различимы; чтение по номеру и по сырому имени отдаёт только свой
+/// лист; сырого имени в ответах нет. Обычный лист — по имени, номер тоже принимается.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_secret_sheets_by_number() {
+    let (a, _) = world("read-secret-sheets").await;
+    let user = a.st.admin_id;
+    let tok = a.token.clone();
+    let node = note(&a, &tok, "knowledge", "docs/ключи").await;
+    let (s1, s2) = ("AKIAIOSFODNN7EXAMPLE", "AKIAJ2345678ABCDEFGH");
+    let book = xlsx(&[
+        ("Итоги", &[&["Name", "Note"], &["Alpha", "tungsten"]]),
+        (s1, &[&["Key", "Val"], &["vanadium", "1"]]),
+        (s2, &[&["Key", "Val"], &["molybdenum", "2"]]),
+    ]);
+    upload(&a, &tok, &node, "ключи.xlsx", &book).await;
+    let d = wait_done(&a, user, &node, "ключи.xlsx").await;
+    let b = format!("b:{}", d.blob_sha256);
+    let toc = read1(&a, &tok, json!({"id": &b})).await;
+    let t = text(&toc);
+    assert!(t.contains("- sheet:Итоги!A2:B2 —"), "{t}");
+    assert!(t.contains("- sheet:#2!A2:B2 —"), "{t}");
+    assert!(t.contains("- sheet:#3!A2:B2 —"), "{t}");
+    assert!(!toc.to_string().contains("AKIA"), "{toc}");
+    for (loc, want, not) in [
+        ("sheet:#2!A2:B2", "vanadium", "molybdenum"),
+        ("sheet:#3!A2:B2", "molybdenum", "vanadium"),
+        (
+            &format!("sheet:{s2}!A1:B9") as &str,
+            "molybdenum",
+            "vanadium",
+        ),
+        (&format!("sheet:{s1}!B2") as &str, "vanadium", "molybdenum"),
+    ] {
+        let it = read1(&a, &tok, json!({"id": &b, "locator": loc})).await;
+        assert!(text(&it).contains(want), "{loc}: {it}");
+        assert!(!text(&it).contains(not), "{loc}: {it}");
+        let shown = it["locator"].as_str().unwrap();
+        assert!(shown.starts_with("sheet:#"), "{loc}: {it}");
+        assert!(
+            it["locator_text"].as_str().unwrap().starts_with("лист №"),
+            "{it}"
+        );
+        assert!(!it.to_string().contains("AKIA"), "{loc}: {it}");
+    }
+    // обычный лист: по номеру — тот же лист, показ — по имени
+    let it = read1(&a, &tok, json!({"id": &b, "locator": "sheet:#1!A2:B2"})).await;
+    assert!(text(&it).contains("tungsten"), "{it}");
+    assert_eq!(it["locator"], "sheet:Итоги!A2:B2");
+    let it = read1(&a, &tok, json!({"id": &b, "locator": "sheet:#9!A1"})).await;
+    assert_eq!(it["error"], "not_found", "{it}");
+    a.st.shutdown().await;
+}
+
+/// Раунд правок 1 (M-3): администратор (сессия WebUI) читает `a:`/`b:`/`d:` вложения в чужом
+/// решении так же, как его заметку `n:` (`node_scope` — все решения сервера).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_reads_foreign_solution_attachment() {
+    const G3: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e93";
+    let (a, _) = world("read-admin-foreign").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    let bid: Id = b_id.parse().unwrap();
+    let r = a
+        .tok(
+            &b_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G3, "name": "Борисово"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let s = note(&a, &b_tok, G3, "p/борис").await;
+    upload(&a, &b_tok, &s, "b.pptx", &pptx(&[("B", "boron pelican")])).await;
+    let d = wait_done(&a, bid, &s, "b.pptx").await;
+    let chunk = chunk_locators(&a, bid, d.id).await[0].0.clone();
+    let adm = async |item: Value| {
+        let r = a
+            .adm(Method::POST, READ, Some(json!({"items": [item]})), None)
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        r.json()["items"][0].clone()
+    };
+    let it = adm(json!({"id": format!("n:{s}")})).await;
+    assert!(it.get("error").is_none(), "{it}");
+    for r in [
+        format!("a:{chunk}"),
+        format!("b:{}", d.blob_sha256),
+        format!("d:{}", d.id),
+    ] {
+        let it = adm(json!({"id": &r, "locator": "slide:1"})).await;
+        assert!(
+            it["text"].as_str().unwrap_or("").contains("boron pelican"),
+            "{r}: {it}"
+        );
+    }
+    // токен администратора (не сессия) чужого решения не видит — как у n:
+    let it = read1(&a, &a.token, json!({"id": format!("d:{}", d.id)})).await;
+    assert_eq!(it["error"], "not_found", "{it}");
+    let it = read1(&a, &a.token, json!({"id": format!("n:{s}")})).await;
+    assert_eq!(it["error"], "not_found", "{it}");
+    a.st.shutdown().await;
+}

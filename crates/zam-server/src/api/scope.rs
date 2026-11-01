@@ -706,7 +706,8 @@ pub struct AttachmentScope {
 
 /// Документ вложения по `lookup` в читаемых областях пользователя запроса ([`readable_areas`]:
 /// личная база — пространства, видимые принципалу, Human по токену — нет; одобренное чужое
-/// решение — только его пространство). У `b:` при нескольких вложениях — первое по дате привязки
+/// решение — только его пространство; администратору — пространства всех чужих решений, как у
+/// [`node_scope`]). У `b:` при нескольких вложениях — первое по дате привязки
 /// (`others` — сколько ещё). Нет документа, он скрыт, вне области или доступ к решению не одобрен —
 /// одинаково `NotFound`, без id владельца и состояния доступа (иначе ответ — оракул). Сбой чужой
 /// базы — пропуск с WARN.
@@ -720,7 +721,29 @@ pub async fn attachment_scope(
     let blob = matches!(lookup, zam_store::DocLookup::Blob(_));
     let mut best: Option<AttachmentScope> = None;
     let mut total = 0usize;
-    for area in readable_areas(st, p, &user).await? {
+    let mut areas = readable_areas(st, p, &user).await?;
+    // администратору — пространства всех чужих решений, как у `node_scope` (`foreign_solutions`)
+    if is_admin(p) {
+        for (info, _) in foreign_solutions(st, p, &user).await? {
+            if areas
+                .iter()
+                .any(|a| a.owner == info.owner_id && a.spaces.iter().any(|s| s.id == info.space_id))
+            {
+                continue;
+            }
+            match solution_space(st, &info).await {
+                Ok((db, space)) => areas.push(Readable {
+                    owner: info.owner_id,
+                    db,
+                    spaces: vec![space],
+                    role: Role::Admin,
+                }),
+                Err(ApiError::NotFound) => {}
+                Err(e) => skip_foreign(&info, &e),
+            }
+        }
+    }
+    for area in areas {
         let ids = area.spaces.iter().map(|s| s.id).collect();
         let found = match zam_store::find_docs(&area.db, lookup.clone(), ids).await {
             Ok(v) => v,

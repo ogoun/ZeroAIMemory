@@ -195,19 +195,22 @@ pub async fn find_docs(
     .await
 }
 
-/// Чанк документа вложения без текста: порядок, сырой `locator`, путь заголовков (маскирован).
+/// Чанк документа вложения без текста: порядок, сырой `locator`, путь заголовков (маскирован),
+/// размер.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocChunkHead {
     pub ordinal: i64,
     pub locator: Option<String>,
     pub heading_path: String,
+    /// Размер текста чанка в токенах (`/read` читает тексты в пределах бюджета).
+    pub token_count: i64,
 }
 
 /// Чанки документа `att` без текста, по порядку (`/read`: выбор по `locator`, оглавление).
 pub async fn doc_chunk_heads(db: &Db, att: Id) -> Result<Vec<DocChunkHead>, StoreError> {
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT ordinal, locator, heading_path FROM chunks INDEXED BY chunks_attachment
+            "SELECT ordinal, locator, heading_path, token_count FROM chunks INDEXED BY chunks_attachment
              WHERE attachment_id IS NOT NULL AND attachment_id = ?1 ORDER BY ordinal",
         )?;
         let rows = st.query_map([att], |r| {
@@ -215,6 +218,7 @@ pub async fn doc_chunk_heads(db: &Db, att: Id) -> Result<Vec<DocChunkHead>, Stor
                 ordinal: r.get(0)?,
                 locator: r.get(1)?,
                 heading_path: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                token_count: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
