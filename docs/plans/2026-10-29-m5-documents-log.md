@@ -716,6 +716,60 @@
   `-p zam-server --test blobs` 10, `--test doc_worker` 10 (1 ignored); clippy `-D warnings` по
   workspace и `fmt --check` — чисто.
 
+#### Задача 4 — раунд правок 4 (2026-11-01): единственная EOCD в окне
+
+Ревью раунда 3 нашло ещё одну причину сбоя разбора каталога у `zip` 9.0.5 — битое extra-поле
+записи (усечённое, Unicode Path `0x7075` длины 1, блок `0x000a` длины `0xFFFF`), — при которой
+`get_metadata` откатывается к ранней EOCD. Ранний zip64-кандидат на 2 млн записей с EOCD64
+`record_size = 52` проходил слой 2 (`Err(_) if may64 => continue`), хотя `zip` такую EOCD64
+принимает (`record_size + 12` = расстояние до локатора). Вместо очередной заплатки класс атак
+закрыт безотказным правилом (решение контроллера):
+
+- **Правило 1: в окне поиска `zip` ровно одна сигнатура EOCD `PK`** (включая неполную у
+  конца файла). Любая вторая — отказ: `sniff`/`sniff_file` → `None`, разбор → `Malformed`
+  («вторая сигнатура конца каталога в окне поиска zip»). С `ArchiveOffset::Known(0)` EOCD64
+  `zip` берёт только по локатору перед этой EOCD и только по смещению из локатора — других
+  кандидатов нет, при сбое разбора каталога `zip` возвращает ошибку, а не откатывается.
+- **Слой 2 удалён** целиком (без мёртвого кода): с единственной EOCD он не нужен. Слои 1 и 3
+  (согласованность единственной EOCD, лимиты `max_entries`/`max_central_dir`, обход записей
+  каталога) — без изменений.
+- **EOCD64 — по-прежнему `record_size = 44`**, строже `zip`. Обоснование: расширяемые данные
+  zip64 (v2, шифрование каталога PKWARE) не пишут Office, LibreOffice, Google Docs, Python
+  `zipfile`, Info-ZIP, 7-Zip, libzip, .NET; `zip` копирует их в память целиком (до размера
+  файла); при единственной EOCD строгость даёт только `Malformed`, а не откат.
+- **Окно сверено с исходником `zip` 9.0.5** (`read/zip_archive.rs::get_metadata`):
+  `min_eocd_position = file_len − (size_of::<Zip32CentralDirectoryEnd>() + 4 + 65 536)`. Это
+  размер структуры в памяти — 32 байта на 64-битных целях (16 байт полей + `Box<[u8]>`), а не 22
+  байта записи: окно `zip` — 65 572 байта, наше `EOCD_WINDOW` — 65 664. Юнит-тест
+  `ooxml::tests::eocd_window_covers_zip_search` замеряет окно на деле (пустая EOCD в начале
+  файла длиной 65 572 открывается, 65 573 — нет) и проверяет `EOCD_WINDOW ≥` него; при
+  обновлении `zip` перепроверить.
+- **Цена правила — ложные отказы.** Случайная `PK` в последних 64 КиБ сжатых данных:
+  ≈ 2¹⁶ · 2⁻³² ≈ 1,5·10⁻⁵ на файл (≈ 1 на 65 000 документов). Такие файлы получат `failed` с
+  причиной «вторая сигнатура конца каталога», пользователь это увидит. Office, LibreOffice,
+  Google Docs и Python `zipfile` второй EOCD не пишут; архивы с префиксом и «zip в zip» в
+  хвосте и раньше не проходили.
+- **`zam-fetch`:** в doc-комментариях `extract_selected` и `extract_atomic` записано, что
+  вызывающий обязан заранее сверить SHA-256 (`verify_sha256`): функции не для недоверенных
+  архивов.
+- **Замеры** (`zip_eocd.rs`, счётчик аллокаций, debug): сценарий ревьюера (битое extra × 3
+  варианта, ранний zip64 на 2 млн записей с EOCD64 `size = 52`, 89 МиБ) — `sniff_file` `None`,
+  пик 0,12 МиБ, ≤ 0,2 мс; разбор — `Malformed`, пик < 0,01 МиБ; прежние пробы (откат
+  `name`/`lfh`/`ok`, поддельная EOCD в хвосте, кандидат на 20 000 записей) — тот же отказ по
+  правилу 1, пик 0,12 МиБ; честный zip64 на 2 млн — `truncated: max_entries`; наполнитель 80 МБ —
+  пик 0,13 МиБ.
+- **Реальные файлы ревьюера** (`.tmp/review-m5-task4/real/`, временный тест без коммита):
+  `comment`, `datadesc_stream`, `deflated`, `eocd64_forced`, `eocd64_stream`,
+  `force64_entries`, `many_9000`, `stored` — `sniff`/`sniff_file` `Docx`, разбор — 1 единица.
+- Тесты: `zip_eocd.rs` +2 (всего 11) — `broken_extra_with_extensible_eocd64_candidate_rejected`,
+  `second_eocd_in_window_rejected` (копия EOCD перед каталогом, zip32 и zip64; без сигнатуры —
+  обычный документ); `over_limit_candidate_in_window_rejected` — ранний кандидат в пределах
+  лимитов теперь тоже отказ с причиной; юнит-тесты `ooxml.rs` +2 —
+  `eocd_window_covers_zip_search`, `second_eocd_signature_in_window_rejected`.
+- Проверки: `cargo test -p zam-docs` 72 passed (2 ignored), `-p zam-store` 304 (4 ignored),
+  `-p zam-server --test blobs --test doc_worker` 20 (1 ignored), `-p zam-fetch` 30 (1 ignored);
+  clippy `-D warnings` по workspace и `fmt --check` — чисто.
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.

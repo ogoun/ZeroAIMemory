@@ -1,4 +1,4 @@
-//! Строгая проверка конца центрального каталога zip (ревью задачи 4 M5, раунд 2): поддельная EOCD
+//! Строгая проверка конца центрального каталога zip (ревью задачи 4 M5, раунды 2–4): поддельная EOCD
 //! в хвосте или в комментарии, неверная EOCD64, каталог сверх `max_central_dir` — отказ и в
 //! `sniff`/`sniff_file`, и в разборе OOXML; настоящие DOCX/XLSX/ODS (в том числе в форме zip64)
 //! по-прежнему распознаются и разбираются. Пик памяти на пробе ревьюера (zip64 на 2 млн записей
@@ -504,8 +504,8 @@ fn assert_rejected_small(label: &str, b: &[u8]) {
     }
 }
 
-/// Откат `zip` к ранней EOCD (раунд правок 3, п. 1): каталог последней EOCD пройден до
-/// `ZipArchive` (слой 3), ранний кандидат в окне сверх лимитов — отказ (слой 2).
+/// Откат `zip` к ранней EOCD (раунд правок 3, п. 1): с раунда 4 — отказ по второй сигнатуре EOCD
+/// в окне поиска `zip`.
 #[test]
 fn fallback_to_earlier_eocd_rejected() {
     let _g = serial();
@@ -517,13 +517,13 @@ fn fallback_to_earlier_eocd_rejected() {
     }
 }
 
-/// Кандидат сверх лимита в окне поиска `zip` (zip32 на 20 000 записей перед честным маленьким
-/// каталогом) — отказ, хотя последняя EOCD и её каталог согласованы.
+/// Ранний кандидат в окне поиска `zip` (zip32 на 20 000 или 10 записей перед честным маленьким
+/// каталогом) — отказ, хотя последняя EOCD и её каталог согласованы (раунд 4: любая вторая EOCD).
 #[test]
 fn over_limit_candidate_in_window_rejected() {
     let _g = serial();
     assert_rejected_small("кандидат 20 000 в окне", &fallback(20_000, false, "ok"));
-    // ранний кандидат в пределах лимитов, а каталог последней EOCD битый — отказ слоем 3
+    // ранний кандидат в пределах лимитов, а каталог последней EOCD битый — отказ
     for bad in ["name", "lfh"] {
         let b = fallback(10, false, bad);
         assert_eq!(file(&b, "a.docx", &Limits::default()), None, "{bad}");
@@ -535,12 +535,13 @@ fn over_limit_candidate_in_window_rejected() {
             "{bad}"
         );
     }
-    // кандидат в пределах лимитов не мешает: последний каталог согласован, а разбор его — свой
+    // раунд 4: и кандидат в пределах лимитов — вторая EOCD в окне, отказ с понятной причиной
     let b = fallback(10, false, "ok");
     let l = Limits::default();
+    assert_eq!(file(&b, "a.docx", &l), None);
     let x = extract(DocKind::Docx, &b, &l, deadline());
     assert!(
-        !matches!(&x, Err(DocError::Malformed(m)) if m.contains("сверх лимитов")),
+        matches!(&x, Err(DocError::Malformed(m)) if m.contains("вторая сигнатура конца каталога")),
         "{x:?}"
     );
 }
@@ -649,4 +650,120 @@ fn eocd64_with_real_eocd_fields_accepted() {
     bad[p + 8..p + 10].copy_from_slice(&n.to_le_bytes());
     assert_eq!(file(&bad, "a.docx", &l), None);
     assert!(matches!(docx_text(&bad, &l), Err(DocError::Malformed(_))));
+}
+
+/// Проба ревьюера раунда 3: большой zip64-каталог на `n` записей, EOCD64 с `ext` байтами
+/// расширяемых данных (`zip` с `Known(0)` такую принимает: `record_size + 12` = расстояние до
+/// локатора), затем маленький каталог из одной записи с extra `extra` и строго согласованная
+/// последняя EOCD. `zip` не разбирает extra последнего каталога и откатывался к раннему
+/// (до раунда 4 слой 2 пропускал такого кандидата).
+fn r3(n: u64, ext: usize, extra: &[u8]) -> Vec<u8> {
+    let mut v = probe(n, 1, true, false);
+    if ext > 0 {
+        let p = v.len() - 22 - 20 - 56;
+        let tail = v.split_off(p);
+        let rd64 = |i: usize| u64::from_le_bytes(tail[i..i + 8].try_into().unwrap());
+        let (n64, size64, off64) = (rd64(32), rd64(40), rd64(48));
+        let e64 = v.len() as u64;
+        u32le(&mut v, 0x0606_4b50);
+        u64le(&mut v, 44 + ext as u64);
+        u16le(&mut v, 45);
+        u16le(&mut v, 45);
+        u32le(&mut v, 0);
+        u32le(&mut v, 0);
+        u64le(&mut v, n64);
+        u64le(&mut v, n64);
+        u64le(&mut v, size64);
+        u64le(&mut v, off64);
+        v.extend(std::iter::repeat_n(0u8, ext));
+        u32le(&mut v, 0x0706_4b50);
+        u32le(&mut v, 0);
+        u64le(&mut v, e64);
+        u32le(&mut v, 1);
+        v.extend_from_slice(&tail[56 + 20..]);
+    }
+    let small = v.len() as u64;
+    let name = b"a.xml";
+    u32le(&mut v, 0x0201_4b50);
+    u16le(&mut v, 20);
+    u16le(&mut v, 20);
+    for _ in 0..4 {
+        u16le(&mut v, 0);
+    }
+    for _ in 0..3 {
+        u32le(&mut v, 0);
+    }
+    u16le(&mut v, name.len() as u16);
+    u16le(&mut v, extra.len() as u16);
+    for _ in 0..3 {
+        u16le(&mut v, 0);
+    }
+    u32le(&mut v, 0);
+    u32le(&mut v, 0);
+    v.extend_from_slice(name);
+    v.extend_from_slice(extra);
+    let size = v.len() as u64 - small;
+    u32le(&mut v, 0x0605_4b50);
+    u16le(&mut v, 0);
+    u16le(&mut v, 0);
+    u16le(&mut v, 1);
+    u16le(&mut v, 1);
+    u32le(&mut v, size as u32);
+    u32le(&mut v, small as u32);
+    u16le(&mut v, 0);
+    v
+}
+
+/// Раунд 4: битое extra в последнем каталоге + ранний zip64-кандидат на 2 млн записей с EOCD64
+/// `record_size = 52` — отказ, пик меньше 2 МиБ (до правки — сотни МиБ).
+#[test]
+fn broken_extra_with_extensible_eocd64_candidate_rejected() {
+    let _g = serial();
+    let l = Limits::default();
+    for (label, extra) in [
+        ("extra усечено (3 байта)", vec![1, 0, 8]),
+        ("Unicode Path 0x7075 длины 1", vec![0x75, 0x70, 1, 0, 9]),
+        ("блок 0x000a длины 0xFFFF", vec![0x0a, 0, 0xff, 0xff]),
+    ] {
+        let b = r3(2_000_000, 8, &extra);
+        assert_rejected_small(&format!("r3 [{label}]"), &b);
+        let x = extract(DocKind::Xlsx, &b, &l, deadline());
+        assert!(
+            matches!(&x, Err(DocError::Malformed(m)) if m.contains("вторая сигнатура конца каталога")),
+            "{label}: {x:?}"
+        );
+    }
+}
+
+/// Вторая EOCD в окне поиска `zip` — отказ в `sniff`, `sniff_file` и разборе (с причиной), даже
+/// если обе согласованы: в «данных» перед каталогом (копия настоящей EOCD) и в zip64-форме.
+#[test]
+fn second_eocd_in_window_rejected() {
+    let _g = serial();
+    let l = Limits::default();
+    let d = docx();
+    // копия EOCD в конце данных последней записи: каталог сдвигается, поля EOCD правятся
+    let p = eocd_at(&d);
+    let (size, off) = (rd32(&d, p + 12), rd32(&d, p + 16) as usize);
+    let mut v = d[..off].to_vec();
+    v.extend_from_slice(&d[p..]);
+    let new_off = v.len() as u32;
+    v.extend_from_slice(&d[off..]);
+    let q = v.len() - 22;
+    v[q + 16..q + 20].copy_from_slice(&new_off.to_le_bytes());
+    assert_eq!(rd32(&v, q + 12), size);
+    let z64 = to_zip64(&v, 0, 0x0606_4b50);
+    for (label, b) in [("zip32", &v), ("zip64", &z64)] {
+        assert_eq!(sniff(b, "a.docx"), None, "{label}");
+        assert_eq!(file(b, "a.docx", &l), None, "{label}");
+        let x = docx_text(b, &l);
+        assert!(
+            matches!(&x, Err(DocError::Malformed(m)) if m.contains("вторая сигнатура конца каталога")),
+            "{label}: {x:?}"
+        );
+    }
+    // та же вставка без сигнатуры (первый байт изменён) — обычный документ
+    let mut ok = v.clone();
+    ok[off] = b'Q';
+    assert_eq!(docx_text(&ok, &l).unwrap(), "Привет из DOCX");
 }

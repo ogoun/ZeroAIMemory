@@ -330,7 +330,10 @@ pub(crate) enum ZipCheck {
 const CDFH_MIN: u64 = 46;
 /// Запись EOCD64 без расширяемых данных: 12 байт (сигнатура и размер) + 44.
 const EOCD64_LEN: u64 = 56;
-/// Окно поиска EOCD у `zip` 9.0.5 (`get_metadata`: 64 КиБ комментария + EOCD) с запасом.
+/// Окно поиска EOCD у `zip` 9.0.5 с запасом: `get_metadata` ищет сигнатуру не раньше
+/// `file_len − (size_of::<Zip32CentralDirectoryEnd>() + 4 + 65 536)`; размер структуры в памяти
+/// (32 байта на 64-битных целях), а не 22 байта записи — окно `zip` 65 572 байта. Сверяется
+/// тестом `eocd_window_covers_zip_search` (при обновлении `zip` перепроверить).
 pub(crate) const EOCD_WINDOW: u64 = 65_536 + 128;
 
 const EOCD: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
@@ -365,6 +368,13 @@ type Eocd64 = (u64, u64, u64, u64, u64);
 /// EOCD64 по локатору перед EOCD в позиции `pos`: `(позиция EOCD64, записей на диске, записей,
 /// размер, смещение каталога)`. `Ok(None)` — локатора нет; `Err` — локатор есть, а EOCD64 не та
 /// (не ровно перед локатором, с расширяемыми данными, многотомная).
+///
+/// Строже `zip` 9.0.5: тот принимает любые расширяемые данные (`record_size + 12 ==
+/// позиция локатора − позиция EOCD64`) и копирует их в память целиком — до размера файла. Здесь
+/// `record_size` ровно 44 (раунд 4, решено оставить): расширяемые данные (zip64 v2 — шифрование
+/// каталога PKWARE) не пишут ни Office/LibreOffice, ни Python `zipfile`, Info-ZIP, 7-Zip, libzip,
+/// .NET; а при единственной EOCD в окне ([`zip_directory`]) строгость даёт только `Malformed`,
+/// не откат `zip` к другому каталогу.
 fn eocd64_at(read_at: &mut ReadAt<'_>, pos: u64) -> Result<Option<Eocd64>, &'static str> {
     let Some(loc_pos) = pos.checked_sub(20) else {
         return Ok(None);
@@ -395,24 +405,27 @@ fn eocd64_at(read_at: &mut ReadAt<'_>, pos: u64) -> Result<Option<Eocd64>, &'sta
     )))
 }
 
-/// Строгая проверка центрального каталога zip до `ZipArchive` (раунды правок 2–3 задачи 4 M5).
+/// Строгая проверка центрального каталога zip до `ZipArchive` (раунды правок 2–4 задачи 4 M5).
 ///
-/// `zip` 9.0.5 перебирает кандидатов EOCD в окне от конца файла и молча пропускает
-/// несогласованные, а если не разобрался каталог выбранной EOCD — откатывается к более ранней.
-/// Поэтому здесь три слоя:
-/// 1. **Последняя** полная сигнатура EOCD (её `zip` пробует первой) должна быть согласованной
-///    целиком: кончается с комментарием ровно на конце файла; один диск; записей на диске =
-///    всего; при локаторе за 20 байт до EOCD — EOCD64 без расширяемых данных ровно перед
-///    локатором, поля каталога из неё, а поля EOCD, кроме `0xFFFF…`, совпадают с ней (так пишет
-///    и Python `zipfile` с принудительным zip64-концом при реальных полях EOCD); каталог
-///    кончается ровно у EOCD (EOCD64): `cd_offset + cd_size`; `entries × 46 ≤ cd_size`.
-/// 2. **Каждый другой кандидат** окна, который `zip` счёл бы годным (комментарий в пределах
-///    файла, по смещению каталога — сигнатура записи или EOCD64 по локатору), не должен быть
-///    сверх `max_entries`/`max_central_dir`: откат `zip` к нему не раздует память.
+/// `zip` 9.0.5 перебирает кандидатов EOCD в окне от конца файла ([`EOCD_WINDOW`]) и молча
+/// пропускает несогласованные, а если не разобрался каталог выбранной EOCD (битое extra, имя и
+/// т. п.) — откатывается к более ранней. Догонять все причины сбоя разбора бесполезно, поэтому
+/// класс атак закрыт безотказным правилом (раунд 4):
+/// 1. **В окне ровно одна сигнатура EOCD** `PK\x05\x06`. Любая вторая — отказ архива. С
+///    `ArchiveOffset::Known(0)` EOCD64 `zip` берёт только по локатору перед этой EOCD, так что
+///    других кандидатов у него нет: при сбое разбора каталога он возвращает ошибку, а не
+///    откатывается. Цена — ложный отказ при случайной `PK\x05\x06` в последних 64 КиБ сжатых
+///    данных (≈ 2¹⁶·2⁻³² ≈ 1,5·10⁻⁵ на файл); Office, LibreOffice, Google Docs и Python
+///    `zipfile` второй EOCD не пишут.
+/// 2. **Эта EOCD согласована целиком**: кончается с комментарием ровно на конце файла; один
+///    диск; записей на диске = всего; при локаторе за 20 байт до EOCD — EOCD64 ровно перед
+///    локатором ([`eocd64_at`]), поля каталога из неё, а поля EOCD, кроме `0xFFFF…`, совпадают с
+///    ней (так пишет и Python `zipfile` с принудительным zip64-концом при реальных полях EOCD);
+///    каталог кончается ровно у EOCD (EOCD64): `cd_offset + cd_size`; `entries × 46 ≤ cd_size`;
+///    число записей и размер каталога — против `max_entries`/`max_central_dir`.
 /// 3. **Каталог пройден запись за записью** (только если в пределах лимитов): сигнатура
 ///    каждой записи, имя, extra и комментарий внутри каталога, смещение локального заголовка до
-///    каталога; сумма длин записей — ровно `cd_size`, записей — ровно `entries`. Тогда `zip` не
-///    провалится на этом каталоге и не откатится.
+///    каталога; сумма длин записей — ровно `cd_size`, записей — ровно `entries`.
 ///
 /// Открывать архив — только [`open_archive`] (`ArchiveOffset::Known(0)`: без сканирования файла
 /// в поисках сигнатур). Архивы с префиксом (самораспаковывающиеся) не проходят слой 1.
@@ -428,38 +441,22 @@ pub(crate) fn zip_directory(
     let max_entries = u64::from(limits.max_entries);
     let max_dir = limits.max_central_dir;
     let window = file_len.saturating_sub(EOCD_WINDOW);
-    let lo = usize::try_from(window.saturating_sub(tail_start)).unwrap_or(usize::MAX);
-    let mut cands = (lo.min(tail.len())..tail.len().saturating_sub(21))
+    let lo = usize::try_from(window.saturating_sub(tail_start))
+        .unwrap_or(usize::MAX)
+        .min(tail.len());
+    // правило 1: в окне поиска `zip` ровно одна сигнатура EOCD (в том числе неполная у конца
+    // файла) — откатываться `zip` некуда
+    let mut sigs = (lo..tail.len().saturating_sub(3))
         .rev()
         .filter(|&i| tail[i..i + 4] == EOCD);
-    let rel = cands.next().ok_or("нет конца центрального каталога")?;
-    // слой 2: прочие кандидаты окна, годные для `zip`, — в пределах лимитов
-    for i in cands {
-        let e = &tail[i..i + 22];
-        let p = tail_start + i as u64;
-        if p + 22 + le16(e, 20) > file_len {
-            continue;
-        }
-        let (n, size, off) = (le16(e, 10), le32(e, 12), le32(e, 16));
-        let may64 = n == 0xFFFF || size == 0xFFFF_FFFF || off == 0xFFFF_FFFF;
-        let (n, size) = match eocd64_at(read_at, p) {
-            Ok(Some((_, _, n64, size64, _))) if may64 => (n64, size64),
-            // локатор с негодной EOCD64: `zip` с `Known(0)` этого кандидата не примет
-            Err(_) if may64 => continue,
-            _ => {
-                let cd_ok =
-                    off < p && read_exact_at(read_at, off, 4).is_some_and(|s| s[..] == CDFH);
-                if !(cd_ok || n == 0) {
-                    continue;
-                }
-                (n, size)
-            }
-        };
-        if n > max_entries || size > max_dir {
-            return Err("кандидат конца каталога в окне сверх лимитов");
-        }
+    let rel = sigs.next().ok_or("нет конца центрального каталога")?;
+    if sigs.next().is_some() {
+        return Err("вторая сигнатура конца каталога в окне поиска zip");
     }
-    // слой 1: последняя EOCD согласована целиком
+    if rel + 22 > tail.len() {
+        return Err("конец каталога обрезан");
+    }
+    // правило 2: единственная EOCD согласована целиком
     let e = &tail[rel..rel + 22];
     let pos = tail_start + rel as u64;
     if pos + 22 + le16(e, 20) != file_len {
@@ -499,7 +496,7 @@ pub(crate) fn zip_directory(
     if cd_size > max_dir {
         return Ok(ZipCheck::DirTooLarge);
     }
-    // слой 3: запись за записью
+    // правило 3: запись за записью
     let mut at = cd_offset;
     for _ in 0..entries {
         let h = read_exact_at(read_at, at, CDFH_MIN as usize).ok_or("запись каталога обрезана")?;
@@ -946,5 +943,73 @@ impl Table {
         }
         self.end_row();
         self.out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    /// Пустой архив: EOCD без записей в начале файла длиной `len`, дальше нули (`zip`
+    /// допускает «мусор после комментария» — EOCD годна, если кончается не позже конца файла).
+    fn opens_with_eocd_at_start(len: usize) -> bool {
+        let mut b = vec![0u8; len];
+        b[..4].copy_from_slice(&EOCD);
+        open_archive(Cursor::new(b)).is_ok()
+    }
+
+    /// Окно [`EOCD_WINDOW`] покрывает всё окно поиска EOCD у `zip` (сейчас 9.0.5): иначе
+    /// сигнатура вне нашего окна, но в окне `zip` ушла бы от правила «ровно одна EOCD».
+    /// Окно `zip` замеряется на деле: EOCD в начале файла длиной `W` ещё находится, `W + 1` —
+    /// уже нет. При обновлении `zip` перепроверить (`format/find_central_directory.rs`,
+    /// `read/zip_archive.rs::get_metadata`).
+    #[test]
+    fn eocd_window_covers_zip_search() {
+        // 9.0.5: size_of::<Zip32CentralDirectoryEnd>() = 32 на 64-битных целях + 4 + 65 536
+        let zip_window = if cfg!(target_pointer_width = "64") {
+            32 + 4 + 65_536
+        } else {
+            24 + 4 + 65_536
+        };
+        assert!(opens_with_eocd_at_start(22));
+        assert!(
+            opens_with_eocd_at_start(zip_window),
+            "окно zip шире замера: перепроверить EOCD_WINDOW"
+        );
+        assert!(
+            !opens_with_eocd_at_start(zip_window + 1),
+            "окно zip шире ожидаемого: перепроверить EOCD_WINDOW"
+        );
+        assert!(EOCD_WINDOW >= zip_window as u64);
+    }
+
+    /// Правило 1: вторая сигнатура EOCD в окне — отказ, даже если она неполная или в комментарии.
+    #[test]
+    fn second_eocd_signature_in_window_rejected() {
+        let limits = crate::Limits::default();
+        let mut empty = EOCD.to_vec();
+        empty.resize(22, 0);
+        assert_eq!(
+            zip_directory_of(&empty, &limits),
+            Ok(ZipCheck::Fits(ZipDir {
+                entries: 0,
+                cd_offset: 0,
+                cd_size: 0
+            }))
+        );
+        // сигнатура перед EOCD (в «данных») и в комментарии
+        let mut before = EOCD.to_vec();
+        before.extend_from_slice(&empty);
+        let mut comment = empty.clone();
+        comment[20] = 4;
+        comment.extend_from_slice(&EOCD);
+        for b in [before, comment] {
+            assert_eq!(
+                zip_directory_of(&b, &limits),
+                Err("вторая сигнатура конца каталога в окне поиска zip")
+            );
+        }
     }
 }
