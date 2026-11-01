@@ -660,3 +660,10 @@
 `cargo test -p zam-docs`, `cargo test -p zam-server --test doc_worker -- --include-ignored` (9/9, в т.ч. `worker_memory_limit_oom`,
 `worker_crash_is_parse_crash_and_restarts`, `worker_timeout_killed`, `worker_dies_with_server`), lib-тесты `docs` и `config`,
 `cargo clippy -p zam-docs -p zam-server --all-targets -- -D warnings` — всё зелёное. Сомнение исполнителя № 1 снято.
+
+### Задача 3 — итог (2026-11-01)
+
+Повторное ревью: APPROVED. Linux-стенд: doc_worker 11/11 (в т.ч. смерть занятого воркера вместе с сервером — PDEATHSIG).
+Известное свойство: номера запросов в слоте последовательны; захваченный воркер может заранее подложить ответ на следующий
+запрос, но это не даёт ему новых возможностей (он и так отвечает на задания слота до исчерпания `worker_jobs`).
+Перенесено в задачу 5: нарушение протокола после повтора сейчас отдаётся как `parse_error`, должно быть `parse_crash`.
