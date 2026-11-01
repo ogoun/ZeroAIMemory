@@ -20,6 +20,8 @@
 | `hints.toml` | M4: точность подсказок хуков — 72 случая (`prompt` 30, `post_tool` 24, `pre_tool` 18; половина «нерелевантно»), 17 insight с триггерами и без и 3 заметки Rules |
 | `scenarios.toml` | M4: 20 сценариев расхода токенов «вопрос агента → источники» (протокол §9.3, повтор через кэш, наивный `mode=chunks`) |
 | `glossary.toml` | M4.5: словарь домена — 16 терминов с псевдонимами RU↔EN (сленг, транслитерация, сокращения) и 24 запроса на псевдонимах |
+| `docs/` | M5: набор документов (не в git, `.gitignore`): генерирует `cargo xtask docs-corpus` из сида — DOCX, XLSX, PPTX, PDF (одна и две колонки, кириллица, CJK, 500 страниц, «скан»), враждебные файлы, `manifest.json` (факты, эталон порядка строк PDF) |
+| `docs-queries.toml` | M5: 45 запросов к фактам набора документов (`exact` 23, `paraphrase` 11, `cross-lang` 8, `date` 3) |
 | `results/` | результаты прогонов: `.json` (полные, по запросам) и `.md` (таблицы) |
 
 **Корпус** — заметки инженера по темам: Windows и кодировки (CRLF, PowerShell), git, Linux и
@@ -336,6 +338,63 @@ session-start`) в каталоге проекта `target/eval/<прогон>/p
 `pre-tool` на `Agent` с текстом запроса набора, бюджет 300 мс). Те же два хука — в тесте
 `zam-cli/tests/m4_acceptance.rs::hook_budgets` (корпус eval, FTS-only, p95 ≤ бюджета ×2, ≤ 5 %
 замолчавших по сроку).
+
+## Документы (M5)
+
+`cargo xtask docs-corpus [--seed N] [--large]` пишет `eval/docs/` (спецификация M5 §6; код —
+`xtask/src/docs_corpus*`). Документы — свои, синтетические, детерминированные: один сид — одинаковые
+байты на любой платформе (тест `docs_corpus_deterministic`); наполнитель — предложения из области
+«эксплуатация предприятия» (трудные соседи фактов), в известные места вставлены **факты**
+(`manifest.json`: файл, ожидаемый `locator`, дословное `evidence`).
+
+| Файл | Что проверяет |
+|---|---|
+| `files/regulations-ru.docx`, `files/onboarding-en.docx` | заголовки H1–H3, таблица, сноска; `para:N` |
+| `files/inventory.xlsx` | 3 листа × 10 000 строк, общие строки, даты со стилем (`numFmt` 164 `dd.mm.yyyy`, встроенный 14) |
+| `files/roadmap.pptx` | 20 слайдов, заметки докладчика |
+| `files/onecol-en.pdf`, `files/twocol-en.pdf` | одна колонка (и страница-таблица); две колонки — поток содержимого чередует строки колонок, страница-таблица |
+| `files/cyrillic-ru.pdf`, `files/cjk-zh.pdf` | кириллица, китайский и японский — свои шрифты Type3 с `ToUnicode` (без чужих шрифтов) |
+| `files/book-500.pdf` | 500 страниц с колонтитулами |
+| `files/scan.pdf` | страницы-картинки без текста → `ocr_needed` |
+| `hostile/` | zip-бомба (1 ГиБ), XXE, «миллиард смешков», 200 тыс. уровней XML, битый и обрезанный PDF, PDF с JavaScript (с фактом), 100 тыс. вложенных массивов PDF, 400 тыс. глифов на странице, картинка 30000 × 30000, обрезанный DOCX |
+| `large/` (`--large`) | DOCX ≈ 21 млн символов, XLSX 300 тыс. строк × 7 — сроки разбора при умолчаниях `[docs]` |
+
+`cargo xtask eval --docs` (`xtask/src/eval/docs.rs`):
+
+1. **A/B извлечения PDF** (`--pdf-backend pdfium|pdf_oxide|pdf_oxide_plain`): каждый PDF — в
+   отдельном процессе (`xtask docs-extract`); метрики по страницам эталона — доля строк эталона в
+   тексте страницы, доля пар соседних строк в верном порядке (строка — ровно одно вхождение),
+   целые строки таблиц (все ячейки строки — в одной строке текста, слева направо), факт на своей
+   странице, время (книга — медиана 3 повторов), пиковая память процесса, исход враждебных
+   (`ok`/`error`/`crash`/`timeout`). Не-PDF набора (и `large/`) — время `zam_docs::extract` в
+   процессе. `pdf_oxide` — только в сборке `cargo run -p xtask --release --features pdf-oxide`.
+2. **Сервер**: корпус заметок `eval/corpus` (кроме `--docs-only`) → латентность основного набора
+   без вложений → заметки-владельцы (`eval-docs/…`) и загрузка файлов `POST /blobs` (у
+   `pdf_oxide` кэш `blob_extract` PDF заполняется его текстом до загрузки — остальной конвейер
+   тот же) → ожидание извлечения и индексации → запросы `docs-queries.toml` (как основной набор:
+   `scope.solution`, `mode = notes`, top 10) и второй раз с `filters.kinds = ["attachment"]` →
+   латентность основного набора с вложениями → исходы враждебных файлов, превью листов XLSX и
+   миниатюр (холодный и из кэша), объём кэша извлечения.
+
+Метрики (бутстреп по запросам, 2000 выборок): **recall@5** — карточка файла факта в первых 5;
+**recall@5 (одни вложения)** — то же при `filters.kinds = ["attachment"]`; **MRR@10**; **loc@5** — в
+первых 5 есть карточка файла, `/read` по `locator` которой содержит `evidence` (агент получит
+нужное место); **точность `locator`** — среди найденных в первых 5, по первой карточке файла;
+**`locator` = эталон** — страница, слайд, ячейка в диапазоне листа совпадают с эталоном (абзац —
+единица начинается не позже абзаца факта и `/read` содержит `evidence`). Итог —
+`results/<дата>-m5-docs-<fts|модель>-<бэкенд>[-метка].{json,md}` и
+`results/<дата>-m5-pdf-ab-<бэкенд>.{json,md}`; сводка этапа —
+`results/2026-11-02-m5-docs-summary.md`.
+
+```sh
+cargo xtask docs-corpus --large                                   # набор (≈ 10 с)
+cargo xtask eval --docs --check                                   # только проверить запросы
+cargo xtask eval --docs --mode fts --prefix m5                    # FTS, A/B pdfium
+cargo xtask eval --docs --device cuda --mode hybrid --prefix m5   # fp16 CUDA
+cargo xtask eval --docs --device cuda --mode hybrid --reuse --set search.attach_prefetch=60 --label pf60
+cargo run -p xtask --release --features pdf-oxide -- eval --docs --ab-only --pdf-backend pdf_oxide --prefix m5
+cargo xtask eval --docs --mode fts --docs-only --large --label large --prefix m5   # сроки больших файлов
+```
 
 ## Словарь (M4.5)
 

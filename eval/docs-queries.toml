@@ -1,0 +1,338 @@
+# Eval документов M5 (спецификация §6, задача 10): запросы к фактам набора `eval/docs/`
+# (`cargo xtask docs-corpus`; факты — `manifest.json`, дословное `evidence` в известном месте).
+#
+# Поля: `id`, `text`, `lang` (ru | en | zh | ja), `kind`, `fact` — id факта манифеста.
+# Виды:
+#   exact      — значимые слова факта (FTS находит по словам);
+#   paraphrase — пересказ своими словами (общих слов мало или нет — работает векторный канал);
+#   cross-lang — запрос на другом языке, чем документ;
+#   date       — строка листа XLSX ищется по дате (ячейка с датой, стиль numFmt); в тексте
+#                извлечения дата сейчас — серийное число Excel.
+# Метрики — `cargo xtask eval --docs`: recall@5 по вложению (файл факта в первых 5), точность
+# `locator` (текст `/read` по `locator` карточки содержит `evidence`) и совпадение `locator`
+# с эталоном (страница, слайд, ячейка листа; у DOCX — абзац в единице).
+
+# ---------------------------------------------------------------- DOCX ru (regulations-ru.docx)
+[[query]]
+id = "d1-exact"
+text = "замена подшипников главного насоса моточасов вибрация"
+lang = "ru"
+kind = "exact"
+fact = "d1"
+
+[[query]]
+id = "d1-para"
+text = "как часто меняют подшипники у основного насоса"
+lang = "ru"
+kind = "paraphrase"
+fact = "d1"
+
+[[query]]
+id = "d2-exact"
+text = "фильтр грубой очистки промывка обратным током"
+lang = "ru"
+kind = "exact"
+fact = "d2"
+
+[[query]]
+id = "d3-para"
+text = "с кем согласовали методику измерения вибраций"
+lang = "ru"
+kind = "paraphrase"
+fact = "d3"
+
+[[query]]
+id = "d4-exact"
+text = "проверка резервного дизель-генератора под нагрузкой"
+lang = "ru"
+kind = "exact"
+fact = "d4"
+
+[[query]]
+id = "d4-cross"
+text = "how long is the backup diesel generator load test"
+lang = "en"
+kind = "cross-lang"
+fact = "d4"
+
+[[query]]
+id = "d5-para"
+text = "какой задвижкой стравливают давление при аварии"
+lang = "ru"
+kind = "paraphrase"
+fact = "d5"
+
+# ---------------------------------------------------------------- DOCX en (onboarding-en.docx)
+[[query]]
+id = "e1-exact"
+text = "badge access server room fire suppression briefing"
+lang = "en"
+kind = "exact"
+fact = "e1"
+
+[[query]]
+id = "e1-cross"
+text = "когда новичку дают доступ в серверную"
+lang = "ru"
+kind = "cross-lang"
+fact = "e1"
+
+[[query]]
+id = "e2-exact"
+text = "VPN token expires after 90 days"
+lang = "en"
+kind = "exact"
+fact = "e2"
+
+[[query]]
+id = "e3-para"
+text = "which office tested the mentor scheme first"
+lang = "en"
+kind = "paraphrase"
+fact = "e3"
+
+[[query]]
+id = "e4-para"
+text = "who must additionally sign off on large travel costs"
+lang = "en"
+kind = "paraphrase"
+fact = "e4"
+
+# ---------------------------------------------------------------- XLSX (inventory.xlsx)
+[[query]]
+id = "x1-exact"
+text = "партия возвращена протечка упаковки антифриза"
+lang = "ru"
+kind = "exact"
+fact = "x1"
+
+[[query]]
+id = "x1-para"
+text = "какую поставку отправили назад из-за подтекающей тары"
+lang = "ru"
+kind = "paraphrase"
+fact = "x1"
+
+[[query]]
+id = "x2-exact"
+text = "стеллаж С-12 перегружен усиление балки"
+lang = "ru"
+kind = "exact"
+fact = "x2"
+
+[[query]]
+id = "x3-exact"
+text = "forklift certification overdue night shift"
+lang = "en"
+kind = "exact"
+fact = "x3"
+
+[[query]]
+id = "x3-cross"
+text = "у какого оператора ночной смены просрочен допуск на погрузчик"
+lang = "ru"
+kind = "cross-lang"
+fact = "x3"
+
+[[query]]
+id = "x4-date"
+text = "поставка Гранит-Сервис от 15.03.2021"
+lang = "ru"
+kind = "date"
+fact = "x4"
+
+[[query]]
+id = "x5-date"
+text = "инвентаризация склада 09.07.2020"
+lang = "ru"
+kind = "date"
+fact = "x5"
+
+[[query]]
+id = "x6-date"
+text = "employee hired on 2019-02-28"
+lang = "en"
+kind = "date"
+fact = "x6"
+
+# ---------------------------------------------------------------- PPTX (roadmap.pptx)
+[[query]]
+id = "p1-exact"
+text = "billing migration new ledger third quarter"
+lang = "en"
+kind = "exact"
+fact = "p1"
+
+[[query]]
+id = "p2-exact"
+text = "пилот голосового помощника время ожидания колл-центр"
+lang = "ru"
+kind = "exact"
+fact = "p2"
+
+[[query]]
+id = "p2-cross"
+text = "how much did the voice assistant pilot cut waiting time"
+lang = "en"
+kind = "cross-lang"
+fact = "p2"
+
+[[query]]
+id = "p3-para"
+text = "how long will we keep recorded phone calls"
+lang = "en"
+kind = "paraphrase"
+fact = "p3"
+
+[[query]]
+id = "p4-exact"
+text = "бюджет пилота согласован с финансовой дирекцией"
+lang = "ru"
+kind = "exact"
+fact = "p4"
+
+# ---------------------------------------------------------------- PDF одноколоночный (onecol-en.pdf)
+[[query]]
+id = "o1-exact"
+text = "cooling tower fan blades rebalanced resonance"
+lang = "en"
+kind = "exact"
+fact = "o1"
+
+[[query]]
+id = "o2-para"
+text = "what must be done to monitoring boreholes before taking a water sample"
+lang = "en"
+kind = "paraphrase"
+fact = "o2"
+
+[[query]]
+id = "o3-exact"
+text = "confined space permit valve chamber contractors"
+lang = "en"
+kind = "exact"
+fact = "o3"
+
+[[query]]
+id = "o4-exact"
+text = "pump seal replaced after leak"
+lang = "en"
+kind = "exact"
+fact = "o4"
+
+# ---------------------------------------------------------------- PDF двухколоночный (twocol-en.pdf)
+[[query]]
+id = "t1-exact"
+text = "lithium iron phosphate cells capacity after 3000 cycles"
+lang = "en"
+kind = "exact"
+fact = "t1"
+
+[[query]]
+id = "t2-para"
+text = "what prevented a battery fire from spreading between packs"
+lang = "en"
+kind = "paraphrase"
+fact = "t2"
+
+[[query]]
+id = "t3-exact"
+text = "Module C energy kWh passive air cooling"
+lang = "en"
+kind = "exact"
+fact = "t3"
+
+[[query]]
+id = "t4-cross"
+text = "были ли сбои отопления в Тромсё полярной ночью"
+lang = "ru"
+kind = "cross-lang"
+fact = "t4"
+
+# ---------------------------------------------------------------- PDF кириллица (cyrillic-ru.pdf)
+[[query]]
+id = "c1-exact"
+text = "сварные швы трубопровода ультразвук толщина стенки"
+lang = "ru"
+kind = "exact"
+fact = "c1"
+
+[[query]]
+id = "c2-para"
+text = "когда отопительная станция переключается на тёплый сезон"
+lang = "ru"
+kind = "paraphrase"
+fact = "c2"
+
+[[query]]
+id = "c3-cross"
+text = "how long is the patrol log kept in the dispatch room"
+lang = "en"
+kind = "cross-lang"
+fact = "c3"
+
+# ---------------------------------------------------------------- PDF CJK (cjk-zh.pdf)
+[[query]]
+id = "k1-exact"
+text = "仓库温度 摄氏度"
+lang = "zh"
+kind = "exact"
+fact = "k1"
+
+[[query]]
+id = "k1-cross"
+text = "what temperature range must the warehouse keep"
+lang = "en"
+kind = "cross-lang"
+fact = "k1"
+
+[[query]]
+id = "k2-exact"
+text = "新员工 安全培训"
+lang = "zh"
+kind = "exact"
+fact = "k2"
+
+[[query]]
+id = "k3-exact"
+text = "東京支社 会議室 清掃"
+lang = "ja"
+kind = "exact"
+fact = "k3"
+
+# ---------------------------------------------------------------- PDF 500 страниц (book-500.pdf)
+[[query]]
+id = "b1-exact"
+text = "emergency diesel reserve northern depot litres"
+lang = "en"
+kind = "exact"
+fact = "b1"
+
+[[query]]
+id = "b2-para"
+text = "how much longer were the railway side tracks made"
+lang = "en"
+kind = "paraphrase"
+fact = "b2"
+
+[[query]]
+id = "b3-cross"
+text = "как часто дроны облетают линии электропередачи"
+lang = "ru"
+kind = "cross-lang"
+fact = "b3"
+
+[[query]]
+id = "b4-exact"
+text = "spare transformer windings climate controlled hall"
+lang = "en"
+kind = "exact"
+fact = "b4"
+
+# ---------------------------------------------------------------- враждебный PDF с JavaScript
+[[query]]
+id = "j1-exact"
+text = "backup tape rotation archive servers Thursday"
+lang = "en"
+kind = "exact"
+fact = "j1"

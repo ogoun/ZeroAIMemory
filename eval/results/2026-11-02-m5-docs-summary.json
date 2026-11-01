@@ -1,0 +1,1049 @@
+{
+ "date": "2026-11-02",
+ "corpus_seed": "0xd0c5e720261102",
+ "queries": 45,
+ "runs": {
+  "fts-pdfium-base": {
+   "recall5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.5111111111111111,
+    "hi": 0.7777777777777778
+   },
+   "mrr10": {
+    "mean": 0.6177777777777778,
+    "lo": 0.47772222222222216,
+    "hi": 0.7511111111111111
+   },
+   "loc5": {
+    "mean": 0.5777777777777777,
+    "lo": 0.4222222222222222,
+    "hi": 0.7111111111111111
+   },
+   "loc_ok": {
+    "mean": 0.896551724137931,
+    "lo": 0.7586206896551724,
+    "hi": 1.0
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 10.19335,
+    "p95": 15.799900000000001,
+    "mean": 9.902817484662576
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 12.5618,
+    "p95": 19.159824999999998,
+    "mean": 12.14507576687116
+   },
+   "extract_secs": 4.4730669,
+   "index_secs": 0.0,
+   "commit": "251a72b+dirty.84586688"
+  },
+  "fts-pdfium": {
+   "recall5": {
+    "mean": 0.6222222222222222,
+    "lo": 0.4888888888888889,
+    "hi": 0.7555555555555555
+   },
+   "recall5_attach": {
+    "mean": 0.8,
+    "lo": 0.6888888888888889,
+    "hi": 0.9111111111111111
+   },
+   "mrr10": {
+    "mean": 0.597037037037037,
+    "lo": 0.4577592592592592,
+    "hi": 0.7303703703703702
+   },
+   "loc5": {
+    "mean": 0.6,
+    "lo": 0.4666666666666667,
+    "hi": 0.7333333333333333
+   },
+   "loc_ok": {
+    "mean": 0.9642857142857143,
+    "lo": 0.8928571428571429,
+    "hi": 1.0
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 7.5563,
+    "p95": 14.2342,
+    "mean": 7.7355659509202495
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 10.242049999999999,
+    "p95": 17.15875,
+    "mean": 10.20375
+   },
+   "extract_secs": 3.2957174,
+   "index_secs": 0.0,
+   "commit": "251a72b+dirty.3fd008d5"
+  },
+  "bge-m3-int8-pdfium": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.6906172839506174,
+    "lo": 0.5681265432098765,
+    "hi": 0.8135833333333334
+   },
+   "loc5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.4888888888888889,
+    "hi": 0.7777777777777778
+   },
+   "loc_ok": {
+    "mean": 0.8787878787878788,
+    "lo": 0.7575757575757576,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 12.30925,
+    "p95": 18.007824999999997,
+    "mean": 12.55756687116565
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 15.5972,
+    "p95": 24.067474999999998,
+    "mean": 16.08773036809816
+   },
+   "extract_secs": 18.0131743,
+   "index_secs": 1348.1421337,
+   "commit": "251a72b+dirty.3fd008d5"
+  },
+  "bge-m3-fp16-pdfium": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.7096913580246914,
+    "lo": 0.5907376543209876,
+    "hi": 0.831867283950617
+   },
+   "loc5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.4888888888888889,
+    "hi": 0.7777777777777778
+   },
+   "loc_ok": {
+    "mean": 0.8787878787878788,
+    "lo": 0.7575757575757576,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 11.3375,
+    "p95": 18.515975000000005,
+    "mean": 12.021855214723926
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 14.3679,
+    "p95": 23.903125,
+    "mean": 15.812557668711662
+   },
+   "extract_secs": 18.5778539,
+   "index_secs": 49.3445697,
+   "commit": "251a72b+dirty.3fd008d5"
+  },
+  "bge-m3-fp16-pdfium-rerank": {
+   "recall5": {
+    "mean": 0.9333333333333333,
+    "lo": 0.8444444444444444,
+    "hi": 1.0
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.8814814814814815,
+    "lo": 0.7888888888888889,
+    "hi": 0.9555555555555556
+   },
+   "loc5": {
+    "mean": 0.7555555555555555,
+    "lo": 0.6222222222222222,
+    "hi": 0.8666666666666667
+   },
+   "loc_ok": {
+    "mean": 0.8095238095238095,
+    "lo": 0.6904761904761905,
+    "hi": 0.9285714285714286
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 94.78625,
+    "p95": 121.51905,
+    "mean": 98.22662116564412
+   },
+   "extract_secs": 18.5778539,
+   "index_secs": 16.3930376,
+   "commit": "251a72b+dirty.3fd008d5"
+  },
+  "bge-m3-fp16-pdfium-docs-only": {
+   "recall5": {
+    "mean": 0.9111111111111111,
+    "lo": 0.8222222222222222,
+    "hi": 0.9777777777777777
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.8149029982363315,
+    "lo": 0.7142835097001763,
+    "hi": 0.9074074074074074
+   },
+   "loc5": {
+    "mean": 0.7777777777777778,
+    "lo": 0.6444444444444445,
+    "hi": 0.8888888888888888
+   },
+   "loc_ok": {
+    "mean": 0.8536585365853658,
+    "lo": 0.7317073170731707,
+    "hi": 0.9512195121951219
+   },
+   "latency_before": null,
+   "latency_after": null,
+   "extract_secs": 12.8327879,
+   "index_secs": 47.5603753,
+   "commit": "251a72b+dirty.3fd008d5"
+  },
+  "bge-m3-fp16-pdf-oxide": {
+   "recall5": {
+    "mean": 0.7555555555555555,
+    "lo": 0.6222222222222222,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6899382716049384,
+    "lo": 0.5707330246913579,
+    "hi": 0.8118796296296295
+   },
+   "loc5": {
+    "mean": 0.6666666666666666,
+    "lo": 0.5333333333333333,
+    "hi": 0.8
+   },
+   "loc_ok": {
+    "mean": 0.8823529411764706,
+    "lo": 0.7647058823529411,
+    "hi": 0.9705882352941176
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 11.80025,
+    "p95": 19.2368,
+    "mean": 12.471848159509205
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 14.944849999999999,
+    "p95": 22.769225000000002,
+    "mean": 15.661343251533737
+   },
+   "extract_secs": 18.8867578,
+   "index_secs": 36.4680976,
+   "commit": "251a72b+dirty.27d19d20"
+  },
+  "bge-m3-fp16-pdfium-pf10": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6872222222222223,
+    "lo": 0.5659212962962963,
+    "hi": 0.8122222222222222
+   },
+   "loc5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.4888888888888889,
+    "hi": 0.7777777777777778
+   },
+   "loc_ok": {
+    "mean": 0.8787878787878788,
+    "lo": 0.7575757575757576,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 12.53865,
+    "p95": 19.2791,
+    "mean": 13.050711963190189
+   },
+   "extract_secs": 17.8035477,
+   "index_secs": 0.2382842,
+   "commit": "251a72b+dirty.50f90daf"
+  },
+  "bge-m3-fp16-pdfium-pf30": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6868518518518519,
+    "lo": 0.5653472222222222,
+    "hi": 0.8116759259259259
+   },
+   "loc5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.4888888888888889,
+    "hi": 0.7777777777777778
+   },
+   "loc_ok": {
+    "mean": 0.8787878787878788,
+    "lo": 0.7575757575757576,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 12.5753,
+    "p95": 19.45715,
+    "mean": 13.30389263803681
+   },
+   "extract_secs": 17.8035477,
+   "index_secs": 0.2329636,
+   "commit": "251a72b+dirty.215a148f"
+  },
+  "bge-m3-fp16-pdfium-pf60": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6969135802469135,
+    "lo": 0.5762268518518517,
+    "hi": 0.8129629629629629
+   },
+   "loc5": {
+    "mean": 0.6222222222222222,
+    "lo": 0.4888888888888889,
+    "hi": 0.7555555555555555
+   },
+   "loc_ok": {
+    "mean": 0.8484848484848485,
+    "lo": 0.7272727272727273,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 13.52535,
+    "p95": 21.087125,
+    "mean": 14.251605828220852
+   },
+   "extract_secs": 17.8035477,
+   "index_secs": 0.2428427,
+   "commit": "251a72b+dirty.50f90daf"
+  },
+  "bge-m3-fp16-pdfium-pf120": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6966666666666667,
+    "lo": 0.575,
+    "hi": 0.8137083333333334
+   },
+   "loc5": {
+    "mean": 0.6222222222222222,
+    "lo": 0.4888888888888889,
+    "hi": 0.7555555555555555
+   },
+   "loc_ok": {
+    "mean": 0.8484848484848485,
+    "lo": 0.7272727272727273,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 15.1902,
+    "p95": 21.149874999999998,
+    "mean": 15.610213803680997
+   },
+   "extract_secs": 17.8035477,
+   "index_secs": 0.2341113,
+   "commit": "251a72b+dirty.56892a01"
+  },
+  "fts-pdfium-large": {
+   "recall5": {
+    "mean": 0.7777777777777778,
+    "lo": 0.6666666666666666,
+    "hi": 0.8888888888888888
+   },
+   "recall5_attach": {
+    "mean": 0.7777777777777778,
+    "lo": 0.6666666666666666,
+    "hi": 0.8888888888888888
+   },
+   "mrr10": {
+    "mean": 0.7555555555555555,
+    "lo": 0.6444444444444445,
+    "hi": 0.8666666666666667
+   },
+   "loc5": {
+    "mean": 0.6666666666666666,
+    "lo": 0.5333333333333333,
+    "hi": 0.8
+   },
+   "loc_ok": {
+    "mean": 0.8571428571428571,
+    "lo": 0.7428571428571429,
+    "hi": 0.9714285714285714
+   },
+   "latency_before": null,
+   "latency_after": null,
+   "extract_secs": 31.9326664,
+   "index_secs": 0.0,
+   "commit": "251a72b+dirty.3fd008d5"
+  }
+ },
+ "pdf_ab": {
+  "pdfium": {
+   "layouts": [
+    {
+     "layout": "all",
+     "pages": 79,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 0.9966436517069428,
+      "lo": 0.9907940161104719,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "cjk",
+     "pages": 4,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "one-column",
+     "pages": 68,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "table",
+     "pages": 2,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 0.8674242424242424,
+      "lo": 0.8181818181818182,
+      "hi": 0.9166666666666666
+     },
+     "table_rows": 24,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "two-column",
+     "pages": 5,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    }
+   ],
+   "facts_ok": 19,
+   "facts": 19,
+   "book_ms": 495.4449,
+   "files": [
+    {
+     "file": "files/regulations-ru.docx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.455,
+     "peak_mb": 8.01171875
+    },
+    {
+     "file": "files/onboarding-en.docx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.34259999999999996,
+     "peak_mb": 8.0
+    },
+    {
+     "file": "files/inventory.xlsx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 169.7781,
+     "peak_mb": 19.98046875
+    },
+    {
+     "file": "files/roadmap.pptx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 2.1774,
+     "peak_mb": 7.99609375
+    },
+    {
+     "file": "files/onecol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 13.7609,
+     "peak_mb": 13.38671875
+    },
+    {
+     "file": "files/twocol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.3867,
+     "peak_mb": 13.58203125
+    },
+    {
+     "file": "files/cyrillic-ru.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 7.3519,
+     "peak_mb": 12.07421875
+    },
+    {
+     "file": "files/cjk-zh.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 3.9113,
+     "peak_mb": 11.7265625
+    },
+    {
+     "file": "files/book-500.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 495.4449,
+     "peak_mb": 30.09765625
+    },
+    {
+     "file": "files/scan.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.2761,
+     "peak_mb": 10.359375
+    },
+    {
+     "file": "hostile/broken.pdf",
+     "status": "error",
+     "detail": "документ повреждён: pdf: PdfiumLibraryInternalError(FormatError)",
+     "ms_median": null,
+     "peak_mb": 10.078125
+    },
+    {
+     "file": "hostile/truncated.pdf",
+     "status": "error",
+     "detail": "документ повреждён: pdf: PdfiumLibraryInternalError(FormatError)",
+     "ms_median": null,
+     "peak_mb": 10.03515625
+    },
+    {
+     "file": "hostile/js-action.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 2.5987,
+     "peak_mb": 12.79296875
+    },
+    {
+     "file": "hostile/deep-array.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 26.4482,
+     "peak_mb": 21.13671875
+    },
+    {
+     "file": "hostile/glyph-flood.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 129.3134,
+     "peak_mb": 59.578125
+    },
+    {
+     "file": "hostile/huge-image.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 1.4358000000000002,
+     "peak_mb": 15.37109375
+    },
+    {
+     "file": "large/big-21m.docx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 147.8261,
+     "peak_mb": 103.2578125
+    },
+    {
+     "file": "large/big-300k.xlsx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 1292.6381,
+     "peak_mb": 152.10546875
+    }
+   ]
+  },
+  "pdf-oxide": {
+   "layouts": [
+    {
+     "layout": "all",
+     "pages": 79,
+     "line_recall": {
+      "mean": 0.9956576839308922,
+      "lo": 0.9934635117916834,
+      "hi": 0.9975582269335139
+     },
+     "order": {
+      "mean": 0.998945147679325,
+      "lo": 0.9968354430379747,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 11
+    },
+    {
+     "layout": "cjk",
+     "pages": 4,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "one-column",
+     "pages": 68,
+     "line_recall": {
+      "mean": 0.9949552504491247,
+      "lo": 0.9924840985150436,
+      "hi": 0.9971544684892589
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "table",
+     "pages": 2,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 0.9583333333333333,
+      "lo": 0.9166666666666666,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 11
+    },
+    {
+     "layout": "two-column",
+     "pages": 5,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    }
+   ],
+   "facts_ok": 19,
+   "facts": 19,
+   "book_ms": 458.2546,
+   "files": [
+    {
+     "file": "files/onecol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.4639,
+     "peak_mb": 15.546875
+    },
+    {
+     "file": "files/twocol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.0271,
+     "peak_mb": 15.20703125
+    },
+    {
+     "file": "files/cyrillic-ru.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 8.5443,
+     "peak_mb": 13.671875
+    },
+    {
+     "file": "files/cjk-zh.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.3857,
+     "peak_mb": 11.00390625
+    },
+    {
+     "file": "files/book-500.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 458.2546,
+     "peak_mb": 36.3359375
+    },
+    {
+     "file": "files/scan.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 1.0274,
+     "peak_mb": 9.0703125
+    },
+    {
+     "file": "hostile/broken.pdf",
+     "status": "error",
+     "detail": "Invalid cross-reference table",
+     "ms_median": null,
+     "peak_mb": 8.5390625
+    },
+    {
+     "file": "hostile/truncated.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 2.6841999999999997,
+     "peak_mb": 10.375
+    },
+    {
+     "file": "hostile/js-action.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.9699,
+     "peak_mb": 9.2421875
+    },
+    {
+     "file": "hostile/deep-array.pdf",
+     "status": "crash",
+     "detail": "exit code: 0xc00000fd",
+     "ms_median": null,
+     "peak_mb": null
+    },
+    {
+     "file": "hostile/glyph-flood.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 92.7361,
+     "peak_mb": 83.7265625
+    },
+    {
+     "file": "hostile/huge-image.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.1269,
+     "peak_mb": 22.55859375
+    }
+   ]
+  },
+  "pdf-oxide-plain": {
+   "layouts": [
+    {
+     "layout": "all",
+     "pages": 79,
+     "line_recall": {
+      "mean": 0.9956576839308922,
+      "lo": 0.9934635117916834,
+      "hi": 0.9975582269335139
+     },
+     "order": {
+      "mean": 0.9996408654636503,
+      "lo": 0.9990869889604066,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 24
+    },
+    {
+     "layout": "cjk",
+     "pages": 4,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "one-column",
+     "pages": 68,
+     "line_recall": {
+      "mean": 0.9949552504491247,
+      "lo": 0.9924840985150436,
+      "hi": 0.9971544684892589
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "table",
+     "pages": 2,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 24
+    },
+    {
+     "layout": "two-column",
+     "pages": 5,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 0.9943256743256743,
+      "lo": 0.9881718281718281,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    }
+   ],
+   "facts_ok": 16,
+   "facts": 19,
+   "book_ms": 600.3963,
+   "files": [
+    {
+     "file": "files/onecol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.200399999999998,
+     "peak_mb": 14.83203125
+    },
+    {
+     "file": "files/twocol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.4596,
+     "peak_mb": 14.34375
+    },
+    {
+     "file": "files/cyrillic-ru.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 7.6889,
+     "peak_mb": 13.48828125
+    },
+    {
+     "file": "files/cjk-zh.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.2836,
+     "peak_mb": 11.140625
+    },
+    {
+     "file": "files/book-500.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 600.3963,
+     "peak_mb": 37.41796875
+    },
+    {
+     "file": "files/scan.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.615,
+     "peak_mb": 8.53125
+    },
+    {
+     "file": "hostile/broken.pdf",
+     "status": "error",
+     "detail": "Invalid cross-reference table",
+     "ms_median": null,
+     "peak_mb": 8.5390625
+    },
+    {
+     "file": "hostile/truncated.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 2.5981,
+     "peak_mb": 10.38671875
+    },
+    {
+     "file": "hostile/js-action.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.6891,
+     "peak_mb": 8.7265625
+    },
+    {
+     "file": "hostile/deep-array.pdf",
+     "status": "crash",
+     "detail": "exit code: 0xc00000fd",
+     "ms_median": null,
+     "peak_mb": null
+    },
+    {
+     "file": "hostile/glyph-flood.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 89.8962,
+     "peak_mb": 83.68359375
+    },
+    {
+     "file": "hostile/huge-image.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.2940000000000005,
+     "peak_mb": 22.50390625
+    }
+   ]
+  }
+ },
+ "paired": {
+  "rerank_minus_hybrid_fp16_recall5": [
+   0.2,
+   0.089,
+   0.311
+  ],
+  "int8_minus_fts_recall5": [
+   0.111,
+   0.022,
+   0.222
+  ],
+  "docs_only_minus_with_notes_fp16_recall5": [
+   0.178,
+   0.067,
+   0.289
+  ],
+  "pdf_oxide_minus_pdfium_fp16_recall5": [
+   0.022,
+   0.0,
+   0.067
+  ],
+  "pdf_oxide_minus_pdfium_fp16_mrr10": [
+   -0.02,
+   -0.057,
+   0.003
+  ],
+  "prefetch60_minus_30_mrr10": [
+   0.01,
+   -0.026,
+   0.046
+  ]
+ },
+ "store_scale_ms": {
+  "pending_count_100k_docs": {
+   "before": 97.05,
+   "after": 0.18
+  },
+  "has_attachment_chunks_1m_chunks_other_space": {
+   "before": 935.58,
+   "after": 0.92
+  },
+  "has_attachment_chunks_100k_notes_no_docs_after": 41.14
+ },
+ "decisions": {
+  "pdf_backend": "pdfium",
+  "attach_prefetch": 30,
+  "xlsx_dates": "excel-like for custom numeric formats, ISO otherwise; EXTRACTOR_VERSION=3",
+  "extract_state_index": "migration 0020 attachment_docs_pending",
+  "expand_neighbors": "not needed"
+ }
+}

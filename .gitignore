@@ -7,6 +7,9 @@
 # Rust
 target/
 
+# Набор документов eval (M5): генерируется `cargo xtask docs-corpus`, бинарники не в git
+/eval/docs/
+
 # Web
 web/node_modules/
 web/dist/
