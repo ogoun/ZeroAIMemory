@@ -24,9 +24,12 @@
 //! делят слоты по очереди, один большой архив вложений не занимает конвейер целиком.
 //!
 //! **Неудачи.** Разбор не удался — документ `failed` с причиной (`parse_crash`,
-//! `parse_timeout`, `parse_oom`, `parse_error: …`, `pdfium_unavailable: …`, `too_large`,
-//! `blob_missing`), задание — сразу `failed` (видно в `failed_items` `/index/status`), повтор —
-//! reindex. PDF без pdfium — `failed`, а не `unsupported`: вид поддерживается, недоступна
+//! `parse_timeout`, `parse_oom`, `parse_error: <область>`, `pdfium_unavailable`, `too_large`,
+//! `blob_missing`; без подробностей разборщика и путей сервера), задание — сразу `failed`
+//! (одной транзакцией с состоянием документа; одна строка `failed_items` на документ), повтор —
+//! reindex. Детерминированные неудачи (`parse_error`, вид не поддерживается разборщиком)
+//! кэшируются по (`sha256`, версия извлечения): падающий файл в N заметках разбирается один
+//! раз; документы одного блоба разбираются по очереди (захват блоба). PDF без pdfium — `failed`, а не `unsupported`: вид поддерживается, недоступна
 //! библиотека; при запуске с pdfium такие документы извлекаются снова. Временные ошибки (база,
 //! чтение файла) — повтор с backoff. Неподдерживаемый вид — `unsupported`, без неудачи.
 //!
@@ -45,12 +48,13 @@ use jiff::Timestamp;
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 use zam_core::Id;
-use zam_docs::{DocError, DocKind, Extracted, Limits};
+use zam_docs::{DocError, DocKind, Limits};
 use zam_store::{
-    BLOB_MISSING, BlobStore, Db, ExtractState, Job, JobOutcome, PDFIUM_UNAVAILABLE, StoreError,
-    SystemStore, TOO_LARGE, UserDbs, claim_extract_jobs, complete_job, ensure_extract_jobs,
-    extract_cached, extract_target, fail_job, give_up_job, has_failed_with, put_extract,
-    replace_attachment_chunks, requeue_failed_with, requeue_running_extract, set_extract_state,
+    BLOB_MISSING, BlobStore, CachedExtract, Db, ExtractEnd, ExtractState, Job, JobOutcome,
+    PDFIUM_UNAVAILABLE, StoreError, SystemStore, TOO_LARGE, UserDbs, cached_extract,
+    claim_extract_jobs, complete_job, ensure_extract_jobs, extract_target, fail_job,
+    finish_extract, has_failed_with, put_extract, put_extract_failure, requeue_failed_with,
+    requeue_running_extract,
 };
 
 use super::pool::{DocPool, ParseFailure};
@@ -63,6 +67,9 @@ const BAD_USER_RETRY: Duration = Duration::from_secs(60);
 /// Сколько ждать незаконченные разборы при остановке (затем задания остаются `running` и
 /// возвращаются в очередь при следующем запуске).
 const STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// Блоб пользователя: `(пользователь, sha256)`.
+type BlobKey = (Id, String);
 
 /// Снимок конвейера для `/index/status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -101,6 +108,8 @@ struct Inner {
     /// pdfium загружается (проверка `ping` при запуске — один раз, только если есть документы,
     /// не извлечённые из-за его отсутствия).
     pdfium_ok: tokio::sync::OnceCell<bool>,
+    /// Захваты блобов на время разбора ([`lock_blob`]).
+    blob_locks: Mutex<HashMap<BlobKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Конвейер индексации вложений сервера; дёшево клонируется через `Arc`.
@@ -145,6 +154,7 @@ impl DocIndexer {
             failed: AtomicU64::new(0),
             running: AtomicUsize::new(0),
             pdfium_ok: tokio::sync::OnceCell::new(),
+            blob_locks: Mutex::default(),
         });
         let task = tokio::spawn(run(inner.clone(), rx));
         *lock(&inner.task) = Some(task);
@@ -334,12 +344,11 @@ async fn startup(inner: &Inner, user: Id, db: &Db) {
 
 /// Чем закончилось извлечение документа.
 enum Step {
-    /// Чанки записаны (или документу извлечение уже не нужно: скрыт, откреплён, не `pending`).
-    Done,
-    /// Вид не поддерживается.
-    Unsupported,
-    /// Окончательная неудача: причина для `extract_error` (без текста документа).
-    Failed(String),
+    /// Извлечению конец без записи (документ скрыт, откреплён, уже не `pending`): задание
+    /// закрывается.
+    Skip,
+    /// Итог для базы: чанки, `unsupported` или `failed` — одной транзакцией с заданием.
+    End(ExtractEnd),
     /// Временная ошибка (база, чтение файла): повтор с backoff.
     Retry(String),
 }
@@ -350,32 +359,19 @@ impl From<StoreError> for Step {
     }
 }
 
-/// Задание извлечения: шаг и его итог в базе (состояние документа, задание).
+/// Задание извлечения: шаг и его итог в базе (состояние документа и задание — одной
+/// транзакцией, [`zam_store::finish_extract`]).
 async fn process(inner: &Inner, user: Id, db: &Db, job: Job) {
     let att = job.target_id;
-    let step = extract_doc(inner, user, db, att).await;
-    let outcome = match step {
-        Step::Done => complete_job(db, job.id, job.claim_gen).await,
-        Step::Unsupported => {
-            match set_extract_state(db, att, ExtractState::Unsupported, None).await {
-                Ok(()) | Err(StoreError::NotFound) => complete_job(db, job.id, job.claim_gen).await,
-                Err(e) => {
-                    fail_job(db, job.id, job.claim_gen, &e.to_string(), Timestamp::now()).await
-                }
+    let outcome = match extract_doc(inner, user, db, att).await {
+        Step::Skip => complete_job(db, job.id, job.claim_gen).await,
+        Step::End(end) => {
+            if let ExtractEnd::Failed(reason) = &end {
+                inner.failed.fetch_add(1, Ordering::SeqCst);
+                tracing::warn!(user = %user, attachment = %att, reason = %reason, "вложение не извлечено");
             }
-        }
-        Step::Failed(reason) => {
-            inner.failed.fetch_add(1, Ordering::SeqCst);
-            tracing::warn!(
-                user = %user,
-                attachment = %att,
-                reason = zam_store::error_code(&reason),
-                "вложение не извлечено"
-            );
-            match set_extract_state(db, att, ExtractState::Failed, Some(&reason)).await {
-                Ok(()) | Err(StoreError::NotFound) => {
-                    give_up_job(db, job.id, job.claim_gen, &reason).await
-                }
+            match finish_extract(db, job.id, job.claim_gen, att, end).await {
+                Ok(o) => Ok(o),
                 Err(e) => {
                     fail_job(db, job.id, job.claim_gen, &e.to_string(), Timestamp::now()).await
                 }
@@ -411,21 +407,61 @@ async fn sniff(
     .map_err(std::io::Error::other)?
 }
 
+/// Захват блоба `sha` пользователя `user` на время разбора: второй документ того же файла ждёт
+/// первого и берёт результат из кэша, а не разбирает файл параллельно во втором слоте.
+async fn lock_blob<'a>(inner: &'a Inner, user: Id, sha: &str) -> BlobGuard<'a> {
+    let key = (user, sha.to_string());
+    let m = lock(&inner.blob_locks)
+        .entry(key.clone())
+        .or_default()
+        .clone();
+    let guard = m.clone().lock_owned().await;
+    BlobGuard {
+        inner,
+        key,
+        _guard: guard,
+        lock: m,
+    }
+}
+
+/// Захват блоба ([`lock_blob`]); при освобождении последний захват снимает запись карты.
+struct BlobGuard<'a> {
+    inner: &'a Inner,
+    key: (Id, String),
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for BlobGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = lock(&self.inner.blob_locks);
+        // карта и этот захват — больше ссылок нет
+        if Arc::strong_count(&self.lock) <= 3 {
+            map.remove(&self.key);
+        }
+    }
+}
+
 /// Извлечение документа `att` пользователя `user`.
 async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
     let t = match extract_target(db, att).await {
         Ok(Some(t)) => t,
-        Ok(None) => return Step::Done,
+        Ok(None) => return Step::Skip,
         Err(e) => return e.into(),
     };
     // скрыт, откреплён или уже обработан: восстановление поставит задание заново
     if !t.live || t.state != ExtractState::Pending {
-        return Step::Done;
+        return Step::Skip;
     }
-    match extract_cached(db, &t.blob_sha256).await {
-        Ok(Some(x)) => {
+    let _blob = lock_blob(inner, user, &t.blob_sha256).await;
+    match cached_extract(db, &t.blob_sha256).await {
+        Ok(Some(c)) => {
             inner.cache_hits.fetch_add(1, Ordering::SeqCst);
-            return store(db, att, &x).await;
+            return Step::End(match c {
+                CachedExtract::Extracted(x) => ExtractEnd::Units(x.units),
+                CachedExtract::Failed(reason) => ExtractEnd::Failed(reason),
+                CachedExtract::Unsupported => ExtractEnd::Unsupported,
+            });
         }
         Ok(None) => {}
         Err(e) => return e.into(),
@@ -434,20 +470,21 @@ async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
     let (kind, size) = match sniff(path.clone(), t.filename.clone(), inner.limits.clone()).await {
         Ok(v) => v,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Step::Failed(BLOB_MISSING.into());
+            return Step::End(ExtractEnd::Failed(BLOB_MISSING.into()));
         }
         Err(e) => return Step::Retry(format!("файл вложения: {e}")),
     };
+    // вид и размер — по файлу и `[docs]` (не кэшируются: дёшевы и зависят от конфигурации)
     let Some(kind) = kind else {
-        return Step::Unsupported;
+        return Step::End(ExtractEnd::Unsupported);
     };
     if size > inner.limits.max_bytes {
-        return Step::Failed(TOO_LARGE.into());
+        return Step::End(ExtractEnd::Failed(TOO_LARGE.into()));
     }
     let bytes = match read(&path).await {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Step::Failed(BLOB_MISSING.into());
+            return Step::End(ExtractEnd::Failed(BLOB_MISSING.into()));
         }
         Err(e) => return Step::Retry(format!("файл вложения: {e}")),
     };
@@ -455,7 +492,19 @@ async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
     let started = Instant::now();
     let x = match inner.pool.extract(kind, bytes).await {
         Ok(x) => x,
-        Err(f) => return failure(inner, kind, f),
+        Err(f) => {
+            let (end, cache) = failure(inner, kind, f);
+            if cache {
+                let reason = match &end {
+                    ExtractEnd::Failed(r) => Some(r.as_str()),
+                    _ => None,
+                };
+                if let Err(e) = put_extract_failure(db, &t.blob_sha256, reason).await {
+                    tracing::warn!(error = %e, "неудача разбора не записана в кэш");
+                }
+            }
+            return Step::End(end);
+        }
     };
     tracing::debug!(
         user = %user,
@@ -469,7 +518,7 @@ async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
     if let Err(e) = put_extract(db, &t.blob_sha256, &x).await {
         return e.into();
     }
-    store(db, att, &x).await
+    Step::End(ExtractEnd::Units(x.units))
 }
 
 /// Чтение файла блоба (не больше `max_bytes`: размер проверен до чтения).
@@ -477,51 +526,55 @@ async fn read(path: &Path) -> std::io::Result<Bytes> {
     tokio::fs::read(path).await.map(Bytes::from)
 }
 
-/// Причина неудачи разбора для `extract_error`.
-fn failure(inner: &Inner, kind: DocKind, f: ParseFailure) -> Step {
+/// Итог неудачного разбора для базы и признак «кэшировать» (неудача — свойство файла этой
+/// версии извлечения). В `extract_error` — код и область ([`DocError::area`]), без
+/// подробностей разборщика (имён тегов, сущностей) и без путей сервера: причина
+/// недоступности pdfium (путь библиотеки) — только в журнал и администратору в `/index/status`.
+fn failure(inner: &Inner, kind: DocKind, f: ParseFailure) -> (ExtractEnd, bool) {
     match f {
-        // PDF без pdfium: вид поддерживается, библиотеки нет
+        // PDF без pdfium: вид поддерживается, библиотеки нет (не кэшируется: не свойство файла)
         ParseFailure::Doc(DocError::Unsupported) if kind == DocKind::Pdf => {
-            let why = inner
-                .pool
-                .pdfium_error()
-                .unwrap_or_else(|| "pdfium не загружен".into());
-            Step::Failed(format!("{PDFIUM_UNAVAILABLE}: {why}"))
+            tracing::warn!(
+                pdfium = inner
+                    .pool
+                    .pdfium_error()
+                    .as_deref()
+                    .unwrap_or("pdfium не загружен"),
+                "PDF не разобран: pdfium недоступен"
+            );
+            (ExtractEnd::Failed(PDFIUM_UNAVAILABLE.into()), false)
         }
-        ParseFailure::Doc(DocError::Unsupported) => Step::Unsupported,
-        ParseFailure::Doc(DocError::TooLarge) => Step::Failed(TOO_LARGE.into()),
-        ParseFailure::Doc(e) => Step::Failed(format!("{}: {e}", f_reason(&e))),
-        other => Step::Failed(other.reason().into()),
+        ParseFailure::Doc(DocError::Unsupported) => (ExtractEnd::Unsupported, true),
+        ParseFailure::Doc(DocError::TooLarge) => (ExtractEnd::Failed(TOO_LARGE.into()), false),
+        // срок истёк без частичного результата — сбой, а не свойство файла
+        ParseFailure::Doc(DocError::Timeout) => (ExtractEnd::Failed("parse_timeout".into()), false),
+        ParseFailure::Doc(e) => (
+            ExtractEnd::Failed(format!("{}: {}", PARSE_ERROR, e.area())),
+            true,
+        ),
+        other => (ExtractEnd::Failed(other.reason().into()), false),
     }
 }
 
-/// Причина ошибки документа (`parse_timeout` — срок истёк без частичного результата).
-fn f_reason(e: &DocError) -> &'static str {
-    match e {
-        DocError::Timeout => "parse_timeout",
-        _ => "parse_error",
-    }
-}
-
-/// Чанки документа из извлечения. Документ скрыт или откреплён во время разбора — результат
-/// бросается (кэш остаётся).
-async fn store(db: &Db, att: Id, x: &Extracted) -> Step {
-    match replace_attachment_chunks(db, att, &x.units).await {
-        Ok(()) | Err(StoreError::NotFound) => Step::Done,
-        Err(e) => e.into(),
-    }
-}
+/// Код ошибки документа (`DocError::Malformed`, `Internal`).
+const PARSE_ERROR: &str = "parse_error";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn doc_error_reasons() {
-        assert_eq!(f_reason(&DocError::Timeout), "parse_timeout");
-        assert_eq!(f_reason(&DocError::Malformed("x".into())), "parse_error");
+    fn parse_error_reason_has_area_only() {
+        let e =
+            DocError::Malformed("xml (word/document.xml): неизвестная сущность &секрет;".into());
+        assert_eq!(e.area(), "xml (word/document.xml)");
         assert_eq!(
-            zam_store::error_code("parse_error: zip: битый"),
+            format!("{PARSE_ERROR}: {}", e.area()),
+            "parse_error: xml (word/document.xml)"
+        );
+        assert_eq!(DocError::Internal("тег <w:p>".into()).area(), "internal");
+        assert_eq!(
+            zam_store::error_code("parse_error: xml (word/document.xml)"),
             "parse_error"
         );
         assert_eq!(zam_store::error_code("parse_crash"), "parse_crash");

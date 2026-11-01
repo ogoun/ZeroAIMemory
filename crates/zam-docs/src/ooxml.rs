@@ -162,7 +162,7 @@ impl<'a> Package<'a> {
                 ctx.warn(format!("skipped: {real}"));
                 return Ok(None);
             }
-            Err(e) => return Err(DocError::Malformed(format!("zip {real}: {e}"))),
+            Err(e) => return Err(DocError::Malformed(format!("zip ({real}): {e}"))),
         };
         if file.encrypted()
             || !matches!(
@@ -196,7 +196,7 @@ impl<'a> Package<'a> {
             let n = match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(e) => return Err(DocError::Malformed(format!("zip {real}: {e}"))),
+                Err(e) => return Err(DocError::Malformed(format!("zip ({real}): {e}"))),
             };
             raw += n as u64;
             // выход UTF-8 (UTF-16 раскодируется по ходу) и вход ограничены одним `left`
@@ -220,7 +220,9 @@ impl<'a> Package<'a> {
         drop(file);
         sink.finish(&mut buf, left);
         if sink.bad_utf16 && !truncated {
-            return Err(DocError::Malformed(format!("invalid utf-16 in {real}")));
+            return Err(DocError::Malformed(format!(
+                "encoding ({real}): invalid utf-16"
+            )));
         }
         self.unpacked += raw.max(buf.len() as u64);
         let text = decode(buf, &real, truncated)?;
@@ -663,9 +665,11 @@ fn decode(mut buf: Vec<u8>, part: &str, truncated: bool) -> Result<String, DocEr
             let mut b = e.into_bytes();
             b.truncate(valid);
             String::from_utf8(b)
-                .map_err(|_| DocError::Malformed(format!("invalid utf-8 in {part}")))
+                .map_err(|_| DocError::Malformed(format!("encoding ({part}): invalid utf-8")))
         }
-        Err(_) => Err(DocError::Malformed(format!("invalid utf-8 in {part}"))),
+        Err(_) => Err(DocError::Malformed(format!(
+            "encoding ({part}): invalid utf-8"
+        ))),
     }
 }
 
@@ -755,14 +759,14 @@ impl<'x> Xml<'x> {
                     if self.lenient {
                         return Ok(None);
                     }
-                    return Err(DocError::Malformed(format!("{}: {e}", self.part)));
+                    return Err(DocError::Malformed(format!("xml ({}): {e}", self.part)));
                 }
             };
             match ev {
                 Event::DocType(_) => {
                     self.done = true;
                     return Err(DocError::Malformed(format!(
-                        "{}: <!DOCTYPE> запрещён",
+                        "xml ({}): <!DOCTYPE> запрещён",
                         self.part
                     )));
                 }
@@ -799,7 +803,7 @@ impl<'x> Xml<'x> {
                         None => {
                             self.done = true;
                             return Err(DocError::Malformed(format!(
-                                "{}: неизвестная сущность &{};",
+                                "xml ({}): неизвестная сущность &{};",
                                 self.part, &*r
                             )));
                         }

@@ -39,11 +39,12 @@ pub mod vault;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use attachments::{
-    AttachmentDoc, BLOB_MISSING, CHUNKER_ATTACHMENTS_KEY, DocIntake, ExtractState, ExtractTarget,
-    PDFIUM_UNAVAILABLE, ReindexAttachment, TOO_LARGE, attachment_chunker_fingerprint,
-    attachment_chunks_for_index, attachment_pieces, detach, enqueue_attachment_upserts,
-    ensure_extract_jobs, error_code, extract_cached, extract_target, has_failed_with,
-    list_attachments, put_extract, rechunk_docs_if_stale, reindex_attachments_page, reindex_docs,
+    AttachmentDoc, BLOB_MISSING, CHUNKER_ATTACHMENTS_KEY, CachedExtract, DocIntake, ExtractEnd,
+    ExtractState, ExtractTarget, PDFIUM_UNAVAILABLE, ReindexAttachment, TOO_LARGE,
+    attachment_chunker_fingerprint, attachment_chunks_for_index, attachment_pieces, cached_extract,
+    detach, enqueue_attachment_upserts, ensure_extract_jobs, error_code, extract_cached,
+    extract_target, finish_extract, has_failed_with, list_attachments, put_extract,
+    put_extract_failure, rechunk_docs_if_stale, reindex_attachments_page, reindex_docs,
     replace_attachment_chunks, requeue_failed_with, set_extract_state,
 };
 pub use blobs::{

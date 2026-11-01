@@ -931,6 +931,58 @@ H: заполнился до 5 ГБ: `target/debug` вырос до 290 ГБ, и
 
 `target/debug` снова вырос на ~130 ГБ за 6 часов. В `Cargo.toml` профиль dev: `debug = "line-tables-only"` для своих крейтов, `debug = false` для зависимостей. Трассировки паник с файлом и строкой сохраняются; отладчику доступны только строки. Один полный пересбор.
 
+#### Задача 5 — раунд правок 1 (2026-11-01)
+
+Ревью: CHANGES_REQUESTED (пробы — `.tmp/review-m5-task5/probes/`). Linux-стенд по c088dee
+зелёный (`attachments_index` 9/9 с `ZAM_REQUIRE_ML=1`). Поверх 5a1e439 (профиль dev без полной
+debuginfo).
+
+- **(I-1) Точки вложения терялись навсегда.** Документ снова `pending` с прежними чанками
+  (перенарезка при открытии базы), пока ждёт извлечения, — его точки удаляет reindex из кэша
+  (страница — только `done`) или удаление узла с восстановлением (`requeue_doc` ставит только
+  извлечение); повторное извлечение давало ту же нарезку и выходило до `upsert`. Теперь
+  `write_chunks` (тело `replace_attachment_chunks`) читает прежний `extract_state`: документ был
+  не `done` — `upsert` ради точек и при той же нарезке (кроме Human). Тест на Qdrant
+  `points_restored_after_pending_with_same_chunks` (оба сценария: reindex из кэша; удаление и
+  восстановление узла), store-тест `finish_extract_one_failed_row_and_points_after_same_chunks`
+  (`done` с той же нарезкой — без задания).
+- **(M-1) Итог извлечения — одна транзакция.** `zam_store::finish_extract(db, job, gen, att,
+  ExtractEnd::{Units, Unsupported, Failed})`: чанки и `done` / `unsupported` / `failed` с причиной —
+  вместе с закрытием задания (`complete_in`, `give_up_in` — тела `complete_job` и `give_up_job`
+  внутри транзакции). Нарезка — `spawn_blocking` до транзакции. Конвейер больше не вызывает
+  `set_extract_state` и `replace_attachment_chunks` отдельно от задания; без записи (документ
+  скрыт, не `pending`) — `complete_job`, временная ошибка — `fail_job` (одна транзакция).
+- **(M-2) Одна строка `failed_items` на документ.** `give_up_in` и окончательная неудача
+  `fail_job` у документа вложения снимают его прежние `failed`-строки (`drop_older_failed`);
+  успешное извлечение — все. У узлов прежние неудачи снимает успешный reindex
+  (`finish_reindexed`) — поведение узлов не менялось.
+- **(M-3) Путь сервера не виден токену.** Секция `docs` `/index/status` (причина pdfium с путём и
+  счётчики по всем пользователям) — только администратору, токену — `null`. `extract_error` PDF
+  без pdfium — код `pdfium_unavailable` без причины; причина с путём — WARN в журнал. Тест
+  `failure_reasons_without_paths_or_document_text`.
+- **(M-4) `parse_error` без строк документа.** `DocError::area()` (`zam-docs`) — область без
+  подробностей: текст `Malformed` до первого `": "`, ≤ 120 символов. Сообщения `zam-docs`
+  приведены к виду `<область>: <подробности>`: `xml (<часть>)` (ошибка quick-xml, `<!DOCTYPE>`,
+  неизвестная сущность), `zip (<часть>)`, `encoding (<часть>)` (неверный UTF-8/UTF-16), `part
+  (<часть>)` (нет главной части); `zip`, `cfb`, `xls`, `xlsx`, `ods`, `pdf` — как были.
+  `extract_error` = `parse_error: <область>` (например `parse_error: xml (word/document.xml)`),
+  подробности разборщика не пишутся ни в базу, ни в журнал. `Internal` — `internal`, срок без
+  результата — `parse_timeout`.
+- **(M-5) Кэш детерминированных неудач.** `put_extract_failure` пишет в `blob_extract` строку
+  `kind = failed` (причина в `warnings`) или `kind = unsupported` по (`sha256`,
+  `EXTRACTOR_VERSION`); `cached_extract` отдаёт `Extracted | Failed | Unsupported`,
+  `extract_cached` такие строки считает промахом без WARN. Кэшируются `parse_error` и
+  «вид не поддерживается разборщиком»; не кэшируются сбои процесса (`parse_crash`,
+  `parse_timeout`, `parse_oom`), `pdfium_unavailable`, а также `too_large` и `unsupported` по
+  `sniff` — их проверка до разбора дешёвая и зависит от `[docs]` (кэш по файлу ошибся бы при смене
+  лимитов). Новая версия извлечения — новый ключ: неудача разбирается заново. **Захват блоба:**
+  документы одного (`пользователь`, `sha256`) разбираются по очереди (`tokio::sync::Mutex` на блоб,
+  запись карты снимает последний захват) — второй берёт результат из кэша, а не разбирает тот же
+  файл во втором слоте; ожидающий занимает слот (простота важнее). Тест
+  `failing_file_parsed_once_for_many_attachments` (4 заметки — 1 разбор, 4 строки `failed_items`).
+- Тест `failed_extract_reported_in_index_status` — без изменений (коды те же).
+- Проверки: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `clippy -p zam-index --features edge` — чисто; `cargo test -p zam-store -p zam-docs` — 379 passed (6 ignored), в т.ч. `attachments` 13; `-p zam-server`: lib 193 (1 ignored), `attachments_index` 12 (+3), `blobs` 10, `doc_worker` 10 (1 ignored), `nodes` 15, `index_api` 4, `index_worker` 10 (1 ignored); `-p zam-index`: lib 38, `worker` 16 (2 ignored), `qdrant` 28 — всё зелёное (Windows, MiniLM + Qdrant + pdfium).
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
@@ -1092,9 +1144,7 @@ H: заполнился до 5 ГБ: `target/debug` вырос до 290 ГБ, и
 - **Payload точек вложений без `tags`/`certainty` заметки, `area` — на момент извлечения:**
   правка `area` во frontmatter заметки не обновляет точки её вложений (до переноса или reindex).
   Решить в задаче 6 по фильтрам выдачи вложений.
-- **Неудача разбора не кэшируется:** тот же падающий файл в другой заметке разбирается снова
-  (`blob_extract` без строки ошибки). Кэшировать причину по (`sha256`, версия) — если на корпусе
-  враждебных файлов (задача 10) это заметно.
+- ~~Неудача разбора не кэшируется~~ — сделано в раунде правок 1 (M-5).
 - **`too_large` при загрузке** — `failed` без задания: в `failed_items` не попадает (виден в
   `GET /nodes/{id}/attachments`), в отличие от `too_large` конвейера.
 - **Пробуждение конвейера** — после загрузки и записей узлов; смена GUID решения и reindex — по

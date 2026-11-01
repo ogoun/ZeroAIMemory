@@ -52,7 +52,7 @@ pub(crate) fn extract(bytes: &[u8], ctx: &mut Ctx) -> Result<Vec<Unit>, DocError
         if ctx.stopped() {
             return Ok(Vec::new());
         }
-        return Err(DocError::Malformed(format!("нет части {main}")));
+        return Err(DocError::Malformed(format!("part ({main}): нет части")));
     };
     let mut body = Body::new(&styles);
     body.walk(&mut Xml::new(&doc, ctx), ctx)?;

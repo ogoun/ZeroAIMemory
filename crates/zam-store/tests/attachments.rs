@@ -935,3 +935,86 @@ async fn attachment_chunks_for_index_payload_split_and_human_guard() {
             .is_empty()
     );
 }
+
+/// Ревью задачи 5 (M-1, M-2, I-1): итог извлечения — одной транзакцией с заданием
+/// (`finish_extract`); повтор после reindex и новая неудача оставляют в `failed_jobs` одну строку
+/// документа; `done` с той же нарезкой после `pending` ставит задание точек.
+#[tokio::test]
+async fn finish_extract_one_failed_row_and_points_after_same_chunks() {
+    use zam_store::{ExtractEnd, JobOutcome, enqueue_reindex, failed_jobs, finish_extract};
+    let env = setup("finish").await;
+    let n = note(&env.db, env.k, "n", "текст").await;
+    put_attach(&env, n, b"doc", "d.txt", Some(DocKind::Text)).await;
+    let d = doc_of(&list_attachments(&env.db, n).await.unwrap(), "d.txt");
+    for round in 0..3 {
+        let jobs = claim_extract_jobs(&env.db, 10, jiff::Timestamp::now())
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1, "раунд {round}: {jobs:?}");
+        let o = finish_extract(
+            &env.db,
+            jobs[0].id,
+            jobs[0].claim_gen,
+            d.id,
+            ExtractEnd::Failed("parse_error: xml (word/document.xml)".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(o, JobOutcome::Failed);
+        let mine: Vec<_> = failed_jobs(&env.db, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.node_id == d.id)
+            .collect();
+        assert_eq!(mine.len(), 1, "раунд {round}: одна строка неудачи");
+        assert_eq!(mine[0].reason.as_deref(), Some("parse_error"));
+        let st = doc_of(&list_attachments(&env.db, n).await.unwrap(), "d.txt");
+        assert_eq!(st.extract_state, ExtractState::Failed);
+        enqueue_reindex(&env.db, None).await.unwrap();
+    }
+    // успех снимает неудачи; та же нарезка после `pending` — задание точек
+    let units = units(&[("", "текст документа")]);
+    let jobs = claim_extract_jobs(&env.db, 10, jiff::Timestamp::now())
+        .await
+        .unwrap();
+    finish_extract(
+        &env.db,
+        jobs[0].id,
+        jobs[0].claim_gen,
+        d.id,
+        ExtractEnd::Units(units.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(failed_jobs(&env.db, 100).await.unwrap().is_empty());
+    drop_jobs(&env.db).await;
+    // документ снова `pending` (перенарезка), чанки прежние
+    env.db
+        .write(move |t| {
+            t.execute(
+                "UPDATE attachment_docs SET extract_state = 'pending' WHERE id = ?1",
+                [d.id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    replace_attachment_chunks(&env.db, d.id, &units)
+        .await
+        .unwrap();
+    assert_eq!(
+        active_job(&env.db, "attachment", d.id).await.as_deref(),
+        Some("upsert"),
+        "та же нарезка после pending — задание точек"
+    );
+    drop_jobs(&env.db).await;
+    replace_attachment_chunks(&env.db, d.id, &units)
+        .await
+        .unwrap();
+    assert_eq!(
+        active_job(&env.db, "attachment", d.id).await,
+        None,
+        "done и та же нарезка — без задания"
+    );
+}

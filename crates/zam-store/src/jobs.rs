@@ -461,20 +461,40 @@ fn requeue_dirty(c: &Connection, id: i64, now: &str) -> Result<JobOutcome, Store
 /// [`finish_reindexed`]): между закрытием задания и отметкой не вклинится перенос или
 /// восстановление, поставившее новое задание.
 pub async fn complete_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome, StoreError> {
-    db.write(move |tx| {
-        let Some((node, rev, op, _, dirty)) = claimed(tx, id, claim_gen)? else {
-            return Ok(JobOutcome::Stale);
-        };
-        if dirty {
-            return requeue_dirty(tx, id, &fmt_ts(Timestamp::now()));
-        }
-        tx.execute("DELETE FROM index_jobs WHERE id = ?1", [id])?;
-        if op == JobOp::Upsert && !has_active_target(tx, node)? {
-            set_target_state(tx, node, rev, IndexState::Indexed)?;
-        }
-        Ok(JobOutcome::Done)
-    })
-    .await
+    db.write(move |tx| complete_in(tx, id, claim_gen)).await
+}
+
+/// [`complete_job`] внутри открытой транзакции писателя (итог задания вместе с его результатом).
+pub(crate) fn complete_in(
+    tx: &Connection,
+    id: i64,
+    claim_gen: i64,
+) -> Result<JobOutcome, StoreError> {
+    let Some((node, rev, op, _, dirty)) = claimed(tx, id, claim_gen)? else {
+        return Ok(JobOutcome::Stale);
+    };
+    if dirty {
+        return requeue_dirty(tx, id, &fmt_ts(Timestamp::now()));
+    }
+    tx.execute("DELETE FROM index_jobs WHERE id = ?1", [id])?;
+    if op == JobOp::Upsert && !has_active_target(tx, node)? {
+        set_target_state(tx, node, rev, IndexState::Indexed)?;
+    }
+    Ok(JobOutcome::Done)
+}
+
+/// Прежние неудавшиеся задания документа вложения `t`, кроме `keep`, снимаются: в
+/// `failed_items` — одна строка на документ (последняя неудача), а не по строке на каждый
+/// reindex. У узлов прежние неудачи снимает успешный reindex ([`finish_reindexed`]).
+fn drop_older_failed(tx: &Connection, t: TargetRef, keep: i64) -> Result<(), StoreError> {
+    if t.kind == TargetKind::Attachment {
+        tx.prepare_cached(
+            "DELETE FROM index_jobs
+             WHERE target_kind = 'attachment' AND target_id = ?1 AND state = 'failed' AND id <> ?2",
+        )?
+        .execute(params![t.id, keep])?;
+    }
+    Ok(())
 }
 
 /// У узла есть задание `queued` или `running`.
@@ -542,6 +562,7 @@ pub async fn fail_job(
             if op == JobOp::Upsert {
                 set_target_state(tx, node, rev, IndexState::Failed)?;
             }
+            drop_older_failed(tx, node, id)?;
             return Ok(JobOutcome::Failed);
         }
         let next = fmt_ts(now + SignedDuration::from_secs(backoff_secs(attempts)));
@@ -585,27 +606,38 @@ pub async fn give_up_job(
     claim_gen: i64,
     err: &str,
 ) -> Result<JobOutcome, StoreError> {
+    let err = err.to_string();
+    db.write(move |tx| give_up_in(tx, id, claim_gen, &err))
+        .await
+}
+
+/// [`give_up_job`] внутри открытой транзакции писателя. Прежние неудачи документа вложения
+/// снимаются (одна строка `failed_items` на документ).
+pub(crate) fn give_up_in(
+    tx: &Connection,
+    id: i64,
+    claim_gen: i64,
+    err: &str,
+) -> Result<JobOutcome, StoreError> {
     let err: String = err.chars().take(LAST_ERROR_MAX_CHARS).collect();
-    db.write(move |tx| {
-        let Some((target, rev, op, attempts, dirty)) = claimed(tx, id, claim_gen)? else {
-            return Ok(JobOutcome::Stale);
-        };
-        let stamp = fmt_ts(Timestamp::now());
-        if dirty {
-            return requeue_dirty(tx, id, &stamp);
-        }
-        tx.execute(
-            "UPDATE index_jobs SET state = 'failed', attempts = ?2, last_error = ?3,
-                                   updated_at = ?4
-             WHERE id = ?1",
-            params![id, attempts + 1, err, stamp],
-        )?;
-        if op == JobOp::Upsert {
-            set_target_state(tx, target, rev, IndexState::Failed)?;
-        }
-        Ok(JobOutcome::Failed)
-    })
-    .await
+    let Some((target, rev, op, attempts, dirty)) = claimed(tx, id, claim_gen)? else {
+        return Ok(JobOutcome::Stale);
+    };
+    let stamp = fmt_ts(Timestamp::now());
+    if dirty {
+        return requeue_dirty(tx, id, &stamp);
+    }
+    tx.execute(
+        "UPDATE index_jobs SET state = 'failed', attempts = ?2, last_error = ?3,
+                               updated_at = ?4
+         WHERE id = ?1",
+        params![id, attempts + 1, err, stamp],
+    )?;
+    if op == JobOp::Upsert {
+        set_target_state(tx, target, rev, IndexState::Failed)?;
+    }
+    drop_older_failed(tx, target, id)?;
+    Ok(JobOutcome::Failed)
 }
 
 /// Число живых заметок, записей журналов и извлечённых документов вложений (не Human), уже

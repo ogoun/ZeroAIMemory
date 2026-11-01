@@ -268,19 +268,26 @@ pub async fn status(
         }
         Principal::Token(_) | Principal::User { .. } => Value::Null,
     };
-    let docs = st.docs.status();
+    // конвейер вложений (M5) — только администратору: причина недоступности pdfium содержит
+    // путь установки сервера, счётчики — сумма по всем пользователям; токену — `null`
+    let docs = match p {
+        Principal::Admin { .. } => {
+            let d = st.docs.status();
+            json!({
+                // `null` — pdfium загружен или PDF ещё не разбирались
+                "pdfium_error": d.pdfium_error,
+                "workers": d.workers,
+                "running": d.running,
+                "extracted": d.extracted,
+                "cache_hits": d.cache_hits,
+                "failed": d.failed,
+                "spawned": d.spawned,
+            })
+        }
+        Principal::Token(_) | Principal::User { .. } => Value::Null,
+    };
     Ok(Json(json!({
-        // конвейер вложений (M5): причина недоступности pdfium (`null` — загружен или PDF ещё не
-        // разбирались), слоты и счётчики с запуска
-        "docs": {
-            "pdfium_error": docs.pdfium_error,
-            "workers": docs.workers,
-            "running": docs.running,
-            "extracted": docs.extracted,
-            "cache_hits": docs.cache_hits,
-            "failed": docs.failed,
-            "spawned": docs.spawned,
-        },
+        "docs": docs,
         "vector": {
             "available": reason.is_none(),
             "reason": reason.map(|r| r.as_str()),

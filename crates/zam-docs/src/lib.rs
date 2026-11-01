@@ -151,6 +151,27 @@ pub enum DocError {
     Internal(String),
 }
 
+/// Предел [`DocError::area`], символов.
+const AREA_MAX_CHARS: usize = 120;
+
+impl DocError {
+    /// Где случилась ошибка — без подробностей разборщика (имён тегов, сущностей, строк
+    /// документа): для хранения в базе и показа пользователю. Сообщение `Malformed` имеет вид
+    /// `<область>: <подробности>`, область — вид части и её имя: `xml (word/document.xml)`,
+    /// `zip`, `zip (xl/sharedStrings.xml)`, `encoding (word/document.xml)`, `part
+    /// (word/document.xml)`, `cfb`, `xls`, `pdf`. Не длиннее 120 символов.
+    pub fn area(&self) -> String {
+        let s = match self {
+            DocError::TooLarge => "too_large",
+            DocError::Unsupported => "unsupported",
+            DocError::Timeout => "timeout",
+            DocError::Internal(_) => "internal",
+            DocError::Malformed(m) => m.split(": ").next().unwrap_or(m),
+        };
+        s.chars().take(AREA_MAX_CHARS).collect()
+    }
+}
+
 /// Извлекает структуру документа вида `kind` из `bytes` в пределах `limits` и срока `deadline`.
 ///
 /// PDF здесь не разбирается ([`DocError::Unsupported`]): только в рабочем процессе (§2).

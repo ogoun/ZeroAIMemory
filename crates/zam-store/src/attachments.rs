@@ -46,8 +46,8 @@ use crate::certainty::{CertaintyChange, check_certainty};
 use crate::embeddings::embed_key_of;
 use crate::entries::Certainty;
 use crate::jobs::{
-    AttachmentPayload, IndexChunk, JobOp, NodePayload, PRIORITY_ATTACHMENT, enqueue_target,
-    has_active_target,
+    AttachmentPayload, IndexChunk, JobOp, JobOutcome, NodePayload, PRIORITY_ATTACHMENT,
+    complete_in, enqueue_target, give_up_in, has_active_target,
 };
 use crate::nodes::{Attribution, context_prefix, token_counter};
 use crate::paths::path_ancestors;
@@ -543,6 +543,10 @@ pub async fn extract_cached(db: &Db, sha: &str) -> Result<Option<Extracted>, Sto
     let Some((kind, units, warnings, ocr_needed)) = row else {
         return Ok(None);
     };
+    // закэшированная неудача разбора — не извлечение ([`cached_extract`])
+    if kind == KIND_FAILED || kind == KIND_UNSUPPORTED {
+        return Ok(None);
+    }
     let parsed = (|| {
         let kind = kind_from_str(&kind)?;
         let json = zstd::stream::decode_all(units.as_slice()).ok()?;
@@ -741,14 +745,39 @@ pub fn attachment_pieces(units: &[Unit]) -> Vec<(String, String, String, i64)> {
 /// или скрыт удалением узла → `NotFound` (результат бросается: восстановление поставит задание).
 /// Нарезка идёт в пуле блокирующих задач, не в исполнителе tokio.
 pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Result<(), StoreError> {
-    let units = units.to_vec();
-    let units = tokio::task::spawn_blocking(move || attachment_pieces(&units))
-        .await
-        .map_err(|e| StoreError::Corrupt(format!("нарезка вложения: {e}")))?;
+    let pieces = pieces_blocking(units).await?;
     db.write(move |t| {
-        let doc: Option<(Id, String, String, String, String, SpaceKind)> = t
+        if write_chunks(t, att, &pieces)? {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound)
+        }
+    })
+    .await
+}
+
+/// Кусок единицы документа: `(locator, heading_path, текст, токенов)`.
+type Piece = (String, String, String, i64);
+
+/// [`attachment_pieces`] в пуле блокирующих задач.
+async fn pieces_blocking(units: &[Unit]) -> Result<Vec<Piece>, StoreError> {
+    let units = units.to_vec();
+    tokio::task::spawn_blocking(move || attachment_pieces(&units))
+        .await
+        .map_err(|e| StoreError::Corrupt(format!("нарезка вложения: {e}")))
+}
+
+/// Тело [`replace_attachment_chunks`] в транзакции писателя; `false` — документ скрыт или
+/// откреплён (ничего не записано). Документ, который был не `done` (перенарезка, повтор после
+/// неудачи, восстановление узла), получает `upsert` ради точек и при той же нарезке: пока он
+/// был `pending`, его точки могли удалить (reindex из кэша их не восстанавливает, удаление узла
+/// убирает), а задание точек ему не ставилось.
+fn write_chunks(t: &Connection, att: Id, units: &[Piece]) -> Result<bool, StoreError> {
+    {
+        let doc: Option<(Id, String, String, String, String, SpaceKind, ExtractState)> = t
             .prepare_cached(
-                "SELECT d.node_id, d.blob_sha256, d.filename, n.path, s.name, s.kind
+                "SELECT d.node_id, d.blob_sha256, d.filename, n.path, s.name, s.kind,
+                        d.extract_state
                  FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
                  JOIN spaces s ON s.id = n.space_id
                  WHERE d.id = ?1 AND d.deleted_at IS NULL AND n.deleted_at IS NULL",
@@ -761,12 +790,14 @@ pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Resu
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             })
             .optional()?;
-        let Some((node, sha, filename, path, space, kind)) = doc else {
-            return Err(StoreError::NotFound);
+        let Some((node, sha, filename, path, space, kind, prev)) = doc else {
+            return Ok(false);
         };
+        let points = kind != SpaceKind::Human;
         let now = fmt_ts(Timestamp::now());
         // документ извлечён: `done`, причина прежней неудачи и её задания сняты
         t.prepare_cached(
@@ -804,7 +835,10 @@ pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Resu
             })
             .collect();
         if same_chunks(t, att, &sha, node, &rows)? {
-            return Ok(());
+            if prev != ExtractState::Done && points {
+                enqueue_doc(t, att, JobOp::Upsert, &now)?;
+            }
+            return Ok(true);
         }
         t.prepare_cached("DELETE FROM chunks WHERE attachment_id = ?1")?
             .execute([att])?;
@@ -836,7 +870,7 @@ pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Resu
             t.prepare_cached("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')")?
                 .execute([crate::user_db::CHUNKED_APPROX])?;
         }
-        if kind != SpaceKind::Human {
+        if points {
             enqueue_doc(t, att, JobOp::Upsert, &now)?;
         }
         // источник выжимок изменился (§9.4): текст вложения — часть заметки
@@ -848,9 +882,140 @@ pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Resu
             },
             StaleKind::Changed,
         )?;
+        Ok(true)
+    }
+}
+
+/// Итог задания извлечения документа ([`finish_extract`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtractEnd {
+    /// Текст извлечён: единицы документа (нарезка, чанки, `done`).
+    Units(Vec<Unit>),
+    /// Вид не поддерживается.
+    Unsupported,
+    /// Окончательная неудача: причина для `extract_error` (код и область, без текста документа).
+    Failed(String),
+}
+
+/// Итог задания извлечения `job_id`/`claim_gen` документа `att` **одной транзакцией**: чанки и
+/// `done` | `unsupported` | `failed` с причиной — вместе с закрытием задания (неудача — задание
+/// сразу `failed`, оно в `failed_items`). Между записью состояния и закрытием задания не
+/// вклинится сброс заданий после аварии. Документ скрыт или откреплён — результат бросается,
+/// задание закрывается. Нарезка — в пуле блокирующих задач до транзакции.
+pub async fn finish_extract(
+    db: &Db,
+    job_id: i64,
+    claim_gen: i64,
+    att: Id,
+    end: ExtractEnd,
+) -> Result<JobOutcome, StoreError> {
+    let pieces = match &end {
+        ExtractEnd::Units(u) => Some(pieces_blocking(u).await?),
+        ExtractEnd::Unsupported | ExtractEnd::Failed(_) => None,
+    };
+    db.write(move |t| match end {
+        ExtractEnd::Units(_) => {
+            write_chunks(t, att, pieces.as_deref().unwrap_or_default())?;
+            complete_in(t, job_id, claim_gen)
+        }
+        ExtractEnd::Unsupported => {
+            t.prepare_cached(
+                "UPDATE attachment_docs SET extract_state = 'unsupported', extract_error = NULL
+                 WHERE id = ?1",
+            )?
+            .execute([att])?;
+            complete_in(t, job_id, claim_gen)
+        }
+        ExtractEnd::Failed(reason) => {
+            let reason: String = reason.chars().take(EXTRACT_ERROR_MAX_CHARS).collect();
+            t.prepare_cached(
+                "UPDATE attachment_docs SET extract_state = 'failed', extract_error = ?2
+                 WHERE id = ?1",
+            )?
+            .execute(params![att, reason])?;
+            give_up_in(t, job_id, claim_gen, &reason)
+        }
+    })
+    .await
+}
+
+/// Вид строки кэша `blob_extract` с детерминированной неудачей разбора (не единицы).
+const KIND_FAILED: &str = "failed";
+const KIND_UNSUPPORTED: &str = "unsupported";
+
+/// Извлечение блоба из кэша с учётом закэшированных неудач.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CachedExtract {
+    Extracted(Extracted),
+    /// Разбор этой версии извлечения не удался детерминированно: причина.
+    Failed(String),
+    /// Разборщик этой версии вид не поддерживает.
+    Unsupported,
+}
+
+/// Детерминированная неудача разбора блоба `sha` текущей версии извлечения — в кэш (повтор того
+/// же файла в другой заметке не разбирается): `reason` — `parse_error: …` (код и область), `None`
+/// — вид не поддерживается. Сбои процесса (`parse_crash`, `parse_timeout`, `parse_oom`) и
+/// отсутствие pdfium не кэшируются: они не свойство файла.
+pub async fn put_extract_failure(
+    db: &Db,
+    sha: &str,
+    reason: Option<&str>,
+) -> Result<(), StoreError> {
+    let (kind, warnings) = match reason {
+        Some(r) => (KIND_FAILED, vec![r.to_string()]),
+        None => (KIND_UNSUPPORTED, Vec::new()),
+    };
+    let warnings =
+        serde_json::to_string(&warnings).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    let units = zstd::bulk::compress(b"[]", ZSTD_LEVEL)?;
+    let sha = sha.to_string();
+    db.write(move |t| {
+        t.prepare_cached(
+            "INSERT OR REPLACE INTO blob_extract (blob_sha256, extractor_version, kind, units,
+                                                  warnings, ocr_needed, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+        )?
+        .execute(params![
+            sha,
+            EXTRACTOR_VERSION,
+            kind,
+            units,
+            warnings,
+            fmt_ts(Timestamp::now())
+        ])?;
         Ok(())
     })
     .await
+}
+
+/// Кэш извлечения блоба `sha` текущей версии: единицы или закэшированная неудача.
+pub async fn cached_extract(db: &Db, sha: &str) -> Result<Option<CachedExtract>, StoreError> {
+    let sha2 = sha.to_string();
+    let row: Option<(String, String)> = db
+        .read(move |c| {
+            Ok(c.prepare_cached(
+                "SELECT kind, warnings FROM blob_extract
+                 WHERE blob_sha256 = ?1 AND extractor_version = ?2",
+            )?
+            .query_row(params![sha2, EXTRACTOR_VERSION], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+        })
+        .await?;
+    match row {
+        None => Ok(None),
+        Some((k, _)) if k == KIND_UNSUPPORTED => Ok(Some(CachedExtract::Unsupported)),
+        Some((k, w)) if k == KIND_FAILED => {
+            let reason = serde_json::from_str::<Vec<String>>(&w)
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .unwrap_or_else(|| "parse_error".into());
+            Ok(Some(CachedExtract::Failed(reason)))
+        }
+        Some(_) => Ok(extract_cached(db, sha).await?.map(CachedExtract::Extracted)),
+    }
 }
 
 /// Что нужно конвейеру документов для задания извлечения документа.

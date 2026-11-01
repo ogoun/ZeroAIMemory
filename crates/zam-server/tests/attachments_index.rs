@@ -836,3 +836,215 @@ async fn pending_without_job_sniffed_by_content() {
     .await;
     b.st.shutdown().await;
 }
+
+/// Reindex по запросу администратора и ожидание его итога.
+async fn reindex(a: &Api, full: bool) {
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/admin/reindex",
+            Some(json!({ "full": full })),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    until(&format!("reindex full={full}"), LIMIT, async || {
+        let s = status(a).await;
+        s["reindex"]["running"] == false
+            && s["reindex"]["queued"] == 0
+            && s["reindex"]["last"]["full"] == full
+    })
+    .await;
+}
+
+/// Задания вложений: срок `not_before` (`far` — отложить, иначе — сейчас).
+async fn delay_attachment_jobs(a: &Api, user: Id, far: bool) {
+    let sql = if far {
+        "UPDATE index_jobs SET not_before = '2999-01-01T00:00:00.000000Z'
+         WHERE target_kind = 'attachment' AND state = 'queued'"
+    } else {
+        "UPDATE index_jobs SET not_before = '2000-01-01T00:00:00.000000Z'
+         WHERE target_kind = 'attachment' AND state = 'queued'"
+    };
+    exec(a, user, sql).await;
+}
+
+/// Ревью задачи 5, I-1: документ снова `pending` с прежними чанками (перенарезка при открытии
+/// базы), пока он ждёт извлечения, его точки удаляются — reindex из кэша (страница — только
+/// `done`) или удаление узла; повторное извлечение даёт ту же нарезку и всё равно ставит задание
+/// точек: точки возвращаются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn points_restored_after_pending_with_same_chunks() {
+    if !have(MINILM) {
+        return;
+    }
+    let q = TestQdrant::start("att-same-chunks");
+    let a = api("att-same-chunks", with_vector(&q)).await;
+    vector_ready(&a).await;
+    let user = a.st.admin_id;
+    let node = note_as(&a, &a.token, "knowledge", "same/n", "# N\n").await;
+    upload(&a, &a.token, &node, "t.csv", &csv(&["альфа;бета гамма"])).await;
+    let d = wait_doc(&a, user, &node, "t.csv", ExtractState::Done).await;
+    let n = chunks(&a, user, d.id).await.len() as u64;
+    until("точки", LIMIT, async || {
+        att_points(&a, user, None).await == n && active_jobs(&a, user).await == 0
+    })
+    .await;
+    let dbh = db(&a, user).await;
+
+    // 1) перенарезка → reindex из кэша, пока документ `pending` → извлечение
+    exec(
+        &a,
+        user,
+        "UPDATE meta SET value = 'bogus' WHERE key = 'chunker_attachments'",
+    )
+    .await;
+    assert_eq!(zam_store::rechunk_docs_if_stale(&dbh).await.unwrap(), 1);
+    delay_attachment_jobs(&a, user, true).await;
+    reindex(&a, false).await;
+    assert_eq!(
+        att_points(&a, user, None).await,
+        0,
+        "pending: reindex точки не вернул"
+    );
+    delay_attachment_jobs(&a, user, false).await;
+    a.st.docs.notify();
+    until(
+        "точки после извлечения той же нарезки",
+        LIMIT,
+        async || att_points(&a, user, None).await == n && active_jobs(&a, user).await == 0,
+    )
+    .await;
+
+    // 2) перенарезка → удаление узла и восстановление, пока документ `pending` → извлечение
+    exec(
+        &a,
+        user,
+        "UPDATE meta SET value = 'bogus' WHERE key = 'chunker_attachments'",
+    )
+    .await;
+    assert_eq!(zam_store::rechunk_docs_if_stale(&dbh).await.unwrap(), 1);
+    delay_attachment_jobs(&a, user, true).await;
+    let r = a
+        .t(Method::DELETE, &format!("/api/v1/nodes/{node}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    until("точки удалены", LIMIT, async || {
+        att_points(&a, user, None).await == 0
+    })
+    .await;
+    let r = a
+        .t(Method::POST, &format!("/api/v1/nodes/{node}/restore"), None)
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    delay_attachment_jobs(&a, user, false).await;
+    a.st.docs.notify();
+    until(
+        "точки после восстановления",
+        LIMIT,
+        async || {
+            att_points(&a, user, None).await == n
+                && active_jobs(&a, user).await == 0
+                && docs(&a, user, &node).await[0].extract_state == ExtractState::Done
+        },
+    )
+    .await;
+    assert_eq!(chunks(&a, user, d.id).await.len() as u64, n);
+    a.st.shutdown().await;
+}
+
+/// Ревью задачи 5, M-3 и M-4: путь установки сервера не виден токену — секция `docs`
+/// `/index/status` только администратору, `extract_error` и `failed_items` — код без пути;
+/// причина `parse_error` — код и область (часть), без имени сущности документа.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failure_reasons_without_paths_or_document_text() {
+    let bogus = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("секрет-путь")
+        .join("pdfium.dll");
+    let a = api("att-reasons", move |c| c.docs.pdfium_dylib = Some(bogus)).await;
+    let user = a.st.admin_id;
+    let node = note_as(&a, &a.token, "knowledge", "r/n", "# N\n").await;
+    let pdf = build(&[Page::default().line(72.0, 700.0, "hello")]);
+    upload(&a, &a.token, &node, "x.pdf", &pdf).await;
+    let ent = docx(&format!(
+        r#"<?xml version="1.0"?><w:document {W}><w:body><w:p><w:r><w:t>&тайнаимени;</w:t></w:r></w:p></w:body></w:document>"#
+    ));
+    upload(&a, &a.token, &node, "ent.docx", &ent).await;
+    let p = wait_doc(&a, user, &node, "x.pdf", ExtractState::Failed).await;
+    let e = wait_doc(&a, user, &node, "ent.docx", ExtractState::Failed).await;
+    assert_eq!(p.extract_error.as_deref(), Some("pdfium_unavailable"));
+    assert_eq!(
+        e.extract_error.as_deref(),
+        Some("parse_error: xml (word/document.xml)")
+    );
+    // токен: секции `docs` нет, путей нет нигде
+    let s = a.t(Method::GET, "/api/v1/index/status", None).await;
+    assert_eq!(s.status, StatusCode::OK);
+    let text = s.text();
+    assert!(s.json()["docs"].is_null(), "{}", s.json()["docs"]);
+    assert!(
+        !text.contains("секрет-путь") && !text.contains("тайнаимени"),
+        "{text}"
+    );
+    let l = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/nodes/{node}/attachments"),
+            None,
+        )
+        .await;
+    assert!(!l.text().contains("секрет-путь"), "{}", l.text());
+    // администратор: причина pdfium с путём — в `docs.pdfium_error`
+    let s = status(&a).await;
+    assert!(
+        s["docs"]["pdfium_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("секрет-путь")),
+        "{}",
+        s["docs"]
+    );
+    let items = s["failed_items"].as_array().unwrap();
+    assert!(
+        items.iter().all(|i| !i.to_string().contains("секрет-путь")),
+        "{items:?}"
+    );
+    a.st.shutdown().await;
+}
+
+/// Ревью задачи 5, M-5: падающий файл в N заметках разбирается один раз (неудача `parse_error`
+/// кэшируется по sha и версии извлечения); у каждого документа своя строка `failed_items`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_file_parsed_once_for_many_attachments() {
+    let a = api("att-fail-once", |_| {}).await;
+    let user = a.st.admin_id;
+    let bad = docx(&format!(
+        r#"<?xml version="1.0"?><!DOCTYPE x [<!ENTITY e "x">]><w:document {W}><w:body/></w:document>"#
+    ));
+    let mut nodes = Vec::new();
+    for i in 0..4 {
+        let node = note_as(&a, &a.token, "knowledge", &format!("f/n{i}"), "# N\n").await;
+        upload(&a, &a.token, &node, "bad.docx", &bad).await;
+        nodes.push(node);
+    }
+    for node in &nodes {
+        let d = wait_doc(&a, user, node, "bad.docx", ExtractState::Failed).await;
+        assert_eq!(
+            d.extract_error.as_deref(),
+            Some("parse_error: xml (word/document.xml)")
+        );
+    }
+    assert_eq!(
+        a.st.docs.extracted(),
+        1,
+        "разбор один, остальные — из кэша неудачи"
+    );
+    let s = status(&a).await;
+    let failed = s["failed_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["reason"] == "parse_error")
+        .count();
+    assert_eq!(failed, 4, "{}", s["failed_items"]);
+    a.st.shutdown().await;
+}
