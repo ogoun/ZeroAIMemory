@@ -770,6 +770,33 @@
   `-p zam-server --test blobs --test doc_worker` 20 (1 ignored), `-p zam-fetch` 30 (1 ignored);
   clippy `-D warnings` по workspace и `fmt --check` — чисто.
 
+### Задача 3 — проверка на Linux-стенде (2026-11-01)
+
+Код под Linux (RLIMIT_AS, PDEATHSIG, VmPeak) проверен на стенде владельца (Debian 13, 2 CPU, 2 ГБ) с настоящим `libpdfium.so`:
+`cargo test -p zam-docs`, `cargo test -p zam-server --test doc_worker -- --include-ignored` (9/9, в т.ч. `worker_memory_limit_oom`,
+`worker_crash_is_parse_crash_and_restarts`, `worker_timeout_killed`, `worker_dies_with_server`), lib-тесты `docs` и `config`,
+`cargo clippy -p zam-docs -p zam-server --all-targets -- -D warnings` — всё зелёное. Сомнение исполнителя № 1 снято.
+
+### Задача 3 — итог (2026-11-01)
+
+Повторное ревью: APPROVED. Linux-стенд: doc_worker 11/11 (в т.ч. смерть занятого воркера вместе с сервером — PDEATHSIG).
+Известное свойство: номера запросов в слоте последовательны; захваченный воркер может заранее подложить ответ на следующий
+запрос, но это не даёт ему новых возможностей (он и так отвечает на задания слота до исчерпания `worker_jobs`).
+Перенесено в задачу 5: нарушение протокола после повтора сейчас отдаётся как `parse_error`, должно быть `parse_crash`.
+
+### Обслуживание диска (2026-11-01)
+
+H: заполнился до 5 ГБ: `target/debug` вырос до 290 ГБ, из них за двое суток накопилось 176 ГБ тестовых бинарников разных хешей.
+Удалено: артефакты `target/debug/{deps,build,.fingerprint}` старше 2 суток, `target/{smoke,dist,task8,fixlog}`,
+сборка зонда `.tmp/review-m5-task3/target`. Свободно 113 ГБ. Правило для исполнителей: при < 100 ГБ — то же самое
+(`find target/debug/deps -mtime +2 -delete`), полный `cargo clean` не нужен.
+
+### Задача 4 — итог (2026-11-01)
+
+Повторное ревью раунда 4: APPROVED. Коммиты 8ff862d, 6bf87f2, 5ae3420, 0b85eb5, e43b59d. Защита zip от
+отката zip 9 к ранней EOCD закрыта безотказным правилом «ровно одна сигнатура EOCD в окне поиска»
+(раунды 2–3 закрывали причины сбоя по одной — путь признан тупиковым).
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
@@ -910,6 +937,8 @@
   `attachment_chunks_for_index`; вид по содержимому (`sniff_file`) для `pending`-документов
   дозаполнения: неподдерживаемые — `unsupported`, больше `docs.max_bytes` — `failed`/`too_large`
   (раунд правок 1, обязательство).
+- **Задача 5 (из задачи 3):** нарушение протокола воркера после повтора — `parse_crash`, а не `parse_error`
+  (`pool.rs:455`); причина недоступности pdfium (`DocPool::pdfium_error()`) — в `/index/status`.
 - **Задача 6:** `scope_sql` — ветка вложений с `attachment_docs.deleted_at IS NULL` (чанки
   скрытых документов лежат в FTS); карточка `a:<chunk>` vs `TargetKind::Attachment` (`a:<id
   документа>`) — согласовать префиксы в задачах 6–7.
@@ -929,24 +958,3 @@
 5. Карта кода (встроенная, решение владельца 2026-10-28) — отдельным этапом M5.5 после M5
    (предложение контроллера), чтобы M5 не разрастался.
 6. OCR — отдельным этапом или в M6.
-
-### Задача 3 — проверка на Linux-стенде (2026-11-01)
-
-Код под Linux (RLIMIT_AS, PDEATHSIG, VmPeak) проверен на стенде владельца (Debian 13, 2 CPU, 2 ГБ) с настоящим `libpdfium.so`:
-`cargo test -p zam-docs`, `cargo test -p zam-server --test doc_worker -- --include-ignored` (9/9, в т.ч. `worker_memory_limit_oom`,
-`worker_crash_is_parse_crash_and_restarts`, `worker_timeout_killed`, `worker_dies_with_server`), lib-тесты `docs` и `config`,
-`cargo clippy -p zam-docs -p zam-server --all-targets -- -D warnings` — всё зелёное. Сомнение исполнителя № 1 снято.
-
-### Задача 3 — итог (2026-11-01)
-
-Повторное ревью: APPROVED. Linux-стенд: doc_worker 11/11 (в т.ч. смерть занятого воркера вместе с сервером — PDEATHSIG).
-Известное свойство: номера запросов в слоте последовательны; захваченный воркер может заранее подложить ответ на следующий
-запрос, но это не даёт ему новых возможностей (он и так отвечает на задания слота до исчерпания `worker_jobs`).
-Перенесено в задачу 5: нарушение протокола после повтора сейчас отдаётся как `parse_error`, должно быть `parse_crash`.
-
-### Обслуживание диска (2026-11-01)
-
-H: заполнился до 5 ГБ: `target/debug` вырос до 290 ГБ, из них за двое суток накопилось 176 ГБ тестовых бинарников разных хешей.
-Удалено: артефакты `target/debug/{deps,build,.fingerprint}` старше 2 суток, `target/{smoke,dist,task8,fixlog}`,
-сборка зонда `.tmp/review-m5-task3/target`. Свободно 113 ГБ. Правило для исполнителей: при < 100 ГБ — то же самое
-(`find target/debug/deps -mtime +2 -delete`), полный `cargo clean` не нужен.
