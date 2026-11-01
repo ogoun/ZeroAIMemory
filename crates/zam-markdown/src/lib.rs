@@ -20,7 +20,9 @@ mod sanitize;
 mod secrets;
 mod sentences;
 
-pub use chunk::{ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, TokenCounter, chunk_note};
+pub use chunk::{
+    ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, TokenCounter, chunk_note, split_plain,
+};
 pub use doc::{
     Doc, Frontmatter, Heading, Link, LinkKind, OutlineItem, Section, SectionLookup,
     first_paragraph, outline, parse, resolve_section, section_by_path, slug,

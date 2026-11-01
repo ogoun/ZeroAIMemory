@@ -6,14 +6,15 @@ use std::path::PathBuf;
 
 use zam_core::{Id, TargetKind};
 use zam_store::attachments::{
-    AttachmentDoc, DocIntake, DocKind, ExtractState, Extracted, Locator, Unit, detach,
-    extract_cached, list_attachments, put_extract, replace_attachment_chunks, set_extract_state,
+    AttachmentDoc, DocIntake, DocKind, ExtractState, Extracted, Locator, Unit,
+    attachment_chunks_for_index, detach, ensure_extract_jobs, extract_cached, list_attachments,
+    put_extract, replace_attachment_chunks, set_extract_state,
 };
 use zam_store::blobs::{AttachScope, BlobStore, attach, resolve_attachment};
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, FtsQuery, NewNote, NodePath, SpaceKind, USER_MIGRATIONS,
-    UserDbs, claim_jobs, create_note, delete_node, list_spaces, move_node, restore_node,
-    search_fts, update_note,
+    UserDbs, claim_extract_jobs, claim_jobs, create_note, delete_node, list_spaces, move_node,
+    restore_node, search_fts, update_note,
 };
 
 const TS: &str = "2026-10-28T00:00:00.000000Z";
@@ -314,7 +315,9 @@ async fn migration_0019_backfills_attachment_docs() {
 }
 
 /// `attach` поддерживаемого вида ставит задание `Attachment` (`pending`); неподдерживаемого —
-/// `unsupported` без задания; повтор пары задание не дублирует.
+/// `unsupported` без задания; повтор пары задание не дублирует. Задание извлечения выдаётся
+/// конвейеру документов (`claim_extract_jobs`), а не воркеру векторного индекса; после записи
+/// чанков документ `done`, задание точек — воркеру.
 #[tokio::test]
 async fn attach_enqueues_attachment_job() {
     let env = setup("enqueue").await;
@@ -330,13 +333,17 @@ async fn attach_enqueues_attachment_job() {
     assert_eq!(pdf.extract_state, ExtractState::Pending);
     assert_eq!(png.extract_state, ExtractState::Unsupported);
     assert_eq!(pdf.node_id, n);
-    let jobs = claim_jobs(&env.db, 10, jiff::Timestamp::now())
-        .await
-        .unwrap();
+    let now = jiff::Timestamp::now();
+    assert!(
+        claim_jobs(&env.db, 10, now).await.unwrap().is_empty(),
+        "извлечение — не задание воркера векторного индекса"
+    );
+    let jobs = claim_extract_jobs(&env.db, 10, now).await.unwrap();
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     assert_eq!(jobs[0].target_kind, TargetKind::Attachment);
     assert_eq!(jobs[0].target_id, pdf.id);
     assert_eq!(jobs[0].target().to_string(), format!("a:{}", pdf.id));
+    drop_jobs(&env.db).await;
 
     // Human: извлечение нужно (FTS), задание ставится; точек нет — чанки задания не ставят
     let hn = note(&env.db, env.h, "личное", "текст").await;
@@ -352,7 +359,7 @@ async fn attach_enqueues_attachment_job() {
         .await
         .unwrap();
     assert_eq!(active_job(&env.db, "attachment", hd.id).await, None);
-    // а у Knowledge — ставят (точки Qdrant)
+    // а у Knowledge — ставят (точки Qdrant): документ `done`, задание — воркеру точек
     replace_attachment_chunks(&env.db, pdf.id, &units(&[("", "текст pdf")]))
         .await
         .unwrap();
@@ -360,6 +367,18 @@ async fn attach_enqueues_attachment_job() {
         active_job(&env.db, "attachment", pdf.id).await.as_deref(),
         Some("upsert")
     );
+    let pdf_doc = doc_of(&list_attachments(&env.db, n).await.unwrap(), "a.pdf");
+    assert_eq!(pdf_doc.extract_state, ExtractState::Done);
+    let now = jiff::Timestamp::now();
+    assert!(
+        claim_extract_jobs(&env.db, 10, now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let jobs = claim_jobs(&env.db, 10, now).await.unwrap();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].target_id, pdf.id);
     // состояние извлечения
     set_extract_state(&env.db, pdf.id, ExtractState::Failed, Some("parse_crash"))
         .await
@@ -657,14 +676,23 @@ async fn same_blob_two_notes_two_docs() {
     let cb = of_attachment(&chunks_of(&env.db, b).await, db_.id);
     assert_eq!((ca.len(), cb.len()), (3, 3));
     assert!(ca.iter().all(|x| cb.iter().all(|y| x.1 != y.1)));
-    // `done` берёт `ocr_needed` из кэша извлечения
+    // запись чанков — `done` с `ocr_needed` из кэша извлечения (у каждого документа)
+    for (node, d) in [(a, da.id), (b, db_.id)] {
+        let d = list_attachments(&env.db, node)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.id == d)
+            .unwrap();
+        assert_eq!(d.extract_state, ExtractState::Done);
+        assert!(d.ocr_needed);
+    }
+    // `set_extract_state(done)` тоже берёт `ocr_needed` из кэша
     set_extract_state(&env.db, da.id, ExtractState::Done, None)
         .await
         .unwrap();
     let da = doc_of(&list_attachments(&env.db, a).await.unwrap(), "x.txt");
     assert!(da.ocr_needed);
-    let db_ = doc_of(&list_attachments(&env.db, b).await.unwrap(), "x.txt");
-    assert!(!db_.ocr_needed);
 
     // другой пользователь: своя база, тот же sha — кэша нет, вложений нет
     let other = setup("shared-other").await;
@@ -784,4 +812,126 @@ async fn extract_cache_is_zstd_and_bad_row_is_miss() {
         .await
         .unwrap();
     assert_eq!(extract_cached(&env.db, &sha).await.unwrap(), None);
+}
+
+/// Задания документов `pending` (задача 5 M5): запуск конвейера ставит их документам без
+/// задания; смена GUID решения — тоже (не только извлечённым); reindex возвращает неудавшиеся в
+/// `pending` с заданием, кроме `too_large`.
+#[tokio::test]
+async fn pending_docs_get_jobs_on_start_guid_change_and_reindex() {
+    let env = setup("pending-jobs").await;
+    let guid = zam_core::SolutionGuid::new_v7();
+    let (s, _) = zam_store::create_solution(&env.db, &guid.to_string(), "S")
+        .await
+        .unwrap();
+    let n = note(&env.db, s.id, "n", "текст").await;
+    put_attach(&env, n, b"pending text", "p.txt", Some(DocKind::Text)).await;
+    put_attach_max(
+        &env,
+        n,
+        b"too large text",
+        "big.txt",
+        Some(DocKind::Text),
+        4,
+    )
+    .await;
+    let d = doc_of(&list_attachments(&env.db, n).await.unwrap(), "p.txt");
+    drop_jobs(&env.db).await;
+    assert_eq!(ensure_extract_jobs(&env.db).await.unwrap(), 1);
+    assert_eq!(
+        active_job(&env.db, "attachment", d.id).await.as_deref(),
+        Some("upsert")
+    );
+    assert_eq!(
+        ensure_extract_jobs(&env.db).await.unwrap(),
+        0,
+        "уже с заданием"
+    );
+    drop_jobs(&env.db).await;
+    zam_store::rename_solution_guid(&env.db, s.id, &zam_core::SolutionGuid::new_v7())
+        .await
+        .unwrap();
+    assert_eq!(
+        active_job(&env.db, "attachment", d.id).await.as_deref(),
+        Some("upsert"),
+        "смена GUID: pending — тоже задание"
+    );
+    drop_jobs(&env.db).await;
+    set_extract_state(&env.db, d.id, ExtractState::Failed, Some("parse_crash"))
+        .await
+        .unwrap();
+    zam_store::enqueue_reindex(&env.db, None).await.unwrap();
+    let docs = list_attachments(&env.db, n).await.unwrap();
+    assert_eq!(doc_of(&docs, "p.txt").extract_state, ExtractState::Pending);
+    assert_eq!(
+        active_job(&env.db, "attachment", d.id).await.as_deref(),
+        Some("upsert")
+    );
+    let big = doc_of(&docs, "big.txt");
+    assert_eq!(
+        (big.extract_state, big.extract_error.as_deref()),
+        (ExtractState::Failed, Some("too_large"))
+    );
+    assert_eq!(active_job(&env.db, "attachment", big.id).await, None);
+}
+
+/// Чанки вложения для векторного индекса: `level = attachment`, payload документа (`node_id`
+/// владельца, `attachment_id`, `blob_sha256`, `locator`); единица длиннее `chunk_hard_max`
+/// режется по предложениям с общим `locator`; Human и неизвлечённый документ — без чанков
+/// (точек нет).
+#[tokio::test]
+async fn attachment_chunks_for_index_payload_split_and_human_guard() {
+    let env = setup("for-index").await;
+    let n = note(&env.db, env.k, "ops/n", "текст").await;
+    let sha = put_attach(&env, n, b"pdf", "doc.pdf", Some(DocKind::Pdf)).await;
+    let d = doc_of(&list_attachments(&env.db, n).await.unwrap(), "doc.pdf");
+    assert!(
+        attachment_chunks_for_index(&env.db, d.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "не извлечён — точек нет"
+    );
+    let long: String = (0..400)
+        .map(|i| format!("Предложение {i} длинной страницы документа о вложениях. "))
+        .collect();
+    let page = vec![Unit {
+        locator: Locator::Page(7),
+        heading_path: Vec::new(),
+        text: long,
+    }];
+    replace_attachment_chunks(&env.db, d.id, &page)
+        .await
+        .unwrap();
+    let ch = attachment_chunks_for_index(&env.db, d.id).await.unwrap();
+    assert!(ch.len() > 2, "длинная страница нарезана: {}", ch.len());
+    for c in &ch {
+        assert_eq!(c.level, zam_markdown::ChunkLevel::Attachment);
+        assert!(c.token_count <= zam_store::chunk_params().hard_max as i64);
+        assert!(c.text.starts_with("Предложение"), "{}", c.text);
+        assert_eq!(c.node.node_id, n);
+        assert_eq!(c.node.path_ancestors, ["ops", "ops/n"]);
+        let a = c.attachment.as_ref().unwrap();
+        assert_eq!(a.attachment_id, d.id);
+        assert_eq!(a.blob_sha256, sha);
+        assert_eq!(a.locator.as_deref(), Some("page:7"));
+    }
+    // Human: чанки (FTS) есть, для векторного индекса — нет
+    let hn = note(&env.db, env.h, "личное", "текст").await;
+    put_attach(&env, hn, b"human", "h.txt", Some(DocKind::Text)).await;
+    let hd = doc_of(&list_attachments(&env.db, hn).await.unwrap(), "h.txt");
+    replace_attachment_chunks(&env.db, hd.id, &units(&[("", "человеческое")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        of_attachment(&chunks_of(&env.db, hn).await, hd.id).len(),
+        1,
+        "FTS"
+    );
+    assert!(
+        attachment_chunks_for_index(&env.db, hd.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

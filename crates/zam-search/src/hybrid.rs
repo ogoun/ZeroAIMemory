@@ -62,15 +62,19 @@ pub enum Level {
     Section,
     /// L1 заметки (сводка).
     Note,
+    /// Фрагмент документа-вложения (M5): текст, не сводка.
+    Attachment,
 }
 
 impl Level {
-    /// `chunk` / `section` / `note`; прочее — `None` (папки и вложения в M2 не ищутся).
+    /// `chunk` / `section` / `note` / `attachment`; прочее — `None` (папки ищутся своим
+    /// каналом).
     pub fn parse(s: &str) -> Option<Level> {
         match s {
             "chunk" => Some(Level::Chunk),
             "section" => Some(Level::Section),
             "note" => Some(Level::Note),
+            "attachment" => Some(Level::Attachment),
             _ => None,
         }
     }
@@ -80,12 +84,13 @@ impl Level {
             Level::Chunk => "chunk",
             Level::Section => "section",
             Level::Note => "note",
+            Level::Attachment => "attachment",
         }
     }
 
     /// Сводка (L1), а не текст.
     pub fn is_summary(self) -> bool {
-        self != Level::Chunk
+        matches!(self, Level::Section | Level::Note)
     }
 }
 

@@ -514,7 +514,9 @@ async fn attachments_list_and_detach() {
     let list = list.as_array().unwrap();
     assert_eq!(list.len(), 2, "{list:?}");
     let by = |f: &str| list.iter().find(|d| d["filename"] == f).unwrap().clone();
-    assert_eq!(by("отчёт.txt")["extract_state"], "pending");
+    // конвейер документов (задача 5) может успеть извлечь текст до запроса списка
+    let st = by("отчёт.txt")["extract_state"].clone();
+    assert!(st == "pending" || st == "done", "{st}");
     assert_eq!(by("cat.png")["extract_state"], "unsupported");
     assert_eq!(by("отчёт.txt")["ocr_needed"], false);
 

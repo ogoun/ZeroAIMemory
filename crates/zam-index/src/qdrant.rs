@@ -9,8 +9,11 @@
 //! - `on_disk_payload`, 2 сегмента, метаданные `{model_id, schema}`;
 //! - payload-индексы: `user_id` (keyword, `is_tenant`), `space_id`, `node_id`,
 //!   `path_ancestors`, `level` (keyword), `updated_at` (integer); с M3 — `entry_id`, `kind`,
-//!   `status`, `insight_kind`, `certainty`, `area` (keyword). Коллекцию M2 `ensure` дополняет
-//!   недостающими индексами на месте, `schema` остаётся 1;
+//!   `status`, `insight_kind`, `certainty`, `area` (keyword); с M5 — `attachment_id` (keyword).
+//!   Коллекцию M2 `ensure` дополняет недостающими индексами на месте, `schema` остаётся 1;
+//! - точки документов вложений (M5): `kind = level = attachment`, `node_id` узла-владельца,
+//!   `attachment_id`, `blob_sha256`, `locator`. Удаление точек узла — по `node_id` при пустом
+//!   `attachment_id` (точки его вложений не задеваются), документа — по `attachment_id`;
 //! - фильтр — дизъюнкция областей `(user_id, space_id ∈ …)` (`should`) и общие условия
 //!   (`must`, статусы — `must_not`), один для prefetch чанков и сводок;
 //! - с `VectorFilter::folders` (M3, канал папок §8.3) — ещё prefetch dense top-10 по точкам
@@ -96,9 +99,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const LEVEL_CHUNK: &str = "chunk";
 const LEVELS_NOTE: [&str; 2] = ["note", "section"];
 
-/// Payload-индексы коллекции: (поле, тип, тенант). Последние шесть добавлены в M3:
-/// `ensure` досоздаёт их в существующей коллекции.
-const PAYLOAD_INDEXES: [(&str, FieldType, bool); 12] = [
+/// Payload-индексы коллекции: (поле, тип, тенант). Шесть после `updated_at` добавлены в M3,
+/// `attachment_id` — в M5: `ensure` досоздаёт их в существующей коллекции.
+const PAYLOAD_INDEXES: [(&str, FieldType, bool); 13] = [
     ("user_id", FieldType::Keyword, true),
     ("space_id", FieldType::Keyword, false),
     ("node_id", FieldType::Keyword, false),
@@ -111,6 +114,7 @@ const PAYLOAD_INDEXES: [(&str, FieldType, bool); 12] = [
     ("insight_kind", FieldType::Keyword, false),
     ("certainty", FieldType::Keyword, false),
     ("area", FieldType::Keyword, false),
+    ("attachment_id", FieldType::Keyword, false),
 ];
 
 /// Умолчания Qdrant 1.19 (`config/config.yaml`): `optimizers.flush_interval_sec` и
@@ -476,16 +480,23 @@ impl QdrantIndex {
     }
 
     async fn delete_targets_impl(&self, user: Id, targets: &[TargetRef]) -> Result<(), IndexError> {
-        let (nodes, entries) = split_targets(targets);
-        let mut any = Vec::new();
-        if !nodes.is_empty() {
-            any.push(kw_any("node_id", nodes));
-        }
-        if !entries.is_empty() {
-            any.push(kw_any("entry_id", entries));
-        }
-        if any.is_empty() {
+        let t = split_targets(targets);
+        if t.is_empty() {
             return Ok(());
+        }
+        let mut any = Vec::new();
+        if !t.nodes.is_empty() {
+            // точки самого узла: у точек его вложений тот же `node_id`, но есть `attachment_id`
+            any.push(Condition::from(Filter::must([
+                kw_any("node_id", t.nodes),
+                Condition::is_empty("attachment_id"),
+            ])));
+        }
+        if !t.entries.is_empty() {
+            any.push(kw_any("entry_id", t.entries));
+        }
+        if !t.attachments.is_empty() {
+            any.push(kw_any("attachment_id", t.attachments));
         }
         let filter = Filter {
             must: vec![kw("user_id", user.to_string())],
@@ -815,6 +826,9 @@ fn to_point(p: IndexPoint) -> PointStruct {
         ("status", pl.status),
         ("insight_kind", pl.insight_kind),
         ("certainty", pl.certainty),
+        ("attachment_id", pl.attachment_id.map(|a| a.to_string())),
+        ("blob_sha256", pl.blob_sha256),
+        ("locator", pl.locator),
     ] {
         if let Some(v) = v {
             payload.insert(k, v);
@@ -899,7 +913,7 @@ fn to_hit(p: ScoredPoint) -> Result<VectorHit, IndexError> {
     let user_id = get("user_id")
         .and_then(|s| s.parse::<Id>().ok())
         .ok_or_else(|| IndexError::Corrupt("точка без корректного user_id".into()))?;
-    let target = hit_target(get("node_id"), get("entry_id"))?;
+    let target = hit_target(get("node_id"), get("entry_id"), get("attachment_id"))?;
     let level = get("level").ok_or_else(|| IndexError::Corrupt("точка без level".into()))?;
     Ok(VectorHit {
         chunk_id,

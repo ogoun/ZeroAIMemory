@@ -15,6 +15,15 @@
 //!
 //! Backoff: после `n`-й неудачи `not_before = now + min(2^n с, 1 ч)`;
 //! после [`MAX_ATTEMPTS`]-й — `failed` (узел — `index_state = 'failed'`).
+//!
+//! **Два потребителя очереди (M5).** Задание `upsert` документа вложения в состоянии
+//! `extract_state = 'pending'` — задание *извлечения*: его выдаёт [`claim_extract_jobs`]
+//! конвейеру документов сервера (работает и без модели: FTS вложений). Остальные задания,
+//! в том числе `upsert` извлечённого документа (точки Qdrant) и `delete`, выдаёт
+//! [`claim_jobs`] воркеру векторного индекса. После извлечения документ — `done`, новая
+//! нарезка ставит `upsert` (задание извлечения ещё `running` → `dirty`), и закрытие задания
+//! извлечения возвращает его в очередь — уже воркеру точек. Сброс заданий после аварии —
+//! у каждого потребителя свой ([`requeue_running`], [`requeue_running_extract`]).
 
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
@@ -36,6 +45,15 @@ pub const MAX_BACKOFF_SECS: i64 = 3600;
 pub(crate) const PRIORITY_WRITE: i64 = 10;
 /// Приоритет заданий reindex и разовой перечанковки при миграции.
 pub(crate) const PRIORITY_REINDEX: i64 = 0;
+/// Приоритет заданий документов вложений (извлечение и точки): после заметок от записи (их
+/// ждёт человек или агент), раньше массового reindex. Документ на тысячи чанков — одно задание
+/// воркера; так он не задерживает индексацию только что записанных заметок.
+pub(crate) const PRIORITY_ATTACHMENT: i64 = 5;
+/// Условие «задание извлечения» над строкой `index_jobs` (алиас `j`): `upsert` документа
+/// вложения, текст которого ещё не извлечён.
+const EXTRACT_JOB: &str = "j.target_kind = 'attachment' AND j.op = 'upsert'
+     AND EXISTS (SELECT 1 FROM attachment_docs d
+                 WHERE d.id = j.target_id AND d.extract_state = 'pending')";
 /// Предел длины `last_error`, символов.
 const LAST_ERROR_MAX_CHARS: usize = 1000;
 
@@ -243,6 +261,19 @@ pub struct IndexChunk {
     pub node: NodePayload,
     /// Поля записи журнала; `None` — чанк заметки.
     pub entry: Option<EntryPayload>,
+    /// Поля документа вложения (M5); `None` — чанк заметки или записи. У чанка вложения
+    /// `node` — узел-владелец (область, права, путь).
+    pub attachment: Option<AttachmentPayload>,
+}
+
+/// Поля документа вложения для payload точек Qdrant (M5): точка получает `attachment_id`,
+/// `blob_sha256` и `locator`, вид `attachment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentPayload {
+    pub attachment_id: Id,
+    pub blob_sha256: String,
+    /// `page:12`, `sheet:Итоги!A1:F40`, `slide:3`, `para:40`.
+    pub locator: Option<String>,
 }
 
 /// Ставит задание `op` для узла, заменяя его активное задание (если есть):
@@ -300,9 +331,10 @@ pub(crate) fn enqueue_target(
     Ok(())
 }
 
-/// Выдаёт до `limit` заданий `queued` с `not_before ≤ now` (приоритет по убыванию,
-/// затем id) и атомарно переводит их в `running` с новым `claim_gen`. Узел, задание
-/// которого уже `running`, не выдаётся: активное задание у узла одно.
+/// Выдаёт воркеру векторного индекса до `limit` заданий `queued` с `not_before ≤ now`
+/// (приоритет по убыванию, затем id) и атомарно переводит их в `running` с новым
+/// `claim_gen`. Узел, задание которого уже `running`, не выдаётся: активное задание у узла
+/// одно. Задания извлечения вложений ([`claim_extract_jobs`]) не выдаются.
 pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job>, StoreError> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -311,16 +343,63 @@ pub async fn claim_jobs(db: &Db, limit: usize, now: Timestamp) -> Result<Vec<Job
     db.write(move |tx| {
         let now = fmt_ts(now);
         let mut jobs: Vec<Job> = {
-            let mut st = tx.prepare_cached(
-                "SELECT id, target_id, rev, op, attempts, target_kind FROM index_jobs
-                 WHERE state = 'queued' AND not_before <= ?1
+            let mut st = tx.prepare_cached(&format!(
+                "SELECT id, target_id, rev, op, attempts, target_kind FROM index_jobs j
+                 WHERE state = 'queued' AND not_before <= ?1 AND NOT ({EXTRACT_JOB})
                  ORDER BY priority DESC, id
-                 LIMIT ?2",
-            )?;
+                 LIMIT ?2"
+            ))?;
             st.query_map(params![now, limit], |r| {
                 Ok(Job {
                     id: r.get(0)?,
                     target_kind: parse_target_kind(&r.get::<_, String>(5)?)?,
+                    target_id: r.get(1)?,
+                    rev: r.get(2)?,
+                    op: r.get(3)?,
+                    attempts: r.get(4)?,
+                    claim_gen: 0,
+                })
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let mut st = tx.prepare_cached(
+            "UPDATE index_jobs SET state = 'running', claim_gen = claim_gen + 1, updated_at = ?2
+             WHERE id = ?1
+             RETURNING claim_gen",
+        )?;
+        for j in &mut jobs {
+            j.claim_gen = st.query_row(params![j.id, now], |r| r.get(0))?;
+        }
+        Ok(jobs)
+    })
+    .await
+}
+
+/// Выдаёт конвейеру документов до `limit` заданий извлечения (`upsert` документа вложения в
+/// `extract_state = 'pending'`), как [`claim_jobs`]: приоритет, затем id, `running` с новым
+/// `claim_gen`.
+pub async fn claim_extract_jobs(
+    db: &Db,
+    limit: usize,
+    now: Timestamp,
+) -> Result<Vec<Job>, StoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    db.write(move |tx| {
+        let now = fmt_ts(now);
+        let mut jobs: Vec<Job> = {
+            let mut st = tx.prepare_cached(&format!(
+                "SELECT id, target_id, rev, op, attempts FROM index_jobs j
+                 WHERE state = 'queued' AND not_before <= ?1 AND {EXTRACT_JOB}
+                 ORDER BY priority DESC, id
+                 LIMIT ?2"
+            ))?;
+            st.query_map(params![now, limit], |r| {
+                Ok(Job {
+                    id: r.get(0)?,
+                    target_kind: TargetKind::Attachment,
                     target_id: r.get(1)?,
                     rev: r.get(2)?,
                     op: r.get(3)?,
@@ -496,15 +575,53 @@ pub async fn release_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome,
     .await
 }
 
-/// Число живых заметок и записей журналов с `index_state = 'indexed'`: есть ли что
-/// терять, если коллекция Qdrant создана заново (тогда нужен reindex из `embeddings`).
+/// Окончательная неудача выдачи `claim_gen` задания `id` без повторов (ошибка не временная:
+/// документ не разбирается): сразу `failed` с `err` — оно видно в `failed_items`
+/// `/index/status`, повтор — reindex. «Грязное» задание возвращается в очередь
+/// ([`JobOutcome::Requeued`]), устаревшая выдача — [`JobOutcome::Stale`].
+pub async fn give_up_job(
+    db: &Db,
+    id: i64,
+    claim_gen: i64,
+    err: &str,
+) -> Result<JobOutcome, StoreError> {
+    let err: String = err.chars().take(LAST_ERROR_MAX_CHARS).collect();
+    db.write(move |tx| {
+        let Some((target, rev, op, attempts, dirty)) = claimed(tx, id, claim_gen)? else {
+            return Ok(JobOutcome::Stale);
+        };
+        let stamp = fmt_ts(Timestamp::now());
+        if dirty {
+            return requeue_dirty(tx, id, &stamp);
+        }
+        tx.execute(
+            "UPDATE index_jobs SET state = 'failed', attempts = ?2, last_error = ?3,
+                                   updated_at = ?4
+             WHERE id = ?1",
+            params![id, attempts + 1, err, stamp],
+        )?;
+        if op == JobOp::Upsert {
+            set_target_state(tx, target, rev, IndexState::Failed)?;
+        }
+        Ok(JobOutcome::Failed)
+    })
+    .await
+}
+
+/// Число живых заметок, записей журналов и извлечённых документов вложений (не Human), уже
+/// проиндексированных: есть ли что терять, если коллекция Qdrant создана заново (тогда нужен
+/// reindex из `embeddings`).
 pub async fn indexed_count(db: &Db) -> Result<i64, StoreError> {
     db.read(|c| {
         Ok(c.query_row(
             "SELECT (SELECT count(*) FROM nodes
                      WHERE kind = 'note' AND index_state = 'indexed' AND deleted_at IS NULL)
                   + (SELECT count(*) FROM entries
-                     WHERE index_state = 'indexed' AND deleted_at IS NULL)",
+                     WHERE index_state = 'indexed' AND deleted_at IS NULL)
+                  + (SELECT count(*) FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
+                     JOIN spaces s ON s.id = n.space_id
+                     WHERE d.extract_state = 'done' AND d.deleted_at IS NULL
+                       AND n.deleted_at IS NULL AND s.kind <> 'human')",
             [],
             |r| r.get(0),
         )?)
@@ -512,14 +629,27 @@ pub async fn indexed_count(db: &Db) -> Result<i64, StoreError> {
     .await
 }
 
-/// При старте: задания, оставшиеся `running` после аварийного завершения, — снова
-/// `queued` (с `dirty = 0`: следующая выдача и так возьмёт актуальную ревизию).
-/// Возвращает их число.
+/// При старте воркера векторного индекса: его задания, оставшиеся `running` после
+/// аварийного завершения, — снова `queued` (с `dirty = 0`: следующая выдача и так возьмёт
+/// актуальную ревизию). Задания извлечения не трогаются — их сбрасывает конвейер документов
+/// ([`requeue_running_extract`]): он может уже работать с ними. Возвращает их число.
 pub async fn requeue_running(db: &Db) -> Result<u64, StoreError> {
-    db.write(|tx| {
+    requeue_running_where(db, false).await
+}
+
+/// [`requeue_running`] конвейера документов: только задания извлечения.
+pub async fn requeue_running_extract(db: &Db) -> Result<u64, StoreError> {
+    requeue_running_where(db, true).await
+}
+
+async fn requeue_running_where(db: &Db, extract: bool) -> Result<u64, StoreError> {
+    db.write(move |tx| {
+        let not = if extract { "" } else { "NOT" };
         let n = tx.execute(
-            "UPDATE index_jobs SET state = 'queued', dirty = 0, updated_at = ?1
-             WHERE state = 'running'",
+            &format!(
+                "UPDATE index_jobs AS j SET state = 'queued', dirty = 0, updated_at = ?1
+                 WHERE state = 'running' AND {not} ({EXTRACT_JOB})"
+            ),
             [fmt_ts(Timestamp::now())],
         )?;
         Ok(n as u64)
@@ -529,7 +659,9 @@ pub async fn requeue_running(db: &Db) -> Result<u64, StoreError> {
 
 /// Перечанковывает живые заметки и записи журналов пространства `space` (`None` — всех)
 /// текущим счётчиком токенов и ставит `upsert` индексируемым (не Human, не `index: false`)
-/// с низким приоритетом. Цель с активным заданием получает одно задание, не два.
+/// с низким приоритетом; документы вложений — заново из кэша извлечения
+/// ([`crate::attachments::reindex_docs`]: перенарезка, затем точки). Цель с активным заданием
+/// получает одно задание, не два.
 /// Возвращает число поставленных `upsert`. Идёт пакетами по отдельным транзакциям.
 /// Перечанковка всей базы точным счётчиком снимает отметку «чанки по оценке» и ставит
 /// текущий отпечаток нарезки.
@@ -537,6 +669,7 @@ pub async fn enqueue_reindex(db: &Db, space: Option<Id>) -> Result<u64, StoreErr
     let (_, mut jobs) =
         crate::nodes::rechunk_notes(db, space, PRIORITY_REINDEX, false, None).await?;
     jobs += crate::entries::rechunk_entries(db, space, PRIORITY_REINDEX, false, None).await?;
+    jobs += crate::attachments::reindex_docs(db, space).await?;
     if space.is_none() {
         crate::user_db::clear_approx_if_exact(db).await?;
         crate::user_db::mark_chunker_current(db).await?;
@@ -607,11 +740,12 @@ pub async fn job_stats(db: &Db) -> Result<JobStats, StoreError> {
     .await
 }
 
-fn parse_level(s: &str) -> Option<ChunkLevel> {
+pub(crate) fn parse_level(s: &str) -> Option<ChunkLevel> {
     match s {
         "chunk" => Some(ChunkLevel::Chunk),
         "section" => Some(ChunkLevel::Section),
         "note" => Some(ChunkLevel::Note),
+        "attachment" => Some(ChunkLevel::Attachment),
         _ => None,
     }
 }
@@ -722,7 +856,7 @@ pub(crate) fn read_index_chunks(
             (id, level, heading_path, ordinal),
             (text, context_prefix, text_hash, tokens, rev, key),
         ) = row?;
-        // папки и вложения (этап M3) векторизуются не здесь
+        // папки векторизуются не здесь, вложения читает `attachments`
         let Some(level) = parse_level(&level) else {
             continue;
         };
@@ -743,6 +877,7 @@ pub(crate) fn read_index_chunks(
             rev,
             node: payload.clone(),
             entry: entry.cloned(),
+            attachment: None,
         });
     }
     Ok(out)
@@ -885,6 +1020,10 @@ pub struct FailedJob {
     pub attempts: i64,
     /// Последняя ошибка (без текста заметок).
     pub error: Option<String>,
+    /// Причина неудачи документа вложения — код из `extract_error` (`parse_crash`,
+    /// `parse_timeout`, `parse_oom`, `parse_error`, `pdfium_unavailable`, `too_large`,
+    /// `blob_missing`, `index_failed`); у узлов и записей — `None`.
+    pub reason: Option<String>,
     pub updated_at: Timestamp,
 }
 
@@ -895,7 +1034,8 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
         let mut st = c.prepare_cached(
             "SELECT j.id, j.target_id, j.op, j.attempts, j.last_error, j.updated_at,
                     coalesce(n.space_id, e.space_id, an.space_id), coalesce(n.path, an.path),
-                    coalesce(n.deleted_at, e.deleted_at, d.deleted_at), j.target_kind
+                    coalesce(n.deleted_at, e.deleted_at, d.deleted_at), j.target_kind,
+                    d.extract_error
              FROM index_jobs j
              LEFT JOIN nodes n ON j.target_kind = 'node' AND n.id = j.target_id
              LEFT JOIN entries e ON j.target_kind = 'entry' AND e.id = j.target_id
@@ -915,6 +1055,9 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
                 space_id: r.get(6)?,
                 path: r.get(7)?,
                 deleted_at: ts_opt(r, 8)?,
+                reason: r
+                    .get::<_, Option<String>>(10)?
+                    .map(|e| crate::attachments::error_code(&e).to_string()),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

@@ -149,6 +149,9 @@ pub enum ChunkLevel {
     Section,
     /// L1 всей заметки.
     Note,
+    /// Фрагмент единицы документа-вложения (M5, `chunks.attachment_id`): нарезка —
+    /// [`split_plain`], не [`chunk_note`].
+    Attachment,
 }
 
 impl ChunkLevel {
@@ -158,6 +161,7 @@ impl ChunkLevel {
             Self::Chunk => "chunk",
             Self::Section => "section",
             Self::Note => "note",
+            Self::Attachment => "attachment",
         }
     }
 }
@@ -174,6 +178,50 @@ pub struct ChunkDraft {
     pub range: Option<Range<usize>>,
     /// Токены `text` по переданному счётчику.
     pub token_count: usize,
+}
+
+/// Нарезка простого текста — единицы документа-вложения (спецификация M5 §3): текст не
+/// длиннее `hard_max` токенов — один кусок; длиннее — дробится по предложениям, затем строкам,
+/// словам и символам (те же шаги, что у абзацев заметки), и соседние части жадно склеиваются,
+/// пока сумма не превысит `target_max` (склейка не длиннее `hard_max`). Куски идут встык по
+/// порядку; куски из одних пробелов отбрасываются, пустой текст — без кусков. Перекрытия
+/// предложений, как у листов заметки, нет: `locator` у всех кусков единицы общий.
+pub fn split_plain(text: &str, p: &ChunkParams, tc: &dyn TokenCounter) -> Vec<Range<usize>> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let ch = Chunker {
+        src: text,
+        p: p.normalized(),
+        tc,
+    };
+    let all = 0..text.len();
+    if ch.count(all.clone()) <= ch.p.hard_max {
+        return vec![all];
+    }
+    let mut pieces = Vec::new();
+    ch.refine(all, PLAIN_STEPS, None, &mut pieces);
+    let mut out: Vec<Range<usize>> = Vec::new();
+    // текущая склейка и её токены
+    let mut cur: Option<(Range<usize>, usize)> = None;
+    for r in pieces {
+        let t = ch.count(r.clone());
+        if let Some((c, ct)) = &mut cur {
+            if *ct + t <= ch.p.target_max {
+                let merged = ch.count(c.start..r.end);
+                if merged <= ch.p.hard_max {
+                    c.end = r.end;
+                    *ct = merged;
+                    continue;
+                }
+            }
+            out.push(c.clone());
+        }
+        cur = Some((r, t));
+    }
+    out.extend(cur.map(|(c, _)| c));
+    out.retain(|r| !text[r.clone()].trim().is_empty());
+    out
 }
 
 /// Чанки заметки: листы в порядке документа, затем L1 секций, затем L1 заметки.
@@ -504,6 +552,9 @@ enum Gran {
 
 const BLOCK_STEPS: &[Gran] = &[Gran::Lines, Gran::Words, Gran::Chars];
 const PROSE_STEPS: &[Gran] = &[Gran::Words, Gran::Chars];
+/// Дробление простого текста ([`split_plain`]): предложения, строки (таблицы, строки страницы
+/// PDF без знаков конца), слова, символы.
+const PLAIN_STEPS: &[Gran] = &[Gran::Sentences, Gran::Lines, Gran::Words, Gran::Chars];
 
 struct Chunker<'s> {
     src: &'s str,

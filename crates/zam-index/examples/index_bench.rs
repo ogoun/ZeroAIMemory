@@ -259,6 +259,9 @@ impl Data {
                 status: None,
                 insight_kind: None,
                 certainty: None,
+                attachment_id: None,
+                blob_sha256: None,
+                locator: None,
             },
         }
     }

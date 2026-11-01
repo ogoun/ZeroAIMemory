@@ -22,7 +22,9 @@ pub fn point_id(chunk_id: &str) -> Uuid {
 /// Payload точки (§6.4). Строковые id — в base32 (`Id::to_string`). Цель точки — ровно
 /// одно из `node_id` (узел) и `entry_id` (запись журнала): точку без цели или с обеими
 /// целями адаптер отклоняет. Поля записей (`entry_id`, `status`, `insight_kind`,
-/// `certainty`) добавлены в M3 без пересборки коллекции: у точек M2 их нет.
+/// `certainty`) добавлены в M3 без пересборки коллекции: у точек M2 их нет. Точка документа
+/// вложения (M5) несёт `node_id` узла-владельца (область, права, путь) и `attachment_id`:
+/// её цель — документ ([`TargetKind::Attachment`]), удаление точек узла её не задевает.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointPayload {
     /// Тенант — владелец базы, в которой лежит узел или запись; обязателен в каждом запросе.
@@ -51,18 +53,29 @@ pub struct PointPayload {
     pub insight_kind: Option<String>,
     /// `axiom` / `theorem` / `hypothesis`.
     pub certainty: Option<String>,
+    /// Документ вложения (M5): точка — его чанк, `node_id` — узел-владелец.
+    pub attachment_id: Option<Id>,
+    /// sha256 файла вложения.
+    pub blob_sha256: Option<String>,
+    /// Место в документе: `page:12`, `sheet:Итоги!A1:F40`, `slide:3`, `para:40`.
+    pub locator: Option<String>,
 }
 
 impl PointPayload {
-    /// Цель точки; `None` — нет ни одной цели или заданы обе.
+    /// Цель точки; `None` — нет ни одной цели или заданы обе. У точки вложения — документ
+    /// (`node_id` узла-владельца обязателен, `entry_id` — нет).
     pub fn target(&self) -> Option<TargetRef> {
-        match (self.node_id, self.entry_id) {
-            (Some(id), None) => Some(TargetRef {
+        match (self.node_id, self.entry_id, self.attachment_id) {
+            (Some(id), None, None) => Some(TargetRef {
                 kind: TargetKind::Node,
                 id,
             }),
-            (None, Some(id)) => Some(TargetRef {
+            (None, Some(id), None) => Some(TargetRef {
                 kind: TargetKind::Entry,
+                id,
+            }),
+            (Some(_), None, Some(id)) => Some(TargetRef {
+                kind: TargetKind::Attachment,
                 id,
             }),
             _ => None,
@@ -267,56 +280,84 @@ pub(crate) fn check_points(pts: &[IndexPoint]) -> Result<(), IndexError> {
     }
     if pts.iter().any(|p| p.payload.target().is_none()) {
         return Err(IndexError::Other(
-            "у точки должна быть ровно одна цель: node_id или entry_id".into(),
+            "у точки должна быть ровно одна цель: node_id, entry_id или attachment_id с node_id"
+                .into(),
         ));
     }
     Ok(())
 }
 
-/// Цели, разделённые по виду: (id узлов, id записей) в base32.
-pub(crate) fn split_targets(targets: &[TargetRef]) -> (Vec<String>, Vec<String>) {
-    let mut nodes = Vec::new();
-    let mut entries = Vec::new();
-    for t in targets {
-        match t.kind {
-            TargetKind::Node => nodes.push(t.id.to_string()),
-            TargetKind::Entry => entries.push(t.id.to_string()),
-            // точек вложений пока нет: удаление по `attachment_id` — задача 5 M5
-            TargetKind::Attachment => {}
-        }
-    }
-    (nodes, entries)
+/// Цели, разделённые по виду (id в base32).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SplitTargets {
+    pub nodes: Vec<String>,
+    pub entries: Vec<String>,
+    pub attachments: Vec<String>,
 }
 
-/// Цель точки по строковым `node_id` / `entry_id` из payload выдачи.
+impl SplitTargets {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.entries.is_empty() && self.attachments.is_empty()
+    }
+}
+
+/// Цели по виду: точки узла — по `node_id` без `attachment_id` (точки его вложений не
+/// задеваются), записи — по `entry_id`, документы вложений — по `attachment_id`.
+pub(crate) fn split_targets(targets: &[TargetRef]) -> SplitTargets {
+    let mut out = SplitTargets::default();
+    for t in targets {
+        match t.kind {
+            TargetKind::Node => out.nodes.push(t.id.to_string()),
+            TargetKind::Entry => out.entries.push(t.id.to_string()),
+            TargetKind::Attachment => out.attachments.push(t.id.to_string()),
+        }
+    }
+    out
+}
+
+/// Цель точки по строковым `node_id` / `entry_id` / `attachment_id` из payload выдачи.
 pub(crate) fn hit_target(
     node_id: Option<String>,
     entry_id: Option<String>,
+    attachment_id: Option<String>,
 ) -> Result<TargetRef, IndexError> {
     let parse = |s: String| {
         s.parse::<Id>()
             .map_err(|_| IndexError::Corrupt("точка с некорректным id цели".into()))
     };
-    match (node_id, entry_id) {
-        (Some(n), None) => Ok(TargetRef {
+    match (node_id, entry_id, attachment_id) {
+        (Some(n), None, None) => Ok(TargetRef {
             kind: TargetKind::Node,
             id: parse(n)?,
         }),
-        (None, Some(e)) => Ok(TargetRef {
+        (None, Some(e), None) => Ok(TargetRef {
             kind: TargetKind::Entry,
             id: parse(e)?,
         }),
+        (Some(_), None, Some(a)) => Ok(TargetRef {
+            kind: TargetKind::Attachment,
+            id: parse(a)?,
+        }),
         _ => Err(IndexError::Corrupt(
-            "у точки нет ровно одной цели (node_id / entry_id)".into(),
+            "у точки нет ровно одной цели (node_id / entry_id / attachment_id)".into(),
         )),
     }
 }
 
 /// Уровень и вид точки папки.
 pub const LEVEL_FOLDER: &str = "folder";
+/// Уровень и вид точки чанка документа вложения (M5).
+pub const LEVEL_ATTACHMENT: &str = "attachment";
 
 /// Поля payload, которые читает выдача поиска.
-pub(crate) const HIT_FIELDS: [&str; 5] = ["chunk_id", "user_id", "node_id", "entry_id", "level"];
+pub(crate) const HIT_FIELDS: [&str; 6] = [
+    "chunk_id",
+    "user_id",
+    "node_id",
+    "entry_id",
+    "attachment_id",
+    "level",
+];
 
 #[cfg(test)]
 mod tests {
@@ -369,18 +410,27 @@ mod tests {
     fn hit_target_needs_exactly_one() {
         let id = Id::new();
         assert_eq!(
-            hit_target(Some(id.to_string()), None).unwrap(),
+            hit_target(Some(id.to_string()), None, None).unwrap(),
             TargetRef {
                 kind: TargetKind::Node,
                 id
             }
         );
         assert_eq!(
-            hit_target(None, Some(id.to_string())).unwrap().kind,
+            hit_target(None, Some(id.to_string()), None).unwrap().kind,
             TargetKind::Entry
         );
-        assert!(hit_target(None, None).is_err());
-        assert!(hit_target(Some(id.to_string()), Some(id.to_string())).is_err());
-        assert!(hit_target(Some("bad".into()), None).is_err());
+        let att = Id::new();
+        assert_eq!(
+            hit_target(Some(id.to_string()), None, Some(att.to_string())).unwrap(),
+            TargetRef {
+                kind: TargetKind::Attachment,
+                id: att
+            }
+        );
+        assert!(hit_target(None, None, Some(att.to_string())).is_err());
+        assert!(hit_target(None, None, None).is_err());
+        assert!(hit_target(Some(id.to_string()), Some(id.to_string()), None).is_err());
+        assert!(hit_target(Some("bad".into()), None, None).is_err());
     }
 }

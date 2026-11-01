@@ -17,9 +17,13 @@ pub fn tmp(name: &str) -> PathBuf {
     d
 }
 
+/// Конфигурация теста в каталоге `dir`. Рабочий процесс разбора документов — бинарник пакета:
+/// текущий исполняемый файл теста подкоманды `doc-worker` не знает.
 pub fn cfg_in(dir: PathBuf) -> ServerConfig {
-    ServerConfig {
+    let mut c = ServerConfig {
         data_dir: dir,
         ..ServerConfig::default()
-    }
+    };
+    c.docs.worker_program = Some(PathBuf::from(env!("CARGO_BIN_EXE_zam-server")));
+    c
 }

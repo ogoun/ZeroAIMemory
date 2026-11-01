@@ -45,8 +45,8 @@ use zam_core::{Id, TargetRef};
 use crate::IndexError;
 use crate::qdrant::{COLLECTION, DENSE, SCHEMA_VERSION, SPARSE};
 use crate::vector::{
-    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, VectorFilter, VectorHit,
-    VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
+    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_ATTACHMENT, LEVEL_FOLDER, VectorFilter,
+    VectorHit, VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
 };
 
 /// Файл метаданных шарда (аналог `metadata` коллекции Qdrant).
@@ -65,7 +65,7 @@ const LEVEL_CHUNK: &str = "chunk";
 const LEVELS_NOTE: [&str; 2] = ["note", "section"];
 
 /// Payload-индексы: (поле, схема в JSON-форме Qdrant), как у managed.
-const PAYLOAD_INDEXES: [(&str, &str); 12] = [
+const PAYLOAD_INDEXES: [(&str, &str); 13] = [
     ("user_id", r#"{"type":"keyword","is_tenant":true}"#),
     ("space_id", r#""keyword""#),
     ("node_id", r#""keyword""#),
@@ -78,6 +78,7 @@ const PAYLOAD_INDEXES: [(&str, &str); 12] = [
     ("insight_kind", r#""keyword""#),
     ("certainty", r#""keyword""#),
     ("area", r#""keyword""#),
+    ("attachment_id", r#""keyword""#),
 ];
 
 /// Параметры Edge-индекса.
@@ -436,16 +437,25 @@ impl VectorIndex for EdgeIndex {
 
     fn delete_targets<'a>(&'a self, user: Id, targets: &'a [TargetRef]) -> IndexFuture<'a, ()> {
         Box::pin(async move {
-            let (nodes, entries) = split_targets(targets);
-            let mut any = Vec::new();
-            if !nodes.is_empty() {
-                any.push(kw_any("node_id", nodes));
-            }
-            if !entries.is_empty() {
-                any.push(kw_any("entry_id", entries));
-            }
-            if any.is_empty() {
+            let t = split_targets(targets);
+            if t.is_empty() {
                 return Ok(());
+            }
+            let mut any = Vec::new();
+            if !t.nodes.is_empty() {
+                // точки самого узла, без точек его вложений (у них `kind = attachment` и
+                // `attachment_id`; managed-адаптер проверяет пустой `attachment_id`)
+                any.push(Condition::Filter(Filter {
+                    must: Some(vec![kw_any("node_id", t.nodes)]),
+                    must_not: Some(vec![kw("kind", LEVEL_ATTACHMENT.to_string())]),
+                    ..Filter::default()
+                }));
+            }
+            if !t.entries.is_empty() {
+                any.push(kw_any("entry_id", t.entries));
+            }
+            if !t.attachments.is_empty() {
+                any.push(kw_any("attachment_id", t.attachments));
             }
             let filter = Filter {
                 must: Some(vec![kw("user_id", user.to_string())]),
@@ -711,6 +721,9 @@ fn to_point(p: IndexPoint) -> Result<qdrant_edge::PointStructPersisted, IndexErr
         ("status", pl.status),
         ("insight_kind", pl.insight_kind),
         ("certainty", pl.certainty),
+        ("attachment_id", pl.attachment_id.map(|a| a.to_string())),
+        ("blob_sha256", pl.blob_sha256),
+        ("locator", pl.locator),
     ] {
         if let Some(v) = v {
             payload.insert(k.into(), v.into());
@@ -854,7 +867,7 @@ fn to_hit(p: qdrant_edge::ScoredPoint) -> Result<VectorHit, IndexError> {
     let user_id = get("user_id")
         .and_then(|s| s.parse::<Id>().ok())
         .ok_or_else(|| IndexError::Corrupt("точка без корректного user_id".into()))?;
-    let target = hit_target(get("node_id"), get("entry_id"))?;
+    let target = hit_target(get("node_id"), get("entry_id"), get("attachment_id"))?;
     let level = get("level").ok_or_else(|| IndexError::Corrupt("точка без level".into()))?;
     Ok(VectorHit {
         chunk_id,

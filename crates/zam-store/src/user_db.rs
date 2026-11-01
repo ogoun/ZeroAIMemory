@@ -300,6 +300,8 @@ impl UserDbs {
                 running: AtomicBool::new(true),
             })
         });
+        // нарезка вложений (M5): состояние и задания извлечения, работа — у конвейера документов
+        crate::attachments::rechunk_docs_if_stale(&db).await?;
         let edges = crate::graph::backfill_pending(&db).await?;
         let secrets = secrets_scan_pending(&db).await?;
         // теги payload и вход эмбеддинга папок (v3): до возврата базы — воркер проверяет

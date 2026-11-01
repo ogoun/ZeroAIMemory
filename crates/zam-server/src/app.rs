@@ -42,6 +42,8 @@ pub struct AppState {
     pub render_gen: Arc<api::render::RenderGenerations>,
     /// Модель, Qdrant и воркер индексации.
     pub index: Arc<IndexRuntime>,
+    /// Конвейер индексации вложений (M5): разбор в рабочих процессах, чанки, задания точек.
+    pub docs: Arc<crate::docs::DocIndexer>,
     /// Реранкер `rerank=on` (загружается при первом таком запросе).
     pub rerank: Arc<RerankSlot>,
     /// Ключи Vault (§7.6): мастер-ключ, ключи пользователей, состояние блокировки.
@@ -61,6 +63,8 @@ impl AppState {
     /// Штатная остановка фоновых частей. Фоновые задачи, держащие `Db` (соединения SQLite), и как
     /// каждая останавливается (финальное ревью M4, M-5):
     /// - воркер обслуживания ([`Maintenance::stop`]) — с ожиданием конца задачи;
+    /// - конвейер документов ([`crate::docs::DocIndexer::shutdown`]) — незаконченные разборы
+    ///   ждём не дольше 5 с (задания вернутся в очередь при следующем запуске);
     /// - воркер индексации (`IndexRuntime::shutdown` → `Worker::shutdown`) — с ожиданием
     ///   текущей пачки;
     /// - фоновая задача открытия базы (перенарезка, дозаполнение рёбер, пересканирование
@@ -73,6 +77,7 @@ impl AppState {
     /// но не для незаконченной задачи открытия базы.
     pub async fn shutdown(&self) {
         self.maintenance.stop().await;
+        self.docs.shutdown().await;
         self.index.shutdown(&self.system, &self.users).await;
     }
 }
@@ -267,6 +272,13 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     // реестр решений — до индексации и приёма запросов (§11.6)
     bootstrap::register_solutions(&system, &users).await;
     let index = Arc::new(IndexRuntime::start(&cfg, ml, early_sup, &system, &users).await);
+    // вложения извлекаются и без модели (FTS): конвейер не зависит от воркера индекса
+    let docs = Arc::new(crate::docs::DocIndexer::start(
+        &cfg.docs,
+        system.clone(),
+        users.clone(),
+        data_dir.blobs_dir(),
+    ));
     let rerank = Arc::new(RerankSlot::new(&cfg));
     let maintenance = Arc::new(Maintenance::start(
         system.clone(),
@@ -278,6 +290,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         glossary: Arc::default(),
         users,
         index,
+        docs,
         rerank,
         vault,
         data_dir,

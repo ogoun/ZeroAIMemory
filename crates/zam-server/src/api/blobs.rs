@@ -206,6 +206,8 @@ pub async fn upload(
     )
     .await?;
     st.render_gen.bump_user(sc.owner);
+    // задание извлечения — конвейеру документов
+    st.docs.notify();
     tracing::info!(node = %sc.node.id, sha256 = %sha, size, "вложение загружено");
     Ok((
         StatusCode::CREATED,

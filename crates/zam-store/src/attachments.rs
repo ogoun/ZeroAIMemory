@@ -19,6 +19,15 @@
 //! Qdrant (новая нарезка, перенос, восстановление) ему не ставится; векторный индекс Human не
 //! берёт и сам (как у заметок, `jobs::index_chunks`).
 //!
+//! **Конвейер (задача 5 M5).** Задание извлечения (`upsert` документа в `pending`,
+//! [`crate::claim_extract_jobs`]) выполняет конвейер документов сервера: вид по содержимому,
+//! кэш [`extract_cached`] или разбор, [`put_extract`], [`replace_attachment_chunks`] (нарезка
+//! единиц, сканер секретов, `done`). Новая нарезка ставит `upsert` ради точек — его выполняет
+//! воркер векторного индекса по [`attachment_chunks_for_index`]. Неудача — `failed` с причиной
+//! ([`error_code`]); повтор — reindex ([`reindex_docs`]). Отпечаток нарезки вложений
+//! ([`rechunk_docs_if_stale`], `meta.chunker_attachments`) включает [`EXTRACTOR_VERSION`]: при
+//! расхождении документы снова `pending` (кэш той же версии — без разбора).
+//!
 //! Типы извлечения — из `zam-docs` ([`Extracted`], [`Unit`], [`Locator`], [`DocKind`]);
 //! [`ExtractState`] — состояние строки базы, поэтому здесь.
 
@@ -36,8 +45,12 @@ use crate::cache::{StaleKind, invalidate_target};
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::embeddings::embed_key_of;
 use crate::entries::Certainty;
-use crate::jobs::{JobOp, PRIORITY_WRITE, enqueue_target, has_active_target};
+use crate::jobs::{
+    AttachmentPayload, IndexChunk, JobOp, NodePayload, PRIORITY_ATTACHMENT, enqueue_target,
+    has_active_target,
+};
 use crate::nodes::{Attribution, context_prefix, token_counter};
+use crate::paths::path_ancestors;
 use crate::time::{fmt_ts, ts_at};
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
@@ -50,6 +63,19 @@ const DOC_REV: i64 = 0;
 const ZSTD_LEVEL: i32 = 3;
 /// Предел длины `extract_error`, символов.
 const EXTRACT_ERROR_MAX_CHARS: usize = 1000;
+/// Ключ `meta`: отпечаток нарезки вложений базы ([`attachment_chunker_fingerprint`]).
+pub const CHUNKER_ATTACHMENTS_KEY: &str = "chunker_attachments";
+
+/// Причина `failed`: pdfium не загружен (PDF не разобрать, пока библиотеки нет; при следующем
+/// запуске с pdfium такие документы извлекаются снова).
+pub const PDFIUM_UNAVAILABLE: &str = "pdfium_unavailable";
+/// Причина `failed`: файла блоба нет на диске.
+pub const BLOB_MISSING: &str = "blob_missing";
+
+/// Код причины `extract_error`: часть до `:` (`parse_error: zip: …` → `parse_error`).
+pub fn error_code(e: &str) -> &str {
+    e.split(':').next().unwrap_or(e).trim()
+}
 
 /// Пространство имён UUIDv5 id чанков вложений (отлично от blake3-схемы чанков заметок).
 fn chunk_namespace() -> Uuid {
@@ -153,7 +179,7 @@ pub(crate) fn enqueue_doc(c: &Connection, id: Id, op: JobOp, now: &str) -> Resul
         id,
         DOC_REV,
         op,
-        PRIORITY_WRITE,
+        PRIORITY_ATTACHMENT,
         now,
     )
 }
@@ -361,15 +387,17 @@ pub(crate) fn refresh_node_docs(
     Ok(())
 }
 
-/// Смена GUID решения: живым извлечённым документам пространства — `upsert` (новый
-/// `solution_guid` в payload точек).
+/// Смена GUID решения: живым документам пространства — `upsert`: извлечённым — новый
+/// `solution_guid` в payload точек, `pending` — извлечение (его задание могло быть закрыто
+/// воркером до задачи 5 M5 или заменено `delete`).
 pub(crate) fn requeue_space_docs(c: &Connection, space: Id, now: &str) -> Result<(), StoreError> {
     let ids: Vec<Id> = c
         .prepare_cached(
             "SELECT d.id FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
              JOIN spaces s ON s.id = n.space_id
              WHERE n.space_id = ?1 AND n.deleted_at IS NULL AND d.deleted_at IS NULL
-               AND d.extract_state = 'done' AND s.kind <> 'human'",
+               AND (d.extract_state = 'pending'
+                    OR (d.extract_state = 'done' AND s.kind <> 'human'))",
         )?
         .query_map([space], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
@@ -676,23 +704,47 @@ fn same_chunks(
     Ok(stored.next()?.is_none())
 }
 
-/// Заменяет чанки документа `att` единицами `units` (по чанку на единицу, в их порядке; нарезка
-/// длинных единиц — у вызывающего): `level = 'attachment'`, `locator`, `blob_sha256`,
-/// `heading_path` через ` > `, текст с замаскированными секретами (§7.6), префикс
-/// [`attachment_prefix`]. Совпадающая нарезка не переписывается. Новая нарезка ставит `upsert`
-/// документа (точки Qdrant), кроме Human. Документ откреплён или скрыт удалением узла →
-/// `NotFound` (воркер бросает результат: восстановление поставит задание заново).
+/// Куски единиц документа: `(locator, heading_path, текст, токенов)`. Значения секретов
+/// маскируются до нарезки (секрет не разрезается между кусками), единица длиннее
+/// `chunk_hard_max` режется по предложениям ([`zam_markdown::split_plain`]: те же пороги и
+/// счётчик токенов, что у заметок); `locator` и `heading_path` у кусков — единицы.
+pub fn attachment_pieces(units: &[Unit]) -> Vec<(String, String, String, i64)> {
+    let p = crate::nodes::chunk_params();
+    let tc = token_counter();
+    let mut out = Vec::with_capacity(units.len());
+    for u in units {
+        let locator = u.locator.render();
+        let heading = mask_text(&u.heading_path.join(" > "));
+        let text = mask_text(&u.text);
+        for r in zam_markdown::split_plain(&text, &p, tc.as_ref()) {
+            let piece = text[r].trim();
+            if piece.is_empty() {
+                continue;
+            }
+            out.push((
+                locator.clone(),
+                heading.clone(),
+                piece.to_string(),
+                tc.count(piece) as i64,
+            ));
+        }
+    }
+    out
+}
+
+/// Заменяет чанки документа `att` кусками единиц `units` ([`attachment_pieces`], в их порядке):
+/// `level = 'attachment'`, `locator`, `blob_sha256`, `heading_path` через ` > `, текст с
+/// замаскированными секретами (§7.6), префикс [`attachment_prefix`]; документ — `done`
+/// (`ocr_needed` — из кэша извлечения), его неудавшиеся задания снимаются. Совпадающая нарезка не
+/// переписывается. Новая нарезка ставит `upsert` документа (точки Qdrant), кроме Human, и
+/// отмечает выжимки узла-владельца устаревшими (§9.4: источник изменился). Документ откреплён
+/// или скрыт удалением узла → `NotFound` (результат бросается: восстановление поставит задание).
+/// Нарезка идёт в пуле блокирующих задач, не в исполнителе tokio.
 pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Result<(), StoreError> {
-    let units: Vec<(String, String, String)> = units
-        .iter()
-        .map(|u| {
-            (
-                u.locator.render(),
-                mask_text(&u.heading_path.join(" > ")),
-                mask_text(&u.text),
-            )
-        })
-        .collect();
+    let units = units.to_vec();
+    let units = tokio::task::spawn_blocking(move || attachment_pieces(&units))
+        .await
+        .map_err(|e| StoreError::Corrupt(format!("нарезка вложения: {e}")))?;
     db.write(move |t| {
         let doc: Option<(Id, String, String, String, String, SpaceKind)> = t
             .prepare_cached(
@@ -715,11 +767,26 @@ pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Resu
         let Some((node, sha, filename, path, space, kind)) = doc else {
             return Err(StoreError::NotFound);
         };
-        let tc = token_counter();
+        let now = fmt_ts(Timestamp::now());
+        // документ извлечён: `done`, причина прежней неудачи и её задания сняты
+        t.prepare_cached(
+            "UPDATE attachment_docs
+             SET extract_state = 'done', extract_error = NULL,
+                 ocr_needed = coalesce((SELECT x.ocr_needed FROM blob_extract x
+                                        WHERE x.blob_sha256 = attachment_docs.blob_sha256
+                                          AND x.extractor_version = ?2), ocr_needed)
+             WHERE id = ?1",
+        )?
+        .execute(params![att, EXTRACTOR_VERSION])?;
+        t.prepare_cached(
+            "DELETE FROM index_jobs
+             WHERE target_kind = 'attachment' AND target_id = ?1 AND state = 'failed'",
+        )?
+        .execute([att])?;
         let rows: Vec<AttChunk> = units
             .iter()
             .enumerate()
-            .map(|(i, (locator, heading, text))| {
+            .map(|(i, (locator, heading, text, tokens))| {
                 let ordinal = i as i64;
                 let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
                 let prefix = attachment_prefix(&space, &path, &filename, heading);
@@ -729,7 +796,7 @@ pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Resu
                     ordinal,
                     embed_key: embed_key_of(&prefix, text),
                     context_prefix: prefix,
-                    token_count: tc.count(text) as i64,
+                    token_count: *tokens,
                     text_hash,
                     text: text.clone(),
                     locator: locator.clone(),
@@ -765,16 +832,416 @@ pub async fn replace_attachment_chunks(db: &Db, att: Id, units: &[Unit]) -> Resu
                 r.locator,
             ])?;
         }
-        if !tc.is_exact() {
+        if !token_counter().is_exact() {
             t.prepare_cached("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')")?
                 .execute([crate::user_db::CHUNKED_APPROX])?;
         }
         if kind != SpaceKind::Human {
-            enqueue_doc(t, att, JobOp::Upsert, &fmt_ts(Timestamp::now()))?;
+            enqueue_doc(t, att, JobOp::Upsert, &now)?;
         }
+        // источник выжимок изменился (§9.4): текст вложения — часть заметки
+        invalidate_target(
+            t,
+            TargetRef {
+                kind: TargetKind::Node,
+                id: node,
+            },
+            StaleKind::Changed,
+        )?;
         Ok(())
     })
     .await
+}
+
+/// Что нужно конвейеру документов для задания извлечения документа.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractTarget {
+    pub node_id: Id,
+    pub blob_sha256: String,
+    pub filename: String,
+    /// Документ и узел-владелец живы (иначе извлекать незачем).
+    pub live: bool,
+    pub state: ExtractState,
+}
+
+/// Документ `att` для извлечения; `None` — документа нет.
+pub async fn extract_target(db: &Db, att: Id) -> Result<Option<ExtractTarget>, StoreError> {
+    db.read(move |c| {
+        Ok(c.prepare_cached(
+            "SELECT d.node_id, d.blob_sha256, d.filename,
+                    d.deleted_at IS NULL AND n.deleted_at IS NULL, d.extract_state
+             FROM attachment_docs d JOIN nodes n ON n.id = d.node_id WHERE d.id = ?1",
+        )?
+        .query_row([att], |r| {
+            Ok(ExtractTarget {
+                node_id: r.get(0)?,
+                blob_sha256: r.get(1)?,
+                filename: r.get(2)?,
+                live: r.get(3)?,
+                state: r.get(4)?,
+            })
+        })
+        .optional()?)
+    })
+    .await
+}
+
+/// Поля payload документа (живого, извлечённого, не Human, заметка не `index: false`); `None`
+/// — точек у документа быть не должно. Нет документа → `NotFound`.
+fn doc_payload(
+    c: &Connection,
+    att: Id,
+) -> Result<Option<(NodePayload, AttachmentPayload)>, StoreError> {
+    let row = c
+        .prepare_cached(
+            "SELECT d.node_id, n.space_id, s.kind, s.solution_guid, n.path, n.area, d.created_at,
+                    d.blob_sha256,
+                    d.deleted_at IS NULL AND n.deleted_at IS NULL AND d.extract_state = 'done'
+                      AND n.index_state <> 'excluded' AND s.kind <> 'human'
+             FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
+             JOIN spaces s ON s.id = n.space_id WHERE d.id = ?1",
+        )?
+        .query_row([att], |r| {
+            Ok((
+                NodePayload {
+                    node_id: r.get(0)?,
+                    space_id: r.get(1)?,
+                    space_kind: r.get(2)?,
+                    solution_guid: r.get(3)?,
+                    path: r.get(4)?,
+                    path_ancestors: Vec::new(),
+                    tags: Vec::new(),
+                    area: r.get(5)?,
+                    updated_at: ts_at(r, 6)?,
+                    certainty: None,
+                },
+                r.get::<_, String>(7)?,
+                r.get::<_, bool>(8)?,
+            ))
+        })
+        .optional()?;
+    let Some((mut node, sha, indexable)) = row else {
+        return Err(StoreError::NotFound);
+    };
+    // Human — только FTS (инвариант): точек нет, даже если задание поставлено в обход
+    if !indexable || node.space_kind == SpaceKind::Human {
+        return Ok(None);
+    }
+    node.path_ancestors = path_ancestors(&node.path);
+    Ok(Some((
+        node,
+        AttachmentPayload {
+            attachment_id: att,
+            blob_sha256: sha,
+            locator: None,
+        },
+    )))
+}
+
+/// Чанки документа `att` с полями payload (`node` — узел-владелец).
+fn doc_chunks(
+    c: &Connection,
+    node: &NodePayload,
+    pl: &AttachmentPayload,
+) -> Result<Vec<IndexChunk>, StoreError> {
+    let mut st = c.prepare_cached(
+        "SELECT id, level, heading_path, ordinal, text, context_prefix, text_hash, token_count,
+                rev, embed_key, locator
+         FROM chunks WHERE attachment_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = st.query_map([pl.attachment_id], |r| {
+        Ok((
+            (
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ),
+            (
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<String>>(10)?,
+            ),
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let ((id, level, heading_path, ordinal), (text, prefix, hash, tokens, rev, key, loc)) =
+            row?;
+        let Some(level) = crate::jobs::parse_level(&level) else {
+            continue;
+        };
+        let embed_key = key
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| embed_key_of(&prefix, &text));
+        out.push(IndexChunk {
+            id,
+            level,
+            heading_path,
+            ordinal,
+            text,
+            context_prefix: prefix,
+            text_hash: hash,
+            embed_key,
+            token_count: tokens,
+            rev,
+            node: node.clone(),
+            entry: None,
+            attachment: Some(AttachmentPayload {
+                locator: loc,
+                ..pl.clone()
+            }),
+        });
+    }
+    Ok(out)
+}
+
+/// Чанки документа вложения для векторного индекса с полями payload: `kind = attachment`,
+/// `node_id` — узел-владелец (область, права), `attachment_id`, `blob_sha256`, `locator`.
+/// Документ не извлечён, скрыт, откреплён, в Human или у заметки `index: false` — пустой
+/// список (точки убираются). Нет документа → `NotFound`.
+pub async fn attachment_chunks_for_index(db: &Db, att: Id) -> Result<Vec<IndexChunk>, StoreError> {
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        match doc_payload(&tx, att)? {
+            Some((node, pl)) => doc_chunks(&tx, &node, &pl),
+            None => Ok(Vec::new()),
+        }
+    })
+    .await
+}
+
+/// Документ вложения для пересборки индекса из кэша: его чанки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReindexAttachment {
+    pub attachment_id: Id,
+    pub chunks: Vec<IndexChunk>,
+}
+
+/// Страница живых извлечённых документов (не Human, заметка индексируется) пространства
+/// `space` (`None` — всех) с чанками: по возрастанию id после `after`, не больше `limit`.
+pub async fn reindex_attachments_page(
+    db: &Db,
+    space: Option<Id>,
+    after: Option<Id>,
+    limit: usize,
+) -> Result<Vec<ReindexAttachment>, StoreError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let ids: Vec<Id> = {
+            let mut st = tx.prepare_cached(
+                "SELECT d.id FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
+                 JOIN spaces s ON s.id = n.space_id
+                 WHERE d.extract_state = 'done' AND d.deleted_at IS NULL
+                   AND n.deleted_at IS NULL AND n.index_state <> 'excluded'
+                   AND s.kind <> 'human'
+                   AND (?1 IS NULL OR n.space_id = ?1) AND (?2 IS NULL OR d.id > ?2)
+                 ORDER BY d.id LIMIT ?3",
+            )?;
+            st.query_map(params![space, after, limit], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let chunks = match doc_payload(&tx, id)? {
+                Some((node, pl)) => doc_chunks(&tx, &node, &pl)?,
+                None => Vec::new(),
+            };
+            out.push(ReindexAttachment {
+                attachment_id: id,
+                chunks,
+            });
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// `upsert` (точки) документам `ids` — промахам кэша эмбеддингов при пересборке индекса.
+pub async fn enqueue_attachment_upserts(db: &Db, ids: Vec<Id>) -> Result<u64, StoreError> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    db.write(move |tx| {
+        let now = fmt_ts(Timestamp::now());
+        for id in &ids {
+            enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
+        }
+        Ok(ids.len() as u64)
+    })
+    .await
+}
+
+/// Живые документы пространства `space` (`None` — всех) для reindex: извлечённые (не Human) —
+/// `upsert` ради точек; неудавшиеся (кроме `too_large`: файл не изменится) — снова `pending` с
+/// заданием (повтор разбора); `pending` без активного задания — задание. Возвращает число
+/// поставленных заданий.
+pub async fn reindex_docs(db: &Db, space: Option<Id>) -> Result<u64, StoreError> {
+    db.write(move |tx| {
+        let now = fmt_ts(Timestamp::now());
+        tx.prepare_cached(
+            "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
+             WHERE extract_state = 'failed' AND coalesce(extract_error, '') <> ?2
+               AND deleted_at IS NULL
+               AND node_id IN (SELECT id FROM nodes
+                               WHERE deleted_at IS NULL AND (?1 IS NULL OR space_id = ?1))",
+        )?
+        .execute(params![space, TOO_LARGE])?;
+        let ids: Vec<(Id, bool)> = tx
+            .prepare_cached(
+                "SELECT d.id, d.extract_state = 'pending' FROM attachment_docs d
+                 JOIN nodes n ON n.id = d.node_id JOIN spaces s ON s.id = n.space_id
+                 WHERE d.deleted_at IS NULL AND n.deleted_at IS NULL
+                   AND (?1 IS NULL OR n.space_id = ?1)
+                   AND (d.extract_state = 'pending'
+                        OR (d.extract_state = 'done' AND s.kind <> 'human'))
+                 ORDER BY d.id",
+            )?
+            .query_map(params![space], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut n = 0u64;
+        for (id, pending) in ids {
+            if pending && has_active_target(tx, att_ref(id))? {
+                continue;
+            }
+            enqueue_doc(tx, id, JobOp::Upsert, &now)?;
+            n += 1;
+        }
+        Ok(n)
+    })
+    .await
+}
+
+/// Запуск конвейера документов: живым документам `pending` без активного задания — задание
+/// извлечения. Такие остаются после воркера до задачи 5 M5 (задание закрывалось пустым
+/// `delete`) и дозаполнения миграции 0019. Возвращает их число.
+pub async fn ensure_extract_jobs(db: &Db) -> Result<u64, StoreError> {
+    db.write(|tx| {
+        let now = fmt_ts(Timestamp::now());
+        let ids: Vec<Id> = tx
+            .prepare_cached(
+                "SELECT d.id FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
+                 WHERE d.extract_state = 'pending' AND d.deleted_at IS NULL
+                   AND n.deleted_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM index_jobs j
+                                   WHERE j.target_kind = 'attachment' AND j.target_id = d.id
+                                     AND j.state IN ('queued', 'running'))",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in &ids {
+            enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
+        }
+        Ok(ids.len() as u64)
+    })
+    .await
+}
+
+/// Есть ли живые документы `failed` с кодом причины `code` ([`error_code`]).
+pub async fn has_failed_with(db: &Db, code: &str) -> Result<bool, StoreError> {
+    let like = format!("{code}%");
+    db.read(move |c| {
+        Ok(c.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM attachment_docs
+                            WHERE extract_state = 'failed' AND deleted_at IS NULL
+                              AND extract_error LIKE ?1)",
+        )?
+        .query_row([like], |r| r.get(0))?)
+    })
+    .await
+}
+
+/// Живые документы `failed` с кодом причины `code` — снова `pending` с заданием (причина
+/// устранена: например, pdfium теперь загружается). Возвращает их число.
+pub async fn requeue_failed_with(db: &Db, code: &str) -> Result<u64, StoreError> {
+    let like = format!("{code}%");
+    db.write(move |tx| {
+        let now = fmt_ts(Timestamp::now());
+        let ids: Vec<Id> = tx
+            .prepare_cached(
+                "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
+                 WHERE extract_state = 'failed' AND deleted_at IS NULL AND extract_error LIKE ?1
+                   AND node_id IN (SELECT id FROM nodes WHERE deleted_at IS NULL)
+                 RETURNING id",
+            )?
+            .query_map([like], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in &ids {
+            enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
+        }
+        Ok(ids.len() as u64)
+    })
+    .await
+}
+
+/// Отпечаток нарезки вложений процесса: пороги и флаги нарезки (как у заметок), версия
+/// извлечения [`EXTRACTOR_VERSION`] и токенизатор (`;tok=…` последним — сравнение
+/// [`crate::nodes::same_chunker`]).
+pub fn attachment_chunker_fingerprint() -> String {
+    format!(
+        "{};ext={EXTRACTOR_VERSION};tok={}",
+        crate::nodes::chunker_base(),
+        token_counter().tokenizer_id()
+    )
+}
+
+/// При открытии базы: отпечаток нарезки вложений (`meta.chunker_attachments`) расходится с
+/// текущим — документы снова `pending` и живым ставится задание извлечения: та же версия
+/// извлечения — перенарезка из кэша без разбора, другая — разбор заново. Не трогаются `pending`
+/// (их задание и так впереди) и `failed`/`too_large` (файл не изменится). Скрытые удалением
+/// узла получают задание при восстановлении. Работа — у конвейера документов (здесь только
+/// состояние и задания в одной транзакции), поэтому не фоновая перенарезка с баннером.
+/// Возвращает число документов.
+pub async fn rechunk_docs_if_stale(db: &Db) -> Result<u64, StoreError> {
+    let current = attachment_chunker_fingerprint();
+    let exact = crate::nodes::token_counter_exact();
+    let n = db
+        .write(move |tx| {
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    [CHUNKER_ATTACHMENTS_KEY],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if crate::nodes::same_chunker(stored.as_deref(), &current, exact) {
+                return Ok(0);
+            }
+            let ids: Vec<(Id, bool)> = tx
+                .prepare_cached(
+                    "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
+                     WHERE extract_state IN ('done', 'unsupported', 'failed')
+                       AND NOT (extract_state = 'failed' AND coalesce(extract_error, '') = ?1)
+                     RETURNING id, deleted_at IS NULL
+                       AND (SELECT deleted_at IS NULL FROM nodes WHERE id = node_id)",
+                )?
+                .query_map([TOO_LARGE], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            let now = fmt_ts(Timestamp::now());
+            for (id, live) in &ids {
+                if *live {
+                    enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
+                }
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                params![CHUNKER_ATTACHMENTS_KEY, current],
+            )?;
+            Ok(ids.len() as u64)
+        })
+        .await?;
+    if n > 0 {
+        tracing::info!(
+            docs = n,
+            "нарезка вложений изменилась: документы извлекаются заново (из кэша, если он подходит)"
+        );
+    }
+    Ok(n)
 }
 
 #[cfg(test)]

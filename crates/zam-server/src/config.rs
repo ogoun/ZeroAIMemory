@@ -738,15 +738,15 @@ impl RecallSection {
     }
 }
 
-/// Секция `[docs]` (M5 §1–2): лимиты разбора документов и рабочие процессы PDF
-/// (`zam-server doc-worker`).
+/// Секция `[docs]` (M5 §1–2): лимиты разбора документов и рабочие процессы разбора
+/// (`zam-server doc-worker`: все виды документов, задача 5 M5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocsSection {
     /// Библиотека pdfium; по умолчанию рядом с исполняемым файлом (`pdfium.dll` /
     /// `libpdfium.so`), относительный путь — от каталога исполняемого файла.
     pub pdfium_dylib: Option<PathBuf>,
-    /// Рабочих процессов разбора PDF (1..=16, 2).
+    /// Рабочих процессов разбора (1..=16, 2): столько же документов разбирается одновременно.
     pub workers: usize,
     /// Заданий на процесс до перезапуска (1..=100000, 200).
     pub worker_jobs: u32,
@@ -771,6 +771,11 @@ pub struct DocsSection {
     pub max_chars: u64,
     /// Страниц PDF (5000).
     pub max_pages: u32,
+    /// Исполняемый файл рабочего процесса (подкоманда `doc-worker`); `None` — исполняемый файл
+    /// сервера. Не ключ конфигурации: его задают интеграционные тесты, где текущий исполняемый
+    /// файл — тестовый, а не `zam-server`.
+    #[serde(skip)]
+    pub worker_program: Option<PathBuf>,
 }
 
 impl Default for DocsSection {
@@ -790,6 +795,7 @@ impl Default for DocsSection {
             max_cells: l.max_cells,
             max_chars: l.max_chars,
             max_pages: l.max_pages,
+            worker_program: None,
         }
     }
 }

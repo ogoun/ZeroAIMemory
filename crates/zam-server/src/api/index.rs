@@ -96,6 +96,11 @@ fn failed_json(user: Id, f: &FailedJob) -> Value {
         "updated_at": fmt_ts(f.updated_at),
     });
     v[id_key] = json!(f.node_id);
+    // у документа вложения — код причины (`parse_crash`, `parse_timeout`, `parse_oom`,
+    // `parse_error`, `pdfium_unavailable`, `too_large`, `blob_missing`, `index_failed`)
+    if f.target_kind == zam_core::TargetKind::Attachment {
+        v["reason"] = json!(f.reason);
+    }
     v
 }
 
@@ -113,6 +118,7 @@ fn reindex_json(o: &ReindexOutcome) -> Value {
                 "users": r.users,
                 "nodes": r.nodes,
                 "entries": r.entries,
+                "attachments": r.attachments,
                 "points": r.points,
                 "folders": r.folders,
                 "misses": r.misses,
@@ -262,7 +268,19 @@ pub async fn status(
         }
         Principal::Token(_) | Principal::User { .. } => Value::Null,
     };
+    let docs = st.docs.status();
     Ok(Json(json!({
+        // конвейер вложений (M5): причина недоступности pdfium (`null` — загружен или PDF ещё не
+        // разбирались), слоты и счётчики с запуска
+        "docs": {
+            "pdfium_error": docs.pdfium_error,
+            "workers": docs.workers,
+            "running": docs.running,
+            "extracted": docs.extracted,
+            "cache_hits": docs.cache_hits,
+            "failed": docs.failed,
+            "spawned": docs.spawned,
+        },
         "vector": {
             "available": reason.is_none(),
             "reason": reason.map(|r| r.as_str()),

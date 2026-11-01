@@ -165,6 +165,7 @@ pub async fn create(
     };
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
+    st.docs.notify();
     Ok((
         StatusCode::CREATED,
         Json(node_reply(&st, &sc.db, sc.space.id, &node, &content).await?),
@@ -209,6 +210,7 @@ pub async fn replace(
     match update_note(&sc.db, sc.node.id, base, req.content, req.l0, attrib).await {
         Ok(n) => {
             st.index.notify();
+            st.docs.notify();
             Ok(Json(
                 node_reply(&st, &sc.db, sc.space.id, &n, &content).await?,
             ))
@@ -240,6 +242,7 @@ pub async fn patch(
     match patch_note_within(&sc.db, sc.node.id, req.base_rev, req.ops, attrib, max).await {
         Ok(n) => {
             st.index.notify();
+            st.docs.notify();
             let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
             Ok(Json(node_reply(&st, &sc.db, sc.space.id, &n, &text).await?))
         }
@@ -274,6 +277,7 @@ pub async fn move_to(
         st.index.rollup_hint(sc.owner, old);
     }
     st.index.notify();
+    st.docs.notify();
     Ok(Json(node))
 }
 
@@ -290,6 +294,7 @@ pub async fn remove(
     let count = delete_node(&sc.db, sc.node.id, author).await?;
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
+    st.docs.notify();
     let details = json!({ "space": sc.space.id, "path": sc.node.path, "nodes": count });
     audit_node(
         &st,
@@ -318,6 +323,7 @@ pub async fn restore(
     let node = restore_node(&sc.db, sc.node.id, author).await?;
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
+    st.docs.notify();
     let details = json!({ "space": sc.space.id, "path": node.path });
     audit_node(
         &st,

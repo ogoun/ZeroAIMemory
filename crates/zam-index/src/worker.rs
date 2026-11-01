@@ -23,8 +23,11 @@
 //!    последовательно с заданиями, в том числе при чужой модели коллекции (её он и
 //!    пересоздаёт). Прерванный reindex базы (отметка `reindex_pending`) повторяется при
 //!    первом открытии базы после запуска.
-//! 4. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла или
-//!    записи журнала (`target_kind = 'entry'`, M3: точки с `entry_id` и полями записи) →
+//! 4. **Задания.** Базы пользователей по кругу, пачками по `batch_jobs`: чанки узла,
+//!    записи журнала (`target_kind = 'entry'`, M3: точки с `entry_id` и полями записи) или
+//!    документа вложения (`'attachment'`, M5: точки `kind = attachment` с `node_id`
+//!    узла-владельца и `attachment_id`; текст извлекает конвейер документов сервера, задания
+//!    извлечения сюда не выдаются — [`claim_jobs`]) →
 //!    кэш `embeddings` по `chunks.embed_key` → инференс промахов (`spawn_blocking`, пачки
 //!    не больше `batch_tokens`, уступка `yield_ms`) → одна запись в Qdrant на пачку:
 //!    `delete_targets` + `upsert` (`wait=true`; отказ пачки — по одной цели) →
@@ -58,11 +61,11 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::ChunkLevel;
 use zam_store::{
     Db, Embedding, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, NodeKind,
-    SpaceKind, StoreError, SystemStore, UserDbs, adopt_owned_embeddings, chunks_for_index,
-    claim_jobs, complete_job, enqueue_reindex, entry_chunks_for_index, fail_job, folders_for_index,
-    gc_embeddings, get_embeddings, get_node, get_space, indexed_count, list_children,
-    pending_reindex, prune_owned_embeddings, put_embeddings, put_owned_embeddings, release_job,
-    requeue_running, set_auto_l0, set_folder_l0,
+    SpaceKind, StoreError, SystemStore, UserDbs, adopt_owned_embeddings,
+    attachment_chunks_for_index, chunks_for_index, claim_jobs, complete_job, enqueue_reindex,
+    entry_chunks_for_index, fail_job, folders_for_index, gc_embeddings, get_embeddings, get_node,
+    get_space, indexed_count, list_children, pending_reindex, prune_owned_embeddings,
+    put_embeddings, put_owned_embeddings, release_job, requeue_running, set_auto_l0, set_folder_l0,
 };
 
 use crate::reindex::{GC_BATCH, ReindexCtx, ReindexReport, ReindexRequest, reindex};
@@ -1302,9 +1305,10 @@ impl Worker {
                     let chunks = match j.target_kind {
                         TargetKind::Node => chunks_for_index(db, j.target_id).await,
                         TargetKind::Entry => entry_chunks_for_index(db, j.target_id).await,
-                        // стадия извлечения и точки вложений — задача 5 M5: пока у документа
-                        // вложения точек нет (`delete` без них — пустая операция)
-                        TargetKind::Attachment => Ok(Vec::new()),
+                        // документ не извлечён, скрыт, в Human — пустой список: точки убираются
+                        TargetKind::Attachment => {
+                            attachment_chunks_for_index(db, j.target_id).await
+                        }
                     };
                     match chunks {
                         Ok(c) if c.is_empty() => Plan::Delete,
@@ -1452,6 +1456,14 @@ impl Worker {
             let Plan::Upsert(chunks) = plan else {
                 continue;
             };
+            // источник выжимок у вложения — его заметка (кэш выжимок ссылается на узлы и записи)
+            let source = match j.target_kind {
+                TargetKind::Attachment => TargetRef {
+                    kind: TargetKind::Node,
+                    id: chunks.first().map_or(j.target_id, |c| c.node.node_id),
+                },
+                TargetKind::Node | TargetKind::Entry => j.target(),
+            };
             for c in chunks {
                 let Some(e) = embs.get(&c.embed_key) else {
                     continue;
@@ -1459,7 +1471,7 @@ impl Worker {
                 groups
                     .entry((c.node.space_id, c.node.area.clone()))
                     .or_default()
-                    .push((j.target(), e.dense.clone()));
+                    .push((source, e.dense.clone()));
             }
         }
         // векторы — текущей модели: выжимки с вектором другой модели не сравниваются
@@ -2021,12 +2033,16 @@ pub(crate) fn folder_point(user: Id, f: &IndexFolder, e: Embedding, key: String)
             status: None,
             insight_kind: None,
             certainty: None,
+            attachment_id: None,
+            blob_sha256: None,
+            locator: None,
         },
     }
 }
 
-/// Точка чанка заметки или записи журнала (`c.entry`): у записи цель — `entry_id`, вид и
-/// поля записи — из [`zam_store::EntryPayload`].
+/// Точка чанка заметки, записи журнала (`c.entry`: цель — `entry_id`, вид и поля записи — из
+/// [`zam_store::EntryPayload`]) или документа вложения (`c.attachment`: `node_id` —
+/// узел-владелец, цель — `attachment_id`, вид `attachment`, без `certainty` заметки).
 pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint {
     let mut payload = PointPayload {
         user_id: user,
@@ -2047,6 +2063,9 @@ pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint
         insight_kind: None,
         // статус заметки (§7.5); у записи журнала его заменит поле записи ниже
         certainty: c.node.certainty.clone(),
+        attachment_id: None,
+        blob_sha256: None,
+        locator: None,
     };
     if let Some(en) = &c.entry {
         payload.node_id = None;
@@ -2056,6 +2075,13 @@ pub(crate) fn chunk_point(user: Id, c: &IndexChunk, e: &Embedding) -> IndexPoint
         payload.insight_kind = en.insight_kind.clone();
         payload.certainty = en.certainty.clone();
         payload.area = en.area.clone();
+    }
+    if let Some(a) = &c.attachment {
+        payload.kind = crate::LEVEL_ATTACHMENT.into();
+        payload.certainty = None;
+        payload.attachment_id = Some(a.attachment_id);
+        payload.blob_sha256 = Some(a.blob_sha256.clone());
+        payload.locator = a.locator.clone();
     }
     IndexPoint {
         chunk_id: c.id.clone(),

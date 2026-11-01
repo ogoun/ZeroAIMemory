@@ -91,7 +91,7 @@ pub const PREFIX_L0_MAX_TOKENS: usize = 50;
 const CHUNKER_VERSION: u32 = 2;
 
 /// Общая часть отпечатков нарезки: версия алгоритма, пороги и флаги `[index]`.
-fn chunker_base() -> String {
+pub(crate) fn chunker_base() -> String {
     let p = chunk_params();
     format!(
         "v{CHUNKER_VERSION};{}/{}/{}/{}/{};lambda={};cohesion={};h4={}",
