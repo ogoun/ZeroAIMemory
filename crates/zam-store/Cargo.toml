@@ -29,6 +29,8 @@ zam-markdown = { path = "../zam-markdown" }
 zam-docs = { path = "../zam-docs" }
 # id чанков вложений — UUIDv5 (M5, задача 4)
 uuid.workspace = true
+# кэш извлечения вложений: `units` — zstd(JSON) (M5 §3)
+zstd.workspace = true
 half.workspace = true
 tracing.workspace = true
 

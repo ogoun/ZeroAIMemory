@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use zam_core::{Id, TargetKind};
 use zam_store::attachments::{
-    AttachmentDoc, DocKind, ExtractState, Extracted, Locator, Unit, detach, extract_cached,
-    list_attachments, put_extract, replace_attachment_chunks, set_extract_state,
+    AttachmentDoc, DocIntake, DocKind, ExtractState, Extracted, Locator, Unit, detach,
+    extract_cached, list_attachments, put_extract, replace_attachment_chunks, set_extract_state,
 };
 use zam_store::blobs::{AttachScope, BlobStore, attach, resolve_attachment};
 use zam_store::{
@@ -72,8 +72,20 @@ async fn setup(name: &str) -> Env {
     }
 }
 
-/// Кладёт `data` в блобы и привязывает к `node` как `name` вида `kind`.
+/// Кладёт `data` в блобы и привязывает к `node` как `name` вида `kind` (без предела размера).
 async fn put_attach(env: &Env, node: Id, data: &[u8], name: &str, kind: Option<DocKind>) -> String {
+    put_attach_max(env, node, data, name, kind, u64::MAX).await
+}
+
+/// [`put_attach`] с пределом `docs.max_bytes` = `max`.
+async fn put_attach_max(
+    env: &Env,
+    node: Id,
+    data: &[u8],
+    name: &str,
+    kind: Option<DocKind>,
+    max: u64,
+) -> String {
     let (sha, size) = env.bs.put(data, 1 << 20).await.unwrap();
     attach(
         &env.db,
@@ -82,7 +94,7 @@ async fn put_attach(env: &Env, node: Id, data: &[u8], name: &str, kind: Option<D
         size,
         name,
         "text/plain",
-        kind,
+        DocIntake::classify(kind, size, max),
         AuthorKind::Human,
     )
     .await
@@ -199,9 +211,10 @@ fn fts(text: &str, spaces: &[Id]) -> FtsQuery {
     }
 }
 
-/// Миграция 0019 на базе M4.5 (v18): `attachment_docs` дозаполняется из `attachments`; виды с
-/// поддерживаемым расширением — `pending` с заданием `attachment`, остальные — `unsupported`
-/// без задания; вложение удалённого узла скрыто той же меткой и задания не получает.
+/// Миграция 0019 на базе M4.5 (v18): `attachment_docs` дозаполняется из `attachments`; каждое
+/// вложение живого узла — `pending` с заданием `attachment` (вид по содержимому определит
+/// конвейер задачи 5: `.xlsm`, PDF без расширения и т. п. — тоже документы; раунд правок 1),
+/// вложение удалённого узла — `pending`, скрыто той же меткой и задания не получает.
 #[tokio::test]
 async fn migration_0019_backfills_attachment_docs() {
     let dd = datadir("mig-0019");
@@ -230,7 +243,8 @@ async fn migration_0019_backfills_attachment_docs() {
         ins_node(live, "live", None);
         ins_node(gone, "gone", Some(TS));
         let (a, b, d) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
-        for sha in [&a, &b, &d] {
+        let (x, y) = ("d".repeat(64), "e".repeat(64));
+        for sha in [&a, &b, &d, &x, &y] {
             c.execute(
                 "INSERT INTO blobs (sha256, size, mime, refcount, created_at)
                  VALUES (?1, 3, NULL, 1, ?2)",
@@ -248,22 +262,26 @@ async fn migration_0019_backfills_attachment_docs() {
         };
         ins(live, &a, "Отчёт.PDF");
         ins(live, &b, "cat.png");
+        ins(live, &x, "book.xlsm");
+        ins(live, &y, "scan");
         ins(gone, &d, "plan.docx");
     }
     let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
     let docs = list_attachments(&db, live).await.unwrap();
-    assert_eq!(docs.len(), 2, "{docs:?}");
+    assert_eq!(docs.len(), 4, "{docs:?}");
     let pdf = doc_of(&docs, "Отчёт.PDF");
     let png = doc_of(&docs, "cat.png");
-    assert_eq!(pdf.extract_state, ExtractState::Pending);
-    assert_eq!(png.extract_state, ExtractState::Unsupported);
     assert_eq!(pdf.blob_sha256, "a".repeat(64));
     assert_ne!(pdf.id, png.id);
-    assert_eq!(
-        active_job(&db, "attachment", pdf.id).await.as_deref(),
-        Some("upsert")
-    );
-    assert_eq!(active_job(&db, "attachment", png.id).await, None);
+    for name in ["Отчёт.PDF", "cat.png", "book.xlsm", "scan"] {
+        let d = doc_of(&docs, name);
+        assert_eq!(d.extract_state, ExtractState::Pending, "{name}");
+        assert_eq!(
+            active_job(&db, "attachment", d.id).await.as_deref(),
+            Some("upsert"),
+            "{name}"
+        );
+    }
     // вложение удалённого узла: строка есть, скрыта меткой узла, без задания
     assert!(list_attachments(&db, gone).await.unwrap().is_empty());
     let (hidden, same_stamp, jobs): (i64, bool, i64) = db
@@ -280,6 +298,17 @@ async fn migration_0019_backfills_attachment_docs() {
         .await
         .unwrap();
     assert_eq!((hidden, same_stamp, jobs), (1, true, 0));
+    let gone_state: String = db
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT extract_state FROM attachment_docs WHERE node_id = ?1",
+                [gone],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(gone_state, "pending");
     // id дозаполнения — обычные Id (26 символов base32)
     assert_eq!(pdf.id.to_string().len(), 26);
 }
@@ -686,4 +715,73 @@ async fn attachment_chunk_ids_unique() {
         .map(|r| r.1)
         .collect();
     assert_eq!(first, again);
+}
+
+/// Поддерживаемый файл больше `docs.max_bytes` — `failed` с `too_large` без задания (раунд правок
+/// 1); повторная привязка после открепления переносит документ в конец списка (`created_at`).
+#[tokio::test]
+async fn too_large_failed_and_reattach_moves_to_end() {
+    let env = setup("too-large").await;
+    let n = note(&env.db, env.k, "n", "текст").await;
+    drop_jobs(&env.db).await;
+    put_attach_max(&env, n, b"%PDF-1.4 big", "big.pdf", Some(DocKind::Pdf), 4).await;
+    let big = doc_of(&list_attachments(&env.db, n).await.unwrap(), "big.pdf");
+    assert_eq!(big.extract_state, ExtractState::Failed);
+    assert_eq!(
+        big.extract_error.as_deref(),
+        Some(zam_store::attachments::TOO_LARGE)
+    );
+    assert_eq!(active_job(&env.db, "attachment", big.id).await, None);
+    // неподдерживаемый вид больше предела — по-прежнему `unsupported`
+    put_attach_max(&env, n, b"PNG big", "cat.png", None, 4).await;
+    let png = doc_of(&list_attachments(&env.db, n).await.unwrap(), "cat.png");
+    assert_eq!(png.extract_state, ExtractState::Unsupported);
+
+    let sha = put_attach(&env, n, b"first", "first.txt", Some(DocKind::Text)).await;
+    put_attach(&env, n, b"second", "second.txt", Some(DocKind::Text)).await;
+    let names = |l: Vec<AttachmentDoc>| l.into_iter().map(|d| d.filename).collect::<Vec<_>>();
+    assert_eq!(
+        names(list_attachments(&env.db, n).await.unwrap()),
+        ["big.pdf", "cat.png", "first.txt", "second.txt"]
+    );
+    detach(&env.db, n, &sha, "first.txt", &human())
+        .await
+        .unwrap();
+    put_attach(&env, n, b"first", "first.txt", Some(DocKind::Text)).await;
+    assert_eq!(
+        names(list_attachments(&env.db, n).await.unwrap()),
+        ["big.pdf", "cat.png", "second.txt", "first.txt"]
+    );
+}
+
+/// Кэш `blob_extract` хранит `units` сжатыми zstd (спецификация M5 §3, раунд правок 1); строка,
+/// которая не разжимается, — промах кэша.
+#[tokio::test]
+async fn extract_cache_is_zstd_and_bad_row_is_miss() {
+    let env = setup("zstd").await;
+    let sha = "f".repeat(64);
+    let long = "повтор ".repeat(2000);
+    let ex = Extracted {
+        kind: DocKind::Text,
+        units: units(&[("", long.as_str())]),
+        warnings: Vec::new(),
+        ocr_needed: false,
+    };
+    put_extract(&env.db, &sha, &ex).await.unwrap();
+    let raw: Vec<u8> = env
+        .db
+        .read(|c| Ok(c.query_row("SELECT units FROM blob_extract", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert!(raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]), "не кадр zstd");
+    assert!(raw.len() < 2000, "не сжато: {} байт", raw.len());
+    assert_eq!(extract_cached(&env.db, &sha).await.unwrap(), Some(ex));
+    env.db
+        .write(|t| {
+            t.execute("UPDATE blob_extract SET units = X'7B7D'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(extract_cached(&env.db, &sha).await.unwrap(), None);
 }

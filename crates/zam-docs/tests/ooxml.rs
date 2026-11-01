@@ -308,6 +308,54 @@ fn pptx_slides_and_notes_order() {
     assert!(x.units[2].text.starts_with("Второй\nТекст второго"));
 }
 
+/// `sniff_file` (по `Read + Seek`, без чтения файла в память) даёт тот же вид, что `sniff`, и
+/// сверяет число записей zip с `limits.max_entries` до разбора каталога (задача 4 M5, раунд 1).
+#[test]
+fn sniff_file_matches_sniff() {
+    use std::io::Cursor;
+    let limits = Limits::default();
+    let file = |b: &[u8], name: &str| zam_docs::sniff_file(Cursor::new(b.to_vec()), name, &limits);
+    let xlsx = zip_of(&[
+        (
+            "[Content_Types].xml",
+            content_types(
+                "/xl/workbook.xml",
+                "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            ),
+        ),
+        ("xl/workbook.xml", b"<workbook/>".to_vec()),
+    ]);
+    let d = docx(&p("x"));
+    let slides = pptx();
+    // текст длиннее окна, граница окна посреди двухбайтового символа
+    let long = "я".repeat(40_000);
+    for (bytes, name) in [
+        (d.as_slice(), "a.docm"),
+        (xlsx.as_slice(), "book.xlsm"),
+        (slides.as_slice(), "s.ppsx"),
+        (b"%PDF-1.7 scan".as_slice(), "scan"),
+        (long.as_bytes(), "notes.txt"),
+        (b"plain".as_slice(), "cat.png"),
+    ] {
+        assert_eq!(file(bytes, name).unwrap(), sniff(bytes, name), "{name}");
+    }
+    assert_eq!(file(&xlsx, "book.xlsm").unwrap(), Some(DocKind::Xlsx));
+    assert_eq!(
+        file(long.as_bytes(), "notes.txt").unwrap(),
+        Some(DocKind::Text)
+    );
+    assert_eq!(file(b"%PDF-1.7 scan", "scan").unwrap(), Some(DocKind::Pdf));
+    // записей больше лимита — не документ, каталог не разбирается
+    let tight = Limits {
+        max_entries: 1,
+        ..Limits::default()
+    };
+    assert_eq!(
+        zam_docs::sniff_file(Cursor::new(xlsx.clone()), "book.xlsx", &tight).unwrap(),
+        None
+    );
+}
+
 #[test]
 fn sniff_by_signature_not_extension() {
     let d = docx(&p("x"));

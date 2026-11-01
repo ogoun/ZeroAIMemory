@@ -290,12 +290,15 @@ pub fn scope_hash(scope: &Value) -> String {
     blake3::hash(s.as_bytes()).to_hex().to_string()
 }
 
-pub(crate) fn kind_str(k: TargetKind) -> &'static str {
+/// `cache_deps.target_kind` цели. Вложение источником выжимки не бывает (CHECK `cache_deps`) —
+/// `BadInput`, а не строка, которую таблица не примет.
+pub(crate) fn kind_str(k: TargetKind) -> Result<&'static str, StoreError> {
     match k {
-        TargetKind::Node => "node",
-        TargetKind::Entry => "entry",
-        // вложение источником выжимки не бывает (CHECK `cache_deps`): запросы по нему пусты
-        TargetKind::Attachment => "attachment",
+        TargetKind::Node => Ok("node"),
+        TargetKind::Entry => Ok("entry"),
+        TargetKind::Attachment => Err(StoreError::BadInput(
+            "вложение не бывает источником выжимки".into(),
+        )),
     }
 }
 
@@ -508,7 +511,7 @@ fn put_tx(tx: &Connection, p: &CachePut) -> Result<CacheEntry, CacheError> {
     for d in &deps {
         ins.execute(params![
             id,
-            kind_str(d.target.kind),
+            kind_str(d.target.kind)?,
             d.target.id,
             d.rev,
             d.text_hash,

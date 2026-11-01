@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use zam_core::{Id, TargetKind, TargetRef};
 
-use crate::attachments::DocKind;
+use crate::attachments::DocIntake;
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::entries::Certainty;
 use crate::nodes::AuthorKind;
@@ -180,8 +180,9 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
 /// Новая пара (узел, sha256, имя) добавляет строку `attachments` и увеличивает
 /// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет. Вложение — изменение
 /// заметки по матрице `certainty` (`author`; с M4 к `axiom` — любому автору, §7.5).
-/// Пара получает документ `attachment_docs` (M5): `kind` — вид по `zam_docs::sniff`;
-/// поддерживаемый — `pending` с заданием индексации `Attachment`, `None` — `unsupported` без него.
+/// Пара получает документ `attachment_docs` (M5) в состоянии по `intake` ([`DocIntake`]):
+/// поддерживаемый вид — `pending` с заданием индексации `Attachment`, больше `docs.max_bytes` —
+/// `failed` (`too_large`), неподдерживаемый — `unsupported`; два последних — без задания.
 #[allow(clippy::too_many_arguments)]
 pub async fn attach(
     db: &Db,
@@ -190,7 +191,7 @@ pub async fn attach(
     size: u64,
     filename: &str,
     mime: &str,
-    kind: Option<DocKind>,
+    intake: DocIntake,
     author: AuthorKind,
 ) -> Result<String, StoreError> {
     if !is_sha256(sha256) {
@@ -226,7 +227,7 @@ pub async fn attach(
             params![node, sha, name, mime, size, now],
         )?;
         // документ пары: новый или возвращённый после открепления; живой не меняется
-        crate::attachments::ensure_doc(t, node, &sha, &name, &mime, kind, &now)?;
+        crate::attachments::ensure_doc(t, node, &sha, &name, &mime, intake, &now)?;
         if new_pair == 1 {
             t.execute(
                 "UPDATE blobs SET refcount = refcount + 1 WHERE sha256 = ?1",

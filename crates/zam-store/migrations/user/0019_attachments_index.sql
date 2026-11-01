@@ -42,8 +42,9 @@ CREATE INDEX chunks_attachment ON chunks (attachment_id) WHERE attachment_id IS 
 
 -- Дозаполнение из `attachments` (база M4.5). Id — 26 случайных символов Crockford base32 (первый
 -- 0–7: 128 бит), как у `Id`; `% 8`/`% 32` от `random()` без `abs` переполнения. Вид документа
--- без чтения файла не определить: `pending` — по расширению поддерживаемых видов (`sniff` M5),
--- остальные — `unsupported`; воркер уточняет вид по содержимому.
+-- без чтения файла не определить (расширение ненадёжно: `.xlsm`, `.docm`, PDF без расширения),
+-- поэтому все вложения — `pending`: вид по содержимому (`zam_docs::sniff_file`) определяет
+-- конвейер индексации (задача 5 M5) и переводит неподдерживаемые в `unsupported`.
 INSERT INTO attachment_docs (id, node_id, blob_sha256, filename, mime, extract_state,
                              created_at, deleted_at)
 SELECT substr('01234567', abs(random() % 8) + 1, 1)
@@ -73,33 +74,7 @@ SELECT substr('01234567', abs(random() % 8) + 1, 1)
        || substr('0123456789ABCDEFGHJKMNPQRSTVWXYZ', abs(random() % 32) + 1, 1)
        || substr('0123456789ABCDEFGHJKMNPQRSTVWXYZ', abs(random() % 32) + 1, 1),
        a.node_id, a.blob_sha256, a.filename, a.mime,
-       CASE WHEN lower(rtrim(a.filename)) GLOB '*.pdf'
-              OR lower(rtrim(a.filename)) GLOB '*.docx'
-              OR lower(rtrim(a.filename)) GLOB '*.pptx'
-              OR lower(rtrim(a.filename)) GLOB '*.xlsx'
-              OR lower(rtrim(a.filename)) GLOB '*.xls'
-              OR lower(rtrim(a.filename)) GLOB '*.ods'
-              OR lower(rtrim(a.filename)) GLOB '*.csv'
-              OR lower(rtrim(a.filename)) GLOB '*.tsv'
-              OR lower(rtrim(a.filename)) GLOB '*.txt'
-              OR lower(rtrim(a.filename)) GLOB '*.text'
-              OR lower(rtrim(a.filename)) GLOB '*.md'
-              OR lower(rtrim(a.filename)) GLOB '*.markdown'
-              OR lower(rtrim(a.filename)) GLOB '*.log'
-              OR lower(rtrim(a.filename)) GLOB '*.json'
-              OR lower(rtrim(a.filename)) GLOB '*.jsonl'
-              OR lower(rtrim(a.filename)) GLOB '*.yaml'
-              OR lower(rtrim(a.filename)) GLOB '*.yml'
-              OR lower(rtrim(a.filename)) GLOB '*.toml'
-              OR lower(rtrim(a.filename)) GLOB '*.ini'
-              OR lower(rtrim(a.filename)) GLOB '*.cfg'
-              OR lower(rtrim(a.filename)) GLOB '*.conf'
-              OR lower(rtrim(a.filename)) GLOB '*.xml'
-              OR lower(rtrim(a.filename)) GLOB '*.html'
-              OR lower(rtrim(a.filename)) GLOB '*.htm'
-              OR lower(rtrim(a.filename)) GLOB '*.rst'
-              OR lower(rtrim(a.filename)) GLOB '*.adoc'
-            THEN 'pending' ELSE 'unsupported' END,
+       'pending',
        a.created_at, n.deleted_at
 FROM attachments a JOIN nodes n ON n.id = a.node_id;
 

@@ -37,7 +37,7 @@ use std::time::Instant;
 pub use ctx::HEADING_PATH_MAX_CHARS;
 pub use locator::Locator;
 pub use sheet::{SheetPage, sheet_page};
-pub use sniff::sniff;
+pub use sniff::{sniff, sniff_file};
 
 /// Версия извлечения: смена правил разбора — перенарезка вложений (кэш по `blob_sha256`).
 pub const EXTRACTOR_VERSION: u32 = 1;

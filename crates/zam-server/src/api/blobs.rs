@@ -19,9 +19,10 @@
 //! для показа типов). Ответы помечаются [`NoCompress`]: сжатие ломает `Range` и
 //! бесполезно для медиа.
 //!
-//! **Документы вложений** (M5 §3). При загрузке вид определяется `zam_docs::sniff` по
-//! содержимому файла (zip — целиком до `docs.max_bytes`, остальное — по началу файла):
-//! поддерживаемый вид ставит задание индексации вложения. `GET /nodes/{id}/attachments` — список
+//! **Документы вложений** (M5 §3). При загрузке вид определяется `zam_docs::sniff_file` по
+//! содержимому файла без чтения его в память (zip — по центральному каталогу): поддерживаемый
+//! вид ставит задание индексации вложения, поддерживаемый больше `docs.max_bytes` — `failed`
+//! (`too_large`), остальное — `unsupported`. `GET /nodes/{id}/attachments` — список
 //! вложений заметки с `extract_state` и `ocr_needed` (доступ — как чтение узла);
 //! `DELETE /nodes/{id}/attachments/{sha256}/{filename}` — открепление (доступ — как запись
 //! узла): `refcount − 1`, чанки и точки вложения удаляются, блоб остаётся (GC — M7).
@@ -41,8 +42,8 @@ use tower_http::services::ServeFile;
 use zam_core::Id;
 use zam_store::blobs::{check_filename, is_sha256};
 use zam_store::{
-    AttachmentDoc, BlobStore, NodeKind, StoreError, attach, blob_meta, blob_meta_in_space, detach,
-    list_attachments,
+    AttachmentDoc, BlobStore, DocIntake, NodeKind, StoreError, attach, blob_meta,
+    blob_meta_in_space, detach, list_attachments,
 };
 
 use super::query;
@@ -197,10 +198,11 @@ pub async fn upload(
         .put(reader, limit)
         .await
         .map_err(|e| put_err(e, limit))?;
-    let max = st.cfg.docs.limits().max_bytes;
-    let kind = sniff_blob(store.path_of(&sha), filename.clone(), size, max).await;
+    let limits = st.cfg.docs.limits();
+    let kind = sniff_blob(store.path_of(&sha), filename.clone(), limits.clone()).await;
+    let intake = DocIntake::classify(kind, size, limits.max_bytes);
     let link = attach(
-        &sc.db, sc.node.id, &sha, size, &filename, &mime, kind, author,
+        &sc.db, sc.node.id, &sha, size, &filename, &mime, intake, author,
     )
     .await?;
     st.render_gen.bump_user(sc.owner);
@@ -211,32 +213,20 @@ pub async fn upload(
     ))
 }
 
-/// Сколько байт начала файла смотрит `sniff`, если файл не zip: окно проверки текста (64 КиБ)
-/// с запасом — обрезанный посреди символа хвост окна тогда не считается ошибкой UTF-8.
-const SNIFF_HEAD: u64 = 64 * 1024 + 16;
-
-/// Вид документа файла блоба `filename` (`zam_docs::sniff`): zip (OOXML, ODS) — по файлу целиком,
-/// если он не больше `max_bytes` (больший разбирать всё равно нельзя), остальное — по началу
-/// файла. Ошибка чтения — `None` (вложение без индексации, загрузка не падает).
+/// Вид документа файла блоба `filename` (`zam_docs::sniff_file`): файл в память не читается —
+/// zip по центральному каталогу (число записей — по `limits.max_entries`) и началу
+/// `[Content_Types].xml`/`mimetype`, остальное — по началу файла. Размер против `max_bytes`
+/// решает вызывающий ([`DocIntake::classify`]). Ошибка чтения — `None` (вложение без
+/// индексации, загрузка не падает).
 async fn sniff_blob(
     path: std::path::PathBuf,
     filename: String,
-    size: u64,
-    max_bytes: u64,
+    limits: zam_docs::Limits,
 ) -> Option<zam_docs::DocKind> {
     let name = path.clone();
-    let res = tokio::task::spawn_blocking(move || -> std::io::Result<Option<zam_docs::DocKind>> {
-        use std::io::Read;
-        let mut f = std::fs::File::open(&path)?;
-        let mut head = Vec::new();
-        (&mut f).take(SNIFF_HEAD).read_to_end(&mut head)?;
-        if head.starts_with(b"PK\x03\x04") {
-            if size > max_bytes {
-                return Ok(None);
-            }
-            f.read_to_end(&mut head)?;
-        }
-        Ok(zam_docs::sniff(&head, &filename))
+    let res = tokio::task::spawn_blocking(move || {
+        let f = std::io::BufReader::new(std::fs::File::open(&path)?);
+        zam_docs::sniff_file(f, &filename, &limits)
     })
     .await;
     match res {

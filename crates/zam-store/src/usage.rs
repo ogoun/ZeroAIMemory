@@ -10,7 +10,14 @@ use rusqlite::params;
 use serde::Serialize;
 use zam_core::{Id, TargetKind, TargetRef};
 
-use crate::sessions::target_kind_str as kind_str;
+/// `usage.target_kind` цели (CHECK у столбца нет: показы вложений в выдаче — задача 6 M5).
+fn kind_str(k: TargetKind) -> &'static str {
+    match k {
+        TargetKind::Node => "node",
+        TargetKind::Entry => "entry",
+        TargetKind::Attachment => "attachment",
+    }
+}
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
 

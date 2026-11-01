@@ -46,6 +46,8 @@ use crate::{Db, StoreError};
 pub const LEVEL_ATTACHMENT: &str = "attachment";
 /// Ревизия заданий и чанков вложения: у документа ревизий нет (содержимое блоба неизменно).
 const DOC_REV: i64 = 0;
+/// Уровень сжатия zstd `blob_extract.units`: быстрый, текст сжимается в 3–5 раз.
+const ZSTD_LEVEL: i32 = 3;
 /// Предел длины `extract_error`, символов.
 const EXTRACT_ERROR_MAX_CHARS: usize = 1000;
 
@@ -156,23 +158,55 @@ pub(crate) fn enqueue_doc(c: &Connection, id: Id, op: JobOp, now: &str) -> Resul
     )
 }
 
-/// Создаёт документ пары (узел, блоб, имя) или возвращает открепленный: `pending` с заданием
-/// для поддерживаемого вида (`kind`), иначе `unsupported` без задания. Живой документ пары не
-/// меняется. В транзакции привязки ([`crate::blobs::attach`]).
+/// Что известно о файле при привязке ([`crate::blobs::attach`]): вид по `zam_docs::sniff` и
+/// размер против `docs.max_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocIntake {
+    /// Поддерживаемый вид: `pending` с заданием `Attachment`.
+    Index(DocKind),
+    /// Поддерживаемый вид, но файл больше `docs.max_bytes`: `failed` с `too_large` без задания
+    /// (разбор всё равно отказал бы `DocError::TooLarge`).
+    TooLarge(DocKind),
+    /// Вид не поддерживается: `unsupported` без задания.
+    Unsupported,
+}
+
+impl DocIntake {
+    /// Решение по виду `kind` (`None` — не поддерживается) и размеру файла.
+    pub fn classify(kind: Option<DocKind>, size: u64, max_bytes: u64) -> DocIntake {
+        match kind {
+            None => DocIntake::Unsupported,
+            Some(k) if size > max_bytes => DocIntake::TooLarge(k),
+            Some(k) => DocIntake::Index(k),
+        }
+    }
+
+    /// Начальные `extract_state` и `extract_error` документа.
+    fn state(self) -> (ExtractState, Option<&'static str>) {
+        match self {
+            DocIntake::Index(_) => (ExtractState::Pending, None),
+            DocIntake::TooLarge(_) => (ExtractState::Failed, Some(TOO_LARGE)),
+            DocIntake::Unsupported => (ExtractState::Unsupported, None),
+        }
+    }
+}
+
+/// `extract_error` файла больше `docs.max_bytes`.
+pub const TOO_LARGE: &str = "too_large";
+
+/// Создаёт документ пары (узел, блоб, имя) или возвращает откреплённый (с новым `created_at`:
+/// порядок списка — по последней привязке) в состоянии по `intake`; задание `Attachment` — только
+/// [`DocIntake::Index`]. Живой документ пары не меняется. В транзакции привязки.
 pub(crate) fn ensure_doc(
     c: &Connection,
     node: Id,
     sha: &str,
     filename: &str,
     mime: &str,
-    kind: Option<DocKind>,
+    intake: DocIntake,
     now: &str,
 ) -> Result<Id, StoreError> {
-    let state = if kind.is_some() {
-        ExtractState::Pending
-    } else {
-        ExtractState::Unsupported
-    };
+    let (state, err) = intake.state();
     let row: Option<(Id, bool)> = c
         .prepare_cached(
             "SELECT id, deleted_at IS NOT NULL FROM attachment_docs
@@ -185,21 +219,21 @@ pub(crate) fn ensure_doc(
         Some((id, true)) => {
             c.prepare_cached(
                 "UPDATE attachment_docs
-                 SET deleted_at = NULL, extract_state = ?2, extract_error = NULL, ocr_needed = 0,
-                     mime = ?3
+                 SET deleted_at = NULL, extract_state = ?2, extract_error = ?3, ocr_needed = 0,
+                     mime = ?4, created_at = ?5
                  WHERE id = ?1",
             )?
-            .execute(params![id, state, mime])?;
+            .execute(params![id, state, err, mime, now])?;
             id
         }
         None => {
             let id = Id::new();
             c.prepare_cached(
                 "INSERT INTO attachment_docs (id, node_id, blob_sha256, filename, mime,
-                                              extract_state, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                              extract_state, extract_error, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?
-            .execute(params![id, node, sha, filename, mime, state, now])?;
+            .execute(params![id, node, sha, filename, mime, state, err, now])?;
             id
         }
     };
@@ -454,7 +488,7 @@ pub async fn detach(
     .await
 }
 
-/// Единица в JSON `blob_extract.units`.
+/// Единица в JSON `blob_extract.units` (в столбце — zstd этого JSON, спецификация M5 §3).
 #[derive(Serialize, Deserialize)]
 struct UnitJson {
     locator: String,
@@ -483,7 +517,8 @@ pub async fn extract_cached(db: &Db, sha: &str) -> Result<Option<Extracted>, Sto
     };
     let parsed = (|| {
         let kind = kind_from_str(&kind)?;
-        let units: Vec<UnitJson> = serde_json::from_slice(&units).ok()?;
+        let json = zstd::stream::decode_all(units.as_slice()).ok()?;
+        let units: Vec<UnitJson> = serde_json::from_slice(&json).ok()?;
         let units = units
             .into_iter()
             .map(|u| {
@@ -519,7 +554,9 @@ pub async fn put_extract(db: &Db, sha: &str, e: &Extracted) -> Result<(), StoreE
             text: u.text.clone(),
         })
         .collect();
-    let units = serde_json::to_vec(&units).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    let json = serde_json::to_vec(&units).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    let units = zstd::bulk::compress(&json, ZSTD_LEVEL)?;
+    drop(json);
     let warnings =
         serde_json::to_string(&e.warnings).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     let (sha, kind, ocr) = (sha.to_string(), e.kind.as_str(), e.ocr_needed);

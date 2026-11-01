@@ -109,14 +109,16 @@ pub struct SeenItem {
     pub rev: i64,
 }
 
-/// `target_kind` колонок `session_seen` и `usage`.
-pub(crate) fn target_kind_str(k: TargetKind) -> &'static str {
+/// `session_seen.target_kind` цели. Показ вложения записывается видом `blob` с sha256 блоба
+/// (CHECK `session_seen`), а не id документа: `TargetKind::Attachment` здесь — `BadInput`
+/// (выдача вложений в `/read` — задача 7 M5, она пишет ключ `blob`).
+fn seen_kind(k: TargetKind) -> Result<&'static str, StoreError> {
     match k {
-        TargetKind::Node => "node",
-        TargetKind::Entry => "entry",
-        // показ вложения (`/read`, задача 7 M5) пока не учитывается; CHECK `session_seen`
-        // такую строку не примет (там вложение — `blob`)
-        TargetKind::Attachment => "attachment",
+        TargetKind::Node => Ok("node"),
+        TargetKind::Entry => Ok("entry"),
+        TargetKind::Attachment => Err(StoreError::BadInput(
+            "показ вложения учитывается видом blob (sha256), не документом".into(),
+        )),
     }
 }
 
@@ -417,7 +419,7 @@ pub async fn mark_seen_with_tokens(
             st.execute(params![
                 s.id,
                 it.key.owner_id,
-                target_kind_str(it.key.target.kind),
+                seen_kind(it.key.target.kind)?,
                 it.key.target.id,
                 it.key.part,
                 it.rev,
@@ -452,7 +454,7 @@ pub async fn seen_revs(
                     params![
                         session,
                         k.owner_id,
-                        target_kind_str(k.target.kind),
+                        seen_kind(k.target.kind)?,
                         k.target.id,
                         k.part
                     ],

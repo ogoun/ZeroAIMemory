@@ -73,6 +73,9 @@ proptest = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 # хеш текста и id чанков (§6.3)
 blake3 = "1"
+# M5: кэш извлечения вложений `blob_extract` — zstd(JSON), спецификация M5 §3; MIT, libzstd —
+# BSD-3-Clause; уже в дереве (jieba-rs → include-flate). Без фич по умолчанию (legacy, словари)
+zstd = { version = "0.13.3", default-features = false }
 # M3: проверка триггеров инсайтов (§10.3): regex без обратных ссылок (ReDoS невозможен) —
 # MIT OR Apache-2.0, уже в дереве; globset — маски file_glob, Unlicense OR MIT (берём MIT)
 regex = "1"

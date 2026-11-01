@@ -39,7 +39,7 @@ pub mod vault;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use attachments::{
-    AttachmentDoc, ExtractState, detach, extract_cached, list_attachments, put_extract,
+    AttachmentDoc, DocIntake, ExtractState, detach, extract_cached, list_attachments, put_extract,
     replace_attachment_chunks, set_extract_state,
 };
 pub use blobs::{

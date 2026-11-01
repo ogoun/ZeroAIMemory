@@ -1,6 +1,6 @@
 //! Вид документа: сначала сигнатура содержимого, расширение — только для видов без сигнатуры.
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use zip::ZipArchive;
 
@@ -12,6 +12,11 @@ const OLE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const PDF_WINDOW: usize = 1024;
 /// Сколько читать из `[Content_Types].xml` и `mimetype` при определении вида.
 const SNIFF_READ: u64 = 256 * 1024;
+/// Начало файла для [`sniff_file`], если это не zip: окно проверки текста (64 КиБ) с запасом —
+/// обрезанный посреди символа хвост окна тогда не считается ошибкой UTF-8.
+const FILE_HEAD: u64 = 64 * 1024 + 16;
+/// Хвост файла с концом центрального каталога zip (EOCD с комментарием до 64 КиБ).
+const EOCD_TAIL: u64 = 22 + 65_535;
 
 /// Вид документа по сигнатуре (zip с `[Content_Types].xml` или `mimetype` ODS, `%PDF-`, OLE),
 /// затем по расширению имени (CSV, текст). `None` — вид не поддерживается.
@@ -67,6 +72,42 @@ fn looks_text(bytes: &[u8]) -> bool {
     }
 }
 
+/// [`sniff`] по файлу без чтения его в память: не zip — по началу файла ([`FILE_HEAD`]); zip —
+/// по концу центрального каталога (число записей сверяется с `limits.max_entries` до разбора
+/// каталога), самому каталогу и не больше 256 КиБ `[Content_Types].xml` или `mimetype`.
+/// Ошибка ввода-вывода — `Err`; неразборчивый zip — `Ok(None)`.
+pub fn sniff_file<R: Read + Seek>(
+    mut r: R,
+    name: &str,
+    limits: &Limits,
+) -> std::io::Result<Option<DocKind>> {
+    r.seek(SeekFrom::Start(0))?;
+    let mut head = Vec::new();
+    (&mut r).take(FILE_HEAD).read_to_end(&mut head)?;
+    if !head.starts_with(b"PK\x03\x04") {
+        return Ok(sniff(&head, name));
+    }
+    drop(head);
+    let len = r.seek(SeekFrom::End(0))?;
+    let start = len.saturating_sub(EOCD_TAIL);
+    r.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::new();
+    (&mut r).take(EOCD_TAIL).read_to_end(&mut tail)?;
+    let declared = crate::ooxml::declared_entries_in(&tail, |off| {
+        let mut rec = [0u8; 40];
+        r.seek(SeekFrom::Start(off)).ok()?;
+        r.read_exact(&mut rec).ok()?;
+        Some(rec)
+    });
+    if declared.is_some_and(|n| n > u64::from(limits.max_entries)) {
+        return Ok(None);
+    }
+    r.seek(SeekFrom::Start(0))?;
+    Ok(ZipArchive::new(r)
+        .ok()
+        .and_then(|mut zip| sniff_archive(&mut zip)))
+}
+
 fn sniff_zip(bytes: &[u8]) -> Option<DocKind> {
     // та же проверка числа записей до разбора центрального каталога, что и при извлечении
     let max = u64::from(Limits::default().max_entries);
@@ -74,13 +115,21 @@ fn sniff_zip(bytes: &[u8]) -> Option<DocKind> {
         return None;
     }
     let mut zip = ZipArchive::new(Cursor::new(bytes)).ok()?;
-    let read = |zip: &mut ZipArchive<Cursor<&[u8]>>, name: &str| -> Option<String> {
-        let f = zip.by_name(name).ok()?;
-        let mut s = Vec::new();
-        f.take(SNIFF_READ).read_to_end(&mut s).ok()?;
-        Some(String::from_utf8_lossy(&s).into_owned())
-    };
-    if let Some(ct) = read(&mut zip, "[Content_Types].xml") {
+    sniff_archive(&mut zip)
+}
+
+/// Начало записи `name` архива (до [`SNIFF_READ`] байт) строкой.
+fn read_part<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Option<String> {
+    let f = zip.by_name(name).ok()?;
+    let mut s = Vec::new();
+    f.take(SNIFF_READ).read_to_end(&mut s).ok()?;
+    Some(String::from_utf8_lossy(&s).into_owned())
+}
+
+/// Вид по содержимому открытого архива: `[Content_Types].xml` (OOXML) или `mimetype` (ODS).
+fn sniff_archive<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Option<DocKind> {
+    let read = read_part::<R>;
+    if let Some(ct) = read(zip, "[Content_Types].xml") {
         let has = |n: &str| zip.index_for_name(n).is_some();
         if ct.contains("wordprocessingml.document.main")
             || ct.contains("wordprocessingml.template.main")
@@ -108,7 +157,7 @@ fn sniff_zip(bytes: &[u8]) -> Option<DocKind> {
         }
         return None;
     }
-    let mime = read(&mut zip, "mimetype")?;
+    let mime = read(zip, "mimetype")?;
     let mime = mime.trim();
     (mime == "application/vnd.oasis.opendocument.spreadsheet"
         || mime == "application/vnd.oasis.opendocument.spreadsheet-template")

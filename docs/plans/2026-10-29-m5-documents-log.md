@@ -525,7 +525,8 @@
   `EXTRACTOR_VERSION` реэкспортируются из `zam_store::attachments`. `ExtractState` в `zam-docs`
   нет — это состояние строки базы, определён в `zam-store`. Новая явная зависимость `uuid`
   (workspace, фича `v5` уже включена) — id чанков вложений.
-- **Кэш `blob_extract` — JSON без zstd (отступление от спецификации §3).** `units` —
+- **Кэш `blob_extract` — JSON без zstd (отступление от спецификации §3; отменено в раунде
+  правок 1 — теперь zstd(JSON)).** `units` —
   `[{locator, heading_path, text}]` (locator — строковая форма `Locator::render`, обратно —
   `parse`); zstd — новая зависимость, выигрыш (текст сжимается в 3–5 раз) не нужен до замеров
   объёма на корпусе `eval/docs/` (задача 10). Строку, которая не разбирается, `extract_cached`
@@ -563,7 +564,8 @@
   документа нет), окончательная неудача (`fail_job`) переводит `pending` в `failed` с
   `index_failed`, если причину не записал воркер. `failed_jobs` берёт путь и пространство
   узла-владельца; `/index/status` отдаёт `attachment_id`.
-- **`attach` получает вид документа** (`Option<DocKind>`): REST `POST /blobs` вызывает
+- **`attach` получает вид документа** (`Option<DocKind>`; в раунде правок 1 — `DocIntake`,
+  `sniff_file` без чтения файла в память, дозаполнение без расширений): REST `POST /blobs` вызывает
   `zam_docs::sniff` по файлу блоба — zip целиком, если не больше `docs.max_bytes`, иначе
   `unsupported`; прочее — по первым 64 КиБ + 16 байт (окно `looks_text`). Дозаполнение миграцией
   файла не читает: `pending` — по расширениям видов `sniff`, остальные — `unsupported`;
@@ -589,6 +591,45 @@
   --lib` 38, `-p zam-server --test blobs --test nodes --test certainty --test solutions_access`
   10 + 15 + 16 + 15; `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` —
   чисто.
+
+#### Задача 4 — раунд правок 1 (2026-11-01)
+
+- **(I-1) Дозаполнение без расширений.** Миграция 0019 ставит `pending` с заданием
+  `Attachment` **каждому** вложению живого узла (вложению удалённого — `pending` без задания,
+  его поставит восстановление): выбор по расширению навсегда оставлял `.xlsm`, `.docm`, `.dotx`,
+  `.ppsx`, `.xlt`, `.ots` и PDF без расширения в `unsupported` (повторная привязка живой
+  документ не меняет). **Обязательство задачи 5:** конвейер определяет вид по содержимому
+  (`zam_docs::sniff_file`) и переводит неподдерживаемые в `unsupported` без ошибки (а
+  поддерживаемые больше `docs.max_bytes` — в `failed`/`too_large`). Тест миграции дополнен
+  `book.xlsm`, `scan` (PDF без расширения) и `cat.png` — все `pending` с заданием.
+- **(M-2) `sniff` без чтения файла в память.** Новая `zam_docs::sniff_file(R: Read + Seek,
+  имя, &Limits)`: не zip — по первым 64 КиБ + 16 байт; zip — число записей по EOCD хвоста
+  файла (общая с `extract` проверка `declared_entries_in`, запись zip64 — по абсолютному
+  смещению) против `limits.max_entries` до разбора каталога, затем `ZipArchive::new(файл)`
+  и до 256 КиБ `[Content_Types].xml`/`mimetype`. Лимит берётся из `[docs]` (заодно частично
+  закрывает замечание M-3 задачи 1 для загрузки; `sniff(&[u8])` по-прежнему с умолчаниями).
+  Тест `zam-docs/tests/ooxml.rs::sniff_file_matches_sniff`.
+- **(M-3) Больше `docs.max_bytes` — `failed`/`too_large`.** Одно правило для любого
+  поддерживаемого вида: `attach` принимает `DocIntake` (`Index(kind)` | `TooLarge(kind)` |
+  `Unsupported`, `DocIntake::classify(kind, size, max_bytes)`); `TooLarge` — без задания.
+- **(M-4) `blob_extract.units` — zstd(JSON)**, как в спецификации §3. Аудит: `zstd` 0.13.3
+  (MIT) → `zstd-safe` 7.3.0 (MIT OR Apache-2.0) → `zstd-sys` 2.1.2+zstd.1.5.7 (MIT OR
+  Apache-2.0; libzstd — BSD-3-Clause, собирается `cc`) уже были в дереве сервера
+  (`jieba-rs` → `include-flate-compress`), лицензии в списке `about.toml`; новых пакетов в
+  `Cargo.lock` нет. Workspace-зависимость `default-features = false` (legacy-форматы и
+  словари не нужны). Уровень 3; разжатие — `zstd::stream::decode_all` (кэш пишет только
+  сервер; объём ограничен `max_chars` при записи). Неразжимаемая или неразборчивая строка —
+  промах кэша. Тест `extract_cache_is_zstd_and_bad_row_is_miss`.
+- **(M-5) Нет строк, которые CHECK не примет.** `cache::kind_str`, `file_refs::owner_kind`,
+  `sessions::seen_kind` для `Attachment` возвращают `BadInput` (показ вложения в
+  `session_seen` — вид `blob` с sha256, его пишет `/read` задачи 7: из id документа sha здесь
+  не получить без запроса). `usage` (CHECK нет) получила свою `kind_str` с `"attachment"` —
+  показы вложений в выдаче (задача 6).
+- **(M-6) Повторная привязка обновляет `created_at`** — порядок списка по последней
+  привязке. Тест `too_large_failed_and_reattach_moves_to_end`.
+- Проверки: `cargo test -p zam-store` 304 passed (4 ignored), `-p zam-docs` 59 (2 ignored),
+  `-p zam-server --test blobs --test nodes --test sessions` 10 + 15 + 13; clippy `-D warnings`
+  по workspace и `fmt --check` — чисто.
 
 ## Решения
 
@@ -727,12 +768,14 @@
   оставляют документ `pending` без задания — при первом запуске конвейера поставить задания
   `pending`-документам без активного задания; `split_targets`/`delete_targets` по
   `attachment_id`, `must_not attachment_id exists` у удаления точек узла; Human-защита в
-  `attachment_chunks_for_index`; вложение больше `docs.max_bytes` сейчас `unsupported`
-  (zip) — можно `failed: too_large`.
+  `attachment_chunks_for_index`; вид по содержимому (`sniff_file`) для `pending`-документов
+  дозаполнения: неподдерживаемые — `unsupported`, больше `docs.max_bytes` — `failed`/`too_large`
+  (раунд правок 1, обязательство).
 - **Задача 6:** `scope_sql` — ветка вложений с `attachment_docs.deleted_at IS NULL` (чанки
   скрытых документов лежат в FTS); карточка `a:<chunk>` vs `TargetKind::Attachment` (`a:<id
   документа>`) — согласовать префиксы в задачах 6–7.
-- **Задача 7:** `sessions::target_kind_str(Attachment)` — показ вложения писать как `blob`.
+- **Задача 7:** показ вложения в `session_seen` — ключом `blob` (sha256): `seen_kind(Attachment)`
+  теперь `BadInput` (раунд правок 1).
 
 ## Уточнить у владельца
 

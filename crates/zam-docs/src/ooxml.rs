@@ -296,6 +296,18 @@ fn resolve(dir: &str, target: &str) -> String {
 
 /// Число записей из конца центрального каталога (EOCD, zip64) — до разбора архива.
 pub(crate) fn declared_entries(b: &[u8]) -> Option<u64> {
+    declared_entries_in(b, |off| {
+        let off = usize::try_from(off).ok()?;
+        b.get(off..off.checked_add(40)?)?.try_into().ok()
+    })
+}
+
+/// [`declared_entries`] по концу архива `b` (весь файл или его хвост с EOCD);
+/// `record(off)` — 40 байт записи EOCD64 по абсолютному смещению файла (zip64).
+pub(crate) fn declared_entries_in(
+    b: &[u8],
+    record: impl FnOnce(u64) -> Option<[u8; 40]>,
+) -> Option<u64> {
     const EOCD: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
     const LOC64: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
     const EOCD64: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
@@ -312,8 +324,7 @@ pub(crate) fn declared_entries(b: &[u8]) -> Option<u64> {
         return Some(total);
     }
     let off = u64::from_le_bytes(b[loc + 8..loc + 16].try_into().ok()?);
-    let off = usize::try_from(off).ok()?;
-    let rec = b.get(off..off.checked_add(40)?)?;
+    let rec = record(off)?;
     if rec[..4] != EOCD64 {
         return Some(total);
     }

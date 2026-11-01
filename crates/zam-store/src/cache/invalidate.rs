@@ -20,7 +20,7 @@ fn deps_of(c: &Connection, target: TargetRef) -> Result<Vec<(Id, String, String)
          JOIN answer_cache a ON a.id = d.cache_id
          WHERE d.target_kind = ?1 AND d.target_id = ?2 AND a.deleted_at IS NULL",
     )?;
-    let rows = st.query_map(params![kind_str(target.kind), target.id], |r| {
+    let rows = st.query_map(params![kind_str(target.kind)?, target.id], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -67,7 +67,7 @@ pub(crate) fn invalidate_revised(
         if same {
             bump.execute(params![
                 cache,
-                kind_str(target.kind),
+                kind_str(target.kind)?,
                 target.id,
                 section,
                 rev
@@ -186,7 +186,7 @@ pub async fn mark_new_sources(
                     continue;
                 }
                 let dep: bool = is_dep
-                    .query_row(params![cache, kind_str(target.kind), target.id], |r| {
+                    .query_row(params![cache, kind_str(target.kind)?, target.id], |r| {
                         r.get(0)
                     })?;
                 if dep {
