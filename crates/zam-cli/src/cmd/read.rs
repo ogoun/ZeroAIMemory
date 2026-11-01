@@ -1,4 +1,4 @@
-//! `zam read <target>… [--tier L0|L1|L2] [--section "A > B"] [--rev N]`.
+//! `zam read <target>… [--tier L0|L1|L2] [--section "A > B"] [--rev N] [--locator <loc>]`.
 //!
 //! - L2 (по умолчанию) — байты ревизии как сохранены (CRLF, BOM), без добавлений;
 //! - L0 и L1 — текст сводки и перевод строки;
@@ -27,6 +27,12 @@
 //!
 //! Нет секции `--section` — код 5 с подсказкой: путь секции — заголовки от верхнего или
 //! однозначный хвост пути.
+//!
+//! **Вложения** (M5, задача 7): `a:<chunk>` из выдачи `zam search` — фрагмент по `locator`
+//! чанка, `b:<sha256>` и `d:<id>` — документ; `--locator page:12|slide:3|para:40|
+//! sheet:<лист>!A1:F40` — часть документа, без него у `b:`/`d:` — оглавление. Читаются всегда
+//! пачкой (заголовок элемента с файлом и подписью `locator`); `--locator` у заметки или записи —
+//! код 6 (`locator-invalid`), части нет в документе — код 5.
 use std::io::{ErrorKind, Read, Write};
 
 use serde_json::{Value, json};
@@ -36,7 +42,7 @@ use crate::client::{
     CliError, EXIT_INPUT, EXIT_NOT_FOUND, EXIT_TOKEN, EXIT_UNREACHABLE, into_reader, read_json,
     read_text,
 };
-use crate::target::{Loc, entry_ref};
+use crate::target::{Loc, doc_ref, entry_ref};
 
 /// Параметры чтения.
 pub struct Opts<'a> {
@@ -50,6 +56,8 @@ pub struct Opts<'a> {
     pub if_rev: Option<i64>,
     /// Изменения с ревизии (M4.5 §7).
     pub since_rev: Option<i64>,
+    /// Часть вложения (M5): `page:12`, `sheet:Итоги!A1:F40`.
+    pub locator: Option<&'a str>,
 }
 
 impl Opts<'_> {
@@ -59,6 +67,7 @@ impl Opts<'_> {
             || self.budget.is_some()
             || self.if_rev.is_some()
             || self.since_rev.is_some()
+            || self.locator.is_some()
     }
 }
 
@@ -72,7 +81,7 @@ enum Out {
 }
 
 pub fn run(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
-    if o.batched() {
+    if o.batched() || targets.iter().any(|t| doc_ref(t)) {
         return batch(ctx, targets, o);
     }
     let many = targets.len() > 1;
@@ -237,10 +246,11 @@ fn error_exit(code: &str) -> u8 {
     }
 }
 
-/// `id` элемента `/read` для цели: ссылка записи `i:|c:|e:|r:|t:|k:|q:<id>` как есть, id
+/// `id` элемента `/read` для цели: ссылка записи `i:|c:|e:|r:|t:|k:|q:<id>` и вложения
+/// `a:|b:|d:` как есть, id
 /// узла — голый (сервер ищет узел, затем запись), путь — `<пространство>:/<путь>`.
 fn item_id(ctx: &Ctx, raw: &str) -> Result<String, CliError> {
-    if entry_ref(raw).is_some() {
+    if entry_ref(raw).is_some() || doc_ref(raw) {
         return Ok(raw.to_string());
     }
     Ok(match ctx.locate(raw)? {
@@ -253,7 +263,7 @@ fn item_id(ctx: &Ctx, raw: &str) -> Result<String, CliError> {
 fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
     if o.rev.is_some() {
         return Err(CliError::input(
-            "--rev несовместим с пачкой (--batch, --max-tokens, --budget, --if-rev, --since-rev)",
+            "--rev несовместим с пачкой (--batch, --max-tokens, --budget, --if-rev, --since-rev, --locator, вложения)",
         ));
     }
     if (o.if_rev.is_some() || o.since_rev.is_some()) && targets.len() > 1 {
@@ -278,6 +288,9 @@ fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
         }
         if let Some(v) = o.since_rev {
             it["since_rev"] = json!(v);
+        }
+        if let Some(v) = o.locator {
+            it["locator"] = json!(v);
         }
         items.push(it);
     }

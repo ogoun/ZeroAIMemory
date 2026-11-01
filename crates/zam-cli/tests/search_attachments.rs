@@ -3,42 +3,8 @@
 //! разбора документов — бинарник `zam-server` из каталога сборки (без него тест пропускается:
 //! `cargo test --workspace` собирает его для тестов `zam-server`).
 mod common;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::process::Output;
 use std::time::{Duration, Instant};
-
-use zam_server::build;
-use zam_server::config::ServerConfig;
-
-/// Сервер на 127.0.0.1:0 в фоновом потоке; адрес и первый токен администратора.
-fn start(data: PathBuf, worker: PathBuf) -> (String, String) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let mut cfg = ServerConfig {
-                data_dir: data,
-                ..ServerConfig::default()
-            };
-            cfg.docs.worker_program = Some(worker);
-            let (app, _st, rep) = build(cfg, Some("pw".into())).await.unwrap();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            tx.send((url, rep.initial_token.unwrap())).unwrap();
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-    });
-    rx.recv().unwrap()
-}
 
 fn out(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
@@ -50,23 +16,12 @@ fn err(o: &Output) -> String {
 
 #[test]
 fn search_shows_attachment_cards() {
-    let worker = assert_cmd::cargo::cargo_bin("zam-server");
-    if !worker.is_file() {
-        // как `common::ml::have` у zam-server: в CI и с ZAM_REQUIRE_ML пропуск недопустим
-        assert!(
-            std::env::var_os("ZAM_REQUIRE_ML").is_none() && std::env::var_os("CI").is_none(),
-            "нет {}: соберите cargo build -p zam-server (или cargo test --workspace)",
-            worker.display()
-        );
-        eprintln!(
-            "SKIP search_shows_attachment_cards: нет {}",
-            worker.display()
-        );
+    let Some(worker) = common::docs_worker("search_shows_attachment_cards") else {
         return;
-    }
+    };
     let data = common::sandbox("cli-search-att", "data");
     let cwd = common::sandbox("cli-search-att", "cwd");
-    let (url, token) = start(data, worker);
+    let (url, token) = common::docs_server(data, worker);
     let zam = |args: &[&str], stdin: &[u8]| -> Output {
         let o = common::zam_cmd()
             .env("ZAM_URL", &url)

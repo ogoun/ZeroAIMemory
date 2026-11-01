@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use jiff::{SignedDuration, Timestamp};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
-    DataDir, SeenItem, SeenKey, SessionTouch, UsageEvent, UsageKind, UsageSource, UserDbs,
-    WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session, latest_session,
+    DataDir, SeenItem, SeenKey, SeenTarget, SessionTouch, UsageEvent, UsageKind, UsageSource,
+    UserDbs, WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session, latest_session,
     list_sessions, mark_seen, record_usage, seen_revs, touch_session, usage_counts,
 };
 
@@ -141,9 +141,9 @@ async fn touch_session_upsert() {
 async fn mark_seen_keeps_latest_rev() {
     let (_dd, db) = db("seen").await;
     let (owner, other_owner, n) = (Id::new(), Id::new(), Id::new());
-    let key = |owner_id, target, part: &str| SeenKey {
+    let key = |owner_id, target: TargetRef, part: &str| SeenKey {
         owner_id,
-        target,
+        target: target.into(),
         part: part.into(),
     };
     let chunk = key(owner, node(n), "c1");
@@ -195,6 +195,69 @@ async fn mark_seen_keeps_latest_rev() {
     assert!(seen_revs(&db, "a", &[]).await.unwrap().is_empty());
 }
 
+/// Показ вложения (M5, задача 7) — ключ `blob` с sha256 и частью (`locator` или `chunk_id`):
+/// пишется и читается, части и блобы различаются; sha256 не из 64 hex и документ вложения
+/// (`TargetKind::Attachment`) — `BadInput`.
+#[tokio::test]
+async fn mark_seen_blob_parts() {
+    let (_dd, db) = db("seen-blob").await;
+    let owner = Id::new();
+    let sha = "ab".repeat(32);
+    let key = |sha: &str, part: &str| SeenKey {
+        owner_id: owner,
+        target: SeenTarget::Blob(sha.into()),
+        part: part.into(),
+    };
+    let (p1, p2) = (key(&sha, "page:1"), key(&sha, "page:2"));
+    let other = key(&"cd".repeat(32), "page:1");
+    let s = touch("blob");
+    mark_seen(
+        &db,
+        &s,
+        &[SeenItem {
+            key: p1.clone(),
+            rev: 0,
+        }],
+    )
+    .await
+    .unwrap();
+    let got = seen_revs(&db, "blob", &[p1.clone(), p2, other])
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[&p1], 0);
+    let kind: String = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT target_kind || '/' || target_id || '/' || part FROM session_seen",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(kind, format!("blob/{sha}/page:1"));
+    for bad in [
+        key("xyz", "page:1"),
+        key(&"AB".repeat(32), "page:1"),
+        SeenKey {
+            owner_id: owner,
+            target: TargetRef {
+                kind: TargetKind::Attachment,
+                id: Id::new(),
+            }
+            .into(),
+            part: String::new(),
+        },
+    ] {
+        let r = mark_seen(&db, &s, &[SeenItem { key: bad, rev: 0 }]).await;
+        assert!(
+            matches!(r, Err(zam_store::StoreError::BadInput(_))),
+            "{r:?}"
+        );
+    }
+}
+
 /// Счётчики по событиям одной цели; события других целей не смешиваются.
 #[tokio::test]
 async fn usage_counts_by_event() {
@@ -242,7 +305,7 @@ async fn gc_sessions_by_last_seen() {
     let (_dd, db) = db("gc").await;
     let key = SeenKey {
         owner_id: Id::new(),
-        target: node(Id::new()),
+        target: node(Id::new()).into(),
         part: WHOLE_TARGET.into(),
     };
     let item = SeenItem {
@@ -466,7 +529,7 @@ async fn session_tokens_accumulate() {
     let item = SeenItem {
         key: SeenKey {
             owner_id: Id::new(),
-            target: node(Id::new()),
+            target: node(Id::new()).into(),
             part: WHOLE_TARGET.into(),
         },
         rev: 1,

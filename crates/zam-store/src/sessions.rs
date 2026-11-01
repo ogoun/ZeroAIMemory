@@ -8,7 +8,8 @@
 //! - `session_seen` — что сессии уже выдано: цель в базе владельца `owner_id` (решение может
 //!   быть чужим), часть цели `part` (решение контроллера R11: `chunk_id` чанка, отданного
 //!   целиком, или [`WHOLE_TARGET`] — полный текст цели; [`RECALL_PART`] — подсказка `/recall`)
-//!   и её ревизия. Хранится большая из выданных ревизий: ревизии только растут, и повторная
+//!   и её ревизия. Вложение (M5) — цель [`SeenTarget::Blob`] (sha256), часть — `locator`,
+//!   отданный `/read` целиком, или `chunk_id` фрагмента `mode=chunks`, ревизия 0. Хранится большая из выданных ревизий: ревизии только растут, и повторная
 //!   выдача старой не откатывает отметку;
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
 //!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя;
@@ -94,11 +95,28 @@ pub struct TokenStat {
     pub tokens: i64,
 }
 
-/// Выданное сессии: владелец базы цели, цель и её часть (`chunk_id` или [`WHOLE_TARGET`]).
+/// Цель выданного: узел или запись журнала ([`TargetRef`]) либо блоб вложения по sha256 (M5,
+/// задача 7: показ вложения учитывается по содержимому файла, а не по документу — один файл в
+/// двух заметках выдаётся один раз).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SeenTarget {
+    Ref(TargetRef),
+    /// sha256 блоба: 64 hex в нижнем регистре.
+    Blob(String),
+}
+
+impl From<TargetRef> for SeenTarget {
+    fn from(r: TargetRef) -> Self {
+        SeenTarget::Ref(r)
+    }
+}
+
+/// Выданное сессии: владелец базы цели, цель и её часть (`chunk_id`, [`WHOLE_TARGET`]; у блоба —
+/// ещё `locator`, отданный целиком через `/read`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SeenKey {
     pub owner_id: Id,
-    pub target: TargetRef,
+    pub target: SeenTarget,
     pub part: String,
 }
 
@@ -109,16 +127,30 @@ pub struct SeenItem {
     pub rev: i64,
 }
 
-/// `session_seen.target_kind` цели. Показ вложения записывается видом `blob` с sha256 блоба
-/// (CHECK `session_seen`), а не id документа: `TargetKind::Attachment` здесь — `BadInput`
-/// (выдача вложений в `/read` — задача 7 M5, она пишет ключ `blob`).
-fn seen_kind(k: TargetKind) -> Result<&'static str, StoreError> {
-    match k {
-        TargetKind::Node => Ok("node"),
-        TargetKind::Entry => Ok("entry"),
-        TargetKind::Attachment => Err(StoreError::BadInput(
-            "показ вложения учитывается видом blob (sha256), не документом".into(),
-        )),
+/// `session_seen.target_kind` и `target_id` цели. Показ вложения — вид `blob` с sha256 блоба
+/// (CHECK `session_seen`); документ вложения (`TargetKind::Attachment`) — `BadInput`: из его id
+/// sha256 без запроса не получить, а ключ по документу разделил бы один файл двух заметок.
+fn seen_cols(t: &SeenTarget) -> Result<(&'static str, String), StoreError> {
+    match t {
+        SeenTarget::Ref(r) => match r.kind {
+            TargetKind::Node => Ok(("node", r.id.to_string())),
+            TargetKind::Entry => Ok(("entry", r.id.to_string())),
+            TargetKind::Attachment => Err(StoreError::BadInput(
+                "показ вложения учитывается видом blob (sha256), не документом".into(),
+            )),
+        },
+        SeenTarget::Blob(sha) => {
+            let ok = sha.len() == 64
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !ok {
+                return Err(StoreError::BadInput(
+                    "sha256 блоба: 64 hex в нижнем регистре".into(),
+                ));
+            }
+            Ok(("blob", sha.clone()))
+        }
     }
 }
 
@@ -416,11 +448,12 @@ pub async fn mark_seen_with_tokens(
                rev = max(rev, excluded.rev), seen_at = excluded.seen_at",
         )?;
         for it in &items {
+            let (kind, id) = seen_cols(&it.key.target)?;
             st.execute(params![
                 s.id,
                 it.key.owner_id,
-                seen_kind(it.key.target.kind)?,
-                it.key.target.id,
+                kind,
+                id,
                 it.key.part,
                 it.rev,
                 now
@@ -449,17 +482,9 @@ pub async fn seen_revs(
         )?;
         let mut out = HashMap::new();
         for k in targets {
+            let (kind, id) = seen_cols(&k.target)?;
             let rev: Option<i64> = st
-                .query_row(
-                    params![
-                        session,
-                        k.owner_id,
-                        seen_kind(k.target.kind)?,
-                        k.target.id,
-                        k.part
-                    ],
-                    |r| r.get(0),
-                )
+                .query_row(params![session, k.owner_id, kind, id, k.part], |r| r.get(0))
                 .optional()?;
             if let Some(rev) = rev {
                 out.insert(k, rev);

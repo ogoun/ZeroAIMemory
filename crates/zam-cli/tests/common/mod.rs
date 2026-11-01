@@ -140,3 +140,52 @@ pub fn stub(status: u16, body: &'static str, delay: std::time::Duration) -> (Str
     });
     (url, seen)
 }
+
+/// Бинарник `zam-server` из каталога сборки — рабочий процесс разбора документов (M5). Нет его —
+/// `None` с `SKIP <test>` в stderr; в CI и с `ZAM_REQUIRE_ML` пропуск недопустим (как
+/// `common::ml::have` у `zam-server`).
+pub fn docs_worker(test: &str) -> Option<PathBuf> {
+    let worker = assert_cmd::cargo::cargo_bin("zam-server");
+    if worker.is_file() {
+        return Some(worker);
+    }
+    assert!(
+        std::env::var_os("ZAM_REQUIRE_ML").is_none() && std::env::var_os("CI").is_none(),
+        "нет {}: соберите cargo build -p zam-server (или cargo test --workspace)",
+        worker.display()
+    );
+    eprintln!("SKIP {test}: нет {}", worker.display());
+    None
+}
+
+/// Сервер с разбором документов на 127.0.0.1:0 в фоновом потоке (данные — `data`, рабочий
+/// процесс — `worker`); адрес и первый токен администратора.
+pub fn docs_server(data: PathBuf, worker: PathBuf) -> (String, String) {
+    use zam_server::build;
+    use zam_server::config::ServerConfig;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut cfg = ServerConfig {
+                data_dir: data,
+                ..ServerConfig::default()
+            };
+            cfg.docs.worker_program = Some(worker);
+            let (app, _st, rep) = build(cfg, Some("pw".into())).await.unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tx.send((url, rep.initial_token.unwrap())).unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+    });
+    rx.recv().unwrap()
+}

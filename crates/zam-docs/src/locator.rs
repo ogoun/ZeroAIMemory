@@ -78,6 +78,75 @@ impl Locator {
     }
 }
 
+/// Прямоугольник диапазона листа: столбцы и строки с 1, `(c1, r1, c2, r2)`, углы упорядочены.
+type Rect = (u32, u32, u32, u32);
+
+impl Locator {
+    /// Адреса пересекаются (`/read` по `locator`, M5 §4): страница, слайд, абзац — равны; лист —
+    /// то же имя и пересечение диапазонов (`A2:B2` попадает в блок `A1:F40`).
+    pub fn overlaps(&self, other: &Locator) -> bool {
+        match (self, other) {
+            (Locator::Sheet { name: a, range: ra }, Locator::Sheet { name: b, range: rb }) => {
+                a == b
+                    && match (rect(ra), rect(rb)) {
+                        (Some(x), Some(y)) => x.0 <= y.2 && y.0 <= x.2 && x.1 <= y.3 && y.1 <= x.3,
+                        _ => false,
+                    }
+            }
+            _ => self == other,
+        }
+    }
+
+    /// Диапазон листа, покрывающий оба (`A1:B5` и `A6:B9` → `A1:B9`); не листы или разные
+    /// листы — `None`.
+    pub fn sheet_union(&self, other: &Locator) -> Option<Locator> {
+        let (Locator::Sheet { name: a, range: ra }, Locator::Sheet { name: b, range: rb }) =
+            (self, other)
+        else {
+            return None;
+        };
+        if a != b {
+            return None;
+        }
+        let (x, y) = (rect(ra)?, rect(rb)?);
+        let (c1, r1, c2, r2) = (x.0.min(y.0), x.1.min(y.1), x.2.max(y.2), x.3.max(y.3));
+        Some(Locator::Sheet {
+            name: a.clone(),
+            range: format!("{}{r1}:{}{r2}", col_letters(c1), col_letters(c2)),
+        })
+    }
+}
+
+/// Ячейка `B12` → (столбец с 1, строка с 1).
+fn cell(s: &str) -> Option<(u32, u32)> {
+    let letters = s.bytes().take_while(u8::is_ascii_uppercase).count();
+    let mut col = 0u32;
+    for b in s[..letters].bytes() {
+        col = col * 26 + u32::from(b - b'A' + 1);
+    }
+    let row = s[letters..].parse().ok()?;
+    (letters > 0).then_some((col, row))
+}
+
+/// Диапазон `A1:F40` или ячейка `A1` → прямоугольник.
+fn rect(range: &str) -> Option<Rect> {
+    let (a, b) = range.split_once(':').unwrap_or((range, range));
+    let ((c1, r1), (c2, r2)) = (cell(a)?, cell(b)?);
+    Some((c1.min(c2), r1.min(r2), c1.max(c2), r1.max(r2)))
+}
+
+/// Буквы столбца с 1 (`1` → `A`, `27` → `AA`).
+fn col_letters(mut c: u32) -> String {
+    let mut out = Vec::new();
+    while c > 0 {
+        c -= 1;
+        out.push(b'A' + (c % 26) as u8);
+        c /= 26;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
 /// Ячейка `A1`: 1–3 латинские буквы и номер строки от 1.
 fn is_cell(s: &str) -> bool {
     let letters = s.bytes().take_while(u8::is_ascii_uppercase).count();
@@ -102,5 +171,37 @@ mod tests {
         assert_eq!(l("sheet:'Q1 ''26'!B2"), "лист «Q1 '26» B2");
         assert_eq!(l("slide:3"), "слайд 3");
         assert_eq!(l("para:40"), "абз. 40");
+    }
+
+    /// Пересечение адресов для `/read` (задача 7 M5) и объединение диапазонов листа.
+    #[test]
+    fn locator_overlaps_and_sheet_union() {
+        let p = |s: &str| Locator::parse(s).unwrap();
+        assert!(p("page:2").overlaps(&p("page:2")));
+        assert!(!p("page:2").overlaps(&p("page:3")));
+        assert!(!p("page:2").overlaps(&p("slide:2")));
+        let block = p("sheet:Итоги!A1:F40");
+        for yes in [
+            "sheet:Итоги!A1:F40",
+            "sheet:Итоги!B2",
+            "sheet:Итоги!F40:Z99",
+        ] {
+            assert!(block.overlaps(&p(yes)), "{yes}");
+            assert!(p(yes).overlaps(&block), "{yes}");
+        }
+        for no in ["sheet:Итоги!G1:H2", "sheet:Итоги!A41", "sheet:Склад!A1"] {
+            assert!(!block.overlaps(&p(no)), "{no}");
+        }
+        assert!(p("sheet:L!AA10:AB12").overlaps(&p("sheet:L!Z11:AA11")));
+        assert_eq!(
+            p("sheet:Итоги!A1:B5").sheet_union(&p("sheet:Итоги!A6:C9")),
+            Some(p("sheet:Итоги!A1:C9"))
+        );
+        assert_eq!(
+            p("sheet:L!Y1:Z2").sheet_union(&p("sheet:L!AA3:AB4")),
+            Some(p("sheet:L!Y1:AB4"))
+        );
+        assert_eq!(p("sheet:A!A1").sheet_union(&p("sheet:B!A1")), None);
+        assert_eq!(p("page:1").sheet_union(&p("page:2")), None);
     }
 }

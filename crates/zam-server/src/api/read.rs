@@ -7,9 +7,21 @@
 //!
 //! - `id`: `n:<id>` (узел), `i:|c:|r:|t:|k:|q:<id>` (запись журнала; `e:` тоже), голый id (узел,
 //!   иначе запись) или путь `<пространство>:/<путь>` (`knowledge:/Инструменты/Bash`). Не больше
-//!   `read.max_items` (20) элементов, пусто или больше — 422; `locator` — 422
-//!   `locator-unsupported` (этап M5). Некорректный `tier`, нулевые `max_tokens` и
-//!   `budget_tokens` — 400. Всё это проверяется до чтения;
+//!   `read.max_items` (20) элементов, пусто или больше — 422. Некорректный `tier`, нулевые
+//!   `max_tokens` и `budget_tokens` — 400. Всё это проверяется до чтения;
+//! - **вложения** (M5 §4, задача 7): `a:<chunk_id>` — фрагмент из выдачи поиска (его документ,
+//!   `locator` по умолчанию — `locator` чанка), `b:<sha256>` — вложение блоба (несколько заметок с
+//!   тем же файлом — первое по дате привязки и `warnings`), `d:<id>` — документ (`attachment_id`
+//!   карточки). Ищутся только в читаемых областях ([`attachment_scope`]); недоступное и
+//!   несуществующее — одинаковый `not_found` без пояснений. `locator` (`page:12`, `slide:3`,
+//!   `para:40`, `sheet:<лист>!A1:F40`) — текст единиц документа с этим адресом: лист — блоки,
+//!   пересекающие диапазон; абзац внутри блока DOCX — этот блок; лист ищется по сырому имени
+//!   (и по его маске из оглавления), в ответе имя листа замаскировано сканером секретов. Без
+//!   `locator` у `b:`/`d:` и при `tier` L0/L1 — оглавление: части документа с первой строкой (до
+//!   [`TOC_MAX_ENTRIES`]) и подсказка. Текст — из чанков (секреты замаскированы при нарезке);
+//!   `section` и `since_rev` к вложению неприменимы (`invalid`), `if_rev: 0` — `unchanged`;
+//! - **`locator` неверного формата** или у цели без документа (`n:`, запись, путь, голый id) —
+//!   422 `/problems/locator-invalid` до чтения;
 //! - `tier` — `L0` | `L1` | `L2` (по умолчанию). Узел: сводка, оглавление с первым предложением
 //!   секций, текст. Запись журнала **[решение исполнителя]**: L0 — заголовок (у term —
 //!   определение), L1 — `note_l1` тела (нет — L0), L2 — тело. `section` — путь заголовков (как в
@@ -37,7 +49,9 @@
 //!   или `X-Zam-Session`, лежит в базе пользователя запроса. Цель отмечается целиком
 //!   (`part = WHOLE_TARGET`, ревизия выданного текста) только когда отдан **полный текст L2
 //!   без `section` и без обрезки** по `max_tokens` и бюджету; секция, L0/L1, обрезанный текст,
-//!   `unchanged`, `(budget)` и ошибки — не отмечаются. Касание сессии и отметка — одна
+//!   `unchanged`, `(budget)` и ошибки — не отмечаются. Вложение: текст по `locator`, отданный
+//!   целиком, — ключ `blob` (sha256), часть — `locator`, ревизия 0; оглавление не отмечается.
+//!   Касание сессии и отметка — одна
 //!   транзакция; сбой учёта — WARN (без id сессии и текста), ответ не портится. Некорректный
 //!   id сессии — 400;
 //! - если у какого-то элемента ошибка, в ответе (md и json) заголовок
@@ -55,20 +69,26 @@ use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
+use std::collections::{HashMap, HashSet};
+
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
+use zam_docs::Locator;
+use zam_markdown::mask_text;
 use zam_search::truncate_to_tokens;
 use zam_store::{
-    EntryKind, NodeKind, NodePath, SeenItem, SeenKey, StoreError, WHOLE_TARGET, count_tokens,
-    entry_revisions, entry_snapshot_text, get_node_by_path, mark_seen, node_content,
+    CHUNK_REF_LETTER, DocLookup, EntryKind, NodeKind, NodePath, SeenItem, SeenKey, SeenTarget,
+    StoreError, WHOLE_TARGET, count_tokens, doc_chunk_heads, doc_chunk_texts, entry_revisions,
+    entry_snapshot_text, get_node_by_path, mark_seen, node_content,
 };
 
 use super::json_body;
 use super::nodes::diff_blocking;
 use super::nodes::read::{Tier, l1, parse_tier, section_slice};
 use super::scope::{
-    EntryScope, Mode, NodeScope, entry_scope, live, live_entry, node_scope, space_scope,
+    AttachmentScope, EntryScope, Mode, NodeScope, attachment_scope, entry_scope, live, live_entry,
+    node_scope, space_scope,
 };
 use super::search::md_inline;
 use super::sessions::request_session;
@@ -91,7 +111,7 @@ pub struct ReadItem {
     id: String,
     tier: Option<String>,
     section: Option<String>,
-    /// Страница или лист документа — этап M5.
+    /// Адрес части вложения (`page:12`, `sheet:Итоги!A1:F40`, …; M5 §4).
     locator: Option<Value>,
     max_tokens: Option<usize>,
     if_rev: Option<i64>,
@@ -202,10 +222,29 @@ struct Fetched {
     tier: Tier,
     rev: i64,
     max_tokens: Option<usize>,
-    seen: SeenKey,
+    /// Ключи выданного сессии (у вложения — `locator` каждой выданной единицы).
+    seen: Vec<SeenKey>,
     content: Content,
     /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
     stale_refs: Vec<String>,
+    /// Цель, чьи устаревшие ссылки нужны: база и ссылка (собираются одним запросом на базу).
+    stale_key: Option<(Id, zam_store::Db, TargetRef)>,
+    /// Вложение: файл, документ, блоб, `locator` (M5).
+    att: Option<AttMeta>,
+    /// Предупреждения элемента (`b:` с несколькими вложениями).
+    warnings: Vec<String>,
+}
+
+/// Поля элемента-вложения.
+struct AttMeta {
+    file: String,
+    attachment_id: Id,
+    node_id: Id,
+    blob_sha256: String,
+    /// `locator` выданной части (имя листа — через сканер секретов); `None` — оглавление.
+    locator: Option<String>,
+    /// Подпись `locator` (`стр. 12`, `лист «Итоги» A1:F40`), тоже замаскирована.
+    locator_text: Option<String>,
 }
 
 /// Результат по элементу после упаковки.
@@ -240,22 +279,76 @@ fn tier_str(t: Tier) -> &'static str {
     }
 }
 
-/// Узел или запись, найденные по `id` элемента.
+/// Узел, запись или документ вложения, найденные по `id` элемента.
 enum Located {
     Node(NodeScope),
     Entry(EntryScope),
+    /// Документ вложения и каноническая ссылка (`a:<chunk>`, `b:<sha256>`, `d:<id>`).
+    Attachment(Box<AttachmentScope>, String),
 }
 
 fn miss() -> Failure {
     Failure::Item(Fail::new("not_found", None))
 }
 
-/// Префикс ссылки элемента: `n` (узел) или буква записи (`i|c|r|t|k|q|e`) и остаток; без
-/// известного префикса — `(None, raw)`.
+/// Буква ссылки на блоб вложения `b:<sha256>`.
+const BLOB_REF_LETTER: &str = "b";
+/// Буква ссылки на документ вложения `d:<id>` (внутренняя форма `TargetKind::Attachment`).
+const DOC_REF_LETTER: &str = "d";
+
+/// Ссылка на вложение: `a:` (фрагмент), `b:` (блоб), `d:` (документ).
+fn is_doc_letter(k: &str) -> bool {
+    k == CHUNK_REF_LETTER || k == BLOB_REF_LETTER || k == DOC_REF_LETTER
+}
+
+/// Префикс ссылки элемента: `n` (узел), буква записи (`i|c|r|t|k|q|e`) или вложения (`a|b|d`) и
+/// остаток; без известного префикса — `(None, raw)`.
 fn split_ref(raw: &str) -> (Option<&str>, &str) {
     match raw.split_once(':') {
-        Some((k, rest)) if k == "n" || zam_store::is_entry_ref_letter(k) => (Some(k), rest),
+        Some((k, rest)) if k == "n" || zam_store::is_entry_ref_letter(k) || is_doc_letter(k) => {
+            (Some(k), rest)
+        }
         _ => (None, raw),
+    }
+}
+
+/// `id` элемента — ссылка на вложение (`locator` допустим только у неё).
+fn is_doc_ref(raw: &str) -> bool {
+    matches!(split_ref(raw.trim()), (Some(k), _) if is_doc_letter(k))
+}
+
+/// Строка из `n` hex-цифр (регистр не важен) → нижний регистр.
+fn hex_lower(s: &str, n: usize) -> Option<String> {
+    (s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
+}
+
+/// Документ вложения по ссылке `letter:rest`: формат ссылки неверен, документа нет или он
+/// недоступен — одинаково `not_found` (без пояснений: ответ не должен быть оракулом).
+async fn resolve_doc(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    letter: &str,
+    rest: &str,
+) -> Result<Located, Failure> {
+    let lookup = match letter {
+        CHUNK_REF_LETTER => hex_lower(rest, 32).map(DocLookup::Chunk),
+        BLOB_REF_LETTER => hex_lower(rest, 64).map(DocLookup::Blob),
+        _ => rest.parse::<Id>().ok().map(DocLookup::Doc),
+    }
+    .ok_or_else(miss)?;
+    let reference = match &lookup {
+        DocLookup::Chunk(c) => zam_store::chunk_ref(c),
+        DocLookup::Blob(s) => format!("{BLOB_REF_LETTER}:{s}"),
+        DocLookup::Doc(id) => format!("{DOC_REF_LETTER}:{id}"),
+    };
+    match attachment_scope(st, p, headers, lookup).await {
+        Ok(sc) => Ok(Located::Attachment(Box::new(sc), reference)),
+        // неотличимо от несуществующего
+        Err(ApiError::NotFound | ApiError::Forbidden | ApiError::SolutionAccess { .. }) => {
+            Err(miss())
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -284,6 +377,9 @@ async fn resolve(
         }));
     }
     let (prefix, rest) = split_ref(raw);
+    if let Some(k) = prefix.filter(|k| is_doc_letter(k)) {
+        return resolve_doc(st, p, headers, k, rest).await;
+    }
     rest.parse::<Id>().map_err(|_| miss())?;
     match prefix {
         Some("n") => Ok(Located::Node(
@@ -352,7 +448,10 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
         }
     };
     let reference = format!("n:{}", node.id);
-    let stale_refs = stale_of(&sc.db, TargetKind::Node, node.id).await?;
+    let target = TargetRef {
+        kind: TargetKind::Node,
+        id: node.id,
+    };
     Ok(Fetched {
         raw: it.id.clone(),
         head: format!("{reference} {}/{}", sc.space.name, node.path),
@@ -367,16 +466,16 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
         tier,
         rev: node.current_rev,
         max_tokens: it.max_tokens,
-        seen: SeenKey {
+        seen: vec![SeenKey {
             owner_id: sc.owner,
-            target: TargetRef {
-                kind: TargetKind::Node,
-                id: node.id,
-            },
+            target: target.into(),
             part: WHOLE_TARGET.to_string(),
-        },
+        }],
         content,
-        stale_refs,
+        stale_refs: Vec::new(),
+        stale_key: Some((sc.owner, sc.db.clone(), target)),
+        att: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -441,7 +540,10 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
     };
     let (letter, kind) = (e.kind.ref_letter(), e.kind.as_str());
     let reference = format!("{letter}:{}", e.id);
-    let stale_refs = stale_of(&sc.db, TargetKind::Entry, e.id).await?;
+    let target = TargetRef {
+        kind: TargetKind::Entry,
+        id: e.id,
+    };
     let sub = match e.kind {
         EntryKind::Release => None,
         _ => e.data.get("kind").and_then(Value::as_str),
@@ -464,16 +566,16 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
         tier,
         rev: e.rev,
         max_tokens: it.max_tokens,
-        seen: SeenKey {
+        seen: vec![SeenKey {
             owner_id: sc.owner,
-            target: TargetRef {
-                kind: TargetKind::Entry,
-                id: e.id,
-            },
+            target: target.into(),
             part: WHOLE_TARGET.to_string(),
-        },
+        }],
         content,
-        stale_refs,
+        stale_refs: Vec::new(),
+        stale_key: Some((sc.owner, sc.db.clone(), target)),
+        att: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -525,13 +627,329 @@ async fn changes(
     })
 }
 
-/// Пути устаревших ссылок цели на файлы.
-async fn stale_of(db: &zam_store::Db, kind: TargetKind, id: Id) -> Result<Vec<String>, Failure> {
-    let r = TargetRef { kind, id };
-    Ok(zam_store::stale_refs_of(db, &[r])
+/// Пути устаревших ссылок на файлы прочитанных целей — одним запросом на базу (а не на элемент:
+/// отложенное M-7, до 20 запросов на горячем пути MCP).
+async fn fill_stale_refs(fetched: &mut [Result<Fetched, (String, Fail)>]) -> Result<(), ApiError> {
+    let mut by_db: HashMap<Id, (zam_store::Db, Vec<TargetRef>)> = HashMap::new();
+    for f in fetched.iter().flatten() {
+        if let Some((owner, db, r)) = &f.stale_key {
+            by_db
+                .entry(*owner)
+                .or_insert_with(|| (db.clone(), Vec::new()))
+                .1
+                .push(*r);
+        }
+    }
+    let mut stale: HashMap<(Id, TargetRef), Vec<String>> = HashMap::new();
+    for (owner, (db, refs)) in by_db {
+        for (r, paths) in zam_store::stale_refs_of(&db, &refs).await? {
+            stale.insert((owner, r), paths);
+        }
+    }
+    for f in fetched.iter_mut().flatten() {
+        if let Some((owner, _, r)) = f.stale_key.take() {
+            f.stale_refs = stale.remove(&(owner, r)).unwrap_or_default();
+        }
+    }
+    Ok(())
+}
+
+/// Предел частей в оглавлении вложения: документ целиком без `locator` не выдаётся.
+pub const TOC_MAX_ENTRIES: usize = 100;
+/// Предел первой строки части в оглавлении, символов.
+const TOC_LINE_CHARS: usize = 120;
+/// Ревизия выданного вложения (у документа ревизий нет, как у его чанков).
+const DOC_REV: i64 = 0;
+
+/// `locator` элемента: нет (`null`) — `None`; строка неверного формата или не строка — 422
+/// `locator-invalid`.
+fn parse_locator(v: Option<&Value>) -> Result<Option<Locator>, ApiError> {
+    const FORMS: &str = "page:N | slide:N | para:N | sheet:<лист>!A1:F40";
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Locator::parse(s.trim()).map(Some).map_err(|_| {
+            ApiError::LocatorInvalid(format!("locator: неверный формат, нужно {FORMS}"))
+        }),
+        Some(_) => Err(ApiError::LocatorInvalid(format!(
+            "locator — строка: {FORMS}"
+        ))),
+    }
+}
+
+/// Адрес из `locator` чанка: сырой и (если сканер секретов его меняет) замаскированный — лист
+/// из оглавления, где имя замаскировано, тоже находится.
+fn chunk_locators(raw: &str) -> Vec<Locator> {
+    let mut out: Vec<Locator> = Locator::parse(raw).into_iter().collect();
+    let masked = mask_text(raw);
+    if masked != raw
+        && let Ok(l) = Locator::parse(&masked)
+    {
+        out.push(l);
+    }
+    out
+}
+
+/// Чанки документа, относящиеся к `want`: пересечение адресов ([`Locator::overlaps`]); абзац
+/// внутри блока DOCX (номера нет среди начал блоков) — блок с ближайшим меньшим началом.
+fn select(heads: &[zam_store::DocChunkHead], want: &Locator) -> Vec<i64> {
+    let parsed: Vec<(i64, Vec<Locator>)> = heads
+        .iter()
+        .map(|h| {
+            (
+                h.ordinal,
+                h.locator.as_deref().map(chunk_locators).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let hit: Vec<i64> = parsed
+        .iter()
+        .filter(|(_, ls)| ls.iter().any(|l| l.overlaps(want)))
+        .map(|(o, _)| *o)
+        .collect();
+    if !hit.is_empty() {
+        return hit;
+    }
+    let Locator::Para(n) = want else {
+        return hit;
+    };
+    let start = parsed
+        .iter()
+        .flat_map(|(_, ls)| ls.iter())
+        .filter_map(|l| match l {
+            Locator::Para(s) if s <= n => Some(*s),
+            _ => None,
+        })
+        .max();
+    let Some(start) = start else {
+        return hit;
+    };
+    let block = Locator::Para(start);
+    parsed
+        .iter()
+        .filter(|(_, ls)| ls.contains(&block))
+        .map(|(o, _)| *o)
+        .collect()
+}
+
+/// Текст выбранных чанков: подряд, путь заголовков — строкой `[путь]` при смене.
+fn join_chunks(heads: &[zam_store::DocChunkHead], texts: &[(i64, String)]) -> String {
+    let heading: HashMap<i64, &str> = heads
+        .iter()
+        .map(|h| (h.ordinal, h.heading_path.as_str()))
+        .collect();
+    let mut out = String::new();
+    let mut last: Option<&str> = None;
+    for (o, t) in texts {
+        let h = heading.get(o).copied().unwrap_or("");
+        if last != Some(h) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            if !h.is_empty() {
+                out.push_str(&format!("[{h}]\n"));
+            }
+        }
+        out.push_str(t.trim());
+        out.push('\n');
+        last = Some(h);
+    }
+    out
+}
+
+/// Первая непустая строка, не длиннее [`TOC_LINE_CHARS`].
+fn first_line(t: &str) -> String {
+    let line = t
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= TOC_LINE_CHARS {
+        return line.to_string();
+    }
+    let mut s: String = line.chars().take(TOC_LINE_CHARS).collect();
+    s.push('…');
+    s
+}
+
+/// Оглавление документа: части по порядку (страница, слайд, абзац-начало блока; лист — одной
+/// строкой с объединённым диапазоном блоков), первая строка части, подсказка `locator`. Не больше
+/// [`TOC_MAX_ENTRIES`] частей.
+async fn toc(
+    db: &zam_store::Db,
+    att: Id,
+    heads: &[zam_store::DocChunkHead],
+) -> Result<String, Failure> {
+    // (адрес, первый чанк, путь заголовков)
+    let mut parts: Vec<(Locator, i64, &str)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for h in heads {
+        let Some(l) = h.locator.as_deref().and_then(|r| Locator::parse(r).ok()) else {
+            continue;
+        };
+        if let Locator::Sheet { name, .. } = &l {
+            if let Some(last) = parts.last_mut()
+                && let Some(u) = last.0.sheet_union(&l)
+            {
+                last.0 = u;
+                continue;
+            }
+            if !seen.insert(format!("sheet:{name}")) {
+                continue;
+            }
+        } else if !seen.insert(l.render()) {
+            continue;
+        }
+        parts.push((l, h.ordinal, h.heading_path.as_str()));
+    }
+    let shown = parts.len().min(TOC_MAX_ENTRIES);
+    let ordinals = parts[..shown].iter().map(|p| p.1).collect();
+    let firsts: HashMap<i64, String> = doc_chunk_texts(db, att, ordinals, Some(TOC_LINE_CHARS * 4))
         .await?
-        .remove(&r)
-        .unwrap_or_default())
+        .into_iter()
+        .collect();
+    let mut out = format!(
+        "Оглавление: {} частей (locator — первая строка)\n",
+        parts.len()
+    );
+    for (l, o, heading) in &parts[..shown] {
+        let line = firsts.get(o).map(|t| first_line(t)).unwrap_or_default();
+        let head = if heading.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", first_line(heading))
+        };
+        out.push_str(&format!("- {} — {head}{line}\n", mask_text(&l.render())));
+    }
+    if parts.len() > shown {
+        out.push_str(&format!("…ещё {} частей\n", parts.len() - shown));
+    }
+    if let Some((l, _, _)) = parts.first() {
+        out.push_str(&format!(
+            "Часть документа: тот же id и locator из списка (например, \"{}\").\n",
+            mask_text(&l.render())
+        ));
+    }
+    Ok(out)
+}
+
+/// Вложение: текст по `locator` (явному или фрагмента `a:`) либо оглавление.
+async fn fetch_attachment(
+    sc: AttachmentScope,
+    reference: String,
+    it: &ReadItem,
+    tier: Tier,
+    locator: Option<Locator>,
+) -> Result<Fetched, Failure> {
+    let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if section || it.since_rev.is_some() {
+        return Err(Failure::Item(Fail::new(
+            "invalid",
+            Some("section и since_rev к вложению неприменимы: часть документа — locator".into()),
+        )));
+    }
+    let doc = &sc.doc;
+    // фрагмент `a:` без locator — его часть; L0/L1 — оглавление
+    let want = locator.or_else(|| {
+        (tier == Tier::L2)
+            .then(|| {
+                doc.chunk_locator
+                    .as_deref()
+                    .and_then(|r| Locator::parse(r).ok())
+            })
+            .flatten()
+    });
+    let mut parts: Vec<String> = Vec::new();
+    let content = if it.if_rev == Some(DOC_REV) {
+        Content::Unchanged
+    } else {
+        let heads = doc_chunk_heads(&sc.db, doc.id).await?;
+        if heads.is_empty() {
+            return Err(Failure::Item(Fail::new(
+                "not_found",
+                Some(format!(
+                    "текст документа не извлечён ({})",
+                    doc.extract_state.as_str()
+                )),
+            )));
+        }
+        match &want {
+            None => Content::plain(toc(&sc.db, doc.id, &heads).await?, false),
+            Some(w) => {
+                let ordinals = select(&heads, w);
+                if ordinals.is_empty() {
+                    return Err(Failure::Item(Fail::new(
+                        "not_found",
+                        Some(format!(
+                            "в документе нет части {}: оглавление — без locator",
+                            mask_text(&w.render())
+                        )),
+                    )));
+                }
+                // выдаются единицы целиком: в сессии — `locator` каждой (как у карточек поиска)
+                let chosen: HashSet<i64> = ordinals.iter().copied().collect();
+                let mut uniq: HashSet<&str> = HashSet::new();
+                for h in heads.iter().filter(|h| chosen.contains(&h.ordinal)) {
+                    if let Some(l) = &h.locator
+                        && uniq.insert(l)
+                    {
+                        parts.push(l.clone());
+                    }
+                }
+                let texts = doc_chunk_texts(&sc.db, doc.id, ordinals, None).await?;
+                Content::plain(join_chunks(&heads, &texts), true)
+            }
+        }
+    };
+    let mut warnings = Vec::new();
+    if sc.others > 0 {
+        warnings.push(format!(
+            "блоб привязан ещё в {} местах ({} всего): выбрано первое по дате — {}/{}",
+            sc.others,
+            sc.others + 1,
+            sc.space.name,
+            doc.path
+        ));
+    }
+    Ok(Fetched {
+        raw: it.id.clone(),
+        head: format!(
+            "{reference} {}/{} › {}",
+            sc.space.name,
+            doc.path,
+            md_inline(&doc.filename)
+        ),
+        reference,
+        kind: "attachment",
+        space: sc.space.name.clone(),
+        path: Some(doc.path.clone()),
+        title: None,
+        status: None,
+        certainty: None,
+        section: None,
+        tier,
+        rev: DOC_REV,
+        max_tokens: it.max_tokens,
+        seen: parts
+            .into_iter()
+            .map(|part| SeenKey {
+                owner_id: sc.owner,
+                target: SeenTarget::Blob(doc.blob_sha256.clone()),
+                part,
+            })
+            .collect(),
+        content,
+        stale_refs: Vec::new(),
+        stale_key: None,
+        att: Some(AttMeta {
+            file: doc.filename.clone(),
+            attachment_id: doc.id,
+            node_id: doc.node_id,
+            blob_sha256: doc.blob_sha256.clone(),
+            locator: want.as_ref().map(|l| mask_text(&l.render())),
+            locator_text: want.as_ref().map(|l| mask_text(&l.label())),
+        }),
+        warnings,
+    })
 }
 
 async fn fetch(
@@ -540,10 +958,14 @@ async fn fetch(
     headers: &HeaderMap,
     it: &ReadItem,
     tier: Tier,
+    locator: Option<Locator>,
 ) -> Result<Fetched, Failure> {
     match resolve(st, p, headers, &it.id).await? {
         Located::Node(sc) => fetch_node(sc, it, tier).await,
         Located::Entry(sc) => fetch_entry(sc, it, tier).await,
+        Located::Attachment(sc, reference) => {
+            fetch_attachment(*sc, reference, it, tier, locator).await
+        }
     }
 }
 
@@ -554,12 +976,19 @@ fn header(f: &Fetched, tail: &str) -> String {
         line.push_str(" › ");
         line.push_str(s);
     }
+    // вложение: подпись части или «оглавление»; ревизий у документа нет
+    if let Some(a) = &f.att {
+        line.push_str(" · ");
+        line.push_str(a.locator_text.as_deref().unwrap_or("оглавление"));
+    }
     let mut parts: Vec<String> = [&f.status, &f.certainty]
         .into_iter()
         .flatten()
         .cloned()
         .collect();
-    parts.push(format!("rev{}", f.rev));
+    if f.att.is_none() {
+        parts.push(format!("rev{}", f.rev));
+    }
     parts.push(tail.to_string());
     line.push_str(&format!("  {}", parts.join(" · ")));
     line
@@ -696,6 +1125,24 @@ fn item_json(piece: &Piece) -> Value {
         if !f.stale_refs.is_empty() {
             o.insert("stale_refs".into(), json!(f.stale_refs));
         }
+        if let Some(a) = &f.att {
+            o.insert("file".into(), json!(a.file));
+            o.insert("attachment_id".into(), json!(a.attachment_id));
+            o.insert("node_id".into(), json!(a.node_id));
+            o.insert("blob_sha256".into(), json!(a.blob_sha256));
+            match (&a.locator, &a.locator_text) {
+                (Some(l), Some(t)) => {
+                    o.insert("locator".into(), json!(l));
+                    o.insert("locator_text".into(), json!(t));
+                }
+                _ => {
+                    o.insert("toc".into(), json!(true));
+                }
+            }
+        }
+        if !f.warnings.is_empty() {
+            o.insert("warnings".into(), json!(f.warnings));
+        }
     };
     match piece {
         Piece::Err { raw, fail } => {
@@ -756,10 +1203,14 @@ fn push_block(out: &mut String, line: &str) {
     }
 }
 
-/// Строка `(возможно устарело: изменился <путь>)` под заголовком элемента (M4.5 §6.2).
+/// Строка `(возможно устарело: изменился <путь>)` под заголовком элемента (M4.5 §6.2) и
+/// предупреждения элемента (`(warning: …)`).
 fn push_stale(out: &mut String, f: &Fetched) {
     if let Some(s) = super::search::stale_line(&f.stale_refs) {
         push_block(out, &format!("({s})"));
+    }
+    for w in &f.warnings {
+        push_block(out, &format!("(warning: {})", md_inline(w)));
     }
 }
 
@@ -837,12 +1288,15 @@ pub async fn read(
         return Err(ApiError::BadRequest("budget_tokens: больше 0".into()));
     }
     let mut tiers = Vec::with_capacity(req.items.len());
+    let mut locators = Vec::with_capacity(req.items.len());
     for it in &req.items {
-        if it.locator.as_ref().is_some_and(|l| !l.is_null()) {
-            return Err(ApiError::LocatorUnsupported(
-                "locator (страница, лист) поддерживается с этапа M5".into(),
+        let locator = parse_locator(it.locator.as_ref())?;
+        if locator.is_some() && !is_doc_ref(&it.id) {
+            return Err(ApiError::LocatorInvalid(
+                "locator — только у вложений: a:<фрагмент>, b:<sha256>, d:<документ>".into(),
             ));
         }
+        locators.push(locator);
         if it.max_tokens == Some(0) {
             return Err(ApiError::BadRequest("max_tokens: больше 0".into()));
         }
@@ -872,13 +1326,14 @@ pub async fn read(
     };
 
     let mut fetched = Vec::with_capacity(req.items.len());
-    for (it, tier) in req.items.iter().zip(tiers) {
-        fetched.push(match fetch(&st, &p, &headers, it, tier).await {
+    for ((it, tier), locator) in req.items.iter().zip(tiers).zip(locators) {
+        fetched.push(match fetch(&st, &p, &headers, it, tier, locator).await {
             Ok(f) => Ok(f),
             Err(Failure::Item(fail)) => Err((it.id.clone(), fail)),
             Err(Failure::Fatal(e)) => return Err(e),
         });
     }
+    fill_stale_refs(&mut fetched).await?;
     let (pieces, total) = pack(fetched, budget);
 
     if let Some(s) = &session {
@@ -889,12 +1344,13 @@ pub async fn read(
                     f,
                     given_whole: true,
                     ..
-                } => Some(SeenItem {
-                    key: f.seen.clone(),
+                } => Some(f.seen.iter().map(|k| SeenItem {
+                    key: k.clone(),
                     rev: f.rev,
-                }),
+                })),
                 _ => None,
             })
+            .flatten()
             .collect();
         if let Err(e) = mark_seen(&s.db, &s.touch, &given).await {
             tracing::warn!(error = %e, "чтение: отметка выданного сессии не выполнена");
@@ -939,6 +1395,12 @@ mod tests {
             let raw = format!("{p}:01ABC");
             assert_eq!(split_ref(&raw), (Some(p), "01ABC"), "{p}");
         }
+        for p in ["a", "b", "d"] {
+            let raw = format!("{p}:01ABC");
+            assert_eq!(split_ref(&raw), (Some(p), "01ABC"), "{p}");
+            assert!(is_doc_ref(&raw), "{p}");
+        }
+        assert!(!is_doc_ref("n:01ABC") && !is_doc_ref("knowledge:/a"));
         assert_eq!(split_ref("x:01ABC"), (None, "x:01ABC"));
         assert_eq!(split_ref("01ABC"), (None, "01ABC"));
         for k in EntryKind::ALL {

@@ -692,6 +692,72 @@ pub async fn readable_areas(
     Ok(out)
 }
 
+/// Документ вложения, найденный в читаемой области (`/read` `a:|b:|d:`, M5 задача 7).
+pub struct AttachmentScope {
+    /// Чья база.
+    pub owner: Id,
+    pub db: Db,
+    /// Пространство заметки-владельца.
+    pub space: Space,
+    pub doc: zam_store::DocFound,
+    /// Сколько ещё вложений нашлось по ссылке (у `b:` — другие заметки с тем же блобом).
+    pub others: usize,
+}
+
+/// Документ вложения по `lookup` в читаемых областях пользователя запроса ([`readable_areas`]:
+/// личная база — пространства, видимые принципалу, Human по токену — нет; одобренное чужое
+/// решение — только его пространство). У `b:` при нескольких вложениях — первое по дате привязки
+/// (`others` — сколько ещё). Нет документа, он скрыт, вне области или доступ к решению не одобрен —
+/// одинаково `NotFound`, без id владельца и состояния доступа (иначе ответ — оракул). Сбой чужой
+/// базы — пропуск с WARN.
+pub async fn attachment_scope(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    lookup: zam_store::DocLookup,
+) -> Result<AttachmentScope, ApiError> {
+    let user = target_user(st, p, headers).await?;
+    let blob = matches!(lookup, zam_store::DocLookup::Blob(_));
+    let mut best: Option<AttachmentScope> = None;
+    let mut total = 0usize;
+    for area in readable_areas(st, p, &user).await? {
+        let ids = area.spaces.iter().map(|s| s.id).collect();
+        let found = match zam_store::find_docs(&area.db, lookup.clone(), ids).await {
+            Ok(v) => v,
+            Err(e) if area.owner != user.id => {
+                tracing::warn!(owner = %area.owner, error = %e, "база владельца решения недоступна: пропущена");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        total += found.len();
+        let Some(doc) = found.into_iter().next() else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|b| doc.created_at < b.doc.created_at)
+        {
+            let Some(space) = area.spaces.iter().find(|s| s.id == doc.space_id).cloned() else {
+                continue;
+            };
+            best = Some(AttachmentScope {
+                owner: area.owner,
+                db: area.db,
+                space,
+                doc,
+                others: 0,
+            });
+        }
+        if !blob {
+            break;
+        }
+    }
+    let mut b = best.ok_or(ApiError::NotFound)?;
+    b.others = total.saturating_sub(1);
+    Ok(b)
+}
+
 /// Живая запись (удалённая → 404).
 pub fn live_entry(s: &EntryScope) -> Result<(), ApiError> {
     match s.entry.deleted_at {

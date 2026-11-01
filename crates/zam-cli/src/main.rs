@@ -41,7 +41,7 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Прочитать заметки: [space:]path или id; Markdown в stdout как сохранён
+    /// Прочитать заметки: [space:]path или id; Markdown в stdout как сохранён; вложения — a:|b:|d:
     Read {
         #[arg(required = true)]
         targets: Vec<String>,
@@ -70,6 +70,10 @@ enum Cmd {
         /// `unchanged`
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..), conflicts_with = "if_rev")]
         since_rev: Option<i64>,
+        /// Часть вложения (a:|b:|d:): page:12, slide:3, para:40, sheet:Лист!A1:F40; без него —
+        /// оглавление
+        #[arg(long)]
+        locator: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -1291,9 +1295,11 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             budget,
             if_rev,
             since_rev,
+            locator,
             common,
         } => {
             let o = cmd::read::Opts {
+                locator: locator.as_deref(),
                 tier: tier.as_deref(),
                 section: section.as_deref(),
                 rev,

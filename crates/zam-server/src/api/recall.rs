@@ -1874,7 +1874,7 @@ async fn error_hints(
 fn seen_key(targets: &[SearchTarget], c: &Cand) -> SeenKey {
     SeenKey {
         owner_id: targets[c.target].owner,
-        target: c.tref,
+        target: c.tref.into(),
         part: RECALL_PART.to_string(),
     }
 }

@@ -40,10 +40,11 @@ pub mod vault;
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use attachments::{
     AttachmentDoc, BLOB_MISSING, CHUNK_REF_LETTER, CHUNKER_ATTACHMENTS_KEY, CachedExtract,
-    DocIntake, ExtractEnd, ExtractState, ExtractTarget, PDFIUM_UNAVAILABLE, ReindexAttachment,
-    TOO_LARGE, attachment_chunk_owner, attachment_chunker_fingerprint, attachment_chunks_for_index,
-    attachment_pieces, cached_extract, chunk_ref, detach, enqueue_attachment_upserts,
-    ensure_extract_jobs, error_code, extract_cached, extract_target, finish_extract,
+    DocChunkHead, DocFound, DocIntake, DocLookup, ExtractEnd, ExtractState, ExtractTarget,
+    PDFIUM_UNAVAILABLE, ReindexAttachment, TOO_LARGE, attachment_chunk_owner,
+    attachment_chunker_fingerprint, attachment_chunks_for_index, attachment_pieces, cached_extract,
+    chunk_ref, detach, doc_chunk_heads, doc_chunk_texts, enqueue_attachment_upserts,
+    ensure_extract_jobs, error_code, extract_cached, extract_target, find_docs, finish_extract,
     has_attachment_chunks, has_failed_with, list_attachments, put_extract, put_extract_failure,
     rechunk_docs_if_stale, reindex_attachments_page, reindex_docs, replace_attachment_chunks,
     requeue_failed_with, set_extract_state,
@@ -125,7 +126,7 @@ pub use search::{
     query_needles, query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use sessions::{
-    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch,
+    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,
     TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
     add_tokens, check_session_id, end_session, gc_sessions, get_session, latest_session,
     list_sessions, mark_seen, mark_seen_with_tokens, seen_revs, session_tokens, touch_session,

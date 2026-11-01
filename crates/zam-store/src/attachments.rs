@@ -117,6 +117,138 @@ pub async fn attachment_chunk_owner(
     })
     .await
 }
+
+/// Как `/read` ищет документ вложения (M5, задача 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocLookup {
+    /// Фрагмент `a:<chunk_id>` — его документ.
+    Chunk(String),
+    /// Документ `d:<id>`.
+    Doc(Id),
+    /// Блоб `b:<sha256>` — его вложения (64 hex в нижнем регистре).
+    Blob(String),
+}
+
+/// Живой документ вложения, найденный для `/read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocFound {
+    pub id: Id,
+    pub node_id: Id,
+    pub space_id: Id,
+    /// Путь заметки-владельца.
+    pub path: String,
+    pub filename: String,
+    pub blob_sha256: String,
+    pub extract_state: ExtractState,
+    /// Время привязки (первое по дате — у `b:` с несколькими вложениями).
+    pub created_at: Timestamp,
+    /// Сырой `locator` фрагмента ([`DocLookup::Chunk`]); у прочих — `None`.
+    pub chunk_locator: Option<String>,
+}
+
+/// Живые документы (`attachment_docs.deleted_at IS NULL`) живых заметок пространств `spaces` по
+/// `lookup`, по дате привязки. Чужие пространства, удалённые узлы и откреплённые документы не
+/// отличаются от несуществующих (пустой ответ). Права на `spaces` проверяет вызывающий.
+pub async fn find_docs(
+    db: &Db,
+    lookup: DocLookup,
+    spaces: Vec<Id>,
+) -> Result<Vec<DocFound>, StoreError> {
+    if spaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list =
+        serde_json::Value::from(spaces.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let (filter, key, chunk) = match &lookup {
+            DocLookup::Chunk(id) => ("ch.id = ?2", id.clone(), "ch.locator"),
+            DocLookup::Doc(id) => ("ad.id = ?2", id.to_string(), "NULL"),
+            DocLookup::Blob(sha) => ("ad.blob_sha256 = ?2", sha.clone(), "NULL"),
+        };
+        let join = match lookup {
+            DocLookup::Chunk(_) => "JOIN chunks ch ON ch.attachment_id = ad.id",
+            _ => "",
+        };
+        let mut st = c.prepare(&format!(
+            "SELECT ad.id, ad.node_id, n.space_id, n.path, ad.filename, ad.blob_sha256,
+                    ad.extract_state, ad.created_at, {chunk}
+             FROM attachment_docs ad JOIN nodes n ON n.id = ad.node_id {join}
+             WHERE {filter} AND ad.deleted_at IS NULL AND n.deleted_at IS NULL
+               AND n.space_id IN (SELECT value FROM json_each(?1))
+             ORDER BY ad.created_at, ad.id"
+        ))?;
+        let rows = st.query_map(params![list, key], |r| {
+            Ok(DocFound {
+                id: r.get(0)?,
+                node_id: r.get(1)?,
+                space_id: r.get(2)?,
+                path: r.get(3)?,
+                filename: r.get(4)?,
+                blob_sha256: r.get(5)?,
+                extract_state: r.get(6)?,
+                created_at: ts_at(r, 7)?,
+                chunk_locator: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
+}
+
+/// Чанк документа вложения без текста: порядок, сырой `locator`, путь заголовков (маскирован).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocChunkHead {
+    pub ordinal: i64,
+    pub locator: Option<String>,
+    pub heading_path: String,
+}
+
+/// Чанки документа `att` без текста, по порядку (`/read`: выбор по `locator`, оглавление).
+pub async fn doc_chunk_heads(db: &Db, att: Id) -> Result<Vec<DocChunkHead>, StoreError> {
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT ordinal, locator, heading_path FROM chunks INDEXED BY chunks_attachment
+             WHERE attachment_id IS NOT NULL AND attachment_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = st.query_map([att], |r| {
+            Ok(DocChunkHead {
+                ordinal: r.get(0)?,
+                locator: r.get(1)?,
+                heading_path: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
+}
+
+/// Тексты чанков `ordinals` документа `att` (секреты замаскированы при нарезке), по порядку;
+/// `max_chars` — только первые символы (первая строка оглавления).
+pub async fn doc_chunk_texts(
+    db: &Db,
+    att: Id,
+    ordinals: Vec<i64>,
+    max_chars: Option<usize>,
+) -> Result<Vec<(i64, String)>, StoreError> {
+    if ordinals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = serde_json::Value::from(ordinals).to_string();
+    let max = max_chars.map_or(-1, |m| i64::try_from(m).unwrap_or(i64::MAX));
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT ordinal, CASE WHEN ?3 < 0 THEN text ELSE substr(text, 1, ?3) END
+             FROM chunks INDEXED BY chunks_attachment
+             WHERE attachment_id IS NOT NULL AND attachment_id = ?1
+               AND ordinal IN (SELECT value FROM json_each(?2))
+             ORDER BY ordinal",
+        )?;
+        let rows = st.query_map(params![att, list, max], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
+}
+
 /// Ревизия заданий и чанков вложения: у документа ревизий нет (содержимое блоба неизменно).
 const DOC_REV: i64 = 0;
 /// Уровень сжатия zstd `blob_extract.units`: быстрый, текст сжимается в 3–5 раз.

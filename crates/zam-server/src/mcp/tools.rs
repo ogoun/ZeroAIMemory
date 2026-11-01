@@ -83,9 +83,10 @@ impl ToolName {
                  insight_kinds, file — знание о файле, decided_by. Дальше — memory_read."
             }
             ToolName::Read => {
-                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id> или путь <пространство>:/<путь>. \
-                 tier L0|L1|L2, section, max_tokens; if_rev равна текущей — unchanged без текста; \
-                 since_rev — дифф изменений с ревизии. Ошибка по элементу — в самом элементе."
+                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id>, путь <пространство>:/<путь>; \
+                 вложение — a:<id> или b:<sha256>, locator page:N|slide:N|para:N|sheet:Лист!A1:F40, \
+                 без него — оглавление. tier, section, max_tokens; if_rev — unchanged; since_rev — \
+                 дифф. Ошибка — в элементе."
             }
             ToolName::CachePut => {
                 "Сохранить выжимку ответа на запрос (до 600 токенов) с источниками [{id, rev?, \
@@ -174,6 +175,8 @@ impl ToolName {
                             "if_rev": {"type": "integer"},
                             "since_rev": {"type": "integer", "minimum": 1,
                                           "description": "дифф с этой ревизии"},
+                            "locator": {"type": "string",
+                                        "description": "часть вложения: page:12, sheet:Итоги!A1:F40"},
                         },
                         "required": ["id"],
                     }},

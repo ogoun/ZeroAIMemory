@@ -222,10 +222,10 @@ use zam_search::{
 use zam_store::time::fmt_ts;
 use zam_store::{
     AttachmentHit, ChunkScope, Db, EntryKind, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START,
-    SeenItem, SeenKey, Space, SpaceKind, StoreError, TargetFilter, WHOLE_TARGET, chunk_ref,
-    count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_targets, live_chunks,
-    live_folders, mark_seen, neighbor_leaves, node_content, pending_count, query_needles,
-    search_fts_channels, seen_revs, text_snippet, touch_session,
+    SeenItem, SeenKey, SeenTarget, Space, SpaceKind, StoreError, TargetFilter, WHOLE_TARGET,
+    chunk_ref, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_targets,
+    live_chunks, live_folders, mark_seen, neighbor_leaves, node_content, pending_count,
+    query_needles, search_fts_channels, seen_revs, text_snippet, touch_session,
 };
 
 use self::merge::merge_channels;
@@ -1850,32 +1850,40 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
 }
 
 /// Ключ выданного: владелец базы цели элемента, цель и часть — `chunk_id` или
-/// [`WHOLE_TARGET`] (решение контроллера R11).
+/// [`WHOLE_TARGET`] (решение контроллера R11). Фрагмент вложения — цель-блоб по sha256 (M5,
+/// задача 7: один файл в двух заметках — одна цель), часть — `chunk_id` или `locator`,
+/// прочитанный через `/read` целиком.
 fn seen_key(targets: &[SearchTarget], it: &Item, part: &str) -> SeenKey {
+    let target = match &it.hit.attachment {
+        Some(a) => SeenTarget::Blob(a.blob_sha256.clone()),
+        None => it.hit.target.into(),
+    };
     SeenKey {
         owner_id: targets[it.target].owner,
-        target: it.hit.target,
+        target,
         part: part.to_string(),
     }
 }
 
-/// Элемент учитывается в `session_seen`: не карточка папки и не вложение (ключ выданного
-/// вложения — блоб и `locator`, задача 7 M5; `TargetKind::Attachment` хранилище не примет).
+/// Элемент учитывается в `session_seen`: не карточка папки.
 fn seen_tracked(it: &Item) -> bool {
-    it.folder.is_none() && it.hit.target.kind != TargetKind::Attachment
+    it.folder.is_none()
 }
 
 /// Помечает элементы, уже выданные сессии в той же ревизии (`seen`), и снимает их текст:
-/// выдана цель целиком или все чанки элемента (`chunk_ids`).
+/// выдана цель целиком, все чанки элемента (`chunk_ids`) или — у вложения — его `locator`
+/// (`/read` отдал единицу документа целиком).
 async fn mark_seen_items(
     s: &RequestSession,
     targets: &[SearchTarget],
     items: &mut [Item],
 ) -> Result<(), StoreError> {
+    let locator = |it: &Item| it.hit.attachment.as_ref().and_then(|a| a.locator.clone());
     let parts = |it: &Item| -> Vec<SeenKey> {
-        std::iter::once(WHOLE_TARGET)
-            .chain(it.chunk_ids.iter().map(String::as_str))
-            .map(|part| seen_key(targets, it, part))
+        std::iter::once(WHOLE_TARGET.to_string())
+            .chain(locator(it))
+            .chain(it.chunk_ids.iter().cloned())
+            .map(|part| seen_key(targets, it, &part))
             .collect()
     };
     let keys: Vec<SeenKey> = items
@@ -1887,7 +1895,8 @@ async fn mark_seen_items(
     let same = |k: &SeenKey, rev: i64| revs.get(k) == Some(&rev);
     for it in items.iter_mut().filter(|it| seen_tracked(it)) {
         let rev = it.hit.rev;
-        let whole = same(&seen_key(targets, it, WHOLE_TARGET), rev);
+        let whole = same(&seen_key(targets, it, WHOLE_TARGET), rev)
+            || locator(it).is_some_and(|l| same(&seen_key(targets, it, &l), rev));
         let chunks = !it.chunk_ids.is_empty()
             && it
                 .chunk_ids
