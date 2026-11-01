@@ -187,7 +187,8 @@ pub async fn upsert_200_and_search_finds_itself_first(idx: &dyn VectorIndex) {
         .await
         .unwrap();
     assert!(!hits.is_empty());
-    assert!(hits.len() <= 60);
+    // итоговый лимит — 60 и окно prefetch вложений (растёт на него, как у папок; M5 задача 6)
+    assert!(hits.len() <= 60 + zam_index::ATTACH_PREFETCH);
     assert_eq!(hits[0].chunk_id, "chunk-77");
     assert_eq!(hits[0].target, node_ref(node));
     assert_eq!(hits[0].user_id, ctx.user);

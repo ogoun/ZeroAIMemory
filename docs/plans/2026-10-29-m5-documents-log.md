@@ -1162,7 +1162,15 @@ BASE 52f6b8a. Поиск находит фрагменты DOCX/PDF/XLSX/PPTX (�
   `logs/zam-server.log*`) — перед `kill` в `mcp.rs` (строка `DEBUG`), и в том же шаблоне
   «журнал после kill» — `vault.rs` (`vault_values_not_in_fts_qdrant_logs`) и `m3_acceptance.rs` (два места,
   `has_server_log`): ждут непустой журнал.
-- Проверки: см. «Задача 6 — итог раунда 1» ниже.
+- Проверки (Windows, MiniLM + Qdrant + pdfium, `ZAM_REQUIRE_ML=1`): `cargo fmt --check`, `cargo clippy
+  --workspace --all-targets -D warnings`, `clippy -p zam-index --features edge` — чисто; `-p zam-index`:
+  lib 38, `qdrant` 30 (+2 случая), `edge` 25 (+2; 1 ignored), `worker` 16 (2 ignored), `supervisor` 15;
+  `upsert_200_and_search_finds_itself_first` — граница выдачи `60 + ATTACH_PREFETCH` (лимит
+  слияния растёт на окно вложений); `-p zam-store`: lib 75, `attachments` 16 (+1), `search` 23;
+  `-p zam-server`: lib 194, `attachments_search` 7 (+1), `attachments_index` 13, `search` 13, `hybrid`
+  7, `cache_api` 8, `mcp` 20 (`mcp_vault_value_not_in_debug_log` — 5 прогонов подряд зелёные),
+  `vault` 19, `m3_acceptance` 3, `search_multi` 9; `-p zam-cli`: `search_attachments` 1 (без SKIP),
+  `repo_clean` 1.
 
 ## Решения
 
