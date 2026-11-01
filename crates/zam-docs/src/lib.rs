@@ -5,20 +5,28 @@
 //! частичный результат и предупреждение `truncated: <лимит>`, а не ошибку.
 //!
 //! Модули: [`sniff`] — вид по сигнатуре, затем по расширению; `ooxml` — общий разбор zip и XML
-//! с лимитами; `docx`, `pptx` — форматы Office Open XML; `text` — простой текст.
+//! с лимитами; `docx`, `pptx` — форматы Office Open XML; `text` — простой текст; `sheet` —
+//! таблицы (`xlsx`, `ods` на `ooxml`, `xls` на `cfb`, `csv`) и превью листа [`sheet_page`].
 
+mod cfb;
+mod csv;
 mod ctx;
 mod docx;
 mod locator;
+mod ods;
 mod ooxml;
 mod pptx;
+mod sheet;
 mod sniff;
 mod text;
+mod xls;
+mod xlsx;
 
 use std::time::Instant;
 
 pub use ctx::HEADING_PATH_MAX_CHARS;
 pub use locator::Locator;
+pub use sheet::{SheetPage, sheet_page};
 pub use sniff::sniff;
 
 /// Версия извлечения: смена правил разбора — перенарезка вложений (кэш по `blob_sha256`).
@@ -66,9 +74,10 @@ pub struct Limits {
     pub max_entries: u32,
     /// Глубина вложенности XML.
     pub max_xml_depth: u32,
-    /// Ячеек листа (таблицы).
+    /// Непустых ячеек листа; заодно — число общих строк книги и ячеек страницы превью.
     pub max_cells: u64,
-    /// Символов текста документа.
+    /// Объём выдачи, символов: текст единиц вместе с путями заголовков и 64 служебными
+    /// символами на единицу.
     pub max_chars: u64,
     /// Страниц PDF.
     pub max_pages: u32,
@@ -146,10 +155,11 @@ pub fn extract(
         DocKind::Docx => docx::extract(bytes, &mut ctx)?,
         DocKind::Pptx => pptx::extract(bytes, &mut ctx)?,
         DocKind::Text => text::extract(bytes, &mut ctx),
-        // таблицы — задача 2 этапа M5, PDF — рабочий процесс (задача 3)
-        DocKind::Pdf | DocKind::Xlsx | DocKind::Xls | DocKind::Ods | DocKind::Csv => {
-            return Err(DocError::Unsupported);
+        DocKind::Xlsx | DocKind::Xls | DocKind::Ods | DocKind::Csv => {
+            sheet::extract(kind, bytes, &mut ctx)?
         }
+        // PDF — только рабочий процесс (задача 3)
+        DocKind::Pdf => return Err(DocError::Unsupported),
     };
     Ok(Extracted {
         kind,

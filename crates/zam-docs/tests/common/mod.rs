@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod sheets;
+
 use std::io::Write;
 
 use zip::write::SimpleFileOptions;

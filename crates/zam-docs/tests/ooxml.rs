@@ -612,19 +612,30 @@ fn locator_render_parse_roundtrip() {
 }
 
 #[test]
-fn pdf_and_tables_not_here() {
-    for kind in [
-        DocKind::Pdf,
-        DocKind::Xlsx,
-        DocKind::Xls,
-        DocKind::Ods,
-        DocKind::Csv,
-    ] {
-        assert_eq!(
-            extract(kind, b"%PDF-1.7", &Limits::default(), far()),
-            Err(DocError::Unsupported)
-        );
-    }
+fn pdf_not_here() {
+    assert_eq!(
+        extract(DocKind::Pdf, b"%PDF-1.7", &Limits::default(), far()),
+        Err(DocError::Unsupported)
+    );
+}
+
+#[test]
+fn heading_unicode_spaces_collapsed() {
+    // NBSP, U+3000, U+2003 и табуляция в заголовке схлопываются, как у `split_whitespace`
+    let body = format!(
+        "{}{}",
+        ps(
+            "Heading1",
+            "\u{a0}Раздел\u{a0}\u{a0}один\u{3000}\tдва\u{2003}"
+        ),
+        p("текст")
+    );
+    let x = run(
+        DocKind::Docx,
+        &docx_with(&body, &style("Heading1", "heading 1", None), None, None),
+    );
+    assert_eq!(x.units[0].heading_path, vec!["Раздел один два".to_string()]);
+    assert_eq!(x.units[0].text, "Раздел один два\n\nтекст");
 }
 
 #[test]

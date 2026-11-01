@@ -167,15 +167,20 @@ pub(crate) fn path_label<'a>(parts: impl IntoIterator<Item = &'a str>) -> String
     out
 }
 
-/// Пробельные символы ASCII схлопываются в один пробел и обрезаются по краям — на месте, без
-/// копии (байты не-ASCII не меняются, поэтому UTF-8 остаётся верным).
-pub(crate) fn collapse_ascii_ws(s: &mut String) {
+/// Пробельные символы (юникодные, как `split_whitespace`: NBSP, U+3000…) схлопываются в один
+/// пробел и обрезаются по краям — на месте, без копии: символ пишется не правее, чем читается.
+pub(crate) fn collapse_ws(s: &mut String) {
     let mut b = std::mem::take(s).into_bytes();
-    let (mut w, mut space) = (0usize, false);
-    for r in 0..b.len() {
-        let c = b[r];
-        if c.is_ascii_whitespace() {
+    let (mut w, mut r, mut space) = (0usize, 0usize, false);
+    while r < b.len() {
+        let len = utf8_len(b[r]).min(b.len() - r);
+        let ws = std::str::from_utf8(&b[r..r + len])
+            .ok()
+            .and_then(|c| c.chars().next())
+            .is_some_and(char::is_whitespace);
+        if ws {
             space = w > 0;
+            r += len;
             continue;
         }
         if space {
@@ -183,11 +188,22 @@ pub(crate) fn collapse_ascii_ws(s: &mut String) {
             w += 1;
             space = false;
         }
-        b[w] = c;
-        w += 1;
+        b.copy_within(r..r + len, w);
+        w += len;
+        r += len;
     }
     b.truncate(w);
     *s = String::from_utf8(b).unwrap_or_default();
+}
+
+/// Длина символа UTF-8 по первому байту.
+fn utf8_len(first: u8) -> usize {
+    match first {
+        0xF0.. => 4,
+        0xE0.. => 3,
+        0xC0.. => 2,
+        _ => 1,
+    }
 }
 
 /// Сборщик единиц: блоки текста под одним путём заголовков до [`UNIT_SOFT_CHARS`].
@@ -277,10 +293,18 @@ impl Units {
         if text.is_empty() {
             return;
         }
+        // путь, имя листа в адресе и служебный вес — до текста: выдача не выходит за `max_chars`
+        let mut path_chars: u64 = heading_path.iter().map(|h| h.chars().count() as u64).sum();
+        if let Locator::Sheet { name, range } = &locator {
+            path_chars += (name.chars().count() + range.len()) as u64;
+        }
+        if ctx.chars.saturating_add(path_chars + UNIT_OVERHEAD_CHARS) >= ctx.limits.max_chars {
+            ctx.stop("max_chars");
+            return;
+        }
+        ctx.charge(path_chars + UNIT_OVERHEAD_CHARS);
         ctx.take_chars(&mut text);
         if !text.is_empty() {
-            let path_chars: u64 = heading_path.iter().map(|h| h.chars().count() as u64).sum();
-            ctx.charge(path_chars + UNIT_OVERHEAD_CHARS);
             self.units.push(Unit {
                 locator,
                 heading_path,

@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ctx::{Ctx, UNIT_SOFT_CHARS, Units, collapse_ascii_ws, trim_in_place};
+use crate::ctx::{Ctx, UNIT_SOFT_CHARS, Units, collapse_ws, trim_in_place};
 use crate::ooxml::{Ev, Package, Table, Xml, attr_ns, local, on};
 use crate::{DocError, Locator, Unit};
 
@@ -411,7 +411,7 @@ impl<'s> Body<'s> {
         // дописывается маркер
         match level {
             Some(l) => {
-                collapse_ascii_ws(&mut text);
+                collapse_ws(&mut text);
                 if !text.is_empty() {
                     self.units.heading(l, text, at, ctx);
                 }
