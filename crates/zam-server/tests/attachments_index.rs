@@ -1048,3 +1048,40 @@ async fn failing_file_parsed_once_for_many_attachments() {
     assert_eq!(failed, 4, "{}", s["failed_items"]);
     a.st.shutdown().await;
 }
+
+/// Ревью задачи 5, раунд 2 (m-1): документ, блоб которого уже разбирается, не занимает слот
+/// разбора в ожидании: при единственном слоте и захваченном блобе одного пользователя
+/// маленький файл другого пользователя извлекается сразу.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_blob_does_not_hold_parse_slot() {
+    let a = api("att-busy-blob", |c| c.docs.workers = 1).await;
+    let alice = a.st.admin_id;
+    let (bob, bob_token) = a.new_user("bob").await;
+    let bob: Id = bob.parse().unwrap();
+    let data = csv(&["Альфа;занятый блоб"]);
+    let sha = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(&data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let hold = a.st.docs.hold_blob(alice, &sha).expect("блоб свободен");
+    let na = note_as(&a, &a.token, "knowledge", "busy/a", "# A\n").await;
+    upload(&a, &a.token, &na, "a.csv", &data).await;
+    // задание Алисы выдано и отложено (блоб занят), слот свободен
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let nb = note_as(&a, &bob_token, "knowledge", "busy/b", "# B\n").await;
+    upload(&a, &bob_token, &nb, "b.csv", &csv(&["Бета;малый файл"])).await;
+    wait_doc(&a, bob, &nb, "b.csv", ExtractState::Done).await;
+    assert_eq!(
+        docs(&a, alice, &na).await[0].extract_state,
+        ExtractState::Pending,
+        "блоб Алисы занят — документ ждёт в очереди"
+    );
+    assert_eq!(a.st.docs.status().running, 0, "слот не занят ожиданием");
+    drop(hold);
+    a.st.docs.notify();
+    wait_doc(&a, alice, &na, "a.csv", ExtractState::Done).await;
+    a.st.shutdown().await;
+}

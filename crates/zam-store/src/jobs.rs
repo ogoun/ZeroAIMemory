@@ -640,6 +640,30 @@ pub(crate) fn give_up_in(
     Ok(JobOutcome::Failed)
 }
 
+/// Возвращает выдачу `claim_gen` задания `id` в очередь без неудачи, как [`release_job`], но не
+/// раньше чем через `delay` (конвейер документов: блоб задания уже разбирается в другом слоте).
+pub async fn defer_job(
+    db: &Db,
+    id: i64,
+    claim_gen: i64,
+    delay: std::time::Duration,
+) -> Result<JobOutcome, StoreError> {
+    db.write(move |tx| {
+        if claimed(tx, id, claim_gen)?.is_none() {
+            return Ok(JobOutcome::Stale);
+        }
+        let now = Timestamp::now();
+        let at = now + SignedDuration::try_from(delay).unwrap_or(SignedDuration::from_secs(1));
+        tx.execute(
+            "UPDATE index_jobs SET state = 'queued', dirty = 0, not_before = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![id, fmt_ts(at), fmt_ts(now)],
+        )?;
+        Ok(JobOutcome::Requeued)
+    })
+    .await
+}
+
 /// Число живых заметок, записей журналов и извлечённых документов вложений (не Human), уже
 /// проиндексированных: есть ли что терять, если коллекция Qdrant создана заново (тогда нужен
 /// reindex из `embeddings`).

@@ -1018,3 +1018,62 @@ async fn finish_extract_one_failed_row_and_points_after_same_chunks() {
         "done и та же нарезка — без задания"
     );
 }
+
+/// Ревью задачи 5, раунд 2 (m-3): полный reindex — способ повтора разбора: закэшированные
+/// неудачи блобов (`blob_extract` `failed`/`unsupported`) снимаются, документы `failed` и
+/// `unsupported` снова `pending` с заданием; `too_large` остаётся.
+#[tokio::test]
+async fn full_reindex_drops_cached_failures() {
+    use zam_store::{CachedExtract, cached_extract, enqueue_reindex, put_extract_failure};
+    let env = setup("reindex-failures").await;
+    let n = note(&env.db, env.k, "n", "текст").await;
+    let bad = put_attach(&env, n, b"bad docx", "bad.docx", Some(DocKind::Docx)).await;
+    let odd = put_attach(&env, n, b"odd", "odd.xlsx", Some(DocKind::Xlsx)).await;
+    put_attach_max(
+        &env,
+        n,
+        b"too large text",
+        "big.txt",
+        Some(DocKind::Text),
+        4,
+    )
+    .await;
+    put_extract_failure(&env.db, &bad, Some("parse_error: xml (word/document.xml)"))
+        .await
+        .unwrap();
+    put_extract_failure(&env.db, &odd, None).await.unwrap();
+    assert_eq!(
+        cached_extract(&env.db, &bad).await.unwrap(),
+        Some(CachedExtract::Failed(
+            "parse_error: xml (word/document.xml)".into()
+        ))
+    );
+    assert_eq!(
+        cached_extract(&env.db, &odd).await.unwrap(),
+        Some(CachedExtract::Unsupported)
+    );
+    let docs = list_attachments(&env.db, n).await.unwrap();
+    let (b, o) = (doc_of(&docs, "bad.docx").id, doc_of(&docs, "odd.xlsx").id);
+    set_extract_state(&env.db, b, ExtractState::Failed, Some("parse_error: xml"))
+        .await
+        .unwrap();
+    set_extract_state(&env.db, o, ExtractState::Unsupported, None)
+        .await
+        .unwrap();
+    drop_jobs(&env.db).await;
+    enqueue_reindex(&env.db, None).await.unwrap();
+    assert_eq!(cached_extract(&env.db, &bad).await.unwrap(), None);
+    assert_eq!(cached_extract(&env.db, &odd).await.unwrap(), None);
+    let docs = list_attachments(&env.db, n).await.unwrap();
+    for name in ["bad.docx", "odd.xlsx"] {
+        let d = doc_of(&docs, name);
+        assert_eq!(d.extract_state, ExtractState::Pending, "{name}");
+        assert_eq!(
+            active_job(&env.db, "attachment", d.id).await.as_deref(),
+            Some("upsert"),
+            "{name}"
+        );
+    }
+    let big = doc_of(&docs, "big.txt");
+    assert_eq!(big.extract_error.as_deref(), Some("too_large"));
+}

@@ -52,7 +52,7 @@ use zam_docs::{DocError, DocKind, Limits};
 use zam_store::{
     BLOB_MISSING, BlobStore, CachedExtract, Db, ExtractEnd, ExtractState, Job, JobOutcome,
     PDFIUM_UNAVAILABLE, StoreError, SystemStore, TOO_LARGE, UserDbs, cached_extract,
-    claim_extract_jobs, complete_job, ensure_extract_jobs, extract_target, fail_job,
+    claim_extract_jobs, complete_job, defer_job, ensure_extract_jobs, extract_target, fail_job,
     finish_extract, has_failed_with, put_extract, put_extract_failure, requeue_failed_with,
     requeue_running_extract,
 };
@@ -67,6 +67,8 @@ const BAD_USER_RETRY: Duration = Duration::from_secs(60);
 /// Сколько ждать незаконченные разборы при остановке (затем задания остаются `running` и
 /// возвращаются в очередь при следующем запуске).
 const STOP_WAIT: Duration = Duration::from_secs(5);
+/// Через сколько снова выдать задание документа, блоб которого разбирается в другом слоте.
+const BLOB_BUSY_RETRY: Duration = Duration::from_secs(1);
 
 /// Блоб пользователя: `(пользователь, sha256)`.
 type BlobKey = (Id, String);
@@ -108,8 +110,8 @@ struct Inner {
     /// pdfium загружается (проверка `ping` при запуске — один раз, только если есть документы,
     /// не извлечённые из-за его отсутствия).
     pdfium_ok: tokio::sync::OnceCell<bool>,
-    /// Захваты блобов на время разбора ([`lock_blob`]).
-    blob_locks: Mutex<HashMap<BlobKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// Блобы, которые сейчас разбираются ([`try_lock_blob`]).
+    blob_locks: Mutex<HashSet<BlobKey>>,
 }
 
 /// Конвейер индексации вложений сервера; дёшево клонируется через `Arc`.
@@ -265,6 +267,25 @@ async fn run(inner: Arc<Inner>, mut stop: watch::Receiver<bool>) {
                 }
             };
             for job in jobs {
+                // блоб уже разбирается в другом слоте — задание обратно в очередь, слот не занят
+                let sha = match extract_target(&db, job.target_id).await {
+                    Ok(Some(t)) => Some(t.blob_sha256),
+                    _ => None,
+                };
+                let blob = match sha {
+                    Some(sha) => match try_lock_blob(&inner, user, &sha) {
+                        Some(g) => Some(g),
+                        None => {
+                            if let Err(e) =
+                                defer_job(&db, job.id, job.claim_gen, BLOB_BUSY_RETRY).await
+                            {
+                                tracing::warn!(job = job.id, error = %e, "задание извлечения не отложено");
+                            }
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 let Ok(permit) = slots.clone().acquire_owned().await else {
                     break;
                 };
@@ -274,6 +295,7 @@ async fn run(inner: Arc<Inner>, mut stop: watch::Receiver<bool>) {
                     inner.running.fetch_add(1, Ordering::SeqCst);
                     process(&inner, user, &db, job).await;
                     inner.running.fetch_sub(1, Ordering::SeqCst);
+                    drop(blob);
                     drop(permit);
                 });
             }
@@ -407,38 +429,38 @@ async fn sniff(
     .map_err(std::io::Error::other)?
 }
 
-/// Захват блоба `sha` пользователя `user` на время разбора: второй документ того же файла ждёт
-/// первого и берёт результат из кэша, а не разбирает файл параллельно во втором слоте.
-async fn lock_blob<'a>(inner: &'a Inner, user: Id, sha: &str) -> BlobGuard<'a> {
+/// Захват блоба `sha` пользователя `user` на время разбора без ожидания: `None` — блоб уже
+/// разбирается. Второй документ того же файла не ждёт в слоте, а возвращается в очередь
+/// ([`BLOB_BUSY_RETRY`]) и потом берёт результат из кэша — слот достаётся другому файлу.
+fn try_lock_blob(inner: &Arc<Inner>, user: Id, sha: &str) -> Option<BlobGuard> {
     let key = (user, sha.to_string());
-    let m = lock(&inner.blob_locks)
-        .entry(key.clone())
-        .or_default()
-        .clone();
-    let guard = m.clone().lock_owned().await;
-    BlobGuard {
-        inner,
-        key,
-        _guard: guard,
-        lock: m,
+    lock(&inner.blob_locks)
+        .insert(key.clone())
+        .then(|| BlobGuard {
+            inner: inner.clone(),
+            key,
+        })
+}
+
+/// Захват блоба ([`try_lock_blob`]); освобождается при удалении.
+pub struct BlobGuard {
+    inner: Arc<Inner>,
+    key: BlobKey,
+}
+
+impl Drop for BlobGuard {
+    fn drop(&mut self) {
+        lock(&self.inner.blob_locks).remove(&self.key);
     }
 }
 
-/// Захват блоба ([`lock_blob`]); при освобождении последний захват снимает запись карты.
-struct BlobGuard<'a> {
-    inner: &'a Inner,
-    key: (Id, String),
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-    lock: Arc<tokio::sync::Mutex<()>>,
-}
-
-impl Drop for BlobGuard<'_> {
-    fn drop(&mut self) {
-        let mut map = lock(&self.inner.blob_locks);
-        // карта и этот захват — больше ссылок нет
-        if Arc::strong_count(&self.lock) <= 3 {
-            map.remove(&self.key);
-        }
+#[cfg(feature = "test-hooks")]
+impl DocIndexer {
+    /// Захватить блоб, как его захватывает разбор (тест: документ этого файла не должен
+    /// занимать слот, пока блоб занят). `None` — уже захвачен.
+    #[doc(hidden)]
+    pub fn hold_blob(&self, user: Id, sha: &str) -> Option<BlobGuard> {
+        try_lock_blob(&self.inner, user, sha)
     }
 }
 
@@ -453,7 +475,6 @@ async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
     if !t.live || t.state != ExtractState::Pending {
         return Step::Skip;
     }
-    let _blob = lock_blob(inner, user, &t.blob_sha256).await;
     match cached_extract(db, &t.blob_sha256).await {
         Ok(Some(c)) => {
             inner.cache_hits.fetch_add(1, Ordering::SeqCst);
@@ -544,19 +565,33 @@ fn failure(inner: &Inner, kind: DocKind, f: ParseFailure) -> (ExtractEnd, bool) 
             );
             (ExtractEnd::Failed(PDFIUM_UNAVAILABLE.into()), false)
         }
+        other => classify(other),
+    }
+}
+
+/// Итог неудачного разбора (кроме PDF без pdfium) и признак «кэшировать». Кэшируются только
+/// свойства файла: `Malformed` (`parse_error: <область>`) и вид, который разборщик не
+/// поддерживает. `Internal` — паника разборщика или ошибка кадра в рабочем процессе — сбой
+/// процесса (`parse_crash`), как и падение, срок и нехватка памяти: не кэшируются.
+fn classify(f: ParseFailure) -> (ExtractEnd, bool) {
+    match f {
         ParseFailure::Doc(DocError::Unsupported) => (ExtractEnd::Unsupported, true),
+        ParseFailure::Doc(e @ DocError::Malformed(_)) => (
+            ExtractEnd::Failed(format!("{}: {}", PARSE_ERROR, e.area())),
+            true,
+        ),
         ParseFailure::Doc(DocError::TooLarge) => (ExtractEnd::Failed(TOO_LARGE.into()), false),
         // срок истёк без частичного результата — сбой, а не свойство файла
         ParseFailure::Doc(DocError::Timeout) => (ExtractEnd::Failed("parse_timeout".into()), false),
-        ParseFailure::Doc(e) => (
-            ExtractEnd::Failed(format!("{}: {}", PARSE_ERROR, e.area())),
-            true,
+        ParseFailure::Doc(DocError::Internal(_)) => (
+            ExtractEnd::Failed(ParseFailure::Crash.reason().into()),
+            false,
         ),
         other => (ExtractEnd::Failed(other.reason().into()), false),
     }
 }
 
-/// Код ошибки документа (`DocError::Malformed`, `Internal`).
+/// Код ошибки документа (`DocError::Malformed`).
 const PARSE_ERROR: &str = "parse_error";
 
 #[cfg(test)]
@@ -573,6 +608,31 @@ mod tests {
             "parse_error: xml (word/document.xml)"
         );
         assert_eq!(DocError::Internal("тег <w:p>".into()).area(), "internal");
+        // кэшируются только свойства файла; паника разборщика (`Internal`) — сбой процесса
+        let end = |f| classify(f);
+        assert_eq!(
+            end(ParseFailure::Doc(e.clone())),
+            (
+                ExtractEnd::Failed("parse_error: xml (word/document.xml)".into()),
+                true
+            )
+        );
+        assert_eq!(
+            end(ParseFailure::Doc(DocError::Unsupported)),
+            (ExtractEnd::Unsupported, true)
+        );
+        assert_eq!(
+            end(ParseFailure::Doc(DocError::Internal("паника".into()))),
+            (ExtractEnd::Failed("parse_crash".into()), false)
+        );
+        for (f, code) in [
+            (ParseFailure::Crash, "parse_crash"),
+            (ParseFailure::Timeout, "parse_timeout"),
+            (ParseFailure::Oom, "parse_oom"),
+            (ParseFailure::Doc(DocError::Timeout), "parse_timeout"),
+        ] {
+            assert_eq!(end(f), (ExtractEnd::Failed(code.into()), false));
+        }
         assert_eq!(
             zam_store::error_code("parse_error: xml (word/document.xml)"),
             "parse_error"

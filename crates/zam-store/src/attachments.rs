@@ -1242,16 +1242,29 @@ pub async fn enqueue_attachment_upserts(db: &Db, ids: Vec<Id>) -> Result<u64, St
     .await
 }
 
-/// Живые документы пространства `space` (`None` — всех) для reindex: извлечённые (не Human) —
-/// `upsert` ради точек; неудавшиеся (кроме `too_large`: файл не изменится) — снова `pending` с
-/// заданием (повтор разбора); `pending` без активного задания — задание. Возвращает число
+/// Живые документы пространства `space` (`None` — всех) для полного reindex и пересборки
+/// коллекции: извлечённые (не Human) — `upsert` ради точек; неудавшиеся (кроме `too_large`:
+/// файл не изменится) и неподдерживаемые — снова `pending` с заданием (повтор разбора,
+/// закэшированные неудачи их блобов снимаются); `pending` без активного задания — задание. Возвращает число
 /// поставленных заданий.
 pub async fn reindex_docs(db: &Db, space: Option<Id>) -> Result<u64, StoreError> {
     db.write(move |tx| {
         let now = fmt_ts(Timestamp::now());
+        // полный reindex — способ повтора разбора (спецификация §2): закэшированные неудачи
+        // блобов области снимаются, `failed` (кроме `too_large`) и `unsupported` — снова `pending`
+        tx.prepare_cached(&format!(
+            "DELETE FROM blob_extract
+             WHERE kind IN ('{KIND_FAILED}', '{KIND_UNSUPPORTED}')
+               AND blob_sha256 IN (
+                   SELECT d.blob_sha256 FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
+                   WHERE d.deleted_at IS NULL AND n.deleted_at IS NULL
+                     AND (?1 IS NULL OR n.space_id = ?1))"
+        ))?
+        .execute(params![space])?;
         tx.prepare_cached(
             "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
-             WHERE extract_state = 'failed' AND coalesce(extract_error, '') <> ?2
+             WHERE (extract_state = 'unsupported'
+                    OR (extract_state = 'failed' AND coalesce(extract_error, '') <> ?2))
                AND deleted_at IS NULL
                AND node_id IN (SELECT id FROM nodes
                                WHERE deleted_at IS NULL AND (?1 IS NULL OR space_id = ?1))",

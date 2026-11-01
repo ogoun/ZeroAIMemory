@@ -96,7 +96,7 @@ pub use graph::{
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
     JobOutcome, JobStats, NodePayload, ReindexNote, chunks_for_index, claim_extract_jobs,
-    claim_jobs, complete_job, enqueue_reindex, enqueue_upserts, fail_job, failed_jobs,
+    claim_jobs, complete_job, defer_job, enqueue_reindex, enqueue_upserts, fail_job, failed_jobs,
     finish_reindexed, folder_embed_input, folders_for_index, give_up_job, indexable_count,
     indexed_count, job_stats, mark_reindex, pending_reindex, reindex_page, release_job,
     requeue_running, requeue_running_extract, set_index_state,

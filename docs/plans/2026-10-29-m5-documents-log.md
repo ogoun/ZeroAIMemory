@@ -983,6 +983,26 @@ debuginfo).
 - Тест `failed_extract_reported_in_index_status` — без изменений (коды те же).
 - Проверки: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `clippy -p zam-index --features edge` — чисто; `cargo test -p zam-store -p zam-docs` — 379 passed (6 ignored), в т.ч. `attachments` 13; `-p zam-server`: lib 193 (1 ignored), `attachments_index` 12 (+3), `blobs` 10, `doc_worker` 10 (1 ignored), `nodes` 15, `index_api` 4, `index_worker` 10 (1 ignored); `-p zam-index`: lib 38, `worker` 16 (2 ignored), `qdrant` 28 — всё зелёное (Windows, MiniLM + Qdrant + pdfium).
 
+#### Задача 5 — раунд правок 2 (2026-11-01)
+
+Повторное ревью: APPROVED с тремя Minor.
+
+- **(m-2) `Internal` не кэшируется.** `DocError::Internal` (паника разборщика в рабочем процессе,
+  ошибка кадра) — сбой процесса: `parse_crash`, без кэша. Кэшируются только `Malformed`
+  (`parse_error: <область>`) и вид, который разборщик не поддерживает (`classify`, unit-тест
+  `parse_error_reason_has_area_only` дополнен).
+- **(m-1) Захват блоба не держит слот.** Захват — `try_lock_blob` (множество (`пользователь`,
+  `sha256`)) **до** семафора слотов: блоб уже разбирается — задание возвращается в очередь
+  через 1 с (`zam_store::defer_job`: как `release_job`, но с `not_before`), слот не занимается.
+  Тест `busy_blob_does_not_hold_parse_slot` (один слот, блоб захвачен тестовой точкой
+  `DocIndexer::hold_blob` фичи `test-hooks`: маленький файл другого пользователя извлекается сразу,
+  документ занятого блоба ждёт в очереди).
+- **(m-3) Полный reindex повторяет разбор.** `reindex_docs` (полный reindex и пересборка
+  коллекции) снимает закэшированные неудачи (`blob_extract` `failed`/`unsupported`) блобов
+  области и возвращает в `pending` `failed` (кроме `too_large`) и `unsupported` документы.
+  Reindex из кэша неудач не трогает. Тест `full_reindex_drops_cached_failures`.
+- Проверки: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` — чисто; `-p zam-store --test attachments` 14 (+1); `-p zam-server`: lib 193 (1 ignored), `attachments_index` 13 (+1), `index_api` 4 — зелёные.
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
