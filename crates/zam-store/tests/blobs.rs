@@ -117,6 +117,7 @@ async fn same_content_is_one_file_and_refcount_counts_new_pairs_only() {
         size,
         "cat.png",
         "image/png",
+        None,
         zam_store::AuthorKind::System,
     )
     .await
@@ -131,6 +132,7 @@ async fn same_content_is_one_file_and_refcount_counts_new_pairs_only() {
         size,
         "cat.png",
         "image/png",
+        None,
         zam_store::AuthorKind::System,
     )
     .await
@@ -144,6 +146,7 @@ async fn same_content_is_one_file_and_refcount_counts_new_pairs_only() {
         size,
         "cat.png",
         "image/png",
+        None,
         zam_store::AuthorKind::System,
     )
     .await
@@ -155,6 +158,7 @@ async fn same_content_is_one_file_and_refcount_counts_new_pairs_only() {
         size,
         "кот 2.png",
         "image/png",
+        None,
         zam_store::AuthorKind::System,
     )
     .await
@@ -189,6 +193,7 @@ async fn link_encodes_markdown_breaking_characters() {
         size,
         "мой (1) <a>.png",
         "image/png",
+        None,
         zam_store::AuthorKind::System,
     )
     .await
@@ -207,6 +212,7 @@ async fn link_encodes_markdown_breaking_characters() {
                     size,
                     bad,
                     "x/y",
+                    None,
                     zam_store::AuthorKind::System
                 )
                 .await,
@@ -223,6 +229,7 @@ async fn link_encodes_markdown_breaking_characters() {
             size,
             "a.png",
             "image/png",
+            None,
             zam_store::AuthorKind::System
         )
         .await,
@@ -236,6 +243,7 @@ async fn link_encodes_markdown_breaking_characters() {
             size,
             "a.png",
             "image/png",
+            None,
             zam_store::AuthorKind::System
         )
         .await,
@@ -257,6 +265,7 @@ async fn resolve_and_meta_respect_human() {
         n1,
         "a.png",
         "image/png",
+        None,
         zam_store::AuthorKind::System,
     )
     .await
@@ -268,6 +277,7 @@ async fn resolve_and_meta_respect_human() {
         n2,
         "b.pdf",
         "application/pdf",
+        None,
         zam_store::AuthorKind::System,
     )
     .await

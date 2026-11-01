@@ -1,4 +1,4 @@
-//! Ссылка на цель (узел или запись журнала): `n:<id>` | `e:<id>`.
+//! Ссылка на цель (узел, запись журнала или документ вложения): `n:<id>` | `e:<id>` | `a:<id>`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -13,19 +13,23 @@ use crate::{Id, ParseIdError};
 pub enum TargetKind {
     Node,
     Entry,
+    /// Документ вложения (`attachment_docs.id`, M5): цель заданий индексации и чанков вложения.
+    Attachment,
 }
 
 impl TargetKind {
-    /// Префикс текстовой формы: `n` | `e`.
+    /// Префикс текстовой формы: `n` | `e` | `a`.
     fn prefix(self) -> &'static str {
         match self {
             TargetKind::Node => "n",
             TargetKind::Entry => "e",
+            TargetKind::Attachment => "a",
         }
     }
 }
 
-/// Узел или запись журнала. Текстовая форма (`Display`/`FromStr`, serde) — `n:<id>` | `e:<id>`.
+/// Узел, запись журнала или документ вложения. Текстовая форма (`Display`/`FromStr`, serde) —
+/// `n:<id>` | `e:<id>` | `a:<id>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TargetRef {
     pub kind: TargetKind,
@@ -46,6 +50,7 @@ impl FromStr for TargetRef {
         let kind = match k {
             "n" => TargetKind::Node,
             "e" => TargetKind::Entry,
+            "a" => TargetKind::Attachment,
             _ => return Err(ParseIdError),
         };
         Ok(TargetRef {
@@ -87,6 +92,16 @@ mod tests {
         assert_eq!(e.to_string(), format!("e:{id}"));
         assert_eq!(n.to_string().parse::<TargetRef>().unwrap(), n);
         assert_eq!(e.to_string().parse::<TargetRef>().unwrap(), e);
+        let a = TargetRef {
+            kind: TargetKind::Attachment,
+            id,
+        };
+        assert_eq!(a.to_string(), format!("a:{id}"));
+        assert_eq!(a.to_string().parse::<TargetRef>().unwrap(), a);
+        assert_eq!(
+            serde_json::to_string(&TargetKind::Attachment).unwrap(),
+            "\"attachment\""
+        );
         // id принимается в любой форме, которую понимает Id
         assert_eq!(
             format!("e:{}", id.as_uuid()).parse::<TargetRef>().unwrap(),

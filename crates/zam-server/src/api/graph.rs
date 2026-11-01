@@ -148,6 +148,12 @@ async fn target_scope(
                 r,
             }
         }
+        // связи — между узлами и записями журналов (вложение концом связи не бывает)
+        TargetKind::Attachment => {
+            return Err(ApiError::BadRequest(
+                "связи есть только у узлов (n:) и записей журналов (e:)".into(),
+            ));
+        }
     })
 }
 

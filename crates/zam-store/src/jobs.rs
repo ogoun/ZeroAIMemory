@@ -79,7 +79,8 @@ impl FromSql for JobOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub id: i64,
-    /// Вид цели: узел (`target_kind = 'node'`) или запись журнала (`'entry'`, M3).
+    /// Вид цели: узел (`target_kind = 'node'`), запись журнала (`'entry'`, M3) или документ
+    /// вложения (`'attachment'`, M5).
     pub target_kind: TargetKind,
     /// Узел или запись.
     pub target_id: Id,
@@ -107,6 +108,7 @@ pub(crate) fn target_kind_sql(k: TargetKind) -> &'static str {
     match k {
         TargetKind::Node => "node",
         TargetKind::Entry => "entry",
+        TargetKind::Attachment => "attachment",
     }
 }
 
@@ -115,6 +117,7 @@ fn parse_target_kind(s: &str) -> rusqlite::Result<TargetKind> {
     match s {
         "node" => Ok(TargetKind::Node),
         "entry" => Ok(TargetKind::Entry),
+        "attachment" => Ok(TargetKind::Attachment),
         other => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
@@ -684,7 +687,7 @@ fn index_chunks(tx: &Connection, node: Id) -> Result<Vec<IndexChunk>, StoreError
         tx,
         "SELECT id, level, heading_path, ordinal, text, context_prefix, text_hash,
                 token_count, rev, embed_key
-         FROM chunks WHERE node_id = ?1 ORDER BY ordinal",
+         FROM chunks WHERE node_id = ?1 AND attachment_id IS NULL ORDER BY ordinal",
         node,
         &payload,
         None,
@@ -868,11 +871,12 @@ pub async fn finish_reindexed(db: &Db, items: Vec<(Id, i64)>) -> Result<(), Stor
 pub struct FailedJob {
     /// Id задания (`index_jobs.id`): у одного узла неудавшихся заданий может быть несколько.
     pub id: i64,
-    /// Вид цели: узел или запись журнала.
+    /// Вид цели: узел, запись журнала или документ вложения.
     pub target_kind: TargetKind,
-    /// Id узла или записи.
+    /// Id узла, записи или документа вложения.
     pub node_id: Id,
-    /// Пространство и путь узла; `None` — цель удалена насовсем (у записи пути нет).
+    /// Пространство и путь узла (у вложения — узла-владельца); `None` — цель удалена насовсем
+    /// (у записи пути нет).
     pub space_id: Option<Id>,
     pub path: Option<String>,
     /// Цель удалена мягко; `None` — жива или удалена насовсем.
@@ -890,11 +894,13 @@ pub async fn failed_jobs(db: &Db, limit: usize) -> Result<Vec<FailedJob>, StoreE
     db.read(move |c| {
         let mut st = c.prepare_cached(
             "SELECT j.id, j.target_id, j.op, j.attempts, j.last_error, j.updated_at,
-                    coalesce(n.space_id, e.space_id), n.path,
-                    coalesce(n.deleted_at, e.deleted_at), j.target_kind
+                    coalesce(n.space_id, e.space_id, an.space_id), coalesce(n.path, an.path),
+                    coalesce(n.deleted_at, e.deleted_at, d.deleted_at), j.target_kind
              FROM index_jobs j
              LEFT JOIN nodes n ON j.target_kind = 'node' AND n.id = j.target_id
              LEFT JOIN entries e ON j.target_kind = 'entry' AND e.id = j.target_id
+             LEFT JOIN attachment_docs d ON j.target_kind = 'attachment' AND d.id = j.target_id
+             LEFT JOIN nodes an ON an.id = d.node_id
              WHERE j.state = 'failed' ORDER BY j.updated_at DESC, j.id DESC LIMIT ?1",
         )?;
         let rows = st.query_map([limit], |r| {
@@ -987,6 +993,12 @@ fn set_target_state(
     match t.kind {
         TargetKind::Node => set_state(c, t.id, rev, state),
         TargetKind::Entry => crate::entries::set_entry_state(c, t.id, rev, state),
+        // у документа вложения нет `index_state`: состояние — `extract_state`, его ставит
+        // воркер; окончательная неудача задания — `failed`, если воркер причину не записал
+        TargetKind::Attachment => match state {
+            IndexState::Failed => crate::attachments::mark_job_failed(c, t.id),
+            IndexState::Pending | IndexState::Indexed | IndexState::Excluded => Ok(()),
+        },
     }
 }
 

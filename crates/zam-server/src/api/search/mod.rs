@@ -1371,6 +1371,8 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Tim
     let id_key = match h.target.kind {
         TargetKind::Node => "node_id",
         TargetKind::Entry => "entry_id",
+        // карточка вложения — задача 6 M5; FTS и векторный канал их пока не отдают
+        TargetKind::Attachment => "attachment_id",
     };
     o.insert(id_key.into(), json!(h.target.id));
     let space = spaces.get(&h.space_id);

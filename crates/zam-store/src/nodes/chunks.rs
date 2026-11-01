@@ -534,17 +534,20 @@ impl ChunkInsert {
 /// Заменяет чанки владельца (`col` — `node_id` или `entry_id`) строками `rows`, если нарезка
 /// отличается от записанной (любой столбец, включая текст); совпадающая не переписывается
 /// (FTS и `rowid` не трогаются). `true` — чанки переписаны. В транзакции писателя.
+/// Чанки вложений узла (`attachment_id IS NOT NULL`, M5) не сравниваются и не удаляются: правка
+/// заметки их не трогает (Review Focus 2 плана M5).
 pub(crate) fn replace_chunks(
     c: &Connection,
     col: &'static str,
     owner: Id,
     rows: &[ChunkInsert],
 ) -> Result<bool, StoreError> {
+    let own = own_chunks(col);
     let same = {
         let mut st = c.prepare_cached(&format!(
             "SELECT id, rev, level, heading_path, ordinal, text, context_prefix, token_count,
                     text_hash, embed_key
-             FROM chunks WHERE {col} = ?1 ORDER BY ordinal"
+             FROM chunks WHERE {col} = ?1{own} ORDER BY ordinal"
         ))?;
         let mut stored = st.query([owner])?;
         let mut same = true;
@@ -562,7 +565,7 @@ pub(crate) fn replace_chunks(
     if same {
         return Ok(false);
     }
-    c.prepare_cached(&format!("DELETE FROM chunks WHERE {col} = ?1"))?
+    c.prepare_cached(&format!("DELETE FROM chunks WHERE {col} = ?1{own}"))?
         .execute([owner])?;
     let mut st = c.prepare_cached(&format!(
         "INSERT INTO chunks (id, {col}, rev, level, heading_path, ordinal, text,
@@ -585,6 +588,16 @@ pub(crate) fn replace_chunks(
         ])?;
     }
     Ok(true)
+}
+
+/// Условие «чанки самого владельца»: у узла — без чанков его вложений (`attachment_id`, M5); у
+/// записи журнала вложений нет (условие не нужно и не требует столбца M5 в старой схеме).
+fn own_chunks(col: &str) -> &'static str {
+    if col == "node_id" {
+        " AND attachment_id IS NULL"
+    } else {
+        ""
+    }
 }
 
 fn text_hash(text: &str) -> String {
@@ -943,7 +956,8 @@ pub(crate) fn index_note(
 /// а чанки старых баз хранят его как есть.
 pub(crate) fn stored_prefix_hit(c: &Connection, col: &str, id: Id) -> Result<bool, StoreError> {
     let mut st = c.prepare_cached(&format!(
-        "SELECT DISTINCT context_prefix FROM chunks WHERE {col} = ?1"
+        "SELECT DISTINCT context_prefix FROM chunks WHERE {col} = ?1{}",
+        own_chunks(col)
     ))?;
     let rows = st.query_map([id], |r| r.get::<_, String>(0))?;
     for p in rows {

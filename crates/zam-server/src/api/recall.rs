@@ -1617,6 +1617,8 @@ async fn prompt_hints(
                     "rules",
                 )
             }
+            // вложения в выдачу подсказок не входят (поиск по вложениям — задача 6 M5)
+            TargetKind::Attachment => continue,
         };
         let mut block = hint_line(
             lead,

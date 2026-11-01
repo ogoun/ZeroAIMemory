@@ -202,6 +202,8 @@ fn owner_kind(k: TargetKind) -> &'static str {
     match k {
         TargetKind::Node => "node",
         TargetKind::Entry => "entry",
+        // ссылок на файлы у вложения нет: запросы по нему пусты
+        TargetKind::Attachment => "attachment",
     }
 }
 

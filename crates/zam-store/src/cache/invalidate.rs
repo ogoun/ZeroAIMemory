@@ -88,6 +88,9 @@ fn updated_at(c: &Connection, t: TargetRef) -> Result<Option<Timestamp>, StoreEr
     let sql = match t.kind {
         TargetKind::Node => "SELECT updated_at FROM nodes WHERE id = ?1 AND deleted_at IS NULL",
         TargetKind::Entry => "SELECT updated_at FROM entries WHERE id = ?1 AND deleted_at IS NULL",
+        TargetKind::Attachment => {
+            "SELECT created_at FROM attachment_docs WHERE id = ?1 AND deleted_at IS NULL"
+        }
     };
     let s: Option<String> = c
         .prepare_cached(sql)?

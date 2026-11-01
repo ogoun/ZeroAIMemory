@@ -32,7 +32,8 @@ fn group(h: &FtsHit) -> u8 {
             _ => 2,
         },
         (None, TargetKind::Node) => 1,
-        _ => 2,
+        // прочие записи; вложения (выдача — задача 6 M5) — тоже в конце
+        (Some(_), _) | (None, TargetKind::Entry | TargetKind::Attachment) => 2,
     }
 }
 

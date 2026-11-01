@@ -509,6 +509,87 @@
   подряд); clippy `-D warnings` по `zam-docs`/`zam-index`/`zam-server` (и `zam-docs` под
   linux-gnu), fmt — чисто.
 
+### Задача 4 — хранилище: вложения как цель индексации, миграция 0019 (2026-11-01)
+
+- **Схема (миграция 0019 `0019_attachments_index.sql`).** `attachment_docs` — документ пары
+  (узел, блоб, имя) со своим id (`Id`, base32): цель заданий `index_jobs.target_kind =
+  'attachment'` и владелец чанков; `extract_state` `pending|done|failed|unsupported`,
+  `extract_error`, `ocr_needed`, `deleted_at`, `UNIQUE(node_id, blob_sha256, filename)`.
+  `blob_extract(blob_sha256, extractor_version, kind, units, warnings, ocr_needed)` — кэш
+  извлечения; `chunks.attachment_id` (+ частичный индекс `chunks_attachment`).
+  `attachments.text_state` (0002) не используется.
+- **Где общие типы (решение исполнителя).** `zam-store` зависит от `zam-docs` напрямую: без
+  фичи `pdfium` крейт — чистый Rust (`quick-xml`, `zip`, `encoding_rs`, `thiserror`, всё уже в
+  дереве), тяжёлая часть (pdfium) включается только у `zam-server`. Отдельный крейт типов дал бы
+  дубли `Unit`/`Locator` и конвертации без выигрыша. `Extracted`, `Unit`, `Locator`, `DocKind`,
+  `EXTRACTOR_VERSION` реэкспортируются из `zam_store::attachments`. `ExtractState` в `zam-docs`
+  нет — это состояние строки базы, определён в `zam-store`. Новая явная зависимость `uuid`
+  (workspace, фича `v5` уже включена) — id чанков вложений.
+- **Кэш `blob_extract` — JSON без zstd (отступление от спецификации §3).** `units` —
+  `[{locator, heading_path, text}]` (locator — строковая форма `Locator::render`, обратно —
+  `parse`); zstd — новая зависимость, выигрыш (текст сжимается в 3–5 раз) не нужен до замеров
+  объёма на корпусе `eval/docs/` (задача 10). Строку, которая не разбирается, `extract_cached`
+  считает промахом (с WARN) — кэш выводится заново. Столбец `kind` добавлен сверх брифа:
+  без него `Extracted` не восстановить.
+- **Чанк вложения** несёт `node_id` узла-владельца (область, права, Human) и `attachment_id`;
+  `level = 'attachment'`, `locator`, `blob_sha256`, `rev = 0` (у документа ревизий нет),
+  `heading_path` — через ` > `, текст и путь маскируются сканером секретов. Префикс —
+  `[<space>/<путь заметки>] <имя файла> > <heading_path>` (`context_prefix` заметки без тегов).
+  `chunk_id` — UUIDv5(своё пространство имён, `attachment_id ‖ ordinal ‖ blake3(text)`) в hex 32 —
+  формат как у заметок, коллизий со схемой blake3 заметок нет. `replace_attachment_chunks` —
+  по чанку на единицу (нарезка длинных единиц — задача 5), совпадающая нарезка не переписывается.
+- **Изоляция (Review Focus 2).** `attachment_id IS NULL` — в `replace_chunks` (сравнение и
+  удаление), `stored_prefix_hit`, `delete_node` (`tree_ops.rs:47`), `refresh_prefixes`
+  (`tree_ops.rs:358`), `jobs::index_chunks` (векторный индекс узла), `search::scope_sql`
+  (ветка узлов: FTS-каналы bm25/trigram/alias и `live_chunks`), `xtask eval` (`index_volume`).
+  Остальные потребители `chunks` берут `level = 'chunk'` (листы, соседи, `leaf_term_hits`,
+  `node_leaves`, бенч) или идут через `scope_sql`; чанки вложений сейчас не попадают ни в
+  поиск, ни в `/recall`, дайджест, eval. **Поиск по вложениям включается в задаче 6**
+  (ветка `kinds ∋ attachment`, живой `attachment_docs`).
+- **Каскад операций над узлом.** Удаление: документы получают метку удаления узла и `delete`;
+  чанки вложения **остаются** (скрыты меткой) — восстановление возвращает их без извлечения.
+  Восстановление: документы с меткой узла (сравнение до снятия метки) живые снова, `pending` —
+  `upsert` всегда (задание извлечения могло быть заменено `delete`), `done` — `upsert` ради точек
+  (не Human). Перенос: префиксы чанков всех документов узла (и скрытых — для восстановления),
+  `upsert` живым. Смена GUID решения — `upsert` извлечённым документам пространства.
+  Открепление (`detach`): строка `attachments` удаляется, `refcount − 1` (не ниже 0), чанки
+  удаляются, документ — метка открепления и `delete`; повторная привязка возвращает тот же id
+  (`pending`, кэш извлечения переиспользуется).
+- **Human — только FTS**, как у заметок: задание извлечения Human-вложению ставится (иначе нет
+  FTS), а задания ради точек (новая нарезка, перенос, восстановление `done`) — нет; `delete`
+  Human-документу — только если у него есть активное задание. Векторный индекс Human всё равно
+  отбрасывает (защита `index_chunks`, у вложений — задача 5).
+- **Задание `Attachment`**: `rev = 0`; `complete_job` состояния не ставит (`index_state` у
+  документа нет), окончательная неудача (`fail_job`) переводит `pending` в `failed` с
+  `index_failed`, если причину не записал воркер. `failed_jobs` берёт путь и пространство
+  узла-владельца; `/index/status` отдаёт `attachment_id`.
+- **`attach` получает вид документа** (`Option<DocKind>`): REST `POST /blobs` вызывает
+  `zam_docs::sniff` по файлу блоба — zip целиком, если не больше `docs.max_bytes`, иначе
+  `unsupported`; прочее — по первым 64 КиБ + 16 байт (окно `looks_text`). Дозаполнение миграцией
+  файла не читает: `pending` — по расширениям видов `sniff`, остальные — `unsupported`;
+  вложения удалённых узлов получают метку узла и без задания.
+- **REST.** `GET /nodes/{id}/attachments` (чтение узла; `id`, `sha256`, `filename`, `mime`,
+  `size`, `extract_state`, `extract_error`, `ocr_needed`, `link`, `created_at`),
+  `DELETE /nodes/{id}/attachments/{sha256}/{filename}` (запись узла, 204).
+- **`match TargetKind`** — явная ветка `Attachment` везде (`_ =>` не осталось, в том числе
+  `search/graph.rs::group`). Вне хранилища: воркер `zam-index` пока даёт документу пустые чанки
+  (план `delete`), `split_targets` его пропускает — точки вложений и удаление по `attachment_id` —
+  задача 5; кэш выжимок, граф, ссылки на файлы, сессии — вложение не источник/не конец связи
+  (`None`/`BadInput`, CHECK таблиц строку не примет).
+- Тесты `crates/zam-store/tests/attachments.rs` (8): `migration_0019_backfills_attachment_docs`,
+  `attach_enqueues_attachment_job`, `note_edit_keeps_attachment_chunks`,
+  `node_move_recomputes_attachment_prefix`, `node_delete_hides_attachments_restore_returns`,
+  `detach_removes_chunks`, `same_blob_two_notes_two_docs`, `attachment_chunk_ids_unique`; lib —
+  `chunk_id_deterministic_and_distinct`, `doc_kind_names_roundtrip`.
+  REST — `zam-server/tests/blobs.rs::attachments_list_and_detach`.
+- Условие `attachment_id IS NULL` в `replace_chunks`/`stored_prefix_hit` — только для
+  `node_id` (`own_chunks`): у записей журналов вложений нет, а тест перехода с базы M4
+  (`rebuild_migration_preserves_m4_db`) пишет записи текущим кодом в схему v14.
+- Проверки: `cargo test -p zam-store` (302 passed, 4 ignored), `-p zam-core` 15, `-p zam-index
+  --lib` 38, `-p zam-server --test blobs --test nodes --test certainty --test solutions_access`
+  10 + 15 + 16 + 15; `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` —
+  чисто.
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
@@ -639,6 +720,19 @@
   таблиц — `sheet_page`), п. 1 итогового раздела («`calamine` на сервере», строка 1654).
 - **Блочные единицы DOCX/PPTX (`Units::flush`) учитывают путь и вес после текста:** выдача может
   превысить `max_chars` на путь + 64 символа последней единицы (у `push` исправлено в задаче 2).
+
+Из задачи 4 M5 (2026-11-01), передано дальше:
+
+- **Задача 5:** задания `Attachment`, выполненные воркером до задачи 5 (пустой план `delete`),
+  оставляют документ `pending` без задания — при первом запуске конвейера поставить задания
+  `pending`-документам без активного задания; `split_targets`/`delete_targets` по
+  `attachment_id`, `must_not attachment_id exists` у удаления точек узла; Human-защита в
+  `attachment_chunks_for_index`; вложение больше `docs.max_bytes` сейчас `unsupported`
+  (zip) — можно `failed: too_large`.
+- **Задача 6:** `scope_sql` — ветка вложений с `attachment_docs.deleted_at IS NULL` (чанки
+  скрытых документов лежат в FTS); карточка `a:<chunk>` vs `TargetKind::Attachment` (`a:<id
+  документа>`) — согласовать префиксы в задачах 6–7.
+- **Задача 7:** `sessions::target_kind_str(Attachment)` — показ вложения писать как `blob`.
 
 ## Уточнить у владельца
 

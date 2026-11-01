@@ -8,6 +8,8 @@
 //! удалённые узлы могут делить путь с живыми. Каждая операция — одна транзакция писателя и ставит
 //! задания outbox (§8.1): удаление — `delete`, восстановление и перенос — `upsert`. В той же
 //! транзакции перепроверяются выведенные рёбра графа пространства (`crate::graph::tree_changed`).
+//! Документы вложений узлов (M5) следуют за узлом: метка удаления и `delete`, снятие метки и
+//! `upsert`, новый `context_prefix` и `upsert` ([`crate::attachments`]).
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -44,13 +46,16 @@ pub async fn delete_node(db: &Db, id: Id, author: AuthorKind) -> Result<u64, Sto
         let ids = subtree(tx, &node, None)?;
         ensure_may_modify_all(tx, &ids, author)?;
         let mut mark = tx.prepare_cached("UPDATE nodes SET deleted_at = ?2 WHERE id = ?1")?;
-        let mut drop_chunks = tx.prepare_cached("DELETE FROM chunks WHERE node_id = ?1")?;
+        // только чанки заметки: чанки вложений остаются, скрытые меткой документа (M5)
+        let mut drop_chunks =
+            tx.prepare_cached("DELETE FROM chunks WHERE node_id = ?1 AND attachment_id IS NULL")?;
         let mut state = tx.prepare_cached(
             "SELECT current_rev, index_state FROM nodes WHERE id = ?1 AND kind = 'note'",
         )?;
         for &nid in &ids {
             mark.execute(params![nid, now])?;
             drop_chunks.execute([nid])?;
+            crate::attachments::hide_node_docs(tx, nid, &now, &now)?;
             // выжимки кэша с этим источником — недействительны (§9.4)
             invalidate_target(tx, node_ref(nid), StaleKind::Deleted)?;
             let note: Option<(i64, String)> = state
@@ -95,11 +100,13 @@ pub async fn restore_node(db: &Db, id: Id, author: AuthorKind) -> Result<Node, S
         }
         let restored_ids: Vec<Id> = restored.iter().map(|n| n.id).collect();
         ensure_may_modify_all(tx, &restored_ids, author)?;
+        let now = fmt_ts(Timestamp::now());
         let mut unmark = tx.prepare_cached("UPDATE nodes SET deleted_at = NULL WHERE id = ?1")?;
         for n in &restored {
+            // документы вложений с меткой узла — до снятия метки (сравнение по ней)
+            crate::attachments::restore_node_docs(tx, n.id, &now)?;
             unmark.execute([n.id])?;
         }
-        let now = fmt_ts(Timestamp::now());
         let mut set_state = tx.prepare_cached("UPDATE nodes SET index_state = ?2 WHERE id = ?1")?;
         for n in restored.iter().filter(|n| n.kind == NodeKind::Note) {
             let content = revision_text(tx, n.id, n.current_rev)?;
@@ -209,9 +216,11 @@ pub async fn move_node(
         )?;
         refresh_prefixes(tx, &space, id)?;
         requeue_moved(tx, id, &now)?;
+        crate::attachments::refresh_node_docs(tx, &space, id, &now)?;
         for (nid, _) in &descendants {
             refresh_prefixes(tx, &space, *nid)?;
             requeue_moved(tx, *nid, &now)?;
+            crate::attachments::refresh_node_docs(tx, &space, *nid, &now)?;
         }
         // граф: относительные ссылки перенесённых заметок — от нового места; ссылки на
         // старые и новые имена и пути пространства — заново
@@ -340,8 +349,9 @@ fn raw_deleted_at(c: &Connection, id: Id) -> Result<Option<String>, StoreError> 
     )
 }
 
-/// Пересчитывает `context_prefix` и `embed_key` чанков узла по его текущим пути, имени и тегам
-/// (триггер `chunks_au` обновляет FTS). У папки и удалённого узла чанков нет.
+/// Пересчитывает `context_prefix` и `embed_key` чанков заметки узла по его текущим пути, имени
+/// и тегам (триггер `chunks_au` обновляет FTS). У папки и удалённого узла чанков заметки нет.
+/// Чанки вложений — по своей формуле ([`crate::attachments::refresh_node_docs`]).
 fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), StoreError> {
     let (path, name, fm, l0): (String, String, Option<String>, Option<String>) = c.query_row(
         "SELECT path, name, frontmatter, l0 FROM nodes WHERE id = ?1",
@@ -354,8 +364,10 @@ fn refresh_prefixes(c: &Connection, space: &str, node_id: Id) -> Result<(), Stor
         None => Vec::new(),
     };
     let chunks: Vec<(i64, String, String)> = {
-        let mut st =
-            c.prepare_cached("SELECT seq, heading_path, text FROM chunks WHERE node_id = ?1")?;
+        let mut st = c.prepare_cached(
+            "SELECT seq, heading_path, text FROM chunks
+                 WHERE node_id = ?1 AND attachment_id IS NULL",
+        )?;
         st.query_map([node_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?
     };

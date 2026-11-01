@@ -4,9 +4,11 @@
 //! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
 //! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3), сессии агентов,
 //! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4), кэш выжимок
-//! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5).
+//! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5), вложения как
+//! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5).
 
 pub mod access;
+pub mod attachments;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
@@ -36,6 +38,10 @@ pub mod user_db;
 pub mod vault;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
+pub use attachments::{
+    AttachmentDoc, ExtractState, detach, extract_cached, list_attachments, put_extract,
+    replace_attachment_chunks, set_extract_state,
+};
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_in_space,
     resolve_attachment,

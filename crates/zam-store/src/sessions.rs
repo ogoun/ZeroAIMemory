@@ -114,6 +114,9 @@ pub(crate) fn target_kind_str(k: TargetKind) -> &'static str {
     match k {
         TargetKind::Node => "node",
         TargetKind::Entry => "entry",
+        // показ вложения (`/read`, задача 7 M5) пока не учитывается; CHECK `session_seen`
+        // такую строку не примет (там вложение — `blob`)
+        TargetKind::Attachment => "attachment",
     }
 }
 

@@ -9,7 +9,8 @@
 //!
 //! **Таблицы.** `attachments` — пара (узел, sha256, имя файла) с MIME и размером;
 //! `blobs.refcount` — число таких различных пар (повторная привязка той же пары
-//! счётчик не меняет). Сборщик мусора (`refcount = 0`) — не в M1.
+//! счётчик не меняет). Сборщик мусора (`refcount = 0`) — не в M1. Документ вложения для
+//! индексации — `attachment_docs` ([`crate::attachments`], M5).
 //!
 //! **Ссылка** в Markdown: `_attachments/<sha256[0..16]>/<имя>`; в имени
 //! percent-кодируются только символы, ломающие синтаксис ссылки Markdown
@@ -24,6 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use zam_core::{Id, TargetKind, TargetRef};
 
+use crate::attachments::DocKind;
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::entries::Certainty;
 use crate::nodes::AuthorKind;
@@ -178,6 +180,9 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
 /// Новая пара (узел, sha256, имя) добавляет строку `attachments` и увеличивает
 /// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет. Вложение — изменение
 /// заметки по матрице `certainty` (`author`; с M4 к `axiom` — любому автору, §7.5).
+/// Пара получает документ `attachment_docs` (M5): `kind` — вид по `zam_docs::sniff`;
+/// поддерживаемый — `pending` с заданием индексации `Attachment`, `None` — `unsupported` без него.
+#[allow(clippy::too_many_arguments)]
 pub async fn attach(
     db: &Db,
     node: Id,
@@ -185,6 +190,7 @@ pub async fn attach(
     size: u64,
     filename: &str,
     mime: &str,
+    kind: Option<DocKind>,
     author: AuthorKind,
 ) -> Result<String, StoreError> {
     if !is_sha256(sha256) {
@@ -219,6 +225,8 @@ pub async fn attach(
              ON CONFLICT (node_id, blob_sha256, filename) DO NOTHING",
             params![node, sha, name, mime, size, now],
         )?;
+        // документ пары: новый или возвращённый после открепления; живой не меняется
+        crate::attachments::ensure_doc(t, node, &sha, &name, &mime, kind, &now)?;
         if new_pair == 1 {
             t.execute(
                 "UPDATE blobs SET refcount = refcount + 1 WHERE sha256 = ?1",

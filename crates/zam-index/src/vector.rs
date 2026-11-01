@@ -281,6 +281,8 @@ pub(crate) fn split_targets(targets: &[TargetRef]) -> (Vec<String>, Vec<String>)
         match t.kind {
             TargetKind::Node => nodes.push(t.id.to_string()),
             TargetKind::Entry => entries.push(t.id.to_string()),
+            // точек вложений пока нет: удаление по `attachment_id` — задача 5 M5
+            TargetKind::Attachment => {}
         }
     }
     (nodes, entries)

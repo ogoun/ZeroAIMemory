@@ -493,3 +493,58 @@ async fn token_render_ignores_attachment_only_in_human() {
     let j = a.adm(Method::GET, &uri, None, None).await.json();
     assert!(j["html"].as_str().unwrap().contains("<img"), "{j}");
 }
+
+/// Документы вложений (M5, задача 4): загрузка текста — `pending` (вид по `sniff`), картинки —
+/// `unsupported`; `GET /nodes/{id}/attachments` их перечисляет, `DELETE …/{sha}/{имя}` открепляет
+/// (204, затем 404), ссылка больше не отдаётся.
+#[tokio::test]
+async fn attachments_list_and_detach() {
+    let a = api("blobs-attachments", |_| {}).await;
+    let n = a.note("knowledge", "Документы", "# Д\n").await;
+    let node = id(&n);
+    let r = upload(&a, &node, "отчёт.txt", "текст отчёта".as_bytes()).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let sha = r.json()["sha256"].as_str().unwrap().to_string();
+    let r = upload(&a, &node, "cat.png", &png()).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+
+    let r = get(&a, &format!("/api/v1/nodes/{node}/attachments"), &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let list = r.json();
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 2, "{list:?}");
+    let by = |f: &str| list.iter().find(|d| d["filename"] == f).unwrap().clone();
+    assert_eq!(by("отчёт.txt")["extract_state"], "pending");
+    assert_eq!(by("cat.png")["extract_state"], "unsupported");
+    assert_eq!(by("отчёт.txt")["ocr_needed"], false);
+
+    let del = format!(
+        "/api/v1/nodes/{node}/attachments/{sha}/{}",
+        "%D0%BE%D1%82%D1%87%D1%91%D1%82.txt"
+    );
+    let r = a.tok_h(&a.token, Method::DELETE, &del, None, &[]).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let r = a.tok_h(&a.token, Method::DELETE, &del, None, &[]).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = get(&a, &format!("/api/v1/nodes/{node}/attachments"), &[]).await;
+    let list = r.json();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let r = get(
+        &a,
+        &format!("/api/v1/blobs/{sha}/%D0%BE%D1%82%D1%87%D1%91%D1%82.txt"),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // неверный sha — 400
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::DELETE,
+            &format!("/api/v1/nodes/{node}/attachments/XYZ/a.txt"),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}

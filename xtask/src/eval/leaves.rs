@@ -177,7 +177,7 @@ pub fn index_volume(data: &Path) -> Result<IndexVolume> {
          LEFT JOIN nodes n ON n.id = c.node_id
          LEFT JOIN entries e ON e.id = c.entry_id
          WHERE (n.id IS NOT NULL AND n.deleted_at IS NULL AND n.index_state <> 'excluded'
-                AND c.rev = n.current_rev)
+                AND c.rev = n.current_rev AND c.attachment_id IS NULL)
             OR (e.id IS NOT NULL AND e.deleted_at IS NULL AND e.index_state <> 'excluded')",
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),

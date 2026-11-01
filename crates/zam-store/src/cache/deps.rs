@@ -77,6 +77,8 @@ fn load_target(c: &Connection, t: TargetRef) -> Result<Option<Target>, StoreErro
                 })
             })
             .optional()?,
+        // вложение источником выжимки не бывает (до M5 — только узлы и записи)
+        TargetKind::Attachment => None,
     })
 }
 
@@ -87,6 +89,9 @@ pub(crate) fn current_text(c: &Connection, t: TargetRef, rev: i64) -> Result<Str
         TargetKind::Entry => Ok(c
             .prepare_cached("SELECT body FROM entries WHERE id = ?1")?
             .query_row([t.id], |r| r.get(0))?),
+        TargetKind::Attachment => Err(StoreError::BadInput(
+            "вложение не бывает источником выжимки".into(),
+        )),
     }
 }
 

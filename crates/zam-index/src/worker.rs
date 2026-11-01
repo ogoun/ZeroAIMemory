@@ -1302,6 +1302,9 @@ impl Worker {
                     let chunks = match j.target_kind {
                         TargetKind::Node => chunks_for_index(db, j.target_id).await,
                         TargetKind::Entry => entry_chunks_for_index(db, j.target_id).await,
+                        // стадия извлечения и точки вложений — задача 5 M5: пока у документа
+                        // вложения точек нет (`delete` без них — пустая операция)
+                        TargetKind::Attachment => Ok(Vec::new()),
                     };
                     match chunks {
                         Ok(c) if c.is_empty() => Plan::Delete,

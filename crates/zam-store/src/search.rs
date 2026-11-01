@@ -276,7 +276,8 @@ const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.spac
 fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
     let target = chunk_target(r.get(o + 1)?, r.get(o + 2)?)?;
     let entry = match target.kind {
-        TargetKind::Node => None,
+        // `chunk_target` вложений не даёт: чанк вложения — цель узла-владельца (выдача — задача 6)
+        TargetKind::Node | TargetKind::Attachment => None,
         TargetKind::Entry => Some(EntryHit {
             kind: r.get(o + 12)?,
             status: r.get(o + 13)?,
@@ -479,13 +480,15 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
 /// пространства — с `?3`, за ними [`TargetArgs`]: «узлы проходят», JSON видов записей,
 /// JSON статусов или NULL, область или NULL (см. [`scope_args`]). Префикс сравнивается через
 /// substr, а не LIKE: LIKE в SQLite нечувствителен к регистру ASCII и требует экранирования `%` и
-/// `_`. У записи пути нет: при префиксе она не проходит.
+/// `_`. У записи пути нет: при префиксе она не проходит. Чанки вложений (`attachment_id`, M5)
+/// не проходят: поиск по ним — задача 6 M5.
 fn scope_sql(n_spaces: usize) -> String {
     let sp = placeholders(3, n_spaces);
     let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
     let (cert, by, file, ik) = (7 + n_spaces, 8 + n_spaces, 9 + n_spaces, 10 + n_spaces);
     format!(
-        "((c.node_id IS NOT NULL AND ?{notes} AND ?{by} IS NULL AND n.deleted_at IS NULL
+        "((c.node_id IS NOT NULL AND c.attachment_id IS NULL AND ?{notes} AND ?{by} IS NULL
+           AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
            AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
            AND (?{area} IS NULL OR n.area = ?{area})
@@ -1033,6 +1036,8 @@ pub async fn leaves_of_targets(
             let st = match t.kind {
                 TargetKind::Node => &mut by_node,
                 TargetKind::Entry => &mut by_entry,
+                // листов (`level = 'chunk'`) у документа вложения нет
+                TargetKind::Attachment => continue,
             };
             let rows = st.query_map(params![t.id, with_text], |r| {
                 Ok(LeafChunk {
@@ -1078,6 +1083,8 @@ pub async fn first_leaves(
             let st = match t.kind {
                 TargetKind::Node => &mut by_node,
                 TargetKind::Entry => &mut by_entry,
+                // листов (`level = 'chunk'`) у документа вложения нет
+                TargetKind::Attachment => continue,
             };
             if let Some(id) = st
                 .query_row([t.id], |r| r.get::<_, String>(0))
@@ -1143,6 +1150,8 @@ pub async fn leaf_term_hits(
             let col = match kind {
                 TargetKind::Node => "node_id",
                 TargetKind::Entry => "entry_id",
+                // в `lists` вложений нет: листов у них нет
+                TargetKind::Attachment => continue,
             };
             let mut st = tx.prepare_cached(&format!(
                 "SELECT c.seq, c.id, c.{col}, c.heading_path, c.ordinal FROM chunks c

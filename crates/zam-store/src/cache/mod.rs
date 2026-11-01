@@ -294,6 +294,8 @@ pub(crate) fn kind_str(k: TargetKind) -> &'static str {
     match k {
         TargetKind::Node => "node",
         TargetKind::Entry => "entry",
+        // вложение источником выжимки не бывает (CHECK `cache_deps`): запросы по нему пусты
+        TargetKind::Attachment => "attachment",
     }
 }
 

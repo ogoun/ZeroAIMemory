@@ -76,11 +76,13 @@ fn qdrant_state(s: &Option<QdrantState>) -> (&'static str, Option<String>) {
     }
 }
 
-/// Неудавшееся задание: цель — `node_id` у узла, `entry_id` у записи журнала.
+/// Неудавшееся задание: цель — `node_id` у узла, `entry_id` у записи журнала,
+/// `attachment_id` у документа вложения (путь — узла-владельца).
 fn failed_json(user: Id, f: &FailedJob) -> Value {
     let id_key = match f.target_kind {
         zam_core::TargetKind::Node => "node_id",
         zam_core::TargetKind::Entry => "entry_id",
+        zam_core::TargetKind::Attachment => "attachment_id",
     };
     let mut v = json!({
         "id": f.id,
