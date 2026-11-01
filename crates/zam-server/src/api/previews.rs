@@ -525,8 +525,9 @@ fn slides_json(x: zam_docs::Extracted) -> Value {
 }
 
 /// JSON страницы листа: имена листов через сканер секретов, номера `ref_no` листов `sheet:#N`
-/// (если в книге есть лист с секретом), признак `secret`. Второе значение — отпечаток номеров
-/// для ETag (только при листах с секретом).
+/// (у всех листов с единицами извлечения — как считают `/read` и поиск; пустой лист и лист до
+/// готовности извлечения — `null`), признак `secret`. Второе значение — отпечаток номеров для
+/// ETag: готовность номеров меняет ETag (раунд правок 1 задачи 9, M-3).
 async fn sheet_json(
     loc: &Located,
     sha: &str,
@@ -534,16 +535,12 @@ async fn sheet_json(
     p: WireSheetPage,
 ) -> (Value, Option<String>) {
     let secret: Vec<bool> = p.sheets.iter().map(|n| mask_text(n) != *n).collect();
-    let refs = if secret.iter().any(|s| *s) {
-        match zam_store::blob_sheet_locators(&loc.db, sha).await {
-            Ok(l) => Some(Sheets::of(l.iter().map(String::as_str))),
-            Err(e) => {
-                tracing::warn!(sha256 = %sha, error = %e, "номера листов превью не прочитаны");
-                None
-            }
+    let refs = match zam_store::blob_sheet_locators(&loc.db, sha).await {
+        Ok(l) => Some(Sheets::of(l.iter().map(String::as_str))),
+        Err(e) => {
+            tracing::warn!(sha256 = %sha, error = %e, "номера листов превью не прочитаны");
+            None
         }
-    } else {
-        None
     };
     let ref_no = |name: &str| refs.as_ref().and_then(|s| s.no(name));
     let sheets: Vec<Value> = p

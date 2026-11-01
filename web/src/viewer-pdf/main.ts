@@ -7,7 +7,10 @@
 //   удалён); передаётся явно на случай отката версии;
 // - формы не отрисовываются (AnnotationMode.ENABLE — только ссылки), редактор аннотаций выключен;
 // - внешние ссылки PDF — в новой вкладке с rel=noopener noreferrer nofollow;
-// - байты файла приходят сообщением от WebUI (protocol.ts): API и выбор пользователя не нужны.
+// - байты файла приходят сообщением от WebUI (protocol.ts): API и выбор пользователя не нужны;
+// - источник документа непрозрачный (CSP `sandbox` без allow-same-origin, web.rs): ни DOM
+//   WebUI, ни cookie, ни API; статика сервера читается по CORS (`/assets/`, `/pdfjs/` —
+//   `Access-Control-Allow-Origin: *`), воркер — классический из blob (см. `startWorker`).
 import 'pdfjs-dist/web/pdf_viewer.css';
 import './viewer.css';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -24,11 +27,27 @@ const find = $<HTMLInputElement>('find');
 const findStatus = $<HTMLSpanElement>('find-status');
 const errorBox = $<HTMLParagraphElement>('error');
 
-/** Адрес данных pdf.js от `<base href>` документа. */
+/** Адрес данных pdf.js от `<base href>` документа (источник сервера, не `self.origin`). */
 const dataUrl = (p: string) => new URL(`${PDFJS_DIR}/${p}`, document.baseURI).href;
+/** Источник сервера и WebUI: у самого документа источник непрозрачный (`'null'`). */
+const serverOrigin = new URL(document.baseURI).origin;
 
 function post(m: FromViewer) {
-  window.parent.postMessage(m, location.origin);
+  window.parent.postMessage(m, serverOrigin);
+}
+
+/**
+ * Воркер pdf.js. Модульный воркер с адресом сервера из непрозрачного документа не создать
+ * (другой источник), модульный из blob — не стартует; классический воркер из blob грузит модуль
+ * `import()` по CORS, а ранние сообщения pdf.js копит до его загрузки.
+ */
+function startWorker(): Worker {
+  const url = JSON.stringify(dataUrl(WORKER_FILE));
+  const wrap =
+    'const q=[];const h=(e)=>q.push(e.data);self.addEventListener("message",h);' +
+    `import(${url}).then(()=>{self.removeEventListener("message",h);` +
+    'for(const d of q)self.dispatchEvent(new MessageEvent("message",{data:d}));});';
+  return new Worker(URL.createObjectURL(new Blob([wrap], { type: 'text/javascript' })));
 }
 
 function fail(message: string) {
@@ -38,7 +57,7 @@ function fail(message: string) {
 }
 
 async function main() {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = dataUrl(WORKER_FILE);
+  pdfjsLib.GlobalWorkerOptions.workerPort = startWorker();
   // компоненты просмотрщика берут pdf.js из globalThis.pdfjsLib — до их загрузки
   (globalThis as unknown as { pdfjsLib: typeof pdfjsLib }).pdfjsLib = pdfjsLib;
   const v = await import('pdfjs-dist/web/pdf_viewer.mjs');
@@ -168,7 +187,7 @@ async function main() {
   });
 
   window.addEventListener('message', (e) => {
-    const m = accept<ToViewer>(e, window.parent);
+    const m = accept<ToViewer>(e, window.parent, serverOrigin);
     if (!m) return;
     if (m.type === 'zam-pdf-open') void open(m.data, m.page);
     else if (m.type === 'zam-pdf-page') goPage(m.page);

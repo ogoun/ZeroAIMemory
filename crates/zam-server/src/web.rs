@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::Request;
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode, Uri, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use memory_serve::{Asset, MemoryServe};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -24,9 +26,15 @@ img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri
 /// и `'wasm-unsafe-eval'` (декодеры JPEG 2000, JBIG2 и ICC pdf.js — WebAssembly), воркер pdf.js
 /// (`worker-src 'self' blob:`), встраивание только в WebUI (`frame-ancestors 'self'`), без
 /// отправки форм. `'unsafe-eval'` нет: JavaScript PDF и `eval` в документе не исполняются.
+/// Директива `sandbox` (раунд правок 1 задачи 9) — непрозрачный источник документа и при прямом
+/// открытии, и без атрибута `sandbox` фрейма: pdf.js не видит ни DOM WebUI, ни cookie сессии, а
+/// запросы к API уходят как межсайтовые (без CORS — отказ). Скрипты и всплывающие окна
+/// (ссылки PDF — http/https/mailto/tel, noopener) разрешены; навигация WebUI, формы,
+/// модальные окна — нет.
 pub const VIEWER_PDF_CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
 style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; \
-worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'self'; form-action 'none'";
+worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'self'; form-action 'none'; \
+sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox";
 
 /// Готовая страница WebUI (с подставленным base href) и её CSP; дёшево клонируется.
 #[derive(Clone)]
@@ -79,6 +87,26 @@ fn static_header(name: HeaderName, value: &'static str) -> SetResponseHeaderLaye
     SetResponseHeaderLayer::overriding(name, HeaderValue::from_static(value))
 }
 
+/// Публичная статика сборки, которую читает документ просмотрщика PDF с непрозрачным источником
+/// (модули и стили страницы — `crossorigin`, данные и воркер pdf.js — `fetch`/`import()`):
+/// `Access-Control-Allow-Origin: *` только здесь. Пользовательских данных в этих каталогах нет —
+/// только файлы `web/dist` (код, стили, CMap, WebAssembly, ICC); API и блобы — никогда.
+const PUBLIC_STATIC: [&str; 2] = ["/assets/", "/pdfjs/"];
+
+async fn cors_public_static(req: Request, next: Next) -> Response {
+    let public = PUBLIC_STATIC
+        .iter()
+        .any(|p| req.uri().path().starts_with(p));
+    let mut r = next.run(req).await;
+    if public {
+        r.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+    }
+    r
+}
+
 /// Маршруты ассетов (кроме index.html). Пусто, если `web/dist` не собран.
 pub fn assets_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     let sets: &[(&str, &[Asset])] = include!(concat!(env!("OUT_DIR"), "/memory_serve_assets.rs"));
@@ -92,6 +120,7 @@ pub fn assets_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     router
         .layer(static_header(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
         .layer(static_header(header::REFERRER_POLICY, "same-origin"))
+        .layer(axum::middleware::from_fn(cors_public_static))
 }
 
 /// Для путей вне `/api` и `/mcp` — index.html (SPA), для остальных — problem+json 404.
@@ -178,7 +207,8 @@ mod tests {
                 "script-src 'self' 'wasm-unsafe-eval'",
                 "worker-src 'self' blob:",
                 "frame-ancestors 'self'",
-                "form-action 'none'"
+                "form-action 'none'",
+                "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"
             ]
         );
     }

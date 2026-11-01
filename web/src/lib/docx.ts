@@ -15,7 +15,7 @@ export const DOCX_LIMITS = {
   maxBytes: 50 * 1024 * 1024,
   /** Записей архива. */
   maxEntries: 10_000,
-  /** Сумма распакованных размеров по центральному каталогу, байт. */
+  /** Сумма фактически распакованных байт всех записей (проверка потоком), байт. */
   maxUnpacked: 256 * 1024 * 1024,
 };
 
@@ -31,22 +31,63 @@ export interface DocxRender {
   target: boolean;
 }
 
-/** Проверка архива по центральному каталогу до разбора docx-preview. */
-async function checkZip(data: ArrayBuffer): Promise<void> {
+/** Поток распакованных байт записи jszip (`internalStream` — вне типов пакета). */
+interface ChunkStream {
+  on(ev: 'data', fn: (c: Uint8Array) => void): ChunkStream;
+  on(ev: 'error', fn: (e: Error) => void): ChunkStream;
+  on(ev: 'end', fn: () => void): ChunkStream;
+  pause(): ChunkStream;
+  resume(): ChunkStream;
+}
+
+const TOO_BIG = 'архив документа слишком велик для просмотра в браузере, скачайте файл';
+
+/**
+ * Распаковывает запись потоком, не накапливая её: число байт; больше `budget` — отказ сразу,
+ * поток останавливается. Ложный размер в каталоге jszip отвергает в конце записи.
+ */
+function drain(f: JSZip.JSZipObject, budget: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let n = 0;
+    let done = false;
+    const s = (f as unknown as { internalStream(t: string): ChunkStream }).internalStream('uint8array');
+    s.on('data', (c) => {
+      if (done) return;
+      n += c.length;
+      if (n > budget) {
+        done = true;
+        s.pause();
+        reject(new Error(TOO_BIG));
+      }
+    })
+      .on('error', (e) => {
+        if (done) return;
+        done = true;
+        reject(new Error(`архив документа повреждён: ${e.message}`));
+      })
+      .on('end', () => {
+        if (done) return;
+        done = true;
+        resolve(n);
+      })
+      .resume();
+  });
+}
+
+/**
+ * Проверка архива до разбора docx-preview: размер файла, число записей и **фактический** объём
+ * распаковки — потоком по всем записям (размерам центрального каталога верить нельзя: zip-бомба
+ * заявляет 100 Б и распаковывается в сотни МиБ; раунд правок 1 задачи 9, I-2).
+ */
+export async function checkZip(data: ArrayBuffer): Promise<void> {
   if (data.byteLength > DOCX_LIMITS.maxBytes) {
     throw new Error('файл больше 50 МиБ — просмотр в браузере недоступен, скачайте файл');
   }
   const zip = await JSZip.loadAsync(data, { checkCRC32: false });
-  let entries = 0;
-  let unpacked = 0;
-  zip.forEach((_, f) => {
-    entries++;
-    // размер из центрального каталога (jszip сверяет его с фактическим при распаковке)
-    unpacked += (f as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize ?? 0;
-  });
-  if (entries > DOCX_LIMITS.maxEntries || unpacked > DOCX_LIMITS.maxUnpacked) {
-    throw new Error('архив документа слишком велик для просмотра в браузере, скачайте файл');
-  }
+  const files = Object.values(zip.files).filter((f) => !f.dir);
+  if (files.length > DOCX_LIMITS.maxEntries) throw new Error(TOO_BIG);
+  let left = DOCX_LIMITS.maxUnpacked;
+  for (const f of files) left -= await drain(f, left);
 }
 
 /**
@@ -79,8 +120,8 @@ function frameCss(bg: string): string {
 function purifier() {
   const p = DOMPurify(window);
   p.addHook('afterSanitizeAttributes', (node) => {
-    if (node.nodeName !== 'A') return;
     const el = node as Element;
+    if (el.localName !== 'a') return;
     const href = el.getAttribute('href') ?? '';
     el.removeAttribute('target');
     if (href && !href.startsWith('#')) {

@@ -103,7 +103,15 @@ fn check_headers(r: &Resp, ctype: &str) {
     assert!(r.header("etag").starts_with('"'));
 }
 
-/// Файлы каталога `dir` (рекурсивно).
+/// Временный файл атомарной записи кэша (`.<hex>.tmp`, `docs/preview.rs`): до `rename`.
+fn is_tmp(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.') && n.ends_with(".tmp"))
+}
+
+/// Файлы каталога `dir` (рекурсивно), без временных файлов записи кэша: тест, увидевший файл
+/// до `rename`, падал на его имени (флейк `preview_cache_reused`, раунд правок 1 задачи 9).
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -115,7 +123,7 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else {
+            } else if !is_tmp(&p) {
                 out.push(p);
             }
         }
@@ -292,7 +300,11 @@ async fn preview_sheet_10k_first_screen_under_1s() {
     println!("превью 10k×8: холодный {cold:?}, из кэша {warm:?}, другое окно {other:?}");
     assert_eq!(p["total_rows"], 10_000);
     assert_eq!(p["rows"].as_array().unwrap().len(), 100);
-    assert_eq!(p, again);
+    // `ref_no` листа появляется, когда извлечение готово (может случиться между запросами)
+    assert_eq!(
+        (&p["header"], &p["rows"]),
+        (&again["header"], &again["rows"])
+    );
     assert_eq!(deep["rows"][0][0], "90000");
     let limit = if cfg!(debug_assertions) {
         Duration::from_secs(15)
@@ -621,6 +633,8 @@ async fn preview_cache_reused() {
     let n = note(&a, &a.token, "knowledge", "p/кэш").await;
     let book = xlsx(&[("Лист", &[&["a"], &["1"], &["2"]])]);
     let sha = sha_of(&upload(&a, &a.token, &n, "c.xlsx", &book).await);
+    // ETag листа учитывает готовность номеров `ref_no`: сравнение — после извлечения
+    wait_done(&a, owner, &n, "c.xlsx").await;
     let first = get(&a, &a.token, &sha, "kind=sheet").await;
     assert_eq!(first.status, StatusCode::OK, "{}", first.text());
     let dir = previews_dir(&a).join(owner.to_string()).join(&sha);
@@ -828,4 +842,34 @@ async fn preview_cache_bounded() {
     }
     assert!(total() <= 1024 * 1024, "кэш {} байт", total());
     assert!(total() > 0);
+}
+
+/// Номера `ref_no` — у всех листов с единицами извлечения, не только при листе с секретом
+/// (раунд правок 1 задачи 9, M-3): пустой лист перед целевым номера не получает, и `sheet:#1`
+/// `/read` — тот же лист, что `ref_no` 1 превью; ETag учитывает готовность номеров.
+#[tokio::test]
+async fn preview_ref_no_without_secret() {
+    let (a, _) = world("prev-refno").await;
+    let owner = a.st.admin_id;
+    let n = note(&a, &a.token, "knowledge", "p/номера").await;
+    let book = xlsx(&[("Пустой", &[]), ("Данные", &[&["ключ"], &["строка один"]])]);
+    let sha = sha_of(&upload(&a, &a.token, &n, "nums.xlsx", &book).await);
+    let doc = wait_done(&a, owner, &n, "nums.xlsx").await;
+    let p = ok_json(&a, &sha, "kind=sheet&sheet=2").await;
+    assert_eq!(p["name"], "Данные");
+    assert_eq!(p["sheets"][0]["ref_no"], Value::Null, "{p}");
+    assert_eq!(p["sheets"][1]["no"], 2);
+    assert_eq!(p["sheets"][1]["ref_no"], 1, "{p}");
+    let r = get(&a, &a.token, &sha, "kind=sheet&sheet=2").await;
+    let etag = r.header("etag").to_string();
+    assert!(etag.contains(".n"), "ETag с отпечатком номеров: {etag}");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/read",
+            Some(json!({"items": [{"id": format!("d:{}", doc.id), "locator": "sheet:#1!A1:A2"}]})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("строка один"), "{}", r.text());
 }

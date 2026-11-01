@@ -45,7 +45,8 @@
     void load(user, node, sha, file);
   });
 
-  let kind = $derived(viewerKind(file, meta?.mime ?? ''));
+  // вид — по сведениям вложения (имя и MIME из списка вложений заметки), а не по адресу
+  let kind = $derived(meta ? viewerKind(meta.filename, meta.mime) : 'none');
   let loc = $derived(parseLocator(locator));
   let download = $derived(blobUrl(user, sha, file));
   let noteHref = $derived(href({ name: 'node', user, space, node, anchor: null }));
@@ -74,7 +75,9 @@
 
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 
-  {#if kind === 'image'}
+  {#if !meta}
+    {#if !error}<p class="muted">Загрузка…</p>{/if}
+  {:else if kind === 'image'}
     <!-- картинки и SVG — только <img>: скрипты SVG не исполняются (Review Focus 5) -->
     <div class="image"><img src={download} alt={file} /></div>
   {:else if kind === 'none'}
@@ -85,7 +88,7 @@
         {#await import('./viewers/PdfViewer.svelte')}
           {@render wait()}
         {:then { default: V }}
-          <V {user} {sha} {file} page={loc?.kind === 'page' ? loc.n : null} {onexpired} />
+          <V {user} {sha} file={meta.filename} page={loc?.kind === 'page' ? loc.n : null} {onexpired} />
         {:catch e}
           {@render failed(e)}
         {/await}
@@ -93,7 +96,14 @@
         {#await import('./viewers/DocxViewer.svelte')}
           {@render wait()}
         {:then { default: V }}
-          <V {user} {sha} {file} para={loc?.kind === 'para' ? loc.n : null} {onexpired} />
+          <V
+            {user}
+            {sha}
+            file={meta.filename}
+            para={loc?.kind === 'para' ? loc.n : null}
+            serverError={meta.extract_error}
+            {onexpired}
+          />
         {:catch e}
           {@render failed(e)}
         {/await}

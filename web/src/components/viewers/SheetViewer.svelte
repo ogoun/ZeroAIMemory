@@ -2,8 +2,8 @@
   // Просмотр листов XLSX/XLS/ODS/CSV (M5): страницы строк из превью сервера
   // (`GET /previews/{sha}?kind=sheet`), виртуальная прокрутка (в DOM — только видимые строки),
   // закреплённые шапка и номера строк, переключение листов (tablist, стрелки), переход к
-  // диапазону `locator` из выдачи поиска. Лист `locator` — по имени; лист с секретом в имени —
-  // по номеру `sheet:#N` (`ref_no` превью).
+  // диапазону `locator` из выдачи поиска. Лист `locator` — по имени или по номеру `sheet:#N`
+  // (`ref_no` превью — у всех листов с единицами извлечения).
   import { untrack } from 'svelte';
   import { ApiError, errorText, previewSheet, type PreviewSheetRef, type SheetPreview } from '../../lib/api';
   import { colName, type CellRange, type Locator } from '../../lib/attachments';
@@ -58,12 +58,9 @@
 
   /** Лист `locator` в книге: по имени (не секрет) или по номеру `sheet:#N`. */
   function sheetOf(l: Extract<Locator, { kind: 'sheet' }>, all: PreviewSheetRef[]): number | null {
-    if (l.no !== null) {
-      const byRef = all.find((s) => s.ref_no === l.no);
-      if (byRef) return byRef.no;
-      // номеров `ref_no` нет (в книге нет листа с секретом) — номер по порядку книги
-      return all.some((s) => s.ref_no !== null) ? null : (all.find((s) => s.no === l.no)?.no ?? null);
-    }
+    // `sheet:#N` — только по `ref_no` сервера (номер среди листов с единицами, как в `/read`);
+    // номер по порядку книги не подставляется: пустые листы сдвигают нумерацию
+    if (l.no !== null) return all.find((s) => s.ref_no === l.no)?.no ?? null;
     return all.find((s) => !s.secret && s.name === l.name)?.no ?? null;
   }
 
@@ -113,7 +110,12 @@
       if (my !== gen) return;
       const l = locator;
       const target = l ? sheetOf(l, first.sheets) : null;
-      if (l && target === null) error = `Лист из выдачи (${l.no !== null ? `№${l.no}` : `«${l.name}»`}) не найден в книге.`;
+      if (l && target === null) {
+        error =
+          l.no !== null && !first.sheets.some((s) => s.ref_no !== null)
+            ? `Номер листа №${l.no} недоступен: текст книги ещё не извлечён. Откройте лист вкладкой.`
+            : `Лист из выдачи (${l.no !== null ? `№${l.no}` : `«${l.name}»`}) не найден в книге.`;
+      }
       if (target !== null && target !== first.sheet) {
         await openSheet(target, l!.range);
         return;

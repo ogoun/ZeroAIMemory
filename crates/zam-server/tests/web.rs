@@ -127,3 +127,30 @@ async fn missing_file_paths_are_not_found() {
         assert_eq!(ctype(&h), "application/problem+json", "{uri}");
     }
 }
+
+/// `Access-Control-Allow-Origin: *` — только у публичной статики (`/assets/`, `/pdfjs/`), которую
+/// читает документ просмотрщика PDF с непрозрачным источником; API и страницы — без него.
+#[tokio::test]
+async fn cors_only_on_public_static() {
+    let app = app("web-cors", "/memory").await;
+    let (st, h, _) = get(&app, "/memory/pdfjs/wasm/openjpeg.wasm").await;
+    if st == StatusCode::OK {
+        assert_eq!(h["access-control-allow-origin"], "*");
+    } else {
+        eprintln!("web/dist не собран — статика pdf.js не проверена");
+    }
+    for uri in [
+        "/memory/api/v1/health",
+        "/memory/api/v1/spaces",
+        "/memory/",
+        "/memory/viewer/pdf",
+        "/memory/THIRD-PARTY-NOTICES.txt",
+    ] {
+        let (_, h, _) = get(&app, uri).await;
+        assert!(
+            h.get("access-control-allow-origin").is_none(),
+            "{uri}: {:?}",
+            h.get("access-control-allow-origin")
+        );
+    }
+}

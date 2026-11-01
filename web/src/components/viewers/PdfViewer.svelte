@@ -2,11 +2,12 @@
   // Просмотр PDF (M5): pdf.js работает в отдельном документе `/viewer/pdf` (своя CSP с
   // 'wasm-unsafe-eval', web.rs) во фрейме; WebUI скачивает файл сам (сессия, выбор пользователя
   // администратора) и передаёт байты сообщением (viewer-pdf/protocol.ts). Фрейм без
-  // allow-top-navigation, allow-forms и allow-modals: документ не уводит WebUI и не показывает
-  // диалогов; allow-popups — внешние ссылки PDF открываются новой вкладкой (noopener).
+  // allow-same-origin (и CSP `sandbox` документа, web.rs): источник непрозрачный — ни DOM WebUI,
+  // ни cookie, ни API; без allow-top-navigation, allow-forms и allow-modals — документ не уводит
+  // WebUI и не показывает диалогов; allow-popups — ссылки PDF новой вкладкой (noopener).
   import { onMount } from 'svelte';
   import { ApiError, blobBytes, errorText } from '../../lib/api';
-  import { accept, type FromViewer, type ToViewer } from '../../viewer-pdf/protocol';
+  import { accept, OPAQUE_ORIGIN, type FromViewer, type ToViewer } from '../../viewer-pdf/protocol';
 
   interface Props {
     user: string;
@@ -26,8 +27,9 @@
   let bytes: ArrayBuffer | null = null;
   let sent = '';
 
+  /** Только своему фрейму и только после `ready`: адресат непрозрачный, источник не задать. */
   function send(m: ToViewer, transfer: Transferable[] = []) {
-    frame?.contentWindow?.postMessage(m, location.origin, transfer);
+    if (ready) frame?.contentWindow?.postMessage(m, '*', transfer);
   }
 
   /** Файл и фрейм готовы — открыть документ (байты передаются, копия не остаётся). */
@@ -68,7 +70,7 @@
 
   onMount(() => {
     const onmessage = (e: MessageEvent) => {
-      const m = accept<FromViewer>(e, frame?.contentWindow);
+      const m = accept<FromViewer>(e, frame?.contentWindow, OPAQUE_ORIGIN);
       if (!m) return;
       if (m.type === 'zam-pdf-ready') {
         ready = true;
@@ -92,7 +94,7 @@
   class="pdf-frame"
   title="Просмотр PDF"
   src="viewer/pdf"
-  sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
   referrerpolicy="no-referrer"
 ></iframe>
 

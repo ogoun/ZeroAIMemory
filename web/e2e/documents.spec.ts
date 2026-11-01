@@ -19,11 +19,14 @@ test.use({ storageState: ADMIN_STATE });
 const MAIN_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
   "img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'";
-/** CSP только ответа `/viewer/pdf`: главная + `'wasm-unsafe-eval'`, воркер, встраивание в WebUI. */
+/**
+ * CSP только ответа `/viewer/pdf`: главная + `'wasm-unsafe-eval'`, воркер, встраивание в WebUI и
+ * `sandbox` без allow-same-origin (непрозрачный источник документа).
+ */
 const VIEWER_PDF_CSP =
   "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; " +
   "img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'self'; " +
-  "base-uri 'self'; form-action 'none'";
+  "base-uri 'self'; form-action 'none'; sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox";
 
 /** Ошибки JS, CSP и неожиданные HTTP-ответы страницы и её фреймов. */
 function watch(page: Page): string[] {
@@ -83,9 +86,7 @@ test('pdf_opens_at_locator_page', async ({ page }) => {
   await expect(page).toHaveURL(/\/a\/[0-9a-f]{64}\/[^/]+\/page%3A2$/);
   await expect(page.getByRole('heading', { level: 1, name: FILES.pdf })).toBeVisible();
 
-  // отдельный документ /viewer/pdf: без доступа к навигации окна, формам и модальным окнам
-  const iframe = page.locator('iframe[title="Просмотр PDF"]');
-  await expect(iframe).toHaveAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox');
+  // отдельный документ /viewer/pdf с непрозрачным источником (проверка поведения — ниже)
   const viewer = page.frameLocator('iframe[title="Просмотр PDF"]');
   await expect(viewer.getByLabel('Страница', { exact: true })).toHaveValue('2', { timeout: 20_000 });
   await expect(viewer.getByText('из 3')).toBeVisible();
@@ -108,6 +109,30 @@ test('pdf_opens_at_locator_page', async ({ page }) => {
   // JavaScript PDF (OpenAction app.alert) не исполнен: диалогов нет (watch), метки нет
   expect(await pwned(page)).toBeNull();
   expect(problems).toEqual([]);
+
+  // изоляция от WebUI (Review Focus 5, раунд правок 1, I-1): DOM WebUI недоступен, запрос к API
+  // с cookie сессии не проходит (межсайтовый без CORS), cookie документа не читаются
+  const isolation = await frameOf(page, 'viewer/pdf').evaluate(async () => {
+    const out: Record<string, string> = { origin: String(self.origin) };
+    try {
+      out.parent = `ACCESS ${parent.document.title}`;
+    } catch (e) {
+      out.parent = (e as Error).name;
+    }
+    try {
+      const r = await fetch('api/v1/spaces', { credentials: 'include' });
+      out.api = `HTTP ${r.status}`;
+    } catch (e) {
+      out.api = (e as Error).name;
+    }
+    try {
+      out.cookie = `READ ${document.cookie}`;
+    } catch (e) {
+      out.cookie = (e as Error).name;
+    }
+    return out;
+  });
+  expect(isolation).toEqual({ origin: 'null', parent: 'SecurityError', api: 'TypeError', cookie: 'SecurityError' });
 
   // CSP документа просмотрщика: строковый код (eval-подобный таймер) и встроенный скрипт не
   // исполняются (CDP-вызов evaluate сам CSP обходит, поэтому проверка — кодом страницы)
@@ -305,6 +330,55 @@ test('attachments_list_detach', async ({ page }) => {
   await page.getByRole('tab', { name: /^Вложения/ }).click();
   await expect(list.getByRole('listitem')).toHaveCount(4);
   await expect(list.getByRole('button', { name: /^Открепить/ })).toHaveCount(0);
+  expect(problems).toEqual([]);
+});
+
+test('sheet_no_locator_without_secret', async ({ page }) => {
+  // `sheet:#1` — первый лист с единицами (как в `/read`), а не первый в книге: перед ним пустой
+  const problems = watch(page);
+  const me = await login(page);
+  const note = env('E2E_NOTE_DOCS');
+  const list = (await (await page.request.get(`${base()}api/v1/nodes/${note}/attachments`)).json()) as {
+    sha256: string;
+    filename: string;
+  }[];
+  const nums = list.find((a) => a.filename === FILES.nums)!;
+  await page.goto(
+    `${base()}#/u/${me}/s/knowledge/n/${note}/a/${nums.sha256}/${encodeURIComponent(nums.filename)}/${encodeURIComponent('sheet:#1!A2:B2')}`,
+  );
+  const tabs = page.getByRole('tablist', { name: 'Листы' });
+  await expect(tabs.getByRole('tab', { name: 'Цифры' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('grid', { name: /Цифры/ }).getByText('один')).toBeVisible();
+  await expect(page.getByTestId('sheet-range')).toContainText('A2:B2');
+  expect(problems).toEqual([]);
+});
+
+test('docx_zip_bomb_refused', async ({ page }) => {
+  // 320 МиБ распаковки при заявленных 100 Б: отказ по фактическому объёму, вкладка жива
+  const problems = watch(page);
+  const me = await login(page);
+  const note = env('E2E_NOTE_BOMB');
+  await page.goto(`${base()}#/u/${me}/s/knowledge/n/${note}`);
+  await page.getByRole('tab', { name: /^Вложения/ }).click();
+  await page.getByRole('link', { name: FILES.bomb, exact: true }).click();
+  // какой отказ — зависит от итога сервера: too_large/parse_oom — без разбора в браузере,
+  // иначе — потоковая проверка распаковки в браузере (главный случай I-2)
+  const docs = (await (await page.request.get(`${base()}api/v1/nodes/${note}/attachments`)).json()) as {
+    extract_error: string | null;
+  }[];
+  const code = (docs[0].extract_error ?? '').split(':')[0];
+  const heavy = code === 'too_large' || code === 'parse_oom';
+  console.log(`бомба: сервер ${docs[0].extract_error ?? 'без ошибки'}, отказ ${heavy ? 'по итогу сервера' : 'в браузере'}`);
+  await expect(page.getByRole('alert')).toContainText(
+    heavy ? 'не смог его разобрать' : 'слишком велик для просмотра в браузере',
+    { timeout: 30_000 },
+  );
+  await expect(page.locator('iframe[title="Просмотр DOCX"]')).toHaveCount(0);
+  expect(await page.evaluate(() => 1 + 1)).toBe(2);
+  const heap = await page.evaluate(
+    () => (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? 0,
+  );
+  expect(heap).toBeLessThan(150 * 1024 * 1024);
   expect(problems).toEqual([]);
 });
 

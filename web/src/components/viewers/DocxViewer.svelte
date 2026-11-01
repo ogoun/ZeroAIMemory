@@ -4,6 +4,10 @@
   // прокручивается в видимую часть фрейма средствами CSS (скриптов во фрейме нет).
   import { ApiError, blobBytes, errorText } from '../../lib/api';
   import { renderDocx } from '../../lib/docx';
+  import { errorCode } from '../../lib/attachments';
+
+  /** Причины неудачи сервера, при которых файл не разбирается и в браузере. */
+  const HEAVY = new Set(['too_large', 'parse_oom']);
 
   interface Props {
     user: string;
@@ -11,10 +15,12 @@
     file: string;
     /** Абзац из выдачи поиска (`para:N`). */
     para: number | null;
+    /** `extract_error` вложения: `too_large`/`parse_oom` — в браузере не разбирать. */
+    serverError?: string | null;
     onexpired: () => void;
   }
 
-  let { user, sha, file, para, onexpired }: Props = $props();
+  let { user, sha, file, para, serverError = null, onexpired }: Props = $props();
 
   let srcdoc = $state<string | null>(null);
   let error = $state('');
@@ -27,6 +33,13 @@
     busy = true;
     error = '';
     note = '';
+    if (serverError && HEAVY.has(errorCode(serverError))) {
+      srcdoc = null;
+      busy = false;
+      error =
+        'Документ не показан: сервер не смог его разобрать (слишком велик или не хватило памяти). Скачайте файл.';
+      return;
+    }
     try {
       const data = await blobBytes(u, s, f);
       const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg');

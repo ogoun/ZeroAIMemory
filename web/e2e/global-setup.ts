@@ -130,6 +130,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_NOTE_ELK = ids.elk;
     process.env.E2E_NOTE_DOCS = docs.docs;
     process.env.E2E_NOTE_ATTACH = docs.attach;
+    process.env.E2E_NOTE_BOMB = docs.bomb;
     // токен администратора — для правок «из другого места» в сценариях конфликта
     process.env.E2E_ADMIN_TOKEN = token;
     process.env.E2E_INSIGHT_OLD = journals.oldInsight;

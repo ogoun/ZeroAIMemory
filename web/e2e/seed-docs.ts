@@ -1,7 +1,7 @@
 // Заметки с вложениями для E2E просмотрщиков (M5): документы собираются docs-fixtures.ts,
 // загружаются по первому токену администратора; global-setup ждёт извлечения текста (поиск
 // по вложениям — полнотекстовый, pdfium — из target/deps).
-import { makeBrokenDocx, makeDocx, makePdf, makePptx, makeXlsx } from './docs-fixtures';
+import { makeBrokenDocx, makeDocx, makePdf, makePptx, makeXlsx, makeZipBombDocx } from './docs-fixtures';
 
 /** Уникальные слова документов: поиск находит фрагмент вложения с `locator`. */
 export const WORDS = {
@@ -21,6 +21,9 @@ export const FILES = {
   docx: 'договор.docx',
   xlsx: 'таблица.xlsx',
   pptx: 'доклад.pptx',
+  /** Книга без секретов с пустым первым листом: `sheet:#1` — второй лист книги. */
+  nums: 'номера.xlsx',
+  bomb: 'бомба.docx',
   svg: 'схема.svg',
   broken: 'сломанный.docx',
   scan: 'скан.pdf',
@@ -88,11 +91,14 @@ export interface DocsSeed {
   docs: string;
   /** Заметка для списка вложений и открепления. */
   attach: string;
+  /** Заметка с zip-бомбой под видом DOCX. */
+  bomb: string;
 }
 
 export async function seedDocs(base: string, token: string): Promise<DocsSeed> {
   const docs = await note(base, token, 'E2E/Документы', '# Документы\n\nВложения для просмотрщиков.\n');
   const attach = await note(base, token, 'E2E/Вложения', '# Вложения\n\nСписок вложений заметки.\n');
+  const bomb = await note(base, token, 'E2E/Бомба', '# Бомба\n\nВраждебный DOCX.\n');
 
   const pdf = makePdf(
     [
@@ -153,6 +159,20 @@ export async function seedDocs(base: string, token: string): Promise<DocsSeed> {
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   );
 
+  await upload(
+    base,
+    token,
+    docs,
+    FILES.nums,
+    await makeXlsx([
+      ['Пусто', []],
+      ['Цифры', [['Код', 'Число'], ['N1', 'один'], ['N2', 'два']]],
+    ]),
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  );
+  // 320 МиБ распаковки при заявленных 100 Б (предел просмотра — 256 МиБ)
+  await upload(base, token, bomb, FILES.bomb, makeZipBombDocx(320 * 1024 * 1024), 'application/octet-stream');
+
   await upload(base, token, attach, FILES.svg, HOSTILE_SVG, 'image/svg+xml');
   // настоящий DOCX с битым XML тела: разбор — failed parse_error
   await upload(base, token, attach, FILES.broken, await makeBrokenDocx(), 'application/octet-stream');
@@ -160,6 +180,6 @@ export async function seedDocs(base: string, token: string): Promise<DocsSeed> {
   await upload(base, token, attach, FILES.text, 'Обычные текстовые заметки.\n', 'text/plain');
   await upload(base, token, attach, FILES.extra, 'Это вложение открепляется в тесте.\n', 'text/plain');
 
-  await waitExtracted(base, token, [docs, attach]);
-  return { docs, attach };
+  await waitExtracted(base, token, [docs, attach, bomb]);
+  return { docs, attach, bomb };
 }

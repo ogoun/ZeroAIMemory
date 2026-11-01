@@ -2,6 +2,7 @@
 // фикстур в git нет. Писатели повторяют помощники Rust-тестов: PDF — `zam_docs::test_pdf`
 // (Helvetica, WinAnsi), OOXML — `crates/zam-server/tests/common/attach.rs`.
 import JSZip from 'jszip';
+import { deflateRawSync } from 'node:zlib';
 
 // ---- PDF ----
 
@@ -231,4 +232,36 @@ export async function makePptx(slides: [string, string][]): Promise<Buffer> {
     'ppt/_rels/presentation.xml.rels': rels(presRels),
     ...files,
   });
+}
+
+/**
+ * Zip-бомба под видом DOCX (порт зонда ревью задачи 9): `word/document.xml` из `real` пробелов
+ * (сжато — сотни КБ), а в локальном заголовке и центральном каталоге заявлено `claimed` байт.
+ * Просмотр в браузере должен отказать по фактическому объёму распаковки, не исчерпав память.
+ */
+export function makeZipBombDocx(real: number, claimed = 100): Buffer {
+  const comp = deflateRawSync(Buffer.alloc(real, 0x20), { level: 9 });
+  const name = Buffer.from('word/document.xml');
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt32LE(comp.length, 18);
+  local.writeUInt32LE(claimed, 22);
+  local.writeUInt16LE(name.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(8, 10);
+  central.writeUInt32LE(comp.length, 20);
+  central.writeUInt32LE(claimed, 24);
+  central.writeUInt16LE(name.length, 28);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(central.length + name.length, 12);
+  eocd.writeUInt32LE(local.length + name.length + comp.length, 16);
+  return Buffer.concat([local, name, comp, central, name, eocd]);
 }
