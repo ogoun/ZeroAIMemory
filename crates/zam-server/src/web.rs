@@ -1,4 +1,5 @@
-//! WebUI: статические ассеты из `web/dist` (встроены через memory-serve) и SPA fallback.
+//! WebUI: статические ассеты из `web/dist` (встроены через memory-serve), SPA fallback и
+//! документ просмотрщика PDF `/viewer/pdf` со своей CSP (M5).
 use std::sync::Arc;
 
 use axum::Router;
@@ -12,13 +13,24 @@ use crate::error::not_found;
 /// `index.html` из `web/dist` (или заглушка), см. build.rs.
 const INDEX_TEMPLATE: &str = include_str!(env!("ZAM_WEB_INDEX"));
 
+/// `viewer-pdf.html` — документ просмотрщика PDF (pdf.js) из `web/dist` (или заглушка).
+const VIEWER_PDF_TEMPLATE: &str = include_str!(env!("ZAM_WEB_VIEWER_PDF"));
+
 /// Политика для HTML: без inline-скриптов, фреймы запрещены.
-const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
 img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'";
 
-/// Готовый index.html (с подставленным base href); дёшево клонируется.
+/// Политика только документа `/viewer/pdf` (M5, спецификация §5 и §11 п. 3): главная [`CSP`]
+/// и `'wasm-unsafe-eval'` (декодеры JPEG 2000, JBIG2 и ICC pdf.js — WebAssembly), воркер pdf.js
+/// (`worker-src 'self' blob:`), встраивание только в WebUI (`frame-ancestors 'self'`), без
+/// отправки форм. `'unsafe-eval'` нет: JavaScript PDF и `eval` в документе не исполняются.
+pub const VIEWER_PDF_CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; \
+worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'self'; form-action 'none'";
+
+/// Готовая страница WebUI (с подставленным base href) и её CSP; дёшево клонируется.
 #[derive(Clone)]
-pub struct Index(Arc<str>);
+pub struct Index(Arc<str>, &'static str);
 
 fn escape_attr(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -44,8 +56,17 @@ fn render_index(template: &str, base_path: &str) -> String {
 }
 
 impl Index {
+    /// Главная страница (SPA).
     pub fn new(base_path: &str) -> Self {
-        Self(render_index(INDEX_TEMPLATE, base_path).into())
+        Self(render_index(INDEX_TEMPLATE, base_path).into(), CSP)
+    }
+
+    /// Документ просмотрщика PDF (`/viewer/pdf`) — со своей CSP [`VIEWER_PDF_CSP`].
+    pub fn viewer_pdf(base_path: &str) -> Self {
+        Self(
+            render_index(VIEWER_PDF_TEMPLATE, base_path).into(),
+            VIEWER_PDF_CSP,
+        )
     }
 
     /// Ответ 200 с HTML и заголовками безопасности.
@@ -96,7 +117,7 @@ fn html(index: &Index) -> Response {
     );
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
+        HeaderValue::from_static(index.1),
     );
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -132,6 +153,33 @@ mod tests {
         assert_eq!(
             render_index("<head><title>x</title>", ""),
             r#"<head><base href="/"><title>x</title>"#
+        );
+    }
+
+    #[test]
+    fn viewer_csp_is_main_plus_wasm_and_worker() {
+        // главная политика + только оговорённые директивы (Review Focus 5 M5)
+        let main: Vec<&str> = CSP.split("; ").collect();
+        let viewer: Vec<&str> = VIEWER_PDF_CSP.split("; ").collect();
+        assert!(!CSP.contains("wasm-unsafe-eval"));
+        assert!(!VIEWER_PDF_CSP.contains("'unsafe-eval'"));
+        let replaced = ["script-src 'self'", "frame-ancestors 'none'"];
+        for d in main.iter().filter(|d| !replaced.contains(d)) {
+            assert!(viewer.contains(d), "в CSP просмотрщика нет {d:?}");
+        }
+        let extra: Vec<&str> = viewer
+            .iter()
+            .copied()
+            .filter(|d| !main.contains(d))
+            .collect();
+        assert_eq!(
+            extra,
+            [
+                "script-src 'self' 'wasm-unsafe-eval'",
+                "worker-src 'self' blob:",
+                "frame-ancestors 'self'",
+                "form-action 'none'"
+            ]
         );
     }
 

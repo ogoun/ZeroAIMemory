@@ -4,6 +4,8 @@
   // метки каналов (`vector`, `fts`), строка деградации и предупреждения сервера (в том числе
   // о доступе к чужим решениям), переход к заметке и разделу. Записи журналов (insight,
   // changelog, release) — карточками с видом, статусом и надёжностью; переход — в журнал.
+  // Фрагменты вложений (M5) — карточками файла с местом в документе; переход — в просмотрщик
+  // вложения к этому месту (`locator`: страница, лист и диапазон, слайд, абзац).
   import { Dialog } from 'bits-ui';
   import { untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
@@ -160,6 +162,19 @@
       return;
     }
     if (!it.node_id) return;
+    if (it.kind === 'attachment' && it.blob_sha256 && it.file) {
+      open = false;
+      go({
+        name: 'attachment',
+        user,
+        space,
+        node: it.node_id,
+        sha: it.blob_sha256,
+        file: it.file,
+        locator: it.locator ?? null,
+      });
+      return;
+    }
     const anchor = await anchorFor(it);
     open = false;
     go({ name: 'node', user, space, node: it.node_id, anchor });
@@ -227,7 +242,7 @@
       {/if}
       {#if items.length}
         <ul id="search-results" class="results" role="listbox" aria-label="Результаты поиска">
-          {#each items as it, i (`${it.node_id ?? it.entry_id}:${i}`)}
+          {#each items as it, i (`${it.id ?? it.node_id ?? it.entry_id}:${i}`)}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <li
               id={`search-opt-${i}`}
@@ -245,6 +260,15 @@
                   {#if it.status}<span class="estatus">{STATUS_TEXT[it.status] ?? it.status}</span>{/if}
                   <CertaintyBadge value={it.certainty} />
                   {#if it.stale_refs?.length}<span class="stale" title={staleText(it.stale_refs)}>{staleText(it.stale_refs)}</span>{/if}
+                  {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}
+                </div>
+              {:else if it.kind === 'attachment'}
+                <div class="where entry-card att-card">
+                  <span class="ekind">файл</span>
+                  <span class="etitle">{it.file ?? ''}</span>
+                  {#if it.locator_text}<span class="loc">{it.locator_text}</span>{/if}
+                  <span>в <span class="space">{it.space?.name ?? '?'}</span>{` / ${it.path}`}</span>
+                  {#if it.heading_path}<span class="section">{`› ${it.heading_path}`}</span>{/if}
                   {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}
                 </div>
               {:else}
@@ -329,6 +353,13 @@
     color: var(--text);
   }
   .estatus {
+    font-size: 12px;
+  }
+  .loc {
+    padding: 0 6px;
+    border-radius: 8px;
+    background: var(--selected);
+    color: var(--text);
     font-size: 12px;
   }
   .snippet {

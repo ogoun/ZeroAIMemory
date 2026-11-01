@@ -1,1 +1,12 @@
-[{ "name": "entry", "path": "dist/assets/entry-*.js", "gzip": true, "limit": "300 KB" }]
+[
+  { "name": "entry", "path": "dist/assets/entry-*.js", "gzip": true, "limit": "105 KB" },
+  { "name": "AttachmentView", "path": "dist/assets/AttachmentView-*.js", "gzip": true, "limit": "4 KB" },
+  { "name": "PdfViewer", "path": "dist/assets/PdfViewer-*.js", "gzip": true, "limit": "2 KB" },
+  { "name": "DocxViewer (docx-preview, jszip)", "path": "dist/assets/DocxViewer-*.js", "gzip": true, "limit": "60 KB" },
+  { "name": "SheetViewer", "path": "dist/assets/SheetViewer-*.js", "gzip": true, "limit": "5 KB" },
+  { "name": "SlidesViewer", "path": "dist/assets/SlidesViewer-*.js", "gzip": true, "limit": "3 KB" },
+  { "name": "TextViewer", "path": "dist/assets/TextViewer-*.js", "gzip": true, "limit": "2 KB" },
+  { "name": "viewer-pdf (pdf.js)", "path": "dist/assets/viewer-pdf-*.js", "gzip": true, "limit": "140 KB" },
+  { "name": "pdf_viewer (компоненты pdf.js)", "path": "dist/assets/pdf_viewer-*.js", "gzip": true, "limit": "60 KB" },
+  { "name": "pdf.worker", "path": "dist/pdfjs/pdf.worker-*.min.js", "gzip": true, "limit": "400 KB" }
+]

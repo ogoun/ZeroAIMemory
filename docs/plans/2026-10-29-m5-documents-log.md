@@ -1644,6 +1644,133 @@ images 5/5). Генератор фикстур ревьюера — `.tmp/review
 в release. Для задачи 9 (просмотрщики): `sheets[].no`/`ref_no` для перехода по `sheet:#N`,
 `highlight.css` для `kind=text`, `kind=thumb` для изображений и страниц PDF.
 
+### Задача 9 — WebUI: вложения и просмотрщики PDF/DOCX/XLSX/PPTX (2026-11-01)
+
+BASE 97cb49a. e2e `web/e2e/documents.spec.ts` (шесть сценариев брифа) написаны до кода; документы
+собирают генераторы `web/e2e/docs-fixtures.ts` (PDF — порт `zam_docs::test_pdf`, OOXML — порт
+`tests/common/attach.rs`, через jszip), бинарных фикстур в git нет; заметки — `seed-docs.ts`,
+global-setup ждёт извлечения; pdfium e2e-сервера — `ZAM_DOCS__PDFIUM_DYLIB` из `target/deps`.
+
+- **Маршрут просмотра** `#/u/<user>/s/<space>/n/<node>/a/<sha256>/<имя>[/<locator>]` (router.ts):
+  ссылка из списка вложений и из карточки поиска; «назад» браузера работает, адрес можно
+  переслать. `AttachmentView` (ленивый чанк) берёт сведения из `GET /nodes/{id}/attachments` и
+  выбирает просмотрщик по расширению (затем по MIME); каждый просмотрщик — свой ленивый чанк.
+- **Карточки вложений в Ctrl+K** (`kind: attachment`): файл, `locator_text`, пространство и путь
+  заметки; Enter или клик — просмотрщик на месте `locator` (карточка уже несёт `sheet:#N` для листа
+  с секретом). Отдельной страницы выдачи в WebUI нет — выдача и есть Ctrl+K.
+- **Список вложений** — вкладка «Вложения N» заметки (`AttachmentList`): имя, размер, состояние
+  (`pending|done|failed|unsupported` по-русски; у `failed` — текст по коду `extract_error` до `:`,
+  сам код — в подсказке; пути сервера в причине нет и так — задача 5), «нужно распознавание» при
+  `ocr_needed`, «Скачать», «Открепить» с подтверждением (`Prompt`). **Право записи:** кнопки нет,
+  если `GET /spaces` отдаёт `access: ro` (токен) или пространство — решение участника в режиме
+  `ro`; сервер всё равно проверяет `Mode::Write`.
+- **PDF (Review Focus 5).** Документ `/viewer/pdf` — вторая страница сборки vite
+  (`web/viewer-pdf.html`); build.rs не кладёт её в ассеты, `web.rs` отдаёт с подстановкой
+  `base href` и своей CSP `VIEWER_PDF_CSP`: главная + `'wasm-unsafe-eval'`,
+  `worker-src 'self' blob:`, `frame-ancestors 'self'` (иначе фрейм не встроить) и
+  `form-action 'none'`. **Байты файла WebUI передаёт сообщением** (transfer,
+  `viewer-pdf/protocol.ts`, проверка `source` и `origin`): документу просмотрщика не нужны API и
+  выбор пользователя администратора (`X-Zam-User`), поэтому `?sha=&page=` из брифа заменён
+  сообщением `zam-pdf-open {data, page}`. Фрейм —
+  `sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"`: от
+  pdf.js он не изолирует (тот же источник), но запрещает навигацию WebUI, формы и модальные окна;
+  внешние ссылки PDF открываются новой вкладкой с `noopener noreferrer nofollow`.
+  JavaScript PDF pdf.js исполняет только через `PDFScriptingManager` и песочницу `quickjs-eval` —
+  они не подключены и не копируются в сборку; XFA выключен; `AnnotationMode.ENABLE` (ссылки без
+  форм), редактор аннотаций и авто-ссылки выключены. **`isEvalSupported`** в pdf.js 6 нет (путь
+  компиляции шрифтов через `new Function` удалён после CVE-2024-4367): опция передаётся явно на
+  случай отката версии, а `eval` запрещён CSP (e2e проверяет `EvalError` в документе
+  просмотрщика). Поиск — `PDFFindController` (Enter/Shift+Enter, «N из M»), страницы, масштаб.
+- **Данные pdf.js** — плагин `build/pdfjs-plugin.mjs` (список и причины — `src/viewer-pdf/assets.ts`):
+  воркер `pdf.worker-<версия>.min.js` (имя `.js` — MIME модуля не зависит от сервера; версия в
+  имени — против старого кэша), `cmaps/*.bcmap` (CJK, Adobe BSD-3), `wasm/{openjpeg,jbig2,qcms_bg}.wasm`
+  (ради них `'wasm-unsafe-eval'`) и `iccs/`, лицензии рядом. **Не берутся:** `quickjs-eval`
+  (скрипты PDF), `*_nowasm_fallback.js`, `standard_fonts/` — шрифты Liberation под GPL-2.0 с
+  исключением (вместо них системные шрифты, `useSystemFonts` по умолчанию). Плагины сборки —
+  `.mjs` с `.d.mts`: `vite.config.ts` проверяется svelte-check без `@types/node` (новой
+  зависимости нет).
+- **DOCX (Review Focus 5).** `lib/docx.ts`: пределы архива по центральному каталогу до разбора
+  (50 МиБ файла, 10 000 записей, 256 МиБ распаковки; jszip сверяет фактический размер записи с
+  заявленным); docx-preview строит DOM вне документа (`useBase64URL` — картинки `data:`;
+  `renderAltChunks: false` — HTML-вставки не отрисовываются; комментарии и правки — нет);
+  DOMPurify (свой экземпляр с хуками; запрещены формы, фреймы, `object`, `embed`, `link`, `meta`,
+  `base`, `srcset`, `ping`) → `srcdoc` фрейма `sandbox=""` (без `allow-scripts` и
+  `allow-same-origin`: непрозрачный источник, `document.cookie` — SecurityError) с CSP в `<meta>`
+  `default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:` поверх
+  унаследованной главной. Ссылки: у внешних (и `javascript:`) `href` снимается, адрес — в
+  подсказке; якоря `#…` остаются. **Абзац `para:n`:** нумерация — абзацы `article p` без
+  предка-абзаца (тело; колонтитулы и сноски docx-preview лежат вне `article`), как правило
+  сервера (`crates/zam-docs/src/docx.rs`); абзац получает `id="zam-target"`, прокрутка — CSS
+  `scroll-initial-target: nearest` (скриптов во фрейме нет). Chromium ≥ 133 — да; в Firefox и
+  Safari свойства пока нет: документ открывается с начала, абзац подсвечен. Возможные
+  расхождения нумерации: абзацы, удалённые правкой целиком (`w:del` знака абзаца), и ветки
+  `mc:Fallback` docx-preview может отрисовать иначе — номер сместится на число таких абзацев выше
+  цели.
+- **Листы.** `SheetViewer`: страницы по 200 строк (`GET /previews?kind=sheet&sheet=&from=&rows=`),
+  в DOM — видимые строки ± 12 (строка 28 px); закреплены буквы столбцов, шапка (первая непустая
+  строка) и номера строк; `role=grid` с `aria-rowcount`/`aria-rowindex` — номера строк листа;
+  вкладки листов — `tablist` (стрелки, Home, End). **Лист `locator`:** по имени (не секрет) или
+  `sheet:#N` через `ref_no` превью. Если `ref_no` нет ни у одного листа (в книге нет листа с
+  секретом), `#N` сопоставляется номеру по порядку книги; `/read` считает только непустые листы,
+  поэтому при пустом листе перед целевым номера разойдутся (карточки поиска `#N` для таких книг
+  не дают). Диапазон подсвечивается, первая его строка прокручивается под шапку. Столбцов в DOM —
+  не больше 200.
+- **PPTX** — `SlidesViewer` по `kind=text` (`format: slides`): список слайдов, «Слайд N из M»,
+  стрелки, PageUp/PageDown, Home/End на области слайда, заметки докладчика — `details`.
+- **Текст и код** — `TextViewer`: HTML подсветки сервера (`{@html}`: syntect, только
+  `<span class>`), `highlight.css`. **Картинки и SVG** — только `<img src=…?user=>`.
+- **CSP главной страницы не изменилась:** константа `web::CSP` (теперь `pub`) сравнивается с
+  эталоном в `tests/web.rs::main_csp_unchanged` (корень, глубокие адреса SPA) и в e2e
+  `main_csp_unchanged`; юнит `viewer_csp_is_main_plus_wasm_and_worker` — CSP просмотрщика равна
+  главной плюс ровно четыре директивы; `viewer_pdf_has_own_csp_and_base_href` — с `base_path` и
+  без, `/viewer-pdf.html` ассетом не отдаётся.
+- **Зависимости (аудит владельца; все не моложе двух недель на 2026-11-01).**
+  - `pdfjs-dist` 6.4.299 (2026-10-03, Apache-2.0, Mozilla; без зависимостей, кроме
+    необязательного `@napi-rs/canvas` для Node — в браузерную сборку не входит): единственный
+    зрелый рендерер PDF для браузера; спецификация §5 — pdf.js 6.x.
+  - `docx-preview` 0.4.1 (2026-09-21, Apache-2.0; зависимость — `jszip`): спецификация §5 —
+    docx-preview 0.4.
+  - `jszip` 3.10.2 (2026-09-08; `(MIT OR GPL-3.0-or-later)` — используется по MIT); браузерная
+    сборка jszip несёт `pako` 1.0.11 (`(MIT AND Zlib)`).
+  - `dompurify` 3.4.16 → 3.4.17 (2026-10-12): `npm audit` — GHSA-cg2g-xh64-v4q7 (critical,
+    SAFE_FOR_TEMPLATES), GHSA-mrv2-3pqr-j5jr (IN_PLACE), GHSA-c6gr-qvv4-5v3f (xhtml). Эти режимы
+    проект не использует; обновление — потому что санитайзер должен быть свежим.
+  - Политика лицензий: `(A AND B)` — если разрешены все части; Zlib — в списке (пермиссивная,
+    совместима с MIT); смешанные и вложенные выражения отклоняются. pako не виден
+    rollup-plugin-license (он внутри `dist/jszip.min.js`) — `build/embedded-notices.mjs`
+    проверяет его той же политикой и пишет в THIRD-PARTY-NOTICES.
+  - `npm audit` после: остаётся `deepmerge` (low, через `@sveltejs/vite-plugin-svelte`, только
+    сборка, исправления нет).
+- **Обязательства журнала.** `sheets[].no`/`ref_no` — сделано (выше). `/read` вложений и
+  оглавление в WebUI **не понадобились**: навигацию дают сами просмотрщики (страницы и поиск
+  pdf.js, вкладки листов, список слайдов), переход к месту — по `locator` карточки; оглавление
+  `/read` остаётся для агентов. Адрес `a:<chunk>` WebUI не нужен: карточка несёт `blob_sha256`,
+  `file`, `node_id` и `locator`.
+- **Найдено прогоном e2e и исправлено.** (1) `overflow: hidden` страницы docx-preview делает
+  `section.docx` контейнером прокрутки — `scroll-initial-target` прокручивал её, а не документ:
+  во фрейме `overflow: clip` (режет так же, контейнером прокрутки не является); зонд
+  `.tmp/m5/probe/probe.mjs` подтвердил поддержку свойства в Edge 156. (2) `frame.evaluate`
+  Playwright (CDP) CSP не подчиняется — `eval` в нём проходил; проверка CSP просмотрщика PDF — кодом
+  страницы: строковый `setTimeout` и встроенный `<script>` не исполняются. (3) Сообщения
+  «Blocked script execution in 'about:srcdoc'…» — отказ песочницы фрейма DOCX (их дают и вызовы
+  Playwright внутри фрейма); в `watch` не считаются ошибкой, отсутствие скриптов в документе и
+  метки `__pwned` проверяется отдельно. (4) «Сломанный» DOCX: мусор после `PK` сервер считает
+  неподдерживаемым видом (`unsupported`), незакрытый XML — частичным текстом (`done`); фикстура —
+  DOCX с DTD и внешней сущностью (XXE) → `failed parse_error`. (5) Вкладки заметки (добавилась
+  «Вложения») на ширине 390 px давали горизонтальную прокрутку страницы (`notes.spec.ts`):
+  ряд вкладок прокручивается сам, линия под ним — тенью.
+- **Размеры (size-limit, gzip):** entry 97,9 КБ (до задачи 94,96; предел 105 КБ = факт + 10);
+  AttachmentView 2,1; PdfViewer 1,0; DocxViewer (docx-preview + jszip) 50,6; SheetViewer 3,1;
+  SlidesViewer 1,8; TextViewer 0,9; документ просмотрщика PDF (pdf.js) 129,5; компоненты
+  pdf_viewer 51,1; воркер pdf.js 375,7 (грузится только в `/viewer/pdf`). DOMPurify — прежний
+  общий чанк. Данные pdf.js в `dist/pdfjs/` ≈ 3,2 МБ без сжатия (встраиваются в бинарник сервера).
+- Проверки: `npm run check` (0/0), `build`, `size` (все пределы), `test:build` 6, `e2e` — 46 из
+  46 (`documents` 6 новых); `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings` — чисто; `-p zam-server`: lib `web::` 4 (+1), `web` 8 (+2: `main_csp_unchanged`,
+  `viewer_pdf_has_own_csp_and_base_href`), `blobs` 10, `previews` 9 (один раз упал
+  `preview_cache_reused` на имени файла кэша при параллельной сборке — на повторе зелёный;
+  вероятно, увиден временный файл атомарной записи: флейк задачи 8, в «Отложенные»).
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
@@ -1752,6 +1879,10 @@ images 5/5). Генератор фикстур ревьюера — `.tmp/review
 
 - **Бюджет HTML подсветки — 4 МиБ на документ, строка длиннее 16 КиБ не подсвечивается, крупный
   ярус кэша рендера (≤ 8 МиБ на запись, ≤ 32 МиБ всего) (исполнитель, раунд правок 2 задачи 8).**
+- **Просмотрщик PDF получает байты сообщением, а не по `?sha=` (исполнитель, задача 9);
+  CSP `/viewer/pdf` — главная + `'wasm-unsafe-eval'`, `worker-src 'self' blob:`,
+  `frame-ancestors 'self'`, `form-action 'none'`; DOCX — `srcdoc` `sandbox=""` с CSP в
+  `<meta>`; шрифты Liberation (GPL) и песочница JS PDF в сборку не входят.** Запись «Задача 9».
 - **Превью — в рабочем процессе, свой пул `docs.preview_workers`; лист — номер в порядке книги с
   `ref_no` номера `sheet:#N`; ячейки не маскируются (как скачивание); недоступное — 404 без 403
   `solution-access` (исполнитель, задача 8).** Запись «Задача 8».
@@ -1864,6 +1995,9 @@ images 5/5). Генератор фикстур ревьюера — `.tmp/review
 
 Из задачи 8 M5 (2026-11-01), пока не сделано:
 
+- **Флейк `previews::preview_cache_reused`** (задача 9, один раз из двух): `wait_files` видит,
+  похоже, временный файл атомарной записи кэша; фильтровать временные имена в помощнике теста.
+
 - **Кэш превью при удалении блоба** не чистится (вытесняется по пределу `preview_cache_mb`).
   **GC M7:** каталог `previews/<владелец>/` удаляется вместе с `blobs/<владелец>/` (удаление
   пользователя), `previews/<владелец>/<sha>/` — вместе с блобом при `refcount = 0` (ревью, M-7).
@@ -1881,7 +2015,7 @@ images 5/5). Генератор фикстур ревьюера — `.tmp/review
 1. Рабочий процесс `zam-server doc-worker` (тот же бинарник) при правиле «без внешних процессов» —
    принято контроллером как допустимое (тот же механизм, что Qdrant).
 2. Регламент обновления pdfium: раз в 2–4 недели и внеочередно при критическом CVE.
-3. `'wasm-unsafe-eval'` в CSP только для просмотрщика PDF.
+3. `'wasm-unsafe-eval'` в CSP только для просмотрщика PDF. Сделано в задаче 9 так: только ответ `/viewer/pdf` (декодеры JPEG 2000, JBIG2, ICC pdf.js); главная CSP не изменилась (тесты `main_csp_unchanged`).
 4. ~~Временный дубль `zip 8` и `zip 9` до обновления `calamine`.~~ Снят: `calamine` не используется
    (задача 2, «Решения»).
 5. Карта кода (встроенная, решение владельца 2026-10-28) — отдельным этапом M5.5 после M5

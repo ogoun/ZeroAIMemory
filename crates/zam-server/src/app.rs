@@ -324,9 +324,15 @@ fn router(state: AppState) -> Router {
     let base = state.cfg.server.base_path.clone();
     let index = web::Index::new(&base);
     let root = index.clone();
+    let viewer = web::Index::viewer_pdf(&base);
     let api = api::router(&state)
         // MCP (§13.1) — под тем же `base_path`; его внутренний роутер — `api::router` без `/mcp`
         .merge(crate::mcp::router(&state))
+        // просмотрщик PDF (M5): отдельный документ со своей CSP, встраивается в iframe WebUI
+        .route(
+            "/viewer/pdf",
+            axum::routing::get(move || std::future::ready(viewer.response())),
+        )
         .merge(web::assets_router())
         .fallback(move |m, u| web::fallback(index.clone(), m, u))
         .with_state(state);
