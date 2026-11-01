@@ -67,6 +67,8 @@ impl AppState {
     /// - воркер обслуживания ([`Maintenance::stop`]) — с ожиданием конца задачи;
     /// - конвейер документов ([`crate::docs::DocIndexer::shutdown`]) — незаконченные разборы
     ///   ждём не дольше 5 с (задания вернутся в очередь при следующем запуске);
+    /// - пул превью ([`crate::docs::Previews::shutdown`]) — закрывается, процессы завершаются
+    ///   (ждём не дольше 3 с);
     /// - воркер индексации (`IndexRuntime::shutdown` → `Worker::shutdown`) — с ожиданием
     ///   текущей пачки;
     /// - фоновая задача открытия базы (перенарезка, дозаполнение рёбер, пересканирование
@@ -80,6 +82,7 @@ impl AppState {
     pub async fn shutdown(&self) {
         self.maintenance.stop().await;
         self.docs.shutdown().await;
+        self.previews.shutdown().await;
         self.index.shutdown(&self.system, &self.users).await;
     }
 }

@@ -157,6 +157,8 @@ async fn preview_sheet_paging() {
     let rr: Vec<&[&str]> = refs.iter().map(Vec::as_slice).collect();
     let book = xlsx(&[
         ("Итоги", rr.as_slice()),
+        // пустой лист перед листом с секретом: номер в книге 3, в `sheet:#N` — 2 (ревью)
+        ("Пустой", &[]),
         (SECRET, &[&["ключ"], &["значение"]]),
     ]);
     let sha = sha_of(&upload(&a, &a.token, &n, "book.xlsx", &book).await);
@@ -185,18 +187,48 @@ async fn preview_sheet_paging() {
     let p3 = ok_json(&a, &sha, "kind=sheet&from=48&rows=10").await;
     assert_eq!(p3["rows"].as_array().unwrap().len(), 4);
     // лист с секретом: по номеру, имя — маска, в ответе нет секрета
-    let r = get(&a, &a.token, &sha, "kind=sheet&sheet=2").await;
+    let r = get(&a, &a.token, &sha, "kind=sheet&sheet=3").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(!r.text().contains(SECRET), "{}", r.text());
     let s = r.json();
-    assert_eq!(s["sheet"], 2);
-    assert_eq!(s["sheets"][1]["secret"], true);
-    assert_eq!(s["sheets"][1]["ref_no"], 2, "{s}");
-    assert_eq!(s["name"], s["sheets"][1]["name"]);
+    assert_eq!(s["sheet"], 3);
+    assert_eq!(s["sheets"][2]["no"], 3);
+    assert_eq!(s["sheets"][2]["secret"], true);
+    assert_eq!(s["sheets"][2]["ref_no"], 2, "{s}");
+    assert_eq!(s["name"], s["sheets"][2]["name"]);
     assert_eq!(s["rows"], json!([["значение"]]));
     check_headers(&r, "application/json");
+    // пустой лист: номер в книге есть, номера `sheet:#N` нет (единиц нет)
+    let e = ok_json(&a, &sha, "kind=sheet&sheet=2").await;
+    assert_eq!(
+        (
+            e["sheets"][1]["no"].clone(),
+            e["sheets"][1]["ref_no"].clone()
+        ),
+        (json!(2), Value::Null)
+    );
+    assert_eq!(
+        (e["name"].clone(), e["total_rows"].clone()),
+        (json!("Пустой"), json!(0))
+    );
+    assert_eq!(e["sheets"][0]["ref_no"], 1);
+    // `/read` тем же номером читает тот же лист с секретом
+    let doc = wait_done(&a, owner, &n, "book.xlsx").await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/read",
+            Some(json!({"items": [{"id": format!("d:{}", doc.id), "locator": "sheet:#2!A1:A2"}]})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        r.text().contains("значение") && !r.text().contains(SECRET),
+        "{}",
+        r.text()
+    );
     // нет листа — 422; неверные параметры — 400
-    let r = get(&a, &a.token, &sha, "kind=sheet&sheet=3").await;
+    let r = get(&a, &a.token, &sha, "kind=sheet&sheet=4").await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
     for q in [
         "kind=sheet&rows=0",
@@ -440,6 +472,43 @@ async fn preview_text_pptx_and_code() {
     let j = ok_json(&a, &bsha, "kind=text").await;
     assert_eq!(j["truncated"], true);
     assert!(j["html"].as_str().unwrap().len() < 4 * 1024 * 1024);
+    // раздувание разметки (ревью, I-1): `[` одной строкой и построчно — тело < 4 МиБ,
+    // повтор из кэша
+    for (name, body) in [
+        ("brackets.json", "[".repeat(256 * 1024)),
+        ("lines.json", "[\n".repeat(128 * 1024)),
+        ("quotes.py", "'''\n".repeat(64 * 1024)),
+        ("anchors.yaml", "&a \n".repeat(64 * 1024)),
+    ] {
+        let s = sha_of(&upload(&a, &a.token, &n, name, body.as_bytes()).await);
+        let t = Instant::now();
+        let r = get(&a, &a.token, &s, "kind=text").await;
+        let first = t.elapsed();
+        assert_eq!(r.status, StatusCode::OK, "{name}: {}", r.text());
+        assert!(
+            r.body.len() < 4 * 1024 * 1024,
+            "{name}: {} байт",
+            r.body.len()
+        );
+        let j = r.json();
+        // подсвечено не больше бюджета превью; сверх предела разметки — экранированный текст
+        assert!(j["highlighted"].as_u64().unwrap() <= 64 * 1024, "{name}");
+        if j["highlight_skipped"] == "too_large" {
+            assert_eq!(j["syntax"], Value::Null, "{name}");
+        }
+        let dir = previews_dir(&a).join(a.st.admin_id.to_string()).join(&s);
+        wait_files(&dir, 1).await;
+        let t = Instant::now();
+        let again = get(&a, &a.token, &s, "kind=text").await;
+        println!(
+            "{name}: тело {} байт, подсветка {} / {}, первый {first:?}, из кэша {:?}",
+            r.body.len(),
+            j["highlighted"],
+            j["highlight_skipped"],
+            t.elapsed()
+        );
+        assert_eq!(again.body, r.body, "{name}");
+    }
     let bin = sha_of(&upload(&a, &a.token, &n, "x.bin", &[0u8, 1, 2, 0, 255, 0]).await);
     let r = get(&a, &a.token, &bin, "kind=text").await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
@@ -586,6 +655,23 @@ async fn preview_cache_reused() {
     assert_eq!(r.status, StatusCode::NOT_MODIFIED);
     assert!(r.body.is_empty());
     assert_eq!(r.header("etag"), etag);
+    // испорченный файл кэша (ревью, M-3): удаляется и строится заново, не 500
+    std::fs::write(&files[0], b"{\"not\": \"a page\"").unwrap();
+    let r = get(&a, &a.token, &sha, "kind=sheet").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["header"], json!(["a"]));
+    let t = Instant::now();
+    loop {
+        let ok = std::fs::read(&files[0])
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .is_some_and(|v| v["header"] == json!(["a"]));
+        if ok {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "кэш не перезаписан");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     // другие параметры — другой ключ и другой ETag
     let r = get(&a, &a.token, &sha, "kind=sheet&rows=1").await;
     assert_ne!(r.header("etag"), etag);
@@ -626,6 +712,77 @@ async fn preview_cache_reused() {
             "{rel:?}"
         );
     }
+}
+
+/// Неудача построения помнится (ревью, M-1): повтор после срока рабочего процесса отвечает тем же
+/// 422 сразу, без нового процесса; другой ключ строится.
+#[tokio::test]
+async fn preview_failure_cached() {
+    // срок 100 мс: декодирование 4000² в debug его не укладывается
+    let (a, _) = world_with("prev-fail", |c| c.docs.timeout_ms = 100).await;
+    let n = note(&a, &a.token, "knowledge", "p/неудачи").await;
+    let big = png(&gradient(4000, 4000), ImageFormat::Png);
+    let sha = sha_of(&upload(&a, &a.token, &n, "big.png", &big).await);
+    let r = get(&a, &a.token, &sha, "kind=thumb&px=64").await;
+    if r.status == StatusCode::OK && !cfg!(debug_assertions) {
+        eprintln!("release уложился в 100 мс — проверка памяти неудач пропущена");
+        return;
+    }
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let detail = r.json()["detail"].clone();
+    assert!(
+        detail.as_str().unwrap().contains("parse_timeout"),
+        "{detail}"
+    );
+    let spawned = a.st.previews.pool().spawned();
+    let t = Instant::now();
+    let again = get(&a, &a.token, &sha, "kind=thumb&px=64").await;
+    assert_eq!(again.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(again.json()["detail"], detail);
+    assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+    assert_eq!(
+        a.st.previews.pool().spawned(),
+        spawned,
+        "новый процесс на повтор"
+    );
+    // недоступное по-прежнему 404 (память неудач — после проверки прав)
+    let (_, c_tok) = a.new_user("Вера").await;
+    let r = get(&a, &c_tok, &sha, "kind=thumb&px=64").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
+/// Пул превью останавливается вместе с сервером (ревью, M-8).
+#[tokio::test]
+async fn preview_pool_stopped_on_shutdown() {
+    let (a, _) = world("prev-stop").await;
+    let n = note(&a, &a.token, "knowledge", "p/стоп").await;
+    let sha = sha_of(
+        &upload(
+            &a,
+            &a.token,
+            &n,
+            "a.png",
+            &png(&gradient(20, 20), ImageFormat::Png),
+        )
+        .await,
+    );
+    let r = get(&a, &a.token, &sha, "kind=thumb&px=16").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!a.st.previews.pool().worker_pids().is_empty());
+    a.st.shutdown().await;
+    assert!(a.st.previews.pool().worker_pids().is_empty());
+    let other = sha_of(
+        &upload(
+            &a,
+            &a.token,
+            &n,
+            "b.png",
+            &png(&gradient(30, 30), ImageFormat::Png),
+        )
+        .await,
+    );
+    let r = get(&a, &a.token, &other, "kind=thumb&px=16").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
 }
 
 /// Размер кэша ограничен `docs.preview_cache_mb`: старые файлы вытесняются.

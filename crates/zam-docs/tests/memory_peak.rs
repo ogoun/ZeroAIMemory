@@ -627,7 +627,7 @@ fn thumb_bound(w: u64, h: u64, bpp: u64) -> usize {
 }
 
 fn check_thumbs(side: u32) {
-    use common::images::{encode, gif_forged, jpeg_forged, png_bomb};
+    use common::images::{encode, gif_forged, jpeg_forged, png_bomb, png_chunk_bomb};
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use zam_docs::thumb::{IMAGE_MAX_PIXELS, IMAGE_MAX_SIDE};
     // бомбы размеров: отказ до декодирования, памяти почти не нужно
@@ -647,6 +647,23 @@ fn check_thumbs(side: u32) {
         );
         assert!(matches!(r, Err(DocError::Malformed(_))), "{name}: {r:?}");
         assert!(peak <= MIB, "{name}: пик {peak}");
+    }
+    // бомбы сжатия в служебных чанках PNG 16 × 16 (ревью задачи 8, M-4): чанки вырезаются до
+    // декодирования — пик — копия файла и буферы декодера
+    for (name, ty, prefix) in [
+        ("S6 PNG iCCP 256 МиБ нулей", b"iCCP", &b"x\0\0"[..]),
+        ("S7 PNG zTXt", b"zTXt", &b"k\0\0"[..]),
+        ("S8 PNG iTXt", b"iTXt", &b"k\0\x01\0\0\0"[..]),
+    ] {
+        let b = png_chunk_bomb(ty, prefix, 256);
+        let (r, peak, took) = measured_thumb(&b);
+        eprintln!(
+            "{name}: файл {:.2} МиБ, пик {:.2} МиБ, {took:?}",
+            b.len() as f64 / MIB as f64,
+            peak as f64 / MIB as f64
+        );
+        assert!(r.is_ok(), "{name}: {r:?}");
+        assert!(peak <= b.len() + 2 * MIB, "{name}: пик {peak}");
     }
     // декомпрессионная бомба в пределах лимитов: однотонный PNG в сотни КиБ, раскрывается в
     // `side² × 4` (8 бит) и `side² × 8` (16 бит) байт

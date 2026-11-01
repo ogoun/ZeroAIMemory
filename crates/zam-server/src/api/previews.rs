@@ -12,9 +12,14 @@
 //! - `kind=thumb&page=<N>&px=<1..=1024>` — PNG: страница PDF (pdfium) или изображение PNG, JPEG,
 //!   GIF, WebP (вид — по сигнатуре; SVG — не изображение); по умолчанию `page=1`, `px=256`.
 //! - `kind=text` — JSON: PPTX — `{format: "slides", slides: [{slide, title, text, notes}]}`;
-//!   текстовый файл — `{format: "html", syntax, html, truncated}`: HTML syntect с классами
-//!   `hl-*` (`/api/v1/render/highlight.css`), только `<span class>` и экранированный текст;
-//!   читается начало файла до [`TEXT_MAX`] байт.
+//!   текстовый файл — `{format: "html", syntax, html, highlighted, highlight_skipped,
+//!   truncated}`: HTML syntect с классами `hl-*` (`/api/v1/render/highlight.css`), только
+//!   `<span class>` и экранированный текст; читается начало файла до [`TEXT_MAX`] байт,
+//!   подсвечиваются первые 64 КиБ; разметка больше 40 × исходник (`[` в JSON и т. п.) — весь
+//!   текст экранирован, `highlight_skipped: "too_large"`.
+//!
+//! Неудача построения (422) помнится [`crate::docs::preview::FAILURE_TTL`] (5 мин): повтор
+//! отвечает сразу, без нового процесса. Испорченный файл кэша удаляется и строится заново.
 //!
 //! **Права — как у скачивания блоба:** пара (sha, узел) в доступном принципалу пространстве
 //! (по токену — без Human; участник решения — только пространство решения; `?user=` —
@@ -293,7 +298,7 @@ pub async fn preview(
         return Err(ApiError::NotFound);
     }
     let svc = st.previews.clone();
-    let name = svc.file_name(&key);
+    let name = svc.file_name(&key, &loc.filename);
     let base_tag = format!(
         "\"{sha}.{}\"",
         name.rsplit_once('.').map_or(&*name, |(n, _)| n)
@@ -302,27 +307,43 @@ pub async fn preview(
         PreviewKey::Thumb { .. } => "image/png",
         _ => "application/json",
     };
+    let sheet = matches!(key, PreviewKey::Sheet { .. });
     // лист: ответ зависит ещё и от номеров `ref_no` — ETag после сборки
-    if !matches!(key, PreviewKey::Sheet { .. }) {
-        if etag_hits(&headers, &base_tag) {
-            return Ok(respond(None, ctype, &base_tag));
-        }
-        if let Some(b) = svc.cache().get(loc.owner, &sha, &name).await {
-            return Ok(respond(Some(b), ctype, &base_tag));
-        }
+    if !sheet && etag_hits(&headers, &base_tag) {
+        return Ok(respond(None, ctype, &base_tag));
     }
-    let cached = match key {
-        PreviewKey::Sheet { .. } => svc.cache().get(loc.owner, &sha, &name).await,
-        _ => None,
+    // файл кэша проверяется: испорченный удаляется и строится заново (ревью, M-3)
+    let cached = match svc.cache().get(loc.owner, &sha, &name).await {
+        Some(b) if cache_valid(&key, &b) => Some(b),
+        Some(_) => {
+            tracing::warn!(sha256 = %sha, file = %name, "файл кэша превью испорчен — удалён");
+            svc.cache().remove(loc.owner, &sha, &name).await;
+            None
+        }
+        None => None,
     };
+    if !sheet && let Some(b) = cached {
+        return Ok(respond(Some(b), ctype, &base_tag));
+    }
     let built = match cached {
         Some(b) => Built {
             data: b,
             cache: false,
         },
         None => {
+            // недавняя неудача того же построения — без нового процесса (ревью, M-1)
+            if let Some(detail) = svc.failed_recently(loc.owner, &sha, &name) {
+                return Err(ApiError::Unprocessable(detail));
+            }
             let _permit = svc.permit().await;
-            build(&st, &loc, &path, &key).await?
+            match build(&st, &loc, &path, &key).await {
+                Ok(b) => b,
+                Err(ApiError::Unprocessable(detail)) => {
+                    svc.remember_failure(loc.owner, &sha, &name, detail.clone());
+                    return Err(ApiError::Unprocessable(detail));
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
     if built.cache {
@@ -331,7 +352,7 @@ pub async fn preview(
     match key {
         PreviewKey::Sheet { no, .. } => {
             let page: WireSheetPage = serde_json::from_slice(&built.data)
-                .map_err(|e| ApiError::Internal(format!("кэш превью листа: {e}")))?;
+                .map_err(|e| ApiError::Internal(format!("страница листа превью: {e}")))?;
             let (body, refs) = sheet_json(&loc, &sha, no, page).await;
             let etag = match refs {
                 Some(r) => format!("{}.n{r}\"", base_tag.trim_end_matches('"')),
@@ -344,6 +365,15 @@ pub async fn preview(
             Ok(respond(Some(body), ctype, &etag))
         }
         _ => Ok(respond(Some(built.data), ctype, &base_tag)),
+    }
+}
+
+/// Файл кэша цел: лист — страница разбирается, текст — JSON, миниатюра — сигнатура PNG.
+fn cache_valid(key: &PreviewKey, b: &[u8]) -> bool {
+    match key {
+        PreviewKey::Sheet { .. } => serde_json::from_slice::<WireSheetPage>(b).is_ok(),
+        PreviewKey::Text => serde_json::from_slice::<serde::de::IgnoredAny>(b).is_ok(),
+        PreviewKey::Thumb { .. } => b.starts_with(b"\x89PNG\r\n\x1a\n"),
     }
 }
 
@@ -444,6 +474,7 @@ async fn build(
                     "syntax": h.syntax,
                     "html": h.html,
                     "highlighted": h.highlighted,
+                    "highlight_skipped": h.skipped,
                     "truncated": more,
                 })
             };

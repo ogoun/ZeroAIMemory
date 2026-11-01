@@ -170,7 +170,8 @@ struct Shared {
 
 /// Пул рабочих процессов разбора документов.
 pub struct DocPool {
-    tx: tokio::sync::mpsc::Sender<Job>,
+    /// Очередь заданий; `None` — пул закрыт ([`DocPool::close`]).
+    tx: Mutex<Option<tokio::sync::mpsc::Sender<Job>>>,
     shared: Arc<Shared>,
 }
 
@@ -247,17 +248,27 @@ impl DocPool {
                 tracing::error!(component = "doc-worker", "поток слота не запущен: {e}");
             }
         }
-        DocPool { tx, shared }
+        DocPool {
+            tx: Mutex::new(Some(tx)),
+            shared,
+        }
     }
 
     async fn submit(&self, op: Op) -> Result<Outcome, ParseFailure> {
         let (reply, rx) = tokio::sync::oneshot::channel();
+        let tx = lock(&self.tx).clone().ok_or(ParseFailure::Crash)?;
         // очередь ограничена: ждём места, а не копим файлы без предела
-        self.tx
-            .send(Job { op, reply })
+        tx.send(Job { op, reply })
             .await
             .map_err(|_| ParseFailure::Crash)?;
+        drop(tx);
         rx.await.unwrap_or(Err(ParseFailure::Crash))
+    }
+
+    /// Закрывает пул: новые задания — [`ParseFailure::Crash`], слоты дорабатывают текущее
+    /// задание и завершают свои процессы (pid исчезают из [`DocPool::worker_pids`]).
+    pub fn close(&self) {
+        lock(&self.tx).take();
     }
 
     /// Извлекает структуру документа в рабочем процессе.

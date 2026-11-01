@@ -11,7 +11,9 @@
 //!   переводятся в 8 бит (RGBA ≤ 4 × `IMAGE_MAX_PIXELS` = 200 МБ); ресайз (`fast_image_resize`,
 //!   Lanczos3, альфа учитывается) пишет в буфер миниатюры ≤ 1024 × 1024 × 4;
 //! - результат всегда перекодируется в свой PNG: исходные байты (метаданные, полиглоты) наружу
-//!   не попадают. Ориентация EXIF применяется. GIF и WebP — первый кадр.
+//!   не попадают. Ориентация EXIF применяется. GIF и WebP — первый кадр;
+//! - сжатые служебные чанки PNG (`iCCP`, `zTXt`, `iTXt`) вырезаются до декодирования: декодер
+//!   раскрывал бы их целиком (бомба сжатия в профиле цвета).
 //!
 //! Пик памяти — декодированный буфер, его 8-битная копия и миниатюра с PNG; замер —
 //! `tests/memory_peak.rs` (`image_thumb_peak_within_bound`).
@@ -80,6 +82,9 @@ pub fn image_thumb(bytes: &[u8], max_px: u32) -> Result<Vec<u8>, DocError> {
     }
     let kind = sniff_image(bytes).ok_or_else(|| bad("не PNG, JPEG, GIF или WebP"))?;
     let f = format_of(kind);
+    // сжатые служебные чанки PNG (профиль цвета, текст) декодер раскрывает целиком
+    let stripped = (kind == ImageKind::Png).then(|| strip_png_chunks(bytes));
+    let bytes = stripped.as_deref().unwrap_or(bytes);
     // размеры из заголовка — до декодирования
     let (w, h) = reader(bytes, f).into_dimensions().map_err(bad)?;
     if w == 0 || h == 0 || w > IMAGE_MAX_SIDE || h > IMAGE_MAX_SIDE {
@@ -131,9 +136,62 @@ pub fn image_thumb(bytes: &[u8], max_px: u32) -> Result<Vec<u8>, DocError> {
     Ok(out)
 }
 
+/// Сжатые служебные чанки PNG, которые декодер `png` распаковывает целиком в память до
+/// пикселей: профиль цвета `iCCP` и текст `zTXt`/`iTXt`. PNG в 1 МБ с `iCCP` из гигабайта нулей
+/// занимал 529 МиБ (ревью задачи 8 M5, M-4). Миниатюре они не нужны (цвет — sRGB по умолчанию).
+const PNG_DROP: [&[u8; 4]; 3] = [b"iCCP", b"zTXt", b"iTXt"];
+
+/// Копия PNG без чанков [`PNG_DROP`]: простой проход по чанкам (длина, тип, данные, CRC; CRC не
+/// проверяется — это делает декодер). Неполный или неверный по длине чанк — остаток копируется
+/// как есть: ошибку покажет декодер.
+fn strip_png_chunks(png: &[u8]) -> Vec<u8> {
+    const SIG: usize = 8;
+    let mut out = Vec::with_capacity(png.len());
+    out.extend_from_slice(&png[..SIG.min(png.len())]);
+    let mut at = SIG;
+    while at < png.len() {
+        let Some(head) = png.get(at..at + 8) else {
+            break;
+        };
+        let len = u32::from_be_bytes(head[..4].try_into().expect("4 байта")) as usize;
+        let Some(end) = (at + 12).checked_add(len).filter(|e| *e <= png.len()) else {
+            break;
+        };
+        if !PNG_DROP.iter().any(|t| head[4..8] == t[..]) {
+            out.extend_from_slice(&png[at..end]);
+        }
+        at = end;
+    }
+    out.extend_from_slice(&png[at.min(png.len())..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::{fit, strip_png_chunks};
+
+    #[test]
+    fn png_chunks_stripped() {
+        let chunk = |t: &[u8; 4], d: &[u8]| {
+            let mut v = (d.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(t);
+            v.extend_from_slice(d);
+            v.extend_from_slice(&[0, 0, 0, 0]);
+            v
+        };
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(chunk(b"IHDR", &[1; 13]));
+        png.extend(chunk(b"iCCP", &[2; 100]));
+        png.extend(chunk(b"IDAT", &[3; 5]));
+        png.extend(chunk(b"zTXt", &[4; 7]));
+        png.extend(chunk(b"IEND", &[]));
+        let s = strip_png_chunks(&png);
+        assert_eq!(s.len(), png.len() - (12 + 100) - (12 + 7));
+        assert!(!s.windows(4).any(|w| w == b"iCCP" || w == b"zTXt"));
+        // обрезанный чанк — остаток как есть
+        let cut = &png[..png.len() - 3];
+        assert_eq!(strip_png_chunks(cut).len(), cut.len() - 112 - 19);
+    }
 
     #[test]
     fn fit_keeps_aspect_and_never_upscales() {

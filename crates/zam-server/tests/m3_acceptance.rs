@@ -429,9 +429,17 @@ fn isolation_human_vault_and_solution_access() {
         format!("/api/v1/graph?node={sol_id}"),
         blob.clone(),
     ];
-    for p in &solution_paths {
+    // блоб — 404 как несуществующий (без 403: не подтверждает существование файла; M5 задача 8)
+    let missing_blob = format!("/api/v1/blobs/{}/a.bin", "0".repeat(64));
+    for p in solution_paths.iter().filter(|p| **p != blob) {
         denied(srv.call("GET", p, &b, None), "pending", p);
     }
+    assert_eq!(
+        srv.call("GET", &blob, &b, None),
+        srv.call("GET", &missing_blob, &b, None),
+        "блоб при ожидании доступа"
+    );
+    assert_eq!(srv.call("GET", &blob, &b, None).0, 404);
     let sq = json!({"query": shared_word, "scope": {"solution": G_ISO}});
     let j = search(&srv, &b, sq.clone());
     assert_eq!(j["warnings"], json!(["solution access pending"]), "{j}");
@@ -545,9 +553,14 @@ fn isolation_human_vault_and_solution_access() {
         None,
     );
     assert_eq!(code, 200, "{j}");
-    for p in &solution_paths {
+    for p in solution_paths.iter().filter(|p| **p != blob) {
         denied(srv.call("GET", p, &b, None), "revoked", p);
     }
+    assert_eq!(
+        srv.call("GET", &blob, &b, None),
+        srv.call("GET", &missing_blob, &b, None),
+        "блоб после отзыва"
+    );
     denied(
         srv.call_h(
             "PUT",

@@ -26,6 +26,9 @@ use super::protocol::{
     write_frame,
 };
 
+/// Бюджет подсветки превью, байт: дальше — экранированный текст (ревью задачи 8, I-1).
+pub const PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
+
 /// Коды выхода рабочего процесса.
 const EXIT_FRAME: i32 = 2;
 const EXIT_WRITE: i32 = 3;
@@ -283,9 +286,11 @@ fn respond(body: &[u8], st: &mut State) -> Response {
                 Err(e) => return error(e),
             };
             match source_text(&bytes, truncated) {
-                Some(text) => {
-                    Response::Html(WireHtml::from(zam_markdown::highlight_source(&name, &text)))
-                }
+                Some(text) => Response::Html(WireHtml::from(zam_markdown::highlight_source(
+                    &name,
+                    &text,
+                    PREVIEW_HIGHLIGHT_BYTES,
+                ))),
                 None => error(DocError::Unsupported),
             }
         }

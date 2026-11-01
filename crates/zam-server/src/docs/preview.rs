@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 use zam_core::Id;
@@ -53,16 +53,34 @@ pub enum PreviewKey {
 }
 
 impl PreviewKey {
-    /// Имя файла кэша: вид, числа параметров, версии и отпечаток лимитов `tag` (8 hex).
-    pub fn file_name(&self, tag: &str) -> String {
+    /// Имя файла кэша: вид, числа параметров, версии, отпечаток лимитов `tag` (8 hex) и — у листа
+    /// и текста — 8 hex blake3 расширения имени файла `filename` в нижнем регистре: вид CSV/текст и
+    /// синтаксис подсветки выбираются по нему (один файл под `.csv` и `.txt`, `.rs` и `.py` — разные
+    /// превью; ревью, M-2). Миниатюра от имени не зависит (вид — по сигнатуре).
+    pub fn file_name(&self, tag: &str, filename: &str) -> String {
         let v = format!("v{}.{PREVIEW_VERSION}-{tag}", zam_docs::EXTRACTOR_VERSION);
+        let ext = filename
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let e = &blake3::hash(ext.as_bytes()).to_hex()[..8];
         match self {
-            PreviewKey::Sheet { no, from, rows } => format!("sheet-{no}-{from}-{rows}-{v}.json"),
+            PreviewKey::Sheet { no, from, rows } => {
+                format!("sheet-{no}-{from}-{rows}-e{e}-{v}.json")
+            }
             PreviewKey::Thumb { page, px } => format!("thumb-{page}-{px}-{v}.png"),
-            PreviewKey::Text => format!("text-{v}.json"),
+            PreviewKey::Text => format!("text-e{e}-{v}.json"),
         }
     }
 }
+
+/// Сколько помнится неудача построения превью (повтор не поднимает процесс заново).
+pub const FAILURE_TTL: Duration = Duration::from_secs(300);
+/// Записей в памяти неудач — не больше.
+const FAILURES_MAX: usize = 4096;
+
+/// Ключ неудачи: владелец, sha и имя файла кэша.
+type FailureKey = (Id, String, String);
 
 /// Пул превью, кэш и ограничение одновременных построений.
 pub struct Previews {
@@ -72,6 +90,8 @@ pub struct Previews {
     limits: Limits,
     /// Отпечаток лимитов разбора в ключе кэша.
     tag: String,
+    /// Недавние неудачи построения: срок и пояснение ответа 422 (ревью, M-1).
+    failures: Mutex<std::collections::HashMap<FailureKey, (Instant, String)>>,
 }
 
 impl std::fmt::Debug for Previews {
@@ -101,6 +121,48 @@ impl Previews {
             builds: Semaphore::new(2 * pc.workers),
             limits,
             tag,
+            failures: Mutex::default(),
+        }
+    }
+
+    /// Пояснение недавней (моложе [`FAILURE_TTL`]) неудачи того же построения.
+    pub fn failed_recently(&self, owner: Id, sha: &str, name: &str) -> Option<String> {
+        let mut f = lock(&self.failures);
+        let k = (owner, sha.to_string(), name.to_string());
+        match f.get(&k) {
+            Some((until, d)) if *until > Instant::now() => Some(d.clone()),
+            Some(_) => {
+                f.remove(&k);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Запоминает неудачу построения на [`FAILURE_TTL`]: сбой, срок и нехватка памяти процесса,
+    /// повреждённый файл — повтор того же запроса отвечает сразу, без нового процесса.
+    pub fn remember_failure(&self, owner: Id, sha: &str, name: &str, detail: String) {
+        let mut f = lock(&self.failures);
+        let now = Instant::now();
+        if f.len() >= FAILURES_MAX {
+            f.retain(|_, (until, _)| *until > now);
+            if f.len() >= FAILURES_MAX {
+                f.clear();
+            }
+        }
+        f.insert(
+            (owner, sha.to_string(), name.to_string()),
+            (now + FAILURE_TTL, detail),
+        );
+    }
+
+    /// Останавливает пул превью: новые задания не принимаются, процессы завершаются (ждём не
+    /// дольше 3 с).
+    pub async fn shutdown(&self) {
+        self.pool.close();
+        let t = Instant::now();
+        while !self.pool.worker_pids().is_empty() && t.elapsed() < Duration::from_secs(3) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -116,9 +178,9 @@ impl Previews {
         &self.limits
     }
 
-    /// Имя файла кэша для `key`.
-    pub fn file_name(&self, key: &PreviewKey) -> String {
-        key.file_name(&self.tag)
+    /// Имя файла кэша для `key` файла `filename`.
+    pub fn file_name(&self, key: &PreviewKey, filename: &str) -> String {
+        key.file_name(&self.tag, filename)
     }
 
     /// Разрешение на построение превью (не больше `2 × preview_workers` одновременно).
@@ -180,6 +242,17 @@ impl PreviewCache {
         Some(data)
     }
 
+    /// Удаляет файл кэша (испорченный).
+    pub async fn remove(&self, owner: Id, sha: &str, name: &str) {
+        if let Some(path) = self.path(owner, sha, name)
+            && let Ok(m) = tokio::fs::metadata(&path).await
+            && tokio::fs::remove_file(&path).await.is_ok()
+            && let Some(u) = lock(&self.inner.used).as_mut()
+        {
+            *u = u.saturating_sub(m.len());
+        }
+    }
+
     /// Пишет файл кэша атомарно в фоне (ответ не ждёт диска); сверх предела — чистка.
     pub fn put(&self, owner: Id, sha: &str, name: &str, data: Vec<u8>) {
         if data.len() > ENTRY_MAX {
@@ -191,15 +264,19 @@ impl PreviewCache {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let len = data.len() as u64;
-            if let Err(e) = write_atomic(&path, &data) {
-                tracing::warn!(error = %e, "кэш превью не записан");
-                return;
-            }
+            // перезапись: учитывается разница размеров (ревью, M-5)
+            let old = match write_atomic(&path, &data) {
+                Ok(old) => old,
+                Err(e) => {
+                    tracing::warn!(error = %e, "кэш превью не записан");
+                    return;
+                }
+            };
             let over = {
                 let mut used = lock(&inner.used);
                 // первый подсчёт уже видит записанный файл
                 let cur = match *used {
-                    Some(u) => u.saturating_add(len),
+                    Some(u) => u.saturating_add(len).saturating_sub(old),
                     None => sweep(&inner.root, u64::MAX),
                 };
                 *used = Some(cur);
@@ -227,18 +304,19 @@ fn touch(path: &Path) {
 }
 
 /// Запись через временный файл в том же каталоге и `rename`: читатель видит файл целиком или
-/// не видит вовсе.
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+/// не видит вовсе. Возвращает размер заменённого файла (0 — его не было).
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<u64> {
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("нет каталога"))?;
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".{:016x}.tmp", rand::random::<u64>()));
+    let old = std::fs::metadata(path).map_or(0, |m| m.len());
     let r = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path));
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    r
+    r.map(|()| old)
 }
 
 /// Чистка кэша: файлы `root/<владелец>/<sha>/*`; давние временные — удаляются; если сумма больше
@@ -309,19 +387,23 @@ mod tests {
             from: 10,
             rows: 50,
         }
-        .file_name("ab12cd34");
+        .file_name("ab12cd34", "Книга.CSV");
+        let e = &blake3::hash(b"csv").to_hex()[..8];
         assert_eq!(
             s,
             format!(
-                "sheet-2-10-50-v{}.{PREVIEW_VERSION}-ab12cd34.json",
+                "sheet-2-10-50-e{e}-v{}.{PREVIEW_VERSION}-ab12cd34.json",
                 zam_docs::EXTRACTOR_VERSION
             )
         );
-        assert!(
-            PreviewKey::Thumb { page: 1, px: 256 }
-                .file_name("x")
-                .starts_with("thumb-1-256-")
-        );
+        // расширение различает ключи текста и листа, миниатюры — нет
+        let t = |n: &str| PreviewKey::Text.file_name("x", n);
+        assert_eq!(t("a.rs"), t("b.RS"));
+        assert_ne!(t("a.rs"), t("a.py"));
+        assert_ne!(t("a.rs"), t("a"));
+        let th = |n: &str| PreviewKey::Thumb { page: 1, px: 256 }.file_name("x", n);
+        assert_eq!(th("a.png"), th("a.jpg"));
+        assert!(th("a").starts_with("thumb-1-256-"));
         let c = PreviewCache::new(PathBuf::from("root"), 1);
         let owner = Id::new();
         let sha = "ab".repeat(32);

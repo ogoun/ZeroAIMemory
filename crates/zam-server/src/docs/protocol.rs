@@ -335,6 +335,9 @@ pub struct WireHtml {
     pub html: String,
     pub syntax: Option<String>,
     pub highlighted: usize,
+    /// Подсветка отброшена (`too_large`).
+    #[serde(default)]
+    pub skipped: Option<String>,
 }
 
 impl From<SourceHtml> for WireHtml {
@@ -343,6 +346,7 @@ impl From<SourceHtml> for WireHtml {
             html: h.html,
             syntax: h.syntax,
             highlighted: h.highlighted,
+            skipped: h.skipped.map(str::to_string),
         }
     }
 }
@@ -503,6 +507,7 @@ mod tests {
             html: "<span class=\"hl-x\">a</span>".into(),
             syntax: Some("Rust".into()),
             highlighted: 1,
+            skipped: None,
         };
         let json = serde_json::to_vec(&Response::Html(h.clone())).unwrap();
         let Response::Html(back) = serde_json::from_slice(&json).unwrap() else {

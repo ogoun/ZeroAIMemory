@@ -84,3 +84,22 @@ pub fn gif_forged(w: u16, h: u16) -> Vec<u8> {
     b[8..10].copy_from_slice(&h.to_le_bytes());
     b
 }
+
+/// Валидный PNG 16 × 16 с чанком `ty` (`iCCP`, `zTXt`, `iTXt`) после IHDR: в данных — `prefix`
+/// и zlib из `mib` МиБ нулей (бомба сжатия в служебном чанке, ревью задачи 8, M-4).
+pub fn png_chunk_bomb(ty: &[u8; 4], prefix: &[u8], mib: usize) -> Vec<u8> {
+    use std::io::Write as _;
+    let base = encode(&gradient(16, 16), ImageFormat::Png);
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    let zeros = vec![0u8; 1024 * 1024];
+    for _ in 0..mib {
+        z.write_all(&zeros).unwrap();
+    }
+    let mut data = prefix.to_vec();
+    data.extend(z.finish().unwrap());
+    // сигнатура (8) и IHDR (25)
+    let mut out = base[..33].to_vec();
+    chunk(&mut out, ty, &data);
+    out.extend_from_slice(&base[33..]);
+    out
+}

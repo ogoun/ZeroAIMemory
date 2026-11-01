@@ -28,7 +28,10 @@ pub use doc::{
     first_paragraph, outline, parse, resolve_section, section_by_path, slug,
 };
 pub use frontmatter::{VERIFIED_AT_INVALID, unrecognized_certainty_keys};
-pub use highlight::{HIGHLIGHT_BUDGET_BYTES, SourceHtml, highlight_css, highlight_source};
+pub use highlight::{
+    HIGHLIGHT_BUDGET_BYTES, SourceHtml, highlight_css, highlight_html_max, highlight_source,
+    source_syntax_name,
+};
 pub use levels::{L1_MAX_TOKENS, NOTE_L1_MAX_CHARS, note_l1, section_l1};
 pub use options::{HEADER_ID_PREFIX, comrak_options};
 pub use patch::{Applied, PatchError, PatchOp, apply_patch, section_bytes};
