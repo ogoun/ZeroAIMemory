@@ -802,6 +802,8 @@ impl DocsSection {
             max_unpacked: self.max_unpacked,
             max_ratio: self.max_ratio,
             max_entries: self.max_entries,
+            // внутренний предел разбора (не ключ `[docs]`): защита каталога zip, не настройка
+            max_central_dir: zam_docs::Limits::default().max_central_dir,
             max_xml_depth: self.max_xml_depth,
             max_cells: self.max_cells,
             max_chars: self.max_chars,

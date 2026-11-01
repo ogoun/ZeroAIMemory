@@ -73,9 +73,10 @@ fn looks_text(bytes: &[u8]) -> bool {
 }
 
 /// [`sniff`] по файлу без чтения его в память: не zip — по началу файла ([`FILE_HEAD`]); zip —
-/// по концу центрального каталога (число записей сверяется с `limits.max_entries` до разбора
-/// каталога), самому каталогу и не больше 256 КиБ `[Content_Types].xml` или `mimetype`.
-/// Ошибка ввода-вывода — `Err`; неразборчивый zip — `Ok(None)`.
+/// по строго проверенному концу центрального каталога (`ooxml::zip_directory`: число записей —
+/// `limits.max_entries`, размер каталога — `limits.max_central_dir`, до разбора каталога), самому
+/// каталогу и не больше 256 КиБ `[Content_Types].xml` или `mimetype`. Ошибка ввода-вывода —
+/// `Err`; неразборчивый или несогласованный zip — `Ok(None)`.
 pub fn sniff_file<R: Read + Seek>(
     mut r: R,
     name: &str,
@@ -93,13 +94,14 @@ pub fn sniff_file<R: Read + Seek>(
     r.seek(SeekFrom::Start(start))?;
     let mut tail = Vec::new();
     (&mut r).take(EOCD_TAIL).read_to_end(&mut tail)?;
-    let declared = crate::ooxml::declared_entries_in(&tail, |off| {
-        let mut rec = [0u8; 40];
+    let mut read_at = |off: u64, n: usize| {
+        let mut b = vec![0u8; n];
         r.seek(SeekFrom::Start(off)).ok()?;
-        r.read_exact(&mut rec).ok()?;
-        Some(rec)
-    });
-    if declared.is_some_and(|n| n > u64::from(limits.max_entries)) {
+        r.read_exact(&mut b).ok()?;
+        Some(b)
+    };
+    let dir = crate::ooxml::zip_directory(&tail, start, len, &mut read_at);
+    if !dir.is_ok_and(|d| within(&d, limits)) {
         return Ok(None);
     }
     r.seek(SeekFrom::Start(0))?;
@@ -108,10 +110,15 @@ pub fn sniff_file<R: Read + Seek>(
         .and_then(|mut zip| sniff_archive(&mut zip)))
 }
 
+/// Каталог в пределах `max_entries` и `max_central_dir`.
+fn within(d: &crate::ooxml::ZipDir, limits: &Limits) -> bool {
+    d.entries <= u64::from(limits.max_entries) && d.cd_size <= limits.max_central_dir
+}
+
 fn sniff_zip(bytes: &[u8]) -> Option<DocKind> {
-    // та же проверка числа записей до разбора центрального каталога, что и при извлечении
-    let max = u64::from(Limits::default().max_entries);
-    if crate::ooxml::declared_entries(bytes).is_some_and(|n| n > max) {
+    // та же строгая проверка конца каталога и его размера, что и при извлечении
+    let dir = crate::ooxml::zip_directory_of(bytes);
+    if !dir.is_ok_and(|d| within(&d, &Limits::default())) {
         return None;
     }
     let mut zip = ZipArchive::new(Cursor::new(bytes)).ok()?;

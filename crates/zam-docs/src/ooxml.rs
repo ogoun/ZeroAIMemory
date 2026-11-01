@@ -69,12 +69,19 @@ pub(crate) struct Part {
 }
 
 impl<'a> Package<'a> {
-    /// Открывает zip. `Ok(None)` — записей больше `max_entries` (предупреждение уже записано).
+    /// Открывает zip. `Ok(None)` — записей больше `max_entries` или каталог больше
+    /// `max_central_dir` (предупреждение уже записано); несогласованный конец каталога
+    /// ([`zip_directory`]) — `Malformed`.
     pub fn open(bytes: &'a [u8], ctx: &mut Ctx) -> Result<Option<Self>, DocError> {
         let max = u64::from(ctx.limits.max_entries);
-        let declared = declared_entries(bytes);
-        if declared.is_some_and(|n| n > max) {
+        // строгая проверка конца каталога — до `ZipArchive`: подделка не прячет настоящий каталог
+        let dir = zip_directory_of(bytes).map_err(|e| DocError::Malformed(format!("zip: {e}")))?;
+        if dir.entries > max {
             ctx.stop("max_entries");
+            return Ok(None);
+        }
+        if dir.cd_size > ctx.limits.max_central_dir {
+            ctx.stop("max_central_dir");
             return Ok(None);
         }
         let read_bytes = Rc::new(Cell::new(0));
@@ -89,7 +96,7 @@ impl<'a> Package<'a> {
             return Ok(None);
         }
         // `zip` складывает записи с одинаковым именем в одну: их число меньше заявленного
-        if declared.is_some_and(|n| n != 0xFFFF && n > zip.len() as u64) {
+        if dir.entries > zip.len() as u64 {
             return Err(DocError::Malformed("zip: повтор имён записей".into()));
         }
         let mut names = HashMap::with_capacity(zip.len());
@@ -294,41 +301,133 @@ fn resolve(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
-/// Число записей из конца центрального каталога (EOCD, zip64) — до разбора архива.
-pub(crate) fn declared_entries(b: &[u8]) -> Option<u64> {
-    declared_entries_in(b, |off| {
-        let off = usize::try_from(off).ok()?;
-        b.get(off..off.checked_add(40)?)?.try_into().ok()
-    })
+/// Центральный каталог zip по концу архива ([`zip_directory`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZipDir {
+    /// Число записей каталога (из EOCD64 у zip64).
+    pub entries: u64,
+    /// Смещение каталога от начала файла.
+    pub cd_offset: u64,
+    /// Размер каталога, байт.
+    pub cd_size: u64,
 }
 
-/// [`declared_entries`] по концу архива `b` (весь файл или его хвост с EOCD);
-/// `record(off)` — 40 байт записи EOCD64 по абсолютному смещению файла (zip64).
-pub(crate) fn declared_entries_in(
-    b: &[u8],
-    record: impl FnOnce(u64) -> Option<[u8; 40]>,
-) -> Option<u64> {
+/// Наименьшая запись центрального каталога: сигнатура и 42 байта полей, без имени.
+const CDFH_MIN: u64 = 46;
+/// Запись EOCD64 без расширяемых данных: 12 байт (сигнатура и размер) + 44.
+const EOCD64_LEN: u64 = 56;
+
+fn le16(b: &[u8], at: usize) -> u64 {
+    u64::from(u16::from_le_bytes([b[at], b[at + 1]]))
+}
+
+fn le32(b: &[u8], at: usize) -> u64 {
+    u64::from(u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]))
+}
+
+fn le64(b: &[u8], at: usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(a)
+}
+
+/// Строгая проверка конца центрального каталога (раунд правок 2 задачи 4 M5): `zip` перебирает
+/// кандидатов EOCD от конца файла и молча пропускает несогласованные, поэтому поддельная EOCD в
+/// хвосте (или в комментарии) прятала от проверки `max_entries` настоящую zip64 на миллионы
+/// записей. Здесь берётся **последняя** полная сигнатура EOCD, и она должна быть согласованной
+/// целиком — тогда `zip` выберет её же (его проверки слабее этих):
+/// - EOCD с комментарием кончается ровно на конце файла;
+/// - один диск; записей на диске столько же, сколько всего;
+/// - zip64 (поле — `0xFFFF…`, а за 20 байт до EOCD — локатор): локатор указывает на EOCD64 без
+///   расширяемых данных, кончающуюся ровно перед локатором; поля каталога — из EOCD64;
+/// - каталог кончается ровно там, где начинается EOCD (EOCD64): `cd_offset + cd_size`;
+/// - `entries × 46 ≤ cd_size`; у непустого каталога по `cd_offset` — сигнатура записи каталога.
+///
+/// Архивы с префиксом (самораспаковывающиеся: смещения от начала архива, а не файла) не проходят
+/// равенство и отвергаются. `tail` — конец файла длиной `file_len`, начинающийся со смещения
+/// `tail_start` (весь файл — `0`); `read_at(off, len)` — байты по абсолютному смещению.
+/// `Err` — причина без содержимого файла.
+pub(crate) fn zip_directory(
+    tail: &[u8],
+    tail_start: u64,
+    file_len: u64,
+    read_at: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Result<ZipDir, &'static str> {
     const EOCD: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
     const LOC64: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
     const EOCD64: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
-    let from = b.len().saturating_sub(22 + 65_535);
-    let pos = (from..b.len().saturating_sub(21))
+    const CDFH: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+    let rel = (0..tail.len().saturating_sub(21))
         .rev()
-        .find(|&i| b[i..i + 4] == EOCD)?;
-    let total = u64::from(u16::from_le_bytes([b[pos + 10], b[pos + 11]]));
-    if total != 0xFFFF {
-        return Some(total);
+        .find(|&i| tail[i..i + 4] == EOCD)
+        .ok_or("нет конца центрального каталога")?;
+    let e = &tail[rel..rel + 22];
+    let pos = tail_start + rel as u64;
+    if pos + 22 + le16(e, 20) != file_len {
+        return Err("конец каталога не на конце файла");
     }
-    let loc = pos.checked_sub(20)?;
-    if b[loc..loc + 4] != LOC64 {
-        return Some(total);
+    if le16(e, 4) != 0 || le16(e, 6) != 0 {
+        return Err("многотомный архив");
     }
-    let off = u64::from_le_bytes(b[loc + 8..loc + 16].try_into().ok()?);
-    let rec = record(off)?;
-    if rec[..4] != EOCD64 {
-        return Some(total);
+    let (n_disk, n, size, off) = (le16(e, 8), le16(e, 10), le32(e, 12), le32(e, 16));
+    let may64 = n == 0xFFFF || size == 0xFFFF_FFFF || off == 0xFFFF_FFFF;
+    let loc = if may64 && pos >= 20 {
+        read_at(pos - 20, 20).filter(|l| l.len() == 20 && l[..4] == LOC64)
+    } else {
+        None
+    };
+    let (entries, entries_disk, cd_size, cd_offset, end) = match loc {
+        None => (n, n_disk, size, off, pos),
+        Some(l) => {
+            let loc_pos = pos - 20;
+            if le32(&l, 4) != 0 || le32(&l, 16) > 1 {
+                return Err("многотомный архив zip64");
+            }
+            let at = le64(&l, 8);
+            if at.checked_add(EOCD64_LEN) != Some(loc_pos) {
+                return Err("EOCD64 не перед локатором");
+            }
+            let r = read_at(at, EOCD64_LEN as usize)
+                .filter(|r| r.len() == EOCD64_LEN as usize)
+                .ok_or("нет EOCD64")?;
+            if r[..4] != EOCD64 || le64(&r, 4) != EOCD64_LEN - 12 {
+                return Err("неверная EOCD64");
+            }
+            if le32(&r, 16) != 0 || le32(&r, 20) != 0 {
+                return Err("многотомный архив zip64");
+            }
+            (le64(&r, 32), le64(&r, 24), le64(&r, 40), le64(&r, 48), at)
+        }
+    };
+    if entries_disk != entries {
+        return Err("число записей на диске и всего различается");
     }
-    Some(u64::from_le_bytes(rec[32..40].try_into().ok()?))
+    if cd_offset.checked_add(cd_size) != Some(end) {
+        return Err("каталог не кончается у EOCD (префикс или подделка)");
+    }
+    if entries.checked_mul(CDFH_MIN).is_none_or(|m| m > cd_size) {
+        return Err("записей больше, чем вмещает каталог");
+    }
+    if entries > 0 {
+        let sig = read_at(cd_offset, 4).ok_or("нет записи каталога")?;
+        if sig[..] != CDFH {
+            return Err("нет записи каталога по смещению");
+        }
+    }
+    Ok(ZipDir {
+        entries,
+        cd_offset,
+        cd_size,
+    })
+}
+
+/// [`zip_directory`] архива в памяти.
+pub(crate) fn zip_directory_of(b: &[u8]) -> Result<ZipDir, &'static str> {
+    let mut read_at = |off: u64, len: usize| {
+        let off = usize::try_from(off).ok()?;
+        b.get(off..off.checked_add(len)?).map(<[u8]>::to_vec)
+    };
+    zip_directory(b, 0, b.len() as u64, &mut read_at)
 }
 
 /// Приёмник байтов записи: UTF-8 копится как есть, UTF-16 (по BOM) раскодируется в UTF-8 по

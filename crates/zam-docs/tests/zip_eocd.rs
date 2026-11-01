@@ -1,0 +1,444 @@
+//! Строгая проверка конца центрального каталога zip (ревью задачи 4 M5, раунд 2): поддельная EOCD
+//! в хвосте или в комментарии, неверная EOCD64, каталог сверх `max_central_dir` — отказ и в
+//! `sniff`/`sniff_file`, и в разборе OOXML; настоящие DOCX/XLSX/ODS (в том числе в форме zip64)
+//! по-прежнему распознаются и разбираются. Пик памяти на пробе ревьюера (zip64 на 2 млн записей
+//! за поддельной EOCD) — счётчик аллокаций этого тестового бинарника.
+mod common;
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::time::{Duration, Instant};
+
+use common::{W, zip_of};
+use zam_docs::{DocError, DocKind, Limits, extract, sniff, sniff_file};
+
+struct Counter;
+static CUR: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn add(n: usize) {
+    let c = CUR.fetch_add(n, Relaxed) + n;
+    PEAK.fetch_max(c, Relaxed);
+}
+
+// SAFETY: делегирует системному аллокатору, только считает байты
+unsafe impl GlobalAlloc for Counter {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            add(l.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) };
+        CUR.fetch_sub(l.size(), Relaxed);
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+        let q = unsafe { System.realloc(p, l, n) };
+        if !q.is_null() {
+            if n > l.size() {
+                add(n - l.size());
+            } else {
+                CUR.fetch_sub(l.size() - n, Relaxed);
+            }
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counter = Counter;
+
+const MIB: usize = 1024 * 1024;
+
+/// Счётчик общий для бинарника: тесты идут по одному.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn u16le(v: &mut Vec<u8>, x: u16) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn u32le(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn u64le(v: &mut Vec<u8>, x: u64) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn rd16(b: &[u8], i: usize) -> u16 {
+    u16::from_le_bytes([b[i], b[i + 1]])
+}
+fn rd32(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(b[i..i + 4].try_into().unwrap())
+}
+
+/// Поддельная EOCD: 1 запись, каталог 46 байт по смещению `0xFFFF_FFF0`, без комментария.
+fn fake_eocd() -> Vec<u8> {
+    let mut v = Vec::new();
+    u32le(&mut v, 0x0605_4b50);
+    u16le(&mut v, 0);
+    u16le(&mut v, 0);
+    u16le(&mut v, 1);
+    u16le(&mut v, 1);
+    u32le(&mut v, 46);
+    u32le(&mut v, 0xFFFF_FFF0);
+    u16le(&mut v, 0);
+    v
+}
+
+/// Позиция EOCD архива без комментария (последние 22 байта).
+fn eocd_at(b: &[u8]) -> usize {
+    let p = b.len() - 22;
+    assert_eq!(rd32(b, p), 0x0605_4b50);
+    p
+}
+
+/// Тот же архив в форме zip64: EOCD64 (с `ext` байтами расширяемых данных) + локатор + EOCD с
+/// полями `0xFFFF…`; `sig64` — сигнатура записи EOCD64.
+fn to_zip64(b: &[u8], ext: usize, sig64: u32) -> Vec<u8> {
+    let p = eocd_at(b);
+    let (n, size, off) = (rd16(b, p + 10), rd32(b, p + 12), rd32(b, p + 16));
+    let mut v = b[..p].to_vec();
+    let e64 = v.len() as u64;
+    u32le(&mut v, sig64);
+    u64le(&mut v, 44 + ext as u64);
+    u16le(&mut v, 45);
+    u16le(&mut v, 45);
+    u32le(&mut v, 0);
+    u32le(&mut v, 0);
+    u64le(&mut v, u64::from(n));
+    u64le(&mut v, u64::from(n));
+    u64le(&mut v, u64::from(size));
+    u64le(&mut v, u64::from(off));
+    v.extend(std::iter::repeat_n(0u8, ext));
+    u32le(&mut v, 0x0706_4b50);
+    u32le(&mut v, 0);
+    u64le(&mut v, e64);
+    u32le(&mut v, 1);
+    u32le(&mut v, 0x0605_4b50);
+    u16le(&mut v, 0);
+    u16le(&mut v, 0);
+    u16le(&mut v, 0xFFFF);
+    u16le(&mut v, 0xFFFF);
+    u32le(&mut v, 0xFFFF_FFFF);
+    u32le(&mut v, 0xFFFF_FFFF);
+    u16le(&mut v, 0);
+    v
+}
+
+/// Архив с комментарием `comment` (длина EOCD исправляется).
+fn with_comment(b: &[u8], comment: &[u8]) -> Vec<u8> {
+    let p = eocd_at(b);
+    let mut v = b.to_vec();
+    v[p + 20..p + 22].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+    v.extend_from_slice(comment);
+    v
+}
+
+fn content_types(part: &str, ct: &str) -> Vec<u8> {
+    format!(
+        r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="{part}" ContentType="{ct}"/></Types>"#
+    )
+    .into_bytes()
+}
+
+fn docx() -> Vec<u8> {
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            content_types(
+                "/word/document.xml",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            ),
+        ),
+        (
+            "word/document.xml",
+            format!(r#"<w:document {W}><w:body><w:p><w:r><w:t>Привет из DOCX</w:t></w:r></w:p></w:body></w:document>"#)
+                .into_bytes(),
+        ),
+    ])
+}
+
+fn xlsx() -> Vec<u8> {
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            content_types(
+                "/xl/workbook.xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+            ),
+        ),
+        ("xl/workbook.xml", b"<workbook/>".to_vec()),
+    ])
+}
+
+fn ods() -> Vec<u8> {
+    zip_of(&[
+        (
+            "mimetype",
+            b"application/vnd.oasis.opendocument.spreadsheet".to_vec(),
+        ),
+        ("content.xml", b"<office:document-content/>".to_vec()),
+    ])
+}
+
+fn file(b: &[u8], name: &str, l: &Limits) -> Option<DocKind> {
+    sniff_file(Cursor::new(b.to_vec()), name, l).unwrap()
+}
+
+fn deadline() -> Instant {
+    Instant::now() + Duration::from_secs(30)
+}
+
+fn docx_text(b: &[u8], l: &Limits) -> Result<String, DocError> {
+    extract(DocKind::Docx, b, l, deadline()).map(|x| {
+        x.units
+            .into_iter()
+            .map(|u| u.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// Настоящие архивы — как прежде (в том числе в форме zip64 без расширяемых данных).
+#[test]
+fn genuine_archives_still_recognized_and_parsed() {
+    let _g = serial();
+    let l = Limits::default();
+    for (b, kind, name) in [
+        (docx(), DocKind::Docx, "a.docx"),
+        (xlsx(), DocKind::Xlsx, "b.xlsx"),
+        (ods(), DocKind::Ods, "c.ods"),
+    ] {
+        assert_eq!(sniff(&b, name), Some(kind), "{name}");
+        assert_eq!(file(&b, name, &l), Some(kind), "{name}");
+        let z = to_zip64(&b, 0, 0x0606_4b50);
+        assert_eq!(sniff(&z, name), Some(kind), "zip64 {name}");
+        assert_eq!(file(&z, name, &l), Some(kind), "zip64 {name}");
+        // комментарий без сигнатур — допустим
+        let c = with_comment(&b, b"just a comment");
+        assert_eq!(file(&c, name, &l), Some(kind), "комментарий {name}");
+    }
+    assert_eq!(docx_text(&docx(), &l).unwrap(), "Привет из DOCX");
+    assert_eq!(
+        docx_text(&to_zip64(&docx(), 0, 0x0606_4b50), &l).unwrap(),
+        "Привет из DOCX"
+    );
+}
+
+/// Поддельная EOCD в хвосте и в комментарии — отказ в `sniff`, `sniff_file` и разборе.
+#[test]
+fn forged_eocd_in_tail_or_comment_rejected() {
+    let _g = serial();
+    let l = Limits::default();
+    let d = docx();
+    let mut tail = d.clone();
+    tail.extend_from_slice(&fake_eocd());
+    let comment = with_comment(&d, &fake_eocd());
+    let mut tail64 = to_zip64(&d, 0, 0x0606_4b50);
+    tail64.extend_from_slice(&fake_eocd());
+    // мусор после EOCD (комментарий короче фактического хвоста) — тоже отказ
+    let mut garbage = d.clone();
+    garbage.extend_from_slice(b"garbage");
+    for (label, b) in [
+        ("хвост", &tail),
+        ("комментарий", &comment),
+        ("хвост zip64", &tail64),
+        ("мусор", &garbage),
+    ] {
+        assert_eq!(sniff(b, "a.docx"), None, "{label}");
+        assert_eq!(file(b, "a.docx", &l), None, "{label}");
+        assert!(
+            matches!(docx_text(b, &l), Err(DocError::Malformed(_))),
+            "{label}: {:?}",
+            docx_text(b, &l)
+        );
+    }
+}
+
+/// zip64 с неверной EOCD64 (сигнатура, расширяемые данные, смещение в локаторе) — отказ.
+#[test]
+fn zip64_with_bad_eocd64_rejected() {
+    let _g = serial();
+    let l = Limits::default();
+    let d = docx();
+    let bad_sig = to_zip64(&d, 0, 0x0606_4b51);
+    let ext = to_zip64(&d, 8, 0x0606_4b50);
+    let mut bad_loc = to_zip64(&d, 0, 0x0606_4b50);
+    let loc = bad_loc.len() - 22 - 20;
+    let wrong = rd32(&bad_loc, loc + 8) - 4;
+    bad_loc[loc + 8..loc + 12].copy_from_slice(&wrong.to_le_bytes());
+    // записей в EOCD64 больше, чем вмещает каталог
+    let mut many = to_zip64(&d, 0, 0x0606_4b50);
+    let e64 = many.len() - 22 - 20 - 56;
+    many[e64 + 24..e64 + 40].copy_from_slice(&[
+        0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0,
+    ]);
+    for (label, b) in [
+        ("сигнатура", &bad_sig),
+        ("расширяемые данные", &ext),
+        ("локатор", &bad_loc),
+        ("записей больше каталога", &many),
+    ] {
+        assert_eq!(sniff(b, "a.docx"), None, "{label}");
+        assert_eq!(file(b, "a.docx", &l), None, "{label}");
+        assert!(
+            matches!(docx_text(b, &l), Err(DocError::Malformed(_))),
+            "{label}"
+        );
+    }
+}
+
+/// Каталог больше `max_central_dir` — не документ при определении вида и `truncated` при разборе.
+#[test]
+fn central_dir_over_limit() {
+    let _g = serial();
+    let d = docx();
+    let small = Limits {
+        max_central_dir: 64,
+        ..Limits::default()
+    };
+    assert_eq!(file(&d, "a.docx", &small), None);
+    let x = extract(DocKind::Docx, &d, &small, deadline()).unwrap();
+    assert!(x.units.is_empty());
+    assert!(
+        x.warnings.iter().any(|w| w == "truncated: max_central_dir"),
+        "{:?}",
+        x.warnings
+    );
+    assert!(Limits::default().max_central_dir >= 16 * MIB as u64);
+}
+
+/// Проба ревьюера: локальный заголовок + `n` записей каталога с именем `name_len` байт, zip64
+/// (EOCD64 + локатор + EOCD `0xFFFF`) или zip32; `fake_tail` — поддельная EOCD после настоящей.
+fn probe(n: u64, name_len: usize, zip64: bool, fake_tail: bool) -> Vec<u8> {
+    let mut v = Vec::new();
+    let lname = b"[Content_Types].xml";
+    u32le(&mut v, 0x0403_4b50);
+    u16le(&mut v, 20);
+    for _ in 0..4 {
+        u16le(&mut v, 0);
+    }
+    for _ in 0..3 {
+        u32le(&mut v, 0);
+    }
+    u16le(&mut v, lname.len() as u16);
+    u16le(&mut v, 0);
+    v.extend_from_slice(lname);
+    let cd = v.len() as u64;
+    for i in 0..n {
+        u32le(&mut v, 0x0201_4b50);
+        u16le(&mut v, 20);
+        u16le(&mut v, 20);
+        for _ in 0..4 {
+            u16le(&mut v, 0);
+        }
+        for _ in 0..3 {
+            u32le(&mut v, 0);
+        }
+        u16le(&mut v, name_len as u16);
+        for _ in 0..4 {
+            u16le(&mut v, 0);
+        }
+        u32le(&mut v, 0);
+        u32le(&mut v, 0);
+        if i == 0 && name_len >= lname.len() {
+            let mut nm = lname.to_vec();
+            nm.resize(name_len, b'x');
+            v.extend_from_slice(&nm);
+        } else {
+            let s = format!("{i:0width$}", width = name_len.max(1));
+            v.extend_from_slice(&s.as_bytes()[s.len() - name_len..]);
+        }
+    }
+    let cd_size = v.len() as u64 - cd;
+    if zip64 {
+        let e64 = v.len() as u64;
+        u32le(&mut v, 0x0606_4b50);
+        u64le(&mut v, 44);
+        u16le(&mut v, 45);
+        u16le(&mut v, 45);
+        u32le(&mut v, 0);
+        u32le(&mut v, 0);
+        u64le(&mut v, n);
+        u64le(&mut v, n);
+        u64le(&mut v, cd_size);
+        u64le(&mut v, cd);
+        u32le(&mut v, 0x0706_4b50);
+        u32le(&mut v, 0);
+        u64le(&mut v, e64);
+        u32le(&mut v, 1);
+        u32le(&mut v, 0x0605_4b50);
+        u16le(&mut v, 0);
+        u16le(&mut v, 0);
+        u16le(&mut v, 0xFFFF);
+        u16le(&mut v, 0xFFFF);
+        u32le(&mut v, 0xFFFF_FFFF);
+        u32le(&mut v, 0xFFFF_FFFF);
+    } else {
+        u32le(&mut v, 0x0605_4b50);
+        u16le(&mut v, 0);
+        u16le(&mut v, 0);
+        u16le(&mut v, n as u16);
+        u16le(&mut v, n as u16);
+        u32le(&mut v, cd_size as u32);
+        u32le(&mut v, cd as u32);
+    }
+    u16le(&mut v, 0);
+    if fake_tail {
+        v.extend_from_slice(&fake_eocd());
+    }
+    v
+}
+
+/// Пик памяти `sniff_file` и разбора сверх входа.
+fn peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let base = CUR.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let r = f();
+    (r, PEAK.load(Relaxed).saturating_sub(base))
+}
+
+/// Проба ревьюера: до правки поддельная EOCD пропускала zip64 на 2 млн записей в `ZipArchive`
+/// (≈ 650 МиБ на файл 89 МиБ); теперь — отказ без разбора каталога, пик — буфер хвоста.
+#[test]
+fn reviewer_probe_peak_is_small() {
+    let _g = serial();
+    let l = Limits::default();
+    for (label, b) in [
+        ("zip64 2M честный", probe(2_000_000, 1, true, false)),
+        (
+            "zip64 2M + поддельная EOCD",
+            probe(2_000_000, 1, true, true),
+        ),
+        // каталог 48 МиБ: файл в пределах `max_bytes`, каталог — сверх `max_central_dir`
+        ("2500 × имя 20000", probe(2500, 20_000, false, false)),
+    ] {
+        let t = Instant::now();
+        let (r, sniff_peak) = peak(|| sniff_file(Cursor::new(&b[..]), "x.xlsx", &l).unwrap());
+        let sniff_time = t.elapsed();
+        let (x, extract_peak) = peak(|| extract(DocKind::Xlsx, &b, &l, deadline()));
+        eprintln!(
+            "{label}: файл {} МиБ, sniff_file {r:?} пик {:.2} МиБ за {sniff_time:?}, \
+             extract {} пик {:.2} МиБ",
+            b.len() / MIB,
+            sniff_peak as f64 / MIB as f64,
+            match &x {
+                Ok(x) => format!("{:?}", x.warnings),
+                Err(e) => format!("{e}"),
+            },
+            extract_peak as f64 / MIB as f64,
+        );
+        assert_eq!(r, None, "{label}");
+        assert!(sniff_peak < MIB, "{label}: sniff_file пик {sniff_peak}");
+        assert!(extract_peak < MIB, "{label}: extract пик {extract_peak}");
+        match x {
+            Ok(x) => assert!(x.units.is_empty(), "{label}"),
+            Err(e) => assert!(matches!(e, DocError::Malformed(_)), "{label}: {e}"),
+        }
+    }
+}

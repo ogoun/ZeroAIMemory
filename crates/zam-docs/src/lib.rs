@@ -82,6 +82,9 @@ pub struct Limits {
     pub max_ratio: u32,
     /// Записей в архиве zip.
     pub max_entries: u32,
+    /// Размер центрального каталога zip, байт (из конца каталога, до его разбора): память
+    /// разбора каталога у `zip` пропорциональна ему (имена записей до 64 КиБ каждое).
+    pub max_central_dir: u64,
     /// Глубина вложенности XML.
     pub max_xml_depth: u32,
     /// Непустых ячеек листа; заодно — число общих строк книги и ячеек страницы превью.
@@ -100,6 +103,7 @@ impl Default for Limits {
             max_unpacked: 500 * 1024 * 1024,
             max_ratio: 100,
             max_entries: 10_000,
+            max_central_dir: 32 * 1024 * 1024,
             max_xml_depth: 256,
             max_cells: 2_000_000,
             max_chars: 20_000_000,
