@@ -598,3 +598,10 @@
 5. Карта кода (встроенная, решение владельца 2026-10-28) — отдельным этапом M5.5 после M5
    (предложение контроллера), чтобы M5 не разрастался.
 6. OCR — отдельным этапом или в M6.
+
+### Задача 3 — проверка на Linux-стенде (2026-11-01)
+
+Код под Linux (RLIMIT_AS, PDEATHSIG, VmPeak) проверен на стенде владельца (Debian 13, 2 CPU, 2 ГБ) с настоящим `libpdfium.so`:
+`cargo test -p zam-docs`, `cargo test -p zam-server --test doc_worker -- --include-ignored` (9/9, в т.ч. `worker_memory_limit_oom`,
+`worker_crash_is_parse_crash_and_restarts`, `worker_timeout_killed`, `worker_dies_with_server`), lib-тесты `docs` и `config`,
+`cargo clippy -p zam-docs -p zam-server --all-targets -- -D warnings` — всё зелёное. Сомнение исполнителя № 1 снято.
