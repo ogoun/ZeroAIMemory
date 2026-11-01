@@ -75,6 +75,14 @@ jobs:
         with:
           toolchain: 1.99.1
           components: rustfmt, clippy
+      # На ubuntu-раннере ~14 ГБ свободно; target тестов workspace (M5: image, pdfium, превью)
+      # к этому подошёл — шаг test падал без аннотации (2026-11-01, bb7ae77, 4556133). Убираем
+      # предустановленные SDK, которые проекту не нужны (~20 ГБ).
+      - name: освободить место (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --check
@@ -106,7 +114,10 @@ jobs:
         run: |
           set -o pipefail
           if ! cargo test --workspace --no-fail-fast 2>&1 | tee target/test.log; then
-            summary=$(grep -E -A12 "panicked at|^error(\[|:)|^---- .* stdout ----|FAILED|failures:" target/test.log | head -c 3500)
+            # bash шага идёт с -e: grep без совпадений или с ошибкой не должен обрывать шаг
+            # до аннотации; хвост журнала и место на диске — на случай падения не в тесте
+            summary=$( { grep -E -A12 "panicked at|^error(\[|:)|^---- .* stdout ----|FAILED|failures:" target/test.log || true; } | head -c 3000 || true)
+            summary="${summary}"$'\n'"--- tail ---"$'\n'"$(tail -c 600 target/test.log 2>/dev/null || true)"$'\n'"--- df ---"$'\n'"$(df -h / 2>/dev/null | tail -1 || true)"
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/}
             summary=${summary//$'\n'/'%0A'}
