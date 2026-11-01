@@ -510,6 +510,10 @@ pub struct SearchSection {
     /// Не больше фрагментов с одного документа вложения (≥ 1, по умолчанию 2; M5): квота
     /// заметки-владельца (`max_per_node`) — своя, вложение её не занимает.
     pub max_per_attachment: usize,
+    /// Окно prefetch фрагментов вложений гибридного поиска (dense и sparse, M5; 1..=500, по
+    /// умолчанию 30 — `zam_index::ATTACH_PREFETCH`, вдвое при `area`/`certainty`). Подбор — eval
+    /// документов задачи 10 M5 (`eval/results/2026-11-02-m5-docs-summary.md`).
+    pub attach_prefetch: usize,
     /// Множители слитого балла (§9.2 п. 4) для insight вида `gotcha` и `failure` и для узлов и
     /// записей текущей области (`X-Zam-Area`). По умолчанию 1,05 / 1,05 / 1,10 — сетка eval задачи
     /// 18 M3: буст вида должен быть ниже буста `theorem` (1,10), иначе гипотеза `gotcha` обходит
@@ -572,6 +576,9 @@ impl SearchSection {
         }
         if self.max_per_attachment == 0 {
             return Err(bad("max_per_attachment", "должно быть больше 0"));
+        }
+        if !(1..=500).contains(&self.attach_prefetch) {
+            return Err(bad("attach_prefetch", "должно быть в 1..=500"));
         }
         for (k, v) in [
             ("boost_gotcha", self.boost_gotcha),
@@ -979,6 +986,7 @@ impl Default for ServerConfig {
                 recency_half_life_days: 180.0,
                 max_per_node: 3,
                 max_per_attachment: 2,
+                attach_prefetch: zam_index::ATTACH_PREFETCH,
                 boost_gotcha: 1.05,
                 boost_failure: 1.05,
                 boost_area: 1.10,
@@ -1879,6 +1887,11 @@ yield_ms = 1
         );
         assert_eq!((d.recency_half_life_days, d.max_per_node), (180.0, 3));
         assert_eq!(d.max_per_attachment, 2);
+        assert_eq!(d.attach_prefetch, 30);
+        for v in ["0", "501"] {
+            let bad = vec![env("ZAM_SEARCH__ATTACH_PREFETCH", v)];
+            assert!(load(None, &bad, &Default::default()).is_err(), "{v}");
+        }
         // ослабленный bm25 — вес по eval (§18.2)
         assert_eq!(d.w_fts_relaxed, 0.25);
         assert_eq!(d.w_fts_alias, 0.5);

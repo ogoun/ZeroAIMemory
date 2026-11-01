@@ -130,6 +130,9 @@ pub struct VectorFilter {
     /// вложений не запускается ([`attachment_window`] = 0; вызывающий проверил SQLite: +1,8 мс к
     /// p95 без пользы, замер ревью задачи 6 M5). Остальные методы поле не читают.
     pub no_attachments: bool,
+    /// Гибридный поиск: окно prefetch вложений (`search.attach_prefetch` сервера); `None` —
+    /// [`ATTACH_PREFETCH`]. Остальные методы поле не читают.
+    pub attach_prefetch: Option<usize>,
 }
 
 impl VectorFilter {
@@ -358,9 +361,9 @@ pub const LEVEL_ATTACHMENT: &str = "attachment";
 /// всё окно листов, и листы заметок выпадали из выдачи. Итоговый лимит слияния растёт на окно.
 pub const ATTACH_PREFETCH: usize = 30;
 
-/// Окно prefetch вложений для фильтра `f`: 0 — виды без `attachment` (или уровни без него) или
-/// в области нет извлечённых документов ([`VectorFilter::no_attachments`]); при
-/// `area`/`certainty` — вдвое (Qdrant эти условия у точек вложений не проверяет, часть окна
+/// Окно prefetch вложений для фильтра `f` ([`VectorFilter::attach_prefetch`], по умолчанию
+/// [`ATTACH_PREFETCH`]): 0 — виды без `attachment` (или уровни без него) или в области нет
+/// извлечённых документов ([`VectorFilter::no_attachments`]); при `area`/`certainty` — вдвое (Qdrant эти условия у точек вложений не проверяет, часть окна
 /// отбросит SQLite по заметке-владельцу).
 pub fn attachment_window(f: &VectorFilter) -> usize {
     let kind_ok = f.kinds.is_empty() || f.kinds.iter().any(|k| k == LEVEL_ATTACHMENT);
@@ -368,10 +371,11 @@ pub fn attachment_window(f: &VectorFilter) -> usize {
     if f.no_attachments || !(kind_ok && level_ok) {
         return 0;
     }
+    let base = f.attach_prefetch.unwrap_or(ATTACH_PREFETCH);
     if f.area.is_some() || !f.certainty.is_empty() {
-        2 * ATTACH_PREFETCH
+        2 * base
     } else {
-        ATTACH_PREFETCH
+        base
     }
 }
 
@@ -411,6 +415,16 @@ mod tests {
             ..VectorFilter::default()
         };
         assert_eq!(attachment_window(&area), 2 * ATTACH_PREFETCH);
+        let wide = VectorFilter {
+            attach_prefetch: Some(100),
+            ..area.clone()
+        };
+        assert_eq!(attachment_window(&wide), 200);
+        let narrow = VectorFilter {
+            attach_prefetch: Some(10),
+            ..VectorFilter::default()
+        };
+        assert_eq!(attachment_window(&narrow), 10);
         let none = VectorFilter {
             no_attachments: true,
             ..area

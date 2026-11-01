@@ -2091,6 +2091,7 @@ pub async fn search(
             &kinds,
             want_folders || folder_channel,
         );
+        filter.attach_prefetch = Some(st.cfg.search.attach_prefetch);
         // prefetch вложений — только если в области есть извлечённые документы (одна проверка
         // EXISTS по базе цели: +1,8 мс к p95 без пользы, раунд правок 2 задачи 6)
         if zam_index::attachment_window(&filter) > 0 {
