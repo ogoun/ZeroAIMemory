@@ -1,4 +1,9 @@
-//! Ссылка на цель (узел, запись журнала или документ вложения): `n:<id>` | `e:<id>` | `a:<id>`.
+//! Ссылка на цель (узел, запись журнала или документ вложения): `n:<id>` | `e:<id>` | `d:<id>`.
+//!
+//! Документ вложения — `d:` (document), а не `a:`: `a:<chunk>` — ссылка выдачи на фрагмент вложения
+//! (чанк, его `locator`; поиск, `/read`, CLI — задача 6 M5), и одна буква с двумя видами id
+//! (base32 документа и hex чанка, который `Id` тоже принимает как UUID) разбиралась бы
+//! неоднозначно.
 
 use std::fmt;
 use std::str::FromStr;
@@ -18,18 +23,18 @@ pub enum TargetKind {
 }
 
 impl TargetKind {
-    /// Префикс текстовой формы: `n` | `e` | `a`.
+    /// Префикс текстовой формы: `n` | `e` | `d`.
     fn prefix(self) -> &'static str {
         match self {
             TargetKind::Node => "n",
             TargetKind::Entry => "e",
-            TargetKind::Attachment => "a",
+            TargetKind::Attachment => "d",
         }
     }
 }
 
 /// Узел, запись журнала или документ вложения. Текстовая форма (`Display`/`FromStr`, serde) —
-/// `n:<id>` | `e:<id>` | `a:<id>`.
+/// `n:<id>` | `e:<id>` | `d:<id>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TargetRef {
     pub kind: TargetKind,
@@ -50,7 +55,7 @@ impl FromStr for TargetRef {
         let kind = match k {
             "n" => TargetKind::Node,
             "e" => TargetKind::Entry,
-            "a" => TargetKind::Attachment,
+            "d" => TargetKind::Attachment,
             _ => return Err(ParseIdError),
         };
         Ok(TargetRef {
@@ -96,7 +101,9 @@ mod tests {
             kind: TargetKind::Attachment,
             id,
         };
-        assert_eq!(a.to_string(), format!("a:{id}"));
+        assert_eq!(a.to_string(), format!("d:{id}"));
+        // `a:` — ссылка выдачи на чанк вложения, не цель
+        assert!(format!("a:{id}").parse::<TargetRef>().is_err());
         assert_eq!(a.to_string().parse::<TargetRef>().unwrap(), a);
         assert_eq!(
             serde_json::to_string(&TargetKind::Attachment).unwrap(),

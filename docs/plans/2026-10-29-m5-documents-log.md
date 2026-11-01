@@ -1003,6 +1003,111 @@ debuginfo).
   Reindex из кэша неудач не трогает. Тест `full_reindex_drops_cached_failures`.
 - Проверки: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` — чисто; `-p zam-store --test attachments` 14 (+1); `-p zam-server`: lib 193 (1 ignored), `attachments_index` 13 (+1), `index_api` 4 — зелёные.
 
+### Задача 6 — поиск по вложениям с `locator` (2026-11-01)
+
+BASE 52f6b8a. Поиск находит фрагменты DOCX/PDF/XLSX/PPTX (и CSV, текст) каналами FTS и
+векторным; карточка — ссылка на фрагмент с файлом и `locator`.
+
+- **Цель чанка вложения — документ, а не заметка (решение исполнителя).** `FtsHit.target` =
+  `TargetKind::Attachment` (`attachment_docs.id`), поля файла — `FtsHit.attachment:
+  AttachmentHit {id, node_id, filename, blob_sha256, locator}`; `path`, `space_id`, `area`,
+  `certainty` — узла-владельца. Отсюда без особых случаев: вложение не выдаётся как заметка
+  (`kind: "attachment"`), своя квота, `notes` группирует документ отдельно от заметки, сводки
+  заметки (`note_to_leaf`, `leaf_fits` — только `chunk`) с фрагментами вложений не сливаются.
+  `chunk_target` различает три цели по `node_id`/`entry_id`/`attachment_id`.
+- **`scope_sql` — ветка вложений** (`c.attachment_id IS NOT NULL AND kinds ∋ attachment`):
+  `attachment_docs.deleted_at IS NULL`, `ad.node_id = c.node_id`, живой узел-владелец, его
+  пространство из области, префикс пути, `area`, `certainty`, `filters.file` — узла-владельца;
+  при `decided_by` — нет (вложение не решение). Ветка заметок — `c.attachment_id IS NULL` (была
+  с задачи 4). Одно условие действует во всех каналах: `bm25`, `trigram`, `alias` (все через
+  `run_channel`) и `live_chunks` (векторные хиты, листы-замены, соседи графа). Листы
+  (`leaves_of_targets`, `first_leaves`, `leaf_term_hits`) и соседи (`neighbor_leaves`) берут
+  только `level = 'chunk'` — чанки вложений туда не попадают. Тесты: store
+  `search_channels_hide_hidden_attachment_docs` (живой документ — все три канала FTS и
+  `live_chunks`, виды и фильтры; метка документа при живом узле и удалённый узел — ни один канал;
+  листы и соседи без чанков вложения), сервер `attachment_not_listed_as_note` (режимы, trigram,
+  `expand=neighbors`, удаление/восстановление узла, открепление).
+- **Векторный канал.** Листовой prefetch гибридного поиска (dense и sparse, `LEAF_PREFETCH` 50) —
+  уровни `chunk` и `attachment` (`zam-index`: `qdrant.rs`, edge-прототип — так же). Отдельный
+  prefetch не вводился: фрагменты конкурируют с листами заметок на равных, итоговый лимит
+  слияния не растёт. Область (`user_id`, `space_id`) и Human (не входит в фильтр) — как у
+  заметок; виды — по `kind = attachment` точки.
+- **Фильтры `area`/`certainty`/`tags` для вложений — наследование в SQL при выдаче (решение
+  исполнителя; отложенное задачи 5).** Варианты: (а) переписывать payload точек вложений при
+  правке frontmatter заметки; (б) брать поля заметки-владельца в момент поиска. Выбрано (б):
+  SQLite — источник истины (так уже проверяются все векторные хиты, `live_chunks`), правка заметки
+  не трогает вложения (Review Focus 2: ни заданий, ни перезаписи точек), нет окна рассинхрона
+  после правки. В Qdrant условия `certainty` и `area` гибридного поиска для точек уровня
+  `attachment` ослаблены (`should[level = attachment, must(условия)]`, `search_filter(…,
+  owner_inherit = true)` — только листовой prefetch поиска; удаление, подсчёт и ближайшие —
+  точный `point_filter`). Цена: при узком фильтре точки вложений чужой области могут занять
+  часть окна prefetch и быть отброшены SQLite — выдача не неверна, лишь короче; при замерах
+  корпуса (задача 10) — пересмотреть (отдельный prefetch вложений). Фильтра `tags` у поиска нет.
+  Тест `attachment_filters_inherit_owner_note` (с MiniLM и Qdrant): `scope.area` — по
+  `nodes.area`; `filters.certainty` — правка frontmatter заметки сразу меняет выдачу её
+  вложения, без переизвлечения, с источником `vector`.
+- **Префиксы ссылок (обязательство задач 4–5; решение исполнителя).** Наружу фрагмент вложения
+  — `a:<chunk_id>` (hex 32): карточка поиска JSON `id` и md, `/read` (задача 7: документ и
+  `locator` чанка по умолчанию), сессии и CLI; `zam_store::chunk_ref`, `CHUNK_REF_LETTER`.
+  Документ — полем `attachment_id`; внутренняя текстовая форма цели `TargetKind::Attachment`
+  сменена с `a:<id>` на `d:<id>` (`zam-core`): `Id` принимает и base32, и hex-UUID, поэтому
+  `a:<hex чанка>` разбирался бы как документ с чужим id — неоднозначность снята, `a:` больше не
+  `TargetRef`. Наружу `d:` нигде не выводится (задания, журнал); блоб — `b:<sha256>` (задача 7).
+  Выбран чанк, а не документ: карточка должна вести к месту (`locator`), документ из чанка
+  выводится однозначно, обратное — нет.
+- **Карточка.** JSON: `kind: "attachment"`, `id: "a:<chunk>"`, `node_id` владельца (как у
+  прочих карточек; в брифе — `node`), `attachment_id`, `file`, `blob_sha256`, `locator`,
+  `locator_text`, `path`, `heading_path`, `level: attachment`, `rev: 0`, `certainty` владельца,
+  `chunk_ids`, `score`, `sources`, `tokens`, `updated_at` (время привязки документа — правка
+  заметки текст файла не меняет; без `verified_at`), `age_days`, `seen: false`, `snippet` (и в
+  `notes`: L0 у документа нет) или `text`. md: `<n>. a:<chunk> <space>/<путь заметки> › <файл>[
+  › <путь заголовков>][ · <locator_text>]  [score][ · certainty] · <дата> · <возраст> · ~N tok`
+  (путь заголовков — сверх брифа: заголовок слайда, лист, раздел DOCX). Подпись —
+  `zam_docs::Locator::label`: `стр. 12`, `лист «Итоги» A1:F40`, `слайд 3`, `абз. 40`.
+- **Квота `search.max_per_attachment` = 2** (новый ключ, ≥ 1, `config.example.toml`):
+  `zam_search::cap_per_node(r, max_per_node, max_per_attachment)` и `target_cap`, то же — у
+  лимита после реранка (`cap_items`). Квота — на документ; заметка-владелец сохраняет свои 3.
+  Тест `attachment_quota_separate` (3 чанка заметки + 2 фрагмента PPTX; в `notes` — по карточке).
+- **Умолчания видов** `DEFAULT_KINDS` += `attachment`. Виды входят в `scope_hash` кэша выжимок:
+  выжимки поиска с прежними умолчаниями таким поиском не находятся и пересоздаются, как в M4.5
+  (CHANGELOG, Changed). `/recall` и дайджест задают виды явно (`insight`, `note`) — вложения туда
+  не входят.
+- **Что к вложениям не применяется.** `expand=section|neighbors` (секции и соседи — у узлов),
+  граф (`expand=graph`, `order_by_contradicts`: документ не конец связи — цели-вложения в
+  запросы графа не передаются; без этого `neighbors` по документу давал 500), `stale_refs`,
+  `seen` сессии (`seen_tracked`: ключ выданного вложения — задача 7). Канал папок поднимает и
+  фрагменты вложений (путь — узла-владельца; не записи журналов) — тест
+  `attachment_quota_and_folder_lift` (`zam-search`).
+- **MCP** `memory_search`: описание (297 символов) — `вложение — a:<id>, файл, locator`, вид
+  `attachment`; инструментов 10. **CLI** `zam search` печатает карточки сервера как есть — тест
+  `zam-cli/tests/search_attachments.rs` (рабочий процесс разбора — бинарник `zam-server` из
+  каталога сборки: без него тест пропускается).
+- Тесты (TDD: сначала красные — не компилировались без `FtsHit.attachment`, `Locator::label`,
+  `cap_items` с квотой вложения): `zam-server/tests/attachments_search.rs` (6, с MiniLM, Qdrant и
+  pdfium — векторный канал и PDF; без них — FTS): `search_finds_docx_pdf_xlsx_pptx_with_locator`,
+  `attachment_not_listed_as_note`, `attachment_quota_separate`,
+  `kinds_note_only_excludes_attachments`, `participant_sees_only_solution_attachments`
+  (участник — только вложение пространства решения, с `vector`; Human — не токену и не владельцу
+  без `include_human`, администратору — только FTS), сверх брифа
+  `attachment_filters_inherit_owner_note`; unit `md_card_locator_text` и квота в
+  `rerank_text_and_cap_items` (`search/mod.rs`), `locator_label_for_cards` (`zam-docs`),
+  `attachment_quota_and_folder_lift` (`zam-search`), `target_ref_display_parse` (`d:`, `a:` — не
+  цель); store `search_channels_hide_hidden_attachment_docs`; MCP `mcp_descriptions_under_300`
+  требует `attachment` и `a:`. Обновлён `note_edit_keeps_attachment_chunks`: слово вложения
+  теперь находится — документом, не заметкой.
+- Общие помощники тестов вложений сервера — `tests/common/attach.rs` (загрузка, ожидание
+  извлечения и точек, DOCX/XLSX/PPTX в памяти); `attachments_index.rs` пока со своими копиями.
+- Проверки (Windows, MiniLM + Qdrant + pdfium, `ZAM_REQUIRE_ML=1`): `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets -D warnings`, `clippy -p zam-index --features edge` —
+  чисто; `-p zam-store` — все наборы зелёные (`attachments` 15, `search` 13); `-p zam-server`: lib
+  194 (1 ignored), `attachments_search` 6, `attachments_index` 13, `search` 13, `hybrid` 7,
+  `search_multi` 9 (1 ignored), `mcp` 20, `recall` 12 (1 ignored), `recall_brief` 6, `cache_api`
+  8, `folders_search` 4, `graph` 6, `glossary_search` 10, `certainty` 16, `search_rerank_boosts`
+  2, `sessions` 13, `blobs` 10, `decisions` 8, `m3_acceptance` 3; `-p zam-index` (lib 38, qdrant
+  28, worker 16 + 2 ignored и др.), `-p zam-search` 24, `-p zam-core`, `-p zam-docs` — зелёные;
+  `-p zam-cli`: `search_attachments` 1, `notes` 8, `repo_clean` 1. `mcp::mcp_vault_value_not_in_debug_log`
+  один раз упал («журнал без debug-строк», к поиску не относится), на повторе — 20/20.
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
@@ -1090,6 +1195,15 @@ debuginfo).
   лимитом, видна. Срок `sheet_page` — параметр `deadline` (раунд правок 1).
 - **Шапка повторяется в каждой единице листа (исполнитель, задача 2).** Чанк блока строк без
   шапки теряет смысл столбцов; повтор учитывается в `max_chars`.
+- **Фрагмент вложения — своя цель поиска (документ), не заметка-владелец (исполнитель,
+  задача 6).** Своя карточка, своя квота `max_per_attachment`, без слияния со сводками.
+- **`a:<chunk>` — ссылка на фрагмент вложения; цель-документ внутри — `d:<id>` (исполнитель,
+  задача 6).** Однозначный разбор `a:` (hex чанка `Id` тоже принимает); `/read a:<chunk>`
+  (задача 7) открывает фрагмент по `locator`.
+- **`area`, `certainty`, `filters.file` вложения — заметки-владельца в момент поиска (SQL), а не
+  payload точки (исполнитель, задача 6).** В Qdrant эти условия для точек `attachment` ослаблены
+  только в листовом prefetch поиска. Пересмотреть по замерам корпуса (задача 10), если точки
+  чужой области заметно сужают выдачу.
 
 ## Отложенные замечания
 
@@ -1151,24 +1265,38 @@ debuginfo).
 - ~~**Задача 5:** задания `pending` без задания, `split_targets`/`delete_targets` по
   `attachment_id`, Human-защита, вид по содержимому, `parse_crash`, pdfium в `/index/status`.~~
   Сделано в задаче 5.
-- **Задача 6:** `scope_sql` — ветка вложений с `attachment_docs.deleted_at IS NULL` (чанки
+- ~~**Задача 6:** `scope_sql` — ветка вложений с `attachment_docs.deleted_at IS NULL` (чанки
   скрытых документов лежат в FTS); карточка `a:<chunk>` vs `TargetKind::Attachment` (`a:<id
-  документа>`) — согласовать префиксы в задачах 6–7.
+  документа>`) — согласовать префиксы в задачах 6–7.~~ Сделано в задаче 6: ветка вложений;
+  наружу `a:<chunk>`, цель-документ — `d:<id>`.
 - **Задача 7:** показ вложения в `session_seen` — ключом `blob` (sha256): `seen_kind(Attachment)`
-  теперь `BadInput` (раунд правок 1).
+  теперь `BadInput` (раунд правок 1). С задачи 6 поиск вложения сессии не отмечает и `seen` им не
+  ставит (`seen_tracked`); задача 7 — отметка `mode=chunks` и `/read` (`part` = `locator`) и
+  пометка `seen` карточек вложений по тому же ключу.
 
 Из задачи 5 M5 (2026-11-01), пока не сделано:
 
-- **Задача 6:** prefetch гибридного поиска не берёт уровень `attachment` (точки вложений есть,
-  но векторный канал их не ищет) — добавить в листовой prefetch вместе с веткой `scope_sql`.
-- **Payload точек вложений без `tags`/`certainty` заметки, `area` — на момент извлечения:**
-  правка `area` во frontmatter заметки не обновляет точки её вложений (до переноса или reindex).
-  Решить в задаче 6 по фильтрам выдачи вложений.
+- ~~**Задача 6:** prefetch гибридного поиска не берёт уровень `attachment`.~~ Сделано в задаче 6:
+  листовой prefetch — `chunk` и `attachment`.
+- ~~**Payload точек вложений без `tags`/`certainty` заметки, `area` — на момент извлечения.**~~
+  Решено в задаче 6: фильтры выдачи вложений наследуются от заметки-владельца в SQL; в Qdrant
+  `certainty`/`area` для точек `attachment` ослаблены. Payload `area` точки остаётся (не
+  используется фильтром поиска).
 - ~~Неудача разбора не кэшируется~~ — сделано в раунде правок 1 (M-5).
 - **`too_large` при загрузке** — `failed` без задания: в `failed_items` не попадает (виден в
   `GET /nodes/{id}/attachments`), в отличие от `too_large` конвейера.
 - **Пробуждение конвейера** — после загрузки и записей узлов; смена GUID решения и reindex — по
   опросу раз в 2 с.
+
+Из задачи 6 M5 (2026-11-01), передано дальше:
+
+- **Задача 7:** `/read a:<chunk>` — документ и `locator` чанка (`zam_store::chunk_ref`, буква
+  `CHUNK_REF_LETTER`); `seen` карточек вложений (см. выше); `expand=neighbors` для фрагментов
+  вложения (соседние фрагменты документа по `ordinal`) — по желанию.
+- **Задача 10:** при узком `scope.area`/`filters.certainty` точки вложений чужой области занимают
+  окно листового prefetch (отбрасывает SQLite) — замерить на корпусе; при заметной потере —
+  отдельный prefetch уровня `attachment`.
+- **Тесты:** `attachments_index.rs` — перевести на `tests/common/attach.rs` (дубли помощников).
 
 ## Уточнить у владельца
 

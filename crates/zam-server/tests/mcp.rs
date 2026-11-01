@@ -1168,7 +1168,15 @@ async fn mcp_descriptions_under_300() {
         ("memory_recall", &["recovery", "brief"]),
         (
             "memory_search",
-            &["term", "task", "question", "file", "decided_by"],
+            &[
+                "term",
+                "task",
+                "question",
+                "file",
+                "decided_by",
+                "attachment",
+                "a:",
+            ],
         ),
         ("memory_link", &["contradicts"]),
         ("memory_vault", &["host", "environment"]),

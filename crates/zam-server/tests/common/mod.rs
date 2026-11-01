@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 pub mod api;
+pub mod attach;
 pub mod ml;
 pub mod process;
 pub mod qdrant;

@@ -57,6 +57,15 @@ use crate::{Db, StoreError};
 
 /// Уровень чанка вложения (`chunks.level`).
 pub const LEVEL_ATTACHMENT: &str = "attachment";
+/// Буква ссылки на фрагмент вложения: `a:<chunk_id>` — карточка поиска, `/read` (с `locator`
+/// чанка по умолчанию), сессии, CLI (M5, задача 6). Документ наружу — полем `attachment_id`
+/// (внутренняя форма цели — `d:<id>`, [`TargetKind::Attachment`]); блоб — `b:<sha256>`.
+pub const CHUNK_REF_LETTER: &str = "a";
+
+/// Ссылка на фрагмент вложения `a:<chunk_id>` ([`CHUNK_REF_LETTER`]).
+pub fn chunk_ref(chunk_id: &str) -> String {
+    format!("{CHUNK_REF_LETTER}:{chunk_id}")
+}
 /// Ревизия заданий и чанков вложения: у документа ревизий нет (содержимое блоба неизменно).
 const DOC_REV: i64 = 0;
 /// Уровень сжатия zstd `blob_extract.units`: быстрый, текст сжимается в 3–5 раз.

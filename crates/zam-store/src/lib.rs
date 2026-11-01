@@ -39,11 +39,11 @@ pub mod vault;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use attachments::{
-    AttachmentDoc, BLOB_MISSING, CHUNKER_ATTACHMENTS_KEY, CachedExtract, DocIntake, ExtractEnd,
-    ExtractState, ExtractTarget, PDFIUM_UNAVAILABLE, ReindexAttachment, TOO_LARGE,
-    attachment_chunker_fingerprint, attachment_chunks_for_index, attachment_pieces, cached_extract,
-    detach, enqueue_attachment_upserts, ensure_extract_jobs, error_code, extract_cached,
-    extract_target, finish_extract, has_failed_with, list_attachments, put_extract,
+    AttachmentDoc, BLOB_MISSING, CHUNK_REF_LETTER, CHUNKER_ATTACHMENTS_KEY, CachedExtract,
+    DocIntake, ExtractEnd, ExtractState, ExtractTarget, PDFIUM_UNAVAILABLE, ReindexAttachment,
+    TOO_LARGE, attachment_chunker_fingerprint, attachment_chunks_for_index, attachment_pieces,
+    cached_extract, chunk_ref, detach, enqueue_attachment_upserts, ensure_extract_jobs, error_code,
+    extract_cached, extract_target, finish_extract, has_failed_with, list_attachments, put_extract,
     put_extract_failure, rechunk_docs_if_stale, reindex_attachments_page, reindex_docs,
     replace_attachment_chunks, requeue_failed_with, set_extract_state,
 };
@@ -118,10 +118,10 @@ pub use questions::{
     days_ago, open_questions, question_duplicates, recent_answered,
 };
 pub use search::{
-    AliasGroup, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit,
-    MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_targets,
-    live_chunks, live_folders, neighbor_leaves, node_leaves, pending_count, query_needles,
-    query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
+    AliasGroup, AttachmentHit, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery,
+    LeafChunk, LeafHit, MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits,
+    leaves_of_targets, live_chunks, live_folders, neighbor_leaves, node_leaves, pending_count,
+    query_needles, query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use sessions::{
     RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch,

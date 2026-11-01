@@ -83,6 +83,12 @@ Pdfium (C++) нельзя прервать и он регулярно получ
 - Human-вложения — только FTS, не Qdrant (инвариант).
 - `filters.kinds` по умолчанию += `attachment`; карточка выдачи — `a:<chunk>` с именем файла и
   `locator` (`стр. 12`, `лист «Итоги» A1:F40`, `слайд 3`).
+- Уточнение задачи 6 (журнал этапа): фрагмент вложения — своя цель выдачи (документ,
+  `attachment_id`), не заметка-владелец; квота `search.max_per_attachment` (2) отдельно от
+  `max_per_node`; `scope.area`, `filters.certainty`, `filters.file`, `path_prefix` — заметки-владельца
+  на момент поиска (SQL), в Qdrant для точек `attachment` эти условия не проверяются; векторный
+  канал — листовой prefetch уровней `chunk` и `attachment`. Внутренняя форма цели-документа —
+  `d:<id>`, наружу документ — полем `attachment_id`.
 
 ## 4. `/read` и `locator`
 

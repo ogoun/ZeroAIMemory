@@ -277,11 +277,13 @@ impl EdgeIndex {
         q_sparse: &[(u32, f32)],
         f: &VectorFilter,
     ) -> Result<Vec<VectorHit>, IndexError> {
-        let leaf_levels = allowed_levels(&[LEVEL_CHUNK], &f.levels);
+        // листы заметок и записей и фрагменты вложений — одним prefetch (как у managed)
+        let leaf_levels = allowed_levels(&[LEVEL_CHUNK, LEVEL_ATTACHMENT], &f.levels);
         let note_levels = allowed_levels(&LEVELS_NOTE, &f.levels);
-        let (Some(leaf_filter), Some(note_filter)) =
-            (point_filter(f, &leaf_levels), point_filter(f, &note_levels))
-        else {
+        let (Some(leaf_filter), Some(note_filter)) = (
+            search_filter(f, &leaf_levels, true),
+            point_filter(f, &note_levels),
+        ) else {
             return Ok(Vec::new());
         };
         let mut prefetches = Vec::new();
@@ -809,8 +811,14 @@ fn scope_must(s: &VectorScope) -> Vec<Condition> {
 
 /// Фильтр точек — как у managed (`qdrant.rs`, `point_filter`): дизъюнкция областей,
 /// общие условия в `must`, исключаемые статусы в `must_not`; `None` — нет ни одной области
-/// с пространствами (фильтр не пропускает ничего).
+/// с пространствами (фильтр не пропускает ничего). Точный: удаление, подсчёт, ближайшие.
 fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
+    search_filter(f, levels, false)
+}
+
+/// [`point_filter`]; `owner_inherit` — гибридный поиск: точки вложений проходят `certainty` и
+/// `area` (их проверяет SQLite по заметке-владельцу), как у managed.
+fn search_filter(f: &VectorFilter, levels: &[String], owner_inherit: bool) -> Option<Filter> {
     let scopes: Vec<&VectorScope> = f.live_scopes().collect();
     let mut all = Vec::new();
     let mut should = None;
@@ -832,14 +840,30 @@ fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
         ("level", levels),
         ("kind", f.kinds.as_slice()),
         ("insight_kind", f.insight_kinds.as_slice()),
-        ("certainty", f.certainty.as_slice()),
     ] {
         if !values.is_empty() {
             all.push(kw_any(field, values.to_vec()));
         }
     }
+    // `certainty` и `area` вложения — заметки-владельца (проверяет SQLite), как у managed
+    let mut owner = Vec::new();
+    if !f.certainty.is_empty() {
+        owner.push(kw_any("certainty", f.certainty.clone()));
+    }
     if let Some(area) = &f.area {
-        all.push(kw("area", area.clone()));
+        owner.push(kw("area", area.clone()));
+    }
+    let with_attachments = levels.is_empty() || levels.iter().any(|l| l == LEVEL_ATTACHMENT);
+    if owner_inherit && !owner.is_empty() && with_attachments {
+        all.push(Condition::Filter(Filter {
+            should: Some(vec![
+                kw("level", LEVEL_ATTACHMENT.to_string()),
+                Condition::Filter(must(owner)),
+            ]),
+            ..Filter::default()
+        }));
+    } else {
+        all.extend(owner);
     }
     let must_not = (!f.exclude_statuses.is_empty())
         .then(|| vec![kw_any("status", f.exclude_statuses.clone())]);

@@ -1617,7 +1617,7 @@ async fn prompt_hints(
                     "rules",
                 )
             }
-            // вложения в выдачу подсказок не входят (поиск по вложениям — задача 6 M5)
+            // вложения в подсказки не входят: виды внутреннего поиска заданы явно (`note`, `insight`)
             TargetKind::Attachment => continue,
         };
         let mut block = hint_line(

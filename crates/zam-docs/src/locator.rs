@@ -30,6 +30,17 @@ impl Locator {
         }
     }
 
+    /// Подпись для человека и агента (карточка поиска, M5 §3): `стр. 12`, `лист «Итоги» A1:F40`,
+    /// `слайд 3`, `абз. 40`.
+    pub fn label(&self) -> String {
+        match self {
+            Locator::Page(n) => format!("стр. {n}"),
+            Locator::Slide(n) => format!("слайд {n}"),
+            Locator::Sheet { name, range } => format!("лист «{name}» {range}"),
+            Locator::Para(n) => format!("абз. {n}"),
+        }
+    }
+
     /// Разбор строковой формы; имя листа может содержать `!` (берётся последний)
     /// и быть в одинарных кавычках, как в формулах (`'Итоги 2026'!A1`).
     pub fn parse(s: &str) -> Result<Self, DocError> {
@@ -76,4 +87,20 @@ fn is_cell(s: &str) -> bool {
         && !digits.starts_with('0')
         && digits.len() <= 7
         && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Подпись `locator` в карточке выдачи (задача 6 M5): страница, лист и диапазон, слайд, абзац.
+    #[test]
+    fn locator_label_for_cards() {
+        let l = |s: &str| Locator::parse(s).unwrap().label();
+        assert_eq!(l("page:12"), "стр. 12");
+        assert_eq!(l("sheet:Итоги!A1:F40"), "лист «Итоги» A1:F40");
+        assert_eq!(l("sheet:'Q1 ''26'!B2"), "лист «Q1 '26» B2");
+        assert_eq!(l("slide:3"), "слайд 3");
+        assert_eq!(l("para:40"), "абз. 40");
+    }
 }

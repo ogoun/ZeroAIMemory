@@ -13,7 +13,10 @@
 //!   Коллекцию M2 `ensure` дополняет недостающими индексами на месте, `schema` остаётся 1;
 //! - точки документов вложений (M5): `kind = level = attachment`, `node_id` узла-владельца,
 //!   `attachment_id`, `blob_sha256`, `locator`. Удаление точек узла — по `node_id` при пустом
-//!   `attachment_id` (точки его вложений не задеваются), документа — по `attachment_id`;
+//!   `attachment_id` (точки его вложений не задеваются), документа — по `attachment_id`.
+//!   Гибридный поиск берёт их листовым prefetch вместе с `chunk` (M5, задача 6); `certainty` и
+//!   `area` у вложения — заметки-владельца на момент поиска (проверяет SQLite), поэтому точки
+//!   уровня `attachment` эти условия фильтра проходят ([`owner_conditions`]);
 //! - фильтр — дизъюнкция областей `(user_id, space_id ∈ …)` (`should`) и общие условия
 //!   (`must`, статусы — `must_not`), один для prefetch чанков и сводок;
 //! - с `VectorFilter::folders` (M3, канал папок §8.3) — ещё prefetch dense top-10 по точкам
@@ -57,8 +60,8 @@ use zam_core::{Id, TargetRef};
 
 use crate::IndexError;
 use crate::vector::{
-    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, VectorFilter, VectorHit,
-    VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
+    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_ATTACHMENT, LEVEL_FOLDER, VectorFilter,
+    VectorHit, VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
 };
 
 /// Имя коллекции (§6.4).
@@ -542,11 +545,13 @@ impl QdrantIndex {
         q_sparse: &[(u32, f32)],
         f: &VectorFilter,
     ) -> Result<Vec<VectorHit>, IndexError> {
-        let leaf_levels = allowed_levels(&[LEVEL_CHUNK], &f.levels);
+        // листы заметок и записей и фрагменты вложений — одним prefetch (M5, задача 6)
+        let leaf_levels = allowed_levels(&[LEVEL_CHUNK, LEVEL_ATTACHMENT], &f.levels);
         let note_levels = allowed_levels(&LEVELS_NOTE, &f.levels);
-        let (Some(leaf_filter), Some(note_filter)) =
-            (point_filter(f, &leaf_levels), point_filter(f, &note_levels))
-        else {
+        let (Some(leaf_filter), Some(note_filter)) = (
+            search_filter(f, &leaf_levels, true),
+            point_filter(f, &note_levels),
+        ) else {
             return Ok(Vec::new());
         };
 
@@ -860,8 +865,15 @@ fn scope_must(s: &VectorScope) -> Vec<Condition> {
 /// остаётся верхнеуровневым), путь, уровни `levels` (пустой — все), виды, виды инсайтов,
 /// `certainty` и `area` — в `must`, исключаемые статусы — в `must_not` (точки без `status`
 /// проходят). `None` — нет ни одной области с пространствами: фильтр не пропускает ничего
-/// (пустой фильтр Qdrant пропустил бы всё).
+/// (пустой фильтр Qdrant пропустил бы всё). Точный: удаление, подсчёт, ближайшие.
 fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
+    search_filter(f, levels, false)
+}
+
+/// [`point_filter`]; `owner_inherit` — гибридный поиск: точки вложений проходят `certainty` и
+/// `area`
+/// ([`owner_conditions`]).
+fn search_filter(f: &VectorFilter, levels: &[String], owner_inherit: bool) -> Option<Filter> {
     let scopes: Vec<&VectorScope> = f.live_scopes().collect();
     let mut filter = Filter::default();
     match scopes.as_slice() {
@@ -881,14 +893,22 @@ fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
         ("level", levels),
         ("kind", f.kinds.as_slice()),
         ("insight_kind", f.insight_kinds.as_slice()),
-        ("certainty", f.certainty.as_slice()),
     ] {
         if !values.is_empty() {
             filter.must.push(kw_any(field, values.to_vec()));
         }
     }
+    let mut owner = Vec::new();
+    if !f.certainty.is_empty() {
+        owner.push(kw_any("certainty", f.certainty.clone()));
+    }
     if let Some(area) = &f.area {
-        filter.must.push(kw("area", area.clone()));
+        owner.push(kw("area", area.clone()));
+    }
+    if owner_inherit {
+        filter.must.extend(owner_conditions(owner, levels));
+    } else {
+        filter.must.extend(owner);
     }
     if !f.exclude_statuses.is_empty() {
         filter
@@ -896,6 +916,22 @@ fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
             .push(kw_any("status", f.exclude_statuses.clone()));
     }
     Some(filter)
+}
+
+/// Условия `certainty` и `area` фильтра. У вложения они — заметки-владельца на момент поиска
+/// (у точки `certainty` нет, `area` — на момент извлечения; правка заметки точки вложений не
+/// переписывает — Review Focus 2 M5): точка `level = attachment` проходит их без проверки, её
+/// проверяет SQLite (`live_chunks`). Уровни `levels` без вложений (пустые — все) — условия как
+/// есть.
+fn owner_conditions(owner: Vec<Condition>, levels: &[String]) -> Vec<Condition> {
+    let with_attachments = levels.is_empty() || levels.iter().any(|l| l == LEVEL_ATTACHMENT);
+    if owner.is_empty() || !with_attachments {
+        return owner;
+    }
+    vec![Condition::from(Filter::should([
+        kw("level", LEVEL_ATTACHMENT.to_string()),
+        Condition::from(Filter::must(owner)),
+    ]))]
 }
 
 /// Поля payload для выдачи.

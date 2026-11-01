@@ -342,7 +342,7 @@ async fn attach_enqueues_attachment_job() {
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     assert_eq!(jobs[0].target_kind, TargetKind::Attachment);
     assert_eq!(jobs[0].target_id, pdf.id);
-    assert_eq!(jobs[0].target().to_string(), format!("a:{}", pdf.id));
+    assert_eq!(jobs[0].target().to_string(), format!("d:{}", pdf.id));
     drop_jobs(&env.db).await;
 
     // Human: извлечение нужно (FTS), задание ставится; точек нет — чанки задания не ставят
@@ -451,13 +451,15 @@ async fn note_edit_keeps_attachment_chunks() {
         of_attachment(&chunks_of(&env.db, n).await, d.id),
         att_before
     );
-    // изоляция в поиске: слово только во вложении — пусто; слово заметки находится
-    assert!(
-        search_fts(&env.db, fts("уникальноеслововложения", &[env.k]))
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    // изоляция в поиске: слово только во вложении — хит документа вложения (задача 6), не
+    // заметки; слово заметки находится заметкой
+    let hits = search_fts(&env.db, fts("уникальноеслововложения", &[env.k]))
+        .await
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|h| h.target.kind == TargetKind::Attachment
+        && h.target.id == d.id
+        && h.level == "attachment"));
     let hits = search_fts(&env.db, fts("вторая", &[env.k])).await.unwrap();
     assert!(!hits.is_empty());
     assert!(hits.iter().all(|h| h.level != "attachment"));
@@ -1076,4 +1078,202 @@ async fn full_reindex_drops_cached_failures() {
     }
     let big = doc_of(&docs, "big.txt");
     assert_eq!(big.extract_error.as_deref(), Some("too_large"));
+}
+
+/// Задача 6 M5: чанки вложения выдаются каналами FTS (`bm25`, `trigram`, `alias`) и
+/// [`live_chunks`] как цель-документ с файлом и `locator`, с `area`/`certainty` узла-владельца;
+/// виды и фильтры (`kinds`, `area`, `certainty`) действуют на них. Чанки скрытого документа
+/// (метка `attachment_docs.deleted_at` при живом узле; удалённый узел — чанки остаются в FTS) не
+/// выдаёт ни один канал; листы и соседи заметки чанков вложения не содержат.
+#[tokio::test]
+async fn search_channels_hide_hidden_attachment_docs() {
+    use zam_core::TargetRef;
+    use zam_store::{
+        AliasGroup, ChunkScope, TargetFilter, leaves_of_targets, live_chunks, neighbor_leaves,
+        search_fts_channels,
+    };
+    let env = setup("search-hidden").await;
+    let n = note(
+        &env.db,
+        env.k,
+        "proj/хозяин",
+        "---\ncertainty: hypothesis\n---\n# Хозяин\n\nПросто погода.\n\n## Второй\n\nЕщё погода.\n",
+    )
+    .await;
+    let sha = put_attach(&env, n, b"doc", "doc.txt", Some(DocKind::Text)).await;
+    let d = doc_of(&list_attachments(&env.db, n).await.unwrap(), "doc.txt");
+    set_extract_state(&env.db, d.id, ExtractState::Done, None)
+        .await
+        .unwrap();
+    replace_attachment_chunks(
+        &env.db,
+        d.id,
+        &units(&[
+            ("Раздел", "Плутоний и метка zx_4242"),
+            ("", "второй фрагмент"),
+        ]),
+    )
+    .await
+    .unwrap();
+    let doc_target = TargetRef {
+        kind: TargetKind::Attachment,
+        id: d.id,
+    };
+    let q = |text: &str, targets: TargetFilter, groups: Vec<AliasGroup>| FtsQuery {
+        alias_groups: groups,
+        targets,
+        ..fts(text, &[env.k])
+    };
+    let alias = || {
+        vec![AliasGroup {
+            start: 0,
+            len: 1,
+            with: vec!["плутоний".into()],
+        }]
+    };
+    // (bm25, trigram, alias) — число хитов документа
+    let channels = |text: &'static str, targets: TargetFilter| {
+        let db = env.db.clone();
+        let qq = q(text, targets, alias());
+        async move {
+            let ch = search_fts_channels(&db, qq).await.unwrap();
+            let of = |l: &[zam_store::FtsHit]| l.iter().filter(|h| h.target == doc_target).count();
+            (of(&ch.bm25), of(&ch.trigram), of(&ch.alias))
+        }
+    };
+    let kinds = |k: &[&str]| TargetFilter {
+        kinds: k.iter().map(|s| s.to_string()).collect(),
+        ..TargetFilter::default()
+    };
+
+    // живой документ: все каналы
+    let ch = search_fts_channels(&env.db, q("плутоний", TargetFilter::default(), Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(ch.bm25.len(), 1, "{:?}", ch.bm25);
+    let h = &ch.bm25[0];
+    assert_eq!(h.target, doc_target);
+    assert_eq!(h.level, "attachment");
+    assert_eq!(h.path, "proj/хозяин");
+    assert_eq!(h.certainty.as_deref(), Some("hypothesis"));
+    let att = h.attachment.as_ref().expect("поля вложения");
+    assert_eq!((att.node_id, att.filename.as_str()), (n, "doc.txt"));
+    assert_eq!(att.blob_sha256, sha);
+    assert_eq!(att.locator.as_deref(), Some("para:1"));
+    let chunk = h.chunk_id.clone();
+    assert_eq!(channels("плутоний", TargetFilter::default()).await.0, 1);
+    assert_eq!(channels("zx_4242", TargetFilter::default()).await.1, 1);
+    assert_eq!(
+        channels("радиоактивный", TargetFilter::default()).await.2,
+        1
+    );
+    assert_eq!(channels("плутоний", kinds(&["attachment"])).await.0, 1);
+    assert_eq!(
+        channels("плутоний", kinds(&["note", "insight"])).await,
+        (0, 0, 0)
+    );
+    let cert = |c: &str| TargetFilter {
+        certainty: vec![c.into()],
+        ..TargetFilter::default()
+    };
+    assert_eq!(channels("плутоний", cert("hypothesis")).await.0, 1);
+    assert_eq!(channels("плутоний", cert("axiom")).await.0, 0);
+    let area = TargetFilter {
+        area: Some("другая".into()),
+        ..TargetFilter::default()
+    };
+    assert_eq!(channels("плутоний", area).await.0, 0);
+    let scope = || ChunkScope {
+        space_ids: vec![env.k],
+        path_prefix: None,
+        indexable_only: true,
+        targets: TargetFilter::default(),
+    };
+    let live = live_chunks(&env.db, vec![chunk.clone()], scope())
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].attachment.as_ref().unwrap().filename, "doc.txt");
+    let only_notes = ChunkScope {
+        targets: kinds(&["note"]),
+        ..scope()
+    };
+    assert!(
+        live_chunks(&env.db, vec![chunk.clone()], only_notes)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // листы и соседи узла — без чанков вложения
+    let node_t = TargetRef {
+        kind: TargetKind::Node,
+        id: n,
+    };
+    let leaves = leaves_of_targets(&env.db, vec![node_t], true)
+        .await
+        .unwrap();
+    let leaves = &leaves[&node_t];
+    assert!(
+        leaves.iter().all(|l| !l.text.contains("Плутоний")),
+        "{leaves:?}"
+    );
+    for l in leaves {
+        let (p, nx) = neighbor_leaves(&env.db, l.chunk_id.clone()).await.unwrap();
+        for t in [p, nx].into_iter().flatten() {
+            assert!(
+                !t.contains("Плутоний") && !t.contains("второй фрагмент"),
+                "{t}"
+            );
+        }
+    }
+    assert_eq!(
+        neighbor_leaves(&env.db, chunk.clone()).await.unwrap(),
+        (None, None)
+    );
+
+    // документ скрыт меткой при живом узле
+    let id = d.id.to_string();
+    let hide = |v: Option<&'static str>| {
+        let id = id.clone();
+        env.db.write(move |t| {
+            t.execute(
+                "UPDATE attachment_docs SET deleted_at = ?2 WHERE id = ?1",
+                rusqlite::params![id, v],
+            )?;
+            Ok(())
+        })
+    };
+    hide(Some(TS)).await.unwrap();
+    for text in ["плутоний", "zx_4242", "радиоактивный"] {
+        assert_eq!(
+            channels(text, TargetFilter::default()).await,
+            (0, 0, 0),
+            "{text}"
+        );
+    }
+    assert!(
+        live_chunks(&env.db, vec![chunk.clone()], scope())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    hide(None).await.unwrap();
+    assert_eq!(channels("плутоний", TargetFilter::default()).await.0, 1);
+
+    // узел удалён: чанки вложения остаются в FTS, но не выдаются
+    delete_node(&env.db, n, AuthorKind::Human).await.unwrap();
+    assert_eq!(of_attachment(&chunks_of(&env.db, n).await, d.id).len(), 2);
+    for text in ["плутоний", "zx_4242", "радиоактивный"] {
+        assert_eq!(
+            channels(text, TargetFilter::default()).await,
+            (0, 0, 0),
+            "{text}"
+        );
+    }
+    assert!(
+        live_chunks(&env.db, vec![chunk], scope())
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

@@ -77,10 +77,10 @@ impl ToolName {
     fn description(self) -> &'static str {
         match self {
             ToolName::Search => {
-                "Поиск в памяти (Knowledge, Rules, текущее решение). Сначала готовые выжимки кэша, \
-                 затем карточки: id, путь, ревизия, возраст, ~токены; выданное в этой сессии \
-                 помечено seen. filters: kinds (и term, task, question), insight_kinds, file — \
-                 знание о файле, decided_by. Дальше — memory_read нужного."
+                "Поиск в памяти (Knowledge, Rules, решение): сначала выжимки кэша, затем \
+                 карточки — id, путь, ревизия, возраст, ~токены, seen (уже выдано); вложение — \
+                 a:<id>, файл, locator. filters: kinds (и term, task, question, attachment), \
+                 insight_kinds, file — знание о файле, decided_by. Дальше — memory_read."
             }
             ToolName::Read => {
                 "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id> или путь <пространство>:/<путь>. \

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use jiff::Timestamp;
-use zam_core::{Id, TargetRef};
+use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::hybrid::{ChunkMeta, Level, Ranked};
 
@@ -245,16 +245,25 @@ pub fn note_to_leaf(r: Vec<Ranked>, best_leaf: impl Fn(&Ranked) -> Option<LeafRe
     out
 }
 
-/// Не больше `max` элементов с одной цели — узла или записи журнала (§9.2 п. 6), порядок
-/// сохраняется.
-pub fn cap_per_node(mut r: Vec<Ranked>, max: usize) -> Vec<Ranked> {
+/// Не больше `max` элементов с одной цели — узла или записи журнала (§9.2 п. 6) — и не больше
+/// `max_attachment` с одного документа вложения (`search.max_per_attachment`, M5): фрагменты
+/// вложения — своя цель и квоту заметки-владельца не занимают. Порядок сохраняется.
+pub fn cap_per_node(mut r: Vec<Ranked>, max: usize, max_attachment: usize) -> Vec<Ranked> {
     let mut per_node: HashMap<TargetRef, usize> = HashMap::new();
     r.retain(|x| {
         let n = per_node.entry(x.target).or_default();
         *n += 1;
-        *n <= max.max(1)
+        *n <= target_cap(x.target.kind, max, max_attachment)
     });
     r
+}
+
+/// Квота цели вида `kind` (не меньше 1): документу вложения — `max_attachment`, прочим — `max`.
+pub fn target_cap(kind: TargetKind, max: usize, max_attachment: usize) -> usize {
+    match kind {
+        TargetKind::Attachment => max_attachment.max(1),
+        TargetKind::Node | TargetKind::Entry => max.max(1),
+    }
 }
 
 /// Добавляет `x` или сливает с уже добавленным тем же `chunk_id`.
@@ -529,7 +538,7 @@ mod tests {
             rh("leaf-b", n, Level::Chunk, "B > C", 0.6, "fts"),
         ];
         assert!(summaries_without_leaf(&list, 10).is_empty());
-        let out = cap_per_node(note_to_leaf(list, |_| unreachable!()), 3);
+        let out = cap_per_node(note_to_leaf(list, |_| unreachable!()), 3, 2);
         let got: Vec<(&str, f64)> = out.iter().map(|x| (x.chunk_id.as_str(), x.score)).collect();
         assert_eq!(got, vec![("leaf-a", 0.9), ("leaf-b", 0.7)]);
         assert_eq!(out[1].sources, vec!["vector", "fts"]);

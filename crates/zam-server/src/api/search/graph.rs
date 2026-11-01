@@ -32,9 +32,14 @@ fn group(h: &FtsHit) -> u8 {
             _ => 2,
         },
         (None, TargetKind::Node) => 1,
-        // прочие записи; вложения (выдача — задача 6 M5) — тоже в конце
+        // прочие записи; вложение соседом не бывает (концом связи не является) — тоже в конце
         (Some(_), _) | (None, TargetKind::Entry | TargetKind::Attachment) => 2,
     }
+}
+
+/// Цель элемента может быть концом связи графа: узел или запись, не документ вложения.
+fn in_graph(h: &FtsHit) -> bool {
+    matches!(h.target.kind, TargetKind::Node | TargetKind::Entry)
 }
 
 /// Порядок `certainty`: `axiom`, `theorem`, `hypothesis`, без статуса.
@@ -69,9 +74,9 @@ pub(super) async fn expand_graph(
 ) -> Result<Vec<Item>, ApiError> {
     let targets = health.targets;
     let seen: HashSet<TargetRef> = items.iter().map(|it| it.hit.target).collect();
-    // родители по базам: цель → лучший балл
+    // родители по базам: цель → лучший балл (документ вложения связей не имеет)
     let mut parents: BTreeMap<usize, HashMap<TargetRef, f64>> = BTreeMap::new();
-    for it in items.iter().take(top_k) {
+    for it in items.iter().take(top_k).filter(|it| in_graph(&it.hit)) {
         let s = parents
             .entry(it.target)
             .or_default()
@@ -208,7 +213,8 @@ pub(super) async fn order_by_contradicts(
     let targets = health.targets;
     let mut by_db: BTreeMap<usize, Vec<TargetRef>> = BTreeMap::new();
     for it in items.iter() {
-        if it.folder.is_none() && health.alive[it.target] {
+        // связи — между узлами и записями: документ вложения концом связи не бывает
+        if it.folder.is_none() && health.alive[it.target] && in_graph(&it.hit) {
             let refs = by_db.entry(it.target).or_default();
             if !refs.contains(&it.hit.target) {
                 refs.push(it.hit.target);
