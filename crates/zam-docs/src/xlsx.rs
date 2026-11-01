@@ -11,8 +11,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::DocError;
-use crate::ctx::Ctx;
-use crate::ooxml::{Ev, Package, Xml, attr, attr_ns, local};
+use crate::ctx::{Ctx, path_label};
+use crate::ooxml::{Ev, Package, REL_ATTR_MAX, Xml, attr, attr_ns, local};
 use crate::sheet::{Feed, Sink, Strings, col_of, number};
 
 /// Значение `<v>` числа или номера общей строки длиннее этого — текст как есть.
@@ -83,20 +83,26 @@ fn sheet_list(
         return Err(DocError::Malformed("xlsx: нет книги workbook.xml".into()));
     };
     let mut out = Vec::new();
+    let mut count = 0u64;
     let mut xml = Xml::new(&part, ctx);
     while let Some(ev) = xml.next(ctx)? {
         if let Ev::Start(e) | Ev::Empty(e) = ev
             && local(&e) == "sheet"
         {
+            // записей `<sheet>` не больше `max_entries`; имя — сразу подпись ≤ 512 символов
+            count += 1;
+            if count > u64::from(ctx.limits.max_entries) {
+                ctx.truncated("max_entries");
+                break;
+            }
             let (Some(name), Some(id)) = (attr(&e, "name"), attr_ns(&e, "id")) else {
                 continue;
             };
+            if id.len() > REL_ATTR_MAX {
+                continue;
+            }
             if let Some(t) = targets.get(&id) {
-                if out.len() as u64 >= u64::from(ctx.limits.max_entries) {
-                    ctx.truncated("max_entries");
-                    break;
-                }
-                out.push((name, t.clone()));
+                out.push((path_label([name.as_str()]), t.clone()));
             }
         }
     }

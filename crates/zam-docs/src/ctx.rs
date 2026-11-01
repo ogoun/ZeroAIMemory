@@ -57,6 +57,11 @@ impl<'l> Ctx<'l> {
         self.stopped = true;
     }
 
+    /// Срок разбора (для циклов, которые сверяют его сами, без `Ctx`).
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     pub fn stopped(&self) -> bool {
         self.stopped
     }

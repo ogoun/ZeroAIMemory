@@ -74,25 +74,28 @@ impl<'a> Cfb<'a> {
             cutoff: u64::from(u32_at(b, 0x38)),
             dir: Vec::new(),
         };
+        // MS-CFB: порог мини-потока — ровно 4096; иной позволил бы «мини» поток любого размера
+        if cfb.cutoff != 4096 {
+            return Err(bad("порог мини-потока не 4096"));
+        }
         // секторы FAT: 109 в заголовке, остальные — по цепочке DIFAT
         let mut fat_sectors: Vec<u32> = (0..109)
             .map(|i| u32_at(b, 0x4C + i * 4))
             .filter(|&s| s < sectors)
             .collect();
         let mut difat = u32_at(b, 0x44);
-        let mut steps = 0u32;
+        let mut seen = Visited::new(sectors);
         while difat < sectors {
-            steps += 1;
-            if steps > sectors {
+            if !seen.insert(difat) {
                 return Err(bad("цикл DIFAT"));
             }
             let s = cfb.sector(difat)?;
             let n = ssz / 4 - 1;
             fat_sectors.extend((0..n).map(|i| u32_at(s, i * 4)).filter(|&x| x < sectors));
+            if fat_sectors.len() as u64 > u64::from(sectors) {
+                return Err(bad("секторов FAT больше, чем в файле"));
+            }
             difat = u32_at(s, n * 4);
-        }
-        if fat_sectors.len() as u64 > u64::from(sectors) {
-            return Err(bad("секторов FAT больше, чем в файле"));
         }
         let mut fat = Vec::with_capacity(fat_sectors.len() * ssz / 4);
         for s in fat_sectors {
@@ -162,9 +165,13 @@ impl<'a> Cfb<'a> {
         if empty_ok && (s == END || s == FREE) {
             return Ok(out);
         }
+        let mut seen = Visited::new(self.sectors);
         while s != END {
-            if s >= self.sectors || out.len() as u64 >= u64::from(self.sectors) {
+            if s >= self.sectors {
                 return Err(bad("цепочка секторов"));
+            }
+            if !seen.insert(s) {
+                return Err(bad("цикл в цепочке секторов"));
             }
             out.push(s);
             s = *self.fat.get(s as usize).ok_or_else(|| bad("FAT"))?;
@@ -204,13 +211,20 @@ impl<'a> Cfb<'a> {
             ctx.truncated("max_unpacked");
         }
         let size = usize::try_from(size).map_err(|_| bad("размер потока"))?;
-        let mut out = Vec::with_capacity(size.min(self.b.len()));
         if e.size < self.cutoff {
+            // мини-поток: не больше ёмкости мини-потока; шагов не больше мини-секторов, цикл —
+            // ошибка (отметка посещённых)
+            let capacity = self.mini.len() << self.shift;
+            if size > capacity {
+                return Err(bad("размер мини-потока"));
+            }
+            let mini_sectors = u32::try_from((capacity / MINI).min(self.minifat.len()))
+                .map_err(|_| bad("мини-FAT"))?;
+            let mut seen = Visited::new(mini_sectors);
+            let mut out = Vec::with_capacity(size);
             let mut s = e.start;
-            let mut steps = 0usize;
             while out.len() < size && s != END {
-                steps += 1;
-                if steps > self.minifat.len() {
+                if s >= mini_sectors || !seen.insert(s) {
                     return Err(bad("цепочка мини-секторов"));
                 }
                 let at = s as usize * MINI;
@@ -227,8 +241,13 @@ impl<'a> Cfb<'a> {
                     .get(s as usize)
                     .ok_or_else(|| bad("мини-FAT"))?;
             }
+            Ok(out)
         } else {
-            for s in self.chain(e.start, true)? {
+            // размер — не больше цепочки: заявленному не верим
+            let chain = self.chain(e.start, true)?;
+            let size = size.min(chain.len() << self.shift);
+            let mut out = Vec::with_capacity(size);
+            for s in chain {
                 if out.len() >= size {
                     break;
                 }
@@ -236,7 +255,28 @@ impl<'a> Cfb<'a> {
                 let take = (size - out.len()).min(data.len());
                 out.extend_from_slice(&data[..take]);
             }
+            Ok(out)
         }
-        Ok(out)
+    }
+}
+
+/// Отметки посещённых секторов цепочки (бит на сектор): повтор — цикл.
+struct Visited(Vec<u64>);
+
+impl Visited {
+    fn new(n: u32) -> Self {
+        Visited(vec![0; (n as usize).div_ceil(64)])
+    }
+
+    /// `false` — сектор уже был (или вне карты).
+    fn insert(&mut self, s: u32) -> bool {
+        let (w, bit) = ((s / 64) as usize, 1u64 << (s % 64));
+        match self.0.get_mut(w) {
+            Some(x) if *x & bit == 0 => {
+                *x |= bit;
+                true
+            }
+            _ => false,
+        }
     }
 }

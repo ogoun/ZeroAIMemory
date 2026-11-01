@@ -1,12 +1,12 @@
 //! CSV (RFC 4180, с поблажками): кодировка, разделитель, записи — один лист [`CSV_SHEET`].
 //!
 //! Кодировка: BOM UTF-8 снимается; BOM UTF-16 — раскодирование целиком (копия в пределах
-//! `max_unpacked`); верный UTF-8 — как есть; иначе Windows-1251 (`encoding_rs`, по кускам
-//! поля — без копии файла). Разделитель — `,`, `;` или табуляция: тот, что встречается
-//! одинаковое ненулевое число раз в наибольшем числе первых записей. Поля в кавычках
-//! (`""` — кавычка) могут содержать разделители и переводы строк; кавычка внутри поля без
-//! кавычек и текст после закрывающей — как есть. Поле передаётся в [`Feed`] срезами входа:
-//! длинная строка без перевода строки не копируется.
+//! `max_unpacked`); UTF-8 (неполный символ в конце или до 0,1 % неверных байт — замена U+FFFD)
+//! — как есть; иначе Windows-1251 (`encoding_rs`, по кускам поля — без копии файла).
+//! Разделитель — `,`, `;` или табуляция: тот, что встречается одинаковое ненулевое число раз в
+//! наибольшем числе первых записей. Поля в кавычках (`""` — кавычка) могут содержать
+//! разделители и переводы строк; кавычка внутри поля без кавычек и текст после закрывающей —
+//! как есть. Поле передаётся в [`Feed`] срезами входа: длинная строка не копируется.
 
 use std::borrow::Cow;
 
@@ -100,7 +100,7 @@ pub(crate) fn read<S: Sink>(
     Ok(())
 }
 
-/// Кодировка полей: UTF-8 (текст уже проверен) или однобайтовая Windows-1251.
+/// Кодировка полей: UTF-8 (единичные неверные байты — U+FFFD) или однобайтовая Windows-1251.
 #[derive(Clone, Copy)]
 enum Enc {
     Utf8,
@@ -110,10 +110,12 @@ enum Enc {
 /// Байты как UTF-8 (без копии, BOM снят) или копия из UTF-16; иначе — Windows-1251.
 fn decode<'b>(bytes: &'b [u8], ctx: &mut Ctx) -> (Cow<'b, [u8]>, Enc) {
     if let Some(b) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        if std::str::from_utf8(b).is_ok() {
-            return (Cow::Borrowed(b), Enc::Utf8);
-        }
-        return (Cow::Borrowed(b), Enc::Single(WINDOWS_1251));
+        let enc = if mostly_utf8(b) {
+            Enc::Utf8
+        } else {
+            Enc::Single(WINDOWS_1251)
+        };
+        return (Cow::Borrowed(b), enc);
     }
     let utf16 = match bytes {
         [0xFF, 0xFE, ..] => Some(UTF_16LE),
@@ -131,19 +133,36 @@ fn decode<'b>(bytes: &'b [u8], ctx: &mut Ctx) -> (Cow<'b, [u8]>, Enc) {
         let s = enc.decode_without_bom_handling(src).0.into_owned();
         return (Cow::Owned(s.into_bytes()), Enc::Utf8);
     }
-    if std::str::from_utf8(bytes).is_ok() {
+    if mostly_utf8(bytes) {
         (Cow::Borrowed(bytes), Enc::Utf8)
     } else {
         (Cow::Borrowed(bytes), Enc::Single(WINDOWS_1251))
     }
 }
 
-/// Кусок поля — в приёмник; срез режется только по ASCII, поэтому UTF-8 в нём верен.
+/// UTF-8 с единичными ошибками: неполный символ в конце файла (обрезка) или неверных байт не
+/// больше 0,1 % — это UTF-8 с заменой, а не другая кодировка (в Windows-1251 кириллица почти
+/// вся — неверный UTF-8).
+fn mostly_utf8(b: &[u8]) -> bool {
+    let Err(e) = std::str::from_utf8(b) else {
+        return true;
+    };
+    if e.error_len().is_none() {
+        return true;
+    }
+    let bad: usize = b.utf8_chunks().map(|c| c.invalid().len()).sum();
+    bad.saturating_mul(1000) <= b.len()
+}
+
+/// Кусок поля — в приёмник; срез режется только по ASCII, поэтому верные символы UTF-8 целы.
 fn emit<S: Sink>(feed: &mut Feed<'_, S>, piece: &[u8], enc: Enc, ctx: &mut Ctx) {
     match enc {
         Enc::Utf8 => {
-            if let Ok(s) = std::str::from_utf8(piece) {
-                feed.text(s, ctx);
+            for c in piece.utf8_chunks() {
+                feed.text(c.valid(), ctx);
+                if !c.invalid().is_empty() {
+                    feed.text("\u{FFFD}", ctx);
+                }
             }
         }
         Enc::Single(e) => {
@@ -171,7 +190,8 @@ fn delimiter(b: &[u8]) -> u8 {
         }
         match c {
             b'"' => quoted = !quoted,
-            b'\n' if !quoted => {
+            // конец записи — `\n`, `\r\n` или одиночный `\r`
+            b'\n' | b'\r' if !quoted => {
                 if any {
                     counts.push(cur);
                 }
@@ -186,9 +206,7 @@ fn delimiter(b: &[u8]) -> u8 {
             }
             _ => {}
         }
-        if c != b'\r' {
-            any = true;
-        }
+        any = true;
     }
     if any && counts.len() < SNIFF_RECORDS {
         counts.push(cur);

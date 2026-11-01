@@ -14,7 +14,8 @@
 //! 2 × 4 × `max_chars` (выдача с шапкой и строкой в работе; общие строки XLSX/XLS или буфер
 //! строки ODS — свой потолок `max_chars`) + 16 × `max_cells` (концы общих строк, `usize`, с ростом
 //! `Vec`) + 1 МиБ. Сетка листа не строится: `dimension`, пустые ячейки и повторы ODS памяти не
-//! занимают. Окно `sheet_page` — в пределах тех же `max_cells` и `max_chars`.
+//! занимают. Окно `sheet_page` ([`page_bound`]) — сверх того 48 × `max_cells`: каждая ячейка или
+//! пустая строка окна — `String`/`Vec` по 24 байта, вдвое с ростом `Vec`.
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -91,7 +92,15 @@ fn measured_page(
 ) -> (Result<SheetPage, DocError>, usize) {
     let base = CUR.load(Relaxed);
     PEAK.store(base, Relaxed);
-    let r = sheet_page(kind, bytes, "", 1, 1000, limits);
+    let r = sheet_page(
+        kind,
+        bytes,
+        "",
+        1,
+        1000,
+        limits,
+        Instant::now() + Duration::from_secs(600),
+    );
     (r, PEAK.load(Relaxed).saturating_sub(base))
 }
 
@@ -295,13 +304,123 @@ fn table_scenarios(size: usize, raw: usize) -> Vec<(&'static str, DocKind, Vec<u
         ("L2 CSV millions of fields", DocKind::Csv, l2),
         ("M XLS SST bomb", DocKind::Xls, m),
         ("N many sheets", DocKind::Ods, nn),
+        (
+            "O XLS empty CONTINUE flood",
+            DocKind::Xls,
+            continue_flood(raw),
+        ),
+        (
+            "P XLS mini-FAT cycle",
+            DocKind::Xls,
+            mini_cycle(size.min(raw)),
+        ),
+        (
+            "Q ODS row of empty cells",
+            DocKind::Ods,
+            ods_empty_row(size * 3 / 4),
+        ),
+        (
+            "R XLSX long sheet names",
+            DocKind::Xlsx,
+            long_names(size * 3 / 4),
+        ),
     ]
+}
+
+fn rec(ty: u16, data: &[u8]) -> Vec<u8> {
+    let mut v = ty.to_le_bytes().to_vec();
+    v.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    v.extend_from_slice(data);
+    v
+}
+
+fn biff_bof() -> Vec<u8> {
+    let mut d = vec![0u8; 16];
+    d[1] = 0x06;
+    d[2] = 0x05;
+    rec(0x0809, &d)
+}
+
+/// O: `SST` и миллионы пустых `CONTINUE` (прежде — 16–32 байта памяти на 4 байта входа).
+fn continue_flood(raw: usize) -> Vec<u8> {
+    let mut wb = biff_bof();
+    wb.extend(rec(0x00FC, &[0u8; 8]));
+    while wb.len() + 2 * MIB < raw {
+        wb.extend_from_slice(&[0x3C, 0, 0, 0]);
+    }
+    common::sheets::cfb(&[("Workbook", wb)])
+}
+
+/// P (зонд ревью `mini`): `Workbook` в мини-потоке с циклом мини-FAT, порогом мини-потока
+/// `u32::MAX` и заявленным размером почти 4 ГиБ.
+fn mini_cycle(raw: usize) -> Vec<u8> {
+    let put32 = |b: &mut [u8], i: usize, v: u32| b[i..i + 4].copy_from_slice(&v.to_le_bytes());
+    let mut wb = biff_bof();
+    wb.extend(rec(0x00FC, &[0u8; 8]));
+    while wb.len() < 64 {
+        wb.extend(rec(0x003C, &[]));
+    }
+    wb.truncate(64);
+    wb.extend(rec(0x0001, &[0u8; 60]));
+    let big: Vec<u8> = std::iter::repeat_n(1u32.to_le_bytes(), raw.saturating_sub(2 * MIB) / 4)
+        .flatten()
+        .collect();
+    let mut f = common::sheets::cfb(&[("Workbook", wb), ("Big", big)]);
+    put32(&mut f, 0x38, u32::MAX);
+    put32(&mut f, 0x3C, 0);
+    let dir = u32::from_le_bytes(f[0x30..0x34].try_into().unwrap()) as usize;
+    put32(&mut f, 512 + dir * 512 + 128 + 0x78, 0xFFFF_FF00);
+    f
+}
+
+/// Q: строка ODS из пустых ячеек на всю часть (буфер строки — не больше 16 384 ячеек).
+fn ods_empty_row(size: usize) -> Vec<u8> {
+    let cell = "<table:table-cell/>";
+    let mut t = String::from(r#"<table:table table:name="Q"><table:table-row>"#);
+    t.push_str(&cell.repeat(size / cell.len()));
+    t.push_str("</table:table-row></table:table>");
+    ods(t.as_bytes())
+}
+
+/// R: 2000 записей `<sheet>` с именами по `size / 2000` байт на один лист.
+fn long_names(size: usize) -> Vec<u8> {
+    const SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let name = "n".repeat(size / 2000);
+    let mut wb = format!(r#"<workbook xmlns="{SML}" xmlns:r="{REL}"><sheets>"#);
+    for i in 0..2000 {
+        wb.push_str(&format!(
+            r#"<sheet name="{name}" sheetId="{i}" r:id="rId1"/>"#
+        ));
+    }
+    wb.push_str("</sheets></workbook>");
+    let rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+    );
+    let root = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+    );
+    let sheet = sheet_xml(
+        None,
+        r#"<row r="1"><c r="A1" t="inlineStr"><is><t>h</t></is></c></row>"#,
+    );
+    zip_of(&[
+        ("_rels/.rels", root.into_bytes()),
+        ("xl/workbook.xml", wb.into_bytes()),
+        ("xl/_rels/workbook.xml.rels", rels.into_bytes()),
+        ("xl/worksheets/sheet1.xml", sheet),
+    ])
 }
 
 /// Граница таблиц: `max_unpacked` (часть или поток) + 2 × 4 × `max_chars` (выдача и общие
 /// строки или буфер строки ODS) + 16 × `max_cells` (концы общих строк с ростом `Vec`) + 1 МиБ.
 fn table_bound(l: &Limits) -> usize {
     l.max_unpacked as usize + 2 * 4 * l.max_chars as usize + 16 * l.max_cells as usize + MIB
+}
+
+/// Граница `sheet_page`: [`table_bound`] + 48 × `max_cells` (ячейки и пустые строки окна).
+fn page_bound(l: &Limits) -> usize {
+    table_bound(l) + 48 * l.max_cells as usize
 }
 
 fn check_tables(limits: &Limits, size: usize) {
@@ -327,6 +446,10 @@ fn check_tables(limits: &Limits, size: usize) {
             peak / MIB,
             bound / MIB
         );
+        if name.starts_with('P') {
+            assert!(matches!(r, Err(DocError::Malformed(_))), "{name}: {r:?}");
+            continue;
+        }
         let x = r.unwrap();
         let total: u64 = x
             .units
@@ -344,9 +467,11 @@ fn check_tables(limits: &Limits, size: usize) {
         let t = Instant::now();
         let (p, peak) = measured_page(kind, &bytes, limits);
         let p = p.unwrap();
+        let bound = page_bound(limits);
         println!(
-            "  {name} sheet_page: peak={} MiB rows={} total_rows={} cols={} warnings={:?} t={:?}",
+            "  {name} sheet_page: peak={} MiB (граница {} MiB) rows={} total_rows={} cols={} warnings={:?} t={:?}",
             peak / MIB,
+            bound / MIB,
             p.rows.len(),
             p.total_rows,
             p.cols,

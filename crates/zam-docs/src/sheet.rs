@@ -7,7 +7,7 @@
 //! не строится: размер листа из `dimension`/`ref`, пустые ячейки и повторы строк ODS ничего не
 //! выделяют. Общие строки XLSX и XLS — [`Strings`] с потолком `max_chars` и `max_cells`.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::ctx::{Ctx, Units, path_label};
 use crate::{DocError, DocKind, Limits, Locator, Unit};
@@ -18,9 +18,6 @@ pub(crate) const SHEET_UNIT_CHARS: usize = 1750;
 
 /// Столбцов листа (Excel: `XFD`); ячейки правее отбрасываются.
 pub(crate) const MAX_COLS: u32 = 16_384;
-
-/// Срок разбора для [`sheet_page`] (умолчание `timeout_ms`): превью вызывается без срока.
-const PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Имя единственного листа CSV.
 pub(crate) const CSV_SHEET: &str = "CSV";
@@ -51,6 +48,7 @@ pub struct SheetPage {
 ///
 /// Лист разбирается целиком (нужны `total_rows` и `cols`), но в память попадает только окно:
 /// его ячейки (с пустыми в разрывах) — не больше `max_cells`, текст — не больше `max_chars`.
+/// Истечение `deadline` — частичная страница с `truncated: timeout_ms`.
 pub fn sheet_page(
     kind: DocKind,
     bytes: &[u8],
@@ -58,11 +56,12 @@ pub fn sheet_page(
     from: u32,
     rows: u32,
     limits: &Limits,
+    deadline: Instant,
 ) -> Result<SheetPage, DocError> {
     if bytes.len() as u64 > limits.max_bytes {
         return Err(DocError::TooLarge);
     }
-    let mut ctx = Ctx::new(limits, Instant::now() + PAGE_TIMEOUT);
+    let mut ctx = Ctx::new(limits, deadline);
     let mut page = Page::new(sheet, from, rows);
     feed(kind, bytes, &mut page, &mut ctx)?;
     if !page.found && !sheet.is_empty() {

@@ -9,7 +9,7 @@
 use crate::DocError;
 use crate::ctx::Ctx;
 use crate::ooxml::{Ev, Package, Xml, attr_ns, local};
-use crate::sheet::{Feed, Sink};
+use crate::sheet::{Feed, MAX_COLS, Sink};
 
 pub(crate) fn read<S: Sink>(
     bytes: &[u8],
@@ -58,6 +58,9 @@ pub(crate) fn read<S: Sink>(
             Ev::Start(e) if in_table && local(&e) == "table-row" => {
                 row.begin(repeat(&e, "number-rows-repeated"));
                 read_row(&mut xml, &mut row, ctx)?;
+                if std::mem::take(&mut row.wide) {
+                    ctx.warn("skipped: columns after XFD".into());
+                }
                 row.replay(feed, ctx);
             }
             Ev::Empty(e) if in_table && local(&e) == "table-row" => {
@@ -78,25 +81,73 @@ fn repeat(e: &quick_xml::events::BytesStart<'_>, name: &str) -> u32 {
 }
 
 /// Строка ODS до развёртки повторов: ячейки (повтор, текст) и общий объём текста.
+///
+/// Столбцов — не больше [`MAX_COLS`] (повторы ячеек обрезаются, ячейки правее отбрасываются),
+/// соседние пустые ячейки сливаются в один повтор: ячеек в буфере не больше `MAX_COLS`.
 #[derive(Default)]
 struct Row {
     repeat: u32,
     cells: Vec<(u32, String)>,
+    cols: u32,
     chars: u64,
     full: bool,
+    /// Текущая ячейка в буфере.
+    open: bool,
+    /// Текущая ячейка правее `XFD`: её текст отбрасывается.
+    over: bool,
+    /// Был непустой текст правее `XFD`.
+    wide: bool,
 }
 
 impl Row {
     fn begin(&mut self, repeat: u32) {
         self.repeat = repeat;
         self.cells.clear();
+        self.cols = 0;
         self.chars = 0;
         self.full = false;
+        self.open = false;
+        self.over = false;
+    }
+
+    /// Начало ячейки с `n` повторами.
+    fn open_cell(&mut self, n: u32) {
+        if self.cols >= MAX_COLS {
+            self.open = false;
+            self.over = true;
+            return;
+        }
+        let n = n.min(MAX_COLS - self.cols);
+        self.cols += n;
+        self.cells.push((n, String::new()));
+        self.open = true;
+        self.over = false;
+    }
+
+    /// Конец ячейки: пустая сливается с пустой соседкой слева.
+    fn close_cell(&mut self) {
+        if self.open
+            && let [.., (a, ta), (b, tb)] = self.cells.as_mut_slice()
+            && ta.is_empty()
+            && tb.is_empty()
+        {
+            *a += *b;
+            self.cells.pop();
+        }
+        self.open = false;
+        self.over = false;
     }
 
     /// Текст в последнюю ячейку строки: строка не длиннее `max_chars` символов.
     fn push(&mut self, s: &str, ctx: &mut Ctx) {
-        if self.full || s.is_empty() {
+        if s.is_empty() {
+            return;
+        }
+        if self.over {
+            self.wide = true;
+            return;
+        }
+        if self.full || !self.open {
             return;
         }
         let Some((_, cell)) = self.cells.last_mut() else {
@@ -160,8 +211,7 @@ fn read_row(xml: &mut Xml<'_>, row: &mut Row, ctx: &mut Ctx) -> Result<(), DocEr
                 depth += 1;
                 match local(&e) {
                     "table-cell" | "covered-table-cell" if !in_cell => {
-                        row.cells
-                            .push((repeat(&e, "number-columns-repeated"), String::new()));
+                        row.open_cell(repeat(&e, "number-columns-repeated"));
                         value = cell_value(&e);
                         in_cell = true;
                         paras = 0;
@@ -182,11 +232,11 @@ fn read_row(xml: &mut Xml<'_>, row: &mut Row, ctx: &mut Ctx) -> Result<(), DocEr
             }
             Ev::Empty(e) => match local(&e) {
                 "table-cell" | "covered-table-cell" if !in_cell => {
-                    row.cells
-                        .push((repeat(&e, "number-columns-repeated"), String::new()));
+                    row.open_cell(repeat(&e, "number-columns-repeated"));
                     if let Some(v) = cell_value(&e) {
                         row.push(&v, ctx);
                     }
+                    row.close_cell();
                 }
                 "s" if in_cell => {
                     let n = attr_ns(&e, "c")
@@ -216,6 +266,7 @@ fn read_row(xml: &mut Xml<'_>, row: &mut Row, ctx: &mut Ctx) -> Result<(), DocEr
                     {
                         row.push(&v, ctx);
                     }
+                    row.close_cell();
                 }
             }
             _ => {}

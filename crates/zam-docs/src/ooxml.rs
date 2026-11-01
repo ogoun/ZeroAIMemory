@@ -23,6 +23,8 @@ use crate::ctx::Ctx;
 
 /// Степень сжатия проверяется у записей больше этого объёма: мелкий XML сжимается сильно.
 const RATIO_FROM: u64 = 1024 * 1024;
+/// Длина `Id`/`Type`/`Target` отношения, байт: длиннее — отношение пропускается.
+pub(crate) const REL_ATTR_MAX: usize = 1024;
 /// Шаг чтения записи.
 const READ_STEP: usize = 64 * 1024;
 /// Начальная ёмкость буфера записи: заявленному размеру не верим, дальше — рост до `left`.
@@ -244,6 +246,14 @@ impl<'a> Package<'a> {
                 else {
                     continue;
                 };
+                if [&id, &ty, &target].iter().any(|a| a.len() > REL_ATTR_MAX) {
+                    continue;
+                }
+                // отношений не больше записей архива: больше частей не бывает
+                if out.len() as u64 >= u64::from(ctx.limits.max_entries) {
+                    ctx.truncated("max_entries");
+                    break;
+                }
                 out.push(Rel {
                     id,
                     kind: ty.rsplit('/').next().unwrap_or_default().to_string(),

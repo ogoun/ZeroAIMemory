@@ -114,7 +114,16 @@ fn xlsx_10k_rows_sheet_page_fast() {
     }
     let bytes = xlsx(&[("Лист1", sheet_xml(None, &rows))], None);
     let t = Instant::now();
-    let p = sheet_page(DocKind::Xlsx, &bytes, "", 5000, 100, &Limits::default()).unwrap();
+    let p = sheet_page(
+        DocKind::Xlsx,
+        &bytes,
+        "",
+        5000,
+        100,
+        &Limits::default(),
+        far(),
+    )
+    .unwrap();
     let took = t.elapsed();
     println!("sheet_page 10k×8: {took:?}");
     assert_eq!(p.sheets, vec!["Лист1".to_string()]);
@@ -132,12 +141,38 @@ fn xlsx_10k_rows_sheet_page_fast() {
         assert!(took <= Duration::from_millis(200), "{took:?}");
     }
     // окно у шапки и за концом листа
-    let p = sheet_page(DocKind::Xlsx, &bytes, "Лист1", 1, 2, &Limits::default()).unwrap();
+    let p = sheet_page(
+        DocKind::Xlsx,
+        &bytes,
+        "Лист1",
+        1,
+        2,
+        &Limits::default(),
+        far(),
+    )
+    .unwrap();
     assert_eq!((p.first_row, p.rows.len()), (2, 2));
-    let p = sheet_page(DocKind::Xlsx, &bytes, "", 20_000, 10, &Limits::default()).unwrap();
+    let p = sheet_page(
+        DocKind::Xlsx,
+        &bytes,
+        "",
+        20_000,
+        10,
+        &Limits::default(),
+        far(),
+    )
+    .unwrap();
     assert!(p.rows.is_empty());
     assert_eq!(
-        sheet_page(DocKind::Xlsx, &bytes, "Нет", 1, 10, &Limits::default()),
+        sheet_page(
+            DocKind::Xlsx,
+            &bytes,
+            "Нет",
+            1,
+            10,
+            &Limits::default(),
+            far()
+        ),
         Err(DocError::Malformed("нет листа \"Нет\"".into()))
     );
 }
@@ -171,7 +206,7 @@ fn ods_basic() {
     );
     assert_eq!(x.units[1].text, "| only |\n| --- |");
     assert_eq!(sheet_of(&x.units[1].locator), ("B", "A1:A1"));
-    let p = sheet_page(DocKind::Ods, &bytes, "", 1, 10, &Limits::default()).unwrap();
+    let p = sheet_page(DocKind::Ods, &bytes, "", 1, 10, &Limits::default(), far()).unwrap();
     assert_eq!(p.sheets, vec!["Sheet A".to_string(), "B".to_string()]);
     assert_eq!(p.header, vec!["Name", "", "Sum"]);
     assert_eq!((p.first_row, p.total_rows, p.cols), (4, 3, 3));
@@ -229,7 +264,16 @@ fn xls_biff8_cells_and_sst_continue() {
     )]);
     let x = run(DocKind::Xls, &small, &Limits::default());
     assert_eq!(x.units[0].text, "| мини |\n| --- |");
-    let p = sheet_page(DocKind::Xls, &bytes, "Отчёт", 1, 5, &Limits::default()).unwrap();
+    let p = sheet_page(
+        DocKind::Xls,
+        &bytes,
+        "Отчёт",
+        1,
+        5,
+        &Limits::default(),
+        far(),
+    )
+    .unwrap();
     assert_eq!(p.sheets.len(), 3);
     assert_eq!(p.rows[0], vec!["Пётр", "1234.5"]);
     // зашифрованный OOXML в OLE и OLE без книги
@@ -291,7 +335,16 @@ fn csv_quotes_newlines() {
     );
     // пустая строка — запись без ячеек: номера строк совпадают с записями
     assert_eq!(sheet_of(&x.units[0].locator).1, "A2:C5");
-    let p = sheet_page(DocKind::Csv, src.as_bytes(), "", 1, 10, &Limits::default()).unwrap();
+    let p = sheet_page(
+        DocKind::Csv,
+        src.as_bytes(),
+        "",
+        1,
+        10,
+        &Limits::default(),
+        far(),
+    )
+    .unwrap();
     assert_eq!(
         p.rows,
         vec![
@@ -346,7 +399,7 @@ fn max_cells_truncates() {
         max_cells: 30,
         ..Limits::default()
     };
-    let p = sheet_page(DocKind::Xlsx, &bytes, "A", 1, 100, &page_limits).unwrap();
+    let p = sheet_page(DocKind::Xlsx, &bytes, "A", 1, 100, &page_limits, far()).unwrap();
     assert!(p.rows.iter().map(Vec::len).sum::<usize>() + p.header.len() <= 30);
     assert_eq!(p.warnings, ["truncated: max_cells"]);
 }
@@ -423,7 +476,7 @@ fn xlsx_huge_dimension_and_empty_cells_cheap() {
     assert_eq!(sheet_of(&x.units[0].locator).1, "A1048576:XFD1048576");
     // ячейка правее XFD отброшена
     assert!(!x.units[0].text.contains(" 2 "));
-    let p = sheet_page(DocKind::Xlsx, &bytes, "", 1, 3, &Limits::default()).unwrap();
+    let p = sheet_page(DocKind::Xlsx, &bytes, "", 1, 3, &Limits::default(), far()).unwrap();
     assert_eq!((p.total_rows, p.cols, p.rows.len()), (1_048_575, 16_384, 3));
     assert!(p.rows.iter().all(Vec::is_empty));
 }
@@ -438,7 +491,7 @@ fn tables_garbage_is_error_not_panic() {
     }
     assert!(run(DocKind::Csv, b"", &Limits::default()).units.is_empty());
     assert_eq!(
-        sheet_page(DocKind::Docx, b"", "", 1, 1, &Limits::default()),
+        sheet_page(DocKind::Docx, b"", "", 1, 1, &Limits::default(), far()),
         Err(DocError::Unsupported)
     );
 }
@@ -566,8 +619,223 @@ proptest! {
         for bytes in [z.as_slice(), ole.as_slice(), ole_cut, csv.as_slice()] {
             for kind in [DocKind::Xlsx, DocKind::Xls, DocKind::Ods, DocKind::Csv] {
                 let _ = extract(kind, bytes, &limits, far());
-                let _ = sheet_page(kind, bytes, "", 1, 5, &limits);
+                let _ = sheet_page(kind, bytes, "", 1, 5, &limits, far());
             }
         }
     }
+}
+
+// ---- Раунд правок 1 ревью задачи 2 ----
+
+fn u32_at(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(b[i..i + 4].try_into().unwrap())
+}
+
+fn put32(b: &mut [u8], i: usize, v: u32) {
+    b[i..i + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn rec(ty: u16, data: &[u8]) -> Vec<u8> {
+    let mut v = ty.to_le_bytes().to_vec();
+    v.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    v.extend_from_slice(data);
+    v
+}
+
+fn biff_bof() -> Vec<u8> {
+    let mut d = vec![0u8; 16];
+    d[1] = 0x06;
+    d[2] = 0x05;
+    rec(0x0809, &d)
+}
+
+/// Разбор в отдельном потоке: должен закончиться не позже срока + запас.
+fn finishes_in(kind: DocKind, bytes: Vec<u8>, deadline: Duration, margin: Duration) -> Extracted {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = extract(kind, &bytes, &Limits::default(), Instant::now() + deadline);
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(deadline + margin) {
+        Ok(r) => r.unwrap(),
+        Err(_) => panic!("разбор не закончился за {:?}", deadline + margin),
+    }
+}
+
+#[test]
+fn xls_continue_past_end_terminates() {
+    // CONTINUE с длиной 0xFFFF за концом потока: прежде — вечный цикл (peek без next)
+    let mut wb = biff_bof();
+    wb.extend(rec(0x00FC, &[0u8; 8]));
+    wb.extend_from_slice(&[0x3C, 0x00, 0xFF, 0xFF]);
+    let x = finishes_in(
+        DocKind::Xls,
+        cfb(&[("Workbook", wb)]),
+        Duration::from_secs(2),
+        Duration::from_secs(10),
+    );
+    assert!(x.units.is_empty());
+    // миллион пустых CONTINUE — до конца потока, без накопления
+    let mut wb = biff_bof();
+    wb.extend(rec(0x00FC, &[0u8; 8]));
+    for _ in 0..1_000_000 {
+        wb.extend_from_slice(&[0x3C, 0, 0, 0]);
+    }
+    wb.extend(rec(0x000A, &[]));
+    let x = finishes_in(
+        DocKind::Xls,
+        cfb(&[("Workbook", wb)]),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    assert!(
+        x.units.is_empty() && x.warnings.is_empty(),
+        "{:?}",
+        x.warnings
+    );
+}
+
+#[test]
+fn cfb_cutoff_and_cycles_rejected() {
+    let small = common::sheets::biff8(&[("S", vec![(0, 0, XCell::Label("a".repeat(100)))])], &[]);
+    assert!(small.len() > 128 && small.len() < 4096);
+    let ok = cfb(&[("Workbook", small.clone())]);
+    assert_eq!(run(DocKind::Xls, &ok, &Limits::default()).units.len(), 1);
+    let malformed = |b: &[u8]| {
+        matches!(
+            extract(DocKind::Xls, b, &Limits::default(), far()),
+            Err(DocError::Malformed(_))
+        )
+    };
+    // порог мини-потока не 4096
+    let mut b = ok.clone();
+    put32(&mut b, 0x38, u32::MAX);
+    assert!(malformed(&b));
+    // цикл мини-FAT: 0 → 1 → 0
+    let mut b = ok.clone();
+    let mf = 512 + u32_at(&b, 0x3C) as usize * 512;
+    put32(&mut b, mf + 4, 0);
+    assert!(malformed(&b));
+    // цикл FAT в цепочке большого потока
+    let mut big = small.clone();
+    big.resize(20_000, 0);
+    let ok = cfb(&[("Workbook", big)]);
+    assert_eq!(run(DocKind::Xls, &ok, &Limits::default()).units.len(), 1);
+    let dir = 512 + u32_at(&ok, 0x30) as usize * 512;
+    let start = u32_at(&ok, dir + 128 + 0x74) as usize;
+    let fat = 512 + u32_at(&ok, 0x4C) as usize * 512;
+    let mut b = ok.clone();
+    put32(&mut b, fat + (start + 2) * 4, start as u32);
+    assert!(malformed(&b));
+}
+
+#[test]
+fn ods_row_cells_bounded_and_wide_skipped() {
+    // 20 тыс. пустых ячеек, затем текст: правее XFD — отброшен с предупреждением
+    let mut t = String::from(
+        r#"<table:table table:name="S"><table:table-row><table:table-cell><text:p>a</text:p></table:table-cell>"#,
+    );
+    t.push_str(&"<table:table-cell/>".repeat(20_000));
+    t.push_str("<table:table-cell><text:p>far</text:p></table:table-cell></table:table-row>");
+    t.push_str(r#"<table:table-row><table:table-cell table:number-columns-repeated="2"/><table:table-cell><text:p>c3</text:p></table:table-cell></table:table-row></table:table>"#);
+    let x = run(DocKind::Ods, &ods(t.as_bytes()), &Limits::default());
+    assert_eq!(x.warnings, ["skipped: columns after XFD"]);
+    assert_eq!(x.units[0].text, "| a |\n| --- |\n|  |  | c3 |");
+    // 4·10⁹ строк без видимых ячеек (текст правее XFD) — сдвиг номера, а не цикл
+    let t = r#"<table:table table:name="S"><table:table-row table:number-rows-repeated="4000000000"><table:table-cell table:number-columns-repeated="16384"/><table:table-cell><text:p>x</text:p></table:table-cell></table:table-row><table:table-row><table:table-cell><text:p>end</text:p></table:table-cell></table:table-row></table:table>"#;
+    let t0 = Instant::now();
+    let x = run(DocKind::Ods, &ods(t.as_bytes()), &Limits::default());
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert_eq!(
+        x.units[0].locator,
+        Locator::Sheet {
+            name: "S".into(),
+            range: "A4000000001:A4000000001".into()
+        }
+    );
+}
+
+#[test]
+fn xlsx_long_sheet_names_capped() {
+    let name = "Имя".repeat(10_000);
+    let sheet = sheet_xml(None, &grid(&[&["h"]]));
+    let x = run(
+        DocKind::Xlsx,
+        &xlsx(&[(&name, sheet.clone()), ("B", sheet)], None),
+        &Limits::default(),
+    );
+    assert_eq!(x.units.len(), 2);
+    let (n, _) = sheet_of(&x.units[0].locator);
+    assert_eq!(n.chars().count(), zam_docs::HEADING_PATH_MAX_CHARS + 1);
+    assert_eq!(x.units[0].heading_path[0], n);
+    // записей `<sheet>` больше max_entries
+    let limits = Limits {
+        max_entries: 50,
+        ..Limits::default()
+    };
+    let sheets: Vec<(String, Vec<u8>)> = (0..60)
+        .map(|i| (format!("L{i}"), sheet_xml(None, &grid(&[&["v"]]))))
+        .collect();
+    let refs: Vec<(&str, Vec<u8>)> = sheets
+        .iter()
+        .map(|(n, s)| (n.as_str(), s.clone()))
+        .collect();
+    let bytes = xlsx(&refs[..40], None);
+    assert_eq!(run(DocKind::Xlsx, &bytes, &limits).units.len(), 40);
+    let bytes = xlsx(&refs, None);
+    let x = extract(DocKind::Xlsx, &bytes, &limits, far()).unwrap();
+    assert!(
+        x.warnings.contains(&"truncated: max_entries".to_string()),
+        "{:?}",
+        x.warnings
+    );
+}
+
+#[test]
+fn sheet_page_deadline_partial() {
+    let mut rows = String::new();
+    for r in 1..=50_000 {
+        rows.push_str(&format!(r#"<row r="{r}"><c><v>{r}</v></c></row>"#));
+    }
+    let bytes = xlsx(&[("S", sheet_xml(None, &rows))], None);
+    let p = sheet_page(
+        DocKind::Xlsx,
+        &bytes,
+        "",
+        1,
+        10,
+        &Limits::default(),
+        Instant::now(),
+    )
+    .unwrap();
+    assert_eq!(p.warnings, ["truncated: timeout_ms"]);
+    assert!(p.total_rows < 49_999);
+}
+
+#[test]
+fn csv_mostly_utf8_and_cr_only() {
+    // неполный символ в конце (обрезка) — всё ещё UTF-8
+    let mut b = "имя,город\nИван,Москва".as_bytes().to_vec();
+    b.extend_from_slice(&"ё".as_bytes()[..1]);
+    let x = run(DocKind::Csv, &b, &Limits::default());
+    assert!(
+        x.units[0].text.contains("| Иван | Москва\u{FFFD} |"),
+        "{}",
+        x.units[0].text
+    );
+    // один неверный байт на 2 КиБ текста — UTF-8 с заменой, а не Windows-1251
+    let mut b = "заголовок,второй\n".repeat(60).into_bytes();
+    b.extend_from_slice(b"x\xFFy,z\n");
+    let x = run(DocKind::Csv, &b, &Limits::default());
+    let t = all_text(&x);
+    assert!(
+        t.contains("| x\u{FFFD}y | z |") && t.contains("заголовок"),
+        "{t}"
+    );
+    // концы строк — одиночный `\r` (старый Mac): разделитель `;`
+    let x = run(DocKind::Csv, b"a;b\r1;2\r3;4\r", &Limits::default());
+    assert_eq!(
+        x.units[0].text,
+        "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    );
 }

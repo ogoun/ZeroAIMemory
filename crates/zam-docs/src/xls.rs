@@ -7,6 +7,8 @@
 //! `MULRK`), логические и ошибки (`BOOLERR`), сохранённые результаты формул (`FORMULA`,
 //! `STRING`); даты остаются числами. Зашифрованная книга (`FILEPASS`) — `skipped: Workbook`.
 
+use std::time::Instant;
+
 use encoding_rs::Encoding;
 
 use crate::DocError;
@@ -36,6 +38,7 @@ fn bad(why: &str) -> DocError {
 }
 
 /// Записи BIFF подряд: (тип, данные). Запись за концом потока — конец.
+#[derive(Clone)]
 struct Records<'a> {
     b: &'a [u8],
     at: usize,
@@ -157,13 +160,8 @@ fn globals(wb: &[u8], ctx: &mut Ctx) -> Result<Option<Book>, DocError> {
                 book.sheets.push((at as usize, name));
             }
             SST if biff8 => {
-                let mut segs = vec![data.get(8..).unwrap_or_default()];
-                while recs.peek() == Some(CONTINUE) {
-                    if let Some((_, c)) = recs.next() {
-                        segs.push(c);
-                    }
-                }
-                read_sst(segs, &mut book.strings, ctx);
+                let first = data.get(8..).unwrap_or_default();
+                recs = read_sst(recs.clone(), first, &mut book.strings, ctx);
                 book.strings.shrink();
             }
             _ => {}
@@ -363,23 +361,45 @@ fn long_string(d: &[u8], book: &Book, out: &mut String) {
 
 /// Чтение `SST` с продолжениями `CONTINUE`: на границе записи внутри символов строки первым
 /// байтом продолжения идут флаги (ширина символов меняется); остальное — сплошные байты.
+///
+/// Продолжения берутся лениво из курсора записей: память O(1) при любом числе `CONTINUE`
+/// (в том числе пустых); срок сверяется раз в 1024 перехода.
 struct Segs<'a> {
-    segs: Vec<&'a [u8]>,
-    i: usize,
+    recs: Records<'a>,
+    cur: &'a [u8],
     pos: usize,
+    deadline: Instant,
+    steps: u64,
+    expired: bool,
 }
 
-impl Segs<'_> {
+impl<'a> Segs<'a> {
+    /// Следующая запись `CONTINUE`; `None` — её нет, она за концом потока или истёк срок.
+    fn next_seg(&mut self) -> Option<()> {
+        self.steps += 1;
+        if self.steps.is_multiple_of(1024) && Instant::now() >= self.deadline {
+            self.expired = true;
+            return None;
+        }
+        match self.recs.peek() {
+            Some(CONTINUE) => {
+                let (_, d) = self.recs.next()?;
+                self.cur = d;
+                self.pos = 0;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
     /// Следующий байт сплошного потока.
     fn byte(&mut self) -> Option<u8> {
         loop {
-            let s = self.segs.get(self.i)?;
-            if let Some(&b) = s.get(self.pos) {
+            if let Some(&b) = self.cur.get(self.pos) {
                 self.pos += 1;
                 return Some(b);
             }
-            self.i += 1;
-            self.pos = 0;
+            self.next_seg()?;
         }
     }
 
@@ -397,17 +417,15 @@ impl Segs<'_> {
     }
 
     fn skip(&mut self, mut n: usize) -> Option<()> {
-        while n > 0 {
-            let s = self.segs.get(self.i)?;
-            let k = (s.len() - self.pos).min(n);
+        loop {
+            let k = (self.cur.len() - self.pos).min(n);
             n -= k;
             self.pos += k;
-            if n > 0 {
-                self.i += 1;
-                self.pos = 0;
+            if n == 0 {
+                return Some(());
             }
+            self.next_seg()?;
         }
-        Some(())
     }
 
     /// `n` символов строки шириной `high`; на новой записи — новый байт флагов.
@@ -418,22 +436,19 @@ impl Segs<'_> {
         f: &mut impl FnMut(&[u8], bool),
     ) -> Option<()> {
         while n > 0 {
-            let s = *self.segs.get(self.i)?;
-            if self.pos >= s.len() {
-                self.i += 1;
-                self.pos = 0;
-                let s = self.segs.get(self.i)?;
-                high = s.first()? & 1 != 0;
+            if self.pos >= self.cur.len() {
+                self.next_seg()?;
+                high = self.cur.first()? & 1 != 0;
                 self.pos = 1;
                 continue;
             }
             let w = if high { 2 } else { 1 };
-            let k = ((s.len() - self.pos) / w).min(n);
+            let k = ((self.cur.len() - self.pos) / w).min(n);
             if k == 0 {
                 // половина символа UTF-16 на границе записи — файл повреждён
                 return None;
             }
-            f(&s[self.pos..self.pos + k * w], high);
+            f(&self.cur[self.pos..self.pos + k * w], high);
             self.pos += k * w;
             n -= k;
         }
@@ -441,26 +456,40 @@ impl Segs<'_> {
     }
 }
 
-fn read_sst(segs: Vec<&[u8]>, strings: &mut Strings, ctx: &mut Ctx) {
-    let mut r = Segs { segs, i: 0, pos: 0 };
+/// Строки `SST` (данные первой записи — `first`, продолжения — из `recs`); возвращает курсор
+/// после прочитанных продолжений.
+fn read_sst<'a>(
+    recs: Records<'a>,
+    first: &'a [u8],
+    strings: &mut Strings,
+    ctx: &mut Ctx,
+) -> Records<'a> {
+    let mut r = Segs {
+        recs,
+        cur: first,
+        pos: 0,
+        deadline: ctx.deadline(),
+        steps: 0,
+        expired: false,
+    };
     let mut tmp = String::new();
     loop {
         if !ctx.tick() {
-            return;
+            break;
         }
         let Some(cch) = r.u16() else {
-            return;
+            break;
         };
         let Some(flags) = r.byte() else {
-            return;
+            break;
         };
         let runs = if flags & 8 != 0 { r.u16() } else { Some(0) };
         let ext = if flags & 4 != 0 { r.u32() } else { Some(0) };
         let (Some(runs), Some(ext)) = (runs, ext) else {
-            return;
+            break;
         };
         if !strings.begin(ctx) {
-            return;
+            break;
         }
         let ok = r.chars(usize::from(cch), flags & 1 != 0, &mut |b, high| {
             tmp.clear();
@@ -470,9 +499,13 @@ fn read_sst(segs: Vec<&[u8]>, strings: &mut Strings, ctx: &mut Ctx) {
         strings.end();
         if ok.is_none() || r.skip(usize::from(runs) * 4).is_none() || r.skip(ext as usize).is_none()
         {
-            return;
+            break;
         }
     }
+    if r.expired {
+        ctx.stop("timeout_ms");
+    }
+    r.recs
 }
 
 /// Кодовая страница BIFF5 → кодировка; неизвестная — Windows-1252.

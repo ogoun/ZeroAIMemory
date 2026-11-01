@@ -846,8 +846,11 @@ fn pptx_many_slide_ids_bounded() {
     let took = t.elapsed();
     assert!(took < Duration::from_secs(4), "{took:?}");
     assert!(x.units.is_empty());
+    // отношений больше `max_entries` не читается (раунд правок 1 задачи 2)
     assert!(
-        x.warnings.is_empty() || x.warnings == ["truncated: timeout_ms"],
+        x.warnings
+            .iter()
+            .all(|w| w == "truncated: max_entries" || w == "truncated: timeout_ms"),
         "{:?}",
         x.warnings
     );
