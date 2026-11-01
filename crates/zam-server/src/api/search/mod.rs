@@ -1910,7 +1910,7 @@ fn session_failed(what: &str, e: &StoreError) {
 /// чтения — `true` (prefetch вложений остаётся; WARN без текста).
 async fn any_attachments(targets: &[SearchTarget]) -> bool {
     for t in targets {
-        match zam_store::has_extracted_attachments(&t.db, t.vector_space_ids()).await {
+        match zam_store::has_attachment_chunks(&t.db, t.vector_space_ids()).await {
             Ok(true) => return true,
             Ok(false) => {}
             Err(e) => {

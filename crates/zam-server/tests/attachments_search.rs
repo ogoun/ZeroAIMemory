@@ -766,3 +766,50 @@ async fn cache_source_attachment_no_owner_id_leak() {
     assert_eq!(ok.json()["sources"][0]["id"], format!("n:{s}"));
     a.st.shutdown().await;
 }
+
+/// Раунд 3: prefetch вложений решается по наличию чанков, а не по `extract_state` — документ,
+/// ждущий переизвлечения (`done` → `pending` после смены версии извлечения) или с неудачей
+/// (`failed`), с прежними чанками и точками находится векторным каналом.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attachment_found_while_reextracting_or_failed() {
+    let w = world("att-reextract", true).await;
+    if !w.vector {
+        return;
+    }
+    let a = &w.a;
+    let user = a.st.admin_id;
+    let node = note(a, &a.token, "knowledge", "r/док", "# Док\n\nК.\n", None).await;
+    upload(
+        a,
+        &a.token,
+        &node,
+        "r.docx",
+        &docx(&["Hafnium turbine blade inspection."]),
+    )
+    .await;
+    let d = wait_done(a, user, &node, "r.docx").await;
+    wait_points(a, user, chunk_locators(a, user, d.id).await.len() as u64).await;
+    for state in ["pending", "failed"] {
+        let id = d.id.to_string();
+        common::attach::db(a, user)
+            .await
+            .write(move |t| {
+                t.execute(
+                    "UPDATE attachment_docs SET extract_state = ?2 WHERE id = ?1",
+                    [id, state.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let j = search(
+            a,
+            &a.token,
+            json!({"query": "hafnium turbine", "filters": {"kinds": ["attachment"]}}),
+        )
+        .await;
+        assert_eq!(files(&j), ["r.docx"], "{state}: {j}");
+        assert!(sources(atts(&j)[0]).contains(&"vector"), "{state}: {j}");
+    }
+    a.st.shutdown().await;
+}

@@ -1199,6 +1199,36 @@ BASE 52f6b8a. Поиск находит фрагменты DOCX/PDF/XLSX/PPTX (�
   (+1), `qdrant` 30, `edge` 24 (1 ignored); `-p zam-store`: `attachments` 17 (+1), `search` 23;
   `-p zam-server`: `attachments_search` 8 (+1), `cache_api` 8, `search` 13, `hybrid` 7.
 
+#### Задача 6 — раунд правок 3 (2026-11-01)
+
+Ревью раунда 2: APPROVED с одной Minor. Поверх 8a80e55.
+
+- **Ложное «нет вложений» у проверки prefetch.** `has_extracted_attachments` требовала
+  `extract_state = 'done'`; после `rechunk_docs_if_stale` (смена `EXTRACTOR_VERSION`: `done` →
+  `pending`, чанки и точки остаются) и при `failed` векторный канал вложений молчал до
+  переизвлечения (зонд ревьюера: 0 карточек при живой точке). Теперь `has_attachment_chunks`
+  смотрит на наличие чанков: EXISTS по `chunks INDEXED BY chunks_attachment` + живой документ +
+  живая заметка в векторных пространствах цели. Тесты: store `has_attachment_chunks_by_space`
+  (`pending` и `failed` с прежними чанками — «есть»; удалённый узел — «нет»), сервер
+  `attachment_found_while_reextracting_or_failed` (MiniLM + Qdrant: фрагмент находится с
+  источником `vector` при `pending` и `failed`).
+- Проверки (Windows, MiniLM + Qdrant + pdfium): `cargo fmt --check`, `cargo clippy --workspace
+  --all-targets -D warnings` — чисто; `-p zam-store --test attachments` 17; `-p zam-server --test
+  attachments_search` 9 (+1).
+
+### Задача 6 — итог (2026-11-01)
+
+Ревью раунда 2: APPROVED, Minor закрыта в раунде 3. Коммиты: 9ab8635 (поиск по вложениям), 5c9cabf
+(большая часть раунда 1, ошибка контроллера, см. ниже) + 32b1220 (остаток раунда 1), 8a80e55
+(раунд 2), раунд 3 — коммит `fix(search): правки ревью задачи 6 M5, раунд 3 — наличие вложений по
+чанкам`. Итог: фрагменты DOCX/PDF/XLSX/PPTX/CSV ищутся FTS и векторным каналом (свой prefetch,
+только когда в области есть чанки вложений); карточка `a:<chunk>` с файлом, `locator` и подписью
+(сканер секретов); фильтры — заметки-владельца на момент поиска; квота `max_per_attachment`;
+права участника и Human; источник выжимки `a:<chunk>` — заметка-владелец без утечки id. Для
+задачи 7 — `/read a:<chunk>` и `seen` карточек вложений; для задачи 10 — окно
+`ATTACH_PREFETCH` и латентность на корпусе, частичный индекс `attachment_docs` для
+`pending_count`.
+
 ### Ошибка контроллера: коммит 5c9cabf (2026-11-01)
 
 Коммит `5c9cabf docs(m5.5): права участника на отчёты` сделан контроллером через `git commit -am`

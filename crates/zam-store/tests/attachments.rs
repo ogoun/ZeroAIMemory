@@ -1337,50 +1337,44 @@ async fn attachment_index_state_and_pending_count() {
     );
 }
 
-/// Раунд правок 2 задачи 6 M5: `has_extracted_attachments` — есть ли в пространствах извлечённый
-/// живой документ живой заметки (иначе поиск не запускает prefetch вложений в Qdrant).
+/// Раунды правок 2–3 задачи 6 M5: `has_attachment_chunks` — есть ли в пространствах чанки
+/// вложения живого документа живой заметки (иначе поиск не запускает prefetch вложений в
+/// Qdrant). Считаются чанки, а не `extract_state`: документ `done` → `pending` (смена версии
+/// извлечения) или `failed` с прежними чанками — «есть».
 #[tokio::test]
-async fn has_extracted_attachments_by_space() {
-    use zam_store::has_extracted_attachments;
-    let env = setup("has-extracted").await;
-    assert!(
-        !has_extracted_attachments(&env.db, vec![env.k])
-            .await
-            .unwrap()
-    );
-    assert!(
-        !has_extracted_attachments(&env.db, Vec::new())
-            .await
-            .unwrap()
-    );
-    let n = note(&env.db, env.k, "p/z", "# Z\n").await;
+async fn has_attachment_chunks_by_space() {
+    use zam_store::has_attachment_chunks;
+    let env = setup("has-chunks").await;
+    let has = |spaces: Vec<Id>| {
+        let db = env.db.clone();
+        async move { has_attachment_chunks(&db, spaces).await.unwrap() }
+    };
+    assert!(!has(vec![env.k]).await);
+    assert!(!has(Vec::new()).await);
+    let n = note(
+        &env.db, env.k, "p/z", "# Z
+",
+    )
+    .await;
     put_attach(&env, n, b"doc", "doc.txt", Some(DocKind::Text)).await;
-    // ещё не извлечён
-    assert!(
-        !has_extracted_attachments(&env.db, vec![env.k])
-            .await
-            .unwrap()
-    );
+    // ещё не извлечён — чанков нет
+    assert!(!has(vec![env.k]).await);
     let d = doc_of(&list_attachments(&env.db, n).await.unwrap(), "doc.txt");
     set_extract_state(&env.db, d.id, ExtractState::Done, None)
         .await
         .unwrap();
-    assert!(
-        has_extracted_attachments(&env.db, vec![env.k])
-            .await
-            .unwrap()
-    );
+    replace_attachment_chunks(&env.db, d.id, &units(&[("", "гафний")]))
+        .await
+        .unwrap();
+    assert!(has(vec![env.k]).await);
+    // переизвлечение (смена версии) и неудача: чанки и точки остаются — вложение ищется
+    for state in [ExtractState::Pending, ExtractState::Failed] {
+        set_extract_state(&env.db, d.id, state, None).await.unwrap();
+        assert!(has(vec![env.k]).await, "{state:?}");
+    }
     // другое пространство — нет
-    assert!(
-        !has_extracted_attachments(&env.db, vec![env.h])
-            .await
-            .unwrap()
-    );
-    // узел удалён — документ скрыт
+    assert!(!has(vec![env.h]).await);
+    // узел удалён — документ скрыт (чанки остаются в базе)
     delete_node(&env.db, n, AuthorKind::Human).await.unwrap();
-    assert!(
-        !has_extracted_attachments(&env.db, vec![env.k])
-            .await
-            .unwrap()
-    );
+    assert!(!has(vec![env.k]).await);
 }
