@@ -127,7 +127,8 @@ async fn worker_crash_is_parse_crash_and_restarts() {
 async fn worker_timeout_killed() {
     let pool = DocPool::with_program(
         &DocsSection {
-            timeout_ms: 500,
+            // запуск debug-процесса под нагрузкой параллельных тестов — до секунды и больше
+            timeout_ms: 3000,
             ..cfg()
         },
         exe(),
@@ -237,8 +238,12 @@ fn probe_server_holding_worker() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let pool = DocPool::with_program(&cfg(), exe());
+        let pool = std::sync::Arc::new(DocPool::with_program(&cfg(), exe()));
         pool.test_op(TestOp::Sleep(1)).await.unwrap();
+        // процесс занят долгим заданием: сам по EOF stdin он не выйдет (ревью, I-3)
+        let busy = pool.clone();
+        tokio::spawn(async move { busy.test_op(TestOp::Sleep(120_000)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
         println!("{PID_LINE}{}", pool.worker_pids()[0]);
         tokio::time::sleep(Duration::from_secs(120)).await;
     });
@@ -273,10 +278,60 @@ fn worker_dies_with_server() {
     let pid = pid.expect("pid рабочего процесса от «сервера»");
     assert!(zam_index::supervisor::pid_alive(pid));
     // жёсткое завершение «сервера»: Windows — TerminateProcess, Linux — SIGKILL
+    let t = Instant::now();
     probe.kill().unwrap();
     probe.wait().unwrap();
+    // занятый процесс (Sleep 120 с) исчезает только по Job Object / PDEATHSIG — быстро
     assert!(
         gone(pid, Duration::from_secs(10)),
         "рабочий процесс {pid} пережил сервер"
+    );
+    eprintln!("рабочий процесс исчез через {:?}", t.elapsed());
+}
+
+/// Резидентная память этого процесса, МиБ.
+fn rss_mib() -> u64 {
+    zam_index::supervisor::rss_bytes(std::process::id()).unwrap_or(0) / (1024 * 1024)
+}
+
+#[tokio::test]
+async fn worker_unsolicited_frames_killed_not_buffered() {
+    // ревью задачи 3 (I-1): процесс после ответа пишет 10 лишних кадров по 64 МиБ; пул не читает
+    // stdout без запроса (память не растёт), лишний кадр не выдаётся следующему запросу
+    let pool = DocPool::with_program(&cfg(), exe());
+    pool.test_op(TestOp::Sleep(1)).await.unwrap();
+    let before = rss_mib();
+    pool.test_op(TestOp::Spam { frames: 10, mb: 64 })
+        .await
+        .unwrap();
+    let first = pool.worker_pids();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let idle = rss_mib();
+    assert!(
+        idle < before + 200,
+        "память простаивающего пула: {before} → {idle} МиБ"
+    );
+    // следующий запрос: лишний кадр — нарушение протокола, процесс убит, ответ — свежий
+    let p = pool.ping().await.unwrap();
+    assert!(p.as_ref().is_none_or(|s| !s.starts_with("stale")), "{p:?}");
+    assert!(p.as_ref().is_none_or(|s| s.len() <= 4096));
+    assert_eq!(pool.spawned(), 2, "процесс с лишними кадрами заменён");
+    assert!(gone(first[0], Duration::from_secs(5)));
+    assert!(pool.pdfium_error().is_none_or(|s| !s.starts_with("stale")));
+    let after = rss_mib();
+    eprintln!("RSS: до {before}, простой {idle}, после {after} МиБ");
+    assert!(after < before + 200, "{before} → {after} МиБ");
+}
+
+#[tokio::test]
+async fn worker_long_reason_capped() {
+    let pool = DocPool::with_program(&cfg(), exe());
+    let e = pool.test_op(TestOp::LongError(1024)).await.unwrap_err();
+    assert_eq!(e, ParseFailure::Doc(DocError::Unsupported));
+    let why = pool.pdfium_error().unwrap();
+    assert!(
+        why.len() <= zam_server::docs::pool::REASON_MAX,
+        "{}",
+        why.len()
     );
 }

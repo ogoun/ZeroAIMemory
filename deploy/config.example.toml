@@ -260,6 +260,7 @@ blob_max_bytes = 209715200
 # заданий на процесс до перезапуска, лимит памяти процесса (МиБ; Windows — Job Object,
 # Linux — RLIMIT_AS) и срок разбора файла (мс; по истечении процесс убивается, вложение —
 # failed с причиной parse_timeout; падение — parse_crash, нехватка памяти — parse_oom).
+# worker_memory_mb должен быть не меньше 3 × max_bytes + 64 МиБ (кадр, файл и pdfium).
 workers = 2
 worker_jobs = 200
 worker_memory_mb = 2048

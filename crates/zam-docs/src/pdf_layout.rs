@@ -44,10 +44,11 @@ pub(crate) struct Row {
     pub y1: f32,
 }
 
-/// Срок: проверка раз в 1024 вызова.
+/// Срок по весу работы: время сверяется, когда накоплено 1024 единицы (символ, фрагмент
+/// области XY-cut), — тяжёлый шаг проверяет срок сразу.
 pub(crate) struct Clock {
     deadline: Instant,
-    n: u32,
+    n: u64,
     expired: bool,
 }
 
@@ -60,12 +61,20 @@ impl Clock {
         }
     }
 
-    /// `true` — срок истёк (один раз истёкший остаётся истёкшим).
+    /// `true` — срок истёк (один раз истёкший остаётся истёкшим); шаг весом 1.
     pub fn expired(&mut self) -> bool {
+        self.charge(1)
+    }
+
+    /// Шаг весом `work`; `true` — срок истёк.
+    pub fn charge(&mut self, work: usize) -> bool {
         if !self.expired {
-            self.n = self.n.wrapping_add(1);
-            if self.n.is_multiple_of(1024) && Instant::now() >= self.deadline {
-                self.expired = true;
+            self.n = self.n.saturating_add(work as u64);
+            if self.n >= 1024 {
+                self.n = 0;
+                if Instant::now() >= self.deadline {
+                    self.expired = true;
+                }
             }
         }
         self.expired
@@ -212,16 +221,32 @@ fn has_column_gap(frags: &[Frag], idx: &[usize], min: f32) -> bool {
         .is_empty()
 }
 
+/// Бюджет работы XY-cut на страницу: столько фрагментов на фрагмент страницы плюс постоянная.
+/// Квадратичная «лестница» (полосы, каждая со столбцами, без общего просвета) исчерпывает его
+/// за десятки разрезов; остаток страницы выдаётся полосами сверху вниз за `O(n log n)`.
+pub(crate) const XY_WORK_PER_FRAG: usize = 32;
+const XY_WORK_BASE: usize = 1 << 20;
+
 /// Порядок чтения фрагментов: строки (фрагменты строки слева направо) сверху вниз по XY-cut.
 fn xy_cut(frags: &[Frag], clock: &mut Clock) -> Vec<Vec<usize>> {
     let min_col = COLUMN_GAP * median_h(frags);
     let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut budget = frags
+        .len()
+        .saturating_mul(XY_WORK_PER_FRAG)
+        .saturating_add(XY_WORK_BASE);
     // стек областей; дети кладутся в обратном порядке, чтобы выходить по порядку чтения
     let mut stack: Vec<Vec<usize>> = vec![(0..frags.len()).collect()];
     while let Some(region) = stack.pop() {
-        if clock.expired() {
-            // остаток — как есть, полосами
-            rows.extend(bands(frags, &region));
+        // вес шага — размер области: срок сверяется по объёму работы, а не по числу шагов
+        let expired = clock.charge(region.len());
+        budget = budget.saturating_sub(region.len());
+        if expired || budget == 0 {
+            // остаток — полосами сверху вниз, фрагменты полосы слева направо
+            for mut b in bands(frags, &region) {
+                b.sort_by(|&a, &c| frags[a].x0.total_cmp(&frags[c].x0));
+                rows.push(b);
+            }
             continue;
         }
         if region.len() <= 1 {
@@ -244,7 +269,12 @@ fn xy_cut(frags: &[Frag], clock: &mut Clock) -> Vec<Vec<usize>> {
             continue;
         }
         let bs = bands(frags, &region);
-        if bs.len() == 1 || !bs.iter().any(|b| has_column_gap(frags, b, min_col)) {
+        if bs.len() == 1
+            || !bs.iter().any(|b| {
+                budget = budget.saturating_sub(b.len());
+                has_column_gap(frags, b, min_col)
+            })
+        {
             for mut b in bs {
                 b.sort_by(|&a, &c| frags[a].x0.total_cmp(&frags[c].x0));
                 rows.push(b);
@@ -544,5 +574,51 @@ mod tests {
         let rows = page_rows(&g, &mut c);
         assert!(c.expired);
         let _ = rows;
+    }
+
+    #[test]
+    fn staircase_is_not_quadratic() {
+        // ревью задачи 3 (I-2): 130 тыс. полос, в каждой два столбца, общая проекция по x
+        // сплошная — без бюджета работы каждый разрез отщеплял одну полосу (O(n²))
+        let n = 130_000;
+        let mut g = Vec::with_capacity(2 * n);
+        for k in 0..n {
+            let (x, y) = (k as f32 * 0.05, 200_000.0 - k as f32 * 1.5);
+            for (c, dx) in [('a', 0.0), ('b', 100.0)] {
+                g.push(Glyph {
+                    c,
+                    x0: x + dx,
+                    y0: y,
+                    x1: x + dx + 0.5,
+                    y1: y + 1.0,
+                });
+                g.push(Glyph {
+                    c: '\n',
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 0.0,
+                    y1: 0.0,
+                });
+            }
+        }
+        let t = Instant::now();
+        let mut c = Clock::new(Instant::now() + Duration::from_secs(60));
+        let rows = page_rows(&g, &mut c);
+        let took = t.elapsed();
+        assert!(!c.expired, "{took:?}");
+        assert!(took < Duration::from_secs(20), "{took:?}");
+        // полный результат: все символы на месте, строки сверху вниз (первые разрезы до
+        // исчерпания бюджета делят полосу на столбцы «a» и «b», дальше — полосы «a b»)
+        eprintln!("лестница: {took:?}, строк {}", rows.len());
+        let chars: usize = rows.iter().map(|r| r.text.replace(' ', "").len()).sum();
+        assert_eq!(chars, 2 * n);
+        assert!(rows.len() >= n && rows.len() < n + 1000, "{}", rows.len());
+        assert!(rows.windows(2).all(|w| w[0].y1 >= w[1].y1));
+    }
+
+    #[test]
+    fn work_weighted_clock_expires_on_heavy_step() {
+        let mut c = Clock::new(Instant::now());
+        assert!(c.charge(5000), "тяжёлый шаг сверяет срок сразу");
     }
 }

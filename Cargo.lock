@@ -6529,6 +6529,7 @@ dependencies = [
  "http-body-util",
  "ipnet",
  "jiff",
+ "libc",
  "lru",
  "memory-serve",
  "mime_guess",

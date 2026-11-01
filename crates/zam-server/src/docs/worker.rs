@@ -73,8 +73,8 @@ pub fn run(pdfium: PathBuf, max_frame: usize) -> i32 {
     let mut input = BufReader::with_capacity(64 * 1024, io::stdin().lock());
     let mut output = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
     loop {
-        let body = match read_frame(&mut input, max_frame) {
-            Ok(Some(b)) => b,
+        let (id, body) = match read_frame(&mut input, max_frame) {
+            Ok(Some(f)) => f,
             Ok(None) => return 0,
             Err(e) => {
                 tracing::error!("кадр запроса: {e}");
@@ -83,23 +83,54 @@ pub fn run(pdfium: PathBuf, max_frame: usize) -> i32 {
         };
         let (resp, panicked) = match catch_unwind(AssertUnwindSafe(|| handle(&body, &mut st))) {
             Ok(r) => (r, false),
-            Err(_) => (error(DocError::Internal("паника разбора".into())), true),
+            Err(_) => (
+                Reply::One(error(DocError::Internal("паника разбора".into()))),
+                true,
+            ),
         };
+        #[cfg(feature = "test-hooks")]
+        let (resp, spam) = match resp {
+            Reply::One(r) => (r, None),
+            Reply::Spam(frames, mb) => (Response::Done, Some((frames, mb))),
+        };
+        #[cfg(not(feature = "test-hooks"))]
+        let Reply::One(resp) = resp;
         drop(body);
         let out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
             serde_json::to_vec(&error(DocError::Internal(format!("ответ: {e}"))))
                 .unwrap_or_default()
         });
         drop(resp);
-        if let Err(e) = write_frame(&mut output, &out) {
+        if let Err(e) = write_frame(&mut output, id, &out) {
             tracing::error!("кадр ответа: {e}");
             return EXIT_WRITE;
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Some((frames, mb)) = spam {
+            // лишние кадры без запроса: пул не должен их копить и путать с ответами
+            let pad = "x".repeat(usize::try_from(mb * 1024 * 1024).unwrap_or(0));
+            for i in 0..frames {
+                let r = Response::Pong {
+                    pdfium: Some(format!("stale-{i}{pad}")),
+                };
+                let b = serde_json::to_vec(&r).unwrap_or_default();
+                if write_frame(&mut output, id, &b).is_err() {
+                    return EXIT_WRITE;
+                }
+            }
         }
         if panicked {
             tracing::error!("паника разбора — процесс завершается");
             return EXIT_PANIC;
         }
     }
+}
+
+/// Ответ на запрос; `Spam` — тестовый поток лишних кадров после ответа.
+enum Reply {
+    One(Response),
+    #[cfg(feature = "test-hooks")]
+    Spam(u32, u64),
 }
 
 fn error(e: DocError) -> Response {
@@ -112,7 +143,15 @@ fn decode(b64: &str) -> Result<Vec<u8>, DocError> {
         .map_err(|e| DocError::Internal(format!("base64: {e}")))
 }
 
-fn handle(body: &[u8], st: &mut State) -> Response {
+fn handle(body: &[u8], st: &mut State) -> Reply {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(Request::Spam { frames, mb }) = serde_json::from_slice::<Request<'_>>(body) {
+        return Reply::Spam(frames, mb);
+    }
+    Reply::One(respond(body, st))
+}
+
+fn respond(body: &[u8], st: &mut State) -> Response {
     let req: Request<'_> = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => return error(DocError::Internal(format!("запрос: {e}"))),
@@ -196,5 +235,12 @@ fn handle(body: &[u8], st: &mut State) -> Response {
             std::hint::black_box(&keep);
             Response::Done
         }
+        #[cfg(feature = "test-hooks")]
+        Request::Spam { .. } => Response::Done,
+        #[cfg(feature = "test-hooks")]
+        Request::LongError { kb } => Response::Error(WireError {
+            kind: "unsupported".into(),
+            message: "x".repeat(usize::try_from(kb * 1024).unwrap_or(0)),
+        }),
     }
 }

@@ -750,7 +750,8 @@ pub struct DocsSection {
     pub workers: usize,
     /// Заданий на процесс до перезапуска (1..=100000, 200).
     pub worker_jobs: u32,
-    /// Лимит памяти процесса, МиБ (128..=65536, 2048): Job Object / `RLIMIT_AS`.
+    /// Лимит памяти процесса, МиБ (128..=65536, 2048; не меньше 3 × `max_bytes` + 64 МиБ):
+    /// Job Object / `RLIMIT_AS`.
     pub worker_memory_mb: u64,
     /// Срок разбора файла, мс (100..=3600000, 60000); по истечении процесс убивается.
     pub timeout_ms: u64,
@@ -843,6 +844,18 @@ impl DocsSection {
         // файл целиком в кадре base64 рабочего процесса: кадр — u32
         if self.max_bytes > 1 << 30 {
             return Err(bad("max_bytes", "не больше 1 ГиБ"));
+        }
+        // в рабочем процессе одновременно: кадр base64 (4/3), декодированный файл и pdfium
+        let need = 3 * self.max_bytes + 64 * 1024 * 1024;
+        if self.worker_memory_mb * 1024 * 1024 < need {
+            return Err(bad(
+                "worker_memory_mb",
+                &format!(
+                    "меньше 3 × max_bytes + 64 МиБ = {} МиБ: файл предельного размера \
+                     не разобрать; увеличьте worker_memory_mb или уменьшите max_bytes",
+                    need.div_ceil(1024 * 1024)
+                ),
+            ));
         }
         Ok(())
     }
@@ -2045,5 +2058,35 @@ master_key = \"x\"
             .to_string();
         assert!(!e.contains("SECRET"), "{e}");
         assert!(e.contains("строка 2"), "{e}");
+    }
+
+    #[test]
+    fn docs_section_defaults_and_memory_check() {
+        let d = load(None, &[], &Default::default()).unwrap().docs;
+        assert_eq!(
+            (d.workers, d.worker_jobs, d.worker_memory_mb),
+            (2, 200, 2048)
+        );
+        assert_eq!(d.timeout_ms, 60_000);
+        assert_eq!(d.limits(), zam_docs::Limits::default());
+        // 3 × 100 МиБ + 64 МиБ = 364 МиБ > 256
+        let e = load(
+            None,
+            &[env("ZAM_DOCS__WORKER_MEMORY_MB", "256")],
+            &Default::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("docs.worker_memory_mb") && e.contains("364"),
+            "{e}"
+        );
+        let ok = vec![
+            env("ZAM_DOCS__WORKER_MEMORY_MB", "256"),
+            env("ZAM_DOCS__MAX_BYTES", "10485760"),
+        ];
+        assert!(load(None, &ok, &Default::default()).is_ok());
+        let e = load(None, &[env("ZAM_DOCS__WORKERS", "0")], &Default::default());
+        assert!(e.unwrap_err().to_string().contains("docs.workers"));
     }
 }

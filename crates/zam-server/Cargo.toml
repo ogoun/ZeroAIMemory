@@ -67,6 +67,10 @@ windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", 
 # служба Windows (SCM, §13.3): диспетчер, обработчик команд, регистрация
 windows-service.workspace = true
 
+# рабочий процесс документов: номер SIGKILL в разборе статуса выхода (docs/pool.rs)
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [features]
 # Тестовые точки (заглушка реранкера `RerankSlot::install`, точка остановки поиска после
 # каналов `AppState::search_hold` на `zam_index::test_hooks::Hold`) — только интеграционным

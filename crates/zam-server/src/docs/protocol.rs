@@ -1,12 +1,14 @@
 //! Протокол обмена с рабочим процессом `zam-server doc-worker` по stdin/stdout.
 //!
-//! Кадр — длина тела `u32` big-endian и тело JSON (`serde_json`). Родитель пишет [`Request`],
-//! процесс отвечает одним [`Response`] на каждый запрос, по порядку. Файл передаётся в base64
-//! внутри JSON (кадр самодостаточен и читается одним `from_slice`). Пустой ввод (EOF на границе
-//! кадра) — штатное завершение процесса. Тело длиннее предела стороны — ошибка кадра, процесс
-//! перезапускается.
+//! Кадр — длина тела `u32` big-endian, номер запроса `u64` big-endian и тело JSON
+//! (`serde_json`). Родитель пишет [`Request`], процесс отвечает одним [`Response`] с тем же
+//! номером. Ответ с чужим номером (лишний кадр) — нарушение протокола: процесс убивается.
+//! Файл передаётся в base64 внутри JSON (кадр читается одним `from_slice`). Пустой ввод (EOF на
+//! границе кадра) — штатное завершение процесса. Тело длиннее предела стороны — ошибка кадра,
+//! процесс перезапускается.
 //!
-//! Тестовые запросы (`Crash`, `Sleep`, `Alloc`) есть только в сборке с фичей `test-hooks`.
+//! Тестовые запросы (`Crash`, `Sleep`, `Alloc`, `Spam`, `LongError`) есть только в сборке с
+//! фичей `test-hooks`.
 
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
@@ -14,21 +16,22 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 use zam_docs::{DocError, DocKind, Extracted, Limits, Locator, Unit};
 
-/// Записывает кадр: длина `u32` BE и тело.
-pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
+/// Записывает кадр: длина тела `u32` BE, номер `id` `u64` BE и тело.
+pub fn write_frame(w: &mut impl Write, id: u64, body: &[u8]) -> io::Result<()> {
     let len = u32::try_from(body.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "кадр больше 4 ГиБ"))?;
     w.write_all(&len.to_be_bytes())?;
+    w.write_all(&id.to_be_bytes())?;
     w.write_all(body)?;
     w.flush()
 }
 
-/// Читает кадр не длиннее `max` байт; `Ok(None)` — EOF до начала кадра.
-pub fn read_frame(r: &mut impl Read, max: usize) -> io::Result<Option<Vec<u8>>> {
-    let mut len = [0u8; 4];
+/// Читает кадр с телом не длиннее `max` байт; `Ok(None)` — EOF до начала кадра.
+pub fn read_frame(r: &mut impl Read, max: usize) -> io::Result<Option<(u64, Vec<u8>)>> {
+    let mut head = [0u8; 12];
     let mut got = 0;
-    while got < 4 {
-        match r.read(&mut len[got..]) {
+    while got < head.len() {
+        match r.read(&mut head[got..]) {
             Ok(0) if got == 0 => return Ok(None),
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => got += n,
@@ -36,7 +39,8 @@ pub fn read_frame(r: &mut impl Read, max: usize) -> io::Result<Option<Vec<u8>>> 
             Err(e) => return Err(e),
         }
     }
-    let len = u32::from_be_bytes(len) as usize;
+    let len = u32::from_be_bytes(head[..4].try_into().expect("4 байта")) as usize;
+    let id = u64::from_be_bytes(head[4..].try_into().expect("8 байт"));
     if len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -50,7 +54,7 @@ pub fn read_frame(r: &mut impl Read, max: usize) -> io::Result<Option<Vec<u8>>> 
     if body.len() != len {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(Some(body))
+    Ok(Some((id, body)))
 }
 
 /// Предел кадра запроса для файла не больше `max_bytes`: base64 (4/3) и 64 КиБ на поля.
@@ -157,6 +161,12 @@ pub enum Request<'a> {
     /// Тест: выделение и запись `mb` МиБ (выше лимита памяти — OOM).
     #[cfg(feature = "test-hooks")]
     Alloc { mb: u64 },
+    /// Тест: ответ `done`, затем `frames` лишних кадров `pong` по `mb` МиБ.
+    #[cfg(feature = "test-hooks")]
+    Spam { frames: u32, mb: u64 },
+    /// Тест: ответ `error unsupported` с причиной в `kb` КиБ.
+    #[cfg(feature = "test-hooks")]
+    LongError { kb: u64 },
 }
 
 /// Ошибка разбора в ответе.
@@ -300,19 +310,22 @@ mod tests {
     #[test]
     fn frames_roundtrip_and_limits() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, b"{\"op\":\"ping\"}").unwrap();
-        write_frame(&mut buf, b"").unwrap();
+        write_frame(&mut buf, 7, b"{\"op\":\"ping\"}").unwrap();
+        write_frame(&mut buf, u64::MAX, b"").unwrap();
         let mut r = &buf[..];
         assert_eq!(
             read_frame(&mut r, 64).unwrap().unwrap(),
-            b"{\"op\":\"ping\"}"
+            (7, b"{\"op\":\"ping\"}".to_vec())
         );
-        assert_eq!(read_frame(&mut r, 64).unwrap().unwrap(), b"");
+        assert_eq!(
+            read_frame(&mut r, 64).unwrap().unwrap(),
+            (u64::MAX, Vec::new())
+        );
         assert!(read_frame(&mut r, 64).unwrap().is_none());
         // длиннее предела и оборванный кадр — ошибки
         assert!(read_frame(&mut &buf[..], 4).is_err());
+        assert!(read_frame(&mut &buf[..14], 64).is_err());
         assert!(read_frame(&mut &buf[..6], 64).is_err());
-        assert!(read_frame(&mut &buf[..2], 64).is_err());
     }
 
     #[test]

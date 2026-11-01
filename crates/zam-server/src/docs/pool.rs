@@ -3,22 +3,29 @@
 //! - `docs.workers` долгоживущих потоков-«слотов»; каждый запускает свой процесс по требованию,
 //!   отдаёт ему задания по одному и перезапускает после `docs.worker_jobs` заданий или падения.
 //!   Процесс запускается из потока слота: на Linux `PDEATHSIG` привязан к потоку-родителю.
+//!   Очередь заданий ограничена (`2 × workers`): `submit` ждёт места, `Bytes` не копятся.
 //! - Привязка к серверу и лимит памяти: Windows — свой Job Object на процесс
 //!   (`KILL_ON_JOB_CLOSE`, `JOB_OBJECT_LIMIT_PROCESS_MEMORY`); Linux — `PDEATHSIG` (`SIGKILL`),
 //!   `RLIMIT_AS` и своя группа процессов. Секреты сервера в окружение процесса не попадают.
-//! - Срок `docs.timeout_ms`: по истечении процесс убивается — [`ParseFailure::Timeout`]; внутри
-//!   процесса разбор получает срок на 10 % короче и отдаёт частичный результат сам.
+//! - Обмен: запрос пишет поток записи процесса, stdout читается **только под ожидающий запрос**
+//!   (разрешение на один кадр): процесс, пишущий кадры без запроса, упирается в канал, память
+//!   сервера не растёт. Кадр с чужим номером — нарушение протокола: процесс убивается, задание
+//!   повторяется один раз на новом процессе.
+//! - Срок `docs.timeout_ms` отсчитывается до отправки запроса (запись тоже под сроком): по
+//!   истечении процесс убивается — [`ParseFailure::Timeout`]; внутри процесса разбор получает
+//!   срок на 20 % короче и отдаёт частичный результат сам.
 //! - Падение — [`ParseFailure::Crash`]; нехватка памяти — [`ParseFailure::Oom`] по признакам:
 //!   сообщение аллокатора Rust или C++ в stderr; Windows — код `0xE0000008` (OOM pdfium) или пик
 //!   памяти процесса у лимита; Linux — пик `VmPeak` у лимита или `SIGKILL` не от пула (OOM killer).
-//! - stderr процесса (JSON-журнал) пересылается в журнал сервера с `component = "doc-worker"`.
+//! - stderr процесса (JSON-журнал) пересылается в журнал сервера с `component = "doc-worker"`, не
+//!   больше [`LOG_BURST`] строк за [`LOG_WINDOW`]; пропущенные считаются и сообщаются итогом.
 
 use std::borrow::Cow;
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,6 +39,13 @@ use super::protocol::{
     write_frame,
 };
 use crate::config::DocsSection;
+
+/// Предел причины от процесса (`pong.pdfium`, `error.message`), байт.
+pub const REASON_MAX: usize = 4096;
+/// Строк stderr процесса в журнал сервера — не больше стольких за [`LOG_WINDOW`].
+pub const LOG_BURST: u32 = 200;
+/// Окно ограничения частоты журнала процесса.
+pub const LOG_WINDOW: Duration = Duration::from_secs(10);
 
 /// Сбой разбора в рабочем процессе; [`ParseFailure::reason`] — причина для `index_state`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -73,6 +87,10 @@ pub enum TestOp {
     Sleep(u64),
     /// Выделение `mb` МиБ.
     Alloc(u64),
+    /// Ответ, затем `frames` лишних кадров по `mb` МиБ.
+    Spam { frames: u32, mb: u64 },
+    /// Ответ `unsupported` с причиной в `kb` КиБ.
+    LongError(u64),
 }
 
 /// Задание слоту.
@@ -130,7 +148,7 @@ struct Shared {
 
 /// Пул рабочих процессов разбора документов.
 pub struct DocPool {
-    tx: Sender<Job>,
+    tx: tokio::sync::mpsc::Sender<Job>,
     shared: Arc<Shared>,
 }
 
@@ -150,6 +168,19 @@ pub fn resolve_pdfium(cfg: &DocsSection, exe_dir: &Path) -> PathBuf {
         Some(p) => exe_dir.join(p),
         None => exe_dir.join(pdfium_default_name()),
     }
+}
+
+/// Строка не длиннее [`REASON_MAX`] байт (по границе символа, с «…»).
+fn cap_reason(mut s: String) -> String {
+    if s.len() > REASON_MAX {
+        let mut cut = REASON_MAX - '…'.len_utf8();
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+        s.push('…');
+    }
+    s
 }
 
 impl DocPool {
@@ -177,13 +208,14 @@ impl DocPool {
             response_max: response_frame_max(limits.max_chars),
             limits,
         });
+        let workers = cfg.workers.max(1);
         let shared = Arc::new(Shared {
-            pids: Mutex::new(vec![0; cfg.workers]),
+            pids: Mutex::new(vec![0; workers]),
             ..Shared::default()
         });
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Job>(workers * 2);
         let rx = Arc::new(Mutex::new(rx));
-        for slot in 0..cfg.workers {
+        for slot in 0..workers {
             let (rx, settings, shared) = (rx.clone(), settings.clone(), shared.clone());
             // поток живёт, пока жив пул: на Linux его смерть убивает процесс слота (PDEATHSIG)
             let r = std::thread::Builder::new()
@@ -198,8 +230,10 @@ impl DocPool {
 
     async fn submit(&self, op: Op) -> Result<Outcome, ParseFailure> {
         let (reply, rx) = tokio::sync::oneshot::channel();
+        // очередь ограничена: ждём места, а не копим файлы без предела
         self.tx
             .send(Job { op, reply })
+            .await
             .map_err(|_| ParseFailure::Crash)?;
         rx.await.unwrap_or(Err(ParseFailure::Crash))
     }
@@ -208,9 +242,7 @@ impl DocPool {
     pub async fn extract(&self, kind: DocKind, bytes: Bytes) -> Result<Extracted, ParseFailure> {
         match self.submit(Op::Extract { kind, bytes }).await? {
             Outcome::Extracted(x) => Ok(x),
-            _ => Err(ParseFailure::Doc(DocError::Internal(
-                "неожиданный ответ".into(),
-            ))),
+            _ => Err(unexpected()),
         }
     }
 
@@ -230,9 +262,7 @@ impl DocPool {
             .await?
         {
             Outcome::Thumb(png) => Ok(png),
-            _ => Err(ParseFailure::Doc(DocError::Internal(
-                "неожиданный ответ".into(),
-            ))),
+            _ => Err(unexpected()),
         }
     }
 
@@ -240,9 +270,7 @@ impl DocPool {
     pub async fn ping(&self) -> Result<Option<String>, ParseFailure> {
         match self.submit(Op::Ping).await? {
             Outcome::Pong(p) => Ok(p),
-            _ => Err(ParseFailure::Doc(DocError::Internal(
-                "неожиданный ответ".into(),
-            ))),
+            _ => Err(unexpected()),
         }
     }
 
@@ -272,21 +300,31 @@ impl DocPool {
     }
 }
 
+fn unexpected() -> ParseFailure {
+    ParseFailure::Doc(DocError::Internal("неожиданный ответ".into()))
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn slot_loop(slot: usize, rx: &Mutex<Receiver<Job>>, s: &Settings, shared: &Shared) {
+fn slot_loop(
+    slot: usize,
+    rx: &Mutex<tokio::sync::mpsc::Receiver<Job>>,
+    s: &Settings,
+    shared: &Shared,
+) {
     let mut worker: Option<Worker> = None;
+    let mut next_id = 0u64;
     loop {
         let job = {
-            let guard = lock(rx);
-            match guard.recv() {
-                Ok(j) => j,
-                Err(_) => break,
+            let mut guard = lock(rx);
+            match guard.blocking_recv() {
+                Some(j) => j,
+                None => break,
             }
         };
-        let r = run_job(slot, &mut worker, job.op, s, shared);
+        let r = run_job(slot, &mut worker, &mut next_id, job.op, s, shared);
         let _ = job.reply.send(r);
     }
     drop(worker);
@@ -295,7 +333,7 @@ fn slot_loop(slot: usize, rx: &Mutex<Receiver<Job>>, s: &Settings, shared: &Shar
 
 /// Тело кадра запроса и срок разбора внутри процесса.
 fn body_of(op: &Op, s: &Settings) -> Vec<u8> {
-    let soft_ms = (s.timeout.as_millis() as u64).saturating_mul(9) / 10;
+    let soft_ms = (s.timeout.as_millis() as u64).saturating_mul(8) / 10;
     match op {
         Op::Extract { kind, bytes } => request_body(
             &Request::Extract {
@@ -325,15 +363,22 @@ fn body_of(op: &Op, s: &Settings) -> Vec<u8> {
                 TestOp::Crash => Request::Crash,
                 TestOp::Sleep(ms) => Request::Sleep { ms },
                 TestOp::Alloc(mb) => Request::Alloc { mb },
+                TestOp::Spam { frames, mb } => Request::Spam { frames, mb },
+                TestOp::LongError(kb) => Request::LongError { kb },
             },
             None,
         ),
     }
 }
 
+fn clear_pid(shared: &Shared, slot: usize) {
+    lock(&shared.pids)[slot] = 0;
+}
+
 fn run_job(
     slot: usize,
     worker: &mut Option<Worker>,
+    next_id: &mut u64,
     op: Op,
     s: &Settings,
     shared: &Shared,
@@ -343,87 +388,99 @@ fn run_job(
     {
         return Err(ParseFailure::Doc(DocError::TooLarge));
     }
-    let body = body_of(&op, s);
+    let body = Arc::new(body_of(&op, s));
     drop(op);
-    // процесс, умерший между заданиями, заменяется до отправки
-    if worker.as_mut().is_some_and(|w| !w.alive())
-        && let Some(w) = worker.take()
-    {
-        w.finish(true);
-    }
-    if worker.is_none() {
-        match Worker::spawn(s) {
-            Ok(w) => {
-                shared.spawned.fetch_add(1, Ordering::Relaxed);
-                lock(&shared.pids)[slot] = w.pid;
-                *worker = Some(w);
-            }
-            Err(e) => {
-                tracing::error!(component = "doc-worker", "рабочий процесс не запущен: {e}");
-                return Err(ParseFailure::Crash);
-            }
-        }
-    }
-    let w = worker.as_mut().expect("процесс запущен");
-    let deadline = Instant::now() + s.timeout;
-    let got = match w.send(&body) {
-        Ok(()) => {
-            drop(body);
-            w.recv(deadline)
-        }
-        Err(e) => {
-            tracing::warn!(
-                component = "doc-worker",
-                pid = w.pid,
-                "запрос не отправлен: {e}"
-            );
-            Err(Recv::Exited)
-        }
-    };
-    let result = match got {
-        Ok(resp) => {
-            w.jobs += 1;
-            outcome(resp, shared)
-        }
-        Err(Recv::Timeout) => {
-            let w = worker.take().expect("процесс есть");
-            tracing::warn!(
-                component = "doc-worker",
-                pid = w.pid,
-                "срок разбора истёк — процесс убит"
-            );
-            w.kill();
-            lock(&shared.pids)[slot] = 0;
-            return Err(ParseFailure::Timeout);
-        }
-        Err(Recv::Exited) => {
-            let w = worker.take().expect("процесс есть");
-            let f = w.reap();
-            lock(&shared.pids)[slot] = 0;
-            return Err(f);
-        }
-        Err(Recv::Bad(msg)) => {
-            let w = worker.take().expect("процесс есть");
-            tracing::warn!(
-                component = "doc-worker",
-                pid = w.pid,
-                "неверный ответ: {msg}"
-            );
-            w.kill();
-            lock(&shared.pids)[slot] = 0;
-            return Err(ParseFailure::Doc(DocError::Internal(msg)));
-        }
-    };
-    if worker.as_ref().is_some_and(|w| w.jobs >= s.worker_jobs) {
-        if let Some(w) = worker.take() {
+    // нарушение протокола (кадр с чужим номером) — один повтор на новом процессе
+    for attempt in 0..2 {
+        // процесс, умерший между заданиями, заменяется до отправки
+        if worker.as_mut().is_some_and(|w| !w.alive())
+            && let Some(w) = worker.take()
+        {
             w.finish(true);
+            clear_pid(shared, slot);
         }
-        lock(&shared.pids)[slot] = 0;
+        if worker.is_none() {
+            match Worker::spawn(s) {
+                Ok(w) => {
+                    shared.spawned.fetch_add(1, Ordering::Relaxed);
+                    lock(&shared.pids)[slot] = w.pid;
+                    *worker = Some(w);
+                }
+                Err(e) => {
+                    tracing::error!(component = "doc-worker", "рабочий процесс не запущен: {e}");
+                    return Err(ParseFailure::Crash);
+                }
+            }
+        }
+        let w = worker.as_mut().expect("процесс запущен");
+        *next_id += 1;
+        let id = *next_id;
+        // срок — до отправки: запись большого запроса тоже под сроком
+        let deadline = Instant::now() + s.timeout;
+        let got = w.exchange(id, body.clone(), deadline);
+        let result = match got {
+            Ok(resp) => {
+                w.jobs += 1;
+                outcome(resp, shared)
+            }
+            Err(Recv::Timeout) => {
+                let w = worker.take().expect("процесс есть");
+                tracing::warn!(
+                    component = "doc-worker",
+                    pid = w.pid,
+                    "срок разбора истёк — процесс убит"
+                );
+                w.kill();
+                clear_pid(shared, slot);
+                return Err(ParseFailure::Timeout);
+            }
+            Err(Recv::Exited) => {
+                let w = worker.take().expect("процесс есть");
+                let f = w.reap();
+                clear_pid(shared, slot);
+                return Err(f);
+            }
+            Err(Recv::Stale(got)) => {
+                let w = worker.take().expect("процесс есть");
+                tracing::warn!(
+                    component = "doc-worker",
+                    pid = w.pid,
+                    "кадр без запроса (номер {got}, ждали {id}) — процесс убит"
+                );
+                w.kill();
+                clear_pid(shared, slot);
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(ParseFailure::Doc(DocError::Internal(
+                    "нарушение протокола рабочим процессом".into(),
+                )));
+            }
+            Err(Recv::Bad(msg)) => {
+                let w = worker.take().expect("процесс есть");
+                tracing::warn!(
+                    component = "doc-worker",
+                    pid = w.pid,
+                    "неверный ответ: {msg}"
+                );
+                w.kill();
+                clear_pid(shared, slot);
+                return Err(ParseFailure::Doc(DocError::Internal(msg)));
+            }
+        };
+        if worker.as_ref().is_some_and(|w| w.jobs >= s.worker_jobs) {
+            if let Some(w) = worker.take() {
+                w.finish(true);
+            }
+            clear_pid(shared, slot);
+        }
+        return result;
     }
-    result
+    Err(ParseFailure::Crash)
 }
 
-/// Ответ процесса → результат задания; учитывает состояние pdfium.
+/// Ответ процесса → результат задания; учитывает состояние pdfium. Причины от процесса — не
+/// длиннее [`REASON_MAX`].
 fn outcome(resp: Response, shared: &Shared) -> Result<Outcome, ParseFailure> {
     let b64 = base64::engine::general_purpose::STANDARD;
     match resp {
@@ -442,10 +499,12 @@ fn outcome(resp: Response, shared: &Shared) -> Result<Outcome, ParseFailure> {
                 .map_err(|e| ParseFailure::Doc(DocError::Internal(format!("base64: {e}"))))
         }
         Response::Pong { pdfium } => {
+            let pdfium = pdfium.map(cap_reason);
             lock(&shared.pdfium_error).clone_from(&pdfium);
             Ok(Outcome::Pong(pdfium))
         }
-        Response::Error(e) => {
+        Response::Error(mut e) => {
+            e.message = cap_reason(e.message);
             if e.kind == "unsupported" && !e.message.is_empty() {
                 tracing::warn!(component = "doc-worker", "PDF недоступен: {}", e.message);
                 *lock(&shared.pdfium_error) = Some(e.message.clone());
@@ -460,10 +519,23 @@ fn outcome(resp: Response, shared: &Shared) -> Result<Outcome, ParseFailure> {
 /// Итог ожидания ответа.
 enum Recv {
     Timeout,
-    /// Процесс закрыл stdout (завершился или упал).
+    /// Процесс закрыл stdout или stdin (завершился или упал).
     Exited,
+    /// Кадр с чужим номером — лишний кадр без запроса.
+    Stale(u64),
     /// Неверный кадр или JSON.
     Bad(String),
+}
+
+/// События потоков процесса для слота.
+enum Event {
+    Frame(u64, Vec<u8>),
+    /// Запрос не записан (процесс закрыл stdin).
+    WriteFailed(String),
+    /// stdout закрыт.
+    Eof,
+    /// Неверный кадр ответа.
+    BadFrame(String),
 }
 
 /// Признак нехватки памяти в строке stderr: аллокатор Rust (`memory allocation of N bytes
@@ -475,11 +547,57 @@ fn oom_line(line: &str) -> bool {
         || l.contains("out of memory")
 }
 
+/// Ограничение частоты журнала процесса: не больше [`LOG_BURST`] строк за [`LOG_WINDOW`].
+struct RateLimit {
+    start: Instant,
+    used: u32,
+    dropped: u64,
+}
+
+impl RateLimit {
+    fn new() -> Self {
+        RateLimit {
+            start: Instant::now(),
+            used: 0,
+            dropped: 0,
+        }
+    }
+
+    /// `true` — строку можно журналировать; при смене окна сообщает о пропущенных.
+    fn allow(&mut self, pid: u32) -> bool {
+        if self.start.elapsed() >= LOG_WINDOW {
+            self.flush(pid);
+            self.start = Instant::now();
+            self.used = 0;
+        }
+        if self.used < LOG_BURST {
+            self.used += 1;
+            true
+        } else {
+            self.dropped += 1;
+            false
+        }
+    }
+
+    fn flush(&mut self, pid: u32) {
+        if self.dropped > 0 {
+            tracing::warn!(
+                component = "doc-worker",
+                pid,
+                dropped = self.dropped,
+                "журнал рабочего процесса: строки пропущены (ограничение частоты)"
+            );
+            self.dropped = 0;
+        }
+    }
+}
+
 /// Пересылает stderr процесса в журнал сервера построчно (строка — не длиннее 16 КиБ).
 fn forward_stderr(r: impl std::io::Read, pid: u32, oom: &AtomicBool) {
     const LINE_MAX: u64 = 16 * 1024;
     let mut reader = BufReader::new(r);
     let mut buf = Vec::with_capacity(512);
+    let mut rate = RateLimit::new();
     loop {
         buf.clear();
         match (&mut reader).take(LINE_MAX).read_until(b'\n', &mut buf) {
@@ -503,8 +621,12 @@ fn forward_stderr(r: impl std::io::Read, pid: u32, oom: &AtomicBool) {
         if line.is_empty() {
             continue;
         }
+        // признак OOM ищется во всех строках, журналируются — в пределах частоты
         if oom_line(line) {
             oom.store(true, Ordering::SeqCst);
+        }
+        if !rate.allow(pid) {
+            continue;
         }
         match zam_index::child::parse_json_line(line) {
             Some(l) => {
@@ -520,14 +642,59 @@ fn forward_stderr(r: impl std::io::Read, pid: u32, oom: &AtomicBool) {
             None => tracing::warn!(component = "doc-worker", pid, "{line}"),
         }
     }
+    rate.flush(pid);
+}
+
+/// Поток записи: запросы `(номер, тело)` в stdin; после записи — разрешение читателю на один
+/// кадр. Ошибка записи — событие слоту.
+fn writer_loop(
+    mut stdin: ChildStdin,
+    jobs: Receiver<(u64, Arc<Vec<u8>>)>,
+    permits: SyncSender<()>,
+    events: SyncSender<Event>,
+) {
+    while let Ok((id, body)) = jobs.recv() {
+        if let Err(e) = write_frame(&mut stdin, id, &body) {
+            let _ = events.send(Event::WriteFailed(e.to_string()));
+            break;
+        }
+        drop(body);
+        if permits.send(()).is_err() {
+            break;
+        }
+    }
+    // stdin закрывается — процесс выходит сам по EOF
+}
+
+/// Поток чтения: один кадр stdout на одно разрешение; без запроса stdout не читается.
+fn reader_loop(
+    stdout: std::process::ChildStdout,
+    max: usize,
+    permits: Receiver<()>,
+    events: SyncSender<Event>,
+) {
+    let mut r = BufReader::with_capacity(64 * 1024, stdout);
+    while permits.recv().is_ok() {
+        let ev = match read_frame(&mut r, max) {
+            Ok(Some((id, f))) => Event::Frame(id, f),
+            Ok(None) => Event::Eof,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Event::Eof,
+            Err(e) => Event::BadFrame(e.to_string()),
+        };
+        let last = !matches!(ev, Event::Frame(..));
+        if events.send(ev).is_err() || last {
+            break;
+        }
+    }
 }
 
 /// Один рабочий процесс.
 struct Worker {
     child: Child,
     pid: u32,
-    stdin: Option<ChildStdin>,
-    frames: Receiver<Result<Vec<u8>, String>>,
+    /// Запросы потоку записи; `None` — закрыт (stdin процесса закрывается).
+    jobs_tx: Option<SyncSender<(u64, Arc<Vec<u8>>)>>,
+    events: Option<Receiver<Event>>,
     threads: Vec<JoinHandle<()>>,
     oom: Arc<AtomicBool>,
     jobs: u32,
@@ -587,47 +754,42 @@ impl Worker {
             return Err(format!("Job Object: {e}"));
         }
         let pid = child.id();
-        let stdin = child.stdin.take();
+        let stdin = child.stdin.take().ok_or("нет stdin")?;
         let stdout = child.stdout.take().ok_or("нет stdout")?;
         let stderr = child.stderr.take().ok_or("нет stderr")?;
-        let (ftx, frames) = mpsc::channel();
-        let max = s.response_max;
+        // каналы на один элемент: ни запросы, ни кадры не копятся
+        let (jobs_tx, jobs_rx) = mpsc::sync_channel(1);
+        let (permit_tx, permit_rx) = mpsc::sync_channel(1);
+        let (ev_tx, events) = mpsc::sync_channel(1);
         let oom = Arc::new(AtomicBool::new(false));
-        let mut threads = Vec::with_capacity(2);
-        let out = std::thread::Builder::new()
-            .name(format!("doc-worker-out-{pid}"))
-            .spawn(move || {
-                let mut r = BufReader::with_capacity(64 * 1024, stdout);
-                loop {
-                    match read_frame(&mut r, max) {
-                        Ok(Some(f)) => {
-                            if ftx.send(Ok(f)).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => {
-                            let _ = ftx.send(Err(e.to_string()));
-                            break;
-                        }
-                    }
-                }
-            })
-            .map_err(|e| e.to_string())?;
-        threads.push(out);
+        let mut threads = Vec::with_capacity(3);
+        let max = s.response_max;
+        let ev2 = ev_tx.clone();
+        let spawn = |name: String, f: Box<dyn FnOnce() + Send>| {
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(f)
+                .map_err(|e| e.to_string())
+        };
+        threads.push(spawn(
+            format!("doc-worker-in-{pid}"),
+            Box::new(move || writer_loop(stdin, jobs_rx, permit_tx, ev_tx)),
+        )?);
+        threads.push(spawn(
+            format!("doc-worker-out-{pid}"),
+            Box::new(move || reader_loop(stdout, max, permit_rx, ev2)),
+        )?);
         let oom2 = oom.clone();
-        let err = std::thread::Builder::new()
-            .name(format!("doc-worker-err-{pid}"))
-            .spawn(move || forward_stderr(stderr, pid, &oom2))
-            .map_err(|e| e.to_string())?;
-        threads.push(err);
+        threads.push(spawn(
+            format!("doc-worker-err-{pid}"),
+            Box::new(move || forward_stderr(stderr, pid, &oom2)),
+        )?);
         tracing::debug!(component = "doc-worker", pid, "рабочий процесс запущен");
         Ok(Worker {
             child,
             pid,
-            stdin,
-            frames,
+            jobs_tx: Some(jobs_tx),
+            events: Some(events),
             threads,
             oom,
             jobs: 0,
@@ -645,39 +807,52 @@ impl Worker {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    fn send(&mut self, body: &[u8]) -> std::io::Result<()> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-        write_frame(stdin, body)
-    }
-
-    #[cfg(unix)]
-    fn sample_memory(&mut self) {
-        if let Some(p) = zam_index::child::vm_peak_bytes(self.pid) {
-            self.vm_peak = self.vm_peak.max(p);
+    /// Отправляет запрос `id` и ждёт ответа с тем же номером до `deadline`.
+    fn exchange(
+        &mut self,
+        id: u64,
+        body: Arc<Vec<u8>>,
+        deadline: Instant,
+    ) -> Result<Response, Recv> {
+        let Some(tx) = &self.jobs_tx else {
+            return Err(Recv::Exited);
+        };
+        // канал на один запрос, предыдущий уже записан: отправка не ждёт
+        if tx.try_send((id, body)).is_err() {
+            return Err(Recv::Exited);
         }
-    }
-
-    #[cfg(windows)]
-    fn sample_memory(&mut self) {}
-
-    fn recv(&mut self, deadline: Instant) -> Result<Response, Recv> {
+        let Some(events) = &self.events else {
+            return Err(Recv::Exited);
+        };
         loop {
             let now = Instant::now();
             if now >= deadline {
                 return Err(Recv::Timeout);
             }
             let step = (deadline - now).min(Duration::from_millis(100));
-            match self.frames.recv_timeout(step) {
-                Ok(Ok(frame)) => {
+            match events.recv_timeout(step) {
+                Ok(Event::Frame(got, _)) if got != id => return Err(Recv::Stale(got)),
+                Ok(Event::Frame(_, frame)) => {
                     return serde_json::from_slice(&frame)
                         .map_err(|e| Recv::Bad(format!("ответ: {e}")));
                 }
-                Ok(Err(e)) => return Err(Recv::Bad(e)),
-                Err(RecvTimeoutError::Timeout) => self.sample_memory(),
-                Err(RecvTimeoutError::Disconnected) => return Err(Recv::Exited),
+                Ok(Event::BadFrame(e)) => return Err(Recv::Bad(e)),
+                Ok(Event::WriteFailed(e)) => {
+                    tracing::warn!(
+                        component = "doc-worker",
+                        pid = self.pid,
+                        "запрос не отправлен: {e}"
+                    );
+                    return Err(Recv::Exited);
+                }
+                Ok(Event::Eof) | Err(RecvTimeoutError::Disconnected) => return Err(Recv::Exited),
+                Err(RecvTimeoutError::Timeout) => {
+                    // Linux: пик адресного пространства для признака OOM
+                    #[cfg(unix)]
+                    if let Some(p) = zam_index::child::vm_peak_bytes(self.pid) {
+                        self.vm_peak = self.vm_peak.max(p);
+                    }
+                }
             }
         }
     }
@@ -701,13 +876,20 @@ impl Worker {
         let _ = self.child.kill();
     }
 
+    /// Закрывает каналы потоков: поток записи закрывает stdin, читатель и запись не ждут слота.
+    fn close_channels(&mut self) {
+        self.jobs_tx.take();
+        self.events.take();
+    }
+
     /// Закрывает процесс: `graceful` — закрыть stdin и дать выйти самому (2 с), затем убить.
     fn close(&mut self, graceful: bool) -> Option<ExitStatus> {
         if self.done {
             return None;
         }
         self.done = true;
-        self.stdin.take();
+        // сначала каналы (потоки не застрянут на отправке слоту), затем процесс, затем join
+        self.close_channels();
         let mut st = if graceful {
             self.wait_for(Duration::from_secs(2))
         } else {
@@ -728,14 +910,14 @@ impl Worker {
         let _ = self.close(graceful);
     }
 
-    /// Убивает процесс (срок, неверный ответ).
+    /// Убивает процесс (срок, неверный ответ, нарушение протокола).
     fn kill(mut self) {
         let _ = self.close(false);
     }
 
     /// Процесс закрыл stdout посреди задания: дожидается выхода и определяет причину.
     fn reap(mut self) -> ParseFailure {
-        self.stdin.take();
+        self.close_channels();
         let st = self.wait_for(Duration::from_secs(5));
         let st = st.or_else(|| self.close(false));
         // stderr дочитан до конца: признак OOM из последних строк учтён
@@ -776,14 +958,10 @@ impl Worker {
     #[cfg(unix)]
     fn oom_by_status(&self, st: Option<ExitStatus>) -> bool {
         use std::os::unix::process::ExitStatusExt as _;
-        let sigkill = st.and_then(|s| s.signal()) == Some(SIGKILL);
+        let sigkill = st.and_then(|s| s.signal()) == Some(libc::SIGKILL);
         self.near_limit(self.vm_peak) || (sigkill && !self.killed)
     }
 }
-
-/// Номер `SIGKILL` (Linux, POSIX).
-#[cfg(unix)]
-const SIGKILL: i32 = 9;
 
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -818,5 +996,24 @@ mod tests {
         let abs = std::env::current_dir().unwrap().join("p.dll");
         cfg.pdfium_dylib = Some(abs.clone());
         assert_eq!(resolve_pdfium(&cfg, dir), abs);
+    }
+
+    #[test]
+    fn reasons_capped() {
+        assert_eq!(cap_reason("кратко".into()), "кратко");
+        let long = cap_reason("я".repeat(10_000));
+        assert!(
+            long.len() <= REASON_MAX && long.ends_with('…'),
+            "{}",
+            long.len()
+        );
+    }
+
+    #[test]
+    fn rate_limit_counts_dropped() {
+        let mut r = RateLimit::new();
+        let allowed = (0..LOG_BURST + 50).filter(|_| r.allow(1)).count();
+        assert_eq!(allowed, LOG_BURST as usize);
+        assert_eq!(r.dropped, 50);
     }
 }

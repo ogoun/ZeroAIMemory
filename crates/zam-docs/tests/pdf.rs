@@ -226,3 +226,39 @@ fn pdf_thumb_png() {
         Err(DocError::Malformed(_))
     ));
 }
+
+#[test]
+fn pdf_xycut_staircase_within_soft_deadline() {
+    // ревью задачи 3 (I-2): лестница из 130 тыс. полос на странице 210000×210000 пт (как
+    // `xycut_staircase` из генератора ревью) — частичный или полный результат в пределах срока,
+    // а не убийство процесса по жёсткому сроку
+    let Some(lib) = lib() else { return };
+    let mut p = Page {
+        media: Some((210_000.0, 210_000.0)),
+        ..Page::default()
+    };
+    for k in 0..130_000 {
+        let (x, y) = (k as f32 * 0.05, 200_000.0 - k as f32 * 1.5);
+        for (dx, t) in [(0.0, "a"), (100.0, "b")] {
+            p.lines.push(zam_docs::test_pdf::Line {
+                x: x + dx,
+                y,
+                size: 1.0,
+                text: t.into(),
+            });
+        }
+    }
+    let pdf = build(&[p]);
+    let soft = Duration::from_secs(30);
+    let t = Instant::now();
+    let x = extract_pdf(lib, &pdf, &Limits::default(), t + soft).unwrap();
+    let took = t.elapsed();
+    let chars: usize = x
+        .units
+        .iter()
+        .map(|u| u.text.matches(['a', 'b']).count())
+        .sum();
+    eprintln!("лестница PDF: {took:?}, символов {chars}, {:?}", x.warnings);
+    assert!(took < soft + Duration::from_secs(5), "{took:?}");
+    assert!(chars > 0, "частичный результат не потерян");
+}

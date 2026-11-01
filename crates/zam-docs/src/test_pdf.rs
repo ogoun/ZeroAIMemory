@@ -15,6 +15,8 @@ pub struct Line {
 pub struct Page {
     pub lines: Vec<Line>,
     pub image: bool,
+    /// Размер страницы, пунктов; `None` — US Letter.
+    pub media: Option<(f32, f32)>,
 }
 
 impl Page {
@@ -85,9 +87,11 @@ pub fn build(pages: &[Page]) -> Vec<u8> {
         }
         objs.push(
             format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] /Resources << \
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Resources << \
 /Font << /F1 3 0 R >> /XObject << /Im1 4 0 R >> >> /Contents {} 0 R >>",
-                6 + 2 * i
+                6 + 2 * i,
+                w = p.media.map_or(PAGE_W, |m| m.0),
+                h = p.media.map_or(PAGE_H, |m| m.1),
             )
             .into_bytes(),
         );

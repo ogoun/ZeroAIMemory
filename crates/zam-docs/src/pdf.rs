@@ -69,6 +69,8 @@ pub fn extract_pdf(
     let mut pending = 0u64;
     let mut collected: Vec<(u32, PageText)> = Vec::new();
     let mut ocr_needed = false;
+    // нечитаемые страницы — одним предупреждением в конце, а не тысячами
+    let mut skipped = 0u32;
     for i in 0..take {
         if Instant::now() >= deadline {
             ctx.stop("timeout_ms");
@@ -77,7 +79,7 @@ pub fn extract_pdf(
         let page = match pages.get(i as i32) {
             Ok(p) => p,
             Err(_) => {
-                ctx.warn(format!("skipped: page {}", i + 1));
+                skipped += 1;
                 continue;
             }
         };
@@ -104,10 +106,13 @@ pub fn extract_pdf(
         drop(glyphs);
         let mut text = pdf_layout::join_rows(&rows, bottom, top);
         drop(rows);
-        // учёт в `max_chars`: обрезка — по остатку, разбор останавливается
-        let mut kept = String::new();
-        ctx.append(&mut kept, &text.text, &mut pending);
-        if kept.len() < text.text.len() {
+        // учёт в `max_chars`: умещается — без копии; иначе обрезка по остатку и остановка
+        let n = text.text.chars().count() as u64;
+        if n <= limits.max_chars.saturating_sub(pending) {
+            pending += n;
+        } else {
+            let mut kept = String::new();
+            ctx.append(&mut kept, &text.text, &mut pending);
             text.edges.retain(|(r, _)| r.end <= kept.len());
             text.text = kept;
         }
@@ -118,6 +123,9 @@ pub fn extract_pdf(
             }
             break;
         }
+    }
+    if skipped > 0 {
+        ctx.warn(format!("skipped: {skipped} pages"));
     }
     let repeated = pdf_layout::repeated_edges(collected.iter().map(|(_, p)| p), take as usize);
     let mut units = Units::default();
