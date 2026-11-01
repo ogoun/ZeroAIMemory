@@ -59,6 +59,37 @@ pub fn sniff(bytes: &[u8], name: &str) -> Option<DocKind> {
     if is_text { text_kind } else { None }
 }
 
+/// Вид изображения для миниатюры (превью, задача 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+/// Вид изображения только по сигнатуре начала файла (расширение и MIME не учитываются; SVG —
+/// не изображение: это документ со скриптами).
+pub fn sniff_image(head: &[u8]) -> Option<ImageKind> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageKind::Png)
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(ImageKind::Jpeg)
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some(ImageKind::Gif)
+    } else if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+        Some(ImageKind::Webp)
+    } else {
+        None
+    }
+}
+
+/// Похоже ли начало файла на текст: UTF-8 (с BOM или без) без нулевых байтов в первых 64 КиБ;
+/// обрезанный посреди символа хвост окна допускается.
+pub fn is_text(head: &[u8]) -> bool {
+    looks_text(head)
+}
+
 /// Текст: UTF-8 (с BOM или без) без нулевых байтов в начале файла.
 fn looks_text(bytes: &[u8]) -> bool {
     let b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);

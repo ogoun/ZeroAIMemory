@@ -113,6 +113,11 @@ impl DataDir {
         self.root.join("blobs")
     }
 
+    /// Производные вложений (кэш превью, можно удалить): `<data_dir>/previews/<user_id>/<sha256>/…`.
+    pub fn previews_dir(&self) -> PathBuf {
+        self.root.join("previews")
+    }
+
     pub fn logs(&self) -> PathBuf {
         self.root.join("logs")
     }

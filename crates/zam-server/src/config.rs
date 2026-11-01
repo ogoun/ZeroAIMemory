@@ -761,6 +761,12 @@ pub struct DocsSection {
     pub worker_memory_mb: u64,
     /// Срок разбора файла, мс (100..=3600000, 60000); по истечении процесс убивается.
     pub timeout_ms: u64,
+    /// Рабочих процессов превью (1..=16, 1): свой пул, чтобы долгий разбор индексации не
+    /// задерживал первый экран листа (ТЗ §17); лимиты памяти и срок — те же.
+    pub preview_workers: usize,
+    /// Предел кэша превью `previews/`, МиБ (1..=1048576, 1024): сверх него старые файлы
+    /// вытесняются.
+    pub preview_cache_mb: u64,
     /// Размер файла, байт (100 МиБ); больше — отказ.
     pub max_bytes: u64,
     /// Распакованный объём zip, байт (500 МиБ).
@@ -793,6 +799,8 @@ impl Default for DocsSection {
             worker_jobs: 200,
             worker_memory_mb: 2048,
             timeout_ms: 60_000,
+            preview_workers: 1,
+            preview_cache_mb: 1024,
             max_bytes: l.max_bytes,
             max_unpacked: l.max_unpacked,
             max_ratio: l.max_ratio,
@@ -840,6 +848,12 @@ impl DocsSection {
         }
         if !(100..=3_600_000).contains(&self.timeout_ms) {
             return Err(bad("timeout_ms", "от 100 до 3600000"));
+        }
+        if !(1..=16).contains(&self.preview_workers) {
+            return Err(bad("preview_workers", "от 1 до 16"));
+        }
+        if !(1..=1_048_576).contains(&self.preview_cache_mb) {
+            return Err(bad("preview_cache_mb", "от 1 до 1048576"));
         }
         for (k, v) in [
             ("max_bytes", self.max_bytes),
@@ -2084,6 +2098,7 @@ master_key = \"x\"
             (2, 200, 2048)
         );
         assert_eq!(d.timeout_ms, 60_000);
+        assert_eq!((d.preview_workers, d.preview_cache_mb), (1, 1024));
         assert_eq!(d.limits(), zam_docs::Limits::default());
         // 3 × 100 МиБ + 64 МиБ = 364 МиБ > 256
         let e = load(
@@ -2104,5 +2119,17 @@ master_key = \"x\"
         assert!(load(None, &ok, &Default::default()).is_ok());
         let e = load(None, &[env("ZAM_DOCS__WORKERS", "0")], &Default::default());
         assert!(e.unwrap_err().to_string().contains("docs.workers"));
+        let e = load(
+            None,
+            &[env("ZAM_DOCS__PREVIEW_WORKERS", "17")],
+            &Default::default(),
+        );
+        assert!(e.unwrap_err().to_string().contains("docs.preview_workers"));
+        let e = load(
+            None,
+            &[env("ZAM_DOCS__PREVIEW_CACHE_MB", "0")],
+            &Default::default(),
+        );
+        assert!(e.unwrap_err().to_string().contains("docs.preview_cache_mb"));
     }
 }

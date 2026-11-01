@@ -42,16 +42,17 @@ pub use attachments::{
     AttachmentDoc, BLOB_MISSING, CHUNK_REF_LETTER, CHUNKER_ATTACHMENTS_KEY, CachedExtract,
     DocChunkHead, DocFound, DocIntake, DocLookup, ExtractEnd, ExtractState, ExtractTarget,
     PDFIUM_UNAVAILABLE, ReindexAttachment, TOO_LARGE, attachment_chunk_owner,
-    attachment_chunker_fingerprint, attachment_chunks_for_index, attachment_pieces, cached_extract,
-    chunk_ref, detach, doc_chunk_heads, doc_chunk_texts, doc_sheet_locators,
-    enqueue_attachment_upserts, ensure_extract_jobs, error_code, extract_cached, extract_target,
-    find_docs, finish_extract, has_attachment_chunks, has_failed_with, list_attachments,
-    put_extract, put_extract_failure, rechunk_docs_if_stale, reindex_attachments_page,
-    reindex_docs, replace_attachment_chunks, requeue_failed_with, set_extract_state,
+    attachment_chunker_fingerprint, attachment_chunks_for_index, attachment_pieces,
+    blob_sheet_locators, cached_extract, chunk_ref, detach, doc_chunk_heads, doc_chunk_texts,
+    doc_sheet_locators, enqueue_attachment_upserts, ensure_extract_jobs, error_code,
+    extract_cached, extract_target, find_docs, finish_extract, has_attachment_chunks,
+    has_failed_with, list_attachments, put_extract, put_extract_failure, rechunk_docs_if_stale,
+    reindex_attachments_page, reindex_docs, replace_attachment_chunks, requeue_failed_with,
+    set_extract_state,
 };
 pub use blobs::{
-    AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_in_space,
-    resolve_attachment,
+    AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_by_sha,
+    blob_meta_by_sha_in_space, blob_meta_in_space, resolve_attachment,
 };
 pub use cache::{
     CACHE_LOOKUP_MAX, CACHE_QUERY_MAX_CHARS, CACHE_SOURCES_MAX, CacheDep, CacheEntry, CacheError,

@@ -37,8 +37,8 @@ use base64::Engine as _;
 use zam_docs::{DocError, DocKind, Extracted, Limits};
 
 use super::protocol::{
-    Request, Response, WireLimits, read_frame, request_body, request_frame_max, response_frame_max,
-    write_frame,
+    Request, Response, WireHtml, WireLimits, WireSheetPage, read_frame, request_body,
+    request_frame_max, response_frame_max, write_frame,
 };
 use crate::config::DocsSection;
 
@@ -107,6 +107,22 @@ enum Op {
         page: u32,
         max_px: u32,
     },
+    Sheet {
+        kind: DocKind,
+        bytes: Bytes,
+        no: u32,
+        from: u32,
+        rows: u32,
+    },
+    Image {
+        bytes: Bytes,
+        max_px: u32,
+    },
+    Highlight {
+        bytes: Bytes,
+        name: String,
+        truncated: bool,
+    },
     Ping,
     #[cfg(feature = "test-hooks")]
     Test(TestOp),
@@ -116,6 +132,9 @@ enum Op {
 enum Outcome {
     Extracted(Extracted),
     Thumb(Vec<u8>),
+    Sheet(WireSheetPage),
+    Image(Vec<u8>),
+    Html(WireHtml),
     Pong(Option<String>),
     #[cfg(feature = "test-hooks")]
     Done,
@@ -269,6 +288,59 @@ impl DocPool {
         }
     }
 
+    /// Страница листа `no` (с 1, порядок книги) таблицы `kind`: `rows` строк со строки `from`
+    /// (превью, задача 8). Срок разбора внутри процесса — как у извлечения.
+    pub async fn sheet_page(
+        &self,
+        kind: DocKind,
+        bytes: Bytes,
+        no: u32,
+        from: u32,
+        rows: u32,
+    ) -> Result<WireSheetPage, ParseFailure> {
+        match self
+            .submit(Op::Sheet {
+                kind,
+                bytes,
+                no,
+                from,
+                rows,
+            })
+            .await?
+        {
+            Outcome::Sheet(p) => Ok(p),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Миниатюра изображения (PNG, JPEG, GIF, WebP) в PNG (превью, задача 8).
+    pub async fn image_thumb(&self, bytes: Bytes, max_px: u32) -> Result<Vec<u8>, ParseFailure> {
+        match self.submit(Op::Image { bytes, max_px }).await? {
+            Outcome::Image(png) => Ok(png),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// HTML syntect начала файла `name` (превью, задача 8); `truncated` — файл длиннее `bytes`.
+    pub async fn highlight(
+        &self,
+        bytes: Bytes,
+        name: String,
+        truncated: bool,
+    ) -> Result<WireHtml, ParseFailure> {
+        match self
+            .submit(Op::Highlight {
+                bytes,
+                name,
+                truncated,
+            })
+            .await?
+        {
+            Outcome::Html(h) => Ok(h),
+            _ => Err(unexpected()),
+        }
+    }
+
     /// Проверка процесса и pdfium: `Ok(None)` — pdfium загружен, `Ok(Some(причина))` — нет.
     pub async fn ping(&self) -> Result<Option<String>, ParseFailure> {
         match self.submit(Op::Ping).await? {
@@ -359,6 +431,43 @@ fn body_of(op: &Op, s: &Settings) -> Vec<u8> {
             },
             Some(bytes),
         ),
+        Op::Sheet {
+            kind,
+            bytes,
+            no,
+            from,
+            rows,
+        } => request_body(
+            &Request::Sheet {
+                kind: kind.as_str().into(),
+                no: *no,
+                from: *from,
+                rows: *rows,
+                limits: WireLimits::from(&s.limits),
+                soft_ms,
+                bytes: Cow::Borrowed(""),
+            },
+            Some(bytes),
+        ),
+        Op::Image { bytes, max_px } => request_body(
+            &Request::Image {
+                max_px: *max_px,
+                bytes: Cow::Borrowed(""),
+            },
+            Some(bytes),
+        ),
+        Op::Highlight {
+            bytes,
+            name,
+            truncated,
+        } => request_body(
+            &Request::Highlight {
+                name: name.clone(),
+                truncated: *truncated,
+                bytes: Cow::Borrowed(""),
+            },
+            Some(bytes),
+        ),
         Op::Ping => request_body(&Request::Ping, None),
         #[cfg(feature = "test-hooks")]
         Op::Test(t) => request_body(
@@ -386,7 +495,11 @@ fn run_job(
     s: &Settings,
     shared: &Shared,
 ) -> Result<Outcome, ParseFailure> {
-    if let Op::Extract { bytes, .. } | Op::Thumb { bytes, .. } = &op
+    if let Op::Extract { bytes, .. }
+    | Op::Thumb { bytes, .. }
+    | Op::Sheet { bytes, .. }
+    | Op::Image { bytes, .. }
+    | Op::Highlight { bytes, .. } = &op
         && bytes.len() as u64 > s.limits.max_bytes
     {
         return Err(ParseFailure::Doc(DocError::TooLarge));
@@ -503,6 +616,12 @@ fn outcome(resp: Response, shared: &Shared) -> Result<Outcome, ParseFailure> {
                 .map(Outcome::Thumb)
                 .map_err(|e| ParseFailure::Doc(DocError::Internal(format!("base64: {e}"))))
         }
+        Response::Sheet(p) => Ok(Outcome::Sheet(p)),
+        Response::Image { png } => b64
+            .decode(png)
+            .map(Outcome::Image)
+            .map_err(|e| ParseFailure::Doc(DocError::Internal(format!("base64: {e}")))),
+        Response::Html(h) => Ok(Outcome::Html(h)),
         Response::Pong { pdfium } => {
             let pdfium = pdfium.map(cap_reason);
             lock(&shared.pdfium_error).clone_from(&pdfium);

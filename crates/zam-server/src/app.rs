@@ -44,6 +44,8 @@ pub struct AppState {
     pub index: Arc<IndexRuntime>,
     /// Конвейер индексации вложений (M5): разбор в рабочих процессах, чанки, задания точек.
     pub docs: Arc<crate::docs::DocIndexer>,
+    /// Превью вложений (M5): свой пул рабочих процессов и кэш `previews/`.
+    pub previews: Arc<crate::docs::Previews>,
     /// Реранкер `rerank=on` (загружается при первом таком запросе).
     pub rerank: Arc<RerankSlot>,
     /// Ключи Vault (§7.6): мастер-ключ, ключи пользователей, состояние блокировки.
@@ -279,6 +281,10 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         users.clone(),
         data_dir.blobs_dir(),
     ));
+    let previews = Arc::new(crate::docs::Previews::new(
+        &cfg.docs,
+        data_dir.previews_dir(),
+    ));
     let rerank = Arc::new(RerankSlot::new(&cfg));
     let maintenance = Arc::new(Maintenance::start(
         system.clone(),
@@ -291,6 +297,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         users,
         index,
         docs,
+        previews,
         rerank,
         vault,
         data_dir,

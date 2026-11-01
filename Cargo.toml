@@ -53,6 +53,13 @@ encoding_rs = "=0.8.42"
 # библиотеке — только динамическая (libloading), без `static`/`bindings`, без `image`
 pdfium-render = { version = "=0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 flate2 = "1"
+# M5: миниатюры изображений (zam-docs, фича `images`; только рабочий процесс doc-worker) —
+# MIT OR Apache-2.0, чистый Rust; 0.25.10 выпущена 2026-03-10 (последняя 0.25 на 2026-11-01).
+# Только PNG, JPEG (zune-jpeg), GIF, WebP — без AVIF/HEIC (C, патенты; ТЗ §5), без rayon
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# M5: SIMD-ресайз миниатюр — MIT OR Apache-2.0, чистый Rust; 6.1.0 выпущена 2026-07-21;
+# фича `image` — представление `DynamicImage` без копии, без rayon
+fast_image_resize = { version = "=6.1.0", default-features = false, features = ["std", "image"] }
 tar = { version = "0.4", default-features = false }
 # M2: tar.xz redist-архивов NVIDIA для Linux (`zam-server cuda fetch`): чистый Rust, без C liblzma;
 # та же версия, что у zip 9 (фичи lzma/xz); только декодер

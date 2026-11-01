@@ -6,8 +6,12 @@
 //! - pdfium загружается лениво, при первом PDF, миниатюре или `Ping`; ошибка загрузки — ответ
 //!   `unsupported` с причиной;
 //! - паника разбора — ответ `internal` и выход процесса: состояние pdfium после неё не
-//!   доверяется, следующий запрос получит новый процесс.
+//!   доверяется, следующий запрос получит новый процесс;
+//! - превью (задача 8) — тоже здесь: страница листа, миниатюра изображения, подсветка syntect
+//!   (регулярные выражения `fancy-regex` с возвратами) — файл недоверенный, срок и память —
+//!   процесса.
 
+use std::borrow::Cow;
 use std::io::{self, BufReader, BufWriter};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -18,7 +22,8 @@ use zam_docs::pdf::Pdfium;
 use zam_docs::{DocError, DocKind, Limits};
 
 use super::protocol::{
-    Request, Response, WireError, WireExtracted, parse_kind, read_frame, write_frame,
+    Request, Response, WireError, WireExtracted, WireHtml, WireSheetPage, parse_kind, read_frame,
+    write_frame,
 };
 
 /// Коды выхода рабочего процесса.
@@ -143,6 +148,21 @@ fn decode(b64: &str) -> Result<Vec<u8>, DocError> {
         .map_err(|e| DocError::Internal(format!("base64: {e}")))
 }
 
+/// Текст файла для подсветки: BOM снимается, нулевой байт — двоичный файл (`None`); у обрезанного
+/// начала файла (`truncated`) неполный последний символ отбрасывается; неверный UTF-8 — с заменой
+/// на U+FFFD, как у извлечения текста (`zam_docs`, вид `text`).
+fn source_text(bytes: &[u8], truncated: bool) -> Option<Cow<'_, str>> {
+    let b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if b.contains(&0) {
+        return None;
+    }
+    let b = match std::str::from_utf8(b) {
+        Err(e) if truncated && e.error_len().is_none() => &b[..e.valid_up_to()],
+        _ => b,
+    };
+    Some(String::from_utf8_lossy(b))
+}
+
 fn handle(body: &[u8], st: &mut State) -> Reply {
     #[cfg(feature = "test-hooks")]
     if let Ok(Request::Spam { frames, mb }) = serde_json::from_slice::<Request<'_>>(body) {
@@ -216,6 +236,57 @@ fn respond(body: &[u8], st: &mut State) -> Response {
                     png: base64::engine::general_purpose::STANDARD.encode(png),
                 },
                 Err(e) => error(e),
+            }
+        }
+        Request::Sheet {
+            kind,
+            no,
+            from,
+            rows,
+            limits,
+            soft_ms,
+            bytes,
+        } => {
+            let Some(kind) = parse_kind(&kind) else {
+                return error(DocError::Unsupported);
+            };
+            let bytes = match decode(&bytes) {
+                Ok(b) => b,
+                Err(e) => return error(e),
+            };
+            let deadline = Instant::now() + Duration::from_millis(soft_ms);
+            let limits = Limits::from(&limits);
+            match zam_docs::sheet_page_no(kind, &bytes, no, from, rows, &limits, deadline) {
+                Ok(p) => Response::Sheet(WireSheetPage::from(p)),
+                Err(e) => error(e),
+            }
+        }
+        Request::Image { max_px, bytes } => {
+            let bytes = match decode(&bytes) {
+                Ok(b) => b,
+                Err(e) => return error(e),
+            };
+            match zam_docs::thumb::image_thumb(&bytes, max_px) {
+                Ok(png) => Response::Image {
+                    png: base64::engine::general_purpose::STANDARD.encode(png),
+                },
+                Err(e) => error(e),
+            }
+        }
+        Request::Highlight {
+            name,
+            truncated,
+            bytes,
+        } => {
+            let bytes = match decode(&bytes) {
+                Ok(b) => b,
+                Err(e) => return error(e),
+            };
+            match source_text(&bytes, truncated) {
+                Some(text) => {
+                    Response::Html(WireHtml::from(zam_markdown::highlight_source(&name, &text)))
+                }
+                None => error(DocError::Unsupported),
             }
         }
         #[cfg(feature = "test-hooks")]

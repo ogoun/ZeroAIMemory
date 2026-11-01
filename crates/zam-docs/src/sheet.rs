@@ -58,14 +58,65 @@ pub fn sheet_page(
     limits: &Limits,
     deadline: Instant,
 ) -> Result<SheetPage, DocError> {
+    let want = if sheet.is_empty() {
+        Want::No(1)
+    } else {
+        Want::Name(sheet.to_string())
+    };
+    let first = sheet.is_empty();
+    page_of(kind, bytes, (want, first), from, rows, limits, deadline)
+}
+
+/// [`sheet_page`] по номеру листа `no` в порядке книги (с 1; пустые листы тоже считаются):
+/// превью выбирает лист номером, а не именем — имя может содержать секрет, а маски двух таких
+/// листов совпадают (задача 8). Номера вне книги (`0` и больше числа листов) — `Malformed`.
+pub fn sheet_page_no(
+    kind: DocKind,
+    bytes: &[u8],
+    no: u32,
+    from: u32,
+    rows: u32,
+    limits: &Limits,
+    deadline: Instant,
+) -> Result<SheetPage, DocError> {
+    if no == 0 {
+        return Err(DocError::Malformed("нет листа №0".into()));
+    }
+    page_of(
+        kind,
+        bytes,
+        (Want::No(no), false),
+        from,
+        rows,
+        limits,
+        deadline,
+    )
+}
+
+/// Страница листа `want`; `first` — запрошен «первый лист» (пустое имя): книга без листов даёт
+/// пустую страницу, а не ошибку.
+fn page_of(
+    kind: DocKind,
+    bytes: &[u8],
+    (want, first): (Want, bool),
+    from: u32,
+    rows: u32,
+    limits: &Limits,
+    deadline: Instant,
+) -> Result<SheetPage, DocError> {
     if bytes.len() as u64 > limits.max_bytes {
         return Err(DocError::TooLarge);
     }
     let mut ctx = Ctx::new(limits, deadline);
-    let mut page = Page::new(sheet, from, rows);
+    let mut page = Page::new(want, from, rows);
     feed(kind, bytes, &mut page, &mut ctx)?;
-    if !page.found && !sheet.is_empty() {
-        return Err(DocError::Malformed(format!("нет листа {sheet:?}")));
+    if !page.found {
+        match (&page.want, first) {
+            // книга без листов: первый лист — пустая страница, как прежде
+            (_, true) => {}
+            (Want::Name(n), _) => return Err(DocError::Malformed(format!("нет листа {n:?}"))),
+            (Want::No(n), _) => return Err(DocError::Malformed(format!("нет листа №{n}"))),
+        }
     }
     Ok(page.finish(ctx.into_warnings()))
 }
@@ -579,9 +630,16 @@ impl Sink for Blocks {
     }
 }
 
+/// Какой лист нужен странице превью.
+enum Want {
+    Name(String),
+    /// Номер в порядке книги, с 1.
+    No(u32),
+}
+
 /// Приёмник страницы превью.
 struct Page {
-    want: String,
+    want: Want,
     from: u32,
     count: u32,
     found: bool,
@@ -604,9 +662,9 @@ struct Page {
 }
 
 impl Page {
-    fn new(want: &str, from: u32, count: u32) -> Self {
+    fn new(want: Want, from: u32, count: u32) -> Self {
         Page {
-            want: want.to_string(),
+            want,
             from,
             count,
             found: false,
@@ -664,7 +722,11 @@ impl Page {
 impl Sink for Page {
     fn sheet(&mut self, name: &str, _ctx: &mut Ctx) -> bool {
         self.sheets.push(name.to_string());
-        self.active = !self.found && (self.want.is_empty() || self.want == name);
+        let hit = match &self.want {
+            Want::Name(n) => n == name,
+            Want::No(n) => self.sheets.len() as u64 == u64::from(*n),
+        };
+        self.active = !self.found && hit;
         if self.active {
             self.found = true;
             self.sheet = name.to_string();

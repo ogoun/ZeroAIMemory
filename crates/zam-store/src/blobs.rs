@@ -356,6 +356,60 @@ pub async fn blob_meta_in_space(
     .await
 }
 
+/// Привязка блоба к узлу по одному `sha256` (без имени файла): превью (`/previews/{sha}`, M5
+/// задача 8). MIME, размер и имя файла первой привязки — те же правила, что у [`blob_meta`]:
+/// Human — только при `allow_human`, живые узлы раньше удалённых, новые раньше старых.
+pub async fn blob_meta_by_sha(
+    db: &Db,
+    sha256: &str,
+    allow_human: bool,
+) -> Result<Option<(String, u64, String)>, StoreError> {
+    let sha = sha256.to_string();
+    db.read(move |c| {
+        let row: Option<(String, i64, String)> = c
+            .query_row(
+                "SELECT COALESCE(a.mime, 'application/octet-stream'), a.size, a.filename
+                 FROM attachments a
+                 JOIN nodes n ON n.id = a.node_id
+                 JOIN spaces s ON s.id = n.space_id
+                 WHERE a.blob_sha256 = ?1 AND (?2 OR s.kind <> 'human')
+                 ORDER BY (n.deleted_at IS NULL) DESC, a.created_at DESC
+                 LIMIT 1",
+                params![sha, allow_human],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(m, s, f)| (m, u64::try_from(s).unwrap_or(0), f)))
+    })
+    .await
+}
+
+/// [`blob_meta_by_sha`] в пределах пространства `space` (участник общего решения в базе
+/// владельца — только пространство решения).
+pub async fn blob_meta_by_sha_in_space(
+    db: &Db,
+    sha256: &str,
+    space: Id,
+) -> Result<Option<(String, u64, String)>, StoreError> {
+    let sha = sha256.to_string();
+    db.read(move |c| {
+        let row: Option<(String, i64, String)> = c
+            .query_row(
+                "SELECT COALESCE(a.mime, 'application/octet-stream'), a.size, a.filename
+                 FROM attachments a
+                 JOIN nodes n ON n.id = a.node_id
+                 WHERE a.blob_sha256 = ?1 AND n.space_id = ?2
+                 ORDER BY (n.deleted_at IS NULL) DESC, a.created_at DESC
+                 LIMIT 1",
+                params![sha, space],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(m, s, f)| (m, u64::try_from(s).unwrap_or(0), f)))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

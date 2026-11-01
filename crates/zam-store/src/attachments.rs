@@ -242,6 +242,29 @@ pub async fn doc_sheet_locators(db: &Db, att: Id) -> Result<Vec<String>, StoreEr
     .await
 }
 
+/// [`doc_sheet_locators`] блоба `sha`: по первому по дате извлечённому живому документу этого
+/// файла (у документов одного файла нарезка одна). Номера листов `sheet:#N` превью (задача 8)
+/// выводятся из них так же, как в `/read` и поиске. Нет такого документа — пусто.
+pub async fn blob_sheet_locators(db: &Db, sha: &str) -> Result<Vec<String>, StoreError> {
+    let sha = sha.to_string();
+    let doc: Option<Id> = db
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT id FROM attachment_docs
+                 WHERE blob_sha256 = ?1 AND deleted_at IS NULL AND extract_state = 'done'
+                 ORDER BY created_at LIMIT 1",
+                [sha],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await?;
+    match doc {
+        Some(id) => doc_sheet_locators(db, id).await,
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Тексты чанков `ordinals` документа `att` (секреты замаскированы при нарезке), по порядку;
 /// `max_chars` — только первые символы (первая строка оглавления).
 pub async fn doc_chunk_texts(

@@ -7,7 +7,8 @@
 //! Модули: [`sniff`] — вид по сигнатуре, затем по расширению; `ooxml` — общий разбор zip и XML
 //! с лимитами; `docx`, `pptx` — форматы Office Open XML; `text` — простой текст; `sheet` —
 //! таблицы (`xlsx`, `ods` на `ooxml`, `xls` на `cfb`, `csv`) и превью листа [`sheet_page`];
-//! `pdf` (фича `pdfium`) — PDF и миниатюры страниц, только в рабочем процессе `doc-worker`.
+//! `pdf` (фича `pdfium`) — PDF и миниатюры страниц, только в рабочем процессе `doc-worker`;
+//! `thumb` (фича `images`) — миниатюры изображений для превью, там же.
 
 mod cfb;
 mod csv;
@@ -29,6 +30,8 @@ mod sniff;
 #[doc(hidden)]
 pub mod test_pdf;
 mod text;
+#[cfg(feature = "images")]
+pub mod thumb;
 mod xls;
 mod xlsx;
 
@@ -36,8 +39,8 @@ use std::time::Instant;
 
 pub use ctx::HEADING_PATH_MAX_CHARS;
 pub use locator::Locator;
-pub use sheet::{SheetPage, sheet_page};
-pub use sniff::{sniff, sniff_file};
+pub use sheet::{SheetPage, sheet_page, sheet_page_no};
+pub use sniff::{ImageKind, is_text, sniff, sniff_file, sniff_image};
 
 /// Версия извлечения: смена правил разбора — перенарезка вложений (кэш по `blob_sha256`).
 /// 2 — `locator` листа с именем вида `#12` пишется в кавычках (`sheet:'#12'!A1`), иначе он

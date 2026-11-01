@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use common::sheets::{XCell, cfb, grid, ods, sheet_xml, sst_xml, xls, xlsx};
 use proptest::prelude::*;
-use zam_docs::{DocError, DocKind, Extracted, Limits, Locator, extract, sheet_page, sniff};
+use zam_docs::{
+    DocError, DocKind, Extracted, Limits, Locator, extract, sheet_page, sheet_page_no, sniff,
+};
 
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(3600)
@@ -838,4 +840,42 @@ fn csv_mostly_utf8_and_cr_only() {
         x.units[0].text,
         "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
     );
+}
+
+/// Превью по номеру листа в порядке книги (задача 8): пустой лист тоже считается, номер вне
+/// книги — ошибка; одинаковые подписи листов не путаются.
+#[test]
+fn sheet_page_by_number() {
+    let bytes = xlsx(
+        &[
+            ("Итоги", sheet_xml(None, &grid(&[&["a", "b"], &["1", "2"]]))),
+            ("Пустой", sheet_xml(None, "")),
+            ("Данные", sheet_xml(None, &grid(&[&["x"], &["7"], &["8"]]))),
+        ],
+        None,
+    );
+    let p = sheet_page_no(DocKind::Xlsx, &bytes, 3, 1, 10, &Limits::default(), far()).unwrap();
+    assert_eq!(p.sheets, vec!["Итоги", "Пустой", "Данные"]);
+    assert_eq!(p.sheet, "Данные");
+    assert_eq!(p.header, vec!["x"]);
+    assert_eq!(p.rows, vec![vec!["7".to_string()], vec!["8".to_string()]]);
+    let first = sheet_page_no(DocKind::Xlsx, &bytes, 1, 1, 10, &Limits::default(), far()).unwrap();
+    assert_eq!(first.sheet, "Итоги");
+    let empty = sheet_page_no(DocKind::Xlsx, &bytes, 2, 1, 10, &Limits::default(), far()).unwrap();
+    assert_eq!((empty.sheet.as_str(), empty.total_rows), ("Пустой", 0));
+    for no in [0, 4] {
+        let e = sheet_page_no(DocKind::Xlsx, &bytes, no, 1, 10, &Limits::default(), far());
+        assert!(matches!(e, Err(DocError::Malformed(_))), "{no}: {e:?}");
+    }
+    // CSV — один лист
+    let csv = sheet_page_no(
+        DocKind::Csv,
+        b"a;b\n1;2\n",
+        1,
+        1,
+        10,
+        &Limits::default(),
+        far(),
+    );
+    assert_eq!(csv.unwrap().sheet, "CSV");
 }

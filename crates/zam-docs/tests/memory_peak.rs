@@ -607,3 +607,95 @@ fn pdf_peak_within_bound() {
         assert!(out as u64 <= limits.max_chars, "{name}: выдача {out}");
     }
 }
+
+/// Миниатюра одного изображения: пик сверх занятой памяти и время.
+fn measured_thumb(bytes: &[u8]) -> (Result<Vec<u8>, DocError>, usize, Duration) {
+    let base = CUR.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let t = Instant::now();
+    let r = zam_docs::thumb::image_thumb(bytes, 1024);
+    (r, PEAK.load(Relaxed).saturating_sub(base), t.elapsed())
+}
+
+/// Граница миниатюры изображения `w × h`, декодированного по `bpp` байт на пиксель:
+/// декодированный буфер, его 8-битная копия RGBA, копия ресайза с умноженной альфой (по 4 байта
+/// на пиксель), промежуточный проход свёртки (1024 × высота × 4), миниатюра и PNG (4 МиБ) и
+/// 1 МиБ на рост `Vec` и таблицы декодеров.
+fn thumb_bound(w: u64, h: u64, bpp: u64) -> usize {
+    let px = w * h;
+    (px * bpp + 2 * 4 * px + 4 * 1024 * w.max(h) + 5 * MIB as u64) as usize
+}
+
+fn check_thumbs(side: u32) {
+    use common::images::{encode, gif_forged, jpeg_forged, png_bomb};
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+    use zam_docs::thumb::{IMAGE_MAX_PIXELS, IMAGE_MAX_SIDE};
+    // бомбы размеров: отказ до декодирования, памяти почти не нужно
+    for (name, b) in [
+        ("S1 PNG 100000²", png_bomb(100_000, 100_000)),
+        ("S2 PNG сторона", png_bomb(IMAGE_MAX_SIDE + 1, 1)),
+        ("S3 PNG 10000² > пикселей", png_bomb(10_000, 10_000)),
+        ("S4 JPEG 65000²", jpeg_forged(65_000, 65_000)),
+        ("S5 GIF 65535²", gif_forged(65_535, 65_535)),
+    ] {
+        let (r, peak, took) = measured_thumb(&b);
+        eprintln!(
+            "{name}: файл {} Б, пик {:.2} МиБ, {took:?}, {:?}",
+            b.len(),
+            peak as f64 / MIB as f64,
+            r.as_ref().map(Vec::len)
+        );
+        assert!(matches!(r, Err(DocError::Malformed(_))), "{name}: {r:?}");
+        assert!(peak <= MIB, "{name}: пик {peak}");
+    }
+    // декомпрессионная бомба в пределах лимитов: однотонный PNG в сотни КиБ, раскрывается в
+    // `side² × 4` (8 бит) и `side² × 8` (16 бит) байт
+    let s = u64::from(side);
+    assert!(s * s <= IMAGE_MAX_PIXELS);
+    let rgba8 =
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(side, side, Rgba([9, 99, 199, 255])));
+    let png8 = encode(&rgba8, ImageFormat::Png);
+    let jpg = encode(&DynamicImage::ImageRgb8(rgba8.to_rgb8()), ImageFormat::Jpeg);
+    drop(rgba8);
+    let rgba16 = DynamicImage::ImageRgba16(ImageBuffer::from_pixel(
+        side,
+        side,
+        Rgba([900u16, 9000, 60000, 65535]),
+    ));
+    let png16 = encode(&rgba16, ImageFormat::Png);
+    drop(rgba16);
+    for (name, b, bpp) in [
+        ("T1 PNG RGBA8", png8, 4),
+        ("T2 PNG RGBA16", png16, 8),
+        ("T3 JPEG RGB", jpg, 3),
+    ] {
+        let (r, peak, took) = measured_thumb(&b);
+        let bound = thumb_bound(s, s, bpp);
+        eprintln!(
+            "{name} {side}²: файл {:.2} МиБ, пик {:.1} МиБ (граница {:.1}), {took:?}",
+            b.len() as f64 / MIB as f64,
+            peak as f64 / MIB as f64,
+            bound as f64 / MIB as f64
+        );
+        let png = r.unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(png.starts_with(b"\x89PNG"), "{name}");
+        assert!(peak <= bound, "{name}: пик {peak} > {bound}");
+    }
+}
+
+/// Миниатюры изображений (задача 8): бомбы размеров — отказ без выделения памяти;
+/// изображение 4000² — пик в пределах [`thumb_bound`].
+#[test]
+fn image_thumb_peak_within_bound() {
+    let _serial = serial();
+    check_thumbs(4000);
+}
+
+/// То же на пределе пикселей (7071² ≈ 50 Мпикс): вручную в release —
+/// `cargo test -p zam-docs --release --test memory_peak -- --ignored image --nocapture`.
+#[test]
+#[ignore = "50 Мпикс, ~1 ГиБ памяти: вручную в release (doc-комментарий модуля)"]
+fn image_thumb_peak_max_pixels() {
+    let _serial = serial();
+    check_thumbs(7071);
+}

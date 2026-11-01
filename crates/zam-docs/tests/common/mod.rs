@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod images;
 pub mod sheets;
 
 use std::io::Write;

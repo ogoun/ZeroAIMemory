@@ -7,6 +7,10 @@
 //! границе кадра) — штатное завершение процесса. Тело длиннее предела стороны — ошибка кадра,
 //! процесс перезапускается.
 //!
+//! Превью (задача 8): `sheet` — страница листа по номеру ([`zam_docs::sheet_page_no`]),
+//! `image` — миниатюра изображения ([`zam_docs::thumb::image_thumb`]), `highlight` — HTML
+//! syntect исходного текста ([`zam_markdown::highlight_source`]); миниатюра PDF — `thumb`.
+//!
 //! Тестовые запросы (`Crash`, `Sleep`, `Alloc`, `Spam`, `LongError`) есть только в сборке с
 //! фичей `test-hooks`.
 
@@ -14,7 +18,8 @@ use std::borrow::Cow;
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
-use zam_docs::{DocError, DocKind, Extracted, Limits, Locator, Unit};
+use zam_docs::{DocError, DocKind, Extracted, Limits, Locator, SheetPage, Unit};
+use zam_markdown::SourceHtml;
 
 /// Записывает кадр: длина тела `u32` BE, номер `id` `u64` BE и тело.
 pub fn write_frame(w: &mut impl Write, id: u64, body: &[u8]) -> io::Result<()> {
@@ -153,6 +158,32 @@ pub enum Request<'a> {
         #[serde(borrow)]
         bytes: Cow<'a, str>,
     },
+    /// Страница листа `no` (с 1, порядок книги) таблицы вида `kind`: `rows` строк со строки
+    /// листа `from`; `soft_ms` — срок разбора (частичная страница).
+    Sheet {
+        kind: String,
+        no: u32,
+        from: u32,
+        rows: u32,
+        limits: WireLimits,
+        soft_ms: u64,
+        #[serde(borrow)]
+        bytes: Cow<'a, str>,
+    },
+    /// Миниатюра изображения (PNG, JPEG, GIF, WebP) в PNG, большая сторона — `max_px`.
+    Image {
+        max_px: u32,
+        #[serde(borrow)]
+        bytes: Cow<'a, str>,
+    },
+    /// HTML syntect текста файла `name` (синтаксис — по расширению); `bytes` — начало файла,
+    /// `truncated` — файл длиннее (неполный последний символ отбрасывается).
+    Highlight {
+        name: String,
+        truncated: bool,
+        #[serde(borrow)]
+        bytes: Cow<'a, str>,
+    },
     /// Проверка: процесс жив; загружен ли pdfium.
     Ping,
     /// Тест: аварийное завершение процесса.
@@ -270,6 +301,52 @@ impl TryFrom<WireExtracted> for Extracted {
     }
 }
 
+/// Страница листа в ответе (поля [`SheetPage`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireSheetPage {
+    pub sheets: Vec<String>,
+    pub sheet: String,
+    pub header: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub total_rows: u32,
+    pub cols: u32,
+    pub first_row: u32,
+    pub warnings: Vec<String>,
+}
+
+impl From<SheetPage> for WireSheetPage {
+    fn from(p: SheetPage) -> Self {
+        WireSheetPage {
+            sheets: p.sheets,
+            sheet: p.sheet,
+            header: p.header,
+            rows: p.rows,
+            total_rows: p.total_rows,
+            cols: p.cols,
+            first_row: p.first_row,
+            warnings: p.warnings,
+        }
+    }
+}
+
+/// Подсвеченный текст в ответе (поля [`SourceHtml`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireHtml {
+    pub html: String,
+    pub syntax: Option<String>,
+    pub highlighted: usize,
+}
+
+impl From<SourceHtml> for WireHtml {
+    fn from(h: SourceHtml) -> Self {
+        WireHtml {
+            html: h.html,
+            syntax: h.syntax,
+            highlighted: h.highlighted,
+        }
+    }
+}
+
 /// Вид документа по `DocKind::as_str`.
 pub fn parse_kind(s: &str) -> Option<DocKind> {
     [
@@ -295,6 +372,14 @@ pub enum Response {
     Thumb {
         png: String,
     },
+    /// Страница листа.
+    Sheet(WireSheetPage),
+    /// Миниатюра изображения: PNG в base64.
+    Image {
+        png: String,
+    },
+    /// HTML syntect.
+    Html(WireHtml),
     /// `pdfium` — `None`, если библиотека загружена, иначе причина.
     Pong {
         pdfium: Option<String>,
@@ -359,6 +444,71 @@ mod tests {
         ));
         let e: Response = serde_json::from_str(r#"{"op":"pong","pdfium":null}"#).unwrap();
         assert!(matches!(e, Response::Pong { pdfium: None }));
+    }
+
+    /// Запросы и ответы превью (задача 8): `bytes` — последнее поле, страница листа и HTML —
+    /// без потерь.
+    #[test]
+    fn preview_requests_and_responses() {
+        for r in [
+            Request::Sheet {
+                kind: "xlsx".into(),
+                no: 2,
+                from: 10,
+                rows: 50,
+                limits: WireLimits::from(&Limits::default()),
+                soft_ms: 7,
+                bytes: Cow::Borrowed(""),
+            },
+            Request::Image {
+                max_px: 64,
+                bytes: Cow::Borrowed(""),
+            },
+            Request::Highlight {
+                name: "a.rs".into(),
+                truncated: true,
+                bytes: Cow::Borrowed(""),
+            },
+        ] {
+            let body = request_body(&r, Some(b"xyz"));
+            let back: Request<'_> = serde_json::from_slice(&body).unwrap();
+            let b = match back {
+                Request::Sheet { bytes, no: 2, .. }
+                | Request::Image { bytes, max_px: 64 }
+                | Request::Highlight {
+                    bytes,
+                    truncated: true,
+                    ..
+                } => bytes,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(b, "eHl6");
+        }
+        let page = WireSheetPage {
+            sheets: vec!["a".into(), "b".into()],
+            sheet: "b".into(),
+            header: vec!["h".into()],
+            rows: vec![vec![], vec!["1".into()]],
+            total_rows: 2,
+            cols: 1,
+            first_row: 2,
+            warnings: vec![],
+        };
+        let json = serde_json::to_vec(&Response::Sheet(page.clone())).unwrap();
+        let Response::Sheet(back) = serde_json::from_slice(&json).unwrap() else {
+            panic!()
+        };
+        assert_eq!(back, page);
+        let h = WireHtml {
+            html: "<span class=\"hl-x\">a</span>".into(),
+            syntax: Some("Rust".into()),
+            highlighted: 1,
+        };
+        let json = serde_json::to_vec(&Response::Html(h.clone())).unwrap();
+        let Response::Html(back) = serde_json::from_slice(&json).unwrap() else {
+            panic!()
+        };
+        assert_eq!(back, h);
     }
 
     #[test]

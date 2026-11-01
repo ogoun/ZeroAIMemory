@@ -15,14 +15,19 @@ zip.workspace = true
 pdfium-render = { workspace = true, optional = true }
 # PNG миниатюр страниц PDF: свой минимальный кодер на deflate (уже в дереве)
 flate2 = { workspace = true, optional = true }
+# миниатюры изображений (превью, задача 8): только в рабочем процессе `zam-server doc-worker`
+image = { workspace = true, optional = true }
+fast_image_resize = { workspace = true, optional = true }
 
 [features]
 # Разбор PDF и миниатюры страниц через pdfium (динамическая библиотека)
 pdfium = ["dep:pdfium-render", "dep:flate2"]
+# Миниатюры PNG, JPEG, GIF, WebP (`thumb`): размеры проверяются до декодирования
+images = ["dep:image", "dep:fast_image_resize"]
 # Простой писатель PDF для тестов (`test_pdf`) — только dev-зависимостям, в сервере его нет
 test-pdf = []
 
 [dev-dependencies]
 proptest.workspace = true
 # тесты PDF (`tests/pdf.rs`, `memory_peak`) — всегда с фичей `pdfium`
-zam-docs = { path = ".", features = ["pdfium", "test-pdf"] }
+zam-docs = { path = ".", features = ["pdfium", "test-pdf", "images"] }

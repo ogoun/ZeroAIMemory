@@ -100,11 +100,17 @@ Pdfium (C++) нельзя прервать и он регулярно получ
 
 ## 5. Превью и просмотрщики WebUI
 
-- `GET /blobs/{sha256}/preview?kind=sheet&sheet=&from=&rows=` — JSON листа (страница строк, шапка,
-  размеры) для XLSX/XLS/ODS/CSV, кэш в `previews/`; первый экран XLSX 10 тыс. строк ≤ 1 с (ТЗ §17).
-- `kind=thumb&page=` — PNG-миниатюра страницы PDF (рабочий процесс, pdfium) или изображения
-  (`image` + `fast_image_resize`), кэш `previews/`.
+- `GET /api/v1/previews/{sha256}?kind=sheet&sheet=&from=&rows=` (правка задачи 8: путь
+  `/blobs/{sha256}/preview` совпал бы с `/blobs/{sha256}/{filename}`) — JSON листа (страница строк,
+  шапка, размеры) для XLSX/XLS/ODS/CSV; лист — номер в порядке книги, имя через сканер секретов и
+  номер `sheet:#N` (`ref_no`); кэш в `previews/<владелец>/<sha256>/`; первый экран XLSX 10 тыс.
+  строк ≤ 1 с (ТЗ §17).
+- `kind=thumb&page=&px=` — PNG-миниатюра (`px` ≤ 1024) страницы PDF (pdfium) или изображения PNG,
+  JPEG, GIF, WebP (`image` + `fast_image_resize`; размеры проверяются до декодирования), кэш
+  `previews/`.
 - `kind=text` — PPTX: текст слайдов; TXT/JSON/YAML/код — HTML syntect (ТЗ §15.3).
+- Все виды превью строятся в рабочем процессе `doc-worker` (свой пул `docs.preview_workers`), права
+  — как у скачивания блоба, недоступное — 404 как несуществующее (журнал этапа, задача 8).
 - **PDF** — `pdf.js` 6.x (Apache-2.0), лениво; `isEvalSupported: false`, скрипты PDF выключены; CSP
   получает `'wasm-unsafe-eval'` только для маршрута просмотрщика PDF (решение контроллера — §11);
   переход к странице из выдачи по `locator`; поиск по тексту — средствами pdf.js.
