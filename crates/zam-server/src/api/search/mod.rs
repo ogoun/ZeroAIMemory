@@ -232,6 +232,7 @@ use self::merge::merge_channels;
 use self::targets::{
     ScopeReq, SearchTarget, WARN_SOLUTION_UNAVAILABLE, dedup_keep_order, resolve_targets,
 };
+use super::doc_locator::{self, Sheets, secret_sheet};
 use super::json_body;
 use super::scope::skip_foreign;
 use super::sessions::{RequestSession, request_session};
@@ -1395,13 +1396,19 @@ fn locator_text(a: &AttachmentHit) -> Option<String> {
     a.locator
         .as_deref()
         .and_then(|l| zam_docs::Locator::parse(l).ok())
-        .map(|l| zam_markdown::mask_text(&l.label()))
+        .map(|l| doc_locator::shown(&l, a.sheet_no).1)
 }
 
-/// `locator` фрагмента для карточки — со сканером секретов (имя листа). Сырой `locator` наружу не
-/// нужен: `/read a:<chunk>` (задача 7) берёт его из чанка по `chunk_id`.
+/// `locator` фрагмента для карточки — со сканером секретов (имя листа); лист с секретом в имени —
+/// `sheet:#N!…` ([`doc_locator::shown`]): такой `locator` читается `/read`. Сырой `locator` наружу
+/// не нужен: `/read a:<chunk>` (задача 7) берёт его из чанка по `chunk_id`.
 fn shown_locator(a: &AttachmentHit) -> Option<String> {
-    a.locator.as_deref().map(zam_markdown::mask_text)
+    a.locator
+        .as_deref()
+        .map(|raw| match zam_docs::Locator::parse(raw) {
+            Ok(l) => doc_locator::shown(&l, a.sheet_no).0,
+            Err(_) => zam_markdown::mask_text(raw),
+        })
 }
 
 fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Timestamp) -> Value {
@@ -1710,6 +1717,43 @@ async fn attach_stale_refs(targets: &[SearchTarget], items: &mut [Item]) {
                 }
             }
             Err(e) => tracing::warn!(error = %e, "чтение устаревших ссылок на файлы"),
+        }
+    }
+}
+
+/// Номер листа ([`zam_store::AttachmentHit::sheet_no`]) у фрагментов листов, имя которых меняет
+/// сканер секретов: у двух таких листов одна маска, и карточка без номера не позволила бы ни
+/// различить их, ни прочитать (`/read` ищет лист по сырому имени или номеру). Номер считается
+/// так же, как в `/read` ([`Sheets`]), по одному запросу `doc_sheet_locators` на документ и только
+/// для таких фрагментов. Сбой чтения — WARN, карточка остаётся с маской.
+async fn number_secret_sheets(targets: &[SearchTarget], items: &mut [Item]) {
+    let mut cache: HashMap<(usize, Id), Option<Sheets>> = HashMap::new();
+    for it in items.iter_mut() {
+        let Some(a) = it.hit.attachment.as_mut() else {
+            continue;
+        };
+        let Some(Ok(l)) = a.locator.as_deref().map(zam_docs::Locator::parse) else {
+            continue;
+        };
+        if !secret_sheet(&l) {
+            continue;
+        }
+        let key = (it.target, a.id);
+        let sheets = match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let db = &targets[it.target].db;
+                v.insert(match zam_store::doc_sheet_locators(db, a.id).await {
+                    Ok(list) => Some(Sheets::of(list.iter().map(String::as_str))),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "поиск: номера листов вложения не прочитаны");
+                        None
+                    }
+                })
+            }
+        };
+        if let (Some(sheets), zam_docs::Locator::Sheet { name, .. }) = (sheets.as_ref(), &l) {
+            a.sheet_no = sheets.no(name);
         }
     }
 }
@@ -2426,6 +2470,8 @@ pub async fn search(
     }
     // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется
     attach_stale_refs(&targets, &mut items).await;
+    // лист с секретом в имени — номером, как в `/read` (задача 7 M5, раунд правок 2)
+    number_secret_sheets(&targets, &mut items).await;
     // выжимки шага 0 — из того же бюджета
     let cache_tokens: usize = cache_items.iter().map(cache_step::CacheItem::tokens).sum();
     let packed = pack_items(items, mode, budget.saturating_sub(cache_tokens).max(1));
@@ -2607,6 +2653,7 @@ mod tests {
             filename: "книга.pdf".into(),
             blob_sha256: "f".repeat(64),
             locator: Some("page:12".into()),
+            sheet_no: None,
         });
         h
     }

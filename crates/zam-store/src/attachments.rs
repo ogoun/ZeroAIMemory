@@ -226,6 +226,22 @@ pub async fn doc_chunk_heads(db: &Db, att: Id) -> Result<Vec<DocChunkHead>, Stor
     .await
 }
 
+/// Различные `locator` листов (`sheet:…`) документа `att` в порядке их первых чанков — одним
+/// запросом: по ним карточка поиска нумерует листы так же, как `/read` (номер листа с секретом в
+/// имени, задача 7 M5, раунд правок 2).
+pub async fn doc_sheet_locators(db: &Db, att: Id) -> Result<Vec<String>, StoreError> {
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT locator FROM chunks INDEXED BY chunks_attachment
+             WHERE attachment_id IS NOT NULL AND attachment_id = ?1 AND locator LIKE 'sheet:%'
+             GROUP BY locator ORDER BY min(ordinal)",
+        )?;
+        let rows = st.query_map([att], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
+}
+
 /// Тексты чанков `ordinals` документа `att` (секреты замаскированы при нарезке), по порядку;
 /// `max_chars` — только первые символы (первая строка оглавления).
 pub async fn doc_chunk_texts(

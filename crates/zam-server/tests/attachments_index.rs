@@ -171,21 +171,23 @@ async fn fts(a: &Api, user: Id, att: Id, word: &str) -> i64 {
 }
 
 /// Выполняет SQL в базе пользователя (подготовка состояний, которые API не создаёт).
-async fn exec(a: &Api, user: Id, sql: &'static str) {
+async fn exec(a: &Api, user: Id, sql: &str) {
+    let sql = sql.to_string();
     db(a, user)
         .await
         .write(move |t| {
-            t.execute_batch(sql)?;
+            t.execute_batch(&sql)?;
             Ok(())
         })
         .await
         .unwrap();
 }
 
-async fn scalar(a: &Api, user: Id, sql: &'static str) -> i64 {
+async fn scalar(a: &Api, user: Id, sql: &str) -> i64 {
+    let sql = sql.to_string();
     db(a, user)
         .await
-        .read(move |c| Ok(c.query_row(sql, [], |r| r.get(0))?))
+        .read(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?))
         .await
         .unwrap()
 }
@@ -638,11 +640,14 @@ async fn extractor_version_bump_rechunks() {
     .await;
     let d = wait_doc(&a, user, &node, "v.docx", ExtractState::Done).await;
     let n = chunks(&a, user, d.id).await.len();
+    const V: u32 = zam_docs::EXTRACTOR_VERSION;
     let fp = scalar(
         &a,
         user,
-        "SELECT count(*) FROM meta WHERE key = 'chunker_attachments'
-                AND value LIKE '%;ext=' || 1 || ';%'",
+        &format!(
+            "SELECT count(*) FROM meta WHERE key = 'chunker_attachments'
+                AND value LIKE '%;ext={V};%'"
+        ),
     )
     .await;
     assert_eq!(fp, 1, "отпечаток с версией извлечения записан");
@@ -671,9 +676,11 @@ async fn extractor_version_bump_rechunks() {
     exec(
         &b,
         user,
-        "UPDATE meta SET value = replace(value, ';ext=1;', ';ext=0;')
-          WHERE key = 'chunker_attachments';
-         UPDATE blob_extract SET extractor_version = 0;",
+        &format!(
+            "UPDATE meta SET value = replace(value, ';ext={V};', ';ext=0;')
+              WHERE key = 'chunker_attachments';
+             UPDATE blob_extract SET extractor_version = 0;"
+        ),
     )
     .await;
     b.st.shutdown().await;
@@ -687,7 +694,7 @@ async fn extractor_version_bump_rechunks() {
             scalar(
                 &c2,
                 user,
-                "SELECT count(*) FROM blob_extract WHERE extractor_version = 1",
+                &format!("SELECT count(*) FROM blob_extract WHERE extractor_version = {V}"),
             )
             .await
                 == 1

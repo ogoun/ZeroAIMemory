@@ -209,6 +209,9 @@ pub struct AttachmentHit {
     pub blob_sha256: String,
     /// Адрес фрагмента в документе (`page:12`, `sheet:Итоги!A1:F40`, `slide:3`, `para:40`).
     pub locator: Option<String>,
+    /// Номер листа в документе — только у листа с секретом в имени (карточка показывает его
+    /// `sheet:#N`); заполняет сервер после выборки (задача 7 M5, раунд правок 2).
+    pub sheet_no: Option<u32>,
 }
 
 /// Найденный чанк (FTS или — через [`live_chunks`] — векторный хит).
@@ -349,6 +352,7 @@ fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
                 filename: r.get(o + 21)?,
                 blob_sha256: r.get(o + 22)?,
                 locator: r.get(o + 23)?,
+                sheet_no: None,
             }),
         ),
     };

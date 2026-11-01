@@ -1385,6 +1385,48 @@ BASE 872cfc4. `POST /read` читает вложения: часть докум�
   `read_since_rev` 7, `mcp` 21, `sessions` 13, `attachments_search` 9, `file_refs` 18,
   `read_budget_memory` 1, `search` 13; `-p zam-cli`: `read_locator` 1, `repo_clean` 1.
 
+#### Задача 7 — раунд правок 2 (2026-11-01)
+
+Повторное ревью подтвердило M-2…M-4 и различие листов в `/read`; осталась карточка поиска. Поверх
+95b8804.
+
+- **(Important) Карточка поиска листа с секретом.** `shown_locator` и `locator_text` давали двум
+  листам с секретами одинаковое `sheet:‹маска›!A2:B2`, и `/read d:<id>` с таким `locator` — 
+  `not_found`. Логика номеров вынесена в общий модуль `api/doc_locator.rs` (`Sheets::of` по сырым
+  `locator` в порядке чанков, `resolve`, `shown`, `secret_sheet`, `shown(l, no)`) — им пользуются
+  `/read` (бывший `read::Sheets`) и поиск. В поиске `number_secret_sheets` (после
+  `attach_stale_refs`): только для фрагментов листов, имя которых меняет `mask_text`, — один
+  запрос `zam_store::doc_sheet_locators` на документ (`SELECT locator … GROUP BY locator ORDER BY
+  min(ordinal)` по `chunks_attachment`), номер — в новое поле `AttachmentHit.sheet_no` (store его
+  не заполняет). Карточка (JSON и md): `locator` `sheet:#N!A2:B2`, подпись `лист №N «‹маска›»
+  A2:B2`; без номера (сбой чтения — WARN) — маска, как раньше. Тест
+  `attachments_search.rs::secret_sheet_cards_numbered_and_readable`: две карточки — `#2` и `#3`,
+  `AKIA` нет ни в JSON, ни в md, `/read d:<attachment_id>` с `locator` карточки отдаёт текст того же
+  листа; unit `doc_locator::tests::sheets_numbered_by_unit_order`.
+- **(Minor) `EXTRACTOR_VERSION` 1 → 2.** `blob_extract.units` хранит отрисованный `locator`: лист с
+  именем вида `#12`, извлечённый до 95b8804 (без кавычек), при перенарезке из кэша читался бы как
+  номер листа. Новая версия — кэш прежней версии не подходит, `rechunk_docs_if_stale` (отпечаток
+  `meta.chunker_attachments` с `ext=<версия>`) переводит документы в `pending` при открытии базы, и
+  файл разбирается заново. Тест `attachments_index.rs::extractor_version_bump_rechunks` сверял
+  версию литералом `1` — теперь `zam_docs::EXTRACTOR_VERSION` (помощники `exec`/`scalar` берут
+  `&str`); механизм проверен этим тестом на версии 2. Цена: после обновления все вложения баз
+  пользователей переизвлекаются один раз (фоном, после заметок; чанки и точки на это время
+  остаются, поиск их видит — раунд 3 задачи 6).
+- Проверки: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` —
+  чисто; `-p zam-docs` — зелёный; `-p zam-store --test attachments` 17; `-p zam-server`: lib 195,
+  `attachments_search` 10, `read_attachments` 9, `attachments_index` 13, `search` 13.
+
+### Задача 7 — итог (2026-11-01)
+
+Коммиты: 861ef96 (`/read` по `locator`, MCP, CLI), 95b8804 (раунд 1: листы по номеру, `stale_refs`
+повтора, администратор и чужие решения, чтение в пределах бюджета), раунд 2 — коммит
+`fix(read): правки ревью задачи 7 M5, раунд 2 — номер листа в карточке поиска`. Итог: `POST /read`,
+`memory_read`, `zam read` читают вложения по `a:`/`b:`/`d:` и `locator` (страница, слайд, абзац,
+лист по имени или `#N`), без `locator` — оглавление; недоступное неотличимо от несуществующего;
+`session_seen` — ключ `blob`; лист с секретом в имени — по номеру и в `/read`, и в карточке поиска;
+текст читается из базы в пределах бюджета. Для задачи 9 (просмотрщики) — переход по `locator`, в
+том числе `sheet:#N`; для задачи 10 — `expand=neighbors` фрагментов и замеры на корпусе.
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.
@@ -1488,7 +1530,8 @@ BASE 872cfc4. `POST /read` читает вложения: часть докум�
   задача 7).** Отметка выданного — блоб и `locator` каждой выданной единицы.
 - **Лист с секретом в имени — по номеру `sheet:#N`, номер — порядок листов среди единиц
   документа (контроллер и исполнитель, раунд правок 1 задачи 7).** Пустой лист номера не получает;
-  номер в чанках не хранится, `EXTRACTOR_VERSION` не менялся.
+  номер в чанках не хранится; карточка поиска нумерует так же (`api/doc_locator.rs`, раунд 2).
+  `EXTRACTOR_VERSION` = 2 (раунд 2): лист `#12` прежних извлечений — в кавычках.
 
 ## Отложенные замечания
 

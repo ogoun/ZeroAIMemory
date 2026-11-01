@@ -813,3 +813,72 @@ async fn attachment_found_while_reextracting_or_failed() {
     }
     a.st.shutdown().await;
 }
+
+/// Раунд правок 2 задачи 7: карточки фрагментов двух листов с секретами в именах (одна маска)
+/// различимы — `locator` `sheet:#N!…` и подпись `лист №N «…»`, номер как у `/read`; `/read d:<id>`
+/// с `locator` карточки отдаёт текст того же листа. Сырого имени листа в выдаче нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_sheet_cards_numbered_and_readable() {
+    let w = world("att-secret-sheets", false).await;
+    let a = &w.a;
+    let user = a.st.admin_id;
+    let node = note(
+        a,
+        &a.token,
+        "knowledge",
+        "docs/ключи",
+        "# Ключи\n\nК.\n",
+        None,
+    )
+    .await;
+    let (s1, s2) = ("AKIAIOSFODNN7EXAMPLE", "AKIAJ2345678ABCDEFGH");
+    let book = xlsx(&[
+        ("Итоги", &[&["Name", "Note"], &["Alpha", "plain"]]),
+        (s1, &[&["Key", "Val"], &["vanadium", "1"]]),
+        (s2, &[&["Key", "Val"], &["molybdenum", "2"]]),
+    ]);
+    upload(a, &a.token, &node, "ключи.xlsx", &book).await;
+    wait_done(a, user, &node, "ключи.xlsx").await;
+    let mut seen = Vec::new();
+    for (word, other, no) in [("vanadium", "molybdenum", 2), ("molybdenum", "vanadium", 3)] {
+        let j = search(a, &a.token, json!({"query": word})).await;
+        assert!(!j.to_string().contains("AKIA"), "{j}");
+        let it = atts(&j)[0].clone();
+        let loc = it["locator"].as_str().unwrap().to_string();
+        assert_eq!(loc, format!("sheet:#{no}!A2:B2"), "{it}");
+        let label = it["locator_text"].as_str().unwrap();
+        assert!(label.starts_with(&format!("лист №{no} «")), "{it}");
+        // md — та же подпись
+        let r = a
+            .tok(
+                &a.token,
+                Method::POST,
+                "/api/v1/search",
+                Some(json!({"query": word, "format": "md"})),
+            )
+            .await;
+        assert!(
+            r.text().contains(&format!("· лист №{no} «")),
+            "{}",
+            r.text()
+        );
+        assert!(!r.text().contains("AKIA"), "{}", r.text());
+        let doc = it["attachment_id"].as_str().unwrap();
+        let r = a
+            .tok(
+                &a.token,
+                Method::POST,
+                "/api/v1/read",
+                Some(json!({"items": [{"id": format!("d:{doc}"), "locator": &loc}]})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let item = &r.json()["items"][0];
+        let text = item["text"].as_str().unwrap_or_else(|| panic!("{item}"));
+        assert!(text.contains(word) && !text.contains(other), "{item}");
+        assert_eq!(item["locator"], loc.as_str());
+        seen.push(loc);
+    }
+    assert_ne!(seen[0], seen[1]);
+    a.st.shutdown().await;
+}

@@ -40,7 +40,10 @@ pub use sheet::{SheetPage, sheet_page};
 pub use sniff::{sniff, sniff_file};
 
 /// Версия извлечения: смена правил разбора — перенарезка вложений (кэш по `blob_sha256`).
-pub const EXTRACTOR_VERSION: u32 = 1;
+/// 2 — `locator` листа с именем вида `#12` пишется в кавычках (`sheet:'#12'!A1`), иначе он
+/// читался бы как номер листа `sheet:#N` (задача 7 M5, раунд правок 2): кэш `blob_extract` хранит
+/// отрисованный `locator` и переизвлекается.
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 /// Вид документа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

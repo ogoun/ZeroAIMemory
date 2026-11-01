@@ -83,6 +83,7 @@ use zam_store::{
     entry_snapshot_text, get_node_by_path, mark_seen, node_content,
 };
 
+use super::doc_locator::Sheets;
 use super::json_body;
 use super::nodes::diff_blocking;
 use super::nodes::read::{Tier, l1, parse_tier, section_slice};
@@ -682,67 +683,6 @@ fn parse_locator(v: Option<&Value>) -> Result<Option<Locator>, ApiError> {
     }
 }
 
-/// Листы документа в порядке их первых единиц: номер листа с 1 (`sheet:#N`). Номер в чанках не
-/// хранится — выводится из порядка единиц (листы идут по порядку книги, блоки листа — подряд);
-/// лист без единиц (пустой) номера не получает (раунд правок 1 задачи 7 M5).
-struct Sheets {
-    /// Имена листов по номеру (`names[N - 1]`).
-    names: Vec<String>,
-}
-
-impl Sheets {
-    fn of(heads: &[zam_store::DocChunkHead]) -> Sheets {
-        let mut names: Vec<String> = Vec::new();
-        for h in heads {
-            if let Some(Locator::Sheet { name, .. }) =
-                h.locator.as_deref().and_then(|r| Locator::parse(r).ok())
-                && !names.contains(&name)
-            {
-                names.push(name);
-            }
-        }
-        Sheets { names }
-    }
-
-    fn no(&self, name: &str) -> Option<u32> {
-        let i = self.names.iter().position(|n| n == name)?;
-        u32::try_from(i + 1).ok()
-    }
-
-    /// Адрес запроса в сырой форме чанков: `sheet:#N` — лист N по имени; номер вне документа —
-    /// `None` (части нет).
-    fn resolve(&self, l: &Locator) -> Option<Locator> {
-        match l {
-            Locator::SheetNo { no, range } => {
-                let name = self.names.get(usize::try_from(*no).ok()?.checked_sub(1)?)?;
-                Some(Locator::Sheet {
-                    name: name.clone(),
-                    range: range.clone(),
-                })
-            }
-            other => Some(other.clone()),
-        }
-    }
-
-    /// Показ адреса и подпись: лист, имя которого сканер секретов меняет, — по номеру
-    /// (`sheet:#2!A1:F40`, «лист №2 «‹маска›» A1:F40»): у двух листов с секретами одинаковая
-    /// маска, номер их различает. Прочие — как есть (через сканер секретов).
-    fn shown(&self, l: &Locator) -> (String, String) {
-        if let Locator::Sheet { name, range } = l {
-            let masked = mask_text(name);
-            if masked != *name
-                && let Some(no) = self.no(name)
-            {
-                return (
-                    format!("sheet:#{no}!{range}"),
-                    format!("лист №{no} «{masked}» {range}"),
-                );
-            }
-        }
-        (mask_text(&l.render()), mask_text(&l.label()))
-    }
-}
-
 /// Чанки документа, относящиеся к `want` (сырой адрес, [`Sheets::resolve`]): пересечение
 /// адресов ([`Locator::overlaps`]) — по сырым `locator` чанков, не по маске; абзац внутри блока
 /// DOCX (номера нет среди начал блоков) — блок с ближайшим меньшим началом.
@@ -956,7 +896,7 @@ async fn fetch_attachment(
                 )),
             )));
         }
-        let sheets = Sheets::of(&heads);
+        let sheets = Sheets::of(heads.iter().filter_map(|h| h.locator.as_deref()));
         match &want {
             None => Content::plain(toc(&sc.db, doc.id, &heads, &sheets).await?, false),
             Some(w) => {
