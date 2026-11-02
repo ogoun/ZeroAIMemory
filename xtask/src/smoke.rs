@@ -3,11 +3,13 @@
 //! сервером; память решения (M3): регистрация решения, insight в выдаче, Vault; агенты (M4):
 //! MCP `tools/list`, `/recall` по ошибке, кэш триггеров и подсказка `zam hook pre-tool`;
 //! рабочая память (M4.5): термин и поиск по псевдониму, захват задачи, вопрос и ответ,
-//! `zam refs check`; для Windows — статический CRT наших exe и app-local MSVC runtime
-//! библиотек.
+//! `zam refs check`; документы (M5): pdfium рядом с `zam-server` грузится рабочим процессом
+//! (`doc-worker`, `ping`), вложения PDF/DOCX/XLSX → извлечение → поиск фрагмента с `locator` →
+//! `zam read --locator` → превью листа и миниатюра PDF; для Windows — статический CRT наших exe
+//! и app-local MSVC runtime библиотек (в том числе pdfium).
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -777,6 +779,14 @@ pub fn run(
     }
     let qbin = qdir.join(crate::package::exe(platform, "qdrant"));
     s.run("qdrant --version", qdrant_version_ok(&qdir, &qbin, &qv))?;
+    s.run(
+        "M5: pdfium рядом с zam-server (библиотека платформы), лицензии pdfium, [docs]",
+        docs_layout(&root, platform),
+    )?;
+    s.run(
+        "M5: pdfium из каталога комплекта грузится (zam-server doc-worker: ping → pong)",
+        pdfium_loads(&root, platform),
+    )?;
     let data = dir.join("data");
     let env = SmokeEnv::new()?;
     let addr = env.addr;
@@ -903,6 +913,29 @@ pub fn run(
     s.run(
         "M4.5: zam log insight --ref → правка файла → zam refs check → stale",
         refs_check(&zam, &dir, &base, &token),
+    )?;
+    let with_log = |e: anyhow::Error, srv: &Server| {
+        anyhow!(
+            "{e:#}\nstderr сервера (целиком — {}):\n{}",
+            server_log.display(),
+            srv.log_tail()
+        )
+    };
+    let att = s.run(
+        "M5: zam attach PDF, DOCX и XLSX к заметке → извлечение done",
+        docs_attach(&zam, &dir, &base, &token).map_err(|e| with_log(e, &srv)),
+    )?;
+    let hits = s.run(
+        "M5: поиск по фрагменту PDF и DOCX → карточка вложения с locator",
+        docs_search(&base, &token, &att).map_err(|e| with_log(e, &srv)),
+    )?;
+    s.run(
+        "M5: zam read a:<фрагмент> --locator → текст места документа",
+        docs_read(&zam, &base, &token, &att, &hits),
+    )?;
+    s.run(
+        "M5: превью листа XLSX и миниатюра страницы PDF",
+        docs_previews(&base, &token, &att).map_err(|e| with_log(e, &srv)),
     )?;
     s.run(
         "Qdrant запущен сервером (pid-файл, qdrant status --json)",
@@ -1957,6 +1990,448 @@ fn refs_check(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
         .map(|r| r["items"][0]["state"].clone());
     if status != 200 || state != Some(Value::from("stale")) {
         bail!("GET /file-refs: HTTP {status}, ссылка src/wm.rs не stale: {idx}");
+    }
+    Ok(())
+}
+
+// ---- M5: документы ----
+
+/// Заметка-владелец вложений шагов M5.
+const DOCS_NOTE: &str = "smoke/docs";
+/// Фрагмент страницы 2 PDF и запрос к нему; слова фрагментов больше нигде в smoke не встречаются
+/// (запросы — на английском: тестовая модель англоязычная).
+const PDF_FACT: &str = "The obsidian heron delivered nineteen copper kettles to the harbour.";
+const PDF_QUERY: &str = "obsidian heron copper kettles";
+/// Текст страницы 1 PDF: в `/read` страницы 2 его быть не должно.
+const PDF_PAGE1: &str = "Routine maintenance notes without the marker.";
+const DOCX_FACT: &str = "The vermilion otter archived twelve glass marbles in the cellar.";
+const DOCX_QUERY: &str = "vermilion otter glass marbles";
+/// Лист XLSX: имя, шапка и строки данных.
+const XLSX_SHEET: &str = "Inventory";
+const XLSX_HEADER: [&str; 3] = ["Item", "Count", "Location"];
+const XLSX_ROWS: [[&str; 3]; 3] = [
+    ["lantern", "17", "north shed"],
+    ["rope", "5", "boathouse"],
+    ["saffron anvil", "42", "east vault"],
+];
+/// Предел кадра запроса рабочего процесса для `ping` (`--max-frame`), байт.
+const WORKER_MAX_FRAME: &str = "65536";
+
+/// Файлы вложений M5 — генераторами набора `docs-corpus` (без бинарных фикстур): PDF из двух
+/// страниц (факт — на второй), DOCX (заголовок и два абзаца, факт — во втором) и XLSX с одним
+/// листом. Возвращает (имя файла, байты) и номер абзаца факта DOCX (`para:N`).
+fn docs_files() -> (Vec<(&'static str, Vec<u8>)>, u32) {
+    use crate::docs_corpus::{ooxml, pdf};
+    let page = |lines: &[&str]| pdf::Page {
+        lines: lines
+            .iter()
+            .enumerate()
+            .map(|(i, t)| pdf::Line {
+                x: 72.0,
+                y: pdf::PAGE_H - 120.0 - 18.0 * i as f32,
+                size: 12.0,
+                text: (*t).to_string(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let pdf = pdf::build(&pdf::Doc {
+        pages: vec![
+            page(&["Smoke document, first page.", PDF_PAGE1]),
+            page(&["Smoke document, second page.", PDF_FACT]),
+        ],
+        open_action_js: None,
+    });
+    let (docx, first) = ooxml::docx(&[
+        ooxml::Block::Heading(1, "Smoke handbook".into()),
+        ooxml::Block::Para("Introductory paragraph without the marker.".into()),
+        ooxml::Block::Para(DOCX_FACT.into()),
+    ]);
+    let row = |r: &[&str]| -> Vec<ooxml::Cell> {
+        r.iter().map(|c| ooxml::Cell::Str((*c).into())).collect()
+    };
+    let mut rows = vec![row(&XLSX_HEADER)];
+    rows.extend(XLSX_ROWS.iter().map(|r| row(r)));
+    let xlsx = ooxml::xlsx(&[ooxml::Sheet {
+        name: XLSX_SHEET.into(),
+        rows,
+    }]);
+    (
+        vec![
+            ("smoke.pdf", pdf),
+            ("smoke.docx", docx),
+            ("smoke.xlsx", xlsx),
+        ],
+        first[2],
+    )
+}
+
+/// Критерий M5 (раскладка): pdfium в корне комплекта рядом с `zam-server` (умолчание
+/// `docs.pdfium_dylib`) — библиотека своей платформы; лицензии pdfium в `LICENSES/`; секция
+/// `[docs]` в `config.example.toml`.
+fn docs_layout(root: &Path, platform: &str) -> Result<()> {
+    let lib = root.join(crate::package::pdfium_file(platform));
+    crate::package::check_native_lib(&lib, platform)?;
+    for n in crate::package::PDFIUM_LICENSES {
+        let p = root.join("LICENSES").join(n);
+        if fs::metadata(&p).map(|m| m.len()).unwrap_or(0) == 0 {
+            bail!("нет или пуст {}", p.display());
+        }
+    }
+    let cfg = fs::read_to_string(root.join("config.example.toml"))?;
+    if !cfg.lines().any(|l| l.trim() == "[docs]") {
+        bail!("в config.example.toml нет секции [docs]");
+    }
+    Ok(())
+}
+
+/// `zam-server doc-worker --pdfium <lib>` из комплекта: кадр `ping` (протокол
+/// `zam_server::docs::protocol`: длина тела `u32` BE, номер `u64` BE, JSON) → `pong`; stdin
+/// закрывается — процесс выходит с кодом 0. Возвращает причину отказа pdfium (`None` —
+/// библиотека загружена).
+fn doc_worker_ping(root: &Path, lib: &Path) -> Result<Option<String>> {
+    const ID: u64 = 7;
+    let body = br#"{"op":"ping"}"#;
+    let mut frame = Vec::with_capacity(12 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&ID.to_be_bytes());
+    frame.extend_from_slice(body);
+    let mut cmd = Command::new(root.join(crate::package::exe(host_platform(root), "zam-server")));
+    scrub_zam_env(&mut cmd, &[])
+        .args(["doc-worker", "--max-frame", WORKER_MAX_FRAME, "--pdfium"])
+        .arg(lib)
+        .current_dir(root);
+    let out = ensure_success(output_with_stdin(&mut cmd, Some(&frame), CMD_TIMEOUT)?)?;
+    let b = &out.stdout;
+    if b.len() < 12 {
+        bail!(
+            "ответ короче заголовка кадра ({} байт); stderr: {}",
+            b.len(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let len = u32::from_be_bytes(b[..4].try_into()?) as usize;
+    let id = u64::from_be_bytes(b[4..12].try_into()?);
+    if id != ID || b.len() != 12 + len {
+        bail!(
+            "кадр ответа: номер {id} (ожидался {ID}), тело {len} байт, получено {}",
+            b.len() - 12
+        );
+    }
+    let v: Value = serde_json::from_slice(&b[12..]).context("тело кадра ответа не JSON")?;
+    if v["op"] != "pong" {
+        bail!("ожидался pong: {v}");
+    }
+    Ok(v["pdfium"].as_str().map(String::from))
+}
+
+/// Критерий M5: pdfium из каталога комплекта грузится рабочим процессом (`ping` → `pong` без
+/// причины); с несуществующей библиотекой — `pong` с причиной (проверка не пустая).
+fn pdfium_loads(root: &Path, platform: &str) -> Result<()> {
+    let lib = root.join(crate::package::pdfium_file(platform));
+    if let Some(r) = doc_worker_ping(root, &lib)? {
+        bail!("pdfium {} не загрузился: {r}", lib.display());
+    }
+    let missing = root.join("no-such-pdfium-library");
+    if doc_worker_ping(root, &missing)?.is_none() {
+        bail!(
+            "ping с несуществующей библиотекой {} ответил «загружена»",
+            missing.display()
+        );
+    }
+    Ok(())
+}
+
+/// Вложения шагов M5: узел-владелец, документы (`GET /nodes/{id}/attachments`) по имени файла,
+/// номер абзаца факта DOCX.
+struct DocsAttached {
+    home: PathBuf,
+    docs: BTreeMap<String, Value>,
+    docx_para: u32,
+}
+
+/// Критерий M5: заметка (`zam write`) → `zam attach` PDF, DOCX и XLSX → извлечение каждого
+/// документа `done` (PDF — рабочим процессом с pdfium комплекта) за ≤ 60 с.
+fn docs_attach(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<DocsAttached> {
+    let home = dir.join("docs-home");
+    fs::create_dir_all(&home)?;
+    let target = format!("knowledge:{DOCS_NOTE}");
+    let run = |args: &[&str], input: Option<&[u8]>| zam_ok(zam, &home, base, token, args, input);
+    let out = run(
+        &["write", &target],
+        Some(b"# Smoke documents\n\nAttachments of the smoke test.\n"),
+    )?;
+    let node = printed_id(&String::from_utf8_lossy(&out.stdout), "zam write")?;
+    let (files, docx_para) = docs_files();
+    for (name, data) in &files {
+        let p = home.join(name);
+        fs::write(&p, data)?;
+        let out = run(&["attach", &target, &p.to_string_lossy(), "--json"], None)?;
+        let v: Value = serde_json::from_slice(&out.stdout)
+            .with_context(|| format!("zam attach {name} --json: не JSON"))?;
+        if v["sha256"].as_str().is_none_or(|s| s.len() != 64) {
+            bail!("zam attach {name}: нет sha256 в ответе: {v}");
+        }
+    }
+    let t0 = Instant::now();
+    loop {
+        let (status, v) = api(
+            base,
+            token,
+            &format!("/api/v1/nodes/{node}/attachments"),
+            None,
+        )?;
+        if status != 200 {
+            bail!("GET /api/v1/nodes/{node}/attachments: HTTP {status}: {v}");
+        }
+        let docs: BTreeMap<String, Value> = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| Some((d["filename"].as_str()?.to_string(), d.clone())))
+            .collect();
+        let state = |n: &str| docs.get(n).and_then(|d| d["extract_state"].as_str());
+        if let Some((n, d)) = docs
+            .iter()
+            .find(|(n, _)| matches!(state(n), Some("failed" | "unsupported" | "excluded")))
+        {
+            bail!(
+                "{n}: extract_state = {}, extract_error = {}",
+                d["extract_state"],
+                d["extract_error"]
+            );
+        }
+        if files.iter().all(|(n, _)| state(n) == Some("done")) {
+            return Ok(DocsAttached {
+                home,
+                docs,
+                docx_para,
+            });
+        }
+        if t0.elapsed() > INDEX_WAIT {
+            bail!(
+                "за {} с документы не извлечены: {}",
+                INDEX_WAIT.as_secs(),
+                files
+                    .iter()
+                    .map(|(n, _)| format!("{n} {}", state(n).unwrap_or("нет")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Карточка вложения в выдаче поиска.
+struct DocHit {
+    file: &'static str,
+    id: String,
+    locator: String,
+    evidence: &'static str,
+}
+
+/// Элементы выдачи для текста ошибки: вид, файл и `locator` (у вложения) или путь.
+fn describe_doc_items(v: &Value) -> String {
+    v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| match i["kind"].as_str() {
+            Some("attachment") => format!("attachment {} {}", i["file"], i["locator"]),
+            k => format!("{} {}", k.unwrap_or("?"), i["path"]),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Критерий M5: фрагмент PDF и DOCX находится поиском (`filters.kinds = ["attachment"]`) —
+/// карточка вложения файла заметки `smoke/docs` с `locator`: у PDF — страница факта
+/// (`page:2`), у DOCX — абзац не позже абзаца факта. Ожидание индексации ≤ 60 с.
+fn docs_search(base: &str, token: &str, att: &DocsAttached) -> Result<Vec<DocHit>> {
+    let mut hits = Vec::new();
+    for (file, query, evidence) in [
+        ("smoke.pdf", PDF_QUERY, PDF_FACT),
+        ("smoke.docx", DOCX_QUERY, DOCX_FACT),
+    ] {
+        let body = serde_json::json!({
+            "query": query, "mode": "notes", "top_k": 5,
+            "filters": { "kinds": ["attachment"] },
+        });
+        let t0 = Instant::now();
+        let item = loop {
+            let (status, v) = api(base, token, "/api/v1/search", Some(&body))?;
+            if status != 200 {
+                bail!("POST /api/v1/search «{query}»: HTTP {status}: {v}");
+            }
+            let item = v["items"]
+                .as_array()
+                .and_then(|a| {
+                    a.iter()
+                        .find(|i| i["kind"] == "attachment" && i["file"] == file)
+                })
+                .cloned();
+            if let Some(item) = item
+                && v["pending_count"] == 0
+                && v["degraded"] == false
+            {
+                break item;
+            }
+            if t0.elapsed() > INDEX_WAIT {
+                bail!(
+                    "за {} с «{query}» не нашёл {file}: degraded = {}, pending_count = {}, \
+                     выдача: {}",
+                    INDEX_WAIT.as_secs(),
+                    v["degraded"],
+                    v["pending_count"],
+                    describe_doc_items(&v)
+                );
+            }
+            thread::sleep(Duration::from_millis(500));
+        };
+        if !item["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with(DOCS_NOTE))
+        {
+            bail!(
+                "{file}: карточка вложения не заметки {DOCS_NOTE}: path = {}",
+                item["path"]
+            );
+        }
+        let locator = item["locator"]
+            .as_str()
+            .with_context(|| format!("{file}: у карточки нет locator: {item}"))?
+            .to_string();
+        let id = item["id"]
+            .as_str()
+            .filter(|i| i.starts_with("a:"))
+            .with_context(|| format!("{file}: id карточки не a:<фрагмент>: {}", item["id"]))?
+            .to_string();
+        let ok = match file {
+            "smoke.pdf" => locator == "page:2",
+            _ => locator
+                .strip_prefix("para:")
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some_and(|n| (1..=att.docx_para).contains(&n)),
+        };
+        if !ok {
+            bail!(
+                "{file}: locator = {locator} (ожидалось {})",
+                if file == "smoke.pdf" {
+                    "page:2".to_string()
+                } else {
+                    format!("para:N, N ≤ {}", att.docx_para)
+                }
+            );
+        }
+        hits.push(DocHit {
+            file,
+            id,
+            locator,
+            evidence,
+        });
+    }
+    Ok(hits)
+}
+
+/// Пробелы схлопнуты: переносы строк извлечения и вывода не влияют на сравнение.
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Критерий M5: `zam read a:<фрагмент> --locator <locator>` (`POST /read`) — текст места
+/// документа с фрагментом; у PDF — без текста другой страницы.
+fn docs_read(
+    zam: &Path,
+    base: &str,
+    token: &str,
+    att: &DocsAttached,
+    hits: &[DocHit],
+) -> Result<()> {
+    for h in hits {
+        let out = zam_ok(
+            zam,
+            &att.home,
+            base,
+            token,
+            &["read", &h.id, "--locator", &h.locator],
+            None,
+        )?;
+        let text = squash(&String::from_utf8_lossy(&out.stdout));
+        if !text.contains(&squash(h.evidence)) {
+            bail!(
+                "zam read {} --locator {}: нет фрагмента «{}»:\n{text}",
+                h.id,
+                h.locator,
+                h.evidence
+            );
+        }
+        if h.file == "smoke.pdf" && text.contains(&squash(PDF_PAGE1)) {
+            bail!(
+                "zam read {} --locator page:2: в тексте страница 1:\n{text}",
+                h.id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Критерий M5: превью листа XLSX (`kind=sheet`: имя листа, шапка, строки данных, их число) и
+/// миниатюра страницы 1 PDF (`kind=thumb`: PNG — страницу рисует pdfium комплекта).
+fn docs_previews(base: &str, token: &str, att: &DocsAttached) -> Result<()> {
+    let sha = |n: &str| -> Result<String> {
+        att.docs
+            .get(n)
+            .and_then(|d| d["sha256"].as_str())
+            .map(String::from)
+            .with_context(|| format!("нет sha256 вложения {n}"))
+    };
+    let path = format!(
+        "/api/v1/previews/{}?kind=sheet&sheet=1&from=1&rows=10",
+        sha("smoke.xlsx")?
+    );
+    let (status, v) = api(base, token, &path, None)?;
+    if status != 200 {
+        bail!("GET {path}: HTTP {status}: {v}");
+    }
+    let want_rows = serde_json::json!(XLSX_ROWS);
+    if v["name"] != XLSX_SHEET
+        || v["header"] != serde_json::json!(XLSX_HEADER)
+        || v["rows"] != want_rows
+        || v["total_rows"] != XLSX_ROWS.len()
+    {
+        bail!(
+            "лист XLSX: name = {}, header = {}, rows = {}, total_rows = {} (ожидались \
+             {XLSX_SHEET}, {:?}, {want_rows}, {})",
+            v["name"],
+            v["header"],
+            v["rows"],
+            v["total_rows"],
+            XLSX_HEADER,
+            XLSX_ROWS.len()
+        );
+    }
+    let path = format!(
+        "/api/v1/previews/{}?kind=thumb&page=1&px=128",
+        sha("smoke.pdf")?
+    );
+    let mut r = agent()
+        .get(&format!("{base}{path}"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .call()?;
+    let status = r.status().as_u16();
+    let ctype = r
+        .headers()
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let png = r.body_mut().with_config().limit(16 << 20).read_to_vec()?;
+    if status != 200 || ctype != "image/png" || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        bail!(
+            "GET {path}: HTTP {status}, content-type {ctype}, {} байт (ожидался PNG)",
+            png.len()
+        );
     }
     Ok(())
 }

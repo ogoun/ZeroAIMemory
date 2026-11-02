@@ -22,7 +22,7 @@
 //! `evidence`) и эталон порядка строк страниц PDF (A/B порядка чтения, [`OrderPage`]).
 
 mod hostile;
-mod ooxml;
+pub(crate) mod ooxml;
 pub mod pdf;
 mod text;
 
