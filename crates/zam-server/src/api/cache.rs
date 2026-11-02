@@ -21,6 +21,8 @@
 //! - **источники** (`id` — как в `POST /read`: `n:`, `i:|c:|r:|t:|k:|q:|e:`, голый id, путь
 //!   `<пространство>:/<путь>`): должны лежать в базе пространства кэша (иначе 422
 //!   `/problems/cache-cross-db`); Human и Vault — 422 `/problems/cache-forbidden-source`;
+//!   отчёт (M5.5 §7) — токену как несуществующий (`cache-source-not-found`), человеку —
+//!   `cache-forbidden-source` (выжимки читает агент, отчёт ему не выдаётся);
 //!   нет источника, он удалён, папка или нет секции — 422 `/problems/cache-source-not-found`;
 //!   insight `superseded` или `retracted` — 422 `/problems/cache-source-inactive`;
 //!   `rev` не совпал с текущей — 409 с `rev` (выжимка основана на устаревшем тексте).
@@ -51,8 +53,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
 use zam_store::{
-    CacheError, CacheFilter, CacheHit, CachePut, Db, PromoteAs, SourceSpec, Space, SpaceKind,
-    StoreError, TITLE_MAX_CHARS, cache_delete, cache_get, cache_list, cache_promote,
+    CacheError, CacheFilter, CacheHit, CachePut, Db, EntryKind, PromoteAs, SourceSpec, Space,
+    SpaceKind, StoreError, TITLE_MAX_CHARS, cache_delete, cache_get, cache_list, cache_promote,
     cache_put_with, count_tokens, get_entry, get_node, get_space, vault_get_any,
 };
 
@@ -165,9 +167,12 @@ fn not_found(raw: &str) -> ApiError {
     })
 }
 
-/// Цель по сырой ссылке в базе `db` (в том числе Human, удалённая): узел, запись или Vault.
+/// Цель по сырой ссылке в базе `db` (в том числе Human, удалённая): узел, запись, отчёт или
+/// Vault.
 enum Raw {
     Target(TargetRef, SpaceKind),
+    /// Запись вида `report` (M5.5 §7): источником выжимки не бывает — выжимки читает агент.
+    Report,
     Vault,
     Missing,
 }
@@ -197,6 +202,7 @@ async fn raw_lookup(db: &Db, prefix: Option<&str>, id: Id) -> Result<Raw, ApiErr
     }
     if prefix != Some("n") {
         match get_entry(db, id).await {
+            Ok(e) if e.kind == EntryKind::Report => return Ok(Raw::Report),
             Ok(e) => {
                 let k = space_kind(e.space_id).await?;
                 return Ok(Raw::Target(
@@ -282,6 +288,9 @@ async fn resolve_source(
     for (owner, db) in &dbs {
         match raw_lookup(db, prefix, id).await? {
             Raw::Vault => return Err(forbidden_source(raw)),
+            // токену отчёт не существует: дальше — как отсутствующий (`not_found`)
+            Raw::Report if !p.is_human() => {}
+            Raw::Report => return Err(forbidden_source(raw)),
             Raw::Target(_, SpaceKind::Human) => return Err(forbidden_source(raw)),
             Raw::Target(t, _) if *owner == sc.owner && !member => return Ok(t),
             Raw::Target(..) => return Err(cross_db(raw)),
@@ -294,10 +303,11 @@ async fn resolve_source(
             .await
             .map(|s| (s.owner, s.space.id, TargetKind::Node))
     };
-    let as_entry = async || {
-        super::scope::entry_scope(st, p, headers, rest, Mode::Read)
-            .await
-            .map(|s| (s.owner, s.space.id, TargetKind::Entry))
+    // отчёт в чужой базе: токену — 404 ещё в `entry_scope`, человеку — запрещённый источник
+    let as_entry = async || match super::scope::entry_scope(st, p, headers, rest, Mode::Read).await
+    {
+        Ok(s) if s.entry.kind == EntryKind::Report => Err(forbidden_source(raw)),
+        r => r.map(|s| (s.owner, s.space.id, TargetKind::Entry)),
     };
     let found = match prefix {
         Some("e") => as_entry().await,
@@ -558,6 +568,7 @@ pub async fn put(
         &req.filters,
         req.include_history,
         solution.as_ref(),
+        p.is_human(),
     )?;
     let mut sources = Vec::with_capacity(req.sources.len());
     for s in &req.sources {

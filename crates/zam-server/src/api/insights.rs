@@ -69,7 +69,8 @@ use super::graph::insight_links;
 use super::json_body;
 use super::nodes::audit_node;
 use super::scope::{
-    EntryScope, MemScope, Mode, deny_report_mutation, entry_scope, live_entry, space_scope,
+    EntryScope, MemScope, Mode, deny_report_mutation, entry_scope, hidden_entry, live_entry,
+    space_scope,
 };
 use crate::app::AppState;
 use crate::attrib::attribution;
@@ -771,7 +772,7 @@ pub async fn create(
     if let Some(raw) = req.supersedes_id.take() {
         let old = super::parse_id(&raw)?;
         let o = match get_entry(&sc.db, old).await {
-            Ok(o) if o.deleted_at.is_none() => o,
+            Ok(o) if o.deleted_at.is_none() && !hidden_entry(p, &o) => o,
             Ok(_) | Err(zam_store::StoreError::NotFound) => return Err(ApiError::NotFound),
             Err(e) => return Err(e.into()),
         };
@@ -779,6 +780,10 @@ pub async fn create(
         // решения (Knowledge владельца и т. п.) — 404, а не 422
         if o.space_id != sc.space.id && sc.owner != sc.user.id {
             return Err(ApiError::NotFound);
+        }
+        // замещение отчёта — его изменение: человеку 409 (токену отчёт не существует — выше)
+        if o.kind == EntryKind::Report {
+            return Err(ApiError::ReportImmutable);
         }
         if o.space_id != sc.space.id || o.kind != kind {
             return Err(unprocessable(format!(

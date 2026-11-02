@@ -630,7 +630,7 @@ fn default_space(rest: &Rest) -> String {
         .to_string()
 }
 
-/// Id записи журнала без префикса ссылки `i:|c:|r:|t:|k:|q:|e:` (или `entry:`).
+/// Id записи журнала без префикса ссылки `i:|c:|r:|t:|k:|q:|p:|e:` (или `entry:`).
 fn entry_id(raw: &str) -> &str {
     let t = raw.trim();
     match t.split_once(':') {
@@ -639,7 +639,8 @@ fn entry_id(raw: &str) -> &str {
     }
 }
 
-/// Ссылка графа: `i:|c:|r:|t:|k:|q:<id>` → `e:<id>`, остальное — как есть.
+/// Ссылка графа: `i:|c:|r:|t:|k:|q:|p:<id>` → `e:<id>`, остальное — как есть (отчёт `p:` токену
+/// — 404 в REST, как несуществующая запись).
 fn graph_ref(raw: &str) -> String {
     let t = raw.trim();
     match t.split_once(':') {

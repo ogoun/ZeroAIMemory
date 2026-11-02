@@ -8,289 +8,16 @@
 //! и сессия WebUI. Отчёты пишет агент A (токен). Серверы без моделей (FTS).
 mod common;
 
-use std::net::SocketAddr;
-
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{Method, Request, StatusCode, header};
-use common::api::{Api, Resp, api, req};
+use common::api::Resp;
+use common::reports::*;
 use serde_json::{Value, json};
-use zam_store::{EntryAttachment, entry_attachments, get_entry};
+use zam_store::get_entry;
 
-const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e12";
-const BOUNDARY: &str = "zam-report-access-7d21";
-const PASS: &str = "first-pass-123";
-const NEW_PASS: &str = "second-pass-456";
-const IMMUTABLE: &str = "/problems/report-immutable";
-
-/// Сессия пользователя WebUI: cookie, CSRF и адрес клиента (лимит входа — по IP).
-struct Web {
-    cookie: String,
-    csrf: String,
-    ip: String,
-}
-
-/// Пользователь: id, токен `rw`, сессия WebUI.
-struct User {
-    id: String,
-    tok: String,
-    web: Web,
-}
-
-struct W {
-    a: Api,
-    /// Владелец решения.
-    o: User,
-    /// Участник `rw`.
-    rw: User,
-    /// Участник `ro`.
-    ro: User,
-}
-
-fn with_ip(mut r: Request<Body>, ip: &str) -> Request<Body> {
-    r.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(ip.parse().unwrap(), 40_000)));
-    r
-}
-
-fn ok(r: &Resp, s: StatusCode, ctx: &str) {
-    assert_eq!(r.status, s, "{ctx}: {}", r.text());
-}
-
-async fn login(a: &Api, name: &str, pw: &str, ip: &str) -> Web {
-    let body = json!({ "login": name, "password": pw });
-    let r = req(Method::POST, "/api/v1/auth/login", Some(&body))
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let r = a.send(with_ip(r, ip)).await;
-    ok(&r, StatusCode::OK, "вход");
-    Web {
-        cookie: r
-            .header("set-cookie")
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string(),
-        csrf: r.json()["csrf"].as_str().unwrap().to_string(),
-        ip: ip.into(),
-    }
-}
-
-/// Запрос сессии пользователя с дополнительными заголовками.
-async fn web_h(
-    a: &Api,
-    w: &Web,
-    m: Method,
-    uri: &str,
-    body: Option<Value>,
-    extra: &[(&str, &str)],
-) -> Resp {
-    let mut b = req(m, uri, body.as_ref())
-        .header(header::COOKIE, &w.cookie)
-        .header("x-csrf-token", &w.csrf);
-    for (k, v) in extra {
-        b = b.header(*k, *v);
-    }
-    let body = body.map_or_else(Body::empty, |v| Body::from(v.to_string()));
-    a.send(with_ip(b.body(body).unwrap(), &w.ip)).await
-}
-
-async fn web(a: &Api, w: &Web, m: Method, uri: &str, body: Option<Value>) -> Resp {
-    web_h(a, w, m, uri, body, &[]).await
-}
-
-/// Пользователь с паролем после обязательной смены.
-async fn ready_user(a: &Api, name: &str, ip: &str) -> User {
-    let (id, tok) = a.new_user(name).await;
-    let r = a
-        .adm(
-            Method::POST,
-            &format!("/api/v1/admin/users/{id}/password"),
-            Some(json!({ "password": PASS })),
-            None,
-        )
-        .await;
-    ok(&r, StatusCode::OK, "пароль");
-    let w = login(a, name, PASS, ip).await;
-    let r = web(
-        a,
-        &w,
-        Method::POST,
-        "/api/v1/auth/password",
-        Some(json!({ "old": PASS, "new": NEW_PASS })),
-    )
-    .await;
-    ok(&r, StatusCode::NO_CONTENT, "смена пароля");
-    User { id, tok, web: w }
-}
-
-/// Решение `guid` пользователя `owner` с участником `member` в режиме `access`.
-async fn share(a: &Api, guid: &str, owner: &str, member: &User, access: &str) {
-    let reg = json!({"agent_solution_id": guid, "name": "Исследование"});
-    let r = a
-        .tok(&member.tok, Method::POST, "/api/v1/solutions", Some(reg))
-        .await;
-    ok(&r, StatusCode::ACCEPTED, "запрос доступа");
-    let r = a
-        .tok(
-            owner,
-            Method::POST,
-            &format!("/api/v1/solutions/{guid}/access/{}/approve", member.id),
-            Some(json!({ "access": access })),
-        )
-        .await;
-    ok(&r, StatusCode::OK, "одобрение");
-}
-
+/// Мир задачи 3: каталог данных — `reports-access-<name>`.
 async fn world(name: &str) -> W {
-    let a = api(&format!("reports-access-{name}"), |_| {}).await;
-    let o = ready_user(&a, "Анна", "10.0.0.1").await;
-    let rw = ready_user(&a, "Борис", "10.0.0.2").await;
-    let ro = ready_user(&a, "Вера", "10.0.0.3").await;
-    let reg = json!({"agent_solution_id": G, "name": "Исследование"});
-    let r = a
-        .tok(&o.tok, Method::POST, "/api/v1/solutions", Some(reg))
-        .await;
-    ok(&r, StatusCode::CREATED, "решение");
-    share(&a, G, &o.tok, &rw, "rw").await;
-    share(&a, G, &o.tok, &ro, "ro").await;
-    W { a, o, rw, ro }
-}
-
-/// Части multipart: `meta`, затем файлы частями `file`.
-fn multipart(meta: &Value, files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut b = Vec::new();
-    let mut part = |disp: String, ct: &str, data: &[u8]| {
-        b.extend_from_slice(
-            format!("--{BOUNDARY}\r\n{disp}\r\nContent-Type: {ct}\r\n\r\n").as_bytes(),
-        );
-        b.extend_from_slice(data);
-        b.extend_from_slice(b"\r\n");
-    };
-    part(
-        "Content-Disposition: form-data; name=\"meta\"".into(),
-        "application/json",
-        meta.to_string().as_bytes(),
-    );
-    for (n, d) in files {
-        part(
-            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{n}\""),
-            "application/octet-stream",
-            d,
-        );
-    }
-    b.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
-    b
-}
-
-/// PNG-подобные байты (сигнатура и `n` байт содержимого по `seed`).
-fn png(seed: u8, n: usize) -> Vec<u8> {
-    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
-    v.extend((0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)));
-    v
-}
-
-const SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\">\
-<script>alert(2)</script><rect width=\"10\" height=\"10\"/></svg>";
-const CSV: &[u8] = b"epoch,loss\n1,0.9\n2,0.5\n";
-
-/// Тело отчёта со всеми видами содержимого.
-const BODY: &str = "# Итог\n\n![loss](figs/loss.png)\n\n![схема](diag.svg)\n\n\
-Формула $E = mc^2$ и блок:\n\n$$\\int_0^1 x\\,dx$$\n\n\
-```mermaid\ngraph TD; A-->B\n```\n\n| метрика | значение |\n|---|---|\n| acc | 0,93 |\n\n\
-```rust\nfn main() { let x = 1; }\n```\n\n[данные](results.csv)\n";
-
-impl W {
-    /// Отчёт агентом владельца (multipart, как `zam report`): id.
-    async fn report_with(&self, title: &str, body: &str, files: &[(&str, &[u8])]) -> String {
-        let meta = json!({"title": title, "body": body, "tags": ["ml"]});
-        let r = Request::post(format!("/api/v1/spaces/{G}/entries"))
-            .header(header::AUTHORIZATION, format!("Bearer {}", self.o.tok))
-            .header(
-                header::CONTENT_TYPE,
-                format!("multipart/form-data; boundary={BOUNDARY}"),
-            )
-            .header("x-zam-session", "sess-report-1")
-            .header("x-zam-machine", "gpu-box")
-            .body(Body::from(multipart(&meta, files)))
-            .unwrap();
-        let r = self.a.send(r).await;
-        ok(&r, StatusCode::CREATED, "отчёт");
-        r.json()["id"].as_str().unwrap().to_string()
-    }
-
-    /// Полный отчёт: картинка PNG, SVG и CSV.
-    async fn report(&self, title: &str) -> String {
-        let p = png(1, 200);
-        self.report_with(
-            title,
-            BODY,
-            &[
-                ("figs/loss.png", &p),
-                ("diag.svg", SVG),
-                ("results.csv", CSV),
-            ],
-        )
-        .await
-    }
-
-    async fn db(&self) -> zam_store::Db {
-        self.a
-            .st
-            .users
-            .get(self.o.id.parse().unwrap())
-            .await
-            .unwrap()
-    }
-
-    async fn files_of(&self, id: &str) -> Vec<EntryAttachment> {
-        entry_attachments(&self.db().await, id.parse().unwrap())
-            .await
-            .unwrap()
-    }
-
-    async fn file(&self, id: &str, name: &str) -> EntryAttachment {
-        self.files_of(id)
-            .await
-            .into_iter()
-            .find(|f| f.filename == name)
-            .unwrap()
-    }
-
-    /// Ревизия и тело записи в базе владельца.
-    async fn stored(&self, id: &str) -> (i64, String) {
-        let e = get_entry(&self.db().await, id.parse().unwrap())
-            .await
-            .unwrap();
-        (e.rev, e.body)
-    }
-
-    /// Заметка в решении (токен владельца): id.
-    async fn note(&self, path: &str) -> String {
-        let r = self
-            .a
-            .tok(
-                &self.o.tok,
-                Method::POST,
-                "/api/v1/nodes",
-                Some(json!({"space": G, "path": path, "kind": "note", "content": "текст"})),
-            )
-            .await;
-        ok(&r, StatusCode::CREATED, "заметка");
-        r.json()["id"].as_str().unwrap().to_string()
-    }
-}
-
-fn file_uri(id: &str, f: &EntryAttachment) -> String {
-    format!(
-        "/api/v1/entries/{id}/attachments/{}/{}",
-        f.sha256,
-        common::api::enc(&f.filename)
-    )
-}
-
-fn problem(r: &Resp) -> String {
-    r.json()["type"].as_str().unwrap_or_default().to_string()
+    common::reports::world(&format!("reports-access-{name}")).await
 }
 
 #[tokio::test]
@@ -468,6 +195,11 @@ async fn report_attachment_download_image_inline_svg_sandbox() {
     assert!(csp.contains("default-src 'none'"), "{csp}");
     assert!(!csp.contains("script-src"), "{csp}");
     assert_eq!(r.header("x-content-type-options"), "nosniff");
+    // прямое открытие SVG — скачивание (как у вложений заметок M5; `<img>` грузит и так)
+    assert_eq!(
+        r.header("content-disposition"),
+        "attachment; filename*=UTF-8''diag.svg"
+    );
     assert_eq!(&r.body[..], SVG);
 }
 
@@ -794,6 +526,18 @@ async fn report_patch_any_field_409() {
         )
         .await;
     ok(&r, StatusCode::NOT_FOUND, "токен");
+    // токен `ro` — тоже 404 (вид проверяется раньше прав записи, задача 4)
+    let ro = w.a.issue(&w.o.id, "ro").await;
+    let r =
+        w.a.tok_h(
+            &ro,
+            Method::PATCH,
+            &uri,
+            Some(json!({"title": "x"})),
+            &[("if-match", "1")],
+        )
+        .await;
+    ok(&r, StatusCode::NOT_FOUND, "токен ro");
     let (rev, body) = w.stored(&id).await;
     assert_eq!((rev, body), (rev0, body0));
 }
@@ -961,14 +705,24 @@ async fn restore_as(w: &W, who: &str, id: &str) -> Resp {
 
 const NOT_OWNERS: [&str; 5] = ["rw", "ro", "owner-token", "member-token", "admin-for"];
 
+/// Отказ не владельцу: сессиям WebUI — 403, токену — 404 (отчёт агенту не существует, §7;
+/// решение задачи 4: 403 выдавал бы существование).
+fn denied(who: &str) -> StatusCode {
+    if who.ends_with("-token") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::FORBIDDEN
+    }
+}
+
 #[tokio::test]
 async fn report_delete_restore_owner_only() {
     let w = world("trash").await;
     let id = w.report("Удаляемый").await;
     for who in NOT_OWNERS {
         let r = delete_as(&w, who, &id).await;
-        ok(&r, StatusCode::FORBIDDEN, &format!("удаление: {who}"));
-        if who != "ro" {
+        ok(&r, denied(who), &format!("удаление: {who}"));
+        if denied(who) == StatusCode::FORBIDDEN && who != "ro" {
             // участник ro отбивается правами записи раньше
             assert!(
                 r.text().contains("только владелец решения"),
@@ -986,7 +740,7 @@ async fn report_delete_restore_owner_only() {
     );
     for who in NOT_OWNERS {
         let r = restore_as(&w, who, &id).await;
-        ok(&r, StatusCode::FORBIDDEN, &format!("восстановление: {who}"));
+        ok(&r, denied(who), &format!("восстановление: {who}"));
     }
     let r = restore_as(&w, "owner", &id).await;
     ok(&r, StatusCode::OK, "владелец восстанавливает");
@@ -1029,7 +783,7 @@ async fn report_delete_restore_owner_only() {
         )
         .await;
     ok(&r, StatusCode::OK, "администратор восстанавливает свой");
-    // а его токен — нет
+    // а его токен — нет (404: отчёт токену не существует)
     let r =
         w.a.tok_h(
             &w.a.token,
@@ -1039,7 +793,7 @@ async fn report_delete_restore_owner_only() {
             &[("if-match", "1")],
         )
         .await;
-    ok(&r, StatusCode::FORBIDDEN, "токен администратора");
+    ok(&r, StatusCode::NOT_FOUND, "токен администратора");
 
     // прочие записи по-прежнему удаляет участник rw
     let r =
@@ -1153,5 +907,125 @@ async fn report_member_ro_reads_html_and_files() {
         let csv = w.file(&id, "results.csv").await;
         let r = web(&w.a, &u.web, Method::GET, &file_uri(&id, &csv), None).await;
         ok(&r, StatusCode::OK, &format!("csv: {who}"));
+    }
+}
+
+/// Ревью задачи 3: курсор корзины (`deleted=only`, порядок по `deleted_at`) при `limit=1` и
+/// двух удалённых отчётах — две страницы по одному, без повторов.
+#[tokio::test]
+async fn report_trash_cursor_limit_1() {
+    let w = world("trash-cursor").await;
+    let first = w.report("Первый в корзину").await;
+    let second = w.report("Второй в корзину").await;
+    let _live = w.report("Живой").await;
+    for id in [&first, &second] {
+        ok(
+            &delete_as(&w, "owner", id).await,
+            StatusCode::NO_CONTENT,
+            "удаление",
+        );
+    }
+    let uri = format!("/api/v1/spaces/{G}/entries?kind=report&deleted=only&limit=1");
+    let r = web(&w.a, &w.o.web, Method::GET, &uri, None).await;
+    ok(&r, StatusCode::OK, "страница 1");
+    let j = r.json();
+    let items = j["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{j}");
+    // удалён последним — первым
+    assert_eq!(items[0]["id"], second, "{j}");
+    let cursor = j["next_cursor"].as_str().unwrap().to_string();
+    let r = web(
+        &w.a,
+        &w.o.web,
+        Method::GET,
+        &format!("{uri}&cursor={}", common::api::enc(&cursor)),
+        None,
+    )
+    .await;
+    ok(&r, StatusCode::OK, "страница 2");
+    let j = r.json();
+    let items = j["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{j}");
+    assert_eq!(items[0]["id"], first, "{j}");
+    if let Some(c) = j["next_cursor"].as_str() {
+        let r = web(
+            &w.a,
+            &w.o.web,
+            Method::GET,
+            &format!("{uri}&cursor={}", common::api::enc(c)),
+            None,
+        )
+        .await;
+        ok(&r, StatusCode::OK, "страница 3");
+        assert!(
+            r.json()["items"].as_array().unwrap().is_empty(),
+            "{}",
+            r.text()
+        );
+    }
+}
+
+/// Ревью задачи 3: `url` файла из ответа страницы (кириллица и пробел в имени) скачивается
+/// сквозным запросом.
+#[tokio::test]
+async fn report_file_url_cyrillic_space_end_to_end() {
+    let w = world("file-url").await;
+    let p = png(8, 64);
+    let id = w
+        .report_with(
+            "Файлы",
+            "![график](<графики/потери модели.png>)\n",
+            &[("графики/потери модели.png", &p)],
+        )
+        .await;
+    let r = web(
+        &w.a,
+        &w.o.web,
+        Method::GET,
+        &format!("/api/v1/entries/{id}?format=html"),
+        None,
+    )
+    .await;
+    ok(&r, StatusCode::OK, "страница");
+    let j = r.json();
+    let url = j["files"][0]["url"].as_str().unwrap().to_string();
+    assert!(!url.contains(' '), "{url}");
+    assert!(j["html"].as_str().unwrap().contains(&url), "{j}");
+    let r = web(&w.a, &w.o.web, Method::GET, &format!("/{url}"), None).await;
+    ok(&r, StatusCode::OK, &format!("скачивание {url}"));
+    assert_eq!(&r.body[..], &p[..]);
+    assert_eq!(r.header("content-type"), "image/png");
+}
+
+/// Ревью задачи 3: `?user=` от обычного пользователя игнорируется (только администратор
+/// действует от имени другого): страница и файл — из его собственной области.
+#[tokio::test]
+async fn report_user_param_ignored_for_plain_user() {
+    let w = world("user-param").await;
+    let id = w.report("Чужой user").await;
+    let loss = w.file(&id, "loss.png").await;
+    for (who, u, other) in [("владелец", &w.o, &w.rw.id), ("участник", &w.ro, &w.o.id)]
+    {
+        let r = web(
+            &w.a,
+            &u.web,
+            Method::GET,
+            &format!("/api/v1/entries/{id}?format=html&user={other}"),
+            None,
+        )
+        .await;
+        // не «от имени»: страница — своя (у `other` отчёта нет), адреса файлов — без `?user=`
+        ok(&r, StatusCode::OK, &format!("{who}: страница с ?user="));
+        assert!(!r.text().contains("?user="), "{who}: {}", r.text());
+        let r = web(
+            &w.a,
+            &u.web,
+            Method::GET,
+            &format!("{}?user={other}", file_uri(&id, &loss)),
+            None,
+        )
+        .await;
+        ok(&r, StatusCode::OK, &format!("{who}: файл с ?user="));
+        assert_eq!(&r.body[..], &png(1, 200)[..]);
     }
 }

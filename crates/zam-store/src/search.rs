@@ -278,6 +278,8 @@ pub struct EntryHit {
     pub insight_kind: Option<String>,
     pub certainty: Option<String>,
     pub title: String,
+    /// Время создания записи (карточка отчёта WebUI, M5.5).
+    pub created_at: Timestamp,
 }
 
 /// Цель чанка по `chunks.node_id` / `chunks.entry_id` / `chunks.attachment_id`: у чанка
@@ -337,7 +339,7 @@ const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.spac
     CASE WHEN json_type(e.data, '$.kind') = 'text' THEN json_extract(e.data, '$.kind') END,
     e.certainty, e.title, coalesce(n.area, e.area), coalesce(n.certainty, e.certainty),
     CASE WHEN c.attachment_id IS NULL THEN n.verified_at END,
-    c.attachment_id, ad.filename, ad.blob_sha256, c.locator";
+    c.attachment_id, ad.filename, ad.blob_sha256, c.locator, e.created_at";
 
 /// Хит по колонкам [`HIT_COLS`], начиная с колонки `o`.
 fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
@@ -351,6 +353,7 @@ fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
                 insight_kind: r.get(o + 14)?,
                 certainty: r.get(o + 15)?,
                 title: r.get(o + 16)?,
+                created_at: ts_at(r, o + 24)?,
             }),
             None,
         ),
