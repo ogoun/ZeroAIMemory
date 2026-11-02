@@ -23,14 +23,14 @@ const EOCD_TAIL: u64 = crate::ooxml::EOCD_WINDOW;
 /// затем по расширению имени (CSV, текст). `None` — вид не поддерживается.
 ///
 /// Расширение не перекрывает сигнатуру: PDF с именем `.docx` — `Pdf`, а `.docx` без
-/// сигнатуры zip — `None`.
+/// сигнатуры zip — `None`. Сигнатура zip с расширением OOXML/ODS, но испорченный архив (битый
+/// конец каталога, каталог не разбирается) — вид по расширению: разбор вернёт `parse_error`, и
+/// вложение станет `failed` с причиной, а не `unsupported` (спецификация M5 §7, задача 10).
+/// Каталог сверх лимитов (`max_entries`, `max_central_dir`) — по-прежнему `None`.
 pub fn sniff(bytes: &[u8], name: &str) -> Option<DocKind> {
-    let ext = name
-        .rsplit_once('.')
-        .map(|(_, e)| e.to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = ext_of(name);
     if bytes.starts_with(b"PK\x03\x04") {
-        return sniff_zip(bytes);
+        return sniff_zip(bytes, &ext);
     }
     if bytes.starts_with(&OLE) {
         // DOC, PPT, MSG тоже OLE; без расширения или с любым другим — пробуем как XLS
@@ -120,6 +120,7 @@ pub fn sniff_file<R: Read + Seek>(
     if !head.starts_with(b"PK\x03\x04") {
         return Ok(sniff(&head, name));
     }
+    let ext = ext_of(name);
     drop(head);
     let len = r.seek(SeekFrom::End(0))?;
     let start = len.saturating_sub(EOCD_TAIL);
@@ -133,24 +134,49 @@ pub fn sniff_file<R: Read + Seek>(
         Some(b)
     };
     let dir = crate::ooxml::zip_directory(&tail, start, len, limits, &mut read_at);
-    // сверх `max_entries`/`max_central_dir` или несогласованный — не документ (`unsupported`)
-    if !matches!(dir, Ok(ZipCheck::Fits(_))) {
-        return Ok(None);
+    match dir {
+        Ok(ZipCheck::Fits(_)) => {}
+        // испорченный каталог: OOXML/ODS по расширению (разбор даст `parse_error`)
+        Err(_) => return Ok(office_ext(&ext)),
+        // сверх `max_entries`/`max_central_dir` — не документ (`unsupported`)
+        Ok(_) => return Ok(None),
     }
     r.seek(SeekFrom::Start(0))?;
-    Ok(crate::ooxml::open_archive(r)
-        .ok()
-        .and_then(|mut zip| sniff_archive(&mut zip)))
+    Ok(match crate::ooxml::open_archive(r) {
+        Ok(mut zip) => sniff_archive(&mut zip),
+        Err(_) => office_ext(&ext),
+    })
 }
 
-fn sniff_zip(bytes: &[u8]) -> Option<DocKind> {
-    // та же строгая проверка конца каталога и его размера, что и при извлечении
-    let dir = crate::ooxml::zip_directory_of(bytes, &Limits::default());
-    if !matches!(dir, Ok(ZipCheck::Fits(_))) {
-        return None;
+/// Расширение имени файла в нижнем регистре.
+fn ext_of(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Вид OOXML/ODS по расширению — только для испорченного архива с сигнатурой zip.
+fn office_ext(ext: &str) -> Option<DocKind> {
+    match ext {
+        "docx" | "docm" | "dotx" | "dotm" => Some(DocKind::Docx),
+        "xlsx" | "xlsm" | "xltx" | "xltm" => Some(DocKind::Xlsx),
+        "pptx" | "pptm" | "potx" | "ppsx" => Some(DocKind::Pptx),
+        "ods" => Some(DocKind::Ods),
+        _ => None,
     }
-    let mut zip = crate::ooxml::open_archive(Cursor::new(bytes)).ok()?;
-    sniff_archive(&mut zip)
+}
+
+fn sniff_zip(bytes: &[u8], ext: &str) -> Option<DocKind> {
+    // та же строгая проверка конца каталога и его размера, что и при извлечении
+    match crate::ooxml::zip_directory_of(bytes, &Limits::default()) {
+        Ok(ZipCheck::Fits(_)) => {}
+        Err(_) => return office_ext(ext),
+        Ok(_) => return None,
+    }
+    match crate::ooxml::open_archive(Cursor::new(bytes)) {
+        Ok(mut zip) => sniff_archive(&mut zip),
+        Err(_) => office_ext(ext),
+    }
 }
 
 /// Начало записи `name` архива (до [`SNIFF_READ`] байт) строкой.

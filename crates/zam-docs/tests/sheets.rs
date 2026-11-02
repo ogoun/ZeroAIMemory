@@ -98,9 +98,67 @@ fn xlsx_sheets_blocks_with_header() {
     assert_eq!(sniff(&xlsx(&[], None), "x.bin"), Some(DocKind::Xlsx));
 }
 
-/// Даты по стилю ячейки (задача 10 M5): свой `numFmt` и встроенные 14 и 22 — ISO 8601, время —
-/// `ЧЧ:ММ`, длительность `[h]:mm`, валюта и проценты — число как есть; ошибка 1900-02-29 Excel и
-/// система 1904; превью листа (`sheet_page`) — тот же текст. Без стилей — число, как раньше.
+/// Стили — свой потолок (задача 10 M5, ревью): `xl/styles.xml` 1,5 МиБ при `max_unpacked`
+/// 1 МиБ читается и не съедает бюджет листа (даты — как в Excel, лист целиком, без `truncated`);
+/// стили сверх потолка (9 МиБ) — `skipped: xl/styles.xml`, даты числом, лист читается.
+#[test]
+fn xlsx_styles_have_own_budget() {
+    let pad = |bytes: usize| -> String {
+        // псевдослучайные hex-символы: сжатие ≈ 2:1, `max_ratio` не срабатывает
+        let mut x = 0x9e37_79b9u32;
+        (0..bytes)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                char::from(b"0123456789abcdef"[(x & 15) as usize])
+            })
+            .collect()
+    };
+    let styles = |padding: usize| {
+        format!(
+            r##"<styleSheet xmlns="{SML}"><!-- {} --><numFmts count="1"><numFmt numFmtId="164" formatCode="dd\.mm\.yyyy"/></numFmts><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>"##,
+            pad(padding)
+        )
+        .into_bytes()
+    };
+    let mut rows = String::new();
+    for r in 1..=300 {
+        rows.push_str(&format!(
+            r#"<row r="{r}"><c r="A{r}" s="1"><v>44270</v></c><c r="B{r}" t="inlineStr"><is><t>строка {r} {}</t></is></c></row>"#,
+            pad(1000)
+        ));
+    }
+    let book = |padding: usize| {
+        xlsx_styled(
+            &[("Л", sheet_xml(None, &rows))],
+            None,
+            Some(styles(padding)),
+            "",
+        )
+    };
+    let tight = Limits {
+        max_unpacked: 1024 * 1024,
+        ..Limits::default()
+    };
+    let x = run(DocKind::Xlsx, &book(1_500_000), &tight);
+    let text = all_text(&x);
+    assert!(x.warnings.is_empty(), "{:?}", x.warnings);
+    assert!(
+        text.contains("| 15.03.2021 |") && text.contains("строка 300 "),
+        "{}",
+        &text[..200]
+    );
+    let x = run(DocKind::Xlsx, &book(9 * 1024 * 1024), &Limits::default());
+    assert_eq!(x.warnings, ["skipped: xl/styles.xml"], "{:?}", x.warnings);
+    let text = all_text(&x);
+    assert!(text.contains("| 44270 |") && text.contains("строка 300 "));
+}
+
+/// Даты по стилю ячейки (задача 10 M5): свой числовой `numFmt` — как в Excel (`01.11.2023`),
+/// встроенные 14 и 22 и формат с названием месяца — ISO 8601, время — `ЧЧ:ММ`, длительность
+/// `[h]:mm`, валюта и проценты — число как есть; ошибка 1900-02-29 Excel и система 1904; превью
+/// листа (`sheet_page`) — тот же текст. Без стилей — число, как раньше.
 #[test]
 fn xlsx_dates_by_number_format() {
     let styles = format!(

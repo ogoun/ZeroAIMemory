@@ -310,6 +310,25 @@ fn pptx_slides_and_notes_order() {
 
 /// `sniff_file` (по `Read + Seek`, без чтения файла в память) даёт тот же вид, что `sniff`, и
 /// сверяет число записей zip с `limits.max_entries` до разбора каталога (задача 4 M5, раунд 1).
+/// Обрезанный DOCX (сигнатура zip есть, конца каталога нет): вид — по расширению, разбор —
+/// `Malformed` области `zip`, а не «вид не поддерживается» — вложение станет `failed` с причиной
+/// (спецификация M5 §7, задача 10). Без расширения OOXML — `None`, как раньше.
+#[test]
+fn truncated_ooxml_is_malformed_not_unsupported() {
+    let full = docx(&p("Текст"));
+    let cut = &full[..full.len() / 2];
+    let l = Limits::default();
+    assert_eq!(sniff(cut, "отчёт.docx"), Some(DocKind::Docx));
+    assert_eq!(
+        zam_docs::sniff_file(std::io::Cursor::new(cut.to_vec()), "отчёт.DOCX", &l).unwrap(),
+        Some(DocKind::Docx)
+    );
+    assert_eq!(sniff(cut, "archive.zip"), None);
+    let e = extract(DocKind::Docx, cut, &l, far()).unwrap_err();
+    assert!(matches!(&e, DocError::Malformed(_)), "{e:?}");
+    assert_eq!(e.area(), "zip", "{e:?}");
+}
+
 #[test]
 fn sniff_file_matches_sniff() {
     use std::io::Cursor;
@@ -407,7 +426,9 @@ fn sniff_by_signature_not_extension() {
     );
     assert_eq!(sniff(b"\n  %PDF-1.7\n", "n.txt"), Some(DocKind::Pdf));
     assert_eq!(sniff(b"\x89PNG\r\n\x1a\n....", "a.docx"), None);
-    assert_eq!(sniff(b"PK\x03\x04garbage", "a.docx"), None);
+    // сигнатура zip и испорченный архив: OOXML по расширению (разбор — `parse_error`, задача 10)
+    assert_eq!(sniff(b"PK\x03\x04garbage", "a.docx"), Some(DocKind::Docx));
+    assert_eq!(sniff(b"PK\x03\x04garbage", "a.zip"), None);
     assert_eq!(sniff(b"", "a.docx"), None);
 }
 

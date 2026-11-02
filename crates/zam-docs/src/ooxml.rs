@@ -141,15 +141,43 @@ impl<'a> Package<'a> {
     /// Читает часть в память в пределах лимитов. `Ok(None)` — нет части, она пропущена
     /// (шифрование, неизвестный метод сжатия) или объём исчерпан.
     pub fn read(&mut self, name: &str, ctx: &mut Ctx) -> Result<Option<Part>, DocError> {
+        self.read_inner(name, None, ctx)
+    }
+
+    /// Служебная часть со своим потолком `cap` байт (стили книги): общий бюджет
+    /// `max_unpacked` она не расходует; больше `cap` или сверх `max_ratio` — `skipped: <часть>`
+    /// и `Ok(None)`, разбор документа продолжается без неё.
+    pub fn read_side(
+        &mut self,
+        name: &str,
+        cap: u64,
+        ctx: &mut Ctx,
+    ) -> Result<Option<Part>, DocError> {
+        self.read_inner(name, Some(cap), ctx)
+    }
+
+    fn read_inner(
+        &mut self,
+        name: &str,
+        side: Option<u64>,
+        ctx: &mut Ctx,
+    ) -> Result<Option<Part>, DocError> {
         if ctx.stopped() {
             return Ok(None);
         }
         let Some(real) = self.entry_name(name).map(str::to_string) else {
             return Ok(None);
         };
-        let left = ctx.limits.max_unpacked.saturating_sub(self.unpacked);
+        let left = match side {
+            Some(cap) => cap,
+            None => ctx.limits.max_unpacked.saturating_sub(self.unpacked),
+        };
         if left == 0 {
             ctx.stop("max_unpacked");
+            return Ok(None);
+        }
+        if side.is_some() && self.zip.by_name(&real).is_ok_and(|f| f.size() > left) {
+            ctx.warn(format!("skipped: {real}"));
             return Ok(None);
         }
         let mut file = match self.zip.by_name(&real) {
@@ -201,6 +229,11 @@ impl<'a> Package<'a> {
             raw += n as u64;
             // выход UTF-8 (UTF-16 раскодируется по ходу) и вход ограничены одним `left`
             sink.feed(&chunk[..n], &mut buf, left);
+            if side.is_some() && (raw > left || buf.len() as u64 > left) {
+                // служебная часть сверх своего потолка — без неё
+                ctx.warn(format!("skipped: {real}"));
+                return Ok(None);
+            }
             if raw > left || buf.len() as u64 > left {
                 buf.truncate(left as usize);
                 // эта часть разбирается частично, следующие уже не читаются (`left == 0`)
@@ -212,6 +245,10 @@ impl<'a> Package<'a> {
             if raw > RATIO_FROM
                 && (raw > packed.saturating_mul(ratio) || raw > effective.saturating_mul(ratio))
             {
+                if side.is_some() {
+                    ctx.warn(format!("skipped: {real}"));
+                    return Ok(None);
+                }
                 ctx.truncated("max_ratio");
                 truncated = true;
                 break;
@@ -224,7 +261,9 @@ impl<'a> Package<'a> {
                 "encoding ({real}): invalid utf-16"
             )));
         }
-        self.unpacked += raw.max(buf.len() as u64);
+        if side.is_none() {
+            self.unpacked += raw.max(buf.len() as u64);
+        }
         let text = decode(buf, &real, truncated)?;
         Ok(Some(Part {
             name: real,

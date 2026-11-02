@@ -363,8 +363,9 @@ pub const ATTACH_PREFETCH: usize = 30;
 
 /// Окно prefetch вложений для фильтра `f` ([`VectorFilter::attach_prefetch`], по умолчанию
 /// [`ATTACH_PREFETCH`]): 0 — виды без `attachment` (или уровни без него) или в области нет
-/// извлечённых документов ([`VectorFilter::no_attachments`]); при `area`/`certainty` — вдвое (Qdrant эти условия у точек вложений не проверяет, часть окна
-/// отбросит SQLite по заметке-владельцу).
+/// извлечённых документов ([`VectorFilter::no_attachments`]); при `area`/`certainty` — вдвое
+/// (Qdrant эти условия у точек вложений не проверяет, часть окна отбросит SQLite по
+/// заметке-владельцу).
 pub fn attachment_window(f: &VectorFilter) -> usize {
     let kind_ok = f.kinds.is_empty() || f.kinds.iter().any(|k| k == LEVEL_ATTACHMENT);
     let level_ok = f.levels.is_empty() || f.levels.iter().any(|l| l == LEVEL_ATTACHMENT);

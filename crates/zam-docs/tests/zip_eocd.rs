@@ -250,8 +250,11 @@ fn forged_eocd_in_tail_or_comment_rejected() {
         ("хвост zip64", &tail64),
         ("мусор", &garbage),
     ] {
-        assert_eq!(sniff(b, "a.docx"), None, "{label}");
-        assert_eq!(file(b, "a.docx", &l), None, "{label}");
+        // испорченный архив: OOXML по расширению (разбор — Malformed), иначе — не документ
+        assert_eq!(sniff(b, "a.docx"), Some(DocKind::Docx), "{label}");
+        assert_eq!(sniff(b, "a.zip"), None, "{label}");
+        assert_eq!(file(b, "a.docx", &l), Some(DocKind::Docx), "{label}");
+        assert_eq!(file(b, "a.zip", &l), None, "{label}");
         assert!(
             matches!(docx_text(b, &l), Err(DocError::Malformed(_))),
             "{label}: {:?}",
@@ -284,8 +287,11 @@ fn zip64_with_bad_eocd64_rejected() {
         ("локатор", &bad_loc),
         ("записей больше каталога", &many),
     ] {
-        assert_eq!(sniff(b, "a.docx"), None, "{label}");
-        assert_eq!(file(b, "a.docx", &l), None, "{label}");
+        // испорченный архив: OOXML по расширению (разбор — Malformed), иначе — не документ
+        assert_eq!(sniff(b, "a.docx"), Some(DocKind::Docx), "{label}");
+        assert_eq!(sniff(b, "a.zip"), None, "{label}");
+        assert_eq!(file(b, "a.docx", &l), Some(DocKind::Docx), "{label}");
+        assert_eq!(file(b, "a.zip", &l), None, "{label}");
         assert!(
             matches!(docx_text(b, &l), Err(DocError::Malformed(_))),
             "{label}"
@@ -419,7 +425,7 @@ fn reviewer_probe_peak_is_small() {
         ("2500 × имя 20000", probe(2500, 20_000, false, false)),
     ] {
         let t = Instant::now();
-        let (r, sniff_peak) = peak(|| sniff_file(Cursor::new(&b[..]), "x.xlsx", &l).unwrap());
+        let (r, sniff_peak) = peak(|| sniff_file(Cursor::new(&b[..]), "x.zip", &l).unwrap());
         let sniff_time = t.elapsed();
         let (x, extract_peak) = peak(|| extract(DocKind::Xlsx, &b, &l, deadline()));
         eprintln!(
@@ -480,7 +486,7 @@ fn fallback(n: u64, zip64: bool, bad: &str) -> Vec<u8> {
 fn assert_rejected_small(label: &str, b: &[u8]) {
     let l = Limits::default();
     let t = Instant::now();
-    let (r, sp) = peak(|| sniff_file(Cursor::new(b), "x.xlsx", &l).unwrap());
+    let (r, sp) = peak(|| sniff_file(Cursor::new(b), "x.zip", &l).unwrap());
     let st = t.elapsed();
     let t = Instant::now();
     let (x, ep) = peak(|| extract(DocKind::Xlsx, b, &l, deadline()));
@@ -526,7 +532,13 @@ fn over_limit_candidate_in_window_rejected() {
     // ранний кандидат в пределах лимитов, а каталог последней EOCD битый — отказ
     for bad in ["name", "lfh"] {
         let b = fallback(10, false, bad);
-        assert_eq!(file(&b, "a.docx", &Limits::default()), None, "{bad}");
+        // испорченный архив с расширением OOXML — вид по расширению, разбор — отказ (задача 10)
+        assert_eq!(
+            file(&b, "a.docx", &Limits::default()),
+            Some(DocKind::Docx),
+            "{bad}"
+        );
+        assert_eq!(file(&b, "a.zip", &Limits::default()), None, "{bad}");
         assert!(
             matches!(
                 docx_text(&b, &Limits::default()),
@@ -538,7 +550,8 @@ fn over_limit_candidate_in_window_rejected() {
     // раунд 4: и кандидат в пределах лимитов — вторая EOCD в окне, отказ с понятной причиной
     let b = fallback(10, false, "ok");
     let l = Limits::default();
-    assert_eq!(file(&b, "a.docx", &l), None);
+    assert_eq!(file(&b, "a.docx", &l), Some(DocKind::Docx));
+    assert_eq!(file(&b, "a.bin", &l), None);
     let x = extract(DocKind::Docx, &b, &l, deadline());
     assert!(
         matches!(&x, Err(DocError::Malformed(m)) if m.contains("вторая сигнатура конца каталога")),
@@ -648,7 +661,8 @@ fn eocd64_with_real_eocd_fields_accepted() {
     let n = rd16(&bad, p + 10) + 1;
     bad[p + 10..p + 12].copy_from_slice(&n.to_le_bytes());
     bad[p + 8..p + 10].copy_from_slice(&n.to_le_bytes());
-    assert_eq!(file(&bad, "a.docx", &l), None);
+    assert_eq!(file(&bad, "a.docx", &l), Some(DocKind::Docx));
+    assert_eq!(file(&bad, "a", &l), None);
     assert!(matches!(docx_text(&bad, &l), Err(DocError::Malformed(_))));
 }
 
@@ -754,8 +768,11 @@ fn second_eocd_in_window_rejected() {
     assert_eq!(rd32(&v, q + 12), size);
     let z64 = to_zip64(&v, 0, 0x0606_4b50);
     for (label, b) in [("zip32", &v), ("zip64", &z64)] {
-        assert_eq!(sniff(b, "a.docx"), None, "{label}");
-        assert_eq!(file(b, "a.docx", &l), None, "{label}");
+        // испорченный архив: OOXML по расширению (разбор — Malformed), иначе — не документ
+        assert_eq!(sniff(b, "a.docx"), Some(DocKind::Docx), "{label}");
+        assert_eq!(sniff(b, "a.zip"), None, "{label}");
+        assert_eq!(file(b, "a.docx", &l), Some(DocKind::Docx), "{label}");
+        assert_eq!(file(b, "a.zip", &l), None, "{label}");
         let x = docx_text(b, &l);
         assert!(
             matches!(&x, Err(DocError::Malformed(m)) if m.contains("вторая сигнатура конца каталога")),

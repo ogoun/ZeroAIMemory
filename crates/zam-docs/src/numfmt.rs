@@ -226,18 +226,26 @@ pub(crate) fn format_serial(v: f64, st: &Style, date1904: bool, out: &mut String
         days += 1;
     }
     let (h, mi, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    // секунды — если они есть и формат их показывает (`h:mm AM/PM` — без секунд)
+    let shows_secs = st.code.as_deref().is_none_or(|c| {
+        let plain: String = c.split(';').next().unwrap_or(c).to_ascii_lowercase();
+        plain.contains('s')
+    });
     let time = |out: &mut String| {
-        if s == 0 {
+        if s == 0 || !shows_secs {
             let _ = write!(out, "{h:02}:{mi:02}");
         } else {
             let _ = write!(out, "{h:02}:{mi:02}:{s:02}");
         }
     };
     out.clear();
-    if kind == DateKind::Time {
+    // дата без дня (номер < 1 в системе 1900: «день 0» Excel) — только время
+    let time_only = kind == DateKind::Time || (!date1904 && days == 0);
+    if time_only {
         if let Some(t) = st
             .code
             .as_deref()
+            .filter(|_| kind == DateKind::Time)
             .and_then(|c| render(c, (1900, 1, 1), (h, mi, s)))
         {
             out.push_str(&t);
@@ -252,9 +260,6 @@ pub(crate) fn format_serial(v: f64, st: &Style, date1904: bool, out: &mut String
         // несуществующее 1900-02-29 Excel (совместимость с Lotus 1-2-3)
         (1900, 2, 29)
     } else if days < 60 {
-        if days == 0 {
-            return false;
-        }
         civil(EPOCH_1900 + days + 1)
     } else {
         civil(EPOCH_1900 + days)
@@ -314,9 +319,27 @@ mod tests {
             c(44_270.0, "dddd, d mmmm yyyy").as_deref(),
             Some("2021-03-15")
         );
-        assert_eq!(c(v, "h:mm AM/PM").as_deref(), Some("14:30:05"));
+        assert_eq!(c(v, "h:mm AM/PM").as_deref(), Some("14:30"));
         assert_eq!(c(v, "mm:ss.0").as_deref(), Some("14:30:05"));
         assert_eq!(c(44_270.0, "0.00"), None);
+    }
+
+    /// Номер меньше 1 с форматом даты или даты-времени — время (`0,5` со встроенным 22 →
+    /// `12:00`, а не `0.5`); `AM/PM` без секунд в формате — без секунд (ревью задачи 10).
+    #[test]
+    fn fraction_with_date_format_is_time() {
+        let b = |v: f64, id: u32| {
+            let mut s = String::new();
+            format_serial(v, &Style::builtin(id), false, &mut s).then_some(s)
+        };
+        assert_eq!(b(0.5, 22).as_deref(), Some("12:00"));
+        assert_eq!(b(0.75, 14).as_deref(), Some("18:00"));
+        assert_eq!(c(0.25, "yyyy-mm-dd hh:mm").as_deref(), Some("06:00"));
+        let v = (14.0 * 3600.0 + 30.0 * 60.0 + 5.0) / 86_400.0;
+        assert_eq!(c(v, "h:mm AM/PM").as_deref(), Some("14:30"));
+        assert_eq!(c(v, "h:mm:ss AM/PM").as_deref(), Some("14:30:05"));
+        // 0 в системе 1900 — время 00:00
+        assert_eq!(b(0.0, 14).as_deref(), Some("00:00"));
     }
 
     #[test]
@@ -380,7 +403,7 @@ mod tests {
             f(2_958_465.0, DateKind::Date, false).as_deref(),
             Some("9999-12-31")
         );
-        assert_eq!(f(0.0, DateKind::Date, false), None);
+        assert_eq!(f(0.0, DateKind::Date, false).as_deref(), Some("00:00"));
         assert_eq!(f(-1.0, DateKind::Date, false), None);
         assert_eq!(f(3e6, DateKind::Date, false), None);
         assert_eq!(f(45231.0, DateKind::None, false), None);

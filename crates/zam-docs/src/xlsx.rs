@@ -6,8 +6,8 @@
 //! через `Package` с его лимитами, общие строки хранятся один раз ([`Strings`]), а ячейки
 //! листа идут в [`Feed`] по мере разбора: `dimension`, пустые ячейки и строки памяти не
 //! занимают. Формулы не вычисляются — берётся сохранённое значение `<v>`. Даты и время — по
-//! формату числа стиля ячейки (`xl/styles.xml`, [`crate::numfmt`]): ISO 8601 вместо серийного
-//! номера; прочие числа — как есть.
+//! формату числа стиля ячейки (`xl/styles.xml`, [`crate::numfmt`]): свой числовой формат —
+//! как показывает Excel, встроенные и с названиями месяцев — ISO 8601; прочие числа — как есть.
 
 use std::collections::{HashMap, HashSet};
 
@@ -139,6 +139,10 @@ fn sheet_list(
     Ok((out, date1904))
 }
 
+/// Потолок части стилей `xl/styles.xml`, байт: настоящие стили — десятки КиБ, а читаются они до
+/// листов; сверх — `skipped: xl/styles.xml`, даты числом, общий бюджет `max_unpacked` цел.
+pub(crate) const STYLES_MAX: u64 = 8 * 1024 * 1024;
+
 /// Вид даты по стилю ячейки (`s` — номер в `cellXfs`) и система дат книги.
 struct Dates<'a> {
     styles: &'a [Style],
@@ -149,7 +153,8 @@ struct Dates<'a> {
 /// ([`numfmt::classify`]) или встроенные ([`numfmt::builtin`]). Не больше [`MAX_STYLES`] своих
 /// форматов и стилей; нет части — пусто (даты — числа).
 fn read_styles(pkg: &mut Package<'_>, name: &str, ctx: &mut Ctx) -> Result<Vec<Style>, DocError> {
-    let Some(part) = pkg.read(name, ctx)? else {
+    // свой потолок: стили не расходуют `max_unpacked` листов; больше — даты числом
+    let Some(part) = pkg.read_side(name, STYLES_MAX, ctx)? else {
         return Ok(Vec::new());
     };
     let mut custom: HashMap<u32, Style> = HashMap::new();
