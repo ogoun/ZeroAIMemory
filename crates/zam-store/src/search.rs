@@ -112,7 +112,7 @@ pub struct TargetFilter {
     pub insight_kinds: Vec<String>,
 }
 
-/// Виды записей журналов (с M4.5 — `term`, `task`, `question`).
+/// Виды записей журналов в поиске по умолчанию (с M4.5 — `term`, `task`, `question`).
 const ENTRY_KINDS: [&str; 6] = [
     "changelog",
     "release",
@@ -121,6 +121,10 @@ const ENTRY_KINDS: [&str; 6] = [
     "task",
     "question",
 ];
+/// Отчёт (M5.5) — только по явному виду в `kinds` (поиск WebUI): пустой список видов его не
+/// включает, агенту отчёты не выдаются (спецификация M5.5 §7; вид в фильтре токена отсекает
+/// сервер).
+const REPORT_KIND: &str = "report";
 
 /// Параметры SQL фильтра целей.
 struct TargetArgs {
@@ -150,6 +154,12 @@ impl TargetFilter {
         let kinds: Vec<&str> = ENTRY_KINDS
             .into_iter()
             .filter(|k| all || self.kinds.iter().any(|x| x == k))
+            .chain(
+                self.kinds
+                    .iter()
+                    .any(|k| k == REPORT_KIND)
+                    .then_some(REPORT_KIND),
+            )
             .collect();
         TargetArgs {
             notes: all || self.kinds.iter().any(|k| k == "note"),

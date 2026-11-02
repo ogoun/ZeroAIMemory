@@ -261,8 +261,8 @@ fn tools_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<Vec<String>
 
 /// Заменяет все триггеры insight `entry` набором `ts` одной транзакцией. Неверный триггер
 /// (`triggers[i]: …`), больше [`TRIGGERS_MAX`] или запись не insight → `BadInput`; нет
-/// записи или удалена → `NotFound`. Права `certainty` проверяются той же транзакцией (с M4
-/// триггеры `axiom` меняет любой автор, §7.5).
+/// записи или удалена → `NotFound`; отчёт → `ReportImmutable`. Права `certainty` проверяются
+/// той же транзакцией (с M4 триггеры `axiom` меняет любой автор, §7.5).
 pub async fn set_triggers(
     db: &Db,
     entry: Id,
@@ -275,6 +275,7 @@ pub async fn set_triggers(
         if e.deleted_at.is_some() {
             return Err(StoreError::NotFound);
         }
+        super::ensure_not_report(&e)?;
         check_certainty(
             author,
             e.certainty,

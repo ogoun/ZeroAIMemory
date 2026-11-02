@@ -123,6 +123,11 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0021_blob_extract_key.sql"),
         rebuild: false,
     },
+    Migration {
+        version: 22,
+        sql: include_str!("../migrations/user/0022_reports.sql"),
+        rebuild: true,
+    },
 ];
 
 /// Вид пространства.

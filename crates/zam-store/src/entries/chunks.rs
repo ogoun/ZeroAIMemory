@@ -7,7 +7,8 @@
 //!
 //! После пересборки чанков в той же транзакции ставится задание `target_kind = 'entry'`:
 //! индексируемая запись → `upsert` (и при смене статуса или `certainty`: меняется payload);
-//! запись Human — `excluded`, без задания. Удаление — `delete`.
+//! запись Human и отчёт (`report`, M5.5: только FTS для WebUI) — `excluded`, без задания.
+//! Удаление — `delete`.
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -27,12 +28,22 @@ use crate::time::{fmt_ts, ts_at};
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
 
-/// `index_state` новой или изменённой записи: Human никогда не векторизуется.
-pub(crate) fn entry_index_state(kind: SpaceKind) -> IndexState {
-    if kind == SpaceKind::Human {
-        IndexState::Excluded
-    } else {
+/// `index_state` новой записи: Human и отчёты никогда не векторизуются (векторы нужны только
+/// поиску агента, а отчёт агенту не выдаётся — спецификация M5.5 §7).
+pub(crate) fn entry_index_state(space: SpaceKind, kind: EntryKind) -> IndexState {
+    let vectors = match kind {
+        EntryKind::Changelog
+        | EntryKind::Release
+        | EntryKind::Insight
+        | EntryKind::Term
+        | EntryKind::Task
+        | EntryKind::Question => space != SpaceKind::Human,
+        EntryKind::Report => false,
+    };
+    if vectors {
         IndexState::Pending
+    } else {
+        IndexState::Excluded
     }
 }
 
@@ -124,7 +135,8 @@ pub(crate) fn index_entry(
 }
 
 /// Задание записи по уже записанным чанкам и `entries.index_state`: индексируемая →
-/// `upsert`, ставшая исключённой → `delete`. Возвращает поставленную операцию.
+/// `upsert`, ставшая исключённой → `delete`; отчёт заданий не получает (только FTS).
+/// Возвращает поставленную операцию.
 fn enqueue_entry(
     c: &Connection,
     id: Id,
@@ -132,10 +144,12 @@ fn enqueue_entry(
     priority: i64,
     now: &str,
 ) -> Result<Option<JobOp>, StoreError> {
-    let (state, rev): (IndexState, i64) = c
-        .prepare_cached("SELECT index_state, current_rev FROM entries WHERE id = ?1")?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    let op = if state != IndexState::Excluded {
+    let (state, rev, kind): (IndexState, i64, EntryKind) = c
+        .prepare_cached("SELECT index_state, current_rev, kind FROM entries WHERE id = ?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let op = if kind == EntryKind::Report {
+        None
+    } else if state != IndexState::Excluded {
         Some(JobOp::Upsert)
     } else if prev.is_some_and(|p| p != IndexState::Excluded) {
         Some(JobOp::Delete)
@@ -279,9 +293,10 @@ pub struct ReindexEntry {
     pub chunks: Vec<IndexChunk>,
 }
 
-/// Условие «живая индексируемая запись» (алиасы: `e` — entries, `s` — spaces).
-const INDEXABLE: &str =
-    "e.deleted_at IS NULL AND e.index_state <> 'excluded' AND s.kind <> 'human'";
+/// Условие «живая индексируемая запись» (алиасы: `e` — entries, `s` — spaces): отчёт — никогда,
+/// даже с `index_state` не `excluded`.
+const INDEXABLE: &str = "e.deleted_at IS NULL AND e.index_state <> 'excluded' AND s.kind <> 'human'
+     AND e.kind <> 'report'";
 
 /// Страница живых индексируемых записей пространства `space` (`None` — всех) с чанками:
 /// по возрастанию id после `after`, не больше `limit`, одним снимком чтения.
@@ -400,21 +415,25 @@ pub(crate) async fn rechunk_entries(
         let (n, u, last) = db
             .write(move |tx| {
                 let now = fmt_ts(Timestamp::now());
-                let batch: Vec<(Id, IndexState)> = {
+                let batch: Vec<(Id, IndexState, EntryKind)> = {
                     let mut st = tx.prepare_cached(
-                        "SELECT id, index_state FROM entries
+                        "SELECT id, index_state, kind FROM entries
                          WHERE deleted_at IS NULL
                            AND (?1 IS NULL OR space_id = ?1) AND (?2 IS NULL OR id > ?2)
                          ORDER BY id LIMIT ?3",
                     )?;
                     st.query_map(params![space, cursor, RECHUNK_BATCH], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                     })?
                     .collect::<Result<_, _>>()?
                 };
                 let mut u = 0u64;
-                for &(id, prev) in &batch {
+                for &(id, prev, kind) in &batch {
                     let changed = rebuild_entry_chunks(tx, id)?;
+                    // отчёт: только чанки FTS, заданий векторного индекса нет
+                    if kind == EntryKind::Report {
+                        continue;
+                    }
                     if only_changed && !changed && prev == IndexState::Indexed {
                         continue;
                     }

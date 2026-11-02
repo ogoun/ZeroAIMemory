@@ -1,6 +1,6 @@
 //! Записи журналов решения (§7.2–7.5 ТЗ): Changelog, Releases и Insights, с M4.5 — термины
-//! словаря, задачи и вопросы (спецификация M4.5 §1.3) в таблице `entries`, их ревизии
-//! (`entry_revisions`, только дописываются) и синхронная индексация.
+//! словаря, задачи и вопросы (спецификация M4.5 §1.3), с M5.5 — отчёты (`report`) в таблице
+//! `entries`, их ревизии (`entry_revisions`, только дописываются) и синхронная индексация.
 //!
 //! Структура модуля:
 //! - `mod.rs` — типы и отображение строк `entries`;
@@ -9,9 +9,14 @@
 //!   транзакцией писателя;
 //! - [`read`] — запись по id, лента с курсором и фильтрами, ревизии;
 //! - [`chunks`] — чанки записи (документ `# <title>\n\n<body>` → `chunk_note`), FTS и задания
-//!   индексации (`target_kind = 'entry'`) в той же транзакции; данные для воркера и reindex.
+//!   индексации (`target_kind = 'entry'`) в той же транзакции; данные для воркера и reindex;
+//! - [`reports`] — отчёты (M5.5): создание с файлами (`entry_attachments`), файлы и миниатюры.
 //!
-//! Хранилище проверяет только целостность: статуса нет только у changelog и release, у
+//! Отчёт неизменяем: любая правка, замещение, отзыв, триггеры, задачи и вопросы над ним —
+//! [`StoreError::ReportImmutable`] (и триггеры SQLite миграции 0022); корзина разрешена. Отчёт
+//! индексируется только в FTS (`index_state = excluded`), рёбер и `file_refs` не создаёт.
+//!
+//! Хранилище проверяет только целостность: статуса нет только у changelog, release и report, у
 //! остальных видов он из множества [`allowed_statuses`]; новая запись получает
 //! [`initial_status`]. Переходы insight `active ↔ revisit` — правкой, `→ superseded` —
 //! замещением, `→ retracted` — отзывом с непустой причиной; из `superseded` и `retracted`
@@ -21,6 +26,7 @@
 
 mod chunks;
 mod read;
+mod reports;
 mod triggers;
 mod write;
 
@@ -44,6 +50,10 @@ pub use read::{
     CHANGELOG_BETWEEN_MAX, DEDUP_CANDIDATES_MAX, DedupCandidate, changelog_between,
     entry_revisions, find_release_by_version, get_entry, list_entries, title_duplicates,
 };
+pub use reports::{
+    EntryAttachment, NewReportFile, create_report, entry_attachment, entry_attachments,
+    first_images,
+};
 pub use triggers::{
     KEYWORD_MAX_CHARS, NewTrigger, PATTERN_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger,
     TriggerKind, TriggerRow, active_triggers, entry_triggers, set_triggers, validate_trigger,
@@ -53,7 +63,7 @@ pub use write::{
     create_entry, delete_entry, entry_by_idempotency_key, restore_entry, retract_entry,
     supersede_entry, update_entry,
 };
-pub(crate) use write::{insert_entry, revise};
+pub(crate) use write::{ensure_not_report, insert_entry, revise};
 
 /// Строковое перечисление с отображением в SQL (`TEXT`) и serde (нижний регистр).
 macro_rules! text_enum {
@@ -103,7 +113,8 @@ macro_rules! text_enum {
 
 text_enum!(
     /// Вид записи журнала (спецификация M4.5 §1.3): журналы решения, словарь (`term`),
-    /// журнал задач (`task`) и вопросы к человеку (`question`).
+    /// журнал задач (`task`), вопросы к человеку (`question`) и отчёты для человека (`report`,
+    /// M5.5).
     EntryKind {
         Changelog => "changelog",
         Release => "release",
@@ -111,23 +122,25 @@ text_enum!(
         Term => "term",
         Task => "task",
         Question => "question",
+        Report => "report",
     }
 );
 
 impl EntryKind {
     /// Все виды записей в порядке объявления.
-    pub const ALL: [EntryKind; 6] = [
+    pub const ALL: [EntryKind; 7] = [
         EntryKind::Changelog,
         EntryKind::Release,
         EntryKind::Insight,
         EntryKind::Term,
         EntryKind::Task,
         EntryKind::Question,
+        EntryKind::Report,
     ];
 
     /// Буква ссылки записи в выдаче (`i:<id>`, §9.3 ТЗ; спецификация M4.5 §1.3): `i` —
-    /// insight, `c` — changelog, `r` — release, `t` — term, `k` — task, `q` — question.
-    /// Общая ссылка записи любого вида — `e:<id>`.
+    /// insight, `c` — changelog, `r` — release, `t` — term, `k` — task, `q` — question, `p` —
+    /// report (M5.5). Общая ссылка записи любого вида — `e:<id>`.
     pub fn ref_letter(self) -> &'static str {
         match self {
             EntryKind::Insight => "i",
@@ -136,6 +149,21 @@ impl EntryKind {
             EntryKind::Term => "t",
             EntryKind::Task => "k",
             EntryKind::Question => "q",
+            EntryKind::Report => "p",
+        }
+    }
+
+    /// Выдаётся ли вид агенту (токену): отчёты пишутся для человека и агенту не выдаются нигде
+    /// (спецификация M5.5 §7), остальные виды — по общим правилам доступа.
+    pub fn agent_visible(self) -> bool {
+        match self {
+            EntryKind::Changelog
+            | EntryKind::Release
+            | EntryKind::Insight
+            | EntryKind::Term
+            | EntryKind::Task
+            | EntryKind::Question => true,
+            EntryKind::Report => false,
         }
     }
 
@@ -146,9 +174,9 @@ impl EntryKind {
 }
 
 /// Буквы ссылок записи: по виду ([`EntryKind::ref_letter`]) и общая `e`.
-pub const ENTRY_REF_LETTERS: [&str; 7] = ["i", "c", "r", "t", "k", "q", "e"];
+pub const ENTRY_REF_LETTERS: [&str; 8] = ["i", "c", "r", "t", "k", "q", "p", "e"];
 
-/// Буква — ссылка записи журнала (`i|c|r|t|k|q|e`).
+/// Буква — ссылка записи журнала (`i|c|r|t|k|q|p|e`).
 pub fn is_entry_ref_letter(s: &str) -> bool {
     ENTRY_REF_LETTERS.contains(&s)
 }
@@ -172,12 +200,12 @@ text_enum!(
     }
 );
 
-/// Допустимые статусы вида (спецификация M4.5 §1.3; та же таблица — CHECK миграции 0015).
-/// У changelog и release статуса нет — пусто.
+/// Допустимые статусы вида (спецификация M4.5 §1.3; та же таблица — CHECK миграций 0015 и
+/// 0022). У changelog, release и report статуса нет — пусто.
 pub fn allowed_statuses(kind: EntryKind) -> &'static [EntryStatus] {
     use EntryStatus::*;
     match kind {
-        EntryKind::Changelog | EntryKind::Release => &[],
+        EntryKind::Changelog | EntryKind::Release | EntryKind::Report => &[],
         EntryKind::Insight => &[Active, Revisit, Superseded, Retracted],
         EntryKind::Term => &[Active, Superseded, Retracted],
         EntryKind::Task => &[Open, InProgress, Blocked, Done, Dropped],
@@ -186,10 +214,10 @@ pub fn allowed_statuses(kind: EntryKind) -> &'static [EntryStatus] {
 }
 
 /// Начальный статус новой записи вида: insight и term — `active`, task и question — `open`,
-/// у changelog и release статуса нет.
+/// у changelog, release и report статуса нет.
 pub fn initial_status(kind: EntryKind) -> Option<EntryStatus> {
     match kind {
-        EntryKind::Changelog | EntryKind::Release => None,
+        EntryKind::Changelog | EntryKind::Release | EntryKind::Report => None,
         EntryKind::Insight | EntryKind::Term => Some(EntryStatus::Active),
         EntryKind::Task | EntryKind::Question => Some(EntryStatus::Open),
     }
@@ -198,7 +226,14 @@ pub fn initial_status(kind: EntryKind) -> Option<EntryStatus> {
 /// Есть ли у вида эпистемический статус `certainty` (спецификация M4.5 §1.3: insight и term;
 /// у решения из ответа на вопрос — это insight).
 pub fn has_certainty(kind: EntryKind) -> bool {
-    matches!(kind, EntryKind::Insight | EntryKind::Term)
+    match kind {
+        EntryKind::Insight | EntryKind::Term => true,
+        EntryKind::Changelog
+        | EntryKind::Release
+        | EntryKind::Task
+        | EntryKind::Question
+        | EntryKind::Report => false,
+    }
 }
 
 text_enum!(
@@ -338,6 +373,7 @@ pub struct EntryPatch {
 #[derive(Debug, Clone)]
 pub struct EntryFilter {
     pub space_id: Id,
+    /// `None` — любые виды, кроме report (если не [`EntryFilter::with_reports`]).
     pub kind: Option<EntryKind>,
     /// Пусто — любые статусы (и записи без статуса).
     pub statuses: Vec<EntryStatus>,
@@ -358,6 +394,10 @@ pub struct EntryFilter {
     pub cursor: Option<String>,
     /// 1..=200.
     pub limit: usize,
+    /// При `kind = None` включать отчёты (только сессии WebUI; агенту отчёты не выдаются).
+    pub with_reports: bool,
+    /// Только удалённые записи (корзина): новые удаления первыми, курсор по `deleted_at`.
+    pub deleted_only: bool,
 }
 
 /// Нормализованный заголовок (дедупликация, §7.5): нижний регистр, всё, что не буква и не

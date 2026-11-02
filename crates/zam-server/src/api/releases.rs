@@ -95,6 +95,8 @@ pub async fn compare(
                 until: Some(to.created_at),
                 cursor: None,
                 limit: 1,
+                with_reports: false,
+                deleted_only: false,
             };
             list_entries(&sc.db, f).await?.0.into_iter().next()
         }

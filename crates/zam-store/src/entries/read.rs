@@ -40,6 +40,9 @@ fn json_list<T>(v: &[T], f: impl Fn(&T) -> &'static str) -> Option<String> {
 /// вид, статусы (пусто — любые), `certainty` (пусто — любые), область, тег, `data.kind`
 /// (`json_extract(data, '$.kind')`), интервал `created_at` `[since, until)`. Фильтры
 /// применяются в SQL до `LIMIT`, поэтому курсор не теряет записей между страницами.
+/// Без вида отчёты (`report`) не выдаются, если не задан `with_reports` (сессии WebUI).
+/// `deleted_only` — корзина: только удалённые записи, новые удаления первыми (курсор —
+/// `<deleted_at>|<id>`).
 pub async fn list_entries(
     db: &Db,
     f: EntryFilter,
@@ -56,11 +59,18 @@ pub async fn list_entries(
     let since = f.since.map(fmt_ts);
     let until = f.until.map(fmt_ts);
     let limit = f.limit;
+    // ключ порядка и курсора: время создания в живой ленте, время удаления в корзине
+    let (alive, key) = if f.deleted_only {
+        ("e.deleted_at IS NOT NULL", "e.deleted_at")
+    } else {
+        ("e.deleted_at IS NULL", "e.created_at")
+    };
     db.read(move |c| {
         let mut st = c.prepare_cached(&format!(
             "SELECT {ENTRY_COLS} FROM entries e
-             WHERE e.space_id = ?1 AND e.deleted_at IS NULL
+             WHERE e.space_id = ?1 AND {alive}
                AND (?2 IS NULL OR e.kind = ?2)
+               AND (?2 IS NOT NULL OR ?14 OR e.kind <> 'report')
                AND (?3 IS NULL OR e.status IN (SELECT value FROM json_each(?3)))
                AND (?4 IS NULL OR e.certainty IN (SELECT value FROM json_each(?4)))
                AND (?5 IS NULL OR e.area = ?5)
@@ -68,7 +78,7 @@ pub async fn list_entries(
                                           WHERE t.value = ?6))
                AND (?7 IS NULL OR e.created_at >= ?7)
                AND (?8 IS NULL OR e.created_at < ?8)
-               AND (?9 IS NULL OR e.created_at < ?9 OR (e.created_at = ?9 AND e.id < ?10))
+               AND (?9 IS NULL OR {key} < ?9 OR ({key} = ?9 AND e.id < ?10))
                AND (?12 IS NULL OR json_extract(e.data, '$.kind') = ?12)
                AND (?13 IS NULL OR (e.kind = 'insight'
                     AND json_extract(e.data, '$.kind') = 'decision'
@@ -76,7 +86,7 @@ pub async fn list_entries(
                              THEN json_extract(e.data, '$.decision.decided_by')
                              ELSE CASE WHEN e.author_kind = 'agent' THEN 'agent'
                                   ELSE 'human' END END = ?13))
-             ORDER BY e.created_at DESC, e.id DESC
+             ORDER BY {key} DESC, e.id DESC
              LIMIT ?11"
         ))?;
         let rows = st.query_map(
@@ -94,14 +104,21 @@ pub async fn list_entries(
                 (limit + 1) as i64,
                 f.data_kind,
                 f.decided_by,
+                f.with_reports,
             ],
             entry_row,
         )?;
         let mut out: Vec<Entry> = rows.collect::<Result<_, _>>()?;
         let next = if out.len() > limit {
             out.truncate(limit);
-            out.last()
-                .map(|e| format!("{}{CURSOR_SEP}{}", fmt_ts(e.created_at), e.id))
+            out.last().map(|e| {
+                let ts = if f.deleted_only {
+                    e.deleted_at.unwrap_or(e.created_at)
+                } else {
+                    e.created_at
+                };
+                format!("{}{CURSOR_SEP}{}", fmt_ts(ts), e.id)
+            })
         } else {
             None
         };

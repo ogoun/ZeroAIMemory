@@ -217,6 +217,9 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
         EntryKind::Question => zam_store::check_question(data)
             .map(|q| q.to_value())
             .map_err(unprocessable),
+        EntryKind::Report => Err(unprocessable(
+            "report создаётся отдельным путём создания отчёта (с файлами)",
+        )),
     }
 }
 
@@ -493,6 +496,9 @@ pub async fn list(
             .transpose()?,
         cursor: q.cursor.filter(|c| !c.is_empty()),
         limit: q.limit.unwrap_or(LIST_DEFAULT),
+        // отчёты в ленте и корзина — задачи 3–4 M5.5
+        with_reports: false,
+        deleted_only: false,
     };
     let (items, next) = list_entries(&sc.db, f).await?;
     // у insight — показы и оценки (столбец списка Insights WebUI, задача 13), одним запросом

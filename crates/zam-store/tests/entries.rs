@@ -832,6 +832,8 @@ async fn deleted_entry_not_in_fts_restore_returns() {
         until: None,
         cursor: None,
         limit: 10,
+        with_reports: false,
+        deleted_only: false,
     };
     assert!(list_entries(&db, feed.clone()).await.unwrap().0.is_empty());
     assert!(matches!(
@@ -903,6 +905,8 @@ async fn list_entries_cursor_and_filters() {
         until: None,
         cursor: None,
         limit: 3,
+        with_reports: false,
+        deleted_only: false,
     };
     // постранично, новые первыми, без повторов и пропусков
     let mut seen = Vec::new();
@@ -1359,7 +1363,7 @@ async fn title_duplicates_same_area_and_active_only() {
 #[test]
 fn allowed_statuses_per_kind() {
     use EntryStatus::*;
-    let table: [(EntryKind, &[EntryStatus], Option<EntryStatus>); 6] = [
+    let table: [(EntryKind, &[EntryStatus], Option<EntryStatus>); 7] = [
         (EntryKind::Changelog, &[], None),
         (EntryKind::Release, &[], None),
         (
@@ -1378,6 +1382,7 @@ fn allowed_statuses_per_kind() {
             Some(Open),
         ),
         (EntryKind::Question, &[Open, Answered, Obsolete], Some(Open)),
+        (EntryKind::Report, &[], None),
     ];
     assert_eq!(table.len(), EntryKind::ALL.len());
     for (kind, statuses, initial) in table {

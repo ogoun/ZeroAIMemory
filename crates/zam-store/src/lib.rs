@@ -5,7 +5,8 @@
 //! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3), сессии агентов,
 //! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4), кэш выжимок
 //! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5), вложения как
-//! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5).
+//! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5), отчёты (вид записи
+//! `report`, файлы `entry_attachments`; M5.5).
 
 pub mod access;
 pub mod attachments;
@@ -73,15 +74,16 @@ pub use embeddings::{
 };
 pub use entries::{
     AREA_MAX_CHARS, AuthorView, CHANGELOG_BETWEEN_MAX, Certainty, DEDUP_CANDIDATES_MAX,
-    DedupCandidate, ENTRY_REF_LETTERS, Entry, EntryFilter, EntryKind, EntryPatch, EntryRevision,
-    EntryStatus, KEYWORD_MAX_CHARS, NewEntry, NewTrigger, PATTERN_MAX_CHARS, REASON_MAX_CHARS,
-    ReindexEntry, TITLE_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger, TriggerKind, TriggerRow,
-    active_triggers, allowed_statuses, changelog_between, create_entry, delete_entry,
-    enqueue_entry_upserts, entry_by_idempotency_key, entry_chunks_for_index, entry_revisions,
-    entry_triggers, find_release_by_version, finish_entries_reindexed, get_entry, has_certainty,
-    initial_status, is_entry_ref_letter, list_entries, normalize_area, normalize_title,
-    reindex_entries_page, restore_entry, retract_entry, set_triggers, supersede_entry,
-    title_duplicates, update_entry, validate_trigger,
+    DedupCandidate, ENTRY_REF_LETTERS, Entry, EntryAttachment, EntryFilter, EntryKind, EntryPatch,
+    EntryRevision, EntryStatus, KEYWORD_MAX_CHARS, NewEntry, NewReportFile, NewTrigger,
+    PATTERN_MAX_CHARS, REASON_MAX_CHARS, ReindexEntry, TITLE_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX,
+    Trigger, TriggerKind, TriggerRow, active_triggers, allowed_statuses, changelog_between,
+    create_entry, create_report, delete_entry, enqueue_entry_upserts, entry_attachment,
+    entry_attachments, entry_by_idempotency_key, entry_chunks_for_index, entry_revisions,
+    entry_triggers, find_release_by_version, finish_entries_reindexed, first_images, get_entry,
+    has_certainty, initial_status, is_entry_ref_letter, list_entries, normalize_area,
+    normalize_title, reindex_entries_page, restore_entry, retract_entry, set_triggers,
+    supersede_entry, title_duplicates, update_entry, validate_trigger,
 };
 pub use file_refs::{
     FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit, check_hash,
@@ -181,6 +183,10 @@ pub enum StoreError {
     /// `Idempotency-Key` повторён с другим содержимым запроса.
     #[error("{0}")]
     IdempotencyMismatch(String),
+    /// Отчёт (`report`, M5.5) не меняется после записи: правка, замещение, отзыв, триггеры,
+    /// захват и ответ над ним запрещены (сервер — 409 `/problems/report-immutable`).
+    #[error("отчёт неизменяем — напишите новый")]
+    ReportImmutable,
     /// Нарушение матрицы прав `certainty` ([`certainty::check_certainty`]).
     #[error(transparent)]
     Certainty(#[from] CertaintyError),

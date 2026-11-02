@@ -497,6 +497,8 @@ fn entry_filter(space: Id, kind: EntryKind) -> EntryFilter {
         until: None,
         cursor: None,
         limit: ENTRY_FETCH,
+        with_reports: false,
+        deleted_only: false,
     }
 }
 
