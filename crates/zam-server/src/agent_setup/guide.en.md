@@ -32,6 +32,18 @@ Every response ends with a `~N tok` line — your spend. Check the cache before 
 - **Links** — `memory_link {src, type, dst}`: `links_to`, `relates_to`, `depends_on`, `part_of`, `caused_by`, `fixes`, `derived_from`, `mentions`, `contradicts`.
 - **Secrets** — only `memory_vault` (`get | set | list`). Values never reach search, summaries or logs; do not copy them into notes.
 - A write response may carry `warnings` (`term_alias`, `decision_near_axiom`, …) — read them and fix the record when needed.
+- **A report for the user** — `zam report` (section "Reports").
+
+## Reports
+
+A report is an outcome of work **for the user**: research, an experiment, model training, a comparison of options (or on the user's request). The user reads it in WebUI (the solution's "Reports" journal) with formulas, Mermaid diagrams, tables, code and images, and exports it to PDF.
+
+- **Write** — `zam report <file.md> [--title T] [--tag X]… [--area A] [--ref commit:<sha>|file:<path>|note:<id>|task:k:<id>]… [--key K]`. Without `--title` — the first `#` heading of the file. The answer is `Отчёт: <url>`: pass the link to the user.
+- **Images and files** — relative links from the file's directory: `![loss curve](figs/loss.png)`, `[data](data/run.csv)`; a path with a space — `<figs/my plot.png>` or `%20`. The CLI uploads them in one request with the body. Images — PNG, JPEG, WebP, GIF, SVG; other files are offered for download. Not allowed: `..`, an absolute path, `\`, an external or `data:` image, `![[…]]`; a file without a link from the body is rejected.
+- **Limits** — up to 64 files, 200 MiB in total; a single file — up to the server's blob limit.
+- **MCP** — `memory_log {kind: "report", title, body, images: [{name, data}]}`: `name` — the path from the body link, `data` — base64; body with files — up to 16 MiB, larger — `zam report`.
+- **Immutable** — a report cannot be fixed or extended: a repeat is a new report. `--key K` (`idempotency_key`) protects against a duplicate when the same command is retried.
+- **Agents do not read reports** — they are absent from search, `memory_read`, the digest and hints. Conclusions you need in later sessions go separately into an `insight` (`experiment`, `failure`, `decision`).
 
 ## Tasks and handing work over
 

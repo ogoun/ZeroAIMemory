@@ -69,8 +69,10 @@ pub const MCP_PATH: &str = "/mcp";
 
 /// Заголовки исходного запроса, которые уходят во внутренние вызовы REST. Заголовки прокси —
 /// чтобы IP клиента в лимитах и аудите был тем же, что у REST; доверять ли им, решает
-/// `trusted_peer` по `ConnectInfo` (`server.trusted_proxies`), как и для REST.
-const FORWARDED: [&str; 8] = [
+/// `trusted_peer` по `ConnectInfo` (`server.trusted_proxies`), как и для REST. `Host` — для
+/// адреса WebUI в ответе (`url` отчёта при пустом `server.public_url`, M5.5).
+const FORWARDED: [&str; 9] = [
+    "host",
     "authorization",
     crate::api::search::SOLUTION_HEADER,
     SESSION_HEADER,
@@ -85,7 +87,8 @@ const FORWARDED: [&str; 8] = [
 const INSTRUCTIONS: &str = "ZeroAIMemory — долговременная память агента. Порядок: memory_search \
 (карточки, шаг 0 — кэш выжимок) → memory_read нужного → memory_cache_put выжимки. Запись — \
 memory_write, memory_log, memory_update_entry; ревизии обязательны при правке (409/428 — \
-перечитать). Задачи, вопросы человеку, словарь — memory_log kind=task|question|term; после \
+перечитать). Задачи, вопросы человеку, словарь — memory_log kind=task|question|term; итог \
+для пользователя — kind=report (большой — zam report); после \
 сжатия контекста — memory_recall event=recovery, задание субагенту — event=brief. Протокол — \
 zam guide (GET /api/v1/agent-guide). Ответы — Markdown, последняя строка ~N tok.";
 
@@ -290,6 +293,8 @@ pub struct Rest {
     router: Router,
     headers: HeaderMap,
     connect: Option<ConnectInfo<SocketAddr>>,
+    /// Внешний `/mcp` держит разрешение большого тела ([`crate::api::big_body::OuterPermit`]).
+    outer_permit: bool,
 }
 
 /// Ответ внутреннего вызова REST.
@@ -319,10 +324,21 @@ impl Rest {
                 headers.insert(HeaderName::from_static(name), v.clone());
             }
         }
+        // HTTP/2 без `Host` — адрес из `:authority`
+        if !headers.contains_key(header::HOST)
+            && let Some(a) = parts.uri.authority()
+            && let Ok(v) = HeaderValue::from_str(a.as_str())
+        {
+            headers.insert(header::HOST, v);
+        }
         Rest {
             router,
             headers,
             connect: parts.extensions.get::<ConnectInfo<SocketAddr>>().cloned(),
+            outer_permit: parts
+                .extensions
+                .get::<crate::api::big_body::OuterPermit>()
+                .is_some(),
         }
     }
 
@@ -361,8 +377,12 @@ impl Rest {
             None => Body::empty(),
         };
         let mut req = b.body(body).map_err(|e| format!("запрос REST: {e}"))?;
-        // разрешение большого тела держит внешний запрос `/mcp` (api::big_body)
-        req.extensions_mut().insert(crate::api::big_body::InnerCall);
+        // внешний `/mcp` с большим телом уже держит разрешение — внутреннее его не берёт;
+        // без него большое внутреннее тело берёт своё (api::big_body)
+        req.extensions_mut()
+            .insert(crate::api::big_body::InnerCall {
+                outer_permit: self.outer_permit,
+            });
         if let Some(c) = self.connect {
             req.extensions_mut().insert(c);
         }

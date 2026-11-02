@@ -164,7 +164,7 @@ async fn ro_token(w: &W) -> String {
 }
 
 /// Матрица Review Focus 1: каждый путь чтения и изменения по id отчёта отвечает токену так же,
-/// как на несуществующий id; токены `rw` и `ro` владельца и токен участника.
+/// как на несуществующий id; токены `rw` и `ro` владельца, токены участников `rw` и `ro`.
 #[tokio::test]
 async fn token_never_sees_report_matrix() {
     let w = world("matrix").await;
@@ -184,6 +184,7 @@ async fn token_never_sees_report_matrix() {
         ("rw", w.o.tok.clone()),
         ("ro", ro),
         ("участник", w.rw.tok.clone()),
+        ("участник-ro", w.ro.tok.clone()),
     ];
     for (who, tok) in &toks {
         let tok = tok.as_str();
@@ -1174,4 +1175,107 @@ async fn token_default_kinds_scope_hash_unchanged() {
     .await;
     ok(&r, StatusCode::OK, "поиск");
     assert!(r.text().contains(&cid), "{}", r.text());
+}
+
+/// MCP-оракулы (ревью задачи 4): `memory_update_entry` — все действия, в том числе `feedback`,
+/// и `memory_link` с отчётом-источником (граф) отвечают на `p:|e:|<id>` отчёта так же, как на
+/// случайный id; токены владельца `rw`/`ro` и участников `rw`/`ro`. Отчёт цел.
+#[tokio::test]
+async fn token_mcp_update_link_feedback_oracle() {
+    let w = world("mcp-oracle").await;
+    let id = secret_report(&w).await;
+    let note = format!("n:{}", w.note("notes/mcp-oracle").await);
+    let ro = ro_token(&w).await;
+    let actions = [
+        json!({"action": "supersede", "rev": 1, "title": "Новый", "body": "т",
+               "data": {"kind": "gotcha"}}),
+        json!({"action": "retract", "rev": 1, "reason": "неверно"}),
+        json!({"action": "revisit", "rev": 1}),
+        json!({"action": "certify", "rev": 1, "certainty": "hypothesis", "reason": "проверка"}),
+        json!({"action": "append", "rev": 1, "body": "ещё"}),
+        json!({"action": "feedback", "value": "useful"}),
+        json!({"action": "status", "rev": 1, "status": "done"}),
+        json!({"action": "claim"}),
+        json!({"action": "release"}),
+        json!({"action": "answer", "text": "да", "by": "human"}),
+    ];
+    for (who, tok) in [
+        ("rw", w.o.tok.as_str()),
+        ("ro", ro.as_str()),
+        ("участник", w.rw.tok.as_str()),
+        ("участник-ro", w.ro.tok.as_str()),
+    ] {
+        for pre in ["p:", "e:", ""] {
+            for args in &actions {
+                let g = ghost();
+                let with = |x: &str| {
+                    let mut a = args.clone();
+                    a["id"] = json!(format!("{pre}{x}"));
+                    a
+                };
+                let a = mcp(&w.a, tok, "memory_update_entry", with(&id)).await;
+                let b = mcp(&w.a, tok, "memory_update_entry", with(&g)).await;
+                let what = format!("{who}: memory_update_entry {} {pre}", args["action"]);
+                assert_eq!(a.replace(&id, "ID"), b.replace(&g, "ID"), "{what}");
+                clean(&a.replace(&id, "ID"), &id, &what);
+            }
+        }
+        // граф: связь от отчёта (к отчёту — в матрице)
+        for pre in ["p:", "e:"] {
+            let g = ghost();
+            let link =
+                |x: &str| json!({"src": format!("{pre}{x}"), "type": "relates_to", "dst": note});
+            let a = mcp(&w.a, tok, "memory_link", link(&id)).await;
+            let b = mcp(&w.a, tok, "memory_link", link(&g)).await;
+            assert_eq!(
+                a.replace(&id, "ID"),
+                b.replace(&g, "ID"),
+                "{who}: memory_link src {pre}"
+            );
+        }
+    }
+    let (rev, _) = w.stored(&id).await;
+    assert_eq!(rev, 1);
+}
+
+/// `POST /cache` токена с `filters.kinds ∋ report` — 400 тем же текстом, что неизвестный вид
+/// (ревью задачи 4); сессии WebUI вид `report` в фильтре допустим.
+#[tokio::test]
+async fn token_cache_put_filters_kinds_report_400() {
+    let w = world("cache-kinds").await;
+    let src = insight(&w, "Источник выжимки").await;
+    let body = |kinds: Value| {
+        json!({"query": "итог", "summary": "Кратко.", "solution": G,
+               "sources": [{"id": format!("i:{src}")}], "filters": {"kinds": kinds}})
+    };
+    let detail = |r: &Resp| r.json()["detail"].as_str().unwrap_or_default().to_string();
+    for tok in [&w.o.tok, &w.rw.tok] {
+        for kinds in [json!(["report"]), json!(["insight", "report"])] {
+            let r =
+                w.a.tok(
+                    tok,
+                    Method::POST,
+                    "/api/v1/cache",
+                    Some(body(kinds.clone())),
+                )
+                .await;
+            ok(&r, StatusCode::BAD_REQUEST, &format!("cache kinds {kinds}"));
+            let xyz: Value =
+                serde_json::from_str(&kinds.to_string().replace("report", "xyz")).unwrap();
+            let u =
+                w.a.tok(tok, Method::POST, "/api/v1/cache", Some(body(xyz)))
+                    .await;
+            ok(&u, StatusCode::BAD_REQUEST, "cache kinds xyz");
+            assert_eq!(detail(&r).replace("report", "xyz"), detail(&u));
+        }
+    }
+    let r = web(
+        &w.a,
+        &w.o.web,
+        Method::POST,
+        "/api/v1/cache",
+        Some(body(json!(["insight", "report"]))),
+    )
+    .await;
+    ok(&r, StatusCode::CREATED, "WebUI: report в фильтре выжимки");
 }

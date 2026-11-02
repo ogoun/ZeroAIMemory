@@ -14,6 +14,7 @@ pub mod question;
 pub mod read;
 pub mod refs;
 pub mod release;
+pub mod report;
 pub mod search;
 pub mod solution;
 pub mod status;

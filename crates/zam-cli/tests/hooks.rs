@@ -539,7 +539,7 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
         "{c}"
     );
     // R2: блок v1 устарел — сервер напоминает
-    assert!(c.contains("устарел (v1 → v3)"), "{c}");
+    assert!(c.contains("устарел (v1 → v4)"), "{c}");
     let s = p.session("ss-1");
     assert_eq!(s["agent"], "claude-code", "{s}");
     assert_eq!(s["solution"], G, "{s}");

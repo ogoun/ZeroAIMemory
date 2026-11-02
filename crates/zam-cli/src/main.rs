@@ -137,6 +137,32 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Отчёт для пользователя: Markdown-файл с картинками и файлами по относительным ссылкам
+    /// (журнал «Отчёты» в WebUI); неизменяем — повтор = новый отчёт; печатает ссылку
+    Report {
+        /// Файл Markdown; картинки и файлы — по ссылкам относительно его каталога
+        file: PathBuf,
+        /// Заголовок (иначе первый заголовок `#` файла)
+        #[arg(long)]
+        title: Option<String>,
+        /// Тег (можно повторять)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Область (монорепозиторий)
+        #[arg(long)]
+        area: Option<String>,
+        /// На чём основан: commit:SHA | file:PATH | note:ID | task:k:ID (можно повторять)
+        #[arg(long = "ref")]
+        refs: Vec<String>,
+        /// Ключ идемпотентности: повтор с тем же ключом не создаёт второй отчёт
+        #[arg(long)]
+        key: Option<String>,
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
     /// Журналы решения: запись в Changelog, Insights или словарь (term)
     Log {
         #[command(subcommand)]
@@ -1363,6 +1389,27 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             file,
             common,
         } => cmd::attach::run(&cmd::connect(&common)?, &target, &file),
+        Cmd::Report {
+            file,
+            title,
+            tags,
+            area,
+            refs,
+            key,
+            solution,
+            common,
+        } => {
+            let a = cmd::report::ReportArgs {
+                file: &file,
+                title: title.as_deref(),
+                tags: &tags,
+                area: area.as_deref(),
+                refs: &refs,
+                key: key.as_deref(),
+                solution: solution.as_deref(),
+            };
+            cmd::report::report(&cmd::connect(&common)?, &a)
+        }
         Cmd::Log {
             cmd:
                 LogCmd::Changelog {

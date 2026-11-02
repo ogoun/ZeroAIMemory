@@ -1133,7 +1133,12 @@ async fn mcp_tool_count_still_10() {
     )
     .await;
     let s = init["instructions"].as_str().unwrap_or_default();
-    for want in ["kind=task|question|term", "event=recovery", "event=brief"] {
+    for want in [
+        "kind=task|question|term",
+        "event=recovery",
+        "event=brief",
+        "kind=report",
+    ] {
         assert!(s.contains(want), "{want}: {s}");
     }
 }
@@ -1162,7 +1167,18 @@ async fn mcp_descriptions_under_300() {
         );
     }
     let need: [(&str, &[&str]); 6] = [
-        ("memory_log", &["term", "task", "question", "refs.files"]),
+        (
+            "memory_log",
+            &[
+                "term",
+                "task",
+                "question",
+                "refs.files",
+                "report",
+                "images",
+                "zam report",
+            ],
+        ),
         (
             "memory_update_entry",
             &["status", "claim", "release", "answer"],
@@ -1443,4 +1459,272 @@ async fn mcp_read_locator() {
     .await;
     assert!(o.is_error, "{}", o.text);
     assert!(o.text.contains("locator"), "{}", o.text);
+}
+
+// ---- отчёты (M5.5, задача 5) ----
+
+/// PNG-подобные байты: сигнатура и `n` байт по `seed`.
+fn png(seed: u8, n: usize) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+    v.extend((0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)));
+    v
+}
+
+fn b64(data: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// Аргументы `memory_log` отчёта с одной картинкой `figs/loss.png`.
+fn report_args(title: &str, img: &[u8]) -> Value {
+    json!({"kind": "report", "title": title,
+           "body": "# Итог\n\nВывод kvazirep: точность выросла.\n\n![loss](figs/loss.png)\n",
+           "images": [{"name": "figs/loss.png", "data": b64(img)}], "tags": ["ml"]})
+}
+
+/// Id отчёта из адреса `…/j/reports/<id>` в тексте.
+fn report_id(text: &str) -> String {
+    let at = text
+        .find("/j/reports/")
+        .unwrap_or_else(|| panic!("нет адреса: {text}"));
+    text[at + "/j/reports/".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+async fn report_count(a: &Api) -> i64 {
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    db.read(|c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM entries WHERE kind = 'report'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?)
+    })
+    .await
+    .unwrap()
+}
+
+/// `memory_log kind=report`: картинки base64, ответ — только ссылка WebUI (без тела и `p:`),
+/// `format: json` — `{id, url}`.
+#[tokio::test]
+async fn mcp_log_report_base64_images() {
+    let a = api("mcp-report", |_| {}).await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    let hdr = [("x-zam-solution", G)];
+    let img = png(1, 300);
+    let o = ok(
+        &a,
+        &a.token,
+        &hdr,
+        "memory_log",
+        report_args("Итог обучения", &img),
+    )
+    .await;
+    assert!(
+        o.text
+            .starts_with("Отчёт записан: http://memory.lan:7700/#/u/"),
+        "{}",
+        o.text
+    );
+    assert!(o.text.contains(&format!("/s/{G}/j/reports/")), "{}", o.text);
+    let id = report_id(&o.text);
+    let pid = format!("p:{id}");
+    for leak in ["kvazirep", "Итог обучения", pid.as_str(), "figs/loss.png"] {
+        assert!(!o.text.contains(leak), "{leak}: {}", o.text);
+    }
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let files = zam_store::entry_attachments(&db, id.parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(
+        (files[0].filename.as_str(), files[0].mime.as_str()),
+        ("loss.png", "image/png")
+    );
+    assert_eq!(files[0].size, img.len() as u64);
+    // JSON — ровно {id, url}
+    let mut args = report_args("Второй", &img);
+    args["format"] = json!("json");
+    let o = ok(&a, &a.token, &hdr, "memory_log", args).await;
+    let j = o.json();
+    assert_eq!(j.as_object().unwrap().len(), 2, "{j}");
+    assert!(
+        j["url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/j/reports/{}", j["id"].as_str().unwrap())),
+        "{j}"
+    );
+    assert_eq!(report_count(&a).await, 2);
+}
+
+/// Больше `reports.mcp_max_bytes` — ошибка инструмента 413 с подсказкой `zam report`; тело
+/// больше предела `/mcp` — 413 транспорта с той же подсказкой; отчёт не создаётся.
+#[tokio::test]
+async fn mcp_log_report_over_limit_hint_cli() {
+    let a = api("mcp-report-limit", |c| {
+        c.limits.note_max_bytes = 1000;
+        c.reports.mcp_max_bytes = 2048;
+    })
+    .await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    let hdr = [("x-zam-solution", G)];
+    let o = tool(
+        &a,
+        &a.token,
+        &hdr,
+        "memory_log",
+        report_args("Большой", &png(2, 4096)),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("413"), "{}", o.text);
+    assert!(o.text.contains("zam report"), "{}", o.text);
+    // транспорт: тело больше предела /mcp
+    let r = rpc_raw(
+        &a,
+        Some(&format!("Bearer {}", a.token)),
+        &hdr,
+        "tools/call",
+        json!({"name": "memory_log",
+               "arguments": report_args("Огромный", &png(3, 100 * 1024))}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", r.text());
+    assert!(r.text().contains("zam report"), "{}", r.text());
+    assert_eq!(report_count(&a).await, 0);
+}
+
+/// Запрос `tools/call` к `/mcp` с телом потоком: `at` байт сразу, остальное — после сигнала.
+fn gated_mcp(
+    tok: &str,
+    body: String,
+    at: usize,
+) -> (Request<Body>, tokio::sync::oneshot::Sender<()>) {
+    use futures_util::StreamExt as _;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let head = body.as_bytes()[..at].to_vec();
+    let rest = body.as_bytes()[at..].to_vec();
+    let s = futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(head))
+    })
+    .chain(futures_util::stream::once(async move {
+        let _ = rx.await;
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(rest))
+    }));
+    let r = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::HOST, "memory.lan:7700")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+        .header("x-zam-solution", G)
+        .body(Body::from_stream(s))
+        .unwrap();
+    (r, tx)
+}
+
+/// Сквозной тест семафора больших тел (ревью задачи 2, Minor 3): два больших MCP-отчёта
+/// одновременно держат оба разрешения — их внутренние `POST /entries` второго разрешения не
+/// берут и проходят; третий большой запрос в это время — 503 `busy`.
+#[tokio::test]
+async fn mcp_two_big_reports_parallel_third_busy() {
+    use tower::ServiceExt as _;
+    let a = api("mcp-report-parallel", |c| c.limits.note_max_bytes = 1000).await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    let threshold = a.st.big_bodies.threshold();
+    let call = |title: &str, seed: u8| {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "memory_log",
+                          "arguments": report_args(title, &png(seed, 80 * 1024))}})
+        .to_string()
+    };
+    let mut gates = Vec::new();
+    let mut tasks = Vec::new();
+    for (i, title) in ["Первый", "Второй"].iter().enumerate() {
+        let body = call(title, i as u8);
+        assert!(body.len() > threshold + 10);
+        let (req, tx) = gated_mcp(&a.token, body, threshold + 10);
+        gates.push(tx);
+        let app = a.app.clone();
+        tasks.push(tokio::spawn(async move {
+            let r = app.oneshot(req).await.unwrap();
+            let status = r.status();
+            let b = http_body_util::BodyExt::collect(r.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            (status, String::from_utf8_lossy(&b).into_owned())
+        }));
+    }
+    // оба тела прочитаны за порог — оба разрешения заняты
+    let t0 = std::time::Instant::now();
+    while a.st.big_bodies.available() > 0 {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(30),
+            "разрешения не заняты"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let r = rpc_raw(
+        &a,
+        Some(&format!("Bearer {}", a.token)),
+        &[("x-zam-solution", G)],
+        "tools/call",
+        json!({"name": "memory_log",
+               "arguments": report_args("Третий", &png(9, 80 * 1024))}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.json()["type"], "/problems/busy");
+    for g in gates {
+        g.send(()).unwrap();
+    }
+    for t in tasks {
+        let (status, text) = t.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let j: Value = serde_json::from_str(&text).unwrap();
+        let out = j["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert_ne!(j["result"]["isError"], json!(true), "{out}");
+        assert!(out.starts_with("Отчёт записан: "), "{out}");
+    }
+    assert_eq!(report_count(&a).await, 2);
+    assert_eq!(a.st.big_bodies.available(), 2, "разрешения освобождены");
+}
+
+/// Внутренний вызов без внешнего разрешения (малое тело `/mcp` → большое внутреннее) берёт
+/// разрешение сам: при занятых — 503; с `outer_permit` — проходит.
+#[tokio::test]
+async fn inner_call_without_outer_permit_takes_permit() {
+    use zam_server::api::big_body::InnerCall;
+    let a = api("mcp-inner-permit", |c| c.limits.note_max_bytes = 1000).await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    let body = json!({"kind": "report", "title": "Внутренний", "body": "![a](a.png)",
+                      "images": [{"name": "a.png", "data": b64(&png(4, 80 * 1024))}]})
+    .to_string();
+    let req = |outer: bool| {
+        let mut r = Request::post(format!("/api/v1/spaces/{G}/entries"))
+            .header(header::AUTHORIZATION, format!("Bearer {}", a.token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        r.extensions_mut().insert(InnerCall {
+            outer_permit: outer,
+        });
+        r
+    };
+    let p1 = a.st.big_bodies.admit().await.unwrap();
+    let p2 = a.st.big_bodies.admit().await.unwrap();
+    let r = a.send(req(false)).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    let r = a.send(req(true)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    drop((p1, p2));
+    let r = a.send(req(false)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
 }

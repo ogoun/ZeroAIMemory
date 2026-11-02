@@ -323,11 +323,11 @@ pub async fn create(
     let json_max = super::entries_json_max(&st.cfg);
     let declared = super::big_body::content_length(&headers);
     // тело больше `note_body_max` держит разрешение большого тела до конца обработки
-    let inner = super::big_body::is_inner(req.extensions());
+    let held = super::big_body::permit_held(req.extensions());
     // не-отчёт с `kind` в начале тела — 413 до ожидания разрешения
     let (bytes, _big) = st
         .big_bodies
-        .read(req.into_body(), json_max, declared, inner, |prefix| {
+        .read(req.into_body(), json_max, declared, held, |prefix| {
             super::big_body::kind_prefix(prefix) == Some(false)
         })
         .await?;

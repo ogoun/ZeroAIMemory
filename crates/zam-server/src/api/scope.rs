@@ -497,7 +497,9 @@ async fn locate<T>(
     let user = target_user(st, p, headers).await?;
     let db = st.users.get(user.id).await?;
     match get(&db, id).await {
-        Ok(item) if hidden(&item) => return Err(ApiError::NotFound),
+        // скрытый объект своей базы — как отсутствующий: тот же путь по чужим решениям (время
+        // ответа и WARN не отличают его от несуществующего id)
+        Ok(item) if hidden(&item) => {}
         Ok(item) => {
             let space = get_space(&db, space_of(&item))
                 .await?

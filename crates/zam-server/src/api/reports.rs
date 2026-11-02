@@ -15,6 +15,9 @@
 //! такого файла — 422 с именем; файл без ссылки — 422 до записи байт; повтор имени — 400;
 //! картинка (`![…]`) с MIME не из [`IMAGE_MIMES`] — 422.
 //!
+//! **Имя части `file`** — `filename*=UTF-8''…` (RFC 8187), если есть, иначе `filename` в UTF-8
+//! (`part_filename`); `zam report` шлёт оба.
+//!
 //! **Файлы** пишутся потоком в [`BlobStore`] владельца базы (решение участника — к владельцу) с
 //! пределом `min(limits.blob_max_bytes, остаток reports.max_total_bytes)` (413); файлов больше
 //! `reports.max_files` — 422; у JSON тело и декодированные файлы — до `reports.mcp_max_bytes`
@@ -1290,6 +1293,64 @@ fn too_large(lim: Limits, over: Over, name: &str) -> ApiError {
     }
 }
 
+/// Имя файла части `file`: `filename*=UTF-8''<percent>` (RFC 8187), если есть, — оно
+/// приоритетнее (RFC 6266 §4.3); иначе `filename="…"` как есть (UTF-8, RFC 7578 §4.2; его
+/// разбирает multer, `filename*` он не понимает). `zam report` шлёт оба с одним именем.
+/// Нет имени, `filename*` не в UTF-8 или с неверным `%XX` — 400.
+fn part_filename(headers: &HeaderMap, plain: Option<&str>) -> Result<String, ApiError> {
+    let bad = |m: &str| ApiError::BadRequest(format!("часть file: {m}"));
+    let ext = headers
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|v| ext_param(v.as_bytes(), "filename*"));
+    if let Some(v) = ext {
+        let v = std::str::from_utf8(v).map_err(|_| bad("filename* — не ASCII"))?;
+        let mut it = v.trim().splitn(3, '\'');
+        let (Some(charset), Some(_lang), Some(enc)) = (it.next(), it.next(), it.next()) else {
+            return Err(bad("filename* — ожидается UTF-8''<имя в %XX>"));
+        };
+        if !charset.eq_ignore_ascii_case("utf-8") {
+            return Err(bad("filename* — только кодировка UTF-8"));
+        }
+        let name =
+            percent_decode(enc).ok_or_else(|| bad("filename* — неверный %XX или не UTF-8"))?;
+        if name.is_empty() {
+            return Err(bad("пустое имя файла"));
+        }
+        return Ok(name);
+    }
+    plain
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::BadRequest("у части file нет имени файла".into()))
+}
+
+/// Значение параметра `name` заголовка `Content-Disposition` (без учёта регистра имени; `;`
+/// внутри кавычек не делит параметры; значение — как есть, с кавычками).
+fn ext_param<'a>(v: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let mut start = 0;
+    let mut quoted = false;
+    let mut i = 0;
+    let mut params = Vec::new();
+    while i < v.len() {
+        match v[i] {
+            b'\\' if quoted => i += 1,
+            b'"' => quoted = !quoted,
+            b';' if !quoted => {
+                params.push(&v[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    params.push(&v[start.min(v.len())..]);
+    params.into_iter().find_map(|p| {
+        let eq = p.iter().position(|&c| c == b'=')?;
+        let key = p[..eq].trim_ascii();
+        key.eq_ignore_ascii_case(name.as_bytes())
+            .then(|| p[eq + 1..].trim_ascii())
+    })
+}
+
 /// Файлы части `file` multipart: поток каждого — в [`BlobStore::put`].
 async fn multipart_files(
     mp: &mut Multipart,
@@ -1306,10 +1367,7 @@ async fn multipart_files(
                 short(f.name().unwrap_or(""))
             )));
         }
-        let raw = f
-            .file_name()
-            .map(str::to_string)
-            .ok_or_else(|| ApiError::BadRequest("у части file нет имени файла".into()))?;
+        let raw = part_filename(f.headers(), f.file_name())?;
         let (name, mime) = intake.admit(&raw, f.content_type())?;
         let left = lim.max_total.saturating_sub(used);
         // поток обрывается на меньшем пределе — он и назван в ответе
@@ -1566,6 +1624,42 @@ pub async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `filename*` (RFC 8187) приоритетнее `filename`; без него — `filename` как есть.
+    #[test]
+    fn part_filename_ext_and_plain() {
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(
+                header::CONTENT_DISPOSITION,
+                axum::http::HeaderValue::from_bytes(v.as_bytes()).unwrap(),
+            );
+            m
+        };
+        let both = "form-data; name=\"file\"; filename=\"рис 1.png\"; \
+                    filename*=UTF-8''%D1%80%D0%B8%D1%81%201.png";
+        assert_eq!(
+            part_filename(&h(both), Some("рис 1.png")).unwrap(),
+            "рис 1.png"
+        );
+        let only = "form-data; name=\"file\"; filename*=utf-8'ru'figs%2Fa%20b.png";
+        assert_eq!(part_filename(&h(only), None).unwrap(), "figs/a b.png");
+        let quoted = "form-data; name=\"file\"; filename=\"a;b filename*=x.png\"";
+        assert_eq!(
+            part_filename(&h(quoted), Some("a;b filename*=x.png")).unwrap(),
+            "a;b filename*=x.png"
+        );
+        for bad in [
+            "form-data; name=\"file\"; filename*=koi8-r''%C1",
+            "form-data; name=\"file\"; filename*=UTF-8''%ZZ.png",
+            "form-data; name=\"file\"; filename*=UTF-8''%FF.png",
+            "form-data; name=\"file\"; filename*=a.png",
+            "form-data; name=\"file\"; filename*=UTF-8''",
+        ] {
+            assert!(part_filename(&h(bad), Some("a.png")).is_err(), "{bad}");
+        }
+        assert!(part_filename(&HeaderMap::new(), None).is_err());
+    }
 
     fn names(body: &str) -> Vec<(String, bool)> {
         report_refs(body)

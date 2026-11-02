@@ -25,6 +25,9 @@ use super::{Reply, Rest};
 
 /// Предел диффа конфликта ревизии в тексте ошибки, символов.
 const DIFF_MAX_CHARS: usize = 4000;
+/// Что делать с отчётом, который не прошёл через MCP по размеру или сроку.
+pub const REPORT_CLI_HINT: &str = "Большой отчёт — используйте `zam report <файл.md>`: \
+                                   картинки рядом с файлом, загрузка потоком без base64.";
 
 /// Имена инструментов (§13.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,10 +108,10 @@ impl ToolName {
                  frontmatter."
             }
             ToolName::Log => {
-                "Новая запись журнала: kind changelog|release (только в решении), insight \
-                 (data.kind, triggers, links, scope, certainty), term (data.definition, \
-                 aliases), task (body — план) или question (data.options, recommendation); \
-                 refs.files — файлы. Дубль insight или вопроса — 409 с кандидатами: force."
+                "Запись журнала: kind changelog|release, insight (data.kind, triggers, scope, \
+                 certainty), term (data.definition, aliases), task, question (data.options); \
+                 refs.files — файлы. report — отчёт пользователю, неизменяем: images [{name, \
+                 data base64}], большой — zam report. Дубль insight — 409: force."
             }
             ToolName::UpdateEntry => {
                 "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
@@ -241,10 +244,14 @@ impl ToolName {
             ),
             ToolName::Log => (
                 json!({
-                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "question"]},
+                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "question", "report"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ)"},
+                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}"},
+                    "images": {"type": "array", "description": "report: файлы по ссылкам тела ![…](figs/a.png); name — путь из ссылки, data — base64",
+                        "items": {"type": "object", "properties": {
+                            "name": {"type": "string"}, "data": {"type": "string"}},
+                            "required": ["name", "data"]}},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "certainty": {"type": "string", "enum": ["axiom", "theorem", "hypothesis"]},
                     "triggers": {"type": "array", "items": {"type": "object"}},
@@ -984,33 +991,36 @@ async fn log(rest: &Rest, args: &JsonObject) -> Res {
     let kind = req_str(args, "kind")?;
     if zam_store::EntryKind::parse(kind).is_none() {
         return Err(Fail::Invalid(
-            "kind: changelog, insight, release, term, task или question".into(),
+            "kind: changelog, insight, release, term, task, question или report".into(),
         ));
     }
     req_str(args, "title")?;
+    let report = kind == "report";
     let space = opt_str(args, "space")?
         .map(str::to_string)
         .unwrap_or_else(|| default_space(rest));
-    let body = pick(
-        args,
-        &[
-            "kind",
-            "title",
-            "body",
-            "data",
-            "tags",
-            "area",
-            "message",
-            "certainty",
-            "status",
-            "triggers",
-            "links",
-            "refs",
-            "scope",
-            "force",
-            "supersedes_id",
-        ],
-    );
+    let mut keys = vec![
+        "kind",
+        "title",
+        "body",
+        "data",
+        "tags",
+        "area",
+        "message",
+        "certainty",
+        "status",
+        "triggers",
+        "links",
+        "refs",
+        "scope",
+        "force",
+        "supersedes_id",
+    ];
+    if report {
+        // у отчёта прочие поля REST отклонит 400 (неизвестное поле) — агент увидит причину
+        keys.push("images");
+    }
+    let body = pick(args, &keys);
     let extra: Vec<(HeaderName, String)> = opt_str(args, "idempotency_key")?
         .map(|k| (HeaderName::from_static("idempotency-key"), k.to_string()))
         .into_iter()
@@ -1022,7 +1032,14 @@ async fn log(rest: &Rest, args: &JsonObject) -> Res {
         Some(&Value::Object(body)),
         &extra,
     )
-    .await?;
+    .await
+    .map_err(|e| if report { report_hint(e) } else { e })?;
+    if report {
+        // отчёт — для человека: агенту только ссылка (тела и `p:` нет, спецификация §7)
+        return done(f, &r, |v| {
+            format!("Отчёт записан: {}", v["url"].as_str().unwrap_or("?"))
+        });
+    }
     done(f, &r, |v| {
         let mut s = format!("Записано {}", entry_line(v));
         if let Some(d) = v["dedup"].as_str() {
@@ -1034,6 +1051,22 @@ async fn log(rest: &Rest, args: &JsonObject) -> Res {
         s.push_str(&warnings_md(v));
         s
     })
+}
+
+/// Подсказка к отказу MCP-отчёта по размеру (413) или сроку чтения тела (408): большой отчёт
+/// идёт через `zam report` (multipart потоком, без base64 и предела `reports.mcp_max_bytes`).
+fn report_hint(e: Fail) -> Fail {
+    match &e {
+        Fail::Rest { reply, .. }
+            if matches!(
+                reply.status,
+                StatusCode::PAYLOAD_TOO_LARGE | StatusCode::REQUEST_TIMEOUT
+            ) =>
+        {
+            e.hint(REPORT_CLI_HINT)
+        }
+        _ => e,
+    }
 }
 
 async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
@@ -1544,10 +1577,10 @@ mod tests {
     /// (спецификация M4.5 §1.3); строка записи печатает букву своего вида.
     #[test]
     fn entry_ref_letters() {
-        for p in ["i", "c", "r", "t", "k", "q", "e", "entry"] {
+        for p in ["i", "c", "r", "t", "k", "q", "p", "e", "entry"] {
             assert_eq!(entry_id(&format!("{p}:01ABC")), "01ABC", "{p}");
         }
-        for p in ["i", "c", "r", "t", "k", "q"] {
+        for p in ["i", "c", "r", "t", "k", "q", "p"] {
             assert_eq!(graph_ref(&format!("{p}:01ABC")), "e:01ABC", "{p}");
         }
         assert_eq!(graph_ref("e:01ABC"), "e:01ABC");
@@ -1557,6 +1590,7 @@ mod tests {
             ("task", "k"),
             ("question", "q"),
             ("insight", "i"),
+            ("report", "p"),
         ] {
             let line = entry_line(&json!({"id": "01ABC", "kind": kind, "title": "x", "rev": 1}));
             assert!(

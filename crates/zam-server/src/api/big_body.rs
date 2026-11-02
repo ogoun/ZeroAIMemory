@@ -13,10 +13,14 @@
 //!   тестов — [`BigBodies::set_read_timeout`]); дольше — 408 `/problems/timeout`, разрешение
 //!   освобождается: медленный клиент не держит его бесконечно.
 //! - **Внутренние вызовы:** инструменты MCP зовут REST через внутренний роутер (`oneshot`) с
-//!   расширением [`InnerCall`]: разрешение уже держит внешний запрос `/mcp`, второе не берётся
-//!   (иначе два больших MCP-отчёта заняли бы оба разрешения и их внутренние POST получили бы
-//!   503). Расширения запроса из сети не приходят — hyper создаёт их пустыми, метку ставит только
-//!   [`crate::mcp`].
+//!   расширением [`InnerCall`]. Если тело внешнего `/mcp` заняло разрешение ([`limit_mcp`]
+//!   ставит [`OuterPermit`]), `InnerCall { outer_permit: true }` — второе не берётся (иначе два
+//!   больших MCP-отчёта заняли бы оба разрешения и их внутренние POST получили бы 503). Малое
+//!   внешнее тело (`outer_permit: false`), из которого инструмент собрал большое внутреннее, —
+//!   разрешение берётся как у внешнего запроса. Расширения запроса из сети не приходят — hyper
+//!   создаёт их пустыми, метки ставят только [`limit_mcp`] и [`crate::mcp`].
+//! - **Подсказка `zam report`:** 413 `/mcp` и 408 срока чтения называют путь для больших
+//!   отчётов — CLI шлёт multipart потоком без base64 и без предела `reports.mcp_max_bytes`.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -41,9 +45,18 @@ pub const BIG_BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// `Retry-After` ответа 503, секунд.
 const RETRY_AFTER_S: u64 = 2;
 
-/// Метка внутреннего запроса MCP → REST: разрешение держит внешний `/mcp`.
+/// Подсказка в 413 `/mcp` и 408: большой отчёт — через CLI.
+const CLI_HINT: &str = "большой отчёт — используйте `zam report <файл.md>` (multipart потоком)";
+
+/// Метка внутреннего запроса MCP → REST; `outer_permit` — внешний `/mcp` держит разрешение.
 #[derive(Debug, Clone, Copy)]
-pub struct InnerCall;
+pub struct InnerCall {
+    pub outer_permit: bool,
+}
+
+/// Метка запроса `/mcp`, тело которого заняло разрешение (ставит [`limit_mcp`]).
+#[derive(Debug, Clone, Copy)]
+pub struct OuterPermit;
 
 /// Семафор больших тел, порог «большого» тела (байт) и срок чтения.
 #[derive(Clone)]
@@ -65,6 +78,11 @@ impl BigBodies {
     /// Порог «большого» тела, байт.
     pub fn threshold(&self) -> usize {
         self.threshold
+    }
+
+    /// Свободных разрешений сейчас (тесты и диагностика).
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
     }
 
     /// Срок дочитывания большого тела (действует на все копии; по умолчанию
@@ -90,14 +108,15 @@ impl BigBodies {
 
     /// Тело до `limit` байт (больше — 413; заявленное `declared` больше — 413 без чтения). Тело
     /// больше порога: прочитанный префикс до порога проверяет `early_reject` (`true` — 413 без
-    /// ожидания разрешения), затем берётся разрешение (кроме `inner`) и тело дочитывается не
-    /// дольше срока (408). Разрешение держит вызывающий до конца обработки.
+    /// ожидания разрешения), затем берётся разрешение (кроме `held` — его уже держит внешний
+    /// запрос) и тело дочитывается не дольше срока (408). Разрешение держит вызывающий до конца
+    /// обработки.
     pub async fn read(
         &self,
         body: Body,
         limit: usize,
         declared: Option<u64>,
-        inner: bool,
+        held: bool,
         early_reject: impl Fn(&[u8]) -> bool,
     ) -> Result<(Bytes, Option<OwnedSemaphorePermit>), ApiError> {
         let too_large = || ApiError::PayloadTooLarge("тело запроса превышает предел".into());
@@ -114,7 +133,7 @@ impl BigBodies {
                     Ok(n) => n,
                     Err(_) => {
                         return Err(ApiError::RequestTimeout(format!(
-                            "большое тело запроса не получено за {} с",
+                            "большое тело запроса не получено за {} с: {CLI_HINT}",
                             self.read_timeout().as_secs_f32()
                         )));
                     }
@@ -134,7 +153,7 @@ impl BigBodies {
                 if early_reject(&buf[..self.threshold]) {
                     return Err(too_large());
                 }
-                if !inner {
+                if !held {
                     permit = Some(self.admit().await?);
                 }
                 deadline = Some(tokio::time::Instant::now() + self.read_timeout());
@@ -151,15 +170,17 @@ pub fn content_length(h: &axum::http::HeaderMap) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// Внутренний ли это вызов MCP → REST ([`InnerCall`]).
-pub fn is_inner(ext: &axum::http::Extensions) -> bool {
-    ext.get::<InnerCall>().is_some()
+/// Разрешение большого тела уже держит внешний запрос: внутренний вызов MCP → REST из `/mcp`
+/// с большим телом ([`InnerCall`] с `outer_permit`).
+pub fn permit_held(ext: &axum::http::Extensions) -> bool {
+    ext.get::<InnerCall>().is_some_and(|c| c.outer_permit)
 }
 
 /// Слой `/mcp`: тело читается здесь с пределом [`super::entries_json_max`] (он же предел rmcp)
-/// и с разрешением для большого тела; дальше запрос идёт с прочитанным телом.
+/// и с разрешением для большого тела; дальше запрос идёт с прочитанным телом и меткой
+/// [`OuterPermit`], если разрешение занято.
 pub async fn limit_mcp(State(st): State<AppState>, req: Request, next: Next) -> Response {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let limit = super::entries_json_max(&st.cfg);
     let declared = content_length(&parts.headers);
     let read = st
@@ -168,8 +189,14 @@ pub async fn limit_mcp(State(st): State<AppState>, req: Request, next: Next) -> 
         .await;
     let (bytes, permit) = match read {
         Ok(v) => v,
+        Err(ApiError::PayloadTooLarge(m)) => {
+            return ApiError::PayloadTooLarge(format!("{m}: {CLI_HINT}")).into_response();
+        }
         Err(e) => return e.into_response(),
     };
+    if permit.is_some() {
+        parts.extensions.insert(OuterPermit);
+    }
     let resp = next
         .run(Request::from_parts(parts, Body::from(bytes)))
         .await;
@@ -307,7 +334,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e, ApiError::Busy { .. }), "{e:?}");
-        // внутренний вызов MCP → REST разрешения не берёт
+        // разрешение уже держит внешний запрос (внутренний вызов MCP → REST) — второе не берётся
         let (bytes, p) = b
             .read(Body::from("x".repeat(50)), 100, None, true, |_| false)
             .await
@@ -330,6 +357,19 @@ mod tests {
         assert!(matches!(e, ApiError::PayloadTooLarge(_)), "{e:?}");
     }
 
+    /// Метка внутреннего вызова сама по себе разрешения не заменяет: только `outer_permit`.
+    #[test]
+    fn permit_held_only_with_outer_permit() {
+        let mut ext = axum::http::Extensions::new();
+        assert!(!permit_held(&ext));
+        ext.insert(InnerCall {
+            outer_permit: false,
+        });
+        assert!(!permit_held(&ext));
+        ext.insert(InnerCall { outer_permit: true });
+        assert!(permit_held(&ext));
+    }
+
     #[tokio::test]
     async fn slow_body_times_out_and_frees_permit() {
         let b = BigBodies::new(1, 10);
@@ -340,7 +380,10 @@ mod tests {
             .read(Body::from_stream(slow), 100, None, false, |_| false)
             .await
             .unwrap_err();
-        assert!(matches!(e, ApiError::RequestTimeout(_)), "{e:?}");
+        assert!(
+            matches!(&e, ApiError::RequestTimeout(m) if m.contains("zam report")),
+            "{e:?}"
+        );
         // разрешение свободно
         let _p = b.admit().await.unwrap();
     }

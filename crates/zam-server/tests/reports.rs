@@ -1314,3 +1314,69 @@ async fn big_bodies_busy_503_small_unaffected() {
     let r = w.a.send(mcp(rpc)).await;
     assert_ne!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
 }
+
+/// Имя части `filename*=UTF-8''…` (RFC 8187) с кириллицей и пробелом: только `filename*` и
+/// вместе с `filename` в UTF-8 (как шлёт `zam report`); неверный `filename*` — 400.
+#[tokio::test]
+async fn report_multipart_filename_star_utf8() {
+    let w = world("filename-star").await;
+    let ext = |s: &str| -> String {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b".-_".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    let (one, two) = ("figs/рис 1.png", "figs/рис 2.png");
+    let meta =
+        json!({"title": "Имена", "body": format!("![a](<{one}>) ![b](<{two}>)")}).to_string();
+    let body = |disp1: &str, disp2: &str| -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"meta\"\r\n\r\n{meta}\r\n"
+            )
+            .as_bytes(),
+        );
+        for (d, seed) in [(disp1, 1u8), (disp2, 2u8)] {
+            b.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; {d}\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            b.extend_from_slice(&png(seed, 40));
+            b.extend_from_slice(b"\r\n");
+        }
+        b.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        b
+    };
+    let only_ext = format!("filename*=UTF-8''{}", ext(one));
+    let both = format!("filename=\"{two}\"; filename*=UTF-8''{}", ext(two));
+    let r = w.mp_raw(&w.a_tok, G, body(&only_ext, &both), None).await;
+    assert_status(&r, StatusCode::CREATED, "filename*");
+    let mut names: Vec<String> = w
+        .files_of(&id_of(&r))
+        .await
+        .into_iter()
+        .map(|f| f.filename)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["рис 1.png", "рис 2.png"]);
+    // неверный filename* — 400, отчёт не создан
+    let before = w.reports().await;
+    let r = w
+        .mp_raw(
+            &w.a_tok,
+            G,
+            body("filename*=koi8-r''%D2%C9%D3", &both),
+            None,
+        )
+        .await;
+    assert_status(&r, StatusCode::BAD_REQUEST, "filename* не UTF-8");
+    assert_eq!(w.reports().await, before);
+}
