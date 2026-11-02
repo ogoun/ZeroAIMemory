@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::ml::{MINILM, READY, have, ml};
-use common::process::{AdminWeb, ServerProc, http};
+use common::process::{AdminWeb, ServerProc};
 use common::qdrant::{TestQdrant, free_port};
 use serde_json::{Value, json};
 use zam_server::config::{LogFormat, QdrantMode, ServerConfig};
@@ -208,25 +208,6 @@ fn hits(j: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Файлы каталога (рекурсивно), содержащие байты `needle`.
-fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            out.extend(files_containing(&p, needle));
-        } else if let Ok(b) = std::fs::read(&p)
-            && b.windows(needle.len()).any(|w| w == needle)
-        {
-            out.push(p);
-        }
-    }
-    out
-}
-
 /// В каталоге журналов есть файл журнала сервера (иначе проверка «нет в журнале» пуста).
 fn has_server_log(data: &Path) {
     let logs = data.join("logs");
@@ -240,32 +221,6 @@ fn has_server_log(data: &Path) {
                 && e.metadata().is_ok_and(|m| m.len() > 0)
         });
     assert!(any, "нет непустого журнала сервера в {}", logs.display());
-}
-
-/// Все точки коллекции с payload — прямым REST API Qdrant, мимо адаптера и его фильтров.
-fn qdrant_points(q: &TestQdrant) -> Vec<Value> {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, q.http_port));
-    let mut out = Vec::new();
-    let mut offset = Value::Null;
-    loop {
-        let (code, v) = http(
-            addr,
-            "POST",
-            &format!("/collections/{}/points/scroll", zam_index::COLLECTION),
-            Some(&q.api_key),
-            Some(
-                &json!({"limit": 1000, "with_payload": true, "with_vector": false,
-                         "offset": offset}),
-            ),
-        )
-        .expect("scroll Qdrant");
-        assert_eq!(code, 200, "{v}");
-        out.extend(v["result"]["points"].as_array().unwrap().iter().cloned());
-        offset = v["result"]["next_page_offset"].clone();
-        if offset.is_null() {
-            return out;
-        }
-    }
 }
 
 // ---- 1. Изоляция ----
@@ -373,7 +328,7 @@ fn isolation_human_vault_and_solution_access() {
     idle(&mut srv, &web);
 
     // Human и Vault — не в Qdrant (точки есть, и среди них нет ни Human, ни Vault)
-    let points = qdrant_points(&q);
+    let points = q.points();
     assert!(
         points
             .iter()
@@ -581,12 +536,12 @@ fn isolation_human_vault_and_solution_access() {
     srv.kill();
     has_server_log(&data);
     for needle in [&human_word, &vault_value] {
-        let hits = files_containing(&data.join("logs"), needle.as_bytes());
+        let hits = common::files_containing(&data.join("logs"), needle.as_bytes());
         assert!(hits.is_empty(), "{needle} в журнале: {hits:?}");
-        let hits = files_containing(&q.dir, needle.as_bytes());
+        let hits = common::files_containing(&q.dir, needle.as_bytes());
         assert!(hits.is_empty(), "{needle} в хранилище Qdrant: {hits:?}");
     }
-    let hits = files_containing(&data, vault_value.as_bytes());
+    let hits = common::files_containing(&data, vault_value.as_bytes());
     assert!(
         hits.is_empty(),
         "значение Vault в каталоге данных: {hits:?}"
@@ -833,9 +788,9 @@ fn secret_through_agent_audited_and_bound_to_master_key() {
     common::process::wait_server_log(&data, "", Duration::from_secs(5));
     srv.kill();
     has_server_log(&data);
-    let hits = files_containing(&data, value.as_bytes());
+    let hits = common::files_containing(&data, value.as_bytes());
     assert!(hits.is_empty(), "значение в каталоге данных: {hits:?}");
-    let hits = files_containing(&q.dir, value.as_bytes());
+    let hits = common::files_containing(&q.dir, value.as_bytes());
     assert!(hits.is_empty(), "значение в хранилище Qdrant: {hits:?}");
     assert!(!srv.tail().contains(&value), "значение в stderr");
 

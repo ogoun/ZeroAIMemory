@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use axum::http::{Method, StatusCode};
 use common::api::{Api, Resp, api};
-use common::attach::{pptx, upload, upload_adm, wait_done, xlsx};
+use common::attach::{big_sheet, pptx, upload, upload_adm, wait_done, xlsx, xlsx_owned};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use serde_json::{Value, json};
 use zam_docs::test_pdf::{Page, build, pdfium_path};
@@ -269,22 +269,14 @@ async fn preview_sheet_paging() {
 async fn preview_sheet_10k_first_screen_under_1s() {
     let (a, _) = world("prev-10k").await;
     let n = note(&a, &a.token, "knowledge", "p/большая").await;
-    let mut rows: Vec<Vec<String>> = vec![(0..8).map(|c| format!("Столбец {c}")).collect()];
-    for r in 2..=10_001 {
-        rows.push((0..8).map(|c| format!("{}", r * 10 + c)).collect());
-    }
-    let refs: Vec<Vec<&str>> = rows
-        .iter()
-        .map(|r| r.iter().map(String::as_str).collect())
-        .collect();
-    let rr: Vec<&[&str]> = refs.iter().map(Vec::as_slice).collect();
+    let rows = big_sheet(10_000, 8);
     let sha = sha_of(
         &upload(
             &a,
             &a.token,
             &n,
             "big.xlsx",
-            &xlsx(&[("Данные", rr.as_slice())]),
+            &xlsx_owned(&[("Данные", &rows)]),
         )
         .await,
     );

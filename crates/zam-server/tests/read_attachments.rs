@@ -8,7 +8,9 @@ mod common;
 
 use axum::http::{Method, StatusCode};
 use common::api::{Api, Resp, api};
-use common::attach::{chunk_locators, db, docx, pptx, upload, upload_adm, wait_done, xlsx};
+use common::attach::{
+    chunk_locators, db, docx, filler, pptx, read1, text, upload, upload_adm, wait_done, xlsx,
+};
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_docs::test_pdf::{Page, build, pdfium_path};
@@ -47,18 +49,6 @@ async fn read(a: &Api, token: &str, body: Value) -> Value {
     r.json()
 }
 
-/// Первый элемент ответа `/read` одной цели.
-async fn read1(a: &Api, token: &str, item: Value) -> Value {
-    let j = read(a, token, json!({"items": [item], "budget_tokens": 20000})).await;
-    j["items"][0].clone()
-}
-
-fn text(it: &Value) -> &str {
-    it["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("нет text: {it}"))
-}
-
 /// Чанк документа `att`, текст которого содержит `word`: `(chunk_id, locator)`.
 async fn chunk_with(a: &Api, user: Id, att: Id, word: &str) -> (String, String) {
     let word = word.to_string();
@@ -74,10 +64,6 @@ async fn chunk_with(a: &Api, user: Id, att: Id, word: &str) -> (String, String) 
         })
         .await
         .unwrap()
-}
-
-fn filler(n: usize) -> String {
-    "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor. ".repeat(n)
 }
 
 /// Части `session_seen` сессии `session` вида `blob` для блоба `sha` (по порядку).

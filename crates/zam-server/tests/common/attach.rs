@@ -1,17 +1,196 @@
-//! Вложения в интеграционных тестах (M5): загрузка `POST /blobs`, ожидание извлечения, сборка
-//! документов DOCX, XLSX и PPTX в памяти (минимальные пакеты OOXML).
+//! Вложения в интеграционных тестах (M5): сервер с pdfium и векторным каналом, загрузка
+//! `POST /blobs`, ожидание извлечения, выдача поиска и `/read`, сборка документов DOCX, XLSX и
+//! PPTX в памяти (минимальные пакеты OOXML).
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
-use serde_json::Value;
+use axum::http::{Method, Request, StatusCode, header};
+use serde_json::{Value, json};
 use zam_core::Id;
+use zam_docs::test_pdf::pdfium_path;
 use zam_store::{AttachmentDoc, ExtractState, list_attachments};
 
-use super::api::Api;
-use super::ml::until;
+use super::api::{Api, api};
+use super::ml::{MINILM, external, have, ml, until, vector_ready};
+use super::qdrant::TestQdrant;
+
+/// pdfium из `cargo xtask fetch-deps`; без него — `None` (PDF в тесте пропускается), в CI
+/// (`ZAM_REQUIRE_ML=1`, зависимости скачаны) — падение.
+pub fn pdfium() -> Option<PathBuf> {
+    let p = pdfium_path(env!("CARGO_MANIFEST_DIR"));
+    if p.is_none() {
+        assert!(
+            std::env::var_os("ZAM_REQUIRE_ML").is_none(),
+            "нет pdfium: cargo xtask fetch-deps"
+        );
+        eprintln!("pdfium не найден (cargo xtask fetch-deps) — PDF в тесте пропущен");
+    }
+    p
+}
+
+/// Сервер документов: векторный канал — если запрошен и есть MiniLM и Qdrant, pdfium — если
+/// найден.
+pub struct World {
+    pub a: Api,
+    pub q: Option<TestQdrant>,
+    pub vector: bool,
+    pub pdf: bool,
+}
+
+/// [`World`] с правкой конфигурации `tweak` поверх модели, Qdrant и pdfium.
+pub async fn world_with(
+    name: &str,
+    vector: bool,
+    tweak: impl FnOnce(&mut zam_server::config::ServerConfig),
+) -> World {
+    let vector = vector && have(MINILM);
+    let q = vector.then(|| TestQdrant::start(name));
+    let pdfium = pdfium_path(env!("CARGO_MANIFEST_DIR"));
+    let pdf = pdfium.is_some();
+    let a = api(name, |c| {
+        if let Some(q) = &q {
+            ml(c, MINILM);
+            external(c, q);
+        }
+        c.docs.pdfium_dylib = pdfium;
+        tweak(c);
+    })
+    .await;
+    if vector {
+        vector_ready(&a).await;
+    }
+    World { a, q, vector, pdf }
+}
+
+pub async fn world(name: &str, vector: bool) -> World {
+    world_with(name, vector, |_| {}).await
+}
+
+/// `POST /search` токеном `token`, ответ 200.
+pub async fn search(a: &Api, token: &str, body: Value) -> Value {
+    let r = a
+        .tok(token, Method::POST, "/api/v1/search", Some(body))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+/// Поиск по cookie администратора (Human — с `include_human`).
+pub async fn search_adm(a: &Api, body: Value) -> Value {
+    let r = a
+        .adm(Method::POST, "/api/v1/search", Some(body), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+pub fn items(j: &Value) -> &Vec<Value> {
+    j["items"].as_array().unwrap_or_else(|| panic!("{j}"))
+}
+
+/// Карточки вложений выдачи.
+pub fn atts(j: &Value) -> Vec<&Value> {
+    items(j)
+        .iter()
+        .filter(|i| i["kind"] == "attachment")
+        .collect()
+}
+
+/// Имена файлов карточек вложений выдачи, по порядку имён.
+pub fn files(j: &Value) -> Vec<String> {
+    let mut v: Vec<String> = atts(j)
+        .iter()
+        .map(|i| i["file"].as_str().unwrap().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Каналы карточки (`sources`).
+pub fn sources(i: &Value) -> Vec<&str> {
+    i["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect()
+}
+
+/// Карточка файла `file` с каналом FTS — ровно одна. Порядок близких косинусов малого корпуса
+/// разный на Linux и Windows: вторая карточка того же файла может прийти только вектором (CI
+/// abd604c), поэтому карточка выбирается по каналу, а не по месту в выдаче.
+pub fn fts_card<'a>(j: &'a Value, file: &str) -> &'a Value {
+    let same: Vec<&Value> = atts(j).into_iter().filter(|i| i["file"] == file).collect();
+    let fts: Vec<&Value> = same
+        .iter()
+        .copied()
+        .filter(|i| sources(i).contains(&"fts"))
+        .collect();
+    assert_eq!(fts.len(), 1, "{file}: карточек с fts {}: {j}", fts.len());
+    assert!(same.len() <= 2, "max_per_attachment: {file}: {j}");
+    fts[0]
+}
+
+/// Первый элемент ответа `/read` одной цели токеном `token`.
+pub async fn read1(a: &Api, token: &str, item: Value) -> Value {
+    let r = a
+        .tok(
+            token,
+            Method::POST,
+            "/api/v1/read",
+            Some(json!({"items": [item], "budget_tokens": 20000})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"][0].clone()
+}
+
+/// Текст элемента `/read`.
+pub fn text(it: &Value) -> &str {
+    it["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("нет text: {it}"))
+}
+
+/// Наполнитель: `n` предложений латыни (~80 символов каждое).
+pub fn filler(n: usize) -> String {
+    "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor. ".repeat(n)
+}
+
+/// Строки большого листа: шапка `Столбец 0..cols` и `n` строк чисел (`r * 10 + c`, `r` — номер
+/// строки листа с 2).
+pub fn big_sheet(n: usize, cols: usize) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = vec![(0..cols).map(|c| format!("Столбец {c}")).collect()];
+    for r in 2..=n + 1 {
+        rows.push((0..cols).map(|c| format!("{}", r * 10 + c)).collect());
+    }
+    rows
+}
+
+/// XLSX из листов со строками-владельцами (`big_sheet`).
+pub fn xlsx_owned(sheets: &[(&str, &[Vec<String>])]) -> Vec<u8> {
+    let refs: Vec<Vec<Vec<&str>>> = sheets
+        .iter()
+        .map(|(_, rows)| {
+            rows.iter()
+                .map(|r| r.iter().map(String::as_str).collect())
+                .collect()
+        })
+        .collect();
+    let rows: Vec<Vec<&[&str]>> = refs
+        .iter()
+        .map(|s| s.iter().map(Vec::as_slice).collect())
+        .collect();
+    let named: Vec<(&str, &[&[&str]])> = sheets
+        .iter()
+        .zip(&rows)
+        .map(|((name, _), r)| (*name, r.as_slice()))
+        .collect();
+    xlsx(&named)
+}
 
 const BOUNDARY: &str = "zam-attach-boundary-7d41";
 /// Предел ожидания извлечения.
@@ -117,7 +296,8 @@ pub async fn wait_points(a: &Api, user: Id, n: u64) {
     .await;
 }
 
-fn zip_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+/// Zip из записей `(имя, байты)` (сжатие по умолчанию).
+pub fn zip_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let o = zip::write::SimpleFileOptions::default();
     for (name, data) in entries {
@@ -153,6 +333,24 @@ fn content_types(main: &str, ct: &str) -> Vec<u8> {
         r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="{main}" ContentType="{ct}"/></Types>"#
     )
     .into_bytes()
+}
+
+/// DOCX с заданным `word/document.xml` как есть (враждебные и особые части).
+pub fn docx_raw(document: &[u8]) -> Vec<u8> {
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            content_types(
+                "/word/document.xml",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            ),
+        ),
+        (
+            "_rels/.rels",
+            rels(&[("rId1".into(), "officeDocument", "word/document.xml".into())]),
+        ),
+        ("word/document.xml", document.to_vec()),
+    ])
 }
 
 /// DOCX из абзацев без стилей.

@@ -9,47 +9,14 @@
 mod common;
 
 use axum::http::{Method, StatusCode};
-use common::api::{Api, api};
+use common::api::Api;
 use common::attach::{
-    chunk_locators, docx, pptx, upload, upload_adm, wait_done, wait_points, xlsx,
+    atts, chunk_locators, docx, files, filler, items, pptx, search, search_adm, sources, upload,
+    upload_adm, wait_done, wait_points, world, xlsx,
 };
-use common::ml::{MINILM, external, have, ml, vector_ready};
-use common::qdrant::TestQdrant;
 use serde_json::{Value, json};
-use zam_docs::test_pdf::{Page, build, pdfium_path};
+use zam_docs::test_pdf::{Page, build};
 use zam_store::attachments::Locator;
-
-/// Сервер: векторный канал — если есть MiniLM и Qdrant, pdfium — если найден.
-struct World {
-    a: Api,
-    _q: Option<TestQdrant>,
-    vector: bool,
-    pdf: bool,
-}
-
-async fn world(name: &str, vector: bool) -> World {
-    let vector = vector && have(MINILM);
-    let q = vector.then(|| TestQdrant::start(name));
-    let pdfium = pdfium_path(env!("CARGO_MANIFEST_DIR"));
-    let pdf = pdfium.is_some();
-    let a = api(name, |c| {
-        if let Some(q) = &q {
-            ml(c, MINILM);
-            external(c, q);
-        }
-        c.docs.pdfium_dylib = pdfium;
-    })
-    .await;
-    if vector {
-        vector_ready(&a).await;
-    }
-    World {
-        a,
-        _q: q,
-        vector,
-        pdf,
-    }
-}
 
 /// Заметка токеном `token`; `area` — заголовок `X-Zam-Area`.
 async fn note(
@@ -74,60 +41,9 @@ async fn note(
     r.json()["id"].as_str().unwrap().to_string()
 }
 
-async fn search(a: &Api, token: &str, body: Value) -> Value {
-    let r = a
-        .tok(token, Method::POST, "/api/v1/search", Some(body))
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    r.json()
-}
-
-/// Поиск по cookie администратора (Human — с `include_human`).
-async fn search_adm(a: &Api, body: Value) -> Value {
-    let r = a
-        .adm(Method::POST, "/api/v1/search", Some(body), None)
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    r.json()
-}
-
-fn items(j: &Value) -> &Vec<Value> {
-    j["items"].as_array().unwrap_or_else(|| panic!("{j}"))
-}
-
-/// Карточки вложений выдачи.
-fn atts(j: &Value) -> Vec<&Value> {
-    items(j)
-        .iter()
-        .filter(|i| i["kind"] == "attachment")
-        .collect()
-}
-
 /// Карточки заметок выдачи.
 fn notes(j: &Value) -> Vec<&Value> {
     items(j).iter().filter(|i| i["kind"] == "note").collect()
-}
-
-fn files(j: &Value) -> Vec<String> {
-    let mut v: Vec<String> = atts(j)
-        .iter()
-        .map(|i| i["file"].as_str().unwrap().to_string())
-        .collect();
-    v.sort();
-    v
-}
-
-fn sources(i: &Value) -> Vec<&str> {
-    i["sources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_str().unwrap())
-        .collect()
-}
-
-fn filler(n: usize) -> String {
-    "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor. ".repeat(n)
 }
 
 /// DOCX, PDF, XLSX и PPTX одной заметки: каждый формат находится по своему слову карточкой

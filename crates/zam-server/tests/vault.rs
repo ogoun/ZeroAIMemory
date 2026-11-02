@@ -56,25 +56,6 @@ fn id_of(r: &Resp) -> String {
     r.json()["id"].as_str().unwrap().to_string()
 }
 
-/// Байтовое вхождение `needle` в файлы каталога (рекурсивно).
-fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            out.extend(files_containing(&p, needle));
-        } else if let Ok(b) = std::fs::read(&p)
-            && b.windows(needle.len()).any(|w| w == needle)
-        {
-            out.push(p);
-        }
-    }
-    out
-}
-
 #[tokio::test]
 async fn agent_sets_and_reveals_secret_audited() {
     let a = api("vault-reveal", |_| {}).await;
@@ -730,7 +711,7 @@ async fn copy_without_master_key_reveals_nothing() {
     // копирования — копия после остановки; WAL «на ходу» проверяет тест журналов)
     let dst = common::tmp("vault-copy-dst");
     copy_dir(&dir, &dst, &["master.key", ".zam.lock"]);
-    let hits = files_containing(&dst, v.as_bytes());
+    let hits = common::files_containing(&dst, v.as_bytes());
     assert!(hits.is_empty(), "значение в байтах копии: {hits:?}");
     assert!(
         std::fs::read_dir(dst.join("users"))
@@ -836,7 +817,7 @@ fn vault_values_not_in_fts_qdrant_logs() {
             .starts_with("zam-server.log")),
         "журнал сервера в каталоге данных"
     );
-    let hits = files_containing(&data, v.as_bytes());
+    let hits = common::files_containing(&data, v.as_bytes());
     assert!(
         hits.is_empty(),
         "значение в файлах каталога данных: {hits:?}"

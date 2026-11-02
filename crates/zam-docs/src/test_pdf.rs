@@ -100,6 +100,12 @@ pub fn build(pages: &[Page]) -> Vec<u8> {
         s.extend_from_slice(b"\nendstream");
         objs.push(s);
     }
+    assemble(&objs)
+}
+
+/// PDF из тел объектов по порядку номеров с 1 (корень — объект 1): заголовок, объекты, таблица
+/// `xref` и `trailer` (враждебные PDF тестов собирают свои словари).
+pub fn assemble(objs: &[Vec<u8>]) -> Vec<u8> {
     let mut out = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
     let mut offsets = Vec::with_capacity(objs.len());
     for (k, o) in objs.iter().enumerate() {
