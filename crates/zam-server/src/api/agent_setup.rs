@@ -84,7 +84,11 @@ pub(crate) fn parse_lang(raw: Option<&str>) -> Result<Lang, ApiError> {
 }
 
 /// Внешний адрес сервера без замыкающего `/`.
-fn public_url(st: &AppState, headers: &HeaderMap, client: Client) -> Result<String, ApiError> {
+pub(crate) fn public_url(
+    st: &AppState,
+    headers: &HeaderMap,
+    client: Client,
+) -> Result<String, ApiError> {
     if let Some(u) = st
         .cfg
         .server

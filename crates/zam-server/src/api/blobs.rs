@@ -86,7 +86,7 @@ impl std::fmt::Display for ClientStream {
 }
 impl std::error::Error for ClientStream {}
 
-fn stream_err(e: MultipartError) -> std::io::Error {
+pub(crate) fn stream_err(e: MultipartError) -> std::io::Error {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
         std::io::Error::other(BodyTooLarge)
     } else {
@@ -94,7 +94,7 @@ fn stream_err(e: MultipartError) -> std::io::Error {
     }
 }
 
-fn multipart_err(e: MultipartError) -> ApiError {
+pub(crate) fn multipart_err(e: MultipartError) -> ApiError {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
         ApiError::PayloadTooLarge("тело запроса превышает предел".into())
     } else {
@@ -102,8 +102,17 @@ fn multipart_err(e: MultipartError) -> ApiError {
     }
 }
 
+/// Запись блоба оборвана пределом: размер потока (`limit` [`BlobStore::put`]) или тела запроса.
+pub(crate) fn put_too_large(e: &StoreError) -> bool {
+    match e {
+        StoreError::BadInput(m) => m == "too large",
+        StoreError::Io(io) => io.get_ref().is_some_and(|r| r.is::<BodyTooLarge>()),
+        _ => false,
+    }
+}
+
 /// Ошибка записи блоба → ответ.
-fn put_err(e: StoreError, limit: u64) -> ApiError {
+pub(crate) fn put_err(e: StoreError, limit: u64) -> ApiError {
     match e {
         StoreError::BadInput(m) if m == "too large" => {
             ApiError::PayloadTooLarge(format!("вложение больше предела {limit} байт"))
@@ -118,7 +127,7 @@ fn put_err(e: StoreError, limit: u64) -> ApiError {
     }
 }
 
-async fn next_field(mp: &mut Multipart) -> Result<Option<Field<'_>>, ApiError> {
+pub(crate) async fn next_field(mp: &mut Multipart) -> Result<Option<Field<'_>>, ApiError> {
     mp.next_field().await.map_err(multipart_err)
 }
 

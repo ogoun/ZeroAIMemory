@@ -20,6 +20,8 @@
 //! `data` по [`zam_store::QuestionData`] (`options`, `recommendation`); совпавший заголовок
 //! `open`/`answered` вопроса — 409 `possible-duplicate` (`force` пишет всё равно); `PATCH` —
 //! `data` пока `open` и `status: obsolete` с `reason`; ответ — `POST /entries/{id}/answer`.
+//! `kind: report` — отчёт (M5.5, [`super::reports`]): `multipart/form-data` или JSON с
+//! `images`, только агентом и только в решении; ответ — `{id, url}`.
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
 //! уходит в [`super::insights::create`] (дедупликация, `scope`, триггеры, замещение).
 //! У insight `GET`/`PATCH` отдают и `triggers`; `PATCH` принимает `status: active | revisit`
@@ -34,7 +36,7 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -49,6 +51,7 @@ use zam_store::{
 
 use super::insights::{entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
+use super::reports::ReportInput;
 use super::scope::{Mode, entry_scope, live_entry, space_scope};
 use super::{json_body, query};
 use crate::app::AppState;
@@ -61,9 +64,9 @@ pub const CHANGELOG_KINDS: [&str; 7] = [
     "feat", "fix", "refactor", "docs", "research", "ops", "other",
 ];
 /// Предел длины массивов `data.refs.*`.
-const REFS_MAX: usize = 200;
+pub(crate) const REFS_MAX: usize = 200;
 /// Предел длины одной ссылки, символов. [решение исполнителя]
-const REF_MAX_CHARS: usize = 1000;
+pub(crate) const REF_MAX_CHARS: usize = 1000;
 /// Предел числа коммитов релиза.
 const COMMITS_MAX: usize = 5000;
 /// Предел длины версии релиза, символов.
@@ -79,7 +82,12 @@ pub(crate) fn unprocessable(m: impl Into<String>) -> ApiError {
 }
 
 /// Массив строк до `max` элементов длиной до `item_max` символов.
-fn string_array(v: &Value, what: &str, max: usize, item_max: usize) -> Result<(), ApiError> {
+pub(crate) fn string_array(
+    v: &Value,
+    what: &str,
+    max: usize,
+    item_max: usize,
+) -> Result<(), ApiError> {
     let a = v
         .as_array()
         .ok_or_else(|| unprocessable(format!("{what}: ожидается массив строк")))?;
@@ -282,16 +290,50 @@ pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, Api
 }
 
 /// `POST /spaces/{space}/entries` → 201 `Entry`; повтор с тем же `Idempotency-Key` — 200.
-/// `kind: insight` и `kind: term` — [`super::insights::create`].
+/// `kind: insight` и `kind: term` — [`super::insights::create`]; отчёт (`multipart/form-data`
+/// или JSON с `kind: report`) — [`super::reports::create`]. JSON читается с пределом
+/// [`super::entries_json_max`]; запись не-отчёта больше [`super::note_body_max`] — 413.
 pub async fn create(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
     client: Client,
     Path(space): Path<String>,
-    body: Result<Bytes, BytesRejection>,
+    req: Request,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let raw: Value = json_body(body)?;
+    if super::reports::is_multipart(&headers) {
+        let mp = Multipart::from_request(req, &st)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("ожидается multipart: {e}")))?;
+        return super::reports::create(
+            &st,
+            &p,
+            &headers,
+            &client,
+            &space,
+            ReportInput::Multipart(mp),
+        )
+        .await;
+    }
+    let bytes =
+        super::reports::read_limited(req.into_body(), super::entries_json_max(&st.cfg)).await?;
+    let parsed: Result<Value, ApiError> = super::parse_body(&bytes);
+    let report = parsed.as_ref().is_ok_and(|raw| {
+        raw.get("kind")
+            .and_then(Value::as_str)
+            .and_then(EntryKind::parse)
+            == Some(EntryKind::Report)
+    });
+    if !report && bytes.len() > super::note_body_max(&st.cfg.limits) {
+        return Err(ApiError::PayloadTooLarge(
+            "тело запроса превышает предел".into(),
+        ));
+    }
+    let raw = parsed?;
+    if report {
+        return super::reports::create(&st, &p, &headers, &client, &space, ReportInput::Json(raw))
+            .await;
+    }
     if matches!(
         raw.get("kind")
             .and_then(Value::as_str)

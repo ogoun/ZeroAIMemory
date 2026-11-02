@@ -55,6 +55,10 @@ pub enum ApiError {
     /// решения из первого ответа.
     #[error("вопрос уже отвечен")]
     AlreadyAnswered { decision_id: Option<zam_core::Id> },
+    /// 409 `/problems/report-immutable` (M5.5 §4): отчёт не меняется после записи —
+    /// исправление пишется новым отчётом.
+    #[error("отчёт неизменяем — напишите новый")]
+    ReportImmutable,
     /// 422 `/problems/reason-required` (M4.5 §3): переоткрытие задачи без причины.
     #[error("{0}")]
     ReasonRequired(String),
@@ -151,6 +155,11 @@ impl ApiError {
             ApiError::AlreadyAnswered { .. } => (
                 StatusCode::CONFLICT,
                 "/problems/already-answered",
+                "Conflict",
+            ),
+            ApiError::ReportImmutable => (
+                StatusCode::CONFLICT,
+                "/problems/report-immutable",
                 "Conflict",
             ),
             ApiError::ReasonRequired(_) => (
@@ -263,6 +272,7 @@ impl From<StoreError> for ApiError {
             StoreError::TermConflict(c) => ApiError::TermConflict(c),
             StoreError::IdempotencyMismatch(m) => ApiError::IdempotencyMismatch(m),
             StoreError::Certainty(c) => ApiError::Certainty(c),
+            StoreError::ReportImmutable => ApiError::ReportImmutable,
             other => ApiError::Internal(other.to_string()),
         }
     }
@@ -348,5 +358,15 @@ mod tests {
         assert!(!d.contains("SECRET-MARKER"), "{d}");
         assert!(d.contains("panic = true"), "{d}");
         assert!(!err.to_string().contains("SECRET-MARKER"));
+    }
+
+    /// Неизменность отчёта из хранилища — 409 `/problems/report-immutable`, а не 500.
+    #[test]
+    fn report_immutable_is_409() {
+        let e = ApiError::from(StoreError::ReportImmutable);
+        assert!(matches!(e, ApiError::ReportImmutable));
+        let (status, kind, _) = e.parts();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(kind, "/problems/report-immutable");
     }
 }
