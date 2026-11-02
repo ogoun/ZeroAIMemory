@@ -2045,6 +2045,64 @@ firefox-1555 в `.tmp/pw-browsers`, `PLAYWRIGHT_BROWSERS_PATH`): зонды из
 корпусе зависит от платформы. Контроллер исправил тест: у файла ровно одна карточка с `fts`, всего
 карточек файла ≤ 2.
 
+### Задача 11 — smoke комплектов и поставка (2026-11-02)
+
+- **Шаги smoke M5** (`xtask/src/smoke.rs`, 28 → 34 шага):
+  - до запуска сервера — раскладка: `pdfium.dll`/`libpdfium.so` в корне рядом с `zam-server`
+    (умолчание `docs.pdfium_dylib` — каталог исполняемого файла), библиотека своей платформы,
+    `LICENSES/PDFIUM-LICENSE.txt` и `PDFIUM-THIRD-PARTY.txt` непусты, `[docs]` в
+    `config.example.toml`;
+  - загрузка pdfium из каталога комплекта: `zam-server doc-worker --pdfium <корень>/<lib>
+    --max-frame 65536`, кадр `ping` по протоколу (`u32` длина, `u64` номер, JSON) → `pong` с
+    `pdfium: null` и код выхода 0 по EOF; отрицательная проверка — несуществующая библиотека
+    даёт `pong` с причиной (шаг не пустой);
+  - после шагов M4.5 — заметка `knowledge:smoke/docs` (`zam write`), `zam attach --json` PDF
+    (2 страницы, факт на второй), DOCX (заголовок + 2 абзаца, факт во втором) и XLSX (лист
+    `Inventory`, шапка + 3 строки) → `GET /nodes/{id}/attachments` все `done` (≤ 60 с, `failed`/
+    `unsupported` — сразу ошибка с `extract_error`);
+  - поиск `filters.kinds = ["attachment"]` по фразе PDF и DOCX (ожидание `pending_count = 0`,
+    без деградации) → карточка файла заметки `smoke/docs`, `id` вида `a:`, `locator` PDF — ровно
+    `page:2`, DOCX — `para:N`, `N ≤` номера абзаца факта (единица DOCX — блок абзацев с номером
+    первого, «Решения», задача 1);
+  - `zam read a:<фрагмент> --locator <locator>` — текст содержит факт (пробелы схлопнуты), у PDF
+    нет текста страницы 1;
+  - `GET /previews/{sha}?kind=sheet&sheet=1&from=1&rows=10` — имя листа, шапка, строки данных и
+    `total_rows = 3`; `kind=thumb&page=1&px=128` PDF — 200, `image/png`, сигнатура PNG.
+  Ошибки шагов вложений и превью — с хвостом журнала сервера, как у векторных шагов.
+- **Файлы — генераторами набора `docs-corpus`** (`docs_corpus::pdf::build`, `ooxml::docx`,
+  `ooxml::xlsx`; модуль `ooxml` стал `pub(crate)`), без бинарных фикстур и без зависимости xtask
+  от фичи `test-pdf` `zam-docs`. Тексты — английские редкие слова (тестовая модель англоязычная;
+  FTS находит их однозначно).
+- **`package.rs`:** `pdfium_file(platform)` — одно имя для упаковки, фикстуры тестов и smoke;
+  `PDFIUM_LICENSES`; `native_lib_platform`/`check_native_lib` — заголовок PE (подпись `PE\0\0`,
+  Machine `0x8664`) или ELF64 little-endian `e_machine = 62`. Упаковка отказывает, если pdfium в
+  `target/deps` — не библиотека своей платформы (отсутствие файла по-прежнему сообщает
+  `check_sources`). Фикстура пишет поддельный заголовок нужной платформы вместо `x`.
+- **Тесты:** `package_layout_docs_pdfium_next_to_server` (windows/linux × cpu/gpu: pdfium в
+  корне рядом с `zam-server`, одна копия и только своей платформы, у Linux `zam-server` 0755 —
+  `doc-worker` его подкоманда, pdfium 0644; `config.example.toml`),
+  `package_rejects_foreign_pdfium` (чужая платформа, не библиотека; PE i386 и ELF32 — `None`),
+  `deploy_licenses_include_pdfium`. `cargo test -p xtask` — 95 passed.
+- **Почему загрузка проверяется в smoke, а не в `package`.** Ping требует запускаемого
+  `zam-server` своей ОС; в `package` — только формат библиотеки (дёшево, ловит чужую платформу в
+  `target/deps`), реальная загрузка — в smoke из распакованного комплекта (тот же путь, что у
+  пользователя). Миниатюра PDF через сервер дополнительно проверяет, что пул сервера находит
+  pdfium по умолчанию без `pdfium_dylib`. app-local CRT pdfium.dll уже проверял шаг `dumpbin`
+  (все DLL корня).
+- **Документация:** `deploy/README-install.md` — раздел «Документы (вложения)»: форматы и
+  `locator`, что в комплекте (pdfium-binaries `chromium/8100` без V8, лицензии BSD-3-Clause/MIT,
+  `pdfium_dylib`, поведение без библиотеки), изоляция `doc-worker` и таблица лимитов `[docs]`,
+  причины неудач, `ocr_needed` (OCR нет), как проверить (`zam attach` → `extract_state` → `zam
+  search` → `zam read --locator`, `failed_items`, `docs.pdfium_error`). `README.md` — строка
+  `smoke` в таблице xtask, лицензия pdfium уточнена (было «BSD/Apache»). CHANGELOG — пункт Added.
+- **Локальные прогоны (Windows, release):** `package --flavor cpu` + `smoke --expect-device cpu`
+  — SMOKE OK, 34 шага; `package --flavor gpu` + `smoke` — SMOKE OK, 34 шага, device = cuda (на
+  машине с NVIDIA GPU-комплект находит CUDA: `--expect-device cpu` здесь неприменим, в CI GPU нет).
+  Логи — `.tmp/m5/task11/`.
+- **Отложено:** проверка загрузки pdfium при упаковке на своей ОС (ping из `target/release`) не
+  добавлена — дублирует smoke; размер ответа `doc-worker` в smoke не ограничен сверх
+  `CMD_TIMEOUT` (процесс наш, ответ — один кадр `pong`).
+
 ## Решения
 
 Решения контроллера и исполнителя, принятые без владельца; каждое можно пересмотреть.

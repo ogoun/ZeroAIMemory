@@ -471,6 +471,65 @@ WebUI открывается по адресу сервера (`http://<хост
 - Файл прикрепляется кнопкой «Прикрепить файл», вставкой из буфера или перетаскиванием
   в редактор; в текст вставляется ссылка `_attachments/…`.
 
+## Документы (вложения)
+
+Вложения DOCX, PPTX, XLSX, XLS, ODS, CSV, PDF и текстовые файлы (код, JSON, YAML) разбираются
+в текст со ссылкой на место — `locator`: `page:12` (страница PDF), `slide:3`, `sheet:Итоги!A1:F40`
+(лист и диапазон), `para:40` (абзац DOCX). Фрагменты индексируются как уровень `attachment`:
+находятся поиском (`zam search`, `POST /search`, MCP `memory_search`) вместе с заметками и
+читаются по `locator` (`zam read`, `POST /read`, MCP `memory_read`); WebUI показывает их
+просмотрщиками (вкладка «Вложения» заметки). Вид файла определяется по содержимому, а не по
+расширению; остальные файлы (картинки, архивы, DOC/PPT старых форматов) хранятся и скачиваются,
+но не индексируются (`unsupported`). Вложения пространства Human — только в полнотекстовом
+индексе, без векторов.
+
+**Что в комплекте.** `pdfium.dll` (Windows) или `libpdfium.so` (Linux) рядом с `zam-server` —
+сборка [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) `chromium/8100` без V8:
+JavaScript и вложения PDF не исполняются и не извлекаются. Лицензии — `LICENSES/PDFIUM-LICENSE.txt`
+(PDFium — BSD-3-Clause, сборка pdfium-binaries — MIT) и `LICENSES/PDFIUM-THIRD-PARTY.txt`
+(компоненты внутри pdfium). Другое место библиотеки — `[docs] pdfium_dylib` (относительный путь —
+от каталога `zam-server`). Без pdfium PDF не индексируются (`failed`, причина
+`pdfium_unavailable`), остальные форматы работают; вернув библиотеку, перезапустите сервер — PDF
+извлекутся заново. Внешних офисных пакетов (LibreOffice и т. п.) не нужно.
+
+**Изоляция и лимиты.** Каждый файл разбирается в рабочем процессе `zam-server doc-worker` (тот же
+исполняемый файл, запускается сервером) с лимитом памяти и сроком; падение или зависание разбора
+не роняет сервер — вложение получает `failed` с причиной, процесс перезапускается. Умолчания
+секции `[docs]` (`config.example.toml`):
+
+| Ключ | Умолчание | Что ограничивает |
+|---|---|---|
+| `max_bytes` | 100 МиБ | размер файла: больше — отказ (`too_large`) |
+| `max_unpacked`, `max_ratio`, `max_entries` | 500 МиБ, 100, 10 000 | zip-бомбы в DOCX/XLSX/PPTX/ODS |
+| `max_cells`, `max_chars`, `max_pages` | 2 млн, 20 млн, 5000 | ячеек листа, символов текста, страниц PDF |
+| `workers`, `preview_workers` | 2, 1 | одновременных разборов для индексации и для превью |
+| `worker_memory_mb` | 2048 | память процесса (Windows — Job Object, Linux — `RLIMIT_AS`) → `parse_oom` |
+| `timeout_ms` | 60 000 | срок разбора файла → `parse_timeout` |
+
+Превышение лимитов объёма даёт частичный текст с предупреждением `truncated: <лимит>`. Причины
+неудач: `parse_error: …` (испорченный файл), `parse_crash`, `parse_timeout`, `parse_oom`,
+`pdfium_unavailable`, `too_large`. Скан без текстового слоя индексируется пустым с признаком
+`ocr_needed` (в WebUI — «нужно распознавание»): распознавания текста (OCR) в этой версии нет.
+
+**Как проверить.**
+
+```bash
+zam write knowledge:test/docs <<< "# Документы"
+zam attach knowledge:test/docs ./отчёт.pdf
+# состояние извлечения: extract_state = pending → done | failed (с extract_error)
+curl -s -H "Authorization: Bearer $ZAM_TOKEN" http://127.0.0.1:7700/api/v1/nodes/<id>/attachments
+zam search "фраза со страницы отчёта"
+#   a:<фрагмент> knowledge/test/docs › отчёт.pdf · стр. 3
+zam read a:<фрагмент> --locator page:3
+```
+
+`<id>` — то, что `zam write` печатает до `@`. Неудачи видны в `failed_items`
+`GET /api/v1/index/status` (вложение, путь заметки, причина); причина отказа pdfium — там же в
+`docs.pdfium_error` (только администратору: в ней путь на сервере). Smoke-тест комплекта
+(`cargo xtask smoke`) проверяет то же самое: pdfium из каталога комплекта грузится рабочим
+процессом, PDF и DOCX находятся по фрагменту с `locator`, читаются по нему, лист XLSX и миниатюра
+PDF показываются.
+
 ## Qdrant
 
 Векторный индекс — нативный Qdrant из комплекта (`qdrant/<версия>/`), без Docker. Его запускает
