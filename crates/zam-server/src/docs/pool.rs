@@ -7,6 +7,11 @@
 //! - Привязка к серверу и лимит памяти: Windows — свой Job Object на процесс
 //!   (`KILL_ON_JOB_CLOSE`, `JOB_OBJECT_LIMIT_PROCESS_MEMORY`); Linux — `PDEATHSIG` (`SIGKILL`),
 //!   `RLIMIT_AS` и своя группа процессов. Секреты сервера в окружение процесса не попадают.
+//! - Дешёвая изоляция (финальное ревью M5, I-3): Windows — `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`
+//!   (процесс не запускает дочерних); Linux — `PR_SET_NO_NEW_PRIVS` и рабочий каталог `/`.
+//!   Ответы процесса недоверенные: вид извлечения сверяется с запросом, HTML подсветки — с
+//!   форматом `zam_markdown` (`api::previews`). Полная песочница ОС (seccomp/landlock,
+//!   AppContainer/restricted token) — M7.
 //! - Обмен: запрос пишет поток записи процесса, stdout читается **только под ожидающий запрос**
 //!   (разрешение на один кадр): процесс, пишущий кадры без запроса, упирается в канал, память
 //!   сервера не растёт. Кадр с чужим номером — нарушение протокола: процесс убивается, задание
@@ -166,6 +171,9 @@ struct Shared {
     spawned: AtomicU64,
     /// pid текущего процесса каждого слота (0 — нет процесса).
     pids: Mutex<Vec<u32>>,
+    /// Тест: мягкий срок разбора внутри процесса, мс (`u64::MAX` — 80 % `docs.timeout_ms`).
+    #[cfg(feature = "test-hooks")]
+    soft_ms: AtomicU64,
 }
 
 /// Пул рабочих процессов разбора документов.
@@ -234,6 +242,8 @@ impl DocPool {
         let workers = cfg.workers.max(1);
         let shared = Arc::new(Shared {
             pids: Mutex::new(vec![0; workers]),
+            #[cfg(feature = "test-hooks")]
+            soft_ms: AtomicU64::new(u64::MAX),
             ..Shared::default()
         });
         let (tx, rx) = tokio::sync::mpsc::channel::<Job>(workers * 2);
@@ -273,10 +283,7 @@ impl DocPool {
 
     /// Извлекает структуру документа в рабочем процессе.
     pub async fn extract(&self, kind: DocKind, bytes: Bytes) -> Result<Extracted, ParseFailure> {
-        match self.submit(Op::Extract { kind, bytes }).await? {
-            Outcome::Extracted(x) => Ok(x),
-            _ => Err(unexpected()),
-        }
+        extracted_of(kind, self.submit(Op::Extract { kind, bytes }).await?)
     }
 
     /// Миниатюра страницы `page` (с 1) PDF в PNG.
@@ -384,6 +391,26 @@ impl DocPool {
     pub async fn test_op(&self, op: TestOp) -> Result<(), ParseFailure> {
         self.submit(Op::Test(op)).await.map(|_| ())
     }
+
+    /// Тест: мягкий срок разбора внутри процесса `ms` (`None` — 80 % `docs.timeout_ms`):
+    /// `Some(0)` даёт частичный по сроку результат (`truncated: timeout_ms`) на первой
+    /// проверке срока.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_soft_ms(&self, ms: Option<u64>) {
+        self.shared
+            .soft_ms
+            .store(ms.unwrap_or(u64::MAX), Ordering::SeqCst);
+    }
+}
+
+/// Ответ на `Extract { kind }`: извлечение того же вида. Другой вид — процесс ответил не на
+/// этот запрос (как неверный кадр: сбой, не свойство файла и не в кэш; финальное ревью M5, M-3).
+fn extracted_of(kind: DocKind, out: Outcome) -> Result<Extracted, ParseFailure> {
+    match out {
+        Outcome::Extracted(x) if x.kind == kind => Ok(x),
+        _ => Err(unexpected()),
+    }
 }
 
 fn unexpected() -> ParseFailure {
@@ -418,8 +445,15 @@ fn slot_loop(
 }
 
 /// Тело кадра запроса и срок разбора внутри процесса.
-fn body_of(op: &Op, s: &Settings) -> Vec<u8> {
+fn body_of(op: &Op, s: &Settings, shared: &Shared) -> Vec<u8> {
     let soft_ms = (s.timeout.as_millis() as u64).saturating_mul(8) / 10;
+    #[cfg(feature = "test-hooks")]
+    let soft_ms = match shared.soft_ms.load(Ordering::SeqCst) {
+        u64::MAX => soft_ms,
+        ms => ms,
+    };
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = shared;
     match op {
         Op::Extract { kind, bytes } => request_body(
             &Request::Extract {
@@ -515,7 +549,7 @@ fn run_job(
     {
         return Err(ParseFailure::Doc(DocError::TooLarge));
     }
-    let body = Arc::new(body_of(&op, s));
+    let body = Arc::new(body_of(&op, s, shared));
     drop(op);
     // нарушение протокола (кадр с чужим номером) — один повтор на новом процессе
     for attempt in 0..2 {
@@ -870,15 +904,21 @@ impl Worker {
         {
             use std::os::unix::process::CommandExt as _;
             cmd.process_group(0);
-            let hook = zam_index::child::pre_exec_hook(std::process::id() as _, Some(s.memory));
+            // рабочий каталог — корень: не каталог данных сервера (относительные пути процесса
+            // не ведут в данные), `/` есть всегда и не доступен на запись службе
+            cmd.current_dir("/");
+            let hook =
+                zam_index::child::pre_exec_hook(std::process::id() as _, Some(s.memory), true);
             // SAFETY: замыкание исполняется между fork и exec и вызывает только
             // async-signal-safe функции (prctl, getppid, setrlimit, _exit).
             unsafe {
                 cmd.pre_exec(hook);
             }
         }
+        // один процесс в job: рабочий процесс не запустит дочерних. Назначение — после запуска,
+        // но до первого запроса: недоверенный файл приходит, когда предел уже действует
         #[cfg(windows)]
-        let job = zam_index::child::KillJob::new(Some(s.memory))?;
+        let job = zam_index::child::KillJob::new(Some(s.memory), Some(1))?;
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("{}: {e}", s.program.display()))?;
@@ -1107,6 +1147,25 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracted_kind_must_match_request() {
+        let x = |kind| Extracted {
+            kind,
+            units: Vec::new(),
+            warnings: Vec::new(),
+            ocr_needed: false,
+        };
+        assert!(extracted_of(DocKind::Csv, Outcome::Extracted(x(DocKind::Csv))).is_ok());
+        assert_eq!(
+            extracted_of(DocKind::Csv, Outcome::Extracted(x(DocKind::Text))),
+            Err(unexpected())
+        );
+        assert_eq!(
+            extracted_of(DocKind::Csv, Outcome::Pong(None)),
+            Err(unexpected())
+        );
+    }
 
     #[test]
     fn oom_lines() {

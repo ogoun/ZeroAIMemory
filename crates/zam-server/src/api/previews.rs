@@ -5,8 +5,9 @@
 //! - `kind=sheet&sheet=<N>&from=<строка>&rows=<1..=1000>` — JSON страницы листа: лист — **номер**
 //!   в порядке книги (с 1), а не имя; `sheets` — `{no, name, secret, ref_no}`: имя через сканер
 //!   секретов (`mask_text`), `secret` — имя замаскировано, `ref_no` — номер `sheet:#N` того же
-//!   листа в `/read` и карточках поиска (порядок листов среди единиц, `api::doc_locator`), если
-//!   в книге есть лист с секретом и документ извлечён; `header`, `rows`, `first_row`,
+//!   листа в `/read` и карточках поиска (порядок листов среди единиц, `api::doc_locator`) — у
+//!   каждого листа с единицами извлечения, когда документ извлечён (иначе `null`); `header`,
+//!   `rows`, `first_row`,
 //!   `total_rows`, `cols`, `warnings`. Ячейки не маскируются: превью показывает файл, как
 //!   скачивание блоба.
 //! - `kind=thumb&page=<N>&px=<1..=1024>` — PNG: страница PDF (pdfium) или изображение PNG, JPEG,
@@ -16,7 +17,8 @@
 //!   truncated}`: HTML syntect с классами `hl-*` (`/api/v1/render/highlight.css`), только
 //!   `<span class>` и экранированный текст; читается начало файла до [`TEXT_MAX`] байт,
 //!   подсвечиваются первые 64 КиБ; разметка больше 40 × исходник (`[` в JSON и т. п.) — весь
-//!   текст экранирован, `highlight_skipped: "too_large"`.
+//!   текст экранирован, `highlight_skipped: "too_large"`. HTML от рабочего процесса проверяется
+//!   (`zam_markdown::is_highlight_html`): иной — отброшен, текст экранируется здесь.
 //!
 //! Неудача построения (422) помнится: свойство файла (`parse_error`, `too_large`, `unsupported`)
 //! — 5 мин, сбой процесса (`parse_timeout`, `parse_crash`, `parse_oom`) — 45 с
@@ -28,8 +30,8 @@
 //! решению) — тот же 404, что и несуществующий sha, без 403 `solution-access`: превью не
 //! подтверждает существование файла.
 //!
-//! **Ответ:** `ETag` — sha, ключ кэша (параметры, версии, отпечаток лимитов), у листа с
-//! секретом — и номера `ref_no`; `If-None-Match` → 304. `Cache-Control: private,
+//! **Ответ:** `ETag` — sha, ключ кэша (параметры, версии, отпечаток лимитов), у листа — и
+//! отпечаток номеров `ref_no`; `If-None-Match` → 304. `Cache-Control: private,
 //! max-age=3600`, `X-Content-Type-Options: nosniff`, CSP `sandbox; default-src 'none'`.
 //! Ошибки построения (файл не того вида, повреждён, лист не найден, сбой или срок рабочего
 //! процесса) — 422 с кодом в `detail`; pdfium недоступен — 503.
@@ -54,7 +56,7 @@ use super::query;
 use super::scope::{foreign_solutions, owner_db, skip_foreign, user_db};
 use crate::app::AppState;
 use crate::auth::{Principal, USER_HEADER};
-use crate::docs::protocol::WireSheetPage;
+use crate::docs::protocol::{WireHtml, WireSheetPage};
 use crate::docs::{ParseFailure, PreviewKey};
 use crate::error::ApiError;
 
@@ -465,10 +467,12 @@ async fn build(
                 if !textual {
                     return Err(unfit("текста"));
                 }
+                let head = Bytes::from(head);
                 let h = pool
-                    .highlight(Bytes::from(head), loc.filename.clone(), more)
+                    .highlight(head.clone(), loc.filename.clone(), more)
                     .await
                     .map_err(|f| failed(st, f, false))?;
+                let h = checked_html(h, &head, more);
                 json!({
                     "kind": "text",
                     "format": "html",
@@ -482,6 +486,27 @@ async fn build(
             let data = serde_json::to_vec(&value).expect("JSON сериализуется");
             Ok(Built { data, cache: true })
         }
+    }
+}
+
+/// HTML подсветки от рабочего процесса — только того вида, что строит `zam_markdown`
+/// ([`zam_markdown::is_highlight_html`]): WebUI вставляет его через `{@html}`, а процесс разбирает
+/// недоверенный файл и мог быть захвачен. Иной HTML отбрасывается — исходный текст экранируется
+/// здесь, без подсветки (финальное ревью M5, I-3).
+fn checked_html(h: WireHtml, head: &[u8], truncated: bool) -> WireHtml {
+    if zam_markdown::is_highlight_html(&h.html) {
+        return h;
+    }
+    tracing::warn!(
+        component = "doc-worker",
+        "HTML подсветки рабочего процесса не прошёл проверку: текст без подсветки"
+    );
+    let text = crate::docs::worker::source_text(head, truncated).unwrap_or_default();
+    WireHtml {
+        html: zam_markdown::escape_html(&text),
+        syntax: None,
+        highlighted: 0,
+        skipped: None,
     }
 }
 
@@ -573,4 +598,38 @@ async fn sheet_json(
         "warnings": p.warnings,
     });
     (body, tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Финальное ревью M5, I-3: HTML подсветки не того вида (захваченный рабочий процесс)
+    /// отбрасывается — исходный текст экранирован, без подсветки; верный проходит как есть.
+    #[test]
+    fn worker_html_checked() {
+        let src = "a <b> & 'c'\n".as_bytes();
+        let evil = WireHtml {
+            html: "<img src=x onerror=alert(1)>".into(),
+            syntax: Some("Rust".into()),
+            highlighted: 10,
+            skipped: None,
+        };
+        let h = checked_html(evil, src, false);
+        assert_eq!(h.html, "a &lt;b&gt; &amp; &#39;c&#39;\n");
+        assert_eq!((h.syntax, h.highlighted), (None, 0));
+        let sneaky = WireHtml {
+            html: "<span class=\"hl-a\" onclick=\"x\">a</span>".into(),
+            syntax: None,
+            highlighted: 0,
+            skipped: None,
+        };
+        assert!(!checked_html(sneaky, src, false).html.contains("onclick"));
+        let good = WireHtml::from(zam_markdown::highlight_source(
+            "x.rs",
+            "fn main() {}\n",
+            1024,
+        ));
+        assert_eq!(checked_html(good.clone(), b"fn main() {}\n", false), good);
+    }
 }

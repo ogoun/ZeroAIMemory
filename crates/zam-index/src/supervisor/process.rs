@@ -357,7 +357,7 @@ pub(crate) fn spawn(
             // SAFETY: замыкание исполняется в дочернем процессе между fork и exec и
             // вызывает только async-signal-safe функции (prctl, getppid, _exit).
             unsafe {
-                c.pre_exec(crate::child::pre_exec_hook(parent, None));
+                c.pre_exec(crate::child::pre_exec_hook(parent, None, false));
             }
         }
     });

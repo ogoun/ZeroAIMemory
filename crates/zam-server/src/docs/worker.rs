@@ -154,7 +154,7 @@ fn decode(b64: &str) -> Result<Vec<u8>, DocError> {
 /// Текст файла для подсветки: BOM снимается, нулевой байт — двоичный файл (`None`); у обрезанного
 /// начала файла (`truncated`) неполный последний символ отбрасывается; неверный UTF-8 — с заменой
 /// на U+FFFD, как у извлечения текста (`zam_docs`, вид `text`).
-fn source_text(bytes: &[u8], truncated: bool) -> Option<Cow<'_, str>> {
+pub(crate) fn source_text(bytes: &[u8], truncated: bool) -> Option<Cow<'_, str>> {
     let b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     if b.contains(&0) {
         return None;

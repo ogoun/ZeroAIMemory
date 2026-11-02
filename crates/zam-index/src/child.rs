@@ -65,7 +65,9 @@ pub fn parse_json_line(line: &str) -> Option<LogLine> {
 
 /// Замыкание для `pre_exec` (Linux): `PR_SET_PDEATHSIG` = `SIGKILL`, выход, если родитель
 /// `parent` умер до `prctl` (сигнал уже не придёт), и лимит адресного пространства
-/// `address_space` байт (`RLIMIT_AS`), если задан.
+/// `address_space` байт (`RLIMIT_AS`), если задан, и `PR_SET_NO_NEW_PRIVS`, если `no_new_privs`
+/// (процесс и его потомки не получат привилегий через setuid/setgid/capabilities файлов при
+/// `exec`; рабочий процесс разбора — финальное ревью M5, I-3).
 ///
 /// Исполняется в дочернем процессе между `fork` и `exec` и вызывает только async-signal-safe
 /// функции (`prctl`, `getppid`, `setrlimit`, `_exit`). Сигнал привязан к потоку, сделавшему
@@ -74,11 +76,15 @@ pub fn parse_json_line(line: &str) -> Option<LogLine> {
 pub fn pre_exec_hook(
     parent: libc::pid_t,
     address_space: Option<u64>,
+    no_new_privs: bool,
 ) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
     move || {
         // SAFETY: вызовы libc с корректными аргументами; структура лимита — на стеке.
         unsafe {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if no_new_privs && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             // Родитель умер до prctl — сигнал уже не придёт.
@@ -120,10 +126,10 @@ mod win {
 
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-        TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
     use windows::core::PCWSTR;
 
@@ -139,8 +145,14 @@ mod win {
     unsafe impl Sync for KillJob {}
 
     impl KillJob {
-        /// Новый job; `process_memory` — лимит выделенной (commit) памяти процесса, байт.
-        pub fn new(process_memory: Option<u64>) -> Result<Self, String> {
+        /// Новый job; `process_memory` — лимит выделенной (commit) памяти процесса, байт;
+        /// `active_processes` — сколько процессов может быть в job одновременно
+        /// (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS`): `Some(1)` — процесс job не запустит дочерних
+        /// (`CreateProcess` откажет) и при захвате.
+        pub fn new(
+            process_memory: Option<u64>,
+            active_processes: Option<u32>,
+        ) -> Result<Self, String> {
             // SAFETY: вызовы WinAPI с корректными аргументами; структура лимитов живёт до
             // конца вызова, размер передан точно.
             unsafe {
@@ -151,6 +163,10 @@ mod win {
                 if let Some(bytes) = process_memory {
                     info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
                     info.ProcessMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
+                }
+                if let Some(n) = active_processes {
+                    info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                    info.BasicLimitInformation.ActiveProcessLimit = n;
                 }
                 SetInformationJobObject(
                     job.0,
@@ -223,7 +239,7 @@ mod tests {
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
-        let job = KillJob::new(Some(64 * 1024 * 1024)).unwrap();
+        let job = KillJob::new(Some(64 * 1024 * 1024), None).unwrap();
         // `pause` — встроенная команда: внуков, запущенных до назначения в job, нет
         let mut child = Command::new("cmd")
             .args(["/C", "pause"])
@@ -242,5 +258,68 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(10), "процесс пережил job");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Предел одного процесса: процесс job не запускает дочерних, а сам работает.
+    #[cfg(windows)]
+    #[test]
+    fn kill_job_single_process_blocks_children() {
+        use std::io::{Read as _, Write as _};
+        use std::process::{Command, Stdio};
+
+        let run = |limit: Option<u32>| {
+            let job = KillJob::new(None, limit).unwrap();
+            let mut child = Command::new("cmd")
+                .args(["/Q", "/K"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            job.assign(&child).unwrap();
+            // команды — после назначения в job: внешний `cmd /c exit 7` — дочерний процесс
+            let mut stdin = child.stdin.take().unwrap();
+            stdin
+                .write_all(b"cmd /c exit 7\r\necho rc=%errorlevel%\r\nexit\r\n")
+                .unwrap();
+            drop(stdin);
+            let mut out = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut out)
+                .unwrap();
+            child.wait().unwrap();
+            out
+        };
+        assert!(
+            run(None).contains("rc=7"),
+            "без предела дочерний процесс запускается"
+        );
+        let limited = run(Some(1));
+        assert!(limited.contains("rc="), "{limited}");
+        assert!(!limited.contains("rc=7"), "{limited}");
+    }
+
+    /// `no_new_privs` выставляется в дочернем процессе (`/proc/self/status`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_exec_sets_no_new_privs() {
+        use std::os::unix::process::CommandExt as _;
+
+        let status = |nnp: bool| {
+            let mut cmd = std::process::Command::new("cat");
+            cmd.arg("/proc/self/status");
+            // SAFETY: замыкание вызывает только async-signal-safe функции
+            unsafe {
+                cmd.pre_exec(pre_exec_hook(std::process::id() as _, None, nnp));
+            }
+            let out = String::from_utf8(cmd.output().unwrap().stdout).unwrap();
+            out.lines()
+                .find(|l| l.starts_with("NoNewPrivs:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+        };
+        assert_eq!(status(true).as_deref(), Some("1"));
     }
 }

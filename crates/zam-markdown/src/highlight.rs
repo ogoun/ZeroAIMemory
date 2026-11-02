@@ -223,8 +223,61 @@ pub fn highlight_source(name: &str, code: &str, budget: usize) -> SourceHtml {
     }
 }
 
+/// Сущности, которыми экранирован текст подсветки (syntect `Escape` и [`escape_html`]).
+const ENTITIES: [&str; 5] = ["&lt;", "&gt;", "&amp;", "&quot;", "&#39;"];
+
+/// Символ имени класса подсветки после `hl-`: атомы областей syntect (`c++`, `c#`, `diff.git`).
+fn class_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '#' | '.')
+}
+
+/// HTML — ровно того вида, что выдаёт [`highlight_source`]: только `<span class="hl-…">` (классы
+/// `hl-<атом>` через одиночный пробел), парные `</span>` и текст, в котором `<`, `>`, `"`, `'`
+/// не встречаются, а `&` — только в пяти сущностях экранирования. Сервер проверяет так HTML
+/// подсветки от рабочего процесса разбора (файл недоверенный, процесс мог быть захвачен), прежде
+/// чем WebUI вставит его через `{@html}` (финальное ревью M5, I-3).
+pub fn is_highlight_html(html: &str) -> bool {
+    const OPEN: &str = "<span class=\"";
+    const CLOSE: &str = "</span>";
+    let mut rest = html;
+    let mut depth: usize = 0;
+    while let Some(c) = rest.chars().next() {
+        if let Some(r) = rest.strip_prefix(OPEN) {
+            let Some((classes, tail)) = r.split_once("\">") else {
+                return false;
+            };
+            let ok = !classes.is_empty()
+                && classes.split(' ').all(|t| {
+                    t.strip_prefix("hl-")
+                        .is_some_and(|a| !a.is_empty() && a.chars().all(class_char))
+                });
+            if !ok {
+                return false;
+            }
+            depth += 1;
+            rest = tail;
+        } else if let Some(r) = rest.strip_prefix(CLOSE) {
+            let Some(d) = depth.checked_sub(1) else {
+                return false;
+            };
+            depth = d;
+            rest = r;
+        } else if c == '&' {
+            let Some(e) = ENTITIES.iter().find(|e| rest.starts_with(**e)) else {
+                return false;
+            };
+            rest = &rest[e.len()..];
+        } else if matches!(c, '<' | '>' | '"' | '\'') {
+            return false;
+        } else {
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    depth == 0
+}
+
 /// Экранирование текста для HTML (`&`, `<`, `>`, `"`, `'`).
-fn escape_html(s: &str) -> String {
+pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + s.len() / 16);
     for c in s.chars() {
         match c {
@@ -264,6 +317,43 @@ fn build_css() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Проверка HTML подсветки: вывод подсветки всех встроенных синтаксисов проходит, разметка
+    /// враждебного рабочего процесса — нет.
+    #[test]
+    fn highlight_html_validator() {
+        let code = "#!/bin/sh\n// <b>x</b> & \"q\" 'a' [[ ]] {{ }} \\ $x @y %z\n\
+                    fn f() { return 1 + 2; } # c\n<a href=\"x\">t</a>\n";
+        let mut checked = 0;
+        for syn in SYNTAXES.syntaxes() {
+            let Some(ext) = syn.file_extensions.first() else {
+                continue;
+            };
+            let h = highlight_source(&format!("f.{ext}"), code, HIGHLIGHT_BUDGET_BYTES);
+            assert!(is_highlight_html(&h.html), "{}: {}", syn.name, h.html);
+            checked += 1;
+        }
+        assert!(checked > 30, "{checked}");
+        assert!(is_highlight_html(&escape_html(code)));
+        for bad in [
+            "<script>alert(1)</script>",
+            "<span class=\"hl-a\" onclick=\"x\">t</span>",
+            "<span class=\"hl-a\"><img src=x onerror=alert(1)></span>",
+            "<span class=\"x\">t</span>",
+            "<span class=\"hl-a\">t",
+            "t</span>",
+            "<span class=\"hl-a\"\">t</span>",
+            "<span class=\"hl-\">t</span>",
+            "<span class=\"hl-a  hl-b\">t</span>",
+            "<span class='hl-a'>t</span>",
+            "a &lt b",
+            "a &#x3c; b",
+            "\" onmouseover=\"x",
+            "<svg/onload=alert(1)>",
+        ] {
+            assert!(!is_highlight_html(bad), "{bad}");
+        }
+    }
 
     /// Исходник в HTML: только классы и экранированный текст; разметка из файла не проходит.
     #[test]

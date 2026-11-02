@@ -311,6 +311,55 @@ fn inline_ok(mime: &str) -> bool {
         || m == "application/pdf"
 }
 
+/// Типы, которые браузер исполняет или применяет к странице при подключении по URL (`<script>`,
+/// `import`, `Worker`, `<link rel=stylesheet>`, XSLT, WebAssembly): JavaScript (все MIME
+/// JavaScript по WHATWG MIME Sniffing), CSS, XSLT, WebAssembly. Блоб такого типа с того же origin
+/// обошёл бы CSP WebUI (`script-src 'self'`): `nosniff` пропускает скрипт, тип которого —
+/// JavaScript, а `Content-Disposition: attachment` подключению не мешает.
+fn executable_mime(mime: &str) -> bool {
+    let essence = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+            | "text/css"
+            | "text/xsl"
+            | "application/xslt+xml"
+            | "application/wasm"
+    ) || essence.ends_with("+javascript")
+}
+
+/// `Content-Type` ответа с блобом: исполняемые типы ([`executable_mime`]) — как
+/// `application/octet-stream` (с `nosniff` браузер не подключит файл ни скриптом, ни стилем;
+/// скачивание и имя файла — прежние). Остальное — как записано: SVG и изображения в `<img>`,
+/// PDF во встроенном просмотрщике (финальное ревью M5, I-3).
+fn served_mime(mime: &str) -> &str {
+    if executable_mime(mime) {
+        "application/octet-stream"
+    } else {
+        mime
+    }
+}
+
 /// RFC 5987 `attr-char`; остальное — `%XX` от байтов UTF-8.
 fn rfc5987(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
@@ -346,7 +395,7 @@ fn if_none_match_hits(headers: &HeaderMap, etag: &str) -> bool {
 /// Заголовки безопасности и кэширования любого ответа с блобом.
 fn decorate(r: &mut Response, mime: &str, filename: &str, etag: &str) {
     let h = r.headers_mut();
-    let ct = HeaderValue::from_str(mime)
+    let ct = HeaderValue::from_str(served_mime(mime))
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     h.insert(header::CONTENT_TYPE, ct);
     h.insert(
@@ -483,6 +532,38 @@ mod tests {
             disposition("text/html", "\"x\";.html"),
             "attachment; filename*=UTF-8''%22x%22%3B.html"
         );
+    }
+
+    #[test]
+    fn executable_types_served_as_octet_stream() {
+        for m in [
+            "text/javascript",
+            "application/javascript; charset=utf-8",
+            "Text/JavaScript",
+            "application/x-javascript",
+            "text/ecmascript",
+            "text/jscript",
+            "text/css",
+            "text/xsl",
+            "application/xslt+xml",
+            "application/wasm",
+        ] {
+            assert_eq!(served_mime(m), "application/octet-stream", "{m}");
+            assert!(disposition(m, "a").starts_with("attachment"), "{m}");
+        }
+        // показ в браузере и просмотрщики не ломаются
+        for m in [
+            "image/png",
+            "image/svg+xml",
+            "application/pdf",
+            "text/html",
+            "text/plain",
+            "application/json",
+            "application/xml",
+            "video/mp4",
+        ] {
+            assert_eq!(served_mime(m), m, "{m}");
+        }
     }
 
     #[test]

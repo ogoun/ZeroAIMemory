@@ -170,6 +170,34 @@ async fn svg_and_html_are_attachment_with_sandbox() {
     assert!(r.header("content-security-policy").starts_with("sandbox"));
 }
 
+/// Финальное ревью M5, I-3: JavaScript и CSS отдаются как `application/octet-stream` с
+/// `nosniff` — с того же origin их нельзя подключить `<script>`/`<link>` в обход CSP WebUI; в
+/// описании вложения тип прежний.
+#[tokio::test]
+async fn script_and_css_blobs_not_executable() {
+    let a = api("blobs-js", |_| {}).await;
+    let n = a.note("knowledge", "js", "x").await;
+    for (file, mime) in [("evil.js", "text/javascript"), ("evil.css", "text/css")] {
+        let r = upload(&a, &id(&n), file, b"alert(document.cookie)").await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        assert_eq!(r.json()["mime"], mime);
+        let sha = r.json()["sha256"].as_str().unwrap().to_string();
+        let r = get(&a, &format!("/api/v1/blobs/{sha}/{file}"), &[]).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(
+            r.header("content-type"),
+            "application/octet-stream",
+            "{file}"
+        );
+        assert_eq!(r.header("x-content-type-options"), "nosniff");
+        assert_eq!(
+            r.header("content-disposition"),
+            format!("attachment; filename*=UTF-8''{file}")
+        );
+        assert_eq!(r.body.as_ref(), b"alert(document.cookie)");
+    }
+}
+
 #[tokio::test]
 async fn over_limit_is_413_and_nothing_stored() {
     let a = api("blobs-413", |c| c.limits.blob_max_bytes = 1000).await;
