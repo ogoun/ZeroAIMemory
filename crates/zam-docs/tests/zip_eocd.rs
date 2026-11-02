@@ -409,6 +409,20 @@ fn peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (r, PEAK.load(Relaxed).saturating_sub(base))
 }
 
+/// Тот же файл под именем `.xlsx` (повторное ревью задачи 10): испорченный каталог с сигнатурой
+/// zip — вид по расширению (`Some(Xlsx)`, разбор даст `parse_error`), каталог сверх лимитов — по-
+/// прежнему `None`; в обоих случаях пик `sniff_file` не больше `max`.
+fn xlsx_name_peak_small(label: &str, b: &[u8], max: usize) {
+    let l = Limits::default();
+    let (r, p) = peak(|| sniff_file(Cursor::new(b), "x.xlsx", &l).unwrap());
+    eprintln!(
+        "{label} (.xlsx): sniff_file {r:?} пик {:.2} МиБ",
+        p as f64 / MIB as f64
+    );
+    assert!(matches!(r, None | Some(DocKind::Xlsx)), "{label}: {r:?}");
+    assert!(p < max, "{label} (.xlsx): sniff_file пик {p}");
+}
+
 /// Проба ревьюера: до правки поддельная EOCD пропускала zip64 на 2 млн записей в `ZipArchive`
 /// (≈ 650 МиБ на файл 89 МиБ); теперь — отказ без разбора каталога, пик — буфер хвоста.
 #[test]
@@ -442,6 +456,7 @@ fn reviewer_probe_peak_is_small() {
         assert_eq!(r, None, "{label}");
         assert!(sniff_peak < MIB, "{label}: sniff_file пик {sniff_peak}");
         assert!(extract_peak < MIB, "{label}: extract пик {extract_peak}");
+        xlsx_name_peak_small(label, &b, MIB);
         match x {
             Ok(x) => assert!(x.units.is_empty(), "{label}"),
             Err(e) => assert!(matches!(e, DocError::Malformed(_)), "{label}: {e}"),
@@ -505,6 +520,7 @@ fn assert_rejected_small(label: &str, b: &[u8]) {
     assert_eq!(r, None, "{label}");
     assert!(sp < 2 * MIB, "{label}: sniff_file пик {sp}");
     assert!(ep < 2 * MIB, "{label}: extract пик {ep}");
+    xlsx_name_peak_small(label, b, 2 * MIB);
     if let Ok(x) = x {
         assert!(x.units.is_empty(), "{label}");
     }

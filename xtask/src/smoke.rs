@@ -2126,18 +2126,24 @@ fn doc_worker_ping(root: &Path, lib: &Path) -> Result<Option<String>> {
 }
 
 /// Критерий M5: pdfium из каталога комплекта грузится рабочим процессом (`ping` → `pong` без
-/// причины); с несуществующей библиотекой — `pong` с причиной (проверка не пустая).
+/// причины); с несуществующей библиотекой и с существующим файлом, который не библиотека
+/// (`config.example.toml` комплекта), — `pong` с причиной (проверка не пустая).
 fn pdfium_loads(root: &Path, platform: &str) -> Result<()> {
     let lib = root.join(crate::package::pdfium_file(platform));
     if let Some(r) = doc_worker_ping(root, &lib)? {
         bail!("pdfium {} не загрузился: {r}", lib.display());
     }
-    let missing = root.join("no-such-pdfium-library");
-    if doc_worker_ping(root, &missing)?.is_none() {
-        bail!(
-            "ping с несуществующей библиотекой {} ответил «загружена»",
-            missing.display()
-        );
+    let not_lib = root.join("config.example.toml");
+    if !not_lib.is_file() {
+        bail!("нет {} для проверки отказа загрузки", not_lib.display());
+    }
+    for bogus in [root.join("no-such-pdfium-library"), not_lib] {
+        if doc_worker_ping(root, &bogus)?.is_none() {
+            bail!(
+                "ping с {} вместо pdfium ответил «загружена»",
+                bogus.display()
+            );
+        }
     }
     Ok(())
 }
@@ -2231,15 +2237,23 @@ struct DocHit {
     evidence: &'static str,
 }
 
-/// Элементы выдачи для текста ошибки: вид, файл и `locator` (у вложения) или путь.
+/// Элементы выдачи для текста ошибки: вид, файл и `locator` (у вложения) или путь, каналы.
 fn describe_doc_items(v: &Value) -> String {
     v["items"]
         .as_array()
         .into_iter()
         .flatten()
         .map(|i| match i["kind"].as_str() {
-            Some("attachment") => format!("attachment {} {}", i["file"], i["locator"]),
-            k => format!("{} {}", k.unwrap_or("?"), i["path"]),
+            Some("attachment") => format!(
+                "attachment {} {} sources = {}",
+                i["file"], i["locator"], i["sources"]
+            ),
+            k => format!(
+                "{} {} sources = {}",
+                k.unwrap_or("?"),
+                i["path"],
+                i["sources"]
+            ),
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -2264,11 +2278,18 @@ fn docs_search(base: &str, token: &str, att: &DocsAttached) -> Result<Vec<DocHit
             if status != 200 {
                 bail!("POST /api/v1/search «{query}»: HTTP {status}: {v}");
             }
+            // карточка с каналом FTS: вторая карточка того же файла может прийти только
+            // вектором (порядок близких косинусов зависит от платформы, CI abd604c)
             let item = v["items"]
                 .as_array()
                 .and_then(|a| {
-                    a.iter()
-                        .find(|i| i["kind"] == "attachment" && i["file"] == file)
+                    a.iter().find(|i| {
+                        i["kind"] == "attachment"
+                            && i["file"] == file
+                            && i["sources"]
+                                .as_array()
+                                .is_some_and(|s| s.iter().any(|x| x == "fts"))
+                    })
                 })
                 .cloned();
             if let Some(item) = item

@@ -379,6 +379,8 @@ pub fn ab_md(r: &AbReport) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     pub id: String,
+    /// Текст запроса (`--compare` сверяет его у пары прогонов).
+    pub text: String,
     pub kind: String,
     pub format: String,
     pub fact: String,
@@ -1204,6 +1206,7 @@ fn run_server(
             .collect();
         results.push(QueryResult {
             id: q.id.clone(),
+            text: q.text.clone(),
             kind: q.kind.clone(),
             format: format_of(&fact.file).to_string(),
             fact: q.fact.clone(),
@@ -1456,6 +1459,31 @@ fn per_query(v: &Value, metric: &str, format: Option<&str>) -> BTreeMap<String, 
         .collect()
 }
 
+/// Общие запросы пары прогонов, у которых разный текст или факт (набор запросов правили между
+/// прогонами — разности по `id` тогда сравнивали бы разные вопросы). Текст — с задачи 12 M5;
+/// у прогонов раньше его нет, тогда сверяется только факт.
+fn query_mismatches(base: &Value, new: &Value) -> Vec<String> {
+    let index = |v: &Value| -> BTreeMap<String, (Option<String>, Option<String>)> {
+        v["queries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|q| {
+                let s = |k: &str| q[k].as_str().map(String::from);
+                (s("id").unwrap_or_default(), (s("text"), s("fact")))
+            })
+            .collect()
+    };
+    let (a, b) = (index(base), index(new));
+    let differ = |x: &Option<String>, y: &Option<String>| x.is_some() && y.is_some() && x != y;
+    a.iter()
+        .filter_map(|(id, (ta, fa))| {
+            let (tb, fb) = b.get(id)?;
+            (differ(ta, tb) || differ(fa, fb)).then(|| id.clone())
+        })
+        .collect()
+}
+
 /// `cargo xtask eval --docs --compare A --compare B [--compare C --compare D …]`: парные
 /// разности B − A (D − C, …) recall@5, MRR@10 и loc@5 по общим запросам, бутстреп
 /// [`PAIRED_BOOTSTRAP`]; `--docs-format pdf` — только запросы к PDF. Итог — в stdout и
@@ -1481,6 +1509,15 @@ fn compare_runs(a: &EvalArgs, p: &Paths) -> Result<()> {
             )?)
         };
         let (base, new) = (load(&pair[0])?, load(&pair[1])?);
+        let bad = query_mismatches(&base, &new);
+        if !bad.is_empty() {
+            bail!(
+                "--compare {} {}: у запросов {} разный текст или факт — прогоны на разных                  наборах запросов",
+                pair[0].display(),
+                pair[1].display(),
+                bad.join(", ")
+            );
+        }
         let mut cells = Vec::new();
         let mut n = 0;
         for metric in ["recall5", "mrr10", "loc5"] {
@@ -1600,6 +1637,28 @@ mod tests {
     use super::*;
     use crate::docs_corpus::{DEFAULT_SEED, Profile};
 
+    /// `--compare` сверяет текст и факт общих запросов (повторное ревью задачи 10): прогоны без
+    /// текста (до задачи 12) сверяются по факту.
+    #[test]
+    fn compare_checks_query_text() {
+        let run = |qs: &[(&str, Option<&str>, &str)]| {
+            serde_json::json!({"queries": qs.iter().map(|(id, text, fact)| {
+                let mut q = serde_json::json!({"id": id, "fact": fact});
+                if let Some(t) = text {
+                    q["text"] = serde_json::json!(t);
+                }
+                q
+            }).collect::<Vec<_>>()})
+        };
+        let a = run(&[("q1", Some("alpha"), "f1"), ("q2", Some("beta"), "f2")]);
+        let same = run(&[("q1", Some("alpha"), "f1"), ("q3", Some("x"), "f3")]);
+        assert!(query_mismatches(&a, &same).is_empty());
+        let text = run(&[("q1", Some("alpha!"), "f1"), ("q2", Some("beta"), "f2")]);
+        assert_eq!(query_mismatches(&a, &text), ["q1"]);
+        let fact = run(&[("q1", None, "f1"), ("q2", None, "f9")]);
+        assert_eq!(query_mismatches(&a, &fact), ["q2"]);
+    }
+
     /// Набор и запросы согласованы; метрики A/B и выдачи считаются на малом наборе: PDF
     /// разбираются pdfium в этом процессе (без pdfium — только проверка запросов), факты PDF —
     /// на своих страницах, порядок двухколоночных страниц верный.
@@ -1621,6 +1680,7 @@ mod tests {
         let q = |rank: Option<usize>, ok: Option<bool>| QueryResult {
             rank_attach: rank,
             id: "q".into(),
+            text: "query".into(),
             kind: "exact".into(),
             format: "pdf".into(),
             fact: "o1".into(),

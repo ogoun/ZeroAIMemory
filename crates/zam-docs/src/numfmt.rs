@@ -69,11 +69,13 @@ pub(crate) fn builtin(id: u32) -> DateKind {
     }
 }
 
-/// Вид своего формата по коду (`dd\.mm\.yyyy`, `[$-419]d mmmm yyyy`, `h:mm`, `#,##0.00 "₽"`).
-pub(crate) fn classify(code: &str) -> DateKind {
+/// Первая секция кода формата (положительные числа: `0;-0;"ноль"`) без литералов в кавычках,
+/// экранированных символов (`\x`, `_x`, `*x`) и `[…]`-секций, в нижнем регистре; второе — есть
+/// ли секция длительности (`[h]`, `[hh]`, `[m]`, `[ss]`).
+fn plain_code(code: &str) -> (String, bool) {
     let mut plain = String::with_capacity(code.len());
+    let mut duration = false;
     let mut chars = code.chars();
-    // только первая секция (положительные числа): `0;-0;"ноль"`
     while let Some(c) = chars.next() {
         match c {
             ';' => break,
@@ -95,16 +97,20 @@ pub(crate) fn classify(code: &str) -> DateKind {
                     }
                     inner.push(q);
                 }
-                // длительность: `[h]`, `[hh]`, `[m]`, `[ss]` — не дата и не время дня
                 let l = inner.to_ascii_lowercase();
-                if !l.is_empty() && l.chars().all(|c| matches!(c, 'h' | 'm' | 's')) {
-                    return DateKind::None;
-                }
+                duration |= !l.is_empty() && l.chars().all(|c| matches!(c, 'h' | 'm' | 's'));
             }
             c => plain.push(c.to_ascii_lowercase()),
         }
     }
-    if plain.contains("general") {
+    (plain, duration)
+}
+
+/// Вид своего формата по коду (`dd\.mm\.yyyy`, `[$-419]d mmmm yyyy`, `h:mm`, `#,##0.00 "₽"`).
+pub(crate) fn classify(code: &str) -> DateKind {
+    let (plain, duration) = plain_code(code);
+    // длительность — не дата и не время дня
+    if duration || plain.contains("general") {
         return DateKind::None;
     }
     let ymd = plain.contains('y') || plain.contains('d');
@@ -226,11 +232,12 @@ pub(crate) fn format_serial(v: f64, st: &Style, date1904: bool, out: &mut String
         days += 1;
     }
     let (h, mi, s) = (secs / 3600, secs / 60 % 60, secs % 60);
-    // секунды — если они есть и формат их показывает (`h:mm AM/PM` — без секунд)
-    let shows_secs = st.code.as_deref().is_none_or(|c| {
-        let plain: String = c.split(';').next().unwrap_or(c).to_ascii_lowercase();
-        plain.contains('s')
-    });
+    // секунды — если они есть и формат их показывает (`h:mm AM/PM` — без секунд; `s` литерала
+    // в кавычках — не секунды)
+    let shows_secs = st
+        .code
+        .as_deref()
+        .is_none_or(|c| plain_code(c).0.contains('s'));
     let time = |out: &mut String| {
         if s == 0 || !shows_secs {
             let _ = write!(out, "{h:02}:{mi:02}");
@@ -239,7 +246,19 @@ pub(crate) fn format_serial(v: f64, st: &Style, date1904: bool, out: &mut String
         }
     };
     out.clear();
-    // дата без дня (номер < 1 в системе 1900: «день 0» Excel) — только время
+    // номер < 1 в системе 1900 — «день 0» Excel (1900-01-00): свой формат — как в Excel
+    // (`00.01.1900`); ISO такого дня не знает — тогда только время
+    if kind != DateKind::Time
+        && !date1904
+        && days == 0
+        && let Some(t) = st
+            .code
+            .as_deref()
+            .and_then(|c| render(c, (1900, 1, 0), (h, mi, s)))
+    {
+        out.push_str(&t);
+        return true;
+    }
     let time_only = kind == DateKind::Time || (!date1904 && days == 0);
     if time_only {
         if let Some(t) = st
@@ -321,6 +340,13 @@ mod tests {
         );
         assert_eq!(c(v, "h:mm AM/PM").as_deref(), Some("14:30"));
         assert_eq!(c(v, "mm:ss.0").as_deref(), Some("14:30:05"));
+        // `s` в литерале — не секунды (повторное ревью задачи 10): вывод ISO (названия месяцев)
+        // без секунд; код, который выводится, — литерал как есть
+        assert_eq!(
+            c(v, r#"d mmmm yyyy h:mm" hrs""#).as_deref(),
+            Some("2021-03-15 14:30")
+        );
+        assert_eq!(c(v, r#"h:mm" hrs""#).as_deref(), Some("14:30 hrs"));
         assert_eq!(c(44_270.0, "0.00"), None);
     }
 
@@ -334,7 +360,14 @@ mod tests {
         };
         assert_eq!(b(0.5, 22).as_deref(), Some("12:00"));
         assert_eq!(b(0.75, 14).as_deref(), Some("18:00"));
-        assert_eq!(c(0.25, "yyyy-mm-dd hh:mm").as_deref(), Some("06:00"));
+        // свой формат — «день 0» Excel (повторное ревью задачи 10); встроенный (ISO) — время
+        assert_eq!(
+            c(0.25, "yyyy-mm-dd hh:mm").as_deref(),
+            Some("1900-01-00 06:00")
+        );
+        assert_eq!(c(0.0, r"dd\.mm\.yyyy").as_deref(), Some("00.01.1900"));
+        assert_eq!(c(0.5, "m/d/yyyy").as_deref(), Some("1/0/1900"));
+        assert_eq!(c(0.25, "hh:mm").as_deref(), Some("06:00"));
         let v = (14.0 * 3600.0 + 30.0 * 60.0 + 5.0) / 86_400.0;
         assert_eq!(c(v, "h:mm AM/PM").as_deref(), Some("14:30"));
         assert_eq!(c(v, "h:mm:ss AM/PM").as_deref(), Some("14:30:05"));

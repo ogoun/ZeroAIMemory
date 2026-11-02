@@ -160,7 +160,7 @@ fn office_ext(ext: &str) -> Option<DocKind> {
     match ext {
         "docx" | "docm" | "dotx" | "dotm" => Some(DocKind::Docx),
         "xlsx" | "xlsm" | "xltx" | "xltm" => Some(DocKind::Xlsx),
-        "pptx" | "pptm" | "potx" | "ppsx" => Some(DocKind::Pptx),
+        "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Some(DocKind::Pptx),
         "ods" => Some(DocKind::Ods),
         _ => None,
     }

@@ -11,7 +11,7 @@
 //! `cargo test -p zam-docs --release --test memory_peak -- --ignored --nocapture`.
 //!
 //! Таблицы ([`table_bound`]): `max_unpacked` (часть zip или поток XLS; копия CSV из UTF-16) +
-//! 2 × 4 × `max_chars` (выдача с шапкой и строкой в работе; общие строки XLSX/XLS или буфер
+//! 8 МиБ (часть стилей XLSX, свой потолок) + 2 × 4 × `max_chars` (выдача с шапкой и строкой в работе; общие строки XLSX/XLS или буфер
 //! строки ODS — свой потолок `max_chars`) + 16 × `max_cells` (концы общих строк, `usize`, с ростом
 //! `Vec`) + 1 МиБ. Сетка листа не строится: `dimension`, пустые ячейки и повторы ODS памяти не
 //! занимают. Окно `sheet_page` ([`page_bound`]) — сверх того 48 × `max_cells`: каждая ячейка или
@@ -412,10 +412,19 @@ fn long_names(size: usize) -> Vec<u8> {
     ])
 }
 
-/// Граница таблиц: `max_unpacked` (часть или поток) + 2 × 4 × `max_chars` (выдача и общие
-/// строки или буфер строки ODS) + 16 × `max_cells` (концы общих строк с ростом `Vec`) + 1 МиБ.
+/// Потолок части стилей XLSX (`xl/styles.xml`, `xlsx::STYLES_MAX`): служебная часть читается
+/// сверх `max_unpacked` (задача 10, M5).
+const STYLES_PART: usize = 8 * MIB;
+
+/// Граница таблиц: `max_unpacked` (часть или поток) + стили XLSX ([`STYLES_PART`]) + 2 × 4 ×
+/// `max_chars` (выдача и общие строки или буфер строки ODS) + 16 × `max_cells` (концы общих строк
+/// с ростом `Vec`) + 1 МиБ.
 fn table_bound(l: &Limits) -> usize {
-    l.max_unpacked as usize + 2 * 4 * l.max_chars as usize + 16 * l.max_cells as usize + MIB
+    l.max_unpacked as usize
+        + STYLES_PART
+        + 2 * 4 * l.max_chars as usize
+        + 16 * l.max_cells as usize
+        + MIB
 }
 
 /// Граница `sheet_page`: [`table_bound`] + 48 × `max_cells` (ячейки и пустые строки окна).

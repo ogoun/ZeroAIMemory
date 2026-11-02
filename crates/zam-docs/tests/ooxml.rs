@@ -324,6 +324,18 @@ fn truncated_ooxml_is_malformed_not_unsupported() {
         Some(DocKind::Docx)
     );
     assert_eq!(sniff(cut, "archive.zip"), None);
+    // все расширения OOXML с макросами и шаблоны, включая показ и шаблон PPTX с макросами
+    for (name, kind) in [
+        ("a.docm", DocKind::Docx),
+        ("a.dotx", DocKind::Docx),
+        ("a.xltm", DocKind::Xlsx),
+        ("a.potm", DocKind::Pptx),
+        ("a.ppsm", DocKind::Pptx),
+        ("a.ppsx", DocKind::Pptx),
+        ("a.ods", DocKind::Ods),
+    ] {
+        assert_eq!(sniff(cut, name), Some(kind), "{name}");
+    }
     let e = extract(DocKind::Docx, cut, &l, far()).unwrap_err();
     assert!(matches!(&e, DocError::Malformed(_)), "{e:?}");
     assert_eq!(e.area(), "zip", "{e:?}");
