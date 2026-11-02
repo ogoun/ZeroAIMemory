@@ -39,8 +39,9 @@ use text::{Lang, Rng, paragraph, sentence, wrap};
 
 /// Сид по умолчанию.
 pub const DEFAULT_SEED: u64 = 0x00d0_c5e7_2026_1102;
-/// Версия набора: смена состава или правил генерации (2 — допустимые исходы `accept`).
-pub const CORPUS_VERSION: u32 = 2;
+/// Версия набора: смена состава или правил генерации (2 — допустимые исходы `accept`; 3 — zip
+/// с системой Unix на любой платформе).
+pub const CORPUS_VERSION: u32 = 3;
 
 /// Аргументы `cargo xtask docs-corpus`.
 #[derive(Debug, clap::Args)]
@@ -1308,7 +1309,7 @@ mod tests {
     /// файлы. Малый набор (`small`): те же генераторы, меньше строк и страниц.
     /// Сводный sha256 манифеста `manifest_in_memory(7, малый набор)`.
     const MANIFEST_SHA256_SEED7_SMALL: &str =
-        "48fba1dfbf034e40ebed143cc61b5a14f024e5213236d9be0376d9e66e62070c";
+        "ef10cf0fe0da453e78e55a51f9fed15c81170a7882da41469dc84d1869749e34";
 
     #[test]
     fn docs_corpus_deterministic() {

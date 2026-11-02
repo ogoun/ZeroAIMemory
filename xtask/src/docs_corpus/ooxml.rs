@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, DateTime, ZipWriter};
+use zip::{CompressionMethod, DateTime, System, ZipWriter};
 
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -14,11 +14,13 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 const SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const PML_NS: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main""#;
 
-/// Параметры записи zip: deflate, фиксированная дата.
+/// Параметры записи zip: deflate, фиксированная дата и система «создано в» — без неё zip 9
+/// пишет DOS на Windows и Unix на прочих, и байты набора зависят от платформы (CI 736a58f).
 pub fn zip_options() -> SimpleFileOptions {
     SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .last_modified_time(DateTime::default())
+        .system(System::Unix)
 }
 
 /// zip из записей по порядку.
