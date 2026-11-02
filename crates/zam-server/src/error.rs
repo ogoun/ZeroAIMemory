@@ -91,6 +91,10 @@ pub enum ApiError {
     Certainty(zam_store::CertaintyError),
     #[error("слишком много запросов")]
     RateLimited { retry_after_s: u64 },
+    /// 503 `/problems/busy` с `Retry-After`: заняты разрешения на большие тела запросов
+    /// ([`crate::api::big_body`]).
+    #[error("сервер занят обработкой больших запросов — повторите позже")]
+    Busy { retry_after_s: u64 },
     #[error("{0}")]
     Unavailable(String),
     /// 503 `/problems/vault-locked` (§7.6): мастер-ключ не подходит или файла ключа нет при
@@ -212,6 +216,11 @@ impl ApiError {
                 "/problems/rate-limited",
                 "Too Many Requests",
             ),
+            ApiError::Busy { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "/problems/busy",
+                "Service Unavailable",
+            ),
             ApiError::Unavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "about:blank",
@@ -323,7 +332,7 @@ impl IntoResponse for ApiError {
             HeaderValue::from_static("application/problem+json"),
         );
         match self {
-            ApiError::RateLimited { retry_after_s } => {
+            ApiError::RateLimited { retry_after_s } | ApiError::Busy { retry_after_s } => {
                 h.insert(header::RETRY_AFTER, HeaderValue::from(retry_after_s));
             }
             // RFC 9110 §15.5.2: 401 обязан нести схему.

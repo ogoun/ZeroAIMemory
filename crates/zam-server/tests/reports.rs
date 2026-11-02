@@ -1199,3 +1199,110 @@ async fn other_kinds_json_limit_unchanged() {
         "отчёт больше предела JSON",
     );
 }
+
+/// Сырое JSON-тело по токену.
+async fn post_raw(w: &W, body: String) -> Resp {
+    let r = Request::post(w.uri(G))
+        .header(header::AUTHORIZATION, format!("Bearer {}", w.a_tok))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    w.a.send(r).await
+}
+
+#[tokio::test]
+async fn report_json_pad_typed_4xx() {
+    // note_body_max = 2 × 1000 + 64 КиБ; тела ниже — больше него, путь отчёта без `Value`
+    let w = world_cfg("json-pad", None, |c| {
+        c.limits.note_max_bytes = 1000;
+    })
+    .await;
+    let zeros = "0,".repeat(60_000);
+    let r = post_raw(
+        &w,
+        format!(r#"{{"kind": "report", "title": "Т", "pad": [{zeros}0]}}"#),
+    )
+    .await;
+    assert_status(&r, StatusCode::BAD_REQUEST, "лишнее поле pad");
+    let r = post_raw(
+        &w,
+        format!(
+            r#"{{"kind": "report", "title": "Т", "data": {{"refs": {{"commits": [{zeros}0]}}}}}}"#
+        ),
+    )
+    .await;
+    assert_status(
+        &r,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "data.refs.commits из чисел",
+    );
+    assert!(r.text().contains("data.refs.commits"), "{}", r.text());
+    let r = post_raw(
+        &w,
+        format!(r#"{{"kind": "report", "title": "Т", "data": {{"x": [{zeros}0]}}}}"#),
+    )
+    .await;
+    assert_status(&r, StatusCode::UNPROCESSABLE_ENTITY, "лишний ключ data");
+    assert_eq!(w.reports().await, 0);
+}
+
+#[tokio::test]
+async fn big_bodies_busy_503_small_unaffected() {
+    let w = world_cfg("big-busy", None, |c| {
+        c.limits.note_max_bytes = 1000;
+    })
+    .await;
+    let img = png(1, 80 * 1024);
+    let report = json!({"kind": "report", "title": "Т", "body": "![a](a.png)",
+                        "images": [{"name": "a.png", "data": b64(&img)}]})
+    .to_string();
+    // оба разрешения заняты — большое тело получает 503 с Retry-After
+    let p1 = w.a.st.big_bodies.admit().await.unwrap();
+    let p2 = w.a.st.big_bodies.admit().await.unwrap();
+    let r = post_raw(&w, report.clone()).await;
+    assert_status(
+        &r,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "отчёт при занятых разрешениях",
+    );
+    assert_eq!(r.json()["type"], "/problems/busy");
+    assert_eq!(r.header("retry-after"), "2");
+    // /mcp — тот же семафор
+    let rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                     "params": {"pad": "x".repeat(80 * 1024)}})
+    .to_string();
+    let mcp = |body: String| {
+        Request::post("/mcp")
+            .header(header::HOST, "memory.lan:7700")
+            .header(header::AUTHORIZATION, format!("Bearer {}", w.a_tok))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let r = w.a.send(mcp(rpc.clone())).await;
+    assert_status(
+        &r,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "/mcp при занятых разрешениях",
+    );
+    // малые тела — без семафора
+    let r = w
+        .js(&w.a_tok, G, json!({"title": "Малый", "body": "x"}), None)
+        .await;
+    assert_status(&r, StatusCode::CREATED, "малый отчёт");
+    let r =
+        w.a.tok(
+            &w.a_tok,
+            Method::POST,
+            &w.uri(G),
+            Some(json!({"kind": "changelog", "title": "Т", "data": {"kind": "feat"}})),
+        )
+        .await;
+    assert_status(&r, StatusCode::CREATED, "малый changelog");
+    drop((p1, p2));
+    let r = post_raw(&w, report).await;
+    assert_status(&r, StatusCode::CREATED, "отчёт после освобождения");
+    let r = w.a.send(mcp(rpc)).await;
+    assert_ne!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+}

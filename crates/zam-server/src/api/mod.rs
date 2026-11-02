@@ -1,6 +1,7 @@
 //! Маршруты HTTP API.
 pub mod admin;
 pub mod agent_setup;
+pub mod big_body;
 pub mod blobs;
 pub mod cache;
 pub mod doc_locator;

@@ -292,7 +292,8 @@ pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, Api
 /// `POST /spaces/{space}/entries` → 201 `Entry`; повтор с тем же `Idempotency-Key` — 200.
 /// `kind: insight` и `kind: term` — [`super::insights::create`]; отчёт (`multipart/form-data`
 /// или JSON с `kind: report`) — [`super::reports::create`]. JSON читается с пределом
-/// [`super::entries_json_max`]; запись не-отчёта больше [`super::note_body_max`] — 413.
+/// [`super::entries_json_max`]; запись не-отчёта больше [`super::note_body_max`] — 413 до
+/// построения `Value`; тело больше `note_body_max` ждёт разрешения [`super::big_body`] (503).
 pub async fn create(
     State(st): State<AppState>,
     p: Principal,
@@ -316,33 +317,30 @@ pub async fn create(
         .await;
     }
     let json_max = super::entries_json_max(&st.cfg);
-    let too_large = || ApiError::PayloadTooLarge("тело запроса превышает предел".into());
-    let declared = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    if declared.is_some_and(|n| n > json_max as u64) {
-        return Err(too_large());
+    let declared = super::big_body::content_length(&headers);
+    // тело больше `note_body_max` держит разрешение большого тела до конца обработки
+    let (bytes, _big) = st
+        .big_bodies
+        .read(req.into_body(), json_max, declared)
+        .await?;
+    // вид — без построения `Value`: отчёт разбирается из байт сразу в типы
+    if super::reports::json_is_report(&bytes) {
+        return super::reports::create(
+            &st,
+            &p,
+            &headers,
+            &client,
+            &space,
+            ReportInput::Json(bytes),
+        )
+        .await;
     }
-    let bytes = super::reports::read_limited(req.into_body(), json_max).await?;
-    // больше предела записи — только отчёт MCP: вид — без построения `Value` из всего тела
-    let big = bytes.len() > super::note_body_max(&st.cfg.limits);
-    if big && !super::reports::json_is_report(&bytes) {
-        return Err(too_large());
+    if bytes.len() > super::note_body_max(&st.cfg.limits) {
+        return Err(ApiError::PayloadTooLarge(
+            "тело запроса превышает предел".into(),
+        ));
     }
     let raw: Value = super::parse_body(&bytes)?;
-    let report = raw
-        .get("kind")
-        .and_then(Value::as_str)
-        .and_then(EntryKind::parse)
-        == Some(EntryKind::Report);
-    if big && !report {
-        return Err(too_large());
-    }
-    if report {
-        return super::reports::create(&st, &p, &headers, &client, &space, ReportInput::Json(raw))
-            .await;
-    }
     if matches!(
         raw.get("kind")
             .and_then(Value::as_str)

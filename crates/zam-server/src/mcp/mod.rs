@@ -5,7 +5,9 @@
 //!   без `Mcp-Session-Id` и дальше работают так же), ответы — `application/json`
 //!   (`json_response`), SSE — только если обработчик шлёт уведомления до ответа (у нас нет).
 //!   Предел тела — как у JSON записи журнала ([`crate::api::entries_json_max`]: отчёт с файлами
-//!   в base64 до `reports.mcp_max_bytes`); пределы заметок и записей проверяют маршруты REST.
+//!   в base64 до `reports.mcp_max_bytes`) для всех инструментов; пределы заметок и записей
+//!   проверяют маршруты REST. Тело больше `note_body_max` занимает разрешение
+//!   [`crate::api::big_body`] (не больше двух одновременно, иначе 503 `busy`).
 //! - **Аутентификация** — `Authorization: Bearer` обязателен ([`require_bearer`]): токен
 //!   проверяется тем же извлекателем [`Principal`], что у REST (лимит неудачных попыток по
 //!   IP, отзыв, срок); без заголовка или с неверным токеном — 401 problem+json до `rmcp`.
@@ -107,6 +109,11 @@ pub fn router(state: &AppState) -> Router<AppState> {
     );
     Router::new()
         .route_service(MCP_PATH, svc)
+        // тело — после аутентификации: разрешения на большие тела берут только токены
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            crate::api::big_body::limit_mcp,
+        ))
         .route_layer(from_fn_with_state(state.clone(), require_bearer))
         .route_layer(axum::middleware::from_fn(same_origin))
 }

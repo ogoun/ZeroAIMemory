@@ -29,12 +29,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use axum::Json;
-use axum::body::{Body, Bytes};
+use axum::body::Bytes;
 use axum::extract::Multipart;
 use axum::http::{HeaderMap, StatusCode, header};
 use base64::Engine as _;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use serde::Deserialize;
+use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
 use tokio_util::io::StreamReader;
 use zam_markdown::{LinkKind, parse};
@@ -44,8 +45,7 @@ use zam_store::{
 
 use super::blobs::{multipart_err, next_field, pick_mime, put_err, put_too_large, stream_err};
 use super::entries::{
-    REF_MAX_CHARS, REFS_MAX, check_size, check_title, empty_object, idempotency_key, string_array,
-    unprocessable,
+    REF_MAX_CHARS, REFS_MAX, check_size, check_title, idempotency_key, unprocessable,
 };
 use super::scope::{Mode, space_scope};
 use crate::app::AppState;
@@ -71,17 +71,13 @@ const REFS_KEYS: [&str; 4] = ["commits", "files", "notes", "tasks"];
 const PATH_FORBIDDEN: [char; 7] = ['"', ':', '*', '?', '<', '>', '|'];
 
 /// Метаданные отчёта: часть `meta` multipart или JSON-тело (без `kind` и `images`).
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct ReportMeta {
     pub title: String,
-    #[serde(default)]
     pub body: String,
-    #[serde(default)]
     pub tags: Vec<String>,
     pub area: Option<String>,
-    #[serde(default = "empty_object")]
-    pub data: Value,
+    pub data: ReportData,
     pub message: Option<String>,
 }
 
@@ -97,7 +93,8 @@ pub struct LocalRef {
 /// Вход создания отчёта.
 pub enum ReportInput {
     Multipart(Multipart),
-    Json(Value),
+    /// Байты JSON (разбираются сразу в типы, без `Value`).
+    Json(Bytes),
 }
 
 /// Файл отчёта в JSON (MCP).
@@ -125,8 +122,6 @@ pub fn is_multipart(headers: &HeaderMap) -> bool {
 /// пропускаются (`IgnoredAny`), значение `kind` не-строкой — не отчёт; не JSON или повтор `kind`
 /// — не отчёт.
 pub fn json_is_report(bytes: &[u8]) -> bool {
-    use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
-
     /// Строка `kind` или `None` (значение другого типа пропускается без выделения памяти).
     struct KindStr(Option<String>);
     impl<'de> Deserialize<'de> for KindStr {
@@ -177,22 +172,6 @@ pub fn json_is_report(bytes: &[u8]) -> bool {
         .and_then(|p| p.kind)
         .and_then(|k| k.0)
         .is_some_and(|k| EntryKind::parse(&k) == Some(EntryKind::Report))
-}
-
-/// Тело запроса до `limit` байт; больше — 413.
-pub async fn read_limited(body: Body, limit: usize) -> Result<Bytes, ApiError> {
-    let mut s = body.into_data_stream();
-    let mut buf = Vec::new();
-    while let Some(chunk) = s.next().await {
-        let chunk = chunk.map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
-        if buf.len() + chunk.len() > limit {
-            return Err(ApiError::PayloadTooLarge(
-                "тело запроса превышает предел".into(),
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(Bytes::from(buf))
 }
 
 // ---- ссылки тела ----
@@ -359,7 +338,11 @@ fn reject_wiki_embeds(body: &str) -> Result<(), ApiError> {
     let probe = body.replace("![[", " [[");
     let b = body.as_bytes();
     for l in parse(&probe).links {
-        if l.kind == LinkKind::Wiki && l.range.start > 0 && b[l.range.start - 1] == b'!' {
+        let bang = l.range.start.checked_sub(1);
+        // `\![[…]]` — экранированный `!`: обычная вики-ссылка после текста «!»
+        let escaped =
+            bang.is_some_and(|i| b[..i].iter().rev().take_while(|&&c| c == b'\\').count() % 2 == 1);
+        if l.kind == LinkKind::Wiki && bang.is_some_and(|i| b[i] == b'!') && !escaped {
             return Err(unprocessable(format!(
                 "встраивание ![[{}]] в отчёте не поддерживается: картинка — ![подпись](путь)",
                 short(&l.target)
@@ -708,6 +691,7 @@ fn skip_ws(b: &[u8], mut i: usize, newline: bool) -> usize {
 /// Индекс `]`, парной `[` в `b[open]`: с вложенными скобками, `\`-экранированием и
 /// `код`-фрагментами.
 fn match_bracket(b: &[u8], open: usize) -> Option<usize> {
+    let mut runs: Option<BacktickRuns> = None;
     let mut depth = 0usize;
     let mut i = open;
     while i < b.len() {
@@ -718,21 +702,9 @@ fn match_bracket(b: &[u8], open: usize) -> Option<usize> {
             }
             b'`' => {
                 let run = b[i..].iter().take_while(|&&c| c == b'`').count();
-                let mut j = i + run;
-                let mut closed = None;
-                while j < b.len() {
-                    if b[j] == b'`' {
-                        let r = b[j..].iter().take_while(|&&c| c == b'`').count();
-                        if r == run {
-                            closed = Some(j + r);
-                            break;
-                        }
-                        j += r;
-                    } else {
-                        j += 1;
-                    }
-                }
-                i = closed.unwrap_or(i + run);
+                let idx = runs.get_or_insert_with(|| BacktickRuns::new(b, open));
+                // закрывающая последовательность той же длины — по индексу, без повторного прохода
+                i = idx.closer_after(i + run, run).unwrap_or(i + run);
                 continue;
             }
             b'[' => depth += 1,
@@ -747,6 +719,35 @@ fn match_bracket(b: &[u8], open: usize) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Последовательности `` ` `` текста по длине (начала по возрастанию) — поиск закрывающей
+/// за O(log n), как индекс последовательностей в CommonMark: незакрытые последовательности разной
+/// длины не дают квадратичного прохода.
+struct BacktickRuns(HashMap<usize, Vec<usize>>);
+
+impl BacktickRuns {
+    fn new(b: &[u8], from: usize) -> BacktickRuns {
+        let mut m: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut i = from;
+        while i < b.len() {
+            if b[i] == b'`' {
+                let n = b[i..].iter().take_while(|&&c| c == b'`').count();
+                m.entry(n).or_default().push(i);
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+        BacktickRuns(m)
+    }
+
+    /// Конец первой последовательности длины `len`, начинающейся не раньше `pos`.
+    fn closer_after(&self, pos: usize, len: usize) -> Option<usize> {
+        let v = self.0.get(&len)?;
+        let k = v.partition_point(|&s| s < pos);
+        v.get(k).map(|s| s + len)
+    }
 }
 
 /// Нормализованная метка ссылки-сноски: регистр и пробельные последовательности не важны.
@@ -828,31 +829,304 @@ fn def_dest(b: &[u8], from: usize) -> Option<Range<usize>> {
 
 // ---- данные и метаданные ----
 
-/// `data` отчёта: объект только с `refs {commits, files, notes, tasks}` — массивами строк (до
-/// 200 элементов до 1000 символов); иначе 422.
-fn check_report_data(data: &Value) -> Result<Value, ApiError> {
-    let o = data
-        .as_object()
-        .ok_or_else(|| unprocessable("data должно быть JSON-объектом"))?;
-    for (k, v) in o {
-        if k != "refs" {
-            return Err(unprocessable(format!(
-                "data.{k}: у отчёта в data только refs {{commits, files, notes, tasks}}"
-            )));
-        }
-        let refs = v
-            .as_object()
-            .ok_or_else(|| unprocessable("data.refs: ожидается объект"))?;
-        for (rk, rv) in refs {
-            if !REFS_KEYS.contains(&rk.as_str()) {
-                return Err(unprocessable(format!(
-                    "data.refs.{rk}: неизвестное поле (commits, files, notes, tasks)"
-                )));
+/// Не больше файлов в `images` (верх `reports.max_files`); больше — 400 при разборе.
+const IMAGES_MAX: usize = 1024;
+
+/// Список до `N` элементов: длиннее — ошибка разбора без накопления лишнего.
+#[derive(Debug)]
+struct Bounded<T, const N: usize>(Vec<T>);
+
+impl<T, const N: usize> Default for Bounded<T, N> {
+    fn default() -> Self {
+        Bounded(Vec::new())
+    }
+}
+
+impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Bounded<T, N> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T, const N: usize>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>, const N: usize> Visitor<'de> for V<T, N> {
+            type Value = Bounded<T, N>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "массив до {N} элементов")
             }
-            string_array(rv, &format!("data.refs.{rk}"), REFS_MAX, REF_MAX_CHARS)?;
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(x) = a.next_element()? {
+                    if out.len() == N {
+                        return Err(serde::de::Error::custom(format!(
+                            "массив длиннее {N} элементов"
+                        )));
+                    }
+                    out.push(x);
+                }
+                Ok(Bounded(out))
+            }
+        }
+        d.deserialize_seq(V::<T, N>(std::marker::PhantomData))
+    }
+}
+
+/// `data` отчёта, проверенная при разборе без промежуточного `Value`: только `refs {commits,
+/// files, notes, tasks}` — массивы строк (до 200 элементов до 1000 символов). Значения не по
+/// схеме пропускаются (`IgnoredAny`), первое нарушение запоминается — 422 после проверки доступа.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReportData {
+    /// Поле `refs` было в запросе.
+    pub has_refs: bool,
+    pub refs: BTreeMap<String, Vec<String>>,
+    error: Option<String>,
+}
+
+impl ReportData {
+    fn fail(&mut self, m: String) {
+        self.error.get_or_insert(m);
+    }
+
+    /// Для записи: `{}` или `{refs: {…}}`.
+    fn to_value(&self) -> Value {
+        if self.has_refs {
+            json!({ "refs": self.refs })
+        } else {
+            json!({})
         }
     }
-    Ok(data.clone())
+}
+
+/// Пропускает значение любого вида; `true` — это строка (её значение в `visit_str`).
+macro_rules! skip_any {
+    ($ty:ty, $on_other:expr) => {
+        fn visit_bool<E>(self, _: bool) -> Result<$ty, E> {
+            Ok($on_other)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<$ty, E> {
+            Ok($on_other)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<$ty, E> {
+            Ok($on_other)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<$ty, E> {
+            Ok($on_other)
+        }
+        fn visit_unit<E>(self) -> Result<$ty, E> {
+            Ok($on_other)
+        }
+    };
+}
+
+/// Элемент массива ссылок: строка в пределе, длиннее предела или не строка.
+enum RefItem {
+    Ok(String),
+    TooLong,
+    NotStr,
+}
+
+impl<'de> Deserialize<'de> for RefItem {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RefItem;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("строка")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<RefItem, E> {
+                Ok(if v.chars().count() <= REF_MAX_CHARS {
+                    RefItem::Ok(v.to_string())
+                } else {
+                    RefItem::TooLong
+                })
+            }
+            skip_any!(RefItem, RefItem::NotStr);
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<RefItem, A::Error> {
+                while a.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RefItem::NotStr)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<RefItem, A::Error> {
+                while a.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(RefItem::NotStr)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Массив ссылок `data.refs.<ключ>`: значения в пределах или текст нарушения (без имени ключа).
+struct RefList(Result<Vec<String>, String>);
+
+impl<'de> Deserialize<'de> for RefList {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RefList;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("массив строк")
+            }
+            fn visit_str<E>(self, _: &str) -> Result<RefList, E> {
+                Ok(RefList(Err("ожидается массив строк".into())))
+            }
+            skip_any!(RefList, RefList(Err("ожидается массив строк".into())));
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<RefList, A::Error> {
+                while a.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(RefList(Err("ожидается массив строк".into())))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<RefList, A::Error> {
+                let mut out = Vec::new();
+                let mut err: Option<String> = None;
+                let mut n = 0usize;
+                while let Some(item) = a.next_element::<RefItem>()? {
+                    n += 1;
+                    match item {
+                        _ if n > REFS_MAX => {
+                            err.get_or_insert(format!("не больше {REFS_MAX} элементов"));
+                        }
+                        RefItem::Ok(s) => out.push(s),
+                        RefItem::TooLong | RefItem::NotStr => {
+                            err.get_or_insert(format!("строки до {REF_MAX_CHARS} символов"));
+                        }
+                    }
+                }
+                Ok(RefList(err.map_or(Ok(out), Err)))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Объект `data.refs`.
+struct RefsIn(BTreeMap<String, Vec<String>>, Option<String>);
+
+impl<'de> Deserialize<'de> for RefsIn {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RefsIn;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("объект refs")
+            }
+            fn visit_str<E>(self, _: &str) -> Result<RefsIn, E> {
+                Ok(RefsIn(
+                    BTreeMap::new(),
+                    Some("data.refs: ожидается объект".into()),
+                ))
+            }
+            skip_any!(
+                RefsIn,
+                RefsIn(BTreeMap::new(), Some("data.refs: ожидается объект".into()))
+            );
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<RefsIn, A::Error> {
+                while a.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RefsIn(
+                    BTreeMap::new(),
+                    Some("data.refs: ожидается объект".into()),
+                ))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<RefsIn, A::Error> {
+                let mut out = BTreeMap::new();
+                let mut err: Option<String> = None;
+                while let Some(k) = a.next_key::<String>()? {
+                    if !REFS_KEYS.contains(&k.as_str()) {
+                        a.next_value::<IgnoredAny>()?;
+                        err.get_or_insert(format!(
+                            "data.refs.{}: неизвестное поле (commits, files, notes, tasks)",
+                            short(&k)
+                        ));
+                        continue;
+                    }
+                    match a.next_value::<RefList>()?.0 {
+                        Ok(v) => {
+                            out.insert(k, v);
+                        }
+                        Err(m) => {
+                            err.get_or_insert(format!("data.refs.{k}: {m}"));
+                        }
+                    }
+                }
+                Ok(RefsIn(out, err))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReportData {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        const NOT_OBJECT: &str = "data должно быть JSON-объектом";
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ReportData;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("объект data")
+            }
+            fn visit_str<E>(self, _: &str) -> Result<ReportData, E> {
+                Ok(ReportData {
+                    error: Some(NOT_OBJECT.into()),
+                    ..ReportData::default()
+                })
+            }
+            skip_any!(
+                ReportData,
+                ReportData {
+                    error: Some(NOT_OBJECT.into()),
+                    ..ReportData::default()
+                }
+            );
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<ReportData, A::Error> {
+                while a.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ReportData {
+                    error: Some(NOT_OBJECT.into()),
+                    ..ReportData::default()
+                })
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<ReportData, A::Error> {
+                let mut out = ReportData::default();
+                while let Some(k) = a.next_key::<String>()? {
+                    if k != "refs" {
+                        a.next_value::<IgnoredAny>()?;
+                        out.fail(format!(
+                            "data.{}: у отчёта в data только refs {{commits, files, notes, tasks}}",
+                            short(&k)
+                        ));
+                        continue;
+                    }
+                    let RefsIn(refs, err) = a.next_value()?;
+                    out.has_refs = true;
+                    out.refs = refs;
+                    if let Some(m) = err {
+                        out.fail(m);
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// `data` отчёта для записи; нарушение схемы — 422.
+fn check_report_data(data: &ReportData) -> Result<Value, ApiError> {
+    match &data.error {
+        Some(m) => Err(unprocessable(m.clone())),
+        None => Ok(data.to_value()),
+    }
+}
+
+/// Тело запроса отчёта (JSON MCP или часть `meta`) — разбор из байт сразу в типы, без `Value`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportRequest {
+    kind: Option<String>,
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    tags: Bounded<String, { zam_store::entries::TAGS_MAX }>,
+    area: Option<String>,
+    #[serde(default)]
+    data: ReportData,
+    message: Option<String>,
+    images: Option<Bounded<ReportImage, IMAGES_MAX>>,
+    /// Поле записей журнала (ссылки на файлы памяти): у отчёта — 422 после проверки доступа.
+    refs: Option<IgnoredAny>,
 }
 
 /// Разобранный запрос (до проверок доступа: только форма, ошибки — 400).
@@ -863,39 +1137,35 @@ struct Parsed {
     refs_field: bool,
 }
 
-/// Метаданные из JSON-объекта; `json` — тело MCP (поле `images` допустимо).
-fn parse_meta(raw: Value, json: bool) -> Result<Parsed, ApiError> {
-    let Value::Object(mut o) = raw else {
-        return Err(ApiError::BadRequest(
-            "метаданные отчёта — JSON-объект".into(),
-        ));
-    };
-    match o.remove("kind") {
+/// Метаданные из байт JSON; `json` — тело MCP (поле `images` допустимо, `kind` обязателен).
+fn parse_meta(bytes: &[u8], json: bool) -> Result<Parsed, ApiError> {
+    let r: ReportRequest = serde_json::from_slice(bytes)
+        .map_err(|e| ApiError::BadRequest(format!("некорректное тело отчёта: {e}")))?;
+    match r.kind.as_deref() {
         None if !json => {}
-        Some(Value::String(k)) if k == "report" => {}
+        Some("report") => {}
         _ => {
             return Err(ApiError::BadRequest(
                 "метаданные отчёта: kind — только report".into(),
             ));
         }
     }
-    let images = match o.remove("images") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(_) if !json => {
-            return Err(ApiError::BadRequest(
-                "в multipart файлы отчёта — части file, а не поле images".into(),
-            ));
-        }
-        Some(v) => serde_json::from_value(v)
-            .map_err(|e| ApiError::BadRequest(format!("images: [{{name, data}}]: {e}")))?,
-    };
-    let refs_field = o.remove("refs").is_some();
-    let meta = serde_json::from_value(Value::Object(o))
-        .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
+    if !json && r.images.is_some() {
+        return Err(ApiError::BadRequest(
+            "в multipart файлы отчёта — части file, а не поле images".into(),
+        ));
+    }
     Ok(Parsed {
-        meta,
-        images,
-        refs_field,
+        meta: ReportMeta {
+            title: r.title,
+            body: r.body,
+            tags: r.tags.0,
+            area: r.area,
+            data: r.data,
+            message: r.message,
+        },
+        images: r.images.map(|b| b.0).unwrap_or_default(),
+        refs_field: r.refs.is_some(),
     })
 }
 
@@ -1121,7 +1391,7 @@ async fn json_files(
 }
 
 /// Часть `meta` multipart (первая): JSON до предела тела записи плюс запас; больше — 413.
-async fn meta_part(st: &AppState, mp: &mut Multipart) -> Result<Value, ApiError> {
+async fn meta_part(st: &AppState, mp: &mut Multipart) -> Result<Vec<u8>, ApiError> {
     let first = || ApiError::BadRequest("первой должна идти часть meta (JSON отчёта)".into());
     let mut f = next_field(mp).await?.ok_or_else(first)?;
     if f.name() != Some("meta") {
@@ -1137,8 +1407,7 @@ async fn meta_part(st: &AppState, mp: &mut Multipart) -> Result<Value, ApiError>
         }
         buf.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&buf)
-        .map_err(|e| ApiError::BadRequest(format!("часть meta — не JSON: {e}")))
+    Ok(buf)
 }
 
 /// Адрес страницы отчёта в WebUI. Без `server.public_url` и `Host` — путь от корня сервера.
@@ -1166,7 +1435,7 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     // форма JSON — до доступа (как у прочих записей); multipart читается после проверок
     let (mut mp, parsed) = match input {
-        ReportInput::Json(raw) => (None, Some(parse_meta(raw, true)?)),
+        ReportInput::Json(bytes) => (None, Some(parse_meta(&bytes, true)?)),
         ReportInput::Multipart(mp) => (Some(mp), None),
     };
     let sc = space_scope(st, p, headers, space, Mode::Write).await?;
@@ -1187,7 +1456,7 @@ pub async fn create(
         .ok_or_else(|| ApiError::Internal("у пространства решения нет GUID".into()))?;
     let parsed = match (parsed, mp.as_mut()) {
         (Some(p), _) => p,
-        (None, Some(mp)) => parse_meta(meta_part(st, mp).await?, false)?,
+        (None, Some(mp)) => parse_meta(&meta_part(st, mp).await?, false)?,
         (None, None) => unreachable!("вход — JSON или multipart"),
     };
     let Parsed {
@@ -1246,6 +1515,7 @@ pub async fn create(
         .collect();
     let body = analysis.rewrite(&body, &pairs);
     debug_assert_eq!(body.len(), new_len);
+    check_size(st, &body)?;
     let files: Vec<NewReportFile> = stored
         .iter()
         .map(|s| NewReportFile {
@@ -1378,14 +1648,87 @@ mod tests {
         assert_eq!(out, format!("[![a]({l}a.png)]({l}b.png)"));
     }
 
+    fn data(v: Value) -> Result<Value, ApiError> {
+        check_report_data(&serde_json::from_value::<ReportData>(v).unwrap())
+    }
+
     #[test]
     fn data_refs_only() {
-        assert!(check_report_data(&json!({})).is_ok());
-        assert!(check_report_data(&json!({"refs": {"commits": ["a"], "tasks": []}})).is_ok());
-        assert!(check_report_data(&json!({"kind": "x"})).is_err());
-        assert!(check_report_data(&json!({"refs": {"issues": []}})).is_err());
-        assert!(check_report_data(&json!({"refs": {"files": "a"}})).is_err());
-        assert!(check_report_data(&json!([])).is_err());
+        assert_eq!(data(json!({})).unwrap(), json!({}));
+        let ok = json!({"refs": {"commits": ["a"], "tasks": []}});
+        assert_eq!(data(ok.clone()).unwrap(), ok);
+        assert!(data(json!({"kind": "x"})).is_err());
+        assert!(data(json!({"refs": {"issues": []}})).is_err());
+        assert!(data(json!({"refs": {"files": "a"}})).is_err());
+        assert!(data(json!({"refs": {"files": [1]}})).is_err());
+        assert!(data(json!({"refs": []})).is_err());
+        assert!(data(json!([])).is_err());
+        let long: Vec<String> = (0..=REFS_MAX).map(|i| i.to_string()).collect();
+        assert!(data(json!({"refs": {"commits": long}})).is_err());
+        assert!(data(json!({"refs": {"notes": ["я".repeat(REF_MAX_CHARS + 1)]}})).is_err());
+    }
+
+    #[test]
+    fn report_request_typed_no_value() {
+        // лишнее поле — ошибка разбора (400), а не накопление в Value
+        let pad = format!(
+            r#"{{"kind": "report", "title": "t", "pad": [{}0]}}"#,
+            "0,".repeat(1000)
+        );
+        assert!(matches!(
+            parse_meta(pad.as_bytes(), true),
+            Err(ApiError::BadRequest(_))
+        ));
+        // массив data вне схемы пропускается без хранения, нарушение — 422 позже
+        let big = format!(
+            r#"{{"kind": "report", "title": "t", "data": {{"refs": {{"commits": [{}0]}}}}}}"#,
+            "0,".repeat(1000)
+        );
+        let p = parse_meta(big.as_bytes(), true).ok().unwrap();
+        assert!(p.meta.data.refs.is_empty());
+        assert!(check_report_data(&p.meta.data).is_err());
+        let tags = format!(
+            r#"{{"kind": "report", "title": "t", "tags": [{}"a"]}}"#,
+            "\"a\",".repeat(zam_store::entries::TAGS_MAX)
+        );
+        assert!(matches!(
+            parse_meta(tags.as_bytes(), true),
+            Err(ApiError::BadRequest(_))
+        ));
+        let p = parse_meta(br#"{"title": "t", "refs": null}"#, false)
+            .ok()
+            .unwrap();
+        assert!(!p.refs_field);
+        let p = parse_meta(br#"{"title": "t", "refs": {"files": []}}"#, false)
+            .ok()
+            .unwrap();
+        assert!(p.refs_field);
+        assert!(parse_meta(br#"{"title": "t"}"#, true).is_err());
+        assert!(parse_meta(br#"{"title": "t", "images": []}"#, false).is_err());
+    }
+
+    #[test]
+    fn backtick_runs_not_quadratic() {
+        // ~1 МБ незакрытых последовательностей длины 1..N внутри текста ссылки
+        let mut text = String::new();
+        let mut n = 1;
+        while text.len() < 1 << 20 {
+            text.push_str(&"`".repeat(n));
+            text.push('a');
+            n = n % 1400 + 1;
+        }
+        let body = format!("[{text}](a.png)");
+        let t = std::time::Instant::now();
+        let close = match_bracket(body.as_bytes(), 0);
+        assert_eq!(close, Some(body.len() - "(a.png)".len() - 1));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t.elapsed()
+        );
+        // закрытая последовательность скрывает скобку
+        assert_eq!(match_bracket(b"[a `]` b] x", 0), Some(8));
+        assert_eq!(match_bracket(b"[a ``]` b] x", 0), Some(5));
     }
 
     #[test]
@@ -1393,6 +1736,9 @@ mod tests {
         let e = report_refs("![[схема.png]]").unwrap_err().to_string();
         assert!(e.contains("![подпись](путь)"), "{e}");
         assert!(report_refs("см. [[Заметка]]").unwrap().is_empty());
+        // экранированный `!` — текст «!» и вики-ссылка
+        assert!(report_refs("Ура\\![[Заметка]]").unwrap().is_empty());
+        assert!(report_refs("Ура\\\\![[x.png]]").is_err());
         // в коде — пример, не встраивание
         assert!(
             report_refs(
