@@ -39,8 +39,8 @@ use text::{Lang, Rng, paragraph, sentence, wrap};
 
 /// Сид по умолчанию.
 pub const DEFAULT_SEED: u64 = 0x00d0_c5e7_2026_1102;
-/// Версия набора: смена состава или правил генерации.
-pub const CORPUS_VERSION: u32 = 1;
+/// Версия набора: смена состава или правил генерации (2 — допустимые исходы `accept`).
+pub const CORPUS_VERSION: u32 = 2;
 
 /// Аргументы `cargo xtask docs-corpus`.
 #[derive(Debug, clap::Args)]
@@ -86,6 +86,10 @@ pub struct FileEntry {
     pub role: String,
     /// Что ожидается от извлечения (для отчёта).
     pub expect: String,
+    /// Допустимые исходы на сервере (сверка eval): `состояние`, `состояние:<начало причины>`,
+    /// `состояние+<предупреждение>`, `done+ocr` — с `ocr_needed`; любой из списка — успех.
+    #[serde(default)]
+    pub accept: Vec<String>,
 }
 
 /// Факт: дословный текст в известном месте документа.
@@ -156,9 +160,24 @@ impl Out {
                 bytes: data.len() as u64,
                 role: role.to_string(),
                 expect: expect.to_string(),
+                accept: match role {
+                    "scan" => vec!["done+ocr".to_string()],
+                    "large" => vec!["done+truncated: max_chars".to_string()],
+                    _ => vec!["done".to_string()],
+                },
             },
             data,
         ));
+    }
+
+    /// Допустимые исходы файла `path` (враждебные файлы).
+    fn set_accept(&mut self, path: &str, alts: &[&str]) {
+        let e = self
+            .files
+            .iter_mut()
+            .find(|f| f.0.path == path)
+            .unwrap_or_else(|| panic!("нет файла {path}"));
+        e.0.accept = alts.iter().map(|s| s.to_string()).collect();
     }
 
     fn fact(&mut self, id: &str, file: &str, locator: String, evidence: &str) {
@@ -229,7 +248,6 @@ pub fn write(dir: &Path, seed: u64, profile: Profile) -> Result<Manifest> {
 }
 
 /// Манифест набора без записи на диск (тесты).
-#[cfg(test)]
 pub fn manifest_in_memory(seed: u64, profile: Profile) -> Manifest {
     let o = generate(seed, profile);
     Manifest {
@@ -1288,12 +1306,25 @@ mod tests {
 
     /// Один сид — одинаковые байты каждого файла и одинаковый манифест; другой сид — другие
     /// файлы. Малый набор (`small`): те же генераторы, меньше строк и страниц.
+    /// Сводный sha256 манифеста `manifest_in_memory(7, малый набор)`.
+    const MANIFEST_SHA256_SEED7_SMALL: &str =
+        "48fba1dfbf034e40ebed143cc61b5a14f024e5213236d9be0376d9e66e62070c";
+
     #[test]
     fn docs_corpus_deterministic() {
         let p = Profile {
             small: true,
             large: false,
         };
+        // эталон: сводный sha256 манифеста малого набора (sha256 каждого файла входит в него) —
+        // одинаков на Windows и Linux (CI), иначе набор зависит от платформы
+        let m = manifest_in_memory(7, p);
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            hex(&Sha256::digest(json.as_bytes())),
+            MANIFEST_SHA256_SEED7_SMALL,
+            "набор изменился: если намеренно — обновите эталон и CORPUS_VERSION"
+        );
         let a = generate(7, p);
         let b = generate(7, p);
         let c = generate(8, p);

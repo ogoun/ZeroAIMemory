@@ -39,7 +39,9 @@ zam-docs = { path = "../crates/zam-docs", features = ["pdfium"] }
 zstd.workspace = true
 # A/B PDF (задача 10 M5): чисто-Rust `pdf_oxide` против pdfium — только в xtask и только за фичей
 # `pdf-oxide` (`cargo run -p xtask --release --features pdf-oxide -- eval --docs --pdf-backend
-# pdf_oxide`): обычная сборка xtask и продукт его не содержат. Аудит — журнал M5, задача 10:
+# pdf_oxide`): обычная сборка xtask и бинарники продукта его не компилируют; в общем
+# Cargo.lock — только добавленные пакеты (версии прежних не меняются); в CI фича не
+# собирается. Аудит — журнал M5, задача 10:
 # MIT OR Apache-2.0, 0.3.78 от 2026-09-08, без фич по умолчанию (icc, legacy-crypto)
 pdf_oxide = { version = "=0.3.78", default-features = false, optional = true }
 

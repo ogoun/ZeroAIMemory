@@ -70,7 +70,40 @@ fn one_page_objs(extra_page: &str, content: &str) -> Vec<String> {
     ]
 }
 
+/// Допустимые исходы враждебных файлов на сервере (сверка eval, спецификация M5 §7).
+const ACCEPT: &[(&str, &[&str])] = &[
+    (
+        "hostile/zip-bomb.docx",
+        &["done+truncated: max_ratio", "failed:parse_error"],
+    ),
+    ("hostile/xxe.docx", &["failed:parse_error: xml"]),
+    ("hostile/billion-laughs.xlsx", &["failed:parse_error: xml"]),
+    (
+        "hostile/deep-nesting.docx",
+        &["done+truncated: max_xml_depth", "failed:parse_error"],
+    ),
+    ("hostile/broken.pdf", &["failed:parse_error: pdf"]),
+    (
+        "hostile/truncated.pdf",
+        &["done", "failed:parse_error: pdf"],
+    ),
+    ("hostile/js-action.pdf", &["done"]),
+    ("hostile/deep-array.pdf", &["done", "failed:parse_error"]),
+    ("hostile/glyph-flood.pdf", &["done+truncated: page_chars"]),
+    ("hostile/huge-image.pdf", &["done+ocr"]),
+    ("hostile/truncated.docx", &["failed:parse_error: zip"]),
+];
+
 pub fn all(o: &mut Out, seed: u64, p: Profile) {
+    files(o, seed, p);
+    for (path, alts) in ACCEPT {
+        if o.files.iter().any(|f| f.0.path == *path) {
+            o.set_accept(path, alts);
+        }
+    }
+}
+
+fn files(o: &mut Out, seed: u64, p: Profile) {
     let mut r = Rng::fork(seed, "hostile");
     // zip-бомба: 1 ГиБ (малый набор — 32 МиБ) пробелов в одной записи
     o.add(

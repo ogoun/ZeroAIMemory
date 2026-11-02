@@ -1,6 +1,6 @@
 # Eval документов: fts без модели (cpu, PDF — pdfium)
 
-Код — `251a72b+dirty.3fd008d5`, 2026-11-02; набор `eval/docs/` (сид 0xd0c5e720261102), запросов 45; заметки eval/corpus: да. Извлечение 3 с, индексация после него 0 с. Сервер жив после набора: да.
+Код — `3403134+dirty.ee3bb400`, 2026-11-02; набор `eval/docs/` (сид 0xd0c5e720261102), запросов 45; заметки eval/corpus: да. Извлечение 4 с, индексация после него 0 с. Сервер жив после набора: да.
 
 recall@5 — файл факта в первых 5; MRR@10 — по файлу; loc@5 — в первых 5 есть карточка файла, `/read` по `locator` которой содержит `evidence`; точность `locator` и совпадение с эталоном — среди найденных в первых 5 (первая карточка файла).
 
@@ -16,8 +16,8 @@ recall@5 — файл факта в первых 5; MRR@10 — по файлу; 
 | pptx | 5 | 0.600 [0.200–1.000] | 0.800 [0.400–1.000] | 0.600 [0.200–1.000] | 0.600 [0.200–1.000] | 1.000 [1.000–1.000] | 1.000 [1.000–1.000] |
 | xlsx | 8 | 0.625 [0.250–0.875] | 0.875 [0.625–1.000] | 0.646 [0.292–0.896] | 0.500 [0.125–0.875] | 0.800 [0.400–1.000] | 0.800 [0.400–1.000] |
 
-Латентность запросов набора (клиент): p50 8.3 мс, p95 18.1 мс.
-Основной набор (326 запросов, второй проход): без вложений p50 7.6 / p95 14.2 мс, с вложениями p50 10.2 / p95 17.2 мс.
+Латентность запросов набора (клиент): p50 8.1 мс, p95 16.0 мс.
+Основной набор (326 запросов, второй проход): без вложений p50 8.0 / p95 14.0 мс, с вложениями p50 10.5 / p95 17.0 мс.
 
 ## Запросы
 
@@ -71,43 +71,45 @@ recall@5 — файл факта в первых 5; MRR@10 — по файлу; 
 
 ## Документы
 
-| Файл | Роль | Ожидание | Состояние | Причина | ocr_needed | с до конца |
-|---|---|---|---|---|---|---:|
-| `files/regulations-ru.docx` | content | done | done |  | false | 2.6 |
-| `files/onboarding-en.docx` | content | done | done |  | false | 2.6 |
-| `files/inventory.xlsx` | content | done | done |  | false | 2.5 |
-| `files/roadmap.pptx` | content | done | done |  | false | 2.5 |
-| `files/onecol-en.pdf` | content | done | done |  | false | 2.4 |
-| `files/twocol-en.pdf` | content | done | done |  | false | 2.4 |
-| `files/cyrillic-ru.pdf` | content | done | done |  | false | 1.5 |
-| `files/cjk-zh.pdf` | content | done | done |  | false | 1.4 |
-| `files/book-500.pdf` | content | done | done |  | false | 1.3 |
-| `files/scan.pdf` | scan | done, ocr_needed | done |  | true | 1.3 |
-| `hostile/zip-bomb.docx` | hostile | truncated: max_ratio \| failed | done |  | false | 1.2 |
-| `hostile/xxe.docx` | hostile | failed: parse_error (DTD) | failed | parse_error: xml (word/document.xml) | false | 1.1 |
-| `hostile/billion-laughs.xlsx` | hostile | failed: parse_error (DTD) | failed | parse_error: xml (xl/sharedStrings.xml) | false | 1.1 |
-| `hostile/deep-nesting.docx` | hostile | failed: parse_error \| truncated: max_xml_depth | done |  | false | 1.1 |
-| `hostile/broken.pdf` | hostile | failed: parse_error | failed | parse_error: pdf | false | 1.0 |
-| `hostile/truncated.pdf` | hostile | done (восстановление xref) \| failed | failed | parse_error: pdf | false | 1.0 |
-| `hostile/js-action.pdf` | hostile | done, JS не исполняется | done |  | false | 0.9 |
-| `hostile/deep-array.pdf` | hostile | done \| failed: parse_error (не parse_crash) | done |  | false | 0.9 |
-| `hostile/glyph-flood.pdf` | hostile | done, truncated: page_chars | done |  | false | 1.1 |
-| `hostile/huge-image.pdf` | hostile | done (текста нет); превью thumb — parse_oom \| parse_crash | done |  | true | 0.9 |
-| `hostile/truncated.docx` | hostile | failed: parse_error (zip) | unsupported |  | false | 0.0 |
+Сверка с допустимыми исходами манифеста: **21 из 21**.
 
-Кэш извлечения `blob_extract`: 20 строк, zstd(JSON) 0.73 МБ, JSON 5.15 МБ (сжатие 7.1×).
+| Файл | Роль | Допустимо | Состояние | Причина | Предупреждения | ocr_needed | Сверка | с до конца |
+|---|---|---|---|---|---|---|---|---:|
+| `files/regulations-ru.docx` | content | done | done |  |  | false | да | 4.0 |
+| `files/onboarding-en.docx` | content | done | done |  |  | false | да | 3.9 |
+| `files/inventory.xlsx` | content | done | done |  |  | false | да | 3.8 |
+| `files/roadmap.pptx` | content | done | done |  |  | false | да | 3.8 |
+| `files/onecol-en.pdf` | content | done | done |  |  | false | да | 3.8 |
+| `files/twocol-en.pdf` | content | done | done |  |  | false | да | 3.7 |
+| `files/cyrillic-ru.pdf` | content | done | done |  |  | false | да | 3.7 |
+| `files/cjk-zh.pdf` | content | done | done |  |  | false | да | 3.6 |
+| `files/book-500.pdf` | content | done | done |  |  | false | да | 2.7 |
+| `files/scan.pdf` | scan | done+ocr | done |  |  | true | да | 2.7 |
+| `hostile/zip-bomb.docx` | hostile | done+truncated: max_ratio / failed:parse_error | done |  | truncated: max_ratio | false | да | 2.5 |
+| `hostile/xxe.docx` | hostile | failed:parse_error: xml | failed | parse_error: xml (word/document.xml) | parse_error: xml (word/document.xml) | false | да | 2.5 |
+| `hostile/billion-laughs.xlsx` | hostile | failed:parse_error: xml | failed | parse_error: xml (xl/sharedStrings.xml) | parse_error: xml (xl/sharedStrings.xml) | false | да | 2.5 |
+| `hostile/deep-nesting.docx` | hostile | done+truncated: max_xml_depth / failed:parse_error | done |  | truncated: max_ratio; truncated: max_xml_depth | false | да | 2.4 |
+| `hostile/broken.pdf` | hostile | failed:parse_error: pdf | failed | parse_error: pdf | parse_error: pdf | false | да | 2.4 |
+| `hostile/truncated.pdf` | hostile | done / failed:parse_error: pdf | failed | parse_error: pdf | parse_error: pdf | false | да | 2.3 |
+| `hostile/js-action.pdf` | hostile | done | done |  |  | false | да | 2.3 |
+| `hostile/deep-array.pdf` | hostile | done / failed:parse_error | done |  |  | false | да | 2.2 |
+| `hostile/glyph-flood.pdf` | hostile | done+truncated: page_chars | done |  | truncated: page_chars | false | да | 2.2 |
+| `hostile/huge-image.pdf` | hostile | done+ocr | done |  |  | true | да | 0.1 |
+| `hostile/truncated.docx` | hostile | failed:parse_error: zip | failed | parse_error: zip | parse_error: zip | false | да | 0.0 |
+
+Кэш извлечения `blob_extract`: 21 строк, zstd(JSON) 0.73 МБ, JSON 5.15 МБ (сжатие 7.1×).
 
 ## Превью
 
 | Файл | Что | HTTP | холодный, мс | из кэша, мс | Подробности |
 |---|---|---:|---:|---:|---|
-| `files/book-500.pdf` | thumb стр. 1, 256 px | 200 | 36 | 7 |  |
-| `files/inventory.xlsx` | sheet 1, строки 1–100 | 200 | 70 | 9 | total_rows 10000 |
-| `files/inventory.xlsx` | sheet 2, строки 1–100 | 200 | 67 | 7 | total_rows 10000 |
-| `files/inventory.xlsx` | sheet 3, строки 1–100 | 200 | 67 | 9 | total_rows 10000 |
+| `files/book-500.pdf` | thumb стр. 1, 256 px | 200 | 45 | 8 |  |
+| `files/inventory.xlsx` | sheet 1, строки 1–100 | 200 | 70 | 8 | total_rows 10000 |
+| `files/inventory.xlsx` | sheet 2, строки 1–100 | 200 | 65 | 8 | total_rows 10000 |
+| `files/inventory.xlsx` | sheet 3, строки 1–100 | 200 | 70 | 9 | total_rows 10000 |
 | `hostile/broken.pdf` | thumb стр. 1, 256 px | 422 | 3 | 1 | превью не построено: parse_error: pdf |
-| `hostile/deep-array.pdf` | thumb стр. 1, 256 px | 200 | 29 | 2 |  |
-| `hostile/glyph-flood.pdf` | thumb стр. 1, 256 px | 200 | 21 | 2 |  |
-| `hostile/huge-image.pdf` | thumb стр. 1, 256 px | 200 | 1072 | 3 |  |
-| `hostile/js-action.pdf` | thumb стр. 1, 256 px | 200 | 3 | 2 |  |
+| `hostile/deep-array.pdf` | thumb стр. 1, 256 px | 200 | 29 | 54 |  |
+| `hostile/glyph-flood.pdf` | thumb стр. 1, 256 px | 200 | 22 | 1 |  |
+| `hostile/huge-image.pdf` | thumb стр. 1, 256 px | 200 | 1372 | 2 |  |
+| `hostile/js-action.pdf` | thumb стр. 1, 256 px | 200 | 4 | 1 |  |
 | `hostile/truncated.pdf` | thumb стр. 1, 256 px | 422 | 2 | 1 | превью не построено: parse_error: pdf |

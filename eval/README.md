@@ -343,7 +343,8 @@ session-start`) в каталоге проекта `target/eval/<прогон>/p
 
 `cargo xtask docs-corpus [--seed N] [--large]` пишет `eval/docs/` (спецификация M5 §6; код —
 `xtask/src/docs_corpus*`). Документы — свои, синтетические, детерминированные: один сид — одинаковые
-байты на любой платформе (тест `docs_corpus_deterministic`); наполнитель — предложения из области
+байты на любой платформе (тест `docs_corpus_deterministic` сверяет сводный sha256 манифеста малого
+набора с эталоном — CI Windows и Linux ловит расхождение); наполнитель — предложения из области
 «эксплуатация предприятия» (трудные соседи фактов), в известные места вставлены **факты**
 (`manifest.json`: файл, ожидаемый `locator`, дословное `evidence`).
 
@@ -367,16 +368,23 @@ session-start`) в каталоге проекта `target/eval/<прогон>/p
    целые строки таблиц (все ячейки строки — в одной строке текста, слева направо), факт на своей
    странице, время (книга — медиана 3 повторов), пиковая память процесса, исход враждебных
    (`ok`/`error`/`crash`/`timeout`). Не-PDF набора (и `large/`) — время `zam_docs::extract` в
-   процессе. `pdf_oxide` — только в сборке `cargo run -p xtask --release --features pdf-oxide`.
+   процессе. `pdf_oxide` — только в сборке `cargo run -p xtask --release --features pdf-oxide`
+   (в CI фича не собирается: код A/B за ней проверяется вручную, `cargo clippy -p xtask
+   --all-targets --features pdf-oxide`).
+   Перед прогоном `eval --docs` сверяет sha256 файлов набора с манифестом и манифест — с
+   генератором сборки (устаревший набор — ошибка «перегенерируйте»), после извлечения у
+   `pdf_oxide` — что кэш не перезаписан pdfium сервера.
 2. **Сервер**: корпус заметок `eval/corpus` (кроме `--docs-only`) → латентность основного набора
    без вложений → заметки-владельцы (`eval-docs/…`) и загрузка файлов `POST /blobs` (у
    `pdf_oxide` кэш `blob_extract` PDF заполняется его текстом до загрузки — остальной конвейер
    тот же) → ожидание извлечения и индексации → запросы `docs-queries.toml` (как основной набор:
    `scope.solution`, `mode = notes`, top 10) и второй раз с `filters.kinds = ["attachment"]` →
-   латентность основного набора с вложениями → исходы враждебных файлов, превью листов XLSX и
-   миниатюр (холодный и из кэша), объём кэша извлечения.
+   латентность основного набора с вложениями → исходы документов (состояние, причина,
+   предупреждения извлечения из кэша `blob_extract`) и сверка с допустимыми исходами манифеста
+   (`accept`), превью листов XLSX и миниатюр (холодный и из кэша), объём кэша извлечения.
 
-Метрики (бутстреп по запросам, 2000 выборок): **recall@5** — карточка файла факта в первых 5;
+Метрики (бутстреп по запросам, 2000 выборок; парные разности прогонов — `--compare`, 10 000
+выборок): **recall@5** — карточка файла факта в первых 5;
 **recall@5 (одни вложения)** — то же при `filters.kinds = ["attachment"]`; **MRR@10**; **loc@5** — в
 первых 5 есть карточка файла, `/read` по `locator` которой содержит `evidence` (агент получит
 нужное место); **точность `locator`** — среди найденных в первых 5, по первой карточке файла;
@@ -394,6 +402,8 @@ cargo xtask eval --docs --device cuda --mode hybrid --prefix m5   # fp16 CUDA
 cargo xtask eval --docs --device cuda --mode hybrid --reuse --set search.attach_prefetch=60 --label pf60
 cargo run -p xtask --release --features pdf-oxide -- eval --docs --ab-only --pdf-backend pdf_oxide --prefix m5
 cargo xtask eval --docs --mode fts --docs-only --large --label large --prefix m5   # сроки больших файлов
+cargo xtask eval --docs --prefix m5 --label pdf \
+  --compare results/A.json --compare results/B.json --docs-format pdf   # парные разности B − A
 ```
 
 ## Словарь (M4.5)

@@ -197,6 +197,9 @@ pub struct EvalArgs {
     /// --docs: также большие файлы large/ (docs-corpus --large): сроки разбора сервером
     #[arg(long, requires = "docs")]
     pub large: bool,
+    /// --docs --compare: только запросы к файлам этого формата (pdf, docx, xlsx, pptx)
+    #[arg(long, value_name = "FORMAT", requires = "docs")]
+    pub docs_format: Option<String>,
 }
 
 /// Каталоги и файлы набора.

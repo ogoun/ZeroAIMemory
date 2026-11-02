@@ -42,7 +42,7 @@ use super::report::{est, write_pair};
 use super::run::{RunSpec, Session, default_model, git_rev, parse_sets, server_dir, today};
 use super::{EvalArgs, Mode, Paths, load_set};
 use crate::docs_corpus::{Fact, Manifest};
-use crate::smoke::{agent_with, api_timeout};
+use crate::smoke::agent_with;
 
 /// Глубина выдачи.
 const TOP_K: usize = 10;
@@ -480,6 +480,14 @@ pub struct DocState {
     pub state: String,
     pub error: Option<String>,
     pub ocr_needed: bool,
+    /// Предупреждения извлечения (`truncated: <лимит>`, `skipped: …`) — из кэша `blob_extract`.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Допустимые исходы манифеста и сверка с ними.
+    #[serde(default)]
+    pub accept: Vec<String>,
+    #[serde(default)]
+    pub pass: bool,
     /// От загрузки до конечного состояния, с (точность опроса 0,25 с; файлы идут в очереди
     /// `docs.workers` слотов).
     pub secs: f64,
@@ -625,10 +633,15 @@ fn user_db(data: &Path) -> Result<PathBuf> {
 
 /// Кэш извлечения `blob_extract` для PDF набора — текстом бэкенда `backend` (A/B без правки
 /// сервера: найдя кэш, конвейер не разбирает файл, а режет и индексирует сохранённые единицы).
-fn inject_extracts(db: &Path, dir: &Path, m: &Manifest, backend: PdfBackend) -> Result<usize> {
+fn inject_extracts(
+    db: &Path,
+    dir: &Path,
+    m: &Manifest,
+    backend: PdfBackend,
+) -> Result<Vec<(String, Vec<u8>)>> {
     let c = rusqlite::Connection::open(db)?;
     c.busy_timeout(Duration::from_secs(30))?;
-    let mut n = 0;
+    let mut out = Vec::new();
     for f in m
         .files
         .iter()
@@ -663,9 +676,116 @@ fn inject_extracts(db: &Path, dir: &Path, m: &Manifest, backend: PdfBackend) -> 
                     .to_string()
             ],
         )?;
-        n += 1;
+        out.push((f.sha256.clone(), blob));
     }
-    Ok(n)
+    Ok(out)
+}
+
+/// После извлечения строки кэша, заполненные бэкендом A/B, — те же (сервер их не разобрал
+/// заново pdfium): иначе прогон `pdf_oxide` молча стал бы прогоном pdfium.
+fn verify_injected(db: &Path, injected: &[(String, Vec<u8>)]) -> Result<()> {
+    let c = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    c.busy_timeout(Duration::from_secs(30))?;
+    for (sha, blob) in injected {
+        let got: Option<Vec<u8>> = c
+            .query_row(
+                "SELECT units FROM blob_extract WHERE blob_sha256 = ?1 AND extractor_version = ?2",
+                rusqlite::params![sha, zam_docs::EXTRACTOR_VERSION],
+                |r| r.get(0),
+            )
+            .ok();
+        if got.as_deref() != Some(&blob[..]) {
+            bail!("кэш извлечения {sha} перезаписан сервером: прогон бэкенда A/B недействителен");
+        }
+    }
+    Ok(())
+}
+
+/// Предупреждения извлечения документа по кэшу `blob_extract` (сервер их не отдаёт в API).
+fn extract_warnings(db: &Path, sha: &str) -> Vec<String> {
+    let Ok(c) =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return Vec::new();
+    };
+    let _ = c.busy_timeout(Duration::from_secs(30));
+    c.query_row(
+        "SELECT warnings FROM blob_extract WHERE blob_sha256 = ?1 AND extractor_version = ?2",
+        rusqlite::params![sha, zam_docs::EXTRACTOR_VERSION],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|w| serde_json::from_str(&w).ok())
+    .unwrap_or_default()
+}
+
+/// Исход документа подходит под одно из допустимых (`FileEntry::accept`).
+pub fn accepted(alts: &[String], d: &DocState) -> bool {
+    alts.iter().any(|alt| {
+        let (head, warn) = match alt.split_once('+') {
+            Some((h, w)) => (h, Some(w)),
+            None => (alt.as_str(), None),
+        };
+        let (state, reason) = match head.split_once(':') {
+            Some((st, r)) => (st, Some(r.trim())),
+            None => (head, None),
+        };
+        d.state == state
+            && reason.is_none_or(|r| d.error.as_deref().is_some_and(|e| e.starts_with(r)))
+            && match warn {
+                Some("ocr") => d.ocr_needed,
+                Some(w) => d.warnings.iter().any(|x| x == w),
+                None => true,
+            }
+    })
+}
+
+/// Набор на диске совпадает с манифестом (sha256 каждого файла), манифест — с генератором этой
+/// сборки при том же сиде: устаревший набор — ошибка, а не тихо неверный прогон.
+pub fn verify_corpus(dir: &Path, m: &Manifest) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let regen = "перегенерируйте набор: cargo xtask docs-corpus (с --large, если он был)";
+    for f in &m.files {
+        let data = fs::read(dir.join(&f.path))
+            .with_context(|| format!("{}: нет файла; {regen}", f.path))?;
+        let sha: String = Sha256::digest(&data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if sha != f.sha256 {
+            bail!("{}: sha256 не совпадает с манифестом; {regen}", f.path);
+        }
+    }
+    let profile = crate::docs_corpus::Profile {
+        small: m.small,
+        large: m.files.iter().any(|f| f.role == "large"),
+    };
+    if crate::docs_corpus::manifest_in_memory(m.seed, profile) != *m {
+        bail!(
+            "манифест не совпадает с генератором этой сборки (сид {:#x}); {regen}",
+            m.seed
+        );
+    }
+    Ok(())
+}
+
+/// `POST` JSON одним агентом с keep-alive: прогон делает тысячи запросов, и новое соединение на
+/// каждый (как у `smoke::api_timeout`) исчерпывало эфемерные порты Windows (`os error 10048`,
+/// раунд правок 1 задачи 10). Латентность — без установки соединения, одинаково до и после
+/// загрузки вложений.
+fn post_json(s: &Session, path: &str, body: &Value) -> Result<(u16, Value)> {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let a = AGENT.get_or_init(|| agent_with(REQ_TIMEOUT));
+    let mut r = a
+        .post(format!("{}{path}", s.base))
+        .header("Authorization", format!("Bearer {}", s.token()))
+        .content_type("application/json")
+        .send(body.to_string())?;
+    let st = r.status().as_u16();
+    let t = r.body_mut().read_to_string()?;
+    let v =
+        serde_json::from_str(&t).with_context(|| format!("{path}: HTTP {st}, ответ не JSON"))?;
+    Ok((st, v))
 }
 
 /// Тело поиска (как у основного набора: решение eval с Knowledge, без Rules).
@@ -694,13 +814,7 @@ fn search_attachments(s: &Session, text: &str, mode: Mode) -> Result<Value> {
 
 fn search_with(s: &Session, body: &Value, text: &str, mode: Mode) -> Result<(Value, f64)> {
     let t0 = Instant::now();
-    let (st, v) = api_timeout(
-        &s.base,
-        s.token(),
-        "/api/v1/search",
-        Some(body),
-        REQ_TIMEOUT,
-    )?;
+    let (st, v) = post_json(s, "/api/v1/search", body)?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     if st != 200 {
         bail!("поиск «{text}»: HTTP {st}: {v}");
@@ -729,7 +843,7 @@ fn read_back(s: &Session, attachment: &str, locator: &str) -> Result<String> {
         "items": [{"id": format!("d:{attachment}"), "locator": locator}],
         "budget_tokens": 1_000_000,
     });
-    let (st, v) = api_timeout(&s.base, s.token(), "/api/v1/read", Some(&body), REQ_TIMEOUT)?;
+    let (st, v) = post_json(s, "/api/v1/read", &body)?;
     if st != 200 {
         bail!("/read d:{attachment} {locator}: HTTP {st}: {v}");
     }
@@ -942,11 +1056,14 @@ fn run_server(
                 v["id"].as_str().context("id узла")?.to_string(),
             );
         }
-        if a.pdf_backend != PdfBackend::Pdfium {
+        let injected = if a.pdf_backend != PdfBackend::Pdfium {
             let db = user_db(&s.data)?;
-            let n = inject_extracts(&db, dir, m, a.pdf_backend)?;
-            println!("кэш извлечения {}: {n} PDF", a.pdf_backend.as_str());
-        }
+            let v = inject_extracts(&db, dir, m, a.pdf_backend)?;
+            println!("кэш извлечения {}: {} PDF", a.pdf_backend.as_str(), v.len());
+            v
+        } else {
+            Vec::new()
+        };
         // большие файлы — по одному в конце: их время до `done` — время разбора без очереди
         let (big, rest): (
             Vec<&crate::docs_corpus::FileEntry>,
@@ -975,20 +1092,27 @@ fn run_server(
             done.extend(wait_extracted(&mut s, &one)?);
             owners.extend(one);
         }
+        let db = user_db(&s.data)?;
+        verify_injected(&db, &injected)?;
         let extract_secs = t0.elapsed().as_secs_f64();
         let states: Vec<DocState> = files
             .iter()
             .map(|f| {
                 let (d, secs) = done.get(&f.path).cloned().unwrap_or((Value::Null, 0.0));
-                DocState {
+                let mut st = DocState {
                     file: f.path.clone(),
                     role: f.role.clone(),
                     expect: f.expect.clone(),
                     state: d["extract_state"].as_str().unwrap_or("?").to_string(),
                     error: d["extract_error"].as_str().map(String::from),
                     ocr_needed: d["ocr_needed"] == true,
+                    warnings: extract_warnings(&db, &f.sha256),
+                    accept: f.accept.clone(),
+                    pass: false,
                     secs,
-                }
+                };
+                st.pass = accepted(&st.accept, &st);
+                st
             })
             .collect();
         let doc_ids: BTreeMap<String, (String, String)> = files
@@ -1260,16 +1384,24 @@ pub fn docs_md(r: &DocsReport) -> String {
             q.top5.join("; ").replace('|', "\\|"),
         ));
     }
-    s.push_str("\n## Документы\n\n| Файл | Роль | Ожидание | Состояние | Причина | ocr_needed | с до конца |\n|---|---|---|---|---|---|---:|\n");
+    let passed = r.docs.iter().filter(|d| d.pass).count();
+    s.push_str(&format!(
+        "\n## Документы\n\nСверка с допустимыми исходами манифеста: **{passed} из {}**.\n\n\
+         | Файл | Роль | Допустимо | Состояние | Причина | Предупреждения | ocr_needed | Сверка | с до конца |\n\
+         |---|---|---|---|---|---|---|---|---:|\n",
+        r.docs.len()
+    ));
     for d in &r.docs {
         s.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {:.1} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {:.1} |\n",
             d.file,
             d.role,
-            d.expect.replace('|', "\\|"),
+            d.accept.join(" / "),
             d.state,
             d.error.as_deref().unwrap_or(""),
+            d.warnings.join("; "),
             d.ocr_needed,
+            if d.pass { "да" } else { "**нет**" },
             d.secs
         ));
     }
@@ -1301,6 +1433,97 @@ pub fn docs_md(r: &DocsReport) -> String {
     s
 }
 
+/// Выборок бутстрепа парных разностей (как у гейта качества M4).
+pub const PAIRED_BOOTSTRAP: usize = 10_000;
+
+/// Значения метрики по запросам прогона (JSON `eval/results/…-docs-…`): id → значение;
+/// `format` — только запросы этого формата файла факта.
+fn per_query(v: &Value, metric: &str, format: Option<&str>) -> BTreeMap<String, f64> {
+    v["queries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|q| format.is_none_or(|f| q["format"] == f))
+        .map(|q| {
+            let rank = q["rank"].as_u64();
+            let x = match metric {
+                "recall5" => f64::from(u8::from(rank.is_some_and(|k| k <= 5))),
+                "mrr10" => rank.map_or(0.0, |k| 1.0 / k as f64),
+                _ => f64::from(u8::from(q["loc5"] == true)),
+            };
+            (q["id"].as_str().unwrap_or_default().to_string(), x)
+        })
+        .collect()
+}
+
+/// `cargo xtask eval --docs --compare A --compare B [--compare C --compare D …]`: парные
+/// разности B − A (D − C, …) recall@5, MRR@10 и loc@5 по общим запросам, бутстреп
+/// [`PAIRED_BOOTSTRAP`]; `--docs-format pdf` — только запросы к PDF. Итог — в stdout и
+/// `results/<дата>-<префикс>-docs-compare[-метка].md`.
+fn compare_runs(a: &EvalArgs, p: &Paths) -> Result<()> {
+    if !a.compare.len().is_multiple_of(2) {
+        bail!("--compare: пары файлов «база новый»");
+    }
+    let fmt = a.docs_format.as_deref();
+    let mut md = format!(
+        "# Парные разности прогонов eval документов ({})\n\nБутстреп по запросам, {} выборок \
+         (`metrics::paired_diff_with`); запросы — общие у пары{}.\n\n\
+         | Новый − база | n | Δ recall@5 | Δ MRR@10 | Δ loc@5 |\n|---|---:|---|---|---|\n",
+        today(),
+        PAIRED_BOOTSTRAP,
+        fmt.map(|f| format!(", только формат `{f}`"))
+            .unwrap_or_default()
+    );
+    for pair in a.compare.chunks(2) {
+        let load = |f: &PathBuf| -> Result<Value> {
+            Ok(serde_json::from_str(
+                &fs::read_to_string(f).with_context(|| f.display().to_string())?,
+            )?)
+        };
+        let (base, new) = (load(&pair[0])?, load(&pair[1])?);
+        let mut cells = Vec::new();
+        let mut n = 0;
+        for metric in ["recall5", "mrr10", "loc5"] {
+            let (x, y) = (per_query(&base, metric, fmt), per_query(&new, metric, fmt));
+            let ids: Vec<&String> = x.keys().filter(|k| y.contains_key(*k)).collect();
+            n = ids.len();
+            let xa: Vec<f64> = ids.iter().map(|k| x[*k]).collect();
+            let ya: Vec<f64> = ids.iter().map(|k| y[*k]).collect();
+            let e = super::metrics::paired_diff_with(&xa, &ya, PAIRED_BOOTSTRAP);
+            cells.push(super::report::diff(&e));
+        }
+        let name = |f: &PathBuf| {
+            f.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        md.push_str(&format!(
+            "| `{}` − `{}` | {n} | {} |\n",
+            name(&pair[1]),
+            name(&pair[0]),
+            cells.join(" | ")
+        ));
+    }
+    print!("{md}");
+    let prefix = a
+        .prefix
+        .as_deref()
+        .map(|x| format!("{x}-"))
+        .unwrap_or_default();
+    let label = a
+        .label
+        .as_deref()
+        .map(|l| format!("-{l}"))
+        .unwrap_or_default();
+    fs::create_dir_all(&p.results)?;
+    let out = p
+        .results
+        .join(format!("{}-{prefix}docs-compare{label}.md", today()));
+    fs::write(&out, md)?;
+    println!("{}", out.display());
+    Ok(())
+}
+
 /// Точка входа `cargo xtask eval --docs`.
 pub fn run(a: &EvalArgs, p: &Paths) -> Result<()> {
     let dir = a
@@ -1314,6 +1537,10 @@ pub fn run(a: &EvalArgs, p: &Paths) -> Result<()> {
         .unwrap_or_else(|| p.repo.join("eval").join("docs-queries.toml"));
     let qs = load_queries(&qpath)?;
     validate(&m, &qs)?;
+    if !a.compare.is_empty() {
+        return compare_runs(a, p);
+    }
+    verify_corpus(&dir, &m)?;
     println!(
         "набор документов: {} файлов, фактов {}, запросов {}",
         m.files.len(),
