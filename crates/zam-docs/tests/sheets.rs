@@ -432,11 +432,27 @@ fn csv_semicolon_cp1251() {
     let (b, _, bad) = encoding_rs::WINDOWS_1251.encode(src);
     assert!(!bad);
     assert!(std::str::from_utf8(&b).is_err());
-    assert_eq!(
-        sniff(&b, "data.csv"),
-        None,
-        "не UTF-8 — расширение не решает"
-    );
+    // ТЗ §5.2/§8.2: CSV/TSV в Windows-1251 и UTF-16 — вид CSV по расширению (финальное ревью
+    // M5); прочий текст — только UTF-8, двоичное с нулевыми байтами — не CSV
+    let file = |b: &[u8], name: &str| {
+        zam_docs::sniff_file(std::io::Cursor::new(b.to_vec()), name, &Limits::default()).unwrap()
+    };
+    for name in ["data.csv", "data.TSV"] {
+        assert_eq!(sniff(&b, name), Some(DocKind::Csv), "{name}");
+        assert_eq!(file(&b, name), Some(DocKind::Csv), "{name}");
+    }
+    assert_eq!(sniff(&b, "data.txt"), None, "текст не CSV — только UTF-8");
+    assert_eq!(sniff(b"a;b\0\x01\x02", "bin.csv"), None);
+    assert_eq!(sniff(b"\xC0;b\x07\n", "ctl.csv"), None);
+    let mut le = vec![0xFF, 0xFE];
+    le.extend(src.encode_utf16().flat_map(u16::to_le_bytes));
+    let mut be = vec![0xFE, 0xFF];
+    be.extend(src.encode_utf16().flat_map(u16::to_be_bytes));
+    for bytes in [&le, &be] {
+        assert_eq!(file(bytes, "data.csv"), Some(DocKind::Csv));
+        let x = run(DocKind::Csv, bytes, &Limits::default());
+        assert!(x.units[0].text.contains("Санкт-Петербург, центр"), "{x:?}");
+    }
     let x = run(DocKind::Csv, &b, &Limits::default());
     assert_eq!(
         x.units[0].text,

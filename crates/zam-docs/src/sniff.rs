@@ -45,7 +45,13 @@ pub fn sniff(bytes: &[u8], name: &str) -> Option<DocKind> {
         | "ini" | "cfg" | "conf" | "xml" | "html" | "htm" | "rst" | "adoc" => Some(DocKind::Text),
         _ => None,
     };
-    let is_text = looks_text(bytes);
+    // CSV/TSV — ещё UTF-16 с BOM и однобайтовые кодировки (Windows-1251): их раскодирует
+    // разборщик CSV (`csv::decode`); прочий текст — только UTF-8
+    let is_text = if text_kind == Some(DocKind::Csv) {
+        looks_csv_text(bytes)
+    } else {
+        looks_text(bytes)
+    };
     // текстовый файл с упоминанием `%PDF-` (заметка о PDF) — текст; PDF — только с начала
     let pdf = if text_kind.is_some() && is_text {
         bytes.trim_ascii_start().starts_with(b"%PDF-")
@@ -102,6 +108,23 @@ fn looks_text(bytes: &[u8]) -> bool {
         // обрезанный на середине символа хвост окна — не повод отказать
         Err(e) => e.error_len().is_none() && head.len() < b.len(),
     }
+}
+
+/// Текст CSV/TSV в начале файла (64 КиБ): UTF-8 по [`looks_text`]; UTF-16 LE/BE с BOM; иначе
+/// однобайтовая кодировка (Windows-1251 и т. п.) — без нулевых байтов и управляющих символов,
+/// кроме `\t`, `\n`, `\r`, `\x0B`, `\x0C` и `\x1A` (конец файла DOS). Правило детерминировано
+/// и кодировку не угадывает: её выбирает разборщик CSV (`csv::decode`).
+fn looks_csv_text(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return true;
+    }
+    if looks_text(bytes) {
+        return true;
+    }
+    let b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    b[..b.len().min(64 * 1024)]
+        .iter()
+        .all(|&c| c >= 0x20 || matches!(c, b'\t' | b'\n' | b'\r' | 0x0B | 0x0C | 0x1A))
 }
 
 /// [`sniff`] по файлу без чтения его в память: не zip — по началу файла ([`FILE_HEAD`]); zip —
