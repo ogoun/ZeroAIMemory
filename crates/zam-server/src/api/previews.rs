@@ -371,11 +371,19 @@ pub async fn preview(
     }
 }
 
-/// Файл кэша цел: лист — страница разбирается, текст — JSON, миниатюра — сигнатура PNG.
+/// Файл кэша цел: лист — страница разбирается, текст — JSON (HTML подсветки — снова через
+/// [`zam_markdown::is_highlight_html`]: файл в каталоге превью мог записать не сервер), миниатюра —
+/// сигнатура PNG.
 fn cache_valid(key: &PreviewKey, b: &[u8]) -> bool {
     match key {
         PreviewKey::Sheet { .. } => serde_json::from_slice::<WireSheetPage>(b).is_ok(),
-        PreviewKey::Text => serde_json::from_slice::<serde::de::IgnoredAny>(b).is_ok(),
+        PreviewKey::Text => match serde_json::from_slice::<serde_json::Value>(b) {
+            Ok(v) if v["format"] == "html" => v["html"]
+                .as_str()
+                .is_some_and(zam_markdown::is_highlight_html),
+            Ok(_) => true,
+            Err(_) => false,
+        },
         PreviewKey::Thumb { .. } => b.starts_with(b"\x89PNG\r\n\x1a\n"),
     }
 }
@@ -631,5 +639,21 @@ mod tests {
             1024,
         ));
         assert_eq!(checked_html(good.clone(), b"fn main() {}\n", false), good);
+    }
+
+    /// HTML подсветки из файла кэша превью проверяется так же, как ответ рабочего процесса
+    /// (повторное финальное ревью M5, Minor 1): чужой HTML — файл испорчен.
+    #[test]
+    fn cached_text_html_checked() {
+        let ok = br#"{"format":"html","html":"<span class=\"hl-a\">a</span>"}"#;
+        let evil = br#"{"format":"html","html":"<img src=x onerror=alert(1)>"}"#;
+        assert!(cache_valid(&PreviewKey::Text, ok));
+        assert!(!cache_valid(&PreviewKey::Text, evil));
+        assert!(!cache_valid(&PreviewKey::Text, br#"{"format":"html"}"#));
+        assert!(cache_valid(
+            &PreviewKey::Text,
+            br#"{"format":"slides","slides":[]}"#
+        ));
+        assert!(!cache_valid(&PreviewKey::Text, b"not json"));
     }
 }
