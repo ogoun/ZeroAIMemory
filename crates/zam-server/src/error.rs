@@ -70,9 +70,10 @@ pub enum ApiError {
     PreconditionRequired(String),
     #[error("{0}")]
     Unprocessable(String),
-    /// 422 `/problems/locator-unsupported`: `locator` в `/read` — этап M5.
+    /// 422 `/problems/locator-invalid` (M5 §4): `locator` в `/read` неверного формата или у цели
+    /// без документа (заметка, запись журнала).
     #[error("{0}")]
-    LocatorUnsupported(String),
+    LocatorInvalid(String),
     /// 422 источника выжимки кэша (§9.4): `kind` — тип problem `/problems/cache-cross-db`,
     /// `/problems/cache-forbidden-source` или `/problems/cache-source-not-found`.
     #[error("{detail}")]
@@ -177,9 +178,9 @@ impl ApiError {
                 "/problems/unprocessable",
                 "Unprocessable Content",
             ),
-            ApiError::LocatorUnsupported(_) => (
+            ApiError::LocatorInvalid(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "/problems/locator-unsupported",
+                "/problems/locator-invalid",
                 "Unprocessable Content",
             ),
             ApiError::CacheSource { kind, .. } => (

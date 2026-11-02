@@ -9,7 +9,8 @@
 //!
 //! **Таблицы.** `attachments` — пара (узел, sha256, имя файла) с MIME и размером;
 //! `blobs.refcount` — число таких различных пар (повторная привязка той же пары
-//! счётчик не меняет). Сборщик мусора (`refcount = 0`) — не в M1.
+//! счётчик не меняет). Сборщик мусора (`refcount = 0`) — не в M1. Документ вложения для
+//! индексации — `attachment_docs` ([`crate::attachments`], M5).
 //!
 //! **Ссылка** в Markdown: `_attachments/<sha256[0..16]>/<имя>`; в имени
 //! percent-кодируются только символы, ломающие синтаксис ссылки Markdown
@@ -24,6 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use zam_core::{Id, TargetKind, TargetRef};
 
+use crate::attachments::DocIntake;
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::entries::Certainty;
 use crate::nodes::AuthorKind;
@@ -178,6 +180,10 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
 /// Новая пара (узел, sha256, имя) добавляет строку `attachments` и увеличивает
 /// `blobs.refcount` (или создаёт блоб); повтор пары ничего не меняет. Вложение — изменение
 /// заметки по матрице `certainty` (`author`; с M4 к `axiom` — любому автору, §7.5).
+/// Пара получает документ `attachment_docs` (M5) в состоянии по `intake` ([`DocIntake`]):
+/// поддерживаемый вид — `pending` с заданием индексации `Attachment`, больше `docs.max_bytes` —
+/// `failed` (`too_large`), неподдерживаемый — `unsupported`; два последних — без задания.
+#[allow(clippy::too_many_arguments)]
 pub async fn attach(
     db: &Db,
     node: Id,
@@ -185,6 +191,7 @@ pub async fn attach(
     size: u64,
     filename: &str,
     mime: &str,
+    intake: DocIntake,
     author: AuthorKind,
 ) -> Result<String, StoreError> {
     if !is_sha256(sha256) {
@@ -219,6 +226,8 @@ pub async fn attach(
              ON CONFLICT (node_id, blob_sha256, filename) DO NOTHING",
             params![node, sha, name, mime, size, now],
         )?;
+        // документ пары: новый или возвращённый после открепления; живой не меняется
+        crate::attachments::ensure_doc(t, node, &sha, &name, &mime, intake, &now)?;
         if new_pair == 1 {
             t.execute(
                 "UPDATE blobs SET refcount = refcount + 1 WHERE sha256 = ?1",
@@ -343,6 +352,60 @@ pub async fn blob_meta_in_space(
             )
             .optional()?;
         Ok(row.map(|(m, s)| (m, u64::try_from(s).unwrap_or(0))))
+    })
+    .await
+}
+
+/// Привязка блоба к узлу по одному `sha256` (без имени файла): превью (`/previews/{sha}`, M5
+/// задача 8). MIME, размер и имя файла первой привязки — те же правила, что у [`blob_meta`]:
+/// Human — только при `allow_human`, живые узлы раньше удалённых, новые раньше старых.
+pub async fn blob_meta_by_sha(
+    db: &Db,
+    sha256: &str,
+    allow_human: bool,
+) -> Result<Option<(String, u64, String)>, StoreError> {
+    let sha = sha256.to_string();
+    db.read(move |c| {
+        let row: Option<(String, i64, String)> = c
+            .query_row(
+                "SELECT COALESCE(a.mime, 'application/octet-stream'), a.size, a.filename
+                 FROM attachments a
+                 JOIN nodes n ON n.id = a.node_id
+                 JOIN spaces s ON s.id = n.space_id
+                 WHERE a.blob_sha256 = ?1 AND (?2 OR s.kind <> 'human')
+                 ORDER BY (n.deleted_at IS NULL) DESC, a.created_at DESC
+                 LIMIT 1",
+                params![sha, allow_human],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(m, s, f)| (m, u64::try_from(s).unwrap_or(0), f)))
+    })
+    .await
+}
+
+/// [`blob_meta_by_sha`] в пределах пространства `space` (участник общего решения в базе
+/// владельца — только пространство решения).
+pub async fn blob_meta_by_sha_in_space(
+    db: &Db,
+    sha256: &str,
+    space: Id,
+) -> Result<Option<(String, u64, String)>, StoreError> {
+    let sha = sha256.to_string();
+    db.read(move |c| {
+        let row: Option<(String, i64, String)> = c
+            .query_row(
+                "SELECT COALESCE(a.mime, 'application/octet-stream'), a.size, a.filename
+                 FROM attachments a
+                 JOIN nodes n ON n.id = a.node_id
+                 WHERE a.blob_sha256 = ?1 AND n.space_id = ?2
+                 ORDER BY (n.deleted_at IS NULL) DESC, a.created_at DESC
+                 LIMIT 1",
+                params![sha, space],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(m, s, f)| (m, u64::try_from(s).unwrap_or(0), f)))
     })
     .await
 }

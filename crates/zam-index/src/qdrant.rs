@@ -9,8 +9,16 @@
 //! - `on_disk_payload`, 2 сегмента, метаданные `{model_id, schema}`;
 //! - payload-индексы: `user_id` (keyword, `is_tenant`), `space_id`, `node_id`,
 //!   `path_ancestors`, `level` (keyword), `updated_at` (integer); с M3 — `entry_id`, `kind`,
-//!   `status`, `insight_kind`, `certainty`, `area` (keyword). Коллекцию M2 `ensure` дополняет
-//!   недостающими индексами на месте, `schema` остаётся 1;
+//!   `status`, `insight_kind`, `certainty`, `area` (keyword); с M5 — `attachment_id` (keyword).
+//!   Коллекцию M2 `ensure` дополняет недостающими индексами на месте, `schema` остаётся 1;
+//! - точки документов вложений (M5): `kind = level = attachment`, `node_id` узла-владельца,
+//!   `attachment_id`, `blob_sha256`, `locator`. Удаление точек узла — по `node_id` при пустом
+//!   `attachment_id` (точки его вложений не задеваются), документа — по `attachment_id`.
+//!   Гибридный поиск берёт их своим prefetch dense и sparse (окно
+//!   [`crate::vector::attachment_window`], итоговый лимит растёт на него), листы — прежним
+//!   prefetch уровня `chunk` с точным фильтром: длинный документ не вытесняет листы заметок
+//!   (задача 6, раунд 1). `certainty` и `area` у вложения — заметки-владельца на момент поиска
+//!   (проверяет SQLite), поэтому prefetch вложений эти условия не проверяет ([`owner_conditions`]);
 //! - фильтр — дизъюнкция областей `(user_id, space_id ∈ …)` (`should`) и общие условия
 //!   (`must`, статусы — `must_not`), один для prefetch чанков и сводок;
 //! - с `VectorFilter::folders` (M3, канал папок §8.3) — ещё prefetch dense top-10 по точкам
@@ -54,8 +62,9 @@ use zam_core::{Id, TargetRef};
 
 use crate::IndexError;
 use crate::vector::{
-    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, VectorFilter, VectorHit,
-    VectorIndex, VectorScope, check_points, hit_target, point_id, split_targets,
+    HIT_FIELDS, IndexFuture, IndexMeta, IndexPoint, LEVEL_ATTACHMENT, LEVEL_FOLDER, VectorFilter,
+    VectorHit, VectorIndex, VectorScope, attachment_window, check_points, hit_target, point_id,
+    split_targets,
 };
 
 /// Имя коллекции (§6.4).
@@ -96,9 +105,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const LEVEL_CHUNK: &str = "chunk";
 const LEVELS_NOTE: [&str; 2] = ["note", "section"];
 
-/// Payload-индексы коллекции: (поле, тип, тенант). Последние шесть добавлены в M3:
-/// `ensure` досоздаёт их в существующей коллекции.
-const PAYLOAD_INDEXES: [(&str, FieldType, bool); 12] = [
+/// Payload-индексы коллекции: (поле, тип, тенант). Шесть после `updated_at` добавлены в M3,
+/// `attachment_id` — в M5: `ensure` досоздаёт их в существующей коллекции.
+const PAYLOAD_INDEXES: [(&str, FieldType, bool); 13] = [
     ("user_id", FieldType::Keyword, true),
     ("space_id", FieldType::Keyword, false),
     ("node_id", FieldType::Keyword, false),
@@ -111,6 +120,7 @@ const PAYLOAD_INDEXES: [(&str, FieldType, bool); 12] = [
     ("insight_kind", FieldType::Keyword, false),
     ("certainty", FieldType::Keyword, false),
     ("area", FieldType::Keyword, false),
+    ("attachment_id", FieldType::Keyword, false),
 ];
 
 /// Умолчания Qdrant 1.19 (`config/config.yaml`): `optimizers.flush_interval_sec` и
@@ -476,16 +486,23 @@ impl QdrantIndex {
     }
 
     async fn delete_targets_impl(&self, user: Id, targets: &[TargetRef]) -> Result<(), IndexError> {
-        let (nodes, entries) = split_targets(targets);
-        let mut any = Vec::new();
-        if !nodes.is_empty() {
-            any.push(kw_any("node_id", nodes));
-        }
-        if !entries.is_empty() {
-            any.push(kw_any("entry_id", entries));
-        }
-        if any.is_empty() {
+        let t = split_targets(targets);
+        if t.is_empty() {
             return Ok(());
+        }
+        let mut any = Vec::new();
+        if !t.nodes.is_empty() {
+            // точки самого узла: у точек его вложений тот же `node_id`, но есть `attachment_id`
+            any.push(Condition::from(Filter::must([
+                kw_any("node_id", t.nodes),
+                Condition::is_empty("attachment_id"),
+            ])));
+        }
+        if !t.entries.is_empty() {
+            any.push(kw_any("entry_id", t.entries));
+        }
+        if !t.attachments.is_empty() {
+            any.push(kw_any("attachment_id", t.attachments));
         }
         let filter = Filter {
             must: vec![kw("user_id", user.to_string())],
@@ -541,6 +558,37 @@ impl QdrantIndex {
 
         let mut q = QueryPointsBuilder::new(COLLECTION);
         let mut prefetches = 0;
+        let mut limit = QUERY_LIMIT;
+        // фрагменты вложений — своим prefetch dense и sparse (см. модуль)
+        let window = attachment_window(f) as u64;
+        if window > 0
+            && let Some(att_filter) = search_filter(f, &[LEVEL_ATTACHMENT.into()], true)
+        {
+            if !q_dense.is_empty() {
+                q = q.add_prefetch(
+                    PrefetchQueryBuilder::default()
+                        .query(Query::new_nearest(q_dense.to_vec()))
+                        .using(DENSE)
+                        .filter(att_filter.clone())
+                        .params(self.dense_params())
+                        .limit(window),
+                );
+                prefetches += 1;
+            }
+            if !q_sparse.is_empty() {
+                let mut sparse = PrefetchQueryBuilder::default()
+                    .query(Query::new_nearest(VectorInput::from(q_sparse)))
+                    .using(SPARSE)
+                    .filter(att_filter)
+                    .limit(window);
+                if self.exact {
+                    sparse = sparse.params(SearchParamsBuilder::default().exact(true));
+                }
+                q = q.add_prefetch(sparse);
+                prefetches += 1;
+            }
+            limit += window;
+        }
         if !leaf_levels.is_empty() && !q_dense.is_empty() {
             q = q.add_prefetch(
                 PrefetchQueryBuilder::default()
@@ -578,7 +626,6 @@ impl QdrantIndex {
         // точки папок — своим prefetch; лимит слияния растёт на его размер: папки не
         // занимают места чанков (каждая точка — только в одном prefetch, RRF не меняет
         // взаимный порядок остальных)
-        let mut limit = QUERY_LIMIT;
         if f.folders
             && !q_dense.is_empty()
             && let Some(folder_filter) = point_filter(&f.folder_filter(), &[LEVEL_FOLDER.into()])
@@ -815,6 +862,9 @@ fn to_point(p: IndexPoint) -> PointStruct {
         ("status", pl.status),
         ("insight_kind", pl.insight_kind),
         ("certainty", pl.certainty),
+        ("attachment_id", pl.attachment_id.map(|a| a.to_string())),
+        ("blob_sha256", pl.blob_sha256),
+        ("locator", pl.locator),
     ] {
         if let Some(v) = v {
             payload.insert(k, v);
@@ -846,8 +896,15 @@ fn scope_must(s: &VectorScope) -> Vec<Condition> {
 /// остаётся верхнеуровневым), путь, уровни `levels` (пустой — все), виды, виды инсайтов,
 /// `certainty` и `area` — в `must`, исключаемые статусы — в `must_not` (точки без `status`
 /// проходят). `None` — нет ни одной области с пространствами: фильтр не пропускает ничего
-/// (пустой фильтр Qdrant пропустил бы всё).
+/// (пустой фильтр Qdrant пропустил бы всё). Точный: удаление, подсчёт, ближайшие.
 fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
+    search_filter(f, levels, false)
+}
+
+/// [`point_filter`]; `owner_inherit` — гибридный поиск: точки вложений проходят `certainty` и
+/// `area`
+/// ([`owner_conditions`]).
+fn search_filter(f: &VectorFilter, levels: &[String], owner_inherit: bool) -> Option<Filter> {
     let scopes: Vec<&VectorScope> = f.live_scopes().collect();
     let mut filter = Filter::default();
     match scopes.as_slice() {
@@ -867,14 +924,22 @@ fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
         ("level", levels),
         ("kind", f.kinds.as_slice()),
         ("insight_kind", f.insight_kinds.as_slice()),
-        ("certainty", f.certainty.as_slice()),
     ] {
         if !values.is_empty() {
             filter.must.push(kw_any(field, values.to_vec()));
         }
     }
+    let mut owner = Vec::new();
+    if !f.certainty.is_empty() {
+        owner.push(kw_any("certainty", f.certainty.clone()));
+    }
     if let Some(area) = &f.area {
-        filter.must.push(kw("area", area.clone()));
+        owner.push(kw("area", area.clone()));
+    }
+    if owner_inherit {
+        filter.must.extend(owner_conditions(owner, levels));
+    } else {
+        filter.must.extend(owner);
     }
     if !f.exclude_statuses.is_empty() {
         filter
@@ -882,6 +947,22 @@ fn point_filter(f: &VectorFilter, levels: &[String]) -> Option<Filter> {
             .push(kw_any("status", f.exclude_statuses.clone()));
     }
     Some(filter)
+}
+
+/// Условия `certainty` и `area` фильтра. У вложения они — заметки-владельца на момент поиска
+/// (у точки `certainty` нет, `area` — на момент извлечения; правка заметки точки вложений не
+/// переписывает — Review Focus 2 M5): точка `level = attachment` проходит их без проверки, её
+/// проверяет SQLite (`live_chunks`). Уровни `levels` без вложений (пустые — все) — условия как
+/// есть.
+fn owner_conditions(owner: Vec<Condition>, levels: &[String]) -> Vec<Condition> {
+    let with_attachments = levels.is_empty() || levels.iter().any(|l| l == LEVEL_ATTACHMENT);
+    if owner.is_empty() || !with_attachments {
+        return owner;
+    }
+    vec![Condition::from(Filter::should([
+        kw("level", LEVEL_ATTACHMENT.to_string()),
+        Condition::from(Filter::must(owner)),
+    ]))]
 }
 
 /// Поля payload для выдачи.
@@ -899,7 +980,7 @@ fn to_hit(p: ScoredPoint) -> Result<VectorHit, IndexError> {
     let user_id = get("user_id")
         .and_then(|s| s.parse::<Id>().ok())
         .ok_or_else(|| IndexError::Corrupt("точка без корректного user_id".into()))?;
-    let target = hit_target(get("node_id"), get("entry_id"))?;
+    let target = hit_target(get("node_id"), get("entry_id"), get("attachment_id"))?;
     let level = get("level").ok_or_else(|| IndexError::Corrupt("точка без level".into()))?;
     Ok(VectorHit {
         chunk_id,

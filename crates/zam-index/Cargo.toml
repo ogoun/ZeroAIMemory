@@ -55,7 +55,7 @@ qdrant-edge = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { workspace = true, features = ["job-object", "creation-flags"] }
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_JobObjects"] }
 
 [target.'cfg(unix)'.dependencies]
 process-wrap = { workspace = true, features = ["process-group"] }

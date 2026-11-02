@@ -1,0 +1,215 @@
+//! Извлечение структуры документов (спецификация M5 §1): без сети, без записи на диск, с лимитами.
+//!
+//! Вход — байты файла; выход — [`Extracted`]: единицы текста с [`Locator`] (страница, слайд,
+//! диапазон листа, абзац) и путём заголовков. Превышение лимитов, кроме размера файла, даёт
+//! частичный результат и предупреждение `truncated: <лимит>`, а не ошибку.
+//!
+//! Модули: [`sniff`] — вид по сигнатуре, затем по расширению; `ooxml` — общий разбор zip и XML
+//! с лимитами; `docx`, `pptx` — форматы Office Open XML; `text` — простой текст; `sheet` —
+//! таблицы (`xlsx`, `ods` на `ooxml`, `xls` на `cfb`, `csv`) и превью листа [`sheet_page`];
+//! `pdf` (фича `pdfium`) — PDF и миниатюры страниц, только в рабочем процессе `doc-worker`;
+//! `thumb` (фича `images`) — миниатюры изображений для превью, там же.
+
+mod cfb;
+mod csv;
+mod ctx;
+mod docx;
+mod locator;
+mod numfmt;
+mod ods;
+mod ooxml;
+#[cfg(feature = "pdfium")]
+pub mod pdf;
+#[cfg(feature = "pdfium")]
+mod pdf_layout;
+#[cfg(feature = "pdfium")]
+mod png;
+mod pptx;
+mod sheet;
+mod sniff;
+#[cfg(feature = "test-pdf")]
+#[doc(hidden)]
+pub mod test_pdf;
+mod text;
+#[cfg(feature = "images")]
+pub mod thumb;
+mod xls;
+mod xlsx;
+
+use std::time::Instant;
+
+pub use ctx::HEADING_PATH_MAX_CHARS;
+pub use locator::Locator;
+pub use sheet::{SheetPage, sheet_page, sheet_page_no};
+pub use sniff::{ImageKind, is_text, sniff, sniff_file, sniff_image};
+
+/// Версия извлечения: смена правил разбора — перенарезка вложений (кэш по `blob_sha256`).
+/// 2 — `locator` листа с именем вида `#12` пишется в кавычках (`sheet:'#12'!A1`), иначе он
+/// читался бы как номер листа `sheet:#N` (задача 7 M5, раунд правок 2): кэш `blob_extract` хранит
+/// отрисованный `locator` и переизвлекается.
+/// 3 — даты и время XLSX по формату числа стиля ячейки вместо серийного номера: свой числовой
+/// формат — как показывает Excel, прочие — ISO 8601 (задача 10 M5, `numfmt`); текст листов
+/// меняется, кэш переизвлекается.
+pub const EXTRACTOR_VERSION: u32 = 3;
+
+/// Вид документа.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DocKind {
+    Pdf,
+    Docx,
+    Pptx,
+    Xlsx,
+    Xls,
+    Ods,
+    Csv,
+    Text,
+}
+
+impl DocKind {
+    /// Имя вида для журналов и API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocKind::Pdf => "pdf",
+            DocKind::Docx => "docx",
+            DocKind::Pptx => "pptx",
+            DocKind::Xlsx => "xlsx",
+            DocKind::Xls => "xls",
+            DocKind::Ods => "ods",
+            DocKind::Csv => "csv",
+            DocKind::Text => "text",
+        }
+    }
+}
+
+/// Лимиты разбора (`[docs]` конфигурации, спецификация §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limits {
+    /// Размер файла, байт; превышение — отказ [`DocError::TooLarge`].
+    pub max_bytes: u64,
+    /// Суммарно распакованных байт zip (фактически прочитанных, не заявленных).
+    pub max_unpacked: u64,
+    /// Степень сжатия записи zip (распакованные / сжатые) для записей больше 1 МиБ.
+    pub max_ratio: u32,
+    /// Записей в архиве zip.
+    pub max_entries: u32,
+    /// Размер центрального каталога zip, байт (из конца каталога, до его разбора): память
+    /// разбора каталога у `zip` пропорциональна ему (имена записей до 64 КиБ каждое).
+    pub max_central_dir: u64,
+    /// Глубина вложенности XML.
+    pub max_xml_depth: u32,
+    /// Непустых ячеек листа; заодно — число общих строк книги и ячеек страницы превью.
+    pub max_cells: u64,
+    /// Объём выдачи, символов: текст единиц вместе с путями заголовков и 64 служебными
+    /// символами на единицу.
+    pub max_chars: u64,
+    /// Страниц PDF.
+    pub max_pages: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_bytes: 100 * 1024 * 1024,
+            max_unpacked: 500 * 1024 * 1024,
+            max_ratio: 100,
+            max_entries: 10_000,
+            max_central_dir: 32 * 1024 * 1024,
+            max_xml_depth: 256,
+            max_cells: 2_000_000,
+            max_chars: 20_000_000,
+            max_pages: 5000,
+        }
+    }
+}
+
+/// Единица текста документа: адрес, путь заголовков и текст.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unit {
+    pub locator: Locator,
+    pub heading_path: Vec<String>,
+    pub text: String,
+}
+
+/// Результат извлечения.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extracted {
+    pub kind: DocKind,
+    pub units: Vec<Unit>,
+    /// Предупреждения: `truncated: <лимит>` при частичном результате, `skipped: <часть>`.
+    pub warnings: Vec<String>,
+    /// Есть страницы без текстового слоя с изображением (OCR — вне M5).
+    pub ocr_needed: bool,
+}
+
+/// Ошибка извлечения.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DocError {
+    /// Файл больше `max_bytes`.
+    #[error("файл больше лимита max_bytes")]
+    TooLarge,
+    /// Вид не поддерживается этим путём разбора (PDF — только в рабочем процессе).
+    #[error("вид документа не поддерживается")]
+    Unsupported,
+    /// Документ повреждён или запрещённого строения (например, `<!DOCTYPE>` в OOXML).
+    #[error("документ повреждён: {0}")]
+    Malformed(String),
+    /// Срок разбора истёк, а частичного результата нет (рабочий процесс PDF).
+    #[error("истёк срок разбора")]
+    Timeout,
+    /// Внутренняя ошибка разборщика.
+    #[error("внутренняя ошибка разбора: {0}")]
+    Internal(String),
+}
+
+/// Предел [`DocError::area`], символов.
+const AREA_MAX_CHARS: usize = 120;
+
+impl DocError {
+    /// Где случилась ошибка — без подробностей разборщика (имён тегов, сущностей, строк
+    /// документа): для хранения в базе и показа пользователю. Сообщение `Malformed` имеет вид
+    /// `<область>: <подробности>`, область — вид части и её имя: `xml (word/document.xml)`,
+    /// `zip`, `zip (xl/sharedStrings.xml)`, `encoding (word/document.xml)`, `part
+    /// (word/document.xml)`, `cfb`, `xls`, `pdf`. Не длиннее 120 символов.
+    pub fn area(&self) -> String {
+        let s = match self {
+            DocError::TooLarge => "too_large",
+            DocError::Unsupported => "unsupported",
+            DocError::Timeout => "timeout",
+            DocError::Internal(_) => "internal",
+            DocError::Malformed(m) => m.split(": ").next().unwrap_or(m),
+        };
+        s.chars().take(AREA_MAX_CHARS).collect()
+    }
+}
+
+/// Извлекает структуру документа вида `kind` из `bytes` в пределах `limits` и срока `deadline`.
+///
+/// PDF здесь не разбирается ([`DocError::Unsupported`]): только в рабочем процессе (§2).
+/// Истечение `deadline` даёт частичный результат с `truncated: timeout_ms`.
+pub fn extract(
+    kind: DocKind,
+    bytes: &[u8],
+    limits: &Limits,
+    deadline: Instant,
+) -> Result<Extracted, DocError> {
+    if bytes.len() as u64 > limits.max_bytes {
+        return Err(DocError::TooLarge);
+    }
+    let mut ctx = ctx::Ctx::new(limits, deadline);
+    let units = match kind {
+        DocKind::Docx => docx::extract(bytes, &mut ctx)?,
+        DocKind::Pptx => pptx::extract(bytes, &mut ctx)?,
+        DocKind::Text => text::extract(bytes, &mut ctx),
+        DocKind::Xlsx | DocKind::Xls | DocKind::Ods | DocKind::Csv => {
+            sheet::extract(kind, bytes, &mut ctx)?
+        }
+        // PDF — только рабочий процесс (задача 3)
+        DocKind::Pdf => return Err(DocError::Unsupported),
+    };
+    Ok(Extracted {
+        kind,
+        units,
+        warnings: ctx.into_warnings(),
+        ocr_needed: false,
+    })
+}

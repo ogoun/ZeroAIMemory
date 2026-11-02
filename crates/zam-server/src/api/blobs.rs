@@ -10,7 +10,9 @@
 //! **Отдача.** Пара (sha256, имя) должна быть привязана к узлу, который принципал
 //! может читать (по токену — не в Human), иначе 404: сначала личная база, затем базы
 //! владельцев чужих решений — только узлы пространства решения (отозванный или
-//! неодобренный доступ — 403 `solution-access`). `?user=` выбирает пользователя
+//! неодобренный доступ — тот же 404, что и у несуществующей пары: без оракула; задача 8 M5,
+//! правка ревью M-6; узлы и дерево решения по-прежнему отвечают 403 `solution-access`).
+//! `?user=` выбирает пользователя
 //! только для администратора (браузер не ставит `X-Zam-User` в `<img src>`);
 //! для токена игнорируется, как и `X-Zam-User`. Файл отдаёт `ServeFile`
 //! (`Range`/206, `If-Modified-Since`); `ETag` — `"<sha256>"` (содержимое неизменно),
@@ -18,6 +20,14 @@
 //! `nosniff`, CSP `sandbox`, `Content-Disposition` (`inline` только для безопасных
 //! для показа типов). Ответы помечаются [`NoCompress`]: сжатие ломает `Range` и
 //! бесполезно для медиа.
+//!
+//! **Документы вложений** (M5 §3). При загрузке вид определяется `zam_docs::sniff_file` по
+//! содержимому файла без чтения его в память (zip — по центральному каталогу): поддерживаемый
+//! вид ставит задание индексации вложения, поддерживаемый больше `docs.max_bytes` — `failed`
+//! (`too_large`), остальное — `unsupported`. `GET /nodes/{id}/attachments` — список
+//! вложений заметки с `extract_state` и `ocr_needed` (доступ — как чтение узла);
+//! `DELETE /nodes/{id}/attachments/{sha256}/{filename}` — открепление (доступ — как запись
+//! узла): `refcount − 1`, чанки и точки вложения удаляются, блоб остаётся (GC — M7).
 use axum::Json;
 use axum::body::Body;
 use axum::extract::multipart::{Field, MultipartError, MultipartRejection};
@@ -33,7 +43,10 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use zam_core::Id;
 use zam_store::blobs::{check_filename, is_sha256};
-use zam_store::{BlobStore, NodeKind, StoreError, attach, blob_meta, blob_meta_in_space};
+use zam_store::{
+    AttachmentDoc, BlobStore, DocIntake, NodeKind, StoreError, attach, blob_meta,
+    blob_meta_in_space, detach, list_attachments,
+};
 
 use super::query;
 use super::scope::{Mode, foreign_solutions, live, node_scope, owner_db, skip_foreign, user_db};
@@ -187,13 +200,100 @@ pub async fn upload(
         .put(reader, limit)
         .await
         .map_err(|e| put_err(e, limit))?;
-    let link = attach(&sc.db, sc.node.id, &sha, size, &filename, &mime, author).await?;
+    let limits = st.cfg.docs.limits();
+    let kind = sniff_blob(store.path_of(&sha), filename.clone(), limits.clone()).await;
+    let intake = DocIntake::classify(kind, size, limits.max_bytes);
+    let link = attach(
+        &sc.db, sc.node.id, &sha, size, &filename, &mime, intake, author,
+    )
+    .await?;
     st.render_gen.bump_user(sc.owner);
+    // задание извлечения — конвейеру документов
+    st.docs.notify();
     tracing::info!(node = %sc.node.id, sha256 = %sha, size, "вложение загружено");
     Ok((
         StatusCode::CREATED,
         Json(json!({ "sha256": sha, "link": link, "mime": mime, "size": size })),
     ))
+}
+
+/// Вид документа файла блоба `filename` (`zam_docs::sniff_file`): файл в память не читается —
+/// zip по центральному каталогу (число записей — по `limits.max_entries`) и началу
+/// `[Content_Types].xml`/`mimetype`, остальное — по началу файла. Размер против `max_bytes`
+/// решает вызывающий ([`DocIntake::classify`]). Ошибка чтения — `None` (вложение без
+/// индексации, загрузка не падает).
+async fn sniff_blob(
+    path: std::path::PathBuf,
+    filename: String,
+    limits: zam_docs::Limits,
+) -> Option<zam_docs::DocKind> {
+    let name = path.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let f = std::io::BufReader::new(std::fs::File::open(&path)?);
+        zam_docs::sniff_file(f, &filename, &limits)
+    })
+    .await;
+    match res {
+        Ok(Ok(k)) => k,
+        Ok(Err(e)) => {
+            tracing::warn!(path = %name.display(), error = %e, "вид вложения не определён");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "вид вложения не определён: задача прервана");
+            None
+        }
+    }
+}
+
+/// `GET /nodes/{id}/attachments` → `[{id, sha256, filename, mime, size, extract_state,
+/// extract_error, ocr_needed, link, created_at}]` живой заметки.
+pub async fn list(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
+    live(&sc)?;
+    let docs = list_attachments(&sc.db, sc.node.id).await?;
+    Ok(Json(docs.iter().map(doc_json).collect()))
+}
+
+fn doc_json(d: &AttachmentDoc) -> Value {
+    json!({
+        "id": d.id,
+        "sha256": d.blob_sha256,
+        "filename": d.filename,
+        "mime": d.mime,
+        "size": d.size,
+        "extract_state": d.extract_state,
+        "extract_error": d.extract_error,
+        "ocr_needed": d.ocr_needed,
+        "link": zam_store::attachment_link(&d.blob_sha256, &d.filename),
+        "created_at": zam_store::time::fmt_ts(d.created_at),
+    })
+}
+
+/// `DELETE /nodes/{id}/attachments/{sha256}/{filename}` → 204 (открепление).
+pub async fn remove(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path((id, sha, filename)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    if !is_sha256(&sha) {
+        return Err(ApiError::BadRequest(
+            "sha256: 64 символа hex в нижнем регистре".into(),
+        ));
+    }
+    let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
+    live(&sc)?;
+    let attrib = crate::attrib::attribution(&p, &headers, None)?;
+    detach(&sc.db, sc.node.id, &sha, &filename, &attrib).await?;
+    st.render_gen.bump_user(sc.owner);
+    tracing::info!(node = %sc.node.id, sha256 = %sha, "вложение откреплено");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize, Default)]
@@ -209,6 +309,55 @@ fn inline_ok(mime: &str) -> bool {
         || m.starts_with("video/")
         || m.starts_with("audio/")
         || m == "application/pdf"
+}
+
+/// Типы, которые браузер исполняет или применяет к странице при подключении по URL (`<script>`,
+/// `import`, `Worker`, `<link rel=stylesheet>`, XSLT, WebAssembly): JavaScript (все MIME
+/// JavaScript по WHATWG MIME Sniffing), CSS, XSLT, WebAssembly. Блоб такого типа с того же origin
+/// обошёл бы CSP WebUI (`script-src 'self'`): `nosniff` пропускает скрипт, тип которого —
+/// JavaScript, а `Content-Disposition: attachment` подключению не мешает.
+fn executable_mime(mime: &str) -> bool {
+    let essence = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+            | "text/css"
+            | "text/xsl"
+            | "application/xslt+xml"
+            | "application/wasm"
+    ) || essence.ends_with("+javascript")
+}
+
+/// `Content-Type` ответа с блобом: исполняемые типы ([`executable_mime`]) — как
+/// `application/octet-stream` (с `nosniff` браузер не подключит файл ни скриптом, ни стилем;
+/// скачивание и имя файла — прежние). Остальное — как записано: SVG и изображения в `<img>`,
+/// PDF во встроенном просмотрщике (финальное ревью M5, I-3).
+fn served_mime(mime: &str) -> &str {
+    if executable_mime(mime) {
+        "application/octet-stream"
+    } else {
+        mime
+    }
 }
 
 /// RFC 5987 `attr-char`; остальное — `%XX` от байтов UTF-8.
@@ -246,7 +395,7 @@ fn if_none_match_hits(headers: &HeaderMap, etag: &str) -> bool {
 /// Заголовки безопасности и кэширования любого ответа с блобом.
 fn decorate(r: &mut Response, mime: &str, filename: &str, etag: &str) {
     let h = r.headers_mut();
-    let ct = HeaderValue::from_str(mime)
+    let ct = HeaderValue::from_str(served_mime(mime))
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     h.insert(header::CONTENT_TYPE, ct);
     h.insert(
@@ -294,12 +443,17 @@ async fn locate_blob(
         return Ok((user.id, mime));
     }
     for (info, role) in foreign_solutions(st, p, &user).await? {
+        // неодобренный или отозванный доступ — как отсутствие: тот же 404, без 403
+        // `solution-access`, иначе ответ подтверждает существование пары sha–имя (ревью задачи 8
+        // M5, M-6; так же, как у превью)
+        if role.is_err() {
+            continue;
+        }
         let Some(odb) = owner_db(st, &info).await else {
             continue;
         };
         match blob_meta_in_space(&odb, sha, filename, info.space_id).await {
             Ok(Some((mime, _))) => {
-                role?;
                 return Ok((info.owner_id, mime));
             }
             Ok(None) => {}
@@ -378,6 +532,38 @@ mod tests {
             disposition("text/html", "\"x\";.html"),
             "attachment; filename*=UTF-8''%22x%22%3B.html"
         );
+    }
+
+    #[test]
+    fn executable_types_served_as_octet_stream() {
+        for m in [
+            "text/javascript",
+            "application/javascript; charset=utf-8",
+            "Text/JavaScript",
+            "application/x-javascript",
+            "text/ecmascript",
+            "text/jscript",
+            "text/css",
+            "text/xsl",
+            "application/xslt+xml",
+            "application/wasm",
+        ] {
+            assert_eq!(served_mime(m), "application/octet-stream", "{m}");
+            assert!(disposition(m, "a").starts_with("attachment"), "{m}");
+        }
+        // показ в браузере и просмотрщики не ломаются
+        for m in [
+            "image/png",
+            "image/svg+xml",
+            "application/pdf",
+            "text/html",
+            "text/plain",
+            "application/json",
+            "application/xml",
+            "video/mp4",
+        ] {
+            assert_eq!(served_mime(m), m, "{m}");
+        }
     }
 
     #[test]

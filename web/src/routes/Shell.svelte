@@ -347,6 +347,23 @@
       <div class="admin">
         <Solutions mine {onexpired} />
       </div>
+    {:else if route.name === 'attachment'}
+      {@const r = route}
+      {#await import('../components/AttachmentView.svelte')}
+        <p class="muted">Загрузка…</p>
+      {:then { default: AttachmentView }}
+        <AttachmentView
+          user={r.user}
+          space={r.space}
+          node={r.node}
+          sha={r.sha}
+          file={r.file}
+          locator={r.locator}
+          {onexpired}
+        />
+      {:catch e}
+        <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
+      {/await}
     {:else if route.name === 'node'}
       <DocView
         user={route.user}

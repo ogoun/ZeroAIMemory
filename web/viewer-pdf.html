@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <base href="/" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Просмотр PDF</title>
+  </head>
+  <body>
+    <!-- Документ просмотрщика PDF (M5): pdf.js в своём документе со своей CSP (web.rs),
+         байты файла приходят от WebUI сообщением, API и cookie документу не нужны. -->
+    <div class="toolbar" role="toolbar" aria-label="Просмотр PDF">
+      <span class="group">
+        <button type="button" id="prev" aria-label="Предыдущая страница" title="Предыдущая страница">‹</button>
+        <input id="page-num" type="number" min="1" value="1" inputmode="numeric" aria-label="Страница" />
+        <span id="page-count" class="muted">из …</span>
+        <button type="button" id="next" aria-label="Следующая страница" title="Следующая страница">›</button>
+      </span>
+      <span class="group">
+        <button type="button" id="zoom-out" aria-label="Уменьшить" title="Уменьшить">−</button>
+        <span id="zoom" class="muted">100%</span>
+        <button type="button" id="zoom-in" aria-label="Увеличить" title="Увеличить">+</button>
+        <button type="button" id="fit">По ширине</button>
+      </span>
+      <span class="group find">
+        <input id="find" type="search" aria-label="Поиск в документе" placeholder="Поиск в документе" autocomplete="off" />
+        <button type="button" id="find-prev" aria-label="Предыдущее совпадение" title="Предыдущее совпадение (Shift+Enter)">↑</button>
+        <button type="button" id="find-next" aria-label="Следующее совпадение" title="Следующее совпадение (Enter)">↓</button>
+        <span id="find-status" class="muted" role="status"></span>
+      </span>
+    </div>
+    <div id="viewerContainer" tabindex="0" aria-label="Страницы документа">
+      <div id="viewer" class="pdfViewer"></div>
+    </div>
+    <p id="error" role="alert" hidden></p>
+    <script type="module" src="/src/viewer-pdf/main.ts"></script>
+  </body>
+</html>

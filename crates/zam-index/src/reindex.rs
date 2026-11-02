@@ -8,8 +8,10 @@
 //!   `embeddings` по `chunks.embed_key` и пишутся в Qdrant пачками по 256 точек
 //!   (`wait=true`, до [`PARALLEL_WRITES`] = 8 запросов одновременно; следующая страница читается, пока пишется
 //!   текущая). Заметка, у которой в кэше нет хотя бы одного чанка, получает
-//!   задание `upsert` (инференс воркером). Записи журналов (M3) — так же, страницами
-//!   после заметок. Точки папок — из кэша по L0 папки.
+//!   задание `upsert` (инференс воркером). Записи журналов (M3) и документы вложений (M5) —
+//!   так же, страницами после заметок. Точки папок — из кэша по L0 папки.
+//! - полный режим для вложений: извлечённым — `upsert` (точки), неудавшимся — повтор
+//!   разбора ([`zam_store::reindex_docs`]); перенарезка вложений — по отпечатку нарезки.
 //! - **полный** (`full`): `enqueue_reindex` — перечанковка и задания для всех заметок и
 //!   записей журналов области, инференс для промахов кэша.
 //!
@@ -36,9 +38,10 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use zam_core::Id;
 use zam_store::{
     Db, Embedding, IndexFolder, ReindexNote, StoreError, SystemStore, UserDbs,
-    adopt_owned_embeddings_batch, enqueue_entry_upserts, enqueue_reindex, enqueue_upserts,
-    finish_entries_reindexed, finish_reindexed, folders_for_index, gc_embeddings, get_embeddings,
-    list_spaces, mark_reindex, put_owned_embeddings, reindex_entries_page, reindex_page,
+    adopt_owned_embeddings_batch, enqueue_attachment_upserts, enqueue_entry_upserts,
+    enqueue_reindex, enqueue_upserts, finish_entries_reindexed, finish_reindexed,
+    folders_for_index, gc_embeddings, get_embeddings, list_spaces, mark_reindex,
+    put_owned_embeddings, reindex_attachments_page, reindex_entries_page, reindex_page,
 };
 
 use crate::worker::{chunk_point, folder_embed, folder_point};
@@ -94,6 +97,8 @@ pub struct ReindexReport {
     pub nodes: u64,
     /// Записей журналов восстановлено из кэша.
     pub entries: u64,
+    /// Документов вложений восстановлено из кэша.
+    pub attachments: u64,
     /// Точек чанков записано.
     pub points: u64,
     /// Точек папок записано.
@@ -244,6 +249,7 @@ pub async fn reindex(
         users = rep.users,
         nodes = rep.nodes,
         entries = rep.entries,
+        attachments = rep.attachments,
         points = rep.points,
         folders = rep.folders,
         misses = rep.misses,
@@ -327,6 +333,7 @@ async fn cache_user(
     rep.misses += misses.len() as u64;
     rep.jobs += enqueue_upserts(db, misses).await?;
     cache_entries(ctx, user, db, space, rep).await?;
+    cache_attachments(ctx, user, db, space, rep).await?;
     // точки папок по их L0 (кэш служебных эмбеддингов)
     let folders = folders_for_index(db, space).await?;
     let embedded: Vec<(String, String)> = folders
@@ -435,6 +442,62 @@ async fn cache_entries(
     }
     rep.misses += misses.len() as u64;
     rep.jobs += enqueue_entry_upserts(db, misses).await?;
+    Ok(())
+}
+
+/// Документы вложений области из кэша: страницами по [`PAGE_NOTES`]; документ, у которого в
+/// кэше нет хотя бы одного чанка, получает задание `upsert`. Точки области уже удалены.
+async fn cache_attachments(
+    ctx: &ReindexCtx<'_>,
+    user: Id,
+    db: &Db,
+    space: Option<Id>,
+    rep: &mut ReindexReport,
+) -> Result<(), UserFail> {
+    let mut after: Option<Id> = None;
+    let mut misses: Vec<Id> = Vec::new();
+    loop {
+        let t = Instant::now();
+        let page = reindex_attachments_page(db, space, after, PAGE_NOTES).await?;
+        if page.is_empty() {
+            rep.read_ms += t.elapsed().as_millis() as u64;
+            break;
+        }
+        after = page.last().map(|d| d.attachment_id);
+        let mut keys: Vec<String> = page
+            .iter()
+            .flat_map(|d| d.chunks.iter().map(|c| c.embed_key.clone()))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let embs = get_embeddings(db, ctx.model_id, &keys).await?;
+        rep.read_ms += t.elapsed().as_millis() as u64;
+        let mut pts: Vec<IndexPoint> = Vec::new();
+        let mut done = 0u64;
+        for d in &page {
+            if d.chunks.iter().all(|c| embs.contains_key(&c.embed_key)) {
+                pts.extend(
+                    d.chunks
+                        .iter()
+                        .map(|c| chunk_point(user, c, &embs[&c.embed_key])),
+                );
+                done += 1;
+            } else {
+                misses.push(d.attachment_id);
+            }
+        }
+        let n = pts.len() as u64;
+        let t = Instant::now();
+        write_points(ctx.vector, pts).await?;
+        rep.write_ms += t.elapsed().as_millis() as u64;
+        rep.points += n;
+        rep.attachments += done;
+        if page.len() < PAGE_NOTES {
+            break;
+        }
+    }
+    rep.misses += misses.len() as u64;
+    rep.jobs += enqueue_attachment_upserts(db, misses).await?;
     Ok(())
 }
 

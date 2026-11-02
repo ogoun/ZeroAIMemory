@@ -43,6 +43,42 @@ async fn index_served_with_base_href() {
     assert_eq!(h["referrer-policy"], "same-origin");
 }
 
+/// Эталон CSP главной страницы: просмотрщики документов (M5) её не ослабляют.
+const MAIN_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'";
+
+#[tokio::test]
+async fn main_csp_unchanged() {
+    let app = app("web-csp", "/memory").await;
+    for uri in ["/memory/", "/memory/users", "/memory/u/x/s/knowledge/n/y"] {
+        let (st, h, _) = get(&app, uri).await;
+        assert_eq!(st, StatusCode::OK, "{uri}");
+        assert_eq!(h["content-security-policy"], MAIN_CSP, "{uri}");
+    }
+    assert_eq!(zam_server::web::CSP, MAIN_CSP);
+}
+
+#[tokio::test]
+async fn viewer_pdf_has_own_csp_and_base_href() {
+    for (base, uri) in [("/memory", "/memory/viewer/pdf"), ("", "/viewer/pdf")] {
+        let app = app("web-viewer", base).await;
+        let (st, h, body) = get(&app, uri).await;
+        assert_eq!(st, StatusCode::OK, "{uri}");
+        assert!(ctype(&h).starts_with("text/html"), "{}", ctype(&h));
+        assert!(
+            body.contains(&format!(r#"<base href="{base}/">"#)),
+            "{body}"
+        );
+        let csp = h["content-security-policy"].to_str().unwrap();
+        assert_eq!(csp, zam_server::web::VIEWER_PDF_CSP);
+        assert!(csp.contains("'wasm-unsafe-eval'") && csp.contains("worker-src 'self' blob:"));
+        assert!(!csp.contains("'unsafe-eval'") && csp.contains("frame-ancestors 'self'"));
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        // документ просмотрщика — не ассет: по имени файла его нет
+        let (st, _, _) = get(&app, &format!("{base}/viewer-pdf.html")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+}
+
 #[tokio::test]
 async fn index_served_at_root_without_base_path() {
     let app = app("web-root", "").await;
@@ -89,5 +125,32 @@ async fn missing_file_paths_are_not_found() {
         let (st, h, _) = get(&app, uri).await;
         assert_eq!(st, StatusCode::NOT_FOUND, "{uri}");
         assert_eq!(ctype(&h), "application/problem+json", "{uri}");
+    }
+}
+
+/// `Access-Control-Allow-Origin: *` — только у публичной статики (`/assets/`, `/pdfjs/`), которую
+/// читает документ просмотрщика PDF с непрозрачным источником; API и страницы — без него.
+#[tokio::test]
+async fn cors_only_on_public_static() {
+    let app = app("web-cors", "/memory").await;
+    let (st, h, _) = get(&app, "/memory/pdfjs/wasm/openjpeg.wasm").await;
+    if st == StatusCode::OK {
+        assert_eq!(h["access-control-allow-origin"], "*");
+    } else {
+        eprintln!("web/dist не собран — статика pdf.js не проверена");
+    }
+    for uri in [
+        "/memory/api/v1/health",
+        "/memory/api/v1/spaces",
+        "/memory/",
+        "/memory/viewer/pdf",
+        "/memory/THIRD-PARTY-NOTICES.txt",
+    ] {
+        let (_, h, _) = get(&app, uri).await;
+        assert!(
+            h.get("access-control-allow-origin").is_none(),
+            "{uri}: {:?}",
+            h.get("access-control-allow-origin")
+        );
     }
 }

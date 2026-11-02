@@ -359,6 +359,10 @@ fn format_of(url: &str) -> Option<Format> {
 /// Извлекает из архива (zip, tar.gz, tar.xz) только перечисленные в `entry.extract` файлы
 /// в `out`. В tar под нужным путём допускается ссылка на файл того же каталога
 /// (см. [`extract_tar`]); в zip — только обычные файлы.
+///
+/// Не для недоверенных архивов: вызывающий обязан заранее сверить SHA-256 архива с манифестом
+/// ([`verify_sha256`]). Здесь нет защиты `zam-docs` от подделанного конца каталога zip и
+/// раздувания памяти (`ZipArchive` открывается как есть).
 pub fn extract_selected(
     archive: &Path,
     url: &str,
@@ -468,6 +472,9 @@ fn fresh_part(out: &Path) -> Result<PathBuf, FetchError> {
 }
 
 /// Атомарная замена каталога: распаковка в `<out>.tmp`, затем подмена `out`.
+///
+/// Не для недоверенных архивов: вызывающий обязан заранее сверить SHA-256 архива с манифестом
+/// ([`verify_sha256`]), как и для [`extract_selected`].
 pub fn extract_atomic(
     archive: &Path,
     url: &str,

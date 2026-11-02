@@ -10,6 +10,9 @@
 // - `#/u/<user_id>` — пространства пользователя;
 // - `#/u/<user_id>/s/<space_ref>/n/<node_id>[#<якорь>]` — документ, якорь — `id`
 //   элемента в percent-encoding (как в href вики-ссылок сервера: `#/n/<id>#h-<slug>`);
+// - `#/u/<user_id>/s/<space_ref>/n/<node_id>/a/<sha256>/<имя файла>[/<locator>]` — просмотр
+//   вложения заметки (M5), `locator` — место в документе (`page:12`, `sheet:Итоги!A1:F40`,
+//   `slide:3`, `para:40`): переход из выдачи поиска;
 // - `#/u/<user_id>/s/<space_ref>/j/<журнал>[/<entry_id>]` — журнал пространства
 //   (`changelog`, `releases`, `insights`, `glossary`, `tasks`, `questions`, `vault`),
 //   необязательно — открытая запись.
@@ -46,7 +49,16 @@ export type Route =
   | { name: 'cache' }
   | { name: 'journal'; user: string; space: string; journal: Journal; entry: string | null }
   | { name: 'home'; user: string | null }
-  | { name: 'node'; user: string; space: string; node: string; anchor: string | null };
+  | { name: 'node'; user: string; space: string; node: string; anchor: string | null }
+  | {
+      name: 'attachment';
+      user: string;
+      space: string;
+      node: string;
+      sha: string;
+      file: string;
+      locator: string | null;
+    };
 
 const enc = encodeURIComponent;
 
@@ -87,6 +99,17 @@ export function parse(hash: string): Route {
         return { name: 'journal', user, space: dec(parts[3]), journal, entry };
       }
     }
+    if ((parts.length === 9 || parts.length === 10) && parts[2] === 's' && parts[4] === 'n' && parts[6] === 'a') {
+      return {
+        name: 'attachment',
+        user,
+        space: dec(parts[3]),
+        node: dec(parts[5]),
+        sha: dec(parts[7]),
+        file: dec(parts[8]),
+        locator: parts[9] ? dec(parts[9]) : null,
+      };
+    }
     if (parts.length === 6 && parts[2] === 's' && parts[4] === 'n') {
       return { name: 'node', user, space: dec(parts[3]), node: dec(parts[5]), anchor };
     }
@@ -97,7 +120,7 @@ export function parse(hash: string): Route {
 
 /** Пользователь маршрута (заметки), если он в адресе. */
 export const routeUser = (r: Route): string | null =>
-  r.name === 'home' || r.name === 'node' || r.name === 'journal' ? r.user : null;
+  r.name === 'home' || r.name === 'node' || r.name === 'journal' || r.name === 'attachment' ? r.user : null;
 
 /** Адрес маршрута (`#/…`). */
 export function href(r: Route): string {
@@ -127,6 +150,11 @@ export function href(r: Route): string {
     case 'node':
       return (
         `#/u/${enc(r.user)}/s/${enc(r.space)}/n/${enc(r.node)}` + (r.anchor ? `#${r.anchor}` : '')
+      );
+    case 'attachment':
+      return (
+        `#/u/${enc(r.user)}/s/${enc(r.space)}/n/${enc(r.node)}/a/${enc(r.sha)}/${enc(r.file)}` +
+        (r.locator ? `/${enc(r.locator)}` : '')
       );
   }
 }

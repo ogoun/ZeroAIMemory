@@ -10,6 +10,7 @@
   import CertaintyBadge from './CertaintyBadge.svelte';
   import Links from './Links.svelte';
   import FileRefs from './FileRefs.svelte';
+  import AttachmentList from './AttachmentList.svelte';
   import { loadRefs, staleOf, staleText, type RefState } from '../lib/fileRefs';
   import { stateShort, stateText } from '../lib/indexing';
   import Lightbox from './Lightbox.svelte';
@@ -17,9 +18,11 @@
     ApiError,
     getNode,
     getNodeHtml,
+    listAttachments,
     listSpaces,
     spaceMatches,
     spaceRef,
+    type Attachment,
     type Certainty,
     type NodeInfo,
     type RenderedNode,
@@ -45,7 +48,7 @@
 
   let { user, space, node, anchor, reloadKey, nav, onloaded, onexpired }: Props = $props();
 
-  type Tab = 'doc' | 'history' | 'links';
+  type Tab = 'doc' | 'history' | 'links' | 'attachments';
   let tab = $state<Tab>('doc');
   let info = $state<NodeInfo | null>(null);
   let rendered = $state<RenderedNode | null>(null);
@@ -59,6 +62,10 @@
   let lightbox = $state<{ src: string; alt: string } | null>(null);
   /** Открыт редактор (вкладка «Документ»). */
   let editing = $state(false);
+  /** Вложения заметки (M5); `null` — не загружены. */
+  let attachments = $state<Attachment[] | null>(null);
+  /** Право записи в пространство: у участника решения в режиме `ro` — нет (открепление скрыто). */
+  let writable = $state(false);
 
   let seq = 0;
   /** Загруженный документ и ключ перезагрузки: смена одного якоря не перечитывает документ. */
@@ -92,13 +99,20 @@
     loading = true;
     error = '';
     notice = '';
-    const [j, h, sp] = await Promise.allSettled([getNode(u, n), getNodeHtml(u, n), listSpaces(u)]);
+    const [j, h, sp, at] = await Promise.allSettled([
+      getNode(u, n),
+      getNodeHtml(u, n),
+      listSpaces(u),
+      listAttachments(u, n),
+    ]);
     if (my !== seq) return;
     loading = false;
+    attachments = at.status === 'fulfilled' ? at.value : null;
     if (sp.status === 'fulfilled') {
       const found = sp.value.spaces.find((x) => spaceMatches(x, s));
       spaceName = found?.name ?? s;
       solutionGuid = found?.kind === 'solution' ? spaceRef(found) : '';
+      writable = sp.value.access !== 'ro' && !(found?.role === 'member' && found.access === 'ro');
     }
     if (j.status === 'rejected') return failed(j.reason);
     info = j.value.node;
@@ -289,6 +303,11 @@
       <button type="button" role="tab" aria-selected={tab === 'doc'} onclick={() => (tab = 'doc')}>Документ</button>
       <button type="button" role="tab" aria-selected={tab === 'history'} onclick={() => (tab = 'history')}>История</button>
       <button type="button" role="tab" aria-selected={tab === 'links'} onclick={() => (tab = 'links')}>Связи</button>
+      {#if info?.kind === 'note'}
+        <button type="button" role="tab" aria-selected={tab === 'attachments'} onclick={() => (tab = 'attachments')}
+          >Вложения{#if attachments?.length}<span class="count">{attachments.length}</span>{/if}</button
+        >
+      {/if}
       {#if info?.kind === 'note' && !editing}
         <button
           type="button"
@@ -365,6 +384,23 @@
       <Links {user} kind="node" id={info.id} {onexpired} />
     {/if}
   </div>
+  <div role="tabpanel" hidden={tab !== 'attachments'}>
+    {#if tab === 'attachments' && info}
+      {#if attachments === null}
+        <p class="error" role="alert">Список вложений не загрузился.</p>
+      {:else}
+        <AttachmentList
+          {user}
+          {space}
+          {node}
+          items={attachments}
+          {writable}
+          ondetached={(a) => (attachments = (attachments ?? []).filter((x) => x !== a))}
+          {onexpired}
+        />
+      {/if}
+    {/if}
+  </div>
 </article>
 
 {#if lightbox}
@@ -434,7 +470,15 @@
     display: flex;
     gap: 2px;
     margin-top: 12px;
-    border-bottom: 1px solid var(--border);
+    /* линия под вкладками — тенью: на узком экране вкладки прокручиваются сами (страница — нет),
+       а подчёркивание активной ложится на линию без выхода за контейнер прокрутки */
+    box-shadow: inset 0 -1px var(--border);
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  .tabs button {
+    flex: none;
   }
   .tabs button {
     border: 0;
@@ -443,11 +487,18 @@
     background: transparent;
     padding: 6px 12px;
     color: var(--muted);
-    margin-bottom: -1px;
   }
   .tabs button[aria-selected='true'] {
     color: var(--text);
     border-bottom-color: var(--accent);
+  }
+  .tabs .count {
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 8px;
+    font-size: 12px;
+    background: var(--chip);
+    color: var(--muted);
   }
   .render-warnings,
   .toc {

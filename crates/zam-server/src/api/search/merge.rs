@@ -101,6 +101,7 @@ mod tests {
             area: None,
             certainty: None,
             verified_at: None,
+            attachment: None,
         }
     }
 

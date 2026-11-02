@@ -270,6 +270,8 @@ fn kind_str(k: TargetKind) -> &'static str {
     match k {
         TargetKind::Node => "node",
         TargetKind::Entry => "entry",
+        // концом связи вложение не бывает (`end_meta` — нет конца): запросы по нему пусты
+        TargetKind::Attachment => "attachment",
     }
 }
 
@@ -415,6 +417,8 @@ fn end_meta(c: &Connection, r: TargetRef) -> Result<Option<EndMeta>, StoreError>
                 })
             })
             .optional()?,
+        // связи — между узлами и записями; вложение концом не бывает
+        TargetKind::Attachment => None,
     };
     Ok(row)
 }

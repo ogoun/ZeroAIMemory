@@ -461,7 +461,13 @@ async fn revoke_takes_effect_on_next_request_same_token() {
     );
     denied(&w.put(&w.b_tok, &nid, 1, "# x\n").await, "revoked");
     denied(&w.note(&w.b_tok, G, "x", "# x\n").await, "revoked");
-    denied(&w.get(&w.b_tok, &blob).await, "revoked");
+    // блоб после отзыва — 404 с тем же телом, что у несуществующего (M5 задача 8, M-6)
+    let r = w.get(&w.b_tok, &blob).await;
+    let m = w
+        .get(&w.b_tok, &format!("/api/v1/blobs/{}/a.bin", "0".repeat(64)))
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert_eq!((r.status, r.body.clone()), (m.status, m.body.clone()));
     denied(&w.upload(&w.b_tok, &nid, "b.bin", b"x").await, "revoked");
     denied(&w.register(&w.b_tok).await, "revoked");
     let s = w.get(&w.b_tok, "/api/v1/spaces").await.json();

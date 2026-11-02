@@ -134,6 +134,61 @@ pub fn ort_files(platform: &str, flavor: Flavor) -> (&'static str, &'static [&'s
     }
 }
 
+/// Библиотека pdfium в корне комплекта (рядом с `zam-server`: умолчание `docs.pdfium_dylib`
+/// сервера — `pool::pdfium_default_name` в каталоге исполняемого файла) и в
+/// `target/deps/<платформа>/pdfium/` (`cargo xtask fetch-deps`, `deploy/pdfium.toml`).
+pub fn pdfium_file(platform: &str) -> &'static str {
+    if is_windows(platform) {
+        "pdfium.dll"
+    } else {
+        "libpdfium.so"
+    }
+}
+
+/// Лицензии pdfium в `LICENSES/` комплекта (из `deploy/licenses/`).
+pub const PDFIUM_LICENSES: [&str; 2] = ["PDFIUM-LICENSE.txt", "PDFIUM-THIRD-PARTY.txt"];
+
+/// Разбирает заголовок библиотеки: `Some(платформа)` для PE AMD64 (`windows-x64`) и ELF64
+/// x86-64 (`linux-x64`), иначе `None`.
+pub fn native_lib_platform(head: &[u8]) -> Option<&'static str> {
+    let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    if head.starts_with(b"\x7fELF") {
+        // EI_CLASS = 2 (64 бита), EI_DATA = 1 (little-endian), e_machine = 62 (EM_X86_64)
+        return (head.get(4) == Some(&2) && head.get(5) == Some(&1) && u16_at(18) == Some(62))
+            .then_some("linux-x64");
+    }
+    if head.starts_with(b"MZ") {
+        let pe = head
+            .get(0x3c..0x40)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)?;
+        // подпись PE\0\0 и Machine = 0x8664 (IMAGE_FILE_MACHINE_AMD64)
+        return (head.get(pe..pe + 4) == Some(b"PE\0\0") && u16_at(pe + 4) == Some(0x8664))
+            .then_some("windows-x64");
+    }
+    None
+}
+
+/// Библиотека `path` собрана для `platform` (PE AMD64 или ELF64 x86-64), иначе ошибка: чужая
+/// или испорченная библиотека не загрузится у пользователя.
+pub fn check_native_lib(path: &Path, platform: &str) -> Result<()> {
+    let mut head = Vec::with_capacity(4096);
+    io::Read::read_to_end(
+        &mut io::Read::take(
+            File::open(path).with_context(|| format!("открытие {}", path.display()))?,
+            4096,
+        ),
+        &mut head,
+    )?;
+    match native_lib_platform(&head) {
+        Some(p) if p == platform => Ok(()),
+        Some(p) => bail!("{}: библиотека {p}, ожидалась {platform}", path.display()),
+        None => bail!(
+            "{}: не библиотека PE AMD64 / ELF64 x86-64 (ожидалась {platform})",
+            path.display()
+        ),
+    }
+}
+
 /// App-local MSVC runtime в корне комплекта Windows. Его импортируют библиотеки ONNX
 /// Runtime (`dumpbin /dependents`): `onnxruntime.dll` — MSVCP140, MSVCP140_1, VCRUNTIME140,
 /// VCRUNTIME140_1; CUDA EP ещё MSVCP140_ATOMIC_WAIT. UCRT (`api-ms-win-crt-*`) входит в
@@ -231,8 +286,14 @@ fn server_entries(i: &Inputs) -> Result<Vec<Entry>> {
     for n in ort {
         v.push(Entry::file(*n, i.deps_dir.join(ort_dir).join(n)));
     }
-    let pdf = if win { "pdfium.dll" } else { "libpdfium.so" };
-    v.push(Entry::file(pdf, i.deps_dir.join("pdfium").join(pdf)));
+    // pdfium — рядом с zam-server (умолчание сервера); чужая платформа — ошибка упаковки
+    // (отсутствие файла сообщает `check_sources` вместе с остальными)
+    let pdf = pdfium_file(p);
+    let pdf_src = i.deps_dir.join("pdfium").join(pdf);
+    if pdf_src.is_file() {
+        check_native_lib(&pdf_src, p).context("pdfium из target/deps")?;
+    }
+    v.push(Entry::file(pdf, pdf_src));
     let q = exe(p, "qdrant");
     v.push(Entry {
         path: format!("qdrant/{}/{q}", i.qdrant_version),
@@ -719,6 +780,23 @@ pub(crate) mod tests {
         fs::write(p, b"x").unwrap();
     }
 
+    /// Заголовок библиотеки платформы: PE AMD64 (`windows-x64`) или ELF64 x86-64.
+    fn fake_lib(platform: &str) -> Vec<u8> {
+        let mut b = vec![0u8; 0x80];
+        if is_windows(platform) {
+            b[..2].copy_from_slice(b"MZ");
+            b[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+            b[0x40..0x44].copy_from_slice(b"PE\0\0");
+            b[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+        } else {
+            b[..4].copy_from_slice(b"\x7fELF");
+            b[4] = 2;
+            b[5] = 1;
+            b[18..20].copy_from_slice(&62u16.to_le_bytes());
+        }
+        b
+    }
+
     /// Фиктивное дерево исходников: (deps, deploy, generated, crt, dist).
     fn fixture(w: &Path, platform: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         let deps = w.join("deps");
@@ -731,12 +809,9 @@ pub(crate) mod tests {
         // библиотеки NVIDIA рядом с ORT GPU (после cuda fetch) в комплект не попадают
         touch(&deps.join("onnxruntime-gpu/cuda/cudnn64_9.dll"));
         touch(&deps.join("onnxruntime-gpu/cuda/libcudnn.so.9"));
-        let pdf = if is_windows(platform) {
-            "pdfium.dll"
-        } else {
-            "libpdfium.so"
-        };
-        touch(&deps.join("pdfium").join(pdf));
+        let pdf = deps.join("pdfium").join(pdfium_file(platform));
+        fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+        fs::write(&pdf, fake_lib(platform)).unwrap();
         touch(&deps.join("qdrant").join(exe(platform, "qdrant")));
         let deploy = w.join("deploy");
         for f in [
@@ -1050,6 +1125,107 @@ pub(crate) mod tests {
         assert!(!w.join("out.part").exists());
         write_archive_limited(&dest, "r", &entries, MAX_RELEASE_FILE).unwrap();
         assert_eq!(zip_names(&dest), ["r/big.bin"]);
+    }
+
+    /// M5 (задача 11): документы в комплекте каждой платформы и flavor — pdfium в корне рядом с
+    /// `zam-server` (умолчание `docs.pdfium_dylib`; `doc-worker` — подкоманда того же
+    /// исполняемого файла, у Linux — с правом исполнения), `config.example.toml` с `[docs]`.
+    #[test]
+    fn package_layout_docs_pdfium_next_to_server() {
+        for platform in PLATFORMS {
+            for flavor in [Flavor::Cpu, Flavor::Gpu] {
+                let w = work(&format!("layout-docs-{platform}-{}", flavor.as_str()));
+                let got = run_package(&w, platform, flavor, true).unwrap();
+                let root = format!("zam-server-1.2.3-{platform}-{}", flavor.as_str());
+                let entries: Vec<(String, u32)> = if is_windows(platform) {
+                    zip_names(&got[0]).into_iter().map(|n| (n, 0)).collect()
+                } else {
+                    tar_entries(&got[0])
+                };
+                let mode = |rel: &str| {
+                    let want = format!("{root}/{rel}");
+                    entries.iter().find(|(n, _)| *n == want).map(|(_, m)| *m)
+                };
+                let (srv, pdf) = (exe(platform, "zam-server"), pdfium_file(platform));
+                let ctx = format!("{platform} {}: {entries:?}", flavor.as_str());
+                assert!(mode(&srv).is_some(), "нет {srv}: {ctx}");
+                assert!(mode(pdf).is_some(), "нет {pdf} в корне: {ctx}");
+                assert!(mode("config.example.toml").is_some(), "{ctx}");
+                if !is_windows(platform) {
+                    assert_eq!(mode(&srv), Some(0o755), "{ctx}");
+                    assert_eq!(mode(pdf), Some(0o644), "{ctx}");
+                }
+                // ровно одна копия pdfium, и только своей платформы
+                let other = pdfium_file(other_platform(platform));
+                let n = entries
+                    .iter()
+                    .filter(|(e, _)| e.ends_with(pdf) || e.ends_with(other))
+                    .count();
+                assert_eq!(n, 1, "{ctx}");
+            }
+        }
+    }
+
+    /// pdfium чужой платформы или не библиотека в `target/deps` — ошибка упаковки с именем.
+    #[test]
+    fn package_rejects_foreign_pdfium() {
+        for (platform, bad) in [
+            ("windows-x64", fake_lib("linux-x64")),
+            ("linux-x64", fake_lib("windows-x64")),
+            ("linux-x64", b"x".to_vec()),
+        ] {
+            let w = work(&format!("pdfium-foreign-{platform}-{}", bad.len()));
+            let (deps, deploy, gen_dir, crt, dist) = fixture(&w, platform);
+            fs::write(deps.join("pdfium").join(pdfium_file(platform)), &bad).unwrap();
+            let (server_bin, cli_bin, lic) = (
+                w.join("zam-server.bin"),
+                w.join("zam.bin"),
+                w.join("LICENSE"),
+            );
+            let r = package(&Inputs {
+                platform,
+                version: "1.2.3",
+                flavor: Flavor::Cpu,
+                server_bin: &server_bin,
+                cli_bin: &cli_bin,
+                other_cli_bin: None,
+                deps_dir: &deps,
+                deploy_dir: &deploy,
+                generated_licenses_dir: &gen_dir,
+                project_license: &lic,
+                crt_dir: Some(&crt),
+                qdrant_version: "1.19.2",
+                out_dir: &dist,
+            });
+            let e = format!("{:#}", r.unwrap_err());
+            assert!(e.contains("pdfium") && e.contains(platform), "{e}");
+        }
+        assert_eq!(
+            native_lib_platform(&fake_lib("windows-x64")),
+            Some("windows-x64")
+        );
+        assert_eq!(
+            native_lib_platform(&fake_lib("linux-x64")),
+            Some("linux-x64")
+        );
+        // PE не AMD64 (i386) и ELF32 — не наши платформы
+        let mut pe32 = fake_lib("windows-x64");
+        pe32[0x44..0x46].copy_from_slice(&0x14cu16.to_le_bytes());
+        assert_eq!(native_lib_platform(&pe32), None);
+        let mut elf32 = fake_lib("linux-x64");
+        elf32[4] = 1;
+        assert_eq!(native_lib_platform(&elf32), None);
+        assert_eq!(native_lib_platform(b"MZ"), None);
+    }
+
+    /// Лицензии pdfium лежат в `deploy/licenses/` (каталог копируется в `LICENSES/` комплекта).
+    #[test]
+    fn deploy_licenses_include_pdfium() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/licenses");
+        for n in PDFIUM_LICENSES {
+            let len = fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0);
+            assert!(len > 0, "нет или пуст deploy/licenses/{n}");
+        }
     }
 
     #[test]

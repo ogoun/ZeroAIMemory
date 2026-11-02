@@ -22,3 +22,17 @@ test('обычные лицензии и SPDX-выражения', () => {
   assert.equal(allowed({ name: 'c', license: null, licenseText: 'MIT License\n...' }), true);
   assert.equal(allowed({ name: 'd', license: null }), false);
 });
+
+test('просмотрщики документов M5: jszip по MIT, pako — MIT и Zlib, pdf.js и docx-preview', () => {
+  assert.equal(allowed({ name: 'jszip', license: '(MIT OR GPL-3.0-or-later)' }), true);
+  assert.equal(allowed({ name: 'pako', license: '(MIT AND Zlib)' }), true);
+  assert.equal(allowed({ name: 'pdfjs-dist', license: 'Apache-2.0' }), true);
+  assert.equal(allowed({ name: 'docx-preview', license: 'Apache-2.0' }), true);
+});
+
+test('AND требует всех частей, смешанные и вложенные выражения отклоняются', () => {
+  assert.equal(allowed({ name: 'e', license: '(MIT AND GPL-3.0)' }), false);
+  assert.equal(allowed({ name: 'f', license: 'MIT OR GPL-3.0 AND Zlib' }), false);
+  assert.equal(allowed({ name: 'g', license: '(MIT OR (GPL-3.0 AND Zlib))' }), false);
+  assert.equal(allowed({ name: 'h', license: 'GPL-3.0 OR LGPL-2.1' }), false);
+});

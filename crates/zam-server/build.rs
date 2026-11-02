@@ -1,5 +1,6 @@
 //! Сборочные шаги сервера: git-хэш (`ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short=12 HEAD`,
-//! иначе "unknown") и подготовка ассетов WebUI из `web/dist` (см. `prepare_web`).
+//! иначе "unknown") и подготовка ассетов WebUI из `web/dist` (см. `prepare_web`): страницы
+//! `index.html` и `viewer-pdf.html` — отдельно от ассетов (см. `PAGES`).
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,13 +11,26 @@ fn watch(p: &Path) {
     }
 }
 
+/// Страницы-документы из корня `web/dist`: отдаются маршрутами `web.rs` со своей CSP и base href,
+/// а не ассетами (переменная окружения сборки, имя файла).
+const PAGES: &[(&str, &str)] = &[
+    ("ZAM_WEB_INDEX", "index.html"),
+    ("ZAM_WEB_VIEWER_PDF", "viewer-pdf.html"),
+];
+
+const STUB_VIEWER: &str = concat!(
+    "<!doctype html>\n<html lang=\"ru\"><head><meta charset=\"UTF-8\" />",
+    "<base href=\"/\" /><title>Просмотр PDF</title></head>",
+    "<body><p>WebUI не собран: выполните npm run build в web/.</p></body></html>\n"
+);
+
 const STUB_INDEX: &str = concat!(
     "<!doctype html>\n<html lang=\"ru\"><head><meta charset=\"UTF-8\" />",
     "<base href=\"/\" /><title>ZeroAIMemory</title></head>",
     "<body><p>WebUI не собран: выполните npm run build в web/.</p></body></html>\n"
 );
 
-/// Копирует `dir` в `dst` без корневого `index.html` (его отдаёт `web.rs` с подстановкой base href).
+/// Копирует `dir` в `dst` без корневых страниц [`PAGES`] (их отдаёт `web.rs` с подстановкой base href).
 fn copy_assets(dir: &Path, dst: &Path, root: bool) {
     std::fs::create_dir_all(dst).expect("создать каталог ассетов");
     for e in std::fs::read_dir(dir)
@@ -26,7 +40,7 @@ fn copy_assets(dir: &Path, dst: &Path, root: bool) {
         let (from, to) = (e.path(), dst.join(e.file_name()));
         if from.is_dir() {
             copy_assets(&from, &to, false);
-        } else if !(root && e.file_name() == "index.html") {
+        } else if !(root && PAGES.iter().any(|(_, f)| e.file_name() == *f)) {
             std::fs::copy(&from, &to).expect("скопировать ассет");
         }
     }
@@ -52,18 +66,28 @@ fn prepare_web() {
     if has_dist || stale {
         let _ = std::fs::remove_dir_all(&assets);
     }
-    let index = if has_dist {
+    if has_dist {
         copy_assets(dist, &assets, true);
-        std::fs::read_to_string(dist.join("index.html")).expect("прочитать web/dist/index.html")
     } else {
         std::fs::create_dir_all(&assets).expect("создать каталог ассетов");
-        STUB_INDEX.to_string()
-    };
-    let index_path = out.join("web-index.html");
-    if std::fs::read_to_string(&index_path).ok().as_deref() != Some(index.as_str()) {
-        std::fs::write(&index_path, index).expect("записать index.html");
     }
-    println!("cargo:rustc-env=ZAM_WEB_INDEX={}", index_path.display());
+    for (var, file) in PAGES {
+        let stub = if *file == "index.html" {
+            STUB_INDEX
+        } else {
+            STUB_VIEWER
+        };
+        // страница из сборки WebUI; нет её (старая сборка или нет web/dist) — заглушка
+        let page = std::fs::read_to_string(dist.join(file))
+            .ok()
+            .filter(|_| has_dist)
+            .unwrap_or_else(|| stub.to_string());
+        let path = out.join(format!("web-{file}"));
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(page.as_str()) {
+            std::fs::write(&path, page).expect("записать страницу WebUI");
+        }
+        println!("cargo:rustc-env={var}={}", path.display());
+    }
     // Без вывода предупреждений memory-serve; ассеты всегда встраиваются в бинарь.
     // SAFETY: build-скрипт однопоточен.
     unsafe { std::env::set_var("MEMORY_SERVE_QUIET", "1") };

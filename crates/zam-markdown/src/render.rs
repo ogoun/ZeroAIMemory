@@ -19,13 +19,14 @@ use comrak::{Arena, parse_document};
 use serde::Serialize;
 
 use crate::doc::{Link, OutlineItem, doc_from_root, outline, split_anchor};
-use crate::highlight::{HIGHLIGHT_BUDGET_BYTES, Highlighted, highlight};
+use crate::highlight::{Budget, Highlighted, highlight};
 use crate::options::{HEADER_ID_PREFIX, comrak_options};
 use crate::sanitize::{EXTERNAL_REL, sanitize_html};
 
 /// Версия вывода рендера: часть ключа кэша `(content_hash, render_version)`.
 /// Растёт при любом изменении HTML.
-pub const RENDER_VERSION: u32 = 3;
+/// 4 — бюджет HTML подсветки на документ и предел длины строки (задача 8 M5, раунд 2).
+pub const RENDER_VERSION: u32 = 4;
 
 /// Разрешённая вики-ссылка.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +149,7 @@ enum Plan {
 }
 
 /// Данные проходов для форматтера; узлы — по адресу в арене.
+#[derive(Default)]
 struct State {
     /// Цитата → callout `(тип, сворачивание)`.
     callouts: HashMap<usize, (String, Fold)>,
@@ -155,19 +157,8 @@ struct State {
     titles: HashMap<usize, Fold>,
     /// Ссылки, картинки и вики-ссылки с особым выводом.
     plans: HashMap<usize, Plan>,
-    /// Остаток бюджета подсветки документа, байт исходника.
-    highlight_budget: usize,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            callouts: HashMap::new(),
-            titles: HashMap::new(),
-            plans: HashMap::new(),
-            highlight_budget: HIGHLIGHT_BUDGET_BYTES,
-        }
-    }
+    /// Остаток бюджетов подсветки документа: байт исходника и байт HTML.
+    highlight_budget: Budget,
 }
 
 fn key(node: &AstNode<'_>) -> usize {

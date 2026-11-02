@@ -1617,6 +1617,8 @@ async fn prompt_hints(
                     "rules",
                 )
             }
+            // вложения в подсказки не входят: виды внутреннего поиска заданы явно (`note`, `insight`)
+            TargetKind::Attachment => continue,
         };
         let mut block = hint_line(
             lead,
@@ -1872,7 +1874,7 @@ async fn error_hints(
 fn seen_key(targets: &[SearchTarget], c: &Cand) -> SeenKey {
     SeenKey {
         owner_id: targets[c.target].owner,
-        target: c.tref,
+        target: c.tref.into(),
         part: RECALL_PART.to_string(),
     }
 }

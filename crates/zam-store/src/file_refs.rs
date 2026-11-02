@@ -198,10 +198,13 @@ pub fn check_commit(c: &str) -> Option<String> {
         .then(|| c.to_ascii_lowercase())
 }
 
-fn owner_kind(k: TargetKind) -> &'static str {
+/// `file_refs.owner_kind` владельца. У вложения ссылок на файлы нет (CHECK `file_refs`) —
+/// `BadInput`, а не строка, которую таблица не примет.
+fn owner_kind(k: TargetKind) -> Result<&'static str, StoreError> {
     match k {
-        TargetKind::Node => "node",
-        TargetKind::Entry => "entry",
+        TargetKind::Node => Ok("node"),
+        TargetKind::Entry => Ok("entry"),
+        TargetKind::Attachment => Err(bad("у вложения нет ссылок на файлы")),
     }
 }
 
@@ -241,7 +244,7 @@ pub fn set_refs(
     if refs.len() > REFS_MAX {
         return Err(bad(format!("refs: не больше {REFS_MAX} ссылок")));
     }
-    let kind = owner_kind(owner.kind);
+    let kind = owner_kind(owner.kind)?;
     let keep: Vec<&str> = refs.iter().map(|r| r.path.as_str()).collect();
     tx.prepare_cached(
         "DELETE FROM file_refs WHERE owner_kind = ?1 AND owner_id = ?2
@@ -275,7 +278,7 @@ pub(crate) fn owner_refs(tx: &Connection, owner: TargetRef) -> Result<Vec<FileRe
         "SELECT path, content_hash, git_commit FROM file_refs
          WHERE owner_kind = ?1 AND owner_id = ?2 ORDER BY path",
     )?;
-    let rows = st.query_map(params![owner_kind(owner.kind), owner.id], |r| {
+    let rows = st.query_map(params![owner_kind(owner.kind)?, owner.id], |r| {
         Ok(FileRef {
             path: r.get(0)?,
             hash: r.get(1)?,
@@ -309,7 +312,7 @@ fn add_paths(
     paths: &[String],
     now: &str,
 ) -> Result<(), StoreError> {
-    let kind = owner_kind(owner.kind);
+    let kind = owner_kind(owner.kind)?;
     let have: HashSet<String> = tx
         .prepare_cached("SELECT path FROM file_refs WHERE owner_kind = ?1 AND owner_id = ?2")?
         .query_map(params![kind, owner.id], |r| r.get(0))?

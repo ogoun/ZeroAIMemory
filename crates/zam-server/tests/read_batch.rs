@@ -63,7 +63,8 @@ async fn seen_rev(
         target: TargetRef {
             kind,
             id: target.parse().unwrap(),
-        },
+        }
+        .into(),
         part: WHOLE_TARGET.to_string(),
     };
     seen_revs(&db, session, std::slice::from_ref(&key))
@@ -406,10 +407,10 @@ async fn read_max_items_422() {
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
     let r = read(&a, json!({"items": []})).await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
-    // locator — M5
+    // locator у заметки — 422 locator-invalid (M5, задача 7)
     let r = read(&a, json!({"items": [{"id": &nid, "locator": "p.4"}]})).await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
-    assert_eq!(r.json()["type"], "/problems/locator-unsupported");
+    assert_eq!(r.json()["type"], "/problems/locator-invalid");
     for bad in [
         json!({"items": [{"id": &nid, "tier": "L9"}]}),
         json!({"items": [{"id": &nid, "max_tokens": 0}]}),

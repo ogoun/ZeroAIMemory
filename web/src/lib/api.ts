@@ -354,6 +354,104 @@ export function uploadBlob(user: string, node: string, file: File): Promise<Uplo
   return request('POST', 'blobs', { body: form, user }).then((r) => r.json() as Promise<UploadedBlob>);
 }
 
+// ---- вложения заметки и превью документов (M5) ----
+
+/** Состояние извлечения текста вложения: `unsupported` — вид без извлечения (картинка, архив). */
+export type ExtractState = 'pending' | 'done' | 'failed' | 'unsupported';
+
+/** Вложение заметки (`GET /nodes/{id}/attachments`). */
+export interface Attachment {
+  id: string;
+  sha256: string;
+  filename: string;
+  mime: string;
+  size: number;
+  extract_state: ExtractState;
+  /** Код причины неудачи (`parse_timeout`, `parse_error: xml (word/document.xml)`…), не путь. */
+  extract_error: string | null;
+  /** Текста нет (скан): нужно распознавание. */
+  ocr_needed: boolean;
+  /** Ссылка для Markdown (`_attachments/<sha>/<имя>`). */
+  link: string;
+  created_at: string;
+}
+
+export const listAttachments = (user: string, node: string) =>
+  call<Attachment[]>('GET', `nodes/${q(node)}/attachments`, undefined, user);
+
+/** Открепление вложения от заметки (право записи). */
+export const detachAttachment = (user: string, node: string, sha: string, filename: string) =>
+  call<void>('DELETE', `nodes/${q(node)}/attachments/${q(sha)}/${q(filename)}`, undefined, user);
+
+/**
+ * Адрес файла вложения (для `<img>` и ссылки «Скачать»): у администратора пользователь —
+ * параметром `user` (заголовок выбора пользователя у `<img>` не передать).
+ */
+export const blobUrl = (user: string, sha: string, filename: string) =>
+  `api/v1/blobs/${q(sha)}/${q(filename)}?user=${q(user)}`;
+
+/** Байты файла вложения (просмотрщики PDF и DOCX разбирают его в браузере). */
+export const blobBytes = async (user: string, sha: string, filename: string): Promise<ArrayBuffer> =>
+  (await request('GET', `blobs/${q(sha)}/${q(filename)}`, { user })).arrayBuffer();
+
+/** Лист книги в превью: номер в порядке книги, имя через сканер секретов, номер `sheet:#N`. */
+export interface PreviewSheetRef {
+  no: number;
+  name: string;
+  secret: boolean;
+  /** Номер листа в `locator` вида `sheet:#N` (только если в книге есть лист с секретом). */
+  ref_no: number | null;
+}
+
+/** Страница листа (`GET /previews/{sha}?kind=sheet`). */
+export interface SheetPreview {
+  kind: 'sheet';
+  sheet: number;
+  name: string;
+  sheets: PreviewSheetRef[];
+  /** Шапка — первая непустая строка листа. */
+  header: string[];
+  /** Строки окна; пустая строка — пустой массив. */
+  rows: string[][];
+  /** Номер строки листа (с 1) первой строки `rows`. */
+  first_row: number;
+  /** Строк данных под шапкой. */
+  total_rows: number;
+  cols: number;
+  warnings: string[];
+}
+
+export const previewSheet = (user: string, sha: string, sheet: number, from: number, rows: number) =>
+  call<SheetPreview>(
+    'GET',
+    `previews/${q(sha)}?kind=sheet&sheet=${sheet}&from=${from}&rows=${rows}`,
+    undefined,
+    user,
+  );
+
+export interface PreviewSlide {
+  slide: number;
+  title: string;
+  text: string;
+  notes: string;
+}
+
+/** Текст документа (`kind=text`): слайды PPTX или HTML подсветки (только `<span class>`). */
+export type TextPreview =
+  | { kind: 'text'; format: 'slides'; slides: PreviewSlide[]; warnings: string[] }
+  | {
+      kind: 'text';
+      format: 'html';
+      syntax: string | null;
+      html: string;
+      highlighted: boolean;
+      highlight_skipped: string | null;
+      truncated: boolean;
+    };
+
+export const previewText = (user: string, sha: string) =>
+  call<TextPreview>('GET', `previews/${q(sha)}?kind=text`, undefined, user);
+
 export interface RevisionInfo {
   rev: number;
   content_hash: string;
@@ -384,7 +482,7 @@ export interface SearchItem {
   /** У заметки; у записи журнала — `entry_id`. */
   node_id?: string;
   entry_id?: string;
-  /** `note` или вид записи (`insight`, `changelog`, `release`). */
+  /** `note`, `attachment` или вид записи (`insight`, `changelog`, `release`). */
   kind?: string;
   /** Статус insight. */
   status?: EntryStatus | null;
@@ -404,6 +502,15 @@ export interface SearchItem {
   score: number;
   /** Каналы, нашедшие элемент: `vector`, `fts`, `trigram`. */
   sources: string[];
+  /** Фрагмент вложения (`kind: attachment`): `a:<chunk>`, документ, файл и место в нём. */
+  id?: string;
+  attachment_id?: string;
+  file?: string;
+  blob_sha256?: string;
+  /** `page:12`, `sheet:Итоги!A1:F40` (`sheet:#N!…` для листа с секретом), `slide:3`, `para:40`. */
+  locator?: string | null;
+  /** Подпись места: `стр. 12`, `лист «Итоги» A1:F40`, `слайд 3`, `абз. 40`. */
+  locator_text?: string | null;
 }
 
 export interface SearchResult {

@@ -25,6 +25,9 @@ use tokio::io::{AsyncBufReadExt as _, AsyncRead, BufReader};
 
 use super::config::ManagedConfig;
 use crate::IndexError;
+#[cfg(test)]
+use crate::child::LogLine;
+use crate::child::parse_json_line;
 
 /// Лок каталога `<data_dir>/qdrant/`: один супервизор на каталог.
 pub(crate) const LOCK_FILE: &str = ".zam-qdrant.lock";
@@ -319,16 +322,13 @@ fn terminate_pid(pid: u32, _grace: Duration) {
 
 // ---------------------------------------------------------------- запуск и остановка
 
-/// Секреты zam-server, которые дочернему Qdrant не передаются.
-pub(crate) const SECRET_ENV: [&str; 3] = ["ZAM_MASTER_KEY", "ZAM_ADMIN_PASSWORD", "ZAM_TOKEN"];
-
 /// Переменная окружения убирается при запуске Qdrant: унаследованные `QDRANT*` и
 /// `RUN_MODE` перекрыли бы наш конфиг (в том числе host), секреты zam-server
-/// ([`SECRET_ENV`]) Qdrant не нужны. Регистр имени на Windows не важен.
+/// ([`crate::child::SECRET_ENV`]) Qdrant не нужны. Регистр имени на Windows не важен.
 pub(crate) fn scrubbed_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    let name = if cfg!(windows) { upper.as_str() } else { name };
-    name.starts_with("QDRANT") || name == "RUN_MODE" || SECRET_ENV.contains(&name)
+    let plain = if cfg!(windows) { upper.as_str() } else { name };
+    plain.starts_with("QDRANT") || plain == "RUN_MODE" || crate::child::is_secret_env(name)
 }
 
 /// Запускает Qdrant в `qdir`. Вызывать только из потока «qdrant-supervisor» (PDEATHSIG).
@@ -357,16 +357,7 @@ pub(crate) fn spawn(
             // SAFETY: замыкание исполняется в дочернем процессе между fork и exec и
             // вызывает только async-signal-safe функции (prctl, getppid, _exit).
             unsafe {
-                c.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // Родитель умер до prctl — сигнал уже не придёт.
-                    if libc::getppid() != parent {
-                        libc::_exit(1);
-                    }
-                    Ok(())
-                });
+                c.pre_exec(crate::child::pre_exec_hook(parent, None, false));
             }
         }
     });
@@ -404,47 +395,6 @@ pub(crate) async fn stop_child(child: &mut Box<dyn ChildWrapper>, grace: Duratio
 }
 
 // ---------------------------------------------------------------- журнал
-
-/// Строка JSON-журнала Qdrant.
-#[derive(Debug, PartialEq)]
-pub(crate) struct LogLine {
-    pub level: tracing::Level,
-    pub target: String,
-    pub message: String,
-}
-
-/// Разбор строки `logger.format: json`:
-/// `{"timestamp":…,"level":"INFO","fields":{"message":…},"target":…}`.
-pub(crate) fn parse_json_line(line: &str) -> Option<LogLine> {
-    if !line.starts_with('{') {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    let level = match v.get("level")?.as_str()? {
-        "ERROR" => tracing::Level::ERROR,
-        "WARN" => tracing::Level::WARN,
-        "INFO" => tracing::Level::INFO,
-        "DEBUG" => tracing::Level::DEBUG,
-        _ => tracing::Level::TRACE,
-    };
-    let message = v
-        .get("fields")
-        .and_then(|f| f.get("message"))
-        .or_else(|| v.get("message"))
-        .and_then(|m| m.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let target = v
-        .get("target")
-        .and_then(|t| t.as_str())
-        .unwrap_or_default()
-        .to_string();
-    Some(LogLine {
-        level,
-        target,
-        message,
-    })
-}
 
 /// Строка с текстом panic несовместимого хранилища.
 pub(crate) fn is_storage_panic(line: &str) -> bool {

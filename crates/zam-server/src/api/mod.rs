@@ -3,6 +3,7 @@ pub mod admin;
 pub mod agent_setup;
 pub mod blobs;
 pub mod cache;
+pub mod doc_locator;
 pub mod downloads;
 pub mod entries;
 pub mod feedback;
@@ -13,6 +14,7 @@ pub mod health;
 pub mod index;
 pub mod insights;
 pub mod nodes;
+pub mod previews;
 pub mod questions;
 pub mod read;
 pub mod recall;
@@ -142,6 +144,10 @@ fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
             "/api/v1/blobs",
             post(blobs::upload).layer(blob_body_limit(limits)),
         )
+        .route(
+            "/api/v1/nodes/{id}/attachments/{sha256}/{filename}",
+            delete(blobs::remove),
+        )
         .route("/api/v1/cache", post(cache::put))
         .route("/api/v1/cache/{id}", delete(cache::remove))
         .route("/api/v1/cache/{id}/promote", post(cache::promote))
@@ -221,6 +227,8 @@ fn service_routes() -> Router<AppState> {
         )
         .route("/api/v1/render/highlight.css", get(render::highlight))
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
+        .route("/api/v1/previews/{sha256}", get(previews::preview))
+        .route("/api/v1/nodes/{id}/attachments", get(blobs::list))
         .route("/api/v1/search", post(search::search))
         .route("/api/v1/read", post(read::read))
         // подсказки пишут только `usage` и `session_seen`, не память (R12)

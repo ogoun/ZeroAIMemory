@@ -7,6 +7,8 @@
 //!   коллекция `zam_chunks` с именованными векторами `dense` и `sparse`, гибридный запрос
 //!   prefetch + RRF, фильтр по тенанту `user_id`.
 //! - [`point_id`] — детерминированный id точки (UUIDv5 от `chunk_id`): upsert идемпотентен.
+//! - [`child`] — общее для дочерних процессов (Qdrant, `doc-worker`): окружение без секретов,
+//!   PDEATHSIG и `RLIMIT_AS` (Linux), Job Object с лимитом памяти (Windows), JSON-журнал.
 //! - [`supervisor`] — супервизор нативного Qdrant (§4.3): запуск с привязкой к родителю
 //!   (Job Object / PDEATHSIG), готовность и версия, перезапуск с circuit breaker, метка
 //!   хранилища и пересборка, штатная остановка; `status`/`reset` для CLI.
@@ -23,6 +25,7 @@
 //! Пространство `human` в индекс никогда не попадает. В ошибки и логи не попадают
 //! векторы, текст чанков и API-ключ.
 
+pub mod child;
 #[cfg(feature = "edge")]
 mod edge;
 mod qdrant;
@@ -42,8 +45,9 @@ pub use qdrant::{
 };
 pub use reindex::{ReindexCtx, ReindexReport, ReindexRequest, reindex};
 pub use vector::{
-    IndexFuture, IndexMeta, IndexPoint, LEVEL_FOLDER, NAMESPACE_ZAM, PointPayload, VectorFilter,
-    VectorHit, VectorIndex, VectorScope, point_id,
+    ATTACH_PREFETCH, IndexFuture, IndexMeta, IndexPoint, LEVEL_ATTACHMENT, LEVEL_FOLDER,
+    NAMESPACE_ZAM, PointPayload, VectorFilter, VectorHit, VectorIndex, VectorScope,
+    attachment_window, point_id,
 };
 pub use worker::{
     PassageEmbedder, ReindexOutcome, SkippedDb, WorkerConfig, WorkerDeps, WorkerHandle,

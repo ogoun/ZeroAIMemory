@@ -76,11 +76,13 @@ fn qdrant_state(s: &Option<QdrantState>) -> (&'static str, Option<String>) {
     }
 }
 
-/// Неудавшееся задание: цель — `node_id` у узла, `entry_id` у записи журнала.
+/// Неудавшееся задание: цель — `node_id` у узла, `entry_id` у записи журнала,
+/// `attachment_id` у документа вложения (путь — узла-владельца).
 fn failed_json(user: Id, f: &FailedJob) -> Value {
     let id_key = match f.target_kind {
         zam_core::TargetKind::Node => "node_id",
         zam_core::TargetKind::Entry => "entry_id",
+        zam_core::TargetKind::Attachment => "attachment_id",
     };
     let mut v = json!({
         "id": f.id,
@@ -94,6 +96,11 @@ fn failed_json(user: Id, f: &FailedJob) -> Value {
         "updated_at": fmt_ts(f.updated_at),
     });
     v[id_key] = json!(f.node_id);
+    // у документа вложения — код причины (`parse_crash`, `parse_timeout`, `parse_oom`,
+    // `parse_error`, `pdfium_unavailable`, `too_large`, `blob_missing`, `index_failed`)
+    if f.target_kind == zam_core::TargetKind::Attachment {
+        v["reason"] = json!(f.reason);
+    }
     v
 }
 
@@ -111,6 +118,7 @@ fn reindex_json(o: &ReindexOutcome) -> Value {
                 "users": r.users,
                 "nodes": r.nodes,
                 "entries": r.entries,
+                "attachments": r.attachments,
                 "points": r.points,
                 "folders": r.folders,
                 "misses": r.misses,
@@ -260,7 +268,26 @@ pub async fn status(
         }
         Principal::Token(_) | Principal::User { .. } => Value::Null,
     };
+    // конвейер вложений (M5) — только администратору: причина недоступности pdfium содержит
+    // путь установки сервера, счётчики — сумма по всем пользователям; токену — `null`
+    let docs = match p {
+        Principal::Admin { .. } => {
+            let d = st.docs.status();
+            json!({
+                // `null` — pdfium загружен или PDF ещё не разбирались
+                "pdfium_error": d.pdfium_error,
+                "workers": d.workers,
+                "running": d.running,
+                "extracted": d.extracted,
+                "cache_hits": d.cache_hits,
+                "failed": d.failed,
+                "spawned": d.spawned,
+            })
+        }
+        Principal::Token(_) | Principal::User { .. } => Value::Null,
+    };
     Ok(Json(json!({
+        "docs": docs,
         "vector": {
             "available": reason.is_none(),
             "reason": reason.map(|r| r.as_str()),

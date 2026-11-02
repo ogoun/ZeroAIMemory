@@ -25,7 +25,10 @@
 //!   insight `superseded` или `retracted` — 422 `/problems/cache-source-inactive`;
 //!   `rev` не совпал с текущей — 409 с `rev` (выжимка основана на устаревшем тексте).
 //!   Участник решения ссылается только на пространство решения (остальное владельца ему не
-//!   существует). Сервер закрепляет ревизии и хэши (`zam_store::cache_put`);
+//!   существует). Сервер закрепляет ревизии и хэши (`zam_store::cache_put`). Фрагмент вложения
+//!   `a:<chunk>` (карточка поиска, M5) — источник «заметка-владелец» (`n:<узел>`, те же права):
+//!   вложение — часть заметки, новая нарезка вложения уже помечает выжимки заметки устаревшими;
+//!   `rev` и `section` карточки вложения к заметке не относятся и отбрасываются;
 //! - выжимка длиннее `cache.summary_tokens` (600) — 413; dense-вектор запроса — эмбеддером
 //!   сервера, без модели — только точное попадание;
 //! - **видимость**: выжимка решения с источником вне пространства решения (владелец сослался
@@ -314,6 +317,45 @@ async fn resolve_source(
     }
 }
 
+/// Источник `a:<chunk>` (фрагмент вложения) → заметка-владелец (см. модуль): узел ищется в базе
+/// кэша (участнику — только в пространстве решения), затем в своей; дальше — проверки
+/// `n:<узел>` ([`resolve_source`]). `None` — не `a:`. Любой отказ — `cache-source-not-found` с
+/// исходной ссылкой `a:<chunk>`: id заметки-владельца в ответ не попадает, а существующий, но
+/// недоступный фрагмент неотличим от несуществующего (раунд правок 2 задачи 6).
+async fn attachment_source(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    sc: &MemScope,
+    raw: &str,
+) -> Result<Option<TargetRef>, ApiError> {
+    let raw = raw.trim();
+    let Some(chunk) = raw
+        .strip_prefix(zam_store::CHUNK_REF_LETTER)
+        .and_then(|r| r.strip_prefix(':'))
+    else {
+        return Ok(None);
+    };
+    let (me, own) = user_db(st, p, headers).await?;
+    let member = matches!(sc.role, Role::Member(_));
+    let mut dbs: Vec<(&Db, Option<Id>)> = vec![(&sc.db, member.then_some(sc.space.id))];
+    if me.id != sc.owner {
+        dbs.push((&own, None));
+    }
+    for (db, space) in dbs {
+        if let Some(node) = zam_store::attachment_chunk_owner(db, chunk.to_string(), space).await? {
+            return match resolve_source(st, p, headers, sc, &format!("n:{node}")).await {
+                Ok(t) => Ok(Some(t)),
+                // любой отказ по подставленной ссылке (нет, удалён, другая база, Human, нет
+                // доступа) — как «нет фрагмента», без id узла; сбой хранилища — как есть
+                Err(e @ (ApiError::Internal(_) | ApiError::Unavailable(_))) => Err(e),
+                Err(_) => Err(not_found(raw)),
+            };
+        }
+    }
+    Err(not_found(raw))
+}
+
 /// Пространство кэша запроса: решение (база владельца) или Knowledge пользователя.
 pub(crate) async fn cache_space(
     st: &AppState,
@@ -519,11 +561,18 @@ pub async fn put(
     )?;
     let mut sources = Vec::with_capacity(req.sources.len());
     for s in &req.sources {
-        let target = resolve_source(&st, &p, &headers, &sc, &s.id).await?;
+        let (target, rev, section) = match attachment_source(&st, &p, &headers, &sc, &s.id).await? {
+            Some(node) => (node, None, None),
+            None => (
+                resolve_source(&st, &p, &headers, &sc, &s.id).await?,
+                s.rev,
+                s.section.clone(),
+            ),
+        };
         sources.push(SourceSpec {
             target,
-            rev: s.rev,
-            section: s.section.clone(),
+            rev,
+            section,
         });
     }
     let promote = match &req.promote {

@@ -22,7 +22,9 @@ pub fn point_id(chunk_id: &str) -> Uuid {
 /// Payload точки (§6.4). Строковые id — в base32 (`Id::to_string`). Цель точки — ровно
 /// одно из `node_id` (узел) и `entry_id` (запись журнала): точку без цели или с обеими
 /// целями адаптер отклоняет. Поля записей (`entry_id`, `status`, `insight_kind`,
-/// `certainty`) добавлены в M3 без пересборки коллекции: у точек M2 их нет.
+/// `certainty`) добавлены в M3 без пересборки коллекции: у точек M2 их нет. Точка документа
+/// вложения (M5) несёт `node_id` узла-владельца (область, права, путь) и `attachment_id`:
+/// её цель — документ ([`TargetKind::Attachment`]), удаление точек узла её не задевает.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointPayload {
     /// Тенант — владелец базы, в которой лежит узел или запись; обязателен в каждом запросе.
@@ -51,18 +53,29 @@ pub struct PointPayload {
     pub insight_kind: Option<String>,
     /// `axiom` / `theorem` / `hypothesis`.
     pub certainty: Option<String>,
+    /// Документ вложения (M5): точка — его чанк, `node_id` — узел-владелец.
+    pub attachment_id: Option<Id>,
+    /// sha256 файла вложения.
+    pub blob_sha256: Option<String>,
+    /// Место в документе: `page:12`, `sheet:Итоги!A1:F40`, `slide:3`, `para:40`.
+    pub locator: Option<String>,
 }
 
 impl PointPayload {
-    /// Цель точки; `None` — нет ни одной цели или заданы обе.
+    /// Цель точки; `None` — нет ни одной цели или заданы обе. У точки вложения — документ
+    /// (`node_id` узла-владельца обязателен, `entry_id` — нет).
     pub fn target(&self) -> Option<TargetRef> {
-        match (self.node_id, self.entry_id) {
-            (Some(id), None) => Some(TargetRef {
+        match (self.node_id, self.entry_id, self.attachment_id) {
+            (Some(id), None, None) => Some(TargetRef {
                 kind: TargetKind::Node,
                 id,
             }),
-            (None, Some(id)) => Some(TargetRef {
+            (None, Some(id), None) => Some(TargetRef {
                 kind: TargetKind::Entry,
+                id,
+            }),
+            (Some(_), None, Some(id)) => Some(TargetRef {
+                kind: TargetKind::Attachment,
                 id,
             }),
             _ => None,
@@ -113,6 +126,13 @@ pub struct VectorFilter {
     /// (`level = kind = folder`, канал папок §8.3): фильтр точек папок — [`Self::folder_filter`].
     /// Остальные методы поле не читают.
     pub folders: bool,
+    /// Гибридный поиск: в области нет ни одного извлечённого документа вложения — prefetch
+    /// вложений не запускается ([`attachment_window`] = 0; вызывающий проверил SQLite: +1,8 мс к
+    /// p95 без пользы, замер ревью задачи 6 M5). Остальные методы поле не читают.
+    pub no_attachments: bool,
+    /// Гибридный поиск: окно prefetch вложений (`search.attach_prefetch` сервера); `None` —
+    /// [`ATTACH_PREFETCH`]. Остальные методы поле не читают.
+    pub attach_prefetch: Option<usize>,
 }
 
 impl VectorFilter {
@@ -267,58 +287,151 @@ pub(crate) fn check_points(pts: &[IndexPoint]) -> Result<(), IndexError> {
     }
     if pts.iter().any(|p| p.payload.target().is_none()) {
         return Err(IndexError::Other(
-            "у точки должна быть ровно одна цель: node_id или entry_id".into(),
+            "у точки должна быть ровно одна цель: node_id, entry_id или attachment_id с node_id"
+                .into(),
         ));
     }
     Ok(())
 }
 
-/// Цели, разделённые по виду: (id узлов, id записей) в base32.
-pub(crate) fn split_targets(targets: &[TargetRef]) -> (Vec<String>, Vec<String>) {
-    let mut nodes = Vec::new();
-    let mut entries = Vec::new();
-    for t in targets {
-        match t.kind {
-            TargetKind::Node => nodes.push(t.id.to_string()),
-            TargetKind::Entry => entries.push(t.id.to_string()),
-        }
-    }
-    (nodes, entries)
+/// Цели, разделённые по виду (id в base32).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SplitTargets {
+    pub nodes: Vec<String>,
+    pub entries: Vec<String>,
+    pub attachments: Vec<String>,
 }
 
-/// Цель точки по строковым `node_id` / `entry_id` из payload выдачи.
+impl SplitTargets {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.entries.is_empty() && self.attachments.is_empty()
+    }
+}
+
+/// Цели по виду: точки узла — по `node_id` без `attachment_id` (точки его вложений не
+/// задеваются), записи — по `entry_id`, документы вложений — по `attachment_id`.
+pub(crate) fn split_targets(targets: &[TargetRef]) -> SplitTargets {
+    let mut out = SplitTargets::default();
+    for t in targets {
+        match t.kind {
+            TargetKind::Node => out.nodes.push(t.id.to_string()),
+            TargetKind::Entry => out.entries.push(t.id.to_string()),
+            TargetKind::Attachment => out.attachments.push(t.id.to_string()),
+        }
+    }
+    out
+}
+
+/// Цель точки по строковым `node_id` / `entry_id` / `attachment_id` из payload выдачи.
 pub(crate) fn hit_target(
     node_id: Option<String>,
     entry_id: Option<String>,
+    attachment_id: Option<String>,
 ) -> Result<TargetRef, IndexError> {
     let parse = |s: String| {
         s.parse::<Id>()
             .map_err(|_| IndexError::Corrupt("точка с некорректным id цели".into()))
     };
-    match (node_id, entry_id) {
-        (Some(n), None) => Ok(TargetRef {
+    match (node_id, entry_id, attachment_id) {
+        (Some(n), None, None) => Ok(TargetRef {
             kind: TargetKind::Node,
             id: parse(n)?,
         }),
-        (None, Some(e)) => Ok(TargetRef {
+        (None, Some(e), None) => Ok(TargetRef {
             kind: TargetKind::Entry,
             id: parse(e)?,
         }),
+        (Some(_), None, Some(a)) => Ok(TargetRef {
+            kind: TargetKind::Attachment,
+            id: parse(a)?,
+        }),
         _ => Err(IndexError::Corrupt(
-            "у точки нет ровно одной цели (node_id / entry_id)".into(),
+            "у точки нет ровно одной цели (node_id / entry_id / attachment_id)".into(),
         )),
     }
 }
 
 /// Уровень и вид точки папки.
 pub const LEVEL_FOLDER: &str = "folder";
+/// Уровень и вид точки чанка документа вложения (M5).
+pub const LEVEL_ATTACHMENT: &str = "attachment";
+
+/// Окно prefetch фрагментов вложений гибридного поиска (dense и sparse, M5, задача 6, раунд 1):
+/// свой prefetch, а не общий с листами — длинный документ (PDF на 100+ страниц) иначе занимал
+/// всё окно листов, и листы заметок выпадали из выдачи. Итоговый лимит слияния растёт на окно.
+pub const ATTACH_PREFETCH: usize = 30;
+
+/// Окно prefetch вложений для фильтра `f` ([`VectorFilter::attach_prefetch`], по умолчанию
+/// [`ATTACH_PREFETCH`]): 0 — виды без `attachment` (или уровни без него) или в области нет
+/// извлечённых документов ([`VectorFilter::no_attachments`]); при `area`/`certainty` — вдвое
+/// (Qdrant эти условия у точек вложений не проверяет, часть окна отбросит SQLite по
+/// заметке-владельцу).
+pub fn attachment_window(f: &VectorFilter) -> usize {
+    let kind_ok = f.kinds.is_empty() || f.kinds.iter().any(|k| k == LEVEL_ATTACHMENT);
+    let level_ok = f.levels.is_empty() || f.levels.iter().any(|l| l == LEVEL_ATTACHMENT);
+    if f.no_attachments || !(kind_ok && level_ok) {
+        return 0;
+    }
+    let base = f.attach_prefetch.unwrap_or(ATTACH_PREFETCH);
+    if f.area.is_some() || !f.certainty.is_empty() {
+        2 * base
+    } else {
+        base
+    }
+}
 
 /// Поля payload, которые читает выдача поиска.
-pub(crate) const HIT_FIELDS: [&str; 5] = ["chunk_id", "user_id", "node_id", "entry_id", "level"];
+pub(crate) const HIT_FIELDS: [&str; 6] = [
+    "chunk_id",
+    "user_id",
+    "node_id",
+    "entry_id",
+    "attachment_id",
+    "level",
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Окно prefetch вложений: виды и уровни с `attachment` (пустые — все), вдвое при условиях
+    /// владельца, 0 — без документов в области (`no_attachments`, раунд правок 2 задачи 6 M5).
+    #[test]
+    fn attachment_window_rules() {
+        let f = VectorFilter::default();
+        assert_eq!(attachment_window(&f), ATTACH_PREFETCH);
+        let only_notes = VectorFilter {
+            kinds: vec!["note".into()],
+            ..VectorFilter::default()
+        };
+        assert_eq!(attachment_window(&only_notes), 0);
+        let chunk = VectorFilter {
+            levels: vec!["chunk".into()],
+            ..VectorFilter::default()
+        };
+        assert_eq!(attachment_window(&chunk), 0);
+        let area = VectorFilter {
+            area: Some("a".into()),
+            kinds: vec!["note".into(), "attachment".into()],
+            ..VectorFilter::default()
+        };
+        assert_eq!(attachment_window(&area), 2 * ATTACH_PREFETCH);
+        let wide = VectorFilter {
+            attach_prefetch: Some(100),
+            ..area.clone()
+        };
+        assert_eq!(attachment_window(&wide), 200);
+        let narrow = VectorFilter {
+            attach_prefetch: Some(10),
+            ..VectorFilter::default()
+        };
+        assert_eq!(attachment_window(&narrow), 10);
+        let none = VectorFilter {
+            no_attachments: true,
+            ..area
+        };
+        assert_eq!(attachment_window(&none), 0);
+    }
 
     #[test]
     fn namespace_is_documented_value() {
@@ -367,18 +480,27 @@ mod tests {
     fn hit_target_needs_exactly_one() {
         let id = Id::new();
         assert_eq!(
-            hit_target(Some(id.to_string()), None).unwrap(),
+            hit_target(Some(id.to_string()), None, None).unwrap(),
             TargetRef {
                 kind: TargetKind::Node,
                 id
             }
         );
         assert_eq!(
-            hit_target(None, Some(id.to_string())).unwrap().kind,
+            hit_target(None, Some(id.to_string()), None).unwrap().kind,
             TargetKind::Entry
         );
-        assert!(hit_target(None, None).is_err());
-        assert!(hit_target(Some(id.to_string()), Some(id.to_string())).is_err());
-        assert!(hit_target(Some("bad".into()), None).is_err());
+        let att = Id::new();
+        assert_eq!(
+            hit_target(Some(id.to_string()), None, Some(att.to_string())).unwrap(),
+            TargetRef {
+                kind: TargetKind::Attachment,
+                id: att
+            }
+        );
+        assert!(hit_target(None, None, Some(att.to_string())).is_err());
+        assert!(hit_target(None, None, None).is_err());
+        assert!(hit_target(Some(id.to_string()), Some(id.to_string()), None).is_err());
+        assert!(hit_target(Some("bad".into()), None, None).is_err());
     }
 }

@@ -1098,6 +1098,8 @@ fn mcp_vault_value_not_in_debug_log() {
     };
     call(json!({"action": "set", "name": "github", "value": value}));
     assert!(call(json!({"action": "get", "name": "github"})).contains(value));
+    // журнал пишется фоновым потоком: kill без штатной остановки — сначала дождаться записи
+    common::process::wait_server_log(&data, "DEBUG", Duration::from_secs(5));
     srv.kill();
     let mut log = String::new();
     for e in std::fs::read_dir(data.join("logs")).unwrap().flatten() {
@@ -1168,7 +1170,15 @@ async fn mcp_descriptions_under_300() {
         ("memory_recall", &["recovery", "brief"]),
         (
             "memory_search",
-            &["term", "task", "question", "file", "decided_by"],
+            &[
+                "term",
+                "task",
+                "question",
+                "file",
+                "decided_by",
+                "attachment",
+                "a:",
+            ],
         ),
         ("memory_link", &["contradicts"]),
         ("memory_vault", &["host", "environment"]),
@@ -1367,4 +1377,70 @@ async fn mcp_answer_requires_by() {
     .await
     .json();
     assert_eq!(o["decision"]["certainty"], "hypothesis", "{o}");
+}
+
+/// M5, задача 7: `memory_read` читает вложение по `locator` (`locator` — в схеме элемента,
+/// описание упоминает `a:`, `b:` и `locator`, до 300 символов); `locator` у заметки — ошибка
+/// инструмента с `locator-invalid`; инструментов по-прежнему 10.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_read_locator() {
+    let a = api("mcp-read-locator", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let tools = list["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 10, "{list}");
+    let t = tools.iter().find(|t| t["name"] == "memory_read").unwrap();
+    let props = &t["inputSchema"]["properties"]["items"]["items"]["properties"];
+    assert_eq!(props["locator"]["type"], "string", "{t}");
+    let d = t["description"].as_str().unwrap();
+    assert!(d.chars().count() <= 300, "{} символов", d.chars().count());
+    for w in ["a:", "b:", "locator"] {
+        assert!(d.contains(w), "нет «{w}»: {d}");
+    }
+    let n = a
+        .note("knowledge", "Доклады/Квартал", "# Квартал\n\nИтоги.\n")
+        .await;
+    let id = n["id"].as_str().unwrap();
+    let deck = common::attach::pptx(&[
+        ("Intro", "nothing special"),
+        ("Second", "cobalt walrus migration"),
+    ]);
+    common::attach::upload(&a, &a.token, id, "квартал.pptx", &deck).await;
+    let d = common::attach::wait_done(&a, a.st.admin_id, id, "квартал.pptx").await;
+    let b = format!("b:{}", d.blob_sha256);
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_read",
+        json!({"items": [{"id": &b, "locator": "slide:2"}]}),
+    )
+    .await;
+    assert!(o.text.contains("cobalt walrus"), "{}", o.text);
+    assert!(!o.text.contains("nothing special"), "{}", o.text);
+    assert!(o.text.contains("квартал.pptx · слайд 2"), "{}", o.text);
+    // без locator — оглавление
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_read",
+        json!({"items": [{"id": &b}]}),
+    )
+    .await;
+    assert!(
+        o.text.contains("slide:2") && o.text.contains("Second"),
+        "{}",
+        o.text
+    );
+    // locator у заметки — ошибка инструмента
+    let o = tool(
+        &a,
+        &a.token,
+        &[],
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}"), "locator": "page:1"}]}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("locator"), "{}", o.text);
 }

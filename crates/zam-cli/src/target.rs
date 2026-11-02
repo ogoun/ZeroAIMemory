@@ -91,6 +91,19 @@ pub fn entry_ref(raw: &str) -> Option<&str> {
     (is_entry_ref_letter(p) && is_node_id(id)).then_some(id)
 }
 
+/// Ссылка на вложение (M5): `a:<chunk_id>` (32 hex, фрагмент из выдачи `zam search`),
+/// `b:<sha256>` (64 hex, блоб) или `d:<id>` (документ, `attachment_id` карточки). Префикс без
+/// такого значения — не ссылка (остаётся путём).
+pub fn doc_ref(raw: &str) -> bool {
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    match raw.split_once(':') {
+        Some(("a", v)) => hex(v, 32),
+        Some(("b", v)) => hex(v, 64),
+        Some(("d", v)) => is_node_id(v),
+        _ => false,
+    }
+}
+
 /// Пространство цели до разрешения решения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpaceSel {

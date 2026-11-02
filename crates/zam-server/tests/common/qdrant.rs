@@ -209,6 +209,30 @@ impl TestQdrant {
     pub fn grpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.grpc_port)
     }
+
+    /// Все точки коллекции с payload — прямым REST API Qdrant, мимо адаптера и его фильтров.
+    pub fn points(&self) -> Vec<serde_json::Value> {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.http_port));
+        let mut out = Vec::new();
+        let mut offset = serde_json::Value::Null;
+        loop {
+            let (code, v) = super::process::http(
+                addr,
+                "POST",
+                &format!("/collections/{}/points/scroll", zam_index::COLLECTION),
+                Some(&self.api_key),
+                Some(&serde_json::json!({"limit": 1000, "with_payload": true,
+                                         "with_vector": false, "offset": offset})),
+            )
+            .expect("scroll Qdrant");
+            assert_eq!(code, 200, "{v}");
+            out.extend(v["result"]["points"].as_array().unwrap().iter().cloned());
+            offset = v["result"]["next_page_offset"].clone();
+            if offset.is_null() {
+                return out;
+            }
+        }
+    }
 }
 
 /// Ждёт `GET /readyz` и открытый gRPC-порт (до 60 с: данные проекта на HDD). Процесс,

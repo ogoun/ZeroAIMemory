@@ -24,6 +24,13 @@ regex.workspace = true
 globset.workspace = true
 similar.workspace = true
 zam-markdown = { path = "../zam-markdown" }
+# типы извлечения документов (`Extracted`, `Unit`, `Locator`, `DocKind`) для кэша `blob_extract` и
+# чанков вложений (M5); без фичи `pdfium` крейт — чистый Rust (quick-xml, zip, encoding_rs)
+zam-docs = { path = "../zam-docs" }
+# id чанков вложений — UUIDv5 (M5, задача 4)
+uuid.workspace = true
+# кэш извлечения вложений: `units` — zstd(JSON) (M5 §3)
+zstd.workspace = true
 half.workspace = true
 tracing.workspace = true
 

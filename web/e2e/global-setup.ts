@@ -7,6 +7,7 @@ import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { request } from '@playwright/test';
 import { seed, seedJournals, type AdminCall } from './seed';
+import { seedDocs } from './seed-docs';
 import { ADMIN_STATE } from './session';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
@@ -68,6 +69,12 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     Object.entries(process.env).filter(([k]) => !k.toUpperCase().startsWith('ZAM_')),
   );
   env.ZAM_ADMIN_PASSWORD = ADMIN_PASSWORD;
+  // pdfium для индексации PDF-вложений (M5) — из cargo xtask fetch-deps, как в тестах Rust
+  const pdfium = process.platform === 'win32'
+    ? `${repo}target/deps/windows-x64/pdfium/pdfium.dll`
+    : `${repo}target/deps/linux-x64/pdfium/libpdfium.so`;
+  if (existsSync(pdfium)) env.ZAM_DOCS__PDFIUM_DYLIB = pdfium;
+  else console.warn(`нет ${pdfium} (cargo xtask fetch-deps): PDF-вложения не индексируются`);
   const base = `http://${lanIp()}:${port}/`;
   const child = spawn(exe, ['serve', '--bind', `0.0.0.0:${port}`, '--data-dir', data], {
     env,
@@ -113,6 +120,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       return (await resp.json()) as T;
     };
     const journals = await seedJournals(base, token, admin);
+    const docs = await seedDocs(base, token);
     await rc.storageState({ path: ADMIN_STATE });
     await rc.dispose();
     process.env.E2E_BASE_URL = base;
@@ -120,6 +128,9 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_NOTE_MEDIA = ids.media;
     process.env.E2E_NOTE_SECOND = ids.second;
     process.env.E2E_NOTE_ELK = ids.elk;
+    process.env.E2E_NOTE_DOCS = docs.docs;
+    process.env.E2E_NOTE_ATTACH = docs.attach;
+    process.env.E2E_NOTE_BOMB = docs.bomb;
     // токен администратора — для правок «из другого места» в сценариях конфликта
     process.env.E2E_ADMIN_TOKEN = token;
     process.env.E2E_INSIGHT_OLD = journals.oldInsight;

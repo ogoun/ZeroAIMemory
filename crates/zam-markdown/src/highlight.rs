@@ -12,8 +12,8 @@
 use std::sync::LazyLock;
 
 use syntect::highlighting::ThemeSet;
-use syntect::html::{ClassStyle, ClassedHTMLGenerator, css_for_theme_with_class_style};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::html::{ClassStyle, css_for_theme_with_class_style, line_tokens_to_classed_spans};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 /// Стиль классов: атомы области видимости через пробел, каждый с `hl-`.
@@ -25,7 +25,14 @@ const LIGHT_THEME: &str = "InspiredGitHub";
 const DARK_THEME: &str = "base16-ocean.dark";
 
 /// Сколько байт исходного кода подсвечивается на документ суммарно.
-pub(crate) const HIGHLIGHT_BUDGET_BYTES: usize = 256 * 1024;
+pub const HIGHLIGHT_BUDGET_BYTES: usize = 256 * 1024;
+/// Сколько байт HTML подсветки строится на документ суммарно (ревью задачи 8 M5, раунд 2): без
+/// него надбавка «+64 КиБ» на каждый блок давала 1000 блокам `[` по 250 Б 25 МБ HTML и 16 с.
+/// Блок, разметка которого не помещается в остаток, — экранированный текст (`hl-skipped`).
+pub const HIGHLIGHT_HTML_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+/// Строка длиннее не подсвечивается (блок целиком — экранированный текст): предел проверяется
+/// после строки, и одна длинная строка временно раздувала бы разметку до десятков МБ.
+pub const HIGHLIGHT_LINE_MAX: usize = 16 * 1024;
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
@@ -42,19 +49,46 @@ pub(crate) enum Highlighted {
     Plain,
 }
 
-/// Подсвечивает `code` для языка `lang` (первое слово info-строки), списывая
-/// размер блока с `budget` (остаток бюджета документа).
-pub(crate) fn highlight(lang: &str, code: &str, budget: &mut usize) -> Highlighted {
+/// Остаток бюджетов подсветки документа: байт исходника и байт HTML.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Budget {
+    pub source: usize,
+    pub html: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget {
+            source: HIGHLIGHT_BUDGET_BYTES,
+            html: HIGHLIGHT_HTML_BUDGET_BYTES,
+        }
+    }
+}
+
+/// Подсвечивает `code` для языка `lang` (первое слово info-строки), списывая размер блока с
+/// бюджета исходника и фактический HTML — с бюджета HTML документа. Предел HTML блока —
+/// `min(40 × исходник + 64 КиБ, остаток бюджета HTML)`.
+pub(crate) fn highlight(lang: &str, code: &str, budget: &mut Budget) -> Highlighted {
     let Some(syntax) = syntax_for(lang) else {
         return Highlighted::Plain;
     };
-    if code.len() > *budget {
+    if code.len() > budget.source {
         return Highlighted::Skipped;
     }
-    *budget -= code.len();
-    match highlight_with(syntax, code) {
-        Some(html) => Highlighted::Html(html),
-        None => Highlighted::Plain,
+    budget.source -= code.len();
+    let max = code
+        .len()
+        .saturating_mul(HIGHLIGHT_RATIO_MAX)
+        .saturating_add(64 * 1024)
+        .min(budget.html);
+    match highlight_with(syntax, code, max) {
+        Ok(html) => {
+            budget.html -= html.len();
+            Highlighted::Html(html)
+        }
+        // разметка раздулась сверх предела — как блок вне бюджета
+        Err(Fail::TooLarge) => Highlighted::Skipped,
+        Err(Fail::Syntect) => Highlighted::Plain,
     }
 }
 
@@ -65,15 +99,197 @@ fn syntax_for(lang: &str) -> Option<&'static SyntaxReference> {
     SYNTAXES.find_syntax_by_token(lang)
 }
 
-fn highlight_with(syntax: &SyntaxReference, code: &str) -> Option<String> {
+/// Во сколько раз HTML подсветки может быть больше исходника. Замер на файлах проекта (классы
+/// `hl-*`): Rust 11–15×, JSON 25×, CSS 28×; враждебные `[`/`'''`/`&a` — 80–100×. Предел 8×
+/// из ревью отключил бы подсветку обычного кода, 40× отделяет одно от другого.
+pub const HIGHLIGHT_RATIO_MAX: usize = 40;
+
+/// Наибольший HTML подсветки файла ([`highlight_source`]), байт: не больше
+/// [`HIGHLIGHT_RATIO_MAX`] × исходник + 64 КиБ и не больше 4 МиБ. Один символ (`[` в JSON,
+/// тройная кавычка в Python) даёт до сотни байт разметки — без предела 256 КиБ раздувались до
+/// 25 МБ (ревью задачи 8 M5, I-1). Блок кода заметки — без предела 4 МиБ (исходник ограничен
+/// бюджетом документа 256 КиБ, прежнее поведение рендера сохраняется).
+pub fn highlight_html_max(source_len: usize) -> usize {
+    source_len
+        .saturating_mul(HIGHLIGHT_RATIO_MAX)
+        .saturating_add(64 * 1024)
+        .min(4 * 1024 * 1024)
+}
+
+/// Почему подсветка не получилась.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fail {
+    /// HTML больше [`highlight_html_max`].
+    TooLarge,
+    /// Ошибка syntect.
+    Syntect,
+}
+
+/// HTML подсветки `code` построчно (как `ClassedHTMLGenerator`); рост проверяется после каждой
+/// строки — сверх `max` байт разбор прекращается сразу.
+fn highlight_with(syntax: &SyntaxReference, code: &str, max: usize) -> Result<String, Fail> {
     let ss = &*SYNTAXES;
-    let mut generator = ClassedHTMLGenerator::new_with_class_style(syntax, ss, CLASS_STYLE);
-    for line in LinesWithEndings::from(code) {
-        generator
-            .parse_html_for_line_which_includes_newline(line)
-            .ok()?;
+    if code.split('\n').any(|l| l.len() > HIGHLIGHT_LINE_MAX) {
+        return Err(Fail::TooLarge);
     }
-    Some(generator.finalize())
+    let mut state = ParseState::new(syntax);
+    let mut stack = ScopeStack::new();
+    let mut open: usize = 0;
+    let mut out = String::with_capacity(code.len().saturating_mul(2).min(max));
+    for line in LinesWithEndings::from(code) {
+        let ops = state.parse_line(line, ss).map_err(|_| Fail::Syntect)?;
+        let (html, delta) = line_tokens_to_classed_spans(line, &ops, CLASS_STYLE, &mut stack)
+            .map_err(|_| Fail::Syntect)?;
+        open = open.saturating_add_signed(delta);
+        // с закрывающими `</span>` всех открытых областей
+        if out.len() + html.len() + 7 * open > max {
+            return Err(Fail::TooLarge);
+        }
+        out.push_str(&html);
+    }
+    for _ in 0..open {
+        out.push_str("</span>");
+    }
+    Ok(out)
+}
+
+/// Подсвеченный исходный файл (превью вложения, M5 задача 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceHtml {
+    /// HTML: только `<span class="hl-…">` и экранированный текст (без атрибутов, кроме
+    /// `class`, без стилей и скриптов) — вставляется в `<pre><code>` под CSP без `unsafe-inline`.
+    pub html: String,
+    /// Имя синтаксиса syntect; `None` — простой текст.
+    pub syntax: Option<String>,
+    /// Байт исходника подсвечено (остаток — экранированный текст без подсветки).
+    pub highlighted: usize,
+    /// Подсветка отброшена: `too_large` — HTML больше [`highlight_html_max`].
+    pub skipped: Option<&'static str>,
+}
+
+/// Синтаксис файла `name`: по расширению, затем по первой строке `code`; простой текст — `None`.
+fn source_syntax(name: &str, code: &str) -> Option<&'static SyntaxReference> {
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or(name);
+    let ss = &*SYNTAXES;
+    ss.find_syntax_by_extension(ext)
+        .or_else(|| ss.find_syntax_by_extension(&ext.to_ascii_lowercase()))
+        .or_else(|| ss.find_syntax_by_first_line(code.lines().next().unwrap_or("")))
+        .filter(|s| s.name != "Plain Text")
+}
+
+/// Имя синтаксиса, который [`highlight_source`] выберет для файла `name` (ключ кэша превью).
+pub fn source_syntax_name(name: &str, code: &str) -> &'static str {
+    source_syntax(name, code).map_or("Plain Text", |s| s.name.as_str())
+}
+
+fn plain(code: &str, skipped: Option<&'static str>) -> SourceHtml {
+    SourceHtml {
+        html: escape_html(code),
+        syntax: None,
+        highlighted: 0,
+        skipped,
+    }
+}
+
+/// Подсвечивает файл `name` (синтаксис — по расширению, затем по первой строке) с классами
+/// `hl-*`: первые `budget` байт по границе строки, дальше — экранированный текст. Неизвестный
+/// синтаксис и ошибка syntect — экранированный текст целиком; HTML подсветки больше
+/// [`highlight_html_max`] — тоже, с `skipped = Some("too_large")`.
+pub fn highlight_source(name: &str, code: &str, budget: usize) -> SourceHtml {
+    let Some(syntax) = source_syntax(name, code) else {
+        return plain(code, None);
+    };
+    // граница бюджета — конец строки, не дальше бюджета
+    let mut cut = code.len().min(budget);
+    if cut < code.len() {
+        while !code.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        cut = code[..cut].rfind('\n').map_or(0, |i| i + 1);
+    }
+    let (head, tail) = code.split_at(cut);
+    match highlight_with(syntax, head, highlight_html_max(head.len())) {
+        Ok(mut html) => {
+            html.push_str(&escape_html(tail));
+            SourceHtml {
+                html,
+                syntax: Some(syntax.name.clone()),
+                highlighted: head.len(),
+                skipped: None,
+            }
+        }
+        Err(Fail::TooLarge) => plain(code, Some("too_large")),
+        Err(Fail::Syntect) => plain(code, None),
+    }
+}
+
+/// Сущности, которыми экранирован текст подсветки (syntect `Escape` и [`escape_html`]).
+const ENTITIES: [&str; 5] = ["&lt;", "&gt;", "&amp;", "&quot;", "&#39;"];
+
+/// Символ имени класса подсветки после `hl-`: атомы областей syntect (`c++`, `c#`, `diff.git`).
+fn class_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '#' | '.')
+}
+
+/// HTML — ровно того вида, что выдаёт [`highlight_source`]: только `<span class="hl-…">` (классы
+/// `hl-<атом>` через одиночный пробел), парные `</span>` и текст, в котором `<`, `>`, `"`, `'`
+/// не встречаются, а `&` — только в пяти сущностях экранирования. Сервер проверяет так HTML
+/// подсветки от рабочего процесса разбора (файл недоверенный, процесс мог быть захвачен), прежде
+/// чем WebUI вставит его через `{@html}` (финальное ревью M5, I-3).
+pub fn is_highlight_html(html: &str) -> bool {
+    const OPEN: &str = "<span class=\"";
+    const CLOSE: &str = "</span>";
+    let mut rest = html;
+    let mut depth: usize = 0;
+    while let Some(c) = rest.chars().next() {
+        if let Some(r) = rest.strip_prefix(OPEN) {
+            let Some((classes, tail)) = r.split_once("\">") else {
+                return false;
+            };
+            let ok = !classes.is_empty()
+                && classes.split(' ').all(|t| {
+                    t.strip_prefix("hl-")
+                        .is_some_and(|a| !a.is_empty() && a.chars().all(class_char))
+                });
+            if !ok {
+                return false;
+            }
+            depth += 1;
+            rest = tail;
+        } else if let Some(r) = rest.strip_prefix(CLOSE) {
+            let Some(d) = depth.checked_sub(1) else {
+                return false;
+            };
+            depth = d;
+            rest = r;
+        } else if c == '&' {
+            let Some(e) = ENTITIES.iter().find(|e| rest.starts_with(**e)) else {
+                return false;
+            };
+            rest = &rest[e.len()..];
+        } else if matches!(c, '<' | '>' | '"' | '\'') {
+            return false;
+        } else {
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    depth == 0
+}
+
+/// Экранирование текста для HTML (`&`, `<`, `>`, `"`, `'`).
+pub fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 16);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// CSS классов `hl-*`: светлая тема по умолчанию, тёмная — внутри
@@ -96,4 +312,131 @@ fn build_css() -> String {
     out.push_str(&css(DARK_THEME));
     out.push_str("}\n");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Проверка HTML подсветки: вывод подсветки всех встроенных синтаксисов проходит, разметка
+    /// враждебного рабочего процесса — нет.
+    #[test]
+    fn highlight_html_validator() {
+        let code = "#!/bin/sh\n// <b>x</b> & \"q\" 'a' [[ ]] {{ }} \\ $x @y %z\n\
+                    fn f() { return 1 + 2; } # c\n<a href=\"x\">t</a>\n";
+        let mut checked = 0;
+        for syn in SYNTAXES.syntaxes() {
+            let Some(ext) = syn.file_extensions.first() else {
+                continue;
+            };
+            let h = highlight_source(&format!("f.{ext}"), code, HIGHLIGHT_BUDGET_BYTES);
+            assert!(is_highlight_html(&h.html), "{}: {}", syn.name, h.html);
+            checked += 1;
+        }
+        assert!(checked > 30, "{checked}");
+        assert!(is_highlight_html(&escape_html(code)));
+        for bad in [
+            "<script>alert(1)</script>",
+            "<span class=\"hl-a\" onclick=\"x\">t</span>",
+            "<span class=\"hl-a\"><img src=x onerror=alert(1)></span>",
+            "<span class=\"x\">t</span>",
+            "<span class=\"hl-a\">t",
+            "t</span>",
+            "<span class=\"hl-a\"\">t</span>",
+            "<span class=\"hl-\">t</span>",
+            "<span class=\"hl-a  hl-b\">t</span>",
+            "<span class='hl-a'>t</span>",
+            "a &lt b",
+            "a &#x3c; b",
+            "\" onmouseover=\"x",
+            "<svg/onload=alert(1)>",
+        ] {
+            assert!(!is_highlight_html(bad), "{bad}");
+        }
+    }
+
+    /// Исходник в HTML: только классы и экранированный текст; разметка из файла не проходит.
+    #[test]
+    fn source_escaped_classes_only_and_budget() {
+        let code = "fn main() { let s = \"<script>alert('x')</script>\"; }\n";
+        let h = highlight_source("x.rs", code, HIGHLIGHT_BUDGET_BYTES);
+        assert_eq!(h.syntax.as_deref(), Some("Rust"));
+        assert_eq!(h.highlighted, code.len());
+        assert!(h.html.contains("hl-"), "{}", h.html);
+        assert!(!h.html.contains("<script"), "{}", h.html);
+        assert!(h.html.contains("&lt;script&gt;"), "{}", h.html);
+        assert!(!h.html.contains("style="), "{}", h.html);
+        // единственные теги — span с классом
+        let tags: Vec<&str> = h
+            .html
+            .split('<')
+            .skip(1)
+            .map(|t| t.split('>').next().unwrap())
+            .collect();
+        assert!(
+            tags.iter()
+                .all(|t| *t == "/span" || t.starts_with("span class=\"")),
+            "{tags:?}"
+        );
+        // неизвестный вид — простой экранированный текст
+        let p = highlight_source("data.zzz", "a < b & c", HIGHLIGHT_BUDGET_BYTES);
+        assert_eq!((p.syntax, p.html.as_str()), (None, "a &lt; b &amp; c"));
+        // сверх бюджета — по границе строки, хвост экранирован
+        // бюджет превью — 64 КиБ: при 256 КиБ плотный код упирается в общий предел 4 МиБ
+        let budget = 64 * 1024;
+        let big = "    let total = items.iter().map(|item| item.len()).sum::<usize>(); // <b>\n"
+            .repeat(budget / 20);
+        let b = highlight_source("big.rs", &big, budget);
+        assert_eq!(b.skipped, None);
+        assert!(b.highlighted <= budget && b.highlighted > 0);
+        assert_eq!(big.as_bytes()[b.highlighted - 1], b'\n');
+        assert!(
+            b.html.ends_with("// &lt;b&gt;\n"),
+            "{}",
+            &b.html[b.html.len() - 40..]
+        );
+        // JSON и YAML узнаются по расширению
+        assert_eq!(
+            highlight_source("a.json", "{\"a\": 1}", 1024)
+                .syntax
+                .as_deref(),
+            Some("JSON")
+        );
+        assert!(highlight_source("a.yaml", "a: 1\n", 1024).syntax.is_some());
+        assert_eq!(p.skipped, None);
+    }
+
+    /// Раздувание разметки (ревью задачи 8, I-1): `[` в JSON, тройные кавычки в Python, якоря
+    /// YAML — HTML не больше предела; сверх него — экранированный текст и `too_large`.
+    #[test]
+    fn source_blowup_capped() {
+        for (name, code) in [
+            ("a.json", "[".repeat(256 * 1024)),
+            ("a.py", "\'\'\'\n".repeat(64 * 1024)),
+            ("a.yaml", "&a \n".repeat(64 * 1024)),
+        ] {
+            let t = std::time::Instant::now();
+            let h = highlight_source(name, &code, HIGHLIGHT_BUDGET_BYTES);
+            eprintln!(
+                "{name}: {} Б → {} Б, {:?}, {:?}",
+                code.len(),
+                h.html.len(),
+                h.skipped,
+                t.elapsed()
+            );
+            match h.skipped {
+                Some(s) => {
+                    assert_eq!((s, h.syntax.as_deref()), ("too_large", None));
+                    assert!(h.html.len() <= 6 * code.len(), "{name}");
+                }
+                None => assert!(h.html.len() <= highlight_html_max(code.len()), "{name}"),
+            }
+        }
+        let j = highlight_source("a.json", &"[".repeat(256 * 1024), HIGHLIGHT_BUDGET_BYTES);
+        assert_eq!(j.skipped, Some("too_large"));
+        // обычный код предел не задевает
+        let own = highlight_source("h.rs", include_str!("highlight.rs"), 64 * 1024);
+        assert_eq!((own.skipped, own.syntax.as_deref()), (None, Some("Rust")));
+        assert_eq!(j.html.len(), 256 * 1024);
+    }
 }

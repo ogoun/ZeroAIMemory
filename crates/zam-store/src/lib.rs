@@ -4,9 +4,11 @@
 //! записи журналов решения (`entries`, M3), граф связей (`edges`, M3), реестр решений и доступ
 //! участников (`system.db`), Vault (`vault_items`, ключи пользователей; M3), сессии агентов,
 //! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4), кэш выжимок
-//! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5).
+//! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5), вложения как
+//! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5).
 
 pub mod access;
+pub mod attachments;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
@@ -36,9 +38,21 @@ pub mod user_db;
 pub mod vault;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
+pub use attachments::{
+    AttachmentDoc, BLOB_MISSING, CHUNK_REF_LETTER, CHUNKER_ATTACHMENTS_KEY, CachedExtract,
+    DOCS_LIMITS_KEY, DocChunkHead, DocFound, DocIntake, DocLimitsKey, DocLookup, ExtractEnd,
+    ExtractState, ExtractTarget, PDFIUM_UNAVAILABLE, ReindexAttachment, TOO_LARGE,
+    attachment_chunk_owner, attachment_chunker_fingerprint, attachment_chunks_for_index,
+    attachment_pieces, blob_sheet_locators, cached_extract, chunk_ref, detach, doc_chunk_heads,
+    doc_chunk_texts, doc_sheet_locators, enqueue_attachment_upserts, ensure_extract_jobs,
+    error_code, extract_cached, extract_target, find_docs, finish_extract, has_attachment_chunks,
+    has_failed_with, list_attachments, put_extract, put_extract_failure, rechunk_docs_if_stale,
+    reindex_attachments_page, reindex_docs, replace_attachment_chunks, requeue_failed_with,
+    set_extract_state, sync_doc_limits,
+};
 pub use blobs::{
-    AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_in_space,
-    resolve_attachment,
+    AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_by_sha,
+    blob_meta_by_sha_in_space, blob_meta_in_space, resolve_attachment,
 };
 pub use cache::{
     CACHE_LOOKUP_MAX, CACHE_QUERY_MAX_CHARS, CACHE_SOURCES_MAX, CacheDep, CacheEntry, CacheError,
@@ -83,11 +97,12 @@ pub use graph::{
     GraphNode, GraphStore, NewEdge, get_edge, graph_node, graph_nodes,
 };
 pub use jobs::{
-    EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp, JobOutcome, JobStats,
-    NodePayload, ReindexNote, chunks_for_index, claim_jobs, complete_job, enqueue_reindex,
-    enqueue_upserts, fail_job, failed_jobs, finish_reindexed, folder_embed_input,
-    folders_for_index, indexable_count, indexed_count, job_stats, mark_reindex, pending_reindex,
-    reindex_page, release_job, requeue_running, set_index_state,
+    AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
+    JobOutcome, JobStats, NodePayload, ReindexNote, chunks_for_index, claim_extract_jobs,
+    claim_jobs, complete_job, defer_job, enqueue_reindex, enqueue_upserts, fail_job, failed_jobs,
+    finish_reindexed, folder_embed_input, folders_for_index, give_up_job, indexable_count,
+    indexed_count, job_stats, mark_reindex, pending_reindex, reindex_page, release_job,
+    requeue_running, requeue_running_extract, set_index_state,
 };
 pub use migrate::Migration;
 pub use nodes::{
@@ -106,13 +121,13 @@ pub use questions::{
     days_ago, open_questions, question_duplicates, recent_answered,
 };
 pub use search::{
-    AliasGroup, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery, LeafChunk, LeafHit,
-    MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits, leaves_of_targets,
-    live_chunks, live_folders, neighbor_leaves, node_leaves, pending_count, query_needles,
-    query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
+    AliasGroup, AttachmentHit, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery,
+    LeafChunk, LeafHit, MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits,
+    leaves_of_targets, live_chunks, live_folders, neighbor_leaves, node_leaves, pending_count,
+    query_needles, query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
 };
 pub use sessions::{
-    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, Session, SessionTouch,
+    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,
     TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
     add_tokens, check_session_id, end_session, gc_sessions, get_session, latest_session,
     list_sessions, mark_seen, mark_seen_with_tokens, seen_revs, session_tokens, touch_session,

@@ -45,6 +45,7 @@ pub struct ServerConfig {
     pub recall: RecallSection,
     pub limits: LimitsSection,
     pub vault: VaultSection,
+    pub docs: DocsSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -506,6 +507,13 @@ pub struct SearchSection {
     pub recency_half_life_days: f64,
     /// Не больше чанков с одного узла (≥ 1).
     pub max_per_node: usize,
+    /// Не больше фрагментов с одного документа вложения (≥ 1, по умолчанию 2; M5): квота
+    /// заметки-владельца (`max_per_node`) — своя, вложение её не занимает.
+    pub max_per_attachment: usize,
+    /// Окно prefetch фрагментов вложений гибридного поиска (dense и sparse, M5; 1..=500, по
+    /// умолчанию 30 — `zam_index::ATTACH_PREFETCH`, вдвое при `area`/`certainty`). Подбор — eval
+    /// документов задачи 10 M5 (`eval/results/2026-11-02-m5-docs-summary.md`).
+    pub attach_prefetch: usize,
     /// Множители слитого балла (§9.2 п. 4) для insight вида `gotcha` и `failure` и для узлов и
     /// записей текущей области (`X-Zam-Area`). По умолчанию 1,05 / 1,05 / 1,10 — сетка eval задачи
     /// 18 M3: буст вида должен быть ниже буста `theorem` (1,10), иначе гипотеза `gotcha` обходит
@@ -565,6 +573,12 @@ impl SearchSection {
         }
         if self.max_per_node == 0 {
             return Err(bad("max_per_node", "должно быть больше 0"));
+        }
+        if self.max_per_attachment == 0 {
+            return Err(bad("max_per_attachment", "должно быть больше 0"));
+        }
+        if !(1..=500).contains(&self.attach_prefetch) {
+            return Err(bad("attach_prefetch", "должно быть в 1..=500"));
         }
         for (k, v) in [
             ("boost_gotcha", self.boost_gotcha),
@@ -737,6 +751,151 @@ impl RecallSection {
     }
 }
 
+/// Секция `[docs]` (M5 §1–2): лимиты разбора документов и рабочие процессы разбора
+/// (`zam-server doc-worker`: все виды документов, задача 5 M5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocsSection {
+    /// Библиотека pdfium; по умолчанию рядом с исполняемым файлом (`pdfium.dll` /
+    /// `libpdfium.so`), относительный путь — от каталога исполняемого файла.
+    pub pdfium_dylib: Option<PathBuf>,
+    /// Рабочих процессов разбора (1..=16, 2): столько же документов разбирается одновременно.
+    pub workers: usize,
+    /// Заданий на процесс до перезапуска (1..=100000, 200).
+    pub worker_jobs: u32,
+    /// Лимит памяти процесса, МиБ (128..=65536, 2048; не меньше 3 × `max_bytes` + 64 МиБ):
+    /// Job Object / `RLIMIT_AS`.
+    pub worker_memory_mb: u64,
+    /// Срок разбора файла, мс (100..=3600000, 60000); по истечении процесс убивается.
+    pub timeout_ms: u64,
+    /// Рабочих процессов превью (1..=16, 1): свой пул, чтобы долгий разбор индексации не
+    /// задерживал первый экран листа (ТЗ §17); лимиты памяти и срок — те же.
+    pub preview_workers: usize,
+    /// Предел кэша превью `previews/`, МиБ (1..=1048576, 1024): сверх него старые файлы
+    /// вытесняются.
+    pub preview_cache_mb: u64,
+    /// Размер файла, байт (100 МиБ); больше — отказ.
+    pub max_bytes: u64,
+    /// Распакованный объём zip, байт (500 МиБ).
+    pub max_unpacked: u64,
+    /// Степень сжатия записи zip (100).
+    pub max_ratio: u32,
+    /// Записей zip (10000).
+    pub max_entries: u32,
+    /// Глубина XML (256).
+    pub max_xml_depth: u32,
+    /// Непустых ячеек листа (2 млн).
+    pub max_cells: u64,
+    /// Объём выдачи, символов (20 млн): текст, пути заголовков и служебный вес единиц.
+    pub max_chars: u64,
+    /// Страниц PDF (5000).
+    pub max_pages: u32,
+    /// Исполняемый файл рабочего процесса (подкоманда `doc-worker`); `None` — исполняемый файл
+    /// сервера. Не ключ конфигурации: его задают интеграционные тесты, где текущий исполняемый
+    /// файл — тестовый, а не `zam-server`.
+    #[serde(skip)]
+    pub worker_program: Option<PathBuf>,
+}
+
+impl Default for DocsSection {
+    fn default() -> Self {
+        let l = zam_docs::Limits::default();
+        DocsSection {
+            pdfium_dylib: None,
+            workers: 2,
+            worker_jobs: 200,
+            worker_memory_mb: 2048,
+            timeout_ms: 60_000,
+            preview_workers: 1,
+            preview_cache_mb: 1024,
+            max_bytes: l.max_bytes,
+            max_unpacked: l.max_unpacked,
+            max_ratio: l.max_ratio,
+            max_entries: l.max_entries,
+            max_xml_depth: l.max_xml_depth,
+            max_cells: l.max_cells,
+            max_chars: l.max_chars,
+            max_pages: l.max_pages,
+            worker_program: None,
+        }
+    }
+}
+
+impl DocsSection {
+    /// Лимиты разбора `zam-docs`.
+    pub fn limits(&self) -> zam_docs::Limits {
+        zam_docs::Limits {
+            max_bytes: self.max_bytes,
+            max_unpacked: self.max_unpacked,
+            max_ratio: self.max_ratio,
+            max_entries: self.max_entries,
+            // внутренний предел разбора (не ключ `[docs]`): защита каталога zip, не настройка
+            max_central_dir: zam_docs::Limits::default().max_central_dir,
+            max_xml_depth: self.max_xml_depth,
+            max_cells: self.max_cells,
+            max_chars: self.max_chars,
+            max_pages: self.max_pages,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("docs.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=16).contains(&self.workers) {
+            return Err(bad("workers", "от 1 до 16"));
+        }
+        if !(1..=100_000).contains(&self.worker_jobs) {
+            return Err(bad("worker_jobs", "от 1 до 100000"));
+        }
+        if !(128..=65_536).contains(&self.worker_memory_mb) {
+            return Err(bad("worker_memory_mb", "от 128 до 65536"));
+        }
+        if !(100..=3_600_000).contains(&self.timeout_ms) {
+            return Err(bad("timeout_ms", "от 100 до 3600000"));
+        }
+        if !(1..=16).contains(&self.preview_workers) {
+            return Err(bad("preview_workers", "от 1 до 16"));
+        }
+        if !(1..=1_048_576).contains(&self.preview_cache_mb) {
+            return Err(bad("preview_cache_mb", "от 1 до 1048576"));
+        }
+        for (k, v) in [
+            ("max_bytes", self.max_bytes),
+            ("max_unpacked", self.max_unpacked),
+            ("max_ratio", u64::from(self.max_ratio)),
+            ("max_entries", u64::from(self.max_entries)),
+            ("max_xml_depth", u64::from(self.max_xml_depth)),
+            ("max_cells", self.max_cells),
+            ("max_chars", self.max_chars),
+            ("max_pages", u64::from(self.max_pages)),
+        ] {
+            if v == 0 {
+                return Err(bad(k, "должно быть больше 0"));
+            }
+        }
+        // файл целиком в кадре base64 рабочего процесса: кадр — u32
+        if self.max_bytes > 1 << 30 {
+            return Err(bad("max_bytes", "не больше 1 ГиБ"));
+        }
+        // в рабочем процессе одновременно: кадр base64 (4/3), декодированный файл и pdfium
+        let need = 3 * self.max_bytes + 64 * 1024 * 1024;
+        if self.worker_memory_mb * 1024 * 1024 < need {
+            return Err(bad(
+                "worker_memory_mb",
+                &format!(
+                    "меньше 3 × max_bytes + 64 МиБ = {} МиБ: файл предельного размера \
+                     не разобрать; увеличьте worker_memory_mb или уменьшите max_bytes",
+                    need.div_ceil(1024 * 1024)
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Секция `[vault]` (§7.6): файл мастер-ключа. Сам ключ — только в файле или в
 /// `ZAM_MASTER_KEY` (переменная важнее файла), в конфигурацию он не попадает.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -826,6 +985,8 @@ impl Default for ServerConfig {
                 w_trigram: 0.7,
                 recency_half_life_days: 180.0,
                 max_per_node: 3,
+                max_per_attachment: 2,
+                attach_prefetch: zam_index::ATTACH_PREFETCH,
                 boost_gotcha: 1.05,
                 boost_failure: 1.05,
                 boost_area: 1.10,
@@ -865,6 +1026,7 @@ impl Default for ServerConfig {
                 blob_max_bytes: 209_715_200,
             },
             vault: VaultSection::default(),
+            docs: DocsSection::default(),
         }
     }
 }
@@ -1036,6 +1198,7 @@ pub fn load(
     cfg.read.validate()?;
     cfg.cache.validate()?;
     cfg.recall.validate()?;
+    cfg.docs.validate()?;
     Ok(cfg)
 }
 
@@ -1723,6 +1886,12 @@ yield_ms = 1
             (60.0, 1.0, 1.0, 0.7)
         );
         assert_eq!((d.recency_half_life_days, d.max_per_node), (180.0, 3));
+        assert_eq!(d.max_per_attachment, 2);
+        assert_eq!(d.attach_prefetch, 30);
+        for v in ["0", "501"] {
+            let bad = vec![env("ZAM_SEARCH__ATTACH_PREFETCH", v)];
+            assert!(load(None, &bad, &Default::default()).is_err(), "{v}");
+        }
         // ослабленный bm25 — вес по eval (§18.2)
         assert_eq!(d.w_fts_relaxed, 0.25);
         assert_eq!(d.w_fts_alias, 0.5);
@@ -1932,5 +2101,48 @@ master_key = \"x\"
             .to_string();
         assert!(!e.contains("SECRET"), "{e}");
         assert!(e.contains("строка 2"), "{e}");
+    }
+
+    #[test]
+    fn docs_section_defaults_and_memory_check() {
+        let d = load(None, &[], &Default::default()).unwrap().docs;
+        assert_eq!(
+            (d.workers, d.worker_jobs, d.worker_memory_mb),
+            (2, 200, 2048)
+        );
+        assert_eq!(d.timeout_ms, 60_000);
+        assert_eq!((d.preview_workers, d.preview_cache_mb), (1, 1024));
+        assert_eq!(d.limits(), zam_docs::Limits::default());
+        // 3 × 100 МиБ + 64 МиБ = 364 МиБ > 256
+        let e = load(
+            None,
+            &[env("ZAM_DOCS__WORKER_MEMORY_MB", "256")],
+            &Default::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("docs.worker_memory_mb") && e.contains("364"),
+            "{e}"
+        );
+        let ok = vec![
+            env("ZAM_DOCS__WORKER_MEMORY_MB", "256"),
+            env("ZAM_DOCS__MAX_BYTES", "10485760"),
+        ];
+        assert!(load(None, &ok, &Default::default()).is_ok());
+        let e = load(None, &[env("ZAM_DOCS__WORKERS", "0")], &Default::default());
+        assert!(e.unwrap_err().to_string().contains("docs.workers"));
+        let e = load(
+            None,
+            &[env("ZAM_DOCS__PREVIEW_WORKERS", "17")],
+            &Default::default(),
+        );
+        assert!(e.unwrap_err().to_string().contains("docs.preview_workers"));
+        let e = load(
+            None,
+            &[env("ZAM_DOCS__PREVIEW_CACHE_MB", "0")],
+            &Default::default(),
+        );
+        assert!(e.unwrap_err().to_string().contains("docs.preview_cache_mb"));
     }
 }

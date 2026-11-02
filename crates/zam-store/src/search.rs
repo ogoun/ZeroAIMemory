@@ -29,6 +29,14 @@
 //! `note` (заметки) и виды записей, статусы — только у insight (записи без статуса проходят
 //! всегда). У записей нет пути: при `path_prefix` они не выдаются.
 //!
+//! С M5 (задача 6) цель чанка вложения — документ ([`TargetKind::Attachment`],
+//! `attachment_docs.id`),
+//! поля файла и `locator` — в [`FtsHit::attachment`]. Вид `attachment` фильтра целей пропускает
+//! чанки живых документов (`attachment_docs.deleted_at IS NULL`) живых узлов-владельцев в
+//! пространствах области; путь, `area`, `certainty` и ссылки на файлы — узла-владельца на момент
+//! поиска (наследование: правка заметки сразу меняет выдачу её вложений без переизвлечения).
+//! Решения (`decided_by`) вложениями не бывают. Листы, соседи и замена сводок — только `chunk`.
+//!
 //! Выборка двухшаговая в одной читающей транзакции: каналы отбирают только
 //! `rowid` и узел (глобальный top с запасом из индекса FTS, затем фильтр области;
 //! если в области осталось мало — точный запрос с фильтром), текст, метаданные
@@ -81,8 +89,8 @@ const SNIPPET_CHARS: usize = 160;
 /// любые статусы и области.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetFilter {
-    /// `note` (заметки) и виды записей (`insight`, `changelog`, `release`); пусто — все.
-    /// Остальные значения (`folder`, `attachment`) чанков не находят.
+    /// `note` (заметки), `attachment` (фрагменты вложений, M5) и виды записей (`insight`,
+    /// `changelog`, `release`, …); пусто — все. `folder` чанков не находит.
     pub kinds: Vec<String>,
     /// Разрешённые статусы записей всех видов; пусто — любые. Записи без статуса и узлы проходят.
     pub statuses: Vec<String>,
@@ -118,6 +126,8 @@ const ENTRY_KINDS: [&str; 6] = [
 struct TargetArgs {
     /// Узлы проходят.
     notes: bool,
+    /// Чанки вложений проходят.
+    attachments: bool,
     /// JSON-массив разрешённых видов записей.
     kinds: String,
     /// JSON-массив разрешённых статусов или `None` (любые).
@@ -143,6 +153,7 @@ impl TargetFilter {
             .collect();
         TargetArgs {
             notes: all || self.kinds.iter().any(|k| k == "note"),
+            attachments: all || self.kinds.iter().any(|k| k == "attachment"),
             kinds: serde_json::Value::from(kinds).to_string(),
             statuses: (!self.statuses.is_empty())
                 .then(|| serde_json::Value::from(self.statuses.clone()).to_string()),
@@ -187,16 +198,33 @@ pub struct AliasGroup {
     pub with: Vec<String>,
 }
 
+/// Поля чанка вложения в хите поиска (M5, задача 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentHit {
+    /// Документ вложения (`attachment_docs.id`) — он же [`FtsHit::target`].
+    pub id: Id,
+    /// Узел-владелец (его путь — [`FtsHit::path`]).
+    pub node_id: Id,
+    pub filename: String,
+    pub blob_sha256: String,
+    /// Адрес фрагмента в документе (`page:12`, `sheet:Итоги!A1:F40`, `slide:3`, `para:40`).
+    pub locator: Option<String>,
+    /// Номер листа в документе — только у листа с секретом в имени (карточка показывает его
+    /// `sheet:#N`); заполняет сервер после выборки (задача 7 M5, раунд правок 2).
+    pub sheet_no: Option<u32>,
+}
+
 /// Найденный чанк (FTS или — через [`live_chunks`] — векторный хит).
 #[derive(Debug, Clone)]
 pub struct FtsHit {
     pub chunk_id: String,
-    /// Цель чанка: узел или запись журнала.
+    /// Цель чанка: узел, запись журнала или документ вложения.
     pub target: TargetRef,
     pub space_id: Id,
+    /// Путь узла (у вложения — узла-владельца); у записи пуст.
     pub path: String,
     pub heading_path: String,
-    /// `chunk` / `section` / `note`.
+    /// `chunk` / `section` / `note` / `attachment`.
     pub level: String,
     /// Ревизия, по которой построен чанк.
     pub rev: i64,
@@ -224,8 +252,10 @@ pub struct FtsHit {
     pub area: Option<String>,
     /// `certainty` узла или записи (`nodes.certainty` / `entries.certainty`, §7.5).
     pub certainty: Option<String>,
-    /// `nodes.verified_at` заметки (M4.5 §7); у записи — `None`.
+    /// `nodes.verified_at` заметки (M4.5 §7); у записи и вложения — `None`.
     pub verified_at: Option<String>,
+    /// Поля вложения; `None` — чанк заметки или записи.
+    pub attachment: Option<AttachmentHit>,
 }
 
 /// Поля записи журнала в хите поиска.
@@ -240,50 +270,91 @@ pub struct EntryHit {
     pub title: String,
 }
 
-/// Цель чанка по `chunks.node_id` / `chunks.entry_id`.
-fn chunk_target(node: Option<Id>, entry: Option<Id>) -> rusqlite::Result<TargetRef> {
-    match (node, entry) {
-        (Some(id), None) => Ok(TargetRef {
+/// Цель чанка по `chunks.node_id` / `chunks.entry_id` / `chunks.attachment_id`: у чанка
+/// вложения `node_id` — узел-владелец, цель — документ.
+fn chunk_target(
+    node: Option<Id>,
+    entry: Option<Id>,
+    attachment: Option<Id>,
+) -> rusqlite::Result<TargetRef> {
+    match (node, entry, attachment) {
+        (Some(_), None, Some(id)) => Ok(TargetRef {
+            kind: TargetKind::Attachment,
+            id,
+        }),
+        (Some(id), None, None) => Ok(TargetRef {
             kind: TargetKind::Node,
             id,
         }),
-        (None, Some(id)) => Ok(TargetRef {
+        (None, Some(id), None) => Ok(TargetRef {
             kind: TargetKind::Entry,
             id,
         }),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             1,
             rusqlite::types::Type::Text,
-            "у чанка нет ровно одной цели (node_id / entry_id)".into(),
+            "у чанка нет ровно одной цели (node_id / entry_id / attachment_id)".into(),
         )),
     }
 }
 
-/// Соединение чанка `c` с его узлом `n` или записью `e`. LEFT JOIN, как и CROSS JOIN,
-/// фиксирует порядок: сначала чанки, затем цель по первичному ключу.
-const TARGET_JOIN: &str =
-    "LEFT JOIN nodes n ON n.id = c.node_id LEFT JOIN entries e ON e.id = c.entry_id";
+/// Соединение чанка `c` с его узлом `n` (у вложения — владельцем), записью `e` и документом
+/// вложения `ad`. LEFT JOIN, как и CROSS JOIN, фиксирует порядок: сначала чанки, затем цель по
+/// первичному ключу.
+const TARGET_JOIN: &str = "LEFT JOIN nodes n ON n.id = c.node_id
+     LEFT JOIN entries e ON e.id = c.entry_id
+     LEFT JOIN attachment_docs ad ON ad.id = c.attachment_id";
 
-/// Колонки хита для [`hit_row`] (после [`TARGET_JOIN`]).
+/// Колонки хита для [`hit_row`] (после [`TARGET_JOIN`]). У вложения время — привязки документа
+/// (`attachment_docs.created_at`: правка заметки текст файла не меняет), без `verified_at`.
+/// `index_state` вложения — документа (своего столбца нет): `indexed` — извлечён и заданий точек
+/// в очереди нет, `pending` — ждёт извлечения или точек, `failed` — задание неудачно, `excluded` —
+/// заметка `index: false`. Иначе фрагмент без точек понижался бы ослабленным bm25 как видимый
+/// вектору (задача 6 M5, раунд 1).
 const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.space_id),
-    coalesce(n.path, ''), c.heading_path, c.rev, coalesce(n.updated_at, e.updated_at), c.text,
-    c.level, c.token_count, coalesce(n.index_state, e.index_state), e.kind, e.status,
+    coalesce(n.path, ''), c.heading_path, c.rev,
+    coalesce(ad.created_at, n.updated_at, e.updated_at), c.text,
+    c.level, c.token_count,
+    CASE WHEN c.attachment_id IS NULL THEN coalesce(n.index_state, e.index_state)
+         WHEN n.index_state = 'excluded' THEN 'excluded'
+         WHEN EXISTS (SELECT 1 FROM index_jobs j WHERE j.target_kind = 'attachment'
+                      AND j.target_id = ad.id AND j.state = 'failed') THEN 'failed'
+         WHEN ad.extract_state = 'done' AND NOT EXISTS (SELECT 1 FROM index_jobs j
+                      WHERE j.target_kind = 'attachment' AND j.target_id = ad.id
+                        AND j.state IN ('queued', 'running')) THEN 'indexed'
+         ELSE 'pending' END,
+    e.kind, e.status,
     CASE WHEN json_type(e.data, '$.kind') = 'text' THEN json_extract(e.data, '$.kind') END,
     e.certainty, e.title, coalesce(n.area, e.area), coalesce(n.certainty, e.certainty),
-    n.verified_at";
+    CASE WHEN c.attachment_id IS NULL THEN n.verified_at END,
+    c.attachment_id, ad.filename, ad.blob_sha256, c.locator";
 
 /// Хит по колонкам [`HIT_COLS`], начиная с колонки `o`.
 fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
-    let target = chunk_target(r.get(o + 1)?, r.get(o + 2)?)?;
-    let entry = match target.kind {
-        TargetKind::Node => None,
-        TargetKind::Entry => Some(EntryHit {
-            kind: r.get(o + 12)?,
-            status: r.get(o + 13)?,
-            insight_kind: r.get(o + 14)?,
-            certainty: r.get(o + 15)?,
-            title: r.get(o + 16)?,
-        }),
+    let target = chunk_target(r.get(o + 1)?, r.get(o + 2)?, r.get(o + 20)?)?;
+    let (entry, attachment) = match target.kind {
+        TargetKind::Node => (None, None),
+        TargetKind::Entry => (
+            Some(EntryHit {
+                kind: r.get(o + 12)?,
+                status: r.get(o + 13)?,
+                insight_kind: r.get(o + 14)?,
+                certainty: r.get(o + 15)?,
+                title: r.get(o + 16)?,
+            }),
+            None,
+        ),
+        TargetKind::Attachment => (
+            None,
+            Some(AttachmentHit {
+                id: target.id,
+                node_id: r.get(o + 1)?,
+                filename: r.get(o + 21)?,
+                blob_sha256: r.get(o + 22)?,
+                locator: r.get(o + 23)?,
+                sheet_no: None,
+            }),
+        ),
     };
     Ok(FtsHit {
         chunk_id: r.get(o)?,
@@ -304,6 +375,7 @@ fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
         area: r.get(o + 17)?,
         certainty: r.get(o + 18)?,
         verified_at: r.get(o + 19)?,
+        attachment,
     })
 }
 
@@ -479,13 +551,26 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
 /// пространства — с `?3`, за ними [`TargetArgs`]: «узлы проходят», JSON видов записей,
 /// JSON статусов или NULL, область или NULL (см. [`scope_args`]). Префикс сравнивается через
 /// substr, а не LIKE: LIKE в SQLite нечувствителен к регистру ASCII и требует экранирования `%` и
-/// `_`. У записи пути нет: при префиксе она не проходит.
+/// `_`. У записи пути нет: при префиксе она не проходит. Чанк вложения (`attachment_id`, M5)
+/// проходит по своей ветке: вид `attachment`, живой документ и живой узел-владелец, область;
+/// префикс, `area`, `certainty` и ссылка на файл — узла-владельца; при `decided_by` — нет.
 fn scope_sql(n_spaces: usize) -> String {
     let sp = placeholders(3, n_spaces);
     let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
     let (cert, by, file, ik) = (7 + n_spaces, 8 + n_spaces, 9 + n_spaces, 10 + n_spaces);
+    let att = 11 + n_spaces;
     format!(
-        "((c.node_id IS NOT NULL AND ?{notes} AND ?{by} IS NULL AND n.deleted_at IS NULL
+        "((c.node_id IS NOT NULL AND c.attachment_id IS NULL AND ?{notes} AND ?{by} IS NULL
+           AND n.deleted_at IS NULL
+           AND n.space_id IN ({sp})
+           AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
+           AND (?{area} IS NULL OR n.area = ?{area})
+           AND (?{cert} IS NULL OR n.certainty IN (SELECT value FROM json_each(?{cert})))
+           AND (?{file} IS NULL OR EXISTS (SELECT 1 FROM file_refs fr WHERE fr.owner_kind = 'node'
+                AND fr.owner_id = n.id AND fr.path = ?{file})))
+          OR (c.attachment_id IS NOT NULL AND ?{att} AND ?{by} IS NULL
+           AND ad.deleted_at IS NULL AND ad.node_id = c.node_id
+           AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
            AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
            AND (?{area} IS NULL OR n.area = ?{area})
@@ -514,7 +599,8 @@ fn scope_sql(n_spaces: usize) -> String {
     )
 }
 
-/// Параметры [`scope_sql`] после `?1`: префикс, пространства, фильтр целей.
+/// Параметры [`scope_sql`] после `?1`: префикс, пространства, фильтр целей (последний — «вложения
+/// проходят»).
 fn scope_args<'a>(
     first: &'a dyn ToSql,
     prefix: &'a Option<&'a str>,
@@ -531,6 +617,7 @@ fn scope_args<'a>(
     args.push(&t.decided_by);
     args.push(&t.file);
     args.push(&t.insight_kinds);
+    args.push(&t.attachments);
     args
 }
 
@@ -578,7 +665,7 @@ fn run_channel(
     let ids = json_ids(&top);
     let args = scope_args(&ids, &prefix, spaces, targets);
     let mut st = c.prepare_cached(&format!(
-        "SELECT c.seq, c.node_id, c.entry_id, c.level = 'note'
+        "SELECT c.seq, c.node_id, c.entry_id, c.attachment_id, c.level = 'note'
          FROM json_each(?1) j
          CROSS JOIN chunks c ON c.seq = j.value
          {TARGET_JOIN}
@@ -587,7 +674,10 @@ fn run_channel(
     ))?;
     let allowed: HashMap<i64, (TargetRef, bool)> = st
         .query_map(params_from_iter(args), |r| {
-            Ok((r.get(0)?, (chunk_target(r.get(1)?, r.get(2)?)?, r.get(3)?)))
+            Ok((
+                r.get(0)?,
+                (chunk_target(r.get(1)?, r.get(2)?, r.get(3)?)?, r.get(4)?),
+            ))
         })?
         .collect::<Result<_, _>>()?;
     let out: Vec<Cand> = top_raw
@@ -605,7 +695,7 @@ fn run_channel(
 
     let args = scope_args(&fts, &prefix, spaces, targets);
     let mut st = c.prepare_cached(&format!(
-        "SELECT f.rowid, c.node_id, c.entry_id, c.level = 'note', {order}
+        "SELECT f.rowid, c.node_id, c.entry_id, c.attachment_id, c.level = 'note', {order}
          FROM {table} f
          CROSS JOIN chunks c ON c.seq = f.rowid
          {TARGET_JOIN}
@@ -617,9 +707,9 @@ fn run_channel(
     let rows = st.query_map(params_from_iter(args), |r| {
         Ok((
             r.get(0)?,
-            chunk_target(r.get(1)?, r.get(2)?)?,
-            r.get(3)?,
+            chunk_target(r.get(1)?, r.get(2)?, r.get(3)?)?,
             r.get(4)?,
+            r.get(5)?,
         ))
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -1033,6 +1123,8 @@ pub async fn leaves_of_targets(
             let st = match t.kind {
                 TargetKind::Node => &mut by_node,
                 TargetKind::Entry => &mut by_entry,
+                // листов (`level = 'chunk'`) у документа вложения нет
+                TargetKind::Attachment => continue,
             };
             let rows = st.query_map(params![t.id, with_text], |r| {
                 Ok(LeafChunk {
@@ -1078,6 +1170,8 @@ pub async fn first_leaves(
             let st = match t.kind {
                 TargetKind::Node => &mut by_node,
                 TargetKind::Entry => &mut by_entry,
+                // листов (`level = 'chunk'`) у документа вложения нет
+                TargetKind::Attachment => continue,
             };
             if let Some(id) = st
                 .query_row([t.id], |r| r.get::<_, String>(0))
@@ -1143,6 +1237,8 @@ pub async fn leaf_term_hits(
             let col = match kind {
                 TargetKind::Node => "node_id",
                 TargetKind::Entry => "entry_id",
+                // в `lists` вложений нет: листов у них нет
+                TargetKind::Attachment => continue,
             };
             let mut st = tx.prepare_cached(&format!(
                 "SELECT c.seq, c.id, c.{col}, c.heading_path, c.ordinal FROM chunks c
@@ -1394,12 +1490,24 @@ const PENDING_COUNT_SQL: &str = "SELECT (SELECT count(*) FROM nodes n INDEXED BY
        AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/'))
      + (SELECT count(*) FROM entries e
         WHERE e.index_state = 'pending' AND e.deleted_at IS NULL AND ?2 IS NULL
-          AND e.space_id IN (SELECT value FROM json_each(?1)))";
+          AND e.space_id IN (SELECT value FROM json_each(?1)))
+     + (SELECT count(*) FROM attachment_docs ad
+        JOIN nodes n ON n.id = ad.node_id
+        JOIN spaces s ON s.id = n.space_id
+        WHERE ad.id IN (SELECT id FROM attachment_docs INDEXED BY attachment_docs_pending
+                        WHERE extract_state = 'pending' AND deleted_at IS NULL
+                        UNION SELECT target_id FROM index_jobs INDEXED BY index_jobs_active
+                        WHERE target_kind = 'attachment' AND state IN ('queued', 'running'))
+          AND ad.deleted_at IS NULL AND n.deleted_at IS NULL AND s.kind <> 'human'
+          AND n.index_state <> 'excluded'
+          AND n.space_id IN (SELECT value FROM json_each(?1))
+          AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/'))";
 
 /// Сколько живых заметок и записей журналов в `space_ids` (и под `path_prefix`, если задан;
 /// у записей пути нет — при префиксе они не считаются) ждут векторной индексации
 /// (`index_state = 'pending'`) — `pending_count` выдачи поиска. Заметки с `index: false`
-/// (`excluded`) не считаются.
+/// (`excluded`) не считаются. С M5 — и живые документы вложений живых заметок (кроме Human),
+/// ждущие извлечения или задания точек.
 pub async fn pending_count(
     db: &Db,
     space_ids: Vec<Id>,
@@ -1441,6 +1549,159 @@ mod tests {
         let plan = plan.join("; ");
         assert!(plan.contains("nodes_pending"), "{plan}");
         assert!(plan.contains("entries_pending"), "{plan}");
+        // вложения (задача 10 M5): документы в очереди — по частичному индексу и активным
+        // заданиям, а не обходом всех документов области
+        assert!(plan.contains("attachment_docs_pending"), "{plan}");
+        assert!(plan.contains("index_jobs_active"), "{plan}");
+        assert!(!plan.contains("SCAN ad"), "{plan}");
+    }
+
+    /// Проверка «есть ли чанки вложений в области» (prefetch вложений поиска) идёт от заметок
+    /// области (`nodes_live_path`), а не обходом всех чанков вложений базы (задача 10 M5).
+    #[test]
+    fn has_attachment_chunks_walks_space_nodes() {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        let sql = crate::attachments::HAS_ATTACHMENT_CHUNKS_SQL;
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = st
+            .query_map(params!["[\"x\"]"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("; ");
+        assert!(plan.contains("nodes_live_path"), "{plan}");
+        assert!(
+            plan.contains("chunks_attachment (attachment_id=?)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN c"), "{plan}");
+        // предварительная проверка: база без чанков вложений — 0 без обхода заметок
+        assert!(
+            plan.contains("SEARCH chunks USING COVERING INDEX chunks_attachment (attachment_id>?)"),
+            "{plan}"
+        );
+        c.execute_batch(
+            "INSERT INTO spaces (id, kind, name, created_at) VALUES ('x', 'knowledge', 'x', 't');
+             INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at, updated_at)
+               VALUES ('n1', 'x', 'note', 'n', 'n', 'indexed', 't', 't');",
+        )
+        .unwrap();
+        let has = |c: &Connection| -> i64 { c.query_row(sql, ["[\"x\"]"], |r| r.get(0)).unwrap() };
+        assert_eq!(has(&c), 0);
+        c.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO attachment_docs (id, node_id, blob_sha256, filename, extract_state, created_at)
+               VALUES ('d1', 'n1', 'b', 'f.pdf', 'done', 't');
+             INSERT INTO chunks (id, node_id, rev, level, ordinal, text, context_prefix, token_count,
+                                 text_hash, attachment_id, locator)
+               VALUES ('c1', 'n1', 1, 'attachment', 0, 'x', '', 1, 'h', 'd1', 'page:1');",
+        )
+        .unwrap();
+        assert_eq!(has(&c), 1);
+    }
+
+    /// Замер задачи 10 M5 (журнал этапа): `pending_count` и проверка «есть ли чанки вложений в
+    /// области» (`has_attachment_chunks`, prefetch вложений поиска) на базе с `docs` документами
+    /// вложений по 10 чанков в пространстве A и без них в пространстве B. Печатает время запроса
+    /// (медиана 9 повторов). `cargo test -p zam-store --release -- --ignored --nocapture
+    /// attachment_queries_scale`.
+    #[test]
+    #[ignore = "замер, вручную"]
+    fn attachment_queries_scale() {
+        use std::time::Instant;
+        for docs in [1_000u32, 10_000, 100_000] {
+            let c = Connection::open_in_memory().unwrap();
+            for m in crate::USER_MIGRATIONS {
+                c.execute_batch(m.sql).unwrap();
+            }
+            let t = "2026-11-02T00:00:00.000000Z";
+            c.execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO spaces (id, kind, name, created_at) VALUES ('A', 'knowledge', 'A', '{t}'),
+                   ('B', 'solution', 'B', '{t}'), ('C', 'solution', 'C', '{t}');
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {docs})
+                 INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at, updated_at)
+                   SELECT 'cn' || i, 'C', 'note', 'cn' || i, 'c/n' || i, 'indexed', '{t}', '{t}'
+                   FROM s;
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {docs})
+                 INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at, updated_at)
+                   SELECT 'n' || i, CASE WHEN i % 100 = 0 THEN 'B' ELSE 'A' END, 'note', 'n' || i,
+                          'p/n' || i, 'indexed', '{t}', '{t}' FROM s;
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {docs})
+                 INSERT INTO blobs (sha256, size, created_at) SELECT 'b' || i, 1, '{t}' FROM s;
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < {docs})
+                 INSERT INTO attachment_docs (id, node_id, blob_sha256, filename, extract_state,
+                                              created_at)
+                   SELECT 'd' || i, 'n' || (CASE WHEN i % 100 = 0 THEN i + 1 ELSE i END), 'b' || i,
+                          'f.pdf', 'done', '{t}' FROM s;
+                 WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < {docs} * 10 - 1)
+                 INSERT INTO chunks (id, node_id, rev, level, ordinal, text, context_prefix,
+                                     token_count, text_hash, attachment_id, locator)
+                   SELECT 'c' || i, 'n' || (i / 10 + 1 + CASE WHEN (i / 10 + 1) % 100 = 0 THEN 1 ELSE 0 END),
+                          1, 'attachment', i % 10, 'x', '', 1, 'h', 'd' || (i / 10 + 1), 'page:1'
+                   FROM s;"
+            ))
+            .unwrap();
+            let time = |sql: &str, p: &[&dyn rusqlite::ToSql]| {
+                let mut ms: Vec<f64> = (0..9)
+                    .map(|_| {
+                        let t0 = Instant::now();
+                        let _: i64 = c.query_row(sql, p, |r| r.get(0)).unwrap();
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    })
+                    .collect();
+                ms.sort_by(f64::total_cmp);
+                ms[4]
+            };
+            let none: Option<String> = None;
+            let sp = |x: &str| format!("[\"{x}\"]");
+            let (a, b, cc) = (sp("A"), sp("B"), sp("C"));
+            let has = crate::attachments::HAS_ATTACHMENT_CHUNKS_SQL;
+            println!(
+                "docs {docs}: pending_count A {:.2} мс, B {:.2} мс, C {:.2} мс; has_attachment_chunks A {:.3} мс, B {:.2} мс, C {:.2} мс",
+                time(PENDING_COUNT_SQL, &[&a, &none]),
+                time(PENDING_COUNT_SQL, &[&b, &none]),
+                time(PENDING_COUNT_SQL, &[&cc, &none]),
+                time(has, &[&a]),
+                time(has, &[&b]),
+                time(has, &[&cc]),
+            );
+        }
+        // база без вложений вовсе (частый случай): 100 тыс. заметок одной области
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        let t = "2026-11-02T00:00:00.000000Z";
+        c.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO spaces (id, kind, name, created_at) VALUES ('A', 'knowledge', 'A', '{t}');
+             WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 100000)
+             INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at, updated_at)
+               SELECT 'n' || i, 'A', 'note', 'n' || i, 'p/n' || i, 'indexed', '{t}', '{t}' FROM s;"
+        ))
+        .unwrap();
+        let mut ms: Vec<f64> = (0..9)
+            .map(|_| {
+                let t0 = Instant::now();
+                let _: i64 = c
+                    .query_row(
+                        crate::attachments::HAS_ATTACHMENT_CHUNKS_SQL,
+                        ["[\"A\"]"],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        println!(
+            "без вложений, 100 тыс. заметок: has_attachment_chunks {:.3} мс",
+            ms[4]
+        );
     }
 
     #[test]

@@ -1,0 +1,82 @@
+/* Документ просмотрщика PDF: цвета — токены WebUI (app.css), тема — по prefers-color-scheme. */
+@import '../app.css';
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+body {
+  background: var(--bg);
+}
+.toolbar {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.toolbar .group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.toolbar .find {
+  margin-left: auto;
+}
+.toolbar button {
+  padding: 3px 10px;
+  min-width: 30px;
+}
+.toolbar input {
+  padding: 3px 8px;
+}
+#page-num {
+  width: 64px;
+  text-align: right;
+}
+#find {
+  width: min(240px, 40vw);
+}
+#zoom {
+  min-width: 44px;
+  text-align: center;
+  font-size: 13px;
+}
+#find-status {
+  font-size: 13px;
+  min-width: 70px;
+}
+/* pdf.js требует абсолютно позиционированный контейнер прокрутки */
+#viewerContainer {
+  position: absolute;
+  inset: 44px 0 0 0;
+  overflow: auto;
+}
+#viewerContainer:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+#error {
+  position: absolute;
+  inset: 56px 16px auto 16px;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--warn-bg);
+  color: var(--danger);
+}
+#error[hidden] {
+  display: none;
+}
+/* тёмная тема: поля между страницами — фон WebUI, страницы остаются «бумагой» */
+.pdfViewer .page {
+  --page-border: 9px solid transparent;
+}

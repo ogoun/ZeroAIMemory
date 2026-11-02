@@ -170,6 +170,34 @@ async fn svg_and_html_are_attachment_with_sandbox() {
     assert!(r.header("content-security-policy").starts_with("sandbox"));
 }
 
+/// Финальное ревью M5, I-3: JavaScript и CSS отдаются как `application/octet-stream` с
+/// `nosniff` — с того же origin их нельзя подключить `<script>`/`<link>` в обход CSP WebUI; в
+/// описании вложения тип прежний.
+#[tokio::test]
+async fn script_and_css_blobs_not_executable() {
+    let a = api("blobs-js", |_| {}).await;
+    let n = a.note("knowledge", "js", "x").await;
+    for (file, mime) in [("evil.js", "text/javascript"), ("evil.css", "text/css")] {
+        let r = upload(&a, &id(&n), file, b"alert(document.cookie)").await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        assert_eq!(r.json()["mime"], mime);
+        let sha = r.json()["sha256"].as_str().unwrap().to_string();
+        let r = get(&a, &format!("/api/v1/blobs/{sha}/{file}"), &[]).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(
+            r.header("content-type"),
+            "application/octet-stream",
+            "{file}"
+        );
+        assert_eq!(r.header("x-content-type-options"), "nosniff");
+        assert_eq!(
+            r.header("content-disposition"),
+            format!("attachment; filename*=UTF-8''{file}")
+        );
+        assert_eq!(r.body.as_ref(), b"alert(document.cookie)");
+    }
+}
+
 #[tokio::test]
 async fn over_limit_is_413_and_nothing_stored() {
     let a = api("blobs-413", |c| c.limits.blob_max_bytes = 1000).await;
@@ -492,4 +520,61 @@ async fn token_render_ignores_attachment_only_in_human() {
     // администратору то же вложение видно
     let j = a.adm(Method::GET, &uri, None, None).await.json();
     assert!(j["html"].as_str().unwrap().contains("<img"), "{j}");
+}
+
+/// Документы вложений (M5, задача 4): загрузка текста — `pending` (вид по `sniff`), картинки —
+/// `unsupported`; `GET /nodes/{id}/attachments` их перечисляет, `DELETE …/{sha}/{имя}` открепляет
+/// (204, затем 404), ссылка больше не отдаётся.
+#[tokio::test]
+async fn attachments_list_and_detach() {
+    let a = api("blobs-attachments", |_| {}).await;
+    let n = a.note("knowledge", "Документы", "# Д\n").await;
+    let node = id(&n);
+    let r = upload(&a, &node, "отчёт.txt", "текст отчёта".as_bytes()).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let sha = r.json()["sha256"].as_str().unwrap().to_string();
+    let r = upload(&a, &node, "cat.png", &png()).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+
+    let r = get(&a, &format!("/api/v1/nodes/{node}/attachments"), &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let list = r.json();
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 2, "{list:?}");
+    let by = |f: &str| list.iter().find(|d| d["filename"] == f).unwrap().clone();
+    // конвейер документов (задача 5) может успеть извлечь текст до запроса списка
+    let st = by("отчёт.txt")["extract_state"].clone();
+    assert!(st == "pending" || st == "done", "{st}");
+    assert_eq!(by("cat.png")["extract_state"], "unsupported");
+    assert_eq!(by("отчёт.txt")["ocr_needed"], false);
+
+    let del = format!(
+        "/api/v1/nodes/{node}/attachments/{sha}/{}",
+        "%D0%BE%D1%82%D1%87%D1%91%D1%82.txt"
+    );
+    let r = a.tok_h(&a.token, Method::DELETE, &del, None, &[]).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let r = a.tok_h(&a.token, Method::DELETE, &del, None, &[]).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = get(&a, &format!("/api/v1/nodes/{node}/attachments"), &[]).await;
+    let list = r.json();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let r = get(
+        &a,
+        &format!("/api/v1/blobs/{sha}/%D0%BE%D1%82%D1%87%D1%91%D1%82.txt"),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // неверный sha — 400
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::DELETE,
+            &format!("/api/v1/nodes/{node}/attachments/XYZ/a.txt"),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }

@@ -1,0 +1,1080 @@
+{
+ "date": "2026-11-02",
+ "corpus_seed": "0xd0c5e720261102",
+ "queries": 45,
+ "runs": {
+  "fts-pdfium-base": {
+   "recall5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.5111111111111111,
+    "hi": 0.7777777777777778
+   },
+   "mrr10": {
+    "mean": 0.6177777777777778,
+    "lo": 0.47772222222222216,
+    "hi": 0.7511111111111111
+   },
+   "loc5": {
+    "mean": 0.5777777777777777,
+    "lo": 0.4222222222222222,
+    "hi": 0.7111111111111111
+   },
+   "loc_ok": {
+    "mean": 0.896551724137931,
+    "lo": 0.7586206896551724,
+    "hi": 1.0
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 10.19335,
+    "p95": 15.799900000000001,
+    "mean": 9.902817484662576
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 12.5618,
+    "p95": 19.159824999999998,
+    "mean": 12.14507576687116
+   },
+   "extract_secs": 4.4730669,
+   "index_secs": 0.0,
+   "commit": "251a72b+dirty.84586688",
+   "docs_pass": 0,
+   "docs": 21
+  },
+  "fts-pdfium": {
+   "recall5": {
+    "mean": 0.6222222222222222,
+    "lo": 0.4888888888888889,
+    "hi": 0.7555555555555555
+   },
+   "recall5_attach": {
+    "mean": 0.8,
+    "lo": 0.6888888888888889,
+    "hi": 0.9111111111111111
+   },
+   "mrr10": {
+    "mean": 0.597037037037037,
+    "lo": 0.4577592592592592,
+    "hi": 0.7303703703703702
+   },
+   "loc5": {
+    "mean": 0.6,
+    "lo": 0.4666666666666667,
+    "hi": 0.7333333333333333
+   },
+   "loc_ok": {
+    "mean": 0.9642857142857143,
+    "lo": 0.8928571428571429,
+    "hi": 1.0
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 8.03855,
+    "p95": 13.960625,
+    "mean": 8.014816257668711
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 10.504100000000001,
+    "p95": 17.015050000000002,
+    "mean": 10.227122699386502
+   },
+   "extract_secs": 4.3359314,
+   "index_secs": 0.0,
+   "commit": "3403134+dirty.ee3bb400",
+   "docs_pass": 21,
+   "docs": 21
+  },
+  "bge-m3-int8-pdfium": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.6906172839506174,
+    "lo": 0.5681265432098765,
+    "hi": 0.8135833333333334
+   },
+   "loc5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.4888888888888889,
+    "hi": 0.7777777777777778
+   },
+   "loc_ok": {
+    "mean": 0.8787878787878788,
+    "lo": 0.7575757575757576,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 12.30925,
+    "p95": 18.007824999999997,
+    "mean": 12.55756687116565
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 15.5972,
+    "p95": 24.067474999999998,
+    "mean": 16.08773036809816
+   },
+   "extract_secs": 18.0131743,
+   "index_secs": 1348.1421337,
+   "commit": "251a72b+dirty.3fd008d5",
+   "docs_pass": 0,
+   "docs": 21
+  },
+  "bge-m3-fp16-pdfium": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.7119135802469135,
+    "lo": 0.5928302469135802,
+    "hi": 0.8325987654320985
+   },
+   "loc5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.4888888888888889,
+    "hi": 0.7777777777777778
+   },
+   "loc_ok": {
+    "mean": 0.8787878787878788,
+    "lo": 0.7575757575757576,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 11.9748,
+    "p95": 18.130025,
+    "mean": 12.33078282208589
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 14.8794,
+    "p95": 21.005000000000003,
+    "mean": 15.356597239263799
+   },
+   "extract_secs": 18.3445836,
+   "index_secs": 39.6424764,
+   "commit": "3403134+dirty.ee3bb400",
+   "docs_pass": 21,
+   "docs": 21
+  },
+  "bge-m3-fp16-pdfium-rerank": {
+   "recall5": {
+    "mean": 0.9333333333333333,
+    "lo": 0.8444444444444444,
+    "hi": 1.0
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.8814814814814815,
+    "lo": 0.7888888888888889,
+    "hi": 0.9555555555555556
+   },
+   "loc5": {
+    "mean": 0.7555555555555555,
+    "lo": 0.6222222222222222,
+    "hi": 0.8666666666666667
+   },
+   "loc_ok": {
+    "mean": 0.8095238095238095,
+    "lo": 0.6904761904761905,
+    "hi": 0.9285714285714286
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 99.3092,
+    "p95": 121.881125,
+    "mean": 102.10353435582819
+   },
+   "extract_secs": 18.3445836,
+   "index_secs": 0.2563796,
+   "commit": "3403134+dirty.ee3bb400",
+   "docs_pass": 21,
+   "docs": 21
+  },
+  "bge-m3-fp16-pdfium-docs-only": {
+   "recall5": {
+    "mean": 0.9111111111111111,
+    "lo": 0.8222222222222222,
+    "hi": 0.9777777777777777
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.8149029982363315,
+    "lo": 0.7142835097001763,
+    "hi": 0.9074074074074074
+   },
+   "loc5": {
+    "mean": 0.7777777777777778,
+    "lo": 0.6444444444444445,
+    "hi": 0.8888888888888888
+   },
+   "loc_ok": {
+    "mean": 0.8536585365853658,
+    "lo": 0.7317073170731707,
+    "hi": 0.9512195121951219
+   },
+   "latency_before": null,
+   "latency_after": null,
+   "extract_secs": 12.8327879,
+   "index_secs": 47.5603753,
+   "commit": "251a72b+dirty.3fd008d5",
+   "docs_pass": 0,
+   "docs": 21
+  },
+  "bge-m3-fp16-pdf-oxide": {
+   "recall5": {
+    "mean": 0.7555555555555555,
+    "lo": 0.6222222222222222,
+    "hi": 0.8666666666666667
+   },
+   "recall5_attach": {
+    "mean": 0.9777777777777777,
+    "lo": 0.9333333333333333,
+    "hi": 1.0
+   },
+   "mrr10": {
+    "mean": 0.7154938271604938,
+    "lo": 0.5975169753086419,
+    "hi": 0.8358117283950618
+   },
+   "loc5": {
+    "mean": 0.6666666666666666,
+    "lo": 0.5333333333333333,
+    "hi": 0.8
+   },
+   "loc_ok": {
+    "mean": 0.8823529411764706,
+    "lo": 0.7647058823529411,
+    "hi": 0.9705882352941176
+   },
+   "latency_before": {
+    "n": 326,
+    "p50": 12.586649999999999,
+    "p95": 18.7374,
+    "mean": 13.099222392638053
+   },
+   "latency_after": {
+    "n": 326,
+    "p50": 14.48895,
+    "p95": 21.874449999999996,
+    "mean": 15.135805828220871
+   },
+   "extract_secs": 18.8530235,
+   "index_secs": 44.2808684,
+   "commit": "3403134+dirty.ee3bb400",
+   "docs_pass": 20,
+   "docs": 21
+  },
+  "bge-m3-fp16-pdfium-pf10": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6872222222222223,
+    "lo": 0.5659212962962963,
+    "hi": 0.8122222222222222
+   },
+   "loc5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.4888888888888889,
+    "hi": 0.7777777777777778
+   },
+   "loc_ok": {
+    "mean": 0.8787878787878788,
+    "lo": 0.7575757575757576,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 12.53865,
+    "p95": 19.2791,
+    "mean": 13.050711963190189
+   },
+   "extract_secs": 17.8035477,
+   "index_secs": 0.2382842,
+   "commit": "251a72b+dirty.50f90daf",
+   "docs_pass": 0,
+   "docs": 21
+  },
+  "bge-m3-fp16-pdfium-pf30": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6868518518518519,
+    "lo": 0.5653472222222222,
+    "hi": 0.8116759259259259
+   },
+   "loc5": {
+    "mean": 0.6444444444444445,
+    "lo": 0.4888888888888889,
+    "hi": 0.7777777777777778
+   },
+   "loc_ok": {
+    "mean": 0.8787878787878788,
+    "lo": 0.7575757575757576,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 12.5753,
+    "p95": 19.45715,
+    "mean": 13.30389263803681
+   },
+   "extract_secs": 17.8035477,
+   "index_secs": 0.2329636,
+   "commit": "251a72b+dirty.215a148f",
+   "docs_pass": 0,
+   "docs": 21
+  },
+  "bge-m3-fp16-pdfium-pf60": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6969135802469135,
+    "lo": 0.5762268518518517,
+    "hi": 0.8129629629629629
+   },
+   "loc5": {
+    "mean": 0.6222222222222222,
+    "lo": 0.4888888888888889,
+    "hi": 0.7555555555555555
+   },
+   "loc_ok": {
+    "mean": 0.8484848484848485,
+    "lo": 0.7272727272727273,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 13.52535,
+    "p95": 21.087125,
+    "mean": 14.251605828220852
+   },
+   "extract_secs": 17.8035477,
+   "index_secs": 0.2428427,
+   "commit": "251a72b+dirty.50f90daf",
+   "docs_pass": 0,
+   "docs": 21
+  },
+  "bge-m3-fp16-pdfium-pf120": {
+   "recall5": {
+    "mean": 0.7333333333333333,
+    "lo": 0.6,
+    "hi": 0.8666666666666667
+   },
+   "mrr10": {
+    "mean": 0.6966666666666667,
+    "lo": 0.575,
+    "hi": 0.8137083333333334
+   },
+   "loc5": {
+    "mean": 0.6222222222222222,
+    "lo": 0.4888888888888889,
+    "hi": 0.7555555555555555
+   },
+   "loc_ok": {
+    "mean": 0.8484848484848485,
+    "lo": 0.7272727272727273,
+    "hi": 0.9696969696969697
+   },
+   "latency_before": null,
+   "latency_after": {
+    "n": 326,
+    "p50": 15.1902,
+    "p95": 21.149874999999998,
+    "mean": 15.610213803680997
+   },
+   "extract_secs": 17.8035477,
+   "index_secs": 0.2341113,
+   "commit": "251a72b+dirty.56892a01",
+   "docs_pass": 0,
+   "docs": 21
+  },
+  "fts-pdfium-large": {
+   "recall5": {
+    "mean": 0.7777777777777778,
+    "lo": 0.6666666666666666,
+    "hi": 0.8888888888888888
+   },
+   "recall5_attach": {
+    "mean": 0.7777777777777778,
+    "lo": 0.6666666666666666,
+    "hi": 0.8888888888888888
+   },
+   "mrr10": {
+    "mean": 0.7555555555555555,
+    "lo": 0.6444444444444445,
+    "hi": 0.8666666666666667
+   },
+   "loc5": {
+    "mean": 0.6666666666666666,
+    "lo": 0.5333333333333333,
+    "hi": 0.8
+   },
+   "loc_ok": {
+    "mean": 0.8571428571428571,
+    "lo": 0.7428571428571429,
+    "hi": 0.9714285714285714
+   },
+   "latency_before": null,
+   "latency_after": null,
+   "extract_secs": 31.9326664,
+   "index_secs": 0.0,
+   "commit": "251a72b+dirty.3fd008d5",
+   "docs_pass": 0,
+   "docs": 23
+  }
+ },
+ "pdf_ab": {
+  "pdfium": {
+   "layouts": [
+    {
+     "layout": "all",
+     "pages": 79,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 0.9966436517069428,
+      "lo": 0.9907940161104719,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "cjk",
+     "pages": 4,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "one-column",
+     "pages": 68,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "table",
+     "pages": 2,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 0.8674242424242424,
+      "lo": 0.8181818181818182,
+      "hi": 0.9166666666666666
+     },
+     "table_rows": 24,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "two-column",
+     "pages": 5,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    }
+   ],
+   "facts_ok": 19,
+   "facts": 19,
+   "book_ms": 516.9019000000001,
+   "files": [
+    {
+     "file": "files/regulations-ru.docx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.4385,
+     "peak_mb": 8.37890625
+    },
+    {
+     "file": "files/onboarding-en.docx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.3101,
+     "peak_mb": 8.33984375
+    },
+    {
+     "file": "files/inventory.xlsx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 167.4158,
+     "peak_mb": 20.2890625
+    },
+    {
+     "file": "files/roadmap.pptx",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 1.9739,
+     "peak_mb": 8.3125
+    },
+    {
+     "file": "files/onecol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 13.7886,
+     "peak_mb": 13.734375
+    },
+    {
+     "file": "files/twocol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.9173,
+     "peak_mb": 14.19921875
+    },
+    {
+     "file": "files/cyrillic-ru.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 7.7095,
+     "peak_mb": 12.3984375
+    },
+    {
+     "file": "files/cjk-zh.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.0095,
+     "peak_mb": 12.1171875
+    },
+    {
+     "file": "files/book-500.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 516.9019000000001,
+     "peak_mb": 29.89453125
+    },
+    {
+     "file": "files/scan.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.3301,
+     "peak_mb": 10.73046875
+    },
+    {
+     "file": "hostile/broken.pdf",
+     "status": "error",
+     "detail": "документ повреждён: pdf: PdfiumLibraryInternalError(FormatError)",
+     "ms_median": null,
+     "peak_mb": 10.4375
+    },
+    {
+     "file": "hostile/truncated.pdf",
+     "status": "error",
+     "detail": "документ повреждён: pdf: PdfiumLibraryInternalError(FormatError)",
+     "ms_median": null,
+     "peak_mb": 10.4140625
+    },
+    {
+     "file": "hostile/js-action.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 2.6660999999999997,
+     "peak_mb": 13.1640625
+    },
+    {
+     "file": "hostile/deep-array.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 27.2628,
+     "peak_mb": 21.6015625
+    },
+    {
+     "file": "hostile/glyph-flood.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 130.5191,
+     "peak_mb": 59.94921875
+    },
+    {
+     "file": "hostile/huge-image.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.7119,
+     "peak_mb": 15.69140625
+    }
+   ]
+  },
+  "pdf-oxide": {
+   "layouts": [
+    {
+     "layout": "all",
+     "pages": 79,
+     "line_recall": {
+      "mean": 0.9956576839308922,
+      "lo": 0.9934635117916834,
+      "hi": 0.9975582269335139
+     },
+     "order": {
+      "mean": 0.998945147679325,
+      "lo": 0.9968354430379747,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 11
+    },
+    {
+     "layout": "cjk",
+     "pages": 4,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "one-column",
+     "pages": 68,
+     "line_recall": {
+      "mean": 0.9949552504491247,
+      "lo": 0.9924840985150436,
+      "hi": 0.9971544684892589
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "table",
+     "pages": 2,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 0.9583333333333333,
+      "lo": 0.9166666666666666,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 11
+    },
+    {
+     "layout": "two-column",
+     "pages": 5,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    }
+   ],
+   "facts_ok": 19,
+   "facts": 19,
+   "book_ms": 458.2546,
+   "files": [
+    {
+     "file": "files/onecol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.4639,
+     "peak_mb": 15.546875
+    },
+    {
+     "file": "files/twocol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.0271,
+     "peak_mb": 15.20703125
+    },
+    {
+     "file": "files/cyrillic-ru.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 8.5443,
+     "peak_mb": 13.671875
+    },
+    {
+     "file": "files/cjk-zh.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.3857,
+     "peak_mb": 11.00390625
+    },
+    {
+     "file": "files/book-500.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 458.2546,
+     "peak_mb": 36.3359375
+    },
+    {
+     "file": "files/scan.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 1.0274,
+     "peak_mb": 9.0703125
+    },
+    {
+     "file": "hostile/broken.pdf",
+     "status": "error",
+     "detail": "Invalid cross-reference table",
+     "ms_median": null,
+     "peak_mb": 8.5390625
+    },
+    {
+     "file": "hostile/truncated.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 2.6841999999999997,
+     "peak_mb": 10.375
+    },
+    {
+     "file": "hostile/js-action.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.9699,
+     "peak_mb": 9.2421875
+    },
+    {
+     "file": "hostile/deep-array.pdf",
+     "status": "crash",
+     "detail": "exit code: 0xc00000fd",
+     "ms_median": null,
+     "peak_mb": null
+    },
+    {
+     "file": "hostile/glyph-flood.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 92.7361,
+     "peak_mb": 83.7265625
+    },
+    {
+     "file": "hostile/huge-image.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.1269,
+     "peak_mb": 22.55859375
+    }
+   ]
+  },
+  "pdf-oxide-plain": {
+   "layouts": [
+    {
+     "layout": "all",
+     "pages": 79,
+     "line_recall": {
+      "mean": 0.9956576839308922,
+      "lo": 0.9934635117916834,
+      "hi": 0.9975582269335139
+     },
+     "order": {
+      "mean": 0.9996408654636503,
+      "lo": 0.9990869889604066,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 24
+    },
+    {
+     "layout": "cjk",
+     "pages": 4,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "one-column",
+     "pages": 68,
+     "line_recall": {
+      "mean": 0.9949552504491247,
+      "lo": 0.9924840985150436,
+      "hi": 0.9971544684892589
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    },
+    {
+     "layout": "table",
+     "pages": 2,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "table_rows": 24,
+     "table_rows_intact": 24
+    },
+    {
+     "layout": "two-column",
+     "pages": 5,
+     "line_recall": {
+      "mean": 1.0,
+      "lo": 1.0,
+      "hi": 1.0
+     },
+     "order": {
+      "mean": 0.9943256743256743,
+      "lo": 0.9881718281718281,
+      "hi": 1.0
+     },
+     "table_rows": 0,
+     "table_rows_intact": 0
+    }
+   ],
+   "facts_ok": 16,
+   "facts": 19,
+   "book_ms": 600.3963,
+   "files": [
+    {
+     "file": "files/onecol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.200399999999998,
+     "peak_mb": 14.83203125
+    },
+    {
+     "file": "files/twocol-en.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 11.4596,
+     "peak_mb": 14.34375
+    },
+    {
+     "file": "files/cyrillic-ru.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 7.6889,
+     "peak_mb": 13.48828125
+    },
+    {
+     "file": "files/cjk-zh.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.2836,
+     "peak_mb": 11.140625
+    },
+    {
+     "file": "files/book-500.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 600.3963,
+     "peak_mb": 37.41796875
+    },
+    {
+     "file": "files/scan.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.615,
+     "peak_mb": 8.53125
+    },
+    {
+     "file": "hostile/broken.pdf",
+     "status": "error",
+     "detail": "Invalid cross-reference table",
+     "ms_median": null,
+     "peak_mb": 8.5390625
+    },
+    {
+     "file": "hostile/truncated.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 2.5981,
+     "peak_mb": 10.38671875
+    },
+    {
+     "file": "hostile/js-action.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 0.6891,
+     "peak_mb": 8.7265625
+    },
+    {
+     "file": "hostile/deep-array.pdf",
+     "status": "crash",
+     "detail": "exit code: 0xc00000fd",
+     "ms_median": null,
+     "peak_mb": null
+    },
+    {
+     "file": "hostile/glyph-flood.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 89.8962,
+     "peak_mb": 83.68359375
+    },
+    {
+     "file": "hostile/huge-image.pdf",
+     "status": "ok",
+     "detail": null,
+     "ms_median": 4.2940000000000005,
+     "peak_mb": 22.50390625
+    }
+   ]
+  }
+ },
+ "paired": {
+  "source": "cargo xtask eval --docs --compare (10000 выборок): 2026-11-02-m5-docs-compare-{all,pdf}.md",
+  "rerank_minus_hybrid_fp16_recall5": [
+   0.2,
+   0.089,
+   0.333
+  ],
+  "int8_minus_fts_recall5": [
+   0.111,
+   0.022,
+   0.2
+  ],
+  "docs_only_minus_with_notes_fp16_recall5": [
+   0.178,
+   0.067,
+   0.289
+  ],
+  "pdf_oxide_minus_pdfium_fp16_pdf_queries_recall5": [
+   0.05,
+   0.0,
+   0.15
+  ],
+  "pdf_oxide_minus_pdfium_fp16_pdf_queries_mrr10": [
+   0.003,
+   -0.014,
+   0.023
+  ],
+  "pdf_oxide_minus_pdfium_fp16_all_mrr10": [
+   0.004,
+   -0.004,
+   0.013
+  ],
+  "fts_dates_minus_base_recall5": [
+   -0.022,
+   -0.067,
+   0.0
+  ],
+  "prefetch60_minus_30_mrr10": [
+   0.01,
+   -0.023,
+   0.044
+  ]
+ },
+ "store_scale_ms": {
+  "pending_count_100k_docs": {
+   "before": 97.05,
+   "after": 0.13
+  },
+  "has_attachment_chunks_1m_chunks_other_space": {
+   "before": 935.58,
+   "after": 0.88
+  },
+  "has_attachment_chunks_100k_notes_no_attachments_in_db": {
+   "first_fix": 11.38,
+   "after": 0.023
+  },
+  "has_attachment_chunks_100k_notes_space_without_docs": 42.16
+ },
+ "decisions": {
+  "pdf_backend": "pdfium",
+  "attach_prefetch": 30,
+  "xlsx_dates": "excel-like for custom numeric formats, ISO otherwise; EXTRACTOR_VERSION=3",
+  "extract_state_index": "migration 0020 attachment_docs_pending",
+  "expand_neighbors": "not needed",
+  "ooxml_truncated": "failed: parse_error: zip"
+ }
+}

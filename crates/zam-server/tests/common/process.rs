@@ -15,6 +15,31 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+/// Ждёт до `limit`, пока в журнале сервера (`<data>/logs/zam-server.log*`) не появится `needle`
+/// (пустая — любой непустой файл); `true` — появилась. Журнал пишется фоновым потоком
+/// (`tracing_appender::non_blocking`): перед [`ServerProc::kill`], без штатной остановки, хвост
+/// может ещё не дойти до файла (флейк `mcp_vault_value_not_in_debug_log`, задача 6 M5).
+pub fn wait_server_log(data: &Path, needle: &str, limit: Duration) -> bool {
+    let t = std::time::Instant::now();
+    loop {
+        let found = std::fs::read_dir(data.join("logs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("zam-server.log")
+            })
+            .filter_map(|e| std::fs::read(e.path()).ok())
+            .any(|b| !b.is_empty() && String::from_utf8_lossy(&b).contains(needle));
+        if found || t.elapsed() >= limit {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Пароль администратора первого старта (`ZAM_ADMIN_PASSWORD`).
 const PASSWORD: &str = "pw";
 /// Строка stderr с первым токеном, когда stderr — терминал (в тестах не бывает).

@@ -25,6 +25,7 @@
 
 pub mod compare;
 pub mod corpus;
+pub mod docs;
 pub mod gate;
 pub mod glossary;
 pub mod grid;
@@ -175,6 +176,30 @@ pub struct EvalArgs {
     /// словаря, со словарём и с весами канала `alias` 0 / 0,25 / 0,5 / 0,75
     #[arg(long, conflicts_with_all = ["grid", "check", "hints", "tokens", "quality_gate", "reuse"])]
     pub glossary: bool,
+    /// Eval документов M5 (eval/docs/, eval/docs-queries.toml): A/B извлечения PDF, recall@5 по
+    /// вложениям, точность `locator`, латентность поиска с вложениями и без, враждебные файлы,
+    /// превью XLSX ([`docs`]); набор — `cargo xtask docs-corpus`
+    #[arg(long, conflicts_with_all = ["grid", "hints", "tokens", "quality_gate", "glossary"])]
+    pub docs: bool,
+    /// Бэкенд PDF для --docs: pdfium (продукт) | pdf_oxide | pdf_oxide_plain (сборка xtask с
+    /// --features pdf-oxide)
+    #[arg(long, value_enum, default_value_t = docs::extract::PdfBackend::Pdfium, requires = "docs")]
+    pub pdf_backend: docs::extract::PdfBackend,
+    /// Каталог набора документов вместо eval/docs
+    #[arg(long, value_name = "DIR", requires = "docs")]
+    pub docs_dir: Option<PathBuf>,
+    /// --docs: без заметок eval/corpus (и без замера латентности основного набора)
+    #[arg(long, requires = "docs")]
+    pub docs_only: bool,
+    /// --docs: только A/B извлечения PDF, без сервера
+    #[arg(long, requires = "docs")]
+    pub ab_only: bool,
+    /// --docs: также большие файлы large/ (docs-corpus --large): сроки разбора сервером
+    #[arg(long, requires = "docs")]
+    pub large: bool,
+    /// --docs --compare: только запросы к файлам этого формата (pdf, docx, xlsx, pptx)
+    #[arg(long, value_name = "FORMAT", requires = "docs")]
+    pub docs_format: Option<String>,
 }
 
 /// Каталоги и файлы набора.
@@ -271,6 +296,9 @@ fn full_set(a: &EvalArgs) -> bool {
 /// Точка входа `cargo xtask eval`.
 pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     let p = Paths::new(repo, &a);
+    if a.docs {
+        return docs::run(&a, &p);
+    }
     if a.check {
         // фрагмент (--queries) проверяется без требований к полному набору
         let (corpus, _, s) = load_set(&p, full_set(&a))?;

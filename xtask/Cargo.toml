@@ -31,10 +31,27 @@ zam-search = { path = "../crates/zam-search" }
 # eval M4: токены ответов сервера считаются токенизатором модели (bge-m3, tokenizer.json);
 # крейт уже в workspace (zam-ml, zam-index; Apache-2.0)
 tokenizers.workspace = true
+# M5 (задача 10): набор документов `docs-corpus` — sha256 файлов манифеста (уже в workspace);
+# eval документов — разбор PDF pdfium тем же кодом, что у рабочего процесса (`zam_docs::pdf`),
+# эталонные `locator`; кэш извлечения `blob_extract` для A/B бэкендов PDF — zstd(JSON)
+sha2.workspace = true
+zam-docs = { path = "../crates/zam-docs", features = ["pdfium"] }
+zstd.workspace = true
+# A/B PDF (задача 10 M5): чисто-Rust `pdf_oxide` против pdfium — только в xtask и только за фичей
+# `pdf-oxide` (`cargo run -p xtask --release --features pdf-oxide -- eval --docs --pdf-backend
+# pdf_oxide`): обычная сборка xtask и бинарники продукта его не компилируют; в общем
+# Cargo.lock — только добавленные пакеты (версии прежних не меняются); в CI фича не
+# собирается. Аудит — журнал M5, задача 10:
+# MIT OR Apache-2.0, 0.3.78 от 2026-09-08, без фич по умолчанию (icc, legacy-crypto)
+pdf_oxide = { version = "=0.3.78", default-features = false, optional = true }
+
+[features]
+pdf-oxide = ["dep:pdf_oxide"]
 
 # Windows: штатная остановка сервера в bench --scenario first-start (Ctrl+Break группе
 # процессов, GenerateConsoleCtrlEvent) и Job Object xtask, завершающий дочерние процессы при
 # аварийном выходе xtask (procjob.rs; JOBOBJECT_EXTENDED_LIMIT_INFORMATION в windows 0.62 —
-# за фичей Win32_System_Threading); крейт уже в дереве (MIT OR Apache-2.0)
+# за фичей Win32_System_Threading); пик памяти процесса разбора A/B PDF (eval --docs,
+# Win32_System_ProcessStatus); крейт уже в дереве (MIT OR Apache-2.0)
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

@@ -5,7 +5,7 @@ members = ["crates/*", "xtask"]
 exclude = ["crates/zam-markdown/fuzz"]
 
 [workspace.package]
-version = "0.0.6-m4.5"
+version = "0.0.7-m5"
 edition = "2024"
 license = "MIT"
 rust-version = "1.92"
@@ -42,7 +42,24 @@ memory-serve = "2.4"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 assert_cmd = "2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# M5: потоковый разбор XML DOCX/PPTX (zam-docs) — MIT, чистый Rust; >= 0.41 обязательно
+# (RUSTSEC-2026-0194/0195); 0.42.0 выпущена 2026-08-22; без serialize и encoding (OOXML — UTF-8)
+quick-xml = { version = "=0.42.0", default-features = false }
+# M5: кодировки CSV (UTF-16, Windows-1251) и кодовые страницы XLS BIFF5 (zam-docs) — уже в
+# графе транзитивно; (Apache-2.0 OR MIT) AND BSD-3-Clause; 0.8.42 выпущена 2026-09-24
+encoding_rs = "=0.8.42"
+# M5: PDF через pdfium (zam-docs, фича `pdfium`; только рабочий процесс doc-worker) — MIT OR
+# Apache-2.0; 0.9.4 выпущена 2026-09-06 (исправлены два double-free обёртки); привязка к
+# библиотеке — только динамическая (libloading), без `static`/`bindings`, без `image`
+pdfium-render = { version = "=0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 flate2 = "1"
+# M5: миниатюры изображений (zam-docs, фича `images`; только рабочий процесс doc-worker) —
+# MIT OR Apache-2.0, чистый Rust; 0.25.10 выпущена 2026-03-10 (последняя 0.25 на 2026-11-01).
+# Только PNG, JPEG (zune-jpeg), GIF, WebP — без AVIF/HEIC (C, патенты; ТЗ §5), без rayon
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# M5: SIMD-ресайз миниатюр — MIT OR Apache-2.0, чистый Rust; 6.1.0 выпущена 2026-07-21;
+# фича `image` — представление `DynamicImage` без копии, без rayon
+fast_image_resize = { version = "=6.1.0", default-features = false, features = ["std", "image"] }
 tar = { version = "0.4", default-features = false }
 # M2: tar.xz redist-архивов NVIDIA для Linux (`zam-server cuda fetch`): чистый Rust, без C liblzma;
 # та же версия, что у zip 9 (фичи lzma/xz); только декодер
@@ -63,6 +80,9 @@ proptest = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 # хеш текста и id чанков (§6.3)
 blake3 = "1"
+# M5: кэш извлечения вложений `blob_extract` — zstd(JSON), спецификация M5 §3; MIT, libzstd —
+# BSD-3-Clause; уже в дереве (jieba-rs → include-flate). Без фич по умолчанию (legacy, словари)
+zstd = { version = "0.13.3", default-features = false }
 # M3: проверка триггеров инсайтов (§10.3): regex без обратных ссылок (ReDoS невозможен) —
 # MIT OR Apache-2.0, уже в дереве; globset — маски file_glob, Unlicense OR MIT (берём MIT)
 regex = "1"
@@ -105,6 +125,14 @@ windows-service = "=0.8.1"
 rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 # argon2 в debug без оптимизаций слишком медленный для тестов входа
+# Отладочная информация: у своих крейтов — только таблицы строк (трассировки паник с файлом и
+# строкой), у зависимостей — нет. Полная debuginfo раздувала target/debug до ~300 ГБ за двое
+# суток (десятки тестовых бинарников по сотне МБ на каждый хеш) и замедляла линковку.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = false
+
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]

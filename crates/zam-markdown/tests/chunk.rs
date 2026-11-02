@@ -11,7 +11,7 @@ use proptest::prelude::*;
 use serde::Serialize;
 use zam_markdown::{
     ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, L1_MAX_TOKENS, TokenCounter, chunk_note,
-    note_l1, parse, section_l1, split_sentences,
+    note_l1, parse, section_l1, split_plain, split_sentences,
 };
 
 fn chunks(src: &str) -> Vec<ChunkDraft> {
@@ -1320,6 +1320,62 @@ proptest! {
                 prop_assert!(d.token_count <= hard);
                 prop_assert!(d.text.ends_with(&src[r]));
             }
+        }
+    }
+}
+
+/// Нарезка единицы документа-вложения (M5): короткий текст — один кусок; длинный — куски не
+/// длиннее `hard_max`, по границам предложений, встык и по порядку; строки без знаков конца
+/// предложения (таблица, страница PDF) — по строкам; пробельный текст — без кусков.
+#[test]
+fn split_plain_respects_hard_max_and_sentences() {
+    let p = ChunkParams {
+        target_min: 20,
+        target_max: 40,
+        hard_max: 60,
+        ..ChunkParams::default()
+    };
+    let tc = ApproxCounter;
+    assert_eq!(split_plain("Коротко.", &p, &tc), vec![0..15]);
+    assert!(split_plain(" \n\t ", &p, &tc).is_empty());
+    let text: String = (0..40)
+        .map(|i| format!("Предложение номер {i} про единицу документа. "))
+        .collect();
+    let parts = split_plain(&text, &p, &tc);
+    assert!(parts.len() > 5, "{}", parts.len());
+    let mut at = 0;
+    for r in &parts {
+        assert!(r.start >= at, "по порядку");
+        at = r.end;
+        let piece = &text[r.clone()];
+        assert!(tc.count(piece) <= p.hard_max, "{piece}");
+        assert!(
+            piece.starts_with("Предложение"),
+            "граница предложения: {piece:?}"
+        );
+    }
+    let rows: String = (0..80)
+        .map(|i| format!("| ячейка {i} | значение {i} |\n"))
+        .collect();
+    for r in split_plain(&rows, &p, &tc) {
+        let piece = &rows[r];
+        assert!(tc.count(piece) <= p.hard_max);
+        assert!(piece.starts_with("| ячейка"), "{piece:?}");
+    }
+}
+
+proptest! {
+    /// Нарезка простого текста не паникует, куски не длиннее `hard_max` (кроме неделимого
+    /// символа) и лежат в пределах текста по порядку.
+    #[test]
+    fn split_plain_never_panics(text in "\\PC{0,600}", hard in 1usize..40) {
+        let p = ChunkParams { target_min: 1, target_max: hard, hard_max: hard, ..ChunkParams::default() };
+        let mut at = 0;
+        for r in split_plain(&text, &p, &ApproxCounter) {
+            prop_assert!(r.start >= at && r.end <= text.len());
+            at = r.end;
+            let piece = &text[r];
+            prop_assert!(ApproxCounter.count(piece) <= hard || piece.chars().count() == 1);
         }
     }
 }

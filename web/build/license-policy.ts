@@ -7,7 +7,11 @@ export interface PackageInfo {
   licenseText?: string | null;
 }
 
-export const ALLOWED = new Set(['MIT', 'ISC', 'BSD-2-Clause', 'BSD-3-Clause', 'Apache-2.0', '0BSD']);
+/**
+ * Разрешённые лицензии. Zlib (M5) — у pako 1.x (`(MIT AND Zlib)`, распаковка zip в jszip
+ * просмотрщика DOCX): пермиссивная, совместима с MIT, требует лишь сохранять уведомление.
+ */
+export const ALLOWED = new Set(['MIT', 'ISC', 'BSD-2-Clause', 'BSD-3-Clause', 'Apache-2.0', '0BSD', 'Zlib']);
 
 /**
  * Лицензии, допустимые только конкретным пакетам (решение владельца 2026-10-21):
@@ -27,13 +31,18 @@ export function licenseOf(d: PackageInfo): string | null {
 }
 
 // Выражение SPDX вида `(A OR B)` допустимо, если допустима хотя бы одна альтернатива
-// (DOMPurify: `(MPL-2.0 OR Apache-2.0)` — используется по Apache-2.0).
+// (DOMPurify: `(MPL-2.0 OR Apache-2.0)` — по Apache-2.0; jszip: `(MIT OR GPL-3.0-or-later)` —
+// по MIT); `(A AND B)` — если допустимы все части (pako: `(MIT AND Zlib)`). Скобки внутри
+// выражения и смешение OR с AND не разбираются: такая лицензия отклоняется.
 function listed(license: string | null): boolean {
   if (!license) return false;
-  return license
-    .replace(/^\(|\)$/g, '')
-    .split(/\s+OR\s+/)
-    .some((l) => ALLOWED.has(l.trim()));
+  const expr = license.trim().replace(/^\((.*)\)$/, '$1');
+  if (/[()]/.test(expr)) return false;
+  const or = expr.split(/\s+OR\s+/);
+  const and = expr.split(/\s+AND\s+/);
+  if (or.length > 1 && and.length > 1) return false;
+  if (and.length > 1) return and.every((l) => ALLOWED.has(l.trim()));
+  return or.some((l) => ALLOWED.has(l.trim()));
 }
 
 /** Допустим ли пакет в бандле: общий список или точечное исключение по имени И лицензии. */

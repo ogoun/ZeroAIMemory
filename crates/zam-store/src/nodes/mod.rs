@@ -34,7 +34,7 @@ use crate::time::{conv_err, ts_at, ts_opt};
 
 pub(crate) use chunks::{
     ChunkInsert, PARAM_ALGORITHM, PARAM_TOKENIZER, backfill_certainty, backfill_embed_keys,
-    changed_params, chunk_id, chunker_fingerprint, chunker_params, context_prefix,
+    changed_params, chunk_id, chunker_base, chunker_fingerprint, chunker_params, context_prefix,
     entry_chunker_fingerprint, frontmatter_tags, mask_tags, note_chunks, param_order,
     params_from_fingerprint, rechunk_notes, replace_chunks, rescan_secrets, same_chunker,
     stored_prefix_hit, token_counter,

@@ -111,6 +111,42 @@ async fn highlight_css_is_cacheable() {
     assert!(!r.body.is_empty());
 }
 
+/// Бюджет HTML подсветки на документ (ревью задачи 8 M5, раунд 2): заметка из 1000 блоков JSON
+/// `[` по 250 Б — HTML в пределах бюджета (было 25 МБ и 16 с в debug), второй GET — из кэша
+/// крупных записей.
+#[tokio::test]
+async fn heavy_highlight_note_bounded_and_cached() {
+    let a = api("render-heavy", |_| {}).await;
+    let block = format!("```json\n{}\n```\n\n", "[".repeat(250));
+    let src = block.repeat(1000);
+    let n = a.note("knowledge", "heavy", &src).await;
+    let uri = format!("/api/v1/nodes/{}?format=html", n["id"].as_str().unwrap());
+    let t = std::time::Instant::now();
+    let r = a.t(Method::GET, &uri, None).await;
+    let first = t.elapsed();
+    assert_eq!(r.status, StatusCode::OK);
+    let html = r.json()["html"].as_str().unwrap().len();
+    let t = std::time::Instant::now();
+    let r2 = a.t(Method::GET, &uri, None).await;
+    let second = t.elapsed();
+    println!("заметка 1000 блоков `[`: HTML {html} байт, первый GET {first:?}, второй {second:?}");
+    assert_eq!(r2.json()["html"].as_str().unwrap().len(), html);
+    assert!(
+        html <= zam_markdown::HIGHLIGHT_HTML_BUDGET_BYTES + 2 * src.len() + 64 * 1000,
+        "HTML {html} байт"
+    );
+    assert!(
+        second * 4 < first,
+        "второй GET не из кэша: {second:?} против {first:?}"
+    );
+    // POST /render того же текста — тот же предел
+    let r = a
+        .t(Method::POST, "/api/v1/render", Some(json!({"md": src})))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.json()["html"].as_str().unwrap().len() <= html + 1024);
+}
+
 #[tokio::test]
 async fn node_html_uses_render_cache() {
     let a = api("render-cache", |_| {}).await;
@@ -176,8 +212,10 @@ fn main() {}
     assert!(new["html"].as_str().unwrap().contains("Новый"));
 }
 
+/// HTML больше 256 КиБ идёт в крупный кэш с пределом суммы байт (задача 8 M5, раунд 2; прежде
+/// не кэшировался вовсе).
 #[tokio::test]
-async fn large_html_is_not_cached() {
+async fn large_html_cached_in_large_tier() {
     let a = api("render-big", |_| {}).await;
     // ~9000 абзацев → HTML заметно больше 256 КиБ при тексте ~27 КиБ
     let md = "a\n\n".repeat(9000);
@@ -186,7 +224,7 @@ async fn large_html_is_not_cached() {
     let r = a.t(Method::GET, &uri, None).await;
     assert_eq!(r.status, StatusCode::OK);
     assert!(r.json()["html"].as_str().unwrap().len() > 256 * 1024);
-    assert_eq!(a.st.render_cache.lock().unwrap().len(), 0);
+    assert_eq!(a.st.render_cache.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

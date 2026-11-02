@@ -23,9 +23,9 @@
 //!   записываются в `session_seen` базы пользователя запроса (`part = chunk_id`, владелец —
 //!   владелец базы цели) одной транзакцией с касанием сессии. Карточки папок не отмечаются;
 //!   сбой учёта сессии поиск не валит (WARN, ответ без пометок);
-//! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release` (по умолчанию все
-//!   четыре), `folder` — карточки папок (см. «Папки»), `attachment` принимается, но ничего не
-//!   находит (вложения — M5); `filters.status` — статусы insight (по умолчанию `active`,
+//! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release`, `attachment`
+//!   (фрагменты вложений, M5; см. «Вложения») — по умолчанию все, `folder` — карточки папок
+//!   (см. «Папки»); `filters.status` — статусы insight (по умолчанию `active`,
 //!   `revisit`); `include_history: true` снимает фильтр статуса. Фильтр действует и в Qdrant
 //!   (`kinds`, `must_not` по исключённым статусам), и в FTS, и в проверке векторных хитов
 //!   ([`live_chunks`]); у changelog и release статуса нет — они проходят всегда.
@@ -120,6 +120,21 @@
 //! или `snippet` (L0), `chunk_ids: []`; md — `<n>. f:<id> <пространство>/<путь>/  [score] ·
 //! <N> детей` и L0 строкой ниже.
 //!
+//! **Вложения** (M5, задача 6). Фрагмент документа-вложения (чанк `level = attachment`) — своя
+//! цель: документ (`attachment_id`), а не заметка-владелец; каналы FTS и векторный (листовой
+//! prefetch уровня `attachment`, Human — только FTS). Видимость — живой документ живого узла в
+//! пространствах цели (участнику общего решения — только пространство решения); путь, `area`,
+//! `certainty` и `filters.file` — заметки-владельца на момент поиска (Qdrant их у точек вложений
+//! не проверяет — проверяет SQLite). С документа — не больше `search.max_per_attachment` (2)
+//! фрагментов, квота заметки (`max_per_node`) — своя. `expand=section|neighbors|graph`, L0 и
+//! `seen` сессии к вложениям не применяются (`/read` по `locator` и учёт выданного — задача 7).
+//! JSON: `kind: "attachment"`, `id: "a:<chunk>"` (ссылка для `/read`), `node_id` владельца,
+//! `attachment_id`, `file`, `blob_sha256`, `locator` (`page:12`, `sheet:Итоги!A1:F40`,
+//! `slide:3`, `para:40`), `locator_text` (`стр. 12`, `лист «Итоги» A1:F40`, `слайд 3`, `абз. 40`),
+//! `path`, `heading_path`, `level`, `rev` (0), `certainty` владельца, `snippet` (и в `notes`) или
+//! `text`; md — `<n>. a:<chunk> <пространство>/<путь заметки> › <файл>[ › <путь заголовков>][ ·
+//! <locator_text>]  [score][ · <certainty>] · <дата> · <возраст> · ~<N> tok`.
+//!
 //! **Деградация.** Нет модели, ORT, Qdrant, чужая модель коллекции или сбой запроса
 //! (эмбеддинг, Qdrant) — ответ из одного FTS (по всем целям), `degraded: true` и `degraded_reason`
 //! (`no_runtime`, `no_model`, `qdrant_down`, `qdrant_locked`, `broken`, `model_mismatch`,
@@ -202,21 +217,22 @@ use zam_search::{
     Boosts, ChunkMeta, Cost, Fit, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights,
     apply_boosts, apply_boosts_to, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed,
     in_section, note_to_leaf, overflow_divisor, pack, rescale_overflow, summaries_without_leaf,
-    truncate_to_tokens,
+    target_cap, truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
-    ChunkScope, Db, EntryKind, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START, SeenItem, SeenKey,
-    Space, SpaceKind, StoreError, TargetFilter, WHOLE_TARGET, count_tokens, get_embeddings,
-    get_node, leaf_term_hits, leaves_of_targets, live_chunks, live_folders, mark_seen,
-    neighbor_leaves, node_content, pending_count, query_needles, search_fts_channels, seen_revs,
-    text_snippet, touch_session,
+    AttachmentHit, ChunkScope, Db, EntryKind, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START,
+    SeenItem, SeenKey, SeenTarget, Space, SpaceKind, StoreError, TargetFilter, WHOLE_TARGET,
+    chunk_ref, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_targets,
+    live_chunks, live_folders, mark_seen, neighbor_leaves, node_content, pending_count,
+    query_needles, search_fts_channels, seen_revs, text_snippet, touch_session,
 };
 
 use self::merge::merge_channels;
 use self::targets::{
     ScopeReq, SearchTarget, WARN_SOLUTION_UNAVAILABLE, dedup_keep_order, resolve_targets,
 };
+use super::doc_locator::{self, Sheets, secret_sheet};
 use super::json_body;
 use super::scope::skip_foreign;
 use super::sessions::{RequestSession, request_session};
@@ -309,14 +325,17 @@ const KINDS: [&str; 9] = [
     "folder",
     "attachment",
 ];
-/// Виды по умолчанию (§9.1; с M4.5 — `term` и `question`, спецификация M4.5 §1.3).
-const DEFAULT_KINDS: [&str; 6] = [
+/// Виды по умолчанию (§9.1; с M4.5 — `term` и `question`, спецификация M4.5 §1.3; с M5 —
+/// `attachment`). Умолчания входят в `scope_hash` кэша выжимок: выжимки поиска с прежними
+/// умолчаниями таким поиском не находятся и пересоздаются (CHANGELOG).
+const DEFAULT_KINDS: [&str; 7] = [
     "note",
     "insight",
     "changelog",
     "release",
     "term",
     "question",
+    "attachment",
 ];
 /// Статусы записей `filters.status`: insight и term, с M4.5 — task и question (спецификация
 /// M4.5 §1.3). Умолчания по виду — [`default_statuses`].
@@ -618,6 +637,7 @@ impl SearchSection {
             w_folder: self.w_folder,
             recency_half_life_days: self.recency_half_life_days,
             max_per_node: self.max_per_node,
+            max_per_attachment: self.max_per_attachment,
         }
     }
 }
@@ -825,15 +845,16 @@ fn rerank_text(h: &FtsHit) -> String {
     }
 }
 
-/// Не больше `max` элементов с одной цели (узла), порядок сохраняется.
-fn cap_items(items: Vec<Item>, max: usize) -> Vec<Item> {
+/// Не больше `max` элементов с одной цели (узла, записи) и `max_attachment` с документа
+/// вложения ([`target_cap`]), порядок сохраняется.
+fn cap_items(items: Vec<Item>, max: usize, max_attachment: usize) -> Vec<Item> {
     let mut seen: HashMap<TargetRef, usize> = HashMap::new();
     items
         .into_iter()
         .filter(|it| {
             let n = seen.entry(it.hit.target).or_insert(0);
             *n += 1;
-            *n <= max
+            *n <= target_cap(it.hit.target.kind, max, max_attachment)
         })
         .collect()
 }
@@ -856,8 +877,9 @@ async fn rerank_items(
     match rerank::score(r, query.to_string(), texts, st.cfg.ml.rerank_tokens).await {
         Ok(scores) => {
             let out = boost_reranked(items, &scores, boosts);
-            // лимит на узел — и после перестановки
-            (cap_items(out, st.cfg.search.max_per_node), None)
+            // лимит на узел и документ вложения — и после перестановки
+            let s = &st.cfg.search;
+            (cap_items(out, s.max_per_node, s.max_per_attachment), None)
         }
         Err(w) => (items, Some(w)),
     }
@@ -1278,13 +1300,14 @@ struct Packed {
     tokens: usize,
 }
 
-/// Строка карточки без текста: по ней считается стоимость в токенах.
+/// Строка карточки без текста: по ней считается стоимость в токенах. У вложения L0 нет — в
+/// `notes` тоже сниппет.
 fn card_summary(it: &Item, mode: SearchMode) -> &str {
     if it.seen {
         return "";
     }
     match mode {
-        SearchMode::Notes => it.l0.as_deref().unwrap_or(""),
+        SearchMode::Notes if it.hit.attachment.is_none() => it.l0.as_deref().unwrap_or(""),
         _ => &it.hit.snippet,
     }
 }
@@ -1295,8 +1318,12 @@ fn pack_items(items: Vec<Item>, mode: SearchMode, budget_tokens: usize) -> Vec<P
         .iter()
         .map(|it| Cost {
             base: count_tokens(&format!(
-                "{} {} {}",
+                "{} {} {} {}",
                 it.hit.path,
+                it.hit
+                    .attachment
+                    .as_ref()
+                    .map_or("", |a| a.filename.as_str()),
                 it.hit.heading_path,
                 card_summary(it, mode)
             )),
@@ -1362,17 +1389,57 @@ fn folder_json(p: &Packed, children: i64, mode: SearchMode, spaces: &HashMap<Id,
     Value::Object(o)
 }
 
+/// Подпись `locator` фрагмента вложения (`стр. 12`, `лист «Итоги» A1:F40`, …) со сканером
+/// секретов (имя листа — текст документа, как путь заголовков); `None` — без `locator` или он не
+/// разбирается.
+fn locator_text(a: &AttachmentHit) -> Option<String> {
+    a.locator
+        .as_deref()
+        .and_then(|l| zam_docs::Locator::parse(l).ok())
+        .map(|l| doc_locator::shown(&l, a.sheet_no).1)
+}
+
+/// `locator` фрагмента для карточки — со сканером секретов (имя листа); лист с секретом в имени —
+/// `sheet:#N!…` ([`doc_locator::shown`]): такой `locator` читается `/read`. Сырой `locator` наружу
+/// не нужен: `/read a:<chunk>` (задача 7) берёт его из чанка по `chunk_id`.
+fn shown_locator(a: &AttachmentHit) -> Option<String> {
+    a.locator
+        .as_deref()
+        .map(|raw| match zam_docs::Locator::parse(raw) {
+            Ok(l) => doc_locator::shown(&l, a.sheet_no).0,
+            Err(_) => zam_markdown::mask_text(raw),
+        })
+}
+
 fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Timestamp) -> Value {
     if let Some(children) = p.item.folder {
         return folder_json(p, children, mode, spaces);
     }
     let h = &p.item.hit;
     let mut o = Map::new();
-    let id_key = match h.target.kind {
-        TargetKind::Node => "node_id",
-        TargetKind::Entry => "entry_id",
-    };
-    o.insert(id_key.into(), json!(h.target.id));
+    match (h.target.kind, &h.attachment) {
+        // фрагмент вложения: ссылка `a:<chunk>`, документ, файл, `locator`; путь и `node_id` —
+        // заметки-владельца
+        (TargetKind::Attachment, Some(a)) => {
+            o.insert("id".into(), json!(chunk_ref(&h.chunk_id)));
+            o.insert("node_id".into(), json!(a.node_id));
+            o.insert("attachment_id".into(), json!(a.id));
+            o.insert("file".into(), json!(a.filename));
+            o.insert("blob_sha256".into(), json!(a.blob_sha256));
+            o.insert("locator".into(), json!(shown_locator(a)));
+            o.insert("locator_text".into(), json!(locator_text(a)));
+        }
+        (TargetKind::Node, _) => {
+            o.insert("node_id".into(), json!(h.target.id));
+        }
+        (TargetKind::Entry, _) => {
+            o.insert("entry_id".into(), json!(h.target.id));
+        }
+        // хит вложения всегда несёт поля документа (`zam_store::search`)
+        (TargetKind::Attachment, None) => {
+            o.insert("attachment_id".into(), json!(h.target.id));
+        }
+    }
     let space = spaces.get(&h.space_id);
     o.insert("space".into(), json!(space));
     if let Some(g) = space.and_then(|s| s.solution_guid.as_ref()) {
@@ -1403,7 +1470,11 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Tim
             o.insert("title".into(), json!(e.title));
         }
         None => {
-            o.insert("kind".into(), json!("note"));
+            let kind = match h.target.kind {
+                TargetKind::Attachment => "attachment",
+                TargetKind::Node | TargetKind::Entry => "note",
+            };
+            o.insert("kind".into(), json!(kind));
             o.insert("certainty".into(), json!(h.certainty));
         }
     }
@@ -1411,7 +1482,8 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Tim
     if !p.item.stale_refs.is_empty() {
         o.insert("stale_refs".into(), json!(p.item.stale_refs));
     }
-    if mode == SearchMode::Notes {
+    // у вложения L0 нет: и в `notes` — сниппет
+    if mode == SearchMode::Notes && h.attachment.is_none() {
         o.insert("l0".into(), json!(p.item.l0));
     } else if !p.item.seen {
         o.insert("snippet".into(), json!(h.snippet));
@@ -1487,8 +1559,45 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, age: u32, tokens: usi
     line
 }
 
+/// Заголовок карточки фрагмента вложения (без номера): `a:<chunk> <space>/<путь заметки> › <файл>
+/// › <путь заголовков> · стр. 12  [0.82] · <certainty> · 2026-10-10 · сегодня · ~120 tok`.
+fn attachment_card(
+    h: &FtsHit,
+    a: &AttachmentHit,
+    space: &str,
+    score: f64,
+    age: u32,
+    tokens: usize,
+) -> String {
+    let mut line = format!(
+        "{} {space}/{} › {}",
+        chunk_ref(&h.chunk_id),
+        h.path,
+        md_inline(&a.filename)
+    );
+    if !h.heading_path.is_empty() {
+        line.push_str(" › ");
+        line.push_str(&md_inline(&h.heading_path));
+    }
+    if let Some(l) = locator_text(a) {
+        line.push_str(" · ");
+        line.push_str(&md_inline(&l));
+    }
+    let certainty = h
+        .certainty
+        .as_ref()
+        .map(|c| format!(" · {c}"))
+        .unwrap_or_default();
+    line.push_str(&format!(
+        "  [{score:.2}]{certainty} · {} · {} · ~{tokens} tok\n",
+        h.updated_at.strftime("%Y-%m-%d"),
+        age_text(age),
+    ));
+    line
+}
+
 /// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · 3 дн. назад
-/// · ~340 tok` (у записи журнала — [`entry_card`]).
+/// · ~340 tok` (у записи журнала — [`entry_card`], у вложения — [`attachment_card`]).
 fn item_md(
     n: usize,
     p: &Packed,
@@ -1510,6 +1619,14 @@ fn item_md(
             )
         }
         (Some(e), None) => format!("{n}. {}", entry_card(e, h.target.id, score, age, p.tokens)),
+        (None, None) if h.attachment.is_some() => {
+            let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
+            let a = h.attachment.as_ref().expect("проверено выше");
+            format!(
+                "{n}. {}",
+                attachment_card(h, a, space, score, age, p.tokens)
+            )
+        }
         (None, None) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             let mut line = format!("{n}. {} {space}/{}", h.target, h.path);
@@ -1578,9 +1695,14 @@ fn item_md(
 /// элементы остаются без пометки.
 async fn attach_stale_refs(targets: &[SearchTarget], items: &mut [Item]) {
     for (i, t) in targets.iter().enumerate() {
+        // ссылок на файлы у документа вложения нет
         let owners: Vec<TargetRef> = items
             .iter()
-            .filter(|it| it.target == i && it.folder.is_none())
+            .filter(|it| {
+                it.target == i
+                    && it.folder.is_none()
+                    && it.hit.target.kind != TargetKind::Attachment
+            })
             .map(|it| it.hit.target)
             .collect();
         if owners.is_empty() {
@@ -1595,6 +1717,43 @@ async fn attach_stale_refs(targets: &[SearchTarget], items: &mut [Item]) {
                 }
             }
             Err(e) => tracing::warn!(error = %e, "чтение устаревших ссылок на файлы"),
+        }
+    }
+}
+
+/// Номер листа ([`zam_store::AttachmentHit::sheet_no`]) у фрагментов листов, имя которых меняет
+/// сканер секретов: у двух таких листов одна маска, и карточка без номера не позволила бы ни
+/// различить их, ни прочитать (`/read` ищет лист по сырому имени или номеру). Номер считается
+/// так же, как в `/read` ([`Sheets`]), по одному запросу `doc_sheet_locators` на документ и только
+/// для таких фрагментов. Сбой чтения — WARN, карточка остаётся с маской.
+async fn number_secret_sheets(targets: &[SearchTarget], items: &mut [Item]) {
+    let mut cache: HashMap<(usize, Id), Option<Sheets>> = HashMap::new();
+    for it in items.iter_mut() {
+        let Some(a) = it.hit.attachment.as_mut() else {
+            continue;
+        };
+        let Some(Ok(l)) = a.locator.as_deref().map(zam_docs::Locator::parse) else {
+            continue;
+        };
+        if !secret_sheet(&l) {
+            continue;
+        }
+        let key = (it.target, a.id);
+        let sheets = match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let db = &targets[it.target].db;
+                v.insert(match zam_store::doc_sheet_locators(db, a.id).await {
+                    Ok(list) => Some(Sheets::of(list.iter().map(String::as_str))),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "поиск: номера листов вложения не прочитаны");
+                        None
+                    }
+                })
+            }
+        };
+        if let (Some(sheets), zam_docs::Locator::Sheet { name, .. }) = (sheets.as_ref(), &l) {
+            a.sheet_no = sheets.no(name);
         }
     }
 }
@@ -1719,6 +1878,7 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
             area: None,
             certainty: None,
             verified_at: None,
+            attachment: None,
         },
         score,
         sources: vec![zam_search::Channel::Folder.as_str()],
@@ -1734,38 +1894,53 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
 }
 
 /// Ключ выданного: владелец базы цели элемента, цель и часть — `chunk_id` или
-/// [`WHOLE_TARGET`] (решение контроллера R11).
+/// [`WHOLE_TARGET`] (решение контроллера R11). Фрагмент вложения — цель-блоб по sha256 (M5,
+/// задача 7: один файл в двух заметках — одна цель), часть — `chunk_id` или `locator`,
+/// прочитанный через `/read` целиком.
 fn seen_key(targets: &[SearchTarget], it: &Item, part: &str) -> SeenKey {
+    let target = match &it.hit.attachment {
+        Some(a) => SeenTarget::Blob(a.blob_sha256.clone()),
+        None => it.hit.target.into(),
+    };
     SeenKey {
         owner_id: targets[it.target].owner,
-        target: it.hit.target,
+        target,
         part: part.to_string(),
     }
 }
 
+/// Элемент учитывается в `session_seen`: не карточка папки.
+fn seen_tracked(it: &Item) -> bool {
+    it.folder.is_none()
+}
+
 /// Помечает элементы, уже выданные сессии в той же ревизии (`seen`), и снимает их текст:
-/// выдана цель целиком или все чанки элемента (`chunk_ids`).
+/// выдана цель целиком, все чанки элемента (`chunk_ids`) или — у вложения — его `locator`
+/// (`/read` отдал единицу документа целиком).
 async fn mark_seen_items(
     s: &RequestSession,
     targets: &[SearchTarget],
     items: &mut [Item],
 ) -> Result<(), StoreError> {
+    let locator = |it: &Item| it.hit.attachment.as_ref().and_then(|a| a.locator.clone());
     let parts = |it: &Item| -> Vec<SeenKey> {
-        std::iter::once(WHOLE_TARGET)
-            .chain(it.chunk_ids.iter().map(String::as_str))
-            .map(|part| seen_key(targets, it, part))
+        std::iter::once(WHOLE_TARGET.to_string())
+            .chain(locator(it))
+            .chain(it.chunk_ids.iter().cloned())
+            .map(|part| seen_key(targets, it, &part))
             .collect()
     };
     let keys: Vec<SeenKey> = items
         .iter()
-        .filter(|it| it.folder.is_none())
+        .filter(|it| seen_tracked(it))
         .flat_map(parts)
         .collect();
     let revs = seen_revs(&s.db, &s.touch.id, &keys).await?;
     let same = |k: &SeenKey, rev: i64| revs.get(k) == Some(&rev);
-    for it in items.iter_mut().filter(|it| it.folder.is_none()) {
+    for it in items.iter_mut().filter(|it| seen_tracked(it)) {
         let rev = it.hit.rev;
-        let whole = same(&seen_key(targets, it, WHOLE_TARGET), rev);
+        let whole = same(&seen_key(targets, it, WHOLE_TARGET), rev)
+            || locator(it).is_some_and(|l| same(&seen_key(targets, it, &l), rev));
         let chunks = !it.chunk_ids.is_empty()
             && it
                 .chunk_ids
@@ -1782,6 +1957,22 @@ async fn mark_seen_items(
 /// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
 fn session_failed(what: &str, e: &StoreError) {
     tracing::warn!(error = %e, "поиск: {what} сессии не выполнено, ответ без пометок seen");
+}
+
+/// Есть ли в векторных пространствах (без Human) целей извлечённый документ вложения. Сбой
+/// чтения — `true` (prefetch вложений остаётся; WARN без текста).
+async fn any_attachments(targets: &[SearchTarget]) -> bool {
+    for t in targets {
+        match zam_store::has_attachment_chunks(&t.db, t.vector_space_ids()).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "поиск: проверка вложений не удалась, prefetch остаётся");
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Расширения запроса словарём для цели `tg`; сбой чтения словаря поиск не валит (WARN без
@@ -1894,12 +2085,18 @@ pub async fn search(
         if !run_vector {
             return VectorRun::default();
         }
-        let filter = vector_filter(
+        let mut filter = vector_filter(
             scopes.clone(),
             prefix.clone(),
             &kinds,
             want_folders || folder_channel,
         );
+        filter.attach_prefetch = Some(st.cfg.search.attach_prefetch);
+        // prefetch вложений — только если в области есть извлечённые документы (одна проверка
+        // EXISTS по базе цели: +1,8 мс к p95 без пользы, раунд правок 2 задачи 6)
+        if zam_index::attachment_window(&filter) > 0 {
+            filter.no_attachments = !any_attachments(&targets).await;
+        }
         vector_channel(&st.index, filter, req.query.clone()).await
     };
     // заметки области всех целей, ещё не прошедшие векторную индексацию (без `index: false`
@@ -2135,7 +2332,7 @@ pub async fn search(
     });
     let ranked = note_to_leaf(ranked, |r| best.get(&r.chunk_id).cloned());
     // лимит на цель — после замены сводок листами
-    let mut ranked = cap_per_node(ranked, weights.max_per_node);
+    let mut ranked = cap_per_node(ranked, weights.max_per_node, weights.max_per_attachment);
     let rerank_on = req.rerank == Some(RerankMode::On);
     // реранку — не меньше `rerank_top` кандидатов, даже при малом top_k
     ranked.truncate(if rerank_on {
@@ -2274,6 +2471,8 @@ pub async fn search(
     }
     // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется
     attach_stale_refs(&targets, &mut items).await;
+    // лист с секретом в имени — номером, как в `/read` (задача 7 M5, раунд правок 2)
+    number_secret_sheets(&targets, &mut items).await;
     // выжимки шага 0 — из того же бюджета
     let cache_tokens: usize = cache_items.iter().map(cache_step::CacheItem::tokens).sum();
     let packed = pack_items(items, mode, budget.saturating_sub(cache_tokens).max(1));
@@ -2281,7 +2480,7 @@ pub async fn search(
     if let (Some(s), SearchMode::Chunks) = (&session, mode) {
         let given: Vec<SeenItem> = packed
             .iter()
-            .filter(|p| matches!(p.text, Some((_, false))) && p.item.folder.is_none())
+            .filter(|p| matches!(p.text, Some((_, false))) && seen_tracked(&p.item))
             .flat_map(|p| {
                 p.item.chunk_ids.iter().map(|c| SeenItem {
                     key: seen_key(&targets, &p.item, c),
@@ -2387,6 +2586,7 @@ mod tests {
             area: None,
             certainty: None,
             verified_at: None,
+            attachment: None,
         }
     }
 
@@ -2421,9 +2621,125 @@ mod tests {
             vec![hit(a, "1"), hit(a, "22"), hit(b, "333"), hit(a, "4444")],
             false,
         );
-        let capped = cap_items(its, 2);
+        let capped = cap_items(its, 2, 1);
         let ids: Vec<&str> = capped.iter().map(|i| i.hit.chunk_id.as_str()).collect();
         assert_eq!(ids, ["c1", "c2", "c3"]);
+        // у документа вложения — своя квота (`max_per_attachment`), заметку она не трогает
+        let mut its = items(
+            vec![
+                hit(a, "1"),
+                hit(a, "22"),
+                att_hit(b, "333"),
+                att_hit(b, "4444"),
+            ],
+            false,
+        );
+        its.push(items(vec![hit(a, "55555")], false).remove(0));
+        let ids: Vec<String> = cap_items(its, 3, 1)
+            .into_iter()
+            .map(|i| i.hit.chunk_id)
+            .collect();
+        assert_eq!(ids, ["c1", "c2", "c3", "c5"]);
+    }
+
+    /// Чанк документа вложения `doc` (узел-владелец — новый).
+    fn att_hit(doc: Id, text: &str) -> FtsHit {
+        let mut h = hit(doc, text);
+        h.target.kind = TargetKind::Attachment;
+        h.level = "attachment".into();
+        h.rev = 0;
+        h.attachment = Some(zam_store::AttachmentHit {
+            id: doc,
+            node_id: Id::new(),
+            filename: "книга.pdf".into(),
+            blob_sha256: "f".repeat(64),
+            locator: Some("page:12".into()),
+            sheet_no: None,
+        });
+        h
+    }
+
+    /// Карточка вложения (задача 6 M5): `a:<chunk>`, путь заметки-владельца, файл, путь заголовков
+    /// и подпись `locator`; JSON — `kind: attachment`, `id`, `node_id` владельца, `attachment_id`,
+    /// `file`, `blob_sha256`, `locator`, `locator_text`.
+    #[test]
+    fn md_card_locator_text() {
+        let now = Timestamp::now();
+        let doc = Id::new();
+        let mut h = att_hit(doc, "Текст страницы");
+        h.chunk_id = "ab".repeat(16);
+        h.path = "docs/отчёт".into();
+        h.heading_path = "Глава 1".into();
+        let owner = h.attachment.as_ref().unwrap().node_id;
+        let card = |h: FtsHit| {
+            let mut p = pack_items(items(vec![h], false), SearchMode::Brief, 1000).remove(0);
+            p.tokens = 7;
+            p
+        };
+        let p = card(h.clone());
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let chunk = "ab".repeat(16);
+        assert!(
+            s.starts_with(&format!(
+                "1. a:{chunk} ?/docs/отчёт › книга.pdf › Глава 1 · стр. 12  [0.50] · {} · \
+                 сегодня · ~7 tok\n",
+                now.strftime("%Y-%m-%d")
+            )),
+            "{s}"
+        );
+        let j = item_json(&p, SearchMode::Brief, &HashMap::new(), now);
+        assert_eq!(j["kind"], "attachment");
+        assert_eq!(j["id"], format!("a:{chunk}"));
+        assert_eq!(j["node_id"], json!(owner));
+        assert_eq!(j["attachment_id"], json!(doc));
+        assert_eq!(j["file"], "книга.pdf");
+        assert_eq!(j["blob_sha256"], "f".repeat(64));
+        assert_eq!(j["locator"], "page:12");
+        assert_eq!(j["locator_text"], "стр. 12");
+        assert_eq!(j["level"], "attachment");
+        assert!(j.get("entry_id").is_none());
+        // секрет в имени листа маскируется и в `locator`, и в подписи (имя файла — как есть)
+        let mut s = h.clone();
+        s.attachment.as_mut().unwrap().locator = Some("sheet:AKIAIOSFODNN7EXAMPLE!A1:B2".into());
+        let p = card(s);
+        let j = item_json(&p, SearchMode::Brief, &HashMap::new(), now);
+        let md = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        for t in [j["locator"].to_string(), j["locator_text"].to_string(), md] {
+            assert!(!t.contains("AKIAIOSFODNN7EXAMPLE"), "{t}");
+        }
+        assert!(j["locator"].as_str().unwrap().ends_with("!A1:B2"), "{j}");
+        // лист с диапазоном, слайд, абзац; без locator — без подписи
+        for (loc, text) in [
+            ("sheet:Итоги!A1:F40", "лист «Итоги» A1:F40"),
+            ("slide:3", "слайд 3"),
+            ("para:40", "абз. 40"),
+        ] {
+            let mut h = h.clone();
+            h.attachment.as_mut().unwrap().locator = Some(loc.into());
+            let p = card(h);
+            assert!(
+                item_md(1, &p, SearchMode::Brief, &HashMap::new(), now)
+                    .contains(&format!("› Глава 1 · {text}  [")),
+                "{loc}"
+            );
+            assert_eq!(
+                item_json(&p, SearchMode::Brief, &HashMap::new(), now)["locator_text"],
+                text
+            );
+        }
+        let mut h = h.clone();
+        h.heading_path.clear();
+        h.attachment.as_mut().unwrap().locator = None;
+        let p = card(h);
+        assert!(
+            item_md(1, &p, SearchMode::Brief, &HashMap::new(), now)
+                .starts_with(&format!("1. a:{chunk} ?/docs/отчёт › книга.pdf  [0.50]")),
+        );
+        assert!(item_json(&p, SearchMode::Brief, &HashMap::new(), now)["locator_text"].is_null());
+        // в `notes` у вложения нет L0 — карточка несёт сниппет
+        let p = card(att_hit(doc, "x"));
+        let j = item_json(&p, SearchMode::Notes, &HashMap::new(), now);
+        assert_eq!(j["snippet"], json!(p.item.hit.snippet));
     }
 
     #[test]

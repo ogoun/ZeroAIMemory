@@ -618,7 +618,8 @@ async fn seen_whole_target_hides_all_chunks() {
             target: TargetRef {
                 kind: TargetKind::Node,
                 id: id(&n).parse().unwrap(),
-            },
+            }
+            .into(),
             part: zam_store::WHOLE_TARGET.into(),
         },
         rev: 1,

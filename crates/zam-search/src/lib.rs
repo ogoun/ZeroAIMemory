@@ -6,7 +6,8 @@
 //! - [`adjust`] — поправки: затухание ([`recency_factor`]), бусты вида инсайта, надёжности и
 //!   текущей области ([`apply_boosts`]) и нормировка шкалы после них ([`rescale_overflow`]),
 //!   замена сводки заметки или секции лучшим листом ([`note_to_leaf`], §9.2 п. 6), затем не
-//!   больше `max_per_node` элементов с узла ([`cap_per_node`]).
+//!   больше `max_per_node` элементов с узла и `max_per_attachment` с документа вложения
+//!   ([`cap_per_node`]).
 //! - [`pack`] — упаковка в `budget_tokens` по числу токенов элементов.
 //! - [`recall`] — проактивное вспоминание `/recall` (§10.3): нормализация ошибки, `error_regex`,
 //!   строки подсказок, упаковка дайджеста в бюджет.
@@ -24,7 +25,7 @@ pub mod recall;
 pub use adjust::{
     Boosts, LeafRef, RECENCY_FLOOR, apply_boosts, apply_boosts_to, cap_per_node,
     drop_unresolved_tail, in_section, note_to_leaf, order_contradicted, overflow_divisor,
-    recency_factor, rescale_overflow, summaries_without_leaf,
+    recency_factor, rescale_overflow, summaries_without_leaf, target_cap,
 };
 pub use hybrid::{
     Channel, ChunkMeta, FolderHit, Level, Ranked, SearchInputs, Weights, folder_score, fuse,

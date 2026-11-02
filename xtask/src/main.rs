@@ -3,6 +3,7 @@
 mod bench;
 mod bundles;
 mod changelog;
+mod docs_corpus;
 mod eval;
 mod fetch;
 mod manifest;
@@ -116,6 +117,12 @@ enum Cmd {
     /// Замеры нефункциональных целей §17 ТЗ (поиск, индексация, запись, reindex, RSS, старт,
     /// падение Qdrant) на корпусе eval/ с размножением до --notes заметок
     Bench(bench::BenchArgs),
+    /// Набор документов eval/docs/ (спецификация M5 §6): DOCX, XLSX, PPTX, PDF и враждебные
+    /// файлы детерминированно из сида; бинарники не в git
+    DocsCorpus(docs_corpus::DocsCorpusArgs),
+    /// Разбор одного PDF бэкендом A/B в этом процессе (JSON в stdout; для eval --docs)
+    #[command(hide = true)]
+    DocsExtract(eval::docs::extract::ExtractArgs),
     /// Проверка архива zam-cuda: штампы совпадают с deploy/cuda.toml, файлы на месте
     /// (cuda fetch после распаковки ничего не скачает), формат библиотек, лицензии NVIDIA
     SmokeCuda {
@@ -470,6 +477,8 @@ fn run(cmd: Cmd) -> Result<()> {
         ),
         Cmd::SmokeCuda { archive } => smoke::run_cuda(&archive, &repo_root()),
         Cmd::Eval(a) => eval::main(a, &repo_root()),
+        Cmd::DocsCorpus(a) => docs_corpus::main(a, &repo_root()),
+        Cmd::DocsExtract(a) => eval::docs::extract::child_main(a, &repo_root()),
         Cmd::Bench(a) => bench::main(a, &repo_root()),
     }
 }

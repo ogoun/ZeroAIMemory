@@ -108,6 +108,21 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0018_vault_fts.sql"),
         rebuild: false,
     },
+    Migration {
+        version: 19,
+        sql: include_str!("../migrations/user/0019_attachments_index.sql"),
+        rebuild: false,
+    },
+    Migration {
+        version: 20,
+        sql: include_str!("../migrations/user/0020_attachment_pending_index.sql"),
+        rebuild: false,
+    },
+    Migration {
+        version: 21,
+        sql: include_str!("../migrations/user/0021_blob_extract_key.sql"),
+        rebuild: false,
+    },
 ];
 
 /// Вид пространства.
@@ -295,6 +310,8 @@ impl UserDbs {
                 running: AtomicBool::new(true),
             })
         });
+        // нарезка вложений (M5): состояние и задания извлечения, работа — у конвейера документов
+        crate::attachments::rechunk_docs_if_stale(&db).await?;
         let edges = crate::graph::backfill_pending(&db).await?;
         let secrets = secrets_scan_pending(&db).await?;
         // теги payload и вход эмбеддинга папок (v3): до возврата базы — воркер проверяет
@@ -1089,8 +1106,8 @@ pub async fn rename_solution_space(db: &Db, space_id: Id, name: &str) -> Result<
 }
 
 /// Меняет GUID пространства решения `space_id` (конфликт GUID при регистрации решений
-/// M1–M2). Узлы, ревизии и чанки остаются на месте; живые индексируемые заметки получают
-/// `upsert`, чтобы точки Qdrant получили новый `solution_guid` в payload. Нет такого
+/// M1–M2). Узлы, ревизии и чанки остаются на месте; живые индексируемые заметки и извлечённые
+/// вложения получают `upsert`, чтобы точки Qdrant получили новый `solution_guid` в payload. Нет такого
 /// пространства решения — `NotFound`, GUID занят — `Conflict`.
 pub async fn rename_solution_guid(
     db: &Db,
@@ -1132,6 +1149,7 @@ pub async fn rename_solution_guid(
         for (node, rev) in notes {
             crate::jobs::enqueue(tx, node, rev, JobOp::Upsert, PRIORITY_REINDEX, &now)?;
         }
+        crate::attachments::requeue_space_docs(tx, space_id, &now)?;
         Ok(())
     })
     .await

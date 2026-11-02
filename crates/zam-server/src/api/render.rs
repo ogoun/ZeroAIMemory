@@ -17,7 +17,11 @@
 //! percent-encoding>`; администратору, действующему от имени другого пользователя,
 //! добавляется `?user=<id>` (браузер не передаёт `X-Zam-User` в `<img src>`).
 //!
-//! **Кэш.** LRU на 512 записей; ключ — `(content_hash, RENDER_VERSION, space_id,
+//! **Кэш.** Два LRU: обычный — 512 записей с HTML до [`RENDER_CACHE_MAX_HTML`] (256 КиБ),
+//! крупный — HTML до [`RENDER_CACHE_LARGE_MAX_HTML`] (8 МиБ) суммарно не больше
+//! [`RENDER_CACHE_LARGE_BYTES`] (32 МиБ): тяжёлая, но допустимая заметка (код до бюджета
+//! подсветки 4 МиБ HTML) рендерится раз, а не на каждый GET (задача 8 M5, раунд 2). Ключ —
+//! `(content_hash, RENDER_VERSION, space_id,
 //! user_id, viewer, поколение)`: `user_id` — владелец базы заметки; href вики-ссылок
 //! зависят от узлов пространства, URL вложений — ещё и от вида зрителя ([`Viewer`]:
 //! токен не видит вложений Human, участник — вложений вне решения, администратору от
@@ -57,8 +61,12 @@ use crate::error::ApiError;
 pub const RENDER_BODY_MAX: usize = 1024 * 1024;
 /// Записей в кэше рендера.
 pub const RENDER_CACHE_ENTRIES: usize = 512;
-/// HTML крупнее не кэшируется: 512 записей по несколько МБ — слишком много памяти.
+/// HTML крупнее идёт в крупный кэш: 512 записей по несколько МБ — слишком много памяти.
 pub const RENDER_CACHE_MAX_HTML: usize = 256 * 1024;
+/// HTML крупнее не кэшируется вовсе (заметка 5 МБ с бюджетом подсветки 4 МиБ — меньше).
+pub const RENDER_CACHE_LARGE_MAX_HTML: usize = 8 * 1024 * 1024;
+/// Суммарный HTML крупного кэша, байт: сверх — вытесняются давние записи.
+pub const RENDER_CACHE_LARGE_BYTES: usize = 32 * 1024 * 1024;
 /// Не больше стольких разных целей вики-ссылок (и отдельно — вложений) разрешается
 /// в одной заметке; остальные считаются битыми (защита от тысяч запросов к БД на
 /// один рендер).
@@ -101,8 +109,54 @@ pub struct RenderCtx {
 
 /// `(content_hash, RENDER_VERSION, space_id, user_id, viewer, поколение)`.
 pub type RenderKey = (String, u32, Id, Id, Viewer, u64);
+/// Кэш HTML заметок: обычные записи и крупные с пределом суммы байт.
+pub struct RenderLru {
+    small: LruCache<RenderKey, Arc<Rendered>>,
+    large: LruCache<RenderKey, Arc<Rendered>>,
+    large_bytes: usize,
+}
+
+impl RenderLru {
+    /// Записей в обоих кэшах.
+    pub fn len(&self) -> usize {
+        self.small.len() + self.large.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&mut self, key: &RenderKey) -> Option<Arc<Rendered>> {
+        self.small
+            .get(key)
+            .cloned()
+            .or_else(|| self.large.get(key).cloned())
+    }
+
+    fn put(&mut self, key: RenderKey, r: Arc<Rendered>) {
+        let n = r.html.len();
+        if n <= RENDER_CACHE_MAX_HTML {
+            self.small.put(key, r);
+            return;
+        }
+        if n > RENDER_CACHE_LARGE_MAX_HTML {
+            return;
+        }
+        if let Some(old) = self.large.put(key, r) {
+            self.large_bytes -= old.html.len();
+        }
+        self.large_bytes += n;
+        while self.large_bytes > RENDER_CACHE_LARGE_BYTES {
+            match self.large.pop_lru() {
+                Some((_, v)) => self.large_bytes -= v.html.len(),
+                None => break,
+            }
+        }
+    }
+}
+
 /// Кэш HTML заметок.
-pub type RenderCache = Arc<Mutex<LruCache<RenderKey, Arc<Rendered>>>>;
+pub type RenderCache = Arc<Mutex<RenderLru>>;
 
 /// Поколения разрешения ссылок для ключа кэша рендера.
 ///
@@ -143,7 +197,14 @@ impl RenderGenerations {
 
 pub fn new_cache() -> RenderCache {
     let n = NonZeroUsize::new(RENDER_CACHE_ENTRIES).expect("ненулевой размер");
-    Arc::new(Mutex::new(LruCache::new(n)))
+    // крупных записей не больше, чем помещается минимальных крупных в сумму байт
+    let large = NonZeroUsize::new(RENDER_CACHE_LARGE_BYTES / RENDER_CACHE_MAX_HTML)
+        .expect("ненулевой размер");
+    Arc::new(Mutex::new(RenderLru {
+        small: LruCache::new(n),
+        large: LruCache::new(large),
+        large_bytes: 0,
+    }))
 }
 
 /// Ключ кэша для текста с хэшем `content_hash` в пространстве `space` пользователя
@@ -168,7 +229,7 @@ pub fn cache_key(
 /// Запись из кэша (отравленный мьютекс не мешает: кэш — только ускорение).
 pub fn cache_get(st: &AppState, key: &RenderKey) -> Option<Arc<Rendered>> {
     let mut c = st.render_cache.lock().unwrap_or_else(|e| e.into_inner());
-    c.get(key).cloned()
+    c.get(key)
 }
 
 fn cache_put(st: &AppState, key: RenderKey, r: Arc<Rendered>) {
@@ -188,15 +249,8 @@ pub async fn render_cached(
         return Ok(r);
     }
     let r = Arc::new(render(db, Some(ctx), text).await?);
-    if cacheable(&r) {
-        cache_put(st, key, Arc::clone(&r));
-    }
+    cache_put(st, key, Arc::clone(&r));
     Ok(r)
-}
-
-/// Кэшируется только HTML не больше [`RENDER_CACHE_MAX_HTML`].
-fn cacheable(r: &Rendered) -> bool {
-    r.html.len() <= RENDER_CACHE_MAX_HTML
 }
 
 /// Рендер текста: ссылки разрешаются в контексте `ctx` (`None` — не разрешаются).
@@ -379,15 +433,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn large_html_not_cacheable() {
-        let mk = |n: usize| Rendered {
-            html: "x".repeat(n),
-            toc: Vec::new(),
-            links: Vec::new(),
-            warnings: Vec::new(),
+    fn large_html_cached_within_byte_budget() {
+        let mk = |n: usize| {
+            Arc::new(Rendered {
+                html: "x".repeat(n),
+                toc: Vec::new(),
+                links: Vec::new(),
+                warnings: Vec::new(),
+            })
         };
-        assert!(cacheable(&mk(RENDER_CACHE_MAX_HTML)));
-        assert!(!cacheable(&mk(RENDER_CACHE_MAX_HTML + 1)));
+        let key = |i: u64| {
+            (
+                "h".to_string(),
+                RENDER_VERSION,
+                Id::new(),
+                Id::new(),
+                Viewer::Admin,
+                i,
+            )
+        };
+        let c = new_cache();
+        let mut c = c.lock().unwrap();
+        let k0 = key(0);
+        c.put(k0.clone(), mk(RENDER_CACHE_MAX_HTML));
+        assert!(c.small.contains(&k0));
+        // слишком крупный — не кэшируется
+        let k1 = key(1);
+        c.put(k1.clone(), mk(RENDER_CACHE_LARGE_MAX_HTML + 1));
+        assert!(c.get(&k1).is_none());
+        // крупные: сумма не больше предела, давние вытесняются
+        let keys: Vec<RenderKey> = (2..8).map(key).collect();
+        for k in &keys {
+            c.put(k.clone(), mk(6 * 1024 * 1024));
+        }
+        assert!(c.large_bytes <= RENDER_CACHE_LARGE_BYTES);
+        assert!(c.get(&keys[5]).is_some());
+        assert!(c.get(&keys[0]).is_none());
+        assert_eq!(
+            c.large_bytes,
+            c.large.iter().map(|(_, v)| v.html.len()).sum::<usize>()
+        );
     }
 
     #[test]

@@ -62,15 +62,19 @@ pub enum Level {
     Section,
     /// L1 заметки (сводка).
     Note,
+    /// Фрагмент документа-вложения (M5): текст, не сводка.
+    Attachment,
 }
 
 impl Level {
-    /// `chunk` / `section` / `note`; прочее — `None` (папки и вложения в M2 не ищутся).
+    /// `chunk` / `section` / `note` / `attachment`; прочее — `None` (папки ищутся своим
+    /// каналом).
     pub fn parse(s: &str) -> Option<Level> {
         match s {
             "chunk" => Some(Level::Chunk),
             "section" => Some(Level::Section),
             "note" => Some(Level::Note),
+            "attachment" => Some(Level::Attachment),
             _ => None,
         }
     }
@@ -80,12 +84,13 @@ impl Level {
             Level::Chunk => "chunk",
             Level::Section => "section",
             Level::Note => "note",
+            Level::Attachment => "attachment",
         }
     }
 
     /// Сводка (L1), а не текст.
     pub fn is_summary(self) -> bool {
-        self != Level::Chunk
+        matches!(self, Level::Section | Level::Note)
     }
 }
 
@@ -178,6 +183,8 @@ pub struct Weights {
     pub recency_half_life_days: f64,
     /// Не больше чанков с одного узла.
     pub max_per_node: usize,
+    /// Не больше фрагментов с одного документа вложения (M5); квота заметки-владельца — своя.
+    pub max_per_attachment: usize,
 }
 
 impl Default for Weights {
@@ -192,6 +199,7 @@ impl Default for Weights {
             w_folder: 0.0,
             recency_half_life_days: 180.0,
             max_per_node: 3,
+            max_per_attachment: 2,
         }
     }
 }
@@ -267,11 +275,12 @@ pub fn fuse_normed(inp: &SearchInputs, w: &Weights, now: Timestamp) -> (Vec<Rank
             max += t / (w.rrf_k + 1.0);
         }
     }
-    // канал папок: прибавка по лучшей папке-предку, один раз на чанк
+    // канал папок: прибавка по лучшей папке-предку, один раз на чанк; фрагмент вложения лежит
+    // по пути узла-владельца
     if w.w_folder > 0.0 && !inp.folders.is_empty() {
         for (id, e) in by_chunk.iter_mut() {
             let m = &inp.chunks[*id];
-            if m.target.kind != TargetKind::Node {
+            if m.target.kind == TargetKind::Entry {
                 continue;
             }
             let best = inp
@@ -536,9 +545,65 @@ mod tests {
         // fuse лимит не применяет: его применяет cap_per_node после note_to_leaf
         let all = fuse(&inp, &Weights::default(), now());
         assert_eq!(all.len(), 7);
-        let r = crate::cap_per_node(all.clone(), Weights::default().max_per_node);
+        let w = Weights::default();
+        let r = crate::cap_per_node(all.clone(), w.max_per_node, w.max_per_attachment);
         assert_eq!(ids(&r), vec!["n0", "n1", "n2", "m0"]);
-        assert_eq!(ids(&crate::cap_per_node(all, 1)), vec!["n0", "m0"]);
+        assert_eq!(ids(&crate::cap_per_node(all, 1, 1)), vec!["n0", "m0"]);
+    }
+
+    /// Фрагменты документа вложения — своя цель: квота `max_per_attachment`, квота узла-владельца
+    /// не тратится; канал папок поднимает и их (путь — узла-владельца), но не записи журналов.
+    #[test]
+    fn attachment_quota_and_folder_lift() {
+        let (n, d) = (Id::new(), Id::new());
+        let space = Id::new();
+        let mut chunks = meta(&[("n0", n), ("n1", n), ("n2", n), ("n3", n)]);
+        for c in ["a0", "a1", "a2"] {
+            chunks.insert(
+                c.into(),
+                ChunkMeta {
+                    target: TargetRef {
+                        kind: TargetKind::Attachment,
+                        id: d,
+                    },
+                    level: Level::Attachment,
+                    heading_path: String::new(),
+                    updated_at: now(),
+                    insight_kind: None,
+                    certainty: None,
+                    area: None,
+                    space_id: space,
+                    path: "docs/x".into(),
+                },
+            );
+        }
+        let inp = SearchInputs {
+            fts: list(&["a0", "n0", "a1", "n1", "a2", "n2", "n3"]),
+            chunks: chunks.clone(),
+            ..Default::default()
+        };
+        let all = fuse(&inp, &Weights::default(), now());
+        let r = crate::cap_per_node(all, 3, 2);
+        assert_eq!(ids(&r), vec!["a0", "n0", "a1", "n1", "n2"]);
+        // папка docs поднимает фрагменты вложения узла под ней
+        let inp = SearchInputs {
+            fts: list(&["n0", "a0"]),
+            chunks,
+            folders: vec![FolderHit {
+                folder: Id::new(),
+                space_id: space,
+                path_prefix: "docs".into(),
+                rank: 1,
+            }],
+            ..Default::default()
+        };
+        let w = Weights {
+            w_folder: 1.0,
+            ..Weights::default()
+        };
+        let r = fuse(&inp, &w, now());
+        assert_eq!(r[0].chunk_id, "a0");
+        assert_eq!(r[0].sources, vec!["fts", "folder"]);
     }
 
     #[test]

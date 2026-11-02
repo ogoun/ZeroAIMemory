@@ -20,7 +20,7 @@ fn deps_of(c: &Connection, target: TargetRef) -> Result<Vec<(Id, String, String)
          JOIN answer_cache a ON a.id = d.cache_id
          WHERE d.target_kind = ?1 AND d.target_id = ?2 AND a.deleted_at IS NULL",
     )?;
-    let rows = st.query_map(params![kind_str(target.kind), target.id], |r| {
+    let rows = st.query_map(params![kind_str(target.kind)?, target.id], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -67,7 +67,7 @@ pub(crate) fn invalidate_revised(
         if same {
             bump.execute(params![
                 cache,
-                kind_str(target.kind),
+                kind_str(target.kind)?,
                 target.id,
                 section,
                 rev
@@ -88,6 +88,9 @@ fn updated_at(c: &Connection, t: TargetRef) -> Result<Option<Timestamp>, StoreEr
     let sql = match t.kind {
         TargetKind::Node => "SELECT updated_at FROM nodes WHERE id = ?1 AND deleted_at IS NULL",
         TargetKind::Entry => "SELECT updated_at FROM entries WHERE id = ?1 AND deleted_at IS NULL",
+        TargetKind::Attachment => {
+            "SELECT created_at FROM attachment_docs WHERE id = ?1 AND deleted_at IS NULL"
+        }
     };
     let s: Option<String> = c
         .prepare_cached(sql)?
@@ -183,7 +186,7 @@ pub async fn mark_new_sources(
                     continue;
                 }
                 let dep: bool = is_dep
-                    .query_row(params![cache, kind_str(target.kind), target.id], |r| {
+                    .query_row(params![cache, kind_str(target.kind)?, target.id], |r| {
                         r.get(0)
                     })?;
                 if dep {
