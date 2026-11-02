@@ -97,6 +97,9 @@ pub enum ApiError {
     Busy { retry_after_s: u64 },
     #[error("{0}")]
     Unavailable(String),
+    /// 408 `/problems/timeout`: тело запроса не получено в срок ([`crate::api::big_body`]).
+    #[error("{0}")]
+    RequestTimeout(String),
     /// 503 `/problems/vault-locked` (§7.6): мастер-ключ не подходит или файла ключа нет при
     /// существующих ключах; в `detail` — причина (без путей и ключей).
     #[error("Vault заблокирован: {0}")]
@@ -220,6 +223,11 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "/problems/busy",
                 "Service Unavailable",
+            ),
+            ApiError::RequestTimeout(_) => (
+                StatusCode::REQUEST_TIMEOUT,
+                "/problems/timeout",
+                "Request Timeout",
             ),
             ApiError::Unavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,

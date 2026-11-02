@@ -1267,6 +1267,14 @@ async fn big_bodies_busy_503_small_unaffected() {
     );
     assert_eq!(r.json()["type"], "/problems/busy");
     assert_eq!(r.header("retry-after"), "2");
+    // не-отчёт с `kind` в начале — 413 без ожидания разрешения, а не 503
+    let pad = "x".repeat(80 * 1024);
+    let r = post_raw(
+        &w,
+        format!(r#"{{"kind": "changelog", "title": "Т", "pad": "{pad}"}}"#),
+    )
+    .await;
+    assert_status(&r, StatusCode::PAYLOAD_TOO_LARGE, "большой changelog");
     // /mcp — тот же семафор
     let rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
                      "params": {"pad": "x".repeat(80 * 1024)}})

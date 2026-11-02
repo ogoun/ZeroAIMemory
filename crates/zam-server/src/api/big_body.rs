@@ -1,12 +1,24 @@
 //! Ограничитель больших тел запросов (M5.5, ревью задачи 2). Отчёт MCP приходит одним JSON до
 //! [`super::entries_json_max`] (≈ 32 МБ при умолчаниях); такие тела держатся в памяти целиком, а
 //! `/mcp` (rmcp) ещё и строит из них `Map<String, Value>`. Тела не больше
-//! [`super::note_body_max`] идут как раньше; «большое» тело — заявленное `Content-Length` или
-//! фактически прочитанное больше этого порога — занимает одно из [`BIG_BODY_PERMITS`] разрешений
-//! общего семафора `POST /spaces/{space}/entries` и `/mcp` на время обработки запроса. Разрешение
-//! не получено за [`BIG_BODY_WAIT`] — 503 `/problems/busy` с `Retry-After`. Так в памяти не
-//! больше двух больших тел одновременно, сколько бы токенов их ни слали.
+//! [`super::note_body_max`] идут как раньше; «большое» тело — прочитанное больше этого порога —
+//! занимает одно из [`BIG_BODY_PERMITS`] разрешений общего семафора `POST /spaces/{space}/entries`
+//! и `/mcp` на время обработки запроса. Разрешение не получено за [`BIG_BODY_WAIT`] — 503
+//! `/problems/busy` с `Retry-After`. Так в памяти не больше двух больших тел одновременно.
+//!
+//! - **Порог читается без разрешения:** первые байты до порога (в памяти не больше обычного
+//!   тела) позволяют отказать 413 раньше ожидания разрешения (`early_reject`, например не-отчёт
+//!   с `kind` в начале тела).
+//! - **Срок чтения:** с разрешением тело дочитывается не дольше [`BIG_BODY_READ_TIMEOUT`] (для
+//!   тестов — [`BigBodies::set_read_timeout`]); дольше — 408 `/problems/timeout`, разрешение
+//!   освобождается: медленный клиент не держит его бесконечно.
+//! - **Внутренние вызовы:** инструменты MCP зовут REST через внутренний роутер (`oneshot`) с
+//!   расширением [`InnerCall`]: разрешение уже держит внешний запрос `/mcp`, второе не берётся
+//!   (иначе два больших MCP-отчёта заняли бы оба разрешения и их внутренние POST получили бы
+//!   503). Расширения запроса из сети не приходят — hyper создаёт их пустыми, метку ставит только
+//!   [`crate::mcp`].
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -24,14 +36,21 @@ use crate::error::ApiError;
 pub const BIG_BODY_PERMITS: usize = 2;
 /// Ожидание разрешения, прежде чем ответить 503.
 pub const BIG_BODY_WAIT: Duration = Duration::from_millis(500);
+/// Срок дочитывания большого тела с разрешением.
+pub const BIG_BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// `Retry-After` ответа 503, секунд.
 const RETRY_AFTER_S: u64 = 2;
 
-/// Семафор больших тел и порог «большого» тела, байт.
+/// Метка внутреннего запроса MCP → REST: разрешение держит внешний `/mcp`.
+#[derive(Debug, Clone, Copy)]
+pub struct InnerCall;
+
+/// Семафор больших тел, порог «большого» тела (байт) и срок чтения.
 #[derive(Clone)]
 pub struct BigBodies {
     sem: Arc<Semaphore>,
     threshold: usize,
+    read_timeout_ms: Arc<AtomicU64>,
 }
 
 impl BigBodies {
@@ -39,12 +58,24 @@ impl BigBodies {
         BigBodies {
             sem: Arc::new(Semaphore::new(permits)),
             threshold,
+            read_timeout_ms: Arc::new(AtomicU64::new(BIG_BODY_READ_TIMEOUT.as_millis() as u64)),
         }
     }
 
     /// Порог «большого» тела, байт.
     pub fn threshold(&self) -> usize {
         self.threshold
+    }
+
+    /// Срок дочитывания большого тела (действует на все копии; по умолчанию
+    /// [`BIG_BODY_READ_TIMEOUT`]).
+    pub fn set_read_timeout(&self, d: Duration) {
+        self.read_timeout_ms
+            .store(d.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn read_timeout(&self) -> Duration {
+        Duration::from_millis(self.read_timeout_ms.load(Ordering::Relaxed))
     }
 
     /// Разрешение на большое тело: ждёт не дольше [`BIG_BODY_WAIT`], иначе 503 `busy`.
@@ -57,34 +88,56 @@ impl BigBodies {
         }
     }
 
-    /// Тело до `limit` байт (больше — 413). `declared` — `Content-Length`: больше `limit` — 413
-    /// без чтения, больше порога — разрешение до чтения; без заголовка разрешение берётся, как
-    /// только прочитано больше порога. Разрешение держит вызывающий до конца обработки.
+    /// Тело до `limit` байт (больше — 413; заявленное `declared` больше — 413 без чтения). Тело
+    /// больше порога: прочитанный префикс до порога проверяет `early_reject` (`true` — 413 без
+    /// ожидания разрешения), затем берётся разрешение (кроме `inner`) и тело дочитывается не
+    /// дольше срока (408). Разрешение держит вызывающий до конца обработки.
     pub async fn read(
         &self,
         body: Body,
         limit: usize,
         declared: Option<u64>,
+        inner: bool,
+        early_reject: impl Fn(&[u8]) -> bool,
     ) -> Result<(Bytes, Option<OwnedSemaphorePermit>), ApiError> {
         let too_large = || ApiError::PayloadTooLarge("тело запроса превышает предел".into());
         if declared.is_some_and(|n| n > limit as u64) {
             return Err(too_large());
         }
-        let mut permit = None;
-        if declared.is_some_and(|n| n > self.threshold as u64) {
-            permit = Some(self.admit().await?);
-        }
         let mut s = body.into_data_stream();
         let mut buf = Vec::new();
-        while let Some(chunk) = s.next().await {
+        let mut permit = None;
+        let mut deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let next = match deadline {
+                Some(d) => match tokio::time::timeout_at(d, s.next()).await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Err(ApiError::RequestTimeout(format!(
+                            "большое тело запроса не получено за {} с",
+                            self.read_timeout().as_secs_f32()
+                        )));
+                    }
+                },
+                None => s.next().await,
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk =
                 chunk.map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
             if buf.len() + chunk.len() > limit {
                 return Err(too_large());
             }
             buf.extend_from_slice(&chunk);
-            if permit.is_none() && buf.len() > self.threshold {
-                permit = Some(self.admit().await?);
+            if deadline.is_none() && buf.len() > self.threshold {
+                if early_reject(&buf[..self.threshold]) {
+                    return Err(too_large());
+                }
+                if !inner {
+                    permit = Some(self.admit().await?);
+                }
+                deadline = Some(tokio::time::Instant::now() + self.read_timeout());
             }
         }
         Ok((Bytes::from(buf), permit))
@@ -98,13 +151,22 @@ pub fn content_length(h: &axum::http::HeaderMap) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// Внутренний ли это вызов MCP → REST ([`InnerCall`]).
+pub fn is_inner(ext: &axum::http::Extensions) -> bool {
+    ext.get::<InnerCall>().is_some()
+}
+
 /// Слой `/mcp`: тело читается здесь с пределом [`super::entries_json_max`] (он же предел rmcp)
 /// и с разрешением для большого тела; дальше запрос идёт с прочитанным телом.
 pub async fn limit_mcp(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
     let limit = super::entries_json_max(&st.cfg);
     let declared = content_length(&parts.headers);
-    let (bytes, permit) = match st.big_bodies.read(body, limit, declared).await {
+    let read = st
+        .big_bodies
+        .read(body, limit, declared, false, |_| false)
+        .await;
+    let (bytes, permit) = match read {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
@@ -115,9 +177,117 @@ pub async fn limit_mcp(State(st): State<AppState>, req: Request, next: Next) -> 
     resp
 }
 
+/// Вид записи по началу JSON-тела: `Some(true)` — верхнеуровневый `"kind": "report"`,
+/// `Some(false)` — `kind` другой (или не строка, или объект кончился без него), `None` —
+/// не понять по префиксу (обрыв, экранирование в значении `kind`, не объект).
+pub fn kind_prefix(b: &[u8]) -> Option<bool> {
+    let mut i = ws(b, 0);
+    if b.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    loop {
+        i = ws(b, i);
+        match b.get(i)? {
+            b'}' => return Some(false),
+            b'"' => {}
+            _ => return None,
+        }
+        let (key, after) = string(b, i)?;
+        i = ws(b, after);
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i = ws(b, i + 1);
+        if key == b"kind" {
+            return match b.get(i)? {
+                b'"' => {
+                    let (v, _) = string(b, i)?;
+                    if v.contains(&b'\\') {
+                        None
+                    } else {
+                        Some(v == b"report")
+                    }
+                }
+                _ => Some(false),
+            };
+        }
+        i = ws(b, skip_value(b, i)?);
+        match b.get(i)? {
+            b',' => i += 1,
+            b'}' => return Some(false),
+            _ => return None,
+        }
+    }
+}
+
+fn ws(b: &[u8], mut i: usize) -> usize {
+    while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        i += 1;
+    }
+    i
+}
+
+/// Строка JSON с `b[i] == '"'`: содержимое (с экранированием как есть) и позиция после `"`.
+fn string(b: &[u8], i: usize) -> Option<(&[u8], usize)> {
+    let start = i + 1;
+    let mut k = start;
+    while k < b.len() {
+        match b[k] {
+            b'\\' => k += 2,
+            b'"' => return Some((&b[start..k], k + 1)),
+            _ => k += 1,
+        }
+    }
+    None
+}
+
+/// Позиция после значения JSON с `b[i]` (строки, вложенные объекты и массивы, литералы).
+fn skip_value(b: &[u8], i: usize) -> Option<usize> {
+    match b.get(i)? {
+        b'"' => string(b, i).map(|(_, e)| e),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut k = i;
+            while k < b.len() {
+                match b[k] {
+                    b'"' => {
+                        k = string(b, k)?.1;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(k + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            None
+        }
+        _ => {
+            let mut k = i;
+            while k < b.len() && !matches!(b[k], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                k += 1;
+            }
+            (k < b.len()).then_some(k)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn read(b: &BigBodies, body: Body, declared: Option<u64>) -> Result<bool, ApiError> {
+        b.read(body, 100, declared, false, |_| false)
+            .await
+            .map(|(_, p)| p.is_some())
+    }
 
     #[tokio::test]
     async fn permits_busy_and_threshold() {
@@ -127,27 +297,69 @@ mod tests {
         let e = b.admit().await.unwrap_err();
         assert!(matches!(e, ApiError::Busy { .. }), "{e:?}");
         // малое тело — без разрешения, даже когда все заняты
-        let (bytes, p) = b.read(Body::from("0123456789"), 100, None).await.unwrap();
-        assert_eq!((bytes.len(), p.is_some()), (10, false));
-        // большое без Content-Length — 503, пока разрешений нет
-        let e = b
-            .read(Body::from("x".repeat(11)), 100, None)
+        assert!(!read(&b, Body::from("0123456789"), None).await.unwrap());
+        // большое — 503, пока разрешений нет (заявленная длина без чтения не решает)
+        let e = read(&b, Body::from("x".repeat(11)), None)
             .await
             .unwrap_err();
         assert!(matches!(e, ApiError::Busy { .. }), "{e:?}");
-        let e = b.read(Body::from("x"), 100, Some(50)).await.unwrap_err();
+        let e = read(&b, Body::from("x".repeat(11)), Some(11))
+            .await
+            .unwrap_err();
         assert!(matches!(e, ApiError::Busy { .. }), "{e:?}");
+        // внутренний вызов MCP → REST разрешения не берёт
+        let (bytes, p) = b
+            .read(Body::from("x".repeat(50)), 100, None, true, |_| false)
+            .await
+            .unwrap();
+        assert_eq!((bytes.len(), p.is_some()), (50, false));
+        // ранний отказ по префиксу — 413, а не 503
+        let e = b
+            .read(Body::from("x".repeat(50)), 100, Some(50), false, |_| true)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ApiError::PayloadTooLarge(_)), "{e:?}");
         drop(p1);
-        let (_, p) = b.read(Body::from("x".repeat(11)), 100, None).await.unwrap();
-        assert!(p.is_some());
+        assert!(read(&b, Body::from("x".repeat(11)), None).await.unwrap());
         // предел: заявленный и фактический
-        let e = b.read(Body::from("x"), 100, Some(101)).await.unwrap_err();
+        let e = read(&b, Body::from("x"), Some(101)).await.unwrap_err();
         assert!(matches!(e, ApiError::PayloadTooLarge(_)), "{e:?}");
-        drop(p);
-        let e = b
-            .read(Body::from("x".repeat(101)), 100, None)
+        let e = read(&b, Body::from("x".repeat(101)), None)
             .await
             .unwrap_err();
         assert!(matches!(e, ApiError::PayloadTooLarge(_)), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn slow_body_times_out_and_frees_permit() {
+        let b = BigBodies::new(1, 10);
+        b.set_read_timeout(Duration::from_millis(100));
+        let first: Result<Bytes, std::io::Error> = Ok(Bytes::from("x".repeat(20)));
+        let slow = futures_util::stream::iter([first]).chain(futures_util::stream::pending());
+        let e = b
+            .read(Body::from_stream(slow), 100, None, false, |_| false)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ApiError::RequestTimeout(_)), "{e:?}");
+        // разрешение свободно
+        let _p = b.admit().await.unwrap();
+    }
+
+    #[test]
+    fn kind_by_prefix() {
+        assert_eq!(kind_prefix(br#"{"kind": "report", "x": "#), Some(true));
+        assert_eq!(
+            kind_prefix(
+                br#" { "title": "a\"b", "data": {"k": [1, {"z": "}"}]}, "kind":"changelog""#
+            ),
+            Some(false)
+        );
+        assert_eq!(kind_prefix(br#"{"kind": 5"#), Some(false));
+        assert_eq!(kind_prefix(br#"{"title": "t"}"#), Some(false));
+        assert_eq!(kind_prefix(br#"{"images": [{"data": "AAAA"#), None);
+        // экранирование в значении kind — по префиксу не решаем
+        assert_eq!(kind_prefix(b"{\"kind\": \"rep\\u006frt\"}"), None);
+        assert_eq!(kind_prefix(b"[1, 2]"), None);
+        assert_eq!(kind_prefix(br#"{"n": 12"#), None);
     }
 }

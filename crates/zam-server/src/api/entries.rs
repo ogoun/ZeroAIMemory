@@ -319,9 +319,13 @@ pub async fn create(
     let json_max = super::entries_json_max(&st.cfg);
     let declared = super::big_body::content_length(&headers);
     // тело больше `note_body_max` держит разрешение большого тела до конца обработки
+    let inner = super::big_body::is_inner(req.extensions());
+    // не-отчёт с `kind` в начале тела — 413 до ожидания разрешения
     let (bytes, _big) = st
         .big_bodies
-        .read(req.into_body(), json_max, declared)
+        .read(req.into_body(), json_max, declared, inner, |prefix| {
+            super::big_body::kind_prefix(prefix) == Some(false)
+        })
         .await?;
     // вид — без построения `Value`: отчёт разбирается из байт сразу в типы
     if super::reports::json_is_report(&bytes) {

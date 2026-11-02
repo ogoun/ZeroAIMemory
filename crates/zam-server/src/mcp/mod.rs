@@ -361,6 +361,8 @@ impl Rest {
             None => Body::empty(),
         };
         let mut req = b.body(body).map_err(|e| format!("запрос REST: {e}"))?;
+        // разрешение большого тела держит внешний запрос `/mcp` (api::big_body)
+        req.extensions_mut().insert(crate::api::big_body::InnerCall);
         if let Some(c) = self.connect {
             req.extensions_mut().insert(c);
         }
