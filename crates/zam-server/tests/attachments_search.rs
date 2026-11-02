@@ -213,8 +213,15 @@ async fn search_finds_docx_pdf_xlsx_pptx_with_locator() {
         let it = &items(&j)[0];
         assert_eq!(it["kind"], "attachment", "{file}: {j}");
         assert!(sources(it).contains(&"fts"), "{file}: {it}");
-        let same = atts(&j).iter().filter(|i| i["file"] == *file).count();
-        assert_eq!(same, 1, "{file}: {j}");
+        // FTS-совпадение у файла одно; вторая его карточка (только вектором) допустима в пределах
+        // квоты: порядок близких косинусов малого корпуса разный на Linux и Windows (CI abd604c)
+        let same: Vec<_> = atts(&j)
+            .into_iter()
+            .filter(|i| i["file"] == *file)
+            .collect();
+        let same_fts = same.iter().filter(|i| sources(i).contains(&"fts")).count();
+        assert_eq!(same_fts, 1, "{file}: {j}");
+        assert!(same.len() <= 2, "max_per_attachment: {file}: {j}");
         for x in items(&j).iter().skip(1) {
             assert!(!sources(x).contains(&"fts"), "без слова — не FTS: {x}");
         }
