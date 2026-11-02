@@ -629,6 +629,29 @@ pub(crate) fn refresh_node_docs(
     Ok(())
 }
 
+/// Смена `index: false` у заметки `node` (не Human): живым извлечённым документам узла —
+/// `upsert` точек. Воркер векторного индекса строит их по [`attachment_chunks_for_index`]: у
+/// заметки `index: false` список пуст — точки убираются, иначе возвращаются из чанков без
+/// повторного извлечения. `pending` не трогаются (точки поставит их извлечение), `failed` и
+/// `unsupported` точек не имеют.
+pub(crate) fn requeue_note_doc_points(
+    c: &Connection,
+    node: Id,
+    now: &str,
+) -> Result<(), StoreError> {
+    let ids: Vec<Id> = c
+        .prepare_cached(
+            "SELECT id FROM attachment_docs
+             WHERE node_id = ?1 AND deleted_at IS NULL AND extract_state = 'done'",
+        )?
+        .query_map([node], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for id in ids {
+        enqueue_doc(c, id, JobOp::Upsert, now)?;
+    }
+    Ok(())
+}
+
 /// Смена GUID решения: живым документам пространства — `upsert`: извлечённым — новый
 /// `solution_guid` в payload точек, `pending` — извлечение (его задание могло быть закрыто
 /// воркером до задачи 5 M5 или заменено `delete`).

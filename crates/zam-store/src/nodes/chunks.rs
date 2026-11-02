@@ -931,6 +931,13 @@ pub(crate) fn enqueue_for_note(
     if let Some(op) = op {
         enqueue(c, node_id, rev, op, priority, now)?;
     }
+    // `index: false` ↔ индексируется: точки вложений заметки следуют за ней (ТЗ §6.4: узлы с
+    // `index: false` в Qdrant не попадают; FTS — как у самой заметки, остаётся)
+    if kind != SpaceKind::Human
+        && prev_state.is_some_and(|p| (p == "excluded") != (state == "excluded"))
+    {
+        crate::attachments::requeue_note_doc_points(c, node_id, now)?;
+    }
     Ok(op)
 }
 

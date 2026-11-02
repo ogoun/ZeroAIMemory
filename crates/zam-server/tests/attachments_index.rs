@@ -621,6 +621,74 @@ async fn node_upsert_keeps_attachment_points() {
     a.st.shutdown().await;
 }
 
+/// Финальное ревью M5, I-1: `index: false` у заметки убирает из Qdrant и точки её вложений
+/// (ТЗ §6.4), FTS вложения остаётся (как у самой заметки); снова индексируемая — точки
+/// возвращаются из чанков без повторного извлечения.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn index_false_note_drops_attachment_points() {
+    if !have(MINILM) {
+        return;
+    }
+    let q = TestQdrant::start("att-index-false");
+    let a = api("att-index-false", with_vector(&q)).await;
+    vector_ready(&a).await;
+    let user = a.st.admin_id;
+    let node = note_as(&a, &a.token, "knowledge", "nofx/n", "# Заметка
+
+Текст.
+").await;
+    upload(
+        &a,
+        &a.token,
+        &node,
+        "data.csv",
+        &csv(&["К;ортогональный базис"]),
+    )
+    .await;
+    let d = wait_doc(&a, user, &node, "data.csv", ExtractState::Done).await;
+    let n = chunks(&a, user, d.id).await.len() as u64;
+    assert!(n > 0);
+    until("точки вложения", LIMIT, async || {
+        att_points(&a, user, None).await == n && active_jobs(&a, user).await == 0
+    })
+    .await;
+    let parsed = a.st.docs.extracted();
+    let put = async |rev: &str, content: &str| {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::PUT,
+                &format!("/api/v1/nodes/{node}"),
+                Some(json!({ "content": content })),
+                &[("if-match", rev)],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    };
+    put("1", "---
+index: false
+---
+# Заметка
+
+Текст.
+").await;
+    until("точки вложения убраны", LIMIT, async || {
+        att_points(&a, user, None).await == 0 && active_jobs(&a, user).await == 0
+    })
+    .await;
+    assert_eq!(fts(&a, user, d.id, "ортогональный").await, 1, "FTS остаётся");
+    put("2", "# Заметка
+
+Текст.
+").await;
+    until("точки вложения вернулись", LIMIT, async || {
+        att_points(&a, user, None).await == n && active_jobs(&a, user).await == 0
+    })
+    .await;
+    assert_eq!(a.st.docs.extracted(), parsed, "без повторного извлечения");
+    a.st.shutdown().await;
+}
+
 /// Отпечаток нарезки вложений (`meta.chunker_attachments`, включает `EXTRACTOR_VERSION`): при
 /// расхождении документы перенарезаются при открытии базы. Другие настройки нарезки — из кэша
 /// извлечения без разбора; другая версия извлечения — кэш не подходит, файл разбирается заново.
