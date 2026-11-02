@@ -50,11 +50,11 @@ use tokio::task::JoinSet;
 use zam_core::Id;
 use zam_docs::{DocError, DocKind, Limits};
 use zam_store::{
-    BLOB_MISSING, BlobStore, CachedExtract, Db, ExtractEnd, ExtractState, Job, JobOutcome,
-    PDFIUM_UNAVAILABLE, StoreError, SystemStore, TOO_LARGE, UserDbs, cached_extract,
+    BLOB_MISSING, BlobStore, CachedExtract, Db, DocLimitsKey, ExtractEnd, ExtractState, Job,
+    JobOutcome, PDFIUM_UNAVAILABLE, StoreError, SystemStore, TOO_LARGE, UserDbs, cached_extract,
     claim_extract_jobs, complete_job, defer_job, ensure_extract_jobs, extract_target, fail_job,
     finish_extract, has_failed_with, put_extract, put_extract_failure, requeue_failed_with,
-    requeue_running_extract,
+    requeue_running_extract, sync_doc_limits,
 };
 
 use super::pool::{DocPool, ParseFailure};
@@ -96,6 +96,8 @@ pub struct DocsStatus {
 struct Inner {
     pool: DocPool,
     limits: Limits,
+    /// Отпечаток `limits` ([`super::limits_fingerprint`]): ключ годности кэша извлечения.
+    limits_fp: String,
     workers: usize,
     system: SystemStore,
     users: UserDbs,
@@ -143,6 +145,7 @@ impl DocIndexer {
         let (stop, rx) = watch::channel(false);
         let inner = Arc::new(Inner {
             pool,
+            limits_fp: super::limits_fingerprint(&cfg.limits()),
             limits: cfg.limits(),
             workers: cfg.workers.max(1),
             system,
@@ -328,6 +331,17 @@ async fn run(inner: Arc<Inner>, mut stop: watch::Receiver<bool>) {
 /// Первое открытие базы после запуска: задания после аварии, `pending` без задания, документы,
 /// не извлечённые без pdfium (если pdfium теперь загружается).
 async fn startup(inner: &Inner, user: Id, db: &Db) {
+    let key = DocLimitsKey {
+        fingerprint: inner.limits_fp.clone(),
+        max_bytes: inner.limits.max_bytes,
+    };
+    match sync_doc_limits(db, key).await {
+        Ok(n) if n > 0 => {
+            tracing::info!(user = %user, docs = n, "лимиты разбора изменились: документы извлекаются заново")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(user = %user, error = %e, "лимиты разбора базы"),
+    }
     match requeue_running_extract(db).await {
         Ok(n) if n > 0 => {
             tracing::info!(user = %user, jobs = n, "задания извлечения после остановки снова в очереди")
@@ -475,18 +489,6 @@ async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
     if !t.live || t.state != ExtractState::Pending {
         return Step::Skip;
     }
-    match cached_extract(db, &t.blob_sha256).await {
-        Ok(Some(c)) => {
-            inner.cache_hits.fetch_add(1, Ordering::SeqCst);
-            return Step::End(match c {
-                CachedExtract::Extracted(x) => ExtractEnd::Units(x.units),
-                CachedExtract::Failed(reason) => ExtractEnd::Failed(reason),
-                CachedExtract::Unsupported => ExtractEnd::Unsupported,
-            });
-        }
-        Ok(None) => {}
-        Err(e) => return e.into(),
-    }
     let path = BlobStore::new(&inner.blobs_dir, user).path_of(&t.blob_sha256);
     let (kind, size) = match sniff(path.clone(), t.filename.clone(), inner.limits.clone()).await {
         Ok(v) => v,
@@ -501,6 +503,19 @@ async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
     };
     if size > inner.limits.max_bytes {
         return Step::End(ExtractEnd::Failed(TOO_LARGE.into()));
+    }
+    // кэш — того же вида (CSV и текст различает имя файла) и годный при текущих лимитах
+    match cached_extract(db, &t.blob_sha256, kind, &inner.limits_fp).await {
+        Ok(Some(c)) => {
+            inner.cache_hits.fetch_add(1, Ordering::SeqCst);
+            return Step::End(match c {
+                CachedExtract::Extracted(x) => ExtractEnd::Units(x.units),
+                CachedExtract::Failed(reason) => ExtractEnd::Failed(reason),
+                CachedExtract::Unsupported => ExtractEnd::Unsupported,
+            });
+        }
+        Ok(None) => {}
+        Err(e) => return e.into(),
     }
     let bytes = match read(&path).await {
         Ok(b) => b,
@@ -520,7 +535,9 @@ async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
                     ExtractEnd::Failed(r) => Some(r.as_str()),
                     _ => None,
                 };
-                if let Err(e) = put_extract_failure(db, &t.blob_sha256, reason).await {
+                if let Err(e) =
+                    put_extract_failure(db, &t.blob_sha256, kind, reason, &inner.limits_fp).await
+                {
                     tracing::warn!(error = %e, "неудача разбора не записана в кэш");
                 }
             }
@@ -536,7 +553,8 @@ async fn extract_doc(inner: &Inner, user: Id, db: &Db, att: Id) -> Step {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "вложение разобрано"
     );
-    if let Err(e) = put_extract(db, &t.blob_sha256, &x).await {
+    // частичный по сроку результат не кэшируется (store: `put_extract`): reindex извлечёт заново
+    if let Err(e) = put_extract(db, &t.blob_sha256, &x, &inner.limits_fp).await {
         return e.into();
     }
     Step::End(ExtractEnd::Units(x.units))

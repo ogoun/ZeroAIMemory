@@ -130,7 +130,7 @@ impl Previews {
             None => DocPool::new(&pc),
         };
         let limits = cfg.limits();
-        let tag = blake3::hash(format!("{limits:?}").as_bytes()).to_hex()[..8].to_string();
+        let tag = super::limits_fingerprint(&limits);
         Previews {
             pool,
             cache: PreviewCache::new(dir, cfg.preview_cache_mb * 1024 * 1024),

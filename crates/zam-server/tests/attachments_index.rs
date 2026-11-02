@@ -458,6 +458,108 @@ async fn extract_cache_shared_by_sha() {
     a.st.shutdown().await;
 }
 
+/// Финальное ревью M5, M-2: кэш извлечения годится только тому же виду разбора — один файл как
+/// `a.csv` (таблица) и `a.txt` (текст) разбирается дважды, у документов свои единицы.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extract_cache_respects_kind() {
+    let a = api("att-cache-kind", |_| {}).await;
+    let user = a.st.admin_id;
+    let data = csv(&["К;тахион мезон"]);
+    let node = note_as(&a, &a.token, "knowledge", "kind/n", "# N\n").await;
+    upload(&a, &a.token, &node, "a.csv", &data).await;
+    let dc = wait_doc(&a, user, &node, "a.csv", ExtractState::Done).await;
+    upload(&a, &a.token, &node, "a.txt", &data).await;
+    let dt = wait_doc(&a, user, &node, "a.txt", ExtractState::Done).await;
+    assert_eq!(dc.blob_sha256, dt.blob_sha256);
+    assert_eq!(a.st.docs.extracted(), 2, "другой вид — не из кэша");
+    let loc = |c: &[(String, Option<String>, String, String, String)]| {
+        c.iter()
+            .map(|r| r.1.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    let (lc, lt) = (
+        loc(&chunks(&a, user, dc.id).await),
+        loc(&chunks(&a, user, dt.id).await),
+    );
+    assert!(lc.iter().all(|l| l.starts_with("sheet:")), "{lc:?}");
+    assert!(lt.iter().all(|l| !l.starts_with("sheet:")), "{lt:?}");
+    a.st.shutdown().await;
+}
+
+/// Финальное ревью M5 (ТЗ §5.2/§8.2): CSV в Windows-1251 и UTF-16 (LE и BE с BOM) — вид CSV при
+/// загрузке, конвейер извлекает текст в UTF-8, FTS его находит.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn csv_cp1251_and_utf16_extracted() {
+    let a = api("att-csv-enc", |_| {}).await;
+    let user = a.st.admin_id;
+    let node = note_as(&a, &a.token, "knowledge", "enc/n", "# N\n").await;
+    let src = "Имя;Город\r\nИван;Кострома\r\n";
+    // Windows-1251: ASCII как есть, А–я — 0xC0–0xFF подряд
+    let cp: Vec<u8> = src
+        .chars()
+        .map(|c| match c {
+            'А'..='я' => (c as u32 - 'А' as u32 + 0xC0) as u8,
+            c => u8::try_from(c).unwrap(),
+        })
+        .collect();
+    let mut le = vec![0xFF, 0xFE];
+    le.extend(src.encode_utf16().flat_map(u16::to_le_bytes));
+    let mut be = vec![0xFE, 0xFF];
+    be.extend(src.encode_utf16().flat_map(u16::to_be_bytes));
+    for (file, data) in [("cp.csv", cp), ("le.csv", le), ("be.tsv", be)] {
+        upload(&a, &a.token, &node, file, &data).await;
+        let d = wait_doc(&a, user, &node, file, ExtractState::Done).await;
+        assert_eq!(fts(&a, user, d.id, "Кострома").await, 1, "{file}");
+    }
+    a.st.shutdown().await;
+}
+
+/// Финальное ревью M5, I-2: частичный по сроку результат (`truncated: timeout_ms`) не кэшируется
+/// навсегда — reindex извлекает файл заново, при запасе времени — целиком.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_partial_extract_not_cached() {
+    let a = api("att-soft-timeout", |_| {}).await;
+    let user = a.st.admin_id;
+    let rows: Vec<String> = (0..5000).map(|i| format!("К{i};строка {i}")).collect();
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let node = note_as(&a, &a.token, "knowledge", "slow/n", "# N\n").await;
+    // мягкий срок 0: разбор останавливается на первой проверке срока
+    a.st.docs.pool().set_soft_ms(Some(0));
+    upload(&a, &a.token, &node, "big.csv", &csv(&rows)).await;
+    let d = wait_doc(&a, user, &node, "big.csv", ExtractState::Done).await;
+    let partial = chunks(&a, user, d.id).await.len();
+    assert_eq!(
+        scalar(&a, user, "SELECT count(*) FROM blob_extract").await,
+        0,
+        "частичный по сроку — не в кэше"
+    );
+    assert_eq!(fts(&a, user, d.id, "К4999").await, 0, "хвост не извлечён");
+    a.st.docs.pool().set_soft_ms(None);
+    zam_store::enqueue_reindex(&db(&a, user).await, None)
+        .await
+        .unwrap();
+    a.st.docs.notify();
+    wait_doc(&a, user, &node, "big.csv", ExtractState::Done).await;
+    until(
+        "извлечено заново целиком",
+        LIMIT,
+        async || fts(&a, user, d.id, "К4999").await == 1,
+    )
+    .await;
+    assert_eq!(a.st.docs.extracted(), 2);
+    assert!(chunks(&a, user, d.id).await.len() > partial);
+    assert_eq!(
+        scalar(
+            &a,
+            user,
+            "SELECT count(*) FROM blob_extract WHERE warnings NOT LIKE '%timeout_ms%'"
+        )
+        .await,
+        1
+    );
+    a.st.shutdown().await;
+}
+
 /// Human — только FTS: чанки вложения пишутся, точек нет и задание ради точек не ставится;
 /// вложение Knowledge рядом получает точки (векторный путь работает).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -633,10 +735,7 @@ async fn index_false_note_drops_attachment_points() {
     let a = api("att-index-false", with_vector(&q)).await;
     vector_ready(&a).await;
     let user = a.st.admin_id;
-    let node = note_as(&a, &a.token, "knowledge", "nofx/n", "# Заметка
-
-Текст.
-").await;
+    let node = note_as(&a, &a.token, "knowledge", "nofx/n", "# Заметка\n\nТекст.\n").await;
     upload(
         &a,
         &a.token,
@@ -665,25 +764,24 @@ async fn index_false_note_drops_attachment_points() {
             .await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     };
-    put("1", "---
-index: false
----
-# Заметка
-
-Текст.
-").await;
-    until("точки вложения убраны", LIMIT, async || {
-        att_points(&a, user, None).await == 0 && active_jobs(&a, user).await == 0
-    })
+    put("1", "---\nindex: false\n---\n# Заметка\n\nТекст.\n").await;
+    until(
+        "точки вложения убраны",
+        LIMIT,
+        async || att_points(&a, user, None).await == 0 && active_jobs(&a, user).await == 0,
+    )
     .await;
-    assert_eq!(fts(&a, user, d.id, "ортогональный").await, 1, "FTS остаётся");
-    put("2", "# Заметка
-
-Текст.
-").await;
-    until("точки вложения вернулись", LIMIT, async || {
-        att_points(&a, user, None).await == n && active_jobs(&a, user).await == 0
-    })
+    assert_eq!(
+        fts(&a, user, d.id, "ортогональный").await,
+        1,
+        "FTS остаётся"
+    );
+    put("2", "# Заметка\n\nТекст.\n").await;
+    until(
+        "точки вложения вернулись",
+        LIMIT,
+        async || att_points(&a, user, None).await == n && active_jobs(&a, user).await == 0,
+    )
     .await;
     assert_eq!(a.st.docs.extracted(), parsed, "без повторного извлечения");
     a.st.shutdown().await;

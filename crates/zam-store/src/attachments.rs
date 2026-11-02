@@ -840,8 +840,21 @@ pub async fn extract_cached(db: &Db, sha: &str) -> Result<Option<Extracted>, Sto
     Ok(parsed)
 }
 
-/// Кладёт извлечение блоба `sha` в кэш под текущей [`EXTRACTOR_VERSION`] (повтор заменяет).
-pub async fn put_extract(db: &Db, sha: &str, e: &Extracted) -> Result<(), StoreError> {
+/// Кладёт извлечение блоба `sha` в кэш под текущей [`EXTRACTOR_VERSION`] (повтор заменяет):
+/// вид разбора — `e.kind`, `limits_fp` — отпечаток лимитов разбора, при которых оно получено
+/// (строка с `truncated: <лимит>` при других лимитах не годится, [`cached_extract`]).
+/// Частичный по сроку результат (`truncated: timeout_ms`) — не свойство файла, а загрузки
+/// машины: он **не кэшируется** (`false`), следующий reindex извлекает файл заново
+/// ([`reindex_docs`]; финальное ревью M5, I-2).
+pub async fn put_extract(
+    db: &Db,
+    sha: &str,
+    e: &Extracted,
+    limits_fp: &str,
+) -> Result<bool, StoreError> {
+    if e.warnings.iter().any(|w| w == TRUNCATED_TIMEOUT) {
+        return Ok(false);
+    }
     let units: Vec<UnitJson> = e
         .units
         .iter()
@@ -857,11 +870,13 @@ pub async fn put_extract(db: &Db, sha: &str, e: &Extracted) -> Result<(), StoreE
     let warnings =
         serde_json::to_string(&e.warnings).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     let (sha, kind, ocr) = (sha.to_string(), e.kind.as_str(), e.ocr_needed);
+    let fp = limits_fp.to_string();
     db.write(move |t| {
         t.prepare_cached(
             "INSERT OR REPLACE INTO blob_extract (blob_sha256, extractor_version, kind, units,
-                                                  warnings, ocr_needed, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                                  warnings, ocr_needed, created_at, src_kind,
+                                                  limits_fp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?3, ?8)",
         )?
         .execute(params![
             sha,
@@ -870,11 +885,26 @@ pub async fn put_extract(db: &Db, sha: &str, e: &Extracted) -> Result<(), StoreE
             units,
             warnings,
             ocr,
-            fmt_ts(Timestamp::now())
+            fmt_ts(Timestamp::now()),
+            fp
         ])?;
-        Ok(())
+        Ok(true)
     })
     .await
+}
+
+/// Предупреждение частичного по сроку разбора (`zam_docs`: `truncated: timeout_ms`).
+const TRUNCATED_TIMEOUT: &str = "truncated: timeout_ms";
+
+/// Условие SQL «строка кэша `x` годна документу при отпечатке лимитов `?{fp}`» (NULL —
+/// отпечаток неизвестен: лимиты не сверяются): не частичная по сроку и, если обрезана лимитом,
+/// получена при тех же лимитах. Вид не сверяется (его сверяет [`cached_extract`] по
+/// `src_kind`): здесь — решение «извлечь ли документ заново» при reindex.
+fn fresh_row_sql(fp: usize) -> String {
+    format!(
+        "x.warnings NOT LIKE '%{TRUNCATED_TIMEOUT}%'
+         AND (?{fp} IS NULL OR x.warnings NOT LIKE '%\"truncated:%' OR x.limits_fp = ?{fp})"
+    )
 }
 
 /// Состояние извлечения документа `att` и причина (`err` — без текста документа, длиннее
@@ -1225,7 +1255,9 @@ pub enum CachedExtract {
 pub async fn put_extract_failure(
     db: &Db,
     sha: &str,
+    src_kind: DocKind,
     reason: Option<&str>,
+    limits_fp: &str,
 ) -> Result<(), StoreError> {
     let (kind, warnings) = match reason {
         Some(r) => (KIND_FAILED, vec![r.to_string()]),
@@ -1234,12 +1266,13 @@ pub async fn put_extract_failure(
     let warnings =
         serde_json::to_string(&warnings).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     let units = zstd::bulk::compress(b"[]", ZSTD_LEVEL)?;
-    let sha = sha.to_string();
+    let (sha, src, fp) = (sha.to_string(), src_kind.as_str(), limits_fp.to_string());
     db.write(move |t| {
         t.prepare_cached(
             "INSERT OR REPLACE INTO blob_extract (blob_sha256, extractor_version, kind, units,
-                                                  warnings, ocr_needed, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                                                  warnings, ocr_needed, created_at, src_kind,
+                                                  limits_fp)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
         )?
         .execute(params![
             sha,
@@ -1247,32 +1280,50 @@ pub async fn put_extract_failure(
             kind,
             units,
             warnings,
-            fmt_ts(Timestamp::now())
+            fmt_ts(Timestamp::now()),
+            src,
+            fp
         ])?;
         Ok(())
     })
     .await
 }
 
-/// Кэш извлечения блоба `sha` текущей версии: единицы или закэшированная неудача.
-pub async fn cached_extract(db: &Db, sha: &str) -> Result<Option<CachedExtract>, StoreError> {
+/// Кэш извлечения блоба `sha` текущей версии для разбора видом `kind` при отпечатке лимитов
+/// `limits_fp`: единицы или закэшированная неудача. Строка не годится (`None` — разобрать
+/// заново), если её получили другим видом (`src_kind`: один файл как `a.csv` и `a.txt`), она
+/// частичная по сроку (прежние версии кэшировали и такие) или обрезана лимитом
+/// (`truncated: <лимит>`) при других лимитах `[docs]` (финальное ревью M5, M-1, M-2).
+pub async fn cached_extract(
+    db: &Db,
+    sha: &str,
+    kind: DocKind,
+    limits_fp: &str,
+) -> Result<Option<CachedExtract>, StoreError> {
     let sha2 = sha.to_string();
-    let row: Option<(String, String)> = db
+    let row: Option<(String, String, Option<String>, String)> = db
         .read(move |c| {
             Ok(c.prepare_cached(
-                "SELECT kind, warnings FROM blob_extract
+                "SELECT kind, warnings, src_kind, limits_fp FROM blob_extract
                  WHERE blob_sha256 = ?1 AND extractor_version = ?2",
             )?
             .query_row(params![sha2, EXTRACTOR_VERSION], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?)
         })
         .await?;
+    let row = row.filter(|(_, w, src, fp)| {
+        let warnings: Vec<String> = serde_json::from_str(w).unwrap_or_default();
+        let truncated = warnings.iter().any(|w| w.starts_with("truncated:"));
+        src.as_deref() == Some(kind.as_str())
+            && !warnings.iter().any(|w| w == TRUNCATED_TIMEOUT)
+            && (!truncated || fp == limits_fp)
+    });
     match row {
         None => Ok(None),
-        Some((k, _)) if k == KIND_UNSUPPORTED => Ok(Some(CachedExtract::Unsupported)),
-        Some((k, w)) if k == KIND_FAILED => {
+        Some((k, ..)) if k == KIND_UNSUPPORTED => Ok(Some(CachedExtract::Unsupported)),
+        Some((k, w, ..)) if k == KIND_FAILED => {
             let reason = serde_json::from_str::<Vec<String>>(&w)
                 .ok()
                 .and_then(|v| v.into_iter().next())
@@ -1535,6 +1586,10 @@ pub async fn reindex_docs(db: &Db, space: Option<Id>) -> Result<u64, StoreError>
                                WHERE deleted_at IS NULL AND (?1 IS NULL OR space_id = ?1))",
         )?
         .execute(params![space, TOO_LARGE])?;
+        // частичные по сроку и обрезанные при других лимитах извлечения, `too_large` по силам
+        // текущему `docs.max_bytes` — заново (финальное ревью M5, I-2, M-1)
+        let limits = stored_doc_limits(tx)?;
+        repend_stale_docs(tx, space, limits.as_ref())?;
         let ids: Vec<(Id, bool)> = tx
             .prepare_cached(
                 "SELECT d.id, d.extract_state = 'pending' FROM attachment_docs d
@@ -1556,6 +1611,103 @@ pub async fn reindex_docs(db: &Db, space: Option<Id>) -> Result<u64, StoreError>
             n += 1;
         }
         Ok(n)
+    })
+    .await
+}
+
+/// Ключ `meta`: лимиты разбора, с которыми работает конвейер документов этой базы
+/// (`<отпечаток>;<max_bytes>`, [`sync_doc_limits`]).
+pub const DOCS_LIMITS_KEY: &str = "docs_limits";
+
+/// Лимиты разбора конвейера документов: отпечаток лимитов `[docs]` и `max_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocLimitsKey {
+    pub fingerprint: String,
+    pub max_bytes: u64,
+}
+
+fn stored_doc_limits(c: &Connection) -> Result<Option<DocLimitsKey>, StoreError> {
+    let v: Option<String> = c
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [DOCS_LIMITS_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v.and_then(|v| {
+        let (fp, max) = v.rsplit_once(';')?;
+        Some(DocLimitsKey {
+            fingerprint: fp.to_string(),
+            max_bytes: max.parse().ok()?,
+        })
+    }))
+}
+
+/// Живые документы области `space`, которым нужно извлечение заново, — `pending` (без задания:
+/// его ставит вызывающий). `done` без годной строки кэша текущей версии: частичный по сроку
+/// результат не кэшируется ([`put_extract`]), строка, обрезанная лимитом, получена при других
+/// лимитах (`limits`; неизвестны — не сверяются). `failed: too_large`, если файл не больше
+/// `limits.max_bytes` (лимит подняли). Чанки и точки остаются до нового извлечения.
+fn repend_stale_docs(
+    tx: &Connection,
+    space: Option<Id>,
+    limits: Option<&DocLimitsKey>,
+) -> Result<Vec<Id>, StoreError> {
+    let (fp, max) = match limits {
+        Some(l) => (
+            Some(l.fingerprint.as_str()),
+            Some(i64::try_from(l.max_bytes).unwrap_or(i64::MAX)),
+        ),
+        None => (None, None),
+    };
+    let sql = format!(
+        "UPDATE attachment_docs AS d SET extract_state = 'pending', extract_error = NULL
+         WHERE d.deleted_at IS NULL
+           AND d.node_id IN (SELECT id FROM nodes
+                             WHERE deleted_at IS NULL AND (?1 IS NULL OR space_id = ?1))
+           AND ((d.extract_state = 'done'
+                 AND NOT EXISTS (SELECT 1 FROM blob_extract x
+                                 WHERE x.blob_sha256 = d.blob_sha256
+                                   AND x.extractor_version = ?2 AND {}))
+                OR (d.extract_state = 'failed' AND d.extract_error = ?4 AND ?5 IS NOT NULL
+                    AND (SELECT a.size FROM attachments a
+                         WHERE a.node_id = d.node_id AND a.blob_sha256 = d.blob_sha256
+                           AND a.filename = d.filename) <= ?5))
+         RETURNING id",
+        fresh_row_sql(3)
+    );
+    let ids = tx
+        .prepare_cached(&sql)?
+        .query_map(params![space, EXTRACTOR_VERSION, fp, TOO_LARGE, max], |r| {
+            r.get(0)
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(ids)
+}
+
+/// Запуск конвейера документов (первое открытие базы): лимиты разбора `limits` расходятся с
+/// записанными в `meta.docs_limits` — документы, извлечённые с обрезкой при прежних лимитах, и
+/// `too_large`, которым хватает нового `max_bytes`, снова `pending` с заданием; новые лимиты
+/// записываются (по ним и reindex решает, что извлекать заново). Возвращает число документов.
+pub async fn sync_doc_limits(db: &Db, limits: DocLimitsKey) -> Result<u64, StoreError> {
+    db.write(move |tx| {
+        let stored = stored_doc_limits(tx)?;
+        if stored.as_ref() == Some(&limits) {
+            return Ok(0);
+        }
+        let ids = repend_stale_docs(tx, None, Some(&limits))?;
+        let now = fmt_ts(Timestamp::now());
+        for id in &ids {
+            enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![
+                DOCS_LIMITS_KEY,
+                format!("{};{}", limits.fingerprint, limits.max_bytes)
+            ],
+        )?;
+        Ok(ids.len() as u64)
     })
     .await
 }
@@ -1671,6 +1823,11 @@ pub async fn rechunk_docs_if_stale(db: &Db) -> Result<u64, StoreError> {
                     enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
                 }
             }
+            // строки кэша прежних версий извлечения больше не читаются (финальное ревью M5, M-5)
+            tx.execute(
+                "DELETE FROM blob_extract WHERE extractor_version <> ?1",
+                [EXTRACTOR_VERSION],
+            )?;
             tx.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
                 params![CHUNKER_ATTACHMENTS_KEY, current],

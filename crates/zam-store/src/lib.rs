@@ -40,15 +40,15 @@ pub mod vault;
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use attachments::{
     AttachmentDoc, BLOB_MISSING, CHUNK_REF_LETTER, CHUNKER_ATTACHMENTS_KEY, CachedExtract,
-    DocChunkHead, DocFound, DocIntake, DocLookup, ExtractEnd, ExtractState, ExtractTarget,
-    PDFIUM_UNAVAILABLE, ReindexAttachment, TOO_LARGE, attachment_chunk_owner,
-    attachment_chunker_fingerprint, attachment_chunks_for_index, attachment_pieces,
-    blob_sheet_locators, cached_extract, chunk_ref, detach, doc_chunk_heads, doc_chunk_texts,
-    doc_sheet_locators, enqueue_attachment_upserts, ensure_extract_jobs, error_code,
-    extract_cached, extract_target, find_docs, finish_extract, has_attachment_chunks,
+    DOCS_LIMITS_KEY, DocChunkHead, DocFound, DocIntake, DocLimitsKey, DocLookup, ExtractEnd,
+    ExtractState, ExtractTarget, PDFIUM_UNAVAILABLE, ReindexAttachment, TOO_LARGE,
+    attachment_chunk_owner, attachment_chunker_fingerprint, attachment_chunks_for_index,
+    attachment_pieces, blob_sheet_locators, cached_extract, chunk_ref, detach, doc_chunk_heads,
+    doc_chunk_texts, doc_sheet_locators, enqueue_attachment_upserts, ensure_extract_jobs,
+    error_code, extract_cached, extract_target, find_docs, finish_extract, has_attachment_chunks,
     has_failed_with, list_attachments, put_extract, put_extract_failure, rechunk_docs_if_stale,
     reindex_attachments_page, reindex_docs, replace_attachment_chunks, requeue_failed_with,
-    set_extract_state,
+    set_extract_state, sync_doc_limits,
 };
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_by_sha,

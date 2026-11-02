@@ -654,9 +654,9 @@ async fn same_blob_two_notes_two_docs() {
         warnings: vec!["truncated: max_cells".into()],
         ocr_needed: true,
     };
-    put_extract(&env.db, &sha, &ex).await.unwrap();
+    put_extract(&env.db, &sha, &ex, "fp").await.unwrap();
     // повтор — без ошибки (тот же ключ кэша)
-    put_extract(&env.db, &sha, &ex).await.unwrap();
+    put_extract(&env.db, &sha, &ex, "fp").await.unwrap();
     assert_eq!(
         extract_cached(&env.db, &sha).await.unwrap(),
         Some(ex.clone())
@@ -797,7 +797,7 @@ async fn extract_cache_is_zstd_and_bad_row_is_miss() {
         warnings: Vec::new(),
         ocr_needed: false,
     };
-    put_extract(&env.db, &sha, &ex).await.unwrap();
+    put_extract(&env.db, &sha, &ex, "fp").await.unwrap();
     let raw: Vec<u8> = env
         .db
         .read(|c| Ok(c.query_row("SELECT units FROM blob_extract", [], |r| r.get(0))?))
@@ -1040,18 +1040,30 @@ async fn full_reindex_drops_cached_failures() {
         4,
     )
     .await;
-    put_extract_failure(&env.db, &bad, Some("parse_error: xml (word/document.xml)"))
+    put_extract_failure(
+        &env.db,
+        &bad,
+        DocKind::Docx,
+        Some("parse_error: xml (word/document.xml)"),
+        "",
+    )
+    .await
+    .unwrap();
+    put_extract_failure(&env.db, &odd, DocKind::Xlsx, None, "")
         .await
         .unwrap();
-    put_extract_failure(&env.db, &odd, None).await.unwrap();
     assert_eq!(
-        cached_extract(&env.db, &bad).await.unwrap(),
+        cached_extract(&env.db, &bad, DocKind::Docx, "")
+            .await
+            .unwrap(),
         Some(CachedExtract::Failed(
             "parse_error: xml (word/document.xml)".into()
         ))
     );
     assert_eq!(
-        cached_extract(&env.db, &odd).await.unwrap(),
+        cached_extract(&env.db, &odd, DocKind::Xlsx, "")
+            .await
+            .unwrap(),
         Some(CachedExtract::Unsupported)
     );
     let docs = list_attachments(&env.db, n).await.unwrap();
@@ -1064,8 +1076,18 @@ async fn full_reindex_drops_cached_failures() {
         .unwrap();
     drop_jobs(&env.db).await;
     enqueue_reindex(&env.db, None).await.unwrap();
-    assert_eq!(cached_extract(&env.db, &bad).await.unwrap(), None);
-    assert_eq!(cached_extract(&env.db, &odd).await.unwrap(), None);
+    assert_eq!(
+        cached_extract(&env.db, &bad, DocKind::Docx, "")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        cached_extract(&env.db, &odd, DocKind::Xlsx, "")
+            .await
+            .unwrap(),
+        None
+    );
     let docs = list_attachments(&env.db, n).await.unwrap();
     for name in ["bad.docx", "odd.xlsx"] {
         let d = doc_of(&docs, name);
@@ -1377,4 +1399,133 @@ async fn has_attachment_chunks_by_space() {
     // узел удалён — документ скрыт (чанки остаются в базе)
     delete_node(&env.db, n, AuthorKind::Human).await.unwrap();
     assert!(!has(vec![env.k]).await);
+}
+
+/// Финальное ревью M5 (I-2, M-1, M-2, M-5): ключ годности кэша извлечения. Частичный по сроку
+/// результат не кэшируется; строка годится только тому же виду разбора; обрезанная лимитом —
+/// только при тех же лимитах (необрезанная — при любых). Reindex извлекает заново `done` без
+/// годной строки; смена лимитов базы (`sync_doc_limits`) — обрезанные при прежних лимитах и
+/// `too_large`, которым хватает нового `max_bytes`. Строки прежних версий извлечения удаляются
+/// при перенарезке по отпечатку.
+#[tokio::test]
+async fn extract_cache_key_kind_limits_timeout() {
+    use zam_store::{
+        CachedExtract, DocLimitsKey, cached_extract, enqueue_reindex, rechunk_docs_if_stale,
+        sync_doc_limits,
+    };
+    let env = setup("cache-key").await;
+    let n = note(&env.db, env.k, "n", "текст").await;
+    let ex = |kind: DocKind, warnings: &[&str]| Extracted {
+        kind,
+        units: units(&[("", "строка")]),
+        warnings: warnings.iter().map(|w| w.to_string()).collect(),
+        ocr_needed: false,
+    };
+    let hit = |c: Option<CachedExtract>| matches!(c, Some(CachedExtract::Extracted(_)));
+
+    // частичный по сроку — не в кэш
+    let slow = put_attach(&env, n, b"slow;1", "slow.csv", Some(DocKind::Csv)).await;
+    let slow_x = ex(DocKind::Csv, &["truncated: timeout_ms"]);
+    assert!(!put_extract(&env.db, &slow, &slow_x, "A").await.unwrap());
+    assert_eq!(extract_cached(&env.db, &slow).await.unwrap(), None);
+
+    // вид и лимиты
+    let cut = put_attach(&env, n, b"cut;1", "cut.csv", Some(DocKind::Csv)).await;
+    let cut_x = ex(DocKind::Csv, &["truncated: max_chars"]);
+    assert!(put_extract(&env.db, &cut, &cut_x, "A").await.unwrap());
+    assert!(hit(cached_extract(&env.db, &cut, DocKind::Csv, "A")
+        .await
+        .unwrap()));
+    assert_eq!(
+        cached_extract(&env.db, &cut, DocKind::Text, "A")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        cached_extract(&env.db, &cut, DocKind::Csv, "B")
+            .await
+            .unwrap(),
+        None
+    );
+    let full = put_attach(&env, n, b"full;1", "full.csv", Some(DocKind::Csv)).await;
+    put_extract(&env.db, &full, &ex(DocKind::Csv, &[]), "A")
+        .await
+        .unwrap();
+    assert!(hit(cached_extract(&env.db, &full, DocKind::Csv, "B")
+        .await
+        .unwrap()));
+
+    // документы `done` по этим извлечениям; `too_large` при пределе 4 байта
+    let docs = list_attachments(&env.db, n).await.unwrap();
+    for name in ["slow.csv", "cut.csv", "full.csv"] {
+        replace_attachment_chunks(&env.db, doc_of(&docs, name).id, &units(&[("", "строка")]))
+            .await
+            .unwrap();
+    }
+    put_attach_max(&env, n, b"0123456789", "big.txt", Some(DocKind::Text), 4).await;
+    drop_jobs(&env.db).await;
+    let state =
+        async |name: &str| doc_of(&list_attachments(&env.db, n).await.unwrap(), name).extract_state;
+
+    // лимиты базы записаны впервые: обрезанное при «A» годно, `too_large` — нет (предел 4)
+    let key = |fp: &str, max: u64| DocLimitsKey {
+        fingerprint: fp.into(),
+        max_bytes: max,
+    };
+    // `slow.csv` без строки кэша — извлекается заново и здесь
+    assert_eq!(sync_doc_limits(&env.db, key("A", 4)).await.unwrap(), 1);
+    assert_eq!(state("slow.csv").await, ExtractState::Pending);
+    assert_eq!(state("cut.csv").await, ExtractState::Done);
+    assert_eq!(state("big.txt").await, ExtractState::Failed);
+    assert_eq!(sync_doc_limits(&env.db, key("A", 4)).await.unwrap(), 0);
+
+    // reindex при тех же лимитах: ничего нового заново не извлекается
+    let docs = list_attachments(&env.db, n).await.unwrap();
+    replace_attachment_chunks(
+        &env.db,
+        doc_of(&docs, "slow.csv").id,
+        &units(&[("", "строка")]),
+    )
+    .await
+    .unwrap();
+    enqueue_reindex(&env.db, None).await.unwrap();
+    assert_eq!(
+        state("slow.csv").await,
+        ExtractState::Pending,
+        "I-2: по сроку — заново"
+    );
+    assert_eq!(state("cut.csv").await, ExtractState::Done);
+    assert_eq!(state("full.csv").await, ExtractState::Done);
+    assert_eq!(state("big.txt").await, ExtractState::Failed);
+
+    // новые лимиты: обрезанное при прежних и `too_large` по силам — заново, полное — нет
+    sync_doc_limits(&env.db, key("B", 100)).await.unwrap();
+    assert_eq!(state("cut.csv").await, ExtractState::Pending);
+    assert_eq!(state("full.csv").await, ExtractState::Done);
+    let big = doc_of(&list_attachments(&env.db, n).await.unwrap(), "big.txt");
+    assert_eq!(big.extract_state, ExtractState::Pending);
+    assert_eq!(
+        active_job(&env.db, "attachment", big.id).await.as_deref(),
+        Some("upsert")
+    );
+
+    // M-5: строки прежних версий удаляются при перенарезке по отпечатку
+    env.db
+        .write(|t| {
+            t.execute_batch(
+                "UPDATE blob_extract SET extractor_version = 0;
+                 INSERT OR REPLACE INTO meta (key, value) VALUES ('chunker_attachments', 'old');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    rechunk_docs_if_stale(&env.db).await.unwrap();
+    let left: i64 = env
+        .db
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM blob_extract", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }

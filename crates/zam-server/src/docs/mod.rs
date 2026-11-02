@@ -17,5 +17,11 @@ pub mod protocol;
 pub mod worker;
 
 pub use indexer::{DocIndexer, DocsStatus};
+
+/// Отпечаток лимитов разбора (8 hex blake3 их `Debug`): ключ годности результата, обрезанного
+/// лимитом, — кэша извлечения `blob_extract.limits_fp` и файлов превью.
+pub fn limits_fingerprint(limits: &zam_docs::Limits) -> String {
+    blake3::hash(format!("{limits:?}").as_bytes()).to_hex()[..8].to_string()
+}
 pub use pool::{DocPool, ParseFailure};
 pub use preview::{PreviewKey, Previews};
