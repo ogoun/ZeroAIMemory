@@ -121,6 +121,64 @@ pub fn is_multipart(headers: &HeaderMap) -> bool {
         })
 }
 
+/// JSON-тело — отчёт (`"kind": "report"` на верхнем уровне). Без построения `Value`: прочие поля
+/// пропускаются (`IgnoredAny`), значение `kind` не-строкой — не отчёт; не JSON или повтор `kind`
+/// — не отчёт.
+pub fn json_is_report(bytes: &[u8]) -> bool {
+    use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    /// Строка `kind` или `None` (значение другого типа пропускается без выделения памяти).
+    struct KindStr(Option<String>);
+    impl<'de> Deserialize<'de> for KindStr {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = KindStr;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("значение kind")
+                }
+                fn visit_str<E>(self, v: &str) -> Result<KindStr, E> {
+                    Ok(KindStr(Some(v.to_string())))
+                }
+                fn visit_bool<E>(self, _: bool) -> Result<KindStr, E> {
+                    Ok(KindStr(None))
+                }
+                fn visit_i64<E>(self, _: i64) -> Result<KindStr, E> {
+                    Ok(KindStr(None))
+                }
+                fn visit_u64<E>(self, _: u64) -> Result<KindStr, E> {
+                    Ok(KindStr(None))
+                }
+                fn visit_f64<E>(self, _: f64) -> Result<KindStr, E> {
+                    Ok(KindStr(None))
+                }
+                fn visit_unit<E>(self) -> Result<KindStr, E> {
+                    Ok(KindStr(None))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<KindStr, A::Error> {
+                    while a.next_element::<IgnoredAny>()?.is_some() {}
+                    Ok(KindStr(None))
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<KindStr, A::Error> {
+                    while a.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                    Ok(KindStr(None))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct Probe {
+        kind: Option<KindStr>,
+    }
+    serde_json::from_slice::<Probe>(bytes)
+        .ok()
+        .and_then(|p| p.kind)
+        .and_then(|k| k.0)
+        .is_some_and(|k| EntryKind::parse(&k) == Some(EntryKind::Report))
+}
+
 /// Тело запроса до `limit` байт; больше — 413.
 pub async fn read_limited(body: Body, limit: usize) -> Result<Bytes, ApiError> {
     let mut s = body.into_data_stream();
@@ -139,6 +197,13 @@ pub async fn read_limited(body: Body, limit: usize) -> Result<Bytes, ApiError> {
 
 // ---- ссылки тела ----
 
+/// Не больше ссылок тела на файлы отчёта (с повторами); больше — 422. Защищает разбор от тел
+/// из сотен тысяч ссылок: 64 файла с запасом на многократные ссылки.
+pub const LINKS_MAX: usize = 4096;
+/// Кандидатов-определений `[метка]: путь` на метку: первые по тексту (действует первое вне кода),
+/// остальные не рассматриваются.
+pub const DEFS_PER_LABEL_MAX: usize = 16;
+
 /// Локальная ссылка тела: имя файла и байты назначения в исходнике (что переписывать).
 struct LocalLink {
     name: String,
@@ -147,20 +212,83 @@ struct LocalLink {
     dest: Range<usize>,
 }
 
+/// Разбор ссылок тела: файлы (без повторов) и назначения для переписывания.
+struct Analysis {
+    refs: Vec<LocalRef>,
+    links: Vec<LocalLink>,
+}
+
+impl Analysis {
+    fn of(body: &str) -> Result<Analysis, ApiError> {
+        let links = local_links(body)?;
+        let mut index: HashMap<&str, usize> = HashMap::new();
+        let mut refs: Vec<LocalRef> = Vec::new();
+        for l in &links {
+            match index.get(l.name.as_str()) {
+                Some(&i) => refs[i].image |= l.image,
+                None => {
+                    index.insert(&l.name, refs.len());
+                    refs.push(LocalRef {
+                        name: l.name.clone(),
+                        image: l.image,
+                    });
+                }
+            }
+        }
+        Ok(Analysis { refs, links })
+    }
+
+    /// Новое назначение ссылки (длина не зависит от sha256).
+    fn target(l: &LocalLink, sha: &str) -> String {
+        let mut new = attachment_link(sha, basename(&l.name));
+        if let Some(a) = &l.anchor {
+            new.push('#');
+            new.push_str(&encode_anchor(a));
+        }
+        new
+    }
+
+    /// Длина тела после переписывания всех ссылок на файлы — известна до приёма файлов.
+    fn rewritten_len(&self, body: &str) -> usize {
+        let zero = "0".repeat(64);
+        let mut seen = BTreeSet::new();
+        let mut len = body.len();
+        for l in &self.links {
+            if seen.insert(l.dest.start) {
+                len = len - l.dest.len() + Self::target(l, &zero).len();
+            }
+        }
+        len
+    }
+
+    /// Тело с назначениями ссылок на файлы `files` (имя, sha256); прочие ссылки — как есть.
+    fn rewrite(&self, body: &str, files: &[(String, String)]) -> String {
+        let sha_of: HashMap<&str, &str> = files
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+            .collect();
+        let mut reps: BTreeMap<usize, (usize, String)> = BTreeMap::new();
+        for l in &self.links {
+            if let Some(sha) = sha_of.get(l.name.as_str()) {
+                reps.insert(l.dest.start, (l.dest.end, Self::target(l, sha)));
+            }
+        }
+        let mut out = String::with_capacity(body.len() + reps.len() * 32);
+        let mut at = 0;
+        for (start, (end, new)) in reps {
+            out.push_str(&body[at..start]);
+            out.push_str(&new);
+            at = end;
+        }
+        out.push_str(&body[at..]);
+        out
+    }
+}
+
 /// Файлы отчёта, на которые ссылается тело, в порядке первого упоминания (без повторов).
 /// Нарушение правил ссылок (см. модуль) — 422.
 pub fn report_refs(body: &str) -> Result<Vec<LocalRef>, ApiError> {
-    let mut out: Vec<LocalRef> = Vec::new();
-    for l in local_links(body)? {
-        match out.iter_mut().find(|r| r.name == l.name) {
-            Some(r) => r.image |= l.image,
-            None => out.push(LocalRef {
-                name: l.name,
-                image: l.image,
-            }),
-        }
-    }
-    Ok(out)
+    Analysis::of(body).map(|a| a.refs)
 }
 
 /// Тело с назначениями ссылок на файлы `files` (имя по [`LocalRef::name`], sha256), заменёнными на
@@ -168,29 +296,27 @@ pub fn report_refs(body: &str) -> Result<Vec<LocalRef>, ApiError> {
 /// `<…>`, определение ссылки-сноски `[r]: путь`) и остальной текст не меняются; ссылки на
 /// прочие имена — как есть. Тело, не прошедшее [`report_refs`], возвращается без изменений.
 pub fn rewrite_links(body: &str, files: &[(String, String)]) -> String {
-    let Ok(links) = local_links(body) else {
-        return body.to_string();
-    };
-    let sha_of: HashMap<&str, &str> = files
-        .iter()
-        .map(|(n, s)| (n.as_str(), s.as_str()))
-        .collect();
-    let mut reps: BTreeMap<usize, (usize, String)> = BTreeMap::new();
-    for l in links {
-        let Some(sha) = sha_of.get(l.name.as_str()) else {
-            continue;
-        };
-        let mut new = attachment_link(sha, basename(&l.name));
-        if let Some(a) = &l.anchor {
-            new.push('#');
-            new.push_str(a);
-        }
-        reps.insert(l.dest.start, (l.dest.end, new));
+    match Analysis::of(body) {
+        Ok(a) => a.rewrite(body, files),
+        Err(_) => body.to_string(),
     }
-    let mut out = body.to_string();
-    // с конца к началу: диапазоны впереди не сдвигаются
-    for (start, (end, new)) in reps.into_iter().rev() {
-        out.replace_range(start..end, &new);
+}
+
+/// Якорь ссылки: символы, ломающие синтаксис ссылки или читаемые Markdown особо, — `%XX`
+/// (`%` не трогается: якорь уже в виде из исходника).
+fn encode_anchor(a: &str) -> String {
+    let mut out = String::with_capacity(a.len());
+    for ch in a.chars() {
+        if ch.is_ascii_control()
+            || matches!(
+                ch,
+                ' ' | '(' | ')' | '<' | '>' | '&' | '\\' | '"' | '\'' | '[' | ']'
+            )
+        {
+            out.push_str(&format!("%{:02X}", ch as u32));
+        } else {
+            out.push(ch);
+        }
     }
     out
 }
@@ -208,97 +334,164 @@ enum Dest {
     Reference(String),
 }
 
-/// Ожидающая подтверждения локальная ссылка: индекс в `Doc::links` и кандидаты назначения.
+/// Где назначение локальной ссылки: inline — диапазон, сноска — номер метки.
+enum Loc {
+    Inline(Range<usize>),
+    Label(usize),
+}
+
+/// Локальная ссылка до проверки назначения: индекс в `Doc::links`.
 struct Pending {
     idx: usize,
     name: String,
     image: bool,
     anchor: Option<String>,
-    cands: Vec<Range<usize>>,
-    pos: usize,
+    loc: Loc,
+}
+
+/// `![[…]]` (встраивание Obsidian) вне кода — 422 с подсказкой: разбор его не видит ни
+/// картинкой, ни ссылкой, и в отчёте он остался бы текстом. Проверка — разбором копии, где `!`
+/// заменён пробелом (длина та же): вики-ссылка там, где в теле стоял `!`, — встраивание.
+fn reject_wiki_embeds(body: &str) -> Result<(), ApiError> {
+    if !body.contains("![[") {
+        return Ok(());
+    }
+    let probe = body.replace("![[", " [[");
+    let b = body.as_bytes();
+    for l in parse(&probe).links {
+        if l.kind == LinkKind::Wiki && l.range.start > 0 && b[l.range.start - 1] == b'!' {
+            return Err(unprocessable(format!(
+                "встраивание ![[{}]] в отчёте не поддерживается: картинка — ![подпись](путь)",
+                short(&l.target)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn local_links(body: &str) -> Result<Vec<LocalLink>, ApiError> {
+    reject_wiki_embeds(body)?;
     let doc = parse(body);
     let mut pending: Vec<Pending> = Vec::new();
+    let mut labels: HashMap<String, usize> = HashMap::new();
+    // бюджет поиска назначений: диапазоны ссылок пересекаются только вложением картинки
+    let mut budget = body.len().saturating_mul(4).saturating_add(1 << 20);
     for (idx, l) in doc.links.iter().enumerate() {
         let Some(name) = classify(l)? else {
             continue;
         };
-        let cands = match locate(body, l.range.clone()) {
-            Some(Dest::Inline(r)) => vec![r],
-            Some(Dest::Reference(label)) => ref_definitions(body, &label),
-            None => Vec::new(),
-        };
-        if cands.is_empty() {
-            return Err(unlocatable(&name));
+        if pending.len() >= LINKS_MAX {
+            return Err(unprocessable(format!(
+                "ссылок тела на файлы отчёта больше {LINKS_MAX}"
+            )));
         }
+        budget = budget.checked_sub(l.range.len()).ok_or_else(|| {
+            unprocessable("ссылки тела: слишком глубокое вложение ссылок и картинок")
+        })?;
+        let loc = match locate(body, l.range.clone()) {
+            Some(Dest::Inline(r)) => Loc::Inline(r),
+            Some(Dest::Reference(label)) => {
+                let n = labels.len();
+                Loc::Label(*labels.entry(norm_label(&label)).or_insert(n))
+            }
+            None => return Err(unlocatable(&name)),
+        };
         pending.push(Pending {
             idx,
             name,
             image: l.kind == LinkKind::Image,
             anchor: l.anchor.clone(),
-            cands,
-            pos: 0,
+            loc,
         });
     }
-    // Проверка найденных назначений одним разбором: каждое назначение заменяется меткой, и
-    // ссылка с тем же индексом обязана получить её целью. Иначе (определение в блоке кода,
-    // форма, не понятая поиском) — следующий кандидат; кандидатов нет — 422.
+    let cands = ref_definitions(body, &labels);
+    for p in &pending {
+        if let Loc::Label(i) = p.loc
+            && cands[i].is_empty()
+        {
+            return Err(unlocatable(&p.name));
+        }
+    }
+    // Проверка назначений проверочным разбором: каждое заменяется меткой, ссылка с тем же
+    // индексом обязана получить её целью. Сноска не прошла (определение в коде) — следующее
+    // определение метки; inline не прошла или кандидаты кончились — 422. Разборов не больше
+    // DEFS_PER_LABEL_MAX + 1.
     let n = doc.links.len();
+    let mut pos = vec![0usize; labels.len()];
+    let range_of = |p: &Pending, pos: &[usize]| -> Range<usize> {
+        match &p.loc {
+            Loc::Inline(r) => r.clone(),
+            Loc::Label(i) => cands[*i][pos[*i]].clone(),
+        }
+    };
+    let mut round = 0;
     loop {
         let mut marks: BTreeMap<usize, (usize, String)> = BTreeMap::new();
         for p in &pending {
-            let r = &p.cands[p.pos];
+            let r = range_of(p, &pos);
             let k = marks.len();
             marks
                 .entry(r.start)
                 .or_insert_with(|| (r.end, format!("zamreportmark{k}x")));
         }
-        let mut probe = body.to_string();
-        let mut prev_start = usize::MAX;
-        for (start, (end, mark)) in marks.iter().rev() {
-            if *end > prev_start {
+        let mut probe = String::with_capacity(body.len() + marks.len() * 8);
+        let mut at = 0;
+        for (start, (end, mark)) in &marks {
+            if *start < at {
                 // пересечение назначений — форма, которую поиск не понял
                 return Err(unprocessable(
                     "ссылки тела: не удалось разобрать назначения ссылок на файлы",
                 ));
             }
-            probe.replace_range(*start..*end, mark);
-            prev_start = *start;
+            probe.push_str(&body[at..*start]);
+            probe.push_str(mark);
+            at = *end;
         }
+        probe.push_str(&body[at..]);
         let pd = parse(&probe);
-        let mut all_ok = true;
-        for p in &mut pending {
-            let r = &p.cands[p.pos];
-            let mark = &marks[&r.start].1;
-            let ok = pd.links.len() == n && pd.links[p.idx].target == *mark;
-            if !ok {
-                all_ok = false;
-                p.pos += 1;
-                if p.pos >= p.cands.len() {
-                    return Err(unlocatable(&p.name));
+        let same = pd.links.len() == n;
+        let mut failed: BTreeSet<usize> = BTreeSet::new();
+        for p in &pending {
+            let r = range_of(p, &pos);
+            if same && pd.links[p.idx].target == marks[&r.start].1 {
+                continue;
+            }
+            match p.loc {
+                Loc::Inline(_) => return Err(unlocatable(&p.name)),
+                Loc::Label(i) => {
+                    failed.insert(i);
                 }
             }
         }
-        if all_ok {
+        if failed.is_empty() {
             break;
+        }
+        round += 1;
+        for i in failed {
+            pos[i] += 1;
+            if pos[i] >= cands[i].len() || round > DEFS_PER_LABEL_MAX {
+                let p = pending
+                    .iter()
+                    .find(|p| matches!(p.loc, Loc::Label(j) if j == i));
+                return Err(unlocatable(p.map_or("", |p| p.name.as_str())));
+            }
         }
     }
     Ok(pending
-        .into_iter()
+        .iter()
         .map(|p| LocalLink {
-            dest: p.cands[p.pos].clone(),
-            name: p.name,
+            dest: range_of(p, &pos),
+            name: p.name.clone(),
             image: p.image,
-            anchor: p.anchor,
+            anchor: p.anchor.clone(),
         })
         .collect())
 }
 
 fn unlocatable(name: &str) -> ApiError {
     unprocessable(format!(
-        "ссылка на «{name}»: назначение не найдено — используйте [текст](путь) или ![подпись](путь)"
+        "ссылка на «{}»: назначение не найдено — используйте [текст](путь) или ![подпись](путь)",
+        short(name)
     ))
 }
 
@@ -564,12 +757,16 @@ fn norm_label(s: &str) -> String {
         .to_lowercase()
 }
 
-/// Назначения определений `[метка]: путь` с такой меткой, в порядке текста (кандидаты:
-/// определение в блоке кода отсеивает проверочный разбор).
-fn ref_definitions(src: &str, label: &str) -> Vec<Range<usize>> {
-    let want = norm_label(label);
+/// Назначения определений `[метка]: путь` для меток `labels` (нормализованная метка → номер) за
+/// один проход по строкам: по номеру метки — до [`DEFS_PER_LABEL_MAX`] кандидатов в порядке
+/// текста (определение в блоке кода отсеивает проверочный разбор). Метка ищется в пределах
+/// строки, отступ — до трёх пробелов.
+fn ref_definitions(src: &str, labels: &HashMap<String, usize>) -> Vec<Vec<Range<usize>>> {
+    let mut out: Vec<Vec<Range<usize>>> = vec![Vec::new(); labels.len()];
+    if labels.is_empty() {
+        return out;
+    }
     let b = src.as_bytes();
-    let mut out = Vec::new();
     let mut line = 0usize;
     while line < b.len() {
         let next = b[line..]
@@ -583,34 +780,50 @@ fn ref_definitions(src: &str, label: &str) -> Vec<Range<usize>> {
             indent += 1;
         }
         if b.get(i) == Some(&b'[')
-            && let Some(close) = match_bracket(b, i)
+            && let Some(close) = label_close(&b[..next], i)
             && b.get(close + 1) == Some(&b':')
-            && close < next
-            && norm_label(&src[i + 1..close]) == want
+            && let Some(&n) = labels.get(&norm_label(&src[i + 1..close]))
+            && out[n].len() < DEFS_PER_LABEL_MAX
+            && let Some(dest) = def_dest(b, close + 2)
         {
-            let mut k = skip_ws(b, close + 2, true);
-            if b.get(k) == Some(&b'<') {
-                let start = k + 1;
-                k = start;
-                while k < b.len() && !matches!(b[k], b'>' | b'\n' | b'\r') {
-                    k += if b[k] == b'\\' { 2 } else { 1 };
-                }
-                if b.get(k) == Some(&b'>') {
-                    out.push(start..k);
-                }
-            } else {
-                let start = k;
-                while k < b.len() && !b[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                if k > start {
-                    out.push(start..k);
-                }
-            }
+            out[n].push(dest);
         }
         line = next;
     }
     out
+}
+
+/// `]` метки определения в пределах строки `b[open..]` (без вложенных скобок, с `\`-экранированием).
+fn label_close(b: &[u8], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'[' | b'\n' | b'\r' => return None,
+            b']' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Назначение определения после `:` (`<…>` или до пробела; допустим один перевод строки).
+fn def_dest(b: &[u8], from: usize) -> Option<Range<usize>> {
+    let mut k = skip_ws(b, from, true);
+    if b.get(k) == Some(&b'<') {
+        let start = k + 1;
+        k = start;
+        while k < b.len() && !matches!(b[k], b'>' | b'\n' | b'\r') {
+            k += if b[k] == b'\\' { 2 } else { 1 };
+        }
+        (b.get(k) == Some(&b'>')).then_some(start..k)
+    } else {
+        let start = k;
+        while k < b.len() && !b[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        (k > start).then_some(start..k)
+    }
 }
 
 // ---- данные и метаданные ----
@@ -733,15 +946,21 @@ impl Intake {
 
     /// Проверка файла до приёма байт; возвращает нормализованное имя и MIME.
     fn admit(&mut self, raw: &str, part_mime: Option<&str>) -> Result<(String, String), ApiError> {
+        let mut name = raw;
+        while let Some(rest) = name.strip_prefix("./") {
+            name = rest;
+        }
+        if self.seen.contains(name) {
+            return Err(ApiError::BadRequest(format!(
+                "файл «{}» передан дважды",
+                short(name)
+            )));
+        }
         if self.seen.len() >= self.lim.max_files {
             return Err(unprocessable(format!(
                 "файлов в отчёте больше предела {}",
                 self.lim.max_files
             )));
-        }
-        let mut name = raw;
-        while let Some(rest) = name.strip_prefix("./") {
-            name = rest;
         }
         let Some(&image) = self.refs.get(name) else {
             return Err(unprocessable(format!(
@@ -749,12 +968,7 @@ impl Intake {
                 short(name)
             )));
         };
-        if !self.seen.insert(name.to_string()) {
-            return Err(ApiError::BadRequest(format!(
-                "файл «{}» передан дважды",
-                short(name)
-            )));
-        }
+        self.seen.insert(name.to_string());
         let mime = pick_mime(basename(name), part_mime);
         if image && !IMAGE_MIMES.contains(&mime.as_str()) {
             return Err(unprocessable(format!(
@@ -778,18 +992,26 @@ impl Intake {
     }
 }
 
-fn too_large(lim: Limits, used: u64, name: &str) -> ApiError {
-    if lim.max_total.saturating_sub(used) < lim.blob_max {
-        ApiError::PayloadTooLarge(format!(
+/// Какой предел размера сработал.
+#[derive(Clone, Copy)]
+enum Over {
+    /// Файл больше `limits.blob_max_bytes`.
+    File,
+    /// Сумма файлов больше `reports.max_total_bytes`.
+    Total,
+}
+
+fn too_large(lim: Limits, over: Over, name: &str) -> ApiError {
+    match over {
+        Over::Total => ApiError::PayloadTooLarge(format!(
             "файлы отчёта больше предела {} байт (reports.max_total_bytes)",
             lim.max_total
-        ))
-    } else {
-        ApiError::PayloadTooLarge(format!(
-            "файл «{}» больше предела {} байт",
+        )),
+        Over::File => ApiError::PayloadTooLarge(format!(
+            "файл «{}» больше предела {} байт (limits.blob_max_bytes)",
             short(name),
             lim.blob_max
-        ))
+        )),
     }
 }
 
@@ -814,11 +1036,17 @@ async fn multipart_files(
             .map(str::to_string)
             .ok_or_else(|| ApiError::BadRequest("у части file нет имени файла".into()))?;
         let (name, mime) = intake.admit(&raw, f.content_type())?;
-        let limit = lim.blob_max.min(lim.max_total.saturating_sub(used));
+        let left = lim.max_total.saturating_sub(used);
+        // поток обрывается на меньшем пределе — он и назван в ответе
+        let (limit, over) = if left < lim.blob_max {
+            (left, Over::Total)
+        } else {
+            (lim.blob_max, Over::File)
+        };
         let reader = StreamReader::new(f.map_err(stream_err));
         let (sha256, size) = store.put(reader, limit).await.map_err(|e| {
             if put_too_large(&e) {
-                too_large(lim, used, &name)
+                too_large(lim, over, &name)
             } else {
                 put_err(e, limit)
             }
@@ -849,7 +1077,13 @@ async fn json_files(
     let mut decoded = Vec::with_capacity(images.len());
     for img in images {
         let (name, mime) = intake.admit(&img.name, None)?;
-        let data = b64.decode(img.data.as_bytes()).map_err(|e| {
+        // переносы строк и пробелы base64 (MIME, PEM) допустимы
+        let clean: Vec<u8> = img
+            .data
+            .bytes()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let data = b64.decode(&clean).map_err(|e| {
             unprocessable(format!("файл «{}»: data — не base64: {e}", short(&name)))
         })?;
         let size = data.len() as u64;
@@ -860,8 +1094,11 @@ async fn json_files(
                 lim.mcp_max
             )));
         }
-        if size > lim.blob_max.min(lim.max_total.saturating_sub(used)) {
-            return Err(too_large(lim, used, &name));
+        if size > lim.blob_max {
+            return Err(too_large(lim, Over::File, &name));
+        }
+        if used + size > lim.max_total {
+            return Err(too_large(lim, Over::Total, &name));
         }
         used += size;
         decoded.push((name, mime, data));
@@ -966,25 +1203,49 @@ pub async fn create(
     check_title(&meta.title)?;
     let data = check_report_data(&meta.data)?;
     check_size(st, &meta.body)?;
-    let refs = report_refs(&meta.body)?;
+    let attrib = attribution(p, headers, meta.message)?;
+    let key = idempotency_key(headers)?;
+    // разбор тела (до LINKS_MAX ссылок и DEFS_PER_LABEL_MAX + 2 разборов) — вне потока tokio
+    let (body, analysis) = tokio::task::spawn_blocking(move || {
+        let a = Analysis::of(&meta.body);
+        (meta.body, a)
+    })
+    .await
+    .map_err(|e| ApiError::aborted("разбор ссылок отчёта", &e))?;
+    let analysis = analysis?;
+    let refs = &analysis.refs;
     let lim = Limits::of(st);
+    // до приёма байт: файлов не больше предела, переписанное тело — в пределе записи
+    if refs.len() > lim.max_files {
+        return Err(unprocessable(format!(
+            "тело ссылается на {} файлов — больше предела {}",
+            refs.len(),
+            lim.max_files
+        )));
+    }
+    let new_len = analysis.rewritten_len(&body);
+    if new_len > st.cfg.limits.note_max_bytes {
+        return Err(ApiError::PayloadTooLarge(format!(
+            "тело отчёта со ссылками на файлы — {new_len} байт, предел {}",
+            st.cfg.limits.note_max_bytes
+        )));
+    }
     let store = BlobStore::new(&st.data_dir.blobs_dir(), sc.owner);
-    let mut intake = Intake::new(&refs, lim);
+    let mut intake = Intake::new(refs, lim);
     let stored = match mp.as_mut() {
         Some(mp) => {
             let s = multipart_files(mp, &mut intake, &store).await?;
-            intake.complete(&refs)?;
+            intake.complete(refs)?;
             s
         }
-        None => json_files(images, meta.body.len(), &mut intake, &refs, &store).await?,
+        None => json_files(images, body.len(), &mut intake, refs, &store).await?,
     };
     let pairs: Vec<(String, String)> = stored
         .iter()
         .map(|s| (s.name.clone(), s.sha256.clone()))
         .collect();
-    let body = rewrite_links(&meta.body, &pairs);
-    // переписанное тело не длиннее предела записи: ссылка `_attachments/…` бывает длиннее пути
-    check_size(st, &body)?;
+    let body = analysis.rewrite(&body, &pairs);
+    debug_assert_eq!(body.len(), new_len);
     let files: Vec<NewReportFile> = stored
         .iter()
         .map(|s| NewReportFile {
@@ -995,7 +1256,6 @@ pub async fn create(
         })
         .collect();
     let bytes: u64 = stored.iter().map(|s| s.size).sum();
-    let attrib = attribution(p, headers, meta.message)?;
     let new = NewEntry {
         space_id: sc.space.id,
         kind: EntryKind::Report,
@@ -1006,7 +1266,7 @@ pub async fn create(
         tags: meta.tags,
         status: None,
         certainty: None,
-        idempotency_key: idempotency_key(headers)?,
+        idempotency_key: key,
         triggers: Vec::new(),
         links: Vec::new(),
         refs: None,
@@ -1126,5 +1386,105 @@ mod tests {
         assert!(check_report_data(&json!({"refs": {"issues": []}})).is_err());
         assert!(check_report_data(&json!({"refs": {"files": "a"}})).is_err());
         assert!(check_report_data(&json!([])).is_err());
+    }
+
+    #[test]
+    fn wiki_embed_rejected_wiki_link_kept() {
+        let e = report_refs("![[схема.png]]").unwrap_err().to_string();
+        assert!(e.contains("![подпись](путь)"), "{e}");
+        assert!(report_refs("см. [[Заметка]]").unwrap().is_empty());
+        // в коде — пример, не встраивание
+        assert!(
+            report_refs(
+                "`![[x.png]]`
+
+```
+![[y.png]]
+```
+"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn anchor_and_special_names_encoded() {
+        let sha = "12".repeat(32);
+        // `&amp;` в исходнике — имя `x&copy;.csv` (сущность раскрыта разбором)
+        let body = "[d](data/x&amp;copy;.csv#a(b)c)";
+        let refs = names(body);
+        assert_eq!(refs, vec![("data/x&copy;.csv".to_string(), false)]);
+        let out = rewrite_links(body, &[("data/x&copy;.csv".into(), sha.clone())]);
+        assert_eq!(
+            out,
+            format!("[d](_attachments/{}/x%26copy;.csv#a%28b%29c)", &sha[..16])
+        );
+        // переписанная ссылка разбирается в то же имя
+        let doc = parse(&out);
+        let (_, name) = zam_markdown::attachment_ref(&doc.links[0].target).unwrap();
+        assert_eq!(name.as_deref(), Some("x&copy;.csv"));
+    }
+
+    #[test]
+    fn rewritten_len_known_before_files() {
+        let sha = "34".repeat(32);
+        let body = "![a](<figs/my plot.png>) [r] [x][r]\n\n[r]: b.csv#z\n";
+        let a = Analysis::of(body).unwrap();
+        let out = a.rewrite(
+            body,
+            &[
+                ("figs/my plot.png".into(), sha.clone()),
+                ("b.csv".into(), sha.clone()),
+            ],
+        );
+        assert_eq!(a.rewritten_len(body), out.len(), "{out}");
+    }
+
+    #[test]
+    fn links_limit_and_many_definitions_fast() {
+        // 10 000 ссылок × 10 000 определений: отказ по LINKS_MAX без квадратичной работы
+        let mut body = "[x][r] ".repeat(10_000);
+        body.push_str("\n\n");
+        body.push_str(&"[r]: a.png\n".repeat(10_000));
+        let t = std::time::Instant::now();
+        let e = report_refs(&body).unwrap_err().to_string();
+        assert!(e.contains(&LINKS_MAX.to_string()), "{e}");
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            t.elapsed()
+        );
+        // в пределе: 4000 ссылок, 10 000 определений (первые — в блоке кода)
+        let mut body = "```\n".to_string();
+        body.push_str(&"[r]: in-code.png\n".repeat(10));
+        body.push_str("```\n\n");
+        body.push_str(&"[x][r] ".repeat(4000));
+        body.push_str("\n\n");
+        body.push_str(&"[r]: a.png\n".repeat(10_000));
+        let t = std::time::Instant::now();
+        assert_eq!(names(&body), vec![("a.png".to_string(), false)]);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            t.elapsed()
+        );
+        // все кандидаты метки в коде (больше DEFS_PER_LABEL_MAX) — 422, а не перебор
+        let mut body = "```\n".to_string();
+        body.push_str(&"[r]: in-code.png\n".repeat(DEFS_PER_LABEL_MAX + 5));
+        body.push_str("```\n\n[x][r]\n\n[r]: a.png\n");
+        assert!(report_refs(&body).is_err());
+    }
+
+    #[test]
+    fn json_report_probe() {
+        assert!(json_is_report(
+            br#"{"title": "t", "kind": "report", "x": [1, {"a": 2}]}"#
+        ));
+        assert!(!json_is_report(br#"{"kind": "changelog"}"#));
+        assert!(!json_is_report(br#"{"kind": ["report"]}"#));
+        assert!(!json_is_report(br#"{"kind": "report", "kind": "report"}"#));
+        assert!(!json_is_report(b"{not json"));
+        assert!(!json_is_report(b"[]"));
     }
 }

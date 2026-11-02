@@ -4,7 +4,8 @@
 //!   (MCP 2026-07-28 убрал сессии, SEP-2567; клиенты 2025-xx получают ответ `initialize`
 //!   без `Mcp-Session-Id` и дальше работают так же), ответы — `application/json`
 //!   (`json_response`), SSE — только если обработчик шлёт уведомления до ответа (у нас нет).
-//!   Предел тела — как у записи заметки ([`crate::api::note_body_max`]).
+//!   Предел тела — как у JSON записи журнала ([`crate::api::entries_json_max`]: отчёт с файлами
+//!   в base64 до `reports.mcp_max_bytes`); пределы заметок и записей проверяют маршруты REST.
 //! - **Аутентификация** — `Authorization: Bearer` обязателен ([`require_bearer`]): токен
 //!   проверяется тем же извлекателем [`Principal`], что у REST (лимит неудачных попыток по
 //!   IP, отзыв, срок); без заголовка или с неверным токеном — 401 problem+json до `rmcp`.
@@ -98,7 +99,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .with_json_response(true)
         .with_sse_keep_alive(None)
         .disable_allowed_hosts()
-        .with_max_request_body_bytes(crate::api::note_body_max(&state.cfg.limits));
+        .with_max_request_body_bytes(crate::api::entries_json_max(&state.cfg));
     let svc = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(NeverSessionManager::default()),

@@ -15,7 +15,8 @@
 //! **Ссылка** в Markdown: `_attachments/<sha256[0..16]>/<имя>`; в имени
 //! percent-кодируются только символы, ломающие синтаксис ссылки Markdown
 //! (пробел, `(`, `)`, `<`, `>`) и символы, которые рендер трактует особо
-//! (`%` — начало кода, `?` и `#` — запрос и якорь URL).
+//! (`%` — начало кода, `?` и `#` — запрос и якорь URL, `&` — начало сущности HTML, `\` —
+//! экранирование Markdown).
 
 use std::path::{Path, PathBuf};
 
@@ -164,7 +165,8 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
     let mut name = String::with_capacity(filename.len());
     for ch in filename.chars() {
         match ch {
-            ' ' | '(' | ')' | '<' | '>' | '%' | '?' | '#' => {
+            // `&` — иначе `&copy;` в имени Markdown прочтёт как сущность, `\` — как экранирование
+            ' ' | '(' | ')' | '<' | '>' | '%' | '?' | '#' | '&' | '\\' => {
                 name.push_str(&format!("%{:02X}", ch as u32));
             }
             _ => name.push(ch),
@@ -424,6 +426,15 @@ mod tests {
                 &sha[..16]
             )
         );
+        // сущность и обратная косая не теряются при разборе Markdown
+        assert_eq!(
+            attachment_link(&sha, "x&copy;\\y.png"),
+            format!("_attachments/{}/x%26copy;%5Cy.png", &sha[..16])
+        );
+        let body = format!("![a]({})", attachment_link(&sha, "x&copy;.png"));
+        let doc = zam_markdown::parse(&body);
+        let (_, name) = zam_markdown::attachment_ref(&doc.links[0].target).unwrap();
+        assert_eq!(name.as_deref(), Some("x&copy;.png"));
         assert_eq!(
             attachment_link(&sha, "кот.png"),
             format!("_attachments/{}/кот.png", &sha[..16])

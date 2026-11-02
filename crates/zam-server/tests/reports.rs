@@ -599,7 +599,9 @@ async fn report_limits_count_422_total_413_file_413() {
         )
         .await;
     assert_status(&r, StatusCode::UNPROCESSABLE_ENTITY, "число файлов");
-    assert!(r.text().contains('3'), "{}", r.text());
+    assert!(r.text().contains("предела 3"), "{}", r.text());
+    // число файлов тела проверено до приёма частей: на диске ничего нет
+    assert!(files_under(&w.blob_root()).is_empty());
     // сумма: 3 × 400 Б > 1 КиБ
     let (b1, b2, b3) = (png(1, 392), png(2, 392), png(3, 392));
     let body3 = "![1](1.png) ![2](2.png) ![3](3.png)";
@@ -707,7 +709,7 @@ async fn report_json_images_limit_413_with_cli_hint() {
 #[tokio::test]
 async fn report_json_bad_base64_422() {
     let w = world("bad-b64").await;
-    for data in ["@@@не base64@@@", "iVBORw0KGgo", "iVBO RW0K"] {
+    for data in ["@@@не base64@@@", "iVBORw0KGgo", "iVBO*RW0K", "iVBO-RW0K"] {
         let r = w
             .js(
                 &w.a_tok,
@@ -720,6 +722,25 @@ async fn report_json_bad_base64_422() {
         assert_status(&r, StatusCode::UNPROCESSABLE_ENTITY, data);
         assert!(r.text().contains("base64"), "{}", r.text());
     }
+    // base64 с переносами строк и пробелами — принимается
+    let img = png(4, 200);
+    let wrapped: String = b64(&img)
+        .as_bytes()
+        .chunks(76)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join("\r\n ");
+    let r = w
+        .js(
+            &w.a_tok,
+            G,
+            json!({"title": "Т", "body": "![a](a.png)",
+                   "images": [{"name": "a.png", "data": wrapped}]}),
+            None,
+        )
+        .await;
+    assert_status(&r, StatusCode::CREATED, "base64 с переносами");
+    assert_eq!(w.files_of(&id_of(&r)).await[0].size, img.len() as u64);
     // форма images неверна — 400
     let r = w
         .js(
@@ -730,7 +751,7 @@ async fn report_json_bad_base64_422() {
         )
         .await;
     assert_status(&r, StatusCode::BAD_REQUEST, "без data");
-    assert_eq!(w.reports().await, 0);
+    assert_eq!(w.reports().await, 1);
 }
 
 #[tokio::test]
@@ -1058,6 +1079,21 @@ async fn report_body_too_large_413() {
         .mp(&w.a_tok, G, json!({"title": "Т", "body": huge}), &[], None)
         .await;
     assert_status(&r, StatusCode::PAYLOAD_TOO_LARGE, "часть meta");
+    // тело в пределе, но со ссылками `_attachments/…` — больше: 413 до приёма файлов
+    let links = "![a](a.png)
+"
+    .repeat(80); // 960 байт
+    let r = w
+        .mp(
+            &w.a_tok,
+            G,
+            json!({"title": "Т", "body": links}),
+            &[("a.png", &png(1, 40))],
+            None,
+        )
+        .await;
+    assert_status(&r, StatusCode::PAYLOAD_TOO_LARGE, "переписанное тело");
+    assert!(files_under(&w.blob_root()).is_empty());
     // заголовок — общая проверка записей (422)
     let r = w.js(&w.a_tok, G, json!({"title": "  "}), None).await;
     assert_status(&r, StatusCode::UNPROCESSABLE_ENTITY, "пустой заголовок");
@@ -1092,6 +1128,33 @@ async fn other_kinds_json_limit_unchanged() {
         .unwrap();
     let r = w.a.send(raw).await;
     assert_status(&r, StatusCode::PAYLOAD_TOO_LARGE, "не JSON");
+    // то же потоком без Content-Length (chunked)
+    let chunks: Vec<Result<String, std::io::Error>> = (0..70)
+        .map(|i| {
+            Ok(if i == 0 {
+                format!("{{\"kind\": \"changelog\", \"pad\": \"{}", "x".repeat(1024))
+            } else {
+                "x".repeat(1024)
+            })
+        })
+        .collect();
+    let raw = Request::post(w.uri(G))
+        .header(header::AUTHORIZATION, format!("Bearer {}", w.a_tok))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap();
+    assert!(!raw.headers().contains_key(header::CONTENT_LENGTH));
+    let r = w.a.send(raw).await;
+    assert_status(&r, StatusCode::PAYLOAD_TOO_LARGE, "chunked");
+    // заявленная длина больше предела чтения — 413 без чтения тела
+    let raw = Request::post(w.uri(G))
+        .header(header::AUTHORIZATION, format!("Bearer {}", w.a_tok))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, "999999999")
+        .body(Body::from("{}"))
+        .unwrap();
+    let r = w.a.send(raw).await;
+    assert_status(&r, StatusCode::PAYLOAD_TOO_LARGE, "Content-Length");
     // обычная запись в пределах — как раньше
     let r =
         w.a.tok(
