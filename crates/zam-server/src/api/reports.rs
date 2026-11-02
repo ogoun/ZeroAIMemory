@@ -25,6 +25,11 @@
 //! **Ответ** — 201 (повтор `Idempotency-Key` — 200) ровно `{id, url}`: `url` — страница отчёта в
 //! WebUI. Тела и ссылки `p:` агент не получает: отчёт для человека (ответ владельца 4). В логи
 //! содержимое отчёта не попадает.
+//!
+//! Страница, файлы и миниатюры ленты — [`view`]; неизменность и права корзины —
+//! [`super::scope::deny_report_mutation`], [`super::scope::report_trash_allowed`].
+pub mod view;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 

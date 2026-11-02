@@ -30,6 +30,8 @@
 //! восстановлении узлов пространства и при загрузке вложения, поэтому появление или
 //! исчезновение цели ссылки сразу видно в HTML. Поколение читается до разрешения
 //! ссылок: рендер, начатый до изменения, попадает в кэш под старым ключом.
+//! Страница отчёта (M5.5) — тот же кэш ([`cached`]) с ключом `entry:<id>:<rev>` вместо хэша и
+//! своим резолвером файлов записи ([`super::reports::view`]).
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -245,10 +247,20 @@ pub async fn render_cached(
     ctx: RenderCtx,
     text: String,
 ) -> Result<Arc<Rendered>, ApiError> {
+    cached(st, key, render(db, Some(ctx), text)).await
+}
+
+/// Кэш рендера по ключу `key`: `make` выполняется только при промахе (отчёт M5.5 — со своим
+/// резолвером файлов записи).
+pub async fn cached(
+    st: &AppState,
+    key: RenderKey,
+    make: impl Future<Output = Result<Rendered, ApiError>>,
+) -> Result<Arc<Rendered>, ApiError> {
     if let Some(r) = cache_get(st, &key) {
         return Ok(r);
     }
-    let r = Arc::new(render(db, Some(ctx), text).await?);
+    let r = Arc::new(make.await?);
     cache_put(st, key, Arc::clone(&r));
     Ok(r)
 }
@@ -263,7 +275,14 @@ pub async fn render(db: &Db, ctx: Option<RenderCtx>, text: String) -> Result<Ren
         ),
         None => (HashMap::new(), HashMap::new()),
     };
-    let resolver = MapResolver { links, attachments };
+    render_with(text, MapResolver { links, attachments }).await
+}
+
+/// Рендер с готовым резолвером; CPU — в `spawn_blocking`.
+pub async fn render_with(
+    text: String,
+    resolver: impl Resolver + Send + 'static,
+) -> Result<Rendered, ApiError> {
     tokio::task::spawn_blocking(move || render_html(&text, &resolver))
         .await
         .map_err(|e| ApiError::aborted("рендер", &e))
@@ -321,7 +340,7 @@ pub fn percent_encode(s: &str) -> String {
 
 /// Цели вики-ссылок документа → id заметок (неразрешённые отсутствуют): одно чтение базы,
 /// разрешение — [`resolve_link`] (общее с рёбрами графа).
-async fn resolve_wiki(db: &Db, space: Id, text: &str) -> Result<HashMap<String, Id>, ApiError> {
+pub async fn resolve_wiki(db: &Db, space: Id, text: &str) -> Result<HashMap<String, Id>, ApiError> {
     let mut links: Vec<zam_markdown::Link> = parse(text)
         .links
         .into_iter()
@@ -351,16 +370,26 @@ struct MapResolver {
     attachments: HashMap<(String, String), String>,
 }
 
+/// Вики-ссылка по заранее разрешённым целям `links` ([`resolve_wiki`]): href `#/n/<id>` с
+/// якорем `#h-<slug>`.
+pub fn wiki_link(
+    links: &HashMap<String, Id>,
+    target: &str,
+    anchor: Option<&str>,
+) -> Option<LinkResolution> {
+    let id = links.get(target)?;
+    let mut href = format!("#/n/{id}");
+    if let Some(a) = anchor {
+        href.push('#');
+        href.push_str(HEADER_ID_PREFIX);
+        href.push_str(&slug(&percent_decode(a)));
+    }
+    Some(LinkResolution { href, exists: true })
+}
+
 impl Resolver for MapResolver {
     fn wiki(&self, target: &str, anchor: Option<&str>) -> Option<LinkResolution> {
-        let id = self.links.get(target)?;
-        let mut href = format!("#/n/{id}");
-        if let Some(a) = anchor {
-            href.push('#');
-            href.push_str(HEADER_ID_PREFIX);
-            href.push_str(&slug(&percent_decode(a)));
-        }
-        Some(LinkResolution { href, exists: true })
+        wiki_link(&self.links, target, anchor)
     }
 
     fn attachment(&self, sha16: &str, filename: &str) -> Option<String> {

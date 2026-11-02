@@ -51,8 +51,12 @@ use zam_store::{
 
 use super::insights::{entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
+use super::render::Viewer;
 use super::reports::ReportInput;
-use super::scope::{Mode, entry_scope, live_entry, space_scope};
+use super::scope::{
+    Mode, deny_report_mutation, entry_scope, live_entry, report_trash_allowed, space_scope,
+    trash_allowed,
+};
 use super::{json_body, query};
 use crate::app::AppState;
 use crate::attrib::attribution;
@@ -454,6 +458,19 @@ pub struct ListQuery {
     until: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
+    /// `only` — корзина (только `kind=report`, только владельцу решения в WebUI).
+    deleted: Option<String>,
+}
+
+/// `deleted` ленты: нет или пусто — живые записи, `only` — корзина; иное — 400.
+fn parse_deleted(raw: Option<&str>) -> Result<bool, ApiError> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(false),
+        Some("only") => Ok(true),
+        Some(v) => Err(ApiError::BadRequest(format!(
+            "deleted: неизвестное значение «{v}»; допустимо only"
+        ))),
+    }
 }
 
 /// `data_kind` ленты: пусто — без фильтра, иначе один из видов changelog или insight (400).
@@ -512,7 +529,10 @@ fn parse_time(raw: &str, what: &str) -> Result<Timestamp, ApiError> {
         .ok_or_else(|| ApiError::BadRequest(format!("{what}: RFC 3339 или YYYY-MM-DD")))
 }
 
-/// `GET /spaces/{space}/entries` → `{items, next_cursor}`.
+/// `GET /spaces/{space}/entries` → `{items, next_cursor}`. Без `kind` отчётов в ленте нет;
+/// `kind=report` — только сессиям WebUI (токену — 400, как неизвестный вид: отчёт агенту не
+/// виден, §7), у элементов — `first_image`; `deleted=only` — корзина отчётов
+/// ([`trash_allowed`], иначе 403).
 pub async fn list(
     State(st): State<AppState>,
     p: Principal,
@@ -523,11 +543,22 @@ pub async fn list(
     let q = query(q)?;
     let sc = space_scope(&st, &p, &headers, &space, Mode::Read).await?;
     let kind = match q.kind.as_deref() {
-        Some(k) => {
-            Some(EntryKind::parse(k).ok_or_else(|| ApiError::BadRequest(format!("kind: «{k}»")))?)
-        }
+        Some(k) => Some(
+            EntryKind::parse(k)
+                .filter(|k| p.is_human() || k.agent_visible())
+                .ok_or_else(|| ApiError::BadRequest(format!("kind: «{k}»")))?,
+        ),
         None => None,
     };
+    let deleted_only = parse_deleted(q.deleted.as_deref())?;
+    if deleted_only {
+        if kind != Some(EntryKind::Report) {
+            return Err(ApiError::BadRequest(
+                "deleted=only — только у ленты отчётов (kind=report)".into(),
+            ));
+        }
+        trash_allowed(&st, &p, sc.owner, sc.role)?;
+    }
     let f = EntryFilter {
         space_id: sc.space.id,
         kind,
@@ -549,9 +580,9 @@ pub async fn list(
             .transpose()?,
         cursor: q.cursor.filter(|c| !c.is_empty()),
         limit: q.limit.unwrap_or(LIST_DEFAULT),
-        // отчёты в ленте и корзина — задачи 3–4 M5.5
+        // без вида — журналы без отчётов (у отчётов свой журнал, `kind=report`)
         with_reports: false,
-        deleted_only: false,
+        deleted_only,
     };
     let (items, next) = list_entries(&sc.db, f).await?;
     // у insight — показы и оценки (столбец списка Insights WebUI, задача 13), одним запросом
@@ -571,18 +602,49 @@ pub async fn list(
         super::tasks::attach_task(&mut v, e);
         out.push(v);
     }
+    if kind == Some(EntryKind::Report) {
+        let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
+        super::reports::view::attach_first_images(&sc.db, &items, &mut out, viewer).await?;
+    }
     Ok(Json(json!({ "items": out, "next_cursor": next })))
 }
 
-/// `GET /entries/{id}` → `Entry` (у insight — с `triggers`).
+#[derive(Deserialize)]
+pub struct GetQuery {
+    /// `json` (по умолчанию) | `html` — страница отчёта ([`super::reports::view::get_html`]).
+    format: Option<String>,
+}
+
+/// `GET /entries/{id}[?format=json|html]` → `Entry` (у insight — с `triggers`); `format=html` —
+/// только у отчёта и только человеку: `{entry, html, toc, warnings, files}` (у прочих видов —
+/// 400, токену отчёт — 404).
 pub async fn get(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
     Path(id): Path<String>,
+    q: Result<Query<GetQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let q = query(q)?;
+    let html = match q.format.as_deref().map(str::trim) {
+        None | Some("" | "json") => false,
+        Some("html") => true,
+        Some(f) => {
+            return Err(ApiError::BadRequest(format!(
+                "format: «{f}»; допустимы json, html"
+            )));
+        }
+    };
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
+    if html {
+        // страница отчёта — только человеку: токену отчёт «не существует» (§7)
+        if sc.entry.kind == EntryKind::Report && !p.is_human() {
+            return Err(ApiError::NotFound);
+        }
+        let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
+        return super::reports::view::get_html(&st, &sc, viewer).await;
+    }
     let mut v = entry_json(&sc.db, &sc.entry).await?;
     // показы и оценки — из базы, где лежит запись (§10.5)
     let target = zam_core::TargetRef {
@@ -748,6 +810,8 @@ pub async fn patch(
 ) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live_entry(&sc)?;
+    // отчёт неизменен: любое поле — 409 раньше `If-Match` и разбора тела
+    deny_report_mutation(&p, &sc)?;
     let rev = Some(if_match(&headers)?);
     let req: Patch = json_body(body)?;
     for t in [&req.body, &req.append_body].into_iter().flatten() {
@@ -840,7 +904,8 @@ pub(crate) fn audit_details(space: zam_core::Id, kind: EntryKind) -> Value {
 }
 
 /// `DELETE /entries/{id}` с `If-Match: <rev>` — мягкое удаление → 204; без заголовка — 428,
-/// устаревшая ревизия — 409; аудит `entry.delete`.
+/// устаревшая ревизия — 409; аудит `entry.delete`. Отчёт — только владелец решения в WebUI
+/// ([`report_trash_allowed`], иначе 403).
 pub async fn remove(
     State(st): State<AppState>,
     p: Principal,
@@ -849,6 +914,7 @@ pub async fn remove(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
+    report_trash_allowed(&st, &p, &sc)?;
     live_entry(&sc)?;
     let rev = if_match(&headers)?;
     let attrib = attribution(&p, &headers, None)?;
@@ -868,7 +934,8 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /entries/{id}/restore` → 200 `Entry`; аудит `entry.restore`.
+/// `POST /entries/{id}/restore` → 200 `Entry`; аудит `entry.restore`. Отчёт — только владелец
+/// решения в WebUI ([`report_trash_allowed`], иначе 403).
 pub async fn restore(
     State(st): State<AppState>,
     p: Principal,
@@ -877,6 +944,7 @@ pub async fn restore(
     Path(id): Path<String>,
 ) -> Result<Json<Entry>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
+    report_trash_allowed(&st, &p, &sc)?;
     let rev = optional_if_match(&headers)?;
     let attrib = attribution(&p, &headers, None)?;
     let e = restore_entry(&sc.db, sc.entry.id, rev, &attrib).await?;

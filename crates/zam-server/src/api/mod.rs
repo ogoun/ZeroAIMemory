@@ -255,6 +255,11 @@ fn service_routes() -> Router<AppState> {
         )
         .route("/api/v1/render/highlight.css", get(render::highlight))
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
+        // файлы отчёта (M5.5): только пара этой записи, только сессиям WebUI
+        .route(
+            "/api/v1/entries/{id}/attachments/{sha256}/{filename}",
+            get(reports::view::attachment),
+        )
         .route("/api/v1/previews/{sha256}", get(previews::preview))
         .route("/api/v1/nodes/{id}/attachments", get(blobs::list))
         .route("/api/v1/search", post(search::search))

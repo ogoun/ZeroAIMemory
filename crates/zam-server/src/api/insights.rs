@@ -68,7 +68,9 @@ use super::glossary::{alias_warnings, attach_warnings};
 use super::graph::insight_links;
 use super::json_body;
 use super::nodes::audit_node;
-use super::scope::{EntryScope, MemScope, Mode, entry_scope, live_entry, space_scope};
+use super::scope::{
+    EntryScope, MemScope, Mode, deny_report_mutation, entry_scope, live_entry, space_scope,
+};
 use crate::app::AppState;
 use crate::attrib::attribution;
 use crate::auth::{Client, Principal};
@@ -883,9 +885,11 @@ pub async fn create(
     Ok((status, Json(v)))
 }
 
-/// Запись по id — живой insight или term (иначе 404 / 422).
-fn live_insight(sc: &EntryScope) -> Result<(), ApiError> {
+/// Запись по id — живой insight или term (иначе 404 / 422; отчёт — 409, токену 404:
+/// [`deny_report_mutation`]).
+fn live_insight(p: &Principal, sc: &EntryScope) -> Result<(), ApiError> {
     live_entry(sc)?;
+    deny_report_mutation(p, sc)?;
     if !matches!(sc.entry.kind, EntryKind::Insight | EntryKind::Term) {
         return Err(unprocessable("операция только для insight и term"));
     }
@@ -904,7 +908,7 @@ pub async fn supersede(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
-    live_insight(&sc)?;
+    live_insight(&p, &sc)?;
     let rev = optional_if_match(&headers)?;
     let mut req: InsightReq = json_body(body)?;
     if req.scope.is_some() || req.supersedes_id.is_some() {
@@ -995,7 +999,7 @@ pub async fn retract(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
-    live_insight(&sc)?;
+    live_insight(&p, &sc)?;
     let rev = optional_if_match(&headers)?;
     let req: RetractReq = json_body(body)?;
     let reason = req.reason.unwrap_or_default();

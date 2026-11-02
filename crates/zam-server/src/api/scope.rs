@@ -25,15 +25,20 @@
 //! - запись в `Rules` по токену при `rules.agent_write = false` → 403;
 //! - участник: доступ только при одобренном запросе (`pending`/`rejected`/`revoked` → 403
 //!   `/problems/solution-access`), запись — при режиме участника `rw` и токене `rw`;
-//! - администратор может всё.
+//! - администратор может всё;
+//! - отчёт (M5.5 §4): изменяющий маршрут — 409 `/problems/report-immutable` сессии WebUI и 404
+//!   токену ([`deny_report_mutation`]); удаление и восстановление — только владелец решения в
+//!   своей сессии WebUI, остальным (в том числе администратору от имени другого и любому токену)
+//!   403 ([`report_trash_allowed`]).
 //!
 //! Настройка `rules.agent_write` и роль в решении читаются из `system.db` на каждом запросе
 //! (решения о доступе не кэшируются): отзыв действует со следующего запроса.
 use axum::http::HeaderMap;
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Access, Db, EdgeView, Entry, Node, SolutionInfo, SolutionRole, Space, SpaceKind, StoreError,
-    User, get_edge, get_entry, get_node, get_solution, get_space, list_spaces, space_of_kind,
+    Access, Db, EdgeView, Entry, EntryKind, Node, SolutionInfo, SolutionRole, Space, SpaceKind,
+    StoreError, User, get_edge, get_entry, get_node, get_solution, get_space, list_spaces,
+    space_of_kind,
 };
 
 use crate::app::AppState;
@@ -787,6 +792,52 @@ pub fn live_entry(s: &EntryScope) -> Result<(), ApiError> {
         Some(_) => Err(ApiError::NotFound),
         None => Ok(()),
     }
+}
+
+/// Текст 403 удаления и восстановления отчёта не владельцем (ответ владельца 11).
+pub const REPORT_TRASH_OWNER_ONLY: &str =
+    "удалять и восстанавливать отчёт может только владелец решения в WebUI";
+
+/// Изменяющий маршрут записи (M5.5 §4): у отчёта допустимой правки нет — сессии WebUI 409
+/// `/problems/report-immutable` (раньше `If-Match`, тела и вида операции); токену — 404, как
+/// у несуществующей записи (отчёт агенту не виден, §7: 409 раскрыл бы существование).
+pub fn deny_report_mutation(p: &Principal, sc: &EntryScope) -> Result<(), ApiError> {
+    if sc.entry.kind != EntryKind::Report {
+        return Ok(());
+    }
+    if p.is_human() {
+        Err(ApiError::ReportImmutable)
+    } else {
+        Err(ApiError::NotFound)
+    }
+}
+
+/// Корзина отчётов области (`owner`, `role`) — только владельцу решения в его сессии WebUI:
+/// пользователь в своей базе (`Role::Owner`) или администратор в своей (`owner` — он сам).
+/// Участник `rw`/`ro`, администратор от имени другого и любой токен — 403
+/// [`REPORT_TRASH_OWNER_ONLY`] (спецификация §4, §12 п. 5).
+pub fn trash_allowed(st: &AppState, p: &Principal, owner: Id, role: Role) -> Result<(), ApiError> {
+    let own = match p {
+        Principal::User { user_id, .. } => owner == *user_id && role == Role::Owner,
+        Principal::Admin { .. } => {
+            owner == st.admin_id && matches!(role, Role::Owner | Role::Admin)
+        }
+        Principal::Token(_) => false,
+    };
+    if own {
+        Ok(())
+    } else {
+        Err(ApiError::Denied(REPORT_TRASH_OWNER_ONLY.into()))
+    }
+}
+
+/// `DELETE /entries/{id}` и `POST …/restore`: у отчёта — [`trash_allowed`], у прочих записей —
+/// общие права записи (уже проверены [`entry_scope`]).
+pub fn report_trash_allowed(st: &AppState, p: &Principal, sc: &EntryScope) -> Result<(), ApiError> {
+    if sc.entry.kind != EntryKind::Report {
+        return Ok(());
+    }
+    trash_allowed(st, p, sc.owner, sc.role)
 }
 
 /// Живой узел (удалённый → 404).
