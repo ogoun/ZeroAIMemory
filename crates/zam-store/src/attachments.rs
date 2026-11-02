@@ -83,17 +83,22 @@ pub async fn has_attachment_chunks(db: &Db, spaces: Vec<Id>) -> Result<bool, Sto
         .await
 }
 
-/// [`has_attachment_chunks`]: `?1` — JSON-массив id пространств. Обход — от живых заметок
-/// области (`nodes_live_path`) к их документам и первому чанку: прежний обход всех чанков
-/// вложений базы (`chunks_attachment`) в области без вложений стоил 48 мс на 100 тыс. и 0,9 с на
-/// 1 млн чанков на каждый поиск (замер `attachment_queries_scale`, задача 10 M5).
+/// [`has_attachment_chunks`]: `?1` — JSON-массив id пространств. Сначала — есть ли в базе хоть
+/// один чанк вложения (первая запись частичного индекса `chunks_attachment`, O(1)): база без
+/// вложений отвечает сразу. Иначе — обход от живых заметок области (`nodes_live_path`) к их
+/// документам и первому чанку. Прежний обход всех чанков вложений базы в области без вложений
+/// стоил 48 мс на 100 тыс. и 0,9 с на 1 млн чанков на поиск; обход заметок линеен по области:
+/// 43 мс на 100 тыс. заметок без вложений, если вложения есть в другой области (компромисс,
+/// замер `attachment_queries_scale`, задача 10 M5).
 pub(crate) const HAS_ATTACHMENT_CHUNKS_SQL: &str =
-    "SELECT EXISTS (SELECT 1 FROM nodes n INDEXED BY nodes_live_path
+    "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM chunks INDEXED BY chunks_attachment
+                                  WHERE attachment_id IS NOT NULL) THEN 0
+     ELSE EXISTS (SELECT 1 FROM nodes n INDEXED BY nodes_live_path
      CROSS JOIN attachment_docs ad ON ad.node_id = n.id
      WHERE n.space_id IN (SELECT value FROM json_each(?1)) AND n.deleted_at IS NULL
        AND ad.deleted_at IS NULL
        AND EXISTS (SELECT 1 FROM chunks c INDEXED BY chunks_attachment
-                   WHERE c.attachment_id = ad.id))";
+                   WHERE c.attachment_id = ad.id)) END";
 
 /// Узел-владелец фрагмента вложения `chunk_id` живого документа (`attachment_docs.deleted_at IS
 /// NULL`) живой заметки; `space` — только в этом пространстве (участник общего решения видит

@@ -1578,6 +1578,29 @@ mod tests {
             "{plan}"
         );
         assert!(!plan.contains("SCAN c"), "{plan}");
+        // предварительная проверка: база без чанков вложений — 0 без обхода заметок
+        assert!(
+            plan.contains("SEARCH chunks USING COVERING INDEX chunks_attachment (attachment_id>?)"),
+            "{plan}"
+        );
+        c.execute_batch(
+            "INSERT INTO spaces (id, kind, name, created_at) VALUES ('x', 'knowledge', 'x', 't');
+             INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at, updated_at)
+               VALUES ('n1', 'x', 'note', 'n', 'n', 'indexed', 't', 't');",
+        )
+        .unwrap();
+        let has = |c: &Connection| -> i64 { c.query_row(sql, ["[\"x\"]"], |r| r.get(0)).unwrap() };
+        assert_eq!(has(&c), 0);
+        c.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO attachment_docs (id, node_id, blob_sha256, filename, extract_state, created_at)
+               VALUES ('d1', 'n1', 'b', 'f.pdf', 'done', 't');
+             INSERT INTO chunks (id, node_id, rev, level, ordinal, text, context_prefix, token_count,
+                                 text_hash, attachment_id, locator)
+               VALUES ('c1', 'n1', 1, 'attachment', 0, 'x', '', 1, 'h', 'd1', 'page:1');",
+        )
+        .unwrap();
+        assert_eq!(has(&c), 1);
     }
 
     /// Замер задачи 10 M5 (журнал этапа): `pending_count` и проверка «есть ли чанки вложений в
@@ -1647,6 +1670,38 @@ mod tests {
                 time(has, &[&cc]),
             );
         }
+        // база без вложений вовсе (частый случай): 100 тыс. заметок одной области
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        let t = "2026-11-02T00:00:00.000000Z";
+        c.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO spaces (id, kind, name, created_at) VALUES ('A', 'knowledge', 'A', '{t}');
+             WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 100000)
+             INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at, updated_at)
+               SELECT 'n' || i, 'A', 'note', 'n' || i, 'p/n' || i, 'indexed', '{t}', '{t}' FROM s;"
+        ))
+        .unwrap();
+        let mut ms: Vec<f64> = (0..9)
+            .map(|_| {
+                let t0 = Instant::now();
+                let _: i64 = c
+                    .query_row(
+                        crate::attachments::HAS_ATTACHMENT_CHUNKS_SQL,
+                        ["[\"A\"]"],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        println!(
+            "без вложений, 100 тыс. заметок: has_attachment_chunks {:.3} мс",
+            ms[4]
+        );
     }
 
     #[test]
