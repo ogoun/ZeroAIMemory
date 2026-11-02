@@ -374,6 +374,25 @@ fn cli_report_rejects_dotdot_absolute_backslash_symlink_outside() {
     } else {
         eprintln!("символическая ссылка не создана — случай пропущен");
     }
+    // junction-каталог наружу (Windows, без прав администратора) — тот же отказ
+    #[cfg(windows)]
+    {
+        put(&root, "outdir/x.png", &png(3, 32));
+        let j = d.join("figs").join("jdir");
+        let st = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&j)
+            .arg(root.join("outdir"))
+            .output()
+            .unwrap();
+        assert!(
+            st.status.success(),
+            "{}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        assert!(j.join("x.png").is_file(), "junction не работает");
+        cases.push("![a](figs/jdir/x.png)".to_string());
+    }
     for c in &cases {
         put(
             &d,

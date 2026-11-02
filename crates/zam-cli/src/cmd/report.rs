@@ -36,6 +36,9 @@ pub const MAX_FILES: usize = 64;
 pub const MAX_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
 /// Символы, запрещённые в пути файла (как у сервера; `\` и управляющие — отдельно).
 const PATH_FORBIDDEN: [char; 7] = ['"', ':', '*', '?', '<', '>', '|'];
+/// Пределы пути узла сервера (`zam_store::paths`): путь и сегмент (имя файла), байт.
+const PATH_MAX_BYTES: usize = 1024;
+const SEGMENT_MAX_BYTES: usize = 255;
 
 /// Аргументы `zam report`.
 pub struct ReportArgs<'a> {
@@ -267,8 +270,8 @@ impl Read for Concat {
     }
 }
 
-/// Файл ровно `len` байт, открывается при первом чтении; файл стал короче — ошибка (иначе
-/// тело не совпало бы с `Content-Length`).
+/// Файл ровно `len` байт, открывается при первом чтении; файл стал короче или длиннее — ошибка
+/// (иначе тело не совпало бы с `Content-Length` или ушёл бы обрезанный файл).
 struct LazyFile {
     path: PathBuf,
     left: u64,
@@ -301,6 +304,22 @@ impl Read for LazyFile {
             )));
         }
         self.left -= n as u64;
+        if self.left == 0 {
+            // заявленная длина отдана: в файле больше быть не должно
+            let mut probe = [0u8; 1];
+            let rest = self
+                .file
+                .as_mut()
+                .expect("открыт")
+                .get_mut()
+                .read(&mut probe)?;
+            if rest > 0 {
+                return Err(std::io::Error::other(format!(
+                    "{}: файл вырос во время отправки",
+                    self.path.display()
+                )));
+            }
+        }
         Ok(n)
     }
 }
@@ -347,10 +366,24 @@ fn local_name(link: &str) -> Result<Option<String>, CliError> {
     {
         return Err(bad(&format!("символ {c:?} в пути не допускается")));
     }
+    if name.ends_with('/') {
+        return Err(bad(
+            "ссылка на каталог — в отчёт прикладываются только файлы",
+        ));
+    }
+    // правила пути узла и имени файла сервера (`NodePath::parse`, `check_filename`)
+    if name.len() > PATH_MAX_BYTES {
+        return Err(bad(&format!("путь длиннее {PATH_MAX_BYTES} байт")));
+    }
     for seg in name.split('/') {
         match seg {
             ".." => return Err(bad("«..» в пути — файл отчёта только внутри его каталога")),
             "" | "." => return Err(bad("пустой сегмент или «.» в пути")),
+            s if s.len() > SEGMENT_MAX_BYTES => {
+                return Err(bad(&format!(
+                    "имя файла или каталога длиннее {SEGMENT_MAX_BYTES} байт"
+                )));
+            }
             _ => {}
         }
     }
@@ -1105,9 +1138,44 @@ mod tests {
             "a%ZZ.png",
             "a//b.png",
             "_attachments/0123456789abcdef/x.png",
+            "src/",
         ] {
             assert!(local_name(bad).is_err(), "{bad}");
         }
+        let e = local_name("src/").unwrap_err();
+        assert!(e.msg.contains("каталог"), "{}", e.msg);
+        // пределы пути узла сервера: сегмент 255 байт, путь 1024
+        let long = format!("figs/{}.png", "я".repeat(130));
+        assert!(local_name(&long).is_err());
+        let deep = format!("{}a.png", "abcdefghi/".repeat(103));
+        assert!(local_name(&deep).is_err());
+        assert!(
+            local_name(&format!("{}.png", "a".repeat(251)))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Файл изменился между `stat` и отправкой: короче или длиннее — ошибка чтения тела.
+    #[test]
+    fn lazy_file_detects_size_change() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp/cli-report-lazy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.bin");
+        std::fs::write(&f, b"0123456789").unwrap();
+        let mut out = Vec::new();
+        LazyFile::new(f.clone(), 10).read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"0123456789");
+        let e = LazyFile::new(f.clone(), 8)
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
+        assert!(e.to_string().contains("вырос"), "{e}");
+        let e = LazyFile::new(f, 12)
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
+        assert!(e.to_string().contains("короче"), "{e}");
     }
 
     #[test]

@@ -420,14 +420,14 @@ impl Fail {
 type Res = Result<Done, Fail>;
 
 /// Вызов инструмента: ответ или ошибка как результат с `~N tok` в конце.
-pub async fn call(tool: ToolName, rest: &Rest, args: JsonObject) -> Output {
+pub async fn call(tool: ToolName, rest: &Rest, mut args: JsonObject) -> Output {
     let r = match tool {
         ToolName::Search => search(rest, &args).await,
         ToolName::Read => read(rest, &args).await,
         ToolName::CachePut => cache_put(rest, &args).await,
         ToolName::Tree => tree(rest, &args).await,
         ToolName::Write => write(rest, &args).await,
-        ToolName::Log => log(rest, &args).await,
+        ToolName::Log => log(rest, &mut args).await,
         ToolName::UpdateEntry => update_entry(rest, &args).await,
         ToolName::Link => link(rest, &args).await,
         ToolName::Recall => recall(rest, &args).await,
@@ -986,7 +986,7 @@ fn entry_line(e: &Value) -> String {
     s
 }
 
-async fn log(rest: &Rest, args: &JsonObject) -> Res {
+async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
     let f = fmt(args)?;
     let kind = req_str(args, "kind")?;
     if zam_store::EntryKind::parse(kind).is_none() {
@@ -999,7 +999,7 @@ async fn log(rest: &Rest, args: &JsonObject) -> Res {
     let space = opt_str(args, "space")?
         .map(str::to_string)
         .unwrap_or_else(|| default_space(rest));
-    let mut keys = vec![
+    let keys = [
         "kind",
         "title",
         "body",
@@ -1016,11 +1016,14 @@ async fn log(rest: &Rest, args: &JsonObject) -> Res {
         "force",
         "supersedes_id",
     ];
+    let mut body = pick(args, &keys);
     if report {
-        // у отчёта прочие поля REST отклонит 400 (неизвестное поле) — агент увидит причину
-        keys.push("images");
+        // у отчёта прочие поля REST отклонит 400 (неизвестное поле) — агент увидит причину;
+        // `images` (base64 до `reports.mcp_max_bytes`) переносится без копии
+        if let Some(images) = args.remove("images").filter(|v| !v.is_null()) {
+            body.insert("images".into(), images);
+        }
     }
-    let body = pick(args, &keys);
     let extra: Vec<(HeaderName, String)> = opt_str(args, "idempotency_key")?
         .map(|k| (HeaderName::from_static("idempotency-key"), k.to_string()))
         .into_iter()

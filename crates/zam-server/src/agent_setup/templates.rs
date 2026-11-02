@@ -23,7 +23,7 @@ ZeroAIMemoryUrl={url}
 - Перед задачей — `memory_search` (исследование — `insight_kinds=[experiment,failure]`) → `[cache]` или `memory_read` пачкой → сводку в `memory_cache_put`.
 - `memory_log <kind>` пишет, `memory_update_entry` с `rev` правит (409 — перечитай).
 - Ловушка, сбой → `insight` gotcha|failure с триггерами (не про проект — scope=global); изменение → `changelog`; устарело → supersede/retract.
-- Итог исследования, эксперимента — пользователю: `zam report <файл.md>` (неизменяем).
+- Итог исследования, эксперимента, сравнения — пользователю `zam report`, себе — `insight`.
 - Задача → `task`: claim перед работой, `status` с `next_step`.
 - Вопрос человеку → `question`; его ответ в чате → `answer`.
 - Код — с `refs.files`; новое понятие → `term`, пиши каноническими терминами.
@@ -42,7 +42,7 @@ No MCP — `zam`; protocol — `zam guide`.
 - Before a task — `memory_search` (research — `insight_kinds=[experiment,failure]`) → `[cache]` or `memory_read` in one call → summary into `memory_cache_put`.
 - `memory_log <kind>` writes, `memory_update_entry` with `rev` edits (409 — reread).
 - Gotcha, failure → `insight` gotcha|failure with triggers (not about the project — scope=global); change → `changelog`; outdated → supersede/retract.
-- Outcome of research, an experiment, a comparison — for the user: `zam report <file.md>` (immutable).
+- Outcome of research, an experiment, a comparison — for the user `zam report <file.md>`, for yourself — `insight`.
 - Task → `task`: claim before work, `status` with `next_step`.
 - Question for the human → `question`; their answer in chat → `answer`.
 - Code — with `refs.files`; new concept → `term`, write with canonical terms.

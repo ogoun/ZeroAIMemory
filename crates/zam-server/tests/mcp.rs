@@ -1728,3 +1728,59 @@ async fn inner_call_without_outer_permit_takes_permit() {
     let r = a.send(req(false)).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
 }
+
+/// Ревью задачи 5, I1: rmcp выполняет инструмент в своей задаче — обрыв клиента после чтения
+/// большого тела уничтожает слой `limit_mcp`, но разрешение держит вызов инструмента: оно
+/// освобождается не раньше, чем инструмент закончил (отчёт после освобождения не появляется).
+#[tokio::test]
+async fn mcp_aborted_big_request_keeps_permit_until_tool_done() {
+    use tower::ServiceExt as _;
+    let a = api("mcp-report-abort", |c| c.limits.note_max_bytes = 1000).await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "memory_log",
+                                 "arguments": report_args("Оборванный", &png(5, 3 * 1024 * 1024))}})
+    .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::HOST, "memory.lan:7700")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::AUTHORIZATION, format!("Bearer {}", a.token))
+        .header("x-zam-solution", G)
+        .body(Body::from(body))
+        .unwrap();
+    let app = a.app.clone();
+    let h = tokio::spawn(async move { app.oneshot(req).await });
+    // тело прочитано за порог — разрешение занято
+    let t0 = std::time::Instant::now();
+    while a.st.big_bodies.available() == 2 {
+        if report_count(&a).await > 0 {
+            eprintln!("обработка закончилась раньше обрыва — проверка не состоялась");
+            return;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(60),
+            "разрешение не занято"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    h.abort();
+    // разрешение вернулось — инструмент закончил: позже отчёт появиться не может
+    let t0 = std::time::Instant::now();
+    while a.st.big_bodies.available() < 2 {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(60),
+            "разрешение не вернулось"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let at_release = report_count(&a).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        report_count(&a).await,
+        at_release,
+        "инструмент записал отчёт после освобождения разрешения"
+    );
+}

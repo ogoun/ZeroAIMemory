@@ -113,9 +113,9 @@ async fn agent_setup_block_v4_under_500_tokens_ru_en() {
                     assert!(block.contains(shown.as_str()), "{block}");
                     // строка v4 (M5.5): итог для пользователя — отчёт, выводы для себя — insight
                     let report = if lang == "ru" {
-                        "пользователю: `zam report <файл.md>`"
+                        "сравнения — пользователю `zam report`, себе — `insight`."
                     } else {
-                        "for the user: `zam report <file.md>`"
+                        "a comparison — for the user `zam report <file.md>`, for yourself — `insight`."
                     };
                     assert!(block.contains(report), "{block}");
                     assert_eq!(
@@ -864,6 +864,7 @@ async fn guide_has_reports_section() {
         "исследования, эксперимента, обучения",
         "`zam report <файл.md>",
         "![кривая](figs/loss.png)",
+        "ссылка на каталог",
         "до 64 файлов, всего до 200 МиБ",
         "base64",
         "16 МиБ",
@@ -884,6 +885,7 @@ async fn guide_has_reports_section() {
         "research, an experiment, model training",
         "`zam report <file.md>",
         "up to 64 files, 200 MiB in total",
+        "a link to a directory",
         "base64",
         "16 MiB",
         "Immutable",

@@ -54,9 +54,11 @@ pub struct InnerCall {
     pub outer_permit: bool,
 }
 
-/// Метка запроса `/mcp`, тело которого заняло разрешение (ставит [`limit_mcp`]).
-#[derive(Debug, Clone, Copy)]
-pub struct OuterPermit;
+/// Разрешение тела запроса `/mcp` (ставит [`limit_mcp`]): обработчик инструмента держит копию
+/// `Arc` до конца вызова — разрешение живо, пока жив хоть один владелец (обрыв клиента не
+/// освобождает его раньше внутреннего вызова REST).
+#[derive(Debug, Clone)]
+pub struct OuterPermit(pub Arc<OwnedSemaphorePermit>);
 
 /// Семафор больших тел, порог «большого» тела (байт) и срок чтения.
 #[derive(Clone)]
@@ -194,8 +196,11 @@ pub async fn limit_mcp(State(st): State<AppState>, req: Request, next: Next) -> 
         }
         Err(e) => return e.into_response(),
     };
-    if permit.is_some() {
-        parts.extensions.insert(OuterPermit);
+    // разрешение — общее с обработчиком: rmcp выполняет инструмент в своей задаче, и при обрыве
+    // клиента этот future уничтожается раньше, чем инструмент закончит (ревью задачи 5, I1)
+    let permit = permit.map(Arc::new);
+    if let Some(p) = &permit {
+        parts.extensions.insert(OuterPermit(p.clone()));
     }
     let resp = next
         .run(Request::from_parts(parts, Body::from(bytes)))
