@@ -110,7 +110,9 @@ fn stored_pairs(c: &Connection, entry: Id) -> Result<BTreeSet<(String, String)>,
 /// ничего не записано. Повтор `idempotency_key` возвращает ту же запись и `false`, если
 /// совпали отпечаток [`create_entry`](super::create_entry) и набор пар (имя, sha256) — иначе
 /// `IdempotencyMismatch`. Не `report`, пространство не решения, `links` не пусто, `refs`
-/// задан, триггеры, статус или `certainty`, неверный sha256, имя или MIME файла → `BadInput`;
+/// задан, триггеры, статус или `certainty`, неверный sha256, имя или MIME файла, размер,
+/// не совпавший с уже записанным блобом, → `BadInput`; `created_at` записи и её файлов — одно
+/// время (так триггер 0022 `entry_attachments_report_only` пропускает только их);
 /// нет пространства → `NotFound`. Ссылки тела на файлы проверяет сервер.
 pub async fn create_report(
     db: &Db,
@@ -161,6 +163,16 @@ pub async fn create_report(
                  VALUES (?1, ?2, ?3, 0, ?4) ON CONFLICT (sha256) DO NOTHING",
             )?
             .execute(params![f.sha256, size, f.mime, now])?;
+            // блоб уже был: размер по sha256 обязан совпасть (иначе файл описан неверно)
+            let stored: i64 = tx
+                .prepare_cached("SELECT size FROM blobs WHERE sha256 = ?1")?
+                .query_row([&f.sha256], |r| r.get(0))?;
+            if stored != size {
+                return Err(bad(format!(
+                    "файл «{}»: размер {size} не совпадает с размером блоба {stored}",
+                    f.filename
+                )));
+            }
             tx.prepare_cached(
                 "INSERT INTO entry_attachments (entry_id, blob_sha256, filename, mime, size,
                                                 created_at)

@@ -411,16 +411,16 @@ async fn migration_0022_keeps_entries_and_indexes() {
     assert_eq!(superseded, 1);
 }
 
-/// CHECK 0022: у report нет статуса, `certainty` и замещения.
+/// CHECK 0022: у report нет статуса, `certainty` и замещения, `index_state` — только `excluded`.
 #[tokio::test]
 async fn report_kind_check_status_certainty_null() {
     let (db, space) = setup("check").await;
     let insert = |cols: &str, vals: &str| {
         format!(
             "INSERT INTO entries (id, space_id, kind, title, title_norm, author_kind, created_at,
-                                  updated_at{cols})
+                                  updated_at, index_state{cols})
              VALUES ('{}', '{space}', 'report', 't', 't', 'agent', '2026-11-01T00:00:00Z',
-                     '2026-11-01T00:00:00Z'{vals})",
+                     '2026-11-01T00:00:00Z', 'excluded'{vals})",
             Id::new()
         )
     };
@@ -441,6 +441,15 @@ async fn report_kind_check_status_certainty_null() {
         .await
     ));
     exec(&db, insert("", "")).await.unwrap();
+    // умолчание `index_state = pending` у отчёта не проходит
+    let pending = format!(
+        "INSERT INTO entries (id, space_id, kind, title, title_norm, author_kind, created_at,
+                              updated_at)
+         VALUES ('{}', '{space}', 'report', 't', 't', 'agent', '2026-11-01T00:00:00Z',
+                 '2026-11-01T00:00:00Z')",
+        Id::new()
+    );
+    assert!(check_failed(exec(&db, pending).await));
     // у прочих видов правило статуса прежнее
     let task = format!(
         "INSERT INTO entries (id, space_id, kind, title, title_norm, author_kind, created_at,
@@ -608,18 +617,6 @@ async fn report_never_enqueued_on_rechunk_or_reindex() {
         .await
         .unwrap();
     for pass in 0..2 {
-        if pass == 1 {
-            // даже с `pending` (прямой правкой) отчёт не индексируется векторами
-            exec(
-                &db,
-                format!(
-                    "UPDATE entries SET index_state = 'pending' WHERE id = '{}'",
-                    e.id
-                ),
-            )
-            .await
-            .unwrap();
-        }
         enqueue_reindex(&db, None).await.unwrap();
         assert_eq!(entry_jobs(&db, e.id).await, 0, "проход {pass}");
         assert!(entry_jobs(&db, c.id).await > 0);
@@ -629,7 +626,20 @@ async fn report_never_enqueued_on_rechunk_or_reindex() {
         assert_eq!(enqueue_entry_upserts(&db, vec![e.id]).await.unwrap(), 0);
         assert_eq!(entry_jobs(&db, e.id).await, 0);
         assert!(entry_chunks(&db, e.id).await > 0, "FTS-чанки остаются");
+        assert_eq!(
+            get_entry(&db, e.id).await.unwrap().index_state,
+            IndexState::Excluded
+        );
     }
+    // корзина и восстановление состояние индекса не меняют
+    delete_entry(&db, e.id, None, &human()).await.unwrap();
+    restore_entry(&db, e.id, None, &human()).await.unwrap();
+    enqueue_reindex(&db, None).await.unwrap();
+    assert_eq!(
+        get_entry(&db, e.id).await.unwrap().index_state,
+        IndexState::Excluded
+    );
+    assert_eq!(entry_jobs(&db, e.id).await, 0);
 }
 
 #[tokio::test]
@@ -787,12 +797,20 @@ async fn sql_update_report_content_aborts() {
         let r = exec(&db, format!("UPDATE entries SET {set} WHERE id = '{id}'")).await;
         assert!(immutable_sql(r), "{set}");
     }
-    // корзина, время и состояние индекса меняются
+    // отчёт не векторизуется: CHECK держит `excluded`
+    for st in ["pending", "indexed", "failed"] {
+        let r = exec(
+            &db,
+            format!("UPDATE entries SET index_state = '{st}' WHERE id = '{id}'"),
+        )
+        .await;
+        assert!(check_failed(r), "{st}");
+    }
+    // корзина и время меняются
     for set in [
         "deleted_at = '2026-11-02T00:00:00Z'",
         "deleted_at = NULL",
         "updated_at = '2026-11-02T00:00:00Z'",
-        "index_state = 'pending'",
         "index_state = 'excluded'",
     ] {
         let n = exec(&db, format!("UPDATE entries SET {set} WHERE id = '{id}'"))
@@ -811,6 +829,40 @@ async fn sql_update_report_content_aborts() {
     .await
     .unwrap();
     assert_eq!(get_entry(&db, id).await.unwrap().body, e.body);
+    // другая запись правкой отчётом не становится
+    let r = exec(
+        &db,
+        format!(
+            "UPDATE entries SET kind = 'report', status = NULL, index_state = 'excluded'
+             WHERE id = '{}'",
+            c.id
+        ),
+    )
+    .await;
+    assert!(immutable_sql(r), "changelog → report");
+    let (i, _) = create_entry(
+        &db,
+        NewEntry {
+            kind: EntryKind::Insight,
+            data: json!({"kind": "gotcha"}),
+            ..changelog(space, "Инсайт")
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let r = exec(
+        &db,
+        format!(
+            "UPDATE entries SET kind = 'report', status = NULL, certainty = NULL,
+                                index_state = 'excluded'
+             WHERE id = '{}'",
+            i.id
+        ),
+    )
+    .await;
+    assert!(immutable_sql(r), "insight → report");
+    assert_eq!(get_entry(&db, i.id).await.unwrap().kind, EntryKind::Insight);
 }
 
 #[tokio::test]
@@ -851,6 +903,57 @@ async fn entry_attachments_append_only() {
     .await;
     assert!(immutable_sql(r));
     assert_eq!(entry_attachments(&db, e.id).await.unwrap().len(), 3);
+    // файлы пишутся только вместе с отчётом: позже (другое `created_at`) и к другой записи — отказ
+    let add = |id: Id, at: &str| {
+        format!(
+            "INSERT INTO entry_attachments (entry_id, blob_sha256, filename, mime, size,
+                                            created_at)
+             VALUES ('{id}', '{}', 'late.png', 'image/png', 101, '{at}')",
+            sha(1)
+        )
+    };
+    let r = exec(&db, add(e.id, "2099-01-01T00:00:00Z")).await;
+    assert!(immutable_sql(r), "позже создания");
+    let (i, _) = create_entry(
+        &db,
+        NewEntry {
+            kind: EntryKind::Insight,
+            data: json!({"kind": "gotcha"}),
+            ..changelog(space, "Инсайт")
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let r = exec(&db, add(i.id, &zam_store::time::fmt_ts(i.created_at))).await;
+    assert!(immutable_sql(r), "к insight");
+    assert_eq!(entry_attachments(&db, e.id).await.unwrap().len(), 3);
+    assert_eq!(refcount(&db, 1).await, Some(1));
+}
+
+#[tokio::test]
+async fn create_report_blob_size_mismatch_rejected() {
+    let (db, space) = setup("size").await;
+    make_report(&db, space, "Отчёт").await;
+    let mut f = file(1, "loss.png", "image/png");
+    f.size += 1;
+    let files = vec![f];
+    let r = create_report(
+        &db,
+        report(space, "Другой", body_of(&files)),
+        files,
+        &agent(),
+    )
+    .await;
+    assert!(
+        matches!(&r, Err(StoreError::BadInput(m)) if m.contains("размер")),
+        "{r:?}"
+    );
+    assert_eq!(refcount(&db, 1).await, Some(1));
+    assert_eq!(
+        count_sql(&db, "SELECT count(*) FROM entries", None).await,
+        1
+    );
 }
 
 #[tokio::test]

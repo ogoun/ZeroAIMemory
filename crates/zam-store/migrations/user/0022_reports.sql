@@ -50,7 +50,9 @@ CREATE TABLE entries_new (
         OR (kind = 'question' AND status IN ('open', 'answered', 'obsolete'))),
     -- отчёт не имеет эпистемического статуса, не замещается и не отзывается
     CHECK (kind <> 'report' OR (certainty IS NULL AND supersedes_id IS NULL
-                                AND superseded_by_id IS NULL AND retract_reason IS NULL))
+                                AND superseded_by_id IS NULL AND retract_reason IS NULL)),
+    -- отчёт не векторизуется: только FTS (спецификация M5.5 §7)
+    CHECK (kind <> 'report' OR index_state = 'excluded')
 );
 INSERT INTO entries_new (
     id, space_id, kind, title, title_norm, body, data, tags, area, status, certainty,
@@ -87,9 +89,10 @@ CREATE INDEX entry_attachments_blob ON entry_attachments (blob_sha256);
 
 -- ---------- неизменность отчёта ----------
 -- Содержимое, атрибуция и ревизия отчёта не меняются; разрешены только корзина
--- (`deleted_at`), `updated_at` и состояние индекса (`index_state`).
+-- (`deleted_at`), `updated_at` и состояние индекса (`index_state`, CHECK держит `excluded`).
+-- Другая запись правкой отчётом не становится.
 CREATE TRIGGER entries_report_immutable BEFORE UPDATE ON entries
-WHEN OLD.kind = 'report' AND (
+WHEN (NEW.kind = 'report' AND OLD.kind <> 'report') OR (OLD.kind = 'report' AND (
        NEW.id IS NOT OLD.id OR NEW.space_id IS NOT OLD.space_id OR NEW.kind IS NOT OLD.kind
     OR NEW.title IS NOT OLD.title OR NEW.title_norm IS NOT OLD.title_norm
     OR NEW.body IS NOT OLD.body OR NEW.data IS NOT OLD.data OR NEW.tags IS NOT OLD.tags
@@ -100,7 +103,7 @@ WHEN OLD.kind = 'report' AND (
     OR NEW.idempotency_key IS NOT OLD.idempotency_key OR NEW.current_rev IS NOT OLD.current_rev
     OR NEW.author_kind IS NOT OLD.author_kind OR NEW.user_id IS NOT OLD.user_id
     OR NEW.token_id IS NOT OLD.token_id OR NEW.session_id IS NOT OLD.session_id
-    OR NEW.machine IS NOT OLD.machine OR NEW.created_at IS NOT OLD.created_at)
+    OR NEW.machine IS NOT OLD.machine OR NEW.created_at IS NOT OLD.created_at))
 BEGIN
     SELECT RAISE(ABORT, 'report-immutable');
 END;
@@ -110,6 +113,15 @@ CREATE TRIGGER entry_revisions_report_once BEFORE INSERT ON entry_revisions
 WHEN NEW.rev > 1 AND EXISTS (SELECT 1 FROM entries WHERE id = NEW.entry_id AND kind = 'report')
 BEGIN
     SELECT RAISE(ABORT, 'report-immutable');
+END;
+
+-- файлы пишутся только в транзакции создания отчёта: `created_at` пары равен `created_at`
+-- отчёта (`create_report` пишет одно и то же время); к другим записям и позже — отказ
+CREATE TRIGGER entry_attachments_report_only BEFORE INSERT ON entry_attachments
+WHEN NOT EXISTS (SELECT 1 FROM entries
+                 WHERE id = NEW.entry_id AND kind = 'report' AND created_at = NEW.created_at)
+BEGIN
+    SELECT RAISE(ABORT, 'report-immutable: files are written only with the report');
 END;
 
 CREATE TRIGGER entry_attachments_no_update BEFORE UPDATE ON entry_attachments BEGIN
