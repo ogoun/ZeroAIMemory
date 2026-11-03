@@ -183,6 +183,10 @@ async fn ro_token_and_member_read_map_403_sync() {
         )
         .await;
         ok(&r, StatusCode::OK, &format!("{ctx}: влияние — чтение"));
+        let uri = format!("/api/v1/code/files?solution={G}");
+        let r = call(&w, &who, Method::GET, &uri, None).await;
+        ok(&r, StatusCode::OK, &format!("{ctx}: таблица файлов"));
+        assert_eq!(r.json()["total"], 1);
         let r = call(
             &w,
             &who,
@@ -300,6 +304,13 @@ async fn knowledge_rules_human_422() {
             StatusCode::UNPROCESSABLE_ENTITY,
             &format!("загрузка {space}"),
         );
+        let uri = format!("/api/v1/code/files?solution={space}");
+        let r = call(&w, &owner, Method::GET, &uri, None).await;
+        ok(
+            &r,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("таблица файлов {space}"),
+        );
     }
     // неизвестное решение — 404
     let r = map(&w, &owner, "0192f1c4-7a1e-7c3b-9a55-000000000000").await;
@@ -368,8 +379,24 @@ async fn clear_owner_cookie_only_audited() {
         .await
         .json();
     assert_eq!(s["exists"], false, "{s}");
+    // администратор в своей базе — владелец своего решения: очистка по cookie — 200
+    let g_admin = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e55";
+    let reg = json!({"agent_solution_id": g_admin, "name": "Своё"});
+    let r = w.a.t(Method::POST, "/api/v1/solutions", Some(reg)).await;
+    ok(&r, StatusCode::CREATED, "решение администратора");
+    let body = put_body(g_admin, vec![file("x.rs", 7, "x")]);
+    let r = w.a.t(Method::PUT, "/api/v1/code/files", Some(body)).await;
+    ok(&r, StatusCode::OK, "карта администратора");
+    let uri = format!("/api/v1/code?solution={g_admin}");
+    let r = w.a.adm(Method::DELETE, &uri, None, None).await;
+    ok(&r, StatusCode::OK, "администратор очищает свою");
+    assert_eq!(r.json()["removed"], 1);
     let audit = w.a.st.system.list_audit(100, None).await.unwrap();
     let rows: Vec<_> = audit.iter().filter(|a| a.action == "code.clear").collect();
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|a| a.target.as_deref() == Some(G))
+        .collect();
     assert_eq!(rows.len(), 1, "одна запись аудита");
     assert_eq!(rows[0].target.as_deref(), Some(G));
     assert_eq!(rows[0].user_id.map(|u| u.to_string()), Some(w.o.id.clone()));

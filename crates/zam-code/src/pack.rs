@@ -68,8 +68,9 @@ fn units(f: &MapFile) -> usize {
     f.syms.len().max(1)
 }
 
-/// Карта из первых `k` единиц (символов в порядке ранга; файл без символов — одна единица).
-fn build(header: &str, files: &[MapFile], k: usize) -> Packed {
+/// Карта из первых `k` единиц (символов в порядке ранга; файл без символов — одна единица);
+/// `rest` — `(файлов, символов)` за пределами `files`, они входят в хвост.
+fn build(header: &str, files: &[MapFile], rest: (usize, usize), k: usize) -> Packed {
     let mut lines: Vec<String> = Vec::new();
     if !header.is_empty() {
         lines.push(header.to_string());
@@ -87,7 +88,8 @@ fn build(header: &str, files: &[MapFile], k: usize) -> Packed {
         left -= units(f).min(left);
     }
     let total_syms: usize = files.iter().map(|f| f.syms.len()).sum();
-    let (files_left, symbols_left) = (files.len() - files_shown, total_syms - symbols_shown);
+    let files_left = files.len() - files_shown + rest.0;
+    let symbols_left = total_syms - symbols_shown + rest.1;
     if files_left > 0 || symbols_left > 0 {
         lines.push(tail_line(files_left, symbols_left));
     }
@@ -143,14 +145,28 @@ pub fn render_map(
     budget: usize,
     count: &dyn Fn(&str) -> usize,
 ) -> Packed {
+    render_map_rest(header, files, (0, 0), budget, count)
+}
+
+/// [`render_map`] по первым файлам карты: `rest` — `(файлов, символов)`, которые вызывающий не
+/// передал (сервер читает символы только первых файлов). Они не показываются, но входят в
+/// хвост и в `files_left`/`symbols_left`. Если показаны не все `files`, итог равен карте
+/// целиком; иначе вызывающему нужно передать больше файлов.
+pub fn render_map_rest(
+    header: &str,
+    files: &[MapFile],
+    rest: (usize, usize),
+    budget: usize,
+    count: &dyn Fn(&str) -> usize,
+) -> Packed {
     let fits = |text: &str| count(text) <= budget;
     let total: usize = files.iter().map(units).sum();
-    let mut packed = if fits(&build(header, files, 0).text) {
-        let k = max_fitting(total, |k| fits(&build(header, files, k).text));
-        build(header, files, k)
+    let mut packed = if fits(&build(header, files, rest, 0).text) {
+        let k = max_fitting(total, |k| fits(&build(header, files, rest, k).text));
+        build(header, files, rest, k)
     } else {
         // заголовок не влезает и без символов: обрезка по символам, сначала — с хвостом
-        let empty = build("", files, 0);
+        let empty = build("", files, rest, 0);
         let tail = empty.text.clone();
         let with_tail = |h: usize| {
             let head = prefix(header, h);

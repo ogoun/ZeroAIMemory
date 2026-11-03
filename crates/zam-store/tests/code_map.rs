@@ -17,7 +17,7 @@ use zam_store::code::{
     code_rank_inputs, code_status, code_store_ranks, code_symbol, code_symbols_named,
     code_symbols_search, code_sync_manifest,
 };
-use zam_store::code::{code_central, code_map_files, code_map_symbols};
+use zam_store::code::{code_central, code_map_files, code_map_symbols, code_snapshot};
 use zam_store::file_refs::{ChangedFile, SYMBOL_CHANGED, SYMBOL_REMOVED, note_refs};
 use zam_store::file_refs::{REFS_MAX, path_owners, symbols_uploaded};
 use zam_store::{
@@ -2399,4 +2399,28 @@ async fn symbols_search_fts_limit_within_solution_and_kind() {
         .unwrap();
     assert_eq!(hits.len(), 10, "все методы");
     assert!(hits.iter().all(|h| h.kind == SymbolKind::Method));
+}
+
+/// Лёгкое чтение снимка: `rank_state` и `etag` без подсчётов; очищенная карта снимок хранит.
+#[tokio::test]
+async fn snapshot_light_read() {
+    let (db, _) = setup("snapshot").await;
+    assert!(code_snapshot(&db, G).await.unwrap().is_none());
+    let f = upload(
+        "a.rs",
+        &h('1'),
+        vec![sym("foo", "foo", &bh('1'), 1)],
+        vec![],
+    );
+    code_put_files(&db, G, &meta("box"), vec![f], &[])
+        .await
+        .unwrap();
+    let s = code_snapshot(&db, G).await.unwrap().unwrap();
+    assert_eq!((s.files, s.rank_state), (1, RankState::Pending));
+    let full = code_status(&db, G).await.unwrap().unwrap().snapshot;
+    assert_eq!(s, full);
+    code_clear(&db, G).await.unwrap();
+    let s = code_snapshot(&db, G).await.unwrap().unwrap();
+    assert_eq!(s.files, 0);
+    assert!(code_status(&db, G).await.unwrap().is_none());
 }

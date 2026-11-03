@@ -1,7 +1,7 @@
 //! Упаковка карты кода в бюджет токенов (спецификация M5.6 §7).
 
 use proptest::prelude::*;
-use zam_code::{MapFile, MapSym, SymbolKind, map_line, render_map};
+use zam_code::{MapFile, MapSym, SymbolKind, map_line, render_map, render_map_rest};
 
 /// Формула `ApproxCounter` сервера (`zam-markdown`): ⌈символы / 3,5⌉.
 fn approx(text: &str) -> usize {
@@ -250,6 +250,50 @@ proptest! {
         prop_assert_eq!(p.symbols_shown + p.symbols_left, total);
         prop_assert_eq!(p.files_shown + p.files_left, map.len());
     }
+}
+
+proptest! {
+    /// Хвост с явным остатком (непрочитанные файлы сервера): если показаны не все переданные
+    /// файлы, текст равен карте целиком (переданные + остаток), а счёт остатка — сумма.
+    #[test]
+    fn render_map_rest_equals_full_map_when_cut(
+        map in arb_map(),
+        cut in 0usize..12,
+        header in "[ -~а-я]{0,120}",
+        budget in 1usize..4000,
+    ) {
+        let cut = cut.min(map.len());
+        let (head, rest) = map.split_at(cut);
+        let rest_syms: usize = rest.iter().map(|f| f.syms.len()).sum();
+        let p = render_map_rest(&header, head, (rest.len(), rest_syms), budget, &approx);
+        prop_assert!(p.tokens <= budget);
+        let total: usize = map.iter().map(|f| f.syms.len()).sum();
+        prop_assert_eq!(p.symbols_shown + p.symbols_left, total);
+        prop_assert_eq!(p.files_shown + p.files_left, map.len());
+        if p.files_shown < head.len() {
+            let full = render_map(&header, &map, budget, &approx);
+            prop_assert_eq!(&p.text, &full.text);
+        }
+    }
+}
+
+#[test]
+fn render_map_rest_tail_names_rest() {
+    let map = big_map(2, 1);
+    let p = render_map_rest("# Карта", &map, (5, 20), 10_000, &approx);
+    assert_eq!((p.files_shown, p.symbols_shown), (2, 2));
+    assert_eq!((p.files_left, p.symbols_left), (5, 20));
+    assert!(
+        p.text
+            .ends_with("… ещё 5 файлов, 20 символов — `memory_code action=map focus=…`"),
+        "{}",
+        p.text
+    );
+    // без остатка — как render_map
+    assert_eq!(
+        render_map_rest("# Карта", &map, (0, 0), 50, &approx),
+        render_map("# Карта", &map, 50, &approx)
+    );
 }
 
 #[test]

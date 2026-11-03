@@ -136,6 +136,7 @@ pub fn lang_of(path: &str) -> Option<Lang> {
 
 /// Символ файла (§3). `line`, `end_line` — с 1; `line` — строка имени (не атрибута/декоратора).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Symbol {
     pub name: String,
     pub qual: String,
@@ -151,6 +152,7 @@ pub struct Symbol {
 
 /// Агрегированная ссылка файла: `(name, kind)` → число и первая строка (§3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefAgg {
     pub name: String,
     pub kind: RefKind,
@@ -160,6 +162,7 @@ pub struct RefAgg {
 
 /// Файл в `PUT /code/files` (§4): только метаданные, содержимое не уходит.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileUpload {
     pub path: String,
     pub lang: Lang,

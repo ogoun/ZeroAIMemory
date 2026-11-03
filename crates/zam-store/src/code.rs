@@ -642,6 +642,13 @@ fn snapshot_of(c: &Connection, solution: &str) -> Result<Option<CodeSnapshot>, S
     .optional()?)
 }
 
+/// Строка снимка решения без подсчётов по файлам (лёгкое чтение `rank_state`, `etag`); снимка
+/// нет — `None` (очищенная карта снимок сохраняет: `files = 0`).
+pub async fn code_snapshot(db: &Db, solution: &str) -> Result<Option<CodeSnapshot>, StoreError> {
+    let solution = solution.to_string();
+    db.read(move |c| snapshot_of(c, &solution)).await
+}
+
 /// Состояние карты решения; карты нет (или в ней нет файлов: очищена, ещё не загружена) —
 /// `None`.
 pub async fn code_status(db: &Db, solution: &str) -> Result<Option<CodeStatus>, StoreError> {

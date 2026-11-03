@@ -41,7 +41,7 @@ use axum::extract::Query;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, patch, post};
 use serde::de::DeserializeOwned;
 use zam_core::Id;
 
@@ -182,8 +182,9 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/cache/{id}/promote", post(cache::promote))
 }
 
-/// Предел тела `POST /code/sync`, `PUT /code/files`, `POST /code/impact` — `code.max_request_bytes`
-/// (больше — 413 с пределом в `detail`, [`code`]).
+/// Предел тела `PUT /code/files`, `POST /code/impact` — `code.max_request_bytes`; у
+/// `POST /code/sync` свой — манифест на `code.max_files` путей ([`code::sync_body_max`]). Больше —
+/// 413 с пределом в `detail`.
 fn code_body_limit(c: &ServerConfig) -> DefaultBodyLimit {
     DefaultBodyLimit::max(usize::try_from(c.code.max_request_bytes).unwrap_or(usize::MAX))
 }
@@ -194,8 +195,14 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
     Router::new()
         // карта кода (M5.6): производные данные, не запись памяти — `memory_writes` не растёт
         .route("/api/v1/code", delete(code::clear))
-        .route("/api/v1/code/sync", post(code::sync).layer(code_limit))
-        .route("/api/v1/code/files", put(code::put_files).layer(code_limit))
+        .route(
+            "/api/v1/code/sync",
+            post(code::sync).layer(DefaultBodyLimit::max(code::sync_body_max(&cfg.code))),
+        )
+        .route(
+            "/api/v1/code/files",
+            get(code::files).put(code::put_files).layer(code_limit),
+        )
         .route("/api/v1/code/status", get(code::status))
         .route("/api/v1/code/map", get(code::map))
         .route("/api/v1/code/symbols", get(code::symbols))

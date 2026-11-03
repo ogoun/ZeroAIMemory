@@ -3,15 +3,20 @@
 //! - `POST /code/sync {solution, commit?, branch?, machine?, manifest: [{path, hash}]}` →
 //!   `{need, removed, etag}`: файлы карты вне манифеста удаляются, `need` — пути без строки или с
 //!   другим хэшем. Повтор пути (после нормализации) — 422 `manifest[i]: повтор пути`.
-//! - `PUT /code/files {solution, commit?, branch?, machine?, files: [FileUpload]}` (до 500) →
-//!   `{accepted, stale_refs, warnings}`; сигнатуры маскируются (`zam_markdown::mask_text`) и
-//!   хранятся маскированными; правило устарелости ссылок памяти — база владельца и Knowledge
-//!   участника (как `POST /files/changed`).
+//! - `PUT /code/files {solution, commit?, branch?, machine?, files: [FileUpload]}` (до 500, а
+//!   карта целиком — до `code.max_files`) → `{accepted, stale_refs, warnings}`; сигнатуры
+//!   маскируются (`zam_markdown::mask_text`) и хранятся маскированными; правило карты для ссылок
+//!   памяти — только ссылки на символы, в базе владельца и в Knowledge участника (файловые
+//!   ссылки судят хуки рабочей копии).
 //! - `GET /code/status`, `GET /code/map` (Markdown или JSON в бюджете токенов, `focus`, `area`),
-//!   `GET /code/symbols`, `GET /code/symbols/{id | путь#qual}`, `POST /code/impact` — чтение
-//!   решения; ответы карты, символов и влияния несут `tokens` (`zam_store::count_tokens`).
-//!   `ETag`/`If-None-Match` — у `status` и у `map` без `focus` (etag снимка, `rank_state` и
-//!   параметры).
+//!   `GET /code/files` (таблица файлов по рангу, постранично), `GET /code/symbols`,
+//!   `GET /code/symbols/{id | путь#qual}`, `POST /code/impact` — чтение решения; ответы карты,
+//!   символов и влияния несут `tokens` (`zam_store::count_tokens`). Слабый `ETag`
+//!   (`W/"…"`)/`If-None-Match` — у `status` и у `map` без `focus` (etag снимка, `rank_state` и
+//!   параметры): возраст снимка в тексте меняется, а содержимое — нет.
+//!
+//! Права проверяются после чтения тела: у `sync`/`files`/`impact` решение — поле тела (предел
+//! тела ограничивает цену чужого запроса).
 //! - `DELETE /code?solution=` — только владелец решения в своей сессии WebUI, аудит `code.clear`.
 //!
 //! **Права:** запись — владелец и участник `rw` (токен `ro`, участник `ro` — 403), чтение — любой с
@@ -32,7 +37,7 @@
 //! первых файлов (`code_map_symbols`) — порциями, пока упаковка показывает все прочитанные.
 //! Центральные символы — `code_central` (без чтения карты), знания о пути — `path_owners`
 //! (без предела индекса хуков). Вызовы хранилища собраны в тонкий слой (раздел «хранилище»).
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -49,15 +54,16 @@ use serde_json::{Map, Value, json};
 use zam_code::{
     FileUpload, Focus, Graph, ManifestItem, MapFile, MapSym, NAME_MAX_CHARS, Packed, ParseState,
     QUAL_MAX_CHARS, SIG_MAX_CHARS, SymbolHash, SymbolKind, UPLOAD_FILES_MAX, edges_among,
-    focus_restart, rank_on_graph, render_map, split_ref,
+    focus_restart, rank_on_graph, render_map_rest, split_ref,
 };
 use zam_core::Id;
 use zam_store::code::{
     CodeSnapshot, CodeStatus, MapFileRow, MapSymRow, RankInputs, RankState, SymbolHit, UploadMeta,
     code_central, code_clear, code_impact, code_map_files, code_map_symbols, code_put_files,
-    code_rank_inputs, code_status, code_store_ranks, code_symbol, code_symbols_search,
-    code_sync_manifest,
+    code_rank_inputs, code_snapshot, code_status, code_store_ranks, code_symbol,
+    code_symbols_search, code_sync_manifest,
 };
+use zam_store::file_refs::PATH_MAX_CHARS;
 use zam_store::{
     ChangedFile, Db, RefItem, SpaceKind, check_commit, check_hash, count_tokens,
     normalize_ref_path, path_owners, symbols_uploaded,
@@ -92,10 +98,66 @@ const DIGEST_CENTRAL: usize = 3;
 const CENTRAL_FILES_MAX: usize = 5000;
 /// Первая порция файлов карты, символы которых читаются (вторая фаза), — не меньше.
 const MAP_FILES_FIRST: usize = 64;
+/// Запас на элемент манифеста сверх пути (`{"path":…,"hash":<64 hex>}` и экранирование), байт.
+const MANIFEST_ITEM_OVERHEAD: usize = 100;
+/// Ранжирований с фокусом одновременно (CPU: PageRank по всей карте на запрос).
+const FOCUS_SLOTS: usize = 2;
+/// Срок ранжирования с фокусом не меньше, мс.
+const FOCUS_TIMEOUT_MIN_MS: u64 = 200;
+/// Входов ранжирования в кэше фокуса (по `(владелец, GUID, etag снимка)`).
+const FOCUS_CACHE: usize = 2;
+/// Знаний в карточке символа и во влиянии не больше (сверх — `knowledge_left`).
+const KNOWLEDGE_MAX: usize = 200;
+/// Файлов на странице `GET /code/files` по умолчанию и не больше.
+const FILES_PAGE_DEFAULT: usize = 50;
+const FILES_PAGE_MAX: usize = 200;
 /// Ветка и машина клиента не длиннее, символов.
 const META_MAX_CHARS: usize = 256;
 /// `qual` в строке дайджеста не длиннее, символов (строка ≤ 80 токенов, §10).
 const DIGEST_QUAL_MAX: usize = 48;
+
+// ---- состояние сервера ----
+
+/// Ключ решения: `(владелец, GUID)`.
+type SolutionKey = (Id, String);
+
+/// Состояние карты кода на сервере (`AppState::code`): пересчёты рангов (single-flight на
+/// решение), слоты и кэш входов ранжирования с фокусом.
+pub struct CodeRuntime {
+    /// Решения, ранги которых сейчас пересчитываются.
+    ranking: Mutex<HashSet<SolutionKey>>,
+    /// Слоты ранжирования с фокусом ([`FOCUS_SLOTS`]).
+    focus_slots: Arc<tokio::sync::Semaphore>,
+    /// Входы ранжирования последних решений: `((владелец, GUID), etag снимка, входы)`.
+    inputs: Mutex<VecDeque<(SolutionKey, String, Arc<RankInputs>)>>,
+    /// Тестовые точки (фича `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub hooks: CodeHooks,
+}
+
+impl Default for CodeRuntime {
+    fn default() -> Self {
+        Self {
+            ranking: Mutex::default(),
+            focus_slots: Arc::new(tokio::sync::Semaphore::new(FOCUS_SLOTS)),
+            inputs: Mutex::default(),
+            #[cfg(feature = "test-hooks")]
+            hooks: CodeHooks::default(),
+        }
+    }
+}
+
+/// Тестовые точки карты кода: задержки фонового пересчёта (после чтения входов) и ранжирования
+/// с фокусом, счётчик запущенных пересчётов.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct CodeHooks {
+    pub rank_delay_ms: std::sync::atomic::AtomicU64,
+    pub focus_delay_ms: std::sync::atomic::AtomicU64,
+    pub rank_runs: std::sync::atomic::AtomicUsize,
+}
 
 // ---- общие проверки ----
 
@@ -114,21 +176,32 @@ fn not_solution() -> ApiError {
     )
 }
 
-/// Тело `/code/*` с пределом `code.max_request_bytes`: больше — 413 с пределом в `detail`.
+/// Предел тела `POST /code/sync`, байт: манифест на `code.max_files` путей предельной длины
+/// (`max_files × (PATH_MAX_CHARS + 100)`), но не меньше `code.max_request_bytes`.
+pub fn sync_body_max(c: &crate::config::CodeSection) -> usize {
+    let request = usize::try_from(c.max_request_bytes).unwrap_or(usize::MAX);
+    (c.max_files as usize)
+        .saturating_mul(PATH_MAX_CHARS + MANIFEST_ITEM_OVERHEAD)
+        .max(request)
+}
+
+/// Тело `/code/*` с пределом `limit` байт (слой маршрута): больше — 413 с пределом в `detail`.
 fn code_body<T: DeserializeOwned>(
-    st: &AppState,
+    limit: usize,
     b: Result<Bytes, BytesRejection>,
 ) -> Result<T, ApiError> {
     match b {
         Ok(b) => parse_body(&b),
-        Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            Err(ApiError::PayloadTooLarge(format!(
-                "тело запроса больше предела code.max_request_bytes = {} байт",
-                st.cfg.code.max_request_bytes
-            )))
-        }
+        Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => Err(ApiError::PayloadTooLarge(
+            format!("тело запроса больше предела {limit} байт (code.max_request_bytes)"),
+        )),
         Err(e) => Err(ApiError::BadRequest(format!("некорректное тело: {e}"))),
     }
+}
+
+/// Предел тела `PUT /code/files` и `POST /code/impact`, байт.
+fn request_max(st: &AppState) -> usize {
+    usize::try_from(st.cfg.code.max_request_bytes).unwrap_or(usize::MAX)
 }
 
 /// Область решения `raw` (GUID или `Id` пространства) для режима `mode`; пространство не
@@ -187,6 +260,14 @@ fn check_text(s: &str, max: usize, what: &str, tab: bool) -> Result<(), ApiError
     Ok(())
 }
 
+/// `qual` без `/`: иначе ссылка `путь#qual` разбиралась бы как путь (`split_ref`).
+fn check_qual(q: &str, what: &str) -> Result<(), ApiError> {
+    if q.contains('/') {
+        return Err(unprocessable(format!("{what}: «/» в qual недопустим")));
+    }
+    Ok(())
+}
+
 /// `n` шестнадцатеричных символов (нижний регистр) или `None`.
 fn hex_of(s: &str, lens: &[usize]) -> Option<String> {
     let s = s.trim();
@@ -237,9 +318,10 @@ fn str_field<'a>(o: &'a Map<String, Value>, key: &str, what: &str) -> Result<&'a
     }
 }
 
-/// `ETag` в кавычках.
+/// Слабый `ETag` (`W/"…"`): ответ семантически тот же при том же снимке, рангах и параметрах,
+/// хотя возраст снимка в тексте («5 мин назад») меняется.
 fn quoted(etag: &str) -> Result<HeaderValue, ApiError> {
-    HeaderValue::from_str(&format!("\"{etag}\"")).map_err(|e| ApiError::Internal(e.to_string()))
+    HeaderValue::from_str(&format!("W/\"{etag}\"")).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// Ответ с `ETag` (или 304 при совпадении `If-None-Match`).
@@ -304,12 +386,38 @@ async fn store_central(sc: &MemScope, guid: &str, n: usize) -> Result<Vec<Symbol
     Ok(code_central(&sc.db, guid, n, CENTRAL_FILES_MAX).await?)
 }
 
-/// Пересчёт рангов: входы → PageRank в `spawn_blocking` → сохранение (`false` — карта
-/// изменилась после чтения входов).
-async fn store_rank(db: Db, guid: String) -> Result<bool, String> {
+/// Строка снимка (лёгкое чтение `rank_state`, `etag`).
+async fn store_snapshot(sc: &MemScope, guid: &str) -> Result<Option<CodeSnapshot>, ApiError> {
+    Ok(code_snapshot(&sc.db, guid).await?)
+}
+
+/// Пересчёт рангов: снимок ещё `pending` → входы → PageRank в `spawn_blocking` → сохранение
+/// (`false` — карта изменилась после чтения входов). Ранги уже посчитаны (другой запрос успел)
+/// — `true` без счёта.
+async fn store_rank(rt: Arc<CodeRuntime>, db: Db, guid: String) -> Result<bool, String> {
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = &rt;
+    match code_snapshot(&db, &guid).await.map_err(|e| e.to_string())? {
+        Some(s) if s.rank_state == RankState::Pending => {}
+        _ => return Ok(true),
+    }
+    #[cfg(feature = "test-hooks")]
+    rt.hooks
+        .rank_runs
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let inputs = code_rank_inputs(&db, &guid)
         .await
         .map_err(|e| e.to_string())?;
+    #[cfg(feature = "test-hooks")]
+    {
+        let ms = rt
+            .hooks
+            .rank_delay_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
     let (inputs, ranked) = tokio::task::spawn_blocking(move || {
         let r = zam_code::rank(&inputs.files, None);
         (inputs, r)
@@ -326,13 +434,14 @@ async fn store_rank(db: Db, guid: String) -> Result<bool, String> {
 
 /// Снимает отметку «пересчёт идёт» решения при завершении фоновой задачи.
 struct RankingGuard {
-    set: Arc<Mutex<HashSet<(Id, String)>>>,
-    key: (Id, String),
+    rt: Arc<CodeRuntime>,
+    key: SolutionKey,
 }
 
 impl Drop for RankingGuard {
     fn drop(&mut self) {
-        self.set
+        self.rt
+            .ranking
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.key);
@@ -344,8 +453,8 @@ impl Drop for RankingGuard {
 /// уже идёт, карта изменилась во время счёта или сбой — `["rank pending"]` (карта отдаётся по
 /// старым рангам).
 pub async fn ensure_ranked(st: &AppState, sc: &MemScope, guid: &str) -> Vec<String> {
-    match code_status(&sc.db, guid).await {
-        Ok(Some(s)) if s.snapshot.rank_state == RankState::Pending => rank_now(st, sc, guid).await,
+    match code_snapshot(&sc.db, guid).await {
+        Ok(Some(s)) if s.rank_state == RankState::Pending => rank_now(st, sc, guid).await,
         Ok(_) => Vec::new(),
         Err(e) => {
             tracing::warn!(error = %e, "состояние карты кода не прочитано");
@@ -357,7 +466,8 @@ pub async fn ensure_ranked(st: &AppState, sc: &MemScope, guid: &str) -> Vec<Stri
 async fn rank_now(st: &AppState, sc: &MemScope, guid: &str) -> Vec<String> {
     let key = (sc.owner, guid.to_string());
     if !st
-        .code_ranking
+        .code
+        .ranking
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert(key.clone())
@@ -365,13 +475,13 @@ async fn rank_now(st: &AppState, sc: &MemScope, guid: &str) -> Vec<String> {
         return vec![RANK_PENDING.into()];
     }
     let guard = RankingGuard {
-        set: st.code_ranking.clone(),
+        rt: st.code.clone(),
         key,
     };
-    let (db, g) = (sc.db.clone(), guid.to_string());
+    let (rt, db, g) = (st.code.clone(), sc.db.clone(), guid.to_string());
     let task = tokio::spawn(async move {
         let _guard = guard;
-        let r = store_rank(db, g).await;
+        let r = store_rank(rt, db, g).await;
         if let Err(e) = &r {
             tracing::warn!(error = %e, "ранги карты кода не пересчитаны");
         }
@@ -397,13 +507,14 @@ async fn ranked_status(
     sc: &MemScope,
     guid: &str,
 ) -> Result<(Option<CodeStatus>, Vec<String>), ApiError> {
-    let s = store_status(sc, guid).await?;
-    if s.as_ref()
-        .is_none_or(|s| s.snapshot.rank_state != RankState::Pending)
-    {
-        return Ok((s, Vec::new()));
-    }
-    let warnings = rank_now(st, sc, guid).await;
+    let pending = store_snapshot(sc, guid)
+        .await?
+        .is_some_and(|s| s.rank_state == RankState::Pending);
+    let warnings = if pending {
+        rank_now(st, sc, guid).await
+    } else {
+        Vec::new()
+    };
     Ok((store_status(sc, guid).await?, warnings))
 }
 
@@ -583,7 +694,7 @@ pub async fn sync(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     enabled(&st)?;
-    let req: SyncReq = code_body(&st, body)?;
+    let req: SyncReq = code_body(sync_body_max(&st.cfg.code), body)?;
     let sc = code_scope(&st, &p, &headers, &req.solution, Mode::Write).await?;
     let meta = upload_meta(
         req.commit.as_deref(),
@@ -678,6 +789,7 @@ fn check_upload(
         let w = format!("{what}.symbols[{j}]");
         check_text(&s.name, NAME_MAX_CHARS, &format!("{w}.name"), false)?;
         check_text(&s.qual, QUAL_MAX_CHARS, &format!("{w}.qual"), false)?;
+        check_qual(&s.qual, &format!("{w}.qual"))?;
         s.body_hash = hex_of(&s.body_hash, &[16])
             .ok_or_else(|| unprocessable(format!("{w}.body_hash: 16 hex-символов")))?;
         if s.line == 0 || s.end_line < s.line {
@@ -725,6 +837,39 @@ fn parse_uploads(
     Ok((out, masked))
 }
 
+/// Карта решения после загрузки — не больше `max` файлов (`code.max_files`): текущие файлы и
+/// новые пути загрузки; иначе 422 с пределом. Новые пути считаются, только если быстрая оценка
+/// «файлы + загрузка» предел превышает.
+async fn check_map_size(
+    sc: &MemScope,
+    guid: &str,
+    files: &[FileUpload],
+    max: u32,
+) -> Result<(), ApiError> {
+    let have = store_snapshot(sc, guid).await?.map_or(0, |s| s.files);
+    if have + files.len() as u64 <= u64::from(max) {
+        return Ok(());
+    }
+    let known: HashSet<String> = store_files(sc, guid, None)
+        .await?
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    let new: HashSet<&str> = files
+        .iter()
+        .map(|f| f.path.as_str())
+        .filter(|p| !known.contains(*p))
+        .collect();
+    if known.len() + new.len() > max as usize {
+        return Err(unprocessable(format!(
+            "files: в карте решения не больше {max} файлов (code.max_files): сейчас {}, новых {}",
+            known.len(),
+            new.len()
+        )));
+    }
+    Ok(())
+}
+
 /// `PUT /code/files` → `{accepted, stale_refs, warnings}`.
 pub async fn put_files(
     State(st): State<AppState>,
@@ -733,7 +878,7 @@ pub async fn put_files(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     enabled(&st)?;
-    let req: PutReq = code_body(&st, body)?;
+    let req: PutReq = code_body(request_max(&st), body)?;
     let sc = code_scope(&st, &p, &headers, &req.solution, Mode::Write).await?;
     let meta = upload_meta(
         req.commit.as_deref(),
@@ -743,6 +888,7 @@ pub async fn put_files(
     )?;
     let (files, masked) = parse_uploads(req.files, &st.cfg.code)?;
     let g = guid(&sc);
+    check_map_size(&sc, &g, &files, st.cfg.code.max_files).await?;
     // ссылки на символы в Knowledge участника (другая база) — то же правило карты, что у
     // `code_put_files`: файловые ссылки и хэш файла не трогаются (CRLF-близнец другой машины не
     // мигает ими, ревью задачи 3, I2); неполный или пропущенный разбор — `None` (не судится)
@@ -946,39 +1092,22 @@ fn rerank_symbols(f: &mut MapFileRow) {
     });
 }
 
-/// Файлы карты для упаковки: у первых `loaded` — символы, у остальных — заглушки по числу
-/// символов (тексты не показываются: упаковка останавливается раньше, иначе вторая фаза
-/// дочитывает символы), чтобы хвост «… ещё N файлов, M символов» считал всю карту.
+/// Прочитанные файлы карты (первые `loaded`) для упаковки.
 fn pack_input(rows: &[MapFileRow], loaded: usize) -> Vec<MapFile> {
-    let stub = MapSym {
-        kind: SymbolKind::Function,
-        qual: String::new(),
-        sig: None,
-        line: 0,
-    };
-    rows.iter()
-        .enumerate()
-        .map(|(i, f)| {
-            if i < loaded {
-                MapFile {
-                    path: f.path.clone(),
-                    syms: f
-                        .symbols
-                        .iter()
-                        .map(|s| MapSym {
-                            kind: s.kind,
-                            qual: s.qual.clone(),
-                            sig: s.sig.clone(),
-                            line: s.line,
-                        })
-                        .collect(),
-                }
-            } else {
-                MapFile {
-                    path: String::new(),
-                    syms: vec![stub.clone(); f.symbol_count as usize],
-                }
-            }
+    rows[..loaded]
+        .iter()
+        .map(|f| MapFile {
+            path: f.path.clone(),
+            syms: f
+                .symbols
+                .iter()
+                .map(|s| MapSym {
+                    kind: s.kind,
+                    qual: s.qual.clone(),
+                    sig: s.sig.clone(),
+                    line: s.line,
+                })
+                .collect(),
         })
         .collect()
 }
@@ -990,8 +1119,84 @@ fn focus_ranks(inputs: &RankInputs, f: &Focus) -> Option<HashMap<i64, f64>> {
     Some(inputs.files.iter().map(|x| x.id).zip(r).collect())
 }
 
-/// Карта в бюджете: строки карты, персонализация `focus` (не дольше `code.rank_timeout_ms`,
-/// иначе — глобальный ранг и предупреждение), упаковка счётчиком сервера, рёбра (`edges`).
+/// Входы ранжирования решения из кэша (тот же `etag` снимка — та же карта) или из хранилища.
+async fn cached_inputs(
+    st: &AppState,
+    sc: &MemScope,
+    guid: &str,
+    etag: &str,
+) -> Result<Arc<RankInputs>, ApiError> {
+    let key = (sc.owner, guid.to_string());
+    let hit = st
+        .code
+        .inputs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(k, e, _)| *k == key && e == etag)
+        .map(|(_, _, i)| i.clone());
+    if let Some(i) = hit {
+        return Ok(i);
+    }
+    let inputs = Arc::new(code_rank_inputs(&sc.db, guid).await?);
+    let mut cache = st
+        .code
+        .inputs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|(k, _, _)| *k != key);
+    cache.push_front((key, etag.to_string(), inputs.clone()));
+    cache.truncate(FOCUS_CACHE);
+    Ok(inputs)
+}
+
+/// Ранги файлов с фокусом: слот ([`FOCUS_SLOTS`]), входы (кэш) и PageRank — всё под сроком
+/// `max(code.rank_timeout_ms, 200)`. Срок вышел — `Err(())` (карта без фокуса); слот занят
+/// счётом до его конца, даже если запрос уже ответил.
+async fn focus_file_ranks(
+    st: &AppState,
+    sc: &MemScope,
+    guid: &str,
+    etag: &str,
+    focus: &Focus,
+) -> Result<Result<Option<HashMap<i64, f64>>, ()>, ApiError> {
+    let wait = Duration::from_millis(st.cfg.code.rank_timeout_ms.max(FOCUS_TIMEOUT_MIN_MS));
+    let work = async {
+        let permit = st
+            .code
+            .focus_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let inputs = cached_inputs(st, sc, guid, etag).await?;
+        let f = focus.clone();
+        #[cfg(feature = "test-hooks")]
+        let delay = st
+            .code
+            .hooks
+            .focus_delay_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(feature = "test-hooks")]
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            focus_ranks(&inputs, &f)
+        })
+        .await
+        .map_err(|e| ApiError::aborted("ранжирование с фокусом", &e))
+    };
+    match tokio::time::timeout(wait, work).await {
+        Ok(r) => r.map(Ok),
+        Err(_) => Ok(Err(())),
+    }
+}
+
+/// Карта в бюджете: файлы по рангу (с `focus` — персонализированному, не дольше
+/// `max(code.rank_timeout_ms, 200)`, иначе глобальный ранг и `focus rank timeout`), символы
+/// первых файлов порциями, упаковка счётчиком сервера, рёбра (`edges`).
 #[allow(clippy::too_many_arguments)]
 async fn build_map(
     st: &AppState,
@@ -1010,28 +1215,17 @@ async fn build_map(
         None => Vec::new(),
     };
     let mut focused = false;
-    let mut inputs: Option<RankInputs> = None;
-    if let (Some(f), Some(_)) = (focus, status) {
-        let inp = code_rank_inputs(&sc.db, guid).await?;
-        let f = f.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            let r = focus_ranks(&inp, &f);
-            (inp, r)
-        });
-        let wait = Duration::from_millis(st.cfg.code.rank_timeout_ms);
-        match tokio::time::timeout(wait, task).await {
-            Ok(Ok((inp, fr))) => {
-                if let Some(fr) = fr {
-                    apply_focus(&mut rows, &fr);
-                    focused = true;
-                }
-                inputs = Some(inp);
+    if let (Some(f), Some(s)) = (focus, status) {
+        match focus_file_ranks(st, sc, guid, &s.snapshot.etag, f).await? {
+            Ok(Some(fr)) => {
+                apply_focus(&mut rows, &fr);
+                focused = true;
             }
-            Ok(Err(e)) => return Err(ApiError::aborted("ранжирование с фокусом", &e)),
-            Err(_) => warnings.push("focus rank timeout".to_string()),
+            Ok(None) => {}
+            Err(()) => warnings.push("focus rank timeout".to_string()),
         }
     }
-    let header = map_header(status, area, focus.is_some());
+    let header = map_header(status, area, focused);
     // фаза 2: символы первых файлов; не все показаны — готово, иначе порция ×4
     let total = rows.len();
     let mut want = total.min((budget / 8).max(MAP_FILES_FIRST));
@@ -1046,22 +1240,28 @@ async fn build_map(
             }
         }
         loaded = want;
+        // непрочитанные файлы — только числом в хвосте «… ещё N файлов, M символов»
+        let rest = (
+            total - loaded,
+            rows[loaded..]
+                .iter()
+                .map(|f| f.symbol_count as usize)
+                .sum::<usize>(),
+        );
         let (h, files) = (header.clone(), pack_input(&rows, loaded));
-        let packed =
-            tokio::task::spawn_blocking(move || render_map(&h, &files, budget, &count_tokens))
-                .await
-                .map_err(|e| ApiError::aborted("упаковка карты", &e))?;
+        let packed = tokio::task::spawn_blocking(move || {
+            render_map_rest(&h, &files, rest, budget, &count_tokens)
+        })
+        .await
+        .map_err(|e| ApiError::aborted("упаковка карты", &e))?;
         if packed.files_shown < loaded || loaded == total {
             break packed;
         }
         want = total.min(loaded.saturating_mul(4));
     };
     let mut out_edges = Vec::new();
-    if edges && packed.files_shown > 1 {
-        let inp = match inputs {
-            Some(i) => i,
-            None => code_rank_inputs(&sc.db, guid).await?,
-        };
+    if let (true, true, Some(s)) = (edges, packed.files_shown > 1, status) {
+        let inp = cached_inputs(st, sc, guid, &s.snapshot.etag).await?;
         let shown: Vec<i64> = rows.iter().take(packed.files_shown).map(|f| f.id).collect();
         out_edges = tokio::task::spawn_blocking(move || {
             let at: HashMap<i64, usize> = inp
@@ -1089,8 +1289,9 @@ async fn build_map(
     })
 }
 
-/// Карта решения в бюджете Markdown (для MCP `memory_code action=map`, задача 7): ранги
-/// пересчитываются при необходимости ([`ensure_ranked`]).
+/// Карта решения в бюджете Markdown и предупреждения (`rank pending`, `focus rank timeout`) —
+/// для MCP `memory_code action=map` (задача 7): ранги пересчитываются при необходимости
+/// ([`ensure_ranked`]).
 pub async fn map_text(
     st: &AppState,
     sc: &MemScope,
@@ -1098,13 +1299,11 @@ pub async fn map_text(
     budget: usize,
     focus: Option<&Focus>,
     area: Option<&str>,
-) -> Result<Packed, ApiError> {
-    let (s, _) = ranked_status(st, sc, guid).await?;
-    Ok(
-        build_map(st, sc, guid, s.as_ref(), budget, focus, area, false)
-            .await?
-            .packed,
-    )
+) -> Result<(Packed, Vec<String>), ApiError> {
+    let (s, mut warnings) = ranked_status(st, sc, guid).await?;
+    let m = build_map(st, sc, guid, s.as_ref(), budget, focus, area, false).await?;
+    warnings.extend(m.warnings);
+    Ok((m.packed, warnings))
 }
 
 /// Показанные файлы карты JSON: первые `files_shown`, символы — первые `symbols_shown` подряд.
@@ -1230,6 +1429,84 @@ pub async fn map(
     }
 }
 
+// ---- GET /code/files ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesQuery {
+    solution: Option<String>,
+    lang: Option<String>,
+    q: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// `GET /code/files?solution=&lang=&q=&offset=&limit=` → `{files: [{id, path, lang, rank,
+/// symbols}], total, offset, limit, warnings}`: таблица файлов карты по рангу (WebUI, задача 8),
+/// фильтр языка и подстроки пути (без учёта регистра), `limit` 1..=200.
+pub async fn files(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    q: Result<Query<FilesQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    enabled(&st)?;
+    let q = query(q)?;
+    let raw = solution_param(q.solution.as_deref(), &headers)?;
+    let sc = code_scope(&st, &p, &headers, raw, Mode::Read).await?;
+    let lang = q
+        .lang
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            zam_code::Lang::parse(l).ok_or_else(|| {
+                let all: Vec<&str> = zam_code::Lang::ALL.iter().map(|l| l.as_str()).collect();
+                unprocessable(format!("lang: один из {}", all.join("|")))
+            })
+        })
+        .transpose()?;
+    let needle =
+        q.q.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| check_text(s, QUAL_MAX_CHARS, "q", false).map(|()| s.to_lowercase()))
+            .transpose()?;
+    let limit = q.limit.unwrap_or(FILES_PAGE_DEFAULT);
+    if !(1..=FILES_PAGE_MAX).contains(&limit) {
+        return Err(unprocessable(format!("limit: от 1 до {FILES_PAGE_MAX}")));
+    }
+    let offset = q.offset.unwrap_or(0);
+    let g = guid(&sc);
+    let warnings = ensure_ranked(&st, &sc, &g).await;
+    let all: Vec<MapFileRow> = store_files(&sc, &g, None)
+        .await?
+        .into_iter()
+        .filter(|f| lang.is_none_or(|l| f.lang == l))
+        .filter(|f| {
+            needle
+                .as_deref()
+                .is_none_or(|n| f.path.to_lowercase().contains(n))
+        })
+        .collect();
+    let page: Vec<Value> = all
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|f| {
+            json!({"id": f.id, "path": f.path, "lang": f.lang, "rank": f.rank,
+                   "symbols": f.symbol_count})
+        })
+        .collect();
+    Ok(Json(json!({
+        "files": page,
+        "total": all.len(),
+        "offset": offset,
+        "limit": limit,
+        "warnings": warnings,
+    })))
+}
+
 // ---- GET /code/symbols, /code/symbols/{id} ----
 
 #[derive(Deserialize)]
@@ -1292,22 +1569,27 @@ pub async fn symbols(
     })))
 }
 
-/// Знания решения о пути `path` (владельцы ссылок в базе владельца и Knowledge участника, без
-/// предела записей на путь): ссылки на символы первыми.
+/// Знания решения о пути `path` в базах `dbs` ([`report_dbs`]: база владельца и Knowledge
+/// участника), без предела записей на путь: ссылки на символы первыми.
 async fn knowledge_of(
-    st: &AppState,
-    p: &Principal,
-    sc: &MemScope,
+    dbs: &[(Db, Vec<Id>)],
     guid: &str,
     path: &str,
 ) -> Result<Vec<RefItem>, ApiError> {
     let mut items = Vec::new();
-    for (db, spaces) in report_dbs(st, p, sc).await? {
-        items.extend(path_owners(&db, guid, path, &spaces).await?);
+    for (db, spaces) in dbs {
+        items.extend(path_owners(db, guid, path, spaces).await?);
     }
     // символьные первыми и после слияния баз (сортировка устойчива)
     items.sort_by_key(|i| i.symbol.is_none());
     Ok(items)
+}
+
+/// Знания выдачи — не больше [`KNOWLEDGE_MAX`]; возвращает, сколько не вошло.
+fn cap_knowledge(items: &mut Vec<Value>) -> usize {
+    let left = items.len().saturating_sub(KNOWLEDGE_MAX);
+    items.truncate(KNOWLEDGE_MAX);
+    left
 }
 
 fn knowledge_json(path: &str, it: &RefItem) -> Value {
@@ -1357,12 +1639,14 @@ pub async fn symbol(
         .await?
         .ok_or(ApiError::NotFound)?;
     let path = card.symbol.path.clone();
-    let knowledge: Vec<Value> = knowledge_of(&st, &p, &sc, &g, &path)
+    let dbs = report_dbs(&st, &p, &sc).await?;
+    let mut knowledge: Vec<Value> = knowledge_of(&dbs, &g, &path)
         .await?
         .iter()
         .filter(|it| it.symbol.as_deref().is_none_or(|s| s == card.symbol.qual))
         .map(|it| knowledge_json(&path, it))
         .collect();
+    let knowledge_left = cap_knowledge(&mut knowledge);
     let mut sym = json!(card.symbol);
     sym["body_hash"] = json!(card.body_hash);
     sym["exported"] = json!(card.exported);
@@ -1372,6 +1656,7 @@ pub async fn symbol(
         "callers": card.callers,
         "uses": card.uses,
         "knowledge": knowledge,
+        "knowledge_left": knowledge_left,
     });
     body["tokens"] = json!(tokens_of(&body));
     Ok(Json(body))
@@ -1420,6 +1705,7 @@ fn parse_impact(files: &[Value], max_symbols: u32) -> Result<Vec<ImpactFile>, Ap
                     known_fields(so, &["qual", "body_hash"], &w)?;
                     let qual = str_field(so, "qual", &w)?;
                     check_text(qual, QUAL_MAX_CHARS, &format!("{w}.qual"), false)?;
+                    check_qual(qual, &format!("{w}.qual"))?;
                     let body_hash = hex_of(str_field(so, "body_hash", &w)?, &[16])
                         .ok_or_else(|| unprocessable(format!("{w}.body_hash: 16 hex-символов")))?;
                     syms.push(SymbolHash {
@@ -1448,7 +1734,7 @@ pub async fn impact(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     enabled(&st)?;
-    let req: ImpactReq = code_body(&st, body)?;
+    let req: ImpactReq = code_body(request_max(&st), body)?;
     let sc = code_scope(&st, &p, &headers, &req.solution, Mode::Read).await?;
     let files = parse_impact(&req.files, st.cfg.code.max_symbols_per_file)?;
     let g = guid(&sc);
@@ -1460,6 +1746,7 @@ pub async fn impact(
             .or_default()
             .insert(s.qual.as_str());
     }
+    let dbs = report_dbs(&st, &p, &sc).await?;
     let mut knowledge = Vec::new();
     for (path, _) in &files {
         let all = rows.paths_only.contains(path);
@@ -1467,7 +1754,7 @@ pub async fn impact(
         if !all && quals.is_none() {
             continue;
         }
-        for it in &knowledge_of(&st, &p, &sc, &g, path).await? {
+        for it in &knowledge_of(&dbs, &g, path).await? {
             let take = all
                 || it
                     .symbol
@@ -1483,6 +1770,7 @@ pub async fn impact(
         "removed": rows.removed,
         "consumers": rows.consumers,
         "paths_only": rows.paths_only,
+        "knowledge_left": cap_knowledge(&mut knowledge),
         "knowledge": knowledge,
         "warnings": [],
     });

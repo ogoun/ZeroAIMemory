@@ -530,6 +530,7 @@ async fn map_etag_304_without_focus_none_with_focus() {
     let r = get(&a, &uri).await;
     ok(&r, StatusCode::OK, "карта");
     let etag = r.header("etag").to_string();
+    assert!(etag.starts_with("W/\""), "слабый ETag: {etag}");
     let same = a
         .tok_h(
             &a.token,
@@ -747,6 +748,7 @@ async fn symbol_card_refs_and_knowledge() {
     );
     assert!(!ids.contains(&w.bar_note));
     assert_eq!(c["knowledge"][0]["symbol"], "foo");
+    assert_eq!(c["knowledge_left"], 0);
     assert!(c["knowledge"][1]["symbol"].is_null());
     assert!(c["tokens"].as_u64().unwrap() > 0);
     assert_eq!(c["symbol"]["ref"], "a.rs#foo");
@@ -881,6 +883,26 @@ async fn limits_413_422_with_limit_in_detail() {
     )
     .await;
     unprocessable(&r, "2", "ссылок > max_refs_per_file");
+    // I4: карта целиком — не больше max_files (3): текущие файлы + новые пути загрузки
+    let three: Vec<Value> = ["a.rs", "b.rs", "c.rs"]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| file(p, i as u64 + 1, vec![], &[]))
+        .collect();
+    put(&a, three).await;
+    let r = put_raw(&a, vec![file("d.rs", 4, vec![], &[])]).await;
+    unprocessable(&r, "3", "карта > max_files");
+    assert!(
+        r.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("code.max_files")
+    );
+    ok(
+        &put_raw(&a, vec![file("a.rs", 9, vec![], &[])]).await,
+        StatusCode::OK,
+        "тот же путь",
+    );
     let r = a
         .t(
             Method::PUT,
@@ -965,6 +987,7 @@ async fn validation_names_qual_control_chars_422() {
             "files[0].symbols[0].qual",
         ),
         (bad_sym("qual", json!("A::\nB")), "files[0].symbols[0].qual"),
+        (bad_sym("qual", json!("a/b::c")), "files[0].symbols[0].qual"),
         (
             bad_sym("sig", json!("s".repeat(161))),
             "files[0].symbols[0].sig",
@@ -1061,7 +1084,12 @@ async fn code_sync_manifest_duplicate_and_outside_root_422() {
 #[tokio::test]
 async fn code_disabled_404() {
     let a = world("disabled", |c| c.code.enabled = false).await;
-    let routes: [(Method, String, Option<Value>); 8] = [
+    let routes: [(Method, String, Option<Value>); 9] = [
+        (
+            Method::GET,
+            format!("/api/v1/code/files?solution={G}"),
+            None,
+        ),
         (
             Method::POST,
             "/api/v1/code/sync".into(),
@@ -1275,4 +1303,168 @@ async fn map_two_phase_many_files_tail_counts_all() {
     let text = md["text"].as_str().unwrap();
     let left = md["files_left"].as_u64().unwrap();
     assert!(text.contains(&format!("… ещё {left} ")), "хвост: {text}");
+}
+
+/// Ревью задачи 4, I1: манифест на `code.max_files` длинных путей укладывается в предел тела
+/// `POST /code/sync` (50 000 путей по 120 символов — ≈ 11 МБ при `max_request_bytes` 8 МиБ).
+#[tokio::test]
+async fn sync_manifest_50000_long_paths_passes() {
+    let a = world("sync-big", |_| {}).await;
+    let dir = "d".repeat(100);
+    let manifest: Vec<Value> = (0..50_000)
+        .map(|i| json!({"path": format!("{dir}/f{i:013}.rs"), "hash": h(i)}))
+        .collect();
+    assert_eq!(format!("{dir}/f{:013}.rs", 0).chars().count(), 118);
+    let body = json!({"solution": G, "manifest": manifest});
+    assert!(
+        body.to_string().len() > 8_388_608,
+        "тело больше max_request_bytes"
+    );
+    let r = a.t(Method::POST, "/api/v1/code/sync", Some(body)).await;
+    ok(&r, StatusCode::OK, "большой манифест");
+    assert_eq!(r.json()["need"].as_array().unwrap().len(), 50_000);
+}
+
+/// Ревью задачи 4, I3: ранжирование с фокусом дольше срока — карта без фокуса и
+/// предупреждение, заголовок фокус не называет.
+#[tokio::test]
+async fn focus_rank_timeout_falls_back_with_warning() {
+    let a = world("focus-timeout", |c| c.code.rank_timeout_ms = 1).await;
+    put(
+        &a,
+        vec![
+            file("src/a.rs", 1, vec![func("alpha_function", 1)], &[]),
+            file(
+                "src/b.rs",
+                2,
+                vec![func("beta_function", 1)],
+                &[("alpha_function", "call", 3)],
+            ),
+        ],
+    )
+    .await;
+    wait_ranked(&a).await;
+    let global = paths_of(&map_json(&a, "").await);
+    let focus = enc(&json!({"paths": ["src/b.rs"]}).to_string());
+    // без задержки — фокус работает
+    let m = map_json(&a, &format!("&focus={focus}")).await;
+    assert_eq!(paths_of(&m)[0], "src/b.rs", "{m}");
+    assert!(m["header"].as_str().unwrap().contains("с фокусом"));
+    // счёт дольше срока max(rank_timeout_ms, 200) — глобальный порядок
+    a.st.code
+        .hooks
+        .focus_delay_ms
+        .store(400, std::sync::atomic::Ordering::SeqCst);
+    let m = map_json(&a, &format!("&focus={focus}")).await;
+    assert_eq!(m["warnings"], json!(["focus rank timeout"]), "{m}");
+    assert_eq!(paths_of(&m), global);
+    assert!(!m["header"].as_str().unwrap().contains("с фокусом"), "{m}");
+}
+
+/// Ревью задачи 4: загрузка во время пересчёта — ранги по старым входам не сохраняются,
+/// ответ с `rank pending`; следующий пересчёт доводит до `ok`.
+#[tokio::test]
+async fn upload_during_ranking_keeps_pending_warning() {
+    let a = world("rank-race", |c| c.code.rank_timeout_ms = 5000).await;
+    put(
+        &a,
+        vec![
+            file("src/a.rs", 1, vec![func("alpha", 1)], &[]),
+            file(
+                "src/b.rs",
+                2,
+                vec![func("beta", 1)],
+                &[("alpha", "call", 1)],
+            ),
+        ],
+    )
+    .await;
+    a.st.code
+        .hooks
+        .rank_delay_ms
+        .store(400, std::sync::atomic::Ordering::SeqCst);
+    let (m, ()) = tokio::join!(map_json(&a, ""), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        put(&a, vec![file("src/c.rs", 3, vec![func("gamma", 1)], &[])]).await;
+    });
+    assert_eq!(m["warnings"], json!(["rank pending"]), "{m}");
+    a.st.code
+        .hooks
+        .rank_delay_ms
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let m = map_json(&a, "").await;
+    assert_eq!(m["warnings"], json!([]), "{m}");
+    assert_eq!(m["rank_state"], "ok");
+}
+
+/// Ревью задачи 4: два одновременных запроса карты — один пересчёт рангов (single-flight).
+#[tokio::test]
+async fn parallel_maps_run_one_ranking() {
+    let a = world("single-flight", |c| c.code.rank_timeout_ms = 5000).await;
+    put(&a, vec![file("src/a.rs", 1, vec![func("alpha", 1)], &[])]).await;
+    a.st.code
+        .hooks
+        .rank_delay_ms
+        .store(300, std::sync::atomic::Ordering::SeqCst);
+    let (m1, m2) = tokio::join!(map_json(&a, ""), map_json(&a, ""));
+    let mut w = [m1["warnings"].clone(), m2["warnings"].clone()];
+    w.sort_by_key(|v| v.as_array().map_or(0, Vec::len));
+    assert_eq!(
+        w,
+        [json!([]), json!(["rank pending"])],
+        "второй — без второго пересчёта"
+    );
+    assert_eq!(
+        a.st.code
+            .hooks
+            .rank_runs
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+/// Ревью задачи 4, I5: таблица файлов по рангу постранично, фильтр языка и подстроки пути.
+#[tokio::test]
+async fn code_files_page_lang_q_offset_limit() {
+    let a = world("files-page", |_| {}).await;
+    let mut files: Vec<Value> = (0..5u64)
+        .map(|i| {
+            file(
+                &format!("src/r{i}.rs"),
+                i + 1,
+                vec![func(&format!("r_fn_{i}"), 1)],
+                &[("hub_fn", "call", 1)],
+            )
+        })
+        .collect();
+    files.push(file("src/hub.rs", 10, vec![func("hub_fn", 1)], &[]));
+    files.push(file(
+        "web/App.ts",
+        11,
+        vec![func("app", 1), func("app2", 2)],
+        &[],
+    ));
+    put(&a, files).await;
+    let q = |s: &str| format!("/api/v1/code/files?solution={G}&{s}");
+    let j = get_ok(&a, &q("limit=3")).await;
+    assert_eq!(j["total"], 7, "{j}");
+    assert_eq!(
+        (j["offset"].clone(), j["limit"].clone()),
+        (json!(0), json!(3))
+    );
+    let page: Vec<&Value> = j["files"].as_array().unwrap().iter().collect();
+    assert_eq!(page.len(), 3);
+    assert_eq!(page[0]["path"], "src/hub.rs", "по рангу: {j}");
+    for k in ["id", "lang", "rank", "symbols"] {
+        assert!(!page[0][k].is_null(), "{k}");
+    }
+    let j = get_ok(&a, &q("limit=3&offset=6")).await;
+    assert_eq!(j["files"].as_array().unwrap().len(), 1);
+    let j = get_ok(&a, &q("lang=typescript")).await;
+    assert_eq!(j["total"], 1);
+    assert_eq!(j["files"][0]["symbols"], 2);
+    let j = get_ok(&a, &q("q=APP")).await;
+    assert_eq!(j["files"][0]["path"], "web/App.ts", "без учёта регистра");
+    unprocessable(&get(&a, &q("limit=201")).await, "200", "предел страницы");
+    unprocessable(&get(&a, &q("lang=cobol")).await, "lang", "язык");
 }
