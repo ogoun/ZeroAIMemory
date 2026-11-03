@@ -6,7 +6,7 @@ import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { request } from '@playwright/test';
-import { seed, seedCliReport, seedJournals, seedReports, type AdminCall } from './seed';
+import { seed, seedCliReport, seedCodeKnowledge, seedCodeMap, seedJournals, seedReports, type AdminCall } from './seed';
 import { seedDocs } from './seed-docs';
 import { ADMIN_STATE } from './session';
 
@@ -124,6 +124,9 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     const cliReport = seedCliReport(base, token, repo);
     const reports = await seedReports(base, token, ids.media);
     const docs = await seedDocs(base, token);
+    // карта кода решения E2E (M5.6): REST как у `zam code sync`, синтетические символы
+    await seedCodeMap(base, token);
+    const code = await seedCodeKnowledge(base, token);
     await rc.storageState({ path: ADMIN_STATE });
     await rc.dispose();
     process.env.E2E_BASE_URL = base;
@@ -148,6 +151,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_REPORT_DUP = reports.dup;
     process.env.E2E_REPORT_TASK = reports.task;
     process.env.E2E_REPORT_CLI = cliReport;
+    process.env.E2E_CODE_NOTE = code.note;
+    process.env.E2E_CODE_TASK = code.task;
   } catch (e) {
     child.kill();
     log.end();

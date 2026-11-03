@@ -296,7 +296,7 @@
         {:else if !journalsOf(journalSpace.kind).includes(r.journal)}
           <p class="warn" role="alert">
             У пространства «{journalSpace.name}» нет журнала {JOURNAL_TITLE[r.journal]}: журналы ведутся в
-            решениях (Changelog, Releases, Отчёты, Insights, Словарь, Задачи, Вопросы, Vault) и в
+            решениях (Changelog, Releases, Отчёты, Код, Insights, Словарь, Задачи, Вопросы, Vault) и в
             Knowledge (Insights, Словарь, Задачи, Вопросы, Vault).
           </p>
         {:else if r.journal === 'changelog'}
@@ -312,6 +312,21 @@
               user={r.user}
               space={r.space}
               project={journalSpace.name}
+              entry={r.entry}
+              owner={journalSpace.role === 'owner' && r.user === me.user_id}
+              {onexpired}
+            />
+          {:catch e}
+            <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
+          {/await}
+        {:else if r.journal === 'code'}
+          <!-- карта кода решения — ленивым чанком (M5.6); очищает только владелец решения -->
+          {#await import('../components/CodeView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: CodeView }}
+            <CodeView
+              user={r.user}
+              space={r.space}
               entry={r.entry}
               owner={journalSpace.role === 'owner' && r.user === me.user_id}
               {onexpired}

@@ -534,3 +534,166 @@ export function seedCliReport(base: string, token: string, repo: string): string
   if (!id) throw new Error(`zam report: нет id в ответе ${out}`);
   return id;
 }
+
+// ---- карта кода (M5.6) ----
+
+/** Секрет в сигнатуре константы `API_TOKEN` (src/b.rs): сервер маскирует его до записи. */
+export const CODE_SECRET = `ghp_${'A1b2C3d4E5'.repeat(4).slice(0, 36)}`;
+export const CODE_COMMIT = '9f8e7d6c5b4a39281706f5e4d3c2b1a098765432';
+export const CODE_BRANCH = 'm5.6-e2e';
+export const CODE_MACHINE = 'e2e-code-box';
+/** Символ, к которому привязана заметка `refs: [путь#qual]`. */
+export const CODE_REF = 'src/a.rs#Store::open';
+export const CODE_NOTE_TITLE = 'Заметка E2E о методе open';
+export const CODE_TASK_TITLE = 'Задача E2E: замок файла src/a.rs';
+
+type Sym = [name: string, qual: string, kind: string, line: number, sig?: string];
+type Ref = [name: string, kind: string, count: number];
+
+/** Файлы карты E2E: 6 разобранных (40 символов) и 2 пропущенных (минифицирован, слишком большой). */
+export const CODE_FILES: { path: string; lang: string; symbols: Sym[]; refs: Ref[]; skip?: string }[] = [
+  {
+    path: 'src/a.rs',
+    lang: 'rust',
+    symbols: [
+      ['Store', 'Store', 'struct', 1, 'pub struct Store'],
+      ['open', 'Store::open', 'method', 5, 'pub fn open(path: &Path) -> Result<Store, Error>'],
+      ['close', 'Store::close', 'method', 12, 'pub fn close(self)'],
+      ['get', 'Store::get', 'method', 16, 'pub fn get(&self, key: &str) -> Option<&[u8]>'],
+      ['put', 'Store::put', 'method', 22, 'pub fn put(&mut self, key: &str, v: Vec<u8>)'],
+      ['delete', 'Store::delete', 'method', 28, 'pub fn delete(&mut self, key: &str) -> bool'],
+      ['Error', 'Error', 'enum', 34, 'pub enum Error'],
+      ['DEFAULT_PATH', 'DEFAULT_PATH', 'const', 40, 'pub const DEFAULT_PATH: &str = "data.db";'],
+    ],
+    refs: [['Error', 'type', 2], ['normalize', 'call', 1]],
+  },
+  {
+    path: 'src/b.rs',
+    lang: 'rust',
+    symbols: [
+      ['Index', 'Index', 'struct', 1, 'pub struct Index'],
+      ['build', 'Index::build', 'method', 4, 'pub fn build(store: &Store) -> Index'],
+      ['search', 'Index::search', 'method', 10, 'pub fn search(&self, q: &str) -> Vec<Hit>'],
+      ['merge', 'Index::merge', 'method', 16, 'pub fn merge(&mut self, other: Index)'],
+      ['rank', 'rank', 'function', 22, 'fn rank(hits: &mut [Hit])'],
+      ['normalize', 'normalize', 'function', 28, 'pub fn normalize(s: &str) -> String'],
+      ['API_TOKEN', 'API_TOKEN', 'const', 34, `const API_TOKEN: &str = "${CODE_SECRET}";`],
+    ],
+    refs: [['open', 'call', 2], ['Store', 'type', 3], ['get', 'call', 4]],
+  },
+  {
+    path: 'src/c.rs',
+    lang: 'rust',
+    symbols: [
+      ['Config', 'Config', 'struct', 1, 'pub struct Config'],
+      ['load', 'Config::load', 'method', 5, 'pub fn load(path: &Path) -> Config'],
+      ['save', 'Config::save', 'method', 11, 'pub fn save(&self) -> io::Result<()>'],
+      ['parse_args', 'parse_args', 'function', 17, 'fn parse_args() -> Args'],
+      ['main', 'main', 'function', 23, 'fn main()'],
+    ],
+    refs: [['Store', 'type', 1], ['open', 'call', 1], ['Index', 'type', 1], ['search', 'call', 2]],
+  },
+  {
+    path: 'web/app.ts',
+    lang: 'typescript',
+    symbols: [
+      ['App', 'App', 'class', 1, 'export class App'],
+      ['start', 'App.start', 'method', 4, 'start(): void'],
+      ['render', 'render', 'function', 12, 'export function render(el: HTMLElement): void'],
+      ['mount', 'mount', 'function', 18, 'export function mount(): App'],
+      ['Router', 'Router', 'class', 24, 'export class Router'],
+      ['go', 'Router.go', 'method', 27, 'go(to: string): void'],
+      ['back', 'Router.back', 'method', 31, 'back(): void'],
+      ['View', 'View', 'interface', 36, 'export interface View'],
+    ],
+    refs: [['fmt', 'call', 3], ['debounce', 'call', 1], ['Queue', 'type', 1]],
+  },
+  {
+    path: 'web/util.ts',
+    lang: 'typescript',
+    symbols: [
+      ['fmt', 'fmt', 'function', 1, 'export function fmt(n: number): string'],
+      ['clamp', 'clamp', 'function', 5, 'export function clamp(x: number, a: number, b: number): number'],
+      ['debounce', 'debounce', 'function', 9, 'export function debounce(f: () => void, ms: number)'],
+      ['throttle', 'throttle', 'function', 15, 'export function throttle(f: () => void, ms: number)'],
+      ['uid', 'uid', 'function', 21, 'export const uid = (): string =>'],
+      ['Queue', 'Queue', 'class', 25, 'export class Queue<T>'],
+    ],
+    refs: [],
+  },
+  {
+    path: 'tools/gen.py',
+    lang: 'python',
+    symbols: [
+      ['Generator', 'Generator', 'class', 1, 'class Generator:'],
+      ['run', 'Generator.run', 'method', 4, 'def run(self) -> None:'],
+      ['emit', 'emit', 'function', 10, 'def emit(line: str) -> None:'],
+      ['main', 'main', 'function', 14, 'def main() -> int:'],
+      ['parse_cli', 'parse_cli', 'function', 18, 'def parse_cli(argv: list[str]) -> dict:'],
+      ['write_file', 'write_file', 'function', 24, 'def write_file(path: str, text: str) -> None:'],
+    ],
+    refs: [['emit', 'call', 2], ['normalize', 'call', 1]],
+  },
+  { path: 'web/vendor.min.js', lang: 'javascript', symbols: [], refs: [], skip: 'minified' },
+  { path: 'assets/big.ts', lang: 'typescript', symbols: [], refs: [], skip: 'too_large' },
+];
+
+const hexOf = (n: number, len: number) => n.toString(16).padStart(len, '0');
+
+/**
+ * Карта кода решения E2E по токену администратора — как её строит `zam code sync`, но без
+ * бинарника `zam` (синтетические символы): `POST /code/sync` с манифестом, затем
+ * `PUT /code/files` файлов из `need`. Повторный вызов восстанавливает карту после очистки.
+ */
+export async function seedCodeMap(base: string, token: string): Promise<void> {
+  const files = CODE_FILES.map((f, i) => ({ ...f, hash: hexOf(0xc0de00 + i, 64) }));
+  const meta = { solution: SOLUTION_GUID, commit: CODE_COMMIT, branch: CODE_BRANCH, machine: CODE_MACHINE };
+  const sync = await api<{ need: string[] }>(base, token, 'POST', 'code/sync', json({
+    ...meta,
+    manifest: files.map((f) => ({ path: f.path, hash: f.hash })),
+  }));
+  const need = new Set(sync.need);
+  let body = 0;
+  const upload = files
+    .filter((f) => need.has(f.path))
+    .map((f) => ({
+      path: f.path,
+      lang: f.lang,
+      hash: f.hash,
+      size: f.skip === 'too_large' ? 4_000_000 : 1200,
+      parse_state: f.skip ? 'skipped' : 'ok',
+      ...(f.skip ? { skip_reason: f.skip } : {}),
+      symbols: f.symbols.map(([name, qual, kind, line, sig]) => ({
+        name,
+        qual,
+        kind,
+        line,
+        end_line: line + 4,
+        ...(sig ? { sig } : {}),
+        body_hash: hexOf(++body, 16),
+        exported: true,
+      })),
+      refs: f.refs.map(([name, kind, count]) => ({ name, kind, count, first_line: 1 })),
+    }));
+  if (upload.length) await api(base, token, 'PUT', 'code/files', json({ ...meta, files: upload }));
+}
+
+/**
+ * Знания о коде: заметка со ссылкой на символ {@link CODE_REF} и задача о файле src/a.rs
+ * (задача, а не insight: журнал Insights в journals.spec считает свои записи).
+ */
+export async function seedCodeKnowledge(base: string, token: string): Promise<{ note: string; task: string }> {
+  const note = await api<Node>(base, token, 'POST', 'nodes', json({
+    space: SOLUTION_GUID,
+    path: `E2E/${CODE_NOTE_TITLE}`,
+    kind: 'note',
+    content: `---\nrefs: ["${CODE_REF}"]\n---\n# ${CODE_NOTE_TITLE}\n\nОткрытие хранилища берёт замок файла.\n`,
+  }));
+  const task = await api<EntryResp>(base, token, 'POST', `spaces/${SOLUTION_GUID}/entries`, json({
+    kind: 'task',
+    title: CODE_TASK_TITLE,
+    body: 'Проверить замок файла при открытии хранилища.',
+    refs: { files: [{ path: 'src/a.rs' }] },
+  }));
+  return { note: note.id, task: task.id };
+}
