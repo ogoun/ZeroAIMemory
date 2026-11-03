@@ -32,7 +32,7 @@
    * при открытом «Обзоре» не перерисовывает диаграмму; общий долг).
    */
   const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  let svgs = new Map<string, string>();
+  let svgs = new Map<string, SVGElement>();
 
   $effect(() => {
     let live = true;
@@ -60,9 +60,16 @@
     };
   });
 
-  /** В простое браузера (запасной путь — таймер): печатная копия не задерживает экранную. */
-  const idle = (f: () => void) =>
-    'requestIdleCallback' in window ? requestIdleCallback(f, { timeout: 2000 }) : setTimeout(f, 200);
+  /** В простое браузера (запасной путь — таймер): печатная копия не задерживает экранную;
+   * возвращает отмену. */
+  function idle(f: () => void): () => void {
+    if ('requestIdleCallback' in window) {
+      const h = requestIdleCallback(f, { timeout: 2000 });
+      return () => cancelIdleCallback(h);
+    }
+    const h = setTimeout(f, 200);
+    return () => clearTimeout(h);
+  }
 
   // диаграмма — после вставки исходника в DOM; модуль Mermaid — ленивый чанк; готовые SVG — из
   // кэша записи; печатная копия — после экранной, своей темой
@@ -70,18 +77,25 @@
     const b = box;
     const pb = printBox;
     if (!b || !overview) return;
+    let live = true;
+    let cancel = () => {};
     tick()
       .then(() => import('../lib/hydrate/mermaid'))
       .then(async (m) => {
         await m.renderMermaid(b, { cache: svgs });
-        if (pb)
-          idle(() =>
+        if (pb && live)
+          cancel = idle(() =>
             m
               .renderMermaid(pb, { theme: 'default', cache: svgs })
               .then(() => (printReady = !!pb.querySelector('.mermaid-diagram'))),
           );
       })
       .catch((e) => (error = errorText(e)));
+    // новый исходник или уход: отложенная печатная копия прежнего не рисуется
+    return () => {
+      live = false;
+      cancel();
+    };
   });
 </script>
 

@@ -116,10 +116,10 @@ export interface RenderOpts {
   theme?: Theme;
   /**
    * Готовые SVG по `тема + исходник` (кэш вызывающего, «Обзор» карты кода): найденный —
-   * вставляется без `mermaid.render`, нарисованный — кладётся. Строки — уже очищенный DOMPurify
-   * результат этого модуля и живут только в памяти страницы.
+   * вставляется копией (`cloneNode`) без `mermaid.render` и разбора разметки, нарисованный —
+   * кладётся. Элементы — уже очищенный DOMPurify результат этого модуля, вне документа.
    */
-  cache?: Map<string, string>;
+  cache?: Map<string, SVGElement>;
 }
 
 /**
@@ -133,7 +133,7 @@ export function renderMermaid(root: HTMLElement, o: RenderOpts = {}): Promise<vo
   return run;
 }
 
-async function render(root: HTMLElement, want: Theme, cache?: Map<string, string>): Promise<void> {
+async function render(root: HTMLElement, want: Theme, cache?: Map<string, SVGElement>): Promise<void> {
   for (const pre of root.querySelectorAll<HTMLElement>('pre.mermaid-src')) {
     // повторный вызов для того же документа (смена bind:this) не рендерит блок дважды
     if (!pre.isConnected || pre.dataset.zamMermaid) continue;
@@ -145,14 +145,14 @@ async function render(root: HTMLElement, want: Theme, cache?: Map<string, string
 ${src}`;
     try {
       const ready = cache?.get(key);
-      if (ready) box.innerHTML = ready;
+      if (ready) box.append(ready.cloneNode(true));
       else {
         init(want);
         const { svg } = await mermaid.render(`zam-mermaid-${++seq}`, src);
         box.innerHTML = sanitize(svg);
         if (!box.querySelector('svg')) throw new Error('пустой результат');
         decodeLabels(box);
-        cache?.set(key, box.innerHTML);
+        cache?.set(key, box.querySelector('svg')!.cloneNode(true) as SVGElement);
       }
       box.setAttribute('role', 'img');
       box.setAttribute('aria-label', 'Диаграмма');

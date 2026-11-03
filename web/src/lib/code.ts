@@ -58,6 +58,8 @@ export interface CodeKnowledge {
   state: string;
   /** `qual` символа — у ссылок на символ; без него — знание о файле. */
   symbol?: string;
+  /** Id пространства записи (сервер с задачи 9A M5.6); нет — текущее пространство. */
+  space?: string;
 }
 
 /** `GET /code/symbols/{путь#qual}`. */
@@ -140,7 +142,11 @@ export function codeFiles(
 }
 
 export const codeOverview = (user: string, space: string) =>
-  codeCall<CodeMapJson>('GET', `code/map?solution=${q(space)}&format=json&budget_tokens=${OVERVIEW_BUDGET}`, user);
+  codeCall<CodeMapJson>(
+    'GET',
+    `code/map?solution=${q(space)}&format=json&files=${OVERVIEW_FILES}&budget_tokens=${OVERVIEW_BUDGET}`,
+    user,
+  );
 
 /** Версия карты для кэша «Обзора»: etag снимка и состояние рангов (как `ETag` `/code/map`). */
 export const overviewVersion = (s: Pick<CodeStatus, 'etag' | 'rank_state'>): string | null =>
@@ -150,7 +156,7 @@ export const overviewVersion = (s: Pick<CodeStatus, 'etag' | 'rank_state'>): str
 export interface OverviewEntry {
   data: Promise<CodeMapJson>;
   /** `renderMermaid({ cache })`: очищенные SVG по `тема + исходник`. */
-  svgs: Map<string, string>;
+  svgs: Map<string, SVGElement>;
 }
 
 /** Последний «Обзор»: одна запись — `(пользователь, решение, версия карты)`. */
@@ -167,7 +173,7 @@ export function codeOverviewCached(user: string, space: string, version: string 
   const key = JSON.stringify([user, space, version]);
   if (overviewCache?.key === key) return overviewCache;
   const data = codeOverview(user, space);
-  const entry = { key, data, svgs: new Map<string, string>() };
+  const entry = { key, data, svgs: new Map<string, SVGElement>() };
   overviewCache = entry;
   data.catch(() => {
     if (overviewCache === entry) overviewCache = null;

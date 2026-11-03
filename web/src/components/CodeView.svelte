@@ -289,16 +289,14 @@
     return (card?.knowledge ?? []).filter((k) => !seen.has(k.id) && !!seen.add(k.id));
   });
 
-  /**
-   * Ссылка на знание: заметка — документ, запись — её журнал. Пространство — текущее: сервер
-   * (`knowledge_json`) пространство записи не отдаёт, и знание из Knowledge участника ведёт мимо
-   * (нужен `space` в ответе карточки — журнал этапа, задача 9B).
-   */
+  /** Ссылка на знание — в пространстве записи (`space`; сервер до 9A его не отдавал — текущее):
+   * заметка — документ, запись — её журнал. */
   function knowledgeHref(k: CodeKnowledge): string | null {
     const id = k.id.includes(':') ? k.id.slice(k.id.indexOf(':') + 1) : k.id;
-    if (k.kind === 'note') return href({ name: 'node', user, space, node: id, anchor: null });
+    const sp = k.space ?? space;
+    if (k.kind === 'note') return href({ name: 'node', user, space: sp, node: id, anchor: null });
     const j = JOURNAL_OF_KIND[k.kind];
-    return j ? href({ name: 'journal', user, space, journal: j, entry: id }) : null;
+    return j ? href({ name: 'journal', user, space: sp, journal: j, entry: id }) : null;
   }
 
   /** Клавиатура tablist: ←/→ по кругу, Home, End; выбор следует за фокусом. */

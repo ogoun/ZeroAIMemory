@@ -179,6 +179,48 @@ test('code_card_sig_refs_knowledge_links', async ({ page }) => {
   expect(problems.filter((p) => !p.includes('/code/symbols/')), problems.join('\n')).toEqual([]);
 });
 
+test('code_card_knowledge_link_to_record_space', async ({ page }) => {
+  const problems = watch(page);
+  const base_ = base();
+  const auth = { Authorization: `Bearer ${env('E2E_ADMIN_TOKEN')}` };
+  // знание из другого пространства (Knowledge участника): ссылка — в его адрес (`space` знания)
+  const sp = await page.request.get(`${base_}api/v1/spaces`, { headers: auth });
+  expect(sp.ok()).toBe(true);
+  const spaces = ((await sp.json()) as { spaces: { id: string; kind: string }[] }).spaces;
+  const knowledgeId = spaces.find((s) => s.kind === 'knowledge')!.id;
+  const solutionId = spaces.find((s) => s.kind === 'solution')?.id;
+  const title = `Знание из Knowledge ${Date.now()}`;
+  const r = await page.request.post(`${base_}api/v1/nodes`, {
+    headers: auth,
+    data: { space: 'knowledge', path: `E2E/${title}`, kind: 'note', content: `# ${title}\n\nЗаметка другого пространства.\n` },
+  });
+  expect(r.ok(), await r.text()).toBe(true);
+  const node = (await r.json()) as { id: string; current_rev: number };
+  const isCard = (u: URL) => u.pathname.includes('/api/v1/code/symbols/');
+  await page.route(isCard, async (route) => {
+    const resp = await route.fetch();
+    const card = (await resp.json()) as { knowledge: Record<string, unknown>[] };
+    card.knowledge.push({ path: 'src/a.rs', id: `n:${node.id}`, kind: 'note', title, state: 'ok', space: knowledgeId, symbol: 'Store::open' });
+    return route.fulfill({ json: card });
+  });
+  try {
+    await openCode(page, CODE_REF);
+    const know = page.getByRole('article', { name: 'Карточка символа' }).getByRole('list', { name: 'Привязанные знания' });
+    const link = know.getByRole('link', { name: title });
+    await expect(link).toHaveAttribute('href', `#/u/${await admin(page)}/s/${knowledgeId}/n/${node.id}`);
+    // знания решения: с `space` сервера (задача 9A) — его Id, без поля — текущее пространство
+    const own = await know.getByRole('link', { name: CODE_NOTE_TITLE }).getAttribute('href');
+    expect(own).toMatch(new RegExp(`/s/(${SOLUTION_GUID}${solutionId ? `|${solutionId}` : ''})/n/${env('E2E_CODE_NOTE')}$`));
+    await link.click();
+    await expect(page).toHaveURL(new RegExp(`/s/${knowledgeId}/n/${node.id}$`));
+    await expect(page.locator('.doc')).toContainText('Заметка другого пространства.');
+  } finally {
+    await page.unroute(isCard);
+    await page.request.delete(`${base_}api/v1/nodes/${node.id}`, { headers: { ...auth, 'If-Match': String(node.current_rev) } });
+  }
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('code_files_table_rank_lang_filter', async ({ page }) => {
   const problems = watch(page);
   await openCode(page);
@@ -295,14 +337,22 @@ test('code_tabs_keyboard_aria', async ({ page }) => {
 test('code_overview_cached_between_tabs', async ({ page }) => {
   const problems = watch(page);
   let maps = 0;
+  const urls: URL[] = [];
   page.on('request', (r) => {
-    if (new URL(r.url()).pathname.endsWith('/api/v1/code/map')) maps++;
+    const u = new URL(r.url());
+    if (u.pathname.endsWith('/api/v1/code/map')) {
+      maps++;
+      urls.push(u);
+    }
   });
   await openCode(page);
   const svg = page.locator('.code-overview .mermaid-diagram svg').first();
   await page.getByRole('tab', { name: 'Обзор' }).click();
   await expect(svg).toBeVisible({ timeout: 30_000 });
   expect(maps).toBe(1);
+  // только первые 40 файлов и рёбра между ними (`files`, задача 9A)
+  expect(urls[0].searchParams.get('files')).toBe('40');
+  expect(urls[0].searchParams.get('format')).toBe('json');
   const first = await svg.getAttribute('id');
   // туда и обратно: тот же снимок — без запроса и без нового mermaid.render (SVG из кэша: тот же id)
   await page.getByRole('tab', { name: 'Файлы' }).click();
