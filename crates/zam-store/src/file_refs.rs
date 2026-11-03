@@ -815,7 +815,9 @@ pub async fn files_changed(
 
 /// Правило загрузки карты кода (`PUT /code/files`) для ссылок владельцев из `spaces` другой
 /// базы (Knowledge участника): судятся только ссылки на символы и только по присланным
-/// символам (`symbols: None` — файл пропущен или разобран не полностью — ссылки не судятся),
+/// символам (`symbols: None` — файл пропущен или разобран не полностью — ссылки не судятся;
+/// **при `partial` передавайте `None`**: присланный список считается полным, и не найденный в
+/// нём символ стал бы `symbol_removed`, хотя его мог обрезать предел),
 /// файловые ссылки и хэш файла не меняются — как у `code_put_files` в базе владельца
 /// (решение контроллера по ревью задачи 3, I2). Возвращает, сколько ссылок признано
 /// устаревшими.
@@ -994,6 +996,56 @@ pub async fn refs_index(
                     symbol,
                 });
             }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Живые владельцы ссылок решения `solution` на путь `path` (нормализован вызывающим) в
+/// пространствах `spaces` — без предела [`INDEX_ITEMS_MAX`] (карточка символа и влияние правки,
+/// M5.6 §8–§9): ссылки на символы первыми, затем новые первыми; владелец с несколькими
+/// ссылками пути (файловой и символьными) — по строке на ссылку.
+pub async fn path_owners(
+    db: &Db,
+    solution: &str,
+    path: &str,
+    spaces: &[Id],
+) -> Result<Vec<RefItem>, StoreError> {
+    if spaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (solution, path) = (solution.to_string(), path.to_string());
+    let spaces = ids_json(spaces);
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT f.state, f.owner_kind, f.owner_id, coalesce(n.name, e.title, ''), e.kind,
+                    f.symbol
+             FROM file_refs f {OWNER_JOIN}
+             WHERE f.solution_guid = ?1 AND f.path = ?3 AND {LIVE_OWNER}
+             ORDER BY f.symbol IS NULL, f.recorded_at DESC, f.id DESC"
+        ))?;
+        let rows = st.query_map(params![solution, spaces, path], |r| {
+            Ok((
+                r.get::<_, RefState>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (state, kind, id, title, ekind, symbol) = row?;
+            let (id, kind) = owner_ref(&kind, &id, ekind.as_deref());
+            out.push(RefItem {
+                id,
+                kind,
+                title,
+                state,
+                symbol,
+            });
         }
         Ok(out)
     })

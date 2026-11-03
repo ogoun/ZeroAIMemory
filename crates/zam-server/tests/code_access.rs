@@ -447,3 +447,118 @@ async fn member_sees_only_solution_map() {
         r.text()
     );
 }
+
+/// Состояния ссылок пути `path` в индексе хуков участника: `(заголовок, символ, состояние)`.
+async fn ref_states(w: &W, tok: &str, path: &str) -> Vec<(String, Option<String>, String)> {
+    let idx =
+        w.a.tok(
+            tok,
+            Method::GET,
+            &format!("/api/v1/file-refs?solution={G}"),
+            None,
+        )
+        .await
+        .json();
+    idx["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["path"] == path)
+        .flat_map(|r| r["items"].as_array().unwrap().clone())
+        .map(|it| {
+            (
+                it["title"].as_str().unwrap().to_string(),
+                it["symbol"].as_str().map(str::to_string),
+                it["state"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Knowledge участника (другая база) по правилу карты (ревью задачи 3, I2/I3): CRLF-близнец
+/// файла с другой машины не трогает файловых ссылок; удаление файла синхронизацией
+/// (`git rm`) — `symbol_removed` у ссылок на его символы, в ответе `sync` — `stale_refs`.
+#[tokio::test]
+async fn member_knowledge_crlf_twin_and_removed_file() {
+    let w = world("member-knowledge").await;
+    let sol = [("x-zam-solution", G)];
+    // у участника в Knowledge: запись о файле (с хэшем) и заметка о символе
+    let r =
+        w.a.tok_h(
+            &w.rw.tok,
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(
+                json!({"kind": "insight", "title": "О файле a.rs", "body": "Подробности.",
+                        "data": {"kind": "gotcha"}, "force": true,
+                        "refs": {"files": [{"path": "a.rs", "hash": h(1)}]}}),
+            ),
+            &sol,
+        )
+        .await;
+    ok(&r, StatusCode::CREATED, "запись участника");
+    let r =
+        w.a.tok_h(
+            &w.rw.tok,
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": "knowledge", "path": "О alpha", "kind": "note",
+                        "content": "---\nrefs: [\"a.rs#alpha\"]\n---\nтекст\n"}),
+            ),
+            &sol,
+        )
+        .await;
+    ok(&r, StatusCode::CREATED, "заметка участника");
+    // у владельца в решении — заметка о том же символе
+    let r =
+        w.a.tok(
+            &w.o.tok,
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": G, "path": "О alpha (решение)", "kind": "note",
+                        "content": "---\nrefs: [\"a.rs#alpha\"]\n---\nтекст\n"}),
+            ),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED, "заметка владельца");
+    let r = put(&w, &As::Tok(&w.rw.tok), G, vec![file("a.rs", 1, "alpha")]).await;
+    ok(&r, StatusCode::OK, "первая загрузка");
+    assert_eq!(r.json()["stale_refs"], 0);
+    // та же версия с другой машины: другой хэш файла (CRLF), то же тело символа
+    let mut twin = file("a.rs", 2, "alpha");
+    twin["symbols"][0]["body_hash"] = json!(format!("{:016x}", 1));
+    let r = put(&w, &As::Tok(&w.rw.tok), G, vec![twin]).await;
+    ok(&r, StatusCode::OK, "близнец с тем же телом");
+    assert_eq!(
+        r.json()["stale_refs"],
+        0,
+        "файловые ссылки не судятся картой"
+    );
+    for (title, symbol, state) in ref_states(&w, &w.rw.tok, "a.rs").await {
+        assert_eq!(state, "ok", "{title} {symbol:?}");
+    }
+    // `git rm a.rs`: манифест без файла
+    let r = call(
+        &w,
+        &As::Tok(&w.rw.tok),
+        Method::POST,
+        "/api/v1/code/sync",
+        Some(json!({"solution": G, "manifest": [{"path": "b.rs", "hash": h(5)}]})),
+    )
+    .await;
+    ok(&r, StatusCode::OK, "синхронизация без a.rs");
+    let j = r.json();
+    assert_eq!(j["removed"], 1, "{j}");
+    assert_eq!(
+        j["stale_refs"], 2,
+        "символьные ссылки владельца и участника: {j}"
+    );
+    let states = ref_states(&w, &w.rw.tok, "a.rs").await;
+    assert_eq!(states.len(), 3, "{states:?}");
+    for (title, symbol, state) in states {
+        let want = if symbol.is_some() { "stale" } else { "ok" };
+        assert_eq!(state, want, "{title} {symbol:?}");
+    }
+}

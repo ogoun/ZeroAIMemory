@@ -219,6 +219,7 @@ async fn sync_need_removed_etag() {
         "{j}"
     );
     assert_eq!(j["removed"], 0);
+    assert_eq!(j["stale_refs"], 0);
     let etag0 = j["etag"].as_str().unwrap().to_string();
     put(
         &a,
@@ -622,6 +623,7 @@ async fn map_rank_pending_warning_on_timeout() {
     wait_ranked(&a).await;
     let m = map_json(&a, "").await;
     assert_eq!(m["warnings"], json!([]), "{m}");
+    assert_eq!(m["rank_state"], "ok", "повторный запрос после фона: {m}");
     assert_eq!(paths_of(&m)[0], "src/a.rs", "на a.rs ссылаются");
 }
 
@@ -1165,4 +1167,112 @@ async fn code_routes_not_counted_as_memory_writes() {
     ok(&r, StatusCode::CREATED, "заметка");
     let s = get_ok(&a, "/api/v1/sessions/s-code").await;
     assert_eq!(s["memory_writes"], 1, "{s}");
+}
+
+/// `git rm` у владельца (ревью задачи 3, I3): файл исчезает из карты, ссылки на его символы —
+/// `stale` (их число — `stale_refs` ответа `sync`), файловая ссылка не трогается.
+#[tokio::test]
+async fn sync_removed_file_marks_symbol_refs_stale() {
+    let w = linked("sync-rm").await;
+    let r = sync(&w.a, &[("b.rs", 2), ("c.rs", 3)]).await;
+    ok(&r, StatusCode::OK, "синхронизация без a.rs");
+    let j = r.json();
+    assert_eq!(j["removed"], 1, "{j}");
+    assert_eq!(j["stale_refs"], 2, "заметки о foo и bar: {j}");
+    let idx = get_ok(&w.a, &format!("/api/v1/file-refs?solution={G}")).await;
+    let items = idx["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"] == "a.rs")
+        .unwrap()["items"]
+        .clone();
+    for it in items.as_array().unwrap() {
+        let want = if it["symbol"].is_string() {
+            "stale"
+        } else {
+            "ok"
+        };
+        assert_eq!(it["state"], want, "{it}");
+    }
+    // повтор той же синхронизации — ничего не удалено
+    let j = sync(&w.a, &[("b.rs", 2), ("c.rs", 3)]).await.json();
+    assert_eq!(
+        (j["removed"].clone(), j["stale_refs"].clone()),
+        (json!(0), json!(0))
+    );
+}
+
+/// Две фазы карты: файлов больше первой порции (64) — символы дочитываются, пока все
+/// прочитанные файлы показаны; хвост считает всю карту.
+#[tokio::test]
+async fn map_two_phase_many_files_tail_counts_all() {
+    let a = world("two-phase", |_| {}).await;
+    let files: Vec<Value> = (0..300u64)
+        .map(|i| {
+            let refs: &[(&str, &str, u32)] = if i > 0 {
+                &[("root_fn_000", "call", 1)]
+            } else {
+                &[]
+            };
+            file(
+                &format!("p/f{i:03}.rs"),
+                i + 1,
+                vec![func(&format!("root_fn_{i:03}"), 1)],
+                refs,
+            )
+        })
+        .collect();
+    put(&a, files).await;
+    let m = map_json(&a, "&budget_tokens=20000").await;
+    assert_eq!(m["files_shown"], 300, "все файлы: {}", m["files_left"]);
+    assert_eq!(m["symbols_shown"], 300);
+    assert_eq!(m["files_left"], 0);
+    assert_eq!(paths_of(&m)[0], "p/f000.rs", "на него ссылаются все");
+    for budget in [300, 1000] {
+        let m = map_json(&a, &format!("&budget_tokens={budget}")).await;
+        let (shown, left) = (
+            m["files_shown"].as_u64().unwrap(),
+            m["files_left"].as_u64().unwrap(),
+        );
+        assert_eq!(shown + left, 300, "{budget}");
+        assert!(shown > 0 && left > 0, "{budget}: {shown}/{left}");
+        let syms = m["symbols_shown"].as_u64().unwrap() + m["symbols_left"].as_u64().unwrap();
+        assert_eq!(syms, 300);
+    }
+    // дешёвые файлы (без символов, ≈ 3 токена): показано больше первой порции (бюджет / 8)
+    let b = world("two-phase-cheap", |_| {}).await;
+    for part in [0..300u64, 300..600] {
+        let cheap: Vec<Value> = part
+            .map(|i| file(&format!("q/a{i}.rs"), i + 1, vec![], &[]))
+            .collect();
+        put(&b, cheap).await;
+    }
+    let m = map_json(&b, "&budget_tokens=2000").await;
+    let shown = m["files_shown"].as_u64().unwrap();
+    assert!(shown > 2000 / 8, "порция дочитана: {shown}");
+    assert_eq!(shown + m["files_left"].as_u64().unwrap(), 600);
+    assert!(m["tokens"].as_u64().unwrap() <= 2000);
+    let md = get_ok(
+        &b,
+        &format!("/api/v1/code/map?solution={G}&budget_tokens=2000"),
+    )
+    .await;
+    let text = md["text"].as_str().unwrap();
+    assert!(
+        !text.lines().any(str::is_empty),
+        "непрочитанные файлы не показаны: {text}"
+    );
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("q/a")).count() as u64,
+        shown
+    );
+    let md = get_ok(
+        &a,
+        &format!("/api/v1/code/map?solution={G}&budget_tokens=300"),
+    )
+    .await;
+    let text = md["text"].as_str().unwrap();
+    let left = md["files_left"].as_u64().unwrap();
+    assert!(text.contains(&format!("… ещё {left} ")), "хвост: {text}");
 }

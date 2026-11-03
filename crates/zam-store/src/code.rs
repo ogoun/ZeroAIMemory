@@ -51,6 +51,8 @@ const FTS_CANDIDATES_MAX: i64 = 2000;
 const FTS_PREFIX_MIN_CHARS: usize = 2;
 /// Относительное изменение ранга файла, ниже которого строка не переписывается.
 const RANK_REL_EPS: f64 = 1e-4;
+/// Центральных символов из одного файла не больше (§7).
+const CENTRAL_PER_FILE: usize = 3;
 /// Изменение доли символа, ниже которого доли файла не переписываются.
 const SHARE_EPS: f32 = 1e-4;
 
@@ -313,6 +315,12 @@ fn ts_col(r: &Row<'_>, i: usize) -> rusqlite::Result<Timestamp> {
     parse_ts(&s).map_err(|e| crate::time::conv_err(i, e))
 }
 
+/// Токен решения в `code_symbols_fts.sol`: `s` + 16 hex blake3 GUID — одно слово для
+/// токенизатора `unicode61` при любом GUID.
+fn sol_token(solution: &str) -> String {
+    format!("s{}", &blake3::hash(solution.as_bytes()).to_hex()[..16])
+}
+
 /// `etag` снимка: blake3 `(files, symbols, updated_at, gen)`, 32 hex.
 fn etag_of(files: i64, symbols: i64, updated_at: &str, generation: i64) -> String {
     let h = blake3::hash(format!("{files}\n{symbols}\n{updated_at}\n{generation}").as_bytes());
@@ -501,8 +509,10 @@ fn put_file(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) RETURNING id",
     )?;
     let mut fts = tx.prepare_cached(
-        "INSERT INTO code_symbols_fts (rowid, name, qual, terms) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO code_symbols_fts (rowid, name, qual, terms, sol, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
+    let sol = sol_token(solution);
     for s in &f.symbols {
         let sid: i64 = sym.query_row(
             params![
@@ -518,7 +528,14 @@ fn put_file(
             ],
             |r| r.get(0),
         )?;
-        fts.execute(params![sid, s.name, s.qual, fts_terms(&s.name, &s.qual)])?;
+        fts.execute(params![
+            sid,
+            s.name,
+            s.qual,
+            fts_terms(&s.name, &s.qual),
+            sol,
+            s.kind.as_str()
+        ])?;
     }
     // повтор `(name, kind)` в загрузке складывается
     let mut rf = tx.prepare_cached(
@@ -951,6 +968,76 @@ pub async fn code_map_rows(
     Ok(files)
 }
 
+/// Центральные символы решения (§7) без чтения всей карты: первые `n` по рангу символа
+/// (ранг файла × доля), не больше трёх из одного файла; при равенстве — по порядку файла и
+/// месту символа. Файлы перебираются по убыванию ранга, не больше `files_max`; перебор
+/// останавливается, как только ранг файла не выше `n`-го найденного (ранг символа не выше
+/// ранга его файла).
+pub async fn code_central(
+    db: &Db,
+    solution: &str,
+    n: usize,
+    files_max: usize,
+) -> Result<Vec<SymbolHit>, StoreError> {
+    if n == 0 || files_max == 0 {
+        return Ok(Vec::new());
+    }
+    let solution = solution.to_string();
+    let files_max = i64::try_from(files_max).unwrap_or(i64::MAX);
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        // (ранг символа, порядок файла, индекс символа в файле, id файла)
+        let mut best: Vec<(f64, usize, usize, i64)> = Vec::new();
+        {
+            let mut files = tx.prepare_cached(
+                "SELECT id, rank, shares, symbols FROM code_files WHERE solution_guid = ?1
+                 ORDER BY rank DESC, path LIMIT ?2",
+            )?;
+            let rows = files.query_map(params![solution, files_max], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            for (order, row) in rows.enumerate() {
+                let (fid, rank, shares, count) = row?;
+                if best.len() >= n && rank <= best[n - 1].0 {
+                    break;
+                }
+                let count = count.max(0) as usize;
+                let mut own: Vec<(f64, usize)> = (0..count)
+                    .map(|i| (rank * share_at(shares.as_deref(), i, count), i))
+                    .collect();
+                own.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                best.extend(
+                    own.into_iter()
+                        .take(CENTRAL_PER_FILE)
+                        .map(|(r, i)| (r, order, i, fid)),
+                );
+                best.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+                best.truncate(n);
+            }
+        }
+        let mut sym = tx.prepare_cached(&format!(
+            "SELECT {HIT_COLS} FROM code_symbols s JOIN code_files f ON f.id = s.file_id
+             WHERE s.file_id = ?1 ORDER BY s.id LIMIT 1 OFFSET ?2"
+        ))?;
+        let mut out = Vec::with_capacity(best.len());
+        for (_, _, idx, fid) in best {
+            if let Some(h) = sym
+                .query_row(params![fid, idx as i64], hit_row)
+                .optional()?
+            {
+                out.push(h);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
 /// Столбцы [`hit_row`]: ранг символа — из ранга файла, его долей, места символа среди
 /// символов файла (по `id`, индекс `code_symbols_file`) и их числа.
 const HIT_COLS: &str = "s.id, s.file_id, f.path, s.name, s.qual, s.kind, s.line, s.end_line,
@@ -1013,8 +1100,10 @@ fn symbol_fts(q: &str, prefix: bool) -> Option<String> {
 /// Поиск символа: сначала точное совпадение `qual` (затем имени), потом FTS по словам имени и
 /// `qual` — точными словами, затем префиксами; внутри группы — по рангу символа. Фильтры — вид
 /// и путь (файл или каталог). `limit` — 1..=100. FTS отдаёт не больше
-/// [`FTS_CANDIDATES_MAX`] кандидатов на проход до фильтров (без сортировки по bm25: на миллионе
-/// символов она стоила секунды) — у очень частого слова выдача неполна.
+/// [`FTS_CANDIDATES_MAX`] кандидатов на проход (без сортировки по bm25: на миллионе символов
+/// она стоила секунды); решение и вид входят в сам запрос MATCH (столбцы `sol`, `kind`), так
+/// что предел действует внутри решения, а путь фильтруется после — у очень частого слова в
+/// узкой области выдача может быть неполна.
 pub async fn code_symbols_search(
     db: &Db,
     solution: &str,
@@ -1027,6 +1116,11 @@ pub async fn code_symbols_search(
     let (solution, q) = (solution.to_string(), q.trim().to_string());
     let path = area_of(path);
     let kind = kind.map(SymbolKind::as_str);
+    // решение и вид — в самом MATCH: предел кандидатов действует уже внутри решения (I6)
+    let scope = match kind {
+        Some(k) => format!("sol : \"{}\" AND kind : \"{k}\"", sol_token(&solution)),
+        None => format!("sol : \"{}\"", sol_token(&solution)),
+    };
     let passes: Vec<String> = [symbol_fts(&q, false), symbol_fts(&q, true)]
         .into_iter()
         .flatten()
@@ -1035,7 +1129,10 @@ pub async fn code_symbols_search(
                 v.push(f);
             }
             v
-        });
+        })
+        .into_iter()
+        .map(|f| format!("{scope} AND {{name qual terms}} : ({f})"))
+        .collect();
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
         let filters = "AND (?3 IS NULL OR s.kind = ?3)";
@@ -1320,22 +1417,49 @@ pub async fn code_impact(
     .await
 }
 
-/// Очищает карту решения (файлы, символы, FTS, ссылки — каскадом); возвращает число удалённых
-/// файлов. Строка снимка остаётся с `gen + 1` (а не удаляется): иначе поколение начиналось бы
-/// заново и ранги, посчитанные до очистки, совпали бы по `gen` с новой картой (ABA).
+/// Файлов в одной транзакции очистки: каскад символов, ссылок и строк FTS — около 1 мс на файл
+/// на HDD, пачка держит писателя доли секунды (одна транзакция на 49 500 файлов — 48 с, ревью
+/// задачи 3, M2).
+const CLEAR_BATCH: i64 = 200;
+
+/// Снимок есть — `gen + 1`, счётчики, `rank_state = pending`.
+fn touch_if_snapshot(tx: &Connection, solution: &str) -> Result<(), StoreError> {
+    if tx
+        .prepare_cached("SELECT 1 FROM code_snapshots WHERE solution_guid = ?1")?
+        .exists([solution])?
+    {
+        touch_snapshot(tx, solution, &fmt_ts(Timestamp::now()))?;
+    }
+    Ok(())
+}
+
+/// Очищает карту решения (файлы, символы, FTS, ссылки — каскадом) пачками по [`CLEAR_BATCH`]
+/// файлов, каждая — своей короткой транзакцией; возвращает число удалённых файлов. Строка
+/// снимка остаётся с `gen + 1` после каждой пачки (а не удаляется): иначе поколение начиналось
+/// бы заново и ранги, посчитанные до очистки, совпали бы по `gen` с новой картой (ABA), а ранги
+/// частично очищенной карты не сохранятся. Загрузка, пришедшая во время очистки, может быть
+/// удалена следующей пачкой — очистка означает «всё, что было до её конца».
 pub async fn code_clear(db: &Db, solution: &str) -> Result<u64, StoreError> {
-    let solution = solution.to_string();
-    db.write(move |tx| {
-        let n = tx
-            .prepare_cached("DELETE FROM code_files WHERE solution_guid = ?1")?
-            .execute([&solution])?;
-        let has_snapshot = tx
-            .prepare_cached("SELECT 1 FROM code_snapshots WHERE solution_guid = ?1")?
-            .exists([&solution])?;
-        if has_snapshot {
-            touch_snapshot(tx, &solution, &fmt_ts(Timestamp::now()))?;
+    let mut total = 0u64;
+    loop {
+        let sol = solution.to_string();
+        let n = db
+            .write(move |tx| {
+                let n = tx
+                    .prepare_cached(
+                        "DELETE FROM code_files WHERE id IN
+                           (SELECT id FROM code_files WHERE solution_guid = ?1 LIMIT ?2)",
+                    )?
+                    .execute(params![sol, CLEAR_BATCH])?;
+                // пустая карта — поколение всё равно растёт (очистка — изменение карты)
+                touch_if_snapshot(tx, &sol)?;
+                Ok(n as u64)
+            })
+            .await?;
+        total += n;
+        if n < CLEAR_BATCH as u64 {
+            break;
         }
-        Ok(n as u64)
-    })
-    .await
+    }
+    Ok(total)
 }

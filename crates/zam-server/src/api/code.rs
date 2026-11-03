@@ -28,8 +28,10 @@
 //! новые id): постоянный адрес символа — `путь#qual` (`GET /code/symbols/{путь#qual}`), id —
 //! только внутри одного ответа.
 //!
-//! Вызовы хранилища собраны в тонкий слой (раздел «хранилище» ниже): интерфейс
-//! `zam_store::code` меняется ревью задачи 3.
+//! **Карта читается в две фазы:** файлы по рангу (`code_map_files`), затем символы только
+//! первых файлов (`code_map_symbols`) — порциями, пока упаковка показывает все прочитанные.
+//! Центральные символы — `code_central` (без чтения карты), знания о пути — `path_owners`
+//! (без предела индекса хуков). Вызовы хранилища собраны в тонкий слой (раздел «хранилище»).
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -51,13 +53,14 @@ use zam_code::{
 };
 use zam_core::Id;
 use zam_store::code::{
-    CodeSnapshot, CodeStatus, MapFileRow, RankInputs, RankState, UploadMeta, code_clear,
-    code_impact, code_map_rows, code_put_files, code_rank_inputs, code_status, code_store_ranks,
-    code_symbol, code_symbols_search, code_sync_manifest,
+    CodeSnapshot, CodeStatus, MapFileRow, MapSymRow, RankInputs, RankState, SymbolHit, UploadMeta,
+    code_central, code_clear, code_impact, code_map_files, code_map_symbols, code_put_files,
+    code_rank_inputs, code_status, code_store_ranks, code_symbol, code_symbols_search,
+    code_sync_manifest,
 };
 use zam_store::{
-    ChangedFile, Db, RefItem, SpaceKind, check_commit, check_hash, count_tokens, files_changed,
-    normalize_ref_path, refs_index,
+    ChangedFile, Db, RefItem, SpaceKind, check_commit, check_hash, count_tokens,
+    normalize_ref_path, path_owners, symbols_uploaded,
 };
 
 use super::entries::unprocessable;
@@ -85,8 +88,10 @@ const SYMBOLS_LIMIT_DEFAULT: usize = 20;
 const STATUS_CENTRAL: usize = 10;
 /// Центральных символов в строке дайджеста.
 const DIGEST_CENTRAL: usize = 3;
-/// Символов из одного файла среди центральных (§7).
-const CENTRAL_PER_FILE: usize = 3;
+/// Файлов, которые перебирает поиск центральных символов (по убыванию ранга).
+const CENTRAL_FILES_MAX: usize = 5000;
+/// Первая порция файлов карты, символы которых читаются (вторая фаза), — не меньше.
+const MAP_FILES_FIRST: usize = 64;
 /// Ветка и машина клиента не длиннее, символов.
 const META_MAX_CHARS: usize = 256;
 /// `qual` в строке дайджеста не длиннее, символов (строка ≤ 80 токенов, §10).
@@ -273,13 +278,30 @@ async fn store_status(sc: &MemScope, guid: &str) -> Result<Option<CodeStatus>, A
     Ok(code_status(&sc.db, guid).await?)
 }
 
-/// Файлы и символы карты по сохранённому рангу (область `area`).
-async fn store_rows(
+/// Файлы карты по сохранённому рангу (область `area`), без символов — первая фаза карты.
+async fn store_files(
     sc: &MemScope,
     guid: &str,
     area: Option<&str>,
 ) -> Result<Vec<MapFileRow>, ApiError> {
-    Ok(code_map_rows(&sc.db, guid, area).await?)
+    Ok(code_map_files(&sc.db, guid, area).await?)
+}
+
+/// Символы файлов `ids` по рангу — вторая фаза карты.
+async fn store_symbols(
+    sc: &MemScope,
+    guid: &str,
+    ids: &[i64],
+) -> Result<HashMap<i64, Vec<MapSymRow>>, ApiError> {
+    Ok(code_map_symbols(&sc.db, guid, ids)
+        .await?
+        .into_iter()
+        .collect())
+}
+
+/// Центральные символы (§7) без чтения всей карты.
+async fn store_central(sc: &MemScope, guid: &str, n: usize) -> Result<Vec<SymbolHit>, ApiError> {
+    Ok(code_central(&sc.db, guid, n, CENTRAL_FILES_MAX).await?)
 }
 
 /// Пересчёт рангов: входы → PageRank в `spawn_blocking` → сохранение (`false` — карта
@@ -466,36 +488,14 @@ fn map_header(s: Option<&CodeStatus>, area: Option<&str>, focused: bool) -> Stri
     h
 }
 
-/// Центральный символ (§7): первые по рангу, не больше трёх из одного файла.
-fn central_of(rows: &[MapFileRow], n: usize) -> Vec<Value> {
-    let mut all: Vec<(f64, usize, usize)> = rows
-        .iter()
-        .enumerate()
-        .flat_map(|(i, f)| {
-            f.symbols
-                .iter()
-                .enumerate()
-                .map(move |(j, s)| (s.rank, i, j))
+/// Центральные символы в JSON ответа.
+fn central_json(hits: &[SymbolHit]) -> Vec<Value> {
+    hits.iter()
+        .map(|s| {
+            json!({"id": s.id, "path": s.path, "qual": s.qual, "kind": s.kind,
+                   "sig": s.sig, "line": s.line, "rank": s.rank})
         })
-        .collect();
-    all.sort_by(|a, b| b.0.total_cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
-    let mut per: HashMap<usize, usize> = HashMap::new();
-    let mut out = Vec::new();
-    for (_, i, j) in all {
-        if out.len() >= n {
-            break;
-        }
-        let c = per.entry(i).or_default();
-        if *c < CENTRAL_PER_FILE {
-            *c += 1;
-            let (f, s) = (&rows[i], &rows[i].symbols[j]);
-            out.push(
-                json!({"id": s.id, "path": f.path, "qual": s.qual, "kind": s.kind,
-                            "sig": s.sig, "line": s.line, "rank": s.rank}),
-            );
-        }
-    }
-    out
+        .collect()
 }
 
 /// Строка дайджеста (§10): размер карты, возраст снимка, центральные символы.
@@ -529,8 +529,8 @@ pub async fn code_line(sc: &MemScope, guid: &str) -> Option<String> {
     if s.snapshot.files == 0 {
         return None;
     }
-    let rows = store_rows(sc, guid, None).await.ok()?;
-    Some(digest_line(&s, &central_of(&rows, DIGEST_CENTRAL)))
+    let central = store_central(sc, guid, DIGEST_CENTRAL).await.ok()?;
+    Some(digest_line(&s, &central_json(&central)))
 }
 
 // ---- POST /code/sync ----
@@ -592,10 +592,42 @@ pub async fn sync(
         sc.user.id,
     )?;
     let manifest = parse_manifest(&req.manifest, st.cfg.code.max_files)?;
-    let out = code_sync_manifest(&sc.db, &guid(&sc), &meta, &manifest, &[]).await?;
-    Ok(Json(
-        json!({ "need": out.need, "removed": out.removed, "etag": out.etag }),
-    ))
+    let g = guid(&sc);
+    let mut dbs = report_dbs(&st, &p, &sc).await?.into_iter();
+    let (_, own_spaces) = dbs
+        .next()
+        .ok_or_else(|| ApiError::Internal("нет базы владельца решения".into()))?;
+    let others: Vec<(Db, Vec<Id>)> = dbs.collect();
+    // удаляемые пути — до синхронизации: ссылки на их символы в Knowledge участника (другая
+    // база) — `symbol_removed`, как у владельца
+    let gone: Vec<ChangedFile> = if others.is_empty() {
+        Vec::new()
+    } else {
+        let keep: HashSet<&str> = manifest.iter().map(|m| m.path.as_str()).collect();
+        store_files(&sc, &g, None)
+            .await?
+            .into_iter()
+            .filter(|f| !keep.contains(f.path.as_str()))
+            .map(|f| ChangedFile {
+                path: f.path,
+                hash: zam_code::MISSING_HASH.to_string(),
+                symbols: None,
+            })
+            .collect()
+    };
+    let out = code_sync_manifest(&sc.db, &g, &meta, &manifest, &own_spaces).await?;
+    let mut stale_refs = out.stale_refs;
+    if !gone.is_empty() {
+        for (db, spaces) in others {
+            stale_refs += symbols_uploaded(&db, &g, &spaces, &gone, meta.now).await?;
+        }
+    }
+    Ok(Json(json!({
+        "need": out.need,
+        "removed": out.removed,
+        "stale_refs": stale_refs,
+        "etag": out.etag,
+    })))
 }
 
 // ---- PUT /code/files ----
@@ -711,8 +743,9 @@ pub async fn put_files(
     )?;
     let (files, masked) = parse_uploads(req.files, &st.cfg.code)?;
     let g = guid(&sc);
-    // ссылки памяти Knowledge участника (другая база) — правило `POST /files/changed`;
-    // неполный или пропущенный разбор — по хэшу файла
+    // ссылки на символы в Knowledge участника (другая база) — то же правило карты, что у
+    // `code_put_files`: файловые ссылки и хэш файла не трогаются (CRLF-близнец другой машины не
+    // мигает ими, ревью задачи 3, I2); неполный или пропущенный разбор — `None` (не судится)
     let changed: Vec<ChangedFile> = files
         .iter()
         .map(|f| ChangedFile {
@@ -736,7 +769,7 @@ pub async fn put_files(
     let out = code_put_files(&sc.db, &g, &meta, files, &own_spaces).await?;
     let mut stale_refs = out.stale_refs;
     for (db, spaces) in dbs {
-        stale_refs += files_changed(&db, &g, &spaces, &changed, meta.now).await?;
+        stale_refs += symbols_uploaded(&db, &g, &spaces, &changed, meta.now).await?;
     }
     let mut warnings: Vec<String> = Vec::new();
     if masked > 0 {
@@ -783,8 +816,7 @@ pub async fn status(
     if not_modified(&headers, &etag) {
         return with_etag(&headers, &etag, || Value::Null);
     }
-    let rows = store_rows(&sc, &g, None).await?;
-    let central = central_of(&rows, STATUS_CENTRAL);
+    let central = central_json(&store_central(&sc, &g, STATUS_CENTRAL).await?);
     let digest = (snap.files > 0).then(|| digest_line(&s, &central));
     let skipped: Vec<Value> = s
         .skipped
@@ -892,17 +924,63 @@ struct MapOut {
     warnings: Vec<String>,
 }
 
-/// Переставляет строки по рангу файлов `fr` (по id): ранг символа = ранг файла × доля.
+/// Переставляет файлы по рангу `fr` (по id, ранг с фокусом); ранги символов — при чтении
+/// символов ([`rerank_symbols`]).
 fn apply_focus(rows: &mut [MapFileRow], fr: &HashMap<i64, f64>) {
     for f in rows.iter_mut() {
         f.rank = fr.get(&f.id).copied().unwrap_or(0.0);
-        for s in f.symbols.iter_mut() {
-            s.rank = f.rank * s.share;
-        }
-        f.symbols
-            .sort_by(|a, b| b.rank.total_cmp(&a.rank).then(a.line.cmp(&b.line)));
     }
     rows.sort_by(|a, b| b.rank.total_cmp(&a.rank).then_with(|| a.path.cmp(&b.path)));
+}
+
+/// Ранги символов файла с фокусом: ранг файла × вычисляемая доля, по убыванию.
+fn rerank_symbols(f: &mut MapFileRow) {
+    for s in f.symbols.iter_mut() {
+        s.rank = f.rank * s.share;
+    }
+    f.symbols.sort_by(|a, b| {
+        b.rank
+            .total_cmp(&a.rank)
+            .then(a.line.cmp(&b.line))
+            .then(a.id.cmp(&b.id))
+    });
+}
+
+/// Файлы карты для упаковки: у первых `loaded` — символы, у остальных — заглушки по числу
+/// символов (тексты не показываются: упаковка останавливается раньше, иначе вторая фаза
+/// дочитывает символы), чтобы хвост «… ещё N файлов, M символов» считал всю карту.
+fn pack_input(rows: &[MapFileRow], loaded: usize) -> Vec<MapFile> {
+    let stub = MapSym {
+        kind: SymbolKind::Function,
+        qual: String::new(),
+        sig: None,
+        line: 0,
+    };
+    rows.iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if i < loaded {
+                MapFile {
+                    path: f.path.clone(),
+                    syms: f
+                        .symbols
+                        .iter()
+                        .map(|s| MapSym {
+                            kind: s.kind,
+                            qual: s.qual.clone(),
+                            sig: s.sig.clone(),
+                            line: s.line,
+                        })
+                        .collect(),
+                }
+            } else {
+                MapFile {
+                    path: String::new(),
+                    syms: vec![stub.clone(); f.symbol_count as usize],
+                }
+            }
+        })
+        .collect()
 }
 
 /// Ранги файлов по фокусу (`None` — совпадений нет, глобальный ранг).
@@ -926,10 +1004,12 @@ async fn build_map(
     edges: bool,
 ) -> Result<MapOut, ApiError> {
     let mut warnings = Vec::new();
+    // фаза 1: файлы по рангу (без символов)
     let mut rows = match status {
-        Some(_) => store_rows(sc, guid, area).await?,
+        Some(_) => store_files(sc, guid, area).await?,
         None => Vec::new(),
     };
+    let mut focused = false;
     let mut inputs: Option<RankInputs> = None;
     if let (Some(f), Some(_)) = (focus, status) {
         let inp = code_rank_inputs(&sc.db, guid).await?;
@@ -943,6 +1023,7 @@ async fn build_map(
             Ok(Ok((inp, fr))) => {
                 if let Some(fr) = fr {
                     apply_focus(&mut rows, &fr);
+                    focused = true;
                 }
                 inputs = Some(inp);
             }
@@ -951,26 +1032,30 @@ async fn build_map(
         }
     }
     let header = map_header(status, area, focus.is_some());
-    let files: Vec<MapFile> = rows
-        .iter()
-        .map(|f| MapFile {
-            path: f.path.clone(),
-            syms: f
-                .symbols
-                .iter()
-                .map(|s| MapSym {
-                    kind: s.kind,
-                    qual: s.qual.clone(),
-                    sig: s.sig.clone(),
-                    line: s.line,
-                })
-                .collect(),
-        })
-        .collect();
-    let h = header.clone();
-    let packed = tokio::task::spawn_blocking(move || render_map(&h, &files, budget, &count_tokens))
-        .await
-        .map_err(|e| ApiError::aborted("упаковка карты", &e))?;
+    // фаза 2: символы первых файлов; не все показаны — готово, иначе порция ×4
+    let total = rows.len();
+    let mut want = total.min((budget / 8).max(MAP_FILES_FIRST));
+    let mut loaded = 0;
+    let packed = loop {
+        let ids: Vec<i64> = rows[loaded..want].iter().map(|f| f.id).collect();
+        let mut syms = store_symbols(sc, guid, &ids).await?;
+        for f in &mut rows[loaded..want] {
+            f.symbols = syms.remove(&f.id).unwrap_or_default();
+            if focused {
+                rerank_symbols(f);
+            }
+        }
+        loaded = want;
+        let (h, files) = (header.clone(), pack_input(&rows, loaded));
+        let packed =
+            tokio::task::spawn_blocking(move || render_map(&h, &files, budget, &count_tokens))
+                .await
+                .map_err(|e| ApiError::aborted("упаковка карты", &e))?;
+        if packed.files_shown < loaded || loaded == total {
+            break packed;
+        }
+        want = total.min(loaded.saturating_mul(4));
+    };
     let mut out_edges = Vec::new();
     if edges && packed.files_shown > 1 {
         let inp = match inputs {
@@ -1207,24 +1292,22 @@ pub async fn symbols(
     })))
 }
 
-/// Знания решения о путях (`refs_index` базы владельца и Knowledge участника): путь → записи,
-/// символьные ссылки первыми. Хранилище отдаёт до 5 записей на путь в базе.
-async fn knowledge_index(
+/// Знания решения о пути `path` (владельцы ссылок в базе владельца и Knowledge участника, без
+/// предела записей на путь): ссылки на символы первыми.
+async fn knowledge_of(
     st: &AppState,
     p: &Principal,
     sc: &MemScope,
     guid: &str,
-) -> Result<HashMap<String, Vec<RefItem>>, ApiError> {
-    let mut by: HashMap<String, Vec<RefItem>> = HashMap::new();
+    path: &str,
+) -> Result<Vec<RefItem>, ApiError> {
+    let mut items = Vec::new();
     for (db, spaces) in report_dbs(st, p, sc).await? {
-        for pr in refs_index(&db, guid, &spaces).await? {
-            let items = by.entry(pr.path).or_default();
-            items.extend(pr.items);
-            // символьные первыми и после слияния баз (сортировка устойчива)
-            items.sort_by_key(|i| i.symbol.is_none());
-        }
+        items.extend(path_owners(&db, guid, path, &spaces).await?);
     }
-    Ok(by)
+    // символьные первыми и после слияния баз (сортировка устойчива)
+    items.sort_by_key(|i| i.symbol.is_none());
+    Ok(items)
 }
 
 fn knowledge_json(path: &str, it: &RefItem) -> Value {
@@ -1273,12 +1356,10 @@ pub async fn symbol(
     let card = code_symbol(&sc.db, &g, id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let index = knowledge_index(&st, &p, &sc, &g).await?;
     let path = card.symbol.path.clone();
-    let knowledge: Vec<Value> = index
-        .get(&path)
-        .into_iter()
-        .flatten()
+    let knowledge: Vec<Value> = knowledge_of(&st, &p, &sc, &g, &path)
+        .await?
+        .iter()
         .filter(|it| it.symbol.as_deref().is_none_or(|s| s == card.symbol.qual))
         .map(|it| knowledge_json(&path, it))
         .collect();
@@ -1379,7 +1460,6 @@ pub async fn impact(
             .or_default()
             .insert(s.qual.as_str());
     }
-    let index = knowledge_index(&st, &p, &sc, &g).await?;
     let mut knowledge = Vec::new();
     for (path, _) in &files {
         let all = rows.paths_only.contains(path);
@@ -1387,7 +1467,7 @@ pub async fn impact(
         if !all && quals.is_none() {
             continue;
         }
-        for it in index.get(path).into_iter().flatten() {
+        for it in &knowledge_of(&st, &p, &sc, &g, path).await? {
             let take = all
                 || it
                     .symbol

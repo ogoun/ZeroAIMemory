@@ -85,8 +85,11 @@ CREATE INDEX code_symbols_qual ON code_symbols (qual);
 -- (удаление строки по `rowid` — точечное, по столбцу UNINDEXED был бы полный перебор).
 -- `terms` — слова имени и частей `qual` (`zam_code::fts_terms`: `getUserById` → `get user by id`).
 -- Строки пишет `zam_store::code` вместе с символом, удаляет триггер — в том числе при каскаде.
+-- `sol` — токен решения (`s` + 16 hex blake3 GUID), `kind` — вид символа: FTS одна на базу
+-- пользователя (у владельца несколько решений), поэтому решение и вид входят в сам запрос
+-- MATCH, а не фильтруют уже ограниченный пределом набор кандидатов (ревью задачи 3, I6).
 CREATE VIRTUAL TABLE code_symbols_fts USING fts5 (
-    name, qual, terms,
+    name, qual, terms, sol, kind,
     tokenize = 'unicode61 remove_diacritics 2',
     -- индексы префиксов 2 и 3 символов: короткий префиксный запрос не перебирает словарь
     prefix = '2 3'

@@ -17,9 +17,9 @@ use zam_store::code::{
     code_rank_inputs, code_status, code_store_ranks, code_symbol, code_symbols_named,
     code_symbols_search, code_sync_manifest,
 };
-use zam_store::code::{code_map_files, code_map_symbols};
+use zam_store::code::{code_central, code_map_files, code_map_symbols};
 use zam_store::file_refs::{ChangedFile, SYMBOL_CHANGED, SYMBOL_REMOVED, note_refs};
-use zam_store::file_refs::{REFS_MAX, symbols_uploaded};
+use zam_store::file_refs::{REFS_MAX, path_owners, symbols_uploaded};
 use zam_store::{
     Attribution, AuthorKind, Certainty, DataDir, Db, EntryKind, FileRef, FtsQuery, NewEntry,
     NewNote, NodePath, SpaceKind, StoreError, TargetFilter, USER_MIGRATIONS, UserDbs, create_entry,
@@ -2178,4 +2178,225 @@ async fn symbols_uploaded_touches_only_symbol_refs() {
         Some(SYMBOL_CHANGED)
     );
     assert_eq!(ref_row(&db, "b.rs", Some("bar")).await.0, "ok");
+}
+
+/// Центральные символы без чтения всей карты (задача 4, правка 4): первые по рангу символа,
+/// не больше трёх из файла — как полный перебор строк карты; `files_max` ограничивает число
+/// рассматриваемых файлов.
+#[tokio::test]
+async fn central_matches_full_scan_three_per_file() {
+    let (db, _) = setup("central").await;
+    // хаб с пятью символами, на которые ссылаются все остальные файлы
+    let hub = upload(
+        "src/hub.rs",
+        &h('1'),
+        (0..5)
+            .map(|i| {
+                sym(
+                    &format!("hub_fn_{i}"),
+                    &format!("hub_fn_{i}"),
+                    &bh('1'),
+                    i * 3 + 1,
+                )
+            })
+            .collect(),
+        vec![],
+    );
+    let mut files = vec![hub];
+    for k in 0..6u32 {
+        let refs = (0..5).map(|i| rf(&format!("hub_fn_{i}"), i + 1)).collect();
+        let syms = vec![sym(&format!("user_{k}"), &format!("user_{k}"), &bh('2'), 1)];
+        files.push(upload(&format!("src/u{k}.rs"), &h('2'), syms, refs));
+    }
+    code_put_files(&db, G, &meta("box"), files, &[])
+        .await
+        .unwrap();
+    let inputs = code_rank_inputs(&db, G).await.unwrap();
+    let ranked = zam_code::rank(&inputs.files, None);
+    code_store_ranks(&db, G, &inputs, &ranked, Timestamp::now())
+        .await
+        .unwrap();
+    // полный перебор
+    let rows = code_map_rows(&db, G, None).await.unwrap();
+    let mut all: Vec<(f64, usize, i64)> = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(i, f)| f.symbols.iter().map(move |s| (s.rank, i, s.id)))
+        .collect();
+    all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut per = std::collections::HashMap::new();
+    let want: Vec<i64> = all
+        .into_iter()
+        .filter(|(_, i, _)| {
+            let c = per.entry(*i).or_insert(0);
+            *c += 1;
+            *c <= 3
+        })
+        .take(5)
+        .map(|(_, _, id)| id)
+        .collect();
+    let got = code_central(&db, G, 5, 1000).await.unwrap();
+    assert_eq!(got.iter().map(|s| s.id).collect::<Vec<_>>(), want);
+    assert_eq!(
+        got.iter().filter(|s| s.path == "src/hub.rs").count(),
+        3,
+        "не больше трёх из файла"
+    );
+    assert!(got.windows(2).all(|w| w[0].rank >= w[1].rank));
+    assert!(got[0].sig.is_some() && got[0].end_line >= got[0].line);
+    // один рассматриваемый файл — только его символы
+    let top = code_central(&db, G, 10, 1).await.unwrap();
+    assert_eq!(top.len(), 3);
+    assert!(top.iter().all(|s| s.path == "src/hub.rs"));
+    assert!(
+        code_central(&db, "g-none", 10, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Владельцы ссылок пути без предела `refs_index` (5 на путь), символьные первыми
+/// (задача 4, правка 5).
+#[tokio::test]
+async fn path_owners_unlimited_symbol_first() {
+    let (db, sol) = setup("owners").await;
+    for i in 0..7 {
+        entry_with(
+            &db,
+            sol,
+            &format!("Файл {i}"),
+            vec![fref("a.rs", None, None, None)],
+        )
+        .await;
+    }
+    let sym_e = entry_with(
+        &db,
+        sol,
+        "Символ",
+        vec![fref("a.rs", Some("Store::open"), None, None)],
+    )
+    .await;
+    entry_with(
+        &db,
+        sol,
+        "Другой путь",
+        vec![fref("b.rs", None, None, None)],
+    )
+    .await;
+    let idx = refs_index(&db, G, &[sol]).await.unwrap();
+    assert_eq!(idx[0].items.len(), 5, "индекс хуков ограничен");
+    let owners = path_owners(&db, G, "a.rs", &[sol]).await.unwrap();
+    assert_eq!(owners.len(), 8, "все владельцы пути");
+    assert_eq!(owners[0].id, format!("c:{sym_e}"));
+    assert_eq!(owners[0].symbol.as_deref(), Some("Store::open"));
+    assert!(owners[1..].iter().all(|o| o.symbol.is_none()));
+    assert!(path_owners(&db, G, "a.rs", &[]).await.unwrap().is_empty());
+    assert!(
+        path_owners(&db, "g-other", "a.rs", &[sol])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Очистка пачками (задача 4, правка 6): больше одной пачки файлов — удалено всё, поколение
+/// снимка растёт.
+#[tokio::test]
+async fn clear_in_batches_removes_all_and_bumps_gen() {
+    let (db, _) = setup("clear-batches").await;
+    let files: Vec<FileUpload> = (0..450)
+        .map(|i| {
+            upload(
+                &format!("m{i}.rs"),
+                &h('1'),
+                vec![sym("foo", "foo", &bh('1'), 1)],
+                vec![rf("x", 1)],
+            )
+        })
+        .collect();
+    code_put_files(&db, G, &meta("box"), files, &[])
+        .await
+        .unwrap();
+    let gen0 = count(&db, "SELECT gen FROM code_snapshots").await;
+    assert_eq!(code_clear(&db, G).await.unwrap(), 450);
+    assert_eq!(count(&db, "SELECT count(*) FROM code_files").await, 0);
+    assert_eq!(count(&db, "SELECT count(*) FROM code_symbols").await, 0);
+    assert_eq!(count(&db, "SELECT count(*) FROM code_symbols_fts").await, 0);
+    assert!(count(&db, "SELECT gen FROM code_snapshots").await > gen0);
+}
+
+/// `getItemN` × `n` символов вида `kind` в файлах по 500.
+fn get_items(prefix: &str, n: usize, kind: SymbolKind) -> Vec<FileUpload> {
+    (0..n.div_ceil(500))
+        .map(|f| {
+            let syms = (f * 500..((f + 1) * 500).min(n))
+                .map(|i| {
+                    let mut s = sym(&format!("getItem{i}"), &format!("getItem{i}"), &bh('1'), 1);
+                    s.kind = kind;
+                    s
+                })
+                .collect();
+            upload(&format!("{prefix}/f{f}.rs"), &h('1'), syms, vec![])
+        })
+        .collect()
+}
+
+/// FTS одна на базу: предел кандидатов действует внутри решения, а не до фильтра по нему
+/// (повторное ревью задачи 3, I6) — 3000 `getX` в старом решении не скрывают 10 в новом.
+#[tokio::test]
+async fn symbols_search_fts_limit_within_solution_and_kind() {
+    let (db, _) = setup("fts-scope").await;
+    create_solution(&db, "g-b", "Второе").await.unwrap();
+    code_put_files(
+        &db,
+        G,
+        &meta("box"),
+        get_items("a", 3000, SymbolKind::Function),
+        &[],
+    )
+    .await
+    .unwrap();
+    code_put_files(
+        &db,
+        "g-b",
+        &meta("box"),
+        get_items("b", 10, SymbolKind::Function),
+        &[],
+    )
+    .await
+    .unwrap();
+    let hits = code_symbols_search(&db, "g-b", "get", None, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 10, "все символы второго решения");
+    assert!(hits.iter().all(|h| h.path.starts_with("b/")));
+    let hits = code_symbols_search(&db, "g-b", "getIt", None, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 10, "префиксный проход");
+    // то же с видом: 3000 функций и 10 методов в одном решении
+    code_put_files(
+        &db,
+        "g-b",
+        &meta("box"),
+        get_items("c", 3000, SymbolKind::Function),
+        &[],
+    )
+    .await
+    .unwrap();
+    code_put_files(
+        &db,
+        "g-b",
+        &meta("box"),
+        get_items("m", 10, SymbolKind::Method),
+        &[],
+    )
+    .await
+    .unwrap();
+    let hits = code_symbols_search(&db, "g-b", "get", Some(SymbolKind::Method), None, 100)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 10, "все методы");
+    assert!(hits.iter().all(|h| h.kind == SymbolKind::Method));
 }
