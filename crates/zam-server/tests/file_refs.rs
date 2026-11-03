@@ -254,6 +254,53 @@ async fn refs_on_insight_and_changelog_strings() {
     assert!(path_of(&index(&a).await, "src/a.rs").is_null());
 }
 
+/// Финальное ревью ветки M5.6, C1: недоверенная ссылка `a.rs#` × 200 000 (1 МБ) — разбор
+/// `путь#qual` линеен. Запись журнала — быстро 422 «длиннее», заметка — быстро с
+/// предупреждением `invalid_ref`, без ссылки в индексе.
+#[tokio::test]
+async fn hostile_long_ref_rejected_fast() {
+    let a = setup("refs-hostile").await;
+    let huge = "a.rs#".repeat(200_000);
+    let t = std::time::Instant::now();
+    let r = a
+        .t(
+            Method::POST,
+            &sol_entries(),
+            Some(
+                json!({"kind": "insight", "title": "Злая ссылка", "body": "подробности",
+                        "data": {"kind": "gotcha"}, "refs": {"files": [{"path": huge}]},
+                        "force": true}),
+            ),
+        )
+        .await;
+    assert_eq!(
+        r.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        r.text().chars().take(200).collect::<String>()
+    );
+    assert!(r.json()["detail"].as_str().unwrap().contains("длиннее"));
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/nodes",
+            Some(json!({"space": G, "path": "Злая", "kind": "note",
+                        "content": format!("---\nrefs: [\"{huge}\"]\n---\n# Злая\n")})),
+        )
+        .await;
+    let n = created(r).await;
+    assert!(
+        n["warnings"].to_string().contains("invalid_ref"),
+        "предупреждение"
+    );
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(index(&a).await["refs"], json!([]));
+}
+
 #[tokio::test]
 async fn note_frontmatter_refs_and_verified_at() {
     let a = setup("refs-note").await;

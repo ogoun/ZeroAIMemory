@@ -11,6 +11,15 @@ pub const SIG_MAX_CHARS: usize = 160;
 pub const NAME_MAX_CHARS: usize = 256;
 /// Предел длины квалифицированного имени, символов (§13).
 pub const QUAL_MAX_CHARS: usize = 512;
+/// Предел длины пути ссылки памяти, символов (M4.5 §6.1; `zam_store::file_refs` и клиент берут
+/// его отсюда).
+pub const PATH_MAX_CHARS: usize = 1000;
+/// Предел длины строки ссылки `путь#qual` для разбора, байт: путь и `qual` у своих пределов, по 4
+/// байта UTF-8 на символ. Строка длиннее — заведомо не символьная ссылка и не допустимый путь
+/// (символов больше [`PATH_MAX_CHARS`]); `split_ref` отдаёт её путём, не разбирая.
+pub const REF_MAX_BYTES: usize = (PATH_MAX_CHARS + 1 + QUAL_MAX_CHARS) * 4;
+// строка длиннее предела в любой кодировке символов длиннее пути — её отвергнет нормализация
+const _: () = assert!(REF_MAX_BYTES / 4 > PATH_MAX_CHARS);
 /// Файлов в одном `PUT /code/files` (§5).
 pub const UPLOAD_FILES_MAX: usize = 500;
 /// Версия выдачи экстрактора (`qual`, виды, сигнатуры). Смена — клиент, чьё состояние

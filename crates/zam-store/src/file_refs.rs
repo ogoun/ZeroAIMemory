@@ -39,8 +39,8 @@ use crate::{Db, StoreError};
 
 /// Предел ссылок одного владельца.
 pub const REFS_MAX: usize = 64;
-/// Предел длины пути ссылки, символов.
-pub const PATH_MAX_CHARS: usize = 1000;
+/// Предел длины пути ссылки, символов (общий с разбором `путь#qual`, [`zam_code::REF_MAX_BYTES`]).
+pub use zam_code::PATH_MAX_CHARS;
 /// Предел файлов в одном сообщении `POST /files/changed` и `/files/verified`.
 pub const FILES_MAX: usize = 500;
 /// Записей на путь в индексе [`refs_index`].

@@ -112,12 +112,13 @@ fn check_symbol(q: &str, path: Option<&str>, what: &str) -> Result<(), ApiError>
             "{what}: символ — только у файла кода (а не у «{p}»)"
         )));
     }
-    // то же правило, что у разбора `путь#qual` (любой путь кода вместо неизвестного)
-    let p = path.unwrap_or("a.rs");
-    let raw = format!("{p}#{q}");
-    if split_ref(&raw) != (p, Some(q)) {
+    // то же правило, что у разбора `путь#qual`; итог от пути кода не зависит (`qual` без `/`),
+    // поэтому — короткий путь кода: длинный путь отвергнет нормализация, а не этот разбор
+    let raw = format!("a.rs#{q}");
+    if split_ref(&raw) != ("a.rs", Some(q)) {
         return Err(unprocessable(format!(
-            "{what}: недопустимый qual (`#` — только суффикс одноимённых `#N`)"
+            "{what}: недопустимый qual (`#` — только суффикс одноимённых `#N`; якорь строки \
+             `L10`, `L10-L20` — не символ)"
         )));
     }
     Ok(())
@@ -563,6 +564,40 @@ mod tests {
         assert!(err(json!({"files": [{"path": "a", "x": 1}]})).contains("неизвестное поле"));
         assert!(err(json!({"other": []})).contains("refs.other"));
         assert!(err(json!([1])).contains("ожидается объект"));
+    }
+
+    /// Финальное ревью ветки M5.6, M1 и C1: якорь строки GitHub — путь целиком, как в 0.0.8;
+    /// `symbol` якорем — 422; ссылка `a.rs#` × 200 000 — 422 «длиннее» (путь), быстро.
+    #[test]
+    fn refs_line_anchor_is_path_and_hostile_ref_is_too_long() {
+        let r = parse_refs(&json!({"files": [{"path": "src/a.rs#L10-L20"}]})).unwrap();
+        assert_eq!(r, [FileRef::path_only("src/a.rs#L10-L20".into())]);
+        let err = |v: Value| match parse_refs(&v) {
+            Err(ApiError::Unprocessable(m)) => m,
+            other => panic!("ожидалась 422: {other:?}"),
+        };
+        let m = err(json!({"files": [{"path": "src/a.rs", "symbol": "L10"}]}));
+        assert!(m.contains("якорь строки"), "{m}");
+        let huge = "a.rs#".repeat(200_000);
+        let t = std::time::Instant::now();
+        let m = err(json!({"files": [{"path": huge}]}));
+        assert!(
+            m.contains("длиннее"),
+            "{}",
+            m.chars().take(80).collect::<String>()
+        );
+        let code = format!("{huge}x.rs");
+        let m = err(json!({"files": [{"path": code, "symbol": "foo"}]}));
+        assert!(
+            m.contains("длиннее"),
+            "{}",
+            m.chars().take(80).collect::<String>()
+        );
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

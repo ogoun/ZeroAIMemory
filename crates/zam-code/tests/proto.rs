@@ -1,8 +1,10 @@
 //! Протокол карты кода и нормализация имён (без фичи `parse`: эти функции берёт и сервер).
 
+use std::time::{Duration, Instant};
 use zam_code::{
-    Lang, MISSING_HASH, ParseState, RefKind, SIG_MAX_CHARS, SkipReason, SymbolKind, body_hash,
-    fts_terms, lang_of, sig_line, split_ident, split_ref,
+    Lang, MISSING_HASH, PATH_MAX_CHARS, ParseState, QUAL_MAX_CHARS, REF_MAX_BYTES, RefKind,
+    SIG_MAX_CHARS, SkipReason, SymbolKind, body_hash, fts_terms, lang_of, sig_line, split_ident,
+    split_ref,
 };
 
 #[test]
@@ -118,6 +120,54 @@ fn split_ref_rules() {
     assert_eq!(split_ref(&long), (long.as_str(), None));
     let max = format!("a.rs#{}", "я".repeat(512));
     assert_eq!(split_ref(&max).1.map(|q| q.chars().count()), Some(512));
+}
+
+/// Якорь строки в стиле GitHub (`#L10`, `#L10-L20`, `#L10-20`) — не символ: ссылка остаётся путём
+/// целиком, как в 0.0.8 (финальное ревью ветки M5.6, M1).
+#[test]
+fn split_ref_line_anchor_is_path() {
+    for raw in [
+        "src/a.rs#L10",
+        "src/a.rs#L10-L20",
+        "src/a.rs#L10-20",
+        "a.py#L1",
+    ] {
+        assert_eq!(split_ref(raw), (raw, None), "{raw}");
+    }
+    // похожие, но не якоря — символы
+    assert_eq!(split_ref("a.rs#L"), ("a.rs", Some("L")));
+    assert_eq!(split_ref("a.rs#Lx10"), ("a.rs", Some("Lx10")));
+    assert_eq!(split_ref("a.rs#L10a"), ("a.rs", Some("L10a")));
+    assert_eq!(split_ref("a.rs#l10"), ("a.rs", Some("l10")));
+    assert_eq!(split_ref("a.rs#L10-"), ("a.rs", Some("L10-")));
+}
+
+/// Разбор линеен: недоверенная строка `a.rs#` × 200 000 (1 МБ) — быстро и путём; строка у
+/// предела [`REF_MAX_BYTES`] — тоже быстро (финальное ревью ветки M5.6, C1).
+#[test]
+fn split_ref_is_linear_on_hostile_input() {
+    let huge = "a.rs#".repeat(200_000);
+    let t = Instant::now();
+    assert_eq!(split_ref(&huge), (huge.as_str(), None));
+    assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+
+    let near = "a.rs#".repeat(REF_MAX_BYTES / 5);
+    assert!(near.len() <= REF_MAX_BYTES);
+    let t = Instant::now();
+    for _ in 0..10 {
+        assert_eq!(split_ref(&near), (near.as_str(), None));
+    }
+    assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+
+    // путь и qual у пределов в 4-байтовых символах — ещё символьная ссылка
+    let path = format!("{}.rs", "\u{1F600}".repeat(PATH_MAX_CHARS - 3));
+    let qual = "\u{1F600}".repeat(QUAL_MAX_CHARS);
+    let raw = format!("{path}#{qual}");
+    assert!(raw.len() <= REF_MAX_BYTES);
+    assert_eq!(split_ref(&raw), (path.as_str(), Some(qual.as_str())));
+    // длиннее предела — путь (его отвергнет нормализация: символов больше PATH_MAX_CHARS)
+    let over = "x".repeat(REF_MAX_BYTES + 1);
+    assert_eq!(split_ref(&over), (over.as_str(), None));
 }
 
 #[test]
