@@ -2020,48 +2020,29 @@ fn code_map_check(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()>
     // хуки smoke не запускают фоновую синхронизацию: проверяется явная `zam code sync`
     fs::write(
         home.join(".zeroaimemory").join("config.toml"),
-        "[code]
-auto = false
-",
+        "[code]\nauto = false\n",
     )?;
     fs::write(
         project.join(".zeroaimemory").join("solution.toml"),
-        format!(
-            "agent_solution_id = \"{SMOKE_SOLUTION}\"
-name = \"smoke\"
-"
-        ),
+        format!("agent_solution_id = \"{SMOKE_SOLUTION}\"\nname = \"smoke\"\n"),
     )?;
     fs::write(
         project.join("src").join("store.rs"),
-        "pub struct SmokeStore;
-
-impl SmokeStore {
-    pub fn smoke_open() -> SmokeStore {
-        SmokeStore
-    }
-}
-",
+        "pub struct SmokeStore;\n\nimpl SmokeStore {\n    pub fn smoke_open() -> SmokeStore {\n        SmokeStore\n    }\n}\n",
     )?;
     fs::write(
         project.join("src").join("client.ts"),
-        "export function smokeClient(n: number): number {
-  return n + 1;
-}
-",
+        "export function smokeClient(n: number): number {\n  return n + 1;\n}\n",
     )?;
     fs::write(
         project.join("src").join("tool.py"),
-        "def smoke_tool(x):
-    return x * 2
-",
+        "def smoke_tool(x):\n    return x * 2\n",
     )?;
     let run = |args: &[&str]| -> Result<String> {
         let out = zam_run(zam, (&home, &project), conn, args, None, &[])?;
         if out.status.code() != Some(0) {
             bail!(
-                "zam {}: код {:?}
-{}{}",
+                "zam {}: код {:?}\n{}{}",
                 args.join(" "),
                 out.status.code(),
                 String::from_utf8_lossy(&out.stdout),
@@ -2086,22 +2067,19 @@ impl SmokeStore {
     }
     let map = run(&["code", "map"])?;
     if map.trim().is_empty() || !map.contains("src/store.rs") {
-        bail!(
-            "zam code map пуст или без src/store.rs:
-{map}"
-        );
+        bail!("zam code map пуст или без src/store.rs:\n{map}");
     }
-    let sym: Value =
-        serde_json::from_str(&run(&["code", "sym", "SmokeStore::smoke_open", "--json"])?)
-            .context("zam code sym --json: не JSON")?;
-    if sym["symbol"]["path"] != "src/store.rs" || sym["symbol"]["qual"] != "SmokeStore::smoke_open"
-    {
-        bail!("zam code sym не нашёл SmokeStore::smoke_open в src/store.rs: {sym}");
-    }
-    let ts: Value = serde_json::from_str(&run(&["code", "sym", "smokeClient", "--json"])?)
-        .context("zam code sym --json: не JSON")?;
-    if ts["symbol"]["path"] != "src/client.ts" {
-        bail!("zam code sym не нашёл smokeClient в src/client.ts: {ts}");
+    // символ каждого языка проекта: Rust (метод в `impl`), TypeScript, Python
+    for (qual, path) in [
+        ("SmokeStore::smoke_open", "src/store.rs"),
+        ("smokeClient", "src/client.ts"),
+        ("smoke_tool", "src/tool.py"),
+    ] {
+        let sym: Value = serde_json::from_str(&run(&["code", "sym", qual, "--json"])?)
+            .with_context(|| format!("zam code sym {qual} --json: не JSON"))?;
+        if sym["symbol"]["path"] != path || sym["symbol"]["qual"] != qual {
+            bail!("zam code sym не нашёл {qual} в {path}: {sym}");
+        }
     }
     Ok(())
 }

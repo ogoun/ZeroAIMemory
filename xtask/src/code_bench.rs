@@ -55,6 +55,10 @@ const SPAWN_RUNS: usize = 20;
 /// Прогревочных запусков до замера (не в выборке): первый запуск свежесобранного exe на Windows
 /// включает его проверку антивирусом и чтение с HDD.
 const WARMUP_RUNS: usize = 3;
+/// Запусков каждого хука в замере с картой.
+const HOOK_RUNS: usize = 20;
+/// Эталоны экстрактора (развилка п. 3: карта без них).
+const FIXTURES_GLOB: &str = "crates/zam-code/tests/fixtures/**";
 /// Файл правки и удаления (есть в любом `HEAD` проекта): правка — комментарий в конце.
 const EDIT_FILE: &str = "crates/zam-core/src/id.rs";
 const REMOVE_FILE: &str = "xtask/src/changelog.rs";
@@ -169,10 +173,12 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
     fs::write(&edit, text)?;
     let edited = ctx.sync(&copy)?;
     let status_before = ctx.get("/api/v1/code/status", SOLUTION)?;
+    // положительный контроль: до удаления файл в таблице карты есть
+    let present = ctx.files_named(REMOVE_FILE)?;
     fs::remove_file(copy.join(REMOVE_FILE)).with_context(|| format!("удаление {REMOVE_FILE}"))?;
     let removed = ctx.sync(&copy)?;
     let status_after = ctx.get("/api/v1/code/status", SOLUTION)?;
-    let gone = ctx.symbols_in(REMOVE_FILE)?;
+    let gone = ctx.files_named(REMOVE_FILE)?;
     // вторая копия рабочего каталога со сброшенным состоянием
     let copy2 = work.join("repo2");
     copy_dir(&copy, &copy2)?;
@@ -217,6 +223,16 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
                          "ms_p50": pct(&times, 50), "ms_max": pct(&times, 100)}));
     }
     let central = central_report(&ctx, &status)?;
+    let hooks = hooks_with_map(&ctx, &copy, &work)?;
+    // развилка для владельца (п. 3): та же карта без эталонов экстрактора — исключением
+    // `[code] exclude` конфигурации проекта, без правки ранжирования; не гейт
+    fs::write(
+        copy.join(".zeroaimemory/config.toml"),
+        format!("[code]\nexclude = [\"{FIXTURES_GLOB}\"]\n"),
+    )?;
+    let no_fixtures_sync = ctx.sync(&copy)?;
+    let status_nf = ctx.wait_ranked()?;
+    let central_nf = central_report(&ctx, &status_nf)?;
     // замеры старта клиента — без работающего рядом сервера замеров (Qdrant, фоновые задачи
     // на том же HDD): у агента сервер обычно на другой машине
     srv.stop()?;
@@ -236,10 +252,20 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
         (
             "удаление — файл исчез из карты",
             removed.n("removed") == 1
+                && present == 1
                 && gone == 0
                 && status_after["files"].as_u64() == status_before["files"].as_u64().map(|n| n - 1),
         ),
         ("вторая копия — загружено 0", second.n("uploaded") == 0),
+        (
+            "хуки с картой — p95 в бюджете, строка карты и «### Код» в каждом выводе",
+            hooks.as_array().is_some_and(|a| {
+                a.iter().all(|h| {
+                    h["ok"] == true
+                        && (h["with_expected"].is_null() || h["with_expected"] == HOOK_RUNS)
+                })
+            }),
+        ),
         (
             "карта ≤ бюджета (200/500/1000/2000)",
             maps.iter().all(|m| m["ok"] == true),
@@ -267,12 +293,16 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
             "edit_one": row(&edited),
             "remove_one": row(&removed),
             "second_copy": row(&second),
-            "removed_symbols_left": gone,
+            "removed_file_rows_before": present,
+            "removed_file_rows_after": gone,
         },
         "map": {"first_after_sync_ms": round2(first_map_ms), "budgets": maps},
         "status": {"files": status["files"], "symbols": status["symbols"],
                    "by_lang": status["by_lang"], "skipped_total": status["skipped_total"]},
         "central": central,
+        "central_without_fixtures": {"exclude": FIXTURES_GLOB, "sync": row(&no_fixtures_sync),
+                                     "files": status_nf["files"], "report": central_nf},
+        "hooks_with_map": hooks,
         "zam_version": version,
         "background_spawn": spawn,
         "checks": checks.iter().map(|(k, v)| json!({"check": k, "ok": v})).collect::<Vec<_>>(),
@@ -366,8 +396,8 @@ impl Ctx {
         Ok(v)
     }
 
-    /// Символов файла `path` в карте сервера.
-    fn symbols_in(&self, path: &str) -> Result<usize> {
+    /// Строк файла `path` в таблице файлов карты (`GET /code/files`, поле `files`): 0 или 1.
+    fn files_named(&self, path: &str) -> Result<usize> {
         let (code, v) = http(
             &self.base,
             &self.token,
@@ -381,9 +411,10 @@ impl Ctx {
         if code != 200 {
             bail!("GET /code/files: HTTP {code}: {v}");
         }
-        Ok(v["items"]
+        let files = v["files"]
             .as_array()
-            .map_or(0, |a| a.iter().filter(|f| f["path"] == path).count()))
+            .with_context(|| format!("GET /code/files: нет массива files: {v}"))?;
+        Ok(files.iter().filter(|f| f["path"] == path).count())
     }
 
     /// Состояние карты после пересчёта рангов.
@@ -599,9 +630,127 @@ fn version_p95(zam: &Path) -> Result<Value> {
     }
     let size = fs::metadata(zam)?.len();
     Ok(
-        json!({"runs": VERSION_RUNS, "p50_ms": pct(&t, 50), "p95_ms": pct(&t, 95),
-              "binary_bytes": size}),
+        json!({"runs": VERSION_RUNS, "warmup": WARMUP_RUNS, "p50_ms": pct(&t, 50),
+              "p95_ms": pct(&t, 95), "max_ms": pct(&t, 100), "binary_bytes": size}),
     )
+}
+
+/// Хуки с загруженной картой этого репозитория против живого сервера замеров (§17 п. 8
+/// «`hook_budgets` зелёный с включённой картой»): `session-start` (строка карты в дайджесте),
+/// `prompt`, `pre-tool` и `post-tool` (успех) на `Read`, `subagent-start` с задачей про
+/// существующую функцию (раздел `### Код`). Конфигурация клиента — по умолчанию (`code_map`
+/// и `code.auto` включены; `HEAD` копии не меняется — фоновая синхронизация стартует только
+/// при первом `session-start`, он — прогревочный). Время — весь процесс хука, с прогревом.
+fn hooks_with_map(ctx: &Ctx, proj: &Path, work: &Path) -> Result<Value> {
+    let home = work.join("hooks-home");
+    fs::create_dir_all(home.join(".zeroaimemory"))?;
+    let run = |kind: &str, ev: &Value| -> Result<(f64, String)> {
+        let mut c = Command::new(&ctx.zam);
+        scrub_zam_env(&mut c, &[])
+            .args(["hook", kind, "--agent", "claude"])
+            .env("ZAM_URL", &ctx.base)
+            .env("ZAM_TOKEN", &ctx.token)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env_remove("CLAUDECODE")
+            .current_dir(proj)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let t0 = Instant::now();
+        let mut child = c.spawn().with_context(|| format!("zam hook {kind}"))?;
+        {
+            use std::io::Write as _;
+            let mut si = child.stdin.take().context("stdin хука")?;
+            si.write_all(ev.to_string().as_bytes())?;
+        }
+        let o = child.wait_with_output()?;
+        let d = ms(t0);
+        let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        let ctx_text = serde_json::from_str::<Value>(&out)
+            .ok()
+            .and_then(|v| {
+                v["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        Ok((d, ctx_text))
+    };
+    let ev = |event: &str, session: &str, extra: Value| {
+        let mut v = json!({"session_id": session, "cwd": proj,
+                           "transcript_path": proj.join("t.jsonl"), "hook_event_name": event});
+        for (k, x) in extra.as_object().into_iter().flatten() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    let read_file = proj.join("crates/zam-store/src/db.rs");
+    let task = "Почини code_sync_manifest в zam-store: падает на пустом манифесте";
+    let mut rows = Vec::new();
+    for (kind, budget, want) in [
+        ("session-start", 300.0, Some("ZeroAIMemory: карта кода:")),
+        ("prompt", 250.0, None),
+        ("pre-tool", 50.0, None),
+        ("post-tool", 50.0, None),
+        ("subagent-start", 300.0, Some("### Код")),
+    ] {
+        let (mut times, mut hits) = (Vec::new(), 0usize);
+        for i in 0..WARMUP_RUNS + HOOK_RUNS {
+            let sess = format!("cb-{kind}-{i}");
+            let e = match kind {
+                "session-start" => ev("SessionStart", &sess, json!({"source": "startup"})),
+                "prompt" => ev(
+                    "UserPromptSubmit",
+                    &sess,
+                    json!({"prompt": "почему падает синхронизация карты"}),
+                ),
+                "pre-tool" => ev(
+                    "PreToolUse",
+                    &sess,
+                    json!({"tool_name": "Read", "tool_input": {"file_path": read_file}}),
+                ),
+                "post-tool" => ev(
+                    "PostToolUse",
+                    &sess,
+                    json!({"tool_name": "Read", "tool_use_id": "u1",
+                           "tool_input": {"file_path": read_file},
+                           "tool_response": {"success": true}}),
+                ),
+                _ => {
+                    // очередь запуска субагента — `pre-tool` на `Agent` (вне замера)
+                    let spawn = ev(
+                        "PreToolUse",
+                        &sess,
+                        json!({"tool_name": "Agent", "tool_use_id": "u2",
+                               "tool_input": {"description": "d", "prompt": task,
+                                              "subagent_type": "Plan"}}),
+                    );
+                    run("pre-tool", &spawn)?;
+                    ev(
+                        "SubagentStart",
+                        &sess,
+                        json!({"agent_id": format!("ag-{i}"), "agent_type": "Plan"}),
+                    )
+                }
+            };
+            let (d, text) = run(kind, &e)?;
+            if i >= WARMUP_RUNS {
+                times.push(d);
+                if want.is_some_and(|w| text.contains(w)) {
+                    hits += 1;
+                }
+            }
+        }
+        let p95 = pct(&times, 95);
+        rows.push(
+            json!({"hook": kind, "runs": HOOK_RUNS, "p50_ms": pct(&times, 50),
+                         "p95_ms": p95, "max_ms": pct(&times, 100), "budget_ms": budget,
+                         "ok": p95 <= budget, "expect": want,
+                         "with_expected": want.map(|_| hits)}),
+        );
+    }
+    Ok(Value::from(rows))
 }
 
 /// Запуск фоновой синхронизации хуком `session-start`: время запуска из `hooks.log` (строка
@@ -656,12 +805,14 @@ fn spawn_p95(zam: &Path, work: &Path) -> Result<Value> {
     let spawns: Vec<f64> = all.iter().skip(WARMUP_RUNS).copied().collect();
     if all.len() != WARMUP_RUNS + SPAWN_RUNS {
         bail!(
-            "запусков фоновой синхронизации {} из {SPAWN_RUNS}; hooks.log:\n{log}",
-            spawns.len()
+            "запусков фоновой синхронизации {} из {}; hooks.log:\n{log}",
+            all.len(),
+            WARMUP_RUNS + SPAWN_RUNS
         );
     }
     Ok(
-        json!({"runs": SPAWN_RUNS, "p50_ms": pct(&spawns, 50), "p95_ms": pct(&spawns, 95),
+        json!({"runs": SPAWN_RUNS, "warmup": WARMUP_RUNS, "p50_ms": pct(&spawns, 50),
+              "p95_ms": pct(&spawns, 95), "max_ms": pct(&spawns, 100),
               "hook_p95_ms": pct(&hook_ms, 95)}),
     )
 }
@@ -724,6 +875,27 @@ fn print_table(r: &Value) {
         "| ключевые типы в 10 центральных `GET /code/status` | {}/10 | — |",
         c["status_hits"]
     );
+    for h in r["hooks_with_map"].as_array().into_iter().flatten() {
+        let expect = match h["expect"].as_str() {
+            Some(w) => format!("; «{w}» в {}/{}", h["with_expected"], h["runs"]),
+            None => String::new(),
+        };
+        println!(
+            "| хук `{}` с картой ({}) | p50 {} мс, p95 {} мс{expect} | ≤ {} мс |",
+            h["hook"].as_str().unwrap_or(""),
+            h["runs"],
+            h["p50_ms"],
+            h["p95_ms"],
+            h["budget_ms"]
+        );
+    }
+    let nf = &r["central_without_fixtures"];
+    println!(
+        "| развилка: без `{}` (файлов {}) — ключевые типы в первых 15 | {}/10 | ≥ 6 |",
+        nf["exclude"].as_str().unwrap_or(""),
+        nf["files"],
+        nf["report"]["top15_hits"]
+    );
     let v = &r["zam_version"];
     println!(
         "| `zam --version` (50) | p50 {} мс, p95 {} мс, бинарник {} байт | p95 ≤ 20 мс |",
@@ -737,6 +909,26 @@ fn print_table(r: &Value) {
     println!();
     println!("первые 15 центральных по рангу символа:");
     for (i, t) in c["top15"].as_array().into_iter().flatten().enumerate() {
+        let mark = if t["key"] == true {
+            " ← ключевой"
+        } else {
+            ""
+        };
+        println!(
+            "{:>2}. {} ({}, {}){mark}",
+            i + 1,
+            t["qual"].as_str().unwrap_or(""),
+            t["kind"].as_str().unwrap_or(""),
+            t["path"].as_str().unwrap_or("")
+        );
+    }
+    println!("развилка без эталонов — первые 15:");
+    for (i, t) in nf["report"]["top15"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
         let mark = if t["key"] == true {
             " ← ключевой"
         } else {
