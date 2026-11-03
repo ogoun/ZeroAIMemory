@@ -130,6 +130,9 @@ pub struct CodeRuntime {
     focus_slots: Arc<tokio::sync::Semaphore>,
     /// Входы ранжирования последних решений: `((владелец, GUID), etag снимка, входы)`.
     inputs: Mutex<VecDeque<(SolutionKey, String, Arc<RankInputs>)>>,
+    /// Идущие чтения входов (single-flight по `(владелец, GUID, etag)`): срок запроса их не
+    /// отменяет — дочитанное ляжет в кэш для следующего запроса.
+    loading: Mutex<HashMap<(SolutionKey, String), InputsLoad>>,
     /// Тестовые точки (фича `test-hooks`).
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
@@ -142,14 +145,66 @@ impl Default for CodeRuntime {
             ranking: Mutex::default(),
             focus_slots: Arc::new(tokio::sync::Semaphore::new(FOCUS_SLOTS)),
             inputs: Mutex::default(),
+            loading: Mutex::default(),
             #[cfg(feature = "test-hooks")]
             hooks: CodeHooks::default(),
         }
     }
 }
 
-/// Тестовые точки карты кода: задержки фонового пересчёта (после чтения входов) и ранжирования
-/// с фокусом, счётчик запущенных пересчётов.
+/// Чтение входов ранжирования, которого могут ждать несколько запросов.
+type InputsLoad = futures_util::future::Shared<
+    futures_util::future::BoxFuture<'static, Result<Arc<RankInputs>, String>>,
+>;
+
+impl CodeRuntime {
+    /// Входы из кэша по `(владелец, GUID, etag снимка)`.
+    fn cached(&self, key: &SolutionKey, etag: &str) -> Option<Arc<RankInputs>> {
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(k, e, _)| k == key && e == etag)
+            .map(|(_, _, i)| i.clone())
+    }
+
+    /// Кладёт входы в кэш (последние [`FOCUS_CACHE`] решений, у решения — одна запись).
+    fn remember(&self, key: SolutionKey, etag: String, inputs: Arc<RankInputs>) {
+        let mut cache = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        cache.retain(|(k, _, _)| *k != key);
+        cache.push_front((key, etag, inputs));
+        cache.truncate(FOCUS_CACHE);
+    }
+
+    /// Очищает кэш входов (тестовая точка).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn forget_inputs(&self) {
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
+/// Входы прочитаны при неизменном снимке: `etag` до и после чтения совпал — входы кладутся в
+/// кэш под ним (иначе карта менялась во время чтения, и кэш не заполняется).
+async fn remember_if_unchanged(
+    rt: &CodeRuntime,
+    db: &Db,
+    key: SolutionKey,
+    before: &str,
+    inputs: &Arc<RankInputs>,
+) {
+    if let Ok(Some(after)) = code_snapshot(db, &key.1).await
+        && after.etag == before
+    {
+        rt.remember(key, after.etag, inputs.clone());
+    }
+}
+
+/// Тестовые точки карты кода: задержки фонового пересчёта (после чтения входов), ранжирования
+/// с фокусом и чтения входов для кэша; счётчики пересчётов и чтений.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 #[derive(Default)]
@@ -157,6 +212,9 @@ pub struct CodeHooks {
     pub rank_delay_ms: std::sync::atomic::AtomicU64,
     pub focus_delay_ms: std::sync::atomic::AtomicU64,
     pub rank_runs: std::sync::atomic::AtomicUsize,
+    /// Задержка перед чтением входов для кэша фокуса, мс, и число таких чтений.
+    pub inputs_delay_ms: std::sync::atomic::AtomicU64,
+    pub inputs_reads: std::sync::atomic::AtomicUsize,
 }
 
 // ---- общие проверки ----
@@ -394,20 +452,22 @@ async fn store_snapshot(sc: &MemScope, guid: &str) -> Result<Option<CodeSnapshot
 /// Пересчёт рангов: снимок ещё `pending` → входы → PageRank в `spawn_blocking` → сохранение
 /// (`false` — карта изменилась после чтения входов). Ранги уже посчитаны (другой запрос успел)
 /// — `true` без счёта.
-async fn store_rank(rt: Arc<CodeRuntime>, db: Db, guid: String) -> Result<bool, String> {
-    #[cfg(not(feature = "test-hooks"))]
-    let _ = &rt;
-    match code_snapshot(&db, &guid).await.map_err(|e| e.to_string())? {
-        Some(s) if s.rank_state == RankState::Pending => {}
+async fn store_rank(rt: Arc<CodeRuntime>, owner: Id, db: Db, guid: String) -> Result<bool, String> {
+    let before = match code_snapshot(&db, &guid).await.map_err(|e| e.to_string())? {
+        Some(s) if s.rank_state == RankState::Pending => s.etag,
         _ => return Ok(true),
-    }
+    };
     #[cfg(feature = "test-hooks")]
     rt.hooks
         .rank_runs
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let inputs = code_rank_inputs(&db, &guid)
-        .await
-        .map_err(|e| e.to_string())?;
+    let inputs = Arc::new(
+        code_rank_inputs(&db, &guid)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    // те же входы нужны ранжированию с фокусом: ранги `etag` снимка не меняют
+    remember_if_unchanged(&rt, &db, (owner, guid.clone()), &before, &inputs).await;
     #[cfg(feature = "test-hooks")]
     {
         let ms = rt
@@ -478,10 +538,10 @@ async fn rank_now(st: &AppState, sc: &MemScope, guid: &str) -> Vec<String> {
         rt: st.code.clone(),
         key,
     };
-    let (rt, db, g) = (st.code.clone(), sc.db.clone(), guid.to_string());
+    let (rt, owner, db, g) = (st.code.clone(), sc.owner, sc.db.clone(), guid.to_string());
     let task = tokio::spawn(async move {
         let _guard = guard;
-        let r = store_rank(rt, db, g).await;
+        let r = store_rank(rt, owner, db, g).await;
         if let Err(e) = &r {
             tracing::warn!(error = %e, "ранги карты кода не пересчитаны");
         }
@@ -656,11 +716,20 @@ pub struct SyncReq {
     branch: Option<String>,
     #[serde(default)]
     machine: Option<String>,
-    manifest: Vec<Value>,
+    manifest: Vec<ManifestIn>,
+}
+
+/// Элемент манифеста как он пришёл (разбор сразу в строки, без промежуточного `Value`: тело
+/// манифеста — до десятков мегабайт).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestIn {
+    path: String,
+    hash: String,
 }
 
 /// Манифест: нормализованные пути, хэши, без повторов; ошибки — 422 `manifest[i]…`.
-fn parse_manifest(m: &[Value], max: u32) -> Result<Vec<ManifestItem>, ApiError> {
+fn parse_manifest(m: Vec<ManifestIn>, max: u32) -> Result<Vec<ManifestItem>, ApiError> {
     if m.len() > max as usize {
         return Err(unprocessable(format!(
             "manifest: не больше {max} файлов (code.max_files)"
@@ -668,14 +737,10 @@ fn parse_manifest(m: &[Value], max: u32) -> Result<Vec<ManifestItem>, ApiError> 
     }
     let mut seen: HashSet<String> = HashSet::with_capacity(m.len());
     let mut out = Vec::with_capacity(m.len());
-    for (i, v) in m.iter().enumerate() {
+    for (i, v) in m.into_iter().enumerate() {
         let what = format!("manifest[{i}]");
-        let o = v
-            .as_object()
-            .ok_or_else(|| unprocessable(format!("{what}: ожидается объект {{path, hash}}")))?;
-        known_fields(o, &["path", "hash"], &what)?;
-        let path = path_of(str_field(o, "path", &what)?, &format!("{what}.path"))?;
-        let hash = check_hash(str_field(o, "hash", &what)?).ok_or_else(|| {
+        let path = path_of(&v.path, &format!("{what}.path"))?;
+        let hash = check_hash(&v.hash).ok_or_else(|| {
             unprocessable(format!("{what}.hash: blake3 содержимого, 64 hex-символа"))
         })?;
         if !seen.insert(path.clone()) {
@@ -686,23 +751,55 @@ fn parse_manifest(m: &[Value], max: u32) -> Result<Vec<ManifestItem>, ApiError> 
     Ok(out)
 }
 
-/// `POST /code/sync` → `{need, removed, etag}`.
+/// `POST /code/sync` → `{need, removed, stale_refs, etag}`. С заголовком `X-Zam-Solution`
+/// права проверяются до чтения тела (манифест — до десятков мегабайт), и `solution` тела
+/// обязан совпадать с ним.
 pub async fn sync(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    body: axum::body::Body,
 ) -> Result<Json<Value>, ApiError> {
     enabled(&st)?;
-    let req: SyncReq = code_body(sync_body_max(&st.cfg.code), body)?;
-    let sc = code_scope(&st, &p, &headers, &req.solution, Mode::Write).await?;
+    let early = match headers
+        .get(SOLUTION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(code_scope(&st, &p, &headers, raw, Mode::Write).await?),
+        None => None,
+    };
+    let limit = sync_body_max(&st.cfg.code);
+    let bytes = axum::body::to_bytes(body, limit).await.map_err(|_| {
+        ApiError::PayloadTooLarge(format!(
+            "тело запроса больше предела {limit} байт (манифест: code.max_files путей)"
+        ))
+    })?;
+    let req: SyncReq = parse_body(&bytes)?;
+    drop(bytes);
+    let sc = match early {
+        Some(sc) => {
+            let body_sc = SpaceRef::parse(&req.solution)?;
+            let same = match body_sc {
+                SpaceRef::Solution(g) => sc.space.solution_guid.as_deref() == Some(g.as_str()),
+                SpaceRef::Id(id) => sc.space.id == id,
+                SpaceRef::Fixed(_) => false,
+            };
+            if !same {
+                return Err(unprocessable("solution: не совпадает с X-Zam-Solution"));
+            }
+            sc
+        }
+        None => code_scope(&st, &p, &headers, &req.solution, Mode::Write).await?,
+    };
     let meta = upload_meta(
         req.commit.as_deref(),
         req.branch.as_deref(),
         req.machine.as_deref(),
         sc.user.id,
     )?;
-    let manifest = parse_manifest(&req.manifest, st.cfg.code.max_files)?;
+    let manifest = parse_manifest(req.manifest, st.cfg.code.max_files)?;
     let g = guid(&sc);
     let mut dbs = report_dbs(&st, &p, &sc).await?.into_iter();
     let (_, own_spaces) = dbs
@@ -1119,7 +1216,9 @@ fn focus_ranks(inputs: &RankInputs, f: &Focus) -> Option<HashMap<i64, f64>> {
     Some(inputs.files.iter().map(|x| x.id).zip(r).collect())
 }
 
-/// Входы ранжирования решения из кэша (тот же `etag` снимка — та же карта) или из хранилища.
+/// Входы ранжирования решения: из кэша (тот же `etag` снимка — та же карта) или отдельной
+/// задачей чтения — одной на `(владелец, GUID, etag)` для всех ждущих запросов. Отмена ожидания
+/// (срок запроса) чтения не отменяет: дочитанное ляжет в кэш.
 async fn cached_inputs(
     st: &AppState,
     sc: &MemScope,
@@ -1127,32 +1226,64 @@ async fn cached_inputs(
     etag: &str,
 ) -> Result<Arc<RankInputs>, ApiError> {
     let key = (sc.owner, guid.to_string());
-    let hit = st
-        .code
-        .inputs
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .find(|(k, e, _)| *k == key && e == etag)
-        .map(|(_, _, i)| i.clone());
-    if let Some(i) = hit {
+    if let Some(i) = st.code.cached(&key, etag) {
         return Ok(i);
     }
-    let inputs = Arc::new(code_rank_inputs(&sc.db, guid).await?);
-    let mut cache = st
-        .code
-        .inputs
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    cache.retain(|(k, _, _)| *k != key);
-    cache.push_front((key, etag.to_string(), inputs.clone()));
-    cache.truncate(FOCUS_CACHE);
-    Ok(inputs)
+    inputs_load(st, sc, key, etag)
+        .await
+        .map_err(ApiError::Internal)
 }
 
-/// Ранги файлов с фокусом: слот ([`FOCUS_SLOTS`]), входы (кэш) и PageRank — всё под сроком
-/// `max(code.rank_timeout_ms, 200)`. Срок вышел — `Err(())` (карта без фокуса); слот занят
-/// счётом до его конца, даже если запрос уже ответил.
+/// Задача чтения входов для `(key, etag)`: идущая или новая.
+fn inputs_load(st: &AppState, sc: &MemScope, key: SolutionKey, etag: &str) -> InputsLoad {
+    use futures_util::FutureExt;
+    let lkey = (key, etag.to_string());
+    let mut loading = st
+        .code
+        .loading
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(f) = loading.get(&lkey) {
+        return f.clone();
+    }
+    let (rt, db, k) = (st.code.clone(), sc.db.clone(), lkey.clone());
+    // задача снимает себя из `loading` под тем же замком — после вставки ниже
+    let task = tokio::spawn(async move {
+        #[cfg(feature = "test-hooks")]
+        {
+            use std::sync::atomic::Ordering;
+            rt.hooks.inputs_reads.fetch_add(1, Ordering::SeqCst);
+            let ms = rt.hooks.inputs_delay_ms.load(Ordering::SeqCst);
+            if ms > 0 {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+        }
+        let r = code_rank_inputs(&db, &k.0.1)
+            .await
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
+        if let Ok(inputs) = &r {
+            remember_if_unchanged(&rt, &db, k.0.clone(), &k.1, inputs).await;
+        }
+        rt.loading
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&k);
+        r
+    });
+    let load: InputsLoad = async move {
+        task.await
+            .unwrap_or_else(|e| Err(format!("чтение входов прервано (panic = {})", e.is_panic())))
+    }
+    .boxed()
+    .shared();
+    loading.insert(lkey, load.clone());
+    load
+}
+
+/// Ранги файлов с фокусом: входы (кэш или общее чтение), слот ([`FOCUS_SLOTS`]) и PageRank —
+/// под одним сроком `max(code.rank_timeout_ms, 200)`. Срок вышел — `Err(())` (карта без
+/// фокуса); чтение входов при этом продолжается и заполнит кэш, слот занят счётом до его конца.
 async fn focus_file_ranks(
     st: &AppState,
     sc: &MemScope,
@@ -1162,6 +1293,7 @@ async fn focus_file_ranks(
 ) -> Result<Result<Option<HashMap<i64, f64>>, ()>, ApiError> {
     let wait = Duration::from_millis(st.cfg.code.rank_timeout_ms.max(FOCUS_TIMEOUT_MIN_MS));
     let work = async {
+        let inputs = cached_inputs(st, sc, guid, etag).await?;
         let permit = st
             .code
             .focus_slots
@@ -1169,7 +1301,6 @@ async fn focus_file_ranks(
             .acquire_owned()
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let inputs = cached_inputs(st, sc, guid, etag).await?;
         let f = focus.clone();
         #[cfg(feature = "test-hooks")]
         let delay = st

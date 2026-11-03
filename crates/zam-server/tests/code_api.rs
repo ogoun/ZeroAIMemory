@@ -283,6 +283,7 @@ async fn put_files_then_status_by_lang_skips_age() {
     assert_eq!(j["accepted"], 4, "{j}");
     assert_eq!(j["stale_refs"], 0);
     assert!(j["warnings"].is_array(), "{j}");
+    wait_ranked(&a).await;
     let s = status(&a).await;
     assert_eq!(s["exists"], true, "{s}");
     assert_eq!(
@@ -421,6 +422,7 @@ async fn map_json_format_edges_between_shown_max_120() {
         })
         .collect();
     put(&a, files).await;
+    wait_ranked(&a).await;
     let m = map_json(&a, "&budget_tokens=20000").await;
     let shown: Vec<i64> = m["files"]
         .as_array()
@@ -491,6 +493,7 @@ async fn map_focus_paths_in_top5() {
         files.push(file(&path, i as u64 + 1, defs, &refs));
     }
     put(&a, files).await;
+    wait_ranked(&a).await;
     let top = |m: &Value| paths_of(m).into_iter().take(5).collect::<Vec<_>>();
     let global = top(&map_json(&a, "").await);
     for p in ["src/f20.rs", "src/f25.rs", "src/f26.rs", "src/f27.rs"] {
@@ -1252,6 +1255,7 @@ async fn map_two_phase_many_files_tail_counts_all() {
         })
         .collect();
     put(&a, files).await;
+    wait_ranked(&a).await;
     let m = map_json(&a, "&budget_tokens=20000").await;
     assert_eq!(m["files_shown"], 300, "все файлы: {}", m["files_left"]);
     assert_eq!(m["symbols_shown"], 300);
@@ -1405,7 +1409,7 @@ async fn parallel_maps_run_one_ranking() {
     a.st.code
         .hooks
         .rank_delay_ms
-        .store(300, std::sync::atomic::Ordering::SeqCst);
+        .store(1500, std::sync::atomic::Ordering::SeqCst);
     let (m1, m2) = tokio::join!(map_json(&a, ""), map_json(&a, ""));
     let mut w = [m1["warnings"].clone(), m2["warnings"].clone()];
     w.sort_by_key(|v| v.as_array().map_or(0, Vec::len));
@@ -1467,4 +1471,121 @@ async fn code_files_page_lang_q_offset_limit() {
     assert_eq!(j["files"][0]["path"], "web/App.ts", "без учёта регистра");
     unprocessable(&get(&a, &q("limit=201")).await, "200", "предел страницы");
     unprocessable(&get(&a, &q("lang=cobol")).await, "lang", "язык");
+}
+
+/// Ревью задачи 4, O1: чтение входов для фокуса — отдельной задачей, одной на решение и снимок;
+/// срок запроса его не отменяет: первые запросы откатываются без фокуса, следующий — с фокусом
+/// из кэша; чтение — одно на два параллельных запроса.
+#[tokio::test]
+async fn focus_inputs_load_survives_timeout_single_read() {
+    use std::sync::atomic::Ordering;
+    let a = world("focus-load", |c| c.code.rank_timeout_ms = 1).await;
+    put(
+        &a,
+        vec![
+            file("src/a.rs", 1, vec![func("alpha_function", 1)], &[]),
+            file(
+                "src/b.rs",
+                2,
+                vec![func("beta_function", 1)],
+                &[("alpha_function", "call", 3)],
+            ),
+        ],
+    )
+    .await;
+    wait_ranked(&a).await;
+    let hooks = &a.st.code.hooks;
+    a.st.code.forget_inputs();
+    hooks.inputs_delay_ms.store(3000, Ordering::SeqCst);
+    let focus = enc(&json!({"paths": ["src/b.rs"]}).to_string());
+    let extra = format!("&focus={focus}");
+    let (m1, m2) = tokio::join!(map_json(&a, &extra), map_json(&a, &extra));
+    for m in [&m1, &m2] {
+        assert_eq!(m["warnings"], json!(["focus rank timeout"]), "{m}");
+    }
+    assert_eq!(
+        hooks.inputs_reads.load(Ordering::SeqCst),
+        1,
+        "одно чтение на два запроса"
+    );
+    // чтение дочиталось в фоне и заполнило кэш
+    for _ in 0..200 {
+        if a.st.code.hooks.inputs_reads.load(Ordering::SeqCst) == 1
+            && map_json(&a, &extra).await["warnings"] == json!([])
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let m = map_json(&a, &extra).await;
+    assert_eq!(m["warnings"], json!([]), "{m}");
+    assert!(m["header"].as_str().unwrap().contains("с фокусом"), "{m}");
+    assert_eq!(paths_of(&m)[0], "src/b.rs");
+    assert_eq!(hooks.inputs_reads.load(Ordering::SeqCst), 1, "из кэша");
+}
+
+/// Ревью задачи 4, O3: с `X-Zam-Solution` права проверяются до чтения тела — токен `ro` получает
+/// 403 и на теле больше предела; `solution` тела обязан совпадать с заголовком; манифест —
+/// строгий `{path, hash}`.
+#[tokio::test]
+async fn sync_header_checks_rights_before_body() {
+    let a = world("sync-header", |c| {
+        c.code.max_files = 1;
+        c.code.max_request_bytes = 2048;
+    })
+    .await;
+    let ro = a.issue(&a.admin_id(), "ro").await;
+    let big = json!({"solution": G, "manifest": [], "pad": "x".repeat(10_000)});
+    let hdr = [("x-zam-solution", G)];
+    let r = a
+        .tok_h(
+            &ro,
+            Method::POST,
+            "/api/v1/code/sync",
+            Some(big.clone()),
+            &hdr,
+        )
+        .await;
+    ok(&r, StatusCode::FORBIDDEN, "ro до чтения тела");
+    let r = a
+        .tok(&ro, Method::POST, "/api/v1/code/sync", Some(big.clone()))
+        .await;
+    ok(
+        &r,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "без заголовка — сначала тело",
+    );
+    let r = a
+        .tok_h(&a.token, Method::POST, "/api/v1/code/sync", Some(big), &hdr)
+        .await;
+    ok(&r, StatusCode::PAYLOAD_TOO_LARGE, "rw: тело больше предела");
+    let other = json!({"solution": "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e99", "manifest": []});
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/code/sync",
+            Some(other),
+            &hdr,
+        )
+        .await;
+    unprocessable(&r, "X-Zam-Solution", "решение тела другое");
+    let body = json!({"solution": G, "manifest": [{"path": "a.rs", "hash": h(1)}]});
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/code/sync",
+            Some(body),
+            &hdr,
+        )
+        .await;
+    ok(&r, StatusCode::OK, "с заголовком");
+    let body = json!({"solution": G, "manifest": [{"path": "a.rs", "hash": h(1), "x": 1}]});
+    let r = a.t(Method::POST, "/api/v1/code/sync", Some(body)).await;
+    ok(
+        &r,
+        StatusCode::BAD_REQUEST,
+        "лишнее поле элемента манифеста",
+    );
 }
