@@ -215,6 +215,42 @@ fn url_token_around<'a>(text: &'a str, r: &Range<usize>) -> &'a str {
     text.get(s..e).unwrap_or("")
 }
 
+/// Конец маски, которая покроет позицию `at`: цепочка пересекающихся диапазонов `raw` (как при
+/// их объединении в [`scan_secrets`]).
+fn masked_span_end(raw: &[(Range<usize>, SecretKind)], at: usize) -> usize {
+    let mut end = at;
+    let mut grown = true;
+    while grown {
+        grown = false;
+        for (h, _) in raw {
+            if h.start <= end && (h.start <= at || h.start < end) && h.end > end {
+                end = h.end;
+                grown = true;
+            }
+        }
+    }
+    end
+}
+
+/// URL-токен вокруг `r`, если текст от `r.end` до `masked_end` заменён маской: левая часть — как
+/// в [`url_token_around`], правая продолжается за маской до границы.
+fn url_token_masked(text: &str, r: &Range<usize>, masked_end: usize) -> String {
+    let b = text.as_bytes();
+    let mut s = r.start;
+    while s > 0 && !is_url_delim(b[s - 1]) {
+        s -= 1;
+    }
+    let mut e = masked_end;
+    while e < b.len() && !is_url_delim(b[e]) {
+        e += 1;
+    }
+    let mut out = String::new();
+    out.push_str(text.get(s..r.end).unwrap_or(""));
+    out.push_str(SECRET_MARK);
+    out.push_str(text.get(masked_end..e).unwrap_or(""));
+    out
+}
+
 /// Находит секреты. Результат отсортирован по началу, диапазоны не пересекаются
 /// (пересёкшиеся объединяются, вид берётся у первого), `line` считается с 1.
 pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
@@ -247,13 +283,18 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
     for m in ENTROPY_CANDIDATE.find_iter(text) {
         let start = m.start();
         let mut end = m.end();
+        // конец замаскированного значения справа от проверяемого имени (см. ниже)
+        let mut masked_end: Option<usize> = None;
         loop {
             // `имя=значение`: `=` внутри строки — разделитель, а не base64-дополнение (оно в
             // конце); проверяется значение
             let inner = text[start..end].trim_end_matches('=').rfind('=');
             let r = inner.map_or(start..end, |i| start + i + 1..end);
-            if r.len() >= 32 && is_high_entropy_secret(&text[r.clone()], url_token_around(text, &r))
-            {
+            let token = match masked_end {
+                Some(me) => url_token_masked(text, &r, me),
+                None => url_token_around(text, &r).to_string(),
+            };
+            if r.len() >= 32 && is_high_entropy_secret(&text[r.clone()], &token) {
                 raw.push((r.clone(), SecretKind::HighEntropy));
             }
             // значение замаскировано (этим или другим правилом): повторный проход увидит
@@ -268,6 +309,10 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
                         .iter()
                         .any(|(h, _)| h.start <= r.start && r.start < h.end) =>
                 {
+                    // окрестность имени — как во втором проходе, где значение уже заменено
+                    // маской: иначе `://` замаскированного значения скрывает имя только в первом
+                    // проходе (CI 41605984321, `mask_is_idempotent`)
+                    masked_end = Some(masked_span_end(&raw, r.start));
                     end = r.start;
                 }
                 _ => break,

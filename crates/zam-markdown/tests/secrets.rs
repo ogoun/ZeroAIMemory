@@ -397,3 +397,18 @@ fn bench_scan_100kb() {
     println!("scan_secrets: {per:?} на {} байт", text.len());
     assert!(per.as_millis() <= 2, "бюджет 2 мс превышен: {per:?}");
 }
+
+/// Регрессия (CI 41605984321): `://` замаскированного значения не должен скрывать длинное имя
+/// слева только в первом проходе.
+#[test]
+fn name_left_of_masked_url_value_idempotent() {
+    let name = "a020abAb0bC0e13h2cA45aaf6cgDEi1B";
+    for tail in [
+        "password=abcdef123postgres://u:pw12345@h/",
+        "password=abcdef123password=abcdef123postgres://u:pw12345@h/",
+    ] {
+        let t = format!("{name}{tail}");
+        let once = mask_text(&t);
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+}
