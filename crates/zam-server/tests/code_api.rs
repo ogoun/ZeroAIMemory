@@ -1427,6 +1427,74 @@ async fn parallel_maps_run_one_ranking() {
     );
 }
 
+/// Финальное ревью ветки M5.6, I1: пересчётов рангов разных решений одновременно — не больше
+/// двух на сервер (глобальный слот тяжёлых операций). Короткий срок: все три запроса — `rank
+/// pending`, без сбоев; затем третий дожидается слота, и все решения доходят до `ok`.
+#[tokio::test]
+async fn parallel_rankings_of_solutions_share_two_heavy_slots() {
+    use std::sync::atomic::Ordering;
+    let a = world("heavy-slots", |c| c.code.rank_timeout_ms = 200).await;
+    let guids = [
+        G.to_string(),
+        "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e32".to_string(),
+        "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e33".to_string(),
+    ];
+    for (i, g) in guids.iter().enumerate().skip(1) {
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/solutions",
+                Some(json!({"agent_solution_id": g, "name": format!("Карта {i}")})),
+            )
+            .await;
+        ok(&r, StatusCode::CREATED, "решение");
+    }
+    for (i, g) in guids.iter().enumerate() {
+        let r = a
+            .t(
+                Method::PUT,
+                "/api/v1/code/files",
+                Some(json!({"solution": g, "commit": "abcdef1", "branch": "main",
+                            "machine": "box",
+                            "files": [file("src/a.rs", i as u64 + 1, vec![func("alpha", 1)], &[])]})),
+            )
+            .await;
+        ok(&r, StatusCode::OK, "загрузка");
+    }
+    let hooks = &a.st.code.hooks;
+    hooks.rank_delay_ms.store(700, Ordering::SeqCst);
+    let a = &a;
+    let map = |g: &str| {
+        let uri = format!("/api/v1/code/map?solution={g}&format=json");
+        async move { get_ok(a, &uri).await }
+    };
+    let (m1, m2, m3) = tokio::join!(map(&guids[0]), map(&guids[1]), map(&guids[2]));
+    for m in [&m1, &m2, &m3] {
+        assert_eq!(m["warnings"], json!(["rank pending"]), "{m}");
+    }
+    // фон: третий пересчёт ждёт слот и доводит своё решение до `ok`
+    let t = std::time::Instant::now();
+    loop {
+        let mut done = 0;
+        for g in &guids {
+            let s = get_ok(a, &format!("/api/v1/code/status?solution={g}")).await;
+            done += usize::from(s["rank_state"] == "ok");
+        }
+        if done == guids.len() {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "ранги не досчитаны");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(hooks.rank_runs.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        hooks.rank_active_max.load(Ordering::SeqCst),
+        2,
+        "не больше двух сразу"
+    );
+    assert!(hooks.heavy_active_max.load(Ordering::SeqCst) <= 2);
+}
+
 /// Ревью задачи 4, I5: таблица файлов по рангу постранично, фильтр языка и подстроки пути.
 #[tokio::test]
 async fn code_files_page_lang_q_offset_limit() {

@@ -33,7 +33,8 @@ zam-search = { path = "../zam-search" }
 # `doc-worker`
 zam-docs = { path = "../zam-docs", features = ["pdfium", "images"] }
 jiff.workspace = true
-serde_json.workspace = true
+# `raw_value`: файлы `PUT /code/files` разбираются по одному без промежуточного `Value`
+serde_json = { workspace = true, features = ["raw_value"] }
 # ETag кэша триггеров (§10.3)
 blake3.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }

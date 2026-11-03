@@ -103,6 +103,11 @@ const MAP_FILES_FIRST: usize = 64;
 const MANIFEST_ITEM_OVERHEAD: usize = 100;
 /// Ранжирований с фокусом одновременно (CPU: PageRank по всей карте на запрос).
 const FOCUS_SLOTS: usize = 2;
+/// Тяжёлых операций карты одновременно на весь сервер (§12): чтений входов ранжирования вне
+/// кэша и фоновых пересчётов рангов (чтение входов и PageRank). Входы карты 50 000 файлов —
+/// ≈ 180 МиБ: без общего предела N решений в `pending` читали бы и считали N раз параллельно
+/// (финальное ревью ветки M5.6, I1).
+const HEAVY_SLOTS: usize = 2;
 /// Срок ранжирования с фокусом не меньше, мс.
 const FOCUS_TIMEOUT_MIN_MS: u64 = 200;
 /// Входов ранжирования в кэше фокуса (по `(владелец, GUID, etag снимка)`).
@@ -129,12 +134,16 @@ const DIGEST_QUAL_MAX: usize = 48;
 type SolutionKey = (Id, String);
 
 /// Состояние карты кода на сервере (`AppState::code`): пересчёты рангов (single-flight на
-/// решение), слоты и кэш входов ранжирования с фокусом.
+/// решение), слоты тяжёлых операций и ранжирования с фокусом, кэш входов ранжирования.
 pub struct CodeRuntime {
     /// Решения, ранги которых сейчас пересчитываются.
     ranking: Mutex<HashSet<SolutionKey>>,
     /// Слоты ранжирования с фокусом ([`FOCUS_SLOTS`]).
     focus_slots: Arc<tokio::sync::Semaphore>,
+    /// Слоты тяжёлых операций на весь сервер ([`HEAVY_SLOTS`], [`heavy_slot`]): слот держит
+    /// задача чтения входов вне кэша или фоновый пересчёт рангов целиком. Ожидающий слота
+    /// пересчёт ничего не держит в памяти; запрос ждёт его в пределах `code.rank_timeout_ms`.
+    heavy_slots: Arc<tokio::sync::Semaphore>,
     /// Входы ранжирования последних решений: `((владелец, GUID), etag снимка, входы, байт)`.
     inputs: Mutex<VecDeque<CachedInputs>>,
     /// Идущее чтение входов решения — не больше одного на `(владелец, GUID)`: `(etag, чтение)`.
@@ -153,6 +162,7 @@ impl Default for CodeRuntime {
         Self {
             ranking: Mutex::default(),
             focus_slots: Arc::new(tokio::sync::Semaphore::new(FOCUS_SLOTS)),
+            heavy_slots: Arc::new(tokio::sync::Semaphore::new(HEAVY_SLOTS)),
             inputs: Mutex::default(),
             loading: Mutex::default(),
             #[cfg(feature = "test-hooks")]
@@ -243,6 +253,9 @@ pub struct CodeHooks {
     pub rank_delay_ms: std::sync::atomic::AtomicU64,
     pub focus_delay_ms: std::sync::atomic::AtomicU64,
     pub rank_runs: std::sync::atomic::AtomicUsize,
+    /// Пересчётов рангов на шаге «входы прочитаны → PageRank» сейчас и наибольшее их число.
+    pub rank_active: std::sync::atomic::AtomicUsize,
+    pub rank_active_max: std::sync::atomic::AtomicUsize,
     /// Задержка перед чтением входов для кэша фокуса, мс, и число таких чтений.
     pub inputs_delay_ms: std::sync::atomic::AtomicU64,
     pub inputs_reads: std::sync::atomic::AtomicUsize,
@@ -251,6 +264,48 @@ pub struct CodeHooks {
     /// Наибольшее число одновременных чтений входов одного решения.
     pub inputs_active: std::sync::atomic::AtomicUsize,
     pub inputs_active_max: std::sync::atomic::AtomicUsize,
+    /// Занятых слотов тяжёлых операций ([`HEAVY_SLOTS`]) сейчас и наибольшее их число.
+    pub heavy_active: std::sync::atomic::AtomicUsize,
+    pub heavy_active_max: std::sync::atomic::AtomicUsize,
+}
+
+/// Слот тяжёлой операции карты ([`HEAVY_SLOTS`]); освобождается при сбросе.
+struct HeavyPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    #[cfg(feature = "test-hooks")]
+    rt: Arc<CodeRuntime>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for HeavyPermit {
+    fn drop(&mut self) {
+        self.rt
+            .hooks
+            .heavy_active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Ждёт слот тяжёлой операции (очередь — по порядку обращения).
+async fn heavy_slot(rt: &Arc<CodeRuntime>) -> Result<HeavyPermit, String> {
+    let permit = rt
+        .heavy_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| e.to_string())?;
+    #[cfg(feature = "test-hooks")]
+    {
+        use std::sync::atomic::Ordering;
+        let h = &rt.hooks;
+        let now = h.heavy_active.fetch_add(1, Ordering::SeqCst) + 1;
+        h.heavy_active_max.fetch_max(now, Ordering::SeqCst);
+    }
+    Ok(HeavyPermit {
+        _permit: permit,
+        #[cfg(feature = "test-hooks")]
+        rt: rt.clone(),
+    })
 }
 
 // ---- общие проверки ----
@@ -284,8 +339,13 @@ fn code_body<T: DeserializeOwned>(
     limit: usize,
     b: Result<Bytes, BytesRejection>,
 ) -> Result<T, ApiError> {
+    parse_body(&code_bytes(limit, b)?)
+}
+
+/// Тело запроса карты: превышение предела — 413 с пределом, иная ошибка чтения — 400.
+fn code_bytes(limit: usize, b: Result<Bytes, BytesRejection>) -> Result<Bytes, ApiError> {
     match b {
-        Ok(b) => parse_body(&b),
+        Ok(b) => Ok(b),
         Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => Err(ApiError::PayloadTooLarge(
             format!("тело запроса больше предела {limit} байт (code.max_request_bytes)"),
         )),
@@ -501,37 +561,47 @@ async fn store_snapshot(sc: &MemScope, guid: &str) -> Result<Option<CodeSnapshot
     Ok(code_snapshot(&sc.db, guid).await?)
 }
 
-/// Пересчёт рангов: снимок ещё `pending` → входы → PageRank в `spawn_blocking` → сохранение
-/// (`false` — карта изменилась после чтения входов). Ранги уже посчитаны (другой запрос успел)
-/// — `true` без счёта.
+/// Пересчёт рангов под слотом тяжёлой операции ([`rank_inputs`]): снимок ещё `pending` → входы
+/// → PageRank в `spawn_blocking` → сохранение (`false` — карта изменилась после чтения входов).
+/// Ранги уже посчитаны (другой запрос успел) — `true` без счёта.
 async fn store_rank(rt: Arc<CodeRuntime>, owner: Id, db: Db, guid: String) -> Result<bool, String> {
-    let before = match code_snapshot(&db, &guid).await.map_err(|e| e.to_string())? {
-        Some(s) if s.rank_state == RankState::Pending => s.etag,
-        _ => return Ok(true),
+    let snapshot = code_snapshot(&db, &guid).await.map_err(|e| e.to_string())?;
+    if snapshot
+        .as_ref()
+        .is_none_or(|s| s.rank_state != RankState::Pending)
+    {
+        return Ok(true);
+    }
+    // слот — до чтения входов и до конца счёта: ожидающий пересчёт ничего не держит в памяти
+    let Some((_slot, inputs)) = rank_inputs(&rt, &db, (owner, guid.clone())).await? else {
+        return Ok(true);
     };
     #[cfg(feature = "test-hooks")]
     rt.hooks
         .rank_runs
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    // общий путь чтения входов (одно на решение; ранги `etag` снимка не меняют, поэтому
-    // входы ложатся в кэш фокуса под тем же `etag`)
-    let inputs = load_inputs(&rt, &db, (owner, guid.clone()), &before).await?;
     #[cfg(feature = "test-hooks")]
     {
-        let ms = rt
-            .hooks
-            .rank_delay_ms
-            .load(std::sync::atomic::Ordering::SeqCst);
+        use std::sync::atomic::Ordering;
+        let h = &rt.hooks;
+        let now = h.rank_active.fetch_add(1, Ordering::SeqCst) + 1;
+        h.rank_active_max.fetch_max(now, Ordering::SeqCst);
+        let ms = h.rank_delay_ms.load(Ordering::SeqCst);
         if ms > 0 {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
     }
-    let (inputs, ranked) = tokio::task::spawn_blocking(move || {
+    let ranked = tokio::task::spawn_blocking(move || {
         let r = zam_code::rank(&inputs.files, None);
         (inputs, r)
     })
-    .await
-    .map_err(|e| format!("ранжирование прервано (panic = {})", e.is_panic()))?;
+    .await;
+    #[cfg(feature = "test-hooks")]
+    rt.hooks
+        .rank_active
+        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    let (inputs, ranked) =
+        ranked.map_err(|e| format!("ранжирование прервано (panic = {})", e.is_panic()))?;
     code_store_ranks(&db, &guid, &inputs, &ranked, Timestamp::now())
         .await
         .map(|written| written.is_some())
@@ -937,9 +1007,12 @@ pub async fn sync(
 
 // ---- PUT /code/files ----
 
+/// Тело `PUT /code/files`. Файлы — сырые срезы тела (`&RawValue`): каждый разбирается сразу в
+/// [`FileUpload`] с индексом в ошибке, без промежуточного `Value` — кратного перерасхода памяти
+/// на теле до `code.max_request_bytes` (финальное ревью ветки M5.6, M3).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PutReq {
+pub struct PutReq<'a> {
     solution: String,
     #[serde(default)]
     commit: Option<String>,
@@ -947,7 +1020,8 @@ pub struct PutReq {
     branch: Option<String>,
     #[serde(default)]
     machine: Option<String>,
-    files: Vec<Value>,
+    #[serde(borrow)]
+    files: Vec<&'a serde_json::value::RawValue>,
 }
 
 /// Проверка файла загрузки `i` (вход недоверенный, §13) и маскировка сигнатур; возвращает
@@ -1012,7 +1086,7 @@ fn check_upload(
 
 /// Файлы загрузки: не больше 500, каждый проверен ([`check_upload`]).
 fn parse_uploads(
-    files: Vec<Value>,
+    files: Vec<&serde_json::value::RawValue>,
     c: &crate::config::CodeSection,
 ) -> Result<(Vec<FileUpload>, usize), ApiError> {
     if files.len() > UPLOAD_FILES_MAX {
@@ -1024,7 +1098,7 @@ fn parse_uploads(
     let mut out = Vec::with_capacity(files.len());
     for (i, v) in files.into_iter().enumerate() {
         let mut f: FileUpload =
-            serde_json::from_value(v).map_err(|e| unprocessable(format!("files[{i}]: {e}")))?;
+            serde_json::from_str(v.get()).map_err(|e| unprocessable(format!("files[{i}]: {e}")))?;
         masked += check_upload(&mut f, i, c)?;
         out.push(f);
     }
@@ -1072,7 +1146,8 @@ pub async fn put_files(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     enabled(&st)?;
-    let req: PutReq = code_body(request_max(&st), body)?;
+    let body = code_bytes(request_max(&st), body)?;
+    let req: PutReq<'_> = parse_body(&body)?;
     let sc = code_scope(&st, &p, &headers, &req.solution, Mode::Write).await?;
     let meta = upload_meta(
         req.commit.as_deref(),
@@ -1351,16 +1426,52 @@ async fn load_inputs(
         if let Some(i) = rt.cached(&key, etag) {
             return Ok(i);
         }
-        match inputs_load(rt, db, &key, etag) {
-            (true, load) => return load.await,
+        match inputs_load(rt, db, &key, etag, false) {
+            Load::Started(load) | Load::Same(load) => return load.await,
             // чужой `etag`: дождаться и проверить кэш снова
-            (false, load) => {
+            Load::Foreign(load) => {
                 let r = load.await;
                 waits += 1;
                 if waits >= INPUTS_FOREIGN_WAITS
                     && let Ok(i) = r
                 {
                     return Ok(i);
+                }
+            }
+        }
+    }
+}
+
+/// Слот тяжёлой операции и входы фонового пересчёта рангов решения `key`; снимок перечитывается
+/// под слотом (уже не `pending` — `None`). Входы — из кэша, чтением под этим же слотом
+/// ([`inputs_load`] с `covered`) или, если чтение решения уже идёт (запрос с фокусом, рёбра
+/// карты), — дождавшись его **без** слота: чужому чтению нужен свой слот, и два пересчёта,
+/// ждущие таких чтений со слотами в руках, заняли бы оба слота навсегда.
+async fn rank_inputs(
+    rt: &Arc<CodeRuntime>,
+    db: &Db,
+    key: SolutionKey,
+) -> Result<Option<(HeavyPermit, Arc<RankInputs>)>, String> {
+    let mut waits = 0;
+    loop {
+        let slot = heavy_slot(rt).await?;
+        let etag = match code_snapshot(db, &key.1).await.map_err(|e| e.to_string())? {
+            Some(s) if s.rank_state == RankState::Pending => s.etag,
+            _ => return Ok(None),
+        };
+        if let Some(i) = rt.cached(&key, &etag) {
+            return Ok(Some((slot, i)));
+        }
+        match inputs_load(rt, db, &key, &etag, true) {
+            Load::Started(load) => return load.await.map(|i| Some((slot, i))),
+            Load::Same(load) | Load::Foreign(load) => {
+                drop(slot);
+                let r = load.await;
+                waits += 1;
+                if waits >= INPUTS_FOREIGN_WAITS
+                    && let Ok(i) = r
+                {
+                    return Ok(Some((heavy_slot(rt).await?, i)));
                 }
             }
         }
@@ -1393,18 +1504,34 @@ impl Drop for LoadingGuard {
     }
 }
 
-/// Идущая задача чтения входов решения `key`: `(true, …)` — под этим `etag` (новая или общая),
-/// `(false, …)` — под другим (её надо дождаться).
+/// Задача чтения входов решения из [`inputs_load`].
+enum Load {
+    /// Новая — запущена этим вызовом под его `etag`.
+    Started(InputsLoad),
+    /// Уже шла под тем же `etag` (общая).
+    Same(InputsLoad),
+    /// Уже шла под другим `etag` — её надо дождаться.
+    Foreign(InputsLoad),
+}
+
+/// Идущая задача чтения входов решения `key` ([`Load`]). Новая задача читает под своим слотом
+/// тяжёлой операции ([`heavy_slot`]); `covered` — слот уже держит вызывающий (фоновый пересчёт,
+/// [`rank_inputs`]), и задача его не ждёт.
 fn inputs_load(
     rt: &Arc<CodeRuntime>,
     db: &Db,
     key: &SolutionKey,
     etag: &str,
-) -> (bool, InputsLoad) {
+    covered: bool,
+) -> Load {
     use futures_util::FutureExt;
     let mut loading = rt.loading.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((e, f)) = loading.get(key) {
-        return (e == etag, f.clone());
+        return if e == etag {
+            Load::Same(f.clone())
+        } else {
+            Load::Foreign(f.clone())
+        };
     }
     let guard = LoadingGuard {
         rt: rt.clone(),
@@ -1422,6 +1549,10 @@ fn inputs_load(
     // задача снимает себя из `loading` охранником под тем же замком — после вставки ниже
     let task = tokio::spawn(async move {
         let g = guard;
+        let _slot = match covered {
+            true => None,
+            false => Some(heavy_slot(&g.rt).await?),
+        };
         #[cfg(feature = "test-hooks")]
         {
             use std::sync::atomic::Ordering;
@@ -1452,7 +1583,7 @@ fn inputs_load(
     .boxed()
     .shared();
     loading.insert(key.clone(), (etag.to_string(), load.clone()));
-    (true, load)
+    Load::Started(load)
 }
 
 /// Ранги файлов с фокусом: входы (кэш или общее чтение), слот ([`FOCUS_SLOTS`]) и PageRank —

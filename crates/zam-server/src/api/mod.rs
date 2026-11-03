@@ -357,7 +357,8 @@ pub(crate) fn parse_id(s: &str) -> Result<Id, ApiError> {
         .map_err(|_| ApiError::BadRequest("некорректный идентификатор".into()))
 }
 
-pub(crate) fn parse_body<T: DeserializeOwned>(b: &Bytes) -> Result<T, ApiError> {
+/// Тело JSON (тип может заимствовать из `b`, например `&RawValue`); ошибка — 400.
+pub(crate) fn parse_body<'a, T: serde::Deserialize<'a>>(b: &'a Bytes) -> Result<T, ApiError> {
     serde_json::from_slice(b).map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))
 }
 
