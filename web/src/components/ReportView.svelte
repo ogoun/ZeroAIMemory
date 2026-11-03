@@ -24,7 +24,7 @@
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
   import { fmtTime } from '../lib/journals';
-  import { clearPrint } from '../lib/printRoot';
+  import { clearPrint, readyPrint } from '../lib/printRoot';
   import { reportAuthor, fmtSize, refsOf, refsText, REF_TITLE, bodyStartsWithTitle } from '../lib/reports';
   import { anchorId, go, href, parse } from '../lib/router';
 
@@ -211,6 +211,12 @@
   async function pdf() {
     const r = report;
     if (!r || printing) return;
+    // готовая копия этого отчёта — печать сразу, в обработчике клика (активация не истекла)
+    if (readyPrint(r.entry.id)) {
+      notice = '';
+      window.print();
+      return;
+    }
     printing = true;
     notice = '';
     try {
@@ -221,6 +227,7 @@
       await printReport(
         r.html,
         {
+          id: e.id,
           title: e.title,
           titleInBody,
           date: fmtTime(e.created_at),

@@ -3,9 +3,9 @@
 // текстом), «оживляет» его как экран (KaTeX, Mermaid в светлой теме `default`) и вызывает
 // `window.print()` только после готовности всего: картинок (загрузка, `decode`), ленивых модулей
 // и шрифтов (`document.fonts.ready`). Не готово — печати нет, причина уходит вызывающему. Готовая
-// копия получает класс `ready` и остаётся до `clearPrint()` (смена отчёта, уход, повторная
-// печать): печать в Safari и Chrome Android асинхронна, предпросмотр пересчитывается, и Ctrl+P
-// после кнопки печатает тот же отчёт. Вёрстка печати — `print.css` (A4, только готовая копия,
+// копия получает класс `ready` и остаётся до `clearPrint()` (смена отчёта, уход): печать в Safari
+// и Chrome Android асинхронна, предпросмотр пересчитывается, Ctrl+P после кнопки печатает тот же
+// отчёт, а повторное нажатие печатает готовую копию сразу (`readyPrint`). Вёрстка печати — `print.css` (A4, только готовая копия,
 // светлые цвета). Модуль грузится по клику (динамический `import()` в ReportView).
 import '../print.css';
 import { hydrateRendered, type HydrateOpts } from './hydrate/render';
@@ -14,6 +14,8 @@ import { hydrateRendered, type HydrateOpts } from './hydrate/render';
 import { PRINT_READY_CLASS, PRINT_ROOT_CLASS, clearPrint } from './printRoot';
 
 export interface PrintMeta {
+  /** id отчёта — у копии `data-report` (повторная печать готовой копии, `readyPrint`). */
+  id: string;
   title: string;
   /** Тело начинается с `<h1>` заголовка — в шапке он не повторяется. */
   titleInBody: boolean;
@@ -101,17 +103,26 @@ async function notReady(root: HTMLElement): Promise<string | null> {
 const isSvg = (img: HTMLImageElement) => /\.svg$/i.test(new URL(img.src, location.href).pathname);
 
 /**
- * Отказ картинки — только событие `error` (без подписки — `complete` с нулевой шириной у растра).
- * SVG без своих размеров (только `viewBox`) в Firefox даёт `naturalWidth = 0`, а очень большой
- * растр отклоняет `decode()` и при этом рисуется — ни то ни другое печать не блокирует.
+ * Отказ картинки — только событие `error` (без подписки: загруженная — `complete`, растр с
+ * ненулевой шириной; незагруженная — ждём `load`/`error`). SVG без своих размеров (только
+ * `viewBox`) в Firefox даёт `naturalWidth = 0`, а очень большой растр отклоняет `decode()` и при
+ * этом рисуется — ни то ни другое печать не блокирует.
  */
 async function imageReady(img: HTMLImageElement): Promise<boolean> {
-  const settled = loaded.get(img);
-  const ok = settled ? await settled : !img.complete || img.naturalWidth > 0 || isSvg(img);
+  const ok = await (loaded.get(img) ?? settle(img));
   if (!ok) return false;
   // декодирование до печати; отказ `decode()` при успешной загрузке — не отказ картинки
   await img.decode().catch(() => undefined);
   return true;
+}
+
+/** Исход загрузки картинки без подписки (вставлена в копию позже разбора HTML). */
+function settle(img: HTMLImageElement): Promise<boolean> {
+  if (img.complete) return Promise.resolve(img.naturalWidth > 0 || isSvg(img));
+  return new Promise<boolean>((r) => {
+    img.addEventListener('load', () => r(true), { once: true });
+    img.addEventListener('error', () => r(false), { once: true });
+  });
 }
 
 /** Подписка на исход загрузки — сразу после разбора HTML, до первых событий. */
@@ -156,6 +167,7 @@ function build(html: string, m: PrintMeta): HTMLElement {
   const root = el('div', PRINT_ROOT_CLASS);
   // на экране контейнер невидим (print.css), печатается только готовая копия
   root.setAttribute('aria-hidden', 'true');
+  root.dataset.report = m.id;
   const head = el('header', 'print-head');
   if (!m.titleInBody) head.append(el('h1', 'print-title', m.title));
   head.append(el('p', 'print-meta', [m.date, m.author, m.project && `проект ${m.project}`].filter(Boolean).join(' · ')));

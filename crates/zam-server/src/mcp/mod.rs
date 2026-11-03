@@ -297,7 +297,8 @@ pub struct Rest {
     /// Разрешение большого тела внешнего `/mcp` ([`crate::api::big_body::OuterPermit`]): копия
     /// держит его до конца вызова инструмента, даже если клиент оборвал соединение.
     outer_permit: Option<crate::api::big_body::OuterPermit>,
-    /// Отмена вызова клиентом (`notifications/cancelled`): дальше внутренних запросов нет.
+    /// Отмена вызова (`RequestContext::ct`): клиент прислал `notifications/cancelled` или оборвал
+    /// соединение — дальше внутренних запросов нет.
     cancel: Option<tokio_util::sync::CancellationToken>,
 }
 

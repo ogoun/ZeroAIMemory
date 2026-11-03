@@ -9,3 +9,15 @@ export const PRINT_READY_CLASS = 'ready';
 export function clearPrint(): void {
   for (const el of document.querySelectorAll(`body > .${PRINT_ROOT_CLASS}`)) el.remove();
 }
+
+/**
+ * Готовая печатная копия отчёта `id` или `null`. Повторное «Скачать PDF» печатает её сразу, без
+ * пересборки и ожидания: `window.print()` вызывается в обработчике клика, пока действует
+ * пользовательская активация (Safari после долгого ожидания её теряет).
+ */
+export function readyPrint(id: string): HTMLElement | null {
+  for (const el of document.querySelectorAll<HTMLElement>(`body > .${PRINT_ROOT_CLASS}.${PRINT_READY_CLASS}`)) {
+    if (el.dataset.report === id) return el;
+  }
+  return null;
+}
