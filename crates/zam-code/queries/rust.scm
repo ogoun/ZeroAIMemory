@@ -1,10 +1,5 @@
 ; Дополнения ZeroAIMemory к tags.scm tree-sitter-rust (MIT, deploy/licenses/TREE-SITTER-QUERIES-MIT.txt).
-; Вид символа определяет экстрактор по виду узла @definition.*, ссылки — по @reference.*.
-
-(const_item name: (identifier) @name) @definition.constant
-(static_item name: (identifier) @name) @definition.constant
-(associated_type name: (type_identifier) @name) @definition.type
-(function_signature_item name: (identifier) @name) @definition.method
+; Только ссылки (@reference.*): определения распознаёт обход дерева (src/extract/lang.rs).
 
 ; вызов по пути: Store::open() — call `open` и тип `Store`
 (call_expression

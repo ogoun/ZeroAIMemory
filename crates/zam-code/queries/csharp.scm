@@ -1,17 +1,7 @@
 ; Запрос тегов ZeroAIMemory для C# (грамматика tree-sitter-c-sharp 0.23.5, MIT). Встроенный
 ; tags.scm крейта не используется: в нём нет структур, записей, конструкторов, делегатов и импортов.
-; Вид символа определяет экстрактор по виду узла @definition.*, ссылки — по @reference.*.
-
-(class_declaration name: (identifier) @name) @definition.class
-(struct_declaration name: (identifier) @name) @definition.struct
-(interface_declaration name: (identifier) @name) @definition.interface
-(enum_declaration name: (identifier) @name) @definition.enum
-(record_declaration name: (identifier) @name) @definition.class
-(delegate_declaration name: (identifier) @name) @definition.type
-(method_declaration name: (identifier) @name) @definition.method
-(constructor_declaration name: (identifier) @name) @definition.method
-(namespace_declaration name: (_) @name) @definition.module
-(file_scoped_namespace_declaration name: (_) @name) @definition.module
+; Только ссылки (@reference.*): определения (классы, структуры, записи, интерфейсы, перечисления,
+; делегаты, методы, конструкторы, пространства имён) распознаёт обход дерева (src/extract/lang.rs).
 
 ; вызовы и создание объектов
 (invocation_expression function: (identifier) @name) @reference.call

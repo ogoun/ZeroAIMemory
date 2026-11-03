@@ -1,9 +1,10 @@
 //! Экстрактор символов и ссылок на tree-sitter (фича `parse`; спецификация M5.6 §3, §12, §13).
 //!
-//! Порядок: размер → эвристики [`sniff`] → разбор с отсечкой по времени → запрос тегов с тем же
-//! дедлайном → символы (`qual` по контейнерам, `sig`, `body_hash`, `exported`, суффиксы `#N`) и
-//! агрегированные ссылки → пределы. Всё под `catch_unwind`: паника — `parser_crash`, наружу не
-//! выходит. Обход дерева — только `Node::parent()` и явный стек, без рекурсии.
+//! Порядок: размер → эвристики [`sniff`] → разбор с отсечкой по времени → один обход дерева
+//! курсором (определения по виду узла, контекст `qual`/`export` — стеком, без рекурсии и без
+//! `Node::parent()`) → запрос ссылок с тем же дедлайном → символы (`qual`, `sig`, `body_hash`,
+//! `exported`, суффиксы `#N`) и агрегированные ссылки → пределы. Всё под `catch_unwind`: паника —
+//! `parser_crash`, наружу не выходит.
 
 mod lang;
 mod sniff;
@@ -69,16 +70,21 @@ impl Extracted {
 }
 
 /// Символы и ссылки файла. Никогда не паникует наружу; BOM срезается до разбора, невалидный
-/// UTF-8 разбирается по байтам (имена — с заменой).
+/// UTF-8 разбирается по байтам (имена — с заменой). Отсечка `parse_timeout` считается после
+/// компиляции запроса ссылок (один раз на процесс и язык).
 pub fn extract(lang: Lang, src: &[u8], lim: &Limits) -> Extracted {
-    guarded(lang, src, lim, lang::Mode::Full)
+    if lang::refs_query(lang).is_err() {
+        return Extracted::skipped(SkipReason::ParserCrash);
+    }
+    guarded(lang, src, lim, true, Instant::now() + lim.parse_timeout)
 }
 
-/// Хэши тел символов одного файла для хуков (§8): запрос только определений (компилируется
-/// в разы быстрее полного, замер журнала M5.6); файл пропущен — `None`.
+/// Хэши тел символов одного файла для хуков (§8): только определения, без запроса (компиляции
+/// нет); дедлайн — абсолютный, от вызова. Файл пропущен или обрезан пределом (`partial`) —
+/// `None`: неполный список хук принял бы за удаление символов.
 pub fn symbol_hashes(lang: Lang, src: &[u8], lim: &Limits) -> Option<Vec<SymbolHash>> {
-    let out = guarded(lang, src, lim, lang::Mode::Defs);
-    if out.state == ParseState::Skipped {
+    let out = guarded(lang, src, lim, false, Instant::now() + lim.parse_timeout);
+    if out.state != ParseState::Ok {
         return None;
     }
     Some(
@@ -93,7 +99,7 @@ pub fn symbol_hashes(lang: Lang, src: &[u8], lim: &Limits) -> Option<Vec<SymbolH
 }
 
 /// Пределы, эвристики и `catch_unwind` вокруг разбора.
-fn guarded(lang: Lang, src: &[u8], lim: &Limits, mode: lang::Mode) -> Extracted {
+fn guarded(lang: Lang, src: &[u8], lim: &Limits, refs: bool, deadline: Instant) -> Extracted {
     if src.len() as u64 > lim.max_file_bytes {
         return Extracted::skipped(SkipReason::TooLarge);
     }
@@ -103,15 +109,16 @@ fn guarded(lang: Lang, src: &[u8], lim: &Limits, mode: lang::Mode) -> Extracted 
     if let Some(reason) = sniff(src) {
         return Extracted::skipped(reason);
     }
-    catch_unwind(AssertUnwindSafe(|| run(lang, src, lim, mode)))
+    catch_unwind(AssertUnwindSafe(|| run(lang, src, lim, refs, deadline)))
         .unwrap_or_else(|_| Extracted::skipped(SkipReason::ParserCrash))
 }
 
-/// Определение из запроса: узел определения, узел имени, суффикс захвата.
+/// Определение из обхода: узел определения, узел имени, вид и контекст обхода.
 struct RawDef<'t> {
     node: Node<'t>,
     name: Node<'t>,
-    cap: &'static str,
+    kind: SymbolKind,
+    ctx: Ctx,
 }
 
 /// Ссылка из запроса: узел имени и вид.
@@ -120,13 +127,72 @@ struct RawRef<'t> {
     kind: RefKind,
 }
 
-fn run(lang: Lang, src: &[u8], lim: &Limits, mode: lang::Mode) -> Extracted {
-    let Ok(spec) = lang::spec(lang, mode) else {
-        return Extracted::skipped(SkipReason::ParserCrash);
-    };
-    let deadline = Instant::now() + lim.parse_timeout;
+/// Ближайший предок-контейнер или функция: решает, метод ли функция Rust/Python.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Near {
+    None,
+    Class,
+    Module,
+    Func,
+}
+
+/// Контекст узла в обходе: цепочка контейнеров (индекс в [`Chain`]), ближайший контейнер или
+/// функция, `export` TS/JS, «внутри функции или тела класса».
+#[derive(Clone, Copy)]
+struct Ctx {
+    chain: Option<usize>,
+    near: Near,
+    export: bool,
+    in_body: bool,
+}
+
+/// Звено цепочки контейнеров: готовый `qual` контейнера (`None` — длиннее [`QUAL_MAX_CHARS`]).
+struct Link {
+    qual: Option<String>,
+}
+
+/// Цепочки контейнеров: звено хранит полный `qual`, поэтому символ не поднимается к корню, а
+/// длинная цепочка обрезается на пределе (глубина вложенности не умножает работу).
+#[derive(Default)]
+struct Chain {
+    links: Vec<Link>,
+}
+
+impl Chain {
+    fn qual(&self, at: Option<usize>) -> Option<&str> {
+        match at {
+            None => Some(""),
+            Some(i) => self.links[i].qual.as_deref(),
+        }
+    }
+
+    fn push(&mut self, parent: Option<usize>, segs: &[String]) -> usize {
+        let qual = self.qual(parent).and_then(|p| {
+            let q = join_qual(p, segs);
+            (q.chars().count() <= QUAL_MAX_CHARS).then_some(q)
+        });
+        self.links.push(Link { qual });
+        self.links.len() - 1
+    }
+}
+
+fn join_qual(prefix: &str, segs: &[String]) -> String {
+    let mut q = String::from(prefix);
+    for s in segs {
+        if !q.is_empty() {
+            q.push_str("::");
+        }
+        q.push_str(s);
+    }
+    q
+}
+
+/// Узлов между проверками дедлайна в обходе.
+const DEADLINE_EVERY: usize = 1024;
+
+fn run(lang: Lang, src: &[u8], lim: &Limits, with_refs: bool, deadline: Instant) -> Extracted {
     let mut parser = Parser::new();
-    if parser.set_language(&spec.language).is_err() {
+    if parser.set_language(&lang::language(lang)).is_err() {
         return Extracted::skipped(SkipReason::ParserCrash);
     }
     let mut on_parse = |_: &tree_sitter::ParseState| {
@@ -146,53 +212,22 @@ fn run(lang: Lang, src: &[u8], lim: &Limits, mode: lang::Mode) -> Extracted {
         return Extracted::skipped(SkipReason::Timeout);
     };
 
-    let names = spec.query.capture_names();
-    let timed_out = Cell::new(false);
-    let mut on_query = |_: &tree_sitter::QueryCursorState| {
-        if Instant::now() >= deadline {
-            timed_out.set(true);
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    };
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches_with_options(
-        &spec.query,
-        tree.root_node(),
-        src,
-        QueryCursorOptions::new().progress_callback(&mut on_query),
-    );
-    let mut defs: Vec<RawDef> = Vec::new();
-    let mut refs: Vec<RawRef> = Vec::new();
-    while let Some(m) = matches.next() {
-        let (mut name, mut def, mut rf) = (None, None, None);
-        for c in m.captures() {
-            let cap: &'static str = names[c.index as usize];
-            if cap == "name" {
-                name = Some(c.node);
-            } else if let Some(k) = cap.strip_prefix("definition.") {
-                def = Some((c.node, k));
-            } else if let Some(k) = cap.strip_prefix("reference.") {
-                rf = Some((c.node, k));
-            }
-        }
-        let Some(name) = name else { continue };
-        if let Some((node, cap)) = def {
-            defs.push(RawDef { node, name, cap });
-        } else if let Some((node, cap)) = rf {
-            refs.push(RawRef {
-                name,
-                kind: lang::ref_kind(node, cap),
-            });
-        }
-    }
-    drop(matches);
-    if timed_out.get() || Instant::now() >= deadline {
+    let mut chain = Chain::default();
+    let Some(defs) = walk_defs(lang, &tree, src, &mut chain, deadline) else {
         return Extracted::skipped(SkipReason::Timeout);
-    }
-
-    let Some(mut symbols) = build_symbols(lang, src, defs.as_slice(), deadline) else {
+    };
+    let refs = if with_refs {
+        let Ok(query) = lang::refs_query(lang) else {
+            return Extracted::skipped(SkipReason::ParserCrash);
+        };
+        match query_refs(query, &tree, src, deadline) {
+            Some(r) => r,
+            None => return Extracted::skipped(SkipReason::Timeout),
+        }
+    } else {
+        Vec::new()
+    };
+    let Some(mut symbols) = build_symbols(lang, src, &defs, &chain, deadline) else {
         return Extracted::skipped(SkipReason::Timeout);
     };
     let def_names: HashSet<usize> = defs.iter().map(|d| d.name.id()).collect();
@@ -216,26 +251,160 @@ fn run(lang: Lang, src: &[u8], lim: &Limits, mode: lang::Mode) -> Extracted {
     }
 }
 
+/// Один обход дерева в глубину курсором (без рекурсии и без `Node::parent()`, который в
+/// tree-sitter 0.27 спускается от корня): определения с контекстом. Стек контекстов идёт
+/// параллельно пути курсора. Дедлайн — раз в [`DEADLINE_EVERY`] узлов; вышел — `None`.
+fn walk_defs<'t>(
+    lang: Lang,
+    tree: &'t tree_sitter::Tree,
+    src: &[u8],
+    chain: &mut Chain,
+    deadline: Instant,
+) -> Option<Vec<RawDef<'t>>> {
+    let root_ctx = Ctx {
+        chain: None,
+        near: Near::None,
+        export: false,
+        in_body: false,
+    };
+    let mut cursor = tree.walk();
+    // контекст и вид каждого предка на пути курсора (контекст — для его детей)
+    let mut stack: Vec<(Ctx, &'t str)> = Vec::new();
+    let mut defs = Vec::new();
+    let mut visited = 0usize;
+    loop {
+        let node = cursor.node();
+        visited += 1;
+        if visited.is_multiple_of(DEADLINE_EVERY) && Instant::now() >= deadline {
+            return None;
+        }
+        let ctx = stack.last().map_or(root_ctx, |s| s.0);
+        let place = lang::Place {
+            parent: stack.last().map(|s| s.1),
+            grand: stack.len().checked_sub(2).map(|i| stack[i].1),
+            in_body: ctx.in_body,
+        };
+        let kind = node.kind();
+        // `export` TS/JS: сам узел под `export_statement` экспортирован
+        let node_ctx = Ctx {
+            export: ctx.export || place.parent == Some("export_statement"),
+            ..ctx
+        };
+        for (name, k) in lang::defs_of(lang, node, place, src) {
+            defs.push(RawDef {
+                node,
+                name,
+                kind: k,
+                ctx: node_ctx,
+            });
+        }
+        if cursor.goto_first_child() {
+            stack.push((child_ctx(lang, node, kind, node_ctx, src, chain), kind));
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Some(defs);
+            }
+            stack.pop();
+        }
+    }
+}
+
+/// Контекст детей узла: контейнер добавляет звено цепочки, функция и тело класса — «внутри»,
+/// граница экспорта TS/JS снимает `export`.
+fn child_ctx(lang: Lang, node: Node, kind: &str, ctx: Ctx, src: &[u8], chain: &mut Chain) -> Ctx {
+    let mut out = ctx;
+    if let Some((segs, class_like)) = lang::container(lang, node, src) {
+        out.chain = Some(chain.push(ctx.chain, &segs));
+        out.near = if class_like {
+            Near::Class
+        } else {
+            Near::Module
+        };
+        out.in_body |= class_like;
+    } else if lang::is_function_like(kind) {
+        out.near = Near::Func;
+        out.in_body = true;
+    }
+    if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript)
+        && lang::is_export_boundary(kind)
+    {
+        out.export = false;
+    }
+    out
+}
+
+/// Ссылки запросом с дедлайном; вышел — `None`.
+fn query_refs<'t>(
+    query: &'static tree_sitter::Query,
+    tree: &'t tree_sitter::Tree,
+    src: &[u8],
+    deadline: Instant,
+) -> Option<Vec<RawRef<'t>>> {
+    let names = query.capture_names();
+    let timed_out = Cell::new(false);
+    let mut on_query = |_: &tree_sitter::QueryCursorState| {
+        if Instant::now() >= deadline {
+            timed_out.set(true);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches_with_options(
+        query,
+        tree.root_node(),
+        src,
+        QueryCursorOptions::new().progress_callback(&mut on_query),
+    );
+    let mut refs = Vec::new();
+    while let Some(m) = matches.next() {
+        let (mut name, mut rf) = (None, None);
+        for c in m.captures() {
+            let cap: &'static str = names[c.index as usize];
+            if cap == "name" {
+                name = Some(c.node);
+            } else if let Some(k) = cap.strip_prefix("reference.") {
+                rf = Some((c.node, k));
+            }
+        }
+        if let (Some(name), Some((node, cap))) = (name, rf) {
+            refs.push(RawRef {
+                name,
+                kind: lang::ref_kind(node, cap),
+            });
+        }
+    }
+    drop(matches);
+    if timed_out.get() || Instant::now() >= deadline {
+        return None;
+    }
+    Some(refs)
+}
+
 /// Символы в порядке файла с суффиксами одноимённых; дедлайн вышел — `None`.
 fn build_symbols(
     lang: Lang,
     src: &[u8],
     defs: &[RawDef],
+    chain: &Chain,
     deadline: Instant,
 ) -> Option<Vec<Symbol>> {
-    let mut seen = HashSet::new();
     let mut items: Vec<(usize, usize, Symbol)> = Vec::new();
     for d in defs {
-        if !seen.insert(d.node.id()) {
-            continue;
-        }
         if Instant::now() >= deadline {
             return None;
         }
-        if let Some(sym) = make_symbol(lang, src, d) {
+        if let Some(sym) = make_symbol(lang, src, d, chain) {
             items.push((d.node.start_byte(), usize::MAX - d.node.end_byte(), sym));
         }
     }
+    // устойчивая сортировка: определения одного узла (`const a, b` Go) — в порядке обхода
     items.sort_by_key(|(start, rev_end, _)| (*start, *rev_end));
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut out = Vec::with_capacity(items.len());
@@ -252,39 +421,29 @@ fn build_symbols(
     Some(out)
 }
 
-fn make_symbol(lang: Lang, src: &[u8], d: &RawDef) -> Option<Symbol> {
-    let mut kind = lang::def_kind(lang, d.node, d.cap)?;
+fn make_symbol(lang: Lang, src: &[u8], d: &RawDef, chain: &Chain) -> Option<Symbol> {
+    let mut kind = d.kind;
     let parts = lang::name_parts(d.name, src);
     let name = parts.last()?.clone();
-    if !valid_name(&name) {
+    if !valid_name(&name) || parts.iter().any(|p| !valid_name(p)) {
         return None;
     }
-    // цепочка контейнеров снизу вверх; первый встреченный контейнер или функция решает,
-    // метод ли функция (Rust `impl`/`trait`, класс Python)
-    let mut chain: Vec<Vec<String>> = Vec::new();
-    let mut nearest_class: Option<bool> = None;
-    if lang == Lang::Go && d.node.kind() == "method_declaration" {
-        chain.push(vec![lang::go_receiver(d.node, src)?]);
-    }
-    let mut cur = d.node.parent();
-    while let Some(n) = cur {
-        if let Some((segs, class_like)) = lang::container(lang, n, src) {
-            nearest_class.get_or_insert(class_like);
-            chain.push(segs);
-        } else if lang::is_function_like(n.kind()) {
-            nearest_class.get_or_insert(false);
-        }
-        cur = n.parent();
-    }
+    // функция в `impl`/`trait` Rust или в классе Python — метод (ближайший — класс, не функция)
     if kind == SymbolKind::Function
         && matches!(d.node.kind(), "function_item" | "function_definition")
-        && nearest_class == Some(true)
+        && d.ctx.near == Near::Class
     {
         kind = SymbolKind::Method;
     }
-    let mut qual_parts: Vec<String> = chain.into_iter().rev().flatten().collect();
-    qual_parts.extend(parts);
-    let qual = qual_parts.join("::");
+    let mut prefix = chain.qual(d.ctx.chain)?.to_string();
+    if lang == Lang::Go && d.node.kind() == "method_declaration" {
+        let recv = lang::go_receiver(d.node, src)?;
+        prefix = join_qual(&prefix, &[recv]);
+    }
+    let qual = join_qual(&prefix, &parts);
+    if qual.chars().count() > QUAL_MAX_CHARS {
+        return None;
+    }
 
     let start = d.node.start_byte();
     let end = d.node.end_byte().min(src.len());
@@ -308,7 +467,7 @@ fn make_symbol(lang: Lang, src: &[u8], d: &RawDef) -> Option<Symbol> {
         end_line -= 1;
     }
     Some(Symbol {
-        exported: lang::exported(lang, d.node, &name, src),
+        exported: lang::exported(lang, d.node, &name, src, d.ctx.export),
         name,
         qual,
         kind,
@@ -319,11 +478,12 @@ fn make_symbol(lang: Lang, src: &[u8], d: &RawDef) -> Option<Symbol> {
     })
 }
 
-/// Имя символа или ссылки: непустое, ≤ [`NAME_MAX_CHARS`], без управляющих символов.
+/// Имя символа или ссылки: непустое, ≤ [`NAME_MAX_CHARS`], без управляющих символов, `/` и `#`
+/// (`#` и `/` ломали бы ссылку `путь#qual`).
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= NAME_MAX_CHARS
-        && !name.chars().any(char::is_control)
+        && !name.chars().any(|c| c.is_control() || c == '/' || c == '#')
 }
 
 /// Приоритет вида при нескольких захватах одного узла имени.

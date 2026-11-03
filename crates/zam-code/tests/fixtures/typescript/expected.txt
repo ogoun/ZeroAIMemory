@@ -30,7 +30,6 @@ module Geometry 88
 interface Geometry::Point 89
 method Geometry::Point::distance 91
 function Geometry::origin 94
-function Geometry::distance 95
 class Geometry::Circle 98
 method Geometry::Circle::area 99
 module external 105

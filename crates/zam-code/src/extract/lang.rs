@@ -1,7 +1,11 @@
-//! Правила языков: грамматика, запрос тегов, вид символа по узлу, контейнеры `qual`, публичность.
+//! Правила языков: грамматика, запрос ссылок, определения по виду узла, контейнеры `qual`,
+//! публичность.
 //!
-//! Запрос языка — встроенный `TAGS_QUERY` грамматики (TypeScript/TSX — ещё и JavaScript: грамматика
-//! TS наследует JS) плюс дополнения `queries/<язык>.scm`; у C# — только свой запрос.
+//! **Определения** распознаются обходом дерева по таблице видов узлов ([`defs_of`]) — без
+//! `Query`: компиляция запроса стоила хуку 14–24 мс (C#, TypeScript), а правила `tags.scm`
+//! повторены здесь явно (шаблоны `@definition.*` встроенных запросов — источник правил).
+//! **Ссылки** — шаблоны `@reference.*` встроенного `TAGS_QUERY` грамматики (TypeScript/TSX — ещё
+//! и JavaScript: грамматика TS наследует JS) плюс `queries/<язык>.scm`; у C# — только свой запрос.
 
 use std::sync::OnceLock;
 
@@ -9,47 +13,8 @@ use tree_sitter::{Language, Node, Query};
 
 use crate::proto::{Lang, RefKind, SymbolKind};
 
-/// Скомпилированная грамматика и запрос языка. Компиляция запроса — единицы–десятки миллисекунд
-/// (release: Rust 15, TypeScript 31, C# 50 мс; только определения — 3, 23, 11 мс; замер журнала
-/// M5.6), поэтому один раз на процесс.
-pub(super) struct Spec {
-    pub language: Language,
-    pub query: Query,
-}
-
-/// Полный запрос (`extract`) или только определения (`symbol_hashes` для хуков: быстрее
-/// компилируется, ссылки не нужны).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Mode {
-    Full,
-    Defs,
-}
-
-type Slot = OnceLock<Result<Spec, String>>;
-static FULL: [Slot; 8] = [const { OnceLock::new() }; 8];
-static DEFS: [Slot; 8] = [const { OnceLock::new() }; 8];
-
-/// Грамматика и запрос языка; ошибка компиляции запроса — строка (тест ловит её заранее).
-pub(super) fn spec(lang: Lang, mode: Mode) -> Result<&'static Spec, &'static str> {
-    let slot = match mode {
-        Mode::Full => &FULL[lang as usize],
-        Mode::Defs => &DEFS[lang as usize],
-    };
-    slot.get_or_init(|| {
-        let language = language(lang);
-        let source = match mode {
-            Mode::Full => query_source(lang),
-            Mode::Defs => definitions_only(&query_source(lang)),
-        };
-        Query::new(&language, &source)
-            .map(|query| Spec { language, query })
-            .map_err(|e| format!("{lang}: {e}"))
-    })
-    .as_ref()
-    .map_err(String::as_str)
-}
-
-fn language(lang: Lang) -> Language {
+/// Грамматика языка (дёшево: таблица из статической памяти грамматики).
+pub(super) fn language(lang: Lang) -> Language {
     match lang {
         Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
         Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
@@ -62,64 +27,59 @@ fn language(lang: Lang) -> Language {
     }
 }
 
-fn query_source(lang: Lang) -> String {
-    let parts: &[&str] = match lang {
-        Lang::Rust => &[
-            tree_sitter_rust::TAGS_QUERY,
-            include_str!("../../queries/rust.scm"),
-        ],
-        Lang::TypeScript | Lang::Tsx => &[
-            tree_sitter_javascript::TAGS_QUERY,
-            tree_sitter_typescript::TAGS_QUERY,
-            include_str!("../../queries/typescript.scm"),
-        ],
-        Lang::JavaScript => &[
-            tree_sitter_javascript::TAGS_QUERY,
-            include_str!("../../queries/javascript.scm"),
-        ],
-        Lang::Python => &[
-            tree_sitter_python::TAGS_QUERY,
-            include_str!("../../queries/python.scm"),
-        ],
-        Lang::Go => &[
-            tree_sitter_go::TAGS_QUERY,
-            include_str!("../../queries/go.scm"),
-        ],
-        Lang::Java => &[
-            tree_sitter_java::TAGS_QUERY,
-            include_str!("../../queries/java.scm"),
-        ],
-        Lang::CSharp => &[include_str!("../../queries/csharp.scm")],
-    };
-    parts
-        .iter()
-        .map(|p| strip_doc_captures(p))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+static REFS: [OnceLock<Result<Query, String>>; 8] = [const { OnceLock::new() }; 8];
 
-/// Убирает из встроенных запросов захват документирующих комментариев (`(comment)* @doc .` и
-/// предикаты `#strip!`/`#select-adjacent!`/`#set-adjacent!` над `@doc`): экстрактор их не берёт,
-/// а квантификатор перед якорем дорог при компиляции (TypeScript: 44 → 31 мс). Те же определения
-/// без комментария совпадают как и раньше — проверяют эталоны.
-fn strip_doc_captures(query: &str) -> String {
-    query
-        .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !(t == "(comment)* @doc"
-                || t == "."
-                || t.starts_with("(#strip! @doc")
-                || t.starts_with("(#select-adjacent! @doc")
-                || t.starts_with("(#set-adjacent! @doc"))
+/// Запрос ссылок языка, один раз на процесс; ошибка компиляции — строка (тесты ловят заранее).
+pub(super) fn refs_query(lang: Lang) -> Result<&'static Query, &'static str> {
+    REFS[lang as usize]
+        .get_or_init(|| {
+            Query::new(&language(lang), &refs_source(lang)).map_err(|e| format!("{lang}: {e}"))
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .as_ref()
+        .map_err(String::as_str)
 }
 
-/// Только шаблоны с `@definition.*`: верхнеуровневые S-выражения запроса (скобки с учётом строк
-/// и комментариев `;`), шаблон заканчивается переводом строки на нулевой глубине.
-fn definitions_only(query: &str) -> String {
+fn refs_source(lang: Lang) -> String {
+    let (builtin, own): (&[&str], &str) = match lang {
+        Lang::Rust => (
+            &[tree_sitter_rust::TAGS_QUERY],
+            include_str!("../../queries/rust.scm"),
+        ),
+        Lang::TypeScript | Lang::Tsx => (
+            &[
+                tree_sitter_javascript::TAGS_QUERY,
+                tree_sitter_typescript::TAGS_QUERY,
+            ],
+            include_str!("../../queries/typescript.scm"),
+        ),
+        Lang::JavaScript => (
+            &[tree_sitter_javascript::TAGS_QUERY],
+            include_str!("../../queries/javascript.scm"),
+        ),
+        Lang::Python => (
+            &[tree_sitter_python::TAGS_QUERY],
+            include_str!("../../queries/python.scm"),
+        ),
+        Lang::Go => (
+            &[tree_sitter_go::TAGS_QUERY],
+            include_str!("../../queries/go.scm"),
+        ),
+        Lang::Java => (
+            &[tree_sitter_java::TAGS_QUERY],
+            include_str!("../../queries/java.scm"),
+        ),
+        Lang::CSharp => (&[], include_str!("../../queries/csharp.scm")),
+    };
+    let mut out: String = builtin.iter().map(|q| references_only(q)).collect();
+    out.push_str(own);
+    out
+}
+
+/// Только шаблоны с `@reference.*`: верхнеуровневые S-выражения запроса (скобки с учётом строк
+/// и комментариев `;`), шаблон заканчивается переводом строки на нулевой глубине. Шаблоны
+/// определений (с захватом документирующих комментариев `(comment)* @doc`, дорогим при
+/// компиляции) и шаблоны без захвата вида отбрасываются.
+pub(super) fn references_only(query: &str) -> String {
     let mut out = String::new();
     let mut cur = String::new();
     let (mut depth, mut in_str, mut esc, mut in_comment) = (0i32, false, false, false);
@@ -152,7 +112,7 @@ fn definitions_only(query: &str) -> String {
         }
         cur.push(c);
         if depth == 0 && c == '\n' {
-            if cur.contains("@definition.") {
+            if cur.contains("@reference.") && !cur.contains("@definition.") {
                 out.push_str(&cur);
             }
             cur.clear();
@@ -161,87 +121,204 @@ fn definitions_only(query: &str) -> String {
     out
 }
 
-/// Вид символа по виду узла `@definition.*` (`cap` — суффикс захвата, запасной путь); `None` —
-/// узел не символ.
-pub(super) fn def_kind(lang: Lang, node: Node, cap: &str) -> Option<SymbolKind> {
+/// Где стоит узел: предки, нужные правилам определений (без `Node::parent()`).
+#[derive(Clone, Copy)]
+pub(super) struct Place<'a> {
+    pub parent: Option<&'a str>,
+    pub grand: Option<&'a str>,
+    /// Внутри функции или тела класса: литералы объектов здесь символов не дают.
+    pub in_body: bool,
+}
+
+/// Определения узла: `(узел имени, вид)`; обычно одно, у `const a, b` Go — по имени.
+pub(super) fn defs_of<'t>(
+    lang: Lang,
+    node: Node<'t>,
+    at: Place,
+    src: &[u8],
+) -> Vec<(Node<'t>, SymbolKind)> {
     use SymbolKind as K;
-    let kind = match (lang, node.kind()) {
-        (Lang::Rust, "struct_item" | "union_item") => K::Struct,
-        (Lang::Rust, "enum_item") => K::Enum,
-        (Lang::Rust, "type_item" | "associated_type") => K::Type,
-        (Lang::Rust, "trait_item") => K::Trait,
-        (Lang::Rust, "mod_item") => K::Module,
-        (Lang::Rust, "macro_definition") => K::Macro,
-        (Lang::Rust, "function_item") => K::Function,
-        (Lang::Rust, "function_signature_item") => K::Method,
-        (Lang::Rust, "const_item" | "static_item") => K::Const,
-        (Lang::Go, "type_spec") => match node.child_by_field_name("type").map(|t| t.kind()) {
-            Some("struct_type") => K::Struct,
-            Some("interface_type") => K::Interface,
-            _ => K::Type,
+    let name = || node.child_by_field_name("name");
+    let one = |kind: SymbolKind| name().map(|n| vec![(n, kind)]).unwrap_or_default();
+    match lang {
+        Lang::Rust => match node.kind() {
+            "struct_item" | "union_item" => one(K::Struct),
+            "enum_item" => one(K::Enum),
+            "type_item" | "associated_type" => one(K::Type),
+            "trait_item" => one(K::Trait),
+            "mod_item" => one(K::Module),
+            "macro_definition" => one(K::Macro),
+            "function_item" => one(K::Function),
+            "function_signature_item" => one(K::Method),
+            "const_item" | "static_item" => one(K::Const),
+            _ => vec![],
         },
-        (Lang::CSharp, "record_declaration") => {
-            let mut c = node.walk();
-            let is_struct = node.children(&mut c).any(|ch| ch.kind() == "struct");
-            if is_struct { K::Struct } else { K::Class }
-        }
-        (Lang::CSharp, "delegate_declaration") => K::Type,
-        (_, "class_declaration" | "class" | "abstract_class_declaration" | "class_definition") => {
-            K::Class
-        }
-        (_, "record_declaration") => K::Class,
-        (_, "struct_declaration") => K::Struct,
-        (_, "interface_declaration" | "annotation_type_declaration") => K::Interface,
-        (_, "enum_declaration") => K::Enum,
-        (_, "type_alias_declaration" | "type_alias") => K::Type,
-        (
-            _,
-            "internal_module"
-            | "module"
-            | "namespace_declaration"
-            | "file_scoped_namespace_declaration",
-        ) => K::Module,
-        (
-            _,
-            "method_definition"
-            | "method_signature"
-            | "abstract_method_signature"
-            | "method_declaration"
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => js_defs(lang, node, at, src),
+        Lang::Python => match node.kind() {
+            "class_definition" => one(K::Class),
+            "function_definition" => one(K::Function),
+            // константа модуля: `X = 1` верхнего уровня
+            "assignment"
+                if at.parent == Some("expression_statement") && at.grand == Some("module") =>
+            {
+                field_of_kind(node, "left", &["identifier"])
+                    .map(|n| vec![(n, K::Const)])
+                    .unwrap_or_default()
+            }
+            _ => vec![],
+        },
+        Lang::Go => match node.kind() {
+            "function_declaration" => one(K::Function),
+            "method_declaration" | "method_elem" => one(K::Method),
+            "type_alias" => one(K::Type),
+            "type_spec" => match node.child_by_field_name("type").map(|t| t.kind()) {
+                Some("struct_type") => one(K::Struct),
+                Some("interface_type") => one(K::Interface),
+                _ => one(K::Type),
+            },
+            "const_spec"
+                if at.parent == Some("const_declaration") && at.grand == Some("source_file") =>
+            {
+                let mut c = node.walk();
+                node.children_by_field_name("name", &mut c)
+                    .map(|n| (n, K::Const))
+                    .collect()
+            }
+            _ => vec![],
+        },
+        Lang::Java => match node.kind() {
+            "class_declaration" | "record_declaration" => one(K::Class),
+            "interface_declaration" | "annotation_type_declaration" => one(K::Interface),
+            "enum_declaration" => one(K::Enum),
+            "method_declaration"
             | "constructor_declaration"
             | "compact_constructor_declaration"
-            | "annotation_type_element_declaration"
-            | "method_elem"
-            | "field_definition"
-            | "public_field_definition",
-        ) => K::Method,
-        (
-            _,
-            "function_declaration"
-            | "function_expression"
-            | "generator_function"
-            | "generator_function_declaration"
-            | "function_signature"
-            | "variable_declarator"
-            | "assignment_expression"
-            | "pair"
-            | "function_definition",
-        ) => K::Function,
-        (Lang::Python, "assignment") | (_, "const_spec" | "export_statement") => K::Const,
-        _ => match cap {
-            "function" => K::Function,
-            "method" => K::Method,
-            "class" => K::Class,
-            "interface" => K::Interface,
-            "module" => K::Module,
-            "macro" => K::Macro,
-            "constant" => K::Const,
-            "type" => K::Type,
-            "struct" => K::Struct,
-            "enum" => K::Enum,
-            _ => return None,
+            | "annotation_type_element_declaration" => one(K::Method),
+            _ => vec![],
         },
+        Lang::CSharp => match node.kind() {
+            "class_declaration" => one(K::Class),
+            "record_declaration" => {
+                let mut c = node.walk();
+                let is_struct = node.children(&mut c).any(|ch| ch.kind() == "struct");
+                one(if is_struct { K::Struct } else { K::Class })
+            }
+            "struct_declaration" => one(K::Struct),
+            "interface_declaration" => one(K::Interface),
+            "enum_declaration" => one(K::Enum),
+            "delegate_declaration" => one(K::Type),
+            "method_declaration" | "constructor_declaration" => one(K::Method),
+            "namespace_declaration" | "file_scoped_namespace_declaration" => one(K::Module),
+            _ => vec![],
+        },
+    }
+}
+
+/// Правила `tags.scm` JavaScript и TypeScript (TS — надмножество JS).
+fn js_defs<'t>(lang: Lang, node: Node<'t>, at: Place, src: &[u8]) -> Vec<(Node<'t>, SymbolKind)> {
+    use SymbolKind as K;
+    let ts = lang != Lang::JavaScript;
+    let is_fn = |n: Option<Node>| {
+        n.is_some_and(|n| matches!(n.kind(), "arrow_function" | "function_expression"))
     };
-    Some(kind)
+    let pick =
+        |n: Option<Node<'t>>, kind: SymbolKind| n.map(|n| vec![(n, kind)]).unwrap_or_default();
+    let field = |f: &str, kinds: &[&str]| field_of_kind(node, f, kinds);
+    match node.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function" => pick(field("name", &["identifier"]), K::Function),
+        "class_declaration" | "class" => pick(node.child_by_field_name("name"), K::Class),
+        "method_definition" => {
+            let n = field("name", &["property_identifier"]);
+            let ctor = n.is_some_and(|n| {
+                n.kind() == "property_identifier" && is_named(n, src, "constructor")
+            });
+            // метод литерала объекта — только у литералов верхнего уровня
+            if ctor || (at.parent == Some("object") && at.in_body) {
+                vec![]
+            } else {
+                pick(n, K::Method)
+            }
+        }
+        "variable_declarator"
+            if matches!(
+                at.parent,
+                Some("lexical_declaration" | "variable_declaration")
+            ) && is_fn(node.child_by_field_name("value")) =>
+        {
+            pick(field("name", &["identifier"]), K::Function)
+        }
+        "assignment_expression" if is_fn(node.child_by_field_name("right")) => {
+            let left = node.child_by_field_name("left");
+            let name = match left.map(|l| l.kind()) {
+                Some("identifier") => left,
+                Some("member_expression") => {
+                    left.and_then(|l| field_of_kind(l, "property", &["property_identifier"]))
+                }
+                _ => None,
+            };
+            pick(name, K::Function)
+        }
+        "pair" if !at.in_body && is_fn(node.child_by_field_name("value")) => {
+            pick(field("key", &["property_identifier"]), K::Function)
+        }
+        "field_definition" if is_fn(node.child_by_field_name("value")) => {
+            pick(field("property", &["property_identifier"]), K::Method)
+        }
+        "export_statement" => {
+            // `export x = <значение>` (шаблон `@definition.constant` встроенного запроса JS)
+            let Some(v) = node.child_by_field_name("value") else {
+                return vec![];
+            };
+            if v.kind() != "assignment_expression" {
+                return vec![];
+            }
+            let right = v.child_by_field_name("right").map(|r| r.kind());
+            let simple = matches!(
+                right,
+                Some(
+                    "number"
+                        | "string"
+                        | "identifier"
+                        | "undefined"
+                        | "null"
+                        | "new_expression"
+                        | "binary_expression"
+                        | "call_expression"
+                )
+            );
+            if simple {
+                pick(field_of_kind(v, "left", &["identifier"]), K::Const)
+            } else {
+                vec![]
+            }
+        }
+        "public_field_definition" if ts && is_fn(node.child_by_field_name("value")) => {
+            pick(field("name", &["property_identifier"]), K::Method)
+        }
+        "abstract_class_declaration" if ts => pick(node.child_by_field_name("name"), K::Class),
+        "function_signature" if ts => pick(field("name", &["identifier"]), K::Function),
+        "method_signature" | "abstract_method_signature" if ts => {
+            pick(field("name", &["property_identifier"]), K::Method)
+        }
+        "interface_declaration" if ts => pick(node.child_by_field_name("name"), K::Interface),
+        "type_alias_declaration" if ts => pick(node.child_by_field_name("name"), K::Type),
+        "enum_declaration" if ts => pick(node.child_by_field_name("name"), K::Enum),
+        "internal_module" if ts => pick(node.child_by_field_name("name"), K::Module),
+        "module" if ts => pick(field("name", &["identifier", "string"]), K::Module),
+        _ => vec![],
+    }
+}
+
+fn field_of_kind<'t>(node: Node<'t>, field: &str, kinds: &[&str]) -> Option<Node<'t>> {
+    node.child_by_field_name(field)
+        .filter(|n| kinds.contains(&n.kind()))
+}
+
+fn is_named(n: Node, src: &[u8], s: &str) -> bool {
+    src.get(n.start_byte()..n.end_byte()) == Some(s.as_bytes())
 }
 
 /// Контейнер `qual`: имя (части через `::`) и признак «внутри — методы» (класс, `impl`, `trait`;
@@ -249,8 +326,9 @@ pub(super) fn def_kind(lang: Lang, node: Node, cap: &str) -> Option<SymbolKind> 
 pub(super) fn container(lang: Lang, node: Node, src: &[u8]) -> Option<(Vec<String>, bool)> {
     let class_like = match (lang, node.kind()) {
         (Lang::Rust, "impl_item") => {
+            // `impl` — всегда контейнер: тип без обобщений и ссылок, иначе текст типа
             let ty = node.child_by_field_name("type")?;
-            return rust_type_path(ty, src).map(|p| (p, true));
+            return Some((rust_type_path(ty, src), true));
         }
         (Lang::Rust, "trait_item") => true,
         (Lang::Rust, "mod_item") => false,
@@ -304,6 +382,16 @@ pub(super) fn is_function_like(kind: &str) -> bool {
     )
 }
 
+/// Граница экспорта TS/JS: потомки этих узлов не наследуют `export` предка (вложенные функции,
+/// блоки, тело пространства имён).
+pub(super) fn is_export_boundary(kind: &str) -> bool {
+    is_function_like(kind)
+        || matches!(
+            kind,
+            "statement_block" | "internal_module" | "module" | "class_static_block"
+        )
+}
+
 /// Тип получателя метода Go: `func (s *Store[T]) Open` → `Store`.
 pub(super) fn go_receiver(node: Node, src: &[u8]) -> Option<String> {
     let recv = node.child_by_field_name("receiver")?;
@@ -319,9 +407,15 @@ pub(super) fn go_receiver(node: Node, src: &[u8]) -> Option<String> {
     None
 }
 
-/// Публичность (§3): Rust — `visibility_modifier`; TS/JS — предок `export_statement`; Go —
+/// Публичность (§3): Rust — `visibility_modifier`; TS/JS — `export` контекста обхода; Go —
 /// заглавная буква; Java/C# — модификатор `public`; Python — `None`.
-pub(super) fn exported(lang: Lang, node: Node, name: &str, src: &[u8]) -> Option<bool> {
+pub(super) fn exported(
+    lang: Lang,
+    node: Node,
+    name: &str,
+    src: &[u8],
+    ts_export: bool,
+) -> Option<bool> {
     let mut c = node.walk();
     Some(match lang {
         Lang::Python => return None,
@@ -329,18 +423,7 @@ pub(super) fn exported(lang: Lang, node: Node, name: &str, src: &[u8]) -> Option
         Lang::Rust => node
             .children(&mut c)
             .any(|ch| ch.kind() == "visibility_modifier"),
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
-            let mut cur = Some(node);
-            let mut found = false;
-            while let Some(n) = cur {
-                if n.kind() == "export_statement" {
-                    found = true;
-                    break;
-                }
-                cur = n.parent();
-            }
-            found
-        }
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => ts_export,
         Lang::Java => node
             .children(&mut c)
             .filter(|ch| ch.kind() == "modifiers")
@@ -370,16 +453,34 @@ pub(super) fn ref_kind(node: Node, cap: &str) -> RefKind {
     }
 }
 
-/// Путь типа `impl` Rust без обобщений: `Pair<A, B>` → `Pair`, `net::Client` → `net::Client`.
-fn rust_type_path(node: Node, src: &[u8]) -> Option<Vec<String>> {
-    match node.kind() {
-        "type_identifier" | "scoped_type_identifier" => {
-            let parts = name_parts(node, src);
-            (!parts.is_empty()).then_some(parts)
+/// Имя типа `impl` Rust циклом (без рекурсии: вложенность `&&&…T` не ограничена): `Pair<A, B>` →
+/// `Pair`, `net::Client` → `net::Client`, `&mut S` → `S`, `Box<dyn Tr>` → `Box`; иные (`[u8]`,
+/// `(A, B)`) — текст без пробелов (до 128 символов, иначе `_`).
+fn rust_type_path(mut node: Node, src: &[u8]) -> Vec<String> {
+    loop {
+        match node.kind() {
+            "type_identifier" | "scoped_type_identifier" => {
+                let parts = name_parts(node, src);
+                if !parts.is_empty() {
+                    return parts;
+                }
+                break;
+            }
+            "generic_type" | "reference_type" | "pointer_type" => {
+                match node.child_by_field_name("type") {
+                    Some(t) => node = t,
+                    None => break,
+                }
+            }
+            _ => break,
         }
-        "generic_type" | "reference_type" => rust_type_path(node.child_by_field_name("type")?, src),
-        _ => None,
     }
+    let flat: String = text(node, src).split_whitespace().collect();
+    let ok = !flat.is_empty()
+        && flat.chars().count() <= 128
+        && !flat.contains(['/', '#'])
+        && !flat.chars().any(char::is_control);
+    vec![if ok { flat } else { "_".to_string() }]
 }
 
 /// Текст узла (невалидный UTF-8 — с заменой).

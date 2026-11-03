@@ -21,7 +21,6 @@ module Theme 64
 interface Theme::Palette 65
 method Theme::Palette::shade 67
 function Theme::dark 70
-function Theme::shade 71
 class Theme::Provider 74
 method Theme::Provider::wrap 75
 function overload 81

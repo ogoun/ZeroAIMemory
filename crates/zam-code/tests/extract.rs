@@ -239,6 +239,26 @@ fn exported_flags_per_lang() {
         Lang::Go,
         "package a\nfunc Open() {}\nfunc open() {}\ntype T struct{}\n",
     );
+    // ревью I1: граница экспорта — функция, блок, пространство имён; методы класса — да
+    let ts = run(
+        Lang::TypeScript,
+        "export function main() {\n  function inner() {}\n  const loc = () => 1;\n}\nexport namespace G {\n  function hidden() {}\n  export function shown() {}\n  export class K {\n    m() {}\n  }\n}\nexport const o = { k: () => 1 };\nexport class E {\n  f() {}\n  g = () => 1;\n}\n",
+    );
+    for (q, want) in [
+        ("main", true),
+        ("inner", false),
+        ("loc", false),
+        ("G", true),
+        ("G::hidden", false),
+        ("G::shown", true),
+        ("G::K", true),
+        ("G::K::m", true),
+        ("k", true),
+        ("E::f", true),
+        ("E::g", true),
+    ] {
+        assert_eq!(sym(&ts, q).exported, Some(want), "{q}");
+    }
     assert_eq!(sym(&go, "Open").exported, Some(true));
     assert_eq!(sym(&go, "open").exported, Some(false));
     assert_eq!(sym(&go, "T").exported, Some(true));
@@ -582,6 +602,133 @@ fn symbol_hashes_match_extract_and_none_when_skipped() {
         .collect();
     assert_eq!(pairs, want);
     assert!(symbol_hashes(Lang::Rust, b"fn a() {}\0", &lim()).is_none());
+    // усечённый пределом список хук принял бы за удаление лишних символов (ревью, M4)
+    let many: String = (0..20).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    let l = Limits {
+        max_symbols: 5,
+        ..lim()
+    };
+    assert_eq!(
+        extract(Lang::Rust, many.as_bytes(), &l).state,
+        ParseState::Partial
+    );
+    assert!(symbol_hashes(Lang::Rust, many.as_bytes(), &l).is_none());
+}
+
+/// Ревью C1: подъём к корню через `Node::parent()` был O(глубины²) — 80 КБ вложенных блоков
+/// разбирались 14 с при отсечке 200 мс. Теперь один обход; отсечка соблюдается.
+#[test]
+fn deep_blocks_definition_respects_timeout() {
+    let n = 20_000;
+    let cases = [
+        (
+            Lang::JavaScript,
+            format!("{}function f() {{}}\n{}", "{\n".repeat(n), "}\n".repeat(n)),
+        ),
+        (
+            Lang::Rust,
+            format!("{}fn f() {{}}\n{}", "mod a {\n".repeat(n), "}\n".repeat(n)),
+        ),
+        (
+            Lang::CSharp,
+            format!(
+                "{}class C {{ void M() {{}} }}\n{}",
+                "namespace A {\n".repeat(n),
+                "}\n".repeat(n)
+            ),
+        ),
+        (
+            Lang::JavaScript,
+            format!("{}{}", "class A { m() {\n".repeat(n), "}}\n".repeat(n)),
+        ),
+    ];
+    for (lang, src) in cases {
+        let l = Limits {
+            max_file_bytes: 16 << 20,
+            parse_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        };
+        let t = Instant::now();
+        let out = extract(lang, src.as_bytes(), &l);
+        let el = t.elapsed();
+        assert!(
+            out.state == ParseState::Ok || out.skip == Some(SkipReason::Timeout),
+            "{lang:?}: {:?} {:?}",
+            out.state,
+            out.skip
+        );
+        assert!(el < Duration::from_millis(150), "{lang:?}: {el:?}");
+        let t = Instant::now();
+        let _ = symbol_hashes(lang, src.as_bytes(), &l);
+        assert!(
+            t.elapsed() < Duration::from_millis(150),
+            "{lang:?} hashes: {:?}",
+            t.elapsed()
+        );
+    }
+}
+
+/// Ревью C2: рекурсивный разбор типа `impl` переполнял стек (catch_unwind его не ловит).
+#[test]
+fn rust_impl_deep_reference_type_no_stack_overflow() {
+    for n in [10_000, 100_000] {
+        let src = format!("impl X for\n{}T {{ fn f() {{}} }}\n", "&\n".repeat(n));
+        let l = Limits {
+            max_file_bytes: 16 << 20,
+            ..lim()
+        };
+        let out = extract(Lang::Rust, src.as_bytes(), &l);
+        assert_ne!(out.skip, Some(SkipReason::ParserCrash));
+        let generic = format!(
+            "impl X for\n{}T{} {{ fn f() {{}} }}\n",
+            "V<\n".repeat(n),
+            ">\n".repeat(n)
+        );
+        let out = extract(Lang::Rust, generic.as_bytes(), &l);
+        assert_ne!(out.skip, Some(SkipReason::ParserCrash));
+    }
+}
+
+/// Ревью M1: `impl` для среза, кортежа, `dyn` — тоже контейнер, функции в нём — методы.
+#[test]
+fn rust_impl_for_any_type_is_container() {
+    let src = "impl X for [u8] {\n    fn f(&self) {}\n}\nimpl<T> X for Box<dyn Tr<T>> {\n    fn g(&self) {}\n}\nimpl X for (A, B) {\n    fn h(&self) {}\n}\nimpl X for &mut S {\n    fn k(&self) {}\n}\n";
+    let out = run(Lang::Rust, src);
+    for name in ["f", "g", "h", "k"] {
+        let s = out.symbols.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.kind, SymbolKind::Method, "{name}: {:?}", quals(&out));
+        assert!(s.qual.ends_with(&format!("::{name}")), "{}", s.qual);
+    }
+    assert_eq!(sym(&out, "Box::g").line, 5);
+    assert_eq!(sym(&out, "S::k").line, 11);
+}
+
+/// Ревью I2: литералы объектов внутри функций не дают символов (и не сдвигают `#N`).
+#[test]
+fn object_literal_members_only_at_top_level() {
+    let src = "export const api = {\n  list() {},\n  remove: (id) => id,\n};\nfunction make() {\n  return { cb: () => 2, m() {} };\n}\nclass K {\n  f() { return { inner: () => 1 }; }\n}\n";
+    for lang in [Lang::JavaScript, Lang::TypeScript] {
+        let out = run(lang, src);
+        assert_eq!(sym(&out, "list").kind, SymbolKind::Method);
+        assert_eq!(sym(&out, "remove").kind, SymbolKind::Function);
+        for q in ["cb", "m", "inner", "K::inner"] {
+            assert!(
+                out.symbols.iter().all(|s| s.qual != q),
+                "{lang:?}: {q} в {:?}",
+                quals(&out)
+            );
+        }
+    }
+}
+
+/// Ревью M6: имя с `/` или `#` (ключ литерала `"a/b": () => {}`) — не символ.
+#[test]
+fn names_with_slash_or_hash_rejected() {
+    let out = run(
+        Lang::JavaScript,
+        "const o = {\n  \"a/b\": () => 1,\n  \"c#d\": () => 2,\n  ok: () => 3,\n};\n",
+    );
+    assert_eq!(quals(&out), ["function ok"]);
 }
 
 /// `symbol_hashes` (хуки) идёт отдельным запросом только определений — итог тот же, что у
