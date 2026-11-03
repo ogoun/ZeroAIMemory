@@ -6,7 +6,8 @@
 //! `zam refs check`; документы (M5): pdfium рядом с `zam-server` грузится рабочим процессом
 //! (`doc-worker`, `ping`), вложения PDF/DOCX/XLSX → извлечение → поиск фрагмента с `locator` →
 //! `zam read --locator` → превью листа и миниатюра PDF; для Windows — статический CRT наших exe
-//! и app-local MSVC runtime библиотек (в том числе pdfium).
+//! и app-local MSVC runtime библиотек (в том числе pdfium); карта кода (M5.6): `zam code sync`
+//! проекта из трёх файлов, `/code/status`, `zam code map` и `zam code sym`.
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -913,6 +914,10 @@ pub fn run(
     s.run(
         "M4.5: zam log insight --ref → правка файла → zam refs check → stale",
         refs_check(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M5.6: проект из 3 файлов → zam code sync → /code/status files = 3 → zam code map, sym",
+        code_map_check(&zam, &dir, &base, &token),
     )?;
     let with_log = |e: anyhow::Error, srv: &Server| {
         anyhow!(
@@ -1995,6 +2000,108 @@ fn refs_check(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
         .map(|r| r["items"][0]["state"].clone());
     if status != 200 || state != Some(Value::from("stale")) {
         bail!("GET /file-refs: HTTP {status}, ссылка src/wm.rs не stale: {idx}");
+    }
+    Ok(())
+}
+
+// ---- M5.6: карта кода ----
+
+/// Карта кода (M5.6 §17): проект из трёх файлов (`.rs`, `.ts`, `.py`) решения smoke →
+/// `zam code sync` загружает три → `GET /code/status` показывает `files = 3` → `zam code map`
+/// непуст → `zam code sym` находит символ с путём (экстрактор tree-sitter собран в `zam`
+/// комплекта, в том числе musl).
+fn code_map_check(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let home = dir.join("code-home");
+    let project = dir.join("code-project");
+    fs::create_dir_all(project.join(".zeroaimemory"))?;
+    fs::create_dir_all(project.join("src"))?;
+    fs::create_dir_all(home.join(".zeroaimemory"))?;
+    // хуки smoke не запускают фоновую синхронизацию: проверяется явная `zam code sync`
+    fs::write(
+        home.join(".zeroaimemory").join("config.toml"),
+        "[code]
+auto = false
+",
+    )?;
+    fs::write(
+        project.join(".zeroaimemory").join("solution.toml"),
+        format!(
+            "agent_solution_id = \"{SMOKE_SOLUTION}\"
+name = \"smoke\"
+"
+        ),
+    )?;
+    fs::write(
+        project.join("src").join("store.rs"),
+        "pub struct SmokeStore;
+
+impl SmokeStore {
+    pub fn smoke_open() -> SmokeStore {
+        SmokeStore
+    }
+}
+",
+    )?;
+    fs::write(
+        project.join("src").join("client.ts"),
+        "export function smokeClient(n: number): number {
+  return n + 1;
+}
+",
+    )?;
+    fs::write(
+        project.join("src").join("tool.py"),
+        "def smoke_tool(x):
+    return x * 2
+",
+    )?;
+    let run = |args: &[&str]| -> Result<String> {
+        let out = zam_run(zam, (&home, &project), conn, args, None, &[])?;
+        if out.status.code() != Some(0) {
+            bail!(
+                "zam {}: код {:?}
+{}{}",
+                args.join(" "),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let sync: Value = serde_json::from_str(&run(&["code", "sync", "--json"])?)
+        .context("zam code sync --json: не JSON")?;
+    if sync["files"] != 3 || sync["uploaded"] != 3 {
+        bail!("zam code sync: ожидалось 3 файла и 3 загрузки: {sync}");
+    }
+    let (status, st) = api(
+        base,
+        token,
+        &format!("/api/v1/code/status?solution={SMOKE_SOLUTION}"),
+        None,
+    )?;
+    if status != 200 || st["files"] != 3 {
+        bail!("GET /code/status: HTTP {status}, files ≠ 3: {st}");
+    }
+    let map = run(&["code", "map"])?;
+    if map.trim().is_empty() || !map.contains("src/store.rs") {
+        bail!(
+            "zam code map пуст или без src/store.rs:
+{map}"
+        );
+    }
+    let sym: Value =
+        serde_json::from_str(&run(&["code", "sym", "SmokeStore::smoke_open", "--json"])?)
+            .context("zam code sym --json: не JSON")?;
+    if sym["symbol"]["path"] != "src/store.rs" || sym["symbol"]["qual"] != "SmokeStore::smoke_open"
+    {
+        bail!("zam code sym не нашёл SmokeStore::smoke_open в src/store.rs: {sym}");
+    }
+    let ts: Value = serde_json::from_str(&run(&["code", "sym", "smokeClient", "--json"])?)
+        .context("zam code sym --json: не JSON")?;
+    if ts["symbol"]["path"] != "src/client.ts" {
+        bail!("zam code sym не нашёл smokeClient в src/client.ts: {ts}");
     }
     Ok(())
 }

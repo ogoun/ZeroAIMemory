@@ -20,3 +20,20 @@ ignore-dev-dependencies = true
 ignore-build-dependencies = true
 workarounds = ["ring"]
 targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+
+# M5.6: в опубликованных пакетах tree-sitter-typescript 0.23.2 и tree-sitter-java 0.23.5 нет
+# файла LICENSE — без уточнения cargo-about подставил бы шаблон MIT без строки авторских прав.
+# Текст берётся из репозитория на коммите пакета (.cargo_vcs_info.json), сверка — по SHA-256.
+[tree-sitter-typescript.clarify]
+license = "MIT"
+
+[[tree-sitter-typescript.clarify.git]]
+path = "LICENSE"
+checksum = "49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559"
+
+[tree-sitter-java.clarify]
+license = "MIT"
+
+[[tree-sitter-java.clarify.git]]
+path = "LICENSE"
+checksum = "52ed137b039cd9c46409bc22e89938af911c95b157feae2d040b51e6084369a7"
