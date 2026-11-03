@@ -24,6 +24,9 @@ regex.workspace = true
 globset.workspace = true
 similar.workspace = true
 zam-markdown = { path = "../zam-markdown" }
+# карта кода (M5.6): типы протокола, `split_ref`, `fts_terms`, входы ранжирования; без фич —
+# C-код tree-sitter в хранилище и сервер не попадает
+zam-code = { path = "../zam-code" }
 # типы извлечения документов (`Extracted`, `Unit`, `Locator`, `DocKind`) для кэша `blob_extract` и
 # чанков вложений (M5); без фичи `pdfium` крейт — чистый Rust (quick-xml, zip, encoding_rs)
 zam-docs = { path = "../zam-docs" }

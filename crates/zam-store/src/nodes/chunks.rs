@@ -342,7 +342,10 @@ pub(crate) fn note_meta(content: &str, agent_l0: Option<&str>) -> NoteMeta {
             m.insert("index".into(), i.into());
         }
         // ссылки на файлы и проверка заметки (M4.5 §6.1, §7) — только заданные
-        let refs = crate::file_refs::note_ref_paths(Some(f));
+        let refs: Vec<String> = crate::file_refs::note_refs(Some(f))
+            .iter()
+            .map(crate::file_refs::FileRef::display)
+            .collect();
         if !refs.is_empty() {
             m.insert("refs".into(), serde_json::json!(refs));
         }

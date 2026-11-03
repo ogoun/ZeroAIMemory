@@ -395,7 +395,7 @@ async fn rebuild_migration_preserves_m4_db() {
     let db = dbs.get(user).await.unwrap();
     dbs.wait_rechunk(user).await;
     assert!(path.with_file_name(format!("{user}.db.bak-v14")).exists());
-    let (after, objects_after, version, violations, fk, entries_sql) = db
+    let (after, objects_after, version, violations, fk, entries_sql, code_objects) = db
         .read(|c| {
             let sql: String = c.query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entries'",
@@ -409,6 +409,16 @@ async fn rebuild_migration_preserves_m4_db() {
                 fk_violations(c),
                 fk_on(c),
                 sql,
+                schema_objects(
+                    c,
+                    &[
+                        "file_refs",
+                        "code_snapshots",
+                        "code_files",
+                        "code_symbols",
+                        "code_refs",
+                    ],
+                ),
             ))
         })
         .await
@@ -435,6 +445,31 @@ async fn rebuild_migration_preserves_m4_db() {
         .filter(|o| !added.contains(&o.as_str()))
         .collect();
     assert_eq!(objects_after, objects_before);
+    // 0016 (M4.5) и 0023 (M5.6): ссылки на файлы и символы, таблицы карты кода — с нуля
+    assert_eq!(
+        code_objects,
+        [
+            "file_refs: index file_refs_owner",
+            "file_refs: index file_refs_path",
+            "code_snapshots: index sqlite_autoindex_code_snapshots_1",
+            "code_files: index sqlite_autoindex_code_files_1",
+            "code_symbols: index code_symbols_file",
+            "code_symbols: index code_symbols_name",
+            "code_symbols: index code_symbols_qual",
+            "code_symbols: trigger code_symbols_fts_delete",
+            "code_refs: index code_refs_name",
+        ]
+    );
+    for t in [
+        "code_snapshots",
+        "code_files",
+        "code_symbols",
+        "code_symbols_fts",
+        "code_refs",
+    ] {
+        assert_eq!(after.get(t), Some(&0), "таблица {t}");
+    }
+    assert!(!after.contains_key("code_file_edges"));
     // FTS по заголовку находит запись
     let hits = search_fts(
         &db,

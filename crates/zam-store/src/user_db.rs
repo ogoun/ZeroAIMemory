@@ -128,6 +128,11 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0022_reports.sql"),
         rebuild: true,
     },
+    Migration {
+        version: 23,
+        sql: include_str!("../migrations/user/0023_code_map.sql"),
+        rebuild: false,
+    },
 ];
 
 /// Вид пространства.

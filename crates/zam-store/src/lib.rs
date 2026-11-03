@@ -6,13 +6,15 @@
 //! выданное им и показы/оценки (`sessions`, `session_seen`, `usage`; M4), кэш выжимок
 //! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5), вложения как
 //! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5), отчёты (вид записи
-//! `report`, файлы `entry_attachments`; M5.5).
+//! `report`, файлы `entry_attachments`; M5.5), карта кода решения (`code_*`, ссылки на символы;
+//! M5.6).
 
 pub mod access;
 pub mod attachments;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
+pub mod code;
 pub mod datadir;
 pub mod db;
 pub mod embeddings;
@@ -86,9 +88,9 @@ pub use entries::{
     supersede_entry, title_duplicates, update_entry, validate_trigger,
 };
 pub use file_refs::{
-    FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit, check_hash,
-    files_changed, files_verified, normalize_ref_path, refs_index, refs_to_path, stale_refs_of,
-    verified_notes,
+    ChangedFile, FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit,
+    check_hash, files_changed, files_verified, normalize_ref_path, refs_index, refs_to_path,
+    stale_refs_of, verified_notes,
 };
 pub use glossary::{
     ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,

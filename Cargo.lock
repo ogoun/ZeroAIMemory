@@ -7178,6 +7178,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "uuid",
+ "zam-code",
  "zam-core",
  "zam-docs",
  "zam-markdown",

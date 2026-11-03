@@ -162,3 +162,46 @@ async fn migrate_v11_to_v12_with_trash() {
     let f = zam_store::get_node(&db, folder).await.unwrap();
     assert!(f.has_children);
 }
+
+/// Новая база создаётся сразу на последней схеме (M5.6: 0023) с таблицами карты кода; файлы
+/// карты привязаны к снимку решения каскадом (очистка карты не оставляет висячих строк).
+#[tokio::test]
+async fn fresh_db_has_code_map_schema() {
+    let dd = datadir("code-map");
+    let db = UserDbs::new(dd.users_dir()).get(Id::new()).await.unwrap();
+    let (ver, tables, fk): (u32, Vec<String>, String) = db
+        .read(|c| {
+            let mut st = c.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'code_%'
+                 AND name NOT LIKE 'code_symbols_fts_%' ORDER BY name",
+            )?;
+            let tables = st
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            let fk: String = c.query_row(
+                "SELECT \"table\" || ':' || on_delete FROM pragma_foreign_key_list('code_files')",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((
+                c.query_row("PRAGMA user_version", [], |r| r.get(0))?,
+                tables,
+                fk,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(ver, zam_store::USER_MIGRATIONS.len() as u32);
+    assert!(ver >= 23);
+    assert_eq!(
+        tables,
+        [
+            "code_files",
+            "code_refs",
+            "code_snapshots",
+            "code_symbols",
+            "code_symbols_fts"
+        ]
+    );
+    assert_eq!(fk, "code_snapshots:CASCADE");
+}

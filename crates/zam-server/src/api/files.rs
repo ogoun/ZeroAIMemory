@@ -39,8 +39,8 @@ use serde_json::{Value, json};
 use zam_core::{Id, SolutionGuid, TargetRef};
 use zam_store::file_refs::{FILES_MAX, REFS_MAX};
 use zam_store::{
-    Db, FileRef, PathRefs, SpaceKind, check_commit, check_hash, files_changed, files_verified,
-    normalize_ref_path, refs_index, refs_to_path, space_of_kind,
+    ChangedFile, Db, FileRef, PathRefs, SpaceKind, check_commit, check_hash, files_changed,
+    files_verified, normalize_ref_path, refs_index, refs_to_path, space_of_kind,
 };
 
 use super::entries::unprocessable;
@@ -125,7 +125,11 @@ pub fn parse_refs(v: &Value) -> Result<Vec<FileRef>, ApiError> {
             })
             .transpose()?;
         if !out.iter().any(|r| r.path == path) {
-            out.push(FileRef { path, hash, commit });
+            out.push(FileRef {
+                hash,
+                commit,
+                ..FileRef::path_only(path)
+            });
         }
     }
     Ok(out)
@@ -219,9 +223,13 @@ pub async fn changed(
 ) -> Result<Json<Value>, ApiError> {
     let req: FilesReq = json_body(body)?;
     let (sc, guid) = write_scope(&st, &p, &headers, &req.solution).await?;
-    let files: Vec<(String, String)> = parse_files(&req.files, true)?
+    let files: Vec<ChangedFile> = parse_files(&req.files, true)?
         .into_iter()
-        .map(|(p, h)| (p, h.unwrap_or_default()))
+        .map(|(path, h)| ChangedFile {
+            path,
+            hash: h.unwrap_or_default(),
+            symbols: None,
+        })
         .collect();
     let now = Timestamp::now();
     let mut stale = 0;
@@ -240,7 +248,10 @@ pub async fn verified(
 ) -> Result<Json<Value>, ApiError> {
     let req: FilesReq = json_body(body)?;
     let (sc, guid) = write_scope(&st, &p, &headers, &req.solution).await?;
-    let files = parse_files(&req.files, false)?;
+    let files: Vec<_> = parse_files(&req.files, false)?
+        .into_iter()
+        .map(|(p, h)| (p, h, None))
+        .collect();
     let now = Timestamp::now();
     let mut verified = 0;
     for (db, spaces) in report_dbs(&st, &p, &sc).await? {
@@ -418,6 +429,7 @@ mod tests {
             kind: "note".into(),
             title: id.into(),
             state: zam_store::RefState::Ok,
+            symbol: None,
         };
         let a = vec![PathRefs {
             path: "b".into(),
