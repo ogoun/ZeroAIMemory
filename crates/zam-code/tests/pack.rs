@@ -12,6 +12,15 @@ fn half_chars(text: &str) -> usize {
     text.chars().count().div_ceil(2)
 }
 
+/// Немонотонный счётчик: приближённый плюс шум 0..=2 от содержимого (точный токенизатор
+/// тоже не обязан расти с длиной префикса).
+fn jittery(text: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    approx(text) + (h.finish() % 3) as usize
+}
+
 fn lines(text: &str) -> usize {
     text.lines().count()
 }
@@ -230,9 +239,10 @@ proptest! {
         map in arb_map(),
         header in "[ -~а-я]{0,300}",
         budget in 1usize..20_000,
-        half in any::<bool>(),
+        which in 0usize..3,
     ) {
-        let count: &dyn Fn(&str) -> usize = if half { &half_chars } else { &approx };
+        let counters: [&Counter; 3] = [&approx, &half_chars, &jittery];
+        let count = counters[which];
         let p = render_map(&header, &map, budget, count);
         prop_assert!(p.tokens <= budget);
         prop_assert_eq!(p.tokens, count(&p.text));

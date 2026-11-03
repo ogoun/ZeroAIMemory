@@ -22,8 +22,8 @@ pub use proto::{
     body_hash, lang_of, sig_line,
 };
 pub use rank::{
-    Focus, RankFile, Ranked, central, file_edges, focus_idents, focus_restart, ident_mult,
-    pagerank, rank, rank_on_edges,
+    Focus, Graph, RankFile, Ranked, central, edges_among, focus_idents, focus_restart, ident_mult,
+    pagerank, rank, rank_on_graph,
 };
 
 #[cfg(feature = "parse")]
