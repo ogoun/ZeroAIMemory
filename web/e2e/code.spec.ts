@@ -2,9 +2,10 @@
 // Knowledge — нет), состояние снимка (языки, пропуски по причинам, возраст, ветка и коммит),
 // поиск символа по Ctrl+K страницы, карточка символа (сигнатура, строки, кто ссылается, на что
 // ссылается, привязанные знания со ссылками), таблица файлов по рангу с фильтром языка, «Обзор»
-// Mermaid (≤ 40 файлов, ≤ 120 рёбер), очистка карты только владельцем, маска секрета в
-// сигнатуре, тёмная тема и печать. Данные — seedCodeMap/seedCodeKnowledge (global-setup).
-import { expect, test, type Browser, type Page } from '@playwright/test';
+// Mermaid (≤ 40 файлов, ≤ 120 рёбер; экранирование подписей; кэш ответа между вкладками;
+// печать светлой копией в тёмной теме), вкладки ARIA с клавиатуры, очистка карты только
+// владельцем, маска секрета в сигнатуре, тёмная тема и печать. Данные — seedCodeMap/seedCodeKnowledge (global-setup).
+import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import {
@@ -248,6 +249,136 @@ test('code_overview_mermaid_40_files_120_edges', async ({ page }) => {
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+test('code_tabs_keyboard_aria', async ({ page }) => {
+  const problems = watch(page);
+  await openCode(page);
+  const list = page.getByRole('tablist', { name: 'Вид карты' });
+  const files = list.getByRole('tab', { name: 'Файлы' });
+  const over = list.getByRole('tab', { name: 'Обзор' });
+  await expect(files).toHaveAttribute('aria-selected', 'true');
+  await expect(files).toHaveAttribute('tabindex', '0');
+  await expect(over).toHaveAttribute('aria-selected', 'false');
+  await expect(over).toHaveAttribute('tabindex', '-1');
+  // вкладка управляет своей панелью, панель подписана вкладкой
+  const panelOf = async (tab: Locator) => page.locator(`[id="${await tab.getAttribute('aria-controls')}"]`);
+  const filesPanel = await panelOf(files);
+  const overPanel = await panelOf(over);
+  await expect(filesPanel).toHaveAttribute('role', 'tabpanel');
+  await expect(filesPanel).toHaveAttribute('aria-labelledby', (await files.getAttribute('id'))!);
+  await expect(overPanel).toHaveAttribute('aria-labelledby', (await over.getAttribute('id'))!);
+  await expect(page.getByRole('tabpanel', { name: 'Файлы' }).getByRole('table', { name: 'Файлы карты' })).toBeVisible();
+  await expect(overPanel).toBeHidden();
+  // клавиатура: ←/→ выбирают и фокусируют соседнюю вкладку по кругу; Home/End — крайние
+  await files.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(over).toBeFocused();
+  await expect(over).toHaveAttribute('aria-selected', 'true');
+  await expect(over).toHaveAttribute('tabindex', '0');
+  await expect(files).toHaveAttribute('tabindex', '-1');
+  await expect(overPanel).toBeVisible();
+  await expect(filesPanel).toBeHidden();
+  await page.keyboard.press('ArrowRight');
+  await expect(files).toBeFocused();
+  await expect(files).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('ArrowLeft');
+  await expect(over).toBeFocused();
+  await page.keyboard.press('Home');
+  await expect(files).toBeFocused();
+  await expect(files).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('End');
+  await expect(over).toBeFocused();
+  await expect(over).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tabpanel', { name: 'Обзор' })).toBeVisible();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('code_overview_cached_between_tabs', async ({ page }) => {
+  const problems = watch(page);
+  let maps = 0;
+  page.on('request', (r) => {
+    if (new URL(r.url()).pathname.endsWith('/api/v1/code/map')) maps++;
+  });
+  await openCode(page);
+  const svg = page.locator('.code-overview .mermaid-diagram svg').first();
+  await page.getByRole('tab', { name: 'Обзор' }).click();
+  await expect(svg).toBeVisible({ timeout: 30_000 });
+  expect(maps).toBe(1);
+  // туда и обратно: тот же снимок — без запроса, диаграмма снова нарисована
+  await page.getByRole('tab', { name: 'Файлы' }).click();
+  await expect(page.getByRole('table', { name: 'Файлы карты' })).toBeVisible();
+  await page.getByRole('tab', { name: 'Обзор' }).click();
+  await expect(svg).toBeVisible({ timeout: 30_000 });
+  // карточка символа и назад к карте — тоже из кэша
+  await page.goto(codeUrl(await admin(page), CODE_REF));
+  await expect(page.getByRole('article', { name: 'Карточка символа' })).toBeVisible();
+  await page.getByRole('link', { name: '← К карте' }).click();
+  await page.getByRole('tab', { name: 'Обзор' }).click();
+  await expect(svg).toBeVisible({ timeout: 30_000 });
+  expect(maps).toBe(1);
+  // новая загрузка страницы — новый запрос (кэш живёт в памяти страницы)
+  await page.reload();
+  await page.getByRole('tab', { name: 'Обзор' }).click();
+  await expect(svg).toBeVisible({ timeout: 30_000 });
+  expect(maps).toBe(2);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('code_overview_mermaid_escapes_labels', async ({ page }) => {
+  const problems = watch(page);
+  const dialogs: string[] = [];
+  page.on('dialog', (d) => {
+    dialogs.push(d.message());
+    void d.dismiss();
+  });
+  // имена, которые ломали бы лексер Mermaid или давали разметку
+  const paths = [
+    'src/a:b@c=d.rs',
+    'src/style:x#1;y.rs',
+    'src/classDef:k#35;v.rs',
+    'src/"q"|p;(r)[s]{t}.rs',
+    'src/<img src=x onerror=alert(1)>.ts',
+    'src/e1@-->f@{ shape: circle }.ts',
+    'src/%%{init: {}}%%&amp;#lt;.ts',
+    'src/пробел и ёлка`~+,!.py',
+  ];
+  const files = paths.map((path, i) => ({ id: 2000 + i, path, lang: 'rust', rank: 1 - i / 100, symbols: [] }));
+  const edges = paths.slice(1).map((_, i) => ({ src: 2000 + i, dst: 2001 + i, weight: 10 - i }));
+  const isMap = (u: URL) => u.pathname.endsWith('/api/v1/code/map');
+  await page.route(isMap, (route) =>
+    route.fulfill({
+      json: {
+        format: 'json', header: '', files, edges, files_shown: files.length, symbols_shown: 0,
+        files_left: 0, symbols_left: 0, tokens: 1, rank_state: 'ok', warnings: [],
+      },
+    }),
+  );
+  await openCode(page);
+  await page.getByRole('tab', { name: 'Обзор' }).click();
+  const svg = page.locator('.code-overview .mermaid-diagram svg').first();
+  await expect(svg).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator('.mermaid-error')).toHaveCount(0);
+  expect(await svg.locator('g.node').count()).toBe(paths.length);
+  // исходник: подписи без «опасных» символов вне сущностей `#<код>;`, все рёбра на месте
+  const src = (await page.getByTestId('code-overview-src').textContent())!;
+  const labels = src.split('\n').filter((l) => /^ {2}f\d+\["/.test(l));
+  expect(labels).toHaveLength(paths.length);
+  for (const l of labels) {
+    const body = l.slice(l.indexOf('["') + 2, l.lastIndexOf('"]'));
+    expect(body, l).not.toMatch(/[:=@"<>|()[\]{}`%&~+,!]/);
+    expect(body.replace(/#\d+;/g, ''), l).not.toMatch(/[#;]/);
+  }
+  expect((src.match(/-->/g) ?? []).length).toBe(paths.length - 1);
+  // диаграмма: подписи — те же имена буквально (Mermaid переносит строки по пробелам — без них)
+  const flat = (t: string) => t.replace(/\s+/g, '');
+  const text = (await svg.locator('g.node').allTextContents()).map(flat);
+  for (const p of paths) expect(text, p).toContain(flat(p));
+  // никакой разметки из имён: ни картинок, ни обработчиков, ни диалогов
+  expect(await page.locator('.code-overview img, .code-overview [onerror]').count()).toBe(0);
+  expect(dialogs).toEqual([]);
+  await page.unroute(isMap);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('code_masked_signature_shown_masked', async ({ page }) => {
   const problems = watch(page);
   await openCode(page, 'src/b.rs#API_TOKEN');
@@ -287,6 +418,51 @@ test.describe('тёмная тема ОС', () => {
     await expect(card.getByTestId('code-sig')).toBeVisible();
     await expect(page.locator('button:visible, nav:visible, input:visible')).toHaveCount(0);
     await page.emulateMedia({ media: 'screen' });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+});
+
+test.describe('тёмная тема ОС: печать «Обзора»', () => {
+  test.use({ colorScheme: 'dark' });
+
+  test('code_overview_print_light_without_controls', async ({ page }) => {
+    const problems = watch(page);
+    await openCode(page);
+    await page.getByRole('tab', { name: 'Обзор' }).click();
+    const screen = page.locator('.code-overview:not(.print-only) .mermaid-diagram svg');
+    const print = page.getByTestId('code-overview-print').locator('.mermaid-diagram svg');
+    await expect(screen).toBeVisible({ timeout: 30_000 });
+    // светлая копия нарисована заранее и на экране не видна
+    await expect(print).toBeAttached({ timeout: 30_000 });
+    await expect(print).toBeHidden();
+    const fill = (l: Locator) => l.locator('g.node').first().locator('rect, polygon, path').first()
+      .evaluate((e) => getComputedStyle(e).fill);
+    const light = (c: string) => {
+      const [r, g, b] = (c.match(/\d+/g) ?? []).map(Number);
+      return (r + g + b) / 3 > 160;
+    };
+    const darkFill = await fill(screen);
+    expect(light(darkFill), darkFill).toBe(false);
+    await page.emulateMedia({ media: 'print' });
+    // печать: только светлая копия; без исходника, вкладок, кнопок и форм (заголовок списка
+    // пропусков состояния карты печатается — это текст)
+    await expect(print).toBeVisible();
+    await expect(screen).toBeHidden();
+    const printFill = await fill(print);
+    expect(light(printFill), printFill).toBe(true);
+    await expect(page.getByTestId('code-overview-note')).toBeVisible();
+    await expect(page.locator('details.src')).toBeHidden();
+    await expect(page.getByRole('tablist', { name: 'Вид карты' })).toBeHidden();
+    await expect(
+      page.locator('button:visible, nav:visible, input:visible, select:visible, .src summary:visible'),
+    ).toHaveCount(0);
+    const bg = (sel: string) => page.evaluate((s) => getComputedStyle(document.querySelector(s)!).backgroundColor, sel);
+    expect(await bg('body')).toBe('rgb(255, 255, 255)');
+    expect(await bg('.code-overview.print-only')).toBe('rgb(255, 255, 255)');
+    await page.screenshot({ path: `${screens}code-overview-print.png`, fullPage: true });
+    await page.emulateMedia({ media: 'screen' });
+    await expect(screen).toBeVisible();
+    await expect(print).toBeHidden();
     expect(problems, problems.join('\n')).toEqual([]);
   });
 });

@@ -29,6 +29,8 @@ export interface CodeStatus {
   age_s?: number;
   other_share?: number;
   rank_state: 'ok' | 'pending' | null;
+  /** Версия снимка (меняется с каждой синхронизацией и очисткой); у пустой карты нет. */
+  etag?: string;
   central: CodeCentral[];
   digest: string | null;
   warnings: string[];
@@ -133,6 +135,36 @@ export function codeFiles(
 export const codeOverview = (user: string, space: string) =>
   codeCall<CodeMapJson>('GET', `code/map?solution=${q(space)}&format=json&budget_tokens=${OVERVIEW_BUDGET}`, user);
 
+/** Версия карты для кэша «Обзора»: etag снимка и состояние рангов (как `ETag` `/code/map`). */
+export const overviewVersion = (s: Pick<CodeStatus, 'etag' | 'rank_state'>): string | null =>
+  s.etag ? `${s.etag}|${s.rank_state ?? ''}` : null;
+
+/** Последний ответ «Обзора»: одна запись — `(пользователь, решение, версия карты)`. */
+let overviewCache: { key: string; data: Promise<CodeMapJson> } | null = null;
+
+/**
+ * «Обзор» с кэшем: повторное открытие вкладки (и возврат с карточки) при той же версии карты не
+ * запрашивает сервер. Другое решение или новая версия (sync, очистка, пересчёт рангов) — новый
+ * запрос; ошибка в кэше не остаётся. `version: null` (сервер без etag) — всегда запрос.
+ */
+export function codeOverviewCached(user: string, space: string, version: string | null): Promise<CodeMapJson> {
+  if (version === null) return codeOverview(user, space);
+  const key = JSON.stringify([user, space, version]);
+  if (overviewCache?.key === key) return overviewCache.data;
+  const data = codeOverview(user, space);
+  const entry = { key, data };
+  overviewCache = entry;
+  data.catch(() => {
+    if (overviewCache === entry) overviewCache = null;
+  });
+  return data;
+}
+
+/** Сброс кэша «Обзора» (очистка карты). */
+export function dropOverviewCache(): void {
+  overviewCache = null;
+}
+
 export function codeSymbols(user: string, space: string, text: string, kind?: string) {
   const s = new URLSearchParams({ solution: space, q: text, limit: '50' });
   if (kind) s.set('kind', kind);
@@ -187,11 +219,16 @@ export function snapshotText(s: Pick<CodeStatus, 'branch' | 'commit'>): string {
 }
 
 /**
- * Подпись узла Mermaid: в кавычках, всё, что могло бы закрыть строку или включить разметку
- * (`"`, `#`, скобки, `<>`, `&`, `` ` ``, `|`, `;`, управляющие), — сущностью `#<код>;`.
+ * Подпись узла Mermaid: в кавычках; всё, кроме букв, цифр, пробела и `_ . - /`, — сущностью
+ * `#<код>;` (Mermaid превращает её в `&#<код>;`, `hydrate/mermaid.ts` — обратно в символ текстом
+ * узла SVG, не разметкой).
+ * Кроме `"`, `#`, скобок, `<>`, `&`, `` ` ``, `|`, `;` и управляющих экранируются и `:`, `=`, `@`:
+ * предобработка Mermaid (`encodeEntities`) срезает последний `;` строки, где после `style` или
+ * `classDef` идут `:` и `#…;` (путь `src/style:x#1` терял бы сущность), а `=`/`@` — синтаксис
+ * рёбер и форм узла (`==>`, `e1@-->`, `f0@{…}`): подпись не зависит от правил лексера.
  */
 export function mermaidLabel(s: string): string {
-  const safe = Array.from(s, (ch) => (/[\p{L}\p{N} _.\-/:@+,=~]/u.test(ch) ? ch : `#${ch.codePointAt(0)};`));
+  const safe = Array.from(s, (ch) => (/[\p{L}\p{N} _.\-/]/u.test(ch) ? ch : `#${ch.codePointAt(0)};`));
   return `"${safe.join('')}"`;
 }
 

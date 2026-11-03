@@ -3,7 +3,9 @@
   // причинам, возраст, ветка и коммит, доля других снимков, пересчёт рангов), очистка карты
   // (только владелец), поиск символа (Ctrl+K страницы), таблица файлов по рангу с фильтрами
   // (`GET /code/files` постранично), «Обзор» — Mermaid первых 40 файлов и рёбер между ними
-  // (CodeOverview, свой ленивый чанк), карточка символа по постоянному адресу `путь#qual`.
+  // (CodeOverview, свой ленивый чанк; ответ карты кэшируется по версии снимка), карточка символа по
+  // постоянному адресу `путь#qual`. Вкладки — шаблон ARIA tabs (стрелки, Home, End, как у листов
+  // SheetViewer).
   // Данные сервера — только текстом (никакого `{@html}`). Ленивый чанк (Shell).
   import { untrack } from 'svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
@@ -17,7 +19,9 @@
     codeStatus,
     codeSymbol,
     codeSymbols,
+    dropOverviewCache,
     filesText,
+    overviewVersion,
     snapshotText,
     symbolsText,
     type CodeFilesPage,
@@ -43,7 +47,15 @@
 
   let status = $state<CodeStatus | null>(null);
   let statusError = $state('');
-  let tab = $state<'files' | 'overview'>('files');
+  type Tab = 'files' | 'overview';
+  const TABS: { id: Tab; title: string }[] = [
+    { id: 'files', title: 'Файлы' },
+    { id: 'overview', title: 'Обзор' },
+  ];
+  let tab = $state<Tab>('files');
+  let tabEls = $state<HTMLButtonElement[]>([]);
+  /** Префикс id вкладок и панелей (`aria-controls`/`aria-labelledby`). */
+  const uid = $props.id();
   let ask = $state<Ask | null>(null);
   let notice = $state('');
 
@@ -228,6 +240,7 @@
         searchSeq++;
         hits = null;
         tab = 'files';
+        dropOverviewCache();
         await loadStatus();
       },
     };
@@ -252,12 +265,30 @@
     return (card?.knowledge ?? []).filter((k) => !seen.has(k.id) && !!seen.add(k.id));
   });
 
-  /** Ссылка на знание: заметка — документ, запись — её журнал. */
+  /**
+   * Ссылка на знание: заметка — документ, запись — её журнал. Пространство — текущее: сервер
+   * (`knowledge_json`) пространство записи не отдаёт, и знание из Knowledge участника ведёт мимо
+   * (нужен `space` в ответе карточки — журнал этапа, задача 9B).
+   */
   function knowledgeHref(k: CodeKnowledge): string | null {
     const id = k.id.includes(':') ? k.id.slice(k.id.indexOf(':') + 1) : k.id;
     if (k.kind === 'note') return href({ name: 'node', user, space, node: id, anchor: null });
     const j = JOURNAL_OF_KIND[k.kind];
     return j ? href({ name: 'journal', user, space, journal: j, entry: id }) : null;
+  }
+
+  /** Клавиатура tablist: ←/→ по кругу, Home, End; выбор следует за фокусом. */
+  function ontabkey(e: KeyboardEvent, i: number) {
+    const n = TABS.length;
+    let j = -1;
+    if (e.key === 'ArrowRight') j = (i + 1) % n;
+    else if (e.key === 'ArrowLeft') j = (i - 1 + n) % n;
+    else if (e.key === 'Home') j = 0;
+    else if (e.key === 'End') j = n - 1;
+    if (j < 0) return;
+    e.preventDefault();
+    tab = TABS[j].id;
+    tabEls[j]?.focus();
   }
 
   const pct = (x: number) => `${Math.round(x * 100)} %`;
@@ -296,7 +327,7 @@
     {#if cardError}
       <p class="error" role="alert">{cardError}</p>
     {:else if !card}
-      <p class="muted">Загрузка…</p>
+      <p class="muted" role="status">Загрузка…</p>
     {:else}
       {@const s = card.symbol}
       <article class="code-card" aria-label="Карточка символа">
@@ -362,7 +393,7 @@
       {#if statusError}
         <p class="error" role="alert">{statusError}</p>
       {:else if !status}
-        <p class="muted">Загрузка…</p>
+        <p class="muted" role="status">Загрузка…</p>
       {:else if empty}
         <p class="hint">
           Карты кода нет. Выполните <code>zam code sync</code> в каталоге решения — клиент разберёт
@@ -415,69 +446,79 @@
 
     {#if status && !empty}
       <div class="tabs" role="tablist" aria-label="Вид карты">
-        <button type="button" role="tab" aria-selected={tab === 'files'} onclick={() => (tab = 'files')}>Файлы</button>
-        <button type="button" role="tab" aria-selected={tab === 'overview'} onclick={() => (tab = 'overview')}>Обзор</button>
+        {#each TABS as t, i (t.id)}
+          <button
+            type="button"
+            role="tab"
+            id={`${uid}-tab-${t.id}`}
+            bind:this={tabEls[i]}
+            aria-selected={tab === t.id}
+            aria-controls={`${uid}-panel-${t.id}`}
+            tabindex={tab === t.id ? 0 : -1}
+            onclick={() => (tab = t.id)}
+            onkeydown={(e) => ontabkey(e, i)}>{t.title}</button
+          >
+        {/each}
       </div>
 
-      {#if tab === 'files'}
-        <div role="tabpanel" aria-label="Файлы">
-          <form class="filters row" onsubmit={applyFilters} aria-label="Фильтры файлов">
-            <label class="row">
-              Язык
-              <select bind:value={lang} onchange={() => applyFilters()}>
-                <option value="">все</option>
-                {#each status.by_lang as l (l.lang)}<option value={l.lang}>{l.lang}</option>{/each}
-              </select>
-            </label>
-            <label class="row grow">
-              Путь содержит
-              <input bind:value={pathQ} placeholder="например, src/store" />
-            </label>
-            <button type="submit">Применить</button>
-          </form>
-          {#if filesError}<p class="error" role="alert">{filesError}</p>{/if}
-          {#if page}
-            <table class="files">
-              <caption>Файлы карты</caption>
-              <thead>
-                <tr><th class="num">№</th><th>путь</th><th>язык</th><th class="num">ранг</th><th class="num">символов</th></tr>
-              </thead>
-              <tbody>
-                {#each page.files as f, i (f.id)}
-                  <tr>
-                    <td class="num muted">{page.offset + i + 1}</td>
-                    <td class="mono path">{f.path}</td>
-                    <td>{f.lang}</td>
-                    <td class="num rank">{rankText(f.rank)}</td>
-                    <td class="num">{f.symbols}</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-            {#if page.total === 0}<p class="muted">Файлов по фильтру нет.</p>{/if}
-            <div class="pager row">
-              <span class="muted" data-testid="code-files-total">
-                {page.total ? `${page.offset + 1}–${page.offset + page.files.length}` : '0'} из {page.total}
-              </span>
-              {#if page.offset > 0}<button type="button" onclick={() => pageTo(page!.offset - page!.limit)}>Назад</button>{/if}
-              {#if page.offset + page.files.length < page.total}
-                <button type="button" onclick={() => pageTo(page!.offset + page!.limit)}>Далее</button>
-              {/if}
-            </div>
-          {/if}
-        </div>
-      {:else}
-        <div role="tabpanel" aria-label="Обзор">
+      <div role="tabpanel" id={`${uid}-panel-files`} aria-labelledby={`${uid}-tab-files`} hidden={tab !== 'files'}>
+        <form class="filters row" onsubmit={applyFilters} aria-label="Фильтры файлов">
+          <label class="row">
+            Язык
+            <select bind:value={lang} onchange={() => applyFilters()}>
+              <option value="">все</option>
+              {#each status.by_lang as l (l.lang)}<option value={l.lang}>{l.lang}</option>{/each}
+            </select>
+          </label>
+          <label class="row grow">
+            Путь содержит
+            <input bind:value={pathQ} placeholder="например, src/store" />
+          </label>
+          <button type="submit">Применить</button>
+        </form>
+        {#if filesError}<p class="error" role="alert">{filesError}</p>{/if}
+        {#if page}
+          <table class="files">
+            <caption>Файлы карты</caption>
+            <thead>
+              <tr><th class="num">№</th><th>путь</th><th>язык</th><th class="num">ранг</th><th class="num">символов</th></tr>
+            </thead>
+            <tbody>
+              {#each page.files as f, i (f.id)}
+                <tr>
+                  <td class="num muted">{page.offset + i + 1}</td>
+                  <td class="mono path">{f.path}</td>
+                  <td>{f.lang}</td>
+                  <td class="num rank">{rankText(f.rank)}</td>
+                  <td class="num">{f.symbols}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+          {#if page.total === 0}<p class="muted">Файлов по фильтру нет.</p>{/if}
+          <div class="pager row">
+            <span class="muted" data-testid="code-files-total">
+              {page.total ? `${page.offset + 1}–${page.offset + page.files.length}` : '0'} из {page.total}
+            </span>
+            {#if page.offset > 0}<button type="button" onclick={() => pageTo(page!.offset - page!.limit)}>Назад</button>{/if}
+            {#if page.offset + page.files.length < page.total}
+              <button type="button" onclick={() => pageTo(page!.offset + page!.limit)}>Далее</button>
+            {/if}
+          </div>
+        {/if}
+      </div>
+      <div role="tabpanel" id={`${uid}-panel-overview`} aria-labelledby={`${uid}-tab-overview`} hidden={tab !== 'overview'}>
+        {#if tab === 'overview'}
           <!-- «Обзор» — свой ленивый чанк (Mermaid подгружается уже из него) -->
           {#await import('./CodeOverview.svelte')}
-            <p class="muted">Загрузка…</p>
+            <p class="muted" role="status">Загрузка…</p>
           {:then { default: CodeOverview }}
-            {#key `${user}|${space}`}<CodeOverview {user} {space} {onexpired} />{/key}
+            {#key `${user}|${space}`}<CodeOverview {user} {space} version={overviewVersion(status)} {onexpired} />{/key}
           {:catch e}
             <p class="error" role="alert">Обзор не загрузился: {errorText(e)}</p>
           {/await}
-        </div>
-      {/if}
+        {/if}
+      </div>
     {/if}
   {/if}
 </section>

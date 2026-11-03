@@ -40,6 +40,64 @@ function sanitize(svg: string): string {
   return DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } });
 }
 
+const NAMED: Record<string, string> = { quot: '"', amp: '&', lt: '<', gt: '>', apos: "'", nbsp: ' ' };
+const ENTITY = /&(?:#(\d{1,7})|#x([0-9a-f]{1,6})|(quot|amp|lt|gt|apos|nbsp));/gi;
+
+function entityChar(m: string, dec?: string, hex?: string, name?: string): string {
+  if (name) return NAMED[name.toLowerCase()] ?? m;
+  const cp = dec ? Number(dec) : parseInt(hex!, 16);
+  return cp > 0 && cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff) ? String.fromCodePoint(cp) : m;
+}
+
+/**
+ * Сущности подписей (`#35;`, `#quot;` исходника Mermaid превращает в `&#35;`, `&quot;`) при
+ * `htmlLabels: false` попадают в `<text>` SVG буквально («a&#58;b» вместо «a:b»), а перенос строк
+ * Mermaid режет их и между `<tspan>` (`&#9` | `1;`). Расшифровка — по всему тексту каждого
+ * `<text>`: символ — в узел, где сущность начинается, её остаток из следующих узлов убирается.
+ * Меняются только текстовые узлы (`nodeValue`): разметка не появляется.
+ */
+function decodeLabels(root: Element): void {
+  for (const el of root.querySelectorAll('text')) {
+    const nodes: Text[] = [];
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) nodes.push(n as Text);
+    const all = nodes.map((n) => n.data).join('');
+    if (!all.includes('&')) continue;
+    // новое содержимое узлов: начало каждого — по смещению в общем тексте
+    const out = nodes.map(() => '');
+    const starts: number[] = [];
+    let acc = 0;
+    for (const n of nodes) {
+      starts.push(acc);
+      acc += n.data.length;
+    }
+    const nodeAt = (pos: number) => {
+      let i = starts.length - 1;
+      while (i > 0 && starts[i] > pos) i--;
+      return i;
+    };
+    let pos = 0;
+    const copy = (to: number) => {
+      // текст без сущностей — по своим узлам, границы узлов сохраняются
+      while (pos < to) {
+        const i = nodeAt(pos);
+        const end = Math.min(to, i + 1 < starts.length ? starts[i + 1] : all.length);
+        out[i] += all.slice(pos, end);
+        pos = end;
+      }
+    };
+    for (const m of all.matchAll(ENTITY)) {
+      copy(m.index);
+      out[nodeAt(m.index)] += entityChar(m[0], m[1], m[2], m[3]);
+      pos = m.index + m[0].length;
+    }
+    copy(all.length);
+    nodes.forEach((n, i) => {
+      if (n.data !== out[i]) n.data = out[i];
+    });
+  }
+}
+
 /**
  * Заменяет каждый `pre.mermaid-src` внутри `root` диаграммой; при ошибке — исходник с пометкой.
  * `theme` — явная тема (печать — `default`); без неё — тема страницы. Вызовы идут по очереди:
@@ -64,6 +122,7 @@ async function render(root: HTMLElement, want: Theme): Promise<void> {
       const { svg } = await mermaid.render(`zam-mermaid-${++seq}`, src);
       box.innerHTML = sanitize(svg);
       if (!box.querySelector('svg')) throw new Error('пустой результат');
+      decodeLabels(box);
       box.setAttribute('role', 'img');
       box.setAttribute('aria-label', 'Диаграмма');
       pre.replaceWith(box);
