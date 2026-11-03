@@ -925,9 +925,11 @@ fn code_sync_batches_500_and_8mib() {
     let p = Proj::plain("batch-bytes", &url, "zam_stub");
     // debug-сборка на медленной машине CI не успевает разобрать 5000 функций за 200 мс по
     // умолчанию — файл ушёл бы без символов, и пачка была бы одна
-    p.config("[code]
+    p.config(
+        "[code]
 parse_timeout_ms = 10000
-");
+",
+    );
     for (i, path) in paths.iter().enumerate() {
         let mut s = String::new();
         for j in 0..5000 {
