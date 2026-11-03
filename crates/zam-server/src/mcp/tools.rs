@@ -1819,14 +1819,15 @@ fn callers_md(v: &Value) -> String {
     if callers.is_empty() {
         return format!("`{addr}` — ссылок из других файлов не найдено (по имени `{name}`).");
     }
-    let mut s = format!(
-        "`{addr}` — кто ссылается (по имени `{name}`), файлов {}:",
-        callers.len()
-    );
-    for c in callers {
-        s.push_str(&format!("\n- {}", caller_line(c)));
-    }
-    s
+    // популярное имя — сотни файлов: потолок строк, как у прочих списков (ревью задачи 7)
+    format!(
+        "`{addr}` — кто ссылается (по имени `{name}`), файлов {}:\n{}",
+        callers.len(),
+        capped_list(callers, CODE_LIST_MD, 0, "\n", |c| format!(
+            "- {}",
+            caller_line(c)
+        ))
+    )
 }
 
 /// Знание о файле или символе: ссылка, название, вид, состояние ссылки, адрес.

@@ -55,6 +55,8 @@ sha2.workspace = true
 mime_guess.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
+# `LengthLimitError` чтения тела `POST /code/sync` (413 против 400); уже в дереве через axum
+http-body-util.workspace = true
 tower = { workspace = true, features = ["util"] }
 # Vault (§7.6): шифрование, мастер-ключ в base64, случайность ОС
 chacha20poly1305.workspace = true
@@ -95,6 +97,5 @@ zip.workspace = true
 # PDF-фикстуры тестов рабочего процесса (tests/doc_worker.rs)
 zam-docs = { path = "../zam-docs", features = ["pdfium", "test-pdf", "images"] }
 tower = { workspace = true, features = ["util"] }
-http-body-util.workspace = true
 # изображения-фикстуры превью (tests/previews.rs)
 image.workspace = true

@@ -170,6 +170,28 @@ pub struct RankInputs {
     pub generation: i64,
 }
 
+impl RankInputs {
+    /// Оценка памяти входов, байт: ёмкости векторов и строк (без накладных распределителя) —
+    /// предел кэша входов сервера (ревью задачи 4, O2).
+    pub fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let def = size_of::<(String, SymbolKind, Option<bool>)>();
+        let rf = size_of::<(String, zam_code::RefKind, u32)>();
+        self.files.capacity() * size_of::<RankFile>()
+            + self
+                .files
+                .iter()
+                .map(|f| {
+                    f.path.capacity()
+                        + f.defs.capacity() * def
+                        + f.defs.iter().map(|d| d.0.capacity()).sum::<usize>()
+                        + f.refs.capacity() * rf
+                        + f.refs.iter().map(|r| r.0.capacity()).sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
 /// Символ строки карты; `share` и `rank` — из сохранённых долей файла.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MapSymRow {
@@ -892,6 +914,76 @@ pub async fn code_map_files(
             })
         })?
         .collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// Страница таблицы файлов (`GET /code/files`): файлы языка `lang` (нет — все), путь которых
+/// содержит `needle` без учёта регистра (Unicode, `needle` — уже в нижнем регистре), по рангу —
+/// `(страница, всего подходящих)`. Язык, порядок и без `needle` страница с числом — в SQL; с
+/// `needle` строки идут потоком, в памяти остаётся только страница (ревью задачи 4, O4:
+/// `lower()` SQLite — только ASCII, а пути бывают кириллицей).
+pub async fn code_files_page(
+    db: &Db,
+    solution: &str,
+    lang: Option<Lang>,
+    needle: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<MapFileRow>, usize), StoreError> {
+    let solution = solution.to_string();
+    let lang = lang.map(|l| l.as_str().to_string());
+    let needle = needle.map(str::to_string);
+    db.read(move |c| {
+        let row = |r: &Row<'_>| {
+            Ok(MapFileRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                lang: lang_col(r, 2)?,
+                rank: r.get(3)?,
+                symbol_count: r.get(4)?,
+                symbols: Vec::new(),
+            })
+        };
+        const WHERE: &str = "f.solution_guid = ?1 AND (?2 IS NULL OR f.lang = ?2)";
+        let Some(needle) = needle else {
+            let total: i64 = c
+                .prepare_cached(&format!("SELECT count(*) FROM code_files f WHERE {WHERE}"))?
+                .query_row(params![solution, lang], |r| r.get(0))?;
+            let page = c
+                .prepare_cached(&format!(
+                    "SELECT f.id, f.path, f.lang, f.rank, f.symbols FROM code_files f
+                     WHERE {WHERE} ORDER BY f.rank DESC, f.path LIMIT ?3 OFFSET ?4"
+                ))?
+                .query_map(
+                    params![
+                        solution,
+                        lang,
+                        i64::try_from(limit).unwrap_or(i64::MAX),
+                        i64::try_from(offset).unwrap_or(i64::MAX)
+                    ],
+                    row,
+                )?
+                .collect::<Result<_, _>>()?;
+            return Ok((page, usize::try_from(total).unwrap_or(0)));
+        };
+        let mut st = c.prepare_cached(&format!(
+            "SELECT f.id, f.path, f.lang, f.rank, f.symbols FROM code_files f
+             WHERE {WHERE} ORDER BY f.rank DESC, f.path"
+        ))?;
+        let mut rows = st.query(params![solution, lang])?;
+        let (mut page, mut total) = (Vec::new(), 0usize);
+        while let Some(r) = rows.next()? {
+            let path: String = r.get(1)?;
+            if !path.to_lowercase().contains(&needle) {
+                continue;
+            }
+            if total >= offset && page.len() < limit {
+                page.push(row(r)?);
+            }
+            total += 1;
+        }
+        Ok((page, total))
     })
     .await
 }

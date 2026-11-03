@@ -573,6 +573,7 @@ mod tests {
             title: id.into(),
             state: zam_store::RefState::Ok,
             symbol: None,
+            space: None,
         };
         let a = vec![PathRefs {
             path: "b".into(),

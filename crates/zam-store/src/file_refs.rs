@@ -904,6 +904,10 @@ pub struct RefItem {
     pub state: RefState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// Пространство записи-владельца — у [`path_owners`] (карточка символа и влияние, ссылка
+    /// WebUI на знание из Knowledge участника); в индексе хуков не отдаётся.
+    #[serde(skip)]
+    pub space: Option<zam_core::Id>,
 }
 
 /// Путь индекса: последний записанный хэш и до [`INDEX_ITEMS_MAX`] записей (ссылки на символы
@@ -998,6 +1002,7 @@ pub async fn refs_index(
                     title,
                     state,
                     symbol,
+                    space: None,
                 });
             }
         }
@@ -1024,7 +1029,7 @@ pub async fn path_owners(
     db.read(move |c| {
         let mut st = c.prepare_cached(&format!(
             "SELECT f.state, f.owner_kind, f.owner_id, coalesce(n.name, e.title, ''), e.kind,
-                    f.symbol
+                    f.symbol, coalesce(n.space_id, e.space_id)
              FROM file_refs f {OWNER_JOIN}
              WHERE f.solution_guid = ?1 AND f.path = ?3 AND {LIVE_OWNER}
              ORDER BY f.symbol IS NULL, f.recorded_at DESC, f.id DESC"
@@ -1037,11 +1042,12 @@ pub async fn path_owners(
                 r.get::<_, String>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<zam_core::Id>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (state, kind, id, title, ekind, symbol) = row?;
+            let (state, kind, id, title, ekind, symbol, space) = row?;
             let (id, kind) = owner_ref(&kind, &id, ekind.as_deref());
             out.push(RefItem {
                 id,
@@ -1049,6 +1055,7 @@ pub async fn path_owners(
                 title,
                 state,
                 symbol,
+                space,
             });
         }
         Ok(out)

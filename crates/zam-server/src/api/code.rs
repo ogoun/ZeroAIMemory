@@ -8,7 +8,8 @@
 //!   маскируются (`zam_markdown::mask_text`) и хранятся маскированными; правило карты для ссылок
 //!   памяти — только ссылки на символы, в базе владельца и в Knowledge участника (файловые
 //!   ссылки судят хуки рабочей копии).
-//! - `GET /code/status`, `GET /code/map` (Markdown или JSON в бюджете токенов, `focus`, `area`),
+//! - `GET /code/status`, `GET /code/map` (Markdown или JSON в бюджете токенов, `focus`, `area`,
+//!   `files` — не больше N файлов),
 //!   `GET /code/files` (таблица файлов по рангу, постранично), `GET /code/symbols`,
 //!   `GET /code/symbols/{id | путь#qual}`, `POST /code/impact` — чтение решения; ответы карты,
 //!   символов и влияния несут `tokens` (`zam_store::count_tokens`). Слабый `ETag`
@@ -59,8 +60,8 @@ use zam_code::{
 use zam_core::Id;
 use zam_store::code::{
     CodeSnapshot, CodeStatus, MapFileRow, MapSymRow, RankInputs, RankState, SymbolHit, UploadMeta,
-    code_central, code_clear, code_impact, code_map_files, code_map_symbols, code_put_files,
-    code_rank_inputs, code_snapshot, code_status, code_store_ranks, code_symbol,
+    code_central, code_clear, code_files_page, code_impact, code_map_files, code_map_symbols,
+    code_put_files, code_rank_inputs, code_snapshot, code_status, code_store_ranks, code_symbol,
     code_symbols_search, code_sync_manifest,
 };
 use zam_store::file_refs::PATH_MAX_CHARS;
@@ -106,8 +107,14 @@ const FOCUS_SLOTS: usize = 2;
 const FOCUS_TIMEOUT_MIN_MS: u64 = 200;
 /// Входов ранжирования в кэше фокуса (по `(владелец, GUID, etag снимка)`).
 const FOCUS_CACHE: usize = 2;
+/// Память кэша фокуса не больше, байт ([`RankInputs::heap_bytes`]): 50 000 символов — ≈ 9 МиБ,
+/// карта 50 000 файлов × 20 символов × 40 ссылок — ≈ 180 МиБ (замер ревью задачи 4, O2).
+/// Входы больше предела не кэшируются (фокус читает их заново, одно чтение на решение).
+const FOCUS_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// Знаний в карточке символа и во влиянии не больше (сверх — `knowledge_left`).
 const KNOWLEDGE_MAX: usize = 200;
+/// Предел параметра `files` у `GET /code/map`.
+const MAP_FILES_PARAM_MAX: usize = 1000;
 /// Файлов на странице `GET /code/files` по умолчанию и не больше.
 const FILES_PAGE_DEFAULT: usize = 50;
 const FILES_PAGE_MAX: usize = 200;
@@ -128,11 +135,13 @@ pub struct CodeRuntime {
     ranking: Mutex<HashSet<SolutionKey>>,
     /// Слоты ранжирования с фокусом ([`FOCUS_SLOTS`]).
     focus_slots: Arc<tokio::sync::Semaphore>,
-    /// Входы ранжирования последних решений: `((владелец, GUID), etag снимка, входы)`.
-    inputs: Mutex<VecDeque<(SolutionKey, String, Arc<RankInputs>)>>,
-    /// Идущие чтения входов (single-flight по `(владелец, GUID, etag)`): срок запроса их не
-    /// отменяет — дочитанное ляжет в кэш для следующего запроса.
-    loading: Mutex<HashMap<(SolutionKey, String), InputsLoad>>,
+    /// Входы ранжирования последних решений: `((владелец, GUID), etag снимка, входы, байт)`.
+    inputs: Mutex<VecDeque<CachedInputs>>,
+    /// Идущее чтение входов решения — не больше одного на `(владелец, GUID)`: `(etag, чтение)`.
+    /// Запрос с тем же `etag` ждёт его (single-flight), с другим (карта меняется, длинная
+    /// синхронизация) — ждёт конца и читает сам. Срок запроса чтение не отменяет — дочитанное
+    /// ляжет в кэш для следующего запроса.
+    loading: Mutex<HashMap<SolutionKey, (String, InputsLoad)>>,
     /// Тестовые точки (фича `test-hooks`).
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
@@ -152,6 +161,9 @@ impl Default for CodeRuntime {
     }
 }
 
+/// Запись кэша входов: `((владелец, GUID), etag снимка, входы, байт)`.
+type CachedInputs = (SolutionKey, String, Arc<RankInputs>, usize);
+
 /// Чтение входов ранжирования, которого могут ждать несколько запросов.
 type InputsLoad = futures_util::future::Shared<
     futures_util::future::BoxFuture<'static, Result<Arc<RankInputs>, String>>,
@@ -164,16 +176,30 @@ impl CodeRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .find(|(k, e, _)| k == key && e == etag)
-            .map(|(_, _, i)| i.clone())
+            .find(|(k, e, _, _)| k == key && e == etag)
+            .map(|(_, _, i, _)| i.clone())
     }
 
-    /// Кладёт входы в кэш (последние [`FOCUS_CACHE`] решений, у решения — одна запись).
+    /// Кладёт входы в кэш: последние [`FOCUS_CACHE`] решений не больше [`FOCUS_CACHE_BYTES`]
+    /// вместе, у решения — одна запись; входы больше предела не кладутся.
     fn remember(&self, key: SolutionKey, etag: String, inputs: Arc<RankInputs>) {
+        let bytes = inputs.heap_bytes();
         let mut cache = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
-        cache.retain(|(k, _, _)| *k != key);
-        cache.push_front((key, etag, inputs));
+        cache.retain(|(k, _, _, _)| *k != key);
+        if bytes > FOCUS_CACHE_BYTES {
+            return;
+        }
+        cache.push_front((key, etag, inputs, bytes));
         cache.truncate(FOCUS_CACHE);
+        let mut total = 0usize;
+        let keep = cache
+            .iter()
+            .take_while(|(_, _, _, b)| {
+                total += b;
+                total <= FOCUS_CACHE_BYTES
+            })
+            .count();
+        cache.truncate(keep);
     }
 
     /// Очищает кэш входов (тестовая точка).
@@ -215,6 +241,11 @@ pub struct CodeHooks {
     /// Задержка перед чтением входов для кэша фокуса, мс, и число таких чтений.
     pub inputs_delay_ms: std::sync::atomic::AtomicU64,
     pub inputs_reads: std::sync::atomic::AtomicUsize,
+    /// Паника в следующем чтении входов (сбрасывается этим чтением).
+    pub inputs_panic: std::sync::atomic::AtomicBool,
+    /// Наибольшее число одновременных чтений входов одного решения.
+    pub inputs_active: std::sync::atomic::AtomicUsize,
+    pub inputs_active_max: std::sync::atomic::AtomicUsize,
 }
 
 // ---- общие проверки ----
@@ -255,6 +286,22 @@ fn code_body<T: DeserializeOwned>(
         )),
         Err(e) => Err(ApiError::BadRequest(format!("некорректное тело: {e}"))),
     }
+}
+
+/// Ошибка чтения тела `POST /code/sync`: превышение предела — 413 с пределом, иное (обрыв
+/// соединения, ошибка кодирования) — 400 (ревью задачи 4).
+fn body_read_error(e: axum::Error, limit: usize) -> ApiError {
+    let inner = e.into_inner();
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
+    while let Some(err) = cur {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return ApiError::PayloadTooLarge(format!(
+                "тело запроса больше предела {limit} байт (манифест: code.max_files путей)"
+            ));
+        }
+        cur = err.source();
+    }
+    ApiError::BadRequest(format!("некорректное тело: {inner}"))
 }
 
 /// Предел тела `PUT /code/files` и `POST /code/impact`, байт.
@@ -822,11 +869,9 @@ pub async fn sync(
         None => None,
     };
     let limit = sync_body_max(&st.cfg.code);
-    let bytes = axum::body::to_bytes(body, limit).await.map_err(|_| {
-        ApiError::PayloadTooLarge(format!(
-            "тело запроса больше предела {limit} байт (манифест: code.max_files путей)"
-        ))
-    })?;
+    let bytes = axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|e| body_read_error(e, limit))?;
     let req: SyncReq = parse_body(&bytes)?;
     drop(bytes);
     let sc = match early {
@@ -1148,6 +1193,9 @@ pub async fn status(
 pub struct MapQuery {
     solution: Option<String>,
     budget_tokens: Option<usize>,
+    /// Файлов карты не больше (`1..=`[`MAP_FILES_PARAM_MAX`]): «Обзор» WebUI берёт 40 —
+    /// без лишних символов в ответе, рёбра — только между ними (ревью задачи 8).
+    files: Option<usize>,
     focus: Option<String>,
     area: Option<String>,
     format: Option<String>,
@@ -1267,9 +1315,11 @@ fn focus_ranks(inputs: &RankInputs, f: &Focus) -> Option<HashMap<i64, f64>> {
     Some(inputs.files.iter().map(|x| x.id).zip(r).collect())
 }
 
-/// Входы ранжирования решения: из кэша (тот же `etag` снимка — та же карта) или отдельной
-/// задачей чтения — одной на `(владелец, GUID, etag)` для всех ждущих запросов. Отмена ожидания
-/// (срок запроса) чтения не отменяет: дочитанное ляжет в кэш.
+/// Входы ранжирования решения: из кэша (тот же `etag` снимка — та же карта) или задачей
+/// чтения — одной на решение ([`CodeRuntime::loading`]). Чтение под другим `etag` (карта
+/// менялась) запрос дожидается и затем читает сам: во время длинной синхронизации полных чтений
+/// решения не больше одного одновременно. Отмена ожидания (срок запроса) чтения не отменяет:
+/// дочитанное ляжет в кэш.
 async fn cached_inputs(
     st: &AppState,
     sc: &MemScope,
@@ -1277,49 +1327,95 @@ async fn cached_inputs(
     etag: &str,
 ) -> Result<Arc<RankInputs>, ApiError> {
     let key = (sc.owner, guid.to_string());
-    if let Some(i) = st.code.cached(&key, etag) {
-        return Ok(i);
+    loop {
+        if let Some(i) = st.code.cached(&key, etag) {
+            return Ok(i);
+        }
+        match inputs_load(st, sc, &key, etag) {
+            (true, load) => return load.await.map_err(ApiError::Internal),
+            // чужой `etag`: дождаться (итог не нужен) и проверить кэш снова
+            (false, load) => {
+                let _ = load.await;
+            }
+        }
     }
-    inputs_load(st, sc, key, etag)
-        .await
-        .map_err(ApiError::Internal)
 }
 
-/// Задача чтения входов для `(key, etag)`: идущая или новая.
-fn inputs_load(st: &AppState, sc: &MemScope, key: SolutionKey, etag: &str) -> InputsLoad {
+/// Снимает запись чтения из [`CodeRuntime::loading`] и при панике задачи (ревью задачи 4):
+/// иначе упавшее чтение осталось бы «вечным», и решение не читалось бы до смены `etag`.
+struct LoadingGuard {
+    rt: Arc<CodeRuntime>,
+    key: SolutionKey,
+    etag: String,
+}
+
+impl Drop for LoadingGuard {
+    fn drop(&mut self) {
+        let mut loading = self
+            .rt
+            .loading
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if loading.get(&self.key).is_some_and(|(e, _)| *e == self.etag) {
+            loading.remove(&self.key);
+        }
+        #[cfg(feature = "test-hooks")]
+        self.rt
+            .hooks
+            .inputs_active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Идущая задача чтения входов решения `key`: `(true, …)` — под этим `etag` (новая или общая),
+/// `(false, …)` — под другим (её надо дождаться).
+fn inputs_load(st: &AppState, sc: &MemScope, key: &SolutionKey, etag: &str) -> (bool, InputsLoad) {
     use futures_util::FutureExt;
-    let lkey = (key, etag.to_string());
     let mut loading = st
         .code
         .loading
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if let Some(f) = loading.get(&lkey) {
-        return f.clone();
+    if let Some((e, f)) = loading.get(key) {
+        return (e == etag, f.clone());
     }
-    let (rt, db, k) = (st.code.clone(), sc.db.clone(), lkey.clone());
-    // задача снимает себя из `loading` под тем же замком — после вставки ниже
+    let guard = LoadingGuard {
+        rt: st.code.clone(),
+        key: key.clone(),
+        etag: etag.to_string(),
+    };
+    #[cfg(feature = "test-hooks")]
+    {
+        use std::sync::atomic::Ordering;
+        let h = &st.code.hooks;
+        let now = h.inputs_active.fetch_add(1, Ordering::SeqCst) + 1;
+        h.inputs_active_max.fetch_max(now, Ordering::SeqCst);
+    }
+    let db = sc.db.clone();
+    // задача снимает себя из `loading` охранником под тем же замком — после вставки ниже
     let task = tokio::spawn(async move {
+        let g = guard;
         #[cfg(feature = "test-hooks")]
         {
             use std::sync::atomic::Ordering;
-            rt.hooks.inputs_reads.fetch_add(1, Ordering::SeqCst);
-            let ms = rt.hooks.inputs_delay_ms.load(Ordering::SeqCst);
+            let h = &g.rt.hooks;
+            h.inputs_reads.fetch_add(1, Ordering::SeqCst);
+            let ms = h.inputs_delay_ms.load(Ordering::SeqCst);
             if ms > 0 {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
             }
+            if h.inputs_panic.swap(false, Ordering::SeqCst) {
+                panic!("тестовая паника чтения входов");
+            }
         }
-        let r = code_rank_inputs(&db, &k.0.1)
+        let r = code_rank_inputs(&db, &g.key.1)
             .await
             .map(Arc::new)
             .map_err(|e| e.to_string());
         if let Ok(inputs) = &r {
-            remember_if_unchanged(&rt, &db, k.0.clone(), &k.1, inputs).await;
+            remember_if_unchanged(&g.rt, &db, g.key.clone(), &g.etag, inputs).await;
         }
-        rt.loading
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&k);
+        drop(g);
         r
     });
     let load: InputsLoad = async move {
@@ -1328,8 +1424,8 @@ fn inputs_load(st: &AppState, sc: &MemScope, key: SolutionKey, etag: &str) -> In
     }
     .boxed()
     .shared();
-    loading.insert(lkey, load.clone());
-    load
+    loading.insert(key.clone(), (etag.to_string(), load.clone()));
+    (true, load)
 }
 
 /// Ранги файлов с фокусом: входы (кэш или общее чтение), слот ([`FOCUS_SLOTS`]) и PageRank —
@@ -1389,6 +1485,7 @@ async fn build_map(
     focus: Option<&Focus>,
     area: Option<&str>,
     edges: bool,
+    files_max: Option<usize>,
 ) -> Result<MapOut, ApiError> {
     let mut warnings = Vec::new();
     // фаза 1: файлы по рангу (без символов)
@@ -1410,7 +1507,9 @@ async fn build_map(
     let header = map_header(status, area, focused);
     // фаза 2: символы первых файлов; не все показаны — готово, иначе порция ×4
     let total = rows.len();
-    let mut want = total.min((budget / 8).max(MAP_FILES_FIRST));
+    // `files`: читаются и показываются только первые; остальные — числом в хвосте
+    let cap = files_max.map_or(total, |n| n.min(total));
+    let mut want = cap.min((budget / 8).max(MAP_FILES_FIRST));
     let mut loaded = 0;
     let packed = loop {
         let ids: Vec<i64> = rows[loaded..want].iter().map(|f| f.id).collect();
@@ -1436,10 +1535,10 @@ async fn build_map(
         })
         .await
         .map_err(|e| ApiError::aborted("упаковка карты", &e))?;
-        if packed.files_shown < loaded || loaded == total {
+        if packed.files_shown < loaded || loaded == cap {
             break packed;
         }
-        want = total.min(loaded.saturating_mul(4));
+        want = cap.min(loaded.saturating_mul(4));
     };
     let mut out_edges = Vec::new();
     if let (true, true, Some(s)) = (edges, packed.files_shown > 1, status) {
@@ -1483,7 +1582,7 @@ pub async fn map_text(
     area: Option<&str>,
 ) -> Result<(Packed, Vec<String>), ApiError> {
     let (s, mut warnings) = ranked_status(st, sc, guid).await?;
-    let m = build_map(st, sc, guid, s.as_ref(), budget, focus, area, false).await?;
+    let m = build_map(st, sc, guid, s.as_ref(), budget, focus, area, false, None).await?;
     warnings.extend(m.warnings);
     Ok((m.packed, warnings))
 }
@@ -1508,7 +1607,7 @@ fn shown_json(rows: &[MapFileRow], p: &Packed) -> Vec<Value> {
         .collect()
 }
 
-/// `GET /code/map?solution=&budget_tokens=&focus=&area=&format=md|json`.
+/// `GET /code/map?solution=&budget_tokens=&focus=&area=&files=&format=md|json`.
 pub async fn map(
     State(st): State<AppState>,
     p: Principal,
@@ -1534,6 +1633,13 @@ pub async fn map(
         .filter(|s| !s.is_empty())
         .map(|a| path_of(a, "area"))
         .transpose()?;
+    let files_max = q.files;
+    if files_max.is_some_and(|n| !(1..=MAP_FILES_PARAM_MAX).contains(&n)) {
+        return Err(unprocessable(format!(
+            "files: от 1 до {MAP_FILES_PARAM_MAX}"
+        )));
+    }
+    let files_tag = files_max.map(|n| n.to_string()).unwrap_or_default();
     let json_fmt = match q.format.as_deref().map(str::trim) {
         None | Some("") | Some("md") => false,
         Some("json") => true,
@@ -1552,6 +1658,7 @@ pub async fn map(
             &budget.to_string(),
             area.as_deref().unwrap_or(""),
             if json_fmt { "json" } else { "md" },
+            &files_tag,
         ])
     });
     if let Some(e) = &etag
@@ -1568,6 +1675,7 @@ pub async fn map(
         focus.as_ref(),
         area.as_deref(),
         json_fmt,
+        files_max,
     )
     .await?;
     warnings.extend(m.warnings.iter().cloned());
@@ -1661,20 +1769,9 @@ pub async fn files(
     let offset = q.offset.unwrap_or(0);
     let g = guid(&sc);
     let warnings = ensure_ranked(&st, &sc, &g).await;
-    let all: Vec<MapFileRow> = store_files(&sc, &g, None)
-        .await?
-        .into_iter()
-        .filter(|f| lang.is_none_or(|l| f.lang == l))
-        .filter(|f| {
-            needle
-                .as_deref()
-                .is_none_or(|n| f.path.to_lowercase().contains(n))
-        })
-        .collect();
-    let page: Vec<Value> = all
+    let (rows, total) = code_files_page(&sc.db, &g, lang, needle.as_deref(), offset, limit).await?;
+    let page: Vec<Value> = rows
         .iter()
-        .skip(offset)
-        .take(limit)
         .map(|f| {
             json!({"id": f.id, "path": f.path, "lang": f.lang, "rank": f.rank,
                    "symbols": f.symbol_count})
@@ -1682,7 +1779,7 @@ pub async fn files(
         .collect();
     Ok(Json(json!({
         "files": page,
-        "total": all.len(),
+        "total": total,
         "offset": offset,
         "limit": limit,
         "warnings": warnings,
@@ -1774,13 +1871,32 @@ fn cap_knowledge(items: &mut Vec<Value>) -> usize {
     left
 }
 
+/// Знание выдачи: `{path, id, kind, title, state, space, symbol?}`; `space` — `Id`
+/// пространства записи (как в `GET /spaces`; ссылка WebUI на знание из Knowledge участника).
 fn knowledge_json(path: &str, it: &RefItem) -> Value {
     let mut v = json!({"path": path, "id": it.id, "kind": it.kind, "title": it.title,
-                       "state": it.state});
+                       "state": it.state, "space": it.space.map(|s| s.to_string())});
     if let Some(s) = &it.symbol {
         v["symbol"] = json!(s);
     }
     v
+}
+
+/// Схлопывание знаний (ревью задачи 8): у записи со ссылками и на файл, и на его символ
+/// остаётся строка символа — файловая той же записи и пути снимается; повтор строки — один раз.
+/// Порядок сохраняется.
+fn collapse_knowledge(items: Vec<(String, RefItem)>) -> Vec<(String, RefItem)> {
+    let with_symbol: HashSet<(String, String)> = items
+        .iter()
+        .filter(|(_, it)| it.symbol.is_some())
+        .map(|(p, it)| (p.clone(), it.id.clone()))
+        .collect();
+    let mut seen: HashSet<(String, String, Option<String>)> = HashSet::new();
+    items
+        .into_iter()
+        .filter(|(p, it)| it.symbol.is_some() || !with_symbol.contains(&(p.clone(), it.id.clone())))
+        .filter(|(p, it)| seen.insert((p.clone(), it.id.clone(), it.symbol.clone())))
+        .collect()
 }
 
 /// Символ по `{id}` (число) или по постоянному адресу `путь#qual` (URL-кодированному).
@@ -1822,11 +1938,15 @@ pub async fn symbol(
         .ok_or_else(|| ApiError::CodeSymbolNotFound(format!("символа {id} нет в карте")))?;
     let path = card.symbol.path.clone();
     let dbs = report_dbs(&st, &p, &sc).await?;
-    let mut knowledge: Vec<Value> = knowledge_of(&dbs, &g, &path)
+    let own: Vec<(String, RefItem)> = knowledge_of(&dbs, &g, &path)
         .await?
-        .iter()
+        .into_iter()
         .filter(|it| it.symbol.as_deref().is_none_or(|s| s == card.symbol.qual))
-        .map(|it| knowledge_json(&path, it))
+        .map(|it| (path.clone(), it))
+        .collect();
+    let mut knowledge: Vec<Value> = collapse_knowledge(own)
+        .iter()
+        .map(|(p, it)| knowledge_json(p, it))
         .collect();
     let knowledge_left = cap_knowledge(&mut knowledge);
     let mut sym = json!(card.symbol);
@@ -1901,24 +2021,28 @@ pub async fn impact(
             .insert(s.qual.as_str());
     }
     let dbs = report_dbs(&st, &p, &sc).await?;
-    let mut knowledge = Vec::new();
+    let mut found: Vec<(String, RefItem)> = Vec::new();
     for (path, _) in &files {
         let all = rows.paths_only.contains(path);
         let quals = affected.get(path.as_str());
         if !all && quals.is_none() {
             continue;
         }
-        for it in &knowledge_of(&dbs, &g, path).await? {
+        for it in knowledge_of(&dbs, &g, path).await? {
             let take = all
                 || it
                     .symbol
                     .as_deref()
                     .is_none_or(|s| quals.is_some_and(|q| q.contains(s)));
             if take {
-                knowledge.push(knowledge_json(path, it));
+                found.push((path.clone(), it));
             }
         }
     }
+    let mut knowledge: Vec<Value> = collapse_knowledge(found)
+        .iter()
+        .map(|(p, it)| knowledge_json(p, it))
+        .collect();
     let mut body = json!({
         "changed": rows.changed,
         "removed": rows.removed,

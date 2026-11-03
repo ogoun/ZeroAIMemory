@@ -2335,3 +2335,140 @@ async fn mcp_code_markdown_lists_capped() {
     .json();
     assert_eq!(j["knowledge"].as_array().unwrap().len(), 28, "{j}");
 }
+
+/// Ревью задачи 7: участник решения читает карту через `memory_code` (права маршрутов REST);
+/// после отзыва доступа — 403 ошибкой инструмента, отозванный токен — 401 у `/mcp`.
+#[tokio::test]
+async fn mcp_code_member_revoked_access_and_token() {
+    let w = code_world("member").await;
+    let a = &w.a;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    assert_eq!(register(a, &b_tok).await, StatusCode::ACCEPTED);
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/approve"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for args in [
+        json!({"action": "map"}),
+        json!({"action": "symbol", "query": "a.rs#foo"}),
+        json!({"action": "refs", "query": "foo"}),
+        json!({"action": "impact", "path": "a.rs"}),
+    ] {
+        let o = ok(a, &b_tok, &SOL, "memory_code", args.clone()).await;
+        assert!(o.text.contains("a.rs"), "{args}: {}", o.text);
+    }
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/revoke"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let o = tool(a, &b_tok, &SOL, "memory_code", json!({"action": "map"})).await;
+    assert!(o.is_error && o.text.contains("403"), "{}", o.text);
+    // отзыв токена: `/mcp` отвечает 401 до вызова инструмента
+    let uid: zam_core::Id = b_id.parse().unwrap();
+    for t in a.st.system.list_tokens(uid).await.unwrap() {
+        a.st.system.revoke_token(t.id).await.unwrap();
+    }
+    let r = rpc_raw(
+        a,
+        Some(&format!("Bearer {b_tok}")),
+        &SOL,
+        "tools/call",
+        json!({"name": "memory_code", "arguments": {"action": "map"}}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+}
+
+/// Ревью задачи 7: фокус дольше срока — карта без фокуса с `focus rank timeout`, не ошибка;
+/// тело `impact` больше `code.max_request_bytes` — 413 ошибкой инструмента.
+#[tokio::test]
+async fn mcp_code_focus_timeout_and_413() {
+    let w = code_world_with("focus-413", |c| {
+        c.code.rank_timeout_ms = 0;
+        c.code.max_request_bytes = 4096;
+    })
+    .await;
+    let a = &w.a;
+    // ранги посчитаны (фокусу нужны входы, срок фокуса — не меньше 200 мс)
+    for _ in 0..200 {
+        let r = a
+            .t(
+                Method::GET,
+                &format!("/api/v1/code/status?solution={G}"),
+                None,
+            )
+            .await;
+        if r.json()["rank_state"] == "ok" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    a.st.code
+        .hooks
+        .focus_delay_ms
+        .store(400, std::sync::atomic::Ordering::SeqCst);
+    let o = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "map", "focus": {"paths": ["b.rs"]}}),
+    )
+    .await;
+    assert!(
+        o.text.contains("> warning: focus rank timeout"),
+        "{}",
+        o.text
+    );
+    let files: Vec<Value> = (0..120)
+        .map(|i| json!({"path": format!("src/very/long/path/number/{i:03}/file.rs")}))
+        .collect();
+    let o = tool(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "impact", "files": files}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("413"), "{}", o.text);
+}
+
+/// Ревью задачи 7: `refs` популярного имени в Markdown — до 20 файлов и «… ещё N».
+#[tokio::test]
+async fn mcp_code_refs_markdown_capped() {
+    let w = code_world("refs-cap").await;
+    let a = &w.a;
+    let users: Vec<Value> = (0..30)
+        .map(|i| {
+            code_file(
+                &format!("u{i:02}.rs"),
+                100 + i,
+                vec![code_sym(&format!("user_{i:02}"), "function", 1)],
+                &[("foo", 1)],
+            )
+        })
+        .collect();
+    code_put(a, users).await;
+    let o = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "refs", "query": "a.rs#foo"}),
+    )
+    .await
+    .text;
+    let lines = o.lines().filter(|l| l.starts_with("- ")).count();
+    assert_eq!(lines, 20, "{o}");
+    assert!(o.contains("файлов 31:"), "{o}");
+    assert!(o.contains("… ещё 11 (полный список — format: json)"), "{o}");
+}

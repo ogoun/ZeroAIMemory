@@ -17,7 +17,9 @@ use zam_store::code::{
     code_rank_inputs, code_status, code_store_ranks, code_symbol, code_symbols_named,
     code_symbols_search, code_sync_manifest,
 };
-use zam_store::code::{code_central, code_map_files, code_map_symbols, code_snapshot};
+use zam_store::code::{
+    code_central, code_files_page, code_map_files, code_map_symbols, code_snapshot,
+};
 use zam_store::file_refs::{ChangedFile, SYMBOL_CHANGED, SYMBOL_REMOVED, note_refs};
 use zam_store::file_refs::{REFS_MAX, path_owners, symbols_uploaded};
 use zam_store::{
@@ -2424,4 +2426,120 @@ async fn snapshot_light_read() {
     let s = code_snapshot(&db, G).await.unwrap().unwrap();
     assert_eq!(s.files, 0);
     assert!(code_status(&db, G).await.unwrap().is_none());
+}
+
+/// Ревью задачи 4, O4: страница таблицы файлов — язык и пагинация в SQL, подстрока пути без
+/// учёта регистра Unicode (кириллица), `total` — все подходящие.
+#[tokio::test]
+async fn files_page_sql_filter_and_unicode_needle() {
+    let (db, _) = setup("files-page").await;
+    let m = meta("box");
+    let files = vec![
+        upload(
+            "src/Модуль/a.rs",
+            &h('1'),
+            vec![sym("a", "a", &bh('1'), 1)],
+            vec![],
+        ),
+        upload(
+            "src/модуль/b.py",
+            &h('2'),
+            vec![sym("b", "b", &bh('2'), 1)],
+            vec![],
+        ),
+        upload(
+            "src/other/c.rs",
+            &h('3'),
+            vec![sym("c", "c", &bh('3'), 1)],
+            vec![],
+        ),
+        upload(
+            "src/other/d.rs",
+            &h('4'),
+            vec![sym("d", "d", &bh('4'), 1)],
+            vec![],
+        ),
+    ];
+    code_put_files(&db, G, &m, files, &[]).await.unwrap();
+    let paths = |rows: &[zam_store::code::MapFileRow]| -> Vec<String> {
+        let mut v: Vec<String> = rows.iter().map(|f| f.path.clone()).collect();
+        v.sort();
+        v
+    };
+    let (all, total) = code_files_page(&db, G, None, None, 0, 10).await.unwrap();
+    assert_eq!((all.len(), total), (4, 4));
+    let (rs, total) = code_files_page(&db, G, Some(Lang::Rust), None, 1, 2)
+        .await
+        .unwrap();
+    assert_eq!((rs.len(), total), (2, 3));
+    let (none, total) = code_files_page(&db, G, Some(Lang::Go), None, 0, 2)
+        .await
+        .unwrap();
+    assert_eq!((none.len(), total), (0, 0));
+    let (cyr, total) = code_files_page(&db, G, None, Some("модуль"), 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(paths(&cyr), ["src/Модуль/a.rs", "src/модуль/b.py"]);
+    let (one, total) = code_files_page(&db, G, Some(Lang::Rust), Some("модуль"), 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        (paths(&one), total),
+        (vec!["src/Модуль/a.rs".to_string()], 1)
+    );
+    let (tail, total) = code_files_page(&db, G, None, Some("other"), 1, 5)
+        .await
+        .unwrap();
+    assert_eq!((tail.len(), total), (1, 2));
+    let (past, total) = code_files_page(&db, G, None, Some("src"), 10, 5)
+        .await
+        .unwrap();
+    assert_eq!((past.len(), total), (0, 4));
+}
+
+/// Ревью задачи 4, O2: память входов ранжирования (кэш фокуса сервера) — 50 000 символов
+/// (2 500 файлов × 20 символов × 40 ссылок) и оценка на предел карты. Числа — в журнал этапа:
+/// `cargo test --release -p zam-store --test code_map -- --ignored --nocapture inputs_memory`.
+#[tokio::test]
+#[ignore = "замер"]
+async fn inputs_memory_50k_symbols() {
+    let (db, _) = setup("inputs-mem").await;
+    let m = meta("box");
+    let names: Vec<String> = (0..60_000).map(|i| format!("name{i}")).collect();
+    for batch in 0..5usize {
+        let files: Vec<FileUpload> = (0..500usize)
+            .map(|k| {
+                let f = batch * 500 + k;
+                let syms = (0..20usize)
+                    .map(|s| {
+                        let n = &names[(f * 20 + s) % names.len()];
+                        sym(
+                            n,
+                            &format!("T{f}::{n}"),
+                            &format!("{:016x}", f * 20 + s),
+                            s as u32 * 3 + 1,
+                        )
+                    })
+                    .collect();
+                let refs = (0..40usize)
+                    .map(|r| rf(&names[(f * 7 + r * 13) % names.len()], 1))
+                    .collect();
+                upload(&format!("src/d{}/f{f}.rs", f % 100), &h('1'), syms, refs)
+            })
+            .collect();
+        code_put_files(&db, G, &m, files, &[]).await.unwrap();
+    }
+    let inputs = code_rank_inputs(&db, G).await.unwrap();
+    let syms: usize = inputs.files.iter().map(|f| f.defs.len()).sum();
+    let refs: usize = inputs.files.iter().map(|f| f.refs.len()).sum();
+    let b = inputs.heap_bytes();
+    eprintln!(
+        "входы: файлов {}, символов {syms}, ссылок {refs}: {:.1} МиБ ({:.0} байт на символ с его долей ссылок)",
+        inputs.files.len(),
+        b as f64 / 1048576.0,
+        b as f64 / syms as f64
+    );
+    assert_eq!(syms, 50_000);
+    assert!(b > 0);
 }

@@ -1589,3 +1589,197 @@ async fn sync_header_checks_rights_before_body() {
         "лишнее поле элемента манифеста",
     );
 }
+
+/// Ревью задачи 4: паника чтения входов не оставляет «вечную загрузку» — следующий запрос с
+/// фокусом читает входы заново и получает карту с фокусом.
+#[tokio::test]
+async fn focus_inputs_panic_does_not_stick() {
+    use std::sync::atomic::Ordering;
+    let a = world("focus-panic", |c| c.code.rank_timeout_ms = 5000).await;
+    put(
+        &a,
+        vec![
+            file("src/a.rs", 1, vec![func("alpha_function", 1)], &[]),
+            file(
+                "src/b.rs",
+                2,
+                vec![func("beta_function", 1)],
+                &[("alpha_function", "call", 3)],
+            ),
+        ],
+    )
+    .await;
+    wait_ranked(&a).await;
+    let hooks = &a.st.code.hooks;
+    a.st.code.forget_inputs();
+    hooks.inputs_panic.store(true, Ordering::SeqCst);
+    let focus = enc(&json!({"paths": ["src/b.rs"]}).to_string());
+    let uri = format!("/api/v1/code/map?solution={G}&format=json&focus={focus}");
+    let r = get(&a, &uri).await;
+    ok(&r, StatusCode::INTERNAL_SERVER_ERROR, "паника чтения");
+    let m = get_ok(&a, &uri).await;
+    assert!(m["header"].as_str().unwrap().contains("с фокусом"), "{m}");
+    assert_eq!(hooks.inputs_reads.load(Ordering::SeqCst), 2);
+}
+
+/// Ревью задачи 4: запросы с фокусом во время синхронизации (снимок меняется, `etag` другой)
+/// не читают входы решения параллельно — второй ждёт первое чтение и читает сам.
+#[tokio::test]
+async fn focus_inputs_one_read_per_solution_while_map_changes() {
+    use std::sync::atomic::Ordering;
+    let a = world("focus-flight", |c| c.code.rank_timeout_ms = 10_000).await;
+    put(
+        &a,
+        vec![
+            file("src/a.rs", 1, vec![func("alpha_function", 1)], &[]),
+            file(
+                "src/b.rs",
+                2,
+                vec![func("beta_function", 1)],
+                &[("alpha_function", "call", 3)],
+            ),
+        ],
+    )
+    .await;
+    wait_ranked(&a).await;
+    let hooks = &a.st.code.hooks;
+    a.st.code.forget_inputs();
+    hooks.inputs_delay_ms.store(800, Ordering::SeqCst);
+    let focus = enc(&json!({"paths": ["src/b.rs"]}).to_string());
+    let extra = format!("&focus={focus}");
+    let (m1, m2) = tokio::join!(map_json(&a, &extra), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        put(
+            &a,
+            vec![file("src/c.rs", 3, vec![func("gamma_function", 1)], &[])],
+        )
+        .await;
+        map_json(&a, &extra).await
+    });
+    for m in [&m1, &m2] {
+        assert!(m["header"].as_str().unwrap().contains("с фокусом"), "{m}");
+    }
+    assert!(paths_of(&m2).contains(&"src/c.rs".to_string()), "{m2}");
+    // второе — своё чтение под новым etag или кэш, заполненный пересчётом рангов
+    let reads = hooks.inputs_reads.load(Ordering::SeqCst);
+    assert!((1..=2).contains(&reads), "чтений {reads}");
+    assert_eq!(
+        hooks.inputs_active_max.load(Ordering::SeqCst),
+        1,
+        "чтения решения не параллельны"
+    );
+}
+
+/// Ревью задачи 4: обрыв тела `POST /code/sync` (не превышение предела) — 400, не 413.
+#[tokio::test]
+async fn sync_body_stream_error_is_400() {
+    use axum::body::{Body, Bytes};
+    let a = world("sync-body-err", |_| {}).await;
+    let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+        Ok(Bytes::from_static(b"{\"solution\":")),
+        Err(std::io::Error::other("обрыв соединения")),
+    ];
+    let req = common::api::req(Method::POST, "/api/v1/code/sync", Some(&json!({})))
+        .header("authorization", format!("Bearer {}", a.token))
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap();
+    let r = a.send(req).await;
+    ok(&r, StatusCode::BAD_REQUEST, "обрыв тела");
+}
+
+/// Ревью задачи 8: у записи со ссылками и на файл, и на его символ — одна строка знания
+/// (символьная) в карточке и во влиянии; у знаний — `space` (id пространства записи).
+#[tokio::test]
+async fn knowledge_collapsed_per_record_with_space() {
+    let w = linked("collapse").await;
+    let both =
+        w.a.note(
+            G,
+            "О foo и файле",
+            "---\nrefs: [\"a.rs\", \"a.rs#foo\"]\n---\nтекст о коде\n",
+        )
+        .await;
+    let both_id = both["id"].as_str().unwrap().to_string();
+    let space = both["space_id"].as_str().unwrap().to_string();
+    let card = get_ok(
+        &w.a,
+        &format!("/api/v1/code/symbols/{}?solution={G}", enc("a.rs#foo")),
+    )
+    .await;
+    let ids = knowledge_ids(&card);
+    assert_eq!(
+        ids.iter().filter(|i| **i == both_id).count(),
+        1,
+        "одна строка: {card}"
+    );
+    let row = card["knowledge"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"].as_str().unwrap().ends_with(&both_id))
+        .unwrap();
+    assert_eq!(row["symbol"], "foo", "строка символа: {card}");
+    for k in card["knowledge"].as_array().unwrap() {
+        assert_eq!(k["space"], space.as_str(), "{card}");
+    }
+    let j = impact(
+        &w.a,
+        json!([{"path": "a.rs", "symbols": [
+            {"qual": "foo", "body_hash": bh(99)},
+            {"qual": "bar", "body_hash": bh(10)},
+            {"qual": "baz", "body_hash": bh(20)},
+        ]}]),
+    )
+    .await
+    .json();
+    let ids = knowledge_ids(&j);
+    assert_eq!(ids.iter().filter(|i| **i == both_id).count(), 1, "{j}");
+    assert!(
+        ids.contains(&w.insight),
+        "файловое знание другой записи: {j}"
+    );
+    assert!(j["knowledge"][0]["space"].is_string(), "{j}");
+}
+
+/// Ревью задачи 8: «Обзор» WebUI — `files=N`: показано не больше N файлов (остальные — в
+/// `files_left`), рёбра только между ними; вне `1..=1000` — 422.
+#[tokio::test]
+async fn map_files_param_limits_files_and_edges() {
+    let a = world("map-files", |c| c.code.rank_timeout_ms = 5000).await;
+    let files: Vec<Value> = (0..6u64)
+        .map(|i| {
+            let callee = format!("fn_{}", (i + 1) % 6);
+            file(
+                &format!("src/f{i}.rs"),
+                10 + i,
+                vec![func(&format!("fn_{i}"), 1)],
+                &[(callee.as_str(), "call", 1)],
+            )
+        })
+        .collect();
+    put(&a, files).await;
+    wait_ranked(&a).await;
+    let m = map_json(&a, "&files=3").await;
+    let shown = paths_of(&m);
+    assert_eq!(shown.len(), 3, "{m}");
+    assert_eq!(m["files_shown"], 3, "{m}");
+    assert_eq!(m["files_left"], 3, "{m}");
+    let ids: Vec<&Value> = m["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| &f["id"])
+        .collect();
+    for e in m["edges"].as_array().unwrap() {
+        assert!(ids.contains(&&e["src"]) && ids.contains(&&e["dst"]), "{m}");
+    }
+    let all = map_json(&a, "").await;
+    assert_eq!(paths_of(&all)[..3], shown[..], "те же первые по рангу");
+    for bad in ["0", "1001"] {
+        unprocessable(
+            &get(&a, &format!("/api/v1/code/map?solution={G}&files={bad}")).await,
+            "files",
+            bad,
+        );
+    }
+}
