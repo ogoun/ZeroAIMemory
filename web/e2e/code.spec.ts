@@ -303,11 +303,13 @@ test('code_overview_cached_between_tabs', async ({ page }) => {
   await page.getByRole('tab', { name: 'Обзор' }).click();
   await expect(svg).toBeVisible({ timeout: 30_000 });
   expect(maps).toBe(1);
-  // туда и обратно: тот же снимок — без запроса, диаграмма снова нарисована
+  const first = await svg.getAttribute('id');
+  // туда и обратно: тот же снимок — без запроса и без нового mermaid.render (SVG из кэша: тот же id)
   await page.getByRole('tab', { name: 'Файлы' }).click();
   await expect(page.getByRole('table', { name: 'Файлы карты' })).toBeVisible();
   await page.getByRole('tab', { name: 'Обзор' }).click();
   await expect(svg).toBeVisible({ timeout: 30_000 });
+  expect(await svg.getAttribute('id')).toBe(first);
   // карточка символа и назад к карте — тоже из кэша
   await page.goto(codeUrl(await admin(page), CODE_REF));
   await expect(page.getByRole('article', { name: 'Карточка символа' })).toBeVisible();
@@ -320,6 +322,54 @@ test('code_overview_cached_between_tabs', async ({ page }) => {
   await page.getByRole('tab', { name: 'Обзор' }).click();
   await expect(svg).toBeVisible({ timeout: 30_000 });
   expect(maps).toBe(2);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('code_overview_rereads_status_new_snapshot', async ({ page }) => {
+  const problems = watch(page);
+  let maps = 0;
+  let statuses = 0;
+  // «фоновая синхронизация»: после первого «Обзора» сервер отдаёт другой снимок
+  let synced = false;
+  const NEW_COMMIT = 'feedface00000000000000000000000000000000';
+  page.on('request', (r) => {
+    if (new URL(r.url()).pathname.endsWith('/api/v1/code/map')) maps++;
+  });
+  const isStatus = (u: URL) => u.pathname.endsWith('/api/v1/code/status');
+  await page.route(isStatus, async (route) => {
+    statuses++;
+    const resp = await route.fetch();
+    if (!synced) return route.fulfill({ response: resp });
+    const body = (await resp.json()) as Record<string, unknown>;
+    return route.fulfill({ json: { ...body, etag: `${body.etag}-synced`, commit: NEW_COMMIT } });
+  });
+  await openCode(page);
+  const svg = page.locator('.code-overview .mermaid-diagram svg').first();
+  await page.getByRole('tab', { name: 'Обзор' }).click();
+  await expect(svg).toBeVisible({ timeout: 30_000 });
+  expect(maps).toBe(1);
+  // показ «Обзора» перечитывает состояние; снимок тот же — карта из кэша
+  await expect.poll(() => statuses).toBe(2);
+  await page.getByRole('tab', { name: 'Файлы' }).click();
+  await page.getByRole('tab', { name: 'Обзор' }).click();
+  await expect.poll(() => statuses).toBe(3);
+  await expect(svg).toBeVisible({ timeout: 30_000 });
+  expect(maps).toBe(1);
+  // новый снимок: состояние обновлено, «Обзор» запрошен заново
+  synced = true;
+  await page.getByRole('tab', { name: 'Файлы' }).click();
+  await page.getByRole('tab', { name: 'Обзор' }).click();
+  await expect(statusBox(page)).toContainText(`${CODE_BRANCH}@${NEW_COMMIT.slice(0, 7)}`);
+  await expect.poll(() => maps).toBe(2);
+  await expect(svg).toBeVisible({ timeout: 30_000 });
+  // возврат с карточки тоже перечитывает состояние
+  const before = statuses;
+  await page.goto(codeUrl(await admin(page), CODE_REF));
+  await expect(page.getByRole('article', { name: 'Карточка символа' })).toBeVisible();
+  await page.getByRole('link', { name: '← К карте' }).click();
+  await expect(page.getByRole('tablist', { name: 'Вид карты' })).toBeVisible();
+  await expect.poll(() => statuses).toBe(before + 1);
+  await page.unroute(isStatus);
   expect(problems, problems.join('\n')).toEqual([]);
 });
 

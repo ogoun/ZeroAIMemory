@@ -50,13 +50,27 @@ function entityChar(m: string, dec?: string, hex?: string, name?: string): strin
 }
 
 /**
- * Сущности подписей (`#35;`, `#quot;` исходника Mermaid превращает в `&#35;`, `&quot;`) при
- * `htmlLabels: false` попадают в `<text>` SVG буквально («a&#58;b» вместо «a:b»), а перенос строк
- * Mermaid режет их и между `<tspan>` (`&#9` | `1;`). Расшифровка — по всему тексту каждого
- * `<text>`: символ — в узел, где сущность начинается, её остаток из следующих узлов убирается.
- * Меняются только текстовые узлы (`nodeValue`): разметка не появляется.
+ * Диаграммы (`aria-roledescription` SVG), у которых Mermaid 12 при `htmlLabels: false` оставляет
+ * сущности подписей буквально. Остальные (sequence, pie, journey, timeline, quadrantChart,
+ * gitGraph, xychart, packet, radar) расшифровывают их сами — повторная расшифровка исказила бы
+ * `#38;amp#59;` («&amp;» → «&»). Список — по пробе `mermaid.render` всех типов (журнал этапа M5.6,
+ * задача 9B); новый тип вне списка не трогается.
+ */
+const LITERAL_ENTITIES = new Set([
+  'flowchart-v2', 'stateDiagram', 'classDiagram', 'er', 'mindmap', 'block', 'kanban', 'requirement', 'c4',
+  'architecture',
+]);
+
+/**
+ * Сущности подписей (`#35;`, `#quot;` исходника Mermaid превращает в `&#35;`, `&quot;`) у типов
+ * {@link LITERAL_ENTITIES} попадают в `<text>` SVG буквально («a&#58;b» вместо «a:b»), а перенос
+ * строк режет их и между `<tspan>` (`&#9` | `1;`). Расшифровка — один проход по всему тексту
+ * каждого `<text>`: символ — в узел, где сущность начинается, её остаток из следующих узлов
+ * убирается. Меняются только текстовые узлы (`data`): разметка не появляется.
  */
 function decodeLabels(root: Element): void {
+  const role = root.querySelector('svg')?.getAttribute('aria-roledescription') ?? '';
+  if (!LITERAL_ENTITIES.has(role)) return;
   for (const el of root.querySelectorAll('text')) {
     const nodes: Text[] = [];
     const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
@@ -98,19 +112,28 @@ function decodeLabels(root: Element): void {
   }
 }
 
+export interface RenderOpts {
+  theme?: Theme;
+  /**
+   * Готовые SVG по `тема + исходник` (кэш вызывающего, «Обзор» карты кода): найденный —
+   * вставляется без `mermaid.render`, нарисованный — кладётся. Строки — уже очищенный DOMPurify
+   * результат этого модуля и живут только в памяти страницы.
+   */
+  cache?: Map<string, string>;
+}
+
 /**
  * Заменяет каждый `pre.mermaid-src` внутри `root` диаграммой; при ошибке — исходник с пометкой.
  * `theme` — явная тема (печать — `default`); без неё — тема страницы. Вызовы идут по очереди:
  * каждый ставит свою тему, поэтому после печатного вызова экран снова рисуется в теме страницы.
  */
-export function renderMermaid(root: HTMLElement, o: { theme?: Theme } = {}): Promise<void> {
-  const run = queue.then(() => render(root, o.theme ?? pageTheme()));
+export function renderMermaid(root: HTMLElement, o: RenderOpts = {}): Promise<void> {
+  const run = queue.then(() => render(root, o.theme ?? pageTheme(), o.cache));
   queue = run.catch(() => undefined);
   return run;
 }
 
-async function render(root: HTMLElement, want: Theme): Promise<void> {
-  init(want);
+async function render(root: HTMLElement, want: Theme, cache?: Map<string, string>): Promise<void> {
   for (const pre of root.querySelectorAll<HTMLElement>('pre.mermaid-src')) {
     // повторный вызов для того же документа (смена bind:this) не рендерит блок дважды
     if (!pre.isConnected || pre.dataset.zamMermaid) continue;
@@ -118,11 +141,19 @@ async function render(root: HTMLElement, want: Theme): Promise<void> {
     const src = pre.textContent ?? '';
     const box = document.createElement('div');
     box.className = 'mermaid-diagram';
+    const key = `${want}
+${src}`;
     try {
-      const { svg } = await mermaid.render(`zam-mermaid-${++seq}`, src);
-      box.innerHTML = sanitize(svg);
-      if (!box.querySelector('svg')) throw new Error('пустой результат');
-      decodeLabels(box);
+      const ready = cache?.get(key);
+      if (ready) box.innerHTML = ready;
+      else {
+        init(want);
+        const { svg } = await mermaid.render(`zam-mermaid-${++seq}`, src);
+        box.innerHTML = sanitize(svg);
+        if (!box.querySelector('svg')) throw new Error('пустой результат');
+        decodeLabels(box);
+        cache?.set(key, box.innerHTML);
+      }
       box.setAttribute('role', 'img');
       box.setAttribute('aria-label', 'Диаграмма');
       pre.replaceWith(box);

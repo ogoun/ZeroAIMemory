@@ -3,9 +3,10 @@
   // `flowchart` первых 40 файлов по рангу и до 120 рёбер между ними (`overviewMermaid`), рисует
   // `hydrate/mermaid.ts` (strict + DOMPurify). Свой ленивый чанк: страница «Код» без вкладки
   // «Обзор» его не тянет. Новое решение — новый экземпляр (`{#key}` в CodeView). Ответ карты —
-  // из кэша `codeOverviewCached` по версии снимка: переключение вкладок сервер не запрашивает.
-  // Печать: при тёмной теме ОС рядом рисуется светлая копия диаграммы (`default`, только для
-  // печати) — экранная в теме `dark` на белом листе нечитаема.
+  // и готовые SVG — из кэша `codeOverviewCached` по версии снимка: переключение вкладок сервер не
+  // запрашивает и диаграмму заново не рисует. Печать: при тёмной теме ОС рядом рисуется светлая
+  // копия диаграммы (`default`, только для печати; экранная `dark` на белом листе нечитаема) — в
+  // простое браузера после экранной; до её готовности печатается экранная.
   import { tick } from 'svelte';
   import { ApiError, errorText } from '../lib/api';
   import { OVERVIEW_EDGES, OVERVIEW_FILES, codeOverviewCached, overviewMermaid } from '../lib/code';
@@ -24,15 +25,24 @@
   let error = $state('');
   let box = $state<HTMLElement | null>(null);
   let printBox = $state<HTMLElement | null>(null);
-  /** Тёмная тема ОС на момент показа — нужна светлая печатная копия. */
+  /** Печатная копия нарисована: экранная тёмная в печать не идёт. */
+  let printReady = $state(false);
+  /**
+   * Тёмная тема ОС — на момент монтирования (как `pageTheme()` hydrate/mermaid.ts: смена темы ОС
+   * при открытом «Обзоре» не перерисовывает диаграмму; общий долг).
+   */
   const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  let svgs = new Map<string, string>();
 
   $effect(() => {
     let live = true;
-    codeOverviewCached(user, space, version)
+    const entry = codeOverviewCached(user, space, version);
+    svgs = entry.svgs;
+    entry.data
       .then((m) => {
         if (!live) return;
         const src = overviewMermaid(m.files, m.edges);
+        printReady = false;
         overview = {
           src,
           shown: Math.min(m.files.length, OVERVIEW_FILES),
@@ -50,8 +60,12 @@
     };
   });
 
-  // диаграмма — после вставки исходника в DOM; модуль Mermaid — ленивый чанк; печатная копия —
-  // после экранной (очередь `renderMermaid`), своей темой
+  /** В простое браузера (запасной путь — таймер): печатная копия не задерживает экранную. */
+  const idle = (f: () => void) =>
+    'requestIdleCallback' in window ? requestIdleCallback(f, { timeout: 2000 }) : setTimeout(f, 200);
+
+  // диаграмма — после вставки исходника в DOM; модуль Mermaid — ленивый чанк; готовые SVG — из
+  // кэша записи; печатная копия — после экранной, своей темой
   $effect(() => {
     const b = box;
     const pb = printBox;
@@ -59,8 +73,13 @@
     tick()
       .then(() => import('../lib/hydrate/mermaid'))
       .then(async (m) => {
-        await m.renderMermaid(b);
-        if (pb) await m.renderMermaid(pb, { theme: 'default' });
+        await m.renderMermaid(b, { cache: svgs });
+        if (pb)
+          idle(() =>
+            m
+              .renderMermaid(pb, { theme: 'default', cache: svgs })
+              .then(() => (printReady = !!pb.querySelector('.mermaid-diagram'))),
+          );
       })
       .catch((e) => (error = errorText(e)));
   });
@@ -72,14 +91,17 @@
     Файлы по рангу: показано {overview.shown} из {overview.total}, связей: {overview.edges} (первые
     {OVERVIEW_FILES} файлов и до {OVERVIEW_EDGES} самых весомых связей между ними).
   </p>
-  <div class="code-overview" class:screen-only={dark} bind:this={box}>
-    <pre class="mermaid-src"><code>{overview.src}</code></pre>
-  </div>
-  {#if dark}
-    <div class="code-overview print-only" data-testid="code-overview-print" bind:this={printBox}>
+  <!-- новый исходник (другой снимок) — новые узлы: прежний <pre> уже заменён диаграммой -->
+  {#key overview.src}
+    <div class="code-overview" class:screen-only={printReady} bind:this={box}>
       <pre class="mermaid-src"><code>{overview.src}</code></pre>
     </div>
-  {/if}
+    {#if dark}
+      <div class="code-overview print-only" class:ready={printReady} data-testid="code-overview-print" bind:this={printBox}>
+        <pre class="mermaid-src"><code>{overview.src}</code></pre>
+      </div>
+    {/if}
+  {/key}
   <details class="src">
     <summary>Исходник Mermaid</summary>
     <pre data-testid="code-overview-src"><code>{overview.src}</code></pre>
@@ -116,7 +138,7 @@
     }
   }
   /* печать: светлая диаграмма целиком (без прокрутки и обрезки), подпись не отрывается от неё,
-     исходник (<details>) и экранная копия тёмной темы — не печатаются */
+     исходник (<details>), неготовая печатная копия и экранная тёмная при готовой — не печатаются */
   @media print {
     .code-overview {
       overflow: visible;
@@ -125,6 +147,7 @@
       break-inside: avoid;
     }
     .screen-only,
+    .print-only:not(.ready),
     .src {
       display: none !important;
     }

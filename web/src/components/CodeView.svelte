@@ -85,8 +85,16 @@
   let cardSeq = 0;
   let empty = $derived(!!status && (!status.exists || status.files === 0));
 
+  /** Сеанс истёк: кэш «Обзора» (ответ и SVG) — не следующему входу. */
+  function expired() {
+    dropOverviewCache();
+    onexpired();
+  }
+  // уход со страницы (и выход — Shell размонтируется) тоже сбрасывает кэш
+  $effect(() => dropOverviewCache);
+
   function fail(e: unknown, set: (s: string) => void) {
-    if (e instanceof ApiError && e.status === 401) return onexpired();
+    if (e instanceof ApiError && e.status === 401) return expired();
     set(errorText(e));
   }
 
@@ -118,18 +126,31 @@
     });
   });
 
-  async function loadStatus() {
+  /**
+   * Состояние карты. `quiet` — перечитать при показе «Обзора» и возврате с карточки (условный
+   * запрос: браузер шлёт `If-None-Match`, сервер — 304): другой снимок (фоновый sync) — таблица и
+   * «Обзор» заново, тот же — только состояние; ошибка тихого перечитывания не показывается.
+   */
+  async function loadStatus(quiet = false) {
     const my = seq;
-    statusError = '';
+    const old = status;
+    if (!quiet) statusError = '';
     try {
       const s = await codeStatus(user, space);
       if (my !== seq) return;
       status = s;
+      if (quiet && old && overviewVersion(old) === overviewVersion(s) && old.files === s.files) return;
       if (s.exists && s.files > 0) loadFiles();
       else page = null;
     } catch (e) {
-      if (my === seq) fail(e, (t) => (statusError = t));
+      if (my === seq && (!quiet || (e instanceof ApiError && e.status === 401))) fail(e, (t) => (statusError = t));
     }
+  }
+
+  function selectTab(t: Tab) {
+    if (t === tab) return;
+    tab = t;
+    if (t === 'overview' && status) loadStatus(true);
   }
 
   async function loadFiles() {
@@ -189,7 +210,8 @@
     return () => window.removeEventListener('keydown', onkey, { capture: true });
   });
 
-  // карточка — по адресу
+  // карточка — по адресу; возврат к карте перечитывает состояние
+  let wasCard = false;
   $effect(() => {
     const ref = entry;
     const u = user;
@@ -198,6 +220,8 @@
       card = null;
       cardError = '';
       if (ref) loadCard(u, s, ref);
+      else if (wasCard && status) loadStatus(true);
+      wasCard = !!ref;
     });
   });
 
@@ -232,7 +256,7 @@
           if (my !== seq) return;
           notice = `Карта очищена: удалено ${filesText(r.removed)}.`;
         } catch (e) {
-          if (e instanceof ApiError && e.status === 401) return onexpired();
+          if (e instanceof ApiError && e.status === 401) return expired();
           throw new Error(errorText(e));
         }
         seq++;
@@ -287,7 +311,7 @@
     else if (e.key === 'End') j = n - 1;
     if (j < 0) return;
     e.preventDefault();
-    tab = TABS[j].id;
+    selectTab(TABS[j].id);
     tabEls[j]?.focus();
   }
 
@@ -455,7 +479,7 @@
             aria-selected={tab === t.id}
             aria-controls={`${uid}-panel-${t.id}`}
             tabindex={tab === t.id ? 0 : -1}
-            onclick={() => (tab = t.id)}
+            onclick={() => selectTab(t.id)}
             onkeydown={(e) => ontabkey(e, i)}>{t.title}</button
           >
         {/each}
@@ -513,7 +537,7 @@
           {#await import('./CodeOverview.svelte')}
             <p class="muted" role="status">Загрузка…</p>
           {:then { default: CodeOverview }}
-            {#key `${user}|${space}`}<CodeOverview {user} {space} version={overviewVersion(status)} {onexpired} />{/key}
+            {#key `${user}|${space}`}<CodeOverview {user} {space} version={overviewVersion(status)} onexpired={expired} />{/key}
           {:catch e}
             <p class="error" role="alert">Обзор не загрузился: {errorText(e)}</p>
           {/await}

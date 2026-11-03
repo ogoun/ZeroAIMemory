@@ -107,6 +107,13 @@ export const FILES_PAGE = 50;
 /** «Обзор»: файлов и рёбер в диаграмме (спецификация §11). */
 export const OVERVIEW_FILES = 40;
 export const OVERVIEW_EDGES = 120;
+/**
+ * Порог веса ребра «Обзора» (спецификация §11: «вес ≥ порога, до 120 рёбер»): ребро — при весе
+ * строго больше порога. Порог 0 — отсекаются только пустые связи: вес сервера
+ * `√c × множитель / d` (`zam_code::rank`) дробный, у слабой, но настоящей связи бывает < 1
+ * (одна ссылка на имя двух файлов — 0,5), а густоту схемы уже ограничивает {@link OVERVIEW_EDGES}.
+ */
+export const OVERVIEW_MIN_EDGE_WEIGHT = 0;
 /** Бюджет карты для «Обзора» — предел сервера: чем больше файлов, тем полнее выбор первых 40. */
 const OVERVIEW_BUDGET = 20000;
 
@@ -139,28 +146,36 @@ export const codeOverview = (user: string, space: string) =>
 export const overviewVersion = (s: Pick<CodeStatus, 'etag' | 'rank_state'>): string | null =>
   s.etag ? `${s.etag}|${s.rank_state ?? ''}` : null;
 
-/** Последний ответ «Обзора»: одна запись — `(пользователь, решение, версия карты)`. */
-let overviewCache: { key: string; data: Promise<CodeMapJson> } | null = null;
+/** «Обзор» в кэше: ответ карты и готовые SVG диаграммы (экранная, печатная) по теме. */
+export interface OverviewEntry {
+  data: Promise<CodeMapJson>;
+  /** `renderMermaid({ cache })`: очищенные SVG по `тема + исходник`. */
+  svgs: Map<string, string>;
+}
+
+/** Последний «Обзор»: одна запись — `(пользователь, решение, версия карты)`. */
+let overviewCache: (OverviewEntry & { key: string }) | null = null;
 
 /**
  * «Обзор» с кэшем: повторное открытие вкладки (и возврат с карточки) при той же версии карты не
- * запрашивает сервер. Другое решение или новая версия (sync, очистка, пересчёт рангов) — новый
- * запрос; ошибка в кэше не остаётся. `version: null` (сервер без etag) — всегда запрос.
+ * запрашивает сервер и не рисует диаграмму заново. Другое решение или новая версия (sync,
+ * очистка, пересчёт рангов) — новый запрос; ошибка в кэше не остаётся. `version: null` (сервер
+ * без etag) — всегда запрос. Кэш сбрасывает CodeView: уход со страницы, истёкший сеанс, очистка.
  */
-export function codeOverviewCached(user: string, space: string, version: string | null): Promise<CodeMapJson> {
-  if (version === null) return codeOverview(user, space);
+export function codeOverviewCached(user: string, space: string, version: string | null): OverviewEntry {
+  if (version === null) return { data: codeOverview(user, space), svgs: new Map() };
   const key = JSON.stringify([user, space, version]);
-  if (overviewCache?.key === key) return overviewCache.data;
+  if (overviewCache?.key === key) return overviewCache;
   const data = codeOverview(user, space);
-  const entry = { key, data };
+  const entry = { key, data, svgs: new Map<string, string>() };
   overviewCache = entry;
   data.catch(() => {
     if (overviewCache === entry) overviewCache = null;
   });
-  return data;
+  return entry;
 }
 
-/** Сброс кэша «Обзора» (очистка карты). */
+/** Сброс кэша «Обзора». */
 export function dropOverviewCache(): void {
   overviewCache = null;
 }
@@ -234,8 +249,8 @@ export function mermaidLabel(s: string): string {
 
 /**
  * Исходник «Обзора»: первые {@link OVERVIEW_FILES} файлов по рангу и рёбра между ними по
- * убыванию веса (до {@link OVERVIEW_EDGES}), раскладка ELK. Узлы — `f<номер>`: пути в
- * идентификаторы не попадают.
+ * убыванию веса (вес > {@link OVERVIEW_MIN_EDGE_WEIGHT}, до {@link OVERVIEW_EDGES}), раскладка ELK. Узлы —
+ * `f<номер>`: пути в идентификаторы не попадают.
  */
 export function overviewMermaid(
   files: { id: number; path: string; rank?: number }[],
@@ -250,7 +265,7 @@ export function overviewMermaid(
   const lines = ['%%{init: {"layout": "elk"}}%%', 'flowchart LR'];
   top.forEach((f, i) => lines.push(`  f${i}[${mermaidLabel(f.path)}]`));
   edges
-    .filter((e) => e.src !== e.dst && node.has(e.src) && node.has(e.dst))
+    .filter((e) => e.src !== e.dst && e.weight > OVERVIEW_MIN_EDGE_WEIGHT && node.has(e.src) && node.has(e.dst))
     .sort((a, b) => b.weight - a.weight)
     .slice(0, OVERVIEW_EDGES)
     .forEach((e) => lines.push(`  ${node.get(e.src)} --> ${node.get(e.dst)}`));
