@@ -887,7 +887,7 @@ pub fn run(
         vault_roundtrip(&zam, &dir, &base, &token),
     )?;
     s.run(
-        "M4: MCP tools/list — 10 инструментов",
+        "M4/M5.6: MCP tools/list — 11 инструментов",
         mcp_tools_list(&base, &token),
     )?;
     let hook_id = s.run(
@@ -1490,7 +1490,7 @@ fn vault_roundtrip(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()
 // ---- M4: агенты ----
 
 /// Инструменты MCP сервера (§13.1).
-const MCP_TOOLS: [&str; 10] = [
+const MCP_TOOLS: [&str; 11] = [
     "memory_search",
     "memory_read",
     "memory_cache_put",
@@ -1501,6 +1501,7 @@ const MCP_TOOLS: [&str; 10] = [
     "memory_link",
     "memory_recall",
     "memory_vault",
+    "memory_code",
 ];
 
 /// Insight с триггерами smoke-теста M4: заголовок и текст (не похожи на insight M3 — без 409).
@@ -1509,7 +1510,7 @@ const HOOK_BODY: &str = "A CRLF shebang breaks the deploy run on Linux runners."
 /// Ошибка инструмента для `/recall(post_tool)`.
 const HOOK_ERROR: &str = "/bin/bash^M: bad interpreter: No such file or directory";
 
-/// Критерий M4: `POST /mcp` `tools/list` по токену — все 10 инструментов (§13.1).
+/// Критерий M4 (M5.6 — `memory_code`): `POST /mcp` `tools/list` по токену — все 11 инструментов (§13.1).
 fn mcp_tools_list(base: &str, token: &str) -> Result<()> {
     let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
     let mut r = agent()
