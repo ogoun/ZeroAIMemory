@@ -881,12 +881,12 @@ async fn report_member_rw_creates_ro_403() {
         .await;
     assert_status(&r, StatusCode::CREATED, "участник rw");
     let j = r.json();
-    // запись и блоб — в базе и каталоге владельца
+    // ссылка — под id участника (так решение видно ему в WebUI), запись и блоб — у владельца
     assert!(
         j["url"]
             .as_str()
             .unwrap()
-            .contains(&format!("#/u/{}/s/{G}/", w.a_id)),
+            .contains(&format!("#/u/{}/s/{G}/", w.b_id)),
         "{j}"
     );
     assert_eq!(w.files_of(&id_of(&r)).await.len(), 1);

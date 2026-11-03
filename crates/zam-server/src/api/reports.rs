@@ -1474,17 +1474,19 @@ async fn meta_part(st: &AppState, mp: &mut Multipart) -> Result<Vec<u8>, ApiErro
 }
 
 /// Адрес страницы отчёта в WebUI. Без `server.public_url` и `Host` — путь от корня сервера.
+/// `user` — пользователь токена, а не владелец базы: участник общего решения видит его в WebUI
+/// под своим id (чужой `u/` его сессии — 403).
 fn report_url(
     st: &AppState,
     headers: &HeaderMap,
     client: &Client,
-    owner: zam_core::Id,
+    user: zam_core::Id,
     guid: &str,
     id: zam_core::Id,
 ) -> String {
     let base = super::agent_setup::public_url(st, headers, *client)
         .unwrap_or_else(|_| st.cfg.server.base_path.clone());
-    format!("{base}/#/u/{owner}/s/{guid}/j/reports/{id}")
+    format!("{base}/#/u/{user}/s/{guid}/j/reports/{id}")
 }
 
 /// Создание отчёта (см. модуль) → 201 `{id, url}`; повтор `Idempotency-Key` — 200.
@@ -1612,7 +1614,7 @@ pub async fn create(
         created,
         "отчёт записан"
     );
-    let url = report_url(st, headers, client, sc.owner, &guid, entry.id);
+    let url = report_url(st, headers, client, sc.user.id, &guid, entry.id);
     let status = if created {
         StatusCode::CREATED
     } else {
