@@ -279,3 +279,113 @@ export async function seedJournals(base: string, token: string, admin: AdminCall
     guestToken: guest.token.plaintext,
   };
 }
+
+// ---- отчёты (M5.5) ----
+
+/** Флаг, который ставил бы скрипт SVG отчёта: картинка `<img>` скрипты не исполняет. */
+export const SVG_FLAG = '__zamSvgPwned';
+/** Заголовок полного отчёта (первый `#` тела совпадает — в шапке не дублируется). */
+export const REPORT_TITLE = 'Отчёт E2E: обучение модели';
+/** Слово только из текста отчёта «perf» — для полнотекстового поиска. */
+export const REPORT_WORD = 'квазичастицами';
+/** Число однотипных отчётов для курсора ленты (страница WebUI — 20). */
+export const REPORT_BULK = 21;
+export const REPORT_SESSION = 'e2e-report-sess';
+export const REPORT_MACHINE = 'e2e-gpu-box';
+export const REPORT_COMMIT = '0123abc4567def89';
+
+const SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60" onload="window.${SVG_FLAG}=1">
+<script>window.${SVG_FLAG}=1</script><rect width="120" height="60" fill="#3a7"/></svg>`;
+
+const REPORT_BODY = `# ${REPORT_TITLE}
+
+Потери падают: $L = -\\sum_i y_i \\log p_i$, итог:
+
+$$
+\\mathrm{acc} = \\frac{TP + TN}{N}
+$$
+
+![Кривая потерь](loss.png)
+
+![Схема](diag.svg)
+
+| эпоха | потери |
+|------:|-------:|
+| 1 | 0.92 |
+| 2 | 0.41 |
+
+\`\`\`python
+print("готово")
+\`\`\`
+
+\`\`\`mermaid
+graph LR
+  A[Данные] --> B[Модель]
+\`\`\`
+
+Сырые данные — [results.csv](results.csv).
+`;
+
+export interface ReportSeed {
+  full: string;
+  perf: string;
+  trash: string;
+  task: string;
+}
+
+/**
+ * Отчёты решения E2E по токену администратора (агент, multipart как `zam report`): полный
+ * (формула, диаграмма, PNG, SVG со скриптом, таблица, код, CSV, `data.refs`), отчёт «perf» для
+ * фильтров и поиска, отчёт для корзины и {@link REPORT_BULK} однотипных — для курсора.
+ */
+export async function seedReports(base: string, token: string, noteId: string): Promise<ReportSeed> {
+  const sp = `spaces/${SOLUTION_GUID}/entries`;
+  const task = await api<EntryResp>(base, token, 'POST', sp, json({ kind: 'task', title: 'Задача из отчёта E2E', body: '' }));
+  const report = async (
+    meta: Record<string, unknown>,
+    files: [string, string, Uint8Array | string][] = [],
+  ): Promise<string> => {
+    const form = new FormData();
+    form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+    for (const [name, mime, data] of files) {
+      form.append('file', new Blob([typeof data === 'string' ? data : new Uint8Array(data)], { type: mime }), name);
+    }
+    const r = await api<EntryResp>(base, token, 'POST', sp, {
+      body: form,
+      headers: { 'X-Zam-Session': REPORT_SESSION, 'X-Zam-Machine': REPORT_MACHINE },
+    });
+    return r.id;
+  };
+  for (let i = 1; i <= REPORT_BULK; i++) {
+    await report({ title: `Серия E2E №${i}`, body: `Замер ${i}.\n`, tags: ['bulk'], area: 'bulk' });
+  }
+  const trash = await report({ title: 'Отчёт E2E для корзины', body: 'Удаляется и восстанавливается.\n', tags: ['trash'] });
+  const perf = await report({
+    title: 'Отчёт E2E: производительность индекса',
+    body: `Сравнение с ${REPORT_WORD}: индекс быстрее на 12 %.\n`,
+    tags: ['perf'],
+    area: 'index',
+  });
+  const full = await report(
+    {
+      title: REPORT_TITLE,
+      body: REPORT_BODY,
+      tags: ['ml'],
+      area: 'train',
+      data: {
+        refs: {
+          commits: [REPORT_COMMIT],
+          files: ['src/train.py'],
+          notes: [`n:${noteId}`],
+          tasks: [`k:${task.id}`],
+        },
+      },
+    },
+    [
+      ['loss.png', 'image/png', makePng(160, 90)],
+      ['diag.svg', 'image/svg+xml', SVG],
+      ['results.csv', 'text/csv', 'epoch,loss\n1,0.92\n2,0.41\n'],
+    ],
+  );
+  return { full, perf, trash, task: task.id };
+}

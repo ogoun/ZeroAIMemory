@@ -531,7 +531,7 @@ fn parse_time(raw: &str, what: &str) -> Result<Timestamp, ApiError> {
 
 /// `GET /spaces/{space}/entries` → `{items, next_cursor}`. Без `kind` отчётов в ленте нет;
 /// `kind=report` — только сессиям WebUI (токену — 400, как неизвестный вид: отчёт агенту не
-/// виден, §7), у элементов — `first_image`; `deleted=only` — корзина отчётов
+/// виден, §7), у элементов — `first_image` и нет `body`; `deleted=only` — корзина отчётов
 /// ([`trash_allowed`], иначе 403).
 pub async fn list(
     State(st): State<AppState>,
@@ -604,7 +604,7 @@ pub async fn list(
     }
     if kind == Some(EntryKind::Report) {
         let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
-        super::reports::view::attach_first_images(&sc.db, &items, &mut out, viewer).await?;
+        super::reports::view::report_feed(&sc.db, &items, &mut out, viewer).await?;
     }
     Ok(Json(json!({ "items": out, "next_cursor": next })))
 }

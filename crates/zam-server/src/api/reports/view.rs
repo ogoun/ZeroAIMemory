@@ -1,6 +1,6 @@
 //! Отчёт для человека (задача 3 M5.5, спецификация §5, §8): страница
 //! `GET /entries/{id}?format=html`, файлы `GET /entries/{id}/attachments/{sha256}/{имя}`,
-//! миниатюры ленты `?kind=report`.
+//! лента `?kind=report` (миниатюры, без тел).
 //!
 //! **Страница** — `{entry, html, toc, warnings, files}` только у отчёта (у прочих видов
 //! `format=html` — 400). Рендер — общий кэш ([`render::cached`]) с ключом записи
@@ -168,10 +168,11 @@ pub async fn attachment(
     .await
 }
 
-/// Миниатюры ленты: у живых отчётов `items` — поле `first_image` (`{sha256, filename, mime,
-/// size, url}` первой картинки тела с файлом записи или `null`); у удалённых — `null` (их
-/// файлы не отдаются). `out[i]` — JSON `items[i]`.
-pub async fn attach_first_images(
+/// Элементы ленты отчётов: без `body` (до 50 тел по `note_max_bytes` ленте не нужны — тело
+/// читает страница `format=html`), поле `first_image` (`{sha256, filename, mime, size, url}`
+/// первой картинки тела с файлом записи или `null`; у удалённых — `null`, их файлы не
+/// отдаются). `out[i]` — JSON `items[i]`.
+pub async fn report_feed(
     db: &zam_store::Db,
     items: &[Entry],
     out: &mut [Value],
@@ -186,6 +187,9 @@ pub async fn attach_first_images(
     for (e, v) in items.iter().zip(out.iter_mut()) {
         if e.kind != EntryKind::Report {
             continue;
+        }
+        if let Some(o) = v.as_object_mut() {
+            o.remove("body");
         }
         v["first_image"] = firsts
             .get(&e.id)

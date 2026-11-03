@@ -389,6 +389,8 @@ async fn report_list_cookie_first_image_author_cursor() {
         assert_eq!(e["author"]["session_id"], "sess-report-1", "{e}");
         assert_eq!(e["author"]["machine"], "gpu-box", "{e}");
         assert_eq!(e["tags"], json!(["ml"]));
+        // тело ленте не нужно (задача 6): его читает страница `format=html`
+        assert!(e.get("body").is_none(), "{e}");
     }
     let cursor = j["next_cursor"].as_str().unwrap().to_string();
     let r = web(

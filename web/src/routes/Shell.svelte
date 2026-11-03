@@ -296,13 +296,28 @@
         {:else if !journalsOf(journalSpace.kind).includes(r.journal)}
           <p class="warn" role="alert">
             У пространства «{journalSpace.name}» нет журнала {JOURNAL_TITLE[r.journal]}: журналы ведутся в
-            решениях (Changelog, Releases, Insights, Словарь, Задачи, Вопросы, Vault) и в Knowledge
-            (Insights, Словарь, Задачи, Вопросы, Vault).
+            решениях (Changelog, Releases, Отчёты, Insights, Словарь, Задачи, Вопросы, Vault) и в
+            Knowledge (Insights, Словарь, Задачи, Вопросы, Vault).
           </p>
         {:else if r.journal === 'changelog'}
           <ChangelogView user={r.user} space={r.space} entry={r.entry} {onexpired} />
         {:else if r.journal === 'releases'}
           <ReleasesView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+        {:else if r.journal === 'reports'}
+          <!-- отчёты — ленивым чанком (страница, лента, корзина); удаляет только владелец решения -->
+          {#await import('../components/ReportsView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: ReportsView }}
+            <ReportsView
+              user={r.user}
+              space={r.space}
+              entry={r.entry}
+              owner={journalSpace.role === 'owner' && r.user === me.user_id}
+              {onexpired}
+            />
+          {:catch e}
+            <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
+          {/await}
         {:else if r.journal === 'insights'}
           <InsightsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
         {:else if r.journal === 'glossary'}

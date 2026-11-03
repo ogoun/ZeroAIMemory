@@ -482,7 +482,7 @@ export interface SearchItem {
   /** У заметки; у записи журнала — `entry_id`. */
   node_id?: string;
   entry_id?: string;
-  /** `note`, `attachment` или вид записи (`insight`, `changelog`, `release`). */
+  /** `note`, `attachment` или вид записи (`insight`, `changelog`, `release`, `report`…). */
   kind?: string;
   /** Статус insight. */
   status?: EntryStatus | null;
@@ -511,6 +511,8 @@ export interface SearchItem {
   locator?: string | null;
   /** Подпись места: `стр. 12`, `лист «Итоги» A1:F40`, `слайд 3`, `абз. 40`. */
   locator_text?: string | null;
+  /** У отчёта (`kind: report`): дата создания. */
+  created_at?: string;
 }
 
 export interface SearchResult {
@@ -635,8 +637,9 @@ export const reindex = (full: boolean) =>
 
 /** Эпистемический статус (§7.5): `axiom` ставит и меняет только человек. */
 export type Certainty = 'axiom' | 'theorem' | 'hypothesis';
-/** Вид записи (спецификация M4.5 §1.3): с M4.5 — термин словаря, задача, вопрос. */
-export type EntryKind = 'changelog' | 'release' | 'insight' | 'term' | 'task' | 'question';
+/** Вид записи (спецификация M4.5 §1.3): с M4.5 — термин словаря, задача, вопрос; с M5.5 —
+ * отчёт (`report`, только WebUI). */
+export type EntryKind = 'changelog' | 'release' | 'report' | 'insight' | 'term' | 'task' | 'question';
 /** Статус по виду: insight/term — `active…retracted` (у term без `revisit`), task —
  * `open…dropped`, question — `open`, `answered`, `obsolete`. */
 export type EntryStatus =
@@ -782,6 +785,87 @@ export const createEntry = async (user: string, space: string, body: Record<stri
   (await (
     await request('POST', `spaces/${q(space)}/entries`, { body, user })
   ).json()) as Entry & { warnings?: string[] };
+
+// ---- отчёты (M5.5): только чтение, удаление и восстановление — владельцу решения ----
+
+/** Файл отчёта (`entry_attachments`); `url` — адрес для `<img>` и «Скачать» (собирает сервер). */
+export interface EntryAttachment {
+  entry_id: string;
+  sha256: string;
+  filename: string;
+  mime: string;
+  size: number;
+  created_at: string;
+  url: string;
+}
+
+/** Элемент ленты отчётов: без `body` (тело — страница отчёта), миниатюра — первая картинка. */
+export interface ReportItem extends Omit<Entry, 'body'> {
+  first_image: EntryAttachment | null;
+}
+
+/** Страница отчёта `GET /entries/{id}?format=html`. */
+export interface ReportHtml {
+  entry: Entry;
+  html: string;
+  toc: OutlineItem[];
+  warnings: string[];
+  files: EntryAttachment[];
+}
+
+export interface ReportQuery {
+  tag?: string;
+  area?: string;
+  cursor?: string | null;
+  /** Корзина (`deleted=only`): только владельцу решения. */
+  deleted?: boolean;
+  limit?: number;
+}
+
+/** Лента отчётов решения (новые — первыми; в корзине — по времени удаления), курсор — `next_cursor`. */
+export function listReports(user: string, space: string, f: ReportQuery) {
+  const p = new URLSearchParams({ kind: 'report' });
+  if (f.tag) p.set('tag', f.tag);
+  if (f.area) p.set('area', f.area);
+  if (f.cursor) p.set('cursor', f.cursor);
+  if (f.deleted) p.set('deleted', 'only');
+  if (f.limit) p.set('limit', String(f.limit));
+  return call<{ items: ReportItem[]; next_cursor: string | null }>(
+    'GET',
+    `spaces/${q(space)}/entries?${p}`,
+    undefined,
+    user,
+  );
+}
+
+/** Поиск отчётов решения по заголовку и тексту: `POST /search` с `kinds: [report]` (FTS). */
+export const searchReports = (user: string, space: string, query: string, area?: string) =>
+  call<SearchResult>(
+    'POST',
+    'search',
+    {
+      query,
+      scope: { spaces: [space], ...(area ? { area } : {}) },
+      filters: { kinds: ['report'] },
+      mode: 'brief',
+      top_k: 50,
+      budget_tokens: 8000,
+      format: 'json',
+    },
+    user,
+  );
+
+export const getReportHtml = (user: string, id: string) =>
+  call<ReportHtml>('GET', `entries/${q(id)}?format=html`, undefined, user);
+
+/** `DELETE /entries/{id}` с `If-Match` ревизии (в корзину; отчёт — только владелец решения). */
+export const deleteEntry = async (user: string, id: string, rev: number): Promise<void> => {
+  await request('DELETE', `entries/${q(id)}`, { user, headers: ifMatch(rev) });
+};
+
+/** Восстановление записи из корзины. */
+export const restoreEntry = (user: string, id: string) =>
+  call<Entry>('POST', `entries/${q(id)}/restore`, undefined, user);
 
 // ---- словарь, задачи, вопросы (M4.5 §2–4) ----
 

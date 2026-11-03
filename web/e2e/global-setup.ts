@@ -6,7 +6,7 @@ import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { request } from '@playwright/test';
-import { seed, seedJournals, type AdminCall } from './seed';
+import { seed, seedJournals, seedReports, type AdminCall } from './seed';
 import { seedDocs } from './seed-docs';
 import { ADMIN_STATE } from './session';
 
@@ -120,6 +120,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       return (await resp.json()) as T;
     };
     const journals = await seedJournals(base, token, admin);
+    const reports = await seedReports(base, token, ids.media);
     const docs = await seedDocs(base, token);
     await rc.storageState({ path: ADMIN_STATE });
     await rc.dispose();
@@ -138,6 +139,10 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_MEMBER_ID = journals.memberId;
     process.env.E2E_MEMBER_TOKEN = journals.memberToken;
     process.env.E2E_GUEST_TOKEN = journals.guestToken;
+    process.env.E2E_REPORT_FULL = reports.full;
+    process.env.E2E_REPORT_PERF = reports.perf;
+    process.env.E2E_REPORT_TRASH = reports.trash;
+    process.env.E2E_REPORT_TASK = reports.task;
   } catch (e) {
     child.kill();
     log.end();

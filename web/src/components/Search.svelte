@@ -3,7 +3,8 @@
   // (Human — для администратора), подсветка совпадений текстовыми узлами и <mark>,
   // метки каналов (`vector`, `fts`), строка деградации и предупреждения сервера (в том числе
   // о доступе к чужим решениям), переход к заметке и разделу. Записи журналов (insight,
-  // changelog, release) — карточками с видом, статусом и надёжностью; переход — в журнал.
+  // changelog, release, report…) — карточками с видом, статусом и надёжностью; переход — в журнал
+  // (отчёт — на его страницу `#/u/…/j/reports/<id>`).
   // Фрагменты вложений (M5) — карточками файла с местом в документе; переход — в просмотрщик
   // вложения к этому месту (`locator`: страница, лист и диапазон, слайд, абзац).
   import { Dialog } from 'bits-ui';
@@ -254,7 +255,7 @@
             >
               {#if it.entry_id}
                 <div class="where entry-card">
-                  <span class="ekind">{it.kind}{it.insight_kind ? `/${it.insight_kind}` : ''}</span>
+                  <span class="ekind">{it.kind === 'report' ? 'отчёт' : it.kind}{it.insight_kind ? `/${it.insight_kind}` : ''}</span>
                   <span class="space">{it.space?.name ?? '?'}</span>
                   <span class="etitle">{it.title ?? ''}</span>
                   {#if it.status}<span class="estatus">{STATUS_TEXT[it.status] ?? it.status}</span>{/if}
