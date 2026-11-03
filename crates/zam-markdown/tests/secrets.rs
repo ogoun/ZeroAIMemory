@@ -432,3 +432,36 @@ fn name_left_of_masked_url_value_idempotent() {
         assert_eq!(mask_text(&once), once, "{t}");
     }
 }
+
+/// Ревью задачи 9A, M2: ключи вплотную друг к другу (`SG.…hf_…`, `ghp_…ghp_…`, `AKIA…npm_…`)
+/// — находки сканера (детекторы, нарезка) покрывают оба ключа целиком, маскировка — одним
+/// проходом. Пересекающиеся находки (правило энтропии) сливаются в одну.
+#[test]
+fn glued_keys_each_detected() {
+    let up = rnd(16, 50).to_ascii_uppercase();
+    let cases = [
+        (
+            format!("SG.{}.{}", rnd(22, 51), rnd(43, 52)),
+            format!("hf_{}", rnd(34, 53)),
+        ),
+        (
+            format!("ghp_{}", rnd(36, 54)),
+            format!("ghp_{}", rnd(36, 55)),
+        ),
+        (format!("AKIA{up}"), format!("npm_{}", rnd(36, 56))),
+        // второй ключ — только правило префикса (нижний регистр без цифр — не энтропия)
+        (
+            format!("AKIA{up}"),
+            format!("hf_{}", &"abcdefghij".repeat(4)[..34]),
+        ),
+    ];
+    for (a, b) in cases {
+        let t = format!("x {a}{b} y");
+        let hits = scan_secrets(&t);
+        let covered = |at: usize| hits.iter().any(|h| h.range.contains(&at));
+        assert!((2..2 + a.len() + b.len()).all(covered), "{t}: {hits:?}");
+        let once = mask_text(&t);
+        assert!(!once.contains(&a) && !once.contains(&b[3..]), "{once}");
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+}

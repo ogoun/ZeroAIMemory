@@ -86,16 +86,21 @@ pub fn fingerprints(root: &Path, cfg: &CodeConfig) -> Result<Vec<Fingerprint>, C
         cfg,
         exclude: cfg.exclude_set(),
     };
-    let mut out = match from_git(root, &f)? {
-        Some(v) => v,
-        None => walk(root, &f, cfg.max_files as usize + 1),
+    let (mut out, walked) = match from_git(root, &f)? {
+        Some(v) => (v, false),
+        None => (walk(root, &f, cfg.max_files as usize + 1), true),
     };
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
     if out.len() > cfg.max_files as usize {
+        // обход вне git оборван на `max_files + 1`: точного числа нет (ревью задачи 9A, M3)
+        let n = if walked {
+            String::new()
+        } else {
+            format!("{} — ", out.len())
+        };
         return Err(CliError::config(format!(
-            "файлов кода {} — больше code.max_files = {}: сузьте code.exclude или code.languages",
-            out.len(),
+            "файлов кода {n}больше code.max_files = {}: сузьте code.exclude или code.languages",
             cfg.max_files
         )));
     }

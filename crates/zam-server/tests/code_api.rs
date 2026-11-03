@@ -1660,9 +1660,10 @@ async fn focus_inputs_one_read_per_solution_while_map_changes() {
         assert!(m["header"].as_str().unwrap().contains("с фокусом"), "{m}");
     }
     assert!(paths_of(&m2).contains(&"src/c.rs".to_string()), "{m2}");
-    // второе — своё чтение под новым etag или кэш, заполненный пересчётом рангов
+    // чтения — первое под старым etag, пересчёт рангов и второй запрос под новым (общее или
+    // своё, по порядку); главное — ниже: ни одно не шло параллельно другому
     let reads = hooks.inputs_reads.load(Ordering::SeqCst);
-    assert!((1..=2).contains(&reads), "чтений {reads}");
+    assert!((1..=3).contains(&reads), "чтений {reads}");
     assert_eq!(
         hooks.inputs_active_max.load(Ordering::SeqCst),
         1,

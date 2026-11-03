@@ -63,6 +63,9 @@ pub struct SecretHit {
 struct Prefix {
     family: &'static str,
     re: Regex,
+    /// Тот же шаблон без границы слова, с якорем `^`: ключ вплотную за найденным секретом
+    /// ([`glued_prefixes`]).
+    glued: Regex,
 }
 
 fn rx(p: &str) -> Regex {
@@ -80,7 +83,8 @@ static PREFIXES: LazyLock<Vec<Prefix>> = LazyLock::new(|| {
         ("api", r"(?-u:\b)sk-(?:ant-)?[A-Za-z0-9_-]{20,}"),
         ("google", r"(?-u:\b)AIza[0-9A-Za-z_-]{35}"),
         // ревью задачи 5 M5.6, M8: Hugging Face, npm, SendGrid (ASIA и пароль в URL — выше)
-        ("huggingface", r"(?-u:\b)hf_[A-Za-z0-9]{34,}"),
+        // ровно 34: иначе жадный повтор съел бы `hf` вплотную следующего ключа
+        ("huggingface", r"(?-u:\b)hf_[A-Za-z0-9]{34}"),
         ("npm", r"(?-u:\b)npm_[A-Za-z0-9]{36}"),
         (
             "sendgrid",
@@ -90,9 +94,41 @@ static PREFIXES: LazyLock<Vec<Prefix>> = LazyLock::new(|| {
         ("zeroaimemory", r"(?-u:\b)zam_[A-Za-z0-9]{40}"),
     ]
     .into_iter()
-    .map(|(family, p)| Prefix { family, re: rx(p) })
+    .map(|(family, p)| Prefix {
+        family,
+        re: rx(p),
+        glued: rx(&format!(
+            "^(?:{})",
+            p.strip_prefix(r"(?-u:\b)").unwrap_or(p)
+        )),
+    })
     .collect()
 });
+
+/// Ключи вплотную за найденными секретами (`SG.<22>.<43>hf_<34>`, `ghp_…ghp_…`): правило
+/// префикса требует границы слова слева, а её у слипшегося ключа нет — без этого шага второй
+/// ключ уходил бы открытым в чанки и индекс, а маскировка не была бы идемпотентной (после
+/// маски соседа граница появляется; ревью задачи 9A, M2). От конца каждого найденного
+/// секрета шаблоны префиксов проверяются якорем, найденное — снова точка продолжения.
+fn glued_prefixes(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
+    let mut stack: Vec<usize> = raw.iter().map(|(r, _)| r.end).collect();
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    while let Some(at) = stack.pop() {
+        if !seen.insert(at) || at >= text.len() || !text.is_char_boundary(at) {
+            continue;
+        }
+        let rest = &text[at..];
+        for p in PREFIXES.iter() {
+            if let Some(m) = p.glued.find(rest) {
+                let r = at..at + m.end();
+                if !raw.iter().any(|(h, _)| *h == r) {
+                    stack.push(r.end);
+                    raw.push((r, SecretKind::KnownPrefix(p.family)));
+                }
+            }
+        }
+    }
+}
 
 /// JWT: заголовок `eyJ…` (base64 от `{"`) и ещё две части, каждая от 10 символов
 /// [решение исполнителя: требование `eyJ` отсекает имена вида `a.b.c`].
@@ -287,6 +323,7 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
             raw.push((v.range(), SecretKind::UrlPassword));
         }
     }
+    glued_prefixes(text, &mut raw);
     for m in ENTROPY_CANDIDATE.find_iter(text) {
         let start = m.start();
         let mut end = m.end();
@@ -374,26 +411,11 @@ pub fn mask_secrets(text: &str, hits: &[SecretHit]) -> String {
 }
 
 /// Сканирует и маскирует за один вызов (текст без секретов возвращается копией).
-///
-/// Маскирование — до неподвижной точки (не больше [`MASK_PASSES`] проходов): ключ, вплотную
-/// следующий за другим (`hf_…hf_…`, `ghp_…ghp_…`), без границы слова слева правилом префикса не
-/// узнаётся, а после маскировки соседа граница появляется — повторный проход не должен ничего
-/// менять (proptest `mask_is_idempotent`, ревью задачи 5 M5.6).
 pub fn mask_text(text: &str) -> String {
-    let mut cur = text.to_string();
-    for _ in 0..MASK_PASSES {
-        let hits = scan_secrets(&cur);
-        if hits.is_empty() {
-            break;
-        }
-        let next = mask_secrets(&cur, &hits);
-        if next == cur {
-            break;
-        }
-        cur = next;
+    let hits = scan_secrets(text);
+    if hits.is_empty() {
+        text.to_string()
+    } else {
+        mask_secrets(text, &hits)
     }
-    cur
 }
-
-/// Проходов [`mask_text`] не больше (каждый открывает границу следующему слипшемуся ключу).
-const MASK_PASSES: usize = 16;

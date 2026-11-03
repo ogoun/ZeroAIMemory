@@ -171,26 +171,33 @@ pub struct RankInputs {
 }
 
 impl RankInputs {
-    /// Оценка памяти входов, байт: ёмкости векторов и строк (без накладных распределителя) —
-    /// предел кэша входов сервера (ревью задачи 4, O2).
+    /// Оценка памяти входов, байт: ёмкости векторов и строк и накладные распределителя
+    /// [`ALLOC_OVERHEAD`] на каждый блок кучи (строка, вектор) — предел кэша входов сервера
+    /// (ревью задачи 4, O2; задачи 9A, M5).
     pub fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
         let def = size_of::<(String, SymbolKind, Option<bool>)>();
         let rf = size_of::<(String, zam_code::RefKind, u32)>();
-        self.files.capacity() * size_of::<RankFile>()
+        let s = |x: &String| x.capacity() + if x.capacity() > 0 { ALLOC_OVERHEAD } else { 0 };
+        let v = |cap: usize, item: usize| cap * item + if cap > 0 { ALLOC_OVERHEAD } else { 0 };
+        v(self.files.capacity(), size_of::<RankFile>())
             + self
                 .files
                 .iter()
                 .map(|f| {
-                    f.path.capacity()
-                        + f.defs.capacity() * def
-                        + f.defs.iter().map(|d| d.0.capacity()).sum::<usize>()
-                        + f.refs.capacity() * rf
-                        + f.refs.iter().map(|r| r.0.capacity()).sum::<usize>()
+                    s(&f.path)
+                        + v(f.defs.capacity(), def)
+                        + f.defs.iter().map(|d| s(&d.0)).sum::<usize>()
+                        + v(f.refs.capacity(), rf)
+                        + f.refs.iter().map(|r| s(&r.0)).sum::<usize>()
                 })
                 .sum::<usize>()
     }
 }
+
+/// Накладные распределителя на блок кучи, байт (заголовок и выравнивание malloc/HeapAlloc —
+/// 16–32 байта).
+pub const ALLOC_OVERHEAD: usize = 24;
 
 /// Символ строки карты; `share` и `rank` — из сохранённых долей файла.
 #[derive(Debug, Clone, PartialEq, Serialize)]

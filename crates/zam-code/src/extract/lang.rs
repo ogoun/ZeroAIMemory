@@ -457,6 +457,11 @@ pub(super) fn ref_kind(node: Node, cap: &str) -> RefKind {
 /// `Pair`, `net::Client` → `net::Client`, `&mut S` → `S`, `Box<dyn Tr>` → `Box`, `dyn Tr + 'a` →
 /// `Tr` (поле `trait`, первая граница не-время-жизни); иные (`[u8]`, `(A, B)`) — текст без
 /// пробелов (до 128 символов, иначе `_`).
+///
+/// Известные ограничения (ревью задачи 9A, M6; тест `rust_impl_dyn_edge_cases_current_behavior`):
+/// `dyn Fn(A, B)` — текст `Fn(A,B)` (у `function_type` нет имени-пути); скобки с `,` внутри
+/// (`(dyn Fn(A, B) + 'a)`) от кортежа не отличаются — текст целиком; `impl dyn Error` рядом с
+/// `trait Error` — методы обоих под `Error::…`, одноимённый второй получает `#2`.
 fn rust_type_path(mut node: Node, src: &[u8]) -> Vec<String> {
     loop {
         match node.kind() {

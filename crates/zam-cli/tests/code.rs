@@ -663,6 +663,14 @@ fn code_sync_crash_journal_skips_parser_crash() {
         // и при следующем запуске — тоже (хэши те же)
         let r = json_of(&ok(&p.zam(&["code", "sync", "--full", "--json"])));
         assert_eq!(r["skipped"]["parser_crash"], 2, "{r}");
+        // ревью 9A, M8: новая версия разбора — журнал падений прежней не действует
+        let path = p.cache("code-state.json");
+        let mut state = json_of(&std::fs::read_to_string(&path).unwrap());
+        state["extractor"] = json!(1);
+        std::fs::write(&path, state.to_string()).unwrap();
+        let r = p.sync();
+        assert!(r["skipped"]["parser_crash"].is_null(), "{r}");
+        assert_eq!(r["uploaded"], 3, "{r}");
     }
 }
 
@@ -1340,7 +1348,10 @@ fn code_sync_skip_worktree_exclude_case_links_walk_limit() {
     let outside = p.repo.parent().unwrap().join("m9-outside");
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("far.rs"), b"pub fn far_away() {}\n").unwrap();
+    // на Windows точка соединения (`mklink /J`) создаётся без прав администратора — не
+    // получилось — ошибка теста, а не тихий пропуск проверки
     let linked = dir_link(&outside, &p.repo.join("src/link"));
+    assert!(linked || !cfg!(windows), "ссылка каталога не создана");
     if !linked {
         eprintln!("ссылку каталога создать не удалось — проверка ссылки пропущена");
     }
@@ -1376,5 +1387,9 @@ fn code_sync_skip_worktree_exclude_case_links_walk_limit() {
     q.config("[code]\nmax_files = 10\n");
     let o = q.zam(&["code", "sync"]);
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
-    assert!(err(&o).contains("файлов кода 11"), "{}", err(&o));
+    assert!(
+        err(&o).contains("файлов кода больше code.max_files = 10"),
+        "{}",
+        err(&o)
+    );
 }

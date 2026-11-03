@@ -374,11 +374,11 @@ const KEY_PREFIXES: [&str; 12] = [
 ];
 
 /// Ключи точного формата (ревью задачи 5, M8; как у `zam_markdown::secrets`): AWS `AKIA`/`ASIA`
-/// и 16 `[0-9A-Z]`, Hugging Face `hf_` и ≥ 34 `[A-Za-z0-9]`, npm `npm_` и 36, SendGrid
+/// и 16 `[0-9A-Z]`, Hugging Face `hf_` и 34 `[A-Za-z0-9]`, npm `npm_` и 36, SendGrid
 /// `SG.<22>.<43>`. Точный формат, а не префикс: `ASIAN_REGION_CODES`, `hf_model_loader` — имена.
 static EXACT_KEYS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"^(?:(?:AKIA|ASIA)[0-9A-Z]{16}|hf_[A-Za-z0-9]{34,}|npm_[A-Za-z0-9]{36}|SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})$",
+        r"^(?:(?:AKIA|ASIA)[0-9A-Z]{16}|hf_[A-Za-z0-9]{34}|npm_[A-Za-z0-9]{36}|SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})$",
     )
     .expect("шаблон ключей")
 });
@@ -678,6 +678,8 @@ pub fn sync(
         && !state.files.is_empty()
         && state.extractor != zam_code::EXTRACT_VERSION;
     if reparse {
+        // журнал падений относится к прежнему разбору: новый пробует файлы заново (ревью 9A, M8)
+        state.crashed.clear();
         report.warnings.push(format!(
             "версия разбора сменилась ({} → {}): файлы карты загружаются заново",
             state.extractor,

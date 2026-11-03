@@ -477,7 +477,7 @@ pub const CHANGED_QUEUE_HARD: u64 = 4 * CHANGED_QUEUE_MAX;
 /// Замок очереди `changed-…jsonl` (`.changed-….jsonl.lock`, как у очереди запусков): все, кто
 /// меняет файл очереди, — под ним, иначе дописанная параллельным `post-tool` строка терялась бы
 /// при переписывании (ревью задачи 6).
-struct QueueLock(Option<PathBuf>);
+struct QueueLock(Option<FileLock>);
 
 impl QueueLock {
     fn take(queue: &Path, wait: Duration) -> QueueLock {
@@ -489,21 +489,30 @@ impl QueueLock {
     }
 }
 
-impl Drop for QueueLock {
-    fn drop(&mut self) {
-        if let Some(l) = self.0.take() {
-            let _ = std::fs::remove_file(l);
-        }
-    }
-}
-
-/// Строки очереди (битые пропускаются).
-fn read_changed(path: &Path) -> Vec<Changed> {
-    std::fs::read(path)
-        .unwrap_or_default()
+/// Строки очереди (битые пропускаются) и прочитанная длина файла, байт.
+fn read_changed(path: &Path) -> (Vec<Changed>, u64) {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let lines = bytes
         .split(|b| *b == b'\n')
         .filter_map(|l| serde_json::from_slice::<Changed>(l).ok())
-        .collect()
+        .collect();
+    (lines, bytes.len() as u64)
+}
+
+/// Переписывает очередь `q` содержимым `out` (под замком): если файл вырос после чтения
+/// (`read_len` байт) — дописанное мимо замка (fail-open `post-tool`) переносится в конец
+/// (ревью задачи 9A, M1).
+fn replace_queue(q: &Path, read_len: u64, mut out: Vec<u8>) -> std::io::Result<()> {
+    if std::fs::metadata(q).is_ok_and(|m| m.len() > read_len) {
+        let all = std::fs::read(q)?;
+        if let Some(tail) = all.get(read_len as usize..) {
+            if !out.is_empty() && !out.ends_with(b"\n") {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(tail);
+        }
+    }
+    write_atomic(q, &out)
 }
 
 fn changed_bytes<'a>(lines: impl IntoIterator<Item = &'a Changed>) -> Vec<u8> {
@@ -569,8 +578,9 @@ pub fn compact_changed_queues(env: &Env) {
         if !lock.held() {
             continue; // замок занят — в другой раз
         }
-        let out = changed_bytes(&compact_changed(read_changed(&q), CHANGED_QUEUE_MAX));
-        if let Err(e) = write_atomic(&q, &out) {
+        let (lines, len) = read_changed(&q);
+        let out = changed_bytes(&compact_changed(lines, CHANGED_QUEUE_MAX));
+        if let Err(e) = replace_queue(&q, len, out) {
             env.log(&format!("уплотнение очереди изменённых файлов: {e}"));
         }
     }
@@ -688,10 +698,12 @@ fn return_changed(env: &Env, q: &Path, back: Vec<Changed>) {
     let lock = QueueLock::take(q, CHANGED_LOCK_WAIT);
     let r = if lock.held() {
         let mut lines = back;
-        lines.extend(read_changed(q));
-        write_atomic(
+        let (newer, len) = read_changed(q);
+        lines.extend(newer);
+        replace_queue(
             q,
-            &changed_bytes(&compact_changed(lines, CHANGED_QUEUE_MAX)),
+            len,
+            changed_bytes(&compact_changed(lines, CHANGED_QUEUE_MAX)),
         )
     } else {
         use std::io::Write;
@@ -954,17 +966,27 @@ pub fn spawn_path(env: &Env, session: &str) -> PathBuf {
         .join(format!("spawn-{}.json", session_file_part(session)))
 }
 
-/// Замок очереди запусков: файл `.spawn-….lock` (создаётся только новым); брошенный старше
-/// [`SPAWN_LOCK_TTL`] снимается; не взят за `wait` — `None` (без замка).
-fn file_lock(path: &Path, wait: Duration) -> Option<PathBuf> {
+/// Замок-файл `.<имя>.lock` очереди запусков и очереди изменённых файлов (создаётся только
+/// новым, внутри — токен владельца); брошенный старше [`SPAWN_LOCK_TTL`] снимается; не взят за
+/// `wait` — `None` (без замка).
+fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
+    use std::io::Write;
     let name = path.file_name()?.to_str()?;
     let lock = path.with_file_name(format!(".{name}.lock"));
+    let token = format!(
+        "{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     let t0 = std::time::Instant::now();
     loop {
-        if o.open(&lock).is_ok() {
-            return Some(lock);
+        if let Ok(mut f) = o.open(&lock) {
+            let _ = f.write_all(token.as_bytes());
+            return Some(FileLock { path: lock, token });
         }
         let stale = std::fs::metadata(&lock)
             .and_then(|m| m.modified())
@@ -979,6 +1001,22 @@ fn file_lock(path: &Path, wait: Duration) -> Option<PathBuf> {
             return None;
         }
         std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Взятый замок-файл: снимается при `Drop`, только если в файле всё ещё свой токен
+/// (`pid.nanos`) — замок, снятый как брошенный и взятый другим процессом, не удаляется
+/// (ревью задачи 9A, M1).
+struct FileLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if std::fs::read(&self.path).is_ok_and(|b| b == self.token.as_bytes()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1025,9 +1063,7 @@ fn with_spawns<T>(
             env.log(&format!("запись очереди запусков субагентов: {e}"));
         }
     }
-    if let Some(l) = lock {
-        let _ = std::fs::remove_file(l);
-    }
+    drop(lock);
     out
 }
 
@@ -1189,6 +1225,26 @@ pub fn sync(ctx: &super::super::Ctx) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ревью задачи 9A, M1: замок, перехваченный другим процессом (токен в файле чужой), при
+    /// `Drop` не удаляется; свой — удаляется.
+    #[test]
+    fn file_lock_removed_only_by_owner() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/zam-cli-file-lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = dir.join("changed-x.jsonl");
+        let l = file_lock(&q, Duration::ZERO).unwrap();
+        let path = l.path.clone();
+        assert!(file_lock(&q, Duration::ZERO).is_none(), "занят");
+        drop(l);
+        assert!(!path.exists(), "свой замок снят");
+        let l = file_lock(&q, Duration::ZERO).unwrap();
+        std::fs::write(&path, b"999.1").unwrap();
+        drop(l);
+        assert!(path.exists(), "чужой замок не тронут");
+    }
 
     fn line(path: &str, symbols: usize) -> Changed {
         Changed {

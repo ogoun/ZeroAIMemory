@@ -202,14 +202,19 @@ impl CodeRuntime {
         cache.truncate(keep);
     }
 
-    /// Очищает кэш входов (тестовая точка).
+    /// Очищает кэш входов и счётчики чтений (тестовая точка): чтения пересчёта рангов до неё
+    /// (тот же путь [`load_inputs`]) в счёт теста не идут.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn forget_inputs(&self) {
+        use std::sync::atomic::Ordering;
         self.inputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.hooks.inputs_reads.store(0, Ordering::SeqCst);
+        let active = self.hooks.inputs_active.load(Ordering::SeqCst);
+        self.hooks.inputs_active_max.store(active, Ordering::SeqCst);
     }
 }
 
@@ -508,13 +513,9 @@ async fn store_rank(rt: Arc<CodeRuntime>, owner: Id, db: Db, guid: String) -> Re
     rt.hooks
         .rank_runs
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let inputs = Arc::new(
-        code_rank_inputs(&db, &guid)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-    // те же входы нужны ранжированию с фокусом: ранги `etag` снимка не меняют
-    remember_if_unchanged(&rt, &db, (owner, guid.clone()), &before, &inputs).await;
+    // общий путь чтения входов (одно на решение; ранги `etag` снимка не меняют, поэтому
+    // входы ложатся в кэш фокуса под тем же `etag`)
+    let inputs = load_inputs(&rt, &db, (owner, guid.clone()), &before).await?;
     #[cfg(feature = "test-hooks")]
     {
         let ms = rt
@@ -1326,16 +1327,41 @@ async fn cached_inputs(
     guid: &str,
     etag: &str,
 ) -> Result<Arc<RankInputs>, ApiError> {
-    let key = (sc.owner, guid.to_string());
+    load_inputs(&st.code, &sc.db, (sc.owner, guid.to_string()), etag)
+        .await
+        .map_err(ApiError::Internal)
+}
+
+/// Чтений под чужим `etag`, которые запрос дожидается, не больше: дальше — итог последнего из
+/// них (входы чуть старее снимка: рёбра и фокус по исчезнувшим файлам просто не находятся).
+/// Иначе во время длинной синхронизации запрос без своего срока (рёбра JSON-карты) ждал бы
+/// чтение за чтением (ревью задачи 9A, M4).
+const INPUTS_FOREIGN_WAITS: usize = 3;
+
+/// Входы решения `key` под `etag`: кэш или чтение через [`CodeRuntime::loading`] — общий путь
+/// запросов с фокусом, рёбер карты и фонового пересчёта рангов ([`store_rank`]).
+async fn load_inputs(
+    rt: &Arc<CodeRuntime>,
+    db: &Db,
+    key: SolutionKey,
+    etag: &str,
+) -> Result<Arc<RankInputs>, String> {
+    let mut waits = 0;
     loop {
-        if let Some(i) = st.code.cached(&key, etag) {
+        if let Some(i) = rt.cached(&key, etag) {
             return Ok(i);
         }
-        match inputs_load(st, sc, &key, etag) {
-            (true, load) => return load.await.map_err(ApiError::Internal),
-            // чужой `etag`: дождаться (итог не нужен) и проверить кэш снова
+        match inputs_load(rt, db, &key, etag) {
+            (true, load) => return load.await,
+            // чужой `etag`: дождаться и проверить кэш снова
             (false, load) => {
-                let _ = load.await;
+                let r = load.await;
+                waits += 1;
+                if waits >= INPUTS_FOREIGN_WAITS
+                    && let Ok(i) = r
+                {
+                    return Ok(i);
+                }
             }
         }
     }
@@ -1369,29 +1395,30 @@ impl Drop for LoadingGuard {
 
 /// Идущая задача чтения входов решения `key`: `(true, …)` — под этим `etag` (новая или общая),
 /// `(false, …)` — под другим (её надо дождаться).
-fn inputs_load(st: &AppState, sc: &MemScope, key: &SolutionKey, etag: &str) -> (bool, InputsLoad) {
+fn inputs_load(
+    rt: &Arc<CodeRuntime>,
+    db: &Db,
+    key: &SolutionKey,
+    etag: &str,
+) -> (bool, InputsLoad) {
     use futures_util::FutureExt;
-    let mut loading = st
-        .code
-        .loading
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut loading = rt.loading.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((e, f)) = loading.get(key) {
         return (e == etag, f.clone());
     }
     let guard = LoadingGuard {
-        rt: st.code.clone(),
+        rt: rt.clone(),
         key: key.clone(),
         etag: etag.to_string(),
     };
     #[cfg(feature = "test-hooks")]
     {
         use std::sync::atomic::Ordering;
-        let h = &st.code.hooks;
+        let h = &rt.hooks;
         let now = h.inputs_active.fetch_add(1, Ordering::SeqCst) + 1;
         h.inputs_active_max.fetch_max(now, Ordering::SeqCst);
     }
-    let db = sc.db.clone();
+    let db = db.clone();
     // задача снимает себя из `loading` охранником под тем же замком — после вставки ниже
     let task = tokio::spawn(async move {
         let g = guard;

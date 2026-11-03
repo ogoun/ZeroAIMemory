@@ -827,3 +827,22 @@ proptest! {
         prop_assert_ne!(out.skip, Some(SkipReason::ParserCrash));
     }
 }
+
+/// Ревью задачи 9A, M6: краевые случаи `impl dyn` — известное поведение (не идеальное):
+/// `dyn Fn(A, B)` — текст типа `Fn(A,B)`; в скобках с `,` внутри — текст целиком; `impl dyn
+/// Error` рядом с `trait Error` — методы обоих под `Error::…` (второй одноимённый — `#2`).
+#[test]
+fn rust_impl_dyn_edge_cases_current_behavior() {
+    let src = "impl dyn Fn(A, B) {\n    fn f1(&self) {}\n}\nimpl<'a> &'a (dyn Fn(A, B) + 'a) {\n    fn f2(&self) {}\n}\ntrait Error {\n    fn source(&self);\n}\nimpl dyn Error {\n    fn source(&self) {}\n}\n";
+    let out = run(Lang::Rust, src);
+    assert_eq!(
+        quals(&out),
+        [
+            "method Fn(A,B)::f1",
+            "method (dynFn(A,B)+'a)::f2",
+            "trait Error",
+            "method Error::source",
+            "method Error::source#2",
+        ]
+    );
+}

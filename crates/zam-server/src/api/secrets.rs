@@ -53,3 +53,25 @@ pub fn entry_text(e: &Entry) -> String {
 pub fn attach_entry(v: &mut Value, e: &Entry) {
     attach(v, &entry_text(e));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ревью задачи 9A, M2: слипшиеся ключи — две находки детектора. Ключи без энтропии
+    /// (повторы), чтобы находки не слились правилом энтропии: второй находит только продолжение
+    /// от конца первого.
+    #[test]
+    fn attach_lists_glued_keys() {
+        let t = format!(
+            "x {}{}{}{} y",
+            "AK",
+            "IA1111111111111111",
+            "npm_",
+            "a".repeat(36)
+        );
+        let mut v = json!({});
+        attach(&mut v, &t);
+        assert_eq!(v[SECRETS_DETECTED].as_array().unwrap().len(), 2, "{v}");
+    }
+}
