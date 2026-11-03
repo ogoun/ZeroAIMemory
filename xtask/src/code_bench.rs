@@ -230,8 +230,19 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
         copy.join(".zeroaimemory/config.toml"),
         format!("[code]\nexclude = [\"{FIXTURES_GLOB}\"]\n"),
     )?;
+    // фоновая синхронизация, запущенная `session-start` в замере хуков, держит замок проекта:
+    // явная `zam code sync` при занятом замке не стартует (код 0) — ждать его снятия
+    wait_sync_lock(&copy)?;
     let no_fixtures_sync = ctx.sync(&copy)?;
     let status_nf = ctx.wait_ranked()?;
+    if status_nf["files"].as_u64() >= status["files"].as_u64() {
+        bail!(
+            "развилка посчитана на старой карте: файлов {} (было {}), отчёт sync: {}",
+            status_nf["files"],
+            status["files"],
+            no_fixtures_sync.report
+        );
+    }
     let central_nf = central_report(&ctx, &status_nf)?;
     // замеры старта клиента — без работающего рядом сервера замеров (Qdrant, фоновые задачи
     // на том же HDD): у агента сервер обычно на другой машине
@@ -430,6 +441,32 @@ impl Ctx {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+/// Ждёт снятия замка синхронизации проекта `dir` (`cache/code-sync.lock`, блокировка файла
+/// ОС) не дольше 120 с.
+fn wait_sync_lock(dir: &Path) -> Result<()> {
+    let lock = dir.join(".zeroaimemory/cache/code-sync.lock");
+    let t = Instant::now();
+    loop {
+        let Ok(f) = fs::OpenOptions::new().read(true).write(true).open(&lock) else {
+            return Ok(()); // замка нет — синхронизации не было
+        };
+        match f.try_lock() {
+            Ok(()) => {
+                let _ = f.unlock();
+                return Ok(());
+            }
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("замок {}", lock.display()));
+            }
+        }
+        if t.elapsed() > Duration::from_secs(120) {
+            bail!("замок {} не снят за 120 с", lock.display());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

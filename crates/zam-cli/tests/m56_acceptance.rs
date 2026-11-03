@@ -750,6 +750,7 @@ fn acceptance_symbol_staleness_via_hook() {
         // сборка под нагрузкой его исчерпывает — строка уходит без `symbols` и судится по хэшу
         // файла (консервативно, как M4.5). Сценарий п. 4 проверяет правило по символам: такая
         // строка снимается и правка повторяется (до 5 раз).
+        let mut with_symbols = false;
         for _ in 0..5 {
             ok(&p.hook(
                 "post-tool",
@@ -767,11 +768,13 @@ fn acceptance_symbol_staleness_via_hook() {
                 .last()
                 .is_some_and(|l| l.contains("\"symbols\""))
             {
+                with_symbols = true;
                 break;
             }
             eprintln!("post-tool без symbols (бюджет исчерпан) — повтор правки");
             std::fs::remove_file(&f).unwrap();
         }
+        assert!(with_symbols, "post-tool 5 раз без symbols; {}", p.log());
         ok(&p.hook(
             "prompt",
             &p.ev("UserPromptSubmit", "m56h", json!({"prompt": "дальше"})),
