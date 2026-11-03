@@ -5,12 +5,19 @@
 import DOMPurify from 'dompurify';
 import mermaid from 'mermaid';
 
-let seq = 0;
-let theme: 'default' | 'dark' | null = null;
+type Theme = 'default' | 'dark';
 
-function init(): void {
-  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  const want = dark ? 'dark' : 'default';
+let seq = 0;
+let theme: Theme | null = null;
+/** Очередь вызовов: тема Mermaid глобальна, печать (`default`) не должна вклиниться в экран. */
+let queue: Promise<void> = Promise.resolve();
+
+/** Тема страницы — по теме ОС, как токены цвета WebUI (app.css). */
+function pageTheme(): Theme {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default';
+}
+
+function init(want: Theme): void {
   if (theme === want) return;
   theme = want;
   mermaid.initialize({
@@ -33,9 +40,19 @@ function sanitize(svg: string): string {
   return DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } });
 }
 
-/** Заменяет каждый `pre.mermaid-src` внутри `root` диаграммой; при ошибке — исходник с пометкой. */
-export async function renderMermaid(root: HTMLElement): Promise<void> {
-  init();
+/**
+ * Заменяет каждый `pre.mermaid-src` внутри `root` диаграммой; при ошибке — исходник с пометкой.
+ * `theme` — явная тема (печать — `default`); без неё — тема страницы. Вызовы идут по очереди:
+ * каждый ставит свою тему, поэтому после печатного вызова экран снова рисуется в теме страницы.
+ */
+export function renderMermaid(root: HTMLElement, o: { theme?: Theme } = {}): Promise<void> {
+  const run = queue.then(() => render(root, o.theme ?? pageTheme()));
+  queue = run.catch(() => undefined);
+  return run;
+}
+
+async function render(root: HTMLElement, want: Theme): Promise<void> {
+  init(want);
   for (const pre of root.querySelectorAll<HTMLElement>('pre.mermaid-src')) {
     // повторный вызов для того же документа (смена bind:this) не рендерит блок дважды
     if (!pre.isConnected || pre.dataset.zamMermaid) continue;

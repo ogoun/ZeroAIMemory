@@ -11,6 +11,8 @@ export interface HydrateOpts {
   self: (anchor: string) => string;
   /** `false` — результат устарел (документ сменился), ленивые модули не применяются. */
   alive: () => boolean;
+  /** Тема диаграмм; без неё — тема страницы (печать задаёт `default`). */
+  mermaidTheme?: 'default' | 'dark';
 }
 
 /**
@@ -25,7 +27,7 @@ export async function hydrateRendered(el: HTMLElement, o: HydrateOpts): Promise<
     jobs.push(import('./katex').then((m) => (o.alive() ? m.renderMath(el) : undefined)));
   }
   if (el.querySelector('pre.mermaid-src')) {
-    jobs.push(import('./mermaid').then((m) => (o.alive() ? m.renderMermaid(el) : undefined)));
+    jobs.push(import('./mermaid').then((m) => (o.alive() ? m.renderMermaid(el, { theme: o.mermaidTheme }) : undefined)));
   }
   if (jobs.length === 0) return true;
   const res = await Promise.allSettled(jobs);

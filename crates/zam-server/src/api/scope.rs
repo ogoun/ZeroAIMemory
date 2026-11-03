@@ -25,15 +25,21 @@
 //! - запись в `Rules` по токену при `rules.agent_write = false` → 403;
 //! - участник: доступ только при одобренном запросе (`pending`/`rejected`/`revoked` → 403
 //!   `/problems/solution-access`), запись — при режиме участника `rw` и токене `rw`;
-//! - администратор может всё.
+//! - администратор может всё;
+//! - отчёт (M5.5 §4, §7): токену не существует — 404 на любом маршруте записи по id раньше
+//!   прав и режима ([`hidden_entry`] в [`entry_scope`]); сессии WebUI изменяющий маршрут — 409
+//!   `/problems/report-immutable` ([`deny_report_mutation`]); удаление и восстановление — только
+//!   владелец решения в своей сессии WebUI, остальным сессиям (участникам, администратору от
+//!   имени другого) 403 ([`report_trash_allowed`]).
 //!
 //! Настройка `rules.agent_write` и роль в решении читаются из `system.db` на каждом запросе
 //! (решения о доступе не кэшируются): отзыв действует со следующего запроса.
 use axum::http::HeaderMap;
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Access, Db, EdgeView, Entry, Node, SolutionInfo, SolutionRole, Space, SpaceKind, StoreError,
-    User, get_edge, get_entry, get_node, get_solution, get_space, list_spaces, space_of_kind,
+    Access, Db, EdgeView, Entry, EntryKind, Node, SolutionInfo, SolutionRole, Space, SpaceKind,
+    StoreError, User, get_edge, get_entry, get_node, get_solution, get_space, list_spaces,
+    space_of_kind,
 };
 
 use crate::app::AppState;
@@ -475,7 +481,9 @@ struct Located<T> {
 /// Находит объект по id: сначала в личной базе пользователя, затем в базах владельцев
 /// решений, к которым у него есть запрос доступа. Чужой объект принимается, только если он
 /// в пространстве решения (иначе 404); сбой чужой базы — пропуск решения с WARN.
-/// `get` читает объект из базы, `space_of` отдаёт его пространство.
+/// `get` читает объект из базы, `space_of` отдаёт его пространство, `hidden` — объект
+/// принципалу не существует (404 раньше проверки прав и режима: ответ не оракул).
+#[allow(clippy::too_many_arguments)]
 async fn locate<T>(
     st: &AppState,
     p: &Principal,
@@ -484,10 +492,14 @@ async fn locate<T>(
     mode: Mode,
     get: impl AsyncFn(&Db, Id) -> Result<T, StoreError>,
     space_of: impl Fn(&T) -> Id,
+    hidden: impl Fn(&T) -> bool,
 ) -> Result<Located<T>, ApiError> {
     let user = target_user(st, p, headers).await?;
     let db = st.users.get(user.id).await?;
     match get(&db, id).await {
+        // скрытый объект своей базы — как отсутствующий: тот же путь по чужим решениям (время
+        // ответа и WARN не отличают его от несуществующего id)
+        Ok(item) if hidden(&item) => {}
         Ok(item) => {
             let space = get_space(&db, space_of(&item))
                 .await?
@@ -518,7 +530,7 @@ async fn locate<T>(
             }
         };
         // объект владельца вне пространства решения участнику не существует
-        if space_of(&item) != info.space_id {
+        if space_of(&item) != info.space_id || hidden(&item) {
             continue;
         }
         let role = role?;
@@ -560,6 +572,7 @@ pub async fn node_scope(
         mode,
         async |db: &Db, id| get_node(db, id).await,
         |n: &Node| n.space_id,
+        |_: &Node| false,
     )
     .await?;
     Ok(NodeScope {
@@ -572,9 +585,17 @@ pub async fn node_scope(
     })
 }
 
+/// Запись `e` принципалу не существует (M5.5 §7): отчёт — токену (агенту). Ответ — как на
+/// несуществующую запись (404, `not_found` элемента, 422 «источник не найден» кэша); проверка
+/// идёт раньше прав и режима, иначе 403 токена `ro` выдавал бы существование отчёта.
+pub fn hidden_entry(p: &Principal, e: &Entry) -> bool {
+    e.kind == EntryKind::Report && !p.is_human()
+}
+
 /// Запись журнала по id с проверкой доступа к её пространству: то же правило, что у
 /// [`node_scope`] (в чужой базе — только записи пространства решения; Knowledge, Rules и
-/// Human владельца участнику не существуют).
+/// Human владельца участнику не существуют). Скрытая запись ([`hidden_entry`]: отчёт токену)
+/// — 404 на любом маршруте, в том числе изменяющем и корзине, раньше проверки прав.
 pub async fn entry_scope(
     st: &AppState,
     p: &Principal,
@@ -591,6 +612,7 @@ pub async fn entry_scope(
         mode,
         async |db: &Db, id| get_entry(db, id).await,
         |e: &Entry| e.space_id,
+        |e: &Entry| hidden_entry(p, e),
     )
     .await?;
     Ok(EntryScope {
@@ -621,6 +643,7 @@ pub async fn edge_scope(
         mode,
         async |db: &Db, id| get_edge(db, id).await?.ok_or(StoreError::NotFound),
         |e: &EdgeView| e.src_space,
+        |_: &EdgeView| false,
     )
     .await?;
     Ok(EdgeScope {
@@ -787,6 +810,54 @@ pub fn live_entry(s: &EntryScope) -> Result<(), ApiError> {
         Some(_) => Err(ApiError::NotFound),
         None => Ok(()),
     }
+}
+
+/// Текст 403 удаления и восстановления отчёта не владельцем (ответ владельца 11).
+pub const REPORT_TRASH_OWNER_ONLY: &str =
+    "удалять и восстанавливать отчёт может только владелец решения в WebUI";
+
+/// Изменяющий маршрут записи (M5.5 §4): у отчёта допустимой правки нет — сессии WebUI 409
+/// `/problems/report-immutable` (раньше `If-Match`, тела и вида операции); токену — 404, как
+/// у несуществующей записи (отчёт агенту не виден, §7). Токену отчёт не доходит сюда —
+/// [`entry_scope`] уже ответил 404 ([`hidden_entry`]); ветка — защита глубины.
+pub fn deny_report_mutation(p: &Principal, sc: &EntryScope) -> Result<(), ApiError> {
+    if sc.entry.kind != EntryKind::Report {
+        return Ok(());
+    }
+    if p.is_human() {
+        Err(ApiError::ReportImmutable)
+    } else {
+        Err(ApiError::NotFound)
+    }
+}
+
+/// Корзина отчётов области (`owner`, `role`) — только владельцу решения в его сессии WebUI:
+/// пользователь в своей базе (`Role::Owner`) или администратор в своей (`owner` — он сам).
+/// Участник `rw`/`ro`, администратор от имени другого и любой токен — 403
+/// [`REPORT_TRASH_OWNER_ONLY`] (спецификация §4, §12 п. 5).
+pub fn trash_allowed(st: &AppState, p: &Principal, owner: Id, role: Role) -> Result<(), ApiError> {
+    let own = match p {
+        Principal::User { user_id, .. } => owner == *user_id && role == Role::Owner,
+        Principal::Admin { .. } => {
+            owner == st.admin_id && matches!(role, Role::Owner | Role::Admin)
+        }
+        Principal::Token(_) => false,
+    };
+    if own {
+        Ok(())
+    } else {
+        Err(ApiError::Denied(REPORT_TRASH_OWNER_ONLY.into()))
+    }
+}
+
+/// `DELETE /entries/{id}` и `POST …/restore`: у отчёта — [`trash_allowed`], у прочих записей —
+/// общие права записи (уже проверены [`entry_scope`]). Токену отчёт — 404 ещё в
+/// [`entry_scope`]; 403 здесь получают сессии WebUI не владельца.
+pub fn report_trash_allowed(st: &AppState, p: &Principal, sc: &EntryScope) -> Result<(), ApiError> {
+    if sc.entry.kind != EntryKind::Report {
+        return Ok(());
+    }
+    trash_allowed(st, p, sc.owner, sc.role)
 }
 
 /// Живой узел (удалённый → 404).

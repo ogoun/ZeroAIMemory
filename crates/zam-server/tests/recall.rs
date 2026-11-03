@@ -287,7 +287,7 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
     );
     assert!(
         text.contains(
-            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v3): обнови через `zam init` или WebUI"
+            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v4): обнови через `zam init` или WebUI"
         ),
         "{text}"
     );

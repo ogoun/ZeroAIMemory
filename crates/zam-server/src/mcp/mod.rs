@@ -4,7 +4,10 @@
 //!   (MCP 2026-07-28 убрал сессии, SEP-2567; клиенты 2025-xx получают ответ `initialize`
 //!   без `Mcp-Session-Id` и дальше работают так же), ответы — `application/json`
 //!   (`json_response`), SSE — только если обработчик шлёт уведомления до ответа (у нас нет).
-//!   Предел тела — как у записи заметки ([`crate::api::note_body_max`]).
+//!   Предел тела — как у JSON записи журнала ([`crate::api::entries_json_max`]: отчёт с файлами
+//!   в base64 до `reports.mcp_max_bytes`) для всех инструментов; пределы заметок и записей
+//!   проверяют маршруты REST. Тело больше `note_body_max` занимает разрешение
+//!   [`crate::api::big_body`] (не больше двух одновременно, иначе 503 `busy`).
 //! - **Аутентификация** — `Authorization: Bearer` обязателен ([`require_bearer`]): токен
 //!   проверяется тем же извлекателем [`Principal`], что у REST (лимит неудачных попыток по
 //!   IP, отзыв, срок); без заголовка или с неверным токеном — 401 problem+json до `rmcp`.
@@ -66,8 +69,10 @@ pub const MCP_PATH: &str = "/mcp";
 
 /// Заголовки исходного запроса, которые уходят во внутренние вызовы REST. Заголовки прокси —
 /// чтобы IP клиента в лимитах и аудите был тем же, что у REST; доверять ли им, решает
-/// `trusted_peer` по `ConnectInfo` (`server.trusted_proxies`), как и для REST.
-const FORWARDED: [&str; 8] = [
+/// `trusted_peer` по `ConnectInfo` (`server.trusted_proxies`), как и для REST. `Host` — для
+/// адреса WebUI в ответе (`url` отчёта при пустом `server.public_url`, M5.5).
+const FORWARDED: [&str; 9] = [
+    "host",
     "authorization",
     crate::api::search::SOLUTION_HEADER,
     SESSION_HEADER,
@@ -82,7 +87,8 @@ const FORWARDED: [&str; 8] = [
 const INSTRUCTIONS: &str = "ZeroAIMemory — долговременная память агента. Порядок: memory_search \
 (карточки, шаг 0 — кэш выжимок) → memory_read нужного → memory_cache_put выжимки. Запись — \
 memory_write, memory_log, memory_update_entry; ревизии обязательны при правке (409/428 — \
-перечитать). Задачи, вопросы человеку, словарь — memory_log kind=task|question|term; после \
+перечитать). Задачи, вопросы человеку, словарь — memory_log kind=task|question|term; итог \
+для пользователя — kind=report (большой — zam report); после \
 сжатия контекста — memory_recall event=recovery, задание субагенту — event=brief. Протокол — \
 zam guide (GET /api/v1/agent-guide). Ответы — Markdown, последняя строка ~N tok.";
 
@@ -98,7 +104,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .with_json_response(true)
         .with_sse_keep_alive(None)
         .disable_allowed_hosts()
-        .with_max_request_body_bytes(crate::api::note_body_max(&state.cfg.limits));
+        .with_max_request_body_bytes(crate::api::entries_json_max(&state.cfg));
     let svc = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(NeverSessionManager::default()),
@@ -106,6 +112,11 @@ pub fn router(state: &AppState) -> Router<AppState> {
     );
     Router::new()
         .route_service(MCP_PATH, svc)
+        // тело — после аутентификации: разрешения на большие тела берут только токены
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            crate::api::big_body::limit_mcp,
+        ))
         .route_layer(from_fn_with_state(state.clone(), require_bearer))
         .route_layer(axum::middleware::from_fn(same_origin))
 }
@@ -227,6 +238,7 @@ impl ServerHandler for McpServer {
             ));
         };
         let mut rest = Rest::new(self.rest.clone(), parts);
+        rest.cancel = Some(context.ct.clone());
         if rest.header(SESSION_HEADER).is_none()
             && let Some(id) = implicit_session(&self.state, parts).await
             && let Ok(v) = HeaderValue::from_str(&id)
@@ -282,6 +294,12 @@ pub struct Rest {
     router: Router,
     headers: HeaderMap,
     connect: Option<ConnectInfo<SocketAddr>>,
+    /// Разрешение большого тела внешнего `/mcp` ([`crate::api::big_body::OuterPermit`]): копия
+    /// держит его до конца вызова инструмента, даже если клиент оборвал соединение.
+    outer_permit: Option<crate::api::big_body::OuterPermit>,
+    /// Отмена вызова (`RequestContext::ct`): клиент прислал `notifications/cancelled` или оборвал
+    /// соединение — дальше внутренних запросов нет.
+    cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Ответ внутреннего вызова REST.
@@ -311,10 +329,22 @@ impl Rest {
                 headers.insert(HeaderName::from_static(name), v.clone());
             }
         }
+        // HTTP/2 без `Host` — адрес из `:authority`
+        if !headers.contains_key(header::HOST)
+            && let Some(a) = parts.uri.authority()
+            && let Ok(v) = HeaderValue::from_str(a.as_str())
+        {
+            headers.insert(header::HOST, v);
+        }
         Rest {
             router,
             headers,
             connect: parts.extensions.get::<ConnectInfo<SocketAddr>>().cloned(),
+            outer_permit: parts
+                .extensions
+                .get::<crate::api::big_body::OuterPermit>()
+                .cloned(),
+            cancel: None,
         }
     }
 
@@ -352,7 +382,16 @@ impl Rest {
             }
             None => Body::empty(),
         };
+        if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return Err("вызов отменён клиентом".into());
+        }
         let mut req = b.body(body).map_err(|e| format!("запрос REST: {e}"))?;
+        // внешний `/mcp` с большим телом уже держит разрешение (его копия живёт в `self`, пока
+        // идёт вызов) — внутреннее его не берёт; без него большое внутреннее тело берёт своё
+        req.extensions_mut()
+            .insert(crate::api::big_body::InnerCall {
+                outer_permit: self.outer_permit.is_some(),
+            });
         if let Some(c) = self.connect {
             req.extensions_mut().insert(c);
         }
@@ -372,6 +411,25 @@ impl Rest {
 #[cfg(test)]
 mod tests {
     use super::origin_matches_host;
+
+    /// Ревью задачи 5, I1: внешний future `/mcp` уничтожен (обрыв клиента), а инструмент ещё
+    /// работает — разрешение держит копия в [`super::Rest`] до конца вызова.
+    #[tokio::test]
+    async fn rest_keeps_outer_permit_until_dropped() {
+        use crate::api::big_body::{BigBodies, OuterPermit};
+        use std::sync::Arc;
+        let b = BigBodies::new(2, 10);
+        let permit = Arc::new(b.admit().await.unwrap());
+        let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+        parts.extensions.insert(OuterPermit(permit.clone()));
+        let rest = super::Rest::new(axum::Router::new(), &parts);
+        // слой `limit_mcp` и запрос rmcp уничтожены
+        drop((permit, parts));
+        assert_eq!(b.available(), 1, "разрешение держит вызов инструмента");
+        assert!(rest.outer_permit.is_some());
+        drop(rest);
+        assert_eq!(b.available(), 2);
+    }
 
     #[test]
     fn origin_vs_host() {

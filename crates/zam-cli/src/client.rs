@@ -317,10 +317,25 @@ impl Client {
         len: u64,
         reader: impl Read + 'static,
     ) -> Result<Response<Body>, CliError> {
-        let rb = self
+        self.send_multipart_with(path, content_type, len, reader, &[])
+    }
+
+    /// POST тела потоком с дополнительными заголовками (`Idempotency-Key`).
+    pub fn send_multipart_with(
+        &self,
+        path: &str,
+        content_type: &str,
+        len: u64,
+        reader: impl Read + 'static,
+        headers: &[(&str, &str)],
+    ) -> Result<Response<Body>, CliError> {
+        let mut rb = self
             .prepare(self.agent.post(&self.url(path)))
             .header("Content-Type", content_type)
             .header("Content-Length", len.to_string());
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
         self.check(rb.send(ureq::SendBody::from_owned_reader(reader)))
     }
 

@@ -16,7 +16,7 @@ use zam_core::{TargetKind, TargetRef};
 use zam_store::{UsageEvent, UsageKind, UsageSource, record_usage};
 
 use super::json_body;
-use super::scope::{Mode, entry_scope, live_entry};
+use super::scope::{Mode, deny_report_mutation, entry_scope, live_entry};
 use super::sessions::touch_from_request;
 use crate::app::AppState;
 use crate::auth::Principal;
@@ -50,6 +50,8 @@ pub async fn entry(
     crate::attrib::session_touch(&p, &headers, req.session_id.as_deref())?;
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
+    // оценка отчёта — его изменение (§4): 409 человеку, токену — 404
+    deny_report_mutation(&p, &sc)?;
     // сессия создаётся или отмечается, как у остальных запросов с ней
     let session = touch_from_request(&st, &p, &headers, req.session_id.as_deref())
         .await?

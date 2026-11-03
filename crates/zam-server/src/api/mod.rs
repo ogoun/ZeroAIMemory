@@ -1,6 +1,7 @@
 //! Маршруты HTTP API.
 pub mod admin;
 pub mod agent_setup;
+pub mod big_body;
 pub mod blobs;
 pub mod cache;
 pub mod doc_locator;
@@ -20,6 +21,7 @@ pub mod read;
 pub mod recall;
 pub mod releases;
 pub mod render;
+pub mod reports;
 pub mod scope;
 pub mod search;
 pub mod secrets;
@@ -45,7 +47,7 @@ use zam_core::Id;
 use crate::app::AppState;
 use crate::auth::admin as login;
 use crate::auth::user as user_auth;
-use crate::config::LimitsSection;
+use crate::config::{LimitsSection, ServerConfig};
 use crate::error::ApiError;
 
 /// Запас на JSON-обёртку тела записи заметки, байт.
@@ -68,6 +70,29 @@ pub(crate) fn note_body_max(l: &LimitsSection) -> usize {
 /// Запас на заголовки частей и поле `node` в multipart загрузки вложения, байт.
 const MULTIPART_OVERHEAD: usize = 1024 * 1024;
 
+/// Предел тела `POST|GET /spaces/{space}/entries` для слоя маршрута: multipart отчёта (часть
+/// `meta` — до [`note_body_max`] плюс [`reports::META_OVERHEAD`], файлы — потоком по
+/// `reports.max_total_bytes` и `limits.blob_max_bytes`, 413) и запас на заголовки частей. JSON
+/// обработчик читает сам с пределом [`entries_json_max`].
+fn entries_body_limit(c: &ServerConfig) -> DefaultBodyLimit {
+    let files = usize::try_from(c.reports.max_total_bytes).unwrap_or(usize::MAX);
+    DefaultBodyLimit::max(
+        note_body_max(&c.limits)
+            .saturating_add(reports::META_OVERHEAD)
+            .saturating_add(files)
+            .saturating_add(MULTIPART_OVERHEAD),
+    )
+}
+
+/// Предел JSON-тела `POST /spaces/{space}/entries`, байт: запись журнала — до [`note_body_max`]
+/// (больше — 413, как раньше), отчёт MCP — ещё файлы в base64 (`⌈mcp_max_bytes · 4/3⌉`) и запас.
+pub(crate) fn entries_json_max(c: &ServerConfig) -> usize {
+    let b64 = c.reports.mcp_max_bytes.div_ceil(3).saturating_mul(4);
+    note_body_max(&c.limits)
+        .saturating_add(usize::try_from(b64).unwrap_or(usize::MAX))
+        .saturating_add(JSON_OVERHEAD)
+}
+
 /// Предел тела `POST /blobs`: само вложение проверяется потоком по
 /// `blob_max_bytes` (413), слой отсекает лишь заведомо большие тела.
 fn blob_body_limit(l: &LimitsSection) -> DefaultBodyLimit {
@@ -76,7 +101,7 @@ fn blob_body_limit(l: &LimitsSection) -> DefaultBodyLimit {
 
 /// Маршруты под `/api/v1` (без `/mcp`: его инструменты зовут этот роутер изнутри).
 pub fn router(state: &AppState) -> Router<AppState> {
-    memory_routes(&state.cfg.limits)
+    memory_routes(&state.cfg)
         // записи в память с `X-Zam-Session` — счётчик сессии (одна точка, R1)
         .route_layer(from_fn_with_state(
             state.clone(),
@@ -91,7 +116,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// [`sessions::count_memory_writes`]; оценка записи (`/feedback`) — не запись в память.
 /// Любой новый путь записи в память — сюда (решение контроллера R12); MCP ([`crate::mcp`])
 /// вызывает эти маршруты через внутренний `Router`.
-fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
+fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
+    let limits = &cfg.limits;
     let note_limit = note_body_limit(limits);
     Router::new()
         .route(
@@ -111,7 +137,9 @@ fn memory_routes(limits: &LimitsSection) -> Router<AppState> {
         .route("/api/v1/nodes/{id}/revert", post(nodes::history::revert))
         .route(
             "/api/v1/spaces/{space}/entries",
-            get(entries::list).post(entries::create).layer(note_limit),
+            get(entries::list)
+                .post(entries::create)
+                .layer(entries_body_limit(cfg)),
         )
         .route(
             "/api/v1/entries/{id}",
@@ -227,6 +255,11 @@ fn service_routes() -> Router<AppState> {
         )
         .route("/api/v1/render/highlight.css", get(render::highlight))
         .route("/api/v1/blobs/{sha256}/{filename}", get(blobs::download))
+        // файлы отчёта (M5.5): только пара этой записи, только сессиям WebUI
+        .route(
+            "/api/v1/entries/{id}/attachments/{sha256}/{filename}",
+            get(reports::view::attachment),
+        )
         .route("/api/v1/previews/{sha256}", get(previews::preview))
         .route("/api/v1/nodes/{id}/attachments", get(blobs::list))
         .route("/api/v1/search", post(search::search))

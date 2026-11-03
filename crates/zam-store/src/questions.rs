@@ -409,6 +409,7 @@ pub async fn answer_question(
         if q.deleted_at.is_some() {
             return Err(StoreError::NotFound);
         }
+        crate::entries::ensure_not_report(&q)?;
         if q.kind != EntryKind::Question {
             return Ok(Err(QuestionError::NotQuestion));
         }

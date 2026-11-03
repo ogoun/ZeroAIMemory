@@ -3,7 +3,8 @@
   // (Human — для администратора), подсветка совпадений текстовыми узлами и <mark>,
   // метки каналов (`vector`, `fts`), строка деградации и предупреждения сервера (в том числе
   // о доступе к чужим решениям), переход к заметке и разделу. Записи журналов (insight,
-  // changelog, release) — карточками с видом, статусом и надёжностью; переход — в журнал.
+  // changelog, release, report…) — карточками с видом, статусом и надёжностью; переход — в журнал
+  // (отчёт — на его страницу `#/u/…/j/reports/<id>`).
   // Фрагменты вложений (M5) — карточками файла с местом в документе; переход — в просмотрщик
   // вложения к этому месту (`locator`: страница, лист и диапазон, слайд, абзац).
   import { Dialog } from 'bits-ui';
@@ -13,6 +14,7 @@
   import { reasonText, warningText } from '../lib/indexing';
   import { JOURNAL_OF_KIND, STATUS_TEXT } from '../lib/journals';
   import { staleText } from '../lib/fileRefs';
+  import { snippetParts } from '../lib/snippet';
   import { go } from '../lib/router';
 
   let {
@@ -27,8 +29,6 @@
     fts: 'Найдено полнотекстовым поиском',
     trigram: 'Найдено поиском по подстроке',
   };
-  const MARK_START = '';
-  const MARK_END = '';
 
   let query = $state('');
   let items = $state<SearchItem[]>([]);
@@ -117,24 +117,6 @@
     } finally {
       if (my === seq) busy = false;
     }
-  }
-
-  /** Сниппет → фрагменты; `m` — совпадение (между U+E000 и U+E001). */
-  function parts(s: string): { t: string; m: boolean }[] {
-    const out: { t: string; m: boolean }[] = [];
-    let m = false;
-    let buf = '';
-    for (const ch of s) {
-      if (ch === MARK_START || ch === MARK_END) {
-        if (buf) out.push({ t: buf, m });
-        buf = '';
-        m = ch === MARK_START;
-      } else {
-        buf += ch;
-      }
-    }
-    if (buf) out.push({ t: buf, m });
-    return out;
   }
 
   /** Якорь раздела по `heading_path` (оглавление сервера: точный путь, иначе последний заголовок). */
@@ -254,7 +236,7 @@
             >
               {#if it.entry_id}
                 <div class="where entry-card">
-                  <span class="ekind">{it.kind}{it.insight_kind ? `/${it.insight_kind}` : ''}</span>
+                  <span class="ekind">{it.kind === 'report' ? 'отчёт' : it.kind}{it.insight_kind ? `/${it.insight_kind}` : ''}</span>
                   <span class="space">{it.space?.name ?? '?'}</span>
                   <span class="etitle">{it.title ?? ''}</span>
                   {#if it.status}<span class="estatus">{STATUS_TEXT[it.status] ?? it.status}</span>{/if}
@@ -280,7 +262,7 @@
                 </div>
               {/if}
               <div class="snippet">
-                {#each parts(it.snippet ?? '') as p, j (j)}{#if p.m}<mark>{p.t}</mark>{:else}{p.t}{/if}{/each}
+                {#each snippetParts(it.snippet ?? '') as p, j (j)}{#if p.m}<mark>{p.t}</mark>{:else}{p.t}{/if}{/each}
               </div>
             </li>
           {/each}

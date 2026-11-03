@@ -19,7 +19,9 @@
 //! `If-None-Match` проверяется здесь же. Заголовки безопасности — на любом ответе:
 //! `nosniff`, CSP `sandbox`, `Content-Disposition` (`inline` только для безопасных
 //! для показа типов). Ответы помечаются [`NoCompress`]: сжатие ломает `Range` и
-//! бесполезно для медиа.
+//! бесполезно для медиа. Та же отдача ([`serve`]) — у файлов отчёта
+//! (`GET /entries/{id}/attachments/…`, [`super::reports::view`]); блоб отчёта через
+//! `/blobs/…` не отдаётся (пара привязана к записи, а не к узлу).
 //!
 //! **Документы вложений** (M5 §3). При загрузке вид определяется `zam_docs::sniff_file` по
 //! содержимому файла без чтения его в память (zip — по центральному каталогу): поддерживаемый
@@ -86,7 +88,7 @@ impl std::fmt::Display for ClientStream {
 }
 impl std::error::Error for ClientStream {}
 
-fn stream_err(e: MultipartError) -> std::io::Error {
+pub(crate) fn stream_err(e: MultipartError) -> std::io::Error {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
         std::io::Error::other(BodyTooLarge)
     } else {
@@ -94,7 +96,7 @@ fn stream_err(e: MultipartError) -> std::io::Error {
     }
 }
 
-fn multipart_err(e: MultipartError) -> ApiError {
+pub(crate) fn multipart_err(e: MultipartError) -> ApiError {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
         ApiError::PayloadTooLarge("тело запроса превышает предел".into())
     } else {
@@ -102,8 +104,17 @@ fn multipart_err(e: MultipartError) -> ApiError {
     }
 }
 
+/// Запись блоба оборвана пределом: размер потока (`limit` [`BlobStore::put`]) или тела запроса.
+pub(crate) fn put_too_large(e: &StoreError) -> bool {
+    match e {
+        StoreError::BadInput(m) => m == "too large",
+        StoreError::Io(io) => io.get_ref().is_some_and(|r| r.is::<BodyTooLarge>()),
+        _ => false,
+    }
+}
+
 /// Ошибка записи блоба → ответ.
-fn put_err(e: StoreError, limit: u64) -> ApiError {
+pub(crate) fn put_err(e: StoreError, limit: u64) -> ApiError {
     match e {
         StoreError::BadInput(m) if m == "too large" => {
             ApiError::PayloadTooLarge(format!("вложение больше предела {limit} байт"))
@@ -118,7 +129,7 @@ fn put_err(e: StoreError, limit: u64) -> ApiError {
     }
 }
 
-async fn next_field(mp: &mut Multipart) -> Result<Option<Field<'_>>, ApiError> {
+pub(crate) async fn next_field(mp: &mut Multipart) -> Result<Option<Field<'_>>, ApiError> {
     mp.next_field().await.map_err(multipart_err)
 }
 
@@ -282,11 +293,7 @@ pub async fn remove(
     headers: HeaderMap,
     Path((id, sha, filename)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    if !is_sha256(&sha) {
-        return Err(ApiError::BadRequest(
-            "sha256: 64 символа hex в нижнем регистре".into(),
-        ));
-    }
+    check_sha(&sha)?;
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let attrib = crate::attrib::attribution(&p, &headers, None)?;
@@ -473,11 +480,30 @@ pub async fn download(
     q: Result<Query<BlobQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
-    if !is_sha256(&sha) {
-        return Err(ApiError::BadRequest(
+    check_sha(&sha)?;
+    admin_user(&p, &mut headers, &q)?;
+    let (owner, mime) = locate_blob(&st, &p, &headers, &sha, &filename).await?;
+    serve(&st, owner, &sha, &filename, &mime, method, &headers).await
+}
+
+/// `sha256` пути: 64 hex в нижнем регистре, иначе 400.
+pub(crate) fn check_sha(sha: &str) -> Result<(), ApiError> {
+    if is_sha256(sha) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
             "sha256: 64 символа hex в нижнем регистре".into(),
-        ));
+        ))
     }
+}
+
+/// `?user=` администратора — как `X-Zam-User` (браузер не ставит заголовок в `<img src>`);
+/// у остальных принципалов параметр игнорируется.
+pub(crate) fn admin_user(
+    p: &Principal,
+    headers: &mut HeaderMap,
+    q: &BlobQuery,
+) -> Result<(), ApiError> {
     if p.is_admin()
         && let Some(u) = q.user.as_deref()
     {
@@ -485,16 +511,29 @@ pub async fn download(
             .map_err(|_| ApiError::BadRequest("некорректный user".into()))?;
         headers.insert(USER_HEADER, v);
     }
-    let (owner, mime) = locate_blob(&st, &p, &headers, &sha, &filename).await?;
-    let path = BlobStore::new(&st.data_dir.blobs_dir(), owner).path_of(&sha);
+    Ok(())
+}
+
+/// Отдача блоба `sha` из каталога владельца `owner` с заголовками [`decorate`]: `ServeFile`
+/// (`Range`/206, `If-Modified-Since`), `If-None-Match` — 304; нет файла — 404 с WARN.
+pub(crate) async fn serve(
+    st: &AppState,
+    owner: Id,
+    sha: &str,
+    filename: &str,
+    mime: &str,
+    method: Method,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let path = BlobStore::new(&st.data_dir.blobs_dir(), owner).path_of(sha);
     if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        tracing::warn!(sha256 = %sha, "файл блоба отсутствует при записи в attachments");
+        tracing::warn!(sha256 = %sha, "файл блоба отсутствует при записи о привязке");
         return Err(ApiError::NotFound);
     }
     let etag = format!("\"{sha}\"");
-    if if_none_match_hits(&headers, &etag) {
+    if if_none_match_hits(headers, &etag) {
         let mut r = StatusCode::NOT_MODIFIED.into_response();
-        decorate(&mut r, &mime, &filename, &etag);
+        decorate(&mut r, mime, filename, &etag);
         return Ok(r);
     }
     let mut req = Request::builder().method(method).uri("/");
@@ -511,7 +550,7 @@ pub async fn download(
         .await
         .map_err(|e| ApiError::Internal(format!("отдача файла: {e}")))?;
     let mut r = resp.map(Body::new);
-    decorate(&mut r, &mime, &filename, &etag);
+    decorate(&mut r, mime, filename, &etag);
     Ok(r)
 }
 

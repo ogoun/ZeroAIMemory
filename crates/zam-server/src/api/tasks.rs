@@ -29,7 +29,7 @@ use zam_store::{
 use super::entries::{audit_details, unprocessable};
 use super::json_body;
 use super::nodes::audit_node;
-use super::scope::{Mode, entry_scope, live_entry};
+use super::scope::{Mode, deny_report_mutation, entry_scope, live_entry};
 use crate::app::AppState;
 use crate::attrib::attribution;
 use crate::auth::{Client, Principal};
@@ -75,6 +75,8 @@ async fn task_scope(
 ) -> Result<super::scope::EntryScope, ApiError> {
     let sc = entry_scope(st, p, headers, id, Mode::Write).await?;
     live_entry(&sc)?;
+    // отчёт — 409 (токену 404), а не «не задача»: неизменность раньше вида операции
+    deny_report_mutation(p, &sc)?;
     if sc.entry.kind != EntryKind::Task {
         return Err(unprocessable("захват есть только у задач (kind: task)"));
     }

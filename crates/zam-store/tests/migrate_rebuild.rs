@@ -424,7 +424,16 @@ async fn rebuild_migration_preserves_m4_db() {
     for (t, n) in before.iter().filter(|(t, _)| t.as_str() != "meta") {
         assert_eq!(after.get(t), Some(n), "таблица {t}");
     }
-    // индексы, автоиндексы и триггеры `entries`, `edges` и детей пересозданы все
+    // индексы, автоиндексы и триггеры `entries`, `edges` и детей пересозданы все; 0022 (M5.5)
+    // добавляет только триггеры неизменности отчётов
+    let added = [
+        "entries: trigger entries_report_immutable",
+        "entry_revisions: trigger entry_revisions_report_once",
+    ];
+    let objects_after: Vec<String> = objects_after
+        .into_iter()
+        .filter(|o| !added.contains(&o.as_str()))
+        .collect();
     assert_eq!(objects_after, objects_before);
     // FTS по заголовку находит запись
     let hits = search_fts(

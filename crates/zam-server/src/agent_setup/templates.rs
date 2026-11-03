@@ -1,7 +1,8 @@
 //! Шаблоны по умолчанию блока инструкции агента (§14.2) и полный протокол `GET /agent-guide`.
 //!
-//! Блок v3 (M4.5 §11): правило — одна строка, не больше 500 токенов bge-m3 в худшем случае
-//! теста (ru и en); пояснения — в протоколе (`guide.{ru,en}.md`), а не в блоке.
+//! Блок v4 (M4.5 §11, M5.5 — строка об отчётах `zam report`): правило — одна строка, не больше
+//! 500 токенов bge-m3 в худшем случае теста (ru и en); пояснения — в протоколе
+//! (`guide.{ru,en}.md`), а не в блоке.
 //!
 //! Шаблон — текст между маркерами `<!-- zeroaimemory:begin vN -->` и `<!-- zeroaimemory:end -->`
 //! (маркеры добавляет [`super::render_block`]). Подстановки:
@@ -16,12 +17,13 @@
 pub const BLOCK_RU: &str = "\
 ## Память ZeroAIMemory
 ZeroAIMemoryUrl={url}
-Токен — `ZAM_TOKEN`. Решение: {solution}.
+Решение: {solution}.
 Без MCP — `zam`; протокол — `zam guide`.
 
-- Перед задачей — `memory_search` (исследование — `insight_kinds=[experiment,failure]`) → `[cache]` или `memory_read` пачкой (`tier=L1`/`section`) → сводку в `memory_cache_put`.
+- Перед задачей — `memory_search` (исследование — `insight_kinds=[experiment,failure]`) → `[cache]` или `memory_read` пачкой → сводку в `memory_cache_put`.
 - `memory_log <kind>` пишет, `memory_update_entry` с `rev` правит (409 — перечитай).
 - Ловушка, сбой → `insight` gotcha|failure с триггерами (не про проект — scope=global); изменение → `changelog`; устарело → supersede/retract.
+- Итог исследования, эксперимента, сравнения — пользователю `zam report`, себе — `insight`.
 - Задача → `task`: claim перед работой, `status` с `next_step`.
 - Вопрос человеку → `question`; его ответ в чате → `answer`.
 - Код — с `refs.files`; новое понятие → `term`, пиши каноническими терминами.
@@ -34,12 +36,13 @@ ZeroAIMemoryUrl={url}
 pub const BLOCK_EN: &str = "\
 ## ZeroAIMemory memory
 ZeroAIMemoryUrl={url}
-Token — `ZAM_TOKEN`. Solution: {solution}.
+Solution: {solution}.
 No MCP — `zam`; protocol — `zam guide`.
 
-- Before a task — `memory_search` (research — `insight_kinds=[experiment,failure]`) → `[cache]` or `memory_read` in one call (`tier=L1`/`section`) → summary into `memory_cache_put`.
+- Before a task — `memory_search` (research — `insight_kinds=[experiment,failure]`) → `[cache]` or `memory_read` in one call → summary into `memory_cache_put`.
 - `memory_log <kind>` writes, `memory_update_entry` with `rev` edits (409 — reread).
 - Gotcha, failure → `insight` gotcha|failure with triggers (not about the project — scope=global); change → `changelog`; outdated → supersede/retract.
+- Outcome of research, an experiment, a comparison — for the user `zam report <file.md>`, for yourself — `insight`.
 - Task → `task`: claim before work, `status` with `next_step`.
 - Question for the human → `question`; their answer in chat → `answer`.
 - Code — with `refs.files`; new concept → `term`, write with canonical terms.

@@ -16,6 +16,7 @@
   import Lightbox from './Lightbox.svelte';
   import {
     ApiError,
+    HIGHLIGHT_CSS,
     getNode,
     getNodeHtml,
     listAttachments,
@@ -267,7 +268,7 @@
 </script>
 
 <svelte:head>
-  <link rel="stylesheet" href="api/v1/render/highlight.css" />
+  <link rel="stylesheet" href={HIGHLIGHT_CSS} />
 </svelte:head>
 
 <article class="docview" class:editing={editing && tab === 'doc'}>

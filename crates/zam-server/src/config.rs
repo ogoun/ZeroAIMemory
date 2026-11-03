@@ -46,6 +46,7 @@ pub struct ServerConfig {
     pub limits: LimitsSection,
     pub vault: VaultSection,
     pub docs: DocsSection,
+    pub reports: ReportsSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -913,6 +914,53 @@ pub struct LimitsSection {
     pub blob_max_bytes: usize,
 }
 
+/// Секция `[reports]` (M5.5 §5–6): пределы файлов отчёта. Размер одного файла — общий предел
+/// блоба `limits.blob_max_bytes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportsSection {
+    /// Не больше файлов в одном отчёте (1..=1024, по умолчанию 64); больше — 422.
+    pub max_files: u32,
+    /// Сумма размеров файлов отчёта, байт (по умолчанию 200 МиБ); больше — 413.
+    pub max_total_bytes: u64,
+    /// Предел отчёта через MCP (JSON, файлы в base64): тело плюс декодированные файлы, байт
+    /// (по умолчанию 16 МиБ, не больше `max_total_bytes`); больше — 413 с подсказкой `zam report`.
+    pub mcp_max_bytes: u64,
+}
+
+impl Default for ReportsSection {
+    fn default() -> Self {
+        Self {
+            max_files: 64,
+            max_total_bytes: 209_715_200,
+            mcp_max_bytes: 16_777_216,
+        }
+    }
+}
+
+impl ReportsSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("reports.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=1024).contains(&self.max_files) {
+            return Err(bad("max_files", "от 1 до 1024"));
+        }
+        if self.max_total_bytes == 0 {
+            return Err(bad("max_total_bytes", "больше 0"));
+        }
+        if self.mcp_max_bytes == 0 || self.mcp_max_bytes > self.max_total_bytes {
+            return Err(bad(
+                "mcp_max_bytes",
+                "больше 0 и не больше reports.max_total_bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -1027,6 +1075,7 @@ impl Default for ServerConfig {
             },
             vault: VaultSection::default(),
             docs: DocsSection::default(),
+            reports: ReportsSection::default(),
         }
     }
 }
@@ -1199,6 +1248,7 @@ pub fn load(
     cfg.cache.validate()?;
     cfg.recall.validate()?;
     cfg.docs.validate()?;
+    cfg.reports.validate()?;
     Ok(cfg)
 }
 
@@ -2040,6 +2090,54 @@ master_key = \"x\"
         assert_eq!(c.recall.digest_tokens, 1500);
         assert_eq!(c.recall.recovery_tokens, 2000);
         assert_eq!(c.recall.brief_tokens, 800);
+    }
+
+    #[test]
+    fn reports_section_defaults() {
+        let r = load(None, &[], &Default::default()).unwrap().reports;
+        assert_eq!(
+            (r.max_files, r.max_total_bytes, r.mcp_max_bytes),
+            (64, 209_715_200, 16_777_216)
+        );
+    }
+
+    #[test]
+    fn reports_section_validation() {
+        for (k, v) in [
+            ("ZAM_REPORTS__MAX_FILES", "0"),
+            ("ZAM_REPORTS__MAX_FILES", "1025"),
+            ("ZAM_REPORTS__MAX_TOTAL_BYTES", "0"),
+            ("ZAM_REPORTS__MCP_MAX_BYTES", "0"),
+            ("ZAM_REPORTS__MCP_MAX_BYTES", "209715201"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("reports."), "{k}={v}: {e}");
+        }
+        // mcp_max_bytes сверяется с итоговым max_total_bytes
+        let e = load(
+            None,
+            &[env("ZAM_REPORTS__MAX_TOTAL_BYTES", "1048576")],
+            &Default::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("reports.mcp_max_bytes"), "{e}");
+        let ok = vec![
+            env("ZAM_REPORTS__MAX_FILES", "1024"),
+            env("ZAM_REPORTS__MAX_TOTAL_BYTES", "1048576"),
+            env("ZAM_REPORTS__MCP_MAX_BYTES", "1048576"),
+        ];
+        let c = load(None, &ok, &Default::default()).unwrap();
+        assert_eq!(c.reports.max_files, 1024);
+        // неизвестный ключ секции — ошибка
+        let e = load(
+            None,
+            &[env("ZAM_REPORTS__MAX_IMAGES", "3")],
+            &Default::default(),
+        );
+        assert!(e.is_err());
     }
 
     #[test]

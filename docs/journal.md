@@ -394,3 +394,16 @@
 - Попутно закрыты Minor ревью задач 10 и 11 (даты XLSX «день 0» и литералы, `ppsm`/`potm`, сверка запросов `eval --compare`, второй отрицательный ping pdfium в smoke, перечень текстовых расширений в README-install).
 - **Финальное ревью ветки** (журнал этапа, раздел «Финальное ревью ветки»): исправлены точки вложений у `index: false`, кэш извлечения (вид разбора, лимиты, частичное по сроку; миграция 0021), CSV в UTF-16/Windows-1251, дешёвая изоляция `doc-worker` и проверка его ответов, отдача JavaScript/CSS как `application/octet-stream`; документация (память сервера ≈ 420 МиБ на слот и др.). Песочница ОС рабочего процесса — M7.
 - Приёмка M5: CI на финальном коммите ветки — зелёный на обеих ОС перед merge (e32fe1f — флейк времени хуков на ubuntu, допуск теста — 5 %); условие — только ответы владельца (журнал этапа, «Уточнить у владельца»).
+
+## 2026-11-03 — Этап M5.5 (отчёты): итог
+
+- Выполнены задачи 1–8 плана `docs/plans/2026-11-01-m5.5-reports.md` на ветке `m5.5-reports`; решения контроллера и исполнителя, отложенное (список M7) и вопросы владельцу (1–6) — `docs/plans/2026-11-01-m5.5-reports-log.md` («Итог M5.5», «Уточнить у владельца»). Версия workspace и WebUI — `0.0.8-m5.5`, ТЗ — v1.21 (спецификация `docs/specs/2026-11-01-m5.5-reports.md` перенесена: §7.11, §15.6 и по разделам).
+- Что умеет M5.5 (подробно — CHANGELOG `[0.0.8-m5.5]`):
+  - журнал решения «Отчёты» (вид `report`, буква `p:`, миграция 0022, файлы — `entry_attachments`, неизменность — 409 и триггеры SQLite);
+  - агент пишет отчёт `zam report <файл.md>` (картинки и файлы по относительным ссылкам одним multipart) или MCP `memory_log kind=report` (base64), ответ — только ссылка на страницу; пределы `[reports]`, семафор больших тел;
+  - отчёт агенту не виден ни одним путём (404 как несуществующий, `kinds ∋ report` — 400); удаляет и восстанавливает только владелец решения в WebUI (токен — 404, решение исполнителя задачи 4 вместо 403 спецификации);
+  - WebUI: лента с миниатюрами, фильтры, поиск, корзина владельца, страница с формулами, Mermaid, оглавлением, ссылками и файлами, Ctrl+K; PDF печатью браузера (готовность картинок, модулей и шрифтов, A4, светлая тема; повторная печать готовой копии сразу);
+  - блок инструкции v4 (строка `zam report`, 494 из 500 токенов) и раздел протокола «Отчёты».
+- **Критерии M5.5 (§19 ТЗ, спецификация §12)** — `crates/zam-cli/tests/m55_acceptance.rs` (`acceptance_cli_report_three_png_formula_mermaid`, `acceptance_mcp_report_same`), `crates/zam-server/tests/m55_acceptance.rs` (`acceptance_patch_409_repeat_new_report`, `acceptance_token_sees_nothing_webui_search_finds`, `acceptance_spaces_and_rights`, `acceptance_unreferenced_image_and_limits`), e2e `web/e2e/reports-print.spec.ts::acceptance_pdf_from_cli_report`; smoke комплекта — `zam report` → лента по cookie → файл картинки.
+- **Прогоны приёмки** (Windows 11, HDD; логи — `.tmp/m55/task8/`): полный `ZAM_REQUIRE_ML=1 cargo test --workspace --no-fail-fast -j 2` (debug) — **1935 passed, 0 failed, 25 ignored**; fmt и clippy `-D warnings` — чисто; WebUI check/build/size/test:build — в норме; e2e WebUI — 71 passed. Smoke комплекта Windows cpu — **SMOKE OK, 35 шагов**.
+- **Приёмка M5.5 условна** до зелёного CI (контроллер; Edge, CUDA, стенд Linux) и ответов владельца на вопросы журнала этапа; merge и тег — контроллер. Дальше — M5.6 (карта кода), M6, M7.

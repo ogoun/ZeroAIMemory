@@ -1,4 +1,4 @@
-//! Подключение агента (§14, §15.5; задача 11 M4, задача 13 M4.5): `GET /agent-setup` (блок v3,
+//! Подключение агента (§14, §15.5; задача 11 M4, задача 13 M4.5): `GET /agent-setup` (блок v4,
 //! фрагменты `.mcp.json` и хуков, установка `zam`), шаблоны в `settings` с версией,
 //! `GET /agent-guide`, `GET /downloads/zam/{os}-{arch}`.
 mod common;
@@ -57,7 +57,7 @@ fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
 }
 
 #[tokio::test]
-async fn agent_setup_block_v3_under_500_tokens_ru_en() {
+async fn agent_setup_block_v4_under_500_tokens_ru_en() {
     let Some(counter) = bge_counter() else {
         return;
     };
@@ -97,7 +97,7 @@ async fn agent_setup_block_v3_under_500_tokens_ru_en() {
                     .await;
                     let block = j["block"].as_str().unwrap();
                     assert!(
-                        block.starts_with("<!-- zeroaimemory:begin v3 -->\n"),
+                        block.starts_with("<!-- zeroaimemory:begin v4 -->\n"),
                         "{block}"
                     );
                     // подставлены реальные адрес, GUID и имя решения (решение контроллера T11-c)
@@ -111,6 +111,13 @@ async fn agent_setup_block_v3_under_500_tokens_ru_en() {
                     let guid = j["solution"]["agent_solution_id"].as_str().unwrap();
                     assert!(block.contains(guid), "{block}");
                     assert!(block.contains(shown.as_str()), "{block}");
+                    // строка v4 (M5.5): итог для пользователя — отчёт, выводы для себя — insight
+                    let report = if lang == "ru" {
+                        "сравнения — пользователю `zam report`, себе — `insight`."
+                    } else {
+                        "a comparison — for the user `zam report <file.md>`, for yourself — `insight`."
+                    };
+                    assert!(block.contains(report), "{block}");
                     assert_eq!(
                         j["solution"]["name"],
                         name.as_str(),
@@ -134,10 +141,10 @@ async fn agent_setup_block_v3_under_500_tokens_ru_en() {
 async fn agent_setup_contains_axiom_rule_and_rev_rule() {
     let a = api("agent-setup-rules", |_| {}).await;
     let ru = setup(&a, &a.token, "agent=claude").await;
-    assert_eq!(ru["version"], 3);
+    assert_eq!(ru["version"], 4);
     assert_eq!(ru["lang"], "ru");
     let b = ru["block"].as_str().unwrap();
-    assert!(b.starts_with("<!-- zeroaimemory:begin v3 -->\n"), "{b}");
+    assert!(b.starts_with("<!-- zeroaimemory:begin v4 -->\n"), "{b}");
     assert!(b.ends_with("<!-- zeroaimemory:end -->\n"), "{b}");
     assert!(
         b.contains("ZeroAIMemoryUrl=http://memory.lan:7700\n"),
@@ -167,7 +174,7 @@ async fn agent_setup_contains_axiom_rule_and_rev_rule() {
     let en = setup(&a, &a.token, "agent=codex&lang=en&rules_write=true").await;
     let b = en["block"].as_str().unwrap();
     for want in [
-        "<!-- zeroaimemory:begin v3 -->",
+        "<!-- zeroaimemory:begin v4 -->",
         "`axiom` — only on the user's direct instruction",
         "`hypothesis`/`theorem` with `contradicts`",
         "`memory_update_entry` with `rev` edits (409 — reread)",
@@ -480,7 +487,7 @@ async fn template_edit_bumps_version() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let s = r.json();
-    assert_eq!(s["agent_setup"]["version"], 3);
+    assert_eq!(s["agent_setup"]["version"], 4);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], false);
     assert!(
         s["agent_setup"]["templates"]["codex.en"]["text"]
@@ -488,9 +495,9 @@ async fn template_edit_bumps_version() {
             .unwrap()
             .contains("{url}")
     );
-    assert!(!reminder(&a, 3).await.contains("устарел"));
+    assert!(!reminder(&a, 4).await.contains("устарел"));
 
-    // свой шаблон: версия 4, блок — свой текст с маркером v4
+    // свой шаблон: версия 5, блок — свой текст с маркером v5
     let tpl = "## Память\nZeroAIMemoryUrl={url}\nРешение: {solution}. {rules}\r\n";
     let (st, s) = admin_settings(
         &a,
@@ -498,29 +505,29 @@ async fn template_edit_bumps_version() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{s}");
-    assert_eq!(s["agent_setup"]["version"], 4);
+    assert_eq!(s["agent_setup"]["version"], 5);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], true);
     let j = setup(&a, &a.token, "agent=claude").await;
-    assert_eq!(j["version"], 4);
+    assert_eq!(j["version"], 5);
     assert_eq!(j["template_custom"], true);
     assert_eq!(
         j["block"],
-        "<!-- zeroaimemory:begin v4 -->\n## Память\nZeroAIMemoryUrl=http://memory.lan:7700\n\
+        "<!-- zeroaimemory:begin v5 -->\n## Память\nZeroAIMemoryUrl=http://memory.lan:7700\n\
          Решение: `.zeroaimemory/solution.toml` (создаёт `zam init`).\n\
          <!-- zeroaimemory:end -->\n"
     );
     // версия одна на сервер: и у других агентов и языков
     assert_eq!(
         setup(&a, &a.token, "agent=codex&lang=en").await["version"],
-        4
+        5
     );
     // /recall(session_start) сравнивает с той же версией
-    let t = reminder(&a, 3).await;
+    let t = reminder(&a, 4).await;
     assert!(
-        t.contains("Блок ZeroAIMemory устарел (v3 → v4): обнови через `zam init` или WebUI"),
+        t.contains("Блок ZeroAIMemory устарел (v4 → v5): обнови через `zam init` или WebUI"),
         "{t}"
     );
-    assert!(!reminder(&a, 4).await.contains("устарел"));
+    assert!(!reminder(&a, 5).await.contains("устарел"));
 
     // тот же текст повторно — версия не меняется; другой — растёт; сброс — тоже растёт
     let (_, s) = admin_settings(
@@ -528,26 +535,26 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"claude.ru": tpl}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 4);
+    assert_eq!(s["agent_setup"]["version"], 5);
     let (_, s) = admin_settings(
         &a,
         json!({"agent_setup": {"templates": {"claude.ru": "{url} шаблон-v4-маркер", "agents.en": "{url} en"}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 5, "один запрос — одна версия");
+    assert_eq!(s["agent_setup"]["version"], 6, "один запрос — одна версия");
     let (_, s) = admin_settings(
         &a,
         json!({"agent_setup": {"templates": {"claude.ru": null}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 6);
+    assert_eq!(s["agent_setup"]["version"], 7);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], false);
     let j = setup(&a, &a.token, "agent=claude").await;
     assert!(
         j["block"]
             .as_str()
             .unwrap()
-            .starts_with("<!-- zeroaimemory:begin v6 -->\n## Память ZeroAIMemory\n")
+            .starts_with("<!-- zeroaimemory:begin v7 -->\n## Память ZeroAIMemory\n")
     );
     // сброс шаблона по умолчанию — без изменения версии
     let (_, s) = admin_settings(
@@ -555,7 +562,7 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"codex.ru": null}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 6);
+    assert_eq!(s["agent_setup"]["version"], 7);
     // сохранение текста, совпадающего с действующим (здесь — по умолчанию), версию не меняет
     // (fix round 1, M-4)
     let default_en = s["agent_setup"]["templates"]["codex.en"]["text"].clone();
@@ -564,7 +571,7 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"codex.en": default_en}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 6);
+    assert_eq!(s["agent_setup"]["version"], 7);
     assert_eq!(s["agent_setup"]["templates"]["codex.en"]["custom"], false);
 
     // неверные шаблоны и ключи — 400, токен — 403
@@ -601,7 +608,7 @@ async fn template_edit_bumps_version() {
         "текст шаблона в аудите"
     );
     assert_eq!(e[0]["details"]["reset"], true);
-    assert_eq!(e[0]["details"]["version"], 6);
+    assert_eq!(e[0]["details"]["version"], 7);
 }
 
 #[tokio::test]
@@ -668,11 +675,11 @@ async fn template_preview_renders_unsaved() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
-    assert_eq!(j["version"], 3);
-    assert_eq!(j["version_next"], 4);
+    assert_eq!(j["version"], 4);
+    assert_eq!(j["version_next"], 5);
     assert_eq!(
         j["block"],
-        "<!-- zeroaimemory:begin v4 -->\nПамять: http://memory.lan:7700\n\
+        "<!-- zeroaimemory:begin v5 -->\nПамять: http://memory.lan:7700\n\
          Решение: «Пример» (`00000000-0000-0000-0000-000000000000`).\n\
          <!-- zeroaimemory:end -->\n"
     );
@@ -684,7 +691,7 @@ async fn template_preview_renders_unsaved() {
         .json();
     let def = s["agent_setup"]["templates"]["claude.ru"]["text"].clone();
     let r = preview(json!({"agent": "claude", "lang": "ru", "template": def})).await;
-    assert_eq!(r.json()["version_next"], 3, "{}", r.text());
+    assert_eq!(r.json()["version_next"], 4, "{}", r.text());
     // проверка — как у сохранения; версия не меняется
     let r = preview(json!({"agent": "claude", "lang": "ru", "template": "без адреса"})).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
@@ -694,7 +701,7 @@ async fn template_preview_renders_unsaved() {
         .adm(Method::GET, "/api/v1/admin/settings", None, None)
         .await
         .json();
-    assert_eq!(s["agent_setup"]["version"], 3);
+    assert_eq!(s["agent_setup"]["version"], 4);
     // токен — 403
     let r = a
         .tok_h(
@@ -815,15 +822,76 @@ async fn agent_setup_codex_hooks_new_events() {
     assert_eq!(h.as_object().unwrap().len(), 7, "{h}");
 }
 
-/// Блок v2 из M4 устарел: `/recall(session_start)` напоминает обновить его до v3.
+/// Блок v3 из M4.5 устарел (M5.5 добавил строку об отчётах): `/recall(session_start)` напоминает
+/// обновить его до v4.
 #[tokio::test]
-async fn block_version_reminder_v2_to_v3() {
-    let a = api("agent-setup-v2-v3", |_| {}).await;
-    let t = reminder(&a, 2).await;
+async fn block_version_reminder_v3_to_v4() {
+    let a = api("agent-setup-v3-v4", |_| {}).await;
+    let t = reminder(&a, 3).await;
     assert!(
-        t.contains("Блок ZeroAIMemory устарел (v2 → v3): обнови через `zam init` или WebUI"),
+        t.contains("Блок ZeroAIMemory устарел (v3 → v4): обнови через `zam init` или WebUI"),
         "{t}"
     );
-    assert!(!reminder(&a, 3).await.contains("устарел"));
-    assert_eq!(setup(&a, &a.token, "agent=claude").await["version"], 3);
+    assert!(!reminder(&a, 4).await.contains("устарел"));
+    assert_eq!(setup(&a, &a.token, "agent=claude").await["version"], 4);
+}
+
+/// Протокол `GET /agent-guide` (ru, en) — раздел об отчётах: для кого, когда, ссылки на
+/// картинки и файлы, лимиты, MCP base64, агент отчёты не читает.
+#[tokio::test]
+async fn guide_has_reports_section() {
+    let a = api("agent-guide-reports", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    let ru = guide("").await;
+    let sec = ru.split("## Отчёты\n").nth(1).expect("раздел «## Отчёты»");
+    let sec = sec.split("\n## ").next().unwrap();
+    for want in [
+        "для пользователя",
+        "исследования, эксперимента, обучения",
+        "`zam report <файл.md>",
+        "![кривая](figs/loss.png)",
+        "ссылка на каталог",
+        "до 64 файлов, всего до 200 МиБ",
+        "base64",
+        "16 МиБ",
+        "Неизменяем",
+        "Агент отчёты не читает",
+        "`insight`",
+    ] {
+        assert!(sec.contains(want), "{want}: {sec}");
+    }
+    let en = guide("?lang=en").await;
+    let sec = en
+        .split("## Reports\n")
+        .nth(1)
+        .expect("section «## Reports»");
+    let sec = sec.split("\n## ").next().unwrap();
+    for want in [
+        "for the user",
+        "research, an experiment, model training",
+        "`zam report <file.md>",
+        "up to 64 files, 200 MiB in total",
+        "a link to a directory",
+        "base64",
+        "16 MiB",
+        "Immutable",
+        "Agents do not read reports",
+        "`insight`",
+    ] {
+        assert!(sec.contains(want), "{want}: {sec}");
+    }
 }

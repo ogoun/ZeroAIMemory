@@ -387,7 +387,8 @@ fn entry_set(kind: EntryKind, refs: &[FileRef], data: &serde_json::Value) -> Vec
     out
 }
 
-/// Ссылки новой записи (в транзакции её создания).
+/// Ссылки новой записи (в транзакции её создания). Отчёт строк не пишет: его `data.refs` —
+/// только данные, следов отчёта у файлов и заметок нет (спецификация M5.5 §7).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_new_entry(
     tx: &Connection,
@@ -399,6 +400,9 @@ pub(crate) fn sync_new_entry(
     a: &Attribution,
     now: &str,
 ) -> Result<(), StoreError> {
+    if kind == EntryKind::Report {
+        return Ok(());
+    }
     let set = entry_set(kind, refs, data);
     if set.is_empty() {
         return Ok(());
@@ -413,7 +417,7 @@ pub(crate) fn sync_new_entry(
 
 /// Ссылки после правки записи: `refs` задан — набор заменяется (с путями `data.refs.files`
 /// итоговой `data` changelog); иначе у changelog с новой `data` (`data_changed`) новые пути
-/// строк дописываются без хэша.
+/// строк дописываются без хэша. Отчёт неизменяем → `ReportImmutable`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_patched_entry(
     tx: &Connection,
@@ -426,6 +430,9 @@ pub(crate) fn sync_patched_entry(
     a: &Attribution,
     now: &str,
 ) -> Result<(), StoreError> {
+    if kind == EntryKind::Report {
+        return Err(StoreError::ReportImmutable);
+    }
     let owner = TargetRef {
         kind: TargetKind::Entry,
         id,

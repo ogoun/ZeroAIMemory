@@ -55,6 +55,10 @@ pub enum ApiError {
     /// решения из первого ответа.
     #[error("вопрос уже отвечен")]
     AlreadyAnswered { decision_id: Option<zam_core::Id> },
+    /// 409 `/problems/report-immutable` (M5.5 §4): отчёт не меняется после записи —
+    /// исправление пишется новым отчётом.
+    #[error("отчёт неизменяем — напишите новый")]
+    ReportImmutable,
     /// 422 `/problems/reason-required` (M4.5 §3): переоткрытие задачи без причины.
     #[error("{0}")]
     ReasonRequired(String),
@@ -87,8 +91,15 @@ pub enum ApiError {
     Certainty(zam_store::CertaintyError),
     #[error("слишком много запросов")]
     RateLimited { retry_after_s: u64 },
+    /// 503 `/problems/busy` с `Retry-After`: заняты разрешения на большие тела запросов
+    /// ([`crate::api::big_body`]).
+    #[error("сервер занят обработкой больших запросов — повторите позже")]
+    Busy { retry_after_s: u64 },
     #[error("{0}")]
     Unavailable(String),
+    /// 408 `/problems/timeout`: тело запроса не получено в срок ([`crate::api::big_body`]).
+    #[error("{0}")]
+    RequestTimeout(String),
     /// 503 `/problems/vault-locked` (§7.6): мастер-ключ не подходит или файла ключа нет при
     /// существующих ключах; в `detail` — причина (без путей и ключей).
     #[error("Vault заблокирован: {0}")]
@@ -153,6 +164,11 @@ impl ApiError {
                 "/problems/already-answered",
                 "Conflict",
             ),
+            ApiError::ReportImmutable => (
+                StatusCode::CONFLICT,
+                "/problems/report-immutable",
+                "Conflict",
+            ),
             ApiError::ReasonRequired(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/reason-required",
@@ -202,6 +218,16 @@ impl ApiError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "/problems/rate-limited",
                 "Too Many Requests",
+            ),
+            ApiError::Busy { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "/problems/busy",
+                "Service Unavailable",
+            ),
+            ApiError::RequestTimeout(_) => (
+                StatusCode::REQUEST_TIMEOUT,
+                "/problems/timeout",
+                "Request Timeout",
             ),
             ApiError::Unavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -263,6 +289,7 @@ impl From<StoreError> for ApiError {
             StoreError::TermConflict(c) => ApiError::TermConflict(c),
             StoreError::IdempotencyMismatch(m) => ApiError::IdempotencyMismatch(m),
             StoreError::Certainty(c) => ApiError::Certainty(c),
+            StoreError::ReportImmutable => ApiError::ReportImmutable,
             other => ApiError::Internal(other.to_string()),
         }
     }
@@ -313,7 +340,7 @@ impl IntoResponse for ApiError {
             HeaderValue::from_static("application/problem+json"),
         );
         match self {
-            ApiError::RateLimited { retry_after_s } => {
+            ApiError::RateLimited { retry_after_s } | ApiError::Busy { retry_after_s } => {
                 h.insert(header::RETRY_AFTER, HeaderValue::from(retry_after_s));
             }
             // RFC 9110 §15.5.2: 401 обязан нести схему.
@@ -348,5 +375,15 @@ mod tests {
         assert!(!d.contains("SECRET-MARKER"), "{d}");
         assert!(d.contains("panic = true"), "{d}");
         assert!(!err.to_string().contains("SECRET-MARKER"));
+    }
+
+    /// Неизменность отчёта из хранилища — 409 `/problems/report-immutable`, а не 500.
+    #[test]
+    fn report_immutable_is_409() {
+        let e = ApiError::from(StoreError::ReportImmutable);
+        assert!(matches!(e, ApiError::ReportImmutable));
+        let (status, kind, _) = e.parts();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(kind, "/problems/report-immutable");
     }
 }

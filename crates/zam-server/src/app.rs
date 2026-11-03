@@ -54,6 +54,8 @@ pub struct AppState {
     pub maintenance: Arc<Maintenance>,
     /// Кэш словаря доменных терминов по базам (M4.5, [`crate::glossary`]).
     pub glossary: Arc<crate::glossary::GlossaryCache>,
+    /// Разрешения на большие тела запросов (`POST /entries` с отчётом MCP, `/mcp`; M5.5).
+    pub big_bodies: api::big_body::BigBodies,
     /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
     /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
     #[cfg(feature = "test-hooks")]
@@ -297,6 +299,10 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     let state = AppState {
         maintenance,
         glossary: Arc::default(),
+        big_bodies: api::big_body::BigBodies::new(
+            api::big_body::BIG_BODY_PERMITS,
+            api::note_body_max(&cfg.limits),
+        ),
         users,
         index,
         docs,

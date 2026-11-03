@@ -29,6 +29,9 @@
 //!   `revisit`); `include_history: true` снимает фильтр статуса. Фильтр действует и в Qdrant
 //!   (`kinds`, `must_not` по исключённым статусам), и в FTS, и в проверке векторных хитов
 //!   ([`live_chunks`]); у changelog и release статуса нет — они проходят всегда.
+//!   Отчёты (M5.5 §7) — только сессиям WebUI: вид `report` у них допустим и входит в умолчания
+//!   (карточка `{kind: "report", id: "p:<id>", space, title, snippet, created_at}`); токену вида
+//!   нет (400 тем же текстом, что у неизвестного), его умолчания и `scope_hash` прежние.
 //!   `filters.certainty` — эпистемические статусы (`axiom`, `theorem`, `hypothesis`, §7.5)
 //!   заметок и записей; пусто — любые, иначе цели без статуса не проходят (Qdrant, FTS и
 //!   проверка хитов). Бусты `search.boost_axiom`/`boost_theorem`/`boost_hypothesis`
@@ -337,6 +340,34 @@ const DEFAULT_KINDS: [&str; 7] = [
     "question",
     "attachment",
 ];
+/// Отчёт (M5.5 §7): вид целей только сессий WebUI (поиск Ctrl+K) — в допустимых и по
+/// умолчанию; токену (агенту) такого вида нет: `report` → 400 тем же текстом, что у
+/// неизвестного вида, умолчания и `scope_hash` токена прежние.
+const REPORT: &str = "report";
+/// [`KINDS`] сессий WebUI.
+const HUMAN_KINDS: [&str; 10] = [
+    "note",
+    "insight",
+    "changelog",
+    "release",
+    "term",
+    "task",
+    "question",
+    "folder",
+    "attachment",
+    REPORT,
+];
+/// [`DEFAULT_KINDS`] сессий WebUI.
+const HUMAN_DEFAULT_KINDS: [&str; 8] = [
+    "note",
+    "insight",
+    "changelog",
+    "release",
+    "term",
+    "question",
+    "attachment",
+    REPORT,
+];
 /// Статусы записей `filters.status`: insight и term, с M4.5 — task и question (спецификация
 /// M4.5 §1.3). Умолчания по виду — [`default_statuses`].
 const STATUSES: [&str; 11] = [
@@ -482,9 +513,19 @@ fn vector_filter(
     }
 }
 
-/// Фильтр целей запроса: виды и статусы (`include_history` — любые статусы).
-fn target_filter(f: &Filters, include_history: bool) -> Result<TargetFilter, ApiError> {
-    let kinds = filter_list("filters.kinds", f.kinds.as_ref(), &KINDS, &DEFAULT_KINDS)?;
+/// Фильтр целей запроса: виды и статусы (`include_history` — любые статусы); `human` — сессия
+/// WebUI (виды с `report`, [`HUMAN_KINDS`]), иначе токен.
+fn target_filter(
+    f: &Filters,
+    include_history: bool,
+    human: bool,
+) -> Result<TargetFilter, ApiError> {
+    let (allowed, default): (&[&str], &[&str]) = if human {
+        (&HUMAN_KINDS, &HUMAN_DEFAULT_KINDS)
+    } else {
+        (&KINDS, &DEFAULT_KINDS)
+    };
+    let kinds = filter_list("filters.kinds", f.kinds.as_ref(), allowed, default)?;
     let explicit = f.kinds.as_ref().is_some_and(|k| !k.is_empty());
     let statuses = filter_list(
         "filters.status",
@@ -544,26 +585,31 @@ fn path_prefix(sc: &ScopeReq) -> Option<String> {
 
 /// `scope_hash` кэша выжимок (§9.4) для области запроса: решение, флаги Knowledge и Rules (по
 /// умолчанию — да), префикс пути, область и фильтры после умолчаний (списки упорядочены) —
-/// одинаковая для `POST /search` и `POST /cache`.
+/// одинаковая для `POST /search` и `POST /cache`; `human` — сессия WebUI ([`target_filter`]).
 pub(crate) fn cache_scope_hash(
     sc: &ScopeReq,
     f: &Filters,
     include_history: bool,
     solution: Option<&SolutionGuid>,
+    human: bool,
 ) -> Result<String, ApiError> {
-    let mut t = target_filter(f, include_history)?;
+    let mut t = target_filter(f, include_history, human)?;
     t.area = area_filter(sc.area.as_deref())?;
     Ok(scope_key(sc, &t, solution))
 }
 
+/// Ключ области ([`cache_scope_hash`]). Вид `report` в ключ не входит: отчёт источником выжимки
+/// не бывает (M5.5 §7), и поиск WebUI с умолчаниями (там есть `report`) находит выжимки той же
+/// области агента.
 fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -> String {
     let sorted = |v: &[String]| {
         let mut v = v.to_vec();
         v.sort();
         v
     };
+    let kinds: Vec<String> = t.kinds.iter().filter(|k| *k != REPORT).cloned().collect();
     let mut filters = json!({
-        "kinds": sorted(&t.kinds),
+        "kinds": sorted(&kinds),
         "status": sorted(&t.statuses),
         "certainty": sorted(&t.certainty),
     });
@@ -1468,6 +1514,11 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Tim
             o.insert("insight_kind".into(), json!(e.insight_kind));
             o.insert("certainty".into(), json!(e.certainty));
             o.insert("title".into(), json!(e.title));
+            // карточка отчёта (только WebUI, M5.5 §7): ссылка `p:<id>` и дата создания
+            if e.kind == REPORT {
+                o.insert("id".into(), json!(format!("p:{}", h.target.id)));
+                o.insert("created_at".into(), json!(fmt_ts(e.created_at)));
+            }
         }
         None => {
             let kind = match h.target.kind {
@@ -2010,7 +2061,7 @@ pub async fn search(
         )));
     }
     let budget = req.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS);
-    let mut kinds = target_filter(&req.filters, req.include_history)?;
+    let mut kinds = target_filter(&req.filters, req.include_history, p.is_human())?;
     kinds.area = area_filter(req.scope.area.as_deref())?;
     let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
@@ -3284,6 +3335,7 @@ mod tests {
             insight_kind: Some("gotcha".into()),
             certainty: Some("hypothesis".into()),
             title: "Bash-скрипты должны иметь LF".into(),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
         });
         let mut p = Packed {
             item: it,
@@ -3306,6 +3358,7 @@ mod tests {
             insight_kind: Some("fix".into()),
             certainty: None,
             title: "Исправлен CRLF".into(),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
         });
         p.tokens = 9;
         let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
@@ -3327,7 +3380,7 @@ mod tests {
 
     #[test]
     fn filters_defaults_and_validation() {
-        let f = target_filter(&Filters::default(), false).unwrap();
+        let f = target_filter(&Filters::default(), false, false).unwrap();
         assert_eq!(f.kinds, DEFAULT_KINDS.map(String::from).to_vec());
         assert_eq!(f.file, None);
         // filters.file нормализуется; путь выше корня — 400
@@ -3337,6 +3390,7 @@ mod tests {
                     file: Some(p.into()),
                     ..Filters::default()
                 },
+                false,
                 false,
             )
         };
@@ -3353,6 +3407,7 @@ mod tests {
                     kinds: Some(kinds.iter().map(|s| s.to_string()).collect()),
                     ..Filters::default()
                 },
+                false,
                 false,
             )
             .unwrap()
@@ -3383,7 +3438,7 @@ mod tests {
         assert!(excluded_statuses(&f).starts_with(&["superseded".into(), "retracted".into()]));
         // include_history без `kinds`: все статусы, кроме `open` (открытые вопросы и задачи - только
         // по явному `kinds`); с явным `kinds` фильтр статусов снят
-        let f = target_filter(&Filters::default(), true).unwrap();
+        let f = target_filter(&Filters::default(), true, false).unwrap();
         assert!(!f.statuses.contains(&"open".to_string()));
         assert!(f.statuses.contains(&"superseded".to_string()));
         assert_eq!(excluded_statuses(&f), ["open"]);
@@ -3393,6 +3448,7 @@ mod tests {
                 ..Filters::default()
             },
             true,
+            false,
         )
         .unwrap();
         assert!(f.statuses.is_empty() && excluded_statuses(&f).is_empty());
@@ -3403,12 +3459,13 @@ mod tests {
                 ..Filters::default()
             },
             false,
+            false,
         )
         .unwrap();
         let vf = vector_filter(Vec::new(), None, &by, false);
         assert_eq!(vf.kinds, ["insight"]);
         assert_eq!(vf.insight_kinds, ["decision"]);
-        let plain = target_filter(&Filters::default(), false).unwrap();
+        let plain = target_filter(&Filters::default(), false, false).unwrap();
         assert!(
             vector_filter(Vec::new(), None, &plain, false)
                 .insight_kinds
@@ -3424,13 +3481,14 @@ mod tests {
                 insight_kinds: None,
             },
             false,
+            false,
         )
         .unwrap();
         assert_eq!(f.kinds, vec!["insight"]);
         assert_eq!(f.certainty, vec!["axiom", "theorem"]);
         // по умолчанию certainty не ограничен
         assert!(
-            target_filter(&Filters::default(), false)
+            target_filter(&Filters::default(), false, false)
                 .unwrap()
                 .certainty
                 .is_empty()
@@ -3454,7 +3512,7 @@ mod tests {
                 ..Filters::default()
             },
         ] {
-            assert!(target_filter(&bad, false).is_err());
+            assert!(target_filter(&bad, false, false).is_err());
         }
     }
 
@@ -3462,7 +3520,7 @@ mod tests {
     /// с `decided_by` — пересечение с `decision`; ключ кэша — только при заданном фильтре.
     #[test]
     fn insight_kinds_vector_filter_and_cache_key() {
-        let tf = |f: Filters| target_filter(&f, false).unwrap();
+        let tf = |f: Filters| target_filter(&f, false, false).unwrap();
         let ik = || Some(vec!["failure".to_string(), "experiment".to_string()]);
         // виды по умолчанию (заметки и записи) — векторный фильтр не сужается
         let any = tf(Filters {
@@ -3503,7 +3561,7 @@ mod tests {
         assert_eq!(by(vec!["gotcha".into()]), [NO_INSIGHT_KIND]);
         // ключ кэша выжимок меняется только при заданном фильтре
         let sc = ScopeReq::default();
-        let key = |f: &Filters| cache_scope_hash(&sc, f, false, None).unwrap();
+        let key = |f: &Filters| cache_scope_hash(&sc, f, false, None, false).unwrap();
         let base = key(&Filters::default());
         assert_eq!(
             base,

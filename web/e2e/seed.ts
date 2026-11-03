@@ -1,5 +1,7 @@
 // Тестовые заметки E2E: создаются через REST API по первому токену администратора.
 // Пространство Knowledge своего пользователя администратора, папка «E2E».
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 
 /** Код rust из заметки — то, что должна положить в буфер кнопка «Копировать». */
@@ -278,4 +280,257 @@ export async function seedJournals(base: string, token: string, admin: AdminCall
     memberToken: member.token.plaintext,
     guestToken: guest.token.plaintext,
   };
+}
+
+// ---- отчёты (M5.5) ----
+
+/** Флаг, который ставил бы скрипт SVG отчёта: картинка `<img>` скрипты не исполняет. */
+export const SVG_FLAG = '__zamSvgPwned';
+/** Заголовок полного отчёта (первый `#` тела совпадает — в шапке не дублируется). */
+export const REPORT_TITLE = 'Отчёт E2E: обучение модели';
+/** Слово только из текста отчёта «perf» — для полнотекстового поиска. */
+export const REPORT_WORD = 'квазичастицами';
+/** Слово из двух разделов одного отчёта: `mode=brief` даёт два элемента выдачи на отчёт. */
+export const REPORT_DUP_WORD = 'гиперзарядами';
+/** Число однотипных отчётов для курсора ленты (страница WebUI — 20). */
+export const REPORT_BULK = 21;
+export const REPORT_SESSION = 'e2e-report-sess';
+export const REPORT_MACHINE = 'e2e-gpu-box';
+export const REPORT_COMMIT = '0123abc4567def89';
+
+const SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60" onload="window.${SVG_FLAG}=1">
+<script>window.${SVG_FLAG}=1</script><rect width="120" height="60" fill="#3a7"/></svg>`;
+
+const REPORT_BODY = `# ${REPORT_TITLE}
+
+Потери падают: $L = -\\sum_i y_i \\log p_i$, итог:
+
+$$
+\\mathrm{acc} = \\frac{TP + TN}{N}
+$$
+
+![Кривая потерь](loss.png)
+
+![Схема](diag.svg)
+
+| эпоха | потери |
+|------:|-------:|
+| 1 | 0.92 |
+| 2 | 0.41 |
+
+\`\`\`python
+print("готово")
+\`\`\`
+
+\`\`\`mermaid
+graph LR
+  A[Данные] --> B[Модель]
+\`\`\`
+
+Сырые данные — [results.csv](results.csv).
+`;
+
+/** Отчёт для печати и PDF (задача 7): три PNG, формула, Mermaid, таблица, длинный код. */
+export const PRINT_TITLE = 'Отчёт E2E: печать';
+/** Подписи узлов диаграммы печатного отчёта — ищутся текстом в PDF. */
+export const PRINT_NODE_A = 'Энкодер';
+export const PRINT_NODE_B = 'Декодер';
+/** Строка кода без пробелов длиннее ширины A4: на бумаге переносится. */
+export const PRINT_LONG_CODE = 'x'.repeat(30) + '_' + 'y'.repeat(300);
+export const PRINT_FILE = 'raw-data.csv';
+/** SVG без собственных размеров (только `viewBox`): печать его не блокирует. */
+const SVG_NOSIZE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 40"><rect width="100" height="40" fill="#58a"/></svg>';
+
+const PRINT_BODY = `# ${PRINT_TITLE}
+
+Метрика $\\mathrm{F1}$ — гармоническое среднее:
+
+$$
+\\mathrm{F1} = \\frac{2 P R}{P + R}
+$$
+
+![Первая](p1.png)
+
+![Вторая](p2.png)
+
+![Третья](p3.png)
+
+![Без размеров](nosize.svg)
+
+Пояснение к метрике[^f1].
+
+| шаг | значение |
+|----:|---------:|
+${Array.from({ length: 40 }, (_, i) => `| ${i + 1} | ${(i * 0.25).toFixed(2)} |`).join('\n')}
+
+\`\`\`text
+${PRINT_LONG_CODE}
+\`\`\`
+
+\`\`\`mermaid
+graph LR
+  A[${PRINT_NODE_A}] --> B[${PRINT_NODE_B}]
+\`\`\`
+
+Исходные замеры — [${PRINT_FILE}](${PRINT_FILE}).
+
+[^f1]: F1 — среднее гармоническое точности и полноты.
+`;
+
+export interface ReportSeed {
+  print: string;
+  full: string;
+  perf: string;
+  trash: string;
+  dup: string;
+  task: string;
+}
+
+/**
+ * Отчёты решения E2E по токену администратора (агент, multipart как `zam report`): полный
+ * (формула, диаграмма, PNG, SVG со скриптом, таблица, код, CSV, `data.refs`), отчёт «perf» для
+ * фильтров и поиска, отчёт для корзины и {@link REPORT_BULK} однотипных — для курсора.
+ */
+export async function seedReports(base: string, token: string, noteId: string): Promise<ReportSeed> {
+  const sp = `spaces/${SOLUTION_GUID}/entries`;
+  const task = await api<EntryResp>(base, token, 'POST', sp, json({ kind: 'task', title: 'Задача из отчёта E2E', body: '' }));
+  const report = async (
+    meta: Record<string, unknown>,
+    files: [string, string, Uint8Array | string][] = [],
+  ): Promise<string> => {
+    const form = new FormData();
+    form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+    for (const [name, mime, data] of files) {
+      form.append('file', new Blob([typeof data === 'string' ? data : new Uint8Array(data)], { type: mime }), name);
+    }
+    const r = await api<EntryResp>(base, token, 'POST', sp, {
+      body: form,
+      headers: { 'X-Zam-Session': REPORT_SESSION, 'X-Zam-Machine': REPORT_MACHINE },
+    });
+    return r.id;
+  };
+  // печатный — первым: лента (reports.spec) ждёт полный отчёт последним
+  const print = await report(
+    {
+      title: PRINT_TITLE,
+      body: PRINT_BODY,
+      tags: ['print'],
+      data: { refs: { commits: [REPORT_COMMIT], files: ['src/print.py'] } },
+    },
+    [
+      ['p1.png', 'image/png', makePng(320, 160)],
+      ['p2.png', 'image/png', makePng(300, 150)],
+      ['p3.png', 'image/png', makePng(280, 140)],
+      ['nosize.svg', 'image/svg+xml', SVG_NOSIZE],
+      [PRINT_FILE, 'text/csv', 'step,value\n1,0.5\n'],
+    ],
+  );
+  for (let i = 1; i <= REPORT_BULK; i++) {
+    await report({ title: `Серия E2E №${i}`, body: `Замер ${i}.\n`, tags: ['bulk'], area: 'bulk' });
+  }
+  const trash = await report({ title: 'Отчёт E2E для корзины', body: 'Удаляется и восстанавливается.\n', tags: ['trash'] });
+  const perf = await report({
+    title: 'Отчёт E2E: производительность индекса',
+    body: `Сравнение с ${REPORT_WORD}: индекс быстрее на 12 %.\n`,
+    tags: ['perf'],
+    area: 'index',
+  });
+  const filler = 'Абзац с подробностями измерений и условий опыта. '.repeat(60);
+  const dup = await report({
+    title: 'Отчёт E2E: два раздела',
+    body: `## Первый раздел
+
+Замер с ${REPORT_DUP_WORD} в начале.
+
+${filler}
+
+## Второй раздел
+
+${filler}
+
+Повтор с ${REPORT_DUP_WORD} в конце.
+`,
+    tags: ['dup'],
+  });
+  const full = await report(
+    {
+      title: REPORT_TITLE,
+      body: REPORT_BODY,
+      tags: ['ml'],
+      area: 'train',
+      data: {
+        refs: {
+          commits: [REPORT_COMMIT],
+          files: ['src/train.py'],
+          notes: [`n:${noteId}`],
+          tasks: [`k:${task.id}`],
+        },
+      },
+    },
+    [
+      ['loss.png', 'image/png', makePng(160, 90)],
+      ['diag.svg', 'image/svg+xml', SVG],
+      ['results.csv', 'text/csv', 'epoch,loss\n1,0.92\n2,0.41\n'],
+    ],
+  );
+  return { print, full, perf, trash, dup, task: task.id };
+}
+
+/** Заголовок отчёта приёмки M5.5, записанного настоящим `zam report` (спецификация §12 п. 1). */
+export const CLI_REPORT_TITLE = 'Отчёт E2E из zam report';
+export const CLI_NODE_A = 'Источник';
+export const CLI_NODE_B = 'Приёмник';
+
+const CLI_REPORT_BODY = `# ${CLI_REPORT_TITLE}
+
+Потери $L = -\\sum_i y_i \\log p_i$ падают, а площадь:
+
+$$
+\\int_0^1 x\\,dx = \\frac{1}{2}
+$$
+
+\`\`\`mermaid
+graph LR
+  A[${CLI_NODE_A}] --> B[${CLI_NODE_B}]
+\`\`\`
+
+![Потери](figs/loss.png)
+
+![Точность](figs/acc.png)
+
+![Шаг](figs/lr.png)
+`;
+
+/**
+ * Отчёт приёмки M5.5 командой `zam report` (release-бинарник `target/release/zam` или
+ * `E2E_ZAM`): проект в `.tmp/e2e/cli-report/w` с `solution.toml` решения E2E и тремя PNG рядом.
+ * Уровнем выше — файл `.git` (как в тестах CLI): корень проекта не поднимается до репозитория.
+ * Окружение — без `ZAM_*`, переменных агента и прокси; `HOME` — каталог проекта.
+ */
+export function seedCliReport(base: string, token: string, repo: string): string {
+  const exe = process.env.E2E_ZAM ?? `${repo}target/release/zam${process.platform === 'win32' ? '.exe' : ''}`;
+  if (!existsSync(exe)) throw new Error(`нет ${exe}: соберите cargo build --release -p zam-cli`);
+  const top = `${repo}.tmp/e2e/cli-report/`;
+  rmSync(top, { recursive: true, force: true });
+  const w = `${top}w/`;
+  mkdirSync(`${w}.zeroaimemory`, { recursive: true });
+  mkdirSync(`${w}figs`, { recursive: true });
+  writeFileSync(`${top}.git`, 'gitdir: ./zam-test-no-repo\n');
+  writeFileSync(
+    `${w}.zeroaimemory/solution.toml`,
+    `agent_solution_id = "${SOLUTION_GUID}"\nname = "${SOLUTION_NAME}"\n`,
+  );
+  writeFileSync(`${w}figs/loss.png`, makePng(300, 150));
+  writeFileSync(`${w}figs/acc.png`, makePng(280, 140));
+  writeFileSync(`${w}figs/lr.png`, makePng(260, 130));
+  writeFileSync(`${w}report.md`, CLI_REPORT_BODY);
+  const drop = /^(ZAM_|CLAUDE|CODEX|HTTPS?_PROXY$|ALL_PROXY$|NO_PROXY$)/i;
+  const env: NodeJS.ProcessEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !drop.test(k)),
+  );
+  Object.assign(env, { ZAM_URL: base.replace(/\/$/, ''), ZAM_TOKEN: token, HOME: w, USERPROFILE: w });
+  const out = execFileSync(exe, ['report', 'report.md', '--json'], { cwd: w, env, encoding: 'utf8' });
+  const { id } = JSON.parse(out) as { id: string };
+  if (!id) throw new Error(`zam report: нет id в ответе ${out}`);
+  return id;
 }

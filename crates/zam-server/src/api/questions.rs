@@ -34,7 +34,7 @@ use zam_store::{
 use super::entries::{audit_details, check_size, unprocessable};
 use super::json_body;
 use super::nodes::audit_node;
-use super::scope::{Mode, entry_scope, live_entry};
+use super::scope::{Mode, deny_report_mutation, entry_scope, live_entry};
 use crate::app::AppState;
 use crate::attrib::attribution;
 use crate::auth::{Client, Principal};
@@ -79,6 +79,7 @@ pub async fn answer(
 ) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live_entry(&sc)?;
+    deny_report_mutation(&p, &sc)?;
     if sc.entry.kind != EntryKind::Question {
         return Err(unprocessable(
             "ответ есть только у вопросов (kind: question)",

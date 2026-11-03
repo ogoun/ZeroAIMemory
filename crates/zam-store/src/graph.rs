@@ -385,6 +385,8 @@ struct EndMeta {
     live: bool,
     /// Узел — папка (концом связи не бывает).
     folder: bool,
+    /// Запись — отчёт (концом связи не бывает: спецификация M5.5 §7).
+    report: bool,
     certainty: Option<Certainty>,
 }
 
@@ -400,19 +402,22 @@ fn end_meta(c: &Connection, r: TargetRef) -> Result<Option<EndMeta>, StoreError>
                     space: r.get(0)?,
                     live: r.get(1)?,
                     folder: r.get(2)?,
+                    report: false,
                     certainty: r.get(3)?,
                 })
             })
             .optional()?,
         TargetKind::Entry => c
             .prepare_cached(
-                "SELECT space_id, deleted_at IS NULL, 0, certainty FROM entries WHERE id = ?1",
+                "SELECT space_id, deleted_at IS NULL, 0, certainty, kind = 'report'
+                 FROM entries WHERE id = ?1",
             )?
             .query_row([r.id], |r| {
                 Ok(EndMeta {
                     space: r.get(0)?,
                     live: r.get(1)?,
                     folder: r.get(2)?,
+                    report: r.get(4)?,
                     certainty: r.get(3)?,
                 })
             })
@@ -684,6 +689,11 @@ pub(crate) fn add_explicit(
         if m.folder {
             return Err(StoreError::BadInput(
                 "конец связи — заметка или запись журнала, не папка".into(),
+            ));
+        }
+        if m.report {
+            return Err(StoreError::BadInput(
+                "отчёт не участвует в связях: ссылки отчёта — только data.refs".into(),
             ));
         }
         Ok(m)

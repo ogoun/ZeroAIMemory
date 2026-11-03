@@ -304,12 +304,13 @@ pub enum TaskError {
     Store(#[from] StoreError),
 }
 
-/// Живая задача по id: нет — `NotFound`, другой вид — `NotTask`.
+/// Живая задача по id: нет — `NotFound`, отчёт — `ReportImmutable`, другой вид — `NotTask`.
 fn live_task(c: &rusqlite::Connection, id: Id) -> Result<crate::Entry, TaskError> {
     let e = load_entry(c, id)?;
     if e.deleted_at.is_some() {
         return Err(StoreError::NotFound.into());
     }
+    crate::entries::ensure_not_report(&e)?;
     if e.kind != EntryKind::Task {
         return Err(TaskError::NotTask);
     }

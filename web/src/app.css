@@ -22,7 +22,8 @@
   --callout-caution: #cf222e;
   --header-h: 52px;
 }
-@media (prefers-color-scheme: dark) {
+/* тёмная тема — только на экране: печать и PDF всегда светлые (print.css, M5.5) */
+@media screen and (prefers-color-scheme: dark) {
   :root {
     --bg: #14171c;
     --panel: #1d2128;

@@ -21,7 +21,7 @@ const CLASS_STYLE: ClassStyle = ClassStyle::SpacedPrefixed { prefix: "hl-" };
 
 /// Светлая тема.
 const LIGHT_THEME: &str = "InspiredGitHub";
-/// Тёмная тема, включается через `prefers-color-scheme: dark`.
+/// Тёмная тема, включается через `screen and (prefers-color-scheme: dark)`: печать — светлая.
 const DARK_THEME: &str = "base16-ocean.dark";
 
 /// Сколько байт исходного кода подсвечивается на документ суммарно.
@@ -293,7 +293,9 @@ pub fn escape_html(s: &str) -> String {
 }
 
 /// CSS классов `hl-*`: светлая тема по умолчанию, тёмная — внутри
-/// `@media (prefers-color-scheme: dark)`. Вычисляется один раз.
+/// `@media screen and (prefers-color-scheme: dark)` (печать — светлая). Вычисляется один раз.
+/// Браузер кэширует CSS сутки: при смене вывода поднять `?v=` в `HIGHLIGHT_CSS`
+/// (`web/src/lib/api.ts`).
 pub fn highlight_css() -> &'static str {
     &CSS
 }
@@ -308,7 +310,8 @@ fn build_css() -> String {
             .unwrap_or_default()
     };
     let mut out = css(LIGHT_THEME);
-    out.push_str("\n@media (prefers-color-scheme: dark) {\n");
+    // только экран: печать и PDF отчёта всегда светлые (M5.5, спецификация §9)
+    out.push_str("\n@media screen and (prefers-color-scheme: dark) {\n");
     out.push_str(&css(DARK_THEME));
     out.push_str("}\n");
     out

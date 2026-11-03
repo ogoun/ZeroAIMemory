@@ -112,7 +112,7 @@ pub struct TargetFilter {
     pub insight_kinds: Vec<String>,
 }
 
-/// Виды записей журналов (с M4.5 — `term`, `task`, `question`).
+/// Виды записей журналов в поиске по умолчанию (с M4.5 — `term`, `task`, `question`).
 const ENTRY_KINDS: [&str; 6] = [
     "changelog",
     "release",
@@ -121,6 +121,10 @@ const ENTRY_KINDS: [&str; 6] = [
     "task",
     "question",
 ];
+/// Отчёт (M5.5) — только по явному виду в `kinds` (поиск WebUI): пустой список видов его не
+/// включает, агенту отчёты не выдаются (спецификация M5.5 §7; вид в фильтре токена отсекает
+/// сервер).
+const REPORT_KIND: &str = "report";
 
 /// Параметры SQL фильтра целей.
 struct TargetArgs {
@@ -150,6 +154,12 @@ impl TargetFilter {
         let kinds: Vec<&str> = ENTRY_KINDS
             .into_iter()
             .filter(|k| all || self.kinds.iter().any(|x| x == k))
+            .chain(
+                self.kinds
+                    .iter()
+                    .any(|k| k == REPORT_KIND)
+                    .then_some(REPORT_KIND),
+            )
             .collect();
         TargetArgs {
             notes: all || self.kinds.iter().any(|k| k == "note"),
@@ -268,6 +278,8 @@ pub struct EntryHit {
     pub insight_kind: Option<String>,
     pub certainty: Option<String>,
     pub title: String,
+    /// Время создания записи (карточка отчёта WebUI, M5.5).
+    pub created_at: Timestamp,
 }
 
 /// Цель чанка по `chunks.node_id` / `chunks.entry_id` / `chunks.attachment_id`: у чанка
@@ -327,7 +339,7 @@ const HIT_COLS: &str = "c.id, c.node_id, c.entry_id, coalesce(n.space_id, e.spac
     CASE WHEN json_type(e.data, '$.kind') = 'text' THEN json_extract(e.data, '$.kind') END,
     e.certainty, e.title, coalesce(n.area, e.area), coalesce(n.certainty, e.certainty),
     CASE WHEN c.attachment_id IS NULL THEN n.verified_at END,
-    c.attachment_id, ad.filename, ad.blob_sha256, c.locator";
+    c.attachment_id, ad.filename, ad.blob_sha256, c.locator, e.created_at";
 
 /// Хит по колонкам [`HIT_COLS`], начиная с колонки `o`.
 fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
@@ -341,6 +353,7 @@ fn hit_row(r: &rusqlite::Row, o: usize) -> rusqlite::Result<FtsHit> {
                 insight_kind: r.get(o + 14)?,
                 certainty: r.get(o + 15)?,
                 title: r.get(o + 16)?,
+                created_at: ts_at(r, o + 24)?,
             }),
             None,
         ),

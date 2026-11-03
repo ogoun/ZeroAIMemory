@@ -25,7 +25,7 @@ use zam_store::{
 use super::entries::CHANGELOG_KINDS;
 use super::nodes::diff_blocking;
 use super::query;
-use super::scope::{Mode, entry_scope, live_entry};
+use super::scope::{Mode, entry_scope, hidden_entry, live_entry};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -95,12 +95,15 @@ pub async fn compare(
                 until: Some(to.created_at),
                 cursor: None,
                 limit: 1,
+                with_reports: false,
+                deleted_only: false,
             };
             list_entries(&sc.db, f).await?.0.into_iter().next()
         }
         Some(raw) => {
             let other = get_entry(&sc.db, super::parse_id(raw)?).await?;
-            if other.space_id != to.space_id {
+            // отчёт токену не существует (M5.5 §7): 404, а не 422 «не релиз»
+            if other.space_id != to.space_id || hidden_entry(&p, &other) {
                 return Err(ApiError::NotFound);
             }
             Some(release_of(other)?)

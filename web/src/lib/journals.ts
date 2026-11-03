@@ -5,6 +5,7 @@ import type { Journal } from './router';
 export const JOURNAL_TITLE: Record<Journal, string> = {
   changelog: 'Changelog',
   releases: 'Releases',
+  reports: 'Отчёты',
   insights: 'Insights',
   glossary: 'Словарь',
   tasks: 'Задачи',
@@ -12,9 +13,10 @@ export const JOURNAL_TITLE: Record<Journal, string> = {
   vault: 'Vault',
 };
 
-/** Журналы пространства: у решения — все, у Knowledge — без Changelog и Releases, иначе — нет. */
+/** Журналы пространства: у решения — все, у Knowledge — без Changelog, Releases и Отчётов
+ * (отчёты пишутся только в решение, M5.5), иначе — нет. */
 export function journalsOf(kind: string): Journal[] {
-  if (kind === 'solution') return ['changelog', 'releases', 'insights', 'glossary', 'tasks', 'questions', 'vault'];
+  if (kind === 'solution') return ['changelog', 'releases', 'reports', 'insights', 'glossary', 'tasks', 'questions', 'vault'];
   if (kind === 'knowledge') return ['insights', 'glossary', 'tasks', 'questions', 'vault'];
   return [];
 }
@@ -24,6 +26,7 @@ export const JOURNAL_OF_KIND: Record<string, Journal> = {
   insight: 'insights',
   changelog: 'changelog',
   release: 'releases',
+  report: 'reports',
   term: 'glossary',
   task: 'tasks',
   question: 'questions',
@@ -34,6 +37,7 @@ const REF_LETTER: Record<string, string> = {
   insight: 'i',
   changelog: 'c',
   release: 'r',
+  report: 'p',
   term: 't',
   task: 'k',
   question: 'q',

@@ -10,7 +10,8 @@
 //! - `POST /edges {src, type, dst}` → 201 ребро `explicit`: `src` — `n:<id>` | `e:<id>` (или
 //!   `node:<id>` | `entry:<id>`), `dst` — то же или `[[Имя]]` (в пространстве источника);
 //!   `type` вне §8.5 или `supersedes` (его ставит замещение) — 422; такая связь уже есть —
-//!   409; цель не найдена — 404 (`[[Имя]]` — 422);
+//!   409; цель не найдена — 404 (`[[Имя]]` — 422); отчёт-источник — 409
+//!   `/problems/report-immutable`, отчёт-цель — 422 (токену оба — 404, M5.5 §7);
 //! - `DELETE /edges/{id}` → 204; удаляются только `explicit` (выведенные и системные — 422);
 //! - `GET /nodes/{id}/backlinks`, `GET /entries/{id}/backlinks` → `{items, nodes}`: рёбра в
 //!   цель от живых источников и узлы-источники; `GET /nodes/{id}/links`,
@@ -38,8 +39,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
-    Db, EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GraphStore, NewEdge, Space, graph_node,
-    graph_nodes, links,
+    Db, EdgeOrigin, EdgeType, EdgeView, EntryKind, GRAPH_DEPTH_MAX, GraphStore, NewEdge, Space,
+    get_entry, graph_node, graph_nodes, links,
 };
 
 use super::entries::unprocessable;
@@ -115,6 +116,8 @@ struct Target {
     role: Role,
     r: TargetRef,
     deleted: bool,
+    /// Запись вида `report` (концом связи не бывает, M5.5 §7).
+    report: bool,
 }
 
 async fn target_scope(
@@ -130,6 +133,7 @@ async fn target_scope(
             let sc = node_scope(st, p, headers, &raw, mode).await?;
             Target {
                 deleted: sc.node.deleted_at.is_some(),
+                report: false,
                 db: sc.db,
                 owner: sc.owner,
                 space: sc.space,
@@ -141,6 +145,7 @@ async fn target_scope(
             let sc = entry_scope(st, p, headers, &raw, mode).await?;
             Target {
                 deleted: sc.entry.deleted_at.is_some(),
+                report: sc.entry.kind == EntryKind::Report,
                 db: sc.db,
                 owner: sc.owner,
                 space: sc.space,
@@ -269,6 +274,7 @@ pub async fn insight_links(
             unprocessable(format!("{field}.target: node:<id>, entry:<id> или [[Имя]]"))
         })?;
         let r = resolve_dst(st, p, headers, db, owner, space.id, &visible, dst, &field).await?;
+        deny_report_dst(p, db, r, &field).await?;
         out.push((kind, r));
     }
     Ok(out)
@@ -380,14 +386,48 @@ pub async fn create(
         .ok_or_else(|| ApiError::BadRequest("dst: n:<id>, e:<id> или [[Имя]]".into()))?;
     let kind = explicit_type(&req.kind, "type")?;
     let t = live_target(&st, &p, &headers, src, Mode::Write).await?;
+    // отчёт-источник — его изменение: 409 человеку, токену — 404 (отчёт агенту не виден)
+    if t.report {
+        return Err(if p.is_human() {
+            ApiError::ReportImmutable
+        } else {
+            ApiError::NotFound
+        });
+    }
     let visible = graph_spaces(&p, &t.db, &t.space, t.role).await?;
     let dst = resolve_dst(
         &st, &p, &headers, &t.db, t.owner, t.space.id, &visible, dst, "dst",
     )
     .await?;
+    deny_report_dst(&p, &t.db, dst, "dst").await?;
     let a = attribution(&p, &headers, None)?;
     let e = t.db.add_edge(NewEdge { src, dst, kind }, &a).await?;
     Ok((StatusCode::CREATED, Json(e)))
+}
+
+/// Цель связи `r` в базе `db` — отчёт: человеку 422 «на отчёт нельзя ссылаться», токену — 404
+/// (отчёт агенту не виден, M5.5 §7). `field` — имя поля в тексте ошибки.
+async fn deny_report_dst(
+    p: &Principal,
+    db: &Db,
+    r: TargetRef,
+    field: &str,
+) -> Result<(), ApiError> {
+    if r.kind != TargetKind::Entry {
+        return Ok(());
+    }
+    let report = match get_entry(db, r.id).await {
+        Ok(e) => e.kind == EntryKind::Report,
+        Err(zam_store::StoreError::NotFound) => false,
+        Err(e) => return Err(e.into()),
+    };
+    match (report, p.is_human()) {
+        (false, _) => Ok(()),
+        (true, true) => Err(unprocessable(format!(
+            "{field}: на отчёт нельзя ссылаться — отчёт концом связи не бывает"
+        ))),
+        (true, false) => Err(ApiError::NotFound),
+    }
 }
 
 /// `DELETE /edges/{id}` → 204; только `explicit`.

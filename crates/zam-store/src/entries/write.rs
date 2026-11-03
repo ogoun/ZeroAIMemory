@@ -121,7 +121,7 @@ fn check_reason(r: Option<String>) -> Result<Option<String>, StoreError> {
 }
 
 /// `Idempotency-Key`: если задан — непустой, до [`KEY_MAX_CHARS`] печатных символов.
-fn check_key(k: Option<String>) -> Result<Option<String>, StoreError> {
+pub(super) fn check_key(k: Option<String>) -> Result<Option<String>, StoreError> {
     let Some(k) = k else {
         return Ok(None);
     };
@@ -145,7 +145,7 @@ fn appended(body: &str, more: &str) -> String {
 }
 
 /// Вид пространства; нет пространства → `NotFound`.
-fn space_kind_of(c: &Connection, space: Id) -> Result<SpaceKind, StoreError> {
+pub(super) fn space_kind_of(c: &Connection, space: Id) -> Result<SpaceKind, StoreError> {
     c.prepare_cached("SELECT kind FROM spaces WHERE id = ?1")?
         .query_row([space], |r| r.get(0))
         .optional()?
@@ -155,7 +155,7 @@ fn space_kind_of(c: &Connection, space: Id) -> Result<SpaceKind, StoreError> {
 /// Ключ идемпотентности в границах автора: `<автор>:<ключ>`, автор — пользователь, иначе
 /// токен, иначе `-` (администратор без пользователя). Идемпотентность по `(автор, ключ)`:
 /// в общем решении ключ участника не совпадает с ключом владельца. [решение исполнителя]
-fn scoped_key(a: &Attribution, key: &str) -> String {
+pub(super) fn scoped_key(a: &Attribution, key: &str) -> String {
     let who = a
         .user_id
         .map(|u| u.to_string())
@@ -165,7 +165,7 @@ fn scoped_key(a: &Attribution, key: &str) -> String {
 }
 
 /// Запись с ключом идемпотентности `key` (уже с автором), если есть.
-fn by_key(c: &Connection, key: &str) -> Result<Option<Entry>, StoreError> {
+pub(super) fn by_key(c: &Connection, key: &str) -> Result<Option<Entry>, StoreError> {
     let id: Option<Id> = c
         .prepare_cached("SELECT id FROM entries WHERE idempotency_key = ?1")?
         .query_row([key], |r| r.get(0))
@@ -192,7 +192,7 @@ pub async fn entry_by_idempotency_key(
 /// (триггеры в ревизию не входят: после замены набора правкой повтор исходного запроса
 /// расходится) **[решение исполнителя]**; расхождение → `IdempotencyMismatch`, удалённая
 /// запись → `Conflict`.
-fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<Entry, StoreError> {
+pub(super) fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<Entry, StoreError> {
     let (title, body, data): (String, String, String) = c
         .prepare_cached(
             "SELECT title, body, data FROM entry_revisions WHERE entry_id = ?1 AND rev = 1",
@@ -358,7 +358,7 @@ pub(crate) fn insert_entry(
         a.token_id,
         a.session_id,
         a.machine,
-        entry_index_state(space_kind).as_str(),
+        entry_index_state(space_kind, e.kind).as_str(),
         now,
     ])?;
     insert_revision(c, id, 1, e.kind, &f, None, a, now)?;
@@ -496,6 +496,20 @@ pub(crate) fn ensure_editable(e: &Entry) -> Result<(), StoreError> {
     }
 }
 
+/// Отчёт не меняется после записи (спецификация M5.5 §4) → `ReportImmutable`; корзина отчёта
+/// (удаление и восстановление) — не изменение содержимого и сюда не относится.
+pub(crate) fn ensure_not_report(e: &Entry) -> Result<(), StoreError> {
+    match e.kind {
+        EntryKind::Report => Err(StoreError::ReportImmutable),
+        EntryKind::Changelog
+        | EntryKind::Release
+        | EntryKind::Insight
+        | EntryKind::Term
+        | EntryKind::Task
+        | EntryKind::Question => Ok(()),
+    }
+}
+
 /// Любое изменение записи (правка, замещение, отзыв, удаление, восстановление, триггеры) —
 /// по матрице `certainty` (§7.5; с M4 разрешено всем, в том числе у `axiom`).
 fn ensure_may_modify(e: &Entry, author: AuthorKind) -> Result<(), StoreError> {
@@ -550,12 +564,16 @@ fn live_entry(c: &Connection, id: Id) -> Result<Entry, StoreError> {
 /// `IdempotencyMismatch`, удалённая запись → `Conflict`. Ключ действует в границах автора
 /// (пользователь или токен). Нет пространства →
 /// `NotFound`; пустой заголовок, `data` не объект, статус или `certainty` не у insight →
-/// `BadInput`. Область по умолчанию — `a.area` (`X-Zam-Area`).
+/// `BadInput`. Область по умолчанию — `a.area` (`X-Zam-Area`). Отчёт (`report`) создаётся
+/// только [`super::create_report`] (с файлами) — здесь `BadInput`.
 pub async fn create_entry(
     db: &Db,
     e: NewEntry,
     a: &Attribution,
 ) -> Result<(Entry, bool), StoreError> {
+    if e.kind == EntryKind::Report {
+        return Err(bad("отчёт создаётся через create_report (с файлами)"));
+    }
     let a = a.clone();
     db.write(move |tx| {
         let key = check_key(e.idempotency_key.clone())?.map(|k| scoped_key(&a, &k));
@@ -578,7 +596,7 @@ pub async fn create_entry(
 /// `retracted` → `Conflict`. Правка без изменений возвращает запись как есть, без ревизии.
 /// `triggers` заменяет набор триггеров insight в той же транзакции (неверный → `BadInput`);
 /// триггеры в ревизию не входят. Правка содержимого (заголовок, тело, `data`, теги, область,
-/// триггеры) insight `superseded`/`retracted` → `Conflict`.
+/// триггеры) insight `superseded`/`retracted` → `Conflict`. Отчёт → `ReportImmutable`.
 pub async fn update_entry(
     db: &Db,
     id: Id,
@@ -590,6 +608,7 @@ pub async fn update_entry(
     db.write(move |tx| {
         let now_ts = Timestamp::now();
         let cur = live_entry(tx, id)?;
+        ensure_not_report(&cur)?;
         // конфликт ревизии — раньше прав (§7.5, §11.3)
         check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, a.author_kind)?;
@@ -847,7 +866,7 @@ pub async fn restore_entry(
 /// возвращает ту же пару. Не insight, другое пространство → `BadInput`; старая уже
 /// `superseded`/`retracted` → `Conflict`; нет или удалена → `NotFound`; `if_rev` (ревизия
 /// старой, необязательна) не совпал с текущей → `StaleRevision` (повтор по ключу ревизию не
-/// сверяет: после первого ответа она уже выросла).
+/// сверяет: после первого ответа она уже выросла). Старая — отчёт → `ReportImmutable`.
 pub async fn supersede_entry(
     db: &Db,
     old: Id,
@@ -858,6 +877,7 @@ pub async fn supersede_entry(
     let a = a.clone();
     db.write(move |tx| {
         let o = live_entry(tx, old)?;
+        ensure_not_report(&o)?;
         if !matches!(o.kind, EntryKind::Insight | EntryKind::Term) || new.kind != o.kind {
             return Err(bad(
                 "замещаются только insight и term, записью того же вида",
@@ -915,7 +935,7 @@ pub async fn supersede_entry(
 /// Отзывает insight или term с обязательной причиной: статус `retracted`, `retract_reason`, ревизия
 /// с причиной, переиндексация. Пустая причина или не insight → `BadInput`; уже отозвана →
 /// `Conflict`; нет или удалена → `NotFound`; `if_rev` (необязателен) не совпал с текущей
-/// ревизией → `StaleRevision`.
+/// ревизией → `StaleRevision`; отчёт → `ReportImmutable`.
 pub async fn retract_entry(
     db: &Db,
     id: Id,
@@ -927,6 +947,7 @@ pub async fn retract_entry(
     let a = a.clone();
     db.write(move |tx| {
         let cur = live_entry(tx, id)?;
+        ensure_not_report(&cur)?;
         check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, a.author_kind)?;
         if !matches!(cur.kind, EntryKind::Insight | EntryKind::Term) {

@@ -14,14 +14,15 @@
 //   вложения заметки (M5), `locator` — место в документе (`page:12`, `sheet:Итоги!A1:F40`,
 //   `slide:3`, `para:40`): переход из выдачи поиска;
 // - `#/u/<user_id>/s/<space_ref>/j/<журнал>[/<entry_id>]` — журнал пространства
-//   (`changelog`, `releases`, `insights`, `glossary`, `tasks`, `questions`, `vault`),
-//   необязательно — открытая запись.
+//   (`changelog`, `releases`, `reports`, `insights`, `glossary`, `tasks`, `questions`,
+//   `vault`), необязательно — открытая запись (у `reports` — страница отчёта).
 // Пустой или неизвестный адрес — `home` без пользователя (Shell выбирает своего).
 
-/** Журналы пространства: у решения — все, у Knowledge — без Changelog и Releases. */
+/** Журналы пространства: у решения — все, у Knowledge — без Changelog, Releases и Отчётов. */
 export type Journal =
   | 'changelog'
   | 'releases'
+  | 'reports'
   | 'insights'
   | 'glossary'
   | 'tasks'
@@ -30,6 +31,7 @@ export type Journal =
 export const JOURNALS: Journal[] = [
   'changelog',
   'releases',
+  'reports',
   'insights',
   'glossary',
   'tasks',
