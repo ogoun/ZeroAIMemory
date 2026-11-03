@@ -1,7 +1,7 @@
 // Карта кода решения (M5.6, спецификация §9, §11): типы ответов REST `/code/*`, запросы
 // страницы «Код» и исходник Mermaid «Обзора». Символ адресуется постоянным `путь#qual`
 // (`symbol.ref`): id символа меняется при перезагрузке файла.
-import { ApiError, me } from './api';
+import { call } from './api';
 
 export interface CodeCentral {
   id: number;
@@ -110,29 +110,9 @@ const OVERVIEW_BUDGET = 20000;
 
 const q = encodeURIComponent;
 
-/**
- * Запрос к `/code/*`. Свой, а не `api.ts`: его общий `call` модульный; ошибки — тем же
- * `ApiError` (problem+json), администратор действует от имени `user` (`X-Zam-User`).
- */
-async function codeCall<T>(method: 'GET' | 'DELETE', path: string, user: string): Promise<T> {
-  const headers: Record<string, string> = { 'X-Zam-User': user };
-  // CSRF изменяющего запроса — из `GET /auth/me` той же сессии (в api.ts он в замыкании)
-  if (method !== 'GET') headers['X-CSRF-Token'] = (await me()).csrf;
-  const resp = await fetch(`api/v1/${path}`, { method, headers, credentials: 'same-origin' });
-  if (!resp.ok) {
-    let detail = resp.statusText;
-    let problem: Record<string, unknown> | null = null;
-    try {
-      const p = await resp.json();
-      if (p && typeof p === 'object') problem = p as Record<string, unknown>;
-      if (typeof p?.detail === 'string') detail = p.detail;
-    } catch {
-      /* тело не JSON */
-    }
-    throw new ApiError(resp.status, detail, problem);
-  }
-  return (await resp.json()) as T;
-}
+/** Запрос к `/code/*` общим `call` (CSRF, problem+json); администратор — от имени `user`. */
+const codeCall = <T>(method: 'GET' | 'DELETE', path: string, user: string) =>
+  call<T>(method, path, undefined, user);
 
 export const codeStatus = (user: string, space: string) =>
   codeCall<CodeStatus>('GET', `code/status?solution=${q(space)}`, user);

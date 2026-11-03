@@ -153,6 +153,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_REPORT_CLI = cliReport;
     process.env.E2E_CODE_NOTE = code.note;
     process.env.E2E_CODE_TASK = code.task;
+    process.env.E2E_CODE_BOTH = code.both;
   } catch (e) {
     child.kill();
     log.end();

@@ -8,6 +8,7 @@ import { expect, test, type Browser, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import {
+  CODE_BOTH_TITLE,
   CODE_BRANCH,
   CODE_COMMIT,
   CODE_TASK_TITLE,
@@ -154,8 +155,15 @@ test('code_card_sig_refs_knowledge_links', async ({ page }) => {
   await expect(uses).toContainText('Error');
   await expect(uses).toContainText('normalize');
   const know = card.getByRole('list', { name: 'Привязанные знания' });
-  // ссылка на символ — первой, затем знание о файле
-  await expect(know.locator('li').first()).toContainText(CODE_NOTE_TITLE);
+  // ссылки на символ — первыми, затем знания о файле
+  await expect(know.locator('li').first()).toContainText('о символе');
+  await expect(know.locator('li').last()).toContainText('о файле src/a.rs');
+  await expect(know.locator('li', { hasText: CODE_NOTE_TITLE })).toContainText('о символе');
+  // заметка со ссылками и на файл, и на этот символ — одной строкой (в ответе две строки одного id)
+  const both = know.locator('li', { hasText: CODE_BOTH_TITLE });
+  await expect(both).toHaveCount(1);
+  await expect(both).toContainText('о символе');
+  await expect(both.getByRole('link')).toHaveAttribute('href', new RegExp(`/n/${env('E2E_CODE_BOTH')}$`));
   await expect(know.getByRole('link', { name: CODE_TASK_TITLE })).toHaveAttribute(
     'href',
     new RegExp(`/j/tasks/${env('E2E_CODE_TASK')}$`),
@@ -326,7 +334,16 @@ test('code_clear_owner_only', async ({ page, browser }) => {
   expect(mProblems, mProblems.join('\n')).toEqual([]);
   await m.ctx.close();
 
-  // владелец: подтверждение → пустое состояние с подсказкой
+  // владелец: подтверждение → пустое состояние с подсказкой; карта — обратно в любом исходе
+  // (повторный прогон отдельных сценариев)
+  try {
+    await clearAsOwner(page);
+  } finally {
+    await seedCodeMap(base(), env('E2E_ADMIN_TOKEN'));
+  }
+});
+
+async function clearAsOwner(page: Page) {
   const problems = watch(page);
   await openCode(page);
   await expect(statusBox(page)).toContainText('40 символов');
@@ -338,7 +355,9 @@ test('code_clear_owner_only', async ({ page, browser }) => {
   await expect(page.getByRole('table', { name: 'Файлы карты' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Очистить карту' })).toHaveCount(0);
   await page.screenshot({ path: `${screens}code-empty.png`, fullPage: true });
+  // на пустой карте Ctrl+K не перехватывается: открывается общий поиск
+  await page.keyboard.press('Control+k');
+  await expect(page.getByRole('combobox', { name: 'Поиск по заметкам' })).toBeVisible();
+  await page.keyboard.press('Escape');
   expect(problems, problems.join('\n')).toEqual([]);
-  // карта — обратно (повторный прогон отдельных сценариев)
-  await seedCodeMap(base(), env('E2E_ADMIN_TOKEN'));
-});
+}

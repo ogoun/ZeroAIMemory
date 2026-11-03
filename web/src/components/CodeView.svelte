@@ -2,25 +2,22 @@
   // Страница «Код» решения (M5.6, спецификация §11): состояние снимка карты (языки, пропуски по
   // причинам, возраст, ветка и коммит, доля других снимков, пересчёт рангов), очистка карты
   // (только владелец), поиск символа (Ctrl+K страницы), таблица файлов по рангу с фильтрами
-  // (`GET /code/files` постранично), «Обзор» — Mermaid первых 40 файлов и рёбер между ними,
-  // карточка символа по постоянному адресу `путь#qual`. Данные сервера — только текстом
-  // (никакого `{@html}`); SVG диаграммы чистит `hydrate/mermaid.ts`. Ленивый чанк (Shell).
-  import { tick, untrack } from 'svelte';
+  // (`GET /code/files` постранично), «Обзор» — Mermaid первых 40 файлов и рёбер между ними
+  // (CodeOverview, свой ленивый чанк), карточка символа по постоянному адресу `путь#qual`.
+  // Данные сервера — только текстом (никакого `{@html}`). Ленивый чанк (Shell).
+  import { untrack } from 'svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import { ApiError, errorText } from '../lib/api';
   import {
     FILES_PAGE,
-    OVERVIEW_FILES,
     SKIP_TEXT,
     ageText,
     clearCode,
     codeFiles,
-    codeOverview,
     codeStatus,
     codeSymbol,
     codeSymbols,
     filesText,
-    overviewMermaid,
     snapshotText,
     symbolsText,
     type CodeFilesPage,
@@ -64,17 +61,15 @@
   let offset = $state(0);
   let filesError = $state('');
 
-  // обзор
-  let overview = $state<{ src: string; shown: number; total: number; edges: number } | null>(null);
-  let overviewError = $state('');
-  let overviewBox = $state<HTMLElement | null>(null);
-
   // карточка
   let card = $state<CodeSymbolCard | null>(null);
   let cardError = $state('');
 
-  /** Поколение ответов карты (другое решение, очистка); у карточки — своё. */
+  /** Поколения ответов: карта (другое решение, очистка), таблица, поиск, карточка — у каждого
+   * своё: опоздавший ответ прежнего запроса не перетирает новый. */
   let seq = 0;
+  let filesSeq = 0;
+  let searchSeq = 0;
   let cardSeq = 0;
   let empty = $derived(!!status && (!status.exists || status.files === 0));
 
@@ -91,10 +86,15 @@
     loadedFor = key;
     untrack(() => {
       seq++;
+      filesSeq++;
+      searchSeq++;
+      ask = null;
       status = null;
+      statusError = '';
       page = null;
+      filesError = '';
       hits = null;
-      overview = null;
+      searchError = '';
       query = '';
       lang = '';
       pathQ = '';
@@ -121,13 +121,13 @@
   }
 
   async function loadFiles() {
-    const my = seq;
+    const my = ++filesSeq;
     filesError = '';
     try {
       const p = await codeFiles(user, space, { lang: applied.lang, q: applied.q, offset, limit: FILES_PAGE });
-      if (my === seq) page = p;
+      if (my === filesSeq) page = p;
     } catch (e) {
-      if (my === seq) fail(e, (t) => (filesError = t));
+      if (my === filesSeq) fail(e, (t) => (filesError = t));
     }
   }
 
@@ -146,24 +146,26 @@
   async function search(e: SubmitEvent) {
     e.preventDefault();
     const text = query.trim();
+    const my = ++searchSeq;
+    searchError = '';
     if (!text) {
       hits = null;
       return;
     }
-    const my = seq;
-    searchError = '';
     try {
       const r = await codeSymbols(user, space, text);
-      if (my === seq) hits = r.symbols;
+      if (my === searchSeq) hits = r.symbols;
     } catch (err) {
-      if (my === seq) fail(err, (t) => (searchError = t));
+      if (my === searchSeq) fail(err, (t) => (searchError = t));
     }
   }
 
   // Ctrl+K на странице «Код» — поиск символа, а не общий поиск по заметкам (Shell): перехват
-  // в фазе захвата, до обработчика окна Shell.
+  // в фазе захвата, до обработчика окна Shell. Пустая карта (поиск выключен) и открытый диалог —
+  // без перехвата: тогда работает общий поиск.
   $effect(() => {
     const onkey = (e: KeyboardEvent) => {
+      if (empty || ask || !searchBox) return;
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         e.stopPropagation();
@@ -200,39 +202,13 @@
     }
   }
 
-  async function showOverview() {
-    tab = 'overview';
-    if (overview) return;
-    const my = seq;
-    overviewError = '';
-    try {
-      const m = await codeOverview(user, space);
-      if (my !== seq) return;
-      const src = overviewMermaid(m.files, m.edges);
-      overview = {
-        src,
-        shown: Math.min(m.files.length, OVERVIEW_FILES),
-        total: m.files.length + m.files_left,
-        edges: (src.match(/-->/g) ?? []).length,
-      };
-    } catch (e) {
-      if (my === seq) fail(e, (t) => (overviewError = t));
-    }
-  }
-
-  // диаграмма рисуется после вставки исходника в DOM; модуль Mermaid — ленивый чанк
-  $effect(() => {
-    const box = overviewBox;
-    if (!box || !overview || tab !== 'overview') return;
-    tick()
-      .then(() => import('../lib/hydrate/mermaid'))
-      .then((m) => m.renderMermaid(box))
-      .catch((e) => (overviewError = errorText(e)));
-  });
-
   function askClear() {
     const s = status;
     if (!s) return;
+    // решение — на момент вопроса: «Очистить» после смены страницы не тронет другую карту
+    const u = user;
+    const sp = space;
+    const my = seq;
     ask = {
       title: 'Очистить карту кода?',
       message: `Будут удалены ${filesText(s.files)} и ${symbolsText(s.symbols)} карты решения; знания памяти не меняются. Карта соберётся заново при следующем zam code sync.`,
@@ -240,14 +216,16 @@
       danger: true,
       run: async () => {
         try {
-          const r = await clearCode(user, space);
+          const r = await clearCode(u, sp);
+          if (my !== seq) return;
           notice = `Карта очищена: удалено ${filesText(r.removed)}.`;
         } catch (e) {
           if (e instanceof ApiError && e.status === 401) return onexpired();
           throw new Error(errorText(e));
         }
         seq++;
-        overview = null;
+        filesSeq++;
+        searchSeq++;
         hits = null;
         tab = 'files';
         await loadStatus();
@@ -264,6 +242,15 @@
 
   const cardHref = (ref: string) => href({ name: 'journal', user, space, journal: 'code', entry: ref });
   const mapHref = () => href({ name: 'journal', user, space, journal: 'code', entry: null });
+
+  /**
+   * Знания карточки: у записи могут быть строки и о файле, и о символе (уникальный индекс 0023 —
+   * `(…, path, COALESCE(symbol, ''))`) — остаётся одна, символьная (сервер отдаёт их первыми).
+   */
+  let knowledge = $derived.by(() => {
+    const seen = new Set<string>();
+    return (card?.knowledge ?? []).filter((k) => !seen.has(k.id) && !!seen.add(k.id));
+  });
 
   /** Ссылка на знание: заметка — документ, запись — её журнал. */
   function knowledgeHref(k: CodeKnowledge): string | null {
@@ -352,9 +339,9 @@
         {/if}
 
         <h3>Привязанные знания</h3>
-        {#if card.knowledge.length}
+        {#if knowledge.length}
           <ul class="plain" aria-label="Привязанные знания">
-            {#each card.knowledge as k (k.id)}
+            {#each knowledge as k (`${k.id}|${k.symbol ?? ''}`)}
               {@const link = knowledgeHref(k)}
               <li>
                 {#if link}<a href={link}>{k.title}</a>{:else}{k.title}{/if}
@@ -384,7 +371,7 @@
       {:else}
         <p class="summary">
           <strong>{filesText(status.files)}, {symbolsText(status.symbols)}</strong>
-          · <span data-testid="code-age">снимок {ageText(status.age_s ?? 0)}</span>
+          {#if status.age_s != null}· <span data-testid="code-age">снимок {ageText(status.age_s)}</span>{/if}
           {#if snapshotText(status)}· <span class="mono">{snapshotText(status)}</span>{/if}
           {#if status.machine}· машина <span class="mono">{status.machine}</span>{/if}
         </p>
@@ -429,7 +416,7 @@
     {#if status && !empty}
       <div class="tabs" role="tablist" aria-label="Вид карты">
         <button type="button" role="tab" aria-selected={tab === 'files'} onclick={() => (tab = 'files')}>Файлы</button>
-        <button type="button" role="tab" aria-selected={tab === 'overview'} onclick={showOverview}>Обзор</button>
+        <button type="button" role="tab" aria-selected={tab === 'overview'} onclick={() => (tab = 'overview')}>Обзор</button>
       </div>
 
       {#if tab === 'files'}
@@ -481,24 +468,14 @@
         </div>
       {:else}
         <div role="tabpanel" aria-label="Обзор">
-          {#if overviewError}<p class="error" role="alert">{overviewError}</p>{/if}
-          {#if overview}
-            <p class="muted" data-testid="code-overview-note">
-              Файлы по рангу: {overview.shown} из {overview.total}, связей: {overview.edges} (первые {OVERVIEW_FILES}
-              файлов и до 120 самых весомых связей между ними).
-            </p>
-            {#key overview.src}
-              <div class="code-overview" bind:this={overviewBox}>
-                <pre class="mermaid-src"><code>{overview.src}</code></pre>
-              </div>
-            {/key}
-            <details class="src">
-              <summary>Исходник Mermaid</summary>
-              <pre data-testid="code-overview-src"><code>{overview.src}</code></pre>
-            </details>
-          {:else if !overviewError}
+          <!-- «Обзор» — свой ленивый чанк (Mermaid подгружается уже из него) -->
+          {#await import('./CodeOverview.svelte')}
             <p class="muted">Загрузка…</p>
-          {/if}
+          {:then { default: CodeOverview }}
+            {#key `${user}|${space}`}<CodeOverview {user} {space} {onexpired} />{/key}
+          {:catch e}
+            <p class="error" role="alert">Обзор не загрузился: {errorText(e)}</p>
+          {/await}
         </div>
       {/if}
     {/if}
@@ -602,8 +579,7 @@
     margin: 0 0 8px;
     padding-left: 18px;
   }
-  .hint code,
-  .src pre {
+  .hint code {
     background: var(--code-bg);
     border-radius: 4px;
     padding: 1px 4px;
@@ -671,24 +647,6 @@
     margin: 0 0 8px;
     font-size: 13px;
   }
-  .code-overview {
-    overflow: auto;
-    padding: 8px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--panel);
-  }
-  .code-overview :global(.mermaid-diagram svg) {
-    max-width: 100%;
-    height: auto;
-  }
-  .src {
-    margin-top: 8px;
-  }
-  .src pre {
-    white-space: pre-wrap;
-    font-size: 12px;
-  }
   /* печать: страница карты без навигации, дерева, форм и кнопок; цвета светлые (тёмные
      токены app.css — только для screen) */
   @media print {
@@ -707,8 +665,7 @@
       display: none !important;
     }
     .status,
-    .code-card,
-    .code-overview {
+    .code-card {
       background: #fff;
       border-color: #d9dde3;
       break-inside: avoid;

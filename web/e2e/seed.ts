@@ -546,6 +546,8 @@ export const CODE_MACHINE = 'e2e-code-box';
 export const CODE_REF = 'src/a.rs#Store::open';
 export const CODE_NOTE_TITLE = 'Заметка E2E о методе open';
 export const CODE_TASK_TITLE = 'Задача E2E: замок файла src/a.rs';
+/** Заметка со ссылками и на файл, и на его символ: в ответе карточки — две строки одного `id`. */
+export const CODE_BOTH_TITLE = 'Заметка E2E о файле и методе open';
 
 type Sym = [name: string, qual: string, kind: string, line: number, sig?: string];
 type Ref = [name: string, kind: string, count: number];
@@ -682,7 +684,7 @@ export async function seedCodeMap(base: string, token: string): Promise<void> {
  * Знания о коде: заметка со ссылкой на символ {@link CODE_REF} и задача о файле src/a.rs
  * (задача, а не insight: журнал Insights в journals.spec считает свои записи).
  */
-export async function seedCodeKnowledge(base: string, token: string): Promise<{ note: string; task: string }> {
+export async function seedCodeKnowledge(base: string, token: string): Promise<{ note: string; task: string; both: string }> {
   const note = await api<Node>(base, token, 'POST', 'nodes', json({
     space: SOLUTION_GUID,
     path: `E2E/${CODE_NOTE_TITLE}`,
@@ -695,5 +697,11 @@ export async function seedCodeKnowledge(base: string, token: string): Promise<{ 
     body: 'Проверить замок файла при открытии хранилища.',
     refs: { files: [{ path: 'src/a.rs' }] },
   }));
-  return { note: note.id, task: task.id };
+  const both = await api<Node>(base, token, 'POST', 'nodes', json({
+    space: SOLUTION_GUID,
+    path: `E2E/${CODE_BOTH_TITLE}`,
+    kind: 'note',
+    content: `---\nrefs: ["src/a.rs", "${CODE_REF}"]\n---\n# ${CODE_BOTH_TITLE}\n\nФайл и его метод open.\n`,
+  }));
+  return { note: note.id, task: task.id, both: both.id };
 }
