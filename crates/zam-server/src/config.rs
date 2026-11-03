@@ -47,6 +47,7 @@ pub struct ServerConfig {
     pub vault: VaultSection,
     pub docs: DocsSection,
     pub reports: ReportsSection,
+    pub code: CodeSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -961,6 +962,78 @@ impl ReportsSection {
     }
 }
 
+/// Секция `[code]` (M5.6 §12): карта кода решения — выключатель маршрутов `/code/*`, пределы
+/// недоверенного входа клиента `zam`, бюджеты карты и срок пересчёта рангов.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeSection {
+    /// Маршруты карты кода (`false` — 404 у всех `/code/*`; строка дайджеста и `### Код` гаснут).
+    pub enabled: bool,
+    /// Не больше файлов в манифесте `POST /code/sync` (1..=500000, 50 000); больше — 422.
+    pub max_files: u32,
+    /// Не больше символов в файле загрузки (1..=100000, 5000); больше — 422.
+    pub max_symbols_per_file: u32,
+    /// Не больше агрегированных ссылок в файле загрузки (1..=1000000, 20 000); больше — 422.
+    pub max_refs_per_file: u32,
+    /// Предел тела `POST /code/sync`, `PUT /code/files`, `POST /code/impact`, байт
+    /// (1 КиБ..=256 МиБ, 8 МиБ); больше — 413.
+    pub max_request_bytes: u64,
+    /// Бюджет карты по умолчанию, токенов (1..=20000, 1000).
+    pub map_tokens: usize,
+    /// Бюджет раздела `### Код` пакета субагенту, токенов (0..=1000, 150).
+    pub brief_tokens: usize,
+    /// Сколько запрос карты ждёт пересчёта рангов, мс (0..=60000, 1000; 0 — не ждать); дольше —
+    /// старые ранги и `warnings: ["rank pending"]`, пересчёт продолжается в фоне.
+    pub rank_timeout_ms: u64,
+}
+
+impl Default for CodeSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_files: 50_000,
+            max_symbols_per_file: 5000,
+            max_refs_per_file: 20_000,
+            max_request_bytes: 8_388_608,
+            map_tokens: 1000,
+            brief_tokens: 150,
+            rank_timeout_ms: 1000,
+        }
+    }
+}
+
+impl CodeSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("code.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=500_000).contains(&self.max_files) {
+            return Err(bad("max_files", "от 1 до 500000"));
+        }
+        if !(1..=100_000).contains(&self.max_symbols_per_file) {
+            return Err(bad("max_symbols_per_file", "от 1 до 100000"));
+        }
+        if !(1..=1_000_000).contains(&self.max_refs_per_file) {
+            return Err(bad("max_refs_per_file", "от 1 до 1000000"));
+        }
+        if !(1024..=268_435_456).contains(&self.max_request_bytes) {
+            return Err(bad("max_request_bytes", "от 1024 до 268435456 (256 МиБ)"));
+        }
+        if !(1..=20_000).contains(&self.map_tokens) {
+            return Err(bad("map_tokens", "от 1 до 20000"));
+        }
+        if self.brief_tokens > 1000 {
+            return Err(bad("brief_tokens", "от 0 до 1000"));
+        }
+        if self.rank_timeout_ms > 60_000 {
+            return Err(bad("rank_timeout_ms", "от 0 до 60000"));
+        }
+        Ok(())
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -1076,6 +1149,7 @@ impl Default for ServerConfig {
             vault: VaultSection::default(),
             docs: DocsSection::default(),
             reports: ReportsSection::default(),
+            code: CodeSection::default(),
         }
     }
 }
@@ -1249,6 +1323,7 @@ pub fn load(
     cfg.recall.validate()?;
     cfg.docs.validate()?;
     cfg.reports.validate()?;
+    cfg.code.validate()?;
     Ok(cfg)
 }
 
@@ -2138,6 +2213,62 @@ master_key = \"x\"
             &Default::default(),
         );
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn code_section_defaults() {
+        let c = load(None, &[], &Default::default()).unwrap().code;
+        assert_eq!(
+            c,
+            CodeSection {
+                enabled: true,
+                max_files: 50_000,
+                max_symbols_per_file: 5000,
+                max_refs_per_file: 20_000,
+                max_request_bytes: 8_388_608,
+                map_tokens: 1000,
+                brief_tokens: 150,
+                rank_timeout_ms: 1000,
+            }
+        );
+    }
+
+    #[test]
+    fn code_section_validation() {
+        for (k, v) in [
+            ("ZAM_CODE__MAX_FILES", "0"),
+            ("ZAM_CODE__MAX_FILES", "500001"),
+            ("ZAM_CODE__MAX_SYMBOLS_PER_FILE", "0"),
+            ("ZAM_CODE__MAX_SYMBOLS_PER_FILE", "100001"),
+            ("ZAM_CODE__MAX_REFS_PER_FILE", "0"),
+            ("ZAM_CODE__MAX_REFS_PER_FILE", "1000001"),
+            ("ZAM_CODE__MAX_REQUEST_BYTES", "1023"),
+            ("ZAM_CODE__MAX_REQUEST_BYTES", "268435457"),
+            ("ZAM_CODE__MAP_TOKENS", "0"),
+            ("ZAM_CODE__MAP_TOKENS", "20001"),
+            ("ZAM_CODE__BRIEF_TOKENS", "1001"),
+            ("ZAM_CODE__RANK_TIMEOUT_MS", "60001"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            let key = k.trim_start_matches("ZAM_CODE__").to_lowercase();
+            assert!(e.contains(&format!("code.{key}")), "{k}={v}: {e}");
+        }
+        let ok = vec![
+            env("ZAM_CODE__ENABLED", "false"),
+            env("ZAM_CODE__MAX_FILES", "500000"),
+            env("ZAM_CODE__MAX_REQUEST_BYTES", "1024"),
+            env("ZAM_CODE__MAP_TOKENS", "20000"),
+            env("ZAM_CODE__BRIEF_TOKENS", "0"),
+            env("ZAM_CODE__RANK_TIMEOUT_MS", "0"),
+        ];
+        let c = load(None, &ok, &Default::default()).unwrap().code;
+        assert!(!c.enabled);
+        assert_eq!((c.max_files, c.brief_tokens), (500_000, 0));
+        assert_eq!(c.rank_timeout_ms, 0, "0 — пересчёт только в фоне");
+        let e = load(None, &[env("ZAM_CODE__AUTO", "true")], &Default::default());
+        assert!(e.is_err(), "неизвестный ключ секции — ошибка");
     }
 
     #[test]

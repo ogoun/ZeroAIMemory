@@ -7142,6 +7142,7 @@ dependencies = [
  "uuid",
  "windows",
  "windows-service",
+ "zam-code",
  "zam-core",
  "zam-docs",
  "zam-fetch",

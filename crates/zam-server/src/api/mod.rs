@@ -4,6 +4,7 @@ pub mod agent_setup;
 pub mod big_body;
 pub mod blobs;
 pub mod cache;
+pub mod code;
 pub mod doc_locator;
 pub mod downloads;
 pub mod entries;
@@ -40,7 +41,7 @@ use axum::extract::Query;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use serde::de::DeserializeOwned;
 use zam_core::Id;
 
@@ -107,7 +108,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
             state.clone(),
             sessions::count_memory_writes,
         ))
-        .merge(service_routes())
+        .merge(service_routes(&state.cfg))
 }
 
 /// Маршруты записи в память (и чтения тех же ресурсов): узлы, вложения, записи журналов,
@@ -181,9 +182,25 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/cache/{id}/promote", post(cache::promote))
 }
 
-/// Остальные маршруты: служебные, чтение, поиск, сессии, администрирование.
-fn service_routes() -> Router<AppState> {
+/// Предел тела `POST /code/sync`, `PUT /code/files`, `POST /code/impact` — `code.max_request_bytes`
+/// (больше — 413 с пределом в `detail`, [`code`]).
+fn code_body_limit(c: &ServerConfig) -> DefaultBodyLimit {
+    DefaultBodyLimit::max(usize::try_from(c.code.max_request_bytes).unwrap_or(usize::MAX))
+}
+
+/// Остальные маршруты: служебные, чтение, поиск, сессии, администрирование, карта кода.
+fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
+    let code_limit = code_body_limit(cfg);
     Router::new()
+        // карта кода (M5.6): производные данные, не запись памяти — `memory_writes` не растёт
+        .route("/api/v1/code", delete(code::clear))
+        .route("/api/v1/code/sync", post(code::sync).layer(code_limit))
+        .route("/api/v1/code/files", put(code::put_files).layer(code_limit))
+        .route("/api/v1/code/status", get(code::status))
+        .route("/api/v1/code/map", get(code::map))
+        .route("/api/v1/code/symbols", get(code::symbols))
+        .route("/api/v1/code/symbols/{id}", get(code::symbol))
+        .route("/api/v1/code/impact", post(code::impact).layer(code_limit))
         .route("/api/v1/health", get(health::health))
         .route("/api/v1/ready", get(health::ready))
         .route("/api/v1/auth/login", post(login::login))

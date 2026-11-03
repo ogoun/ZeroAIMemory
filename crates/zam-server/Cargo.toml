@@ -22,6 +22,9 @@ ipnet.workspace = true
 thiserror.workspace = true
 argon2.workspace = true
 zam-store = { path = "../zam-store" }
+# M5.6: карта кода — протокол, ранжирование и упаковка карты (без фичи `parse`: C-код
+# грамматик tree-sitter сервер не тянет)
+zam-code = { path = "../zam-code" }
 zam-index = { path = "../zam-index" }
 zam-ml = { path = "../zam-ml" }
 zam-fetch = { path = "../zam-fetch" }

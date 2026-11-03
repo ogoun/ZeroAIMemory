@@ -187,7 +187,7 @@ fn parse_files(
 
 /// Базы и пространства, ссылки которых меняет сообщение: в базе владельца решения — видимые
 /// запросу (участнику — только пространство решения), у участника — ещё его Knowledge.
-async fn report_dbs(
+pub(crate) async fn report_dbs(
     st: &AppState,
     p: &Principal,
     sc: &MemScope,
@@ -316,7 +316,7 @@ fn merge_index(parts: Vec<Vec<PathRefs>>) -> Vec<PathRefs> {
 }
 
 /// `If-None-Match` совпадает с `etag` (список значений, слабые `W/`, `*`).
-fn not_modified(headers: &HeaderMap, etag: &str) -> bool {
+pub(crate) fn not_modified(headers: &HeaderMap, etag: &str) -> bool {
     headers
         .get_all(header::IF_NONE_MATCH)
         .iter()
