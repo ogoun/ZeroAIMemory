@@ -1301,16 +1301,41 @@ async fn digest_code_map_off_no_line() {
         )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    for event in ["session_start", "recovery"] {
-        let j = ok(
-            &a,
-            &a.token,
-            Some("off-1"),
-            json!({"event": event, "solution": G}),
+    // хуки (`session_start`, запрос с полем `code_map`) — без строки
+    for body in [
+        json!({"event": "session_start", "solution": G}),
+        json!({"event": "recovery", "solution": G, "code_map": true}),
+    ] {
+        let j = ok(&a, &a.token, Some("off-1"), body.clone()).await;
+        assert_eq!(code_line(&j), None, "{body}: {j}");
+    }
+    // ревью задачи 6, M2: явный вызов (MCP `memory_recall`, REST без `code_map`) не гасится
+    let j = ok(
+        &a,
+        &a.token,
+        Some("off-1"),
+        json!({"event": "recovery", "solution": G}),
+    )
+    .await;
+    assert!(code_line(&j).is_some(), "{j}");
+    // `[hooks] code_map = false` клиента (поле запроса) — без строки и при включённом сервере
+    let r = a
+        .adm(
+            Method::PATCH,
+            &uri,
+            Some(json!({"hooks": {"code_map": true}})),
+            None,
         )
         .await;
-        assert_eq!(code_line(&j), None, "{event}: {j}");
-    }
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = ok(
+        &a,
+        &a.token,
+        Some("off-2"),
+        json!({"event": "session_start", "solution": G, "code_map": false}),
+    )
+    .await;
+    assert_eq!(code_line(&j), None, "{j}");
     // `code.enabled = false` сервера — тоже без строки
     let b = api("recall-code-disabled", |c| {
         roomy(c);

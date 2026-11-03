@@ -99,6 +99,8 @@ fn digest(env: &Env, inp: &Input, s: &Settings) -> Output {
                 "session_id": session,
                 "solution": solution,
                 "source": source,
+                // строка карты кода — по `[hooks] code_map` клиента (M5.6 §10)
+                "code_map": s.client.get(Flag::CodeMap) != Some(false),
             });
             // `recovery` выключен в клиенте — сервер не строит пакет (по `source` он его и
             // выбирает; иначе `source` только в журнал DEBUG)

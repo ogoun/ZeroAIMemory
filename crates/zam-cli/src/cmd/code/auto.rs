@@ -30,6 +30,9 @@ use super::config;
 use super::state::{SyncMark, cache_dir};
 use crate::cmd::hook::{Env, Flag, Settings, cache};
 
+/// Предел `packed-refs`, который хук читает построчно, байт.
+const PACKED_REFS_MAX: u64 = 1024 * 1024;
+
 /// Предел читаемых файлов `.git` и кэша, байт (`packed-refs` больших репозиториев — мегабайты).
 const READ_MAX: u64 = 16 * 1024 * 1024;
 
@@ -107,8 +110,20 @@ pub fn git_head_fast(root: &Path) -> Option<String> {
             return Some(sha);
         }
     }
-    read_small(&common.join("packed-refs"))?
+    packed_ref(&common.join("packed-refs"), r)
+}
+
+/// sha ссылки `r` в `packed-refs`: построчно с ранним выходом; файл больше
+/// [`PACKED_REFS_MAX`] — `None` (запуск — только по времени; ревью задачи 6, M6).
+fn packed_ref(path: &Path, r: &str) -> Option<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).ok()?;
+    if f.metadata().ok()?.len() > PACKED_REFS_MAX {
+        return None;
+    }
+    std::io::BufReader::new(f)
         .lines()
+        .map_while(Result::ok)
         .filter(|l| !l.starts_with(['#', '^']))
         .find_map(|l| {
             let (sha, name) = l.split_once(' ')?;
@@ -140,7 +155,9 @@ fn rfc3339_secs(s: &str) -> Option<u64> {
 }
 
 /// Пора ли запускать: опорная точка — самое позднее из успешной синхронизации этого решения и
-/// запуска из хука; её нет — пора; иначе — прошло `interval_min` или `HEAD` другой.
+/// запуска из хука; её нет — пора; иначе — прошло `interval_min` или `HEAD` другой. `HEAD`
+/// опоры неизвестен (синхронизация без git: нет git, «dubious ownership») — сравнение с `HEAD`
+/// последнего запуска из хука, нет и его — только по времени (ревью задачи 6, M5).
 fn due(
     mark: Option<&SyncMark>,
     attempt: Option<&Attempt>,
@@ -156,8 +173,9 @@ fn due(
     let Some((at, last_head)) = [ok, tried].into_iter().flatten().max_by_key(|(t, _)| *t) else {
         return true;
     };
+    let last_head = last_head.or_else(|| attempt.and_then(|a| a.head.as_deref()));
     now.saturating_sub(at) >= u64::from(interval_min) * 60
-        || head.is_some_and(|h| last_head != Some(h))
+        || head.is_some_and(|h| last_head.is_some_and(|l| l != h))
 }
 
 /// Идёт синхронизация проекта: замок `cache/code-sync.lock` занят другим процессом (как у
@@ -341,6 +359,30 @@ mod tests {
         assert!(due(Some(&m), None, "g", t + 30 * 60, Some("a"), 30));
         // HEAD неизвестен (не git) — только по времени
         assert!(!due(Some(&m), None, "g", t + 60, None, 30));
+        // ревью задачи 6, M5: синхронизация без HEAD (git не ответил), хук HEAD знает — не на
+        // каждом хуке: сравнение с HEAD последнего запуска, нет его — по времени
+        let nohead = mark("2026-10-27T12:01:01Z", None);
+        assert!(!due(Some(&nohead), None, "g", t + 60, Some("a"), 30));
+        let tried_a = Attempt {
+            at: t - 10,
+            head: Some("a".into()),
+        };
+        assert!(!due(
+            Some(&nohead),
+            Some(&tried_a),
+            "g",
+            t + 60,
+            Some("a"),
+            30
+        ));
+        assert!(due(
+            Some(&nohead),
+            Some(&tried_a),
+            "g",
+            t + 60,
+            Some("b"),
+            30
+        ));
         // отметка другого решения не считается
         assert!(due(Some(&m), None, "other", t + 60, Some("a"), 30));
         // запуск из хука новее старой синхронизации: опора — он (и его HEAD)
@@ -373,6 +415,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(git_head_fast(&repo), Some(sha2.to_ascii_lowercase()));
+        // M6: `packed-refs` больше 1 МиБ не читается
+        let mut big = String::from("# pack-refs\n");
+        while big.len() <= PACKED_REFS_MAX as usize {
+            big.push_str(&format!("{sha1} refs/tags/t{}\n", big.len()));
+        }
+        big.push_str(&format!("{sha2} refs/heads/main\n"));
+        std::fs::write(g.join("packed-refs"), &big).unwrap();
+        assert_eq!(git_head_fast(&repo), None);
+        std::fs::write(g.join("packed-refs"), format!("{sha2} refs/heads/main\n")).unwrap();
         // отсоединённый
         std::fs::write(g.join("HEAD"), format!("{sha1}\n")).unwrap();
         assert_eq!(git_head_fast(&repo), Some(sha1.clone()));

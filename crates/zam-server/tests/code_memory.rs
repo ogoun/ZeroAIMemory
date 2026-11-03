@@ -650,3 +650,178 @@ async fn hook_kinds_include_code_map_default_true() {
     assert_eq!(r.json()["hooks"]["code_map"], false, "{}", r.text());
     assert_eq!(zam_server::api::user_settings::HOOK_KINDS[9], "code_map");
 }
+
+// ---- ревью задачи 6 ----
+
+/// I1: тело `/files/changed` больше 2 МиБ (по умолчанию axum) принимается — до
+/// `code.max_request_bytes`.
+#[tokio::test]
+async fn files_changed_body_over_2mib_accepted() {
+    let a = setup("big-body").await;
+    let (n, _) = scenario(&a).await;
+    // 8 файлов × 5000 символов ≈ 2,5 МиБ
+    let many: Vec<Value> = (0..5000u64)
+        .map(|k| json!({"qual": format!("fn_with_quite_long_name_{k:05}"), "body_hash": bh(k)}))
+        .collect();
+    let mut files = vec![json!({"path": "src/a.rs", "hash": h(1), "symbols": syms(&[("foo", 1)])})];
+    for f in ["x", "y", "z", "u", "v", "w", "p", "q"].map(|n| format!("src/{n}.rs")) {
+        files.push(json!({"path": f, "hash": h(2), "symbols": many.clone()}));
+    }
+    let body = json!({"solution": G, "files": files.clone()});
+    assert!(body.to_string().len() > 2 * 1024 * 1024);
+    changed(&a, Value::from(files)).await;
+    assert_eq!(
+        rows(&a, &n).await[0].4.as_deref(),
+        Some(bh(1).as_str()),
+        "ориентир тела"
+    );
+}
+
+/// I2: символов больше `code.max_symbols_per_file` — файл судится по хэшу (как неполный
+/// разбор), а не 422 на весь запрос.
+#[tokio::test]
+async fn files_changed_too_many_symbols_judged_by_hash() {
+    let a = api("codemem-many-syms", |c| c.code.max_symbols_per_file = 2).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "x"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED, "решение");
+    let (n, i) = scenario(&a).await;
+    changed(
+        &a,
+        json!([{"path": "src/a.rs", "hash": h(1), "symbols": syms(&[("foo", 1)])}]),
+    )
+    .await;
+    // 3 символа при пределе 2: тело `foo` не судится, по хэшу файла — обе stale
+    let j = changed(
+        &a,
+        json!([{"path": "src/a.rs", "hash": h(2),
+                "symbols": syms(&[("foo", 1), ("bar", 2), ("baz", 3)])}]),
+    )
+    .await;
+    assert_eq!(j["stale"], 2, "{j}");
+    assert_eq!(
+        state(&a, &n, "src/a.rs", Some("foo")).await,
+        st("stale", Some("source_changed"))
+    );
+    assert_eq!(
+        state(&a, &i, "src/a.rs", None).await,
+        st("stale", Some("source_changed"))
+    );
+    // /files/verified так же
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/files/verified",
+            Some(
+                json!({"solution": G, "files": [{"path": "src/a.rs", "hash": h(2),
+                         "symbols": syms(&[("foo", 1), ("bar", 2), ("baz", 3)])}]}),
+            ),
+        )
+        .await;
+    ok(&r, StatusCode::OK, "verified");
+}
+
+/// I3: подтверждение файла без символов (`zam write --ref a.rs`, файл не разобран) не стирает
+/// ориентир чужих ссылок на его символы: правка `foo` после него — `symbol_changed`.
+#[tokio::test]
+async fn files_verified_without_symbols_keeps_symbol_hash() {
+    let a = setup("verify-keep").await;
+    let na = id(&note(&a, "Код/А", &["src/a.rs#foo"]).await);
+    let _nb = id(&note(&a, "Код/Б", &["src/a.rs"]).await);
+    changed(
+        &a,
+        json!([{"path": "src/a.rs", "hash": h(1), "symbols": syms(&[("foo", 1)])}]),
+    )
+    .await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/files/verified",
+            Some(json!({"solution": G, "files": [{"path": "src/a.rs", "hash": h(2)}]})),
+        )
+        .await;
+    ok(&r, StatusCode::OK, "verified");
+    assert_eq!(rows(&a, &na).await[0].4.as_deref(), Some(bh(1).as_str()));
+    changed(
+        &a,
+        json!([{"path": "src/a.rs", "hash": h(3), "symbols": syms(&[("foo", 9)])}]),
+    )
+    .await;
+    assert_eq!(
+        state(&a, &na, "src/a.rs", Some("foo")).await,
+        st("stale", Some("symbol_changed"))
+    );
+}
+
+/// M3: `GET /graph?file=a.rs#foo` — знания о `foo`, затем о файле; о `bar` — нет.
+#[tokio::test]
+async fn graph_file_symbol_excludes_other_symbols() {
+    let a = setup("graph-other").await;
+    let nf = id(&note(&a, "Код/Фу", &["src/a.rs#foo"]).await);
+    let nb = id(&note(&a, "Код/Бар", &["src/a.rs#bar"]).await);
+    let i = insight(&a, "Файл", json!({"files": [{"path": "src/a.rs"}]})).await;
+    let r = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/graph?file={}&solution={G}", enc("src/a.rs#foo")),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK, "graph");
+    let j = r.json();
+    let ids: Vec<String> = j["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["ref"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2, "{j}");
+    assert!(ids[0].contains(&nf), "{j}");
+    assert!(ids[1].contains(&i), "{j}");
+    assert!(!ids.iter().any(|x| x.contains(&nb)), "{j}");
+}
+
+/// M4: символ проверяется тем же правилом, что `путь#qual`: `#` только суффикс `#N`, символ —
+/// только у файла кода.
+#[tokio::test]
+async fn refs_symbol_rules_like_split_ref() {
+    let a = setup("symbol-rules").await;
+    for (f, needle) in [
+        (json!({"path": "src/a.rs", "symbol": "a#b"}), "qual"),
+        (json!({"path": "src/a.rs", "symbol": "#2"}), "qual"),
+        (json!({"path": "README.md", "symbol": "foo"}), "файла кода"),
+    ] {
+        let r = a
+            .t(
+                Method::POST,
+                &sol_entries(),
+                Some(json!({"kind": "insight", "title": "плохо", "body": "плохо",
+                            "data": {"kind": "gotcha"}, "refs": {"files": [f]}, "force": true})),
+            )
+            .await;
+        unprocessable(&r, needle);
+    }
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/files/changed",
+            Some(
+                json!({"solution": G, "files": [{"path": "a.rs", "hash": h(1),
+                         "symbols": [{"qual": "a#b", "body_hash": bh(1)}]}]}),
+            ),
+        )
+        .await;
+    unprocessable(&r, "qual");
+    // `foo#2` — допустимый суффикс одноимённых
+    insight(
+        &a,
+        "Перегрузка",
+        json!({"files": [{"path": "src/a.rs", "symbol": "foo#2"}]}),
+    )
+    .await;
+}

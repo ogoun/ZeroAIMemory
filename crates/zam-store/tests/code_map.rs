@@ -1023,8 +1023,9 @@ async fn put_files_applies_rule_only_in_ref_spaces() {
     assert_eq!(ref_row(&db, "b.rs", Some("foo")).await.0, "ok");
 }
 
-/// `files_verified` с символами: ссылка `ok`, хэш символа — присланный; без символов —
-/// хэш символа снимается (ориентиром станет следующее сообщение).
+/// `files_verified` с символами: ссылка `ok`, хэш символа — присланный; без символов (файл не
+/// разобран) — хэш символа прежний, иначе правка символа после подтверждения файла не давала
+/// бы `symbol_changed` (ревью задачи 6 M5.6, I3); хэш файла — присланный (нет — NULL).
 #[tokio::test]
 async fn files_verified_takes_symbol_hashes() {
     let (db, sol) = setup("verified").await;
@@ -1062,7 +1063,7 @@ async fn files_verified_takes_symbol_hashes() {
         .await
         .unwrap();
     let s = ref_row(&db, "a.rs", Some("foo")).await;
-    assert_eq!((s.2, s.3), (None, None));
+    assert_eq!((s.2, s.3), (None, Some(bh('9'))));
 }
 
 // ---------- ссылки: индекс, разбор ----------
@@ -1092,7 +1093,7 @@ async fn refs_index_items_carry_symbol_symbol_first() {
     assert_eq!(items[2].id, format!("c:{file}"));
     let json = serde_json::to_value(&idx).unwrap();
     assert!(json[0]["items"][1].get("symbol").is_none(), "{json}");
-    let owners = refs_to_path(&db, "a.rs", &[sol]).await.unwrap();
+    let owners = refs_to_path(&db, "a.rs", None, &[sol]).await.unwrap();
     assert_eq!(owners[0].id, symbolic);
     assert_eq!(owners.len(), 3);
 }

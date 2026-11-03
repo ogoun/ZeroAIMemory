@@ -853,8 +853,10 @@ pub type VerifiedFile = (String, Option<String>, Option<Vec<SymbolHash>>);
 
 /// «Проверено, знание актуально»: ссылки решения на эти пути у владельцев из `spaces` —
 /// `ok`, `recorded_at` — сейчас, хэш — присланный (без него — NULL: ориентиром станет хэш
-/// следующего сообщения). У символьной ссылки хэш тела — из присланных символов (нет символов
-/// или символа среди них — NULL). Возвращает число обновлённых ссылок.
+/// следующего сообщения). У символьной ссылки хэш тела — из присланных символов (символа среди
+/// них нет — NULL); символов не прислали (файл не разобран, клиент без карты) — хэш тела
+/// прежний: иначе подтверждение файла стёрло бы ориентир чужих ссылок на его символы, и правка
+/// символа больше не давала бы `symbol_changed` (ревью задачи 6 M5.6, I3).
 pub async fn files_verified(
     db: &Db,
     solution: &str,
@@ -869,7 +871,8 @@ pub async fn files_verified(
         let now = fmt_ts(now);
         let mut st = tx.prepare_cached(
             "UPDATE file_refs SET state = 'ok', stale_at = NULL, stale_reason = NULL,
-                    recorded_at = ?2, content_hash = ?3, symbol_hash = ?4
+                    recorded_at = ?2, content_hash = ?3,
+                    symbol_hash = CASE WHEN ?5 THEN ?4 ELSE symbol_hash END
              WHERE id = ?1",
         )?;
         let mut n = 0u32;
@@ -882,7 +885,8 @@ pub async fn files_verified(
                         .find(|s| s.qual == q)
                         .map(|s| s.body_hash.as_str())
                 });
-                n += st.execute(params![r.id, now, hash, body])? as u32;
+                let judged = symbols.is_some();
+                n += st.execute(params![r.id, now, hash, body, judged])? as u32;
             }
         }
         Ok(n)
@@ -1054,21 +1058,25 @@ pub async fn path_owners(
 
 /// Живые владельцы ссылок на путь `path` (нормализован вызывающим) в пространствах `spaces`
 /// — в любом решении: «что память знает об этом файле». Владельцы ссылок на символы первыми,
-/// затем новые первыми.
+/// затем новые первыми. `symbol` задан (`путь#qual`) — только ссылки на этот символ (первыми)
+/// и файловые; ссылки на другие символы файла — нет (ревью задачи 6 M5.6, M3).
 pub async fn refs_to_path(
     db: &Db,
     path: &str,
+    symbol: Option<&str>,
     spaces: &[Id],
 ) -> Result<Vec<TargetRef>, StoreError> {
     let path = path.to_string();
+    let symbol = symbol.map(str::to_string);
     let spaces = ids_json(spaces);
     db.read(move |c| {
         let mut st = c.prepare_cached(&format!(
             "SELECT f.owner_kind, f.owner_id FROM file_refs f {OWNER_JOIN}
              WHERE f.path = ?1 AND {LIVE_OWNER}
+               AND (?3 IS NULL OR f.symbol IS NULL OR f.symbol = ?3)
              ORDER BY f.symbol IS NULL, f.recorded_at DESC, f.id DESC"
         ))?;
-        let rows = st.query_map(params![path, spaces], |r| {
+        let rows = st.query_map(params![path, spaces, symbol], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Id>(1)?))
         })?;
         let mut out = Vec::new();

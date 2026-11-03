@@ -87,6 +87,8 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             "parent_id": session,
             "solution": solution,
             "task": spawn.as_ref().map(|x| x.task.as_str()).filter(|t| !t.trim().is_empty()),
+            // раздел `### Код` — по `[hooks] code_map` клиента (сервер добавит свой ключ)
+            "code_map": s.client.get(Flag::CodeMap) != Some(false),
         });
         let c = &client;
         let recall = sc.spawn(move || c.post_json("/recall", &body).and_then(read_json));

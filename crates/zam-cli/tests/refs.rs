@@ -654,3 +654,39 @@ fn write_ref_symbol_into_frontmatter() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 404);
 }
+
+/// Ревью задачи 6, I3: заметка A ссылается на `store.rs#Store::open`, заметка B — `zam write
+/// --ref store.rs` (подтверждение файла); правка `open` после этого — A `stale`
+/// (`symbol_changed` через `zam refs check`), а не молча `ok`.
+#[test]
+fn write_ref_file_keeps_symbol_ref_judged() {
+    let (url, tok) = start("write-keep");
+    let p = Proj::new("write-keep", &url, &tok);
+    p.file("src/store.rs", LIB_RS);
+    ok(&p.zam_in(
+        "",
+        &["write", "arch/a.md", "--ref", "src/store.rs#Store::open"],
+        "# А\nтекст\n".as_bytes(),
+    ));
+    ok(&p.zam_in(
+        "",
+        &["write", "arch/b.md", "--ref", "src/store.rs"],
+        "# Б\nтекст\n".as_bytes(),
+    ));
+    assert_eq!(states(&p.index(), "src/store.rs"), ["ok", "ok"]);
+    p.file(
+        "src/store.rs",
+        b"pub struct Store;\n\nimpl Store {\n    pub fn open() -> Store {\n        let s = Store;\n        s\n    }\n}\n\npub fn helper() {}\n",
+    );
+    ok(&p.zam(&["refs", "check"]));
+    let idx = p.index();
+    let items = path_of(&idx, "src/store.rs")["items"].clone();
+    let sym = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["symbol"] == "Store::open")
+        .unwrap_or_else(|| panic!("{idx}"))
+        .clone();
+    assert_eq!(sym["state"], "stale", "{idx}");
+}

@@ -295,8 +295,15 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/triggers", get(triggers::list))
         // ссылки на файлы (M4.5 §6): состояние ссылок, не текст памяти — вне `memory_routes`
         .route("/api/v1/file-refs", get(files::index))
-        .route("/api/v1/files/changed", post(files::changed))
-        .route("/api/v1/files/verified", post(files::verified))
+        // тела с хэшами символов (M5.6 §8) — до `code.max_request_bytes`, как загрузка карты
+        .route(
+            "/api/v1/files/changed",
+            post(files::changed).layer(code_body_limit(cfg)),
+        )
+        .route(
+            "/api/v1/files/verified",
+            post(files::verified).layer(code_body_limit(cfg)),
+        )
         .route(
             "/api/v1/sessions",
             get(sessions::list).post(sessions::create),

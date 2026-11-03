@@ -122,10 +122,18 @@ impl Proj {
         let repo = root.join("repo");
         let home = root.join("home");
         std::fs::create_dir_all(repo.join(".zeroaimemory")).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(home.join(".zeroaimemory")).unwrap();
         std::fs::write(
             repo.join(".zeroaimemory/solution.toml"),
             format!("agent_solution_id = \"{G}\"\nname = \"Хуки\"\n"),
+        )
+        .unwrap();
+        // ревью задачи 6, M8: хуки тестов не запускают настоящую `zam code sync --background`
+        // (каталог теста занят, лишние запросы к тестовому серверу); автозапуск проверяют
+        // тесты, снявшие это ([`Proj::auto_on`])
+        std::fs::write(
+            home.join(".zeroaimemory/config.toml"),
+            "[code]\nauto = false\n",
         )
         .unwrap();
         Proj {
@@ -184,6 +192,11 @@ impl Proj {
             v[k] = x.clone();
         }
         v
+    }
+
+    /// Автозапуск фоновой синхронизации карты — по умолчанию клиента (снимает `auto = false`).
+    fn auto_on(&self) {
+        let _ = std::fs::remove_file(self.home.join(".zeroaimemory/config.toml"));
     }
 
     fn cache(&self) -> PathBuf {
@@ -3058,6 +3071,7 @@ fn sha(n: u32) -> String {
 fn session_start_spawns_background_sync_once_per_interval() {
     let _g = serial();
     let p = Proj::new("auto-sync", NO_URL, "zam_x");
+    p.auto_on();
     git_head(&p, &sha(1));
     let start = |s: &str| {
         let ev = p.ev("SessionStart", s, json!({"source": "startup"}));
@@ -3132,6 +3146,7 @@ fn session_start_spawns_background_sync_once_per_interval() {
 fn checkpoint_spawns_only_after_edits() {
     let _g = serial();
     let p = Proj::new("auto-checkpoint", NO_URL, "zam_x");
+    p.auto_on();
     git_head(&p, &sha(1));
     let stop = |s: &str| {
         let ev = p.ev("Stop", s, json!({"stop_hook_active": false}));
@@ -3156,6 +3171,7 @@ fn checkpoint_spawns_only_after_edits() {
 fn code_map_flag_off_no_spawn() {
     let _g = serial();
     let p = Proj::new("auto-off", NO_URL, "zam_x");
+    p.auto_on();
     git_head(&p, &sha(1));
     let start = |s: &str| {
         let ev = p.ev("SessionStart", s, json!({"source": "startup"}));
@@ -3191,4 +3207,77 @@ fn code_map_flag_off_no_spawn() {
     git_head(&p, &sha(77));
     start("f3");
     assert!(spawns_logged(&p).is_empty(), "{}", p.log());
+}
+
+/// Ревью задачи 6, I1: очередь из 30 файлов × 1500 символов (≈ 2,5 МБ) уходит пачками по
+/// байтам без потерь — каждая символьная ссылка получает `symbol_changed`.
+#[test]
+fn changed_queue_with_many_symbols_flushed_without_loss() {
+    let _g = serial();
+    let (url, tok) = start("big-queue");
+    let p = Proj::new("big-queue", &url, &tok);
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    let mut args: Vec<String> = ["log", "insight", "--kind", "gotcha", "--title", "Много"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for i in 0..30 {
+        std::fs::write(
+            p.repo.join(format!("src/f{i}.rs")),
+            b"pub fn f0() -> u32 {\n    0\n}\n",
+        )
+        .unwrap();
+        args.push("--ref".into());
+        args.push(format!("src/f{i}.rs#f0"));
+    }
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    ok(&p.zam(&a, "Подробно.\n".as_bytes()));
+    // очередь сессии: у каждого файла 1500 символов, тело `f0` другое
+    let v = post_ok(
+        &p,
+        "bq1",
+        "Write",
+        json!({"file_path": p.repo.join("src/f0.rs")}),
+    );
+    let _ = p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes());
+    let q = p.session_file("changed", "bq1", ".jsonl").expect("очередь");
+    let mut text = String::new();
+    for i in 0..30 {
+        let mut syms: Vec<Value> = (0..1500)
+            .map(|k| json!({"qual": format!("other_function_{k:05}"), "body_hash": format!("{k:016x}")}))
+            .collect();
+        syms.push(json!({"qual": "f0", "body_hash": "f".repeat(16)}));
+        text.push_str(
+            &json!({"path": format!("src/f{i}.rs"), "hash": "1".repeat(64), "symbols": syms})
+                .to_string(),
+        );
+        text.push('\n');
+    }
+    assert!(text.len() > 2 * 1024 * 1024, "{}", text.len());
+    std::fs::write(&q, text).unwrap();
+    for i in 0..20 {
+        if p.session_file("changed", "bq1", ".jsonl").is_none() {
+            break;
+        }
+        let ev = p.ev(
+            "SessionStart",
+            &format!("bqs{i}"),
+            json!({"source": "startup"}),
+        );
+        ok(&p.hook("session-start", &ev));
+    }
+    assert!(
+        p.session_file("changed", "bq1", ".jsonl").is_none(),
+        "очередь не ушла: {}",
+        p.log()
+    );
+    assert!(!p.log().contains("отброшена"), "{}", p.log());
+    let idx = file_refs_index(&p);
+    for i in 0..30 {
+        assert_eq!(
+            ref_state(&idx, &format!("src/f{i}.rs")),
+            ["stale"],
+            "f{i}: {idx}"
+        );
+    }
 }

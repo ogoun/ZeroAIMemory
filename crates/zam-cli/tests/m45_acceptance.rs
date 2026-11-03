@@ -405,7 +405,14 @@ impl Proj {
         let repo = root.join("repo");
         let home = root.join("home");
         std::fs::create_dir_all(repo.join(".zeroaimemory")).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(home.join(".zeroaimemory")).unwrap();
+        // хуки приёмки без фоновой `zam code sync` (M5.6, ревью задачи 6 M8): бюджеты хуков
+        // меряются без синхронизации карты за тот же тестовый сервер
+        std::fs::write(
+            home.join(".zeroaimemory/config.toml"),
+            "[code]\nauto = false\n",
+        )
+        .unwrap();
         std::fs::write(
             repo.join(".zeroaimemory/solution.toml"),
             format!("agent_solution_id = \"{GA}\"\nname = \"Рабочая память\"\n"),

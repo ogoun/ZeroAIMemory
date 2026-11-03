@@ -542,7 +542,22 @@ pub fn post_verified(
         files.push(o);
     }
     let mut n = 0;
-    for chunk in files.chunks(FILES_MAX) {
+    // пачки до FILES_MAX путей и ≈ CHANGED_BATCH_BYTES: хэши символов — десятки КиБ на файл
+    let mut chunks: Vec<Vec<Value>> = vec![Vec::new()];
+    let mut size = 0usize;
+    for f in files {
+        let len = f.to_string().len() + 1;
+        let cur = chunks.last_mut().expect("есть пачка");
+        if !cur.is_empty()
+            && (size + len > hook::cache::CHANGED_BATCH_BYTES || cur.len() >= FILES_MAX)
+        {
+            chunks.push(Vec::new());
+            size = 0;
+        }
+        size += len;
+        chunks.last_mut().expect("есть пачка").push(f);
+    }
+    for chunk in chunks.into_iter().filter(|c| !c.is_empty()) {
         let v = read_json(ctx.client.post_json(
             "/files/verified",
             &json!({"solution": guid, "files": chunk}),
@@ -552,20 +567,29 @@ pub fn post_verified(
     Ok(n)
 }
 
-/// `POST /files/changed {solution, files}` пачками до [`FILES_MAX`]; число `stale`.
+/// `POST /files/changed {solution, files}` пачками до [`FILES_MAX`] путей и
+/// [`hook::cache::CHANGED_BATCH_BYTES`] байт ([`hook::cache::changed_batches`]); число `stale`.
 pub fn post_changed(
     client: &crate::client::Client,
     guid: &str,
     files: &[hook::cache::Changed],
 ) -> Result<i64, CliError> {
     let mut n = 0;
-    for chunk in files.chunks(FILES_MAX) {
-        let v = read_json(
-            client.post_json("/files/changed", &json!({"solution": guid, "files": chunk}))?,
-        )?;
-        n += v["stale"].as_i64().unwrap_or(0);
+    for b in hook::cache::changed_batches(files, hook::cache::CHANGED_BATCH_BYTES) {
+        n += post_changed_batch(client, guid, &b)?;
     }
     Ok(n)
+}
+
+/// Один `POST /files/changed` (пачка уже в пределах); число `stale`.
+pub fn post_changed_batch(
+    client: &crate::client::Client,
+    guid: &str,
+    files: &[hook::cache::Changed],
+) -> Result<i64, CliError> {
+    let v =
+        read_json(client.post_json("/files/changed", &json!({"solution": guid, "files": files}))?)?;
+    Ok(v["stale"].as_i64().unwrap_or(0))
 }
 
 /// `zam refs check [--since C]`.

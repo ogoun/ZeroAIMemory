@@ -409,7 +409,64 @@ fn append_options() -> std::fs::OpenOptions {
     o
 }
 
-/// Дописывает файлы в очередь изменённых: строка на файл, все одним `write` с append.
+/// Предел очереди изменённых файлов сессии, байт: больше — очередь уплотняется
+/// ([`compact_changed`]; ревью задачи 6, I1).
+pub const CHANGED_QUEUE_MAX: u64 = 4 * 1024 * 1024;
+/// Предел тела одного `POST /files/changed` из очереди и `zam refs check`, байт.
+pub const CHANGED_BATCH_BYTES: usize = 256 * 1024;
+
+/// Пачки строк для `POST /files/changed`: не больше [`crate::cmd::refs::FILES_MAX`] путей и
+/// `max_bytes` JSON; строка, которая не влезает и одна, уходит без `symbols` (её ссылки на
+/// символы сервер судит по хэшу файла — как неполный разбор).
+pub fn changed_batches(files: &[Changed], max_bytes: usize) -> Vec<Vec<Changed>> {
+    let mut out: Vec<Vec<Changed>> = Vec::new();
+    let mut cur: Vec<Changed> = Vec::new();
+    let mut size = 0usize;
+    for c in files {
+        let mut c = c.clone();
+        let mut n = serde_json::to_vec(&c).map_or(0, |v| v.len()) + 1;
+        if n > max_bytes && c.symbols.is_some() {
+            c.symbols = None;
+            n = serde_json::to_vec(&c).map_or(0, |v| v.len()) + 1;
+        }
+        if !cur.is_empty() && (size + n > max_bytes || cur.len() >= crate::cmd::refs::FILES_MAX) {
+            out.push(std::mem::take(&mut cur));
+            size = 0;
+        }
+        size += n;
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Уплотнение строк очереди: повтор пути заменяет прежнюю строку; сверх `max` байт у самых
+/// старых строк снимаются `symbols` (ссылки на символы этих файлов сервер судит по хэшу).
+pub fn compact_changed(lines: Vec<Changed>, max: u64) -> Vec<Changed> {
+    let mut out: Vec<Changed> = Vec::new();
+    for c in lines {
+        out.retain(|f| !crate::cmd::refs::same_path(&f.path, &c.path));
+        out.push(c);
+    }
+    let len = |c: &Changed| serde_json::to_vec(c).map_or(0, |v| v.len() as u64) + 1;
+    let mut total: u64 = out.iter().map(len).sum();
+    for c in out.iter_mut() {
+        if total <= max {
+            break;
+        }
+        if c.symbols.is_some() {
+            let before = len(c);
+            c.symbols = None;
+            total = total - before + len(c);
+        }
+    }
+    out
+}
+
+/// Дописывает файлы в очередь изменённых: строка на файл, все одним `write` с append; очередь
+/// больше [`CHANGED_QUEUE_MAX`] — сначала уплотняется ([`compact_changed`]) и переписывается.
 pub fn queue_changed(env: &Env, session: &str, files: &[Changed]) {
     if files.is_empty() {
         return;
@@ -419,11 +476,28 @@ pub fn queue_changed(env: &Env, session: &str, files: &[Changed]) {
         buf.extend(serde_json::to_vec(c).unwrap_or_default());
         buf.push(b'\n');
     }
+    let path = changed_path(env, session);
+    let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+    if len + buf.len() as u64 > CHANGED_QUEUE_MAX {
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let mut lines: Vec<Changed> = bytes
+            .split(|b| *b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<Changed>(l).ok())
+            .collect();
+        lines.extend(files.iter().cloned());
+        let mut out = Vec::new();
+        for c in compact_changed(lines, CHANGED_QUEUE_MAX) {
+            out.extend(serde_json::to_vec(&c).unwrap_or_default());
+            out.push(b'\n');
+        }
+        if let Err(e) = write_atomic(&path, &out) {
+            env.log(&format!("очередь изменённых файлов: {e}"));
+        }
+        return;
+    }
     let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| {
         use std::io::Write;
-        append_options()
-            .open(changed_path(env, session))?
-            .write_all(&buf)
+        append_options().open(&path)?.write_all(&buf)
     });
     if let Err(e) = r {
         env.log(&format!("очередь изменённых файлов: {e}"));
@@ -497,28 +571,27 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
             files.push((c, qi));
         }
     }
-    let n = files.len().min(crate::cmd::refs::FILES_MAX);
-    let back: Vec<(Changed, usize)> = if n == 0 {
-        Vec::new()
-    } else if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
-        files.clone()
-    } else {
-        let send: Vec<Changed> = files[..n].iter().map(|(c, _)| c.clone()).collect();
-        match crate::cmd::refs::post_changed(client, &sol, &send) {
-            Ok(_) => files[n..].to_vec(),
+    // пачки по байтам (ревью задачи 6, I1): строки с хэшами символов — десятки КиБ каждая
+    let lines: Vec<Changed> = files.iter().map(|(c, _)| c.clone()).collect();
+    let mut done = 0usize;
+    for b in changed_batches(&lines, CHANGED_BATCH_BYTES) {
+        if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+            break;
+        }
+        let n = b.len();
+        match crate::cmd::refs::post_changed_batch(client, &sol, &b) {
+            Ok(_) => done += n,
             Err(e) if permanent(&e) => {
-                env.log(&format!(
-                    "files/changed: очередь ({} путей) отброшена: {e}",
-                    files.len()
-                ));
-                Vec::new()
+                env.log(&format!("files/changed: пачка ({n} путей) отброшена: {e}"));
+                done += n;
             }
             Err(e) => {
                 env.log(&format!("files/changed: {e}"));
-                files.clone()
+                break;
             }
         }
-    };
+    }
+    let back: Vec<(Changed, usize)> = files[done..].to_vec();
     for (qi, (q, _)) in taken.iter().enumerate() {
         let mut out = Vec::new();
         for (c, _) in back.iter().filter(|(_, i)| *i == qi) {
@@ -1023,6 +1096,77 @@ pub fn sync(ctx: &super::super::Ctx) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line(path: &str, symbols: usize) -> Changed {
+        Changed {
+            path: path.into(),
+            hash: "a".repeat(64),
+            symbols: (symbols > 0).then(|| {
+                (0..symbols)
+                    .map(|k| zam_code::SymbolHash {
+                        qual: format!("function_name_{k:05}"),
+                        body_hash: format!("{k:016x}"),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// Ревью задачи 6, I1: пачки по байтам и числу путей; строка больше пачки — без `symbols`.
+    #[test]
+    fn changed_batches_by_bytes_and_count() {
+        let files: Vec<Changed> = (0..40)
+            .map(|i| line(&format!("src/f{i}.rs"), 1500))
+            .collect();
+        let one = serde_json::to_vec(&files[0]).unwrap().len();
+        assert!(one > 64 * 1024, "{one}");
+        let b = changed_batches(&files, CHANGED_BATCH_BYTES);
+        assert!(b.len() > 1);
+        assert_eq!(b.iter().map(Vec::len).sum::<usize>(), 40, "без потерь");
+        for p in &b {
+            let size: usize = p
+                .iter()
+                .map(|c| serde_json::to_vec(c).unwrap().len() + 1)
+                .sum();
+            assert!(size <= CHANGED_BATCH_BYTES, "{size}");
+            assert!(p.iter().all(|c| c.symbols.is_some()));
+        }
+        // строка больше пачки — уходит без символов
+        let huge = changed_batches(&[line("src/big.rs", 6000)], CHANGED_BATCH_BYTES);
+        assert_eq!(huge.len(), 1);
+        assert!(huge[0][0].symbols.is_none());
+        // путей — не больше FILES_MAX в пачке
+        let small: Vec<Changed> = (0..1200).map(|i| line(&format!("f{i}"), 0)).collect();
+        let b = changed_batches(&small, CHANGED_BATCH_BYTES);
+        assert!(b.iter().all(|p| p.len() <= crate::cmd::refs::FILES_MAX));
+        assert_eq!(b.iter().map(Vec::len).sum::<usize>(), 1200);
+    }
+
+    /// Уплотнение очереди: повтор пути — последняя строка; сверх предела — старые без `symbols`.
+    #[test]
+    fn compact_changed_dedup_and_strip_oldest() {
+        let mut a2 = line("src/a.rs", 0);
+        a2.hash = "b".repeat(64);
+        let out = compact_changed(
+            vec![line("src/a.rs", 10), line("src/b.rs", 10), a2.clone()],
+            u64::MAX,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], a2, "повтор пути — последняя строка");
+        let lines: Vec<Changed> = (0..20)
+            .map(|i| line(&format!("src/f{i}.rs"), 1500))
+            .collect();
+        let max = 300 * 1024;
+        let out = compact_changed(lines, max);
+        let total: u64 = out
+            .iter()
+            .map(|c| serde_json::to_vec(c).unwrap().len() as u64 + 1)
+            .sum();
+        assert!(total <= max, "{total}");
+        assert_eq!(out.len(), 20);
+        assert!(out[0].symbols.is_none(), "старые — без символов");
+        assert!(out[19].symbols.is_some(), "новые — с символами");
+    }
 
     #[test]
     fn rfc3339_known_dates() {

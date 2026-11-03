@@ -752,11 +752,31 @@ async fn brief_code_off_no_section() {
         )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // хук `subagent-start` (поле `code_map`) — раздела нет
     let j = brief(
         &a,
         &a.token,
         "off:ag",
+        json!({"event": "brief", "solution": G, "task": "Почини open_store", "code_map": true}),
+    )
+    .await;
+    assert_eq!(code_section(text(&j)), None, "{j}");
+    // ревью задачи 6, M2: явный вызов (MCP, REST без `code_map`) — раздел есть
+    let j = brief(
+        &a,
+        &a.token,
+        "off2:ag",
         json!({"event": "brief", "solution": G, "task": "Почини open_store"}),
+    )
+    .await;
+    assert!(code_section(text(&j)).is_some(), "{j}");
+    // `[hooks] code_map = false` клиента — раздела нет и при включённом сервере
+    let c = code_world("off-client", |_| {}).await;
+    let j = brief(
+        &c,
+        &c.token,
+        "off3:ag",
+        json!({"event": "brief", "solution": G, "task": "Почини open_store", "code_map": false}),
     )
     .await;
     assert_eq!(code_section(text(&j)), None, "{j}");

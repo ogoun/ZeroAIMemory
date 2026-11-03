@@ -45,7 +45,8 @@
 //!   [`VERIFIED_COMMANDS_MAX`] заметок пространства решения с `verified_at`, новые проверки
 //!   первыми (M4.5 §7, решение владельца 2026-10-28), за ней — строка карты кода решения
 //!   (M5.6 §10, [`super::code::code_line`]: размер, возраст снимка, центральные символы;
-//!   ≤ 80 токенов; нет карты, `code.enabled = false` или выключен `hooks.code_map` — строки нет;
+//!   ≤ 80 токенов; нет карты или `code.enabled = false` — строки нет; у хуков (`session_start`
+//!   и запрос с полем `code_map`) её гасят и `hooks.code_map`, и `code_map: false` клиента;
 //!   так же в пакете восстановления).
 //!   Ответ несёт `hooks: {session_start, prompt, pre_tool, post_tool, checkpoint,
 //!   subagent_start, file_context, session_journal, recovery}` — настройки типов подсказок
@@ -110,7 +111,8 @@
 //!   `task` — индекс `file_refs` решения, до 3), `### Код` (M5.6 §10: символы карты с именами
 //!   или `qual` из `task` — точные `qual` первыми, затем символы путей из `task`, до
 //!   [`BRIEF_CODE_MAX`], строка `<путь>:<line> <kind> <sig или qual>`, бюджет раздела —
-//!   `min(code.brief_tokens, остаток)`; выключенный `hooks.code_map` — раздела нет; учёта показа
+//!   `min(code.brief_tokens, остаток)`; у хука `subagent-start` (поле `code_map`) выключенный
+//!   `hooks.code_map` или `code_map: false` — раздела нет, явный вызов не гасится; учёта показа
 //!   нет). Без `task` — мини-дайджест: правила L0,
 //!   ловушки решения и Knowledge, `### Задачи` (захваченные `parent_id` или сессией — первыми).
 //!   Поиск — `mode=brief`, балл ≥ `recall.prompt_min_score`. Повторы не отсекаются (у субагента
@@ -309,6 +311,10 @@ pub struct RecallReq {
     task: Option<String>,
     /// Сессия родителя (`brief` субагента): её захваченные задачи — первыми в мини-дайджесте.
     parent_id: Option<String>,
+    /// Карта кода в ответе по настройке клиента `[hooks] code_map` (M5.6 §10): поле шлют хуки
+    /// (`session-start`, `subagent-start`); есть поле — действует и `hooks.code_map`
+    /// пользователя, нет (явный вызов REST/MCP `recovery`/`brief`) — не гасится.
+    code_map: Option<bool>,
 }
 
 /// Кандидат в подсказки.
@@ -2247,7 +2253,11 @@ pub async fn recall(
                 .is_some_and(|s| RECOVERY_SOURCES.contains(&s.trim())));
     let brief_event = req.event == Event::Brief;
     // карта кода (M5.6 §10): сервер с картой и тип подсказок `code_map` пользователя
-    let code_on = st.cfg.code.enabled && hooks.enabled("code_map");
+    // `session_start` — всегда хук; `recovery`/`brief` — хук, если прислал `code_map`
+    // (ревью задачи 6, M2: явные вызовы REST/MCP/CLI тип подсказок не гасит, §10)
+    let from_hook = req.event == Event::SessionStart || req.code_map.is_some();
+    let code_on = st.cfg.code.enabled
+        && (!from_hook || (hooks.enabled("code_map") && req.code_map != Some(false)));
     let budget = req.budget_tokens.unwrap_or(if recovery {
         st.cfg.recall.recovery_tokens
     } else if brief_event {

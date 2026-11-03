@@ -671,6 +671,8 @@ fn central_json(hits: &[SymbolHit]) -> Vec<Value> {
 
 /// Предел строки дайджеста карты, токенов (§10).
 pub const DIGEST_LINE_TOKENS: usize = 80;
+/// Предел имени ветки в строке дайджеста, символов (длиннее — обрезка с `…`).
+const DIGEST_BRANCH_MAX: usize = 40;
 
 /// Возраст снимка в строке дайджеста (Minor 7 ревью задачи 4): «N мин» (меньше часа), «N ч»
 /// (меньше 48 ч), иначе «N дн.».
@@ -685,7 +687,18 @@ fn digest_age(secs: i64) -> String {
 /// Снимок строки дайджеста: `ветка@коммит7` — что известно, без машины (Minor 7).
 fn digest_snapshot(s: &CodeSnapshot) -> Option<String> {
     let commit = s.commit.as_deref().map(|c| &c[..c.len().min(7)]);
-    match (s.branch.as_deref(), commit) {
+    // ветка — до 256 символов: в строке ≤ 80 токенов — до [`DIGEST_BRANCH_MAX`] (ревью
+    // задачи 6, M1)
+    let branch = s.branch.as_deref().map(|b| {
+        if b.chars().count() > DIGEST_BRANCH_MAX {
+            let mut t: String = b.chars().take(DIGEST_BRANCH_MAX).collect();
+            t.push('…');
+            t
+        } else {
+            b.to_string()
+        }
+    });
+    match (branch.as_deref(), commit) {
         (Some(b), Some(c)) => Some(format!("{b}@{c}")),
         (Some(b), None) => Some(b.to_string()),
         (None, Some(c)) => Some(c.to_string()),
@@ -694,15 +707,17 @@ fn digest_snapshot(s: &CodeSnapshot) -> Option<String> {
 }
 
 /// Строка дайджеста (§10): размер карты, возраст снимка, центральные символы — до
-/// [`DIGEST_CENTRAL`]; строка длиннее [`DIGEST_LINE_TOKENS`] по `count` — центральных 2, 1, 0.
+/// [`DIGEST_CENTRAL`]; строка длиннее [`DIGEST_LINE_TOKENS`] по `count` — центральных 2, 1, 0,
+/// а без центральных всё ещё длиннее — и без скобки снимка.
 fn digest_line(s: &CodeStatus, central: &[Value], count: &dyn Fn(&str) -> usize) -> String {
     let snap = &s.snapshot;
-    let mut head = format!(
+    let bare = format!(
         "ZeroAIMemory: карта кода: {}, {}, снимок {}",
         files_text(snap.files),
         symbols_text(snap.symbols),
         digest_age(age_s(snap))
     );
+    let mut head = bare.clone();
     if let Some(t) = digest_snapshot(snap) {
         head.push_str(&format!(" ({t})"));
     }
@@ -720,11 +735,11 @@ fn digest_line(s: &CodeStatus, central: &[Value], count: &dyn Fn(&str) -> usize)
         l.push_str(" — `memory_code`/`zam code map`");
         l
     };
-    (1..=names.len())
+    (0..=names.len())
         .rev()
         .map(line)
         .find(|l| count(l) <= DIGEST_LINE_TOKENS)
-        .unwrap_or_else(|| line(0))
+        .unwrap_or_else(|| format!("{bare} — `memory_code`/`zam code map`"))
 }
 
 /// Строка дайджеста карты решения `guid` в базе `db` (для `/recall`: `session_start` и
@@ -1855,7 +1870,7 @@ fn parse_impact(files: &[Value], max_symbols: u32) -> Result<Vec<ImpactFile>, Ap
             .ok_or_else(|| unprocessable(format!("{what}: ожидается объект {{path, symbols?}}")))?;
         known_fields(o, &["path", "symbols"], &what)?;
         let path = path_of(str_field(o, "path", &what)?, &format!("{what}.path"))?;
-        let symbols = super::files::symbol_hashes_of(o.get("symbols"), max_symbols, &what)?;
+        let symbols = super::files::symbol_hashes_of(o.get("symbols"), max_symbols, false, &what)?;
         if !out.iter().any(|(p, _)| *p == path) {
             out.push((path, symbols));
         }
@@ -2066,6 +2081,13 @@ mod tests {
         assert!(two.contains("Store::open, Db —"), "{two}");
         let none = cut(10);
         assert!(!none.contains("центральные"), "{none}");
+        assert!(!none.contains("(main"), "без скобки снимка: {none}");
         assert!(none.ends_with(" — `memory_code`/`zam code map`"), "{none}");
+        // ревью задачи 6, M1: ветка в 256 символов — обрезка до 40 с «…», строка ≤ 80 токенов
+        let long = "b".repeat(256);
+        let sl = status(snap(Some(&long), Some("abcdef1234")));
+        let l = digest_line(&sl, &central, &zam_store::count_tokens);
+        assert!(l.contains(&format!("({}…@abcdef1)", "b".repeat(40))), "{l}");
+        assert!(zam_store::count_tokens(&l) <= DIGEST_LINE_TOKENS, "{l}");
     }
 }
