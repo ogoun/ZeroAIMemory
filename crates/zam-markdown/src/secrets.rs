@@ -63,7 +63,7 @@ pub struct SecretHit {
 struct Prefix {
     family: &'static str,
     re: Regex,
-    /// Тот же шаблон без границы слова, с якорем `^`: ключ вплотную за найденным секретом
+    /// Тот же шаблон без границы слова, с якорем `^`: ключ вплотную к найденному секрету
     /// ([`glued_prefixes`]).
     glued: Regex,
 }
@@ -105,26 +105,61 @@ static PREFIXES: LazyLock<Vec<Prefix>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Ключи вплотную за найденными секретами (`SG.<22>.<43>hf_<34>`, `ghp_…ghp_…`): правило
-/// префикса требует границы слова слева, а её у слипшегося ключа нет — без этого шага второй
-/// ключ уходил бы открытым в чанки и индекс, а маскировка не была бы идемпотентной (после
-/// маски соседа граница появляется; ревью задачи 9A, M2). От конца каждого найденного
-/// секрета шаблоны префиксов проверяются якорем, найденное — снова точка продолжения.
-fn glued_prefixes(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
-    let mut stack: Vec<usize> = raw.iter().map(|(r, _)| r.end).collect();
-    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    while let Some(at) = stack.pop() {
-        if !seen.insert(at) || at >= text.len() || !text.is_char_boundary(at) {
-            continue;
+/// Окно проверки ключа внутри конца находки, байт ([`glued_prefixes`]): правило с жадным
+/// хвостом (`xox…-[A-Za-z0-9-]{10,}`, `sk-…`, `glpat-…`, JWT) поглощает начало вплотную
+/// следующего ключа (`xoxb-…hf` + `_<34>`); его начало — не дальше окна от конца находки
+/// (самый длинный литерал префикса — `github_pat_`, заголовок JWT — десятки символов).
+const GLUED_INNER_WINDOW: usize = 256;
+
+/// Первые байты шаблонов [`PREFIXES`] и JWT: проверка внутри находки — только с них.
+const GLUED_FIRST: &[u8] = b"AghxsSnze";
+
+/// Ключи (префиксные и JWT) с позиции `at` — якорем, без границы слова.
+fn anchored_at(text: &str, at: usize, out: &mut Vec<(Range<usize>, SecretKind)>) {
+    let rest = &text[at..];
+    for p in PREFIXES.iter() {
+        if let Some(m) = p.glued.find(rest) {
+            out.push((at..at + m.end(), SecretKind::KnownPrefix(p.family)));
         }
-        let rest = &text[at..];
-        for p in PREFIXES.iter() {
-            if let Some(m) = p.glued.find(rest) {
-                let r = at..at + m.end();
-                if !raw.iter().any(|(h, _)| *h == r) {
-                    stack.push(r.end);
-                    raw.push((r, SecretKind::KnownPrefix(p.family)));
+    }
+    if let Some(m) = JWT_GLUED.find(rest) {
+        out.push((at..at + m.end(), SecretKind::Jwt));
+    }
+}
+
+/// Ключи вплотную к найденным секретам (`SG.<22>.<43>hf_<34>`, `ghp_…ghp_…`, `ghp_…eyJ…`,
+/// `xoxb-…hf_…`): правило префикса требует границы слова слева, а её у слипшегося ключа нет —
+/// без этого шага второй ключ уходил бы открытым в чанки и индекс, а маскировка не была бы
+/// идемпотентной (ревью задачи 9A, M2). Для каждой находки: от её конца шаблоны префиксов и JWT
+/// проверяются якорем; у префиксной и JWT — ещё и с позиций последних [`GLUED_INNER_WINDOW`]
+/// байт внутри неё (жадный хвост съел начало следующего ключа; берутся ключи, выходящие за
+/// конец находки). Найденное — снова в работу. Повторы отсекает множество `(начало, конец)`:
+/// цепочка из 50 000 ключей — линейно (ревью повторное 9A).
+fn glued_prefixes(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
+    let mut seen: std::collections::HashSet<(usize, usize)> =
+        raw.iter().map(|(r, _)| (r.start, r.end)).collect();
+    let mut ends: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut work: Vec<(Range<usize>, SecretKind)> = raw.clone();
+    let mut found = Vec::new();
+    while let Some((h, kind)) = work.pop() {
+        found.clear();
+        if h.end < text.len() && text.is_char_boundary(h.end) && ends.insert(h.end) {
+            anchored_at(text, h.end, &mut found);
+        }
+        if matches!(kind, SecretKind::KnownPrefix(_) | SecretKind::Jwt) {
+            let from = (h.start + 1).max(h.end.saturating_sub(GLUED_INNER_WINDOW));
+            let mut inner = Vec::new();
+            for pos in from..h.end {
+                if GLUED_FIRST.contains(&text.as_bytes()[pos]) && text.is_char_boundary(pos) {
+                    anchored_at(text, pos, &mut inner);
                 }
+            }
+            found.extend(inner.into_iter().filter(|(r, _)| r.end > h.end));
+        }
+        for (r, k) in found.drain(..) {
+            if seen.insert((r.start, r.end)) {
+                raw.push((r.clone(), k));
+                work.push((r, k));
             }
         }
     }
@@ -134,6 +169,10 @@ fn glued_prefixes(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
 /// [решение исполнителя: требование `eyJ` отсекает имена вида `a.b.c`].
 static JWT: LazyLock<Regex> =
     LazyLock::new(|| rx(r"(?-u:\b)eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"));
+
+/// JWT без границы слова, с якорем `^` — для [`glued_prefixes`] (`ghp_<36>eyJ…`).
+static JWT_GLUED: LazyLock<Regex> =
+    LazyLock::new(|| rx(r"^eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"));
 
 /// Блок закрытого ключа целиком; без `END` — заголовок и следующие строки base64.
 static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {

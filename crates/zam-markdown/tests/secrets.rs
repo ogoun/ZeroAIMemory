@@ -465,3 +465,48 @@ fn glued_keys_each_detected() {
         assert_eq!(mask_text(&once), once, "{t}");
     }
 }
+
+/// Повторное ревью 9A: жадный хвост правила (Slack `xox…-[A-Za-z0-9-]{10,}`) съедает начало
+/// следующего ключа (`hf`) — ключ всё равно находится (тело без энтропии: ловит только правило
+/// префикса); JWT вплотную за ключом (`ghp_<36>eyJ…`) — тоже.
+#[test]
+fn glued_after_greedy_tail_and_jwt() {
+    let low = "abcdefghij".repeat(4);
+    let cases = [
+        (
+            format!("xo{}-{}", "xb", "1234567890"),
+            format!("hf_{}", &low[..34]),
+        ),
+        (
+            format!("xo{}-{}", "xp", "abcdefghijklmn"),
+            format!("npm_{}", &low[..36]),
+        ),
+        (
+            format!("ghp_{}", rnd(36, 60)),
+            format!("ey{}{}.{}.{}", "J", rnd(20, 61), rnd(30, 62), rnd(20, 63)),
+        ),
+    ];
+    for (a, b) in cases {
+        let t = format!("x {a}{b} y");
+        let hits = scan_secrets(&t);
+        let covered = |at: usize| hits.iter().any(|h| h.range.contains(&at));
+        assert!((2..2 + a.len() + b.len()).all(covered), "{t}: {hits:?}");
+        let once = mask_text(&t);
+        assert_eq!(once, format!("x {SECRET_MARK} y"), "{t}");
+        assert_eq!(mask_text(&once), once);
+    }
+}
+
+/// Повторное ревью 9A: цепочка слипшихся ключей не квадратична — 1 МБ из `AKIA<16>` подряд
+/// (≈ 52 000 ключей) сканируется быстро (замер — в журнале этапа).
+#[test]
+fn glued_chain_1mb_linear() {
+    let key = format!("{}{}{}", "AK", "IA", "ABCDEFGH23456789");
+    let t = key.repeat(1_048_576 / key.len());
+    let t0 = std::time::Instant::now();
+    let hits = scan_secrets(&t);
+    let ms = t0.elapsed().as_millis();
+    eprintln!("1 МБ AKIA-цепочки: {} находок за {ms} мс", hits.len());
+    assert_eq!(hits.len(), t.len() / key.len());
+    assert!(ms < 5000, "{ms} мс");
+}
