@@ -6958,6 +6958,7 @@ dependencies = [
  "tokio",
  "toml",
  "ureq",
+ "zam-code",
  "zam-core",
  "zam-markdown",
  "zam-server",

@@ -293,6 +293,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RefsCmd,
     },
+    /// Карта кода решения: синхронизация, карта в бюджете, символы, влияние правки
+    Code {
+        #[command(subcommand)]
+        cmd: cmd::code::CodeCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1263,6 +1268,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Triggers {
             cmd: TriggersCmd::Sync { common },
         } => cmd::hook::cache::sync(&cmd::connect(&common)?),
+        Cmd::Code { cmd } => cmd::code::run(cmd),
         Cmd::Refs {
             cmd:
                 RefsCmd::Check {

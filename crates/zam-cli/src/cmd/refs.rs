@@ -200,15 +200,23 @@ pub fn real_case(root: &Path, rel: &str) -> String {
     if !cfg!(windows) {
         return rel.to_string();
     }
-    let (Ok(abs), Ok(r)) = (
-        std::fs::canonicalize(root.join(rel)),
-        std::fs::canonicalize(root),
-    ) else {
+    match std::fs::canonicalize(root) {
+        Ok(canon) => real_case_in(root, &canon, rel),
+        Err(_) => rel.to_string(),
+    }
+}
+
+/// [`real_case`] с уже каноническим корнем `canon` (обход многих файлов: корень — один раз).
+pub fn real_case_in(root: &Path, canon: &Path, rel: &str) -> String {
+    if !cfg!(windows) {
+        return rel.to_string();
+    }
+    let Ok(abs) = std::fs::canonicalize(root.join(rel)) else {
         return rel.to_string();
     };
     let (a, r) = (
         abs.to_string_lossy().replace('\\', "/"),
-        r.to_string_lossy().replace('\\', "/"),
+        canon.to_string_lossy().replace('\\', "/"),
     );
     let r = r.trim_end_matches('/');
     let Some(rest) = strip_prefix_ci(&a, r) else {
@@ -276,12 +284,12 @@ pub fn hash_rel(root: &Path, rel: &str) -> Option<String> {
 }
 
 /// Каталог над `root` (включительно) с `.git` — корень репозитория есть.
-fn in_git(root: &Path) -> bool {
+pub(crate) fn in_git(root: &Path) -> bool {
     root.ancestors().any(|d| d.join(".git").exists())
 }
 
 /// `git -C root <args>`: stdout при коде 0; нет `git` или ошибка — `None`.
-fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+pub(crate) fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut c = Command::new("git");
     c.arg("-C")
         .arg(root)

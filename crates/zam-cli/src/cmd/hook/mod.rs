@@ -362,27 +362,31 @@ impl Env {
     /// Строка в `hooks.log` (ротация по [`LOG_MAX`]); сбой журнала молча игнорируется.
     /// Текст промптов, команд и содержимого файлов сюда не передаётся.
     pub fn log(&self, msg: &str) {
-        let path = self.log_path();
-        let _ = (|| -> std::io::Result<()> {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() >= LOG_MAX) {
-                let _ = std::fs::rename(&path, path.with_extension("log.1"));
-            }
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            let line = format!(
-                "{} {} {}\n",
-                cache::now_rfc3339(),
-                self.kind.as_str(),
-                msg.replace(['\r', '\n'], " ")
-            );
-            f.write_all(line.as_bytes())
-        })();
+        log_line(&self.log_path(), self.kind.as_str(), msg);
     }
+}
+
+/// Строка `<время> <источник> <текст>` в журнал хуков `path` (ротация по [`LOG_MAX`]); сбой
+/// журнала молча игнорируется. Пишут хуки ([`Env::log`]) и фоновая `zam code sync`.
+pub fn log_line(path: &Path, source: &str, msg: &str) {
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if std::fs::metadata(path).is_ok_and(|m| m.len() >= LOG_MAX) {
+            let _ = std::fs::rename(path, path.with_extension("log.1"));
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let line = format!(
+            "{} {source} {}\n",
+            cache::now_rfc3339(),
+            msg.replace(['\r', '\n'], " ")
+        );
+        f.write_all(line.as_bytes())
+    })();
 }
 
 /// Корень проекта (fix round 1, m-6; fix round 2): ближайший вверх от `cwd` каталог с
