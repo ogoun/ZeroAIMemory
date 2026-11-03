@@ -1,4 +1,4 @@
-// Общее для ленты и страницы отчётов (M5.5): автор, размер файла, ссылки `data.refs`.
+// Общее для ленты, страницы и печати отчётов (M5.5): автор, размер файла, ссылки `data.refs`.
 import type { AuthorView, SearchItem } from './api';
 import { AUTHOR_TEXT } from './journals';
 
@@ -48,4 +48,17 @@ export function uniqueHits(items: SearchItem[]): SearchItem[] {
     .filter((x) => x.kind === 'report' && x.entry_id)
     .sort((a, b) => b.score - a.score)
     .filter((x) => !seen.has(x.entry_id!) && !!seen.add(x.entry_id!));
+}
+
+/** Первый элемент тела — `<h1>` с текстом заголовка: в шапке (экран, печать) он не повторяется. */
+export function bodyStartsWithTitle(html: string, title: string): boolean {
+  const t = document.createElement('template');
+  t.innerHTML = html;
+  const first = t.content.firstElementChild;
+  return first?.tagName === 'H1' && (first.textContent ?? '').trim() === title.trim();
+}
+
+/** `data.refs` текстом: строка на вид ссылок («Коммиты: a, b») — для печати и PDF. */
+export function refsText(data: Record<string, unknown>): string[] {
+  return refsOf(data).map(([k, v]) => `${REF_TITLE[k] ?? k}: ${v.join(', ')}`);
 }

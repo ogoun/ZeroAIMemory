@@ -23,6 +23,8 @@
   interface Props {
     user: string;
     space: string;
+    /** Имя решения (проект) — в шапке печати отчёта. */
+    project: string;
     /** Открытый отчёт; `null` — лента. */
     entry: string | null;
     /** Владелец решения: корзина, удаление и восстановление. */
@@ -30,7 +32,7 @@
     onexpired: () => void;
   }
 
-  let { user, space, entry, owner, onexpired }: Props = $props();
+  let { user, space, project, entry, owner, onexpired }: Props = $props();
 
   const PAGE = 20;
 
@@ -172,7 +174,7 @@
 </script>
 
 {#if entry}
-  <ReportView {user} {space} id={entry} {owner} {ondeleted} {onexpired} />
+  <ReportView {user} {space} id={entry} {project} {owner} {ondeleted} {onexpired} />
 {:else}
   <section class="journal">
     <form class="filters row" onsubmit={apply} aria-label="Фильтры отчётов">

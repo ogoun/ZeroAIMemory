@@ -11,9 +11,10 @@
 //!
 //! **Файлы** — только сессиям WebUI (токену — 404: отчёт агенту не виден, §7) и только живой
 //! записи вида `report`, пара (sha256, имя) — именно этой записи, иначе 404. Заголовки — общий
-//! [`blobs::serve`]: картинки — `inline`, SVG — `image/svg+xml`, всё — с CSP
-//! [`blobs::BLOB_CSP`] (`sandbox`) и `nosniff`, прочие файлы — `attachment`; `ETag` — sha256,
-//! `Range`. `?user=` — только администратору (браузер не ставит `X-Zam-User` в `<img src>`).
+//! [`blobs::serve`]: растровые картинки — `inline`; SVG — `image/svg+xml`, но `attachment`
+//! (`<img>` показывает, документом не открывается); прочие файлы — `attachment`; всё — с CSP
+//! [`blobs::BLOB_CSP`] (`sandbox`) и `nosniff`; `ETag` — sha256, `Range`.
+//! `?user=` — только администратору (браузер не ставит `X-Zam-User` в `<img src>`).
 use std::collections::HashMap;
 
 use axum::Json;

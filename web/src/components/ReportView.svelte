@@ -4,7 +4,8 @@
   // диаграммы. Шапка: заголовок (первый `#` тела, совпадающий с ним, не дублируется), дата,
   // автор, область, теги; ссылки `data.refs`; прочие файлы — на скачивание. Отчёт неизменен:
   // кнопок правки нет; «Удалить» — только владельцу решения (в корзину, с подтверждением).
-  import { tick, untrack } from 'svelte';
+  // «Скачать PDF» — печать браузера (lib/print.ts): только после догрузки картинок и модулей.
+  import { onDestroy, tick, untrack } from 'svelte';
   import Lightbox from './Lightbox.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import {
@@ -22,13 +23,16 @@
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
   import { fmtTime } from '../lib/journals';
-  import { reportAuthor, fmtSize, refsOf, REF_TITLE } from '../lib/reports';
+  import { clearPrint, printReport } from '../lib/print';
+  import { reportAuthor, fmtSize, refsOf, refsText, REF_TITLE, bodyStartsWithTitle } from '../lib/reports';
   import { anchorId, go, href, parse } from '../lib/router';
 
   interface Props {
     user: string;
     space: string;
     id: string;
+    /** Имя решения (проект) — в шапке печати. */
+    project: string;
     /** Владелец решения: может удалить отчёт. */
     owner: boolean;
     /** Отчёт удалён (переход в ленту делает родитель). */
@@ -36,7 +40,7 @@
     onexpired: () => void;
   }
 
-  let { user, space, id, owner, ondeleted, onexpired }: Props = $props();
+  let { user, space, id, project, owner, ondeleted, onexpired }: Props = $props();
 
   let report = $state<ReportHtml | null>(null);
   let error = $state('');
@@ -47,7 +51,11 @@
   let ask = $state<Ask | null>(null);
   /** Адреса заметок из `data.refs.notes` (`n:<id>` → страница заметки); `null` — не найдена. */
   let noteHrefs = $state<Record<string, string | null>>({});
+  /** Идёт подготовка печати (ожидание картинок, модулей, шрифтов). */
+  let printing = $state(false);
   let seq = 0;
+
+  onDestroy(clearPrint);
 
   /** Загруженный отчёт: эффект срабатывает на любую смену маршрута (props — из `route`). */
   let loadedFor = '';
@@ -66,6 +74,7 @@
     error = '';
     notice = '';
     report = null;
+    clearPrint();
     noteHrefs = {};
     try {
       const r = await getReportHtml(u, i);
@@ -166,14 +175,7 @@
   }
 
   /** Первый элемент тела — `<h1>` с текстом заголовка: в шапке заголовок не повторяется. */
-  let titleInBody = $derived.by(() => {
-    const r = report;
-    if (!r) return false;
-    const t = document.createElement('template');
-    t.innerHTML = r.html;
-    const first = t.content.firstElementChild;
-    return first?.tagName === 'H1' && (first.textContent ?? '').trim() === r.entry.title.trim();
-  });
+  let titleInBody = $derived(report ? bodyStartsWithTitle(report.html, report.entry.title) : false);
 
   let refs = $derived(report ? refsOf(report.entry.data) : []);
   /** Файлы, кроме картинок (картинки — в теле). */
@@ -203,6 +205,38 @@
   }
 
   const fileLabel = (f: EntryAttachment) => `${f.filename} (${fmtSize(f.size)})`;
+
+  /** «Скачать PDF»: печатная вёрстка и `window.print()` после готовности всего. */
+  async function pdf() {
+    const r = report;
+    if (!r || printing) return;
+    printing = true;
+    notice = '';
+    try {
+      const e = r.entry;
+      await printReport(
+        r.html,
+        {
+          title: e.title,
+          date: fmtTime(e.created_at),
+          author: reportAuthor(e.author),
+          project,
+          refs: refsText(e.data),
+          files: others.map((f) => `${fileLabel(f)}, ${f.mime}`),
+        },
+        {
+          wiki: (n, a) => href({ name: 'node', user, space, node: n, anchor: a }),
+          self: (a) => `#${a}`,
+          alive: () => report === r,
+          onfail: (why) => {
+            if (report === r) notice = `PDF не готов: ${why}.`;
+          },
+        },
+      );
+    } finally {
+      printing = false;
+    }
+  }
 </script>
 
 <svelte:head>
@@ -222,11 +256,12 @@
         {#if e.area}· область <span class="chip">{e.area}</span>{/if}
         {#each e.tags as t (t)}<span class="chip">#{t}</span>{/each}
       </div>
-      {#if owner}
-        <div class="actions">
-          <button type="button" class="danger" onclick={askDelete}>Удалить</button>
-        </div>
-      {/if}
+      <div class="actions">
+        <button type="button" onclick={pdf} disabled={printing} aria-busy={printing}>
+          {printing ? 'Готовлю PDF…' : 'Скачать PDF'}
+        </button>
+        {#if owner}<button type="button" class="danger" onclick={askDelete}>Удалить</button>{/if}
+      </div>
     </header>
     {#if notice}<p class="warn" role="status">{notice}</p>{/if}
     {#if report.warnings.length}

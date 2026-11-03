@@ -1,0 +1,119 @@
+/*
+ * Печать отчёта (M5.5, спецификация §9; lib/print.ts). На экране `.print-root` невидим, но
+ * раскладывается (шрифты KaTeX и картинки загружаются); при печати виден только он: A4, поля,
+ * светлые цвета при любой теме ОС (тёмные токены app.css — только для screen), разрывы страниц
+ * не режут картинки, формулы, диаграммы и строки таблиц, длинный код переносится.
+ */
+@media screen {
+  .print-root {
+    position: fixed;
+    top: 0;
+    left: -10000px;
+    width: 182mm; /* ширина A4 за вычетом полей */
+    visibility: hidden;
+    pointer-events: none;
+  }
+}
+
+@media print {
+  @page {
+    size: A4;
+    margin: 16mm 14mm;
+  }
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --panel: #ffffff;
+  }
+  html,
+  body {
+    background: #ffffff;
+  }
+  /* печатается только контейнер; без него (Ctrl+P на любой странице) — страница как есть */
+  body:has(> .print-root) > :not(.print-root) {
+    display: none !important;
+  }
+  .print-root {
+    color: var(--text);
+    font: 11pt/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .print-root button,
+  .print-root nav,
+  .print-root .heading-anchor {
+    display: none !important;
+  }
+  .print-head {
+    margin: 0 0 6mm;
+    padding-bottom: 3mm;
+    border-bottom: 1px solid var(--border);
+  }
+  .print-title {
+    margin: 0 0 2mm;
+    font-size: 18pt;
+  }
+  .print-meta {
+    margin: 0;
+    color: var(--muted);
+    font-size: 9pt;
+  }
+  .print-refs,
+  .print-files {
+    margin-top: 6mm;
+    padding-top: 3mm;
+    border-top: 1px solid var(--border);
+    font-size: 9.5pt;
+    overflow-wrap: anywhere;
+    break-inside: avoid;
+  }
+  .print-refs h2,
+  .print-files h2 {
+    margin: 0 0 2mm;
+    font-size: 11pt;
+  }
+  .print-refs ul,
+  .print-files ul {
+    margin: 0;
+    padding-left: 5mm;
+  }
+
+  .print-root img,
+  .print-root svg,
+  .print-root .katex-display,
+  .print-root .mermaid-diagram,
+  .print-root figure,
+  .print-root tr,
+  .print-root .callout {
+    break-inside: avoid;
+  }
+  .print-root h1,
+  .print-root h2,
+  .print-root h3,
+  .print-root h4,
+  .print-root h5,
+  .print-root h6 {
+    break-after: avoid;
+  }
+  /* на экране таблица — блок с прокруткой; на бумаге — таблица с шапкой на каждой странице */
+  .print-root .doc table {
+    display: table;
+    width: auto;
+    max-width: 100%;
+    overflow: visible;
+  }
+  .print-root thead {
+    display: table-header-group;
+  }
+  .print-root pre {
+    overflow: visible;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .print-root .doc div.math,
+  .print-root .doc span.math[data-math-style='display'],
+  .print-root .mermaid-diagram {
+    overflow: visible;
+  }
+  .print-root img {
+    max-width: 100%;
+  }
+}

@@ -394,7 +394,10 @@ fn render_never_panics_on_odd_input() {
 fn highlight_css_has_light_and_dark() {
     let css = highlight_css();
     assert!(css.contains(".hl-"), "{css}");
-    assert!(css.contains("@media (prefers-color-scheme: dark)"), "{css}");
+    assert!(
+        css.contains("@media screen and (prefers-color-scheme: dark)"),
+        "{css}"
+    );
 }
 
 // ---------- Сверка якорей заголовков с comrak ----------

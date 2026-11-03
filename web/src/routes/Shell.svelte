@@ -311,6 +311,7 @@
             <ReportsView
               user={r.user}
               space={r.space}
+              project={journalSpace.name}
               entry={r.entry}
               owner={journalSpace.role === 'owner' && r.user === me.user_id}
               {onexpired}

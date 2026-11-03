@@ -124,7 +124,8 @@ test('reports_feed_date_author_tags_thumb_cursor', async ({ page }) => {
   const resp = await more;
   const body = (await resp.json()) as { items: Record<string, unknown>[] };
   expect(body.items.every((x) => !('body' in x))).toBe(true);
-  await expect(cards).toHaveCount(REPORT_BULK + 4);
+  // + полный, «perf», корзина, «два раздела», печатный (reports-print.spec)
+  await expect(cards).toHaveCount(REPORT_BULK + 5);
   await expect(page.getByRole('button', { name: 'Показать ещё' })).toHaveCount(0);
   expect(problems, problems.join('\n')).toEqual([]);
 });
@@ -208,7 +209,6 @@ test('report_svg_as_img_no_script', async ({ page }) => {
   expect(r.headers()['content-type']).toContain('image/svg+xml');
   expect(r.headers()['content-security-policy']).toContain('sandbox');
   expect(r.headers()['x-content-type-options']).toBe('nosniff');
-  expect(problems, problems.join('\n')).toEqual([]);
   expect(r.headers()['content-disposition']).toMatch(/^attachment/);
   // прямой переход по адресу SVG документом не открывается (attachment + CSP sandbox): браузер
   // скачивает файл, страница остаётся прежней, скрипт и `onload` не исполняются нигде
@@ -218,6 +218,7 @@ test('report_svg_as_img_no_script', async ({ page }) => {
   expect((await download).suggestedFilename()).toBe('diag.svg');
   expect(await page.evaluate((f) => (window as unknown as Record<string, unknown>)[f], SVG_FLAG)).toBeUndefined();
   expect(page.url()).not.toContain('/attachments/');
+  expect(problems, problems.join('\n')).toEqual([]);
 });
 
 test('report_search_one_card_per_report', async ({ page }) => {

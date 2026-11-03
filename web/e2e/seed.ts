@@ -328,7 +328,47 @@ graph LR
 Сырые данные — [results.csv](results.csv).
 `;
 
+/** Отчёт для печати и PDF (задача 7): три PNG, формула, Mermaid, таблица, длинный код. */
+export const PRINT_TITLE = 'Отчёт E2E: печать';
+/** Подписи узлов диаграммы печатного отчёта — ищутся текстом в PDF. */
+export const PRINT_NODE_A = 'Энкодер';
+export const PRINT_NODE_B = 'Декодер';
+/** Строка кода без пробелов длиннее ширины A4: на бумаге переносится. */
+export const PRINT_LONG_CODE = 'x'.repeat(30) + '_' + 'y'.repeat(300);
+export const PRINT_FILE = 'raw-data.csv';
+
+const PRINT_BODY = `# ${PRINT_TITLE}
+
+Метрика $\\mathrm{F1}$ — гармоническое среднее:
+
+$$
+\\mathrm{F1} = \\frac{2 P R}{P + R}
+$$
+
+![Первая](p1.png)
+
+![Вторая](p2.png)
+
+![Третья](p3.png)
+
+| шаг | значение |
+|----:|---------:|
+${Array.from({ length: 40 }, (_, i) => `| ${i + 1} | ${(i * 0.25).toFixed(2)} |`).join('\n')}
+
+\`\`\`text
+${PRINT_LONG_CODE}
+\`\`\`
+
+\`\`\`mermaid
+graph LR
+  A[${PRINT_NODE_A}] --> B[${PRINT_NODE_B}]
+\`\`\`
+
+Исходные замеры — [${PRINT_FILE}](${PRINT_FILE}).
+`;
+
 export interface ReportSeed {
+  print: string;
   full: string;
   perf: string;
   trash: string;
@@ -359,6 +399,21 @@ export async function seedReports(base: string, token: string, noteId: string): 
     });
     return r.id;
   };
+  // печатный — первым: лента (reports.spec) ждёт полный отчёт последним
+  const print = await report(
+    {
+      title: PRINT_TITLE,
+      body: PRINT_BODY,
+      tags: ['print'],
+      data: { refs: { commits: [REPORT_COMMIT], files: ['src/print.py'] } },
+    },
+    [
+      ['p1.png', 'image/png', makePng(320, 160)],
+      ['p2.png', 'image/png', makePng(300, 150)],
+      ['p3.png', 'image/png', makePng(280, 140)],
+      [PRINT_FILE, 'text/csv', 'step,value\n1,0.5\n'],
+    ],
+  );
   for (let i = 1; i <= REPORT_BULK; i++) {
     await report({ title: `Серия E2E №${i}`, body: `Замер ${i}.\n`, tags: ['bulk'], area: 'bulk' });
   }
@@ -407,5 +462,5 @@ ${filler}
       ['results.csv', 'text/csv', 'epoch,loss\n1,0.92\n2,0.41\n'],
     ],
   );
-  return { full, perf, trash, dup, task: task.id };
+  return { print, full, perf, trash, dup, task: task.id };
 }
