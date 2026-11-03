@@ -294,8 +294,9 @@ async fn store_rank(db: Db, guid: String) -> Result<bool, String> {
     })
     .await
     .map_err(|e| format!("ранжирование прервано (panic = {})", e.is_panic()))?;
-    code_store_ranks(&db, &guid, &inputs, &ranked)
+    code_store_ranks(&db, &guid, &inputs, &ranked, Timestamp::now())
         .await
+        .map(|written| written.is_some())
         .map_err(|e| e.to_string())
 }
 
@@ -591,7 +592,7 @@ pub async fn sync(
         sc.user.id,
     )?;
     let manifest = parse_manifest(&req.manifest, st.cfg.code.max_files)?;
-    let out = code_sync_manifest(&sc.db, &guid(&sc), &meta, &manifest).await?;
+    let out = code_sync_manifest(&sc.db, &guid(&sc), &meta, &manifest, &[]).await?;
     Ok(Json(
         json!({ "need": out.need, "removed": out.removed, "etag": out.etag }),
     ))

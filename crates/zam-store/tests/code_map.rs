@@ -11,17 +11,20 @@ use zam_code::{
     SymbolHash, SymbolKind,
 };
 use zam_core::Id;
+use zam_core::{TargetKind, TargetRef};
 use zam_store::code::{
     RankState, UploadMeta, code_clear, code_impact, code_map_rows, code_put_files,
     code_rank_inputs, code_status, code_store_ranks, code_symbol, code_symbols_named,
     code_symbols_search, code_sync_manifest,
 };
+use zam_store::code::{code_map_files, code_map_symbols};
 use zam_store::file_refs::{ChangedFile, SYMBOL_CHANGED, SYMBOL_REMOVED, note_refs};
+use zam_store::file_refs::{REFS_MAX, symbols_uploaded};
 use zam_store::{
-    Attribution, AuthorKind, DataDir, Db, EntryKind, FileRef, FtsQuery, NewEntry, NewNote,
-    NodePath, SpaceKind, TargetFilter, USER_MIGRATIONS, UserDbs, create_entry, create_note,
-    create_solution, files_changed, files_verified, list_spaces, refs_index, refs_to_path,
-    search_fts, space_of_kind,
+    Attribution, AuthorKind, Certainty, DataDir, Db, EntryKind, FileRef, FtsQuery, NewEntry,
+    NewNote, NodePath, SpaceKind, StoreError, TargetFilter, USER_MIGRATIONS, UserDbs, create_entry,
+    create_note, create_solution, files_changed, files_verified, list_spaces, refs_index,
+    refs_to_path, search_fts, space_of_kind, stale_refs_of, supersede_entry,
 };
 
 const G: &str = "g-code-map";
@@ -316,7 +319,7 @@ async fn manifest_need_and_removed() {
             .collect()
     };
     let three = man(&[("a.rs", '1'), ("b.rs", '2'), ("c.rs", '3')]);
-    let out = code_sync_manifest(&db, G, &m, &three).await.unwrap();
+    let out = code_sync_manifest(&db, G, &m, &three, &[]).await.unwrap();
     let mut need = out.need.clone();
     need.sort();
     assert_eq!(need, ["a.rs", "b.rs", "c.rs"]);
@@ -342,17 +345,20 @@ async fn manifest_need_and_removed() {
         ),
     ];
     code_put_files(&db, G, &m, files, &[]).await.unwrap();
-    let again = code_sync_manifest(&db, G, &m, &three).await.unwrap();
+    let again = code_sync_manifest(&db, G, &m, &three, &[]).await.unwrap();
     assert!(again.need.is_empty(), "{:?}", again.need);
     assert_eq!(again.removed, 0);
     // другой хэш — нужен снова
     let changed = man(&[("a.rs", '9'), ("b.rs", '2'), ("c.rs", '3')]);
     assert_eq!(
-        code_sync_manifest(&db, G, &m, &changed).await.unwrap().need,
+        code_sync_manifest(&db, G, &m, &changed, &[])
+            .await
+            .unwrap()
+            .need,
         ["a.rs"]
     );
     let two = man(&[("a.rs", '1'), ("b.rs", '2')]);
-    let out = code_sync_manifest(&db, G, &m, &two).await.unwrap();
+    let out = code_sync_manifest(&db, G, &m, &two, &[]).await.unwrap();
     assert_eq!(out.removed, 1);
     assert_ne!(out.etag, again.etag);
     assert_eq!(count(&db, "SELECT count(*) FROM code_files").await, 2);
@@ -811,12 +817,123 @@ async fn put_files_crlf_twin_keeps_symbol_refs_ok() {
     for s in ["foo", "bar"] {
         let r = ref_row(&db, "a.rs", Some(s)).await;
         assert_eq!(r.0, "ok", "{s}");
-        assert_eq!(r.2, Some(h('2')), "{s}");
+        // хэш файла другой машины ссылке не передаётся: его судят хуки рабочей копии
+        assert_eq!(r.2, Some(h('1')), "{s}");
     }
 }
 
-/// Неполный разбор (`partial`): найденный символ судится по телу, не найденный — по хэшу файла
-/// (символ мог быть обрезан пределом); пропущенный файл — только по хэшу файла.
+/// I2 (ревью задачи 3): загрузка с другой машины (другой хэш файла) файловые ссылки не трогает —
+/// ни `ok` → `stale`, ни `stale` → `ok`; хэш у них прежний.
+#[tokio::test]
+async fn put_files_crlf_twin_keeps_file_refs_untouched() {
+    let (db, sol) = setup("crlf-file").await;
+    entry_with(
+        &db,
+        sol,
+        "Файловая",
+        vec![fref("a.rs", None, Some(h('1')), None)],
+    )
+    .await;
+    entry_with(
+        &db,
+        sol,
+        "Устаревшая",
+        vec![fref("b.rs", None, Some(h('1')), None)],
+    )
+    .await;
+    files_changed(
+        &db,
+        G,
+        &[sol],
+        &[changed("b.rs", &h('5'), None)],
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ref_row(&db, "b.rs", None).await.0, "stale");
+    let files = vec![
+        upload(
+            "a.rs",
+            &h('2'),
+            vec![sym("foo", "foo", &bh('f'), 1)],
+            vec![],
+        ),
+        upload(
+            "b.rs",
+            &h('1'),
+            vec![sym("foo", "foo", &bh('f'), 1)],
+            vec![],
+        ),
+    ];
+    let out = code_put_files(&db, G, &meta("win"), files, &[sol])
+        .await
+        .unwrap();
+    assert_eq!(out.stale_refs, 0);
+    let a = ref_row(&db, "a.rs", None).await;
+    assert_eq!((a.0.as_str(), a.2), ("ok", Some(h('1'))));
+    let b = ref_row(&db, "b.rs", None).await;
+    assert_eq!(
+        (b.0.as_str(), b.1.as_deref()),
+        ("stale", Some("source_changed"))
+    );
+}
+
+/// Карта подтверждает тело символа, но `stale` по хэшу файла (поставленный хуком) не снимает;
+/// `stale` по символу — снимает.
+#[tokio::test]
+async fn put_files_clears_only_symbol_staleness() {
+    let (db, sol) = setup("map-ok").await;
+    entry_with(
+        &db,
+        sol,
+        "Две",
+        vec![
+            fref("a.rs", Some("foo"), Some(h('1')), Some(bh('f'))),
+            fref("b.rs", Some("foo"), Some(h('1')), Some(bh('f'))),
+        ],
+    )
+    .await;
+    let now = Timestamp::now();
+    files_changed(&db, G, &[sol], &[changed("a.rs", &h('2'), None)], now)
+        .await
+        .unwrap();
+    files_changed(
+        &db,
+        G,
+        &[sol],
+        &[changed("b.rs", &h('2'), Some(vec![("foo", &bh('9'))]))],
+        now,
+    )
+    .await
+    .unwrap();
+    let files = vec![
+        upload(
+            "a.rs",
+            &h('2'),
+            vec![sym("foo", "foo", &bh('f'), 1)],
+            vec![],
+        ),
+        upload(
+            "b.rs",
+            &h('3'),
+            vec![sym("foo", "foo", &bh('f'), 1)],
+            vec![],
+        ),
+    ];
+    code_put_files(&db, G, &meta("box"), files, &[sol])
+        .await
+        .unwrap();
+    let a = ref_row(&db, "a.rs", Some("foo")).await;
+    assert_eq!(
+        (a.0.as_str(), a.1.as_deref()),
+        ("stale", Some("source_changed"))
+    );
+    let b = ref_row(&db, "b.rs", Some("foo")).await;
+    assert_eq!((b.0.as_str(), b.1), ("ok", None));
+}
+
+/// Неполный разбор (`partial`): найденный символ судится по телу, не найденный — не судится
+/// (символ мог быть обрезан пределом); пропущенный файл — ссылки не судятся.
 #[tokio::test]
 async fn put_files_partial_and_skipped_do_not_remove_symbols() {
     let (db, sol) = setup("partial").await;
@@ -847,8 +964,22 @@ async fn put_files_partial_and_skipped_do_not_remove_symbols() {
         .unwrap();
     assert_eq!(ref_row(&db, "a.rs", Some("foo")).await.0, "ok");
     let tail = ref_row(&db, "a.rs", Some("tail")).await;
-    assert_eq!(tail.1.as_deref(), Some("source_changed"));
+    assert_eq!((tail.0.as_str(), tail.2), ("ok", Some(h('1'))));
     assert_eq!(ref_row(&db, "b.rs", Some("big")).await.0, "ok");
+    // а хуки рабочей копии при неполном разборе судят не найденный символ по хэшу файла
+    files_changed(
+        &db,
+        G,
+        &[sol],
+        &[changed("a.rs", &h('2'), None)],
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ref_row(&db, "a.rs", Some("tail")).await.1.as_deref(),
+        Some("source_changed")
+    );
 }
 
 /// Правило загрузки касается только ссылок пространств `ref_spaces`.
@@ -1050,6 +1181,20 @@ async fn fts_finds_camel_parts() {
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
+    // слово из одного символа — не префикс; от двух — префикс
+    assert!(
+        code_symbols_search(&db, G, "g", None, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        code_symbols_search(&db, G, "ge", None, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     // синтаксис FTS5 в запросе не действует
     assert!(
         code_symbols_search(&db, G, "\"user\" OR *", None, None, 10)
@@ -1189,7 +1334,16 @@ async fn clear_removes_everything_of_solution_only() {
     assert_eq!(count(&db, "SELECT count(*) FROM code_symbols").await, 1);
     assert_eq!(count(&db, "SELECT count(*) FROM code_refs").await, 1);
     assert_eq!(count(&db, "SELECT count(*) FROM code_symbols_fts").await, 1);
-    assert_eq!(count(&db, "SELECT count(*) FROM code_snapshots").await, 1);
+    // строка снимка очищенного решения остаётся (поколение не начинается заново, M1)
+    assert_eq!(count(&db, "SELECT count(*) FROM code_snapshots").await, 2);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT files FROM code_snapshots WHERE solution_guid = 'g-code-map'"
+        )
+        .await,
+        0
+    );
     assert_eq!(code_clear(&db, G).await.unwrap(), 0);
 }
 
@@ -1298,10 +1452,24 @@ async fn rank_inputs_store_ranks_and_map_rows() {
         ]
     );
     let ranked = zam_code::rank(&inputs.files, None);
-    assert!(code_store_ranks(&db, G, &inputs, &ranked).await.unwrap());
+    let at: Timestamp = "2026-11-03T10:00:00Z".parse().unwrap();
+    assert_eq!(
+        code_store_ranks(&db, G, &inputs, &ranked, at)
+            .await
+            .unwrap(),
+        Some(3)
+    );
     let st = code_status(&db, G).await.unwrap().unwrap();
     assert_eq!(st.snapshot.rank_state, RankState::Ok);
-    assert!(st.snapshot.ranked_at.is_some());
+    // M7: время ранжирования — переданное
+    assert_eq!(st.snapshot.ranked_at, Some(at));
+    // повтор с теми же рангами ничего не переписывает (I1)
+    assert_eq!(
+        code_store_ranks(&db, G, &inputs, &ranked, at)
+            .await
+            .unwrap(),
+        Some(0)
+    );
     let rows = code_map_rows(&db, G, None).await.unwrap();
     assert_eq!(rows.len(), 3);
     assert!(rows.windows(2).all(|w| w[0].rank >= w[1].rank));
@@ -1312,7 +1480,34 @@ async fn rank_inputs_store_ranks_and_map_rows() {
     assert_eq!(store.symbols.len(), 2);
     assert!(store.symbols.windows(2).all(|w| w[0].rank >= w[1].rank));
     let share: f64 = store.symbols.iter().map(|s| s.share).sum();
-    assert!((share - 1.0).abs() < 1e-9, "{share}");
+    assert!((share - 1.0).abs() < 1e-5, "{share}");
+    for s in &store.symbols {
+        assert!((s.rank - store.rank * s.share).abs() < 1e-12);
+    }
+    // вторая фаза карты: символы только выбранных файлов, в их порядке
+    let two = code_map_symbols(&db, G, &[store.id, 999_999, rows[0].id])
+        .await
+        .unwrap();
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[0].0, store.id);
+    assert_eq!(two[0].1, store.symbols);
+    assert!(
+        code_map_symbols(&db, "g-none", &[store.id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // ранг в выдаче поиска — тот же, что в карте
+    let open = code_symbols_search(&db, G, "Store::open", None, None, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let in_map = store
+        .symbols
+        .iter()
+        .find(|s| s.qual == "Store::open")
+        .unwrap();
+    assert!((open.rank - in_map.rank).abs() < 1e-12);
     assert_eq!(
         code_map_rows(&db, G, Some("src/cfg.rs"))
             .await
@@ -1349,7 +1544,12 @@ async fn store_ranks_skipped_when_snapshot_changed() {
     )
     .await
     .unwrap();
-    assert!(!code_store_ranks(&db, G, &inputs, &ranked).await.unwrap());
+    assert_eq!(
+        code_store_ranks(&db, G, &inputs, &ranked, Timestamp::now())
+            .await
+            .unwrap(),
+        None
+    );
     let st = code_status(&db, G).await.unwrap().unwrap();
     assert_eq!(st.snapshot.rank_state, RankState::Pending);
     let rows = code_map_rows(&db, G, None).await.unwrap();
@@ -1458,4 +1658,524 @@ async fn impact_changed_removed_consumers() {
     assert_eq!(consumers, ["src/main.rs"]);
     assert_eq!(rows.consumers[0].names, ["Store"]);
     assert_eq!(rows.paths_only, ["src/cfg.rs"]);
+}
+
+// ---------- ревью задачи 3 ----------
+
+/// I3: файл исчез из манифеста — ссылки на его символы `symbol_removed`, файловые не тронуты,
+/// число — в `stale_refs`; без `ref_spaces` ссылки не судятся.
+#[tokio::test]
+async fn sync_removed_file_marks_symbol_refs_removed() {
+    let (db, sol) = setup("sync-removed").await;
+    let m = meta("box");
+    let files = vec![
+        upload(
+            "a.rs",
+            &h('1'),
+            vec![sym("foo", "foo", &bh('f'), 1)],
+            vec![],
+        ),
+        upload(
+            "b.rs",
+            &h('2'),
+            vec![sym("bar", "bar", &bh('b'), 1)],
+            vec![],
+        ),
+    ];
+    code_put_files(&db, G, &m, files, &[]).await.unwrap();
+    entry_with(
+        &db,
+        sol,
+        "Ссылки",
+        vec![
+            fref("a.rs", Some("foo"), Some(h('1')), Some(bh('f'))),
+            fref("a.rs", None, Some(h('1')), None),
+            fref("b.rs", Some("bar"), Some(h('2')), Some(bh('b'))),
+        ],
+    )
+    .await;
+    let only_b = [ManifestItem {
+        path: "b.rs".into(),
+        hash: h('2'),
+    }];
+    let out = code_sync_manifest(&db, G, &m, &only_b, &[sol])
+        .await
+        .unwrap();
+    assert_eq!((out.removed, out.stale_refs), (1, 1));
+    let foo = ref_row(&db, "a.rs", Some("foo")).await;
+    assert_eq!(
+        (foo.0.as_str(), foo.1.as_deref()),
+        ("stale", Some(SYMBOL_REMOVED))
+    );
+    assert_eq!(ref_row(&db, "a.rs", None).await.0, "ok");
+    assert_eq!(ref_row(&db, "b.rs", Some("bar")).await.0, "ok");
+    // без пространств ссылок — только удаление из карты
+    let none: [ManifestItem; 0] = [];
+    let out = code_sync_manifest(&db, G, &m, &none, &[]).await.unwrap();
+    assert_eq!((out.removed, out.stale_refs), (1, 0));
+    assert_eq!(ref_row(&db, "b.rs", Some("bar")).await.0, "ok");
+}
+
+/// Повтор пути в манифесте — первый; `need` без повторов.
+#[tokio::test]
+async fn manifest_duplicate_path_first_wins() {
+    let (db, _) = setup("manifest-dup").await;
+    let m = meta("box");
+    code_put_files(
+        &db,
+        G,
+        &m,
+        vec![upload("a.rs", &h('1'), vec![], vec![])],
+        &[],
+    )
+    .await
+    .unwrap();
+    let man = [
+        ManifestItem {
+            path: "a.rs".into(),
+            hash: h('1'),
+        },
+        ManifestItem {
+            path: "a.rs".into(),
+            hash: h('2'),
+        },
+        ManifestItem {
+            path: "b.rs".into(),
+            hash: h('3'),
+        },
+        ManifestItem {
+            path: "b.rs".into(),
+            hash: h('3'),
+        },
+    ];
+    let out = code_sync_manifest(&db, G, &m, &man, &[]).await.unwrap();
+    assert_eq!(out.need, ["b.rs"]);
+    assert_eq!(out.removed, 0);
+}
+
+/// M1: входы ранжирования до очистки не ложатся на карту, загруженную после неё (ABA по `gen`).
+#[tokio::test]
+async fn clear_then_reupload_old_ranks_not_stored() {
+    let (db, _) = setup("aba").await;
+    code_put_files(&db, G, &meta("box"), graph_files(), &[])
+        .await
+        .unwrap();
+    let inputs = code_rank_inputs(&db, G).await.unwrap();
+    let ranked = zam_code::rank(&inputs.files, None);
+    code_clear(&db, G).await.unwrap();
+    code_put_files(&db, G, &meta("box"), graph_files(), &[])
+        .await
+        .unwrap();
+    assert!(code_rank_inputs(&db, G).await.unwrap().generation > inputs.generation);
+    assert_eq!(
+        code_store_ranks(&db, G, &inputs, &ranked, Timestamp::now())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        code_status(&db, G)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .rank_state,
+        RankState::Pending
+    );
+}
+
+/// Замещение записи без `refs` наследует символьные ссылки с состоянием и хэшами.
+#[tokio::test]
+async fn supersede_inherits_symbol_refs_and_state() {
+    let (db, sol) = setup("supersede").await;
+    let insight = |title: &str, refs: Option<Vec<FileRef>>| NewEntry {
+        refs,
+        space_id: sol,
+        kind: EntryKind::Insight,
+        title: title.into(),
+        body: "Тело.".into(),
+        data: json!({"kind": "gotcha"}),
+        area: None,
+        tags: Vec::new(),
+        status: None,
+        certainty: Some(Certainty::Hypothesis),
+        idempotency_key: None,
+        triggers: Vec::new(),
+        links: Vec::new(),
+    };
+    let refs = vec![
+        fref("a.rs", Some("foo"), Some(h('1')), Some(bh('f'))),
+        fref("a.rs", Some("bar"), Some(h('1')), Some(bh('b'))),
+        fref("a.rs", None, Some(h('1')), None),
+    ];
+    let old = create_entry(&db, insight("Старая", Some(refs)), &agent())
+        .await
+        .unwrap()
+        .0
+        .id;
+    files_changed(
+        &db,
+        G,
+        &[sol],
+        &[changed(
+            "a.rs",
+            &h('1'),
+            Some(vec![("foo", &bh('9')), ("bar", &bh('b'))]),
+        )],
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    let (n, _) = supersede_entry(&db, old, None, insight("Новая", None), &agent())
+        .await
+        .unwrap();
+    let rows: Vec<(String, Option<String>, String, Option<String>)> = db
+        .read(move |c| {
+            let mut st = c.prepare(
+                "SELECT path, symbol, state, symbol_hash FROM file_refs
+                 WHERE owner_kind = 'entry' AND owner_id = ?1 ORDER BY coalesce(symbol, '')",
+            )?;
+            Ok(st
+                .query_map([n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("a.rs".to_string(), None, "ok".to_string(), None),
+            (
+                "a.rs".into(),
+                Some("bar".into()),
+                "ok".into(),
+                Some(bh('b'))
+            ),
+            (
+                "a.rs".into(),
+                Some("foo".into()),
+                "stale".into(),
+                Some(bh('f'))
+            ),
+        ]
+    );
+}
+
+/// `REFS_MAX` считает все ссылки владельца, символьные тоже; `stale_refs_of` называет
+/// символьную ссылку `путь#qual`.
+#[tokio::test]
+async fn refs_max_counts_symbol_refs_and_stale_refs_of_names_symbol() {
+    let (db, sol) = setup("refs-max").await;
+    let many: Vec<FileRef> = (0..REFS_MAX)
+        .map(|i| fref("a.rs", Some(&format!("f{i}")), None, None))
+        .collect();
+    let id = entry_with(&db, sol, "Ровно предел", many.clone()).await;
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM file_refs WHERE symbol IS NOT NULL"
+        )
+        .await,
+        REFS_MAX as i64
+    );
+    let mut over = many;
+    over.push(fref("a.rs", None, None, None));
+    let e = NewEntry {
+        refs: Some(over),
+        space_id: sol,
+        kind: EntryKind::Changelog,
+        title: "Сверх предела".into(),
+        body: "Тело.".into(),
+        data: json!({"kind": "fix"}),
+        area: None,
+        tags: Vec::new(),
+        status: None,
+        certainty: None,
+        idempotency_key: None,
+        triggers: Vec::new(),
+        links: Vec::new(),
+    };
+    assert!(matches!(
+        create_entry(&db, e, &agent()).await,
+        Err(StoreError::BadInput(_))
+    ));
+    files_changed(
+        &db,
+        G,
+        &[sol],
+        &[changed("a.rs", MISSING_HASH, None)],
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    let owner = TargetRef {
+        kind: TargetKind::Entry,
+        id,
+    };
+    let stale = stale_refs_of(&db, &[owner]).await.unwrap();
+    let paths = &stale[&owner];
+    assert_eq!(paths.len(), REFS_MAX);
+    assert!(paths.contains(&"a.rs#f0".to_string()), "{paths:?}");
+}
+
+/// §17 п. 12 на реалистичной базе M5.5 (0022): заметки (одна удалена) и записи со ссылками,
+/// отчёт, ссылка `stale` — после 0023 ссылки на месте с теми же владельцами и состояниями,
+/// `symbol` NULL, индекс и правило устарелости работают.
+#[tokio::test]
+async fn migration_0023_on_realistic_0022_db() {
+    let dd = datadir("migration-real");
+    let user = Id::new();
+    let path = dd.user_db(&user);
+    // код этой версии пишет `symbol` — старую схему заполняем SQL, как её писала M5.5
+    let sol = Id::new();
+    {
+        let db = Db::open(&path, &USER_MIGRATIONS[..22]).unwrap();
+        db.write(move |tx| {
+            let now = zam_store::time::fmt_ts(Timestamp::now());
+            tx.execute(
+                "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
+                 VALUES (?1, 'solution', ?2, 'sol', ?3)",
+                rusqlite::params![sol, G, now],
+            )?;
+            // база M5.5 уже прошла дозаполнение ссылок 0016
+            tx.execute("DELETE FROM meta WHERE key = 'refs_backfill'", [])?;
+            let fref = |kind: &str, owner: Id, path: &str, hash: Option<&str>| {
+                tx.execute(
+                    "INSERT INTO file_refs (owner_kind, owner_id, solution_guid, path,
+                                            content_hash, recorded_at, state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ok')",
+                    rusqlite::params![kind, owner, G, path, hash, now],
+                )
+            };
+            for i in 0..5 {
+                let id = Id::new();
+                tx.execute(
+                    "INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at,
+                                        updated_at, deleted_at)
+                     VALUES (?1, ?2, 'note', ?3, ?3, 'excluded', ?4, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        sol,
+                        format!("n{i}"),
+                        now,
+                        (i == 4).then_some(now.clone())
+                    ],
+                )?;
+                fref("node", id, &format!("src/n{i}.rs"), None)?;
+                fref("node", id, "src/common.rs", None)?;
+            }
+            for i in 0..5 {
+                let id = Id::new();
+                tx.execute(
+                    "INSERT INTO entries (id, space_id, kind, title, title_norm, author_kind,
+                                          created_at, updated_at)
+                     VALUES (?1, ?2, 'changelog', ?3, ?3, 'agent', ?4, ?4)",
+                    rusqlite::params![id, sol, format!("правка {i}"), now],
+                )?;
+                fref("entry", id, &format!("src/e{i}.rs"), Some(&"1".repeat(64)))?;
+                fref("entry", id, "src/common.rs", None)?;
+            }
+            tx.execute(
+                "INSERT INTO entries (id, space_id, kind, title, title_norm, author_kind,
+                                      index_state, created_at, updated_at)
+                 VALUES (?1, ?2, 'report', 'отчёт', 'отчёт', 'agent', 'excluded', ?3, ?3)",
+                rusqlite::params![Id::new(), sol, now],
+            )?;
+            tx.execute(
+                "UPDATE file_refs SET state = 'stale', stale_reason = 'source_changed',
+                        stale_at = ?1 WHERE path = 'src/e0.rs'",
+                [&now],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    let snapshot = |c: &Connection| -> Vec<(String, String, String, String)> {
+        let mut st = c
+            .prepare(
+                "SELECT owner_kind, owner_id, path, state FROM file_refs
+                 ORDER BY owner_kind, owner_id, path",
+            )
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before = snapshot(&conn(&path));
+    // 5 заметок (одна удалена) × 2 + 5 записей × 2; у отчёта ссылок нет
+    assert_eq!(before.len(), 20);
+    assert_eq!(before.iter().filter(|r| r.3 == "stale").count(), 1);
+    let dbs = UserDbs::new(dd.users_dir());
+    let db = dbs.get(user).await.unwrap();
+    dbs.wait_rechunk(user).await;
+    let (after, nulls, violations) = db
+        .read(move |c| {
+            let nulls: i64 = c.query_row(
+                "SELECT count(*) FROM file_refs WHERE symbol IS NULL AND symbol_hash IS NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            let mut st = c.prepare("PRAGMA foreign_key_check")?;
+            let violations = st.query_map([], |_| Ok(()))?.count();
+            Ok((snapshot(c), nulls, violations))
+        })
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(nulls, 20);
+    assert_eq!(violations, 0);
+    let idx = refs_index(&db, G, &[sol]).await.unwrap();
+    let common = idx.iter().find(|p| p.path == "src/common.rs").unwrap();
+    // до 5 живых владельцев (удалённая заметка в индекс не входит)
+    assert_eq!(common.items.len(), 5);
+    assert!(common.items.iter().all(|i| i.symbol.is_none()));
+    // правило устарелости по старым ссылкам — как в M4.5
+    let stale = files_changed(
+        &db,
+        G,
+        &[sol],
+        &[changed("src/e1.rs", &h('3'), None)],
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale, 1);
+}
+
+/// I5: замер на синтетике 50 000 файлов × 20 символов × 40 ссылок (release:
+/// `cargo test --release -p zam-store --test code_map -- --ignored --nocapture bench_`).
+#[tokio::test]
+#[ignore = "замер, ~минуты"]
+async fn bench_map_50k_files() {
+    use std::time::Instant;
+    let (db, _) = setup("bench-50k").await;
+    let (files_n, syms_n, refs_n) = (50_000usize, 20usize, 40usize);
+    let names: Vec<String> = (0..60_000).map(|i| format!("name{i}")).collect();
+    let t = Instant::now();
+    let m = meta("box");
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for batch in 0..files_n / 500 {
+        let files: Vec<FileUpload> = (0..500)
+            .map(|k| {
+                let f = batch * 500 + k;
+                let syms = (0..syms_n)
+                    .map(|s| {
+                        let n = &names[(f * syms_n + s) % names.len()];
+                        sym(
+                            n,
+                            &format!("T{f}::{n}"),
+                            &format!("{:016x}", rnd()),
+                            s as u32 * 3 + 1,
+                        )
+                    })
+                    .collect();
+                let refs = (0..refs_n)
+                    .map(|_| rf(&names[(rnd() % names.len() as u64) as usize], 1))
+                    .collect();
+                upload(&format!("src/d{}/f{f}.rs", f % 100), &h('1'), syms, refs)
+            })
+            .collect();
+        code_put_files(&db, G, &m, files, &[]).await.unwrap();
+    }
+    eprintln!("заполнение: {:.1} с", t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    let inputs = code_rank_inputs(&db, G).await.unwrap();
+    eprintln!("code_rank_inputs: {} мс", t.elapsed().as_millis());
+    let t = Instant::now();
+    let ranked = zam_code::rank(&inputs.files, None);
+    eprintln!("zam_code::rank: {} мс", t.elapsed().as_millis());
+    let wal = || {
+        std::fs::metadata(db.path().with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    let (t, w0) = (Instant::now(), wal());
+    let n = code_store_ranks(&db, G, &inputs, &ranked, Timestamp::now())
+        .await
+        .unwrap();
+    eprintln!(
+        "code_store_ranks (первый): {} мс, файлов {n:?}, WAL +{:.1} МиБ",
+        t.elapsed().as_millis(),
+        (wal().saturating_sub(w0)) as f64 / 1048576.0
+    );
+    let t = Instant::now();
+    let n = code_store_ranks(&db, G, &inputs, &ranked, Timestamp::now())
+        .await
+        .unwrap();
+    eprintln!(
+        "code_store_ranks (повтор): {} мс, файлов {n:?}",
+        t.elapsed().as_millis()
+    );
+    let t = Instant::now();
+    let files = code_map_files(&db, G, None).await.unwrap();
+    eprintln!(
+        "code_map_files: {} мс, {} файлов",
+        t.elapsed().as_millis(),
+        files.len()
+    );
+    let top: Vec<i64> = files.iter().take(200).map(|f| f.id).collect();
+    let t = Instant::now();
+    let syms = code_map_symbols(&db, G, &top).await.unwrap();
+    eprintln!(
+        "code_map_symbols(200): {} мс, {} файлов",
+        t.elapsed().as_millis(),
+        syms.len()
+    );
+    for q in ["name", "na", "n", "name7", "name12345", "T49999::name1"] {
+        let t = Instant::now();
+        let hits = code_symbols_search(&db, G, q, None, None, 100)
+            .await
+            .unwrap();
+        eprintln!(
+            "поиск «{q}»: {} мс, {}",
+            t.elapsed().as_millis(),
+            hits.len()
+        );
+    }
+}
+
+/// Правило загрузки для другой базы (Knowledge участника): файловые ссылки и хэш файла не
+/// меняются, символьные судятся по символам, `symbols: None` — не судятся.
+#[tokio::test]
+async fn symbols_uploaded_touches_only_symbol_refs() {
+    let (db, sol) = setup("uploaded").await;
+    entry_with(
+        &db,
+        sol,
+        "Ссылки",
+        vec![
+            fref("a.rs", None, Some(h('1')), None),
+            fref("a.rs", Some("foo"), Some(h('1')), Some(bh('f'))),
+            fref("b.rs", Some("bar"), Some(h('1')), Some(bh('b'))),
+        ],
+    )
+    .await;
+    let stale = symbols_uploaded(
+        &db,
+        G,
+        &[sol],
+        &[
+            changed("a.rs", &h('2'), Some(vec![("foo", &bh('9'))])),
+            changed("b.rs", &h('2'), None),
+        ],
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale, 1);
+    let file = ref_row(&db, "a.rs", None).await;
+    assert_eq!((file.0.as_str(), file.2), ("ok", Some(h('1'))));
+    assert_eq!(
+        ref_row(&db, "a.rs", Some("foo")).await.1.as_deref(),
+        Some(SYMBOL_CHANGED)
+    );
+    assert_eq!(ref_row(&db, "b.rs", Some("bar")).await.0, "ok");
 }

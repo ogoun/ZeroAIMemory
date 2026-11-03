@@ -592,7 +592,8 @@ fn verified_of(fm: Option<&zam_markdown::Frontmatter>) -> (Option<String>, Optio
 
 /// Ссылки решения `?1` на путь `?2` у владельцев из пространств `?3` (JSON-массив), в том
 /// числе удалённых: участнику не видны ссылки базы владельца вне пространства решения.
-const REFS_IN_SPACES: &str = "SELECT f.id, f.content_hash, f.state, f.symbol, f.symbol_hash
+const REFS_IN_SPACES: &str = "SELECT f.id, f.content_hash, f.state, f.symbol, f.symbol_hash,
+            f.stale_reason
      FROM file_refs f
      LEFT JOIN nodes n ON f.owner_kind = 'node' AND n.id = f.owner_id
      LEFT JOIN entries e ON f.owner_kind = 'entry' AND e.id = f.owner_id
@@ -606,6 +607,7 @@ struct RefRow {
     state: RefState,
     symbol: Option<String>,
     symbol_hash: Option<String>,
+    stale_reason: Option<String>,
 }
 
 /// Ссылки решения на путь у владельцев из пространств (`spaces` — JSON-массив id).
@@ -623,19 +625,33 @@ fn refs_in_spaces(
             state: r.get(2)?,
             symbol: r.get(3)?,
             symbol_hash: r.get(4)?,
+            stale_reason: r.get(5)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Файл для правила устарелости: [`ChangedFile`] и полнота присланных символов. Неполный разбор
-/// (`partial`, предел символов): найденный символ судится по телу, не найденный — по хэшу
-/// файла (он мог быть обрезан пределом, а не удалён).
+/// Откуда сведения об изменении файла.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeSource {
+    /// Хуки рабочей копии (`POST /files/changed`): файловые и символьные ссылки.
+    WorkingCopy,
+    /// Карта кода (`PUT /code/files`, удаление синхронизацией): только символьные ссылки и только
+    /// по символам — хэш файла другой машины (CRLF/LF, BOM) ни файловых ссылок, ни хэша файла
+    /// у символьных не трогает (решение контроллера по ревью задачи 3, I2).
+    Map,
+}
+
+/// Файл для правила устарелости: [`ChangedFile`], полнота присланных символов и источник.
+/// Неполный разбор (`partial`, предел символов): найденный символ судится по телу, не
+/// найденный — по хэшу файла у [`ChangeSource::WorkingCopy`] и не судится у
+/// [`ChangeSource::Map`] (он мог быть обрезан пределом, а не удалён).
 pub(crate) struct Change<'a> {
     pub path: &'a str,
     pub hash: &'a str,
     pub symbols: Option<&'a [SymbolHash]>,
     pub complete: bool,
+    pub source: ChangeSource,
 }
 
 /// Вердикт правила для одной ссылки.
@@ -647,19 +663,32 @@ enum Verdict<'a> {
     },
     /// `ok` без изменения хэшей (хэш совпал).
     Same,
+    /// Карта подтвердила тело символа: хэш тела — если не было; `stale` по символу снимается,
+    /// `stale` по хэшу файла (его судят хуки рабочей копии) — остаётся.
+    SymbolOk {
+        symbol_hash: &'a str,
+    },
     Stale(&'static str),
+    /// Ссылку этот источник не судит.
+    Skip,
 }
 
 /// Правило устарелости (спецификация M4.5 §6.2, M5.6 §8) для ссылки `r` и файла `c`.
 fn verdict<'a>(r: &RefRow, c: &Change<'a>) -> Verdict<'a> {
-    let by_file = || match r.hash.as_deref() {
-        Some(h) if h == c.hash => Verdict::Same,
-        Some(_) => Verdict::Stale(SOURCE_CHANGED),
-        // без хэша: первый присланный хэш — ориентир
-        None => Verdict::Ok {
-            hash: c.hash,
-            symbol_hash: None,
-        },
+    let map = c.source == ChangeSource::Map;
+    let by_file = || {
+        if map {
+            return Verdict::Skip;
+        }
+        match r.hash.as_deref() {
+            Some(h) if h == c.hash => Verdict::Same,
+            Some(_) => Verdict::Stale(SOURCE_CHANGED),
+            // без хэша: первый присланный хэш — ориентир
+            None => Verdict::Ok {
+                hash: c.hash,
+                symbol_hash: None,
+            },
+        }
     };
     let Some(qual) = r.symbol.as_deref() else {
         return by_file();
@@ -673,6 +702,9 @@ fn verdict<'a>(r: &RefRow, c: &Change<'a>) -> Verdict<'a> {
     match symbols.iter().find(|s| s.qual == qual) {
         Some(s) => match r.symbol_hash.as_deref() {
             Some(h) if h != s.body_hash => Verdict::Stale(SYMBOL_CHANGED),
+            _ if map => Verdict::SymbolOk {
+                symbol_hash: &s.body_hash,
+            },
             // тело то же (или ориентира не было): ссылка принимает и новый хэш файла, иначе
             // следующее сообщение без символов сочло бы её устаревшей по старому хэшу файла
             _ => Verdict::Ok {
@@ -686,8 +718,9 @@ fn verdict<'a>(r: &RefRow, c: &Change<'a>) -> Verdict<'a> {
 }
 
 /// Применяет правило устарелости к ссылкам решения `solution` на файлы `changes` у владельцев
-/// из `spaces` (JSON-массив id) — общая часть [`files_changed`] и `code_put_files`.
-/// Возвращает, сколько ссылок этих путей после этого `stale`.
+/// из `spaces` (JSON-массив id) — общая часть [`files_changed`], `code_put_files` и
+/// `code_sync_manifest`. Возвращает, сколько ссылок этот вызов признал устаревшими (в том
+/// числе уже бывших `stale`).
 pub(crate) fn apply_changes(
     tx: &Connection,
     solution: &str,
@@ -711,6 +744,11 @@ pub(crate) fn apply_changes(
                 stale_reason = NULL
          WHERE id = ?1",
     )?;
+    let mut symbol_ok = tx.prepare_cached(
+        "UPDATE file_refs SET symbol_hash = coalesce(symbol_hash, ?2), state = 'ok',
+                stale_at = NULL, stale_reason = NULL
+         WHERE id = ?1",
+    )?;
     for c in changes {
         for r in refs_in_spaces(tx, solution, c.path, spaces)? {
             match verdict(&r, c) {
@@ -722,10 +760,19 @@ pub(crate) fn apply_changes(
                 Verdict::Ok { hash, symbol_hash } => {
                     adopt.execute(params![r.id, hash, symbol_hash])?;
                 }
+                Verdict::SymbolOk { symbol_hash } => {
+                    // `stale` по хэшу файла снимают только хуки рабочей копии
+                    let by_file = r.state == RefState::Stale
+                        && r.stale_reason.as_deref() == Some(SOURCE_CHANGED);
+                    if !by_file && (r.state == RefState::Stale || r.symbol_hash.is_none()) {
+                        symbol_ok.execute(params![r.id, symbol_hash])?;
+                    }
+                }
                 Verdict::Stale(reason) => {
                     to_stale.execute(params![r.id, reason, now])?;
                     stale += 1;
                 }
+                Verdict::Skip => {}
             }
         }
     }
@@ -758,6 +805,39 @@ pub async fn files_changed(
                 hash: &f.hash,
                 symbols: f.symbols.as_deref(),
                 complete: true,
+                source: ChangeSource::WorkingCopy,
+            })
+            .collect();
+        apply_changes(tx, &solution, &spaces, &changes, &fmt_ts(now))
+    })
+    .await
+}
+
+/// Правило загрузки карты кода (`PUT /code/files`) для ссылок владельцев из `spaces` другой
+/// базы (Knowledge участника): судятся только ссылки на символы и только по присланным
+/// символам (`symbols: None` — файл пропущен или разобран не полностью — ссылки не судятся),
+/// файловые ссылки и хэш файла не меняются — как у `code_put_files` в базе владельца
+/// (решение контроллера по ревью задачи 3, I2). Возвращает, сколько ссылок признано
+/// устаревшими.
+pub async fn symbols_uploaded(
+    db: &Db,
+    solution: &str,
+    spaces: &[Id],
+    files: &[ChangedFile],
+    now: Timestamp,
+) -> Result<u32, StoreError> {
+    let solution = solution.to_string();
+    let spaces = ids_json(spaces);
+    let files = files.to_vec();
+    db.write(move |tx| {
+        let changes: Vec<Change<'_>> = files
+            .iter()
+            .map(|f| Change {
+                path: &f.path,
+                hash: &f.hash,
+                symbols: f.symbols.as_deref(),
+                complete: true,
+                source: ChangeSource::Map,
             })
             .collect();
         apply_changes(tx, &solution, &spaces, &changes, &fmt_ts(now))

@@ -7,10 +7,13 @@
 //! - **Загрузка** ([`code_put_files`]): пофайлово «последний побеждает» — upsert строки файла по
 //!   `(solution_guid, path)` (id сохраняется), замена символов и ссылок, атрибуция загрузки; затем
 //!   правило устарелости ссылок памяти по загруженным символам
-//!   ([`crate::file_refs::apply_changes`] — то же, что у `POST /files/changed`).
+//!   ([`crate::file_refs::apply_changes`] — та же функция, что у `POST /files/changed`, но
+//!   только для ссылок на символы: файловые ссылки судят хуки рабочей копии). Удаление файла
+//!   синхронизацией — `symbol_removed` у ссылок на его символы.
 //! - **Ранги** считаются лениво ([`code_rank_inputs`] → `zam_code::rank` → [`code_store_ranks`]);
 //!   любое изменение карты увеличивает `gen` снимка и ставит `rank_state = pending`, ранги по
-//!   устаревшим входам не сохраняются.
+//!   устаревшим входам не сохраняются. Хранятся ранг файла и доли его символов
+//!   (`code_files.shares`, f32); ранг символа = ранг файла × доля — при чтении.
 //! - **Невидимость:** функции модуля не трогают `chunks`, `index_jobs` и Qdrant; поиск памяти
 //!   (`search.rs`) таблиц карты не читает.
 //!
@@ -29,7 +32,7 @@ use zam_code::{
 };
 use zam_core::Id;
 
-use crate::file_refs::{Change, apply_changes};
+use crate::file_refs::{Change, ChangeSource, apply_changes};
 use crate::time::{fmt_ts, parse_ts, ser_ts};
 use crate::{Db, StoreError};
 
@@ -41,6 +44,15 @@ pub const STATUS_SKIPPED_MAX: usize = 500;
 const CALLERS_MAX: i64 = 50;
 /// Ссылок файла в карточке символа не больше.
 const USES_MAX: i64 = 100;
+/// Кандидатов FTS на один проход поиска символов: без сортировки по bm25 по всему совпадению
+/// префиксный запрос на 10^6 символов стоил секунды (ревью задачи 3, M5).
+const FTS_CANDIDATES_MAX: i64 = 2000;
+/// Слово запроса короче — точное слово FTS, не префикс.
+const FTS_PREFIX_MIN_CHARS: usize = 2;
+/// Относительное изменение ранга файла, ниже которого строка не переписывается.
+const RANK_REL_EPS: f64 = 1e-4;
+/// Изменение доли символа, ниже которого доли файла не переписываются.
+const SHARE_EPS: f32 = 1e-4;
 
 /// Атрибуция загрузки: коммит, ветка и машина клиента, пользователь запроса, момент.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +72,8 @@ pub struct SyncOutcome {
     /// Удалено файлов карты, которых нет в манифесте.
     pub removed: u64,
     pub etag: String,
+    /// Ссылок на символы удалённых файлов признано устаревшими (`symbol_removed`).
+    pub stale_refs: u32,
 }
 
 /// Итог `PUT /code/files`.
@@ -149,12 +163,12 @@ pub struct CodeStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankInputs {
     /// Файлы по `id`; `defs` — символы файла по `id`, `refs` — строки `code_refs`
-    /// `(name, kind, count)` по алфавиту имени и вида.
+    /// `(name, kind, count)` (порядок не задан).
     pub files: Vec<RankFile>,
     pub generation: i64,
 }
 
-/// Символ строки карты.
+/// Символ строки карты; `share` и `rank` — из сохранённых долей файла.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MapSymRow {
     pub id: i64,
@@ -163,19 +177,21 @@ pub struct MapSymRow {
     pub kind: SymbolKind,
     pub sig: Option<String>,
     pub line: u32,
-    /// Доля ранга файла (`zam_code::Ranked::symbol_share`).
+    /// Доля ранга файла (`zam_code::Ranked::symbol_share`); долей нет — поровну.
     pub share: f64,
     /// Ранг файла × доля.
     pub rank: f64,
 }
 
-/// Файл карты с символами по сохранённому рангу.
+/// Файл карты; `symbols` — по рангу символа ([`code_map_symbols`]; [`code_map_files`] их не
+/// заполняет).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MapFileRow {
     pub id: i64,
     pub path: String,
     pub lang: Lang,
     pub rank: f64,
+    pub symbol_count: u32,
     pub symbols: Vec<MapSymRow>,
 }
 
@@ -246,6 +262,36 @@ pub struct ImpactRows {
     pub consumers: Vec<Consumer>,
     /// Пути без присланных символов — знания по путям.
     pub paths_only: Vec<String>,
+}
+
+/// Доли символов файла → BLOB f32 little-endian (порядок `code_symbols.id`).
+fn shares_blob(shares: &[f64]) -> Vec<u8> {
+    shares
+        .iter()
+        .flat_map(|&v| (if v.is_finite() { v as f32 } else { 0.0 }).to_le_bytes())
+        .collect()
+}
+
+/// BLOB долей → значения; длина не кратна 4 — пусто.
+fn shares_of(blob: &[u8]) -> Vec<f32> {
+    let (chunks, rest) = blob.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Vec::new();
+    }
+    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
+}
+
+/// Доля символа `idx` из `n` символов файла: сохранённая, если долей ровно `n`, иначе поровну
+/// (файл перезагружен после ранжирования).
+fn share_at(blob: Option<&[u8]>, idx: usize, n: usize) -> f64 {
+    let saved = blob.map(shares_of).unwrap_or_default();
+    if saved.len() == n && idx < n {
+        f64::from(saved[idx])
+    } else if n > 0 {
+        1.0 / n as f64
+    } else {
+        0.0
+    }
 }
 
 fn corrupt(what: &str, v: &str) -> rusqlite::Error {
@@ -330,16 +376,20 @@ fn touch_snapshot(tx: &Connection, solution: &str, now: &str) -> Result<(), Stor
 
 /// Синхронизация по манифесту (одна транзакция): удаляет файлы карты вне манифеста, отдаёт
 /// пути без строки или с другим хэшем. Повтор пути в манифесте — первый (сервер отвечает 422
-/// раньше, M5.6 Review Focus 5).
+/// раньше, M5.6 Review Focus 5). Ссылки на символы удалённых файлов у владельцев пространств
+/// `ref_spaces` этой базы — `stale`/`symbol_removed` (файл удалён, переименован или исключён
+/// `code.exclude`); файловые ссылки не трогаются.
 pub async fn code_sync_manifest(
     db: &Db,
     solution: &str,
     meta: &UploadMeta,
     manifest: &[ManifestItem],
+    ref_spaces: &[Id],
 ) -> Result<SyncOutcome, StoreError> {
     let solution = solution.to_string();
     let now = fmt_ts(meta.now);
     let manifest = manifest.to_vec();
+    let spaces = (!ref_spaces.is_empty()).then(|| crate::file_refs::ids_json(ref_spaces));
     db.write(move |tx| {
         ensure_snapshot(tx, &solution, &now)?;
         let have: HashMap<String, (i64, String)> = tx
@@ -358,25 +408,40 @@ pub async fn code_sync_manifest(
                 need.push(m.path.clone());
             }
         }
-        let mut removed = 0u64;
+        let mut gone: Vec<&str> = Vec::new();
         {
             let mut del = tx.prepare_cached("DELETE FROM code_files WHERE id = ?1")?;
             for (path, (id, _)) in &have {
-                if !seen.contains(path.as_str()) {
-                    removed += del.execute([id])? as u64;
+                if !seen.contains(path.as_str()) && del.execute([id])? > 0 {
+                    gone.push(path);
                 }
             }
         }
-        if removed > 0 {
+        let mut stale_refs = 0;
+        if !gone.is_empty() {
             touch_snapshot(tx, &solution, &now)?;
+            if let Some(spaces) = &spaces {
+                let changes: Vec<Change<'_>> = gone
+                    .iter()
+                    .map(|p| Change {
+                        path: p,
+                        hash: zam_code::MISSING_HASH,
+                        symbols: None,
+                        complete: true,
+                        source: ChangeSource::Map,
+                    })
+                    .collect();
+                stale_refs = apply_changes(tx, &solution, spaces, &changes, &now)?;
+            }
         }
         let etag: String = tx
             .prepare_cached("SELECT etag FROM code_snapshots WHERE solution_guid = ?1")?
             .query_row([&solution], |r| r.get(0))?;
         Ok(SyncOutcome {
             need,
-            removed,
+            removed: gone.len() as u64,
             etag,
+            stale_refs,
         })
     })
     .await
@@ -403,7 +468,7 @@ fn put_file(
                parse_state = excluded.parse_state, skip_reason = excluded.skip_reason,
                symbols = excluded.symbols, git_commit = excluded.git_commit,
                branch = excluded.branch, machine = excluded.machine,
-               user_id = excluded.user_id, updated_at = excluded.updated_at
+               user_id = excluded.user_id, updated_at = excluded.updated_at, shares = NULL
              RETURNING id",
         )?
         .query_row(
@@ -469,9 +534,10 @@ fn put_file(
 }
 
 /// Загрузка разобранных файлов (одна транзакция на вызов, до 500 файлов): строки файлов,
-/// символы, ссылки, атрибуция; затем правило устарелости ссылок памяти пространств
-/// `ref_spaces` этой базы по загруженным символам. Пропущенный файл (`skipped`) судится по хэшу
-/// файла; неполный (`partial`) — найденные символы по телу, прочие по хэшу файла. Снимок:
+/// символы, ссылки, атрибуция; затем правило устарелости ссылок памяти на символы пространств
+/// `ref_spaces` этой базы по загруженным символам. Файловые ссылки и хэш файла у ссылок не
+/// меняются (их судят хуки рабочей копии: у другой машины другой перевод строк); пропущенный
+/// файл (`skipped`) и не найденный символ неполного (`partial`) — ссылку не судят. Снимок:
 /// счётчики, преобладающий коммит/ветка/машина, `rank_state = pending`.
 pub async fn code_put_files(
     db: &Db,
@@ -519,6 +585,7 @@ pub async fn code_put_files(
                     hash: &f.hash,
                     symbols: hashes[i].as_deref(),
                     complete: f.parse_state == ParseState::Ok,
+                    source: ChangeSource::Map,
                 })
                 .collect();
             stale_refs = apply_changes(tx, &solution, spaces, &changes, &now)?;
@@ -558,12 +625,13 @@ fn snapshot_of(c: &Connection, solution: &str) -> Result<Option<CodeSnapshot>, S
     .optional()?)
 }
 
-/// Состояние карты решения; карты нет — `None`.
+/// Состояние карты решения; карты нет (или в ней нет файлов: очищена, ещё не загружена) —
+/// `None`.
 pub async fn code_status(db: &Db, solution: &str) -> Result<Option<CodeStatus>, StoreError> {
     let solution = solution.to_string();
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
-        let Some(snapshot) = snapshot_of(&tx, &solution)? else {
+        let Some(snapshot) = snapshot_of(&tx, &solution)?.filter(|s| s.files > 0) else {
             return Ok(None);
         };
         let by_lang: Vec<LangCount> = tx
@@ -632,29 +700,39 @@ pub async fn code_rank_inputs(db: &Db, solution: &str) -> Result<RankInputs, Sto
             })?
             .collect::<Result<_, _>>()?;
         let at: HashMap<i64, usize> = files.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+        // без ORDER BY: временное B-дерево на 10^6 строк стоило ~0,2 с; порядок `id` внутри
+        // файла восстанавливается ниже (обычно его уже даёт индекс `code_symbols_file`)
         let mut st = tx.prepare_cached(
-            "SELECT s.file_id, s.name, s.kind, s.exported FROM code_symbols s
-             JOIN code_files f ON f.id = s.file_id
-             WHERE f.solution_guid = ?1 ORDER BY s.file_id, s.id",
+            "SELECT s.file_id, s.id, s.name, s.kind, s.exported FROM code_files f
+             JOIN code_symbols s ON s.file_id = f.id WHERE f.solution_guid = ?1",
         )?;
         let rows = st.query_map([&solution], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                kind_col(r, 2)?,
-                r.get::<_, Option<bool>>(3)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                kind_col(r, 3)?,
+                r.get::<_, Option<bool>>(4)?,
             ))
         })?;
+        let mut def_ids: Vec<Vec<i64>> = vec![Vec::new(); files.len()];
         for row in rows {
-            let (fid, name, kind, exported) = row?;
+            let (fid, sid, name, kind, exported) = row?;
             if let Some(&i) = at.get(&fid) {
                 files[i].defs.push((name, kind, exported));
+                def_ids[i].push(sid);
+            }
+        }
+        for (f, ids) in files.iter_mut().zip(&def_ids) {
+            if !ids.is_sorted() {
+                let mut pairs: Vec<_> = ids.iter().copied().zip(f.defs.drain(..)).collect();
+                pairs.sort_by_key(|p| p.0);
+                f.defs = pairs.into_iter().map(|p| p.1).collect();
             }
         }
         let mut st = tx.prepare_cached(
-            "SELECT r.file_id, r.name, r.kind, r.count FROM code_refs r
-             JOIN code_files f ON f.id = r.file_id
-             WHERE f.solution_guid = ?1 ORDER BY r.file_id, r.name, r.kind",
+            "SELECT r.file_id, r.name, r.kind, r.count FROM code_files f
+             JOIN code_refs r ON r.file_id = f.id WHERE f.solution_guid = ?1",
         )?;
         let rows = st.query_map([&solution], |r| {
             let k: String = r.get(2)?;
@@ -676,16 +754,20 @@ pub async fn code_rank_inputs(db: &Db, solution: &str) -> Result<RankInputs, Sto
     .await
 }
 
-/// Сохраняет ранги файлов и символов (`rank`, `share`), `rank_state = ok`, `ranked_at`.
-/// Карта изменилась после [`code_rank_inputs`] (другое поколение) — ничего не пишет и отвечает
-/// `false`: ранги посчитаются при следующем запросе. Это единственное место, где хранилище
-/// читает [`Ranked`] (рёбра графа не хранятся — решение контроллера по ревью задачи 2).
+/// Сохраняет ранги файлов и доли символов (`code_files.rank`, `code_files.shares`),
+/// `rank_state = ok`, `ranked_at = now`. Пишутся только файлы, у которых ранг изменился больше
+/// чем на [`RANK_REL_EPS`] (относительно) или доля — больше чем на [`SHARE_EPS`]: повторное
+/// ранжирование почти без изменений не переписывает таблицу под замком писателя. Карта
+/// изменилась после [`code_rank_inputs`] (другое поколение) — ничего не пишет: `None` (ранги
+/// посчитаются при следующем запросе); иначе `Some(файлов переписано)`. Единственное место,
+/// где хранилище читает [`Ranked`].
 pub async fn code_store_ranks(
     db: &Db,
     solution: &str,
     inputs: &RankInputs,
     r: &Ranked,
-) -> Result<bool, StoreError> {
+    now: Timestamp,
+) -> Result<Option<u64>, StoreError> {
     if r.file_rank.len() != inputs.files.len() || r.symbol_share.len() != inputs.files.len() {
         return Err(StoreError::BadInput(
             "ранги не соответствуют входам ранжирования".into(),
@@ -698,7 +780,13 @@ pub async fn code_store_ranks(
         .iter()
         .zip(&r.file_rank)
         .zip(&r.symbol_share)
-        .map(|((f, &rank), share)| (f.id, rank, share.clone()))
+        .map(|((f, &rank), share)| {
+            (
+                f.id,
+                if rank.is_finite() { rank } else { 0.0 },
+                share.clone(),
+            )
+        })
         .collect();
     db.write(move |tx| {
         let cur: Option<i64> = tx
@@ -706,29 +794,42 @@ pub async fn code_store_ranks(
             .query_row([&solution], |r| r.get(0))
             .optional()?;
         if cur != Some(generation) {
-            return Ok(false);
+            return Ok(None);
         }
-        let mut file = tx.prepare_cached("UPDATE code_files SET rank = ?2 WHERE id = ?1")?;
-        let mut ids =
-            tx.prepare_cached("SELECT id FROM code_symbols WHERE file_id = ?1 ORDER BY id")?;
-        let mut sym =
-            tx.prepare_cached("UPDATE code_symbols SET share = ?2, rank = ?3 WHERE id = ?1")?;
+        let old: HashMap<i64, (f64, Option<Vec<u8>>)> = tx
+            .prepare_cached("SELECT id, rank, shares FROM code_files WHERE solution_guid = ?1")?
+            .query_map([&solution], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+            .collect::<Result<_, _>>()?;
+        let mut upd =
+            tx.prepare_cached("UPDATE code_files SET rank = ?2, shares = ?3 WHERE id = ?1")?;
+        let mut written = 0u64;
         for (fid, rank, share) in &rows {
-            let rank = if rank.is_finite() { *rank } else { 0.0 };
-            file.execute(params![fid, rank])?;
-            let sids: Vec<i64> = ids
-                .query_map([fid], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
-            for (sid, s) in sids.iter().zip(share) {
-                let s = if s.is_finite() { *s } else { 0.0 };
-                sym.execute(params![sid, s, rank * s])?;
+            let changed = match old.get(fid) {
+                None => false, // файла уже нет — поколение это исключает, но не пишем
+                Some((old_rank, old_shares)) => {
+                    let rank_moved =
+                        (rank - old_rank).abs() > RANK_REL_EPS * rank.abs().max(old_rank.abs());
+                    let saved = old_shares.as_deref().map(shares_of);
+                    let shares_moved = match saved {
+                        Some(v) if v.len() == share.len() => v
+                            .iter()
+                            .zip(share)
+                            .any(|(a, b)| (a - *b as f32).abs() > SHARE_EPS),
+                        _ => true,
+                    };
+                    rank_moved || shares_moved
+                }
+            };
+            if changed {
+                upd.execute(params![fid, rank, shares_blob(share)])?;
+                written += 1;
             }
         }
         tx.prepare_cached(
             "UPDATE code_snapshots SET rank_state = 'ok', ranked_at = ?2 WHERE solution_guid = ?1",
         )?
-        .execute(params![solution, fmt_ts(Timestamp::now())])?;
-        Ok(true)
+        .execute(params![solution, fmt_ts(now)])?;
+        Ok(Some(written))
     })
     .await
 }
@@ -736,69 +837,134 @@ pub async fn code_store_ranks(
 /// Условие «путь `?2` — сам файл или каталог над ним» (`?2` NULL — без условия) для `f.path`.
 const AREA: &str = "(?2 IS NULL OR f.path = ?2 OR substr(f.path, 1, length(?2) + 1) = ?2 || '/')";
 
-/// Файлы карты (с префиксом пути `area`: файл или каталог) и их символы по сохранённому рангу.
-pub async fn code_map_rows(
+/// `area` запроса: без краевых пробелов и `/`; пусто — нет.
+fn area_of(area: Option<&str>) -> Option<String> {
+    area.map(|a| a.trim().trim_end_matches('/').to_string())
+        .filter(|a| !a.is_empty())
+}
+
+/// Файлы карты (с префиксом пути `area`: файл или каталог) по сохранённому рангу, без символов
+/// (первая фаза карты: сервер отбирает файлы под бюджет, затем [`code_map_symbols`]).
+pub async fn code_map_files(
     db: &Db,
     solution: &str,
     area: Option<&str>,
 ) -> Result<Vec<MapFileRow>, StoreError> {
     let solution = solution.to_string();
-    let area = area
-        .map(|a| a.trim().trim_end_matches('/').to_string())
-        .filter(|a| !a.is_empty());
+    let area = area_of(area);
     db.read(move |c| {
-        let tx = c.unchecked_transaction()?;
-        let mut files: Vec<MapFileRow> = tx
-            .prepare_cached(&format!(
-                "SELECT f.id, f.path, f.lang, f.rank FROM code_files f
-                 WHERE f.solution_guid = ?1 AND {AREA} ORDER BY f.rank DESC, f.path"
-            ))?
-            .query_map(params![solution, area], |r| {
-                Ok(MapFileRow {
-                    id: r.get(0)?,
-                    path: r.get(1)?,
-                    lang: lang_col(r, 2)?,
-                    rank: r.get(3)?,
-                    symbols: Vec::new(),
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-        let at: HashMap<i64, usize> = files.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
-        let mut st = tx.prepare_cached(&format!(
-            "SELECT s.file_id, s.id, s.name, s.qual, s.kind, s.sig, s.line, s.share, s.rank
-             FROM code_symbols s JOIN code_files f ON f.id = s.file_id
-             WHERE f.solution_guid = ?1 AND {AREA} ORDER BY s.rank DESC, s.line, s.id"
-        ))?;
-        let rows = st.query_map(params![solution, area], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                MapSymRow {
-                    id: r.get(1)?,
-                    name: r.get(2)?,
-                    qual: r.get(3)?,
-                    kind: kind_col(r, 4)?,
-                    sig: r.get(5)?,
-                    line: r.get(6)?,
-                    share: r.get(7)?,
-                    rank: r.get(8)?,
-                },
-            ))
-        })?;
-        for row in rows {
-            let (fid, s) = row?;
-            if let Some(&i) = at.get(&fid) {
-                files[i].symbols.push(s);
-            }
-        }
-        Ok(files)
+        Ok(c.prepare_cached(&format!(
+            "SELECT f.id, f.path, f.lang, f.rank, f.symbols FROM code_files f
+             WHERE f.solution_guid = ?1 AND {AREA} ORDER BY f.rank DESC, f.path"
+        ))?
+        .query_map(params![solution, area], |r| {
+            Ok(MapFileRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                lang: lang_col(r, 2)?,
+                rank: r.get(3)?,
+                symbol_count: r.get(4)?,
+                symbols: Vec::new(),
+            })
+        })?
+        .collect::<Result<_, _>>()?)
     })
     .await
 }
 
+/// Символы файлов `file_ids` решения по рангу символа (затем строке) — в порядке `file_ids`;
+/// файл другого решения или несуществующий — пропускается.
+pub async fn code_map_symbols(
+    db: &Db,
+    solution: &str,
+    file_ids: &[i64],
+) -> Result<Vec<(i64, Vec<MapSymRow>)>, StoreError> {
+    let solution = solution.to_string();
+    let ids = file_ids.to_vec();
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let mut file = tx.prepare_cached(
+            "SELECT rank, shares FROM code_files WHERE id = ?1 AND solution_guid = ?2",
+        )?;
+        let mut syms = tx.prepare_cached(
+            "SELECT id, name, qual, kind, sig, line FROM code_symbols WHERE file_id = ?1
+             ORDER BY id",
+        )?;
+        let mut out = Vec::with_capacity(ids.len());
+        for fid in ids {
+            let Some((rank, shares)) = file
+                .query_row(params![fid, solution], |r| {
+                    Ok((r.get::<_, f64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+                })
+                .optional()?
+            else {
+                continue;
+            };
+            let mut list: Vec<MapSymRow> = syms
+                .query_map([fid], |r| {
+                    Ok(MapSymRow {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        qual: r.get(2)?,
+                        kind: kind_col(r, 3)?,
+                        sig: r.get(4)?,
+                        line: r.get(5)?,
+                        share: 0.0,
+                        rank: 0.0,
+                    })
+                })?
+                .collect::<Result<_, _>>()?;
+            let n = list.len();
+            for (i, s) in list.iter_mut().enumerate() {
+                s.share = share_at(shares.as_deref(), i, n);
+                s.rank = rank * s.share;
+            }
+            list.sort_by(|a, b| {
+                b.rank
+                    .total_cmp(&a.rank)
+                    .then(a.line.cmp(&b.line))
+                    .then(a.id.cmp(&b.id))
+            });
+            out.push((fid, list));
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Файлы карты с символами ([`code_map_files`] + [`code_map_symbols`] всех файлов) — для
+/// небольших областей; полную карту сервер собирает в две фазы.
+pub async fn code_map_rows(
+    db: &Db,
+    solution: &str,
+    area: Option<&str>,
+) -> Result<Vec<MapFileRow>, StoreError> {
+    let mut files = code_map_files(db, solution, area).await?;
+    let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+    let mut syms: HashMap<i64, Vec<MapSymRow>> = code_map_symbols(db, solution, &ids)
+        .await?
+        .into_iter()
+        .collect();
+    for f in &mut files {
+        f.symbols = syms.remove(&f.id).unwrap_or_default();
+    }
+    Ok(files)
+}
+
+/// Столбцы [`hit_row`]: ранг символа — из ранга файла, его долей, места символа среди
+/// символов файла (по `id`, индекс `code_symbols_file`) и их числа.
 const HIT_COLS: &str = "s.id, s.file_id, f.path, s.name, s.qual, s.kind, s.line, s.end_line,
-    s.sig, s.rank";
+    s.sig, f.rank, f.shares, f.symbols,
+    (SELECT count(*) FROM code_symbols x WHERE x.file_id = s.file_id AND x.id < s.id)";
+/// Число столбцов [`HIT_COLS`].
+const HIT_COLS_N: usize = 13;
 
 fn hit_row(r: &Row<'_>) -> rusqlite::Result<SymbolHit> {
+    let file_rank: f64 = r.get(9)?;
+    let shares: Option<Vec<u8>> = r.get(10)?;
+    let n: i64 = r.get(11)?;
+    let idx: i64 = r.get(12)?;
+    let share = share_at(shares.as_deref(), idx as usize, n.max(0) as usize);
     Ok(SymbolHit {
         id: r.get(0)?,
         file_id: r.get(1)?,
@@ -809,36 +975,46 @@ fn hit_row(r: &Row<'_>) -> rusqlite::Result<SymbolHit> {
         line: r.get(6)?,
         end_line: r.get(7)?,
         sig: r.get(8)?,
-        rank: r.get(9)?,
+        rank: file_rank * share,
     })
 }
 
-/// Добавляет в `out` новые (по id) символы, пока их меньше `limit`.
-fn merge_hits(out: &mut Vec<SymbolHit>, more: Vec<SymbolHit>, limit: usize) {
-    for h in more {
-        if out.len() >= limit {
-            break;
-        }
-        if !out.iter().any(|o| o.id == h.id) {
-            out.push(h);
-        }
-    }
+/// Выдача по рангу символа (затем пути и строке), не больше `limit`.
+fn sort_hits(hits: &mut Vec<SymbolHit>, limit: usize) {
+    hits.sort_by(|a, b| {
+        b.rank
+            .total_cmp(&a.rank)
+            .then_with(|| a.path.cmp(&b.path))
+            .then(a.line.cmp(&b.line))
+    });
+    hits.truncate(limit);
 }
 
-/// Запрос FTS5 из слов идентификатора (`getUser` → `"get"* "user"*`); слов нет — `None`.
-/// Слова — только буквы и цифры (`split_ident`), синтаксис FTS5 в запросе не действует.
-fn symbol_fts(q: &str) -> Option<String> {
+/// Запрос FTS5 из слов идентификатора: `prefix` — слова от [`FTS_PREFIX_MIN_CHARS`] символов
+/// префиксом (`getUs` → `"get"* "us"*`), короче — точным словом; иначе все слова точные.
+/// Слов нет — `None`. Слова — только буквы и цифры (`split_ident`): синтаксис FTS5 запроса не
+/// действует.
+fn symbol_fts(q: &str, prefix: bool) -> Option<String> {
     let w = split_ident(q);
     (!w.is_empty()).then(|| {
         w.iter()
-            .map(|t| format!("\"{t}\"*"))
+            .map(|t| {
+                if prefix && t.chars().count() >= FTS_PREFIX_MIN_CHARS {
+                    format!("\"{t}\"*")
+                } else {
+                    format!("\"{t}\"")
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ")
     })
 }
 
 /// Поиск символа: сначала точное совпадение `qual` (затем имени), потом FTS по словам имени и
-/// `qual`; фильтры — вид и путь (файл или каталог). `limit` — 1..=100.
+/// `qual` — точными словами, затем префиксами; внутри группы — по рангу символа. Фильтры — вид
+/// и путь (файл или каталог). `limit` — 1..=100. FTS отдаёт не больше
+/// [`FTS_CANDIDATES_MAX`] кандидатов на проход до фильтров (без сортировки по bm25: на миллионе
+/// символов она стоила секунды) — у очень частого слова выдача неполна.
 pub async fn code_symbols_search(
     db: &Db,
     solution: &str,
@@ -849,41 +1025,61 @@ pub async fn code_symbols_search(
 ) -> Result<Vec<SymbolHit>, StoreError> {
     let limit = limit.clamp(1, SYMBOLS_LIMIT_MAX);
     let (solution, q) = (solution.to_string(), q.trim().to_string());
-    let path = path
-        .map(|a| a.trim().trim_end_matches('/').to_string())
-        .filter(|a| !a.is_empty());
+    let path = area_of(path);
     let kind = kind.map(SymbolKind::as_str);
-    let fts = symbol_fts(&q);
+    let passes: Vec<String> = [symbol_fts(&q, false), symbol_fts(&q, true)]
+        .into_iter()
+        .flatten()
+        .fold(Vec::new(), |mut v, f| {
+            if !v.contains(&f) {
+                v.push(f);
+            }
+            v
+        });
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
         let filters = "AND (?3 IS NULL OR s.kind = ?3)";
-        let mut out: Vec<SymbolHit> = tx
+        let mut exact: Vec<(SymbolHit, bool)> = tx
             .prepare_cached(&format!(
-                "SELECT {HIT_COLS} FROM code_symbols s JOIN code_files f ON f.id = s.file_id
+                "SELECT {HIT_COLS}, s.qual = ?4 FROM code_symbols s
+                 JOIN code_files f ON f.id = s.file_id
                  WHERE f.solution_guid = ?1 AND {AREA} {filters}
                    AND (s.qual = ?4 OR s.name = ?4)
-                 ORDER BY s.qual = ?4 DESC, s.rank DESC, f.path, s.line LIMIT ?5"
+                 ORDER BY s.qual = ?4 DESC, f.rank DESC LIMIT ?5"
             ))?
-            .query_map(params![solution, path, kind, q, limit as i64], hit_row)?
+            .query_map(params![solution, path, kind, q, limit as i64], |r| {
+                Ok((hit_row(r)?, r.get::<_, bool>(HIT_COLS_N)?))
+            })?
             .collect::<Result<_, _>>()?;
-        if let Some(fts) = fts
-            && out.len() < limit
-        {
-            let more: Vec<SymbolHit> = tx
+        // совпадение `qual` — первым, внутри группы — по рангу символа
+        exact.sort_by(|(a, qa), (b, qb)| {
+            qb.cmp(qa)
+                .then_with(|| b.rank.total_cmp(&a.rank))
+                .then_with(|| a.path.cmp(&b.path))
+                .then(a.line.cmp(&b.line))
+        });
+        let mut out: Vec<SymbolHit> = exact.into_iter().map(|(h, _)| h).collect();
+        for fts in passes {
+            if out.len() >= limit {
+                break;
+            }
+            let mut more: Vec<SymbolHit> = tx
                 .prepare_cached(&format!(
-                    "SELECT {HIT_COLS} FROM code_symbols_fts
-                     JOIN code_symbols s ON s.id = code_symbols_fts.rowid
+                    "SELECT {HIT_COLS} FROM
+                       (SELECT rowid AS sid FROM code_symbols_fts
+                        WHERE code_symbols_fts MATCH ?4 LIMIT ?5) m
+                     JOIN code_symbols s ON s.id = m.sid
                      JOIN code_files f ON f.id = s.file_id
-                     WHERE code_symbols_fts MATCH ?4 AND f.solution_guid = ?1 AND {AREA}
-                       {filters}
-                     ORDER BY bm25(code_symbols_fts), s.rank DESC, f.path, s.line LIMIT ?5"
+                     WHERE f.solution_guid = ?1 AND {AREA} {filters}"
                 ))?
                 .query_map(
-                    params![solution, path, kind, fts, (limit + out.len()) as i64],
+                    params![solution, path, kind, fts, FTS_CANDIDATES_MAX],
                     hit_row,
                 )?
                 .collect::<Result<_, _>>()?;
-            merge_hits(&mut out, more, limit);
+            more.retain(|h| !out.iter().any(|o: &SymbolHit| o.id == h.id));
+            sort_hits(&mut more, limit - out.len());
+            out.extend(more);
         }
         Ok(out)
     })
@@ -908,8 +1104,8 @@ pub async fn code_symbol(
             .query_row(params![id, solution], |r| {
                 Ok((
                     hit_row(r)?,
-                    r.get::<_, String>(10)?,
-                    r.get::<_, Option<bool>>(11)?,
+                    r.get::<_, String>(HIT_COLS_N)?,
+                    r.get::<_, Option<bool>>(HIT_COLS_N + 1)?,
                 ))
             })
             .optional()?;
@@ -983,25 +1179,24 @@ pub async fn code_symbols_named(
                  WHERE f.solution_guid = ?1
                    AND (s.qual IN (SELECT value FROM json_each(?2))
                         OR s.name IN (SELECT value FROM json_each(?2)))
-                 ORDER BY s.qual IN (SELECT value FROM json_each(?2)) DESC, s.rank DESC,
+                 ORDER BY s.qual IN (SELECT value FROM json_each(?2)) DESC, f.rank DESC,
                           f.path, s.line
                  LIMIT ?3"
             ))?
             .query_map(params![solution, names, limit as i64], hit_row)?
             .collect::<Result<_, _>>()?;
         if out.len() < limit {
-            let more: Vec<SymbolHit> = tx
+            // символы названных файлов — все (файлов в задаче единицы), затем по рангу символа
+            let mut more: Vec<SymbolHit> = tx
                 .prepare_cached(&format!(
                     "SELECT {HIT_COLS} FROM code_symbols s JOIN code_files f ON f.id = s.file_id
-                     WHERE f.solution_guid = ?1 AND f.path IN (SELECT value FROM json_each(?2))
-                     ORDER BY s.rank DESC, f.path, s.line LIMIT ?3"
+                     WHERE f.solution_guid = ?1 AND f.path IN (SELECT value FROM json_each(?2))"
                 ))?
-                .query_map(
-                    params![solution, paths, (limit + out.len()) as i64],
-                    hit_row,
-                )?
+                .query_map(params![solution, paths], hit_row)?
                 .collect::<Result<_, _>>()?;
-            merge_hits(&mut out, more, limit);
+            more.retain(|h| !out.iter().any(|o| o.id == h.id));
+            sort_hits(&mut more, limit - out.len());
+            out.extend(more);
         }
         Ok(out)
     })
@@ -1125,16 +1320,21 @@ pub async fn code_impact(
     .await
 }
 
-/// Очищает карту решения (снимок, файлы, символы, FTS, ссылки — каскадом); возвращает число
-/// удалённых файлов.
+/// Очищает карту решения (файлы, символы, FTS, ссылки — каскадом); возвращает число удалённых
+/// файлов. Строка снимка остаётся с `gen + 1` (а не удаляется): иначе поколение начиналось бы
+/// заново и ранги, посчитанные до очистки, совпали бы по `gen` с новой картой (ABA).
 pub async fn code_clear(db: &Db, solution: &str) -> Result<u64, StoreError> {
     let solution = solution.to_string();
     db.write(move |tx| {
-        let n: i64 = tx
-            .prepare_cached("SELECT count(*) FROM code_files WHERE solution_guid = ?1")?
-            .query_row([&solution], |r| r.get(0))?;
-        tx.prepare_cached("DELETE FROM code_snapshots WHERE solution_guid = ?1")?
+        let n = tx
+            .prepare_cached("DELETE FROM code_files WHERE solution_guid = ?1")?
             .execute([&solution])?;
+        let has_snapshot = tx
+            .prepare_cached("SELECT 1 FROM code_snapshots WHERE solution_guid = ?1")?
+            .exists([&solution])?;
+        if has_snapshot {
+            touch_snapshot(tx, &solution, &fmt_ts(Timestamp::now()))?;
+        }
         Ok(n as u64)
     })
     .await

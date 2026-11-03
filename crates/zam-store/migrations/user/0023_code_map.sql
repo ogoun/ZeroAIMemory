@@ -34,6 +34,11 @@ CREATE TABLE code_snapshots (
 );
 
 -- ---------- файлы ----------
+-- `rank` — ранг файла (PageRank, сумма по решению = 1); `shares` — доли ранга файла на символы
+-- (`zam_code::Ranked::symbol_share`): f32 little-endian подряд в порядке `code_symbols.id`
+-- файла; NULL или другая длина (файл перезагружен после ранжирования) — доли поровну. Ранг
+-- символа = `rank × доля` считается при чтении: ранжирование пишет только файлы, чей ранг или
+-- доли изменились, а не миллион строк символов (решение контроллера по ревью задачи 3, I1).
 -- Виды языка и причины пропуска проверяет код (`zam_code::{Lang, SkipReason}`), а не CHECK:
 -- новые языки (§14) не потребуют пересборки таблицы. Удаление снимка удаляет файлы, файла —
 -- его символы и ссылки (каскад).
@@ -49,6 +54,7 @@ CREATE TABLE code_files (
     skip_reason   TEXT,
     symbols       INTEGER NOT NULL DEFAULT 0,
     rank          REAL NOT NULL DEFAULT 0,
+    shares        BLOB,
     git_commit    TEXT,
     branch        TEXT,
     machine       TEXT,
@@ -58,8 +64,7 @@ CREATE TABLE code_files (
 );
 
 -- ---------- символы ----------
--- `share` — доля ранга файла (`zam_code::Ranked::symbol_share`), `rank` — ранг файла × доля;
--- с `focus` ранг символа — персонализированный ранг файла × сохранённая доля (§7).
+-- Ранга у символа нет: он вычисляется из `code_files.rank` и `code_files.shares` (выше).
 CREATE TABLE code_symbols (
     id        INTEGER PRIMARY KEY,
     file_id   INTEGER NOT NULL REFERENCES code_files (id) ON DELETE CASCADE,
@@ -70,9 +75,7 @@ CREATE TABLE code_symbols (
     end_line  INTEGER NOT NULL,
     sig       TEXT,
     body_hash TEXT NOT NULL,
-    exported  INTEGER,
-    share     REAL NOT NULL DEFAULT 0,
-    rank      REAL NOT NULL DEFAULT 0
+    exported  INTEGER
 );
 CREATE INDEX code_symbols_file ON code_symbols (file_id);
 CREATE INDEX code_symbols_name ON code_symbols (name);
@@ -84,7 +87,9 @@ CREATE INDEX code_symbols_qual ON code_symbols (qual);
 -- Строки пишет `zam_store::code` вместе с символом, удаляет триггер — в том числе при каскаде.
 CREATE VIRTUAL TABLE code_symbols_fts USING fts5 (
     name, qual, terms,
-    tokenize = 'unicode61 remove_diacritics 2'
+    tokenize = 'unicode61 remove_diacritics 2',
+    -- индексы префиксов 2 и 3 символов: короткий префиксный запрос не перебирает словарь
+    prefix = '2 3'
 );
 CREATE TRIGGER code_symbols_fts_delete AFTER DELETE ON code_symbols BEGIN
     DELETE FROM code_symbols_fts WHERE rowid = old.id;
@@ -105,4 +110,5 @@ CREATE INDEX code_refs_name ON code_refs (name);
 -- Таблицы рёбер графа файлов (`code_file_edges` §6 спецификации) нет — решение контроллера по
 -- ревью задачи 2: граф по именам плотный (вкладов «ссылки × определители», до 10^8 на 50 000
 -- файлов), он строится из `code_symbols`/`code_refs` при ранжировании, рёбра между показанными
--- файлами считаются по запросу; хранятся только ранги (`code_files.rank`, `code_symbols.rank`).
+-- файлами считаются по запросу; хранятся только ранги файлов и доли символов
+-- (`code_files.rank`, `code_files.shares`).
