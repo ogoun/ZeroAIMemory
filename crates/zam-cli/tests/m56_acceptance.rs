@@ -13,6 +13,8 @@
 //!   `parser_crash`;
 //! - `acceptance_symbol_staleness_via_hook` — п. 4 через хуки: `post-tool` правки кладёт хэши
 //!   символов, `prompt` отправляет очередь; знание о файле при чтении называет `foo`;
+//! - `acceptance_hook_budgets_with_map` — п. 8: бюджеты хуков с загруженной картой и включённой
+//!   автосинхронизацией, строка карты в дайджесте и `### Код` в пакете субагенту;
 //! - `acceptance_bodies_never_sent` — п. 9: тела запросов `zam code sync` (заглушка) — только
 //!   поля §4, `sig` ≤ 160 символов, `send_signatures = false` — без `sig`; секрет сигнатуры
 //!   замаскирован в ответе `/code/symbols`;
@@ -109,26 +111,19 @@ fn start_db(name: &str) -> (String, String, PathBuf) {
 /// `(символ, состояние, причина)` ссылок на `path` в базе пользователя (второе соединение к
 /// базе сервера, WAL): причина устарелости в REST индекса не отдаётся.
 fn db_refs(db: &Path, path: &str) -> Vec<(Option<String>, String, Option<String>)> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let c = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .unwrap();
-    let path = path.to_string();
-    rt.block_on(async {
-        let db = zam_store::Db::open(db, zam_store::USER_MIGRATIONS).unwrap();
-        db.read(move |c| {
-            let mut st = c.prepare(
-                "SELECT symbol, state, stale_reason FROM file_refs WHERE path = ?1
-                 ORDER BY coalesce(symbol, '')",
-            )?;
-            let rows = st
-                .query_map([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
-        .await
+    c.busy_timeout(Duration::from_secs(10)).unwrap();
+    let mut st = c
+        .prepare(
+            "SELECT symbol, state, stale_reason FROM file_refs WHERE path = ?1
+             ORDER BY coalesce(symbol, '')",
+        )
+        .unwrap();
+    st.query_map([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap()
-    })
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 /// Запрос к REST `/api/v1{path}`: (код, JSON или `Null`).
@@ -623,6 +618,10 @@ fn acceptance_hostile_and_crash() {
     // вложенность 100 000: разбор завершился (без падения процесса), файл в карте
     let files = p.get(&format!("/code/files?solution={G}&q=nest.rs"));
     assert!(files.to_string().contains("nest.rs"), "{files}");
+    assert!(
+        matches!(reason_of(&st, "nest.rs").as_deref(), None | Some("timeout")),
+        "nest.rs: разобран (ok) или отсечка времени: {st}"
+    );
 
     // обрыв процесса после записи журнала падений — только debug-сборка (крючок
     // `ZAM_DEBUG_CODE_ABORT`, решение составителя плана 17)
@@ -707,21 +706,72 @@ fn acceptance_symbol_staleness_via_hook() {
         states(&p),
         [(None, st("ok", None)), (Some("foo".into()), st("ok", None))]
     );
-    // индекс знания о файлах — в кэш (старт сессии)
-    ok(&p.hook(
-        "session-start",
-        &p.ev("SessionStart", "m56h", json!({"source": "startup"})),
-    ));
+    // индекс знания о файлах — в кэш (старт сессии; хук fail-open — до 5 попыток, пока в кэше
+    // не появится символьная ссылка: без неё `post-tool` не кладёт хэши символов)
+    let cached = |p: &Proj| {
+        std::fs::read_to_string(p.cache().join("file-refs.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|v| {
+                v["refs"].as_array().into_iter().flatten().any(|r| {
+                    r["items"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|i| i["symbol"] == "foo")
+                })
+            })
+    };
+    for _ in 0..5 {
+        ok(&p.hook(
+            "session-start",
+            &p.ev("SessionStart", "m56h", json!({"source": "startup"})),
+        ));
+        if cached(&p) {
+            break;
+        }
+    }
+    assert!(cached(&p), "индекс с символом не в кэше: {}", p.log());
+    // очередь правок сессии `m56h` (`changed-m56h-<8 hex>.jsonl`)
+    let queue_file = |p: &Proj| {
+        std::fs::read_dir(p.cache())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|f| {
+                f.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("changed-m56h-") && n.ends_with(".jsonl"))
+            })
+    };
     let edit = |body: &str| {
         p.file("src/a.rs", body.as_bytes());
-        ok(&p.hook(
-            "post-tool",
-            &p.post_ok(
-                "m56h",
-                "Edit",
-                json!({"file_path": p.repo.join("src/a.rs"), "old_string": "x", "new_string": "y"}),
-            ),
-        ));
+        // `post-tool` разбирает файл в остатке своего бюджета (50 мс на процесс): отладочная
+        // сборка под нагрузкой его исчерпывает — строка уходит без `symbols` и судится по хэшу
+        // файла (консервативно, как M4.5). Сценарий п. 4 проверяет правило по символам: такая
+        // строка снимается и правка повторяется (до 5 раз).
+        for _ in 0..5 {
+            ok(&p.hook(
+                "post-tool",
+                &p.post_ok(
+                    "m56h",
+                    "Edit",
+                    json!({"file_path": p.repo.join("src/a.rs"), "old_string": "x",
+                           "new_string": "y"}),
+                ),
+            ));
+            let f = queue_file(&p).unwrap_or_else(|| panic!("нет очереди: {}", p.log()));
+            let text = std::fs::read_to_string(&f).unwrap();
+            if text
+                .lines()
+                .last()
+                .is_some_and(|l| l.contains("\"symbols\""))
+            {
+                break;
+            }
+            eprintln!("post-tool без symbols (бюджет исчерпан) — повтор правки");
+            std::fs::remove_file(&f).unwrap();
+        }
         ok(&p.hook(
             "prompt",
             &p.ev("UserPromptSubmit", "m56h", json!({"prompt": "дальше"})),
@@ -768,6 +818,104 @@ fn acceptance_symbol_staleness_via_hook() {
         ),
     ));
     assert!(c.contains("src/a.rs") && c.contains("`foo`"), "{c}");
+}
+
+// ---------- п. 8 ----------
+
+/// p95 выборки (ближайший ранг).
+fn p95(mut v: Vec<Duration>) -> Duration {
+    v.sort();
+    v[(v.len() * 95).div_ceil(100) - 1]
+}
+
+/// §17 п. 8: бюджеты хуков с включённой и загруженной картой против живого сервера — конфигурация
+/// клиента по умолчанию (`code_map` и `code.auto` включены), карта проекта синхронизирована.
+/// `session-start` несёт строку карты, `subagent-start` с задачей про существующую функцию —
+/// раздел `### Код`; p95 каждого хука — в пределе отладочной сборки (×4 от бюджета §10.3, как
+/// `hooks.rs`: `session-start`/`subagent-start` 1200 мс, `prompt`/`post-tool` 1000 мс,
+/// `pre-tool` 200 мс). Замер release на карте этого репозитория — `cargo xtask code-bench`.
+#[test]
+fn acceptance_hook_budgets_with_map() {
+    let _g = serial();
+    let (url, tok) = start("budgets");
+    let p = Proj::plain("budgets", &url, &tok);
+    // конфигурация клиента по умолчанию: фоновая синхронизация включена
+    std::fs::remove_file(p.home.join(".zeroaimemory/config.toml")).unwrap();
+    three_files(&p);
+    p.file(
+        "src/d.ts",
+        b"export function dee(): number {\n  return 4;\n}\n",
+    );
+    let r = p.sync();
+    assert_eq!(r["uploaded"], 4, "{r}");
+    let task = "Почини helper в src/c.rs: возвращает не то число";
+    let mut report = Vec::new();
+    for (kind, limit, want) in [
+        ("session-start", 1200u64, Some("ZeroAIMemory: карта кода:")),
+        ("prompt", 1000, None),
+        ("pre-tool", 200, None),
+        ("post-tool", 1000, None),
+        ("subagent-start", 1200, Some("### Код")),
+    ] {
+        let (mut times, mut hits) = (Vec::new(), 0usize);
+        for i in 0..12 {
+            let sess = format!("hb-{kind}-{i}");
+            let ev = match kind {
+                "session-start" => p.ev("SessionStart", &sess, json!({"source": "startup"})),
+                "prompt" => p.ev(
+                    "UserPromptSubmit",
+                    &sess,
+                    json!({"prompt": "почему helper возвращает единицу"}),
+                ),
+                "pre-tool" => p.ev(
+                    "PreToolUse",
+                    &sess,
+                    json!({"tool_name": "Read",
+                           "tool_input": {"file_path": p.repo.join("src/c.rs")}}),
+                ),
+                "post-tool" => {
+                    p.post_ok(&sess, "Read", json!({"file_path": p.repo.join("src/c.rs")}))
+                }
+                _ => {
+                    let spawn = p.ev(
+                        "PreToolUse",
+                        &sess,
+                        json!({"tool_name": "Agent", "tool_use_id": "u1",
+                               "tool_input": {"description": "d", "prompt": task,
+                                              "subagent_type": "Plan"}}),
+                    );
+                    ok(&p.hook("pre-tool", &spawn));
+                    p.ev(
+                        "SubagentStart",
+                        &sess,
+                        json!({"agent_id": format!("ag-{i}"), "agent_type": "Plan"}),
+                    )
+                }
+            };
+            let t = std::time::Instant::now();
+            let o = p.hook(kind, &ev);
+            let d = t.elapsed();
+            let c = context(&o);
+            // первые два — прогрев (первые запросы отладочного сервера, фоновая синхронизация)
+            if i >= 2 {
+                times.push(d);
+                if want.is_some_and(|w| c.contains(w)) {
+                    hits += 1;
+                }
+            }
+        }
+        let q = p95(times);
+        report.push(format!("{kind} p95={q:?}"));
+        assert!(
+            q <= Duration::from_millis(limit),
+            "{kind}: p95 {q:?} > {limit} мс; {}",
+            p.log()
+        );
+        if let Some(w) = want {
+            assert_eq!(hits, 10, "{kind}: «{w}» в {hits} из 10; {}", p.log());
+        }
+    }
+    eprintln!("ZAM_TIMING хуки с картой: {}", report.join(", "));
 }
 
 // ---------- п. 9 ----------

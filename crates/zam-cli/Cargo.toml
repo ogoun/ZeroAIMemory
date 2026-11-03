@@ -37,3 +37,5 @@ zam-markdown = { path = "../zam-markdown" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 axum.workspace = true
 assert_cmd.workspace = true
+# приёмка M5.6: причина устарелости ссылки — из базы сервера соединением только для чтения
+rusqlite.workspace = true

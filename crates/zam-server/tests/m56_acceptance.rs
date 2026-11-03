@@ -589,6 +589,33 @@ async fn acceptance_invisible_in_memory() {
     let line = code_line(&j).unwrap_or_else(|| panic!("нет строки карты: {j}"));
     assert!(zam_store::count_tokens(&line) <= 80, "{line}");
     assert!(line.contains("2 файла"), "{line}");
+    // положительный контроль: запись со словом NAME в заголовке и теле поиск находит, символов
+    // карты в выдаче нет
+    let iid = insight(
+        &a,
+        &format!("Функция {NAME} падает"),
+        json!({"files": [{"path": "src/z.rs"}]}),
+    )
+    .await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": NAME, "scope": {"solution": G}, "format": "json"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK, "search с записью");
+    let items = r.json()["items"].as_array().cloned().unwrap_or_default();
+    assert!(
+        items.iter().any(|i| i["entry_id"] == iid.as_str()),
+        "запись найдена: {}",
+        r.text()
+    );
+    assert!(
+        items.iter().all(|i| i["entry_id"] == iid.as_str()),
+        "в выдаче только запись, без символов карты: {}",
+        r.text()
+    );
 }
 
 // ---------- п. 7 ----------
@@ -614,7 +641,7 @@ async fn acceptance_server_limits_413_422() {
             Some(json!({"solution": G, "manifest": manifest})),
         )
         .await;
-    unprocessable(&r, "3", "манифест > max_files");
+    unprocessable(&r, "code.max_files", "манифест > max_files");
     let r = put_raw_as(
         &a,
         &a.token,
@@ -626,14 +653,18 @@ async fn acceptance_server_limits_413_422() {
         )],
     )
     .await;
-    unprocessable(&r, "2", "символов > max_symbols_per_file");
+    unprocessable(
+        &r,
+        "code.max_symbols_per_file",
+        "символов > max_symbols_per_file",
+    );
     let r = put_raw_as(
         &a,
         &a.token,
         vec![file("a.rs", 1, vec![], &[("p", 1), ("q", 1), ("r", 1)])],
     )
     .await;
-    unprocessable(&r, "2", "ссылок > max_refs_per_file");
+    unprocessable(&r, "code.max_refs_per_file", "ссылок > max_refs_per_file");
     for (m, uri, pad) in [
         (Method::PUT, "/api/v1/code/files", "files"),
         (Method::POST, "/api/v1/code/sync", "manifest"),
@@ -783,6 +814,11 @@ async fn acceptance_rights_matrix() {
     for (m, uri, body) in [
         (Method::GET, map_uri.clone(), None),
         (Method::POST, "/api/v1/code/sync".to_string(), Some(sync)),
+        (
+            Method::PUT,
+            "/api/v1/code/files".to_string(),
+            Some(fbody("b.rs", 2)),
+        ),
     ] {
         let r = w.a.tok(&w.rw.tok, m, &uri, body).await;
         ok(&r, StatusCode::FORBIDDEN, &uri);
@@ -801,7 +837,7 @@ async fn acceptance_rights_matrix() {
             None,
         )
         .await;
-    ok(&r, StatusCode::UNPROCESSABLE_ENTITY, "Knowledge");
+    unprocessable(&r, "только у пространств решений", "Knowledge");
 }
 
 // ---------- п. 11 ----------
@@ -819,7 +855,8 @@ async fn acceptance_mcp_11_tools_same_map() {
     assert!(tools.iter().any(|t| t["name"] == "memory_code"), "{list}");
     for t in tools {
         let d = t["description"].as_str().unwrap();
-        assert!(d.chars().count() <= 300, "{}: {}", t["name"], d.len());
+        let n = d.chars().count();
+        assert!(n <= 300, "{}: {n} символов", t["name"]);
     }
     let focus = json!({"paths": ["src/f20.rs"]});
     for (args, q) in [
@@ -861,7 +898,6 @@ async fn acceptance_migration_from_m55_db() {
     assert!(!path.exists(), "{}", path.display());
     assert_eq!(USER_MIGRATIONS[21].version, 22);
     let (sol, kn) = (zam_core::Id::new(), zam_core::Id::new());
-    let (mut notes, mut entries) = (Vec::new(), Vec::new());
     let mut sql = String::from("DELETE FROM meta WHERE key = 'refs_backfill';\n");
     const TS: &str = "2026-10-30T00:00:00.000000Z";
     for (id, kind, name, guid) in [
@@ -892,7 +928,6 @@ async fn acceptance_migration_from_m55_db() {
         ));
         sql.push_str(&fref("node", &id, &format!("src/n{i}.rs"), None));
         sql.push_str(&fref("node", &id, "src/common.rs", None));
-        notes.push(id);
     }
     for i in 0..4 {
         let id = zam_core::Id::new();
@@ -903,7 +938,6 @@ async fn acceptance_migration_from_m55_db() {
                      '{TS}', '{TS}');\n"
         ));
         sql.push_str(&fref("entry", &id, &format!("src/e{i}.rs"), Some(&h(1))));
-        entries.push(id);
     }
     sql.push_str(&format!(
         "UPDATE file_refs SET state = 'stale', stale_reason = 'source_changed', stale_at = '{TS}'
@@ -1044,5 +1078,4 @@ async fn acceptance_migration_from_m55_db() {
         .await
         .unwrap();
     assert_eq!(n, 1);
-    let _ = (notes, entries, kn);
 }

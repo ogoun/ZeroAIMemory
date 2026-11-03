@@ -6953,6 +6953,7 @@ dependencies = [
  "globset",
  "regex",
  "rpassword",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
