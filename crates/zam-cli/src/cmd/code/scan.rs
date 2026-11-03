@@ -1,7 +1,8 @@
 //! Отпечатки файлов кода (спецификация M5.6 §4; решение составителя плана 6).
 //!
-//! - **В git:** список и oid — `git ls-files -s -z` (пути относительно корня решения — git
-//!   сам сужает список подкаталогом), изменённые и неотслеживаемые (не игнорируемые) —
+//! - **В git:** список и oid — `git ls-files -s -v -z` (пути относительно корня решения — git
+//!   сам сужает список подкаталогом; oid — только без `skip-worktree` и `assume-unchanged`),
+//!   изменённые и неотслеживаемые (не игнорируемые) —
 //!   `git status --porcelain=v2 -z --untracked-files=all -- .` (пути от корня репозитория —
 //!   срезается `--show-prefix`). Чистый файл — отпечаток `oid:<sha>` и `git_oid`, изменённый
 //!   или новый — `mt:<размер>:<mtime_ns>` без `git_oid`. Подмодули и символические ссылки
@@ -9,14 +10,16 @@
 //!   игнорируемой части чужого репозитория (пустой индекс и `check-ignore .`) — как вне git.
 //!   Сбой `git` в настоящем репозитории (`safe.directory`, битый индекс, нет `git`) — ошибка, а
 //!   не обход (ревью задачи 5, I3). `git` — с `GIT_OPTIONAL_LOCKS=0` ([`git_run`]). Windows:
-//!   файл, чей канонический путь не под каноническим корнем (точка соединения наружу), — мимо.
+//!   файл за точкой соединения или символической ссылкой каталога — мимо.
 //! - **Вне git:** обход каталогов стеком (без рекурсии), без `.git`, `.zeroaimemory`, `target`,
 //!   `node_modules`, `dist`, `build` и скрытых каталогов; символические ссылки (и точки
 //!   соединения Windows) не обходятся и не читаются; отпечаток `mt:…`.
 //! - **Отбор:** язык по расширению ([`zam_code::lang_of`]) и `code.languages`, маски
-//!   `code.exclude`; путь — по правилам ссылок ([`refs::normalize_ref_path`]), `/`, регистр —
-//!   из файловой системы ([`refs::real_case_in`], Review Focus 5); повтор пути (другой регистр
-//!   в индексе) — один раз. Больше `code.max_files` файлов — ошибка конфигурации.
+//!   `code.exclude` (на Windows — без учёта регистра); путь — по правилам ссылок
+//!   ([`refs::normalize_ref_path`]), `/`, регистр — из листинга каталогов (один `read_dir` на
+//!   каталог, Review Focus 5); повтор пути (другой регистр в индексе) — один раз. Больше
+//!   `code.max_files` файлов — ошибка конфигурации (обход вне git останавливается на
+//!   `max_files + 1`).
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -85,7 +88,7 @@ pub fn fingerprints(root: &Path, cfg: &CodeConfig) -> Result<Vec<Fingerprint>, C
     };
     let mut out = match from_git(root, &f)? {
         Some(v) => v,
-        None => walk(root, &f),
+        None => walk(root, &f, cfg.max_files as usize + 1),
     };
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
@@ -99,8 +102,10 @@ pub fn fingerprints(root: &Path, cfg: &CodeConfig) -> Result<Vec<Fingerprint>, C
     Ok(out)
 }
 
-/// Записи `git ls-files -s -z`: `<mode> <oid> <stage>\t<путь>` → путь → oid (без подмодулей и
-/// символических ссылок; конфликт — несколько стадий, oid нет).
+/// Записи `git ls-files -s -v -z`: `<тег> <mode> <oid> <stage>\t<путь>` → путь → oid (без
+/// подмодулей и символических ссылок; конфликт — несколько стадий, oid нет). oid — только у тега
+/// `H`: у `skip-worktree` (`S`) и `assume-unchanged` (строчные) `git status` правку содержимого
+/// не видит, и отпечаток `oid:` отдал бы старый хэш (ревью задачи 5, M9).
 fn ls_files(z: &[u8]) -> Vec<(String, Option<String>)> {
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<(String, Option<String>)> = Vec::new();
@@ -113,13 +118,15 @@ fn ls_files(z: &[u8]) -> Vec<(String, Option<String>)> {
             continue;
         };
         let mut it = meta.split(' ');
-        let (Some(mode), Some(oid), Some(stage)) = (it.next(), it.next(), it.next()) else {
+        let (Some(tag), Some(mode), Some(oid), Some(stage)) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
             continue;
         };
         if mode == "160000" || mode == "120000" {
             continue;
         }
-        let oid = (stage == "0").then(|| oid.to_ascii_lowercase());
+        let oid = (stage == "0" && tag == "H").then(|| oid.to_ascii_lowercase());
         match seen.get(path) {
             Some(&i) => out[i].1 = None,
             None => {
@@ -189,29 +196,70 @@ pub fn git_run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Путь `rel` в регистре ФС, если он под корнем (Windows: канонический путь файла — под
-/// каноническим корнем и отличается от `rel` только регистром; путь через точку соединения или
-/// ссылку — `None`). Не Windows — `rel`.
-fn fs_path(root: &Path, canon: &str, rel: &str) -> Option<String> {
-    if !cfg!(windows) {
-        return Some(rel.to_string());
-    }
-    let abs = std::fs::canonicalize(root.join(rel)).ok()?;
-    let a = abs.to_string_lossy().replace('\\', "/");
-    let rest = strip_prefix_ci(&a, canon)?.strip_prefix('/')?;
-    (rest.to_lowercase() == rel.to_lowercase()).then(|| rest.to_string())
+/// Регистр путей из листинга каталогов (ревью задачи 5, M3): один `read_dir` на каталог вместо
+/// `canonicalize` на каждый файл. Windows: путь `rel` в регистре ФС; компонент — точка
+/// соединения или символическая ссылка каталога (куда бы она ни вела) — `None`. Не Windows — `rel`
+/// (git не отдаёт пути за символической ссылкой каталога).
+struct CaseMap<'a> {
+    root: &'a Path,
+    /// Каталог (относительно корня, регистр ФС) → его листинг; не читается — `None`.
+    dirs: HashMap<String, Option<Listing>>,
 }
 
-/// `strip_prefix` без учёта регистра (посимвольно).
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let mut it = s.char_indices();
-    for pc in prefix.chars() {
-        let (_, c) = it.next()?;
-        if !c.to_lowercase().eq(pc.to_lowercase()) {
-            return None;
+/// Листинг каталога: имя в нижнем регистре → `(имя ФС, ссылка)` (несколько — каталог с учётом
+/// регистра).
+type Listing = HashMap<String, Vec<(String, bool)>>;
+
+impl<'a> CaseMap<'a> {
+    fn new(root: &'a Path) -> Self {
+        CaseMap {
+            root,
+            dirs: HashMap::new(),
         }
     }
-    Some(it.next().map_or("", |(i, _)| &s[i..]))
+
+    /// Имя `name` в каталоге `dir` в регистре ФС и признак ссылки; точное имя сильнее
+    /// совпадения без регистра (каталоги с учётом регистра).
+    fn entry(&mut self, dir: &str, name: &str) -> Option<(String, bool)> {
+        let root = self.root;
+        let listing = self.dirs.entry(dir.to_string()).or_insert_with(|| {
+            let rd = std::fs::read_dir(root.join(dir)).ok()?;
+            let mut m = Listing::new();
+            for e in rd.flatten() {
+                let (Ok(t), Some(n)) = (e.file_type(), e.file_name().to_str().map(str::to_string))
+                else {
+                    continue;
+                };
+                m.entry(n.to_lowercase())
+                    .or_default()
+                    .push((n, t.is_symlink()));
+            }
+            Some(m)
+        });
+        let all = listing.as_ref()?.get(&name.to_lowercase())?;
+        all.iter()
+            .find(|(n, _)| n == name)
+            .or_else(|| all.first())
+            .cloned()
+    }
+
+    fn path(&mut self, rel: &str) -> Option<String> {
+        if !cfg!(windows) {
+            return Some(rel.to_string());
+        }
+        let mut real = String::with_capacity(rel.len());
+        for part in rel.split('/') {
+            let (name, link) = self.entry(&real, part)?;
+            if link {
+                return None;
+            }
+            if !real.is_empty() {
+                real.push('/');
+            }
+            real.push_str(&name);
+        }
+        Some(real)
+    }
 }
 
 /// Отпечатки по git: не репозиторий (или корень в игнорируемой части) — `None`; сбой `git` в
@@ -231,7 +279,8 @@ fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliErro
     let prefix =
         git_run(root, &["rev-parse", "--show-prefix"]).map_err(|e| fail("rev-parse", e))?;
     let prefix = String::from_utf8_lossy(&prefix).trim().to_string();
-    let ls = ls_files(&git_run(root, &["ls-files", "-s", "-z"]).map_err(|e| fail("ls-files", e))?);
+    let ls =
+        ls_files(&git_run(root, &["ls-files", "-s", "-v", "-z"]).map_err(|e| fail("ls-files", e))?);
     if ls.is_empty() && git_run(root, &["check-ignore", "-q", "."]).is_ok() {
         return Ok(None);
     }
@@ -258,12 +307,7 @@ fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliErro
         })
         .collect();
     cands.extend(untracked_repo.iter().filter_map(strip).map(|p| (p, None)));
-    let canon = std::fs::canonicalize(root)
-        .unwrap_or_else(|_| root.to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
+    let mut case = CaseMap::new(root);
     let mut out = Vec::with_capacity(cands.len());
     for (raw, oid) in cands {
         let Ok(rel) = refs::normalize_ref_path(&raw) else {
@@ -278,8 +322,8 @@ fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliErro
         if !m.is_file() {
             continue;
         }
-        let Some(path) = fs_path(root, &canon, &rel) else {
-            continue; // вне корня (точка соединения) или через ссылку
+        let Some(path) = case.path(&rel) else {
+            continue; // через точку соединения или символическую ссылку каталога
         };
         if path != rel && f.excluded(&path) {
             continue;
@@ -298,11 +342,16 @@ fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliErro
     Ok(Some(out))
 }
 
-/// Обход вне git (стек каталогов, без символических ссылок).
-fn walk(root: &Path, f: &Filter) -> Vec<Fingerprint> {
+/// Обход вне git (стек каталогов, без символических ссылок и точек соединения) до `limit`
+/// файлов: больше `code.max_files` — всё равно ошибка, полный обход огромного дерева не нужен
+/// (ревью задачи 5, M9).
+fn walk(root: &Path, f: &Filter, limit: usize) -> Vec<Fingerprint> {
     let mut out = Vec::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
+        if out.len() >= limit {
+            break;
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -338,6 +387,9 @@ fn walk(root: &Path, f: &Filter) -> Vec<Fingerprint> {
                 size: m.len(),
                 git_oid: None,
             });
+            if out.len() >= limit {
+                break;
+            }
         }
     }
     out
@@ -360,12 +412,14 @@ mod tests {
     #[test]
     fn ls_files_records() {
         let z = z(&[
-            "100644 aaaa 0\tsrc/a.rs",
-            "160000 bbbb 0\tsub",
-            "120000 cccc 0\tlink.rs",
-            "100644 d1 1\tc.rs",
-            "100644 d2 2\tc.rs",
-            "100755 EEEE 0\tbin.py",
+            "H 100644 aaaa 0\tsrc/a.rs",
+            "H 160000 bbbb 0\tsub",
+            "H 120000 cccc 0\tlink.rs",
+            "M 100644 d1 1\tc.rs",
+            "M 100644 d2 2\tc.rs",
+            "H 100755 EEEE 0\tbin.py",
+            "S 100644 ffff 0\tsparse.rs",
+            "h 100644 9999 0\tassumed.rs",
         ]);
         assert_eq!(
             ls_files(&z),
@@ -373,6 +427,8 @@ mod tests {
                 ("src/a.rs".to_string(), Some("aaaa".to_string())),
                 ("c.rs".to_string(), None),
                 ("bin.py".to_string(), Some("eeee".to_string())),
+                ("sparse.rs".to_string(), None),
+                ("assumed.rs".to_string(), None),
             ]
         );
     }

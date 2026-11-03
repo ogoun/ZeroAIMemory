@@ -3281,3 +3281,66 @@ fn changed_queue_with_many_symbols_flushed_without_loss() {
         );
     }
 }
+
+/// Ревью задачи 6: частичный сбой отправки очереди пачками — постоянная ошибка на второй пачке
+/// или тайм-аут посередине: первая пачка снята, остаток возвращён в очередь без потерь и
+/// повторов.
+#[test]
+fn changed_flush_partial_failure_returns_rest() {
+    let _g = serial();
+    for (name, code, delay) in [
+        ("flush-part-500", 500u16, Duration::ZERO),
+        ("flush-part-slow", 200, Duration::from_secs(3)),
+    ] {
+        let (url, seen) =
+            common::stub_with(std::sync::Arc::new(move |_: &str, path: &str, n: usize| {
+                if path == "/api/v1/files/changed" && n >= 1 {
+                    (code, r#"{"status":500,"detail":"x"}"#, delay)
+                } else {
+                    (200, r#"{"stale":0}"#, Duration::ZERO)
+                }
+            }));
+        let p = Proj::new(name, &url, "zam_x");
+        std::fs::create_dir_all(p.cache()).unwrap();
+        let all: Vec<String> = (0..8).map(|i| format!("src/f{i}.rs")).collect();
+        let mut text = String::new();
+        for path in &all {
+            let syms: Vec<Value> = (0..1500)
+                .map(|k| json!({"qual": format!("other_function_{k:05}"), "body_hash": format!("{k:016x}")}))
+                .collect();
+            text.push_str(
+                &json!({"path": path, "hash": "1".repeat(64), "symbols": syms}).to_string(),
+            );
+            text.push('\n');
+        }
+        let part = format!("pq-{}", &blake(b"pq")[..8]);
+        std::fs::write(p.cache().join(format!("changed-{part}.jsonl")), text).unwrap();
+        let ss = p.ev("SessionStart", "pq-new", json!({"source": "startup"}));
+        let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+        let posts: Vec<Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert!(posts.len() >= 2, "{name}: пачек {}", posts.len());
+        let sent: Vec<String> = posts[0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect();
+        let left: Vec<String> = queue(&p, "pq")
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !sent.is_empty() && !left.is_empty(),
+            "{name}: {sent:?} / {left:?}"
+        );
+        let mut both: Vec<String> = sent.iter().chain(&left).cloned().collect();
+        both.sort();
+        assert_eq!(both, all, "{name}: первая пачка снята, остаток возвращён");
+    }
+}

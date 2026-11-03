@@ -355,6 +355,16 @@ fn code_sync_edit_one_uploads_one() {
     // --full — разобраны и загружены все
     let r = json_of(&ok(&p.zam(&["code", "sync", "--full", "--json"])));
     assert_eq!(r["uploaded"], 4, "{r}");
+    // ревью задачи 1, M8: состояние другой версии разбора — перезагрузка всех файлов один раз
+    let path = p.cache("code-state.json");
+    let mut state = json_of(&std::fs::read_to_string(&path).unwrap());
+    assert_eq!(state["extractor"], zam_code::EXTRACT_VERSION, "{state}");
+    state["extractor"] = json!(1);
+    std::fs::write(&path, state.to_string()).unwrap();
+    let r = p.sync();
+    assert_eq!(r["uploaded"], 4, "{r}");
+    assert!(r["warnings"].to_string().contains("версия разбора"), "{r}");
+    assert_eq!(p.sync()["uploaded"], 0);
 }
 
 /// Review Focus 3: `git mv` и `git rm` — старый путь исчезает из карты, новый загружен.
@@ -436,11 +446,20 @@ fn dir_link(target: &Path, link: &Path) -> bool {
     }
     #[cfg(windows)]
     {
+        // `mklink` разбирает `/…` внутри пути (`../../target`) как ключ — полный путь с `\`
+        let win = |p: &Path| {
+            let full = match (p.parent().map(std::fs::canonicalize), p.file_name()) {
+                (Some(Ok(dir)), Some(name)) => dir.join(name),
+                _ => p.to_path_buf(),
+            };
+            let s = full.to_string_lossy().replace('/', "\\");
+            s.strip_prefix(r"\\?\").map_or(s.clone(), str::to_string)
+        };
         std::os::windows::fs::symlink_dir(target, link).is_ok()
             || std::process::Command::new("cmd")
                 .args(["/C", "mklink", "/J"])
-                .arg(link)
-                .arg(target)
+                .arg(win(link))
+                .arg(win(target))
                 .output()
                 .is_ok_and(|o| o.status.success())
     }
@@ -1280,6 +1299,15 @@ fn code_sync_guards_root_prune_and_git_failure() {
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
     assert!(err(&o).contains("--prune"), "{}", err(&o));
     assert_eq!(p.status()["files"], 24, "карта не тронута");
+    // без локального состояния (вторая машина, кэш удалён) — сверка с картой сервера
+    let state = p.cache("code-state.json");
+    let saved = std::fs::read(&state).unwrap();
+    std::fs::remove_file(&state).unwrap();
+    let o = p.zam(&["code", "sync"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("файлов карты (24)"), "{}", err(&o));
+    assert_eq!(p.status()["files"], 24, "карта не тронута");
+    std::fs::write(&state, saved).unwrap();
     let o = p.zam(&["code", "sync", "--background"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).is_empty(), "{}", err(&o));
@@ -1293,4 +1321,60 @@ fn code_sync_guards_root_prune_and_git_failure() {
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
     assert!(err(&o).contains("git"), "{}", err(&o));
     assert_eq!(p.status()["files"], 4);
+}
+
+/// Ревью задачи 5, M9: файл `skip-worktree` с правкой — загружается (отпечаток не `oid:`);
+/// маски `exclude` на Windows — без учёта регистра; файлы за точкой соединения/ссылкой каталога
+/// в git — мимо; обход вне git останавливается на `max_files + 1`.
+#[test]
+fn code_sync_skip_worktree_exclude_case_links_walk_limit() {
+    let (url, tok) = start("m9");
+    let Some(p) = Proj::git("m9", &url, &tok) else {
+        return;
+    };
+    p.config("[code]\nexclude = [\"GEN/**\"]\n");
+    p.file("src/a.rs", b"pub fn alpha() {}\n");
+    p.file("src/b.rs", b"pub fn beta() {}\n");
+    p.file("gen/x.rs", b"pub fn generated_fn() {}\n");
+    p.commit("init");
+    let outside = p.repo.parent().unwrap().join("m9-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("far.rs"), b"pub fn far_away() {}\n").unwrap();
+    let linked = dir_link(&outside, &p.repo.join("src/link"));
+    if !linked {
+        eprintln!("ссылку каталога создать не удалось — проверка ссылки пропущена");
+    }
+    p.sync();
+    assert!(
+        p.symbol_paths("far_away").is_empty(),
+        "файл за ссылкой каталога"
+    );
+    let want_gen: &[&str] = if cfg!(windows) { &[] } else { &["gen/x.rs"] };
+    assert_eq!(
+        p.symbol_paths("generated_fn"),
+        want_gen,
+        "exclude без учёта регистра"
+    );
+    git(&p.repo, &["update-index", "--skip-worktree", "src/b.rs"]).unwrap();
+    p.file("src/b.rs", b"pub fn beta() {}\npub fn beta_two() {}\n");
+    let r = p.sync();
+    assert_eq!(r["uploaded"], 1, "{r}");
+    assert_eq!(p.symbol_paths("beta_two"), ["src/b.rs"]);
+    let state = json_of(&std::fs::read_to_string(p.cache("code-state.json")).unwrap());
+    assert!(
+        state["files"]["src/b.rs"]["fp"]
+            .as_str()
+            .unwrap()
+            .starts_with("mt:"),
+        "{state}"
+    );
+    // вне git: больше max_files — ошибка без полного обхода (найдено ровно max_files + 1)
+    let q = Proj::plain("m9-walk", &url, &tok);
+    for i in 0..30 {
+        q.file(&format!("src/f{i:02}.rs"), b"pub fn f() {}\n");
+    }
+    q.config("[code]\nmax_files = 10\n");
+    let o = q.zam(&["code", "sync"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("файлов кода 11"), "{}", err(&o));
 }

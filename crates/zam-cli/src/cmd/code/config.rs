@@ -4,7 +4,7 @@
 //! (код 1) с именем ключа и файла: молча выключенная карта хуже явной ошибки.
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use zam_code::Lang;
 
@@ -119,10 +119,17 @@ fn read_section(path: &Path) -> Result<Section, CliError> {
         .map_err(|e| bad(format!("[code]: {}", e.message())))
 }
 
+/// Маски `exclude`; на Windows — без учёта регистра, как файловая система (ревью задачи 5, M9):
+/// `Gen/**` исключает и `gen/x.rs`.
 fn globs(masks: &[String]) -> Result<GlobSet, String> {
     let mut b = GlobSetBuilder::new();
     for m in masks {
-        b.add(Glob::new(m).map_err(|e| format!("«{m}»: {e}"))?);
+        b.add(
+            GlobBuilder::new(m)
+                .case_insensitive(cfg!(windows))
+                .build()
+                .map_err(|e| format!("«{m}»: {e}"))?,
+        );
     }
     b.build().map_err(|e| e.to_string())
 }

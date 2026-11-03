@@ -17,9 +17,9 @@ pub mod extract;
 pub use names::{fts_terms, split_ident, split_ref};
 pub use pack::{MapFile, MapSym, Packed, map_line, render_map, render_map_rest};
 pub use proto::{
-    FileUpload, Lang, MISSING_HASH, ManifestItem, NAME_MAX_CHARS, ParseState, QUAL_MAX_CHARS,
-    RefAgg, RefKind, SIG_MAX_CHARS, SkipReason, Symbol, SymbolHash, SymbolKind, UPLOAD_FILES_MAX,
-    body_hash, lang_of, sig_line,
+    EXTRACT_VERSION, FileUpload, Lang, MISSING_HASH, ManifestItem, NAME_MAX_CHARS, ParseState,
+    QUAL_MAX_CHARS, RefAgg, RefKind, SIG_MAX_CHARS, SkipReason, Symbol, SymbolHash, SymbolKind,
+    UPLOAD_FILES_MAX, body_hash, lang_of, sig_line,
 };
 pub use rank::{
     Focus, Graph, RankFile, Ranked, central, edges_among, focus_idents, focus_restart, ident_mult,

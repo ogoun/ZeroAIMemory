@@ -13,7 +13,8 @@
 //!   (M4.5 §6.3; как `triggers.json`): знание о файле для `post-tool` и `pre-tool` без сети;
 //! - `changed-<сессия>.jsonl` — очередь `{path, hash}` правленых файлов (M4.5 §6.2): пишет
 //!   `post-tool`, отправляют `POST /files/changed` `prompt`, `session-start` и `checkpoint`
-//!   ([`flush_changed`]);
+//!   ([`flush_changed`]); файл меняют только под замком `.changed-….jsonl.lock`, уплотняют
+//!   (больше [`CHANGED_QUEUE_MAX`]) `session-start` и возврат неотправленного, не `post-tool`;
 //! - `events-<сессия>.jsonl` — журнал событий сессии ([`super::journal`]);
 //! - `tokens-<сессия>.jsonl` — выданное хуками с локальным выводом (M4.5 §9.5): строка
 //!   `{e, t}` (событие `pre_tool` | `post_tool_local` | `subagent_local`, оценка токенов) на
@@ -465,42 +466,113 @@ pub fn compact_changed(lines: Vec<Changed>, max: u64) -> Vec<Changed> {
     out
 }
 
-/// Дописывает файлы в очередь изменённых: строка на файл, все одним `write` с append; очередь
-/// больше [`CHANGED_QUEUE_MAX`] — сначала уплотняется ([`compact_changed`]) и переписывается.
+/// Ожидание замка очереди изменённых файлов у `post-tool` (дописывание): дольше — без замка.
+const CHANGED_APPEND_WAIT: Duration = Duration::from_millis(20);
+/// Ожидание замка у отправки и уплотнения (`flush_changed`, `session-start`).
+const CHANGED_LOCK_WAIT: Duration = Duration::from_millis(50);
+/// Жёсткий предел очереди, байт: сверх него `post-tool` строки не дописывает (строка в
+/// `hooks.log`) — до уплотнения `session-start` или отправки.
+pub const CHANGED_QUEUE_HARD: u64 = 4 * CHANGED_QUEUE_MAX;
+
+/// Замок очереди `changed-…jsonl` (`.changed-….jsonl.lock`, как у очереди запусков): все, кто
+/// меняет файл очереди, — под ним, иначе дописанная параллельным `post-tool` строка терялась бы
+/// при переписывании (ревью задачи 6).
+struct QueueLock(Option<PathBuf>);
+
+impl QueueLock {
+    fn take(queue: &Path, wait: Duration) -> QueueLock {
+        QueueLock(file_lock(queue, wait))
+    }
+
+    fn held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for QueueLock {
+    fn drop(&mut self) {
+        if let Some(l) = self.0.take() {
+            let _ = std::fs::remove_file(l);
+        }
+    }
+}
+
+/// Строки очереди (битые пропускаются).
+fn read_changed(path: &Path) -> Vec<Changed> {
+    std::fs::read(path)
+        .unwrap_or_default()
+        .split(|b| *b == b'\n')
+        .filter_map(|l| serde_json::from_slice::<Changed>(l).ok())
+        .collect()
+}
+
+fn changed_bytes<'a>(lines: impl IntoIterator<Item = &'a Changed>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in lines {
+        out.extend(serde_json::to_vec(c).unwrap_or_default());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Дописывает файлы в очередь изменённых под замком очереди: строка на файл, все одним `write`
+/// с append. Уплотнения здесь нет (ревью задачи 6: 20–40 мс на 4 МиБ — в бюджете `post-tool`):
+/// очередь больше [`CHANGED_QUEUE_MAX`] — у новых строк снимаются `symbols` (ссылки на символы
+/// сервер судит по хэшу файла), больше [`CHANGED_QUEUE_HARD`] — строки не дописываются.
+/// Уплотняют очередь отправка ([`flush_changed`]) и `session-start` ([`compact_changed_queues`]).
 pub fn queue_changed(env: &Env, session: &str, files: &[Changed]) {
     if files.is_empty() {
         return;
     }
-    let mut buf = Vec::new();
-    for c in files {
-        buf.extend(serde_json::to_vec(c).unwrap_or_default());
-        buf.push(b'\n');
-    }
     let path = changed_path(env, session);
-    let len = std::fs::metadata(&path).map_or(0, |m| m.len());
-    if len + buf.len() as u64 > CHANGED_QUEUE_MAX {
-        let bytes = std::fs::read(&path).unwrap_or_default();
-        let mut lines: Vec<Changed> = bytes
-            .split(|b| *b == b'\n')
-            .filter_map(|l| serde_json::from_slice::<Changed>(l).ok())
-            .collect();
-        lines.extend(files.iter().cloned());
-        let mut out = Vec::new();
-        for c in compact_changed(lines, CHANGED_QUEUE_MAX) {
-            out.extend(serde_json::to_vec(&c).unwrap_or_default());
-            out.push(b'\n');
-        }
-        if let Err(e) = write_atomic(&path, &out) {
-            env.log(&format!("очередь изменённых файлов: {e}"));
-        }
+    if let Err(e) = std::fs::create_dir_all(env.cache_dir()) {
+        env.log(&format!("очередь изменённых файлов: {e}"));
         return;
     }
-    let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| {
-        use std::io::Write;
-        append_options().open(&path)?.write_all(&buf)
-    });
-    if let Err(e) = r {
+    let _lock = QueueLock::take(&path, CHANGED_APPEND_WAIT);
+    let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+    let mut buf = changed_bytes(files);
+    if len + buf.len() as u64 > CHANGED_QUEUE_MAX {
+        let lean: Vec<Changed> = files
+            .iter()
+            .map(|c| Changed {
+                symbols: None,
+                ..c.clone()
+            })
+            .collect();
+        buf = changed_bytes(&lean);
+    }
+    if len + buf.len() as u64 > CHANGED_QUEUE_HARD {
+        env.log(&format!(
+            "очередь изменённых файлов больше {CHANGED_QUEUE_HARD} байт: {} путей не записано",
+            files.len()
+        ));
+        return;
+    }
+    use std::io::Write;
+    if let Err(e) = append_options()
+        .open(&path)
+        .and_then(|mut f| f.write_all(&buf))
+    {
         env.log(&format!("очередь изменённых файлов: {e}"));
+    }
+}
+
+/// Уплотнение очередей изменённых файлов больше [`CHANGED_QUEUE_MAX`] (`session-start`, вне
+/// бюджета `post-tool`): под замком очереди — чтение, [`compact_changed`], атомарная запись.
+pub fn compact_changed_queues(env: &Env) {
+    for q in queue_files(env, None) {
+        if std::fs::metadata(&q).map_or(0, |m| m.len()) <= CHANGED_QUEUE_MAX {
+            continue;
+        }
+        let lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
+        if !lock.held() {
+            continue; // замок занят — в другой раз
+        }
+        let out = changed_bytes(&compact_changed(read_changed(&q), CHANGED_QUEUE_MAX));
+        if let Err(e) = write_atomic(&q, &out) {
+            env.log(&format!("уплотнение очереди изменённых файлов: {e}"));
+        }
     }
 }
 
@@ -552,6 +624,8 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     for (i, q) in queue_files(env, session).into_iter().enumerate() {
         let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("changed");
         let t = q.with_file_name(format!(".{name}.{}.{nanos}.{i}.tmp", std::process::id()));
+        // под замком: `post-tool`, открывший очередь до rename, допишет уже в забранный файл
+        let _lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
         if std::fs::rename(&q, &t).is_ok() {
             taken.push((q, t));
         }
@@ -593,21 +667,40 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     }
     let back: Vec<(Changed, usize)> = files[done..].to_vec();
     for (qi, (q, _)) in taken.iter().enumerate() {
-        let mut out = Vec::new();
-        for (c, _) in back.iter().filter(|(_, i)| *i == qi) {
-            out.extend(serde_json::to_vec(c).unwrap_or_default());
-            out.push(b'\n');
-        }
-        if out.is_empty() {
-            continue;
-        }
-        use std::io::Write;
-        if let Err(e) = append_options().open(q).and_then(|mut f| f.write_all(&out)) {
-            env.log(&format!("возврат очереди изменённых файлов: {e}"));
+        let mine: Vec<Changed> = back
+            .iter()
+            .filter(|(_, i)| *i == qi)
+            .map(|(c, _)| c.clone())
+            .collect();
+        if !mine.is_empty() {
+            return_changed(env, q, mine);
         }
     }
     for (_, t) in &taken {
         let _ = std::fs::remove_file(t);
+    }
+}
+
+/// Возврат неотправленных строк в очередь `q` (ревью задачи 6): под замком — **перед**
+/// строками, дописанными за время отправки (они новее: повтор пути — последний хэш), вместе
+/// уплотнённые ([`compact_changed`]). Замок не взят — дописывание в конец (fail-open, без потерь).
+fn return_changed(env: &Env, q: &Path, back: Vec<Changed>) {
+    let lock = QueueLock::take(q, CHANGED_LOCK_WAIT);
+    let r = if lock.held() {
+        let mut lines = back;
+        lines.extend(read_changed(q));
+        write_atomic(
+            q,
+            &changed_bytes(&compact_changed(lines, CHANGED_QUEUE_MAX)),
+        )
+    } else {
+        use std::io::Write;
+        append_options()
+            .open(q)
+            .and_then(|mut f| f.write_all(&changed_bytes(&back)))
+    };
+    if let Err(e) = r {
+        env.log(&format!("возврат очереди изменённых файлов: {e}"));
     }
 }
 
@@ -863,7 +956,7 @@ pub fn spawn_path(env: &Env, session: &str) -> PathBuf {
 
 /// Замок очереди запусков: файл `.spawn-….lock` (создаётся только новым); брошенный старше
 /// [`SPAWN_LOCK_TTL`] снимается; не взят за `wait` — `None` (без замка).
-fn spawn_lock(path: &Path, wait: Duration) -> Option<PathBuf> {
+fn file_lock(path: &Path, wait: Duration) -> Option<PathBuf> {
     let name = path.file_name()?.to_str()?;
     let lock = path.with_file_name(format!(".{name}.lock"));
     let mut o = std::fs::OpenOptions::new();
@@ -900,7 +993,7 @@ fn with_spawns<T>(
 ) -> T {
     let path = spawn_path(env, session);
     let _ = std::fs::create_dir_all(env.cache_dir());
-    let lock = spawn_lock(&path, wait);
+    let lock = file_lock(&path, wait);
     let mut q: Vec<Spawn> = match read_json_file::<Vec<Spawn>>(&path) {
         Ok(v) => v.unwrap_or_default(),
         Err(e) => {

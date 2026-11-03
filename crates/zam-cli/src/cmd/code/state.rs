@@ -1,7 +1,7 @@
 //! Локальное состояние карты кода (спецификация M5.6 §4, §5; решения составителя плана 6, 7):
 //!
 //! - `cache/code-state.json` — `{server, solution, files: {путь: {fp, size, hash, sent_at}},
-//!   crashed: [[путь, hash]]}`: по отпечатку `fp` хэш берётся без чтения файла; `crashed` —
+//!   crashed: [[путь, hash]], extractor}`: по отпечатку `fp` хэш берётся без чтения файла; `crashed` —
 //!   файлы, на которых оборвался разбор (пропуск `parser_crash`, пока хэш тот же);
 //! - `cache/code-sync.json` — `{server, solution, last_ok_at, head}`: малый файл для хуков
 //!   (задача 6 — «не чаще `auto_interval_min` или при смене `HEAD`»).
@@ -29,6 +29,10 @@ pub struct CodeState {
     pub files: BTreeMap<String, FileState>,
     #[serde(default)]
     pub crashed: Vec<(String, String)>,
+    /// [`zam_code::EXTRACT_VERSION`], которой разобраны файлы; другая — полная перезагрузка.
+    /// Нет поля (состояние до версии 2) — 0.
+    #[serde(default)]
+    pub extractor: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

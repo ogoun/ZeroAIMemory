@@ -449,10 +449,32 @@ fn init_codex_writes_codex_hooks() {
     assert_eq!(h["hooks"]["Stop"].as_array().unwrap().len(), 1, "{h}");
 }
 
+/// Прогрев сервера без сроков: первый запрос пользователя открывает его базу (миграции) — под
+/// нагрузкой полного прогона дольше 5 с `zam status` (профиль `Probe`), и блок пропадал из
+/// вывода. Проверяется предупреждение об устаревшем блоке, а не время первого ответа.
+fn warm(p: &Proj) {
+    let a = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build(),
+    );
+    for path in ["/spaces", "/agent-setup"] {
+        let st = a
+            .get(&format!("{}/api/v1{path}", p.url))
+            .header("Authorization", format!("Bearer {}", p.token))
+            .call()
+            .unwrap()
+            .status();
+        assert_eq!(st.as_u16(), 200, "прогрев {path}");
+    }
+}
+
 #[test]
 fn status_warns_outdated_block() {
     let (url, tok) = start("status");
     let p = Proj::new("status", &url, &tok);
+    warm(&p);
     std::fs::write(
         p.repo.join("CLAUDE.md"),
         format!("<!-- zeroaimemory:begin v1 -->\nZeroAIMemoryUrl={url}\nZeroAIMemoryToken={tok}\n<!-- zeroaimemory:end -->\n"),

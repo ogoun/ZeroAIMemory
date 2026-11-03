@@ -703,6 +703,29 @@ fn rust_impl_for_any_type_is_container() {
     assert_eq!(sym(&out, "S::k").line, 11);
 }
 
+/// Ревью задачи 1, M8: `impl dyn Trait` — `qual` по трейту (первая граница), не текст типа
+/// `dynWritableBuffer+'a`.
+#[test]
+fn rust_impl_dyn_trait_qual_by_trait() {
+    let src = "impl dyn WritableBuffer + '_ {\n    fn write(&self) {}\n}\nimpl<'a> dyn io::Sink + Send + 'a {\n    fn flush(&self) {}\n}\nimpl dyn Plain {\n    fn p(&self) {}\n}\nimpl<'a> dyn Gen<u8> + 'a {\n    fn g(&self) {}\n}\nimpl<'a> &'a (dyn Tr + 'a) {\n    fn t(&self) {}\n}\n";
+    let out = run(Lang::Rust, src);
+    for q in [
+        "WritableBuffer::write",
+        "io::Sink::flush",
+        "Plain::p",
+        "Gen::g",
+    ] {
+        assert_eq!(
+            sym(&out, q).kind,
+            SymbolKind::Method,
+            "{q}: {:?}",
+            quals(&out)
+        );
+    }
+    let t = out.symbols.iter().find(|s| s.name == "t").unwrap();
+    assert_eq!(t.qual, "Tr::t", "{:?}", quals(&out));
+}
+
 /// Ревью I2: литералы объектов внутри функций не дают символов (и не сдвигают `#N`).
 #[test]
 fn object_literal_members_only_at_top_level() {

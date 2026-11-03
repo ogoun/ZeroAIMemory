@@ -49,6 +49,8 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
 /// Регистрация сессии, дайджест, кэши и очереди (см. модуль).
 fn digest(env: &Env, inp: &Input, s: &Settings) -> Output {
     cache::gc_cache(env);
+    // очереди изменённых файлов больше 4 МиБ — уплотнение здесь, не в бюджете `post-tool`
+    cache::compact_changed_queues(env);
     let session = inp.session_id.as_deref();
     let source = inp.str("source");
     if let Some(id) = session {

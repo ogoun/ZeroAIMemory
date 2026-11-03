@@ -13,6 +13,11 @@ pub const NAME_MAX_CHARS: usize = 256;
 pub const QUAL_MAX_CHARS: usize = 512;
 /// Файлов в одном `PUT /code/files` (§5).
 pub const UPLOAD_FILES_MAX: usize = 500;
+/// Версия выдачи экстрактора (`qual`, виды, сигнатуры). Смена — клиент, чьё состояние
+/// `code-state.json` записано другой версией, перезагружает все файлы (`zam code sync` как с
+/// `--full`): сервер решает `need` по хэшу содержимого и сам смену разбора не увидит.
+/// 2 — `impl dyn Trait` по трейту (ревью задачи 1, M8).
+pub const EXTRACT_VERSION: u32 = 2;
 /// Хэш удалённого файла: 64 нуля, как `zam-cli` `refs::MISSING_HASH` (очередь хуков M4.5).
 pub const MISSING_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 

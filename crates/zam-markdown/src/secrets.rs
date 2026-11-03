@@ -79,6 +79,13 @@ static PREFIXES: LazyLock<Vec<Prefix>> = LazyLock::new(|| {
         ("slack", r"(?-u:\b)xox[abprs]-[A-Za-z0-9-]{10,}"),
         ("api", r"(?-u:\b)sk-(?:ant-)?[A-Za-z0-9_-]{20,}"),
         ("google", r"(?-u:\b)AIza[0-9A-Za-z_-]{35}"),
+        // ревью задачи 5 M5.6, M8: Hugging Face, npm, SendGrid (ASIA и пароль в URL — выше)
+        ("huggingface", r"(?-u:\b)hf_[A-Za-z0-9]{34,}"),
+        ("npm", r"(?-u:\b)npm_[A-Za-z0-9]{36}"),
+        (
+            "sendgrid",
+            r"(?-u:\b)SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}",
+        ),
         // формат zam_core::token: `zam_` + 40 символов base62
         ("zeroaimemory", r"(?-u:\b)zam_[A-Za-z0-9]{40}"),
     ]
@@ -367,11 +374,26 @@ pub fn mask_secrets(text: &str, hits: &[SecretHit]) -> String {
 }
 
 /// Сканирует и маскирует за один вызов (текст без секретов возвращается копией).
+///
+/// Маскирование — до неподвижной точки (не больше [`MASK_PASSES`] проходов): ключ, вплотную
+/// следующий за другим (`hf_…hf_…`, `ghp_…ghp_…`), без границы слова слева правилом префикса не
+/// узнаётся, а после маскировки соседа граница появляется — повторный проход не должен ничего
+/// менять (proptest `mask_is_idempotent`, ревью задачи 5 M5.6).
 pub fn mask_text(text: &str) -> String {
-    let hits = scan_secrets(text);
-    if hits.is_empty() {
-        text.to_string()
-    } else {
-        mask_secrets(text, &hits)
+    let mut cur = text.to_string();
+    for _ in 0..MASK_PASSES {
+        let hits = scan_secrets(&cur);
+        if hits.is_empty() {
+            break;
+        }
+        let next = mask_secrets(&cur, &hits);
+        if next == cur {
+            break;
+        }
+        cur = next;
     }
+    cur
 }
+
+/// Проходов [`mask_text`] не больше (каждый открывает границу следующему слипшемуся ключу).
+const MASK_PASSES: usize = 16;

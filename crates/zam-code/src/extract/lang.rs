@@ -454,8 +454,9 @@ pub(super) fn ref_kind(node: Node, cap: &str) -> RefKind {
 }
 
 /// Имя типа `impl` Rust циклом (без рекурсии: вложенность `&&&…T` не ограничена): `Pair<A, B>` →
-/// `Pair`, `net::Client` → `net::Client`, `&mut S` → `S`, `Box<dyn Tr>` → `Box`; иные (`[u8]`,
-/// `(A, B)`) — текст без пробелов (до 128 символов, иначе `_`).
+/// `Pair`, `net::Client` → `net::Client`, `&mut S` → `S`, `Box<dyn Tr>` → `Box`, `dyn Tr + 'a` →
+/// `Tr` (поле `trait`, первая граница не-время-жизни); иные (`[u8]`, `(A, B)`) — текст без
+/// пробелов (до 128 символов, иначе `_`).
 fn rust_type_path(mut node: Node, src: &[u8]) -> Vec<String> {
     loop {
         match node.kind() {
@@ -466,8 +467,33 @@ fn rust_type_path(mut node: Node, src: &[u8]) -> Vec<String> {
                 }
                 break;
             }
-            "generic_type" | "reference_type" | "pointer_type" => {
+            "generic_type" | "reference_type" | "pointer_type" | "higher_ranked_trait_bound" => {
                 match node.child_by_field_name("type") {
+                    Some(t) => node = t,
+                    None => break,
+                }
+            }
+            // `dyn Tr`, `impl Tr` — по полю `trait` (ревью задачи 1, M8)
+            "dynamic_type" | "abstract_type" => match node.child_by_field_name("trait") {
+                Some(t) => node = t,
+                None => break,
+            },
+            // `(dyn Tr + 'a)` — скобки (у грамматики это `tuple_type` из одного типа без `,`)
+            "tuple_type" | "parenthesized_type"
+                if node.named_child_count() == 1 && !text(node, src).contains(',') =>
+            {
+                match node.named_child(0) {
+                    Some(t) => node = t,
+                    None => break,
+                }
+            }
+            // `dyn Tr + 'a`, `dyn Tr + Send` — первая граница, не время жизни
+            "bounded_type" => {
+                let mut cur = node.walk();
+                let first = node
+                    .named_children(&mut cur)
+                    .find(|c| c.kind() != "lifetime" && c.kind() != "use_bounds");
+                match first {
                     Some(t) => node = t,
                     None => break,
                 }

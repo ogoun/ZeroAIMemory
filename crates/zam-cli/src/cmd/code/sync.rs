@@ -14,7 +14,8 @@
 //!   завершении процесса (обрыв тоже), поэтому брошенных замков нет. Файл остаётся.
 //! - **Предохранитель** (ревью задачи 5, I3): манифест меньше половины файлов прошлого
 //!   состояния (если их ≥ [`PRUNE_GUARD_MIN`]) не отправляется без `--prune` — сервер удалил
-//!   бы из карты всё недостающее.
+//!   бы из карты всё недостающее. Нет локального состояния этого решения (вторая машина, кэш
+//!   удалён) — сверка с числом файлов карты на сервере (`GET /code/status`, ревью задачи 5).
 //! - На сервер — только метаданные §4: без `code.send_signatures` поле `sig` не отправляется;
 //!   секреты сигнатуры клиент маскирует до обрезки ([`mask_sig`]); файл, чей JSON больше
 //!   предела запроса, уходит `skipped`/`limit` без символов.
@@ -355,7 +356,8 @@ fn token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_' | '.')
 }
 
-/// Префиксы известных ключей (GitHub, GitLab, Slack, AWS, OpenAI/Anthropic, Stripe, Google).
+/// Префиксы известных ключей (GitHub, GitLab, Slack, AWS, OpenAI/Anthropic, Stripe, Google):
+/// префикс и ≥ 16 символов токена.
 const KEY_PREFIXES: [&str; 12] = [
     "ghp_",
     "gho_",
@@ -371,15 +373,71 @@ const KEY_PREFIXES: [&str; 12] = [
     "AIza",
 ];
 
-/// Токен похож на секрет: известный префикс и ≥ 16 символов либо высокая энтропия.
-fn secret_token(t: &str) -> bool {
-    let n = t.chars().count();
-    (n >= 16 && KEY_PREFIXES.iter().any(|p| t.starts_with(p)))
-        || crate::cmd::hook::journal::high_entropy(t)
+/// Ключи точного формата (ревью задачи 5, M8; как у `zam_markdown::secrets`): AWS `AKIA`/`ASIA`
+/// и 16 `[0-9A-Z]`, Hugging Face `hf_` и ≥ 34 `[A-Za-z0-9]`, npm `npm_` и 36, SendGrid
+/// `SG.<22>.<43>`. Точный формат, а не префикс: `ASIAN_REGION_CODES`, `hf_model_loader` — имена.
+static EXACT_KEYS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"^(?:(?:AKIA|ASIA)[0-9A-Z]{16}|hf_[A-Za-z0-9]{34,}|npm_[A-Za-z0-9]{36}|SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})$",
+    )
+    .expect("шаблон ключей")
+});
+
+/// Пароль в URL `scheme://user:пароль@host` (пароль — группа 2), как у `zam_markdown::secrets`.
+static URL_PASSWORD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"([A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]*:)([^\s/@]+)@").expect("шаблон URL")
+});
+
+/// Высокая энтропия в сигнатуре — по правилу сервера (`zam_markdown::secrets`): ≥ 32 символов,
+/// строчные, прописные и цифры, не путь из слов, ≥ 4,5 бита на символ. Порог журнала хуков
+/// (3,5 бита, без требования классов) здесь не годится: длинные имена
+/// (`handle_incoming_websocket_message_v2` — 4,0) он принимает за секреты (ревью задачи 5, M8).
+fn sig_high_entropy(t: &str) -> bool {
+    let b = t.as_bytes();
+    if b.len() < 32
+        || !b.iter().any(u8::is_ascii_lowercase)
+        || !b.iter().any(u8::is_ascii_uppercase)
+        || !b.iter().any(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    let wordlike = |p: &str| {
+        !p.is_empty()
+            && p.bytes()
+                .all(|c| c.is_ascii_alphabetic() || c == b'_' || c == b'-')
+    };
+    if t.matches('/').count() >= 2 && t.split('/').filter(|p| wordlike(p)).count() >= 2 {
+        return false;
+    }
+    let mut counts = [0u32; 256];
+    for &c in b {
+        counts[c as usize] += 1;
+    }
+    let n = b.len() as f64;
+    let h: f64 = counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = f64::from(c) / n;
+            -p * p.log2()
+        })
+        .sum();
+    h >= 4.5
 }
 
-/// Секреты в тексте → `‹secret›` (по токенам из [`token_char`]).
+/// Токен похож на секрет: известный префикс и ≥ 16 символов, точный формат ключа или высокая
+/// энтропия ([`sig_high_entropy`]).
+fn secret_token(t: &str) -> bool {
+    (t.chars().count() >= 16 && KEY_PREFIXES.iter().any(|p| t.starts_with(p)))
+        || EXACT_KEYS.is_match(t)
+        || sig_high_entropy(t)
+}
+
+/// Секреты в тексте → `‹secret›`: пароль в URL, затем токены из [`token_char`].
 fn mask_tokens(text: &str) -> String {
+    let text = URL_PASSWORD.replace_all(text, |c: &regex::Captures| {
+        format!("{}{}@", &c[1], crate::cmd::hook::journal::SECRET)
+    });
     let mut out = String::with_capacity(text.len());
     let mut tok = String::new();
     let flush = |tok: &mut String, out: &mut String| {
@@ -568,14 +626,16 @@ pub fn sync(
         hashes.insert(fp.path.clone(), h);
         live.push(fp);
     }
-    let known = if state.solution == guid {
+    let known = if state.solution == guid && !state.files.is_empty() {
         state.files.len()
-    } else {
+    } else if opts.prune {
         0
+    } else {
+        server_files(ctx, guid)
     };
     if !opts.prune && known >= PRUNE_GUARD_MIN && live.len() * 2 < known {
         return Err(CliError::config(format!(
-            "файлов кода {} — меньше половины прошлой синхронизации ({known}): сервер удалил бы \
+            "файлов кода {} — меньше половины файлов карты ({known}): сервер удалил бы \
              из карты остальные. Проверьте корень, code.exclude и code.languages; удаление \
              намеренное — zam code sync --prune",
             live.len()
@@ -613,7 +673,18 @@ pub fn sync(
         warnings,
         ..SyncReport::default()
     };
-    let need: Vec<&Fingerprint> = if opts.full {
+    // разбор сменился (`EXTRACT_VERSION`) — карта этого клиента перезагружается целиком
+    let reparse = state.solution == guid
+        && !state.files.is_empty()
+        && state.extractor != zam_code::EXTRACT_VERSION;
+    if reparse {
+        report.warnings.push(format!(
+            "версия разбора сменилась ({} → {}): файлы карты загружаются заново",
+            state.extractor,
+            zam_code::EXTRACT_VERSION
+        ));
+    }
+    let need: Vec<&Fingerprint> = if opts.full || reparse {
         live.clone()
     } else {
         let set: HashSet<&str> = resp["need"]
@@ -704,6 +775,7 @@ pub fn sync(
         solution: guid.to_string(),
         files,
         crashed,
+        extractor: zam_code::EXTRACT_VERSION,
     };
     let io = |e: std::io::Error| CliError::config(format!("кэш карты кода: {e}"));
     new_state.save(root).map_err(io)?;
@@ -717,6 +789,17 @@ pub fn sync(
     .map_err(io)?;
     report.ms = started.elapsed().as_millis();
     Ok(report)
+}
+
+/// Файлов в карте решения на сервере (`GET /code/status`) — для предохранителя без локального
+/// состояния; карты нет или ответ не получен — 0 (ошибку сети покажет сама синхронизация).
+fn server_files(ctx: &Ctx, guid: &str) -> usize {
+    ctx.client
+        .get("/code/status", &[("solution", guid)])
+        .and_then(read_json)
+        .ok()
+        .and_then(|v| v["files"].as_u64())
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
 }
 
 /// Имя решения для регистрации: из `solution.toml`, иначе GUID.
@@ -830,6 +913,47 @@ mod tests {
             mask_sig(&format!("const K = \"{tok}\";"), None),
             "const K = \"‹secret›\";"
         );
+    }
+
+    /// Ревью задачи 5, M8: `ASIA…`, `hf_`, `npm_`, `SG.`, пароль в URL — маскируются; длинные
+    /// имена и пути в сигнатуре — нет.
+    #[test]
+    fn sig_masks_more_prefixes_not_identifiers() {
+        let rnd = |n: usize, seed: u64| -> String {
+            const A: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+            let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (0..n)
+                .map(|_| {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    A[((x >> 33) % 62) as usize] as char
+                })
+                .collect()
+        };
+        let up = rnd(16, 1).to_ascii_uppercase();
+        for secret in [
+            format!("AS{}{up}", "IA"),
+            format!("hf_{}", rnd(34, 2)),
+            format!("npm_{}", rnd(36, 3)),
+            format!("SG.{}.{}", rnd(22, 4), rnd(43, 5)),
+        ] {
+            let s = mask_sig(&format!("const K = \"{secret}\";"), None);
+            assert_eq!(s, "const K = \"‹secret›\";", "{secret}");
+        }
+        let s = mask_sig("const DSN = \"postgres://admin:s3cr3tpw@db/app\";", None);
+        assert!(
+            !s.contains("s3cr3tpw") && s.contains("admin:‹secret›@"),
+            "{s}"
+        );
+        for sig in [
+            "pub fn handle_incoming_websocket_message_v2(&self) -> Result<(), Error>",
+            "export function useQueryClientInvalidationOnMount2x(): void",
+            "const VIEW = \"src/components/Button2/index_view.tsx\";",
+            "fn hf_model_loader_from_pretrained_v2(npm_package_version: &str)",
+        ] {
+            assert_eq!(mask_sig(sig, None), sig);
+        }
     }
 
     #[test]

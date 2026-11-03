@@ -79,6 +79,19 @@ fn detects_each_rule() {
         one(&format!("AI{}{}", "za", rnd(35, 8))),
         SecretKind::KnownPrefix("google")
     ));
+    // Hugging Face, npm, SendGrid (ревью задачи 5 M5.6, M8)
+    assert!(matches!(
+        one(&format!("token {}{}", "hf_", rnd(34, 30))),
+        SecretKind::KnownPrefix("huggingface")
+    ));
+    assert!(matches!(
+        one(&format!("authToken {}{}", "npm_", rnd(36, 31))),
+        SecretKind::KnownPrefix("npm")
+    ));
+    assert!(matches!(
+        one(&format!("key {}.{}.{}", "SG", rnd(22, 32), rnd(43, 33))),
+        SecretKind::KnownPrefix("sendgrid")
+    ));
     // токен ZeroAIMemory (формат zam_core::token)
     let zam = format!("za{}_{}", "m", rnd(40, 9));
     assert!(matches!(
@@ -143,6 +156,10 @@ fn ignores_identifiers() {
         "password: $DB_PASSWORD".to_string(),
         "src/components/UserProfileCard/Details2/ProfileCardDetailsView.tsx".to_string(),
         "ВерблюжийРегистрДлинныйИдентификаторБезЦифр".to_string(),
+        // имена с префиксами новых правил — не секреты
+        "fn hf_model_loader_from_pretrained_v2() npm_package_version SG.Config.load".to_string(),
+        "pub fn handle_incoming_websocket_message_v2(&self) -> useQueryClientInvalidationOnMount2x"
+            .to_string(),
         "обычный текст про токены и пароли: без значений".to_string(),
     ];
     for s in &samples {
@@ -362,6 +379,9 @@ proptest! {
                 "[A-Za-z0-9=]{32,60}",
                 Just("postgres://u:pw12345@h/".to_string()),
                 Just(SECRET_MARK.to_string()),
+                Just(format!("hf_{}", rnd(34, 40))),
+                Just(format!("SG.{}.{}", rnd(22, 41), rnd(43, 42))),
+                Just(format!("npm_{}", rnd(36, 43))),
             ],
             0..12,
         )
