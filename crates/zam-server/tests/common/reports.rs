@@ -6,6 +6,7 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
+use zam_server::config::ServerConfig;
 use zam_store::{EntryAttachment, entry_attachments, get_entry};
 
 use super::api::{Api, Resp, api, req};
@@ -136,7 +137,12 @@ pub async fn share(a: &Api, guid: &str, owner: &str, member: &User, access: &str
 }
 
 pub async fn world(name: &str) -> W {
-    let a = api(name, |_| {}).await;
+    world_cfg(name, |_| {}).await
+}
+
+/// Мир с правкой конфигурации сервера.
+pub async fn world_cfg(name: &str, tweak: impl FnOnce(&mut ServerConfig)) -> W {
+    let a = api(name, tweak).await;
     let o = ready_user(&a, "Анна", "10.0.0.1").await;
     let rw = ready_user(&a, "Борис", "10.0.0.2").await;
     let ro = ready_user(&a, "Вера", "10.0.0.3").await;
@@ -196,9 +202,23 @@ pub const BODY: &str = "# Итог\n\n![loss](figs/loss.png)\n\n![схема](di
 impl W {
     /// Отчёт агентом владельца (multipart, как `zam report`): id.
     pub async fn report_with(&self, title: &str, body: &str, files: &[(&str, &[u8])]) -> String {
+        let r = self.report_as(&self.o.tok, G, title, body, files).await;
+        ok(&r, StatusCode::CREATED, "отчёт");
+        r.json()["id"].as_str().unwrap().to_string()
+    }
+
+    /// Отчёт токеном `tok` в пространство `space` (multipart): ответ как есть.
+    pub async fn report_as(
+        &self,
+        tok: &str,
+        space: &str,
+        title: &str,
+        body: &str,
+        files: &[(&str, &[u8])],
+    ) -> Resp {
         let meta = json!({"title": title, "body": body, "tags": ["ml"]});
-        let r = Request::post(format!("/api/v1/spaces/{G}/entries"))
-            .header(header::AUTHORIZATION, format!("Bearer {}", self.o.tok))
+        let r = Request::post(format!("/api/v1/spaces/{space}/entries"))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={BOUNDARY}"),
@@ -207,9 +227,7 @@ impl W {
             .header("x-zam-machine", "gpu-box")
             .body(Body::from(multipart(&meta, files)))
             .unwrap();
-        let r = self.a.send(r).await;
-        ok(&r, StatusCode::CREATED, "отчёт");
-        r.json()["id"].as_str().unwrap().to_string()
+        self.a.send(r).await
     }
 
     /// Полный отчёт: картинка PNG, SVG и CSV.

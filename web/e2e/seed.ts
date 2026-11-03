@@ -1,5 +1,7 @@
 // Тестовые заметки E2E: создаются через REST API по первому токену администратора.
 // Пространство Knowledge своего пользователя администратора, папка «E2E».
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 
 /** Код rust из заметки — то, что должна положить в буфер кнопка «Копировать». */
@@ -472,4 +474,63 @@ ${filler}
     ],
   );
   return { print, full, perf, trash, dup, task: task.id };
+}
+
+/** Заголовок отчёта приёмки M5.5, записанного настоящим `zam report` (спецификация §12 п. 1). */
+export const CLI_REPORT_TITLE = 'Отчёт E2E из zam report';
+export const CLI_NODE_A = 'Источник';
+export const CLI_NODE_B = 'Приёмник';
+
+const CLI_REPORT_BODY = `# ${CLI_REPORT_TITLE}
+
+Потери $L = -\\sum_i y_i \\log p_i$ падают, а площадь:
+
+$$
+\\int_0^1 x\\,dx = \\frac{1}{2}
+$$
+
+\`\`\`mermaid
+graph LR
+  A[${CLI_NODE_A}] --> B[${CLI_NODE_B}]
+\`\`\`
+
+![Потери](figs/loss.png)
+
+![Точность](figs/acc.png)
+
+![Шаг](figs/lr.png)
+`;
+
+/**
+ * Отчёт приёмки M5.5 командой `zam report` (release-бинарник `target/release/zam` или
+ * `E2E_ZAM`): проект в `.tmp/e2e/cli-report/w` с `solution.toml` решения E2E и тремя PNG рядом.
+ * Уровнем выше — файл `.git` (как в тестах CLI): корень проекта не поднимается до репозитория.
+ * Окружение — без `ZAM_*`, переменных агента и прокси; `HOME` — каталог проекта.
+ */
+export function seedCliReport(base: string, token: string, repo: string): string {
+  const exe = process.env.E2E_ZAM ?? `${repo}target/release/zam${process.platform === 'win32' ? '.exe' : ''}`;
+  if (!existsSync(exe)) throw new Error(`нет ${exe}: соберите cargo build --release -p zam-cli`);
+  const top = `${repo}.tmp/e2e/cli-report/`;
+  rmSync(top, { recursive: true, force: true });
+  const w = `${top}w/`;
+  mkdirSync(`${w}.zeroaimemory`, { recursive: true });
+  mkdirSync(`${w}figs`, { recursive: true });
+  writeFileSync(`${top}.git`, 'gitdir: ./zam-test-no-repo\n');
+  writeFileSync(
+    `${w}.zeroaimemory/solution.toml`,
+    `agent_solution_id = "${SOLUTION_GUID}"\nname = "${SOLUTION_NAME}"\n`,
+  );
+  writeFileSync(`${w}figs/loss.png`, makePng(300, 150));
+  writeFileSync(`${w}figs/acc.png`, makePng(280, 140));
+  writeFileSync(`${w}figs/lr.png`, makePng(260, 130));
+  writeFileSync(`${w}report.md`, CLI_REPORT_BODY);
+  const drop = /^(ZAM_|CLAUDE|CODEX|HTTPS?_PROXY$|ALL_PROXY$|NO_PROXY$)/i;
+  const env: NodeJS.ProcessEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !drop.test(k)),
+  );
+  Object.assign(env, { ZAM_URL: base.replace(/\/$/, ''), ZAM_TOKEN: token, HOME: w, USERPROFILE: w });
+  const out = execFileSync(exe, ['report', 'report.md', '--json'], { cwd: w, env, encoding: 'utf8' });
+  const { id } = JSON.parse(out) as { id: string };
+  if (!id) throw new Error(`zam report: нет id в ответе ${out}`);
+  return id;
 }

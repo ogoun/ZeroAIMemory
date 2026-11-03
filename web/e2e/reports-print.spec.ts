@@ -9,6 +9,9 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import {
+  CLI_NODE_A,
+  CLI_NODE_B,
+  CLI_REPORT_TITLE,
   PRINT_FILE,
   PRINT_LONG_CODE,
   PRINT_NODE_A,
@@ -137,12 +140,37 @@ test('print_waits_for_lazy_modules_images_fonts', async ({ page }) => {
 });
 
 test('print_svg_without_size_not_blocking', async ({ page }) => {
+  // ветка Firefox: SVG только с viewBox (без width/height) там даёт naturalWidth = 0 — Chromium
+  // подменяется геттером, растр не трогается
+  await page.addInitScript(() => {
+    const d = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'naturalWidth')!;
+    Object.defineProperty(HTMLImageElement.prototype, 'naturalWidth', {
+      configurable: true,
+      get(this: HTMLImageElement) {
+        return /\.svg$/i.test(new URL(this.src, location.href).pathname) ? 0 : d.get!.call(this);
+      },
+    });
+  });
   const call = await printed(page);
-  // SVG только с viewBox (без width/height) — печать вызвана, картинка в копии
+  // печать вызвана, картинка в копии, её naturalWidth — 0
   const svg = page.locator('.print-root img[src*="nosize.svg"]');
   await expect(svg).toHaveCount(1);
-  expect(await svg.evaluate((i: HTMLImageElement) => i.complete)).toBe(true);
+  expect(await svg.evaluate((i: HTMLImageElement) => [i.complete, i.naturalWidth])).toEqual([true, 0]);
   expect(call.imgs.length).toBe(4);
+});
+
+test('print_again_ready_copy_immediate', async ({ page }) => {
+  await printed(page);
+  // повторное нажатие: готовая копия того же отчёта печатается сразу, без пересборки и ожидания
+  // (пользовательская активация Safari не успевает истечь)
+  await page.locator('.print-root.ready').evaluate((r) => ((r as HTMLElement).dataset.mark = 'первая'));
+  // любые загрузки после клика держатся: печать не должна их ждать
+  await page.route(/\/assets\/|\/attachments\//, () => undefined);
+  await pdfButton(page).click();
+  expect(await page.evaluate(() => window.__printCalls.length)).toBe(2);
+  await expect(page.locator('.print-root')).toHaveCount(1);
+  await expect(page.locator('.print-root.ready')).toHaveAttribute('data-mark', 'первая');
+  await expect(pdfButton(page)).toBeEnabled();
 });
 
 test('print_not_called_when_image_fails', async ({ page }) => {
@@ -304,6 +332,46 @@ test('report_pdf_contains_images_formula_diagram', async ({ page }) => {
   // прочие файлы и ссылки — текстом
   expect(facts.text).toContain(PRINT_FILE);
   expect(facts.text).toContain(REPORT_COMMIT);
+});
+
+test('acceptance_pdf_from_cli_report', async ({ page }) => {
+  // приёмка M5.5 (спецификация §12 п. 1): отчёт записан настоящим `zam report` (global-setup) —
+  // страница в WebUI и PDF печатью браузера
+  const problems: string[] = [];
+  page.on('pageerror', (e) => problems.push(e.message));
+  await spyPrint(page);
+  if (!adminId) {
+    const r = await page.request.get(`${base()}api/v1/auth/me`);
+    adminId = ((await r.json()) as { user_id: string }).user_id;
+  }
+  const id = env('E2E_REPORT_CLI');
+  await page.goto(`${base()}#/u/${adminId}/s/${SOLUTION_GUID}/j/reports/${id}`);
+  const doc = page.locator(`article.report[data-report="${id}"] .doc`);
+  await expect(doc.locator('h1').first()).toContainText(CLI_REPORT_TITLE);
+  const imgs = doc.locator('img');
+  await expect(imgs).toHaveCount(3);
+  for (let i = 0; i < 3; i++) {
+    await expect(imgs.nth(i)).toHaveAttribute('src', /\/attachments\/[0-9a-f]{64}\/(loss|acc|lr)\.png$/);
+    await expect.poll(() => imgs.nth(i).evaluate((x: HTMLImageElement) => x.complete && x.naturalWidth > 0)).toBe(true);
+  }
+  await expect(doc.locator('.katex')).toHaveCount(2);
+  await expect(doc.locator('.mermaid-diagram svg')).toHaveCount(1);
+  await expect(doc.locator('.mermaid-diagram')).toContainText(CLI_NODE_A);
+  await pdfButton(page).click();
+  await expect.poll(() => page.evaluate(() => window.__printCalls.length), { timeout: 30_000 }).toBe(1);
+  const call = (await page.evaluate(() => window.__printCalls))[0];
+  expect(call.katex).toBe(2);
+  expect(call.diagrams).toBe(1);
+  expect(call.imgs).toEqual([true, true, true]);
+  const pdf = await page.pdf({ preferCSSPageSize: true });
+  writeFileSync(`${out}cli-report.pdf`, pdf);
+  const facts = await pdfFacts(pdf);
+  expect(facts.text).toContain(CLI_NODE_A);
+  expect(facts.text).toContain(CLI_NODE_B);
+  expect(facts.text).not.toContain('graph LR');
+  expect(facts.fonts.some((f) => f.includes('KaTeX')), facts.fonts.join(', ')).toBe(true);
+  expect(facts.images).toBeGreaterThanOrEqual(3);
+  expect(problems, problems.join('\n')).toEqual([]);
 });
 
 /** Текст, шрифты, число изображений и размеры страниц PDF (pdfjs-dist, без отрисовки). */

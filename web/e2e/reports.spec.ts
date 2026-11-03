@@ -124,8 +124,8 @@ test('reports_feed_date_author_tags_thumb_cursor', async ({ page }) => {
   const resp = await more;
   const body = (await resp.json()) as { items: Record<string, unknown>[] };
   expect(body.items.every((x) => !('body' in x))).toBe(true);
-  // + полный, «perf», корзина, «два раздела», печатный (reports-print.spec)
-  await expect(cards).toHaveCount(REPORT_BULK + 5);
+  // + полный, «perf», корзина, «два раздела», печатный (reports-print.spec), из `zam report`
+  await expect(cards).toHaveCount(REPORT_BULK + 6);
   await expect(page.getByRole('button', { name: 'Показать ещё' })).toHaveCount(0);
   expect(problems, problems.join('\n')).toEqual([]);
 });

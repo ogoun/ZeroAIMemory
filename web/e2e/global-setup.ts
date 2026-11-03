@@ -6,7 +6,7 @@ import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { request } from '@playwright/test';
-import { seed, seedJournals, seedReports, type AdminCall } from './seed';
+import { seed, seedCliReport, seedJournals, seedReports, type AdminCall } from './seed';
 import { seedDocs } from './seed-docs';
 import { ADMIN_STATE } from './session';
 
@@ -120,6 +120,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       return (await resp.json()) as T;
     };
     const journals = await seedJournals(base, token, admin);
+    // отчёт настоящим `zam report` — первым в журнале: лента (reports.spec) ждёт полный последним
+    const cliReport = seedCliReport(base, token, repo);
     const reports = await seedReports(base, token, ids.media);
     const docs = await seedDocs(base, token);
     await rc.storageState({ path: ADMIN_STATE });
@@ -145,6 +147,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_REPORT_TRASH = reports.trash;
     process.env.E2E_REPORT_DUP = reports.dup;
     process.env.E2E_REPORT_TASK = reports.task;
+    process.env.E2E_REPORT_CLI = cliReport;
   } catch (e) {
     child.kill();
     log.end();

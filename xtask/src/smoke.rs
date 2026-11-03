@@ -938,6 +938,10 @@ pub fn run(
         docs_previews(&base, &token, &att).map_err(|e| with_log(e, &srv)),
     )?;
     s.run(
+        "M5.5: zam report с картинкой → лента по cookie → файл картинки 200",
+        report_feed(&zam, &dir, &base, &token).map_err(|e| with_log(e, &srv)),
+    )?;
+    s.run(
         "Qdrant запущен сервером (pid-файл, qdrant status --json)",
         qdrant_alive(&env, &root, &data).and_then(|(alive, j)| {
             if alive {
@@ -2393,6 +2397,90 @@ fn docs_read(
                 h.id
             );
         }
+    }
+    Ok(())
+}
+
+/// PNG 1×1 (красный пиксель) — картинка отчёта smoke-теста.
+const SMOKE_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+    0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+    0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// Критерий M5.5 (спецификация §12, smoke комплекта): `zam report` с картинкой рядом с файлом
+/// отчёта → отчёт в ленте журнала «Отчёты» по cookie администратора (миниатюра — эта картинка) →
+/// файл картинки по адресу ленты — 200 с теми же байтами; токену журнал отчётов не отдаётся (400).
+fn report_feed(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let home = dir.join("report-home");
+    fs::create_dir_all(home.join("figs"))?;
+    fs::write(home.join("figs").join("dot.png"), SMOKE_PNG)?;
+    fs::write(
+        home.join("report.md"),
+        "# Smoke report\n\nOne red pixel:\n\n![dot](figs/dot.png)\n",
+    )?;
+    let out = zam_ok(
+        zam,
+        &home,
+        base,
+        token,
+        &[
+            "report",
+            "report.md",
+            "--solution",
+            SMOKE_SOLUTION,
+            "--json",
+        ],
+        None,
+    )?;
+    let v: Value = serde_json::from_slice(&out.stdout).context("zam report --json: не JSON")?;
+    let id = v["id"].as_str().context("zam report --json: нет id")?;
+    if !v["url"]
+        .as_str()
+        .is_some_and(|u| u.ends_with(&format!("/j/reports/{id}")))
+    {
+        bail!("zam report --json: адрес не на страницу отчёта: {v}");
+    }
+    let feed = format!("/api/v1/spaces/{SMOKE_SOLUTION}/entries?kind=report");
+    let (status, _) = api(base, token, &feed, None)?;
+    if status != 400 {
+        bail!("GET {feed} токеном: HTTP {status}, ожидался 400 (отчёты агенту не отдаются)");
+    }
+    let AdminSession { cookie, .. } = admin_login(base)?;
+    let a = agent();
+    let mut r = a
+        .get(&format!("{base}{feed}"))
+        .header("Cookie", &cookie)
+        .call()?;
+    let status = r.status().as_u16();
+    let text = r.body_mut().read_to_string()?;
+    if status != 200 {
+        bail!("GET {feed} по cookie: HTTP {status}: {text}");
+    }
+    let v: Value = serde_json::from_str(&text).with_context(|| format!("{feed}: не JSON"))?;
+    let item = v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["id"] == id)
+        .with_context(|| format!("отчёта {id} нет в ленте: {text}"))?;
+    let url = item["first_image"]["url"]
+        .as_str()
+        .with_context(|| format!("у отчёта в ленте нет first_image: {item}"))?;
+    let mut r = a
+        .get(&format!("{base}/{url}"))
+        .header("Cookie", &cookie)
+        .call()?;
+    let status = r.status().as_u16();
+    let bytes = r.body_mut().read_to_vec()?;
+    if status != 200 || bytes != SMOKE_PNG {
+        bail!(
+            "GET /{url}: HTTP {status}, {} байт (ожидалась картинка отчёта, {} байт)",
+            bytes.len(),
+            SMOKE_PNG.len()
+        );
     }
     Ok(())
 }
