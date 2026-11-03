@@ -1206,7 +1206,8 @@ export type HookKind =
   | 'subagent_start'
   | 'file_context'
   | 'session_journal'
-  | 'recovery';
+  | 'recovery'
+  | 'code_map';
 export const HOOK_KINDS: HookKind[] = [
   'session_start',
   'prompt',
@@ -1217,6 +1218,7 @@ export const HOOK_KINDS: HookKind[] = [
   'file_context',
   'session_journal',
   'recovery',
+  'code_map',
 ];
 export type HookFlags = Record<HookKind, boolean>;
 

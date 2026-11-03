@@ -1,4 +1,4 @@
-//! MCP `/mcp` (§13.1, задача 9 M4): streamable HTTP без сессий, bearer, 10 инструментов поверх
+//! MCP `/mcp` (§13.1, задача 9 M4): streamable HTTP без сессий, bearer, 11 инструментов поверх
 //! REST (решение R12: внутренний `Router` с исходными заголовками), ошибки сервиса —
 //! `isError: true`, область решения и участника, раскрытие Vault с аудитом.
 //!
@@ -15,7 +15,7 @@ const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e77";
 const SESSION: &str = "mcp-session-1";
 const MACHINE: &str = "mcp-box";
 
-const TOOLS: [&str; 10] = [
+const TOOLS: [&str; 11] = [
     "memory_search",
     "memory_read",
     "memory_cache_put",
@@ -26,6 +26,7 @@ const TOOLS: [&str; 10] = [
     "memory_link",
     "memory_recall",
     "memory_vault",
+    "memory_code",
 ];
 
 /// JSON-RPC к `/mcp`: `auth` — значение `Authorization` (или без него), `extra` — заголовки.
@@ -1116,13 +1117,26 @@ fn mcp_vault_value_not_in_debug_log() {
     assert!(!srv.tail().contains(value), "значение Vault в stderr");
 }
 
-/// M4.5 (принцип 0.2): новые виды и действия идут через прежние инструменты — их по-прежнему
-/// 10; инструкция `initialize` называет рабочую память.
+/// M4.5 (принцип 0.2): новые виды и действия идут через прежние инструменты; M5.6 (§9, решение
+/// §15 п. 3) — 11-й инструмент `memory_code`. Инструкция `initialize` называет рабочую память.
 #[tokio::test]
-async fn mcp_tool_count_still_10() {
-    let a = api("mcp-count-m45", |_| {}).await;
+async fn mcp_tool_count_11() {
+    let a = api("mcp-count-m56", |_| {}).await;
     let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
-    assert_eq!(list["tools"].as_array().unwrap().len(), 10, "{list}");
+    assert_eq!(list["tools"].as_array().unwrap().len(), 11, "{list}");
+    let code = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_code")
+        .unwrap_or_else(|| panic!("нет memory_code: {list}"));
+    assert_eq!(code["annotations"]["readOnlyHint"], true, "{code}");
+    assert_eq!(
+        code["inputSchema"]["properties"]["action"]["enum"],
+        json!(["map", "symbol", "refs", "impact"]),
+        "{code}"
+    );
+    assert_eq!(code["inputSchema"]["required"], json!(["action"]), "{code}");
     let init = rpc(
         &a,
         &a.token,
@@ -1166,7 +1180,7 @@ async fn mcp_descriptions_under_300() {
             d.chars().count()
         );
     }
-    let need: [(&str, &[&str]); 6] = [
+    let need: [(&str, &[&str]); 7] = [
         (
             "memory_log",
             &[
@@ -1198,6 +1212,10 @@ async fn mcp_descriptions_under_300() {
         ),
         ("memory_link", &["contradicts"]),
         ("memory_vault", &["host", "environment"]),
+        (
+            "memory_code",
+            &["map", "focus", "symbol", "refs", "impact", "путь#qual"],
+        ),
     ];
     for (tool, words) in need {
         let d = desc(tool);
@@ -1397,13 +1415,13 @@ async fn mcp_answer_requires_by() {
 
 /// M5, задача 7: `memory_read` читает вложение по `locator` (`locator` — в схеме элемента,
 /// описание упоминает `a:`, `b:` и `locator`, до 300 символов); `locator` у заметки — ошибка
-/// инструмента с `locator-invalid`; инструментов по-прежнему 10.
+/// инструмента с `locator-invalid`; инструментов 10 (с M5.6 — 11: `memory_code`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mcp_read_locator() {
     let a = api("mcp-read-locator", |_| {}).await;
     let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
     let tools = list["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 10, "{list}");
+    assert_eq!(tools.len(), 11, "{list}");
     let t = tools.iter().find(|t| t["name"] == "memory_read").unwrap();
     let props = &t["inputSchema"]["properties"]["items"]["items"]["properties"];
     assert_eq!(props["locator"]["type"], "string", "{t}");
@@ -1783,4 +1801,400 @@ async fn mcp_aborted_big_request_keeps_permit_until_tool_done() {
         at_release,
         "инструмент записал отчёт после освобождения разрешения"
     );
+}
+
+// ---- memory_code (M5.6 §9, §17 п. 11) ----
+
+/// Символ карты: `qual` вида `kind` в строке `line`, тело — по строке.
+fn code_sym(qual: &str, kind: &str, line: u32) -> Value {
+    let name = qual.rsplit("::").next().unwrap();
+    json!({"name": name, "qual": qual, "kind": kind, "line": line, "end_line": line + 2,
+           "sig": format!("fn {qual}()"), "body_hash": format!("{line:016x}"), "exported": true})
+}
+
+/// Файл загрузки карты: путь, номер хэша, символы, ссылки `(name, count)`.
+fn code_file(path: &str, n: u64, symbols: Vec<Value>, refs: &[(&str, u32)]) -> Value {
+    let refs: Vec<Value> = refs
+        .iter()
+        .map(|(name, count)| json!({"name": name, "kind": "call", "count": count, "first_line": 1}))
+        .collect();
+    json!({"path": path, "lang": "rust", "hash": format!("{n:064x}"), "size": 100,
+           "parse_state": "ok", "symbols": symbols, "refs": refs})
+}
+
+async fn code_put(a: &Api, files: Vec<Value>) {
+    let r = a
+        .t(
+            Method::PUT,
+            "/api/v1/code/files",
+            Some(
+                json!({"solution": G, "commit": "abcdef1", "branch": "main", "machine": "box",
+                        "files": files}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "загрузка карты: {}", r.text());
+}
+
+/// Решение `G` с картой: `a.rs` — `foo`, `bar`, `baz` (ссылается на `helper`), `b.rs`
+/// ссылается на `foo` ×3, `c.rs` — на `baz`; заметки о `a.rs#foo` и `a.rs#bar`, insight о файле
+/// `a.rs`.
+struct CodeWorld {
+    a: Api,
+    foo_note: String,
+    bar_note: String,
+    insight: String,
+}
+
+async fn code_world(name: &str) -> CodeWorld {
+    let a = api(&format!("mcp-code-{name}"), |_| {}).await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    code_put(
+        &a,
+        vec![
+            code_file(
+                "a.rs",
+                1,
+                vec![
+                    code_sym("foo", "function", 1),
+                    code_sym("bar", "function", 10),
+                    code_sym("baz", "function", 20),
+                ],
+                &[("helper", 1)],
+            ),
+            code_file(
+                "b.rs",
+                2,
+                vec![code_sym("user_b", "function", 1)],
+                &[("foo", 3)],
+            ),
+            code_file(
+                "c.rs",
+                3,
+                vec![code_sym("user_c", "function", 1)],
+                &[("baz", 1)],
+            ),
+        ],
+    )
+    .await;
+    let note = |path: &'static str, r: &'static str| {
+        let a = &a;
+        async move {
+            let n = a
+                .note(
+                    G,
+                    path,
+                    &format!("---\nrefs: [\"{r}\"]\n---\nтекст о коде\n"),
+                )
+                .await;
+            n["id"].as_str().unwrap().to_string()
+        }
+    };
+    let foo_note = note("О foo", "a.rs#foo").await;
+    let bar_note = note("О bar", "a.rs#bar").await;
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/spaces/{G}/entries"),
+            Some(
+                json!({"kind": "insight", "title": "Файл a.rs", "body": "о файле a.rs",
+                        "data": {"kind": "gotcha"}, "refs": {"files": [{"path": "a.rs"}]},
+                        "force": true}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let insight = r.json()["id"].as_str().unwrap().to_string();
+    CodeWorld {
+        a,
+        foo_note,
+        bar_note,
+        insight,
+    }
+}
+
+const SOL: [(&str, &str); 1] = [("x-zam-solution", G)];
+
+/// Текст ответа без строк `> warning:` и `~N tok` в конце.
+fn body_of(text: &str) -> String {
+    let mut lines: Vec<&str> = text.trim_end().lines().collect();
+    while lines
+        .last()
+        .is_some_and(|l| l.starts_with("> warning:") || (l.starts_with('~') && l.ends_with(" tok")))
+    {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// §17 п. 11: `memory_code action=map` — та же карта, что `GET /code/map` (текст до строки
+/// `~N tok`), в том числе с бюджетом, фокусом и областью; `format: json` — JSON ответа REST.
+#[tokio::test]
+async fn mcp_code_map_same_as_rest() {
+    let w = code_world("map").await;
+    let a = &w.a;
+    let rest_text = |q: String| async move {
+        let r = a
+            .t(
+                Method::GET,
+                &format!("/api/v1/code/map?solution={G}{q}"),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        r.json()["text"].as_str().unwrap().to_string()
+    };
+    let focus = json!({"paths": ["b.rs"], "idents": ["foo"]});
+    for (args, q) in [
+        (json!({"action": "map"}), String::new()),
+        (
+            json!({"action": "map", "budget_tokens": 200}),
+            "&budget_tokens=200".to_string(),
+        ),
+        (
+            json!({"action": "map", "focus": focus, "budget_tokens": 500}),
+            format!(
+                "&budget_tokens=500&focus={}",
+                common::api::enc(&focus.to_string())
+            ),
+        ),
+        (
+            json!({"action": "map", "path": "a.rs"}),
+            "&area=a.rs".to_string(),
+        ),
+    ] {
+        let o = ok(a, &a.token, &SOL, "memory_code", args.clone()).await;
+        let want = rest_text(q).await;
+        assert!(want.starts_with("# Карта кода: 3 файла"), "{want}");
+        assert_eq!(body_of(&o.text), want.trim_end(), "{args}");
+    }
+    // фокус называет заголовок; JSON — как у REST
+    let o = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "map", "focus": {"paths": ["b.rs"]}, "format": "json"}),
+    )
+    .await;
+    let j = o.json();
+    assert_eq!(j["format"], "json", "{j}");
+    assert!(j["header"].as_str().unwrap().contains("с фокусом"), "{j}");
+    assert_eq!(j["files"][0]["path"], "b.rs", "{j}");
+    // неверный action и фокус — ошибка инструмента, а не JSON-RPC
+    for bad in [
+        json!({}),
+        json!({"action": "graph"}),
+        json!({"action": "map", "focus": "b.rs"}),
+    ] {
+        let o = tool(a, &a.token, &SOL, "memory_code", bad.clone()).await;
+        assert!(o.is_error, "{bad}: {}", o.text);
+    }
+}
+
+/// `symbol`: одно точное совпадение — карточка (определение, кто ссылается, знания о символе и
+/// файле, без чужого символа); `путь#qual` — та же карточка; несколько — список адресов;
+/// `refs` — только «кто ссылается».
+#[tokio::test]
+async fn mcp_code_symbol_card_and_refs() {
+    let w = code_world("symbol").await;
+    let a = &w.a;
+    let call = |args: Value| async move { ok(a, &a.token, &SOL, "memory_code", args).await.text };
+    let card = call(json!({"action": "symbol", "query": "foo"})).await;
+    for want in [
+        "`a.rs#foo`",
+        "function",
+        "fn foo()",
+        "b.rs ×3",
+        "helper",
+        w.foo_note.as_str(),
+        w.insight.as_str(),
+    ] {
+        assert!(card.contains(want), "{want}: {card}");
+    }
+    assert!(!card.contains(&w.bar_note), "чужой символ: {card}");
+    // знание о символе — раньше знания о файле
+    assert!(
+        card.find(&w.foo_note).unwrap() < card.find(&w.insight).unwrap(),
+        "{card}"
+    );
+    let by_ref = call(json!({"action": "symbol", "query": "a.rs#foo"})).await;
+    assert_eq!(body_of(&by_ref), body_of(&card));
+    // JSON карточки — ответ REST
+    let j = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "symbol", "query": "a.rs#foo", "format": "json"}),
+    )
+    .await
+    .json();
+    assert_eq!(j["symbol"]["ref"], "a.rs#foo", "{j}");
+    assert_eq!(j["callers"][0]["path"], "b.rs", "{j}");
+    // кто ссылается — без знаний и того, на что ссылается файл
+    let refs = call(json!({"action": "refs", "query": "foo"})).await;
+    assert!(
+        refs.contains("`a.rs#foo`") && refs.contains("b.rs ×3"),
+        "{refs}"
+    );
+    assert!(
+        !refs.contains(&w.foo_note) && !refs.contains("helper"),
+        "{refs}"
+    );
+    let none = call(json!({"action": "refs", "query": "a.rs#bar"})).await;
+    assert!(none.contains("не найдено"), "{none}");
+    // второй `foo` (метод) — два точных совпадения: список адресов, не карточка
+    code_put(
+        a,
+        vec![code_file(
+            "d.rs",
+            4,
+            vec![code_sym("Other::foo", "method", 5)],
+            &[],
+        )],
+    )
+    .await;
+    let list = call(json!({"action": "symbol", "query": "foo"})).await;
+    assert!(
+        list.contains("`a.rs#foo`") && list.contains("`d.rs#Other::foo`"),
+        "{list}"
+    );
+    assert!(!list.contains(&w.foo_note), "список без знаний: {list}");
+    // path сужает до одного — карточка
+    let one = call(json!({"action": "symbol", "query": "foo", "path": "d.rs"})).await;
+    assert!(
+        one.contains("`d.rs#Other::foo`") && one.contains("method"),
+        "{one}"
+    );
+    assert!(!one.contains("`a.rs#foo`"), "{one}");
+    // нет символа — не ошибка; без query — ошибка аргументов
+    let t = call(json!({"action": "symbol", "query": "nope_xyz"})).await;
+    assert!(t.contains("не найден"), "{t}");
+    let t = call(json!({"action": "symbol", "query": "a.rs#nope_xyz"})).await;
+    assert!(t.contains("не найден"), "{t}");
+    let o = tool(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "symbol"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+}
+
+/// `impact` по MCP: путь без хэшей символов — все знания пути; `files` с символами — изменённые,
+/// удалённые и потребители на 1 шаг.
+#[tokio::test]
+async fn mcp_code_impact_paths_without_hashes() {
+    let w = code_world("impact").await;
+    let a = &w.a;
+    let o = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "impact", "path": "a.rs"}),
+    )
+    .await
+    .text;
+    for want in [&w.foo_note, &w.bar_note, &w.insight] {
+        assert!(o.contains(want.as_str()), "{want}: {o}");
+    }
+    // foo — другое тело, bar — то же, baz — удалён
+    let o = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "impact", "files": [{"path": "a.rs", "symbols": [
+            {"qual": "foo", "body_hash": "ffffffffffffffff"},
+            {"qual": "bar", "body_hash": format!("{:016x}", 10)}]}]}),
+    )
+    .await;
+    let t = &o.text;
+    assert!(t.contains("`a.rs#foo`") && t.contains("`a.rs#baz`"), "{t}");
+    assert!(t.contains("b.rs") && t.contains("c.rs"), "потребители: {t}");
+    assert!(t.contains(&w.foo_note) && t.contains(&w.insight), "{t}");
+    assert!(!t.contains(&w.bar_note), "bar не изменён: {t}");
+    let j = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "impact", "path": "a.rs", "format": "json"}),
+    )
+    .await
+    .json();
+    assert_eq!(j["paths_only"], json!(["a.rs"]), "{j}");
+    // ни path, ни files — ошибка аргументов; без решения — ошибка
+    let o = tool(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "impact"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    let o = tool(
+        a,
+        &a.token,
+        &[],
+        "memory_code",
+        json!({"action": "impact", "path": "a.rs"}),
+    )
+    .await;
+    assert!(
+        o.is_error && o.text.contains("X-Zam-Solution"),
+        "{}",
+        o.text
+    );
+}
+
+/// Права — как у REST: токен `ro` владельца читает карту, символ и влияние; без решения в
+/// заголовке — 400 маршрута как ошибка инструмента; Knowledge — 422.
+#[tokio::test]
+async fn mcp_code_ro_token_reads() {
+    let w = code_world("ro").await;
+    let a = &w.a;
+    let ro = a.issue(&a.admin_id(), "ro").await;
+    for args in [
+        json!({"action": "map"}),
+        json!({"action": "symbol", "query": "foo"}),
+        json!({"action": "refs", "query": "a.rs#foo"}),
+        json!({"action": "impact", "path": "a.rs"}),
+    ] {
+        let o = ok(a, &ro, &SOL, "memory_code", args.clone()).await;
+        assert!(o.text.contains("a.rs"), "{args}: {}", o.text);
+    }
+    let o = tool(a, &ro, &[], "memory_code", json!({"action": "map"})).await;
+    assert!(o.is_error && o.text.contains("400"), "{}", o.text);
+    let o = tool(
+        a,
+        &ro,
+        &[("x-zam-solution", "knowledge")],
+        "memory_code",
+        json!({"action": "map"}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("422"), "{}", o.text);
+}
+
+/// Инструкция `initialize` называет карту кода одной фразой.
+#[tokio::test]
+async fn mcp_initialize_mentions_memory_code() {
+    let a = api("mcp-init-code", |_| {}).await;
+    let init = rpc(
+        &a,
+        &a.token,
+        &[],
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "test", "version": "1"}}),
+    )
+    .await;
+    let s = init["instructions"].as_str().unwrap_or_default();
+    assert!(s.contains("карта кода — memory_code"), "{s}");
 }

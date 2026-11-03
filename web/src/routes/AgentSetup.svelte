@@ -55,6 +55,7 @@
     file_context: 'Знание о файле перед правкой и после чтения (PreToolUse, PostToolUse)',
     session_journal: 'Журнал сессии и подсказки по нему (PostToolUse)',
     recovery: 'Восстановление после сжатия контекста и возобновления (SessionStart)',
+    code_map: 'Карта кода: строка в дайджесте, раздел «Код» брифа, фоновая синхронизация',
   };
 
   /** Выбранный пользователь; пусто — свой. */
@@ -380,7 +381,8 @@
     сессии; выключить тип можно и в <code>[hooks]</code> файла <code>config.toml</code> клиента — тип
     выключен, если выключен хотя бы где-то. Выключатели касаются только хуков: явный вызов MCP
     <code>memory_recall</code> с <code>event=recovery</code> или <code>event=brief</code> они не гасят
-    (<code>hooks.recovery</code> не действует на <code>memory_recall event=recovery</code>).
+    (<code>hooks.recovery</code> не действует на <code>memory_recall event=recovery</code>), а
+    <code>hooks.code_map</code> — на <code>memory_code</code> и <code>zam code</code>.
   </p>
   {#if flagsError}<p class="error" role="alert">{flagsError}</p>{/if}
   {#if flags}
