@@ -1,8 +1,9 @@
 /*
  * Печать отчёта (M5.5, спецификация §9; lib/print.ts). На экране `.print-root` невидим, но
- * раскладывается (шрифты KaTeX и картинки загружаются); при печати виден только он: A4, поля,
- * светлые цвета при любой теме ОС (тёмные токены app.css — только для screen), разрывы страниц
- * не режут картинки, формулы, диаграммы и строки таблиц, длинный код переносится.
+ * раскладывается (шрифты KaTeX и картинки загружаются); при печати видна только готовая копия
+ * (`.print-root.ready`): A4, поля, светлые цвета при любой теме ОС (тёмные токены app.css —
+ * только для screen), разрывы страниц не режут картинки, формулы, диаграммы и строки таблиц,
+ * длинный код переносится.
  */
 @media screen {
   .print-root {
@@ -29,13 +30,46 @@
   body {
     background: #ffffff;
   }
-  /* печатается только контейнер; без него (Ctrl+P на любой странице) — страница как есть */
-  body:has(> .print-root) > :not(.print-root) {
+  /*
+   * Печатается только готовая копия (`.ready`); недогруженная копия (Ctrl+P во время подготовки)
+   * в печати не участвует — тогда печатается страница отчёта без навигации и кнопок
+   * (ReportView.svelte, свой `@media print`).
+   */
+  body:has(> .print-root.ready) > :not(.print-root) {
+    display: none !important;
+  }
+  .print-root:not(.ready) {
     display: none !important;
   }
   .print-root {
     color: var(--text);
     font: 11pt/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  /* размеры текста печати — явно: экранные `.doc { font-size: 16px }` и мобильные правила
+     doc.css (max-width: 719px — ширина листа в CSS-пикселях меньше) на бумагу не переносятся */
+  .print-root .doc {
+    font-size: 11pt;
+    line-height: 1.5;
+  }
+  .print-root .doc h1 {
+    font-size: 18pt;
+  }
+  .print-root .doc h2 {
+    font-size: 14pt;
+  }
+  .print-root .doc h3 {
+    font-size: 12pt;
+  }
+  .print-root .doc h4,
+  .print-root .doc h5,
+  .print-root .doc h6 {
+    font-size: 11pt;
+  }
+  .print-root .doc pre code {
+    font-size: 9pt;
+  }
+  .print-root .doc table {
+    font-size: 10pt;
   }
   .print-root button,
   .print-root nav,

@@ -43,6 +43,13 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Стили подсветки кода сервера (кэш — сутки, `render.rs`): версия в адресе сбрасывает кэш
+ * браузера при смене CSS. Поднимать вместе с `zam_markdown::highlight_css` (v2 — тёмная тема
+ * только для screen, M5.5).
+ */
+export const HIGHLIGHT_CSS = 'api/v1/render/highlight.css?v=2';
+
 // CSRF-токен живёт только в памяти (приходит в ответе на вход).
 let csrf = '';
 

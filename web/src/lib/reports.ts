@@ -1,4 +1,4 @@
-// Общее для ленты, страницы и печати отчётов (M5.5): автор, размер файла, ссылки `data.refs`.
+// Общее для ленты и страницы отчётов (M5.5): автор, размер файла, ссылки `data.refs`.
 import type { AuthorView, SearchItem } from './api';
 import { AUTHOR_TEXT } from './journals';
 

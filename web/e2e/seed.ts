@@ -336,6 +336,8 @@ export const PRINT_NODE_B = 'Декодер';
 /** Строка кода без пробелов длиннее ширины A4: на бумаге переносится. */
 export const PRINT_LONG_CODE = 'x'.repeat(30) + '_' + 'y'.repeat(300);
 export const PRINT_FILE = 'raw-data.csv';
+/** SVG без собственных размеров (только `viewBox`): печать его не блокирует. */
+const SVG_NOSIZE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 40"><rect width="100" height="40" fill="#58a"/></svg>';
 
 const PRINT_BODY = `# ${PRINT_TITLE}
 
@@ -351,6 +353,10 @@ $$
 
 ![Третья](p3.png)
 
+![Без размеров](nosize.svg)
+
+Пояснение к метрике[^f1].
+
 | шаг | значение |
 |----:|---------:|
 ${Array.from({ length: 40 }, (_, i) => `| ${i + 1} | ${(i * 0.25).toFixed(2)} |`).join('\n')}
@@ -365,6 +371,8 @@ graph LR
 \`\`\`
 
 Исходные замеры — [${PRINT_FILE}](${PRINT_FILE}).
+
+[^f1]: F1 — среднее гармоническое точности и полноты.
 `;
 
 export interface ReportSeed {
@@ -411,6 +419,7 @@ export async function seedReports(base: string, token: string, noteId: string): 
       ['p1.png', 'image/png', makePng(320, 160)],
       ['p2.png', 'image/png', makePng(300, 150)],
       ['p3.png', 'image/png', makePng(280, 140)],
+      ['nosize.svg', 'image/svg+xml', SVG_NOSIZE],
       [PRINT_FILE, 'text/csv', 'step,value\n1,0.5\n'],
     ],
   );

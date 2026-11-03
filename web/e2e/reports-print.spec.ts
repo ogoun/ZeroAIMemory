@@ -56,9 +56,11 @@ async function spyPrint(page: Page) {
       window.__printCalls.push({
         katex: root?.querySelectorAll('.katex').length ?? 0,
         diagrams: root?.querySelectorAll('.mermaid-diagram svg').length ?? 0,
-        imgs: [...(root?.querySelectorAll('img') ?? [])].map(
-          (i) => (i as HTMLImageElement).complete && (i as HTMLImageElement).naturalWidth > 0,
-        ),
+        // загружена: растр — с шириной, SVG без размеров может иметь naturalWidth = 0 (Firefox)
+        imgs: [...(root?.querySelectorAll('img') ?? [])].map((x) => {
+          const i = x as HTMLImageElement;
+          return i.complete && (i.naturalWidth > 0 || /\.svg$/.test(new URL(i.src).pathname));
+        }),
         fontsLoading: fonts.filter((f) => f.status === 'loading').length,
         katexFontsLoaded: fonts.filter((f) => f.family.includes('KaTeX') && f.status === 'loaded').length,
       });
@@ -88,35 +90,70 @@ async function printed(page: Page): Promise<PrintCall> {
   return (await page.evaluate(() => window.__printCalls))[0];
 }
 
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const KATEX_CHUNK = /\/assets\/katex-[\w-]+\.js$/;
 const MERMAID_CHUNK = /\/assets\/mermaid-[\w-]+\.js$/;
 
 test('print_waits_for_lazy_modules_images_fonts', async ({ page }) => {
-  // чанки KaTeX и Mermaid, шрифты KaTeX и одна картинка — на 1,5 с позже
-  const slow = async (route: import('@playwright/test').Route) => {
-    await delay(1500);
+  // «ворота»: чанки KaTeX и Mermaid, шрифты KaTeX и одна картинка держатся до отпускания
+  let open!: () => void;
+  const gate = new Promise<void>((r) => (open = r));
+  const held = async (route: import('@playwright/test').Route) => {
+    await gate;
     await route.continue();
   };
-  await page.route(KATEX_CHUNK, slow);
-  await page.route(MERMAID_CHUNK, slow);
-  await page.route(/\/assets\/KaTeX_[\w-]+\.woff2$/, slow);
-  await page.route(/\/attachments\/[0-9a-f]{64}\/p2\.png/, slow);
+  await page.route(KATEX_CHUNK, held);
+  await page.route(MERMAID_CHUNK, held);
+  await page.route(/\/assets\/KaTeX_[\w-]+\.woff2$/, held);
+  await page.route(/\/attachments\/[0-9a-f]{64}\/p2\.png/, held);
   await spyPrint(page);
   await openPrintReport(page);
-  const t0 = Date.now();
   await pdfButton(page).click();
   await expect(page.getByRole('button', { name: 'Готовлю PDF…' })).toBeDisabled();
+  // копия собрана, но не готова: печати нет, в печать (Ctrl+P) она не попадает — печатается
+  // страница отчёта без навигации и кнопок
+  await expect(page.locator('.print-root')).toHaveCount(1);
+  await expect(page.locator('.print-root')).not.toHaveClass(/\bready\b/);
+  await page.emulateMedia({ media: 'print' });
+  await expect(page.locator('.print-root')).toBeHidden();
+  await expect(page.locator('article.report .doc')).toBeVisible();
+  await expect(page.locator('.topbar, .sidebar')).toHaveCount(2);
+  for (const sel of ['.topbar', '.sidebar', 'article.report button']) {
+    await expect(page.locator(sel).first(), sel).toBeHidden();
+  }
+  await page.emulateMedia({ media: null });
+  await page.waitForTimeout(500);
+  expect(await page.evaluate(() => window.__printCalls.length)).toBe(0);
+  open();
   await expect.poll(() => page.evaluate(() => window.__printCalls.length), { timeout: 30_000 }).toBe(1);
-  expect(Date.now() - t0).toBeGreaterThanOrEqual(1000);
   const call = (await page.evaluate(() => window.__printCalls))[0];
-  // формулы (строчная и выключная), диаграмма, три картинки, шрифты KaTeX — к моменту печати
+  // формулы (строчная и выключная), диаграмма, картинки (три PNG и SVG без размеров), шрифты KaTeX
   expect(call.katex).toBe(2);
   expect(call.diagrams).toBe(1);
-  expect(call.imgs).toEqual([true, true, true]);
+  expect(call.imgs).toEqual([true, true, true, true]);
   expect(call.fontsLoading).toBe(0);
   expect(call.katexFontsLoaded).toBeGreaterThan(0);
   await expect(pdfButton(page)).toBeEnabled();
+  await expect(page.locator('.print-root.ready')).toHaveCount(1);
+});
+
+test('print_svg_without_size_not_blocking', async ({ page }) => {
+  const call = await printed(page);
+  // SVG только с viewBox (без width/height) — печать вызвана, картинка в копии
+  const svg = page.locator('.print-root img[src*="nosize.svg"]');
+  await expect(svg).toHaveCount(1);
+  expect(await svg.evaluate((i: HTMLImageElement) => i.complete)).toBe(true);
+  expect(call.imgs.length).toBe(4);
+});
+
+test('print_not_called_when_image_fails', async ({ page }) => {
+  await page.route(/\/attachments\/[0-9a-f]{64}\/p2\.png/, (route) => route.fulfill({ status: 404, body: 'нет' }));
+  await spyPrint(page);
+  await openPrintReport(page);
+  await pdfButton(page).click();
+  await expect(page.getByRole('status').filter({ hasText: 'PDF не готов:' })).toContainText('Вторая');
+  await expect(pdfButton(page)).toBeEnabled();
+  expect(await page.evaluate(() => window.__printCalls.length)).toBe(0);
+  await expect(page.locator('.print-root')).toHaveCount(0);
 });
 
 test('print_not_called_when_module_fails', async ({ page }) => {
@@ -184,8 +221,17 @@ test('print_layout_a4_no_nav_buttons', async ({ page }) => {
     expect(Math.abs(w - 595.28)).toBeLessThan(1.5);
     expect(Math.abs(h - 841.89)).toBeLessThan(1.5);
   }
-  // после печати контейнер убирается
+  // после печати копия остаётся (асинхронная печать, пересчёт предпросмотра, повторный Ctrl+P):
+  // на экране она невидима, в печати — снова отчёт
   await page.evaluate(() => window.dispatchEvent(new Event('afterprint')));
+  await expect(page.locator('.print-root.ready')).toHaveCount(1);
+  await expect(page.locator('.print-root')).toBeVisible();
+  await page.emulateMedia({ media: 'screen' });
+  await expect(page.locator('.print-root')).toBeHidden();
+  await expect(page.locator('#app')).toBeVisible();
+  expect(await page.locator('.print-root').evaluate((e) => getComputedStyle(e).visibility)).toBe('hidden');
+  // уход со страницы отчёта убирает копию
+  await page.locator('article.report a.back').click();
   await expect(page.locator('.print-root')).toHaveCount(0);
 });
 
@@ -203,6 +249,8 @@ test('print_breaks_avoid_inside', async ({ page }) => {
     expect(new Set(v), sel).toEqual(new Set(['avoid']));
   }
   expect(await css('.print-root thead', 'display')).toEqual(['table-header-group']);
+  // размер текста печати — явно (11pt), не экранные 16px `.doc` и не мобильные правила doc.css
+  expect(await css('.print-root .doc', 'font-size')).toEqual(['14.6667px']);
   expect(await css('.print-root .doc table', 'display')).toEqual(['table']);
   expect(new Set(await css('.print-root h1, .print-root h2', 'break-after'))).toEqual(new Set(['avoid']));
   // длинный код переносится, а не уходит за поле
@@ -223,6 +271,20 @@ test('print_refs_and_files_as_text', async ({ page }) => {
   await expect(files).toContainText('text/csv');
   // текстом, не ссылками
   await expect(page.locator('.print-root .print-refs a, .print-root .print-files a')).toHaveCount(0);
+  // id копии не повторяют id экрана, ссылки на сноски ведут внутрь копии
+  const ids = await page.evaluate(() => {
+    const inside = [...document.querySelectorAll('.print-root [id]')].map((e) => e.id);
+    const outside = new Set(
+      [...document.querySelectorAll('[id]')].filter((e) => !e.closest('.print-root')).map((e) => e.id),
+    );
+    const links = [...document.querySelectorAll<HTMLAnchorElement>('.print-root a[href^="#"]')].map((a) =>
+      decodeURIComponent(a.getAttribute('href')!.slice(1)),
+    );
+    return { dup: inside.filter((i) => outside.has(i)), links, inside };
+  });
+  expect(ids.dup).toEqual([]);
+  expect(ids.links.length).toBeGreaterThan(0);
+  for (const l of ids.links) expect(ids.inside, l).toContain(l);
 });
 
 test('report_pdf_contains_images_formula_diagram', async ({ page }) => {

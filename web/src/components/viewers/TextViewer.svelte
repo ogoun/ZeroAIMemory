@@ -1,7 +1,7 @@
 <script lang="ts">
   // Просмотр текста и кода (M5): HTML подсветки сервера (`GET /previews/{sha}?kind=text`,
   // syntect — только `<span class>` и экранированный текст), стили — /render/highlight.css.
-  import { ApiError, errorText, previewText } from '../../lib/api';
+  import { ApiError, HIGHLIGHT_CSS, errorText, previewText } from '../../lib/api';
 
   let { user, sha, onexpired }: { user: string; sha: string; onexpired: () => void } = $props();
 
@@ -37,7 +37,7 @@
 </script>
 
 <svelte:head>
-  <link rel="stylesheet" href="api/v1/render/highlight.css" />
+  <link rel="stylesheet" href={HIGHLIGHT_CSS} />
 </svelte:head>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}

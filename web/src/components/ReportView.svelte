@@ -10,6 +10,7 @@
   import Prompt, { type Ask } from './Prompt.svelte';
   import {
     ApiError,
+    HIGHLIGHT_CSS,
     deleteEntry,
     errorText,
     getNode,
@@ -23,7 +24,7 @@
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
   import { fmtTime } from '../lib/journals';
-  import { clearPrint, printReport } from '../lib/print';
+  import { clearPrint } from '../lib/printRoot';
   import { reportAuthor, fmtSize, refsOf, refsText, REF_TITLE, bodyStartsWithTitle } from '../lib/reports';
   import { anchorId, go, href, parse } from '../lib/router';
 
@@ -213,11 +214,15 @@
     printing = true;
     notice = '';
     try {
+      // модуль печати (и print.css) — по клику: лента и страница его не тянут
+      const { printReport } = await import('../lib/print');
+      if (report !== r) return;
       const e = r.entry;
       await printReport(
         r.html,
         {
           title: e.title,
+          titleInBody,
           date: fmtTime(e.created_at),
           author: reportAuthor(e.author),
           project,
@@ -233,6 +238,8 @@
           },
         },
       );
+    } catch (e) {
+      if (report === r) notice = `PDF не готов: ${errorText(e)}.`;
     } finally {
       printing = false;
     }
@@ -240,7 +247,7 @@
 </script>
 
 <svelte:head>
-  <link rel="stylesheet" href="api/v1/render/highlight.css" />
+  <link rel="stylesheet" href={HIGHLIGHT_CSS} />
 </svelte:head>
 
 <article class="report" data-report={id}>
@@ -327,6 +334,17 @@
 <Prompt bind:ask />
 
 <style>
+  /* Ctrl+P без «Скачать PDF» (или во время подготовки копии) — страница без навигации и кнопок */
+  @media print {
+    :global(body:has(article.report) .topbar),
+    :global(body:has(article.report) .sidebar),
+    :global(body:has(article.report) nav),
+    :global(body:has(article.report) button),
+    .back,
+    .actions {
+      display: none !important;
+    }
+  }
   .report {
     max-width: 860px;
     margin: 0 auto;

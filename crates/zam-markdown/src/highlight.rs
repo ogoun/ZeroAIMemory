@@ -294,6 +294,8 @@ pub fn escape_html(s: &str) -> String {
 
 /// CSS классов `hl-*`: светлая тема по умолчанию, тёмная — внутри
 /// `@media screen and (prefers-color-scheme: dark)` (печать — светлая). Вычисляется один раз.
+/// Браузер кэширует CSS сутки: при смене вывода поднять `?v=` в `HIGHLIGHT_CSS`
+/// (`web/src/lib/api.ts`).
 pub fn highlight_css() -> &'static str {
     &CSS
 }
