@@ -1847,7 +1847,14 @@ struct CodeWorld {
 }
 
 async fn code_world(name: &str) -> CodeWorld {
-    let a = api(&format!("mcp-code-{name}"), |_| {}).await;
+    code_world_with(name, |_| {}).await
+}
+
+async fn code_world_with(
+    name: &str,
+    tweak: impl FnOnce(&mut zam_server::config::ServerConfig),
+) -> CodeWorld {
+    let a = api(&format!("mcp-code-{name}"), tweak).await;
     assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
     code_put(
         &a,
@@ -2197,4 +2204,134 @@ async fn mcp_initialize_mentions_memory_code() {
     .await;
     let s = init["instructions"].as_str().unwrap_or_default();
     assert!(s.contains("карта кода — memory_code"), "{s}");
+}
+
+/// Ревью задачи 7 (M1, M2, M4): «символа нет в карте» (свой тип problem REST) — не ошибка, в
+/// JSON — `symbol: null`; выключенная карта — честная ошибка; `path` при адресе `путь#qual` —
+/// предупреждение; предупреждения поиска (`rank pending`) — и у единственной карточки.
+#[tokio::test]
+async fn mcp_code_not_found_kinds_and_warnings() {
+    let w = code_world_with("nf", |c| c.code.rank_timeout_ms = 0).await;
+    let a = &w.a;
+    // первый запрос после загрузки: ранги ещё не посчитаны (срок 0 — не ждать)
+    let card = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "symbol", "query": "foo"}),
+    )
+    .await
+    .text;
+    assert!(card.contains("`a.rs#foo`"), "{card}");
+    assert!(card.contains("> warning: rank pending"), "{card}");
+    let t = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "symbol", "query": "a.rs#foo", "path": "b.rs"}),
+    )
+    .await
+    .text;
+    assert!(
+        t.contains("`a.rs#foo`") && t.contains("path «b.rs» не учтён"),
+        "{t}"
+    );
+    let j = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "symbol", "query": "a.rs#nope_xyz", "format": "json"}),
+    )
+    .await
+    .json();
+    assert_eq!(j["symbol"], Value::Null, "{j}");
+    assert_eq!(j["ref"], "a.rs#nope_xyz", "{j}");
+    let j = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "refs", "query": "a.rs#foo", "format": "json"}),
+    )
+    .await
+    .json();
+    assert_eq!(j["callers"][0]["path"], "b.rs", "{j}");
+    // выключенная карта: 404 маршрута — ошибка инструмента, а не «символ не найден»
+    let off = api("mcp-code-off", |c| c.code.enabled = false).await;
+    assert_eq!(register(&off, &off.token).await, StatusCode::CREATED);
+    for q in ["a.rs#foo", "foo"] {
+        let o = tool(
+            &off,
+            &off.token,
+            &SOL,
+            "memory_code",
+            json!({"action": "symbol", "query": q}),
+        )
+        .await;
+        assert!(o.is_error && o.text.contains("404"), "{q}: {}", o.text);
+        assert!(!o.text.contains("в карте не найден"), "{q}: {}", o.text);
+    }
+}
+
+/// Ревью задачи 7 (M3): списки Markdown карточки и влияния — до 20 строк и «… ещё N»;
+/// полный список — `format: json`.
+#[tokio::test]
+async fn mcp_code_markdown_lists_capped() {
+    let w = code_world("cap").await;
+    let a = &w.a;
+    for i in 0..25 {
+        a.note(
+            G,
+            &format!("О foo {i:02}"),
+            "---\nrefs: [\"a.rs#foo\"]\n---\nтекст о коде\n",
+        )
+        .await;
+    }
+    let card = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "symbol", "query": "a.rs#foo"}),
+    )
+    .await
+    .text;
+    let lines = card
+        .lines()
+        .filter(|l| l.starts_with("- n:") || l.starts_with("- i:"))
+        .count();
+    assert_eq!(lines, 20, "{card}");
+    assert!(card.contains("Знания (27):"), "{card}");
+    assert!(
+        card.contains("… ещё 7 (полный список — format: json)"),
+        "{card}"
+    );
+    let o = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "impact", "path": "a.rs"}),
+    )
+    .await
+    .text;
+    let lines = o
+        .lines()
+        .filter(|l| l.starts_with("- n:") || l.starts_with("- i:"))
+        .count();
+    assert_eq!(lines, 20, "{o}");
+    assert!(o.contains("… ещё 8"), "{o}");
+    let j = ok(
+        a,
+        &a.token,
+        &SOL,
+        "memory_code",
+        json!({"action": "impact", "path": "a.rs", "format": "json"}),
+    )
+    .await
+    .json();
+    assert_eq!(j["knowledge"].as_array().unwrap().len(), 28, "{j}");
 }

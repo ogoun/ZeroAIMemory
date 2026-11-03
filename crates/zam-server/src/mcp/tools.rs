@@ -140,10 +140,10 @@ impl ToolName {
                  (личный) или solution (из X-Zam-Solution)."
             }
             ToolName::Code => {
-                "Карта кода решения: map — ключевые файлы и символы с сигнатурами в бюджете \
-                 (focus — пути, имена, текст задачи); symbol — карточка по имени или путь#qual: \
-                 определение, кто ссылается, знания; refs — кто ссылается; impact — что затронет \
-                 правка (path или files). Тела кода не хранятся."
+                "Карта кода решения, перед правкой незнакомого кода: map — ключевые файлы и \
+                 символы с сигнатурами в бюджете (focus — пути, имена, текст задачи); symbol — \
+                 карточка по имени или путь#qual: определение, кто ссылается, знания; refs — кто \
+                 ссылается; impact — что затронет правка. Тела кода не хранятся."
             }
         }
     }
@@ -1586,8 +1586,10 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
 
 /// Символов в списке кандидатов `symbol`/`refs` (поиск `GET /code/symbols`).
 const CODE_SYMBOLS_LIST: usize = 20;
-/// Строк «кто ссылается» и «на что ссылается файл» в карточке Markdown не больше.
-const CODE_CALLERS_MD: usize = 20;
+/// Строк списков Markdown (кто ссылается, знания, изменённые, потребители) не больше; остаток —
+/// «… ещё N», полный список — `format: json`.
+const CODE_LIST_MD: usize = 20;
+/// «На что ссылается файл» в карточке Markdown — не больше.
 const CODE_USES_MD: usize = 15;
 
 /// `memory_code`: карта, карточка символа, «кто ссылается», влияние правки — поверх
@@ -1645,18 +1647,52 @@ fn sym_ref(v: &Value) -> String {
     )
 }
 
-/// `symbol` и `refs`: адрес `путь#qual` — сразу карточка; иначе поиск, одно точное совпадение
-/// (`qual` или имя) — карточка, иначе список адресов. Нет символа — не ошибка.
+/// Предупреждения `extra` и ответа `v` строками `> warning: …` (сначала свои).
+fn with_warnings(mut s: String, v: &Value, extra: &[String]) -> String {
+    for w in extra {
+        s.push_str(&format!("\n> warning: {w}"));
+    }
+    s.push_str(&warnings_md(v));
+    s
+}
+
+/// JSON ответа с предупреждениями `extra` в начале массива `warnings`.
+fn json_with_warnings(mut v: Value, extra: &[String]) -> Value {
+    if extra.is_empty() {
+        return v;
+    }
+    let mut all: Vec<Value> = extra.iter().map(|w| json!(w)).collect();
+    if let Some(a) = v["warnings"].as_array() {
+        all.extend(a.iter().cloned());
+    }
+    if let Value::Object(o) = &mut v {
+        o.insert("warnings".into(), Value::Array(all));
+    }
+    v
+}
+
+/// `symbol` и `refs`: адрес `путь#qual` — сразу карточка (`path` тогда не нужен —
+/// предупреждение); иначе поиск, одно точное совпадение (`qual` или имя) — карточка с
+/// предупреждениями поиска, иначе список адресов. Символа нет в карте (REST
+/// [`crate::error::CODE_SYMBOL_NOT_FOUND`]) — не ошибка; прочие 404 (карта выключена, нет
+/// решения) — ошибка.
 async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) -> Res {
     let query = req_str(args, "query")?.trim();
+    let path = opt_text(args, "path")?;
+    let mut extra: Vec<String> = Vec::new();
     let addr = match zam_code::split_ref(query) {
-        (_, Some(_)) => query.to_string(),
+        (_, Some(_)) => {
+            if let Some(p) = path {
+                extra.push(format!("path «{p}» не учтён: query — уже адрес путь#qual"));
+            }
+            query.to_string()
+        }
         (_, None) => {
             let mut uri = format!(
                 "/api/v1/code/symbols?q={}&limit={CODE_SYMBOLS_LIST}",
                 enc(query)
             );
-            if let Some(p) = opt_text(args, "path")? {
+            if let Some(p) = path {
                 uri.push_str(&format!("&path={}", enc(p)));
             }
             let r = call_rest(rest, Method::GET, &uri, None, &[]).await?;
@@ -1667,36 +1703,62 @@ async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) ->
                 .filter(|h| h["qual"] == query || h["name"] == query)
                 .collect();
             match exact.as_slice() {
-                [one] => sym_ref(one),
-                _ => {
-                    return done(f, &r, |v| symbols_md(v, query));
+                [one] => {
+                    // предупреждения поиска (`rank pending`) — и у карточки
+                    extra.extend(
+                        v["warnings"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string),
+                    );
+                    sym_ref(one)
                 }
+                _ => return done(f, &r, |v| symbols_md(v, query)),
             }
         }
     };
     let uri = format!("/api/v1/code/symbols/{}", enc(&addr));
     let r = match call_rest(rest, Method::GET, &uri, None, &[]).await {
         Ok(r) => r,
-        Err(Fail::Rest { reply, .. }) if reply.status == StatusCode::NOT_FOUND => {
-            return Ok(Done::Md(format!(
-                "Символ «{addr}» в карте не найден: проверьте адрес путь#qual \
-                 (memory_code action=symbol по имени) или обновите карту — `zam code sync`."
-            )));
+        Err(Fail::Rest { reply, .. })
+            if reply.json()["type"] == crate::error::CODE_SYMBOL_NOT_FOUND =>
+        {
+            return Ok(match f {
+                Fmt::Json => Done::Json(json_with_warnings(
+                    json!({"symbol": null, "ref": addr, "callers": [], "knowledge": [],
+                           "warnings": []}),
+                    &extra,
+                )),
+                Fmt::Md => Done::Md(with_warnings(
+                    format!(
+                        "Символ «{addr}» в карте не найден: проверьте адрес путь#qual \
+                         (memory_code action=symbol по имени) или обновите карту — \
+                         `zam code sync`."
+                    ),
+                    &Value::Null,
+                    &extra,
+                )),
+            });
         }
         Err(e) => return Err(e),
     };
-    if refs_only {
-        let v = r.json();
-        return Ok(match f {
-            Fmt::Json => Done::Json(json!({
+    let v = r.json();
+    Ok(match (f, refs_only) {
+        (Fmt::Json, true) => Done::Json(json_with_warnings(
+            json!({
                 "symbol": v["symbol"],
                 "callers": v["callers"],
                 "tokens": count_tokens(&json!([v["symbol"], v["callers"]]).to_string()),
-            })),
-            Fmt::Md => Done::Md(callers_md(&v)),
-        });
-    }
-    done(f, &r, card_md)
+                "warnings": [],
+            }),
+            &extra,
+        )),
+        (Fmt::Json, false) => Done::Json(json_with_warnings(v, &extra)),
+        (Fmt::Md, true) => Done::Md(with_warnings(callers_md(&v), &Value::Null, &extra)),
+        (Fmt::Md, false) => Done::Md(with_warnings(card_md(&v), &Value::Null, &extra)),
+    })
 }
 
 /// Список кандидатов поиска символа: адрес, вид, строка, сигнатура.
@@ -1728,13 +1790,20 @@ fn symbols_md(v: &Value, query: &str) -> String {
     s
 }
 
-/// Строки «файл ×N» (до `max`, остаток — «… ещё N»).
-fn counted_list(items: &[Value], max: usize, line: impl Fn(&Value) -> String) -> String {
+/// Элементы через `sep` (до `max`, остаток `rest` — «… ещё N»).
+fn capped_list(
+    items: &[Value],
+    max: usize,
+    rest: usize,
+    sep: &str,
+    line: impl Fn(&Value) -> String,
+) -> String {
     let mut parts: Vec<String> = items.iter().take(max).map(line).collect();
-    if items.len() > max {
-        parts.push(format!("… ещё {}", items.len() - max));
+    let left = items.len().saturating_sub(max) + rest;
+    if left > 0 {
+        parts.push(format!("… ещё {left} (полный список — format: json)"));
     }
-    parts.join(", ")
+    parts.join(sep)
 }
 
 fn caller_line(c: &Value) -> String {
@@ -1768,7 +1837,7 @@ fn knowledge_line(k: &Value) -> String {
         None => path.to_string(),
     };
     format!(
-        "\n- {} «{}» {} · {} · `{target}`",
+        "- {} «{}» {} · {} · `{target}`",
         k["id"].as_str().unwrap_or("?"),
         k["title"].as_str().unwrap_or(""),
         k["kind"].as_str().unwrap_or(""),
@@ -1776,20 +1845,18 @@ fn knowledge_line(k: &Value) -> String {
     )
 }
 
-/// Знания выдачи и остаток `knowledge_left`.
+/// Знания выдачи — до [`CODE_LIST_MD`] строк, остаток (и `knowledge_left` REST) — «… ещё N».
 fn knowledge_md(v: &Value, title: &str) -> String {
     let items = v["knowledge"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     if items.is_empty() {
         return String::new();
     }
-    let mut s = format!("\n{title} ({}):", items.len());
-    for k in items {
-        s.push_str(&knowledge_line(k));
-    }
-    if let Some(n) = v["knowledge_left"].as_u64().filter(|n| *n > 0) {
-        s.push_str(&format!("\n… ещё {n}"));
-    }
-    s
+    let left = v["knowledge_left"].as_u64().unwrap_or(0) as usize;
+    format!(
+        "\n{title} ({}):\n{}",
+        items.len() + left,
+        capped_list(items, CODE_LIST_MD, left, "\n", knowledge_line)
+    )
 }
 
 /// Карточка символа: определение, кто ссылается, на что ссылается файл, знания.
@@ -1811,14 +1878,14 @@ fn card_md(v: &Value) -> String {
     } else {
         format!(
             "\nКто ссылается: {}",
-            counted_list(callers, CODE_CALLERS_MD, caller_line)
+            capped_list(callers, CODE_LIST_MD, 0, ", ", caller_line)
         )
     });
     let uses = v["uses"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     if !uses.is_empty() {
         s.push_str(&format!(
             "\nФайл ссылается на: {}",
-            counted_list(uses, CODE_USES_MD, |u| format!(
+            capped_list(uses, CODE_USES_MD, 0, ", ", |u| format!(
                 "{} ({}) ×{}",
                 u["name"].as_str().unwrap_or("?"),
                 u["kind"].as_str().unwrap_or("?"),
@@ -1855,22 +1922,30 @@ async fn code_impact(rest: &Rest, args: &JsonObject, f: Fmt) -> Res {
     done(f, &r, impact_md)
 }
 
-fn impact_syms(items: &[Value]) -> String {
-    items
-        .iter()
-        .map(|x| {
-            format!(
-                "`{}` ({}, стр. {})",
-                sym_ref(x),
-                x["kind"].as_str().unwrap_or("?"),
-                x["line"]
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+fn impact_sym(x: &Value) -> String {
+    format!(
+        "`{}` ({}, стр. {})",
+        sym_ref(x),
+        x["kind"].as_str().unwrap_or("?"),
+        x["line"]
+    )
 }
 
-/// Итог влияния: изменённые и удалённые символы, потребители на 1 шаг, знания.
+fn consumer_line(c: &Value) -> String {
+    let names: Vec<&str> = c["names"]
+        .as_array()
+        .map(|n| n.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    format!(
+        "{} → {} ×{}",
+        c["path"].as_str().unwrap_or("?"),
+        names.join(", "),
+        c["count"]
+    )
+}
+
+/// Итог влияния: изменённые и удалённые символы, потребители на 1 шаг, знания — каждый список
+/// до [`CODE_LIST_MD`] строк (полный — `format: json`).
 fn impact_md(v: &Value) -> String {
     let arr = |k: &str| v[k].as_array().map(Vec::as_slice).unwrap_or(&[]);
     let (changed, removed, consumers, paths) = (
@@ -1894,34 +1969,30 @@ fn impact_md(v: &Value) -> String {
         knowledge.len() + v["knowledge_left"].as_u64().unwrap_or(0) as usize
     );
     if !changed.is_empty() {
-        s.push_str(&format!("\nИзменены: {}", impact_syms(changed)));
+        s.push_str(&format!(
+            "\nИзменены: {}",
+            capped_list(changed, CODE_LIST_MD, 0, ", ", impact_sym)
+        ));
     }
     if !removed.is_empty() {
-        s.push_str(&format!("\nУдалены: {}", impact_syms(removed)));
+        s.push_str(&format!(
+            "\nУдалены: {}",
+            capped_list(removed, CODE_LIST_MD, 0, ", ", impact_sym)
+        ));
     }
     if !consumers.is_empty() {
-        let list: Vec<String> = consumers
-            .iter()
-            .map(|c| {
-                let names: Vec<&str> = c["names"]
-                    .as_array()
-                    .map(|n| n.iter().filter_map(Value::as_str).collect())
-                    .unwrap_or_default();
-                format!(
-                    "{} → {} ×{}",
-                    c["path"].as_str().unwrap_or("?"),
-                    names.join(", "),
-                    c["count"]
-                )
-            })
-            .collect();
-        s.push_str(&format!("\nПотребители (1 шаг): {}", list.join("; ")));
+        s.push_str(&format!(
+            "\nПотребители (1 шаг): {}",
+            capped_list(consumers, CODE_LIST_MD, 0, "; ", consumer_line)
+        ));
     }
     if !paths.is_empty() {
-        let p: Vec<&str> = paths.iter().filter_map(Value::as_str).collect();
         s.push_str(&format!(
             "\nБез хэшей символов (все знания о пути): {}",
-            p.join(", ")
+            capped_list(paths, CODE_LIST_MD, 0, ", ", |p| p
+                .as_str()
+                .unwrap_or("?")
+                .to_string())
         ));
     }
     s.push_str(&knowledge_md(v, "Знания — перепроверить"));

@@ -58,6 +58,11 @@ fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
 
 /// Фразы, которые блок v5 (M5.6) перенёс в протокол `zam guide` ради бюджета 500 токенов (ru и
 /// en): исследование по прошлым опытам, `scope=global` у insight, канонические термины.
+/// GUIDv7 с наибольшим числом токенов bge-m3 в подстановке «(`…`)» — 39 (поиск
+/// восхождением по всем шестнадцатеричным позициям при фиксированных версии и варианте; у
+/// случайных GUIDv7 — 23–36): тест бюджета блока детерминирован (ревью задачи 7 M5.6, I1).
+const WORST_GUID: &str = "d6c5a5d9-c4c7-7f6b-a8b6-d8fd4c9fb6f6";
+
 const MOVED_TO_GUIDE: [&str; 6] = [
     "insight_kinds=[experiment,failure]",
     "scope=global",
@@ -101,7 +106,7 @@ async fn agent_setup_block_v5_under_500_tokens_ru_en() {
                         &a,
                         &a.token,
                         &format!(
-                            "agent={agent}&lang={lang}&solution=new&name={}&rules_write={rules}",
+                            "agent={agent}&lang={lang}&solution={WORST_GUID}&name={}&rules_write={rules}",
                             enc(name)
                         ),
                     )
@@ -133,11 +138,11 @@ async fn agent_setup_block_v5_under_500_tokens_ru_en() {
                     // строка v5 (M5.6): символ — `путь#Тип::метод`, карта и карточка символа
                     let code = if lang == "ru" {
                         "- Код — `refs.files`, функция — `путь#Тип::метод`; карта — \
-                         `memory_code`/`zam code map`, символ — `zam code sym`; новое понятие → \
+                         `zam code map`, символ — `zam code sym`; новое понятие → \
                          `term`.\n"
                     } else {
                         "- Code — `refs.files`, a function — `path#Type::method`; map — \
-                         `memory_code`/`zam code map`, symbol — `zam code sym`; new concept → \
+                         `zam code map`, symbol — `zam code sym`; new concept → \
                          `term`.\n"
                     };
                     assert!(block.contains(code), "{block}");
@@ -192,7 +197,7 @@ async fn agent_setup_contains_axiom_rule_and_rev_rule() {
         "новое понятие → `term`.",
         // правило v5 (M5.6): ссылка на символ, карта и карточка символа
         "Код — `refs.files`, функция — `путь#Тип::метод`",
-        "`memory_code`/`zam code map`, символ — `zam code sym`",
+        "карта — `zam code map`, символ — `zam code sym`",
         "после сжатия — `recovery`; субагенту — `brief`",
         // без решения — его создаст `zam init`; Rules — по настройке сервера (закрыты)
         "(создаёт `zam init`)",
@@ -211,7 +216,7 @@ async fn agent_setup_contains_axiom_rule_and_rev_rule() {
         "their answer in chat → `answer`",
         "new concept → `term`",
         "Code — `refs.files`, a function — `path#Type::method`",
-        "map — `memory_code`/`zam code map`, symbol — `zam code sym`",
+        "map — `zam code map`, symbol — `zam code sym`",
         "after compaction — `recovery`; for a subagent — `brief`",
         "Shared rules go to Rules.",
     ] {

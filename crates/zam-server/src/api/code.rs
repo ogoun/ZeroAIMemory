@@ -1783,7 +1783,7 @@ async fn find_symbol(sc: &MemScope, guid: &str, raw: &str) -> Result<i64, ApiErr
     hits.into_iter()
         .find(|h| h.path == path && h.qual == qual)
         .map(|h| h.id)
-        .ok_or(ApiError::NotFound)
+        .ok_or_else(|| ApiError::CodeSymbolNotFound(format!("символа «{path}#{qual}» нет в карте")))
 }
 
 /// `GET /code/symbols/{id | путь#qual}?solution=` → карточка: определение, кто ссылается, на
@@ -1804,7 +1804,7 @@ pub async fn symbol(
     let id = find_symbol(&sc, &g, raw_id.trim()).await?;
     let card = code_symbol(&sc.db, &g, id)
         .await?
-        .ok_or(ApiError::NotFound)?;
+        .ok_or_else(|| ApiError::CodeSymbolNotFound(format!("символа {id} нет в карте")))?;
     let path = card.symbol.path.clone();
     let dbs = report_dbs(&st, &p, &sc).await?;
     let mut knowledge: Vec<Value> = knowledge_of(&dbs, &g, &path)

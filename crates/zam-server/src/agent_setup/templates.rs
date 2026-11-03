@@ -28,7 +28,7 @@ ZeroAIMemoryUrl={url}
 - Итог исследования, эксперимента, сравнения — пользователю `zam report`, себе — `insight`.
 - Задача → `task`: claim перед работой, `status` с `next_step`.
 - Вопрос человеку → `question`; его ответ в чате → `answer`.
-- Код — `refs.files`, функция — `путь#Тип::метод`; карта — `memory_code`/`zam code map`, символ — `zam code sym`; новое понятие → `term`.
+- Код — `refs.files`, функция — `путь#Тип::метод`; карта — `zam code map`, символ — `zam code sym`; новое понятие → `term`.
 - `axiom` — только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` с `contradicts` и скажи ему; `certainty` меняй с `reason`.
 - Секреты, хосты → `memory_vault`; заметке — `l0`. {rules}
 - Без хуков `memory_recall`: новый тип файла, ошибка; после сжатия — `recovery`; субагенту — `brief`.
@@ -47,7 +47,7 @@ No MCP — `zam`; protocol — `zam guide`.
 - Outcome of research, an experiment, a comparison — for the user `zam report`, for yourself — `insight`.
 - Task → `task`: claim before work, `status` with `next_step`.
 - Question for the human → `question`; their answer in chat → `answer`.
-- Code — `refs.files`, a function — `path#Type::method`; map — `memory_code`/`zam code map`, symbol — `zam code sym`; new concept → `term`.
+- Code — `refs.files`, a function — `path#Type::method`; map — `zam code map`, symbol — `zam code sym`; new concept → `term`.
 - `axiom` — only on the user's direct instruction; if you disagree — `hypothesis`/`theorem` with `contradicts` and tell the user; change `certainty` with a `reason`.
 - Secrets, hosts → `memory_vault`; give notes an `l0`. {rules}
 - Without hooks `memory_recall`: new file type, error; after compaction — `recovery`; for a subagent — `brief`.

@@ -6,6 +6,9 @@ use serde_json::{Map, Value, json};
 use zam_core::SolutionGuid;
 use zam_store::StoreError;
 
+/// Тип problem «символа нет в карте кода» (M5.6 §9): MCP `memory_code` отличает его от прочих 404.
+pub const CODE_SYMBOL_NOT_FOUND: &str = "/problems/code-symbol-not-found";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("{0}")]
@@ -30,6 +33,10 @@ pub enum ApiError {
     },
     #[error("ресурс не найден")]
     NotFound,
+    /// 404 [`CODE_SYMBOL_NOT_FOUND`] (M5.6 §9): символа нет в карте решения — в отличие от
+    /// выключенной карты и неизвестного решения (`about:blank`).
+    #[error("{0}")]
+    CodeSymbolNotFound(String),
     /// `extra` — расширения RFC 9457: поля попадают в тело problem рядом с `detail`.
     #[error("{detail}")]
     Conflict {
@@ -194,6 +201,9 @@ impl ApiError {
                 "/problems/unprocessable",
                 "Unprocessable Content",
             ),
+            ApiError::CodeSymbolNotFound(_) => {
+                (StatusCode::NOT_FOUND, CODE_SYMBOL_NOT_FOUND, "Not Found")
+            }
             ApiError::LocatorInvalid(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/locator-invalid",

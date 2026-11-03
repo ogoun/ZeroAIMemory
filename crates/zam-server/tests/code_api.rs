@@ -762,21 +762,21 @@ async fn symbol_card_refs_and_knowledge() {
     )
     .await;
     assert_eq!(by_ref["symbol"]["id"], id);
-    ok(
-        &get(
-            &w.a,
-            &format!("/api/v1/code/symbols/{}?solution={G}", enc("a.rs#nope")),
-        )
-        .await,
-        StatusCode::NOT_FOUND,
-        "нет символа по адресу",
-    );
-    // нет символа — 404; символ без решения — 400
-    ok(
-        &get(&w.a, &format!("/api/v1/code/symbols/999999?solution={G}")).await,
-        StatusCode::NOT_FOUND,
-        "нет символа",
-    );
+    // нет символа — 404 своего типа (MCP отличает его от выключенной карты, ревью задачи 7)
+    for uri in [
+        format!("/api/v1/code/symbols/{}?solution={G}", enc("a.rs#nope")),
+        format!("/api/v1/code/symbols/999999?solution={G}"),
+    ] {
+        let r = get(&w.a, &uri).await;
+        ok(&r, StatusCode::NOT_FOUND, &uri);
+        assert_eq!(
+            r.json()["type"],
+            "/problems/code-symbol-not-found",
+            "{uri}: {}",
+            r.text()
+        );
+    }
+    // символ без решения — 400
     ok(
         &get(&w.a, &format!("/api/v1/code/symbols/{id}")).await,
         StatusCode::BAD_REQUEST,
