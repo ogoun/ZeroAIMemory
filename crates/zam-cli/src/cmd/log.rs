@@ -59,8 +59,9 @@ pub fn parse_ref(raw: &str) -> Result<(&'static str, String), CliError> {
             Ok(("files", raw.to_string()))
         };
     };
-    // буква диска или путь с двоеточием в имени (`a/b:c`) — файл
-    if k.len() == 1 && k.bytes().all(|b| b.is_ascii_alphabetic()) || k.contains(['/', '\\']) {
+    // буква диска, путь с двоеточием в имени (`a/b:c`) или символ (`a.rs#Тип::метод`, M5.6) —
+    // файл
+    if k.len() == 1 && k.bytes().all(|b| b.is_ascii_alphabetic()) || k.contains(['/', '\\', '#']) {
         return Ok(("files", raw.to_string()));
     }
     let key = match k {
@@ -132,13 +133,17 @@ pub fn changelog(ctx: &Ctx, o: &Changelog) -> Result<(), CliError> {
         .unwrap_or_default();
     let refs = super::refs::request_refs(&files)?;
     if let Some(r) = &refs {
-        // в `data.refs.files` — нормализованные пути (те же, что у ссылок)
+        // в `data.refs.files` — нормализованные пути (те же, что у ссылок), у ссылки на символ —
+        // `путь#qual` (M5.6 §8)
         data["refs"]["files"] = Value::Array(
             r["files"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|f| f["path"].clone())
+                .map(|f| match f["symbol"].as_str() {
+                    Some(q) => json!(format!("{}#{q}", f["path"].as_str().unwrap_or_default())),
+                    None => f["path"].clone(),
+                })
                 .collect(),
         );
     }

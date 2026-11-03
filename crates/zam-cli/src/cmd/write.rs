@@ -8,8 +8,9 @@
 //! `--ref <путь>` (повторяемый; M4.5 §6.1): путь файла проекта нормализуется
 //! ([`super::refs::ref_path`]) и дописывается в список `refs:` frontmatter
 //! ([`super::refs::add_frontmatter_refs`]) — ссылки заметки сервер берёт оттуда, без хэша.
-//! После записи — `POST /files/verified` с хэшами этих файлов (решение задачи 7: ориентир
-//! ставится по фактическому содержимому). Коммит у заметки не хранится (полей нет). Сбой
+//! `--ref путь#qual` (M5.6 §8) — строка `"путь#qual"`; символ проверяется разбором файла (нет —
+//! код 6, заметка не пишется). После записи — `POST /files/verified` с хэшами этих файлов и
+//! тел символов (решение задачи 7: ориентир ставится по фактическому содержимому). Коммит у заметки не хранится (полей нет). Сбой
 //! подтверждения — предупреждение в stderr, заметка уже записана.
 use std::io::Read;
 use std::path::Path;
@@ -64,7 +65,7 @@ pub fn run(ctx: &Ctx, raw: &str, o: &Opts) -> Result<(), CliError> {
     } else {
         let (cwd, root) = super::refs::cli_root();
         let local = super::refs::local_refs(o.refs, &cwd, &root)?;
-        let paths: Vec<String> = local.iter().map(|r| r.path.clone()).collect();
+        let paths: Vec<String> = local.iter().map(super::refs::LocalRef::display).collect();
         text = super::refs::add_frontmatter_refs(&text, &paths)?;
         local
     };
@@ -133,7 +134,8 @@ fn after_write(ctx: &Ctx, local: &[super::refs::LocalRef]) {
         eprintln!("--ref: решение не задано (solution.toml) — хэши файлов не подтверждены");
         return;
     };
-    if let Err(e) = super::refs::post_verified(ctx, &guid, local) {
+    let (_, root) = super::refs::cli_root();
+    if let Err(e) = super::refs::post_verified(ctx, &guid, &root, local, false) {
         eprintln!("--ref: хэши файлов не подтверждены: {e}");
     }
 }

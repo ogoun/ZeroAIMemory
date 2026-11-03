@@ -16,7 +16,11 @@
 //!   рабочей копией; с `--since` набор сужают `git diff --name-only <c>..HEAD` и
 //!   `git status --porcelain`. Изменившиеся (и ещё без ориентира) уходят `POST /files/changed`
 //!   пачками до [`FILES_MAX`]; удалённый файл — хэш [`MISSING_HASH`] **[решение исполнителя]**.
-//! - `zam refs verify <path>…` → `POST /files/verified` («проверено, знание актуально»).
+//! - `zam refs verify <path>…` → `POST /files/verified` («проверено, знание актуально»; у файла
+//!   кода — с хэшами тел символов).
+//! - **Символы** (M5.6 §8): `--ref путь#qual` ([`local_refs`]) разбирает файл
+//!   (`zam_code::symbol_hashes`) и дописывает `body_hash` символа (`symbol_hash`); символа нет —
+//!   код 6. `zam refs check` у путей со ссылками на символы шлёт и хэши тел символов файла.
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -385,28 +389,77 @@ pub fn cli_root() -> (PathBuf, PathBuf) {
     (cwd, root)
 }
 
-/// Ссылка `{path, hash?, commit?}` записи журнала по файлу `--ref`.
+/// Ссылка `{path, symbol?, hash?, symbol_hash?, commit?}` записи журнала по `--ref` (M5.6 §8:
+/// `путь#qual` — ссылка на символ с `body_hash` его тела).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRef {
     pub path: String,
+    pub symbol: Option<String>,
     pub hash: Option<String>,
+    pub symbol_hash: Option<String>,
 }
 
-/// Пути `--ref` → ссылки (без повторов; ошибка пути — код 6). Файла нет — ссылка без хэша и
-/// строка в stderr.
+impl LocalRef {
+    /// Строка `путь` или `путь#qual` (frontmatter заметки, `data.refs.files` changelog).
+    pub fn display(&self) -> String {
+        match &self.symbol {
+            Some(s) => format!("{}#{s}", self.path),
+            None => self.path.clone(),
+        }
+    }
+}
+
+/// Хэши тел символов файла кода `rel` (полный разбор, пределы `[code]` по умолчанию); файл не
+/// код, не читается или разобран не полностью — `None`.
+pub fn file_symbols(root: &Path, rel: &str) -> Option<Vec<zam_code::SymbolHash>> {
+    let lang = zam_code::lang_of(rel)?;
+    let bytes = std::fs::read(root.join(rel)).ok()?;
+    zam_code::symbol_hashes(lang, &bytes, &zam_code::Limits::default())
+}
+
+/// Пути `--ref` (`путь` или `путь#qual`) → ссылки (без повторов `(путь, символ)`; ошибка пути —
+/// код 6). Файла нет — файловая ссылка без хэша и строка в stderr; у ссылки на символ файл
+/// разбирается, символа нет (или файла, или разбор неполный) — код 6 «символ `qual` не найден в
+/// `путь`».
 pub fn local_refs(files: &[String], cwd: &Path, root: &Path) -> Result<Vec<LocalRef>, CliError> {
     let mut out: Vec<LocalRef> = Vec::new();
     for f in files {
+        let (raw, symbol) = zam_code::split_ref(f.trim());
         let path =
-            ref_path(f, cwd, root).map_err(|e| CliError::input(format!("--ref «{f}»: {e}")))?;
-        if out.iter().any(|r| same_path(&r.path, &path)) {
+            ref_path(raw, cwd, root).map_err(|e| CliError::input(format!("--ref «{f}»: {e}")))?;
+        let symbol = symbol.map(str::to_string);
+        if out
+            .iter()
+            .any(|r| same_path(&r.path, &path) && r.symbol == symbol)
+        {
             continue;
         }
         let hash = hash_rel(root, &path);
-        if hash.is_none() {
-            eprintln!("--ref {path}: файла нет в рабочей копии — ссылка без хэша");
-        }
-        out.push(LocalRef { path, hash });
+        let symbol_hash = match &symbol {
+            Some(q) => {
+                let body = file_symbols(root, &path)
+                    .and_then(|s| s.into_iter().find(|s| s.qual == *q))
+                    .map(|s| s.body_hash);
+                if body.is_none() {
+                    return Err(CliError::input(format!(
+                        "--ref «{f}»: символ `{q}` не найден в `{path}`"
+                    )));
+                }
+                body
+            }
+            None => {
+                if hash.is_none() {
+                    eprintln!("--ref {path}: файла нет в рабочей копии — ссылка без хэша");
+                }
+                None
+            }
+        };
+        out.push(LocalRef {
+            path,
+            symbol,
+            hash,
+            symbol_hash,
+        });
     }
     if out.len() > REFS_MAX {
         return Err(CliError::input(format!(
@@ -416,17 +469,24 @@ pub fn local_refs(files: &[String], cwd: &Path, root: &Path) -> Result<Vec<Local
     Ok(out)
 }
 
-/// Поле запроса `refs: {files: [{path, hash?, commit?}]}` (коммит — один на все ссылки).
+/// Поле запроса `refs: {files: [{path, symbol?, hash?, symbol_hash?, commit?}]}` (коммит — один
+/// на все ссылки).
 pub fn refs_field(refs: &[LocalRef], commit: Option<&str>) -> Value {
     let files: Vec<Value> = refs
         .iter()
         .map(|r| {
             let mut o = json!({ "path": r.path });
+            if let Some(s) = &r.symbol {
+                o["symbol"] = json!(s);
+            }
             if let Some(h) = &r.hash {
                 o["hash"] = json!(h);
                 if let Some(c) = commit {
                     o["commit"] = json!(c);
                 }
+            }
+            if let Some(b) = &r.symbol_hash {
+                o["symbol_hash"] = json!(b);
             }
             o
         })
@@ -450,19 +510,42 @@ pub fn request_refs(files: &[String]) -> Result<Option<Value>, CliError> {
 }
 
 /// `POST /files/verified {solution, files}` пачками до [`FILES_MAX`]; число подтверждённых.
-pub fn post_verified(ctx: &Ctx, guid: &str, refs: &[LocalRef]) -> Result<i64, CliError> {
-    let mut n = 0;
-    for chunk in refs.chunks(FILES_MAX) {
-        let files: Vec<Value> = chunk
+/// Путь — один раз (повтор с другим символом — та же строка); у файла кода, на символ которого
+/// есть ссылка (`all_code` — у любого файла кода), — хэши тел **всех** его символов (`symbols`,
+/// M5.6 §8): подтверждение ставит ориентир и прочим символьным ссылкам пути.
+pub fn post_verified(
+    ctx: &Ctx,
+    guid: &str,
+    root: &Path,
+    refs: &[LocalRef],
+    all_code: bool,
+) -> Result<i64, CliError> {
+    let mut files: Vec<Value> = Vec::new();
+    for r in refs {
+        if files
             .iter()
-            .map(|r| match &r.hash {
-                Some(h) => json!({"path": r.path, "hash": h}),
-                None => json!({"path": r.path}),
-            })
-            .collect();
+            .any(|f| f["path"].as_str().is_some_and(|p| same_path(p, &r.path)))
+        {
+            continue;
+        }
+        let mut o = json!({ "path": r.path });
+        if let Some(h) = &r.hash {
+            o["hash"] = json!(h);
+        }
+        let symbolic = all_code
+            || refs
+                .iter()
+                .any(|x| x.symbol.is_some() && same_path(&x.path, &r.path));
+        if symbolic && let Some(s) = file_symbols(root, &r.path) {
+            o["symbols"] = json!(s);
+        }
+        files.push(o);
+    }
+    let mut n = 0;
+    for chunk in files.chunks(FILES_MAX) {
         let v = read_json(ctx.client.post_json(
             "/files/verified",
-            &json!({"solution": guid, "files": files}),
+            &json!({"solution": guid, "files": chunk}),
         )?)?;
         n += v["verified"].as_i64().unwrap_or(0);
     }
@@ -473,16 +556,12 @@ pub fn post_verified(ctx: &Ctx, guid: &str, refs: &[LocalRef]) -> Result<i64, Cl
 pub fn post_changed(
     client: &crate::client::Client,
     guid: &str,
-    files: &[(String, String)],
+    files: &[hook::cache::Changed],
 ) -> Result<i64, CliError> {
     let mut n = 0;
     for chunk in files.chunks(FILES_MAX) {
-        let files: Vec<Value> = chunk
-            .iter()
-            .map(|(p, h)| json!({"path": p, "hash": h}))
-            .collect();
         let v = read_json(
-            client.post_json("/files/changed", &json!({"solution": guid, "files": files}))?,
+            client.post_json("/files/changed", &json!({"solution": guid, "files": chunk}))?,
         )?;
         n += v["stale"].as_i64().unwrap_or(0);
     }
@@ -497,37 +576,48 @@ pub fn check(ctx: &Ctx, since: Option<&str>, solution: Option<&str>) -> Result<(
         ctx.client
             .get("/file-refs", &[("solution", guid.as_str())])?,
     )?;
-    let mut paths: Vec<(String, Option<String>)> = idx["refs"]
+    // (путь, хэш, есть ссылки на символы)
+    let mut paths: Vec<(String, Option<String>, bool)> = idx["refs"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|r| {
+            let symbolic = r["items"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|i| i["symbol"].is_string()));
             Some((
                 r["path"].as_str()?.to_string(),
                 r["hash"].as_str().map(str::to_string),
+                symbolic,
             ))
         })
         .collect();
     if let Some(c) = since {
         let changed = git_changed_since(&root, c)?;
-        paths.retain(|(p, _)| changed.iter().any(|c| same_path(c, p)));
+        paths.retain(|(p, _, _)| changed.iter().any(|c| same_path(c, p)));
     }
-    let mut send: Vec<(String, String)> = Vec::new();
+    let mut send: Vec<hook::cache::Changed> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     // путь, который правила Windows отклоняют (устройство, поток), не открывается и не
     // считается удалённым (fix round 1, M-5)
-    paths.retain(|(p, _)| local_rules(p, cfg!(windows)).is_ok_and(|l| l == *p));
-    for (p, known) in &paths {
+    paths.retain(|(p, _, _)| local_rules(p, cfg!(windows)).is_ok_and(|l| l == *p));
+    for (p, known, symbolic) in &paths {
         let now = hash_rel(&root, p).unwrap_or_else(|| MISSING_HASH.to_string());
-        match known {
-            Some(k) if *k == now => {}
-            Some(_) => {
-                changed.push(p.clone());
-                send.push((p.clone(), now));
-            }
-            // ориентир ссылки без хэша (правило I2 задачи 7)
-            None => send.push((p.clone(), now)),
+        if known.as_deref() == Some(now.as_str()) {
+            continue;
         }
+        if known.is_some() {
+            changed.push(p.clone());
+        }
+        // ссылки на символы судятся по телу (M5.6 §8); без ориентира — ориентир (правило I2)
+        let symbols = (*symbolic && now != MISSING_HASH)
+            .then(|| file_symbols(&root, p))
+            .flatten();
+        send.push(hook::cache::Changed {
+            path: p.clone(),
+            hash: now,
+            symbols,
+        });
     }
     let stale = if send.is_empty() {
         0
@@ -562,10 +652,16 @@ pub fn verify(ctx: &Ctx, files: &[String], solution: Option<&str>) -> Result<(),
         let path = ref_path(f, &cwd, &root).map_err(|e| CliError::input(format!("«{f}»: {e}")))?;
         if !refs.iter().any(|r| same_path(&r.path, &path)) {
             let hash = hash_rel(&root, &path);
-            refs.push(LocalRef { path, hash });
+            refs.push(LocalRef {
+                path,
+                symbol: None,
+                hash,
+                symbol_hash: None,
+            });
         }
     }
-    let n = post_verified(ctx, &guid, &refs)?;
+    // у файла кода — и тела символов: подтверждаются и ссылки на его символы (M5.6 §8)
+    let n = post_verified(ctx, &guid, &root, &refs, true)?;
     if ctx.json {
         return emit_json(&json!({ "verified": n }));
     }

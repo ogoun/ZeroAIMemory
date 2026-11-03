@@ -5,26 +5,31 @@
 //!   ([`parse_refs`]): до 64, путь нормализуется (`\` → `/`, `./` и `..` сворачиваются;
 //!   абсолютный, выше корня, пустой, длиннее 1000 символов, с управляющими символами — 422
 //!   `refs.files[i]: …`), `hash` — blake3 содержимого (64 hex), `commit` — sha git (4–64 hex).
-//!   У заметок ссылки — список `refs:` во frontmatter (без хэша; ненормализуемые пути
-//!   пропускаются с предупреждением `invalid_ref: <путь>`).
-//! - `POST /files/changed {solution, files: [{path, hash}]}` (до 500) → `{stale: N}`:
-//!   сообщение клиента `zam` об изменении файлов (тела файлов не передаются); ссылки решения на
-//!   эти пути становятся `stale` (хэш другой) или `ok` (хэш совпал); у ссылки без хэша
-//!   присланный хэш становится ориентиром (`ok`). `N` — сколько ссылок этих путей после
-//!   этого `stale`.
-//! - `POST /files/verified {solution, files: [{path, hash?}]}` → `{verified: N}`: «проверено,
-//!   знание актуально» — ссылки решения на пути снова `ok` с новым хэшем.
+//!   M5.6 §8: ссылка на символ — `symbol` (qual, ≤ 512, без `/`) и `symbol_hash` (`body_hash`,
+//!   16 hex) или `path` вида `a.rs#qual` без `symbol` ([`zam_code::split_ref`]); повтор
+//!   `(путь, символ)` — первая. У заметок ссылки — список `refs:` во frontmatter (`путь` или
+//!   `путь#qual`, без хэша; ненормализуемые пропускаются с предупреждением `invalid_ref`).
+//! - `POST /files/changed {solution, files: [{path, hash, symbols?: [{qual, body_hash}]}]}` (до
+//!   500) → `{stale: N}`: сообщение клиента `zam` об изменении файлов (тела файлов не
+//!   передаются); ссылки решения на эти пути становятся `stale` (хэш другой) или `ok` (хэш
+//!   совпал); у ссылки без хэша присланный хэш становится ориентиром (`ok`). Ссылки на символ
+//!   при `symbols` судятся по телу (`symbol_changed`, `symbol_removed`; список — полный разбор
+//!   файла), без `symbols` — по хэшу файла. `N` — сколько ссылок этих путей после этого `stale`.
+//! - `POST /files/verified {solution, files: [{path, hash?, symbols?}]}` → `{verified: N}`:
+//!   «проверено, знание актуально» — ссылки решения на пути снова `ok` с новым хэшем (у
+//!   символьных — хэш тела из `symbols`).
 //!
 //!   Оба маршрута — право записи в решение (`ro`-токен и участник `ro` — 403); меняются
 //!   ссылки базы владельца решения и, у участника, ещё его личной базы (Knowledge со ссылками
 //!   на это решение). Ошибка в файле — 422 `files[i]: …`. Маршруты служебные, не в
 //!   `memory_routes`: текст памяти они не пишут, `memory_writes` не растёт.
 //! - `GET /file-refs?solution=<guid>` (или `X-Zam-Solution`) → `{etag, refs: [{path, hash?,
-//!   items: [{id, kind, title, state}]}]}`: индекс для кэша хуков (до 5 записей на путь, новые
-//!   первыми; `id` — ссылка `n:`/`i:`/`c:`/…). Участнику — только пространство решения и его
-//!   Knowledge. `ETag` — blake3 канонического JSON `{refs}`, `If-None-Match` → 304.
-//! - `GET /graph?file=<path>` ([`super::graph`]) и `filters.file` поиска — «что память знает об
-//!   этом файле».
+//!   items: [{id, kind, title, state, symbol?}]}]}`: индекс для кэша хуков (до 5 записей на
+//!   путь, символьные, затем новые первыми; `id` — ссылка `n:`/`i:`/`c:`/…). Участнику —
+//!   только пространство решения и его Knowledge. `ETag` — blake3 канонического JSON `{refs}`,
+//!   `If-None-Match` → 304.
+//! - `GET /graph?file=<path>` ([`super::graph`]; `путь#qual` — путь символа) и `filters.file`
+//!   поиска — «что память знает об этом файле».
 use std::collections::BTreeMap;
 
 use axum::Json;
@@ -36,6 +41,7 @@ use axum::response::{IntoResponse, Response};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use zam_code::{QUAL_MAX_CHARS, SymbolHash, split_ref};
 use zam_core::{Id, SolutionGuid, TargetRef};
 use zam_store::file_refs::{FILES_MAX, REFS_MAX};
 use zam_store::{
@@ -80,8 +86,82 @@ fn hash_of(o: &serde_json::Map<String, Value>, what: &str) -> Result<Option<Stri
         .transpose()
 }
 
-/// `refs` запроса записи журнала: `{files: [{path, hash?, commit?}]}` → ссылки (повтор пути —
-/// первая). `null` и `{}` — пустой набор; ошибки — 422 `refs…`.
+/// Символ ссылки (`qual`, M5.6 §8): 1..=512 символов без управляющих и без `/` (иначе `путь#qual`
+/// разбирался бы как путь) или 422 `<what>: …`.
+fn check_symbol(q: &str, what: &str) -> Result<(), ApiError> {
+    if q.is_empty() {
+        return Err(unprocessable(format!("{what}: пустая строка")));
+    }
+    if q.chars().count() > QUAL_MAX_CHARS {
+        return Err(unprocessable(format!(
+            "{what}: длиннее {QUAL_MAX_CHARS} символов"
+        )));
+    }
+    if q.chars().any(char::is_control) {
+        return Err(unprocessable(format!("{what}: управляющие символы")));
+    }
+    if q.contains('/') {
+        return Err(unprocessable(format!("{what}: «/» в qual недопустим")));
+    }
+    Ok(())
+}
+
+/// Хэш тела символа: 16 hex (в нижний регистр) или `None`.
+fn body_hash_of(s: &str) -> Option<String> {
+    let s = s.trim();
+    (s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
+}
+
+/// Хэши тел символов файла `{what}.symbols: [{qual, body_hash}]` (`/files/changed`,
+/// `/files/verified`, `/code/impact`): нет поля или `null` — `None`; больше `max` символов,
+/// неверный `qual` или `body_hash` — 422 `<what>.symbols…`. Список считается полным: не
+/// найденный в нём символ ссылки — `symbol_removed` (клиент шлёт символы, только если разбор
+/// полный — `zam_code::symbol_hashes`; неполный — без поля, ссылки судятся по хэшу файла).
+pub(crate) fn symbol_hashes_of(
+    v: Option<&Value>,
+    max: u32,
+    what: &str,
+) -> Result<Option<Vec<SymbolHash>>, ApiError> {
+    let a = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(a)) => a,
+        Some(_) => return Err(unprocessable(format!("{what}.symbols: ожидается массив"))),
+    };
+    if a.len() > max as usize {
+        return Err(unprocessable(format!(
+            "{what}.symbols: не больше {max} символов (code.max_symbols_per_file)"
+        )));
+    }
+    let mut out = Vec::with_capacity(a.len());
+    for (j, s) in a.iter().enumerate() {
+        let w = format!("{what}.symbols[{j}]");
+        let so = s
+            .as_object()
+            .ok_or_else(|| unprocessable(format!("{w}: ожидается объект {{qual, body_hash}}")))?;
+        if let Some(k) = so
+            .keys()
+            .find(|k| !["qual", "body_hash"].contains(&k.as_str()))
+        {
+            return Err(unprocessable(format!("{w}.{k}: неизвестное поле")));
+        }
+        let qual = opt_str(so, "qual", &w)?
+            .ok_or_else(|| unprocessable(format!("{w}.qual: обязательное поле")))?;
+        check_symbol(qual, &format!("{w}.qual"))?;
+        let body_hash = opt_str(so, "body_hash", &w)?
+            .and_then(body_hash_of)
+            .ok_or_else(|| unprocessable(format!("{w}.body_hash: 16 hex-символов")))?;
+        out.push(SymbolHash {
+            qual: qual.to_string(),
+            body_hash,
+        });
+    }
+    Ok(Some(out))
+}
+
+/// `refs` запроса записи журнала: `{files: [{path, symbol?, hash?, symbol_hash?, commit?}]}` →
+/// ссылки (повтор `(путь, символ)` — первая). `path` вида `a.rs#qual` без `symbol` — ссылка на
+/// символ ([`zam_code::split_ref`], M5.6 §8); `symbol` вместе с `путь#qual` — 422. `null` и
+/// `{}` — пустой набор; ошибки — 422 `refs…`.
 pub fn parse_refs(v: &Value) -> Result<Vec<FileRef>, ApiError> {
     let o = match v {
         Value::Null => return Ok(Vec::new()),
@@ -105,18 +185,47 @@ pub fn parse_refs(v: &Value) -> Result<Vec<FileRef>, ApiError> {
     for (i, f) in files.iter().enumerate() {
         let what = format!("refs.files[{i}]");
         let o = f.as_object().ok_or_else(|| {
-            unprocessable(format!("{what}: ожидается объект {{path, hash?, commit?}}"))
+            unprocessable(format!(
+                "{what}: ожидается объект {{path, symbol?, hash?, symbol_hash?, commit?}}"
+            ))
         })?;
         if let Some(k) = o
             .keys()
-            .find(|k| !["path", "hash", "commit"].contains(&k.as_str()))
+            .find(|k| !["path", "symbol", "hash", "symbol_hash", "commit"].contains(&k.as_str()))
         {
             return Err(unprocessable(format!("{what}.{k}: неизвестное поле")));
         }
         let raw = opt_str(o, "path", &what)?
             .ok_or_else(|| unprocessable(format!("{what}.path: обязательное поле")))?;
-        let path = path_of(raw, &format!("{what}.path"))?;
+        let (raw_path, symbol) = match opt_str(o, "symbol", &what)? {
+            Some(s) => {
+                if split_ref(raw.trim()).1.is_some() {
+                    return Err(unprocessable(format!(
+                        "{what}.symbol: символ уже задан в path (путь#qual)"
+                    )));
+                }
+                check_symbol(s, &format!("{what}.symbol"))?;
+                (raw, Some(s.to_string()))
+            }
+            None => {
+                let (p, s) = split_ref(raw.trim());
+                (p, s.map(str::to_string))
+            }
+        };
+        let path = path_of(raw_path, &format!("{what}.path"))?;
         let hash = hash_of(o, &what)?;
+        let symbol_hash = opt_str(o, "symbol_hash", &what)?
+            .map(|h| {
+                if symbol.is_none() {
+                    return Err(unprocessable(format!(
+                        "{what}.symbol_hash: только у ссылки на символ (symbol или путь#qual)"
+                    )));
+                }
+                body_hash_of(h).ok_or_else(|| {
+                    unprocessable(format!("{what}.symbol_hash: body_hash символа, 16 hex"))
+                })
+            })
+            .transpose()?;
         let commit = opt_str(o, "commit", &what)?
             .map(|c| {
                 check_commit(c).ok_or_else(|| {
@@ -124,9 +233,11 @@ pub fn parse_refs(v: &Value) -> Result<Vec<FileRef>, ApiError> {
                 })
             })
             .transpose()?;
-        if !out.iter().any(|r| r.path == path) {
+        if !out.iter().any(|r| r.path == path && r.symbol == symbol) {
             out.push(FileRef {
+                symbol,
                 hash,
+                symbol_hash,
                 commit,
                 ..FileRef::path_only(path)
             });
@@ -154,11 +265,16 @@ fn guid_of(raw: &str) -> Result<SolutionGuid, ApiError> {
         .map_err(|_| unprocessable("solution: GUID решения (UUID с дефисами)"))
 }
 
-/// Файлы сообщения: `(путь, хэш)`; `need_hash` — хэш обязателен. 422 `files[i]: …`.
+/// Файл сообщения: путь, хэш и хэши тел символов, если присланы.
+type MsgFile = (String, Option<String>, Option<Vec<SymbolHash>>);
+
+/// Файлы сообщения `[{path, hash, symbols?}]`; `need_hash` — хэш обязателен; символов в файле —
+/// не больше `max_symbols`. 422 `files[i]: …`.
 fn parse_files(
     files: &[Value],
     need_hash: bool,
-) -> Result<Vec<(String, Option<String>)>, ApiError> {
+    max_symbols: u32,
+) -> Result<Vec<MsgFile>, ApiError> {
     if files.len() > FILES_MAX {
         return Err(unprocessable(format!(
             "files: не больше {FILES_MAX} за запрос"
@@ -167,10 +283,13 @@ fn parse_files(
     let mut out = Vec::with_capacity(files.len());
     for (i, f) in files.iter().enumerate() {
         let what = format!("files[{i}]");
-        let o = f
-            .as_object()
-            .ok_or_else(|| unprocessable(format!("{what}: ожидается объект {{path, hash}}")))?;
-        if let Some(k) = o.keys().find(|k| !["path", "hash"].contains(&k.as_str())) {
+        let o = f.as_object().ok_or_else(|| {
+            unprocessable(format!("{what}: ожидается объект {{path, hash, symbols?}}"))
+        })?;
+        if let Some(k) = o
+            .keys()
+            .find(|k| !["path", "hash", "symbols"].contains(&k.as_str()))
+        {
             return Err(unprocessable(format!("{what}.{k}: неизвестное поле")));
         }
         let raw = opt_str(o, "path", &what)?
@@ -180,7 +299,8 @@ fn parse_files(
         if need_hash && hash.is_none() {
             return Err(unprocessable(format!("{what}.hash: обязательное поле")));
         }
-        out.push((path, hash));
+        let symbols = symbol_hashes_of(o.get("symbols"), max_symbols, &what)?;
+        out.push((path, hash, symbols));
     }
     Ok(out)
 }
@@ -223,12 +343,13 @@ pub async fn changed(
 ) -> Result<Json<Value>, ApiError> {
     let req: FilesReq = json_body(body)?;
     let (sc, guid) = write_scope(&st, &p, &headers, &req.solution).await?;
-    let files: Vec<ChangedFile> = parse_files(&req.files, true)?
+    let max = st.cfg.code.max_symbols_per_file;
+    let files: Vec<ChangedFile> = parse_files(&req.files, true, max)?
         .into_iter()
-        .map(|(path, h)| ChangedFile {
+        .map(|(path, h, symbols)| ChangedFile {
             path,
             hash: h.unwrap_or_default(),
-            symbols: None,
+            symbols,
         })
         .collect();
     let now = Timestamp::now();
@@ -248,10 +369,7 @@ pub async fn verified(
 ) -> Result<Json<Value>, ApiError> {
     let req: FilesReq = json_body(body)?;
     let (sc, guid) = write_scope(&st, &p, &headers, &req.solution).await?;
-    let files: Vec<_> = parse_files(&req.files, false)?
-        .into_iter()
-        .map(|(p, h)| (p, h, None))
-        .collect();
+    let files = parse_files(&req.files, false, st.cfg.code.max_symbols_per_file)?;
     let now = Timestamp::now();
     let mut verified = 0;
     for (db, spaces) in report_dbs(&st, &p, &sc).await? {
@@ -365,9 +483,10 @@ pub async fn index(
     Ok(r)
 }
 
-/// Владельцы ссылок на путь `raw` (нормализуется; ошибка — 422 `file: …`), видимые запросу:
-/// в решении `solution` (база владельца, у участника — только пространство решения) или,
-/// без решения, в личной базе. Возвращает базу и ссылки (новые первыми).
+/// Владельцы ссылок на путь `raw` (нормализуется; ошибка — 422 `file: …`; `путь#qual` — путь
+/// символа: знания о символе и о его файле, M5.6 §8), видимые запросу: в решении `solution`
+/// (база владельца, у участника — только пространство решения) или, без решения, в личной
+/// базе. Возвращает базу и ссылки (символьные первыми, затем новые первыми).
 pub(crate) async fn file_owners(
     st: &AppState,
     p: &Principal,
@@ -375,7 +494,7 @@ pub(crate) async fn file_owners(
     raw: &str,
     solution: Option<SolutionGuid>,
 ) -> Result<(Db, Vec<TargetRef>), ApiError> {
-    let path = path_of(raw, "file")?;
+    let path = path_of(split_ref(raw.trim()).0, "file")?;
     let (db, spaces): (Db, Vec<Id>) = match solution {
         Some(g) => {
             let sc = space_scope(st, p, headers, g.as_str(), Mode::Read).await?;

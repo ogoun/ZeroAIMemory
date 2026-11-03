@@ -266,7 +266,8 @@ pub fn refresh_triggers(
     Ok((Refresh::Updated(c.triggers.len()), warnings))
 }
 
-/// Запись индекса `GET /file-refs`: ссылка (`n:`/`i:`/…), вид, заголовок, состояние.
+/// Запись индекса `GET /file-refs`: ссылка (`n:`/`i:`/…), вид, заголовок, состояние и символ
+/// (`qual`, если ссылка на символ — M5.6 §8; кэш клиента M4.5 без поля читается).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RefItem {
@@ -274,6 +275,8 @@ pub struct RefItem {
     pub kind: String,
     pub title: String,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
 }
 
 /// Путь индекса `GET /file-refs`: последний записанный хэш и до 5 записей.
@@ -302,6 +305,12 @@ impl FileRefsCache {
         self.refs
             .iter()
             .find(|r| crate::cmd::refs::same_path(&r.path, path))
+    }
+
+    /// У пути есть ссылки на символы (хук правки разбирает файл, M5.6 §8).
+    pub fn has_symbol_refs(&self, path: &str) -> bool {
+        self.find(path)
+            .is_some_and(|p| p.items.iter().any(|i| i.symbol.is_some()))
     }
 }
 
@@ -372,11 +381,15 @@ pub fn refresh_file_refs(env: &Env, client: &Client) -> Result<Option<Refresh>, 
     Ok(Some(Refresh::Updated(c.refs.len())))
 }
 
-/// Строка очереди `changed-<сессия>.jsonl`.
+/// Строка очереди `changed-<сессия>.jsonl` и файл `POST /files/changed`: путь, хэш и (M5.6 §8)
+/// хэши тел **всех** символов файла — только при полном разборе; строка клиента M4.5 без поля
+/// читается.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Changed {
     pub path: String,
     pub hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbols: Option<Vec<zam_code::SymbolHash>>,
 }
 
 pub fn changed_path(env: &Env, session: &str) -> PathBuf {
@@ -472,7 +485,7 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     if taken.is_empty() {
         return;
     }
-    // (путь, хэш, номер очереди) — повтор пути: последний хэш
+    // (строка, номер очереди) — повтор пути: последняя строка (хэш и символы)
     let mut files: Vec<(Changed, usize)> = Vec::new();
     for (qi, (_, t)) in taken.iter().enumerate() {
         let bytes = std::fs::read(t).unwrap_or_default();
@@ -490,11 +503,8 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     } else if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
         files.clone()
     } else {
-        let pairs: Vec<(String, String)> = files[..n]
-            .iter()
-            .map(|(c, _)| (c.path.clone(), c.hash.clone()))
-            .collect();
-        match crate::cmd::refs::post_changed(client, &sol, &pairs) {
+        let send: Vec<Changed> = files[..n].iter().map(|(c, _)| c.clone()).collect();
+        match crate::cmd::refs::post_changed(client, &sol, &send) {
             Ok(_) => files[n..].to_vec(),
             Err(e) if permanent(&e) => {
                 env.log(&format!(

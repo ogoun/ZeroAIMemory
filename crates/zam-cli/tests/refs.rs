@@ -518,3 +518,139 @@ fn refs_paths_windows_case_and_backslash() {
         assert_eq!(o.trim(), "подтверждено ссылок: 3");
     }
 }
+
+// ---------- M5.6, задача 6: ссылки на символы `путь#qual` ----------
+
+const LIB_RS: &[u8] = b"pub struct Store;\n\nimpl Store {\n    pub fn open() -> Store {\n        Store\n    }\n}\n\npub fn helper() {}\n";
+
+/// `zam log … --ref путь#qual`: в `refs.files` — путь, символ, хэш файла и `body_hash`
+/// символа (разбор файла); `data.refs.files` changelog — строка `путь#qual`. Символа нет в
+/// файле или файла нет — код 6 «символ `qual` не найден в `путь`», запроса нет.
+#[test]
+fn cli_ref_symbol_hash_and_missing_symbol_exit_6() {
+    let (url, seen) = stub();
+    let p = Proj::new("ref-symbol", &url, "zam_stub");
+    p.file("src/store.rs", LIB_RS);
+    let o = p.zam_in(
+        "src",
+        &[
+            "log",
+            "changelog",
+            "--kind",
+            "fix",
+            "--title",
+            "Правка open",
+            "--ref",
+            "store.rs#Store::open",
+            "--ref",
+            "store.rs",
+        ],
+        b"text\n",
+    );
+    ok(&o);
+    let s = seen.lock().unwrap().clone();
+    let body = &s
+        .iter()
+        .find(|(m, p, _)| m == "POST" && p.ends_with("/entries"))
+        .expect("POST записи")
+        .2;
+    let files = body["refs"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{body}");
+    assert_eq!(files[0]["path"], "src/store.rs", "{body}");
+    assert_eq!(files[0]["symbol"], "Store::open", "{body}");
+    assert_eq!(files[0]["hash"], blake(LIB_RS));
+    let sh = files[0]["symbol_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(sh.len(), 16, "{body}");
+    assert!(files[1].get("symbol").is_none(), "{body}");
+    assert!(files[1].get("symbol_hash").is_none(), "{body}");
+    assert_eq!(
+        body["data"]["refs"]["files"],
+        json!(["src/store.rs#Store::open", "src/store.rs"])
+    );
+    // нет символа, нет файла — код 6 без запроса
+    let before = seen.lock().unwrap().len();
+    for r in ["src/store.rs#Store::close", "src/none.rs#foo"] {
+        let o = p.zam(&[
+            "log", "insight", "--kind", "gotcha", "--title", "x", "--ref", r,
+        ]);
+        assert_eq!(o.status.code(), Some(6), "{r}: {}", out(&o));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("не найден"), "{r}: {err}");
+    }
+    let o = p.zam(&[
+        "log",
+        "insight",
+        "--kind",
+        "gotcha",
+        "--title",
+        "x",
+        "--ref",
+        "src/store.rs#Store::close",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&o.stderr)
+            .contains("символ `Store::close` не найден в `src/store.rs`"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(seen.lock().unwrap().len(), before);
+}
+
+/// `zam write --ref путь#qual`: строка `"путь#qual"` во frontmatter, подтверждение хэшей файла
+/// и тел символов; символа нет — код 6, заметка не пишется.
+#[test]
+fn write_ref_symbol_into_frontmatter() {
+    let (url, tok) = start("write-symbol");
+    let p = Proj::new("write-symbol", &url, &tok);
+    p.file("src/store.rs", LIB_RS);
+    let o = p.zam_in(
+        "",
+        &[
+            "write",
+            "arch/store.md",
+            "--ref",
+            "src/store.rs#Store::open",
+        ],
+        "# Хранилище\nтекст\n".as_bytes(),
+    );
+    ok(&o);
+    let note = p.get(&format!(
+        "/nodes/by-path?space={G}&path=arch/store.md&format=json"
+    ));
+    let content = note["content"].as_str().unwrap();
+    assert!(
+        content.contains("refs:\n  - \"src/store.rs#Store::open\"\n"),
+        "{content}"
+    );
+    let idx = p.index();
+    let pr = path_of(&idx, "src/store.rs");
+    assert_eq!(pr["items"][0]["symbol"], "Store::open", "{idx}");
+    assert_eq!(pr["items"][0]["state"], "ok", "{idx}");
+    assert_eq!(pr["hash"], blake(LIB_RS), "подтверждён хэш файла: {idx}");
+    // правка другого символа (через refs check — по хэшу файла) не трогает тело `open`;
+    // подтверждение с символами (`refs verify`) оставляет ссылку ok
+    p.file(
+        "src/store.rs",
+        b"pub struct Store;\n\nimpl Store {\n    pub fn open() -> Store {\n        Store\n    }\n}\n\npub fn helper() { let _ = 1; }\n",
+    );
+    ok(&p.zam(&["refs", "verify", "src/store.rs"]));
+    assert_eq!(states(&p.index(), "src/store.rs"), ["ok"]);
+    // символа нет — код 6, заметки нет
+    let o = p.zam_in(
+        "",
+        &["write", "arch/bad.md", "--ref", "src/store.rs#Nope"],
+        "# Нет\n".as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(6), "{}", out(&o));
+    let r = http()
+        .get(&format!(
+            "{}/api/v1/nodes/by-path?space={G}&path=arch/bad.md",
+            p.url
+        ))
+        .header("Authorization", format!("Bearer {}", p.token))
+        .call()
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+}

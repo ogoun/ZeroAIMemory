@@ -669,17 +669,42 @@ fn central_json(hits: &[SymbolHit]) -> Vec<Value> {
         .collect()
 }
 
-/// Строка дайджеста (§10): размер карты, возраст снимка, центральные символы.
-fn digest_line(s: &CodeStatus, central: &[Value]) -> String {
+/// Предел строки дайджеста карты, токенов (§10).
+pub const DIGEST_LINE_TOKENS: usize = 80;
+
+/// Возраст снимка в строке дайджеста (Minor 7 ревью задачи 4): «N мин» (меньше часа), «N ч»
+/// (меньше 48 ч), иначе «N дн.».
+fn digest_age(secs: i64) -> String {
+    match secs.max(0) {
+        s @ ..3600 => format!("{} мин", s / 60),
+        s @ ..172_800 => format!("{} ч", s / 3600),
+        s => format!("{} дн.", s / 86_400),
+    }
+}
+
+/// Снимок строки дайджеста: `ветка@коммит7` — что известно, без машины (Minor 7).
+fn digest_snapshot(s: &CodeSnapshot) -> Option<String> {
+    let commit = s.commit.as_deref().map(|c| &c[..c.len().min(7)]);
+    match (s.branch.as_deref(), commit) {
+        (Some(b), Some(c)) => Some(format!("{b}@{c}")),
+        (Some(b), None) => Some(b.to_string()),
+        (None, Some(c)) => Some(c.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Строка дайджеста (§10): размер карты, возраст снимка, центральные символы — до
+/// [`DIGEST_CENTRAL`]; строка длиннее [`DIGEST_LINE_TOKENS`] по `count` — центральных 2, 1, 0.
+fn digest_line(s: &CodeStatus, central: &[Value], count: &dyn Fn(&str) -> usize) -> String {
     let snap = &s.snapshot;
-    let mut line = format!(
+    let mut head = format!(
         "ZeroAIMemory: карта кода: {}, {}, снимок {}",
         files_text(snap.files),
         symbols_text(snap.symbols),
-        age_text(age_s(snap))
+        digest_age(age_s(snap))
     );
-    if let Some(t) = snapshot_text(snap) {
-        line.push_str(&format!(" ({t})"));
+    if let Some(t) = digest_snapshot(snap) {
+        head.push_str(&format!(" ({t})"));
     }
     let names: Vec<String> = central
         .iter()
@@ -687,21 +712,32 @@ fn digest_line(s: &CodeStatus, central: &[Value]) -> String {
         .filter_map(|c| c["qual"].as_str())
         .map(|q| q.chars().take(DIGEST_QUAL_MAX).collect())
         .collect();
-    if !names.is_empty() {
-        line.push_str(&format!("; центральные: {}", names.join(", ")));
-    }
-    line.push_str(" — `memory_code`/`zam code map`");
-    line
+    let line = |n: usize| {
+        let mut l = head.clone();
+        if n > 0 {
+            l.push_str(&format!("; центральные: {}", names[..n].join(", ")));
+        }
+        l.push_str(" — `memory_code`/`zam code map`");
+        l
+    };
+    (1..=names.len())
+        .rev()
+        .map(line)
+        .find(|l| count(l) <= DIGEST_LINE_TOKENS)
+        .unwrap_or_else(|| line(0))
 }
 
-/// Строка дайджеста карты решения (для `/recall`, задача 6); карты нет или она пуста — `None`.
-pub async fn code_line(sc: &MemScope, guid: &str) -> Option<String> {
-    let s = store_status(sc, guid).await.ok()??;
+/// Строка дайджеста карты решения `guid` в базе `db` (для `/recall`: `session_start` и
+/// `recovery`, задача 6); карты нет, она пуста или не читается — `None`.
+pub async fn code_line(db: &Db, guid: &str) -> Option<String> {
+    let s = code_status(db, guid).await.ok()??;
     if s.snapshot.files == 0 {
         return None;
     }
-    let central = store_central(sc, guid, DIGEST_CENTRAL).await.ok()?;
-    Some(digest_line(&s, &central_json(&central)))
+    let central = code_central(db, guid, DIGEST_CENTRAL, CENTRAL_FILES_MAX)
+        .await
+        .ok()?;
+    Some(digest_line(&s, &central_json(&central), &count_tokens))
 }
 
 // ---- POST /code/sync ----
@@ -1060,7 +1096,7 @@ pub async fn status(
         return with_etag(&headers, &etag, || Value::Null);
     }
     let central = central_json(&store_central(&sc, &g, STATUS_CENTRAL).await?);
-    let digest = (snap.files > 0).then(|| digest_line(&s, &central));
+    let digest = (snap.files > 0).then(|| digest_line(&s, &central, &count_tokens));
     let skipped: Vec<Value> = s
         .skipped
         .iter()
@@ -1819,35 +1855,7 @@ fn parse_impact(files: &[Value], max_symbols: u32) -> Result<Vec<ImpactFile>, Ap
             .ok_or_else(|| unprocessable(format!("{what}: ожидается объект {{path, symbols?}}")))?;
         known_fields(o, &["path", "symbols"], &what)?;
         let path = path_of(str_field(o, "path", &what)?, &format!("{what}.path"))?;
-        let symbols = match o.get("symbols") {
-            None | Some(Value::Null) => None,
-            Some(Value::Array(a)) => {
-                if a.len() > max_symbols as usize {
-                    return Err(unprocessable(format!(
-                        "{what}.symbols: не больше {max_symbols} символов (code.max_symbols_per_file)"
-                    )));
-                }
-                let mut syms = Vec::with_capacity(a.len());
-                for (j, s) in a.iter().enumerate() {
-                    let w = format!("{what}.symbols[{j}]");
-                    let so = s.as_object().ok_or_else(|| {
-                        unprocessable(format!("{w}: ожидается объект {{qual, body_hash}}"))
-                    })?;
-                    known_fields(so, &["qual", "body_hash"], &w)?;
-                    let qual = str_field(so, "qual", &w)?;
-                    check_text(qual, QUAL_MAX_CHARS, &format!("{w}.qual"), false)?;
-                    check_qual(qual, &format!("{w}.qual"))?;
-                    let body_hash = hex_of(str_field(so, "body_hash", &w)?, &[16])
-                        .ok_or_else(|| unprocessable(format!("{w}.body_hash: 16 hex-символов")))?;
-                    syms.push(SymbolHash {
-                        qual: qual.to_string(),
-                        body_hash,
-                    });
-                }
-                Some(syms)
-            }
-            Some(_) => return Err(unprocessable(format!("{what}.symbols: ожидается массив"))),
-        };
+        let symbols = super::files::symbol_hashes_of(o.get("symbols"), max_symbols, &what)?;
         if !out.iter().any(|(p, _)| *p == path) {
             out.push((path, symbols));
         }
@@ -2002,5 +2010,62 @@ mod tests {
             Some("abcdef0123456789")
         );
         assert!(hex_of("xyz", &[16]).is_none());
+    }
+
+    /// Minor 7 ревью задачи 4: возраст «N мин / N ч / N дн.», без машины, центральные
+    /// сокращаются 3 → 2 → 1 → 0, пока строка длиннее предела.
+    #[test]
+    fn digest_line_age_snapshot_and_central_cut() {
+        assert_eq!(digest_age(59), "0 мин");
+        assert_eq!(digest_age(3599), "59 мин");
+        assert_eq!(digest_age(3600), "1 ч");
+        assert_eq!(digest_age(47 * 3600 + 59), "47 ч");
+        assert_eq!(digest_age(48 * 3600), "2 дн.");
+        let snap = |branch: Option<&str>, commit: Option<&str>| CodeSnapshot {
+            solution: "g".into(),
+            commit: commit.map(str::to_string),
+            branch: branch.map(str::to_string),
+            machine: Some("box".into()),
+            updated_at: Timestamp::now(),
+            files: 2,
+            symbols: 5,
+            etag: String::new(),
+            rank_state: RankState::Ok,
+            ranked_at: None,
+        };
+        let status = |s: CodeSnapshot| CodeStatus {
+            snapshot: s,
+            by_lang: Vec::new(),
+            skipped: Vec::new(),
+            skipped_total: 0,
+            other_share: 0.0,
+        };
+        let c = |q: &str| json!({"qual": q});
+        let central = [c("Store::open"), c("Db"), c("route")];
+        let chars = |t: &str| t.chars().count();
+        let s = status(snap(Some("main"), Some("abcdef1234")));
+        assert_eq!(
+            digest_line(&s, &central, &|_| 0),
+            "ZeroAIMemory: карта кода: 2 файла, 5 символов, снимок 0 мин (main@abcdef1); \
+             центральные: Store::open, Db, route — `memory_code`/`zam code map`"
+        );
+        // без ветки и коммита — без скобок; машина не показывается
+        let s0 = status(snap(None, None));
+        let l = digest_line(&s0, &central[..1], &|_| 0);
+        assert!(l.contains("снимок 0 мин; центральные: Store::open"), "{l}");
+        assert!(!l.contains("box"), "{l}");
+        // предел по счётчику: длина строки с 3, 2, 1 центральным
+        let full = chars(&digest_line(&s, &central, &|_| 0));
+        let cut = |limit: usize| {
+            digest_line(&s, &central, &|t: &str| {
+                (chars(t) * DIGEST_LINE_TOKENS).div_ceil(limit)
+            })
+        };
+        assert!(cut(full).contains("route"));
+        let two = cut(full - 1);
+        assert!(two.contains("Store::open, Db —"), "{two}");
+        let none = cut(10);
+        assert!(!none.contains("центральные"), "{none}");
+        assert!(none.ends_with(" — `memory_code`/`zam code map`"), "{none}");
     }
 }

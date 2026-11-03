@@ -20,6 +20,8 @@
 //! дописывает после его текста сводку журнала сессии ([`journal::render_summary`], ключи
 //! `recovery` и `session_journal`); общий предел — прежний ([`output::with_tail`]). Сервер
 //! недоступен — только сводка; журнала нет — только текст сервера.
+//! M5.6 §5: до запросов — запуск фоновой `zam code sync --background`, если пора
+//! ([`crate::cmd::code::auto::maybe_spawn_sync`]; сервер для запуска не нужен).
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -52,6 +54,8 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             }
         }
     }
+    // карта кода (M5.6 §5): фоновая синхронизация, если пора; хук её не ждёт (≤ 10 мс)
+    crate::cmd::code::auto::maybe_spawn_sync(env, s);
     // сводка журнала до сжатия (§9.2): только после `compact`/`resume`
     let summary = |st: &Settings| -> String {
         match session {

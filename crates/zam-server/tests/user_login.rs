@@ -1038,7 +1038,8 @@ async fn user_hook_settings_rest() {
     let (other, _) = a.new_user("Олег").await;
     let all_on = json!({"session_start": true, "prompt": true, "pre_tool": true,
                         "post_tool": true, "checkpoint": true, "subagent_start": true,
-                        "file_context": true, "session_journal": true, "recovery": true});
+                        "file_context": true, "session_journal": true, "recovery": true,
+                        "code_map": true});
     let r = web(&a, &w, Method::GET, "/api/v1/auth/settings", None).await;
     ok(&r, StatusCode::OK);
     assert_eq!(r.json()["hooks"], all_on);

@@ -10,6 +10,7 @@
 //!   в `.zeroaimemory/logs/hooks.log` (запускают хуки, задача 6); stdout и stderr пусты.
 //! - Коды выхода — ТЗ §13.2: нет решения или неверный `[code]` — 1, сервер недоступен — 2,
 //!   неверный ввод — 6; идущая синхронизация и `code.enabled = false` — 0 со строкой в stderr.
+pub mod auto;
 pub mod config;
 pub mod scan;
 pub mod state;

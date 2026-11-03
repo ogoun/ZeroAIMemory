@@ -17,6 +17,8 @@
 //! M4.5: `PreCompact` пишет в журнал сессии `Ev::Compact {trigger}` (ключ `session_journal`);
 //! на `Stop` и `PreCompact` очередь изменённых файлов сессии уходит `POST /files/changed`
 //! параллельно с `GET /sessions/{id}` в том же бюджете ([`cache::flush_changed`]).
+//! M5.6 §5: были правки в сессии — запуск фоновой `zam code sync --background`, если пора
+//! ([`crate::cmd::code::auto::maybe_spawn_sync`]).
 use super::cache;
 use super::input::Input;
 use super::journal::{self, Ev};
@@ -67,6 +69,10 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             .take(32)
             .collect();
         journal::note(env, id, &Ev::Compact { trigger });
+    }
+    // карта кода (M5.6 §5): после правок сессии — фоновая синхронизация, если пора
+    if session.is_some_and(|id| cache::had_edits(env, id)) {
+        crate::cmd::code::auto::maybe_spawn_sync(env, s);
     }
     let queued =
         env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
