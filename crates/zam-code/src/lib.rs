@@ -14,7 +14,7 @@ pub mod rank;
 #[cfg(feature = "parse")]
 pub mod extract;
 
-pub use names::{fts_terms, split_ident, split_ref};
+pub use names::{fts_terms, is_line_anchor, split_ident, split_ref, valid_qual};
 pub use pack::{MapFile, MapSym, Packed, map_line, render_map, render_map_rest};
 pub use proto::{
     EXTRACT_VERSION, FileUpload, Lang, MISSING_HASH, ManifestItem, NAME_MAX_CHARS, PATH_MAX_CHARS,

@@ -60,9 +60,10 @@ fn strip_dup_suffix(qual: &str) -> &str {
 /// Ссылка памяти `путь#qual` → `(путь, Some(qual))`; иначе `(raw, None)`.
 ///
 /// Символ отделяется по последнему `#`, при котором префикс — путь кода (`lang_of`), а суффикс —
-/// допустимый `qual`: 1..=512 символов, без `/` и управляющих, `#` — только суффикс одноимённых
-/// `#N`, не якорь строки в стиле GitHub (`L10`, `L10-L20`, `L10-20`). Поэтому `a.rs#foo#2` —
-/// символ `foo#2`, а `docs/a#b.md`, `a.rs#`, `a.rs#x/y`, `src/a.rs#L10-L20` — пути (как в 0.0.8).
+/// допустимый `qual` ([`valid_qual`]) и не якорь строки в стиле GitHub ([`is_line_anchor`]:
+/// `L10`, `L10-L20`, `L10-20`). Поэтому `a.rs#foo#2` — символ `foo#2`, а `docs/a#b.md`, `a.rs#`,
+/// `a.rs#x/y`, `src/a.rs#L10-L20` — пути (как в 0.0.8). Якорь — правило только этого разбора:
+/// символ с именем `L10` в списках `symbols` допустим, но строкой `путь#L10` не адресуется.
 ///
 /// Разбор линеен по длине строки (вход недоверенный): строка длиннее [`REF_MAX_BYTES`] — путь
 /// без разбора (его отвергнет нормализация пути: символов больше `PATH_MAX_CHARS`), а `qual`
@@ -77,7 +78,7 @@ pub fn split_ref(raw: &str) -> (&str, Option<&str>) {
             break;
         };
         let (path, qual) = (&raw[..i], &raw[i + 1..]);
-        if lang_of(path).is_some() && valid_qual(qual) {
+        if lang_of(path).is_some() && valid_qual(qual) && !is_line_anchor(qual) {
             return (path, Some(qual));
         }
         end = i;
@@ -85,17 +86,20 @@ pub fn split_ref(raw: &str) -> (&str, Option<&str>) {
     (raw, None)
 }
 
-fn valid_qual(qual: &str) -> bool {
+/// Допустимый `qual` (§8): 1..=512 символов, без `/` и управляющих, `#` — только суффикс
+/// одноимённых `#N`. Якорь строки здесь не проверяется — он касается только разбора `путь#qual`
+/// ([`split_ref`]).
+pub fn valid_qual(qual: &str) -> bool {
     let n = qual.chars().take(QUAL_MAX_CHARS + 1).count();
     if n == 0 || n > QUAL_MAX_CHARS || qual.contains('/') || qual.chars().any(char::is_control) {
         return false;
     }
     let base = strip_dup_suffix(qual);
-    !base.is_empty() && !base.contains('#') && !is_line_anchor(qual)
+    !base.is_empty() && !base.contains('#')
 }
 
 /// Якорь строки в стиле GitHub: `L10`, `L10-L20`, `L10-20`.
-fn is_line_anchor(qual: &str) -> bool {
+pub fn is_line_anchor(qual: &str) -> bool {
     let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let Some(rest) = qual.strip_prefix('L') else {
         return false;

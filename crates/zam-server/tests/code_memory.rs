@@ -314,6 +314,53 @@ async fn files_verified_with_symbols() {
     );
 }
 
+/// Повторное финальное ревью ветки M5.6: символ с именем вида якоря строки (`L2`, `L1-L2`) —
+/// настоящий символ в списках `symbols` (`/files/changed`, `/files/verified`, `/code/impact`):
+/// 200, а не 422 на всю пачку. Якорем он считается только при разборе строки `путь#qual`, а
+/// явный `symbol: "L10"` в `refs.files` — 422.
+#[tokio::test]
+async fn anchor_like_symbols_accepted_in_symbol_lists() {
+    let a = setup("anchor-like").await;
+    let s = syms(&[("L2", 1), ("L1-L2", 2), ("foo", 3)]);
+    let j = changed(
+        &a,
+        json!([{"path": "src/a.rs", "hash": h(1), "symbols": s.clone()}]),
+    )
+    .await;
+    assert!(j["stale"].is_number(), "{j}");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/files/verified",
+            Some(
+                json!({"solution": G, "files": [{"path": "src/a.rs", "hash": h(1),
+                                                   "symbols": s.clone()}]}),
+            ),
+        )
+        .await;
+    ok(&r, StatusCode::OK, "verified");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/code/impact",
+            Some(json!({"solution": G, "files": [{"path": "src/a.rs", "symbols": s}]})),
+        )
+        .await;
+    ok(&r, StatusCode::OK, "impact");
+    let r = a
+        .t(
+            Method::POST,
+            &sol_entries(),
+            Some(
+                json!({"kind": "insight", "title": "Якорь", "body": "Якорь: подробно",
+                        "data": {"kind": "gotcha"}, "force": true,
+                        "refs": {"files": [{"path": "src/a.rs", "symbol": "L10"}]}}),
+            ),
+        )
+        .await;
+    unprocessable(&r, "якорь строки");
+}
+
 #[tokio::test]
 async fn entry_refs_symbol_field_and_hash_suffix() {
     let a = setup("entry-refs").await;

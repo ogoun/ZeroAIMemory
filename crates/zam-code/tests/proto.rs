@@ -140,6 +140,13 @@ fn split_ref_line_anchor_is_path() {
     assert_eq!(split_ref("a.rs#L10a"), ("a.rs", Some("L10a")));
     assert_eq!(split_ref("a.rs#l10"), ("a.rs", Some("l10")));
     assert_eq!(split_ref("a.rs#L10-"), ("a.rs", Some("L10-")));
+    // якорь — правило только разбора строки: как `qual` символа `L10` допустим
+    assert_eq!(split_ref("a.rs#L10#2"), ("a.rs", Some("L10#2")));
+    for q in ["L1", "L10", "L1-L2", "L10-20"] {
+        assert!(zam_code::valid_qual(q), "{q}");
+        assert!(zam_code::is_line_anchor(q), "{q}");
+    }
+    assert!(!zam_code::is_line_anchor("L10#2"));
 }
 
 /// Разбор линеен: недоверенная строка `a.rs#` × 200 000 (1 МБ) — быстро и путём; строка у

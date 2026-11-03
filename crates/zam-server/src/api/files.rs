@@ -88,8 +88,9 @@ fn hash_of(o: &serde_json::Map<String, Value>, what: &str) -> Result<Option<Stri
 
 /// Символ ссылки (`qual`, M5.6 §8): 1..=512 символов без управляющих и без `/` (иначе `путь#qual`
 /// разбирался бы как путь), `#` — только суффикс одноимённых `#N`, у файла кода `path` (`None` —
-/// путь не известен: хэши символов сообщения) — то же правило, что у [`zam_code::split_ref`]
-/// (ревью задачи 6 M5.6, M4); иначе 422 `<what>: …`.
+/// путь не известен: хэши символов сообщения) — правило `qual` разбора `путь#qual`
+/// ([`zam_code::valid_qual`], ревью задачи 6 M5.6, M4) без якоря строки: символ `L10` в списках
+/// `symbols` допустим (повторное финальное ревью ветки M5.6); иначе 422 `<what>: …`.
 fn check_symbol(q: &str, path: Option<&str>, what: &str) -> Result<(), ApiError> {
     if q.is_empty() {
         return Err(unprocessable(format!("{what}: пустая строка")));
@@ -113,13 +114,12 @@ fn check_symbol(q: &str, path: Option<&str>, what: &str) -> Result<(), ApiError>
             zam_store::shown_ref(p)
         )));
     }
-    // то же правило, что у разбора `путь#qual`; итог от пути кода не зависит (`qual` без `/`),
-    // поэтому — короткий путь кода: длинный путь отвергнет нормализация, а не этот разбор
-    let raw = format!("a.rs#{q}");
-    if split_ref(&raw) != ("a.rs", Some(q)) {
+    // то же правило `qual`, что у разбора `путь#qual`, но без якоря строки: символ `L10` в
+    // списке `symbols` настоящий (повторное финальное ревью ветки M5.6); явный `symbol` ссылки
+    // якорем отвергает `parse_refs`
+    if !zam_code::valid_qual(q) {
         return Err(unprocessable(format!(
-            "{what}: недопустимый qual (`#` — только суффикс одноимённых `#N`; якорь строки \
-             `L10`, `L10-L20` — не символ)"
+            "{what}: недопустимый qual (`#` — только суффикс одноимённых `#N`)"
         )));
     }
     Ok(())
@@ -230,6 +230,13 @@ pub fn parse_refs(v: &Value) -> Result<Vec<FileRef>, ApiError> {
                     )));
                 }
                 check_symbol(s, Some(raw.trim()), &format!("{what}.symbol"))?;
+                // строку `путь#L10` разбор читает как путь с якорем — символ так не адресуется
+                if zam_code::is_line_anchor(s) {
+                    return Err(unprocessable(format!(
+                        "{what}.symbol: якорь строки `L10`, `L10-L20` — не символ \
+                         (`путь#{s}` адресует файл)"
+                    )));
+                }
                 (raw, Some(s.to_string()))
             }
             None => {
