@@ -598,6 +598,62 @@ fn cli_ref_symbol_hash_and_missing_symbol_exit_6() {
     assert_eq!(seen.lock().unwrap().len(), before);
 }
 
+/// Финальное ревью ветки M5.6, I2: `zam refs verify` шлёт `symbols` только файлу кода со
+/// ссылками на символы (индекс `GET /file-refs`); сервер 0.0.8 отвергает поле (422 «неизвестное
+/// поле») — пачка повторяется без `symbols`, файлы подтверждаются.
+#[test]
+fn verify_symbols_only_for_symbol_refs_and_retry_on_old_server() {
+    let reply: std::sync::Arc<common::Reply> = std::sync::Arc::new(|m: &str, p: &str, n: usize| {
+        let z = std::time::Duration::ZERO;
+        if m == "GET" && p.starts_with("/api/v1/file-refs") {
+            return (
+                200,
+                r#"{"etag":"e1","refs":[{"path":"src/store.rs","hash":null,"items":[{"id":"n:01X","kind":"note","title":"t","state":"ok","symbol":"Store::open"}]}]}"#,
+                z,
+            );
+        }
+        if m == "POST" && p == "/api/v1/files/verified" && n == 0 {
+            return (
+                422,
+                r#"{"status":422,"title":"Unprocessable Entity","detail":"files[0].symbols: неизвестное поле"}"#,
+                z,
+            );
+        }
+        (200, r#"{"verified":2}"#, z)
+    });
+    let (url, seen) = common::stub_with(reply);
+    let p = Proj::new("verify-old-server", &url, "zam_stub");
+    p.file("src/store.rs", LIB_RS);
+    p.file("src/plain.rs", b"pub fn plain() {}\n");
+    let o = ok(&p.zam(&["refs", "verify", "src/store.rs", "src/plain.rs"]));
+    assert!(o.contains("подтверждено ссылок: 2"), "{o}");
+    let s = seen.lock().unwrap().clone();
+    let posts: Vec<&Value> = s
+        .iter()
+        .filter(|(m, p, _)| m == "POST" && p == "/api/v1/files/verified")
+        .map(|(_, _, b)| b)
+        .collect();
+    assert_eq!(posts.len(), 2, "повтор после 422: {s:?}");
+    let first = posts[0]["files"].as_array().unwrap();
+    assert_eq!(first[0]["path"], "src/store.rs");
+    assert!(
+        first[0]["symbols"].is_array(),
+        "символьные ссылки: {first:?}"
+    );
+    assert_eq!(first[1]["path"], "src/plain.rs");
+    assert!(
+        first[1].get("symbols").is_none(),
+        "без символьных ссылок: {first:?}"
+    );
+    let second = posts[1]["files"].as_array().unwrap();
+    assert_eq!(second.len(), 2);
+    assert!(
+        second.iter().all(|f| f.get("symbols").is_none()),
+        "{second:?}"
+    );
+    assert_eq!(second[0]["hash"], blake(LIB_RS));
+}
+
 /// `zam write --ref путь#qual`: строка `"путь#qual"` во frontmatter, подтверждение хэшей файла
 /// и тел символов; символа нет — код 6, заметка не пишется.
 #[test]

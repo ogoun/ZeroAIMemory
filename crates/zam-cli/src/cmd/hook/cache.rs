@@ -324,18 +324,30 @@ pub fn file_refs_path(root: &Path) -> PathBuf {
 /// Индекс ссылок для сервера `server` (если известен) и решения проекта; битый — `None` и
 /// строка в журнал.
 pub fn usable_file_refs(env: &Env, server: Option<&str>) -> Option<FileRefsCache> {
-    let c: FileRefsCache = match read_json_file(&file_refs_path(&env.root)) {
-        Ok(c) => c?,
+    let sol = env.solution.as_ref().map(|s| s.id.as_str())?;
+    match file_refs_for(&env.root, sol, server) {
+        Ok(c) => c,
         Err(e) => {
             env.log(&format!("кэш file-refs битый, пропущен: {e}"));
-            return None;
+            None
         }
-    };
-    let sol = env.solution.as_ref().map(|s| s.id.as_str());
-    if sol.is_none() || c.solution.as_deref() != sol || server.is_some_and(|s| s != c.server) {
-        return None;
     }
-    Some(c)
+}
+
+/// Индекс ссылок проекта `root` решения `solution` для сервера `server` (если известен): нет
+/// файла или он другого решения/сервера — `Ok(None)`, битый — `Err`.
+pub fn file_refs_for(
+    root: &Path,
+    solution: &str,
+    server: Option<&str>,
+) -> Result<Option<FileRefsCache>, String> {
+    let Some(c) = read_json_file::<FileRefsCache>(&file_refs_path(root))? else {
+        return Ok(None);
+    };
+    if c.solution.as_deref() != Some(solution) || server.is_some_and(|s| s != c.server) {
+        return Ok(None);
+    }
+    Ok(Some(c))
 }
 
 /// `GET /file-refs?solution=` с `If-None-Match` и запись `file-refs.json` (304 — кэш остаётся,

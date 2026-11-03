@@ -137,7 +137,9 @@ fn after_write(ctx: &Ctx, local: &[super::refs::LocalRef]) {
         return;
     };
     let (_, root) = super::refs::cli_root();
-    if let Err(e) = super::refs::post_verified(ctx, &guid, &root, local, true) {
+    // символьные ссылки пути — по локальному индексу и самим `--ref путь#qual`
+    let index = super::refs::local_refs_index(ctx, &guid, &root);
+    if let Err(e) = super::refs::post_verified(ctx, &guid, &root, local, index.as_ref()) {
         eprintln!("--ref: хэши файлов не подтверждены: {e}");
     }
 }

@@ -30,8 +30,8 @@ use serde_json::{Value, json};
 use super::{Ctx, emit, emit_json, home_dir, hook, solution_guid};
 use crate::client::{CliError, read_json};
 
-/// Предел длины пути ссылки, символов (как у сервера).
-pub const PATH_MAX_CHARS: usize = 1000;
+/// Предел длины пути ссылки, символов (общий с сервером, `zam_code`).
+pub use zam_code::PATH_MAX_CHARS;
 /// Предел файлов в одном `POST /files/changed|verified` (как у сервера).
 pub const FILES_MAX: usize = 500;
 /// Предел ссылок одной записи (как у сервера).
@@ -510,37 +510,18 @@ pub fn request_refs(files: &[String]) -> Result<Option<Value>, CliError> {
 }
 
 /// `POST /files/verified {solution, files}` пачками до [`FILES_MAX`]; число подтверждённых.
-/// Путь — один раз (повтор с другим символом — та же строка); у файла кода, на символ которого
-/// есть ссылка (`all_code` — у любого файла кода), — хэши тел **всех** его символов (`symbols`,
-/// M5.6 §8): подтверждение ставит ориентир и прочим символьным ссылкам пути.
+/// Тело — [`verified_files`] по индексу ссылок `index`. Сервер старше 0.0.9 (422
+/// «`files[i].symbols`: неизвестное поле») — пачка повторяется без `symbols`
+/// ([`without_symbols`]): файлы подтверждаются, символьных ссылок такой сервер всё равно не
+/// принимает (финальное ревью ветки M5.6, I2).
 pub fn post_verified(
     ctx: &Ctx,
     guid: &str,
     root: &Path,
     refs: &[LocalRef],
-    all_code: bool,
+    index: Option<&hook::cache::FileRefsCache>,
 ) -> Result<i64, CliError> {
-    let mut files: Vec<Value> = Vec::new();
-    for r in refs {
-        if files
-            .iter()
-            .any(|f| f["path"].as_str().is_some_and(|p| same_path(p, &r.path)))
-        {
-            continue;
-        }
-        let mut o = json!({ "path": r.path });
-        if let Some(h) = &r.hash {
-            o["hash"] = json!(h);
-        }
-        let symbolic = all_code
-            || refs
-                .iter()
-                .any(|x| x.symbol.is_some() && same_path(&x.path, &r.path));
-        if symbolic && let Some(s) = file_symbols(root, &r.path) {
-            o["symbols"] = json!(s);
-        }
-        files.push(o);
-    }
+    let files = verified_files(root, refs, index);
     let mut n = 0;
     // пачки до FILES_MAX путей и ≈ CHANGED_BATCH_BYTES: хэши символов — десятки КиБ на файл
     let mut chunks: Vec<Vec<Value>> = vec![Vec::new()];
@@ -558,13 +539,102 @@ pub fn post_verified(
         chunks.last_mut().expect("есть пачка").push(f);
     }
     for chunk in chunks.into_iter().filter(|c| !c.is_empty()) {
-        let v = read_json(ctx.client.post_json(
-            "/files/verified",
-            &json!({"solution": guid, "files": chunk}),
-        )?)?;
-        n += v["verified"].as_i64().unwrap_or(0);
+        let post = |files: &[Value]| {
+            ctx.client.post_json(
+                "/files/verified",
+                &json!({"solution": guid, "files": files}),
+            )
+        };
+        let resp = match post(&chunk) {
+            Err(e) if unknown_symbols_field(&e) => post(&without_symbols(chunk))?,
+            r => r?,
+        };
+        n += read_json(resp)?["verified"].as_i64().unwrap_or(0);
     }
     Ok(n)
+}
+
+/// Файлы тела `POST /files/verified`: путь — один раз (повтор с другим символом — та же
+/// строка), хэш файла и, у файла кода с символьными ссылками, хэши тел **всех** его символов
+/// (`symbols`, M5.6 §8): подтверждение ставит ориентир и прочим символьным ссылкам пути.
+/// Символьные ссылки пути — в индексе `file-refs.json` (`index`, как у хука правки) или среди
+/// самих `refs` (`zam write --ref путь#qual`: новой ссылки в индексе ещё нет). Прочим файлам
+/// `symbols` не шлётся: сервер 0.0.8 отвергает неизвестное поле.
+/// Индекс ссылок решения для [`post_verified`]: `GET /file-refs` (свежий), сбой — локальный
+/// `file-refs.json` (как у хуков), нет и его — `None`.
+pub fn refs_index(ctx: &Ctx, guid: &str, root: &Path) -> Option<hook::cache::FileRefsCache> {
+    let fresh = ctx
+        .client
+        .get("/file-refs", &[("solution", guid)])
+        .and_then(read_json)
+        .ok()
+        .and_then(|v| serde_json::from_value(v["refs"].clone()).ok())
+        .map(|refs| hook::cache::FileRefsCache {
+            server: ctx.client.base().to_string(),
+            solution: Some(guid.to_string()),
+            refs,
+            ..Default::default()
+        });
+    fresh.or_else(|| local_refs_index(ctx, guid, root))
+}
+
+/// Локальный индекс ссылок `file-refs.json` решения `guid` этого сервера (без запроса).
+pub fn local_refs_index(ctx: &Ctx, guid: &str, root: &Path) -> Option<hook::cache::FileRefsCache> {
+    hook::cache::file_refs_for(root, guid, Some(ctx.client.base()))
+        .ok()
+        .flatten()
+}
+
+pub fn verified_files(
+    root: &Path,
+    refs: &[LocalRef],
+    index: Option<&hook::cache::FileRefsCache>,
+) -> Vec<Value> {
+    let mut files: Vec<Value> = Vec::new();
+    for r in refs {
+        if files
+            .iter()
+            .any(|f| f["path"].as_str().is_some_and(|p| same_path(p, &r.path)))
+        {
+            continue;
+        }
+        let mut o = json!({ "path": r.path });
+        if let Some(h) = &r.hash {
+            o["hash"] = json!(h);
+        }
+        let symbolic = index.is_some_and(|c| c.has_symbol_refs(&r.path))
+            || refs
+                .iter()
+                .any(|x| x.symbol.is_some() && same_path(&x.path, &r.path));
+        if symbolic && let Some(s) = file_symbols(root, &r.path) {
+            o["symbols"] = json!(s);
+        }
+        files.push(o);
+    }
+    files
+}
+
+/// 422 сервера, не знающего поля `symbols` (0.0.8: «`files[i].symbols`: неизвестное поле»).
+pub fn unknown_symbols_field(e: &CliError) -> bool {
+    let detail = e
+        .problem
+        .as_ref()
+        .and_then(|p| p.get("detail"))
+        .and_then(Value::as_str)
+        .unwrap_or(&e.msg);
+    e.http_status() == Some(422)
+        && detail.contains(".symbols")
+        && detail.contains("неизвестное поле")
+}
+
+/// Пачка без `symbols` (повтор для сервера 0.0.8).
+pub fn without_symbols(mut files: Vec<Value>) -> Vec<Value> {
+    for f in &mut files {
+        if let Some(o) = f.as_object_mut() {
+            o.remove("symbols");
+        }
+    }
+    files
 }
 
 /// `POST /files/changed {solution, files}` пачками до [`FILES_MAX`] путей и
@@ -684,8 +754,9 @@ pub fn verify(ctx: &Ctx, files: &[String], solution: Option<&str>) -> Result<(),
             });
         }
     }
-    // у файла кода — и тела символов: подтверждаются и ссылки на его символы (M5.6 §8)
-    let n = post_verified(ctx, &guid, &root, &refs, true)?;
+    // у файла кода со ссылками на символы — и тела символов: подтверждаются и они (M5.6 §8)
+    let index = refs_index(ctx, &guid, &root);
+    let n = post_verified(ctx, &guid, &root, &refs, index.as_ref())?;
     if ctx.json {
         return emit_json(&json!({ "verified": n }));
     }
@@ -879,6 +950,44 @@ fn unquote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Финальное ревью ветки M5.6, I2: 422 сервера 0.0.8 о поле `symbols` узнаётся (и только
+    /// оно), повтор — без `symbols`.
+    #[test]
+    fn old_server_symbols_rejection_detected_and_stripped() {
+        let e = |status: u16, detail: &str| CliError {
+            code: 2,
+            msg: format!("{detail} (HTTP {status})"),
+            problem: Some(json!({"status": status, "detail": detail})),
+        };
+        assert!(unknown_symbols_field(&e(
+            422,
+            "files[3].symbols: неизвестное поле"
+        )));
+        assert!(!unknown_symbols_field(&e(
+            422,
+            "files[3].x: неизвестное поле"
+        )));
+        assert!(!unknown_symbols_field(&e(
+            422,
+            "files[0].symbols[1].qual: пустая строка"
+        )));
+        assert!(!unknown_symbols_field(&e(
+            400,
+            "files[3].symbols: неизвестное поле"
+        )));
+        let files = vec![
+            json!({"path": "a.rs", "hash": "h", "symbols": []}),
+            json!({"path": "b.md"}),
+        ];
+        assert_eq!(
+            without_symbols(files),
+            [
+                json!({"path": "a.rs", "hash": "h"}),
+                json!({"path": "b.md"})
+            ]
+        );
+    }
 
     /// Правила копии совпадают с `zam_store::file_refs::normalize_ref_path` (принятие,
     /// итог и отказ), как `entry_ref_letters_match_store` у букв ссылок.
