@@ -115,30 +115,6 @@ fn ref_weight(name: &str, c: f64, d: usize) -> f64 {
     c.sqrt() * ident_mult(name, d) / d as f64
 }
 
-/// Хэш строк для интернирования имён — алгоритм FxHash (rustc): умножение и циклический сдвиг
-/// по 8 байт. SipHash `std` на 50 000 файлах (650 тыс. имён, 2 млн ссылок) съедал больше
-/// половины секунды. Стойкости к подбору коллизий нет: имена присылают только участники
-/// решения с правом записи, а их объём ограничен пределами `[code]` сервера.
-#[derive(Default, Clone, Copy)]
-struct FxHasher(u64);
-
-impl std::hash::Hasher for FxHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-        for chunk in bytes.chunks(8) {
-            let mut b = [0u8; 8];
-            b[..chunk.len()].copy_from_slice(chunk);
-            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(b)).wrapping_mul(K);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
-
 /// Ссылка графа: файл, id имени, `w_An / out[A]` (доля исходящего веса файла).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct GraphRef {
@@ -153,7 +129,9 @@ struct GraphRef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Graph<'a> {
     n: usize,
-    ids: FxMap<&'a str, usize>,
+    /// Интернирование имён: `std` `HashMap` (SipHash со случайным ключом) — имена приходят
+    /// от клиентов, детерминированный хэш позволил бы подобрать коллизии (HashDoS).
+    ids: HashMap<&'a str, usize>,
     /// Определители имени `id`: `def_files[def_start[id]..def_start[id + 1]]`, по возрастанию.
     def_start: Vec<usize>,
     def_files: Vec<usize>,
@@ -170,7 +148,7 @@ impl<'a> Graph<'a> {
     /// только в самом файле, рёбер не дают.
     pub fn new(files: &'a [RankFile]) -> Graph<'a> {
         let total_defs: usize = files.iter().map(|f| f.defs.len()).sum();
-        let mut ids: FxMap<&'a str, usize> = FxMap::default();
+        let mut ids: HashMap<&'a str, usize> = HashMap::new();
         ids.reserve(total_defs);
         let mut def_ids = Vec::with_capacity(files.len());
         // число определителей имени; `last` — последний учтённый файл (повтор имени в файле)
