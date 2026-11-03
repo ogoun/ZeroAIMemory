@@ -7,6 +7,9 @@
 //!   или новый — `mt:<размер>:<mtime_ns>` без `git_oid`. Подмодули и символические ссылки
 //!   индекса пропускаются; удалённый в рабочей копии файл в список не входит. Корень внутри
 //!   игнорируемой части чужого репозитория (пустой индекс и `check-ignore .`) — как вне git.
+//!   Сбой `git` в настоящем репозитории (`safe.directory`, битый индекс, нет `git`) — ошибка, а
+//!   не обход (ревью задачи 5, I3). `git` — с `GIT_OPTIONAL_LOCKS=0` ([`git_run`]). Windows:
+//!   файл, чей канонический путь не под каноническим корнем (точка соединения наружу), — мимо.
 //! - **Вне git:** обход каталогов стеком (без рекурсии), без `.git`, `.zeroaimemory`, `target`,
 //!   `node_modules`, `dist`, `build` и скрытых каталогов; символические ссылки (и точки
 //!   соединения Windows) не обходятся и не читаются; отпечаток `mt:…`.
@@ -16,6 +19,7 @@
 //!   в индексе) — один раз. Больше `code.max_files` файлов — ошибка конфигурации.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
 use globset::GlobSet;
@@ -79,7 +83,7 @@ pub fn fingerprints(root: &Path, cfg: &CodeConfig) -> Result<Vec<Fingerprint>, C
         cfg,
         exclude: cfg.exclude_set(),
     };
-    let mut out = match from_git(root, &f) {
+    let mut out = match from_git(root, &f)? {
         Some(v) => v,
         None => walk(root, &f),
     };
@@ -149,18 +153,89 @@ fn porcelain_v2(z: &[u8]) -> (HashSet<String>, Vec<String>) {
     (dirty, untracked)
 }
 
-/// Отпечатки по git; не репозиторий (или корень в игнорируемой части) — `None`.
-fn from_git(root: &Path, f: &Filter) -> Option<Vec<Fingerprint>> {
-    if !refs::in_git(root) {
-        return None;
+/// Репозиторий над `root`: `Some(true)` — настоящий (`.git` — каталог или файл worktree с
+/// существующим `gitdir`), `Some(false)` — маркер без репозитория, `None` — git нет.
+fn repo_marker(root: &Path) -> Option<bool> {
+    let dir = root.ancestors().find(|d| d.join(".git").exists())?;
+    let g = dir.join(".git");
+    if g.is_dir() {
+        return Some(true);
     }
-    let prefix = refs::git(root, &["rev-parse", "--show-prefix"])?;
+    let text = std::fs::read_to_string(&g).unwrap_or_default();
+    let gitdir = text
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|x| !x.is_empty());
+    Some(gitdir.is_some_and(|x| dir.join(x).is_dir()))
+}
+
+/// `git -C root <args>` без необязательных замков (`GIT_OPTIONAL_LOCKS=0`: `status` не берёт
+/// `index.lock` параллельно с git пользователя); ошибка — текст stderr.
+pub fn git_run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("git не запустился: {e}"))?;
+    if o.status.success() {
+        Ok(o.stdout)
+    } else {
+        let err = String::from_utf8_lossy(&o.stderr);
+        Err(err.trim().chars().take(300).collect())
+    }
+}
+
+/// Путь `rel` в регистре ФС, если он под корнем (Windows: канонический путь файла — под
+/// каноническим корнем и отличается от `rel` только регистром; путь через точку соединения или
+/// ссылку — `None`). Не Windows — `rel`.
+fn fs_path(root: &Path, canon: &str, rel: &str) -> Option<String> {
+    if !cfg!(windows) {
+        return Some(rel.to_string());
+    }
+    let abs = std::fs::canonicalize(root.join(rel)).ok()?;
+    let a = abs.to_string_lossy().replace('\\', "/");
+    let rest = strip_prefix_ci(&a, canon)?.strip_prefix('/')?;
+    (rest.to_lowercase() == rel.to_lowercase()).then(|| rest.to_string())
+}
+
+/// `strip_prefix` без учёта регистра (посимвольно).
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let mut it = s.char_indices();
+    for pc in prefix.chars() {
+        let (_, c) = it.next()?;
+        if !c.to_lowercase().eq(pc.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(it.next().map_or("", |(i, _)| &s[i..]))
+}
+
+/// Отпечатки по git: не репозиторий (или корень в игнорируемой части) — `None`; сбой `git` в
+/// настоящем репозитории (`safe.directory`, битый индекс, нет `git`) — ошибка конфигурации, а
+/// не тихий обход: обход дал бы другой набор файлов, и сервер стёр бы часть карты.
+fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliError> {
+    match repo_marker(root) {
+        None | Some(false) => return Ok(None),
+        Some(true) => {}
+    }
+    let fail = |what: &str, e: String| {
+        CliError::config(format!(
+            "git {what} в {} не выполнен: {e} (git в PATH? safe.directory?)",
+            root.display()
+        ))
+    };
+    let prefix =
+        git_run(root, &["rev-parse", "--show-prefix"]).map_err(|e| fail("rev-parse", e))?;
     let prefix = String::from_utf8_lossy(&prefix).trim().to_string();
-    let ls = ls_files(&refs::git(root, &["ls-files", "-s", "-z"])?);
-    if ls.is_empty() && refs::git(root, &["check-ignore", "-q", "."]).is_some() {
-        return None;
+    let ls = ls_files(&git_run(root, &["ls-files", "-s", "-z"]).map_err(|e| fail("ls-files", e))?);
+    if ls.is_empty() && git_run(root, &["check-ignore", "-q", "."]).is_ok() {
+        return Ok(None);
     }
-    let st = refs::git(
+    let st = git_run(
         root,
         &[
             "status",
@@ -170,7 +245,8 @@ fn from_git(root: &Path, f: &Filter) -> Option<Vec<Fingerprint>> {
             "--",
             ".",
         ],
-    )?;
+    )
+    .map_err(|e| fail("status", e))?;
     let (dirty_repo, untracked_repo) = porcelain_v2(&st);
     let strip = |p: &String| p.strip_prefix(prefix.as_str()).map(str::to_string);
     let dirty: HashSet<String> = dirty_repo.iter().filter_map(strip).collect();
@@ -182,7 +258,12 @@ fn from_git(root: &Path, f: &Filter) -> Option<Vec<Fingerprint>> {
         })
         .collect();
     cands.extend(untracked_repo.iter().filter_map(strip).map(|p| (p, None)));
-    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canon = std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
     let mut out = Vec::with_capacity(cands.len());
     for (raw, oid) in cands {
         let Ok(rel) = refs::normalize_ref_path(&raw) else {
@@ -197,7 +278,9 @@ fn from_git(root: &Path, f: &Filter) -> Option<Vec<Fingerprint>> {
         if !m.is_file() {
             continue;
         }
-        let path = refs::real_case_in(root, &canon, &rel);
+        let Some(path) = fs_path(root, &canon, &rel) else {
+            continue; // вне корня (точка соединения) или через ссылку
+        };
         if path != rel && f.excluded(&path) {
             continue;
         }
@@ -212,7 +295,7 @@ fn from_git(root: &Path, f: &Filter) -> Option<Vec<Fingerprint>> {
             git_oid,
         });
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// Обход вне git (стек каталогов, без символических ссылок).

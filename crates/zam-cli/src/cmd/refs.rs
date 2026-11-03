@@ -294,6 +294,8 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     c.arg("-C")
         .arg(root)
         .args(args)
+        // без необязательных замков: `status` не берёт `index.lock` рядом с git пользователя
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     let o = c.output().ok()?;

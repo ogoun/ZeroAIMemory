@@ -313,7 +313,7 @@ fn code_sync_first_uploads_all_second_zero() {
         (json!(0), json!(0)),
         "{r}"
     );
-    assert!(!p.cache("code-sync.lock").exists());
+    drop(hold_lock(&p)); // замок свободен (файл остаётся, блокировку держит ОС)
     // человекочитаемый вывод — одна строка итога
     let o = ok(&p.zam(&["code", "sync"]));
     assert!(o.contains("файлов 3") && o.contains("загружено 0"), "{o}");
@@ -615,70 +615,82 @@ fn code_sync_crash_journal_skips_parser_crash() {
     assert_eq!(r["uploaded"], 1, "{r}");
     assert_eq!(reason_of(&p.status(), "src/a.rs"), None);
     assert_eq!(p.symbol_paths("fixed"), ["src/a.rs"]);
-    // обрыв процесса во время разбора c.rs (только debug-сборка)
+    // обрыв процесса во время разбора (только debug-сборка): два файла подряд — третий запуск
+    // пропускает оба (ревью задачи 5, I1: запись первого обрыва не теряется вторым)
     if cfg!(debug_assertions) {
         std::thread::sleep(Duration::from_millis(20));
         p.file("src/c.rs", b"pub fn helper() -> u32 {\n    3\n}\n");
-        let o = p.zam_env(
-            &["code", "sync", "--json"],
-            &[("ZAM_DEBUG_CODE_ABORT", "src/c.rs")],
-        );
-        assert_ne!(o.status.code(), Some(0), "{}", err(&o));
-        let j = json_of(&std::fs::read_to_string(p.cache("code-parsing.json")).unwrap());
-        assert_eq!(j["path"], "src/c.rs", "{j}");
-        // брошенный обрывом замок не мешает (тот же процесс мёртв — замок снимается по pid)
+        p.file("src/b.rs", b"pub fn run() {}\n");
+        for victim in ["src/b.rs", "src/c.rs"] {
+            let o = p.zam_env(
+                &["code", "sync", "--json"],
+                &[("ZAM_DEBUG_CODE_ABORT", victim)],
+            );
+            assert_ne!(o.status.code(), Some(0), "{victim}: {}", err(&o));
+            let j = json_of(&std::fs::read_to_string(p.cache("code-parsing.json")).unwrap());
+            assert_eq!(j["path"], victim, "{j}");
+        }
+        // замок обрыва держала ОС — он снят; оба файла — parser_crash
         let r = p.sync();
-        assert_eq!(r["skipped"]["parser_crash"], 1, "{r}");
-        assert_eq!(
-            reason_of(&p.status(), "src/c.rs").as_deref(),
-            Some("parser_crash")
-        );
+        assert_eq!(r["skipped"]["parser_crash"], 2, "{r}");
+        let st = p.status();
+        for victim in ["src/b.rs", "src/c.rs"] {
+            assert_eq!(
+                reason_of(&st, victim).as_deref(),
+                Some("parser_crash"),
+                "{st}"
+            );
+        }
+        // и при следующем запуске — тоже (хэши те же)
+        let r = json_of(&ok(&p.zam(&["code", "sync", "--full", "--json"])));
+        assert_eq!(r["skipped"]["parser_crash"], 2, "{r}");
     }
 }
 
-/// Review Focus 4: живой замок — вторая синхронизация не стартует (код 0, строка в stderr),
-/// брошенный старше 30 мин — снимается; после успешной синхронизации замка нет.
+/// Держит замок синхронизации проекта, пока жив (как идущая синхронизация).
+fn hold_lock(p: &Proj) -> std::fs::File {
+    let lock = p.cache("code-sync.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)
+        .unwrap();
+    f.try_lock().unwrap();
+    f
+}
+
+/// Review Focus 4: замок — блокировка файла ОС. Занят — вторая синхронизация не стартует (код
+/// 0, строка в stderr; `--background` — строка в `hooks.log`); снят — синхронизация идёт;
+/// ошибка и завершение процесса замок снимают. Два настоящих процесса одновременно — второй
+/// не стартует.
 #[test]
 fn code_sync_lock_second_skips_stale_lock_taken() {
     let (url, tok) = start("lock");
     let p = Proj::plain("lock", &url, &tok);
     three_files(&p);
-    let lock = p.cache("code-sync.lock");
-    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
-    // живой процесс (сам тест) и свежее время
-    std::fs::write(
-        &lock,
-        json!({"pid": std::process::id(), "at": now_s()}).to_string(),
-    )
-    .unwrap();
+    let held = hold_lock(&p);
     let o = p.zam(&["code", "sync"]);
     ok(&o);
     assert!(err(&o).contains("синхронизация уже идёт"), "{}", err(&o));
     assert!(!p.cache("code-state.json").exists(), "синхронизация не шла");
-    assert!(lock.exists(), "чужой замок не снимается");
-    // брошенный: 31 мин назад
+    let o = p.zam(&["code", "sync", "--background"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(out(&o).is_empty() && err(&o).is_empty(), "{}", err(&o));
+    drop(held);
+    // файл замка остался (старое содержимое `{pid, at}` ни на что не влияет)
     std::fs::write(
-        &lock,
-        json!({"pid": std::process::id(), "at": now_s() - 31 * 60}).to_string(),
+        p.cache("code-sync.lock"),
+        json!({"pid": 1, "at": now_s()}).to_string(),
     )
     .unwrap();
     let r = p.sync();
     assert_eq!(r["uploaded"], 3, "{r}");
-    assert!(!lock.exists());
-    // ошибка синхронизации (сервер недоступен) тоже снимает свой замок
+    // ошибка синхронизации (сервер недоступен) замок снимает
     let o = p.zam_env(&["code", "sync"], &[("ZAM_URL", "http://127.0.0.1:9")]);
     assert_eq!(o.status.code(), Some(2), "{}", err(&o));
-    assert!(!lock.exists());
-    // --background: вывод — одна строка в hooks.log, stdout пуст
-    std::fs::write(
-        &lock,
-        json!({"pid": std::process::id(), "at": now_s()}).to_string(),
-    )
-    .unwrap();
-    let o = p.zam(&["code", "sync", "--background"]);
-    assert_eq!(o.status.code(), Some(0));
-    assert!(out(&o).is_empty() && err(&o).is_empty(), "{}", err(&o));
-    std::fs::remove_file(&lock).unwrap();
     let o = p.zam(&["code", "sync", "--background"]);
     assert_eq!(o.status.code(), Some(0));
     assert!(out(&o).is_empty(), "{}", out(&o));
@@ -687,6 +699,56 @@ fn code_sync_lock_second_skips_stale_lock_taken() {
     assert_eq!(lines.len(), 2, "{log}");
     assert!(lines[0].contains("синхронизация уже идёт"), "{log}");
     assert!(lines[1].contains("файлов 3"), "{log}");
+    // два настоящих процесса: первый держит замок, пока ждёт медленную заглушку
+    let (slow, seen) = common::stub(
+        200,
+        r#"{"need":[],"removed":0,"etag":"e","accepted":0,"stale_refs":0,"warnings":[]}"#,
+        Duration::from_millis(1500),
+    );
+    let q = Proj::plain("lock-two", &slow, "zam_stub");
+    three_files(&q);
+    // фоновый процесс: std-команда с тем же чистым окружением, что у `common::zam_cmd`
+    let mut first = std::process::Command::new(assert_cmd::cargo::cargo_bin("zam"));
+    for k in common::PROXY_VARS {
+        first.env_remove(k);
+    }
+    for (k, _) in std::env::vars_os() {
+        if let Some(k) = k.to_str()
+            && (k.starts_with("ZAM_")
+                || zam_core::AGENT_ENV_VARS.contains(&k)
+                || zam_core::CLIENT_ENV_VARS.contains(&k))
+        {
+            first.env_remove(k);
+        }
+    }
+    first
+        .env("ZAM_URL", &q.url)
+        .env("ZAM_TOKEN", &q.token)
+        .env("HOME", &q.home)
+        .env("USERPROFILE", &q.home)
+        .current_dir(&q.repo)
+        .args(["code", "sync"]);
+    let mut child = first
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    while seen.lock().unwrap().is_empty() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "первый процесс не дошёл до сервера"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let o = q.zam(&["code", "sync"]);
+    ok(&o);
+    assert!(err(&o).contains("синхронизация уже идёт"), "{}", err(&o));
+    assert!(child.wait().unwrap().success());
+    // первый завершился — замок свободен
+    let o = q.zam(&["code", "sync"]);
+    ok(&o);
+    assert!(!err(&o).contains("уже идёт"), "{}", err(&o));
 }
 
 /// Токен вида GitHub в сигнатуре фикстуры.
@@ -724,7 +786,8 @@ fn code_sync_request_only_metadata() {
         };
         p.file(
             "src/a.rs",
-            b"pub fn secret_holder() -> &'static str {\n    \"BODY_MARKER_7f3a\"\n}\n",
+            b"pub fn secret_holder() -> &'static str {\n    \"BODY_MARKER_7f3a\"\n}\n\
+pub fn one() -> u32 { 1 } static NEIGHBOUR_X: &str = \"NEIGHBOUR_7f3a\";\n",
         );
         let mut long = format!(
             "export function longSignature({}) {{\n  return 'BODY_MARKER_7f3a';\n}}\n",
@@ -764,6 +827,18 @@ fn code_sync_request_only_metadata() {
             "содержимое файла ушло: {text}"
         );
         assert!(!text.contains(&SECRET_TOKEN[..8]), "секрет ушёл: {text}");
+        // однострочное определение: в сигнатуру `one` соседний код строки не попадает (I2)
+        if send_sig {
+            let one = puts[0]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|f| f["symbols"].as_array().unwrap().iter())
+                .find(|s| s["name"] == "one")
+                .cloned()
+                .expect("символ one");
+            assert_eq!(one["sig"], "pub fn one() -> u32 { 1 }", "{one}");
+        }
         let files = puts[0]["files"].as_array().unwrap();
         assert_eq!(files.len(), 2);
         let file_keys = [
@@ -1155,4 +1230,64 @@ fn code_commands_exit_codes() {
     assert_eq!(o.status.code(), Some(6));
     let o = p.zam(&["code", "frobnicate"]);
     assert_eq!(o.status.code(), Some(6));
+}
+
+/// Ревью задачи 5, I3: защита карты от массового удаления — корень не совпадает с каталогом
+/// `solution.toml` (код 1); манифест меньше половины прошлой синхронизации — без `--prune` не
+/// отправляется (в фоне — строка в `hooks.log`); сбой `git` в настоящем репозитории — ошибка,
+/// а не тихий обход.
+#[test]
+fn code_sync_guards_root_prune_and_git_failure() {
+    let (url, tok) = start("guards");
+    let Some(p) = Proj::git("guards", &url, &tok) else {
+        return;
+    };
+    for i in 0..24 {
+        p.file(
+            &format!("src/m{i:02}.rs"),
+            format!("pub fn f{i}() {{}}\n").as_bytes(),
+        );
+    }
+    p.commit("init");
+    assert_eq!(p.sync()["uploaded"], 24);
+    // подкаталог со своим .zeroaimemory/: корень проекта — он, решение — выше
+    std::fs::create_dir_all(p.repo.join("src/.zeroaimemory")).unwrap();
+    let mut c = common::zam_cmd();
+    let o = c
+        .env("ZAM_URL", &p.url)
+        .env("ZAM_TOKEN", &p.token)
+        .env("HOME", &p.home)
+        .env("USERPROFILE", &p.home)
+        .current_dir(p.repo.join("src"))
+        .args(["code", "sync"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("не совпадает с каталогом решения"),
+        "{}",
+        err(&o)
+    );
+    std::fs::remove_dir_all(p.repo.join("src/.zeroaimemory")).unwrap();
+    // 20 из 24 файлов исчезли — предохранитель
+    for i in 0..20 {
+        git(&p.repo, &["rm", "-q", &format!("src/m{i:02}.rs")]).unwrap();
+    }
+    let o = p.zam(&["code", "sync"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("--prune"), "{}", err(&o));
+    assert_eq!(p.status()["files"], 24, "карта не тронута");
+    let o = p.zam(&["code", "sync", "--background"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).is_empty(), "{}", err(&o));
+    let log = std::fs::read_to_string(p.repo.join(".zeroaimemory/logs/hooks.log")).unwrap();
+    assert!(log.contains("--prune"), "{log}");
+    let r = json_of(&ok(&p.zam(&["code", "sync", "--prune", "--json"])));
+    assert_eq!(r["removed"], 20, "{r}");
+    // битый индекс git — ошибка конфигурации, карта не тронута
+    std::fs::write(p.repo.join(".git/index"), b"garbage, not an index").unwrap();
+    let o = p.zam(&["code", "sync"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("git"), "{}", err(&o));
+    assert_eq!(p.status()["files"], 4);
 }

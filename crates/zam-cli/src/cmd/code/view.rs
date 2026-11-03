@@ -63,13 +63,7 @@ pub fn status(ctx: &Ctx, guid: &str, root: &Path) -> Result<(), CliError> {
     let snap: Vec<String> = ["commit", "branch", "machine"]
         .iter()
         .filter_map(|k| v[*k].as_str())
-        .map(|x| {
-            if x.len() == 40 {
-                x[..12].to_string()
-            } else {
-                x.to_string()
-            }
-        })
+        .map(short_commit)
         .collect();
     if !snap.is_empty() {
         s.push_str(&format!(" ({})", snap.join(", ")));
@@ -115,6 +109,15 @@ pub fn status(ctx: &Ctx, guid: &str, root: &Path) -> Result<(), CliError> {
         s.push_str(&format!("синхронизация с этой машины: {}\n", m.last_ok_at));
     }
     emit(s.as_bytes())
+}
+
+/// Коммит (40 или 64 hex) — первые 12 символов; прочее (ветка, машина) — как есть.
+fn short_commit(x: &str) -> String {
+    if matches!(x.len(), 40 | 64) && x.bytes().all(|b| b.is_ascii_hexdigit()) {
+        x[..12].to_string()
+    } else {
+        x.to_string()
+    }
 }
 
 /// Аргумент `--focus`: путь (есть `/` или расширение кода) или идентификатор.
@@ -345,8 +348,9 @@ fn impact_paths(
             None => out.push(fp.path.clone()),
         }
     }
+    let live: std::collections::HashSet<&str> = fps.iter().map(|f| f.path.as_str()).collect();
     for p in state.files.keys() {
-        if !fps.iter().any(|f| f.path == *p) {
+        if !live.contains(p.as_str()) {
             out.push(p.clone());
         }
     }
@@ -449,6 +453,17 @@ pub fn impact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_shortened_only_if_hex() {
+        assert_eq!(short_commit(&"a".repeat(40)), "aaaaaaaaaaaa");
+        assert_eq!(
+            short_commit("ветка-номер-сорок-символов-длиной-ровно-x"),
+            "ветка-номер-сорок-символов-длиной-ровно-x"
+        );
+        let mach = "машина".repeat(4);
+        assert_eq!(short_commit(&mach), mach);
+    }
 
     #[test]
     fn segment_encoding() {

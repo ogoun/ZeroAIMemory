@@ -5,17 +5,23 @@
 //! `code-sync.json`.
 //!
 //! - **Журнал падений** `cache/code-parsing.json` ([`CrashLog`]): `{path, hash}` пишется перед
-//!   разбором файла без fsync (обрыв процесса запись сохраняет) и удаляется после; незакрытая
-//!   запись при следующем запуске попадает в `crashed` состояния — файл уходит `skipped`/
-//!   `parser_crash`, пока его хэш тот же.
-//! - **Замок** `cache/code-sync.lock` ([`SyncLock`], `create_new`, внутри `{pid, at}`): живой —
-//!   вторая синхронизация не идёт; брошенный (старше [`LOCK_STALE`] или процесс `pid` завершён)
-//!   снимается; свой замок снимается в конце и при ошибке (`Drop`).
-//! - На сервер — только метаданные §4: без `code.send_signatures` поле `sig` не отправляется.
-use std::collections::{BTreeMap, HashMap};
+//!   разбором файла без fsync (обрыв процесса запись сохраняет) и удаляется после. Незакрытая
+//!   запись при следующем запуске сначала атомарно дописывается в `crashed` `code-state.json`
+//!   и только потом снимается (ревью задачи 5, I1: иначе второй обрыв подряд терял первую
+//!   запись); файл из `crashed` уходит `skipped`/`parser_crash`, пока его хэш тот же.
+//! - **Замок** `cache/code-sync.lock` ([`SyncLock`]) — блокировка файла ОС
+//!   (`File::try_lock`): занят — вторая синхронизация не идёт; ОС снимает её при любом
+//!   завершении процесса (обрыв тоже), поэтому брошенных замков нет. Файл остаётся.
+//! - **Предохранитель** (ревью задачи 5, I3): манифест меньше половины файлов прошлого
+//!   состояния (если их ≥ [`PRUNE_GUARD_MIN`]) не отправляется без `--prune` — сервер удалил
+//!   бы из карты всё недостающее.
+//! - На сервер — только метаданные §4: без `code.send_signatures` поле `sig` не отправляется;
+//!   секреты сигнатуры клиент маскирует до обрезки ([`mask_sig`]); файл, чей JSON больше
+//!   предела запроса, уходит `skipped`/`limit` без символов.
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,8 +38,8 @@ use crate::cmd::{Ctx, refs};
 pub const BATCH_BYTES_MAX: usize = 8 * 1024 * 1024;
 /// Запас на конверт запроса (`solution`, `commit`, `branch`, `machine`, скобки).
 const ENVELOPE_RESERVE: usize = 4096;
-/// Возраст замка, после которого он считается брошенным.
-pub const LOCK_STALE: Duration = Duration::from_secs(30 * 60);
+/// Предохранитель массового удаления действует от этого числа файлов прошлого состояния.
+pub const PRUNE_GUARD_MIN: usize = 20;
 /// Пределы символов и ссылок файла (как умолчания сервера `[code]`).
 const MAX_SYMBOLS: usize = 5000;
 const MAX_REFS: usize = 20_000;
@@ -54,10 +60,12 @@ pub struct SyncReport {
     /// Ссылок памяти признано устаревшими.
     pub stale_refs: u32,
     pub ms: u128,
+    /// Предупреждения сервера и клиента (stderr; в фоне — в строке итога `hooks.log`).
+    pub warnings: Vec<String>,
 }
 
 impl SyncReport {
-    /// Одна строка итога (stdout и `hooks.log`).
+    /// Одна строка итога (stdout).
     pub fn line(&self) -> String {
         let mut s = format!(
             "карта кода: файлов {}, к загрузке {}, загружено {}, удалено {}",
@@ -75,6 +83,15 @@ impl SyncReport {
             s.push_str(&format!(", устаревших ссылок {}", self.stale_refs));
         }
         s.push_str(&format!(" ({} мс)", self.ms));
+        s
+    }
+
+    /// Строка итога с предупреждениями (фоновый режим: stderr не пишется).
+    pub fn line_with_warnings(&self) -> String {
+        let mut s = self.line();
+        if !self.warnings.is_empty() {
+            s.push_str(&format!("; предупреждения: {}", self.warnings.join("; ")));
+        }
         s
     }
 }
@@ -116,134 +133,75 @@ impl CrashLog {
         let _ = std::fs::remove_file(&self.path);
     }
 
-    /// Незакрытая запись прошлого запуска (и её снятие).
-    pub fn take_unfinished(&self) -> Option<(String, String)> {
+    /// Незакрытая запись прошлого запуска; не снимается — снять ([`Self::end`]) после того, как
+    /// она сохранена в `code-state.json`. Битая запись — `None`.
+    pub fn unfinished(&self) -> Option<(String, String)> {
         let bytes = std::fs::read(&self.path).ok()?;
-        let _ = std::fs::remove_file(&self.path);
         let e: CrashEntry = serde_json::from_slice(&bytes).ok()?;
         Some((e.path, e.hash))
     }
 }
 
-/// Содержимое замка.
-#[derive(Debug, Serialize, Deserialize)]
-struct LockInfo {
-    pid: u32,
-    /// Секунды Unix.
-    at: u64,
+/// Незакрытая запись журнала → `crashed` состояния, состояние — на диск, затем запись
+/// снимается (обрыв между шагами запись не теряет: она ещё в журнале).
+fn absorb_crash(root: &Path, crash: &CrashLog, state: &mut CodeState) -> Result<(), CliError> {
+    if let Some(c) = crash.unfinished()
+        && !state.crashed.contains(&c)
+    {
+        state.crashed.push(c);
+        state
+            .save(root)
+            .map_err(|e| CliError::config(format!("кэш карты кода: {e}")))?;
+    }
+    crash.end();
+    Ok(())
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Замок синхронизации проекта; снимается при `Drop`.
+/// Замок синхронизации проекта: блокировка файла ОС; снимается при `Drop` (и ОС — при
+/// завершении процесса).
 #[derive(Debug)]
 pub struct SyncLock {
-    path: PathBuf,
+    _file: std::fs::File,
 }
 
 impl SyncLock {
-    /// Захват: `None` — идёт другая синхронизация (живой замок).
+    /// Захват: `None` — идёт другая синхронизация.
     pub fn acquire(root: &Path) -> Result<Option<SyncLock>, CliError> {
-        let path = cache_dir(root).join("code-sync.lock");
-        std::fs::create_dir_all(cache_dir(root))
-            .map_err(|e| CliError::config(format!("{}: {e}", cache_dir(root).display())))?;
-        for _ in 0..2 {
-            let mut o = std::fs::OpenOptions::new();
-            o.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                o.mode(0o600);
+        let dir = cache_dir(root);
+        let path = dir.join("code-sync.lock");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CliError::config(format!("{}: {e}", dir.display())))?;
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let file = o
+            .open(&path)
+            .map_err(|e| CliError::config(format!("замок {}: {e}", path.display())))?;
+        match file.try_lock() {
+            Ok(()) => {
+                // `{pid, at}` — для хука (задача 6) и человека; замок держит ОС, не содержимое
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let mut f = &file;
+                let _ = f.set_len(0);
+                let _ = f.write_all(
+                    json!({"pid": std::process::id(), "at": at})
+                        .to_string()
+                        .as_bytes(),
+                );
+                Ok(Some(SyncLock { _file: file }))
             }
-            match o.open(&path) {
-                Ok(mut f) => {
-                    let info = LockInfo {
-                        pid: std::process::id(),
-                        at: now_secs(),
-                    };
-                    let _ = f.write_all(&serde_json::to_vec(&info).unwrap_or_default());
-                    return Ok(Some(SyncLock { path }));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let seen = std::fs::read(&path).unwrap_or_default();
-                    if !stale(&path, &seen) {
-                        return Ok(None);
-                    }
-                    // брошенный: снимается, только если его не успели заменить
-                    if std::fs::read(&path).unwrap_or_default() == seen {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-                Err(e) => {
-                    return Err(CliError::config(format!("замок {}: {e}", path.display())));
-                }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(CliError::config(format!("замок {}: {e}", path.display())))
             }
         }
-        Ok(None)
     }
-}
-
-impl Drop for SyncLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Замок брошен: старше [`LOCK_STALE`] или процесс завершён. Нечитаемое содержимое — по
-/// времени изменения файла.
-fn stale(path: &Path, bytes: &[u8]) -> bool {
-    let age = |at: u64| Duration::from_secs(now_secs().saturating_sub(at));
-    match serde_json::from_slice::<LockInfo>(bytes) {
-        Ok(i) => age(i.at) > LOCK_STALE || !pid_alive(i.pid),
-        Err(_) => std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_none_or(|a| a > LOCK_STALE),
-    }
-}
-
-/// Процесс `pid` существует (Linux — `/proc`, Windows — `OpenProcess`; иначе считается живым).
-#[cfg(target_os = "linux")]
-fn pid_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
-}
-
-#[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
-    use std::ffi::c_void;
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 259;
-    const ERROR_ACCESS_DENIED: u32 = 5;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-        fn GetExitCodeProcess(h: *mut c_void, code: *mut u32) -> i32;
-        fn CloseHandle(h: *mut c_void) -> i32;
-        fn GetLastError() -> u32;
-    }
-    // SAFETY: вызовы kernel32 с проверкой результата; дескриптор закрывается в той же ветке,
-    // указатель `code` — на локальную переменную.
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h.is_null() {
-            // нет такого процесса — ERROR_INVALID_PARAMETER; чужой защищённый — жив
-            return GetLastError() == ERROR_ACCESS_DENIED;
-        }
-        let mut code = 0u32;
-        let ok = GetExitCodeProcess(h, &mut code) != 0;
-        CloseHandle(h);
-        !ok || code == STILL_ACTIVE
-    }
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn pid_alive(_pid: u32) -> bool {
-    true
 }
 
 /// Тестовый крючок debug-сборки (решение составителя плана 16): обрыв процесса после записи
@@ -269,14 +227,28 @@ fn hash_of(root: &Path, fp: &Fingerprint, state: &CodeState) -> Option<String> {
     refs::hash_file(&root.join(&fp.path)).ok()
 }
 
-/// Ветка git (`None` — не git или отсоединённый `HEAD`).
-fn git_branch(root: &Path) -> Option<String> {
+/// `git rev-parse <args>` одной строкой (без необязательных замков); не git — `None`.
+fn rev_parse(root: &Path, args: &[&str]) -> Option<String> {
     if !refs::in_git(root) {
         return None;
     }
-    let out = refs::git(root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let b = String::from_utf8(out).ok()?.trim().to_string();
-    (!b.is_empty() && b != "HEAD" && b.chars().count() <= 256).then_some(b)
+    let mut a = vec!["rev-parse"];
+    a.extend_from_slice(args);
+    let out = scan::git_run(root, &a).ok()?;
+    let s = String::from_utf8(out).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Коммит `HEAD` (hex) или `None`.
+fn git_head(root: &Path) -> Option<String> {
+    let s = rev_parse(root, &["HEAD"])?.to_ascii_lowercase();
+    ((4..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())).then_some(s)
+}
+
+/// Ветка git (`None` — не git или отсоединённый `HEAD`).
+fn git_branch(root: &Path) -> Option<String> {
+    let b = rev_parse(root, &["--abbrev-ref", "HEAD"])?;
+    (b != "HEAD" && b.chars().count() <= 256).then_some(b)
 }
 
 /// Снимок: коммит, ветка, машина.
@@ -358,7 +330,10 @@ fn parse_file(
         let src = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
         for s in &mut up.symbols {
             if let Some(sig) = s.sig.take() {
-                s.sig = Some(mask_sig(&sig, line_of(src, s.line)));
+                let tail = (s.end_line > s.line)
+                    .then(|| line_of(src, s.line))
+                    .flatten();
+                s.sig = Some(mask_sig(&sig, tail));
             }
         }
     } else {
@@ -427,23 +402,23 @@ fn mask_tokens(text: &str) -> String {
     out
 }
 
-/// Сигнатура для сервера (ревью задачи 4): маскировка секретов клиентом **до** обрезки до
-/// 160 символов — обрезанный экстрактором токен шаблон сервера может не узнать. Полный текст —
-/// строка определения с начала сигнатуры; не нашлась — у обрезанной сигнатуры снимается
-/// оборванный последний токен. Сервер маскирует повторно.
-fn mask_sig(sig: &str, line: Option<String>) -> String {
-    let cut = sig.strip_suffix('…');
-    let head = cut.unwrap_or(sig);
-    let full = line
+/// Сигнатура для сервера (ревью задач 4 и 5): секреты маскируются клиентом **до** обрезки
+/// до 160 символов — обрезанный экстрактором токен шаблон сервера может не узнать.
+/// Необрезанная сигнатура (она не длиннее узла) маскируется как есть. Обрезанная: `tail` —
+/// строка имени, если узел продолжается на следующих строках (тогда весь остаток строки —
+/// внутри узла); полный текст — от начала сигнатуры до конца строки. Нет `tail` (однострочный
+/// узел: конец узла на строке неизвестен, дальше может быть соседний код) — оборванный
+/// последний токен снимается. Сервер маскирует повторно.
+fn mask_sig(sig: &str, tail: Option<String>) -> String {
+    let Some(head) = sig.strip_suffix('…') else {
+        return mask_tokens(sig);
+    };
+    let full = tail
         .as_deref()
         .and_then(|l| l.find(head).map(|i| l[i..].to_string()))
-        .unwrap_or_else(|| match cut {
-            // оборванный токен в конце — прочь (его продолжения не видно)
-            Some(h) => {
-                let keep = h.trim_end_matches(token_char).trim_end();
-                format!("{keep}…")
-            }
-            None => sig.to_string(),
+        .unwrap_or_else(|| {
+            let keep = head.trim_end_matches(token_char).trim_end();
+            format!("{keep}…")
         });
     let masked = mask_tokens(&full);
     if masked.chars().count() <= zam_code::SIG_MAX_CHARS {
@@ -452,6 +427,21 @@ fn mask_sig(sig: &str, line: Option<String>) -> String {
     let mut s: String = masked.chars().take(zam_code::SIG_MAX_CHARS - 1).collect();
     s.push('…');
     s
+}
+
+/// Файл, чей JSON не помещается в запрос (ревью задачи 5, M7): `skipped`/`limit` без символов
+/// и ссылок — иначе сервер отвечал бы 413 на каждой синхронизации.
+fn over_limit(mut f: FileUpload) -> FileUpload {
+    f.parse_state = ParseState::Skipped;
+    f.skip_reason = Some(SkipReason::Limit);
+    f.symbols.clear();
+    f.refs.clear();
+    f
+}
+
+/// JSON файла помещается в один запрос.
+fn fits_request(n: usize) -> bool {
+    n + 1 + ENVELOPE_RESERVE <= BATCH_BYTES_MAX
 }
 
 /// Пачка `PUT /code/files`: файлы в виде готового JSON.
@@ -485,18 +475,17 @@ struct Uploader<'a> {
     accepted: usize,
     stale_refs: u32,
     sent: Vec<String>,
+    warnings: Vec<String>,
 }
 
 impl Uploader<'_> {
-    fn push(&mut self, up: &FileUpload) -> Result<(), CliError> {
-        let bytes = serde_json::to_vec(up)
-            .map_err(|e| CliError::config(format!("сериализация файла: {e}")))?;
+    fn push(&mut self, bytes: Vec<u8>, path: &str) -> Result<(), CliError> {
         if !self.batch.fits(bytes.len()) {
             self.flush()?;
         }
         self.batch.bytes += bytes.len() + 1;
         self.batch.files.push(bytes);
-        self.batch.paths.push(up.path.clone());
+        self.batch.paths.push(path.to_string());
         Ok(())
     }
 
@@ -523,7 +512,7 @@ impl Uploader<'_> {
         self.stale_refs += v["stale_refs"].as_u64().unwrap_or(0) as u32;
         for w in v["warnings"].as_array().into_iter().flatten() {
             if let Some(w) = w.as_str() {
-                eprintln!("предупреждение сервера: {w}");
+                self.warnings.push(format!("сервер: {w}"));
             }
         }
         self.sent.extend(b.paths);
@@ -536,7 +525,8 @@ impl Uploader<'_> {
 fn upload_error(e: CliError) -> CliError {
     let hint = match e.http_status() {
         Some(413 | 422) => {
-            "; предел карты сервера ([code] max_files, max_request_bytes, max_symbols_per_file) —              сузьте code.exclude или code.languages"
+            "; предел карты сервера ([code] max_files, max_request_bytes, max_symbols_per_file) \
+             — сузьте code.exclude или code.languages"
         }
         _ => "",
     };
@@ -545,22 +535,27 @@ fn upload_error(e: CliError) -> CliError {
     e
 }
 
+/// Режим синхронизации.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SyncOpts {
+    /// Разобрать и загрузить все файлы.
+    pub full: bool,
+    /// Разрешить манифест меньше половины прошлого состояния ([`PRUNE_GUARD_MIN`]).
+    pub prune: bool,
+}
+
 /// Синхронизация карты решения `guid` с корнем `root` (замок берёт вызывающий).
 pub fn sync(
     ctx: &Ctx,
     guid: &str,
     root: &Path,
     cfg: &CodeConfig,
-    full: bool,
+    opts: SyncOpts,
 ) -> Result<SyncReport, CliError> {
     let started = Instant::now();
     let mut state = CodeState::load(root);
     let crash = CrashLog::new(root);
-    if let Some(c) = crash.take_unfinished()
-        && !state.crashed.contains(&c)
-    {
-        state.crashed.push(c);
-    }
+    absorb_crash(root, &crash, &mut state)?;
     let fps = scan::fingerprints(root, cfg)?;
     let mut hashes: HashMap<String, String> = HashMap::with_capacity(fps.len());
     let mut manifest: Vec<Value> = Vec::with_capacity(fps.len());
@@ -573,8 +568,21 @@ pub fn sync(
         hashes.insert(fp.path.clone(), h);
         live.push(fp);
     }
+    let known = if state.solution == guid {
+        state.files.len()
+    } else {
+        0
+    };
+    if !opts.prune && known >= PRUNE_GUARD_MIN && live.len() * 2 < known {
+        return Err(CliError::config(format!(
+            "файлов кода {} — меньше половины прошлой синхронизации ({known}): сервер удалил бы \
+             из карты остальные. Проверьте корень, code.exclude и code.languages; удаление \
+             намеренное — zam code sync --prune",
+            live.len()
+        )));
+    }
     let meta = Meta {
-        commit: refs::git_head(root),
+        commit: git_head(root),
         branch: git_branch(root),
         machine: ctx.client.machine().map(str::to_string),
     };
@@ -586,10 +594,11 @@ pub fn sync(
             &json!({"agent_solution_id": guid, "name": solution_name(ctx, guid)}),
         )
         .map_err(|e| e.context("регистрация решения"))?;
+    let mut warnings = Vec::new();
     if r.status().as_u16() == 202 {
-        eprintln!(
+        warnings.push(format!(
             "решение {guid} принадлежит другому пользователю: запрос доступа ждёт подтверждения владельца"
-        );
+        ));
     }
     let mut body = serde_json::Map::new();
     body.insert("solution".into(), json!(guid));
@@ -601,12 +610,13 @@ pub fn sync(
         files: live.len(),
         removed: resp["removed"].as_u64().unwrap_or(0),
         stale_refs: resp["stale_refs"].as_u64().unwrap_or(0) as u32,
+        warnings,
         ..SyncReport::default()
     };
-    let need: Vec<&Fingerprint> = if full {
+    let need: Vec<&Fingerprint> = if opts.full {
         live.clone()
     } else {
-        let set: std::collections::HashSet<&str> = resp["need"]
+        let set: HashSet<&str> = resp["need"]
             .as_array()
             .into_iter()
             .flatten()
@@ -635,26 +645,36 @@ pub fn sync(
         accepted: 0,
         stale_refs: 0,
         sent: Vec::new(),
+        warnings: Vec::new(),
     };
     for fp in need {
         let h = &hashes[&fp.path];
-        let Some(file) = parse_file(root, fp, h, &state, cfg, &crash) else {
+        let Some(mut file) = parse_file(root, fp, h, &state, cfg, &crash) else {
             continue;
         };
+        let ser = |f: &FileUpload| {
+            serde_json::to_vec(f).map_err(|e| CliError::config(format!("сериализация файла: {e}")))
+        };
+        let mut bytes = ser(&file)?;
+        if !fits_request(bytes.len()) {
+            file = over_limit(file);
+            bytes = ser(&file)?;
+        }
         if let Some(r) = file.skip_reason {
             *report.skipped.entry(r.as_str().to_string()).or_default() += 1;
         }
         if file.hash != *h {
             hashes.insert(fp.path.clone(), file.hash.clone());
         }
-        up.push(&file)?;
+        up.push(bytes, &file.path)?;
     }
     up.flush()?;
     report.uploaded = up.accepted;
     report.stale_refs += up.stale_refs;
+    report.warnings.append(&mut up.warnings);
     // состояние: текущие файлы; журнал падений — только для неизменившихся хэшей
     let now = cache::now_rfc3339();
-    let sent: std::collections::HashSet<&str> = up.sent.iter().map(String::as_str).collect();
+    let sent: HashSet<&str> = up.sent.iter().map(String::as_str).collect();
     let mut files = BTreeMap::new();
     for fp in &live {
         let hash = hashes[&fp.path].clone();
@@ -724,40 +744,67 @@ mod tests {
     fn crash_log_round_trip() {
         let r = root("crash");
         let c = CrashLog::new(&r);
-        assert_eq!(c.take_unfinished(), None);
+        assert_eq!(c.unfinished(), None);
         c.begin("src/a.rs", "h1");
         c.end();
-        assert_eq!(c.take_unfinished(), None);
+        assert_eq!(c.unfinished(), None);
+        // две незакрытые записи подряд: каждая сохраняется в состоянии до снятия (I1)
+        let mut st = CodeState::default();
         c.begin("src/b.rs", "h2");
-        assert_eq!(c.take_unfinished(), Some(("src/b.rs".into(), "h2".into())));
-        assert_eq!(c.take_unfinished(), None);
+        absorb_crash(&r, &c, &mut st).unwrap();
+        assert_eq!(c.unfinished(), None);
+        c.begin("src/c.rs", "h3");
+        let mut st2 = CodeState::load(&r);
+        absorb_crash(&r, &c, &mut st2).unwrap();
+        let saved = CodeState::load(&r);
+        assert_eq!(
+            saved.crashed,
+            [
+                ("src/b.rs".into(), "h2".into()),
+                ("src/c.rs".into(), "h3".into())
+            ]
+        );
+        drop(st);
     }
 
     #[test]
-    fn lock_live_stale_dead() {
+    fn lock_held_then_released() {
         let r = root("lock");
         let a = SyncLock::acquire(&r).unwrap().expect("первый");
-        assert!(SyncLock::acquire(&r).unwrap().is_none(), "живой замок");
+        assert!(SyncLock::acquire(&r).unwrap().is_none(), "занят");
         drop(a);
-        let p = cache_dir(&r).join("code-sync.lock");
-        assert!(!p.exists());
-        let old = LockInfo {
-            pid: std::process::id(),
-            at: now_secs() - 31 * 60,
+        assert!(SyncLock::acquire(&r).unwrap().is_some(), "снят при Drop");
+    }
+
+    #[test]
+    fn oversized_file_goes_limit() {
+        assert!(fits_request(BATCH_BYTES_MAX - ENVELOPE_RESERVE - 1));
+        assert!(!fits_request(BATCH_BYTES_MAX - ENVELOPE_RESERVE));
+        let f = FileUpload {
+            path: "a.rs".into(),
+            lang: zam_code::Lang::Rust,
+            hash: "0".repeat(64),
+            git_oid: None,
+            size: 1,
+            parse_state: ParseState::Ok,
+            skip_reason: None,
+            symbols: vec![zam_code::Symbol {
+                name: "a".into(),
+                qual: "a".into(),
+                kind: zam_code::SymbolKind::Function,
+                line: 1,
+                end_line: 1,
+                sig: None,
+                body_hash: "0".repeat(16),
+                exported: None,
+            }],
+            refs: vec![],
         };
-        std::fs::write(&p, serde_json::to_vec(&old).unwrap()).unwrap();
-        assert!(
-            SyncLock::acquire(&r).unwrap().is_some(),
-            "брошенный по времени"
+        let g = over_limit(f);
+        assert_eq!(
+            (g.parse_state, g.skip_reason, g.symbols.len()),
+            (ParseState::Skipped, Some(SkipReason::Limit), 0)
         );
-        if cfg!(any(windows, target_os = "linux")) {
-            let dead = LockInfo {
-                pid: u32::MAX - 1,
-                at: now_secs(),
-            };
-            std::fs::write(&p, serde_json::to_vec(&dead).unwrap()).unwrap();
-            assert!(SyncLock::acquire(&r).unwrap().is_some(), "процесс завершён");
-        }
     }
 
     #[test]
@@ -773,6 +820,12 @@ mod tests {
         assert!(!s.contains("ghp_") && s.ends_with('…'), "{s}");
         // короткая — как есть, секрет внутри — маскируется
         assert_eq!(mask_sig("fn open() -> Store", None), "fn open() -> Store");
+        // необрезанная — соседний код строки не подхватывается (I2)
+        let line = "pub fn a() -> u32 { 1 } static DB_PASSWORD: &str = \"hunter2-prod\";";
+        assert_eq!(
+            mask_sig("pub fn a() -> u32 { 1 }", Some(line.into())),
+            "pub fn a() -> u32 { 1 }"
+        );
         assert_eq!(
             mask_sig(&format!("const K = \"{tok}\";"), None),
             "const K = \"‹secret›\";"
