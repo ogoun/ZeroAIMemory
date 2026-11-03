@@ -859,13 +859,15 @@ mod tests {
                         Ok(k) => req.extend_from_slice(&b[..k]),
                     }
                 }
+                // счёт до ответа: клиент, дочитав тело, может проверить счётчик раньше,
+                // чем этот поток вернётся из write_all
+                h.fetch_add(1, Ordering::SeqCst);
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = s.write_all(head.as_bytes());
                 let _ = s.write_all(body);
-                h.fetch_add(1, Ordering::SeqCst);
             }
         });
         (url, hits)
