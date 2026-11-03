@@ -9,6 +9,7 @@ import { ADMIN_STATE } from './session';
 import {
   REPORT_BULK,
   REPORT_COMMIT,
+  REPORT_DUP_WORD,
   REPORT_MACHINE,
   REPORT_SESSION,
   REPORT_TITLE,
@@ -16,6 +17,7 @@ import {
   SOLUTION_GUID,
   SOLUTION_NAME,
   SVG_FLAG,
+  makePng,
 } from './seed';
 
 const env = (k: string) => {
@@ -122,7 +124,7 @@ test('reports_feed_date_author_tags_thumb_cursor', async ({ page }) => {
   const resp = await more;
   const body = (await resp.json()) as { items: Record<string, unknown>[] };
   expect(body.items.every((x) => !('body' in x))).toBe(true);
-  await expect(cards).toHaveCount(REPORT_BULK + 3);
+  await expect(cards).toHaveCount(REPORT_BULK + 4);
   await expect(page.getByRole('button', { name: 'Показать ещё' })).toHaveCount(0);
   expect(problems, problems.join('\n')).toEqual([]);
 });
@@ -207,6 +209,30 @@ test('report_svg_as_img_no_script', async ({ page }) => {
   expect(r.headers()['content-security-policy']).toContain('sandbox');
   expect(r.headers()['x-content-type-options']).toBe('nosniff');
   expect(problems, problems.join('\n')).toEqual([]);
+  expect(r.headers()['content-disposition']).toMatch(/^attachment/);
+  // прямой переход по адресу SVG документом не открывается (attachment + CSP sandbox): браузер
+  // скачивает файл, страница остаётся прежней, скрипт и `onload` не исполняются нигде
+  const src = `${base()}${await svg.getAttribute('src')}`;
+  const download = page.waitForEvent('download');
+  await page.goto(src).catch((e: Error) => expect(e.message).toContain('Download is starting'));
+  expect((await download).suggestedFilename()).toBe('diag.svg');
+  expect(await page.evaluate((f) => (window as unknown as Record<string, unknown>)[f], SVG_FLAG)).toBeUndefined();
+  expect(page.url()).not.toContain('/attachments/');
+});
+
+test('report_search_one_card_per_report', async ({ page }) => {
+  const problems = watch(page);
+  await openFeed(page);
+  const searched = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().endsWith('/api/v1/search'));
+  await page.getByLabel('Поиск по отчётам').fill(REPORT_DUP_WORD);
+  await page.getByRole('button', { name: 'Применить' }).click();
+  // сервер отдал по элементу на чанк: совпадения в двух разделах — два элемента одного отчёта
+  const body = (await (await searched).json()) as { items: { entry_id?: string }[] };
+  expect(body.items.filter((x) => x.entry_id === env('E2E_REPORT_DUP')).length).toBeGreaterThan(1);
+  const hits = page.getByRole('feed', { name: 'Найденные отчёты' }).locator('article');
+  await expect(hits).toHaveCount(1);
+  await expect(hits.first()).toContainText('два раздела');
+  expect(problems, problems.join('\n')).toEqual([]);
 });
 
 test('report_other_file_download_attachment', async ({ page }) => {
@@ -256,7 +282,7 @@ test('ctrl_k_finds_report_opens_page', async ({ page }) => {
   await page.keyboard.press('Control+k');
   const search = page.getByRole('combobox', { name: 'Поиск по заметкам' });
   await search.fill(REPORT_WORD);
-  const opt = page.getByRole('option').filter({ hasText: 'отчёт' });
+  const opt = page.getByRole('option').filter({ has: page.locator('.ekind', { hasText: /^отчёт$/ }) });
   await expect(opt).toHaveCount(1);
   await expect(opt).toContainText('производительность индекса');
   await opt.click();
@@ -278,8 +304,8 @@ test('report_no_create_or_edit_ui', async ({ page }) => {
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
-/** Участник `rw` решения администратора: вход с обязательной сменой пароля, свой контекст. */
-async function memberRw(browser: Browser, page: Page) {
+/** Участник решения администратора с одобренным доступом `access` (без входа в WebUI). */
+async function member(browser: Browser, page: Page, access: 'rw' | 'ro') {
   const rc = page.request;
   const me = await rc.get(`${base()}api/v1/auth/me`);
   const { csrf } = (await me.json()) as { csrf: string };
@@ -288,7 +314,7 @@ async function memberRw(browser: Browser, page: Page) {
     if (!r.ok()) throw new Error(`${method} ${path}: HTTP ${r.status()} ${await r.text()}`);
     return (r.status() === 204 ? undefined : await r.json()) as T;
   };
-  const name = `e2e-report-rw-${Date.now()}`;
+  const name = `e2e-report-${access}-${Date.now()}`;
   const u = await call<{ user: { id: string }; token: { plaintext: string } }>('POST', 'admin/users', { name });
   // свой контекст без cookie администратора: запрос доступа — токеном участника
   const ctx = await browser.newContext({ storageState: { cookies: [], origins: [] } });
@@ -297,8 +323,14 @@ async function memberRw(browser: Browser, page: Page) {
     data: { agent_solution_id: SOLUTION_GUID, name: SOLUTION_NAME },
   });
   expect(req.status()).toBe(202);
-  await call('POST', `solutions/${SOLUTION_GUID}/access/${u.user.id}/approve`, { access: 'rw' });
-  await call('POST', `admin/users/${u.user.id}/password`, { password: PASS });
+  await call('POST', `solutions/${SOLUTION_GUID}/access/${u.user.id}/approve`, { access });
+  return { ctx, call, name, id: u.user.id, token: u.token.plaintext };
+}
+
+/** Участник `rw` решения администратора: вход с обязательной сменой пароля, свой контекст. */
+async function memberRw(browser: Browser, page: Page) {
+  const { ctx, call, name, id } = await member(browser, page, 'rw');
+  await call('POST', `admin/users/${id}/password`, { password: PASS });
   const login = await ctx.request.post(`${base()}api/v1/auth/login`, { data: { login: name, password: PASS } });
   expect(login.status()).toBe(200);
   const mc = ((await login.json()) as { csrf: string }).csrf;
@@ -307,8 +339,50 @@ async function memberRw(browser: Browser, page: Page) {
     data: { old: PASS, new: PASS2 },
   });
   expect(pw.status()).toBe(204);
-  return { ctx, id: u.user.id, csrf: mc };
+  return { ctx, id, csrf: mc };
 }
+
+test('report_admin_for_user_no_trash_ui_files_with_user', async ({ page, browser }) => {
+  const problems = watch(page);
+  // отчёт в решении другого пользователя (его агент, multipart); администратор открывает журнал
+  // от его имени: база не своя — адреса файлов с ?user=<владелец>, корзины и «Удалить» нет
+  const m = await member(browser, page, 'ro');
+  const guid = '0e2e0000-0000-4000-8000-0000000005a5';
+  const auth = { Authorization: `Bearer ${m.token}` };
+  const reg = await m.ctx.request.post(`${base()}api/v1/solutions`, {
+    headers: auth,
+    data: { agent_solution_id: guid, name: 'E2E решение пользователя' },
+  });
+  expect(reg.status()).toBe(201);
+  const created = await m.ctx.request.post(`${base()}api/v1/spaces/${guid}/entries`, {
+    headers: auth,
+    multipart: {
+      meta: {
+        name: 'meta',
+        mimeType: 'application/json',
+        buffer: Buffer.from(JSON.stringify({ title: 'Отчёт пользователя E2E', body: '![график](plot.png)\n', tags: [] })),
+      },
+      file: { name: 'plot.png', mimeType: 'image/png', buffer: makePng(80, 40) },
+    },
+  });
+  expect(created.status()).toBe(201);
+  const id = ((await created.json()) as { id: string }).id;
+  await m.ctx.close();
+
+  const url = `${base()}#/u/${m.id}/s/${guid}/j/reports`;
+  await page.goto(url);
+  const feed = page.getByRole('feed', { name: 'Лента отчётов' });
+  const thumb = feed.locator(`article[data-report="${id}"] img.thumb`);
+  await expect(thumb).toHaveAttribute('src', new RegExp(`/plot\\.png\\?user=${m.id}$`));
+  await expect.poll(() => thumb.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(80);
+  await expect(page.getByRole('button', { name: 'Корзина', exact: true })).toHaveCount(0);
+  await page.goto(`${url}/${id}`);
+  const img = page.locator('article.report .doc img');
+  await expect(img).toHaveAttribute('src', new RegExp(`\\?user=${m.id}$`));
+  await expect.poll(() => img.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(80);
+  await expect(page.getByRole('button', { name: 'Удалить' })).toHaveCount(0);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
 
 test('report_delete_restore_owner_only_ui', async ({ page, browser }) => {
   const id = env('E2E_REPORT_TRASH');

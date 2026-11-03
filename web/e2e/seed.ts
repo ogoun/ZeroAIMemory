@@ -288,6 +288,8 @@ export const SVG_FLAG = '__zamSvgPwned';
 export const REPORT_TITLE = 'Отчёт E2E: обучение модели';
 /** Слово только из текста отчёта «perf» — для полнотекстового поиска. */
 export const REPORT_WORD = 'квазичастицами';
+/** Слово из двух разделов одного отчёта: `mode=brief` даёт два элемента выдачи на отчёт. */
+export const REPORT_DUP_WORD = 'гиперзарядами';
 /** Число однотипных отчётов для курсора ленты (страница WebUI — 20). */
 export const REPORT_BULK = 21;
 export const REPORT_SESSION = 'e2e-report-sess';
@@ -330,6 +332,7 @@ export interface ReportSeed {
   full: string;
   perf: string;
   trash: string;
+  dup: string;
   task: string;
 }
 
@@ -366,6 +369,23 @@ export async function seedReports(base: string, token: string, noteId: string): 
     tags: ['perf'],
     area: 'index',
   });
+  const filler = 'Абзац с подробностями измерений и условий опыта. '.repeat(60);
+  const dup = await report({
+    title: 'Отчёт E2E: два раздела',
+    body: `## Первый раздел
+
+Замер с ${REPORT_DUP_WORD} в начале.
+
+${filler}
+
+## Второй раздел
+
+${filler}
+
+Повтор с ${REPORT_DUP_WORD} в конце.
+`,
+    tags: ['dup'],
+  });
   const full = await report(
     {
       title: REPORT_TITLE,
@@ -387,5 +407,5 @@ export async function seedReports(base: string, token: string, noteId: string): 
       ['results.csv', 'text/csv', 'epoch,loss\n1,0.92\n2,0.41\n'],
     ],
   );
-  return { full, perf, trash, task: task.id };
+  return { full, perf, trash, dup, task: task.id };
 }

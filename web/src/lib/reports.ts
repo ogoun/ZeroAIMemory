@@ -1,5 +1,5 @@
 // Общее для ленты и страницы отчётов (M5.5): автор, размер файла, ссылки `data.refs`.
-import type { AuthorView } from './api';
+import type { AuthorView, SearchItem } from './api';
 import { AUTHOR_TEXT } from './journals';
 
 /** Автор отчёта: вид, сессия агента и машина (если известны). */
@@ -36,4 +36,16 @@ export function refsOf(data: Record<string, unknown>): [string, string[]][] {
       Array.isArray(refs[k]) ? (refs[k] as unknown[]).filter((s): s is string => typeof s === 'string') : [],
     ])
     .filter(([, v]) => v.length > 0);
+}
+
+/**
+ * Выдача поиска отчётов — по одному элементу на отчёт: `mode=brief` отдаёт элемент на каждый
+ * чанк, остаётся лучший по баллу (первый после сортировки), порядок — по баллу.
+ */
+export function uniqueHits(items: SearchItem[]): SearchItem[] {
+  const seen = new Set<string>();
+  return items
+    .filter((x) => x.kind === 'report' && x.entry_id)
+    .sort((a, b) => b.score - a.score)
+    .filter((x) => !seen.has(x.entry_id!) && !!seen.add(x.entry_id!));
 }

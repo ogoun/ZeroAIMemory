@@ -142,6 +142,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_REPORT_FULL = reports.full;
     process.env.E2E_REPORT_PERF = reports.perf;
     process.env.E2E_REPORT_TRASH = reports.trash;
+    process.env.E2E_REPORT_DUP = reports.dup;
     process.env.E2E_REPORT_TASK = reports.task;
   } catch (e) {
     child.kill();

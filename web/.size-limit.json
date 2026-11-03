@@ -1,5 +1,5 @@
 [
-  { "name": "entry", "path": "dist/assets/entry-*.js", "gzip": true, "limit": "105 KB" },
+  { "name": "entry", "path": "dist/assets/entry-*.js", "gzip": true, "limit": "103 KB" },
   { "name": "ReportsView (журнал «Отчёты»)", "path": "dist/assets/ReportsView-*.js", "gzip": true, "limit": "8 KB" },
   { "name": "AttachmentView", "path": "dist/assets/AttachmentView-*.js", "gzip": true, "limit": "4 KB" },
   { "name": "PdfViewer", "path": "dist/assets/PdfViewer-*.js", "gzip": true, "limit": "2 KB" },

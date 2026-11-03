@@ -16,7 +16,8 @@
     type SearchItem,
   } from '../lib/api';
   import { fmtTime } from '../lib/journals';
-  import { reportAuthor } from '../lib/reports';
+  import { reportAuthor, uniqueHits } from '../lib/reports';
+  import { snippetParts } from '../lib/snippet';
   import { go, href } from '../lib/router';
 
   interface Props {
@@ -32,8 +33,6 @@
   let { user, space, entry, owner, onexpired }: Props = $props();
 
   const PAGE = 20;
-  const MARK_START = '';
-  const MARK_END = '';
 
   let items = $state<ReportItem[]>([]);
   let next = $state<string | null>(null);
@@ -56,6 +55,12 @@
     if (key === filtersFor) return;
     filtersFor = key;
     untrack(() => {
+      // другое решение: выдача прежнего не показывается и не дописывается ответом в полёте
+      seq++;
+      items = [];
+      hits = null;
+      next = null;
+      error = '';
       tag = '';
       area = '';
       query = '';
@@ -88,7 +93,8 @@
       if (f.query && !trash) {
         const r = await searchReports(u, s, f.query, f.area || undefined);
         if (my !== seq) return;
-        hits = r.items.filter((x) => x.kind === 'report' && x.entry_id);
+        // `brief` — элемент на каждый чанк: отчёт с совпадениями в нескольких разделах — один
+        hits = uniqueHits(r.items);
         items = [];
         next = null;
         return;
@@ -118,7 +124,10 @@
 
   function apply(e: SubmitEvent) {
     e.preventDefault();
-    applied = { tag: tag.trim(), area: area.trim(), query: query.trim() };
+    const qtext = query.trim();
+    // поиск теги не фильтрует: при запросе тег сбрасывается, а не висит скрытым фильтром
+    if (qtext && !trash) tag = '';
+    applied = { tag: qtext && !trash ? '' : tag.trim(), area: area.trim(), query: qtext };
     notice = '';
     load(user, space, true);
   }
@@ -139,11 +148,15 @@
 
   async function restore(it: ReportItem) {
     error = '';
+    // ответ применяется к той же корзине: за время запроса ленту могли перезагрузить
+    const my = seq;
     try {
       await restoreEntry(user, it.id);
+      if (my !== seq || !trash) return;
       items = items.filter((x) => x.id !== it.id);
       notice = `Отчёт «${it.title}» восстановлен.`;
     } catch (e) {
+      if (my !== seq) return;
       fail(e);
     }
   }
@@ -154,24 +167,6 @@
   }
 
   const open = (id: string) => href({ name: 'journal', user, space, journal: 'reports', entry: id });
-
-  /** Сниппет → фрагменты; `m` — совпадение (между U+E000 и U+E001). */
-  function parts(s: string): { t: string; m: boolean }[] {
-    const out: { t: string; m: boolean }[] = [];
-    let m = false;
-    let buf = '';
-    for (const ch of s) {
-      if (ch === MARK_START || ch === MARK_END) {
-        if (buf) out.push({ t: buf, m });
-        buf = '';
-        m = ch === MARK_START;
-      } else {
-        buf += ch;
-      }
-    }
-    if (buf) out.push({ t: buf, m });
-    return out;
-  }
 
   let filtered = $derived(!!(applied.tag || applied.area || applied.query));
 </script>
@@ -187,7 +182,13 @@
       </label>
       <label class="row">
         Тег
-        <input bind:value={tag} placeholder="например, ml" aria-label="Тег" disabled={!!query.trim() && !trash} />
+        <input
+          bind:value={tag}
+          placeholder="например, ml"
+          aria-label="Тег"
+          title={query.trim() && !trash ? 'Поиск по тексту теги не фильтрует' : undefined}
+          disabled={!!query.trim() && !trash}
+        />
       </label>
       <label class="row">
         Область
@@ -212,7 +213,7 @@
               <h3><a href={open(h.entry_id ?? '')}>{h.title ?? ''}</a></h3>
               {#if h.created_at}<div class="meta muted"><time datetime={h.created_at}>{fmtTime(h.created_at)}</time></div>{/if}
               <p class="snippet">
-                {#each parts(h.snippet ?? '') as p, j (j)}{#if p.m}<mark>{p.t}</mark>{:else}{p.t}{/if}{/each}
+                {#each snippetParts(h.snippet ?? '') as p, j (j)}{#if p.m}<mark>{p.t}</mark>{:else}{p.t}{/if}{/each}
               </p>
             </div>
           </article>
