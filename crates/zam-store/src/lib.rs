@@ -90,7 +90,7 @@ pub use entries::{
 pub use file_refs::{
     ChangedFile, FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit,
     check_hash, files_changed, files_verified, normalize_ref_path, path_owners, refs_index,
-    refs_to_path, stale_refs_of, symbols_uploaded, verified_notes,
+    refs_to_path, shown_ref, stale_refs_of, symbols_uploaded, verified_notes,
 };
 pub use glossary::{
     ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,

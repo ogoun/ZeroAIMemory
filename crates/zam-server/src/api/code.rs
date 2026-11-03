@@ -913,7 +913,10 @@ fn parse_manifest(m: Vec<ManifestIn>, max: u32) -> Result<Vec<ManifestItem>, Api
             unprocessable(format!("{what}.hash: blake3 содержимого, 64 hex-символа"))
         })?;
         if !seen.insert(path.clone()) {
-            return Err(unprocessable(format!("{what}: повтор пути «{path}»")));
+            return Err(unprocessable(format!(
+                "{what}: повтор пути «{}»",
+                zam_store::shown_ref(&path)
+            )));
         }
         out.push(ManifestItem { path, hash });
     }
@@ -2072,7 +2075,10 @@ async fn find_symbol(sc: &MemScope, guid: &str, raw: &str) -> Result<i64, ApiErr
     hits.into_iter()
         .find(|h| h.path == path && h.qual == qual)
         .map(|h| h.id)
-        .ok_or_else(|| ApiError::CodeSymbolNotFound(format!("символа «{path}#{qual}» нет в карте")))
+        .ok_or_else(|| {
+            let r = zam_store::shown_ref(&format!("{path}#{qual}"));
+            ApiError::CodeSymbolNotFound(format!("символа «{r}» нет в карте"))
+        })
 }
 
 /// `GET /code/symbols/{id | путь#qual}?solution=` → карточка: определение, кто ссылается, на

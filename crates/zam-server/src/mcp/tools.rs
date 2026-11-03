@@ -1683,7 +1683,10 @@ async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) ->
     let addr = match zam_code::split_ref(query) {
         (_, Some(_)) => {
             if let Some(p) = path {
-                extra.push(format!("path «{p}» не учтён: query — уже адрес путь#qual"));
+                extra.push(format!(
+                    "path «{}» не учтён: query — уже адрес путь#qual",
+                    zam_store::shown_ref(p)
+                ));
             }
             query.to_string()
         }
@@ -1733,9 +1736,10 @@ async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) ->
                 )),
                 Fmt::Md => Done::Md(with_warnings(
                     format!(
-                        "Символ «{addr}» в карте не найден: проверьте адрес путь#qual \
+                        "Символ «{}» в карте не найден: проверьте адрес путь#qual \
                          (memory_code action=symbol по имени) или обновите карту — \
-                         `zam code sync`."
+                         `zam code sync`.",
+                        zam_store::shown_ref(&addr)
                     ),
                     &Value::Null,
                     &extra,

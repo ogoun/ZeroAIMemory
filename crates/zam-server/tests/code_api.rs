@@ -1462,7 +1462,8 @@ async fn parallel_rankings_of_solutions_share_two_heavy_slots() {
         ok(&r, StatusCode::OK, "загрузка");
     }
     let hooks = &a.st.code.hooks;
-    hooks.rank_delay_ms.store(700, Ordering::SeqCst);
+    // счёт дольше, чем приход трёх запросов даже под нагрузкой: пересчёты перекрываются
+    hooks.rank_delay_ms.store(2000, Ordering::SeqCst);
     let a = &a;
     let map = |g: &str| {
         let uri = format!("/api/v1/code/map?solution={g}&format=json");

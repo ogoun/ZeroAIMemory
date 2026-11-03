@@ -280,6 +280,32 @@ async fn hostile_long_ref_rejected_fast() {
         r.text().chars().take(200).collect::<String>()
     );
     assert!(r.json()["detail"].as_str().unwrap().contains("длиннее"));
+    assert!(
+        r.text().len() < 2048,
+        "ответ без эха пути: {} байт",
+        r.text().len()
+    );
+    // путь не кода с `symbol` — текст называет путь: не больше 200 символов и длина
+    let r = a
+        .t(
+            Method::POST,
+            &sol_entries(),
+            Some(
+                json!({"kind": "insight", "title": "Злая ссылка", "body": "подробности",
+                        "data": {"kind": "gotcha"},
+                        "refs": {"files": [{"path": format!("{huge}x.md"), "symbol": "foo"}]},
+                        "force": true}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        r.text().len() < 2048,
+        "ответ без эха пути: {} байт",
+        r.text().len()
+    );
+    let d = r.json()["detail"].as_str().unwrap().to_string();
+    assert!(d.contains("… (1000004 символов)"), "{d}");
     let r = a
         .t(
             Method::POST,
@@ -289,10 +315,15 @@ async fn hostile_long_ref_rejected_fast() {
         )
         .await;
     let n = created(r).await;
+    // тело ответа заметки содержит её текст (с той же ссылкой) — меряется предупреждение
+    let w = n["warnings"].to_string();
+    assert!(w.contains("invalid_ref"), "предупреждение");
     assert!(
-        n["warnings"].to_string().contains("invalid_ref"),
-        "предупреждение"
+        w.len() < 2048,
+        "предупреждение без эха пути: {} байт",
+        w.len()
     );
+    assert!(w.contains("… (1000000 символов)"), "{w}");
     assert!(
         t.elapsed() < std::time::Duration::from_secs(3),
         "{:?}",

@@ -41,6 +41,8 @@ use crate::{Db, StoreError};
 pub const REFS_MAX: usize = 64;
 /// Предел длины пути ссылки, символов (общий с разбором `путь#qual`, [`zam_code::REF_MAX_BYTES`]).
 pub use zam_code::PATH_MAX_CHARS;
+/// Символов пути или ссылки в тексте ошибки и предупреждения не больше ([`shown_ref`]).
+pub const SHOWN_REF_CHARS: usize = 200;
 /// Предел файлов в одном сообщении `POST /files/changed` и `/files/verified`.
 pub const FILES_MAX: usize = 500;
 /// Записей на путь в индексе [`refs_index`].
@@ -167,6 +169,17 @@ pub enum PathError {
     Absolute,
     #[error("путь выходит выше корня решения")]
     AboveRoot,
+}
+
+/// Путь или ссылка (`путь#qual`) в тексте ошибки или предупреждения: недоверенная строка — не
+/// длиннее [`SHOWN_REF_CHARS`] символов, сверх — многоточие и общая длина
+/// (`<начало>… (N символов)`), чтобы ответ не повторял присланный мегабайт (финальное ревью
+/// ветки M5.6).
+pub fn shown_ref(s: &str) -> String {
+    match s.char_indices().nth(SHOWN_REF_CHARS) {
+        Some((i, _)) => format!("{}… ({} символов)", &s[..i], s.chars().count()),
+        None => s.to_string(),
+    }
 }
 
 /// Лексическая нормализация пути относительно корня решения: края без пробелов, `\` → `/`,
@@ -1354,6 +1367,18 @@ mod tests {
             ok(&"я".repeat(PATH_MAX_CHARS)).chars().count(),
             PATH_MAX_CHARS
         );
+    }
+
+    /// Путь в тексте ошибки: до 200 символов как есть, длиннее — начало, многоточие и длина.
+    #[test]
+    fn shown_ref_clips_long_paths() {
+        assert_eq!(shown_ref("src/a.rs"), "src/a.rs");
+        let max = "я".repeat(SHOWN_REF_CHARS);
+        assert_eq!(shown_ref(&max), max);
+        let long = "я".repeat(1_000_000);
+        let s = shown_ref(&long);
+        assert_eq!(s, format!("{max}… (1000000 символов)"));
+        assert!(s.len() < 1024);
     }
 
     #[test]

@@ -86,7 +86,7 @@ fn note_warnings(content: &str) -> Vec<String> {
                 Ok(p) => {
                     valid.insert((p, fr.symbol));
                 }
-                Err(e) => out.push(format!("invalid_ref: {r} ({e})")),
+                Err(e) => out.push(format!("invalid_ref: {} ({e})", zam_store::shown_ref(r))),
             }
         }
         if valid.len() > zam_store::file_refs::REFS_MAX {

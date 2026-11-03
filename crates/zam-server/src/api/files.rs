@@ -109,7 +109,8 @@ fn check_symbol(q: &str, path: Option<&str>, what: &str) -> Result<(), ApiError>
         && zam_code::lang_of(p).is_none()
     {
         return Err(unprocessable(format!(
-            "{what}: символ — только у файла кода (а не у «{p}»)"
+            "{what}: символ — только у файла кода (а не у «{}»)",
+            zam_store::shown_ref(p)
         )));
     }
     // то же правило, что у разбора `путь#qual`; итог от пути кода не зависит (`qual` без `/`),
