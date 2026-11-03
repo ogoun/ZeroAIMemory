@@ -152,11 +152,15 @@ impl TestQdrant {
         loop {
             let http_port = free_port();
             let grpc_port = free_port();
-            // Пути в конфиге — от рабочего каталога процесса (исследование 05 §6.1).
+            let (storage, snapshots, temp) = (
+                qpath(&dir, "storage"),
+                qpath(&dir, "snapshots"),
+                qpath(&dir, "temp"),
+            );
             let config = format!(
                 "log_level: WARN\n\
                  telemetry_disabled: true\n\
-                 storage:\n  storage_path: ./storage\n  snapshots_path: ./snapshots\n  temp_path: ./temp\n  on_disk_payload: true\n\
+                 storage:\n  storage_path: {storage}\n  snapshots_path: {snapshots}\n  temp_path: {temp}\n  on_disk_payload: true\n\
                  service:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  enable_cors: false\n  enable_static_content: false\n\
                  cluster:\n  enabled: false\n"
             );
@@ -269,6 +273,21 @@ fn wait_ready(
             );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Путь данных Qdrant в конфиге — как `zam_index::supervisor::config::storage_path`: Linux —
+/// от рабочего каталога процесса (исследование 05 §6.1), Windows — абсолютный `\\?\…` в
+/// YAML-кавычках. Файлы payload-индексов лежат глубоко, и с относительным путём каталог теста
+/// в `target/<dir>/tmp/…` уводит их за MAX_PATH (260): Qdrant отвечает на создание индекса
+/// «failed to open mutable numeric index on gridstore» (os error 3), векторный канал не
+/// включается.
+fn qpath(dir: &Path, name: &str) -> String {
+    if cfg!(windows) {
+        let abs = std::path::absolute(dir.join(name)).expect("абсолютный путь Qdrant");
+        format!("'\\\\?\\{}'", abs.display().to_string().replace('\'', "''"))
+    } else {
+        format!("./{name}")
     }
 }
 
