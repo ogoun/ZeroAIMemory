@@ -83,46 +83,55 @@ impl HookFlags {
     }
 }
 
-/// Переключатели пользователя из `user_settings`; нечитаемое значение — `true` (как без строки).
-pub async fn hook_flags(sys: &SystemStore, user: Id) -> Result<HookFlags, zam_store::StoreError> {
-    let mut f = HookFlags::default();
+/// Действующие значения всех настроек пользователя (нет строки — `true`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserFlags {
+    /// Типы подсказок хуков `hooks.<тип>`.
+    pub hooks: HookFlags,
+    /// Проактивность идей `ideas.proactive` (действует вместе с `[ideas] proactive`).
+    pub ideas_proactive: bool,
+}
+
+impl Default for UserFlags {
+    fn default() -> Self {
+        UserFlags {
+            hooks: HookFlags::default(),
+            ideas_proactive: true,
+        }
+    }
+}
+
+/// Все настройки пользователя одним чтением `user_settings`; нечитаемое значение — `true`
+/// (как без строки).
+pub async fn user_flags(sys: &SystemStore, user: Id) -> Result<UserFlags, zam_store::StoreError> {
+    let mut f = UserFlags::default();
     for (key, value) in sys.user_settings(user).await? {
-        let Some(kind) = key.strip_prefix(HOOKS_PREFIX) else {
+        let Some(b) = value.as_bool() else {
             continue;
         };
-        if let (Some(i), Some(b)) = (HOOK_KINDS.iter().position(|k| *k == kind), value.as_bool()) {
-            f.0[i] = b;
+        if key == IDEAS_PROACTIVE {
+            f.ideas_proactive = b;
+        } else if let Some(i) = key
+            .strip_prefix(HOOKS_PREFIX)
+            .and_then(|kind| HOOK_KINDS.iter().position(|k| *k == kind))
+        {
+            f.hooks.0[i] = b;
         }
     }
     Ok(f)
 }
 
-/// Проактивность идей пользователя (`ideas.proactive`); нет строки или значение нечитаемо —
-/// `true`.
+/// Переключатели типов подсказок пользователя ([`user_flags`]).
+pub async fn hook_flags(sys: &SystemStore, user: Id) -> Result<HookFlags, zam_store::StoreError> {
+    Ok(user_flags(sys, user).await?.hooks)
+}
+
+/// Проактивность идей пользователя (`ideas.proactive`, [`user_flags`]).
 pub async fn ideas_proactive(sys: &SystemStore, user: Id) -> Result<bool, ApiError> {
-    Ok(sys
-        .user_settings(user)
-        .await?
-        .into_iter()
-        .find(|(k, _)| k == IDEAS_PROACTIVE)
-        .and_then(|(_, v)| v.as_bool())
-        .unwrap_or(true))
+    Ok(user_flags(sys, user).await?.ideas_proactive)
 }
 
-/// Действующие значения всех настроек пользователя (нет строки — `true`).
-struct Current {
-    hooks: HookFlags,
-    ideas_proactive: bool,
-}
-
-impl Current {
-    async fn load(sys: &SystemStore, user: Id) -> Result<Current, ApiError> {
-        Ok(Current {
-            hooks: hook_flags(sys, user).await?,
-            ideas_proactive: ideas_proactive(sys, user).await?,
-        })
-    }
-
+impl UserFlags {
     /// Значение по ключу `user_settings`.
     fn value(&self, key: &str) -> bool {
         if key == IDEAS_PROACTIVE {
@@ -132,7 +141,7 @@ impl Current {
             .enabled(key.strip_prefix(HOOKS_PREFIX).unwrap_or(key))
     }
 
-    fn to_json(&self) -> Value {
+    fn to_json(self) -> Value {
         json!({
             "hooks": self.hooks.to_json(),
             "ideas": {"proactive": self.ideas_proactive},
@@ -189,7 +198,7 @@ fn parse_patch(body: &Bytes) -> Result<Vec<(String, Value)>, ApiError> {
 }
 
 async fn settings_json(st: &AppState, user: Id) -> Result<Value, ApiError> {
-    Ok(Current::load(&st.system, user).await?.to_json())
+    Ok(user_flags(&st.system, user).await?.to_json())
 }
 
 /// Сохраняет правки и пишет аудит каждого изменения. Правка сравнивается с действующим
@@ -202,7 +211,7 @@ async fn apply(
     body: &Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let edits = parse_patch(body)?;
-    let current = Current::load(&st.system, user).await?;
+    let current = user_flags(&st.system, user).await?;
     let edits: Vec<(String, Value)> = edits
         .into_iter()
         .filter(|(key, v)| v.as_bool() != Some(current.value(key)))

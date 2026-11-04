@@ -104,7 +104,7 @@ pub use graph::{
 pub use ideas::{
     Decided, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS, IDEA_LINKS_MAX, IDEA_OPTIONS,
     IDEA_ORIGIN_REQUIRED, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewDecision,
-    PROPOSE_TEXT_MAX_CHARS, TaskState, adopt_idea, check_idea, check_idea_shape,
+    PROPOSE_TEXT_MAX_CHARS, TaskState, adopt_idea, any_idea, check_idea, check_idea_shape,
     check_idea_transition, decide_idea, idea_candidate, proactive_ideas, propose_idea,
 };
 pub use jobs::{
@@ -141,7 +141,8 @@ pub use sessions::{
     RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,
     TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
     add_tokens, check_session_id, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, mark_seen_with_tokens, seen_revs, session_tokens, touch_session,
+    list_sessions, mark_seen, mark_seen_with_tokens, seen_entry_ids, seen_revs, session_tokens,
+    touch_session,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{

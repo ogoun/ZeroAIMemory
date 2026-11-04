@@ -165,7 +165,7 @@ use super::nodes::read::l1;
 use super::search::targets::{ScopeReq, SearchTarget, dedup_keep_order, resolve_targets};
 use super::search::{Health, SOLUTION_HEADER};
 use super::sessions::{RequestSession, request_session};
-use super::user_settings::{HookFlags, hook_flags};
+use super::user_settings::{UserFlags, user_flags};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, SESSION_HEADER};
 use crate::auth::{Principal, target_user_id};
@@ -558,8 +558,6 @@ const IDEAS_HINT: &str = "Предложи человеку одну: memory_upd
 const REASON_IDEA: &str = "idea";
 /// Предел заголовка идеи в строке дайджеста и подсказки, символов.
 const IDEA_TITLE_CHARS: usize = 120;
-/// Кандидатов-идей, по которым [`digest_ideas`] проверяет «раздел этой сессии уже был».
-const IDEA_SEEN_FETCH: usize = 100;
 /// Ближайших точек dense при замере косинуса общих идей Knowledge (§6.2).
 const IDEA_COSINE_NEAREST: usize = 50;
 /// Тестовая метка заголовка идеи: отдельный поиск идей к `prompt` «не укладывается в срок»
@@ -714,13 +712,6 @@ async fn question_cands(
     Ok((cands, line))
 }
 
-/// Сегодняшняя дата UTC: `horizon` идеи — «не раньше» по UTC (M5.7 §4).
-fn today_utc() -> jiff::civil::Date {
-    jiff::Timestamp::now()
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .date()
-}
-
 /// Заголовок идеи в строке: до [`IDEA_TITLE_CHARS`] символов, секреты маскируются.
 fn idea_title(e: &Entry) -> String {
     zam_markdown::mask_text(&clip(&e.title, IDEA_TITLE_CHARS))
@@ -755,107 +746,83 @@ fn idea_cand(target: usize, e: &Entry, block: String) -> Cand {
 }
 
 /// Проактивность идей (§8): `[ideas] proactive` сервера и `ideas.proactive` пользователя
-/// (`server && user`). Сбой чтения настройки — включено, как у `hooks.<тип>`.
-async fn ideas_enabled(st: &AppState, user: Id) -> bool {
-    if !st.cfg.ideas.proactive {
-        return false;
-    }
-    match super::user_settings::ideas_proactive(&st.system, user).await {
-        Ok(on) => on,
-        Err(e) => {
-            tracing::warn!(error = %e, "recall: настройка ideas.proactive не прочитана");
-            true
-        }
-    }
+/// (`server && user`; настройки пользователя — одним чтением с `hooks.<тип>`, сбой чтения —
+/// всё включено).
+fn ideas_enabled(st: &AppState, flags: &UserFlags) -> bool {
+    st.cfg.ideas.proactive && flags.ideas_proactive
 }
 
-/// Показанные сессии идеи из `cands` цели `target`: один запрос `seen_revs` по их ключам
-/// (`RECALL_PART`, любая ревизия, без эпох — §6.1), как у «Ответов человека». Без сессии —
-/// пусто; сбой чтения — WARN и пусто (как [`shown`]).
-async fn seen_ideas(
-    s: Option<&RequestSession>,
-    targets: &[SearchTarget],
-    target: usize,
-    cands: &[Entry],
-) -> HashSet<Id> {
+/// Показывалась ли сессии хоть одна идея базы цели `t` (§6.1, «первый `session_start`»):
+/// среди записей, выданных сессии (`session_seen`, `RECALL_PART`, любая ревизия, без эпох),
+/// есть вид `idea` любого статуса — в том числе отложенная, предложенная или удалённая после
+/// показа. Без сессии — нет (учёта показа нет); сбой чтения — WARN и «показывалась»: раздел
+/// лучше пропустить, чем повторить.
+async fn idea_shown_in_session(s: Option<&RequestSession>, t: &SearchTarget) -> bool {
     let Some(s) = s else {
-        return HashSet::new();
+        return false;
     };
-    let keys: Vec<SeenKey> = cands
-        .iter()
-        .map(|e| SeenKey {
-            owner_id: targets[target].owner,
-            target: TargetRef {
-                kind: TargetKind::Entry,
-                id: e.id,
-            }
-            .into(),
-            part: RECALL_PART.to_string(),
-        })
-        .collect();
-    match seen_revs(&s.db, &s.touch.id, &keys).await {
-        Ok(m) => cands
-            .iter()
-            .zip(&keys)
-            .filter(|(_, k)| m.contains_key(*k))
-            .map(|(e, _)| e.id)
-            .collect(),
+    let ids = match zam_store::seen_entry_ids(&s.db, &s.touch.id, t.owner, RECALL_PART).await {
+        Ok(ids) => ids,
         Err(e) => {
-            tracing::warn!(error = %e, "recall: показанные идеи сессии не прочитаны");
-            HashSet::new()
+            tracing::warn!(error = %e, "recall: показанное сессии не прочитано, без раздела идей");
+            return true;
+        }
+    };
+    match zam_store::any_idea(&t.db, &ids).await {
+        Ok(shown) => shown,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: виды показанных записей не прочитаны, без раздела идей");
+            true
         }
     }
 }
 
 /// Идеи раздела [`SECTION_IDEAS`] (§6.1): только пространство решения запроса (личного или
 /// общего — база владельца; Knowledge — нет), до `ideas.digest_max` в порядке
-/// [`zam_store::proactive_ideas`], и только на первом `session_start` сессии — пока ни одна
-/// из кандидатов (до [`IDEA_SEEN_FETCH`]) ей не показана. Иначе каждый `/compact` приносил бы
-/// следующие три (ждёт ответа владельца, вопрос 10).
+/// [`zam_store::proactive_ideas`], и только на первом `session_start` сессии — пока ей не
+/// показана ни одна идея этой базы ([`idea_shown_in_session`]). Иначе каждый `/compact`
+/// приносил бы следующие три. Сбой чтения идей — WARN и раздела нет: ни ответ, ни остальной
+/// дайджест цели (`health.alive`) он не трогает.
 async fn digest_ideas(
     st: &AppState,
     session: Option<&RequestSession>,
-    health: &mut Health<'_>,
+    health: &Health<'_>,
     deadline: &mut Deadline,
-) -> Result<Vec<Cand>, ApiError> {
+) -> Vec<Cand> {
     let max = st.cfg.ideas.digest_max as usize;
     let Some((i, space)) = solution_space(health.targets()) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     if max == 0 || !health.alive[i] {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let db = health.targets()[i].db.clone();
+    let t = &health.targets()[i];
+    match deadline.step(idea_shown_in_session(session, t)).await {
+        Some(false) => {}
+        Some(true) | None => return Vec::new(),
+    }
     let Some(r) = deadline
         .step(zam_store::proactive_ideas(
-            &db,
+            &t.db,
             &[space],
-            today_utc(),
+            zam_store::time::utc_today(),
             &HashSet::new(),
-            IDEA_SEEN_FETCH,
+            max,
         ))
         .await
     else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
-    let Some(cands) = health.soft(i, r)? else {
-        return Ok(Vec::new());
-    };
-    if cands.is_empty() {
-        return Ok(Vec::new());
+    match r {
+        Ok(cands) => cands
+            .iter()
+            .map(|e| idea_cand(i, e, idea_line(e)))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: идеи дайджеста не прочитаны");
+            Vec::new()
+        }
     }
-    let targets = health.targets();
-    let Some(seen) = deadline.step(seen_ideas(session, targets, i, &cands)).await else {
-        return Ok(Vec::new());
-    };
-    if !seen.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(cands
-        .iter()
-        .take(max)
-        .map(|e| idea_cand(i, e, idea_line(e)))
-        .collect())
 }
 
 /// Подсказки-идеи к `prompt` (§6.2): отдельный лёгкий поиск после основного (`mode=brief`,
@@ -927,7 +894,7 @@ async fn collect_prompt_ideas(
         return Ok(Vec::new());
     };
     let min = st.cfg.recall.prompt_min_score;
-    let today = today_utc();
+    let today = zam_store::time::utc_today();
     let targets = health.targets();
     // (цель, идея, общая из Knowledge) в порядке выдачи
     let mut found: Vec<(usize, Entry, bool)> = Vec::new();
@@ -972,8 +939,12 @@ async fn collect_prompt_ideas(
         .iter()
         .any(|(_, e, _)| e.title.contains(TEST_SLOW_IDEA_MARK))
     {
-        let left = d.at.saturating_duration_since(Instant::now()) + Duration::from_millis(10);
-        if d.step(tokio::time::sleep(left)).await.is_none() {
+        // заведомо дольше срока: `timeout_at` сначала опрашивает сам шаг, и короткий сон,
+        // истёкший вместе со сроком (поток разбужен поздно под нагрузкой), прошёл бы как успех
+        if d.step(tokio::time::sleep(Duration::from_secs(3600)))
+            .await
+            .is_none()
+        {
             return Ok(Vec::new());
         }
     }
@@ -2720,14 +2691,16 @@ pub async fn recall(
         }
     }
     let user = target_user_id(&st, &p, &headers)?;
-    // R5: переключатели пользователя; сбой чтения — все включены (подсказки не валятся)
-    let hooks = match hook_flags(&st.system, user).await {
+    // R5: настройки пользователя (`hooks.<тип>`, `ideas.proactive`) одним чтением; сбой
+    // чтения — всё включено (подсказки не валятся)
+    let flags = match user_flags(&st.system, user).await {
         Ok(f) => f,
         Err(e) => {
-            tracing::warn!(error = %e, "recall: настройки hooks пользователя не прочитаны");
-            HookFlags::default()
+            tracing::warn!(error = %e, "recall: настройки пользователя не прочитаны");
+            UserFlags::default()
         }
     };
+    let hooks = flags.hooks;
     // N4: тип выключен на сервере — пустой `text`, показ не учитывается (сессия касается)
     let enabled = req.event.hook_kind().is_none_or(|k| hooks.enabled(k));
     // пакет восстановления (§9.2): `event: recovery` (без гейта) или `session_start` после
@@ -2798,7 +2771,7 @@ pub async fn recall(
     let ideas_on = enabled
         && matches!(req.event, Event::SessionStart | Event::Prompt)
         && !recovery
-        && ideas_enabled(&st, user).await;
+        && ideas_enabled(&st, &flags);
     let mut idea_cands: Vec<Cand> = Vec::new();
     let (notices, sections, repeatable, after_rules, open_line) = match req.event {
         _ if !enabled => (Vec::new(), Vec::new(), true, Vec::new(), None),
@@ -2817,8 +2790,7 @@ pub async fn recall(
             )
             .await?;
             if ideas_on {
-                idea_cands =
-                    digest_ideas(&st, session.as_ref(), &mut health, &mut deadline).await?;
+                idea_cands = digest_ideas(&st, session.as_ref(), &health, &mut deadline).await;
             }
             (n, s, true, g, o)
         }

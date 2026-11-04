@@ -297,7 +297,7 @@ impl ToolName {
                     "decision": {"type": "string", "enum": ["accept", "defer", "decline", "reopen"],
                         "description": "decide: решение человека по идее w: (by обязателен; без ответа «начать» не начинай); accept создаёт задачу k:, reopen — с reason"},
                     "horizon": {"type": "string", "description": "decide defer и answer defer вопроса-предложения: «не раньше» YYYY-MM-DD (UTC, позже сегодня; по умолчанию +30 дней)"},
-                    "space": {"type": "string", "description": "propose, decide accept: пространство будущей задачи (GUID решения); по умолчанию — решение запроса"},
+                    "space": {"type": "string", "description": "propose, decide accept: пространство будущей задачи — GUID решения или knowledge; по умолчанию — решение запроса"},
                     "title": {"type": "string"},
                     "body": {"type": "string", "description": "supersede — тело; append — дописать"},
                     "data": {"type": "object"},

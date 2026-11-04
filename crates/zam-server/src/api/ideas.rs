@@ -21,8 +21,8 @@ use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
+use jiff::Span;
 use jiff::civil::Date;
-use jiff::{Span, Timestamp};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zam_core::Id;
@@ -353,9 +353,7 @@ pub(crate) fn parse_horizon(raw: Option<&str>) -> Result<Option<Date>, ApiError>
 
 /// `horizon` отсрочки по умолчанию: сегодня (UTC) + `[ideas] defer_days`.
 pub(crate) fn default_horizon(st: &AppState) -> Result<Date, ApiError> {
-    Timestamp::now()
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .date()
+    zam_store::time::utc_today()
         .checked_add(Span::new().days(i64::from(st.cfg.ideas.defer_days)))
         .map_err(|e| ApiError::Internal(format!("horizon по умолчанию: {e}")))
 }

@@ -6,6 +6,11 @@ use rusqlite::Row;
 
 use crate::StoreError;
 
+/// Сегодняшняя дата по UTC: «сегодня» идей (`horizon`) и релизов — одно определение.
+pub fn utc_today() -> jiff::civil::Date {
+    Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC).date()
+}
+
 /// Форматирует момент времени для хранения в TEXT-колонке.
 pub fn fmt_ts(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%S.%6fZ").to_string()

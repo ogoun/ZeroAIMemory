@@ -27,8 +27,8 @@ Every response ends with a `~N tok` line — your spend. Check the cache before 
   - `changelog` — a project change (what and why);
   - `insight` — a finding: `gotcha`, `failure`, `experiment` (with its result), `discovery`, `decision` (see below); `scope=global` when it is not about this project; `triggers` (`file_glob:**/*.sh`, `command_regex:…`, `error_regex:…`) — when to show the hint. After fixing an error, record a `gotcha`/`failure` with `error_regex` — the hook reminds you when it sees an "error → fix" pair;
   - `release` — a release;
-  - `term`, `task`, `question` — glossary, tasks, questions for the human (sections below).
-- **Editing a record** — `memory_update_entry {id, rev, action}` (409 — reread): `supersede`, `retract` (with a reason), `revisit`, `certify`, `append`, `feedback`; for tasks — `status`, `claim`, `release`; for questions — `answer`; for ideas — `propose`, `decide` (section "Ideas"). `rev` is required (except `feedback`, `claim`, `release`, `answer`): without it — 428, after someone else's edit — 409 with the current revision. On 409/428 reread the record and retry.
+  - `term`, `task`, `question`, `idea` — glossary, tasks, questions for the human, ideas (sections below).
+- **Editing a record** — `memory_update_entry {id, rev, action}` (409 — reread): `supersede`, `retract` (with a reason), `revisit`, `certify`, `append`, `feedback`; for tasks — `status`, `claim`, `release`; for questions — `answer`; for ideas — `propose`, `decide` (section "Ideas"). `rev` is required (except `feedback`, `claim`, `release`, `answer`, `propose`, `decide`): without it — 428, after someone else's edit — 409 with the current revision. On 409/428 reread the record and retry.
 - **Links** — `memory_link {src, type, dst}`: `links_to`, `relates_to`, `depends_on`, `part_of`, `caused_by`, `fixes`, `derived_from`, `mentions`, `contradicts`.
 - **Secrets** — only `memory_vault` (`get | set | list`). Values never reach search, summaries or logs; do not copy them into notes.
 - A write response may carry `warnings` (`term_alias`, `decision_near_axiom`, …) — read them and fix the record when needed.

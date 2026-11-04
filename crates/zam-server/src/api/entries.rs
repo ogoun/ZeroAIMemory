@@ -140,10 +140,7 @@ fn check_changelog(data: &Value) -> Result<(), ApiError> {
 
 /// Сегодняшняя дата UTC, `YYYY-MM-DD`.
 fn today_utc() -> String {
-    Timestamp::now()
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .date()
-        .to_string()
+    zam_store::time::utc_today().to_string()
 }
 
 /// `data` релиза: версия, дата (по умолчанию сегодня UTC), `git_tag?`, `commits?`.

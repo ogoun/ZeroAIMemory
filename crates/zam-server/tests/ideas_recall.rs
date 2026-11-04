@@ -367,6 +367,63 @@ async fn never_proposed_kinds_matrix() {
             "{p}: {j}"
         );
     }
+    // положительная сторона: `deferred` с наступившим `horizon` к подсказке приходит
+    let j = prompt(&a, "p-due", "звездолёт созревший").await;
+    assert_eq!(idea_items(&j), [format!("w:{due}")], "{j}");
+}
+
+/// Ревью задачи 3, I1: сбой чтения идей (повреждённый JSON `data` — `json_extract` падает)
+/// не роняет `session_start` и не снимает остальной дайджест — раздела идей просто нет.
+#[tokio::test]
+async fn digest_ideas_store_error_degrades() {
+    let a = server("store-err", |_| {}).await;
+    let r = a
+        .t(
+            Method::POST,
+            &sol(),
+            Some(json!({"kind": "insight", "title": "Пул течёт при панике",
+                        "body": "Соединение не возвращается.", "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let gotcha = r.json()["id"].as_str().unwrap().to_string();
+    idea(&a, &sol(), "Целая идея", json!({})).await;
+    let bad = idea(&a, &sol(), "Битая идея", json!({})).await;
+    sql(&a, "UPDATE entries SET data = '{' WHERE id = ?1", &bad).await;
+    let j = start(&a, "s1").await;
+    assert!(section_lines(&j).is_none(), "{j}");
+    assert!(text(&j).contains(&format!("i:{gotcha}")), "{j}");
+}
+
+/// Ревью задачи 3, M4 (буква §6.1): «первый `session_start`» — в сессии нет ни одной отметки
+/// показа любой идеи. Показанные идеи отложены (из кандидатов ушли) — повторный старт той же
+/// сессии раздела всё равно не даёт, хотя четвёртая идея — кандидат.
+#[tokio::test]
+async fn digest_no_section_after_shown_ideas_deferred() {
+    let a = server("shown-deferred", |_| {}).await;
+    for i in 0..4 {
+        idea(&a, &sol(), &format!("Идея {i}"), json!({})).await;
+    }
+    let j = start(&a, "s1").await;
+    let shown = idea_items(&j);
+    assert_eq!(shown.len(), 3, "{j}");
+    for w in &shown {
+        let id = w.trim_start_matches("w:");
+        let r = post(
+            &a,
+            id,
+            "decide",
+            json!({"decision": "defer", "by": "human", "horizon": tomorrow()}),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    }
+    let j = start(&a, "s1").await;
+    assert!(section_lines(&j).is_none(), "{j}");
+    assert!(idea_items(&j).is_empty(), "{j}");
+    // новая сессия — четвёртая
+    let j = start(&a, "s2").await;
+    assert_eq!(idea_items(&j).len(), 1, "{j}");
 }
 
 /// Review Focus 5: выключенный `ideas.proactive` (пользователя и сервера) — дайджест побайтно
@@ -469,8 +526,41 @@ async fn prompt_skips_idea_seen_in_digest() {
     assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
 }
 
-/// Review Focus 5: набор, порядок и строки insight-подсказок с идеями и без них одинаковы —
-/// идеи ищутся отдельным запросом.
+/// Основной поиск подсказок `prompt` (то же тело, что у `prompt_hints` в `recall.rs`):
+/// `(id, балл)` по порядку.
+async fn main_search(a: &Api, q: &str) -> Vec<(String, f64)> {
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({
+                "query": q,
+                "scope": {"solution": G, "include_knowledge": true, "include_rules": true},
+                "filters": {"kinds": ["insight", "note"]},
+                "mode": "brief",
+                "top_k": 20,
+                "budget_tokens": 4000,
+                "rerank": "off",
+                "skip_seen": false,
+                "no_cache": true,
+                "format": "json",
+            })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            let id = i["entry_id"].as_str().or(i["node_id"].as_str()).unwrap();
+            (id.to_string(), i["score"].as_f64().unwrap())
+        })
+        .collect()
+}
+
+/// Review Focus 5: набор, порядок, строки insight-подсказок и баллы основного поиска `prompt`
+/// с идеями и без них одинаковы — идеи ищутся отдельным запросом.
 #[tokio::test]
 async fn prompt_insight_hints_unchanged_with_ideas() {
     let a = server("prompt-same", |_| {}).await;
@@ -490,6 +580,8 @@ async fn prompt_insight_hints_unchanged_with_ideas() {
     }
     let q = "экспорт отчётов в PDF";
     let base = prompt(&a, "s0", q).await;
+    let base_scores = main_search(&a, q).await;
+    assert!(!base_scores.is_empty());
     for i in 0..5 {
         idea(
             &a,
@@ -518,6 +610,8 @@ async fn prompt_insight_hints_unchanged_with_ideas() {
     };
     assert!(!base["items"].as_array().unwrap().is_empty(), "{base}");
     assert_eq!(strip(&with), strip(&base), "{with}\n{base}");
+    // баллы основного поиска — побайтно те же (идей в нём нет)
+    assert_eq!(main_search(&a, q).await, base_scores);
 }
 
 /// Отдельный поиск идей не уложился в срок — идей нет, основные подсказки есть, без
@@ -665,6 +759,98 @@ async fn prompt_knowledge_idea_needs_link_or_cosine() {
     // сессия без захваченной задачи — нет
     let j = prompt(&a, "s3", p).await;
     assert!(idea_items(&j).is_empty(), "{j}");
+    // ревью задачи 3, M8: ветка `area` — задача `in_progress` сессии s4 с той же областью
+    let kn_idea = |title: &'static str, area: Option<&'static str>| {
+        let a = &a;
+        async move {
+            let mut body = json!({"kind": "idea", "title": title,
+                                  "body": "Something to build later.",
+                                  "data": {"origin": "human"}});
+            if let Some(ar) = area {
+                body["area"] = json!(ar);
+            }
+            let r = a.t(Method::POST, KN, Some(body)).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+            r.json()["id"].as_str().unwrap().to_string()
+        }
+    };
+    let by_area = kn_idea("Telemetry dashboard for nightly benchmarks", Some("bench")).await;
+    let by_edge = kn_idea("Offline mode for the mobile client", None).await;
+    let sol_note = a
+        .t(
+            Method::POST,
+            &sol(),
+            Some(
+                json!({"kind": "insight", "title": "Mobile client caches nothing",
+                        "body": "No offline storage yet.", "data": {"kind": "discovery"}}),
+            ),
+        )
+        .await;
+    assert_eq!(sol_note.status, StatusCode::CREATED, "{}", sol_note.text());
+    let sol_id = sol_note.json()["id"].as_str().unwrap().to_string();
+    // ветка ребра: `relates_to` идея → запись пространства решения
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/edges",
+            Some(json!({"src": format!("e:{by_edge}"), "type": "relates_to",
+                        "dst": format!("e:{sol_id}")})),
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    for id in [&by_area, &by_edge] {
+        let eid: Id = id.parse().unwrap();
+        a.st.index.worker.notify();
+        until(
+            "идея проиндексирована",
+            INDEXED,
+            async || {
+                zam_store::get_entry(&db, eid).await.unwrap().index_state
+                    == zam_store::IndexState::Indexed
+            },
+        )
+        .await;
+    }
+    let r = a
+        .t(
+            Method::POST,
+            &sol(),
+            Some(json!({"kind": "task", "title": "Бенчмарки", "area": "bench"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let t2 = r.json()["id"].as_str().unwrap().to_string();
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{t2}/claim"),
+            Some(json!({})),
+            &[("x-zam-session", "s4")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{t2}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let pa = "telemetry dashboard for nightly benchmarks";
+    // без задачи сессии идея области не проходит (идея с ребром — может: связь действует всегда)
+    let j = prompt(&a, "s5", pa).await;
+    assert!(
+        !idea_items(&j).contains(&format!("w:{by_area}")),
+        "без связи: {j}"
+    );
+    let j = prompt(&a, "s4", pa).await;
+    assert_eq!(idea_items(&j), [format!("w:{by_area}")], "{j}");
+    // ребро действует без задачи сессии
+    let j = prompt(&a, "s6", "offline mode for the mobile client").await;
+    assert_eq!(idea_items(&j), [format!("w:{by_edge}")], "{j}");
     // порог 0 — проходит по косинусу без связи (та же база, другой сервер не нужен)
     drop(a);
     let b = server("kn-cos", |c| {

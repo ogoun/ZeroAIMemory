@@ -18,7 +18,6 @@
 use std::collections::HashSet;
 
 use jiff::civil::Date;
-use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
 use rusqlite::{Connection, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -35,7 +34,7 @@ use crate::questions::{
     AnswerBy, Channel, NormalizedAnswer, QuestionData, QuestionError, answer_tx, in_list,
 };
 use crate::tasks::{TASK_LINK_MAX_CHARS, TASK_LINKS_MAX, TaskData, links_field};
-use crate::time::{fmt_ts, parse_ts, ser_ts};
+use crate::time::{fmt_ts, parse_ts, ser_ts, utc_today};
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
 
@@ -629,11 +628,6 @@ fn entry_ref(id: Id) -> TargetRef {
         kind: TargetKind::Entry,
         id,
     }
-}
-
-/// Сегодняшняя дата по UTC.
-fn utc_today() -> Date {
-    Timestamp::now().to_zoned(TimeZone::UTC).date()
 }
 
 /// Живая идея: нет или удалена — `NotFound`, отчёт — `ReportImmutable`, другой вид — `NotIdea`.
@@ -1273,6 +1267,31 @@ pub fn idea_candidate(e: &Entry, today: Date) -> bool {
             _ => false,
         }
 }
+
+/// Есть ли среди `ids` запись вида `idea` — любого статуса, в том числе в корзине (показ идеи
+/// сессии, §6.1). Пачками по [`ANY_IDEA_CHUNK`] параметров.
+pub async fn any_idea(db: &Db, ids: &[Id]) -> Result<bool, StoreError> {
+    if ids.is_empty() {
+        return Ok(false);
+    }
+    let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    db.read(move |c| {
+        for chunk in ids.chunks(ANY_IDEA_CHUNK) {
+            let mut st = c.prepare(&format!(
+                "SELECT 1 FROM entries WHERE kind = 'idea' AND id IN ({}) LIMIT 1",
+                in_list(chunk.len())
+            ))?;
+            if st.exists(params_from_iter(chunk))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
+}
+
+/// Параметров в одном запросе [`any_idea`].
+const ANY_IDEA_CHUNK: usize = 500;
 
 /// Кандидаты §6 пространств `spaces` ([`idea_candidate`]), кроме записей из `seen`: по
 /// `priority` (`high`, `normal`, `low`), затем `updated_at` новые первыми; не больше `limit`.
