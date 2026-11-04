@@ -73,6 +73,25 @@ pub enum ApiError {
     /// без явного `by` — чей это ответ, решает агент, а не умолчание.
     #[error("укажите by: human — ответ человека, by: agent — решение агента")]
     ByRequired,
+    /// 403 `/problems/idea-human-decision` (M5.7 §5): решение по идее за человека агентом.
+    #[error("решение по идее принимает человек: передайте его слова с by: human")]
+    IdeaHumanDecision,
+    /// 403 `/problems/idea-human-owned` (M5.7 §7.1): токен правит или удаляет идею человека.
+    #[error("идею человека правит человек; дополнение — append")]
+    IdeaHumanOwned,
+    /// 409 `/problems/idea-agent-origin` (M5.7 §5): идея «от агента» не предлагается и не
+    /// начинается, пока человек не примет её как свою.
+    #[error("идея от агента: сначала человек принимает идею как свою")]
+    IdeaAgentOrigin,
+    /// 409 `/problems/already-decided` (M5.7 §5): «начать» уже было; тело несёт `task_id`.
+    #[error("по идее уже решено «начать»: задача создана (task_id)")]
+    AlreadyDecided { task_id: Option<zam_core::Id> },
+    /// 409 `/problems/already-adopted` (M5.7 §5.4): идея уже человека.
+    #[error("идея уже принята как своя")]
+    AlreadyAdopted,
+    /// 422 `/problems/option-required` (M5.7 §5.3): ответ на вопрос-предложение без варианта.
+    #[error("{0}")]
+    OptionRequired(String),
     #[error("{0}")]
     PayloadTooLarge(String),
     /// 428 `/problems/precondition-required` (§11.3): правка без `If-Match`; в `detail` —
@@ -186,6 +205,36 @@ impl ApiError {
                 "/problems/by-required",
                 "Bad Request",
             ),
+            ApiError::IdeaHumanDecision => (
+                StatusCode::FORBIDDEN,
+                "/problems/idea-human-decision",
+                "Forbidden",
+            ),
+            ApiError::IdeaHumanOwned => (
+                StatusCode::FORBIDDEN,
+                "/problems/idea-human-owned",
+                "Forbidden",
+            ),
+            ApiError::IdeaAgentOrigin => (
+                StatusCode::CONFLICT,
+                "/problems/idea-agent-origin",
+                "Conflict",
+            ),
+            ApiError::AlreadyDecided { .. } => (
+                StatusCode::CONFLICT,
+                "/problems/already-decided",
+                "Conflict",
+            ),
+            ApiError::AlreadyAdopted => (
+                StatusCode::CONFLICT,
+                "/problems/already-adopted",
+                "Conflict",
+            ),
+            ApiError::OptionRequired(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "/problems/option-required",
+                "Unprocessable Content",
+            ),
             ApiError::PayloadTooLarge(_) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "/problems/too-large",
@@ -295,6 +344,8 @@ impl From<StoreError> for ApiError {
                     extra,
                 }
             }
+            // клиентская связь `derived_from` на идею — 422 в `POST /edges` и `links` (M5.7 §4)
+            e @ StoreError::IdeaLinkDenied => ApiError::Unprocessable(e.to_string()),
             StoreError::BadInput(m) => ApiError::BadRequest(m),
             StoreError::TermConflict(c) => ApiError::TermConflict(c),
             StoreError::IdempotencyMismatch(m) => ApiError::IdempotencyMismatch(m),
@@ -332,6 +383,9 @@ impl IntoResponse for ApiError {
         }
         if let (ApiError::AlreadyAnswered { decision_id }, Value::Object(o)) = (&self, &mut body) {
             o.insert("decision_id".into(), json!(decision_id));
+        }
+        if let (ApiError::AlreadyDecided { task_id }, Value::Object(o)) = (&self, &mut body) {
+            o.insert("task_id".into(), json!(task_id));
         }
         if let (ApiError::TaskClaimed(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("claimed_by".into(), json!(c));

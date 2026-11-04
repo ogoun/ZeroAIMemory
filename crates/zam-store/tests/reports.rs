@@ -160,6 +160,8 @@ fn filter(space: Id) -> EntryFilter {
         limit: 50,
         with_reports: false,
         deleted_only: false,
+        origin: None,
+        priority: None,
     }
 }
 
@@ -760,6 +762,7 @@ async fn update_supersede_retract_report_immutable() {
         option: None,
         by: AnswerBy::Human,
         channel: Channel::Webui,
+        horizon: None,
     };
     let r = answer_question(&db, e.id, ans, &human()).await;
     assert!(
@@ -1232,10 +1235,10 @@ fn ref_letter_p_roundtrip() {
     assert_eq!(EntryKind::from_ref_letter("p"), Some(EntryKind::Report));
     assert_eq!(
         zam_store::ENTRY_REF_LETTERS,
-        ["i", "c", "r", "t", "k", "q", "p", "e"]
+        ["i", "c", "r", "t", "k", "q", "p", "w", "e"]
     );
     assert!(zam_store::is_entry_ref_letter("p"));
-    assert_eq!(EntryKind::ALL.len(), 7);
+    assert_eq!(EntryKind::ALL.len(), 8);
     let mut letters: Vec<&str> = EntryKind::ALL.iter().map(|k| k.ref_letter()).collect();
     for l in &letters {
         assert!(zam_store::ENTRY_REF_LETTERS.contains(l), "{l}");

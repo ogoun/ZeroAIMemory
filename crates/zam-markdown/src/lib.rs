@@ -20,6 +20,7 @@ mod sanitize;
 mod secrets;
 mod sentences;
 
+pub use boundary::is_stop_word;
 pub use chunk::{
     ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, TokenCounter, chunk_note, split_plain,
 };

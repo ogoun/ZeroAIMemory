@@ -13,6 +13,7 @@ pub mod files;
 pub mod glossary;
 pub mod graph;
 pub mod health;
+pub mod ideas;
 pub mod index;
 pub mod insights;
 pub mod nodes;
@@ -153,6 +154,9 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/entries/{id}/restore", post(entries::restore))
         .route("/api/v1/entries/{id}/answer", post(questions::answer))
         .route("/api/v1/entries/{id}/claim", post(tasks::claim))
+        .route("/api/v1/entries/{id}/propose", post(ideas::propose))
+        .route("/api/v1/entries/{id}/decide", post(ideas::decide))
+        .route("/api/v1/entries/{id}/adopt", post(ideas::adopt))
         .route("/api/v1/entries/{id}/release", post(tasks::release))
         .route(
             "/api/v1/entries/{id}/supersede",

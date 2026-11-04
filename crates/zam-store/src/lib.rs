@@ -7,7 +7,7 @@
 //! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5), вложения как
 //! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5), отчёты (вид записи
 //! `report`, файлы `entry_attachments`; M5.5), карта кода решения (`code_*`, ссылки на символы;
-//! M5.6).
+//! M5.6), журнал идей (вид записи `idea`; M5.7).
 
 pub mod access;
 pub mod attachments;
@@ -22,6 +22,7 @@ pub mod entries;
 pub mod file_refs;
 pub mod glossary;
 pub mod graph;
+pub mod ideas;
 pub mod jobs;
 pub mod links;
 pub mod migrate;
@@ -98,7 +99,14 @@ pub use glossary::{
 };
 pub use graph::{
     EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,
-    GraphNode, GraphStore, NewEdge, get_edge, graph_node, graph_nodes,
+    GraphNode, GraphStore, IDEA_DERIVED_FROM_DENIED, NewEdge, get_edge, graph_node, graph_nodes,
+};
+pub use ideas::{
+    Decided, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS, IDEA_LINKS_MAX, IDEA_OPTIONS,
+    IDEA_ORIGIN_REQUIRED, IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin,
+    IdeaPriority, NewDecision, PROPOSE_TEXT_MAX_CHARS, ProposalKind, TaskState, adopt_idea,
+    any_idea, any_new_idea, check_idea, check_idea_shape, check_idea_transition, decide_idea,
+    idea_candidate, idea_task_state, proactive_ideas, propose_idea, released_ideas, task_released,
 };
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
@@ -119,7 +127,7 @@ pub use nodes::{
 };
 pub use paths::{NodePath, path_ancestors};
 pub use questions::{
-    ANSWER_TEXT_MAX_CHARS, Answer, AnswerBy, Channel, NewAnswer, OPTION_KEY_MAX_CHARS,
+    ANSWER_TEXT_MAX_CHARS, Answer, AnswerBy, Answered, Channel, NewAnswer, OPTION_KEY_MAX_CHARS,
     OPTION_TEXT_MAX_CHARS, OPTIONS_MAX, QOption, QUESTION_DUPLICATES_MAX, QuestionCandidate,
     QuestionData, QuestionError, answer_question, check_question, check_question_transition,
     days_ago, open_questions, question_duplicates, recent_answered,
@@ -134,7 +142,8 @@ pub use sessions::{
     RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,
     TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
     add_tokens, check_session_id, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, mark_seen_with_tokens, seen_revs, session_tokens, touch_session,
+    list_sessions, mark_seen, mark_seen_with_tokens, seen_entry_ids, seen_revs, session_tokens,
+    touch_session,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
@@ -189,6 +198,10 @@ pub enum StoreError {
     /// захват и ответ над ним запрещены (сервер — 409 `/problems/report-immutable`).
     #[error("отчёт неизменяем — напишите новый")]
     ReportImmutable,
+    /// Клиентская связь `derived_from` с целью-идеей (M5.7 §4): её ставит только «начать»
+    /// (сервер — 422).
+    #[error("{}", graph::IDEA_DERIVED_FROM_DENIED)]
+    IdeaLinkDenied,
     /// Нарушение матрицы прав `certainty` ([`certainty::check_certainty`]).
     #[error(transparent)]
     Certainty(#[from] CertaintyError),

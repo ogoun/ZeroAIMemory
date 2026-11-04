@@ -5,7 +5,8 @@
   // установки и `zam init` (в блоке и `.mcp.json` — `${ZAM_TOKEN}`) и только в браузере —
   // вместо заглушки сервера `'<токен>'`, серверу в адресе он не уходит. Страница открывается
   // сразу после создания пользователя или выпуска токена (lib/agentSetup.ts). Здесь же —
-  // типы подсказок хуков пользователя на сервере (`hooks.<тип>`, §10.3, R5).
+  // типы подсказок хуков пользователя на сервере (`hooks.<тип>`, §10.3, R5) и проактивность идей
+  // (`ideas.proactive`, M5.7 §8: раздел дайджеста «Идеи» и подсказки идей).
   import { onMount } from 'svelte';
   import TokenShown from '../components/TokenShown.svelte';
   import {
@@ -20,6 +21,7 @@
     issueToken,
     listSolutions,
     setUserHooks,
+    setUserIdeas,
     type Access,
     type AgentKind,
     type AgentSetup,
@@ -84,6 +86,8 @@
   let tokenAccess = $state<Access>('rw');
   let tokError = $state('');
   let flags = $state<HookFlags | null>(null);
+  /** `ideas.proactive` пользователя (`null` — ещё не прочитано). */
+  let ideasOn = $state<boolean | null>(null);
   let flagsError = $state('');
   let copied = $state('');
   let copyHint = $state('');
@@ -152,8 +156,11 @@
   async function loadFlags() {
     flagsError = '';
     flags = null;
+    ideasOn = null;
     try {
-      flags = (await getUserSettings(admin ? userId : null)).hooks;
+      const s = await getUserSettings(admin ? userId : null);
+      flags = s.hooks;
+      ideasOn = s.ideas?.proactive ?? true;
     } catch (e) {
       flagsError = fail(e);
     }
@@ -179,6 +186,16 @@
     flagsError = '';
     try {
       flags = (await setUserHooks(admin ? userId : null, { [k]: on })).hooks;
+    } catch (e) {
+      flagsError = fail(e);
+      await loadFlags();
+    }
+  }
+
+  async function setIdeas(on: boolean) {
+    flagsError = '';
+    try {
+      ideasOn = (await setUserIdeas(admin ? userId : null, on)).ideas.proactive;
     } catch (e) {
       flagsError = fail(e);
       await loadFlags();
@@ -393,6 +410,12 @@
           {HOOK_TITLE[k]} <code class="muted small">hooks.{k}</code>
         </label>
       {/each}
+      {#if ideasOn !== null}
+        <label class="opt">
+          <input type="checkbox" checked={ideasOn} onchange={(e) => setIdeas(e.currentTarget.checked)} />
+          Идеи: предлагать (дайджест и подсказки) <code class="muted small">ideas.proactive</code>
+        </label>
+      {/if}
     </div>
   {:else if !flagsError}
     <p class="muted">Загрузка…</p>

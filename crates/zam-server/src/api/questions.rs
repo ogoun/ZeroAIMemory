@@ -18,7 +18,12 @@
 //!   `answered` — 409 `/problems/possible-duplicate` с `candidates` (`status`, у `answered` —
 //!   `answer`), `force: true` записывает всё равно ([`question_duplicate`]);
 //! - правка вопроса — `PATCH /entries/{id}`: `data` (`options`, `recommendation`) пока вопрос
-//!   `open`; `status: obsolete` — с `reason` (иначе 422 `reason-required`).
+//!   `open`; `status: obsolete` — с `reason` (иначе 422 `reason-required`);
+//! - вопрос-предложение идеи (`data.idea`, M5.7 §5.3): нужен `option` `accept|defer|decline`,
+//!   у вопроса «вернуть» (`data.proposal: reopen`, §16) — `reopen|decline` (нет варианта —
+//!   422 `/problems/option-required`, чужой — 422), `horizon` — только у `defer` (нет —
+//!   сегодня + `[ideas] defer_days`); `by: agent` — 403 `/problems/idea-human-decision` до
+//!   чтения идеи. Ответ переводит идею той же транзакцией и возвращает ещё `idea` и `task?`.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -27,8 +32,8 @@ use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zam_store::{
-    AnswerBy, Channel, EntryKind, EntryStatus, NewAnswer, QuestionCandidate, QuestionError,
-    answer_question, question_duplicates,
+    AnswerBy, Channel, EntryKind, EntryStatus, NewAnswer, QuestionCandidate, QuestionData,
+    QuestionError, answer_question, question_duplicates,
 };
 
 use super::entries::{audit_details, check_size, unprocessable};
@@ -50,9 +55,13 @@ impl From<QuestionError> for ApiError {
                 detail: e.to_string(),
                 extra: Map::new(),
             },
-            QuestionError::UnknownOption(_) | QuestionError::Empty | QuestionError::NotQuestion => {
-                unprocessable(e.to_string())
-            }
+            QuestionError::UnknownOption(_)
+            | QuestionError::Empty
+            | QuestionError::NotQuestion
+            | QuestionError::HorizonNotAllowed => unprocessable(e.to_string()),
+            e @ QuestionError::OptionRequired(_) => ApiError::OptionRequired(e.to_string()),
+            QuestionError::ByAgentOnProposal => ApiError::IdeaHumanDecision,
+            QuestionError::Idea(e) => e.into(),
             QuestionError::Store(e) => e.into(),
         }
     }
@@ -65,6 +74,8 @@ pub struct AnswerReq {
     option: Option<String>,
     channel: Option<Channel>,
     by: Option<AnswerBy>,
+    /// Только вопрос-предложение идеи с `option: defer` (M5.7 §5.3): «отложить до».
+    horizon: Option<String>,
     message: Option<String>,
 }
 
@@ -89,32 +100,33 @@ pub async fn answer(
     if let Some(t) = &req.text {
         check_size(&st, t)?;
     }
-    let session = matches!(p, Principal::User { .. } | Principal::Admin { .. });
-    let channel = req.channel.unwrap_or(if session {
-        Channel::Webui
-    } else {
-        Channel::Chat
-    });
-    if !session && channel == Channel::Webui {
-        return Err(unprocessable(
-            "channel: webui — ответ из WebUI; агент отвечает с channel chat или cli",
-        ));
+    // токену умолчания `by` нет: чей ответ — знает только агент (финальное ревью M4.5, I-2)
+    let (by, channel) = super::ideas::by_channel(&p, req.by, req.channel)?;
+    // вопрос-предложение идеи (M5.7 §5.3): агент не отвечает за человека — проверка по вопросу,
+    // до чтения идеи (ответ не раскрывает её состояние)
+    let proposal = QuestionData::from_stored(&sc.entry.data).idea.is_some();
+    if proposal && by == AnswerBy::Agent {
+        return Err(ApiError::IdeaHumanDecision);
     }
-    // токену умолчания нет: чей ответ — знает только агент (финальное ревью M4.5, I-2)
-    let by = match req.by {
-        Some(b) => b,
-        None if session => AnswerBy::Human,
-        None => return Err(ApiError::ByRequired),
-    };
+    let mut horizon = super::ideas::parse_horizon(req.horizon.as_deref())?;
+    if proposal && horizon.is_none() && req.option.as_deref().map(str::trim) == Some("defer") {
+        horizon = Some(super::ideas::default_horizon(&st)?);
+    }
     let attrib = attribution(&p, &headers, req.message)?;
-    let (q, d) = answer_question(
+    let zam_store::Answered {
+        question: q,
+        decision: d,
+        idea,
+        task,
+    } = answer_question(
         &sc.db,
         sc.entry.id,
         NewAnswer {
             text: req.text,
-            option: req.option,
+            option: req.option.clone(),
             by,
             channel,
+            horizon,
         },
         &attrib,
     )
@@ -124,6 +136,12 @@ pub async fn answer(
     details["by"] = json!(by.as_str());
     details["channel"] = json!(channel.as_str());
     details["decision"] = json!(d.id);
+    if let Some(i) = &idea {
+        details["idea"] = json!(i.id);
+    }
+    if let Some(t) = &task {
+        details["task"] = json!(t.id);
+    }
     audit_node(
         &st,
         &p,
@@ -135,15 +153,49 @@ pub async fn answer(
         details,
     )
     .await?;
+    // решение по идее через вопрос-предложение — тот же аудит, что у прямого `decide`
+    // (финальное ревью M5.7, Minor 4)
+    if let Some(i) = &idea {
+        let mut extra = audit_details(i.space_id, EntryKind::Idea);
+        extra["decision"] = json!(req.option.as_deref().map(str::trim));
+        extra["by"] = json!(by.as_str());
+        extra["channel"] = json!(channel.as_str());
+        extra["question"] = json!(q.id);
+        if let Some(t) = &task {
+            extra["task"] = json!(t.id);
+        }
+        audit_node(
+            &st,
+            &p,
+            &client,
+            sc.user.id,
+            sc.owner,
+            "entry.idea.decide",
+            i.id,
+            extra,
+        )
+        .await?;
+    }
     let mut decision = json!(d);
     super::secrets::attach_entry(&mut decision, &d);
     let mut entry = json!(q);
     super::secrets::attach_entry(&mut entry, &q);
-    Ok(Json(json!({
+    let mut out = json!({
         "entry": entry,
         "decision": decision,
         "decision_id": d.id,
-    })))
+    });
+    if let Some(i) = &idea {
+        let mut v = json!(i);
+        super::secrets::attach_entry(&mut v, i);
+        out["idea"] = v;
+    }
+    if let Some(t) = &task {
+        let mut v = json!(t);
+        super::secrets::attach_entry(&mut v, t);
+        out["task"] = v;
+    }
+    Ok(Json(out))
 }
 
 /// 409 `possible-duplicate` нового вопроса: совпал нормализованный заголовок `open` или

@@ -37,7 +37,8 @@ pub(crate) fn entry_index_state(space: SpaceKind, kind: EntryKind) -> IndexState
         | EntryKind::Insight
         | EntryKind::Term
         | EntryKind::Task
-        | EntryKind::Question => space != SpaceKind::Human,
+        | EntryKind::Question
+        | EntryKind::Idea => space != SpaceKind::Human,
         EntryKind::Report => false,
     };
     if vectors {

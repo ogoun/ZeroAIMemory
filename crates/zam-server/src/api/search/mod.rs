@@ -32,6 +32,9 @@
 //!   Отчёты (M5.5 §7) — только сессиям WebUI: вид `report` у них допустим и входит в умолчания
 //!   (карточка `{kind: "report", id: "p:<id>", space, title, snippet, created_at}`); токену вида
 //!   нет (400 тем же текстом, что у неизвестного), его умолчания и `scope_hash` прежние.
+//!   Идеи (M5.7 §4) — вид `idea`: у токена только явным `kinds`, у сессии WebUI — и по
+//!   умолчанию; статусы по умолчанию `new, proposed, deferred, accepted`. Вид и статусы идей в
+//!   ключ кэша выжимок не входят ([`scope_key`]).
 //!   `filters.certainty` — эпистемические статусы (`axiom`, `theorem`, `hypothesis`, §7.5)
 //!   заметок и записей; пусто — любые, иначе цели без статуса не проходят (Qdrant, FTS и
 //!   проверка хитов). Бусты `search.boost_axiom`/`boost_theorem`/`boost_hypothesis`
@@ -316,8 +319,8 @@ pub(crate) struct Filters {
 const NO_INSIGHT_KIND: &str = "-";
 
 /// Допустимые виды целей `filters.kinds` (с M4.5 — `term`, `task`, `question`, спецификация
-/// M4.5 §1.3).
-const KINDS: [&str; 9] = [
+/// M4.5 §1.3; с M5.7 — `idea`, только явным `kinds`, как `task`).
+const KINDS: [&str; 10] = [
     "note",
     "insight",
     "changelog",
@@ -327,6 +330,7 @@ const KINDS: [&str; 9] = [
     "question",
     "folder",
     "attachment",
+    IDEA,
 ];
 /// Виды по умолчанию (§9.1; с M4.5 — `term` и `question`, спецификация M4.5 §1.3; с M5 —
 /// `attachment`). Умолчания входят в `scope_hash` кэша выжимок: выжимки поиска с прежними
@@ -344,8 +348,12 @@ const DEFAULT_KINDS: [&str; 7] = [
 /// умолчанию; токену (агенту) такого вида нет: `report` → 400 тем же текстом, что у
 /// неизвестного вида, умолчания и `scope_hash` токена прежние.
 const REPORT: &str = "report";
+/// Идея (M5.7 §4): у токена — только явным `kinds` (умолчания и `scope_hash` токена прежние), у
+/// сессии WebUI — и по умолчанию (Ctrl+K находит идеи). В ключ кэша выжимок не входит, как
+/// [`REPORT`] ([`scope_key`]).
+const IDEA: &str = "idea";
 /// [`KINDS`] сессий WebUI.
-const HUMAN_KINDS: [&str; 10] = [
+const HUMAN_KINDS: [&str; 11] = [
     "note",
     "insight",
     "changelog",
@@ -356,9 +364,10 @@ const HUMAN_KINDS: [&str; 10] = [
     "folder",
     "attachment",
     REPORT,
+    IDEA,
 ];
 /// [`DEFAULT_KINDS`] сессий WebUI.
-const HUMAN_DEFAULT_KINDS: [&str; 8] = [
+const HUMAN_DEFAULT_KINDS: [&str; 9] = [
     "note",
     "insight",
     "changelog",
@@ -367,10 +376,12 @@ const HUMAN_DEFAULT_KINDS: [&str; 8] = [
     "question",
     "attachment",
     REPORT,
+    IDEA,
 ];
 /// Статусы записей `filters.status`: insight и term, с M4.5 — task и question (спецификация
-/// M4.5 §1.3). Умолчания по виду — [`default_statuses`].
-const STATUSES: [&str; 11] = [
+/// M4.5 §1.3), с M5.7 — идеи ([`IDEA_STATUSES`]; `done` — общий с task). Умолчания по виду —
+/// [`default_statuses`].
+const STATUSES: [&str; 16] = [
     "active",
     "revisit",
     "superseded",
@@ -382,7 +393,16 @@ const STATUSES: [&str; 11] = [
     "dropped",
     "answered",
     "obsolete",
+    "new",
+    "proposed",
+    "accepted",
+    "deferred",
+    "declined",
 ];
+/// Статусы, которые бывают только у идей: в ключ кэша выжимок не входят ([`scope_key`]).
+const IDEA_STATUSES: [&str; 5] = ["new", "proposed", "accepted", "deferred", "declined"];
+/// Статусы идей по умолчанию (M5.7 §4): живые замыслы и начатые, без `declined` и `done`.
+const IDEA_DEFAULT_STATUSES: [&str; 4] = ["new", "proposed", "deferred", "accepted"];
 /// Статусы по умолчанию (§7.5): действующие.
 const DEFAULT_STATUSES: [&str; 2] = ["active", "revisit"];
 
@@ -391,7 +411,8 @@ const DEFAULT_STATUSES: [&str; 2] = ["active", "revisit"];
 /// - `insight` и `term` — действующие (`active`, `revisit`);
 /// - `question`: в умолчании видов — только `answered`, при явном `kinds` — ещё `open`;
 /// - `task` (только явным `kinds`): `open`, `in_progress`, `blocked` — выполненные и
-///   отброшенные только явным `filters.status`.
+///   отброшенные только явным `filters.status`;
+/// - `idea` (токену — только явным `kinds`): [`IDEA_DEFAULT_STATUSES`].
 ///
 /// Значения `answered` и `open` в других видах не встречаются, поэтому слияние безопасно.
 fn default_statuses(kinds: &[String], explicit: bool) -> Vec<&'static str> {
@@ -409,6 +430,9 @@ fn default_statuses(kinds: &[String], explicit: bool) -> Vec<&'static str> {
                 v.push(s);
             }
         }
+    }
+    if has(IDEA) {
+        v.extend(IDEA_DEFAULT_STATUSES);
     }
     v
 }
@@ -542,6 +566,7 @@ fn target_filter(
     )?;
     insight_kinds.sort();
     insight_kinds.dedup();
+    let with_idea = kinds.iter().any(|k| k == IDEA);
     Ok(TargetFilter {
         kinds,
         // include_history снимает фильтр статусов; без явного `kinds` открытые вопросы и задачи
@@ -549,9 +574,12 @@ fn target_filter(
         statuses: match (include_history, explicit) {
             (false, _) => statuses,
             (true, true) => Vec::new(),
+            // статусы идей — только если идеи среди видов (у токена без явного idea их нет):
+            // список истории и ключ кэша выжимок токена прежние
             (true, false) => STATUSES
                 .iter()
                 .filter(|s| **s != "open")
+                .filter(|s| with_idea || !IDEA_STATUSES.contains(s))
                 .map(|s| s.to_string())
                 .collect(),
         },
@@ -571,6 +599,7 @@ fn target_filter(
             })
             .transpose()?,
         insight_kinds,
+        entry_ids: Vec::new(),
     })
 }
 
@@ -600,17 +629,32 @@ pub(crate) fn cache_scope_hash(
 
 /// Ключ области ([`cache_scope_hash`]). Вид `report` в ключ не входит: отчёт источником выжимки
 /// не бывает (M5.5 §7), и поиск WebUI с умолчаниями (там есть `report`) находит выжимки той же
-/// области агента.
+/// области агента. Так же исключены вид `idea` и статусы идей (M5.7 §4, I9): иначе новое
+/// умолчание WebUI изменило бы ключ, и поиск WebUI перестал бы находить прежние выжимки.
 fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -> String {
     let sorted = |v: &[String]| {
         let mut v = v.to_vec();
         v.sort();
         v
     };
-    let kinds: Vec<String> = t.kinds.iter().filter(|k| *k != REPORT).cloned().collect();
+    let kinds: Vec<String> = t
+        .kinds
+        .iter()
+        .filter(|k| *k != REPORT && *k != IDEA)
+        .cloned()
+        .collect();
+    // статусы идей не входят в ключ, только когда в видах есть idea (умолчания WebUI или явный
+    // вид): без idea они — обычный фильтр других видов и меняют выдачу
+    let with_idea = t.kinds.iter().any(|k| k == IDEA);
+    let statuses: Vec<String> = t
+        .statuses
+        .iter()
+        .filter(|s| !(with_idea && IDEA_STATUSES.contains(&s.as_str())))
+        .cloned()
+        .collect();
     let mut filters = json!({
         "kinds": sorted(&kinds),
-        "status": sorted(&t.statuses),
+        "status": sorted(&statuses),
         "certainty": sorted(&t.certainty),
     });
     // ключ только при заданном фильтре: хэши прежних кэшей не меняются
@@ -3441,7 +3485,12 @@ mod tests {
         let f = target_filter(&Filters::default(), true, false).unwrap();
         assert!(!f.statuses.contains(&"open".to_string()));
         assert!(f.statuses.contains(&"superseded".to_string()));
-        assert_eq!(excluded_statuses(&f), ["open"]);
+        // статусы идей — только при идеях среди видов (M5.7): у токена их нет, у WebUI — есть
+        let mut want = vec!["open"];
+        want.extend(IDEA_STATUSES);
+        assert_eq!(excluded_statuses(&f), want);
+        let web = target_filter(&Filters::default(), true, true).unwrap();
+        assert_eq!(excluded_statuses(&web), ["open"]);
         let f = target_filter(
             &Filters {
                 kinds: Some(vec!["question".into()]),
@@ -3584,5 +3633,101 @@ mod tests {
         });
         assert_ne!(base, a);
         assert_eq!(a, b, "порядок и повторы не меняют ключ");
+    }
+
+    /// Ключ кэша выжимок M5.6 запроса по умолчанию (без решения) и с `include_history`.
+    const M56_DEFAULT_KEY: &str =
+        "c31dfa31c9c09b6586b0cdda868871345d33c71cd0d52cc8014eab4257b9158f";
+    const M56_HISTORY_KEY: &str =
+        "1ce9365890aceb9666a59596f7216cb168b0d9d20986ec89a529db2f4dd8c469";
+
+    /// M5.7 (I9): вид `idea` и статусы идей не входят в ключ кэша выжимок — ключи M5.6
+    /// (фикстура) сохраняются у токена и у WebUI, с историей и без.
+    #[test]
+    fn scope_key_ignores_idea() {
+        let sc = ScopeReq::default();
+        let key = |f: &Filters, history: bool, human: bool| {
+            cache_scope_hash(&sc, f, history, None, human).unwrap()
+        };
+        let d = Filters::default();
+        let fixture = |status: &[&str]| {
+            zam_store::scope_hash(&json!({
+                "solution": null,
+                "include_knowledge": true,
+                "include_rules": true,
+                "path_prefix": null,
+                "area": null,
+                "filters": {
+                    "kinds": ["attachment", "changelog", "insight", "note", "question", "release",
+                              "term"],
+                    "status": status,
+                    "certainty": [],
+                },
+            }))
+        };
+        let current = fixture(&["active", "answered", "revisit"]);
+        let history = fixture(&[
+            "active",
+            "answered",
+            "blocked",
+            "done",
+            "dropped",
+            "in_progress",
+            "obsolete",
+            "retracted",
+            "revisit",
+            "superseded",
+        ]);
+        // замороженные ключи M5.6 (`M56_*_KEY`): hex — `zam_store::scope_hash` структур
+        // `current` и `history`, посчитан 2026-11-04 на коде после 4361d39 для запроса по
+        // умолчанию; структуры сверены вручную со `scope_key` на 1ceeec0 (DEFAULT_KINDS — 7
+        // видов, DEFAULT_STATUSES + answered; история — STATUSES без open), `scope_hash`
+        // (`zam-store/src/cache`) с 1ceeec0 не менялся
+        assert_eq!(current, M56_DEFAULT_KEY);
+        assert_eq!(history, M56_HISTORY_KEY);
+        for human in [false, true] {
+            assert_eq!(key(&d, false, human), current, "human = {human}");
+            assert_eq!(key(&d, true, human), history, "human = {human}");
+        }
+        let kinds = |k: &[&str]| Filters {
+            kinds: Some(k.iter().map(|s| s.to_string()).collect()),
+            ..Filters::default()
+        };
+        assert_eq!(
+            key(&kinds(&["note", "idea"]), false, false),
+            key(&kinds(&["note"]), false, false)
+        );
+        // без idea в kinds статусы идей — обычный фильтр и входят в ключ
+        let with_status = |k: &[&str], s: &[&str]| Filters {
+            kinds: Some(k.iter().map(|x| x.to_string()).collect()),
+            status: Some(s.iter().map(|x| x.to_string()).collect()),
+            ..Filters::default()
+        };
+        assert_ne!(
+            key(&with_status(&["insight"], &["active", "new"]), false, false),
+            key(&with_status(&["insight"], &["active"]), false, false)
+        );
+        assert_ne!(
+            key(&with_status(&["insight"], &["new"]), false, false),
+            key(&kinds(&["insight"]), false, false)
+        );
+        // у WebUI idea в умолчаниях, у токена — только явно
+        assert!(
+            target_filter(&d, false, true)
+                .unwrap()
+                .kinds
+                .contains(&IDEA.to_string())
+        );
+        assert!(
+            !target_filter(&d, false, false)
+                .unwrap()
+                .kinds
+                .contains(&IDEA.to_string())
+        );
+        let t = target_filter(&kinds(&["idea"]), false, false).unwrap();
+        for s in IDEA_DEFAULT_STATUSES {
+            assert!(t.statuses.contains(&s.to_string()), "{s}");
+        }
+        assert!(!t.statuses.contains(&"declined".to_string()));
     }
 }

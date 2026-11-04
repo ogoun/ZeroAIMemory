@@ -251,6 +251,16 @@ async fn answer_token_requires_by() {
     assert_eq!(r.json()["decision"]["certainty"], "axiom");
 }
 
+/// Сессия WebUI — всегда человек (ревью задачи 2 M5.7): явный `by: agent` — 422.
+#[tokio::test]
+async fn answer_webui_by_agent_422() {
+    let a = api("questions-webui-agent", |_| {}).await;
+    let qid = new_q(&a, "Кто отвечает?", options()).await;
+    let r = answer_webui(&a, &qid, json!({"option": "a", "by": "agent"})).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert_eq!(get(&a, &qid).await["status"], "open");
+}
+
 #[tokio::test]
 async fn answer_by_agent_hypothesis() {
     let a = api("questions-agent", |_| {}).await;

@@ -375,6 +375,8 @@
       <path d="M3.5 2.5h8a1 1 0 0 1 1 1v9.5h-8a1 1 0 0 1-1-1z M5.5 5.5h4 M5.5 8h4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" />
     {:else if kind === 'j-tasks'}
       <path d="M2.5 4l1.4 1.4L6 3.3 M2.5 9l1.4 1.4L6 8.3 M8 4.5h5.5 M8 9.5h5.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+    {:else if kind === 'j-ideas'}
+      <path d="M8 2.2l1.6 3.4 3.7.5-2.7 2.6.7 3.7L8 10.6l-3.3 1.8.7-3.7-2.7-2.6 3.7-.5z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
     {:else if kind === 'j-questions'}
       <path d="M5.8 5.6a2.3 2.3 0 1 1 3.2 2.1c-.7.3-1 .8-1 1.5 M8 12.2v.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
     {:else if kind === 'j-vault'}

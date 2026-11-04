@@ -46,3 +46,5 @@ test-hooks = []
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rusqlite.workspace = true
+# свойства разбора `data` идеи (M5.7, `idea_patch_never_panics`)
+proptest.workspace = true

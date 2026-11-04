@@ -48,6 +48,7 @@ pub struct ServerConfig {
     pub docs: DocsSection,
     pub reports: ReportsSection,
     pub code: CodeSection,
+    pub ideas: IdeasSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1034,6 +1035,59 @@ impl CodeSection {
     }
 }
 
+/// Секция `[ideas]` (M5.7 §8): журнал «Идеи» — проактивность (раздел дайджеста `### Идеи`,
+/// подсказки `prompt`) и срок отсрочки по умолчанию.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeasSection {
+    /// Глобальный выключатель проактивности (`false` — ни раздела, ни подсказок у всех);
+    /// действует вместе с пользовательским `ideas.proactive` (`server && user`).
+    pub proactive: bool,
+    /// Идей в разделе `### Идеи` дайджеста (0..=10, 3; 0 — раздела нет).
+    pub digest_max: u32,
+    /// Идей в подсказке `prompt` (0..=3, 1).
+    pub prompt_max: u32,
+    /// `top_k` отдельного поиска идей к `prompt` (1..=20, 5).
+    pub prompt_top_k: u32,
+    /// `horizon` по умолчанию у `defer`, дней (1..=3650, 30).
+    pub defer_days: u32,
+}
+
+impl Default for IdeasSection {
+    fn default() -> Self {
+        Self {
+            proactive: true,
+            digest_max: 3,
+            prompt_max: 1,
+            prompt_top_k: 5,
+            defer_days: zam_store::IDEA_DEFER_DAYS_DEFAULT,
+        }
+    }
+}
+
+impl IdeasSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("ideas.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if self.digest_max > 10 {
+            return Err(bad("digest_max", "от 0 до 10"));
+        }
+        if self.prompt_max > 3 {
+            return Err(bad("prompt_max", "от 0 до 3"));
+        }
+        if !(1..=20).contains(&self.prompt_top_k) {
+            return Err(bad("prompt_top_k", "от 1 до 20"));
+        }
+        if !(1..=3650).contains(&self.defer_days) {
+            return Err(bad("defer_days", "от 1 до 3650"));
+        }
+        Ok(())
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -1150,6 +1204,7 @@ impl Default for ServerConfig {
             docs: DocsSection::default(),
             reports: ReportsSection::default(),
             code: CodeSection::default(),
+            ideas: IdeasSection::default(),
         }
     }
 }
@@ -1324,6 +1379,7 @@ pub fn load(
     cfg.docs.validate()?;
     cfg.reports.validate()?;
     cfg.code.validate()?;
+    cfg.ideas.validate()?;
     Ok(cfg)
 }
 
@@ -2213,6 +2269,55 @@ master_key = \"x\"
             &Default::default(),
         );
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn ideas_section_defaults_and_bounds() {
+        let c = load(None, &[], &Default::default()).unwrap().ideas;
+        assert_eq!(c, IdeasSection::default());
+        assert!(c.proactive);
+        assert_eq!(
+            (c.digest_max, c.prompt_max, c.prompt_top_k, c.defer_days),
+            (3, 1, 5, 30)
+        );
+        assert_eq!(c.defer_days, zam_store::IDEA_DEFER_DAYS_DEFAULT);
+        for (k, v) in [
+            ("ZAM_IDEAS__DIGEST_MAX", "11"),
+            ("ZAM_IDEAS__PROMPT_MAX", "4"),
+            ("ZAM_IDEAS__PROMPT_TOP_K", "0"),
+            ("ZAM_IDEAS__PROMPT_TOP_K", "21"),
+            ("ZAM_IDEAS__DEFER_DAYS", "0"),
+            ("ZAM_IDEAS__DEFER_DAYS", "3651"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            let key = k.trim_start_matches("ZAM_IDEAS__").to_lowercase();
+            assert!(e.contains(&format!("ideas.{key}")), "{k}={v}: {e}");
+        }
+        let ok = vec![
+            env("ZAM_IDEAS__PROACTIVE", "false"),
+            env("ZAM_IDEAS__DIGEST_MAX", "0"),
+            env("ZAM_IDEAS__PROMPT_MAX", "3"),
+            env("ZAM_IDEAS__PROMPT_TOP_K", "20"),
+            env("ZAM_IDEAS__DEFER_DAYS", "3650"),
+        ];
+        let c = load(None, &ok, &Default::default()).unwrap().ideas;
+        assert!(!c.proactive);
+        assert_eq!(
+            (c.digest_max, c.prompt_max, c.prompt_top_k, c.defer_days),
+            (0, 3, 20, 3650)
+        );
+        let e = load(None, &[env("ZAM_IDEAS__AUTO", "true")], &Default::default());
+        assert!(e.is_err(), "неизвестный ключ секции — ошибка");
+        // ответ владельца на вопрос 8 (А): порога косинуса нет — ключ не выпускался ни в одном
+        // релизе и отклоняется как неизвестный
+        let e = load(
+            None,
+            &[env("ZAM_IDEAS__KNOWLEDGE_MIN_COSINE", "0.7")],
+            &Default::default(),
+        );
+        assert!(e.is_err(), "knowledge_min_cosine удалён");
     }
 
     #[test]

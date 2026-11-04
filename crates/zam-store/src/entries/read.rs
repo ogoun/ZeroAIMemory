@@ -6,7 +6,7 @@ use serde::Serialize;
 use zam_core::Id;
 
 use super::{
-    AuthorView, Certainty, ENTRY_COLS, Entry, EntryFilter, EntryRevision, EntryStatus,
+    AuthorView, Certainty, ENTRY_COLS, Entry, EntryFilter, EntryKind, EntryRevision, EntryStatus,
     LIST_LIMIT_MAX, entry_row, json_col, load_entry, normalize_area, normalize_title,
 };
 use crate::time::{fmt_ts, ts_at};
@@ -42,7 +42,8 @@ fn json_list<T>(v: &[T], f: impl Fn(&T) -> &'static str) -> Option<String> {
 /// применяются в SQL до `LIMIT`, поэтому курсор не теряет записей между страницами.
 /// Без вида отчёты (`report`) не выдаются, если не задан `with_reports` (сессии WebUI).
 /// `deleted_only` — корзина: только удалённые записи, новые удаления первыми (курсор —
-/// `<deleted_at>|<id>`).
+/// `<deleted_at>|<id>`). `origin` и `priority` — фильтры идей по `data` (M5.7), только при
+/// `kind = idea` (иначе `BadInput`).
 pub async fn list_entries(
     db: &Db,
     f: EntryFilter,
@@ -52,6 +53,13 @@ pub async fn list_entries(
             "limit: от 1 до {LIST_LIMIT_MAX}"
         )));
     }
+    if (f.origin.is_some() || f.priority.is_some()) && f.kind != Some(EntryKind::Idea) {
+        return Err(StoreError::BadInput(
+            "origin и priority — фильтры идей: только с kind=idea".into(),
+        ));
+    }
+    let origin = f.origin.map(|o| o.as_str());
+    let priority = f.priority.map(|p| p.as_str());
     let cursor = f.cursor.as_deref().map(parse_cursor).transpose()?;
     let statuses = json_list(&f.statuses, |s| s.as_str());
     let certainty = json_list(&f.certainty, |c| c.as_str());
@@ -86,6 +94,8 @@ pub async fn list_entries(
                              THEN json_extract(e.data, '$.decision.decided_by')
                              ELSE CASE WHEN e.author_kind = 'agent' THEN 'agent'
                                   ELSE 'human' END END = ?13))
+               AND (?15 IS NULL OR json_extract(e.data, '$.origin') = ?15)
+               AND (?16 IS NULL OR json_extract(e.data, '$.priority') = ?16)
              ORDER BY {key} DESC, e.id DESC
              LIMIT ?11"
         ))?;
@@ -105,6 +115,8 @@ pub async fn list_entries(
                 f.data_kind,
                 f.decided_by,
                 f.with_reports,
+                origin,
+                priority,
             ],
             entry_row,
         )?;

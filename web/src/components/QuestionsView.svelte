@@ -3,6 +3,11 @@
   // (рекомендация агента отмечена), ответ в один клик или текстом. Ответ идёт с
   // `channel: webui` и создаёт решение (insight `decision`, `decided_by: human`) — после
   // ответа карточка ссылается на него. Отвеченные и неактуальные — ниже, с ответом.
+  // Вопрос-предложение идеи (`data.idea`, M5.7 §5.3) — со ссылкой «Идея w:<id>»; ответ — только
+  // вариантом (у вопроса «вернуть» идею со снятой задачей, §16, — «вернуть»/«отказаться», без
+  // даты), у «отложить» — дата «не раньше» (UTC, не раньше завтрашней); «начать» идеи
+  // Knowledge с задачей в общем решении (`data.task_space`) — после предупреждения (§5.2, п. 1).
+
   import { tick, untrack } from 'svelte';
   import {
     ApiError,
@@ -11,18 +16,21 @@
     errorText,
     listEntries,
     type Entry,
+    type Space,
   } from '../lib/api';
-  import { AUTHOR_TEXT, STATUS_TEXT, fmtTime } from '../lib/journals';
+  import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime, utcDate } from '../lib/journals';
   import { href } from '../lib/router';
 
   interface Props {
     user: string;
     space: string;
     entry: string | null;
+    /** Пространства пользователя: общее ли решение задачи вопроса-предложения. */
+    spaces?: Space[];
     onexpired: () => void;
   }
 
-  let { user, space, entry, onexpired }: Props = $props();
+  let { user, space, entry, spaces = [], onexpired }: Props = $props();
 
   const PAGE = 200;
   const CHANNEL_TEXT: Record<string, string> = { webui: 'WebUI', chat: 'чат', cli: 'CLI' };
@@ -43,6 +51,9 @@
   let texts = $state<Record<string, string>>({});
   /** Решение, созданное ответом только что (до перечитывания списка). */
   let created = $state<Record<string, string>>({});
+  /** Вопрос-предложение, у которого открыт выбор даты «отложить», и сама дата. */
+  let deferFor = $state('');
+  let deferDate = $state('');
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
@@ -83,6 +94,48 @@
           (o): o is Opt => !!o && typeof o === 'object' && typeof (o as Opt).key === 'string' && typeof (o as Opt).text === 'string',
         )
       : [];
+  /** Идея вопроса-предложения (`data.idea`) или пустая строка. */
+  const ideaOf = (e: Entry): string => (typeof e.data.idea === 'string' ? e.data.idea : '');
+  const ideaHref = (id: string) => href({ name: 'journal', user, space, journal: 'ideas', entry: id });
+
+  /** Вопрос-предложение, у которого ждёт подтверждения «начать» в общем решении. */
+  let confirmFor = $state('');
+
+  /** Общее решение, где «начать» поставит задачу идеи Knowledge (иначе `null`). */
+  function sharedTarget(q: Entry): Space | null {
+    const here = spaces.find((s) => s.kind === 'knowledge');
+    if (space !== 'knowledge' && q.space_id !== here?.id) return null;
+    const ts = typeof q.data.task_space === 'string' ? q.data.task_space : '';
+    const sp = spaces.find((s) => s.id === ts);
+    return sp && sp.kind === 'solution' && sp.shared ? sp : null;
+  }
+
+  function pick(q: Entry, key: string) {
+    if (ideaOf(q) && key === 'accept' && sharedTarget(q) && confirmFor !== q.id) {
+      confirmFor = q.id;
+      deferFor = '';
+      errors[q.id] = '';
+      return;
+    }
+    if (ideaOf(q) && key === 'defer') {
+      confirmFor = '';
+      deferFor = q.id;
+      deferDate = utcDate(30);
+      errors[q.id] = '';
+      return;
+    }
+    answer(q, { option: key });
+  }
+
+  function submitDefer(e: SubmitEvent, q: Entry) {
+    e.preventDefault();
+    if (!deferDate || deferDate < utcDate(1)) {
+      errors[q.id] = `Дата — не раньше ${utcDate(1)} (UTC).`;
+      return;
+    }
+    answer(q, { option: 'defer', horizon: deferDate });
+  }
+
   const recommended = (e: Entry): string =>
     typeof e.data.recommendation === 'string' ? e.data.recommendation : '';
 
@@ -106,7 +159,7 @@
   /** Открытые первыми (новые вопросы сверху внутри группы — как отдаёт сервер). */
   let ordered = $derived([...items.filter((q) => q.status === 'open'), ...items.filter((q) => q.status !== 'open')]);
 
-  async function answer(q: Entry, a: { text?: string; option?: string }) {
+  async function answer(q: Entry, a: { text?: string; option?: string; horizon?: string }) {
     if (busy) return;
     busy = q.id;
     errors[q.id] = '';
@@ -114,6 +167,8 @@
       const r = await answerQuestion(user, q.id, a);
       created[q.id] = r.decision_id;
       texts[q.id] = '';
+      if (deferFor === q.id) deferFor = '';
+      if (confirmFor === q.id) confirmFor = '';
       await load(user, space, true);
     } catch (e) {
       const d = answeredDecision(e);
@@ -158,6 +213,9 @@
           <span class="muted small">{AUTHOR_TEXT[q.author.kind] ?? q.author.kind} · {fmtTime(q.created_at)}</span>
         </header>
         {#if q.body}<p class="body">{q.body}</p>{/if}
+        {#if ideaOf(q)}
+          <p><a href={ideaHref(ideaOf(q))} data-testid="idea-link">Идея {entryRef('idea', ideaOf(q))}</a></p>
+        {/if}
 
         {#if q.status === 'open'}
           {#if opts.length}
@@ -166,24 +224,45 @@
                 <button
                   type="button"
                   class:primary={o.key === recommended(q)}
-                  disabled={busy !== ''}
+                  disabled={busy !== '' || (confirmFor === q.id && o.key === 'accept')}
                   title={o.key === recommended(q) ? 'Рекомендация агента' : ''}
-                  onclick={() => answer(q, { option: o.key })}
+                  onclick={() => pick(q, o.key)}
                 >
                   {o.text}{#if o.key === recommended(q)}<span class="rec"> · рекомендуется</span>{/if}
                 </button>
               {/each}
             </div>
           {/if}
-          <form class="row" onsubmit={(e) => submitText(e, q)} aria-label="Ответ текстом">
-            <input
-              bind:value={texts[q.id]}
-              placeholder={opts.length ? 'или свой ответ' : 'ответ'}
-              aria-label="Ответ на вопрос «{q.title}»"
-              maxlength="4000"
-            />
-            <button type="submit" disabled={busy !== ''}>Ответить</button>
-          </form>
+          {#if confirmFor === q.id}
+            {@const sp = sharedTarget(q)}
+            <div class="row" role="group" aria-label="Подтверждение «начать»">
+              <p class="warn" data-testid="shared-warning">Задача появится в решении «{sp?.name ?? ''}», её увидят участники.</p>
+              <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>Начать</button>
+              <button type="button" onclick={() => (confirmFor = '')}>Отмена</button>
+            </div>
+          {/if}
+          {#if deferFor === q.id}
+            <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label="Отложить идею">
+              <label class="row">
+                Не раньше
+                <input type="date" bind:value={deferDate} min={utcDate(1)} required aria-label="Отложить до" />
+                <span class="muted small" title="Даты хранятся в UTC">UTC</span>
+              </label>
+              <button type="submit" disabled={busy !== ''}>Отложить</button>
+              <button type="button" onclick={() => (deferFor = '')}>Отмена</button>
+            </form>
+          {/if}
+          {#if !ideaOf(q)}
+            <form class="row" onsubmit={(e) => submitText(e, q)} aria-label="Ответ текстом">
+              <input
+                bind:value={texts[q.id]}
+                placeholder={opts.length ? 'или свой ответ' : 'ответ'}
+                aria-label="Ответ на вопрос «{q.title}»"
+                maxlength="4000"
+              />
+              <button type="submit" disabled={busy !== ''}>Ответить</button>
+            </form>
+          {/if}
           {#if errors[q.id]}<p class="error" role="alert">{errors[q.id]}</p>{/if}
         {:else if a}
           <p class="answer">

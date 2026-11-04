@@ -2,7 +2,7 @@
 //! 0015 базы пользователя (виды `term`/`task`/`question`, связь `contradicts`, §1.2–1.3) на
 //! базе M4 (0014) с данными — Review Focus 1 плана M4.5.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
@@ -10,9 +10,10 @@ use rusqlite::Connection;
 use serde_json::json;
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
-    Attribution, AuthorKind, Certainty, DataDir, Db, EdgeType, EntryKind, EntryPatch, FtsQuery,
-    Migration, NewEntry, NewTrigger, StoreError, TargetFilter, TriggerKind, USER_MIGRATIONS,
-    UserDbs, create_entry, delete_entry, search_fts, supersede_entry, update_entry,
+    Attribution, AuthorKind, Certainty, DataDir, Db, EdgeType, EntryKind, EntryPatch, EntryStatus,
+    FtsQuery, Migration, NewEntry, NewReportFile, NewTrigger, SpaceKind, StoreError, TargetFilter,
+    TriggerKind, USER_MIGRATIONS, UserDbs, attachment_link, create_entry, create_report,
+    delete_entry, search_fts, supersede_entry, update_entry,
 };
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -561,4 +562,311 @@ async fn entries_kind_status_check() {
     })
     .await
     .unwrap();
+}
+
+// ---------- 0024 (M5.7): вид `idea` на базе M5.6 (0023) ----------
+
+/// Объект схемы: `(тип, имя, таблица, SQL без лишних пробелов)`.
+type MasterObject = (String, String, String, String);
+
+/// Все объекты схемы `sqlite_master`.
+fn master_objects(c: &Connection) -> BTreeSet<MasterObject> {
+    let mut st = c
+        .prepare("SELECT type, name, tbl_name, coalesce(sql, '') FROM sqlite_master")
+        .unwrap();
+    st.query_map([], |r| {
+        let sql: String = r.get(3)?;
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            sql.split_whitespace().collect::<Vec<_>>().join(" "),
+        ))
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// Строка `entries`: id, вид, статус, `data`, `idempotency_key`, ревизия.
+type EntryRow = (String, String, Option<String>, String, Option<String>, i64);
+
+/// Строки `entries`, которые миграция обязана перенести как есть.
+fn entry_rows(c: &Connection) -> Vec<EntryRow> {
+    let mut st = c
+        .prepare(
+            "SELECT id, kind, status, data, idempotency_key, current_rev FROM entries ORDER BY id",
+        )
+        .unwrap();
+    st.query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// Заполняет базу на 0023 записями всех видов: changelog, release, insight с триггером и
+/// `Idempotency-Key`, term, task, question с вариантами, report с файлом; у части — ревизии.
+/// Возвращает id отчёта и sha256 его файла.
+async fn fill_m56(db: &Db) -> (Id, String) {
+    let now = zam_store::time::fmt_ts(Timestamp::now());
+    let (sol, kn, rules, hu) = (Id::new(), Id::new(), Id::new(), Id::new());
+    db.write(move |tx| {
+        for (id, kind, guid) in [
+            (sol, "solution", Some("g-m57-mig")),
+            (kn, "knowledge", None),
+            (rules, "rules", None),
+            (hu, "human", None),
+        ] {
+            tx.execute(
+                "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
+                 VALUES (?1, ?2, ?3, ?2, ?4)",
+                rusqlite::params![id, kind, guid, now],
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let a = agent();
+    let mut all = vec![
+        new_entry(
+            sol,
+            EntryKind::Changelog,
+            "Изменение".into(),
+            json!({"kind": "fix"}),
+        ),
+        new_entry(
+            sol,
+            EntryKind::Release,
+            "Релиз".into(),
+            json!({"version": "0.0.9"}),
+        ),
+        new_entry(
+            sol,
+            EntryKind::Task,
+            "Задача".into(),
+            json!({"next_step": "сделать"}),
+        ),
+        new_entry(
+            sol,
+            EntryKind::Question,
+            "Какую БД?".into(),
+            json!({"options": [{"key": "a", "text": "SQLite"}, {"key": "b", "text": "Postgres"}]}),
+        ),
+        new_entry(
+            kn,
+            EntryKind::Term,
+            "Выжимка".into(),
+            json!({"definition": "Готовый ответ кэша", "aliases": ["digest"]}),
+        ),
+    ];
+    let mut ins = new_entry(
+        kn,
+        EntryKind::Insight,
+        "Инсайт".into(),
+        json!({"kind": "gotcha"}),
+    );
+    ins.triggers = vec![NewTrigger {
+        kind: TriggerKind::Keyword,
+        pattern: "слово".into(),
+        tools: None,
+    }];
+    ins.idempotency_key = Some("key-m57".into());
+    all.push(ins);
+    for (n, e) in all.into_iter().enumerate() {
+        let (e, _) = create_entry(db, e, &a).await.unwrap();
+        if n % 2 == 0 {
+            update_entry(
+                db,
+                e.id,
+                None,
+                EntryPatch {
+                    append_body: Some("Ещё.".into()),
+                    ..EntryPatch::default()
+                },
+                &a,
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let sha = format!("{:08x}{}", 7, "cd".repeat(28));
+    let file = NewReportFile {
+        sha256: sha.clone(),
+        filename: "loss.png".into(),
+        mime: "image/png".into(),
+        size: 100,
+    };
+    let mut rep = new_entry(sol, EntryKind::Report, "Отчёт".into(), json!({}));
+    rep.body = format!(
+        "## Итоги\n\n![loss.png]({})\n",
+        attachment_link(&sha, "loss.png")
+    );
+    rep.certainty = None;
+    rep.tags = Vec::new();
+    let (rep, _) = create_report(db, rep, vec![file], &a).await.unwrap();
+    (rep.id, sha)
+}
+
+async fn exec_sql(db: &Db, sql: String) -> Result<usize, StoreError> {
+    db.write(move |tx| Ok(tx.execute(&sql, [])?)).await
+}
+
+fn immutable(r: &Result<usize, StoreError>) -> bool {
+    matches!(r, Err(StoreError::Sqlite(e)) if e.to_string().contains("report-immutable"))
+}
+
+/// Review Focus 2 M5.7: пересборка `entries` в 0024 не теряет ни строк, ни защиты отчёта —
+/// ни на `entries`, ни на дочерних таблицах. Объекты схемы до и после совпадают (кроме SQL
+/// таблицы `entries`), все пять триггеров отчёта срабатывают на прямой SQL.
+#[tokio::test]
+async fn migrate_0024_keeps_report_triggers_and_rows() {
+    let dir = tmp_dir("m56-db");
+    let dd = DataDir::open(&dir).unwrap();
+    let user = Id::new();
+    let path = dd.user_db(&user);
+    assert_eq!(USER_MIGRATIONS[22].version, 23);
+    let (report, sha) = {
+        let db = Db::open(&path, &USER_MIGRATIONS[..23]).unwrap();
+        fill_m56(&db).await
+    };
+    let (counts_before, objects_before, rows_before) = {
+        let c = conn(&path);
+        assert_eq!(user_version(&c), 23);
+        (table_counts(&c), master_objects(&c), entry_rows(&c))
+    };
+    assert!(rows_before.len() >= 7);
+    assert!(
+        rows_before.iter().any(|r| r.4.is_some()),
+        "есть Idempotency-Key"
+    );
+    assert!(rows_before.iter().any(|r| r.1 == "report"));
+    for t in [
+        "entries_report_immutable",
+        "entry_revisions_report_once",
+        "entry_attachments_report_only",
+        "entry_attachments_no_update",
+        "entry_attachments_no_delete",
+    ] {
+        assert!(
+            objects_before.iter().any(|o| o.0 == "trigger" && o.1 == t),
+            "{t} до миграции"
+        );
+    }
+
+    let dbs = UserDbs::new(dd.users_dir());
+    let db = dbs.get(user).await.unwrap();
+    dbs.wait_rechunk(user).await;
+    assert!(path.with_file_name(format!("{user}.db.bak-v23")).exists());
+    let (counts_after, objects_after, rows_after, version, violations, fk) = db
+        .read(|c| {
+            Ok((
+                table_counts(c),
+                master_objects(c),
+                entry_rows(c),
+                user_version(c),
+                fk_violations(c),
+                fk_on(c),
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(version, USER_MIGRATIONS.len() as u32);
+    assert!(version >= 24);
+    assert_eq!(violations, 0, "foreign_key_check не пуст");
+    assert!(fk, "foreign_keys выключены после миграции");
+    // строки (в том числе Idempotency-Key) и счётчики всех таблиц
+    assert_eq!(rows_after, rows_before);
+    for (t, n) in counts_before.iter().filter(|(t, _)| t.as_str() != "meta") {
+        assert_eq!(counts_after.get(t), Some(n), "таблица {t}");
+    }
+    assert!(!counts_after.contains_key("entries_new"));
+    // объекты схемы: меняется только SQL таблицы `entries`
+    let is_entries = |o: &&MasterObject| o.0 == "table" && o.1 == "entries";
+    let before: Vec<&MasterObject> = objects_before.iter().filter(|o| !is_entries(o)).collect();
+    let after: Vec<&MasterObject> = objects_after.iter().filter(|o| !is_entries(o)).collect();
+    assert_eq!(after, before);
+    let sql_of = |s: &BTreeSet<MasterObject>| s.iter().find(is_entries).unwrap().3.clone();
+    let (sql_before, sql_after) = (sql_of(&objects_before), sql_of(&objects_after));
+    assert!(!sql_before.contains("'idea'"));
+    assert!(
+        sql_after.contains("'idea'") && sql_after.contains("'declined'"),
+        "{sql_after}"
+    );
+
+    // триггеры отчёта — прямым SQL
+    let r = exec_sql(
+        &db,
+        format!("UPDATE entries SET title = 'x' WHERE kind = 'report' AND id = '{report}'"),
+    )
+    .await;
+    assert!(immutable(&r), "entries_report_immutable: {r:?}");
+    let r = exec_sql(
+        &db,
+        format!(
+            "INSERT INTO entry_revisions (entry_id, rev, title, body, data, tags, area, status,
+                                          certainty, reason, ts, author_kind, user_id, token_id,
+                                          session_id, machine)
+             SELECT entry_id, 2, title, body, data, tags, area, status, certainty, reason, ts,
+                    author_kind, user_id, token_id, session_id, machine
+             FROM entry_revisions WHERE entry_id = '{report}' AND rev = 1"
+        ),
+    )
+    .await;
+    assert!(immutable(&r), "entry_revisions_report_once: {r:?}");
+    let r = exec_sql(
+        &db,
+        format!(
+            "INSERT INTO entry_attachments (entry_id, blob_sha256, filename, mime, size, created_at)
+             VALUES ('{report}', '{sha}', 'late.png', 'image/png', 100, '2030-01-01T00:00:00Z')"
+        ),
+    )
+    .await;
+    assert!(immutable(&r), "entry_attachments_report_only: {r:?}");
+    let r = exec_sql(
+        &db,
+        "UPDATE entry_attachments SET filename = 'x.png'".to_string(),
+    )
+    .await;
+    assert!(immutable(&r), "entry_attachments_no_update: {r:?}");
+    let r = exec_sql(&db, "DELETE FROM entry_attachments".to_string()).await;
+    assert!(immutable(&r), "entry_attachments_no_delete: {r:?}");
+    assert_eq!(
+        db.read(|c| Ok(count(c, "entry_attachments")))
+            .await
+            .unwrap(),
+        1
+    );
+    // обычная запись правится, идея пишется
+    exec_sql(
+        &db,
+        "UPDATE entries SET title = 'Задача 2' WHERE kind = 'task'".to_string(),
+    )
+    .await
+    .unwrap();
+    let space = zam_store::list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Solution)
+        .unwrap()
+        .id;
+    let mut idea = new_entry(
+        space,
+        EntryKind::Idea,
+        "Идея".into(),
+        json!({"origin": "human"}),
+    );
+    idea.certainty = None;
+    let (idea, _) = create_entry(&db, idea, &agent()).await.unwrap();
+    assert_eq!(idea.status, Some(EntryStatus::New));
 }

@@ -495,6 +495,33 @@ pub async fn seen_revs(
     .await
 }
 
+/// Записи журналов (`target_kind = entry`) базы владельца `owner`, выданные сессии с частью
+/// `part` (любая ревизия): по ним вызывающий узнаёт, показывалась ли сессии запись нужного вида
+/// (раздел идей M5.7 §6.1 — только на первом `session_start` сессии).
+pub async fn seen_entry_ids(
+    db: &Db,
+    session: &str,
+    owner: Id,
+    part: &str,
+) -> Result<Vec<Id>, StoreError> {
+    let (session, part) = (session.to_string(), part.to_string());
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT target_id FROM session_seen
+             WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = 'entry' AND part = ?3",
+        )?;
+        let rows = st.query_map(params![session, owner, part], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for id in rows {
+            if let Ok(id) = id?.parse::<Id>() {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
 /// Удаляет сессии без обращений с `cutoff` (`last_seen_at < cutoff`) и выданное им; число
 /// удалённых сессий.
 pub async fn gc_sessions(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError> {

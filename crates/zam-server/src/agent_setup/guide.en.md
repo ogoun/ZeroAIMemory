@@ -22,13 +22,13 @@ Every response ends with a `~N tok` line — your spend. Check the cache before 
 
 ## Writing
 
-- **Notes** — `memory_write {path, content | ops, base_rev?, message?, l0?}`; path `[<space>:/]<path>`. Without `base_rev` — create, with it — replace or patch. Give a note an `l0` — a one-line summary. **Verified commands** (build, test, deploy commands that really worked) — notes with `verified_at: YYYY-MM-DD` (and `verified_at_commit: <sha>`) in the frontmatter: the session digest lists them as "Verified commands", and their age counts from the check date. Rechecked — update `verified_at`.
+- **Notes** — `memory_write {path, content | ops, base_rev?, message?, l0?}`; path `[<space>:/]<path>`. Without `base_rev` — create, with it — replace or patch. Always give notes an `l0` — a one-line summary. **Verified commands** (build, test, deploy commands that really worked) — notes with `verified_at: YYYY-MM-DD` (and `verified_at_commit: <sha>`) in the frontmatter: the session digest lists them as "Verified commands", and their age counts from the check date. Rechecked — update `verified_at`.
 - **Journals** — `memory_log {kind, …}`:
   - `changelog` — a project change (what and why);
   - `insight` — a finding: `gotcha`, `failure`, `experiment` (with its result), `discovery`, `decision` (see below); `scope=global` when it is not about this project; `triggers` (`file_glob:**/*.sh`, `command_regex:…`, `error_regex:…`) — when to show the hint. After fixing an error, record a `gotcha`/`failure` with `error_regex` — the hook reminds you when it sees an "error → fix" pair;
   - `release` — a release;
-  - `term`, `task`, `question` — glossary, tasks, questions for the human (sections below).
-- **Editing a record** — `memory_update_entry {id, rev, action}`: `supersede`, `retract` (with a reason), `revisit`, `certify`, `append`, `feedback`; for tasks — `status`, `claim`, `release`; for questions — `answer`. `rev` is required (except `feedback`, `claim`, `release`, `answer`): without it — 428, after someone else's edit — 409 with the current revision. On 409/428 reread the record and retry.
+  - `term`, `task`, `question`, `idea` — glossary, tasks, questions for the human, ideas (sections below).
+- **Editing a record** — `memory_update_entry {id, rev, action}` (409 — reread): `supersede`, `retract` (with a reason), `revisit`, `certify`, `append`, `feedback`; for tasks — `status`, `claim`, `release`; for questions — `answer`; for ideas — `propose`, `decide` (section "Ideas"). `rev` is required (except `feedback`, `claim`, `release`, `answer`, `propose`, `decide`): without it — 428, after someone else's edit — 409 with the current revision. On 409/428 reread the record and retry.
 - **Links** — `memory_link {src, type, dst}`: `links_to`, `relates_to`, `depends_on`, `part_of`, `caused_by`, `fixes`, `derived_from`, `mentions`, `contradicts`.
 - **Secrets** — only `memory_vault` (`get | set | list`). Values never reach search, summaries or logs; do not copy them into notes.
 - A write response may carry `warnings` (`term_alias`, `decision_near_axiom`, …) — read them and fix the record when needed.
@@ -50,7 +50,7 @@ A report is an outcome of work **for the user**: research, an experiment, model 
 A task (`task`) is work state that survives context compaction and a change of session or agent.
 
 - **Create** — `memory_log {kind: "task", title, body: plan, data: {next_step?, owner?: agent|human, estimate_min?, links?}}` → `k:<id>`. CLI: `zam task new`.
-- **Take it** — `memory_update_entry {id: "k:<id>", action: "claim", ttl_min?}` (120 min by default, up to 1440). A live claim by someone else — 409 `task-claimed` with `claimed_by`: do not duplicate the work, pick another task or ask the human. The claim is advisory, it does not forbid edits. Done or dropped — `release`.
+- **Take it** — claim before work: `memory_update_entry {id: "k:<id>", action: "claim", ttl_min?}` (120 min by default, up to 1440). A live claim by someone else — 409 `task-claimed` with `claimed_by`: do not duplicate the work, pick another task or ask the human. The claim is advisory, it does not forbid edits. Done or dropped — `release`.
 - **Progress** — `memory_update_entry {id, rev, action: "status", status: in_progress|blocked|done|dropped, next_step?, blocked_by?}`. Update `next_step` after every notable step: it is the first thing the next session sees. `blocked` — with `blocked_by`. From `done`/`dropped` — only reopening to `open` with a `reason`.
 - **The session digest** has a "Tasks" section: `in_progress` and `blocked`, the ones claimed by this session first. Continue from `next_step`.
 - **Estimates** — from the actual durations of similar tasks: closed tasks carry `duration_min` (`zam task list --status done`, REST `GET /spaces/{space}/entries?kind=task&status=done`); find similar ones with `memory_search {filters: {kinds: [task], status: [done]}}`.
@@ -62,10 +62,22 @@ A question (`question`) is something only the human decides. The answer becomes 
 
 - **Ask** — `memory_log {kind: "question", title: question, body: context, data: {options: [{key, text}] up to 8, recommendation?: key}}` → `q:<id>`. The same question is already open or answered — 409 `possible-duplicate` with candidates: read the answer, do not ask again. Open questions are listed in the digest.
 - **Answer in WebUI** (the "Questions" page) is given by the human; answers of the last 14 days reach the digest as "Human answers".
-- **Answer in chat.** The human answered you in the conversation — record it: `memory_update_entry {id: "q:<id>", action: "answer", option? | text?, by: "human", channel: "chat"}` (no question yet — ask it first). `by` is required: without it — 400 `by-required`. With `by: human` the decision gets `certainty: axiom`. CLI: `zam question answer q:<id> --option … --by human|agent`.
+- **Answer in chat.** The human answered you in the conversation — record it: `memory_update_entry {id: "q:<id>", action: "answer", option? | text?, by: "human", channel: "chat"}` (no question yet — ask it first). `by` is required: without it — 400 `by-required`. With `by: human` the decision gets `certainty: axiom`. CLI: `zam question answer q:<id> --option … --by human|agent --channel chat`.
 - **`by: human` only if the human really answered.** You decided yourself (no answer, the human asked you to choose, the answer is your conclusion) — `by: agent`: the decision gets `hypothesis`. Never attribute your own choice to the human.
 - In one operation the server sets the question to `answered` and creates an insight `decision` ("question → answer") linked by `derived_from`; `decision_id` is in the response.
 - **No longer relevant** — `memory_update_entry {id, rev, action: "status", status: "obsolete", reason}`.
+
+## Ideas
+
+An idea (`idea`, reference `w:`) is something the human wants to do but has not started yet. Unlike a task, an idea has no plan, `next_step` or claim: the work on an idea happens in the task that appears after the human answers “start”.
+
+- **Record** — `memory_log {kind: "idea", title, body: the intent, data: {origin, priority?, horizon?, links?}}` → `w:<id>`; CLI `zam idea new`. `origin` is required: dictation “write down an idea …” → `origin: human`; your own thought for later (for example, a deferred review remark) → `origin: agent` — such an idea is never proposed, the human adopts it in WebUI. `priority` — `low|normal|high`, `horizon` — a “not before” date (`YYYY-MM-DD`, UTC). Do not rewrite a human's idea (only `append`) and do not delete it.
+- **Propose.** Ideas arrive as the digest section `### Идеи` (up to 3, only at the first start of a session) and as a “an idea fits the task” hint line for a prompt. Propose one to the human: `memory_update_entry {id: "w:<id>", action: "propose", text?: why now}` (action=propose) — the server asks a question `q:` with the options “start / postpone / decline”. One idea — one showing per session; declined ideas and ideas postponed until `horizon` do not arrive.
+- **Answer in chat** — `memory_update_entry {id: "q:<id>", action: "answer", option, by: "human"}`: `option` — `accept` (start), `defer` (postpone), `decline`; “postpone until …” — plus `horizon`. A decision without a question — `action: "decide", decision: accept|defer|decline|reopen`. The human decides: `by: human` — only their words; `by: agent` — only `decline` of your own idea. CLI: `zam idea accept|defer|decline w:<id> --by human --channel chat` (a human decision taken from the chat — always with `--channel chat`).
+- **Without the answer “start”, do not start.** “Start” creates, in one operation, a task `k:` linked to the idea with `derived_from` — then follow the task protocol; the task is `done` — the idea is `done` too.
+- **Return.** An idea marked “задача снята” (task dropped) may be proposed for return: propose with an explanation of why now (`text` is required; a deleted task is marked “задача удалена”); the human decides. The server asks “return / decline” — `option`: `reopen` or `decline`.
+- **Shared Knowledge ideas** — do not propose them yourself: only when the human asks (`memory_search {filters: {kinds: [idea]}}`, CLI `zam idea list --knowledge`) or when they are explicitly linked to the current work — then the server sends the hint.
+- **Switch** — `ideas.proactive` (WebUI “Agent connection → Hook hints”): off — no section and no idea hints.
 
 ## Glossary
 

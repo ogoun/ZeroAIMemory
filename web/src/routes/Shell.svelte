@@ -296,8 +296,8 @@
         {:else if !journalsOf(journalSpace.kind).includes(r.journal)}
           <p class="warn" role="alert">
             У пространства «{journalSpace.name}» нет журнала {JOURNAL_TITLE[r.journal]}: журналы ведутся в
-            решениях (Changelog, Releases, Отчёты, Код, Insights, Словарь, Задачи, Вопросы, Vault) и в
-            Knowledge (Insights, Словарь, Задачи, Вопросы, Vault).
+            решениях (Changelog, Releases, Отчёты, Код, Insights, Словарь, Задачи, Идеи, Вопросы, Vault) и в
+            Knowledge (Insights, Словарь, Задачи, Идеи, Вопросы, Vault).
           </p>
         {:else if r.journal === 'changelog'}
           <ChangelogView user={r.user} space={r.space} entry={r.entry} {onexpired} />
@@ -340,8 +340,17 @@
           <GlossaryView user={r.user} space={r.space} entry={r.entry} {onexpired} />
         {:else if r.journal === 'tasks'}
           <TasksView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+        {:else if r.journal === 'ideas'}
+          <!-- идеи — ленивым чанком (M5.7); пространства — для выбора решения задачи идеи Knowledge -->
+          {#await import('../components/IdeasView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: IdeasView }}
+            <IdeasView user={r.user} space={r.space} entry={r.entry} spaces={journalSpaces?.spaces ?? []} {onexpired} />
+          {:catch e}
+            <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
+          {/await}
         {:else if r.journal === 'questions'}
-          <QuestionsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          <QuestionsView user={r.user} space={r.space} entry={r.entry} spaces={journalSpaces?.spaces ?? []} {onexpired} />
         {:else}
           <VaultView user={r.user} space={r.space} {onexpired} />
         {/if}

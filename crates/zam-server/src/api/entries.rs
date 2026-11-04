@@ -20,6 +20,10 @@
 //! `data` по [`zam_store::QuestionData`] (`options`, `recommendation`); совпавший заголовок
 //! `open`/`answered` вопроса — 409 `possible-duplicate` (`force` пишет всё равно); `PATCH` —
 //! `data` пока `open` и `status: obsolete` с `reason`; ответ — `POST /entries/{id}/answer`.
+//! `kind: idea` — идея (M5.7, [`super::ideas`]): в решении и Knowledge; `data.origin` у токена
+//! обязателен, у WebUI — всегда `human`; `PATCH status` — 422, содержимое — только в `new` и
+//! `deferred` (иначе 409); токен по идее человека — 403 `idea-human-owned`, кроме `append_body`
+//! (и на `DELETE`); лента — фильтры `origin`, `priority`; `GET` — ещё `task` и `question`.
 //! `kind: report` — отчёт (M5.5, [`super::reports`]): `multipart/form-data` или JSON с
 //! `images`, только агентом и только в решении; ответ — `{id, url}`.
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
@@ -136,10 +140,7 @@ fn check_changelog(data: &Value) -> Result<(), ApiError> {
 
 /// Сегодняшняя дата UTC, `YYYY-MM-DD`.
 fn today_utc() -> String {
-    Timestamp::now()
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .date()
-        .to_string()
+    zam_store::time::utc_today().to_string()
 }
 
 /// `data` релиза: версия, дата (по умолчанию сегодня UTC), `git_tag?`, `commits?`.
@@ -232,6 +233,12 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
         EntryKind::Report => Err(unprocessable(
             "report создаётся отдельным путём создания отчёта (с файлами)",
         )),
+        // `origin` и дата `horizon` новой идеи — [`super::ideas::create_data`]; здесь — патч
+        // полей клиента (`priority`, `horizon`, `links`)
+        EntryKind::Idea => zam_store::IdeaData::default()
+            .apply_patch(data)
+            .map(|()| data.clone())
+            .map_err(unprocessable),
     }
 }
 
@@ -361,11 +368,14 @@ pub async fn create(
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
     let sc = space_scope(&st, &p, &headers, &space, Mode::Write).await?;
     // вид проверяется после доступа к пространству: без прав 403/404, а не 422
-    if matches!(req.kind, EntryKind::Task | EntryKind::Question) {
-        // задачи и вопросы ведутся в решении и Knowledge (Rules и Human журналов не имеют)
+    if matches!(
+        req.kind,
+        EntryKind::Task | EntryKind::Question | EntryKind::Idea
+    ) {
+        // задачи, вопросы и идеи ведутся в решении и Knowledge (Rules и Human журналов не имеют)
         if !matches!(sc.space.kind, SpaceKind::Solution | SpaceKind::Knowledge) {
             return Err(unprocessable(
-                "задачи и вопросы ведутся только в пространстве решения или Knowledge",
+                "задачи, вопросы и идеи ведутся только в пространстве решения или Knowledge",
             ));
         }
     } else if sc.space.kind != SpaceKind::Solution {
@@ -375,10 +385,21 @@ pub async fn create(
     }
     check_title(&req.title)?;
     let refs = super::files::refs_field(req.refs.as_ref())?;
-    let mut data = check_data(req.kind, &req.data)?;
-    check_size(&st, &req.body)?;
-    let attrib = attribution(&p, &headers, req.message)?;
     let key = idempotency_key(&headers)?;
+    let attrib = attribution(&p, &headers, req.message)?;
+    let mut data = if req.kind == EntryKind::Idea {
+        // повтор по ключу сверяет хранилище без часов: дата `horizon` здесь не проверяется
+        let repeat = match &key {
+            Some(k) => entry_by_idempotency_key(&sc.db, &attrib, k)
+                .await?
+                .is_some(),
+            None => false,
+        };
+        super::ideas::create_data(&p, &req.data, !repeat)?
+    } else {
+        check_data(req.kind, &req.data)?
+    };
+    check_size(&st, &req.body)?;
     if req.kind == EntryKind::Question && !req.force {
         // повтор по ключу дубликатом не считается (иначе запись нашла бы саму себя)
         let repeat = match &key {
@@ -460,6 +481,10 @@ pub struct ListQuery {
     limit: Option<usize>,
     /// `only` — корзина (только `kind=report`, только владельцу решения в WebUI).
     deleted: Option<String>,
+    /// Только `kind=idea`: `human` | `agent` (M5.7 §7.1).
+    origin: Option<String>,
+    /// Только `kind=idea`: `low` | `normal` | `high`.
+    priority: Option<String>,
 }
 
 /// `deleted` ленты: нет или пусто — живые записи, `only` — корзина; иное — 400.
@@ -517,6 +542,20 @@ fn parse_list<T>(
         .collect()
 }
 
+/// Одно значение фильтра ленты: пусто — без фильтра, неизвестное — 400.
+fn parse_one<T>(
+    raw: Option<&str>,
+    what: &str,
+    f: fn(&str) -> Option<T>,
+) -> Result<Option<T>, ApiError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) => f(s)
+            .map(Some)
+            .ok_or_else(|| ApiError::BadRequest(format!("{what}: неизвестное значение «{s}»"))),
+    }
+}
+
 /// Момент времени: RFC 3339 или дата `YYYY-MM-DD` (начало суток UTC).
 fn parse_time(raw: &str, what: &str) -> Result<Timestamp, ApiError> {
     if let Ok(t) = raw.parse::<Timestamp>() {
@@ -559,6 +598,15 @@ pub async fn list(
         }
         trash_allowed(&st, &p, sc.owner, sc.role)?;
     }
+    // фильтры по `data` идеи — только у ленты идей (M5.7 §7.1)
+    let idea_filter = [&q.origin, &q.priority]
+        .into_iter()
+        .any(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()));
+    if idea_filter && kind != Some(EntryKind::Idea) {
+        return Err(unprocessable(
+            "origin и priority — фильтры ленты идей (kind=idea)",
+        ));
+    }
     let f = EntryFilter {
         space_id: sc.space.id,
         kind,
@@ -583,6 +631,12 @@ pub async fn list(
         // без вида — журналы без отчётов (у отчётов свой журнал, `kind=report`)
         with_reports: false,
         deleted_only,
+        origin: parse_one(q.origin.as_deref(), "origin", zam_store::IdeaOrigin::parse)?,
+        priority: parse_one(
+            q.priority.as_deref(),
+            "priority",
+            zam_store::IdeaPriority::parse,
+        )?,
     };
     let (items, next) = list_entries(&sc.db, f).await?;
     // у insight — показы и оценки (столбец списка Insights WebUI, задача 13), одним запросом
@@ -646,6 +700,8 @@ pub async fn get(
         return super::reports::view::get_html(&st, &sc, viewer).await;
     }
     let mut v = entry_json(&sc.db, &sc.entry).await?;
+    let links = super::ideas::idea_links(&sc.db, &sc.entry).await?;
+    super::ideas::attach_idea(&mut v, &sc.entry, &links);
     // показы и оценки — из базы, где лежит запись (§10.5)
     let target = zam_core::TargetRef {
         kind: zam_core::TargetKind::Entry,
@@ -736,6 +792,9 @@ fn check_status_change(e: &Entry, s: EntryStatus, reason: Option<&str>) -> Resul
     if e.kind == EntryKind::Question {
         return check_question_status(e, s, reason);
     }
+    if e.kind == EntryKind::Idea {
+        return Err(super::ideas::status_patch_error());
+    }
     if e.kind != EntryKind::Insight {
         return Err(unprocessable(
             "status есть только у insight, task и question",
@@ -814,6 +873,14 @@ pub async fn patch(
     deny_report_mutation(&p, &sc)?;
     let rev = Some(if_match(&headers)?);
     let req: Patch = json_body(body)?;
+    // токен по идее человека — только дополнение `append_body` (M5.7 §7.1), до записи
+    let content = req.title.is_some()
+        || req.body.is_some()
+        || req.data.is_some()
+        || req.tags.is_some()
+        || req.area.is_some()
+        || req.refs.is_some();
+    super::ideas::deny_token_on_human_idea(&p, &sc.entry, content)?;
     for t in [&req.body, &req.append_body].into_iter().flatten() {
         check_size(&st, t)?;
     }
@@ -857,6 +924,13 @@ pub async fn patch(
         }
         (Some(d), EntryKind::Insight) => {
             super::insights::check_insight_data(d)?;
+            Some(d.clone())
+        }
+        (Some(d), EntryKind::Idea) => {
+            // слияние полей клиента; `origin` и поля сервера — 422 (хранилище сохраняет их)
+            zam_store::IdeaData::from_stored(&sc.entry.data)
+                .apply_patch(d)
+                .map_err(unprocessable)?;
             Some(d.clone())
         }
         (Some(d), EntryKind::Question) => {
@@ -917,6 +991,8 @@ pub async fn remove(
     report_trash_allowed(&st, &p, &sc)?;
     live_entry(&sc)?;
     let rev = if_match(&headers)?;
+    // идею человека в корзину убирает человек (M5.7 §5.6, §9)
+    super::ideas::deny_token_on_human_idea(&p, &sc.entry, true)?;
     let attrib = attribution(&p, &headers, None)?;
     delete_entry(&sc.db, sc.entry.id, Some(rev), &attrib).await?;
     st.index.notify();
@@ -945,6 +1021,8 @@ pub async fn restore(
 ) -> Result<Json<Entry>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     report_trash_allowed(&st, &p, &sc)?;
+    // идею человека из корзины возвращает человек (M5.7 §7.1, §9)
+    super::ideas::deny_token_on_human_idea(&p, &sc.entry, true)?;
     let rev = optional_if_match(&headers)?;
     let attrib = attribution(&p, &headers, None)?;
     let e = restore_entry(&sc.db, sc.entry.id, rev, &attrib).await?;

@@ -6,7 +6,7 @@ import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { request } from '@playwright/test';
-import { seed, seedCliReport, seedCodeKnowledge, seedCodeMap, seedJournals, seedReports, type AdminCall } from './seed';
+import { seed, seedCliReport, seedCodeKnowledge, seedCodeMap, seedIdeas, seedJournals, seedReports, type AdminCall } from './seed';
 import { seedDocs } from './seed-docs';
 import { ADMIN_STATE } from './session';
 
@@ -127,6 +127,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     // карта кода решения E2E (M5.6): REST как у `zam code sync`, синтетические символы
     await seedCodeMap(base, token);
     const code = await seedCodeKnowledge(base, token);
+    // журнал «Идеи» (M5.7): своё общее решение, идеи человека и агента, вопрос-предложение, Knowledge
+    const ideas = await seedIdeas(base, token, admin);
     await rc.storageState({ path: ADMIN_STATE });
     await rc.dispose();
     process.env.E2E_BASE_URL = base;
@@ -154,6 +156,11 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_CODE_NOTE = code.note;
     process.env.E2E_CODE_TASK = code.task;
     process.env.E2E_CODE_BOTH = code.both;
+    process.env.E2E_IDEA_HUMAN = ideas.human;
+    process.env.E2E_IDEA_AGENT = ideas.agent;
+    process.env.E2E_IDEA_PROPOSED = ideas.proposed;
+    process.env.E2E_IDEA_QUESTION = ideas.question;
+    process.env.E2E_IDEA_KNOWLEDGE = ideas.knowledge;
   } catch (e) {
     child.kill();
     log.end();

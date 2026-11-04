@@ -705,3 +705,59 @@ export async function seedCodeKnowledge(base: string, token: string): Promise<{ 
   }));
   return { note: note.id, task: task.id, both: both.id };
 }
+
+// ---- идеи (M5.7) ----
+
+/** Решение журнала «Идеи»: своё, отдельно от решения E2E (сценарии идей ставят задачи и вопросы). */
+export const IDEAS_GUID = '0e2e0000-0000-4000-8000-000000000057';
+export const IDEAS_NAME = 'Идеи E2E';
+/** Участник решения идей (`rw`, одобрен): решение «общее» — предупреждение «Начать» идеи Knowledge. */
+export const IDEAS_MEMBER = 'e2e-ideas-member';
+export const IDEA_HUMAN_TITLE = 'Идея E2E: звездолётная карта связей';
+/** Слово только из идеи человека — для Ctrl+K. */
+export const IDEA_WORD = 'звездолётная';
+export const IDEA_AGENT_TITLE = 'Идея агента E2E: кэш миниатюр';
+export const IDEA_PROPOSED_TITLE = 'Идея E2E: экспорт графа в SVG';
+export const IDEA_KNOWLEDGE_TITLE = 'Общая идея E2E: шаблоны заметок';
+
+export interface IdeaSeed {
+  human: string;
+  agent: string;
+  proposed: string;
+  question: string;
+  knowledge: string;
+}
+
+/**
+ * Решение «Идеи E2E» (общее: одобренный участник `rw`) и идеи по токену администратора (агент):
+ * идея человека (по его словам, `origin: human`), своя идея агента, идея с вопросом-предложением
+ * (`propose`) и общая идея Knowledge.
+ */
+export async function seedIdeas(base: string, token: string, admin: AdminCall): Promise<IdeaSeed> {
+  const post = <T>(path: string, body: unknown) => api<T>(base, token, 'POST', path, json(body));
+  await post('solutions', { agent_solution_id: IDEAS_GUID, name: IDEAS_NAME });
+  const u = await admin<{ user: { id: string }; token: { plaintext: string } }>('POST', 'admin/users', { name: IDEAS_MEMBER });
+  const r = await fetch(`${base}api/v1/solutions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${u.token.plaintext}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_solution_id: IDEAS_GUID, name: IDEAS_NAME }),
+  });
+  if (r.status !== 202) throw new Error(`запрос доступа ${IDEAS_MEMBER}: HTTP ${r.status} ${await r.text()}`);
+  await admin('POST', `solutions/${IDEAS_GUID}/access/${u.user.id}/approve`, { access: 'rw' });
+
+  const sp = `spaces/${IDEAS_GUID}/entries`;
+  const idea = (title: string, origin: 'human' | 'agent', extra: Record<string, unknown> = {}, where = sp) =>
+    post<EntryResp>(where, { kind: 'idea', title, body: `${title}: замысел.`, ...extra, data: { origin, ...((extra.data as object) ?? {}) } });
+  const human = await idea(IDEA_HUMAN_TITLE, 'human', {
+    body: `Показывать ${IDEA_WORD} карту связей заметок.`,
+    tags: ['ui'],
+    data: { priority: 'high' },
+  });
+  const agent = await idea(IDEA_AGENT_TITLE, 'agent');
+  const proposed = await idea(IDEA_PROPOSED_TITLE, 'human');
+  const pr = await post<{ question: { id: string } }>(`entries/${proposed.id}/propose`, {
+    text: 'Сейчас правим граф — экспорт ляжет рядом.',
+  });
+  const knowledge = await idea(IDEA_KNOWLEDGE_TITLE, 'human', {}, 'spaces/knowledge/entries');
+  return { human: human.id, agent: agent.id, proposed: proposed.id, question: pr.question.id, knowledge: knowledge.id };
+}

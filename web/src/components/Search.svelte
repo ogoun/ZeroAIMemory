@@ -236,7 +236,7 @@
             >
               {#if it.entry_id}
                 <div class="where entry-card">
-                  <span class="ekind">{it.kind === 'report' ? 'отчёт' : it.kind}{it.insight_kind ? `/${it.insight_kind}` : ''}</span>
+                  <span class="ekind">{it.kind === 'report' ? 'отчёт' : it.kind === 'idea' ? 'идея' : it.kind}{it.insight_kind ? `/${it.insight_kind}` : ''}</span>
                   <span class="space">{it.space?.name ?? '?'}</span>
                   <span class="etitle">{it.title ?? ''}</span>
                   {#if it.status}<span class="estatus">{STATUS_TEXT[it.status] ?? it.status}</span>{/if}

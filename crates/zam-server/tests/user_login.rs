@@ -1185,6 +1185,86 @@ async fn user_hook_settings_rest() {
     );
 }
 
+/// M5.7 §8: `ideas.proactive` — по умолчанию включено, правка сессией и администратором,
+/// токену 403, неизвестное поле `ideas` — 400, аудит изменения; хуки не трогаются.
+#[tokio::test]
+async fn user_ideas_settings_rest() {
+    let a = api("ul-settings-ideas", |_| {}).await;
+    let (uid, tok, w) = ready_user(&a, "Ида", "10.1.9.3").await;
+    let r = web(&a, &w, Method::GET, "/api/v1/auth/settings", None).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["ideas"], json!({"proactive": true}));
+    let hooks_before = r.json()["hooks"].clone();
+    let r = web(
+        &a,
+        &w,
+        Method::PATCH,
+        "/api/v1/auth/settings",
+        Some(json!({"ideas": {"proactive": false}})),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["ideas"]["proactive"], false);
+    assert_eq!(r.json()["hooks"], hooks_before, "хуки не меняются");
+    let r = web(&a, &w, Method::GET, "/api/v1/auth/settings", None).await;
+    assert_eq!(r.json()["ideas"]["proactive"], false);
+    let r = a
+        .adm(
+            Method::GET,
+            &format!("/api/v1/admin/users/{uid}/settings"),
+            None,
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["ideas"]["proactive"], false);
+    // токен свои подсказки не выключает
+    for (m, body) in [
+        (Method::GET, None),
+        (Method::PATCH, Some(json!({"ideas": {"proactive": true}}))),
+    ] {
+        let r = a.tok(&tok, m, "/api/v1/auth/settings", body).await;
+        ok(&r, StatusCode::FORBIDDEN);
+    }
+    for bad in [
+        json!({"ideas": {"digest": false}}),
+        json!({"ideas": {"proactive": "no"}}),
+        json!({"ideas": {}}),
+        json!({"ideas": true}),
+        json!({"ideas": {"proactive": null}}),
+    ] {
+        let r = web(&a, &w, Method::PATCH, "/api/v1/auth/settings", Some(bad)).await;
+        ok(&r, StatusCode::BAD_REQUEST);
+    }
+    // повтор того же значения — без записи и аудита
+    let r = web(
+        &a,
+        &w,
+        Method::PATCH,
+        "/api/v1/auth/settings",
+        Some(json!({"ideas": {"proactive": false}})),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let rows: Vec<_> = audit(&a)
+        .await
+        .into_iter()
+        .filter(|r| r.action == "user.settings.update")
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].actor, "user");
+    assert_eq!(rows[0].target.as_deref(), Some(uid.as_str()));
+    assert_eq!(
+        rows[0].details,
+        json!({"key": "ideas.proactive", "from": true, "to": false})
+    );
+    assert!(
+        !zam_server::api::user_settings::ideas_proactive(&a.st.system, uid.parse().unwrap())
+            .await
+            .unwrap()
+    );
+}
+
 /// M4.5 §9.6: ключи `subagent_start`, `file_context`, `session_journal`, `recovery` — без строки
 /// включены, правка принимается и приходит в `/recall(session_start)`; неизвестный ключ — 400.
 #[tokio::test]

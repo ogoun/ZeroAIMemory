@@ -97,6 +97,8 @@ pub async fn compare(
                 limit: 1,
                 with_reports: false,
                 deleted_only: false,
+                origin: None,
+                priority: None,
             };
             list_entries(&sc.db, f).await?.0.into_iter().next()
         }
