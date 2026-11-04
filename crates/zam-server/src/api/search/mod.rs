@@ -599,6 +599,7 @@ fn target_filter(
             })
             .transpose()?,
         insight_kinds,
+        entry_ids: Vec::new(),
     })
 }
 

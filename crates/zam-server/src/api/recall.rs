@@ -889,9 +889,8 @@ async fn digest_ideas(
 /// меньше `ideas.prompt_max` кандидатов, не показанных сессии. У каждого прохода свой срок:
 /// просрочка второго не гасит первый.
 ///
-/// Срок — остаток общего минус [`ideas_reserve`]: не уложился — тишина по идеям без
-/// предупреждений (ни `recall timeout`, ни ошибок поиска идей), а упаковке и учёту остаётся
-/// запас.
+/// Срок — остаток общего (до общего срока сбора минус `ACCOUNTING_RESERVE_MS`): не уложился —
+/// тишина по идеям без предупреждений (ни `recall timeout`, ни ошибок поиска идей).
 async fn prompt_ideas(
     st: &AppState,
     p: &Principal,
@@ -915,10 +914,7 @@ async fn prompt_ideas(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let at = deadline
-        .at
-        .checked_sub(ideas_reserve(st.cfg.recall.timeout_ms))
-        .unwrap_or(deadline.at);
+    let at = deadline.at;
     let mut own = Deadline {
         at,
         expired: deadline.expired,
@@ -930,10 +926,13 @@ async fn prompt_ideas(
         return Ok(Vec::new());
     }
     let mut first = r?;
-    // (а) первый проход уже дал предел непоказанных — второй не нужен
+    // (а) первый проход уже дал предел непоказанных — второй не нужен; срок вышел на чтении
+    // показанного — первый отдаётся без второго прохода
     let fresh = {
         let refs: Vec<&Cand> = first.iter().collect();
-        let seen = shown(session, health.targets(), &refs).await;
+        let Some(seen) = own.step(shown(session, health.targets(), &refs)).await else {
+            return Ok(first);
+        };
         first
             .iter()
             .filter(|c| !seen.contains(&seen_key(health.targets(), c)))
@@ -962,17 +961,21 @@ async fn prompt_ideas(
     Ok(first)
 }
 
-/// Запас срока подсказок-идей перед общим сроком сбора: `max(ACCOUNTING_RESERVE_MS,
-/// recall.timeout_ms / 10)`, не больше половины срока. Идеи — последний шаг сбора `prompt`:
-/// их тишина по сроку не должна съедать время упаковки и учёта (иначе под нагрузкой —
-/// `recall timeout` у ответа без идей).
-fn ideas_reserve(timeout_ms: u64) -> Duration {
-    Duration::from_millis(
-        ACCOUNTING_RESERVE_MS
-            .max(timeout_ms / 10)
-            .min(timeout_ms / 2),
-    )
+/// Тестовая «медленная идея» (фича `test-hooks`): шаг сбора идей «не уложился в срок» `d`.
+/// Сон кончается раньше `d.at` на [`TEST_SLOW_MARGIN`] (не больше половины остатка), после чего
+/// срок считается вышедшим: тишина по идеям проверяется так же строго, а упаковке и учёту
+/// остаётся запас под нагрузкой (иначе ответ упирался бы в `ACCOUNTING_RESERVE_MS`).
+#[cfg(feature = "test-hooks")]
+async fn test_slow_idea(d: &mut Deadline) {
+    let left = d.at.saturating_duration_since(Instant::now());
+    let until = d.at - TEST_SLOW_MARGIN.min(left / 2);
+    tokio::time::sleep_until(until).await;
+    d.expired = true;
 }
+
+/// Запас тестовой «медленной идеи» до срока ([`test_slow_idea`]).
+#[cfg(feature = "test-hooks")]
+const TEST_SLOW_MARGIN: Duration = Duration::from_millis(300);
 
 /// Идея подсказки: (цель, идея, общая из Knowledge, пометка «задача снята»).
 type FoundIdea = (usize, Entry, bool, Option<&'static str>);
@@ -1000,14 +1003,8 @@ async fn collect_prompt_ideas(
         .iter()
         .any(|(_, e, _, _)| e.title.contains(TEST_SLOW_IDEA_MARK))
     {
-        // заведомо дольше срока: `timeout_at` сначала опрашивает сам шаг, и короткий сон,
-        // истёкший вместе со сроком (поток разбужен поздно под нагрузкой), прошёл бы как успех
-        if d.step(tokio::time::sleep(Duration::from_secs(3600)))
-            .await
-            .is_none()
-        {
-            return Ok(Vec::new());
-        }
+        test_slow_idea(d).await;
+        return Ok(Vec::new());
     }
     let shared: Vec<&Entry> = found.iter().filter(|f| f.2).map(|f| &f.1).collect();
     let related = if shared.is_empty() {
@@ -1117,6 +1114,8 @@ async fn released_prompt_ideas(
                 decided_by: None,
                 file: None,
                 insight_kinds: Vec::new(),
+                // только выборка: принятые идеи с живой задачей не занимают места канала bm25
+                entry_ids: ids.iter().copied().collect(),
             },
         };
         let Some(r) = d.step(search_fts_channels(&t.db, q)).await else {
@@ -1184,10 +1183,8 @@ async fn released_prompt_ideas(
     if found
         .iter()
         .any(|(_, e, _, _)| e.title.contains(TEST_SLOW_IDEA_MARK))
-        && d.step(tokio::time::sleep(Duration::from_secs(3600)))
-            .await
-            .is_none()
     {
+        test_slow_idea(d).await;
         return Vec::new();
     }
     let shared: Vec<&Entry> = found.iter().filter(|f| f.2).map(|f| &f.1).collect();
@@ -2654,6 +2651,7 @@ async fn error_hints(
                     decided_by: None,
                     file: None,
                     insight_kinds: Vec::new(),
+                    entry_ids: Vec::new(),
                 },
             };
             let Some(r) = deadline.step(search_fts_channels(&t.db, q)).await else {

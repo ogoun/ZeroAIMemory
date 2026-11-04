@@ -2494,3 +2494,32 @@ async fn propose_with_open_reopen_question_but_live_task() {
     assert_eq!(idea.status, Some(EntryStatus::Accepted));
     assert_eq!(data_of(&idea).question_id, None);
 }
+
+/// Ревью задачи 7 (М3): фильтр `TargetFilter.entry_ids` — FTS только среди этих записей
+/// (второй проход подсказки-идей); заметки при непустом списке не проходят.
+#[tokio::test]
+async fn fts_entry_ids_filter() {
+    use zam_store::search::{FtsQuery, TargetFilter, search_fts_channels};
+    let (db, sol, _) = setup("fts-entry-ids").await;
+    let a = new_idea(&db, sol, "Экспорт отчётов в PDF", "human", "normal").await;
+    let b = new_idea(&db, sol, "Экспорт отчётов в PDF архивом", "human", "normal").await;
+    let q = |ids: Vec<Id>| FtsQuery {
+        alias_groups: Vec::new(),
+        text: "экспорт отчётов".into(),
+        space_ids: vec![sol],
+        path_prefix: None,
+        top_k: 100,
+        targets: TargetFilter {
+            kinds: vec!["idea".into()],
+            entry_ids: ids,
+            ..TargetFilter::default()
+        },
+    };
+    let found = |ch: zam_store::search::FtsChannels| -> HashSet<Id> {
+        ch.bm25.iter().map(|h| h.target.id).collect()
+    };
+    let all = found(search_fts_channels(&db, q(Vec::new())).await.unwrap());
+    assert!(all.contains(&a.id) && all.contains(&b.id), "{all:?}");
+    let only = found(search_fts_channels(&db, q(vec![b.id])).await.unwrap());
+    assert_eq!(only, [b.id].into_iter().collect::<HashSet<_>>());
+}

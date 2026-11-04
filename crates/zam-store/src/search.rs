@@ -110,6 +110,9 @@ pub struct TargetFilter {
     /// Виды insight (`filters.insight_kinds`, §9.1): insight проходят, только если `data.kind`
     /// из списка; записи других видов и заметки фильтр не трогает. Пусто — любые.
     pub insight_kinds: Vec<String>,
+    /// Только записи с этими id (второй проход подсказки-идей, ревью задачи 7 M5.7); заметки и
+    /// вложения при непустом списке не проходят. Пусто — без фильтра. В REST-поиск не выводится.
+    pub entry_ids: Vec<Id>,
 }
 
 /// Виды записей журналов в поиске по умолчанию (с M4.5 — `term`, `task`, `question`).
@@ -149,6 +152,8 @@ struct TargetArgs {
     file: Option<String>,
     /// JSON-массив видов insight или `None` (любые).
     insight_kinds: Option<String>,
+    /// JSON-массив id записей или `None` (любые).
+    entry_ids: Option<String>,
 }
 
 impl TargetFilter {
@@ -176,6 +181,10 @@ impl TargetFilter {
             file: self.file.clone(),
             insight_kinds: (!self.insight_kinds.is_empty())
                 .then(|| serde_json::Value::from(self.insight_kinds.clone()).to_string()),
+            entry_ids: (!self.entry_ids.is_empty()).then(|| {
+                let ids: Vec<String> = self.entry_ids.iter().map(Id::to_string).collect();
+                serde_json::Value::from(ids).to_string()
+            }),
         }
     }
 }
@@ -574,8 +583,10 @@ fn scope_sql(n_spaces: usize) -> String {
     let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
     let (cert, by, file, ik) = (7 + n_spaces, 8 + n_spaces, 9 + n_spaces, 10 + n_spaces);
     let att = 11 + n_spaces;
+    let eid = 12 + n_spaces;
     format!(
         "((c.node_id IS NOT NULL AND c.attachment_id IS NULL AND ?{notes} AND ?{by} IS NULL
+           AND ?{eid} IS NULL
            AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
            AND (?2 IS NULL OR n.path = ?2 OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')
@@ -583,7 +594,7 @@ fn scope_sql(n_spaces: usize) -> String {
            AND (?{cert} IS NULL OR n.certainty IN (SELECT value FROM json_each(?{cert})))
            AND (?{file} IS NULL OR EXISTS (SELECT 1 FROM file_refs fr WHERE fr.owner_kind = 'node'
                 AND fr.owner_id = n.id AND fr.path = ?{file})))
-          OR (c.attachment_id IS NOT NULL AND ?{att} AND ?{by} IS NULL
+          OR (c.attachment_id IS NOT NULL AND ?{att} AND ?{by} IS NULL AND ?{eid} IS NULL
            AND ad.deleted_at IS NULL AND ad.node_id = c.node_id
            AND n.deleted_at IS NULL
            AND n.space_id IN ({sp})
@@ -595,6 +606,7 @@ fn scope_sql(n_spaces: usize) -> String {
           OR (c.entry_id IS NOT NULL AND ?2 IS NULL AND e.deleted_at IS NULL
            AND e.space_id IN ({sp})
            AND e.kind IN (SELECT value FROM json_each(?{kinds}))
+           AND (?{eid} IS NULL OR e.id IN (SELECT value FROM json_each(?{eid})))
            AND (e.status IS NULL OR ?{statuses} IS NULL
                 OR e.status IN (SELECT value FROM json_each(?{statuses})))
            AND (?{area} IS NULL OR e.area = ?{area})
@@ -633,6 +645,7 @@ fn scope_args<'a>(
     args.push(&t.file);
     args.push(&t.insight_kinds);
     args.push(&t.attachments);
+    args.push(&t.entry_ids);
     args
 }
 
