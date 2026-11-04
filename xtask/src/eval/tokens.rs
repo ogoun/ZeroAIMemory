@@ -27,9 +27,12 @@ use serde_json::{Value, json};
 use super::corpus::{Corpus, EVAL_SOLUTION, INSIGHT_REF, fnv1a};
 use super::hints::refs_in_text;
 use super::metrics::{Estimate, estimate, ratio_estimate};
+use super::nuggets::Nugget;
 use super::run::{self, RunSpec, Session};
 use super::{Device, EvalArgs, Mode, Paths};
 use crate::smoke::api_text;
+
+pub mod mcp;
 
 /// Не меньше стольких сценариев.
 pub const MIN_SCENARIOS: usize = 15;
@@ -49,9 +52,30 @@ const SESSION_HEADER: &str = "X-Zam-Session";
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
     pub id: String,
+    /// Вид сценария (M6: длинные заметки, insight, вложения, много источников, один источник) —
+    /// слой разбиения dev/holdout; без поля — [`DEFAULT_KIND`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub question: String,
     /// Пути заметок корпуса или `insight:<key>`.
     pub expect: Vec<String>,
+    /// Нагеты M6 (спецификация M6 §3.2; разметка — задача 1b).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nuggets: Vec<Nugget>,
+}
+
+/// Вид сценария без поля `kind`.
+pub const DEFAULT_KIND: &str = "general";
+
+impl Scenario {
+    pub fn kind(&self) -> &str {
+        self.kind.as_deref().unwrap_or(DEFAULT_KIND)
+    }
+
+    /// Нагеты источника.
+    pub fn nuggets_of<'a>(&'a self, source: &'a str) -> impl Iterator<Item = &'a Nugget> + 'a {
+        self.nuggets.iter().filter(move |n| n.source == source)
+    }
 }
 
 #[derive(Deserialize)]
@@ -69,9 +93,15 @@ pub fn load_scenarios(path: &Path) -> Result<(Vec<Scenario>, String)> {
     Ok((f.scenario, fnv1a(text.into_bytes())))
 }
 
-/// Проверка: объём, уникальные id, ожидаемые источники существуют (заметка корпуса с
-/// индексацией или действующий insight).
+/// Проверка полного набора: не меньше [`MIN_SCENARIOS`] сценариев, см.
+/// [`validate_scenarios_with`].
 pub fn validate_scenarios(sc: &[Scenario], corpus: &Corpus) -> Result<()> {
+    validate_scenarios_with(sc, corpus, MIN_SCENARIOS)
+}
+
+/// Проверка: объём (не меньше `min`), уникальные id, ожидаемые источники существуют (заметка
+/// корпуса с индексацией или действующий insight).
+pub fn validate_scenarios_with(sc: &[Scenario], corpus: &Corpus, min: usize) -> Result<()> {
     let mut errs = Vec::new();
     let mut ids = BTreeSet::new();
     for s in sc {
@@ -94,8 +124,8 @@ pub fn validate_scenarios(sc: &[Scenario], corpus: &Corpus) -> Result<()> {
             }
         }
     }
-    if sc.len() < MIN_SCENARIOS {
-        errs.push(format!("сценариев {} < {MIN_SCENARIOS}", sc.len()));
+    if sc.len() < min {
+        errs.push(format!("сценариев {} < {min}", sc.len()));
     }
     if !errs.is_empty() {
         bail!("сценарии расхода токенов:\n  {}", errs.join("\n  "));
@@ -104,17 +134,21 @@ pub fn validate_scenarios(sc: &[Scenario], corpus: &Corpus) -> Result<()> {
 }
 
 /// Вызов пути: что вызвано и сколько токенов в ответе.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub call: String,
     pub tokens: usize,
     /// Служебная строка `~N tok` ответа (оценка сервера), если есть.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_estimate: Option<usize>,
+    /// Ответ целиком (замер M6: отчёт хранит то, что видел агент).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// Один путь сценария.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PathRun {
     pub steps: Vec<Step>,
     pub tokens: usize,
@@ -125,12 +159,27 @@ pub struct PathRun {
 
 impl PathRun {
     fn push(&mut self, call: &str, text: &str, counter: &Counter) {
+        self.push_step(call, text, counter, false);
+    }
+
+    /// Вызов пути; `keep` — сохранить ответ целиком ([`Step::text`]).
+    pub fn push_step(&mut self, call: &str, text: &str, counter: &Counter, keep: bool) {
         self.steps.push(Step {
             call: call.into(),
             tokens: counter.count(text),
             server_estimate: tok_line(text),
+            text: keep.then(|| text.to_string()),
         });
         self.tokens = scenario_tokens_sum(&self.steps);
+    }
+
+    /// Все ответы пути одним текстом (для поиска нагетов).
+    pub fn delivered(&self) -> String {
+        self.steps
+            .iter()
+            .filter_map(|s| s.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -249,7 +298,7 @@ pub fn summarize(runs: &[ScenarioRun]) -> TokenSummary {
 }
 
 /// Последняя строка `~N tok` ответа.
-fn tok_line(text: &str) -> Option<usize> {
+pub(super) fn tok_line(text: &str) -> Option<usize> {
     text.lines().rev().find_map(|l| {
         l.trim()
             .strip_prefix('~')?
@@ -316,7 +365,7 @@ impl Client<'_> {
 
 /// Ссылки ответа md → ссылки набора: путь заметки, `insight:<key>`; второе — исходные
 /// `n:<id>` / `i:<id>` по порядку.
-fn mapped_refs(s: &Session, text: &str) -> Vec<(String, String)> {
+pub(super) fn mapped_refs(s: &Session, text: &str) -> Vec<(String, String)> {
     refs_in_text(text)
         .into_iter()
         .filter_map(|(k, id)| {
@@ -332,7 +381,7 @@ fn mapped_refs(s: &Session, text: &str) -> Vec<(String, String)> {
 }
 
 /// Выжимка «агента»: начало прочитанного текста без заголовков элементов и служебной строки.
-fn summary_of(question: &str, read_md: &str) -> String {
+pub(super) fn summary_of(question: &str, read_md: &str) -> String {
     let body: String = read_md
         .lines()
         .filter(|l| !l.starts_with("### ") && tok_line(l).is_none())
@@ -449,6 +498,105 @@ fn run_scenario(s: &Session, c: &Client, counter: &Counter, sc: &Scenario) -> Re
         cached,
         naive,
     })
+}
+
+/// Пометка явного фокуса (M6 §6): `[пропущено: <путь заголовков> · ~N t]`.
+const SKIPPED_OPEN: &str = "[пропущено: ";
+
+/// Элемент ответа `memory_read` в Markdown: ссылка цели и текст (заголовок `### <ref> …` и всё
+/// до следующего заголовка элемента).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadElement {
+    pub raw: String,
+    pub text: String,
+}
+
+/// Строка — заголовок элемента одной из `raws` (`### n:<id> …`)?
+fn element_head<'a>(line: &str, raws: &'a [String]) -> Option<&'a String> {
+    let rest = line.strip_prefix("### ")?;
+    raws.iter().find(|r| {
+        rest.strip_prefix(r.as_str())
+            .is_some_and(|t| t.is_empty() || t.starts_with(' '))
+    })
+}
+
+/// Разбор ответа `memory_read` (md) на элементы запрошенных целей `raws` (строки до первого
+/// заголовка элемента — не элемент). Заголовки внутри текста заметки не начинаются со ссылки и
+/// элемент не разрывают.
+pub fn read_elements(md: &str, raws: &[String]) -> Vec<ReadElement> {
+    let mut out: Vec<ReadElement> = Vec::new();
+    for line in md.lines() {
+        if let Some(r) = element_head(line, raws) {
+            out.push(ReadElement {
+                raw: r.clone(),
+                text: String::new(),
+            });
+        }
+        if let Some(e) = out.last_mut() {
+            e.text.push_str(line);
+            e.text.push('\n');
+        }
+    }
+    out
+}
+
+/// Что дочитать по пометке пропуска элемента (спецификация M6 §3.4, п. 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reread {
+    /// Названные пометками `[пропущено: …]` секции.
+    Sections(Vec<String>),
+    /// L2 источника целиком (обрезка `…ещё N токенов` или `(budget)`).
+    Whole,
+}
+
+/// `…ещё N токенов` — пометка обрезки элемента `/read`.
+fn is_cut_marker(line: &str) -> bool {
+    line.trim()
+        .strip_prefix("…ещё ")
+        .and_then(|r| r.strip_suffix(" токенов"))
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Пути секций пометок `[пропущено: <путь> · ~N t]` в тексте.
+fn skipped_sections(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(SKIPPED_OPEN) {
+        let after = &rest[i + SKIPPED_OPEN.len()..];
+        let Some(end) = after.find(']') else {
+            break;
+        };
+        let inner = &after[..end];
+        let path = inner.rsplit_once(" · ~").map_or(inner, |(p, _)| p).trim();
+        if !path.is_empty() && !out.iter().any(|p| p == path) {
+            out.push(path.to_string());
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+/// Пометка пропуска в элементе: секции явного фокуса важнее обрезки; пометок нет — `None`.
+pub fn reread_need(element_text: &str) -> Option<Reread> {
+    let sections = skipped_sections(element_text);
+    if !sections.is_empty() {
+        return Some(Reread::Sections(sections));
+    }
+    element_text
+        .lines()
+        .any(|l| l.trim() == "(budget)" || is_cut_marker(l))
+        .then_some(Reread::Whole)
+}
+
+/// Цели дочитывания одного источника: секции из пометки или L2 целиком (`tier` по умолчанию).
+pub fn reread_items(raw: &str, need: &Reread) -> Vec<Value> {
+    match need {
+        Reread::Sections(s) => s
+            .iter()
+            .map(|p| json!({ "id": raw, "section": p }))
+            .collect(),
+        Reread::Whole => vec![json!({ "id": raw })],
+    }
 }
 
 /// Сведения о прогоне.
@@ -648,6 +796,7 @@ mod tests {
             call: "x".into(),
             tokens: t,
             server_estimate: None,
+            text: None,
         }
     }
 
@@ -709,6 +858,47 @@ mod tests {
         let ci = u.protocol_to_naive_ci.unwrap();
         assert!((ci.mean - 1540.0 / 7700.0).abs() < 1e-12 && ci.lo <= ci.mean && ci.mean <= ci.hi);
         assert!((u.protocol.tokens_mean.unwrap().mean - 770.0).abs() < 1e-12);
+    }
+
+    /// Элементы `memory_read` разбираются по заголовкам запрошенных целей; заголовок внутри
+    /// текста заметки элемент не рвёт.
+    #[test]
+    fn read_elements_split_by_requested_refs() {
+        let a = format!("n:{}", "A".repeat(26));
+        let b = format!("n:{}", "B".repeat(26));
+        let md = format!(
+            "### {a} knowledge/x  rev1 · ~900 tok\nначало\n### Раздел заметки\nтекст\n…ещё 500 токенов\n\n\
+             ### {b} knowledge/y  rev2 · ~300 tok\n(budget)\n\n~1200 tok\n"
+        );
+        let raws = vec![a.clone(), b.clone()];
+        let el = read_elements(&md, &raws);
+        assert_eq!(el.len(), 2);
+        assert_eq!(el[0].raw, a);
+        assert!(el[0].text.contains("### Раздел заметки") && el[0].text.contains("…ещё 500"));
+        assert_eq!(reread_need(&el[0].text), Some(Reread::Whole));
+        assert_eq!(reread_need(&el[1].text), Some(Reread::Whole));
+        assert_eq!(reread_need("### n:x\nполный текст\n"), None);
+        // «ещё» в тексте заметки — не пометка
+        assert_eq!(reread_need("осталось …ещё много токенов\n"), None);
+    }
+
+    /// Пометки явного фокуса называют секции: дочитываются они, а не L2 целиком.
+    #[test]
+    fn reread_prefers_named_sections() {
+        let t = "### n:x a\nлист\n[пропущено: Установка › Linux · ~420 t]\n[пропущено: FAQ · ~80 t]\n…ещё 10 токенов\n";
+        let need = reread_need(t).unwrap();
+        assert_eq!(
+            need,
+            Reread::Sections(vec!["Установка › Linux".into(), "FAQ".into()])
+        );
+        assert_eq!(
+            reread_items("n:x", &need),
+            [
+                json!({"id": "n:x", "section": "Установка › Linux"}),
+                json!({"id": "n:x", "section": "FAQ"})
+            ]
+        );
+        assert_eq!(reread_items("n:x", &Reread::Whole), [json!({"id": "n:x"})]);
     }
 
     #[test]

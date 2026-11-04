@@ -560,9 +560,102 @@ pub fn grid_md(g: &GridResult) -> String {
     s
 }
 
+/// Точка сетки замера M6 (`eval --tokens --via mcp --grid <файл>`, спецификация M6 §3.5):
+/// `[[point]] name = "…"; env = { ZAM_SEARCH__BUDGET_TOKENS = "600", … }`. Первая точка —
+/// база сравнения точек. Переопределения отбираются по версии сервера
+/// ([`crate::eval::caps::filter_overrides`]).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Point {
+    pub name: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PointFile {
+    #[serde(default)]
+    point: Vec<Point>,
+}
+
+/// Сетка подбирается только на dev: приёмка (holdout) — одна конфигурация, выбранная до неё
+/// (спецификация M6 §3.5, I1).
+pub fn refuse_holdout(grid: Option<&Path>, part: Option<crate::eval::split::Part>) -> Result<()> {
+    if let (Some(g), Some(crate::eval::split::Part::Holdout)) = (grid, part) {
+        bail!(
+            "сетка {} подбирается только на dev (--split dev); --split holdout — приёмка \
+             выбранных значений, без сетки (спецификация M6 §3.5)",
+            g.display()
+        );
+    }
+    Ok(())
+}
+
+/// Точки сетки M6: непустой список, имена уникальны (в имени файла результата — буквы, цифры,
+/// `-`, `_`, `.`), ключи — `ZAM_<РАЗДЕЛ>__<КЛЮЧ>`, не больше [`MAX_CONFIGS`].
+pub fn load_points(path: &Path) -> Result<Vec<Point>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("чтение сетки {}", path.display()))?;
+    let f: PointFile =
+        toml::from_str(&text).with_context(|| format!("разбор сетки {}", path.display()))?;
+    let mut errs = Vec::new();
+    if f.point.is_empty() {
+        errs.push("нет ни одной [[point]]".to_string());
+    }
+    if f.point.len() > MAX_CONFIGS {
+        errs.push(format!("точек {} > {MAX_CONFIGS}", f.point.len()));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for p in &f.point {
+        let ok_name = !p.name.is_empty()
+            && p.name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if !ok_name {
+            errs.push(format!("имя точки «{}»: буквы, цифры, -, _, .", p.name));
+        }
+        if !names.insert(p.name.as_str()) {
+            errs.push(format!("точка {} повторяется", p.name));
+        }
+        for k in p.env.keys() {
+            if crate::eval::caps::env_to_key(k).is_none() {
+                errs.push(format!("{}: {k} — ожидается ZAM_<РАЗДЕЛ>__<КЛЮЧ>", p.name));
+            }
+        }
+    }
+    if !errs.is_empty() {
+        bail!("сетка {}:\n  {}", path.display(), errs.join("\n  "));
+    }
+    Ok(f.point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn points_file_format() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-tmp/xtask/grid-points");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("g.toml");
+        std::fs::write(
+            &f,
+            "[[point]]\nname = \"base\"\n\n[[point]]\nname = \"b600\"\nenv = { ZAM_SEARCH__BUDGET_TOKENS = \"600\" }\n",
+        )
+        .unwrap();
+        let p = load_points(&f).unwrap();
+        assert_eq!(p.len(), 2);
+        assert!(p[0].env.is_empty());
+        assert_eq!(p[1].env["ZAM_SEARCH__BUDGET_TOKENS"], "600");
+        std::fs::write(&f, "[[point]]\nname = \"x y\"\nenv = { SEARCH = \"1\" }\n").unwrap();
+        let e = load_points(&f).unwrap_err().to_string();
+        assert!(e.contains("x y") && e.contains("SEARCH"), "{e}");
+        use crate::eval::split::Part;
+        assert!(refuse_holdout(Some(&f), Some(Part::Holdout)).is_err());
+        assert!(refuse_holdout(Some(&f), Some(Part::Dev)).is_ok());
+        assert!(refuse_holdout(None, Some(Part::Holdout)).is_ok());
+    }
 
     #[test]
     fn intro_evidence_is_colon_phrase_and_block_start() {

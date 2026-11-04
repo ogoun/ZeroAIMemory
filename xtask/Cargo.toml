@@ -37,6 +37,9 @@ tokenizers.workspace = true
 sha2.workspace = true
 zam-docs = { path = "../crates/zam-docs", features = ["pdfium"] }
 zstd.workspace = true
+# M6 (задача 1a1): разбиение dev/holdout по blake3(соль ‖ id) и отпечатки набора ТС-1; крейт
+# уже в workspace (zam-cli; CC0-1.0 OR Apache-2.0)
+blake3.workspace = true
 # A/B PDF (задача 10 M5): чисто-Rust `pdf_oxide` против pdfium — только в xtask и только за фичей
 # `pdf-oxide` (`cargo run -p xtask --release --features pdf-oxide -- eval --docs --pdf-backend
 # pdf_oxide`): обычная сборка xtask и бинарники продукта его не компилируют; в общем

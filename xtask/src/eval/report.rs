@@ -360,3 +360,174 @@ pub fn write_pair<T: Serialize>(
     fs::write(&mdp, md)?;
     Ok((json, mdp))
 }
+
+/// Markdown плеча замера M6 (`eval --tokens --via mcp`, спецификация M6 §3.6).
+pub fn tokens_m6_md(r: &super::tokens::mcp::McpResult) -> String {
+    let i = &r.info;
+    let u = &r.summary;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "# Замер токенов M6 (ТС-1, MCP): {} {} — {}{} ({})\n",
+        i.model.as_deref().unwrap_or("fts"),
+        i.device.as_deref().unwrap_or("—"),
+        i.split,
+        i.point
+            .as_deref()
+            .map_or(String::new(), |p| format!(", точка {p}")),
+        i.date
+    );
+    let _ = writeln!(
+        s,
+        "Коммит `{}`, сервер {}{} (git `{}`); отпечатки: корпус `{}`, нагеты `{}`{}; чтение — \
+         бюджет {}; токены — {}.\n",
+        i.git,
+        i.server_version,
+        if i.server_next {
+            " (сборка M6)"
+        } else {
+            ""
+        },
+        i.server_git.as_deref().unwrap_or("—"),
+        i.corpus_fingerprint,
+        i.nuggets_fingerprint,
+        if i.frozen {
+            " (заморожены)"
+        } else {
+            " (замка нет)"
+        },
+        i.read_budget,
+        i.counter
+    );
+    if !i.overrides.is_empty() || !i.overrides_dropped.is_empty() {
+        let kept: Vec<String> = i
+            .overrides
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        let _ = writeln!(
+            s,
+            "Переопределения: {}; отброшены (нет в версии сервера): {}.\n",
+            if kept.is_empty() {
+                "—".into()
+            } else {
+                kept.join(", ")
+            },
+            if i.overrides_dropped.is_empty() {
+                "—".into()
+            } else {
+                i.overrides_dropped.join(", ")
+            }
+        );
+    }
+    if !i.excluded.is_empty() {
+        let _ = writeln!(s, "Исключено из всех плеч: {}.\n", i.excluded.join("; "));
+    }
+    let _ = writeln!(
+        s,
+        "| Путь | токенов всего | в среднем на сценарий | микро-полнота | полных |\n|---|---:|---|---:|---:|"
+    );
+    let mean = |e: &Option<Estimate>| {
+        e.as_ref().map_or("—".into(), |e| {
+            format!("{:.0} [{:.0}–{:.0}]", e.mean, e.lo, e.hi)
+        })
+    };
+    for (name, p) in [
+        (
+            "(а) протокол: brief → read → дочитывание → cache put",
+            &u.protocol,
+        ),
+        ("справочно: карточки 1–3 без оракула", &u.reference),
+        ("(в) наивный: chunks, бюджет 4000", &u.naive),
+    ] {
+        let _ = writeln!(
+            s,
+            "| {name} | {} | {} | {:.3} | {} из {} |",
+            p.tokens_total,
+            mean(&p.tokens_mean),
+            p.micro_recall,
+            p.full,
+            u.scenarios
+        );
+    }
+    let _ = writeln!(
+        s,
+        "| (б) повтор: кэш | {} | — | — | {} из {} |",
+        u.cached.tokens_total, u.cached.full, u.scenarios
+    );
+    let _ = writeln!(
+        s,
+        "\nСценариев {}, нагетов {}; (а) / (в): {}; выжимки агента (вывод, не ответ сервера): {} \
+         токенов.\n",
+        u.scenarios,
+        u.nuggets_total,
+        u.protocol_to_naive.as_ref().map_or("—".into(), est),
+        u.summary_tokens_total
+    );
+    let _ = writeln!(
+        s,
+        "| id | вид | (а) токены | нагеты | дочитано | справочно | (в) | примечание |\n|---|---|---:|---|---|---:|---:|---|"
+    );
+    for x in &r.scenarios {
+        let note: Vec<&str> = [&x.protocol.note, &x.cached.note]
+            .into_iter()
+            .filter(|n| !n.is_empty())
+            .map(String::as_str)
+            .collect();
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {}/{} | {} | {} | {} | {} |",
+            x.id,
+            x.kind,
+            x.protocol.tokens,
+            x.protocol.found,
+            x.nuggets_total,
+            x.protocol.reread.len(),
+            x.reference.tokens,
+            x.naive.tokens,
+            note.join("; ")
+        );
+    }
+    s
+}
+
+/// Markdown сравнения плеча с базой (спецификация M6 §3.5).
+pub fn comparison_md(c: &super::tokens::mcp::Comparison) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "\n## {} против {} ({}, сценариев {})\n",
+        c.arm, c.base, c.split, c.scenarios
+    );
+    let _ = writeln!(
+        s,
+        "- R = Σ плеча / Σ базы = {} / {}: {} (95 %, парный бутстреп сценариев);",
+        c.arm_tokens,
+        c.base_tokens,
+        c.r.as_ref().map_or("—".into(), est)
+    );
+    let _ = writeln!(
+        s,
+        "- микро-полнота: база {:.3}, плечо {:.3}; Δ {} (односторонние 95 % границы; порог \
+         нижней ≥ {});",
+        c.base_micro,
+        c.arm_micro,
+        est(&c.d_micro),
+        super::tokens::mcp::MIN_D_MICRO
+    );
+    let _ = writeln!(
+        s,
+        "- чистые потери L = {} (порог ≤ {}); неинфериорность: {}.",
+        c.net_losses,
+        super::tokens::mcp::MAX_NET_LOSSES,
+        if c.noninferior { "да" } else { "нет" }
+    );
+    if !c.only_base.is_empty() || !c.only_arm.is_empty() {
+        let _ = writeln!(
+            s,
+            "- вне сравнения: только в базе {:?}, только в плече {:?}.",
+            c.only_base, c.only_arm
+        );
+    }
+    s
+}

@@ -99,7 +99,7 @@ pub fn parse_sets(raw: &[String]) -> Result<Vec<(String, String)>> {
 }
 
 /// `search.w_fts` → `ZAM_SEARCH__W_FTS`.
-fn env_key(k: &str) -> String {
+pub fn env_key(k: &str) -> String {
     format!("ZAM_{}", k.replace('.', "__").to_ascii_uppercase())
 }
 

@@ -6890,6 +6890,7 @@ name = "xtask"
 version = "0.0.10-m5.7"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "flate2",
  "half 2.7.1",

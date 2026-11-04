@@ -22,6 +22,109 @@ baton — [docs/research/2026-11-04-baton-review.md](../research/2026-11-04-bato
 
 ### Задача 1a1. Каркас замера и статистика
 
+Коммит — `feat(eval): каркас замера M6 — MCP, статистика, разбиение` (sha — в отчёте контроллеру).
+
+Сделано:
+- `xtask/src/eval/mcp_client.rs` — синхронный `McpClient` (`ureq`): `initialize`, при
+  `Mcp-Session-Id` — `notifications/initialized` и id в запросах; ответ JSON или SSE; `call` —
+  текст `result.content`, `isError` и ошибка JSON-RPC — ошибка.
+- `caps.rs` — `parse_version` (вручную), `ServerCaps` (`focus`, `ideas`, `snapshot`, `next`,
+  `keys`), таблица `KEYS` «ключ → версия появления» (сверена с `config.rs` тегов v0.0.5-m4 …
+  v0.0.10-m5.7, ключи M6 — §14), `probe` (`GET /api/v1/health`), `filter_overrides`,
+  `split_overrides` (с отброшенными для отчёта).
+- `metrics.rs` расширен: `BOOTSTRAP_M6`, `ratio_estimate_with` (прежний `ratio_estimate` — через
+  него, результат тот же), `paired_diff_weighted`, `micro_recall`, `net_losses`; `Estimate` —
+  `Deserialize`.
+- `split.rs` — `SPLIT_SALT`, `split`, `Part` (`dev`/`holdout`).
+- `nuggets.rs` — `Nugget`, проверки §3.2 (`validate`), `normalize_md`/`found`, `l0_of`,
+  `overlap`, `nuggets_fingerprint`, `corpus_fingerprint`, замок `nuggets.lock` (`check_lock`).
+- `tokens.rs` — у сценария `kind`, `nuggets`; `Step.text` (ответ целиком); политика §3.4:
+  `read_elements`, `reread_need` (`…ещё N токенов`, `(budget)`, `[пропущено: <путь> · ~N t]`),
+  `reread_items`; `READ_BUDGET` = 4000 (как было). Прогон M6 — `tokens/mcp.rs`.
+- `grid.rs` — точки `[[point]] name, env` (`load_points`), `refuse_holdout`; `report.rs` —
+  `tokens_m6_md`, `comparison_md`.
+- CLI: `eval --tokens --via mcp --split dev|holdout [--grid] [--out] [--server-bin] [--zam-bin]
+  [--compare]`, `--arm <json> --compare <json>` (сравнение без прогона), `--scenarios <файл>`,
+  `--check` печатает отпечатки и сверяет замок. `eval/README.md` — раздел «Замер токенов M6».
+
+Тесты (`cargo test -p xtask`): брифа — `ratio_identity_is_one`, `ratio_seed_reproducible`,
+`net_losses_counts_both_ways`, `split_is_third_per_kind`, `parse_version_stage`,
+`filter_overrides_drops_unknown_keys` (модульные), `grid_refuses_holdout`,
+`eval_rejects_fingerprint_mismatch`, `arms_must_share_corpus_fingerprint` (`xtask/tests/eval_cli.rs`,
+процесс xtask, падение до запуска сервера); сверх брифа — `micro_recall_and_weighted_diff`,
+`read_elements_split_by_requested_refs`, `reread_prefers_named_sections`, `points_file_format`,
+`compare_pairs_by_id`, `reread_only_for_missing_nuggets`, `reply_json_and_sse`,
+`normalize_strips_markdown_markers`, `l0_is_frontmatter_or_first_paragraph`,
+`overlap_counts_shared_stems`, `fingerprints_follow_content`. Шаг 1 (RED) — сборка тестов падала
+на отсутствующих функциях; итог — 114 + 3 зелёные; `cargo fmt --all -- --check`, `cargo clippy -p
+xtask --all-targets -- -D warnings` чисто.
+
+Прогоны:
+- `cargo xtask eval --check` — EVAL-CHECK OK; ТС-1: 20 сценариев без нагетов;
+  `nuggets_fingerprint = 6219cc9edbccddd67f43649123f4626c`, `corpus_fingerprint =
+  76fadce3f3e6447fe6714eed8e4b3712` (до 1c/1b — значения меняются, замка нет).
+- Дымовой прогон `eval --tokens --via mcp --split dev --mode fts --server-bin
+  target/r1-new/release/zam-server.exe --out .tmp/m6/task1a1/smoke-fts` (сборка ветки от 2026-11-04,
+  `0.0.10-m5.7`, git `535910eba54f` → распознана как сборка M6): dev — 13 из 20 сценариев; (а)
+  40 132 токена (3087 [2459–3684] на сценарий), полных 9 из 13; справочная политика без оракула
+  55 917; (в) наивный 40 992; (б) кэш 15 368; (а)/(в) 0,979 [0,775–1,208]; дочитываний 0 (у
+  нынешних сценариев чтение в 4000 не обрезается). Число справочное: FTS, без нагетов, до
+  пополнения набора. Заголовки элементов `memory_read` реального ответа разбираются верно.
+
+Решения исполнителя:
+- **[решение исполнителя задачи 1a1]** Сборка `0.0.10-m5.7` с `git` из `/health`, отличным от
+  коммита выпуска `91363056d3ba`, считается сборкой M6 (`ServerCaps.next`): до задачи 13c
+  версия этапа не меняется, иначе B5.7 и M6 неразличимы. Следствие для 1a2: бинарник тега из
+  `git archive` внутри рабочей копии собирать с `ZAM_GIT_SHA=<12 знаков коммита тега>` (иначе
+  `build.rs` возьмёт `git rev-parse` текущей ветки) — записано в `eval/README.md`.
+- **[решение исполнителя задачи 1a1]** Возможности узнаются отдельным коротким стартом сервера
+  без переопределений (`…-probe`, без корпуса) — до старта с ключами, которых старый сервер не
+  знает. Каждая точка сетки — на свежем каталоге (загрузка и индексация заново): выжимки кэша и
+  `session_seen` прошлой точки исказили бы путь (а).
+- **[решение исполнителя задачи 1a1]** Наивный путь (в) идёт первым в сценарии: инструмент
+  `memory_search` не передаёт `no_cache`, а после `memory_cache_put` пути (а) поиск отдал бы
+  выжимку.
+- **[решение исполнителя задачи 1a1]** Дочитывание (§3.4): только у ожидаемого источника, у
+  которого не выдан хоть один нагет (у источника без нагетов — при любой пометке); один раз на
+  источник, отдельным `memory_read` с бюджетом 4000. Пометки `[пропущено: …]` — все названные
+  секции одним вызовом; иначе L2 целиком. Пометка, оставшаяся после дочитывания, — в примечание
+  сценария. Справочная политика без оракула берёт ответ того же поиска (его токены входят в путь),
+  читает своей сессией, без `memory_cache_put`; дочитывает по тем же правилам.
+- **[решение исполнителя задачи 1a1]** `paired_diff_weighted` возвращает в `lo`/`hi`
+  **односторонние** 95 % границы (5-й и 95-й перцентили): правило §3.5 — «нижняя граница
+  одностороннего 95 % интервала Δ ≥ −0,02». `R` — двусторонний 95 % (2,5…97,5), как в §3.5.
+  Зерно — прежнее `SEED`, выборок — `BOOTSTRAP_M6`.
+- **[решение исполнителя задачи 1a1]** Проверки нагетов: набор без единого нагета (до задачи 1b)
+  проходит со сводкой; размечен хоть один сценарий — должны быть размечены все. L0 источника —
+  приближение сервера в xtask (xtask не зависит от `zam-store`): `l0`/`description` frontmatter,
+  иначе первый абзац (не заголовок, код, таблица, список, цитата), 200 символов по границе
+  слова; у insight — заголовок. Нормализация для поиска нагета — снятие отступов, `#`, `>`,
+  маркеров списков, `**`, `__`, `` ` `` и сведение пробелов.
+- **[решение исполнителя задачи 1a1]** Отпечатки — blake3, 32 знака, `\r\n` → `\n` у текстовых
+  файлов (не зависит от `core.autocrlf`). `corpus_fingerprint` берёт и `eval/insights.toml` (ТС-1
+  его грузит), `eval/docs/large/` пропускает (большие файлы `docs-corpus --large` ТС-1 не грузит).
+  Замок — `nuggets.lock` рядом с файлом сценариев (`eval/nuggets.lock`); замка нет — прогон до
+  заморозки (`frozen: false` в отчёте).
+- **[решение исполнителя задачи 1a1]** Полнота пути у сценария без нагетов — все ожидаемые
+  источники прочитаны и пометок пропуска не осталось (как «полнота (а)» M4).
+- **[решение исполнителя задачи 1a1]** CLI: `--zam-bin` — псевдоним существующего `--cli-bin`;
+  `--docs-dir` больше не требует `--docs` (нужен отпечатку корпуса); `--tokens` больше не
+  конфликтует с `--grid` на уровне clap (REST-путь M4 с `--grid` — ошибка в рантайме);
+  `--out` у `--via mcp` — каталог или префикс пути файлов; добавлены `--scenarios` (свой файл
+  сценариев: проверка фрагмента, замок рядом с ним) и `--arm` (сравнение сохранённых плеч без
+  прогона — им проверяется и запрет разных отпечатков).
+- **[решение исполнителя задачи 1a1]** Прогон M6 вынесен в подмодуль `xtask/src/eval/tokens/mcp.rs`
+  (политика §3.4 — в `tokens.rs`, как в плане): `tokens.rs` вырос бы вдвое. `main.rs` правки не
+  потребовал (аргументы `eval` — в `EvalArgs`).
+
+Не сделано в 1a1 (передать):
+- загрузка вложений `eval/docs` в прогон ТС-1 (сценарии на вложения появятся в 1c/1b): сейчас
+  `eval/docs` входит только в отпечаток корпуса — задача 1b;
+- загрузчик корпуса с учётом версии (у B4 нет `POST /edges` для `contradicts`, M4.5) и перечень
+  исключённых целей (`info.excluded` пока пуст) — задача 1a2 (пилот на тегах);
+- дочитывание на реальной пометке пропуска не проверено прогоном (в наборе нет обрезки при 4000) —
+  только модульными тестами на тексте формата `api/read.rs`.
+
 ### Задача 1c. Пополнение корпуса до заморозки
 
 ### Задача 1a2. Пилот на тегах, контроль, эталон подсказок-идей M5.7
