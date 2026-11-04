@@ -223,7 +223,7 @@
                 <button
                   type="button"
                   class:primary={o.key === recommended(q)}
-                  disabled={busy !== ''}
+                  disabled={busy !== '' || (confirmFor === q.id && o.key === 'accept')}
                   title={o.key === recommended(q) ? 'Рекомендация агента' : ''}
                   onclick={() => pick(q, o.key)}
                 >

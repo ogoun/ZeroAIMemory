@@ -7,7 +7,8 @@
 //! (`doc-worker`, `ping`), вложения PDF/DOCX/XLSX → извлечение → поиск фрагмента с `locator` →
 //! `zam read --locator` → превью листа и миниатюра PDF; для Windows — статический CRT наших exe
 //! и app-local MSVC runtime библиотек (в том числе pdfium); карта кода (M5.6): `zam code sync`
-//! проекта из трёх файлов, `/code/status`, `zam code map` и `zam code sym`.
+//! проекта из трёх файлов, `/code/status`, `zam code map` и `zam code sym`; идеи (M5.7):
+//! `zam idea new` → раздел `### Идеи` хука `session-start` → `zam idea accept` → задача.
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -918,6 +919,10 @@ pub fn run(
     s.run(
         "M5.6: проект из 3 файлов → zam code sync → /code/status files = 3 → zam code map, sym",
         code_map_check(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M5.7: zam idea new --origin human → hook session-start с w: → zam idea accept --by human          → zam task list",
+        idea_flow(&zam, &dir, &base, &token),
     )?;
     let with_log = |e: anyhow::Error, srv: &Server| {
         anyhow!(
@@ -2000,6 +2005,79 @@ fn refs_check(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
         .map(|r| r["items"][0]["state"].clone());
     if status != 200 || state != Some(Value::from("stale")) {
         bail!("GET /file-refs: HTTP {status}, ссылка src/wm.rs не stale: {idx}");
+    }
+    Ok(())
+}
+
+// ---- M5.7: идеи ----
+
+/// Заголовок идеи smoke-теста (слова не встречаются в других шагах).
+const IDEA_TITLE: &str = "Smoke: янтарный маяк для журнала идей";
+
+/// Журнал «Идеи» (M5.7 §13 п. 16): `zam idea new --origin human` (флаги явно: smoke может идти
+/// под агентом) → `zam hook session-start` новой сессии показывает раздел `### Идеи` со ссылкой
+/// `w:<id>` (до 5 попыток с новой сессией: хук укладывается в бюджет или молчит) → `zam idea
+/// accept --by human` печатает задачу `k:<id>` → `zam task list` её показывает.
+fn idea_flow(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let out = wm_zam(
+        zam,
+        dir,
+        conn,
+        &[
+            "idea",
+            "new",
+            IDEA_TITLE,
+            "--origin",
+            "human",
+            "--priority",
+            "high",
+        ],
+        None,
+        &[],
+    )?;
+    let id = printed_id(&out, "zam idea new")?;
+    let w = format!("w:{id}");
+    let (home, project) = wm_project(dir)?;
+    let mut shown = String::new();
+    for attempt in 0..5 {
+        let ev = serde_json::json!({
+            "session_id": format!("smoke-ideas-{attempt}"), "cwd": project,
+            "hook_event_name": "SessionStart", "source": "startup",
+        });
+        shown = run_hook(zam, &home, &project, conn, "session-start", &ev)?;
+        if shown.contains(&w) {
+            break;
+        }
+    }
+    if !shown.contains(&w) || !shown.contains("### Идеи") {
+        let log =
+            fs::read_to_string(project.join(".zeroaimemory/logs/hooks.log")).unwrap_or_default();
+        bail!(
+            "zam hook session-start: нет раздела «### Идеи» с {w}: {shown}
+hooks.log:
+{log}"
+        );
+    }
+    let out = wm_zam(
+        zam,
+        dir,
+        conn,
+        &["idea", "accept", &w, "--by", "human"],
+        None,
+        &[],
+    )?;
+    let task = out
+        .trim()
+        .rsplit_once("задача k:")
+        .map(|(_, t)| t.trim().to_string())
+        .with_context(|| format!("zam idea accept не напечатал задачу: {out}"))?;
+    let list = wm_zam(zam, dir, conn, &["task", "list"], None, &[])?;
+    if task.is_empty() || !list.contains(&task) || !list.contains(IDEA_TITLE) {
+        bail!(
+            "zam task list: нет задачи k:{task} из идеи {w}:
+{list}"
+        );
     }
     Ok(())
 }

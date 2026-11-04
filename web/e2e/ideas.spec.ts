@@ -473,10 +473,13 @@ test('ideas_knowledge_proposal_start_in_shared_solution_warns', async ({ page })
   await expect(confirm.getByTestId('shared-warning')).toHaveText(
     `Задача появится в решении «${IDEAS_NAME}», её увидят участники.`,
   );
+  // пока подтверждение открыто, исходная кнопка «начать» неактивна
+  await expect(q.getByRole('button', { name: 'начать', exact: true })).toBeDisabled();
   expect(answered).toBe(false);
   // отмена — без ответа
   await confirm.getByRole('button', { name: 'Отмена' }).click();
   await expect(confirm).toHaveCount(0);
+  await expect(q.getByRole('button', { name: 'начать', exact: true })).toBeEnabled();
   expect(answered).toBe(false);
   await q.getByRole('button', { name: 'начать', exact: true }).click();
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${question.id}/answer`));

@@ -100,3 +100,5 @@ zam-docs = { path = "../zam-docs", features = ["pdfium", "test-pdf", "images"] }
 tower = { workspace = true, features = ["util"] }
 # изображения-фикстуры превью (tests/previews.rs)
 image.workspace = true
+# приёмка M5.7: база 0023 и объекты схемы прямым SQL (tests/m57_acceptance.rs)
+rusqlite.workspace = true

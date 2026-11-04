@@ -1094,6 +1094,9 @@ async fn guide_has_ideas_section_and_moved_phrases() {
     assert!(section(&ru, "Запись").contains("заметке — `l0`"));
     assert!(section(&ru, "Задачи и передача работы").contains("перед работой"));
     assert!(section(&ru, "Вопросы человеку").contains("в чате"));
+    // решение человека из чата через CLI — с `--channel chat` (ревью задачи 4)
+    assert!(ideas.contains("zam idea accept|defer|decline w:<id> --by human --channel chat"));
+    assert!(section(&ru, "Вопросы человеку").contains("--by human|agent --channel chat"));
     let en = guide("?lang=en").await;
     let ideas = section(&en, "Ideas");
     for want in [
@@ -1119,6 +1122,8 @@ async fn guide_has_ideas_section_and_moved_phrases() {
     assert!(section(&en, "Writing").contains("give notes an `l0`"));
     assert!(section(&en, "Tasks and handing work over").contains("before work"));
     assert!(section(&en, "Questions for the human").contains("in chat"));
+    assert!(ideas.contains("zam idea accept|defer|decline w:<id> --by human --channel chat"));
+    assert!(section(&en, "Questions for the human").contains("--by human|agent --channel chat"));
     for lang in ["ru", "en"] {
         let j = setup(&a, &a.token, &format!("agent=claude&lang={lang}")).await;
         let block = j["block"].as_str().unwrap();
