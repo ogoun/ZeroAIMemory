@@ -50,9 +50,18 @@ impl From<QuestionError> for ApiError {
                 detail: e.to_string(),
                 extra: Map::new(),
             },
-            QuestionError::UnknownOption(_) | QuestionError::Empty | QuestionError::NotQuestion => {
-                unprocessable(e.to_string())
-            }
+            QuestionError::UnknownOption(_)
+            | QuestionError::Empty
+            | QuestionError::NotQuestion
+            | QuestionError::OptionRequired
+            | QuestionError::HorizonNotAllowed => unprocessable(e.to_string()),
+            // проблемы идей (`idea-human-decision`, `option-required`, …) — задача 2 M5.7
+            QuestionError::ByAgentOnProposal => ApiError::Denied(e.to_string()),
+            QuestionError::Idea(zam_store::IdeaError::Store(e)) => e.into(),
+            QuestionError::Idea(e) => ApiError::Conflict {
+                detail: e.to_string(),
+                extra: Map::new(),
+            },
             QuestionError::Store(e) => e.into(),
         }
     }
@@ -107,7 +116,11 @@ pub async fn answer(
         None => return Err(ApiError::ByRequired),
     };
     let attrib = attribution(&p, &headers, req.message)?;
-    let (q, d) = answer_question(
+    let zam_store::Answered {
+        question: q,
+        decision: d,
+        ..
+    } = answer_question(
         &sc.db,
         sc.entry.id,
         NewAnswer {
@@ -115,6 +128,7 @@ pub async fn answer(
             option: req.option,
             by,
             channel,
+            horizon: None,
         },
         &attrib,
     )

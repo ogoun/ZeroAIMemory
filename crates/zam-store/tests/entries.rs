@@ -834,6 +834,8 @@ async fn deleted_entry_not_in_fts_restore_returns() {
         limit: 10,
         with_reports: false,
         deleted_only: false,
+        origin: None,
+        priority: None,
     };
     assert!(list_entries(&db, feed.clone()).await.unwrap().0.is_empty());
     assert!(matches!(
@@ -907,6 +909,8 @@ async fn list_entries_cursor_and_filters() {
         limit: 3,
         with_reports: false,
         deleted_only: false,
+        origin: None,
+        priority: None,
     };
     // постранично, новые первыми, без повторов и пропусков
     let mut seen = Vec::new();
@@ -1363,7 +1367,7 @@ async fn title_duplicates_same_area_and_active_only() {
 #[test]
 fn allowed_statuses_per_kind() {
     use EntryStatus::*;
-    let table: [(EntryKind, &[EntryStatus], Option<EntryStatus>); 7] = [
+    let table: [(EntryKind, &[EntryStatus], Option<EntryStatus>); 8] = [
         (EntryKind::Changelog, &[], None),
         (EntryKind::Release, &[], None),
         (
@@ -1383,6 +1387,11 @@ fn allowed_statuses_per_kind() {
         ),
         (EntryKind::Question, &[Open, Answered, Obsolete], Some(Open)),
         (EntryKind::Report, &[], None),
+        (
+            EntryKind::Idea,
+            &[New, Proposed, Accepted, Deferred, Declined, Done],
+            Some(New),
+        ),
     ];
     assert_eq!(table.len(), EntryKind::ALL.len());
     for (kind, statuses, initial) in table {
@@ -1402,6 +1411,38 @@ fn allowed_statuses_per_kind() {
         serde_json::to_value(EntryKind::Question).unwrap(),
         json!("question")
     );
+}
+
+/// Виды записей M5.7: восемь видов, буквы ссылок уникальны и все известны разбору, `w` — идея.
+#[test]
+fn entry_kind_all_and_letters() {
+    assert_eq!(EntryKind::ALL.len(), 8);
+    assert_eq!(EntryKind::Idea.as_str(), "idea");
+    assert_eq!(EntryKind::parse("idea"), Some(EntryKind::Idea));
+    assert_eq!(EntryKind::Idea.ref_letter(), "w");
+    assert_eq!(EntryKind::from_ref_letter("w"), Some(EntryKind::Idea));
+    assert!(EntryKind::Idea.agent_visible());
+    assert!(!zam_store::has_certainty(EntryKind::Idea));
+    let mut letters: Vec<&str> = EntryKind::ALL.iter().map(|k| k.ref_letter()).collect();
+    for l in &letters {
+        assert!(zam_store::is_entry_ref_letter(l), "{l}");
+    }
+    letters.sort();
+    letters.dedup();
+    assert_eq!(letters.len(), EntryKind::ALL.len(), "буквы не повторяются");
+    assert_eq!(zam_store::ENTRY_REF_LETTERS.len(), EntryKind::ALL.len() + 1);
+    assert!(zam_store::is_entry_ref_letter("e"));
+    assert_eq!(EntryKind::from_ref_letter("e"), None);
+    for (s, st) in [
+        ("new", EntryStatus::New),
+        ("proposed", EntryStatus::Proposed),
+        ("accepted", EntryStatus::Accepted),
+        ("deferred", EntryStatus::Deferred),
+        ("declined", EntryStatus::Declined),
+    ] {
+        assert_eq!(st.as_str(), s);
+        assert_eq!(EntryStatus::parse(s), Some(st));
+    }
 }
 
 /// Новые виды M4.5 хранилище принимает через `create_entry`: начальный статус по виду,

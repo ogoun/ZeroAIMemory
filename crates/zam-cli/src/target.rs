@@ -66,7 +66,7 @@ fn is_node_id(s: &str) -> bool {
 
 /// Буквы ссылок записи журнала — как `zam_store::ENTRY_REF_LETTERS` (клиент без SQLite не
 /// зависит от `zam-store`; совпадение проверяет тест `entry_ref_letters_match_store`).
-pub const ENTRY_REF_LETTERS: [&str; 8] = ["i", "c", "r", "t", "k", "q", "p", "e"];
+pub const ENTRY_REF_LETTERS: [&str; 9] = ["i", "c", "r", "t", "k", "q", "p", "w", "e"];
 
 /// Буква `p` — буква ссылки записи журнала ([`ENTRY_REF_LETTERS`]).
 pub fn is_entry_ref_letter(p: &str) -> bool {

@@ -232,6 +232,8 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
         EntryKind::Report => Err(unprocessable(
             "report создаётся отдельным путём создания отчёта (с файлами)",
         )),
+        // REST идей (origin, права, проблемы) — задача 2 M5.7
+        EntryKind::Idea => Err(unprocessable("вид idea появится в задаче 2")),
     }
 }
 
@@ -583,6 +585,8 @@ pub async fn list(
         // без вида — журналы без отчётов (у отчётов свой журнал, `kind=report`)
         with_reports: false,
         deleted_only,
+        origin: None,
+        priority: None,
     };
     let (items, next) = list_entries(&sc.db, f).await?;
     // у insight — показы и оценки (столбец списка Insights WebUI, задача 13), одним запросом

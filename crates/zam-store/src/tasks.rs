@@ -95,7 +95,7 @@ fn text_field(v: &Value, field: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn links_field(v: &Value) -> Result<Vec<String>, String> {
+pub(crate) fn links_field(v: &Value) -> Result<Vec<String>, String> {
     if v.is_null() {
         return Ok(Vec::new());
     }

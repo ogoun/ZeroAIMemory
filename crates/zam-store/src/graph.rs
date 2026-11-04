@@ -387,6 +387,8 @@ struct EndMeta {
     folder: bool,
     /// Запись — отчёт (концом связи не бывает: спецификация M5.5 §7).
     report: bool,
+    /// Запись — идея (M5.7): `derived_from` на неё ставит только «начать».
+    idea: bool,
     certainty: Option<Certainty>,
 }
 
@@ -403,13 +405,14 @@ fn end_meta(c: &Connection, r: TargetRef) -> Result<Option<EndMeta>, StoreError>
                     live: r.get(1)?,
                     folder: r.get(2)?,
                     report: false,
+                    idea: false,
                     certainty: r.get(3)?,
                 })
             })
             .optional()?,
         TargetKind::Entry => c
             .prepare_cached(
-                "SELECT space_id, deleted_at IS NULL, 0, certainty, kind = 'report'
+                "SELECT space_id, deleted_at IS NULL, 0, certainty, kind = 'report', kind = 'idea'
                  FROM entries WHERE id = ?1",
             )?
             .query_row([r.id], |r| {
@@ -418,6 +421,7 @@ fn end_meta(c: &Connection, r: TargetRef) -> Result<Option<EndMeta>, StoreError>
                     live: r.get(1)?,
                     folder: r.get(2)?,
                     report: r.get(4)?,
+                    idea: r.get(5)?,
                     certainty: r.get(3)?,
                 })
             })
@@ -674,6 +678,19 @@ pub(crate) fn add_explicit(
     a: &Attribution,
     now: &str,
 ) -> Result<Id, StoreError> {
+    add_checked(c, e, a, now, EdgeOrigin::Explicit)
+}
+
+/// Ребро с проверками концов и прав: явное (клиент) или системное (связи, которые ставит
+/// сервер в операциях идей, M5.7). Клиентское `derived_from` на идею → `BadInput`: связь задачи
+/// с идеей создаёт только «начать» (спецификация M5.7 §4).
+fn add_checked(
+    c: &Connection,
+    e: NewEdge,
+    a: &Attribution,
+    now: &str,
+    origin: EdgeOrigin,
+) -> Result<Id, StoreError> {
     if e.kind == EdgeType::Supersedes {
         return Err(StoreError::BadInput(
             "supersedes ставится замещением insight, а не явной связью".into(),
@@ -700,6 +717,11 @@ pub(crate) fn add_explicit(
     };
     let src = end(e.src)?;
     let dst = end(e.dst)?;
+    if origin == EdgeOrigin::Explicit && e.kind == EdgeType::DerivedFrom && dst.idea {
+        return Err(StoreError::BadInput(
+            "связь задачи с идеей создаёт только «начать» (decide accept)".into(),
+        ));
+    }
     // ребро по матрице certainty: с M4 от axiom — любому автору (§7.5, §8.5)
     check_certainty(
         a.author_kind,
@@ -716,7 +738,7 @@ pub(crate) fn add_explicit(
         None,
         None,
         e.kind,
-        EdgeOrigin::Explicit,
+        origin,
         Some(a),
         now,
     )
@@ -734,14 +756,15 @@ pub(crate) fn add_explicit(
     })
 }
 
-/// Явные рёбра `links` новой записи `src` (в транзакции её создания); повторы в списке
-/// пропускаются.
+/// Рёбра `links` новой записи `src` (в транзакции её создания): явные (`links` клиента) или
+/// системные (служебные записи сервера, M5.7); повторы в списке пропускаются.
 pub(crate) fn insert_entry_links(
     c: &Connection,
     src: Id,
     links: &[(EdgeType, TargetRef)],
     a: &Attribution,
     now: &str,
+    origin: EdgeOrigin,
 ) -> Result<(), StoreError> {
     let mut seen = HashSet::new();
     for &(kind, dst) in links {
@@ -756,7 +779,7 @@ pub(crate) fn insert_entry_links(
             dst,
             kind,
         };
-        add_explicit(c, e, a, now)?;
+        add_checked(c, e, a, now, origin)?;
     }
     Ok(())
 }

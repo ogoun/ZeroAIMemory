@@ -1,6 +1,7 @@
 //! Записи журналов решения (§7.2–7.5 ТЗ): Changelog, Releases и Insights, с M4.5 — термины
-//! словаря, задачи и вопросы (спецификация M4.5 §1.3), с M5.5 — отчёты (`report`) в таблице
-//! `entries`, их ревизии (`entry_revisions`, только дописываются) и синхронная индексация.
+//! словаря, задачи и вопросы (спецификация M4.5 §1.3), с M5.5 — отчёты (`report`), с M5.7 —
+//! идеи (`idea`, [`crate::ideas`]) в таблице `entries`, их ревизии (`entry_revisions`, только
+//! дописываются) и синхронная индексация.
 //!
 //! Структура модуля:
 //! - `mod.rs` — типы и отображение строк `entries`;
@@ -59,11 +60,13 @@ pub use triggers::{
     TriggerKind, TriggerRow, active_triggers, entry_triggers, set_triggers, validate_trigger,
 };
 pub(crate) use triggers::{check_triggers, replace_triggers, same_triggers};
+pub(crate) use write::{
+    Maker, ensure_not_report, insert_entry, insert_entry_as, revise, revise_with,
+};
 pub use write::{
     create_entry, delete_entry, entry_by_idempotency_key, restore_entry, retract_entry,
     supersede_entry, update_entry,
 };
-pub(crate) use write::{ensure_not_report, insert_entry, revise};
 
 /// Строковое перечисление с отображением в SQL (`TEXT`) и serde (нижний регистр).
 macro_rules! text_enum {
@@ -113,8 +116,8 @@ macro_rules! text_enum {
 
 text_enum!(
     /// Вид записи журнала (спецификация M4.5 §1.3): журналы решения, словарь (`term`),
-    /// журнал задач (`task`), вопросы к человеку (`question`) и отчёты для человека (`report`,
-    /// M5.5).
+    /// журнал задач (`task`), вопросы к человеку (`question`), отчёты для человека (`report`,
+    /// M5.5) и идеи (`idea`, M5.7).
     EntryKind {
         Changelog => "changelog",
         Release => "release",
@@ -123,12 +126,13 @@ text_enum!(
         Task => "task",
         Question => "question",
         Report => "report",
+        Idea => "idea",
     }
 );
 
 impl EntryKind {
     /// Все виды записей в порядке объявления.
-    pub const ALL: [EntryKind; 7] = [
+    pub const ALL: [EntryKind; 8] = [
         EntryKind::Changelog,
         EntryKind::Release,
         EntryKind::Insight,
@@ -136,11 +140,13 @@ impl EntryKind {
         EntryKind::Task,
         EntryKind::Question,
         EntryKind::Report,
+        EntryKind::Idea,
     ];
 
     /// Буква ссылки записи в выдаче (`i:<id>`, §9.3 ТЗ; спецификация M4.5 §1.3): `i` —
     /// insight, `c` — changelog, `r` — release, `t` — term, `k` — task, `q` — question, `p` —
-    /// report (M5.5). Общая ссылка записи любого вида — `e:<id>`.
+    /// report (M5.5), `w` — idea (M5.7, «wish»: `d:` занята документом вложения). Общая ссылка
+    /// записи любого вида — `e:<id>`.
     pub fn ref_letter(self) -> &'static str {
         match self {
             EntryKind::Insight => "i",
@@ -150,6 +156,7 @@ impl EntryKind {
             EntryKind::Task => "k",
             EntryKind::Question => "q",
             EntryKind::Report => "p",
+            EntryKind::Idea => "w",
         }
     }
 
@@ -162,7 +169,8 @@ impl EntryKind {
             | EntryKind::Insight
             | EntryKind::Term
             | EntryKind::Task
-            | EntryKind::Question => true,
+            | EntryKind::Question
+            | EntryKind::Idea => true,
             EntryKind::Report => false,
         }
     }
@@ -174,17 +182,18 @@ impl EntryKind {
 }
 
 /// Буквы ссылок записи: по виду ([`EntryKind::ref_letter`]) и общая `e`.
-pub const ENTRY_REF_LETTERS: [&str; 8] = ["i", "c", "r", "t", "k", "q", "p", "e"];
+pub const ENTRY_REF_LETTERS: [&str; 9] = ["i", "c", "r", "t", "k", "q", "p", "w", "e"];
 
-/// Буква — ссылка записи журнала (`i|c|r|t|k|q|p|e`).
+/// Буква — ссылка записи журнала (`i|c|r|t|k|q|p|w|e`).
 pub fn is_entry_ref_letter(s: &str) -> bool {
     ENTRY_REF_LETTERS.contains(&s)
 }
 
 text_enum!(
     /// Статус записи по виду (§7.5 ТЗ, спецификация M4.5 §1.3): у insight и term — жизненный
-    /// цикл знания, у task — ход работы, у question — ответ. Допустимые множества —
-    /// [`allowed_statuses`]; `open` общий у task и question.
+    /// цикл знания, у task — ход работы, у question — ответ, у idea — решение человека (M5.7).
+    /// Допустимые множества — [`allowed_statuses`]; `open` общий у task и question, `done` — у
+    /// task и idea.
     EntryStatus {
         Active => "active",
         Revisit => "revisit",
@@ -197,11 +206,16 @@ text_enum!(
         Dropped => "dropped",
         Answered => "answered",
         Obsolete => "obsolete",
+        New => "new",
+        Proposed => "proposed",
+        Accepted => "accepted",
+        Deferred => "deferred",
+        Declined => "declined",
     }
 );
 
-/// Допустимые статусы вида (спецификация M4.5 §1.3; та же таблица — CHECK миграций 0015 и
-/// 0022). У changelog, release и report статуса нет — пусто.
+/// Допустимые статусы вида (спецификация M4.5 §1.3, M5.7 §5; та же таблица — CHECK миграций
+/// 0015, 0022 и 0024). У changelog, release и report статуса нет — пусто.
 pub fn allowed_statuses(kind: EntryKind) -> &'static [EntryStatus] {
     use EntryStatus::*;
     match kind {
@@ -210,16 +224,18 @@ pub fn allowed_statuses(kind: EntryKind) -> &'static [EntryStatus] {
         EntryKind::Term => &[Active, Superseded, Retracted],
         EntryKind::Task => &[Open, InProgress, Blocked, Done, Dropped],
         EntryKind::Question => &[Open, Answered, Obsolete],
+        EntryKind::Idea => &[New, Proposed, Accepted, Deferred, Declined, Done],
     }
 }
 
 /// Начальный статус новой записи вида: insight и term — `active`, task и question — `open`,
-/// у changelog, release и report статуса нет.
+/// idea — `new`, у changelog, release и report статуса нет.
 pub fn initial_status(kind: EntryKind) -> Option<EntryStatus> {
     match kind {
         EntryKind::Changelog | EntryKind::Release | EntryKind::Report => None,
         EntryKind::Insight | EntryKind::Term => Some(EntryStatus::Active),
         EntryKind::Task | EntryKind::Question => Some(EntryStatus::Open),
+        EntryKind::Idea => Some(EntryStatus::New),
     }
 }
 
@@ -232,7 +248,8 @@ pub fn has_certainty(kind: EntryKind) -> bool {
         | EntryKind::Release
         | EntryKind::Task
         | EntryKind::Question
-        | EntryKind::Report => false,
+        | EntryKind::Report
+        | EntryKind::Idea => false,
     }
 }
 
@@ -398,6 +415,10 @@ pub struct EntryFilter {
     pub with_reports: bool,
     /// Только удалённые записи (корзина): новые удаления первыми, курсор по `deleted_at`.
     pub deleted_only: bool,
+    /// Идеи с таким `data.origin` (M5.7); только при `kind = Some(Idea)`, иначе `BadInput`.
+    pub origin: Option<crate::ideas::IdeaOrigin>,
+    /// Идеи с таким `data.priority` (M5.7); только при `kind = Some(Idea)`, иначе `BadInput`.
+    pub priority: Option<crate::ideas::IdeaPriority>,
 }
 
 /// Нормализованный заголовок (дедупликация, §7.5): нижний регистр, всё, что не буква и не

@@ -7,7 +7,7 @@
 //! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5), вложения как
 //! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5), отчёты (вид записи
 //! `report`, файлы `entry_attachments`; M5.5), карта кода решения (`code_*`, ссылки на символы;
-//! M5.6).
+//! M5.6), журнал идей (вид записи `idea`; M5.7).
 
 pub mod access;
 pub mod attachments;
@@ -22,6 +22,7 @@ pub mod entries;
 pub mod file_refs;
 pub mod glossary;
 pub mod graph;
+pub mod ideas;
 pub mod jobs;
 pub mod links;
 pub mod migrate;
@@ -100,6 +101,12 @@ pub use graph::{
     EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,
     GraphNode, GraphStore, NewEdge, get_edge, graph_node, graph_nodes,
 };
+pub use ideas::{
+    Decided, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS, IDEA_LINKS_MAX, IDEA_OPTIONS,
+    IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewDecision,
+    PROPOSE_TEXT_MAX_CHARS, TaskState, adopt_idea, check_idea, check_idea_transition, decide_idea,
+    idea_candidate, proactive_ideas, propose_idea,
+};
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
     JobOutcome, JobStats, NodePayload, ReindexNote, chunks_for_index, claim_extract_jobs,
@@ -119,7 +126,7 @@ pub use nodes::{
 };
 pub use paths::{NodePath, path_ancestors};
 pub use questions::{
-    ANSWER_TEXT_MAX_CHARS, Answer, AnswerBy, Channel, NewAnswer, OPTION_KEY_MAX_CHARS,
+    ANSWER_TEXT_MAX_CHARS, Answer, AnswerBy, Answered, Channel, NewAnswer, OPTION_KEY_MAX_CHARS,
     OPTION_TEXT_MAX_CHARS, OPTIONS_MAX, QOption, QUESTION_DUPLICATES_MAX, QuestionCandidate,
     QuestionData, QuestionError, answer_question, check_question, check_question_transition,
     days_ago, open_questions, question_duplicates, recent_answered,

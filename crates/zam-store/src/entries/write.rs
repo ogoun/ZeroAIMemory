@@ -17,8 +17,12 @@ use crate::certainty::{
     CertaintyChange, Evidence, check_certainty, check_final_state, default_certainty,
 };
 use crate::glossary::{check_term, ensure_names_free, terms_written};
+use crate::graph::EdgeOrigin;
+use crate::ideas::IdeaData;
 use crate::nodes::{Attribution, AuthorKind};
-use crate::questions::{QuestionData, check_question, check_question_transition};
+use crate::questions::{
+    QuestionData, check_question, check_question_transition, check_server_question,
+};
 use crate::tasks::{TaskData, check_task, check_task_transition};
 use crate::time::fmt_ts;
 use crate::user_db::SpaceKind;
@@ -200,11 +204,19 @@ pub(super) fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<En
         .query_row([ex.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     let data: serde_json::Value =
         serde_json::from_str(&data).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    // `data` идеи хранится нормализованной (`priority`, `origin` — всегда): запрос сравнивается
+    // в том же виде (M5.7)
+    let asked = match e.kind {
+        EntryKind::Idea => crate::ideas::idea_from_request(&e.data)
+            .map(|d| d.to_value())
+            .unwrap_or_else(|_| e.data.clone()),
+        _ => e.data.clone(),
+    };
     if ex.space_id != e.space_id
         || ex.kind != e.kind
         || title != e.title.trim()
         || body != e.body
-        || data != e.data
+        || data != asked
         || !same_triggers(c, ex.id, &e.triggers)?
     {
         return Err(StoreError::IdempotencyMismatch(
@@ -273,14 +285,36 @@ fn new_status(kind: EntryKind, s: Option<EntryStatus>) -> Result<Option<EntrySta
     }
 }
 
-/// Вставляет новую запись с ревизией 1, чанками и заданием. Возвращает её id.
+/// Кто создаёт запись: клиент (запрос) или сервер — служебные записи операций идей (вопрос
+/// `propose`, задача «начать», M5.7). У записи сервера связи `links` — системные
+/// (`origin: system`), а `data` вопроса может нести поля сервера (`idea`, `task_space`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Maker {
+    Client,
+    Server,
+}
+
+/// Вставляет новую запись клиента с ревизией 1, чанками и заданием. Возвращает её id.
 pub(crate) fn insert_entry(
+    c: &Connection,
+    e: NewEntry,
+    key: Option<String>,
+    a: &Attribution,
+    supersedes: Option<Id>,
+    now: &str,
+) -> Result<Id, StoreError> {
+    insert_entry_as(c, e, key, a, supersedes, now, Maker::Client)
+}
+
+/// [`insert_entry`] от имени `maker` ([`Maker`]).
+pub(crate) fn insert_entry_as(
     c: &Connection,
     mut e: NewEntry,
     key: Option<String>,
     a: &Attribution,
     supersedes: Option<Id>,
     now: &str,
+    maker: Maker,
 ) -> Result<Id, StoreError> {
     let space_kind = space_kind_of(c, e.space_id)?;
     check_data(&e.data)?;
@@ -298,7 +332,17 @@ pub(crate) fn insert_entry(
         e.data = check_task(&e.data).map_err(bad)?.to_value();
     }
     if e.kind == EntryKind::Question {
-        e.data = check_question(&e.data).map_err(bad)?.to_value();
+        e.data = match maker {
+            Maker::Client => check_question(&e.data),
+            Maker::Server => check_server_question(&e.data),
+        }
+        .map_err(bad)?
+        .to_value();
+    }
+    if e.kind == EntryKind::Idea {
+        e.data = crate::ideas::idea_from_request(&e.data)
+            .map_err(bad)?
+            .to_value();
     }
     let status = new_status(e.kind, e.status)?;
     if !has_certainty(e.kind) && e.certainty.is_some() {
@@ -364,7 +408,11 @@ pub(crate) fn insert_entry(
     insert_revision(c, id, 1, e.kind, &f, None, a, now)?;
     replace_triggers(c, id, &triggers, now)?;
     index_entry_now(c, id, None, now)?;
-    crate::graph::insert_entry_links(c, id, &links, a, now)?;
+    let origin = match maker {
+        Maker::Client => EdgeOrigin::Explicit,
+        Maker::Server => EdgeOrigin::System,
+    };
+    crate::graph::insert_entry_links(c, id, &links, a, now, origin)?;
     crate::file_refs::sync_new_entry(c, id, e.space_id, e.kind, &refs, &f.data, a, now)?;
     if e.kind == EntryKind::Term {
         terms_written(c, e.space_id)?;
@@ -506,7 +554,8 @@ pub(crate) fn ensure_not_report(e: &Entry) -> Result<(), StoreError> {
         | EntryKind::Insight
         | EntryKind::Term
         | EntryKind::Task
-        | EntryKind::Question => Ok(()),
+        | EntryKind::Question
+        | EntryKind::Idea => Ok(()),
     }
 }
 
@@ -543,10 +592,23 @@ pub(crate) fn revise(
     a: &Attribution,
     now: &str,
 ) -> Result<(), StoreError> {
+    revise_with(c, cur, status, data, None, a, now)
+}
+
+/// [`revise`] с причиной в ревизии (переходы идей, M5.7).
+pub(crate) fn revise_with(
+    c: &Connection,
+    cur: &Entry,
+    status: Option<EntryStatus>,
+    data: serde_json::Value,
+    reason: Option<&str>,
+    a: &Attribution,
+    now: &str,
+) -> Result<(), StoreError> {
     let mut f = Fields::of(cur);
     f.status = status;
     f.data = data;
-    save(c, cur, &f, None, a, now)
+    save(c, cur, &f, reason, a, now)
 }
 
 /// Живая запись по id: нет или удалена → `NotFound`.
@@ -629,6 +691,15 @@ pub async fn update_entry(
                 "вопрос уже не открыт: содержимое не меняется — задайте новый вопрос".into(),
             ));
         }
+        if content
+            && cur.kind == EntryKind::Idea
+            && !matches!(cur.status, Some(EntryStatus::New | EntryStatus::Deferred))
+        {
+            return Err(StoreError::Conflict(format!(
+                "идея {}: содержимое меняется только в new и deferred",
+                cur.status.map_or("?", EntryStatus::as_str)
+            )));
+        }
         if p.body.is_some() && p.append_body.is_some() {
             return Err(bad("body и append_body вместе"));
         }
@@ -641,6 +712,9 @@ pub async fn update_entry(
         let question =
             (cur.kind == EntryKind::Question).then(|| QuestionData::from_stored(&cur.data));
         let mut question_patch: Option<serde_json::Value> = None;
+        // idea: `data` — слияние полей клиента, `origin` и поля сервера сохраняются (M5.7)
+        let idea = (cur.kind == EntryKind::Idea).then(|| IdeaData::from_stored(&cur.data));
+        let mut idea_patch: Option<serde_json::Value> = None;
         if let Some(t) = p.title {
             f.title = check_title(&t)?;
         }
@@ -660,6 +734,8 @@ pub async fn update_entry(
                 task_patch = Some(d);
             } else if question.is_some() {
                 question_patch = Some(d);
+            } else if idea.is_some() {
+                idea_patch = Some(d);
             } else {
                 f.data = d;
             }
@@ -698,6 +774,10 @@ pub async fn update_entry(
                         s.as_str()
                     ))
                 })?;
+            } else if cur.kind == EntryKind::Idea {
+                return Err(bad(
+                    "статус идеи меняется операциями propose, decide, adopt",
+                ));
             } else if cur.kind != EntryKind::Insight {
                 return Err(bad(format!(
                     "статус {} правкой не меняется",
@@ -731,6 +811,10 @@ pub async fn update_entry(
         if let (Some(mut qd), Some(d)) = (question, &question_patch) {
             qd.apply_patch(d).map_err(bad)?;
             f.data = qd.to_value();
+        }
+        if let (Some(mut idd), Some(d)) = (idea, &idea_patch) {
+            idd.apply_patch(d).map_err(bad)?;
+            f.data = idd.to_value();
         }
         if let Some(c) = p.certainty {
             if !has_certainty(cur.kind) {
@@ -784,6 +868,18 @@ pub async fn update_entry(
             Evidence::from_data(&f.data).as_ref(),
         )?;
         save(tx, &cur, &f, reason.as_deref(), &a, &now)?;
+        // связанные идеи — в той же транзакции (M5.7 §5.3, §5.5)
+        if let (Some(from), Some(to)) = (cur.status, f.status)
+            && from != to
+        {
+            match cur.kind {
+                EntryKind::Task => crate::ideas::on_task_status_tx(tx, &cur, from, to, &a, &now)?,
+                EntryKind::Question if to == EntryStatus::Obsolete => {
+                    crate::ideas::on_proposal_closed_tx(tx, &cur, &a, &now)?;
+                }
+                _ => {}
+            }
+        }
         load_entry(tx, id)
     })
     .await
@@ -791,18 +887,19 @@ pub async fn update_entry(
 
 /// Мягко удаляет запись: чанки убираются (и из FTS), индексируемой — `delete`. Ревизии
 /// остаются. Нет записи или уже удалена → `NotFound`; `if_rev` не совпал с текущей ревизией →
-/// `StaleRevision`. В строке записи автор удаления не хранится, как и у узлов.
+/// `StaleRevision`. В строке записи автор удаления не хранится, как и у узлов. Идея и её
+/// вопрос-предложение — по §5.6 спецификации M5.7 в той же транзакции.
 pub async fn delete_entry(
     db: &Db,
     id: Id,
     if_rev: Option<i64>,
     a: &Attribution,
 ) -> Result<(), StoreError> {
-    let author = a.author_kind;
+    let a = a.clone();
     db.write(move |tx| {
         let cur = live_entry(tx, id)?;
         check_rev(&cur, if_rev)?;
-        ensure_may_modify(&cur, author)?;
+        ensure_may_modify(&cur, a.author_kind)?;
         let now = fmt_ts(Timestamp::now());
         tx.execute(
             "UPDATE entries SET deleted_at = ?2 WHERE id = ?1",
@@ -813,6 +910,7 @@ pub async fn delete_entry(
         if cur.kind == EntryKind::Term {
             terms_written(tx, cur.space_id)?;
         }
+        crate::ideas::on_entry_deleted_tx(tx, &cur, &a, &now)?;
         Ok(())
     })
     .await

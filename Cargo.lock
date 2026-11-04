@@ -7168,6 +7168,7 @@ dependencies = [
  "globset",
  "half 2.7.1",
  "jiff",
+ "proptest",
  "rand 0.9.5",
  "regex",
  "rusqlite",

@@ -8,14 +8,17 @@
 //!   (правка статуса, [`check_question_transition`]: с причиной; из `open` и `answered`);
 //! - [`answer_question`] — одна транзакция писателя: вопрос → `answered` с `data.answer` (новая
 //!   ревизия), новый insight `decision` (`certainty: axiom` при `by: human`, иначе `hypothesis`;
-//!   `data.decision.decided_by`) и ребро `derived_from` решение → вопрос. Повторный ответ —
-//!   [`QuestionError::AlreadyAnswered`] с id решения;
+//!   `data.decision.decided_by`) и ребро `derived_from` решение → вопрос (шаг `answer_tx`).
+//!   Повторный ответ — [`QuestionError::AlreadyAnswered`] с id решения;
+//! - вопрос-предложение идеи (M5.7, `data.idea`, `data.task_space` — поля сервера): ответ —
+//!   только вариантом [`crate::ideas::IDEA_OPTIONS`] и только человеком; в той же транзакции
+//!   идея проходит переход (`ideas::apply_decision_tx`);
 //! - [`question_duplicates`] — вопросы `open` и `answered` с тем же нормализованным заголовком
 //!   (для `answered` — с ответом);
 //! - чтение для дайджеста: [`recent_answered`], [`open_questions`].
 
 use jiff::{SignedDuration, Timestamp};
-use rusqlite::{params, params_from_iter};
+use rusqlite::{Connection, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
@@ -24,6 +27,9 @@ use crate::entries::{
     Certainty, EntryKind, EntryStatus, NewEntry, TITLE_MAX_CHARS, load_entry, normalize_title,
 };
 use crate::graph::EdgeType;
+use crate::ideas::{
+    IDEA_DEFER_DAYS_DEFAULT, IdeaDecision, IdeaError, NewDecision, apply_decision_tx, atomic,
+};
 use crate::nodes::Attribution;
 use crate::time::{fmt_ts, ser_ts};
 use crate::{Db, Entry, StoreError};
@@ -121,10 +127,28 @@ pub struct QuestionData {
     pub options: Vec<QOption>,
     pub recommendation: Option<String>,
     pub answer: Option<Answer>,
+    /// Идея вопроса-предложения (M5.7); ведёт сервер.
+    pub idea: Option<Id>,
+    /// Пространство будущей задачи вопроса-предложения (M5.7 §5.1); ведёт сервер.
+    pub task_space: Option<Id>,
 }
 
 /// Поля, которые ведёт спросивший.
 const CLIENT_KEYS: [&str; 2] = ["options", "recommendation"];
+/// Поля вопроса-предложения, которые ведёт сервер (M5.7).
+const PROPOSAL_KEYS: [&str; 2] = ["idea", "task_space"];
+
+/// Id из строки `data.<k>`; `null` и отсутствие — `None`.
+fn id_field(v: Option<&Value>, k: &str) -> Result<Option<Id>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => s
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("data.{k}: ожидается id")),
+        Some(_) => Err(format!("data.{k}: ожидается id")),
+    }
+}
 
 fn options_field(v: &Value) -> Result<Vec<QOption>, String> {
     if v.is_null() {
@@ -180,6 +204,8 @@ impl QuestionData {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             answer: get("answer").and_then(|v| serde_json::from_value(v.clone()).ok()),
+            idea: id_field(get("idea"), "idea").ok().flatten(),
+            task_space: id_field(get("task_space"), "task_space").ok().flatten(),
         }
     }
 
@@ -193,6 +219,9 @@ impl QuestionData {
         for k in o.keys() {
             if k == "answer" {
                 return Err("data.answer: поле ведёт сервер (ответ — POST …/answer)".into());
+            }
+            if PROPOSAL_KEYS.contains(&k.as_str()) {
+                return Err(format!("data.{k}: поле ведёт сервер"));
             }
             if !CLIENT_KEYS.contains(&k.as_str()) {
                 return Err(format!("data.{k}: неизвестное поле"));
@@ -236,6 +265,12 @@ impl QuestionData {
         if let Some(a) = &self.answer {
             o.insert("answer".into(), json!(a));
         }
+        if let Some(i) = self.idea {
+            o.insert("idea".into(), json!(i.to_string()));
+        }
+        if let Some(s) = self.task_space {
+            o.insert("task_space".into(), json!(s.to_string()));
+        }
         Value::Object(o)
     }
 }
@@ -244,6 +279,21 @@ impl QuestionData {
 pub fn check_question(data: &Value) -> Result<QuestionData, String> {
     let mut q = QuestionData::default();
     q.apply_patch(data)?;
+    Ok(q)
+}
+
+/// `data` вопроса, созданного сервером (вопрос-предложение идеи, M5.7): поля клиента — по
+/// [`check_question`], плюс `idea` и `task_space`.
+pub(crate) fn check_server_question(data: &Value) -> Result<QuestionData, String> {
+    let mut o = data
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "data должно быть JSON-объектом".to_string())?;
+    let idea = id_field(o.remove("idea").as_ref(), "idea")?;
+    let task_space = id_field(o.remove("task_space").as_ref(), "task_space")?;
+    let mut q = check_question(&Value::Object(o))?;
+    q.idea = idea;
+    q.task_space = task_space;
     Ok(q)
 }
 
@@ -283,6 +333,58 @@ pub struct NewAnswer {
     pub option: Option<String>,
     pub by: AnswerBy,
     pub channel: Channel,
+    /// «Отложить до» — только у вопроса-предложения идеи с `option: defer` (M5.7 §5.3);
+    /// `None` у defer — сегодня + [`IDEA_DEFER_DAYS_DEFAULT`] (сервер подставляет свой срок).
+    pub horizon: Option<jiff::civil::Date>,
+}
+
+/// Ответ после нормализации: текст и вариант без пробелов по краям, пустые — `None`.
+#[derive(Debug, Clone)]
+pub(crate) struct NormalizedAnswer {
+    pub(crate) text: Option<String>,
+    pub(crate) option: Option<String>,
+    pub(crate) by: AnswerBy,
+    pub(crate) channel: Channel,
+}
+
+impl NormalizedAnswer {
+    /// Нет ни текста, ни варианта — [`QuestionError::Empty`]; длинный текст — `BadInput`.
+    fn of(a: &NewAnswer) -> Result<NormalizedAnswer, QuestionError> {
+        let clean = |s: &Option<String>| {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+        let (text, option) = (clean(&a.text), clean(&a.option));
+        if text.is_none() && option.is_none() {
+            return Err(QuestionError::Empty);
+        }
+        if text
+            .as_deref()
+            .is_some_and(|t| t.chars().count() > ANSWER_TEXT_MAX_CHARS)
+        {
+            return Err(StoreError::BadInput(format!(
+                "text: не больше {ANSWER_TEXT_MAX_CHARS} символов"
+            ))
+            .into());
+        }
+        Ok(NormalizedAnswer {
+            text,
+            option,
+            by: a.by,
+            channel: a.channel,
+        })
+    }
+}
+
+/// Итог ответа: вопрос и решение; у вопроса-предложения — ещё идея и задача «начать» (M5.7).
+#[derive(Debug, Clone)]
+pub struct Answered {
+    pub question: Entry,
+    pub decision: Entry,
+    pub idea: Option<Entry>,
+    pub task: Option<Entry>,
 }
 
 /// Ошибки операций над вопросом.
@@ -303,6 +405,18 @@ pub enum QuestionError {
     /// Запись не вопрос: 422.
     #[error("запись не является вопросом")]
     NotQuestion,
+    /// Вопрос-предложение идеи отвечается только вариантом: 422 `option-required`.
+    #[error("ответ на предложение идеи — вариант option: accept, defer или decline")]
+    OptionRequired,
+    /// `horizon` — только у ответа `defer` на вопрос-предложение: 422.
+    #[error("horizon: только у ответа defer на предложение идеи")]
+    HorizonNotAllowed,
+    /// Ответ агента за себя на вопрос-предложение: 403 `idea-human-decision`.
+    #[error("решение по идее принимает человек: передайте его слова с by: human")]
+    ByAgentOnProposal,
+    /// Переход идеи не состоялся (идея удалена, переход не разрешён, …).
+    #[error(transparent)]
+    Idea(#[from] IdeaError),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -370,116 +484,179 @@ fn decision_body(q: &Entry, qd: &QuestionData, a: &Answer) -> String {
     s
 }
 
-/// Отвечает на вопрос одной транзакцией: статус `answered` и `data.answer` (новая ревизия),
-/// новый insight `decision` и ребро `derived_from` решение → вопрос. Возвращает вопрос и
-/// решение. Ошибки — [`QuestionError`]; второй ответ — `AlreadyAnswered` с id решения первого.
+/// Шаг ответа в транзакции писателя (общий для [`answer_question`] и
+/// [`crate::ideas::decide_idea`]): статус `answered` и `data.answer` (новая ревизия), новый
+/// insight `decision` и ребро `derived_from` решение → вопрос. Возвращает `(вопрос, решение)`.
+/// Не вопрос, уже отвечен, устарел, неизвестный вариант — ошибка без записи.
+pub(crate) fn answer_tx(
+    tx: &Connection,
+    q: &Entry,
+    a: &NormalizedAnswer,
+    attrib: &Attribution,
+    now: &str,
+) -> Result<Result<(Entry, Entry), QuestionError>, StoreError> {
+    if q.kind != EntryKind::Question {
+        return Ok(Err(QuestionError::NotQuestion));
+    }
+    let mut qd = QuestionData::from_stored(&q.data);
+    match q.status.unwrap_or(EntryStatus::Open) {
+        EntryStatus::Answered => {
+            return Ok(Err(QuestionError::AlreadyAnswered {
+                decision_id: qd.answer.map(|a| a.decision_id),
+            }));
+        }
+        EntryStatus::Obsolete => return Ok(Err(QuestionError::Obsolete)),
+        _ => {}
+    }
+    if let Some(k) = &a.option
+        && !qd.options.iter().any(|o| &o.key == k)
+    {
+        return Ok(Err(QuestionError::UnknownOption(k.clone())));
+    }
+    let mut answer = Answer {
+        text: a.text.clone(),
+        option: a.option.clone(),
+        by: a.by,
+        channel: a.channel,
+        answered_at: crate::time::parse_ts(now)?,
+        // подставляется ниже: id решения известен после его вставки
+        decision_id: q.id,
+    };
+    let from_option = answer
+        .option
+        .as_deref()
+        .is_some_and(|k| qd.options.iter().any(|o| o.key == k));
+    let brief = answer.brief(&qd.options);
+    let decision = NewEntry {
+        refs: None,
+        space_id: q.space_id,
+        kind: EntryKind::Insight,
+        title: decision_title(&q.title, &brief, from_option),
+        body: decision_body(q, &qd, &answer),
+        data: json!({"kind": "decision", "decision": {"decided_by": a.by.as_str()}}),
+        area: q.area.clone(),
+        tags: q.tags.clone(),
+        status: None,
+        certainty: Some(match a.by {
+            AnswerBy::Human => Certainty::Axiom,
+            AnswerBy::Agent => Certainty::Hypothesis,
+        }),
+        idempotency_key: None,
+        triggers: Vec::new(),
+        links: vec![(
+            EdgeType::DerivedFrom,
+            TargetRef {
+                kind: TargetKind::Entry,
+                id: q.id,
+            },
+        )],
+    };
+    let decision_id = crate::entries::insert_entry(tx, decision, None, attrib, None, now)?;
+    answer.decision_id = decision_id;
+    qd.answer = Some(answer);
+    crate::entries::revise(
+        tx,
+        q,
+        Some(EntryStatus::Answered),
+        qd.to_value(),
+        attrib,
+        now,
+    )?;
+    Ok(Ok((load_entry(tx, q.id)?, load_entry(tx, decision_id)?)))
+}
+
+/// Ответ без перехода идеи: вопрос и решение.
+fn plain(r: Result<(Entry, Entry), QuestionError>) -> Result<Answered, QuestionError> {
+    r.map(|(question, decision)| Answered {
+        question,
+        decision,
+        idea: None,
+        task: None,
+    })
+}
+
+/// Отвечает на вопрос одной транзакцией: шаг `answer_tx`; у вопроса-предложения идеи (M5.7
+/// §5.3) затем переход идеи (`ideas::apply_decision_tx`, задача при `accept`) в той же
+/// транзакции — сбой перехода откатывает и ответ. У предложения: `by: agent` —
+/// [`QuestionError::ByAgentOnProposal`] до чтения идеи, без варианта —
+/// [`QuestionError::OptionRequired`], идея удалена — `Idea(IdeaDeleted)`; `horizon` — только у
+/// `defer` предложения ([`QuestionError::HorizonNotAllowed`]). Второй ответ — `AlreadyAnswered`
+/// с id решения первого.
 pub async fn answer_question(
     db: &Db,
     id: Id,
     a: NewAnswer,
     attrib: &Attribution,
-) -> Result<(Entry, Entry), QuestionError> {
+) -> Result<Answered, QuestionError> {
     let attrib = attrib.clone();
-    let text = a
-        .text
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string);
-    let option = a
-        .option
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string);
-    if text.is_none() && option.is_none() {
-        return Err(QuestionError::Empty);
-    }
-    if text
-        .as_deref()
-        .is_some_and(|t| t.chars().count() > ANSWER_TEXT_MAX_CHARS)
-    {
-        return Err(StoreError::BadInput(format!(
-            "text: не больше {ANSWER_TEXT_MAX_CHARS} символов"
-        ))
-        .into());
-    }
+    let na = NormalizedAnswer::of(&a)?;
+    let horizon = a.horizon;
     db.write(move |tx| {
-        let q = load_entry(tx, id)?;
-        if q.deleted_at.is_some() {
-            return Err(StoreError::NotFound);
-        }
-        crate::entries::ensure_not_report(&q)?;
-        if q.kind != EntryKind::Question {
-            return Ok(Err(QuestionError::NotQuestion));
-        }
-        let mut qd = QuestionData::from_stored(&q.data);
-        match q.status.unwrap_or(EntryStatus::Open) {
-            EntryStatus::Answered => {
-                return Ok(Err(QuestionError::AlreadyAnswered {
-                    decision_id: qd.answer.map(|a| a.decision_id),
-                }));
+        atomic(tx, |tx| {
+            let q = load_entry(tx, id)?;
+            if q.deleted_at.is_some() {
+                return Err(StoreError::NotFound);
             }
-            EntryStatus::Obsolete => return Ok(Err(QuestionError::Obsolete)),
-            _ => {}
-        }
-        if let Some(k) = &option
-            && !qd.options.iter().any(|o| &o.key == k)
-        {
-            return Ok(Err(QuestionError::UnknownOption(k.clone())));
-        }
-        let now_ts = Timestamp::now();
-        let now = fmt_ts(now_ts);
-        let mut answer = Answer {
-            text,
-            option,
-            by: a.by,
-            channel: a.channel,
-            answered_at: now_ts,
-            // подставляется ниже: id решения известен после его вставки
-            decision_id: id,
-        };
-        let from_option = answer
-            .option
-            .as_deref()
-            .is_some_and(|k| qd.options.iter().any(|o| o.key == k));
-        let brief = answer.brief(&qd.options);
-        let decision = NewEntry {
-            refs: None,
-            space_id: q.space_id,
-            kind: EntryKind::Insight,
-            title: decision_title(&q.title, &brief, from_option),
-            body: decision_body(&q, &qd, &answer),
-            data: json!({"kind": "decision", "decision": {"decided_by": a.by.as_str()}}),
-            area: q.area.clone(),
-            tags: q.tags.clone(),
-            status: None,
-            certainty: Some(match a.by {
-                AnswerBy::Human => Certainty::Axiom,
-                AnswerBy::Agent => Certainty::Hypothesis,
-            }),
-            idempotency_key: None,
-            triggers: Vec::new(),
-            links: vec![(
-                EdgeType::DerivedFrom,
-                TargetRef {
-                    kind: TargetKind::Entry,
-                    id,
-                },
-            )],
-        };
-        let decision_id = crate::entries::insert_entry(tx, decision, None, &attrib, None, &now)?;
-        answer.decision_id = decision_id;
-        qd.answer = Some(answer);
-        crate::entries::revise(
-            tx,
-            &q,
-            Some(EntryStatus::Answered),
-            qd.to_value(),
-            &attrib,
-            &now,
-        )?;
-        Ok(Ok((load_entry(tx, id)?, load_entry(tx, decision_id)?)))
+            crate::entries::ensure_not_report(&q)?;
+            if q.kind != EntryKind::Question {
+                return Ok(Err(QuestionError::NotQuestion));
+            }
+            let now = fmt_ts(Timestamp::now());
+            let Some(idea_id) = QuestionData::from_stored(&q.data).idea else {
+                if horizon.is_some() {
+                    return Ok(Err(QuestionError::HorizonNotAllowed));
+                }
+                return Ok(plain(answer_tx(tx, &q, &na, &attrib, &now)?));
+            };
+            // вопрос-предложение: решает человек — проверка до чтения идеи (§5.3)
+            if na.by == AnswerBy::Agent {
+                return Ok(Err(QuestionError::ByAgentOnProposal));
+            }
+            if q.status != Some(EntryStatus::Open) {
+                // уже отвечен или устарел — ошибка шага ответа, без записи
+                return Ok(plain(answer_tx(tx, &q, &na, &attrib, &now)?));
+            }
+            let Some(key) = na.option.as_deref() else {
+                return Ok(Err(QuestionError::OptionRequired));
+            };
+            let Some(decision) = IdeaDecision::from_option(key) else {
+                return Ok(Err(QuestionError::UnknownOption(key.to_string())));
+            };
+            if horizon.is_some() && decision != IdeaDecision::Defer {
+                return Ok(Err(QuestionError::HorizonNotAllowed));
+            }
+            let idea = match load_entry(tx, idea_id) {
+                Ok(e) if e.deleted_at.is_none() && e.kind == EntryKind::Idea => e,
+                Ok(_) | Err(StoreError::NotFound) => {
+                    return Ok(Err(IdeaError::IdeaDeleted.into()));
+                }
+                Err(e) => return Err(e),
+            };
+            let (question, answer) = match answer_tx(tx, &q, &na, &attrib, &now)? {
+                Ok(v) => v,
+                Err(e) => return Ok(Err(e)),
+            };
+            let nd = NewDecision {
+                decision,
+                horizon,
+                reason: None,
+                by: na.by,
+                channel: na.channel,
+                task_space: None,
+                request_solution: None,
+                defer_days: IDEA_DEFER_DAYS_DEFAULT,
+            };
+            Ok(
+                apply_decision_tx(tx, &idea, &nd, Some(answer.id), &attrib, &now)?
+                    .map(|(idea, task)| Answered {
+                        question,
+                        decision: answer,
+                        idea: Some(idea),
+                        task,
+                    })
+                    .map_err(QuestionError::Idea),
+            )
+        })
     })
     .await?
 }
