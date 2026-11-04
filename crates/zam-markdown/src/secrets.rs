@@ -363,44 +363,10 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
         }
     }
     glued_prefixes(text, &mut raw);
-    for m in ENTROPY_CANDIDATE.find_iter(text) {
-        let start = m.start();
-        let mut end = m.end();
-        // конец замаскированного значения справа от проверяемого имени (см. ниже)
-        let mut masked_end: Option<usize> = None;
-        loop {
-            // `имя=значение`: `=` внутри строки — разделитель, а не base64-дополнение (оно в
-            // конце); проверяется значение
-            let inner = text[start..end].trim_end_matches('=').rfind('=');
-            let r = inner.map_or(start..end, |i| start + i + 1..end);
-            let token = match masked_end {
-                Some(me) => url_token_masked(text, &r, me),
-                None => url_token_around(text, &r).to_string(),
-            };
-            if r.len() >= 32 && is_high_entropy_secret(&text[r.clone()], &token) {
-                raw.push((r.clone(), SecretKind::HighEntropy));
-            }
-            // значение замаскировано (этим или другим правилом): повторный проход увидит
-            // `имя=` перед маской отдельным кандидатом — он проверяется сразу, иначе маскировка
-            // не идемпотентна. Плата: длинное (от 32 символов) имя с высокой энтропией и всеми
-            // классами символов маскируется вместе с `=` уже в первом проходе (раньше — во
-            // втором); `UPPER_SNAKE_CASE` и CamelCase без цифр не маскируются (тест
-            // `long_name_left_of_masked_value`)
-            match inner {
-                Some(_)
-                    if raw
-                        .iter()
-                        .any(|(h, _)| h.start <= r.start && r.start < h.end) =>
-                {
-                    // окрестность имени — как во втором проходе, где значение уже заменено
-                    // маской: иначе `://` замаскированного значения скрывает имя только в первом
-                    // проходе (CI 41605984321, `mask_is_idempotent`)
-                    masked_end = Some(masked_span_end(&raw, r.start));
-                    end = r.start;
-                }
-                _ => break,
-            }
-        }
+    let view = MaskedView::new(text, &raw);
+    for r in entropy_hits(&view.text) {
+        let start = view.to_text(r.start);
+        raw.push((start..start + r.len(), SecretKind::HighEntropy));
     }
     raw.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(b.0.end.cmp(&a.0.end)));
     let mut merged: Vec<(Range<usize>, SecretKind)> = Vec::with_capacity(raw.len());
@@ -423,6 +389,96 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
             SecretHit { kind, range, line }
         })
         .collect()
+}
+
+/// Текст, каким его увидит повторный проход маскировки: находки остальных правил заменены
+/// [`SECRET_MARK`]. Правило энтропии работает по нему (полный прогон перед слиянием M5.6,
+/// `mask_is_idempotent`): иначе окрестность кандидата (URL-токен с `://`, граница токена)
+/// в первом проходе включала ещё не замаскированные значения, и ключ вплотную после буквы
+/// (`Ahf_<34>‹secret›password=…postgres://…`) отбрасывался как часть URL — открытым.
+struct MaskedView {
+    text: String,
+    /// Незамаскированные куски: (начало в виде, начало в исходном тексте), по возрастанию.
+    segs: Vec<(usize, usize)>,
+}
+
+impl MaskedView {
+    fn new(text: &str, raw: &[(Range<usize>, SecretKind)]) -> Self {
+        let mut ranges: Vec<Range<usize>> = raw.iter().map(|(r, _)| r.clone()).collect();
+        ranges.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        // объединение — как в [`scan_secrets`]: пересёкшиеся в одну маску, смежные — раздельно
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            match merged.last_mut() {
+                Some(last) if r.start < last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut segs = vec![(0, 0)];
+        let mut pos = 0;
+        for r in merged {
+            out.push_str(&text[pos..r.start]);
+            out.push_str(SECRET_MARK);
+            pos = r.end;
+            segs.push((out.len(), pos));
+        }
+        out.push_str(&text[pos..]);
+        MaskedView { text: out, segs }
+    }
+
+    /// Позиция в исходном тексте для позиции вида вне маски.
+    fn to_text(&self, at: usize) -> usize {
+        let i = self.segs.partition_point(|s| s.0 <= at) - 1;
+        let (v, t) = self.segs[i];
+        t + (at - v)
+    }
+}
+
+/// Кандидаты правила энтропии в `text` (виде [`MaskedView`]): диапазоны в его координатах.
+fn entropy_hits(text: &str) -> Vec<Range<usize>> {
+    let mut raw: Vec<(Range<usize>, SecretKind)> = Vec::new();
+    for m in ENTROPY_CANDIDATE.find_iter(text) {
+        let start = m.start();
+        let mut end = m.end();
+        // конец замаскированного значения справа от проверяемого имени (см. ниже)
+        let mut masked_end: Option<usize> = None;
+        loop {
+            // `имя=значение`: `=` внутри строки — разделитель, а не base64-дополнение (оно в
+            // конце); проверяется значение
+            let inner = text[start..end].trim_end_matches('=').rfind('=');
+            let r = inner.map_or(start..end, |i| start + i + 1..end);
+            let token = match masked_end {
+                Some(me) => url_token_masked(text, &r, me),
+                None => url_token_around(text, &r).to_string(),
+            };
+            if r.len() >= 32 && is_high_entropy_secret(&text[r.clone()], &token) {
+                raw.push((r.clone(), SecretKind::HighEntropy));
+            }
+            // значение замаскировано этим правилом (находки остальных в виде уже заменены
+            // маской и в кандидата не входят): повторный проход увидит
+            // `имя=` перед маской отдельным кандидатом — он проверяется сразу, иначе маскировка
+            // не идемпотентна. Плата: длинное (от 32 символов) имя с высокой энтропией и всеми
+            // классами символов маскируется вместе с `=` уже в первом проходе (раньше — во
+            // втором); `UPPER_SNAKE_CASE` и CamelCase без цифр не маскируются (тест
+            // `long_name_left_of_masked_value`)
+            match inner {
+                Some(_)
+                    if raw
+                        .iter()
+                        .any(|(h, _)| h.start <= r.start && r.start < h.end) =>
+                {
+                    // окрестность имени — как во втором проходе, где значение уже заменено
+                    // маской: иначе `://` замаскированного значения скрывает имя только в первом
+                    // проходе (CI 41605984321, `mask_is_idempotent`)
+                    masked_end = Some(masked_span_end(&raw, r.start));
+                    end = r.start;
+                }
+                _ => break,
+            }
+        }
+    }
+    raw.into_iter().map(|(r, _)| r).collect()
 }
 
 /// Заменяет диапазоны `hits` на [`SECRET_MARK`]; остальные байты не меняются.

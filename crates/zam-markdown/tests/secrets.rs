@@ -433,6 +433,52 @@ fn name_left_of_masked_url_value_idempotent() {
     }
 }
 
+/// Полный прогон перед слиянием M5.6 (`mask_is_idempotent`, seed `cc ef3a6e…`): ключ вплотную
+/// после буквы (`Ahf_<34>`, граница слова правила префикса не срабатывает — ловит правило
+/// энтропии), дальше в том же URL-токене — `password=…postgres://…`. Первый проход видел `://`
+/// ещё не замаскированного значения и отбрасывал кандидата как часть URL, второй — уже нет:
+/// ключ уходил открытым. Правило энтропии смотрит на текст, каким его увидит повторный проход.
+#[test]
+fn key_glued_after_letter_before_masked_url_value() {
+    let tail = format!("{SECRET_MARK}password=abcdef123postgres://u:pw12345@h/");
+    let keys = [
+        // тело — как у генератора `mask_is_idempotent` (`rnd(34, 40)`)
+        format!("{}_{}", "hf", rnd(34, 40)),
+        format!("{}_{}", "hf", rnd(34, 70)),
+        format!("gh{}_{}", "p", rnd(36, 71)),
+        format!("np{}_{}", "m", rnd(36, 72)),
+        format!("za{}_{}", "m", rnd(40, 73)),
+        format!("AI{}{}", "za", rnd(35, 74)),
+        format!("s{}-{}", "k", rnd(40, 75)),
+        format!("xo{}-{}", "xb", rnd(40, 76)),
+        format!("gl{}-{}", "pat", rnd(40, 77)),
+        format!("github{}pat_{}", "_", rnd(70, 78)),
+        format!("ey{}{}.{}.{}", "J", rnd(20, 79), rnd(30, 80), rnd(20, 81)),
+        format!("{}.{}.{}", "SG", rnd(22, 82), rnd(43, 83)),
+        format!("{}{}", "AK", "IA") + &rnd(16, 84).to_ascii_uppercase(),
+    ];
+    for lead in ["A", "7", "x "] {
+        for key in &keys {
+            for t in [
+                format!("{lead}{key}{tail}"),
+                format!("{lead}{key} {tail}"),
+                format!("{lead}{key}{tail} x"),
+            ] {
+                let once = mask_text(&t);
+                assert_eq!(mask_text(&once), once, "{t}");
+            }
+        }
+    }
+    // исходный вход: ключ маскируется с первого прохода
+    let key = &keys[0];
+    let once = mask_text(&format!("A{key}{tail}"));
+    assert!(!once.contains(&key[3..]), "{once}");
+    assert_eq!(
+        once,
+        format!("{SECRET_MARK}{SECRET_MARK}password={SECRET_MARK}")
+    );
+}
+
 /// Ревью задачи 9A, M2: ключи вплотную друг к другу (`SG.…hf_…`, `ghp_…ghp_…`, `AKIA…npm_…`)
 /// — находки сканера (детекторы, нарезка) покрывают оба ключа целиком, маскировка — одним
 /// проходом. Пересекающиеся находки (правило энтропии) сливаются в одну.
@@ -468,7 +514,9 @@ fn glued_keys_each_detected() {
 
 /// Повторное ревью 9A: жадный хвост правила (Slack `xox…-[A-Za-z0-9-]{10,}`) съедает начало
 /// следующего ключа (`hf`) — ключ всё равно находится (тело без энтропии: ловит только правило
-/// префикса); JWT вплотную за ключом (`ghp_<36>eyJ…`) — тоже.
+/// префикса); JWT вплотную за ключом (`ghp_<36>eyJ…`) — тоже. Пересёкшиеся находки (жадный
+/// хвост) — одна маска, смежные (`ghp_<36>` и JWT) — две: правило энтропии не склеивает их
+/// кандидатом поверх уже найденного (полный прогон перед слиянием M5.6).
 #[test]
 fn glued_after_greedy_tail_and_jwt() {
     let low = "abcdefghij".repeat(4);
@@ -476,23 +524,26 @@ fn glued_after_greedy_tail_and_jwt() {
         (
             format!("xo{}-{}", "xb", "1234567890"),
             format!("hf_{}", &low[..34]),
+            1,
         ),
         (
             format!("xo{}-{}", "xp", "abcdefghijklmn"),
             format!("npm_{}", &low[..36]),
+            1,
         ),
         (
             format!("ghp_{}", rnd(36, 60)),
             format!("ey{}{}.{}.{}", "J", rnd(20, 61), rnd(30, 62), rnd(20, 63)),
+            2,
         ),
     ];
-    for (a, b) in cases {
+    for (a, b, marks) in cases {
         let t = format!("x {a}{b} y");
         let hits = scan_secrets(&t);
         let covered = |at: usize| hits.iter().any(|h| h.range.contains(&at));
         assert!((2..2 + a.len() + b.len()).all(covered), "{t}: {hits:?}");
         let once = mask_text(&t);
-        assert_eq!(once, format!("x {SECRET_MARK} y"), "{t}");
+        assert_eq!(once, format!("x {} y", SECRET_MARK.repeat(marks)), "{t}");
         assert_eq!(mask_text(&once), once);
     }
 }
