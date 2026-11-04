@@ -1018,19 +1018,79 @@ async fn any_prompt_candidates(
 /// Лексическое подтверждение идеи решения в подсказке (финальное ревью M5.7, I-1): балл
 /// отдельного поиска только по идеям нормирован по непустым каналам, и без порога вектора
 /// ближайшая идея получала бы 1,0 на любой запрос. Нужны канал `fts`, `alias` или `trigram` в
-/// `sources` и покрытие слов запроса заголовком и телом идеи [`coverage_enough`] (строгий FTS —
-/// все слова — проходит всегда).
+/// `sources` и совпадение слов запроса со словами идеи по основам ([`idea_words_match`]).
 fn idea_lexically_matched(item: &Value, e: &Entry, terms: &[String]) -> bool {
     let lexical = item["sources"]
         .as_array()
         .into_iter()
         .flatten()
         .any(|s| matches!(s.as_str(), Some("fts" | "alias" | "trigram")));
-    lexical
-        && coverage_enough(
-            term_coverage(terms, &format!("{}\n{}", e.title, e.body)),
-            terms.len(),
-        )
+    lexical && idea_words_match(terms, &format!("{}\n{}", e.title, e.body))
+}
+
+/// Значимых слов идеи в пороге [`idea_words_match`], не больше: длинное тело не делает порог
+/// недостижимым (половина от 6 — 3 слова, не больше порога покрытия запроса 4).
+const IDEA_WORDS_CAP: usize = 6;
+/// Короче — слово сравнивается целиком: у трёхбуквенных слов («код», «api», «pdf») окончание
+/// неотличимо от корня.
+const STEM_MIN_CHARS: usize = 4;
+
+/// Слово для сравнения основ: нижний регистр, `ё` → `е`.
+fn idea_norm_word(w: &str) -> String {
+    w.to_lowercase().replace('ё', "е")
+}
+
+/// Основа слова: первые `max(4, длина − 3)` символов — срез типичных русских и английских
+/// окончаний («отчётов» → «отче», «экспортировать» → «экспортиров», «reports» → «repo»); слова
+/// короче [`STEM_MIN_CHARS`] — целиком.
+fn idea_stem(w: &str) -> String {
+    let c: Vec<char> = w.chars().collect();
+    if c.len() < STEM_MIN_CHARS {
+        return w.to_string();
+    }
+    c[..c.len().saturating_sub(3).max(STEM_MIN_CHARS)]
+        .iter()
+        .collect()
+}
+
+/// Слова совпадают по основе (оба уже [`idea_norm_word`]): одно начинается с основы другого;
+/// короче [`STEM_MIN_CHARS`] — только точное совпадение. Ложные совпадения длинных слов с общим
+/// началом («план» ~ «планета») допускаются сознательно: это подтверждение к вектору и FTS, а
+/// не самостоятельный поиск.
+fn idea_stem_match(a: &str, b: &str) -> bool {
+    if a.chars().count() < STEM_MIN_CHARS || b.chars().count() < STEM_MIN_CHARS {
+        return a == b;
+    }
+    b.starts_with(&idea_stem(a)) || a.starts_with(&idea_stem(b))
+}
+
+/// Слова запроса `terms` ([`error_terms`]) подтверждаются словами идеи `text` (финальное
+/// ревью M5.7, I-1′): покрыты все слова запроса — да; иначе нужно не меньше
+/// `min(порог покрытия запроса, max(1, ⌈k / 2⌉))` совпавших по основе, где `k` — значимые слова
+/// идеи (до [`IDEA_WORDS_CAP`]). Порог ограничен словами самой идеи: к длинному запросу Claude
+/// Code короткая идея иначе не подходила бы никогда. Только для подсказок-идей; общий
+/// [`term_coverage`] у `post_tool` прежний.
+fn idea_words_match(terms: &[String], text: &str) -> bool {
+    let mut q: Vec<String> = terms.iter().map(|t| idea_norm_word(t)).collect();
+    q.dedup();
+    if q.is_empty() {
+        return false;
+    }
+    let words: Vec<String> = error_terms(text)
+        .iter()
+        .map(|w| idea_norm_word(w))
+        .collect();
+    let covered = q
+        .iter()
+        .filter(|t| words.iter().any(|w| idea_stem_match(t, w)))
+        .count();
+    if covered == q.len() {
+        return true;
+    }
+    let n = q.len();
+    let query_need = n.div_ceil(3).clamp(2, 4).min(n);
+    let k = words.len().min(IDEA_WORDS_CAP);
+    covered >= query_need.min(k.div_ceil(2).max(1))
 }
 
 /// Идея подсказки: (цель, идея, общая из Knowledge, пометка «задача снята»).
@@ -1195,15 +1255,7 @@ async fn released_prompt_ideas(
             if !ids.contains(&h.target.id) || !taken.insert(h.target.id) {
                 continue;
             }
-            let Some(eh) = &h.entry else {
-                continue;
-            };
-            if ch.relaxed
-                && !coverage_enough(
-                    term_coverage(&terms, &format!("{}\n{}", eh.title, h.text)),
-                    terms.len(),
-                )
-            {
+            if h.entry.is_none() {
                 continue;
             }
             // источник истины — SQLite (`origin`, задача, вопрос «вернуть»)
@@ -1218,6 +1270,10 @@ async fn released_prompt_ideas(
                     continue;
                 }
             };
+            // строгий FTS (все слова запроса) проходит сразу; ослабленный — по основам слов
+            if ch.relaxed && !idea_words_match(&terms, &format!("{}\n{}", e.title, e.body)) {
+                continue;
+            }
             let shared = t
                 .spaces
                 .iter()
@@ -3290,6 +3346,49 @@ pub async fn recall(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Финальное ревью M5.7, I-1′: сравнение основ слов подсказок-идей — совпадения форм и
+    /// поведение коротких слов (зафиксировано).
+    #[test]
+    fn idea_stem_match_forms_and_short_words() {
+        let m = |a: &str, b: &str| idea_stem_match(&idea_norm_word(a), &idea_norm_word(b));
+        // формы одного слова
+        assert!(m("отчёты", "отчётов"));
+        assert!(m("отчеты", "Отчётов"));
+        assert!(m("экспортировать", "экспорт"));
+        assert!(m("экспорт", "экспортировать"));
+        assert!(m("reports", "report"));
+        assert!(m("PDF", "pdf"));
+        // короткие слова — только целиком
+        assert!(!m("код", "кодекс"));
+        assert!(!m("pdf", "pdfium"));
+        // длинные с общим началом — совпадают (сознательно: это подтверждение, не поиск)
+        assert!(m("план", "планета"));
+        // разные слова
+        assert!(!m("логирование", "экспорт"));
+        assert!(!m("сервера", "скачать"));
+        assert_eq!(idea_stem("отчётов"), "отчё");
+        assert_eq!(idea_stem("экспортировать"), "экспортиров");
+        assert_eq!(idea_stem("код"), "код");
+    }
+
+    /// Порог подтверждения ограничен словами идеи: длинный запрос к короткой идее подходит.
+    #[test]
+    fn idea_words_match_long_queries() {
+        let idea = "Экспорт отчётов в PDF
+Замысел.";
+        let ok = |q: &str| idea_words_match(&error_terms(q), idea);
+        assert!(ok("экспортировать отчёты в pdf"));
+        assert!(ok(
+            "Пользователи просят, чтобы отчёты можно было скачать в PDF; посмотри модуль reports              и предложи план, с чего начать"
+        ));
+        assert!(ok("как сделать экспорт отчётов в PDF"));
+        assert!(!ok("настрой логирование сервера"));
+        assert!(!ok(
+            "Почини падающий тест миграции базы данных и обнови документацию по развёртыванию              на стенде"
+        ));
+        assert!(!idea_words_match(&[], idea));
+    }
 
     fn cand(title: &str) -> Cand {
         Cand {
