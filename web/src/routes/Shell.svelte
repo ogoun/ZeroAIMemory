@@ -350,7 +350,7 @@
             <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
           {/await}
         {:else if r.journal === 'questions'}
-          <QuestionsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          <QuestionsView user={r.user} space={r.space} entry={r.entry} spaces={journalSpaces?.spaces ?? []} {onexpired} />
         {:else}
           <VaultView user={r.user} space={r.space} {onexpired} />
         {/if}

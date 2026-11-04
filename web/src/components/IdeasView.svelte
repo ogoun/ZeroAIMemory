@@ -26,6 +26,7 @@
   import {
     AUTHOR_TEXT,
     IDEA_ACTIVE,
+    IDEA_STATUSES,
     IDEA_STATUS_TEXT,
     PRIORITIES,
     PRIORITY_TEXT,
@@ -109,6 +110,8 @@
   let fPriority = $state<IdeaPriority>('normal');
   let fHorizon = $state('');
   let fTags = $state('');
+  /** `horizon` идеи до правки: неизменённая (в том числе наступившая) дата не ограничивается min. */
+  let fHorizonWas = $state('');
   // формы решений
   let dHorizon = $state('');
   let dReason = $state('');
@@ -166,7 +169,8 @@
     const statuses = statusesOf(statusSel);
     try {
       if (applied.query) {
-        const r = await searchIdeas(u, s, applied.query, statuses);
+        // «все» — явным перечнем: без статуса сервер берёт умолчание поиска (без declined, done)
+        const r = await searchIdeas(u, s, applied.query, statuses.length ? statuses : IDEA_STATUSES);
         if (my !== seq) return;
         hits = uniqueHits(r.items);
         items = [];
@@ -206,6 +210,7 @@
     if (!id) {
       cur = null;
       curQuestion = null;
+      taskSpace = null;
       return;
     }
     try {
@@ -314,6 +319,7 @@
     fBody = '';
     fPriority = 'normal';
     fHorizon = '';
+    fHorizonWas = '';
     fTags = '';
     actionError = '';
     mode = 'create';
@@ -346,6 +352,7 @@
     fBody = c.body;
     fPriority = priorityOf(c);
     fHorizon = str(c.data, 'horizon');
+    fHorizonWas = fHorizon;
     fTags = c.tags.join(', ');
     actionError = '';
     mode = 'edit';
@@ -457,7 +464,7 @@
   const released = (c: Entry): '' | 'снята' | 'удалена' =>
     c.status !== 'accepted' || !c.task ? '' : c.task.deleted ? 'удалена' : c.task.status === 'dropped' ? 'снята' : '';
 
-  const taskHref = (id: string) => href({ name: 'journal', user, space: taskSpace ?? space, journal: 'tasks', entry: id });
+  const taskHref = (id: string, sp = taskSpace ?? space) => href({ name: 'journal', user, space: sp, journal: 'tasks', entry: id });
   const questionHref = (id: string) => href({ name: 'journal', user, space, journal: 'questions', entry: id });
   const minDate = () => utcDate(1);
   let filtered = $derived(!!(applied.tag || applied.query));
@@ -544,9 +551,10 @@
             <button type="button" class="link title" onclick={() => select(it.id)}>{it.title}</button>
             <span class="chip prio" data-priority={priorityOf(it)}>{PRIORITY_TEXT[priorityOf(it)]}</span>
             <span class="chip">{statusText(it.status)}</span>
-            {#if it.status === 'deferred' && str(it.data, 'horizon')}<span class="muted small">не раньше {str(it.data, 'horizon')}</span>{/if}
+            {#if it.status === 'deferred' && str(it.data, 'horizon')}<span class="muted small">не раньше {str(it.data, 'horizon')} UTC</span>{/if}
             {#if originOf(it) === 'agent'}<span class="badge small">от агента</span>{/if}
-            {#if task}<span class="muted small">задача {entryRef('task', task)}</span>
+            {#if task && !knowledge}<a class="small" href={taskHref(task, space)}>задача {entryRef('task', task)}</a>
+            {:else if task}<button type="button" class="link small" onclick={() => select(it.id)} title="Задача может быть в решении: ссылка — в карточке">задача {entryRef('task', task)}</button>
             {:else if q && it.status === 'proposed'}<a class="small" href={questionHref(q)}>вопрос {entryRef('question', q)}</a>{/if}
             {#each it.tags as t (t)}<span class="chip">#{t}</span>{/each}
           </article>
@@ -585,10 +593,10 @@
           {#if curQuestion.body}<p class="body">{curQuestion.body}</p>{/if}
         </div>
       {/if}
-      {#if c.task && !rel}
+      {#if c.task && !c.task.deleted && !rel}
         <p>
-          {#if c.task.deleted}{:else}<a href={taskHref(c.task.id)} data-testid="task-link">Задача {entryRef('task', c.task.id)}</a>
-            <span class="muted small">{c.task.title ?? ''}</span>{/if}
+          <a href={taskHref(c.task.id)} data-testid="task-link">Задача {entryRef('task', c.task.id)}</a>
+          <span class="muted small">{c.task.title ?? ''}</span>
         </p>
       {/if}
       {#if rel}
@@ -659,7 +667,7 @@
           {@render fields()}
           {@render formEnd('Сохранить')}
         </form>
-      {:else if actionError}
+      {:else if actionError && mode !== 'create'}
         <p class="error" role="alert">{actionError}</p>
       {/if}
     </article>
@@ -679,7 +687,7 @@
     <label>
       Не раньше
       <span class="row">
-        <input type="date" bind:value={fHorizon} min={minDate()} aria-label="Не раньше" />
+        <input type="date" bind:value={fHorizon} min={fHorizon && fHorizon === fHorizonWas ? undefined : minDate()} aria-label="Не раньше" />
         <span class="muted small" title="Даты хранятся в UTC">UTC</span>
       </span>
     </label>

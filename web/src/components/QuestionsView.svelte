@@ -4,7 +4,8 @@
   // `channel: webui` и создаёт решение (insight `decision`, `decided_by: human`) — после
   // ответа карточка ссылается на него. Отвеченные и неактуальные — ниже, с ответом.
   // Вопрос-предложение идеи (`data.idea`, M5.7 §5.3) — со ссылкой «Идея w:<id>»; ответ — только
-  // вариантом, у «отложить» — дата «не раньше» (UTC, не раньше завтрашней).
+  // вариантом, у «отложить» — дата «не раньше» (UTC, не раньше завтрашней); «начать» идеи
+  // Knowledge с задачей в общем решении (`data.task_space`) — после предупреждения (§5.2, п. 1).
 
   import { tick, untrack } from 'svelte';
   import {
@@ -14,6 +15,7 @@
     errorText,
     listEntries,
     type Entry,
+    type Space,
   } from '../lib/api';
   import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime, utcDate } from '../lib/journals';
   import { href } from '../lib/router';
@@ -22,10 +24,12 @@
     user: string;
     space: string;
     entry: string | null;
+    /** Пространства пользователя: общее ли решение задачи вопроса-предложения. */
+    spaces?: Space[];
     onexpired: () => void;
   }
 
-  let { user, space, entry, onexpired }: Props = $props();
+  let { user, space, entry, spaces = [], onexpired }: Props = $props();
 
   const PAGE = 200;
   const CHANNEL_TEXT: Record<string, string> = { webui: 'WebUI', chat: 'чат', cli: 'CLI' };
@@ -93,8 +97,27 @@
   const ideaOf = (e: Entry): string => (typeof e.data.idea === 'string' ? e.data.idea : '');
   const ideaHref = (id: string) => href({ name: 'journal', user, space, journal: 'ideas', entry: id });
 
+  /** Вопрос-предложение, у которого ждёт подтверждения «начать» в общем решении. */
+  let confirmFor = $state('');
+
+  /** Общее решение, где «начать» поставит задачу идеи Knowledge (иначе `null`). */
+  function sharedTarget(q: Entry): Space | null {
+    const here = spaces.find((s) => s.kind === 'knowledge');
+    if (space !== 'knowledge' && q.space_id !== here?.id) return null;
+    const ts = typeof q.data.task_space === 'string' ? q.data.task_space : '';
+    const sp = spaces.find((s) => s.id === ts);
+    return sp && sp.kind === 'solution' && sp.shared ? sp : null;
+  }
+
   function pick(q: Entry, key: string) {
+    if (ideaOf(q) && key === 'accept' && sharedTarget(q) && confirmFor !== q.id) {
+      confirmFor = q.id;
+      deferFor = '';
+      errors[q.id] = '';
+      return;
+    }
     if (ideaOf(q) && key === 'defer') {
+      confirmFor = '';
       deferFor = q.id;
       deferDate = utcDate(30);
       errors[q.id] = '';
@@ -144,6 +167,7 @@
       created[q.id] = r.decision_id;
       texts[q.id] = '';
       if (deferFor === q.id) deferFor = '';
+      if (confirmFor === q.id) confirmFor = '';
       await load(user, space, true);
     } catch (e) {
       const d = answeredDecision(e);
@@ -206,6 +230,14 @@
                   {o.text}{#if o.key === recommended(q)}<span class="rec"> · рекомендуется</span>{/if}
                 </button>
               {/each}
+            </div>
+          {/if}
+          {#if confirmFor === q.id}
+            {@const sp = sharedTarget(q)}
+            <div class="row" role="group" aria-label="Подтверждение «начать»">
+              <p class="warn" data-testid="shared-warning">Задача появится в решении «{sp?.name ?? ''}», её увидят участники.</p>
+              <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>Начать</button>
+              <button type="button" onclick={() => (confirmFor = '')}>Отмена</button>
             </div>
           {/if}
           {#if deferFor === q.id}

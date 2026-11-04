@@ -4,7 +4,8 @@
 // вопрос-предложение в «Вопросах», конфликт ревизии, выключатель ideas.proactive, Ctrl+K.
 // Данные — seedIdeas (global-setup); сценарии, которые меняют статус, создают свою идею по токену
 // администратора (агент: идея человека — `origin: human`, решения — `by: human`).
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import {
@@ -84,6 +85,25 @@ const decide = (id: string, decision: string, extra: Record<string, unknown> = {
 /** Сегодняшняя дата UTC + `days` (`YYYY-MM-DD`). */
 const utc = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
 
+/** Атрибут (`min`) или значение поля — дата «сегодня UTC + days»: страница могла посчитать её по
+ * ту сторону полуночи UTC, поэтому годится и значение на день раньше. */
+async function expectUtcDay(l: Locator, days: number, attr?: string) {
+  const ok = [utc(days - 1), utc(days)];
+  const got = attr ? await l.getAttribute(attr) : await l.inputValue();
+  expect(ok).toContain(got);
+}
+
+/** Прямой SQL в базе пользователя E2E (время «horizon наступил» без ожидания, как в тестах Rust). */
+function sql(user: string, query: string, ...args: string[]) {
+  const db = new DatabaseSync(fileURLToPath(new URL(`../../.tmp/e2e/data/users/${user}.db`, import.meta.url)));
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    db.prepare(query).run(...args);
+  } finally {
+    db.close();
+  }
+}
+
 let adminUser = '';
 async function me(page: Page): Promise<string> {
   if (adminUser) return adminUser;
@@ -136,7 +156,7 @@ test('ideas_create_and_list', async ({ page }) => {
   await form.getByLabel('Приоритет').selectOption('low');
   await form.getByLabel('Теги идеи').fill('web, e2e');
   // «не раньше» — не раньше завтрашней даты UTC, подпись UTC рядом
-  await expect(form.getByLabel('Не раньше')).toHaveAttribute('min', utc(1));
+  await expectUtcDay(form.getByLabel('Не раньше'), 1, 'min');
   await expect(form.getByText('UTC', { exact: true })).toBeVisible();
   const sent = page.waitForRequest((r) => r.method() === 'POST' && r.url().endsWith(`/spaces/${IDEAS_GUID}/entries`));
   await form.getByRole('button', { name: 'Записать' }).click();
@@ -206,6 +226,10 @@ test('ideas_start_creates_task_link', async ({ page }) => {
   await expect(link).toHaveText(/^Задача k:[0-9A-Z]{26}$/);
   await expect(page.getByRole('status')).toContainText('Идея начата: задача k:');
   const task = (await link.textContent())!.replace('Задача k:', '');
+  // ссылка на задачу — и в строке ленты (идея решения: задача в том же решении)
+  await page.getByLabel('Статус идей').selectOption('accepted');
+  const rowLink = feed(page).locator(`[data-idea="${idea.id}"]`).getByRole('link', { name: `задача k:${task}` });
+  await expect(rowLink).toHaveAttribute('href', new RegExp(`/s/${IDEAS_GUID}/j/tasks/${task}$`));
   await link.click();
   await expect(page).toHaveURL(new RegExp(`/s/${IDEAS_GUID}/j/tasks/${task}$`));
   const tc = page.getByRole('article', { name: 'Карточка задачи' });
@@ -251,8 +275,8 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   const form = page.getByRole('form', { name: 'Отложить идею' });
   const date = form.getByLabel('Отложить до');
   // минимум — завтра по UTC, по умолчанию +30 дней, подпись UTC
-  await expect(date).toHaveAttribute('min', utc(1));
-  await expect(date).toHaveValue(utc(30));
+  await expectUtcDay(date, 1, 'min');
+  await expectUtcDay(date, 30);
   await expect(form.getByText('UTC', { exact: true })).toBeVisible();
   await date.fill(utc(5));
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
@@ -338,7 +362,7 @@ test('ideas_proposal_answered_in_questions', async ({ page }) => {
   await q.getByRole('button', { name: 'отложить', exact: true }).click();
   const form = q.getByRole('form', { name: 'Отложить идею' });
   const date = form.getByLabel('Отложить до');
-  await expect(date).toHaveAttribute('min', utc(1));
+  await expectUtcDay(date, 1, 'min');
   await expect(form.getByText('UTC', { exact: true })).toBeVisible();
   await date.fill(utc(10));
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${qid}/answer`));
@@ -381,6 +405,91 @@ test('ideas_stale_rev_conflict_rereads', async ({ page }) => {
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+test('ideas_edit_with_due_horizon', async ({ page }) => {
+  const problems = watch(page);
+  const idea = await newIdea('Идея E2E: наступивший срок');
+  await decide(idea.id, 'defer', { horizon: utc(5) });
+  // срок наступил: horizon в прошлом (прямой SQL, без ожидания)
+  sql(await me(page), "UPDATE entries SET data = json_set(data, '$.horizon', '2020-01-02') WHERE id = ?", idea.id);
+  await openIdeas(page, idea.id);
+  await expect(card(page)).toContainText('Отложена до 2020-01-02 (UTC).');
+  await card(page).getByRole('button', { name: 'Изменить' }).click();
+  const form = page.getByRole('form', { name: 'Правка идеи' });
+  const date = form.getByLabel('Не раньше');
+  // неизменённая дата не ограничена min (иначе браузер не отправит форму), изменённая — ограничена
+  await expect(date).toHaveValue('2020-01-02');
+  expect(await date.getAttribute('min')).toBeNull();
+  await form.getByLabel('Заголовок').fill('Идея E2E: наступивший срок, правка');
+  const saved = page.waitForResponse((r) => r.url().endsWith(`/entries/${idea.id}`) && r.request().method() === 'PATCH');
+  await form.getByRole('button', { name: 'Сохранить' }).click();
+  const resp = await saved;
+  expect(resp.status()).toBe(200);
+  expect(resp.request().postDataJSON().data).toBeUndefined();
+  await expect(card(page).locator('h2')).toHaveText('Идея E2E: наступивший срок, правка');
+  await card(page).getByRole('button', { name: 'Изменить' }).click();
+  await date.fill(utc(7));
+  await expectUtcDay(date, 1, 'min');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('ideas_accepted_deleted_task_decline', async ({ page }) => {
+  const problems = watch(page);
+  const idea = await newIdea('Идея E2E: задача удалена');
+  const task = (await decide(idea.id, 'accept')).task!;
+  const r = await fetch(`${base()}api/v1/entries/${task.id}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${env('E2E_ADMIN_TOKEN')}`, 'If-Match': `"${task.rev}"` },
+  });
+  expect(r.ok, await r.text()).toBe(true);
+  await openIdeas(page, idea.id);
+  await expect(card(page).locator('[data-status]')).toHaveText('начата');
+  await expect(card(page).getByTestId('task-released')).toContainText('Задача удалена');
+  await expect(card(page).getByTestId('task-link')).toHaveCount(0);
+  await expect(card(page).getByRole('button', { name: 'Вернуть' })).toBeVisible();
+  await card(page).getByRole('button', { name: 'Отказаться' }).click();
+  await page.getByRole('form', { name: 'Отказаться от идеи' }).getByRole('button', { name: 'Отказаться' }).click();
+  await expect(card(page).locator('[data-status]')).toHaveText('отклонена');
+  expect((await api('GET', `entries/${idea.id}`)).status).toBe('declined');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('ideas_knowledge_proposal_start_in_shared_solution_warns', async ({ page }) => {
+  const problems = watch(page);
+  const idea = await newIdea('Общая идея E2E: предложена в общем решении', 'spaces/knowledge');
+  const { question } = await api<{ question: { id: string } }>('POST', `entries/${idea.id}/propose`, {
+    text: 'Подходит к текущей работе.',
+    space: IDEAS_GUID,
+  });
+  const u = await me(page);
+  await page.goto(`${base()}#/u/${u}/s/knowledge/j/questions/${question.id}`);
+  const q = page.locator(`[data-question="${question.id}"]`);
+  await expect(q).toContainText('Общая идея E2E: предложена в общем решении');
+  let answered = false;
+  page.on('request', (r) => {
+    if (r.url().endsWith(`/entries/${question.id}/answer`)) answered = true;
+  });
+  await q.getByRole('button', { name: 'начать', exact: true }).click();
+  const confirm = q.getByRole('group', { name: 'Подтверждение «начать»' });
+  await expect(confirm.getByTestId('shared-warning')).toHaveText(
+    `Задача появится в решении «${IDEAS_NAME}», её увидят участники.`,
+  );
+  expect(answered).toBe(false);
+  // отмена — без ответа
+  await confirm.getByRole('button', { name: 'Отмена' }).click();
+  await expect(confirm).toHaveCount(0);
+  expect(answered).toBe(false);
+  await q.getByRole('button', { name: 'начать', exact: true }).click();
+  const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${question.id}/answer`));
+  await confirm.getByRole('button', { name: 'Начать' }).click();
+  expect((await sent).postDataJSON()).toEqual({ option: 'accept', channel: 'webui' });
+  await expect(q).toContainText('Ответ: начать');
+  const e = await api('GET', `entries/${idea.id}`);
+  expect(e.status).toBe('accepted');
+  const tasks = await api<{ items: { id: string }[] }>('GET', `${SP}/entries?kind=task`);
+  expect(tasks.items.some((x) => x.id === e.data.task_id)).toBe(true);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('agent_setup_ideas_toggle_persists', async ({ page }) => {
   const problems = watch(page);
   await page.goto(base());
@@ -389,19 +498,28 @@ test('agent_setup_ideas_toggle_persists', async ({ page }) => {
   const box = page.getByRole('group', { name: 'Типы подсказок' }).getByLabel(/ideas\.proactive$/);
   await expect(box).toBeChecked();
   await expect(page.getByText('Идеи: предлагать (дайджест и подсказки)')).toBeVisible();
-  let saved = page.waitForResponse((r) => r.url().includes('/settings') && r.request().method() === 'PATCH');
-  await box.uncheck();
-  const off = await saved;
-  expect(off.request().postDataJSON()).toEqual({ ideas: { proactive: false } });
-  expect((await off.json()).ideas.proactive).toBe(false);
-  await page.reload();
-  await expect(box).not.toBeChecked();
-  const mine = await page.request.get(`${base()}api/v1/auth/settings`);
-  expect((await mine.json()).ideas).toEqual({ proactive: false });
-  // возвращаем умолчание: остальные сценарии и прогоны не должны видеть выключенное
-  saved = page.waitForResponse((r) => r.url().includes('/settings') && r.request().method() === 'PATCH');
-  await box.check();
-  expect((await (await saved).json()).ideas.proactive).toBe(true);
+  try {
+    const saved = page.waitForResponse((r) => r.url().includes('/settings') && r.request().method() === 'PATCH');
+    await box.uncheck();
+    const off = await saved;
+    expect(off.request().postDataJSON()).toEqual({ ideas: { proactive: false } });
+    expect((await off.json()).ideas.proactive).toBe(false);
+    await page.reload();
+    await expect(box).not.toBeChecked();
+    const mine = await page.request.get(`${base()}api/v1/auth/settings`);
+    expect((await mine.json()).ideas).toEqual({ proactive: false });
+    const back = page.waitForResponse((r) => r.url().includes('/settings') && r.request().method() === 'PATCH');
+    await box.check();
+    expect((await (await back).json()).ideas.proactive).toBe(true);
+  } finally {
+    // умолчание возвращается и при сбое: остальные сценарии и прогоны не видят выключенное
+    const { csrf } = (await (await page.request.get(`${base()}api/v1/auth/me`)).json()) as { csrf: string };
+    const r = await page.request.patch(`${base()}api/v1/auth/settings`, {
+      headers: { 'X-CSRF-Token': csrf },
+      data: { ideas: { proactive: true } },
+    });
+    expect(r.status()).toBe(200);
+  }
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
@@ -449,7 +567,7 @@ test('ctrlk_finds_idea', async ({ page }) => {
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
-test('ctrlk_finds_cached_summary_as_before', async ({ page }) => {
+test('webui_search_finds_cached_summary_ideas_in_defaults', async ({ page }) => {
   // I9: умолчания поиска WebUI теперь включают вид idea, а ключ кэша выжимок прежний — выжимку
   // агента находит поиск сессии WebUI, Ctrl+K работает как раньше
   const problems = watch(page);
