@@ -56,24 +56,33 @@ fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
     None
 }
 
-/// Фразы, которые блок v5 (M5.6) перенёс в протокол `zam guide` ради бюджета 500 токенов (ru и
-/// en): исследование по прошлым опытам, `scope=global` у insight, канонические термины.
+/// Фразы, которые блоки v5 (M5.6) и v6 (M5.7) перенесли в протокол `zam guide` ради бюджета
+/// 500 токенов (ru и en): v5 — исследование по прошлым опытам, `scope=global` у insight,
+/// канонические термины; v6 — «(409 — перечитай)», «заметке — `l0`», «перед работой», «в чате».
 /// GUIDv7 с наибольшим числом токенов bge-m3 в подстановке «(`…`)» — 39 (поиск
 /// восхождением по всем шестнадцатеричным позициям при фиксированных версии и варианте; у
 /// случайных GUIDv7 — 23–36): тест бюджета блока детерминирован (ревью задачи 7 M5.6, I1).
 const WORST_GUID: &str = "d6c5a5d9-c4c7-7f6b-a8b6-d8fd4c9fb6f6";
 
-const MOVED_TO_GUIDE: [&str; 6] = [
+const MOVED_TO_GUIDE: [&str; 14] = [
     "insight_kinds=[experiment,failure]",
     "scope=global",
     "каноническими терминами",
     "canonical terms",
     "не про проект",
     "not about the project",
+    "(409 — перечитай)",
+    "(409 — reread)",
+    "заметке — `l0`",
+    "give notes an `l0`",
+    "перед работой",
+    "before work",
+    "в чате",
+    "in chat",
 ];
 
 #[tokio::test]
-async fn agent_setup_block_v5_under_500_tokens_ru_en() {
+async fn agent_setup_block_v6_under_500_tokens_ru_en() {
     let Some(counter) = bge_counter() else {
         return;
     };
@@ -113,7 +122,7 @@ async fn agent_setup_block_v5_under_500_tokens_ru_en() {
                     .await;
                     let block = j["block"].as_str().unwrap();
                     assert!(
-                        block.starts_with("<!-- zeroaimemory:begin v5 -->\n"),
+                        block.starts_with("<!-- zeroaimemory:begin v6 -->\n"),
                         "{block}"
                     );
                     // подставлены реальные адрес, GUID и имя решения (решение контроллера T11-c)
@@ -146,7 +155,14 @@ async fn agent_setup_block_v5_under_500_tokens_ru_en() {
                          `term`.\n"
                     };
                     assert!(block.contains(code), "{block}");
-                    // перенесены в протокол (M5.6): их в блоке нет
+                    // строка v6 (M5.7): идея — отдельный вид, начинать — только после «начать»
+                    let idea = if lang == "ru" {
+                        "- Идея → `idea`; начинать её — только после ответа человека «начать».\n"
+                    } else {
+                        "- Idea → `idea`; start it only after the human answers “start”.\n"
+                    };
+                    assert!(block.contains(idea), "{block}");
+                    // перенесены в протокол (M5.6, M5.7): их в блоке нет
                     for moved in MOVED_TO_GUIDE {
                         assert!(!block.contains(moved), "{moved}: {block}");
                     }
@@ -173,10 +189,10 @@ async fn agent_setup_block_v5_under_500_tokens_ru_en() {
 async fn agent_setup_contains_axiom_rule_and_rev_rule() {
     let a = api("agent-setup-rules", |_| {}).await;
     let ru = setup(&a, &a.token, "agent=claude").await;
-    assert_eq!(ru["version"], 5);
+    assert_eq!(ru["version"], 6);
     assert_eq!(ru["lang"], "ru");
     let b = ru["block"].as_str().unwrap();
-    assert!(b.starts_with("<!-- zeroaimemory:begin v5 -->\n"), "{b}");
+    assert!(b.starts_with("<!-- zeroaimemory:begin v6 -->\n"), "{b}");
     assert!(b.ends_with("<!-- zeroaimemory:end -->\n"), "{b}");
     assert!(
         b.contains("ZeroAIMemoryUrl=http://memory.lan:7700\n"),
@@ -186,14 +202,16 @@ async fn agent_setup_contains_axiom_rule_and_rev_rule() {
         "`axiom` — только по прямому указанию пользователя",
         "`hypothesis`/`theorem` с `contradicts`",
         "`certainty` меняй с `reason`",
-        "`memory_update_entry` с `rev` правит (409 — перечитай)",
+        "`memory_update_entry` с `rev` правит.\n",
         "`memory_search`",
         "`memory_cache_put`",
         "`memory_vault`",
         "`memory_recall`",
-        // правила v3 (M4.5 §11)
-        "Задача → `task`: claim перед работой, `status` с `next_step`",
-        "Вопрос человеку → `question`; его ответ в чате → `answer`",
+        // правила v3 (M4.5 §11), строки задач и вопросов слиты в v6 (M5.7)
+        "- Задача → `task` (claim, `status` с `next_step`); вопрос человеку → `question`, его \
+         ответ → `answer`.\n",
+        // правило v6 (M5.7): идеи
+        "- Идея → `idea`; начинать её — только после ответа человека «начать».\n",
         "новое понятие → `term`.",
         // правило v5 (M5.6): ссылка на символ, карта и карточка символа
         "Код — `refs.files`, функция — `путь#Тип::метод`",
@@ -201,19 +219,21 @@ async fn agent_setup_contains_axiom_rule_and_rev_rule() {
         "после сжатия — `recovery`; субагенту — `brief`",
         // без решения — его создаст `zam init`; Rules — по настройке сервера (закрыты)
         "(создаёт `zam init`)",
-        "Секреты, хосты → `memory_vault`; заметке — `l0`.\n",
+        "- Секреты, хосты → `memory_vault`.\n",
     ] {
         assert!(b.contains(want), "{want}: {b}");
     }
     let en = setup(&a, &a.token, "agent=codex&lang=en&rules_write=true").await;
     let b = en["block"].as_str().unwrap();
     for want in [
-        "<!-- zeroaimemory:begin v5 -->",
+        "<!-- zeroaimemory:begin v6 -->",
         "`axiom` — only on the user's direct instruction",
         "`hypothesis`/`theorem` with `contradicts`",
-        "`memory_update_entry` with `rev` edits (409 — reread)",
-        "Task → `task`: claim before work, `status` with `next_step`",
-        "their answer in chat → `answer`",
+        "`memory_update_entry` with `rev` edits.\n",
+        "- Task → `task` (claim, `status` with `next_step`); question for the human → \
+         `question`, their answer → `answer`.\n",
+        "- Idea → `idea`; start it only after the human answers “start”.\n",
+        "- Secrets, hosts → `memory_vault`. Shared rules go to Rules.\n",
         "new concept → `term`",
         "Code — `refs.files`, a function — `path#Type::method`",
         "map — `zam code map`, symbol — `zam code sym`",
@@ -522,7 +542,7 @@ async fn template_edit_bumps_version() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let s = r.json();
-    assert_eq!(s["agent_setup"]["version"], 5);
+    assert_eq!(s["agent_setup"]["version"], 6);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], false);
     assert!(
         s["agent_setup"]["templates"]["codex.en"]["text"]
@@ -530,9 +550,9 @@ async fn template_edit_bumps_version() {
             .unwrap()
             .contains("{url}")
     );
-    assert!(!reminder(&a, 5).await.contains("устарел"));
+    assert!(!reminder(&a, 6).await.contains("устарел"));
 
-    // свой шаблон: версия 6, блок — свой текст с маркером v6
+    // свой шаблон: версия 7, блок — свой текст с маркером v7
     let tpl = "## Память\nZeroAIMemoryUrl={url}\nРешение: {solution}. {rules}\r\n";
     let (st, s) = admin_settings(
         &a,
@@ -540,29 +560,29 @@ async fn template_edit_bumps_version() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{s}");
-    assert_eq!(s["agent_setup"]["version"], 6);
+    assert_eq!(s["agent_setup"]["version"], 7);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], true);
     let j = setup(&a, &a.token, "agent=claude").await;
-    assert_eq!(j["version"], 6);
+    assert_eq!(j["version"], 7);
     assert_eq!(j["template_custom"], true);
     assert_eq!(
         j["block"],
-        "<!-- zeroaimemory:begin v6 -->\n## Память\nZeroAIMemoryUrl=http://memory.lan:7700\n\
+        "<!-- zeroaimemory:begin v7 -->\n## Память\nZeroAIMemoryUrl=http://memory.lan:7700\n\
          Решение: `.zeroaimemory/solution.toml` (создаёт `zam init`).\n\
          <!-- zeroaimemory:end -->\n"
     );
     // версия одна на сервер: и у других агентов и языков
     assert_eq!(
         setup(&a, &a.token, "agent=codex&lang=en").await["version"],
-        6
+        7
     );
     // /recall(session_start) сравнивает с той же версией
-    let t = reminder(&a, 5).await;
+    let t = reminder(&a, 6).await;
     assert!(
-        t.contains("Блок ZeroAIMemory устарел (v5 → v6): обнови через `zam init` или WebUI"),
+        t.contains("Блок ZeroAIMemory устарел (v6 → v7): обнови через `zam init` или WebUI"),
         "{t}"
     );
-    assert!(!reminder(&a, 6).await.contains("устарел"));
+    assert!(!reminder(&a, 7).await.contains("устарел"));
 
     // тот же текст повторно — версия не меняется; другой — растёт; сброс — тоже растёт
     let (_, s) = admin_settings(
@@ -570,26 +590,26 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"claude.ru": tpl}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 6);
+    assert_eq!(s["agent_setup"]["version"], 7);
     let (_, s) = admin_settings(
         &a,
         json!({"agent_setup": {"templates": {"claude.ru": "{url} шаблон-v4-маркер", "agents.en": "{url} en"}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 7, "один запрос — одна версия");
+    assert_eq!(s["agent_setup"]["version"], 8, "один запрос — одна версия");
     let (_, s) = admin_settings(
         &a,
         json!({"agent_setup": {"templates": {"claude.ru": null}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 8);
+    assert_eq!(s["agent_setup"]["version"], 9);
     assert_eq!(s["agent_setup"]["templates"]["claude.ru"]["custom"], false);
     let j = setup(&a, &a.token, "agent=claude").await;
     assert!(
         j["block"]
             .as_str()
             .unwrap()
-            .starts_with("<!-- zeroaimemory:begin v8 -->\n## Память ZeroAIMemory\n")
+            .starts_with("<!-- zeroaimemory:begin v9 -->\n## Память ZeroAIMemory\n")
     );
     // сброс шаблона по умолчанию — без изменения версии
     let (_, s) = admin_settings(
@@ -597,7 +617,7 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"codex.ru": null}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 8);
+    assert_eq!(s["agent_setup"]["version"], 9);
     // сохранение текста, совпадающего с действующим (здесь — по умолчанию), версию не меняет
     // (fix round 1, M-4)
     let default_en = s["agent_setup"]["templates"]["codex.en"]["text"].clone();
@@ -606,7 +626,7 @@ async fn template_edit_bumps_version() {
         json!({"agent_setup": {"templates": {"codex.en": default_en}}}),
     )
     .await;
-    assert_eq!(s["agent_setup"]["version"], 8);
+    assert_eq!(s["agent_setup"]["version"], 9);
     assert_eq!(s["agent_setup"]["templates"]["codex.en"]["custom"], false);
 
     // неверные шаблоны и ключи — 400, токен — 403
@@ -643,7 +663,7 @@ async fn template_edit_bumps_version() {
         "текст шаблона в аудите"
     );
     assert_eq!(e[0]["details"]["reset"], true);
-    assert_eq!(e[0]["details"]["version"], 8);
+    assert_eq!(e[0]["details"]["version"], 9);
 }
 
 #[tokio::test]
@@ -710,11 +730,11 @@ async fn template_preview_renders_unsaved() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
-    assert_eq!(j["version"], 5);
-    assert_eq!(j["version_next"], 6);
+    assert_eq!(j["version"], 6);
+    assert_eq!(j["version_next"], 7);
     assert_eq!(
         j["block"],
-        "<!-- zeroaimemory:begin v6 -->\nПамять: http://memory.lan:7700\n\
+        "<!-- zeroaimemory:begin v7 -->\nПамять: http://memory.lan:7700\n\
          Решение: «Пример» (`00000000-0000-0000-0000-000000000000`).\n\
          <!-- zeroaimemory:end -->\n"
     );
@@ -726,7 +746,7 @@ async fn template_preview_renders_unsaved() {
         .json();
     let def = s["agent_setup"]["templates"]["claude.ru"]["text"].clone();
     let r = preview(json!({"agent": "claude", "lang": "ru", "template": def})).await;
-    assert_eq!(r.json()["version_next"], 5, "{}", r.text());
+    assert_eq!(r.json()["version_next"], 6, "{}", r.text());
     // проверка — как у сохранения; версия не меняется
     let r = preview(json!({"agent": "claude", "lang": "ru", "template": "без адреса"})).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
@@ -736,7 +756,7 @@ async fn template_preview_renders_unsaved() {
         .adm(Method::GET, "/api/v1/admin/settings", None, None)
         .await
         .json();
-    assert_eq!(s["agent_setup"]["version"], 5);
+    assert_eq!(s["agent_setup"]["version"], 6);
     // токен — 403
     let r = a
         .tok_h(
@@ -857,18 +877,17 @@ async fn agent_setup_codex_hooks_new_events() {
     assert_eq!(h.as_object().unwrap().len(), 7, "{h}");
 }
 
-/// Блок v4 из M5.5 устарел (M5.6 — строка о карте кода и ссылках на символы):
-/// `/recall(session_start)` напоминает обновить его до v5.
+/// Блок v5 из M5.6 устарел (M5.7 — строка об идеях, фразы перенесены в протокол):
+/// `/recall(session_start)` напоминает обновить его до v6 — одним уведомлением.
 #[tokio::test]
-async fn block_version_reminder_v4_to_v5() {
-    let a = api("agent-setup-v4-v5", |_| {}).await;
-    let t = reminder(&a, 4).await;
-    assert!(
-        t.contains("Блок ZeroAIMemory устарел (v4 → v5): обнови через `zam init` или WebUI"),
-        "{t}"
-    );
-    assert!(!reminder(&a, 5).await.contains("устарел"));
-    assert_eq!(setup(&a, &a.token, "agent=claude").await["version"], 5);
+async fn block_version_reminder_v5_to_v6() {
+    let a = api("agent-setup-v5-v6", |_| {}).await;
+    let t = reminder(&a, 5).await;
+    let want = "Блок ZeroAIMemory устарел (v5 → v6): обнови через `zam init` или WebUI";
+    assert_eq!(t.matches(want).count(), 1, "{t}");
+    assert_eq!(t.matches("устарел").count(), 1, "{t}");
+    assert!(!reminder(&a, 6).await.contains("устарел"));
+    assert_eq!(setup(&a, &a.token, "agent=claude").await["version"], 6);
 }
 
 /// Протокол `GET /agent-guide` (ru, en) — раздел об отчётах: для кого, когда, ссылки на
@@ -1014,6 +1033,92 @@ async fn guide_has_code_map_section_and_moved_phrases() {
     assert!(section(&en, "Writing").contains("`scope=global`"));
     assert!(section(&en, "Glossary").contains("Write with canonical terms"));
     // в блоке перенесённых фраз нет (ru и en)
+    for lang in ["ru", "en"] {
+        let j = setup(&a, &a.token, &format!("agent=claude&lang={lang}")).await;
+        let block = j["block"].as_str().unwrap();
+        for moved in MOVED_TO_GUIDE {
+            assert!(!block.contains(moved), "{lang}: {moved}: {block}");
+        }
+    }
+}
+
+/// Протокол (M5.7): раздел «Идеи» / «Ideas» (ru, en) и четыре фразы, перенесённые из блока v6
+/// ради бюджета 500 токенов, — в своих разделах протокола; в блоке их нет.
+#[tokio::test]
+async fn guide_has_ideas_section_and_moved_phrases() {
+    let a = api("agent-guide-ideas", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    fn section<'a>(g: &'a str, title: &str) -> &'a str {
+        let sec = g
+            .split(&format!("\n## {title}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("нет раздела «## {title}»"));
+        sec.split("\n## ").next().unwrap()
+    }
+    let ru = guide("").await;
+    let ideas = section(&ru, "Идеи");
+    for want in [
+        "`idea`",
+        "`origin: human`",
+        "`origin: agent`",
+        "### Идеи",
+        "action=propose",
+        "начать / отложить / отказаться",
+        "`option`",
+        "`by: human`",
+        "`horizon`",
+        "Без ответа «начать» не начинай",
+        "`k:`",
+        "`derived_from`",
+        "Knowledge",
+        "`ideas.proactive`",
+        "`w:`",
+    ] {
+        assert!(ideas.contains(want), "{want}: {ideas}");
+    }
+    assert!(section(&ru, "Запись").contains("(409 — перечитай)"));
+    assert!(section(&ru, "Запись").contains("заметке — `l0`"));
+    assert!(section(&ru, "Задачи и передача работы").contains("перед работой"));
+    assert!(section(&ru, "Вопросы человеку").contains("в чате"));
+    let en = guide("?lang=en").await;
+    let ideas = section(&en, "Ideas");
+    for want in [
+        "`idea`",
+        "`origin: human`",
+        "`origin: agent`",
+        "### Идеи",
+        "action=propose",
+        "start / postpone / decline",
+        "`option`",
+        "`by: human`",
+        "`horizon`",
+        "Without the answer “start”, do not start",
+        "`k:`",
+        "`derived_from`",
+        "Knowledge",
+        "`ideas.proactive`",
+        "`w:`",
+    ] {
+        assert!(ideas.contains(want), "{want}: {ideas}");
+    }
+    assert!(section(&en, "Writing").contains("(409 — reread)"));
+    assert!(section(&en, "Writing").contains("give notes an `l0`"));
+    assert!(section(&en, "Tasks and handing work over").contains("before work"));
+    assert!(section(&en, "Questions for the human").contains("in chat"));
     for lang in ["ru", "en"] {
         let j = setup(&a, &a.token, &format!("agent=claude&lang={lang}")).await;
         let block = j["block"].as_str().unwrap();

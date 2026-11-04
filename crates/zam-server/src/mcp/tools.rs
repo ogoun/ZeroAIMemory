@@ -112,15 +112,15 @@ impl ToolName {
             }
             ToolName::Log => {
                 "Запись журнала: kind changelog|release, insight (data.kind, triggers, scope, \
-                 certainty), term (data.definition, aliases), task, question (data.options); \
+                 certainty), term (data.definition, aliases), task, idea, question (data.options); \
                  refs.files — файлы. report — отчёт пользователю, неизменяем: images [{name, \
                  data base64}], большой — zam report. Дубль insight — 409: force."
             }
             ToolName::UpdateEntry => {
                 "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
-                 claim|release|answer; rev — ревизия (кроме feedback, claim, release, answer). \
-                 certify — certainty, reason; feedback — value; задача: status, claim, release; \
-                 вопрос: answer (option, text, by обязателен), status obsolete."
+                 claim|release|answer|propose|decide; rev — ревизия (кроме feedback, claim, \
+                 release, answer). certify — certainty, reason; feedback — value; задача: status, \
+                 claim, release; вопрос: answer (by обязателен), status obsolete."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
@@ -253,10 +253,10 @@ impl ToolName {
             ),
             ToolName::Log => (
                 json!({
-                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "question", "report"]},
+                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "idea", "question", "report"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}"},
+                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}; idea: origin обязателен — human (записана по словам человека) | agent (своя мысль: не предлагается, человек принимает её в WebUI), priority low|normal|high, horizon YYYY-MM-DD («не раньше»), links"},
                     "images": {"type": "array", "description": "report: файлы по ссылкам тела ![…](figs/a.png); name — путь из ссылки, data — base64",
                         "items": {"type": "object", "properties": {
                             "name": {"type": "string"}, "data": {"type": "string"}},
@@ -278,20 +278,26 @@ impl ToolName {
             ToolName::UpdateEntry => (
                 json!({
                     "id": {"type": "string"},
-                    "rev": {"type": "integer"},
+                    "rev": {"type": "integer",
+                        "description": "ревизия записи; не нужна у feedback, claim, release, answer, propose, decide"},
                     "action": {"type": "string", "enum": ["supersede", "retract", "revisit",
-                        "certify", "append", "feedback", "status", "claim", "release", "answer"]},
+                        "certify", "append", "feedback", "status", "claim", "release", "answer",
+                        "propose", "decide"]},
                     "status": {"type": "string", "description": "задача: open, in_progress, blocked, done, dropped"},
                     "next_step": {"type": ["string", "null"]},
                     "blocked_by": {"type": ["string", "null"]},
                     "ttl_min": {"type": "integer", "minimum": 1, "maximum": 1440},
                     "agent": {"type": "string"},
-                    "option": {"type": "string", "description": "answer: ключ варианта вопроса"},
-                    "text": {"type": "string", "description": "answer: текст ответа"},
+                    "option": {"type": "string", "description": "answer: ключ варианта вопроса (option, text или оба: text — свободный ответ); у вопроса-предложения идеи обязателен: accept (начать), defer (отложить, с horizon), decline (отказаться)"},
+                    "text": {"type": "string", "description": "answer: текст ответа; propose: почему идея подходит сейчас (до 2000 символов)"},
                     "channel": {"type": "string", "enum": ["chat", "cli"],
-                        "description": "answer: где человек ответил (по умолчанию chat)"},
+                        "description": "answer, decide: где человек ответил (по умолчанию chat)"},
                     "by": {"type": "string", "enum": ["human", "agent"],
-                        "description": "answer: обязателен — human: ответ человека (axiom), agent: решение агента (hypothesis)"},
+                        "description": "answer, decide: обязателен — human: слова человека (axiom), agent: решение агента (hypothesis; у идеи — только decline своей)"},
+                    "decision": {"type": "string", "enum": ["accept", "defer", "decline", "reopen"],
+                        "description": "decide: решение человека по идее w: (by обязателен; без ответа «начать» не начинай); accept создаёт задачу k:, reopen — с reason"},
+                    "horizon": {"type": "string", "description": "decide defer и answer defer вопроса-предложения: «не раньше» YYYY-MM-DD (UTC, позже сегодня; по умолчанию +30 дней)"},
+                    "space": {"type": "string", "description": "propose, decide accept: пространство будущей задачи (GUID решения); по умолчанию — решение запроса"},
                     "title": {"type": "string"},
                     "body": {"type": "string", "description": "supersede — тело; append — дописать"},
                     "data": {"type": "object"},
@@ -1003,6 +1009,25 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
     })
 }
 
+/// Итог решения по идее (`decide`, ответ на вопрос-предложение): `Идея w:<id>: <статус>`, при
+/// «начать» — ` → задача k:<id>`.
+fn idea_outcome(v: &Value) -> String {
+    let idea = if v["idea"].is_object() {
+        &v["idea"]
+    } else {
+        &v["entry"]
+    };
+    let mut s = format!(
+        "Идея w:{}: {}",
+        idea["id"].as_str().unwrap_or("?"),
+        idea["status"].as_str().unwrap_or("?")
+    );
+    if let Some(t) = v["task"]["id"].as_str() {
+        s.push_str(&format!(" → задача k:{t}"));
+    }
+    s
+}
+
 /// Строка записи журнала: `i:<id> insight/<вид> «заголовок» rev<N> · status · certainty`.
 fn entry_line(e: &Value) -> String {
     let kind = e["kind"].as_str().unwrap_or("entry");
@@ -1029,7 +1054,7 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
     let kind = req_str(args, "kind")?;
     if zam_store::EntryKind::parse(kind).is_none() {
         return Err(Fail::Invalid(
-            "kind: changelog, insight, release, term, task, question или report".into(),
+            "kind: changelog, insight, release, term, task, idea, question или report".into(),
         ));
     }
     req_str(args, "title")?;
@@ -1186,7 +1211,10 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
                     "answer: укажите by: human — ответ человека, by: agent — решение агента".into(),
                 ));
             }
-            let mut b = pick(args, &["text", "option", "channel", "by", "message"]);
+            let mut b = pick(
+                args,
+                &["text", "option", "horizon", "channel", "by", "message"],
+            );
             b.entry("channel").or_insert_with(|| json!("chat"));
             let r = call_rest(
                 rest,
@@ -1197,12 +1225,64 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             )
             .await?;
             return done(f, &r, |v| {
-                format!(
+                let mut s = format!(
                     "Ответ записан {}\nРешение {}",
                     entry_line(&v["entry"]),
                     entry_line(&v["decision"])
+                );
+                // ответ на вопрос-предложение: переход идеи (и задача при «начать»)
+                if v["idea"].is_object() {
+                    s.push('\n');
+                    s.push_str(&idea_outcome(v));
+                }
+                s
+            });
+        }
+        "propose" => {
+            let b = pick(args, &["text", "space", "message"]);
+            let r = call_rest(
+                rest,
+                Method::POST,
+                &format!("{entry}/propose"),
+                Some(&Value::Object(b)),
+                &[],
+            )
+            .await?;
+            return done(f, &r, |v| {
+                format!(
+                    "Предложено w:{} → вопрос q:{}\nСпроси человека: начать, отложить или \
+                     отказаться; без ответа «начать» не начинай.",
+                    v["entry"]["id"].as_str().unwrap_or("?"),
+                    v["question"]["id"].as_str().unwrap_or("?")
                 )
             });
+        }
+        "decide" => {
+            // как у answer: решение по идее — слова человека или агента, умолчания нет
+            if !args.get("by").is_some_and(Value::is_string) {
+                return Err(Fail::Invalid(
+                    "decide: укажите by: human — решение человека (его слова); by: agent — \
+                     только decline своей идеи"
+                        .into(),
+                ));
+            }
+            req_str(args, "decision")?;
+            let mut b = pick(
+                args,
+                &[
+                    "decision", "horizon", "reason", "by", "channel", "space", "message",
+                ],
+            );
+            b.entry("channel").or_insert_with(|| json!("chat"));
+            let r = call_rest(
+                rest,
+                Method::POST,
+                &format!("{entry}/decide"),
+                Some(&Value::Object(b)),
+                &[],
+            )
+            .await?;
+            return done(f, &r, idea_outcome);
         }
         "claim" => (
             Method::POST,
@@ -1229,7 +1309,7 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         _ => {
             return Err(Fail::Invalid(
                 "action: supersede, retract, revisit, certify, append, feedback, status, claim, \
-                 release или answer"
+                 release, answer, propose или decide"
                     .into(),
             ));
         }
@@ -2041,10 +2121,10 @@ mod tests {
     /// (спецификация M4.5 §1.3); строка записи печатает букву своего вида.
     #[test]
     fn entry_ref_letters() {
-        for p in ["i", "c", "r", "t", "k", "q", "p", "e", "entry"] {
+        for p in ["i", "c", "r", "t", "k", "q", "p", "w", "e", "entry"] {
             assert_eq!(entry_id(&format!("{p}:01ABC")), "01ABC", "{p}");
         }
-        for p in ["i", "c", "r", "t", "k", "q", "p"] {
+        for p in ["i", "c", "r", "t", "k", "q", "p", "w"] {
             assert_eq!(graph_ref(&format!("{p}:01ABC")), "e:01ABC", "{p}");
         }
         assert_eq!(graph_ref("e:01ABC"), "e:01ABC");
@@ -2055,6 +2135,7 @@ mod tests {
             ("question", "q"),
             ("insight", "i"),
             ("report", "p"),
+            ("idea", "w"),
         ] {
             let line = entry_line(&json!({"id": "01ABC", "kind": kind, "title": "x", "rev": 1}));
             assert!(

@@ -6,7 +6,8 @@
 //!   `zam hook session-start` обновляет кэш триггеров, сервер останавливается, и `pre-tool`
 //!   (Write `deploy.sh`) и `post-tool` («bad interpreter») выдают подсказки без сети;
 //! - `hook_budgets` — p95 каждого хука на корпусе eval в пределах бюджетов §10.3 с запасом ×2
-//!   (M4.5: и `post-tool` успеха — 50 мс без сети, и `subagent-start` — 300 мс);
+//!   (M4.5: и `post-tool` успеха — 50 мс без сети, и `subagent-start` — 300 мс; M5.7 — с 50
+//!   идеями в решении: раздел `### Идеи` и отдельный поиск идей к `prompt`);
 //! - `source_change_marks_cache_stale` — изменение источника выжимки → `stale` (критерий §19);
 //! - `fail_open_when_server_down` — все пять хуков при выключенном и при зависшем сервере;
 //! - `shared_solution_cache_and_recall` — участник общего решения видит общий кэш и подсказки
@@ -801,6 +802,22 @@ fn hook_budgets() {
         &[],
     );
     assert_eq!(code, 201, "{v}");
+    // M5.7: 50 идей человека в решении — раздел `### Идеи` дайджеста и отдельный поиск идей
+    // к `prompt` входят в те же бюджеты
+    let topics = ["кэш", "деплой", "поиск", "логирование", "миграции"];
+    for i in 0..50 {
+        let (code, v) = srv.call(
+            0,
+            "POST",
+            &format!("/api/v1/spaces/{GA}/entries"),
+            Some(
+                &json!({"kind": "idea", "title": format!("Идея {i}: улучшить {}", topics[i % 5]),
+                         "body": "Замысел на будущее.", "data": {"origin": "human"}}),
+            ),
+            &[],
+        );
+        assert_eq!(code, 201, "{v}");
+    }
     std::fs::create_dir_all(p.repo.join("src")).unwrap();
     std::fs::write(p.repo.join("src/pool.rs"), "pub fn pool() {}\n").unwrap();
     // кэш триггеров — до pre-tool

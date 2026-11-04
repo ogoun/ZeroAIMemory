@@ -2472,3 +2472,260 @@ async fn mcp_code_refs_markdown_capped() {
     assert!(o.contains("файлов 31:"), "{o}");
     assert!(o.contains("… ещё 11 (полный список — format: json)"), "{o}");
 }
+
+// ---- идеи (M5.7, задача 3) ----
+
+/// Идея человека токеном через MCP: `id`.
+async fn mcp_idea(a: &Api, title: &str) -> String {
+    let o = ok(
+        a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "idea", "title": title, "space": "knowledge",
+               "data": {"origin": "human"}}),
+    )
+    .await;
+    assert!(o.text.starts_with("Записано w:"), "{}", o.text);
+    o.text
+        .trim_start_matches("Записано w:")
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// `memory_log kind=idea` без `data.origin` — ошибка с подсказкой human|agent; с ним — `w:`.
+#[tokio::test]
+async fn mcp_log_idea_requires_origin() {
+    let a = api("mcp-idea-origin", |_| {}).await;
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "idea", "title": "Тёмная тема", "space": "knowledge"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(
+        o.text.contains("origin") && o.text.contains("human") && o.text.contains("agent"),
+        "{}",
+        o.text
+    );
+    mcp_idea(&a, "Тёмная тема").await;
+}
+
+/// `propose` → вопрос с тремя вариантами; ответ `accept` человека из чата → задача.
+#[tokio::test]
+async fn mcp_propose_then_answer_accept_creates_task() {
+    let a = api("mcp-idea-accept", |_| {}).await;
+    let id = mcp_idea(&a, "Экспорт отчётов в PDF").await;
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("w:{id}"), "action": "propose", "text": "подходит к задаче"}),
+    )
+    .await;
+    let head = format!("Предложено w:{id} → вопрос q:");
+    assert!(o.text.starts_with(&head), "{}", o.text);
+    let qid = o.text[head.len()..]
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .unwrap()
+        .to_string();
+    let q = a
+        .t(Method::GET, &format!("/api/v1/entries/{qid}"), None)
+        .await
+        .json();
+    let keys: Vec<&str> = q["data"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["accept", "defer", "decline"], "{q}");
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("q:{qid}"), "action": "answer", "option": "accept",
+               "by": "human"}),
+    )
+    .await;
+    assert!(
+        o.text
+            .contains(&format!("Идея w:{id}: accepted → задача k:")),
+        "{}",
+        o.text
+    );
+    let idea = a
+        .t(Method::GET, &format!("/api/v1/entries/{id}"), None)
+        .await
+        .json();
+    assert_eq!(idea["status"], "accepted", "{idea}");
+    let task = idea["data"]["task_id"].as_str().unwrap();
+    let t = a
+        .t(Method::GET, &format!("/api/v1/entries/{task}"), None)
+        .await
+        .json();
+    assert_eq!(t["kind"], "task", "{t}");
+    assert_eq!(t["status"], "open", "{t}");
+}
+
+/// `decide` агентом за человека — ошибка 403 с текстом правила; без `by` — подсказка; `by:
+/// human` — переход и строка `Идея w:…: accepted → задача k:…`.
+#[tokio::test]
+async fn mcp_decide_by_agent_403_text() {
+    let a = api("mcp-idea-decide", |_| {}).await;
+    let id = mcp_idea(&a, "Голосовой ввод").await;
+    let w = format!("w:{id}");
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": w, "action": "decide", "decision": "accept", "by": "agent"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("Ошибка 403"), "{}", o.text);
+    assert!(
+        o.text.contains("решение по идее принимает человек"),
+        "{}",
+        o.text
+    );
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": w, "action": "decide", "decision": "accept"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("by: human"), "{}", o.text);
+    let st = a
+        .t(Method::GET, &format!("/api/v1/entries/{id}"), None)
+        .await
+        .json();
+    assert_eq!(st["status"], "new", "{st}");
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": w, "action": "decide", "decision": "accept", "by": "human"}),
+    )
+    .await;
+    assert!(
+        o.text
+            .starts_with(&format!("Идея w:{id}: accepted → задача k:")),
+        "{}",
+        o.text
+    );
+}
+
+/// Ответ «отложить до …» из чата: `answer option=defer horizon=<+10 дней>` → идея `deferred`
+/// с этим `horizon`.
+#[tokio::test]
+async fn mcp_answer_defer_with_horizon() {
+    let a = api("mcp-idea-defer", |_| {}).await;
+    let id = mcp_idea(&a, "Резервное копирование").await;
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("w:{id}"), "action": "propose", "format": "json"}),
+    )
+    .await
+    .json();
+    let qid = o["question"]["id"].as_str().unwrap().to_string();
+    let h = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .checked_add(jiff::Span::new().days(10))
+        .unwrap()
+        .to_string();
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("q:{qid}"), "action": "answer", "option": "defer",
+               "horizon": h, "by": "human", "channel": "chat"}),
+    )
+    .await;
+    assert!(
+        o.text.contains(&format!("Идея w:{id}: deferred")),
+        "{}",
+        o.text
+    );
+    let idea = a
+        .t(Method::GET, &format!("/api/v1/entries/{id}"), None)
+        .await
+        .json();
+    assert_eq!(idea["status"], "deferred", "{idea}");
+    assert_eq!(idea["data"]["horizon"], h, "{idea}");
+}
+
+/// Пояснения идей — в `description` полей схемы (`data` у `memory_log`; `decision`, `horizon`,
+/// `space` у `memory_update_entry`), в описаниях инструментов — только имена.
+#[tokio::test]
+async fn mcp_schema_field_descriptions_mention_idea() {
+    let a = api("mcp-idea-schema", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let tool_of = |name: &str| {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .clone()
+    };
+    let log = tool_of("memory_log");
+    assert!(
+        log["description"].as_str().unwrap().contains("idea"),
+        "{log}"
+    );
+    let props = &log["inputSchema"]["properties"];
+    assert!(
+        props["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("idea")),
+        "{log}"
+    );
+    let data = props["data"]["description"].as_str().unwrap();
+    for want in ["idea", "origin", "human", "agent", "priority", "horizon"] {
+        assert!(data.contains(want), "{want}: {data}");
+    }
+    let upd = tool_of("memory_update_entry");
+    let d = upd["description"].as_str().unwrap();
+    assert!(d.contains("propose") && d.contains("decide"), "{d}");
+    let props = &upd["inputSchema"]["properties"];
+    let actions = props["action"]["enum"].as_array().unwrap();
+    assert!(actions.contains(&json!("propose")) && actions.contains(&json!("decide")));
+    assert_eq!(
+        props["decision"]["enum"],
+        json!(["accept", "defer", "decline", "reopen"]),
+        "{upd}"
+    );
+    let dd = props["decision"]["description"].as_str().unwrap();
+    assert!(dd.contains("by"), "{dd}");
+    assert!(
+        props["horizon"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("YYYY-MM-DD"),
+        "{upd}"
+    );
+    assert!(props["space"]["description"].as_str().is_some(), "{upd}");
+    let opt = props["option"]["description"].as_str().unwrap();
+    assert!(opt.contains("text") && opt.contains("accept"), "{opt}");
+}

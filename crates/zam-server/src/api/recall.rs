@@ -61,6 +61,15 @@
 //!   термина решения и Knowledge в первых 512 символах `prompt` —
 //!   `ZeroAIMemory: термин «<имя>» — <определение> — t:<id>`, `reason: glossary`, каждый термин
 //!   раз за сессию (`session_seen`); словарь — из кэша [`crate::glossary::GlossaryCache`];
+//! - **идеи** (M5.7 §6; `[ideas] proactive` сервера и `ideas.proactive` пользователя): в
+//!   дайджесте `session_start` — раздел `### Идеи` сразу после строки открытых вопросов
+//!   ([`digest_ideas`]: строка-указание и до `ideas.digest_max` строк
+//!   `ZeroAIMemory: идея «…» [<priority>] — w:<id>`, `reason: idea`; только пространство
+//!   решения и только первый `session_start` сессии; нет в `recovery` и `brief`); к `prompt` —
+//!   до `ideas.prompt_max` строк отдельного лёгкого поиска идей после основного
+//!   ([`prompt_ideas`]; общие идеи Knowledge — [`knowledge_ideas_related`]). Кандидаты —
+//!   [`zam_store::idea_candidate`]: «от агента», `proposed`, `accepted`, `declined`, `done` и
+//!   `deferred` до `horizon` не предлагаются никогда; показ — `session_seen`, раз за сессию;
 //! - **`post_tool`** — ошибка инструмента: совпадения `error_regex` действующих триггеров
 //!   insight решения и Knowledge (по первым [`ERROR_SCAN_MAX`] байтам `error`; триггер с
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
@@ -144,9 +153,9 @@ use zam_search::recall::{
 };
 use zam_search::truncate_to_tokens;
 use zam_store::{
-    Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, NodeKind, RECALL_PART,
-    SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind, UsageEvent,
-    UsageKind, UsageSource, active_triggers, count_tokens, list_children, list_entries,
+    Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, GraphStore, NodeKind,
+    RECALL_PART, SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind,
+    UsageEvent, UsageKind, UsageSource, active_triggers, count_tokens, list_children, list_entries,
     mark_seen_with_tokens, node_content, record_usages, search_fts_channels, seen_revs,
     touch_session,
 };
@@ -539,6 +548,24 @@ pub const ENVIRONMENT_MAX: usize = 5;
 const REASON_ENVIRONMENT: &str = "environment";
 /// Заголовок раздела дайджеста с открытыми вопросами.
 const SECTION_OPEN_QUESTIONS: &str = "### Открытые вопросы";
+/// Заголовок раздела идей дайджеста (M5.7 §6.1): сразу после строки открытых вопросов.
+const SECTION_IDEAS: &str = "### Идеи";
+/// Строка-указание под заголовком [`SECTION_IDEAS`]: правило «без ответа не начинай» приходит
+/// ровно тогда, когда идея предложена (блок инструкции v6 тратит на него одну строку).
+const IDEAS_HINT: &str = "Предложи человеку одну: memory_update_entry action=propose — вопрос \
+    «начать / отложить / отказаться»; без ответа «начать» не начинай.";
+/// `reason` подсказки-идеи (дайджест и `prompt`).
+const REASON_IDEA: &str = "idea";
+/// Предел заголовка идеи в строке дайджеста и подсказки, символов.
+const IDEA_TITLE_CHARS: usize = 120;
+/// Кандидатов-идей, по которым [`digest_ideas`] проверяет «раздел этой сессии уже был».
+const IDEA_SEEN_FETCH: usize = 100;
+/// Ближайших точек dense при замере косинуса общих идей Knowledge (§6.2).
+const IDEA_COSINE_NEAREST: usize = 50;
+/// Тестовая метка заголовка идеи: отдельный поиск идей к `prompt` «не укладывается в срок»
+/// (фича `test-hooks`, проверка тишины по идеям).
+#[cfg(feature = "test-hooks")]
+pub const TEST_SLOW_IDEA_MARK: &str = "zam-test-slow-idea";
 
 /// Обрезка текста до `max` символов с многоточием.
 fn clip(s: &str, max: usize) -> String {
@@ -685,6 +712,448 @@ async fn question_cands(
         format!("{open_n} открытых: {}", list.join(", "))
     });
     Ok((cands, line))
+}
+
+/// Сегодняшняя дата UTC: `horizon` идеи — «не раньше» по UTC (M5.7 §4).
+fn today_utc() -> jiff::civil::Date {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+}
+
+/// Заголовок идеи в строке: до [`IDEA_TITLE_CHARS`] символов, секреты маскируются.
+fn idea_title(e: &Entry) -> String {
+    zam_markdown::mask_text(&clip(&e.title, IDEA_TITLE_CHARS))
+}
+
+/// Строка идеи дайджеста: `ZeroAIMemory: идея «<заголовок до 120>» [<priority>] — w:<id>`.
+fn idea_line(e: &Entry) -> String {
+    let priority = zam_store::IdeaData::from_stored(&e.data).priority;
+    format!(
+        "ZeroAIMemory: идея «{}» [{}] — {}",
+        idea_title(e),
+        priority.as_str(),
+        entry_ref(e)
+    )
+}
+
+/// Строка подсказки идеи к `prompt` (§6.2).
+fn idea_prompt_line(e: &Entry) -> String {
+    format!(
+        "ZeroAIMemory: к задаче подходит идея «{}» — {} (предложи: action=propose; без ответа \
+         не начинай)",
+        idea_title(e),
+        entry_ref(e)
+    )
+}
+
+/// Подсказка-идея цели `target` со строкой `block` (`kind: idea`, `reason: idea`).
+fn idea_cand(target: usize, e: &Entry, block: String) -> Cand {
+    let mut c = entry_cand(target, e, REASON_IDEA, "");
+    c.block = block;
+    c
+}
+
+/// Проактивность идей (§8): `[ideas] proactive` сервера и `ideas.proactive` пользователя
+/// (`server && user`). Сбой чтения настройки — включено, как у `hooks.<тип>`.
+async fn ideas_enabled(st: &AppState, user: Id) -> bool {
+    if !st.cfg.ideas.proactive {
+        return false;
+    }
+    match super::user_settings::ideas_proactive(&st.system, user).await {
+        Ok(on) => on,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: настройка ideas.proactive не прочитана");
+            true
+        }
+    }
+}
+
+/// Показанные сессии идеи из `cands` цели `target`: один запрос `seen_revs` по их ключам
+/// (`RECALL_PART`, любая ревизия, без эпох — §6.1), как у «Ответов человека». Без сессии —
+/// пусто; сбой чтения — WARN и пусто (как [`shown`]).
+async fn seen_ideas(
+    s: Option<&RequestSession>,
+    targets: &[SearchTarget],
+    target: usize,
+    cands: &[Entry],
+) -> HashSet<Id> {
+    let Some(s) = s else {
+        return HashSet::new();
+    };
+    let keys: Vec<SeenKey> = cands
+        .iter()
+        .map(|e| SeenKey {
+            owner_id: targets[target].owner,
+            target: TargetRef {
+                kind: TargetKind::Entry,
+                id: e.id,
+            }
+            .into(),
+            part: RECALL_PART.to_string(),
+        })
+        .collect();
+    match seen_revs(&s.db, &s.touch.id, &keys).await {
+        Ok(m) => cands
+            .iter()
+            .zip(&keys)
+            .filter(|(_, k)| m.contains_key(*k))
+            .map(|(e, _)| e.id)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: показанные идеи сессии не прочитаны");
+            HashSet::new()
+        }
+    }
+}
+
+/// Идеи раздела [`SECTION_IDEAS`] (§6.1): только пространство решения запроса (личного или
+/// общего — база владельца; Knowledge — нет), до `ideas.digest_max` в порядке
+/// [`zam_store::proactive_ideas`], и только на первом `session_start` сессии — пока ни одна
+/// из кандидатов (до [`IDEA_SEEN_FETCH`]) ей не показана. Иначе каждый `/compact` приносил бы
+/// следующие три (ждёт ответа владельца, вопрос 10).
+async fn digest_ideas(
+    st: &AppState,
+    session: Option<&RequestSession>,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Result<Vec<Cand>, ApiError> {
+    let max = st.cfg.ideas.digest_max as usize;
+    let Some((i, space)) = solution_space(health.targets()) else {
+        return Ok(Vec::new());
+    };
+    if max == 0 || !health.alive[i] {
+        return Ok(Vec::new());
+    }
+    let db = health.targets()[i].db.clone();
+    let Some(r) = deadline
+        .step(zam_store::proactive_ideas(
+            &db,
+            &[space],
+            today_utc(),
+            &HashSet::new(),
+            IDEA_SEEN_FETCH,
+        ))
+        .await
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(cands) = health.soft(i, r)? else {
+        return Ok(Vec::new());
+    };
+    if cands.is_empty() {
+        return Ok(Vec::new());
+    }
+    let targets = health.targets();
+    let Some(seen) = deadline.step(seen_ideas(session, targets, i, &cands)).await else {
+        return Ok(Vec::new());
+    };
+    if !seen.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(cands
+        .iter()
+        .take(max)
+        .map(|e| idea_cand(i, e, idea_line(e)))
+        .collect())
+}
+
+/// Подсказки-идеи к `prompt` (§6.2): отдельный лёгкий поиск после основного (`mode=brief`,
+/// первые 512 символов, `kinds [idea]`, `status [new, deferred]`, `top_k`
+/// `ideas.prompt_top_k`), основной поиск `prompt` не меняется. Идея — кандидат
+/// ([`zam_store::idea_candidate`]); идея решения — с баллом ≥ `recall.prompt_min_score`, общая
+/// идея Knowledge — по [`knowledge_ideas_related`]. Показанное сессии и предел
+/// `ideas.prompt_max` отсекает общий отбор [`recall`]. Срок — остаток общего, но свой: не
+/// уложился — тишина по идеям без предупреждений (ни `recall timeout`, ни ошибок поиска идей).
+async fn prompt_ideas(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    req: &RecallReq,
+    health: &mut Health<'_>,
+    deadline: &Deadline,
+) -> Result<Vec<Cand>, ApiError> {
+    if st.cfg.ideas.prompt_max == 0 {
+        return Ok(Vec::new());
+    }
+    let query: String = req
+        .prompt
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .take(zam_store::search::QUERY_MAX_CHARS)
+        .collect();
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut own = Deadline {
+        at: deadline.at,
+        expired: deadline.expired,
+    };
+    let warned = health.warnings.len();
+    let r = collect_prompt_ideas(st, p, headers, req, &query, health, &mut own).await;
+    health.warnings.truncate(warned);
+    if own.expired {
+        return Ok(Vec::new());
+    }
+    r
+}
+
+/// Сбор [`prompt_ideas`] со своим сроком `d`. Ошибки чтения баз не трогают `health.alive`:
+/// иначе сбой поиска идей снял бы основные подсказки той же цели.
+async fn collect_prompt_ideas(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    req: &RecallReq,
+    query: &str,
+    health: &mut Health<'_>,
+    d: &mut Deadline,
+) -> Result<Vec<Cand>, ApiError> {
+    let body = json!({
+        "query": query,
+        "scope": {"solution": req.solution, "include_knowledge": true, "include_rules": false},
+        "filters": {"kinds": ["idea"], "status": ["new", "deferred"]},
+        "mode": "brief",
+        "top_k": st.cfg.ideas.prompt_top_k,
+        "budget_tokens": PROMPT_SEARCH_BUDGET,
+        "rerank": "off",
+        "skip_seen": false,
+        "no_cache": true,
+        "format": "json",
+    });
+    let area = req.area.as_deref();
+    let Some(v) = inner_search(st, p, headers, area, body, health, d).await? else {
+        return Ok(Vec::new());
+    };
+    let min = st.cfg.recall.prompt_min_score;
+    let today = today_utc();
+    let targets = health.targets();
+    // (цель, идея, общая из Knowledge) в порядке выдачи
+    let mut found: Vec<(usize, Entry, bool)> = Vec::new();
+    for it in v["items"].as_array().into_iter().flatten() {
+        if it["kind"] != "idea" {
+            continue;
+        }
+        let Some(id) = it["entry_id"].as_str().and_then(|s| s.parse::<Id>().ok()) else {
+            continue;
+        };
+        let Some(space) = it["space"]["id"]
+            .as_str()
+            .and_then(|s| s.parse::<Id>().ok())
+        else {
+            continue;
+        };
+        let Some(target) = targets
+            .iter()
+            .position(|t| t.spaces.iter().any(|s| s.id == space))
+        else {
+            continue;
+        };
+        let shared = match it["space"]["kind"].as_str() {
+            Some("solution") if it["score"].as_f64().unwrap_or(0.0) >= min => false,
+            Some("knowledge") => true,
+            _ => continue,
+        };
+        // источник истины — SQLite: `origin`, наступивший `horizon` (статусы выдачи шире)
+        let db = targets[target].db.clone();
+        let Some(r) = d.step(zam_store::get_entry(&db, id)).await else {
+            return Ok(Vec::new());
+        };
+        match r {
+            Ok(e) if zam_store::idea_candidate(&e, today) => found.push((target, e, shared)),
+            Ok(_) | Err(StoreError::NotFound) => {}
+            Err(e) => tracing::warn!(error = %e, "recall: идея подсказки не прочитана"),
+        }
+    }
+    // тестовая задержка (тишина по сроку): только с фичей test-hooks
+    #[cfg(feature = "test-hooks")]
+    if found
+        .iter()
+        .any(|(_, e, _)| e.title.contains(TEST_SLOW_IDEA_MARK))
+    {
+        let left = d.at.saturating_duration_since(Instant::now()) + Duration::from_millis(10);
+        if d.step(tokio::time::sleep(left)).await.is_none() {
+            return Ok(Vec::new());
+        }
+    }
+    let shared: Vec<&Entry> = found.iter().filter(|f| f.2).map(|f| &f.1).collect();
+    let related = if shared.is_empty() {
+        HashSet::new()
+    } else {
+        knowledge_ideas_related(st, req, headers, query, &shared, health, d).await
+    };
+    Ok(found
+        .iter()
+        .filter(|(_, e, shared)| !shared || related.contains(&e.id))
+        .map(|(i, e, _)| idea_cand(*i, e, idea_prompt_line(e)))
+        .collect())
+}
+
+/// **Единственное место правила** «явная связь общей идеи Knowledge с текущей работой»
+/// (ответ 2 владельца; ждёт ответа владельца, вопрос 8): идея из `ideas` проходит, если
+/// - тег или `area` идеи совпадает с тегом или `area` задачи `in_progress`, захваченной
+///   сессией запроса (решение и Knowledge), или у идеи есть ребро (в любую сторону) к такой
+///   задаче либо к записи пространства решения запроса той же базы; или
+/// - абсолютный косинус dense (запрос — идея, лучший чанк) ≥ `ideas.knowledge_min_cosine`
+///   (точки — [`IDEA_COSINE_NEAREST`] ближайших идей Knowledge; нет векторного канала — только
+///   явная связь).
+async fn knowledge_ideas_related(
+    st: &AppState,
+    req: &RecallReq,
+    headers: &HeaderMap,
+    query: &str,
+    ideas: &[&Entry],
+    health: &Health<'_>,
+    d: &mut Deadline,
+) -> HashSet<Id> {
+    let mut out: HashSet<Id> = HashSet::new();
+    let targets = health.targets();
+    let Some((ki, kn)) = personal_space(targets, SpaceKind::Knowledge) else {
+        return out;
+    };
+    let sol = solution_space(targets);
+    // задачи `in_progress`, захваченные сессией запроса
+    let session = req.session_id.clone().or_else(|| {
+        crate::attrib::header_value(headers, SESSION_HEADER)
+            .ok()
+            .flatten()
+    });
+    let mut tasks: Vec<Entry> = Vec::new();
+    if let Some(sid) = session.as_deref() {
+        let now = jiff::Timestamp::now();
+        let spaces: Vec<(usize, Id)> = sol.into_iter().chain([(ki, kn)]).collect();
+        for (i, space) in spaces {
+            let f = EntryFilter {
+                statuses: vec![EntryStatus::InProgress],
+                ..entry_filter(space, EntryKind::Task)
+            };
+            let db = targets[i].db.clone();
+            let Some(r) = d.step(list_entries(&db, f)).await else {
+                return out;
+            };
+            match r {
+                Ok((rows, _)) => tasks.extend(rows.into_iter().filter(|e| {
+                    zam_store::TaskData::from_stored(&e.data)
+                        .claimed_by
+                        .is_some_and(|c| c.session == sid && c.live(now))
+                })),
+                Err(e) => tracing::warn!(error = %e, "recall: задачи сессии не прочитаны"),
+            }
+        }
+    }
+    let task_ids: HashSet<Id> = tasks.iter().map(|t| t.id).collect();
+    // решение той же базы, что Knowledge (рёбра не выходят за базу)
+    let sol_here = sol.filter(|(i, _)| *i == ki).map(|(_, s)| s);
+    let graph_spaces: Vec<Id> = targets[ki].space_ids();
+    for e in ideas {
+        let by_tag = tasks.iter().any(|t| {
+            t.tags.iter().any(|g| e.tags.contains(g)) || (t.area.is_some() && t.area == e.area)
+        });
+        if by_tag {
+            out.insert(e.id);
+            continue;
+        }
+        let start = [TargetRef {
+            kind: TargetKind::Entry,
+            id: e.id,
+        }];
+        let db = targets[ki].db.clone();
+        let Some(r) = d.step(db.neighbors(&start, 1, &[], &graph_spaces)).await else {
+            return out;
+        };
+        match r {
+            Ok(g) => {
+                if g.nodes.iter().any(|n| {
+                    n.r.id != e.id
+                        && !n.deleted
+                        && (task_ids.contains(&n.r.id) || Some(n.space_id) == sol_here)
+                }) {
+                    out.insert(e.id);
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "recall: связи идеи не прочитаны"),
+        }
+    }
+    if out.len() == ideas.len() {
+        return out;
+    }
+    let min = st.cfg.ideas.knowledge_min_cosine;
+    let cos = knowledge_cosines(st, targets[ki].owner, kn, query, d).await;
+    for e in ideas {
+        if cos.get(&e.id).is_some_and(|c| f64::from(*c) >= min) {
+            out.insert(e.id);
+        }
+    }
+    out
+}
+
+/// Абсолютный косинус dense запроса `query` к идеям Knowledge `space` пользователя `owner`
+/// (лучшая точка записи; [`IDEA_COSINE_NEAREST`] ближайших, статусы — только кандидатов).
+/// Нет векторного канала, срок вышел или сбой — пусто (WARN без текста).
+async fn knowledge_cosines(
+    st: &AppState,
+    owner: Id,
+    space: Id,
+    query: &str,
+    d: &mut Deadline,
+) -> HashMap<Id, f32> {
+    let mut best: HashMap<Id, f32> = HashMap::new();
+    let (Ok(()), Some(emb), Some(vector)) = (
+        st.index.vector_available(),
+        st.index.embedder.clone(),
+        st.index.vector.clone(),
+    ) else {
+        return best;
+    };
+    // эмбеддинг запроса — из LRU-кэша эмбеддера (основной поиск уже считал тот же текст)
+    let text = query.to_string();
+    let Some(r) = d
+        .step(tokio::task::spawn_blocking(move || emb.embed_query(&text)))
+        .await
+    else {
+        return best;
+    };
+    let dense = match r {
+        Ok(Ok(e)) => e.dense,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "recall: эмбеддинг запроса для идей не удался");
+            return best;
+        }
+        Err(j) => {
+            tracing::error!(
+                panic = j.is_panic(),
+                "recall: эмбеддинг запроса для идей упал"
+            );
+            return best;
+        }
+    };
+    let filter = zam_index::VectorFilter {
+        kinds: vec!["idea".into()],
+        exclude_statuses: ["proposed", "accepted", "declined", "done"]
+            .map(String::from)
+            .to_vec(),
+        ..zam_index::VectorFilter::scope(owner, vec![space])
+    };
+    let Some(r) = d
+        .step(vector.nearest_dense(&dense, &filter, IDEA_COSINE_NEAREST))
+        .await
+    else {
+        return best;
+    };
+    match r {
+        Ok(hits) => {
+            for h in hits
+                .iter()
+                .filter(|h| h.user_id == owner && h.target.kind == TargetKind::Entry)
+            {
+                let s = best.entry(h.target.id).or_insert(h.score);
+                *s = s.max(h.score);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "recall: косинус идей Knowledge не получен"),
+    }
+    best
 }
 
 /// Строка окружения: `ZeroAIMemory: <имя> — <purpose>; <address>; ограничения: <limits> —
@@ -2088,7 +2557,13 @@ async fn record(
 
 /// Предел подсказок раздела `title`: у пакета под задачу — свои (§9.4), у дайджеста — по
 /// разделу, у разделов без заголовка — строки словаря или общий предел события `limit`.
-fn section_limit(event: Event, title: Option<&str>, cands: &[Cand], limit: usize) -> usize {
+fn section_limit(
+    event: Event,
+    title: Option<&str>,
+    cands: &[Cand],
+    limit: usize,
+    ideas_max: usize,
+) -> usize {
     if event == Event::Brief {
         return match title {
             Some(SECTION_RULES) => RULES_MAX,
@@ -2102,6 +2577,7 @@ fn section_limit(event: Event, title: Option<&str>, cands: &[Cand], limit: usize
         Some("### Решение") => SOLUTION_ROOT_MAX,
         Some(_) => DIGEST_ENTRIES_MAX,
         None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,
+        None if cands.iter().any(|c| c.reason == REASON_IDEA) => ideas_max,
         None => limit,
     }
 }
@@ -2110,16 +2586,19 @@ fn section_limit(event: Event, title: Option<&str>, cands: &[Cand], limit: usize
 /// подсказки записей — уведомления, словарь, открытые вопросы, — пустой список: ни
 /// `session_seen`, ни `usage`). Уведомления — первыми; в пакете восстановления — после задач,
 /// ответов и решений (§9.2), а если других разделов нет — в конце. Открытые вопросы — после
-/// ответов (в пакете — вместе с уведомлениями), строки словаря и проверенных команд — после
-/// правил.
+/// ответов (в пакете — вместе с уведомлениями), за ними — раздел [`SECTION_IDEAS`] (`ideas`,
+/// строка-указание — в заголовке: она выводится, только если вошла хоть одна идея), строки
+/// словаря и проверенных команд — после правил.
 fn arrange<'c>(
     recovery: bool,
     notices: Vec<String>,
     open_line: Option<String>,
+    ideas: Vec<&'c Cand>,
     after_rules: &[String],
     chosen: Vec<(Option<&'static str>, Vec<&'c Cand>)>,
 ) -> (Vec<Section>, Vec<Vec<&'c Cand>>) {
     let mut out = Arranged::default();
+    let mut ideas = ideas;
     let mut notices = Some(notices);
     let mut open_line = open_line;
     if !recovery {
@@ -2145,6 +2624,13 @@ fn arrange<'c>(
             && let Some(line) = open_line.take()
         {
             out.line(Some(SECTION_OPEN_QUESTIONS), vec![line]);
+        }
+        if title == Some(SECTION_ANSWERS) && !recovery && !ideas.is_empty() {
+            out.packed.push(Section {
+                title: Some(format!("{SECTION_IDEAS}\n{IDEAS_HINT}")),
+                blocks: ideas.iter().map(|c| c.block.clone()).collect(),
+            });
+            out.picked.push(std::mem::take(&mut ideas));
         }
         if title == Some(SECTION_RULES) && !after_rules.is_empty() {
             out.line(None, after_rules.to_vec());
@@ -2308,6 +2794,12 @@ pub async fn recall(
 
     // сбор кандидатов
     let mut code_section: Vec<String> = Vec::new();
+    // идеи (M5.7 §6): раздел дайджеста и подсказка `prompt`, `server && user`
+    let ideas_on = enabled
+        && matches!(req.event, Event::SessionStart | Event::Prompt)
+        && !recovery
+        && ideas_enabled(&st, user).await;
+    let mut idea_cands: Vec<Cand> = Vec::new();
     let (notices, sections, repeatable, after_rules, open_line) = match req.event {
         _ if !enabled => (Vec::new(), Vec::new(), true, Vec::new(), None),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
@@ -2324,6 +2816,10 @@ pub async fn recall(
                 &mut deadline,
             )
             .await?;
+            if ideas_on {
+                idea_cands =
+                    digest_ideas(&st, session.as_ref(), &mut health, &mut deadline).await?;
+            }
             (n, s, true, g, o)
         }
         Event::Prompt => {
@@ -2332,9 +2828,15 @@ pub async fn recall(
             let chars = crate::glossary::HINT_TEXT_CHARS;
             let terms = term_cands(&st, prompt, chars, &mut health, &mut deadline).await;
             let c = prompt_hints(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
+            // идеи — отдельным поиском после основного, своей строкой и своим пределом
+            let ideas = if ideas_on {
+                prompt_ideas(&st, &p, &sh, &req, &mut health, &deadline).await?
+            } else {
+                Vec::new()
+            };
             (
                 Vec::new(),
-                vec![(None, terms), (None, c)],
+                vec![(None, terms), (None, c), (None, ideas)],
                 false,
                 Vec::new(),
                 None,
@@ -2376,11 +2878,12 @@ pub async fn recall(
         Event::Prompt => PROMPT_MAX,
         Event::PostTool => POST_TOOL_MAX,
     };
+    let ideas_max = st.cfg.ideas.prompt_max as usize;
     let mut dup: HashSet<TargetRef> = HashSet::new();
     let chosen: Vec<(Option<&'static str>, Vec<&Cand>)> = sections
         .iter()
         .map(|(title, cands)| {
-            let per = section_limit(req.event, *title, cands, limit);
+            let per = section_limit(req.event, *title, cands, limit, ideas_max);
             let chosen: Vec<&Cand> = cands
                 .iter()
                 .filter(|c| health.alive[c.target])
@@ -2391,7 +2894,14 @@ pub async fn recall(
             (*title, chosen)
         })
         .collect();
-    let (mut packed, mut picked) = arrange(recovery, notices, open_line, &after_rules, chosen);
+    // идеи дайджеста — не раздел `sections`: свой отбор уже сделан ([`digest_ideas`])
+    let ideas: Vec<&Cand> = idea_cands
+        .iter()
+        .filter(|c| health.alive[c.target])
+        .filter(|c| dup.insert(c.tref))
+        .collect();
+    let (mut packed, mut picked) =
+        arrange(recovery, notices, open_line, ideas, &after_rules, chosen);
     if !code_section.is_empty() {
         // раздел `### Код` — после `### Файлы`; строки карты не подсказки записей (без учёта)
         packed.push(Section {
@@ -2507,7 +3017,14 @@ mod tests {
             (Some(SECTION_ANSWERS), Vec::new()),
         ];
         let notices = vec!["ZeroAIMemory: уведомление".to_string()];
-        let (packed, picked) = arrange(true, notices, Some("1 открытых: «в»".into()), &[], chosen);
+        let (packed, picked) = arrange(
+            true,
+            notices,
+            Some("1 открытых: «в»".into()),
+            Vec::new(),
+            &[],
+            chosen,
+        );
         assert_eq!(packed.len(), picked.len());
         let titles: Vec<Option<&str>> = packed.iter().map(|s| s.title.as_deref()).collect();
         assert_eq!(
@@ -2531,6 +3048,7 @@ mod tests {
             false,
             vec!["n".into()],
             Some("q".into()),
+            Vec::new(),
             &[
                 "Словарь".to_string(),
                 "Проверенные команды: a (проверено 2026-10-28)".into(),
