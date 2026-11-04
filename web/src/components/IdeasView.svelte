@@ -462,9 +462,10 @@
   }
 
   const ACTIVE = new Set<string>(IDEA_ACTIVE);
-  /** Задача «начать» снята или удалена: идея `accepted` без живой задачи (§5). */
+  /** Задача «начать» снята или удалена: идея `accepted` без живой задачи (§5); нет `task` —
+   * как удалена, по правилу сервера `idea_task_state` (ревью задачи 7, M5). */
   const released = (c: Entry): '' | 'снята' | 'удалена' =>
-    c.status !== 'accepted' || !c.task ? '' : c.task.deleted ? 'удалена' : c.task.status === 'dropped' ? 'снята' : '';
+    c.status !== 'accepted' ? '' : !c.task || c.task.deleted ? 'удалена' : c.task.status === 'dropped' ? 'снята' : '';
 
   const taskHref = (id: string, sp = taskSpace ?? space) => href({ name: 'journal', user, space: sp, journal: 'tasks', entry: id });
   const questionHref = (id: string) => href({ name: 'journal', user, space, journal: 'questions', entry: id });

@@ -21,6 +21,9 @@ const RECALL: &str = "/api/v1/recall";
 const SECTION: &str = "### Идеи";
 const HINT: &str = "Предложи человеку одну: memory_update_entry action=propose — вопрос «начать / \
                     отложить / отказаться»; без ответа «начать» не начинай.";
+/// Добавка к строке-указанию, если в разделе есть идея со снятой задачей (ревью задачи 7, M3).
+const HINT_REOPEN: &str =
+    " Со снятой задачей — предложи вернуть: propose с text, почему пора; решает человек.";
 const INDEXED: Duration = Duration::from_secs(240);
 
 fn sol() -> String {
@@ -1018,7 +1021,7 @@ async fn digest_reopen_mark_once_per_session() {
     assert_eq!(
         lines,
         [
-            HINT.to_string(),
+            format!("{HINT}{HINT_REOPEN}"),
             format!("ZeroAIMemory: идея «Новая идея» [low] — w:{fresh}"),
             format!(
                 "ZeroAIMemory: идея «Снятая идея» [high] — задача снята, можно предложить \
@@ -1062,4 +1065,21 @@ async fn prompt_reopen_hint_mark() {
     assert!(text(&j).lines().any(|l| l == line), "{j}");
     let j = prompt(&a, "s1", "экспорт отчётов в PDF").await;
     assert!(idea_items(&j).is_empty(), "{j}");
+}
+
+/// Ревью задачи 7, I1: принятая идея с живой задачей, совпадающая с запросом лучше, не вытесняет
+/// новую подходящую идею даже при `prompt_top_k = 1`: основной проход ищет только `new` и
+/// `deferred`, `accepted` — вторым проходом и только при идеях со снятой задачей.
+#[tokio::test]
+async fn prompt_live_accepted_does_not_crowd_new_idea() {
+    let a = server("reopen-crowd", |c| c.ideas.prompt_top_k = 1).await;
+    let (_, _) = accepted(&a, "Экспорт отчётов в PDF", json!({})).await;
+    let fresh = idea(&a, &sol(), "Экспорт отчётов в PDF с картинками", json!({})).await;
+    let j = prompt(&a, "s1", "экспорт отчётов в PDF").await;
+    assert_eq!(idea_items(&j), [format!("w:{fresh}")], "{j}");
+    // и наоборот: снятая задача — после новой, но тоже находится (новая уже показана)
+    let (rel, task) = accepted(&a, "Импорт заметок Obsidian", json!({})).await;
+    drop_task(&a, &task).await;
+    let j = prompt(&a, "s2", "импорт заметок Obsidian").await;
+    assert_eq!(idea_items(&j), [format!("w:{rel}")], "{j}");
 }

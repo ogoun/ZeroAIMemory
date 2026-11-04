@@ -1180,6 +1180,21 @@ async fn mcp_descriptions_under_300() {
             d.chars().count()
         );
     }
+    // поля идей `memory_update_entry` — тоже до 300 символов (ревью задачи 7 M5.7, M4)
+    let upd = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_update_entry")
+        .unwrap();
+    for k in ["option", "text", "decision", "horizon", "space", "by"] {
+        let n = upd["inputSchema"]["properties"][k]["description"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .count();
+        assert!(n <= 300, "memory_update_entry.{k}: {n} символов");
+    }
     let need: [(&str, &[&str]); 7] = [
         (
             "memory_log",

@@ -733,6 +733,45 @@ fn task_state(c: &Connection, d: &IdeaData) -> Result<Option<TaskState>, StoreEr
     }))
 }
 
+/// Есть ли в пространствах `spaces` живая идея человека `accepted` со снятой или удалённой
+/// задачей (кандидат §16 без учёта показа и открытого вопроса; один SQL `LIMIT 1`). Нужна,
+/// чтобы второй проход поиска подсказки (`status: accepted`) шёл, только когда есть что искать
+/// (ревью задачи 7, I1).
+pub async fn any_released_idea(db: &Db, spaces: &[Id]) -> Result<bool, StoreError> {
+    if spaces.is_empty() {
+        return Ok(false);
+    }
+    let args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+    db.read(move |c| {
+        let mut st = c.prepare(&format!(
+            "SELECT 1 FROM entries e
+             WHERE e.space_id IN ({}) AND e.kind = 'idea' AND e.deleted_at IS NULL
+               AND e.status = 'accepted' AND json_extract(e.data, '$.origin') = 'human'
+               AND {RELEASED_SQL} AND {NOT_REOPEN_PROPOSED_SQL}
+             LIMIT 1",
+            in_list(args.len())
+        ))?;
+        Ok(st.exists(params_from_iter(args))?)
+    })
+    .await
+}
+
+/// SQL «задача идеи `e` снята или удалена» — то же, что [`task_released`] (нет живой задачи
+/// `data.task_id` не в `dropped`).
+const RELEASED_SQL: &str = "NOT EXISTS (
+    SELECT 1 FROM entries t
+    WHERE t.id = json_extract(e.data, '$.task_id')
+      AND t.deleted_at IS NULL AND t.status IS NOT 'dropped')";
+
+/// SQL «нет открытого предложения «вернуть»» — то же, что `!IdeaData::reopen_proposed`
+/// (`question_id` задан и `proposed_at` позже `decided.at`). Время в `data` пишется
+/// [`fmt_ts`] фиксированной ширины (`…T…​.ffffffZ`), поэтому строки сравнимы лексикографически
+/// (ревью задачи 7, I2).
+const NOT_REOPEN_PROPOSED_SQL: &str = "NOT (json_extract(e.data, '$.question_id') IS NOT NULL
+    AND json_extract(e.data, '$.proposed_at') IS NOT NULL
+    AND json_extract(e.data, '$.proposed_at')
+        > COALESCE(json_extract(e.data, '$.decided.at'), ''))";
+
 /// Состояние задачи идеи `accepted` или `done` для отбора кандидатов (§6, §16): у прочих
 /// статусов — `None`. Задачи нет в данных или она удалена — [`TaskState::Deleted`].
 pub async fn idea_task_state(db: &Db, idea: &Entry) -> Result<Option<TaskState>, StoreError> {
@@ -879,7 +918,14 @@ pub async fn propose_idea(
             if matches!(status, EntryStatus::Proposed | EntryStatus::Accepted)
                 && let Some(q) = open_question(tx, &d)?
             {
-                return Ok(Ok((idea, q)));
+                // вопрос «вернуть», а задача снова живая (рассогласование мимо хуков): вопрос
+                // устаревает «задача возобновлена», ответ — 409 (ревью задачи 7, M6)
+                if status == EntryStatus::Accepted && !task_released(task_state(tx, &d)?) {
+                    let now = fmt_ts(Timestamp::now());
+                    revive_task_tx(tx, idea, &attrib, &now)?;
+                    return Ok(Ok(None));
+                }
+                return Ok(Ok(Some((idea, q))));
             }
             let kind = if status == EntryStatus::Accepted && task_released(task_state(tx, &d)?) {
                 ProposalKind::Reopen
@@ -945,10 +991,14 @@ pub async fn propose_idea(
                 ProposalKind::Reopen => EntryStatus::Accepted,
             };
             revise_with(tx, &idea, Some(next), d.to_value(), None, &attrib, &now)?;
-            Ok(Ok((load_entry(tx, id)?, load_entry(tx, qid)?)))
+            Ok(Ok(Some((load_entry(tx, id)?, load_entry(tx, qid)?))))
         })
     })
-    .await?
+    .await??
+    .ok_or(IdeaError::Transition {
+        from: EntryStatus::Accepted,
+        to: EntryStatus::Proposed.as_str(),
+    })
 }
 
 /// Переход идеи в транзакции писателя (§5.2): проверка [`check_idea_transition`], у `accept` —
@@ -1418,7 +1468,8 @@ pub(crate) fn on_entry_restored_tx(
 /// `horizon ≤ today` (UTC) или в `accepted`, чья задача снята или удалена
 /// ([`task_released`]), без открытого предложения «вернуть» ([`IdeaData::reopen_proposed`];
 /// §16, п. 1). `task` — состояние задачи идеи ([`idea_task_state`]); у `accepted` вызывающий
-/// обязан его передать. Тот же предикат — у дайджеста и подсказки `prompt`.
+/// обязан его передать (`None` у `accepted` — не кандидат). Тот же предикат — у дайджеста и
+/// подсказки `prompt`.
 pub fn idea_candidate(e: &Entry, task: Option<TaskState>, today: Date) -> bool {
     if e.kind != EntryKind::Idea || e.deleted_at.is_some() {
         return false;
@@ -1428,7 +1479,11 @@ pub fn idea_candidate(e: &Entry, task: Option<TaskState>, today: Date) -> bool {
         && match e.status {
             Some(EntryStatus::New) => true,
             Some(EntryStatus::Deferred) => d.horizon.is_some_and(|h| h <= today),
-            Some(EntryStatus::Accepted) => task_released(task) && !d.reopen_proposed(),
+            // у `accepted` `task: None` — состояние не передано: не кандидат (ревью задачи 7,
+            // M2); задачи нет в данных — `Some(Deleted)` от [`idea_task_state`]
+            Some(EntryStatus::Accepted) => {
+                task.is_some_and(|t| task_released(Some(t))) && !d.reopen_proposed()
+            }
             _ => false,
         }
 }
@@ -1476,7 +1531,9 @@ pub async fn proactive_ideas(
     let mut args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
     args.push(today.to_string());
     let seen = seen.clone();
-    // в выдаче SQL не больше `seen` лишних: остальное отсекает тот же предикат
+    // в выдаче SQL не больше `seen` лишних: снятая задача и открытый вопрос «вернуть»
+    // отсекаются уже в SQL (иначе предложенные идеи с новым `updated_at` вытесняли бы прочие
+    // под `LIMIT`), предикат — вторая линия
     let fetch = limit.saturating_add(seen.len());
     db.read(move |c| {
         let mut st = c.prepare(&format!(
@@ -1485,10 +1542,8 @@ pub async fn proactive_ideas(
                AND json_extract(e.data, '$.origin') = 'human'
                AND (e.status = 'new'
                     OR (e.status = 'deferred' AND json_extract(e.data, '$.horizon') <= ?{})
-                    OR (e.status = 'accepted' AND NOT EXISTS (
-                        SELECT 1 FROM entries t
-                        WHERE t.id = json_extract(e.data, '$.task_id')
-                          AND t.deleted_at IS NULL AND t.status IS NOT 'dropped')))
+                    OR (e.status = 'accepted' AND {RELEASED_SQL}
+                        AND {NOT_REOPEN_PROPOSED_SQL}))
              ORDER BY e.status = 'accepted',
                       CASE json_extract(e.data, '$.priority')
                           WHEN 'high' THEN 2 WHEN 'low' THEN 0 ELSE 1 END DESC,

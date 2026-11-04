@@ -288,7 +288,7 @@ impl ToolName {
                     "blocked_by": {"type": ["string", "null"]},
                     "ttl_min": {"type": "integer", "minimum": 1, "maximum": 1440},
                     "agent": {"type": "string"},
-                    "option": {"type": "string", "description": "answer: ключ варианта вопроса (option, text или оба: text — свободный ответ); у вопроса-предложения идеи обязателен: accept (начать), defer (отложить, с horizon), decline (отказаться); у вопроса «вернуть» — reopen (вернуть) или decline"},
+                    "option": {"type": "string", "description": "answer: ключ варианта (option, text или оба; text — свободный ответ); у вопроса-предложения идеи обязателен: accept (начать), defer (отложить, с horizon), decline (отказаться); у «вернуть» — reopen|decline"},
                     "text": {"type": "string", "description": "answer: текст ответа; propose: почему идея подходит сейчас (до 2000 символов), у идеи с пометкой «задача снята» обязателен — почему её пора вернуть"},
                     "channel": {"type": "string", "enum": ["chat", "cli"],
                         "description": "answer, decide: где человек ответил (по умолчанию chat)"},

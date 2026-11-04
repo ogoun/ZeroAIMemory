@@ -2349,3 +2349,126 @@ async fn decide_from_webui_answers_open_reopen_question() {
         assert_eq!(count(&db, DECISIONS).await, before + 1);
     }
 }
+
+/// Ревью задачи 7, I2: открытый вопрос «вернуть» отсекается в SQL, до `LIMIT`: при пределе 1 и
+/// двух идеях со снятой задачей, где у более свежей открыт вопрос, возвращается вторая.
+#[tokio::test]
+async fn proactive_limit_skips_reopen_proposed_in_sql() {
+    let (db, sol, _) = setup("reopen-limit").await;
+    let (older, t1) = accepted_idea(&db, sol, "Старая снятая").await;
+    set_task_status(&db, t1.id, EntryStatus::Dropped).await;
+    reopen_proposed(&db, sol, "Свежая с вопросом").await;
+    let got = proactive_ideas(&db, &[sol], today(), &HashSet::new(), 1)
+        .await
+        .unwrap();
+    assert_eq!(got.iter().map(|e| e.id).collect::<Vec<_>>(), [older.id]);
+    assert!(zam_store::any_released_idea(&db, &[sol]).await.unwrap());
+    // единственная снятая — с открытым вопросом: SQL-проверка второго прохода подсказки — нет
+    let (db2, sol2, _) = setup("reopen-limit-2").await;
+    reopen_proposed(&db2, sol2, "Только с вопросом").await;
+    assert!(!zam_store::any_released_idea(&db2, &[sol2]).await.unwrap());
+    assert!(!zam_store::any_released_idea(&db2, &[]).await.unwrap());
+}
+
+/// Ревью задачи 7, M1: идея принята ответом на вопрос «начать» (`question_id` — отвеченный
+/// вопрос) → задача снята → кандидат → `propose` → не кандидат → вопрос удалён → снова
+/// кандидат; то же с устареванием.
+#[tokio::test]
+async fn accepted_via_start_question_then_reopen_cycle() {
+    let (db, sol, _) = setup("reopen-cycle").await;
+    let i = new_idea(&db, sol, "Через вопрос", "human", "normal").await;
+    let (_, qs) = propose_idea(&db, i.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    let r = answer_question(
+        &db,
+        qs.id,
+        answer(Some("accept"), None, AnswerBy::Human),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let task = r.task.unwrap();
+    assert_eq!(data_of(&r.idea.unwrap()).question_id, Some(qs.id));
+    assert!(!candidate_now(&db, i.id).await, "живая задача");
+    set_task_status(&db, task.id, EntryStatus::Dropped).await;
+    assert!(
+        candidate_now(&db, i.id).await,
+        "отвеченный вопрос «начать» не мешает"
+    );
+    for close in ["delete", "obsolete"] {
+        let (_, q) = propose_idea(&db, i.id, Some("пора".into()), None, None, &agent())
+            .await
+            .unwrap();
+        assert_ne!(q.id, qs.id);
+        assert!(!candidate_now(&db, i.id).await, "{close}: открыт вопрос");
+        assert!(
+            proactive_ideas(&db, &[sol], today(), &HashSet::new(), 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        if close == "delete" {
+            delete_entry(&db, q.id, None, &human()).await.unwrap();
+        } else {
+            update_entry(
+                &db,
+                q.id,
+                None,
+                EntryPatch {
+                    status: Some(EntryStatus::Obsolete),
+                    reason: Some("неактуально".into()),
+                    ..EntryPatch::default()
+                },
+                &agent(),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(candidate_now(&db, i.id).await, "{close}: снова кандидат");
+        let ids: Vec<Id> = proactive_ideas(&db, &[sol], today(), &HashSet::new(), 5)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, [i.id], "{close}");
+    }
+    // у `accepted` без переданного состояния задачи — не кандидат (M2)
+    let e = get_entry(&db, i.id).await.unwrap();
+    assert!(!idea_candidate(&e, None, today()));
+}
+
+/// Ревью задачи 7, M6: открыт вопрос «вернуть», а задача снова живая мимо хуков — `propose`
+/// устаревает вопрос («задача возобновлена»), снимает `question_id` и отвечает 409.
+#[tokio::test]
+async fn propose_with_open_reopen_question_but_live_task() {
+    let (db, sol, _) = setup("reopen-live-again").await;
+    let (i, t, q) = reopen_proposed(&db, sol, "Идея").await;
+    exec(
+        &db,
+        format!("UPDATE entries SET status = 'open' WHERE id = '{}'", t.id),
+    )
+    .await
+    .unwrap();
+    let r = propose_idea(&db, i.id, Some("снова".into()), None, None, &agent()).await;
+    assert!(
+        matches!(
+            r,
+            Err(IdeaError::Transition {
+                from: EntryStatus::Accepted,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    let q = get_entry(&db, q.id).await.unwrap();
+    assert_eq!(q.status, Some(EntryStatus::Obsolete));
+    assert_eq!(
+        last_reason(&db, q.id).await.as_deref(),
+        Some("задача возобновлена")
+    );
+    let idea = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(idea.status, Some(EntryStatus::Accepted));
+    assert_eq!(data_of(&idea).question_id, None);
+}

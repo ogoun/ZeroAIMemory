@@ -556,6 +556,11 @@ const SECTION_IDEAS: &str = "### Идеи";
 /// ровно тогда, когда идея предложена (блок инструкции v6 тратит на него одну строку).
 const IDEAS_HINT: &str = "Предложи человеку одну: memory_update_entry action=propose — вопрос \
     «начать / отложить / отказаться»; без ответа «начать» не начинай.";
+/// Добавка к [`IDEAS_HINT`], если в разделе есть идея со снятой задачей (ревью задачи 7, M3).
+const IDEAS_HINT_REOPEN: &str = " Со снятой задачей — предложи вернуть: propose с text, почему \
+    пора; решает человек.";
+/// Хвост пометки строки идеи со снятой задачей (§16, п. 1).
+const REOPEN_MARK_TAIL: &str = "можно предложить вернуть";
 /// `reason` подсказки-идеи (дайджест и `prompt`).
 const REASON_IDEA: &str = "idea";
 /// Предел заголовка идеи в строке дайджеста и подсказки, символов.
@@ -736,7 +741,7 @@ fn released_mark(e: &Entry, task: Option<zam_store::TaskState>) -> Option<&'stat
 fn idea_line(e: &Entry, mark: Option<&str>) -> String {
     let priority = zam_store::IdeaData::from_stored(&e.data).priority;
     let mark = mark
-        .map(|m| format!(" — {m}, можно предложить вернуть"))
+        .map(|m| format!(" — {m}, {REOPEN_MARK_TAIL}"))
         .unwrap_or_default();
     format!(
         "ZeroAIMemory: идея «{}» [{}]{mark} — {}",
@@ -909,8 +914,17 @@ async fn prompt_ideas(
     r
 }
 
+/// Идея подсказки: (цель, идея, общая из Knowledge, пометка «задача снята»).
+type FoundIdea = (usize, Entry, bool, Option<&'static str>);
+
 /// Сбор [`prompt_ideas`] со своим сроком `d`. Ошибки чтения баз не трогают `health.alive`:
 /// иначе сбой поиска идей снял бы основные подсказки той же цели.
+///
+/// Два прохода (ревью задачи 7, I1): основной — `status [new, deferred]`; второй —
+/// `status [accepted]`, только если в базах целей есть принятая идея со снятой или удалённой
+/// задачей ([`zam_store::any_released_idea`], один дешёвый SQL `LIMIT 1`). Иначе принятые идеи
+/// с живой задачей (их текст и есть текущая работа) занимали бы все `top_k` мест и вытесняли
+/// новую подходящую идею. Кандидаты второго прохода идут после основных (как в дайджесте).
 async fn collect_prompt_ideas(
     st: &AppState,
     p: &Principal,
@@ -920,83 +934,35 @@ async fn collect_prompt_ideas(
     health: &mut Health<'_>,
     d: &mut Deadline,
 ) -> Result<Vec<Cand>, ApiError> {
-    let body = json!({
-        "query": query,
-        "scope": {"solution": req.solution, "include_knowledge": true, "include_rules": false},
-        "filters": {"kinds": ["idea"], "status": ["new", "deferred", "accepted"]},
-        "mode": "brief",
-        "top_k": st.cfg.ideas.prompt_top_k,
-        "budget_tokens": PROMPT_SEARCH_BUDGET,
-        "rerank": "off",
-        "skip_seen": false,
-        "no_cache": true,
-        "format": "json",
-    });
-    let area = req.area.as_deref();
-    let Some(v) = inner_search(st, p, headers, area, body, health, d).await? else {
+    let Some(mut found) =
+        search_prompt_ideas(st, p, headers, req, query, &["new", "deferred"], health, d).await?
+    else {
         return Ok(Vec::new());
     };
-    let min = st.cfg.recall.prompt_min_score;
-    let today = zam_store::time::utc_today();
-    let targets = health.targets();
-    // (цель, идея, общая из Knowledge, пометка «задача снята») в порядке выдачи
-    let mut found: Vec<(usize, Entry, bool, Option<&'static str>)> = Vec::new();
-    for it in v["items"].as_array().into_iter().flatten() {
-        if it["kind"] != "idea" {
-            continue;
-        }
-        let Some(id) = it["entry_id"].as_str().and_then(|s| s.parse::<Id>().ok()) else {
-            continue;
-        };
-        let Some(space) = it["space"]["id"]
-            .as_str()
-            .and_then(|s| s.parse::<Id>().ok())
+    let mut released = false;
+    for t in health.targets() {
+        let Some(r) = d
+            .step(zam_store::any_released_idea(&t.db, &t.space_ids()))
+            .await
         else {
-            continue;
-        };
-        let Some(target) = targets
-            .iter()
-            .position(|t| t.spaces.iter().any(|s| s.id == space))
-        else {
-            continue;
-        };
-        let shared = match it["space"]["kind"].as_str() {
-            Some("solution") if it["score"].as_f64().unwrap_or(0.0) >= min => false,
-            Some("knowledge") => true,
-            _ => continue,
-        };
-        // источник истины — SQLite: `origin`, наступивший `horizon` (статусы выдачи шире)
-        let db = targets[target].db.clone();
-        let Some(r) = d.step(zam_store::get_entry(&db, id)).await else {
             return Ok(Vec::new());
         };
-        let e = match r {
-            Ok(e) => e,
-            Err(StoreError::NotFound) => continue,
-            Err(e) => {
-                tracing::warn!(error = %e, "recall: идея подсказки не прочитана");
-                continue;
+        match r {
+            Ok(true) => {
+                released = true;
+                break;
             }
-        };
-        // у `accepted` — состояние задачи (§16): кандидат, только если она снята или удалена
-        let task = if e.status == Some(EntryStatus::Accepted) {
-            let Some(r) = d.step(zam_store::idea_task_state(&db, &e)).await else {
-                return Ok(Vec::new());
-            };
-            match r {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::warn!(error = %err, "recall: задача идеи подсказки не прочитана");
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        if zam_store::idea_candidate(&e, task, today) {
-            let mark = released_mark(&e, task);
-            found.push((target, e, shared, mark));
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "recall: принятые идеи подсказки не прочитаны"),
         }
+    }
+    if released {
+        let Some(more) =
+            search_prompt_ideas(st, p, headers, req, query, &["accepted"], health, d).await?
+        else {
+            return Ok(Vec::new());
+        };
+        found.extend(more);
     }
     // тестовая задержка (тишина по сроку): только с фичей test-hooks
     #[cfg(feature = "test-hooks")]
@@ -1024,6 +990,99 @@ async fn collect_prompt_ideas(
         .filter(|(_, e, shared, _)| !shared || related.contains(&e.id))
         .map(|(i, e, _, mark)| idea_cand(*i, e, idea_prompt_line(e, *mark)))
         .collect())
+}
+
+/// Один проход отдельного поиска идей [`collect_prompt_ideas`] по статусам `statuses`:
+/// кандидаты [`zam_store::idea_candidate`] в порядке выдачи. `None` — срок истёк.
+#[allow(clippy::too_many_arguments)]
+async fn search_prompt_ideas(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    req: &RecallReq,
+    query: &str,
+    statuses: &[&str],
+    health: &mut Health<'_>,
+    d: &mut Deadline,
+) -> Result<Option<Vec<FoundIdea>>, ApiError> {
+    let body = json!({
+        "query": query,
+        "scope": {"solution": req.solution, "include_knowledge": true, "include_rules": false},
+        "filters": {"kinds": ["idea"], "status": statuses},
+        "mode": "brief",
+        "top_k": st.cfg.ideas.prompt_top_k,
+        "budget_tokens": PROMPT_SEARCH_BUDGET,
+        "rerank": "off",
+        "skip_seen": false,
+        "no_cache": true,
+        "format": "json",
+    });
+    let area = req.area.as_deref();
+    let Some(v) = inner_search(st, p, headers, area, body, health, d).await? else {
+        return Ok(Some(Vec::new()));
+    };
+    let min = st.cfg.recall.prompt_min_score;
+    let today = zam_store::time::utc_today();
+    let targets = health.targets();
+    let mut found: Vec<FoundIdea> = Vec::new();
+    for it in v["items"].as_array().into_iter().flatten() {
+        if it["kind"] != "idea" {
+            continue;
+        }
+        let Some(id) = it["entry_id"].as_str().and_then(|s| s.parse::<Id>().ok()) else {
+            continue;
+        };
+        let Some(space) = it["space"]["id"]
+            .as_str()
+            .and_then(|s| s.parse::<Id>().ok())
+        else {
+            continue;
+        };
+        let Some(target) = targets
+            .iter()
+            .position(|t| t.spaces.iter().any(|s| s.id == space))
+        else {
+            continue;
+        };
+        let shared = match it["space"]["kind"].as_str() {
+            Some("solution") if it["score"].as_f64().unwrap_or(0.0) >= min => false,
+            Some("knowledge") => true,
+            _ => continue,
+        };
+        // источник истины — SQLite: `origin`, наступивший `horizon` (статусы выдачи шире)
+        let db = targets[target].db.clone();
+        let Some(r) = d.step(zam_store::get_entry(&db, id)).await else {
+            return Ok(None);
+        };
+        let e = match r {
+            Ok(e) => e,
+            Err(StoreError::NotFound) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "recall: идея подсказки не прочитана");
+                continue;
+            }
+        };
+        // у `accepted` — состояние задачи (§16): кандидат, только если она снята или удалена
+        let task = if e.status == Some(EntryStatus::Accepted) {
+            let Some(r) = d.step(zam_store::idea_task_state(&db, &e)).await else {
+                return Ok(None);
+            };
+            match r {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(error = %err, "recall: задача идеи подсказки не прочитана");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if zam_store::idea_candidate(&e, task, today) {
+            let mark = released_mark(&e, task);
+            found.push((target, e, shared, mark));
+        }
+    }
+    Ok(Some(found))
 }
 
 /// **Единственное место правила** «явная связь общей идеи Knowledge с текущей работой»
@@ -2583,7 +2642,14 @@ fn arrange<'c>(
         }
         if title == Some(SECTION_ANSWERS) && !recovery && !ideas.is_empty() {
             out.packed.push(Section {
-                title: Some(format!("{SECTION_IDEAS}\n{IDEAS_HINT}")),
+                title: Some(format!(
+                    "{SECTION_IDEAS}\n{IDEAS_HINT}{}",
+                    if ideas.iter().any(|c| c.block.contains(REOPEN_MARK_TAIL)) {
+                        IDEAS_HINT_REOPEN
+                    } else {
+                        ""
+                    }
+                )),
                 blocks: ideas.iter().map(|c| c.block.clone()).collect(),
             });
             out.picked.push(std::mem::take(&mut ideas));
