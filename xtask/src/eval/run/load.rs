@@ -64,6 +64,7 @@ impl Session {
                 .as_str()
                 .with_context(|| format!("insight {}: нет id в ответе {v}", i.key))?
                 .to_string();
+            super::check_entry_area(&i.key, i.area.as_deref(), e)?;
             let want = i.certainty.as_deref().unwrap_or("hypothesis");
             if e["certainty"] != want {
                 bail!(

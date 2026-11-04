@@ -15,6 +15,10 @@
 "en/api/timestamps-utc" = "backend"
 "ru/api/rate-limiting-token-bucket" = "backend"
 "en/api/health-endpoint-design" = "backend"
+# одноязычные соседи другой области (правки ревью 1c): к k02, k04, k08
+"en/api/idempotency-keys" = "backend"
+"ru/api/redis-cache-ttl" = "backend"
+"ru/api/service-request-timeouts" = "backend"
 "en/db/connection-pool-exhaustion" = "backend"
 "en/db/postgres-explain-analyze" = "backend"
 "ru/db/postgres-zero-downtime-migrations" = "backend"
@@ -35,6 +39,9 @@
 "ru/web/date-formatting-intl" = "frontend"
 "en/web/large-file-upload" = "frontend"
 "ru/web/vite-env-variables" = "frontend"
+# одноязычные соседи другой области (правки ревью 1c): к k01, k03
+"ru/web/fetch-retry-ui" = "frontend"
+"en/web/browser-http-cache" = "frontend"
 "en/devtools/eslint-prettier-conflict" = "frontend"
 "en/devtools/typescript-strict-flags" = "frontend"
 "en/devtools/playwright-flaky-e2e" = "frontend"
@@ -48,6 +55,8 @@
 "en/infra/nginx-limit-req" = "infra"
 "en/infra/ci-docker-layer-cache" = "infra"
 "ru/infra/readiness-liveness-probes" = "infra"
+# одноязычный сосед другой области (правки ревью 1c): к k24
+"en/infra/load-balancer-health-checks" = "infra"
 "en/docker/compose-healthcheck-depends-on" = "infra"
 "en/docker/multistage-build-layer-cache" = "infra"
 "en/docker/exit-code-137-container-oom" = "infra"

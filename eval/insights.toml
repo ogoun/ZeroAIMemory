@@ -888,8 +888,8 @@ lang = "ru"
 kind = "experiment"
 scope = "solution"
 area = "infra"
-title = "Потоковая отдача выгрузки держит соединение через прокси без увеличения тайм-аута"
-body = "Попробовали отдавать выгрузку заказов потоком: сервис пишет строки CSV по мере чтения из базы. Между порциями проходит меньше секунды, proxy_read_timeout не срабатывает, а память сервиса на выгрузку в 2 миллиона строк — 40 МБ вместо 1,6 ГБ."
+title = "Потоковая выгрузка заказов через прокси: память сервиса 40 МБ вместо 1,6 ГБ"
+body = "Попробовали отдавать выгрузку заказов потоком через nginx: сервис пишет строки CSV по мере чтения из базы курсором. На выгрузке в 2 миллиона строк память сервиса — 40 МБ вместо 1,6 ГБ, первая строка приходит клиенту через 0,3 секунды, общее время выгрузки не изменилось."
 
 # ---- k09: флаги, frontend (заметка ru/web/feature-flags-first-paint) ----
 
@@ -969,7 +969,7 @@ kind = "experiment"
 scope = "solution"
 area = "backend"
 title = "Допуск 30 секунд на расхождение часов при проверке exp и nbf JWT"
-body = "Проверили, как допуск leeway в 30 секунд при проверке exp и nbf влияет на ошибки 401: доля отказов сразу после входа упала до нуля, а продление жизни токена на полминуты признано безопасным при времени жизни 10 минут."
+body = "Проверили на стенде допуск leeway в 30 секунд при проверке exp и nbf JWT: просроченный токен принимается ещё до 30 секунд, число запросов к сервису авторизации за обновлением не изменилось, а продление жизни токена на полминуты признано безопасным при времени жизни 10 минут."
 
 # ---- k13: пагинация, backend (заметка ru/api/keyset-pagination) ----
 
@@ -1088,8 +1088,8 @@ lang = "ru"
 kind = "discovery"
 scope = "solution"
 area = "infra"
-title = "Предел размера тела запроса надо поднимать на трёх уровнях сразу"
-body = "Разбор загрузок больших файлов показал: тело ограничивают балансировщик облака, nginx (client_max_body_size) и сам сервис (предел тела фреймворка). Поднятие одного предела без двух других переносит отказ на следующее звено, и код ответа меняется с 413 на 400 или обрыв соединения."
+title = "Отказ из-за размера тела выглядит по-разному на каждом звене цепочки"
+body = "Разбор загрузок больших файлов показал: тело запроса ограничено на трёх звеньях — балансировщик облака, nginx, сам сервис. Балансировщик рвёт соединение без ответа, nginx отвечает своей HTML-страницей, сервис — JSON с кодом 400; по виду ответа сразу видно, какое звено отказало."
 
 # ---- k19: лимиты частоты, backend (заметка ru/api/rate-limiting-token-bucket) ----
 
@@ -1255,8 +1255,8 @@ kind = "gotcha"
 scope = "solution"
 area = "backend"
 certainty = "theorem"
-title = "SQLite is safe across threads with one connection per thread in WAL mode"
-body = "The default SQLite build is compiled in serialized threading mode. Several threads, each with its own connection, can use one database file; in WAL mode readers do not block the single writer. Sharing one connection without a lock is what causes errors, not using threads."
+title = "SQLite is safe to use from several threads in its default serialized mode"
+body = "The default SQLite build uses the serialized threading mode, so connections may be used from several threads; the usual pattern is one connection per thread. Thread safety does not depend on the journal mode: WAL only lets readers run in parallel with the single writer instead of waiting for it. Problems come from builds with SQLITE_THREADSAFE=0 or from sharing one connection between threads in multi-thread mode (SQLITE_OPEN_NOMUTEX), not from threads as such."
 evidence = { checked = "export worker with 8 threads, one connection per thread, WAL mode", method = "stress test of one hour and PRAGMA integrity_check afterwards", result = "no errors except handled SQLITE_BUSY, integrity_check returned ok" }
 
 # ---- p17: systemd после OOM ----
@@ -1354,3 +1354,75 @@ certainty = "theorem"
 title = "host.docker.internal works on Linux with --add-host=host.docker.internal:host-gateway"
 body = "Since Docker 20.10 the special value host-gateway maps a host name to the host's gateway address. Adding --add-host=host.docker.internal:host-gateway (or extra_hosts in compose) lets a container on Linux reach a service on the host, provided the service listens on that interface."
 evidence = { checked = "Linux CI runner with Docker 24, Postgres on the host", method = "psql from a container started with --add-host=host.docker.internal:host-gateway", result = "connection established, query returned rows" }
+
+# ---- p21: параллельные тесты cargo (правки ревью задачи 1c: ответ — theorem gotcha) ----
+
+[[insight]]
+key = "p21-h"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+certainty = "hypothesis"
+contradicts = ["p21-t"]
+title = "Тесты одного файла cargo test выполняет по очереди, общий порт делить не нужно"
+body = "Интеграционные тесты одного файла tests/*.rs идут последовательно, поэтому сервер для них можно поднимать на фиксированном порту 8080."
+
+[[insight]]
+key = "p21-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+certainty = "theorem"
+title = "cargo test запускает тесты параллельно потоками — фиксированный порт даёт флейки"
+body = "Тесты одного бинарника cargo test выполняет параллельно в нескольких потоках (по числу ядер). Два теста с фиксированным портом 8080 конфликтуют: второй падает с «Address already in use». Нужен свободный порт на тест (bind на порт 0) или --test-threads=1."
+evidence = { checked = "интеграционные тесты сервиса заказов с портом 8080", method = "cargo test 20 раз подряд, затем с bind на порт 0", result = "с фиксированным портом 7 падений из 20 с AddrInUse, с портом 0 — 0" }
+
+# ---- p22: очистка useEffect ----
+
+[[insight]]
+key = "p22-h"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+certainty = "hypothesis"
+contradicts = ["p22-t"]
+title = "A useEffect cleanup runs only when the component unmounts"
+body = "The function returned from useEffect is called once, when the component unmounts, so a subscription created in the effect cannot leak while the component stays on screen."
+
+[[insight]]
+key = "p22-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+certainty = "theorem"
+title = "useEffect cleanup runs before every re-run of the effect, not only on unmount"
+body = "React calls the cleanup of an effect before running the effect again after a dependency change, and on unmount. In development StrictMode it also mounts, cleans up and mounts again once. A subscription without a cleanup therefore leaks one listener per dependency change."
+evidence = { checked = "price subscription effect of the product page", method = "counted listeners after switching between five products with and without the cleanup", result = "without cleanup 5 listeners stayed active, with cleanup 1" }
+
+# ---- p23: nginx после продления сертификата ----
+
+[[insight]]
+key = "p23-h"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "infra"
+certainty = "hypothesis"
+contradicts = ["p23-t"]
+title = "После продления сертификата certbot nginx подхватывает новый файл сам"
+body = "certbot renew заменяет файлы сертификата, а nginx читает их при каждом TLS-рукопожатии, поэтому после продления ничего делать не нужно."
+
+[[insight]]
+key = "p23-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "infra"
+certainty = "theorem"
+title = "nginx держит сертификат в памяти: после продления нужен reload"
+body = "nginx читает сертификат и ключ при запуске и при reload, а не при каждом рукопожатии. Без reload после certbot renew клиенты получают старый сертификат до истечения его срока. Reload делает deploy-hook certbot: systemctl reload nginx."
+evidence = { checked = "стенд с сертификатом, продлённым certbot renew --force-renewal", method = "openssl s_client -connect до и после systemctl reload nginx, сравнение notAfter", result = "до reload — прежний notAfter, после — новый" }

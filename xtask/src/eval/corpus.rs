@@ -818,6 +818,9 @@ pub struct Summary {
     pub areas: BTreeMap<String, usize>,
     /// Пары «`hypothesis` `gotcha` → `theorem`» со связью `contradicts` (M6 §10).
     pub gotcha_contradicts: usize,
+    /// Из них — с ответом (`theorem`) вида `gotcha`/`failure` (M6 §10: ответ набора буста вида —
+    /// ловушка или сбой).
+    pub gotcha_answer_contradicts: usize,
 }
 
 impl Summary {
@@ -991,12 +994,18 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
             *areas.entry(a.clone()).or_default() += 1;
         }
     }
-    let gotcha_contradicts = corpus
+    let gotcha_pairs: Vec<&Insight> = corpus
         .insights
         .iter()
         .filter(|i| i.kind == "gotcha" && corpus.insight_certainty(&i.key) == Some("hypothesis"))
         .flat_map(|i| &i.contradicts)
         .filter(|t| corpus.insight_certainty(t) == Some("theorem"))
+        .filter_map(|t| corpus.insight(t))
+        .collect();
+    let gotcha_contradicts = gotcha_pairs.len();
+    let gotcha_answer_contradicts = gotcha_pairs
+        .iter()
+        .filter(|t| matches!(t.kind.as_str(), "gotcha" | "failure"))
         .count();
     let mut ids: BTreeSet<&str> = BTreeSet::new();
     let mut s = Summary {
@@ -1032,6 +1041,7 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
             .count(),
         areas,
         gotcha_contradicts,
+        gotcha_answer_contradicts,
         ..Summary::default()
     };
     let mut referenced: BTreeSet<&str> = BTreeSet::new();
@@ -1403,6 +1413,12 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                 s.gotcha_contradicts
             ));
         }
+        if s.gotcha_answer_contradicts < MIN_GOTCHA_CONTRADICTS {
+            errs.push(format!(
+                "пар hypothesis gotcha → theorem gotcha/failure {} < {MIN_GOTCHA_CONTRADICTS}",
+                s.gotcha_answer_contradicts
+            ));
+        }
         if s.contradictions < MIN_CONTRADICTIONS {
             errs.push(format!(
                 "пар противоречий {} < {MIN_CONTRADICTIONS}",
@@ -1571,6 +1587,23 @@ mod tests {
             retracted,
         ];
         c
+    }
+
+    /// Пары §10 считаются двояко: все «`hypothesis` `gotcha` → `theorem`» и только те, где
+    /// ответ (`theorem`) сам `gotcha`/`failure` (правка ревью задачи 1c M6).
+    #[test]
+    fn gotcha_pairs_counted_by_answer_kind() {
+        let mut c = m3_corpus();
+        let mut t2 = insight("disc-ok", Some("theorem"), None);
+        t2.kind = "discovery".into();
+        t2.evidence = c.insight("cache-ok").unwrap().evidence.clone();
+        c.insights.push(t2);
+        let mut h2 = insight("disc-guess", Some("hypothesis"), None);
+        h2.contradicts = vec!["disc-ok".into()];
+        c.insights.push(h2);
+        c.insights[3].contradicts = vec!["cache-ok".into()];
+        let s = validate(&c, &[], false).unwrap();
+        assert_eq!((s.gotcha_contradicts, s.gotcha_answer_contradicts), (2, 1));
     }
 
     fn m3_query(id: &str, kind: Kind, expect: &str) -> Query {

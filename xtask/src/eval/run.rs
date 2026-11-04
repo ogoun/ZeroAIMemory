@@ -236,6 +236,9 @@ pub struct Session {
     entry_keys: BTreeMap<String, String>,
     /// id узла → путь заметки корпуса (ссылки `n:<id>` ответов `format: md`, eval M4).
     node_paths: BTreeMap<String, String>,
+    /// Заметки с областью (M6 §11), которые [`Session::wait_indexed`] проверяет поиском с
+    /// `scope.area`: сервер не отдаёт область узла в ответах узлов.
+    area_probes: Vec<(Note, String)>,
 }
 
 /// Сообщение журнала сервера с действующими `[search]` и `[index]`.
@@ -403,6 +406,7 @@ impl Session {
             loaded_at: None,
             entry_keys,
             node_paths,
+            area_probes: Vec::new(),
         })
     }
 
@@ -475,6 +479,9 @@ impl Session {
         for n in corpus.notes.values() {
             let area = corpus.areas.get(&n.path).map(String::as_str);
             let (st, v) = note_request(&self.base, &self.token, n, area)?;
+            if let Some(a) = area {
+                self.area_probes.push((n.clone(), a.to_string()));
+            }
             if st != 201 {
                 bail!("POST /nodes {}: HTTP {st}: {v}", n.path);
             }
@@ -520,7 +527,7 @@ impl Session {
                 if code == 200 && v["degraded"] == false && v["pending_count"] == 0 {
                     self.index_secs = t0.elapsed().as_secs_f64();
                     self.status = s;
-                    return Ok(());
+                    return self.verify_areas();
                 }
             }
             if t0.elapsed() > INDEX_WAIT {
@@ -542,6 +549,19 @@ impl Session {
             }
             thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    /// Области заметок корпуса дошли до сервера (M6 §11): каждая заметка с областью находится
+    /// своим заголовком при фильтре `scope.area` (у всех баз `caps::RELEASES` — с M3).
+    fn verify_areas(&mut self) -> Result<()> {
+        for (n, a) in std::mem::take(&mut self.area_probes) {
+            let (st, v) = self.api("/api/v1/search", Some(&area_probe_body(&n, &a)))?;
+            if st != 200 {
+                bail!("проверка области {}: HTTP {st}: {v}", n.path);
+            }
+            check_area_probe(&n.path, &a, &self.hits(&v))?;
+        }
+        Ok(())
     }
 
     /// Проверяет модель и устройство по `/index/status` (только с моделью).
@@ -734,6 +754,46 @@ pub fn search_request(base: &str, token: &str, q: &Query, body: &Value) -> Resul
         &headers,
         SEARCH_TIMEOUT,
     )
+}
+
+/// Область записи в ответе сервера совпадает с областью набора (`None` — без области). Ответ без
+/// поля `area` (сервер без областей) не проверяется.
+pub fn check_entry_area(key: &str, want: Option<&str>, entry: &Value) -> Result<()> {
+    let Some(got) = entry.get("area") else {
+        return Ok(());
+    };
+    if got.as_str() != want {
+        bail!("insight {key}: область в ответе сервера {got}, в наборе {want:?}");
+    }
+    Ok(())
+}
+
+/// Тело поиска проверки области заметки: её заголовок H1 (или путь) при `scope.area`.
+pub fn area_probe_body(n: &Note, area: &str) -> Value {
+    let title = n
+        .text
+        .lines()
+        .find_map(|l| l.strip_prefix("# "))
+        .map(str::trim)
+        .unwrap_or(&n.path);
+    json!({
+        "query": title,
+        "mode": "notes",
+        "top_k": TOP_K,
+        "scope": { "solution": EVAL_SOLUTION, "include_rules": false, "area": area },
+        "rerank": "off",
+    })
+}
+
+/// Заметка `path` нашлась в первых [`TOP_K`] поиска с фильтром области `area`.
+pub fn check_area_probe(path: &str, area: &str, hits: &[Hit]) -> Result<()> {
+    if !hits.iter().any(|h| h.path == path) {
+        bail!(
+            "заметка {path}: не найдена своим заголовком с scope.area = {area} — область не \
+             дошла до сервера (X-Zam-Area при POST /nodes)"
+        );
+    }
+    Ok(())
 }
 
 /// `POST /nodes` заметки корпуса: группа `e` — в решение набора, остальные — в Knowledge;
@@ -1423,6 +1483,46 @@ mod tests {
         let req = rx.recv().unwrap().to_ascii_lowercase();
         assert!(req.contains("\r\nx-zam-area: backend\r\n"), "{req}");
         assert!(req.starts_with("post /api/v1/nodes "), "{req}");
+    }
+
+    /// Область записи в ответе сервера сверяется с набором: расхождение — ошибка; ответ без
+    /// поля `area` (сервер без областей) не проверяется.
+    #[test]
+    fn entry_area_mismatch_is_an_error() {
+        check_entry_area("k01-t", Some("backend"), &json!({"area": "backend"})).unwrap();
+        check_entry_area("k01-t", None, &json!({"area": null})).unwrap();
+        check_entry_area("k01-t", Some("backend"), &json!({"id": "x"})).unwrap();
+        let e = check_entry_area("k01-t", Some("backend"), &json!({"area": "infra"}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("k01-t") && e.contains("infra"), "{e}");
+        assert!(check_entry_area("k02-t", None, &json!({"area": "web"})).is_err());
+    }
+
+    /// Область узла сервер в ответах узлов не отдаёт: заметка ищется своим заголовком с фильтром
+    /// `scope.area` — не нашлась в первых 10 — ошибка.
+    #[test]
+    fn note_area_probe_finds_note_in_its_area() {
+        let note = Note {
+            path: "ru/api/x".into(),
+            lang: Lang::Ru,
+            text: "# Повторы запросов\n\nТекст.\n".into(),
+        };
+        let b = area_probe_body(&note, "backend");
+        assert_eq!(b["query"], "Повторы запросов");
+        assert_eq!(b["scope"]["area"], "backend");
+        assert_eq!(b["scope"]["solution"], EVAL_SOLUTION);
+        let hit = |p: &str| Hit {
+            path: p.into(),
+            score: 1.0,
+            sources: Vec::new(),
+            reranked: false,
+        };
+        check_area_probe(&note.path, "backend", &[hit("en/web/y"), hit("ru/api/x")]).unwrap();
+        let e = check_area_probe(&note.path, "backend", &[hit("en/web/y")])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ru/api/x") && e.contains("backend"), "{e}");
     }
 
     #[test]

@@ -335,9 +335,10 @@ fn print_summary(s: &corpus::Summary) {
         let areas: Vec<String> = s.areas.iter().map(|(a, n)| format!("{a} {n}")).collect();
         println!(
             "набор M6 (§10, §11): целей по областям: {}; пар hypothesis gotcha → theorem \
-             (contradicts) {}",
+             (contradicts) {}, из них с ответом gotcha/failure {}",
             areas.join(", "),
-            s.gotcha_contradicts
+            s.gotcha_contradicts,
+            s.gotcha_answer_contradicts
         );
     }
 }
