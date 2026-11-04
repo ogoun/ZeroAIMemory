@@ -15,7 +15,7 @@
 //! `--origin` и `--by` — по правилу `zam question answer --by`
 //! ([`super::question::resolve_human_agent`]): запустил агент — флаг обязателен, иначе код 6
 //! до обращения к серверу; человек в терминале — `human`. Даты `--horizon` и `--until` — строго
-//! `YYYY-MM-DD` позже сегодняшней даты UTC, как у сервера (иначе код 6 без запроса).
+//! `YYYY-MM-DD` (иначе код 6 без запроса); «позже сегодняшней даты UTC» проверяет сервер (422).
 //!
 //! Пространство — решение из `solution.toml`, `--knowledge` — Knowledge. Ссылка — `w:<id>`,
 //! `e:<id>` или голый id; иначе код 6.
@@ -53,24 +53,6 @@ pub fn idea_id(raw: &str) -> Result<String, CliError> {
     }
 }
 
-/// Сегодняшняя дата UTC `YYYY-MM-DD` (часы системы; алгоритм civil_from_days Г. Хиннанта).
-fn utc_today() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let z = (secs / 86_400) as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 /// Дата календаря строго `YYYY-MM-DD` (месяц и день существуют).
 fn is_date(s: &str) -> bool {
     let b = s.as_bytes();
@@ -97,18 +79,13 @@ fn is_date(s: &str) -> bool {
     (1..=days).contains(&d)
 }
 
-/// Дата «не раньше» (`--horizon`, `--until`) по правилу сервера: строго `YYYY-MM-DD`, позже
-/// сегодняшней даты UTC (`today`); иначе код 6.
-fn check_horizon<'a>(raw: &'a str, flag: &str, today: &str) -> Result<&'a str, CliError> {
+/// Дата «не раньше» (`--horizon`, `--until`): строго `YYYY-MM-DD`, иначе код 6. «Позже
+/// сегодняшней даты UTC» проверяет только сервер (422 → код 6): часы клиента и сервера могут
+/// расходиться около полуночи UTC.
+fn check_horizon<'a>(raw: &'a str, flag: &str) -> Result<&'a str, CliError> {
     let s = raw.trim();
     if !is_date(s) {
         return Err(CliError::input(format!("{flag} «{raw}»: дата YYYY-MM-DD")));
-    }
-    // у дат одного формата порядок строк — порядок дат
-    if s <= today {
-        return Err(CliError::input(format!(
-            "{flag} {s}: не раньше завтрашней даты (UTC, сегодня {today})"
-        )));
     }
     Ok(s)
 }
@@ -206,16 +183,12 @@ pub struct New<'a> {
 
 /// Тело запроса идеи (`POST /spaces/{space}/entries`, `kind: idea`); `origin` — уже разрешён.
 pub fn new_body(o: &New, body: &str, origin: &str) -> Result<Value, CliError> {
-    new_body_at(o, body, origin, &utc_today())
-}
-
-fn new_body_at(o: &New, body: &str, origin: &str, today: &str) -> Result<Value, CliError> {
     let mut data = json!({ "origin": origin });
     if let Some(p) = o.priority {
         data["priority"] = json!(p);
     }
     if let Some(h) = o.horizon {
-        data["horizon"] = json!(check_horizon(h, "--horizon", today)?);
+        data["horizon"] = json!(check_horizon(h, "--horizon")?);
     }
     let mut req = json!({ "kind": "idea", "title": o.title, "body": body, "data": data });
     if !o.tags.is_empty() {
@@ -309,14 +282,14 @@ fn explain_decided(e: CliError) -> CliError {
     }
 }
 
-/// Тело решения по параметрам команды (дата `--until` проверяется до запроса).
-fn decide_req(decision: &str, o: &DecideOpts, today: &str) -> Result<Value, CliError> {
+/// Тело решения по параметрам команды (формат `--until` проверяется до запроса).
+fn decide_req(decision: &str, o: &DecideOpts) -> Result<Value, CliError> {
     let mut extra: Vec<(&str, Value)> = Vec::new();
     if let Some(s) = o.space {
         extra.push(("space", json!(s)));
     }
     if let Some(u) = o.until {
-        extra.push(("horizon", json!(check_horizon(u, "--until", today)?)));
+        extra.push(("horizon", json!(check_horizon(u, "--until")?)));
     }
     if let Some(r) = o.reason {
         extra.push(("reason", json!(r)));
@@ -324,10 +297,10 @@ fn decide_req(decision: &str, o: &DecideOpts, today: &str) -> Result<Value, CliE
     Ok(decide_body(decision, o.by, o.channel, &extra))
 }
 
-/// `zam idea accept|defer|decline`; ссылка и дата `--until` проверяются до запроса (код 6).
+/// `zam idea accept|defer|decline`; ссылка и формат `--until` проверяются до запроса (код 6).
 pub fn decide(ctx: &Ctx, decision: &str, o: DecideOpts) -> Result<(), CliError> {
     let id = idea_id(o.id)?;
-    let req = decide_req(decision, &o, &utc_today())?;
+    let req = decide_req(decision, &o)?;
     let v = read_json(
         ctx.client
             .post_json(&format!("/entries/{id}/decide"), &req)
@@ -387,18 +360,16 @@ mod tests {
         ] {
             assert!(!is_date(bad), "{bad}");
         }
-        let today = "2026-11-04";
         assert_eq!(
-            check_horizon(" 2026-11-05 ", "--until", today).unwrap(),
-            "2026-11-05"
+            check_horizon(" 2000-01-01 ", "--until").unwrap(),
+            "2000-01-01",
+            "прошедшая дата — дело сервера"
         );
-        for bad in ["2026-11-04", "2026-11-03", "01.12.2026"] {
-            let e = check_horizon(bad, "--until", today).unwrap_err();
+        for bad in ["2026-11-31", "01.12.2026", "2026-11-05T00:00"] {
+            let e = check_horizon(bad, "--until").unwrap_err();
             assert_eq!(e.code, crate::client::EXIT_INPUT);
             assert!(e.msg.starts_with("--until"), "{}", e.msg);
         }
-        let t = utc_today();
-        assert!(is_date(&t), "{t}");
 
         // тело идеи
         let tags = vec!["ui".to_string()];
@@ -412,7 +383,7 @@ mod tests {
             knowledge: false,
         };
         assert_eq!(
-            new_body_at(&o, "замысел", "human", today).unwrap(),
+            new_body(&o, "замысел", "human").unwrap(),
             json!({"kind": "idea", "title": "Тема", "body": "замысел", "tags": ["ui"],
                    "data": {"origin": "human", "priority": "high", "horizon": "2099-01-01"}})
         );
@@ -423,14 +394,14 @@ mod tests {
             ..o
         };
         assert_eq!(
-            new_body_at(&bare, "", "agent", today).unwrap(),
+            new_body(&bare, "", "agent").unwrap(),
             json!({"kind": "idea", "title": "Тема", "body": "", "data": {"origin": "agent"}})
         );
-        let past = New {
-            horizon: Some("2026-11-04"),
+        let bad_date = New {
+            horizon: Some("2026-02-30"),
             ..bare
         };
-        assert!(new_body_at(&past, "", "human", today).is_err());
+        assert!(new_body(&bad_date, "", "human").is_err());
 
         // тело решения
         assert_eq!(
@@ -446,15 +417,15 @@ mod tests {
             reason: Some("лишнее"),
         };
         assert_eq!(
-            decide_req("decline", &d, today).unwrap(),
+            decide_req("decline", &d).unwrap(),
             json!({"decision": "decline", "by": "agent", "channel": "chat", "reason": "лишнее"})
         );
         let d = DecideOpts {
-            until: Some("2026-11-04"),
+            until: Some("2026-1-04"),
             reason: None,
             ..d
         };
-        assert!(decide_req("defer", &d, today).is_err());
+        assert!(decide_req("defer", &d).is_err());
 
         // статусы ленты
         assert_eq!(statuses(&[]).unwrap(), ACTIVE);

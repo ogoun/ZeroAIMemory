@@ -363,7 +363,7 @@ fn idea_defer_until_and_bad_date_code_6() {
     // без --until — сервер ставит сегодня + defer_days
     let d = ok(&t.z(&["idea", "defer", &id]));
     assert!(d.contains("deferred до 20"), "{d}");
-    // плохие даты — код 6 до сервера; прошедшая и сегодняшняя — тоже 6
+    // неверный формат — код 6 в CLI, до сервера
     for bad in [
         "2099-3-1",
         "01.03.2099",
@@ -371,16 +371,48 @@ fn idea_defer_until_and_bad_date_code_6() {
         "2099-13-01",
         "2099-03-01T00:00",
         "завтра",
-        "2000-01-01",
     ] {
         let o = t.z(&["idea", "defer", &id, "--until", bad]);
         assert_eq!(code(&o), Some(6), "{bad}: {}", err(&o));
         assert!(err(&o).contains("--until"), "{bad}: {}", err(&o));
     }
-    // --horizon у new — те же правила
-    let o = t.z(&["idea", "new", "x", "--horizon", "2000-01-01"]);
+    let o = t.z(&["idea", "new", "x", "--horizon", "2099-02-30"]);
     assert_eq!(code(&o), Some(6), "{}", err(&o));
     assert!(err(&o).contains("--horizon"), "{}", err(&o));
+
+    // «позже сегодняшней даты UTC» решает только сервер: сегодня и прошедшая — 422 → код 6
+    let today = zam_store::time::utc_today().to_string();
+    for day in [today.as_str(), "2000-01-01"] {
+        let o = t.z(&["idea", "defer", &id, "--until", day]);
+        assert_eq!(code(&o), Some(6), "{day}: {}", err(&o));
+        assert!(
+            err(&o).contains("не раньше завтрашней даты (UTC") && err(&o).contains("HTTP 422"),
+            "{day}: {}",
+            err(&o)
+        );
+        let o = t.z(&["idea", "new", "x", "--horizon", day]);
+        assert_eq!(code(&o), Some(6), "{day}: {}", err(&o));
+        assert!(err(&o).contains("HTTP 422"), "{day}: {}", err(&o));
+    }
+    // идея не тронута: horizon прежний
+    assert_eq!(entry(&t, &id)["status"], "deferred");
+}
+
+/// 422 сервера → код 6: `--space` — GUID решения, которого нет.
+#[test]
+fn idea_server_422_code_6() {
+    let t = T::new("server-422");
+    let id = t.idea("Задача в чужом решении", &[]);
+    let o = t.z(&[
+        "idea",
+        "accept",
+        &id,
+        "--space",
+        "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9eff",
+    ]);
+    assert_eq!(code(&o), Some(6), "{}{}", out(&o), err(&o));
+    assert!(err(&o).contains("HTTP 422"), "{}", err(&o));
+    assert!(ok(&t.z(&["idea", "list"])).contains(&format!("w:{id} [new]")));
 }
 
 #[test]

@@ -220,7 +220,8 @@ pub fn resolve_human_agent<'a>(
     }
 }
 
-/// `by` ответа: явный `--by`; без него у агента — код 6 (ошибка ввода) с подсказкой, у человека — `human`.
+/// `by` ответа: явный `--by`; без него у агента — код 6 (ошибка ввода) с подсказкой, у
+/// человека — `human`.
 pub fn resolve_by(by: Option<&str>, agent: bool) -> Result<&str, CliError> {
     resolve_human_agent(by, "--by", agent)
 }
