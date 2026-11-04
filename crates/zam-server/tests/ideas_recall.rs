@@ -1,8 +1,8 @@
 //! Проактивность идей (M5.7 §6, задача 3): раздел `### Идеи` дайджеста `session_start` (только
 //! первый старт сессии, только пространство решения, до `ideas.digest_max`), подсказка идеи к
 //! `prompt` отдельным лёгким поиском (основной поиск не меняется), выключатели `ideas.proactive`
-//! сервера и пользователя, общие идеи Knowledge — только при явной связи или косинусе ≥
-//! `ideas.knowledge_min_cosine`, совместный доступ. Сервер без моделей (поиск — FTS), тесты с
+//! сервера и пользователя, общие идеи Knowledge — только при связи с задачей `in_progress`
+//! сессии (ответ владельца на вопрос 8 — А), совместный доступ. Сервер без моделей (поиск — FTS), тесты с
 //! векторным каналом — под `ZAM_REQUIRE_ML`.
 mod common;
 
@@ -677,11 +677,12 @@ async fn hooks_prompt_off_silences_ideas() {
     assert!(idea_items(&j).is_empty(), "{j}");
 }
 
-/// Общая идея Knowledge (ждёт ответа владельца): без явной связи и с косинусом ниже
-/// `ideas.knowledge_min_cosine` — нет даже на первом месте выдачи; с тегом задачи
-/// `in_progress` сессии — есть; с порогом 0 — проходит по косинусу.
+/// Общая идея Knowledge (ответ владельца на вопрос 8 — вариант А): связь с текущей работой —
+/// только тег или `area` задачи `in_progress`, захваченной сессией, либо ребро именно к такой
+/// задаче. Почти дословный запрос без связи — нет (косинус не учитывается); ребро к insight
+/// решения — нет; ребро к задаче чужой сессии или не `in_progress` — нет.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prompt_knowledge_idea_needs_link_or_cosine() {
+async fn prompt_knowledge_idea_needs_session_task_link() {
     if !have(MINILM) {
         return;
     }
@@ -689,116 +690,104 @@ async fn prompt_knowledge_idea_needs_link_or_cosine() {
     let a = server("kn-link", |c| {
         ml(c, MINILM);
         external(c, &q);
-        c.ideas.knowledge_min_cosine = 1.0;
     })
     .await;
     vector_ready(&a).await;
-    let r = a
-        .t(
-            Method::POST,
-            KN,
-            Some(
-                json!({"kind": "idea", "title": "Export reports to PDF with embedded fonts",
-                        "body": "Reports should be exportable to PDF.", "tags": ["pdf"],
-                        "data": {"origin": "human"}}),
-            ),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-    let id = r.json()["id"].as_str().unwrap().to_string();
     let db = a.st.users.get(a.st.admin_id).await.unwrap();
-    let eid: Id = id.parse().unwrap();
-    a.st.index.worker.notify();
-    until(
-        "идея проиндексирована",
-        INDEXED,
-        async || {
-            zam_store::get_entry(&db, eid).await.unwrap().index_state
-                == zam_store::IndexState::Indexed
-        },
-    )
-    .await;
-    let p = "export reports to PDF with embedded fonts";
-    // не в дайджесте (Knowledge), в подсказке — без связи нет
-    let j = start(&a, "s1").await;
-    assert!(idea_items(&j).is_empty(), "{j}");
-    let j = prompt(&a, "s1", p).await;
-    assert!(idea_items(&j).is_empty(), "{j}");
-    // задача `in_progress` сессии s2 с тем же тегом — явная связь
-    let r = a
-        .t(
-            Method::POST,
-            &sol(),
-            Some(json!({"kind": "task", "title": "Отчёты", "tags": ["pdf"]})),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-    let task = r.json()["id"].as_str().unwrap().to_string();
-    let h = [("x-zam-session", "s2")];
-    let r = a
-        .tok_h(
-            &a.token,
-            Method::POST,
-            &format!("/api/v1/entries/{task}/claim"),
-            Some(json!({})),
-            &h,
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    let r = a
-        .tok_rev(
-            &a.token,
-            Method::PATCH,
-            &format!("/api/v1/entries/{task}"),
-            Some(json!({"status": "in_progress"})),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    let j = prompt(&a, "s2", p).await;
-    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
-    // сессия без захваченной задачи — нет
-    let j = prompt(&a, "s3", p).await;
-    assert!(idea_items(&j).is_empty(), "{j}");
-    // ревью задачи 3, M8: ветка `area` — задача `in_progress` сессии s4 с той же областью
-    let kn_idea = |title: &'static str, area: Option<&'static str>| {
+    let post = |path: String, body: Value| {
         let a = &a;
         async move {
-            let mut body = json!({"kind": "idea", "title": title,
-                                  "body": "Something to build later.",
-                                  "data": {"origin": "human"}});
-            if let Some(ar) = area {
-                body["area"] = json!(ar);
-            }
-            let r = a.t(Method::POST, KN, Some(body)).await;
+            let r = a.t(Method::POST, &path, Some(body)).await;
             assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
             r.json()["id"].as_str().unwrap().to_string()
         }
     };
-    let by_area = kn_idea("Telemetry dashboard for nightly benchmarks", Some("bench")).await;
-    let by_edge = kn_idea("Offline mode for the mobile client", None).await;
-    let sol_note = a
-        .t(
-            Method::POST,
-            &sol(),
-            Some(
-                json!({"kind": "insight", "title": "Mobile client caches nothing",
-                        "body": "No offline storage yet.", "data": {"kind": "discovery"}}),
-            ),
-        )
-        .await;
-    assert_eq!(sol_note.status, StatusCode::CREATED, "{}", sol_note.text());
-    let sol_id = sol_note.json()["id"].as_str().unwrap().to_string();
-    // ветка ребра: `relates_to` идея → запись пространства решения
-    let r = a
-        .t(
-            Method::POST,
-            "/api/v1/edges",
-            Some(json!({"src": format!("e:{by_edge}"), "type": "relates_to",
-                        "dst": format!("e:{sol_id}")})),
-        )
-        .await;
-    assert!(r.status.is_success(), "{}", r.text());
-    for id in [&by_area, &by_edge] {
+    let kn_idea = |title: &'static str, tags: Value, area: Option<&'static str>| {
+        let mut body = json!({"kind": "idea", "title": title, "body": "Something to build later.",
+                              "tags": tags, "data": {"origin": "human"}});
+        if let Some(ar) = area {
+            body["area"] = json!(ar);
+        }
+        post(KN.to_string(), body)
+    };
+    let edge = |src: String, dst: String| {
+        let a = &a;
+        async move {
+            let r = a
+                .t(
+                    Method::POST,
+                    "/api/v1/edges",
+                    Some(json!({"src": format!("e:{src}"), "type": "relates_to",
+                                "dst": format!("e:{dst}")})),
+                )
+                .await;
+            assert!(r.status.is_success(), "{}", r.text());
+        }
+    };
+    // задача решения, захваченная сессией `session`; `in_progress` — по флагу
+    let task = |title: &'static str, extra: Value, session: &'static str, progress: bool| {
+        let a = &a;
+        async move {
+            let mut body = json!({"kind": "task", "title": title});
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let r = a.t(Method::POST, &sol(), Some(body)).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+            let id = r.json()["id"].as_str().unwrap().to_string();
+            let r = a
+                .tok_h(
+                    &a.token,
+                    Method::POST,
+                    &format!("/api/v1/entries/{id}/claim"),
+                    Some(json!({})),
+                    &[("x-zam-session", session)],
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            if progress {
+                let r = a
+                    .tok_rev(
+                        &a.token,
+                        Method::PATCH,
+                        &format!("/api/v1/entries/{id}"),
+                        Some(json!({"status": "in_progress"})),
+                    )
+                    .await;
+                assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            }
+            id
+        }
+    };
+    let by_tag = kn_idea(
+        "Export reports to PDF with embedded fonts",
+        json!(["pdf"]),
+        None,
+    )
+    .await;
+    let by_area = kn_idea(
+        "Telemetry dashboard for nightly benchmarks",
+        json!([]),
+        Some("bench"),
+    )
+    .await;
+    let by_sol_edge = kn_idea("Offline mode for the mobile client", json!([]), None).await;
+    let by_task_edge = kn_idea("Search history export to CSV", json!([]), None).await;
+    let by_open_edge = kn_idea("Keyboard shortcuts cheat sheet", json!([]), None).await;
+    let insight = post(
+        sol(),
+        json!({"kind": "insight", "title": "Mobile client caches nothing",
+               "body": "No offline storage yet.", "data": {"kind": "discovery"}}),
+    )
+    .await;
+    edge(by_sol_edge.clone(), insight).await;
+    for id in [
+        &by_tag,
+        &by_area,
+        &by_sol_edge,
+        &by_task_edge,
+        &by_open_edge,
+    ] {
         let eid: Id = id.parse().unwrap();
         a.st.index.worker.notify();
         until(
@@ -811,82 +800,43 @@ async fn prompt_knowledge_idea_needs_link_or_cosine() {
         )
         .await;
     }
-    let r = a
-        .t(
-            Method::POST,
-            &sol(),
-            Some(json!({"kind": "task", "title": "Бенчмарки", "area": "bench"})),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-    let t2 = r.json()["id"].as_str().unwrap().to_string();
-    let r = a
-        .tok_h(
-            &a.token,
-            Method::POST,
-            &format!("/api/v1/entries/{t2}/claim"),
-            Some(json!({})),
-            &[("x-zam-session", "s4")],
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    let r = a
-        .tok_rev(
-            &a.token,
-            Method::PATCH,
-            &format!("/api/v1/entries/{t2}"),
-            Some(json!({"status": "in_progress"})),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let w = |id: &str| format!("w:{id}");
+    // почти дословный запрос без связи — нет (косинус не учитывается)
+    let p = "export reports to PDF with embedded fonts";
+    let j = prompt(&a, "s1", p).await;
+    assert!(!idea_items(&j).contains(&w(&by_tag)), "без связи: {j}");
+    // тег задачи `in_progress` сессии s2 — да; другая сессия — нет
+    task("Отчёты", json!({"tags": ["pdf"]}), "s2", true).await;
+    let j = prompt(&a, "s2", p).await;
+    assert_eq!(idea_items(&j), [w(&by_tag)], "{j}");
+    let j = prompt(&a, "s3", p).await;
+    assert!(idea_items(&j).is_empty(), "{j}");
+    // `area` задачи `in_progress` сессии s4 — да; без задачи — нет
+    task("Бенчмарки", json!({"area": "bench"}), "s4", true).await;
     let pa = "telemetry dashboard for nightly benchmarks";
-    // без задачи сессии идея области не проходит (идея с ребром — может: связь действует всегда)
     let j = prompt(&a, "s5", pa).await;
-    assert!(
-        !idea_items(&j).contains(&format!("w:{by_area}")),
-        "без связи: {j}"
-    );
+    assert!(!idea_items(&j).contains(&w(&by_area)), "без связи: {j}");
     let j = prompt(&a, "s4", pa).await;
-    assert_eq!(idea_items(&j), [format!("w:{by_area}")], "{j}");
-    // ребро действует без задачи сессии
-    let j = prompt(&a, "s6", "offline mode for the mobile client").await;
-    assert_eq!(idea_items(&j), [format!("w:{by_edge}")], "{j}");
-    // порог 0 — проходит по косинусу без связи (та же база, другой сервер не нужен)
-    drop(a);
-    let b = server("kn-cos", |c| {
-        ml(c, MINILM);
-        external(c, &q);
-        c.ideas.knowledge_min_cosine = 0.0;
-    })
-    .await;
-    vector_ready(&b).await;
-    let r = b
-        .t(
-            Method::POST,
-            KN,
-            Some(
-                json!({"kind": "idea", "title": "Export reports to PDF with embedded fonts",
-                        "body": "Reports should be exportable to PDF.",
-                        "data": {"origin": "human"}}),
-            ),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-    let id = r.json()["id"].as_str().unwrap().to_string();
-    let db = b.st.users.get(b.st.admin_id).await.unwrap();
-    let eid: Id = id.parse().unwrap();
-    b.st.index.worker.notify();
-    until(
-        "идея проиндексирована",
-        INDEXED,
-        async || {
-            zam_store::get_entry(&db, eid).await.unwrap().index_state
-                == zam_store::IndexState::Indexed
-        },
-    )
-    .await;
-    let j = prompt(&b, "s1", p).await;
-    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
+    assert_eq!(idea_items(&j), [w(&by_area)], "{j}");
+    // ребро к insight решения — больше не связь (ни без задач, ни в сессии с задачей)
+    let ps = "offline mode for the mobile client";
+    for s in ["s6", "s2"] {
+        let j = prompt(&a, s, ps).await;
+        assert!(!idea_items(&j).contains(&w(&by_sol_edge)), "{s}: {j}");
+    }
+    // ребро к задаче `in_progress` сессии s7 — да; другая сессия — нет
+    let t7 = task("История поиска", json!({}), "s7", true).await;
+    edge(by_task_edge.clone(), t7).await;
+    let pt = "search history export to CSV";
+    let j = prompt(&a, "s7", pt).await;
+    assert_eq!(idea_items(&j), [w(&by_task_edge)], "{j}");
+    let j = prompt(&a, "s8", pt).await;
+    assert!(idea_items(&j).is_empty(), "{j}");
+    // ребро к задаче сессии s9, но не `in_progress` (`open`) — нет
+    let t9 = task("Горячие клавиши", json!({}), "s9", false).await;
+    edge(by_open_edge.clone(), t9).await;
+    let j = prompt(&a, "s9", "keyboard shortcuts cheat sheet").await;
+    assert!(idea_items(&j).is_empty(), "{j}");
 }
 
 // ---- совместный доступ ----
@@ -930,8 +880,9 @@ async fn shared_solution_ideas_in_participant_digest_until_revoked() {
     assert!(idea_items(&j).is_empty(), "{j}");
 }
 
-/// Замер для журнала (ждёт ответа владельца, вопрос 8): абсолютный косинус dense bge-m3
-/// запроса к связанным и несвязанным общим идеям. Запуск: `cargo test --test ideas_recall
+/// Исследовательский замер (обоснование ответа владельца на вопрос 8 — вариант А: косинус не
+/// учитывается; связанные пары 0,45–0,73, несвязанные 0,23–0,44): абсолютный косинус dense
+/// bge-m3 запроса к связанным и несвязанным общим идеям. Запуск: `cargo test --test ideas_recall
 /// measure_knowledge_idea_cosine_bge_m3 -- --ignored --nocapture`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "замер для журнала: bge-m3 на CPU"]

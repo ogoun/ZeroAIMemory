@@ -558,8 +558,6 @@ const IDEAS_HINT: &str = "Предложи человеку одну: memory_upd
 const REASON_IDEA: &str = "idea";
 /// Предел заголовка идеи в строке дайджеста и подсказки, символов.
 const IDEA_TITLE_CHARS: usize = 120;
-/// Ближайших точек dense при замере косинуса общих идей Knowledge (§6.2).
-const IDEA_COSINE_NEAREST: usize = 50;
 /// Тестовая метка заголовка идеи: отдельный поиск идей к `prompt` «не укладывается в срок»
 /// (фича `test-hooks`, проверка тишины по идеям).
 #[cfg(feature = "test-hooks")]
@@ -952,7 +950,7 @@ async fn collect_prompt_ideas(
     let related = if shared.is_empty() {
         HashSet::new()
     } else {
-        knowledge_ideas_related(st, req, headers, query, &shared, health, d).await
+        knowledge_ideas_related(req, headers, &shared, health, d).await
     };
     Ok(found
         .iter()
@@ -962,18 +960,16 @@ async fn collect_prompt_ideas(
 }
 
 /// **Единственное место правила** «явная связь общей идеи Knowledge с текущей работой»
-/// (ответ 2 владельца; ждёт ответа владельца, вопрос 8): идея из `ideas` проходит, если
+/// (ответ 2 владельца; ответ владельца на вопрос 8 — вариант А, 2026-11-04): идея из `ideas`
+/// проходит, только если
 /// - тег или `area` идеи совпадает с тегом или `area` задачи `in_progress`, захваченной
-///   сессией запроса (решение и Knowledge), или у идеи есть ребро (в любую сторону) к такой
-///   задаче либо к записи пространства решения запроса той же базы; или
-/// - абсолютный косинус dense (запрос — идея, лучший чанк) ≥ `ideas.knowledge_min_cosine`
-///   (точки — [`IDEA_COSINE_NEAREST`] ближайших идей Knowledge; нет векторного канала — только
-///   явная связь).
+///   сессией запроса (решение и Knowledge), или
+/// - у идеи есть ребро (в любую сторону, глубина 1) именно к такой задаче.
+///
+/// Ребро к произвольной записи решения связи не даёт, косинус не учитывается.
 async fn knowledge_ideas_related(
-    st: &AppState,
     req: &RecallReq,
     headers: &HeaderMap,
-    query: &str,
     ideas: &[&Entry],
     health: &Health<'_>,
     d: &mut Deadline,
@@ -1013,9 +1009,10 @@ async fn knowledge_ideas_related(
             }
         }
     }
+    if tasks.is_empty() {
+        return out;
+    }
     let task_ids: HashSet<Id> = tasks.iter().map(|t| t.id).collect();
-    // решение той же базы, что Knowledge (рёбра не выходят за базу)
-    let sol_here = sol.filter(|(i, _)| *i == ki).map(|(_, s)| s);
     let graph_spaces: Vec<Id> = targets[ki].space_ids();
     for e in ideas {
         let by_tag = tasks.iter().any(|t| {
@@ -1035,96 +1032,17 @@ async fn knowledge_ideas_related(
         };
         match r {
             Ok(g) => {
-                if g.nodes.iter().any(|n| {
-                    n.r.id != e.id
-                        && !n.deleted
-                        && (task_ids.contains(&n.r.id) || Some(n.space_id) == sol_here)
-                }) {
+                if g.nodes
+                    .iter()
+                    .any(|n| n.r.id != e.id && !n.deleted && task_ids.contains(&n.r.id))
+                {
                     out.insert(e.id);
                 }
             }
             Err(err) => tracing::warn!(error = %err, "recall: связи идеи не прочитаны"),
         }
     }
-    if out.len() == ideas.len() {
-        return out;
-    }
-    let min = st.cfg.ideas.knowledge_min_cosine;
-    let cos = knowledge_cosines(st, targets[ki].owner, kn, query, d).await;
-    for e in ideas {
-        if cos.get(&e.id).is_some_and(|c| f64::from(*c) >= min) {
-            out.insert(e.id);
-        }
-    }
     out
-}
-
-/// Абсолютный косинус dense запроса `query` к идеям Knowledge `space` пользователя `owner`
-/// (лучшая точка записи; [`IDEA_COSINE_NEAREST`] ближайших, статусы — только кандидатов).
-/// Нет векторного канала, срок вышел или сбой — пусто (WARN без текста).
-async fn knowledge_cosines(
-    st: &AppState,
-    owner: Id,
-    space: Id,
-    query: &str,
-    d: &mut Deadline,
-) -> HashMap<Id, f32> {
-    let mut best: HashMap<Id, f32> = HashMap::new();
-    let (Ok(()), Some(emb), Some(vector)) = (
-        st.index.vector_available(),
-        st.index.embedder.clone(),
-        st.index.vector.clone(),
-    ) else {
-        return best;
-    };
-    // эмбеддинг запроса — из LRU-кэша эмбеддера (основной поиск уже считал тот же текст)
-    let text = query.to_string();
-    let Some(r) = d
-        .step(tokio::task::spawn_blocking(move || emb.embed_query(&text)))
-        .await
-    else {
-        return best;
-    };
-    let dense = match r {
-        Ok(Ok(e)) => e.dense,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "recall: эмбеддинг запроса для идей не удался");
-            return best;
-        }
-        Err(j) => {
-            tracing::error!(
-                panic = j.is_panic(),
-                "recall: эмбеддинг запроса для идей упал"
-            );
-            return best;
-        }
-    };
-    let filter = zam_index::VectorFilter {
-        kinds: vec!["idea".into()],
-        exclude_statuses: ["proposed", "accepted", "declined", "done"]
-            .map(String::from)
-            .to_vec(),
-        ..zam_index::VectorFilter::scope(owner, vec![space])
-    };
-    let Some(r) = d
-        .step(vector.nearest_dense(&dense, &filter, IDEA_COSINE_NEAREST))
-        .await
-    else {
-        return best;
-    };
-    match r {
-        Ok(hits) => {
-            for h in hits
-                .iter()
-                .filter(|h| h.user_id == owner && h.target.kind == TargetKind::Entry)
-            {
-                let s = best.entry(h.target.id).or_insert(h.score);
-                *s = s.max(h.score);
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "recall: косинус идей Knowledge не получен"),
-    }
-    best
 }
 
 /// Строка окружения: `ZeroAIMemory: <имя> — <purpose>; <address>; ограничения: <limits> —

@@ -1051,9 +1051,6 @@ pub struct IdeasSection {
     pub prompt_top_k: u32,
     /// `horizon` по умолчанию у `defer`, дней (1..=3650, 30).
     pub defer_days: u32,
-    /// Порог абсолютного косинуса dense общей идеи Knowledge в подсказке (0..=1); ключ и смысл
-    /// ждут ответа владельца, значение уточняется замером (M5.7 §6.2).
-    pub knowledge_min_cosine: f64,
 }
 
 impl Default for IdeasSection {
@@ -1064,7 +1061,6 @@ impl Default for IdeasSection {
             prompt_max: 1,
             prompt_top_k: 5,
             defer_days: zam_store::IDEA_DEFER_DAYS_DEFAULT,
-            knowledge_min_cosine: 0.70,
         }
     }
 }
@@ -1087,10 +1083,6 @@ impl IdeasSection {
         }
         if !(1..=3650).contains(&self.defer_days) {
             return Err(bad("defer_days", "от 1 до 3650"));
-        }
-        let c = self.knowledge_min_cosine;
-        if !(c.is_finite() && (0.0..=1.0).contains(&c)) {
-            return Err(bad("knowledge_min_cosine", "должно быть в 0..=1"));
         }
         Ok(())
     }
@@ -2289,7 +2281,6 @@ master_key = \"x\"
             (3, 1, 5, 30)
         );
         assert_eq!(c.defer_days, zam_store::IDEA_DEFER_DAYS_DEFAULT);
-        assert!((0.0..=1.0).contains(&c.knowledge_min_cosine));
         for (k, v) in [
             ("ZAM_IDEAS__DIGEST_MAX", "11"),
             ("ZAM_IDEAS__PROMPT_MAX", "4"),
@@ -2297,9 +2288,6 @@ master_key = \"x\"
             ("ZAM_IDEAS__PROMPT_TOP_K", "21"),
             ("ZAM_IDEAS__DEFER_DAYS", "0"),
             ("ZAM_IDEAS__DEFER_DAYS", "3651"),
-            ("ZAM_IDEAS__KNOWLEDGE_MIN_COSINE", "1.5"),
-            ("ZAM_IDEAS__KNOWLEDGE_MIN_COSINE", "-0.1"),
-            ("ZAM_IDEAS__KNOWLEDGE_MIN_COSINE", "nan"),
         ] {
             let e = load(None, &[env(k, v)], &Default::default())
                 .unwrap_err()
@@ -2313,7 +2301,6 @@ master_key = \"x\"
             env("ZAM_IDEAS__PROMPT_MAX", "3"),
             env("ZAM_IDEAS__PROMPT_TOP_K", "20"),
             env("ZAM_IDEAS__DEFER_DAYS", "3650"),
-            env("ZAM_IDEAS__KNOWLEDGE_MIN_COSINE", "1"),
         ];
         let c = load(None, &ok, &Default::default()).unwrap().ideas;
         assert!(!c.proactive);
@@ -2323,6 +2310,14 @@ master_key = \"x\"
         );
         let e = load(None, &[env("ZAM_IDEAS__AUTO", "true")], &Default::default());
         assert!(e.is_err(), "неизвестный ключ секции — ошибка");
+        // ответ владельца на вопрос 8 (А): порога косинуса нет — ключ не выпускался ни в одном
+        // релизе и отклоняется как неизвестный
+        let e = load(
+            None,
+            &[env("ZAM_IDEAS__KNOWLEDGE_MIN_COSINE", "0.7")],
+            &Default::default(),
+        );
+        assert!(e.is_err(), "knowledge_min_cosine удалён");
     }
 
     #[test]
