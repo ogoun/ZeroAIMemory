@@ -159,6 +159,7 @@ impl GlossarySet {
                     weaker: Vec::new(),
                     evidence: None,
                     also: Vec::new(),
+                    area: None,
                 }
             })
             .collect()
@@ -1164,6 +1165,7 @@ expect = ["ru/zam/cache"]
             weaker: Vec::new(),
             evidence: None,
             also: Vec::new(),
+            area: None,
         }];
         let mut e = Fake {
             notes: c

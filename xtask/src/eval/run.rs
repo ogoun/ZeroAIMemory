@@ -52,7 +52,7 @@ use super::metrics::{
 };
 use super::report;
 use super::{Device, EvalArgs, Mode, Paths};
-use crate::smoke::{Server, SmokeEnv, api, api_timeout, wait_health_for};
+use crate::smoke::{Server, SmokeEnv, api, api_with, wait_health_for};
 
 /// Ожидание `/health` после старта (загрузка модели с HDD, sha256 файла модели).
 const HEALTH_WAIT: Duration = Duration::from_secs(300);
@@ -473,13 +473,8 @@ impl Session {
             bail!("POST /solutions: HTTP {st}: {v}");
         }
         for n in corpus.notes.values() {
-            let body = json!({
-                "space": note_space(&n.path),
-                "path": n.path,
-                "kind": "note",
-                "content": n.text,
-            });
-            let (st, v) = self.api("/api/v1/nodes", Some(&body))?;
+            let area = corpus.areas.get(&n.path).map(String::as_str);
+            let (st, v) = note_request(&self.base, &self.token, n, area)?;
             if st != 201 {
                 bail!("POST /nodes {}: HTTP {st}: {v}", n.path);
             }
@@ -587,13 +582,7 @@ impl Session {
     /// `POST /search` с проверками режима (деградация, реранк); ответ и время на клиенте, мс.
     fn search(&self, q: &Query, mode: Mode, body: &Value) -> Result<(Value, f64)> {
         let t0 = Instant::now();
-        let (st, v) = api_timeout(
-            &self.base,
-            &self.token,
-            "/api/v1/search",
-            Some(body),
-            SEARCH_TIMEOUT,
-        )?;
+        let (st, v) = search_request(&self.base, &self.token, q, body)?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if st != 200 {
             bail!("запрос {}: HTTP {st}: {v}", q.id);
@@ -732,6 +721,40 @@ impl Session {
     pub fn kill(mut self) -> Result<()> {
         self.srv.kill()
     }
+}
+
+/// `POST /search` запроса набора: область запроса (`area`, M6 §11) — заголовком `X-Zam-Area`.
+pub fn search_request(base: &str, token: &str, q: &Query, body: &Value) -> Result<(u16, Value)> {
+    let headers: Vec<(&str, &str)> = q.area.iter().map(|a| ("X-Zam-Area", a.as_str())).collect();
+    api_with(
+        base,
+        token,
+        "/api/v1/search",
+        Some(body),
+        &headers,
+        SEARCH_TIMEOUT,
+    )
+}
+
+/// `POST /nodes` заметки корпуса: группа `e` — в решение набора, остальные — в Knowledge;
+/// область (`areas.toml`, M6 §11) — заголовком `X-Zam-Area` (сервер берёт область заметки из
+/// него, ТЗ §11.2).
+pub fn note_request(base: &str, token: &str, n: &Note, area: Option<&str>) -> Result<(u16, Value)> {
+    let body = json!({
+        "space": note_space(&n.path),
+        "path": n.path,
+        "kind": "note",
+        "content": n.text,
+    });
+    let headers: Vec<(&str, &str)> = area.iter().map(|a| ("X-Zam-Area", *a)).collect();
+    api_with(
+        base,
+        token,
+        "/api/v1/nodes",
+        Some(&body),
+        &headers,
+        Duration::from_secs(10),
+    )
 }
 
 /// Пространство заметки при загрузке: группа `e` — решение набора, остальное — Knowledge.
@@ -1333,6 +1356,73 @@ mod tests {
         assert!(history_control(&r).is_some());
         r.metrics.cancelled5_history = Some(est(0.2));
         assert!(history_control(&r).is_none());
+    }
+
+    /// Мок-сервер на один запрос: отвечает `status` с телом `{}` и возвращает текст запроса
+    /// (строка запроса, заголовки, тело).
+    fn mock_once(status: u16) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut head = String::new();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+                head.push_str(&line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            head.push_str(&String::from_utf8_lossy(&body));
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n\r\n{{}}"
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+            tx.send(head).unwrap();
+        });
+        (base, rx)
+    }
+
+    /// Область запроса набора (`area`, спецификация M6 §11) уходит заголовком `X-Zam-Area`;
+    /// у запроса без области заголовка нет. Область заметки корпуса (`areas.toml`) — тоже
+    /// заголовком, при `POST /nodes`.
+    #[test]
+    fn area_header_sent_from_query() {
+        let mut q = crate::eval::corpus::tests_query("a-01", "en/web/x");
+        q.area = Some("frontend".into());
+        let body = Session::search_body(&q, Mode::Fts, "notes", false);
+        let (base, rx) = mock_once(200);
+        let (st, _) = search_request(&base, "tok", &q, &body).unwrap();
+        assert_eq!(st, 200);
+        let req = rx.recv().unwrap().to_ascii_lowercase();
+        assert!(req.contains("\r\nx-zam-area: frontend\r\n"), "{req}");
+        q.area = None;
+        let (base, rx) = mock_once(200);
+        search_request(&base, "tok", &q, &body).unwrap();
+        let req = rx.recv().unwrap().to_ascii_lowercase();
+        assert!(!req.contains("x-zam-area"), "{req}");
+        let note = Note {
+            path: "en/web/x".into(),
+            lang: Lang::En,
+            text: "# X\n\nText.\n".into(),
+        };
+        let (base, rx) = mock_once(201);
+        let (st, _) = note_request(&base, "tok", &note, Some("backend")).unwrap();
+        assert_eq!(st, 201);
+        let req = rx.recv().unwrap().to_ascii_lowercase();
+        assert!(req.contains("\r\nx-zam-area: backend\r\n"), "{req}");
+        assert!(req.starts_with("post /api/v1/nodes "), "{req}");
     }
 
     #[test]

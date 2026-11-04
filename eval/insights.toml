@@ -720,3 +720,637 @@ scope = "solution"
 certainty = "axiom"
 title = "Значения Vault никогда не попадают в FTS, Qdrant, выдачу поиска и журналы"
 body = "Значение секрета хранится только зашифрованным в Vault; ни FTS, ни Qdrant, ни ответы поиска, ни журналы его не видят. Искать можно только по метаданным записи."
+
+# ======================= M6, задача 1c: буст вида (§10) и области (§11) =======================
+#
+# Группы k01–k24: ответ — insight `gotcha`/`failure` (`k<NN>-t`), трудные соседи — заметка той же
+# темы (`<язык>/api|web|infra/…`, в комментарии группы) и insight `discovery`/`experiment` с
+# близким текстом (`k<NN>-n`). Темы идут парами в разных областях (k01/k02 — повторы в backend и
+# frontend и т. д.): запросы `same`/`other` набора областей (задача 11) получают соседа той же
+# темы из другой области. Области заметок — `eval/corpus/areas.toml`.
+# Пары p15–p20 — ещё шесть противоречий «`hypothesis` `gotcha` → `theorem`» (всего с p01–p04,
+# p08, p09 — 12, §10 требует ≥ 8).
+
+# ---- k01: повторы, backend (заметка ru/api/http-client-retries) ----
+
+[[insight]]
+key = "k01-t"
+lang = "ru"
+kind = "failure"
+scope = "solution"
+area = "backend"
+title = "Двойное списание: повтор POST к платёжному шлюзу без ключа идемпотентности"
+body = "После тайм-аута ответа клиент заказов повторил POST /payments, хотя первый запрос уже дошёл до шлюза. Шлюз провёл оба платежа, и 37 покупателей получили двойное списание. Повтор неидемпотентного запроса без Idempotency-Key запрещён; у платежей ключ — идентификатор операции заказа."
+
+[[insight]]
+key = "k01-n"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+area = "backend"
+title = "Платёжный шлюз на повторный POST с тем же ключом идемпотентности отдаёт первый ответ"
+body = "Проверили поведение шлюза: повторный POST /payments с тем же Idempotency-Key в течение 24 часов не создаёт новый платёж, а возвращает сохранённый ответ первого запроса с заголовком Idempotent-Replayed: true. Ключ с другим телом запроса получает 422."
+
+# ---- k02: повторы, frontend (заметка en/web/fetch-retry-abort) ----
+
+[[insight]]
+key = "k02-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+title = "Reusing an aborted AbortController makes every fetch retry fail instantly"
+body = "The retry loop passed the same AbortController signal to each attempt. Once the timeout aborted the first attempt, the signal stayed aborted, so every retry rejected immediately with AbortError and the wrapper reported a timeout after 0 ms. Each attempt needs its own controller; the component-level signal is combined with AbortSignal.any."
+
+[[insight]]
+key = "k02-n"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+area = "frontend"
+title = "Three fetch attempts with jitter cut failed product page loads by half"
+body = "A/B test of the fetch wrapper: retrying GET requests on network errors up to three times with randomized backoff (300 ms, 1 s) reduced failed product page loads from 1.4 % to 0.7 % on mobile networks; median load time did not change."
+
+# ---- k03: кэш, backend (заметка en/api/product-cache-invalidation) ----
+
+[[insight]]
+key = "k03-t"
+lang = "en"
+kind = "failure"
+scope = "solution"
+area = "backend"
+title = "Cache stampede: popular product keys expiring together overloaded Postgres"
+body = "During the sale all hot product cards were written within the same minute with a 15-minute TTL, so they expired together. Hundreds of concurrent misses for the same keys went to the primary database, connection pool waits exceeded 5 s and the catalog returned 503 for four minutes. Fix: random TTL spread of plus or minus 20 % and a single-flight lock per key on miss."
+
+[[insight]]
+key = "k03-n"
+lang = "en"
+kind = "discovery"
+scope = "solution"
+area = "backend"
+title = "Product cache hit ratio rose from 81 to 94 percent after keying cards by locale"
+body = "Before the change one Redis key held the card for all locales and every translation update deleted it. With product:{id}:{locale} keys an update of one locale invalidates only its own key, and the hit ratio of the product cache grew from 81 % to 94 %."
+
+# ---- k04: кэш, frontend (заметка ru/web/service-worker-cache) ----
+
+[[insight]]
+key = "k04-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+title = "Service worker отдаёт старый index.html после релиза — белый экран"
+body = "Старый service worker кэшировал index.html стратегией «сначала кэш». После релиза оболочка ссылалась на файлы прошлой сборки, которых уже нет на сервере, и часть посетителей видела белый экран до очистки данных сайта. index.html нельзя отдавать из кэша раньше сети."
+
+[[insight]]
+key = "k04-n"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+area = "frontend"
+title = "Stale-while-revalidate для статики ускорил повторный вход в витрину"
+body = "Сравнили стратегии service worker для картинок и справочника категорий: stale-while-revalidate сократил время до первой отрисовки при повторном входе с 1,9 до 1,1 секунды на медленном 3G, доля устаревших справочников в первой отрисовке — меньше 2 %."
+
+# ---- k05: журналы, backend (заметка ru/api/structured-logging) ----
+
+[[insight]]
+key = "k05-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "#[instrument] без skip пишет тело запроса с персональными данными в журнал"
+body = "Атрибут #[instrument] на обработчике регистрации записывал в span все аргументы функции, включая тело запроса с телефоном и адресом почты. Журналы с персональными данными три недели уходили в общий сборщик. У #[instrument] нужно перечислять поля явно (skip_all и fields)."
+
+[[insight]]
+key = "k05-n"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+area = "backend"
+title = "request_id в каждом событии журнала сократил разбор инцидента до минут"
+body = "После того как request_id стал полем корневого span обработчика, все события запроса во всех сервисах находятся одним фильтром в сборщике журналов. Разбор инцидента с цепочкой из трёх сервисов занял 6 минут вместо прежнего часа."
+
+# ---- k06: журналы ошибок, frontend (заметка en/web/client-error-reporting) ----
+
+[[insight]]
+key = "k06-t"
+lang = "en"
+kind = "failure"
+scope = "solution"
+area = "frontend"
+title = "Error reporter flooded the collector when a render loop threw on every frame"
+body = "A component threw inside requestAnimationFrame on every frame after a release. The reporter sent each error separately, about 60 reports per second per tab, and the collector endpoint started rejecting all traffic, including reports from other pages. Deduplication within a page view and a hard cap of 20 reports were added after this incident."
+
+[[insight]]
+key = "k06-n"
+lang = "en"
+kind = "discovery"
+scope = "solution"
+area = "frontend"
+title = "Grouping client errors by source-mapped top frame shows three crash sites"
+body = "After stack frames were resolved through uploaded source maps, client error reports grouped by top frame showed that three code sites produce 70 % of all storefront errors: the price formatter, the cart badge and the image carousel."
+
+# ---- k07: тайм-ауты, backend (заметка en/api/database-statement-timeout) ----
+
+[[insight]]
+key = "k07-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "SET statement_timeout per session is lost behind pgbouncer transaction pooling"
+body = "The service ran SET statement_timeout = '5s' once after connecting. With pgbouncer in transaction pooling mode the next transaction may run on another server connection, so most queries ran without the limit and a slow report held connections for minutes. The limit must be set per role or with SET LOCAL inside the transaction."
+
+[[insight]]
+key = "k07-n"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+area = "backend"
+title = "A 5 s statement timeout cut p99 latency of the orders endpoint"
+body = "With statement_timeout = 5s on the orders role, runaway queries are cancelled instead of holding pool connections. Over a week p99 latency of the orders endpoint dropped from 4.2 s to 1.1 s, while 0.02 % of requests got 503 from cancelled statements."
+
+# ---- k08: тайм-ауты, infra (заметка ru/infra/proxy-timeouts-long-requests) ----
+
+[[insight]]
+key = "k08-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "infra"
+title = "Выгрузка заказов обрывается с 504 ровно через 60 секунд — proxy_read_timeout nginx"
+body = "Выгрузка заказов в CSV собиралась целиком в памяти и отправлялась только в конце. Пока сервис считал, nginx не получал ни байта и через proxy_read_timeout по умолчанию (60 секунд) закрывал соединение с 504, хотя сервис продолжал работу и потом писал в журнал ошибку записи в закрытый сокет."
+
+[[insight]]
+key = "k08-n"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+area = "infra"
+title = "Потоковая отдача выгрузки держит соединение через прокси без увеличения тайм-аута"
+body = "Попробовали отдавать выгрузку заказов потоком: сервис пишет строки CSV по мере чтения из базы. Между порциями проходит меньше секунды, proxy_read_timeout не срабатывает, а память сервиса на выгрузку в 2 миллиона строк — 40 МБ вместо 1,6 ГБ."
+
+# ---- k09: флаги, frontend (заметка ru/web/feature-flags-first-paint) ----
+
+[[insight]]
+key = "k09-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+title = "Флаг, полученный после первой отрисовки, даёт мигание старого интерфейса"
+body = "Новая корзина за флагом сначала рисовалась в старом виде, а через 300–800 мс, когда приходил ответ /api/flags, перерисовывалась в новом. На медленных сетях мигание было заметно, а клики по старой кнопке «Оформить» терялись при перерисовке."
+
+[[insight]]
+key = "k09-n"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+area = "frontend"
+title = "Встраивание значений флагов в HTML-оболочку убрало ожидание /api/flags"
+body = "Эксперимент: сервер оболочки вставляет значения флагов посетителя в script-тег страницы, и приложение читает их до первой отрисовки. Запрос /api/flags при загрузке больше не нужен, время до интерактивности на медленном 3G уменьшилось на 0,4 секунды."
+
+# ---- k10: флаги, backend (заметка en/api/feature-flag-evaluation) ----
+
+[[insight]]
+key = "k10-t"
+lang = "en"
+kind = "failure"
+scope = "solution"
+area = "backend"
+title = "Flag service outage turned every flag off and disabled checkout"
+body = "The orders service was restarted while the flag service was down. The SDK could not load the rule set and returned the default for every flag, and the default of new_checkout was false although the old checkout had already been removed. Checkout returned 404 for 25 minutes. Defaults must describe the behaviour that still exists in code."
+
+[[insight]]
+key = "k10-n"
+lang = "en"
+kind = "discovery"
+scope = "solution"
+area = "backend"
+title = "A local rule set snapshot keeps flag evaluation working when the flag service is down"
+body = "The flag SDK can persist the last downloaded rule set to disk and load it at startup when the flag service is unreachable. In a drill with the flag service stopped, restarted instances evaluated flags from the snapshot and served the same variants as before."
+
+# ---- k11: токены, frontend (заметка en/web/token-refresh-tabs) ----
+
+[[insight]]
+key = "k11-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+title = "Two tabs refreshing the token at once log the user out on every device"
+body = "Each open tab refreshed the access token on its own timer. When two tabs refreshed within the same second, the second one presented a refresh token that the first had just rotated, the auth service detected reuse and revoked the whole token family. Users with several tabs were logged out several times a day."
+
+[[insight]]
+key = "k11-n"
+lang = "en"
+kind = "discovery"
+scope = "solution"
+area = "frontend"
+title = "BroadcastChannel lets one tab refresh the access token for all tabs"
+body = "With a BroadcastChannel and the Web Locks API, only the tab holding the lock refreshes the access token and posts the new one to the other tabs. In the test environment with 30 s tokens, ten open tabs made one refresh call per cycle instead of ten."
+
+# ---- k12: токены, backend (заметка ru/api/jwt-validation) ----
+
+[[insight]]
+key = "k12-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "Проверка JWT отвергает только что выпущенные токены: часы узла отстали"
+body = "На одном узле сервиса заказов отключилась синхронизация времени, и часы отстали на 40 секунд. Токены от сервиса авторизации приходили с nbf «в будущем» по часам узла, проверка отвергала их, и пользователи получали 401 сразу после входа, но только при попадании на этот узел."
+
+[[insight]]
+key = "k12-n"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+area = "backend"
+title = "Допуск 30 секунд на расхождение часов при проверке exp и nbf JWT"
+body = "Проверили, как допуск leeway в 30 секунд при проверке exp и nbf влияет на ошибки 401: доля отказов сразу после входа упала до нуля, а продление жизни токена на полминуты признано безопасным при времени жизни 10 минут."
+
+# ---- k13: пагинация, backend (заметка ru/api/keyset-pagination) ----
+
+[[insight]]
+key = "k13-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "Пагинация через OFFSET пропускает и дублирует заказы при новых вставках"
+body = "Выгрузка заказов партнёру шла страницами LIMIT 100 OFFSET n по убыванию времени. Новые заказы, пришедшие во время выгрузки, сдвигали страницы: часть заказов попала в выгрузку дважды, а часть не попала вовсе. Для обхода изменяющейся таблицы нужен курсор по ключу сортировки."
+
+[[insight]]
+key = "k13-n"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+area = "backend"
+title = "Keyset-пагинация по (created_at, id) держит время ответа постоянным на дальних страницах"
+body = "Замер списка заказов: с OFFSET время ответа росло линейно и на странице 5000 достигало 2,3 секунды, с условием (created_at, id) < (последние значения) и индексом по этой паре каждая страница отвечает за 8–12 мс независимо от глубины."
+
+# ---- k14: бесконечная прокрутка, frontend (заметка en/web/infinite-scroll) ----
+
+[[insight]]
+key = "k14-t"
+lang = "en"
+kind = "failure"
+scope = "solution"
+area = "frontend"
+title = "Infinite scroll requested the same page twice while the sentinel stayed visible"
+body = "On tall screens the sentinel stayed inside the viewport after the first page arrived, and the IntersectionObserver callback fired again before the cursor in state was updated. The listing requested the same cursor twice and showed duplicate product cards. The component now ignores intersections while a request is in flight and keys pages by cursor."
+
+[[insight]]
+key = "k14-n"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+area = "frontend"
+title = "A virtualized product list keeps memory flat after 10,000 scrolled items"
+body = "Measured the listing with and without virtualization: after scrolling through 10,000 products, the plain list held 410 MB of DOM and images and dropped frames, while the virtualized list rendered about 40 cards at a time and stayed at 90 MB."
+
+# ---- k15: время, backend (заметка en/api/timestamps-utc) ----
+
+[[insight]]
+key = "k15-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "Local time stored without offset shifted orders by an hour after the DST change"
+body = "The legacy warehouse table kept order times in a timestamp column filled with server local time. On the night of the daylight saving change, orders between 02:00 and 03:00 got ambiguous times, and the same-day shipping rule assigned them to the wrong day. New columns use timestamptz and the rule converts instants into the warehouse IANA zone."
+
+[[insight]]
+key = "k15-n"
+lang = "en"
+kind = "discovery"
+scope = "solution"
+area = "backend"
+title = "timestamptz normalizes input with any offset to UTC on write"
+body = "Checked Postgres behaviour: a timestamptz column stores an instant, and input such as 2026-03-29T03:30:00+02:00 is converted to UTC on write; output is rendered in the session TimeZone. The column itself keeps no zone, so the warehouse zone must be stored separately."
+
+# ---- k16: даты, frontend (заметка ru/web/date-formatting-intl) ----
+
+[[insight]]
+key = "k16-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+title = "new Date('2026-03-01') показывает в западных поясах 28 февраля"
+body = "Строку даты без времени конструктор Date разбирает как полночь UTC. В поясах западнее UTC эта полночь приходится на предыдущий день, и дата доставки в интерфейсе показывалась на день раньше. Дату без времени нельзя превращать в объект Date: её выводят как строку или разбирают по частям."
+
+[[insight]]
+key = "k16-n"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+area = "frontend"
+title = "Общий кэш форматтеров Intl.DateTimeFormat ускорил таблицу заказов в 6 раз"
+body = "Таблица из 2000 заказов создавала новый Intl.DateTimeFormat в каждой строке и рисовалась 900 мс. С кэшем форматтеров по языку и поясу та же таблица рисуется за 150 мс, вывод дат не изменился."
+
+# ---- k17: загрузки, frontend (заметка en/web/large-file-upload) ----
+
+[[insight]]
+key = "k17-t"
+lang = "en"
+kind = "failure"
+scope = "solution"
+area = "frontend"
+title = "Upload progress stuck at 100 % while the server processed the price list"
+body = "The progress bar used upload progress events only. For price lists the server parsed the file after the last byte arrived, which took up to two minutes, and the bar stayed at 100 % with no feedback. Sellers reloaded the page and uploaded the file again, creating duplicate imports. The dashboard now shows a separate processing state polled from the import status."
+
+[[insight]]
+key = "k17-n"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+area = "frontend"
+title = "8 MiB upload parts survive flaky mobile networks better than 64 MiB parts"
+body = "Compared part sizes for dashboard uploads over a throttled, lossy connection: with 64 MiB parts 31 % of 1 GB uploads failed or restarted large parts, with 8 MiB parts 2 % failed and total time grew by 6 %."
+
+# ---- k18: пределы тела, infra (заметка ru/infra/upload-size-limits) ----
+
+[[insight]]
+key = "k18-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "infra"
+title = "413 Request Entity Too Large на импорте прайс-листа: предел nginx 1 МБ по умолчанию"
+body = "На новом стенде прайс-листы больше 1 МБ получали 413, хотя сервис принимает до 50 МБ. В конфигурации стенда не было client_max_body_size, и действовало значение nginx по умолчанию — 1 МБ. Предел задаётся явно на каждом стенде из общего шаблона."
+
+[[insight]]
+key = "k18-n"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+area = "infra"
+title = "Предел размера тела запроса надо поднимать на трёх уровнях сразу"
+body = "Разбор загрузок больших файлов показал: тело ограничивают балансировщик облака, nginx (client_max_body_size) и сам сервис (предел тела фреймворка). Поднятие одного предела без двух других переносит отказ на следующее звено, и код ответа меняется с 413 на 400 или обрыв соединения."
+
+# ---- k19: лимиты частоты, backend (заметка ru/api/rate-limiting-token-bucket) ----
+
+[[insight]]
+key = "k19-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "Лимит частоты по IP за прокси ограничивал всех клиентов разом"
+body = "Сервис брал адрес клиента из соединения, а за балансировщиком это всегда адрес балансировщика. Все клиенты попали в одно ведро токенов, и в пиковый час API отвечало 429 всем подряд. Адрес клиента берётся из X-Forwarded-For только от доверенных адресов прокси, а лимиты платных клиентов — по их ключу."
+
+[[insight]]
+key = "k19-n"
+lang = "ru"
+kind = "experiment"
+scope = "solution"
+area = "backend"
+title = "Лимит частоты по ключу клиента вместо IP снизил ложные 429 до нуля"
+body = "Две недели лимиты API считались параллельно по IP и по ключу клиента. При лимите по ключу клиенты за общим корпоративным NAT перестали получать 429 из-за соседей, а нагрузку от одного ключа ведро по-прежнему ограничивало."
+
+# ---- k20: лимиты частоты, infra (заметка en/infra/nginx-limit-req) ----
+
+[[insight]]
+key = "k20-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "infra"
+title = "limit_req without burst rejected normal page loads with 503"
+body = "The API location had limit_req zone=api with rate=20r/s but no burst. A single storefront page load fires 12 API requests within 50 ms; nginx counts the rate per millisecond window, so requests after the first arrived too early and got 503 even for one user. A burst of 40 with nodelay fixed it, and limit_req_status is now 429."
+
+[[insight]]
+key = "k20-n"
+lang = "en"
+kind = "discovery"
+scope = "solution"
+area = "infra"
+title = "limit_req_dry_run shows which clients a new nginx rate limit would reject"
+body = "Deploying a new rate limit with limit_req_dry_run on logged would-be rejections with the zone and client address. A day of dry-run logs showed that the planned login limit would reject the office proxy of a large customer, and the limit was adjusted before enforcement."
+
+# ---- k21: переменные сборки, frontend (заметка ru/web/vite-env-variables) ----
+
+[[insight]]
+key = "k21-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+title = "Переменная с префиксом VITE_ попала в бандл открытым текстом"
+body = "Ключ API службы доставки положили в VITE_DELIVERY_KEY, чтобы обращаться к нему из кода витрины. Vite подставил значение в собранный JS, и ключ оказался в открытом доступе для всех посетителей. Секреты нельзя передавать в сборку фронтенда: запросы с ними идут через сервис."
+
+[[insight]]
+key = "k21-n"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+area = "frontend"
+title = "import.meta.env подставляется при сборке: одна сборка не может узнать стенд"
+body = "Выяснили, почему сборка для стенда показывала адрес API продакшена: значения import.meta.env.VITE_* подставляются строкой при сборке, а не читаются при запуске. Для одной сборки на все стенды адрес API читается из /config.json стенда."
+
+# ---- k22: кэш слоёв, infra (заметка en/infra/ci-docker-layer-cache) ----
+
+[[insight]]
+key = "k22-t"
+lang = "en"
+kind = "failure"
+scope = "solution"
+area = "infra"
+title = "CI image builds took 20 minutes after COPY . moved before the dependency install"
+body = "A refactoring of the orders Dockerfile put COPY . . before cargo fetch and the dependency build. Every commit changed the copied layer, so all following layers, including the dependency build, were rebuilt from scratch and the image build went from 4 to 20 minutes. The manifest is copied and dependencies are built before the source again."
+
+[[insight]]
+key = "k22-n"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+area = "infra"
+title = "A registry-backed BuildKit cache with mode=max cut CI image builds to four minutes"
+body = "Tried cache backends for buildx on ephemeral runners: without an exported cache builds took 14 minutes, with type=registry and mode=max they took 4 minutes on average, and the cache reference in the internal registry stayed under 3 GB."
+
+# ---- k23: пробы, infra (заметка ru/infra/readiness-liveness-probes) ----
+
+[[insight]]
+key = "k23-t"
+lang = "ru"
+kind = "failure"
+scope = "solution"
+area = "infra"
+title = "Проба живости с проверкой базы перезапустила все поды при сбое Postgres"
+body = "В /livez добавили проверку соединения с базой. Когда основной Postgres переключался на реплику 40 секунд, проба живости не проходила у всех подов сервиса, Kubernetes перезапустил их одновременно, и после возвращения базы сервис ещё 5 минут прогревал кэши. Зависимости проверяет только проба готовности."
+
+[[insight]]
+key = "k23-n"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+area = "infra"
+title = "Неготовый под снимается с балансировки без перезапуска"
+body = "Проверили на стенде: когда /readyz отвечает 503, под исчезает из Endpoints сервиса через период пробы и порог неудач, но процесс не перезапускается и сохраняет прогретые кэши. После восстановления зависимости под возвращается в балансировку за 20 секунд."
+
+# ---- k24: /health, backend (заметка en/api/health-endpoint-design) ----
+
+[[insight]]
+key = "k24-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "A /health endpoint that counted orders became the heaviest query under load"
+body = "The orders service health check ran SELECT count(*) FROM orders to prove the database worked. Load balancers, uptime checks and the deploy pipeline called it about 50 times per second, and during a traffic peak the health query alone used a third of database CPU. A dependency check must be cheap, such as SELECT 1, and cached."
+
+[[insight]]
+key = "k24-n"
+lang = "en"
+kind = "experiment"
+scope = "solution"
+area = "backend"
+title = "Caching dependency checks of /health for 10 seconds removed health traffic from the database"
+body = "The health endpoint now refreshes dependency status in the background every 10 seconds and answers from the cached result. Database queries from health checks fell from about 50 per second to 0.1 per second, and the reported status lags real failures by at most 10 seconds."
+
+# ---- p15: localStorage в приватном режиме Safari ----
+
+[[insight]]
+key = "p15-h"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+certainty = "hypothesis"
+contradicts = ["p15-t"]
+title = "В приватном режиме Safari localStorage.setItem всегда бросает исключение"
+body = "В приватном окне Safari запись в localStorage невозможна: setItem бросает QuotaExceededError, поэтому корзину в приватном режиме надо хранить только в памяти."
+
+[[insight]]
+key = "p15-t"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+area = "frontend"
+certainty = "theorem"
+title = "localStorage в приватном окне Safari работает, данные удаляются при закрытии окна"
+body = "Исключение QuotaExceededError в приватном режиме было у старых Safari (до 11). В актуальных версиях setItem и getItem в приватном окне работают с обычной квотой, а данные удаляются, когда закрываются приватные вкладки."
+evidence = { checked = "корзина витрины в приватном окне Safari 17 на macOS и iOS", method = "setItem и getItem из консоли, затем перезагрузка вкладки", result = "запись и чтение без исключений, значение сохраняется до закрытия окна" }
+
+# ---- p16: SQLite и потоки ----
+
+[[insight]]
+key = "p16-h"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+certainty = "hypothesis"
+contradicts = ["p16-t"]
+title = "SQLite cannot be used from more than one thread"
+body = "SQLite is single-threaded: opening the database from several threads corrupts it, so the export worker must funnel every query through one thread."
+
+[[insight]]
+key = "p16-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+certainty = "theorem"
+title = "SQLite is safe across threads with one connection per thread in WAL mode"
+body = "The default SQLite build is compiled in serialized threading mode. Several threads, each with its own connection, can use one database file; in WAL mode readers do not block the single writer. Sharing one connection without a lock is what causes errors, not using threads."
+evidence = { checked = "export worker with 8 threads, one connection per thread, WAL mode", method = "stress test of one hour and PRAGMA integrity_check afterwards", result = "no errors except handled SQLITE_BUSY, integrity_check returned ok" }
+
+# ---- p17: systemd после OOM ----
+
+[[insight]]
+key = "p17-h"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "infra"
+certainty = "hypothesis"
+contradicts = ["p17-t"]
+title = "systemd не перезапускает сервис, убитый OOM killer"
+body = "Если процесс сервиса убил OOM killer, systemd считает остановку штатной и не перезапускает его даже с Restart=on-failure — нужен внешний сторож."
+
+[[insight]]
+key = "p17-t"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "infra"
+certainty = "theorem"
+title = "Restart=on-failure перезапускает сервис после OOM kill: завершение по SIGKILL — неуспех"
+body = "Завершение процесса сигналом SIGKILL от OOM killer systemd считает неуспешным, и юнит с Restart=on-failure перезапускается; в журнале остаётся result 'oom-kill'. Не перезапускаются только сервисы с Restart=no или исчерпавшие StartLimitBurst."
+evidence = { checked = "юнит сервиса выгрузок с MemoryMax=200M и Restart=on-failure", method = "выделение памяти сверх предела, затем systemctl status и journalctl -u", result = "процесс убит с oom-kill, systemd перезапустил его через RestartSec" }
+
+# ---- p18: position sticky во flex ----
+
+[[insight]]
+key = "p18-h"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+certainty = "hypothesis"
+contradicts = ["p18-t"]
+title = "position: sticky does not work inside flex containers"
+body = "A sticky element inside a flex container never sticks, so the order summary in the checkout sidebar must use position: fixed and JavaScript scroll handlers."
+
+[[insight]]
+key = "p18-t"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "frontend"
+certainty = "theorem"
+title = "Sticky works inside flex; it breaks on an ancestor with overflow hidden or a stretched item"
+body = "position: sticky works for flex items. It fails when an ancestor between the element and the scroll container has overflow other than visible, or when the flex item is stretched to the full height of the row so there is no room to stick; align-self: flex-start fixes the second case."
+evidence = { checked = "checkout sidebar inside a flex row", method = "removed overflow: hidden from the wrapper and set align-self: flex-start, scrolled in Chrome, Firefox and Safari", result = "the order summary sticks in all three browsers" }
+
+# ---- p19: отмена задачи tokio ----
+
+[[insight]]
+key = "p19-h"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+certainty = "hypothesis"
+contradicts = ["p19-t"]
+title = "Задачу tokio::spawn нельзя отменить, она работает до конца"
+body = "Запущенная через tokio::spawn задача не отменяется: даже если выбросить JoinHandle, она доработает до конца, поэтому долгие выгрузки нужно делить на части вручную."
+
+[[insight]]
+key = "p19-t"
+lang = "ru"
+kind = "discovery"
+scope = "solution"
+area = "backend"
+certainty = "theorem"
+title = "JoinHandle::abort отменяет задачу tokio в ближайшей точке await"
+body = "Отбрасывание JoinHandle задачу не отменяет, но вызов abort отменяет: задача снимается в ближайшей точке await, её future уничтожается, а ожидающий получает JoinError с is_cancelled. Код без точек await (долгий цикл вычислений) не прерывается."
+evidence = { checked = "выгрузка заказов в задаче tokio::spawn", method = "abort через 100 мс и проверка результата await на JoinHandle", result = "JoinError::is_cancelled() = true, запись в файл прекратилась" }
+
+# ---- p20: доступ к хосту из контейнера на Linux ----
+
+[[insight]]
+key = "p20-h"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "infra"
+certainty = "hypothesis"
+contradicts = ["p20-t"]
+title = "Containers on Linux cannot reach services running on the host"
+body = "host.docker.internal exists only on Docker Desktop, so on a Linux CI runner a container has no way to reach a database listening on the host."
+
+[[insight]]
+key = "p20-t"
+lang = "en"
+kind = "discovery"
+scope = "solution"
+area = "infra"
+certainty = "theorem"
+title = "host.docker.internal works on Linux with --add-host=host.docker.internal:host-gateway"
+body = "Since Docker 20.10 the special value host-gateway maps a host name to the host's gateway address. Adding --add-host=host.docker.internal:host-gateway (or extra_hosts in compose) lets a container on Linux reach a service on the host, provided the service listens on that interface."
+evidence = { checked = "Linux CI runner with Docker 24, Postgres on the host", method = "psql from a container started with --add-host=host.docker.internal:host-gateway", result = "connection established, query returned rows" }

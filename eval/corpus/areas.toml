@@ -1,0 +1,62 @@
+# Области целей корпуса (спецификация M6 §11, задача 1c): путь заметки → backend | frontend |
+# infra. Загрузчик шлёт область заголовком X-Zam-Area при POST /nodes (сервер берёт из него
+# область узла, ТЗ §11.2). Область insight — поле `area` в eval/insights.toml. Заметки без
+# строки здесь — без области (запросы `none` набора областей, задача 11).
+
+[area]
+# ---- backend: сервисы, API, базы ----
+"ru/api/http-client-retries" = "backend"
+"en/api/product-cache-invalidation" = "backend"
+"ru/api/structured-logging" = "backend"
+"en/api/database-statement-timeout" = "backend"
+"en/api/feature-flag-evaluation" = "backend"
+"ru/api/jwt-validation" = "backend"
+"ru/api/keyset-pagination" = "backend"
+"en/api/timestamps-utc" = "backend"
+"ru/api/rate-limiting-token-bucket" = "backend"
+"en/api/health-endpoint-design" = "backend"
+"en/db/connection-pool-exhaustion" = "backend"
+"en/db/postgres-explain-analyze" = "backend"
+"ru/db/postgres-zero-downtime-migrations" = "backend"
+"ru/db/sqlite-busy-timeout" = "backend"
+"ru/ops/retries-backoff-jitter" = "backend"
+"en/long/payment-webhooks-reliability" = "backend"
+"en/long/api-versioning-guide" = "backend"
+"en/long/postgres-index-tuning-notes" = "backend"
+"ru/long/kafka-consumer-lag-analysis" = "backend"
+
+# ---- frontend: витрина, кабинет продавца, сборка фронтенда ----
+"en/web/fetch-retry-abort" = "frontend"
+"ru/web/service-worker-cache" = "frontend"
+"en/web/client-error-reporting" = "frontend"
+"ru/web/feature-flags-first-paint" = "frontend"
+"en/web/token-refresh-tabs" = "frontend"
+"en/web/infinite-scroll" = "frontend"
+"ru/web/date-formatting-intl" = "frontend"
+"en/web/large-file-upload" = "frontend"
+"ru/web/vite-env-variables" = "frontend"
+"en/devtools/eslint-prettier-conflict" = "frontend"
+"en/devtools/typescript-strict-flags" = "frontend"
+"en/devtools/playwright-flaky-e2e" = "frontend"
+"en/devtools/node-version-pinning" = "frontend"
+"en/devtools/npm-ci-clean-install" = "frontend"
+"en/long/frontend-performance-audit" = "frontend"
+
+# ---- infra: прокси, контейнеры, кластер, CI ----
+"ru/infra/proxy-timeouts-long-requests" = "infra"
+"ru/infra/upload-size-limits" = "infra"
+"en/infra/nginx-limit-req" = "infra"
+"en/infra/ci-docker-layer-cache" = "infra"
+"ru/infra/readiness-liveness-probes" = "infra"
+"en/docker/compose-healthcheck-depends-on" = "infra"
+"en/docker/multistage-build-layer-cache" = "infra"
+"en/docker/exit-code-137-container-oom" = "infra"
+"ru/docker/container-log-rotation" = "infra"
+"en/ops/http-cache-headers" = "infra"
+"en/ops/trusted-proxies" = "infra"
+"en/ops/dns-ttl-migration" = "infra"
+"ru/ops/nginx-reverse-proxy-headers" = "infra"
+"ru/ops/log-rotation" = "infra"
+"ru/ops/tls-expired-certificate" = "infra"
+"en/linux/systemd-unit-restart" = "infra"
+"en/long/kubernetes-upgrade-log" = "infra"

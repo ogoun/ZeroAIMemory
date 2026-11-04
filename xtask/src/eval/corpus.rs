@@ -164,6 +164,65 @@ pub const INSIGHT_REF: &str = "insight:";
 pub struct Corpus {
     pub notes: BTreeMap<String, Note>,
     pub insights: Vec<Insight>,
+    /// Области заметок (M6 §11): путь → `backend` | `frontend` | `infra` из
+    /// [`AREAS_FILE`] корпуса; загрузчик шлёт её заголовком `X-Zam-Area` при `POST /nodes`.
+    /// Область insight — его поле `area`.
+    pub areas: BTreeMap<String, String>,
+}
+
+/// Файл областей заметок в корне каталога корпуса (M6 §11).
+pub const AREAS_FILE: &str = "areas.toml";
+
+/// Области целей набора (M6 §11): у каждой — не меньше [`MIN_PER_AREA`] целей полного набора.
+pub const AREAS: [&str; 3] = ["backend", "frontend", "infra"];
+/// Минимум целей (заметок и insight) на область у полного набора (M6 §11).
+pub const MIN_PER_AREA: usize = 8;
+/// Минимум пар «`hypothesis` `gotcha` → `theorem`» со связью `contradicts` (M6 §10).
+pub const MIN_GOTCHA_CONTRADICTS: usize = 8;
+
+/// Имя каталога корпуса ТС-2 (`eval/sessions-corpus`, M6 §3.2): его грузит только ТС-2 и
+/// наборы идей; загрузчик корпуса ТС-1 и основного набора его не читает.
+pub const SESSIONS_CORPUS_DIR: &str = "sessions-corpus";
+
+/// `areas.toml`: `[area] "<путь заметки>" = "<область>"`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AreasFile {
+    #[serde(default)]
+    area: BTreeMap<String, String>,
+}
+
+/// Каталог `dir` — не корпус ТС-2 и не содержит его (рецензия плана M6, C1): иначе ТС-1 и
+/// основной набор получили бы сущности ТС-2 (идеи, Rules), которых у старых баз нет.
+fn ensure_not_sessions_corpus(dir: &Path) -> Result<()> {
+    let refuse = |p: &Path| {
+        anyhow::anyhow!(
+            "{}: каталог {SESSIONS_CORPUS_DIR} — корпус ТС-2, его грузит только ТС-2 (eval \
+             --sessions) и наборы идей; ТС-1 и основной набор берут eval/corpus",
+            p.display()
+        )
+    };
+    let full = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if full
+        .components()
+        .any(|c| c.as_os_str() == SESSIONS_CORPUS_DIR)
+    {
+        return Err(refuse(dir));
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if e.file_name() == SESSIONS_CORPUS_DIR {
+                    return Err(refuse(&p));
+                }
+                stack.push(p);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Запрос с ожидаемыми заметками или insight.
@@ -189,6 +248,9 @@ pub struct Query {
     /// `chunk`: дословная подстрока ожидаемой заметки — лист должен содержать её целиком.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// Текущая область запроса (M6 §11): уходит заголовком `X-Zam-Area` (буст области).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
     /// Дополнительно релевантные цели (`insight:<key>` или заметки M3): засчитываются в метриках
     /// прогона вместе с `expect`, в сравнении с прежним прогоном (`--compare`) не участвуют —
     /// разметка M2 (`id`, `expect`) не меняется.
@@ -616,9 +678,19 @@ fn valid_note_path(p: &str) -> bool {
 }
 
 impl Corpus {
-    /// Загружает все `*.md` под `dir` (рекурсивно). Пути — относительно `dir`, без `.md`.
+    /// Загружает все `*.md` под `dir` (рекурсивно) и области заметок [`AREAS_FILE`]. Пути —
+    /// относительно `dir`, без `.md`. Корпус ТС-2 ([`SESSIONS_CORPUS_DIR`]) — ошибка.
     pub fn load(dir: &Path) -> Result<Corpus> {
+        ensure_not_sessions_corpus(dir)?;
         let mut c = Corpus::default();
+        let areas = dir.join(AREAS_FILE);
+        if areas.is_file() {
+            let text = fs::read_to_string(&areas)
+                .with_context(|| format!("чтение {}", areas.display()))?;
+            let f: AreasFile =
+                toml::from_str(&text).with_context(|| format!("разбор {}", areas.display()))?;
+            c.areas = f.area;
+        }
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
             for e in fs::read_dir(&d).with_context(|| format!("чтение {}", d.display()))? {
@@ -680,7 +752,15 @@ impl Corpus {
                         .flatten()
                         .copied()
                 })
-                .chain(insights),
+                .chain(insights)
+                .chain(
+                    // области (M6): без файла областей отпечаток прежний
+                    self.areas
+                        .iter()
+                        .flat_map(|(p, a)| [b"area\0", p.as_bytes(), b"\0", a.as_bytes(), b"\0"])
+                        .flatten()
+                        .copied(),
+                ),
         )
     }
 }
@@ -734,6 +814,10 @@ pub struct Summary {
     pub long_paragraphs: usize,
     /// Запросов с `also`.
     pub with_also: usize,
+    /// Целей (заметок и insight) по области (M6 §11).
+    pub areas: BTreeMap<String, usize>,
+    /// Пары «`hypothesis` `gotcha` → `theorem`» со связью `contradicts` (M6 §10).
+    pub gotcha_contradicts: usize,
 }
 
 impl Summary {
@@ -882,6 +966,38 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         }
     }
     validate_insights(corpus, &mut errs);
+    let mut areas: BTreeMap<String, usize> = BTreeMap::new();
+    for (p, a) in &corpus.areas {
+        if !corpus.notes.contains_key(p) {
+            errs.push(format!("{AREAS_FILE}: нет заметки {p}"));
+        }
+        if !AREAS.contains(&a.as_str()) {
+            errs.push(format!(
+                "{AREAS_FILE}: {p}: область — одна из {}",
+                AREAS.join(", ")
+            ));
+        }
+        *areas.entry(a.clone()).or_default() += 1;
+    }
+    for i in &corpus.insights {
+        if let Some(a) = &i.area {
+            if !AREAS.contains(&a.as_str()) {
+                errs.push(format!(
+                    "insight {}: область — одна из {}",
+                    i.key,
+                    AREAS.join(", ")
+                ));
+            }
+            *areas.entry(a.clone()).or_default() += 1;
+        }
+    }
+    let gotcha_contradicts = corpus
+        .insights
+        .iter()
+        .filter(|i| i.kind == "gotcha" && corpus.insight_certainty(&i.key) == Some("hypothesis"))
+        .flat_map(|i| &i.contradicts)
+        .filter(|t| corpus.insight_certainty(t) == Some("theorem"))
+        .count();
     let mut ids: BTreeSet<&str> = BTreeSet::new();
     let mut s = Summary {
         notes: corpus.notes.len(),
@@ -914,6 +1030,8 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
             .iter()
             .filter(|i| i.retract_reason.is_some())
             .count(),
+        areas,
+        gotcha_contradicts,
         ..Summary::default()
     };
     let mut referenced: BTreeSet<&str> = BTreeSet::new();
@@ -971,6 +1089,9 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         }
         if q.evidence.is_some() && q.kind != Kind::Chunk {
             bad("evidence — только у chunk".into());
+        }
+        if q.area.as_deref().is_some_and(|a| !AREAS.contains(&a)) {
+            bad(format!("область — одна из {}", AREAS.join(", ")));
         }
         if Kind::M2.contains(&q.kind) && notes.len() != targets.len() {
             bad("запросы видов M2 ждут только заметки".into());
@@ -1270,6 +1391,18 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         if s.retracted < MIN_RETRACTED {
             errs.push(format!("отзывов {} < {MIN_RETRACTED}", s.retracted));
         }
+        for a in AREAS {
+            let n = s.areas.get(a).copied().unwrap_or(0);
+            if n < MIN_PER_AREA {
+                errs.push(format!("целей области {a}: {n} < {MIN_PER_AREA}"));
+            }
+        }
+        if s.gotcha_contradicts < MIN_GOTCHA_CONTRADICTS {
+            errs.push(format!(
+                "пар hypothesis gotcha → theorem (contradicts) {} < {MIN_GOTCHA_CONTRADICTS}",
+                s.gotcha_contradicts
+            ));
+        }
         if s.contradictions < MIN_CONTRADICTIONS {
             errs.push(format!(
                 "пар противоречий {} < {MIN_CONTRADICTIONS}",
@@ -1306,6 +1439,7 @@ pub fn tests_query(id: &str, note: &str) -> Query {
         weaker: Vec::new(),
         evidence: None,
         also: Vec::new(),
+        area: None,
     }
 }
 
@@ -1382,6 +1516,7 @@ mod tests {
             weaker: Vec::new(),
             evidence: None,
             also: Vec::new(),
+            area: None,
         }
     }
 

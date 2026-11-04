@@ -1,0 +1,53 @@
+# Корпус ТС-2 (спецификация M6 §3.1, задача 1c): insight проекта «магазин» для событий сессий —
+# ошибки `post_tool` (триггеры `command_regex`) и знание о файле при чтении (`file_glob`).
+# Формат — как в eval/insights.toml.
+
+[[insight]]
+key = "s-sqlx-offline"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "cargo build fails with SQLX_OFFLINE: query data is missing in .sqlx"
+body = "CI builds the orders service with SQLX_OFFLINE=true. A new or changed query! macro needs cargo sqlx prepare and the updated .sqlx directory in the same commit, otherwise the build fails with an error that the query data file is missing."
+triggers = [{ type = "command_regex", pattern = "cargo (build|test|clippy)" }]
+
+[[insight]]
+key = "s-e2e-port"
+lang = "ru"
+kind = "failure"
+scope = "solution"
+area = "frontend"
+title = "e2e витрины падают с EADDRINUSE: порт 5173 занят забытым dev-сервером"
+body = "Playwright поднимает свой dev-сервер Vite на порту 5173. Если в соседнем терминале уже запущен npm run dev, тесты падают с EADDRINUSE до первого шага. Остановить dev-сервер или запустить e2e с PORT=5174."
+triggers = [{ type = "command_regex", pattern = "npm (run )?(e2e|test)" }]
+
+[[insight]]
+key = "s-migration-lock"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+area = "backend"
+title = "Миграции заказов: ALTER TABLE без lock_timeout блокирует чтение таблицы"
+body = "ALTER TABLE orders ждёт эксклюзивную блокировку, а за ним в очередь встают все читатели. В начале каждой миграции таблицы orders стоит SET lock_timeout = '2s', и миграция повторяется при неудаче."
+triggers = [{ type = "file_glob", pattern = "services/orders/migrations/**", tools = ["Write", "Edit"] }]
+
+[[insight]]
+key = "s-nginx-template"
+lang = "en"
+kind = "decision"
+scope = "solution"
+area = "infra"
+title = "Stand nginx limits come from the shared template only"
+body = "client_max_body_size, proxy_read_timeout and limit_req values of every stand are set in infra/nginx/stand.conf.tmpl. Stand-specific files may not override them; a different value needs a template parameter."
+triggers = [{ type = "file_glob", pattern = "infra/nginx/**", tools = ["Read", "Write", "Edit"] }]
+
+[[insight]]
+key = "s-env-dts"
+lang = "ru"
+kind = "decision"
+scope = "solution"
+area = "frontend"
+title = "Новые переменные сборки витрины описываются в env.d.ts"
+body = "Каждая переменная VITE_ описывается в web/storefront/src/env.d.ts; секреты в переменные сборки не попадают, адрес API берётся из /config.json стенда."
+triggers = [{ type = "file_glob", pattern = "web/storefront/**/.env*", tools = ["Read", "Write", "Edit"] }]

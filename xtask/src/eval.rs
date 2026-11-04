@@ -44,6 +44,7 @@ pub mod metrics;
 pub mod nuggets;
 pub mod report;
 pub mod run;
+pub mod sessions_corpus;
 pub mod split;
 pub mod tokens;
 
@@ -253,6 +254,8 @@ pub struct Paths {
     pub docs: PathBuf,
     /// `eval/glossary.toml` — словарь и запросы на псевдонимах (M4.5).
     pub glossary: PathBuf,
+    /// `eval/sessions-corpus` — корпус ТС-2 и идей (M6, задача 1c); ТС-1 его не грузит.
+    pub sessions_corpus: PathBuf,
     pub results: PathBuf,
     /// `target/eval` — каталоги данных прогонов.
     pub work: PathBuf,
@@ -279,6 +282,7 @@ impl Paths {
                 .unwrap_or_else(|| eval.join("scenarios.toml")),
             docs: a.docs_dir.clone().unwrap_or_else(|| eval.join("docs")),
             glossary: eval.join("glossary.toml"),
+            sessions_corpus: eval.join(corpus::SESSIONS_CORPUS_DIR),
             results: a.out.clone().unwrap_or_else(|| eval.join("results")),
             work: repo.join("target").join("eval"),
         }
@@ -325,6 +329,15 @@ fn print_summary(s: &corpus::Summary) {
             s.long_paragraphs,
             s.fts_only_notes,
             s.with_also
+        );
+    }
+    if !s.areas.is_empty() || s.gotcha_contradicts > 0 {
+        let areas: Vec<String> = s.areas.iter().map(|(a, n)| format!("{a} {n}")).collect();
+        println!(
+            "набор M6 (§10, §11): целей по областям: {}; пар hypothesis gotcha → theorem \
+             (contradicts) {}",
+            areas.join(", "),
+            s.gotcha_contradicts
         );
     }
 }
@@ -376,6 +389,30 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
                 "набор M4.5: терминов словаря {}, запросов на псевдонимах {}",
                 g.term.len(),
                 g.query.len()
+            );
+            let sc = sessions_corpus::load(&p.sessions_corpus)?;
+            let ss = sessions_corpus::validate(&sc)?;
+            let states: Vec<String> = ss
+                .ideas_by_state
+                .iter()
+                .map(|(k, n)| format!("{k} {n}"))
+                .collect();
+            println!(
+                "корпус ТС-2 M6: Rules {}, задач {} (in_progress/blocked {}), вопросов {} \
+                 (отвечено {}), запросов доступа {}, терминов {}, insight {}; идей {} ({}; с \
+                 общим глаголом в заголовке {}, со словом «на стоп-основу» {})",
+                ss.rules,
+                ss.tasks,
+                ss.active_tasks,
+                ss.questions,
+                ss.answered,
+                ss.access,
+                ss.terms,
+                ss.insights,
+                ss.ideas,
+                states.join(", "),
+                ss.stop_verb_ideas,
+                ss.false_friend_ideas
             );
         }
         println!("EVAL-CHECK OK");

@@ -1,0 +1,94 @@
+# Корпус ТС-2 (спецификация M6 §3.1, задача 1c): журналы решения проекта «магазин».
+#
+# [[task]] — задача (`kind: task`): key, lang, title, body?, status (open | in_progress |
+# blocked | done | dropped), next_step?, blocked_by? (обязателен у blocked).
+# [[question]] — вопрос к человеку (`kind: question`): key, lang, title, body?, options?
+# ({key, text}), recommendation?; answer = {option?, text?} — ответ человека (загрузчик
+# отвечает `POST /entries/{id}/answer` с `by: human`), без answer — вопрос открыт.
+# [[access]] — ожидающий запрос доступа к решению (ТЗ §11.6): key, user — логин второго
+# пользователя, которого создаёт загрузчик.
+
+# ---- задачи ----
+
+[[task]]
+key = "t-export-stream"
+lang = "ru"
+title = "Потоковая выгрузка заказов в CSV"
+body = "Выгрузка заказов обрывается с 504 на больших периодах. Переделать на потоковую отдачу без сборки файла в памяти."
+status = "in_progress"
+next_step = "проверить выгрузку за квартал на стенде и сравнить память сервиса"
+
+[[task]]
+key = "t-token-refresh"
+lang = "en"
+title = "Single-tab access token refresh in the storefront"
+body = "Users with several tabs get logged out after refresh token reuse detection. Refresh in one tab and share the token through BroadcastChannel."
+status = "in_progress"
+next_step = "add an e2e test with three tabs and 30 s token lifetime"
+
+[[task]]
+key = "t-upload-limits"
+lang = "ru"
+title = "Поднять предел размера прайс-листа до 50 МБ на всех стендах"
+body = "На новом стенде импорт прайс-листов больше 1 МБ получает 413."
+status = "blocked"
+blocked_by = "ждём доступ к репозиторию конфигурации шлюза от команды инфраструктуры"
+next_step = "вынести client_max_body_size в общий шаблон стенда"
+
+[[task]]
+key = "t-flags-snapshot"
+lang = "en"
+title = "Persist the flag rule set snapshot for service restarts"
+body = "After the flag service outage the checkout was disabled by defaults. Load the last rule set from disk when the flag service is unreachable."
+status = "blocked"
+blocked_by = "flag SDK 4.2 with snapshot support is not released yet"
+
+[[task]]
+key = "t-keyset-orders"
+lang = "ru"
+title = "Перевести выгрузку партнёру на keyset-пагинацию"
+status = "open"
+next_step = "добавить индекс (created_at, id) миграцией"
+
+[[task]]
+key = "t-health-cache"
+lang = "en"
+title = "Cache dependency checks of /health"
+status = "done"
+
+# ---- вопросы к человеку ----
+
+[[question]]
+key = "q-export-format"
+lang = "ru"
+title = "В каком формате отдавать выгрузку заказов партнёрам — CSV или XLSX?"
+body = "Партнёры просят Excel, но XLSX нельзя отдавать потоком без сборки файла."
+options = [{ key = "csv", text = "CSV, потоком" }, { key = "xlsx", text = "XLSX, фоновой задачей" }]
+recommendation = "csv"
+answer = { option = "csv", text = "CSV потоком; XLSX позже, если партнёры будут жаловаться" }
+
+[[question]]
+key = "q-release-day"
+lang = "en"
+title = "Can the token refresh fix go out on Friday?"
+body = "The fix is small but touches authentication, and Friday releases are for incidents only."
+answer = { text = "No, release it on Tuesday together with the e2e test." }
+
+[[question]]
+key = "q-flag-default"
+lang = "ru"
+title = "Какое умолчание у флага new_checkout после удаления старой корзины?"
+options = [{ key = "true", text = "true — новая корзина" }, { key = "remove", text = "удалить флаг" }]
+answer = { option = "remove", text = "Удалить флаг в ближайшем релизе, до этого умолчание true" }
+
+[[question]]
+key = "q-dark-theme"
+lang = "ru"
+title = "Нужна ли тёмная тема в кабинете продавца в этом квартале?"
+body = "Дизайн готов, но есть задачи по импорту прайс-листов."
+
+# ---- запросы доступа ----
+
+[[access]]
+key = "a-maria"
+user = "maria"

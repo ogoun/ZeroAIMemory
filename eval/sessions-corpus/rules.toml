@@ -1,0 +1,133 @@
+# Корпус ТС-2 (спецификация M6 §3.1, задача 1c): заметки Rules проекта «магазин» — сервисы
+# заказов и каталога (Rust), витрина и кабинет продавца (TypeScript), инфраструктура.
+#
+# [[rule]] — заметка пространства Rules: key (`rule:<key>` в разметке сессий), path (путь в
+# Rules), text (Markdown с заголовком `# `). Тяжёлый профиль ТС-2 грузит все (≥ 10),
+# стандартный — 2–4 по выбору сессии (eval/sessions.toml, задача 4).
+
+[[rule]]
+key = "commits"
+path = "process/commits"
+text = """
+# Коммиты
+
+Сообщения коммитов — Conventional Commits на русском: `feat(orders): что сделано`. Один коммит —
+одна логическая правка. В коммит попадают только пути задачи, без локальных файлов настроек.
+"""
+
+[[rule]]
+key = "migrations"
+path = "backend/migrations"
+text = """
+# Миграции базы
+
+Миграции Postgres только добавляют: новая колонка — с умолчанием или nullable, удаление колонки
+— отдельным релизом после того, как код перестал её читать. Каждая миграция проверяется на
+копии продакшен-базы, время блокировки записывается в описание задачи.
+"""
+
+[[rule]]
+key = "secrets"
+path = "security/secrets"
+text = """
+# Secrets
+
+Secrets never go into the repository, build arguments, frontend bundles or logs. Services read
+them from Vault at startup. A secret that leaked into a commit is rotated first and removed from
+history second.
+"""
+
+[[rule]]
+key = "api-compat"
+path = "backend/api-compatibility"
+text = """
+# Совместимость API
+
+Публичный API меняется только с сохранением совместимости: новые поля — необязательные, старые
+не удаляются без новой версии `/v2`. Изменение контракта сопровождается правкой OpenAPI в том
+же коммите.
+"""
+
+[[rule]]
+key = "tests"
+path = "process/tests"
+text = """
+# Tests
+
+Every bug fix comes with a test that fails without the fix. Integration tests use the shared
+Postgres container of the test stand, never a developer's local database. Flaky tests are
+quarantined within a day, with a task to fix them.
+"""
+
+[[rule]]
+key = "deps"
+path = "process/dependencies"
+text = """
+# Зависимости
+
+Новая библиотека (crate или npm-пакет) добавляется только после проверки лицензии (MIT,
+Apache-2.0, BSD) и записи в журнал задачи. Версии фиксируются lock-файлом, обновления — отдельным
+коммитом.
+"""
+
+[[rule]]
+key = "frontend-a11y"
+path = "frontend/accessibility"
+text = """
+# Accessibility
+
+Every interactive element of the storefront is reachable from the keyboard and has an accessible
+name. Colour contrast is at least 4.5:1. New components get an axe check in their e2e test.
+"""
+
+[[rule]]
+key = "release"
+path = "process/release"
+text = """
+# Релизы
+
+Релиз выкатывается по вторникам и четвергам до 15:00. Перед выкаткой — зелёный CI и запись в
+канале релизов. В пятницу и перед праздниками выкатываются только исправления инцидентов.
+"""
+
+[[rule]]
+key = "logging"
+path = "backend/logging"
+text = """
+# Журналы
+
+Журналы сервисов — JSON через `tracing`. В журнал не пишутся тела запросов, токены, телефоны и
+адреса почты. Ошибки клиента (4xx) — уровень INFO, ERROR — только то, что требует действия
+человека.
+"""
+
+[[rule]]
+key = "infra-changes"
+path = "infra/changes"
+text = """
+# Infrastructure changes
+
+Infrastructure is changed only through the configuration repository and the deploy pipeline.
+Manual changes on servers are forbidden: the next deploy overwrites them. Every change to nginx
+limits or timeouts is first rolled out to the staging stand.
+"""
+
+[[rule]]
+key = "tmp-files"
+path = "process/temporary-files"
+text = """
+# Временные файлы
+
+Временные файлы, логи прогонов и выгрузки для отладки — только в каталоге `.tmp/` проекта. Системный
+temp не используется. Выгрузки с данными покупателей удаляются в тот же день.
+"""
+
+[[rule]]
+key = "reviews"
+path = "process/code-review"
+text = """
+# Code review
+
+A change is merged after one approval from the owning team. The author answers every comment
+before merging. Changes to payments, authentication and migrations need a second reviewer.
+"""

@@ -273,3 +273,51 @@ fn arms_must_share_corpus_fingerprint() {
         "{e}"
     );
 }
+
+/// Корпус ТС-1 и корпус ТС-2 разделены (спецификация M6 §3.2, рецензия плана C1): соседний
+/// `sessions-corpus` не входит в отпечаток ТС-1, а ТС-1 на каталоге с корпусом ТС-2 (сам
+/// `sessions-corpus` или каталог, который его содержит) падает до запуска сервера.
+#[test]
+fn ts1_never_loads_sessions_corpus() {
+    let d = tmp("ts1-no-ts2");
+    mini_set(&d);
+    let ts2 = d.join("sessions-corpus");
+    fs::create_dir_all(ts2.join("ru")).unwrap();
+    fs::write(
+        ts2.join("ru").join("rule.md"),
+        "# Правило\n\nТолько для ТС-2.\n",
+    )
+    .unwrap();
+    let set = set_args(&d);
+    let o = run(&["eval", "--check"], &set);
+    assert!(o.status.success(), "{}\n{}", stdout(&o), stderr(&o));
+    let cf = printed(&stdout(&o), "corpus_fingerprint");
+    fs::write(
+        ts2.join("ru").join("rule.md"),
+        "# Правило\n\nДругой текст.\n",
+    )
+    .unwrap();
+    let o = run(&["eval", "--check"], &set);
+    assert!(o.status.success(), "{}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(printed(&stdout(&o), "corpus_fingerprint"), cf);
+    for bad in [ts2.clone(), d.clone()] {
+        let mut args = set.clone();
+        let i = args.iter().position(|a| a == "--corpus").unwrap();
+        args[i + 1] = s(&bad);
+        let o = run(&["eval", "--check"], &args);
+        assert!(!o.status.success(), "{}", stdout(&o));
+        let e = stderr(&o);
+        assert!(e.contains("sessions-corpus") && e.contains("ТС-2"), "{e}");
+        args.extend([
+            "--server-bin".into(),
+            s(&d.join("nope").join("zam-server.exe")),
+        ]);
+        let o = run(
+            &["eval", "--tokens", "--via", "mcp", "--split", "dev"],
+            &args,
+        );
+        assert!(!o.status.success());
+        let e = stderr(&o);
+        assert!(e.contains("sessions-corpus") && !e.contains("нет "), "{e}");
+    }
+}

@@ -1132,16 +1132,39 @@ pub(crate) fn api_timeout(
     body: Option<&Value>,
     timeout: Duration,
 ) -> Result<(u16, Value)> {
+    api_with(base, token, path, body, &[], timeout)
+}
+
+/// То же со своими заголовками запроса (`X-Zam-Area` загрузчика eval, M6 §11).
+pub(crate) fn api_with(
+    base: &str,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<(u16, Value)> {
     let a = agent_with(timeout);
     let url = format!("{base}{path}");
     let auth = format!("Bearer {token}");
     let mut r = match body {
-        Some(b) => a
-            .post(&url)
-            .header("Authorization", &auth)
-            .content_type("application/json")
-            .send(b.to_string())?,
-        None => a.get(&url).header("Authorization", &auth).call()?,
+        Some(b) => {
+            let mut req = a
+                .post(&url)
+                .header("Authorization", &auth)
+                .content_type("application/json");
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.send(b.to_string())?
+        }
+        None => {
+            let mut req = a.get(&url).header("Authorization", &auth);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.call()?
+        }
     };
     let status = r.status().as_u16();
     let text = r.body_mut().read_to_string()?;
