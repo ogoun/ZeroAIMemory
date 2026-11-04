@@ -198,19 +198,36 @@ pub fn ask(ctx: &Ctx, o: &Ask) -> Result<(), CliError> {
     post_entry(ctx, &space, &req, o.key, o.area).map_err(explain_duplicate)
 }
 
-/// `by` ответа: явный `--by`; без него у агента — код 6 (ошибка ввода) с подсказкой, у человека — `human`.
-pub fn resolve_by(by: Option<&str>, agent: bool) -> Result<&str, CliError> {
-    match by {
+/// `human | agent` флага `name` (`--by` ответа или решения, `--origin` идеи): явное значение;
+/// без него у агента — код 6 (ошибка ввода) с подсказкой, у человека — `human` (M5.7 §7.3).
+pub fn resolve_human_agent<'a>(
+    flag: Option<&'a str>,
+    name: &str,
+    agent: bool,
+) -> Result<&'a str, CliError> {
+    match flag {
         Some(b) => Ok(b),
-        None if agent => Err(CliError::input(
-            "укажите --by human — ответ человека, --by agent — решение агента",
-        )),
+        None if agent => Err(CliError::input(match name {
+            "--by" => {
+                "укажите --by human — ответ человека, --by agent — решение агента".to_string()
+            }
+            "--origin" => {
+                "укажите --origin human (по словам человека) или agent (своя)".to_string()
+            }
+            n => format!("укажите {n} human или agent"),
+        })),
         None => Ok("human"),
     }
 }
 
-/// Команду запустил агент (переменные окружения процесса, [`super::hook::launched_by_agent`]).
-fn agent_env() -> bool {
+/// `by` ответа: явный `--by`; без него у агента — код 6 (ошибка ввода) с подсказкой, у человека — `human`.
+pub fn resolve_by(by: Option<&str>, agent: bool) -> Result<&str, CliError> {
+    resolve_human_agent(by, "--by", agent)
+}
+
+/// Команду запустил агент (переменные окружения процесса, [`super::hook::launched_by_agent`]:
+/// `CLAUDECODE`, переменные Codex, `ZAM_AGENT`).
+pub fn agent_env() -> bool {
     let names: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
         .collect();
@@ -347,6 +364,20 @@ mod tests {
             e.msg.contains("--by human") && e.msg.contains("--by agent"),
             "{}",
             e.msg
+        );
+        assert_eq!(
+            resolve_human_agent(None, "--origin", false).unwrap(),
+            "human"
+        );
+        assert_eq!(
+            resolve_human_agent(Some("agent"), "--origin", true).unwrap(),
+            "agent"
+        );
+        let e = resolve_human_agent(None, "--origin", true).unwrap_err();
+        assert_eq!(e.code, crate::client::EXIT_INPUT);
+        assert_eq!(
+            e.msg,
+            "укажите --origin human (по словам человека) или agent (своя)"
         );
     }
 

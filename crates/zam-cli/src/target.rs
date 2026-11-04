@@ -57,8 +57,8 @@ pub fn is_guid(s: &str) -> bool {
         })
 }
 
-/// Канонический id узла (26 символов Crockford, как печатает сервер).
-fn is_node_id(s: &str) -> bool {
+/// Канонический id узла или записи (26 символов Crockford, как печатает сервер).
+pub fn is_node_id(s: &str) -> bool {
     s.len() == 26
         && s.parse::<zam_core::Id>()
             .is_ok_and(|id| id.to_string() == s)
@@ -84,7 +84,7 @@ pub fn bare_entry_id(raw: &str) -> &str {
     }
 }
 
-/// Ссылка записи журнала `i:|c:|e:|r:|t:|k:|q:|p:<id>` (как в выдаче `zam search` и `/read`): id
+/// Ссылка записи журнала `i:|c:|e:|r:|t:|k:|q:|p:|w:<id>` (как в выдаче `zam search` и `/read`): id
 /// записи. Префикс без канонического id — не ссылка (`i:заметка` остаётся путём).
 pub fn entry_ref(raw: &str) -> Option<&str> {
     let (p, id) = raw.split_once(':')?;
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn entry_refs() {
         let id = zam_core::Id::new().to_string();
-        for pfx in ["i", "c", "e", "r", "t", "k", "q", "p"] {
+        for pfx in ["i", "c", "e", "r", "t", "k", "q", "p", "w"] {
             assert_eq!(entry_ref(&format!("{pfx}:{id}")), Some(id.as_str()));
         }
         assert_eq!(entry_ref(&format!("n:{id}")), None);

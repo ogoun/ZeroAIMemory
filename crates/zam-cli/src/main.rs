@@ -183,6 +183,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: QuestionCmd,
     },
+    /// Журнал «Идеи»: лента, запись, предложение человеку и решение (начать, отложить, отказаться)
+    Idea {
+        #[command(subcommand)]
+        cmd: IdeaCmd,
+    },
     /// Словарь домена: список терминов «имя — определение» или карточка по имени или псевдониму
     Glossary {
         /// Имя или псевдоним термина (без него — весь список)
@@ -620,6 +625,112 @@ enum QuestionCmd {
         #[arg(long, value_parser = ["human", "agent"])]
         by: Option<String>,
         /// Где человек ответил
+        #[arg(long, default_value = "cli", value_parser = ["chat", "cli"])]
+        channel: String,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdeaCmd {
+    /// Лента идей (по умолчанию new, proposed, deferred, accepted)
+    List {
+        /// Статусы (повторяемый, через запятую): new, proposed, accepted, deferred, declined, done
+        #[arg(long)]
+        status: Vec<String>,
+        /// Только идеи человека или агента
+        #[arg(long, value_parser = ["human", "agent"])]
+        origin: Option<String>,
+        /// Knowledge вместо решения
+        #[arg(long)]
+        knowledge: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Новая идея (замысел — из --body или --file, иначе пустой)
+    New {
+        /// Заголовок идеи
+        title: String,
+        /// Замысел текстом
+        #[arg(long, conflicts_with = "file")]
+        body: Option<String>,
+        /// Файл с замыслом (Markdown)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long, value_parser = ["low", "normal", "high"])]
+        priority: Option<String>,
+        /// Не раньше даты YYYY-MM-DD (позже сегодняшней, UTC)
+        #[arg(long)]
+        horizon: Option<String>,
+        /// Тег (повторяемый)
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Чья идея: human — по словам человека, agent — своя (агенту обязателен)
+        #[arg(long, value_parser = ["human", "agent"])]
+        origin: Option<String>,
+        /// Knowledge вместо решения
+        #[arg(long)]
+        knowledge: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Предложить идею человеку: вопрос «начать / отложить / отказаться»
+    Propose {
+        /// w:<id>
+        id: String,
+        /// Почему сейчас (до 2000 символов)
+        #[arg(long)]
+        text: Option<String>,
+        /// GUID решения будущей задачи
+        #[arg(long)]
+        space: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Начать: идея становится задачей (решает человек); уже начата — код 4
+    Accept {
+        /// w:<id>
+        id: String,
+        /// Чьё решение: human — слова человека (агенту обязателен)
+        #[arg(long, value_parser = ["human", "agent"])]
+        by: Option<String>,
+        /// Где человек решил
+        #[arg(long, default_value = "cli", value_parser = ["chat", "cli"])]
+        channel: String,
+        /// GUID решения задачи
+        #[arg(long)]
+        space: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Отложить до даты (без --until — на [ideas] defer_days сервера)
+    Defer {
+        /// w:<id>
+        id: String,
+        /// Не раньше даты YYYY-MM-DD (позже сегодняшней, UTC)
+        #[arg(long)]
+        until: Option<String>,
+        /// Чьё решение: human — слова человека (агенту обязателен)
+        #[arg(long, value_parser = ["human", "agent"])]
+        by: Option<String>,
+        /// Где человек решил
+        #[arg(long, default_value = "cli", value_parser = ["chat", "cli"])]
+        channel: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Отказаться (свою идею агент снимает с --by agent)
+    Decline {
+        /// w:<id>
+        id: String,
+        /// Причина (до 2000 символов)
+        #[arg(long)]
+        reason: Option<String>,
+        /// Чьё решение: human — слова человека, agent — своя идея агента (агенту обязателен)
+        #[arg(long, value_parser = ["human", "agent"])]
+        by: Option<String>,
+        /// Где человек решил
         #[arg(long, default_value = "cli", value_parser = ["chat", "cli"])]
         channel: String,
         #[command(flatten)]
@@ -1206,6 +1317,121 @@ fn question(c: QuestionCmd) -> Result<(), CliError> {
     }
 }
 
+fn idea(c: IdeaCmd) -> Result<(), CliError> {
+    use cmd::idea as w;
+    use cmd::question::{agent_env, resolve_human_agent};
+    // `--by` и `--origin` разрешаются до подключения: агенту без флага — код 6 без запроса
+    let by = |b: Option<String>| -> Result<String, CliError> {
+        resolve_human_agent(b.as_deref(), "--by", agent_env()).map(str::to_string)
+    };
+    match c {
+        IdeaCmd::List {
+            status,
+            origin,
+            knowledge,
+            common,
+        } => w::list(
+            &cmd::connect(&common)?,
+            &w::List {
+                status: &status,
+                origin: origin.as_deref(),
+                knowledge,
+            },
+        ),
+        IdeaCmd::New {
+            title,
+            body,
+            file,
+            priority,
+            horizon,
+            tag,
+            origin,
+            knowledge,
+            common,
+        } => {
+            let origin = resolve_human_agent(origin.as_deref(), "--origin", agent_env())?;
+            w::new(
+                &cmd::connect(&common)?,
+                &w::New {
+                    title: &title,
+                    body: body.as_deref(),
+                    file: file.as_deref(),
+                    priority: priority.as_deref(),
+                    horizon: horizon.as_deref(),
+                    tags: &tag,
+                    knowledge,
+                },
+                origin,
+            )
+        }
+        IdeaCmd::Propose {
+            id,
+            text,
+            space,
+            common,
+        } => w::propose(
+            &cmd::connect(&common)?,
+            &id,
+            text.as_deref(),
+            space.as_deref(),
+        ),
+        IdeaCmd::Accept {
+            id,
+            by: b,
+            channel,
+            space,
+            common,
+        } => {
+            let b = by(b)?;
+            let o = w::DecideOpts {
+                id: &id,
+                by: &b,
+                channel: &channel,
+                space: space.as_deref(),
+                until: None,
+                reason: None,
+            };
+            w::decide(&cmd::connect(&common)?, "accept", o)
+        }
+        IdeaCmd::Defer {
+            id,
+            until,
+            by: b,
+            channel,
+            common,
+        } => {
+            let b = by(b)?;
+            let o = w::DecideOpts {
+                id: &id,
+                by: &b,
+                channel: &channel,
+                space: None,
+                until: until.as_deref(),
+                reason: None,
+            };
+            w::decide(&cmd::connect(&common)?, "defer", o)
+        }
+        IdeaCmd::Decline {
+            id,
+            reason,
+            by: b,
+            channel,
+            common,
+        } => {
+            let b = by(b)?;
+            let o = w::DecideOpts {
+                id: &id,
+                by: &b,
+                channel: &channel,
+                space: None,
+                until: None,
+                reason: reason.as_deref(),
+            };
+            w::decide(&cmd::connect(&common)?, "decline", o)
+        }
+    }
+}
+
 fn insight(c: InsightCmd) -> Result<(), CliError> {
     use cmd::insight as i;
     match c {
@@ -1501,6 +1727,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Insight { cmd } => insight(cmd),
         Cmd::Task { cmd } => task(cmd),
         Cmd::Question { cmd } => question(cmd),
+        Cmd::Idea { cmd } => idea(cmd),
         Cmd::Cache { cmd } => cache(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {

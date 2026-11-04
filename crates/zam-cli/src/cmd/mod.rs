@@ -6,6 +6,7 @@ pub mod glossary;
 pub mod guide;
 pub mod history;
 pub mod hook;
+pub mod idea;
 pub mod init;
 pub mod insight;
 pub mod link;
