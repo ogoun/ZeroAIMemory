@@ -1391,3 +1391,104 @@ async fn revoked_member_cannot_decide_or_propose() {
         assert_eq!(r.json()["status"], st);
     }
 }
+
+/// Задача 7 (§16): идея `accepted` со снятой задачей — `propose` из WebUI 422, токеном без
+/// `text` 422, с `text` — вопрос «вернуть» (`data.proposal: reopen`, без `task_space`), идея
+/// остаётся `accepted` с `question_id`, аудит `entry.idea.propose`; ответ: без варианта —
+/// `option-required` с `reopen`, `accept` — 422, `by: agent` — 403, `reopen` человека — идея
+/// `new`; `GET` идеи показывает открытый вопрос.
+#[tokio::test]
+async fn reopen_proposal_rest() {
+    let a = setup("reopen").await;
+    let i = idea_tok(&a, &sol(), "Кэш выжимок", "human").await;
+    let r = post_tok(
+        &a,
+        &i,
+        "decide",
+        json!({"decision": "accept", "by": "human"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let task = id(&r.json()["task"]);
+    // живая задача — 409
+    let r = post_tok(&a, &i, "propose", json!({"text": "пора"})).await;
+    ok(&r, StatusCode::CONFLICT);
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &ent(&task),
+            Some(json!({"status": "dropped", "reason": "не до того"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let r = post_web(&a, &i, "propose", json!({"text": "пора"})).await;
+    ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    let r = post_tok(&a, &i, "propose", json!({})).await;
+    ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        r.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("почему идею пора вернуть"),
+        "{}",
+        r.text()
+    );
+    let before = actions(&audit(&a).await, "entry.idea.propose");
+    let r = post_tok(&a, &i, "propose", json!({"text": "кэш снова тормозит"})).await;
+    ok(&r, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["entry"]["status"], "accepted", "{j}");
+    let qid = id(&j["question"]);
+    assert_eq!(j["entry"]["data"]["question_id"], qid.as_str(), "{j}");
+    assert_eq!(j["question"]["title"], "Вернуть идею «Кэш выжимок»?", "{j}");
+    assert_eq!(j["question"]["data"]["proposal"], "reopen", "{j}");
+    assert!(j["question"]["data"]["task_space"].is_null(), "{j}");
+    assert_eq!(actions(&audit(&a).await, "entry.idea.propose"), before + 1);
+    // повтор — тот же вопрос, без аудита
+    let r = post_tok(&a, &i, "propose", json!({})).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(id(&r.json()["question"]), qid);
+    assert_eq!(actions(&audit(&a).await, "entry.idea.propose"), before + 1);
+    let e = get(&a, &i).await;
+    assert_eq!(e["question"]["id"], qid.as_str(), "{e}");
+    assert_eq!(e["question"]["status"], "open", "{e}");
+    assert_eq!(e["task"]["status"], "dropped", "{e}");
+    // ответы
+    let r = post_tok(&a, &qid, "answer", json!({"text": "давай", "by": "human"})).await;
+    problem(&r, StatusCode::UNPROCESSABLE_ENTITY, "option-required");
+    assert!(r.text().contains("reopen"), "{}", r.text());
+    for key in ["accept", "defer"] {
+        let r = post_tok(&a, &qid, "answer", json!({"option": key, "by": "human"})).await;
+        ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let r = post_tok(
+        &a,
+        &qid,
+        "answer",
+        json!({"option": "reopen", "by": "human", "horizon": today_plus(3)}),
+    )
+    .await;
+    ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    let r = post_tok(
+        &a,
+        &qid,
+        "answer",
+        json!({"option": "reopen", "by": "agent"}),
+    )
+    .await;
+    problem(&r, StatusCode::FORBIDDEN, "idea-human-decision");
+    let r = post_tok(
+        &a,
+        &qid,
+        "answer",
+        json!({"option": "reopen", "by": "human"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["idea"]["status"], "new", "{j}");
+    assert_eq!(j["idea"]["data"]["prev_task_ids"], json!([task]), "{j}");
+    assert!(j["idea"]["data"]["task_id"].is_null(), "{j}");
+    assert!(j.get("task").is_none(), "{j}");
+}

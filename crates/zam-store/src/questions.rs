@@ -10,9 +10,10 @@
 //!   ревизия), новый insight `decision` (`certainty: axiom` при `by: human`, иначе `hypothesis`;
 //!   `data.decision.decided_by`) и ребро `derived_from` решение → вопрос (шаг `answer_tx`).
 //!   Повторный ответ — [`QuestionError::AlreadyAnswered`] с id решения;
-//! - вопрос-предложение идеи (M5.7, `data.idea`, `data.task_space` — поля сервера): ответ —
-//!   только вариантом [`crate::ideas::IDEA_OPTIONS`] и только человеком; в той же транзакции
-//!   идея проходит переход (`ideas::apply_decision_tx`);
+//! - вопрос-предложение идеи (M5.7, `data.idea`, `data.task_space`, `data.proposal` — поля
+//!   сервера): ответ — только вариантом своего вида ([`crate::ideas::IDEA_OPTIONS`] у «начать»,
+//!   [`crate::ideas::IDEA_REOPEN_OPTIONS`] у «вернуть», §16) и только человеком; в той же
+//!   транзакции идея проходит переход (`ideas::apply_decision_tx`);
 //! - [`question_duplicates`] — вопросы `open` и `answered` с тем же нормализованным заголовком
 //!   (для `answered` — с ответом);
 //! - чтение для дайджеста: [`recent_answered`], [`open_questions`].
@@ -24,11 +25,13 @@ use serde_json::{Map, Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::entries::{
-    Certainty, EntryKind, EntryStatus, NewEntry, TITLE_MAX_CHARS, load_entry, normalize_title,
+    Certainty, EntryKind, EntryStatus, NewEntry, REASON_MAX_CHARS, TITLE_MAX_CHARS, load_entry,
+    normalize_title,
 };
 use crate::graph::EdgeType;
 use crate::ideas::{
-    IDEA_DEFER_DAYS_DEFAULT, IdeaDecision, IdeaError, NewDecision, apply_decision_tx, atomic,
+    IDEA_DEFER_DAYS_DEFAULT, IdeaDecision, IdeaError, NewDecision, ProposalKind, apply_decision_tx,
+    atomic,
 };
 use crate::nodes::Attribution;
 use crate::time::{fmt_ts, ser_ts};
@@ -131,12 +134,15 @@ pub struct QuestionData {
     pub idea: Option<Id>,
     /// Пространство будущей задачи вопроса-предложения (M5.7 §5.1); ведёт сервер.
     pub task_space: Option<Id>,
+    /// Вид вопроса-предложения (`data.proposal`, M5.7 §16): нет поля — «начать», `reopen` —
+    /// «вернуть» идею со снятой задачей; ведёт сервер.
+    pub proposal: ProposalKind,
 }
 
 /// Поля, которые ведёт спросивший.
 const CLIENT_KEYS: [&str; 2] = ["options", "recommendation"];
 /// Поля вопроса-предложения, которые ведёт сервер (M5.7).
-const PROPOSAL_KEYS: [&str; 2] = ["idea", "task_space"];
+const PROPOSAL_KEYS: [&str; 3] = ["idea", "task_space", "proposal"];
 
 /// Id из строки `data.<k>`; `null` и отсутствие — `None`.
 fn id_field(v: Option<&Value>, k: &str) -> Result<Option<Id>, String> {
@@ -206,6 +212,7 @@ impl QuestionData {
             answer: get("answer").and_then(|v| serde_json::from_value(v.clone()).ok()),
             idea: id_field(get("idea"), "idea").ok().flatten(),
             task_space: id_field(get("task_space"), "task_space").ok().flatten(),
+            proposal: ProposalKind::from_stored(get("proposal")),
         }
     }
 
@@ -271,6 +278,9 @@ impl QuestionData {
         if let Some(s) = self.task_space {
             o.insert("task_space".into(), json!(s.to_string()));
         }
+        if self.proposal == ProposalKind::Reopen {
+            o.insert("proposal".into(), json!(self.proposal.as_str()));
+        }
         Value::Object(o)
     }
 }
@@ -283,7 +293,7 @@ pub fn check_question(data: &Value) -> Result<QuestionData, String> {
 }
 
 /// `data` вопроса, созданного сервером (вопрос-предложение идеи, M5.7): поля клиента — по
-/// [`check_question`], плюс `idea` и `task_space`.
+/// [`check_question`], плюс `idea`, `task_space` и `proposal` (`reopen`; иное — ошибка).
 pub(crate) fn check_server_question(data: &Value) -> Result<QuestionData, String> {
     let mut o = data
         .as_object()
@@ -291,9 +301,15 @@ pub(crate) fn check_server_question(data: &Value) -> Result<QuestionData, String
         .ok_or_else(|| "data должно быть JSON-объектом".to_string())?;
     let idea = id_field(o.remove("idea").as_ref(), "idea")?;
     let task_space = id_field(o.remove("task_space").as_ref(), "task_space")?;
+    let proposal = match o.remove("proposal") {
+        None | Some(Value::Null) => ProposalKind::Start,
+        Some(Value::String(s)) if s == "reopen" => ProposalKind::Reopen,
+        Some(_) => return Err("data.proposal: только reopen".into()),
+    };
     let mut q = check_question(&Value::Object(o))?;
     q.idea = idea;
     q.task_space = task_space;
+    q.proposal = proposal;
     Ok(q)
 }
 
@@ -405,9 +421,10 @@ pub enum QuestionError {
     /// Запись не вопрос: 422.
     #[error("запись не является вопросом")]
     NotQuestion,
-    /// Вопрос-предложение идеи отвечается только вариантом: 422 `option-required`.
-    #[error("ответ на предложение идеи — вариант option: accept, defer или decline")]
-    OptionRequired,
+    /// Вопрос-предложение идеи отвечается только вариантом своего вида: 422
+    /// `option-required`.
+    #[error("ответ на предложение идеи — вариант option: {}", .0.keys_text())]
+    OptionRequired(ProposalKind),
     /// `horizon` — только у ответа `defer` на вопрос-предложение: 422.
     #[error("horizon: только у ответа defer на предложение идеи")]
     HorizonNotAllowed,
@@ -602,7 +619,8 @@ pub async fn answer_question(
                 return Ok(Err(QuestionError::NotQuestion));
             }
             let now = fmt_ts(Timestamp::now());
-            let Some(idea_id) = QuestionData::from_stored(&q.data).idea else {
+            let qd = QuestionData::from_stored(&q.data);
+            let Some(idea_id) = qd.idea else {
                 if horizon.is_some() {
                     return Ok(Err(QuestionError::HorizonNotAllowed));
                 }
@@ -617,9 +635,10 @@ pub async fn answer_question(
                 return Ok(plain(answer_tx(tx, &q, &na, &attrib, &now)?));
             }
             let Some(key) = na.option.as_deref() else {
-                return Ok(Err(QuestionError::OptionRequired));
+                return Ok(Err(QuestionError::OptionRequired(qd.proposal)));
             };
-            let Some(decision) = IdeaDecision::from_option(key) else {
+            // варианты — по виду вопроса: «начать» или «вернуть» (§5.3, §16, п. 3)
+            let Some(decision) = qd.proposal.decision(key) else {
                 return Ok(Err(QuestionError::UnknownOption(key.to_string())));
             };
             if horizon.is_some() && decision != IdeaDecision::Defer {
@@ -644,7 +663,7 @@ pub async fn answer_question(
             let nd = NewDecision {
                 decision,
                 horizon,
-                reason: None,
+                reason: (decision == IdeaDecision::Reopen).then(|| reopen_reason(&na, &q)),
                 by: na.by,
                 channel: na.channel,
                 task_space: None,
@@ -666,6 +685,33 @@ pub async fn answer_question(
         })
     })
     .await?
+}
+
+/// Причина `reopen` по ответу на вопрос «вернуть» (§16, п. 3): текст ответа, а без него —
+/// «по предложению агента: <первая строка вопроса>» (первая непустая строка тела — объяснение
+/// агента, иначе заголовок) **[решение исполнителя задачи 7]**. Не длиннее
+/// [`REASON_MAX_CHARS`].
+fn reopen_reason(a: &NormalizedAnswer, q: &Entry) -> String {
+    if let Some(t) = &a.text {
+        return clip_reason(t);
+    }
+    let first = q
+        .body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(&q.title);
+    clip_reason(&format!("по предложению агента: {first}"))
+}
+
+/// Причина решения не длиннее [`REASON_MAX_CHARS`] (длинный ответ не ломает переход).
+fn clip_reason(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= REASON_MAX_CHARS {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(REASON_MAX_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
 }
 
 /// Кандидат-дубль вопроса.

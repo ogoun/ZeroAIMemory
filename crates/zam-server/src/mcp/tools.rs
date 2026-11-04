@@ -288,8 +288,8 @@ impl ToolName {
                     "blocked_by": {"type": ["string", "null"]},
                     "ttl_min": {"type": "integer", "minimum": 1, "maximum": 1440},
                     "agent": {"type": "string"},
-                    "option": {"type": "string", "description": "answer: ключ варианта вопроса (option, text или оба: text — свободный ответ); у вопроса-предложения идеи обязателен: accept (начать), defer (отложить, с horizon), decline (отказаться)"},
-                    "text": {"type": "string", "description": "answer: текст ответа; propose: почему идея подходит сейчас (до 2000 символов)"},
+                    "option": {"type": "string", "description": "answer: ключ варианта вопроса (option, text или оба: text — свободный ответ); у вопроса-предложения идеи обязателен: accept (начать), defer (отложить, с horizon), decline (отказаться); у вопроса «вернуть» — reopen (вернуть) или decline"},
+                    "text": {"type": "string", "description": "answer: текст ответа; propose: почему идея подходит сейчас (до 2000 символов), у идеи с пометкой «задача снята» обязателен — почему её пора вернуть"},
                     "channel": {"type": "string", "enum": ["chat", "cli"],
                         "description": "answer, decide: где человек ответил (по умолчанию chat)"},
                     "by": {"type": "string", "enum": ["human", "agent"],
@@ -1249,11 +1249,20 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             )
             .await?;
             return done(f, &r, |v| {
-                format!(
-                    "Предложено w:{} → вопрос q:{}\nСпроси человека: начать, отложить или \
-                     отказаться; без ответа «начать» не начинай.",
+                let (idea, q) = (
                     v["entry"]["id"].as_str().unwrap_or("?"),
-                    v["question"]["id"].as_str().unwrap_or("?")
+                    v["question"]["id"].as_str().unwrap_or("?"),
+                );
+                // вопрос «вернуть» идею со снятой задачей (§16)
+                if v["question"]["data"]["proposal"] == "reopen" {
+                    return format!(
+                        "Предложено вернуть w:{idea} → вопрос q:{q}\nСпроси человека: вернуть \
+                         или отказаться; решает человек."
+                    );
+                }
+                format!(
+                    "Предложено w:{idea} → вопрос q:{q}\nСпроси человека: начать, отложить или \
+                     отказаться; без ответа «начать» не начинай."
                 )
             });
         }

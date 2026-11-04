@@ -4,7 +4,8 @@
 //!   `deferred` → `proposed` и вопрос-предложение с вариантами «начать / отложить /
 //!   отказаться» ([`zam_store::propose_idea`]). Предложение — действие агента: сессии WebUI 422.
 //!   `space` — пространство будущей задачи; без него — решение запроса (`X-Zam-Solution`), если
-//!   оно в базе идеи;
+//!   оно в базе идеи. Идея `accepted` со снятой или удалённой задачей (§16) — вопрос «вернуть /
+//!   отказаться» (`data.proposal: reopen`), статус прежний; `text` обязателен (нет — 422);
 //! - `POST /entries/{id}/decide {decision, horizon?, reason?, by?, channel?, space?}` → 200
 //!   `{entry, task?, question?}` ([`zam_store::decide_idea`]); `by` и `channel` — по правилам
 //!   ответа на вопрос ([`super::questions`]). Права проверяются до хранилища: токен без `by` —
@@ -62,6 +63,7 @@ impl From<IdeaError> for ApiError {
             e @ (IdeaError::IdeaDeleted | IdeaError::StaleProposal | IdeaError::OriginChanged) => {
                 ApiError::conflict(e.to_string())
             }
+            e @ IdeaError::ReopenTextRequired => unprocessable(e.to_string()),
             // ошибки проверки тела операции идеи (`text`, `reason` длиннее предела) — 422
             IdeaError::Store(StoreError::BadInput(m)) => unprocessable(m),
             IdeaError::Store(e) => e.into(),

@@ -90,8 +90,8 @@ pub enum ApiError {
     #[error("идея уже принята как своя")]
     AlreadyAdopted,
     /// 422 `/problems/option-required` (M5.7 §5.3): ответ на вопрос-предложение без варианта.
-    #[error("ответ на предложение идеи — вариант option: accept, defer или decline")]
-    OptionRequired,
+    #[error("{0}")]
+    OptionRequired(String),
     #[error("{0}")]
     PayloadTooLarge(String),
     /// 428 `/problems/precondition-required` (§11.3): правка без `If-Match`; в `detail` —
@@ -230,7 +230,7 @@ impl ApiError {
                 "/problems/already-adopted",
                 "Conflict",
             ),
-            ApiError::OptionRequired => (
+            ApiError::OptionRequired(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/option-required",
                 "Unprocessable Content",

@@ -68,8 +68,10 @@
 //!   решения и только первый `session_start` сессии; нет в `recovery` и `brief`); к `prompt` —
 //!   до `ideas.prompt_max` строк отдельного лёгкого поиска идей после основного
 //!   ([`prompt_ideas`]; общие идеи Knowledge — [`knowledge_ideas_related`]). Кандидаты —
-//!   [`zam_store::idea_candidate`]: «от агента», `proposed`, `accepted`, `declined`, `done` и
-//!   `deferred` до `horizon` не предлагаются никогда; показ — `session_seen`, раз за сессию;
+//!   [`zam_store::idea_candidate`]: «от агента», `proposed`, `declined`, `done`, `deferred` до
+//!   `horizon` и `accepted` с живой задачей не предлагаются никогда; `accepted` со снятой или
+//!   удалённой задачей (§16) — после `new`/`deferred`, строка с пометкой «задача снята|удалена,
+//!   можно предложить вернуть»; показ — `session_seen`, раз за сессию;
 //! - **`post_tool`** — ошибка инструмента: совпадения `error_regex` действующих триггеров
 //!   insight решения и Knowledge (по первым [`ERROR_SCAN_MAX`] байтам `error`; триггер с
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
@@ -715,25 +717,52 @@ fn idea_title(e: &Entry) -> String {
     zam_markdown::mask_text(&clip(&e.title, IDEA_TITLE_CHARS))
 }
 
-/// Строка идеи дайджеста: `ZeroAIMemory: идея «<заголовок до 120>» [<priority>] — w:<id>`.
-fn idea_line(e: &Entry) -> String {
+/// Пометка строки идеи `accepted` со снятой или удалённой задачей (§16, п. 1): `task` —
+/// состояние её задачи ([`zam_store::idea_task_state`]); у прочих статусов — `None`.
+fn released_mark(e: &Entry, task: Option<zam_store::TaskState>) -> Option<&'static str> {
+    use zam_store::TaskState;
+    if e.status != Some(EntryStatus::Accepted) {
+        return None;
+    }
+    match task {
+        Some(TaskState::Dropped) => Some("задача снята"),
+        Some(TaskState::Deleted) | None => Some("задача удалена"),
+        Some(TaskState::Live | TaskState::Done) => None,
+    }
+}
+
+/// Строка идеи дайджеста: `ZeroAIMemory: идея «<заголовок до 120>» [<priority>] — w:<id>`;
+/// у идеи со снятой задачей перед ссылкой — `<пометка>, можно предложить вернуть` (§16).
+fn idea_line(e: &Entry, mark: Option<&str>) -> String {
     let priority = zam_store::IdeaData::from_stored(&e.data).priority;
+    let mark = mark
+        .map(|m| format!(" — {m}, можно предложить вернуть"))
+        .unwrap_or_default();
     format!(
-        "ZeroAIMemory: идея «{}» [{}] — {}",
+        "ZeroAIMemory: идея «{}» [{}]{mark} — {}",
         idea_title(e),
         priority.as_str(),
         entry_ref(e)
     )
 }
 
-/// Строка подсказки идеи к `prompt` (§6.2).
-fn idea_prompt_line(e: &Entry) -> String {
-    format!(
-        "ZeroAIMemory: к задаче подходит идея «{}» — {} (предложи: action=propose; без ответа \
-         не начинай)",
-        idea_title(e),
-        entry_ref(e)
-    )
+/// Строка подсказки идеи к `prompt` (§6.2); у идеи со снятой задачей — пометка и указание
+/// «предложи вернуть» (§16).
+fn idea_prompt_line(e: &Entry, mark: Option<&str>) -> String {
+    match mark {
+        None => format!(
+            "ZeroAIMemory: к задаче подходит идея «{}» — {} (предложи: action=propose; без \
+             ответа не начинай)",
+            idea_title(e),
+            entry_ref(e)
+        ),
+        Some(m) => format!(
+            "ZeroAIMemory: к задаче подходит идея «{}» — {m}, можно предложить вернуть — {} \
+             (предложи: action=propose с text — почему пора; решает человек)",
+            idea_title(e),
+            entry_ref(e)
+        ),
+    }
 }
 
 /// Подсказка-идея цели `target` со строкой `block` (`kind: idea`, `reason: idea`).
@@ -811,20 +840,36 @@ async fn digest_ideas(
     else {
         return Vec::new();
     };
-    match r {
-        Ok(cands) => cands
-            .iter()
-            .map(|e| idea_cand(i, e, idea_line(e)))
-            .collect(),
+    let cands = match r {
+        Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "recall: идеи дайджеста не прочитаны");
-            Vec::new()
+            return Vec::new();
         }
+    };
+    let mut out = Vec::with_capacity(cands.len());
+    for e in &cands {
+        // пометка «задача снята» — по состоянию задачи (только у `accepted`, §16)
+        let task = if e.status == Some(EntryStatus::Accepted) {
+            match deadline.step(zam_store::idea_task_state(&t.db, e)).await {
+                Some(Ok(s)) => s,
+                Some(Err(err)) => {
+                    tracing::warn!(error = %err, "recall: задача идеи дайджеста не прочитана");
+                    continue;
+                }
+                None => break,
+            }
+        } else {
+            None
+        };
+        out.push(idea_cand(i, e, idea_line(e, released_mark(e, task))));
     }
+    out
 }
 
 /// Подсказки-идеи к `prompt` (§6.2): отдельный лёгкий поиск после основного (`mode=brief`,
-/// первые 512 символов, `kinds [idea]`, `status [new, deferred]`, `top_k`
+/// первые 512 символов, `kinds [idea]`, `status [new, deferred, accepted]` — `accepted` со
+/// снятой задачей, §16, — `top_k`
 /// `ideas.prompt_top_k`), основной поиск `prompt` не меняется. Идея — кандидат
 /// ([`zam_store::idea_candidate`]); идея решения — с баллом ≥ `recall.prompt_min_score`, общая
 /// идея Knowledge — по [`knowledge_ideas_related`]. Показанное сессии и предел
@@ -878,7 +923,7 @@ async fn collect_prompt_ideas(
     let body = json!({
         "query": query,
         "scope": {"solution": req.solution, "include_knowledge": true, "include_rules": false},
-        "filters": {"kinds": ["idea"], "status": ["new", "deferred"]},
+        "filters": {"kinds": ["idea"], "status": ["new", "deferred", "accepted"]},
         "mode": "brief",
         "top_k": st.cfg.ideas.prompt_top_k,
         "budget_tokens": PROMPT_SEARCH_BUDGET,
@@ -894,8 +939,8 @@ async fn collect_prompt_ideas(
     let min = st.cfg.recall.prompt_min_score;
     let today = zam_store::time::utc_today();
     let targets = health.targets();
-    // (цель, идея, общая из Knowledge) в порядке выдачи
-    let mut found: Vec<(usize, Entry, bool)> = Vec::new();
+    // (цель, идея, общая из Knowledge, пометка «задача снята») в порядке выдачи
+    let mut found: Vec<(usize, Entry, bool, Option<&'static str>)> = Vec::new();
     for it in v["items"].as_array().into_iter().flatten() {
         if it["kind"] != "idea" {
             continue;
@@ -925,17 +970,39 @@ async fn collect_prompt_ideas(
         let Some(r) = d.step(zam_store::get_entry(&db, id)).await else {
             return Ok(Vec::new());
         };
-        match r {
-            Ok(e) if zam_store::idea_candidate(&e, today) => found.push((target, e, shared)),
-            Ok(_) | Err(StoreError::NotFound) => {}
-            Err(e) => tracing::warn!(error = %e, "recall: идея подсказки не прочитана"),
+        let e = match r {
+            Ok(e) => e,
+            Err(StoreError::NotFound) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "recall: идея подсказки не прочитана");
+                continue;
+            }
+        };
+        // у `accepted` — состояние задачи (§16): кандидат, только если она снята или удалена
+        let task = if e.status == Some(EntryStatus::Accepted) {
+            let Some(r) = d.step(zam_store::idea_task_state(&db, &e)).await else {
+                return Ok(Vec::new());
+            };
+            match r {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(error = %err, "recall: задача идеи подсказки не прочитана");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if zam_store::idea_candidate(&e, task, today) {
+            let mark = released_mark(&e, task);
+            found.push((target, e, shared, mark));
         }
     }
     // тестовая задержка (тишина по сроку): только с фичей test-hooks
     #[cfg(feature = "test-hooks")]
     if found
         .iter()
-        .any(|(_, e, _)| e.title.contains(TEST_SLOW_IDEA_MARK))
+        .any(|(_, e, _, _)| e.title.contains(TEST_SLOW_IDEA_MARK))
     {
         // заведомо дольше срока: `timeout_at` сначала опрашивает сам шаг, и короткий сон,
         // истёкший вместе со сроком (поток разбужен поздно под нагрузкой), прошёл бы как успех
@@ -954,8 +1021,8 @@ async fn collect_prompt_ideas(
     };
     Ok(found
         .iter()
-        .filter(|(_, e, shared)| !shared || related.contains(&e.id))
-        .map(|(i, e, _)| idea_cand(*i, e, idea_prompt_line(e)))
+        .filter(|(_, e, shared, _)| !shared || related.contains(&e.id))
+        .map(|(i, e, _, mark)| idea_cand(*i, e, idea_prompt_line(e, *mark)))
         .collect())
 }
 

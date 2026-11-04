@@ -1,7 +1,8 @@
 // Сквозные сценарии журнала «Идеи» (M5.7 §10): лента и вкладки по происхождению, создание,
 // «Принять как свою», «Начать» (ссылка на задачу; идея Knowledge — в общее решение с
 // предупреждением), «Отложить» с датой UTC, «Отказаться», «Вернуть», задача снята, ответ на
-// вопрос-предложение в «Вопросах», конфликт ревизии, выключатель ideas.proactive, Ctrl+K.
+// вопрос-предложение в «Вопросах» (и вопрос «вернуть» идею со снятой задачей, задача 7), конфликт
+// ревизии, выключатель ideas.proactive, Ctrl+K.
 // Данные — seedIdeas (global-setup); сценарии, которые меняют статус, создают свою идею по токену
 // администратора (агент: идея человека — `origin: human`, решения — `by: human`).
 import { expect, test, type Locator, type Page } from '@playwright/test';
@@ -450,6 +451,49 @@ test('ideas_accepted_deleted_task_decline', async ({ page }) => {
   await page.getByRole('form', { name: 'Отказаться от идеи' }).getByRole('button', { name: 'Отказаться' }).click();
   await expect(card(page).locator('[data-status]')).toHaveText('отклонена');
   expect((await api('GET', `entries/${idea.id}`)).status).toBe('declined');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// Задача 7 (§16, п. 6): агент предложил вернуть идею со снятой задачей — пометка в «Идеях»,
+// ответ «вернуть» в «Вопросах» (кнопки «вернуть»/«отказаться», без поля даты) → идея `new`.
+test('ideas_reopen_proposal_answered_in_questions', async ({ page }) => {
+  const problems = watch(page);
+  const title = 'Идея E2E: предложено вернуть';
+  const idea = await newIdea(title);
+  const task = (await decide(idea.id, 'accept')).task!;
+  await api('PATCH', `entries/${task.id}`, { status: 'dropped' }, { 'If-Match': `"${task.rev}"` });
+  const p = await api<{ entry: Record<string, any>; question: { id: string } }>('POST', `entries/${idea.id}/propose`, {
+    text: 'Снова просят экспорт — пора вернуть.',
+  });
+  expect(p.entry.status).toBe('accepted');
+  const qid = p.question.id;
+  await openIdeas(page, idea.id);
+  await expect(card(page).locator('[data-status]')).toHaveText('начата');
+  const mark = card(page).getByTestId('reopen-proposed');
+  await expect(mark).toContainText('Предложено вернуть.');
+  await expect(mark).toContainText('Снова просят экспорт — пора вернуть.');
+  await expect(mark.getByRole('link', { name: `Вопрос q:${qid}` })).toHaveAttribute('href', new RegExp(`/j/questions/${qid}$`));
+  await expect(card(page).getByRole('button', { name: 'Вернуть' })).toBeVisible();
+  await expect(card(page).getByRole('button', { name: 'Отказаться' })).toBeVisible();
+
+  const u = await me(page);
+  await page.goto(`${base()}#/u/${u}/s/${IDEAS_GUID}/j/questions/${qid}`);
+  const q = page.locator(`[data-question="${qid}"]`);
+  await expect(q).toContainText(`Вернуть идею «${title}»?`);
+  await expect(q.getByTestId('idea-link')).toHaveText(`Идея w:${idea.id}`);
+  await expect(q.getByRole('group', { name: 'Варианты ответа' }).getByRole('button')).toHaveText(['вернуть', 'отказаться']);
+  await expect(q.getByRole('form', { name: 'Ответ текстом' })).toHaveCount(0);
+  const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${qid}/answer`));
+  await q.getByRole('button', { name: 'вернуть', exact: true }).click();
+  expect((await sent).postDataJSON()).toEqual({ option: 'reopen', channel: 'webui' });
+  await expect(q).toContainText('Ответ: вернуть');
+  await expect(q.getByRole('form', { name: 'Отложить идею' })).toHaveCount(0);
+  const e = await api('GET', `entries/${idea.id}`);
+  expect(e.status).toBe('new');
+  expect(e.data.prev_task_ids).toContain(task.id);
+  await q.getByTestId('idea-link').click();
+  await expect(card(page).locator('[data-status]')).toHaveText('новая');
+  await expect(card(page).getByTestId('reopen-proposed')).toHaveCount(0);
   expect(problems, problems.join('\n')).toEqual([]);
 });
 

@@ -534,3 +534,35 @@ fn question_answer_by_unchanged() {
     assert_eq!(j["entry"]["data"]["answer"]["by"], "human");
     assert_eq!(j["entry"]["data"]["answer"]["channel"], "cli");
 }
+
+/// Задача 7 (§16): `zam idea propose` по идее со снятой задачей — без `--text` код 6 (422),
+/// с `--text` — «Предложено вернуть w:<id> → вопрос q:<id>», варианты «вернуть / отказаться».
+#[test]
+fn idea_propose_reopen_prints() {
+    let t = T::new("propose-reopen");
+    let id = t.idea("Кэш выжимок", &[]);
+    let a = ok(&t.z(&["idea", "accept", &format!("w:{id}")]));
+    let tid = a.trim().rsplit("k:").next().unwrap().to_string();
+    ok(&t.z(&["task", "status", &format!("k:{tid}"), "dropped"]));
+    let o = t.z(&["idea", "propose", &format!("w:{id}")]);
+    assert_eq!(code(&o), Some(6), "{}", err(&o));
+    assert!(err(&o).contains("почему идею пора вернуть"), "{}", err(&o));
+    let p = ok(&t.z(&[
+        "idea",
+        "propose",
+        &format!("w:{id}"),
+        "--text",
+        "кэш снова тормозит",
+    ]));
+    assert!(
+        p.starts_with(&format!("Предложено вернуть w:{id} → вопрос q:")),
+        "{p}"
+    );
+    let qid = p.trim().rsplit("q:").next().unwrap().to_string();
+    let q = ok(&t.z(&["question", "list"]));
+    assert!(q.contains(&qid), "{q}");
+    assert!(q.contains("reopen=вернуть"), "{q}");
+    // идея остаётся принятой
+    let l = ok(&t.z(&["idea", "list"]));
+    assert!(l.contains(&format!("w:{id} [accepted]")), "{l}");
+}

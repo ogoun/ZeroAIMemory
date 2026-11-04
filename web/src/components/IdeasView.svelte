@@ -5,7 +5,9 @@
   // Карточка: «Начать» (decide accept — задача и ссылка на неё; у идеи Knowledge — выбор
   // решения с предупреждением об общем), «Отложить» (дата UTC), «Отказаться», «Вернуть»,
   // «Принять как свою» (у «от агента» «Начать» нет до неё), «Изменить» (PATCH с If-Match,
-  // 409 — перечитать). Предлагает идею агент (propose): у WebUI этого действия нет. Ленивый чанк.
+  // 409 — перечитать). Предлагает идею агент (propose): у WebUI этого действия нет; у идеи со
+  // снятой задачей открытый вопрос агента «вернуть» — пометка «Предложено вернуть» (§16, п. 6),
+  // кнопки «Вернуть»/«Отказаться» остаются. Ленивый чанк.
   import { untrack } from 'svelte';
   import {
     ApiError,
@@ -587,9 +589,9 @@
       {#if c.body}<p class="body">{c.body}</p>{/if}
       {#if c.tags.length}<div class="row">{#each c.tags as t (t)}<span class="chip">#{t}</span>{/each}</div>{/if}
       {#if c.status === 'deferred' && str(c.data, 'horizon')}<p class="muted">Отложена до {str(c.data, 'horizon')} (UTC).</p>{/if}
-      {#if c.status === 'proposed' && curQuestion}
-        <div class="proposal">
-          <p><strong>Агент предлагает начать.</strong> <a href={questionHref(curQuestion.id)}>Вопрос {entryRef('question', curQuestion.id)}</a></p>
+      {#if curQuestion && (c.status === 'proposed' || rel)}
+        <div class="proposal" data-testid={rel ? 'reopen-proposed' : undefined}>
+          <p><strong>{rel ? 'Предложено вернуть' : 'Агент предлагает начать'}.</strong> <a href={questionHref(curQuestion.id)}>Вопрос {entryRef('question', curQuestion.id)}</a></p>
           {#if curQuestion.body}<p class="body">{curQuestion.body}</p>{/if}
         </div>
       {/if}

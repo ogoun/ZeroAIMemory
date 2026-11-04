@@ -19,10 +19,11 @@
 //!   `answer`), `force: true` записывает всё равно ([`question_duplicate`]);
 //! - правка вопроса — `PATCH /entries/{id}`: `data` (`options`, `recommendation`) пока вопрос
 //!   `open`; `status: obsolete` — с `reason` (иначе 422 `reason-required`);
-//! - вопрос-предложение идеи (`data.idea`, M5.7 §5.3): нужен `option` `accept|defer|decline`
-//!   (иначе 422 `/problems/option-required`), `horizon` — только у `defer` (нет — сегодня +
-//!   `[ideas] defer_days`); `by: agent` — 403 `/problems/idea-human-decision` до чтения идеи.
-//!   Ответ переводит идею той же транзакцией и возвращает ещё `idea` и `task?`.
+//! - вопрос-предложение идеи (`data.idea`, M5.7 §5.3): нужен `option` `accept|defer|decline`,
+//!   у вопроса «вернуть» (`data.proposal: reopen`, §16) — `reopen|decline` (нет варианта —
+//!   422 `/problems/option-required`, чужой — 422), `horizon` — только у `defer` (нет —
+//!   сегодня + `[ideas] defer_days`); `by: agent` — 403 `/problems/idea-human-decision` до
+//!   чтения идеи. Ответ переводит идею той же транзакцией и возвращает ещё `idea` и `task?`.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -58,7 +59,7 @@ impl From<QuestionError> for ApiError {
             | QuestionError::Empty
             | QuestionError::NotQuestion
             | QuestionError::HorizonNotAllowed => unprocessable(e.to_string()),
-            QuestionError::OptionRequired => ApiError::OptionRequired,
+            e @ QuestionError::OptionRequired(_) => ApiError::OptionRequired(e.to_string()),
             QuestionError::ByAgentOnProposal => ApiError::IdeaHumanDecision,
             QuestionError::Idea(e) => e.into(),
             QuestionError::Store(e) => e.into(),

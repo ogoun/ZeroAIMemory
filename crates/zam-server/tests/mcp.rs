@@ -2729,3 +2729,79 @@ async fn mcp_schema_field_descriptions_mention_idea() {
     let opt = props["option"]["description"].as_str().unwrap();
     assert!(opt.contains("text") && opt.contains("accept"), "{opt}");
 }
+
+/// Задача 7 (§16): `propose` по идее со снятой задачей — без `text` ошибка с объяснением,
+/// с `text` — «Предложено вернуть …» и вопрос `reopen|decline`; ответ человека `reopen` из чата
+/// возвращает идею в `new`.
+#[tokio::test]
+async fn mcp_propose_reopen_dropped_task() {
+    let a = api("mcp-idea-reopen", |_| {}).await;
+    let id = mcp_idea(&a, "Кэш выжимок").await;
+    let w = format!("w:{id}");
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/entries/{id}/decide"),
+            Some(json!({"decision": "accept", "by": "human"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let task = r.json()["task"]["id"].as_str().unwrap().to_string();
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{task}"),
+            Some(json!({"status": "dropped", "reason": "не до того"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": w, "action": "propose"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("почему идею пора вернуть"), "{}", o.text);
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": w, "action": "propose", "text": "кэш снова тормозит"}),
+    )
+    .await;
+    let head = format!("Предложено вернуть w:{id} → вопрос q:");
+    assert!(o.text.starts_with(&head), "{}", o.text);
+    assert!(o.text.contains("вернуть или отказаться"), "{}", o.text);
+    let qid = o.text[head.len()..]
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .unwrap()
+        .to_string();
+    let q = a
+        .t(Method::GET, &format!("/api/v1/entries/{qid}"), None)
+        .await
+        .json();
+    let keys: Vec<&str> = q["data"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["reopen", "decline"], "{q}");
+    assert_eq!(q["data"]["proposal"], "reopen", "{q}");
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("q:{qid}"), "action": "answer", "option": "reopen",
+               "by": "human"}),
+    )
+    .await;
+    assert!(o.text.contains(&format!("Идея w:{id}: new")), "{}", o.text);
+}

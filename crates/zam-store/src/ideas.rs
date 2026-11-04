@@ -51,6 +51,62 @@ pub const IDEA_OPTIONS: [(&str, &str); 3] = [
     ("defer", "отложить"),
     ("decline", "отказаться"),
 ];
+/// Варианты вопроса «вернуть» идею со снятой или удалённой задачей (§16, п. 2).
+pub const IDEA_REOPEN_OPTIONS: [(&str, &str); 2] =
+    [("reopen", "вернуть"), ("decline", "отказаться")];
+
+/// Вид вопроса-предложения идеи (`data.proposal` вопроса; нет поля — [`ProposalKind::Start`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ProposalKind {
+    /// «Начать идею?» — варианты [`IDEA_OPTIONS`] (§5.1).
+    #[default]
+    Start,
+    /// «Вернуть идею?» — идея `accepted` со снятой задачей, варианты [`IDEA_REOPEN_OPTIONS`]
+    /// (§16).
+    Reopen,
+}
+
+impl ProposalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposalKind::Start => "start",
+            ProposalKind::Reopen => "reopen",
+        }
+    }
+
+    /// Вид из `data.proposal`: `reopen` — «вернуть», прочее и нет поля — «начать».
+    pub fn from_stored(v: Option<&Value>) -> ProposalKind {
+        match v.and_then(Value::as_str) {
+            Some("reopen") => ProposalKind::Reopen,
+            _ => ProposalKind::Start,
+        }
+    }
+
+    /// Варианты вопроса этого вида (фиксирует сервер).
+    pub fn options(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            ProposalKind::Start => &IDEA_OPTIONS,
+            ProposalKind::Reopen => &IDEA_REOPEN_OPTIONS,
+        }
+    }
+
+    /// Решение по ключу варианта вопроса этого вида; чужой ключ — `None`.
+    pub fn decision(self, key: &str) -> Option<IdeaDecision> {
+        self.options()
+            .iter()
+            .any(|(k, _)| *k == key)
+            .then(|| IdeaDecision::parse(key))
+            .flatten()
+    }
+
+    /// Ключи вариантов для сообщений: «accept, defer или decline».
+    pub fn keys_text(self) -> &'static str {
+        match self {
+            ProposalKind::Start => "accept, defer или decline",
+            ProposalKind::Reopen => "reopen или decline",
+        }
+    }
+}
 
 /// Приоритет идеи.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -142,21 +198,6 @@ impl IdeaDecision {
             "reopen" => Some(IdeaDecision::Reopen),
             _ => None,
         }
-    }
-
-    /// Ключ варианта вопроса-предложения ([`IDEA_OPTIONS`]); у `reopen` варианта нет.
-    pub fn option_key(self) -> Option<&'static str> {
-        match self {
-            IdeaDecision::Accept | IdeaDecision::Defer | IdeaDecision::Decline => {
-                Some(self.as_str())
-            }
-            IdeaDecision::Reopen => None,
-        }
-    }
-
-    /// Решение по ключу варианта вопроса-предложения; прочее — `None`.
-    pub fn from_option(key: &str) -> Option<IdeaDecision> {
-        IdeaDecision::parse(key).filter(|d| d.option_key().is_some())
     }
 }
 
@@ -355,6 +396,18 @@ impl IdeaData {
         Ok(())
     }
 
+    /// Действующее предложение «вернуть» у идеи `accepted` (§16): `question_id` задан и
+    /// предложен позже последнего решения. У принятой «начать» идеи `question_id` — отвеченный
+    /// вопрос «начать» (предложен раньше решения). Согласованность держат хуки транзакций:
+    /// вопрос «вернуть» устарел, удалён или задача снова живая — `question_id` снимается
+    /// ([`on_proposal_closed_tx`], [`on_task_status_tx`], [`on_entry_restored_tx`]).
+    pub fn reopen_proposed(&self) -> bool {
+        match (self.question_id, self.proposed_at) {
+            (Some(_), Some(p)) => self.decided.as_ref().is_none_or(|d| p > d.at),
+            _ => false,
+        }
+    }
+
     /// Нормализованная `data` для записи: `priority` и `origin` всегда (по ним фильтруют
     /// лента и отбор), прочие — если заданы.
     pub fn to_value(&self) -> Value {
@@ -465,10 +518,11 @@ pub enum TaskState {
     Done,
 }
 
-/// Можно ли выйти из `accepted` вручную (`reopen`, `decline`): задача снята (`dropped`),
-/// удалена или её нет. Единственное место правила «задача снята или удалена» — ждёт ответа
-/// владельца (журнал этапа, вопрос 9) **[решение составителя]**.
-fn task_released(task: Option<TaskState>) -> bool {
+/// Задача идеи `accepted` снята (`dropped`), удалена или её нет: можно выйти из `accepted`
+/// вручную (`reopen`, `decline`, §5) и агент может предложить вернуть идею (§16).
+/// **Единственное место правила** «задача снята или удалена» (ответ владельца на вопрос 9 —
+/// А; задача 7).
+pub fn task_released(task: Option<TaskState>) -> bool {
     matches!(task, None | Some(TaskState::Dropped | TaskState::Deleted))
 }
 
@@ -576,6 +630,9 @@ pub enum IdeaError {
     /// Вопрос — не действующее предложение идеи (у неё другой `question_id`): 409.
     #[error("предложение устарело: у идеи другой вопрос-предложение или его нет")]
     StaleProposal,
+    /// Предложение вернуть идею без объяснения (`text`): 422 (§16, п. 2).
+    #[error("text: объясните, почему идею пора вернуть")]
+    ReopenTextRequired,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -676,6 +733,17 @@ fn task_state(c: &Connection, d: &IdeaData) -> Result<Option<TaskState>, StoreEr
     }))
 }
 
+/// Состояние задачи идеи `accepted` или `done` для отбора кандидатов (§6, §16): у прочих
+/// статусов — `None`. Задачи нет в данных или она удалена — [`TaskState::Deleted`].
+pub async fn idea_task_state(db: &Db, idea: &Entry) -> Result<Option<TaskState>, StoreError> {
+    if !matches!(idea.status, Some(EntryStatus::Accepted | EntryStatus::Done)) {
+        return Ok(None);
+    }
+    let d = IdeaData::from_stored(&idea.data);
+    db.read(move |c| Ok(Some(task_state(c, &d)?.unwrap_or(TaskState::Deleted))))
+        .await
+}
+
 /// Вид пространства этой базы; нет — `None`.
 fn space_kind(c: &Connection, id: Id) -> Result<Option<SpaceKind>, StoreError> {
     use rusqlite::OptionalExtension;
@@ -733,12 +801,21 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// Заголовок вопроса-предложения «Начать идею «…»?» не длиннее [`TITLE_MAX_CHARS`].
-fn proposal_title(title: &str) -> String {
-    const HEAD: &str = "Начать идею «";
+/// Заголовок вопроса-предложения «Начать идею «…»?» («Вернуть идею «…»?» у [`ProposalKind::Reopen`])
+/// не длиннее [`TITLE_MAX_CHARS`].
+fn proposal_title(title: &str, kind: ProposalKind) -> String {
+    let head = match kind {
+        ProposalKind::Start => "Начать идею «",
+        ProposalKind::Reopen => "Вернуть идею «",
+    };
+    proposal_title_with(title, head)
+}
+
+fn proposal_title_with(title: &str, head: &str) -> String {
     const TAIL: &str = "»?";
-    let room = TITLE_MAX_CHARS - HEAD.chars().count() - TAIL.chars().count();
-    format!("{HEAD}{}{TAIL}", clip(title, room))
+    let head_len = head.chars().count();
+    let room = TITLE_MAX_CHARS - head_len - TAIL.chars().count();
+    format!("{head}{}{TAIL}", clip(title, room))
 }
 
 /// Ссылка на идею в теле вопроса и задачи.
@@ -763,6 +840,12 @@ fn joined(parts: &[&str]) -> String {
 /// запроса той же базы → пространство идеи. «От агента» — [`IdeaError::AgentOrigin`]; статус
 /// не `new`/`deferred` — [`IdeaError::Transition`]; `text` длиннее
 /// [`PROPOSE_TEXT_MAX_CHARS`] — `BadInput`.
+///
+/// Идея `accepted` со снятой или удалённой задачей ([`task_released`], §16) получает вопрос
+/// «вернуть» ([`ProposalKind::Reopen`], варианты [`IDEA_REOPEN_OPTIONS`], без `task_space`):
+/// `text` обязателен ([`IdeaError::ReopenTextRequired`]), статус остаётся `accepted`, идея
+/// получает `question_id` и `proposed_at`. `task_space` и решение запроса здесь не нужны и не
+/// проверяются: задачу выберет следующий «начать» **[решение исполнителя задачи 7]**.
 pub async fn propose_idea(
     db: &Db,
     id: Id,
@@ -793,42 +876,58 @@ pub async fn propose_idea(
                 return Ok(Err(IdeaError::AgentOrigin));
             }
             let status = idea.status.unwrap_or(EntryStatus::New);
-            if status == EntryStatus::Proposed
+            if matches!(status, EntryStatus::Proposed | EntryStatus::Accepted)
                 && let Some(q) = open_question(tx, &d)?
             {
                 return Ok(Ok((idea, q)));
             }
+            let kind = if status == EntryStatus::Accepted && task_released(task_state(tx, &d)?) {
+                ProposalKind::Reopen
+            } else {
+                ProposalKind::Start
+            };
             // `proposed` без открытого вопроса (рассогласование) предлагается заново
-            if !matches!(
-                status,
-                EntryStatus::New | EntryStatus::Deferred | EntryStatus::Proposed
-            ) {
+            if kind == ProposalKind::Start
+                && !matches!(
+                    status,
+                    EntryStatus::New | EntryStatus::Deferred | EntryStatus::Proposed
+                )
+            {
                 return Ok(Err(IdeaError::Transition {
                     from: status,
                     to: EntryStatus::Proposed.as_str(),
                 }));
             }
-            let space = match resolve_task_space(tx, &idea, task_space, None, request_solution)? {
-                Ok(s) => s,
-                Err(e) => return Ok(Err(e)),
-            };
+            if kind == ProposalKind::Reopen && text.is_none() {
+                return Ok(Err(IdeaError::ReopenTextRequired));
+            }
+            let mut qdata = json!({
+                "options": kind.options()
+                    .iter()
+                    .map(|(key, text)| json!({"key": key, "text": text}))
+                    .collect::<Vec<Value>>(),
+                "idea": idea.id.to_string(),
+            });
+            match kind {
+                ProposalKind::Start => {
+                    let space =
+                        match resolve_task_space(tx, &idea, task_space, None, request_solution)? {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                    qdata["task_space"] = json!(space.to_string());
+                }
+                ProposalKind::Reopen => qdata["proposal"] = json!(kind.as_str()),
+            }
             let now_ts = Timestamp::now();
             let now = fmt_ts(now_ts);
-            let options: Vec<Value> = IDEA_OPTIONS
-                .iter()
-                .map(|(key, text)| json!({"key": key, "text": text}))
-                .collect();
             let q = NewEntry {
                 refs: None,
                 space_id: idea.space_id,
                 kind: EntryKind::Question,
-                title: proposal_title(&idea.title),
+                title: proposal_title(&idea.title, kind),
                 body: joined(&[text.as_deref().unwrap_or(""), &idea_line(idea.id)]),
-                data: json!({
-                    "options": options,
-                    "idea": idea.id.to_string(),
-                    "task_space": space.to_string(),
-                }),
+                data: qdata,
                 area: idea.area.clone(),
                 tags: idea.tags.clone(),
                 status: None,
@@ -840,15 +939,12 @@ pub async fn propose_idea(
             let qid = insert_entry_as(tx, q, None, &attrib, None, &now, Maker::Server)?;
             d.question_id = Some(qid);
             d.proposed_at = Some(now_ts);
-            revise_with(
-                tx,
-                &idea,
-                Some(EntryStatus::Proposed),
-                d.to_value(),
-                None,
-                &attrib,
-                &now,
-            )?;
+            // «вернуть» статус не меняет: `proposed` значит «предложено начать» (§16, п. 2)
+            let next = match kind {
+                ProposalKind::Start => EntryStatus::Proposed,
+                ProposalKind::Reopen => EntryStatus::Accepted,
+            };
+            revise_with(tx, &idea, Some(next), d.to_value(), None, &attrib, &now)?;
             Ok(Ok((load_entry(tx, id)?, load_entry(tx, qid)?)))
         })
     })
@@ -986,10 +1082,10 @@ pub(crate) fn apply_decision_tx(
         attrib,
         now,
     )?;
-    if let (Some(q), Some(key)) = (open_q, d.decision.option_key()) {
+    if let Some(q) = open_q {
         let a = NormalizedAnswer {
             text: None,
-            option: Some(key.to_string()),
+            option: Some(d.decision.as_str().to_string()),
             by: d.by,
             channel: d.channel,
         };
@@ -1020,11 +1116,7 @@ pub async fn decide_idea(
                 Ok(e) => e,
                 Err(e) => return Ok(Err(e)),
             };
-            let open = if d.decision.option_key().is_some() {
-                open_question(tx, &IdeaData::from_stored(&idea.data))?.map(|q| q.id)
-            } else {
-                None
-            };
+            let open = open_question(tx, &IdeaData::from_stored(&idea.data))?.map(|q| q.id);
             let now = fmt_ts(Timestamp::now());
             let (idea, task) = match apply_decision_tx(tx, &idea, &d, None, &attrib, &now)? {
                 Ok(v) => v,
@@ -1099,9 +1191,52 @@ fn idea_of_task(c: &Connection, task: Id) -> Result<Option<Entry>, StoreError> {
     Ok(None)
 }
 
+/// Причина устаревания вопроса «вернуть», когда задача идеи снова живая (§16, п. 4).
+const TASK_REVIVED_REASON: &str = "задача возобновлена";
+
+/// Задача идеи снова живая (переоткрыта из `dropped`, восстановлена из корзины; §16, п. 4):
+/// открытый вопрос «вернуть» идеи `accepted` — `obsolete` с причиной «задача возобновлена»,
+/// у идеи снимается `question_id` (новая ревизия). Возвращает идею после шага.
+fn revive_task_tx(
+    tx: &Connection,
+    idea: Entry,
+    attrib: &Attribution,
+    now: &str,
+) -> Result<Entry, StoreError> {
+    let mut d = IdeaData::from_stored(&idea.data);
+    if idea.status != Some(EntryStatus::Accepted) {
+        return Ok(idea);
+    }
+    let Some(q) = open_question(tx, &d)? else {
+        return Ok(idea);
+    };
+    if ProposalKind::from_stored(q.data.get("proposal")) != ProposalKind::Reopen {
+        return Ok(idea);
+    }
+    revise_with(
+        tx,
+        &q,
+        Some(EntryStatus::Obsolete),
+        q.data.clone(),
+        Some(TASK_REVIVED_REASON),
+        attrib,
+        now,
+    )?;
+    d.question_id = None;
+    revise_with(tx, &idea, idea.status, d.to_value(), None, attrib, now)?;
+    load_entry(tx, idea.id)
+}
+
+/// Идея задачи `task`: ребро `derived_from` ведёт к живой идее с этим `task_id`.
+fn idea_with_task(tx: &Connection, task: Id) -> Result<Option<Entry>, StoreError> {
+    Ok(idea_of_task(tx, task)?.filter(|i| IdeaData::from_stored(&i.data).task_id == Some(task)))
+}
+
 /// Смена статуса задачи (из `update_entry`, та же транзакция; §5.5): задача идеи `accepted`
 /// → `done` — идея `done` с `done_at`; задача из `done` переоткрыта — идея снова `accepted`.
-/// Ревизия идеи — с атрибуцией правки задачи. `dropped` идею не меняет (§5).
+/// Ревизия идеи — с атрибуцией правки задачи. `dropped` идею не меняет (§5); задача из
+/// `dropped` в любой другой статус — открытый вопрос «вернуть» устаревает
+/// ([`revive_task_tx`], §16, п. 4).
 pub(crate) fn on_task_status_tx(
     tx: &Connection,
     task: &Entry,
@@ -1110,16 +1245,17 @@ pub(crate) fn on_task_status_tx(
     attrib: &Attribution,
     now: &str,
 ) -> Result<(), StoreError> {
-    if from == to || !(to == EntryStatus::Done || from == EntryStatus::Done) {
+    let revived = from == EntryStatus::Dropped && to != EntryStatus::Dropped;
+    if from == to || !(revived || to == EntryStatus::Done || from == EntryStatus::Done) {
         return Ok(());
     }
-    let Some(idea) = idea_of_task(tx, task.id)? else {
+    let Some(mut idea) = idea_with_task(tx, task.id)? else {
         return Ok(());
     };
-    let mut d = IdeaData::from_stored(&idea.data);
-    if d.task_id != Some(task.id) {
-        return Ok(());
+    if revived {
+        idea = revive_task_tx(tx, idea, attrib, now)?;
     }
+    let mut d = IdeaData::from_stored(&idea.data);
     let next = match (idea.status, to) {
         (Some(EntryStatus::Accepted), EntryStatus::Done) => {
             d.done_at = Some(parse_ts(now)?);
@@ -1135,7 +1271,9 @@ pub(crate) fn on_task_status_tx(
 }
 
 /// Вопрос-предложение устарел или удалён (из `update_entry` и `delete_entry`; §5.3, §5.6):
-/// идея `proposed` с этим `question_id` возвращается в `new`, `question_id` снимается.
+/// идея `proposed` с этим `question_id` возвращается в `new`, `question_id` снимается. Вопрос
+/// «вернуть» (§16, п. 4): у идеи `accepted` снимается только `question_id` — статус прежний,
+/// идея снова кандидат.
 pub(crate) fn on_proposal_closed_tx(
     tx: &Connection,
     q: &Entry,
@@ -1149,19 +1287,19 @@ pub(crate) fn on_proposal_closed_tx(
         return Ok(());
     };
     let mut d = IdeaData::from_stored(&idea.data);
-    if idea.status != Some(EntryStatus::Proposed) || d.question_id != Some(q.id) {
+    if d.question_id != Some(q.id) {
         return Ok(());
     }
+    let next = match (
+        idea.status,
+        ProposalKind::from_stored(q.data.get("proposal")),
+    ) {
+        (Some(EntryStatus::Proposed), ProposalKind::Start) => EntryStatus::New,
+        (Some(EntryStatus::Accepted), ProposalKind::Reopen) => EntryStatus::Accepted,
+        _ => return Ok(()),
+    };
     d.question_id = None;
-    revise_with(
-        tx,
-        &idea,
-        Some(EntryStatus::New),
-        d.to_value(),
-        None,
-        attrib,
-        now,
-    )
+    revise_with(tx, &idea, Some(next), d.to_value(), None, attrib, now)
 }
 
 /// Причина устаревания вопроса-предложения удалённой идеи.
@@ -1202,8 +1340,13 @@ const STALE_PROPOSAL_REASON: &str = "предложение устарело";
 /// Восстановление записи из корзины (из `restore_entry`, та же транзакция; §5.6). Связанные
 /// статусы не откатываются, но и рассогласования не остаётся:
 /// - открытый вопрос-предложение, который идея уже не считает своим (`question_id` другой,
-///   идея не `proposed`, удалена), становится `obsolete` с причиной «предложение устарело»;
-/// - идея `proposed` без открытого вопроса-предложения возвращается в `new` без `question_id`.
+///   идея не `proposed` — у вопроса «вернуть» не `accepted`, — удалена), становится
+///   `obsolete` с причиной «предложение устарело»;
+/// - идея `proposed` без открытого вопроса-предложения возвращается в `new` без `question_id`;
+/// - идея `accepted` с предложением «вернуть», вопрос которого уже не открыт (устарел при её
+///   удалении), теряет `question_id` — снова кандидат (§16, п. 4);
+/// - восстановленная живая (не `dropped`) задача идеи — как переоткрытая: открытый вопрос
+///   «вернуть» устаревает ([`revive_task_tx`]).
 pub(crate) fn on_entry_restored_tx(
     tx: &Connection,
     e: &Entry,
@@ -1215,9 +1358,13 @@ pub(crate) fn on_entry_restored_tx(
             let Some(iid) = QuestionData::from_stored(&e.data).idea else {
                 return Ok(());
             };
+            let wanted = match ProposalKind::from_stored(e.data.get("proposal")) {
+                ProposalKind::Start => EntryStatus::Proposed,
+                ProposalKind::Reopen => EntryStatus::Accepted,
+            };
             let current = live_opt(tx, iid)?.is_some_and(|i| {
                 i.kind == EntryKind::Idea
-                    && i.status == Some(EntryStatus::Proposed)
+                    && i.status == Some(wanted)
                     && IdeaData::from_stored(&i.data).question_id == Some(e.id)
             });
             if !current {
@@ -1249,13 +1396,30 @@ pub(crate) fn on_entry_restored_tx(
                 now,
             )
         }
+        EntryKind::Idea if e.status == Some(EntryStatus::Accepted) => {
+            let mut d = IdeaData::from_stored(&e.data);
+            if !d.reopen_proposed() || open_question(tx, &d)?.is_some() {
+                return Ok(());
+            }
+            d.question_id = None;
+            revise_with(tx, e, e.status, d.to_value(), None, attrib, now)
+        }
+        EntryKind::Task if e.status != Some(EntryStatus::Dropped) => {
+            if let Some(idea) = idea_with_task(tx, e.id)? {
+                revive_task_tx(tx, idea, attrib, now)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
 
-/// Кандидат проактивности §6: живая идея `origin: human` в `new` или в `deferred` с
-/// `horizon ≤ today` (UTC). Тот же предикат — у дайджеста и подсказки `prompt`.
-pub fn idea_candidate(e: &Entry, today: Date) -> bool {
+/// Кандидат проактивности §6: живая идея `origin: human` в `new`, в `deferred` с
+/// `horizon ≤ today` (UTC) или в `accepted`, чья задача снята или удалена
+/// ([`task_released`]), без открытого предложения «вернуть» ([`IdeaData::reopen_proposed`];
+/// §16, п. 1). `task` — состояние задачи идеи ([`idea_task_state`]); у `accepted` вызывающий
+/// обязан его передать. Тот же предикат — у дайджеста и подсказки `prompt`.
+pub fn idea_candidate(e: &Entry, task: Option<TaskState>, today: Date) -> bool {
     if e.kind != EntryKind::Idea || e.deleted_at.is_some() {
         return false;
     }
@@ -1264,6 +1428,7 @@ pub fn idea_candidate(e: &Entry, today: Date) -> bool {
         && match e.status {
             Some(EntryStatus::New) => true,
             Some(EntryStatus::Deferred) => d.horizon.is_some_and(|h| h <= today),
+            Some(EntryStatus::Accepted) => task_released(task) && !d.reopen_proposed(),
             _ => false,
         }
 }
@@ -1293,8 +1458,10 @@ pub async fn any_idea(db: &Db, ids: &[Id]) -> Result<bool, StoreError> {
 /// Параметров в одном запросе [`any_idea`].
 const ANY_IDEA_CHUNK: usize = 500;
 
-/// Кандидаты §6 пространств `spaces` ([`idea_candidate`]), кроме записей из `seen`: по
-/// `priority` (`high`, `normal`, `low`), затем `updated_at` новые первыми; не больше `limit`.
+/// Кандидаты §6 пространств `spaces` ([`idea_candidate`]), кроме записей из `seen`: сначала
+/// `new` и `deferred`, затем `accepted` со снятой или удалённой задачей (§16, п. 1); внутри —
+/// по `priority` (`high`, `normal`, `low`), затем `updated_at` новые первыми; не больше
+/// `limit`.
 pub async fn proactive_ideas(
     db: &Db,
     spaces: &[Id],
@@ -1317,8 +1484,13 @@ pub async fn proactive_ideas(
              WHERE e.space_id IN ({}) AND e.kind = 'idea' AND e.deleted_at IS NULL
                AND json_extract(e.data, '$.origin') = 'human'
                AND (e.status = 'new'
-                    OR (e.status = 'deferred' AND json_extract(e.data, '$.horizon') <= ?{}))
-             ORDER BY CASE json_extract(e.data, '$.priority')
+                    OR (e.status = 'deferred' AND json_extract(e.data, '$.horizon') <= ?{})
+                    OR (e.status = 'accepted' AND NOT EXISTS (
+                        SELECT 1 FROM entries t
+                        WHERE t.id = json_extract(e.data, '$.task_id')
+                          AND t.deleted_at IS NULL AND t.status IS NOT 'dropped')))
+             ORDER BY e.status = 'accepted',
+                      CASE json_extract(e.data, '$.priority')
                           WHEN 'high' THEN 2 WHEN 'low' THEN 0 ELSE 1 END DESC,
                       e.updated_at DESC, e.id DESC
              LIMIT {fetch}",
@@ -1329,7 +1501,16 @@ pub async fn proactive_ideas(
         let mut out = Vec::new();
         for e in rows {
             let e = e?;
-            if !seen.contains(&e.id) && idea_candidate(&e, today) {
+            if seen.contains(&e.id) {
+                continue;
+            }
+            let task = if e.status == Some(EntryStatus::Accepted) {
+                let d = IdeaData::from_stored(&e.data);
+                Some(task_state(c, &d)?.unwrap_or(TaskState::Deleted))
+            } else {
+                None
+            };
+            if idea_candidate(&e, task, today) {
                 out.push(e);
                 if out.len() == limit {
                     break;
@@ -1347,19 +1528,68 @@ mod tests {
 
     #[test]
     fn proposal_title_fits() {
-        assert_eq!(proposal_title("Кэш"), "Начать идею «Кэш»?");
-        let t = proposal_title(&"я".repeat(600));
+        assert_eq!(
+            proposal_title("Кэш", ProposalKind::Start),
+            "Начать идею «Кэш»?"
+        );
+        assert_eq!(
+            proposal_title("Кэш", ProposalKind::Reopen),
+            "Вернуть идею «Кэш»?"
+        );
+        let t = proposal_title(&"я".repeat(600), ProposalKind::Reopen);
         assert_eq!(t.chars().count(), TITLE_MAX_CHARS);
         assert!(t.ends_with("…»?"));
     }
 
     #[test]
     fn decision_options_match() {
-        for (k, _) in IDEA_OPTIONS {
-            let d = IdeaDecision::from_option(k).unwrap();
-            assert_eq!(d.option_key(), Some(k));
+        for kind in [ProposalKind::Start, ProposalKind::Reopen] {
+            for (k, _) in kind.options() {
+                assert_eq!(kind.decision(k).unwrap().as_str(), *k);
+                assert!(kind.keys_text().contains(k), "{kind:?}: {k}");
+            }
         }
-        assert_eq!(IdeaDecision::from_option("reopen"), None);
+        assert_eq!(ProposalKind::Start.decision("reopen"), None);
+        assert_eq!(ProposalKind::Reopen.decision("accept"), None);
+        assert_eq!(ProposalKind::Reopen.decision("defer"), None);
+        assert_eq!(ProposalKind::from_stored(None), ProposalKind::Start);
+        assert_eq!(
+            ProposalKind::from_stored(Some(&json!("reopen"))),
+            ProposalKind::Reopen
+        );
+    }
+
+    /// Предложение «вернуть» — `question_id` и `proposed_at` позже последнего решения.
+    #[test]
+    fn reopen_proposed_by_time() {
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
+        let mut d = IdeaData {
+            origin: IdeaOrigin::Human,
+            question_id: Some(Id::new()),
+            proposed_at: Some(at("2026-11-04T10:00:00Z")),
+            decided: Some(Decided {
+                decision: IdeaDecision::Accept,
+                by: AnswerBy::Human,
+                channel: Channel::Webui,
+                at: at("2026-11-04T11:00:00Z"),
+            }),
+            ..IdeaData::default()
+        };
+        // вопрос «начать», отвеченный решением, — не предложение «вернуть»
+        assert!(!d.reopen_proposed());
+        d.proposed_at = Some(at("2026-11-04T12:00:00Z"));
+        assert!(d.reopen_proposed());
+        d.question_id = None;
+        assert!(!d.reopen_proposed());
+    }
+
+    #[test]
+    fn released_only_dropped_or_deleted() {
+        assert!(task_released(None));
+        assert!(task_released(Some(TaskState::Dropped)));
+        assert!(task_released(Some(TaskState::Deleted)));
+        assert!(!task_released(Some(TaskState::Live)));
+        assert!(!task_released(Some(TaskState::Done)));
     }
 
     /// Ошибка хранилища внутри шага откатывает его записи до точки сохранения: внешняя

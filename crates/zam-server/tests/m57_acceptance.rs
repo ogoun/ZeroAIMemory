@@ -1731,3 +1731,138 @@ async fn acceptance_migration_from_m56_db() {
     ok(&r, StatusCode::OK, "accept");
     assert_eq!(r.json()["task"]["kind"], "task");
 }
+
+// ---------- задача 7 (§16, п. 8) ----------
+
+/// §16, п. 8: предложение вернуть идею со снятой задачей. Сценарий 1: задача снята → идея в
+/// дайджесте с пометкой → `propose` без `text` 422, с `text` (MCP) — вопрос «вернуть» → ответ
+/// человека `reopen` из чата → идея `new`, `prev_task_ids` со старой задачей, одно решение.
+/// Сценарий 2: задача удалена → ответ `decline` в WebUI → `declined`. Сценарий 3: задача
+/// переоткрыта при открытом вопросе → вопрос `obsolete`, идея `accepted` без `question_id`.
+#[tokio::test]
+async fn acceptance_reopen_proposal_flow() {
+    let a = world("reopen-flow", |_| {}).await;
+    // 1: reopen
+    let id = idea_web(&a, &sol(), "Кэш выжимок", json!({"priority": "high"})).await;
+    let task = accept_web(&a, &id).await;
+    let r = post_tok(&a, &id, "propose", json!({"text": "пора"})).await;
+    ok(&r, StatusCode::CONFLICT, "живая задача");
+    let r = patch_tok(
+        &a,
+        &task,
+        json!({"status": "dropped", "reason": "не до того"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK, "dropped");
+    let j = start(&a, "rf1").await;
+    let lines = section_lines(&j).unwrap_or_else(|| panic!("нет раздела: {j}"));
+    let line = format!(
+        "ZeroAIMemory: идея «Кэш выжимок» [high] — задача снята, можно предложить вернуть — {}",
+        w(&id)
+    );
+    assert!(lines.contains(&line), "{j}");
+    assert_eq!(idea_items(&j), [w(&id)], "{j}");
+    let r = post_tok(&a, &id, "propose", json!({})).await;
+    ok(&r, StatusCode::UNPROCESSABLE_ENTITY, "propose без text");
+    let (t, err) = mcp(
+        &a,
+        "rf1",
+        "memory_update_entry",
+        json!({"id": w(&id), "action": "propose", "text": "Кэш снова тормозит на сборке"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let qid = after(&t, &format!("Предложено вернуть w:{id} → вопрос q:"));
+    let q = get(&a, &qid).await;
+    assert_eq!(q["title"], "Вернуть идею «Кэш выжимок»?", "{q}");
+    assert_eq!(q["data"]["proposal"], "reopen", "{q}");
+    let e = get(&a, &id).await;
+    assert_eq!(e["status"], "accepted", "{e}");
+    assert_eq!(e["data"]["question_id"], qid.as_str(), "{e}");
+    let decisions = count(&a, DECISIONS).await;
+    let r = post_tok(
+        &a,
+        &qid,
+        "answer",
+        json!({"option": "accept", "by": "human"}),
+    )
+    .await;
+    ok(
+        &r,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "accept на вопросе «вернуть»",
+    );
+    let r = post_tok(
+        &a,
+        &qid,
+        "answer",
+        json!({"option": "reopen", "by": "agent"}),
+    )
+    .await;
+    problem(
+        &r,
+        StatusCode::FORBIDDEN,
+        "idea-human-decision",
+        "агент за человека",
+    );
+    let (t, err) = mcp(
+        &a,
+        "rf1",
+        "memory_update_entry",
+        json!({"id": format!("q:{qid}"), "action": "answer", "option": "reopen",
+               "by": "human", "channel": "chat"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let e = get(&a, &id).await;
+    assert_eq!(e["status"], "new", "{e}");
+    assert_eq!(e["data"]["prev_task_ids"], json!([task]), "{e}");
+    assert!(e["data"]["task_id"].is_null(), "{e}");
+    assert_eq!(get(&a, &qid).await["status"], "answered");
+    assert_eq!(count(&a, DECISIONS).await, decisions + 1);
+    // следующий «начать» — новая задача
+    let task2 = accept_web(&a, &id).await;
+    assert_ne!(task2, task);
+
+    // 2: задача удалена → decline в WebUI («Вопросы»)
+    let id2 = idea_web(&a, &sol(), "Голосовой ввод", json!({})).await;
+    let t2 = accept_web(&a, &id2).await;
+    let r = a.tok_rev(&a.token, Method::DELETE, &ent(&t2), None).await;
+    ok(&r, StatusCode::NO_CONTENT, "удаление задачи");
+    let j = start(&a, "rf2").await;
+    let line = format!(
+        "ZeroAIMemory: идея «Голосовой ввод» [normal] — задача удалена, можно предложить \
+         вернуть — {}",
+        w(&id2)
+    );
+    assert!(section_lines(&j).unwrap_or_default().contains(&line), "{j}");
+    let r = post_tok(&a, &id2, "propose", json!({"text": "снова просили"})).await;
+    ok(&r, StatusCode::OK, "propose удалённой задачи");
+    let q2 = id_of(&r.json()["question"]);
+    let r = post_web(&a, &q2, "answer", json!({"option": "decline"})).await;
+    ok(&r, StatusCode::OK, "decline в WebUI");
+    assert_eq!(get(&a, &id2).await["status"], "declined");
+
+    // 3: задача переоткрыта при открытом вопросе → вопрос obsolete
+    let id3 = idea_web(&a, &sol(), "Тёмная тема", json!({})).await;
+    let t3 = accept_web(&a, &id3).await;
+    let r = patch_tok(&a, &t3, json!({"status": "dropped", "reason": "позже"})).await;
+    ok(&r, StatusCode::OK, "dropped 3");
+    let r = post_tok(&a, &id3, "propose", json!({"text": "уже пора"})).await;
+    ok(&r, StatusCode::OK, "propose 3");
+    let q3 = id_of(&r.json()["question"]);
+    let r = patch_tok(&a, &t3, json!({"status": "open", "reason": "вернулись"})).await;
+    ok(&r, StatusCode::OK, "переоткрытие задачи");
+    assert_eq!(get(&a, &q3).await["status"], "obsolete");
+    let e = get(&a, &id3).await;
+    assert_eq!(e["status"], "accepted", "{e}");
+    assert!(e["data"]["question_id"].is_null(), "{e}");
+    let r = post_tok(
+        &a,
+        &q3,
+        "answer",
+        json!({"option": "reopen", "by": "human"}),
+    )
+    .await;
+    ok(&r, StatusCode::CONFLICT, "ответ на устаревший вопрос");
+}

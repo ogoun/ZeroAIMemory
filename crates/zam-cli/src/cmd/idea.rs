@@ -7,7 +7,9 @@
 //! - `new <заголовок> [--body T | --file F.md] [--priority …] [--horizon YYYY-MM-DD] [--tag X]…
 //!   [--origin human|agent] [--knowledge]` — новая идея (`<id>@<rev>`);
 //! - `propose <w:id> [--text T] [--space GUID]` — предложить человеку: вопрос-предложение
-//!   «начать / отложить / отказаться» (`Предложено w:<id> → вопрос q:<id>`);
+//!   «начать / отложить / отказаться» (`Предложено w:<id> → вопрос q:<id>`); у принятой идеи
+//!   со снятой или удалённой задачей — вопрос «вернуть / отказаться», `--text` обязателен
+//!   (`Предложено вернуть w:<id> → вопрос q:<id>`, M5.7 §16);
 //! - `accept|defer|decline <w:id> [--by human|agent] [--channel chat|cli]` — решение человека:
 //!   `accept [--space GUID]` создаёт задачу (повтор — код 4 с той же задачей), `defer [--until
 //!   YYYY-MM-DD]` — отсрочка, `decline [--reason T]` — отказ.
@@ -232,9 +234,15 @@ pub fn propose(
     if ctx.json {
         return emit_json(&v);
     }
+    // вопрос «вернуть» идею со снятой задачей (§16)
+    let what = if v["question"]["data"]["proposal"] == "reopen" {
+        "Предложено вернуть"
+    } else {
+        "Предложено"
+    };
     emit(
         format!(
-            "Предложено w:{id} → вопрос q:{}\n",
+            "{what} w:{id} → вопрос q:{}\n",
             v["question"]["id"].as_str().unwrap_or("?")
         )
         .as_bytes(),

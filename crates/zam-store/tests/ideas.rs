@@ -15,11 +15,12 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
     AnswerBy, Answered, Attribution, AuthorKind, Channel, DataDir, Db, EdgeType, Entry,
     EntryFilter, EntryKind, EntryPatch, EntryStatus, GraphStore, IDEA_LINKS_MAX, IDEA_OPTIONS,
-    IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewAnswer, NewDecision, NewEdge,
-    NewEntry, QuestionData, QuestionError, SpaceKind, StoreError, TaskData, TaskState, UserDbs,
-    adopt_idea, answer_question, check_idea, check_idea_transition, create_entry, create_solution,
-    decide_idea, delete_entry, get_entry, idea_candidate, list_entries, list_spaces,
-    proactive_ideas, propose_idea, restore_entry, update_entry,
+    IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewAnswer,
+    NewDecision, NewEdge, NewEntry, ProposalKind, QuestionData, QuestionError, SpaceKind,
+    StoreError, TaskData, TaskState, UserDbs, adopt_idea, answer_question, check_idea,
+    check_idea_transition, create_entry, create_solution, decide_idea, delete_entry, get_entry,
+    idea_candidate, idea_task_state, list_entries, list_spaces, proactive_ideas, propose_idea,
+    restore_entry, update_entry,
 };
 
 // ---------- окружение ----------
@@ -255,8 +256,15 @@ fn idea_data_rules() {
     ] {
         assert_eq!(IdeaDecision::parse(d.as_str()), Some(d));
     }
-    assert_eq!(IdeaDecision::Reopen.option_key(), None);
-    assert_eq!(IdeaDecision::Defer.option_key(), Some("defer"));
+    assert_eq!(ProposalKind::Start.decision("reopen"), None);
+    assert_eq!(
+        ProposalKind::Start.decision("defer"),
+        Some(IdeaDecision::Defer)
+    );
+    assert_eq!(
+        ProposalKind::Reopen.decision("reopen"),
+        Some(IdeaDecision::Reopen)
+    );
 }
 
 #[tokio::test]
@@ -840,7 +848,10 @@ async fn answer_proposal_requires_option() {
         &agent(),
     )
     .await;
-    assert!(matches!(r, Err(QuestionError::OptionRequired)), "{r:?}");
+    assert!(
+        matches!(r, Err(QuestionError::OptionRequired(ProposalKind::Start))),
+        "{r:?}"
+    );
     let r = answer_question(
         &db,
         q.id,
@@ -1423,10 +1434,16 @@ async fn proactive_ideas_selection() {
     ] {
         let e = get_entry(&db, id).await.unwrap();
         let expected = ids.contains(&id) || id == other_space.id;
-        assert_eq!(idea_candidate(&e, today()), expected, "{}", e.title);
+        assert_eq!(
+            idea_candidate(&e, idea_task_state(&db, &e).await.unwrap(), today()),
+            expected,
+            "{}",
+            e.title
+        );
     }
     assert!(idea_candidate(
         &get_entry(&db, future.id).await.unwrap(),
+        None,
         today() + days(1)
     ));
     assert!(
@@ -1844,5 +1861,491 @@ async fn restore_idea_and_question_any_order() {
             "idea_first={idea_first}"
         );
         assert!(idea.deleted_at.is_none() && q.deleted_at.is_none());
+    }
+}
+
+// ---------- задача 7: предложение вернуть идею со снятой задачей (§16) ----------
+
+/// Идея человека, принятая «начать»: `(идея, задача)`.
+async fn accepted_idea(db: &Db, sol: Id, title: &str) -> (Entry, Entry) {
+    let i = new_idea(db, sol, title, "human", "high").await;
+    let d = decide_idea(db, i.id, nd(IdeaDecision::Accept), &human())
+        .await
+        .unwrap();
+    (d.idea, d.task.unwrap())
+}
+
+async fn set_task_status(db: &Db, task: Id, status: EntryStatus) {
+    update_entry(
+        db,
+        task,
+        None,
+        EntryPatch {
+            status: Some(status),
+            reason: Some("по ходу работы".into()),
+            ..EntryPatch::default()
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+}
+
+/// Идея `accepted` со снятой задачей и вопросом «вернуть»: `(идея, задача, вопрос)`.
+async fn reopen_proposed(db: &Db, sol: Id, title: &str) -> (Entry, Entry, Entry) {
+    let (i, t) = accepted_idea(db, sol, title).await;
+    set_task_status(db, t.id, EntryStatus::Dropped).await;
+    let (idea, q) = propose_idea(
+        db,
+        i.id,
+        Some("Задачу сняли, но кэш снова тормозит".into()),
+        None,
+        None,
+        &agent(),
+    )
+    .await
+    .unwrap();
+    (idea, t, q)
+}
+
+/// Кандидат §6 сейчас: предикат с состоянием задачи из базы.
+async fn candidate_now(db: &Db, id: Id) -> bool {
+    let e = get_entry(db, id).await.unwrap();
+    let task = idea_task_state(db, &e).await.unwrap();
+    idea_candidate(&e, task, today())
+}
+
+/// Причина последней ревизии записи.
+async fn last_reason(db: &Db, id: Id) -> Option<String> {
+    db.read(move |c| {
+        Ok(c.query_row(
+            "SELECT reason FROM entry_revisions WHERE entry_id = ?1 ORDER BY rev DESC LIMIT 1",
+            [id],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+    .unwrap()
+}
+
+/// §16, п. 1: `accepted` — кандидат, только если задача снята или удалена и нет открытого
+/// вопроса «вернуть»; в отборе — после `new`/`deferred`, под общим пределом.
+#[tokio::test]
+async fn reopen_candidate_only_released_task() {
+    let (db, sol, _) = setup("reopen-candidate").await;
+    let (live, _) = accepted_idea(&db, sol, "Живая задача").await;
+    let (dropped, td) = accepted_idea(&db, sol, "Снятая задача").await;
+    set_task_status(&db, td.id, EntryStatus::Dropped).await;
+    let (deleted, tx) = accepted_idea(&db, sol, "Удалённая задача").await;
+    delete_entry(&db, tx.id, None, &agent()).await.unwrap();
+    let (done, tdone) = accepted_idea(&db, sol, "Сделанная задача").await;
+    set_task_status(&db, tdone.id, EntryStatus::Done).await;
+    let fresh = new_idea(&db, sol, "Новая", "human", "low").await;
+    assert!(!candidate_now(&db, live.id).await);
+    assert!(candidate_now(&db, dropped.id).await);
+    assert!(candidate_now(&db, deleted.id).await);
+    assert!(!candidate_now(&db, done.id).await);
+    let state = |id: Id| {
+        let db = db.clone();
+        async move {
+            idea_task_state(&db, &get_entry(&db, id).await.unwrap())
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(state(dropped.id).await, Some(TaskState::Dropped));
+    assert_eq!(state(deleted.id).await, Some(TaskState::Deleted));
+    assert_eq!(state(live.id).await, Some(TaskState::Live));
+    assert_eq!(state(fresh.id).await, None);
+    // отбор: сначала new/deferred (даже low), затем снятые; живая и сделанная — нет
+    let got = proactive_ideas(&db, &[sol], today(), &HashSet::new(), 10)
+        .await
+        .unwrap();
+    let ids: Vec<Id> = got.iter().map(|e| e.id).collect();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert_eq!(ids[0], fresh.id, "{ids:?}");
+    assert!(ids.contains(&dropped.id) && ids.contains(&deleted.id));
+    let one = proactive_ideas(&db, &[sol], today(), &HashSet::new(), 1)
+        .await
+        .unwrap();
+    assert_eq!(one.iter().map(|e| e.id).collect::<Vec<_>>(), [fresh.id]);
+    // открытый вопрос «вернуть» — уже не кандидат
+    propose_idea(&db, dropped.id, Some("пора".into()), None, None, &agent())
+        .await
+        .unwrap();
+    assert!(!candidate_now(&db, dropped.id).await);
+    let ids: Vec<Id> = proactive_ideas(&db, &[sol], today(), &HashSet::new(), 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.id)
+        .collect();
+    assert!(!ids.contains(&dropped.id), "{ids:?}");
+    // предикат: «от агента», живая и сделанная задача — никогда
+    let e = get_entry(&db, deleted.id).await.unwrap();
+    let mut forged = e.clone();
+    forged.data["origin"] = json!("agent");
+    assert!(!idea_candidate(&forged, Some(TaskState::Deleted), today()));
+    assert!(!idea_candidate(&e, Some(TaskState::Live), today()));
+    assert!(!idea_candidate(&e, Some(TaskState::Done), today()));
+    assert!(idea_candidate(&e, Some(TaskState::Dropped), today()));
+}
+
+/// §16, п. 2: `propose` по снятой задаче без `text` — ошибка без записи; живая задача — 409.
+#[tokio::test]
+async fn propose_reopen_requires_text() {
+    let (db, sol, _) = setup("reopen-text").await;
+    let (i, t) = accepted_idea(&db, sol, "Идея").await;
+    let r = propose_idea(&db, i.id, Some("пора".into()), None, None, &agent()).await;
+    assert!(
+        matches!(
+            r,
+            Err(IdeaError::Transition {
+                from: EntryStatus::Accepted,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    set_task_status(&db, t.id, EntryStatus::Dropped).await;
+    let before = get_entry(&db, i.id).await.unwrap();
+    for text in [None, Some("   ".to_string())] {
+        let r = propose_idea(&db, i.id, text, None, None, &agent()).await;
+        assert!(matches!(r, Err(IdeaError::ReopenTextRequired)), "{r:?}");
+    }
+    assert_eq!(snap(&get_entry(&db, i.id).await.unwrap()), snap(&before));
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM entries WHERE kind = 'question'").await,
+        0
+    );
+}
+
+/// §16, п. 2: вопрос «вернуть» — заголовок, `data.proposal`, варианты сервера, без
+/// `task_space`; идея остаётся `accepted` с `question_id`; повтор — тот же вопрос.
+#[tokio::test]
+async fn propose_reopen_keeps_accepted() {
+    let (db, sol, _) = setup("reopen-propose").await;
+    let (idea, t, q) = reopen_proposed(&db, sol, "Кэш выжимок").await;
+    assert_eq!(idea.status, Some(EntryStatus::Accepted));
+    let d = data_of(&idea);
+    assert_eq!(d.question_id, Some(q.id));
+    assert_eq!(d.task_id, Some(t.id));
+    assert!(d.proposed_at.is_some());
+    assert_eq!(q.title, "Вернуть идею «Кэш выжимок»?");
+    assert_eq!(q.status, Some(EntryStatus::Open));
+    assert!(q.body.contains("кэш снова тормозит"), "{}", q.body);
+    assert!(q.body.contains(&format!("w:{}", idea.id)), "{}", q.body);
+    let qd = QuestionData::from_stored(&q.data);
+    assert_eq!(qd.proposal, ProposalKind::Reopen);
+    assert_eq!(qd.idea, Some(idea.id));
+    assert_eq!(qd.task_space, None);
+    let opts: Vec<(&str, &str)> = qd
+        .options
+        .iter()
+        .map(|o| (o.key.as_str(), o.text.as_str()))
+        .collect();
+    assert_eq!(opts, IDEA_REOPEN_OPTIONS);
+    assert_eq!(q.data["proposal"], "reopen");
+    // повтор — тот же вопрос без ревизии (и без text)
+    let (again, q2) = propose_idea(&db, idea.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    assert_eq!((q2.id, again.rev), (q.id, idea.rev));
+    // клиент поле proposal не задаёт
+    let mut fake = idea_entry(sol, "Вопрос", json!({"proposal": "reopen"}));
+    fake.kind = EntryKind::Question;
+    let r = create_entry(&db, fake, &agent()).await;
+    assert!(
+        matches!(&r, Err(StoreError::BadInput(m)) if m.contains("поле ведёт сервер")),
+        "{r:?}"
+    );
+    // у вопроса «начать» поля proposal нет
+    let s = new_idea(&db, sol, "Другая", "human", "normal").await;
+    let (_, qs) = propose_idea(&db, s.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    assert!(qs.data.get("proposal").is_none(), "{}", qs.data);
+    assert_eq!(
+        QuestionData::from_stored(&qs.data).proposal,
+        ProposalKind::Start
+    );
+}
+
+/// §16, п. 3: ответ `reopen` — идея `new`, задача в `prev_task_ids`, одно решение; причина —
+/// текст ответа или «по предложению агента: …»; `by: agent` — отказ.
+#[tokio::test]
+async fn answer_reopen_moves_task_to_prev() {
+    let (db, sol, _) = setup("reopen-answer").await;
+    let (idea, t, q) = reopen_proposed(&db, sol, "Идея").await;
+    let before = count(&db, DECISIONS).await;
+    let r = answer_question(
+        &db,
+        q.id,
+        answer(Some("reopen"), None, AnswerBy::Human),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.question.status, Some(EntryStatus::Answered));
+    let i = r.idea.unwrap();
+    assert_eq!(i.status, Some(EntryStatus::New));
+    let d = data_of(&i);
+    assert_eq!((d.task_id, d.prev_task_ids.clone()), (None, vec![t.id]));
+    assert_eq!(d.decided.unwrap().decision, IdeaDecision::Reopen);
+    assert!(r.task.is_none());
+    assert_eq!(count(&db, DECISIONS).await, before + 1);
+    let reason = last_reason(&db, idea.id).await.unwrap();
+    assert_eq!(
+        reason,
+        "по предложению агента: Задачу сняли, но кэш снова тормозит"
+    );
+    let (i2, _, q2) = reopen_proposed(&db, sol, "Вторая").await;
+    answer_question(
+        &db,
+        q2.id,
+        answer(Some("reopen"), Some("да, вернём"), AnswerBy::Human),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(last_reason(&db, i2.id).await.as_deref(), Some("да, вернём"));
+    let (_, _, q3) = reopen_proposed(&db, sol, "Третья").await;
+    let r = answer_question(
+        &db,
+        q3.id,
+        answer(Some("reopen"), None, AnswerBy::Agent),
+        &agent(),
+    )
+    .await;
+    assert!(matches!(r, Err(QuestionError::ByAgentOnProposal)), "{r:?}");
+}
+
+/// §16, п. 3: ответ `decline` — идея `declined`.
+#[tokio::test]
+async fn answer_reopen_decline() {
+    let (db, sol, _) = setup("reopen-decline").await;
+    let (_, t, q) = reopen_proposed(&db, sol, "Идея").await;
+    let r = answer_question(
+        &db,
+        q.id,
+        answer(Some("decline"), Some("не нужно"), AnswerBy::Human),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let i = r.idea.unwrap();
+    assert_eq!(i.status, Some(EntryStatus::Declined));
+    assert_eq!(data_of(&i).task_id, Some(t.id));
+    assert_eq!(r.question.status, Some(EntryStatus::Answered));
+}
+
+/// §16, п. 3: на вопросе «вернуть» `accept`/`defer` и `horizon` — ошибка без записи, без
+/// варианта — `option-required` с вариантами «вернуть»; и наоборот у вопроса «начать».
+#[tokio::test]
+async fn start_options_rejected_on_reopen_question() {
+    let (db, sol, _) = setup("reopen-options").await;
+    let (idea, _, q) = reopen_proposed(&db, sol, "Идея").await;
+    for key in ["accept", "defer"] {
+        let r = answer_question(
+            &db,
+            q.id,
+            answer(Some(key), None, AnswerBy::Human),
+            &agent(),
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(QuestionError::UnknownOption(k)) if k == key),
+            "{r:?}"
+        );
+    }
+    let r = answer_question(
+        &db,
+        q.id,
+        answer(None, Some("да"), AnswerBy::Human),
+        &agent(),
+    )
+    .await;
+    assert!(
+        matches!(&r, Err(e @ QuestionError::OptionRequired(ProposalKind::Reopen))
+            if e.to_string().contains("reopen")),
+        "{r:?}"
+    );
+    let mut a = answer(Some("reopen"), None, AnswerBy::Human);
+    a.horizon = Some(today() + days(3));
+    let r = answer_question(&db, q.id, a, &agent()).await;
+    assert!(matches!(r, Err(QuestionError::HorizonNotAllowed)), "{r:?}");
+    assert_eq!(snap(&get_entry(&db, idea.id).await.unwrap()), snap(&idea));
+    assert_eq!(
+        get_entry(&db, q.id).await.unwrap().status,
+        Some(EntryStatus::Open)
+    );
+    // и наоборот: reopen на вопросе «начать»
+    let s = new_idea(&db, sol, "Новая", "human", "normal").await;
+    let (_, qs) = propose_idea(&db, s.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    let r = answer_question(
+        &db,
+        qs.id,
+        answer(Some("reopen"), None, AnswerBy::Human),
+        &agent(),
+    )
+    .await;
+    assert!(
+        matches!(&r, Err(QuestionError::UnknownOption(k)) if k == "reopen"),
+        "{r:?}"
+    );
+    let r = answer_question(
+        &db,
+        qs.id,
+        answer(None, Some("да"), AnswerBy::Human),
+        &agent(),
+    )
+    .await;
+    assert!(
+        matches!(&r, Err(e @ QuestionError::OptionRequired(ProposalKind::Start))
+            if e.to_string().contains("accept")),
+        "{r:?}"
+    );
+}
+
+/// §16, п. 4: задача снова живая (переоткрыта из `dropped`, восстановлена из корзины) —
+/// вопрос «вернуть» `obsolete` с причиной «задача возобновлена», `question_id` снимается.
+#[tokio::test]
+async fn reopen_question_obsolete_when_task_revived() {
+    let (db, sol, _) = setup("reopen-revived").await;
+    let (i, t, q) = reopen_proposed(&db, sol, "Переоткрытая").await;
+    set_task_status(&db, t.id, EntryStatus::Open).await;
+    let q = get_entry(&db, q.id).await.unwrap();
+    assert_eq!(q.status, Some(EntryStatus::Obsolete));
+    assert_eq!(
+        last_reason(&db, q.id).await.as_deref(),
+        Some("задача возобновлена")
+    );
+    let idea = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(idea.status, Some(EntryStatus::Accepted));
+    assert_eq!(data_of(&idea).question_id, None);
+    assert!(!candidate_now(&db, i.id).await);
+    // задача удалена и восстановлена из корзины
+    let (i2, t2) = accepted_idea(&db, sol, "Восстановленная").await;
+    delete_entry(&db, t2.id, None, &agent()).await.unwrap();
+    let (_, q2) = propose_idea(&db, i2.id, Some("пора".into()), None, None, &agent())
+        .await
+        .unwrap();
+    restore_entry(&db, t2.id, None, &human()).await.unwrap();
+    assert_eq!(
+        get_entry(&db, q2.id).await.unwrap().status,
+        Some(EntryStatus::Obsolete)
+    );
+    assert_eq!(
+        data_of(&get_entry(&db, i2.id).await.unwrap()).question_id,
+        None
+    );
+    // восстановлена снятой — вопрос остаётся
+    let (i4, t4, q4) = reopen_proposed(&db, sol, "Снятая в корзине").await;
+    delete_entry(&db, t4.id, None, &agent()).await.unwrap();
+    restore_entry(&db, t4.id, None, &human()).await.unwrap();
+    assert_eq!(
+        get_entry(&db, q4.id).await.unwrap().status,
+        Some(EntryStatus::Open)
+    );
+    assert_eq!(
+        data_of(&get_entry(&db, i4.id).await.unwrap()).question_id,
+        Some(q4.id)
+    );
+    // переоткрытая задача доведена до done — идея done, как прежде (§5.5)
+    set_task_status(&db, t.id, EntryStatus::Done).await;
+    assert_eq!(
+        get_entry(&db, i.id).await.unwrap().status,
+        Some(EntryStatus::Done)
+    );
+}
+
+/// §16, п. 4: вопрос «вернуть» удалён или устарел — `question_id` снимается, статус прежний
+/// (идея снова кандидат); восстановленный вопрос устаревает; удалённая и восстановленная
+/// идея — без `question_id`; удаление отвеченного вопроса «начать» идею не трогает.
+#[tokio::test]
+async fn reopen_question_deleted_clears_question_id() {
+    let (db, sol, _) = setup("reopen-deleted").await;
+    let (i, _, q) = reopen_proposed(&db, sol, "Удалённый вопрос").await;
+    delete_entry(&db, q.id, None, &human()).await.unwrap();
+    let idea = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(idea.status, Some(EntryStatus::Accepted));
+    assert_eq!(data_of(&idea).question_id, None);
+    assert!(candidate_now(&db, i.id).await);
+    let back = restore_entry(&db, q.id, None, &human()).await.unwrap();
+    assert_eq!(back.status, Some(EntryStatus::Obsolete));
+    assert_eq!(snap(&get_entry(&db, i.id).await.unwrap()), snap(&idea));
+    // устарел правкой
+    let (j, _, qj) = reopen_proposed(&db, sol, "Устаревший вопрос").await;
+    update_entry(
+        &db,
+        qj.id,
+        None,
+        EntryPatch {
+            status: Some(EntryStatus::Obsolete),
+            reason: Some("неактуально".into()),
+            ..EntryPatch::default()
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let jd = get_entry(&db, j.id).await.unwrap();
+    assert_eq!(jd.status, Some(EntryStatus::Accepted));
+    assert_eq!(data_of(&jd).question_id, None);
+    assert!(candidate_now(&db, j.id).await);
+    // идея удалена — вопрос устарел; восстановлена — снова кандидат без question_id
+    let (k, _, qk) = reopen_proposed(&db, sol, "Удалённая идея").await;
+    delete_entry(&db, k.id, None, &human()).await.unwrap();
+    assert_eq!(
+        get_entry(&db, qk.id).await.unwrap().status,
+        Some(EntryStatus::Obsolete)
+    );
+    restore_entry(&db, k.id, None, &human()).await.unwrap();
+    let kd = get_entry(&db, k.id).await.unwrap();
+    assert_eq!(kd.status, Some(EntryStatus::Accepted));
+    assert_eq!(data_of(&kd).question_id, None);
+    assert!(candidate_now(&db, k.id).await);
+    // удаление отвеченного вопроса «начать» не трогает принятую идею
+    let s = new_idea(&db, sol, "Начатая по вопросу", "human", "normal").await;
+    let (_, qs) = propose_idea(&db, s.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    answer_question(
+        &db,
+        qs.id,
+        answer(Some("accept"), None, AnswerBy::Human),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let sd = get_entry(&db, s.id).await.unwrap();
+    delete_entry(&db, qs.id, None, &human()).await.unwrap();
+    assert_eq!(snap(&get_entry(&db, s.id).await.unwrap()), snap(&sd));
+}
+
+/// §16, п. 4: `decide reopen|decline` из WebUI при открытом вопросе «вернуть» отвечает его
+/// (одно решение `decision`).
+#[tokio::test]
+async fn decide_from_webui_answers_open_reopen_question() {
+    let (db, sol, _) = setup("reopen-decide").await;
+    for (decision, to) in [
+        (IdeaDecision::Reopen, EntryStatus::New),
+        (IdeaDecision::Decline, EntryStatus::Declined),
+    ] {
+        let (i, _, _) = reopen_proposed(&db, sol, decision.as_str()).await;
+        let before = count(&db, DECISIONS).await;
+        let mut d = nd(decision);
+        d.reason = Some("решил в WebUI".into());
+        let r = decide_idea(&db, i.id, d, &human()).await.unwrap();
+        assert_eq!(r.idea.status, Some(to));
+        let q = r.question.expect("вопрос отвечен");
+        assert_eq!(q.status, Some(EntryStatus::Answered));
+        assert_eq!(
+            QuestionData::from_stored(&q.data).answer.unwrap().option,
+            Some(decision.as_str().to_string())
+        );
+        assert_eq!(count(&db, DECISIONS).await, before + 1);
     }
 }

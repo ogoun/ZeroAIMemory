@@ -963,3 +963,103 @@ async fn measure_knowledge_idea_cosine_bge_m3() {
         eprintln!("ZAM_COSINE «{p}»: {}", row.join("; "));
     }
 }
+
+// ---- задача 7: идея со снятой задачей (§16) ----
+
+/// Принятая «начать» идея решения: `(идея, задача)`.
+async fn accepted(a: &Api, title: &str, extra: Value) -> (String, String) {
+    let id = idea(a, &sol(), title, extra).await;
+    let r = post(
+        a,
+        &id,
+        "decide",
+        json!({"decision": "accept", "by": "human"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let task = r.json()["task"]["id"].as_str().unwrap().to_string();
+    (id, task)
+}
+
+/// Снять задачу (`dropped`) токеном.
+async fn drop_task(a: &Api, task: &str) {
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{task}"),
+            Some(json!({"status": "dropped", "reason": "не до того"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// §16, п. 1: в дайджесте идея со снятой (удалённой) задачей — после `new`, с пометкой; живая
+/// задача — нет; раздел один раз за сессию; с открытым вопросом «вернуть» — нет.
+#[tokio::test]
+async fn digest_reopen_mark_once_per_session() {
+    let a = server("reopen-digest", |_| {}).await;
+    let (dropped, t1) = accepted(&a, "Снятая идея", json!({"priority": "high"})).await;
+    drop_task(&a, &t1).await;
+    let (deleted, t2) = accepted(&a, "Удалённая идея", json!({"priority": "normal"})).await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::DELETE,
+            &format!("/api/v1/entries/{t2}"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let (live, _) = accepted(&a, "Живая идея", json!({"priority": "high"})).await;
+    let fresh = idea(&a, &sol(), "Новая идея", json!({"priority": "low"})).await;
+    let j = start(&a, "s1").await;
+    let lines = section_lines(&j).unwrap_or_else(|| panic!("нет раздела: {j}"));
+    assert_eq!(
+        lines,
+        [
+            HINT.to_string(),
+            format!("ZeroAIMemory: идея «Новая идея» [low] — w:{fresh}"),
+            format!(
+                "ZeroAIMemory: идея «Снятая идея» [high] — задача снята, можно предложить \
+                 вернуть — w:{dropped}"
+            ),
+            format!(
+                "ZeroAIMemory: идея «Удалённая идея» [normal] — задача удалена, можно \
+                 предложить вернуть — w:{deleted}"
+            ),
+        ],
+        "{j}"
+    );
+    assert!(!text(&j).contains(&live), "{j}");
+    // повторный старт той же сессии — без раздела
+    let j = start(&a, "s1").await;
+    assert!(section_lines(&j).is_none(), "{j}");
+    // открытый вопрос «вернуть» — в новой сессии идеи нет
+    let r = post(&a, &dropped, "propose", json!({"text": "кэш снова нужен"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = start(&a, "s2").await;
+    assert!(!text(&j).contains(&dropped), "{j}");
+    assert!(text(&j).contains(&deleted), "{j}");
+}
+
+/// §16, п. 1: подсказка к `prompt` по идее со снятой задачей — с пометкой и указанием
+/// «предложи вернуть», один раз за сессию; живая задача — тишина.
+#[tokio::test]
+async fn prompt_reopen_hint_mark() {
+    let a = server("reopen-prompt", |_| {}).await;
+    let (id, task) = accepted(&a, "Экспорт отчётов в PDF", json!({})).await;
+    let j = prompt(&a, "s0", "как сделать экспорт отчётов в PDF").await;
+    assert!(idea_items(&j).is_empty(), "живая задача: {j}");
+    drop_task(&a, &task).await;
+    let j = prompt(&a, "s1", "как сделать экспорт отчётов в PDF").await;
+    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
+    let line = format!(
+        "ZeroAIMemory: к задаче подходит идея «Экспорт отчётов в PDF» — задача снята, можно \
+         предложить вернуть — w:{id} (предложи: action=propose с text — почему пора; решает \
+         человек)"
+    );
+    assert!(text(&j).lines().any(|l| l == line), "{j}");
+    let j = prompt(&a, "s1", "экспорт отчётов в PDF").await;
+    assert!(idea_items(&j).is_empty(), "{j}");
+}
