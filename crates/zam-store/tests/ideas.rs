@@ -2475,13 +2475,8 @@ async fn propose_with_open_reopen_question_but_live_task() {
     .unwrap();
     let r = propose_idea(&db, i.id, Some("снова".into()), None, None, &agent()).await;
     assert!(
-        matches!(
-            r,
-            Err(IdeaError::Transition {
-                from: EntryStatus::Accepted,
-                ..
-            })
-        ),
+        matches!(&r, Err(e @ IdeaError::TaskRevived { question })
+            if *question == q.id && e.to_string().contains("предлагать вернуть нечего")),
         "{r:?}"
     );
     let q = get_entry(&db, q.id).await.unwrap();
@@ -2522,4 +2517,54 @@ async fn fts_entry_ids_filter() {
     assert!(all.contains(&a.id) && all.contains(&b.id), "{all:?}");
     let only = found(search_fts_channels(&db, q(vec![b.id])).await.unwrap());
     assert_eq!(only, [b.id].into_iter().collect::<HashSet<_>>());
+}
+
+/// Финальное ревью M5.7, Minor 1: идея в корзине не видит смену статуса задачи — при
+/// восстановлении `accepted` при задаче `done` становится `done`, `done` при открытой задаче —
+/// `accepted`.
+#[tokio::test]
+async fn restored_idea_reconciles_with_task_status() {
+    let (db, sol, _) = setup("restore-reconcile").await;
+    let (i, t) = accepted_idea(&db, sol, "Сделали, пока идея в корзине").await;
+    delete_entry(&db, i.id, None, &human()).await.unwrap();
+    set_task_status(&db, t.id, EntryStatus::Done).await;
+    restore_entry(&db, i.id, None, &human()).await.unwrap();
+    let e = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(e.status, Some(EntryStatus::Done));
+    assert!(data_of(&e).done_at.is_some());
+    // и наоборот: done → задача переоткрыта, пока идея в корзине → accepted
+    delete_entry(&db, i.id, None, &human()).await.unwrap();
+    set_task_status(&db, t.id, EntryStatus::Open).await;
+    restore_entry(&db, i.id, None, &human()).await.unwrap();
+    let e = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(e.status, Some(EntryStatus::Accepted));
+    assert!(data_of(&e).done_at.is_none());
+    // согласованная идея восстанавливается без новой ревизии
+    delete_entry(&db, i.id, None, &human()).await.unwrap();
+    let before = get_entry(&db, i.id).await.unwrap().rev;
+    restore_entry(&db, i.id, None, &human()).await.unwrap();
+    assert_eq!(get_entry(&db, i.id).await.unwrap().rev, before);
+}
+
+/// Финальное ревью M5.7, Minor 5: дешёвая проверка кандидатов первого прохода подсказки.
+#[tokio::test]
+async fn any_new_idea_check() {
+    let (db, sol, kn) = setup("any-new-idea").await;
+    assert!(
+        !zam_store::any_new_idea(&db, &[sol, kn], today())
+            .await
+            .unwrap()
+    );
+    let a = new_idea(&db, sol, "От агента", "agent", "normal").await;
+    let _ = a;
+    accepted_idea(&db, sol, "Принятая").await;
+    assert!(!zam_store::any_new_idea(&db, &[sol], today()).await.unwrap());
+    new_idea(&db, kn, "Общая", "human", "normal").await;
+    assert!(!zam_store::any_new_idea(&db, &[sol], today()).await.unwrap());
+    assert!(
+        zam_store::any_new_idea(&db, &[sol, kn], today())
+            .await
+            .unwrap()
+    );
+    assert!(!zam_store::any_new_idea(&db, &[], today()).await.unwrap());
 }

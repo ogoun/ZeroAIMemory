@@ -1126,3 +1126,70 @@ async fn prompt_second_pass_timeout_keeps_first() {
     let j = prompt(&a, "s1", "экспорт отчётов в PDF").await;
     assert_eq!(idea_items(&j), [format!("w:{fresh}")], "{j}");
 }
+
+/// Финальное ревью M5.7, I-1 (ML: MiniLM + Qdrant): балл отдельного поиска только по идеям
+/// нормирован, и ближайшая по вектору идея получала 1,0 на любой запрос. Идея решения теперь
+/// требует лексического подтверждения: посторонний запрос — идей нет, связанный — есть.
+#[tokio::test]
+async fn prompt_solution_idea_needs_lexical_match() {
+    if !have(MINILM) {
+        return;
+    }
+    let q = TestQdrant::start("ideas-lexical");
+    let a = server("lexical", |c| {
+        ml(c, MINILM);
+        external(c, &q);
+    })
+    .await;
+    vector_ready(&a).await;
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let id = idea(&a, &sol(), "Экспорт отчётов в PDF", json!({})).await;
+    let eid: Id = id.parse().unwrap();
+    a.st.index.worker.notify();
+    until(
+        "идея проиндексирована",
+        INDEXED,
+        async || {
+            zam_store::get_entry(&db, eid).await.unwrap().index_state
+                == zam_store::IndexState::Indexed
+        },
+    )
+    .await;
+    let j = prompt(&a, "s1", "настрой логирование сервера").await;
+    assert!(idea_items(&j).is_empty(), "посторонний запрос: {j}");
+    let j = prompt(&a, "s2", "как сделать экспорт отчётов в PDF").await;
+    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
+}
+
+/// Финальное ревью M5.7, Minor 3: токену `ro` идей не предлагают — ни раздела `### Идеи`, ни
+/// подсказки к `prompt` (его `propose` получил бы 403).
+#[tokio::test]
+async fn ro_token_gets_no_ideas() {
+    let a = server("ro-token", |_| {}).await;
+    let id = idea(&a, &sol(), "Экспорт отчётов в PDF", json!({})).await;
+    let (_, ro) =
+        a.st.system
+            .issue_token(a.st.admin_id, "ro", zam_store::Access::Ro)
+            .await
+            .unwrap();
+    let start_ro = ok_as(
+        &a,
+        &ro,
+        Some("ro-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    assert!(section_lines(&start_ro).is_none(), "{start_ro}");
+    assert!(!text(&start_ro).contains(&id), "{start_ro}");
+    let pr = ok_as(
+        &a,
+        &ro,
+        Some("ro-2"),
+        json!({"event": "prompt", "solution": G, "prompt": "экспорт отчётов в PDF"}),
+    )
+    .await;
+    assert!(idea_items(&pr).is_empty(), "{pr}");
+    // тот же запрос токеном rw — идея есть
+    let j = prompt(&a, "rw-1", "экспорт отчётов в PDF").await;
+    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
+}

@@ -123,7 +123,7 @@ pub async fn answer(
         sc.entry.id,
         NewAnswer {
             text: req.text,
-            option: req.option,
+            option: req.option.clone(),
             by,
             channel,
             horizon,
@@ -153,6 +153,29 @@ pub async fn answer(
         details,
     )
     .await?;
+    // решение по идее через вопрос-предложение — тот же аудит, что у прямого `decide`
+    // (финальное ревью M5.7, Minor 4)
+    if let Some(i) = &idea {
+        let mut extra = audit_details(i.space_id, EntryKind::Idea);
+        extra["decision"] = json!(req.option.as_deref().map(str::trim));
+        extra["by"] = json!(by.as_str());
+        extra["channel"] = json!(channel.as_str());
+        extra["question"] = json!(q.id);
+        if let Some(t) = &task {
+            extra["task"] = json!(t.id);
+        }
+        audit_node(
+            &st,
+            &p,
+            &client,
+            sc.user.id,
+            sc.owner,
+            "entry.idea.decide",
+            i.id,
+            extra,
+        )
+        .await?;
+    }
     let mut decision = json!(d);
     super::secrets::attach_entry(&mut decision, &d);
     let mut entry = json!(q);

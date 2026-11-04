@@ -630,6 +630,10 @@ pub enum IdeaError {
     /// Вопрос — не действующее предложение идеи (у неё другой `question_id`): 409.
     #[error("предложение устарело: у идеи другой вопрос-предложение или его нет")]
     StaleProposal,
+    /// Задача идеи снова живая, а вопрос «вернуть» был открыт: вопрос устарел («задача
+    /// возобновлена», запись зафиксирована), предлагать нечего — 409 (финальное ревью M5.7).
+    #[error("задача идеи возобновлена — предлагать вернуть нечего; вопрос q:{question} устарел")]
+    TaskRevived { question: Id },
     /// Предложение вернуть идею без объяснения (`text`): 422 (§16, п. 2).
     #[error("text: объясните, почему идею пора вернуть")]
     ReopenTextRequired,
@@ -731,6 +735,32 @@ fn task_state(c: &Connection, d: &IdeaData) -> Result<Option<TaskState>, StoreEr
             _ => TaskState::Live,
         },
     }))
+}
+
+/// Есть ли в пространствах `spaces` кандидат первого прохода подсказки к `prompt`: живая идея
+/// человека `new` или `deferred` с наступившим `horizon` (один SQL `LIMIT 1`). Нет — поиск идей
+/// не нужен (финальное ревью M5.7, Minor 5).
+pub async fn any_new_idea(db: &Db, spaces: &[Id], today: Date) -> Result<bool, StoreError> {
+    if spaces.is_empty() {
+        return Ok(false);
+    }
+    let n = spaces.len();
+    let mut args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+    args.push(today.to_string());
+    db.read(move |c| {
+        let mut st = c.prepare(&format!(
+            "SELECT 1 FROM entries e
+             WHERE e.space_id IN ({}) AND e.kind = 'idea' AND e.deleted_at IS NULL
+               AND json_extract(e.data, '$.origin') = 'human'
+               AND (e.status = 'new'
+                    OR (e.status = 'deferred' AND json_extract(e.data, '$.horizon') <= ?{}))
+             LIMIT 1",
+            in_list(n),
+            n + 1
+        ))?;
+        Ok(st.exists(params_from_iter(args))?)
+    })
+    .await
 }
 
 /// Id живых идей человека `accepted` со снятой или удалённой задачей и без открытого вопроса
@@ -943,9 +973,9 @@ pub async fn propose_idea(
                 if status == EntryStatus::Accepted && !task_released(task_state(tx, &d)?) {
                     let now = fmt_ts(Timestamp::now());
                     revive_task_tx(tx, idea, &attrib, &now)?;
-                    return Ok(Ok(None));
+                    return Ok(Ok(Err(q.id)));
                 }
-                return Ok(Ok(Some((idea, q))));
+                return Ok(Ok(Ok((idea, q))));
             }
             let kind = if status == EntryStatus::Accepted && task_released(task_state(tx, &d)?) {
                 ProposalKind::Reopen
@@ -1011,14 +1041,11 @@ pub async fn propose_idea(
                 ProposalKind::Reopen => EntryStatus::Accepted,
             };
             revise_with(tx, &idea, Some(next), d.to_value(), None, &attrib, &now)?;
-            Ok(Ok(Some((load_entry(tx, id)?, load_entry(tx, qid)?))))
+            Ok(Ok(Ok((load_entry(tx, id)?, load_entry(tx, qid)?))))
         })
     })
     .await??
-    .ok_or(IdeaError::Transition {
-        from: EntryStatus::Accepted,
-        to: EntryStatus::Proposed.as_str(),
-    })
+    .map_err(|question| IdeaError::TaskRevived { question })
 }
 
 /// Переход идеи в транзакции писателя (§5.2): проверка [`check_idea_transition`], у `accept` —
@@ -1417,6 +1444,9 @@ const STALE_PROPOSAL_REASON: &str = "предложение устарело";
 ///   удалении), теряет `question_id` — снова кандидат (§16, п. 4);
 /// - восстановленная живая (не `dropped`) задача идеи — как переоткрытая: открытый вопрос
 ///   «вернуть» устаревает ([`revive_task_tx`]).
+/// - восстановленная идея `accepted` при задаче `done` становится `done` (с `done_at`), идея
+///   `done` при живой или снятой задаче — снова `accepted` (финальное ревью M5.7): в корзине идея
+///   не видела смену статуса задачи.
 pub(crate) fn on_entry_restored_tx(
     tx: &Connection,
     e: &Entry,
@@ -1466,13 +1496,36 @@ pub(crate) fn on_entry_restored_tx(
                 now,
             )
         }
-        EntryKind::Idea if e.status == Some(EntryStatus::Accepted) => {
+        // идея в корзине не видела смену статуса задачи: `accepted` ↔ `done` сверяется с
+        // задачей (финальное ревью M5.7, Minor 1)
+        EntryKind::Idea if matches!(e.status, Some(EntryStatus::Accepted | EntryStatus::Done)) => {
             let mut d = IdeaData::from_stored(&e.data);
-            if !d.reopen_proposed() || open_question(tx, &d)?.is_some() {
+            let mut status = e.status;
+            let mut changed = false;
+            if status == Some(EntryStatus::Accepted)
+                && d.reopen_proposed()
+                && open_question(tx, &d)?.is_none()
+            {
+                d.question_id = None;
+                changed = true;
+            }
+            match (status, task_state(tx, &d)?) {
+                (Some(EntryStatus::Accepted), Some(TaskState::Done)) => {
+                    status = Some(EntryStatus::Done);
+                    d.done_at = Some(parse_ts(now)?);
+                    changed = true;
+                }
+                (Some(EntryStatus::Done), Some(TaskState::Live | TaskState::Dropped)) => {
+                    status = Some(EntryStatus::Accepted);
+                    d.done_at = None;
+                    changed = true;
+                }
+                _ => {}
+            }
+            if !changed {
                 return Ok(());
             }
-            d.question_id = None;
-            revise_with(tx, e, e.status, d.to_value(), None, attrib, now)
+            revise_with(tx, e, status, d.to_value(), None, attrib, now)
         }
         EntryKind::Task if e.status != Some(EntryStatus::Dropped) => {
             if let Some(idea) = idea_with_task(tx, e.id)? {

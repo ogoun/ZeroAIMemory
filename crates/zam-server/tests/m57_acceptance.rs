@@ -446,6 +446,10 @@ async fn acceptance_prompt_hint_rules() {
     assert!(idea_items(&d).contains(&w(&dark)), "{d}");
     let j = prompt(&a, "p2", "dark theme for the web interface").await;
     assert!(!idea_items(&j).contains(&w(&dark)), "{j}");
+    // посторонний запрос — идей решения нет: ближайшая по вектору идея без лексического
+    // подтверждения не подсказывается (финальное ревью M5.7, I-1)
+    let j = prompt(&a, "p-off", "configure server logging rotation").await;
+    assert!(idea_items(&j).is_empty(), "посторонний запрос: {j}");
     // Knowledge без связи — нет даже при совпадении текста
     let pk = "telemetry dashboard for nightly benchmarks";
     let j = prompt(&a, "p3", pk).await;

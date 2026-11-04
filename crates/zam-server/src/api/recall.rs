@@ -822,6 +822,7 @@ async fn idea_shown_in_session(s: Option<&RequestSession>, t: &SearchTarget) -> 
 /// дайджест цели (`health.alive`) он не трогает.
 async fn digest_ideas(
     st: &AppState,
+    p: &Principal,
     session: Option<&RequestSession>,
     health: &Health<'_>,
     deadline: &mut Deadline,
@@ -830,7 +831,7 @@ async fn digest_ideas(
     let Some((i, space)) = solution_space(health.targets()) else {
         return Vec::new();
     };
-    if max == 0 || !health.alive[i] {
+    if max == 0 || !health.alive[i] || !ideas_writable(p, &health.targets()[i]) {
         return Vec::new();
     }
     let t = &health.targets()[i];
@@ -945,6 +946,7 @@ async fn prompt_ideas(
     let mut own2 = Deadline { at, expired: false };
     let warned = health.warnings.len();
     let more = released_prompt_ideas(
+        p,
         req,
         headers,
         &query,
@@ -977,6 +979,60 @@ async fn test_slow_idea(d: &mut Deadline) {
 #[cfg(feature = "test-hooks")]
 const TEST_SLOW_MARGIN: Duration = Duration::from_millis(300);
 
+/// Предлагать идеи цели `t` можно, только если `propose` в неё пройдёт: токен `ro` и участник
+/// общего решения с `ro` получили бы 403 — им ни раздела `### Идеи`, ни подсказок-идей
+/// (финальное ревью M5.7, Minor 3).
+fn ideas_writable(p: &Principal, t: &SearchTarget) -> bool {
+    super::scope::effective_write(p, t.role).is_ok()
+}
+
+/// Есть ли в доступных на запись целях кандидат первого прохода подсказки (`new`/`deferred`):
+/// один SQL `LIMIT 1` на цель вместо поиска (финальное ревью M5.7, Minor 5). Сбой — WARN и
+/// «есть» (поиск решит сам); `None` — срок вышел.
+async fn any_prompt_candidates(
+    p: &Principal,
+    health: &Health<'_>,
+    d: &mut Deadline,
+) -> Option<bool> {
+    let today = zam_store::time::utc_today();
+    for t in health.targets() {
+        let spaces = entry_spaces(t);
+        if spaces.is_empty() || !ideas_writable(p, t) {
+            continue;
+        }
+        match d
+            .step(zam_store::any_new_idea(&t.db, &spaces, today))
+            .await?
+        {
+            Ok(true) => return Some(true),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "recall: кандидаты идей подсказки не прочитаны");
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Лексическое подтверждение идеи решения в подсказке (финальное ревью M5.7, I-1): балл
+/// отдельного поиска только по идеям нормирован по непустым каналам, и без порога вектора
+/// ближайшая идея получала бы 1,0 на любой запрос. Нужны канал `fts`, `alias` или `trigram` в
+/// `sources` и покрытие слов запроса заголовком и телом идеи [`coverage_enough`] (строгий FTS —
+/// все слова — проходит всегда).
+fn idea_lexically_matched(item: &Value, e: &Entry, terms: &[String]) -> bool {
+    let lexical = item["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|s| matches!(s.as_str(), Some("fts" | "alias" | "trigram")));
+    lexical
+        && coverage_enough(
+            term_coverage(terms, &format!("{}\n{}", e.title, e.body)),
+            terms.len(),
+        )
+}
+
 /// Идея подсказки: (цель, идея, общая из Knowledge, пометка «задача снята»).
 type FoundIdea = (usize, Entry, bool, Option<&'static str>);
 
@@ -992,6 +1048,10 @@ async fn collect_prompt_ideas(
     health: &mut Health<'_>,
     d: &mut Deadline,
 ) -> Result<Vec<Cand>, ApiError> {
+    match any_prompt_candidates(p, health, d).await {
+        Some(true) => {}
+        Some(false) | None => return Ok(Vec::new()),
+    }
     let Some(found) =
         search_prompt_ideas(st, p, headers, req, query, &["new", "deferred"], health, d).await?
     else {
@@ -1034,7 +1094,9 @@ const RELEASED_PROMPT_IDS: usize = 50;
 /// - общая идея Knowledge — по [`knowledge_ideas_related`].
 ///
 /// Не больше `want` кандидатов, после основных. Ошибки — WARN, `health.alive` не трогается.
+#[allow(clippy::too_many_arguments)]
 async fn released_prompt_ideas(
+    p: &Principal,
     req: &RecallReq,
     headers: &HeaderMap,
     query: &str,
@@ -1053,7 +1115,7 @@ async fn released_prompt_ideas(
     let mut hits: Vec<(f64, FoundIdea)> = Vec::new();
     for (i, t) in health.targets().iter().enumerate() {
         let spaces = entry_spaces(t);
-        if spaces.is_empty() {
+        if spaces.is_empty() || !ideas_writable(p, t) {
             continue;
         }
         let exclude: Vec<Id> = match session {
@@ -1232,6 +1294,7 @@ async fn search_prompt_ideas(
     };
     let min = st.cfg.recall.prompt_min_score;
     let today = zam_store::time::utc_today();
+    let terms = error_terms(query);
     let targets = health.targets();
     let mut found: Vec<FoundIdea> = Vec::new();
     for it in v["items"].as_array().into_iter().flatten() {
@@ -1253,6 +1316,9 @@ async fn search_prompt_ideas(
         else {
             continue;
         };
+        if !ideas_writable(p, &targets[target]) {
+            continue;
+        }
         let shared = match it["space"]["kind"].as_str() {
             Some("solution") if it["score"].as_f64().unwrap_or(0.0) >= min => false,
             Some("knowledge") => true,
@@ -1271,6 +1337,9 @@ async fn search_prompt_ideas(
                 continue;
             }
         };
+        if !shared && !idea_lexically_matched(it, &e, &terms) {
+            continue;
+        }
         // у `accepted` — состояние задачи (§16): кандидат, только если она снята или удалена
         let task = if e.status == Some(EntryStatus::Accepted) {
             let Some(r) = d.step(zam_store::idea_task_state(&db, &e)).await else {
@@ -3051,7 +3120,7 @@ pub async fn recall(
             )
             .await?;
             if ideas_on {
-                idea_cands = digest_ideas(&st, session.as_ref(), &health, &mut deadline).await;
+                idea_cands = digest_ideas(&st, &p, session.as_ref(), &health, &mut deadline).await;
             }
             (n, s, true, g, o)
         }

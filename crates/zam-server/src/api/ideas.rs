@@ -64,11 +64,25 @@ impl From<IdeaError> for ApiError {
                 ApiError::conflict(e.to_string())
             }
             e @ IdeaError::ReopenTextRequired => unprocessable(e.to_string()),
+            IdeaError::TaskRevived { question } => {
+                let mut extra = Map::new();
+                extra.insert("code".into(), json!("task-revived"));
+                extra.insert("question".into(), json!(question));
+                ApiError::Conflict {
+                    detail: e_text_task_revived(question),
+                    extra,
+                }
+            }
             // ошибки проверки тела операции идеи (`text`, `reason` длиннее предела) — 422
             IdeaError::Store(StoreError::BadInput(m)) => unprocessable(m),
             IdeaError::Store(e) => e.into(),
         }
     }
+}
+
+/// Текст 409 «задача возобновлена» у `propose` (тот же, что у ошибки хранилища).
+fn e_text_task_revived(question: Id) -> String {
+    IdeaError::TaskRevived { question }.to_string()
 }
 
 /// Сессия WebUI (человек), а не токен агента.
@@ -310,7 +324,25 @@ pub async fn propose(
     let solution = request_solution(&sc.db, &headers).await?;
     let attrib = attribution(&p, &headers, req.message)?;
     let (idea, question) =
-        propose_idea(&sc.db, sc.entry.id, req.text, space, solution, &attrib).await?;
+        match propose_idea(&sc.db, sc.entry.id, req.text, space, solution, &attrib).await {
+            Ok(v) => v,
+            // вопрос «вернуть» устарел и записан (задача снова живая) — аудит записи, затем 409
+            // (финальное ревью M5.7, Minor 2)
+            Err(IdeaError::TaskRevived { question }) => {
+                st.index.notify();
+                audit(
+                    &st,
+                    &p,
+                    &client,
+                    &sc,
+                    "entry.idea.propose",
+                    json!({"question": question, "obsolete": "task-revived"}),
+                )
+                .await?;
+                return Err(IdeaError::TaskRevived { question }.into());
+            }
+            Err(e) => return Err(e.into()),
+        };
     // повтор при открытом вопросе — без новой ревизии и без аудита
     if idea.rev != sc.entry.rev {
         st.index.notify();

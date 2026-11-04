@@ -1492,3 +1492,69 @@ async fn reopen_proposal_rest() {
     assert!(j["idea"]["data"]["task_id"].is_null(), "{j}");
     assert!(j.get("task").is_none(), "{j}");
 }
+
+/// Финальное ревью M5.7, Minor 2 и Minor 4: `propose` при открытом вопросе «вернуть» и живой
+/// задаче (мимо хуков) — 409 `task-revived` с понятным текстом и аудитом записи; решение через
+/// ответ на вопрос-предложение пишет аудит `entry.idea.decide`, как прямой `decide`.
+#[tokio::test]
+async fn propose_task_revived_409_and_answer_decide_audit() {
+    let a = setup("revived-audit").await;
+    let i = idea_tok(&a, &sol(), "Кэш выжимок", "human").await;
+    let r = post_tok(
+        &a,
+        &i,
+        "decide",
+        json!({"decision": "accept", "by": "human"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let task = id(&r.json()["task"]);
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &ent(&task),
+            Some(json!({"status": "dropped", "reason": "не до того"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let r = post_tok(&a, &i, "propose", json!({"text": "пора"})).await;
+    ok(&r, StatusCode::OK);
+    let qid = id(&r.json()["question"]);
+    // задача снова живая мимо хуков
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let t = task.clone();
+    db.write(move |tx| Ok(tx.execute("UPDATE entries SET status = 'open' WHERE id = ?1", [t])?))
+        .await
+        .unwrap();
+    let before = actions(&audit(&a).await, "entry.idea.propose");
+    let r = post_tok(&a, &i, "propose", json!({"text": "снова"})).await;
+    ok(&r, StatusCode::CONFLICT);
+    let j = r.json();
+    assert_eq!(j["code"], "task-revived", "{j}");
+    assert_eq!(j["question"], qid.as_str(), "{j}");
+    assert!(
+        j["detail"]
+            .as_str()
+            .unwrap()
+            .contains("предлагать вернуть нечего"),
+        "{j}"
+    );
+    assert_eq!(actions(&audit(&a).await, "entry.idea.propose"), before + 1);
+    assert_eq!(get(&a, &qid).await["status"], "obsolete");
+    // ответ на вопрос-предложение — аудит entry.idea.decide
+    let i2 = idea_tok(&a, &sol(), "Тёмная тема", "human").await;
+    let r = post_tok(&a, &i2, "propose", json!({})).await;
+    let q2 = id(&r.json()["question"]);
+    let before = actions(&audit(&a).await, "entry.idea.decide");
+    let r = post_tok(
+        &a,
+        &q2,
+        "answer",
+        json!({"option": "decline", "by": "human"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let rows = audit(&a).await;
+    assert_eq!(actions(&rows, "entry.idea.decide"), before + 1);
+}

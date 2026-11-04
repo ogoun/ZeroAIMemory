@@ -105,8 +105,8 @@ pub use ideas::{
     Decided, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS, IDEA_LINKS_MAX, IDEA_OPTIONS,
     IDEA_ORIGIN_REQUIRED, IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin,
     IdeaPriority, NewDecision, PROPOSE_TEXT_MAX_CHARS, ProposalKind, TaskState, adopt_idea,
-    any_idea, check_idea, check_idea_shape, check_idea_transition, decide_idea, idea_candidate,
-    idea_task_state, proactive_ideas, propose_idea, released_ideas, task_released,
+    any_idea, any_new_idea, check_idea, check_idea_shape, check_idea_transition, decide_idea,
+    idea_candidate, idea_task_state, proactive_ideas, propose_idea, released_ideas, task_released,
 };
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
