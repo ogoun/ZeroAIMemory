@@ -62,9 +62,11 @@
   `std::env::temp_dir()`, `tempfile` без `dir=`. Субагентам правило передаётся в брифе.
 - **Вне каталога проекта не читать**, в том числе `~/.claude` и `~/.codex`, пока владелец не
   разрешит (задача 17a, шаг 0).
-- **Тесты с процессами** — без `ZAM_*` и `AGENT_ENV_VARS`. CLI — через
+- **Тесты с процессами** не наследуют `ZAM_*` и `AGENT_ENV_VARS` окружения. Явная установка нужной
+  переменной в самом тесте (например `ZAM_SESSION_ID`) допустима. CLI — через
   `crates/zam-cli/tests/common::zam_cmd`, сторож `repo_clean` зелёный.
-  - Время — замороженными часами (задача 6, фича `test-hooks`) или прямым SQL.
+  - Время сервера — замороженными часами (задача 6, фича `test-hooks`) или прямым SQL. Время в
+    клиентских тестах — правкой поля `at` в `snapst-*.json` (и подобных файлах кэша) фикстурой.
   - Гонки — барьерами и точками `test-hooks`, без `sleep`.
 - **Ключи-приманки** в фикстурах и тестах собираются конкатенацией (`["AK", "IA", …].concat()`):
   литерал заблокирует push protection.
@@ -189,9 +191,9 @@ deploy/licenses/*, about.toml
 | № | Задача | Зависит от | Объём |
 |---|---|---|---|
 | 1a1 | Каркас замера: MCP-клиент, возможности, статистика, разбиение | — | M |
-| 1a2 | Пилот на трёх тегах, контроль v0.0.9 ≡ v0.0.10, эталон подсказок-идей M5.7 | 1a1 | M |
+| 1c | Пополнение корпуса до заморозки, корпус ТС-2, 50 идей для эталона | 1a1 | M |
+| 1a2 | Пилот на трёх тегах, контроль v0.0.9 ≡ v0.0.10, эталон подсказок-идей M5.7 | 1a1, 1c | M |
 | 2 | Схема `0025` | — | M |
-| 1c | Пополнение корпуса до заморозки, корпус ТС-2 | 1a1 | M |
 | 1b | Набор ТС-1, нагеты, заморозка двух отпечатков | 1c | L |
 | 3 | Привязка MCP к сессии, `explicit`/`via_mcp`, `unattributed` | 2 | M |
 | 4 | Сессионный набор ТС-2 | 1a1, 1c, 3 | L |
@@ -219,7 +221,7 @@ deploy/licenses/*, about.toml
 | 13b | Переснятие на holdout, приёмка, совместимость | 13a | L |
 | 13c | Документы и выпуск `0.0.11-m6` | 13b | M |
 
-Строгий порядок исполнения: **1a1 → 1a2 → 2 → 1c → 1b → 3 → 4 → 5 → 6 → 7a → 7b → 8a → 8b → 8c → 9 →
+Строгий порядок исполнения: **1a1 → 1c → 1a2 → 2 → 1b → 3 → 4 → 5 → 6 → 7a → 7b → 8a → 8b → 8c → 9 →
 10 → 11 → 12 → 14 → 15a → 15b → 15c → 16 → 17a → 17b → 17c → 17d → 13a → 13b → 13c.** 15b стоит
 раньше 17a, потому что 17a маскирует снимок через `zam-secrets`. Таблица «Зависит от» описывает
 связи, а не разрешение на параллельность.
@@ -291,6 +293,30 @@ CLI xtask:
   Run: `cargo test -p xtask $T` — PASS.
 - [ ] **Step 3: Commit** `feat(eval): каркас замера M6 — MCP, статистика, разбиение`.
 
+### Task 1c: Пополнение корпуса до заморозки (§3.2, §10, §11, рецензия плана C1)
+
+**Files.** Modify: `eval/corpus/**` (области у целей, трудные соседи и пары `contradicts`). Create:
+`eval/sessions-corpus/**` (Rules ≥ 10, задачи `in_progress`/`blocked`, ответы человека, доступ,
+словарь, идеи, в том числе 50 идей `eval/sessions-corpus/ideas/` для эталона подсказок-идей задачи
+1a2). Modify: загрузчик xtask — `X-Zam-Area`,
+`--corpus`.
+
+**Interfaces — Produces:**
+- `eval/corpus` — корпус ТС-1, ТС-1 грузит только его и `eval/docs`;
+- `eval/sessions-corpus` — грузит только ТС-2 (`eval --sessions`) и наборы идей;
+- у целей корпуса — поле `area` (`backend`, `frontend`, `infra`, ≥ 8 на каждую).
+
+- [ ] **Step 1: Тест загрузчика** (FAIL) `ts1_never_loads_sessions_corpus`,
+  `area_header_sent_from_query` (`cargo test -p xtask $T`).
+- [ ] **Step 2: Пополнение.**
+  - Для §10: ≥ 24 ответа `gotcha`/`failure` с соседями — заметка той же темы, `discovery`/
+    `experiment` с близким текстом — и ≥ 8 пар `hypothesis gotcha` ↔ `theorem` со связью
+    `contradicts`.
+  - Для §11: области.
+  - `cargo xtask eval` (основной набор) на новом корпусе — числа **только в журнал**, без критерия
+    прохождения: базы сравниваются уже на этом корпусе.
+- [ ] **Step 3: Commit** `test(eval): пополнение корпуса M6 и корпус ТС-2`.
+
 ### Task 1a2: Пилот на тегах, контроль, эталон подсказок-идей M5.7 (§3.3, рецензия плана C3)
 
 **Files.**
@@ -344,6 +370,7 @@ CREATE TABLE session_snapshots (session_id TEXT PRIMARY KEY REFERENCES sessions(
   status TEXT NOT NULL CHECK (status IN ('complete','partial')), skipped INTEGER NOT NULL,
   bytes INTEGER NOT NULL, data TEXT NOT NULL);
 ALTER TABLE code_refs ADD recv_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE session_tokens ADD reread_calls INTEGER NOT NULL DEFAULT 0;  -- повторная выдача (7a, 8b)
 ```
 ```rust
 // zam-core/src/snapshot.rs — единственное место нейтральных типов снимка (serde)
@@ -393,29 +420,6 @@ pub async fn gc_snapshots(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError>
 - [ ] **Step 4: Проверка.** `cargo test -p zam-store $T` и `cargo test -p zam-server --test sessions
   --test session_tokens $T` — PASS.
 - [ ] **Step 5: Commit** `feat(store): миграция 0025 — эпохи, holdout, учёт, снимки, recv_count`.
-
-### Task 1c: Пополнение корпуса до заморозки (§3.2, §10, §11, рецензия плана C1)
-
-**Files.** Modify: `eval/corpus/**` (области у целей, трудные соседи и пары `contradicts`). Create:
-`eval/sessions-corpus/**` (Rules ≥ 10, задачи `in_progress`/`blocked`, ответы человека, доступ,
-словарь, идеи, в том числе 50 идей фикстуры 1a2). Modify: загрузчик xtask — `X-Zam-Area`,
-`--corpus`.
-
-**Interfaces — Produces:**
-- `eval/corpus` — корпус ТС-1, ТС-1 грузит только его и `eval/docs`;
-- `eval/sessions-corpus` — грузит только ТС-2 (`eval --sessions`) и наборы идей;
-- у целей корпуса — поле `area` (`backend`, `frontend`, `infra`, ≥ 8 на каждую).
-
-- [ ] **Step 1: Тест загрузчика** (FAIL) `ts1_never_loads_sessions_corpus`,
-  `area_header_sent_from_query` (`cargo test -p xtask $T`).
-- [ ] **Step 2: Пополнение.**
-  - Для §10: ≥ 24 ответа `gotcha`/`failure` с соседями — заметка той же темы, `discovery`/
-    `experiment` с близким текстом — и ≥ 8 пар `hypothesis gotcha` ↔ `theorem` со связью
-    `contradicts`.
-  - Для §11: области.
-  - `cargo xtask eval` (основной набор) — без регрессии к пилоту 1a2: изменение записывается, но
-    сравнение баз ведётся на новом корпусе.
-- [ ] **Step 3: Commit** `test(eval): пополнение корпуса M6 и корпус ТС-2`.
 
 ### Task 1b: Набор ТС-1, нагеты, заморозка (§3.1–§3.2)
 
@@ -473,8 +477,10 @@ pub struct RequestSession { pub touch: SessionTouch, pub db: Db, pub explicit: b
 `read_binding` (при `initialize` и раз в 30 с). Прогоны ТС-2 из xtask задают `ZAM_SESSION_ID`.
 
 - [ ] **Step 1: Тесты** (FAIL):
-  - CLI: `binding_written_on_session_start_clear_resume` (после `resume` — новая сессия в файле),
-    `binding_found_via_fake_ancestors` (`--features test-hooks`), `env_session_beats_binding`;
+  - CLI (`tests/mcp_bind.rs`): `binding_written_on_session_start_clear_resume` (после `resume` —
+    новая сессия в файле), `env_session_beats_binding`;
+  - юнит в `binding.rs`: `binding_found_via_fake_ancestors` — подмена предков `procs::set_fake_ancestors`
+    под `test-hooks`, без новой переменной `ZAM_*`;
   - сервер: `mcp_explicit_session_marks_seen`, `implicit_session_no_marks_goes_unattributed`,
     `mcp_origin_not_forgeable_by_header` (внешний запрос с любыми заголовками —
     `via_mcp = false`), `mcp_search_counts_once`, `subagent_on_shared_mcp_keeps_snippet` (фрагмент
@@ -483,7 +489,8 @@ pub struct RequestSession { pub touch: SessionTouch, pub db: Db, pub explicit: b
   `guide` (п. 1 «Карточки», строка 17): «(выдавалось) — уже было в сессии, перечитывать не нужно,
   если текст у тебя есть».
 - [ ] **Step 3: Проверка.**
-  - `cargo test -p zam-cli --test mcp_bind --features test-hooks $T` — PASS;
+  - `cargo test -p zam-cli --bin zam --features test-hooks $T binding` — PASS;
+  - `cargo test -p zam-cli --test mcp_bind $T` — PASS;
   - `cargo test -p zam-server --test mcp --test session_tokens $T` — PASS;
   - `cargo test -p zam-cli --test m4_acceptance $T hook_budgets` — PASS: `session-start` с записью
     привязки ≤ 300 мс.
@@ -577,7 +584,9 @@ pub fn agent_date(rfc3339: &str) -> Option<String>;   // → "2026-10-10"
 // сервер вызывает agent_ts(&fmt_ts(t)); CLI — на строках JSON ответа
 // zam-store/src/time.rs — источник времени
 pub fn now() -> jiff::Timestamp;                       // все «сейчас» сервера и хранилища — через неё
-#[cfg(feature = "test-hooks")] pub fn freeze_now(t: jiff::Timestamp) -> FreezeGuard; // до drop
+#[cfg(feature = "test-hooks")] pub fn freeze_now(t: jiff::Timestamp) -> FreezeGuard;
+//   FreezeGuard держит существующую блокировку GATE (`zam-store/src/test_hooks.rs`, write) до drop:
+//   тесты с замороженными часами не идут параллельно с прочими точками test-hooks
 ```
 ```ts
 export function localTime(iso: string): string;        // RFC 3339 UTC → локальное время браузера
@@ -613,8 +622,9 @@ ideas_recall.rs,read_batch.rs}`, `crates/zam-cli/tests/hooks.rs`.
   - явный `new_epoch`.
 - `/read` при той же ревизии и эпохе выдаёт полный текст, в заголовке — `· уже выдавалось в этой
   сессии`; в JSON — `seen: true`.
-- Счётчик повторной выдачи: `session_tokens` событие `read`, поле `reread_calls`. `GET
-  /sessions/{id}` получает `tokens.read.reread_calls`. Из него WebUI (8b) показывает долю.
+- Счётчик повторной выдачи — колонка `session_tokens.reread_calls` (миграция 0025, задача 2):
+  `/read` с пометкой «уже выдавалось» прибавляет 1 к строке события `read`. `GET /sessions/{id}`
+  отдаёт `tokens.read.reread_calls`. Из него WebUI (8b) показывает долю.
 
 - [ ] **Step 0 (до правки): эталон** `/read` без сессии на 10 целях —
   `crates/zam-server/tests/fixtures/read_l2_m57.json` (тест `--ignored`).
@@ -713,7 +723,7 @@ recall_recovery.rs,recall_brief.rs}`.
   M, "warning": "rules_heavy" | null}`. Область — Rules текущего решения (`X-Zam-Solution`).
   `rules_heavy` — при > 10 Rules или Σ L1 > 1500.
 - WebUI: страница сессий (список, «событие · вызовов · токенов», доля «уже выдавалось» из
-  `reread_calls`), плашка `rules_heavy` у папки Rules и в «Состоянии индекса».
+  колонки `session_tokens.reread_calls` через `tokens.read.reread_calls`), плашка `rules_heavy` у папки Rules и в «Состоянии индекса».
 
 - [ ] **Step 1: Тесты** (FAIL):
   - сервер: `session_tokens_search_read_mcp`, `index_status_rules_heavy_shape`;
@@ -1108,7 +1118,7 @@ pub fn mask_and_limit(s: Snapshot, max_bytes: usize) -> Snapshot;
     - `snapshot_tail_of_growing_file`;
     - `snapshot_bad_path_is_silent`;
   - события хуков:
-    - `stop_throttle_16kib_60s`;
+    - `stop_throttle_16kib_60s` — время «60 с назад» задаётся правкой поля `at` в `snapst-*.json`;
     - `post_compact_and_session_end_accepted_within_100ms` (пустой вывод);
     - `session_end_patches_ended`;
     - `compact_put_before_recall`;
@@ -1284,7 +1294,8 @@ pub fn mask_and_limit(s: Snapshot, max_bytes: usize) -> Snapshot;
 
 Каждое решение записывается в журнал этапа и переносится в ТЗ (задача 13c).
 
-1. **Порядок** — строго последовательный, по таблице. Задача 2 идёт до 1c и 1b: разметка долгая, а
+1. **Порядок** — строго последовательный, по таблице (решение контролёра). 1c идёт до 1a2: 1c
+   зависит только от 1a1 и создаёт 50 идей для эталона 1a2. Задача 2 идёт до 1b: разметка долгая, а
    схема нужна задачам 3 и 7a. Задача 15b стоит до 17a: снимок маскируется через `zam-secrets`.
 2. **Одна миграция `0025_session_epochs.sql`** для всей схемы этапа — один `bak-v24` и один шаг
    отката. До 7a эпоха всегда 0, поведение не меняется.
